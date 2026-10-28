@@ -77,6 +77,9 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_SMEM_BSCALE_OFF 231424
 #define SMEM_SMEM_BSCALE_STAGE_BYTES 512
 #define SMEM_SMEM_BSCALE_STRIDE 512
+#define SMEM_SMEM_GEOMETRY_OFF 231936
+#define SMEM_SMEM_GEOMETRY_STAGE_BYTES 8
+#define SMEM_SMEM_GEOMETRY_STRIDE 8
 #define SMEM_SMEM_Y_OFF 196608
 #define SMEM_SMEM_Y_STAGE_BYTES 16384
 #define SMEM_SMEM_Y_STRIDE 16384
@@ -266,8 +269,8 @@ __device__ __forceinline__ float mul_f32_rn_noftz(float a, float b) {
 
 extern "C" {
 
-__global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap b_map, const __grid_constant__ CUtensorMap c_map, const __grid_constant__ CUtensorMap out_map, __nv_bfloat16* __restrict__ x, float* __restrict__ dt, __half* __restrict__ delta_precomputed, float* __restrict__ cumsum_precomputed, float* __restrict__ A, __nv_bfloat16* __restrict__ B_tensor, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ D, __nv_bfloat16* __restrict__ z, float* __restrict__ dt_bias, float* __restrict__ initial_states, float* __restrict__ final_states, float* __restrict__ checkpoint_states, int* __restrict__ checkpoint_token_indices, int* __restrict__ checkpoint_state_slots, int* __restrict__ seq_idx_i32, long long* __restrict__ seq_idx_i64, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, int* __restrict__ seq_chunk_cumsum, __nv_bfloat16* __restrict__ out_native, int nheads, int ngroups, int batch, int seqlen, int nchunks, int sequence_count, int num_logical_chunks, int mode_varlen, int D_mode, int has_z, int has_initial, int dt_softplus, float dt_min, float dt_max, int write_final_states, int checkpoint_state_count, int* __restrict__ cu_seqlens, int metadata_from_cu_seqlens, int* __restrict__ preprocess_status)
+__global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) __cluster_dims__(1,1,1) void
+kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap b_map, const __grid_constant__ CUtensorMap c_map, const __grid_constant__ CUtensorMap out_map, __nv_bfloat16* __restrict__ x, float* __restrict__ dt, __half* __restrict__ delta_precomputed, float* __restrict__ cumsum_precomputed, float* __restrict__ A, __nv_bfloat16* __restrict__ B_tensor, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ D, __nv_bfloat16* __restrict__ z, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ initial_states, __nv_bfloat16* __restrict__ final_states, __nv_bfloat16* __restrict__ checkpoint_states, int* __restrict__ checkpoint_token_indices, int* __restrict__ checkpoint_state_slots, int* __restrict__ seq_idx_i32, long long* __restrict__ seq_idx_i64, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, int* __restrict__ seq_chunk_cumsum, __nv_bfloat16* __restrict__ out_native, int nheads, int ngroups, int batch, int seqlen, int nchunks, int sequence_count, int num_logical_chunks, int mode_varlen, int D_mode, int has_z, int has_initial, int dt_softplus, float dt_min, float dt_max, int write_final_states, int checkpoint_state_count, int* __restrict__ cu_seqlens, int metadata_from_cu_seqlens, int* __restrict__ preprocess_status)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -282,7 +285,7 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 #endif
 
-    const int mbar_base = smem + 231936;
+    const int mbar_base = smem + 231944;
     #define bc_full_addr (mbar_base + 0)
     #define bc_empty_addr (mbar_base + 16)
     #define x_full_addr (mbar_base + 32)
@@ -325,79 +328,93 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
     const int smem_cumsum_all_addr = smem + 230400;
     float* smem_bscale = reinterpret_cast<float*>(smem_raw + 231424);
     const int smem_bscale_addr = smem + 231424;
+    int* smem_geometry = reinterpret_cast<int*>(smem_raw + 231936);
+    const int smem_geometry_addr = smem + 231936;
     __nv_bfloat16* smem_y = reinterpret_cast<__nv_bfloat16*>(smem_raw + 196608);
     const int smem_y_addr = smem + 196608;
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 232176);
-    int taddr;
-    int tmem_cb_tmem;
-    int tmem_intra_tmem;
-    int tmem_state_delta_tmem;
-    int tmem_inter_tmem;
 
     // Mbarrier init (17 pipeline groups, 0 ordered-sequence groups, 30 barriers)
-    // Mbarriers at smem_raw[231936..232176)
+    // Mbarriers at smem_raw[231944..232184)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
         if (leader) {
             // --- pipeline 'input_pipe' ---
             // bc_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 231936, 1);
             mbarrier_init(smem + 231944, 1);
+            mbarrier_init(smem + 231952, 1);
             // bc_empty: 2 barriers, init_count=3
-            mbarrier_init(smem + 231952, 3);
             mbarrier_init(smem + 231960, 3);
+            mbarrier_init(smem + 231968, 3);
             // x_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 231968, 1);
             mbarrier_init(smem + 231976, 1);
+            mbarrier_init(smem + 231984, 1);
             // x_empty: 2 barriers, init_count=3
-            mbarrier_init(smem + 231984, 3);
             mbarrier_init(smem + 231992, 3);
+            mbarrier_init(smem + 232000, 3);
             // aux_full: 2 barriers, init_count=32
-            mbarrier_init(smem + 232000, 32);
             mbarrier_init(smem + 232008, 32);
+            mbarrier_init(smem + 232016, 32);
             // aux_empty: 2 barriers, init_count=384
-            mbarrier_init(smem + 232016, 384);
             mbarrier_init(smem + 232024, 384);
+            mbarrier_init(smem + 232032, 384);
             // --- pipeline 'intra1_acc_pipe' ---
             // cb_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 232032, 1);
             mbarrier_init(smem + 232040, 1);
+            mbarrier_init(smem + 232048, 1);
             // cb_empty: 2 barriers, init_count=2
-            mbarrier_init(smem + 232048, 2);
             mbarrier_init(smem + 232056, 2);
+            mbarrier_init(smem + 232064, 2);
             // q_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 232064, 1);
             mbarrier_init(smem + 232072, 1);
-            // scaled_b_full: 1 barriers, init_count=1
             mbarrier_init(smem + 232080, 1);
+            // scaled_b_full: 1 barriers, init_count=1
+            mbarrier_init(smem + 232088, 1);
             // --- pipeline 'state_pipe' ---
             // state_operand_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 232088, 1);
             mbarrier_init(smem + 232096, 1);
-            // state_read_released: 2 barriers, init_count=1
             mbarrier_init(smem + 232104, 1);
+            // state_read_released: 2 barriers, init_count=1
             mbarrier_init(smem + 232112, 1);
-            // state_delta_full: 1 barriers, init_count=1
             mbarrier_init(smem + 232120, 1);
+            // state_delta_full: 1 barriers, init_count=1
+            mbarrier_init(smem + 232128, 1);
             // --- pipeline 'intra1_acc_pipe' ---
             // intra_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 232128, 1);
             mbarrier_init(smem + 232136, 1);
+            mbarrier_init(smem + 232144, 1);
             // intra_empty: 2 barriers, init_count=4
-            mbarrier_init(smem + 232144, 4);
             mbarrier_init(smem + 232152, 4);
+            mbarrier_init(smem + 232160, 4);
             // inter_full: 1 barriers, init_count=1
-            mbarrier_init(smem + 232160, 1);
+            mbarrier_init(smem + 232168, 1);
             // inter_empty: 1 barriers, init_count=4
-            mbarrier_init(smem + 232168, 4);
+            mbarrier_init(smem + 232176, 4);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
 
+    __syncwarp();
+
+    // TMEM alloc (512 columns, 512 used)
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 232184);
+    if (warp == 12) {
+        int _tmem_hold = smem + 232184;
+        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
+        __syncwarp();
+        asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
+    }
+
     __syncthreads();
+    asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+
+    const int taddr = tmem_addr_storage[0];
 
     // Kernel post-init ops
+    const int tmem_cb_tmem = taddr;
+    const int tmem_intra_tmem = taddr + 256;
+    const int tmem_state_delta_tmem = taddr + 384;
+    const int tmem_inter_tmem = taddr + 448;
     if (warp >= 0 && warp <= 3) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 32;");
     }
@@ -405,12 +422,6 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
     // ---- Role: mma_inter ----
     if (warp == 0) {
         { // mma_inter_main
-            asm volatile("barrier.sync 11, 480;" ::: "memory");
-            taddr = tmem_addr_storage[0];
-            tmem_cb_tmem = taddr;
-            tmem_intra_tmem = taddr + 256;
-            tmem_state_delta_tmem = taddr + 384;
-            tmem_inter_tmem = taddr + 448;
             unsigned int input_stage = 0;
             unsigned int state_stage = 0;
             unsigned int _phase_bc_full = 0;
@@ -426,6 +437,31 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                 int item_hi = 0;
                 int item_checkpoint = -1;
                 int checkpoint_rank = 1073741824;
+                if (metadata_from_cu_seqlens != 0) {
+                    int _max_1 = ((cu_seqlens[sequence]) > (0) ? (cu_seqlens[sequence]) : (0));
+                    int _min_0 = ((_max_1) < (seqlen) ? (_max_1) : (seqlen));
+                    item_lo = _min_0;
+                    int _max_3 = ((cu_seqlens[sequence + 1]) > (0) ? (cu_seqlens[sequence + 1]) : (0));
+                    int _min_2 = ((_max_3) < (seqlen) ? (_max_3) : (seqlen));
+                    item_hi = _min_2;
+                    int item_count = 0;
+                    if (item_hi > item_lo) {
+                        item_count = (item_hi + 127) / 128 - item_lo / 128;
+                        if (checkpoint_state_count > 0) {
+                            int candidate_checkpoint = checkpoint_token_indices[sequence];
+                            if (candidate_checkpoint > item_lo && candidate_checkpoint < item_hi && candidate_checkpoint % 128 != 0) {
+                                item_checkpoint = candidate_checkpoint;
+                                checkpoint_rank = candidate_checkpoint / 128 - item_lo / 128 + 1;
+                                item_count = item_count + 1;
+                            }
+                        }
+                    }
+                    first_logical = 0;
+                    logical_end = item_count;
+                } else {
+                    first_logical = seq_chunk_cumsum[sequence];
+                    logical_end = seq_chunk_cumsum[sequence + 1];
+                }
                 int uniform = make_warp_uniform(first_logical);
                 first_logical = uniform;
                 int uniform_1 = make_warp_uniform(logical_end);
@@ -440,45 +476,45 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                     int _mma_a_lo_1 = make_warp_uniform((((smem_c_addr) >> 4) & 0x7FFF) + (input_stage) * 2048);
                     int _mma_b_lo_2 = make_warp_uniform((((smem_state_addr) >> 4) & 0x7FFF) + (state_stage) * 1024);
                     {
-                        uint64_t _mma_ss_a_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_1);
-                        uint64_t _mma_ss_b_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_2);
+                        uint64_t _mma_ss_a_desc_4 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_1);
+                        uint64_t _mma_ss_b_desc_4 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_2);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_inter_tmem, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 135267472, 0);
+                            tcgen05_mma_f16(tmem_inter_tmem, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 135267472, 0);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_4, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_inter_tmem, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 135267472, 1);
+                            tcgen05_mma_f16(tmem_inter_tmem, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 135267472, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_4, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_inter_tmem, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 135267472, 1);
+                            tcgen05_mma_f16(tmem_inter_tmem, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 135267472, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_4, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_inter_tmem, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 135267472, 1);
+                            tcgen05_mma_f16(tmem_inter_tmem, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 135267472, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_0, 1018U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_0, 506U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_4, 1018U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_4, 506U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_inter_tmem, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 135267472, 1);
+                            tcgen05_mma_f16(tmem_inter_tmem, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 135267472, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_4, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_inter_tmem, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 135267472, 1);
+                            tcgen05_mma_f16(tmem_inter_tmem, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 135267472, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_4, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_inter_tmem, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 135267472, 1);
+                            tcgen05_mma_f16(tmem_inter_tmem, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 135267472, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_4, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_inter_tmem, _mma_ss_a_desc_0, _mma_ss_b_desc_0, 135267472, 1);
+                            tcgen05_mma_f16(tmem_inter_tmem, _mma_ss_a_desc_4, _mma_ss_b_desc_4, 135267472, 1);
                         }
                     }
                     elect_commit(inter_full_addr);
@@ -490,45 +526,45 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                     int _mma_a_lo_2 = make_warp_uniform(((((smem_b_t_addr) >> 4) & 0x7FFF) | 0x4000000) + (input_stage) * 2048);
                     int _mma_b_lo_3 = make_warp_uniform(((((smem_x_addr) >> 4) & 0x7FFF) | 0x4000000) + (input_stage) * 1024);
                     {
-                        uint64_t _mma_ss_a_desc_1 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_2);
-                        uint64_t _mma_ss_b_desc_1 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_3);
+                        uint64_t _mma_ss_a_desc_5 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_2);
+                        uint64_t _mma_ss_b_desc_5 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_3);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_state_delta_tmem, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 135365776, 0);
+                            tcgen05_mma_f16(tmem_state_delta_tmem, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 135365776, 0);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_1, 128U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_1, 128U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_5, 128U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_5, 128U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_state_delta_tmem, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 135365776, 1);
+                            tcgen05_mma_f16(tmem_state_delta_tmem, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 135365776, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_1, 128U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_1, 128U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_5, 128U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_5, 128U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_state_delta_tmem, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 135365776, 1);
+                            tcgen05_mma_f16(tmem_state_delta_tmem, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 135365776, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_1, 128U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_1, 128U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_5, 128U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_5, 128U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_state_delta_tmem, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 135365776, 1);
+                            tcgen05_mma_f16(tmem_state_delta_tmem, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 135365776, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_1, 128U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_1, 128U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_5, 128U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_5, 128U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_state_delta_tmem, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 135365776, 1);
+                            tcgen05_mma_f16(tmem_state_delta_tmem, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 135365776, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_1, 128U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_1, 128U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_5, 128U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_5, 128U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_state_delta_tmem, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 135365776, 1);
+                            tcgen05_mma_f16(tmem_state_delta_tmem, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 135365776, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_1, 128U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_1, 128U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_5, 128U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_5, 128U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_state_delta_tmem, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 135365776, 1);
+                            tcgen05_mma_f16(tmem_state_delta_tmem, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 135365776, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_1, 128U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_1, 128U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_5, 128U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_5, 128U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16(tmem_state_delta_tmem, _mma_ss_a_desc_1, _mma_ss_b_desc_1, 135365776, 1);
+                            tcgen05_mma_f16(tmem_state_delta_tmem, _mma_ss_a_desc_5, _mma_ss_b_desc_5, 135365776, 1);
                         }
                     }
                     elect_commit(state_delta_full_addr);
@@ -540,19 +576,11 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                     if (state_stage == 2) { state_stage = 0; _phase_state_operand_full ^= 1; }
                 }
             }
-            asm volatile("tcgen05.fence::before_thread_sync;");
-            asm volatile("barrier.sync 12, 352;" ::: "memory");
         }
     }
     // ---- Role: mma_intra ----
     if (warp == 1) {
         { // mma_intra_main
-            asm volatile("barrier.sync 11, 480;" ::: "memory");
-            taddr = tmem_addr_storage[0];
-            tmem_cb_tmem = taddr;
-            tmem_intra_tmem = taddr + 256;
-            tmem_state_delta_tmem = taddr + 384;
-            tmem_inter_tmem = taddr + 448;
             unsigned int input_stage_1 = 0;
             unsigned int acc_stage = 0;
             unsigned int _phase_q_full = 0;
@@ -567,6 +595,31 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                 int item_hi_1 = 0;
                 int item_checkpoint_1 = -1;
                 int checkpoint_rank_1 = 1073741824;
+                if (metadata_from_cu_seqlens != 0) {
+                    int _max_1_1 = ((cu_seqlens[sequence_1]) > (0) ? (cu_seqlens[sequence_1]) : (0));
+                    int _min_0_1 = ((_max_1_1) < (seqlen) ? (_max_1_1) : (seqlen));
+                    item_lo_1 = _min_0_1;
+                    int _max_3_1 = ((cu_seqlens[sequence_1 + 1]) > (0) ? (cu_seqlens[sequence_1 + 1]) : (0));
+                    int _min_2_1 = ((_max_3_1) < (seqlen) ? (_max_3_1) : (seqlen));
+                    item_hi_1 = _min_2_1;
+                    int item_count_1 = 0;
+                    if (item_hi_1 > item_lo_1) {
+                        item_count_1 = (item_hi_1 + 127) / 128 - item_lo_1 / 128;
+                        if (checkpoint_state_count > 0) {
+                            int candidate_checkpoint_1 = checkpoint_token_indices[sequence_1];
+                            if (candidate_checkpoint_1 > item_lo_1 && candidate_checkpoint_1 < item_hi_1 && candidate_checkpoint_1 % 128 != 0) {
+                                item_checkpoint_1 = candidate_checkpoint_1;
+                                checkpoint_rank_1 = candidate_checkpoint_1 / 128 - item_lo_1 / 128 + 1;
+                                item_count_1 = item_count_1 + 1;
+                            }
+                        }
+                    }
+                    first_logical_1 = 0;
+                    logical_end_1 = item_count_1;
+                } else {
+                    first_logical_1 = seq_chunk_cumsum[sequence_1];
+                    logical_end_1 = seq_chunk_cumsum[sequence_1 + 1];
+                }
                 int uniform_2 = make_warp_uniform(first_logical_1);
                 first_logical_1 = uniform_2;
                 int uniform_1_1 = make_warp_uniform(logical_end_1);
@@ -636,8 +689,6 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                     if (acc_stage == 2) { acc_stage = 0; _phase_q_full ^= 1; _phase_intra_empty ^= 1; }
                 }
             }
-            asm volatile("tcgen05.fence::before_thread_sync;");
-            asm volatile("barrier.sync 12, 352;" ::: "memory");
         }
     }
     // ---- Role: load_bc ----
@@ -646,41 +697,7 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
             unsigned int input_stage_2 = 0;
             unsigned int cb_input_stage = 0;
             unsigned int cb_acc_stage = 0;
-            int pe_work = bid;
             unsigned int _phase_bc_empty = 1;
-            if (pe_work < sequence_count * nheads) {
-                int pe_sequence = pe_work / nheads;
-                int pe_head = pe_work % nheads;
-                int pe_group = pe_head * ngroups / nheads;
-                int pe_first = pe_sequence * nchunks;
-                int pe_end = pe_first + nchunks;
-                int _uniform_0 = make_warp_uniform(pe_first);
-                pe_first = _uniform_0;
-                int _uniform_1 = make_warp_uniform(pe_end);
-                pe_end = _uniform_1;
-                int pe_batch = 0;
-                pe_batch = pe_sequence;
-                if (pe_first < pe_end) {
-                    int pe_physical = pe_first - pe_sequence * nchunks;
-                    int pe_token = pe_physical * 128;
-                    mbarrier_wait(bc_empty_addr + (input_stage_2) * 8, _phase_bc_empty);
-                    if (elect_sync()) {
-                        tma_5d_gmem2smem(smem_b_addr + input_stage_2 * 32768, (&b_map), 0, 0, pe_group, pe_token, pe_batch, bc_full_addr + (input_stage_2) * 8);
-                        tma_5d_gmem2smem(smem_b_addr + input_stage_2 * 32768 + 16384, (&b_map), 0, 1, pe_group, pe_token, pe_batch, bc_full_addr + (input_stage_2) * 8);
-                        tma_5d_gmem2smem(smem_c_addr + input_stage_2 * 32768, (&c_map), 0, 0, pe_group, pe_token, pe_batch, bc_full_addr + (input_stage_2) * 8);
-                        tma_5d_gmem2smem(smem_c_addr + input_stage_2 * 32768 + 16384, (&c_map), 0, 1, pe_group, pe_token, pe_batch, bc_full_addr + (input_stage_2) * 8);
-                        mbarrier_arrive_expect_tx(bc_full_addr + (input_stage_2) * 8, 65536);
-                    }
-                    input_stage_2 += 1;
-                    if (input_stage_2 == 2) { input_stage_2 = 0; _phase_bc_empty ^= 1; }
-                }
-            }
-            asm volatile("barrier.sync 11, 480;" ::: "memory");
-            taddr = tmem_addr_storage[0];
-            tmem_cb_tmem = taddr;
-            tmem_intra_tmem = taddr + 256;
-            tmem_state_delta_tmem = taddr + 384;
-            tmem_inter_tmem = taddr + 448;
             unsigned int _phase_bc_full_1 = 0;
             unsigned int _phase_cb_empty = 1;
             #pragma unroll 1
@@ -694,12 +711,36 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                 int item_hi_2 = 0;
                 int item_checkpoint_2 = -1;
                 int checkpoint_rank_2 = 1073741824;
+                if (metadata_from_cu_seqlens != 0) {
+                    int _max_1_2 = ((cu_seqlens[sequence_2]) > (0) ? (cu_seqlens[sequence_2]) : (0));
+                    int _min_0_2 = ((_max_1_2) < (seqlen) ? (_max_1_2) : (seqlen));
+                    item_lo_2 = _min_0_2;
+                    int _max_3_2 = ((cu_seqlens[sequence_2 + 1]) > (0) ? (cu_seqlens[sequence_2 + 1]) : (0));
+                    int _min_2_2 = ((_max_3_2) < (seqlen) ? (_max_3_2) : (seqlen));
+                    item_hi_2 = _min_2_2;
+                    int item_count_2 = 0;
+                    if (item_hi_2 > item_lo_2) {
+                        item_count_2 = (item_hi_2 + 127) / 128 - item_lo_2 / 128;
+                        if (checkpoint_state_count > 0) {
+                            int candidate_checkpoint_2 = checkpoint_token_indices[sequence_2];
+                            if (candidate_checkpoint_2 > item_lo_2 && candidate_checkpoint_2 < item_hi_2 && candidate_checkpoint_2 % 128 != 0) {
+                                item_checkpoint_2 = candidate_checkpoint_2;
+                                checkpoint_rank_2 = candidate_checkpoint_2 / 128 - item_lo_2 / 128 + 1;
+                                item_count_2 = item_count_2 + 1;
+                            }
+                        }
+                    }
+                    first_logical_2 = 0;
+                    logical_end_2 = item_count_2;
+                } else {
+                    first_logical_2 = seq_chunk_cumsum[sequence_2];
+                    logical_end_2 = seq_chunk_cumsum[sequence_2 + 1];
+                }
                 int uniform_3 = make_warp_uniform(first_logical_2);
                 first_logical_2 = uniform_3;
                 int uniform_1_2 = make_warp_uniform(logical_end_2);
                 logical_end_2 = uniform_1_2;
                 int physical_batch = 0;
-                physical_batch = sequence_2;
                 int refill_first = 0;
                 int next_work = work_2 + (unsigned int)num_bids;
                 if (next_work < sequence_count * nheads) {
@@ -709,26 +750,29 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                 if (item_chunks >= 32) {
                     refill_first = 1;
                 }
-                int _uniform_4 = make_warp_uniform(refill_first);
-                refill_first = _uniform_4;
+                int _uniform_2 = make_warp_uniform(refill_first);
+                refill_first = _uniform_2;
                 int next_physical = 0;
                 int next_token = 0;
                 if (first_logical_2 < logical_end_2) {
                     int chunk = first_logical_2 - sequence_2 * nchunks;
-                    int first_token = chunk * 128;
-                    if (work_2 != (unsigned int)bid) {
-                        mbarrier_wait(bc_empty_addr + (input_stage_2) * 8, _phase_bc_empty);
-                        if (elect_sync()) {
-                            tma_5d_gmem2smem(smem_b_addr + input_stage_2 * 32768, (&b_map), 0, 0, group, first_token, physical_batch, bc_full_addr + (input_stage_2) * 8);
-                            tma_5d_gmem2smem(smem_b_addr + input_stage_2 * 32768 + 16384, (&b_map), 0, 1, group, first_token, physical_batch, bc_full_addr + (input_stage_2) * 8);
-                            tma_5d_gmem2smem(smem_c_addr + input_stage_2 * 32768, (&c_map), 0, 0, group, first_token, physical_batch, bc_full_addr + (input_stage_2) * 8);
-                            tma_5d_gmem2smem(smem_c_addr + input_stage_2 * 32768 + 16384, (&c_map), 0, 1, group, first_token, physical_batch, bc_full_addr + (input_stage_2) * 8);
-                            asm volatile("tcgen05.fence::before_thread_sync;");
-                            mbarrier_arrive_expect_tx(bc_full_addr + (input_stage_2) * 8, 65536);
-                        }
-                        input_stage_2 += 1;
-                        if (input_stage_2 == 2) { input_stage_2 = 0; _phase_bc_empty ^= 1; }
+                    if (metadata_from_cu_seqlens != 0) {
+                        chunk = ((first_logical_2 > checkpoint_rank_2) ? (item_lo_2 / 128 + first_logical_2 - 1) * 128 : ((first_logical_2 == checkpoint_rank_2) ? item_checkpoint_2 : ((first_logical_2 == 0) ? item_lo_2 : (item_lo_2 / 128 + first_logical_2) * 128))) / 128;
+                    } else {
+                        chunk = chunk_indices[first_logical_2];
                     }
+                    int first_token = chunk * 128;
+                    mbarrier_wait(bc_empty_addr + (input_stage_2) * 8, _phase_bc_empty);
+                    if (elect_sync()) {
+                        tma_5d_gmem2smem(smem_b_addr + input_stage_2 * 32768, (&b_map), 0, 0, group, first_token, physical_batch, bc_full_addr + (input_stage_2) * 8);
+                        tma_5d_gmem2smem(smem_b_addr + input_stage_2 * 32768 + 16384, (&b_map), 0, 1, group, first_token, physical_batch, bc_full_addr + (input_stage_2) * 8);
+                        tma_5d_gmem2smem(smem_c_addr + input_stage_2 * 32768, (&c_map), 0, 0, group, first_token, physical_batch, bc_full_addr + (input_stage_2) * 8);
+                        tma_5d_gmem2smem(smem_c_addr + input_stage_2 * 32768 + 16384, (&c_map), 0, 1, group, first_token, physical_batch, bc_full_addr + (input_stage_2) * 8);
+                        asm volatile("tcgen05.fence::before_thread_sync;");
+                        mbarrier_arrive_expect_tx(bc_full_addr + (input_stage_2) * 8, 65536);
+                    }
+                    input_stage_2 += 1;
+                    if (input_stage_2 == 2) { input_stage_2 = 0; _phase_bc_empty ^= 1; }
                 }
                 #pragma unroll 1
                 for (int logical_2 = first_logical_2; logical_2 < logical_end_2; logical_2++) {
@@ -736,6 +780,11 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                     if (logical_end_2 > logical_2 + 1) {
                         if (refill_before_cb != 0) {
                             int chunk_1 = logical_2 + 1 - sequence_2 * nchunks;
+                            if (metadata_from_cu_seqlens != 0) {
+                                chunk_1 = ((checkpoint_rank_2 < logical_2 + 1) ? (item_lo_2 / 128 + (logical_2 + 1) - 1) * 128 : ((logical_2 + 1 == checkpoint_rank_2) ? item_checkpoint_2 : ((logical_2 + 1 == 0) ? item_lo_2 : (item_lo_2 / 128 + (logical_2 + 1)) * 128))) / 128;
+                            } else {
+                                chunk_1 = chunk_indices[logical_2 + 1];
+                            }
                             next_physical = chunk_1;
                             next_token = next_physical * 128;
                             mbarrier_wait(bc_empty_addr + (input_stage_2) * 8, _phase_bc_empty);
@@ -757,45 +806,45 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                     int _mma_a_lo_0 = make_warp_uniform((((smem_c_addr) >> 4) & 0x7FFF) + (cb_input_stage) * 2048);
                     int _mma_b_lo_0 = make_warp_uniform((((smem_b_addr) >> 4) & 0x7FFF) + (cb_input_stage) * 2048);
                     {
-                        uint64_t _mma_ss_a_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_0);
-                        uint64_t _mma_ss_b_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_0);
+                        uint64_t _mma_ss_a_desc_4 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_a_lo_0);
+                        uint64_t _mma_ss_b_desc_4 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(_mma_b_lo_0);
                         if (elect_sync()) {
-                            tcgen05_mma_f16((tmem_cb_tmem + (cb_acc_stage * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 136316048, 0);
+                            tcgen05_mma_f16((tmem_cb_tmem + (cb_acc_stage * 128)), _mma_ss_a_desc_4, _mma_ss_b_desc_4, 136316048, 0);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_4, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16((tmem_cb_tmem + (cb_acc_stage * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 136316048, 1);
+                            tcgen05_mma_f16((tmem_cb_tmem + (cb_acc_stage * 128)), _mma_ss_a_desc_4, _mma_ss_b_desc_4, 136316048, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_4, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16((tmem_cb_tmem + (cb_acc_stage * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 136316048, 1);
+                            tcgen05_mma_f16((tmem_cb_tmem + (cb_acc_stage * 128)), _mma_ss_a_desc_4, _mma_ss_b_desc_4, 136316048, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_4, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16((tmem_cb_tmem + (cb_acc_stage * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 136316048, 1);
+                            tcgen05_mma_f16((tmem_cb_tmem + (cb_acc_stage * 128)), _mma_ss_a_desc_4, _mma_ss_b_desc_4, 136316048, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_0, 1018U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_0, 1018U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_4, 1018U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_4, 1018U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16((tmem_cb_tmem + (cb_acc_stage * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 136316048, 1);
+                            tcgen05_mma_f16((tmem_cb_tmem + (cb_acc_stage * 128)), _mma_ss_a_desc_4, _mma_ss_b_desc_4, 136316048, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_4, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16((tmem_cb_tmem + (cb_acc_stage * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 136316048, 1);
+                            tcgen05_mma_f16((tmem_cb_tmem + (cb_acc_stage * 128)), _mma_ss_a_desc_4, _mma_ss_b_desc_4, 136316048, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_4, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16((tmem_cb_tmem + (cb_acc_stage * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 136316048, 1);
+                            tcgen05_mma_f16((tmem_cb_tmem + (cb_acc_stage * 128)), _mma_ss_a_desc_4, _mma_ss_b_desc_4, 136316048, 1);
                         }
-                        incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
-                        incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+                        incr_smem_desc_lo(_mma_ss_a_desc_4, 2U);
+                        incr_smem_desc_lo(_mma_ss_b_desc_4, 2U);
                         if (elect_sync()) {
-                            tcgen05_mma_f16((tmem_cb_tmem + (cb_acc_stage * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 136316048, 1);
+                            tcgen05_mma_f16((tmem_cb_tmem + (cb_acc_stage * 128)), _mma_ss_a_desc_4, _mma_ss_b_desc_4, 136316048, 1);
                         }
                     }
                     elect_commit(cb_full_addr + (cb_acc_stage) * 8);
@@ -807,6 +856,11 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                     if (logical_end_2 > logical_2 + 1) {
                         if (refill_before_cb == 0) {
                             int chunk_2 = logical_2 + 1 - sequence_2 * nchunks;
+                            if (metadata_from_cu_seqlens != 0) {
+                                chunk_2 = ((checkpoint_rank_2 < logical_2 + 1) ? (item_lo_2 / 128 + (logical_2 + 1) - 1) * 128 : ((logical_2 + 1 == checkpoint_rank_2) ? item_checkpoint_2 : ((logical_2 + 1 == 0) ? item_lo_2 : (item_lo_2 / 128 + (logical_2 + 1)) * 128))) / 128;
+                            } else {
+                                chunk_2 = chunk_indices[logical_2 + 1];
+                            }
                             next_physical = chunk_2;
                             next_token = next_physical * 128;
                             mbarrier_wait(bc_empty_addr + (input_stage_2) * 8, _phase_bc_empty);
@@ -824,8 +878,6 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                     }
                 }
             }
-            asm volatile("tcgen05.fence::before_thread_sync;");
-            asm volatile("barrier.sync 12, 352;" ::: "memory");
         }
     }
     // ---- Role: load_x_dt ----
@@ -843,6 +895,31 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                 int item_hi_3 = 0;
                 int item_checkpoint_3 = -1;
                 int checkpoint_rank_3 = 1073741824;
+                if (metadata_from_cu_seqlens != 0) {
+                    int _max_1_3 = ((cu_seqlens[sequence_3]) > (0) ? (cu_seqlens[sequence_3]) : (0));
+                    int _min_0_3 = ((_max_1_3) < (seqlen) ? (_max_1_3) : (seqlen));
+                    item_lo_3 = _min_0_3;
+                    int _max_3_3 = ((cu_seqlens[sequence_3 + 1]) > (0) ? (cu_seqlens[sequence_3 + 1]) : (0));
+                    int _min_2_3 = ((_max_3_3) < (seqlen) ? (_max_3_3) : (seqlen));
+                    item_hi_3 = _min_2_3;
+                    int item_count_3 = 0;
+                    if (item_hi_3 > item_lo_3) {
+                        item_count_3 = (item_hi_3 + 127) / 128 - item_lo_3 / 128;
+                        if (checkpoint_state_count > 0) {
+                            int candidate_checkpoint_3 = checkpoint_token_indices[sequence_3];
+                            if (candidate_checkpoint_3 > item_lo_3 && candidate_checkpoint_3 < item_hi_3 && candidate_checkpoint_3 % 128 != 0) {
+                                item_checkpoint_3 = candidate_checkpoint_3;
+                                checkpoint_rank_3 = candidate_checkpoint_3 / 128 - item_lo_3 / 128 + 1;
+                                item_count_3 = item_count_3 + 1;
+                            }
+                        }
+                    }
+                    first_logical_3 = 0;
+                    logical_end_3 = item_count_3;
+                } else {
+                    first_logical_3 = seq_chunk_cumsum[sequence_3];
+                    logical_end_3 = seq_chunk_cumsum[sequence_3 + 1];
+                }
                 int uniform_4 = make_warp_uniform(first_logical_3);
                 first_logical_3 = uniform_4;
                 int uniform_1_3 = make_warp_uniform(logical_end_3);
@@ -855,23 +932,44 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                     int physical_chunk = logical_3 - sequence_3 * nchunks;
                     int segment_offset = 0;
                     int segment_limit = 128;
+                    if (metadata_from_cu_seqlens != 0) {
+                        int first_chunk = item_lo_3 / 128;
+                        int segment_start = ((checkpoint_rank_3 < logical_3) ? (first_chunk + logical_3 - 1) * 128 : ((logical_3 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 == 0) ? item_lo_3 : (first_chunk + logical_3) * 128)));
+                        int segment_end = ((((checkpoint_rank_3 < logical_3 + 1) ? (first_chunk + (logical_3 + 1) - 1) * 128 : ((logical_3 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 == 0) ? item_lo_3 : (first_chunk + (logical_3 + 1)) * 128)))) < (item_hi_3) ? (((checkpoint_rank_3 < logical_3 + 1) ? (first_chunk + (logical_3 + 1) - 1) * 128 : ((logical_3 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 == 0) ? item_lo_3 : (first_chunk + (logical_3 + 1)) * 128)))) : (item_hi_3));
+                        physical_chunk = segment_start / 128;
+                        segment_offset = segment_start - physical_chunk * 128;
+                        segment_limit = segment_end - physical_chunk * 128;
+                    } else {
+                        physical_chunk = chunk_indices[logical_3];
+                        segment_offset = chunk_offsets[logical_3];
+                        if (logical_3 + 1 < num_logical_chunks) {
+                            int next_chunk = chunk_indices[logical_3 + 1];
+                            if (next_chunk == physical_chunk) {
+                                segment_limit = chunk_offsets[logical_3 + 1];
+                            }
+                        }
+                    }
                     int chunk_tokens = seqlen - physical_chunk * 128;
                     if (chunk_tokens > 128) {
                         chunk_tokens = 128;
                     }
+                    if (segment_limit > chunk_tokens) {
+                        segment_limit = chunk_tokens;
+                    }
                     int physical_batch_1 = 0;
-                    physical_batch_1 = sequence_3;
                     int token_in_batch = physical_chunk * 128;
                     int physical_start = physical_batch_1 * seqlen + token_in_batch;
+                    int geometry_word = segment_offset + segment_limit * 256 + chunk_tokens * 65536;
                     int publish_end = chunk_tokens;
+                    publish_end = segment_limit;
                     int prefetch_base = lane * 4;
                     float lane_raw[4];
                     if (have_next == 0) {
                         int prefetch_last = publish_end - 1;
                         #pragma unroll
                         for (int local = 0; local < 4; local++) {
-                            int _min_0 = ((prefetch_last) < (prefetch_base + local) ? (prefetch_last) : (prefetch_base + local));
-                            lane_raw[local] = dt[(physical_start + _min_0) * nheads + head_1];
+                            int _min_4 = ((prefetch_last) < (prefetch_base + local) ? (prefetch_last) : (prefetch_base + local));
+                            lane_raw[local] = dt[(physical_start + _min_4) * nheads + head_1];
                         }
                     }
                     int has_next_chunk = 0;
@@ -886,19 +984,40 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                         int physical_chunk_1 = logical_3 + 1 - sequence_3 * nchunks;
                         int segment_offset_0 = 0;
                         int segment_limit_0 = 128;
+                        if (metadata_from_cu_seqlens != 0) {
+                            int first_chunk_1 = item_lo_3 / 128;
+                            int segment_start_1 = ((checkpoint_rank_3 < logical_3 + 1) ? (first_chunk_1 + (logical_3 + 1) - 1) * 128 : ((logical_3 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 == 0) ? item_lo_3 : (first_chunk_1 + (logical_3 + 1)) * 128)));
+                            int segment_end_1 = ((((checkpoint_rank_3 < logical_3 + 1 + 1) ? (first_chunk_1 + (logical_3 + 1 + 1) - 1) * 128 : ((logical_3 + 1 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 + 1 == 0) ? item_lo_3 : (first_chunk_1 + (logical_3 + 1 + 1)) * 128)))) < (item_hi_3) ? (((checkpoint_rank_3 < logical_3 + 1 + 1) ? (first_chunk_1 + (logical_3 + 1 + 1) - 1) * 128 : ((logical_3 + 1 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 + 1 == 0) ? item_lo_3 : (first_chunk_1 + (logical_3 + 1 + 1)) * 128)))) : (item_hi_3));
+                            physical_chunk_1 = segment_start_1 / 128;
+                            segment_offset_0 = segment_start_1 - physical_chunk_1 * 128;
+                            segment_limit_0 = segment_end_1 - physical_chunk_1 * 128;
+                        } else {
+                            physical_chunk_1 = chunk_indices[logical_3 + 1];
+                            segment_offset_0 = chunk_offsets[logical_3 + 1];
+                            if (logical_3 + 1 + 1 < num_logical_chunks) {
+                                int next_chunk_1 = chunk_indices[logical_3 + 1 + 1];
+                                if (next_chunk_1 == physical_chunk_1) {
+                                    segment_limit_0 = chunk_offsets[logical_3 + 1 + 1];
+                                }
+                            }
+                        }
                         int chunk_tokens_0 = seqlen - physical_chunk_1 * 128;
                         if (chunk_tokens_0 > 128) {
                             chunk_tokens_0 = 128;
                         }
+                        if (segment_limit_0 > chunk_tokens_0) {
+                            segment_limit_0 = chunk_tokens_0;
+                        }
                         next_segment_offset = segment_offset_0;
                         next_chunk_tokens = chunk_tokens_0;
                         next_publish_end = chunk_tokens_0;
+                        next_publish_end = segment_limit_0;
                         int next_start = physical_batch_1 * seqlen + physical_chunk_1 * 128;
                         int next_last = next_publish_end - 1;
                         #pragma unroll
                         for (int local_1 = 0; local_1 < 4; local_1++) {
-                            int _min_1 = ((next_last) < (prefetch_base + local_1) ? (next_last) : (prefetch_base + local_1));
-                            raw_next[local_1] = dt[(next_start + _min_1) * nheads + head_1];
+                            int _min_5 = ((next_last) < (prefetch_base + local_1) ? (next_last) : (prefetch_base + local_1));
+                            raw_next[local_1] = dt[(next_start + _min_5) * nheads + head_1];
                         }
                     }
                     mbarrier_wait(aux_empty_addr + (input_stage_3) * 8, _phase_aux_empty);
@@ -906,6 +1025,7 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                     if (elect_sync()) {
                         tma_4d_gmem2smem(smem_x_tma_addr + input_stage_3 * 16384, (&x_map), 0, head_1, token_in_batch, physical_batch_1, x_full_addr + (input_stage_3) * 8);
                         mbarrier_arrive_expect_tx(x_full_addr + (input_stage_3) * 8, 16384);
+                        smem_geometry[input_stage_3] = geometry_word;
                     }
                     if (have_next == 0) {
                         float a_value = A[head_1];
@@ -925,11 +1045,11 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                                     if (biased <= 20.0f) {
                                         float scaled;
                                         asm("mul.rn.f32 %0, %1, %2;" : "=f"(scaled) : "f"(biased), "f"(1.442695f));
-                                        float _exp2_2 = approx_exp2(scaled);
+                                        float _exp2_6 = approx_exp2(scaled);
                                         float softplus_arg;
-                                        asm("add.rn.f32 %0, %1, %2;" : "=f"(softplus_arg) : "f"(_exp2_2), "f"(1.0f));
-                                        float _log_3 = __nv_logf(softplus_arg);
-                                        transformed = _log_3;
+                                        asm("add.rn.f32 %0, %1, %2;" : "=f"(softplus_arg) : "f"(_exp2_6), "f"(1.0f));
+                                        float _log_7 = __nv_logf(softplus_arg);
+                                        transformed = _log_7;
                                     }
                                 }
                                 if (transformed < dt_min) {
@@ -951,15 +1071,15 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                             float scan_offset_1[4];
                             scan_offset_1[0] = lane_product[0];
                             if (block_lane >= 1) {
-                                float _fma_4;
-                                asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_4) : "f"(lane_dt[0]), "f"(a_value), "f"(previous_product));
-                                scan_offset_1[0] = _fma_4;
+                                float _fma_8;
+                                asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_8) : "f"(lane_dt[0]), "f"(a_value), "f"(previous_product));
+                                scan_offset_1[0] = _fma_8;
                             }
                             #pragma unroll
                             for (int local_3 = 1; local_3 < 4; local_3++) {
-                                float _fma_5;
-                                asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_5) : "f"(lane_dt[local_3]), "f"(a_value), "f"(lane_product[local_3 - 1]));
-                                scan_offset_1[local_3] = _fma_5;
+                                float _fma_9;
+                                asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_9) : "f"(lane_dt[local_3]), "f"(a_value), "f"(lane_product[local_3 - 1]));
+                                scan_offset_1[local_3] = _fma_9;
                             }
                             float previous_scan_1_2 = __shfl_up_sync(0xFFFFFFFF, scan_offset_1[2], 1, 4);
                             float previous_scan_1_3 = __shfl_up_sync(0xFFFFFFFF, scan_offset_1[3], 1, 4);
@@ -967,28 +1087,28 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                             scan_offset_2[0] = scan_offset_1[0];
                             scan_offset_2[1] = scan_offset_1[1];
                             if (block_lane >= 1) {
-                                float _add_6;
-                                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_6) : "f"(previous_scan_1_2), "f"(scan_offset_1[0]));
-                                scan_offset_2[0] = _add_6;
-                                float _add_7;
-                                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_7) : "f"(previous_scan_1_3), "f"(scan_offset_1[1]));
-                                scan_offset_2[1] = _add_7;
+                                float _add_10;
+                                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_10) : "f"(previous_scan_1_2), "f"(scan_offset_1[0]));
+                                scan_offset_2[0] = _add_10;
+                                float _add_11;
+                                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_11) : "f"(previous_scan_1_3), "f"(scan_offset_1[1]));
+                                scan_offset_2[1] = _add_11;
                             }
-                            float _add_8;
-                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_8) : "f"(scan_offset_1[0]), "f"(scan_offset_1[2]));
-                            scan_offset_2[2] = _add_8;
-                            float _add_9;
-                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_9) : "f"(scan_offset_1[1]), "f"(scan_offset_1[3]));
-                            scan_offset_2[3] = _add_9;
+                            float _add_12;
+                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_12) : "f"(scan_offset_1[0]), "f"(scan_offset_1[2]));
+                            scan_offset_2[2] = _add_12;
+                            float _add_13;
+                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_13) : "f"(scan_offset_1[1]), "f"(scan_offset_1[3]));
+                            scan_offset_2[3] = _add_13;
                             float scan_offset_4[4];
                             #pragma unroll
                             for (int local_4 = 0; local_4 < 4; local_4++) {
                                 float previous_scan_2 = __shfl_up_sync(0xFFFFFFFF, scan_offset_2[local_4], 1, 4);
                                 scan_offset_4[local_4] = scan_offset_2[local_4];
                                 if (block_lane >= 1) {
-                                    float _add_10;
-                                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_10) : "f"(previous_scan_2), "f"(scan_offset_2[local_4]));
-                                    scan_offset_4[local_4] = _add_10;
+                                    float _add_14;
+                                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_14) : "f"(previous_scan_2), "f"(scan_offset_2[local_4]));
+                                    scan_offset_4[local_4] = _add_14;
                                 }
                             }
                             #pragma unroll
@@ -996,9 +1116,9 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                                 float previous_scan_4 = __shfl_up_sync(0xFFFFFFFF, scan_offset_4[local_5], 2, 4);
                                 lane_scan[local_5] = scan_offset_4[local_5];
                                 if (block_lane >= 2) {
-                                    float _add_11;
-                                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_11) : "f"(previous_scan_4), "f"(scan_offset_4[local_5]));
-                                    lane_scan[local_5] = _add_11;
+                                    float _add_15;
+                                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_15) : "f"(previous_scan_4), "f"(scan_offset_4[local_5]));
+                                    lane_scan[local_5] = _add_15;
                                 }
                             }
                             int block_index = lane / 4;
@@ -1009,9 +1129,9 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                                     if (block == 0) {
                                         running = block_total;
                                     } else {
-                                        float _add_12;
-                                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_12) : "f"(running), "f"(block_total));
-                                        running = _add_12;
+                                        float _add_16;
+                                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_16) : "f"(running), "f"(block_total));
+                                        running = _add_16;
                                     }
                                 }
                             }
@@ -1020,19 +1140,19 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                             }
                         } else {
                             lane_scan[0] = lane_product[0];
-                            float _fma_13;
-                            asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_13) : "f"(lane_dt[1]), "f"(a_value), "f"(lane_product[0]));
-                            lane_scan[1] = _fma_13;
+                            float _fma_17;
+                            asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_17) : "f"(lane_dt[1]), "f"(a_value), "f"(lane_product[0]));
+                            lane_scan[1] = _fma_17;
                             float group_pair_12;
                             asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(group_pair_12) : "f"(lane_dt[2]), "f"(a_value), "f"(lane_product[1]));
-                            float _add_14;
-                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_14) : "f"(group_pair_12), "f"(lane_product[0]));
-                            lane_scan[2] = _add_14;
+                            float _add_18;
+                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_18) : "f"(group_pair_12), "f"(lane_product[0]));
+                            lane_scan[2] = _add_18;
                             float group_pair_23;
                             asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(group_pair_23) : "f"(lane_dt[3]), "f"(a_value), "f"(lane_product[2]));
-                            float _add_15;
-                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_15) : "f"(group_pair_23), "f"(lane_scan[1]));
-                            lane_scan[3] = _add_15;
+                            float _add_19;
+                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_19) : "f"(group_pair_23), "f"(lane_scan[1]));
+                            lane_scan[3] = _add_19;
                             #pragma unroll
                             for (int group_1 = 0; group_1 < 32; group_1++) {
                                 float group_total = __shfl_sync(0xFFFFFFFF, lane_scan[3], group_1);
@@ -1040,9 +1160,9 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                                     if (group_1 == 0) {
                                         running = group_total;
                                     } else {
-                                        float _add_16;
-                                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_16) : "f"(running), "f"(group_total));
-                                        running = _add_16;
+                                        float _add_20;
+                                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_20) : "f"(running), "f"(group_total));
+                                        running = _add_20;
                                     }
                                 }
                             }
@@ -1055,9 +1175,9 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                         for (int local_6 = 0; local_6 < 4; local_6++) {
                             float value = lane_scan[local_6];
                             if (has_carry != 0) {
-                                float _add_17;
-                                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_17) : "f"(value), "f"(running));
-                                value = _add_17;
+                                float _add_21;
+                                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_21) : "f"(value), "f"(running));
+                                value = _add_21;
                             }
                             physical_cumsum[local_6] = value;
                         }
@@ -1077,52 +1197,36 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                             segment_base = base_broadcast;
                         }
                         float fill_broadcast = 0.0f;
-                        int fill_token = chunk_tokens - 1;
-                        int fill_lane = fill_token / 4;
-                        int fill_slot = fill_token % 4;
-                        float _shfl_sync_18 = __shfl_sync(0xFFFFFFFF, physical_cumsum[0], fill_lane);
-                        fill_broadcast = _shfl_sync_18;
-                        #pragma unroll
-                        for (int local_8 = 1; local_8 < 4; local_8++) {
-                            float fill_slot_value = __shfl_sync(0xFFFFFFFF, physical_cumsum[local_8], fill_lane);
-                            if (fill_slot == local_8) {
-                                fill_broadcast = fill_slot_value;
-                            }
-                        }
                         float lane_cumsum[4];
                         float lane_delta[4];
                         #pragma unroll
-                        for (int local_9 = 0; local_9 < 4; local_9++) {
-                            int physical_token_1 = token_base + local_9;
+                        for (int local_8 = 0; local_8 < 4; local_8++) {
+                            int physical_token_1 = token_base + local_8;
                             float cumsum_value = 0.0f;
                             float delta_value = 0.0f;
-                            if (physical_token_1 < chunk_tokens) {
-                                float _sub_19;
-                                asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_19) : "f"(physical_cumsum[local_9]), "f"(segment_base));
-                                cumsum_value = _sub_19;
-                                float bounded = fminf(max_noftz(lane_dt[local_9], -65504.0f), 65504.0f);
+                            if (physical_token_1 >= segment_offset && physical_token_1 < publish_end) {
+                                float _sub_22;
+                                asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_22) : "f"(physical_cumsum[local_8]), "f"(segment_base));
+                                cumsum_value = _sub_22;
+                                float bounded = fminf(max_noftz(lane_dt[local_8], -65504.0f), 65504.0f);
                                 __half delta_half = (__half)bounded;
                                 delta_value = (float)delta_half;
-                            } else {
-                                float _sub_20;
-                                asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_20) : "f"(fill_broadcast), "f"(segment_base));
-                                cumsum_value = _sub_20;
                             }
-                            lane_cumsum[local_9] = cumsum_value;
-                            lane_delta[local_9] = delta_value;
+                            lane_cumsum[local_8] = cumsum_value;
+                            lane_delta[local_8] = delta_value;
                         }
                         #pragma unroll
-                        for (int local_10 = 0; local_10 < 4; local_10++) {
-                            next_cumsum[local_10] = lane_cumsum[local_10];
-                            next_delta[local_10] = lane_delta[local_10];
+                        for (int local_9 = 0; local_9 < 4; local_9++) {
+                            next_cumsum[local_9] = lane_cumsum[local_9];
+                            next_delta[local_9] = lane_delta[local_9];
                         }
                     }
                     int token_base_1 = lane * 4;
                     #pragma unroll
-                    for (int local_11 = 0; local_11 < 4; local_11++) {
-                        int physical_token_2 = token_base_1 + local_11;
-                        smem_cumsum_all[input_stage_3 * 128 + (unsigned int)physical_token_2] = next_cumsum[local_11];
-                        smem_delta_all[input_stage_3 * 128 + (unsigned int)physical_token_2] = next_delta[local_11];
+                    for (int local_10 = 0; local_10 < 4; local_10++) {
+                        int physical_token_2 = token_base_1 + local_10;
+                        smem_cumsum_all[input_stage_3 * 128 + (unsigned int)physical_token_2] = next_cumsum[local_10];
+                        smem_delta_all[input_stage_3 * 128 + (unsigned int)physical_token_2] = next_delta[local_10];
                     }
                     __syncwarp();
                     if (elect_sync()) {
@@ -1138,22 +1242,22 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                         float lane_dt_1[4];
                         float lane_product_1[4];
                         #pragma unroll
-                        for (int local_12 = 0; local_12 < 4; local_12++) {
-                            int physical_token_3 = token_base_1_1 + local_12;
+                        for (int local_11 = 0; local_11 < 4; local_11++) {
+                            int physical_token_3 = token_base_1_1 + local_11;
                             float transformed_1 = 0.0f;
                             if (physical_token_3 < next_publish_end) {
                                 float biased_1;
-                                asm("add.rn.f32 %0, %1, %2;" : "=f"(biased_1) : "f"(raw_next[local_12]), "f"(bias_value_1));
+                                asm("add.rn.f32 %0, %1, %2;" : "=f"(biased_1) : "f"(raw_next[local_11]), "f"(bias_value_1));
                                 transformed_1 = biased_1;
                                 if (dt_softplus != 0) {
                                     if (biased_1 <= 20.0f) {
                                         float scaled_1;
                                         asm("mul.rn.f32 %0, %1, %2;" : "=f"(scaled_1) : "f"(biased_1), "f"(1.442695f));
-                                        float _exp2_21 = approx_exp2(scaled_1);
+                                        float _exp2_23 = approx_exp2(scaled_1);
                                         float softplus_arg_1;
-                                        asm("add.rn.f32 %0, %1, %2;" : "=f"(softplus_arg_1) : "f"(_exp2_21), "f"(1.0f));
-                                        float _log_22 = __nv_logf(softplus_arg_1);
-                                        transformed_1 = _log_22;
+                                        asm("add.rn.f32 %0, %1, %2;" : "=f"(softplus_arg_1) : "f"(_exp2_23), "f"(1.0f));
+                                        float _log_24 = __nv_logf(softplus_arg_1);
+                                        transformed_1 = _log_24;
                                     }
                                 }
                                 if (transformed_1 < dt_min) {
@@ -1163,8 +1267,8 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                                     transformed_1 = dt_max;
                                 }
                             }
-                            lane_dt_1[local_12] = transformed_1;
-                            lane_product_1[local_12] = mul_f32_rn_noftz(transformed_1, a_value_1);
+                            lane_dt_1[local_11] = transformed_1;
+                            lane_product_1[local_11] = mul_f32_rn_noftz(transformed_1, a_value_1);
                         }
                         float lane_scan_1[4];
                         float running_1 = 0.0f;
@@ -1175,15 +1279,15 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                             float scan_offset_1_1[4];
                             scan_offset_1_1[0] = lane_product_1[0];
                             if (block_lane_1 >= 1) {
-                                float _fma_23;
-                                asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_23) : "f"(lane_dt_1[0]), "f"(a_value_1), "f"(previous_product_1));
-                                scan_offset_1_1[0] = _fma_23;
+                                float _fma_25;
+                                asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_25) : "f"(lane_dt_1[0]), "f"(a_value_1), "f"(previous_product_1));
+                                scan_offset_1_1[0] = _fma_25;
                             }
                             #pragma unroll
-                            for (int local_13 = 1; local_13 < 4; local_13++) {
-                                float _fma_24;
-                                asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_24) : "f"(lane_dt_1[local_13]), "f"(a_value_1), "f"(lane_product_1[local_13 - 1]));
-                                scan_offset_1_1[local_13] = _fma_24;
+                            for (int local_12 = 1; local_12 < 4; local_12++) {
+                                float _fma_26;
+                                asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_26) : "f"(lane_dt_1[local_12]), "f"(a_value_1), "f"(lane_product_1[local_12 - 1]));
+                                scan_offset_1_1[local_12] = _fma_26;
                             }
                             float previous_scan_1_2_1 = __shfl_up_sync(0xFFFFFFFF, scan_offset_1_1[2], 1, 4);
                             float previous_scan_1_3_1 = __shfl_up_sync(0xFFFFFFFF, scan_offset_1_1[3], 1, 4);
@@ -1191,38 +1295,38 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                             scan_offset_2_1[0] = scan_offset_1_1[0];
                             scan_offset_2_1[1] = scan_offset_1_1[1];
                             if (block_lane_1 >= 1) {
-                                float _add_25;
-                                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_25) : "f"(previous_scan_1_2_1), "f"(scan_offset_1_1[0]));
-                                scan_offset_2_1[0] = _add_25;
-                                float _add_26;
-                                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_26) : "f"(previous_scan_1_3_1), "f"(scan_offset_1_1[1]));
-                                scan_offset_2_1[1] = _add_26;
+                                float _add_27;
+                                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_27) : "f"(previous_scan_1_2_1), "f"(scan_offset_1_1[0]));
+                                scan_offset_2_1[0] = _add_27;
+                                float _add_28;
+                                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_28) : "f"(previous_scan_1_3_1), "f"(scan_offset_1_1[1]));
+                                scan_offset_2_1[1] = _add_28;
                             }
-                            float _add_27;
-                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_27) : "f"(scan_offset_1_1[0]), "f"(scan_offset_1_1[2]));
-                            scan_offset_2_1[2] = _add_27;
-                            float _add_28;
-                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_28) : "f"(scan_offset_1_1[1]), "f"(scan_offset_1_1[3]));
-                            scan_offset_2_1[3] = _add_28;
+                            float _add_29;
+                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_29) : "f"(scan_offset_1_1[0]), "f"(scan_offset_1_1[2]));
+                            scan_offset_2_1[2] = _add_29;
+                            float _add_30;
+                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_30) : "f"(scan_offset_1_1[1]), "f"(scan_offset_1_1[3]));
+                            scan_offset_2_1[3] = _add_30;
                             float scan_offset_4_1[4];
                             #pragma unroll
-                            for (int local_14 = 0; local_14 < 4; local_14++) {
-                                float previous_scan_2_1 = __shfl_up_sync(0xFFFFFFFF, scan_offset_2_1[local_14], 1, 4);
-                                scan_offset_4_1[local_14] = scan_offset_2_1[local_14];
+                            for (int local_13 = 0; local_13 < 4; local_13++) {
+                                float previous_scan_2_1 = __shfl_up_sync(0xFFFFFFFF, scan_offset_2_1[local_13], 1, 4);
+                                scan_offset_4_1[local_13] = scan_offset_2_1[local_13];
                                 if (block_lane_1 >= 1) {
-                                    float _add_29;
-                                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_29) : "f"(previous_scan_2_1), "f"(scan_offset_2_1[local_14]));
-                                    scan_offset_4_1[local_14] = _add_29;
+                                    float _add_31;
+                                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_31) : "f"(previous_scan_2_1), "f"(scan_offset_2_1[local_13]));
+                                    scan_offset_4_1[local_13] = _add_31;
                                 }
                             }
                             #pragma unroll
-                            for (int local_15 = 0; local_15 < 4; local_15++) {
-                                float previous_scan_4_1 = __shfl_up_sync(0xFFFFFFFF, scan_offset_4_1[local_15], 2, 4);
-                                lane_scan_1[local_15] = scan_offset_4_1[local_15];
+                            for (int local_14 = 0; local_14 < 4; local_14++) {
+                                float previous_scan_4_1 = __shfl_up_sync(0xFFFFFFFF, scan_offset_4_1[local_14], 2, 4);
+                                lane_scan_1[local_14] = scan_offset_4_1[local_14];
                                 if (block_lane_1 >= 2) {
-                                    float _add_30;
-                                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_30) : "f"(previous_scan_4_1), "f"(scan_offset_4_1[local_15]));
-                                    lane_scan_1[local_15] = _add_30;
+                                    float _add_32;
+                                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_32) : "f"(previous_scan_4_1), "f"(scan_offset_4_1[local_14]));
+                                    lane_scan_1[local_14] = _add_32;
                                 }
                             }
                             int block_index_1 = lane / 4;
@@ -1233,9 +1337,9 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                                     if (block_1 == 0) {
                                         running_1 = block_total_1;
                                     } else {
-                                        float _add_31;
-                                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_31) : "f"(running_1), "f"(block_total_1));
-                                        running_1 = _add_31;
+                                        float _add_33;
+                                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_33) : "f"(running_1), "f"(block_total_1));
+                                        running_1 = _add_33;
                                     }
                                 }
                             }
@@ -1244,19 +1348,19 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                             }
                         } else {
                             lane_scan_1[0] = lane_product_1[0];
-                            float _fma_32;
-                            asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_32) : "f"(lane_dt_1[1]), "f"(a_value_1), "f"(lane_product_1[0]));
-                            lane_scan_1[1] = _fma_32;
+                            float _fma_34;
+                            asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_34) : "f"(lane_dt_1[1]), "f"(a_value_1), "f"(lane_product_1[0]));
+                            lane_scan_1[1] = _fma_34;
                             float group_pair_12_1;
                             asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(group_pair_12_1) : "f"(lane_dt_1[2]), "f"(a_value_1), "f"(lane_product_1[1]));
-                            float _add_33;
-                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_33) : "f"(group_pair_12_1), "f"(lane_product_1[0]));
-                            lane_scan_1[2] = _add_33;
+                            float _add_35;
+                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_35) : "f"(group_pair_12_1), "f"(lane_product_1[0]));
+                            lane_scan_1[2] = _add_35;
                             float group_pair_23_1;
                             asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(group_pair_23_1) : "f"(lane_dt_1[3]), "f"(a_value_1), "f"(lane_product_1[2]));
-                            float _add_34;
-                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_34) : "f"(group_pair_23_1), "f"(lane_scan_1[1]));
-                            lane_scan_1[3] = _add_34;
+                            float _add_36;
+                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_36) : "f"(group_pair_23_1), "f"(lane_scan_1[1]));
+                            lane_scan_1[3] = _add_36;
                             #pragma unroll
                             for (int group_2 = 0; group_2 < 32; group_2++) {
                                 float group_total_1 = __shfl_sync(0xFFFFFFFF, lane_scan_1[3], group_2);
@@ -1264,9 +1368,9 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                                     if (group_2 == 0) {
                                         running_1 = group_total_1;
                                     } else {
-                                        float _add_35;
-                                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_35) : "f"(running_1), "f"(group_total_1));
-                                        running_1 = _add_35;
+                                        float _add_37;
+                                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_37) : "f"(running_1), "f"(group_total_1));
+                                        running_1 = _add_37;
                                     }
                                 }
                             }
@@ -1276,23 +1380,23 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                         }
                         float physical_cumsum_1[4];
                         #pragma unroll
-                        for (int local_16 = 0; local_16 < 4; local_16++) {
-                            float value_1 = lane_scan_1[local_16];
+                        for (int local_15 = 0; local_15 < 4; local_15++) {
+                            float value_1 = lane_scan_1[local_15];
                             if (has_carry_1 != 0) {
-                                float _add_36;
-                                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_36) : "f"(value_1), "f"(running_1));
-                                value_1 = _add_36;
+                                float _add_38;
+                                asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_38) : "f"(value_1), "f"(running_1));
+                                value_1 = _add_38;
                             }
-                            physical_cumsum_1[local_16] = value_1;
+                            physical_cumsum_1[local_15] = value_1;
                         }
                         int base_token_1 = ((next_segment_offset - 1) > (0) ? (next_segment_offset - 1) : (0));
                         int base_lane_1 = base_token_1 / 4;
                         int base_slot_1 = base_token_1 % 4;
                         float base_broadcast_1 = __shfl_sync(0xFFFFFFFF, physical_cumsum_1[0], base_lane_1);
                         #pragma unroll
-                        for (int local_17 = 1; local_17 < 4; local_17++) {
-                            float base_slot_value_1 = __shfl_sync(0xFFFFFFFF, physical_cumsum_1[local_17], base_lane_1);
-                            if (base_slot_1 == local_17) {
+                        for (int local_16 = 1; local_16 < 4; local_16++) {
+                            float base_slot_value_1 = __shfl_sync(0xFFFFFFFF, physical_cumsum_1[local_16], base_lane_1);
+                            if (base_slot_1 == local_16) {
                                 base_broadcast_1 = base_slot_value_1;
                             }
                         }
@@ -1301,44 +1405,28 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                             segment_base_1 = base_broadcast_1;
                         }
                         float fill_broadcast_1 = 0.0f;
-                        int fill_token_1 = next_chunk_tokens - 1;
-                        int fill_lane_1 = fill_token_1 / 4;
-                        int fill_slot_1 = fill_token_1 % 4;
-                        float _shfl_sync_37 = __shfl_sync(0xFFFFFFFF, physical_cumsum_1[0], fill_lane_1);
-                        fill_broadcast_1 = _shfl_sync_37;
-                        #pragma unroll
-                        for (int local_18 = 1; local_18 < 4; local_18++) {
-                            float fill_slot_value_1 = __shfl_sync(0xFFFFFFFF, physical_cumsum_1[local_18], fill_lane_1);
-                            if (fill_slot_1 == local_18) {
-                                fill_broadcast_1 = fill_slot_value_1;
-                            }
-                        }
                         float lane_cumsum_1[4];
                         float lane_delta_1[4];
                         #pragma unroll
-                        for (int local_19 = 0; local_19 < 4; local_19++) {
-                            int physical_token_4 = token_base_1_1 + local_19;
+                        for (int local_17 = 0; local_17 < 4; local_17++) {
+                            int physical_token_4 = token_base_1_1 + local_17;
                             float cumsum_value_1 = 0.0f;
                             float delta_value_1 = 0.0f;
-                            if (physical_token_4 < next_chunk_tokens) {
-                                float _sub_38;
-                                asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_38) : "f"(physical_cumsum_1[local_19]), "f"(segment_base_1));
-                                cumsum_value_1 = _sub_38;
-                                float bounded_1 = fminf(max_noftz(lane_dt_1[local_19], -65504.0f), 65504.0f);
+                            if (physical_token_4 >= next_segment_offset && physical_token_4 < next_publish_end) {
+                                float _sub_39;
+                                asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_39) : "f"(physical_cumsum_1[local_17]), "f"(segment_base_1));
+                                cumsum_value_1 = _sub_39;
+                                float bounded_1 = fminf(max_noftz(lane_dt_1[local_17], -65504.0f), 65504.0f);
                                 __half delta_half_1 = (__half)bounded_1;
                                 delta_value_1 = (float)delta_half_1;
-                            } else {
-                                float _sub_39;
-                                asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_39) : "f"(fill_broadcast_1), "f"(segment_base_1));
-                                cumsum_value_1 = _sub_39;
                             }
-                            lane_cumsum_1[local_19] = cumsum_value_1;
-                            lane_delta_1[local_19] = delta_value_1;
+                            lane_cumsum_1[local_17] = cumsum_value_1;
+                            lane_delta_1[local_17] = delta_value_1;
                         }
                         #pragma unroll
-                        for (int local_20 = 0; local_20 < 4; local_20++) {
-                            next_cumsum[local_20] = lane_cumsum_1[local_20];
-                            next_delta[local_20] = lane_delta_1[local_20];
+                        for (int local_18 = 0; local_18 < 4; local_18++) {
+                            next_cumsum[local_18] = lane_cumsum_1[local_18];
+                            next_delta[local_18] = lane_delta_1[local_18];
                         }
                         have_next = 1;
                     } else {
@@ -1352,12 +1440,6 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
     if (warp >= 4 && warp <= 7) {
         asm volatile("setmaxnreg.inc.sync.aligned.u32 160;");
         { // pre_inter_main
-            asm volatile("barrier.sync 11, 480;" ::: "memory");
-            taddr = tmem_addr_storage[0];
-            tmem_cb_tmem = taddr;
-            tmem_intra_tmem = taddr + 256;
-            tmem_state_delta_tmem = taddr + 384;
-            tmem_inter_tmem = taddr + 448;
             unsigned int input_stage_4 = 0;
             unsigned int acc_stage_1 = 0;
             unsigned int state_stage_1 = 0;
@@ -1372,6 +1454,37 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                 int sequence_4 = work_4 / (unsigned int)nheads;
                 int head_2 = work_4 % (unsigned int)nheads;
                 int state_head_base = (sequence_4 * nheads + head_2) * 64 * 128;
+                if (metadata_from_cu_seqlens != 0) {
+                    if (warp == 4) {
+                        if (elect_sync()) {
+                            int raw_lo = cu_seqlens[sequence_4];
+                            int raw_hi = cu_seqlens[sequence_4 + 1];
+                            int flagged_cu = 0;
+                            if (sequence_4 == 0) {
+                                if (raw_lo != 0) {
+                                    flagged_cu = 1;
+                                }
+                            }
+                            if (sequence_4 == sequence_count - 1) {
+                                if (raw_hi != seqlen) {
+                                    flagged_cu = 1;
+                                }
+                            }
+                            if (raw_hi < raw_lo) {
+                                flagged_cu = 1;
+                            }
+                            if (raw_lo < 0) {
+                                flagged_cu = 1;
+                            }
+                            if (raw_hi > seqlen) {
+                                flagged_cu = 1;
+                            }
+                            if (flagged_cu != 0) {
+                                preprocess_status[0] = 1;
+                            }
+                        }
+                    }
+                }
                 #pragma unroll
                 for (int dim_chunk = 0; dim_chunk < 2; dim_chunk++) {
                     #pragma unroll
@@ -1386,7 +1499,7 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                             int dim = dim_chunk * 32 + state_repeat * 8 + lane % 4 * 2 + state_reg % 2;
                             float initial_value = 0.0f;
                             if (has_initial != 0) {
-                                initial_value = initial_states[state_head_base + dim * 128 + state_row];
+                                initial_value = (float)initial_states[state_head_base + dim * 128 + state_row];
                             }
                             state_values[state_fragment_offset + state_local] = initial_value;
                         }
@@ -1398,26 +1511,49 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                 int item_hi_4 = 0;
                 int item_checkpoint_4 = -1;
                 int checkpoint_rank_4 = 1073741824;
+                if (metadata_from_cu_seqlens != 0) {
+                    int _max_1_4 = ((cu_seqlens[sequence_4]) > (0) ? (cu_seqlens[sequence_4]) : (0));
+                    int _min_0_4 = ((_max_1_4) < (seqlen) ? (_max_1_4) : (seqlen));
+                    item_lo_4 = _min_0_4;
+                    int _max_3_4 = ((cu_seqlens[sequence_4 + 1]) > (0) ? (cu_seqlens[sequence_4 + 1]) : (0));
+                    int _min_2_4 = ((_max_3_4) < (seqlen) ? (_max_3_4) : (seqlen));
+                    item_hi_4 = _min_2_4;
+                    int item_count_4 = 0;
+                    if (item_hi_4 > item_lo_4) {
+                        item_count_4 = (item_hi_4 + 127) / 128 - item_lo_4 / 128;
+                        if (checkpoint_state_count > 0) {
+                            int candidate_checkpoint_4 = checkpoint_token_indices[sequence_4];
+                            if (candidate_checkpoint_4 > item_lo_4 && candidate_checkpoint_4 < item_hi_4 && candidate_checkpoint_4 % 128 != 0) {
+                                item_checkpoint_4 = candidate_checkpoint_4;
+                                checkpoint_rank_4 = candidate_checkpoint_4 / 128 - item_lo_4 / 128 + 1;
+                                item_count_4 = item_count_4 + 1;
+                            }
+                        }
+                    }
+                    first_logical_4 = 0;
+                    logical_end_4 = item_count_4;
+                } else {
+                    first_logical_4 = seq_chunk_cumsum[sequence_4];
+                    logical_end_4 = seq_chunk_cumsum[sequence_4 + 1];
+                }
                 int uniform_5 = make_warp_uniform(first_logical_4);
                 first_logical_4 = uniform_5;
                 int uniform_1_4 = make_warp_uniform(logical_end_4);
                 logical_end_4 = uniform_1_4;
                 #pragma unroll 1
                 for (int logical_4 = first_logical_4; logical_4 < logical_end_4; logical_4++) {
-                    int physical_chunk_2 = logical_4 - sequence_4 * nchunks;
                     int segment_offset_1 = 0;
                     int segment_limit_1 = 128;
-                    int chunk_tokens_1 = seqlen - physical_chunk_2 * 128;
-                    if (chunk_tokens_1 > 128) {
-                        chunk_tokens_1 = 128;
-                    }
                     mbarrier_wait(aux_full_addr + (input_stage_4) * 8, _phase_aux_full);
+                    int geometry = smem_geometry[input_stage_4];
+                    segment_offset_1 = geometry & 255;
+                    segment_limit_1 = geometry >> 8 & 255;
                     float last_cumsum = smem_cumsum_all[input_stage_4 * 128 + (unsigned int)(segment_limit_1 - 1)];
                     int factor_token = warp % 4 * 32 + lane;
                     float factor_value = 0.0f;
                     if (factor_token >= segment_offset_1 && factor_token < segment_limit_1) {
-                        float _exp2_0 = approx_exp2((last_cumsum - smem_cumsum_all[input_stage_4 * 128 + (unsigned int)factor_token]) * 1.442695f);
-                        factor_value = _exp2_0;
+                        float _exp2_4 = approx_exp2((last_cumsum - smem_cumsum_all[input_stage_4 * 128 + (unsigned int)factor_token]) * 1.442695f);
+                        factor_value = _exp2_4;
                         factor_value *= smem_delta_all[input_stage_4 * 128 + (unsigned int)factor_token];
                     }
                     smem_bscale[factor_token] = factor_value;
@@ -1445,9 +1581,9 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                                 int stsm_row = dim_chunk_1 * 32 + stsm_repeat * 16 + stsm_matrix / 2 * 8 + lane % 8;
                                 int stsm_col = state_row_origin_1 + stsm_matrix % 2 * 8;
                                 int packed_base = stsm_repeat * 4;
-                                uint32_t _stmatrix_addr_1 = static_cast<uint32_t>((smem_state_addr + state_stage_1 * 16384 + (unsigned int)(stsm_col / 64 * 8192 + stsm_row * 128 + stsm_col % 64 * 2 ^ (stsm_col / 64 * 8192 + stsm_row * 128 + stsm_col % 64 * 2 >> 7 & 7) << 4)));
+                                uint32_t _stmatrix_addr_5 = static_cast<uint32_t>((smem_state_addr + state_stage_1 * 16384 + (unsigned int)(stsm_col / 64 * 8192 + stsm_row * 128 + stsm_col % 64 * 2 ^ (stsm_col / 64 * 8192 + stsm_row * 128 + stsm_col % 64 * 2 >> 7 & 7) << 4)));
                                 asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%0], {%1, %2, %3, %4};\n"
-                                    :: "r"(_stmatrix_addr_1), "r"(*reinterpret_cast<const uint32_t*>(&state_fragment_bf16[packed_base])), "r"(*reinterpret_cast<const uint32_t*>(&state_fragment_bf16[packed_base + 1])), "r"(*reinterpret_cast<const uint32_t*>(&state_fragment_bf16[packed_base + 2])), "r"(*reinterpret_cast<const uint32_t*>(&state_fragment_bf16[packed_base + 3]))
+                                    :: "r"(_stmatrix_addr_5), "r"(*reinterpret_cast<const uint32_t*>(&state_fragment_bf16[packed_base])), "r"(*reinterpret_cast<const uint32_t*>(&state_fragment_bf16[packed_base + 1])), "r"(*reinterpret_cast<const uint32_t*>(&state_fragment_bf16[packed_base + 2])), "r"(*reinterpret_cast<const uint32_t*>(&state_fragment_bf16[packed_base + 3]))
                                     : "memory");
                             }
                         }
@@ -1473,21 +1609,25 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                         for (int b_local = 0; b_local < 8; b_local++) {
                             scaled_b_values[b_local] = 0.0f;
                         }
-                        if (col >= segment_offset_1 && col < segment_limit_1) {
-                            unsigned int b_packed[4];
-                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&b_packed[0])), "=r"(*reinterpret_cast<uint32_t*>(&b_packed[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&b_packed[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&b_packed[(0) + 3]))
-                                : "r"((smem_b_addr + input_stage_4 * 32768 + (unsigned int)(b_state_base / 64 * 16384 + col * 128 + b_state_base % 64 * 2 ^ (b_state_base / 64 * 16384 + col * 128 + b_state_base % 64 * 2 >> 7 & 7) << 4))));
+                        unsigned int b_packed[4];
+                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                            : "=r"(*reinterpret_cast<uint32_t*>(&b_packed[0])), "=r"(*reinterpret_cast<uint32_t*>(&b_packed[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&b_packed[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&b_packed[(0) + 3]))
+                            : "r"((smem_b_addr + input_stage_4 * 32768 + (unsigned int)(b_state_base / 64 * 16384 + col * 128 + b_state_base % 64 * 2 ^ (b_state_base / 64 * 16384 + col * 128 + b_state_base % 64 * 2 >> 7 & 7) << 4))));
+                        #pragma unroll
+                        for (int _pair = 0; _pair < 4; _pair++) {
+                            (&scaled_b_values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(b_packed[_pair]) << 16);
+                            (&scaled_b_values[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(b_packed[_pair]) & 0xffff0000u);
+                        }
+                        float b_scale = smem_bscale[col];
+                        const float2 _scale2_6 = {b_scale, b_scale};
+                        #pragma unroll
+                        for (int _ls = 0; _ls < 4; _ls++)
+                            mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(scaled_b_values)[_ls], _scale2_6);
+                        if (col < segment_offset_1 || col >= segment_limit_1) {
                             #pragma unroll
-                            for (int _pair = 0; _pair < 4; _pair++) {
-                                (&scaled_b_values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(b_packed[_pair]) << 16);
-                                (&scaled_b_values[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(b_packed[_pair]) & 0xffff0000u);
+                            for (int b_local_1 = 0; b_local_1 < 8; b_local_1++) {
+                                scaled_b_values[b_local_1] = 0.0f;
                             }
-                            float b_scale = smem_bscale[col];
-                            const float2 _scale2_2 = {b_scale, b_scale};
-                            #pragma unroll
-                            for (int _ls = 0; _ls < 4; _ls++)
-                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(scaled_b_values)[_ls], _scale2_2);
                         }
                         unsigned int scaled_b_values_bf16[4];
                         #pragma unroll
@@ -1545,11 +1685,17 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                     if (state_stage_1 == 2) { state_stage_1 = 0; _phase_state_read_released ^= 1; }
                     if (checkpoint_state_count > 0) {
                         int checkpoint_token = checkpoint_token_indices[sequence_4];
-                        int segment_end = physical_chunk_2 * 128 + segment_limit_1;
-                        if (segment_end > seqlen) {
-                            segment_end = seqlen;
+                        int chunk_3 = logical_4 - sequence_4 * nchunks;
+                        if (metadata_from_cu_seqlens != 0) {
+                            chunk_3 = ((checkpoint_rank_4 < logical_4) ? (item_lo_4 / 128 + logical_4 - 1) * 128 : ((logical_4 == checkpoint_rank_4) ? item_checkpoint_4 : ((logical_4 == 0) ? item_lo_4 : (item_lo_4 / 128 + logical_4) * 128))) / 128;
+                        } else {
+                            chunk_3 = chunk_indices[logical_4];
                         }
-                        if (checkpoint_token == segment_end) {
+                        int segment_end_2 = chunk_3 * 128 + segment_limit_1;
+                        if (segment_end_2 > seqlen) {
+                            segment_end_2 = seqlen;
+                        }
+                        if (checkpoint_token == segment_end_2) {
                             int checkpoint_slot = checkpoint_state_slots[sequence_4];
                             if (checkpoint_slot >= 0 && checkpoint_slot < checkpoint_state_count) {
                                 int checkpoint_head_base = (checkpoint_slot * nheads + head_2) * 64 * 128;
@@ -1592,19 +1738,12 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                     }
                 }
             }
-            asm volatile("barrier.sync 12, 352;" ::: "memory");
         }
     }
     // ---- Role: pre_intra ----
     if (warp >= 8 && warp <= 11) {
         asm volatile("setmaxnreg.inc.sync.aligned.u32 208;");
         { // pre_intra_main
-            asm volatile("barrier.sync 11, 480;" ::: "memory");
-            taddr = tmem_addr_storage[0];
-            tmem_cb_tmem = taddr;
-            tmem_intra_tmem = taddr + 256;
-            tmem_state_delta_tmem = taddr + 384;
-            tmem_inter_tmem = taddr + 448;
             unsigned int input_stage_5 = 0;
             unsigned int acc_stage_2 = 0;
             int row = warp % 4 * 32 + lane;
@@ -1621,22 +1760,45 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                 int item_hi_5 = 0;
                 int item_checkpoint_5 = -1;
                 int checkpoint_rank_5 = 1073741824;
+                if (metadata_from_cu_seqlens != 0) {
+                    int _max_1_5 = ((cu_seqlens[sequence_5]) > (0) ? (cu_seqlens[sequence_5]) : (0));
+                    int _min_0_5 = ((_max_1_5) < (seqlen) ? (_max_1_5) : (seqlen));
+                    item_lo_5 = _min_0_5;
+                    int _max_3_5 = ((cu_seqlens[sequence_5 + 1]) > (0) ? (cu_seqlens[sequence_5 + 1]) : (0));
+                    int _min_2_5 = ((_max_3_5) < (seqlen) ? (_max_3_5) : (seqlen));
+                    item_hi_5 = _min_2_5;
+                    int item_count_5 = 0;
+                    if (item_hi_5 > item_lo_5) {
+                        item_count_5 = (item_hi_5 + 127) / 128 - item_lo_5 / 128;
+                        if (checkpoint_state_count > 0) {
+                            int candidate_checkpoint_5 = checkpoint_token_indices[sequence_5];
+                            if (candidate_checkpoint_5 > item_lo_5 && candidate_checkpoint_5 < item_hi_5 && candidate_checkpoint_5 % 128 != 0) {
+                                item_checkpoint_5 = candidate_checkpoint_5;
+                                checkpoint_rank_5 = candidate_checkpoint_5 / 128 - item_lo_5 / 128 + 1;
+                                item_count_5 = item_count_5 + 1;
+                            }
+                        }
+                    }
+                    first_logical_5 = 0;
+                    logical_end_5 = item_count_5;
+                } else {
+                    first_logical_5 = seq_chunk_cumsum[sequence_5];
+                    logical_end_5 = seq_chunk_cumsum[sequence_5 + 1];
+                }
                 int uniform_6 = make_warp_uniform(first_logical_5);
                 first_logical_5 = uniform_6;
                 int uniform_1_5 = make_warp_uniform(logical_end_5);
                 logical_end_5 = uniform_1_5;
                 #pragma unroll 1
                 for (int logical_5 = first_logical_5; logical_5 < logical_end_5; logical_5++) {
-                    int physical_chunk_3 = logical_5 - sequence_5 * nchunks;
                     int segment_offset_2 = 0;
                     int segment_limit_2 = 128;
-                    int chunk_tokens_2 = seqlen - physical_chunk_3 * 128;
-                    if (chunk_tokens_2 > 128) {
-                        chunk_tokens_2 = 128;
-                    }
                     mbarrier_wait(cb_full_addr + (acc_stage_2) * 8, _phase_cb_full_1);
                     mbarrier_wait(aux_full_addr + (input_stage_5) * 8, _phase_aux_full_1);
                     asm volatile("tcgen05.fence::after_thread_sync;");
+                    int geometry_1 = smem_geometry[input_stage_5];
+                    segment_offset_2 = geometry_1 & 255;
+                    segment_limit_2 = geometry_1 >> 8 & 255;
                     float row_cumsum = smem_cumsum_all[input_stage_5 * 128 + (unsigned int)row];
                     float segment_base_3 = 0.0f;
                     if (segment_offset_2 > 0) {
@@ -1701,26 +1863,12 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                     if (acc_stage_2 == 2) { acc_stage_2 = 0; _phase_cb_full_1 ^= 1; }
                 }
             }
-            asm volatile("barrier.sync 12, 352;" ::: "memory");
         }
     }
     // ---- Role: epilogue ----
     if (warp >= 12 && warp <= 15) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 112;");
         { // epilogue_main
-            if (warp == 12) {
-                int _tmem_hold_0 = smem + 232176;
-                asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold_0), "r"(512) : "memory");
-            }
-            if (warp == 12) {
-                asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
-            }
-            asm volatile("barrier.sync 11, 480;" ::: "memory");
-            taddr = tmem_addr_storage[0];
-            tmem_cb_tmem = taddr;
-            tmem_intra_tmem = taddr + 256;
-            tmem_state_delta_tmem = taddr + 384;
-            tmem_inter_tmem = taddr + 448;
             unsigned int input_stage_6 = 0;
             unsigned int acc_stage_3 = 0;
             unsigned int output_stage = 0;
@@ -1745,32 +1893,66 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                 int item_hi_6 = 0;
                 int item_checkpoint_6 = -1;
                 int checkpoint_rank_6 = 1073741824;
+                if (metadata_from_cu_seqlens != 0) {
+                    int _max_1_6 = ((cu_seqlens[sequence_6]) > (0) ? (cu_seqlens[sequence_6]) : (0));
+                    int _min_0_6 = ((_max_1_6) < (seqlen) ? (_max_1_6) : (seqlen));
+                    item_lo_6 = _min_0_6;
+                    int _max_3_6 = ((cu_seqlens[sequence_6 + 1]) > (0) ? (cu_seqlens[sequence_6 + 1]) : (0));
+                    int _min_2_6 = ((_max_3_6) < (seqlen) ? (_max_3_6) : (seqlen));
+                    item_hi_6 = _min_2_6;
+                    int item_count_6 = 0;
+                    if (item_hi_6 > item_lo_6) {
+                        item_count_6 = (item_hi_6 + 127) / 128 - item_lo_6 / 128;
+                        if (checkpoint_state_count > 0) {
+                            int candidate_checkpoint_6 = checkpoint_token_indices[sequence_6];
+                            if (candidate_checkpoint_6 > item_lo_6 && candidate_checkpoint_6 < item_hi_6 && candidate_checkpoint_6 % 128 != 0) {
+                                item_checkpoint_6 = candidate_checkpoint_6;
+                                checkpoint_rank_6 = candidate_checkpoint_6 / 128 - item_lo_6 / 128 + 1;
+                                item_count_6 = item_count_6 + 1;
+                            }
+                        }
+                    }
+                    first_logical_6 = 0;
+                    logical_end_6 = item_count_6;
+                } else {
+                    first_logical_6 = seq_chunk_cumsum[sequence_6];
+                    logical_end_6 = seq_chunk_cumsum[sequence_6 + 1];
+                }
                 int uniform_7 = make_warp_uniform(first_logical_6);
                 first_logical_6 = uniform_7;
                 int uniform_1_6 = make_warp_uniform(logical_end_6);
                 logical_end_6 = uniform_1_6;
                 #pragma unroll 1
                 for (int logical_6 = first_logical_6; logical_6 < logical_end_6; logical_6++) {
-                    int physical_chunk_4 = logical_6 - sequence_6 * nchunks;
+                    int chunk_4 = logical_6 - sequence_6 * nchunks;
+                    if (metadata_from_cu_seqlens != 0) {
+                        chunk_4 = ((checkpoint_rank_6 < logical_6) ? (item_lo_6 / 128 + logical_6 - 1) * 128 : ((logical_6 == checkpoint_rank_6) ? item_checkpoint_6 : ((logical_6 == 0) ? item_lo_6 : (item_lo_6 / 128 + logical_6) * 128))) / 128;
+                    } else {
+                        chunk_4 = chunk_indices[logical_6];
+                    }
                     int segment_offset_3 = 0;
                     int segment_limit_3 = 128;
-                    int chunk_tokens_3 = seqlen - physical_chunk_4 * 128;
-                    if (chunk_tokens_3 > 128) {
-                        chunk_tokens_3 = 128;
-                    }
+                    int chunk_tokens_1 = 128;
                     mbarrier_wait(intra_full_addr + (acc_stage_3) * 8, _phase_intra_full);
                     mbarrier_wait(inter_full_addr, _phase_inter_full_0);
                     _phase_inter_full_0 ^= 1;
                     mbarrier_wait(aux_full_addr + (input_stage_6) * 8, _phase_aux_full_2);
                     mbarrier_wait(x_full_addr + (input_stage_6) * 8, _phase_aux_full_2);
                     asm volatile("tcgen05.fence::after_thread_sync;");
+                    int geometry_2 = smem_geometry[input_stage_6];
+                    segment_offset_3 = geometry_2 & 255;
+                    segment_limit_3 = geometry_2 >> 8 & 255;
+                    chunk_tokens_1 = geometry_2 >> 16;
                     int physical_batch_2 = 0;
-                    physical_batch_2 = sequence_6;
                     float segment_base_4 = 0.0f;
                     if (segment_offset_3 > 0) {
                         segment_base_4 = smem_cumsum_all[input_stage_6 * 128 + (unsigned int)(segment_offset_3 - 1)];
                     }
                     int full_chunk = 1;
+                    full_chunk = 0;
+                    if (segment_offset_3 == 0 && segment_limit_3 == chunk_tokens_1) {
+                        full_chunk = 1;
+                    }
                     if (full_chunk != 0 && output_issued >= 2) {
                         int warp_id_in_role = warp - 12;
                         if (warp_id_in_role == 0) {
@@ -1804,12 +1986,12 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                                 }
                             }
                             if (row_1 >= segment_offset_3 && row_1 < segment_limit_3) {
-                                int token_in_batch_1 = physical_chunk_4 * 128 + row_1;
+                                int token_in_batch_1 = chunk_4 * 128 + row_1;
                                 int token = physical_batch_2 * seqlen + token_in_batch_1;
                                 float decay_1 = approx_exp2((smem_cumsum_all[input_stage_6 * 128 + (unsigned int)row_1] - segment_base_4) * 1.442695f);
                                 int z_token = token;
-                                if (row_1 >= chunk_tokens_3) {
-                                    z_token = physical_batch_2 * seqlen + physical_chunk_4 * 128 + chunk_tokens_3 - 1;
+                                if (row_1 >= chunk_tokens_1) {
+                                    z_token = physical_batch_2 * seqlen + chunk_4 * 128 + chunk_tokens_1 - 1;
                                 }
                                 int z_row_base = z_token * nheads * 64 + head_3 * 64;
                                 int out_row_base = (token * nheads + head_3) * 64;
@@ -1818,11 +2000,11 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                                     #pragma unroll
                                     for (int load_group = 0; load_group < 4; load_group++) {
                                         {
-                                            const uint4* _vptr_1 = reinterpret_cast<const uint4*>(z + z_row_base + dim_chunk_5 * 32 + load_group * 8);
-                                            uint4* _vdst_1 = reinterpret_cast<uint4*>(&z_packed[load_group * 4]);
+                                            const uint4* _vptr_4 = reinterpret_cast<const uint4*>(z + z_row_base + dim_chunk_5 * 32 + load_group * 8);
+                                            uint4* _vdst_4 = reinterpret_cast<uint4*>(&z_packed[load_group * 4]);
                                             #pragma unroll
                                             for (int _blk = 0; _blk < 1; _blk++) {
-                                                _vdst_1[_blk] = _vptr_1[_blk];
+                                                _vdst_4[_blk] = _vptr_4[_blk];
                                             }
                                         }
                                     }
@@ -1847,16 +2029,16 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                                     }
                                     if (D_mode == 2) {
                                         {
-                                            const uint4* _vptr_2 = reinterpret_cast<const uint4*>(D + head_3 * 64 + dim_base);
-                                            uint4 _vld_2[1];
+                                            const uint4* _vptr_5 = reinterpret_cast<const uint4*>(D + head_3 * 64 + dim_base);
+                                            uint4 _vld_5[1];
                                             #pragma unroll
                                             for (int _blk = 0; _blk < 1; _blk++) {
-                                                _vld_2[_blk] = _vptr_2[_blk];
-                                                uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2[_blk]);
+                                                _vld_5[_blk] = _vptr_5[_blk];
+                                                uint32_t* _vpairs_5 = reinterpret_cast<uint32_t*>(&_vld_5[_blk]);
                                                 #pragma unroll
                                                 for (int _pair = 0; _pair < 4; _pair++) {
-                                                    (&d_values[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) << 16);
-                                                    (&d_values[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) & 0xffff0000u);
+                                                    (&d_values[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_5[_pair]) << 16);
+                                                    (&d_values[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_5[_pair]) & 0xffff0000u);
                                                 }
                                             }
                                         }
@@ -1871,9 +2053,9 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                                         #pragma unroll
                                         for (int group_dim_1 = 0; group_dim_1 < 8; group_dim_1++) {
                                             float z_value = z_scale[group_dim_1];
-                                            float _exp_4 = __expf(-z_value);
-                                            float _rcp_3 = approx_rcp(1.0f + _exp_4);
-                                            z_scale[group_dim_1] = z_value * _rcp_3;
+                                            float _exp_7 = __expf(-z_value);
+                                            float _rcp_6 = approx_rcp(1.0f + _exp_7);
+                                            z_scale[group_dim_1] = z_value * _rcp_6;
                                         }
                                     } else {
                                         #pragma unroll
@@ -1940,12 +2122,12 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                                 }
                             }
                             if (row_1 >= segment_offset_3 && row_1 < segment_limit_3) {
-                                int token_in_batch_2 = physical_chunk_4 * 128 + row_1;
+                                int token_in_batch_2 = chunk_4 * 128 + row_1;
                                 int token_1 = physical_batch_2 * seqlen + token_in_batch_2;
                                 float decay_2 = approx_exp2((smem_cumsum_all[input_stage_6 * 128 + (unsigned int)row_1] - segment_base_4) * 1.442695f);
                                 int z_token_1 = token_1;
-                                if (row_1 >= chunk_tokens_3) {
-                                    z_token_1 = physical_batch_2 * seqlen + physical_chunk_4 * 128 + chunk_tokens_3 - 1;
+                                if (row_1 >= chunk_tokens_1) {
+                                    z_token_1 = physical_batch_2 * seqlen + chunk_4 * 128 + chunk_tokens_1 - 1;
                                 }
                                 int z_row_base_1 = z_token_1 * nheads * 64 + head_3 * 64;
                                 int out_row_base_1 = (token_1 * nheads + head_3) * 64;
@@ -1954,11 +2136,11 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                                     #pragma unroll
                                     for (int load_group_1 = 0; load_group_1 < 4; load_group_1++) {
                                         {
-                                            const uint4* _vptr_5 = reinterpret_cast<const uint4*>(z + z_row_base_1 + dim_chunk_6 * 32 + load_group_1 * 8);
-                                            uint4* _vdst_5 = reinterpret_cast<uint4*>(&z_packed_1[load_group_1 * 4]);
+                                            const uint4* _vptr_8 = reinterpret_cast<const uint4*>(z + z_row_base_1 + dim_chunk_6 * 32 + load_group_1 * 8);
+                                            uint4* _vdst_8 = reinterpret_cast<uint4*>(&z_packed_1[load_group_1 * 4]);
                                             #pragma unroll
                                             for (int _blk = 0; _blk < 1; _blk++) {
-                                                _vdst_5[_blk] = _vptr_5[_blk];
+                                                _vdst_8[_blk] = _vptr_8[_blk];
                                             }
                                         }
                                     }
@@ -1983,16 +2165,16 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                                     }
                                     if (D_mode == 2) {
                                         {
-                                            const uint4* _vptr_6 = reinterpret_cast<const uint4*>(D + head_3 * 64 + dim_base_1);
-                                            uint4 _vld_6[1];
+                                            const uint4* _vptr_9 = reinterpret_cast<const uint4*>(D + head_3 * 64 + dim_base_1);
+                                            uint4 _vld_9[1];
                                             #pragma unroll
                                             for (int _blk = 0; _blk < 1; _blk++) {
-                                                _vld_6[_blk] = _vptr_6[_blk];
-                                                uint32_t* _vpairs_6 = reinterpret_cast<uint32_t*>(&_vld_6[_blk]);
+                                                _vld_9[_blk] = _vptr_9[_blk];
+                                                uint32_t* _vpairs_9 = reinterpret_cast<uint32_t*>(&_vld_9[_blk]);
                                                 #pragma unroll
                                                 for (int _pair = 0; _pair < 4; _pair++) {
-                                                    (&d_values_1[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_6[_pair]) << 16);
-                                                    (&d_values_1[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_6[_pair]) & 0xffff0000u);
+                                                    (&d_values_1[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_9[_pair]) << 16);
+                                                    (&d_values_1[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_9[_pair]) & 0xffff0000u);
                                                 }
                                             }
                                         }
@@ -2007,9 +2189,9 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                                         #pragma unroll
                                         for (int group_dim_5 = 0; group_dim_5 < 8; group_dim_5++) {
                                             float z_value_1 = z_scale_1[group_dim_5];
-                                            float _exp_8 = __expf(-z_value_1);
-                                            float _rcp_7 = approx_rcp(1.0f + _exp_8);
-                                            z_scale_1[group_dim_5] = z_value_1 * _rcp_7;
+                                            float _exp_11 = __expf(-z_value_1);
+                                            float _rcp_10 = approx_rcp(1.0f + _exp_11);
+                                            z_scale_1[group_dim_5] = z_value_1 * _rcp_10;
                                         }
                                     } else {
                                         #pragma unroll
@@ -2062,7 +2244,7 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
                             if (elect_sync()) {
                                 #pragma unroll
                                 for (int out_slab = 0; out_slab < 4; out_slab++) {
-                                    tma_store_4d((&out_map), 0, head_3, physical_chunk_4 * 128 + out_slab * 32, physical_batch_2, smem_y_addr + output_stage * 16384 + (unsigned int)(out_slab * 4096));
+                                    tma_store_4d((&out_map), 0, head_3, chunk_4 * 128 + out_slab * 32, physical_batch_2, smem_y_addr + output_stage * 16384 + (unsigned int)(out_slab * 4096));
                                 }
                             }
                             asm volatile("cp.async.bulk.commit_group;");
@@ -2085,14 +2267,6 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
             }
             int warp_id_in_role_2 = warp - 12;
             if (warp_id_in_role_2 == 0) {
-                input_stage_6 += 1;
-                if (input_stage_6 == 2) { input_stage_6 = 0; _phase_aux_full_2 ^= 1; }
-                mbarrier_wait(aux_empty_addr + (input_stage_6) * 8, _phase_aux_full_2 ^ (unsigned int)(input_stage_6 + 2 >= 2));
-                __syncwarp();
-                asm volatile("tcgen05.fence::after_thread_sync;");
-                asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(512));
-            }
-            if (warp_id_in_role_2 == 0) {
                 asm volatile("cp.async.bulk.wait_group.read 0;");
             }
             asm volatile("barrier.sync 10, 128;" ::: "memory");
@@ -2100,6 +2274,12 @@ kernel_mamba_ssd_q_tmem_alias_f32_batched_noring(const __grid_constant__ CUtenso
     }
 
     // Cleanup
+    asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
+    __syncthreads(); // barrier before TMEM dealloc
+
+    if (warp == 12) {
+        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(512));
+    }
 }
 
 } // extern "C"
