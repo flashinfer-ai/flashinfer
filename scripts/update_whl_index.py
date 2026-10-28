@@ -93,10 +93,23 @@ def get_package_info(wheel_path: pathlib.Path) -> Optional[dict]:
     return None
 
 
-# Matches one wheel row in a generated index page. The href is the stable key;
-# any ``data-`` attributes and the trailing visible marker are optional, so this
-# also matches rows written before the untested marker existed.
+# Matches one wheel row in a generated index page. The href without its
+# ``#sha256=`` fragment is the stable key (see ``row_key``); any ``data-``
+# attributes and the trailing visible marker are optional, so this also matches
+# rows written before the untested marker existed.
 ROW_RE = re.compile(r'<a href="(?P<href>[^"]*)"[^>]*>.*?</a>(?: \(untested\))?<br>\n')
+
+
+def row_key(href: str) -> str:
+    """Return the release asset URL that identifies an index row.
+
+    The ``#sha256=`` fragment is excluded: a re-run recreates the release and
+    re-uploads the wheel under the same URL with ``--clobber``, and a rebuilt
+    wheel's bytes (and so its hash) can differ. Keying on the full href would
+    keep the stale row next to the new one, and an installer that picked it
+    would fail hash verification.
+    """
+    return href.split("#", 1)[0]
 
 
 def build_row(download_url: str, wheel_name: str, untested: bool) -> str:
@@ -228,20 +241,22 @@ def update_index(
         # Update index.html
         index_file = index_dir / "index.html"
 
-        # Read existing rows, keyed by download URL, so that re-running for a
-        # wheel already in the index rewrites its row in place instead of
-        # appending a near-duplicate that differs only in the untested marker.
+        # Read existing rows, keyed by release asset URL, so that re-running for
+        # a wheel already in the index rewrites its row in place instead of
+        # appending a near-duplicate that differs only in the untested marker
+        # or in the hash of a rebuilt wheel.
         rows: dict[str, str] = {}
         if index_file.exists():
             with index_file.open("r") as f:
                 content = f.read()
             for match in ROW_RE.finditer(content):
-                rows[match.group("href")] = match.group(0)
+                rows[row_key(match.group("href"))] = match.group(0)
 
         # Create and add new row
         new_row = build_row(download_url, wheel_path.name, untested)
-        is_new = rows.get(download_url) != new_row
-        rows[download_url] = new_row
+        key = row_key(download_url)
+        is_new = rows.get(key) != new_row
+        rows[key] = new_row
         if is_new:
             # Write the complete, valid HTML file
             with index_file.open("w") as f:

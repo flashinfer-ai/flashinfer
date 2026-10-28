@@ -7,6 +7,7 @@ pin both the untested marker and the unchanged default output the stable
 release path depends on.
 """
 
+import hashlib
 import importlib.util
 import pathlib
 import re
@@ -113,6 +114,29 @@ def test_rerun_replaces_row_instead_of_duplicating(whl_index, tmp_path):
     assert content.count("<a href=") == 1
     assert "data-untested" not in content
     assert "(untested)" not in content
+
+
+def test_rebuilt_wheel_replaces_row_with_new_hash(whl_index, tmp_path):
+    """A re-uploaded wheel with new bytes keeps one row, carrying the new hash.
+
+    Re-runs replace the release asset under the same URL, so the stale row's
+    hash would no longer match what that URL serves.
+    """
+    dist = _make_dist(tmp_path)
+    out = tmp_path / "whl"
+    wheel = dist / WHEEL
+
+    _run(whl_index, dist, out)
+    old_sha = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    wheel.write_bytes(b"rebuilt-" + WHEEL.encode())
+    new_sha = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    assert new_sha != old_sha
+    _run(whl_index, dist, out)
+
+    content = _index_for(out).read_text()
+    hrefs = re.findall(r'<a href="([^"]+)"', content)
+    assert len(hrefs) == 1
+    assert hrefs[0].endswith(f"/{WHEEL}#sha256={new_sha}")
 
 
 def test_preexisting_plain_rows_are_preserved(whl_index, tmp_path):
