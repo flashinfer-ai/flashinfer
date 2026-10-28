@@ -56,7 +56,6 @@ from ...helpers.math import (
     qkv_smem_swizzle,
     qkv_smem_swizzle_for_head_dim,
 )
-from ...helpers.gather4 import issue_gather4_tma_cta
 from ...helpers.ops import lane_idx_from_thread
 from ...helpers.query import query_batch_bounds
 from ...helpers.stage import MlaStage
@@ -747,26 +746,26 @@ class SmemPageOffsetsResource(MlaResource):
         # into registers, and keeps swaps K0/K1 live until their delayed V use.
         del stage_info
         if cutlass.const_expr(self.cfg.is_dynamic_token_sparse):
-            if cutlass.const_expr(self.cfg.cache_uniform_sparse_quads):
-                # Snapshot this warp's eight quads once per K / V tile as
-                # warp-uniform coordinates; every head-dimension stage of the
-                # tile then issues them from one elected lane without the
-                # per-lane R2UR waterfall.
-                quads = self.cfg.tile_size_kv // (4 * self.cfg.load_num_warps)
-                warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - Int32(
-                    self.cfg.load_warp_idx
-                )
-                row_base = self.consumer_work_stage * Int32(
-                    self.cfg.page_offsets_entries_per_stage
-                ) + warp * Int32(4 * quads)
-                for quad in cutlass.range_constexpr(quads):
-                    rows = self._smem_page_offsets.data_ptr(
-                        row_base + Int32(4 * quad)
-                    ).load(count=4, alignment=16)
-                    for j in cutlass.range_constexpr(4):
-                        cached_page_ids[6 + quad * 4 + j] = cute.arch.make_warp_uniform(
-                            Int32(rows[j])
-                        )
+            assert self.cfg.cache_uniform_sparse_quads
+            # Snapshot this warp's eight quads once per K / V tile as
+            # warp-uniform coordinates; every head-dimension stage of the
+            # tile then issues them from one elected lane without the
+            # per-lane R2UR waterfall.
+            quads = self.cfg.tile_size_kv // (4 * self.cfg.load_num_warps)
+            warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - Int32(
+                self.cfg.load_warp_idx
+            )
+            row_base = self.consumer_work_stage * Int32(
+                self.cfg.page_offsets_entries_per_stage
+            ) + warp * Int32(4 * quads)
+            for quad in cutlass.range_constexpr(quads):
+                rows = self._smem_page_offsets.data_ptr(
+                    row_base + Int32(4 * quad)
+                ).load(count=4, alignment=16)
+                for j in cutlass.range_constexpr(4):
+                    cached_page_ids[6 + quad * 4 + j] = cute.arch.make_warp_uniform(
+                        Int32(rows[j])
+                    )
             return cached_page_ids
         if cutlass.const_expr(self.cfg.native_sparse_pages):
             lane = lane_idx_from_thread(cute.arch.thread_idx()[0])
@@ -1002,120 +1001,6 @@ class SmemKvResource(MlaResource):
         return self._smem_kv.subview(stage_info.stage_idx * Int32(stage_elems))
 
     @cute.jit
-    def _producer_gather_token_rows(
-        self,
-        stage_info: StageInfo,
-        stage_base,
-        *,
-        dim_offset,
-        active_width: cutlass.Constexpr[int],
-        is_rope_stage: cutlass.Constexpr[bool],
-        uses_compact_fp8_rope_stage: cutlass.Constexpr[bool],
-        publish_mask: cutlass.Constexpr[bool] = False,
-        tile_idx=None,
-        cached_page_ids=None,
-    ):
-        """Token-sparse K/V stage: 32 lanes x one Gather4 of four token rows each.
-
-        Lane ``l`` owns tokens ``4l .. 4l+3`` of the 128-token tile.  It reads
-        their physical row indices from the staged index ring and issues one
-        Gather4 whose four ``active_width``-byte rows land at consecutive SMEM
-        rows of the stage, so the TMA swizzle (SW128 latent / SW64 RoPE) is the
-        one the UMMA descriptors expect.  Rows addressed outside the pool are
-        zero-filled by the TMA unit and still count toward the stage's
-        transaction bytes; only ``-1`` slots are also masked in softmax.
-        """
-        cfg = self.cfg
-        lane_idx = lane_idx_from_thread(cute.arch.thread_idx()[0])
-        ring = self.page_offsets_kv
-        num_load_warps = cfg.load_num_warps
-        warp_in_task = Int32(0)
-        if cutlass.const_expr(num_load_warps > 1):
-            warp_in_task = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - Int32(
-                cfg.load_warp_idx
-            )
-        descriptor = self.raw_gather4_descs.iterator
-        if cutlass.const_expr(is_rope_stage):
-            descriptor = descriptor + Int64(128)
-        row_bytes = active_width
-        if cutlass.const_expr(publish_mask):
-            # First K slice of the tile: warp w publishes the validity word of
-            # tokens 32w .. 32w+31 (bit = token & 31).  With one loader warp
-            # all four words come from that warp.
-            #
-            # The words live outside the TS resource graph.  The softmax reads
-            # slot ``tile % SPARSE_MASK_SLOTS`` only after this tile's gathers
-            # landed, QK(tile) ran on them and its S stage was committed, so
-            # the store precedes the read by at least a full gather + MMA
-            # round trip; the slot is reused only after the loader runs
-            # SPARSE_MASK_SLOTS tiles ahead, which the K/V ring (one tile of
-            # stages plus one in flight) rules out.
-            assert cfg.kv_stages // (cfg.v_head_dim_stages + 1) + 2 < (
-                SPARSE_MASK_SLOTS
-            ), "token-sparse validity ring too short for the K/V ring depth"
-            mask_base = Int32(ring.sparse_mask_word_base) + (
-                Int32(tile_idx) % Int32(SPARSE_MASK_SLOTS)
-            ) * Int32(SPARSE_MASK_WORDS)
-            words_per_warp = max(1, SPARSE_MASK_WORDS // num_load_warps)
-            for word_sub in cutlass.range_constexpr(words_per_warp):
-                word_idx = warp_in_task * Int32(words_per_warp) + Int32(word_sub)
-                # With more loader warps than mask words only the first
-                # SPARSE_MASK_WORDS warps publish (one word each).
-                if word_idx < Int32(SPARSE_MASK_WORDS):
-                    row = ring.token_row(word_idx * Int32(32) + lane_idx)
-                    bits = Int32(cute.arch.vote_ballot_sync(row >= Int32(0)))
-                    if lane_idx == Int32(0):
-                        ring._smem_page_offsets[mask_base + word_idx] = bits
-        quads_per_warp = 32 // num_load_warps
-        if cutlass.const_expr(cfg.cache_uniform_sparse_quads):
-            gather4_cached_warp(
-                stage_base.data_ptr(
-                    warp_in_task * Int32(quads_per_warp * 4 * row_bytes)
-                ),
-                descriptor,
-                dim_offset,
-                cached_page_ids,
-                stage_info.barrier,
-                cache_start=6,
-                num_quads=quads_per_warp,
-                num_slices=1,
-                quad_stride=4 * row_bytes,
-                slice_stride=0,
-                col_stride=0,
-            )
-        else:
-            # Lane l < quads_per_warp issues quad (warp_in_task * quads_per_warp + l);
-            # the other lanes read (and drop) the last quad's indices, staying in
-            # the index stage.
-            quad = warp_in_task * Int32(quads_per_warp) + cute.math.min(
-                lane_idx, Int32(quads_per_warp - 1)
-            )
-            q_base = quad * Int32(4)
-            row0 = ring.token_row(q_base)
-            row1 = ring.token_row(q_base + Int32(1))
-            row2 = ring.token_row(q_base + Int32(2))
-            row3 = ring.token_row(q_base + Int32(3))
-            if lane_idx < Int32(quads_per_warp):
-                issue_gather4_tma_cta(
-                    descriptor,
-                    stage_base.data_ptr(quad * Int32(4 * row_bytes)),
-                    stage_info.barrier,
-                    Int32(dim_offset),
-                    (row0, row1, row2, row3),
-                )
-        if cutlass.const_expr(uses_compact_fp8_rope_stage):
-            if warp_in_task == Int32(0):
-                if prims.elect_sync():
-                    missing_stage_bytes = (
-                        cfg.tile_size_kv
-                        * (cfg.head_dim_per_stage_kv - active_width)
-                        * cfg.qkv_dtype_bytes
-                    )
-                    prims.mbarrier_complete_tx(
-                        stage_info.barrier, Int32(missing_stage_bytes)
-                    )
-
-    @cute.jit
     def _producer_copy_rope_stage(
         self,
         stage_info: StageInfo,
@@ -1313,20 +1198,86 @@ class SmemKvResource(MlaResource):
             return
 
         if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+            # Token-sparse K/V stage: each loader warp issues its quads (one
+            # Gather4 of four token rows each) from the warp-uniform rows that
+            # read_offsets cached for this tile.  The four rows land at
+            # consecutive SMEM rows of the stage, so the TMA swizzle (SW128
+            # latent / SW64 RoPE) is the one the UMMA descriptors expect.  Rows
+            # addressed outside the pool are zero-filled by the TMA unit and
+            # still count toward the stage's transaction bytes; only -1 slots
+            # are also masked in softmax.
+            assert cfg.cache_uniform_sparse_quads, (
+                "token-sparse loads issue from the cached uniform quads"
+            )
             is_rope_stage = (not is_v) and (
                 qk_stage_idx >= cfg.latent_dim // cfg.head_dim_per_stage_kv
             )
-            self._producer_gather_token_rows(
-                stage_info,
-                stage_base,
-                dim_offset=Int32(cfg.latent_dim) if is_rope_stage else dim_offset,
-                active_width=active_width,
-                is_rope_stage=is_rope_stage,
-                uses_compact_fp8_rope_stage=uses_compact_fp8_rope_stage,
-                publish_mask=(not is_v) and qk_stage_idx == 0,
-                tile_idx=tile_idx,
-                cached_page_ids=cached_page_ids,
+            num_load_warps = cfg.load_num_warps
+            warp_in_task = Int32(0)
+            if cutlass.const_expr(num_load_warps > 1):
+                warp_in_task = cute.arch.make_warp_uniform(
+                    cute.arch.warp_idx()
+                ) - Int32(cfg.load_warp_idx)
+            descriptor = self.raw_gather4_descs.iterator
+            if cutlass.const_expr(is_rope_stage):
+                descriptor = descriptor + Int64(128)
+            if cutlass.const_expr((not is_v) and qk_stage_idx == 0):
+                # First K slice of the tile: warp w publishes the validity word
+                # of tokens 32w .. 32w+31 (bit = token & 31).  With one loader
+                # warp all four words come from that warp.
+                #
+                # The words live outside the TS resource graph.  The softmax
+                # reads slot ``tile % SPARSE_MASK_SLOTS`` only after this
+                # tile's gathers landed, QK(tile) ran on them and its S stage
+                # was committed, so the store precedes the read by at least a
+                # full gather + MMA round trip; the slot is reused only after
+                # the loader runs SPARSE_MASK_SLOTS tiles ahead, which the K/V
+                # ring (one tile of stages plus one in flight) rules out.
+                assert cfg.kv_stages // (cfg.v_head_dim_stages + 1) + 2 < (
+                    SPARSE_MASK_SLOTS
+                ), "token-sparse validity ring too short for the K/V ring depth"
+                ring = self.page_offsets_kv
+                lane_idx = lane_idx_from_thread(cute.arch.thread_idx()[0])
+                mask_base = Int32(ring.sparse_mask_word_base) + (
+                    Int32(tile_idx) % Int32(SPARSE_MASK_SLOTS)
+                ) * Int32(SPARSE_MASK_WORDS)
+                words_per_warp = max(1, SPARSE_MASK_WORDS // num_load_warps)
+                for word_sub in cutlass.range_constexpr(words_per_warp):
+                    word_idx = warp_in_task * Int32(words_per_warp) + Int32(word_sub)
+                    # With more loader warps than mask words only the first
+                    # SPARSE_MASK_WORDS warps publish (one word each).
+                    if word_idx < Int32(SPARSE_MASK_WORDS):
+                        row = ring.token_row(word_idx * Int32(32) + lane_idx)
+                        bits = Int32(cute.arch.vote_ballot_sync(row >= Int32(0)))
+                        if lane_idx == Int32(0):
+                            ring._smem_page_offsets[mask_base + word_idx] = bits
+            quads_per_warp = 32 // num_load_warps
+            gather4_cached_warp(
+                stage_base.data_ptr(
+                    warp_in_task * Int32(quads_per_warp * 4 * active_width)
+                ),
+                descriptor,
+                Int32(cfg.latent_dim) if is_rope_stage else dim_offset,
+                cached_page_ids,
+                stage_info.barrier,
+                cache_start=6,
+                num_quads=quads_per_warp,
+                num_slices=1,
+                quad_stride=4 * active_width,
+                slice_stride=0,
+                col_stride=0,
             )
+            if cutlass.const_expr(uses_compact_fp8_rope_stage):
+                if warp_in_task == Int32(0):
+                    if prims.elect_sync():
+                        missing_stage_bytes = (
+                            cfg.tile_size_kv
+                            * (cfg.head_dim_per_stage_kv - active_width)
+                            * cfg.qkv_dtype_bytes
+                        )
+                        prims.mbarrier_complete_tx(
+                            stage_info.barrier, Int32(missing_stage_bytes)
+                        )
             return
         if cutlass.const_expr(cfg.use_paged_kv == 1):
             if cutlass.const_expr(
