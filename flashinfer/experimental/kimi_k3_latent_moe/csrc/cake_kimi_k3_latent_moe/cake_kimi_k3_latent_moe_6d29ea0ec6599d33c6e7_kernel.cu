@@ -177,7 +177,7 @@ __device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
 extern "C" {
 
 __global__ __launch_bounds__(192) void
-kernel_cake_kimi_k3_latent_moe_7309f374d654ca0c525c(const __grid_constant__ CUtensorMap A_R, const __grid_constant__ CUtensorMap A_L, const __grid_constant__ CUtensorMap A_S, const __grid_constant__ CUtensorMap A_2, const __grid_constant__ CUtensorMap B_1, const __grid_constant__ CUtensorMap B_2, float* __restrict__ out_r, __nv_bfloat16* __restrict__ out_l, __nv_bfloat16* __restrict__ out_s, unsigned int* __restrict__ counters, __nv_bfloat16* __restrict__ routed, __nv_bfloat16* __restrict__ norm_w, __nv_bfloat16* __restrict__ y_out, unsigned long long* __restrict__ tl, int num_tokens, int k1_off, int num_partials, float eps)
+kernel_cake_kimi_k3_latent_moe_6d29ea0ec6599d33c6e7(const __grid_constant__ CUtensorMap A_R, const __grid_constant__ CUtensorMap A_L, const __grid_constant__ CUtensorMap A_S, const __grid_constant__ CUtensorMap A_2, const __grid_constant__ CUtensorMap B_1, const __grid_constant__ CUtensorMap B_2, float* __restrict__ out_r, __nv_bfloat16* __restrict__ out_l, __nv_bfloat16* __restrict__ out_s, unsigned int* __restrict__ counters, __nv_bfloat16* __restrict__ routed, __nv_bfloat16* __restrict__ norm_w, __nv_bfloat16* __restrict__ y_out, unsigned long long* __restrict__ tl, int num_tokens, int k1_off, int num_partials, float eps)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -464,421 +464,421 @@ kernel_cake_kimi_k3_latent_moe_7309f374d654ca0c525c(const __grid_constant__ CUte
             }
             if (fin == 1) {
                 if (cls == 2) {
-                    int tok = lane_pair * 2;
-                    int frow = row_base;
-                    if (tok < num_tokens) {
-                        float gk = (float)(__nv_bfloat16)red[0];
-                        float uk = (float)(__nv_bfloat16)red[32];
-                        float _exp2_0 = approx_exp2((-gk) * 1.442695f);
-                        float sig = approx_rcp(1.0f + _exp2_0);
-                        float _tanh_1 = tanhf(gk * 0.25f);
-                        float aa = 4.0f * _tanh_1 * sig;
-                        float _tanh_2 = tanhf(uk * 0.04f);
-                        float bb = 25.0f * _tanh_2;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok * 6144 + row_s + frow)) + (0)) = (__nv_bfloat16)(aa * bb);
+                    int tok_1_0 = lane_pair * 2;
+                    int frow_2_0 = row_base;
+                    if (tok_1_0 < num_tokens) {
+                        float gk_1_0 = (float)(__nv_bfloat16)red[0];
+                        float uk_1_0 = (float)(__nv_bfloat16)red[32];
+                        float _exp2_0 = approx_exp2((-gk_1_0) * 1.442695f);
+                        float sig_1_0 = approx_rcp(1.0f + _exp2_0);
+                        float _tanh_1 = tanhf(gk_1_0 * 0.25f);
+                        float aa_1_0 = 4.0f * _tanh_1 * sig_1_0;
+                        float _tanh_2 = tanhf(uk_1_0 * 0.04f);
+                        float bb_1_0 = 25.0f * _tanh_2;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_0 * 6144 + row_s + frow_2_0)) + (0)) = (__nv_bfloat16)(aa_1_0 * bb_1_0);
                     }
-                    int tok_0 = lane_pair * 2 + 1;
-                    int frow_1 = row_base;
-                    if (tok_0 < num_tokens) {
-                        float gk_1 = (float)(__nv_bfloat16)red[1];
-                        float uk_1 = (float)(__nv_bfloat16)red[33];
-                        float _exp2_3 = approx_exp2((-gk_1) * 1.442695f);
-                        float sig_1 = approx_rcp(1.0f + _exp2_3);
-                        float _tanh_4 = tanhf(gk_1 * 0.25f);
-                        float aa_1 = 4.0f * _tanh_4 * sig_1;
-                        float _tanh_5 = tanhf(uk_1 * 0.04f);
-                        float bb_1 = 25.0f * _tanh_5;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_0 * 6144 + row_s + frow_1)) + (0)) = (__nv_bfloat16)(aa_1 * bb_1);
+                    int tok_1_1 = lane_pair * 2 + 1;
+                    int frow_2_1 = row_base;
+                    if (tok_1_1 < num_tokens) {
+                        float gk_1_1 = (float)(__nv_bfloat16)red[1];
+                        float uk_1_1 = (float)(__nv_bfloat16)red[33];
+                        float _exp2_3 = approx_exp2((-gk_1_1) * 1.442695f);
+                        float sig_1_1 = approx_rcp(1.0f + _exp2_3);
+                        float _tanh_4 = tanhf(gk_1_1 * 0.25f);
+                        float aa_1_1 = 4.0f * _tanh_4 * sig_1_1;
+                        float _tanh_5 = tanhf(uk_1_1 * 0.04f);
+                        float bb_1_1 = 25.0f * _tanh_5;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_1 * 6144 + row_s + frow_2_1)) + (0)) = (__nv_bfloat16)(aa_1_1 * bb_1_1);
                     }
-                    int tok_2 = lane_pair * 2;
-                    int frow_3 = row_base + 8;
-                    if (tok_2 < num_tokens) {
-                        float gk_2 = (float)(__nv_bfloat16)red[2];
-                        float uk_2 = (float)(__nv_bfloat16)red[34];
-                        float _exp2_6 = approx_exp2((-gk_2) * 1.442695f);
-                        float sig_2 = approx_rcp(1.0f + _exp2_6);
-                        float _tanh_7 = tanhf(gk_2 * 0.25f);
-                        float aa_2 = 4.0f * _tanh_7 * sig_2;
-                        float _tanh_8 = tanhf(uk_2 * 0.04f);
-                        float bb_2 = 25.0f * _tanh_8;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_2 * 6144 + row_s + frow_3)) + (0)) = (__nv_bfloat16)(aa_2 * bb_2);
+                    int tok_1_2 = lane_pair * 2;
+                    int frow_2_2 = row_base + 8;
+                    if (tok_1_2 < num_tokens) {
+                        float gk_1_2 = (float)(__nv_bfloat16)red[2];
+                        float uk_1_2 = (float)(__nv_bfloat16)red[34];
+                        float _exp2_6 = approx_exp2((-gk_1_2) * 1.442695f);
+                        float sig_1_2 = approx_rcp(1.0f + _exp2_6);
+                        float _tanh_7 = tanhf(gk_1_2 * 0.25f);
+                        float aa_1_2 = 4.0f * _tanh_7 * sig_1_2;
+                        float _tanh_8 = tanhf(uk_1_2 * 0.04f);
+                        float bb_1_2 = 25.0f * _tanh_8;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_2 * 6144 + row_s + frow_2_2)) + (0)) = (__nv_bfloat16)(aa_1_2 * bb_1_2);
                     }
-                    int tok_4 = lane_pair * 2 + 1;
-                    int frow_5 = row_base + 8;
-                    if (tok_4 < num_tokens) {
-                        float gk_3 = (float)(__nv_bfloat16)red[3];
-                        float uk_3 = (float)(__nv_bfloat16)red[35];
-                        float _exp2_9 = approx_exp2((-gk_3) * 1.442695f);
-                        float sig_3 = approx_rcp(1.0f + _exp2_9);
-                        float _tanh_10 = tanhf(gk_3 * 0.25f);
-                        float aa_3 = 4.0f * _tanh_10 * sig_3;
-                        float _tanh_11 = tanhf(uk_3 * 0.04f);
-                        float bb_3 = 25.0f * _tanh_11;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_4 * 6144 + row_s + frow_5)) + (0)) = (__nv_bfloat16)(aa_3 * bb_3);
+                    int tok_1_3 = lane_pair * 2 + 1;
+                    int frow_2_3 = row_base + 8;
+                    if (tok_1_3 < num_tokens) {
+                        float gk_1_3 = (float)(__nv_bfloat16)red[3];
+                        float uk_1_3 = (float)(__nv_bfloat16)red[35];
+                        float _exp2_9 = approx_exp2((-gk_1_3) * 1.442695f);
+                        float sig_1_3 = approx_rcp(1.0f + _exp2_9);
+                        float _tanh_10 = tanhf(gk_1_3 * 0.25f);
+                        float aa_1_3 = 4.0f * _tanh_10 * sig_1_3;
+                        float _tanh_11 = tanhf(uk_1_3 * 0.04f);
+                        float bb_1_3 = 25.0f * _tanh_11;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_3 * 6144 + row_s + frow_2_3)) + (0)) = (__nv_bfloat16)(aa_1_3 * bb_1_3);
                     }
-                    int tok_6 = 8 + lane_pair * 2;
-                    int frow_7 = row_base;
-                    if (tok_6 < num_tokens) {
-                        float gk_4 = (float)(__nv_bfloat16)red[4];
-                        float uk_4 = (float)(__nv_bfloat16)red[36];
-                        float _exp2_12 = approx_exp2((-gk_4) * 1.442695f);
-                        float sig_4 = approx_rcp(1.0f + _exp2_12);
-                        float _tanh_13 = tanhf(gk_4 * 0.25f);
-                        float aa_4 = 4.0f * _tanh_13 * sig_4;
-                        float _tanh_14 = tanhf(uk_4 * 0.04f);
-                        float bb_4 = 25.0f * _tanh_14;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_6 * 6144 + row_s + frow_7)) + (0)) = (__nv_bfloat16)(aa_4 * bb_4);
+                    int tok_1_4 = 8 + lane_pair * 2;
+                    int frow_2_4 = row_base;
+                    if (tok_1_4 < num_tokens) {
+                        float gk_1_4 = (float)(__nv_bfloat16)red[4];
+                        float uk_1_4 = (float)(__nv_bfloat16)red[36];
+                        float _exp2_12 = approx_exp2((-gk_1_4) * 1.442695f);
+                        float sig_1_4 = approx_rcp(1.0f + _exp2_12);
+                        float _tanh_13 = tanhf(gk_1_4 * 0.25f);
+                        float aa_1_4 = 4.0f * _tanh_13 * sig_1_4;
+                        float _tanh_14 = tanhf(uk_1_4 * 0.04f);
+                        float bb_1_4 = 25.0f * _tanh_14;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_4 * 6144 + row_s + frow_2_4)) + (0)) = (__nv_bfloat16)(aa_1_4 * bb_1_4);
                     }
-                    int tok_8 = 8 + lane_pair * 2 + 1;
-                    int frow_9 = row_base;
-                    if (tok_8 < num_tokens) {
-                        float gk_5 = (float)(__nv_bfloat16)red[5];
-                        float uk_5 = (float)(__nv_bfloat16)red[37];
-                        float _exp2_15 = approx_exp2((-gk_5) * 1.442695f);
-                        float sig_5 = approx_rcp(1.0f + _exp2_15);
-                        float _tanh_16 = tanhf(gk_5 * 0.25f);
-                        float aa_5 = 4.0f * _tanh_16 * sig_5;
-                        float _tanh_17 = tanhf(uk_5 * 0.04f);
-                        float bb_5 = 25.0f * _tanh_17;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_8 * 6144 + row_s + frow_9)) + (0)) = (__nv_bfloat16)(aa_5 * bb_5);
+                    int tok_1_5 = 8 + lane_pair * 2 + 1;
+                    int frow_2_5 = row_base;
+                    if (tok_1_5 < num_tokens) {
+                        float gk_1_5 = (float)(__nv_bfloat16)red[5];
+                        float uk_1_5 = (float)(__nv_bfloat16)red[37];
+                        float _exp2_15 = approx_exp2((-gk_1_5) * 1.442695f);
+                        float sig_1_5 = approx_rcp(1.0f + _exp2_15);
+                        float _tanh_16 = tanhf(gk_1_5 * 0.25f);
+                        float aa_1_5 = 4.0f * _tanh_16 * sig_1_5;
+                        float _tanh_17 = tanhf(uk_1_5 * 0.04f);
+                        float bb_1_5 = 25.0f * _tanh_17;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_5 * 6144 + row_s + frow_2_5)) + (0)) = (__nv_bfloat16)(aa_1_5 * bb_1_5);
                     }
-                    int tok_10 = 8 + lane_pair * 2;
-                    int frow_11 = row_base + 8;
-                    if (tok_10 < num_tokens) {
-                        float gk_6 = (float)(__nv_bfloat16)red[6];
-                        float uk_6 = (float)(__nv_bfloat16)red[38];
-                        float _exp2_18 = approx_exp2((-gk_6) * 1.442695f);
-                        float sig_6 = approx_rcp(1.0f + _exp2_18);
-                        float _tanh_19 = tanhf(gk_6 * 0.25f);
-                        float aa_6 = 4.0f * _tanh_19 * sig_6;
-                        float _tanh_20 = tanhf(uk_6 * 0.04f);
-                        float bb_6 = 25.0f * _tanh_20;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_10 * 6144 + row_s + frow_11)) + (0)) = (__nv_bfloat16)(aa_6 * bb_6);
+                    int tok_1_6 = 8 + lane_pair * 2;
+                    int frow_2_6 = row_base + 8;
+                    if (tok_1_6 < num_tokens) {
+                        float gk_1_6 = (float)(__nv_bfloat16)red[6];
+                        float uk_1_6 = (float)(__nv_bfloat16)red[38];
+                        float _exp2_18 = approx_exp2((-gk_1_6) * 1.442695f);
+                        float sig_1_6 = approx_rcp(1.0f + _exp2_18);
+                        float _tanh_19 = tanhf(gk_1_6 * 0.25f);
+                        float aa_1_6 = 4.0f * _tanh_19 * sig_1_6;
+                        float _tanh_20 = tanhf(uk_1_6 * 0.04f);
+                        float bb_1_6 = 25.0f * _tanh_20;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_6 * 6144 + row_s + frow_2_6)) + (0)) = (__nv_bfloat16)(aa_1_6 * bb_1_6);
                     }
-                    int tok_12 = 8 + lane_pair * 2 + 1;
-                    int frow_13 = row_base + 8;
-                    if (tok_12 < num_tokens) {
-                        float gk_7 = (float)(__nv_bfloat16)red[7];
-                        float uk_7 = (float)(__nv_bfloat16)red[39];
-                        float _exp2_21 = approx_exp2((-gk_7) * 1.442695f);
-                        float sig_7 = approx_rcp(1.0f + _exp2_21);
-                        float _tanh_22 = tanhf(gk_7 * 0.25f);
-                        float aa_7 = 4.0f * _tanh_22 * sig_7;
-                        float _tanh_23 = tanhf(uk_7 * 0.04f);
-                        float bb_7 = 25.0f * _tanh_23;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_12 * 6144 + row_s + frow_13)) + (0)) = (__nv_bfloat16)(aa_7 * bb_7);
+                    int tok_1_7 = 8 + lane_pair * 2 + 1;
+                    int frow_2_7 = row_base + 8;
+                    if (tok_1_7 < num_tokens) {
+                        float gk_1_7 = (float)(__nv_bfloat16)red[7];
+                        float uk_1_7 = (float)(__nv_bfloat16)red[39];
+                        float _exp2_21 = approx_exp2((-gk_1_7) * 1.442695f);
+                        float sig_1_7 = approx_rcp(1.0f + _exp2_21);
+                        float _tanh_22 = tanhf(gk_1_7 * 0.25f);
+                        float aa_1_7 = 4.0f * _tanh_22 * sig_1_7;
+                        float _tanh_23 = tanhf(uk_1_7 * 0.04f);
+                        float bb_1_7 = 25.0f * _tanh_23;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_7 * 6144 + row_s + frow_2_7)) + (0)) = (__nv_bfloat16)(aa_1_7 * bb_1_7);
                     }
-                    int tok_14 = 16 + lane_pair * 2;
-                    int frow_15 = row_base;
-                    if (tok_14 < num_tokens) {
-                        float gk_8 = (float)(__nv_bfloat16)red[8];
-                        float uk_8 = (float)(__nv_bfloat16)red[40];
-                        float _exp2_24 = approx_exp2((-gk_8) * 1.442695f);
-                        float sig_8 = approx_rcp(1.0f + _exp2_24);
-                        float _tanh_25 = tanhf(gk_8 * 0.25f);
-                        float aa_8 = 4.0f * _tanh_25 * sig_8;
-                        float _tanh_26 = tanhf(uk_8 * 0.04f);
-                        float bb_8 = 25.0f * _tanh_26;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_14 * 6144 + row_s + frow_15)) + (0)) = (__nv_bfloat16)(aa_8 * bb_8);
+                    int tok_1_8 = 16 + lane_pair * 2;
+                    int frow_2_8 = row_base;
+                    if (tok_1_8 < num_tokens) {
+                        float gk_1_8 = (float)(__nv_bfloat16)red[8];
+                        float uk_1_8 = (float)(__nv_bfloat16)red[40];
+                        float _exp2_24 = approx_exp2((-gk_1_8) * 1.442695f);
+                        float sig_1_8 = approx_rcp(1.0f + _exp2_24);
+                        float _tanh_25 = tanhf(gk_1_8 * 0.25f);
+                        float aa_1_8 = 4.0f * _tanh_25 * sig_1_8;
+                        float _tanh_26 = tanhf(uk_1_8 * 0.04f);
+                        float bb_1_8 = 25.0f * _tanh_26;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_8 * 6144 + row_s + frow_2_8)) + (0)) = (__nv_bfloat16)(aa_1_8 * bb_1_8);
                     }
-                    int tok_16 = 16 + lane_pair * 2 + 1;
-                    int frow_17 = row_base;
-                    if (tok_16 < num_tokens) {
-                        float gk_9 = (float)(__nv_bfloat16)red[9];
-                        float uk_9 = (float)(__nv_bfloat16)red[41];
-                        float _exp2_27 = approx_exp2((-gk_9) * 1.442695f);
-                        float sig_9 = approx_rcp(1.0f + _exp2_27);
-                        float _tanh_28 = tanhf(gk_9 * 0.25f);
-                        float aa_9 = 4.0f * _tanh_28 * sig_9;
-                        float _tanh_29 = tanhf(uk_9 * 0.04f);
-                        float bb_9 = 25.0f * _tanh_29;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_16 * 6144 + row_s + frow_17)) + (0)) = (__nv_bfloat16)(aa_9 * bb_9);
+                    int tok_1_9 = 16 + lane_pair * 2 + 1;
+                    int frow_2_9 = row_base;
+                    if (tok_1_9 < num_tokens) {
+                        float gk_1_9 = (float)(__nv_bfloat16)red[9];
+                        float uk_1_9 = (float)(__nv_bfloat16)red[41];
+                        float _exp2_27 = approx_exp2((-gk_1_9) * 1.442695f);
+                        float sig_1_9 = approx_rcp(1.0f + _exp2_27);
+                        float _tanh_28 = tanhf(gk_1_9 * 0.25f);
+                        float aa_1_9 = 4.0f * _tanh_28 * sig_1_9;
+                        float _tanh_29 = tanhf(uk_1_9 * 0.04f);
+                        float bb_1_9 = 25.0f * _tanh_29;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_9 * 6144 + row_s + frow_2_9)) + (0)) = (__nv_bfloat16)(aa_1_9 * bb_1_9);
                     }
-                    int tok_18 = 16 + lane_pair * 2;
-                    int frow_19 = row_base + 8;
-                    if (tok_18 < num_tokens) {
-                        float gk_10 = (float)(__nv_bfloat16)red[10];
-                        float uk_10 = (float)(__nv_bfloat16)red[42];
-                        float _exp2_30 = approx_exp2((-gk_10) * 1.442695f);
-                        float sig_10 = approx_rcp(1.0f + _exp2_30);
-                        float _tanh_31 = tanhf(gk_10 * 0.25f);
-                        float aa_10 = 4.0f * _tanh_31 * sig_10;
-                        float _tanh_32 = tanhf(uk_10 * 0.04f);
-                        float bb_10 = 25.0f * _tanh_32;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_18 * 6144 + row_s + frow_19)) + (0)) = (__nv_bfloat16)(aa_10 * bb_10);
+                    int tok_1_10 = 16 + lane_pair * 2;
+                    int frow_2_10 = row_base + 8;
+                    if (tok_1_10 < num_tokens) {
+                        float gk_1_10 = (float)(__nv_bfloat16)red[10];
+                        float uk_1_10 = (float)(__nv_bfloat16)red[42];
+                        float _exp2_30 = approx_exp2((-gk_1_10) * 1.442695f);
+                        float sig_1_10 = approx_rcp(1.0f + _exp2_30);
+                        float _tanh_31 = tanhf(gk_1_10 * 0.25f);
+                        float aa_1_10 = 4.0f * _tanh_31 * sig_1_10;
+                        float _tanh_32 = tanhf(uk_1_10 * 0.04f);
+                        float bb_1_10 = 25.0f * _tanh_32;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_10 * 6144 + row_s + frow_2_10)) + (0)) = (__nv_bfloat16)(aa_1_10 * bb_1_10);
                     }
-                    int tok_20 = 16 + lane_pair * 2 + 1;
-                    int frow_21 = row_base + 8;
-                    if (tok_20 < num_tokens) {
-                        float gk_11 = (float)(__nv_bfloat16)red[11];
-                        float uk_11 = (float)(__nv_bfloat16)red[43];
-                        float _exp2_33 = approx_exp2((-gk_11) * 1.442695f);
-                        float sig_11 = approx_rcp(1.0f + _exp2_33);
-                        float _tanh_34 = tanhf(gk_11 * 0.25f);
-                        float aa_11 = 4.0f * _tanh_34 * sig_11;
-                        float _tanh_35 = tanhf(uk_11 * 0.04f);
-                        float bb_11 = 25.0f * _tanh_35;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_20 * 6144 + row_s + frow_21)) + (0)) = (__nv_bfloat16)(aa_11 * bb_11);
+                    int tok_1_11 = 16 + lane_pair * 2 + 1;
+                    int frow_2_11 = row_base + 8;
+                    if (tok_1_11 < num_tokens) {
+                        float gk_1_11 = (float)(__nv_bfloat16)red[11];
+                        float uk_1_11 = (float)(__nv_bfloat16)red[43];
+                        float _exp2_33 = approx_exp2((-gk_1_11) * 1.442695f);
+                        float sig_1_11 = approx_rcp(1.0f + _exp2_33);
+                        float _tanh_34 = tanhf(gk_1_11 * 0.25f);
+                        float aa_1_11 = 4.0f * _tanh_34 * sig_1_11;
+                        float _tanh_35 = tanhf(uk_1_11 * 0.04f);
+                        float bb_1_11 = 25.0f * _tanh_35;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_11 * 6144 + row_s + frow_2_11)) + (0)) = (__nv_bfloat16)(aa_1_11 * bb_1_11);
                     }
-                    int tok_22 = 24 + lane_pair * 2;
-                    int frow_23 = row_base;
-                    if (tok_22 < num_tokens) {
-                        float gk_12 = (float)(__nv_bfloat16)red[12];
-                        float uk_12 = (float)(__nv_bfloat16)red[44];
-                        float _exp2_36 = approx_exp2((-gk_12) * 1.442695f);
-                        float sig_12 = approx_rcp(1.0f + _exp2_36);
-                        float _tanh_37 = tanhf(gk_12 * 0.25f);
-                        float aa_12 = 4.0f * _tanh_37 * sig_12;
-                        float _tanh_38 = tanhf(uk_12 * 0.04f);
-                        float bb_12 = 25.0f * _tanh_38;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_22 * 6144 + row_s + frow_23)) + (0)) = (__nv_bfloat16)(aa_12 * bb_12);
+                    int tok_1_12 = 24 + lane_pair * 2;
+                    int frow_2_12 = row_base;
+                    if (tok_1_12 < num_tokens) {
+                        float gk_1_12 = (float)(__nv_bfloat16)red[12];
+                        float uk_1_12 = (float)(__nv_bfloat16)red[44];
+                        float _exp2_36 = approx_exp2((-gk_1_12) * 1.442695f);
+                        float sig_1_12 = approx_rcp(1.0f + _exp2_36);
+                        float _tanh_37 = tanhf(gk_1_12 * 0.25f);
+                        float aa_1_12 = 4.0f * _tanh_37 * sig_1_12;
+                        float _tanh_38 = tanhf(uk_1_12 * 0.04f);
+                        float bb_1_12 = 25.0f * _tanh_38;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_12 * 6144 + row_s + frow_2_12)) + (0)) = (__nv_bfloat16)(aa_1_12 * bb_1_12);
                     }
-                    int tok_24 = 24 + lane_pair * 2 + 1;
-                    int frow_25 = row_base;
-                    if (tok_24 < num_tokens) {
-                        float gk_13 = (float)(__nv_bfloat16)red[13];
-                        float uk_13 = (float)(__nv_bfloat16)red[45];
-                        float _exp2_39 = approx_exp2((-gk_13) * 1.442695f);
-                        float sig_13 = approx_rcp(1.0f + _exp2_39);
-                        float _tanh_40 = tanhf(gk_13 * 0.25f);
-                        float aa_13 = 4.0f * _tanh_40 * sig_13;
-                        float _tanh_41 = tanhf(uk_13 * 0.04f);
-                        float bb_13 = 25.0f * _tanh_41;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_24 * 6144 + row_s + frow_25)) + (0)) = (__nv_bfloat16)(aa_13 * bb_13);
+                    int tok_1_13 = 24 + lane_pair * 2 + 1;
+                    int frow_2_13 = row_base;
+                    if (tok_1_13 < num_tokens) {
+                        float gk_1_13 = (float)(__nv_bfloat16)red[13];
+                        float uk_1_13 = (float)(__nv_bfloat16)red[45];
+                        float _exp2_39 = approx_exp2((-gk_1_13) * 1.442695f);
+                        float sig_1_13 = approx_rcp(1.0f + _exp2_39);
+                        float _tanh_40 = tanhf(gk_1_13 * 0.25f);
+                        float aa_1_13 = 4.0f * _tanh_40 * sig_1_13;
+                        float _tanh_41 = tanhf(uk_1_13 * 0.04f);
+                        float bb_1_13 = 25.0f * _tanh_41;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_13 * 6144 + row_s + frow_2_13)) + (0)) = (__nv_bfloat16)(aa_1_13 * bb_1_13);
                     }
-                    int tok_26 = 24 + lane_pair * 2;
-                    int frow_27 = row_base + 8;
-                    if (tok_26 < num_tokens) {
-                        float gk_14 = (float)(__nv_bfloat16)red[14];
-                        float uk_14 = (float)(__nv_bfloat16)red[46];
-                        float _exp2_42 = approx_exp2((-gk_14) * 1.442695f);
-                        float sig_14 = approx_rcp(1.0f + _exp2_42);
-                        float _tanh_43 = tanhf(gk_14 * 0.25f);
-                        float aa_14 = 4.0f * _tanh_43 * sig_14;
-                        float _tanh_44 = tanhf(uk_14 * 0.04f);
-                        float bb_14 = 25.0f * _tanh_44;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_26 * 6144 + row_s + frow_27)) + (0)) = (__nv_bfloat16)(aa_14 * bb_14);
+                    int tok_1_14 = 24 + lane_pair * 2;
+                    int frow_2_14 = row_base + 8;
+                    if (tok_1_14 < num_tokens) {
+                        float gk_1_14 = (float)(__nv_bfloat16)red[14];
+                        float uk_1_14 = (float)(__nv_bfloat16)red[46];
+                        float _exp2_42 = approx_exp2((-gk_1_14) * 1.442695f);
+                        float sig_1_14 = approx_rcp(1.0f + _exp2_42);
+                        float _tanh_43 = tanhf(gk_1_14 * 0.25f);
+                        float aa_1_14 = 4.0f * _tanh_43 * sig_1_14;
+                        float _tanh_44 = tanhf(uk_1_14 * 0.04f);
+                        float bb_1_14 = 25.0f * _tanh_44;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_14 * 6144 + row_s + frow_2_14)) + (0)) = (__nv_bfloat16)(aa_1_14 * bb_1_14);
                     }
-                    int tok_28 = 24 + lane_pair * 2 + 1;
-                    int frow_29 = row_base + 8;
-                    if (tok_28 < num_tokens) {
-                        float gk_15 = (float)(__nv_bfloat16)red[15];
-                        float uk_15 = (float)(__nv_bfloat16)red[47];
-                        float _exp2_45 = approx_exp2((-gk_15) * 1.442695f);
-                        float sig_15 = approx_rcp(1.0f + _exp2_45);
-                        float _tanh_46 = tanhf(gk_15 * 0.25f);
-                        float aa_15 = 4.0f * _tanh_46 * sig_15;
-                        float _tanh_47 = tanhf(uk_15 * 0.04f);
-                        float bb_15 = 25.0f * _tanh_47;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_28 * 6144 + row_s + frow_29)) + (0)) = (__nv_bfloat16)(aa_15 * bb_15);
+                    int tok_1_15 = 24 + lane_pair * 2 + 1;
+                    int frow_2_15 = row_base + 8;
+                    if (tok_1_15 < num_tokens) {
+                        float gk_1_15 = (float)(__nv_bfloat16)red[15];
+                        float uk_1_15 = (float)(__nv_bfloat16)red[47];
+                        float _exp2_45 = approx_exp2((-gk_1_15) * 1.442695f);
+                        float sig_1_15 = approx_rcp(1.0f + _exp2_45);
+                        float _tanh_46 = tanhf(gk_1_15 * 0.25f);
+                        float aa_1_15 = 4.0f * _tanh_46 * sig_1_15;
+                        float _tanh_47 = tanhf(uk_1_15 * 0.04f);
+                        float bb_1_15 = 25.0f * _tanh_47;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_15 * 6144 + row_s + frow_2_15)) + (0)) = (__nv_bfloat16)(aa_1_15 * bb_1_15);
                     }
-                    int tok_30 = 32 + lane_pair * 2;
-                    int frow_31 = row_base;
-                    if (tok_30 < num_tokens) {
-                        float gk_16 = (float)(__nv_bfloat16)red[16];
-                        float uk_16 = (float)(__nv_bfloat16)red[48];
-                        float _exp2_48 = approx_exp2((-gk_16) * 1.442695f);
-                        float sig_16 = approx_rcp(1.0f + _exp2_48);
-                        float _tanh_49 = tanhf(gk_16 * 0.25f);
-                        float aa_16 = 4.0f * _tanh_49 * sig_16;
-                        float _tanh_50 = tanhf(uk_16 * 0.04f);
-                        float bb_16 = 25.0f * _tanh_50;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_30 * 6144 + row_s + frow_31)) + (0)) = (__nv_bfloat16)(aa_16 * bb_16);
+                    int tok_1_16 = 32 + lane_pair * 2;
+                    int frow_2_16 = row_base;
+                    if (tok_1_16 < num_tokens) {
+                        float gk_1_16 = (float)(__nv_bfloat16)red[16];
+                        float uk_1_16 = (float)(__nv_bfloat16)red[48];
+                        float _exp2_48 = approx_exp2((-gk_1_16) * 1.442695f);
+                        float sig_1_16 = approx_rcp(1.0f + _exp2_48);
+                        float _tanh_49 = tanhf(gk_1_16 * 0.25f);
+                        float aa_1_16 = 4.0f * _tanh_49 * sig_1_16;
+                        float _tanh_50 = tanhf(uk_1_16 * 0.04f);
+                        float bb_1_16 = 25.0f * _tanh_50;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_16 * 6144 + row_s + frow_2_16)) + (0)) = (__nv_bfloat16)(aa_1_16 * bb_1_16);
                     }
-                    int tok_32 = 32 + lane_pair * 2 + 1;
-                    int frow_33 = row_base;
-                    if (tok_32 < num_tokens) {
-                        float gk_17 = (float)(__nv_bfloat16)red[17];
-                        float uk_17 = (float)(__nv_bfloat16)red[49];
-                        float _exp2_51 = approx_exp2((-gk_17) * 1.442695f);
-                        float sig_17 = approx_rcp(1.0f + _exp2_51);
-                        float _tanh_52 = tanhf(gk_17 * 0.25f);
-                        float aa_17 = 4.0f * _tanh_52 * sig_17;
-                        float _tanh_53 = tanhf(uk_17 * 0.04f);
-                        float bb_17 = 25.0f * _tanh_53;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_32 * 6144 + row_s + frow_33)) + (0)) = (__nv_bfloat16)(aa_17 * bb_17);
+                    int tok_1_17 = 32 + lane_pair * 2 + 1;
+                    int frow_2_17 = row_base;
+                    if (tok_1_17 < num_tokens) {
+                        float gk_1_17 = (float)(__nv_bfloat16)red[17];
+                        float uk_1_17 = (float)(__nv_bfloat16)red[49];
+                        float _exp2_51 = approx_exp2((-gk_1_17) * 1.442695f);
+                        float sig_1_17 = approx_rcp(1.0f + _exp2_51);
+                        float _tanh_52 = tanhf(gk_1_17 * 0.25f);
+                        float aa_1_17 = 4.0f * _tanh_52 * sig_1_17;
+                        float _tanh_53 = tanhf(uk_1_17 * 0.04f);
+                        float bb_1_17 = 25.0f * _tanh_53;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_17 * 6144 + row_s + frow_2_17)) + (0)) = (__nv_bfloat16)(aa_1_17 * bb_1_17);
                     }
-                    int tok_34 = 32 + lane_pair * 2;
-                    int frow_35 = row_base + 8;
-                    if (tok_34 < num_tokens) {
-                        float gk_18 = (float)(__nv_bfloat16)red[18];
-                        float uk_18 = (float)(__nv_bfloat16)red[50];
-                        float _exp2_54 = approx_exp2((-gk_18) * 1.442695f);
-                        float sig_18 = approx_rcp(1.0f + _exp2_54);
-                        float _tanh_55 = tanhf(gk_18 * 0.25f);
-                        float aa_18 = 4.0f * _tanh_55 * sig_18;
-                        float _tanh_56 = tanhf(uk_18 * 0.04f);
-                        float bb_18 = 25.0f * _tanh_56;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_34 * 6144 + row_s + frow_35)) + (0)) = (__nv_bfloat16)(aa_18 * bb_18);
+                    int tok_1_18 = 32 + lane_pair * 2;
+                    int frow_2_18 = row_base + 8;
+                    if (tok_1_18 < num_tokens) {
+                        float gk_1_18 = (float)(__nv_bfloat16)red[18];
+                        float uk_1_18 = (float)(__nv_bfloat16)red[50];
+                        float _exp2_54 = approx_exp2((-gk_1_18) * 1.442695f);
+                        float sig_1_18 = approx_rcp(1.0f + _exp2_54);
+                        float _tanh_55 = tanhf(gk_1_18 * 0.25f);
+                        float aa_1_18 = 4.0f * _tanh_55 * sig_1_18;
+                        float _tanh_56 = tanhf(uk_1_18 * 0.04f);
+                        float bb_1_18 = 25.0f * _tanh_56;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_18 * 6144 + row_s + frow_2_18)) + (0)) = (__nv_bfloat16)(aa_1_18 * bb_1_18);
                     }
-                    int tok_36 = 32 + lane_pair * 2 + 1;
-                    int frow_37 = row_base + 8;
-                    if (tok_36 < num_tokens) {
-                        float gk_19 = (float)(__nv_bfloat16)red[19];
-                        float uk_19 = (float)(__nv_bfloat16)red[51];
-                        float _exp2_57 = approx_exp2((-gk_19) * 1.442695f);
-                        float sig_19 = approx_rcp(1.0f + _exp2_57);
-                        float _tanh_58 = tanhf(gk_19 * 0.25f);
-                        float aa_19 = 4.0f * _tanh_58 * sig_19;
-                        float _tanh_59 = tanhf(uk_19 * 0.04f);
-                        float bb_19 = 25.0f * _tanh_59;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_36 * 6144 + row_s + frow_37)) + (0)) = (__nv_bfloat16)(aa_19 * bb_19);
+                    int tok_1_19 = 32 + lane_pair * 2 + 1;
+                    int frow_2_19 = row_base + 8;
+                    if (tok_1_19 < num_tokens) {
+                        float gk_1_19 = (float)(__nv_bfloat16)red[19];
+                        float uk_1_19 = (float)(__nv_bfloat16)red[51];
+                        float _exp2_57 = approx_exp2((-gk_1_19) * 1.442695f);
+                        float sig_1_19 = approx_rcp(1.0f + _exp2_57);
+                        float _tanh_58 = tanhf(gk_1_19 * 0.25f);
+                        float aa_1_19 = 4.0f * _tanh_58 * sig_1_19;
+                        float _tanh_59 = tanhf(uk_1_19 * 0.04f);
+                        float bb_1_19 = 25.0f * _tanh_59;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_19 * 6144 + row_s + frow_2_19)) + (0)) = (__nv_bfloat16)(aa_1_19 * bb_1_19);
                     }
-                    int tok_38 = 40 + lane_pair * 2;
-                    int frow_39 = row_base;
-                    if (tok_38 < num_tokens) {
-                        float gk_20 = (float)(__nv_bfloat16)red[20];
-                        float uk_20 = (float)(__nv_bfloat16)red[52];
-                        float _exp2_60 = approx_exp2((-gk_20) * 1.442695f);
-                        float sig_20 = approx_rcp(1.0f + _exp2_60);
-                        float _tanh_61 = tanhf(gk_20 * 0.25f);
-                        float aa_20 = 4.0f * _tanh_61 * sig_20;
-                        float _tanh_62 = tanhf(uk_20 * 0.04f);
-                        float bb_20 = 25.0f * _tanh_62;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_38 * 6144 + row_s + frow_39)) + (0)) = (__nv_bfloat16)(aa_20 * bb_20);
+                    int tok_1_20 = 40 + lane_pair * 2;
+                    int frow_2_20 = row_base;
+                    if (tok_1_20 < num_tokens) {
+                        float gk_1_20 = (float)(__nv_bfloat16)red[20];
+                        float uk_1_20 = (float)(__nv_bfloat16)red[52];
+                        float _exp2_60 = approx_exp2((-gk_1_20) * 1.442695f);
+                        float sig_1_20 = approx_rcp(1.0f + _exp2_60);
+                        float _tanh_61 = tanhf(gk_1_20 * 0.25f);
+                        float aa_1_20 = 4.0f * _tanh_61 * sig_1_20;
+                        float _tanh_62 = tanhf(uk_1_20 * 0.04f);
+                        float bb_1_20 = 25.0f * _tanh_62;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_20 * 6144 + row_s + frow_2_20)) + (0)) = (__nv_bfloat16)(aa_1_20 * bb_1_20);
                     }
-                    int tok_40 = 40 + lane_pair * 2 + 1;
-                    int frow_41 = row_base;
-                    if (tok_40 < num_tokens) {
-                        float gk_21 = (float)(__nv_bfloat16)red[21];
-                        float uk_21 = (float)(__nv_bfloat16)red[53];
-                        float _exp2_63 = approx_exp2((-gk_21) * 1.442695f);
-                        float sig_21 = approx_rcp(1.0f + _exp2_63);
-                        float _tanh_64 = tanhf(gk_21 * 0.25f);
-                        float aa_21 = 4.0f * _tanh_64 * sig_21;
-                        float _tanh_65 = tanhf(uk_21 * 0.04f);
-                        float bb_21 = 25.0f * _tanh_65;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_40 * 6144 + row_s + frow_41)) + (0)) = (__nv_bfloat16)(aa_21 * bb_21);
+                    int tok_1_21 = 40 + lane_pair * 2 + 1;
+                    int frow_2_21 = row_base;
+                    if (tok_1_21 < num_tokens) {
+                        float gk_1_21 = (float)(__nv_bfloat16)red[21];
+                        float uk_1_21 = (float)(__nv_bfloat16)red[53];
+                        float _exp2_63 = approx_exp2((-gk_1_21) * 1.442695f);
+                        float sig_1_21 = approx_rcp(1.0f + _exp2_63);
+                        float _tanh_64 = tanhf(gk_1_21 * 0.25f);
+                        float aa_1_21 = 4.0f * _tanh_64 * sig_1_21;
+                        float _tanh_65 = tanhf(uk_1_21 * 0.04f);
+                        float bb_1_21 = 25.0f * _tanh_65;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_21 * 6144 + row_s + frow_2_21)) + (0)) = (__nv_bfloat16)(aa_1_21 * bb_1_21);
                     }
-                    int tok_42 = 40 + lane_pair * 2;
-                    int frow_43 = row_base + 8;
-                    if (tok_42 < num_tokens) {
-                        float gk_22 = (float)(__nv_bfloat16)red[22];
-                        float uk_22 = (float)(__nv_bfloat16)red[54];
-                        float _exp2_66 = approx_exp2((-gk_22) * 1.442695f);
-                        float sig_22 = approx_rcp(1.0f + _exp2_66);
-                        float _tanh_67 = tanhf(gk_22 * 0.25f);
-                        float aa_22 = 4.0f * _tanh_67 * sig_22;
-                        float _tanh_68 = tanhf(uk_22 * 0.04f);
-                        float bb_22 = 25.0f * _tanh_68;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_42 * 6144 + row_s + frow_43)) + (0)) = (__nv_bfloat16)(aa_22 * bb_22);
+                    int tok_1_22 = 40 + lane_pair * 2;
+                    int frow_2_22 = row_base + 8;
+                    if (tok_1_22 < num_tokens) {
+                        float gk_1_22 = (float)(__nv_bfloat16)red[22];
+                        float uk_1_22 = (float)(__nv_bfloat16)red[54];
+                        float _exp2_66 = approx_exp2((-gk_1_22) * 1.442695f);
+                        float sig_1_22 = approx_rcp(1.0f + _exp2_66);
+                        float _tanh_67 = tanhf(gk_1_22 * 0.25f);
+                        float aa_1_22 = 4.0f * _tanh_67 * sig_1_22;
+                        float _tanh_68 = tanhf(uk_1_22 * 0.04f);
+                        float bb_1_22 = 25.0f * _tanh_68;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_22 * 6144 + row_s + frow_2_22)) + (0)) = (__nv_bfloat16)(aa_1_22 * bb_1_22);
                     }
-                    int tok_44 = 40 + lane_pair * 2 + 1;
-                    int frow_45 = row_base + 8;
-                    if (tok_44 < num_tokens) {
-                        float gk_23 = (float)(__nv_bfloat16)red[23];
-                        float uk_23 = (float)(__nv_bfloat16)red[55];
-                        float _exp2_69 = approx_exp2((-gk_23) * 1.442695f);
-                        float sig_23 = approx_rcp(1.0f + _exp2_69);
-                        float _tanh_70 = tanhf(gk_23 * 0.25f);
-                        float aa_23 = 4.0f * _tanh_70 * sig_23;
-                        float _tanh_71 = tanhf(uk_23 * 0.04f);
-                        float bb_23 = 25.0f * _tanh_71;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_44 * 6144 + row_s + frow_45)) + (0)) = (__nv_bfloat16)(aa_23 * bb_23);
+                    int tok_1_23 = 40 + lane_pair * 2 + 1;
+                    int frow_2_23 = row_base + 8;
+                    if (tok_1_23 < num_tokens) {
+                        float gk_1_23 = (float)(__nv_bfloat16)red[23];
+                        float uk_1_23 = (float)(__nv_bfloat16)red[55];
+                        float _exp2_69 = approx_exp2((-gk_1_23) * 1.442695f);
+                        float sig_1_23 = approx_rcp(1.0f + _exp2_69);
+                        float _tanh_70 = tanhf(gk_1_23 * 0.25f);
+                        float aa_1_23 = 4.0f * _tanh_70 * sig_1_23;
+                        float _tanh_71 = tanhf(uk_1_23 * 0.04f);
+                        float bb_1_23 = 25.0f * _tanh_71;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_23 * 6144 + row_s + frow_2_23)) + (0)) = (__nv_bfloat16)(aa_1_23 * bb_1_23);
                     }
-                    int tok_46 = 48 + lane_pair * 2;
-                    int frow_47 = row_base;
-                    if (tok_46 < num_tokens) {
-                        float gk_24 = (float)(__nv_bfloat16)red[24];
-                        float uk_24 = (float)(__nv_bfloat16)red[56];
-                        float _exp2_72 = approx_exp2((-gk_24) * 1.442695f);
-                        float sig_24 = approx_rcp(1.0f + _exp2_72);
-                        float _tanh_73 = tanhf(gk_24 * 0.25f);
-                        float aa_24 = 4.0f * _tanh_73 * sig_24;
-                        float _tanh_74 = tanhf(uk_24 * 0.04f);
-                        float bb_24 = 25.0f * _tanh_74;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_46 * 6144 + row_s + frow_47)) + (0)) = (__nv_bfloat16)(aa_24 * bb_24);
+                    int tok_1_24 = 48 + lane_pair * 2;
+                    int frow_2_24 = row_base;
+                    if (tok_1_24 < num_tokens) {
+                        float gk_1_24 = (float)(__nv_bfloat16)red[24];
+                        float uk_1_24 = (float)(__nv_bfloat16)red[56];
+                        float _exp2_72 = approx_exp2((-gk_1_24) * 1.442695f);
+                        float sig_1_24 = approx_rcp(1.0f + _exp2_72);
+                        float _tanh_73 = tanhf(gk_1_24 * 0.25f);
+                        float aa_1_24 = 4.0f * _tanh_73 * sig_1_24;
+                        float _tanh_74 = tanhf(uk_1_24 * 0.04f);
+                        float bb_1_24 = 25.0f * _tanh_74;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_24 * 6144 + row_s + frow_2_24)) + (0)) = (__nv_bfloat16)(aa_1_24 * bb_1_24);
                     }
-                    int tok_48 = 48 + lane_pair * 2 + 1;
-                    int frow_49 = row_base;
-                    if (tok_48 < num_tokens) {
-                        float gk_25 = (float)(__nv_bfloat16)red[25];
-                        float uk_25 = (float)(__nv_bfloat16)red[57];
-                        float _exp2_75 = approx_exp2((-gk_25) * 1.442695f);
-                        float sig_25 = approx_rcp(1.0f + _exp2_75);
-                        float _tanh_76 = tanhf(gk_25 * 0.25f);
-                        float aa_25 = 4.0f * _tanh_76 * sig_25;
-                        float _tanh_77 = tanhf(uk_25 * 0.04f);
-                        float bb_25 = 25.0f * _tanh_77;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_48 * 6144 + row_s + frow_49)) + (0)) = (__nv_bfloat16)(aa_25 * bb_25);
+                    int tok_1_25 = 48 + lane_pair * 2 + 1;
+                    int frow_2_25 = row_base;
+                    if (tok_1_25 < num_tokens) {
+                        float gk_1_25 = (float)(__nv_bfloat16)red[25];
+                        float uk_1_25 = (float)(__nv_bfloat16)red[57];
+                        float _exp2_75 = approx_exp2((-gk_1_25) * 1.442695f);
+                        float sig_1_25 = approx_rcp(1.0f + _exp2_75);
+                        float _tanh_76 = tanhf(gk_1_25 * 0.25f);
+                        float aa_1_25 = 4.0f * _tanh_76 * sig_1_25;
+                        float _tanh_77 = tanhf(uk_1_25 * 0.04f);
+                        float bb_1_25 = 25.0f * _tanh_77;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_25 * 6144 + row_s + frow_2_25)) + (0)) = (__nv_bfloat16)(aa_1_25 * bb_1_25);
                     }
-                    int tok_50 = 48 + lane_pair * 2;
-                    int frow_51 = row_base + 8;
-                    if (tok_50 < num_tokens) {
-                        float gk_26 = (float)(__nv_bfloat16)red[26];
-                        float uk_26 = (float)(__nv_bfloat16)red[58];
-                        float _exp2_78 = approx_exp2((-gk_26) * 1.442695f);
-                        float sig_26 = approx_rcp(1.0f + _exp2_78);
-                        float _tanh_79 = tanhf(gk_26 * 0.25f);
-                        float aa_26 = 4.0f * _tanh_79 * sig_26;
-                        float _tanh_80 = tanhf(uk_26 * 0.04f);
-                        float bb_26 = 25.0f * _tanh_80;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_50 * 6144 + row_s + frow_51)) + (0)) = (__nv_bfloat16)(aa_26 * bb_26);
+                    int tok_1_26 = 48 + lane_pair * 2;
+                    int frow_2_26 = row_base + 8;
+                    if (tok_1_26 < num_tokens) {
+                        float gk_1_26 = (float)(__nv_bfloat16)red[26];
+                        float uk_1_26 = (float)(__nv_bfloat16)red[58];
+                        float _exp2_78 = approx_exp2((-gk_1_26) * 1.442695f);
+                        float sig_1_26 = approx_rcp(1.0f + _exp2_78);
+                        float _tanh_79 = tanhf(gk_1_26 * 0.25f);
+                        float aa_1_26 = 4.0f * _tanh_79 * sig_1_26;
+                        float _tanh_80 = tanhf(uk_1_26 * 0.04f);
+                        float bb_1_26 = 25.0f * _tanh_80;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_26 * 6144 + row_s + frow_2_26)) + (0)) = (__nv_bfloat16)(aa_1_26 * bb_1_26);
                     }
-                    int tok_52 = 48 + lane_pair * 2 + 1;
-                    int frow_53 = row_base + 8;
-                    if (tok_52 < num_tokens) {
-                        float gk_27 = (float)(__nv_bfloat16)red[27];
-                        float uk_27 = (float)(__nv_bfloat16)red[59];
-                        float _exp2_81 = approx_exp2((-gk_27) * 1.442695f);
-                        float sig_27 = approx_rcp(1.0f + _exp2_81);
-                        float _tanh_82 = tanhf(gk_27 * 0.25f);
-                        float aa_27 = 4.0f * _tanh_82 * sig_27;
-                        float _tanh_83 = tanhf(uk_27 * 0.04f);
-                        float bb_27 = 25.0f * _tanh_83;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_52 * 6144 + row_s + frow_53)) + (0)) = (__nv_bfloat16)(aa_27 * bb_27);
+                    int tok_1_27 = 48 + lane_pair * 2 + 1;
+                    int frow_2_27 = row_base + 8;
+                    if (tok_1_27 < num_tokens) {
+                        float gk_1_27 = (float)(__nv_bfloat16)red[27];
+                        float uk_1_27 = (float)(__nv_bfloat16)red[59];
+                        float _exp2_81 = approx_exp2((-gk_1_27) * 1.442695f);
+                        float sig_1_27 = approx_rcp(1.0f + _exp2_81);
+                        float _tanh_82 = tanhf(gk_1_27 * 0.25f);
+                        float aa_1_27 = 4.0f * _tanh_82 * sig_1_27;
+                        float _tanh_83 = tanhf(uk_1_27 * 0.04f);
+                        float bb_1_27 = 25.0f * _tanh_83;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_27 * 6144 + row_s + frow_2_27)) + (0)) = (__nv_bfloat16)(aa_1_27 * bb_1_27);
                     }
-                    int tok_54 = 56 + lane_pair * 2;
-                    int frow_55 = row_base;
-                    if (tok_54 < num_tokens) {
-                        float gk_28 = (float)(__nv_bfloat16)red[28];
-                        float uk_28 = (float)(__nv_bfloat16)red[60];
-                        float _exp2_84 = approx_exp2((-gk_28) * 1.442695f);
-                        float sig_28 = approx_rcp(1.0f + _exp2_84);
-                        float _tanh_85 = tanhf(gk_28 * 0.25f);
-                        float aa_28 = 4.0f * _tanh_85 * sig_28;
-                        float _tanh_86 = tanhf(uk_28 * 0.04f);
-                        float bb_28 = 25.0f * _tanh_86;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_54 * 6144 + row_s + frow_55)) + (0)) = (__nv_bfloat16)(aa_28 * bb_28);
+                    int tok_1_28 = 56 + lane_pair * 2;
+                    int frow_2_28 = row_base;
+                    if (tok_1_28 < num_tokens) {
+                        float gk_1_28 = (float)(__nv_bfloat16)red[28];
+                        float uk_1_28 = (float)(__nv_bfloat16)red[60];
+                        float _exp2_84 = approx_exp2((-gk_1_28) * 1.442695f);
+                        float sig_1_28 = approx_rcp(1.0f + _exp2_84);
+                        float _tanh_85 = tanhf(gk_1_28 * 0.25f);
+                        float aa_1_28 = 4.0f * _tanh_85 * sig_1_28;
+                        float _tanh_86 = tanhf(uk_1_28 * 0.04f);
+                        float bb_1_28 = 25.0f * _tanh_86;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_28 * 6144 + row_s + frow_2_28)) + (0)) = (__nv_bfloat16)(aa_1_28 * bb_1_28);
                     }
-                    int tok_56 = 56 + lane_pair * 2 + 1;
-                    int frow_57 = row_base;
-                    if (tok_56 < num_tokens) {
-                        float gk_29 = (float)(__nv_bfloat16)red[29];
-                        float uk_29 = (float)(__nv_bfloat16)red[61];
-                        float _exp2_87 = approx_exp2((-gk_29) * 1.442695f);
-                        float sig_29 = approx_rcp(1.0f + _exp2_87);
-                        float _tanh_88 = tanhf(gk_29 * 0.25f);
-                        float aa_29 = 4.0f * _tanh_88 * sig_29;
-                        float _tanh_89 = tanhf(uk_29 * 0.04f);
-                        float bb_29 = 25.0f * _tanh_89;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_56 * 6144 + row_s + frow_57)) + (0)) = (__nv_bfloat16)(aa_29 * bb_29);
+                    int tok_1_29 = 56 + lane_pair * 2 + 1;
+                    int frow_2_29 = row_base;
+                    if (tok_1_29 < num_tokens) {
+                        float gk_1_29 = (float)(__nv_bfloat16)red[29];
+                        float uk_1_29 = (float)(__nv_bfloat16)red[61];
+                        float _exp2_87 = approx_exp2((-gk_1_29) * 1.442695f);
+                        float sig_1_29 = approx_rcp(1.0f + _exp2_87);
+                        float _tanh_88 = tanhf(gk_1_29 * 0.25f);
+                        float aa_1_29 = 4.0f * _tanh_88 * sig_1_29;
+                        float _tanh_89 = tanhf(uk_1_29 * 0.04f);
+                        float bb_1_29 = 25.0f * _tanh_89;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_29 * 6144 + row_s + frow_2_29)) + (0)) = (__nv_bfloat16)(aa_1_29 * bb_1_29);
                     }
-                    int tok_58 = 56 + lane_pair * 2;
-                    int frow_59 = row_base + 8;
-                    if (tok_58 < num_tokens) {
-                        float gk_30 = (float)(__nv_bfloat16)red[30];
-                        float uk_30 = (float)(__nv_bfloat16)red[62];
-                        float _exp2_90 = approx_exp2((-gk_30) * 1.442695f);
-                        float sig_30 = approx_rcp(1.0f + _exp2_90);
-                        float _tanh_91 = tanhf(gk_30 * 0.25f);
-                        float aa_30 = 4.0f * _tanh_91 * sig_30;
-                        float _tanh_92 = tanhf(uk_30 * 0.04f);
-                        float bb_30 = 25.0f * _tanh_92;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_58 * 6144 + row_s + frow_59)) + (0)) = (__nv_bfloat16)(aa_30 * bb_30);
+                    int tok_1_30 = 56 + lane_pair * 2;
+                    int frow_2_30 = row_base + 8;
+                    if (tok_1_30 < num_tokens) {
+                        float gk_1_30 = (float)(__nv_bfloat16)red[30];
+                        float uk_1_30 = (float)(__nv_bfloat16)red[62];
+                        float _exp2_90 = approx_exp2((-gk_1_30) * 1.442695f);
+                        float sig_1_30 = approx_rcp(1.0f + _exp2_90);
+                        float _tanh_91 = tanhf(gk_1_30 * 0.25f);
+                        float aa_1_30 = 4.0f * _tanh_91 * sig_1_30;
+                        float _tanh_92 = tanhf(uk_1_30 * 0.04f);
+                        float bb_1_30 = 25.0f * _tanh_92;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_30 * 6144 + row_s + frow_2_30)) + (0)) = (__nv_bfloat16)(aa_1_30 * bb_1_30);
                     }
-                    int tok_60 = 56 + lane_pair * 2 + 1;
-                    int frow_61 = row_base + 8;
-                    if (tok_60 < num_tokens) {
-                        float gk_31 = (float)(__nv_bfloat16)red[31];
-                        float uk_31 = (float)(__nv_bfloat16)red[63];
-                        float _exp2_93 = approx_exp2((-gk_31) * 1.442695f);
-                        float sig_31 = approx_rcp(1.0f + _exp2_93);
-                        float _tanh_94 = tanhf(gk_31 * 0.25f);
-                        float aa_31 = 4.0f * _tanh_94 * sig_31;
-                        float _tanh_95 = tanhf(uk_31 * 0.04f);
-                        float bb_31 = 25.0f * _tanh_95;
-                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_60 * 6144 + row_s + frow_61)) + (0)) = (__nv_bfloat16)(aa_31 * bb_31);
+                    int tok_1_31 = 56 + lane_pair * 2 + 1;
+                    int frow_2_31 = row_base + 8;
+                    if (tok_1_31 < num_tokens) {
+                        float gk_1_31 = (float)(__nv_bfloat16)red[31];
+                        float uk_1_31 = (float)(__nv_bfloat16)red[63];
+                        float _exp2_93 = approx_exp2((-gk_1_31) * 1.442695f);
+                        float sig_1_31 = approx_rcp(1.0f + _exp2_93);
+                        float _tanh_94 = tanhf(gk_1_31 * 0.25f);
+                        float aa_1_31 = 4.0f * _tanh_94 * sig_1_31;
+                        float _tanh_95 = tanhf(uk_1_31 * 0.04f);
+                        float bb_1_31 = 25.0f * _tanh_95;
+                        *(reinterpret_cast<__nv_bfloat16*>(out_s + (tok_1_31 * 6144 + row_s + frow_2_31)) + (0)) = (__nv_bfloat16)(aa_1_31 * bb_1_31);
                     }
                 } else {
                     if (num_tokens > 0) {
@@ -1432,7 +1432,7 @@ kernel_cake_kimi_k3_latent_moe_7309f374d654ca0c525c(const __grid_constant__ CUte
                     mbarrier_wait(a_full_addr + (stage_1) * 8, _phase_a_full);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     int init_flag = ((m_1 == 0) ? 1 : 0);
-                    int init_sub = init_flag;
+                    int init_sub_1_0 = init_flag;
                     if (cls_2 == 2) {
                         int _smem_desc_lo_0 = (((smem_ag_addr) >> 4) & 0x3FFF) + (stage_1) * 2048;
                         int _smem_desc_lo_1 = (((smem_b_addr) >> 4) & 0x3FFF) + (stage_1) * 1024;
@@ -1469,7 +1469,7 @@ kernel_cake_kimi_k3_latent_moe_7309f374d654ca0c525c(const __grid_constant__ CUte
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_0), "r"(_smem_desc_lo_1), "r"((tmem_acc + (64))), "r"(((init_sub) ? 0 : 1)) : "memory");
+                    :: "r"(_smem_desc_lo_0), "r"(_smem_desc_lo_1), "r"((tmem_acc + (64))), "r"(((init_sub_1_0) ? 0 : 1)) : "memory");
                         int _smem_desc_lo_2 = (((smem_au_addr) >> 4) & 0x3FFF) + (stage_1) * 2048;
                         int _smem_desc_lo_3 = (((smem_b_addr) >> 4) & 0x3FFF) + (stage_1) * 1024;
                         asm volatile(
@@ -1505,7 +1505,7 @@ kernel_cake_kimi_k3_latent_moe_7309f374d654ca0c525c(const __grid_constant__ CUte
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_2), "r"(_smem_desc_lo_3), "r"((tmem_acc + (128))), "r"(((init_sub) ? 0 : 1)) : "memory");
+                    :: "r"(_smem_desc_lo_2), "r"(_smem_desc_lo_3), "r"((tmem_acc + (128))), "r"(((init_sub_1_0) ? 0 : 1)) : "memory");
                     } else {
                         int _smem_desc_lo_4 = (((smem_a_addr) >> 4) & 0x3FFF) + (stage_1) * 2048;
                         int _smem_desc_lo_5 = (((smem_b_addr) >> 4) & 0x3FFF) + (stage_1) * 1024;
@@ -1542,9 +1542,9 @@ kernel_cake_kimi_k3_latent_moe_7309f374d654ca0c525c(const __grid_constant__ CUte
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_4), "r"(_smem_desc_lo_5), "r"(tmem_acc), "r"(((init_sub) ? 0 : 1)) : "memory");
+                    :: "r"(_smem_desc_lo_4), "r"(_smem_desc_lo_5), "r"(tmem_acc), "r"(((init_sub_1_0) ? 0 : 1)) : "memory");
                     }
-                    int init_sub_0 = 0;
+                    int init_sub_1_1 = 0;
                     if (cls_2 == 2) {
                         int _smem_desc_lo_6 = (((smem_ag_addr + 8192) >> 4) & 0x3FFF) + (stage_1) * 2048;
                         int _smem_desc_lo_7 = (((smem_b_addr + 8192) >> 4) & 0x3FFF) + (stage_1) * 1024;
@@ -1581,7 +1581,7 @@ kernel_cake_kimi_k3_latent_moe_7309f374d654ca0c525c(const __grid_constant__ CUte
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_6), "r"(_smem_desc_lo_7), "r"((tmem_acc + (64))), "r"(((init_sub_0) ? 0 : 1)) : "memory");
+                    :: "r"(_smem_desc_lo_6), "r"(_smem_desc_lo_7), "r"((tmem_acc + (64))), "r"(((init_sub_1_1) ? 0 : 1)) : "memory");
                         int _smem_desc_lo_8 = (((smem_au_addr + 8192) >> 4) & 0x3FFF) + (stage_1) * 2048;
                         int _smem_desc_lo_9 = (((smem_b_addr + 8192) >> 4) & 0x3FFF) + (stage_1) * 1024;
                         asm volatile(
@@ -1617,7 +1617,7 @@ kernel_cake_kimi_k3_latent_moe_7309f374d654ca0c525c(const __grid_constant__ CUte
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_8), "r"(_smem_desc_lo_9), "r"((tmem_acc + (128))), "r"(((init_sub_0) ? 0 : 1)) : "memory");
+                    :: "r"(_smem_desc_lo_8), "r"(_smem_desc_lo_9), "r"((tmem_acc + (128))), "r"(((init_sub_1_1) ? 0 : 1)) : "memory");
                     } else {
                         int _smem_desc_lo_10 = (((smem_a_addr + 16384) >> 4) & 0x3FFF) + (stage_1) * 2048;
                         int _smem_desc_lo_11 = (((smem_b_addr + 8192) >> 4) & 0x3FFF) + (stage_1) * 1024;
@@ -1654,7 +1654,7 @@ kernel_cake_kimi_k3_latent_moe_7309f374d654ca0c525c(const __grid_constant__ CUte
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_smem_desc_lo_10), "r"(_smem_desc_lo_11), "r"(tmem_acc), "r"(((init_sub_0) ? 0 : 1)) : "memory");
+                    :: "r"(_smem_desc_lo_10), "r"(_smem_desc_lo_11), "r"(tmem_acc), "r"(((init_sub_1_1) ? 0 : 1)) : "memory");
                     }
                     tcgen05_commit(a_empty_addr + (stage_1) * 8);
                     stage_1 += 1;
