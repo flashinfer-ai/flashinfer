@@ -143,6 +143,9 @@ def _build_layer(
     combine_wire: str | None = None,
     token_capacity: int = TOKEN_CAPACITY,
     seed: int = 7,
+    compact_form: int | None = None,
+    publish_form: int | None = None,
+    **dispatch_kwargs,
 ):
     from flashinfer.moe_ep import (
         BootstrapConfig,
@@ -183,6 +186,9 @@ def _build_layer(
                 dedup_dispatch=dedup_dispatch,
                 clamp_limit=clamp_limit,
                 combine_wire=combine_wire,
+                compact_form=compact_form,
+                publish_form=publish_form,
+                **dispatch_kwargs,
             ),
             quantize_input=True,
             preprocess_weights=True,
@@ -272,6 +278,351 @@ def test_ep1_forward_repeated_and_deterministic(
         assert torch.equal(repeat, outputs[0])
 
 
+# Token counts that take each path of the latency-pipelined compact on a 132-SM part
+# (grid 4 x SMs = 528 blocks; m = TOP_K x tokens rows): one row per block, four rows
+# per block, one warp per row.
+COPY_FORM_TOKENS = (7, TOKEN_CAPACITY, 700, 2048)
+
+
+@requires_sm90
+@pytest.mark.parametrize("wire", WIRES)
+@pytest.mark.parametrize("mode", ["random", "masked", "hot", "dup_rank"])
+def test_ep1_copy_forms_bitwise(mode: str, wire: str) -> None:
+    """compact_form / publish_form 1 write the same bytes as the forms 0."""
+    device = torch.device("cuda", 0)
+    capacity = max(COPY_FORM_TOKENS)
+    layers = {
+        forms: _build_layer(
+            1,
+            0,
+            device,
+            combine_wire=wire,
+            token_capacity=capacity,
+            compact_form=forms[0],
+            publish_form=forms[1],
+        )
+        for forms in ((0, 0), (1, 1), (1, 0), (0, 1))
+    }
+    _, w13, w2 = layers[(0, 0)]
+    for num_tokens in COPY_FORM_TOKENS:
+        x, ids, weights = _make_inputs(
+            num_tokens, LOCAL_EXPERTS, 31 + num_tokens, device, mode=mode
+        )
+        outputs = {}
+        for forms, (layer, _w13, _w2) in layers.items():
+            outputs[forms] = _forward(layer, x, ids, weights).clone()
+            torch.cuda.synchronize()
+        _check(
+            outputs[(1, 1)],
+            x,
+            ids,
+            weights,
+            w13,
+            w2,
+            label=f" ep1 {wire} {mode} T={num_tokens} forms=1,1",
+        )
+        for forms, output in outputs.items():
+            assert torch.equal(output, outputs[(0, 0)]), (
+                f"forms {forms} differ at T={num_tokens}"
+            )
+
+
+@requires_sm90
+@pytest.mark.parametrize("wire", WIRES)
+def test_ep1_per_route_publish_pdl(wire: str) -> None:
+    """per_route_publish_pdl adds the publish edge on the per-route wire only (same bytes)."""
+    device = torch.device("cuda", 0)
+    ref, w13, w2 = _build_layer(1, 0, device, combine_wire=wire, pdl=6, pdl_late=True)
+    layer, _w13, _w2 = _build_layer(
+        1,
+        0,
+        device,
+        combine_wire=wire,
+        pdl=6,
+        pdl_late=True,
+        per_route_publish_pdl=True,
+    )
+    runner = _warm_runner(layer, device)
+    assert runner.pdl == 6 and runner.per_route_publish_pdl
+    assert runner._pdl_flag(8) & 1 == (1 if wire == "per_route" else 0)
+    for num_tokens in (1, 8, TOKEN_CAPACITY):
+        x, ids, weights = _make_inputs(
+            num_tokens, LOCAL_EXPERTS, 47 + num_tokens, device
+        )
+        output = _forward(layer, x, ids, weights).clone()
+        reference = _forward(ref, x, ids, weights).clone()
+        torch.cuda.synchronize()
+        assert torch.equal(output, reference), f"T={num_tokens}"
+    _check(output, x, ids, weights, w13, w2, label=f" ep1 {wire} per_route_publish_pdl")
+
+
+# Environment fallbacks of the backend's round switches (every one is also a config field).
+ROUND_SWITCH_ENVS = (
+    "FLASHINFER_SM90_CAKE_BF16_PDL",
+    "FLASHINFER_SM90_CAKE_BF16_PDL_LATE",
+    "FLASHINFER_SM90_CAKE_BF16_FUSED_BEGIN",
+    "FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH_MAX_TOKENS",
+    "FLASHINFER_SM90_CAKE_BF16_GRID_DISPATCH_MIN_TOKENS",
+    "FLASHINFER_SM90_CAKE_BF16_COMPACT_FORM",
+    "FLASHINFER_SM90_CAKE_BF16_PUBLISH_FORM",
+    "FLASHINFER_SM90_CAKE_BF16_PER_ROUTE_PUBLISH_PDL",
+    "FLASHINFER_SM90_CAKE_BF16_FC2_EARLY_MAX_TOKENS",
+    "FLASHINFER_SM90_CAKE_BF16_PREFIX_FORM",
+)
+
+
+@requires_sm90
+def test_ep1_round_switch_defaults(monkeypatch) -> None:
+    """With no config value and no environment override the runner resolves the
+    shipped round switches."""
+    for name in ROUND_SWITCH_ENVS + (
+        "FLASHINFER_SM90_CAKE_BF16_FUSED_TAIL",
+        "FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    device = torch.device("cuda", 0)
+    # a token capacity no other test uses: the workspace pool is keyed on
+    # (max_tokens_per_rank, config) and the switches are resolved when the pooled
+    # runner is built
+    layer, w13, w2 = _build_layer(1, 0, device, token_capacity=37)
+    runner = _warm_runner(layer, device)
+    assert runner.pdl == 6  # FC1 and FC2 edges
+    assert runner.pdl_late is True
+    assert runner.fused_begin == 2
+    assert runner.fused_dispatch_max_tokens == 512
+    assert runner.grid_dispatch_min_tokens == 513
+    assert runner.compact_form == 1 and runner.publish_form == 1
+    assert runner.per_route_publish_pdl is True
+    assert runner.fc2_early_max_tokens == 128
+    assert runner.prefix_form == 1
+    x, ids, weights = _make_inputs(37, LOCAL_EXPERTS, 59, device)
+    output = _forward(layer, x, ids, weights)
+    torch.cuda.synchronize()
+    _check(output, x, ids, weights, w13, w2, label=" ep1 round switch defaults")
+
+
+class _GemmSpy:
+    """Forwards to the runner's grouped GEMM launcher and records whether each FC1 /
+    FC2 launch of a round took the early-start pair (a ``sched`` buffer)."""
+
+    def __init__(self, gemm) -> None:
+        self._gemm = gemm
+        self.calls: list[tuple[str, bool]] = []
+
+    def __getattr__(self, name):
+        return getattr(self._gemm, name)
+
+    def fc1(self, *args, **kwargs):
+        self.calls.append(("fc1", kwargs.get("sched") is not None))
+        return self._gemm.fc1(*args, **kwargs)
+
+    def fc2(self, *args, **kwargs):
+        self.calls.append(("fc2", kwargs.get("sched") is not None))
+        return self._gemm.fc2(*args, **kwargs)
+
+
+# Round sizes around the FC2 early-start window (0 < local tokens <= 128 by default).
+FC2_EARLY_TOKENS = (1, 8, 16, 32, 64, 128, 129, 160)
+
+
+@requires_sm90
+@pytest.mark.parametrize("wire", WIRES)
+@pytest.mark.parametrize("mode", ["random", "hot", "masked"])
+def test_ep1_fc2_early_window_bitwise(mode: str, wire: str) -> None:
+    """Rounds with 0 < tokens <= fc2_early_max_tokens run the early-start GEMM pair and
+    write the same bytes as the regular pair; larger rounds run the regular pair."""
+    device = torch.device("cuda", 0)
+    capacity = max(FC2_EARLY_TOKENS)
+    ref, w13, w2 = _build_layer(
+        1, 0, device, combine_wire=wire, token_capacity=capacity, fc2_early_max_tokens=0
+    )
+    layer, _w13, _w2 = _build_layer(
+        1,
+        0,
+        device,
+        combine_wire=wire,
+        token_capacity=capacity,
+        fc2_early_max_tokens=128,
+    )
+    assert _warm_runner(ref, device).fc2_early_max_tokens == 0
+    runner = _warm_runner(layer, device)
+    assert runner.fc2_early_max_tokens == 128
+    spy = _GemmSpy(runner.gemm)
+    runner.gemm = spy
+    try:
+        _fc2_early_rounds(layer, ref, spy, w13, w2, mode, wire, device)
+    finally:
+        runner.gemm = spy._gemm
+
+
+def _fc2_early_rounds(layer, ref, spy, w13, w2, mode, wire, device) -> None:
+    for num_tokens in (0,) + FC2_EARLY_TOKENS:
+        x, ids, weights = _make_inputs(
+            num_tokens, LOCAL_EXPERTS, 61 + num_tokens, device, mode=mode
+        )
+        spy.calls.clear()
+        output = _forward(layer, x, ids, weights).clone()
+        reference = _forward(ref, x, ids, weights).clone()
+        torch.cuda.synchronize()
+        if num_tokens:
+            early = num_tokens <= 128
+            assert spy.calls == [("fc1", early), ("fc2", early)], (
+                num_tokens,
+                spy.calls,
+            )
+        else:  # an empty round never takes the early-start pair
+            assert not any(e for _, e in spy.calls), spy.calls
+        assert torch.equal(output, reference), f"T={num_tokens}"
+        if num_tokens:
+            _check(
+                output,
+                x,
+                ids,
+                weights,
+                w13,
+                w2,
+                label=f" ep1 {wire} {mode} T={num_tokens} fc2_early",
+            )
+    # graph replay of a window round, then a regular round on the same layer
+    x, ids, weights = _make_inputs(16, LOCAL_EXPERTS, 71, device, mode=mode)
+    reference = _forward(ref, x, ids, weights).clone()
+    static = [t.clone() for t in (x, ids, weights)]
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        _forward(layer, *static)
+    torch.cuda.current_stream().wait_stream(side_stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static_output = _forward(layer, *static)
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(static_output, reference)
+    x2, ids2, weights2 = _make_inputs(160, LOCAL_EXPERTS, 73, device, mode=mode)
+    output2 = _forward(layer, x2, ids2, weights2).clone()
+    reference2 = _forward(ref, x2, ids2, weights2).clone()
+    torch.cuda.synchronize()
+    assert torch.equal(output2, reference2)
+
+
+@requires_sm90
+def test_ep1_fc2_early_switch_validation() -> None:
+    """fc2_early_max_tokens rejects negative and non-int values."""
+    from flashinfer.moe_ep import MoEEpConfigError
+
+    device = torch.device("cuda", 0)
+    for kwargs in (
+        {"fc2_early_max_tokens": -1},
+        {"fc2_early_max_tokens": True},
+    ):
+        with pytest.raises((MoEEpConfigError, ValueError)):
+            _build_layer(1, 0, device, token_capacity=33, **kwargs)
+
+
+class _DispatchSpy:
+    """Forwards to the runner's fused dispatch module and records the prefix form of
+    each fused dispatch launch."""
+
+    def __init__(self, module) -> None:
+        self._module = module
+        self.calls: list[int] = []
+
+    def __getattr__(self, name):
+        return getattr(self._module, name)
+
+    def sm90_cake_dispatch_fused_bf16(self, *args):
+        self.calls.append(int(args[-1]))
+        return self._module.sm90_cake_dispatch_fused_bf16(*args)
+
+
+# Round sizes around the fused / grid-strided dispatch bound (fused up to 512 tokens,
+# grid-strided from 513) and the small-route instance bound (T * top_k <= 1024).
+DISPATCH_SWITCH_TOKENS = (1, 8, 64, 128, 129, 512, 513, 700)
+# The dispatch paths these tests exercise (the shipped defaults), pinned so that the
+# backend environment of a run cannot route the rounds elsewhere.
+DISPATCH_PATHS = dict(
+    fused_begin=2, fused_dispatch_max_tokens=512, grid_dispatch_min_tokens=513
+)
+
+
+@requires_sm90
+@pytest.mark.parametrize("mode", ["random", "masked", "hot", "dup_rank"])
+def test_ep1_dispatch_switches_bitwise(mode: str) -> None:
+    """prefix_form 1 writes the same bytes as prefix_form 0 in fused and grid-strided
+    dispatch rounds, and a graph replay of a small round stays bitwise equal."""
+    device = torch.device("cuda", 0)
+    capacity = max(DISPATCH_SWITCH_TOKENS)
+    layers = {
+        form: _build_layer(
+            1, 0, device, token_capacity=capacity, prefix_form=form, **DISPATCH_PATHS
+        )
+        for form in (0, 1)
+    }
+    _, w13, w2 = layers[0]
+    for form, (layer, _w13, _w2) in layers.items():
+        assert _warm_runner(layer, device).prefix_form == form
+    runner = _warm_runner(layers[1][0], device)
+    spy = _DispatchSpy(runner.dispatch_module)
+    runner.dispatch_module = spy
+    try:
+        for num_tokens in DISPATCH_SWITCH_TOKENS:
+            x, ids, weights = _make_inputs(
+                num_tokens, LOCAL_EXPERTS, 89 + num_tokens, device, mode=mode
+            )
+            spy.calls.clear()
+            outputs = {}
+            for key, (layer, _w13, _w2) in layers.items():
+                outputs[key] = _forward(layer, x, ids, weights).clone()
+                torch.cuda.synchronize()
+            assert spy.calls == ([1] if num_tokens <= 512 else []), (
+                num_tokens,
+                spy.calls,
+            )
+            _check(
+                outputs[1],
+                x,
+                ids,
+                weights,
+                w13,
+                w2,
+                label=f" ep1 {mode} T={num_tokens} prefix_form 1",
+            )
+            assert torch.equal(outputs[1], outputs[0]), f"T={num_tokens}"
+        # graph replay of a small round
+        layer = layers[1][0]
+        x, ids, weights = _make_inputs(16, LOCAL_EXPERTS, 97, device, mode=mode)
+        reference = _forward(layers[0][0], x, ids, weights).clone()
+        static = [t.clone() for t in (x, ids, weights)]
+        side_stream = torch.cuda.Stream()
+        side_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side_stream):
+            _forward(layer, *static)
+        torch.cuda.current_stream().wait_stream(side_stream)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_output = _forward(layer, *static)
+        for _ in range(3):
+            graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(static_output, reference)
+    finally:
+        runner.dispatch_module = spy._module
+
+
+@requires_sm90
+def test_ep1_dispatch_switch_validation() -> None:
+    """prefix_form rejects values other than 0, 1 and None."""
+    from flashinfer.moe_ep import MoEEpConfigError
+
+    device = torch.device("cuda", 0)
+    for kwargs in ({"prefix_form": 2}, {"prefix_form": True}):
+        with pytest.raises((MoEEpConfigError, ValueError)):
+            _build_layer(1, 0, device, token_capacity=33, **kwargs)
+
+
 @requires_sm90
 @pytest.mark.parametrize("wire", WIRES)
 @pytest.mark.parametrize("case", ["short", "masked", "hot", "empty", "dup_rank"])
@@ -321,6 +672,16 @@ def _find_runner(root, class_name="Sm90CakeBf16MoERunner", max_depth=8):
                 children = []
         frontier.extend((child, depth + 1) for child in children)
     return None
+
+
+def _warm_runner(layer, device: torch.device):
+    """One single-token round (the workspace and its runner are created lazily), then the runner."""
+    x, ids, weights = _make_inputs(1, LOCAL_EXPERTS, 5, device)
+    _forward(layer, x, ids, weights)
+    torch.cuda.synchronize()
+    runner = _find_runner(layer)
+    assert runner is not None
+    return runner
 
 
 @requires_sm90
@@ -660,6 +1021,398 @@ def test_ep_forward_modes(mode: str, dedup_dispatch: bool, wire: str) -> None:
     )
     for repeat in outputs[1:]:
         assert torch.equal(repeat, outputs[0])
+    dist.barrier()
+
+
+@requires_dist
+@pytest.mark.parametrize(
+    "mode", ["random", "hot", "masked", "dup_rank", "dup_remote", "empty_rank"]
+)
+def test_ep_grid_dispatch_matches_vendored(mode: str) -> None:
+    """The grid-strided single-launch dispatch is bit-identical to the vendored kernels."""
+    import torch.distributed as dist
+
+    rank, world_size = _dist_setup()
+    device = torch.device("cuda", rank)
+    total_experts = LOCAL_EXPERTS * world_size
+    # vendored count / reserve / store_publish (no fused small-round path, no grid path)
+    vendored, w13, w2 = _build_layer(
+        world_size,
+        rank,
+        device,
+        fused_dispatch_max_tokens=1,
+        grid_dispatch_min_tokens=0,
+    )
+    grid, _w13, _w2 = _build_layer(world_size, rank, device, grid_dispatch_min_tokens=1)
+    x, ids, weights = _make_inputs(
+        TOKEN_CAPACITY,
+        total_experts,
+        101 + rank,
+        device,
+        mode=mode,
+        rank=rank,
+        world_size=world_size,
+    )
+    reference = _forward(vendored, x, ids, weights).clone()
+    torch.cuda.synchronize()
+    for _ in range(3):
+        output = _forward(grid, x, ids, weights).clone()
+        torch.cuda.synchronize()
+        assert torch.equal(output, reference), f"ep{world_size} rank{rank} {mode}"
+    _check(
+        reference,
+        x,
+        ids,
+        weights,
+        w13,
+        w2,
+        label=f" ep{world_size} rank{rank} {mode} grid",
+    )
+    dist.barrier()
+
+
+@requires_dist
+@pytest.mark.parametrize("wire", WIRES)
+@pytest.mark.parametrize("mode", ["random", "hot", "dup_remote", "empty_rank"])
+def test_ep_copy_forms_bitwise(mode: str, wire: str) -> None:
+    """The copy forms write the same bytes on every rank, also when ranks mix forms."""
+    import torch.distributed as dist
+
+    rank, world_size = _dist_setup()
+    device = torch.device("cuda", rank)
+    total_experts = LOCAL_EXPERTS * world_size
+    capacity = max(COPY_FORM_TOKENS)
+    mixed = rank % 2
+    layers = {
+        name: _build_layer(
+            world_size,
+            rank,
+            device,
+            combine_wire=wire,
+            token_capacity=capacity,
+            compact_form=forms[0],
+            publish_form=forms[1],
+        )
+        for name, forms in (
+            ("f0", (0, 0)),
+            ("f1", (1, 1)),
+            ("mixed", (mixed, 1 - mixed)),
+        )
+    }
+    _, w13, w2 = layers["f0"]
+    for num_tokens in COPY_FORM_TOKENS:
+        x, ids, weights = _make_inputs(
+            num_tokens,
+            total_experts,
+            71 + rank + num_tokens,
+            device,
+            mode=mode,
+            rank=rank,
+            world_size=world_size,
+        )
+        outputs = {}
+        for name, (layer, _w13, _w2) in layers.items():
+            outputs[name] = _forward(layer, x, ids, weights).clone()
+            torch.cuda.synchronize()
+        _check(
+            outputs["f1"],
+            x,
+            ids,
+            weights,
+            w13,
+            w2,
+            label=f" ep{world_size} rank{rank} {wire} {mode} T={num_tokens} forms=1,1",
+        )
+        for name, output in outputs.items():
+            assert torch.equal(output, outputs["f0"]), (
+                f"{name} differs at T={num_tokens}"
+            )
+    dist.barrier()
+
+
+@requires_dist
+@pytest.mark.parametrize("mode", ["random", "hot", "dup_remote", "empty_rank"])
+def test_ep_per_route_publish_pdl_bitwise(mode: str) -> None:
+    """Per-route wire: the PDL-launched publish twin writes the same bytes, also when ranks mix it with the
+    vendored publish."""
+    import torch.distributed as dist
+
+    rank, world_size = _dist_setup()
+    device = torch.device("cuda", rank)
+    total_experts = LOCAL_EXPERTS * world_size
+    common = dict(combine_wire="per_route", token_capacity=8, pdl=6, pdl_late=True)
+    # own pool key for the mixed layer on every rank: the workspace pool shares a pipe
+    # between layers with equal configs, so a layer whose config depends on the rank
+    # would share the "off" pipe on some ranks and the "on" pipe on the others
+    layers = {
+        name: _build_layer(
+            world_size, rank, device, per_route_publish_pdl=on, **common, **extra
+        )
+        for name, on, extra in (
+            ("off", False, {}),
+            ("on", True, {}),
+            ("mixed", bool(rank % 2), {"init_timeout_s": 601.0}),
+        )
+    }
+    _, w13, w2 = layers["off"]
+    for num_tokens in (1, 5, 8):
+        x, ids, weights = _make_inputs(
+            num_tokens,
+            total_experts,
+            89 + rank + num_tokens,
+            device,
+            mode=mode,
+            rank=rank,
+            world_size=world_size,
+        )
+        outputs = {}
+        for name, (layer, _w13, _w2) in layers.items():
+            outputs[name] = _forward(layer, x, ids, weights).clone()
+            torch.cuda.synchronize()
+        _check(
+            outputs["on"],
+            x,
+            ids,
+            weights,
+            w13,
+            w2,
+            label=f" ep{world_size} rank{rank} {mode} T={num_tokens} per_route_publish_pdl",
+        )
+        for name, output in outputs.items():
+            assert torch.equal(output, outputs["off"]), (
+                f"{name} differs at T={num_tokens}"
+            )
+    dist.barrier()
+
+
+@requires_dist
+@pytest.mark.parametrize("mode", ["random", "hot", "masked", "empty_rank"])
+def test_ep_shared_workspace_round_paths(mode: str) -> None:
+    """Layers of one config share one pooled workspace; each round takes the dispatch
+    path of each rank's own token count (fused up to 512 tokens, grid-strided from 513),
+    which differs between ranks and rounds (across that bound, an idle rank), and every
+    layer stays bitwise equal to a layer with every round switch off."""
+    import torch.distributed as dist
+
+    rank, world_size = _dist_setup()
+    device = torch.device("cuda", rank)
+    total_experts = LOCAL_EXPERTS * world_size
+    capacity = 640
+    off = dict(
+        pdl=0,
+        pdl_late=False,
+        fused_begin=0,
+        fused_dispatch_max_tokens=128,
+        grid_dispatch_min_tokens=0,
+        compact_form=0,
+        publish_form=0,
+        per_route_publish_pdl=False,
+        fc2_early_max_tokens=0,
+        prefix_form=0,
+    )
+    ref, w13, w2 = _build_layer(
+        world_size, rank, device, token_capacity=capacity, **off
+    )
+    layers = [
+        _build_layer(world_size, rank, device, token_capacity=capacity)[0]
+        for _ in range(3)
+    ]
+    plans = (
+        lambda r: 1,
+        lambda r: 16 + r % 2,
+        lambda r: 124 + 8 * (r % 2),
+        lambda r: 0 if r == 0 else 128,
+        lambda r: 512 + r % 2,
+        lambda r: 640 - r,
+    )
+    for index, plan in enumerate(plans):
+        num_tokens = plan(rank)
+        x, ids, weights = _make_inputs(
+            num_tokens,
+            total_experts,
+            131 + 7 * index + rank,
+            device,
+            mode=mode,
+            rank=rank,
+            world_size=world_size,
+        )
+        reference = _forward(ref, x, ids, weights).clone()
+        torch.cuda.synchronize()
+        for layer_index, layer in enumerate(layers):
+            output = _forward(layer, x, ids, weights).clone()
+            torch.cuda.synchronize()
+            assert torch.equal(output, reference), (
+                f"layer {layer_index} differs at round {index} T={num_tokens}"
+            )
+        if num_tokens:
+            _check(
+                reference,
+                x,
+                ids,
+                weights,
+                w13,
+                w2,
+                label=f" ep{world_size} rank{rank} {mode} round {index} T={num_tokens} shared",
+            )
+    runners = {id(_find_runner(layer)) for layer in layers}
+    assert len(runners) == 1, "layers of one config must share one pooled runner"
+    assert id(_find_runner(ref)) not in runners
+    dist.barrier()
+
+
+@requires_dist
+@pytest.mark.parametrize("mode", ["random", "hot", "masked", "empty_rank"])
+def test_ep_fc2_early_straddle_bitwise(mode: str) -> None:
+    """The FC2 early start is rank-local: in one round some ranks run the early-start
+    pair (<= 128 local tokens) and others the regular pair (> 128 or no tokens), also on
+    the per-route wire whose publish is a PDL launch (8-token pipes); every layer stays
+    bitwise equal to a layer with the early start off."""
+    import torch.distributed as dist
+
+    rank, world_size = _dist_setup()
+    device = torch.device("cuda", rank)
+    total_experts = LOCAL_EXPERTS * world_size
+    for capacity, common, plans in (
+        (
+            160,
+            {},
+            (
+                lambda r: 128 + r % 2,
+                lambda r: 127 + 2 * (r % 2),
+                lambda r: 0 if r == 0 else 16,
+                lambda r: 1 + r,
+            ),
+        ),
+        (
+            8,
+            dict(
+                combine_wire="per_route",
+                pdl=6,
+                pdl_late=True,
+                per_route_publish_pdl=True,
+            ),
+            (lambda r: 8, lambda r: 1 + r % 8, lambda r: 0 if r == 0 else 8),
+        ),
+    ):
+        ref, w13, w2 = _build_layer(
+            world_size,
+            rank,
+            device,
+            token_capacity=capacity,
+            fc2_early_max_tokens=0,
+            **common,
+        )
+        layer, _w13, _w2 = _build_layer(
+            world_size,
+            rank,
+            device,
+            token_capacity=capacity,
+            fc2_early_max_tokens=128,
+            **common,
+        )
+        runner = _warm_runner(layer, device)
+        assert runner.fc2_early_max_tokens == 128
+        if common:
+            assert runner.combine_wire == "per_route" and runner.per_route_publish_pdl
+        for index, plan in enumerate(plans):
+            num_tokens = plan(rank)
+            x, ids, weights = _make_inputs(
+                num_tokens,
+                total_experts,
+                151 + 11 * index + rank,
+                device,
+                mode=mode,
+                rank=rank,
+                world_size=world_size,
+            )
+            reference = _forward(ref, x, ids, weights).clone()
+            torch.cuda.synchronize()
+            output = _forward(layer, x, ids, weights).clone()
+            torch.cuda.synchronize()
+            assert torch.equal(output, reference), (
+                f"capacity {capacity} round {index} T={num_tokens}"
+            )
+            if num_tokens:
+                _check(
+                    output,
+                    x,
+                    ids,
+                    weights,
+                    w13,
+                    w2,
+                    label=f" ep{world_size} rank{rank} {mode} cap {capacity} round {index} T={num_tokens} fc2_early",
+                )
+    dist.barrier()
+
+
+@requires_dist
+@pytest.mark.parametrize("mode", ["random", "hot", "masked", "empty_rank"])
+def test_ep_dispatch_switches_straddle_bitwise(mode: str) -> None:
+    """The prefix form is rank-local: in one round the ranks' token counts straddle the
+    small-route bound (128 tokens at top_k 8) and the fused / grid-strided bound (512),
+    and ranks mix the forms; every layer stays bitwise equal to prefix_form 0."""
+    import torch.distributed as dist
+
+    rank, world_size = _dist_setup()
+    device = torch.device("cuda", rank)
+    total_experts = LOCAL_EXPERTS * world_size
+    capacity = 640
+    # own pool key for the mixed layer on every rank (see test_ep_per_route_publish_pdl_bitwise)
+    layers = {
+        name: _build_layer(
+            world_size,
+            rank,
+            device,
+            token_capacity=capacity,
+            **DISPATCH_PATHS,
+            **kwargs,
+        )
+        for name, kwargs in (
+            ("off", dict(prefix_form=0)),
+            ("on", dict(prefix_form=1)),
+            ("mixed", dict(prefix_form=rank % 2, init_timeout_s=601.0)),
+        )
+    }
+    _, w13, w2 = layers["off"]
+    runner = _warm_runner(layers["on"][0], device)
+    assert runner.prefix_form == 1
+    plans = (
+        lambda r: 128 + r % 2,
+        lambda r: 127 + 2 * (r % 2),
+        lambda r: 0 if r == 0 else 16,
+        lambda r: 512 + r % 2,
+        lambda r: 1 + r,
+        lambda r: 640 - 3 * r,
+    )
+    for index, plan in enumerate(plans):
+        num_tokens = plan(rank)
+        x, ids, weights = _make_inputs(
+            num_tokens,
+            total_experts,
+            191 + 13 * index + rank,
+            device,
+            mode=mode,
+            rank=rank,
+            world_size=world_size,
+        )
+        outputs = {}
+        for name, (layer, _w13, _w2) in layers.items():
+            outputs[name] = _forward(layer, x, ids, weights).clone()
+            torch.cuda.synchronize()
+        if num_tokens:
+            _check(
+                outputs["on"],
+                x,
+                ids,
+                weights,
+                w13,
+                w2,
+                label=f" ep{world_size} rank{rank} {mode} round {index} T={num_tokens} dispatch switches",
+            )
+        for name, output in outputs.items():
+            assert torch.equal(output, outputs["off"]), (
+                f"{name} differs at round {index} T={num_tokens}"
+            )
     dist.barrier()
 
 
