@@ -1498,7 +1498,16 @@ def test_sparse_d576_capture_without_eager_run():
     lse = torch.empty(4, 1, 64, device="cuda")
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        w.run(q, kv, indices, lengths, softmax_scale=_D576_SCALE, out=out, lse=lse)
+        w.run(
+            q,
+            kv,
+            indices,
+            lengths,
+            softmax_scale=_D576_SCALE,
+            out=out,
+            lse=lse,
+            validate=False,
+        )
     graph.replay()
     torch.cuda.synchronize()
     _check_d576(q, kv, indices, lengths, out, lse)
