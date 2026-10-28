@@ -127,6 +127,7 @@ def launch_fp8(
     finalize: cutlass.Constexpr,
     stream,
     architecture: cutlass.Constexpr = 90,
+    weight_first: cutlass.Constexpr = False,
 ):
     top_k = cute.size(ids, mode=[1])
     if cutlass.const_expr(
@@ -170,9 +171,16 @@ def launch_fp8(
             gated,
             parameters,
             serial_gather=serial_w8_t4,
+            weight_first=weight_first,
         )
         second_warp = WarpGroupedProjection(
-            False, group_size, stages, tile_k, top_k, serial_gather=serial_w8_t4
+            False,
+            group_size,
+            stages,
+            tile_k,
+            top_k,
+            serial_gather=serial_w8_t4,
+            weight_first=weight_first,
         )
         first_warp(w1, x, ids, mid, stream, dq1, aq2)
         second_warp(w2, mid, ids, routes, stream, dq2, aq2)
@@ -217,6 +225,11 @@ _WEIGHT_FIRST_TACTICS = tuple(
 )
 
 
+# Keep ordinary FP8's existing scheduling choices. Its cache/reuse boundary
+# differs from dense, so only the separately measured FP8 tiles are admitted.
+_FP8_WEIGHT_FIRST_TACTICS = tuple(("warp_mma", group, 2, 128, True) for group in (2, 4))
+
+
 def execute(inputs, config, tactic):
     """Bind live buffers to a compiled projection pair."""
     import torch
@@ -225,7 +238,11 @@ def execute(inputs, config, tactic):
     from ..runtime import _COMPILED, _COMPILE_LOCK
     from .....utils import get_compute_capability
 
-    if tactic not in _TACTICS and tactic not in _WEIGHT_FIRST_TACTICS:
+    if (
+        tactic not in _TACTICS
+        and tactic not in _WEIGHT_FIRST_TACTICS
+        and tactic not in _FP8_WEIGHT_FIRST_TACTICS
+    ):
         raise ValueError(
             "Grouped decode requires a valid architecture/group/stage/K tactic"
         )
@@ -264,10 +281,27 @@ def execute(inputs, config, tactic):
     group_size, stages, tile_k = tactic[1:4]
     weight_first = len(tactic) == 5
     if weight_first:
-        from ....api import SwiGLU
+        from ....api import ReLU2, SiTU, SwiGLU
 
-        if (
-            scaled
+        if fp8:
+            if (
+                tactic not in _FP8_WEIGHT_FIRST_TACTICS
+                or x.shape[0] not in (4, 8)
+                or (x.shape[1], mid.shape[1], ids.shape[1]) != (2048, 512, 10)
+                or output.dtype != torch.bfloat16
+                or not (
+                    config.activation in (SwiGLU(), SiTU())
+                    or (x.shape[0] == 8 and config.activation == ReLU2())
+                )
+                or not config.finalize.do_finalize
+            ):
+                raise ValueError(
+                    "Weight-first FP8 decode requires measured SM120 SwiGLU/SiTU or T8 ReLU2 tiles, "
+                    "T4/T8/H2048/I512/top-k10, BF16 output and finalization"
+                )
+        elif (
+            weight_only
+            or tactic not in _WEIGHT_FIRST_TACTICS
             or (x.shape[0], x.shape[1], mid.shape[1], ids.shape[1])
             != (8, 2048, 512, 10)
             or output.dtype != x.dtype
