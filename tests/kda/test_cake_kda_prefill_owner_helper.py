@@ -319,9 +319,9 @@ def test_owner_helper_pool_is_bitwise_the_per_task_split(
     with monkeypatch.context() as m:
         m.setattr(runtime, "_owner_helper_pool_count", lambda **_: 0)
         split_schedule, split = _run(d, lengths, heads, launches=1)
-    if "_owner" not in split_schedule:
-        pytest.skip(f"{split_schedule}: the call takes no owner/helper split here")
-    assert "_pool" not in split_schedule, split_schedule
+    # _expected_suffix skipped a part that leaves no helper: every call here
+    # takes the per-task split, a call that routes elsewhere fails.
+    assert split_schedule.endswith(suffix.split("_pool")[0]), (split_schedule, suffix)
     pool_schedule, pooled = _run(d, lengths, heads, launches=3)
     assert pool_schedule.endswith(suffix), (pool_schedule, suffix)
     assert pool_schedule.startswith(split_schedule), (pool_schedule, split_schedule)
