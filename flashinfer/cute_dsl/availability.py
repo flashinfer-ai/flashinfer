@@ -225,12 +225,31 @@ def cute_dsl_compile_arch(major: int, minor: int) -> str:
     )
 
 
+@functools.cache
+def _device_capability(device_index: int) -> tuple[int, int]:
+    r"""Return the compute capability of one CUDA device, queried once per process."""
+    import torch
+
+    return torch.cuda.get_device_capability(device_index)
+
+
 def require_cute_dsl_arch(device, native_only: bool = False) -> None:
     r"""Raise :class:`NotImplementedError` when the installed CuTe DSL cannot
     target ``device``'s architecture (see :func:`is_cute_dsl_arch_supported`)."""
     import torch
 
-    major, minor = torch.cuda.get_device_capability(device)
+    # Several CuTe-DSL ops run this check on every launch, so a CUDA device
+    # with an index reuses its cached capability. Other forms, such as a bare
+    # "cuda" device (the current device, which can change), are resolved on
+    # each call.
+    if (
+        isinstance(device, torch.device)
+        and device.type == "cuda"
+        and device.index is not None
+    ):
+        major, minor = _device_capability(device.index)
+    else:
+        major, minor = torch.cuda.get_device_capability(device)
     if not is_cute_dsl_arch_supported(major, minor, native_only=native_only):
         hint = ""
         if not native_only:
