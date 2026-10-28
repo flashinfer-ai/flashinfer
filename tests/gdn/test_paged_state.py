@@ -762,6 +762,90 @@ def test_packed_checkpoints_without_state(state_dtype):
         _assert_state(ckpts[i], expected, msg=f"checkpoint {i}")
 
 
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_checkpoint_rows_deterministic_under_store_load(state_dtype):
+    """Checkpoints into pool rows are bit-identical in repeated identical calls
+    and match the packed checkpoints. One pool row per 64-token checkpoint (the
+    paged API with 64-token pages), and one selected row per sequence three
+    blocks before its end, on 64 sequences x 32 heads: every SM stores
+    checkpoints while the other math warp group still reads its K stage. On
+    SM120 the release of that stage once overtook the read, and the next TMA
+    fill corrupted a 16 x 16 tile of the state in about half of the calls."""
+    _skip_if_unsupported()
+    torch.manual_seed(13)
+    num_seqs, seq_len = 64, 512
+    num_q_heads, num_k_heads, num_v_heads = 16, 16, 32
+    heads = max(num_q_heads, num_v_heads)
+    lens = [seq_len] * num_seqs
+    total = sum(lens)
+    q = torch.randn(total, num_q_heads, HEAD_SIZE, device="cuda").to(torch.bfloat16)
+    k = F.normalize(torch.randn(total, num_k_heads, HEAD_SIZE, device="cuda"), dim=-1)
+    k = k.to(torch.bfloat16)
+    v = torch.randn(total, num_v_heads, HEAD_SIZE, device="cuda").to(torch.bfloat16)
+    q, v = q * 0.1, v * 0.1
+    g = 0.9 + 0.1 * torch.rand(total, heads, device="cuda")
+    beta = torch.rand(total, heads, device="cuda")
+    scale = 1.0 / math.sqrt(HEAD_SIZE)
+    cu = _cu(lens, "cuda")
+    counts = [n // CHUNK for n in lens]
+    starts = _cu(counts, "cuda")
+    num_ckpts = sum(counts)
+    packed = torch.zeros(
+        num_ckpts, heads, HEAD_SIZE, HEAD_SIZE, dtype=state_dtype, device="cuda"
+    )
+    ref_out = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale,
+        cu_seqlens=cu,
+        state_checkpoints=packed,
+        checkpoint_cu_starts=starts,
+        checkpoint_every_n_tokens=CHUNK,
+    )
+    selected = starts[:-1].long() + (counts[0] - 3)
+    selected_entries = torch.full((num_ckpts,), -1, dtype=torch.int32, device="cuda")
+    selected_entries[selected] = torch.arange(
+        num_seqs, dtype=torch.int32, device="cuda"
+    )
+    cases = {
+        "every": (torch.arange(num_ckpts, dtype=torch.int32, device="cuda"), packed),
+        "selected": (selected_entries, packed[selected]),
+    }
+    for name, (entries, expected) in cases.items():
+        rows = torch.empty_like(expected)
+        first = None
+        for call in range(8):
+            rows.zero_()
+            out = chunk_gated_delta_rule(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                scale,
+                cu_seqlens=cu,
+                state_checkpoints=rows,
+                checkpoint_cu_starts=starts[:-1],
+                checkpoint_every_n_tokens=CHUNK,
+                checkpoint_state_indices=entries,
+            )
+            torch.cuda.synchronize()
+            if first is None:
+                first = (out.clone(), rows.clone())
+                torch.testing.assert_close(
+                    out.float(), ref_out.float(), atol=1e-2, rtol=1e-2
+                )
+                for lo in range(0, rows.size(0), num_seqs):
+                    hi = lo + num_seqs
+                    _assert_state(rows[lo:hi], expected[lo:hi], msg=f"{name} {lo}")
+                continue
+            assert torch.equal(out, first[0]), f"{name}, call {call}: output"
+            assert torch.equal(rows, first[1]), f"{name}, call {call}: checkpoints"
+
+
 @pytest.mark.parametrize("index_dtypes", list(_INDEX_DTYPES))
 def test_prefix_lens_absolute_checkpoints(index_dtypes):
     """``prefix_lens`` moves the checkpoint grid to absolute positions; an

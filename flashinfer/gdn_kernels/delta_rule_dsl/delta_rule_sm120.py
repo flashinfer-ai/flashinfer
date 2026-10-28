@@ -39,6 +39,7 @@ class NamedBarrier(IntEnum):
     MATH_WG0 = 4  # OrderedMathBarriers: StreamkBarrier0
     MATH_WG1 = 5  # OrderedMathBarriers: StreamkBarrier1
     KK_SYNC = 13  # sync all 128 WG0 threads before collective_inverse
+    QK_SYNC = 14  # sync all 128 WG1 threads before the QK store into sQK
 
 
 class WarpGroupRole(IntEnum):
@@ -1245,6 +1246,9 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
                 tKKcMkk,
             )
         if cutlass.const_expr(self.needs_beta):
+            # Reads of the beta stage complete before its refill (see the k
+            # release below).
+            cute.arch.fence_view_async_shared()
             beta_pipeline.consumer_release(beta_consumer_state)
             beta_consumer_state.advance()
 
@@ -1262,6 +1266,10 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             cute.gemm(qk_tiled_mma, tQKrQK, tQKrQ, tQKrK, tQKrQK)
             self.qk_epi(tQKrQK, tQKcMqk, sAlpha, alpha_stage, scale)
             self.qk_or_kk_mask(tQKrQK, tQKcMqk, is_final_block, B)
+            # Every QK warp reads all of sQK in the previous block's O2, and
+            # nothing else orders those reads before the other QK warps'
+            # stores of this block.
+            cute.arch.barrier(barrier_id=NamedBarrier.QK_SYNC, number_of_threads=128)
             self.qk_store(tQKrQK, sQK, qk_tiled_mma, qk_thread_idx)
 
         # ── O1: KV_state @ Q (both WGs, skip on first block) ─────────────────
@@ -1274,6 +1282,8 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             tOrKV = SM80.make_acc_into_op(tKVrKV, o1_tiled_mma, self.dtype)
             cute.gemm(o1_tiled_mma, tOrO, tOrKV, tOrQ, tOrO)
             self.o1_epi(tOrO, tOcO, sAlpha, alpha_stage, scale)
+        # Reads of the q stage complete before its refill (see the k release).
+        cute.arch.fence_view_async_shared()
         q_pipeline.consumer_release(q_consumer_state)
         q_consumer_state.advance()
 
@@ -1309,6 +1319,8 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             newv_tiled_mma, tNewVrA, tNewVrB, tNewVrC, sKK_opd.shape
         )
         self._math_order_notify(wg_idx)
+        # Reads of the v stage complete before its refill (see the k release).
+        cute.arch.fence_view_async_shared()
         v_pipeline.consumer_release(v_consumer_state)
         v_consumer_state.advance()
 
@@ -1345,6 +1357,15 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         # KV += NewV @ K
         cute.copy(kv_tiled_copy_B, tKVsK[None, None, None, k_stage], tKVrK_cv)
         cute.gemm(kv_tiled_mma, tKVrKV, tOrNewV, tKVrK, tKVrKV)
+        # Fence before every stage release. A release is one mbarrier arrive
+        # per warp (lane 0), and it does not wait for this warp's ldmatrix
+        # reads of the stage above. Once all math warps have arrived, TMA
+        # (async proxy) refills the stage. When the memory pipe is backed up,
+        # e.g. by the other warp group's checkpoint stores, the refill can
+        # land before a queued read, and the KV update then uses the K of
+        # block + 2. The fence completes this thread's shared-memory reads
+        # before the release. It also covers the alpha reads released below.
+        cute.arch.fence_view_async_shared()
         k_pipeline.consumer_release(k_consumer_state)
         k_consumer_state.advance()
         if cutlass.const_expr(self.needs_alpha):
