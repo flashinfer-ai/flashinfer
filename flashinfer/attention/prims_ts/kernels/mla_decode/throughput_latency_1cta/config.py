@@ -223,14 +223,6 @@ class MlaConfig:
         return self.num_tokens_per_page == 1 and self.rope_dim > 0
 
     @property
-    def keeps_ilp_softmax(self) -> bool:
-        """Keeps-MMA-AB softmax with a 4-way row max, FFMA2 exp arguments, four
-        packed sum accumulators and the running max / sum in registers (short
-        dependency chains, no per-tile SMEM round trip or named barrier): the
-        native sparse path and the D576 sparse path."""
-        return self.num_tokens_per_page == 1
-
-    @property
     def one_insts_kv_swap(self) -> bool:
         """One KV stream with swapped MMA operands (P remains in SMEM)."""
         return self.num_insts_kv == 1 and self.kernel_variant == "swaps_mma_ab"
@@ -1629,17 +1621,13 @@ def make_throughput_latency_mla_config(
             f"num_tokens_per_page={num_tokens_per_page}"
         )
     pages_per_kv_tile = MlaConfig.tile_size_kv // num_tokens_per_page
-    # Page size one stages one int32 row index per token: a 128-token K tile
-    # needs 128 entries.
-    page_offsets_entries_per_stage = (
-        MlaConfig.tile_size_kv
-        if num_tokens_per_page == 1
-        else MlaConfig.page_offsets_entries_per_stage
+    metadata_capacity = (
+        128 if num_tokens_per_page == 1 else MlaConfig.page_offsets_entries_per_stage
     )
     page_offsets_stages = MlaConfig.page_offsets_stages
     if sparse_d576:
         page_offsets_stages = 4
-    if pages_per_kv_tile > page_offsets_entries_per_stage:
+    if pages_per_kv_tile > metadata_capacity:
         raise ValueError(
             "page-offset staging capacity is smaller than one KV tile: "
             f"pages_per_kv_tile={pages_per_kv_tile}, "
@@ -1769,9 +1757,9 @@ def make_throughput_latency_mla_config(
         softmax_regs=softmax_register_budget(tile_size_q),
         correction_regs=correction_register_budget(tile_size_q),
         num_tokens_per_page=num_tokens_per_page,
-        max_num_pages_per_seq_kv=max(1, ceil(seq_len_kv / num_tokens_per_page)),
-        page_offsets_entries_per_stage=page_offsets_entries_per_stage,
+        page_offsets_entries_per_stage=metadata_capacity,
         page_offsets_stages=page_offsets_stages,
+        max_num_pages_per_seq_kv=max(1, ceil(seq_len_kv / num_tokens_per_page)),
         tmem_s_cols=tile_size_q,
         tmem_stats_cols=MlaConfig.tmem_stats_cols,
         tmem_o_cols=tile_size_q,

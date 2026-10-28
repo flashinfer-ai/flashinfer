@@ -1630,6 +1630,7 @@ def _make_single_kv_pipe_task_graph(
             )
         },
     }
+
     smem_allocator = SmemAllocator()
     if isinstance(work_queue, ThroughputLatencyMlaClcWorkQueue):
         work_queue._response_allocator = smem_allocator
