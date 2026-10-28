@@ -952,9 +952,16 @@ def _assert_bitwise(got, want, label):
         if a is None or b is None:
             assert a is None and b is None, f"{label}: {name} on one side only"
             continue
-        assert torch.equal(
-            a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8)
-        ), f"{label}: {name} differs"
+        bits_a = a.contiguous().view(torch.uint8)
+        bits_b = b.contiguous().view(torch.uint8)
+        if not torch.equal(bits_a, bits_b):
+            same = (bits_a == bits_b).view(a.shape + (a.element_size(),)).all(-1)
+            first = tuple(int(i) for i in (~same).nonzero()[0])
+            diff = (a.float() - b.float()).abs()
+            raise AssertionError(
+                f"{label}: {name} differs: {int((~same).sum())} of {a.numel()} "
+                f"elements, first at {first}, max abs diff {float(diff.max()):.3e}"
+            )
 
 
 def _modules(prepared):
@@ -1359,28 +1366,50 @@ PAIR_SHARE_ROWS = [
     pytest.param([3000, 13384], 16, id="3000+13384-h16"),
     pytest.param([8192], 6, id="8192-h6"),
 ]
-STATE_VARIANTS = [
-    pytest.param(dict(indexed=True), id="indexed-pool"),
-    pytest.param(dict(indexed=False), id="dense-state"),
-    pytest.param(dict(indexed=False, initial=False), id="zero-initial-state"),
-]
+
+
+def _pair_share_cases():
+    """Without state indices (dense states, zero initial states) the long rows
+    above take the M64 value split; with them they take the chain composite
+    (test below), so the indexed pool runs on serving rows the pair-share
+    route takes on both arches."""
+    rows = [([8192, 17], 12, "8192+17-h12"), ([3000, 13384], 16, "3000+13384-h16")]
+    rows += [([8192], 6, "8192-h6")]
+    states = [(dict(indexed=False), "dense-state")]
+    states += [(dict(indexed=False, initial=False), "zero-initial-state")]
+    cases = [
+        pytest.param(lengths, heads, state, id=f"{row}-{name}")
+        for lengths, heads, row in rows
+        for state, name in states
+    ]
+    for lengths, row in (([8192, 8192], "2x8192"), ([8128, 64] * 2, "2x(8128+64)")):
+        cases.append(
+            pytest.param(lengths, 16, dict(indexed=True), id=f"{row}-h16-indexed-pool")
+        )
+    return cases
+
+
+def _own_pool(d):
+    """The same inputs with this arm's own copy of the initial pool and indices."""
+    return dict(
+        d, state=d["initial_pool"].clone(), state_indices=d["state_indices"].clone()
+    )
 
 
 @requires_blackwell
-@pytest.mark.parametrize("state", STATE_VARIANTS)
-@pytest.mark.parametrize("lengths,heads", PAIR_SHARE_ROWS)
+@pytest.mark.parametrize("lengths,heads,state", _pair_share_cases())
 def test_pair_share_is_bitwise_the_routed_m64_program(
     lengths, heads, state, monkeypatch
 ):
     """A long M64 value-split launch that takes the pair-share build equals, bit
     for bit, the routed M64 program (the loader without pair-share builds):
     output, final states and checkpoint rows, with and without state indices
-    and initial states."""
+    and initial states; each arm has its own copy of the initial pool."""
     arch = registry.device_arch()
     pair_share = set(registry._RENDERED_PAIR_SHARE_ROUTES[arch].values())
     d = _inputs(lengths, heads)
 
-    shared = _Call(d, -5.0, **state)
+    shared = _Call(_own_pool(d), -5.0, **state)
     schedule = str(shared.prepared.schedule)
     assert schedule.startswith("fused_m64_independent_dvsplit"), schedule
     assert schedule.endswith("_pair_share"), schedule
@@ -1393,10 +1422,36 @@ def test_pair_share_is_bitwise_the_routed_m64_program(
         "_RENDERED_PAIR_SHARE_ROUTES",
         {name: {} for name in registry.ARCHES},
     )
-    routed = _Call(d, -5.0, **state)
+    routed = _Call(_own_pool(d), -5.0, **state)
     assert str(routed.prepared.schedule) == schedule.removesuffix("_pair_share")
     assert not _modules(routed.prepared) & pair_share
     _assert_bitwise(shared_result, routed.run(), "pair-share vs routed M64")
+
+
+@requires_blackwell
+@pytest.mark.parametrize("lengths,heads", PAIR_SHARE_ROWS)
+def test_indexed_long_rows_take_the_chain_not_the_pair_share(
+    lengths, heads, monkeypatch
+):
+    """With state indices the long rows above take the chain composite (the
+    affine split needs indexed states), not the M64 value split: no pair-share
+    program loads, and clearing the pair-share table changes no bit."""
+    arch = registry.device_arch()
+    pair_share = set(registry._RENDERED_PAIR_SHARE_ROUTES[arch].values())
+    d = _inputs(lengths, heads)
+    chain = _Call(_own_pool(d), -5.0)
+    schedule = str(chain.prepared.schedule)
+    assert schedule.startswith("split_seq_affine_prefix"), schedule
+    assert not _modules(chain.prepared) & pair_share
+    want = chain.run()
+    monkeypatch.setattr(
+        registry,
+        "_RENDERED_PAIR_SHARE_ROUTES",
+        {name: {} for name in registry.ARCHES},
+    )
+    cleared = _Call(_own_pool(d), -5.0)
+    assert str(cleared.prepared.schedule) == schedule
+    _assert_bitwise(cleared.run(), want, "pair-share table cleared")
 
 
 CHAIN_ROWS = [
