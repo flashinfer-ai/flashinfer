@@ -281,6 +281,19 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
                 f"{_NAME} fc2_early_max_tokens must be an int >= 0 or None, got "
                 f"{kcfg.fc2_early_max_tokens!r}"
             )
+        if kcfg.direct_place is not None and not isinstance(kcfg.direct_place, bool):
+            raise MoEEpConfigError(
+                f"{_NAME} direct_place must be a bool or None, got {kcfg.direct_place!r}"
+            )
+        if kcfg.direct_place_min_tokens is not None and not (
+            isinstance(kcfg.direct_place_min_tokens, int)
+            and not isinstance(kcfg.direct_place_min_tokens, bool)
+            and kcfg.direct_place_min_tokens >= 0
+        ):
+            raise MoEEpConfigError(
+                f"{_NAME} direct_place_min_tokens must be an int >= 0 or None, got "
+                f"{kcfg.direct_place_min_tokens!r}"
+            )
 
     def preprocess_weights(
         self, weights: MoEWeightPack, fleet_params: FleetParams
@@ -399,6 +412,8 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
                 per_route_publish_pdl=kcfg.per_route_publish_pdl,
                 fc2_early_max_tokens=kcfg.fc2_early_max_tokens,
                 prefix_form=kcfg.prefix_form,
+                direct_place=kcfg.direct_place,
+                direct_place_min_tokens=kcfg.direct_place_min_tokens,
             )
         except Exception:
             pipe.destroy()
@@ -435,6 +450,8 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
             kcfg.per_route_publish_pdl,
             kcfg.fc2_early_max_tokens,
             kcfg.prefix_form,
+            kcfg.direct_place,
+            kcfg.direct_place_min_tokens,
             float(kcfg.init_timeout_s),
         )
 

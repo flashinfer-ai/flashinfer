@@ -107,6 +107,21 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     warp scan per source), ``0`` walks the keys with one thread in every
     dispatch.  Both store the same values.  ``None`` reads
     ``FLASHINFER_SM90_CAKE_BF16_PREFIX_FORM`` (default ``1``).
+
+    ``direct_place`` makes the grid dispatch store the first route of each token
+    to a rank (its carrier) straight into that rank's activation matrix, which
+    becomes a symmetric (peer-writable) buffer, at the row the compact would have
+    copied it to; the compact then copies only the later routes of the token to
+    the same rank.  It is effective only when every EP rank sets it and every
+    rank's pipe can run it (dedup dispatch, the grid dispatch and compact form
+    ``1`` on, at most 1024 (expert, rank) keys); otherwise the layer keeps the
+    inbox path without an error.  A round is placed directly only when every rank
+    dispatches it through the grid dispatch with at least
+    ``direct_place_min_tokens`` local tokens; other rounds take the inbox path.
+    It changes no stored value.  ``None`` reads
+    ``FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE`` (``0`` or ``1``, default ``0``) and
+    ``FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE_MIN_TOKENS`` (default ``513``, the
+    grid-dispatch bound).
     """
 
     intermediate_size: int
@@ -128,3 +143,5 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     per_route_publish_pdl: bool | None = None
     fc2_early_max_tokens: int | None = None
     prefix_form: int | None = None
+    direct_place: bool | None = None
+    direct_place_min_tokens: int | None = None

@@ -16,13 +16,16 @@ limitations under the License.
 
 from __future__ import annotations
 
+import atexit
 import contextlib
 import os
+import weakref
 from enum import Enum
 
 import torch
 
 from ...push_style_megamoe.shim.protocol import (
+    _CAPSULE_KEEPALIVE,
     Sm90PushCombine,
     Sm90PushPayload,
     Sm90PushPipe,
@@ -52,6 +55,8 @@ __all__ = [
     "COMBINE_WIRE_ENV",
     "COMPACT_FORM_ENV",
     "COPY_FORMS",
+    "DIRECT_PLACE_ENV",
+    "DIRECT_PLACE_MIN_TOKENS_ENV",
     "FC2_EARLY_MAX_TOKENS",
     "FC2_EARLY_MAX_TOKENS_ENV",
     "FUSED_BEGIN_ENV",
@@ -191,6 +196,22 @@ FC2_EARLY_MAX_TOKENS = 128
 # dispatch.  The 129..512-token fused dispatch walks the keys with one thread in
 # both settings.  Both forms write the same values, so ranks may differ.
 PREFIX_FORM_ENV = "FLASHINFER_SM90_CAKE_BF16_PREFIX_FORM"
+# Direct placement in grid-dispatch rounds: the activation matrix of every rank is a
+# symmetric (peer-writable) buffer; the sender stores the first route of a token to
+# a rank (its carrier) straight into that rank's matrix at the row the compact would
+# have copied it to, and the compact copies only the later routes of the token to
+# the same rank (from the carrier's row).  A round is direct only when every rank
+# dispatches it this way (decided on the device, the same on every rank); other
+# rounds use the inbox path.  Requested with 1 (``direct_place=True``; default 0);
+# effective only when every rank requests it and its pipe allows it (dedup
+# dispatch, the grid dispatch on, compact form 1, at most 1024 (expert, rank) keys),
+# and then for grid-dispatch rounds with at least DIRECT_PLACE_MIN_TOKENS_ENV
+# (``direct_place_min_tokens``; default the grid-dispatch bound) local tokens.
+# Bit-identical outputs.
+DIRECT_PLACE_ENV = "FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE"
+DIRECT_PLACE_MIN_TOKENS_ENV = "FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE_MIN_TOKENS"
+_DIRECT_PLACE_MAX_KEYS = 1024  # E * ep: the pipelined compact's segment tables
+_DIRECT_PLACE_MAX_ROWS = 1 << 30  # the SlotMeta row field (bits 0..29)
 
 
 def _env_flag(name: str) -> bool:
@@ -283,6 +304,41 @@ def _fc2_early_max_tokens_default() -> int:
     return FC2_EARLY_MAX_TOKENS if raw is None else int(raw.strip())
 
 
+def _direct_place_default() -> bool:
+    raw = os.environ.get(DIRECT_PLACE_ENV, "0").strip()
+    if raw not in ("0", "1"):
+        raise ValueError(f"{DIRECT_PLACE_ENV} must be 0 or 1, got {raw!r}")
+    return raw == "1"
+
+
+def _direct_place_min_tokens_default() -> int:
+    raw = os.environ.get(DIRECT_PLACE_MIN_TOKENS_ENV)
+    return GRID_DISPATCH_MIN_TOKENS if raw is None else int(raw.strip())
+
+
+def _align256(nbytes: int) -> int:
+    return (nbytes + 255) // 256 * 256
+
+
+# Symmetric a1 views carry C++ deleters that must not run during interpreter
+# finalization (see protocol.py): atexit drops them early, the buffer itself is left
+# to the process exit since a peer may still map it.
+_LIVE_RUNNERS: list = []
+
+
+def _drain_live_runners() -> None:
+    with contextlib.suppress(Exception):
+        torch.cuda.synchronize()
+    for ref in _LIVE_RUNNERS:
+        runner = ref()
+        if runner is not None:
+            runner._release_direct_views()
+    _LIVE_RUNNERS.clear()
+
+
+atexit.register(_drain_live_runners)
+
+
 def _combine_wire_default(token_capacity: int) -> str:
     """Default combine wire: the environment override when set, otherwise the
     per-shape default (``per_route`` when ``token_capacity`` is at or below
@@ -343,6 +399,15 @@ class Sm90CakeBf16MoERunner:
     default from ``FUSED_COMBINE_TAIL_ENV`` / ``FUSED_DISPATCH_ENV``) are
     bit-identical and a peer rank may use any of them.
 
+    Direct placement (``direct_place``; ``None`` = ``DIRECT_PLACE_ENV``, default
+    off): grid-dispatch rounds store each token's row for a rank straight into
+    that rank's activation matrix (a symmetric buffer), so the compact copies only
+    the later routes of a token to the same rank.  It is effective only when every
+    rank of the pipe requests it and can run it; a round is direct only when every
+    rank dispatches it through the grid dispatch with at least
+    ``direct_place_min_tokens`` tokens, otherwise the round takes the inbox path.
+    Bit-identical outputs.
+
     Precision contract: bf16 operands into both GEMMs, fp32 accumulation, bf16
     intermediate, bf16 dispatch payload and combine wire, bf16 output.  No FP8
     anywhere.  The pipe must be configured with ``payload_dtype=BF16`` and
@@ -369,6 +434,8 @@ class Sm90CakeBf16MoERunner:
         per_route_publish_pdl: bool | None = None,
         fc2_early_max_tokens: int | None = None,
         prefix_form: int | None = None,
+        direct_place: bool | None = None,
+        direct_place_min_tokens: int | None = None,
     ) -> None:
         self.pipe = pipe
         self._state = _RunnerState.IDLE
@@ -463,6 +530,42 @@ class Sm90CakeBf16MoERunner:
         self._fc2_early_max_tokens = early_max  # effective value fixed after the JIT
         self._gemm_sched: torch.Tensor | None = None
         self._prefix_form = _form(prefix_form, PREFIX_FORM_ENV, "prefix_form")
+        if direct_place is None:
+            requested = _direct_place_default()
+        elif direct_place in (0, 1):  # bool or 0 / 1
+            requested = bool(direct_place)
+        else:
+            raise ValueError(
+                f"direct_place must be a bool or None, got {direct_place!r}"
+            )
+        direct_min = (
+            _direct_place_min_tokens_default()
+            if direct_place_min_tokens is None
+            else int(direct_place_min_tokens)
+        )
+        if direct_min < 0:
+            raise ValueError(
+                f"direct_place_min_tokens must be >= 0, got {direct_place_min_tokens!r}"
+            )
+        self._direct_min = direct_min
+        # this rank can run it; effective (self._direct) = every rank can (init handshake)
+        self._direct_local = (
+            requested
+            and pipe.config.dedup_dispatch
+            and self._grid_dispatch_min_tokens > 0
+            and self._compact_form == 1
+            and pipe.E * pipe.ep <= _DIRECT_PLACE_MAX_KEYS
+            and output_row_capacity(pipe.m_cap) < _DIRECT_PLACE_MAX_ROWS
+        )
+        self._direct = False
+        # symmetric a1 + count all-gather area (direct placement)
+        self._a1_symm: object | None = None
+        self._a1_peers = 0
+        self._ag_offset = 0
+        self._ag_view: torch.Tensor | None = None
+        self._grid_a1base: torch.Tensor | None = None
+        self._staged_direct = False
+        self._last_round_direct = False
         self._per_route_publish_pdl = (
             _per_route_publish_pdl_default()
             if per_route_publish_pdl is None
@@ -524,6 +627,18 @@ class Sm90CakeBf16MoERunner:
         _run_guarded_phase(
             pipe._comm, pipe.rank, "cake-bf16-combine-wire", _wire_handshake
         )
+
+        # direct placement needs every rank: a rank that cannot run it disables it for
+        # the pipe (no error, ranks may request different switches)
+        direct_flags = _run_guarded_phase(
+            pipe._comm, pipe.rank, "cake-bf16-direct-place", lambda: self._direct_local
+        )
+        self._direct = all(direct_flags)
+        _run_guarded_phase(
+            pipe._comm, pipe.rank, "cake-bf16-direct-a1", self._init_direct_a1
+        )
+        if self._direct:
+            _LIVE_RUNNERS.append(weakref.ref(self))
 
         def _jit():
             self.compact_module = gen_sm90_cake_bf16_compact_module().build_and_load()
@@ -640,6 +755,22 @@ class Sm90CakeBf16MoERunner:
         return self._prefix_form
 
     @property
+    def direct_place(self) -> bool:
+        """True when grid-dispatch rounds may place carrier rows directly (every rank opted in)."""
+        return self._direct
+
+    @property
+    def direct_place_min_tokens(self) -> int:
+        """Smallest round (local tokens) that takes the direct-placement grid dispatch."""
+        return self._direct_min
+
+    def _direct_flag(self) -> int:
+        """Debug: 1 when the last round placed its rows directly on this rank, else 0 (syncs)."""
+        if not self._last_round_direct or self._grid_a1base is None:
+            return 0
+        return int(self._grid_a1base[-1].item())
+
+    @property
     def fused_begin(self) -> int:
         """Round-opening fusion level of small rounds (0, 1 or 2; see ``FUSED_BEGIN_ENV``)."""
         return self._fused_begin
@@ -676,7 +807,13 @@ class Sm90CakeBf16MoERunner:
         H = pipe.H
         self.m_buf = output_row_capacity(pipe.m_cap)
         dv = pipe.device
-        self.a1 = torch.empty(self.m_buf, H, dtype=torch.bfloat16, device=dv)
+        # direct placement: a1 is the symmetric buffer of _init_direct_a1 (or, when a peer
+        # cannot run it, a regular tensor allocated there)
+        self.a1: torch.Tensor | None = (
+            None
+            if self._direct_local
+            else torch.empty(self.m_buf, H, dtype=torch.bfloat16, device=dv)
+        )
         self.meta = torch.empty(self.m_buf, 4, dtype=torch.int32, device=dv)
         self.row_expert = torch.empty(self.m_buf, dtype=torch.int32, device=dv)
         self.h2 = torch.empty(self.m_buf, self.I, dtype=torch.bfloat16, device=dv)
@@ -717,6 +854,63 @@ class Sm90CakeBf16MoERunner:
                 1, dtype=torch.int32, device=dv
             )
 
+    def _init_direct_a1(self) -> None:
+        """Guarded phase after the direct-placement handshake (every rank runs it)."""
+        pipe = self.pipe
+        if not self._direct:
+            if self.a1 is None:
+                self.a1 = torch.empty(
+                    self.m_buf, pipe.H, dtype=torch.bfloat16, device=pipe.device
+                )
+            return None
+        from ......comm import pack_strided_memory
+        from ......comm.mnnvl import SymmDeviceMemory
+
+        # [a1 rows | one flag per source | one per-key count row per source]
+        nkeys = pipe.E * pipe.ep
+        a1_bytes = self.m_buf * pipe.H * 2
+        self._ag_offset = _align256(a1_bytes)
+        ag_bytes = _align256(8 * pipe.ep) + pipe.ep * ((nkeys + 3) // 4 * 4) * 4
+        symm = SymmDeviceMemory(
+            buf_size=self._ag_offset + ag_bytes,
+            group_size=pipe.ep,
+            group_rank=pipe.rank,
+            device_idx=pipe.device_index,
+            comm_backend_for_handle_transfer=pipe._comm,
+            enable_multicast=False,
+            allocate_signal_pads=False,
+        )
+        self._a1_symm = symm
+        self._a1_peers = symm.get_buffer_ptrs_dev()
+        base = symm.get_unicast_ptr(pipe.rank)
+
+        def view(offset: int, nbytes: int, dtype: torch.dtype) -> torch.Tensor:
+            t = pack_strided_memory(
+                base + offset, nbytes, nbytes, 1, dtype, pipe.device_index
+            )
+            wrapper = getattr(t, "_capsule_wrapper", None)
+            if wrapper is not None:  # see protocol._CAPSULE_KEEPALIVE
+                _CAPSULE_KEEPALIVE.append(wrapper)
+            t = t.reshape(-1)
+            return (
+                t if t.dtype == dtype else t.view(dtype)
+            )  # dlpack labels bf16 as fp16
+
+        self.a1 = view(0, a1_bytes, torch.bfloat16).reshape(self.m_buf, pipe.H)
+        self._ag_view = view(self._ag_offset, ag_bytes, torch.uint8)
+        self._ag_view.zero_()  # tag 0 never matches a round (the first round's tag is 1)
+        self._grid_a1base = torch.zeros(
+            nkeys + 1, dtype=torch.int32, device=pipe.device
+        )
+        torch.cuda.synchronize(pipe.device)
+        return None
+
+    def _release_direct_views(self) -> None:
+        """Drop the dlpack views of the symmetric a1 (destroy / interpreter exit)."""
+        if self._a1_symm is not None:
+            self.a1 = None
+            self._ag_view = None
+
     def bind_weights(self, weights: Sm90CakeBf16Weights) -> None:
         """Swap the expert weights between rounds (same geometry, same device)."""
         self._require_usable()
@@ -747,6 +941,7 @@ class Sm90CakeBf16MoERunner:
         if self._state in (_RunnerState.POISONED, _RunnerState.DESTROYED):
             return
         self._state = _RunnerState.POISONED
+        self._staged_direct = False
         self._staged_tokens = None
         self._staged_topk_ids = None
         self._staged_stream = None
@@ -766,6 +961,10 @@ class Sm90CakeBf16MoERunner:
         if gemm is not None:
             with contextlib.suppress(Exception):
                 gemm.destroy()
+        if self._a1_symm is not None:  # quiesce, then drop the views before the buffer
+            torch.cuda.synchronize(self.pipe.device)
+            self._release_direct_views()
+            self._a1_symm = None
         self.pipe.destroy()
 
     # ---------------------------------------------------------------- rounds
@@ -882,6 +1081,7 @@ class Sm90CakeBf16MoERunner:
         nv = self.record_stages
         use_grid = self._use_grid_dispatch(num_tokens)
         use_fused = not use_grid and self._use_fused_dispatch(num_tokens)
+        direct = use_grid and self._direct and num_tokens >= self._direct_min
         level = (
             self._grid_begin if use_grid else (self._fused_begin if use_fused else 0)
         )
@@ -891,7 +1091,7 @@ class Sm90CakeBf16MoERunner:
             with _record_stage("dispatch", nv):
                 if use_grid:
                     pipe = self.pipe
-                    self.dispatch_grid_module.sm90_cake_dispatch_grid_bf16(
+                    grid_args = (
                         x,
                         topk_ids,
                         topk_weights,
@@ -918,6 +1118,17 @@ class Sm90CakeBf16MoERunner:
                         pipe.m_cap,
                         self._prefix_form,
                     )
+                    if direct:
+                        self.dispatch_grid_module.sm90_cake_dispatch_grid_direct_bf16(
+                            *grid_args,
+                            self._grid_a1base,
+                            self._a1_peers,
+                            self._ag_offset,
+                        )
+                    else:
+                        self.dispatch_grid_module.sm90_cake_dispatch_grid_bf16(
+                            *grid_args
+                        )
                 elif use_fused:
                     pipe = self.pipe
                     self.dispatch_module.sm90_cake_dispatch_fused_bf16(
@@ -946,6 +1157,8 @@ class Sm90CakeBf16MoERunner:
             self._poison()
             raise
         self._staged_tokens = num_tokens
+        self._staged_direct = direct
+        self._last_round_direct = direct
         self._staged_prefix_done = level == 2
         self._staged_topk_ids = topk_ids  # the fused tail skips masked (-1) slots
         self._staged_stream = stream
@@ -994,25 +1207,45 @@ class Sm90CakeBf16MoERunner:
                     with _record_stage("wait_prefix", nv):
                         pipe.proto_wait_prefix()
                 with _record_stage("compact_bf16", nv):
-                    self.compact_module.sm90_cake_compact_bf16(
-                        self.a1,
-                        self.meta,
-                        self.row_expert,
-                        *pipe._layout_args(),
-                        pipe._seg_src_base,
-                        pipe._seg_out_base,
-                        pipe._m_dev,
-                        pipe._next_row,
-                        self._grp_cnt,
-                        self._grp_rows,
-                        self._grp_list,
-                        self._n_groups,
-                        self._groups_per_src,
-                        pipe._round,
-                        1 if self._combine_wire in _PREREDUCED_WIRES else 0,
-                        self._pdl_flag(PDL_EDGE_COMPACT),
-                        self._compact_form,
-                    )
+                    build_groups = 1 if self._combine_wire in _PREREDUCED_WIRES else 0
+                    if self._staged_direct:  # the carriers are in a1 already
+                        self.compact_module.sm90_cake_compact_direct_bf16(
+                            self.a1,
+                            self.meta,
+                            self.row_expert,
+                            *pipe._layout_args(),
+                            pipe._seg_src_base,
+                            pipe._seg_out_base,
+                            pipe._m_dev,
+                            self._grp_cnt,
+                            self._grp_rows,
+                            self._grp_list,
+                            self._n_groups,
+                            self._groups_per_src,
+                            pipe._round,
+                            build_groups,
+                            self._pdl_flag(PDL_EDGE_COMPACT),
+                        )
+                    else:
+                        self.compact_module.sm90_cake_compact_bf16(
+                            self.a1,
+                            self.meta,
+                            self.row_expert,
+                            *pipe._layout_args(),
+                            pipe._seg_src_base,
+                            pipe._seg_out_base,
+                            pipe._m_dev,
+                            pipe._next_row,
+                            self._grp_cnt,
+                            self._grp_rows,
+                            self._grp_list,
+                            self._n_groups,
+                            self._groups_per_src,
+                            pipe._round,
+                            build_groups,
+                            self._pdl_flag(PDL_EDGE_COMPACT),
+                            self._compact_form,
+                        )
                 # FC2 early start in the decode window (rank-local: no cross-rank protocol)
                 sched = (
                     self._gemm_sched
@@ -1134,6 +1367,7 @@ class Sm90CakeBf16MoERunner:
             raise
         self._state = _RunnerState.IDLE
         self._staged_tokens = None
+        self._staged_direct = False
         self._staged_prefix_done = False
         self._staged_topk_ids = None
         self._staged_stream = None
