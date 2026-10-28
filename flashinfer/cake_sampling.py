@@ -577,9 +577,15 @@ _C12_BLOCK_TAIL_CELLS: dict[
 # 1.019-1.045 of the chain at batch 8 and 16 (0.937-0.949 at batch 32), so those rows keep the chain below 800.
 # Batch 1, 2 and 4 keep the chain in its ``_CHAIN_CELL_FORMS_BY_DEVICE`` form (the tail runs at 0.966-1.032 of the
 # chain at batch 2 and 4).
+# Round 20: on GB300 (152 SMs) the V = 151936 row at batch 128 (the cost model's (1, 32) stream, a two-launch chain on
+# its no-tail twin) runs `c1_e32s_bt_sp_tia` (the integer-tested tail of compute capability 10.3) from k = 769 at
+# 0.852-0.868 of the chain at k = 1000, 0.851-0.859 at k = 769, 0.855-0.862 at k = 800, 0.853-0.859 at k = 900 and
+# 0.775-0.782 at k = 1024 (two nodes, 12 rounds, both buffer placements, eager and graph, same sampled tokens).  The
+# 148-SM B300 keeps the chain.
 _C1_BLOCK_TAIL_PICKS_BY_DEVICE: dict[
     tuple[int, int, int], dict[tuple[int, int], int]
 ] = {
+    (10, 3, 152): {(151936, 128): 769},
     (10, 7, 212): {(32768, 8): 800, (32768, 16): 800, (32768, 32): 769},
 }
 _C1_BLOCK_TAIL_PICK_BUILD = (1, 32, True)
