@@ -241,7 +241,16 @@ reads its staged rows before its predicated stores, and row sinks load before
 the correction task's first wait. Two metadata stages let the next tile's row
 IDs load during the current tile.
 
+While `4 * batch` (or `2 * batch`) CTAs still fit one wave, each request's V
+columns split over four (or two) CTAs. Every V owner computes the full QK over
+the K tile it retains and reads V from its own D128 slices of that tile, so the
+split divides PV, correction and output work but not the loads or the FP4
+conversion. Outputs match one V owner bitwise.
+
 Capture requires caller output/workspace and eager warmup for the same declaration.
+The V split is a compiled specialization chosen from the batch size, so warm up a
+batch of each split class (`4 * batch <= SMs`, `2 * batch <= SMs`, otherwise)
+that will be captured.
 Keep addresses alive/fixed and update values in place. Changing Python scales
 requires recapture, not recompilation. Concurrent calls need separate writable
 buffers or synchronization. Output/workspace cannot overlap inputs or each other;

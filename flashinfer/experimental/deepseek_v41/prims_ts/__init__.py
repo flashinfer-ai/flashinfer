@@ -17,7 +17,9 @@ from ._workspace import bind_inputs, device_sm_count
 
 
 @functools.cache
-def _compile(device_index, compressed_k, *, has_sink=False, native_fp4=None):
+def _compile(
+    device_index, compressed_k, *, has_sink=False, native_fp4=None, head_dim_ctas=1
+):
     if torch.cuda.is_current_stream_capturing():
         raise ValueError("warm up the decode specialization before CUDA Graph capture")
 
@@ -49,7 +51,9 @@ def _compile(device_index, compressed_k, *, has_sink=False, native_fp4=None):
     from . import kernel as adapter_kernel
 
     sm_count = device_sm_count(device_index)
-    attention = adapter_kernel._make_fp8_attention(compressed_k, sm_count, native_fp4)
+    attention = adapter_kernel._make_fp8_attention(
+        compressed_k, sm_count, native_fp4, head_dim_ctas
+    )
     decode_kernel = adapter_kernel.Fp8SwaDecodeKernel(attention)
     batch = cute.sym_int()
     f = cute.runtime.make_fake_compact_tensor
@@ -100,7 +104,7 @@ def _compile(device_index, compressed_k, *, has_sink=False, native_fp4=None):
     native_root = Path(native_kernel.__file__).resolve().parents[3]
     return build_and_load_cute_dsl_kernel(
         "deepseek_v41_prims_ts_fp8",
-        f"h64_d512_swa128_c{compressed_k}_keep_bk128_kv8_split1_i64"
+        f"h64_d512_swa128_c{compressed_k}_keep_bk128_kv8_split1_v{head_dim_ctas}_i64"
         f"_shared_pertensor_joint_sink{int(has_sink)}"
         f"_nativefp4{int(native_fp4)}_sm{sm_count}_{key}",
         lambda: cute.compile[cute.FrontendNext](
@@ -130,6 +134,16 @@ def _compile(device_index, compressed_k, *, has_sink=False, native_fp4=None):
             *sorted(native_root.rglob("*.py")),
         ),
     )
+
+
+def _head_dim_ctas(batch, device_index):
+    """V owners per request: four or two while the grid still fits one wave.
+
+    Every owner still loads and converts the whole K tile, so only PV,
+    correction and output work divide; a second wave would cost more.
+    """
+    sm_count = device_sm_count(device_index)
+    return next((v for v in (4, 2) if batch * v <= sm_count), 1)
 
 
 def decode_mixed(
@@ -166,7 +180,10 @@ def decode_mixed(
     views = bound.views
     with torch.cuda.device(query.device):
         kernel = _compile(
-            query.device.index, bound.compressed_k, has_sink=bound.sinks is not None
+            query.device.index,
+            bound.compressed_k,
+            has_sink=bound.sinks is not None,
+            head_dim_ctas=_head_dim_ctas(bound.batch, query.device.index),
         )
         kernel(
             query.permute(2, 3, 1, 0),

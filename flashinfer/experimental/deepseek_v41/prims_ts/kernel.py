@@ -10,7 +10,7 @@ import cutlass
 import cutlass.cute as cute
 
 
-def _make_fp8_attention(compressed_k, sm_count, native_fp4):
+def _make_fp8_attention(compressed_k, sm_count, native_fp4, head_dim_ctas=1):
     from ....attention.prims_ts.kernels.mla_decode.sparse_policy import SparseMlaProfile
     from ....attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.kernel import (
         ThroughputLatencyMlaDecodeTs,
@@ -38,6 +38,9 @@ def _make_fp8_attention(compressed_k, sm_count, native_fp4):
             name="dsv41_shared_pertensor_joint",
             kernel_variant="keeps_mma_ab",
             tile_size_q=64,
+            # V owners each read their D128 slices of the retained K tile, so
+            # a split divides PV, correction and output work, not the loads.
+            num_ctas_per_head_dim=head_dim_ctas,
             use_persistent_scheduler=0,
         ),
         logical_num_heads=64,
@@ -52,7 +55,7 @@ def _make_fp8_attention(compressed_k, sm_count, native_fp4):
             tile_size_q=64,
             split_kv=1,
             scheduler="nonpersistent",
-            head_dim_ctas=1,
+            head_dim_ctas=head_dim_ctas,
             gather_issue_warps=4,
             reuse_kv=True,
             reuse_kv_stages=8,
