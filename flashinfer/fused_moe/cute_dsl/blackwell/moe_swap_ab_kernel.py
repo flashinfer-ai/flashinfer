@@ -2279,8 +2279,12 @@ class Sm100BlockScaledGroupedGemmKernel:
         operand_pipe.producer_acquire(
             producer,
             expected_tx=self.cta_group_size
-            * (128 * self.tile_k * self.weight_dtype.width // 8 + self.sf_stage_bytes)
-            * self.channel_tiles,
+            * (
+                (128 * self.tile_k * self.weight_dtype.width // 8 + self.sf_stage_bytes)
+                * self.channel_tiles
+                + self.b_copy_rows * self.tile_k * self.activation_dtype.width // 8
+                + self.sfb_stage_bytes
+            ),
         )
         if cutlass.const_expr(self.enable_iket):
             _iket.range_pop()
@@ -2370,13 +2374,13 @@ class Sm100BlockScaledGroupedGemmKernel:
         block = block // self.cta_group_size
         grid = grid // self.cta_group_size
         storage = utils.SmemAllocator().allocate(self.storage_type)
-        # Two independent producers announce disjoint bytes to one full barrier;
+        # Weight announces all operand bytes; both producers wait for reuse.
         # MMA releases their shared stage only after consuming all operands.
         operand_pipe = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.operand_barriers.data_ptr(),
             defer_sync=True,
             num_stages=self.num_stages,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 2),
+            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             cta_layout_vmnk=cluster_layout,
             tx_count=0,
@@ -2589,17 +2593,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                 for k_tile in cutlass.range(k_tiles):
                     if cutlass.const_expr(self.enable_iket):
                         _iket.range_push("producer_activation_empty")
-                    operand_pipe.producer_acquire(
-                        producer,
-                        expected_tx=self.cta_group_size
-                        * (
-                            self.b_copy_rows
-                            * self.tile_k
-                            * self.activation_dtype.width
-                            // 8
-                            + self.sfb_stage_bytes
-                        ),
-                    )
+                    operand_pipe.sync_object_empty.wait(producer.index, producer.phase)
                     if cutlass.const_expr(self.enable_iket):
                         _iket.range_pop()
                         _iket.range_push("producer_activation_tma")
