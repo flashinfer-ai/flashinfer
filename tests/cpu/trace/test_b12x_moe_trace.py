@@ -22,6 +22,7 @@ def _packed_ones(*shape):
     return torch.full(shape, 0x22, dtype=torch.uint8)
 
 
+@pytest.mark.cpu_only
 def test_b12x_wrapper_trace_keeps_constructor_quantization_config():
     from flashinfer.trace.templates.moe import (
         b12x_fused_moe_trace,
@@ -36,6 +37,7 @@ def test_b12x_wrapper_trace_keeps_constructor_quantization_config():
     assert "source_format" in b12x_moe_wrapper_run_trace.inputs
 
 
+@pytest.mark.cpu_only
 def test_b12x_reference_uses_activation_precision_and_fc2_scale():
     from flashinfer.trace.templates.moe import (
         b12x_fused_moe_trace,
@@ -100,6 +102,7 @@ def test_b12x_reference_uses_activation_precision_and_fc2_scale():
     assert not torch.equal(fp4, bf16)
 
 
+@pytest.mark.cpu_only
 def test_b12x_reference_applies_expert_map():
     from flashinfer.trace.templates.moe import b12x_fused_moe_trace
 

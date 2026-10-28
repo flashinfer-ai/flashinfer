@@ -1,5 +1,7 @@
 """Trace tests for routed TRT-LLM FP8 per-tensor-scale MoE."""
 
+import pytest
+
 import torch
 
 
@@ -46,6 +48,7 @@ def _trace_kwargs():
     )
 
 
+@pytest.mark.cpu_only
 def test_fp8_per_tensor_routed_moe_trace_schema():
     from flashinfer.fused_moe import trtllm_fp8_per_tensor_scale_routed_moe
 
@@ -62,6 +65,7 @@ def test_fp8_per_tensor_routed_moe_trace_schema():
     assert "reference" in defn
 
 
+@pytest.mark.cpu_only
 def test_fp8_per_tensor_routed_moe_trace_reference_unpacks_routing():
     from flashinfer.fused_moe import trtllm_fp8_per_tensor_scale_routed_moe
 

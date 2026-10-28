@@ -12,6 +12,7 @@ from flashinfer.fused_moe import MoELayer, RoutingInputMode
 from tests.trace.example_moe_layer import example_inputs
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("dtype", ["bf16", "mxfp8", "nvfp4", "mxfp8_mxfp4"])
 def test_frost_trace_metadata_and_golden(dtype, tmp_path):
     layer, act, weights = example_inputs(dtype)
@@ -27,10 +28,13 @@ def test_frost_trace_metadata_and_golden(dtype, tmp_path):
     assert all(value["dtype"] != "unknown" for value in result["inputs"].values())
     from pathlib import Path
 
-    expected = Path(__file__).parent / "fi_trace_out" / f"{name}.json"
+    expected = (
+        Path(__file__).resolve().parents[2] / "trace/fi_trace_out" / f"{name}.json"
+    )
     assert result == json.loads(expected.read_text())
 
 
+@pytest.mark.cpu_only
 def test_moe_layer_autodump(tmp_path, monkeypatch):
     layer, act, weights = example_inputs("nvfp4")
 
