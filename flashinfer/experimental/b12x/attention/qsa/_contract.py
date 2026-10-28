@@ -868,12 +868,18 @@ def _scratch_layout(
         workspace_q_rows * int(caps.group_budget) * torch.int32.itemsize
     )
     stable_topk_blocks = math.ceil(score_workspace_width / _STABLE_TOPK_BLOCK)
-    stable_topk_nbytes = (
-        2 * workspace_q_rows * stable_topk_blocks * torch.int32.itemsize
-        + workspace_q_rows
-        * int(caps.group_budget)
-        * (torch.float32.itemsize + torch.int32.itemsize)
-        + workspace_q_rows * (torch.float32.itemsize + torch.int32.itemsize)
+    # Every stable-selection region is a separate native kernel operand.
+    # Keep its base aligned like the metadata-only compilation operands.
+    stable_topk_nbytes = sum(
+        _align_up(nbytes)
+        for nbytes in (
+            workspace_q_rows * stable_topk_blocks * torch.int32.itemsize,
+            workspace_q_rows * stable_topk_blocks * torch.int32.itemsize,
+            workspace_q_rows * int(caps.group_budget) * torch.float32.itemsize,
+            workspace_q_rows * int(caps.group_budget) * torch.int32.itemsize,
+            workspace_q_rows * torch.float32.itemsize,
+            workspace_q_rows * torch.int32.itemsize,
+        )
     )
     topk_workspace_nbytes = _align_up(
         max(_MIN_TOPK_WORKSPACE_BYTES, stable_topk_nbytes)
@@ -2590,35 +2596,39 @@ def _qsa_decode_impl(
         shape=(work_rows, stable_topk_blocks),
         dtype=torch.int32,
     )
-    stable_offset += stable_count_nbytes
+    stable_offset = _align_up(stable_offset + stable_count_nbytes)
     greater_counts = _scratch_view(
         scratch,
         offset_bytes=stable_offset,
         shape=(work_rows, stable_topk_blocks),
         dtype=torch.int32,
     )
-    stable_offset += stable_count_nbytes
+    stable_offset = _align_up(stable_offset + stable_count_nbytes)
     stable_values = _scratch_view(
         scratch,
         offset_bytes=stable_offset,
         shape=(work_rows, group_budget),
         dtype=torch.float32,
     )
-    stable_offset += work_rows * group_budget * torch.float32.itemsize
+    stable_offset = _align_up(
+        stable_offset + work_rows * group_budget * torch.float32.itemsize
+    )
     stable_ids = _scratch_view(
         scratch,
         offset_bytes=stable_offset,
         shape=(work_rows, group_budget),
         dtype=torch.int32,
     )
-    stable_offset += work_rows * group_budget * torch.int32.itemsize
+    stable_offset = _align_up(
+        stable_offset + work_rows * group_budget * torch.int32.itemsize
+    )
     thresholds = _scratch_view(
         scratch,
         offset_bytes=stable_offset,
         shape=(work_rows,),
         dtype=torch.float32,
     )
-    stable_offset += work_rows * torch.float32.itemsize
+    stable_offset = _align_up(stable_offset + work_rows * torch.float32.itemsize)
     greater_totals = _scratch_view(
         scratch,
         offset_bytes=stable_offset,
