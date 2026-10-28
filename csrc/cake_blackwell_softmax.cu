@@ -107,6 +107,15 @@ constexpr uint64_t kFiveTileLateRowsDenSm100 = 2;
 // rows per shared-tile cluster.
 constexpr uint64_t kSixTileC16MaxTripsSm100 = 20;
 constexpr uint64_t kSevenTileC16MaxTripsSm100 = 22;
+// The balanced chunk (sm_100, see select_cached_launch): rounding, the minimum
+// cut of the whole-tile chunk (1/32; 1/16 past one wave, and for a one-wave
+// 4-tile 16-CTA row kernel), the waves it covers, and the minimum cut (1/10)
+// of a 16-CTA 8-tile chunk.
+constexpr uint32_t kBalancedChunkElements = 32;
+constexpr uint64_t kBalancedChunkMinCutDen = 32;
+constexpr uint64_t kBalancedChunkMultiWaveCutDen = 16;
+constexpr uint64_t kBalancedChunkMaxWaves = 5;
+constexpr uint64_t kBalancedChunkSixteenCtaMinCutDen = 10;
 constexpr int kMaxDevices = 64;
 
 enum class ParameterKind : int {
@@ -639,13 +648,15 @@ struct CachedLaunch {
   uint64_t clusters;
   size_t dynamic_smem_bytes;
   SoftmaxRoute route;
+  // Elements of the row per CTA (set by select_cached_launch).
+  uint32_t chunk_elements = 0;
 };
 
 // One cluster per row. An 8-tile variant whose rows exceed the resident
 // persistent clusters takes the shared-tile kernel (one cluster per row) or
 // the persistent kernel on every resident cluster, by the rule above.
-cudaError_t select_cached_launch(uint32_t rows, uint32_t vocab_size, ParameterKind parameter_kind,
-                                 bool pdl, int device, CachedLaunch* launch) {
+cudaError_t select_cached_route(uint32_t rows, uint32_t vocab_size, ParameterKind parameter_kind,
+                                bool pdl, int device, CachedLaunch* launch) {
   int sm_count = 0;
   cudaError_t status = cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
   if (status != cudaSuccess) {
@@ -763,6 +774,83 @@ cudaError_t select_cached_launch(uint32_t rows, uint32_t vocab_size, ParameterKi
     *launch = {variant, persistent, persistent_clusters, persistent_smem,
                SoftmaxRoute::kCachedClusterPersistent};
   }
+  return cudaSuccess;
+}
+
+// The launch: select_cached_route's kernel and the chunk each CTA covers. A CTA
+// covers whole tiles, except on sm_100, where the chunk is ceil(V / C) rounded
+// up to 32 elements (CTA starts 128-byte aligned within the row; the same tile
+// count) when that balanced chunk is more than 1/32 shorter than the
+// whole-tile chunk and the rows fit one wave of the launched kernel's resident
+// clusters, or it is more than 1/16 shorter and the rows fit five waves, for
+// these kernels (measured on B200): the 8-CTA shared-tile and persistent
+// kernels; the 4-tile 16-CTA row kernel past one wave or with a cut of more
+// than 1/16; the 16-CTA shared-tile and persistent kernels with a cut of at
+// least 1/10. The other kernels keep whole tiles.
+cudaError_t select_cached_launch(uint32_t rows, uint32_t vocab_size, ParameterKind parameter_kind,
+                                 bool pdl, int device, CachedLaunch* launch) {
+  cudaError_t status = select_cached_route(rows, vocab_size, parameter_kind, pdl, device, launch);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  const int cluster_ctas = launch->variant.cluster_ctas;
+  const uint32_t whole = static_cast<uint32_t>(cached_chunk_elements(vocab_size, cluster_ctas));
+  launch->chunk_elements = whole;
+  const bool shared_or_persistent = launch->route == SoftmaxRoute::kCachedClusterSharedTiles ||
+                                    launch->route == SoftmaxRoute::kCachedClusterPersistent;
+  const bool eight_cta_chunk = shared_or_persistent && cluster_ctas == kCachedPortableClusterSize;
+  const bool sixteen_cta_chunk = shared_or_persistent && cluster_ctas == kCachedMaxClusterSize &&
+                                 launch->variant.max_tiles == kCachedMaxTiles;
+  const bool sixteen_cta_rows = launch->route == SoftmaxRoute::kCachedCluster &&
+                                cluster_ctas == kCachedMaxClusterSize &&
+                                launch->variant.max_tiles == 4;
+  if (!eight_cta_chunk && !sixteen_cta_chunk && !sixteen_cta_rows) {
+    return cudaSuccess;
+  }
+  int device_minor = 0;
+  status = cudaDeviceGetAttribute(&device_minor, cudaDevAttrComputeCapabilityMinor, device);
+  if (status != cudaSuccess || device_minor != 0) {
+    return status;
+  }
+  const uint32_t balanced =
+      ceil_div(ceil_div(vocab_size, static_cast<uint32_t>(cluster_ctas)), kBalancedChunkElements) *
+      kBalancedChunkElements;
+  const uint64_t cut = whole - balanced;
+  if (cut * kBalancedChunkMinCutDen <= whole) {
+    return cudaSuccess;
+  }
+  // Resident clusters of the launched kernel.
+  uint64_t resident = 0;
+  if (launch->route == SoftmaxRoute::kCachedClusterPersistent) {
+    resident = launch->clusters;
+  } else if (launch->route == SoftmaxRoute::kCachedClusterSharedTiles) {
+    int shared = 0;
+    status = shared_tile_resident_clusters(cluster_ctas, pdl, device, &shared);
+    if (status != cudaSuccess) {
+      return status;
+    }
+    resident = static_cast<uint64_t>(std::max(shared, 0));
+  } else {
+    int row = 0;
+    status = row_resident_clusters(cluster_ctas, pdl, device, &row);
+    if (status != cudaSuccess) {
+      return status;
+    }
+    resident = static_cast<uint64_t>(std::max(row, 0));
+  }
+  const uint64_t rows64 = rows;
+  const bool large_cut = cut * kBalancedChunkMultiWaveCutDen > whole;
+  if (resident == 0 ||
+      !(rows64 <= resident || (large_cut && rows64 <= kBalancedChunkMaxWaves * resident))) {
+    return cudaSuccess;
+  }
+  if (sixteen_cta_rows && !(rows64 > resident || large_cut)) {
+    return cudaSuccess;
+  }
+  if (sixteen_cta_chunk && cut * kBalancedChunkSixteenCtaMinCutDen < whole) {
+    return cudaSuccess;
+  }
+  launch->chunk_elements = balanced;
   return cudaSuccess;
 }
 
@@ -931,7 +1019,7 @@ cudaError_t launch_blackwell_softmax(float* logits, float* output, float* temper
     if (grid > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
       return cudaErrorNotSupported;
     }
-    int chunk_elements_i = cached_chunk_elements(vocab_size, launch.variant.cluster_ctas);
+    int chunk_elements_i = static_cast<int>(launch.chunk_elements);
     // The row-caching cluster kernels take PDL as their _pdl twins, the
     // persistent kernels as the flag.
     int cached_parameter_kind_i = launch.route == SoftmaxRoute::kCachedClusterPersistent
@@ -1091,7 +1179,7 @@ SoftmaxRoute query_softmax_route(TensorView logits, Optional<TensorView> maybe_t
 // The cached-cluster kernel these logits would launch, for tests: {cluster
 // CTAs, max tiles, 1 if its symbol is a _pdl twin, its resident clusters on
 // this device, the resident clusters of the 4-tile kernel twice its size (0
-// past 16 CTAs)}; empty for the other routes.
+// past 16 CTAs), the elements of the row per CTA}; empty for the other routes.
 Array<int64_t> query_cached_kernel(TensorView logits, Optional<TensorView> maybe_temperature_arr,
                                    double temperature_val, bool enable_pdl,
                                    bool temperature_is_none) {
@@ -1123,7 +1211,8 @@ Array<int64_t> query_cached_kernel(TensorView logits, Optional<TensorView> maybe
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Blackwell Softmax kernel query failed with error code " << cudaGetErrorString(status);
   return Array<int64_t>(std::vector<int64_t>{launch.variant.cluster_ctas, launch.variant.max_tiles,
-                                             pdl_twin ? 1 : 0, resident, next_resident});
+                                             pdl_twin ? 1 : 0, resident, next_resident,
+                                             static_cast<int64_t>(launch.chunk_elements)});
 }
 
 void blackwell_softmax_impl(TensorView workspace_buffer, TensorView logits, TensorView output,
