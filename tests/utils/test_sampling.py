@@ -831,7 +831,11 @@ def test_blackwell_cached_cluster_ten_cta_rows_per_arch(
         (320, 69632, "none", 8704, 8704),
         (82, 70000, "none", 8768, 8768),
         (52, 100000, "scalar_pdl", 12512, 12512),
-        (370, 66000, "none", 10240, 8256),  # five waves of shared-tile clusters (GB300)
+        (370, 66000, "none", 8256, 8256),  # five waves of shared-tile clusters (GB300)
+        (180, 71680, "none", 8960, 8960),  # five persistent trips (GB300)
+        # On sm_100 also past five waves, up to seven 8-CTA waves or trips.
+        (371, 66000, "none", 8256, 10240),
+        (181, 71680, "none", 8960, 10240),
         (48, 76000, "none", 9504, 9504),
         (82, 76000, "none", 9504, 9504),
         (50, 110000, "none", 14336, 13760),
@@ -854,8 +858,8 @@ def test_blackwell_cached_cluster_ten_cta_rows_per_arch(
         # under 1/10, a 4-tile row kernel with a cut of at most 1/16 in one
         # wave, the 4-tile row kernels of 4 and 8 CTAs with other chunk tile
         # counts, the 4-tile row kernels of 1 and 2 CTAs, the 8-tile 16-CTA row
-        # kernel, and rows past five waves (180 rows are five persistent waves
-        # on GB300) or past one wave with a cut of at most 1/16.
+        # kernel, and rows past five waves (on sm_100 past seven for the 8-CTA
+        # kernels) or past one wave with a cut of at most 1/16.
         (8, 256000, "none", 26624, 22528),
         (24, 151936, "none", 10240, 16384),
         (100, 30720, "none", 8192, 8192),
@@ -870,9 +874,8 @@ def test_blackwell_cached_cluster_ten_cta_rows_per_arch(
         (371, 50304, "none", 8192, 8192),
         (8, 126464, "none", 8192, 8192),
         (1, 151936, "none", 10240, 10240),
-        (180, 71680, "none", 10240, 8960),
-        (181, 71680, "none", 10240, 10240),
-        (371, 66000, "none", 10240, 10240),
+        (232, 71680, "none", 10240, 10240),
+        (498, 66000, "none", 10240, 10240),
         (76, 92000, "none", 12288, 12288),
     ],
 )
@@ -894,6 +897,66 @@ def test_blackwell_cached_cluster_balanced_chunk_per_arch(
     )
     on_sm100 = torch.cuda.get_device_capability() == (10, 0)
     assert kernel[5] == (sm100_chunk if on_sm100 else sm103_chunk)
+    probs = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    torch.testing.assert_close(probs, probs_ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size,cluster_ctas,sm100_chunk,sm103_chunk",
+    [
+        # 16-CTA shared-tile kernel: up to 9 waves and from 9 up to 13 waves
+        # of 31 resident clusters on B200.
+        (156, 151936, 16, 9504, 10240),
+        (279, 151936, 16, 9504, 10240),
+        (280, 151936, 16, 9504, 10240),
+        (403, 151936, 16, 9504, 10240),
+        (404, 151936, 16, 10240, 10240),
+        (337, 201088, 16, 12576, 14336),
+        # 16-CTA persistent kernel: up to 18 trips of 14 resident clusters.
+        (71, 201088, 16, 12576, 14336),
+        (252, 201088, 16, 12576, 14336),
+        (253, 201088, 16, 14336, 14336),
+        # 8-CTA kernels: up to 7 waves of 71 resident shared-tile clusters or
+        # 7 trips of 33 resident persistent clusters.
+        (356, 66000, 8, 8256, 8256),
+        (497, 66000, 8, 8256, 10240),
+        (498, 66000, 8, 10240, 10240),
+        (166, 71680, 8, 8960, 8960),
+        (231, 71680, 8, 8960, 10240),
+        (232, 71680, 8, 10240, 10240),
+    ],
+)
+@pytest.mark.parametrize("temperature_kind", ["scalar", "scalar_pdl", "per_row"])
+def test_blackwell_cached_cluster_balanced_chunk_past_five_waves_per_arch(
+    rows, vocab_size, cluster_ctas, sm100_chunk, sm103_chunk, temperature_kind
+):
+    # On sm_100 the 8-tile 8- and 16-CTA shared-tile and persistent kernels
+    # keep the balanced chunk past five waves up to these bounds, unless the
+    # temperature is per row; sm_103 keeps its five-wave rule.
+    _skip_unless_b200_or_gb300()
+    torch.manual_seed(7)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    enable_pdl = temperature_kind == "scalar_pdl"
+    if temperature_kind == "per_row":
+        temperature = torch.rand(rows, device="cuda") * 0.9 + 0.1
+        probs_ref = torch.softmax(logits / temperature[:, None], dim=-1)
+    else:
+        temperature = 0.5
+        probs_ref = torch.softmax(logits / temperature, dim=-1)
+    kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    on_sm100 = torch.cuda.get_device_capability() == (10, 0)
+    per_cta = -(-vocab_size // cluster_ctas)
+    whole = -(-per_cta // 2048) * 2048
+    assert kernel[0] == cluster_ctas
+    assert kernel[5] == (
+        (whole if temperature_kind == "per_row" else sm100_chunk)
+        if on_sm100
+        else sm103_chunk
+    )
     probs = flashinfer.sampling.softmax(
         logits, temperature=temperature, enable_pdl=enable_pdl
     )

@@ -127,6 +127,18 @@ constexpr uint64_t kBalancedChunkMinCutDen = 32;
 constexpr uint64_t kBalancedChunkMultiWaveCutDen = 16;
 constexpr uint64_t kBalancedChunkMaxWaves = 5;
 constexpr uint64_t kBalancedChunkSixteenCtaMinCutDen = 10;
+// sm_100: the 8-tile 8- and 16-CTA shared-tile and persistent kernels keep the
+// balanced chunk (a cut of more than 1/16) past five waves of their resident
+// clusters (persistent trips), unless the temperature is per row: the 16-CTA
+// shared-tile kernel up to 9 waves and from FarMin up to FarMax waves (9 to
+// 13), the 16-CTA persistent kernel up to 18 trips and the 8-CTA kernels up
+// to 7. A bound of 5 (FarMax equal to FarMin) adds no launch.
+constexpr uint64_t kBalancedChunkSixteenCtaSharedMaxWavesSm100 = 9;
+constexpr uint64_t kBalancedChunkSixteenCtaSharedFarMinWavesSm100 = 9;
+constexpr uint64_t kBalancedChunkSixteenCtaSharedFarMaxWavesSm100 = 13;
+constexpr uint64_t kBalancedChunkSixteenCtaPersistentMaxTripsSm100 = 18;
+constexpr uint64_t kBalancedChunkEightCtaSharedMaxWavesSm100 = 7;
+constexpr uint64_t kBalancedChunkEightCtaPersistentMaxTripsSm100 = 7;
 // sm_103: the cuts at which the 8-CTA shared-tile and persistent kernels take
 // the balanced chunk: at least 1/MinCutDen and under 1/MaxCutDen of the
 // whole-tile chunk (1/1: no upper bound). The shared-tile kernel takes it at
@@ -838,7 +850,9 @@ cudaError_t select_cached_route(uint32_t rows, uint32_t vocab_size, ParameterKin
 // whole-tile chunk's tile count set per architecture for rows in one wave or
 // past it, unless the temperature is per row; the 16-CTA shared-tile and
 // persistent kernels with a cut of at least 1/10, or on sm_100 past one wave.
-// The other kernels keep whole tiles.
+// On sm_100 the 8-tile 8- and 16-CTA kernels keep it past five waves up to the
+// bounds above, unless the temperature is per row. The other kernels keep
+// whole tiles.
 cudaError_t select_cached_launch(uint32_t rows, uint32_t vocab_size, ParameterKind parameter_kind,
                                  bool pdl, int device, CachedLaunch* launch) {
   cudaError_t status = select_cached_route(rows, vocab_size, parameter_kind, pdl, device, launch);
@@ -928,8 +942,22 @@ cudaError_t select_cached_launch(uint32_t rows, uint32_t vocab_size, ParameterKi
   }
   const uint64_t rows64 = rows;
   const bool large_cut = cut * kBalancedChunkMultiWaveCutDen > whole;
-  if (resident == 0 ||
-      !(rows64 <= resident || (large_cut && rows64 <= kBalancedChunkMaxWaves * resident))) {
+  uint64_t max_waves = kBalancedChunkMaxWaves;
+  if (device_minor == 0 && (eight_cta_chunk || sixteen_cta_chunk) &&
+      parameter_kind != ParameterKind::kPerRow) {
+    const bool persistent = launch->route == SoftmaxRoute::kCachedClusterPersistent;
+    if (sixteen_cta_chunk) {
+      max_waves = persistent ? kBalancedChunkSixteenCtaPersistentMaxTripsSm100
+                             : kBalancedChunkSixteenCtaSharedMaxWavesSm100;
+      if (!persistent && rows64 > kBalancedChunkSixteenCtaSharedFarMinWavesSm100 * resident) {
+        max_waves = kBalancedChunkSixteenCtaSharedFarMaxWavesSm100;
+      }
+    } else {
+      max_waves = persistent ? kBalancedChunkEightCtaPersistentMaxTripsSm100
+                             : kBalancedChunkEightCtaSharedMaxWavesSm100;
+    }
+  }
+  if (resident == 0 || !(rows64 <= resident || (large_cut && rows64 <= max_waves * resident))) {
     return cudaSuccess;
   }
   if ((sixteen_cta_rows || four_tile_rows) && !(rows64 > resident || large_cut)) {
