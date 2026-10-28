@@ -6,9 +6,12 @@ vLLM's Triton `qsa_sparse_paged_attention` (same arguments, same order) and adds
 NVFP4 block scales `k_sf` / `v_sf`. vLLM keeps its Triton kernel for BF16 and FP8
 caches; this backend covers the NVFP4 case it does not.
 
-It is reached only through that explicit experimental API: no AOT packaging and no
-automatic routing. The experimental lifecycle is owned by `@lesj0610`; the tracking
-issue is linked from the pull request that adds the package.
+It is reached only through that experimental API: with `backend="default"`, or with
+the entry's default `backend="auto"` on a device outside SM80 through SM90, where it
+reports the unsupported device (on SM80 through SM90, `"auto"` runs the Cake kernels
+of `flashinfer.experimental.cake_qsa_nvfp4`). No AOT packaging. The experimental
+lifecycle is owned by `@lesj0610`; the tracking issue is linked from the pull request
+that adds the package.
 
 ## Contract
 

@@ -46,11 +46,13 @@ class _Planner:
         self.capability = (10, 0)
         self.sm_count = 148
         self.requests = []
+        self.work_bins = []
 
     def configure(self, capability, sm_count):
         self.capability = tuple(capability)
         self.sm_count = sm_count
         self.requests = []
+        self.work_bins = []
 
 
 class _StubModule:
@@ -122,6 +124,7 @@ def planner(monkeypatch):
         key = registry._key(args, kwargs)
         module = registry.FACTORIES[arch].get(name, {}).get(key)
         rec.requests.append((name, module))
+        rec.work_bins.append(bool(factory.keywords.get("route_work_bins", False)))
         if module is None:
             raise NotImplementedError(
                 f"Unexported KDA schedule specialization: {(arch, name, *key)}"
@@ -274,7 +277,7 @@ UNBOUNDED_ROWS = (
                 "cake_kda_bf16_b38d251875e94cb4aaa6",
             ),
         ),
-        # unchanged selections
+        # short H12 grids keep the bounded N32 body without the early state pack
         (
             (10, 0),
             1,
@@ -283,8 +286,42 @@ UNBOUNDED_ROWS = (
             -5.0,
             True,
             0,
-            ("fused_direct_m128", "cake_kda_bf16_fd04381524dba62b317d"),
+            ("fused_direct_m128", "cake_kda_bf16_5be344cbddc29563f1ee"),
         ),
+        (
+            (10, 3),
+            16,
+            12,
+            128,
+            -5.0,
+            True,
+            0,
+            ("fused_direct_m128", "cake_kda_bf16_5be344cbddc29563f1ee"),
+        ),
+        # H12 short rows with checkpoint rows: the bounded N32 body without the
+        # early state pack, one task per CTA where every task has an SM of its own
+        # and work-binned where a bin runs tasks back to back
+        (
+            (10, 0),
+            4,
+            12,
+            128,
+            -5.0,
+            True,
+            64,
+            ("fused_checkpoint_direct_m128_n32", "cake_kda_bf16_5be344cbddc29563f1ee"),
+        ),
+        (
+            (10, 0),
+            16,
+            12,
+            128,
+            -5.0,
+            True,
+            64,
+            ("fused_checkpoint_direct_m128_n32", "cake_kda_bf16_5be344cbddc29563f1ee"),
+        ),
+        # unchanged selections
         ((10, 3), 8, 32, 1024, -5.0, True, 0, PREDICTION_FIRST),
         (
             (10, 0),
@@ -311,6 +348,23 @@ def test_route_selection_pins(
     schedule, module = expected
     assert str(prepared.schedule) == schedule
     assert planner.requests[-1][1] == module
+
+
+@pytest.mark.parametrize("capability", CAPABILITIES, ids=["sm100a", "sm103a"])
+@pytest.mark.parametrize(("B", "binned"), [(4, False), (16, True), (64, True)])
+def test_n16_checkpoint_launch_asks_for_work_bins_where_a_bin_chains_tasks(
+    planner, capability, B, binned
+):
+    # The H12 serving launch of 64-token sequences with 64-token checkpoint rows
+    # runs the N16 checkpoint-TMA body; with more (sequence, head) tasks than
+    # SMs a bin runs tasks back to back and the launch asks for work bins.
+    planner.configure(capability, 148)
+    prepared = _prepare(
+        B, 12, 64, lower_bound=-5.0, indexed=True, checkpoint_every_n_tokens=64
+    )
+    assert str(prepared.schedule) == "fused_checkpoint_tma_direct_m128_n16"
+    assert planner.requests[-1][1] == "cake_kda_bf16_51e813006f17147a02a5"
+    assert planner.work_bins[-1] is binned
 
 
 UNBOUNDED_COMPOSITE_APPLY = (

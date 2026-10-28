@@ -321,7 +321,7 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
                 if (st_t + 128 < 144) {
                     w2 = meta[mrow + st_t + 128];
                 }
-                mbarrier_wait(meta_empty_addr + (slot) * 8, 1);
+                mbarrier_wait(meta_empty_addr, 1);
                 if (warp == 2) {
                     int head = __shfl_sync(0xFFFFFFFF, w0, 0);
                     int qb0 = __shfl_sync(0xFFFFFFFF, w0, 1);
@@ -336,7 +336,7 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
                 if (st_t + 128 < 144) {
                     meta_smem[slot * 144 + st_t + 128] = w2;
                 }
-                mbarrier_arrive(meta_full_addr + (slot) * 8);
+                mbarrier_arrive(meta_full_addr);
                 int nt_st = __shfl_sync(0xFFFFFFFF, nt_st_ld, 0);
                 int pool_base = g_ctas * tile_stride;
                 #pragma unroll 1
@@ -360,7 +360,9 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
                     if (st_t + 128 < 144) {
                         w2_4 = meta[mrow_1 + st_t + 128];
                     }
-                    mbarrier_wait(meta_empty_addr + (slot_0) * 8, (ti >> 1) + 1 & 1);
+                    int _stage_meta_empty = (int)((unsigned int)ti % 2);
+                    int _parity_meta_empty = (int)((unsigned int)ti / 2 % 2) ^ 1;
+                    mbarrier_wait(meta_empty_addr + (_stage_meta_empty) * 8, _parity_meta_empty);
                     if (warp == 2) {
                         int head_1 = __shfl_sync(0xFFFFFFFF, w0_2, 0);
                         int qb0_1 = __shfl_sync(0xFFFFFFFF, w0_2, 1);
@@ -370,7 +372,8 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
                         if (elect_sync()) {
                             if (ti > 0) {
                                 if (valid_s_1 != 0) {
-                                    mbarrier_wait(q_empty_addr, ti - 1 & 1);
+                                    int _parity_q_empty = (int)((unsigned int)ti % 2) ^ 1;
+                                    mbarrier_wait(q_empty_addr, _parity_q_empty);
                                     mbarrier_arrive_expect_tx(q_ready_addr, 16384);
                                     asm volatile(
                                         "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
@@ -394,7 +397,7 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
                     if (st_t + 128 < 144) {
                         meta_smem[slot_0 * 144 + st_t + 128] = w2_4;
                     }
-                    mbarrier_arrive(meta_full_addr + (slot_0) * 8);
+                    mbarrier_arrive(meta_full_addr + ((int)((unsigned int)ti % 2)) * 8);
                     int valid_st = meta[trow * 144 + 7];
                     if (valid_st == 0) {
                         if (warp == 2) {
@@ -420,42 +423,109 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
                     int h_head_k = hdr[hb];
                     int n_hdr_k = hdr[hb + 4];
                     int kv_base_h = h_head_k * seqlen_k;
-                    #pragma unroll
-                    for (int hp = 0; hp < 3; hp++) {
-                        if (n_hdr_k > hp) {
-                            mbarrier_wait(k_empty_addr + (hp % 3) * 8, hp / 3 + 1 & 1);
-                            int hblk_a = hdr[hb + 5 + 2 * hp];
-                            int hblk_b = hdr[hb + 6 + 2 * hp];
-                            int kv_row_a = kv_base_h + hblk_a * 64;
-                            int kv_row_b = kv_base_h + hblk_b * 64;
-                            int has_b = 1;
-                            if (hblk_b < 0) {
-                                has_b = 0;
-                            }
-                            int k_dst = k_smem_addr + (unsigned int)(hp % 3 * 32768);
-                            mbarrier_arrive_expect_tx(k_full_addr + (hp % 3) * 8, 16384 * (1 + has_b));
+                    if (n_hdr_k > 0) {
+                        mbarrier_wait(k_empty_addr, 1);
+                        int hblk_a = hdr[hb + 5];
+                        int hblk_b = hdr[hb + 6];
+                        int kv_row_a = kv_base_h + hblk_a * 64;
+                        int kv_row_b = kv_base_h + hblk_b * 64;
+                        int has_b = 1;
+                        if (hblk_b < 0) {
+                            has_b = 0;
+                        }
+                        int k_dst = k_smem_addr;
+                        mbarrier_arrive_expect_tx(k_full_addr, 16384 * (1 + has_b));
+                        asm volatile(
+                            "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                            :: "r"(k_dst), "l"((&K)), "r"(0), "r"(kv_row_a), "r"(0),
+                               "r"(k_full_addr), "l"(pol_k) : "memory");
+                        asm volatile(
+                            "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                            :: "r"(k_dst + 16384), "l"((&K)), "r"(0), "r"(kv_row_a), "r"(1),
+                               "r"(k_full_addr), "l"(pol_k) : "memory");
+                        if (has_b != 0) {
                             asm volatile(
                                 "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                 " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                :: "r"(k_dst), "l"((&K)), "r"(0), "r"(kv_row_a), "r"(0),
-                                   "r"(k_full_addr + (hp % 3) * 8), "l"(pol_k) : "memory");
+                                :: "r"(k_dst + 8192), "l"((&K)), "r"(0), "r"(kv_row_b), "r"(0),
+                                   "r"(k_full_addr), "l"(pol_k) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                 " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                :: "r"(k_dst + 16384), "l"((&K)), "r"(0), "r"(kv_row_a), "r"(1),
-                                   "r"(k_full_addr + (hp % 3) * 8), "l"(pol_k) : "memory");
-                            if (has_b != 0) {
-                                asm volatile(
-                                    "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-                                    " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                    :: "r"(k_dst + 8192), "l"((&K)), "r"(0), "r"(kv_row_b), "r"(0),
-                                       "r"(k_full_addr + (hp % 3) * 8), "l"(pol_k) : "memory");
-                                asm volatile(
-                                    "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-                                    " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                    :: "r"(k_dst + 16384 + 8192), "l"((&K)), "r"(0), "r"(kv_row_b), "r"(1),
-                                       "r"(k_full_addr + (hp % 3) * 8), "l"(pol_k) : "memory");
-                            }
+                                :: "r"(k_dst + 16384 + 8192), "l"((&K)), "r"(0), "r"(kv_row_b), "r"(1),
+                                   "r"(k_full_addr), "l"(pol_k) : "memory");
+                        }
+                    }
+                    if (n_hdr_k > 1) {
+                        mbarrier_wait(k_empty_addr + 8, 1);
+                        int hblk_a_1 = hdr[hb + 5 + 2];
+                        int hblk_b_1 = hdr[hb + 6 + 2];
+                        int kv_row_a_1 = kv_base_h + hblk_a_1 * 64;
+                        int kv_row_b_1 = kv_base_h + hblk_b_1 * 64;
+                        int has_b_1 = 1;
+                        if (hblk_b_1 < 0) {
+                            has_b_1 = 0;
+                        }
+                        int k_dst_1 = k_smem_addr + 32768;
+                        mbarrier_arrive_expect_tx(k_full_addr + 8, 16384 * (1 + has_b_1));
+                        asm volatile(
+                            "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                            :: "r"(k_dst_1), "l"((&K)), "r"(0), "r"(kv_row_a_1), "r"(0),
+                               "r"(k_full_addr + 8), "l"(pol_k) : "memory");
+                        asm volatile(
+                            "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                            :: "r"(k_dst_1 + 16384), "l"((&K)), "r"(0), "r"(kv_row_a_1), "r"(1),
+                               "r"(k_full_addr + 8), "l"(pol_k) : "memory");
+                        if (has_b_1 != 0) {
+                            asm volatile(
+                                "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                :: "r"(k_dst_1 + 8192), "l"((&K)), "r"(0), "r"(kv_row_b_1), "r"(0),
+                                   "r"(k_full_addr + 8), "l"(pol_k) : "memory");
+                            asm volatile(
+                                "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                :: "r"(k_dst_1 + 16384 + 8192), "l"((&K)), "r"(0), "r"(kv_row_b_1), "r"(1),
+                                   "r"(k_full_addr + 8), "l"(pol_k) : "memory");
+                        }
+                    }
+                    if (n_hdr_k > 2) {
+                        mbarrier_wait(k_empty_addr + 16, 1);
+                        int hblk_a_2 = hdr[hb + 5 + 4];
+                        int hblk_b_2 = hdr[hb + 6 + 4];
+                        int kv_row_a_2 = kv_base_h + hblk_a_2 * 64;
+                        int kv_row_b_2 = kv_base_h + hblk_b_2 * 64;
+                        int has_b_2 = 1;
+                        if (hblk_b_2 < 0) {
+                            has_b_2 = 0;
+                        }
+                        int k_dst_2 = k_smem_addr + 65536;
+                        mbarrier_arrive_expect_tx(k_full_addr + 16, 16384 * (1 + has_b_2));
+                        asm volatile(
+                            "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                            :: "r"(k_dst_2), "l"((&K)), "r"(0), "r"(kv_row_a_2), "r"(0),
+                               "r"(k_full_addr + 16), "l"(pol_k) : "memory");
+                        asm volatile(
+                            "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                            :: "r"(k_dst_2 + 16384), "l"((&K)), "r"(0), "r"(kv_row_a_2), "r"(1),
+                               "r"(k_full_addr + 16), "l"(pol_k) : "memory");
+                        if (has_b_2 != 0) {
+                            asm volatile(
+                                "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                :: "r"(k_dst_2 + 8192), "l"((&K)), "r"(0), "r"(kv_row_b_2), "r"(0),
+                                   "r"(k_full_addr + 16), "l"(pol_k) : "memory");
+                            asm volatile(
+                                "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                :: "r"(k_dst_2 + 16384 + 8192), "l"((&K)), "r"(0), "r"(kv_row_b_2), "r"(1),
+                                   "r"(k_full_addr + 16), "l"(pol_k) : "memory");
                         }
                     }
                     int nt_k = q_bound;
@@ -463,7 +533,9 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
                     for (int ti_1 = 0; ti_1 < nt_k; ti_1++) {
                         int slot_k = ti_1 & 1;
                         int mb_k = slot_k * 144;
-                        mbarrier_wait(meta_full_addr + (slot_k) * 8, ti_1 >> 1 & 1);
+                        int _stage_meta_full = (int)((unsigned int)ti_1 % 2);
+                        int _parity_meta_full = (int)((unsigned int)ti_1 / 2 % 2);
+                        mbarrier_wait(meta_full_addr + (_stage_meta_full) * 8, _parity_meta_full);
                         int valid_k = meta_smem[mb_k + 7];
                         if (valid_k == 0) {
                             break;
@@ -479,43 +551,46 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
                         for (int i = i0_k; i < n_seq_k; i++) {
                             int p = gk + i;
                             int stage = p % 3;
-                            mbarrier_wait(k_empty_addr + (stage) * 8, p / 3 + 1 & 1);
+                            int plap = 0;
+                            plap += p / 3;
+                            int _parity_k_empty = (int)((unsigned int)plap % 2) ^ 1;
+                            mbarrier_wait(k_empty_addr + (stage) * 8, _parity_k_empty);
                             int sw = meta_smem[mb_k + 8 + i];
                             int blk_a = sw << 16 >> 16;
                             int blk_b = sw >> 16;
-                            int kv_row_a_1 = kv_base + blk_a * 64;
-                            int kv_row_b_1 = kv_base + blk_b * 64;
-                            int has_b_1 = 1;
+                            int kv_row_a_3 = kv_base + blk_a * 64;
+                            int kv_row_b_3 = kv_base + blk_b * 64;
+                            int has_b_3 = 1;
                             if (blk_b < 0) {
-                                has_b_1 = 0;
+                                has_b_3 = 0;
                             }
-                            int k_dst_1 = k_smem_addr + (unsigned int)(stage * 32768);
-                            mbarrier_arrive_expect_tx(k_full_addr + (stage) * 8, 16384 * (1 + has_b_1));
+                            int k_dst_3 = k_smem_addr + (unsigned int)(stage * 32768);
+                            mbarrier_arrive_expect_tx(k_full_addr + (stage) * 8, 16384 * (1 + has_b_3));
                             asm volatile(
                                 "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                 " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                :: "r"(k_dst_1), "l"((&K)), "r"(0), "r"(kv_row_a_1), "r"(0),
+                                :: "r"(k_dst_3), "l"((&K)), "r"(0), "r"(kv_row_a_3), "r"(0),
                                    "r"(k_full_addr + (stage) * 8), "l"(pol_k) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                 " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                :: "r"(k_dst_1 + 16384), "l"((&K)), "r"(0), "r"(kv_row_a_1), "r"(1),
+                                :: "r"(k_dst_3 + 16384), "l"((&K)), "r"(0), "r"(kv_row_a_3), "r"(1),
                                    "r"(k_full_addr + (stage) * 8), "l"(pol_k) : "memory");
-                            if (has_b_1 != 0) {
+                            if (has_b_3 != 0) {
                                 asm volatile(
                                     "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                    :: "r"(k_dst_1 + 8192), "l"((&K)), "r"(0), "r"(kv_row_b_1), "r"(0),
+                                    :: "r"(k_dst_3 + 8192), "l"((&K)), "r"(0), "r"(kv_row_b_3), "r"(0),
                                        "r"(k_full_addr + (stage) * 8), "l"(pol_k) : "memory");
                                 asm volatile(
                                     "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                    :: "r"(k_dst_1 + 16384 + 8192), "l"((&K)), "r"(0), "r"(kv_row_b_1), "r"(1),
+                                    :: "r"(k_dst_3 + 16384 + 8192), "l"((&K)), "r"(0), "r"(kv_row_b_3), "r"(1),
                                        "r"(k_full_addr + (stage) * 8), "l"(pol_k) : "memory");
                             }
                         }
                         gk += n_seq_k;
-                        mbarrier_arrive(meta_empty_addr + (slot_k) * 8);
+                        mbarrier_arrive(meta_empty_addr + ((int)((unsigned int)ti_1 % 2)) * 8);
                     }
                 }
             }
@@ -527,31 +602,76 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
                     int h_head_v = hdr[hb];
                     int n_hdr_v = hdr[hb + 4];
                     int kv_base_hv = h_head_v * seqlen_k;
-                    #pragma unroll
-                    for (int hp_1 = 0; hp_1 < 3; hp_1++) {
-                        if (n_hdr_v > hp_1) {
-                            mbarrier_wait(v_empty_addr + (hp_1 % 3) * 8, hp_1 / 3 + 1 & 1);
-                            int hvblk_a = hdr[hb + 5 + 2 * hp_1];
-                            int hvblk_b = hdr[hb + 6 + 2 * hp_1];
-                            int v_row_a = kv_base_hv + hvblk_a * 64;
-                            int v_row_b = kv_base_hv + hvblk_b * 64;
-                            int v_has_b = 1;
-                            if (hvblk_b < 0) {
-                                v_has_b = 0;
-                            }
-                            mbarrier_arrive_expect_tx(v_full_addr + (hp_1 % 3) * 8, 16384 * (1 + v_has_b));
+                    if (n_hdr_v > 0) {
+                        mbarrier_wait(v_empty_addr, 1);
+                        int hvblk_a = hdr[hb + 5];
+                        int hvblk_b = hdr[hb + 6];
+                        int v_row_a = kv_base_hv + hvblk_a * 64;
+                        int v_row_b = kv_base_hv + hvblk_b * 64;
+                        int v_has_b = 1;
+                        if (hvblk_b < 0) {
+                            v_has_b = 0;
+                        }
+                        mbarrier_arrive_expect_tx(v_full_addr, 16384 * (1 + v_has_b));
+                        asm volatile(
+                            "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                            :: "r"(vt_smem_a_addr), "l"((&Vt)), "r"(0), "r"(0), "r"(v_row_a / 8), "r"(0),
+                               "r"(v_full_addr), "l"(pol_v) : "memory");
+                        if (v_has_b != 0) {
                             asm volatile(
                                 "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                 " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
-                                :: "r"(vt_smem_a_addr + (unsigned int)(hp_1 % 3 * 32768)), "l"((&Vt)), "r"(0), "r"(0), "r"(v_row_a / 8), "r"(0),
-                                   "r"(v_full_addr + (hp_1 % 3) * 8), "l"(pol_v) : "memory");
-                            if (v_has_b != 0) {
-                                asm volatile(
-                                    "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-                                    " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
-                                    :: "r"(vt_smem_b_addr + (unsigned int)(hp_1 % 3 * 32768)), "l"((&Vt)), "r"(0), "r"(0), "r"(v_row_b / 8), "r"(0),
-                                       "r"(v_full_addr + (hp_1 % 3) * 8), "l"(pol_v) : "memory");
-                            }
+                                :: "r"(vt_smem_b_addr), "l"((&Vt)), "r"(0), "r"(0), "r"(v_row_b / 8), "r"(0),
+                                   "r"(v_full_addr), "l"(pol_v) : "memory");
+                        }
+                    }
+                    if (n_hdr_v > 1) {
+                        mbarrier_wait(v_empty_addr + 8, 1);
+                        int hvblk_a_1 = hdr[hb + 5 + 2];
+                        int hvblk_b_1 = hdr[hb + 6 + 2];
+                        int v_row_a_1 = kv_base_hv + hvblk_a_1 * 64;
+                        int v_row_b_1 = kv_base_hv + hvblk_b_1 * 64;
+                        int v_has_b_1 = 1;
+                        if (hvblk_b_1 < 0) {
+                            v_has_b_1 = 0;
+                        }
+                        mbarrier_arrive_expect_tx(v_full_addr + 8, 16384 * (1 + v_has_b_1));
+                        asm volatile(
+                            "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                            :: "r"(vt_smem_a_addr + 32768), "l"((&Vt)), "r"(0), "r"(0), "r"(v_row_a_1 / 8), "r"(0),
+                               "r"(v_full_addr + 8), "l"(pol_v) : "memory");
+                        if (v_has_b_1 != 0) {
+                            asm volatile(
+                                "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                :: "r"(vt_smem_b_addr + 32768), "l"((&Vt)), "r"(0), "r"(0), "r"(v_row_b_1 / 8), "r"(0),
+                                   "r"(v_full_addr + 8), "l"(pol_v) : "memory");
+                        }
+                    }
+                    if (n_hdr_v > 2) {
+                        mbarrier_wait(v_empty_addr + 16, 1);
+                        int hvblk_a_2 = hdr[hb + 5 + 4];
+                        int hvblk_b_2 = hdr[hb + 6 + 4];
+                        int v_row_a_2 = kv_base_hv + hvblk_a_2 * 64;
+                        int v_row_b_2 = kv_base_hv + hvblk_b_2 * 64;
+                        int v_has_b_2 = 1;
+                        if (hvblk_b_2 < 0) {
+                            v_has_b_2 = 0;
+                        }
+                        mbarrier_arrive_expect_tx(v_full_addr + 16, 16384 * (1 + v_has_b_2));
+                        asm volatile(
+                            "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                            " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                            :: "r"(vt_smem_a_addr + 65536), "l"((&Vt)), "r"(0), "r"(0), "r"(v_row_a_2 / 8), "r"(0),
+                               "r"(v_full_addr + 16), "l"(pol_v) : "memory");
+                        if (v_has_b_2 != 0) {
+                            asm volatile(
+                                "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                :: "r"(vt_smem_b_addr + 65536), "l"((&Vt)), "r"(0), "r"(0), "r"(v_row_b_2 / 8), "r"(0),
+                                   "r"(v_full_addr + 16), "l"(pol_v) : "memory");
                         }
                     }
                     int nt_v = q_bound;
@@ -559,7 +679,9 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
                     for (int ti_2 = 0; ti_2 < nt_v; ti_2++) {
                         int slot_v = ti_2 & 1;
                         int mb_v = slot_v * 144;
-                        mbarrier_wait(meta_full_addr + (slot_v) * 8, ti_2 >> 1 & 1);
+                        int _stage_meta_full_1 = (int)((unsigned int)ti_2 % 2);
+                        int _parity_meta_full_1 = (int)((unsigned int)ti_2 / 2 % 2);
+                        mbarrier_wait(meta_full_addr + (_stage_meta_full_1) * 8, _parity_meta_full_1);
                         int valid_v = meta_smem[mb_v + 7];
                         if (valid_v == 0) {
                             break;
@@ -575,32 +697,35 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
                         for (int i_1 = i0_v; i_1 < n_seq_v; i_1++) {
                             int pv = gv + i_1;
                             int stage_v = pv % 3;
-                            mbarrier_wait(v_empty_addr + (stage_v) * 8, pv / 3 + 1 & 1);
+                            int pvlap = 0;
+                            pvlap += pv / 3;
+                            int _parity_v_empty = (int)((unsigned int)pvlap % 2) ^ 1;
+                            mbarrier_wait(v_empty_addr + (stage_v) * 8, _parity_v_empty);
                             int svw = meta_smem[mb_v + 8 + i_1];
                             int vblk_a = svw << 16 >> 16;
                             int vblk_b = svw >> 16;
-                            int v_row_a_1 = kv_base_v + vblk_a * 64;
-                            int v_row_b_1 = kv_base_v + vblk_b * 64;
-                            int v_has_b_1 = 1;
+                            int v_row_a_3 = kv_base_v + vblk_a * 64;
+                            int v_row_b_3 = kv_base_v + vblk_b * 64;
+                            int v_has_b_3 = 1;
                             if (vblk_b < 0) {
-                                v_has_b_1 = 0;
+                                v_has_b_3 = 0;
                             }
-                            mbarrier_arrive_expect_tx(v_full_addr + (stage_v) * 8, 16384 * (1 + v_has_b_1));
+                            mbarrier_arrive_expect_tx(v_full_addr + (stage_v) * 8, 16384 * (1 + v_has_b_3));
                             asm volatile(
                                 "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                 " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
-                                :: "r"(vt_smem_a_addr + (unsigned int)(stage_v * 32768)), "l"((&Vt)), "r"(0), "r"(0), "r"(v_row_a_1 / 8), "r"(0),
+                                :: "r"(vt_smem_a_addr + (unsigned int)(stage_v * 32768)), "l"((&Vt)), "r"(0), "r"(0), "r"(v_row_a_3 / 8), "r"(0),
                                    "r"(v_full_addr + (stage_v) * 8), "l"(pol_v) : "memory");
-                            if (v_has_b_1 != 0) {
+                            if (v_has_b_3 != 0) {
                                 asm volatile(
                                     "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
-                                    :: "r"(vt_smem_b_addr + (unsigned int)(stage_v * 32768)), "l"((&Vt)), "r"(0), "r"(0), "r"(v_row_b_1 / 8), "r"(0),
+                                    :: "r"(vt_smem_b_addr + (unsigned int)(stage_v * 32768)), "l"((&Vt)), "r"(0), "r"(0), "r"(v_row_b_3 / 8), "r"(0),
                                        "r"(v_full_addr + (stage_v) * 8), "l"(pol_v) : "memory");
                             }
                         }
                         gv += n_seq_v;
-                        mbarrier_arrive(meta_empty_addr + (slot_v) * 8);
+                        mbarrier_arrive(meta_empty_addr + ((int)((unsigned int)ti_2 % 2)) * 8);
                     }
                 }
             }
@@ -695,7 +820,7 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
             int slot_n = 0;
             int mbase_n = slot_n * 144;
             nx[7] = 0;
-            mbarrier_wait(meta_full_addr + (slot_n) * 8, 0);
+            mbarrier_wait(meta_full_addr, 0);
             int valid_n = __shfl_sync(0xFFFFFFFF, meta_smem[mbase_n + 7], 0);
             if (valid_n != 0) {
                 nx[7] = 1;
@@ -773,20 +898,30 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
                 if (nx[5] > 0) {
                     int mbase_n_0 = 0;
                     int e0_n = meta_smem[mbase_n_0 + 76 + cwg * 34] & 65535;
-                    nx[8] = gbase + (e0_n >> 3);
+                    int own_n = gbase + (e0_n >> 3);
+                    nx[8] = own_n;
                     nx[9] = e0_n >> 2 & 1;
                     #pragma unroll 1
                     for (int p_1 = prev + 1; p_1 < nx[8]; p_1++) {
-                        mbarrier_wait(k_full_addr + (p_1 % 3) * 8, p_1 / 3 & 1);
+                        int plap_1 = 0;
+                        plap_1 += p_1 / 3;
+                        int _parity_k_full = (int)((unsigned int)plap_1 % 2);
+                        mbarrier_wait(k_full_addr + (p_1 % 3) * 8, _parity_k_full);
                         if (elect_sync()) {
                             mbarrier_arrive(k_empty_addr + (p_1 % 3) * 8);
                         }
-                        mbarrier_wait(v_full_addr + (p_1 % 3) * 8, p_1 / 3 & 1);
+                        int _parity_v_full = (int)((unsigned int)plap_1 % 2);
+                        mbarrier_wait(v_full_addr + (p_1 % 3) * 8, _parity_v_full);
                         if (elect_sync()) {
                             mbarrier_arrive(v_empty_addr + (p_1 % 3) * 8);
                         }
                     }
-                    mbarrier_wait(k_full_addr + (nx[8] % 3) * 8, nx[8] / 3 & 1);
+                    int kown = 0;
+                    kown += own_n;
+                    int klown = 0;
+                    klown += own_n / 3;
+                    int _parity_k_full_1 = (int)((unsigned int)klown % 2);
+                    mbarrier_wait(k_full_addr + (kown % 3) * 8, _parity_k_full_1);
                 }
             }
             int stage_n = nx[8] % 3;
@@ -850,7 +985,9 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
                     int slot_n_0 = ti_3 & 1;
                     int mbase_n_1 = slot_n_0 * 144;
                     nx[7] = 0;
-                    mbarrier_wait(meta_full_addr + (slot_n_0) * 8, ti_3 >> 1 & 1);
+                    int _stage_meta_full_2 = (int)((unsigned int)ti_3 % 2);
+                    int _parity_meta_full_2 = (int)((unsigned int)ti_3 / 2 % 2);
+                    mbarrier_wait(meta_full_addr + (_stage_meta_full_2) * 8, _parity_meta_full_2);
                     int valid_n_2 = __shfl_sync(0xFFFFFFFF, meta_smem[mbase_n_1 + 7], 0);
                     if (valid_n_2 != 0) {
                         nx[7] = 1;
@@ -957,7 +1094,8 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
                 row_sum1 = 0.0f;
                 if (nx[10] == 0) {
                     int qs_n_1 = ((nx[3] == 1) ? 0 : cwg);
-                    mbarrier_wait(q_ready_addr + (qs_n_1) * 8, ti_3 & 1);
+                    int _parity_q_ready = (int)((unsigned int)ti_3 % 2);
+                    mbarrier_wait(q_ready_addr + (qs_n_1) * 8, _parity_q_ready);
                     int q_half_base_1 = q_smem_addr + (unsigned int)(qs_n_1 * 16384) + (unsigned int)(q_ld_row * 128);
                     int q_col_bytes_2 = q_ld_col_lane * 2;
                     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
@@ -1014,27 +1152,41 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
                 int cur_has2 = has2_0;
                 asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
                 if (n_own > 0) {
+                    int kpos0 = 0;
+                    int klap0 = 0;
                     if (nx[10] == 0) {
                         int mbase_n_0_1 = (ti_3 & 1) * 144;
                         int e0_n_1 = meta_smem[mbase_n_0_1 + 76 + cwg * 34] & 65535;
-                        nx[8] = gbase + (e0_n_1 >> 3);
+                        int own_n_1 = gbase + (e0_n_1 >> 3);
+                        nx[8] = own_n_1;
                         nx[9] = e0_n_1 >> 2 & 1;
                         #pragma unroll 1
                         for (int p_2 = prev + 1; p_2 < nx[8]; p_2++) {
-                            mbarrier_wait(k_full_addr + (p_2 % 3) * 8, p_2 / 3 & 1);
+                            int plap_2 = 0;
+                            plap_2 += p_2 / 3;
+                            int _parity_k_full_2 = (int)((unsigned int)plap_2 % 2);
+                            mbarrier_wait(k_full_addr + (p_2 % 3) * 8, _parity_k_full_2);
                             if (elect_sync()) {
                                 mbarrier_arrive(k_empty_addr + (p_2 % 3) * 8);
                             }
-                            mbarrier_wait(v_full_addr + (p_2 % 3) * 8, p_2 / 3 & 1);
+                            int _parity_v_full_1 = (int)((unsigned int)plap_2 % 2);
+                            mbarrier_wait(v_full_addr + (p_2 % 3) * 8, _parity_v_full_1);
                             if (elect_sync()) {
                                 mbarrier_arrive(v_empty_addr + (p_2 % 3) * 8);
                             }
                         }
-                        mbarrier_wait(k_full_addr + (nx[8] % 3) * 8, nx[8] / 3 & 1);
+                        int kown_1 = 0;
+                        kown_1 += own_n_1;
+                        int klown_1 = 0;
+                        klown_1 += own_n_1 / 3;
+                        int _parity_k_full_3 = (int)((unsigned int)klown_1 % 2);
+                        mbarrier_wait(k_full_addr + (kown_1 % 3) * 8, _parity_k_full_3);
                         pos0 = nx[8];
                         has2_0 = nx[9];
                         cur_pos = pos0;
                         cur_has2 = has2_0;
+                        kpos0 += pos0;
+                        klap0 += pos0 / 3;
                         asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
                         uint64_t _wgmma_desc_16 = (((uint64_t)(((k_smem_addr + (unsigned int)(pos0 % 3 * 32768))) >> 4) & 0x3FFFULL) | ((uint64_t)(0) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
                         uint64_t _wgmma_b_2 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_16 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_16);
@@ -1075,11 +1227,13 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
                         asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
                         asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
                         if (elect_sync()) {
-                            mbarrier_arrive(k_empty_addr + (pos0 % 3) * 8);
+                            mbarrier_arrive(k_empty_addr + (kpos0 % 3) * 8);
                         }
                     } else {
+                        kpos0 += pos0;
+                        klap0 += pos0 / 3;
                         if (elect_sync()) {
-                            mbarrier_arrive(k_empty_addr + (pos0 % 3) * 8);
+                            mbarrier_arrive(k_empty_addr + (kpos0 % 3) * 8);
                         }
                     }
                     float f_max0 = -CUDART_INF_F;
@@ -1388,25 +1542,38 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
                     #pragma unroll 1
                     for (int n = 0; n < n_loop; n++) {
                         int cur_stage = cur_pos % 3;
-                        int cur_ph = cur_pos / 3 & 1;
                         int w_e = meta_smem[own_base_w + (n + 1 >> 1)];
                         int en = w_e >> (n + 1 & 1) * 16 & 65535;
                         int nxt_pos = gbase + (en >> 3);
                         int nxt_has2 = en >> 2 & 1;
                         #pragma unroll 1
                         for (int p_3 = cur_pos + 1; p_3 < nxt_pos; p_3++) {
-                            mbarrier_wait(k_full_addr + (p_3 % 3) * 8, p_3 / 3 & 1);
+                            int plap_3 = 0;
+                            plap_3 += p_3 / 3;
+                            int _parity_k_full_4 = (int)((unsigned int)plap_3 % 2);
+                            mbarrier_wait(k_full_addr + (p_3 % 3) * 8, _parity_k_full_4);
                             if (elect_sync()) {
                                 mbarrier_arrive(k_empty_addr + (p_3 % 3) * 8);
                             }
-                            mbarrier_wait(v_full_addr + (p_3 % 3) * 8, p_3 / 3 & 1);
+                            int _parity_v_full_2 = (int)((unsigned int)plap_3 % 2);
+                            mbarrier_wait(v_full_addr + (p_3 % 3) * 8, _parity_v_full_2);
                             if (elect_sync()) {
                                 mbarrier_arrive(v_empty_addr + (p_3 % 3) * 8);
                             }
                         }
+                        int knext = 0;
+                        knext += nxt_pos;
+                        int knlap = 0;
+                        knlap += nxt_pos / 3;
+                        int vcur = 0;
+                        vcur += cur_pos;
+                        int vclap = 0;
+                        vclap += cur_pos / 3;
                         int nxt_stage = nxt_pos % 3;
-                        mbarrier_wait(k_full_addr + (nxt_stage) * 8, nxt_pos / 3 & 1);
-                        mbarrier_wait(v_full_addr + (cur_stage) * 8, cur_ph);
+                        int _parity_k_full_5 = (int)((unsigned int)knlap % 2);
+                        mbarrier_wait(k_full_addr + (knext % 3) * 8, _parity_k_full_5);
+                        int _parity_v_full_3 = (int)((unsigned int)vclap % 2);
+                        mbarrier_wait(v_full_addr + (vcur % 3) * 8, _parity_v_full_3);
                         asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
                         uint64_t _wgmma_desc_62 = (((uint64_t)(((k_smem_addr + (unsigned int)(nxt_stage * 32768))) >> 4) & 0x3FFFULL) | ((uint64_t)(0) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
                         uint64_t _wgmma_b_4 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_62 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_62);
@@ -1679,7 +1846,7 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
                         asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
                         asm volatile("wgmma.wait_group.sync.aligned 1;" ::: "memory");
                         if (elect_sync()) {
-                            mbarrier_arrive(k_empty_addr + (nxt_pos % 3) * 8);
+                            mbarrier_arrive(k_empty_addr + (knext % 3) * 8);
                         }
                         float new_max0 = -CUDART_INF_F;
                         float new_max1 = -CUDART_INF_F;
@@ -1904,7 +2071,7 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
                         new_sum1 += _shfl_xor_sync_77;
                         asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
                         if (elect_sync()) {
-                            mbarrier_arrive(v_empty_addr + (cur_pos % 3) * 8);
+                            mbarrier_arrive(v_empty_addr + (vcur % 3) * 8);
                         }
                         pend0 = _exp2_64;
                         pend1 = _exp2_65;
@@ -1999,7 +2166,12 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
                         cur_has2 = nxt_has2;
                     }
                     int last_stage = cur_pos % 3;
-                    mbarrier_wait(v_full_addr + (last_stage) * 8, cur_pos / 3 & 1);
+                    int vlast = 0;
+                    vlast += cur_pos;
+                    int vllap = 0;
+                    vllap += cur_pos / 3;
+                    int _parity_v_full_4 = (int)((unsigned int)vllap % 2);
+                    mbarrier_wait(v_full_addr + (vlast % 3) * 8, _parity_v_full_4);
                     asm volatile("" : "+f"(d_o[0]) :: "memory");
                     asm volatile("" : "+f"(d_o[1]) :: "memory");
                     asm volatile("" : "+f"(d_o[2]) :: "memory");
@@ -2234,7 +2406,7 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
                     asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
                     asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
                     if (elect_sync()) {
-                        mbarrier_arrive(v_empty_addr + (cur_pos % 3) * 8);
+                        mbarrier_arrive(v_empty_addr + (vlast % 3) * 8);
                     }
                     prev = cur_pos;
                 }
@@ -2242,11 +2414,15 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
                 int tail_lo = prev + 1;
                 #pragma unroll 1
                 for (int p_4 = tail_lo; p_4 < tile_end; p_4++) {
-                    mbarrier_wait(k_full_addr + (p_4 % 3) * 8, p_4 / 3 & 1);
+                    int tlap = 0;
+                    tlap += p_4 / 3;
+                    int _parity_k_full_6 = (int)((unsigned int)tlap % 2);
+                    mbarrier_wait(k_full_addr + (p_4 % 3) * 8, _parity_k_full_6);
                     if (elect_sync()) {
                         mbarrier_arrive(k_empty_addr + (p_4 % 3) * 8);
                     }
-                    mbarrier_wait(v_full_addr + (p_4 % 3) * 8, p_4 / 3 & 1);
+                    int _parity_v_full_5 = (int)((unsigned int)tlap % 2);
+                    mbarrier_wait(v_full_addr + (p_4 % 3) * 8, _parity_v_full_5);
                     if (elect_sync()) {
                         mbarrier_arrive(v_empty_addr + (p_4 % 3) * 8);
                     }
@@ -2263,7 +2439,9 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
                     int slot_n_0_1 = ti_3 + 1 & 1;
                     int mbase_n_1_1 = slot_n_0_1 * 144;
                     nx[7] = 0;
-                    mbarrier_wait(meta_full_addr + (slot_n_0_1) * 8, ti_3 + 1 >> 1 & 1);
+                    int _stage_meta_full_3 = (int)((unsigned int)(ti_3 + 1) % 2);
+                    int _parity_meta_full_3 = (int)((unsigned int)(ti_3 + 1) / 2 % 2);
+                    mbarrier_wait(meta_full_addr + (_stage_meta_full_3) * 8, _parity_meta_full_3);
                     int valid_n_2_1 = __shfl_sync(0xFFFFFFFF, meta_smem[mbase_n_1_1 + 7], 0);
                     if (valid_n_2_1 != 0) {
                         nx[7] = 1;
@@ -2286,7 +2464,8 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
                     }
                     if (nx[7] != 0) {
                         int qs_n_2 = ((nx[3] == 1) ? 0 : cwg);
-                        mbarrier_wait(q_ready_addr + (qs_n_2) * 8, ti_3 + 1 & 1);
+                        int _parity_q_ready_1 = (int)((unsigned int)ti_3 % 2) ^ 1;
+                        mbarrier_wait(q_ready_addr + (qs_n_2) * 8, _parity_q_ready_1);
                         int q_half_base_3 = q_smem_addr + (unsigned int)(qs_n_2 * 16384) + (unsigned int)(q_ld_row * 128);
                         int q_col_bytes_4 = q_ld_col_lane * 2;
                         asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
@@ -2341,20 +2520,30 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
                         if (nx[5] > 0) {
                             int mbase_n_0_2 = (ti_3 + 1 & 1) * 144;
                             int e0_n_2 = meta_smem[mbase_n_0_2 + 76 + cwg * 34] & 65535;
-                            nx[8] = gbase + (e0_n_2 >> 3);
+                            int own_n_2 = gbase + (e0_n_2 >> 3);
+                            nx[8] = own_n_2;
                             nx[9] = e0_n_2 >> 2 & 1;
                             #pragma unroll 1
                             for (int p_5 = prev + 1; p_5 < nx[8]; p_5++) {
-                                mbarrier_wait(k_full_addr + (p_5 % 3) * 8, p_5 / 3 & 1);
+                                int plap_4 = 0;
+                                plap_4 += p_5 / 3;
+                                int _parity_k_full_7 = (int)((unsigned int)plap_4 % 2);
+                                mbarrier_wait(k_full_addr + (p_5 % 3) * 8, _parity_k_full_7);
                                 if (elect_sync()) {
                                     mbarrier_arrive(k_empty_addr + (p_5 % 3) * 8);
                                 }
-                                mbarrier_wait(v_full_addr + (p_5 % 3) * 8, p_5 / 3 & 1);
+                                int _parity_v_full_6 = (int)((unsigned int)plap_4 % 2);
+                                mbarrier_wait(v_full_addr + (p_5 % 3) * 8, _parity_v_full_6);
                                 if (elect_sync()) {
                                     mbarrier_arrive(v_empty_addr + (p_5 % 3) * 8);
                                 }
                             }
-                            mbarrier_wait(k_full_addr + (nx[8] % 3) * 8, nx[8] / 3 & 1);
+                            int kown_2 = 0;
+                            kown_2 += own_n_2;
+                            int klown_2 = 0;
+                            klown_2 += own_n_2 / 3;
+                            int _parity_k_full_8 = (int)((unsigned int)klown_2 % 2);
+                            mbarrier_wait(k_full_addr + (kown_2 % 3) * 8, _parity_k_full_8);
                         }
                     }
                 }
@@ -3007,7 +3196,7 @@ kernel_cake_vsa_sm90_3c3e392830e702a1d2b1(const __grid_constant__ CUtensorMap Q,
                 }
                 __syncwarp();
                 if (elect_sync()) {
-                    mbarrier_arrive(meta_empty_addr + (slot_m) * 8);
+                    mbarrier_arrive(meta_empty_addr + ((int)((unsigned int)ti_3 % 2)) * 8);
                 }
                 if (nx[10] != 0) {
                     if (nx[7] == 0) {

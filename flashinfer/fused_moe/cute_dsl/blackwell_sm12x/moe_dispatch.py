@@ -44,6 +44,7 @@ from .moe_w4a16_fp4_helpers import swizzle_block_scale
 from .moe_w4a16_host import (
     _W4A16_ALLOWED_ROUTED_SIZES,
     max_packed_route_slots,
+    max_w4a16_scratch_route_slots,
     packed_gemm_scratch_elements,
     route_pack_numel_capacity,
     unswizzle_block_scale,
@@ -3478,11 +3479,14 @@ def _w4a16_workspace_geometry(
         blocks = (slots + int(block_size) - 1) // int(block_size)
         route_slots = max(route_slots, slots)
         route_blocks = max(route_blocks, blocks)
+        scratch_slots = max_w4a16_scratch_route_slots(
+            routed_rows_capacity, num_topk, block_size, slots
+        )
         fc1_c_tmp_elements = max(
             fc1_c_tmp_elements,
             packed_gemm_scratch_elements(
                 size_n=fc1_cols,
-                route_slots=slots,
+                route_slots=scratch_slots,
                 moe_block_size=int(block_size),
                 sms=sms,
             ),
@@ -3491,7 +3495,7 @@ def _w4a16_workspace_geometry(
             fc2_c_tmp_elements,
             packed_gemm_scratch_elements(
                 size_n=int(k),
-                route_slots=slots,
+                route_slots=scratch_slots,
                 moe_block_size=int(block_size),
                 sms=sms,
             ),
@@ -3931,6 +3935,11 @@ def allocate_sm120_moe_workspace(
     raise ValueError(f"unsupported SM120 MoE backend {backend!r}")
 
 
+def _bucket_workspace_rows(routed_rows: int) -> int:
+    """Round a workspace row request up to a power-of-two (floor 128)."""
+    return 1 << (max(128, int(routed_rows)) - 1).bit_length()
+
+
 def _get_cached_workspace(
     *,
     backend: str,
@@ -3996,10 +4005,9 @@ def _get_cached_workspace(
             "functional path before capture."
         )
     _refuse_during_capture("a per-call MoE workspace")
-    workspace = allocate_sm120_moe_workspace(
+    alloc_kwargs = dict(
         state_E=state_E,
         weight_E=weight_E,
-        routed_rows=routed_rows,
         k=k,
         n=n,
         num_topk=num_topk,
@@ -4009,6 +4017,30 @@ def _get_cached_workspace(
         backend=backend,
         activation=activation,
     )
+    workspace = None
+    if backend == "static" and quant_mode != "w4a16":
+        # Allocate static workspaces on a power-of-two ladder (floor 128)
+        # rather than at the exact request. Growing replaces the cached
+        # workspace, and the new max_rows is baked into every kernel cache key
+        # compiled against it (_get_static_kernel / _get_micro_kernel), so each
+        # new high-water mark invalidates all previously compiled kernels for
+        # this key - a multi-second MLIR recompile per shape class at serving
+        # time. Bucketing bounds growth (and therefore recompile waves) to
+        # O(log) events at the cost of at most 2x scratch rows. Dynamic and
+        # W4A16 kernels do not key on max_rows, and dynamic workspaces derive
+        # their M-tile from routed_rows, so they keep exact sizing.
+        try:
+            workspace = allocate_sm120_moe_workspace(
+                routed_rows=_bucket_workspace_rows(routed_rows), **alloc_kwargs
+            )
+        except ValueError:
+            # The bucketed size can exceed the runtime memref limit where the
+            # exact request still fits; fall back to exact sizing.
+            workspace = None
+    if workspace is None:
+        workspace = allocate_sm120_moe_workspace(
+            routed_rows=routed_rows, **alloc_kwargs
+        )
 
     _WORKSPACE_CACHE[cache_key] = workspace
     return workspace

@@ -47,7 +47,7 @@ struct CakeParamArray {
 };
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
+#define NUM_MAIN_1_STAGES 1
 #define SMEM_MSTATS_OFF 148480
 #define SMEM_MSTATS_STAGE_BYTES 1024
 #define SMEM_MSTATS_STRIDE 1024
@@ -271,7 +271,7 @@ kernel_cake_vsa_sm90_6ef70e9d44dd4f5aaefb(const __grid_constant__ CUtensorMap Q,
     __syncthreads();
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Q))) : "memory"); }
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&K))) : "memory"); }
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Vt))) : "memory"); }
@@ -1852,31 +1852,47 @@ kernel_cake_vsa_sm90_6ef70e9d44dd4f5aaefb(const __grid_constant__ CUtensorMap Q,
             uint32_t _mapa_0;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_0) : "r"(recv_full_addr), "r"(0));
-            uint32_t _mapa_1;
-            asm volatile(
+                : "=r"(_mapa_0) : "r"(recv_smem_addr + (unsigned int)(pslot * 17408) + (unsigned int)my_off), "r"(0));
+            uint32_t _mbar_peer_102;
+            asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_1) : "r"(recv_smem_addr + (unsigned int)(pslot * 17408) + (unsigned int)my_off), "r"(0));
+                : "=r"(_mbar_peer_102) : "r"(recv_full_addr), "r"(0));
             asm volatile(
                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_1), "r"(__float_as_uint(d_o[0])), "r"(__float_as_uint(d_o[1])), "r"(__float_as_uint(d_o[2])), "r"(__float_as_uint(d_o[3])), "r"(_mapa_0) : "memory");
+                :: "r"(_mapa_0), "r"(__float_as_uint(d_o[0])), "r"(__float_as_uint(d_o[1])), "r"(__float_as_uint(d_o[2])), "r"(__float_as_uint(d_o[3])), "r"(_mbar_peer_102) : "memory");
+            uint32_t _mbar_peer_103;
+            asm(
+                "mapa.shared::cluster.u32 %0, %1, %2;"
+                : "=r"(_mbar_peer_103) : "r"(recv_full_addr), "r"(0));
             asm volatile(
                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_1 + 2048), "r"(__float_as_uint(d_o[4])), "r"(__float_as_uint(d_o[5])), "r"(__float_as_uint(d_o[6])), "r"(__float_as_uint(d_o[7])), "r"(_mapa_0) : "memory");
+                :: "r"(_mapa_0 + 2048), "r"(__float_as_uint(d_o[4])), "r"(__float_as_uint(d_o[5])), "r"(__float_as_uint(d_o[6])), "r"(__float_as_uint(d_o[7])), "r"(_mbar_peer_103) : "memory");
+            uint32_t _mbar_peer_104;
+            asm(
+                "mapa.shared::cluster.u32 %0, %1, %2;"
+                : "=r"(_mbar_peer_104) : "r"(recv_full_addr), "r"(0));
             asm volatile(
                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_1 + 4096), "r"(__float_as_uint(d_o[8])), "r"(__float_as_uint(d_o[9])), "r"(__float_as_uint(d_o[10])), "r"(__float_as_uint(d_o[11])), "r"(_mapa_0) : "memory");
+                :: "r"(_mapa_0 + 4096), "r"(__float_as_uint(d_o[8])), "r"(__float_as_uint(d_o[9])), "r"(__float_as_uint(d_o[10])), "r"(__float_as_uint(d_o[11])), "r"(_mbar_peer_104) : "memory");
+            uint32_t _mbar_peer_105;
+            asm(
+                "mapa.shared::cluster.u32 %0, %1, %2;"
+                : "=r"(_mbar_peer_105) : "r"(recv_full_addr), "r"(0));
             asm volatile(
                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_1 + 6144), "r"(__float_as_uint(d_o[12])), "r"(__float_as_uint(d_o[13])), "r"(__float_as_uint(d_o[14])), "r"(__float_as_uint(d_o[15])), "r"(_mapa_0) : "memory");
+                :: "r"(_mapa_0 + 6144), "r"(__float_as_uint(d_o[12])), "r"(__float_as_uint(d_o[13])), "r"(__float_as_uint(d_o[14])), "r"(__float_as_uint(d_o[15])), "r"(_mbar_peer_105) : "memory");
             if (qj == 0) {
-                uint32_t _cluster_mapa_102;
+                uint32_t _cluster_mapa_106;
                 asm volatile(
                     "mapa.shared::cluster.u32 %0, %1, %2;"
-                    : "=r"(_cluster_mapa_102) : "r"(recv_smem_addr + (unsigned int)(pslot * 17408) + 16384 + (unsigned int)(m0_local * 16)), "r"(0));
+                    : "=r"(_cluster_mapa_106) : "r"(recv_smem_addr + (unsigned int)(pslot * 17408) + 16384 + (unsigned int)(m0_local * 16)), "r"(0));
+                uint32_t _mbar_peer_107;
+                asm(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_mbar_peer_107) : "r"(recv_full_addr), "r"(0));
                 asm volatile(
                     "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                    :: "r"(_cluster_mapa_102), "r"(__float_as_uint(row_max0)), "r"(__float_as_uint(row_sum0)), "r"(__float_as_uint(row_max1)), "r"(__float_as_uint(row_sum1)), "r"(_mapa_0) : "memory");
+                    :: "r"(_cluster_mapa_106), "r"(__float_as_uint(row_max0)), "r"(__float_as_uint(row_sum0)), "r"(__float_as_uint(row_max1)), "r"(__float_as_uint(row_sum1)), "r"(_mbar_peer_107) : "memory");
             }
         }
         if (my_rank != 1) {
@@ -1884,34 +1900,50 @@ kernel_cake_vsa_sm90_6ef70e9d44dd4f5aaefb(const __grid_constant__ CUtensorMap Q,
             if (my_rank > 1) {
                 pslot_1 = my_rank - 1;
             }
-            uint32_t _mapa_2;
+            uint32_t _mapa_1;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_2) : "r"(recv_full_addr), "r"(1));
-            uint32_t _mapa_3;
-            asm volatile(
+                : "=r"(_mapa_1) : "r"(recv_smem_addr + (unsigned int)(pslot_1 * 17408) + (unsigned int)my_off), "r"(1));
+            uint32_t _mbar_peer_108;
+            asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_3) : "r"(recv_smem_addr + (unsigned int)(pslot_1 * 17408) + (unsigned int)my_off), "r"(1));
+                : "=r"(_mbar_peer_108) : "r"(recv_full_addr), "r"(1));
             asm volatile(
                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_3), "r"(__float_as_uint(d_o[16])), "r"(__float_as_uint(d_o[17])), "r"(__float_as_uint(d_o[18])), "r"(__float_as_uint(d_o[19])), "r"(_mapa_2) : "memory");
+                :: "r"(_mapa_1), "r"(__float_as_uint(d_o[16])), "r"(__float_as_uint(d_o[17])), "r"(__float_as_uint(d_o[18])), "r"(__float_as_uint(d_o[19])), "r"(_mbar_peer_108) : "memory");
+            uint32_t _mbar_peer_109;
+            asm(
+                "mapa.shared::cluster.u32 %0, %1, %2;"
+                : "=r"(_mbar_peer_109) : "r"(recv_full_addr), "r"(1));
             asm volatile(
                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_3 + 2048), "r"(__float_as_uint(d_o[20])), "r"(__float_as_uint(d_o[21])), "r"(__float_as_uint(d_o[22])), "r"(__float_as_uint(d_o[23])), "r"(_mapa_2) : "memory");
+                :: "r"(_mapa_1 + 2048), "r"(__float_as_uint(d_o[20])), "r"(__float_as_uint(d_o[21])), "r"(__float_as_uint(d_o[22])), "r"(__float_as_uint(d_o[23])), "r"(_mbar_peer_109) : "memory");
+            uint32_t _mbar_peer_110;
+            asm(
+                "mapa.shared::cluster.u32 %0, %1, %2;"
+                : "=r"(_mbar_peer_110) : "r"(recv_full_addr), "r"(1));
             asm volatile(
                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_3 + 4096), "r"(__float_as_uint(d_o[24])), "r"(__float_as_uint(d_o[25])), "r"(__float_as_uint(d_o[26])), "r"(__float_as_uint(d_o[27])), "r"(_mapa_2) : "memory");
+                :: "r"(_mapa_1 + 4096), "r"(__float_as_uint(d_o[24])), "r"(__float_as_uint(d_o[25])), "r"(__float_as_uint(d_o[26])), "r"(__float_as_uint(d_o[27])), "r"(_mbar_peer_110) : "memory");
+            uint32_t _mbar_peer_111;
+            asm(
+                "mapa.shared::cluster.u32 %0, %1, %2;"
+                : "=r"(_mbar_peer_111) : "r"(recv_full_addr), "r"(1));
             asm volatile(
                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_3 + 6144), "r"(__float_as_uint(d_o[28])), "r"(__float_as_uint(d_o[29])), "r"(__float_as_uint(d_o[30])), "r"(__float_as_uint(d_o[31])), "r"(_mapa_2) : "memory");
+                :: "r"(_mapa_1 + 6144), "r"(__float_as_uint(d_o[28])), "r"(__float_as_uint(d_o[29])), "r"(__float_as_uint(d_o[30])), "r"(__float_as_uint(d_o[31])), "r"(_mbar_peer_111) : "memory");
             if (qj == 0) {
-                uint32_t _cluster_mapa_103;
+                uint32_t _cluster_mapa_112;
                 asm volatile(
                     "mapa.shared::cluster.u32 %0, %1, %2;"
-                    : "=r"(_cluster_mapa_103) : "r"(recv_smem_addr + (unsigned int)(pslot_1 * 17408) + 16384 + (unsigned int)(m0_local * 16)), "r"(1));
+                    : "=r"(_cluster_mapa_112) : "r"(recv_smem_addr + (unsigned int)(pslot_1 * 17408) + 16384 + (unsigned int)(m0_local * 16)), "r"(1));
+                uint32_t _mbar_peer_113;
+                asm(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_mbar_peer_113) : "r"(recv_full_addr), "r"(1));
                 asm volatile(
                     "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                    :: "r"(_cluster_mapa_103), "r"(__float_as_uint(row_max0)), "r"(__float_as_uint(row_sum0)), "r"(__float_as_uint(row_max1)), "r"(__float_as_uint(row_sum1)), "r"(_mapa_2) : "memory");
+                    :: "r"(_cluster_mapa_112), "r"(__float_as_uint(row_max0)), "r"(__float_as_uint(row_sum0)), "r"(__float_as_uint(row_max1)), "r"(__float_as_uint(row_sum1)), "r"(_mbar_peer_113) : "memory");
             }
         }
         if (my_rank < 2) {
@@ -1927,10 +1959,10 @@ kernel_cake_vsa_sm90_6ef70e9d44dd4f5aaefb(const __grid_constant__ CUtensorMap Q,
             float w_peer0[1];
             float w_peer1[1];
             int sbase = 4096 + m0_local * 4;
-            float _exp2_104_1 = approx_exp2(recv_smem[sbase] - merged_max0_3);
-            w_peer0[0] = _exp2_104_1;
-            float _exp2_105_1 = approx_exp2(recv_smem[sbase + 2] - merged_max1_3);
-            w_peer1[0] = _exp2_105_1;
+            float _exp2_114_1 = approx_exp2(recv_smem[sbase] - merged_max0_3);
+            w_peer0[0] = _exp2_114_1;
+            float _exp2_115_1 = approx_exp2(recv_smem[sbase + 2] - merged_max1_3);
+            w_peer1[0] = _exp2_115_1;
             msum0 = __fmaf_rn(recv_smem[sbase + 1], w_peer0[0], msum0);
             msum1 = __fmaf_rn(recv_smem[sbase + 3], w_peer1[0], msum1);
             int my_tid4 = tid_wg * 4;
@@ -2021,34 +2053,34 @@ kernel_cake_vsa_sm90_6ef70e9d44dd4f5aaefb(const __grid_constant__ CUtensorMap Q,
                 unsigned int o_tmp[4];
                 int o_row_base = q_row * 128;
                 int m_local_r = m0_local;
-                __nv_bfloat162 _bit_cast_src_106 = __float22bfloat162_rn(make_float2(acc[0], acc[1]));
-                o_vec[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_106)[0];
-                __nv_bfloat162 _bit_cast_src_107 = __float22bfloat162_rn(make_float2(acc[4], acc[5]));
-                o_vec[1] = reinterpret_cast<unsigned int*>(&_bit_cast_src_107)[0];
-                __nv_bfloat162 _bit_cast_src_108 = __float22bfloat162_rn(make_float2(acc[8], acc[9]));
-                o_vec[2] = reinterpret_cast<unsigned int*>(&_bit_cast_src_108)[0];
-                __nv_bfloat162 _bit_cast_src_109 = __float22bfloat162_rn(make_float2(acc[12], acc[13]));
-                o_vec[3] = reinterpret_cast<unsigned int*>(&_bit_cast_src_109)[0];
-                unsigned int _shfl_xor_sync_110 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
-                o_tmp[0] = _shfl_xor_sync_110;
-                unsigned int _shfl_xor_sync_111 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
-                o_tmp[1] = _shfl_xor_sync_111;
-                unsigned int _shfl_xor_sync_112 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
-                o_tmp[2] = _shfl_xor_sync_112;
-                unsigned int _shfl_xor_sync_113 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
-                o_tmp[3] = _shfl_xor_sync_113;
+                __nv_bfloat162 _bit_cast_src_116 = __float22bfloat162_rn(make_float2(acc[0], acc[1]));
+                o_vec[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_116)[0];
+                __nv_bfloat162 _bit_cast_src_117 = __float22bfloat162_rn(make_float2(acc[4], acc[5]));
+                o_vec[1] = reinterpret_cast<unsigned int*>(&_bit_cast_src_117)[0];
+                __nv_bfloat162 _bit_cast_src_118 = __float22bfloat162_rn(make_float2(acc[8], acc[9]));
+                o_vec[2] = reinterpret_cast<unsigned int*>(&_bit_cast_src_118)[0];
+                __nv_bfloat162 _bit_cast_src_119 = __float22bfloat162_rn(make_float2(acc[12], acc[13]));
+                o_vec[3] = reinterpret_cast<unsigned int*>(&_bit_cast_src_119)[0];
+                unsigned int _shfl_xor_sync_120 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
+                o_tmp[0] = _shfl_xor_sync_120;
+                unsigned int _shfl_xor_sync_121 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
+                o_tmp[1] = _shfl_xor_sync_121;
+                unsigned int _shfl_xor_sync_122 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
+                o_tmp[2] = _shfl_xor_sync_122;
+                unsigned int _shfl_xor_sync_123 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
+                o_tmp[3] = _shfl_xor_sync_123;
                 o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
                 o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
                 o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
                 o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
-                unsigned int _shfl_xor_sync_114 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
-                o_tmp[0] = _shfl_xor_sync_114;
-                unsigned int _shfl_xor_sync_115 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
-                o_tmp[1] = _shfl_xor_sync_115;
-                unsigned int _shfl_xor_sync_116 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
-                o_tmp[2] = _shfl_xor_sync_116;
-                unsigned int _shfl_xor_sync_117 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
-                o_tmp[3] = _shfl_xor_sync_117;
+                unsigned int _shfl_xor_sync_124 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
+                o_tmp[0] = _shfl_xor_sync_124;
+                unsigned int _shfl_xor_sync_125 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
+                o_tmp[1] = _shfl_xor_sync_125;
+                unsigned int _shfl_xor_sync_126 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
+                o_tmp[2] = _shfl_xor_sync_126;
+                unsigned int _shfl_xor_sync_127 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
+                o_tmp[3] = _shfl_xor_sync_127;
                 o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
                 o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
                 o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
@@ -2056,34 +2088,34 @@ kernel_cake_vsa_sm90_6ef70e9d44dd4f5aaefb(const __grid_constant__ CUtensorMap Q,
                 int o_off = o_row_base + m_local_r * 128 + (4 * sset + qj) * 8;
                 reinterpret_cast<int4*>(O + o_off)[0] = reinterpret_cast<int4*>(o_vec)[0];
                 int m_local_r_0 = m1_local;
-                __nv_bfloat162 _bit_cast_src_118 = __float22bfloat162_rn(make_float2(acc[2], acc[3]));
-                o_vec[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_118)[0];
-                __nv_bfloat162 _bit_cast_src_119 = __float22bfloat162_rn(make_float2(acc[6], acc[7]));
-                o_vec[1] = reinterpret_cast<unsigned int*>(&_bit_cast_src_119)[0];
-                __nv_bfloat162 _bit_cast_src_120 = __float22bfloat162_rn(make_float2(acc[10], acc[11]));
-                o_vec[2] = reinterpret_cast<unsigned int*>(&_bit_cast_src_120)[0];
-                __nv_bfloat162 _bit_cast_src_121 = __float22bfloat162_rn(make_float2(acc[14], acc[15]));
-                o_vec[3] = reinterpret_cast<unsigned int*>(&_bit_cast_src_121)[0];
-                unsigned int _shfl_xor_sync_122 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
-                o_tmp[0] = _shfl_xor_sync_122;
-                unsigned int _shfl_xor_sync_123 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
-                o_tmp[1] = _shfl_xor_sync_123;
-                unsigned int _shfl_xor_sync_124 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
-                o_tmp[2] = _shfl_xor_sync_124;
-                unsigned int _shfl_xor_sync_125 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
-                o_tmp[3] = _shfl_xor_sync_125;
+                __nv_bfloat162 _bit_cast_src_128 = __float22bfloat162_rn(make_float2(acc[2], acc[3]));
+                o_vec[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_128)[0];
+                __nv_bfloat162 _bit_cast_src_129 = __float22bfloat162_rn(make_float2(acc[6], acc[7]));
+                o_vec[1] = reinterpret_cast<unsigned int*>(&_bit_cast_src_129)[0];
+                __nv_bfloat162 _bit_cast_src_130 = __float22bfloat162_rn(make_float2(acc[10], acc[11]));
+                o_vec[2] = reinterpret_cast<unsigned int*>(&_bit_cast_src_130)[0];
+                __nv_bfloat162 _bit_cast_src_131 = __float22bfloat162_rn(make_float2(acc[14], acc[15]));
+                o_vec[3] = reinterpret_cast<unsigned int*>(&_bit_cast_src_131)[0];
+                unsigned int _shfl_xor_sync_132 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
+                o_tmp[0] = _shfl_xor_sync_132;
+                unsigned int _shfl_xor_sync_133 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
+                o_tmp[1] = _shfl_xor_sync_133;
+                unsigned int _shfl_xor_sync_134 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
+                o_tmp[2] = _shfl_xor_sync_134;
+                unsigned int _shfl_xor_sync_135 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
+                o_tmp[3] = _shfl_xor_sync_135;
                 o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
                 o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
                 o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
                 o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
-                unsigned int _shfl_xor_sync_126 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
-                o_tmp[0] = _shfl_xor_sync_126;
-                unsigned int _shfl_xor_sync_127 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
-                o_tmp[1] = _shfl_xor_sync_127;
-                unsigned int _shfl_xor_sync_128 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
-                o_tmp[2] = _shfl_xor_sync_128;
-                unsigned int _shfl_xor_sync_129 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
-                o_tmp[3] = _shfl_xor_sync_129;
+                unsigned int _shfl_xor_sync_136 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
+                o_tmp[0] = _shfl_xor_sync_136;
+                unsigned int _shfl_xor_sync_137 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
+                o_tmp[1] = _shfl_xor_sync_137;
+                unsigned int _shfl_xor_sync_138 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
+                o_tmp[2] = _shfl_xor_sync_138;
+                unsigned int _shfl_xor_sync_139 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
+                o_tmp[3] = _shfl_xor_sync_139;
                 o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
                 o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
                 o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
@@ -2177,34 +2209,34 @@ kernel_cake_vsa_sm90_6ef70e9d44dd4f5aaefb(const __grid_constant__ CUtensorMap Q,
                 unsigned int o_tmp_1[4];
                 int o_row_base_1 = q_row * 128;
                 int m_local_r_1 = m0_local;
-                __nv_bfloat162 _bit_cast_src_130 = __float22bfloat162_rn(make_float2(acc[0], acc[1]));
-                o_vec_1[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_130)[0];
-                __nv_bfloat162 _bit_cast_src_131 = __float22bfloat162_rn(make_float2(acc[4], acc[5]));
-                o_vec_1[1] = reinterpret_cast<unsigned int*>(&_bit_cast_src_131)[0];
-                __nv_bfloat162 _bit_cast_src_132 = __float22bfloat162_rn(make_float2(acc[8], acc[9]));
-                o_vec_1[2] = reinterpret_cast<unsigned int*>(&_bit_cast_src_132)[0];
-                __nv_bfloat162 _bit_cast_src_133 = __float22bfloat162_rn(make_float2(acc[12], acc[13]));
-                o_vec_1[3] = reinterpret_cast<unsigned int*>(&_bit_cast_src_133)[0];
-                unsigned int _shfl_xor_sync_134 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[1], 1);
-                o_tmp_1[0] = _shfl_xor_sync_134;
-                unsigned int _shfl_xor_sync_135 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[0], 1);
-                o_tmp_1[1] = _shfl_xor_sync_135;
-                unsigned int _shfl_xor_sync_136 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[3], 1);
-                o_tmp_1[2] = _shfl_xor_sync_136;
-                unsigned int _shfl_xor_sync_137 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[2], 1);
-                o_tmp_1[3] = _shfl_xor_sync_137;
+                __nv_bfloat162 _bit_cast_src_140 = __float22bfloat162_rn(make_float2(acc[0], acc[1]));
+                o_vec_1[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_140)[0];
+                __nv_bfloat162 _bit_cast_src_141 = __float22bfloat162_rn(make_float2(acc[4], acc[5]));
+                o_vec_1[1] = reinterpret_cast<unsigned int*>(&_bit_cast_src_141)[0];
+                __nv_bfloat162 _bit_cast_src_142 = __float22bfloat162_rn(make_float2(acc[8], acc[9]));
+                o_vec_1[2] = reinterpret_cast<unsigned int*>(&_bit_cast_src_142)[0];
+                __nv_bfloat162 _bit_cast_src_143 = __float22bfloat162_rn(make_float2(acc[12], acc[13]));
+                o_vec_1[3] = reinterpret_cast<unsigned int*>(&_bit_cast_src_143)[0];
+                unsigned int _shfl_xor_sync_144 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[1], 1);
+                o_tmp_1[0] = _shfl_xor_sync_144;
+                unsigned int _shfl_xor_sync_145 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[0], 1);
+                o_tmp_1[1] = _shfl_xor_sync_145;
+                unsigned int _shfl_xor_sync_146 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[3], 1);
+                o_tmp_1[2] = _shfl_xor_sync_146;
+                unsigned int _shfl_xor_sync_147 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[2], 1);
+                o_tmp_1[3] = _shfl_xor_sync_147;
                 o_vec_1[0] = ((qj1_1 != 0) ? o_tmp_1[0] : o_vec_1[0]);
                 o_vec_1[1] = ((qj1_1 == 0) ? o_tmp_1[1] : o_vec_1[1]);
                 o_vec_1[2] = ((qj1_1 != 0) ? o_tmp_1[2] : o_vec_1[2]);
                 o_vec_1[3] = ((qj1_1 == 0) ? o_tmp_1[3] : o_vec_1[3]);
-                unsigned int _shfl_xor_sync_138 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[2], 2);
-                o_tmp_1[0] = _shfl_xor_sync_138;
-                unsigned int _shfl_xor_sync_139 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[3], 2);
-                o_tmp_1[1] = _shfl_xor_sync_139;
-                unsigned int _shfl_xor_sync_140 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[0], 2);
-                o_tmp_1[2] = _shfl_xor_sync_140;
-                unsigned int _shfl_xor_sync_141 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[1], 2);
-                o_tmp_1[3] = _shfl_xor_sync_141;
+                unsigned int _shfl_xor_sync_148 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[2], 2);
+                o_tmp_1[0] = _shfl_xor_sync_148;
+                unsigned int _shfl_xor_sync_149 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[3], 2);
+                o_tmp_1[1] = _shfl_xor_sync_149;
+                unsigned int _shfl_xor_sync_150 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[0], 2);
+                o_tmp_1[2] = _shfl_xor_sync_150;
+                unsigned int _shfl_xor_sync_151 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[1], 2);
+                o_tmp_1[3] = _shfl_xor_sync_151;
                 o_vec_1[0] = ((qj2_1 != 0) ? o_tmp_1[0] : o_vec_1[0]);
                 o_vec_1[1] = ((qj2_1 != 0) ? o_tmp_1[1] : o_vec_1[1]);
                 o_vec_1[2] = ((qj2_1 == 0) ? o_tmp_1[2] : o_vec_1[2]);
@@ -2212,34 +2244,34 @@ kernel_cake_vsa_sm90_6ef70e9d44dd4f5aaefb(const __grid_constant__ CUtensorMap Q,
                 int o_off_2 = o_row_base_1 + m_local_r_1 * 128 + (4 * sset_0 + qj) * 8;
                 reinterpret_cast<int4*>(O + o_off_2)[0] = reinterpret_cast<int4*>(o_vec_1)[0];
                 int m_local_r_0_1 = m1_local;
-                __nv_bfloat162 _bit_cast_src_142 = __float22bfloat162_rn(make_float2(acc[2], acc[3]));
-                o_vec_1[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_142)[0];
-                __nv_bfloat162 _bit_cast_src_143 = __float22bfloat162_rn(make_float2(acc[6], acc[7]));
-                o_vec_1[1] = reinterpret_cast<unsigned int*>(&_bit_cast_src_143)[0];
-                __nv_bfloat162 _bit_cast_src_144 = __float22bfloat162_rn(make_float2(acc[10], acc[11]));
-                o_vec_1[2] = reinterpret_cast<unsigned int*>(&_bit_cast_src_144)[0];
-                __nv_bfloat162 _bit_cast_src_145 = __float22bfloat162_rn(make_float2(acc[14], acc[15]));
-                o_vec_1[3] = reinterpret_cast<unsigned int*>(&_bit_cast_src_145)[0];
-                unsigned int _shfl_xor_sync_146 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[1], 1);
-                o_tmp_1[0] = _shfl_xor_sync_146;
-                unsigned int _shfl_xor_sync_147 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[0], 1);
-                o_tmp_1[1] = _shfl_xor_sync_147;
-                unsigned int _shfl_xor_sync_148 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[3], 1);
-                o_tmp_1[2] = _shfl_xor_sync_148;
-                unsigned int _shfl_xor_sync_149 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[2], 1);
-                o_tmp_1[3] = _shfl_xor_sync_149;
+                __nv_bfloat162 _bit_cast_src_152 = __float22bfloat162_rn(make_float2(acc[2], acc[3]));
+                o_vec_1[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_152)[0];
+                __nv_bfloat162 _bit_cast_src_153 = __float22bfloat162_rn(make_float2(acc[6], acc[7]));
+                o_vec_1[1] = reinterpret_cast<unsigned int*>(&_bit_cast_src_153)[0];
+                __nv_bfloat162 _bit_cast_src_154 = __float22bfloat162_rn(make_float2(acc[10], acc[11]));
+                o_vec_1[2] = reinterpret_cast<unsigned int*>(&_bit_cast_src_154)[0];
+                __nv_bfloat162 _bit_cast_src_155 = __float22bfloat162_rn(make_float2(acc[14], acc[15]));
+                o_vec_1[3] = reinterpret_cast<unsigned int*>(&_bit_cast_src_155)[0];
+                unsigned int _shfl_xor_sync_156 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[1], 1);
+                o_tmp_1[0] = _shfl_xor_sync_156;
+                unsigned int _shfl_xor_sync_157 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[0], 1);
+                o_tmp_1[1] = _shfl_xor_sync_157;
+                unsigned int _shfl_xor_sync_158 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[3], 1);
+                o_tmp_1[2] = _shfl_xor_sync_158;
+                unsigned int _shfl_xor_sync_159 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[2], 1);
+                o_tmp_1[3] = _shfl_xor_sync_159;
                 o_vec_1[0] = ((qj1_1 != 0) ? o_tmp_1[0] : o_vec_1[0]);
                 o_vec_1[1] = ((qj1_1 == 0) ? o_tmp_1[1] : o_vec_1[1]);
                 o_vec_1[2] = ((qj1_1 != 0) ? o_tmp_1[2] : o_vec_1[2]);
                 o_vec_1[3] = ((qj1_1 == 0) ? o_tmp_1[3] : o_vec_1[3]);
-                unsigned int _shfl_xor_sync_150 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[2], 2);
-                o_tmp_1[0] = _shfl_xor_sync_150;
-                unsigned int _shfl_xor_sync_151 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[3], 2);
-                o_tmp_1[1] = _shfl_xor_sync_151;
-                unsigned int _shfl_xor_sync_152 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[0], 2);
-                o_tmp_1[2] = _shfl_xor_sync_152;
-                unsigned int _shfl_xor_sync_153 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[1], 2);
-                o_tmp_1[3] = _shfl_xor_sync_153;
+                unsigned int _shfl_xor_sync_160 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[2], 2);
+                o_tmp_1[0] = _shfl_xor_sync_160;
+                unsigned int _shfl_xor_sync_161 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[3], 2);
+                o_tmp_1[1] = _shfl_xor_sync_161;
+                unsigned int _shfl_xor_sync_162 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[0], 2);
+                o_tmp_1[2] = _shfl_xor_sync_162;
+                unsigned int _shfl_xor_sync_163 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[1], 2);
+                o_tmp_1[3] = _shfl_xor_sync_163;
                 o_vec_1[0] = ((qj2_1 != 0) ? o_tmp_1[0] : o_vec_1[0]);
                 o_vec_1[1] = ((qj2_1 != 0) ? o_tmp_1[1] : o_vec_1[1]);
                 o_vec_1[2] = ((qj2_1 == 0) ? o_tmp_1[2] : o_vec_1[2]);
@@ -2257,52 +2289,76 @@ kernel_cake_vsa_sm90_6ef70e9d44dd4f5aaefb(const __grid_constant__ CUtensorMap Q,
             if (my_rank_1 > 0) {
                 pslot_2 = my_rank_1 - 1;
             }
-            uint32_t _mapa_4;
+            uint32_t _mapa_2;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_4) : "r"(recv_full_addr), "r"(0));
-            uint32_t _mapa_5;
-            asm volatile(
+                : "=r"(_mapa_2) : "r"(recv_smem_addr + (unsigned int)(pslot_2 * 17408) + 8192 + (unsigned int)my_off_1), "r"(0));
+            uint32_t _mbar_peer_164;
+            asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_5) : "r"(recv_smem_addr + (unsigned int)(pslot_2 * 17408) + 8192 + (unsigned int)my_off_1), "r"(0));
+                : "=r"(_mbar_peer_164) : "r"(recv_full_addr), "r"(0));
             asm volatile(
                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_5), "r"(__float_as_uint(d_o[32])), "r"(__float_as_uint(d_o[33])), "r"(__float_as_uint(d_o[34])), "r"(__float_as_uint(d_o[35])), "r"(_mapa_4) : "memory");
+                :: "r"(_mapa_2), "r"(__float_as_uint(d_o[32])), "r"(__float_as_uint(d_o[33])), "r"(__float_as_uint(d_o[34])), "r"(__float_as_uint(d_o[35])), "r"(_mbar_peer_164) : "memory");
+            uint32_t _mbar_peer_165;
+            asm(
+                "mapa.shared::cluster.u32 %0, %1, %2;"
+                : "=r"(_mbar_peer_165) : "r"(recv_full_addr), "r"(0));
             asm volatile(
                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_5 + 2048), "r"(__float_as_uint(d_o[36])), "r"(__float_as_uint(d_o[37])), "r"(__float_as_uint(d_o[38])), "r"(__float_as_uint(d_o[39])), "r"(_mapa_4) : "memory");
+                :: "r"(_mapa_2 + 2048), "r"(__float_as_uint(d_o[36])), "r"(__float_as_uint(d_o[37])), "r"(__float_as_uint(d_o[38])), "r"(__float_as_uint(d_o[39])), "r"(_mbar_peer_165) : "memory");
+            uint32_t _mbar_peer_166;
+            asm(
+                "mapa.shared::cluster.u32 %0, %1, %2;"
+                : "=r"(_mbar_peer_166) : "r"(recv_full_addr), "r"(0));
             asm volatile(
                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_5 + 4096), "r"(__float_as_uint(d_o[40])), "r"(__float_as_uint(d_o[41])), "r"(__float_as_uint(d_o[42])), "r"(__float_as_uint(d_o[43])), "r"(_mapa_4) : "memory");
+                :: "r"(_mapa_2 + 4096), "r"(__float_as_uint(d_o[40])), "r"(__float_as_uint(d_o[41])), "r"(__float_as_uint(d_o[42])), "r"(__float_as_uint(d_o[43])), "r"(_mbar_peer_166) : "memory");
+            uint32_t _mbar_peer_167;
+            asm(
+                "mapa.shared::cluster.u32 %0, %1, %2;"
+                : "=r"(_mbar_peer_167) : "r"(recv_full_addr), "r"(0));
             asm volatile(
                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_5 + 6144), "r"(__float_as_uint(d_o[44])), "r"(__float_as_uint(d_o[45])), "r"(__float_as_uint(d_o[46])), "r"(__float_as_uint(d_o[47])), "r"(_mapa_4) : "memory");
+                :: "r"(_mapa_2 + 6144), "r"(__float_as_uint(d_o[44])), "r"(__float_as_uint(d_o[45])), "r"(__float_as_uint(d_o[46])), "r"(__float_as_uint(d_o[47])), "r"(_mbar_peer_167) : "memory");
         }
         if (my_rank_1 != 1) {
             int pslot_3 = my_rank_1;
             if (my_rank_1 > 1) {
                 pslot_3 = my_rank_1 - 1;
             }
-            uint32_t _mapa_6;
+            uint32_t _mapa_3;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_6) : "r"(recv_full_addr), "r"(1));
-            uint32_t _mapa_7;
-            asm volatile(
+                : "=r"(_mapa_3) : "r"(recv_smem_addr + (unsigned int)(pslot_3 * 17408) + 8192 + (unsigned int)my_off_1), "r"(1));
+            uint32_t _mbar_peer_168;
+            asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_7) : "r"(recv_smem_addr + (unsigned int)(pslot_3 * 17408) + 8192 + (unsigned int)my_off_1), "r"(1));
+                : "=r"(_mbar_peer_168) : "r"(recv_full_addr), "r"(1));
             asm volatile(
                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_7), "r"(__float_as_uint(d_o[48])), "r"(__float_as_uint(d_o[49])), "r"(__float_as_uint(d_o[50])), "r"(__float_as_uint(d_o[51])), "r"(_mapa_6) : "memory");
+                :: "r"(_mapa_3), "r"(__float_as_uint(d_o[48])), "r"(__float_as_uint(d_o[49])), "r"(__float_as_uint(d_o[50])), "r"(__float_as_uint(d_o[51])), "r"(_mbar_peer_168) : "memory");
+            uint32_t _mbar_peer_169;
+            asm(
+                "mapa.shared::cluster.u32 %0, %1, %2;"
+                : "=r"(_mbar_peer_169) : "r"(recv_full_addr), "r"(1));
             asm volatile(
                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_7 + 2048), "r"(__float_as_uint(d_o[52])), "r"(__float_as_uint(d_o[53])), "r"(__float_as_uint(d_o[54])), "r"(__float_as_uint(d_o[55])), "r"(_mapa_6) : "memory");
+                :: "r"(_mapa_3 + 2048), "r"(__float_as_uint(d_o[52])), "r"(__float_as_uint(d_o[53])), "r"(__float_as_uint(d_o[54])), "r"(__float_as_uint(d_o[55])), "r"(_mbar_peer_169) : "memory");
+            uint32_t _mbar_peer_170;
+            asm(
+                "mapa.shared::cluster.u32 %0, %1, %2;"
+                : "=r"(_mbar_peer_170) : "r"(recv_full_addr), "r"(1));
             asm volatile(
                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_7 + 4096), "r"(__float_as_uint(d_o[56])), "r"(__float_as_uint(d_o[57])), "r"(__float_as_uint(d_o[58])), "r"(__float_as_uint(d_o[59])), "r"(_mapa_6) : "memory");
+                :: "r"(_mapa_3 + 4096), "r"(__float_as_uint(d_o[56])), "r"(__float_as_uint(d_o[57])), "r"(__float_as_uint(d_o[58])), "r"(__float_as_uint(d_o[59])), "r"(_mbar_peer_170) : "memory");
+            uint32_t _mbar_peer_171;
+            asm(
+                "mapa.shared::cluster.u32 %0, %1, %2;"
+                : "=r"(_mbar_peer_171) : "r"(recv_full_addr), "r"(1));
             asm volatile(
                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_7 + 6144), "r"(__float_as_uint(d_o[60])), "r"(__float_as_uint(d_o[61])), "r"(__float_as_uint(d_o[62])), "r"(__float_as_uint(d_o[63])), "r"(_mapa_6) : "memory");
+                :: "r"(_mapa_3 + 6144), "r"(__float_as_uint(d_o[60])), "r"(__float_as_uint(d_o[61])), "r"(__float_as_uint(d_o[62])), "r"(__float_as_uint(d_o[63])), "r"(_mbar_peer_171) : "memory");
         }
         if (my_rank_1 < 2) {
             mbarrier_wait_cluster_hint(recv_full_addr, 0, 10000000);
@@ -2317,10 +2373,10 @@ kernel_cake_vsa_sm90_6ef70e9d44dd4f5aaefb(const __grid_constant__ CUtensorMap Q,
             float w_peer0_1[1];
             float w_peer1_1[1];
             int sbase_1 = 4096 + m0_local * 4;
-            float _exp2_154 = approx_exp2(recv_smem[sbase_1] - merged_max0_4);
-            w_peer0_1[0] = _exp2_154;
-            float _exp2_155 = approx_exp2(recv_smem[sbase_1 + 2] - merged_max1_4);
-            w_peer1_1[0] = _exp2_155;
+            float _exp2_172 = approx_exp2(recv_smem[sbase_1] - merged_max0_4);
+            w_peer0_1[0] = _exp2_172;
+            float _exp2_173 = approx_exp2(recv_smem[sbase_1 + 2] - merged_max1_4);
+            w_peer1_1[0] = _exp2_173;
             msum0_1 = __fmaf_rn(recv_smem[sbase_1 + 1], w_peer0_1[0], msum0_1);
             msum1_1 = __fmaf_rn(recv_smem[sbase_1 + 3], w_peer1_1[0], msum1_1);
             int my_tid4_1 = tid_wg * 4;
@@ -2411,34 +2467,34 @@ kernel_cake_vsa_sm90_6ef70e9d44dd4f5aaefb(const __grid_constant__ CUtensorMap Q,
                 unsigned int o_tmp_2[4];
                 int o_row_base_2 = q_row * 128;
                 int m_local_r_2 = m0_local;
-                __nv_bfloat162 _bit_cast_src_156 = __float22bfloat162_rn(make_float2(acc_1[0], acc_1[1]));
-                o_vec_2[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_156)[0];
-                __nv_bfloat162 _bit_cast_src_157 = __float22bfloat162_rn(make_float2(acc_1[4], acc_1[5]));
-                o_vec_2[1] = reinterpret_cast<unsigned int*>(&_bit_cast_src_157)[0];
-                __nv_bfloat162 _bit_cast_src_158 = __float22bfloat162_rn(make_float2(acc_1[8], acc_1[9]));
-                o_vec_2[2] = reinterpret_cast<unsigned int*>(&_bit_cast_src_158)[0];
-                __nv_bfloat162 _bit_cast_src_159 = __float22bfloat162_rn(make_float2(acc_1[12], acc_1[13]));
-                o_vec_2[3] = reinterpret_cast<unsigned int*>(&_bit_cast_src_159)[0];
-                unsigned int _shfl_xor_sync_160 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[1], 1);
-                o_tmp_2[0] = _shfl_xor_sync_160;
-                unsigned int _shfl_xor_sync_161 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[0], 1);
-                o_tmp_2[1] = _shfl_xor_sync_161;
-                unsigned int _shfl_xor_sync_162 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[3], 1);
-                o_tmp_2[2] = _shfl_xor_sync_162;
-                unsigned int _shfl_xor_sync_163 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[2], 1);
-                o_tmp_2[3] = _shfl_xor_sync_163;
+                __nv_bfloat162 _bit_cast_src_174 = __float22bfloat162_rn(make_float2(acc_1[0], acc_1[1]));
+                o_vec_2[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_174)[0];
+                __nv_bfloat162 _bit_cast_src_175 = __float22bfloat162_rn(make_float2(acc_1[4], acc_1[5]));
+                o_vec_2[1] = reinterpret_cast<unsigned int*>(&_bit_cast_src_175)[0];
+                __nv_bfloat162 _bit_cast_src_176 = __float22bfloat162_rn(make_float2(acc_1[8], acc_1[9]));
+                o_vec_2[2] = reinterpret_cast<unsigned int*>(&_bit_cast_src_176)[0];
+                __nv_bfloat162 _bit_cast_src_177 = __float22bfloat162_rn(make_float2(acc_1[12], acc_1[13]));
+                o_vec_2[3] = reinterpret_cast<unsigned int*>(&_bit_cast_src_177)[0];
+                unsigned int _shfl_xor_sync_178 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[1], 1);
+                o_tmp_2[0] = _shfl_xor_sync_178;
+                unsigned int _shfl_xor_sync_179 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[0], 1);
+                o_tmp_2[1] = _shfl_xor_sync_179;
+                unsigned int _shfl_xor_sync_180 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[3], 1);
+                o_tmp_2[2] = _shfl_xor_sync_180;
+                unsigned int _shfl_xor_sync_181 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[2], 1);
+                o_tmp_2[3] = _shfl_xor_sync_181;
                 o_vec_2[0] = ((qj1_2 != 0) ? o_tmp_2[0] : o_vec_2[0]);
                 o_vec_2[1] = ((qj1_2 == 0) ? o_tmp_2[1] : o_vec_2[1]);
                 o_vec_2[2] = ((qj1_2 != 0) ? o_tmp_2[2] : o_vec_2[2]);
                 o_vec_2[3] = ((qj1_2 == 0) ? o_tmp_2[3] : o_vec_2[3]);
-                unsigned int _shfl_xor_sync_164 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[2], 2);
-                o_tmp_2[0] = _shfl_xor_sync_164;
-                unsigned int _shfl_xor_sync_165 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[3], 2);
-                o_tmp_2[1] = _shfl_xor_sync_165;
-                unsigned int _shfl_xor_sync_166 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[0], 2);
-                o_tmp_2[2] = _shfl_xor_sync_166;
-                unsigned int _shfl_xor_sync_167 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[1], 2);
-                o_tmp_2[3] = _shfl_xor_sync_167;
+                unsigned int _shfl_xor_sync_182 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[2], 2);
+                o_tmp_2[0] = _shfl_xor_sync_182;
+                unsigned int _shfl_xor_sync_183 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[3], 2);
+                o_tmp_2[1] = _shfl_xor_sync_183;
+                unsigned int _shfl_xor_sync_184 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[0], 2);
+                o_tmp_2[2] = _shfl_xor_sync_184;
+                unsigned int _shfl_xor_sync_185 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[1], 2);
+                o_tmp_2[3] = _shfl_xor_sync_185;
                 o_vec_2[0] = ((qj2_2 != 0) ? o_tmp_2[0] : o_vec_2[0]);
                 o_vec_2[1] = ((qj2_2 != 0) ? o_tmp_2[1] : o_vec_2[1]);
                 o_vec_2[2] = ((qj2_2 == 0) ? o_tmp_2[2] : o_vec_2[2]);
@@ -2446,34 +2502,34 @@ kernel_cake_vsa_sm90_6ef70e9d44dd4f5aaefb(const __grid_constant__ CUtensorMap Q,
                 int o_off_3 = o_row_base_2 + m_local_r_2 * 128 + (4 * sset_1 + qj) * 8;
                 reinterpret_cast<int4*>(O + o_off_3)[0] = reinterpret_cast<int4*>(o_vec_2)[0];
                 int m_local_r_0_2 = m1_local;
-                __nv_bfloat162 _bit_cast_src_168 = __float22bfloat162_rn(make_float2(acc_1[2], acc_1[3]));
-                o_vec_2[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_168)[0];
-                __nv_bfloat162 _bit_cast_src_169 = __float22bfloat162_rn(make_float2(acc_1[6], acc_1[7]));
-                o_vec_2[1] = reinterpret_cast<unsigned int*>(&_bit_cast_src_169)[0];
-                __nv_bfloat162 _bit_cast_src_170 = __float22bfloat162_rn(make_float2(acc_1[10], acc_1[11]));
-                o_vec_2[2] = reinterpret_cast<unsigned int*>(&_bit_cast_src_170)[0];
-                __nv_bfloat162 _bit_cast_src_171 = __float22bfloat162_rn(make_float2(acc_1[14], acc_1[15]));
-                o_vec_2[3] = reinterpret_cast<unsigned int*>(&_bit_cast_src_171)[0];
-                unsigned int _shfl_xor_sync_172 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[1], 1);
-                o_tmp_2[0] = _shfl_xor_sync_172;
-                unsigned int _shfl_xor_sync_173 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[0], 1);
-                o_tmp_2[1] = _shfl_xor_sync_173;
-                unsigned int _shfl_xor_sync_174 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[3], 1);
-                o_tmp_2[2] = _shfl_xor_sync_174;
-                unsigned int _shfl_xor_sync_175 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[2], 1);
-                o_tmp_2[3] = _shfl_xor_sync_175;
+                __nv_bfloat162 _bit_cast_src_186 = __float22bfloat162_rn(make_float2(acc_1[2], acc_1[3]));
+                o_vec_2[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_186)[0];
+                __nv_bfloat162 _bit_cast_src_187 = __float22bfloat162_rn(make_float2(acc_1[6], acc_1[7]));
+                o_vec_2[1] = reinterpret_cast<unsigned int*>(&_bit_cast_src_187)[0];
+                __nv_bfloat162 _bit_cast_src_188 = __float22bfloat162_rn(make_float2(acc_1[10], acc_1[11]));
+                o_vec_2[2] = reinterpret_cast<unsigned int*>(&_bit_cast_src_188)[0];
+                __nv_bfloat162 _bit_cast_src_189 = __float22bfloat162_rn(make_float2(acc_1[14], acc_1[15]));
+                o_vec_2[3] = reinterpret_cast<unsigned int*>(&_bit_cast_src_189)[0];
+                unsigned int _shfl_xor_sync_190 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[1], 1);
+                o_tmp_2[0] = _shfl_xor_sync_190;
+                unsigned int _shfl_xor_sync_191 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[0], 1);
+                o_tmp_2[1] = _shfl_xor_sync_191;
+                unsigned int _shfl_xor_sync_192 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[3], 1);
+                o_tmp_2[2] = _shfl_xor_sync_192;
+                unsigned int _shfl_xor_sync_193 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[2], 1);
+                o_tmp_2[3] = _shfl_xor_sync_193;
                 o_vec_2[0] = ((qj1_2 != 0) ? o_tmp_2[0] : o_vec_2[0]);
                 o_vec_2[1] = ((qj1_2 == 0) ? o_tmp_2[1] : o_vec_2[1]);
                 o_vec_2[2] = ((qj1_2 != 0) ? o_tmp_2[2] : o_vec_2[2]);
                 o_vec_2[3] = ((qj1_2 == 0) ? o_tmp_2[3] : o_vec_2[3]);
-                unsigned int _shfl_xor_sync_176 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[2], 2);
-                o_tmp_2[0] = _shfl_xor_sync_176;
-                unsigned int _shfl_xor_sync_177 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[3], 2);
-                o_tmp_2[1] = _shfl_xor_sync_177;
-                unsigned int _shfl_xor_sync_178 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[0], 2);
-                o_tmp_2[2] = _shfl_xor_sync_178;
-                unsigned int _shfl_xor_sync_179 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[1], 2);
-                o_tmp_2[3] = _shfl_xor_sync_179;
+                unsigned int _shfl_xor_sync_194 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[2], 2);
+                o_tmp_2[0] = _shfl_xor_sync_194;
+                unsigned int _shfl_xor_sync_195 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[3], 2);
+                o_tmp_2[1] = _shfl_xor_sync_195;
+                unsigned int _shfl_xor_sync_196 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[0], 2);
+                o_tmp_2[2] = _shfl_xor_sync_196;
+                unsigned int _shfl_xor_sync_197 = __shfl_xor_sync(0xFFFFFFFF, o_vec_2[1], 2);
+                o_tmp_2[3] = _shfl_xor_sync_197;
                 o_vec_2[0] = ((qj2_2 != 0) ? o_tmp_2[0] : o_vec_2[0]);
                 o_vec_2[1] = ((qj2_2 != 0) ? o_tmp_2[1] : o_vec_2[1]);
                 o_vec_2[2] = ((qj2_2 == 0) ? o_tmp_2[2] : o_vec_2[2]);
@@ -2567,34 +2623,34 @@ kernel_cake_vsa_sm90_6ef70e9d44dd4f5aaefb(const __grid_constant__ CUtensorMap Q,
                 unsigned int o_tmp_3[4];
                 int o_row_base_3 = q_row * 128;
                 int m_local_r_3 = m0_local;
-                __nv_bfloat162 _bit_cast_src_180 = __float22bfloat162_rn(make_float2(acc_1[0], acc_1[1]));
-                o_vec_3[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_180)[0];
-                __nv_bfloat162 _bit_cast_src_181 = __float22bfloat162_rn(make_float2(acc_1[4], acc_1[5]));
-                o_vec_3[1] = reinterpret_cast<unsigned int*>(&_bit_cast_src_181)[0];
-                __nv_bfloat162 _bit_cast_src_182 = __float22bfloat162_rn(make_float2(acc_1[8], acc_1[9]));
-                o_vec_3[2] = reinterpret_cast<unsigned int*>(&_bit_cast_src_182)[0];
-                __nv_bfloat162 _bit_cast_src_183 = __float22bfloat162_rn(make_float2(acc_1[12], acc_1[13]));
-                o_vec_3[3] = reinterpret_cast<unsigned int*>(&_bit_cast_src_183)[0];
-                unsigned int _shfl_xor_sync_184 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[1], 1);
-                o_tmp_3[0] = _shfl_xor_sync_184;
-                unsigned int _shfl_xor_sync_185 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[0], 1);
-                o_tmp_3[1] = _shfl_xor_sync_185;
-                unsigned int _shfl_xor_sync_186 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[3], 1);
-                o_tmp_3[2] = _shfl_xor_sync_186;
-                unsigned int _shfl_xor_sync_187 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[2], 1);
-                o_tmp_3[3] = _shfl_xor_sync_187;
+                __nv_bfloat162 _bit_cast_src_198 = __float22bfloat162_rn(make_float2(acc_1[0], acc_1[1]));
+                o_vec_3[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_198)[0];
+                __nv_bfloat162 _bit_cast_src_199 = __float22bfloat162_rn(make_float2(acc_1[4], acc_1[5]));
+                o_vec_3[1] = reinterpret_cast<unsigned int*>(&_bit_cast_src_199)[0];
+                __nv_bfloat162 _bit_cast_src_200 = __float22bfloat162_rn(make_float2(acc_1[8], acc_1[9]));
+                o_vec_3[2] = reinterpret_cast<unsigned int*>(&_bit_cast_src_200)[0];
+                __nv_bfloat162 _bit_cast_src_201 = __float22bfloat162_rn(make_float2(acc_1[12], acc_1[13]));
+                o_vec_3[3] = reinterpret_cast<unsigned int*>(&_bit_cast_src_201)[0];
+                unsigned int _shfl_xor_sync_202 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[1], 1);
+                o_tmp_3[0] = _shfl_xor_sync_202;
+                unsigned int _shfl_xor_sync_203 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[0], 1);
+                o_tmp_3[1] = _shfl_xor_sync_203;
+                unsigned int _shfl_xor_sync_204 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[3], 1);
+                o_tmp_3[2] = _shfl_xor_sync_204;
+                unsigned int _shfl_xor_sync_205 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[2], 1);
+                o_tmp_3[3] = _shfl_xor_sync_205;
                 o_vec_3[0] = ((qj1_3 != 0) ? o_tmp_3[0] : o_vec_3[0]);
                 o_vec_3[1] = ((qj1_3 == 0) ? o_tmp_3[1] : o_vec_3[1]);
                 o_vec_3[2] = ((qj1_3 != 0) ? o_tmp_3[2] : o_vec_3[2]);
                 o_vec_3[3] = ((qj1_3 == 0) ? o_tmp_3[3] : o_vec_3[3]);
-                unsigned int _shfl_xor_sync_188 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[2], 2);
-                o_tmp_3[0] = _shfl_xor_sync_188;
-                unsigned int _shfl_xor_sync_189 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[3], 2);
-                o_tmp_3[1] = _shfl_xor_sync_189;
-                unsigned int _shfl_xor_sync_190 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[0], 2);
-                o_tmp_3[2] = _shfl_xor_sync_190;
-                unsigned int _shfl_xor_sync_191 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[1], 2);
-                o_tmp_3[3] = _shfl_xor_sync_191;
+                unsigned int _shfl_xor_sync_206 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[2], 2);
+                o_tmp_3[0] = _shfl_xor_sync_206;
+                unsigned int _shfl_xor_sync_207 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[3], 2);
+                o_tmp_3[1] = _shfl_xor_sync_207;
+                unsigned int _shfl_xor_sync_208 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[0], 2);
+                o_tmp_3[2] = _shfl_xor_sync_208;
+                unsigned int _shfl_xor_sync_209 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[1], 2);
+                o_tmp_3[3] = _shfl_xor_sync_209;
                 o_vec_3[0] = ((qj2_3 != 0) ? o_tmp_3[0] : o_vec_3[0]);
                 o_vec_3[1] = ((qj2_3 != 0) ? o_tmp_3[1] : o_vec_3[1]);
                 o_vec_3[2] = ((qj2_3 == 0) ? o_tmp_3[2] : o_vec_3[2]);
@@ -2602,34 +2658,34 @@ kernel_cake_vsa_sm90_6ef70e9d44dd4f5aaefb(const __grid_constant__ CUtensorMap Q,
                 int o_off_4 = o_row_base_3 + m_local_r_3 * 128 + (4 * sset_0_1 + qj) * 8;
                 reinterpret_cast<int4*>(O + o_off_4)[0] = reinterpret_cast<int4*>(o_vec_3)[0];
                 int m_local_r_0_3 = m1_local;
-                __nv_bfloat162 _bit_cast_src_192 = __float22bfloat162_rn(make_float2(acc_1[2], acc_1[3]));
-                o_vec_3[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_192)[0];
-                __nv_bfloat162 _bit_cast_src_193 = __float22bfloat162_rn(make_float2(acc_1[6], acc_1[7]));
-                o_vec_3[1] = reinterpret_cast<unsigned int*>(&_bit_cast_src_193)[0];
-                __nv_bfloat162 _bit_cast_src_194 = __float22bfloat162_rn(make_float2(acc_1[10], acc_1[11]));
-                o_vec_3[2] = reinterpret_cast<unsigned int*>(&_bit_cast_src_194)[0];
-                __nv_bfloat162 _bit_cast_src_195 = __float22bfloat162_rn(make_float2(acc_1[14], acc_1[15]));
-                o_vec_3[3] = reinterpret_cast<unsigned int*>(&_bit_cast_src_195)[0];
-                unsigned int _shfl_xor_sync_196 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[1], 1);
-                o_tmp_3[0] = _shfl_xor_sync_196;
-                unsigned int _shfl_xor_sync_197 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[0], 1);
-                o_tmp_3[1] = _shfl_xor_sync_197;
-                unsigned int _shfl_xor_sync_198 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[3], 1);
-                o_tmp_3[2] = _shfl_xor_sync_198;
-                unsigned int _shfl_xor_sync_199 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[2], 1);
-                o_tmp_3[3] = _shfl_xor_sync_199;
+                __nv_bfloat162 _bit_cast_src_210 = __float22bfloat162_rn(make_float2(acc_1[2], acc_1[3]));
+                o_vec_3[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_210)[0];
+                __nv_bfloat162 _bit_cast_src_211 = __float22bfloat162_rn(make_float2(acc_1[6], acc_1[7]));
+                o_vec_3[1] = reinterpret_cast<unsigned int*>(&_bit_cast_src_211)[0];
+                __nv_bfloat162 _bit_cast_src_212 = __float22bfloat162_rn(make_float2(acc_1[10], acc_1[11]));
+                o_vec_3[2] = reinterpret_cast<unsigned int*>(&_bit_cast_src_212)[0];
+                __nv_bfloat162 _bit_cast_src_213 = __float22bfloat162_rn(make_float2(acc_1[14], acc_1[15]));
+                o_vec_3[3] = reinterpret_cast<unsigned int*>(&_bit_cast_src_213)[0];
+                unsigned int _shfl_xor_sync_214 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[1], 1);
+                o_tmp_3[0] = _shfl_xor_sync_214;
+                unsigned int _shfl_xor_sync_215 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[0], 1);
+                o_tmp_3[1] = _shfl_xor_sync_215;
+                unsigned int _shfl_xor_sync_216 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[3], 1);
+                o_tmp_3[2] = _shfl_xor_sync_216;
+                unsigned int _shfl_xor_sync_217 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[2], 1);
+                o_tmp_3[3] = _shfl_xor_sync_217;
                 o_vec_3[0] = ((qj1_3 != 0) ? o_tmp_3[0] : o_vec_3[0]);
                 o_vec_3[1] = ((qj1_3 == 0) ? o_tmp_3[1] : o_vec_3[1]);
                 o_vec_3[2] = ((qj1_3 != 0) ? o_tmp_3[2] : o_vec_3[2]);
                 o_vec_3[3] = ((qj1_3 == 0) ? o_tmp_3[3] : o_vec_3[3]);
-                unsigned int _shfl_xor_sync_200 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[2], 2);
-                o_tmp_3[0] = _shfl_xor_sync_200;
-                unsigned int _shfl_xor_sync_201 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[3], 2);
-                o_tmp_3[1] = _shfl_xor_sync_201;
-                unsigned int _shfl_xor_sync_202 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[0], 2);
-                o_tmp_3[2] = _shfl_xor_sync_202;
-                unsigned int _shfl_xor_sync_203 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[1], 2);
-                o_tmp_3[3] = _shfl_xor_sync_203;
+                unsigned int _shfl_xor_sync_218 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[2], 2);
+                o_tmp_3[0] = _shfl_xor_sync_218;
+                unsigned int _shfl_xor_sync_219 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[3], 2);
+                o_tmp_3[1] = _shfl_xor_sync_219;
+                unsigned int _shfl_xor_sync_220 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[0], 2);
+                o_tmp_3[2] = _shfl_xor_sync_220;
+                unsigned int _shfl_xor_sync_221 = __shfl_xor_sync(0xFFFFFFFF, o_vec_3[1], 2);
+                o_tmp_3[3] = _shfl_xor_sync_221;
                 o_vec_3[0] = ((qj2_3 != 0) ? o_tmp_3[0] : o_vec_3[0]);
                 o_vec_3[1] = ((qj2_3 != 0) ? o_tmp_3[1] : o_vec_3[1]);
                 o_vec_3[2] = ((qj2_3 == 0) ? o_tmp_3[2] : o_vec_3[2]);

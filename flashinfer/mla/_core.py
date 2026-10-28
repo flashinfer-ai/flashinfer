@@ -32,6 +32,7 @@ from flashinfer.autotuner import (
 from ..api_logging import flashinfer_api, flashinfer_experimental_api
 from ..trace.templates.attention import (
     trtllm_batch_decode_mla_trace_dispatch,
+    trtllm_batch_decode_sparse_mla_dsv4_trace_dispatch,
     xqa_batch_decode_mla_trace,
 )
 from ..utils import (
@@ -1816,6 +1817,7 @@ def convert_compressed_page_aligned_sparse_indices_to_hca_metadata(
     )
 
 
+@flashinfer_api(trace=trtllm_batch_decode_sparse_mla_dsv4_trace_dispatch)
 def trtllm_batch_decode_sparse_mla_dsv4(
     query: torch.Tensor,
     swa_kv_cache: torch.Tensor,
@@ -2148,15 +2150,6 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         yet include the 128 SWA slots (``128``) or shrink every row uniformly.
         Combined with ``extra_sparse_topk_lens`` the implied 128 is added on
         top of this value.
-
-    Returns
-    -------
-    torch.Tensor or tuple[torch.Tensor, torch.Tensor]
-        The existing BF16 output when RopeQuant is disabled. With RopeQuant,
-        returns ``(out_fp8, out_scale)``. ``out_fp8`` has shape
-        ``[sum_q, 16, 4096]`` and group-major strides
-        ``(4096, sum_q * 4096, 1)``; ``out_scale`` uses the packed UE8M0
-        layout described above.
     multi_ctas_kv_counter_buffer : Optional[torch.Tensor]
         Caller-owned, zero-initialized ``uint8`` buffer for the TRTLLM-GEN
         multi-CTA KV split semaphores, sized by
@@ -2199,6 +2192,15 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         "cake"`` rejects them). Footer and inline caches cannot be told apart
         from their shapes, so the format must name the layout the cache was
         written in.
+
+    Returns
+    -------
+    torch.Tensor or tuple[torch.Tensor, torch.Tensor]
+        The existing BF16 output when RopeQuant is disabled. With RopeQuant,
+        returns ``(out_fp8, out_scale)``. ``out_fp8`` has shape
+        ``[sum_q, 16, 4096]`` and group-major strides
+        ``(4096, sum_q * 4096, 1)``; ``out_scale`` uses the packed UE8M0
+        layout described above.
     """
     backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
     _check_dsv4_kv_cache_format_backend(
@@ -4661,8 +4663,9 @@ def nvfp4_sparse_mla_decode(
         ``[num_tokens, 16, 512]`` ``torch.bfloat16`` output; allocated when omitted.
     num_ctas_per_token : Optional[int]
         Thread-block cluster size per query token: 3 to 8 with ``backend="cuda"``, 1 to 6 or 8 with
-        ``backend="cake"`` (7 is rejected). By default, the largest size whose ``num_tokens`` clusters all fit
-        on the device in one wave.
+        ``backend="cake"`` (7 is rejected). By default, among the sizes whose ``num_tokens`` clusters all fit
+        on the device in one wave, ``backend="cuda"`` takes the largest and ``backend="cake"`` the one with
+        the least work per CTA.
     backend : str
         ``"cuda"`` (default), the hand-written kernel, or ``"cake"``, the generated program of the same
         operator (``flashinfer/experimental/nvfp4_sparse_mla_decode/cake_backend.py``).

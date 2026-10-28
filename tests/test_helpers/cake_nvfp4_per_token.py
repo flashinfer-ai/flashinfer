@@ -21,7 +21,9 @@ fold)`` rows the quantizer and the GEMM were validated on (the matrix the
 package README describes), and :func:`required_kernel_keys` runs the
 backend's own planner (``cake_backend.quant_plan`` / ``cake_backend.gemm_plan``)
 over those rows to enumerate the kernels the matrix launches on one
-architecture at its validated SM count (:data:`ARCH_SM_COUNT`).  The tests in
+architecture at its validated SM count (:data:`ARCH_SM_COUNT`); a plan that runs
+the nearest registered program stands for the unregistered key it replaces
+(``unregistered_key``), so the matrix never relies on that fallback.  The tests in
 ``tests/gemm/test_cake_mm_fp4.py`` and
 ``tests/quantization/test_cake_nvfp4_quantize.py`` assert that every such key
 is registered in ``cake_jit.KERNELS``; nothing in the package reads these
@@ -122,9 +124,10 @@ def required_kernel_keys(arch: str, sm_count: Optional[int] = None) -> tuple[str
         sm_count = ARCH_SM_COUNT[arch]
     keys: list[str] = []
     for kind, k, n, m, x_bf16, out_f16, fold in validated_problems():
-        plan_keys = [quant_plan(m, k, x_bf16, fold, arch, sm_count).kernel_key]
+        plans = [quant_plan(m, k, x_bf16, fold, arch, sm_count)]
         if kind == "gemm":
-            plan_keys.append(gemm_plan(m, n, k, out_f16, arch, sm_count).kernel_key)
+            plans.append(gemm_plan(m, n, k, out_f16, arch, sm_count))
+        plan_keys = [plan.unregistered_key or plan.kernel_key for plan in plans]
         for key in plan_keys:
             if key not in keys:
                 keys.append(key)

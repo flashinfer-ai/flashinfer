@@ -46,6 +46,12 @@ owns dispatch, expert compute, and combine; output is always BF16
 | `sm90_bf16_bf16_bf16_push_cake` | BF16 | BF16 | BF16 | SM90 | — (`capacity_factor`, `dedup_dispatch`, optional `clamp_limit`, `combine_wire` = `prereduced` (default: one pre-reduced bf16 row per (token, source rank), deterministic rank-ordered fp32 sum) or `per_route`; native BF16 end to end: bf16 dispatch payload, Cake-generated WGMMA FC1/FC2 with fp32 accumulation, bf16 combine wire) |
 | `sm120_mxfp4_mxfp8_bf16_cake` | MXFP8 (E4M3, block-32 UE8M0) | MXFP4 (E2M1, block-32 UE8M0); optional FP8 E4M3 shared expert | BF16 | SM120 | `transport_table` per EP-rank pair (`all_gin` default; `lsa_where_reachable` / `all_lsa` / explicit tuple: LSA copier CTAs over NVLink / PCIe P2P); `"tuned"` → offline winner from `torchrun --nproc_per_node=<EP> -m flashinfer.moe_ep.tune --dtype sm120_mxfp4_mxfp8` in `FLASHINFER_MOE_EP_KNOB_CACHE`; `"auto"` → setup probe. Compile-time `swiglu_limit`, `codec_overflow_blocks`; one Cake-generated parametric persistent kernel (dispatch, FC1 + SwiGLU, FP8 requant, FC2, return, weighted combine) JIT-compiled per (EP, E, H, I, top-k, capacity), DeepSeek-V4-Flash EP4/EP8 instances in AOT; graph token buckets via `stage_inputs(compile_tokens_per_rank=...)` |
 
+The `sm100_bf16_nvfp4_bf16_cutedsl` backend is the W4A16 variant: expert
+weights remain packed NVFP4 and expert activations remain BF16, including
+the FC1-to-FC2 handoff. For more on this backend's design and performance, see
+[Faster-than-light NVFP4 decode—with precision](https://humansand.ai/blog/faster-than-light-nvfp4-decode)
+by Ziang Li at humans& ai.
+
 The SM90 pull-style CuTeDSL tree is process-exclusive with the SM100 CuTeDSL
 tree (module names collide). Weight inputs are canonical BF16 `MoEWeightPack`
 by default (the FP8 backend quantizes at `preprocess_weights`, the BF16 twin
@@ -411,8 +417,9 @@ classDiagram
 **Mega weights:** with `preprocess_weights=True` (default), canonical bf16 or pre-quantized `MoEWeightPack` is transformed at init. With `preprocess_weights=False`, supply `MegaConfig.transformed_weights` (from `preprocess_*_mega_weights`).
 
 BF16×NVFP4 stages BF16 inputs and defaults to ordered FP32 combine inside MegaMoE.
-Routing weights apply after FC2 by default; `apply_topk_in_fc1=True` applies them
-before the BF16 FC1 handoff, with a different rounding contract.
+Routing weights apply after FC2 by default;
+`apply_routing_weights_before_fc2=True` applies them before the BF16 FC1
+handoff, with a different rounding contract.
 
 **Mega activations:** with `quantize_input=True` (default), bf16 `[T, hidden]` is quantized into symm workspace at forward. Non-bf16 with `quantize_input=True` raises `MoEEpConfigError`; use `quantize_input=False` and pre-quantized activations plus `MoEEpTensors.scales`.
 BF16-activation backends ignore `quantize_input` and copy BF16 inputs.

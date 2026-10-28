@@ -39,6 +39,345 @@ NVFP4_BLOCK = 16
 NVFP4_MODES = ("w4a4", "w4a16")
 
 
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    "kind,intermediate",
+    [("nvfp4", 192), ("nvfp4", 96), ("mxfp8_e4m3", 192), ("mxfp8_e5m2", 192)],
+)
+@pytest.mark.parametrize("early", [True, False])
+@pytest.mark.parametrize("capacity", [1, 129])
+def test_blackwell_standard_provider_graph(
+    kind, intermediate, early, capacity, monkeypatch
+):
+    """Check the exported standard kernel against staged bytes and changing routes."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("requires SM100/SM103")
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+
+    torch.manual_seed(9911)
+    cfg = pkg.Sm100BlockScaledMoeConfig(
+        num_total_experts=8,
+        max_tokens_per_rank=capacity,
+        num_topk=3,
+        hidden=384,
+        intermediate=intermediate,
+        rank=0,
+        world_size=1,
+        quant_kind=kind,
+        apply_routing_weights_before_fc2=early,
+    )
+    ws = pkg.Sm100BlockScaledSymmBuffer(cfg)
+    graph = None
+    try:
+        weights = pkg.preprocess_block_scaled_weights(
+            (
+                torch.randn(8, 2 * intermediate, 384, device="cuda") / 384**0.5
+            ).bfloat16(),
+            (
+                torch.randn(8, 384, intermediate, device="cuda") / intermediate**0.5
+            ).bfloat16(),
+            quant_kind=kind,
+            intermediate_size=intermediate,
+        )
+        x = torch.randn(capacity, 384, device="cuda")
+        data, scales = (
+            pkg.quantize_nvfp4_block16(x)
+            if kind == "nvfp4"
+            else pkg.quantize_mxfp8_block32(
+                x, torch.float8_e5m2 if kind == "mxfp8_e5m2" else torch.float8_e4m3fn
+            )
+        )
+        ws.x[:capacity].view(torch.uint8).copy_(data.view(torch.uint8))
+        ws.x_sf[:capacity, : scales.shape[1]].view(torch.uint8).copy_(
+            scales.view(torch.uint8)
+        )
+        ids = (
+            torch.arange(capacity * 3, device="cuda", dtype=torch.int32).reshape(-1, 3)
+            % 8
+        )
+        scores = torch.linspace(0.1, 0.9, capacity * 3, device="cuda").reshape_as(ids)
+        ws.topk_idx[:capacity].copy_(ids)
+        ws.topk_weights[:capacity].copy_(scores)
+        ws.note_staged_tokens(capacity)
+        thunk = pkg.sm100_block_scaled_mega_launch_thunk(*weights, ws)
+        thunk()
+        torch.cuda.synchronize()
+        indices, expected = pkg.sampled_reference(
+            ws, *weights, capacity, sample_size=min(capacity, 32)
+        )
+        assert (
+            pkg.output_error(ws.output_activation[:capacity], indices, expected) < 0.025
+        )
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            thunk()
+        for state in ("holes", "empty", "last", "restore"):
+            valid = torch.ones_like(ids, dtype=torch.bool)
+            if state == "holes":
+                valid.view(-1)[::3] = False
+            if state in ("empty", "last"):
+                valid.zero_()
+            if state == "last":
+                valid[-1, -1] = True
+            ws.topk_idx[:capacity].copy_(ids).masked_fill_(~valid, -1)
+            ws.topk_weights[:capacity].copy_(scores).masked_fill_(~valid, float("nan"))
+            for _ in range(3):
+                graph.replay()
+            torch.cuda.synchronize()
+            indices, expected = pkg.sampled_reference(
+                ws, *weights, capacity, sample_size=min(capacity, 32)
+            )
+            assert (
+                pkg.output_error(ws.output_activation[:capacity], indices, expected)
+                < 0.025
+            ), state
+    finally:
+        if graph is not None:
+            graph.reset()
+        ws.destroy()
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
+@pytest.mark.parametrize("scalar", ["fc1_alpha", "fc2_alpha", "fc1_norm_const"])
+def test_blackwell_standard_global_scales(kind, scalar, monkeypatch):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("requires SM100/SM103")
+    import cutlass.cute as cute
+
+    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    cfg = pkg.Sm100BlockScaledMoeConfig(
+        num_total_experts=8,
+        max_tokens_per_rank=1,
+        num_topk=3,
+        hidden=384,
+        intermediate=192,
+        rank=0,
+        world_size=1,
+        quant_kind=kind,
+    )
+    ws = pkg.Sm100BlockScaledSymmBuffer(cfg)
+    try:
+        weights = pkg.preprocess_block_scaled_weights(
+            torch.zeros(8, 384, 384, device="cuda", dtype=torch.bfloat16),
+            torch.zeros(8, 384, 192, device="cuda", dtype=torch.bfloat16),
+            quant_kind=kind,
+            intermediate_size=192,
+        )
+        kwargs = ws._runtime_kwargs(*weights)
+        if kind == "nvfp4":
+            kwargs[scalar] = None
+            message = f"requires {scalar}"
+        else:
+            from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim.block_scaled import (
+                _to_cute,
+            )
+
+            scale = torch.ones(8, device="cuda", dtype=torch.float32)
+            kwargs[scalar] = _to_cute(scale, assumed_align=4)
+            message = f"{scalar} must be None"
+        with pytest.raises(Exception, match=message):
+            cute.compile(ws.kernel, **kwargs)
+    finally:
+        ws.destroy()
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("persistent", [False, True])
+def test_blackwell_standard_nvfp4_padded_aot(monkeypatch, persistent):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("requires SM100/SM103")
+    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+    from functools import partial
+    import cutlass.torch as cutlass_torch
+
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    monkeypatch.setattr(
+        cutlass_torch,
+        "from_dlpack",
+        partial(cutlass_torch.from_dlpack, enable_tvm_ffi=True),
+    )
+    cfg = pkg.Sm100BlockScaledMoeConfig(
+        num_total_experts=8,
+        max_tokens_per_rank=1,
+        num_topk=3,
+        hidden=384,
+        intermediate=96,
+        rank=0,
+        world_size=1,
+        quant_kind="nvfp4",
+        use_persistent_finalize_kernel=persistent,
+        enable_fc1_activation_per_token_scale=persistent,
+    )
+    ws = pkg.Sm100BlockScaledSymmBuffer(
+        cfg,
+        num_valid_tokens_tensor=torch.ones(1, dtype=torch.int32, device="cuda")
+        if persistent
+        else None,
+    )
+    try:
+        loaded = ws.kernel.aot_compile()
+        weights = pkg.preprocess_block_scaled_weights(
+            torch.zeros(8, 192, 384, device="cuda", dtype=torch.bfloat16),
+            torch.zeros(8, 384, 96, device="cuda", dtype=torch.bfloat16),
+            quant_kind="nvfp4",
+            intermediate_size=96,
+        )
+        loaded(**ws._runtime_kwargs(*weights))
+        torch.cuda.synchronize()
+        assert torch.count_nonzero(ws.output_activation[:1]) == 0
+    finally:
+        ws.destroy()
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
+def test_blackwell_standard_max_topk(kind, monkeypatch):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("requires SM100/SM103")
+    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    torch.manual_seed(7731)
+    cfg = pkg.Sm100BlockScaledMoeConfig(
+        num_total_experts=512,
+        max_tokens_per_rank=1,
+        num_topk=256,
+        hidden=384,
+        intermediate=192,
+        rank=0,
+        world_size=1,
+        quant_kind=kind,
+    )
+    ws = pkg.Sm100BlockScaledSymmBuffer(cfg)
+    graph = None
+    try:
+        weights = pkg.preprocess_block_scaled_weights(
+            (torch.randn(512, 384, 384, device="cuda") / 384**0.5).bfloat16(),
+            (torch.randn(512, 384, 192, device="cuda") / 192**0.5).bfloat16(),
+            quant_kind=kind,
+            intermediate_size=192,
+        )
+        x = torch.randn(1, 384, device="cuda")
+        data, scales = (
+            pkg.quantize_nvfp4_block16(x)
+            if kind == "nvfp4"
+            else pkg.quantize_mxfp8_block32(
+                x, torch.float8_e5m2 if kind == "mxfp8_e5m2" else torch.float8_e4m3fn
+            )
+        )
+        ws.x[0].view(torch.uint8).copy_(data[0].view(torch.uint8))
+        ws.x_sf[0, : scales.shape[1]].view(torch.uint8).copy_(
+            scales[0].view(torch.uint8)
+        )
+        ws.topk_idx[0].copy_(torch.arange(256, device="cuda", dtype=torch.int32))
+        ws.topk_weights[0].fill_(1 / 256)
+        ws.note_staged_tokens(1)
+        thunk = pkg.sm100_block_scaled_mega_launch_thunk(*weights, ws)
+        thunk()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            thunk()
+        for _ in range(3):
+            graph.replay()
+        torch.cuda.synchronize()
+        indices, expected = pkg.sampled_reference(ws, *weights, 1, sample_size=1)
+        assert pkg.output_error(ws.output_activation[:1], indices, expected) < 0.025
+    finally:
+        if graph is not None:
+            graph.reset()
+        ws.destroy()
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
+@pytest.mark.parametrize("fused", [True, False])
+def test_blackwell_standard_backend_staging(kind, fused, monkeypatch):
+    """Exercise registered dispatch, shared staging, and repeated batch sizes."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("requires SM100/SM103")
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    monkeypatch.setenv("FLASHINFER_MEGA_FUSED_STAGE", "1" if fused else "0")
+    from flashinfer import moe_ep
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
+
+    nvfp4 = kind == "nvfp4"
+    config_type = (
+        moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+        if nvfp4
+        else moe_ep.Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
+    )
+    config = config_type(
+        intermediate_size=192,
+        top_k=3,
+        kernel_name="sm100_"
+        + ("nvfp4_nvfp4" if nvfp4 else "mxfp8_mxfp8")
+        + "_bf16_cutedsl_next",
+        **({} if nvfp4 else {"kind": kind}),
+    )
+    backend = create_mega_kernel(config)
+    bootstrap = moe_ep.BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False)
+    fleet = moe_ep.FleetParams(
+        num_experts=8, max_tokens_per_rank=129, token_hidden_size=384
+    )
+    backend.validate_init(bootstrap, fleet)
+    torch.manual_seed(8821)
+    weights = backend.preprocess_weights(
+        moe_ep.MoEWeightPack(
+            (torch.randn(8, 384, 384, device="cuda") / 384**0.5).bfloat16(),
+            (torch.randn(8, 384, 192, device="cuda") / 192**0.5).bfloat16(),
+        ),
+        fleet,
+    )
+    backend.validate_transformed_weights(weights, bootstrap, fleet)
+    ws = backend.prepare_workspace(bootstrap, fleet)
+    try:
+        for count in (129, 1, 65, 0, 17):
+            inputs = moe_ep.MoEEpTensors(
+                hidden_states=torch.randn(
+                    count, 384, device="cuda", dtype=torch.bfloat16
+                ),
+                topk_ids=torch.arange(
+                    count * 3, device="cuda", dtype=torch.int64
+                ).reshape(-1, 3)
+                % 8,
+                topk_weights=torch.full((count, 3), 1 / 3, device="cuda"),
+            )
+            backend.validate_forward(inputs, fleet, quantize_input=True)
+            backend.stage_inputs(inputs, ws, quantize_input=True)
+            output = backend.compute(ws, weights, output=None)
+            torch.cuda.synchronize()
+            assert output.shape == (count, 384)
+            assert (ws.topk_idx[count:] == -1).all()
+            if count:
+                indices, expected = pkg.sampled_reference(
+                    ws, *weights, count, sample_size=min(count, 32)
+                )
+                assert pkg.output_error(output, indices, expected) < 0.025
+    finally:
+        backend.destroy(ws)
+
+
 def _run_blackwell_genphase_graph(rank, world, capacity, early, tile_n, cluster_m):
     """Native reference plus changing-route graph replay for the GenPhase prototype."""
     import torch.distributed as dist
@@ -65,7 +404,7 @@ def _run_blackwell_genphase_graph(rank, world, capacity, early, tile_n, cluster_
         intermediate=intermediate,
         rank=rank,
         world_size=world,
-        apply_topk_at_fc1=early,
+        apply_routing_weights_before_fc2=early,
         mma_tiler_mnk=(256, tile_n, 128),
         cluster_shape_mn=(cluster_m, 1),
     )
@@ -397,7 +736,7 @@ def _torch_nvfp4_mega_reference(
     fc2_alpha=None,  # (E,) fp32 per-expert or None (identity)
     fc1_norm_const=None,  # (E,) fp32 per-expert or None (1.0)
 ):
-    """Pure-torch NVFP4 MegaMoE oracle (apply_topk_in_fc1=True graph).
+    """Pure-torch NVFP4 MegaMoE oracle (routing weights applied before FC2).
 
     Mirrors the kernel's data path — dequant → fp32 fc1 GEMM → 16-interleaved
     gated activation → per-token topk weight folded in BEFORE the fc1-out
@@ -482,7 +821,7 @@ def _torch_nvfp4_mega_reference(
             up = up + beta
         activated = (gate * up).reshape(m, intermediate)
 
-        # apply_topk_in_fc1=True: weight folded in before the fp4 round-trip
+        # Weight folded in before the fp4 round-trip.
         # (post-hoc weighting would NOT match — quant changes the magnitude).
         activated = activated * topk_weights[tokens, slots].unsqueeze(-1)
 
@@ -617,17 +956,25 @@ def test_nvfp4_preprocess_fp4_weights_match_plain_quant(
 
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
-    "mode,tile_n,in_kernel_fc2_reduce,token_back_mode,apply_topk_in_fc1",
+    "mode,tile_n,in_kernel_fc2_reduce,token_back_mode,apply_routing_weights_before_fc2",
     [
-        (mode, 128, False, token_back_mode, apply_topk_in_fc1)
+        (mode, 128, False, token_back_mode, apply_routing_weights_before_fc2)
         for mode in NVFP4_MODES
         for token_back_mode in ("epi_warps", "reuse_dispatch_warps")
-        for apply_topk_in_fc1 in ([False, True] if mode == "w4a16" else [False])
+        for apply_routing_weights_before_fc2 in (
+            [False, True] if mode == "w4a16" else [False]
+        )
     ]
     + [
-        ("w4a16", tile_n, True, "reuse_dispatch_warps", apply_topk_in_fc1)
+        (
+            "w4a16",
+            tile_n,
+            True,
+            "reuse_dispatch_warps",
+            apply_routing_weights_before_fc2,
+        )
         for tile_n in (64, 128)
-        for apply_topk_in_fc1 in (False, True)
+        for apply_routing_weights_before_fc2 in (False, True)
     ],
 )
 @pytest.mark.parametrize(
@@ -647,7 +994,7 @@ def test_nvfp4_kernel_matches_torch_reference(
     tile_n,
     in_kernel_fc2_reduce,
     token_back_mode,
-    apply_topk_in_fc1,
+    apply_routing_weights_before_fc2,
     hidden,
     intermediate,
     num_experts,
@@ -660,7 +1007,7 @@ def test_nvfp4_kernel_matches_torch_reference(
         tile_n=tile_n,
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         token_back_mode=token_back_mode,
-        apply_topk_in_fc1=apply_topk_in_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         hidden=hidden,
         intermediate=intermediate,
         num_experts=num_experts,
@@ -679,7 +1026,7 @@ def test_nvfp4_w4a4_swiglu_parameters(monkeypatch, token_back_mode, activation_c
         tile_n=128,
         in_kernel_fc2_reduce=False,
         token_back_mode=token_back_mode,
-        apply_topk_in_fc1=False,
+        apply_routing_weights_before_fc2=False,
         hidden=2048,
         intermediate=1024,
         num_experts=4,
@@ -707,7 +1054,7 @@ def test_nvfp4_w4a4_situ_parameters(
         tile_n=128,
         in_kernel_fc2_reduce=False,
         token_back_mode=token_back_mode,
-        apply_topk_in_fc1=False,
+        apply_routing_weights_before_fc2=False,
         hidden=hidden,
         intermediate=intermediate,
         num_experts=num_experts,
@@ -725,7 +1072,7 @@ def _check_nvfp4_kernel_matches_torch_reference(
     tile_n,
     in_kernel_fc2_reduce,
     token_back_mode,
-    apply_topk_in_fc1,
+    apply_routing_weights_before_fc2,
     hidden,
     intermediate,
     num_experts,
@@ -800,7 +1147,7 @@ def _check_nvfp4_kernel_matches_torch_reference(
     if mode == "w4a4":
         pack = MoEWeightPack(w13=problem["w13"], w2=problem["w2"])
     elif mode == "w4a16":
-        from .w4a16_reference import make_w4a16_weights
+        from tests.test_helpers.w4a16_reference import make_w4a16_weights
 
         pack = make_w4a16_weights(hidden, intermediate, num_experts)
     transformed_l1, transformed_l2 = preprocess_mega_weights(
@@ -847,7 +1194,7 @@ def _check_nvfp4_kernel_matches_torch_reference(
         fc2_alpha=alpha2,
         knobs=knobs,
         **(
-            {"apply_topk_in_fc1": apply_topk_in_fc1}
+            {"apply_routing_weights_before_fc2": (apply_routing_weights_before_fc2)}
             if mode == "w4a16"
             else dict(
                 swiglu_alpha=activation_pairs[0][0],
@@ -902,7 +1249,7 @@ def _check_nvfp4_kernel_matches_torch_reference(
                     mode=mode,
                     fc1_alpha=alpha1,
                     fc2_alpha=alpha2,
-                    apply_topk_in_fc1=apply_topk_in_fc1,
+                    apply_routing_weights_before_fc2=(apply_routing_weights_before_fc2),
                     in_kernel_fc2_reduce=in_kernel_fc2_reduce,
                 )
 
@@ -965,7 +1312,7 @@ def _assert_nvfp4_reference(y_kernel, reference, *, mode, in_kernel_fc2_reduce=F
                 y_kernel, reference, ikr=True, label="w4a16 atomic BF16 combine"
             )
         else:
-            from .w4a16_reference import assert_w4a16_bits
+            from tests.test_helpers.w4a16_reference import assert_w4a16_bits
 
             assert_w4a16_bits(y_kernel, reference)
         return
@@ -997,7 +1344,7 @@ def _nvfp4_reference_from_weights(
     fc1_alpha=None,
     fc2_alpha=None,
     fc1_norm_const=None,
-    apply_topk_in_fc1=False,
+    apply_routing_weights_before_fc2=False,
     in_kernel_fc2_reduce=False,
 ):
     """Shared oracle input assembly from canonical prequantized weight packs."""
@@ -1006,7 +1353,7 @@ def _nvfp4_reference_from_weights(
     assert mode in NVFP4_MODES, mode
     assert isinstance(weights, PrequantizedMoEWeights), type(weights)
     if mode == "w4a16":
-        from .w4a16_reference import w4a16_reference
+        from tests.test_helpers.w4a16_reference import w4a16_reference
 
         return w4a16_reference(
             problem,
@@ -1014,12 +1361,12 @@ def _nvfp4_reference_from_weights(
             fc1_alpha=fc1_alpha,
             fc2_alpha=fc2_alpha,
             fc1_norm_const=fc1_norm_const,
-            apply_topk_in_fc1=apply_topk_in_fc1,
+            apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
             in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         )
     assert mode == "w4a4"
     assert fc1_alpha is None and fc2_alpha is None and fc1_norm_const is None
-    assert not apply_topk_in_fc1
+    assert not apply_routing_weights_before_fc2
     import torch
     from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.weights import (
         _interleave_gate_up_16,
@@ -1068,7 +1415,7 @@ def test_nvfp4_w4a16_fp32_scales_and_routing(
         Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
 
-    from .w4a16_reference import assert_w4a16_bits
+    from tests.test_helpers.w4a16_reference import assert_w4a16_bits
 
     _require_cuda()
     monkeypatch.setenv("MEGA_NO_DIST", "1")

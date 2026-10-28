@@ -92,7 +92,7 @@ kernel_cake_kda_train_47a9c058e6d6c78c166d(float* __restrict__ dg_in, float* __r
     int clen_setup = chunk_len[chunk_s];
     if (__syncthreads_and(clen_setup == 0)) return;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int bx = blockIdx.x;
     int by = blockIdx.y;
     int nbx = (int)gridDim.x;

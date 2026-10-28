@@ -8,6 +8,8 @@ from unittest import mock
 
 import pytest
 
+from flashinfer.moe_ep import FinalizeMode
+
 
 def _fake_deep_gemm_transformed(
     *,
@@ -243,8 +245,8 @@ def test_live_profile_pool_shares_only_equal_tactics(monkeypatch, tmp_path):
     config = moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=128,
         top_k=2,
-        do_finalize=False,
-        apply_topk_in_fc1=False,
+        finalize_mode=FinalizeMode.NONE,
+        apply_routing_weights_before_fc2=False,
     )
     backend = create_mega_kernel(config)
     backend.bind_ep_bootstrap(
@@ -262,7 +264,7 @@ def test_live_profile_pool_shares_only_equal_tactics(monkeypatch, tmp_path):
             topk=2,
             max_tokens=64,
             live_tokens=live,
-            defer_topk_reduce=True,
+            use_custom_finalize=True,
         )
     assert backend.live_token_buckets(fleet) == [8, 16, 32]
     keys = [
@@ -457,7 +459,9 @@ def test_unfinalized_output_requires_explicit_backend_opt_in():
     from flashinfer.moe_ep import MoEEpConfigError
 
     layer, _, _ = _make_layer()
-    with pytest.raises(MoEEpConfigError, match="do_finalize=False"):
+    with pytest.raises(
+        MoEEpConfigError, match="requires finalize_mode=FinalizeMode.NONE"
+    ):
         layer.forward_unfinalized(_inputs(8))
     layer._kernel.supports_unfinalized_output = True
     with pytest.raises(MoEEpConfigError, match="requires forward_unfinalized"):
@@ -465,10 +469,10 @@ def test_unfinalized_output_requires_explicit_backend_opt_in():
     layer.destroy()
 
 
-@pytest.mark.parametrize("apply_topk_in_fc1", [False, True])
+@pytest.mark.parametrize("apply_routing_weights_before_fc2", [False, True])
 @pytest.mark.parametrize("backend", ["nvfp4", "bf16", "w4a16"])
 def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
-    monkeypatch, backend, apply_topk_in_fc1
+    monkeypatch, backend, apply_routing_weights_before_fc2
 ):
     """Remaining weights and identity indices reuse storage across live sizes."""
     import torch
@@ -489,19 +493,21 @@ def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
     raw = SimpleNamespace(
         x=torch.empty(capacity, hidden, dtype=torch.bfloat16),
         hidden=hidden,
-        combine_output=partials,
+        output_activation=None,
         topk_idx=torch.empty(capacity, top_k, dtype=torch.int32),
         topk_weights=torch.randn(capacity, top_k, dtype=torch.float32),
         _frontend=mock.Mock(),
         _staging_inputs=None,
     )
-    raw._frontend.config.apply_topk_in_fc1 = apply_topk_in_fc1
-    options = {"apply_topk_in_fc1": apply_topk_in_fc1}
+    raw._frontend.config.apply_routing_weights_before_fc2 = (
+        apply_routing_weights_before_fc2
+    )
+    options = {"apply_routing_weights_before_fc2": apply_routing_weights_before_fc2}
     allocate = mock.Mock(return_value=raw)
     if backend == "nvfp4":
         config_cls = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
         monkeypatch.setattr(cutedsl_megamoe, "get_symm_buffer_for_mega_moe", allocate)
-        raw._frontend.deferred_topk_reduce_workspace.return_value = (
+        raw._frontend.custom_finalize_workspace.return_value = (
             partials,
             partials,
             None,
@@ -509,12 +515,16 @@ def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
         launch = mock.Mock()
     elif backend == "bf16":
         config_cls = Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig
-        options = {"knobs": {"apply_topk_in_fc1": apply_topk_in_fc1}}
         monkeypatch.setattr(
             cutedsl_megamoe, "get_symm_buffer_for_bf16_mega_moe", allocate
         )
         launch = raw._frontend.run
-        launch.side_effect = lambda inputs, *, num_tokens: partials[:num_tokens]
+        launch.side_effect = lambda inputs, *, num_tokens: None
+        raw._frontend.custom_finalize_workspace.return_value = (
+            partials,
+            partials,
+            None,
+        )
     else:
         config_cls = Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
         monkeypatch.setattr(
@@ -528,7 +538,7 @@ def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
         config_cls(
             intermediate_size=128,
             top_k=top_k,
-            do_finalize=False,
+            finalize_mode=FinalizeMode.NONE,
             **options,
         )
     )
@@ -538,7 +548,7 @@ def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
     workspace = kernel._allocate_workspace(FleetParams(2, capacity, hidden))
     assert workspace is raw
     if backend != "bf16":
-        assert allocate.call_args.kwargs["defer_topk_reduce"]
+        assert allocate.call_args.kwargs["use_custom_finalize"]
     assert kernel.supports_unfinalized_output
     with pytest.raises(ValueError, match="requires compute_unfinalized"):
         kernel.compute(workspace, (), output=None)
@@ -576,7 +586,7 @@ def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
         assert indices.flatten().tolist() == list(range(live_tokens * top_k))
         expected_weights = (
             torch.full((live_tokens, top_k), 1.0)
-            if apply_topk_in_fc1
+            if apply_routing_weights_before_fc2
             else raw.topk_weights[:live_tokens]
         )
         torch.testing.assert_close(weights, expected_weights)
@@ -586,85 +596,35 @@ def test_unfinalized_output_borrows_route_metadata_and_launches_empty_batches(
     assert launch.call_count == 3
 
 
-@pytest.mark.parametrize("apply_topk_in_fc1", [False, True])
-def test_nvfp4_unfinalized_weights_follow_resolved_knobs(
-    monkeypatch, apply_topk_in_fc1
-):
-    import torch
-
-    from flashinfer import moe_ep
-    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe
-    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import nvfp4
-
-    def byte_view(shape, dtype):
-        tensor = torch.zeros(shape, dtype=torch.uint8)
-        return tensor, tensor
-
-    monkeypatch.setattr(nvfp4, "_sym_zeros_byte_view", byte_view)
-    monkeypatch.setattr(
-        nvfp4, "sym_zeros", lambda shape, dtype: torch.zeros(shape, dtype=dtype)
-    )
-    monkeypatch.setattr(
-        nvfp4,
-        "_resolve_per_expert_epilogue",
-        lambda name, value, count: torch.ones(count),
-    )
-    kernel = create_mega_kernel(
-        moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
-            intermediate_size=128,
-            top_k=2,
-            do_finalize=False,
-            apply_topk_in_fc1=apply_topk_in_fc1,
-            knobs={"apply_topk_in_fc1": not apply_topk_in_fc1},
-        )
-    )
-    kernel.bind_ep_bootstrap(
-        moe_ep.BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False)
-    )
-    workspace = kernel._allocate_workspace(moe_ep.FleetParams(2, 1, 128))
-    frontend = workspace._frontend
-    assert frontend.config.apply_topk_in_fc1 is not apply_topk_in_fc1
-    workspace.topk_weights.copy_(torch.tensor([[0.25, 0.75]]))
-    partials = torch.tensor([1.0, 2.0]).view(1, 2, 1).expand(1, 2, 128).clone()
-    if frontend.config.apply_topk_in_fc1:
-        partials *= workspace.topk_weights.unsqueeze(-1)
-    monkeypatch.setattr(
-        frontend, "deferred_topk_reduce_workspace", lambda: (partials, partials, None)
-    )
-    monkeypatch.setattr(
-        kernel, "_prepared_thunk_state", lambda *args: (None, lambda: None, None)
-    )
-    monkeypatch.setattr(cutedsl_megamoe, "staged_tokens", lambda _: 1)
-
-    rows, weights, indices = kernel.compute_unfinalized(workspace, ())
-    reduced = (rows[indices.long()] * weights.unsqueeze(-1)).sum(dim=1)
-    torch.testing.assert_close(reduced, torch.full((1, 128), 1.75))
-
-
-def test_nvfp4_deferred_output_rejects_knobs_that_disable_it(monkeypatch):
+@pytest.mark.parametrize(
+    "knobs",
+    [
+        {"apply_routing_weights_before_fc2": False},
+        {"use_custom_finalize": False},
+        {"use_persistent_finalize_kernel": True},
+    ],
+)
+def test_nvfp4_knobs_reject_explicit_config_fields(monkeypatch, knobs):
     from flashinfer import moe_ep
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
     from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import nvfp4
 
     allocate = mock.Mock(
-        side_effect=AssertionError("allocation before mode validation")
+        side_effect=AssertionError("allocation before knob validation")
     )
     monkeypatch.setattr(nvfp4, "_sym_zeros_byte_view", allocate)
     kernel = create_mega_kernel(
         moe_ep.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
             intermediate_size=128,
             top_k=2,
-            do_finalize=False,
-            knobs={"defer_topk_reduce": False},
+            finalize_mode=FinalizeMode.NONE,
+            knobs=knobs,
         )
     )
     kernel.bind_ep_bootstrap(
         moe_ep.BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False)
     )
-    with pytest.raises(
-        ValueError, match="defer_topk_reduce=True cannot be disabled by knobs"
-    ):
+    with pytest.raises(ValueError, match="explicit config fields"):
         kernel._allocate_workspace(moe_ep.FleetParams(2, 1, 128))
     allocate.assert_not_called()
 
@@ -691,7 +651,9 @@ def test_finalized_and_unfinalized_workspaces_have_distinct_pool_keys(
     )
     config = getattr(moe_ep, config_name)(intermediate_size=128, top_k=2)
     finalized = create_mega_kernel(config)
-    unfinalized = create_mega_kernel(dataclasses.replace(config, do_finalize=False))
+    unfinalized = create_mega_kernel(
+        dataclasses.replace(config, finalize_mode=FinalizeMode.NONE)
+    )
     bootstrap = moe_ep.BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False)
     finalized.bind_ep_bootstrap(bootstrap)
     unfinalized.bind_ep_bootstrap(bootstrap)
@@ -700,7 +662,7 @@ def test_finalized_and_unfinalized_workspaces_have_distinct_pool_keys(
     assert finalized._workspace_pool_key(fleet) != unfinalized._workspace_pool_key(
         fleet
     )
-    with pytest.raises(ValueError, match="requires do_finalize=False"):
+    with pytest.raises(ValueError, match="requires finalize_mode=NONE"):
         finalized.compute_unfinalized(None, ())
 
 
@@ -713,7 +675,7 @@ def test_w4a16_unfinalized_launch_failure_releases_staging_sources(monkeypatch):
 
     kernel = create_mega_kernel(
         Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
-            intermediate_size=128, top_k=2, do_finalize=False
+            intermediate_size=128, top_k=2, finalize_mode=FinalizeMode.NONE
         )
     )
     workspace = SimpleNamespace(_staging_inputs=(torch.empty(3, 128),))
@@ -1034,6 +996,94 @@ def test_create_workspace_rejects_mutable_auto_tuning_state():
     layer.destroy()
 
 
+@pytest.mark.parametrize("supports_live_profiles", [False, True])
+def test_auto_handles_and_default_replacement_retain_old_storage(
+    supports_live_profiles,
+):
+    from flashinfer.moe_ep import MoEEpConfigError
+
+    layer, transformed, _ = _make_layer()
+    layer._megakernel_config = SimpleNamespace(knobs="auto")
+    layer._kernel.supports_auto_workspaces = True
+    layer._kernel.supports_live_token_tuning = supports_live_profiles
+    if not supports_live_profiles:
+        with pytest.raises(MoEEpConfigError, match="live-token tuning"):
+            layer.create_workspace(64, live_tokens=8, knobs={})
+    first_raw = object()
+    with (
+        mock.patch.object(layer._kernel, "validate_init"),
+        mock.patch.object(
+            layer._kernel, "prepare_workspace", return_value=first_raw
+        ) as allocate,
+        pytest.warns(UserWarning, match="live_tokens is ignored for automatic tuning"),
+    ):
+        first = layer.create_workspace(64, live_tokens=8)
+    allocate.assert_called_once()
+    assert first.live_tokens == 8
+    second, second_raw, _, _ = _create_workspace(layer, 64)
+    assert first_raw is not second_raw
+    assert layer._resolve_workspace(first)[1] is first_raw
+    assert layer._resolve_workspace(second)[1] is second_raw
+    layer._bootstrap_validated = True
+    replacement = object()
+    with (
+        mock.patch.object(layer._kernel, "validate_forward"),
+        mock.patch.object(
+            layer._kernel, "coordinate_workspace_replacement", return_value=True
+        ),
+        mock.patch.object(layer._kernel, "prepare_workspace", return_value=replacement),
+        mock.patch.object(layer._kernel, "destroy") as destroy,
+    ):
+        _, selected, _, _, weights = layer._prepare_inputs(_inputs(8))
+        assert selected is replacement and weights is transformed
+        assert first._backend_workspace is first_raw and not first.is_destroyed
+        assert second._backend_workspace is second_raw and not second.is_destroyed
+        destroy.assert_not_called()
+        first.destroy()
+        destroy.assert_called_once_with(first_raw)
+        assert layer._ensure_workspace() is replacement
+        layer.destroy()
+        assert destroy.call_count == 3
+
+
+@pytest.mark.parametrize("dummy_warmup", [False, True])
+def test_default_replacement_keeps_implicit_workspace_until_layer_destroy(dummy_warmup):
+    import torch
+
+    layer, _, _ = _make_layer()
+    layer._bootstrap_validated = True
+    original, replacement = object(), object()
+    layer._workspace = original
+    with (
+        mock.patch.object(layer._kernel, "validate_forward"),
+        mock.patch.object(
+            layer._kernel, "coordinate_workspace_replacement", return_value=True
+        ),
+        mock.patch.object(layer._kernel, "prepare_workspace", return_value=replacement),
+        mock.patch.object(layer._kernel, "destroy") as destroy,
+    ):
+        if dummy_warmup:
+            with (
+                mock.patch("torch.cuda.current_device", return_value=0),
+                mock.patch("torch.device", return_value=torch.device("cpu")),
+                mock.patch("torch.cuda.synchronize"),
+                mock.patch.object(
+                    layer,
+                    "forward",
+                    side_effect=lambda t, **kwargs: layer._prepare_inputs(t),
+                ),
+            ):
+                layer.warmup()
+            assert id(replacement) not in layer._forward_signatures
+        else:
+            assert layer._prepare_inputs(_inputs(8))[1] is replacement
+        assert layer._workspace is replacement
+        assert layer._retired_tuning_workspaces == [original]
+        destroy.assert_not_called()
+        layer.destroy()
+        assert destroy.call_args_list == [mock.call(replacement), mock.call(original)]
+
+
 def test_nvfp4_recompiled_workspace_releases_obsolete_launch_scratch(monkeypatch):
     """Recompiling one profile releases its old scratch and preserves its peers."""
     import weakref
@@ -1059,7 +1109,7 @@ def test_nvfp4_recompiled_workspace_releases_obsolete_launch_scratch(monkeypatch
     def workspace(value):
         frontend = SimpleNamespace(
             _mega=session(value),
-            config=SimpleNamespace(defer_topk_reduce=False),
+            config=SimpleNamespace(use_custom_finalize=False),
             set_swiglu_params=lambda *args: None,
         )
         raw = SimpleNamespace(_frontend=frontend, output_activation=torch.empty(1, 128))

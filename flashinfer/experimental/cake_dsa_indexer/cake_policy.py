@@ -26,7 +26,12 @@ record of the architecture (``cake_jit.POLICY[arch]``); this module evaluates
 the record.  It depends on nothing but the standard library so that the
 generated-program export can run the very same code against the kernel's own
 dispatch functions before a record is frozen (a disagreement fails the export,
-never the user).
+never the user).  A record may give the wide program precedence over the
+three-warpgroup rule from ``wide_first_rule[0]`` mean unit tiles on, and the
+CTA pair serves the unit geometries of ``pair_units`` only.  A record may also
+replace the sampled rank shift from a ``top_k`` of ``sample_shift_rule[0]`` on
+(``sample_shift_for``); an explicit ``sample_shift_permille`` knob still
+overrides it.
 
 Nothing here reads device memory: the segment boundaries stay on the device
 and the dispatch sees only host-known integers.  The chosen program never
@@ -50,24 +55,34 @@ POLICY_FIELDS = (
     "candidate_slack",  # minimum headroom above top_k before a buffer can be compacted
     "cand_mult_rule",  # [min mean unit tiles, multiplier] for long-unit calls, or None
     "cand_cap_floor",  # minimum candidate slots per (warpgroup, query), or None
+    "candidate_multiplier_unsampled",  # capacity multiplier when the sampled first threshold is off
+    "cand_mult_rule_unsampled",  # its [min mean unit tiles, multiplier] long-unit rule, or None
+    "cand_cap_floor_unsampled",  # its minimum candidate slots, or None
+    "cand_cap_ceiling",  # most candidate slots the default multiplier requests per (warpgroup, query), or None; lowers the multiplier, the floor and top_k + slack still hold
+    "cand_cap_ceiling_unsampled",  # its ceiling when the sampled first threshold is off, or None
     "l6_rule",  # [max mean unit tiles, min top_k] of the three-warpgroup program, or None
     "wide_rule",  # [min wide rounds per CTA, min rounds x mean unit tiles] of the wide program
+    "wide_first_rule",  # [min mean unit tiles] from which a wide-eligible call takes the wide program before the three-warpgroup rule, or None (the three-warpgroup rule first)
     "split_max",  # most key-range splits per unit
     "split_min_range_tiles",  # a split's key range is at least this many tiles
     "split_wave_rule",  # [min mean unit tiles, min CTA-efficiency gain] for a two-way split, or None
     "pair_rule",  # [min mean unit tiles, max mean unit tiles, min top_k] of the CTA-pair program, or None
+    "pair_units",  # unit geometries ("l6", "narrow", "wide") whose CTA-pair program the architecture registers; the pair rule applies to these units only
     "snake_default",  # snake unit order when no rule applies
     "snake_rule",  # [program kinds, min mean tiles, min mean tiles (ratio > 1), min unit-cost spread], or None
     "tile_unroll_default",  # tile-loop unroll when no rule applies
     "tile_unroll_factor",  # tile-loop unroll when the rule applies
     "tile_unroll_rule",  # [program kinds, min top_k, yields to the snake order], or None
     "sample_fit_max_mean_tiles",  # sampled first threshold on buffer-fitting units up to this mean tile count
+    "sample_fit_kinds",  # physical scan kinds whose sampled-fit program the architecture registers; every other kind runs its plain program
     "sample_tiles_max",  # sample-tile cap of long units (0 = no sampling)
     "sample_tiles_short_units",  # sample-tile cap of short units
     "sample_dispatch_mean_tiles_max",  # mean unit tiles up to which the short-unit cap applies
     "sample_tiles_tiny_units",  # sample-tile cap of tiny units (lever K3b)
     "sample_dispatch_tiny_tiles_max",  # mean unit tiles up to which the tiny-unit cap applies
     "sample_shift_permille",  # conservative shift of the sampled rank
+    "sample_shift_rule",  # [min top_k, shift permille] replacing sample_shift_permille from that top_k on, or None (the default shift on every call); an explicit sample_shift_permille knob overrides both
+    "far_sample",  # 1: the sampled first threshold of the ascending-tile-order programs ranks the far sample tiles only (the tile nearest the diagonal left out); 0: every sample tile
     "check_period_max",  # cap on the default selection-trigger check period (tiles)
     "check_period_knob_max",  # cap on an explicit check period (tiles)
     "check_period_cap_divisor",  # default period = cand_cap // divisor
@@ -102,11 +117,25 @@ POLICY_FIELDS = (
 
 KINDS = ("narrow", "wide", "l6", "split", "pair_narrow", "pair_wide", "pair_l6")
 UNITS = ("narrow", "wide", "l6")
+# Names of the compiled scan program kinds (the split program is one per unit geometry).
+PHYSICAL_KINDS = tuple(
+    sorted(set(KINDS) - {"split"} | {f"split_{unit}" for unit in UNITS})
+)
 MERGE_KEY = "merge"
+# Admissible sampled rank shift (permille): the backend's ``sample_shift_permille`` knob bound and the bound of a record's
+# ``sample_shift_rule`` shift.  Every value gives the same bits; the shift only sets how conservative the sampled first
+# threshold is.
+SAMPLE_SHIFT_PERMILLE_BOUNDS = (-1000, 10000)
+# Dynamic unit tickets (the sm_103a gate-warpgroup wide scan programs): the CTAs
+# draw their next work unit from the low u32 word of the first int64 behind the
+# candidate buffers (and behind the split staging), a 128-byte tail every plan's
+# workspace carries.  The host zeroes it right before the scan launch of those
+# programs (``cake_backend``); the other programs leave it unused.
+TICKET_TAIL_BYTES = 128
 
 _INT = ("tile_keys", "block_q_narrow", "block_q_wide", "block_q_l6", "candidate_entry_bytes", "candidate_multiplier",
-        "candidate_slack", "split_max", "split_min_range_tiles", "tile_unroll_default", "tile_unroll_factor",
-        "sample_tiles_max", "sample_tiles_short_units", "sample_tiles_tiny_units", "sample_shift_permille",
+        "candidate_multiplier_unsampled", "candidate_slack", "split_max", "split_min_range_tiles", "tile_unroll_default", "tile_unroll_factor",
+        "sample_tiles_max", "sample_tiles_short_units", "sample_tiles_tiny_units", "sample_shift_permille", "far_sample",
         "check_period_max", "check_period_knob_max", "check_period_cap_divisor", "finalize_items",
         "finalize_threads_small", "finalize_top_k_small", "finalize_threads", "rank_top_k_min",
         "rank_slab_window_max", "rank_bulk_align_bytes", "rank_persist_max_k", "rank_persist_ctas_per_sm")  # fmt: skip
@@ -126,14 +155,22 @@ _NUMBER = (
     "sample_dispatch_mean_tiles_max",
     "sample_dispatch_tiny_tiles_max",
 )
-_OPTIONAL_INT = ("cand_cap_floor",)
+_OPTIONAL_INT = (
+    "cand_cap_floor",
+    "cand_cap_floor_unsampled",
+    "cand_cap_ceiling",
+    "cand_cap_ceiling_unsampled",
+)
 _OPTIONAL_RULE = (
     "cand_mult_rule",
+    "cand_mult_rule_unsampled",
     "l6_rule",
+    "wide_first_rule",
     "split_wave_rule",
     "pair_rule",
     "snake_rule",
     "tile_unroll_rule",
+    "sample_shift_rule",
     "rank_rule",
     "rank_staged_rule",
     "rank_two_level_rule",
@@ -166,24 +203,34 @@ class DispatchPolicy:
     candidate_slack: int
     cand_mult_rule: Optional[list]
     cand_cap_floor: Optional[int]
+    candidate_multiplier_unsampled: int
+    cand_mult_rule_unsampled: Optional[list]
+    cand_cap_floor_unsampled: Optional[int]
+    cand_cap_ceiling: Optional[int]
+    cand_cap_ceiling_unsampled: Optional[int]
     l6_rule: Optional[list]
     wide_rule: list
+    wide_first_rule: Optional[list]
     split_max: int
     split_min_range_tiles: int
     split_wave_rule: Optional[list]
     pair_rule: Optional[list]
+    pair_units: list
     snake_default: bool
     snake_rule: Optional[list]
     tile_unroll_default: int
     tile_unroll_factor: int
     tile_unroll_rule: Optional[list]
     sample_fit_max_mean_tiles: float
+    sample_fit_kinds: list
     sample_tiles_max: int
     sample_tiles_short_units: int
     sample_dispatch_mean_tiles_max: float
     sample_tiles_tiny_units: int
     sample_dispatch_tiny_tiles_max: float
     sample_shift_permille: int
+    sample_shift_rule: Optional[list]
+    far_sample: int
     check_period_max: int
     check_period_knob_max: int
     check_period_cap_divisor: int
@@ -250,6 +297,38 @@ class DispatchPolicy:
         ):
             raise ValueError(
                 f"policy['wide_rule'] must be [min rounds, min work], got {raw['wide_rule']!r}"
+            )
+        first = raw["wide_first_rule"]
+        if first is not None and (
+            len(first) != 1 or not _is_number(first[0]) or first[0] < 0
+        ):
+            raise ValueError(
+                f"policy['wide_first_rule'] must be [min mean unit tiles] or None, got {first!r}"
+            )
+        pair_units = raw["pair_units"]
+        if (
+            not isinstance(pair_units, (list, tuple))
+            or not all(isinstance(u, str) and u in UNITS for u in pair_units)
+            or list(pair_units) != sorted(set(pair_units))
+        ):
+            raise ValueError(
+                f"policy['pair_units'] must be an ascending list of unit geometries {UNITS}, got {pair_units!r}"
+            )
+        if raw["pair_rule"] is not None and not pair_units:
+            raise ValueError(
+                "policy['pair_units'] must name at least one unit geometry when policy['pair_rule'] is set"
+            )
+        shift_lo, shift_hi = SAMPLE_SHIFT_PERMILLE_BOUNDS
+        shift_rule = raw["sample_shift_rule"]
+        if shift_rule is not None and (
+            len(shift_rule) != 2
+            or not _is_int(shift_rule[0])
+            or shift_rule[0] < 1
+            or not _is_int(shift_rule[1])
+            or not shift_lo <= shift_rule[1] <= shift_hi
+        ):
+            raise ValueError(
+                f"policy['sample_shift_rule'] must be [min top_k >= 1, shift permille in [{shift_lo}, {shift_hi}]] or None, got {shift_rule!r}"
             )
         if not isinstance(raw["check_period_kind_overrides"], dict):
             raise ValueError("policy['check_period_kind_overrides'] must be a mapping")
@@ -323,6 +402,27 @@ class DispatchPolicy:
             raise ValueError(
                 "policy['rank_t16_slots'] must be an ascending list of positive sort-slot counts divisible by 16"
             )
+        for floor_name, ceiling_name in (
+            ("cand_cap_floor", "cand_cap_ceiling"),
+            ("cand_cap_floor_unsampled", "cand_cap_ceiling_unsampled"),
+        ):
+            ceiling = raw[ceiling_name]
+            if ceiling is not None and (
+                ceiling <= 0
+                or (raw[floor_name] is not None and ceiling < raw[floor_name])
+            ):
+                raise ValueError(
+                    f"policy[{ceiling_name!r}] must be a positive slot count at or above policy[{floor_name!r}], got {ceiling!r}"
+                )
+        fit_kinds = raw["sample_fit_kinds"]
+        if (
+            not isinstance(fit_kinds, (list, tuple))
+            or not all(isinstance(k, str) and k in PHYSICAL_KINDS for k in fit_kinds)
+            or list(fit_kinds) != sorted(set(fit_kinds))
+        ):
+            raise ValueError(
+                f"policy['sample_fit_kinds'] must be an ascending list of physical scan kinds {PHYSICAL_KINDS}, got {fit_kinds!r}"
+            )
         if raw["rank_bulk_align_bytes"] % 4:
             raise ValueError(
                 "policy['rank_bulk_align_bytes'] must be a multiple of the 4-byte output element"
@@ -334,7 +434,8 @@ class DispatchPolicy:
         if raw["rank_persist_ctas_per_sm"] <= 0:
             raise ValueError("policy['rank_persist_ctas_per_sm'] must be positive")
         for name in ("tile_keys", "block_q_narrow", "block_q_wide", "block_q_l6", "candidate_entry_bytes",
-                     "candidate_multiplier", "candidate_slack", "split_max", "split_min_range_tiles",
+                     "candidate_multiplier", "candidate_multiplier_unsampled", "candidate_slack", "split_max",
+                     "split_min_range_tiles",
                      "tile_unroll_default", "tile_unroll_factor", "sample_tiles_short_units", "sample_tiles_tiny_units",
                      "check_period_max", "check_period_knob_max", "check_period_cap_divisor", "finalize_items",
                      "finalize_threads_small", "finalize_top_k_small", "finalize_threads", "rank_top_k_min",
@@ -345,6 +446,8 @@ class DispatchPolicy:
                 )
         if raw["sample_tiles_max"] < 0:
             raise ValueError("policy['sample_tiles_max'] must be >= 0")
+        if raw["far_sample"] not in (0, 1):
+            raise ValueError("policy['far_sample'] must be 0 or 1")
         values = dict(raw)
         for name in _OPTIONAL_RULE:
             if values[name] is not None:
@@ -365,6 +468,8 @@ class DispatchPolicy:
             int(v) for v in values["rank_two_level_window_variants"]
         ]
         values["rank_t16_slots"] = [int(v) for v in values["rank_t16_slots"]]
+        values["sample_fit_kinds"] = [str(k) for k in values["sample_fit_kinds"]]
+        values["pair_units"] = [str(u) for u in values["pair_units"]]
         values["check_period_kind_overrides"] = {
             str(k): int(v) for k, v in values["check_period_kind_overrides"].items()
         }
@@ -419,20 +524,54 @@ class DispatchPolicy:
             else self.sample_tiles_max
         )
 
+    def sample_shift_for(self, top_k: int) -> int:
+        """Conservative shift (permille) of the sampled rank for a call: ``sample_shift_rule[1]`` from the rule's
+        ``top_k`` floor on, else ``sample_shift_permille``.  Every value gives the same bits -- the shift only sets
+        how conservative the sampled first threshold is (a threshold that proves too aggressive is streamed again
+        exactly); an unsampled call (``sample_tiles_max=0``) never reads it."""
+        rule = self.sample_shift_rule
+        if rule is not None and int(top_k) >= int(rule[0]):
+            return int(rule[1])
+        return self.sample_shift_permille
+
     def cand_cap_multiplier_for(
-        self, num_queries: int, num_keys: int, num_segments: int, ratio: int, top_k: int
+        self,
+        num_queries: int,
+        num_keys: int,
+        num_segments: int,
+        ratio: int,
+        top_k: int,
+        sampled: bool = True,
     ) -> int:
-        mult = self.candidate_multiplier
-        rule = self.cand_mult_rule
+        """Capacity multiplier of a call: the sampled values by default, the ``*_unsampled`` values
+        when the sampled first threshold is off (``sample_tiles_max=0``), whose larger buffers would
+        only delay the first selection.  The long-unit rule replaces the multiplier, the floor raises it
+        and the ceiling lowers it (``cand_cap_ceiling // top_k``, so the buffer stops growing with
+        ``top_k`` once it holds the ceiling)."""
+        if sampled:
+            mult, rule, floor, ceiling = (
+                self.candidate_multiplier,
+                self.cand_mult_rule,
+                self.cand_cap_floor,
+                self.cand_cap_ceiling,
+            )
+        else:
+            mult, rule, floor, ceiling = (
+                self.candidate_multiplier_unsampled,
+                self.cand_mult_rule_unsampled,
+                self.cand_cap_floor_unsampled,
+                self.cand_cap_ceiling_unsampled,
+            )
         if rule is not None:
             if (
                 self.mean_unit_tiles(num_queries, num_keys, num_segments, ratio)
                 >= rule[0]
             ):
                 mult = int(rule[1])
-        floor = self.cand_cap_floor
         if floor is not None and int(top_k) * mult < int(floor):
             mult = -(-int(floor) // int(top_k))
+        if ceiling is not None and int(top_k) * mult > int(ceiling):
+            mult = max(1, int(ceiling) // int(top_k))
         return mult
 
     def candidate_capacity(self, top_k: int, multiplier: Optional[int] = None) -> int:
@@ -513,15 +652,15 @@ class DispatchPolicy:
         units_wide = -(-int(num_queries) // self.block_q_wide)
         rounds = units_wide / max(1, int(grid))
         mean_tiles = self.mean_unit_tiles(num_queries, num_keys, num_segments, ratio)
+        min_rounds, min_work = self.wide_rule
+        wide = rounds >= min_rounds and rounds * mean_tiles >= min_work
+        first = self.wide_first_rule
+        if wide and first is not None and mean_tiles >= first[0]:
+            return self.block_q_wide
         l6 = self.l6_rule
         if l6 is not None and mean_tiles <= l6[0] and int(top_k) >= int(l6[1]):
             return self.block_q_l6
-        min_rounds, min_work = self.wide_rule
-        return (
-            self.block_q_wide
-            if rounds >= min_rounds and rounds * mean_tiles >= min_work
-            else self.block_q_narrow
-        )
+        return self.block_q_wide if wide else self.block_q_narrow
 
     def n_split_for(
         self,
@@ -571,9 +710,15 @@ class DispatchPolicy:
         ratio: int,
         grid: int,
         top_k: int,
+        block_q: int,
     ) -> bool:
+        """The two-CTA multicast program of the chosen unit ``block_q``: the pair serves the unit geometries of
+        ``pair_units`` only (the units whose pair program the architecture registers), inside the ``pair_rule``
+        mean-tile interval and from its ``top_k`` floor, on a grid of at least two CTAs."""
         rule = self.pair_rule
         if rule is None or int(grid) < 2:
+            return False
+        if self.unit_name(block_q) not in self.pair_units:
             return False
         mean_tiles = self.mean_unit_tiles(num_queries, num_keys, num_segments, ratio)
         return rule[0] <= mean_tiles <= rule[1] and int(top_k) >= int(rule[2])
@@ -611,7 +756,13 @@ class DispatchPolicy:
         num_segments: int,
         ratio: int,
         cand_cap: int,
+        physical_kind: Optional[str] = None,
     ) -> bool:
+        """Sampled first threshold on buffer-fitting units: the mean unit is at most ``sample_fit_max_mean_tiles`` and
+        the mean segment offset leaves units that fit the capacity.  A program kind outside ``sample_fit_kinds`` has no
+        sampled-fit program registered and runs its plain program on every call (``physical_kind`` None: no kind gate)."""
+        if physical_kind is not None and physical_kind not in self.sample_fit_kinds:
+            return False
         mean_tiles = self.mean_unit_tiles(num_queries, num_keys, num_segments, ratio)
         offset_tiles = self.offset_tiles(num_queries, num_keys, num_segments, ratio)
         fit_tiles = int(cand_cap) // self.tile_keys - 1
@@ -904,6 +1055,7 @@ class ProgramChoice:
     grid_ctas: int  # launched persistent grid (even for the CTA-pair program)
     sample_tiles_max: int
     sample_shift_permille: int
+    far_sample: int
     cand_cap_multiplier: int
     cand_cap: int
     first_cap: int
@@ -976,6 +1128,7 @@ def select_program(
     check_period: Optional[int] = None,
     sample_tiles_max: Optional[int] = None,
     sample_shift_permille: Optional[int] = None,
+    far_sample: Optional[int] = None,
     finalize_threads: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
     outputs_aligned: bool = True,
@@ -984,9 +1137,13 @@ def select_program(
 
     The keyword knobs change the internal partition and scheduling only
     (results are bitwise identical for every admissible value); ``None`` takes
-    the policy's default.  ``max_seqlen_k`` (the call's bound on every key
+    the policy's default (``sample_shift_permille``: ``sample_shift_for`` of
+    the call's ``top_k``).  ``far_sample`` (``0`` or ``1``) is the far-sample
+    first threshold switch of the ascending-tile-order scan programs (the
+    descending-order and wide programs ignore it).  ``max_seqlen_k`` (the call's bound on every key
     segment, optional) sizes the rank finalize's bitmap pool under lever RW
-    (``rank_seg_window``); results are identical with and without it.  The finalize program is the prefix-popcount rank
+    (``rank_seg_window``); results are identical with and without it.  With the sampled first threshold off
+    (``sample_tiles_max=0``) the candidate capacity follows the record's ``*_unsampled`` values.  The finalize program is the prefix-popcount rank
     scatter where ``finalize_rank_for`` names a bitmap window for the call
     (``finalize_rank:t<threads>:w<window>``; ``:staged`` appended where ``finalize_rank_staged_for``
     admits its SMEM-staged form, lever FRS), else the CUB block radix sort
@@ -1011,26 +1168,30 @@ def select_program(
         else int(sample_tiles_max)
     )
     shift = (
-        policy.sample_shift_permille
+        policy.sample_shift_for(K)
         if sample_shift_permille is None
         else int(sample_shift_permille)
     )
+    far = policy.far_sample if far_sample is None else int(far_sample)
+    if far not in (0, 1):
+        raise ValueError(f"far_sample must be 0 or 1, got {far_sample!r}")
     mult = (
-        policy.cand_cap_multiplier_for(T, Tkv, S, r, K)
+        policy.cand_cap_multiplier_for(T, Tkv, S, r, K, sampled=tiles > 0)
         if candidate_multiplier is None
         else int(candidate_multiplier)
     )
     block_q = policy.unit_block_q_for(T, Tkv, S, r, grid, K)
     n_split = policy.n_split_for(T, Tkv, S, r, grid, block_q)
     split = n_split > 1
-    pair = (not split) and policy.pair_for(T, Tkv, S, r, grid, K)
+    pair = (not split) and policy.pair_for(T, Tkv, S, r, grid, K, block_q)
     kind = policy.program_kind(block_q, split, pair)
     unit = policy.unit_name(block_q)
     snake = policy.snake_for(kind, T, Tkv, S, r)
     unroll = policy.tile_unroll_for(kind, K, snake, block_q)
     grid_ctas = grid - grid % 2 if pair else grid
+    physical = physical_kind(kind, unit)
     cap = policy.candidate_capacity(K, mult)
-    fit = policy.sample_fit_for(T, Tkv, S, r, cap)
+    fit = policy.sample_fit_for(T, Tkv, S, r, cap, physical)
     if check_period is None:
         period = policy.check_period_for(K, cap, kind)
     else:
@@ -1077,6 +1238,7 @@ def select_program(
         grid_ctas=grid_ctas,
         sample_tiles_max=tiles,
         sample_shift_permille=shift,
+        far_sample=far,
         cand_cap_multiplier=mult,
         cand_cap=cap,
         first_cap=cap,
@@ -1087,7 +1249,7 @@ def select_program(
         split=split,
         pair=pair,
         kind=kind,
-        physical_kind=physical_kind(kind, unit),
+        physical_kind=physical,
         snake=snake,
         tile_unroll=unroll,
         sample_fit=fit,
@@ -1116,7 +1278,8 @@ def select_program(
         ),
         scan_entries=scan_entries,
         staging_entries=staging,
-        workspace_bytes=(scan_entries + staging) * policy.candidate_entry_bytes,
+        workspace_bytes=(scan_entries + staging) * policy.candidate_entry_bytes
+        + TICKET_TAIL_BYTES,
     )
 
 
@@ -1127,6 +1290,7 @@ __all__ = [
     "MERGE_KEY",
     "POLICY_FIELDS",
     "RANK_ITEMS_DEFAULT",
+    "SAMPLE_SHIFT_PERMILLE_BOUNDS",
     "UNITS",
     "DispatchPolicy",
     "ProgramChoice",

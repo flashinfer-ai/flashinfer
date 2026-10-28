@@ -348,8 +348,7 @@ kernel_cake_kda_train_0fb763e9a81e9066d776(const __grid_constant__ CUtensorMap m
             asm volatile("tcgen05.fence::before_thread_sync;");
             asm volatile("barrier.sync 1, 512;" ::: "memory");
             if (warp == 0) {
-                int _tmem_dealloc_addr = *((volatile int*)tmem_addr_storage);
-                asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(_tmem_dealloc_addr), "r"(512));
+                asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(512));
             }
         }
     }

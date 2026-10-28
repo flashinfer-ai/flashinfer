@@ -517,7 +517,7 @@ def _time_dispatch_and_combine(
             topk_ids,
             topk_weights,
             hidden_states_scale=hidden_states_scale,
-            max_tokens_per_rank=step_max_tokens,
+            runtime_max_tokens_per_rank=step_max_tokens,
         )
         return received.hidden_states
 
@@ -936,10 +936,11 @@ def main() -> None:
 
         for local_num_tokens in local_batch_sizes:
             step_max_tokens = max(_allgather(int(local_num_tokens)))
-            if not comm.is_workload_feasible(step_max_tokens):
+            if step_max_tokens > comm.params.max_tokens_per_rank:
                 _print_rank0(
                     f"[bench_moe_ep_comm] Skipping {backend_name} @ "
-                    f"local_batch_size={local_num_tokens}: workload not feasible."
+                    f"local_batch_size={local_num_tokens}: exceeds "
+                    f"max_tokens_per_rank={comm.params.max_tokens_per_rank}."
                 )
                 continue
             hidden_states, hidden_states_scale, topk_ids, topk_weights = _make_inputs(

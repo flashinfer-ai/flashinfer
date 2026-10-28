@@ -41,6 +41,7 @@ from .attention import (
     BatchPrefillWithCausalBidirectionalRangesWrapper as BatchPrefillWithCausalBidirectionalRangesWrapper,
 )
 from .autotune_cache import MeasurementPolicy as MeasurementPolicy
+from .autotune_cache import ReplayCoverage as ReplayCoverage
 from .autotune_cache import autotune_v2 as autotune_v2
 from .autotune_cache import autotune_v2_reload as autotune_v2_reload
 from .autotuner import autotune as autotune
@@ -282,6 +283,9 @@ from .cake_causal_conv1d_train import (
 from .cake_causal_conv1d_train import (
     cake_causal_conv1d_train_forward as cake_causal_conv1d_train_forward,
 )
+from .cake_causal_conv1d_train import (
+    cake_causal_conv1d_train_forward_workspace_bytes as cake_causal_conv1d_train_forward_workspace_bytes,
+)
 from .cake_mhc_train import CakeMHCTrainFinishFunction as CakeMHCTrainFinishFunction
 from .cake_mhc_train import CakeMHCTrainPrepareFunction as CakeMHCTrainPrepareFunction
 from .cake_mhc_train import (
@@ -375,6 +379,8 @@ from .prefill import (
 )
 from .quantization import packbits as packbits
 from .quantization import segment_packbits as segment_packbits
+from .qsa import qsa_forward as qsa_forward
+from .qsa import qsa_indexed_forward as qsa_indexed_forward
 from .rope import apply_llama31_rope as apply_llama31_rope
 from .rope import apply_llama31_rope_inplace as apply_llama31_rope_inplace
 from .rope import apply_llama31_rope_pos_ids as apply_llama31_rope_pos_ids

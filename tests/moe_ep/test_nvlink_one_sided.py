@@ -360,7 +360,7 @@ def _run_case(case: Case, rank: int) -> dict:
         BootstrapConfig(world_size=case.ep_size, rank=rank), params, config
     )
     try:
-        cft_enabled = one_sided and comm.cft_enabled
+        cft_enabled = one_sided and comm._cft_enabled
         if case.mode == "cft" and not cft_enabled:
             return {"skip": "CFT counted writes are unavailable on this platform"}
         launches: list = []
@@ -386,7 +386,7 @@ def _run_case(case: Case, rank: int) -> dict:
                     slots,
                     weights,
                     hidden_states_scale=sf,
-                    max_tokens_per_rank=maximum,
+                    runtime_max_tokens_per_rank=maximum,
                     eplb_local_stats=stats,
                 )
                 combine_offsets.append(comm._round["combine_offset"])

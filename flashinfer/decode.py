@@ -233,7 +233,7 @@ def sm110_gqa_decode(
         allocated tensor.
     """
 
-    from .experimental.sm110_gqa_decode import decode
+    from .experimental.sm110_gqa_decode.backend import sm110_gqa_decode as decode
 
     return decode(
         q,
@@ -260,12 +260,15 @@ def prepare_sm110_gqa_decode(
         to 1.0 and must be finite and positive.
     num_splits : Optional[int]
         ``None`` (or ``1``) selects the size-based route with one split: one
-        request over a 64-key cache uses the short kernel, over 65..128 keys
-        the long kernel, one or two requests over more than 128 keys the
-        one-split 64-token-tile build of the split-KV kernel and every other
-        shape its one-split 32-token-tile build. An explicit count in
-        ``{2, 4, 8, 10, 16}`` launches the run-time-split program of the
-        shape's tile with that many splits; any other value is rejected.
+        request over a 64-key cache uses the short kernel and over 65..128 keys
+        the long kernel; one request over 129..256 keys or two requests over at
+        most 512 keys use the one-split 64-token-tile build of the split-KV
+        kernel, one or two requests over longer caches its four-slot-ring
+        64-token-tile build, and three or more requests its one-split
+        32-token-tile build. An explicit count in ``{2, 4, 8, 10, 16}``
+        launches the run-time-split program of the shape's tile (64-token tiles
+        for one or two requests over at most 4095 keys, 32-token tiles
+        otherwise) with that many splits; any other value is rejected.
 
     Returns
     -------
@@ -285,7 +288,7 @@ def prepare_sm110_gqa_decode(
     Prepare and warm up before CUDA Graph capture. Retain the prepared state
     until all asynchronous work completes and captured Graphs are retired.
     """
-    from .experimental.sm110_gqa_decode import prepare_for_launch
+    from .experimental.sm110_gqa_decode.backend import prepare_for_launch
 
     return prepare_for_launch(inputs, num_splits=num_splits)
 
@@ -390,7 +393,7 @@ def launch_sm110_gqa_decode_prepared(prepared: dict[str, Any]) -> torch.Tensor:
     including event-ordered stream handoffs. No allocations or host reads of
     sequence lengths occur in this launch path.
     """
-    from .experimental.sm110_gqa_decode import launch_prepared
+    from .experimental.sm110_gqa_decode.backend import launch_prepared
 
     return launch_prepared(prepared)
 
@@ -1782,6 +1785,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     "The size of indices should be less than or equal to the allocated buffer"
                 )
 
+        # Normalized like plan(): the native size query reads raw pointers (#5260).
+        indptr = indptr.contiguous()
+        last_page_len = last_page_len.contiguous()
+        if seq_lens is not None:
+            seq_lens = seq_lens.contiguous()
+
         indptr_host = indptr.to("cpu")
         last_page_len_host = last_page_len.to("cpu")
         if seq_lens is None:
@@ -2090,6 +2099,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._float_workspace_buffer.numel()
             * self._float_workspace_buffer.element_size()
         )
+
+        # Normalized: the planner and kernels read these as raw pointers (#5260).
+        indptr = indptr.contiguous()
+        indices = indices.contiguous()
+        last_page_len = last_page_len.contiguous()
+        if seq_lens is not None:
+            seq_lens = seq_lens.contiguous()
 
         batch_size = len(last_page_len)
         if logits_soft_cap is None:
@@ -4664,11 +4680,25 @@ def trtllm_batch_decode_with_kv_cache(
                 )
             )
 
+        if backend == "cake" and (query.size(0) == 0 or batch_size == 0):
+            # No request has a query token: there is nothing to attend or write,
+            # so return before choosing a route or launching a kernel.
+            empty_out = (
+                out
+                if out_dtype != "nvfp4"
+                else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
+            )
+            if return_lse:
+                return empty_out, lse
+            return empty_out
+
         if backend == "cake":
             from .cake_fmha import (
                 CakeFmhaAlignedDecodeModule,
+                CakeFmhaDecodeProgramModule,
                 _resolve_cake_fmha_decode_module,
                 _run_cake_fmha_aligned_decode,
+                _run_cake_fmha_decode_program,
                 select_cake_fmha_decode_route,
             )
 
@@ -4705,6 +4735,7 @@ def trtllm_batch_decode_with_kv_cache(
                 enable_block_sparse_attention=enable_block_sparse_attention,
                 lse=lse,
                 multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
+                enable_pdl=enable_pdl,
             )
             cake_module, optimized_loaded = _resolve_cake_fmha_decode_module(
                 query.device, cake_route
@@ -4725,6 +4756,33 @@ def trtllm_batch_decode_with_kv_cache(
                     seq_lens=seq_lens,
                     bmm1_scale=bmm1_scale,
                 )
+                return out
+            if isinstance(cake_module, CakeFmhaDecodeProgramModule):
+                # A generated decode program: the host computes every argument
+                # of its binding from host scalars and views of the caller's
+                # tensors (device scales stay on the device), so the launch
+                # reads nothing back and can be captured in a CUDA graph.
+                _run_cake_fmha_decode_program(
+                    cake_module,
+                    query=query,
+                    key_cache=k_cache,
+                    value_cache=v_cache,
+                    out=out,
+                    workspace_buffer=workspace_buffer,
+                    counter_buffer=multi_ctas_kv_counter_buffer,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                    max_seq_len=max_seq_len,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                    sinks=sinks,
+                    lse=lse,
+                    key_block_scales=k_block_scales,
+                    value_block_scales=v_block_scales,
+                    sm_count=sm_count,
+                )
+                if return_lse:
+                    return out, lse
                 return out
             if not optimized_loaded:
                 # compat_v1 takes host scalar scales; only the optimized
@@ -5059,6 +5117,10 @@ def fast_decode_plan(
     compatible prepared graphs are still reused. The copy-elision below is
     specific to the FA2/FA3 module, not cuDNN's metadata contract.
     """
+    # Normalized: kernels read these as raw pointers (#5260); no-op when contiguous.
+    indptr = indptr.contiguous()
+    indices = indices.contiguous()
+    last_page_len = last_page_len.contiguous()
     batch_size = len(last_page_len)
     wants_cudnn = self._backend == "cudnn"
     if self._requested_backend == "auto":
@@ -5239,7 +5301,8 @@ def fast_decode_plan(
     )
 
     indptr_host = (
-        global_override_indptr_cpu
+        # Normalized: the planner reads this as a raw pointer (#5260).
+        global_override_indptr_cpu.contiguous()
         if global_override_indptr_cpu is not None
         else indptr.cpu()
     )

@@ -223,12 +223,14 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
         "ckpt_eq_direct": all(torch.equal(res_auto[n], res_ckpt[n]) for n in TENSORS),
         "save_transfer_eq": all(torch.equal(res[n], res_recompute[n]) for n in TENSORS),
         "ring_eq_a2a": ring_ok,
-        # a backend with local stages must have run the SPEC-3 assertion (unless disabled) and passed it; a rank
-        # without tokens launches no local stage, so it has nothing to check
+        # a backend with local stages must have run the SPEC-3 probe (unless disabled); a rank without tokens
+        # launches no local stage, so it has nothing to probe.  The probe's row comparison (the forward's intra
+        # prep against the backward's prep program) is reported in spec3_by_rank, not gated: the requirement of
+        # record is saved_eq_replay (both backward modes run the same local programs)
         "spec3": (not backend.local_stages)
         or (spec3 is None and os.environ.get(cake_kcp.SPEC3_ENV, "1") == "0")
         or (spec3 is None and q.shape[0] == 0)
-        or bool(spec3 and spec3.get("equal")),
+        or bool(spec3 and spec3.get("checked")),
     }
     gathered = {}
     for n in TENSORS:
@@ -383,14 +385,14 @@ def test_public_api_cannot_select_a_precision_mode(monkeypatch) -> None:
 
 
 def test_public_api_cannot_select_a_transfer_walk(monkeypatch) -> None:
-    """The ``transfer_walk`` knob (K3's ``bf16x3`` candidates of ``build.test.json``) is reachable only through
+    """The ``transfer_walk`` knob (K3's ``tf32_hilo`` / ``bf16x3`` programs of ``build.test.json``) is reachable only through
     the gated test hook; the public options never select a non-shipped transfer-walk program (SPEC-11)."""
     monkeypatch.delenv(cake_kcp_plan.TEST_KNOBS_ENV, raising=False)
     with pytest.raises(TypeError):
         cake_kcp._options({"transfer_walk": "bf16x3"})
     with pytest.raises(ValueError):
         cake_kcp._options({"_kcp_test_knobs": {"transfer_walk": "bf16x3"}})
-    assert cake_kcp._options({}).transfer_walk == "tf32_hilo"
+    assert cake_kcp._options({}).transfer_walk == "bf16x3_hw64"
     monkeypatch.setenv(cake_kcp_plan.TEST_KNOBS_ENV, "1")
     assert (
         cake_kcp._options(
@@ -405,7 +407,19 @@ def test_public_api_cannot_select_a_transfer_walk(monkeypatch) -> None:
         == "bf16x3_hw64"
     )
     assert (
+        cake_kcp._options(
+            {"_kcp_test_knobs": {"transfer_walk": "tf32_hilo"}}
+        ).transfer_walk
+        == "tf32_hilo"
+    )
+    assert (
         cake_kcp._options({"_kcp_test_knobs": {"precision_mode": 1}}).transfer_walk
+        == "tf32_hilo"
+    )
+    assert (
+        cake_kcp._options(
+            {"_kcp_test_knobs": {"precision_mode": 1, "transfer_walk": "tf32_hilo"}}
+        ).transfer_walk
         == "tf32_hilo"
     )
     with pytest.raises(ValueError):
@@ -416,12 +430,26 @@ def test_public_api_cannot_select_a_transfer_walk(monkeypatch) -> None:
         cake_kcp._options(
             {"_kcp_test_knobs": {"precision_mode": 1, "transfer_walk": "bf16x3"}}
         )
+    with pytest.raises(
+        ValueError
+    ):  # the shipped BF16x3 walk named beside it is refused too
+        cake_kcp._options(
+            {"_kcp_test_knobs": {"precision_mode": 2, "transfer_walk": "bf16x3_hw64"}}
+        )
 
 
 def test_module_imports_only_torch_and_its_package() -> None:
     """The design note §11.3: the host module imports torch, torch.distributed, tvm_ffi and its own package
     (plus ``ctypes`` for the CUDA runtime's device cache-config preference around the tape launches,
-    ``cake_kcp.walk_device_cache_config``)."""
+    ``cake_kcp.walk_device_cache_config``; the same ``ctypes`` import also reaches the capture-graph entry points of the
+    replay cap of record
+    ``graph_cap="node_attr"`` -- ``cudaStreamGetCaptureInfo`` (``_v2`` / ``_v3``), ``cudaGraphNodeGetType``,
+    ``cudaGraphKernelNodeSetAttribute``, ``cudaGraphKernelNodeGetAttribute``, ``cudaRuntimeGetVersion``,
+    ``cudaGetLastError``; no new module; the trimmed host path:
+    ``functools.cached_property`` on the host table set (``walk_all_p0`` / ``walk_all_rest``, host ints only) -- stdlib,
+    no new module either; ``weakref`` for the trimmed
+    path's begin_call template cache, owned by the local arena and weakly keyed by the table set -- stdlib, no new
+    module)."""
     import ast
 
     src = Path(cake_kcp.__file__).read_text()
@@ -440,7 +468,9 @@ def test_module_imports_only_torch_and_its_package() -> None:
         "tvm_ffi",
         "ctypes",
         "warnings",
-    }  # ctypes: the cache-config bracket of the walk-launch geometry; warnings: its one RuntimeWarning without a loadable CUDA runtime; no other use
+        "functools",
+        "weakref",
+    }  # weakref: the arena-owned template cache of the trimmed host path; functools: cached_property of the trimmed host path; ctypes: the cache-config bracket of the walk-launch geometry and the capture-graph entry points of the replay cap; warnings: the one RuntimeWarning without a loadable CUDA runtime or for a degraded node cap; no other use
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for a in node.names:

@@ -15,7 +15,8 @@ limitations under the License.
 """
 
 # The fused mHC inference step of a GLM-style four-route model (hidden 4096, BF16
-# output) through the experimental ``prepare_mega_mhc`` API on an SM107a GPU.
+# output) through the experimental ``prepare_mega_mhc`` API on an SM100a, SM103a or
+# SM107a GPU.
 #
 # The caller's names (``residual_cur``, ``post_mix_cur``, ``comb_mix_cur``,
 # ``layer_input_cur``) map onto the plan's outputs (``new_residual``,

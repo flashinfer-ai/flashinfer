@@ -3,6 +3,7 @@ import json
 import random
 import tracemalloc
 import weakref
+from dataclasses import replace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -41,6 +42,7 @@ from flashinfer.autotuner import (
     DynamicTensorSpec,
     TuningConfig,
     TunableRunner,
+    ValueProfileArena,
     make_bucket_mapper,
     round_to_nearest_bucket,
 )
@@ -547,7 +549,7 @@ def test_choose_one_releases_inputs_before_oom_sync_and_cache_cleanup(
         assert synthetic_ref is not None
         assert synthetic_ref() is None
 
-    def sync_oom(local_oom):
+    def sync_oom(local_oom, **kwargs):
         gc.collect()
         if local_oom:
             assert synthetic_ref is not None
@@ -636,7 +638,7 @@ def test_rank_tactics_preparation_oom_error_and_input_lifetime(
             fail_preparation()
         return tensors
 
-    def sync_oom(local_oom):
+    def sync_oom(local_oom, **kwargs):
         if local_oom:
             gc.collect()
             assert synthetic_ref() is None
@@ -646,6 +648,10 @@ def test_rank_tactics_preparation_oom_error_and_input_lifetime(
     monkeypatch.setattr(
         "flashinfer.autotuner.autotuner._tune_process_group",
         object() if distributed else None,
+    )
+    monkeypatch.setattr(
+        "flashinfer.autotuner.autotuner._check_tuning_group_phase",
+        lambda *args, **kwargs: None,
     )
     # The sentinel group models OOM handling; real collectives are covered
     # by test_autotuner_distributed.py.
@@ -672,7 +678,7 @@ def test_rank_tactics_preparation_oom_error_and_input_lifetime(
         )
 
     if distributed:
-        sync.assert_any_call(True)
+        assert any(call.args == (True,) for call in sync.call_args_list)
     else:
         assert exc.value is local_errors[0]
     profile.assert_not_called()
@@ -1527,6 +1533,159 @@ def test_cold_l2_profile_uses_full_flush_buffer(monkeypatch):
 
     assert latency >= 0
     assert allocations == [(8192, inputs[0].device)]
+
+
+class _CudaAddRunner(DummyRunner):
+    def __init__(self, launched):
+        super().__init__(valid_tactics=(0,))
+        self.launched = launched
+
+    def forward(self, inputs, tactic: int = -1, do_preparation: bool = False, **kwargs):
+        self.launched.append(inputs[0].data_ptr())
+        torch.add(inputs[0], 1, out=inputs[1])
+        return inputs[1]
+
+
+def _cuda_chain_setup(monkeypatch, sample_ms, weight, repeat=2):
+    tuner = AutoTuner(warmup=1, repeat=repeat)
+    # Large enough that the gapped weight's span still fits the arena path.
+    monkeypatch.setattr(
+        tuner, "_get_l2_cache_size_in_bytes", lambda device_id=None: 16384
+    )
+    monkeypatch.setattr(
+        "flashinfer.autotuner.autotuner.delay_kernel", lambda delay_us: None
+    )
+    inputs = [weight, torch.empty(64, 32, device="cuda")]
+    config = TuningConfig(
+        use_cuda_graph=True,
+        use_cold_l2_cache=True,
+        cold_chain_launches=8,
+        profile_arena_input_indices=(0,),
+    )
+    assert config.uses_cold_chain
+    batches = tuner._prepare_input_tensors_with_batches(inputs, config)
+    assert len(batches) == 8
+    for batch in batches:
+        assert batch[0].stride() == weight.stride()
+        torch.testing.assert_close(batch[0], weight)
+    # Every timed sample, including the warm replay, reports sample_ms.
+    monkeypatch.setattr(torch.cuda.Event, "elapsed_time", lambda self, end: sample_ms)
+    return tuner, inputs, config, batches
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("gapped", [False, True])
+def test_cold_chain_times_arena_lanes_per_launch(monkeypatch, gapped):
+    launched = []
+    weight = (
+        torch.randn(32, 80, device="cuda")[:, :64].T
+        if gapped
+        else torch.randn(32, 64, device="cuda").T
+    )
+    tuner, inputs, config, batches = _cuda_chain_setup(monkeypatch, 0.01, weight)
+
+    latency = tuner._profile_single_kernel(
+        _CudaAddRunner(launched), inputs, 0, config, input_tensor_batches=batches
+    )
+
+    # One warmup launch, then the graph captures one launch per scheduled
+    # batch, cycling distinct arena lanes.
+    assert launched[0] == batches[-1][0].data_ptr()
+    assert launched[1:] == [batch[0].data_ptr() for batch in batches]
+    assert len(set(launched[1:])) > 1
+    assert latency == pytest.approx(0.01 / len(batches))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("chain_ms, samples", [(0.01, 10), (4.0, 2), (50.0, 1)])
+def test_cold_chain_caps_samples_by_chain_time(monkeypatch, chain_ms, samples):
+    weight = torch.randn(32, 64, device="cuda").T
+    tuner, inputs, config, batches = _cuda_chain_setup(
+        monkeypatch, chain_ms, weight, repeat=10
+    )
+    replays = []
+    original_replay = torch.cuda.CUDAGraph.replay
+
+    def replay(graph):
+        replays.append(graph)
+        return original_replay(graph)
+
+    monkeypatch.setattr(torch.cuda.CUDAGraph, "replay", replay)
+    tuner._profile_single_kernel(
+        _CudaAddRunner([]), inputs, 0, config, input_tensor_batches=batches
+    )
+
+    # One untimed warm replay, then the capped number of timed samples.
+    assert len(replays) == 1 + samples
+
+
+def test_value_profile_arena_layout_helpers():
+    dense_t = torch.empty(32, 64).T
+    gapped = torch.empty(32, 80)[:, :64].T
+    expanded = torch.empty(64, 1).expand(64, 32)
+    assert ValueProfileArena.is_non_overlapping(dense_t)
+    assert ValueProfileArena.is_non_overlapping(gapped)
+    assert not ValueProfileArena.is_non_overlapping(expanded)
+    assert ValueProfileArena.span_bytes(dense_t) == 32 * 64 * 4
+    assert ValueProfileArena.span_bytes(gapped) == (31 * 80 + 63 + 1) * 4
+
+
+def test_cold_chain_profiling_policy_labels():
+    from flashinfer.gemm import gemm_base
+
+    def l2_policy(config):
+        return AutoTuner._profiling_policy(config)[-1]
+
+    chain = TuningConfig(
+        use_cuda_graph=True,
+        use_cold_l2_cache=True,
+        cold_chain_launches=8,
+        profile_arena_input_indices=(0,),
+    )
+    assert l2_policy(chain) == "cold-chain:8"
+    assert l2_policy(replace(chain, profile_arena_input_indices=())) == "cold"
+    assert l2_policy(replace(chain, use_cold_l2_cache=False)) == "hot"
+    assert l2_policy(gemm_base._BF16_GEMM_SM100_TUNING_CONFIG) == "cold-chain:8"
+    assert l2_policy(gemm_base._MM_MXFP8_CUTE_DSL_TUNING_CONFIG) == "cold"
+
+
+def test_tuning_overrides_keep_cold_chain():
+    tuner = reset_autotuner()
+    config = TuningConfig(
+        use_cuda_graph=True,
+        use_cold_l2_cache=True,
+        cold_chain_launches=8,
+        profile_arena_input_indices=(0,),
+    )
+    with autotune(tune_mode=True, tuning_buckets=[16], cuda_graph_profile_replays=2):
+        overridden = tuner._apply_tuning_overrides(config)
+
+    assert overridden is not config
+    assert overridden.cuda_graph_profile_replays == 2
+    assert overridden.uses_cold_chain
+    assert overridden.cold_chain_launches == 8
+
+
+def test_cold_chain_reuses_inputs_for_payload_above_working_set(monkeypatch):
+    tuner = AutoTuner()
+    monkeypatch.setattr(
+        tuner, "_get_l2_cache_size_in_bytes", lambda device_id=None: 1024
+    )
+    inputs = [torch.empty(4096, dtype=torch.uint8)]
+    config = TuningConfig(
+        use_cuda_graph=True,
+        use_cold_l2_cache=True,
+        cold_chain_launches=8,
+        profile_arena_input_indices=(0,),
+    )
+
+    batches = tuner._prepare_input_tensors_with_batches(inputs, config)
+    assert len(batches) == 8
+    assert all(batch is inputs for batch in batches)
+
+    # Few elements but a span above 2xL2: chaining one pointer would be warm.
+    gapped = [torch.empty(8, 4096)[:, :4].T]
+    assert tuner._prepare_input_tensors_with_batches(gapped, config) == [gapped]
 
 
 @pytest.mark.parametrize("use_cuda_graph", [False, True])

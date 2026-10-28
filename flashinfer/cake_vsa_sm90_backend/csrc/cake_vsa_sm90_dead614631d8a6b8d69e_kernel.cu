@@ -314,7 +314,7 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                 if (st_t + 128 < 144) {
                     w2 = meta[mrow + st_t + 128];
                 }
-                mbarrier_wait(meta_empty_addr + (slot) * 8, 1);
+                mbarrier_wait(meta_empty_addr, 1);
                 if (warp == 2) {
                     int head = __shfl_sync(0xFFFFFFFF, w0, 0);
                     int qb0 = __shfl_sync(0xFFFFFFFF, w0, 1);
@@ -328,7 +328,7 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                 if (st_t + 128 < 144) {
                     meta_smem[slot * 144 + st_t + 128] = w2;
                 }
-                mbarrier_arrive(meta_full_addr + (slot) * 8);
+                mbarrier_arrive(meta_full_addr);
                 int nt_st = __shfl_sync(0xFFFFFFFF, nt_st_ld, 0);
                 #pragma unroll 1
                 for (int ti = 1; ti < nt_st; ti++) {
@@ -340,7 +340,9 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                     if (st_t + 128 < 144) {
                         w2_4 = meta[mrow_1 + st_t + 128];
                     }
-                    mbarrier_wait(meta_empty_addr + (slot_0) * 8, (ti >> 1) + 1 & 1);
+                    int _stage_meta_empty = (int)((unsigned int)ti % 2);
+                    int _parity_meta_empty = (int)((unsigned int)ti / 2 % 2) ^ 1;
+                    mbarrier_wait(meta_empty_addr + (_stage_meta_empty) * 8, _parity_meta_empty);
                     if (warp == 2) {
                         int head_1 = __shfl_sync(0xFFFFFFFF, w0_2, 0);
                         int qb0_1 = __shfl_sync(0xFFFFFFFF, w0_2, 1);
@@ -348,7 +350,8 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                         int mode_w_1 = __shfl_sync(0xFFFFFFFF, w0_2, 3);
                         if (elect_sync()) {
                             if (ti > 0) {
-                                mbarrier_wait(q_empty_addr, ti - 1 & 1);
+                                int _parity_q_empty = (int)((unsigned int)ti % 2) ^ 1;
+                                mbarrier_wait(q_empty_addr, _parity_q_empty);
                                 mbarrier_arrive_expect_tx(q_ready_addr, 16384);
                                 asm volatile(
                                     "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
@@ -371,7 +374,7 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                     if (st_t + 128 < 144) {
                         meta_smem[slot_0 * 144 + st_t + 128] = w2_4;
                     }
-                    mbarrier_arrive(meta_full_addr + (slot_0) * 8);
+                    mbarrier_arrive(meta_full_addr + ((int)((unsigned int)ti % 2)) * 8);
                 }
             }
             if (warp == 0) {
@@ -384,72 +387,201 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                     int h_head_k = hdr[hb];
                     int n_hdr_k = hdr[hb + 4];
                     int kv_base_h = h_head_k * seqlen_k;
-                    #pragma unroll
-                    for (int hp = 0; hp < 3; hp++) {
-                        if (n_hdr_k > hp) {
-                            mbarrier_wait(k_empty_addr + (hp % 3) * 8, hp / 3 + 1 & 1);
-                            int hblk_a = hdr[hb + 5 + 2 * hp];
-                            int hblk_b = hdr[hb + 6 + 2 * hp];
-                            int has_b = 1;
-                            if (hblk_b < 0) {
-                                has_b = 0;
+                    if (n_hdr_k > 0) {
+                        mbarrier_wait(k_empty_addr, 1);
+                        int hblk_a = hdr[hb + 5];
+                        int hblk_b = hdr[hb + 6];
+                        int has_b = 1;
+                        if (hblk_b < 0) {
+                            has_b = 0;
+                        }
+                        int k_dst = k_smem_addr;
+                        mbarrier_arrive_expect_tx(k_full_addr, 16384 * (1 + has_b));
+                        if (tagf_k != 0) {
+                            int tag_a = hblk_a >> 14;
+                            int tag_b = hblk_b >> 14;
+                            unsigned long long pol_a = ((tag_a != 0) ? 1364590687093260288 : pol_k);
+                            unsigned long long pol_b = ((tag_b != 0) ? 1364590687093260288 : pol_k);
+                            int row_ta = kv_base_h + (hblk_a - (tag_a << 14)) * 64;
+                            int row_tb = kv_base_h + (hblk_b - (tag_b << 14)) * 64;
+                            asm volatile(
+                                "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                :: "r"(k_dst), "l"((&K)), "r"(0), "r"(row_ta), "r"(0),
+                                   "r"(k_full_addr), "l"(pol_a) : "memory");
+                            asm volatile(
+                                "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                :: "r"(k_dst + 16384), "l"((&K)), "r"(0), "r"(row_ta), "r"(1),
+                                   "r"(k_full_addr), "l"(pol_a) : "memory");
+                            if (has_b != 0) {
+                                asm volatile(
+                                    "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                    " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                    :: "r"(k_dst + 8192), "l"((&K)), "r"(0), "r"(row_tb), "r"(0),
+                                       "r"(k_full_addr), "l"(pol_b) : "memory");
+                                asm volatile(
+                                    "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                    " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                    :: "r"(k_dst + 16384 + 8192), "l"((&K)), "r"(0), "r"(row_tb), "r"(1),
+                                       "r"(k_full_addr), "l"(pol_b) : "memory");
                             }
-                            int k_dst = k_smem_addr + (unsigned int)(hp % 3 * 32768);
-                            mbarrier_arrive_expect_tx(k_full_addr + (hp % 3) * 8, 16384 * (1 + has_b));
-                            if (tagf_k != 0) {
-                                int tag_a = hblk_a >> 14;
-                                int tag_b = hblk_b >> 14;
-                                unsigned long long pol_a = ((tag_a != 0) ? 1364590687093260288 : pol_k);
-                                unsigned long long pol_b = ((tag_b != 0) ? 1364590687093260288 : pol_k);
-                                int row_ta = kv_base_h + (hblk_a - (tag_a << 14)) * 64;
-                                int row_tb = kv_base_h + (hblk_b - (tag_b << 14)) * 64;
+                        } else {
+                            int row_ua = kv_base_h + hblk_a * 64;
+                            int row_ub = kv_base_h + hblk_b * 64;
+                            asm volatile(
+                                "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                :: "r"(k_dst), "l"((&K)), "r"(0), "r"(row_ua), "r"(0),
+                                   "r"(k_full_addr), "l"(pol_k) : "memory");
+                            asm volatile(
+                                "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                :: "r"(k_dst + 16384), "l"((&K)), "r"(0), "r"(row_ua), "r"(1),
+                                   "r"(k_full_addr), "l"(pol_k) : "memory");
+                            if (has_b != 0) {
                                 asm volatile(
                                     "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                    :: "r"(k_dst), "l"((&K)), "r"(0), "r"(row_ta), "r"(0),
-                                       "r"(k_full_addr + (hp % 3) * 8), "l"(pol_a) : "memory");
+                                    :: "r"(k_dst + 8192), "l"((&K)), "r"(0), "r"(row_ub), "r"(0),
+                                       "r"(k_full_addr), "l"(pol_k) : "memory");
                                 asm volatile(
                                     "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                    :: "r"(k_dst + 16384), "l"((&K)), "r"(0), "r"(row_ta), "r"(1),
-                                       "r"(k_full_addr + (hp % 3) * 8), "l"(pol_a) : "memory");
-                                if (has_b != 0) {
-                                    asm volatile(
-                                        "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-                                        " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                        :: "r"(k_dst + 8192), "l"((&K)), "r"(0), "r"(row_tb), "r"(0),
-                                           "r"(k_full_addr + (hp % 3) * 8), "l"(pol_b) : "memory");
-                                    asm volatile(
-                                        "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-                                        " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                        :: "r"(k_dst + 16384 + 8192), "l"((&K)), "r"(0), "r"(row_tb), "r"(1),
-                                           "r"(k_full_addr + (hp % 3) * 8), "l"(pol_b) : "memory");
-                                }
-                            } else {
-                                int row_ua = kv_base_h + hblk_a * 64;
-                                int row_ub = kv_base_h + hblk_b * 64;
+                                    :: "r"(k_dst + 16384 + 8192), "l"((&K)), "r"(0), "r"(row_ub), "r"(1),
+                                       "r"(k_full_addr), "l"(pol_k) : "memory");
+                            }
+                        }
+                    }
+                    if (n_hdr_k > 1) {
+                        mbarrier_wait(k_empty_addr + 8, 1);
+                        int hblk_a_1 = hdr[hb + 5 + 2];
+                        int hblk_b_1 = hdr[hb + 6 + 2];
+                        int has_b_1 = 1;
+                        if (hblk_b_1 < 0) {
+                            has_b_1 = 0;
+                        }
+                        int k_dst_1 = k_smem_addr + 32768;
+                        mbarrier_arrive_expect_tx(k_full_addr + 8, 16384 * (1 + has_b_1));
+                        if (tagf_k != 0) {
+                            int tag_a_1 = hblk_a_1 >> 14;
+                            int tag_b_1 = hblk_b_1 >> 14;
+                            unsigned long long pol_a_1 = ((tag_a_1 != 0) ? 1364590687093260288 : pol_k);
+                            unsigned long long pol_b_1 = ((tag_b_1 != 0) ? 1364590687093260288 : pol_k);
+                            int row_ta_1 = kv_base_h + (hblk_a_1 - (tag_a_1 << 14)) * 64;
+                            int row_tb_1 = kv_base_h + (hblk_b_1 - (tag_b_1 << 14)) * 64;
+                            asm volatile(
+                                "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                :: "r"(k_dst_1), "l"((&K)), "r"(0), "r"(row_ta_1), "r"(0),
+                                   "r"(k_full_addr + 8), "l"(pol_a_1) : "memory");
+                            asm volatile(
+                                "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                :: "r"(k_dst_1 + 16384), "l"((&K)), "r"(0), "r"(row_ta_1), "r"(1),
+                                   "r"(k_full_addr + 8), "l"(pol_a_1) : "memory");
+                            if (has_b_1 != 0) {
                                 asm volatile(
                                     "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                    :: "r"(k_dst), "l"((&K)), "r"(0), "r"(row_ua), "r"(0),
-                                       "r"(k_full_addr + (hp % 3) * 8), "l"(pol_k) : "memory");
+                                    :: "r"(k_dst_1 + 8192), "l"((&K)), "r"(0), "r"(row_tb_1), "r"(0),
+                                       "r"(k_full_addr + 8), "l"(pol_b_1) : "memory");
                                 asm volatile(
                                     "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                    :: "r"(k_dst + 16384), "l"((&K)), "r"(0), "r"(row_ua), "r"(1),
-                                       "r"(k_full_addr + (hp % 3) * 8), "l"(pol_k) : "memory");
-                                if (has_b != 0) {
-                                    asm volatile(
-                                        "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-                                        " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                        :: "r"(k_dst + 8192), "l"((&K)), "r"(0), "r"(row_ub), "r"(0),
-                                           "r"(k_full_addr + (hp % 3) * 8), "l"(pol_k) : "memory");
-                                    asm volatile(
-                                        "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-                                        " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                        :: "r"(k_dst + 16384 + 8192), "l"((&K)), "r"(0), "r"(row_ub), "r"(1),
-                                           "r"(k_full_addr + (hp % 3) * 8), "l"(pol_k) : "memory");
-                                }
+                                    :: "r"(k_dst_1 + 16384 + 8192), "l"((&K)), "r"(0), "r"(row_tb_1), "r"(1),
+                                       "r"(k_full_addr + 8), "l"(pol_b_1) : "memory");
+                            }
+                        } else {
+                            int row_ua_1 = kv_base_h + hblk_a_1 * 64;
+                            int row_ub_1 = kv_base_h + hblk_b_1 * 64;
+                            asm volatile(
+                                "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                :: "r"(k_dst_1), "l"((&K)), "r"(0), "r"(row_ua_1), "r"(0),
+                                   "r"(k_full_addr + 8), "l"(pol_k) : "memory");
+                            asm volatile(
+                                "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                :: "r"(k_dst_1 + 16384), "l"((&K)), "r"(0), "r"(row_ua_1), "r"(1),
+                                   "r"(k_full_addr + 8), "l"(pol_k) : "memory");
+                            if (has_b_1 != 0) {
+                                asm volatile(
+                                    "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                    " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                    :: "r"(k_dst_1 + 8192), "l"((&K)), "r"(0), "r"(row_ub_1), "r"(0),
+                                       "r"(k_full_addr + 8), "l"(pol_k) : "memory");
+                                asm volatile(
+                                    "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                    " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                    :: "r"(k_dst_1 + 16384 + 8192), "l"((&K)), "r"(0), "r"(row_ub_1), "r"(1),
+                                       "r"(k_full_addr + 8), "l"(pol_k) : "memory");
+                            }
+                        }
+                    }
+                    if (n_hdr_k > 2) {
+                        mbarrier_wait(k_empty_addr + 16, 1);
+                        int hblk_a_2 = hdr[hb + 5 + 4];
+                        int hblk_b_2 = hdr[hb + 6 + 4];
+                        int has_b_2 = 1;
+                        if (hblk_b_2 < 0) {
+                            has_b_2 = 0;
+                        }
+                        int k_dst_2 = k_smem_addr + 65536;
+                        mbarrier_arrive_expect_tx(k_full_addr + 16, 16384 * (1 + has_b_2));
+                        if (tagf_k != 0) {
+                            int tag_a_2 = hblk_a_2 >> 14;
+                            int tag_b_2 = hblk_b_2 >> 14;
+                            unsigned long long pol_a_2 = ((tag_a_2 != 0) ? 1364590687093260288 : pol_k);
+                            unsigned long long pol_b_2 = ((tag_b_2 != 0) ? 1364590687093260288 : pol_k);
+                            int row_ta_2 = kv_base_h + (hblk_a_2 - (tag_a_2 << 14)) * 64;
+                            int row_tb_2 = kv_base_h + (hblk_b_2 - (tag_b_2 << 14)) * 64;
+                            asm volatile(
+                                "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                :: "r"(k_dst_2), "l"((&K)), "r"(0), "r"(row_ta_2), "r"(0),
+                                   "r"(k_full_addr + 16), "l"(pol_a_2) : "memory");
+                            asm volatile(
+                                "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                :: "r"(k_dst_2 + 16384), "l"((&K)), "r"(0), "r"(row_ta_2), "r"(1),
+                                   "r"(k_full_addr + 16), "l"(pol_a_2) : "memory");
+                            if (has_b_2 != 0) {
+                                asm volatile(
+                                    "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                    " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                    :: "r"(k_dst_2 + 8192), "l"((&K)), "r"(0), "r"(row_tb_2), "r"(0),
+                                       "r"(k_full_addr + 16), "l"(pol_b_2) : "memory");
+                                asm volatile(
+                                    "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                    " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                    :: "r"(k_dst_2 + 16384 + 8192), "l"((&K)), "r"(0), "r"(row_tb_2), "r"(1),
+                                       "r"(k_full_addr + 16), "l"(pol_b_2) : "memory");
+                            }
+                        } else {
+                            int row_ua_2 = kv_base_h + hblk_a_2 * 64;
+                            int row_ub_2 = kv_base_h + hblk_b_2 * 64;
+                            asm volatile(
+                                "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                :: "r"(k_dst_2), "l"((&K)), "r"(0), "r"(row_ua_2), "r"(0),
+                                   "r"(k_full_addr + 16), "l"(pol_k) : "memory");
+                            asm volatile(
+                                "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                :: "r"(k_dst_2 + 16384), "l"((&K)), "r"(0), "r"(row_ua_2), "r"(1),
+                                   "r"(k_full_addr + 16), "l"(pol_k) : "memory");
+                            if (has_b_2 != 0) {
+                                asm volatile(
+                                    "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                    " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                    :: "r"(k_dst_2 + 8192), "l"((&K)), "r"(0), "r"(row_ub_2), "r"(0),
+                                       "r"(k_full_addr + 16), "l"(pol_k) : "memory");
+                                asm volatile(
+                                    "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                    " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                    :: "r"(k_dst_2 + 16384 + 8192), "l"((&K)), "r"(0), "r"(row_ub_2), "r"(1),
+                                       "r"(k_full_addr + 16), "l"(pol_k) : "memory");
                             }
                         }
                     }
@@ -460,7 +592,9 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                         int slot_k = ti_1 & 1;
                         int mb_k = slot_k * 144;
                         if (ti_1 > 0) {
-                            mbarrier_wait(meta_full_addr + (slot_k) * 8, ti_1 >> 1 & 1);
+                            int _stage_meta_full = (int)((unsigned int)ti_1 % 2);
+                            int _parity_meta_full = (int)((unsigned int)ti_1 / 2 % 2);
+                            mbarrier_wait(meta_full_addr + (_stage_meta_full) * 8, _parity_meta_full);
                         }
                         int head_k = meta_smem[mb_k];
                         int n_seq_k = meta_smem[mb_k + 4];
@@ -473,74 +607,77 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                         for (int i = i0_k; i < n_seq_k; i++) {
                             int p = gk + i;
                             int stage = p % 3;
-                            mbarrier_wait(k_empty_addr + (stage) * 8, p / 3 + 1 & 1);
+                            int plap = 0;
+                            plap += p / 3;
+                            int _parity_k_empty = (int)((unsigned int)plap % 2) ^ 1;
+                            mbarrier_wait(k_empty_addr + (stage) * 8, _parity_k_empty);
                             int sw = meta_smem[mb_k + 8 + i];
                             int blk_a = sw << 16 >> 16;
                             int blk_b = sw >> 16;
-                            int has_b_1 = 1;
+                            int has_b_3 = 1;
                             if (blk_b < 0) {
-                                has_b_1 = 0;
+                                has_b_3 = 0;
                             }
-                            int k_dst_1 = k_smem_addr + (unsigned int)(stage * 32768);
-                            mbarrier_arrive_expect_tx(k_full_addr + (stage) * 8, 16384 * (1 + has_b_1));
+                            int k_dst_3 = k_smem_addr + (unsigned int)(stage * 32768);
+                            mbarrier_arrive_expect_tx(k_full_addr + (stage) * 8, 16384 * (1 + has_b_3));
                             if (tagf_k != 0) {
-                                int tag_a_1 = blk_a >> 14;
-                                int tag_b_1 = blk_b >> 14;
-                                unsigned long long pol_a_1 = ((tag_a_1 != 0) ? 1364590687093260288 : pol_k);
-                                unsigned long long pol_b_1 = ((tag_b_1 != 0) ? 1364590687093260288 : pol_k);
-                                int row_ta_1 = kv_base + (blk_a - (tag_a_1 << 14)) * 64;
-                                int row_tb_1 = kv_base + (blk_b - (tag_b_1 << 14)) * 64;
+                                int tag_a_3 = blk_a >> 14;
+                                int tag_b_3 = blk_b >> 14;
+                                unsigned long long pol_a_3 = ((tag_a_3 != 0) ? 1364590687093260288 : pol_k);
+                                unsigned long long pol_b_3 = ((tag_b_3 != 0) ? 1364590687093260288 : pol_k);
+                                int row_ta_3 = kv_base + (blk_a - (tag_a_3 << 14)) * 64;
+                                int row_tb_3 = kv_base + (blk_b - (tag_b_3 << 14)) * 64;
                                 asm volatile(
                                     "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                    :: "r"(k_dst_1), "l"((&K)), "r"(0), "r"(row_ta_1), "r"(0),
-                                       "r"(k_full_addr + (stage) * 8), "l"(pol_a_1) : "memory");
+                                    :: "r"(k_dst_3), "l"((&K)), "r"(0), "r"(row_ta_3), "r"(0),
+                                       "r"(k_full_addr + (stage) * 8), "l"(pol_a_3) : "memory");
                                 asm volatile(
                                     "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                    :: "r"(k_dst_1 + 16384), "l"((&K)), "r"(0), "r"(row_ta_1), "r"(1),
-                                       "r"(k_full_addr + (stage) * 8), "l"(pol_a_1) : "memory");
-                                if (has_b_1 != 0) {
+                                    :: "r"(k_dst_3 + 16384), "l"((&K)), "r"(0), "r"(row_ta_3), "r"(1),
+                                       "r"(k_full_addr + (stage) * 8), "l"(pol_a_3) : "memory");
+                                if (has_b_3 != 0) {
                                     asm volatile(
                                         "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                         " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                        :: "r"(k_dst_1 + 8192), "l"((&K)), "r"(0), "r"(row_tb_1), "r"(0),
-                                           "r"(k_full_addr + (stage) * 8), "l"(pol_b_1) : "memory");
+                                        :: "r"(k_dst_3 + 8192), "l"((&K)), "r"(0), "r"(row_tb_3), "r"(0),
+                                           "r"(k_full_addr + (stage) * 8), "l"(pol_b_3) : "memory");
                                     asm volatile(
                                         "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                         " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                        :: "r"(k_dst_1 + 16384 + 8192), "l"((&K)), "r"(0), "r"(row_tb_1), "r"(1),
-                                           "r"(k_full_addr + (stage) * 8), "l"(pol_b_1) : "memory");
+                                        :: "r"(k_dst_3 + 16384 + 8192), "l"((&K)), "r"(0), "r"(row_tb_3), "r"(1),
+                                           "r"(k_full_addr + (stage) * 8), "l"(pol_b_3) : "memory");
                                 }
                             } else {
-                                int row_ua_1 = kv_base + blk_a * 64;
-                                int row_ub_1 = kv_base + blk_b * 64;
+                                int row_ua_3 = kv_base + blk_a * 64;
+                                int row_ub_3 = kv_base + blk_b * 64;
                                 asm volatile(
                                     "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                    :: "r"(k_dst_1), "l"((&K)), "r"(0), "r"(row_ua_1), "r"(0),
+                                    :: "r"(k_dst_3), "l"((&K)), "r"(0), "r"(row_ua_3), "r"(0),
                                        "r"(k_full_addr + (stage) * 8), "l"(pol_k) : "memory");
                                 asm volatile(
                                     "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                    :: "r"(k_dst_1 + 16384), "l"((&K)), "r"(0), "r"(row_ua_1), "r"(1),
+                                    :: "r"(k_dst_3 + 16384), "l"((&K)), "r"(0), "r"(row_ua_3), "r"(1),
                                        "r"(k_full_addr + (stage) * 8), "l"(pol_k) : "memory");
-                                if (has_b_1 != 0) {
+                                if (has_b_3 != 0) {
                                     asm volatile(
                                         "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                         " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                        :: "r"(k_dst_1 + 8192), "l"((&K)), "r"(0), "r"(row_ub_1), "r"(0),
+                                        :: "r"(k_dst_3 + 8192), "l"((&K)), "r"(0), "r"(row_ub_3), "r"(0),
                                            "r"(k_full_addr + (stage) * 8), "l"(pol_k) : "memory");
                                     asm volatile(
                                         "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                         " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                                        :: "r"(k_dst_1 + 16384 + 8192), "l"((&K)), "r"(0), "r"(row_ub_1), "r"(1),
+                                        :: "r"(k_dst_3 + 16384 + 8192), "l"((&K)), "r"(0), "r"(row_ub_3), "r"(1),
                                            "r"(k_full_addr + (stage) * 8), "l"(pol_k) : "memory");
                                 }
                             }
                         }
                         gk += n_seq_k;
-                        mbarrier_arrive(meta_empty_addr + (slot_k) * 8);
+                        mbarrier_arrive(meta_empty_addr + ((int)((unsigned int)ti_1 % 2)) * 8);
                     }
                 }
             }
@@ -554,51 +691,138 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                     int h_head_v = hdr[hb];
                     int n_hdr_v = hdr[hb + 4];
                     int kv_base_hv = h_head_v * seqlen_k;
-                    #pragma unroll
-                    for (int hp_1 = 0; hp_1 < 3; hp_1++) {
-                        if (n_hdr_v > hp_1) {
-                            mbarrier_wait(v_empty_addr + (hp_1 % 3) * 8, hp_1 / 3 + 1 & 1);
-                            int hvblk_a = hdr[hb + 5 + 2 * hp_1];
-                            int hvblk_b = hdr[hb + 6 + 2 * hp_1];
-                            int v_has_b = 1;
-                            if (hvblk_b < 0) {
-                                v_has_b = 0;
+                    if (n_hdr_v > 0) {
+                        mbarrier_wait(v_empty_addr, 1);
+                        int hvblk_a = hdr[hb + 5];
+                        int hvblk_b = hdr[hb + 6];
+                        int v_has_b = 1;
+                        if (hvblk_b < 0) {
+                            v_has_b = 0;
+                        }
+                        mbarrier_arrive_expect_tx(v_full_addr, 16384 * (1 + v_has_b));
+                        if (tagf_v != 0) {
+                            int vtag_a = hvblk_a >> 14;
+                            int vtag_b = hvblk_b >> 14;
+                            unsigned long long vpol_a = ((vtag_a != 0) ? 1364590687093260288 : pol_v);
+                            unsigned long long vpol_b = ((vtag_b != 0) ? 1364590687093260288 : pol_v);
+                            int vrow_ta = kv_base_hv + (hvblk_a - (vtag_a << 14)) * 64;
+                            int vrow_tb = kv_base_hv + (hvblk_b - (vtag_b << 14)) * 64;
+                            asm volatile(
+                                "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                :: "r"(vt_smem_a_addr), "l"((&Vt)), "r"(0), "r"(0), "r"(vrow_ta / 8), "r"(0),
+                                   "r"(v_full_addr), "l"(vpol_a) : "memory");
+                            if (v_has_b != 0) {
+                                asm volatile(
+                                    "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                    " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                    :: "r"(vt_smem_b_addr), "l"((&Vt)), "r"(0), "r"(0), "r"(vrow_tb / 8), "r"(0),
+                                       "r"(v_full_addr), "l"(vpol_b) : "memory");
                             }
-                            mbarrier_arrive_expect_tx(v_full_addr + (hp_1 % 3) * 8, 16384 * (1 + v_has_b));
-                            if (tagf_v != 0) {
-                                int vtag_a = hvblk_a >> 14;
-                                int vtag_b = hvblk_b >> 14;
-                                unsigned long long vpol_a = ((vtag_a != 0) ? 1364590687093260288 : pol_v);
-                                unsigned long long vpol_b = ((vtag_b != 0) ? 1364590687093260288 : pol_v);
-                                int vrow_ta = kv_base_hv + (hvblk_a - (vtag_a << 14)) * 64;
-                                int vrow_tb = kv_base_hv + (hvblk_b - (vtag_b << 14)) * 64;
+                        } else {
+                            int vrow_ua = kv_base_hv + hvblk_a * 64;
+                            int vrow_ub = kv_base_hv + hvblk_b * 64;
+                            asm volatile(
+                                "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                :: "r"(vt_smem_a_addr), "l"((&Vt)), "r"(0), "r"(0), "r"(vrow_ua / 8), "r"(0),
+                                   "r"(v_full_addr), "l"(pol_v) : "memory");
+                            if (v_has_b != 0) {
                                 asm volatile(
                                     "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
-                                    :: "r"(vt_smem_a_addr + (unsigned int)(hp_1 % 3 * 32768)), "l"((&Vt)), "r"(0), "r"(0), "r"(vrow_ta / 8), "r"(0),
-                                       "r"(v_full_addr + (hp_1 % 3) * 8), "l"(vpol_a) : "memory");
-                                if (v_has_b != 0) {
-                                    asm volatile(
-                                        "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-                                        " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
-                                        :: "r"(vt_smem_b_addr + (unsigned int)(hp_1 % 3 * 32768)), "l"((&Vt)), "r"(0), "r"(0), "r"(vrow_tb / 8), "r"(0),
-                                           "r"(v_full_addr + (hp_1 % 3) * 8), "l"(vpol_b) : "memory");
-                                }
-                            } else {
-                                int vrow_ua = kv_base_hv + hvblk_a * 64;
-                                int vrow_ub = kv_base_hv + hvblk_b * 64;
+                                    :: "r"(vt_smem_b_addr), "l"((&Vt)), "r"(0), "r"(0), "r"(vrow_ub / 8), "r"(0),
+                                       "r"(v_full_addr), "l"(pol_v) : "memory");
+                            }
+                        }
+                    }
+                    if (n_hdr_v > 1) {
+                        mbarrier_wait(v_empty_addr + 8, 1);
+                        int hvblk_a_1 = hdr[hb + 5 + 2];
+                        int hvblk_b_1 = hdr[hb + 6 + 2];
+                        int v_has_b_1 = 1;
+                        if (hvblk_b_1 < 0) {
+                            v_has_b_1 = 0;
+                        }
+                        mbarrier_arrive_expect_tx(v_full_addr + 8, 16384 * (1 + v_has_b_1));
+                        if (tagf_v != 0) {
+                            int vtag_a_1 = hvblk_a_1 >> 14;
+                            int vtag_b_1 = hvblk_b_1 >> 14;
+                            unsigned long long vpol_a_1 = ((vtag_a_1 != 0) ? 1364590687093260288 : pol_v);
+                            unsigned long long vpol_b_1 = ((vtag_b_1 != 0) ? 1364590687093260288 : pol_v);
+                            int vrow_ta_1 = kv_base_hv + (hvblk_a_1 - (vtag_a_1 << 14)) * 64;
+                            int vrow_tb_1 = kv_base_hv + (hvblk_b_1 - (vtag_b_1 << 14)) * 64;
+                            asm volatile(
+                                "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                :: "r"(vt_smem_a_addr + 32768), "l"((&Vt)), "r"(0), "r"(0), "r"(vrow_ta_1 / 8), "r"(0),
+                                   "r"(v_full_addr + 8), "l"(vpol_a_1) : "memory");
+                            if (v_has_b_1 != 0) {
                                 asm volatile(
                                     "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
-                                    :: "r"(vt_smem_a_addr + (unsigned int)(hp_1 % 3 * 32768)), "l"((&Vt)), "r"(0), "r"(0), "r"(vrow_ua / 8), "r"(0),
-                                       "r"(v_full_addr + (hp_1 % 3) * 8), "l"(pol_v) : "memory");
-                                if (v_has_b != 0) {
-                                    asm volatile(
-                                        "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-                                        " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
-                                        :: "r"(vt_smem_b_addr + (unsigned int)(hp_1 % 3 * 32768)), "l"((&Vt)), "r"(0), "r"(0), "r"(vrow_ub / 8), "r"(0),
-                                           "r"(v_full_addr + (hp_1 % 3) * 8), "l"(pol_v) : "memory");
-                                }
+                                    :: "r"(vt_smem_b_addr + 32768), "l"((&Vt)), "r"(0), "r"(0), "r"(vrow_tb_1 / 8), "r"(0),
+                                       "r"(v_full_addr + 8), "l"(vpol_b_1) : "memory");
+                            }
+                        } else {
+                            int vrow_ua_1 = kv_base_hv + hvblk_a_1 * 64;
+                            int vrow_ub_1 = kv_base_hv + hvblk_b_1 * 64;
+                            asm volatile(
+                                "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                :: "r"(vt_smem_a_addr + 32768), "l"((&Vt)), "r"(0), "r"(0), "r"(vrow_ua_1 / 8), "r"(0),
+                                   "r"(v_full_addr + 8), "l"(pol_v) : "memory");
+                            if (v_has_b_1 != 0) {
+                                asm volatile(
+                                    "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                    " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                    :: "r"(vt_smem_b_addr + 32768), "l"((&Vt)), "r"(0), "r"(0), "r"(vrow_ub_1 / 8), "r"(0),
+                                       "r"(v_full_addr + 8), "l"(pol_v) : "memory");
+                            }
+                        }
+                    }
+                    if (n_hdr_v > 2) {
+                        mbarrier_wait(v_empty_addr + 16, 1);
+                        int hvblk_a_2 = hdr[hb + 5 + 4];
+                        int hvblk_b_2 = hdr[hb + 6 + 4];
+                        int v_has_b_2 = 1;
+                        if (hvblk_b_2 < 0) {
+                            v_has_b_2 = 0;
+                        }
+                        mbarrier_arrive_expect_tx(v_full_addr + 16, 16384 * (1 + v_has_b_2));
+                        if (tagf_v != 0) {
+                            int vtag_a_2 = hvblk_a_2 >> 14;
+                            int vtag_b_2 = hvblk_b_2 >> 14;
+                            unsigned long long vpol_a_2 = ((vtag_a_2 != 0) ? 1364590687093260288 : pol_v);
+                            unsigned long long vpol_b_2 = ((vtag_b_2 != 0) ? 1364590687093260288 : pol_v);
+                            int vrow_ta_2 = kv_base_hv + (hvblk_a_2 - (vtag_a_2 << 14)) * 64;
+                            int vrow_tb_2 = kv_base_hv + (hvblk_b_2 - (vtag_b_2 << 14)) * 64;
+                            asm volatile(
+                                "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                :: "r"(vt_smem_a_addr + 65536), "l"((&Vt)), "r"(0), "r"(0), "r"(vrow_ta_2 / 8), "r"(0),
+                                   "r"(v_full_addr + 16), "l"(vpol_a_2) : "memory");
+                            if (v_has_b_2 != 0) {
+                                asm volatile(
+                                    "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                    " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                    :: "r"(vt_smem_b_addr + 65536), "l"((&Vt)), "r"(0), "r"(0), "r"(vrow_tb_2 / 8), "r"(0),
+                                       "r"(v_full_addr + 16), "l"(vpol_b_2) : "memory");
+                            }
+                        } else {
+                            int vrow_ua_2 = kv_base_hv + hvblk_a_2 * 64;
+                            int vrow_ub_2 = kv_base_hv + hvblk_b_2 * 64;
+                            asm volatile(
+                                "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                :: "r"(vt_smem_a_addr + 65536), "l"((&Vt)), "r"(0), "r"(0), "r"(vrow_ua_2 / 8), "r"(0),
+                                   "r"(v_full_addr + 16), "l"(pol_v) : "memory");
+                            if (v_has_b_2 != 0) {
+                                asm volatile(
+                                    "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                    " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                    :: "r"(vt_smem_b_addr + 65536), "l"((&Vt)), "r"(0), "r"(0), "r"(vrow_ub_2 / 8), "r"(0),
+                                       "r"(v_full_addr + 16), "l"(pol_v) : "memory");
                             }
                         }
                     }
@@ -609,7 +833,9 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                         int slot_v = ti_2 & 1;
                         int mb_v = slot_v * 144;
                         if (ti_2 > 0) {
-                            mbarrier_wait(meta_full_addr + (slot_v) * 8, ti_2 >> 1 & 1);
+                            int _stage_meta_full_1 = (int)((unsigned int)ti_2 % 2);
+                            int _parity_meta_full_1 = (int)((unsigned int)ti_2 / 2 % 2);
+                            mbarrier_wait(meta_full_addr + (_stage_meta_full_1) * 8, _parity_meta_full_1);
                         }
                         int head_v = meta_smem[mb_v];
                         int n_seq_v = meta_smem[mb_v + 4];
@@ -622,53 +848,56 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                         for (int i_1 = i0_v; i_1 < n_seq_v; i_1++) {
                             int pv = gv + i_1;
                             int stage_v = pv % 3;
-                            mbarrier_wait(v_empty_addr + (stage_v) * 8, pv / 3 + 1 & 1);
+                            int pvlap = 0;
+                            pvlap += pv / 3;
+                            int _parity_v_empty = (int)((unsigned int)pvlap % 2) ^ 1;
+                            mbarrier_wait(v_empty_addr + (stage_v) * 8, _parity_v_empty);
                             int svw = meta_smem[mb_v + 8 + i_1];
                             int vblk_a = svw << 16 >> 16;
                             int vblk_b = svw >> 16;
-                            int v_has_b_1 = 1;
+                            int v_has_b_3 = 1;
                             if (vblk_b < 0) {
-                                v_has_b_1 = 0;
+                                v_has_b_3 = 0;
                             }
-                            mbarrier_arrive_expect_tx(v_full_addr + (stage_v) * 8, 16384 * (1 + v_has_b_1));
+                            mbarrier_arrive_expect_tx(v_full_addr + (stage_v) * 8, 16384 * (1 + v_has_b_3));
                             if (tagf_v != 0) {
-                                int vtag_a_1 = vblk_a >> 14;
-                                int vtag_b_1 = vblk_b >> 14;
-                                unsigned long long vpol_a_1 = ((vtag_a_1 != 0) ? 1364590687093260288 : pol_v);
-                                unsigned long long vpol_b_1 = ((vtag_b_1 != 0) ? 1364590687093260288 : pol_v);
-                                int vrow_ta_1 = kv_base_v + (vblk_a - (vtag_a_1 << 14)) * 64;
-                                int vrow_tb_1 = kv_base_v + (vblk_b - (vtag_b_1 << 14)) * 64;
+                                int vtag_a_3 = vblk_a >> 14;
+                                int vtag_b_3 = vblk_b >> 14;
+                                unsigned long long vpol_a_3 = ((vtag_a_3 != 0) ? 1364590687093260288 : pol_v);
+                                unsigned long long vpol_b_3 = ((vtag_b_3 != 0) ? 1364590687093260288 : pol_v);
+                                int vrow_ta_3 = kv_base_v + (vblk_a - (vtag_a_3 << 14)) * 64;
+                                int vrow_tb_3 = kv_base_v + (vblk_b - (vtag_b_3 << 14)) * 64;
                                 asm volatile(
                                     "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
-                                    :: "r"(vt_smem_a_addr + (unsigned int)(stage_v * 32768)), "l"((&Vt)), "r"(0), "r"(0), "r"(vrow_ta_1 / 8), "r"(0),
-                                       "r"(v_full_addr + (stage_v) * 8), "l"(vpol_a_1) : "memory");
-                                if (v_has_b_1 != 0) {
+                                    :: "r"(vt_smem_a_addr + (unsigned int)(stage_v * 32768)), "l"((&Vt)), "r"(0), "r"(0), "r"(vrow_ta_3 / 8), "r"(0),
+                                       "r"(v_full_addr + (stage_v) * 8), "l"(vpol_a_3) : "memory");
+                                if (v_has_b_3 != 0) {
                                     asm volatile(
                                         "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                         " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
-                                        :: "r"(vt_smem_b_addr + (unsigned int)(stage_v * 32768)), "l"((&Vt)), "r"(0), "r"(0), "r"(vrow_tb_1 / 8), "r"(0),
-                                           "r"(v_full_addr + (stage_v) * 8), "l"(vpol_b_1) : "memory");
+                                        :: "r"(vt_smem_b_addr + (unsigned int)(stage_v * 32768)), "l"((&Vt)), "r"(0), "r"(0), "r"(vrow_tb_3 / 8), "r"(0),
+                                           "r"(v_full_addr + (stage_v) * 8), "l"(vpol_b_3) : "memory");
                                 }
                             } else {
-                                int vrow_ua_1 = kv_base_v + vblk_a * 64;
-                                int vrow_ub_1 = kv_base_v + vblk_b * 64;
+                                int vrow_ua_3 = kv_base_v + vblk_a * 64;
+                                int vrow_ub_3 = kv_base_v + vblk_b * 64;
                                 asm volatile(
                                     "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
-                                    :: "r"(vt_smem_a_addr + (unsigned int)(stage_v * 32768)), "l"((&Vt)), "r"(0), "r"(0), "r"(vrow_ua_1 / 8), "r"(0),
+                                    :: "r"(vt_smem_a_addr + (unsigned int)(stage_v * 32768)), "l"((&Vt)), "r"(0), "r"(0), "r"(vrow_ua_3 / 8), "r"(0),
                                        "r"(v_full_addr + (stage_v) * 8), "l"(pol_v) : "memory");
-                                if (v_has_b_1 != 0) {
+                                if (v_has_b_3 != 0) {
                                     asm volatile(
                                         "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                         " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
-                                        :: "r"(vt_smem_b_addr + (unsigned int)(stage_v * 32768)), "l"((&Vt)), "r"(0), "r"(0), "r"(vrow_ub_1 / 8), "r"(0),
+                                        :: "r"(vt_smem_b_addr + (unsigned int)(stage_v * 32768)), "l"((&Vt)), "r"(0), "r"(0), "r"(vrow_ub_3 / 8), "r"(0),
                                            "r"(v_full_addr + (stage_v) * 8), "l"(pol_v) : "memory");
                                 }
                             }
                         }
                         gv += n_seq_v;
-                        mbarrier_arrive(meta_empty_addr + (slot_v) * 8);
+                        mbarrier_arrive(meta_empty_addr + ((int)((unsigned int)ti_2 % 2)) * 8);
                     }
                 }
             }
@@ -759,7 +988,9 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                 int slot_m = ti_3 & 1;
                 int mbase = slot_m * 144;
                 if (ti_3 > 0) {
-                    mbarrier_wait(meta_full_addr + (slot_m) * 8, ti_3 >> 1 & 1);
+                    int _stage_meta_full_2 = (int)((unsigned int)ti_3 % 2);
+                    int _parity_meta_full_2 = (int)((unsigned int)ti_3 / 2 % 2);
+                    mbarrier_wait(meta_full_addr + (_stage_meta_full_2) * 8, _parity_meta_full_2);
                 }
                 int head_m = __shfl_sync(0xFFFFFFFF, meta_smem[mbase], 0);
                 int qb0_m = __shfl_sync(0xFFFFFFFF, meta_smem[mbase + 1], 0);
@@ -842,7 +1073,8 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                 row_max1 = -CUDART_INF_F;
                 row_sum0 = 0.0f;
                 row_sum1 = 0.0f;
-                mbarrier_wait(q_ready_addr + (qs) * 8, ti_3 & 1);
+                int _parity_q_ready = (int)((unsigned int)ti_3 % 2);
+                mbarrier_wait(q_ready_addr + (qs) * 8, _parity_q_ready);
                 int q_half_base = q_smem_addr + (unsigned int)(qs * 16384) + (unsigned int)(q_ld_row * 128);
                 int q_col_bytes = q_ld_col_lane * 2;
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
@@ -897,25 +1129,34 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                 int cur_pos = 0;
                 int cur_has2 = 1;
                 if (n_own > 0) {
+                    int kpos0 = 0;
+                    int klap0 = 0;
                     int w_e = meta_smem[own_base_w];
                     int e0 = w_e & 65535;
                     int pos0 = gbase + (e0 >> 3);
                     int has2_0 = e0 >> 2 & 1;
                     #pragma unroll 1
                     for (int p_1 = prev + 1; p_1 < pos0; p_1++) {
-                        mbarrier_wait(k_full_addr + (p_1 % 3) * 8, p_1 / 3 & 1);
+                        int plap_1 = 0;
+                        plap_1 += p_1 / 3;
+                        int _parity_k_full = (int)((unsigned int)plap_1 % 2);
+                        mbarrier_wait(k_full_addr + (p_1 % 3) * 8, _parity_k_full);
                         if (elect_sync()) {
                             mbarrier_arrive(k_empty_addr + (p_1 % 3) * 8);
                         }
-                        mbarrier_wait(v_full_addr + (p_1 % 3) * 8, p_1 / 3 & 1);
+                        int _parity_v_full = (int)((unsigned int)plap_1 % 2);
+                        mbarrier_wait(v_full_addr + (p_1 % 3) * 8, _parity_v_full);
                         if (elect_sync()) {
                             mbarrier_arrive(v_empty_addr + (p_1 % 3) * 8);
                         }
                     }
+                    kpos0 += pos0;
+                    klap0 += pos0 / 3;
                     cur_pos = pos0;
                     cur_has2 = has2_0;
                     int stage_0 = pos0 % 3;
-                    mbarrier_wait(k_full_addr + (stage_0) * 8, pos0 / 3 & 1);
+                    int _parity_k_full_1 = (int)((unsigned int)klap0 % 2);
+                    mbarrier_wait(k_full_addr + (kpos0 % 3) * 8, _parity_k_full_1);
                     asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
                     uint64_t _wgmma_desc_0 = (((uint64_t)(((k_smem_addr + (unsigned int)(stage_0 * 32768))) >> 4) & 0x3FFFULL) | ((uint64_t)(0) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
                     uint64_t _wgmma_b_0 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_0 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_0);
@@ -956,7 +1197,7 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                     asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
                     asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
                     if (elect_sync()) {
-                        mbarrier_arrive(k_empty_addr + (pos0 % 3) * 8);
+                        mbarrier_arrive(k_empty_addr + (kpos0 % 3) * 8);
                     }
                     float f_max0 = -CUDART_INF_F;
                     float f_max1 = -CUDART_INF_F;
@@ -1263,25 +1504,38 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                     #pragma unroll 1
                     for (int n = 0; n < n_loop; n++) {
                         int cur_stage = cur_pos % 3;
-                        int cur_ph = cur_pos / 3 & 1;
                         int w_e_0 = meta_smem[own_base_w + (n + 1 >> 1)];
                         int en = w_e_0 >> (n + 1 & 1) * 16 & 65535;
                         int nxt_pos = gbase + (en >> 3);
                         int nxt_has2 = en >> 2 & 1;
                         #pragma unroll 1
                         for (int p_2 = cur_pos + 1; p_2 < nxt_pos; p_2++) {
-                            mbarrier_wait(k_full_addr + (p_2 % 3) * 8, p_2 / 3 & 1);
+                            int plap_2 = 0;
+                            plap_2 += p_2 / 3;
+                            int _parity_k_full_2 = (int)((unsigned int)plap_2 % 2);
+                            mbarrier_wait(k_full_addr + (p_2 % 3) * 8, _parity_k_full_2);
                             if (elect_sync()) {
                                 mbarrier_arrive(k_empty_addr + (p_2 % 3) * 8);
                             }
-                            mbarrier_wait(v_full_addr + (p_2 % 3) * 8, p_2 / 3 & 1);
+                            int _parity_v_full_1 = (int)((unsigned int)plap_2 % 2);
+                            mbarrier_wait(v_full_addr + (p_2 % 3) * 8, _parity_v_full_1);
                             if (elect_sync()) {
                                 mbarrier_arrive(v_empty_addr + (p_2 % 3) * 8);
                             }
                         }
+                        int knext = 0;
+                        knext += nxt_pos;
+                        int knlap = 0;
+                        knlap += nxt_pos / 3;
+                        int vcur = 0;
+                        vcur += cur_pos;
+                        int vclap = 0;
+                        vclap += cur_pos / 3;
                         int nxt_stage = nxt_pos % 3;
-                        mbarrier_wait(k_full_addr + (nxt_stage) * 8, nxt_pos / 3 & 1);
-                        mbarrier_wait(v_full_addr + (cur_stage) * 8, cur_ph);
+                        int _parity_k_full_3 = (int)((unsigned int)knlap % 2);
+                        mbarrier_wait(k_full_addr + (knext % 3) * 8, _parity_k_full_3);
+                        int _parity_v_full_2 = (int)((unsigned int)vclap % 2);
+                        mbarrier_wait(v_full_addr + (vcur % 3) * 8, _parity_v_full_2);
                         asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
                         uint64_t _wgmma_desc_46 = (((uint64_t)(((k_smem_addr + (unsigned int)(nxt_stage * 32768))) >> 4) & 0x3FFFULL) | ((uint64_t)(0) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
                         uint64_t _wgmma_b_2 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_46 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_46);
@@ -1552,7 +1806,7 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                         asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
                         asm volatile("wgmma.wait_group.sync.aligned 1;" ::: "memory");
                         if (elect_sync()) {
-                            mbarrier_arrive(k_empty_addr + (nxt_pos % 3) * 8);
+                            mbarrier_arrive(k_empty_addr + (knext % 3) * 8);
                         }
                         float new_max0 = -CUDART_INF_F;
                         float new_max1 = -CUDART_INF_F;
@@ -1777,7 +2031,7 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                         new_sum1 += _shfl_xor_sync_61;
                         asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
                         if (elect_sync()) {
-                            mbarrier_arrive(v_empty_addr + (cur_pos % 3) * 8);
+                            mbarrier_arrive(v_empty_addr + (vcur % 3) * 8);
                         }
                         pend0 = _exp2_64;
                         pend1 = _exp2_65;
@@ -1870,7 +2124,12 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                         cur_has2 = nxt_has2;
                     }
                     int last_stage = cur_pos % 3;
-                    mbarrier_wait(v_full_addr + (last_stage) * 8, cur_pos / 3 & 1);
+                    int vlast = 0;
+                    vlast += cur_pos;
+                    int vllap = 0;
+                    vllap += cur_pos / 3;
+                    int _parity_v_full_3 = (int)((unsigned int)vllap % 2);
+                    mbarrier_wait(v_full_addr + (vlast % 3) * 8, _parity_v_full_3);
                     asm volatile("" : "+f"(d_o[0]) :: "memory");
                     asm volatile("" : "+f"(d_o[1]) :: "memory");
                     asm volatile("" : "+f"(d_o[2]) :: "memory");
@@ -2103,7 +2362,7 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                     asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
                     asm volatile("wgmma.wait_group.sync.aligned 0;" ::: "memory");
                     if (elect_sync()) {
-                        mbarrier_arrive(v_empty_addr + (cur_pos % 3) * 8);
+                        mbarrier_arrive(v_empty_addr + (vlast % 3) * 8);
                     }
                     prev = cur_pos;
                 }
@@ -2111,11 +2370,15 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                 int tail_lo = prev + 1;
                 #pragma unroll 1
                 for (int p_3 = tail_lo; p_3 < tile_end; p_3++) {
-                    mbarrier_wait(k_full_addr + (p_3 % 3) * 8, p_3 / 3 & 1);
+                    int tlap = 0;
+                    tlap += p_3 / 3;
+                    int _parity_k_full_4 = (int)((unsigned int)tlap % 2);
+                    mbarrier_wait(k_full_addr + (p_3 % 3) * 8, _parity_k_full_4);
                     if (elect_sync()) {
                         mbarrier_arrive(k_empty_addr + (p_3 % 3) * 8);
                     }
-                    mbarrier_wait(v_full_addr + (p_3 % 3) * 8, p_3 / 3 & 1);
+                    int _parity_v_full_4 = (int)((unsigned int)tlap % 2);
+                    mbarrier_wait(v_full_addr + (p_3 % 3) * 8, _parity_v_full_4);
                     if (elect_sync()) {
                         mbarrier_arrive(v_empty_addr + (p_3 % 3) * 8);
                     }
@@ -2449,7 +2712,7 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                     unsigned int _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, send, 1);
                     o_vec[0] = ((qodd == 0) ? o_pk[0] : _shfl_xor_0);
                     o_vec[1] = ((qodd == 0) ? _shfl_xor_0 : o_pk[1]);
-                    asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + row_off + (0)), "r"(o_vec[(0) + 0]), "r"(o_vec[(0) + 1]) : "memory");
+                    reinterpret_cast<int2*>(O + row_off)[0] = reinterpret_cast<int2*>(o_vec)[0];
                     __nv_bfloat162 _bit_cast_src_102 = __float22bfloat162_rn(make_float2(d_o[8], d_o[9]));
                     o_pk[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_102)[0];
                     __nv_bfloat162 _bit_cast_src_103 = __float22bfloat162_rn(make_float2(d_o[12], d_o[13]));
@@ -2458,7 +2721,7 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                     unsigned int _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, send_0, 1);
                     o_vec[0] = ((qodd == 0) ? o_pk[0] : _shfl_xor_1);
                     o_vec[1] = ((qodd == 0) ? _shfl_xor_1 : o_pk[1]);
-                    asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + (row_off + 16) + (0)), "r"(o_vec[(0) + 0]), "r"(o_vec[(0) + 1]) : "memory");
+                    reinterpret_cast<int2*>(O + (row_off + 16))[0] = reinterpret_cast<int2*>(o_vec)[0];
                     __nv_bfloat162 _bit_cast_src_104 = __float22bfloat162_rn(make_float2(d_o[16], d_o[17]));
                     o_pk[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_104)[0];
                     __nv_bfloat162 _bit_cast_src_105 = __float22bfloat162_rn(make_float2(d_o[20], d_o[21]));
@@ -2467,7 +2730,7 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                     unsigned int _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, send_1, 1);
                     o_vec[0] = ((qodd == 0) ? o_pk[0] : _shfl_xor_2);
                     o_vec[1] = ((qodd == 0) ? _shfl_xor_2 : o_pk[1]);
-                    asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + (row_off + 32) + (0)), "r"(o_vec[(0) + 0]), "r"(o_vec[(0) + 1]) : "memory");
+                    reinterpret_cast<int2*>(O + (row_off + 32))[0] = reinterpret_cast<int2*>(o_vec)[0];
                     __nv_bfloat162 _bit_cast_src_106 = __float22bfloat162_rn(make_float2(d_o[24], d_o[25]));
                     o_pk[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_106)[0];
                     __nv_bfloat162 _bit_cast_src_107 = __float22bfloat162_rn(make_float2(d_o[28], d_o[29]));
@@ -2476,7 +2739,7 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                     unsigned int _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, send_2, 1);
                     o_vec[0] = ((qodd == 0) ? o_pk[0] : _shfl_xor_3);
                     o_vec[1] = ((qodd == 0) ? _shfl_xor_3 : o_pk[1]);
-                    asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + (row_off + 48) + (0)), "r"(o_vec[(0) + 0]), "r"(o_vec[(0) + 1]) : "memory");
+                    reinterpret_cast<int2*>(O + (row_off + 48))[0] = reinterpret_cast<int2*>(o_vec)[0];
                     __nv_bfloat162 _bit_cast_src_108 = __float22bfloat162_rn(make_float2(d_o[32], d_o[33]));
                     o_pk[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_108)[0];
                     __nv_bfloat162 _bit_cast_src_109 = __float22bfloat162_rn(make_float2(d_o[36], d_o[37]));
@@ -2485,7 +2748,7 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                     unsigned int _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, send_3, 1);
                     o_vec[0] = ((qodd == 0) ? o_pk[0] : _shfl_xor_4);
                     o_vec[1] = ((qodd == 0) ? _shfl_xor_4 : o_pk[1]);
-                    asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + (row_off + 64) + (0)), "r"(o_vec[(0) + 0]), "r"(o_vec[(0) + 1]) : "memory");
+                    reinterpret_cast<int2*>(O + (row_off + 64))[0] = reinterpret_cast<int2*>(o_vec)[0];
                     __nv_bfloat162 _bit_cast_src_110 = __float22bfloat162_rn(make_float2(d_o[40], d_o[41]));
                     o_pk[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_110)[0];
                     __nv_bfloat162 _bit_cast_src_111 = __float22bfloat162_rn(make_float2(d_o[44], d_o[45]));
@@ -2494,7 +2757,7 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                     unsigned int _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, send_4, 1);
                     o_vec[0] = ((qodd == 0) ? o_pk[0] : _shfl_xor_5);
                     o_vec[1] = ((qodd == 0) ? _shfl_xor_5 : o_pk[1]);
-                    asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + (row_off + 80) + (0)), "r"(o_vec[(0) + 0]), "r"(o_vec[(0) + 1]) : "memory");
+                    reinterpret_cast<int2*>(O + (row_off + 80))[0] = reinterpret_cast<int2*>(o_vec)[0];
                     __nv_bfloat162 _bit_cast_src_112 = __float22bfloat162_rn(make_float2(d_o[48], d_o[49]));
                     o_pk[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_112)[0];
                     __nv_bfloat162 _bit_cast_src_113 = __float22bfloat162_rn(make_float2(d_o[52], d_o[53]));
@@ -2503,7 +2766,7 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                     unsigned int _shfl_xor_6 = __shfl_xor_sync(0xFFFFFFFF, send_5, 1);
                     o_vec[0] = ((qodd == 0) ? o_pk[0] : _shfl_xor_6);
                     o_vec[1] = ((qodd == 0) ? _shfl_xor_6 : o_pk[1]);
-                    asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + (row_off + 96) + (0)), "r"(o_vec[(0) + 0]), "r"(o_vec[(0) + 1]) : "memory");
+                    reinterpret_cast<int2*>(O + (row_off + 96))[0] = reinterpret_cast<int2*>(o_vec)[0];
                     __nv_bfloat162 _bit_cast_src_114 = __float22bfloat162_rn(make_float2(d_o[56], d_o[57]));
                     o_pk[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_114)[0];
                     __nv_bfloat162 _bit_cast_src_115 = __float22bfloat162_rn(make_float2(d_o[60], d_o[61]));
@@ -2512,7 +2775,7 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                     unsigned int _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, send_6, 1);
                     o_vec[0] = ((qodd == 0) ? o_pk[0] : _shfl_xor_7);
                     o_vec[1] = ((qodd == 0) ? _shfl_xor_7 : o_pk[1]);
-                    asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + (row_off + 112) + (0)), "r"(o_vec[(0) + 0]), "r"(o_vec[(0) + 1]) : "memory");
+                    reinterpret_cast<int2*>(O + (row_off + 112))[0] = reinterpret_cast<int2*>(o_vec)[0];
                     int m_local_r_7 = m1_local;
                     int row_off_8 = o_row_base + m_local_r_7 * 128;
                     __nv_bfloat162 _bit_cast_src_116 = __float22bfloat162_rn(make_float2(d_o[2], d_o[3]));
@@ -2523,7 +2786,7 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                     unsigned int _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, send_9, 1);
                     o_vec[0] = ((qodd == 0) ? o_pk[0] : _shfl_xor_8);
                     o_vec[1] = ((qodd == 0) ? _shfl_xor_8 : o_pk[1]);
-                    asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + row_off_8 + (0)), "r"(o_vec[(0) + 0]), "r"(o_vec[(0) + 1]) : "memory");
+                    reinterpret_cast<int2*>(O + row_off_8)[0] = reinterpret_cast<int2*>(o_vec)[0];
                     __nv_bfloat162 _bit_cast_src_118 = __float22bfloat162_rn(make_float2(d_o[10], d_o[11]));
                     o_pk[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_118)[0];
                     __nv_bfloat162 _bit_cast_src_119 = __float22bfloat162_rn(make_float2(d_o[14], d_o[15]));
@@ -2532,7 +2795,7 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                     unsigned int _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, send_10, 1);
                     o_vec[0] = ((qodd == 0) ? o_pk[0] : _shfl_xor_9);
                     o_vec[1] = ((qodd == 0) ? _shfl_xor_9 : o_pk[1]);
-                    asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + (row_off_8 + 16) + (0)), "r"(o_vec[(0) + 0]), "r"(o_vec[(0) + 1]) : "memory");
+                    reinterpret_cast<int2*>(O + (row_off_8 + 16))[0] = reinterpret_cast<int2*>(o_vec)[0];
                     __nv_bfloat162 _bit_cast_src_120 = __float22bfloat162_rn(make_float2(d_o[18], d_o[19]));
                     o_pk[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_120)[0];
                     __nv_bfloat162 _bit_cast_src_121 = __float22bfloat162_rn(make_float2(d_o[22], d_o[23]));
@@ -2541,7 +2804,7 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                     unsigned int _shfl_xor_10 = __shfl_xor_sync(0xFFFFFFFF, send_11, 1);
                     o_vec[0] = ((qodd == 0) ? o_pk[0] : _shfl_xor_10);
                     o_vec[1] = ((qodd == 0) ? _shfl_xor_10 : o_pk[1]);
-                    asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + (row_off_8 + 32) + (0)), "r"(o_vec[(0) + 0]), "r"(o_vec[(0) + 1]) : "memory");
+                    reinterpret_cast<int2*>(O + (row_off_8 + 32))[0] = reinterpret_cast<int2*>(o_vec)[0];
                     __nv_bfloat162 _bit_cast_src_122 = __float22bfloat162_rn(make_float2(d_o[26], d_o[27]));
                     o_pk[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_122)[0];
                     __nv_bfloat162 _bit_cast_src_123 = __float22bfloat162_rn(make_float2(d_o[30], d_o[31]));
@@ -2550,7 +2813,7 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                     unsigned int _shfl_xor_11 = __shfl_xor_sync(0xFFFFFFFF, send_12, 1);
                     o_vec[0] = ((qodd == 0) ? o_pk[0] : _shfl_xor_11);
                     o_vec[1] = ((qodd == 0) ? _shfl_xor_11 : o_pk[1]);
-                    asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + (row_off_8 + 48) + (0)), "r"(o_vec[(0) + 0]), "r"(o_vec[(0) + 1]) : "memory");
+                    reinterpret_cast<int2*>(O + (row_off_8 + 48))[0] = reinterpret_cast<int2*>(o_vec)[0];
                     __nv_bfloat162 _bit_cast_src_124 = __float22bfloat162_rn(make_float2(d_o[34], d_o[35]));
                     o_pk[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_124)[0];
                     __nv_bfloat162 _bit_cast_src_125 = __float22bfloat162_rn(make_float2(d_o[38], d_o[39]));
@@ -2559,7 +2822,7 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                     unsigned int _shfl_xor_12 = __shfl_xor_sync(0xFFFFFFFF, send_13, 1);
                     o_vec[0] = ((qodd == 0) ? o_pk[0] : _shfl_xor_12);
                     o_vec[1] = ((qodd == 0) ? _shfl_xor_12 : o_pk[1]);
-                    asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + (row_off_8 + 64) + (0)), "r"(o_vec[(0) + 0]), "r"(o_vec[(0) + 1]) : "memory");
+                    reinterpret_cast<int2*>(O + (row_off_8 + 64))[0] = reinterpret_cast<int2*>(o_vec)[0];
                     __nv_bfloat162 _bit_cast_src_126 = __float22bfloat162_rn(make_float2(d_o[42], d_o[43]));
                     o_pk[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_126)[0];
                     __nv_bfloat162 _bit_cast_src_127 = __float22bfloat162_rn(make_float2(d_o[46], d_o[47]));
@@ -2568,7 +2831,7 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                     unsigned int _shfl_xor_13 = __shfl_xor_sync(0xFFFFFFFF, send_14, 1);
                     o_vec[0] = ((qodd == 0) ? o_pk[0] : _shfl_xor_13);
                     o_vec[1] = ((qodd == 0) ? _shfl_xor_13 : o_pk[1]);
-                    asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + (row_off_8 + 80) + (0)), "r"(o_vec[(0) + 0]), "r"(o_vec[(0) + 1]) : "memory");
+                    reinterpret_cast<int2*>(O + (row_off_8 + 80))[0] = reinterpret_cast<int2*>(o_vec)[0];
                     __nv_bfloat162 _bit_cast_src_128 = __float22bfloat162_rn(make_float2(d_o[50], d_o[51]));
                     o_pk[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_128)[0];
                     __nv_bfloat162 _bit_cast_src_129 = __float22bfloat162_rn(make_float2(d_o[54], d_o[55]));
@@ -2577,7 +2840,7 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                     unsigned int _shfl_xor_14 = __shfl_xor_sync(0xFFFFFFFF, send_15, 1);
                     o_vec[0] = ((qodd == 0) ? o_pk[0] : _shfl_xor_14);
                     o_vec[1] = ((qodd == 0) ? _shfl_xor_14 : o_pk[1]);
-                    asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + (row_off_8 + 96) + (0)), "r"(o_vec[(0) + 0]), "r"(o_vec[(0) + 1]) : "memory");
+                    reinterpret_cast<int2*>(O + (row_off_8 + 96))[0] = reinterpret_cast<int2*>(o_vec)[0];
                     __nv_bfloat162 _bit_cast_src_130 = __float22bfloat162_rn(make_float2(d_o[58], d_o[59]));
                     o_pk[0] = reinterpret_cast<unsigned int*>(&_bit_cast_src_130)[0];
                     __nv_bfloat162 _bit_cast_src_131 = __float22bfloat162_rn(make_float2(d_o[62], d_o[63]));
@@ -2586,11 +2849,11 @@ kernel_cake_vsa_sm90_dead614631d8a6b8d69e(const __grid_constant__ CUtensorMap Q,
                     unsigned int _shfl_xor_15 = __shfl_xor_sync(0xFFFFFFFF, send_16, 1);
                     o_vec[0] = ((qodd == 0) ? o_pk[0] : _shfl_xor_15);
                     o_vec[1] = ((qodd == 0) ? _shfl_xor_15 : o_pk[1]);
-                    asm volatile("st.global.v2.b32 [%0], {%1, %2};" :: "l"(O + (row_off_8 + 112) + (0)), "r"(o_vec[(0) + 0]), "r"(o_vec[(0) + 1]) : "memory");
+                    reinterpret_cast<int2*>(O + (row_off_8 + 112))[0] = reinterpret_cast<int2*>(o_vec)[0];
                 }
                 __syncwarp();
                 if (elect_sync()) {
-                    mbarrier_arrive(meta_empty_addr + (slot_m) * 8);
+                    mbarrier_arrive(meta_empty_addr + ((int)((unsigned int)ti_3 % 2)) * 8);
                 }
             }
         }
