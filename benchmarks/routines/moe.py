@@ -21,6 +21,16 @@ from flashinfer.fused_moe import (
     trtllm_fp8_per_tensor_scale_moe,
     cutlass_fused_moe,
     fused_topk_deepseek,
+    GELU,
+    GeGLU,
+    GeGLUTanh,
+    Identity,
+    ReLU,
+    ReLU2,
+    SiLU,
+    SiTU,
+    SwiGLU,
+    SwiGLUStep,
 )
 from flashinfer.tllm_enums import RoutingMethodType, is_gated_activation
 from flashinfer import fp4_quantize, mxfp8_quantize
@@ -49,6 +59,7 @@ from .moe_utils import (
     add_common_moe_args,
     process_fp8_weight_layout,
     create_moe_output_scale_scalars,
+    pack_topk_ids,
     FLOAT8_E4M3_MAX,
     FLOAT4_E2M1_MAX,
     SF_VEC_SIZE,
@@ -59,6 +70,45 @@ from .moe_utils import (
 _ACTIVATION_TO_GATED_ACT = {
     ActivationType.Swiglu: 0,
     ActivationType.Geglu: 1,
+}
+
+
+# Flat ActivationType -> typed activation of the library's prepare_* helpers
+# (they choose the gated / non-gated weight permutation from it).
+_UNIFIED_ACTIVATIONS = {
+    ActivationType.Swiglu: SwiGLU,
+    ActivationType.SwigluStep: SwiGLUStep,
+    ActivationType.Geglu: GeGLU,
+    ActivationType.GegluTanh: GeGLUTanh,
+    ActivationType.Situ: SiTU,
+    ActivationType.Relu2: ReLU2,
+    ActivationType.Identity: Identity,
+    ActivationType.Gelu: GELU,
+    ActivationType.Relu: ReLU,
+    ActivationType.Silu: SiLU,
+}
+
+# Activations accepted by cute_dsl_fp4_block_scale_moe (CuteDslMoEWrapper).
+_CUTE_DSL_FLAT_ACTIVATIONS = (
+    ActivationType.Swiglu,
+    ActivationType.GegluTanh,
+    ActivationType.Relu2,
+)
+
+# CLI spelling -> RoutingMethodType value. "hash" (DeepSeek-V4 hash_topk) has
+# no RoutingMethodType; it maps to -1 and is accepted by moe_routing only.
+_ROUTING_METHOD_NAME_TO_TYPE = {
+    "default": int(RoutingMethodType.Default),
+    "renormalize": int(RoutingMethodType.Renormalize),
+    "deepseek_v3": int(RoutingMethodType.DeepSeekV3),
+    "llama4": int(RoutingMethodType.Llama4),
+    "renormalize_naive": int(RoutingMethodType.RenormalizeNaive),
+    "topk": int(RoutingMethodType.TopK),
+    "sigmoid_renorm": int(RoutingMethodType.SigmoidRenorm),
+    "minimax2": int(RoutingMethodType.MiniMax2),
+    "sigmoid": int(RoutingMethodType.Sigmoid),
+    "topk_sigmoid": int(RoutingMethodType.TopKSigmoid),
+    "hash": -1,
 }
 
 
@@ -108,6 +158,12 @@ def run_moe_test(args):
         return testBgmvMoe(args)
     elif args.routine == "unified_nvfp4_moe":
         return testUnifiedNvfp4Moe(args)
+    elif args.routine == "trtllm_bf16_moe":
+        return testTrtllmBf16Moe(args)
+    elif args.routine == "trtllm_mxint4_block_scale_moe":
+        return testTrtllmMxint4BlockScaleMoe(args)
+    elif args.routine == "moe_routing":
+        return testMoeRouting(args)
     else:
         raise ValueError(f"Unsupported routine: {args.routine}")
 
@@ -123,13 +179,15 @@ def parse_moe_args(line, parser):
     Returns:
         Parsed argument namespace
     """
-    add_common_moe_args(parser)
+    # moe_routing times the router only and has no expert FFN.
+    routing_only = "moe_routing" in line
+    add_common_moe_args(parser, hidden_size_required=not routing_only)
     # Note: num_tokens/hidden_size is added by add_common_moe_args
     parser.add_argument(
         "--intermediate_size",
         type=int,
-        required=True,
-        help="Intermediate dimension size (not used for bgmv_moe).",
+        required=not routing_only,
+        help="Intermediate dimension size (not used for bgmv_moe or moe_routing).",
     )
     # Note: num_experts/top_k is added by add_common_moe_args
     parser.add_argument(
@@ -179,16 +237,138 @@ def parse_moe_args(line, parser):
         type=str,
         required=False,
         default="deepseek_v3",
-        choices=[
-            "renormalize",
-            "deepseek_v3",
-            "llama4",
-            "renormalize_naive",
-            "topk",
-        ],
+        choices=list(_ROUTING_METHOD_NAME_TO_TYPE),
         help=(
-            "Routing method: renormalize | deepseek_v3 | llama4 | renormalize_naive | topk."
+            "Routing method (RoutingMethodType): "
+            + " | ".join(_ROUTING_METHOD_NAME_TO_TYPE)
+            + ". 'hash' is DeepSeek-V4 hash routing and is only valid for moe_routing."
         ),
+    )
+    parser.add_argument(
+        "--backends",
+        type=str,
+        nargs="+",
+        required=False,
+        default=None,
+        help=(
+            "Backends to benchmark. trtllm_* routines: trtllm (default) and/or "
+            "prims-ts. moe_routing: trtllm, dsv3, alphamoe, hash (default: "
+            "every backend that implements --routing_method)."
+        ),
+    )
+    parser.add_argument(
+        "--routing_input",
+        type=str,
+        required=False,
+        default="logits",
+        choices=["logits", "precomputed"],
+        help=(
+            "trtllm_* routines: logits runs the in-kernel router on routing logits; "
+            "precomputed calls the *_routed_moe API with packed top-k ids computed "
+            "by a torch reference of --routing_method."
+        ),
+    )
+    parser.add_argument(
+        "--fp8_quant_type",
+        type=str,
+        required=False,
+        default="deepseek",
+        choices=["deepseek", "mxfp8"],
+        help=(
+            "trtllm_fp8_block_scale_moe weight/activation format: deepseek "
+            "(128x128 FP8 block scales) or mxfp8 (MXFP8 x MXFP8)."
+        ),
+    )
+    parser.add_argument(
+        "--fp8_scale_granularity",
+        type=str,
+        required=False,
+        default="per_tensor",
+        choices=["per_tensor", "per_channel"],
+        help=(
+            "trtllm_fp8_per_tensor_scale_moe weight scale: per_tensor or "
+            "per_channel (trtllm_fp8_per_channel_scale_moe)."
+        ),
+    )
+    parser.add_argument(
+        "--swiglu_alpha",
+        type=float,
+        required=False,
+        default=None,
+        help="SwiGLU alpha (gpt-oss style) for trtllm_fp4_block_scale_moe and cutlass_fused_moe.",
+    )
+    parser.add_argument(
+        "--swiglu_beta",
+        type=float,
+        required=False,
+        default=None,
+        help="SwiGLU beta (gpt-oss style) for trtllm_fp4_block_scale_moe and cutlass_fused_moe.",
+    )
+    parser.add_argument(
+        "--swiglu_limit",
+        type=float,
+        required=False,
+        default=None,
+        help="SwiGLU clamp limit (gpt-oss style) for trtllm_fp4_block_scale_moe and cutlass_fused_moe.",
+    )
+    parser.add_argument(
+        "--gemm_bias",
+        action="store_true",
+        default=False,
+        help="Add FC1/FC2 expert biases (trtllm_fp4_block_scale_moe only).",
+    )
+    parser.add_argument(
+        "--valid_hidden_size",
+        type=int,
+        required=False,
+        default=None,
+        help=(
+            "trtllm_* routines: unpadded hidden size when --hidden_size is the padded "
+            "weight/activation width (e.g. GPT-OSS: --hidden_size 3072 "
+            "--valid_hidden_size 2880)."
+        ),
+    )
+    parser.add_argument(
+        "--valid_intermediate_size",
+        type=int,
+        required=False,
+        default=None,
+        help=(
+            "trtllm_* routines: unpadded intermediate size when --intermediate_size is "
+            "padded (e.g. GPT-OSS: --intermediate_size 2944 --valid_intermediate_size 2880)."
+        ),
+    )
+    parser.add_argument(
+        "--num_fused_shared_experts",
+        type=int,
+        required=False,
+        default=0,
+        help="Fused shared experts appended to the routed experts (trtllm FP4/FP8 block, DeepSeekV3 routing only).",
+    )
+    parser.add_argument(
+        "--alphamoe_routing",
+        type=str,
+        required=False,
+        default="aligned",
+        choices=["aligned", "routed"],
+        help=(
+            "alphamoe_nvfp4_aligned_moe: aligned times the MoE over a pre-built "
+            "aligned plan; routed times alphamoe_nvfp4_routed_moe (route + align + MoE)."
+        ),
+    )
+    parser.add_argument(
+        "--tile_tokens_dim",
+        type=int,
+        required=False,
+        default=8,
+        help="moe_routing trtllm backend: token tile of the downstream grouped GEMM.",
+    )
+    parser.add_argument(
+        "--hash_vocab_size",
+        type=int,
+        required=False,
+        default=129280,
+        help="moe_routing hash backend: vocabulary size of the token-to-expert table.",
     )
     parser.add_argument(
         "--use_shuffled_weight",
@@ -351,14 +531,9 @@ def parse_moe_args(line, parser):
     args = parser.parse_args(line)
 
     # Normalize routing method (map string to internal int expected by kernels)
-    routing_method_name_to_type = {
-        "renormalize": 1,
-        "deepseek_v3": 2,
-        "llama4": 3,
-        "renormalize_naive": 4,
-        "topk": 5,
-    }
-    args.routing_method_type = routing_method_name_to_type[args.routing_method]
+    args.routing_method_type = _ROUTING_METHOD_NAME_TO_TYPE[args.routing_method]
+    if args.routing_method == "hash" and args.routine != "moe_routing":
+        raise ValueError("--routing_method hash is only valid for moe_routing")
 
     if args.verbose >= 1:
         print(f"[INFO] {args = }")
@@ -376,8 +551,14 @@ def create_trtllm_moe_test_data(
     weight_dtype: torch.dtype,
     device: torch.device,
     moe_kernel_type: str = "fp8_per_tensor",
+    is_gated: bool = True,
+    num_weight_experts: Optional[int] = None,
 ):
     """
+    ``num_weight_experts`` is the number of expert weight slices to build: the
+    launcher requires ``local_num_experts`` (+ fused shared experts) rows, so an
+    EP-local run passes that instead of the global ``num_experts``.
+    ``is_gated=False`` (ReLU2) builds a single-projection GEMM1.
     Create test data for TensorRT-LLM fused MoE benchmarking (trtllm_*_moe APIs).
 
     This helper prepares inputs for the TensorRT-LLM fused MoE kernels exposed via
@@ -405,7 +586,7 @@ def create_trtllm_moe_test_data(
         routing_logits = torch.randn(
             (num_tokens, num_experts), device=device, dtype=routing_dtype
         )
-    elif moe_kernel_type == "fp4_block_scale":
+    elif moe_kernel_type in ("fp4_block_scale", "bf16", "mxint4"):
         # FP4 block scale MOE follows the test pattern: float32 for DeepSeekV3, bfloat16 for others
         routing_dtype = torch.float32 if routing_method_type == 2 else torch.bfloat16
         routing_logits = torch.randn(
@@ -429,10 +610,74 @@ def create_trtllm_moe_test_data(
 
     # Create weights - always start with bfloat16 for proper quantization
     gemm1_weights, gemm2_weights = generate_moe_weights(
-        num_experts, hidden_size, intermediate_size, device, dtype=torch.bfloat16
+        num_weight_experts or num_experts,
+        hidden_size,
+        intermediate_size,
+        device,
+        dtype=torch.bfloat16,
+        is_gated=is_gated,
     )
 
     return routing_logits, routing_bias, hidden_states, gemm1_weights, gemm2_weights
+
+
+def _reference_routing(
+    routing_logits: torch.Tensor,
+    routing_bias: Optional[torch.Tensor],
+    top_k: int,
+    routing_method_type: int,
+    n_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
+    routed_scaling_factor: Optional[float] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Torch reference of every ``RoutingMethodType`` (see flashinfer/tllm_enums.py).
+
+    Returns ``(topk_ids int32, topk_weights float32)``, both ``[num_tokens, top_k]``.
+    It feeds ``--routing_input precomputed``, the bandwidth model's active-expert
+    count, and the moe_routing cross-check. It is deliberately independent of
+    ``fused_topk_deepseek``, whose kernel limits (top_k <= 8, ...) are not the
+    fused-MoE routing limits.
+    """
+    logits = routing_logits.float()
+    method = RoutingMethodType(routing_method_type)
+    if method in (RoutingMethodType.DeepSeekV3, RoutingMethodType.MiniMax2):
+        scores = torch.sigmoid(logits)
+        biased = scores
+        if routing_bias is not None:
+            biased = scores + routing_bias.float()
+        if method == RoutingMethodType.DeepSeekV3 and n_group and n_group > 1:
+            num_tokens, num_experts = biased.shape
+            grouped = biased.view(num_tokens, n_group, num_experts // n_group)
+            group_scores = grouped.topk(2, dim=-1).values.sum(dim=-1)
+            keep = torch.zeros_like(group_scores, dtype=torch.bool)
+            keep.scatter_(1, group_scores.topk(topk_group, dim=-1).indices, True)
+            biased = biased.masked_fill(
+                ~keep.repeat_interleave(num_experts // n_group, dim=1), float("-inf")
+            )
+        ids = biased.topk(top_k, dim=-1).indices
+        weights = scores.gather(1, ids)
+        weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+        if method == RoutingMethodType.DeepSeekV3 and routed_scaling_factor:
+            weights = weights * routed_scaling_factor
+    elif method in (RoutingMethodType.Default, RoutingMethodType.RenormalizeNaive):
+        weights, ids = torch.softmax(logits, dim=-1).topk(top_k, dim=-1)
+        if method == RoutingMethodType.RenormalizeNaive:
+            weights = weights / weights.sum(dim=-1, keepdim=True)
+    elif method == RoutingMethodType.Renormalize:
+        values, ids = logits.topk(top_k, dim=-1)
+        weights = torch.softmax(values, dim=-1)
+    elif method in (RoutingMethodType.Llama4, RoutingMethodType.TopKSigmoid):
+        values, ids = logits.topk(top_k, dim=-1)
+        weights = torch.sigmoid(values)
+    elif method in (RoutingMethodType.Sigmoid, RoutingMethodType.SigmoidRenorm):
+        weights, ids = torch.sigmoid(logits).topk(top_k, dim=-1)
+        if method == RoutingMethodType.SigmoidRenorm:
+            weights = weights / weights.sum(dim=-1, keepdim=True)
+    elif method == RoutingMethodType.TopK:
+        weights, ids = logits.topk(top_k, dim=-1)
+    else:
+        raise ValueError(f"No reference routing for {method!r}")
+    return ids.to(torch.int32), weights.float().contiguous()
 
 
 def _compute_routing_for_method(
@@ -448,53 +693,398 @@ def _compute_routing_for_method(
     Compute selected experts based on routing method type.
     Returns only the selected expert indices tensor.
 
-    Args:
-        routing_logits: [num_tokens, num_experts] routing scores
-        routing_bias: Optional [num_experts] routing bias
-        top_k: Number of experts to select per token
-        routing_method_type: Type of routing method (see RoutingMethodType enum)
-        n_group: Number of expert groups (for DeepSeekV3)
-        topk_group: Number of top groups (for DeepSeekV3)
-        routed_scaling_factor: Scaling factor (for DeepSeekV3)
-
-    Returns:
-        selected_experts: [num_tokens, top_k] tensor of selected expert indices
+    DeepSeekV3 keeps using ``fused_topk_deepseek`` where that kernel accepts the
+    configuration (so existing CSV rows are unchanged) and falls back to the torch
+    reference where it does not (e.g. n_group=1 with top_k > 8, which the
+    fused MoE accepts but fused_topk_deepseek rejects).
     """
-    num_tokens = routing_logits.shape[0]
-    device = routing_logits.device
-
     if routing_method_type == RoutingMethodType.DeepSeekV3:
-        # Use fused_topk_deepseek for accurate DeepSeekV3 routing
         if n_group is None or topk_group is None or routed_scaling_factor is None:
             raise ValueError(
                 "DeepSeekV3 routing requires n_group, topk_group, and routed_scaling_factor"
             )
-        if routing_bias is None:
-            routing_bias = torch.zeros(
+        num_tokens = routing_logits.shape[0]
+        device = routing_logits.device
+        bias = routing_bias
+        if bias is None:
+            bias = torch.zeros(
                 routing_logits.shape[1], device=device, dtype=routing_logits.dtype
             )
-
-        # Allocate output tensors
         topk_values = torch.empty(num_tokens, top_k, device=device, dtype=torch.float32)
         topk_indices = torch.empty(num_tokens, top_k, device=device, dtype=torch.int32)
+        try:
+            fused_topk_deepseek(
+                scores=routing_logits.float(),
+                bias=bias.float(),
+                n_group=n_group,
+                topk_group=topk_group,
+                topk=top_k,
+                routed_scaling_factor=routed_scaling_factor,
+                topk_values=topk_values,
+                topk_indices=topk_indices,
+            )
+            return topk_indices
+        except ValueError:
+            pass
+    ids, _ = _reference_routing(
+        routing_logits,
+        routing_bias,
+        top_k,
+        routing_method_type,
+        n_group,
+        topk_group,
+        routed_scaling_factor,
+    )
+    return ids
 
-        fused_topk_deepseek(
-            scores=routing_logits.float(),
-            bias=routing_bias.float(),
-            n_group=n_group,
-            topk_group=topk_group,
-            topk=top_k,
-            routed_scaling_factor=routed_scaling_factor,
-            topk_values=topk_values,
-            topk_indices=topk_indices,
+
+# =============================================================================
+# TRT-LLM Gen MoE family: the trtllm_* flat APIs, their *_routed_moe twins
+# (--routing_input precomputed) and the signature-compatible Prims-TS
+# implementations (--backends prims-ts).
+# =============================================================================
+
+# (family, backend, routing_input) -> public API in flashinfer.fused_moe. The
+# Prims-TS entry points share the TRT-LLM signatures (backends/prims_ts/*_op.py)
+# and are lazy exports, so every API is resolved by name at call time.
+_TRTLLM_MOE_APIS = {
+    ("fp4", "trtllm", "logits"): "trtllm_fp4_block_scale_moe",
+    ("fp4", "trtllm", "precomputed"): "trtllm_fp4_block_scale_routed_moe",
+    ("fp4", "prims-ts", "logits"): "prims_ts_fp4_block_scale_moe",
+    ("fp4", "prims-ts", "precomputed"): "prims_ts_fp4_block_scale_routed_moe",
+    ("fp8_block", "trtllm", "logits"): "trtllm_fp8_block_scale_moe",
+    ("fp8_block", "trtllm", "precomputed"): "trtllm_fp8_block_scale_routed_moe",
+    ("fp8_block", "prims-ts", "logits"): "prims_ts_fp8_block_scale_moe",
+    ("fp8_block", "prims-ts", "precomputed"): "prims_ts_fp8_block_scale_routed_moe",
+    ("fp8_per_tensor", "trtllm", "logits"): "trtllm_fp8_per_tensor_scale_moe",
+    (
+        "fp8_per_tensor",
+        "trtllm",
+        "precomputed",
+    ): "trtllm_fp8_per_tensor_scale_routed_moe",
+    ("fp8_per_tensor", "prims-ts", "logits"): "prims_ts_fp8_per_tensor_scale_moe",
+    ("fp8_per_channel", "trtllm", "logits"): "trtllm_fp8_per_channel_scale_moe",
+    (
+        "fp8_per_channel",
+        "trtllm",
+        "precomputed",
+    ): "trtllm_fp8_per_channel_scale_routed_moe",
+    ("bf16", "trtllm", "logits"): "trtllm_bf16_moe",
+    ("bf16", "trtllm", "precomputed"): "trtllm_bf16_routed_moe",
+    ("bf16", "prims-ts", "logits"): "prims_ts_bf16_moe",
+    ("bf16", "prims-ts", "precomputed"): "prims_ts_bf16_routed_moe",
+    ("mxint4", "trtllm", "logits"): "trtllm_mxint4_block_scale_moe",
+    ("mxint4", "trtllm", "precomputed"): "trtllm_mxint4_block_scale_routed_moe",
+}
+
+
+def _select_trtllm_moe_backends(args, family, device):
+    """Resolve --backends (default trtllm) against the APIs that exist for this mode."""
+    backends = []
+    for backend in dict.fromkeys(args.backends or ["trtllm"]):
+        if (family, backend, args.routing_input) in _TRTLLM_MOE_APIS:
+            backends.append(backend)
+        else:
+            print(
+                f"[WARNING] {backend} has no {args.routing_input}-routing API for "
+                f"{args.routine} ({family}). Skipping."
+            )
+    return filter_backends_by_compute_capability(backends, args.routine, device)
+
+
+def _trtllm_moe_setup(args, moe_kernel_type, device):
+    """Shared geometry, test data and routing for every trtllm_* routine."""
+    activation_type = args.activation_type
+    is_gated = is_gated_activation(activation_type)
+    num_shared = args.num_fused_shared_experts
+    if num_shared and args.routing_method_type != RoutingMethodType.DeepSeekV3:
+        raise ValueError("--num_fused_shared_experts requires DeepSeekV3 routing")
+    if num_shared and args.routing_input == "precomputed":
+        raise ValueError(
+            "--num_fused_shared_experts is only supported with --routing_input logits"
         )
-        return topk_indices
-    else:
-        # For other routing methods, use simple top-k as approximation
-        # This is accurate for Default, Renormalize, RenormalizeNaive, TopK
-        # and approximate for Llama4
-        _, selected_experts = compute_routing(routing_logits.float(), top_k)
-        return selected_experts
+    local_num_experts = args.local_num_experts or args.num_experts
+    # Physical expert rows: the launcher sizes every per-expert tensor as
+    # local_num_experts + num_fused_shared_experts.
+    weight_rows = local_num_experts + num_shared
+    routing_logits, routing_bias, hidden_states, gemm1_weights, gemm2_weights = (
+        create_trtllm_moe_test_data(
+            args.num_tokens,
+            args.hidden_size,
+            args.intermediate_size,
+            args.num_experts,
+            args.routing_method_type,
+            args.use_routing_bias,
+            dtype_str_to_torch_dtype(args.input_dtype),
+            dtype_str_to_torch_dtype(args.weight_dtype),
+            device,
+            moe_kernel_type=moe_kernel_type,
+            is_gated=is_gated,
+            num_weight_experts=weight_rows,
+        )
+    )
+    n_group = args.n_group if args.n_group is not None and args.n_group > 0 else None
+    topk_group = (
+        args.topk_group if args.topk_group is not None and args.topk_group > 0 else None
+    )
+    routing = dict(
+        n_group=n_group,
+        topk_group=topk_group,
+        routed_scaling_factor=args.routed_scaling_factor,
+    )
+    # Selected experts drive the bandwidth model; the torch reference also feeds
+    # --routing_input precomputed.
+    selected_experts = _compute_routing_for_method(
+        routing_logits,
+        routing_bias,
+        args.top_k,
+        args.routing_method_type,
+        **routing,
+    )
+    routing_ref = None
+    if args.routing_input == "precomputed":
+        routing_ref = _reference_routing(
+            routing_logits,
+            routing_bias,
+            args.top_k,
+            args.routing_method_type,
+            **routing,
+        )
+    return dict(
+        activation_type=activation_type,
+        is_gated=is_gated,
+        local_num_experts=local_num_experts,
+        weight_rows=weight_rows,
+        routing_logits=routing_logits,
+        routing_bias=routing_bias,
+        hidden_states=hidden_states,
+        gemm1_weights=gemm1_weights,
+        gemm2_weights=gemm2_weights,
+        selected_experts=selected_experts,
+        routing_ref=routing_ref,
+        **routing,
+    )
+
+
+def _trtllm_moe_common_kwargs(args, setup, zero_groups=False):
+    """Routing/geometry keywords of the logits-routed trtllm_* API."""
+    n_group, topk_group = setup["n_group"], setup["topk_group"]
+    if zero_groups:
+        # FP8 entry points take int64 n_group/topk_group: 0 means "no groups".
+        n_group = n_group if n_group is not None else 0
+        topk_group = topk_group if topk_group is not None else 0
+    kwargs = dict(
+        routing_logits=setup["routing_logits"],
+        routing_bias=setup["routing_bias"],
+        num_experts=args.num_experts,
+        top_k=args.top_k,
+        n_group=n_group,
+        topk_group=topk_group,
+        intermediate_size=args.intermediate_size,
+        local_expert_offset=args.local_expert_offset,
+        local_num_experts=setup["local_num_experts"],
+        routed_scaling_factor=setup["routed_scaling_factor"],
+        routing_method_type=args.routing_method_type,
+        enable_pdl=args.enable_pdl,
+    )
+    if args.num_fused_shared_experts:
+        kwargs["num_fused_shared_experts"] = args.num_fused_shared_experts
+    # Padded GEMM geometry (GPT-OSS): the kernels clamp to the valid extents.
+    if args.valid_hidden_size is not None:
+        kwargs["valid_hidden_size"] = args.valid_hidden_size
+    if args.valid_intermediate_size is not None:
+        kwargs["valid_intermediate_size"] = args.valid_intermediate_size
+    return kwargs
+
+
+def _bind_trtllm_moe_api(api_name, kwargs, routing_ref):
+    """Bind logits-routed kwargs to ``api_name``, switching to packed top-k ids
+    for the *_routed_moe APIs. Raises if a non-default argument is not accepted
+    instead of silently dropping it."""
+    fn = getattr(flashinfer.fused_moe, api_name)
+    kwargs = dict(kwargs)
+    if routing_ref is not None:
+        kwargs.pop("routing_logits")
+        topk_ids, topk_weights = routing_ref
+        # Global expert ids: the kernel maps them to the local shard through
+        # local_expert_offset (tests/moe/test_trtllm_gen_routed_fused_moe.py).
+        kwargs["topk_ids"] = pack_topk_ids(topk_ids, topk_weights, 0)
+    params = inspect.signature(fn).parameters
+    for name in list(kwargs):
+        if name in params:
+            continue
+        value = kwargs.pop(name)
+        # routing_bias is already folded into precomputed ids; Prims-TS takes the
+        # linear activation-scale layout without a layout argument.
+        benign = (
+            value is None
+            or value is False
+            or name == "routing_bias"
+            or (
+                name == "hidden_states_scale_layout" and value == SfLayout.layout_linear
+            )
+        )
+        if not benign:
+            raise ValueError(f"{api_name} does not accept {name}={value!r}")
+    return fn, kwargs
+
+
+def _run_trtllm_moe_backends(
+    args,
+    family,
+    backends,
+    setup,
+    kwargs,
+    *,
+    input_format,
+    weight_format,
+    csv_fields,
+    write_activation_type=True,
+):
+    """Autotune (optional), time and report ``kwargs`` on every backend.
+
+    Metrics count the work this rank executes: only routed (token, slot) pairs
+    whose expert lies in the local shard, plus one pair per token for each fused
+    shared expert. TFLOPS use the valid (unpadded) GEMM dims when
+    --valid_hidden_size / --valid_intermediate_size are given; bandwidth keeps the
+    physical (padded) weight bytes the kernel reads. For EP=1, no shared experts
+    and no padding this equals the plain num_tokens * top_k accounting.
+    """
+    res = []
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+    weight_dtype = dtype_str_to_torch_dtype(args.weight_dtype)
+    cache_path = getattr(args, "autotune_cache", None)
+    selected = setup["selected_experts"].long()
+    in_shard = (selected >= args.local_expert_offset) & (
+        selected < args.local_expert_offset + setup["local_num_experts"]
+    )
+    num_shared = args.num_fused_shared_experts
+    computed_pairs = int(in_shard.sum().item()) + args.num_tokens * num_shared
+    active_experts = int(selected[in_shard].unique().numel()) + num_shared
+    flop_hidden = args.valid_hidden_size or args.hidden_size
+    flop_intermediate = args.valid_intermediate_size or args.intermediate_size
+    for backend in backends:
+        api_name = _TRTLLM_MOE_APIS[(family, backend, args.routing_input)]
+        fn, call = _bind_trtllm_moe_api(api_name, kwargs, setup["routing_ref"])
+        tensor_names = [k for k, v in call.items() if isinstance(v, torch.Tensor)]
+        static = {k: v for k, v in call.items() if k not in tensor_names}
+        input_args = tuple(call[k] for k in tensor_names)
+
+        def run_moe(*tensors, fn=fn, static=static, names=tensor_names):
+            return fn(**static, **dict(zip(names, tensors, strict=True)))
+
+        label = backend
+        if args.autotune:
+            warmup_iters = (
+                args.dry_run_iters
+                if args.dry_run_iters and args.dry_run_iters > 0
+                else 10
+            )
+            label = f"{backend}_autotune"
+            if args.verbose >= 1:
+                print(f"[INFO] Autotune warmup for {api_name}: {warmup_iters} iters")
+            with autotune(True, cache=cache_path):
+                for _ in range(warmup_iters):
+                    run_moe(*input_args)
+        elif cache_path:
+            with autotune(False, cache=cache_path):
+                pass
+
+        times = bench_gpu_time(
+            fn=run_moe,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            sleep_after_run=False,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=not args.no_cuda_graph,
+            cold_l2_cache=True,
+            input_args=input_args,
+        )
+        median_time = np.median(times)
+        std_time = np.std(times)
+        # computed_pairs (token, expert) GEMM pairs == num_tokens * top_k for EP=1.
+        tflops = calculate_moe_tflops(
+            computed_pairs,
+            flop_hidden,
+            flop_intermediate,
+            args.num_experts,
+            1,
+            median_time,
+            is_gated=setup["is_gated"],
+        )
+        tb_per_sec = calculate_moe_kernel_bandwidth(
+            args.num_tokens,
+            args.hidden_size,
+            args.intermediate_size,
+            args.num_experts,
+            args.top_k,
+            median_time,
+            input_dtype,
+            weight_dtype,
+            input_format=input_format,
+            weight_format=weight_format,
+            # The *_routed_moe APIs never read routing logits.
+            routing_logits_dtype=(
+                None
+                if args.routing_input == "precomputed"
+                else setup["routing_logits"].dtype
+            ),
+            active_experts=active_experts,
+            verbose=args.verbose,
+            is_gated=setup["is_gated"],
+        )
+        print_perf_metrics(label, median_time, std_time, tflops, tb_per_sec)
+
+        if args.output_path is not None:
+            cur_res = defaultdict(str)
+            cur_res["routine"] = args.routine
+            cur_res["median_time"] = median_time
+            cur_res["std_time"] = std_time
+            cur_res["tflops"] = tflops
+            cur_res["tb_per_sec"] = tb_per_sec
+            cur_res["backend"] = label
+            cur_res["num_tokens"] = args.num_tokens
+            cur_res["hidden_size"] = args.hidden_size
+            cur_res["intermediate_size"] = args.intermediate_size
+            cur_res["num_experts"] = args.num_experts
+            cur_res["top_k"] = args.top_k
+            cur_res["n_group"] = setup["n_group"]
+            cur_res["topk_group"] = setup["topk_group"]
+            cur_res["routed_scaling_factor"] = setup["routed_scaling_factor"]
+            cur_res["local_expert_offset"] = args.local_expert_offset
+            cur_res["local_num_experts"] = setup["local_num_experts"]
+            cur_res["routing_method"] = args.routing_method
+            cur_res["routing_input"] = args.routing_input
+            cur_res["num_fused_shared_experts"] = args.num_fused_shared_experts
+            cur_res["valid_hidden_size"] = args.valid_hidden_size or ""
+            cur_res["valid_intermediate_size"] = args.valid_intermediate_size or ""
+            cur_res["use_routing_bias"] = args.use_routing_bias
+            cur_res["use_routing_scales_on_input"] = args.use_routing_scales_on_input
+            cur_res["input_dtype"] = input_dtype
+            cur_res["weight_dtype"] = weight_dtype
+            if write_activation_type:
+                # trtllm_fp8_block_scale_moe never wrote it; its rows keep the
+                # args backfill so existing dashboard keys stay unchanged.
+                cur_res["activation_type"] = setup["activation_type"].name
+            cur_res["autotune"] = args.autotune
+            cur_res.update(csv_fields)
+            res.append(cur_res)
+    return res
+
+
+def _gemm1_activation_params(args, rows, device):
+    """Per-expert SwiGLU alpha/beta/limit and FC1/FC2 biases (gpt-oss style)."""
+    params = {}
+    for name, value in (
+        ("gemm1_alpha", args.swiglu_alpha),
+        ("gemm1_beta", args.swiglu_beta),
+        ("gemm1_clamp_limit", args.swiglu_limit),
+    ):
+        if value is not None:
+            params[name] = torch.full(
+                (rows,), value, device=device, dtype=torch.float32
+            )
+    return params
 
 
 def testTrtllmFp4BlockScaleMoe(args):
@@ -503,7 +1093,8 @@ def testTrtllmFp4BlockScaleMoe(args):
 
     This test:
     1. Creates quantized FP4 weights and scales
-    2. Runs FP4 block scale MOE
+    2. Runs FP4 block scale MOE (TRT-LLM Gen and/or Prims-TS, logits or
+       precomputed routing)
     3. Measures performance metrics (TFLOPS, TB/sec)
 
     Args:
@@ -522,81 +1113,22 @@ def testTrtllmFp4BlockScaleMoe(args):
             f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
         )
 
-    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
-    weight_dtype = dtype_str_to_torch_dtype(args.weight_dtype)
+    backends = _select_trtllm_moe_backends(args, "fp4", device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return []
 
-    # Parse configuration
     num_tokens = args.num_tokens
     hidden_size = args.hidden_size
     intermediate_size = args.intermediate_size
-    num_experts = args.num_experts
-    top_k = args.top_k
-    n_group = (
-        args.n_group
-        if hasattr(args, "n_group") and args.n_group is not None and args.n_group > 0
-        else None
-    )
-    topk_group = (
-        args.topk_group
-        if hasattr(args, "topk_group")
-        and args.topk_group is not None
-        and args.topk_group > 0
-        else None
-    )
-    routed_scaling_factor = (
-        args.routed_scaling_factor
-        if hasattr(args, "routed_scaling_factor")
-        and args.routed_scaling_factor is not None
-        else None
-    )
-    local_expert_offset = args.local_expert_offset
-    local_num_experts = args.local_num_experts or num_experts
-    routing_method_type = args.routing_method_type
-    use_shuffled_weight = args.use_shuffled_weight
-    weight_layout = args.weight_layout
-    is_cuda_graph_compatible = not args.no_cuda_graph
-    activation_type = args.activation_type
-    res = []
-
-    backends = ["trtllm"]
-    backends = filter_backends_by_compute_capability(backends, args.routine, device)
-    if len(backends) == 0:
-        print("[ERROR] No backends to test. Exiting.")
-        return res
-
     if args.verbose >= 1:
         print(
             f"[INFO] Configuration: tokens={num_tokens}, hidden={hidden_size}, "
-            f"intermediate={intermediate_size}, experts={num_experts}, top_k={top_k}"
+            f"intermediate={intermediate_size}, experts={args.num_experts}, top_k={args.top_k}"
         )
-
-    # Create test data
-    routing_logits, routing_bias, hidden_states, gemm1_weights, gemm2_weights = (
-        create_trtllm_moe_test_data(
-            num_tokens,
-            hidden_size,
-            intermediate_size,
-            num_experts,
-            routing_method_type,
-            args.use_routing_bias,
-            input_dtype,
-            weight_dtype,
-            device,
-            moe_kernel_type="fp4_block_scale",
-        )
-    )
-
-    # Compute selected experts for accurate bandwidth calculation
-    # Use the actual routing method to get correct expert assignments
-    selected_experts = _compute_routing_for_method(
-        routing_logits=routing_logits,
-        routing_bias=routing_bias,
-        top_k=top_k,
-        routing_method_type=routing_method_type,
-        n_group=n_group,
-        topk_group=topk_group,
-        routed_scaling_factor=routed_scaling_factor,
-    )
+    setup = _trtllm_moe_setup(args, "fp4_block_scale", device)
+    rows = setup["weight_rows"]
+    w1_rows = (2 if setup["is_gated"] else 1) * intermediate_size
 
     # Determine FP4 quantization mode
     fp4_mode = getattr(args, "fp4_mode", "nvfp4")
@@ -610,26 +1142,25 @@ def testTrtllmFp4BlockScaleMoe(args):
         )
 
     # Quantize weights using proper FP4 quantization
-    gemm1_weights_fp4_bytes, gemm1_scales_fp4_bytes, gemm1_scales_global = (
-        quantize_fp4_batched(gemm1_weights, num_experts, use_ue8m0, True)
+    gemm1_weights_fp4_bytes, gemm1_scales_fp4_bytes, _ = quantize_fp4_batched(
+        setup["gemm1_weights"], rows, use_ue8m0, True
     )
-    gemm2_weights_fp4_bytes, gemm2_scales_fp4_bytes, gemm2_scales_global = (
-        quantize_fp4_batched(gemm2_weights, num_experts, use_ue8m0, True)
+    gemm2_weights_fp4_bytes, gemm2_scales_fp4_bytes, _ = quantize_fp4_batched(
+        setup["gemm2_weights"], rows, use_ue8m0, True
     )
 
-    # Prepare hidden states and scale based on fp4_mode
+    # Prepare hidden states and scale based on fp4_mode. The trtllm-gen routed
+    # GEMM requires the LINEAR activation SF layout ("Tokens need use SF linear
+    # layout when being routed"), so both quantized modes quantize non-swizzled.
+    # The swizzled layout used to be passed here: it pads rows to 128, so the
+    # mxfp4_mxfp8 path raised and the nvfp4 path substituted all-ones scales for
+    # num_tokens % 128 != 0 -- and at multiples of 128 both silently read
+    # swizzled bytes as linear. Linear is exact at every M.
+    hidden_states = setup["hidden_states"]
     if fp4_mode == "mxfp4_bf16":
         hidden_states_fp4 = hidden_states.to(torch.bfloat16)
         hidden_states_scale_linear_fp4 = None
     elif fp4_mode == "mxfp4_mxfp8":
-        # The trtllm-gen routed GEMM requires the LINEAR activation SF layout
-        # ("Tokens need use SF linear layout when being routed"), so quantize
-        # non-swizzled.  This used to pass is_sf_swizzled_layout=True and work
-        # around the resulting shape error by demanding num_tokens % 128 == 0 --
-        # but that is exactly the regime where the swizzled buffer's numel
-        # coincides with the linear one, so the kernel silently read swizzled
-        # bytes as linear and produced wrong numbers instead of throwing.
-        # Linear pads no rows, so the alignment restriction is unnecessary too.
         hs_quant, hs_scale = mxfp8_quantize(hidden_states, False)
         hidden_states_fp4 = hs_quant
         hidden_states_scale_linear_fp4 = hs_scale.view(torch.float8_e4m3fn).reshape(
@@ -638,28 +1169,14 @@ def testTrtllmFp4BlockScaleMoe(args):
     else:
         hidden_states_scale_global = calculate_fp4_global_scale(hidden_states)
         hidden_states_fp4_bytes, hidden_states_scale_fp4_bytes, _ = quantize_fp4(
-            hidden_states, hidden_states_scale_global, use_ue8m0, True
+            hidden_states, hidden_states_scale_global, use_ue8m0, False
         )
         hidden_states_fp4 = hidden_states_fp4_bytes.view(torch.uint8).reshape(
             num_tokens, hidden_size // 2
         )
         hidden_states_scale_linear_fp4 = hidden_states_scale_fp4_bytes.view(
             torch.float8_e4m3fn
-        )
-        expected_scale_elems = (num_tokens * hidden_size) // sf_vec_size
-        if hidden_states_scale_linear_fp4.numel() != expected_scale_elems:
-            print(
-                f"[WARNING] FP4 hidden_states_scale element count mismatch "
-                f"({hidden_states_scale_linear_fp4.numel()} vs expected {expected_scale_elems}), "
-                f"substituting all-ones scale tensor. This is likely caused by swizzled "
-                f"layout padding when num_tokens ({num_tokens}) is not a multiple of 128."
-            )
-            hidden_states_scale_linear_fp4 = torch.ones(
-                expected_scale_elems, device=device, dtype=torch.float8_e4m3fn
-            )
-        hidden_states_scale_linear_fp4 = hidden_states_scale_linear_fp4.reshape(
-            num_tokens, hidden_size // sf_vec_size
-        )
+        ).reshape(num_tokens, hidden_size // sf_vec_size)
 
     # Prepare weights for kernel (packed uint8 format, scale as float8_e4m3fn)
     # fp4_quantize pads the scale tensor on both dims; the data tensor is unpadded.
@@ -671,202 +1188,416 @@ def testTrtllmFp4BlockScaleMoe(args):
         return (n + 3) // 4 * 4
 
     gemm1_weights_fp4 = gemm1_weights_fp4_bytes.view(torch.uint8).reshape(
-        num_experts, 2 * intermediate_size, hidden_size // 2
+        rows, w1_rows, hidden_size // 2
     )
     gemm1_weights_scale = gemm1_scales_fp4_bytes.view(torch.float8_e4m3fn).reshape(
-        num_experts, _sf_outer(2 * intermediate_size), _sf_inner(hidden_size)
+        rows, _sf_outer(w1_rows), _sf_inner(hidden_size)
     )
-
     gemm2_weights_fp4 = gemm2_weights_fp4_bytes.view(torch.uint8).reshape(
-        num_experts, hidden_size, intermediate_size // 2
+        rows, hidden_size, intermediate_size // 2
     )
     gemm2_weights_scale = gemm2_scales_fp4_bytes.view(torch.float8_e4m3fn).reshape(
-        num_experts, _sf_outer(hidden_size), _sf_inner(intermediate_size)
+        rows, _sf_outer(hidden_size), _sf_inner(intermediate_size)
     )
-
-    gemm1_bias = None
-    gemm1_alpha = None
-    gemm1_beta = None
-    gemm1_clamp_limit = None
-    gemm2_bias = None
 
     # Create scale scalars using shared utility
     output1_scale_scalar, output1_scale_gate_scalar, output2_scale_scalar = (
-        create_moe_output_scale_scalars(local_num_experts, device)
+        create_moe_output_scale_scalars(rows, device)
     )
+    gemm1_bias = gemm2_bias = None
+    if args.gemm_bias:
+        gemm1_bias = 0.01 * torch.randn(rows, w1_rows, device=device)
+        gemm2_bias = 0.01 * torch.randn(rows, hidden_size, device=device)
 
     if args.verbose >= 2:
-        print(f"[VVERBOSE] routing_logits.shape = {routing_logits.shape}")
         print(f"[VVERBOSE] hidden_states.shape = {hidden_states.shape}")
         print(f"[VVERBOSE] gemm1_weights_fp4.shape = {gemm1_weights_fp4.shape}")
         print(f"[VVERBOSE] gemm2_weights_fp4.shape = {gemm2_weights_fp4.shape}")
 
-    def run_fp4_moe(
-        routing_logits,
-        routing_bias,
-        hidden_states_fp4,
-        hidden_states_scale_linear_fp4,
-        gemm1_weights_fp4,
-        gemm1_weights_scale,
-        gemm2_weights_fp4,
-        gemm2_weights_scale,
-        output1_scale_scalar,
-        output1_scale_gate_scalar,
-        output2_scale_scalar,
-    ):
-        return trtllm_fp4_block_scale_moe(
-            routing_logits=routing_logits,
-            routing_bias=routing_bias,
-            hidden_states=hidden_states_fp4,
-            hidden_states_scale=hidden_states_scale_linear_fp4,
-            gemm1_weights=gemm1_weights_fp4,
-            gemm1_weights_scale=gemm1_weights_scale,
-            gemm1_bias=gemm1_bias,
-            gemm1_alpha=gemm1_alpha,
-            gemm1_beta=gemm1_beta,
-            gemm1_clamp_limit=gemm1_clamp_limit,
-            gemm2_weights=gemm2_weights_fp4,
-            gemm2_weights_scale=gemm2_weights_scale,
-            gemm2_bias=gemm2_bias,
-            output1_scale_scalar=output1_scale_scalar,
-            output1_scale_gate_scalar=output1_scale_gate_scalar,
-            output2_scale_scalar=output2_scale_scalar,
-            num_experts=num_experts,
-            top_k=top_k,
-            n_group=n_group,
-            topk_group=topk_group,
-            intermediate_size=intermediate_size,
-            local_expert_offset=local_expert_offset,
-            local_num_experts=local_num_experts,
-            routed_scaling_factor=routed_scaling_factor,
-            routing_method_type=routing_method_type,
-            do_finalize=True,
-            enable_pdl=args.enable_pdl,
-            **_activation_kwarg(trtllm_fp4_block_scale_moe, activation_type),
-            hidden_states_scale_layout=SfLayout.layout_linear,
-        )
-
-    backend = "trtllm"
-
-    # Optional autotune warmup (supported for FP4 TRTLlm fused MoE)
-    cache_path = getattr(args, "autotune_cache", None)
-    if getattr(args, "autotune", False):
-        warmup_iters = (
-            args.dry_run_iters if args.dry_run_iters and args.dry_run_iters > 0 else 10
-        )
-        backend = "trtllm_autotune"
-        if args.verbose >= 1:
-            print(
-                f"[INFO] Autotune warmup for FP4 block scale MoE: {warmup_iters} iters"
-            )
-        with autotune(True, cache=cache_path):
-            for _ in range(warmup_iters):
-                run_fp4_moe(
-                    routing_logits,
-                    routing_bias,
-                    hidden_states_fp4,
-                    hidden_states_scale_linear_fp4,
-                    gemm1_weights_fp4,
-                    gemm1_weights_scale,
-                    gemm2_weights_fp4,
-                    gemm2_weights_scale,
-                    output1_scale_scalar,
-                    output1_scale_gate_scalar,
-                    output2_scale_scalar,
-                )
-    elif cache_path:
-        with autotune(False, cache=cache_path):
-            pass
-
-    # Benchmark timing
-    times = bench_gpu_time(
-        fn=run_fp4_moe,
-        dry_run_iters=args.dry_run_iters,
-        repeat_iters=args.num_iters,
-        sleep_after_run=False,
-        enable_cupti=args.use_cupti,
-        use_cuda_graph=is_cuda_graph_compatible,
-        cold_l2_cache=True,
-        input_args=(
-            routing_logits,
-            routing_bias,
-            hidden_states_fp4,
-            hidden_states_scale_linear_fp4,
-            gemm1_weights_fp4,
-            gemm1_weights_scale,
-            gemm2_weights_fp4,
-            gemm2_weights_scale,
-            output1_scale_scalar,
-            output1_scale_gate_scalar,
-            output2_scale_scalar,
-        ),
+    kwargs = _trtllm_moe_common_kwargs(args, setup)
+    kwargs.update(
+        hidden_states=hidden_states_fp4,
+        hidden_states_scale=hidden_states_scale_linear_fp4,
+        gemm1_weights=gemm1_weights_fp4,
+        gemm1_weights_scale=gemm1_weights_scale,
+        gemm1_bias=gemm1_bias,
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        gemm2_weights=gemm2_weights_fp4,
+        gemm2_weights_scale=gemm2_weights_scale,
+        gemm2_bias=gemm2_bias,
+        output1_scale_scalar=output1_scale_scalar,
+        output1_scale_gate_scalar=output1_scale_gate_scalar,
+        output2_scale_scalar=output2_scale_scalar,
+        do_finalize=True,
+        hidden_states_scale_layout=SfLayout.layout_linear,
+        **_activation_kwarg(trtllm_fp4_block_scale_moe, setup["activation_type"]),
     )
+    kwargs.update(_gemm1_activation_params(args, rows, device))
 
-    # Compute performance metrics
-    median_time = np.median(times)
-    std_time = np.std(times)
-    tflops = calculate_moe_tflops(
-        num_tokens,
-        hidden_size,
-        intermediate_size,
-        num_experts,
-        top_k,
-        median_time,
-        is_gated=args.activation_type in (ActivationType.Swiglu, ActivationType.Geglu),
-    )
     input_format_str = {"nvfp4": "nvfp4", "mxfp4_mxfp8": "mxfp8", "mxfp4_bf16": "bf16"}[
         fp4_mode
     ]
-    weight_format_str = "mxfp4" if is_mxfp4 else "nvfp4"
-    tb_per_sec = calculate_moe_kernel_bandwidth(
-        num_tokens,
-        hidden_size,
-        intermediate_size,
-        num_experts,
-        top_k,
-        median_time,
-        input_dtype,
-        weight_dtype,
+    return _run_trtllm_moe_backends(
+        args,
+        "fp4",
+        backends,
+        setup,
+        kwargs,
         input_format=input_format_str,
-        weight_format=weight_format_str,
-        routing_logits_dtype=routing_logits.dtype,
-        active_experts=int(selected_experts.unique().numel()),
-        verbose=args.verbose,
-        is_gated=args.activation_type in (ActivationType.Swiglu, ActivationType.Geglu),
+        weight_format="mxfp4" if is_mxfp4 else "nvfp4",
+        csv_fields={
+            "fp4_mode": fp4_mode,
+            "use_shuffled_weight": args.use_shuffled_weight,
+            "weight_layout": args.weight_layout,
+        },
     )
 
-    print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
-    if args.output_path is not None:
-        cur_res = defaultdict(str)
-        cur_res["routine"] = args.routine
-        cur_res["median_time"] = median_time
-        cur_res["std_time"] = std_time
-        cur_res["tflops"] = tflops
-        cur_res["tb_per_sec"] = tb_per_sec
-        cur_res["backend"] = backend
-        cur_res["num_tokens"] = num_tokens
-        cur_res["hidden_size"] = hidden_size
-        cur_res["intermediate_size"] = intermediate_size
-        cur_res["num_experts"] = num_experts
-        cur_res["top_k"] = top_k
-        cur_res["n_group"] = n_group
-        cur_res["topk_group"] = topk_group
-        cur_res["routed_scaling_factor"] = routed_scaling_factor
-        cur_res["local_expert_offset"] = local_expert_offset
-        cur_res["local_num_experts"] = local_num_experts
-        cur_res["routing_method"] = args.routing_method
-        cur_res["use_shuffled_weight"] = use_shuffled_weight
-        cur_res["weight_layout"] = weight_layout
-        cur_res["use_routing_bias"] = args.use_routing_bias
-        cur_res["use_routing_scales_on_input"] = args.use_routing_scales_on_input
-        cur_res["input_dtype"] = input_dtype
-        cur_res["weight_dtype"] = weight_dtype
-        cur_res["activation_type"] = args.activation_type.name
-        cur_res["fp4_mode"] = fp4_mode
-        res.append(cur_res)
+def testTrtllmFp8BlockScaleMoe(args):
+    """
+    Test trtllm_fp8_block_scale_moe API (TensorRT-LLM fused MoE).
 
-    return res
+    --fp8_quant_type deepseek (default): FP8 weights with 128x128 block scales.
+    --fp8_quant_type mxfp8: MXFP8 x MXFP8, weights/activations prepared by the
+    library's ``prepare_trtllm_fp8_block_{weights,activations}``.
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testTrtllmFp8BlockScaleMoe")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    backends = _select_trtllm_moe_backends(args, "fp8_block", device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return []
+
+    hidden_size = args.hidden_size
+    intermediate_size = args.intermediate_size
+    use_shuffled_weight = args.use_shuffled_weight
+    weight_layout = args.weight_layout
+    if args.verbose >= 1:
+        print(
+            f"[INFO] Configuration: tokens={args.num_tokens}, hidden={hidden_size}, "
+            f"intermediate={intermediate_size}, experts={args.num_experts}, top_k={args.top_k}"
+        )
+    setup = _trtllm_moe_setup(args, "fp8_block_scale", device)
+    rows = setup["weight_rows"]
+    w1_rows = (2 if setup["is_gated"] else 1) * intermediate_size
+
+    if args.fp8_quant_type == "mxfp8":
+        from flashinfer.fused_moe import QuantConfig, QuantFormat
+        from flashinfer.fused_moe.prepare import (
+            prepare_trtllm_fp8_block_activations,
+            prepare_trtllm_fp8_block_weights,
+        )
+        from flashinfer.tllm_enums import Fp8QuantizationType, WeightLayout
+
+        quant = QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8)
+        view = prepare_trtllm_fp8_block_weights(
+            setup["gemm1_weights"],
+            setup["gemm2_weights"],
+            quant=quant,
+            num_local_experts=rows,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=_UNIFIED_ACTIVATIONS[setup["activation_type"]](),
+            device=device,
+        )
+        hidden_states_fp8, hidden_states_scale = prepare_trtllm_fp8_block_activations(
+            setup["hidden_states"], quant=quant
+        )
+        # MXFP8 weights come out shuffled in MajorK (TrtllmFp8BlockRunner).
+        use_shuffled_weight = True
+        weight_layout = int(WeightLayout.MajorK)
+        weights = dict(view)
+        quant_kwargs = {"fp8_quantization_type": Fp8QuantizationType.MxFp8}
+        weight_format = "mxfp8"
+    else:
+        gemm1_weights_fp8 = setup["gemm1_weights"].to(torch.float8_e4m3fn)
+        gemm2_weights_fp8 = setup["gemm2_weights"].to(torch.float8_e4m3fn)
+        # Optionally shuffle weights and convert to BlockMajorK layout to match kernel expectation
+        if use_shuffled_weight:
+            gemm1_weights_fp8 = torch.stack(
+                [
+                    process_fp8_weight_layout(
+                        w, use_shuffled_weight, weight_layout
+                    ).view(torch.uint8)
+                    for w in gemm1_weights_fp8
+                ]
+            ).view(torch.float8_e4m3fn)
+            gemm2_weights_fp8 = torch.stack(
+                [
+                    process_fp8_weight_layout(
+                        w, use_shuffled_weight, weight_layout
+                    ).view(torch.uint8)
+                    for w in gemm2_weights_fp8
+                ]
+            ).view(torch.float8_e4m3fn)
+        # Block scales (values do not affect timing): hidden_states_scale is
+        # [hidden_size // 128, num_tokens].
+        hidden_states_scale = 2.0 * torch.ones(
+            (hidden_size // 128, args.num_tokens), device=device, dtype=torch.float32
+        )
+        # The FP8 cast of the activations happens once here. It used to sit inside
+        # the timed function, so every iteration also timed a BF16->FP8 cast.
+        hidden_states_fp8 = setup["hidden_states"].to(torch.float8_e4m3fn)
+        weights = dict(
+            gemm1_weights=gemm1_weights_fp8,
+            gemm1_weights_scale=2.0
+            * torch.ones(
+                (rows, w1_rows // 128, hidden_size // 128),
+                device=device,
+                dtype=torch.float32,
+            ),
+            gemm2_weights=gemm2_weights_fp8,
+            gemm2_weights_scale=2.0
+            * torch.ones(
+                (rows, hidden_size // 128, intermediate_size // 128),
+                device=device,
+                dtype=torch.float32,
+            ),
+        )
+        quant_kwargs = {}
+        weight_format = "fp8"
+
+    kwargs = _trtllm_moe_common_kwargs(args, setup, zero_groups=True)
+    kwargs.update(
+        hidden_states=hidden_states_fp8,
+        hidden_states_scale=hidden_states_scale,
+        use_shuffled_weight=use_shuffled_weight,
+        weight_layout=weight_layout,
+        **weights,
+        **quant_kwargs,
+    )
+    if setup["activation_type"] != ActivationType.Swiglu:
+        kwargs.update(
+            _activation_kwarg(trtllm_fp8_block_scale_moe, setup["activation_type"])
+        )
+    return _run_trtllm_moe_backends(
+        args,
+        "fp8_block",
+        backends,
+        setup,
+        kwargs,
+        input_format=weight_format,
+        weight_format=weight_format,
+        csv_fields={
+            "use_shuffled_weight": use_shuffled_weight,
+            "weight_layout": weight_layout,
+            # Written only for the non-default mode: existing DeepSeek-FP8 rows
+            # keep quant_variant="" (rule 1, dashboard key continuity).
+            **({"quant_variant": "mxfp8"} if args.fp8_quant_type == "mxfp8" else {}),
+        },
+        write_activation_type=False,
+    )
+
+
+def testTrtllmFp8PerTensorScaleMoe(args):
+    """
+    Test trtllm_fp8_per_tensor_scale_moe API (TensorRT-LLM fused MoE).
+
+    --fp8_scale_granularity per_channel benchmarks trtllm_fp8_per_channel_scale_moe
+    (per-output-channel weight scales, per-token activation scales).
+
+    Args:
+        args: Parsed command line arguments containing test configuration
+
+    Returns:
+        dict: List of dictionaries containing performance results
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testTrtllmFp8PerTensorScaleMoe")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+
+    per_channel = args.fp8_scale_granularity == "per_channel"
+    family = "fp8_per_channel" if per_channel else "fp8_per_tensor"
+    backends = _select_trtllm_moe_backends(args, family, device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return []
+
+    if args.verbose >= 1:
+        print(
+            f"[INFO] Configuration: tokens={args.num_tokens}, hidden={args.hidden_size}, "
+            f"intermediate={args.intermediate_size}, experts={args.num_experts}, top_k={args.top_k}"
+        )
+    setup = _trtllm_moe_setup(args, "fp8_per_tensor", device)
+    rows = setup["weight_rows"]
+
+    # For FP8 per-tensor scale, create quantized weights and per-tensor scales
+    gemm1_weights_fp8 = setup["gemm1_weights"].to(torch.float8_e4m3fn)
+    gemm2_weights_fp8 = setup["gemm2_weights"].to(torch.float8_e4m3fn)
+    hidden_states_fp8 = setup["hidden_states"].to(torch.float8_e4m3fn)
+    output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar = (
+        create_moe_output_scale_scalars(rows, device)
+    )
+
+    kwargs = _trtllm_moe_common_kwargs(args, setup, zero_groups=not per_channel)
+    kwargs.update(
+        hidden_states=hidden_states_fp8,
+        gemm1_weights=gemm1_weights_fp8,
+        gemm2_weights=gemm2_weights_fp8,
+        use_routing_scales_on_input=args.use_routing_scales_on_input,
+        **_activation_kwarg(trtllm_fp8_per_tensor_scale_moe, setup["activation_type"]),
+    )
+    if per_channel:
+        kwargs.update(
+            hidden_states_scale=torch.ones(
+                args.num_tokens, 1, device=device, dtype=torch.float32
+            ),
+            gemm1_per_channel_weight_scale=torch.ones(
+                rows, gemm1_weights_fp8.shape[1], device=device, dtype=torch.float32
+            ),
+            gemm2_per_channel_weight_scale=torch.ones(
+                rows, args.hidden_size, device=device, dtype=torch.float32
+            ),
+            output1_scale_scalar=output1_scales_scalar,
+            output1_scale_gate_scalar=output1_scales_gate_scalar,
+            output2_scale_scalar=output2_scales_scalar,
+        )
+    else:
+        kwargs.update(
+            output1_scales_scalar=output1_scales_scalar,
+            output1_scales_gate_scalar=output1_scales_gate_scalar,
+            output2_scales_scalar=output2_scales_scalar,
+        )
+    return _run_trtllm_moe_backends(
+        args,
+        family,
+        backends,
+        setup,
+        kwargs,
+        input_format="fp8",
+        weight_format="fp8",
+        # Written only for per-channel: existing per-tensor rows keep quant_variant="".
+        csv_fields={"quant_variant": "per_channel"} if per_channel else {},
+    )
+
+
+def testTrtllmBf16Moe(args):
+    """
+    Test trtllm_bf16_moe (TRT-LLM Gen BF16 x BF16 fused MoE, BlockMajorK weights).
+
+    Weights are laid out by the library's ``prepare_trtllm_bf16_weights``; the same
+    view feeds ``prims_ts_bf16_moe`` (--backends prims-ts).
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testTrtllmBf16Moe")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+    backends = _select_trtllm_moe_backends(args, "bf16", device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return []
+
+    from flashinfer.fused_moe.prepare import prepare_trtllm_bf16_weights
+    from flashinfer.tllm_enums import WeightLayout
+
+    setup = _trtllm_moe_setup(args, "bf16", device)
+    view = prepare_trtllm_bf16_weights(
+        setup["gemm1_weights"],
+        setup["gemm2_weights"],
+        num_local_experts=setup["weight_rows"],
+        hidden_size=args.hidden_size,
+        intermediate_size=args.intermediate_size,
+        activation=_UNIFIED_ACTIVATIONS[setup["activation_type"]](),
+        device=device,
+    )
+    kwargs = _trtllm_moe_common_kwargs(args, setup)
+    kwargs.update(
+        hidden_states=setup["hidden_states"],
+        use_shuffled_weight=True,
+        weight_layout=int(WeightLayout.BlockMajorK),
+        **view,
+        **_activation_kwarg(trtllm_fp4_block_scale_moe, setup["activation_type"]),
+    )
+    return _run_trtllm_moe_backends(
+        args,
+        "bf16",
+        backends,
+        setup,
+        kwargs,
+        input_format="bf16",
+        weight_format="bf16",
+        csv_fields={
+            "use_shuffled_weight": True,
+            "weight_layout": int(WeightLayout.BlockMajorK),
+        },
+    )
+
+
+def testTrtllmMxint4BlockScaleMoe(args):
+    """
+    Test trtllm_mxint4_block_scale_moe (MxInt4 weights x BF16 activations,
+    e.g. Kimi-K2 INT4). Weights are quantized and laid out by the library's
+    ``prepare_trtllm_mxint4_weights``. SwiGLU only.
+    """
+    if args.verbose >= 1:
+        print("[INFO] Running testTrtllmMxint4BlockScaleMoe")
+        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+    device = get_device(args)
+    if args.generate_repro_command:
+        print(
+            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
+        )
+    backends = _select_trtllm_moe_backends(args, "mxint4", device)
+    if len(backends) == 0:
+        print("[ERROR] No backends to test. Exiting.")
+        return []
+
+    from flashinfer.fused_moe.prepare import prepare_trtllm_mxint4_weights
+
+    setup = _trtllm_moe_setup(args, "mxint4", device)
+    view = prepare_trtllm_mxint4_weights(
+        setup["gemm1_weights"],
+        setup["gemm2_weights"],
+        num_local_experts=setup["weight_rows"],
+        hidden_size=args.hidden_size,
+        intermediate_size=args.intermediate_size,
+        activation=_UNIFIED_ACTIVATIONS[setup["activation_type"]](),
+        device=device,
+    )
+    kwargs = _trtllm_moe_common_kwargs(args, setup)
+    kwargs.update(
+        hidden_states=setup["hidden_states"],
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        **view,
+    )
+    return _run_trtllm_moe_backends(
+        args,
+        "mxint4",
+        backends,
+        setup,
+        kwargs,
+        input_format="bf16",
+        weight_format="mxint4",
+        csv_fields={"quant_variant": "mxint4"},
+    )
 
 
 def testCutlassFusedMoe(args):
@@ -976,6 +1707,20 @@ def testCutlassFusedMoe(args):
     # Prepare variant-specific inputs (outside of the timed/captured region)
     variant = getattr(args, "cutlass_variant", "base")
     out = torch.empty_like(x)
+    # gpt-oss style SwiGLU: per-local-expert float32 alpha/beta/limit.
+    cutlass_extra = {
+        name: torch.full(
+            (w31_local.shape[0],), value, device=device, dtype=torch.float32
+        )
+        for name, value in (
+            ("swiglu_alpha", args.swiglu_alpha),
+            ("swiglu_beta", args.swiglu_beta),
+            ("swiglu_limit", args.swiglu_limit),
+        )
+        if value is not None
+    }
+    if args.gemm_bias:
+        raise ValueError("--gemm_bias is not wired for cutlass_fused_moe")
 
     if variant == "base":
 
@@ -995,6 +1740,7 @@ def testCutlassFusedMoe(args):
                 output=out,
                 enable_pdl=args.enable_pdl,
                 **_activation_kwarg(cutlass_fused_moe, activation_type),
+                **cutlass_extra,
             )
 
         input_args_for_bench = (
@@ -1064,6 +1810,7 @@ def testCutlassFusedMoe(args):
                 output=out,
                 enable_pdl=args.enable_pdl,
                 **_activation_kwarg(cutlass_fused_moe, activation_type),
+                **cutlass_extra,
             )
 
         input_args_for_bench = (
@@ -1151,6 +1898,7 @@ def testCutlassFusedMoe(args):
                 output=out,
                 enable_pdl=args.enable_pdl,
                 **_activation_kwarg(cutlass_fused_moe, activation_type),
+                **cutlass_extra,
             )
 
         input_args_for_bench = (
@@ -1285,9 +2033,9 @@ def _create_nvfp4_moe_test_data(
     Supports two backends that share the weight-quantization recipe but differ
     in the FC1 weight layout and in whether input activations are pre-quantized:
 
-    - ``backend="cute-dsl"`` (SM100/SM103 ``CuteDslMoEWrapper``): gated SwiGLU only,
-      FC1 weights interleaved via ``_interleave_linear_and_gate``, fp4-quantized
-      input activations + scale factors.
+    - ``backend="cute-dsl"`` (SM100/SM103/SM107 ``CuteDslMoEWrapper``): gated FC1
+      weights interleaved via ``_interleave_linear_and_gate`` (non-gated ReLU2 FC1
+      is not interleaved), fp4-quantized input activations + scale factors.
     - ``backend="b12x"`` (SM120/SM121 ``B12xMoEWrapper``): either gated (SwiGLU,
       ``[E, 2n, k]``) or non-gated (ReLU2, ``[E, n, k]``) FC1, no interleave,
       bf16 input activations (the kernel fuses quantization internally).
@@ -1300,8 +2048,6 @@ def _create_nvfp4_moe_test_data(
 
     if backend not in ("cute-dsl", "b12x"):
         raise ValueError(f"Unsupported backend: {backend!r}")
-    if backend == "cute-dsl" and not is_gated:
-        raise ValueError("cute-dsl backend only supports gated (SwiGLU) activation")
 
     sf_vec_size = 16
 
@@ -1334,8 +2080,8 @@ def _create_nvfp4_moe_test_data(
         )
         / 10
     )
-    # cute-dsl (SM100) expects gate/up interleaved; b12x (SM120) does not.
-    if backend == "cute-dsl":
+    # cute-dsl (SM100) expects gated gate/up interleaved; b12x (SM120) does not.
+    if backend == "cute-dsl" and is_gated:
         w1_bf16_prepared = _interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
     else:
         w1_bf16_prepared = w1_bf16
@@ -1753,6 +2499,44 @@ def testAlphaMoeNvfp4AlignedMoe(args):
             raise RuntimeError("AlphaMoE preallocated-output API must return None")
         return out
 
+    routed = args.alphamoe_routing == "routed"
+    if routed:
+        # alphamoe_nvfp4_routed_moe builds the aligned plan itself (route
+        # alignment + MoE + weighted accumulation in one call). The plan tensors
+        # of ``data`` become its caller-owned workspaces, sized like
+        # tests/moe/test_alphamoe_nvfp4_sm100.py.
+        from flashinfer.fused_moe import alphamoe_nvfp4_routed_moe
+
+        pairs = num_tokens * top_k
+        raw_capacity = (
+            pairs * block_m
+            if pairs < num_experts + 1
+            else pairs + (num_experts + 1) * (block_m - 1)
+        )
+        expert_capacity = (raw_capacity + block_m - 1) // block_m
+        input_args = input_args[:9] + (
+            torch.empty((expert_capacity * block_m,), dtype=torch.int32, device=device),
+            torch.empty((expert_capacity,), dtype=torch.int32, device=device),
+            torch.empty((1,), dtype=torch.int32, device=device),
+            data["topk_weights"],
+            data["topk_ids"],
+            torch.empty((num_experts + 2,), dtype=torch.int32, device=device),
+            data["out"],
+        )
+
+        def run_alphamoe(*tensors):  # noqa: F811
+            (*kernel_inputs, topk_ids, cumsum_buffer, out) = tensors
+            return alphamoe_nvfp4_routed_moe(
+                *kernel_inputs,
+                out,
+                topk_ids,
+                cumsum_buffer,
+                top_k,
+                block_m,
+                args.routed_scaling_factor,
+                accumulate=False,
+            )
+
     if args.refcheck:
         expected = _alphamoe_nvfp4_reference(data)
         data["out"].zero_()
@@ -1824,7 +2608,7 @@ def testAlphaMoeNvfp4AlignedMoe(args):
             routed_scaling_factor=args.routed_scaling_factor,
             local_expert_offset=0,
             local_num_experts=num_experts,
-            routing_method="prealigned",
+            routing_method="routed" if routed else "prealigned",
             input_dtype="nvfp4",
             weight_dtype="nvfp4",
             activation_type=ActivationType.Swiglu.name,
@@ -1891,15 +2675,18 @@ def testCuteDslFp4BlockScaleMoe(args):
             f"intermediate={intermediate_size}, experts={num_experts}, top_k={top_k}"
         )
 
-    # CuteDslMoEWrapper is gated SwiGLU only.
+    # CuteDslMoEWrapper activations: gated SwiGLU / GeGLU-tanh, non-gated ReLU2
+    # (cute_dsl/fused_moe.py cute_dsl_fused_moe docstring). SiTU needs per-expert
+    # situ_beta tensors and is benchmarked through unified_moe instead.
     activation_type = args.activation_type
-    if activation_type != ActivationType.Swiglu:
+    if activation_type not in _CUTE_DSL_FLAT_ACTIVATIONS:
         raise ValueError(
-            f"cute_dsl_fp4_block_scale_moe only supports Swiglu activation, "
-            f"got {activation_type.name}. Use --routine b12x_fused_moe for ReLU2."
+            f"cute_dsl_fp4_block_scale_moe supports "
+            f"{[a.name for a in _CUTE_DSL_FLAT_ACTIVATIONS]}, got {activation_type.name}"
         )
+    is_gated = is_gated_activation(activation_type)
 
-    # Create CuteDSL-specific NVFP4 test data (gated, fp4 input)
+    # Create CuteDSL-specific NVFP4 test data (fp4 input)
     tensors = _create_nvfp4_moe_test_data(
         num_tokens=num_tokens,
         hidden_size=hidden_size,
@@ -1909,7 +2696,7 @@ def testCuteDslFp4BlockScaleMoe(args):
         top_k=top_k,
         device=device,
         backend="cute-dsl",
-        is_gated=True,
+        is_gated=is_gated,
     )
 
     if args.verbose >= 2:
@@ -1938,6 +2725,7 @@ def testCuteDslFp4BlockScaleMoe(args):
             local_expert_offset=local_expert_offset,
             moe_output=moe_output,
             enable_pdl=args.enable_pdl,
+            activation_type=activation_type.value,
         )
 
         # Warmup call to populate workspace cache before timed region
@@ -1965,6 +2753,7 @@ def testCuteDslFp4BlockScaleMoe(args):
             num_local_experts=local_num_experts,
             local_expert_offset=local_expert_offset,
             enable_pdl=args.enable_pdl,
+            activation_type=activation_type.value,
         )
         runner = moe.run
 
@@ -2055,7 +2844,7 @@ def testCuteDslFp4BlockScaleMoe(args):
         num_experts,
         top_k,
         median_time,
-        is_gated=True,
+        is_gated=is_gated,
     )
     tb_per_sec = calculate_moe_kernel_bandwidth(
         num_tokens,
@@ -2071,7 +2860,7 @@ def testCuteDslFp4BlockScaleMoe(args):
         routing_logits_dtype=None,
         active_experts=num_active_experts,
         verbose=args.verbose,
-        is_gated=True,
+        is_gated=is_gated,
     )
 
     print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
@@ -2661,507 +3450,241 @@ def testB12xFusedMoe(args):
     return res
 
 
-def testTrtllmFp8BlockScaleMoe(args):
+# =============================================================================
+# MoE routing kernels (router only, no expert FFN)
+# =============================================================================
+
+# Routing methods each moe_routing backend implements. trtllm runs the same
+# routing kernels the trtllm-gen fused MoE launches before its GEMMs, plus the
+# public API's torch topk_ids reconstruction (see testMoeRouting).
+_MOE_ROUTING_BACKEND_METHODS = {
+    "trtllm": tuple(m for m in _ROUTING_METHOD_NAME_TO_TYPE if m != "hash"),
+    "dsv3": ("deepseek_v3",),
+    "alphamoe": ("renormalize",),
+    "hash": ("hash",),
+}
+
+
+def testMoeRouting(args):
     """
-    Test trtllm_fp8_block_scale_moe API (TensorRT-LLM fused MoE).
+    Benchmark standalone MoE routing kernels on the same router logits.
 
-    This test:
-    1. Creates quantized FP8 weights and block scales
-    2. Runs FP8 block scale MOE
-    3. Measures performance metrics (TFLOPS, TB/sec)
-
-    Args:
-        args: Parsed command line arguments containing test configuration
-
-    Returns:
-        dict: List of dictionaries containing performance results
+    Backends (picked by --backends, filtered by --routing_method):
+      - trtllm:   flashinfer.fused_moe.trtllm_gen_routing (every RoutingMethodType).
+                  The timed call is the public API: the 2 routing kernels the fused MoE
+                  runs plus ~10 torch kernels that rebuild topk_ids from the permutation
+                  (trtllm_gen_routing.py:340-351), which the fused MoE never runs. On B200
+                  at 1 token that epilogue is ~70% of the time
+                  (evidence/.../moe/logs/profile_trtllm_gen_routing_b200.txt), so trtllm
+                  rows are not comparable to dsv3 kernel time.
+      - dsv3:     fused_topk_deepseek (DeepSeekV3 grouped routing; the cake
+                  backend of this API is deliberately not benchmarked)
+      - alphamoe: alphamoe_fused_router (top-k + softmax + aligned route plan)
+      - hash:     hash_topk (DeepSeek-V4 token-id hash routing)
+    --refcheck compares each backend's selected expert set with a torch reference.
     """
     if args.verbose >= 1:
-        print("[INFO] Running testTrtllmFp8BlockScaleMoe")
+        print("[INFO] Running testMoeRouting")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
-
     device = get_device(args)
     if args.generate_repro_command:
         print(
             f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
         )
 
-    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
-    weight_dtype = dtype_str_to_torch_dtype(args.weight_dtype)
-
-    # Parse configuration
-    num_tokens = args.num_tokens
-    hidden_size = args.hidden_size
-    intermediate_size = args.intermediate_size
-    num_experts = args.num_experts
-    top_k = args.top_k
-    n_group = (
-        args.n_group
-        if hasattr(args, "n_group") and args.n_group is not None and args.n_group > 0
-        else None
-    )
-    topk_group = (
-        args.topk_group
-        if hasattr(args, "topk_group")
-        and args.topk_group is not None
-        and args.topk_group > 0
-        else None
-    )
-    routed_scaling_factor = (
-        args.routed_scaling_factor
-        if hasattr(args, "routed_scaling_factor")
-        and args.routed_scaling_factor is not None
-        else None
-    )
-    local_expert_offset = args.local_expert_offset
-    local_num_experts = args.local_num_experts or num_experts
-    routing_method_type = args.routing_method_type
-    use_shuffled_weight = args.use_shuffled_weight
-    weight_layout = args.weight_layout
-    is_cuda_graph_compatible = not args.no_cuda_graph
-    res = []
-    backends = ["trtllm"]
+    method = args.routing_method
+    requested = args.backends or list(_MOE_ROUTING_BACKEND_METHODS)
+    backends = []
+    for backend in dict.fromkeys(requested):
+        if backend not in _MOE_ROUTING_BACKEND_METHODS:
+            raise ValueError(f"Unknown moe_routing backend {backend!r}")
+        if method in _MOE_ROUTING_BACKEND_METHODS[backend]:
+            backends.append(backend)
+        elif args.backends:
+            print(f"[WARNING] {backend} does not implement {method} routing. Skipping.")
     backends = filter_backends_by_compute_capability(backends, args.routine, device)
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
-        return res
+        return []
 
-    if args.verbose >= 1:
-        print(
-            f"[INFO] Configuration: tokens={num_tokens}, hidden={hidden_size}, "
-            f"intermediate={intermediate_size}, experts={num_experts}, top_k={top_k}"
+    num_tokens, num_experts, top_k = args.num_tokens, args.num_experts, args.top_k
+    torch.manual_seed(args.random_seed)
+    logits = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
+    bias = None
+    if args.use_routing_bias:
+        bias = 0.1 * torch.randn(num_experts, device=device, dtype=torch.float32)
+    n_group = args.n_group if args.n_group else 1
+    topk_group = args.topk_group if args.topk_group else 1
+    rsf = args.routed_scaling_factor
+    local_num_experts = args.local_num_experts or num_experts
+
+    if method == "hash":
+        input_ids = torch.randint(
+            0, args.hash_vocab_size, (num_tokens,), device=device, dtype=torch.int64
         )
-
-    # Create test data
-    routing_logits, routing_bias, hidden_states, gemm1_weights, gemm2_weights = (
-        create_trtllm_moe_test_data(
-            num_tokens,
-            hidden_size,
-            intermediate_size,
-            num_experts,
-            routing_method_type,
-            args.use_routing_bias,
-            input_dtype,
-            weight_dtype,
-            device,
-            moe_kernel_type="fp8_block_scale",
-        )
-    )
-
-    # Compute selected experts for accurate bandwidth calculation
-    # Use the actual routing method to get correct expert assignments
-    selected_experts = _compute_routing_for_method(
-        routing_logits=routing_logits,
-        routing_bias=routing_bias,
-        top_k=top_k,
-        routing_method_type=routing_method_type,
-        n_group=n_group,
-        topk_group=topk_group,
-        routed_scaling_factor=routed_scaling_factor,
-    )
-
-    # For FP8 block scale, create quantized weights and block scales
-    # Quantize to FP8
-    gemm1_weights_fp8 = gemm1_weights.to(torch.float8_e4m3fn)
-    gemm2_weights_fp8 = gemm2_weights.to(torch.float8_e4m3fn)
-
-    # Optionally shuffle weights and convert to BlockMajorK layout to match kernel expectation
-    if use_shuffled_weight:
-        gemm1_weights_fp8_shuffled = []
-        gemm2_weights_fp8_shuffled = []
-        for i in range(num_experts):
-            tmp_w1 = process_fp8_weight_layout(
-                gemm1_weights_fp8[i], use_shuffled_weight, weight_layout
-            )
-            tmp_w2 = process_fp8_weight_layout(
-                gemm2_weights_fp8[i], use_shuffled_weight, weight_layout
-            )
-            gemm1_weights_fp8_shuffled.append(tmp_w1.view(torch.uint8))
-            gemm2_weights_fp8_shuffled.append(tmp_w2.view(torch.uint8))
-
-        kernel_gemm1_weights = torch.stack(gemm1_weights_fp8_shuffled).view(
-            torch.float8_e4m3fn
-        )
-        kernel_gemm2_weights = torch.stack(gemm2_weights_fp8_shuffled).view(
-            torch.float8_e4m3fn
-        )
+        tid2eid = torch.stack(
+            [
+                torch.randperm(num_experts, device=device)[:top_k]
+                for _ in range(min(args.hash_vocab_size, 1024))
+            ]
+        ).to(torch.int32)
+        # Tile the 1024 sampled rows to the full vocabulary (table contents do
+        # not change the kernel's memory traffic).
+        tid2eid = tid2eid.repeat(
+            (args.hash_vocab_size + tid2eid.shape[0] - 1) // tid2eid.shape[0], 1
+        )[: args.hash_vocab_size].contiguous()
+        ref_ids = tid2eid[input_ids].long()
     else:
-        kernel_gemm1_weights = gemm1_weights_fp8
-        kernel_gemm2_weights = gemm2_weights_fp8
-
-    # Create block scale tensors for hidden states and weights (use float32 for scales)
-    # TensorRT-LLM FP8 block-scale expects hidden_states_scale shape [hidden_size // 128, num_tokens]
-    hidden_states_scale = 2.0 * torch.ones(
-        (hidden_size // 128, num_tokens), device=device, dtype=torch.float32
-    )
-    gemm1_weights_scale = 2.0 * torch.ones(
-        (num_experts, 2 * intermediate_size // 128, hidden_size // 128),
-        device=device,
-        dtype=torch.float32,
-    )
-    gemm2_weights_scale = 2.0 * torch.ones(
-        (num_experts, hidden_size // 128, intermediate_size // 128),
-        device=device,
-        dtype=torch.float32,
-    )
-
-    if args.verbose >= 2:
-        print(f"[VVERBOSE] routing_logits.shape = {routing_logits.shape}")
-        print(f"[VVERBOSE] hidden_states.shape = {hidden_states.shape}")
-        print(f"[VVERBOSE] gemm1_weights_fp8.shape = {gemm1_weights_fp8.shape}")
-        print(f"[VVERBOSE] gemm2_weights_fp8.shape = {gemm2_weights_fp8.shape}")
-
-    def run_fp8_block_moe(
-        routing_logits,
-        routing_bias,
-        hidden_states,
-        hidden_states_scale,
-        kernel_gemm1_weights,
-        gemm1_weights_scale,
-        kernel_gemm2_weights,
-        gemm2_weights_scale,
-    ):
-        # Quantize hidden states to FP8 for block scale MOE
-        hidden_states_fp8 = hidden_states.to(torch.float8_e4m3fn)
-        # Note: FP8 block scale MOE expects int64_t for n_group/topk_group, not Optional[int64_t]
-        # So we convert None to 0 to indicate "no groups" mode
-        return trtllm_fp8_block_scale_moe(
-            routing_logits=routing_logits,
-            routing_bias=routing_bias,
-            hidden_states=hidden_states_fp8,
-            hidden_states_scale=hidden_states_scale,
-            gemm1_weights=kernel_gemm1_weights,
-            gemm1_weights_scale=gemm1_weights_scale,
-            gemm2_weights=kernel_gemm2_weights,
-            gemm2_weights_scale=gemm2_weights_scale,
-            num_experts=num_experts,
-            top_k=top_k,
-            n_group=n_group if n_group is not None else 0,
-            topk_group=topk_group if topk_group is not None else 0,
-            intermediate_size=intermediate_size,
-            local_expert_offset=local_expert_offset,
-            local_num_experts=local_num_experts,
-            routed_scaling_factor=routed_scaling_factor,
-            routing_method_type=routing_method_type,
-            use_shuffled_weight=use_shuffled_weight,
-            weight_layout=weight_layout,
-            enable_pdl=args.enable_pdl,
+        ref_ids, _ = _reference_routing(
+            logits,
+            bias,
+            top_k,
+            args.routing_method_type,
+            n_group if method == "deepseek_v3" else None,
+            topk_group if method == "deepseek_v3" else None,
+            rsf,
         )
 
-    # Benchmark timing
-    times = bench_gpu_time(
-        fn=run_fp8_block_moe,
-        dry_run_iters=args.dry_run_iters,
-        repeat_iters=args.num_iters,
-        sleep_after_run=False,
-        enable_cupti=args.use_cupti,
-        use_cuda_graph=is_cuda_graph_compatible,
-        cold_l2_cache=True,
-        input_args=(
-            routing_logits,
-            routing_bias,
-            hidden_states,
-            hidden_states_scale,
-            kernel_gemm1_weights,
-            gemm1_weights_scale,
-            kernel_gemm2_weights,
-            gemm2_weights_scale,
-        ),
-    )
+    def make_runner(backend):
+        if backend == "trtllm":
+            from flashinfer.fused_moe import trtllm_gen_routing
 
-    # Compute performance metrics
-    median_time = np.median(times)
-    std_time = np.std(times)
-    tflops = calculate_moe_tflops(
-        num_tokens,
-        hidden_size,
-        intermediate_size,
-        num_experts,
-        top_k,
-        median_time,
-        is_gated=args.activation_type in (ActivationType.Swiglu, ActivationType.Geglu),
-    )
-    tb_per_sec = calculate_moe_kernel_bandwidth(
-        num_tokens,
-        hidden_size,
-        intermediate_size,
-        num_experts,
-        top_k,
-        median_time,
-        input_dtype,
-        weight_dtype,
-        input_format="fp8",
-        weight_format="fp8",
-        routing_logits_dtype=routing_logits.dtype,
-        active_experts=int(selected_experts.unique().numel()),
-        verbose=args.verbose,
-    )
+            def run(logits, bias):
+                return trtllm_gen_routing(
+                    logits,
+                    bias,
+                    RoutingMethodType(args.routing_method_type),
+                    top_k,
+                    n_group=n_group if method == "deepseek_v3" else 0,
+                    topk_group=topk_group if method == "deepseek_v3" else 0,
+                    local_expert_offset=args.local_expert_offset,
+                    local_num_experts=local_num_experts,
+                    routed_scaling_factor=rsf,
+                    tile_tokens_dim=args.tile_tokens_dim,
+                    enable_pdl=args.enable_pdl,
+                )
 
-    backend = "trtllm"
-    print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
+            return run, (lambda out: out.topk_ids), (logits, bias)
+        if backend == "dsv3":
+            topk_values = torch.empty(num_tokens, top_k, device=device)
+            topk_indices = torch.empty(
+                num_tokens, top_k, device=device, dtype=torch.int32
+            )
+            dsv3_bias = bias if bias is not None else torch.zeros_like(logits[0])
 
-    if args.output_path is not None:
-        cur_res = defaultdict(str)
-        cur_res["routine"] = args.routine
-        cur_res["median_time"] = median_time
-        cur_res["std_time"] = std_time
-        cur_res["tflops"] = tflops
-        cur_res["tb_per_sec"] = tb_per_sec
-        cur_res["backend"] = backend
-        cur_res["num_tokens"] = num_tokens
-        cur_res["hidden_size"] = hidden_size
-        cur_res["intermediate_size"] = intermediate_size
-        cur_res["num_experts"] = num_experts
-        cur_res["top_k"] = top_k
-        cur_res["n_group"] = n_group
-        cur_res["topk_group"] = topk_group
-        cur_res["routed_scaling_factor"] = routed_scaling_factor
-        cur_res["local_expert_offset"] = local_expert_offset
-        cur_res["local_num_experts"] = local_num_experts
-        cur_res["routing_method"] = args.routing_method
-        cur_res["use_shuffled_weight"] = use_shuffled_weight
-        cur_res["weight_layout"] = weight_layout
-        cur_res["use_routing_bias"] = args.use_routing_bias
-        cur_res["use_routing_scales_on_input"] = args.use_routing_scales_on_input
-        cur_res["input_dtype"] = input_dtype
-        cur_res["weight_dtype"] = weight_dtype
-        res.append(cur_res)
+            def run(logits, bias, topk_values, topk_indices):
+                fused_topk_deepseek(
+                    logits,
+                    bias,
+                    n_group,
+                    topk_group,
+                    top_k,
+                    rsf,
+                    topk_values,
+                    topk_indices,
+                    backend="default",
+                )
+                return topk_indices
 
-    return res
+            return (
+                run,
+                (lambda out: out),
+                (logits, dsv3_bias, topk_values, topk_indices),
+            )
+        if backend == "alphamoe":
+            from flashinfer.fused_moe import (
+                allocate_alphamoe_route_plan,
+                alphamoe_fused_router,
+            )
 
+            plan = allocate_alphamoe_route_plan(
+                logits, top_k=top_k, block_m=args.block_m
+            )
 
-def testTrtllmFp8PerTensorScaleMoe(args):
-    """
-    Test trtllm_fp8_per_tensor_scale_moe API (TensorRT-LLM fused MoE).
+            def run(logits):
+                return alphamoe_fused_router(
+                    logits, top_k=top_k, block_m=args.block_m, plan=plan
+                )
 
-    This test:
-    1. Creates quantized FP8 weights and per-tensor scales
-    2. Runs FP8 per-tensor scale MOE
-    3. Measures performance metrics (TFLOPS, TB/sec)
+            return run, (lambda out: out.topk_ids), (logits,)
+        # hash
+        from flashinfer.fused_moe import hash_topk
 
-    Args:
-        args: Parsed command line arguments containing test configuration
+        def run(logits, input_ids, tid2eid):
+            return hash_topk(
+                logits,
+                input_ids,
+                tid2eid,
+                routed_scaling_factor=rsf,
+                launch_with_pdl=bool(args.enable_pdl),
+            )
 
-    Returns:
-        dict: List of dictionaries containing performance results
-    """
-    if args.verbose >= 1:
-        print("[INFO] Running testTrtllmFp8PerTensorScaleMoe")
-        print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
+        return run, (lambda out: out[1]), (logits, input_ids, tid2eid)
 
-    device = get_device(args)
-    if args.generate_repro_command:
-        print(
-            f"[INFO] To reproduce this test case, run the following command: {args.repro_command}"
-        )
-
-    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
-    weight_dtype = dtype_str_to_torch_dtype(args.weight_dtype)
-
-    # Parse configuration
-    num_tokens = args.num_tokens
-    hidden_size = args.hidden_size
-    intermediate_size = args.intermediate_size
-    num_experts = args.num_experts
-    top_k = args.top_k
-    n_group = (
-        args.n_group
-        if hasattr(args, "n_group") and args.n_group is not None and args.n_group > 0
-        else None
-    )
-    topk_group = (
-        args.topk_group
-        if hasattr(args, "topk_group")
-        and args.topk_group is not None
-        and args.topk_group > 0
-        else None
-    )
-    routed_scaling_factor = (
-        args.routed_scaling_factor
-        if hasattr(args, "routed_scaling_factor")
-        and args.routed_scaling_factor is not None
-        else None
-    )
-    local_expert_offset = args.local_expert_offset
-    local_num_experts = args.local_num_experts or num_experts
-    routing_method_type = args.routing_method_type
-    use_routing_scales_on_input = args.use_routing_scales_on_input
-    is_cuda_graph_compatible = not args.no_cuda_graph
     res = []
-    backends = ["trtllm"]
-    backends = filter_backends_by_compute_capability(backends, args.routine, device)
-    if len(backends) == 0:
-        print("[ERROR] No backends to test. Exiting.")
-        return res
+    for backend in backends:
+        run, ids_of, input_args = make_runner(backend)
+        refcheck_passed = ""
+        if args.refcheck:
+            got = ids_of(run(*input_args)).long()
+            # Compare expert sets per token (slot order is backend-specific);
+            # near-ties in random logits may legitimately flip a few experts.
+            match = (
+                (got.sort(dim=-1).values[:, :top_k] == ref_ids.sort(dim=-1).values)
+                .all(dim=-1)
+                .float()
+                .mean()
+                .item()
+            )
+            refcheck_passed = match >= 0.99
+            print(
+                f"[REFCHECK] {backend}: {match * 100:.2f}% of tokens select the "
+                "reference expert set"
+            )
+            if not refcheck_passed and not args.allow_output_mismatch:
+                raise AssertionError(f"{backend} routing does not match the reference")
 
-    if args.verbose >= 1:
-        print(
-            f"[INFO] Configuration: tokens={num_tokens}, hidden={hidden_size}, "
-            f"intermediate={intermediate_size}, experts={num_experts}, top_k={top_k}"
+        times = bench_gpu_time(
+            fn=run,
+            dry_run_iters=args.dry_run_iters,
+            repeat_iters=args.num_iters,
+            sleep_after_run=False,
+            enable_cupti=args.use_cupti,
+            use_cuda_graph=not args.no_cuda_graph,
+            cold_l2_cache=True,
+            input_args=input_args,
         )
+        median_time = np.median(times)
+        std_time = np.std(times)
+        # Logits (+ token ids / hash table rows) in, top-k ids + weights out.
+        moved_bytes = num_tokens * num_experts * 4 + num_tokens * top_k * 8
+        if backend == "hash":
+            moved_bytes += num_tokens * (8 + top_k * 4)
+        tb_per_sec = moved_bytes / (median_time * 1e-3) / 1e12
+        print_perf_metrics(backend, median_time, std_time, 0.0, tb_per_sec)
 
-    # Create test data
-    routing_logits, routing_bias, hidden_states, gemm1_weights, gemm2_weights = (
-        create_trtllm_moe_test_data(
-            num_tokens,
-            hidden_size,
-            intermediate_size,
-            num_experts,
-            routing_method_type,
-            args.use_routing_bias,
-            input_dtype,
-            weight_dtype,
-            device,
-            moe_kernel_type="fp8_per_tensor",
-        )
-    )
-
-    # Compute selected experts for accurate bandwidth calculation
-    # Use the actual routing method to get correct expert assignments
-    selected_experts = _compute_routing_for_method(
-        routing_logits=routing_logits,
-        routing_bias=routing_bias,
-        top_k=top_k,
-        routing_method_type=routing_method_type,
-        n_group=n_group,
-        topk_group=topk_group,
-        routed_scaling_factor=routed_scaling_factor,
-    )
-
-    # For FP8 per-tensor scale, create quantized weights and per-tensor scales
-    # Quantize to FP8
-    gemm1_weights_fp8 = gemm1_weights.to(torch.float8_e4m3fn)
-    gemm2_weights_fp8 = gemm2_weights.to(torch.float8_e4m3fn)
-
-    # Quantize hidden states to FP8 for per-tensor scale
-    hidden_states_fp8 = hidden_states.to(torch.float8_e4m3fn)
-
-    # Create per-tensor scale scalars using shared utility
-    output1_scales_scalar, output1_scales_gate_scalar, output2_scales_scalar = (
-        create_moe_output_scale_scalars(local_num_experts, device)
-    )
-
-    if args.verbose >= 2:
-        print(f"[VVERBOSE] routing_logits.shape = {routing_logits.shape}")
-        print(f"[VVERBOSE] hidden_states.shape = {hidden_states.shape}")
-        print(f"[VVERBOSE] gemm1_weights_fp8.shape = {gemm1_weights_fp8.shape}")
-        print(f"[VVERBOSE] gemm2_weights_fp8.shape = {gemm2_weights_fp8.shape}")
-
-    def run_fp8_per_tensor_moe(
-        routing_logits,
-        routing_bias,
-        hidden_states_fp8,
-        gemm1_weights_fp8,
-        output1_scales_scalar,
-        output1_scales_gate_scalar,
-        gemm2_weights_fp8,
-        output2_scales_scalar,
-        activation_type,
-    ):
-        # Note: FP8 per-tensor MOE expects int64_t for n_group/topk_group, not Optional[int64_t]
-        # So we convert None to 0 to indicate "no groups" mode
-        return trtllm_fp8_per_tensor_scale_moe(
-            routing_logits=routing_logits,
-            routing_bias=routing_bias,
-            hidden_states=hidden_states_fp8,
-            gemm1_weights=gemm1_weights_fp8,
-            output1_scales_scalar=output1_scales_scalar,
-            output1_scales_gate_scalar=output1_scales_gate_scalar,
-            gemm2_weights=gemm2_weights_fp8,
-            output2_scales_scalar=output2_scales_scalar,
-            num_experts=num_experts,
-            top_k=top_k,
-            n_group=n_group if n_group is not None else 0,
-            topk_group=topk_group if topk_group is not None else 0,
-            intermediate_size=intermediate_size,
-            local_expert_offset=local_expert_offset,
-            local_num_experts=local_num_experts,
-            routed_scaling_factor=routed_scaling_factor,
-            use_routing_scales_on_input=use_routing_scales_on_input,
-            routing_method_type=routing_method_type,
-            enable_pdl=args.enable_pdl,
-            **_activation_kwarg(trtllm_fp8_per_tensor_scale_moe, activation_type),
-        )
-
-    # Benchmark timing
-    times = bench_gpu_time(
-        fn=run_fp8_per_tensor_moe,
-        dry_run_iters=args.dry_run_iters,
-        repeat_iters=args.num_iters,
-        sleep_after_run=False,
-        enable_cupti=args.use_cupti,
-        use_cuda_graph=is_cuda_graph_compatible,
-        cold_l2_cache=True,
-        input_args=(
-            routing_logits,
-            routing_bias,
-            hidden_states_fp8,
-            gemm1_weights_fp8,
-            output1_scales_scalar,
-            output1_scales_gate_scalar,
-            gemm2_weights_fp8,
-            output2_scales_scalar,
-            args.activation_type,
-        ),
-    )
-
-    # Compute performance metrics
-    median_time = np.median(times)
-    std_time = np.std(times)
-    tflops = calculate_moe_tflops(
-        num_tokens,
-        hidden_size,
-        intermediate_size,
-        num_experts,
-        top_k,
-        median_time,
-        is_gated=args.activation_type in (ActivationType.Swiglu, ActivationType.Geglu),
-    )
-    tb_per_sec = calculate_moe_kernel_bandwidth(
-        num_tokens,
-        hidden_size,
-        intermediate_size,
-        num_experts,
-        top_k,
-        median_time,
-        input_dtype,
-        weight_dtype,
-        input_format="fp8",
-        weight_format="fp8",
-        routing_logits_dtype=routing_logits.dtype,
-        active_experts=int(selected_experts.unique().numel()),
-        verbose=args.verbose,
-    )
-
-    backend = "trtllm"
-    print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
-
-    if args.output_path is not None:
-        cur_res = defaultdict(str)
-        cur_res["routine"] = args.routine
-        cur_res["median_time"] = median_time
-        cur_res["std_time"] = std_time
-        cur_res["tflops"] = tflops
-        cur_res["tb_per_sec"] = tb_per_sec
-        cur_res["backend"] = backend
-        cur_res["num_tokens"] = num_tokens
-        cur_res["hidden_size"] = hidden_size
-        cur_res["intermediate_size"] = intermediate_size
-        cur_res["num_experts"] = num_experts
-        cur_res["top_k"] = top_k
-        cur_res["n_group"] = n_group
-        cur_res["topk_group"] = topk_group
-        cur_res["routed_scaling_factor"] = routed_scaling_factor
-        cur_res["local_expert_offset"] = local_expert_offset
-        cur_res["local_num_experts"] = local_num_experts
-        cur_res["routing_method"] = args.routing_method
-        cur_res["use_routing_bias"] = args.use_routing_bias
-        cur_res["use_routing_scales_on_input"] = use_routing_scales_on_input
-        cur_res["input_dtype"] = input_dtype
-        cur_res["weight_dtype"] = weight_dtype
-        cur_res["activation_type"] = args.activation_type.name
-        res.append(cur_res)
-
+        if args.output_path is not None:
+            cur_res = defaultdict(str)
+            cur_res["routine"] = args.routine
+            cur_res["median_time"] = median_time
+            cur_res["std_time"] = std_time
+            cur_res["tflops"] = 0.0
+            cur_res["tb_per_sec"] = tb_per_sec
+            cur_res["backend"] = backend
+            cur_res["num_tokens"] = num_tokens
+            cur_res["num_experts"] = num_experts
+            cur_res["top_k"] = top_k
+            cur_res["n_group"] = n_group if method == "deepseek_v3" else ""
+            cur_res["topk_group"] = topk_group if method == "deepseek_v3" else ""
+            cur_res["routed_scaling_factor"] = rsf
+            cur_res["local_expert_offset"] = args.local_expert_offset
+            cur_res["local_num_experts"] = local_num_experts
+            cur_res["routing_method"] = method
+            cur_res["use_routing_bias"] = args.use_routing_bias
+            cur_res["block_m"] = args.block_m if backend == "alphamoe" else ""
+            cur_res["input_dtype"] = torch.float32
+            cur_res["refcheck_passed"] = refcheck_passed
+            res.append(cur_res)
     return res
 
 

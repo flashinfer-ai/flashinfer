@@ -48,12 +48,21 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `mm_bf16` - Matrix multiplication with BF16 inputs (Blackwell SM10.0+).
     - `bmm_bf16` - Batched matrix multiplication with BF16 inputs (Blackwell SM10.0+).
 - MOE:
-    - `trtllm_fp4_block_scale_moe` - MOE with FP4 quantized weights and block-wise scaling.
-    - `trtllm_fp8_block_scale_moe` - MOE with FP8 quantized weights and block-wise scaling.
-    - `trtllm_fp8_per_tensor_scale_moe` - MOE with FP8 quantized weights and per-tensor scaling.
+    - `trtllm_fp4_block_scale_moe` - MOE with FP4 quantized weights and block-wise scaling (NVFP4, MXFP4 x MXFP8, MXFP4 x BF16).
+    - `trtllm_fp8_block_scale_moe` - MOE with FP8 quantized weights and block-wise scaling (DeepSeek 128x128 blocks, or MXFP8 via `--fp8_quant_type mxfp8`).
+    - `trtllm_fp8_per_tensor_scale_moe` - MOE with FP8 quantized weights and per-tensor scaling (or per-channel weight scales via `--fp8_scale_granularity per_channel`).
+    - `trtllm_bf16_moe` - TRT-LLM Gen BF16 x BF16 fused MoE (BlockMajorK weights).
+    - `trtllm_mxint4_block_scale_moe` - TRT-LLM Gen MxInt4 weights x BF16 activations (e.g. Kimi-K2 INT4).
+    - The `trtllm_*` routines take `--backends trtllm prims-ts` (Prims-TS GEMMs behind the same signature, SM100/SM103) and `--routing_input precomputed` (the `*_routed_moe` APIs with packed top-k ids from a torch reference of `--routing_method`).
     - `cutlass_fused_moe` - CUTLASS fused MoE (base/fp8/nvfp4 variants with optional TP/EP)
+    - `cute_dsl_fp4_block_scale_moe` - CuTe-DSL NVFP4 (W4A4) fused MoE on SM100/SM103/SM107 with SwiGLU, GeGLU-Tanh or ReLU2. W4A8/W4A16/MXFP8 are benchmarked through `unified_moe --backends cute_dsl`.
     - `cute_dsl_bf16_moe` - CuTe-DSL BF16/FP16 fused MoE for Hopper.
-    - `unified_moe` - Unified MoE API comparison between the CUTLASS, cuTile, b12x and cuDNN grouped-GEMM backends. It supports BF16, NVFP4 and MXFP4 W4A4/W4A16, per-tensor FP8 and MXFP8 W8A8/W8A16, and MXFP4 W4A8 with gated SwiGLU, SwiGLU-Step, GeGLU, GeGLU-Tanh, and SiTU or non-gated GELU, ReLU, SiLU, ReLU2, and Identity; filters unsupported backends at runtime; and can autotune each backend independently.
+    - `b12x_fused_moe` - b12x (CuTe-DSL SM120/SM121) NVFP4 or W4A16 fused MoE.
+    - `alphamoe_nvfp4_aligned_moe` - AlphaMoE NVFP4 megakernel (SM100/SM103) over a pre-aligned plan, or `--alphamoe_routing routed` for `alphamoe_nvfp4_routed_moe` (route alignment + MoE in one call).
+    - `unified_nvfp4_moe` - `MoELayer` cross-backend NVFP4 autotune over CuTe-DSL and TRT-LLM.
+    - `bgmv_moe` - Multi-LoRA BGMV shrink + expand kernels for MoE experts.
+    - `moe_routing` - Standalone MoE routing kernels on the same logits: `trtllm` (`trtllm_gen_routing`, every routing method), `dsv3` (`fused_topk_deepseek`), `alphamoe` (`alphamoe_fused_router`) and `hash` (`hash_topk`, DeepSeek-V4). `--refcheck` compares each backend's expert selection with a torch reference.
+    - `unified_moe` - Unified MoE API (`MoELayer` runners) comparison on identical inputs across the CUTLASS, cuTile, b12x, SM12x, cuDNN grouped-GEMM, TRT-LLM Gen (`trtllm`), CuTe-DSL (`cute_dsl`), Prims-TS (`prims_ts`), cuDNN Frost (`cudnn_frost`, SM107/SM120) and Frost low-latency decode (`frost_ll`, 1-8 tokens) backends. It supports BF16, NVFP4 and MXFP4 W4A4/W4A16, per-tensor FP8 W8A8/W8A16, DeepSeek block FP8 (`fp8_block`), MXFP8 W8A8/W8A16, MXFP4 W4A8 and MxInt4 W4A16 with gated SwiGLU, SwiGLU-Step, GeGLU, GeGLU-Tanh, SiTU and PowLU or non-gated GELU, ReLU, SiLU, ReLU2, and Identity; filters unsupported backends at runtime; and can autotune each backend independently.
 - MOE Communication: no routine yet; standalone scripts cover it. `benchmarks/moe_ep/core/comm/bench_moe_ep_comm.py` times dispatch + combine of the `flashinfer.moe_ep` communication backends (launched with `torchrun`), and `benchmarks/moe_ep/bench_moe_ep.py` times dispatch + MoE + combine.
 - AllReduce Communication:
     - `allreduce_fusion` - AllReduce fusion benchmark for multi-GPU inference. Requires `mpirun` for multi-GPU execution. Supports TRTLLM and TRTLLM MNNVL backends with multiple fusion patterns (plain allreduce, allreduce + residual + RMSNorm).
@@ -319,7 +328,17 @@ The output CSV will contain detailed metrics including:
 | `--routed_scaling_factor`| Scaling factor for routing. Default: 2.5                                                                   |
 | `--local_expert_offset`  | Offset of local experts in global expert space. Default: 0                                                 |
 | `--local_num_experts`    | Number of experts handled by this device. Default: equals num_experts                                      |                                                                    |
-| `--routing_method`       | Routing method: `renormalize`, `deepseek_v3`, `llama4`, `renormalize_naive`. Default: `deepseek_v3`.       |
+| `--routing_method`       | Routing method: `default`, `renormalize`, `deepseek_v3`, `llama4`, `renormalize_naive`, `topk`, `sigmoid_renorm`, `minimax2`, `sigmoid`, `topk_sigmoid` (all `RoutingMethodType` values), or `hash` (`moe_routing` only). Default: `deepseek_v3`. |
+| `--backends`             | `trtllm_*` routines: `trtllm` (default) and/or `prims-ts`. `moe_routing`: `trtllm`, `dsv3`, `alphamoe`, `hash` (default: all that implement the routing method). `unified_moe`: see the routine description. |
+| `--routing_input`        | `trtllm_*` routines: `logits` (default, in-kernel routing) or `precomputed` (`*_routed_moe` APIs with packed top-k ids) |
+| `--fp8_quant_type`       | `trtllm_fp8_block_scale_moe`: `deepseek` (default, 128x128 FP8 blocks) or `mxfp8`                           |
+| `--fp8_scale_granularity`| `trtllm_fp8_per_tensor_scale_moe`: `per_tensor` (default) or `per_channel` (`trtllm_fp8_per_channel_scale_moe`) |
+| `--swiglu_alpha` / `--swiglu_beta` / `--swiglu_limit` | gpt-oss style SwiGLU parameters (`trtllm_fp4_block_scale_moe`, `cutlass_fused_moe`) |
+| `--gemm_bias`            | Add FC1/FC2 expert biases (`trtllm_fp4_block_scale_moe`)                                                    |
+| `--valid_hidden_size` / `--valid_intermediate_size` | `trtllm_*` routines: unpadded sizes when `--hidden_size` / `--intermediate_size` are padded (e.g. GPT-OSS 3072/2944 with valid 2880/2880) |
+| `--num_fused_shared_experts` | Fused shared experts appended to the routed experts (`trtllm_fp4/fp8_block_scale_moe`, DeepSeekV3 routing, logits input) |
+| `--alphamoe_routing`     | `alphamoe_nvfp4_aligned_moe`: `aligned` (default, pre-aligned plan) or `routed` (`alphamoe_nvfp4_routed_moe`) |
+| `--tile_tokens_dim` / `--hash_vocab_size` | `moe_routing`: trtllm token tile (default 8) / hash-routing vocabulary (default 129280)  |
 | `--use_shuffled_weight`  | Whether to use shuffled weight layout                                                                      |
 | `--weight_layout`        | Weight layout: 0=MajorK, 1=MajorMn,  2=BlockMajorK. Default: 0                                             |
 | `--use_routing_bias`     | Whether to use routing bias                                                                                |
@@ -333,7 +352,7 @@ The output CSV will contain detailed metrics including:
 | `--ep_size`              | Expert-parallel world size                                                                                  |
 | `--ep_rank`              | Expert-parallel rank                                                                                        |
 | `--activation-type`      | Activation function: `Swiglu` (default), `Geglu`, `SwigluStep` (clipped SwiGLU, limit=7.0), `Relu2`, etc.  |
-| `--autotune`             | Enable autotune for supported operation                                                                     |
+| `--autotune`             | Enable autotune for supported operation (all `trtllm_*` routines, `cutlass_fused_moe`, `cute_dsl_*`, `unified_moe`) |
 
 ### MOE Routing Method Compatibility
 

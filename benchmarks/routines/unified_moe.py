@@ -1,9 +1,10 @@
-"""Apples-to-apples benchmarks for unified CUTLASS, cuTile, b12x, SM12x, cuDNN grouped-GEMM, TRTLLM and CuTe-DSL MoE runners."""
+"""Apples-to-apples benchmarks for unified CUTLASS, cuTile, b12x, SM12x, cuDNN grouped-GEMM, TRTLLM, CuTe-DSL, Prims-TS and cuDNN Frost MoE runners."""
 
 from __future__ import annotations
 
 import argparse
 import functools
+import inspect
 from collections import defaultdict
 from typing import Any
 
@@ -19,6 +20,10 @@ from flashinfer.fused_moe import (
     BackendOptions,
     B12xNvfp4Config,
     B12xW4A16Config,
+    CudnnFrostBf16Config,
+    CudnnFrostMxfp8Config,
+    CudnnFrostMxfp8Mxfp4Config,
+    CudnnFrostNvfp4Config,
     CudnnGroupedGemmBf16Config,
     CudnnGroupedGemmFp8PerTensorConfig,
     CudnnGroupedGemmMxfp8Config,
@@ -42,6 +47,7 @@ from flashinfer.fused_moe import (
     CuTileNvfp4Config,
     ExecutionConfig,
     ExpertConfig,
+    FrostLowLatencyConfig,
     GELU,
     GeGLU,
     GeGLUTanh,
@@ -51,6 +57,8 @@ from flashinfer.fused_moe import (
     MoEFinalizeConfig,
     MoELayer,
     MoEWeightPack,
+    PowLU,
+    PrimsTsConfig,
     QuantConfig,
     QuantFormat,
     ReLU,
@@ -62,7 +70,11 @@ from flashinfer.fused_moe import (
     SiTU,
     SwiGLU,
     SwiGLUStep,
+    TrtllmBf16Config,
+    TrtllmFp4Config,
     TrtllmFp8BlockConfig,
+    TrtllmFp8PerTensorConfig,
+    TrtllmMxInt4Config,
 )
 from flashinfer.fused_moe.prepare import (
     _quantize_mxfp4_linear,
@@ -111,7 +123,69 @@ _BACKEND_CONFIGS = {
     ("mxfp8_w8a16", "cutile"): CuTileMxfp8Bf16Config,
     ("mxfp4_w4a8", "cutile"): CuTileMxfp4Mxfp8Config,
     ("mxfp4_w4a8", "cutlass"): CutlassMxfp8Mxfp4Config,
+    # bench1026-moe: TRT-LLM Gen, CuTe-DSL, Prims-TS and cuDNN Frost pairs. All
+    # are prepared from the canonical BF16 weights by the config's own
+    # prepare_weights and fed the canonical activation pack of their quant pair
+    # (MoEActivationPack docstring, flashinfer/fused_moe/api.py).
+    ("bf16", "trtllm"): TrtllmBf16Config,
+    ("bf16", "prims_ts"): PrimsTsConfig,
+    ("bf16", "cudnn_frost"): CudnnFrostBf16Config,
+    ("nvfp4", "trtllm"): TrtllmFp4Config,
+    ("nvfp4", "cute_dsl"): CuteDslConfig,
+    ("nvfp4", "prims_ts"): PrimsTsConfig,
+    ("nvfp4", "cudnn_frost"): CudnnFrostNvfp4Config,
+    ("nvfp4_w4a16", "cute_dsl"): CuteDslConfig,
+    ("mxfp4_w4a8", "trtllm"): TrtllmFp4Config,
+    ("mxfp4_w4a8", "cute_dsl"): CuteDslConfig,
+    ("mxfp4_w4a8", "prims_ts"): PrimsTsConfig,
+    ("mxfp4_w4a8", "cudnn_frost"): CudnnFrostMxfp8Mxfp4Config,
+    ("mxfp4_w4a16", "trtllm"): TrtllmFp4Config,
+    ("mxfp4_w4a16", "prims_ts"): PrimsTsConfig,
+    ("fp8", "trtllm"): TrtllmFp8PerTensorConfig,
+    ("fp8", "prims_ts"): PrimsTsConfig,
+    ("fp8_block", "trtllm"): TrtllmFp8BlockConfig,
+    ("fp8_block", "prims_ts"): PrimsTsConfig,
+    ("mxfp8", "prims_ts"): PrimsTsConfig,
+    ("mxfp8", "cudnn_frost"): CudnnFrostMxfp8Config,
+    ("mxint4_w4a16", "trtllm"): TrtllmMxInt4Config,
+    # Frost low-latency decode MoE (1-8 tokens; FrostLowLatencyConfig docstring).
+    ("bf16", "frost_ll"): FrostLowLatencyConfig,
+    ("nvfp4", "frost_ll"): FrostLowLatencyConfig,
+    ("nvfp4_w4a16", "frost_ll"): FrostLowLatencyConfig,
+    ("mxfp4_w4a8", "frost_ll"): FrostLowLatencyConfig,
+    ("mxfp4_w4a16", "frost_ll"): FrostLowLatencyConfig,
+    ("fp8", "frost_ll"): FrostLowLatencyConfig,
+    ("fp8_w8a16", "frost_ll"): FrostLowLatencyConfig,
+    ("fp8_block", "frost_ll"): FrostLowLatencyConfig,
+    ("mxfp8", "frost_ll"): FrostLowLatencyConfig,
+    ("mxint4_w4a16", "frost_ll"): FrostLowLatencyConfig,
 }
+
+# Bandwidth-model name of each canonical activation pack (None = BF16 bytes).
+_CANONICAL_INPUT_FORMAT = {
+    QuantFormat.BF16: None,
+    QuantFormat.NVFP4: "nvfp4",
+    QuantFormat.MXFP8: "mxfp8",
+    QuantFormat.FP8PerTensor: "fp8",
+    QuantFormat.DeepSeekFp8: "fp8_block_scale",
+}
+
+# bench1026-moe: configs whose weights come from the canonical BF16 weights via
+# their own prepare_weights and whose activations are the canonical pack of the
+# quant pair (_canonical_activation_pack). CuteDslConfig joins them for every
+# pair except MXFP8, which keeps the original path below.
+_CANONICAL_PACK_CONFIGS = (
+    TrtllmBf16Config,
+    TrtllmFp4Config,
+    TrtllmFp8PerTensorConfig,
+    TrtllmMxInt4Config,
+    PrimsTsConfig,
+    CudnnFrostBf16Config,
+    CudnnFrostMxfp8Config,
+    CudnnFrostMxfp8Mxfp4Config,
+    CudnnFrostNvfp4Config,
+    FrostLowLatencyConfig,
+)
 
 # Backends consuming a pre-quantized activation pack built once, outside the
 # timed region, by their config's ``prepare_activations``. The other quantized
@@ -163,6 +237,7 @@ _ACTIVATIONS = {
     ActivationType.Gelu: GELU,
     ActivationType.Relu: ReLU,
     ActivationType.Silu: SiLU,
+    ActivationType.PowLU: PowLU,
 }
 
 
@@ -173,7 +248,18 @@ def parse_unified_moe_args(line, parser: argparse.ArgumentParser):
     parser.add_argument(
         "--backends",
         nargs="+",
-        choices=("cutlass", "cutile", "b12x", "sm12x", "cudnn", "trtllm", "cute_dsl"),
+        choices=(
+            "cutlass",
+            "cutile",
+            "b12x",
+            "sm12x",
+            "cudnn",
+            "trtllm",
+            "cute_dsl",
+            "prims_ts",
+            "cudnn_frost",
+            "frost_ll",
+        ),
         default=["cutlass", "cutile"],
         help="Unified MoE backends to benchmark with the same inputs.",
     )
@@ -416,6 +502,149 @@ def _prepare_weight_view(
     return config_type.prepare_weights(w1_q, w1_scale, w2_q, w2_scale, **common)
 
 
+def _uses_canonical_pack(config_type, quant_variant: str) -> bool:
+    """Whether a (config, mode) pair goes through the canonical-pack path."""
+    if config_type is CuteDslConfig:
+        return quant_variant != "mxfp8"
+    if config_type is TrtllmFp8BlockConfig:
+        # MXFP8 keeps the original path; DeepSeek FP8 is new.
+        return quant_variant == "fp8_block"
+    return config_type in _CANONICAL_PACK_CONFIGS
+
+
+def _canonical_prepare_weights(config_type, w1, w2, common, quant, fp8_static_scales):
+    """Call ``config_type.prepare_weights`` with the keywords it declares."""
+    if config_type is FrostLowLatencyConfig:
+        return _frost_ll_prepare_weights(w1, w2, common, quant, fp8_static_scales)
+    params = inspect.signature(config_type.prepare_weights).parameters
+    kwargs = {k: v for k, v in common.items() if k in params}
+    if "quant" in params:
+        kwargs["quant"] = quant
+    for name, value in fp8_static_scales.items():
+        if name in params:
+            kwargs[name] = value
+    return config_type.prepare_weights(w1, w2, **kwargs)
+
+
+def _quantize_fp8_block128(weight: torch.Tensor):
+    """E4M3 weights with FP32 128x128 block scales (DeepSeek FP8 checkpoint)."""
+    e, rows, cols = weight.shape
+    x = weight.float().reshape(e, rows // 128, 128, cols // 128, 128)
+    scale = (x.abs().amax(dim=(2, 4)) / 448.0).clamp_min(1e-12)
+    q = (x / scale[:, :, None, :, None]).clamp(-448, 448).to(torch.float8_e4m3fn)
+    return q.reshape(e, rows, cols), scale.contiguous()
+
+
+def _quantize_mxint4(weight: torch.Tensor):
+    """Signed INT4 (even K in the low nibble) with BF16 scales per 32 K values."""
+    e, rows, cols = weight.shape
+    x = weight.float().reshape(e, rows, cols // 32, 32)
+    scale = (x.abs().amax(-1) / 7.0).clamp_min(1e-8).to(torch.bfloat16)
+    q = torch.round(x / scale.float().unsqueeze(-1)).clamp(-8, 7).to(torch.int32)
+    q = (q & 0xF).reshape(e, rows, cols)
+    packed = (q[..., 0::2] | (q[..., 1::2] << 4)).to(torch.uint8)
+    return packed, scale
+
+
+def _frost_ll_prepare_weights(w1, w2, common, quant, fp8_static_scales):
+    """Frost low-latency weight view for each supported quant pair.
+
+    Uses the matching ``FrostLowLatencyConfig.prepare_*`` helper on checkpoint-
+    style tensors quantized from the canonical BF16 weights.
+    """
+    activation = common["activation"]
+    pair = quant.pair
+    if pair == (QuantFormat.BF16, QuantFormat.BF16):
+        return FrostLowLatencyConfig.prepare_bf16_weights(w1, w2, activation=activation)
+    if pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
+        return FrostLowLatencyConfig.prepare_nvfp4_weights(
+            w1, w2, activation=activation
+        )
+    if pair == (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor):
+        return FrostLowLatencyConfig.prepare_fp8_per_tensor_weights(
+            w1,
+            w2,
+            **fp8_static_scales,
+            num_local_experts=common["num_local_experts"],
+            hidden_size=common["hidden_size"],
+            intermediate_size=common["intermediate_size"],
+            activation=activation,
+            device=common["device"],
+        )
+    if pair == (QuantFormat.FP8PerTensor, QuantFormat.BF16):
+        q1, s1 = _quantize_cutile_fp8_source(w1, block_scaled=False)
+        q2, s2 = _quantize_cutile_fp8_source(w2, block_scaled=False)
+        return FrostLowLatencyConfig.prepare_fp8_weight_only_weights(
+            q1, s1, q2, s2, activation=activation
+        )
+    if pair == (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8):
+        q1, s1 = _quantize_fp8_block128(w1)
+        q2, s2 = _quantize_fp8_block128(w2)
+        return FrostLowLatencyConfig.prepare_deepseek_fp8_weights(
+            q1, s1, q2, s2, activation=activation
+        )
+    if pair in (
+        (QuantFormat.MXFP8, QuantFormat.MXFP8),
+        (QuantFormat.MXFP4, QuantFormat.MXFP8),
+    ):
+        quantize = (
+            _quantize_cutile_mxfp4_source
+            if quant.weight == QuantFormat.MXFP4
+            else functools.partial(_quantize_cutile_fp8_source, block_scaled=True)
+        )
+        q1, s1 = quantize(w1)
+        q2, s2 = quantize(w2)
+        return FrostLowLatencyConfig.prepare_weights(
+            q1,
+            s1.view(torch.uint8),
+            q2,
+            s2.view(torch.uint8),
+            activation=activation,
+        )
+    if pair == (QuantFormat.MXFP4, QuantFormat.BF16):
+        q1, s1 = _quantize_cutile_mxfp4_source(w1)
+        q2, s2 = _quantize_cutile_mxfp4_source(w2)
+        return FrostLowLatencyConfig.prepare_mxfp4_weight_only_weights(
+            q1, s1, q2, s2, activation=activation
+        )
+    if pair == (QuantFormat.NVFP4, QuantFormat.BF16):
+        q1, s1, g1 = _quantize_cutile_nvfp4_source(w1)
+        q2, s2, g2 = _quantize_cutile_nvfp4_source(w2)
+        return FrostLowLatencyConfig.prepare_nvfp4_weight_only_weights(
+            q1, s1, g1, q2, s2, g2, activation=activation
+        )
+    if pair == (QuantFormat.MXINT4, QuantFormat.BF16):
+        q1, s1 = _quantize_mxint4(w1)
+        q2, s2 = _quantize_mxint4(w2)
+        return FrostLowLatencyConfig.prepare_mxint4_weight_only_weights(
+            q1, s1, q2, s2, activation=activation
+        )
+    raise ValueError(f"frost_ll has no weight preparation for {quant!r}")
+
+
+def _canonical_activation_pack(quant: QuantConfig, hidden_states, fp8_static_scales):
+    """Canonical activation pack of a quant pair (MoEActivationPack docstring).
+
+    Returns ``(hidden_states_q, hidden_states_scale)``; built once, outside the
+    timed region, as for the other pre-quantized backends.
+    """
+    if quant.activation == QuantFormat.BF16:
+        return hidden_states, None
+    if quant.activation in (QuantFormat.NVFP4,) or quant.pair == (
+        QuantFormat.MXFP4,
+        QuantFormat.MXFP8,
+    ):
+        return TrtllmFp4Config.prepare_activations(hidden_states, quant=quant)
+    if quant.activation in (QuantFormat.MXFP8, QuantFormat.DeepSeekFp8):
+        return TrtllmFp8BlockConfig.prepare_activations(hidden_states, quant=quant)
+    if quant.activation == QuantFormat.FP8PerTensor:
+        return TrtllmFp8PerTensorConfig.prepare_activations(
+            hidden_states,
+            hidden_states_scale_global=fp8_static_scales["hidden_states_scale_global"],
+        )
+    raise ValueError(f"no canonical activation pack for {quant!r}")
+
+
 def _reference_moe(
     activations: MoEActivationPack,
     w1: torch.Tensor,
@@ -484,6 +713,18 @@ def _reference_activation(
             if activation.linear_scale is not None:
                 up = activation.linear_scale * torch.tanh(up / activation.linear_scale)
             result = gate * up
+        elif isinstance(activation, PowLU):
+            positive = gate.clamp_min(1e-30)
+            gate = torch.where(
+                gate > 0,
+                positive.pow(activation.m / (positive.sqrt() + 1))
+                * torch.sigmoid(gate),
+                F.silu(gate),
+            )
+            if activation.limit is not None:
+                gate = gate.clamp(max=activation.limit)
+                up = up.clamp(min=-activation.limit, max=activation.limit)
+            result = gate * up
         else:
             raise ValueError(f"unsupported gated activation {activation!r}")
     else:
@@ -515,6 +756,8 @@ def _quant_config(args) -> QuantConfig:
         "mxfp8": (QuantFormat.MXFP8, QuantFormat.MXFP8),
         "mxfp8_w8a16": (QuantFormat.MXFP8, QuantFormat.BF16),
         "mxfp4_w4a8": (QuantFormat.MXFP4, QuantFormat.MXFP8),
+        "fp8_block": (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),
+        "mxint4_w4a16": (QuantFormat.MXINT4, QuantFormat.BF16),
     }[args.quant_variant]
     return QuantConfig(weight=weight_format, activation=activation_format)
 
@@ -644,7 +887,12 @@ def run_unified_moe_test(args):
             )
             continue
 
-        backend_config = config_type()
+        backend_config = (
+            # Frost admits 1-8 tokens; larger calls are rejected by the probe.
+            FrostLowLatencyConfig(max_num_tokens=min(8, max(1, args.num_tokens)))
+            if config_type is FrostLowLatencyConfig
+            else config_type()
+        )
         config = _config_for_backend(args, activation, backend_config)
         try:
             backend_activations = activations
@@ -660,7 +908,18 @@ def run_unified_moe_test(args):
                 prepare_activations = functools.partial(
                     prepare_activations, quant=config.quant
                 )
-            if config_type in _PREQUANTIZED_ACTIVATIONS:
+            canonical = _uses_canonical_pack(config_type, args.quant_variant)
+            if canonical:
+                x_q, x_sf = _canonical_activation_pack(
+                    config.quant, activations.hidden_states_q, fp8_static_scales
+                )
+                backend_activations = MoEActivationPack(
+                    hidden_states_q=x_q,
+                    hidden_states_scale=x_sf,
+                    topk_ids=activations.topk_ids,
+                    topk_weights=activations.topk_weights,
+                )
+            elif config_type in _PREQUANTIZED_ACTIVATIONS:
                 # Inside the guard so an unaligned hidden_size skips this
                 # backend like any other unsupported configuration.
                 x_q, x_sf = prepare_activations(activations.hidden_states_q)
@@ -672,17 +931,33 @@ def run_unified_moe_test(args):
                 )
             layer = MoELayer(config, device=device)
             runner = layer.runners[0]
-            view = _prepare_weight_view(
-                backend,
-                args.quant_variant,
-                config_type,
-                w1,
-                w2,
-                activation,
-                args,
-                device,
-                fp8_static_scales,
-            )
+            if canonical:
+                view = _canonical_prepare_weights(
+                    config_type,
+                    w1,
+                    w2,
+                    {
+                        "num_local_experts": args.num_experts,
+                        "hidden_size": args.hidden_size,
+                        "intermediate_size": args.intermediate_size,
+                        "activation": activation,
+                        "device": device,
+                    },
+                    config.quant,
+                    fp8_static_scales,
+                )
+            else:
+                view = _prepare_weight_view(
+                    backend,
+                    args.quant_variant,
+                    config_type,
+                    w1,
+                    w2,
+                    activation,
+                    args,
+                    device,
+                    fp8_static_scales,
+                )
             weights = MoEWeightPack()
             weights.prepare_for(runner.backend_key, view)
             input_quantizer = None
@@ -768,6 +1043,17 @@ def run_unified_moe_test(args):
         )
         if args.quant_variant.startswith(("fp8", "mxfp8")):
             weight_format = "mxfp8" if args.quant_variant.startswith("mxfp8") else "fp8"
+        if args.quant_variant == "fp8_block":
+            weight_format = "fp8_block_scale"
+        elif args.quant_variant == "mxint4_w4a16":
+            weight_format = "mxint4"
+        if canonical:
+            # Canonical packs are read in their quantized activation format.
+            input_format = _CANONICAL_INPUT_FORMAT[config.quant.activation]
+        else:
+            input_format = (
+                weight_format if config_type in _PREQUANTIZED_ACTIVATIONS else None
+            )
         weight_dtype = torch.uint8 if weight_format else torch.bfloat16
         tb_per_sec = calculate_moe_kernel_bandwidth(
             args.num_tokens,
@@ -780,9 +1066,7 @@ def run_unified_moe_test(args):
             weight_dtype,
             # Pre-quantized packs are read in their quantized format; the
             # other backends read BF16.
-            input_format=(
-                weight_format if config_type in _PREQUANTIZED_ACTIVATIONS else None
-            ),
+            input_format=input_format,
             weight_format=weight_format,
             routing_logits_dtype=None,
             active_experts=active_experts,
