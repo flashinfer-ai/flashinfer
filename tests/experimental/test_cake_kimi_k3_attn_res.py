@@ -1115,6 +1115,68 @@ def test_registered_keys_cover_the_measured_grid_when_programs_exist(arch, sm_co
         assert record["arches"] and set(record["arches"]) <= set(ARCHES)
 
 
+# The five shared launch bindings under ``csrc/``, one per argument-plan form.  Every
+# ``build.json`` entry names its form's binding in ``sources[1]`` and carries the
+# binding's selectors in ``nvcc_flags``: ``-DCAKE_PROGRAM_KERNEL`` (the kernel symbol
+# its device source defines) and the ``-DCAKE_BIND_*`` launch literals the binding
+# refuses to compile without.
+_LAUNCH_BINDINGS = (
+    "cake_kimi_k3_attn_res_common_binding.cu",
+    "cake_kimi_k3_attn_res_small_m_cluster_binding.cu",
+    "cake_kimi_k3_attn_res_small_m_direct_binding.cu",
+    "cake_kimi_k3_attn_res_direct_binding.cu",
+    "cake_kimi_k3_attn_res_k0_tma_binding.cu",
+)
+_BINDING_ALWAYS_REQUIRED = {
+    "CAKE_PROGRAM_KERNEL",
+    "CAKE_BIND_SMEM",
+    "CAKE_BIND_THREADS",
+}
+_BINDING_REQUIRED_MACRO = re.compile(r"^#ifndef (\w+)\n#error ", re.M)
+_KERNEL_DEFINITION = re.compile(r"^(kernel_\w+|CAKE_PROGRAM_KERNEL)\(", re.M)
+_PROGRAM_MACRO_DEFAULT = re.compile(r"^#define CAKE_PROGRAM_KERNEL (\w+)$", re.M)
+
+
+def _launch_binding(record):
+    """The shared launch binding of a registry record, by its kind and kernel key."""
+    kind = record["kind"]
+    if kind == "small_m":
+        form = "cluster" if "cluster" in record["kernel_key"] else "direct"
+        return f"cake_kimi_k3_attn_res_small_m_{form}_binding.cu"
+    if kind in ("direct", "k0_tma"):
+        return f"cake_kimi_k3_attn_res_{kind}_binding.cu"
+    return "cake_kimi_k3_attn_res_common_binding.cu"
+
+
+def _binding_required(binding):
+    """The ``-D`` names a shared launch binding refuses to compile without."""
+    text = (_CSRC / binding).read_text(encoding="utf-8")
+    return set(_BINDING_REQUIRED_MACRO.findall(text))
+
+
+def _compile_defines(entry):
+    """``name -> value`` of the ``-D`` flags of a ``build.json`` entry."""
+    return dict(
+        flag[2:].split("=", 1) if "=" in flag else (flag[2:], "1")
+        for flag in entry["nvcc_flags"]
+        if flag.startswith("-D")
+    )
+
+
+def _defined_kernel_symbol(entry):
+    """The kernel symbol the entry's device source defines under its ``-D`` flags: the
+    literal name at the definition, or the ``-DCAKE_PROGRAM_KERNEL`` value (else the
+    source's ``#ifndef`` default) when the definition spells the macro."""
+    text = (_CSRC.parent / entry["sources"][0]).read_text(encoding="utf-8")
+    definition = _KERNEL_DEFINITION.search(text)
+    assert definition is not None, entry["name"]
+    if definition.group(1) != "CAKE_PROGRAM_KERNEL":
+        return definition.group(1)
+    default = _PROGRAM_MACRO_DEFAULT.search(text)
+    defines = _compile_defines(entry)
+    return defines.get("CAKE_PROGRAM_KERNEL", default and default.group(1))
+
+
 def test_registry_records_reference_the_build_manifest():
     """Every ``MODULES`` record names its ``build.json`` library and nothing to compile.
 
@@ -1160,10 +1222,11 @@ def test_registry_records_reference_the_build_manifest():
             entry = libraries[library]
             assert entry["arch"] == arch
             assert entry["entry"] == "run"
-            assert entry["sources"] == [
-                f"csrc/{name}_kernel.cu",
-                f"csrc/{name}_binding.cu",
-            ]
+            binding = _launch_binding(record)
+            assert entry["sources"] == [f"csrc/{name}_kernel.cu", f"csrc/{binding}"]
+            defines = _compile_defines(entry)
+            assert defines.get("CAKE_PROGRAM_KERNEL") == f"kernel_{name}", name
+            assert _binding_required(binding) <= set(defines), (name, arch)
             assert set(entry["sha256"]) == set(entry["sources"])
             for source in entry["sources"]:
                 assert (package / source).is_file(), source
@@ -1176,6 +1239,72 @@ def test_registry_records_reference_the_build_manifest():
             assert (
                 MODULES[name]["kernel_key"] == key and arch in MODULES[name]["arches"]
             )
+
+
+def test_shared_sources_keep_distinct_program_symbols():
+    """Every library of the family loads into one process, so no two libraries of one
+    architecture may export one kernel symbol.  Each ``build.json`` entry selects its
+    own through ``-DCAKE_PROGRAM_KERNEL``, equal to the symbol its device source
+    defines (the literal name, or the macro at the definition with the entry's value),
+    and the 187 records' symbols are distinct per architecture."""
+    libraries = cake_build.libraries_by_name()
+    symbols_by_arch = {}
+    for library, entry in libraries.items():
+        arch = entry["arch"]
+        name = library[: -len(arch) - 1]
+        assert name in MODULES and arch in MODULES[name]["arches"], library
+        symbol = _compile_defines(entry).get("CAKE_PROGRAM_KERNEL")
+        assert symbol == f"kernel_{name}", (library, symbol)
+        assert _defined_kernel_symbol(entry) == symbol, library
+        symbols_by_arch.setdefault(arch, set()).add(symbol)
+    for arch, symbols in symbols_by_arch.items():
+        assert len(symbols) == sum(e["arch"] == arch for e in libraries.values()), arch
+    assert set().union(*symbols_by_arch.values()) == {
+        f"kernel_{name}" for name in MODULES
+    }
+
+
+def test_launch_bindings_take_each_record_from_its_compile_flags():
+    """One shared launch binding per argument-plan form.  Every ``build.json`` entry
+    names one of the five in ``sources[1]`` and carries exactly the ``-DCAKE_BIND_*``
+    selectors its binding refuses to compile without, each with an integer or
+    identifier value and equal to the record's launch block (threads, dynamic shared
+    memory, cluster size) and kernel key (the last snapshot row ``K - 1 + write``; the
+    write-index arm).  ``TVM_FFI_CHECK`` stringises its condition unexpanded, so the
+    bindings keep the selectors out of its conditions and route a condition that needs
+    one through ``CAKE_CHECK_EXPANDED``."""
+    required = {}
+    for binding in _LAUNCH_BINDINGS:
+        text = (_CSRC / binding).read_text(encoding="utf-8")
+        required[binding] = _binding_required(binding)
+        assert required[binding] >= _BINDING_ALWAYS_REQUIRED, binding
+        for line in text.splitlines():
+            if line.lstrip().startswith("TVM_FFI_CHECK("):
+                assert not set(re.findall(r"\w+", line)) & required[binding], line
+    libraries = cake_build.libraries_by_name()
+    for name, record in MODULES.items():
+        binding = _launch_binding(record)
+        key = record["kernel_key"]
+        for arch in record["arches"]:
+            entry = libraries[cake_jit.library_name(name, arch)]
+            assert entry["sources"][1] == f"csrc/{binding}", (name, arch)
+            defines = _compile_defines(entry)
+            selectors = {macro for macro in defines if macro.startswith("CAKE_BIND_")}
+            assert selectors == required[binding] - {"CAKE_PROGRAM_KERNEL"}, name
+            for macro in required[binding]:
+                assert re.fullmatch(r"-?\d+|[A-Za-z_]\w*", defines[macro]), macro
+            launch = record["launch"]
+            assert int(defines["CAKE_BIND_THREADS"]) == launch["block"][0], name
+            assert int(defines["CAKE_BIND_SMEM"]) == launch["dynamic_smem_bytes"], name
+            cluster = int(defines.get("CAKE_BIND_CLUSTER", 1))
+            assert cluster == launch["cluster"][0], name
+            if "CAKE_BIND_KM" in defines:
+                K = int(re.search(r":k(\d+)", key).group(1))
+                write = key.endswith("_write")
+                assert int(defines["CAKE_BIND_KM"]) == K - 1 + write, name
+            if "CAKE_BIND_WRITE_IDX" in defines:
+                write_idx = "1" if "_w1_" in key else "0"
+                assert defines["CAKE_BIND_WRITE_IDX"] == write_idx, name
 
 
 # Every token count a decoder step can present in the small / mid range, plus the measured
