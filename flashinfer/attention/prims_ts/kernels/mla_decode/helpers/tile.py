@@ -164,10 +164,10 @@ def runtime_request_publishes(cfg: MlaConfig, cache_seqs, batch_idx):
     """Return whether a batch row publishes O / LSE (and split scratch).
 
     An empty request (zero KV length) publishes nothing, which preserves its
-    output. Token-sparse rows keep their contract instead: a token whose
+    output. D576 sparse rows keep their contract instead: a token whose
     top-k length is zero still writes O = 0 and LSE = -inf.
     """
-    if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+    if cutlass.const_expr(cfg.sparse_d576):
         return cutlass.Boolean(True)
     return runtime_base_seq_len_kv(cfg, cache_seqs, batch_idx) > Int32(0)
 

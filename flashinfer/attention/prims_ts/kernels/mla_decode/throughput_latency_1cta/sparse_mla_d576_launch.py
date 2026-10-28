@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Host-side launch plumbing for the 1CTA token-sparse (DSA) MLA decode kernel.
+"""Host-side launch plumbing for the 1CTA D576 sparse (DSA) MLA decode kernel.
 
-The DSA kernel is the ``throughput_latency_1cta`` q64 keeps-MMA-AB FP8 schedule
+The D576 kernel is the ``throughput_latency_1cta`` q64 keeps-MMA-AB FP8 schedule
 run with one "batch" per query token: ``cache_seqs[t]`` is the token's active
 top-k width and ``page_offsets[:, t]`` its row indices into a flat row pool
 with ``page_size == 1``.  K/V tiles are fetched four rows per Gather4 TMA
@@ -77,7 +77,7 @@ def _encode_pool_gather4_descriptor_host(
         cuda_drv.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
     )
     if int(err) != 0:
-        raise RuntimeError(f"cuTensorMapEncodeTiled for DSA Gather4 failed: {err}")
+        raise RuntimeError(f"cuTensorMapEncodeTiled for D576 Gather4 failed: {err}")
     return torch.tensor(
         list(ctypes.string_at(tensor_map.getPtr(), _DESCRIPTOR_BYTES)),
         dtype=torch.uint8,
@@ -93,7 +93,7 @@ def gather4_descriptors(kv_pool: torch.Tensor) -> torch.Tensor:
         return cached
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
-            "DSA Gather4 descriptors for this KV pool were not built before CUDA "
+            "D576 Gather4 descriptors for this KV pool were not built before CUDA "
             "graph capture; run the same pool tensor once eagerly first"
         )
     maps = [
@@ -103,14 +103,14 @@ def gather4_descriptors(kv_pool: torch.Tensor) -> torch.Tensor:
     host = torch.cat(maps)
     device_tensor = host.to(device=kv_pool.device, non_blocking=False)
     if device_tensor.data_ptr() % 64:
-        raise RuntimeError("DSA Gather4 descriptor tensor must be 64-byte aligned")
+        raise RuntimeError("D576 Gather4 descriptor tensor must be 64-byte aligned")
     _DESCRIPTOR_CACHE[key] = device_tensor
     return device_tensor
 
 
 @dataclasses.dataclass(frozen=True)
-class _DsaCompileSpec:
-    """Compile identity of one token-sparse specialization (persistent-cache key)."""
+class _SparseMlaD576Spec:
+    """Compile identity of one D576 sparse specialization (persistent-cache key)."""
 
     num_heads: int
     sparse_mla_top_k: int
@@ -121,7 +121,7 @@ class _DsaCompileSpec:
 
 
 @functools.lru_cache(maxsize=None)
-def compile_dsa_sparse_kernel(
+def compile_sparse_mla_d576_kernel(
     device_index: int,
     *,
     num_heads: int,
@@ -130,7 +130,7 @@ def compile_dsa_sparse_kernel(
     split_kv: int = 1,
     head_dim_split: int = 1,
 ):
-    """Compile (or load from the PrimTS disk cache) one token-sparse 1CTA specialization.
+    """Compile (or load from the PrimTS disk cache) one D576 sparse 1CTA specialization.
 
     Kept in process by ``lru_cache`` on the argument list and on disk by
     :func:`build_and_load_attention_kernel` (same cache as the dense MLA path),
@@ -141,7 +141,7 @@ def compile_dsa_sparse_kernel(
 
     ``split_kv > 1`` splits every token's top-k list into that many contiguous
     tile ranges, one CTA each; the CTAs write BF16 partial O / LSE to the
-    caller's workspace (:func:`dsa_split_workspace_bytes`) and the kernel's
+    caller's workspace (:func:`sparse_mla_d576_workspace_bytes`) and the kernel's
     standalone reducer (launched with PDL) merges them into ``out`` / ``lse``.
     ``head_dim_split > 1`` (split launches only) also splits the 512 V columns
     over that many CTAs: each one still runs the whole QK / softmax for its
@@ -165,7 +165,7 @@ def compile_dsa_sparse_kernel(
     phys_sq = num_heads // phys_heads
     profile = _PROFILE
     if head_dim_split > 1 and split_kv == 1:
-        raise NotImplementedError("token-sparse V head-dim split requires split-KV")
+        raise NotImplementedError("D576 sparse V head-dim split requires split-KV")
     if split_kv > 1:
         # Explicit profile: the generic split profile derives the V head-dim
         # split from the compile-time batch (1 here, one batch per token at
@@ -188,7 +188,7 @@ def compile_dsa_sparse_kernel(
         seq_len_q=phys_sq,
         # The 1CTA profiles start at one 128-key tile; a smaller top-k still
         # runs one tile, and each token's active width comes from top_k_lens.
-        # (``_dsa.py`` already rounds small top-k up so they share one entry.)
+        # (the plan rounds the capacity up to whole tiles.)
         seq_len_k=max(sparse_mla_top_k, 128),
         latent_dim=LATENT_DIM,
         rope_dim=ROPE_DIM,
@@ -207,7 +207,6 @@ def compile_dsa_sparse_kernel(
         explicit_persistent=None,
         mask_type="dense",
         softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
-        is_dynamic_token_sparse=True,
     )
     cfg = kernel._make_config()
     if (
@@ -216,7 +215,7 @@ def compile_dsa_sparse_kernel(
         or int(cfg.use_cluster_reduction) != 0
     ):
         raise NotImplementedError(
-            f"token-sparse 1CTA MLA expects {split_kv} KV CTAs per token, "
+            f"D576 sparse 1CTA MLA expects {split_kv} KV CTAs per token, "
             f"{head_dim_split} V head-dim CTAs and GMEM reduction; got {cfg.num_ctas_per_seq_kv}, "
             f"{cfg.num_ctas_per_head_dim}, cluster={cfg.use_cluster_reduction}"
         )
@@ -307,7 +306,7 @@ def compile_dsa_sparse_kernel(
             options=_COMPILE_OPTIONS,
         )
 
-    spec = _DsaCompileSpec(
+    spec = _SparseMlaD576Spec(
         num_heads=num_heads,
         sparse_mla_top_k=sparse_mla_top_k,
         softmax_rescale_threshold_log2=float(softmax_rescale_threshold_log2),
@@ -317,11 +316,11 @@ def compile_dsa_sparse_kernel(
     )
     with torch.cuda.device(device_index):
         return build_and_load_attention_kernel(
-            "mla_decode", "dsa", spec, _COMPILE_OPTIONS, compile_kernel
+            "mla_decode", "sparse_mla_d576", spec, _COMPILE_OPTIONS, compile_kernel
         )
 
 
-def dsa_split_workspace_bytes(total_q: int, num_heads: int, split_kv: int) -> int:
+def sparse_mla_d576_workspace_bytes(total_q: int, num_heads: int, split_kv: int) -> int:
     """GMEM bytes of the split-KV partials: BF16 O ``[T, SQ, 64, S, 512]`` + FP32 LSE."""
     if split_kv <= 1:
         return 0
@@ -329,7 +328,7 @@ def dsa_split_workspace_bytes(total_q: int, num_heads: int, split_kv: int) -> in
     return rows * (V_DIM * 2 + 4)
 
 
-def launch_dsa_sparse_kernel(
+def launch_sparse_mla_d576_kernel(
     compiled,
     *,
     query: torch.Tensor,

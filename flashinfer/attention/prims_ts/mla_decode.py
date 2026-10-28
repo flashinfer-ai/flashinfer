@@ -1254,7 +1254,7 @@ def _get_compiled_mla_decode(
 
     output_quant_args = _fake_output_quant_args(getattr(kernel, "output_quant", None))
 
-    # The 1CTA kernel also serves token-sparse DSA decode (``_dsa.py``), which
+    # The 1CTA kernel also serves D576 sparse MLA (``_dsa.py``), which
     # passes its raw Gather4 descriptors after ``output_scale``; dense and
     # native-sparse MLA leave that operand unset.
     from .kernels.mla_decode.throughput_latency_1cta.kernel import (
@@ -1262,7 +1262,7 @@ def _get_compiled_mla_decode(
     )
 
     one_cta = isinstance(kernel, ThroughputLatencyMlaDecodeTs)
-    token_sparse_args = (None,) if one_cta else ()
+    d576_args = (None,) if one_cta else ()
 
     # Task objects carry loop-local state through generated control flow, so
     # select the public staged frontend for this compilation.
@@ -1283,7 +1283,7 @@ def _get_compiled_mla_decode(
             sparse_inputs_fake,
             cutlass.Float32(1.0),
             cutlass.Float32(1.0),
-            *token_sparse_args,
+            *d576_args,
             stream_fake,
             output_quant_args=output_quant_args,
             options=_COMPILE_OPTIONS,
@@ -1303,7 +1303,7 @@ def _get_compiled_mla_decode(
 
         def compiled(*args):
             # _launch_mla_decode passes output_quant_args as the last
-            # positional argument; the 1CTA ABI inserts the token-sparse
+            # positional argument; the 1CTA ABI inserts the D576 sparse
             # descriptors (inactive for dense callers) before it.
             *dense_args, output_quant_args = args
             return launch(*dense_args, None, output_quant_args)
@@ -2389,7 +2389,7 @@ def _resolve_sparse_mla_plan(
     return device, profile, spec, sections, byte_end, capacity, output_quant
 
 
-def _resolve_dsa_plan(
+def _resolve_sparse_d576_plan(
     device,
     batch_size,
     num_heads,
@@ -2405,13 +2405,13 @@ def _resolve_dsa_plan(
     kv_lora_rank=512,
     qk_rope_head_dim=64,
 ):
-    """Resolve a DSA plan's split and scratch sizing without allocation/compilation."""
+    """Resolve a D576 plan's split and scratch sizing without allocation/compilation."""
     from . import _dsa
 
     if (kv_lora_rank, qk_rope_head_dim) != (_dsa.KV_LORA_RANK, _dsa.QK_ROPE_HEAD_DIM):
         raise ValueError(
             "sparse MLA supports (kv_lora_rank, qk_rope_head_dim) = (512, 0) "
-            "(D512 pools) or (512, 64) (DSA)"
+            "(D512) or (512, 64) (D576)"
         )
     device, _ = _resolve_cuda_device(device)
     if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
@@ -2442,6 +2442,13 @@ def _resolve_dsa_plan(
     max_rows = batch_size * max_seq_len_q
     if max_rows * num_heads >= 2**31:
         raise ValueError("query extent exceeds the int32 kernel domain")
+    if max_rows > 65535:
+        # Each query token is one grid-z slice of the attention and reducer
+        # launches; CUDA caps grid z at 65535.
+        raise ValueError(
+            "D576 sparse MLA supports at most 65535 query tokens per plan "
+            f"(batch_size * max_seq_len_q), got {max_rows}"
+        )
     split_kv, head_dim_split = _dsa.resolve_split(
         device.index, max_rows, num_heads, max_topk
     )
@@ -2459,7 +2466,7 @@ class BatchSparseMLADecodePagedTSWrapper:
     """Plan native BF16/E4M3 attention, then bind one or two source index lists.
 
     Q is [B,Sq,H,512] or packed [total_q,H,512] (DSV4-style D512 pools).
-    ``plan(kv_lora_rank=512, qk_rope_head_dim=64)`` instead selects DSA
+    ``plan(kv_lora_rank=512, qk_rope_head_dim=64)`` instead selects D576
     (GLM-5.3 / DeepSeek-V3.2): E4M3 Q [..,H,576] over one E4M3 pool of
     [..,576] rows (512 latent + 64 RoPE; V is the latent), H in {64, 128},
     no extra pool, sinks or output quantization. Each source supplies int32
@@ -2518,7 +2525,7 @@ class BatchSparseMLADecodePagedTSWrapper:
     ):
         """Plan D512 attention over one primary and an optional extra pool.
 
-        ``kv_lora_rank=512, qk_rope_head_dim=64`` plans DSA instead (D576 Q /
+        ``kv_lora_rank=512, qk_rope_head_dim=64`` plans D576 instead (D576 Q /
         KV, E4M3, one pool; see the class docstring). Its split of each token's
         top-k list is chosen here from ``batch_size * max_seq_len_q`` query
         rows, so every run of the plan uses one compiled kernel.
@@ -2546,7 +2553,7 @@ class BatchSparseMLADecodePagedTSWrapper:
         there.
         """
         if (kv_lora_rank, qk_rope_head_dim) != (512, 0):
-            return self._plan_dsa(
+            return self._plan_sparse_d576(
                 device,
                 batch_size,
                 num_heads,
@@ -2653,7 +2660,7 @@ class BatchSparseMLADecodePagedTSWrapper:
         self.workspace_size_bytes = byte_end
         self._scalar_cache.clear()
 
-    def _plan_dsa(
+    def _plan_sparse_d576(
         self,
         device,
         batch_size,
@@ -2672,11 +2679,11 @@ class BatchSparseMLADecodePagedTSWrapper:
         kv_lora_rank,
         qk_rope_head_dim,
     ):
-        """Plan the DSA (D576, one E4M3 pool) schedule; see :mod:`._dsa`."""
+        """Plan the D576 sparse MLA (DSA, one E4M3 pool) schedule."""
         from . import _dsa
 
         (device, split_kv, head_dim_split, threshold, sections, byte_end) = (
-            _resolve_dsa_plan(
+            _resolve_sparse_d576_plan(
                 device,
                 batch_size,
                 num_heads,
@@ -2705,7 +2712,7 @@ class BatchSparseMLADecodePagedTSWrapper:
             head_dim_split=head_dim_split,
         )
         self._state = dict(
-            dsa=True,
+            d576=True,
             device=device,
             batch=batch_size,
             heads=num_heads,
@@ -2729,7 +2736,7 @@ class BatchSparseMLADecodePagedTSWrapper:
         self.workspace_size_bytes = byte_end
         self._scalar_cache.clear()
 
-    def _run_dsa(
+    def _run_sparse_d576(
         self,
         query,
         kv_cache,
@@ -2750,7 +2757,7 @@ class BatchSparseMLADecodePagedTSWrapper:
         out_scale,
         validate,
     ):
-        """Run a DSA plan: Q [..,H,576] over one E4M3 [..,576] pool."""
+        """Run a D576 plan: Q [..,H,576] over one E4M3 [..,576] pool."""
         from . import _dsa
 
         state = self._state
@@ -2767,7 +2774,7 @@ class BatchSparseMLADecodePagedTSWrapper:
             )
         ):
             raise ValueError(
-                "a DSA plan takes no extra pool, sinks, RoPE or output-scale tensors"
+                "a D576 plan takes no extra pool, sinks, RoPE or output-scale tensors"
             )
         _validate_query(
             query,
@@ -2813,7 +2820,7 @@ class BatchSparseMLADecodePagedTSWrapper:
             (softmax_scale, "softmax_scale"),
             (output_scale, "output_scale"),
         ):
-            # The DSA kernel takes the scales as launch arguments; a captured
+            # The D576 kernel takes the scales as launch arguments; a captured
             # graph keeps the values of capture time.
             if (
                 isinstance(value, bool)
@@ -2822,7 +2829,7 @@ class BatchSparseMLADecodePagedTSWrapper:
                 or value <= 0
             ):
                 raise ValueError(
-                    f"a DSA plan takes {name} as a positive finite Python number"
+                    f"a D576 plan takes {name} as a positive finite Python number"
                 )
             scales.append(float(value))
         if out is None:
@@ -3023,7 +3030,7 @@ class BatchSparseMLADecodePagedTSWrapper:
         execution spans internally and bounds all source reads.
 
         ``softmax_scale`` and ``output_scale`` are positive finite Python
-        scalars or scalar CUDA FP32 tensors (a DSA plan takes Python scalars
+        scalars or scalar CUDA FP32 tensors (a D576 plan takes Python scalars
         only). They are already combined:
         softmax_scale = attention_scale * q_descale * kv_descale;
         output_scale = output_multiplier * kv_descale. Both pools share that
@@ -3040,7 +3047,7 @@ class BatchSparseMLADecodePagedTSWrapper:
         padded pages only creates a tensor view. Required attention reductions
         remain included. Caller-owned LSE must be contiguous FP32 and 16-byte
         aligned, including with validate=False. LSE is the natural-log
-        log-sum-exp for every plan (D512 and DSA).
+        log-sum-exp for every plan (D512 and D576).
 
         With output quantization enabled, ``token_positions`` is contiguous
         INT32 with the query's batch/token prefix; ``cos_sin_cache`` is aligned
@@ -3069,8 +3076,8 @@ class BatchSparseMLADecodePagedTSWrapper:
         state = self._state
         if state is None:
             raise RuntimeError("plan() must be called before run()")
-        if state.get("dsa"):
-            return self._run_dsa(
+        if state.get("d576"):
+            return self._run_sparse_d576(
                 query,
                 kv_cache,
                 indices,
@@ -3285,7 +3292,7 @@ def get_prims_ts_sparse_mla_decode_workspace_size(*plan_args, **plan_kwargs):
             "num_output_groups",
         ):
             plan_kwargs.pop(unused, None)
-        return _resolve_dsa_plan(
+        return _resolve_sparse_d576_plan(
             *plan_args,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
@@ -3327,7 +3334,7 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
     """Eager plan-and-run helper using separate source indices and lengths.
 
     Use a planned wrapper for CUDA Graph replay. A query of width 576 plans
-    the DSA schedule (``qk_rope_head_dim=64``); width 512 the D512 one. Index
+    the D576 schedule (``qk_rope_head_dim=64``); width 512 the D512 one. Index
     conversion and scale composition remain external. softmax_scale includes attention/Q/K descales;
     output_scale includes the V descale and optional output multiplier.
     Source contracts, output quantization arguments, ``tuning`` and return
@@ -3348,7 +3355,7 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
     else:
         batch = query.shape[0]
         max_seq_len_q = query.shape[1] if max_seq_len_q is None else max_seq_len_q
-    # A 576-wide query (512 latent + 64 RoPE) selects the DSA schedule.
+    # A 576-wide query (512 latent + 64 RoPE) selects the D576 schedule.
     qk_rope_head_dim = query.shape[-1] - 512
     wrapper = BatchSparseMLADecodePagedTSWrapper(workspace_buffer)
     wrapper.plan(

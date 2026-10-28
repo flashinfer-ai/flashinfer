@@ -1245,13 +1245,13 @@ def test_softmax_rescale_threshold_log2_rejected(dtype, threshold):
         )
 
 
-# DSA (GLM-5.3 / DeepSeek-V3.2): plan(kv_lora_rank=512, qk_rope_head_dim=64)
+# D576 sparse MLA (DSA: GLM-5.3 / DeepSeek-V3.2): plan(kv_lora_rank=512, qk_rope_head_dim=64)
 # attends E4M3 576-wide Q / KV rows of one pool; indices are storage rows
 # with -1 holes anywhere, and V is the 512-wide latent.
-_DSA_SCALE = 1.0 / 16
+_D576_SCALE = 1.0 / 16
 
 
-def _dsa_inputs(rows, heads, topk, holes=0.0, pool=1 << 15, seed=0):
+def _d576_inputs(rows, heads, topk, holes=0.0, pool=1 << 15, seed=0):
     g = torch.Generator(device="cuda").manual_seed(seed)
     q = torch.randn(rows, 1, heads, 576, device="cuda", generator=g) * 0.5
     kv = torch.randn(pool, 576, device="cuda", generator=g) * 0.5
@@ -1263,21 +1263,21 @@ def _dsa_inputs(rows, heads, topk, holes=0.0, pool=1 << 15, seed=0):
     return q.to(torch.float8_e4m3fn), kv.to(torch.float8_e4m3fn), indices, lengths
 
 
-def _check_dsa(q, kv, indices, lengths, out, lse, threshold=0.0):
+def _check_d576(q, kv, indices, lengths, out, lse, threshold=0.0):
     ref, ref_lse, bound = _reference(
         q,
         kv.reshape(-1, 1, 576),
         None,
         indices,
         lengths=lengths,
-        softmax_scale=_DSA_SCALE,
+        softmax_scale=_D576_SCALE,
         p_scale=448.0 * 2.0**-threshold,
     )
     assert ((out.double() - ref).abs() <= bound).all()
     torch.testing.assert_close(lse.double(), ref_lse, atol=2e-4, rtol=1e-4)
 
 
-def _dsa_plan(rows, heads, topk, threshold=0.0, **kwargs):
+def _d576_plan(rows, heads, topk, threshold=0.0, **kwargs):
     w = BatchSparseMLADecodePagedTSWrapper()
     w.plan(
         torch.device("cuda"),
@@ -1302,12 +1302,13 @@ def _dsa_plan(rows, heads, topk, threshold=0.0, **kwargs):
         pytest.param(4, 128, 2048, 0.1, 0.0, "nhd4", id="h128"),
         pytest.param(300, 64, 2048, 0.0, 8.0, "flat", id="two-waves"),
         pytest.param(3, 64, 4, 0.0, 0.0, "flat", id="topk4"),
+        pytest.param(3, 64, 66, 0.1, 0.0, "flat", id="topk66"),
         pytest.param(40, 64, 136, 0.1, 0.0, "nhd3", id="topk136-unsplit"),
         pytest.param(3, 64, 1028, 0.2, 0.0, "hnd4", id="topk1028"),
     ],
 )
-def test_dsa_graph(rows, heads, topk, holes, threshold, layout):
-    q, kv, indices, lengths = _dsa_inputs(rows, heads, topk, holes)
+def test_sparse_d576_graph(rows, heads, topk, holes, threshold, layout):
+    q, kv, indices, lengths = _d576_inputs(rows, heads, topk, holes)
     views = {
         "flat": (kv, "NHD"),
         "nhd3": (kv.view(-1, 64, 576), "NHD"),
@@ -1315,7 +1316,7 @@ def test_dsa_graph(rows, heads, topk, holes, threshold, layout):
         "hnd4": (kv.view(-1, 1, 64, 576), "HND"),
     }
     pool, kv_layout = views[layout]
-    w = _dsa_plan(rows, heads, topk, threshold, kv_layout=kv_layout)
+    w = _d576_plan(rows, heads, topk, threshold, kv_layout=kv_layout)
     out = torch.empty(rows, 1, heads, 512, device="cuda", dtype=torch.bfloat16)
     lse = torch.empty(rows, 1, heads, device="cuda")
 
@@ -1325,14 +1326,14 @@ def test_dsa_graph(rows, heads, topk, holes, threshold, layout):
             pool,
             indices,
             lengths,
-            softmax_scale=_DSA_SCALE,
+            softmax_scale=_D576_SCALE,
             out=out,
             lse=lse,
             validate=checked,
         )
 
     run(checked=True)
-    _check_dsa(q, kv, indices, lengths, out, lse, threshold)
+    _check_d576(q, kv, indices, lengths, out, lse, threshold)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
@@ -1347,14 +1348,14 @@ def test_dsa_graph(rows, heads, topk, holes, threshold, layout):
     lengths[-1] = 0
     graph.replay()
     torch.cuda.synchronize()
-    _check_dsa(q, kv, indices, lengths, out, lse, threshold)
+    _check_d576(q, kv, indices, lengths, out, lse, threshold)
     assert torch.count_nonzero(out[-1]) == 0 and torch.isneginf(lse[-1]).all()
 
 
-def test_dsa_packed_query():
+def test_sparse_d576_packed_query():
     """Packed MTP queries match the fixed [B, 4, H, 576] layout bitwise."""
-    q, kv, indices, lengths = _dsa_inputs(12, 64, 2048, 0.1)
-    kwargs = dict(softmax_scale=_DSA_SCALE)
+    q, kv, indices, lengths = _d576_inputs(12, 64, 2048, 0.1)
+    kwargs = dict(softmax_scale=_D576_SCALE)
     fixed = batch_sparse_mla_decode_with_paged_kv_cache(
         q.view(3, 4, 64, 576), kv, indices, lengths, **kwargs
     )
@@ -1376,19 +1377,19 @@ def test_dsa_packed_query():
 
 @pytest.mark.parametrize("topk", [2048, 1028])
 @pytest.mark.parametrize("split,head_dim_split", [(1, 1), (2, 4), (4, 2), (16, 4)])
-def test_dsa_forced_split(split, head_dim_split, topk, monkeypatch):
+def test_sparse_d576_forced_split(split, head_dim_split, topk, monkeypatch):
     """Forced splits (incl. empty and one-tile splits, V head-dim splits) and
     the direct store agree with the reference, natural-log LSE included."""
     monkeypatch.setattr(_dsa, "_select_fp8_split", lambda *_: (split, head_dim_split))
-    q, kv, indices, lengths = _dsa_inputs(6, 64, topk, 0.3)
+    q, kv, indices, lengths = _d576_inputs(6, 64, topk, 0.3)
     lengths[1:] = torch.randint(1, topk + 1, (5,), device="cuda")
     lengths[2] = 0
-    w = _dsa_plan(6, 64, topk)
-    out, lse = w.run(q, kv, indices, lengths, softmax_scale=_DSA_SCALE)
-    _check_dsa(q, kv, indices, lengths, out, lse)
+    w = _d576_plan(6, 64, topk)
+    out, lse = w.run(q, kv, indices, lengths, softmax_scale=_D576_SCALE)
+    _check_d576(q, kv, indices, lengths, out, lse)
 
 
-def test_dsa_split_policy():
+def test_sparse_d576_split_policy():
     """E4M3 follows trtllm-gen: at least two tiles per split CTA within one wave
     (one tile for a top-k of one tile pair), then a V head-dim split while the
     grid fills at most a quarter / half of the SMs."""
@@ -1428,7 +1429,6 @@ def test_dsa_split_policy():
     [
         pytest.param(dict(query="bf16"), "requires E4M3", id="query-bf16"),
         pytest.param(dict(heads=32), "64 or 128 query heads", id="heads"),
-        pytest.param(dict(topk=66), "multiple of 4", id="topk"),
         pytest.param(dict(extra=True), "one KV pool", id="extra-pool"),
         pytest.param(dict(sinks=True), "attention sinks", id="sinks"),
         pytest.param(dict(output_quant_block_size=32), "output quantization", id="oq"),
@@ -1442,10 +1442,10 @@ def test_dsa_split_policy():
         pytest.param(dict(route=128), "outside pool", id="route-outside-pool"),
     ],
 )
-def test_dsa_rejected(change, match):
+def test_sparse_d576_rejected(change, match):
     change = dict(change)
     heads, topk = change.pop("heads", 64), change.pop("topk", 64)
-    q, kv, indices, lengths = _dsa_inputs(2, heads, topk, pool=128)
+    q, kv, indices, lengths = _d576_inputs(2, heads, topk, pool=128)
     if change.pop("query", None):
         q = q.to(torch.bfloat16)
     kv = {"bf16": kv.to(torch.bfloat16), "row512": kv[:, :512].contiguous()}.get(
@@ -1461,3 +1461,21 @@ def test_dsa_rejected(change, match):
         change["num_output_groups"] = 1
     with pytest.raises(ValueError, match=match):
         batch_sparse_mla_decode_with_paged_kv_cache(q, kv, indices, lengths, **change)
+
+
+def test_sparse_d576_compile_capacity_bucket(monkeypatch):
+    """Capacities in one 128-key tile bucket compile one kernel."""
+    seen = []
+    monkeypatch.setattr(
+        _dsa,
+        "compile_sparse_mla_d576_kernel",
+        lambda *args, **kwargs: seen.append(kwargs["sparse_mla_top_k"]),
+    )
+    for topk in (132, 136, 256):
+        _d576_plan(150, 64, topk)
+    assert seen == [256] * 3
+
+
+def test_sparse_d576_rejects_grid_z_overflow():
+    with pytest.raises(ValueError, match="at most 65535 query tokens"):
+        _d576_plan(65536, 64, 2048)

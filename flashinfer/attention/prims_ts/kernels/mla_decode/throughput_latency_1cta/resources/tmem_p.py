@@ -242,7 +242,7 @@ class TmemPResource(MlaResource):
                 if cutlass.const_expr(cfg.kernel_variant == "keeps_mma_ab"):
                     new_max = new_max_arr[0]
                     if new_max != neg_max_f32():
-                        if cutlass.const_expr(cfg.native_sparse_pages):
+                        if cutlass.const_expr(cfg.sparse_d512):
                             scaled = ffma2(
                                 (s_arr[s0], s_arr[s1]),
                                 (self.scale_softmax_log2, self.scale_softmax_log2),
@@ -259,7 +259,7 @@ class TmemPResource(MlaResource):
                                 s_arr[s1] * self.scale_softmax_log2 + neg_scaled_max[0],
                                 fastmath=True,
                             )
-                    if cutlass.const_expr(cfg.native_sparse_pages):
+                    if cutlass.const_expr(cfg.sparse_d512):
                         offset = (pair_idx % 2) * 2
                         sums[offset], sums[offset + 1] = fadd2(
                             (sums[offset], sums[offset + 1]), (p0, p1)
@@ -290,9 +290,7 @@ class TmemPResource(MlaResource):
 
         if cutlass.const_expr(
             cfg.kernel_variant == "keeps_mma_ab"
-            and (
-                cfg.native_sparse_pages or (cfg.keeps_ilp_softmax and cfg.is_fp8_qkv())
-            )
+            and (cfg.sparse_d512 or (cfg.keeps_ilp_softmax and cfg.is_fp8_qkv()))
         ):
             local_sums[0] = (sums[0] + sums[1]) + (sums[2] + sums[3])
 

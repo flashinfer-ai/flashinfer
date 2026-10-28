@@ -23,10 +23,10 @@ take storage-row `indices` / `lengths` with `-1` holes.
 | Mode | Models | `plan()` | Q / KV rows | Pools and indices | Options |
 | --- | --- | --- | --- | --- | --- |
 | Two-source D512 | DeepSeek V4 / V4.1 | `kv_lora_rank=512, qk_rope_head_dim=0` (default) | BF16 or E4M3, 512 | Primary pool plus an optional extra KV cache with its own `extra_indices` / `extra_lengths` | Sinks, output quantization, RoPE fusion, skip correction |
-| DSA D576 | DeepSeek V3.2 / GLM-5.3 | `kv_lora_rank=512, qk_rope_head_dim=64` | E4M3, 576 (512 latent + 64 RoPE); V is the latent | One pool; the one-shot helper infers DSA from a 576-wide query | Skip correction; no extra pool, sinks or output quantization |
+| D576 (DSA) | DeepSeek V3.2 / GLM-5.3 | `kv_lora_rank=512, qk_rope_head_dim=64` | E4M3, 576 (512 latent + 64 RoPE); V is the latent | One pool; the one-shot helper infers DSA from a 576-wide query | Skip correction; no extra pool, sinks or output quantization |
 
-DSA details:
-- **Kernel.** The 1CTA keeps-MMA-AB q64 schedule in a token-sparse
+D576 details:
+- **Kernel.** The 1CTA keeps-MMA-AB q64 schedule in a D576 sparse
   configuration: one CTA per (token, 64 heads), with Gather4 loads of the
   routed rows. H is 64 or 128.
 - **Split-KV below 96 CTAs.** `plan()` chooses the split from
@@ -366,7 +366,7 @@ graphs:
 
 ```bash
 pytest -q tests/attention/test_attention_ts_mla_decode.py
-pytest -q tests/attention/test_attention_ts_sparse_mla.py  # two-source D512 and DSA
+pytest -q tests/attention/test_attention_ts_sparse_mla.py  # two-source D512 and D576
 pytest -q tests/trace/test_fi_trace_template_consistency.py
 ```
 

@@ -143,7 +143,7 @@ class TmemCorrResource(MlaResource):
     def _keeps_direct_output(self):
         return (
             self.cfg.kernel_variant == "keeps_mma_ab"
-            and self.cfg.native_sparse_pages
+            and self.cfg.sparse_d512
             and self.cfg.use_cluster_reduction != 1
         )
 
@@ -521,7 +521,7 @@ class TmemCorrResource(MlaResource):
             )
             head_idx = head_base_idx + local_row_idx
         if cutlass.const_expr(
-            self.cfg.native_sparse_pages and self.cfg.use_cluster_reduction != 1
+            self.cfg.sparse_d512 and self.cfg.use_cluster_reduction != 1
         ):
             should_store_lse = should_store_lse and cta_idx_head_dim_v == Int32(0)
         if should_store_lse:
@@ -594,7 +594,7 @@ class TmemCorrResource(MlaResource):
                             lse_val
                         )
                 else:
-                    if cutlass.const_expr(self.cfg.is_dynamic_token_sparse):
+                    if cutlass.const_expr(self.cfg.sparse_d576):
                         # The sparse MLA wrapper publishes natural-log LSE (the
                         # D512 path finalizes the same way); split partials
                         # above stay base 2 for the reducer.

@@ -1440,9 +1440,7 @@ def _make_single_kv_pipe_task_graph(
     from .resources.tmem_softmax_stats import SmemSoftmaxLocalResource
 
     local_resource = (
-        SmemSoftmaxLocalResource
-        if cfg.native_sparse_pages
-        else TmemSoftmaxLocalResource
+        SmemSoftmaxLocalResource if cfg.sparse_d512 else TmemSoftmaxLocalResource
     )
     local = local_resource(
         cfg=cfg,
@@ -1549,8 +1547,8 @@ def _make_single_kv_pipe_task_graph(
             ),
         ]
     )
-    if cfg.is_dynamic_token_sparse:
-        # The token-sparse layout moves the loader to W12-15 with page
+    if cfg.sparse_d576:
+        # The D576 sparse layout moves the loader to W12-15 with page
         # offsets on W10; pad W11 unless it loads or stages page offsets, and
         # whichever of warps 9-10 stays unused.
         used = set(range(cfg.load_warp_idx, cfg.load_warp_idx + cfg.load_num_warps))
@@ -1597,7 +1595,7 @@ def _make_single_kv_pipe_task_graph(
             )
         )
 
-    if cfg.load_warp_idx == 12 and not cfg.is_dynamic_token_sparse:
+    if cfg.load_warp_idx == 12 and not cfg.sparse_d576:
         idle = create_padding_task(
             cfg, work_queue, warp_idx=9, num_warps=1, task_class=MlaDecodeTask
         )
@@ -1732,7 +1730,6 @@ class ThroughputLatencyMlaDecodeTs:
         sparse_profile=None,
         finalize_output: bool = False,
         softmax_rescale_threshold_log2: float = 0.0,
-        is_dynamic_token_sparse: bool = False,
     ):
         """Initialize one selected physical tile profile over logical flat Q rows."""
         import cutlass as _cutlass
@@ -1755,7 +1752,6 @@ class ThroughputLatencyMlaDecodeTs:
         self.profile = profile
         self.persistent_wave_sm_count = persistent_wave_sm_count
         self.reduction_mode = reduction_mode
-        self.is_dynamic_token_sparse = bool(is_dynamic_token_sparse)
         self.logical_num_heads = logical_num_heads
         self.logical_seq_len_q = logical_seq_len_q
         self.tile_size_q = tile_size_q
@@ -1910,7 +1906,6 @@ class ThroughputLatencyMlaDecodeTs:
             explicit_persistent=self.explicit_persistent,
             mask_type=self.mask_type,
             softmax_rescale_threshold_log2=self.softmax_rescale_threshold_log2,
-            is_dynamic_token_sparse=self.is_dynamic_token_sparse,
         )
         if self.sparse_profile is not None:
             cfg = configure_sparse_mla(
@@ -2001,7 +1996,7 @@ class ThroughputLatencyMlaDecodeTs:
     ):
         """Execute throughput-latency 1CTA MLA with fixed or compact ragged Q.
 
-        ``raw_tma_descriptors`` is only read by the token-sparse configuration:
+        ``raw_tma_descriptors`` is only read by the D576 sparse configuration:
         the two encoded Gather4 ``CUtensorMap``s (latent and RoPE maps).
         """
         cfg = self._make_config()
@@ -2161,7 +2156,7 @@ class ThroughputLatencyMlaDecodeTs:
             c_latent.iterator,
             cute.select(c_latent.layout, mode=[1, 0, 2]),
         )
-        if cutlass.const_expr(cfg.native_sparse_pages):
+        if cutlass.const_expr(cfg.sparse_d512):
             # Sparse routes address individual rows; the unused D512 RoPE
             # descriptor slot carries the independent compressed-pool map.
             c_rows = cute.make_tensor(
@@ -2216,11 +2211,11 @@ class ThroughputLatencyMlaDecodeTs:
                 swizzle=c_rope_swizzle,
                 l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
             )
-        elif cutlass.const_expr(not cfg.native_sparse_pages):
+        elif cutlass.const_expr(not cfg.sparse_d512):
             tma_desc_c_rope = tma_desc_c_latent
 
         tma_desc_v = tma_desc_c_latent
-        if cutlass.const_expr(cfg.native_sparse_pages):
+        if cutlass.const_expr(cfg.sparse_d512):
             # D512 does not use Q-rope; reuse its descriptor slot for the
             # second pool's contiguous-run map. Gather maps stay separate.
             rows_per_issuer = 32
@@ -2438,7 +2433,7 @@ class ThroughputLatencyMlaDecodeTs:
     ):
         """Execute one flat-Q, batch, KV-split, and V head-dimension tile."""
         cfg = self._make_config()
-        if cutlass.const_expr(cfg.is_dynamic_token_sparse and acc_o is not None):
+        if cutlass.const_expr(cfg.sparse_d576 and acc_o is not None):
             # Split-KV launches use PDL (for the reducer); wait for the
             # upstream grid before reading Q / routes / pools in case the
             # producer of those inputs (e.g. the top-k indexer) releases its
@@ -2555,7 +2550,7 @@ class ThroughputLatencyMlaDecodeTs:
                     cute.arch.inline_ptx(
                         "prefetch.global.L2 [{$r0}];", read_only_args=[address]
                     )
-            if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+            if cutlass.const_expr(cfg.sparse_d576):
                 # The Gather4 latent / RoPE maps at bytes 0 / 128.
                 prims.prefetch_tensormap(
                     _gmem_pointer_to_generic(raw_tma_descriptors.iterator)

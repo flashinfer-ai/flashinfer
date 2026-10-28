@@ -125,7 +125,7 @@ class TmemSResource(MlaResource):
     cta_idx_q: object = None
     cta_idx_kv: object = None
     sync_barrier_id: cutlass.Constexpr[int] = 0
-    # Token-sparse: the page-offset resource whose allocation carries the
+    # D576 sparse: the page-offset resource whose allocation carries the
     # per-tile validity ring (see ``SPARSE_MASK_SLOTS`` in smem_resources).
     page_offsets_kv: object = None
     _sparse_mask_words: object = None
@@ -168,7 +168,7 @@ class TmemSResource(MlaResource):
 
     def get_smem_requirements(self):
         """Return the softmax scratch SMEM allocation."""
-        if self.cfg.kernel_variant == "keeps_mma_ab" and self.cfg.native_sparse_pages:
+        if self.cfg.kernel_variant == "keeps_mma_ab" and self.cfg.sparse_d512:
             return []
         if self._scratch_alloc is None:
             self._scratch_alloc = SmemAllocation(
@@ -241,10 +241,7 @@ class TmemSResource(MlaResource):
         context = stage_info.context
         self._init_tmem_state(stage_info)
         if cutlass.const_expr(
-            not (
-                self.cfg.kernel_variant == "keeps_mma_ab"
-                and self.cfg.native_sparse_pages
-            )
+            not (self.cfg.kernel_variant == "keeps_mma_ab" and self.cfg.sparse_d512)
         ):
             self._softmax_scratch = smem_array(
                 context,
@@ -252,7 +249,7 @@ class TmemSResource(MlaResource):
                 Uint32,
                 softmax_scratch_words(self.cfg),
             )
-        if cutlass.const_expr(self.cfg.is_dynamic_token_sparse):
+        if cutlass.const_expr(self.cfg.sparse_d576):
             self._sparse_mask_words = smem_array(
                 context,
                 self.page_offsets_kv._alloc,
@@ -502,9 +499,7 @@ class TmemSResource(MlaResource):
                 swaps=cfg.kernel_variant != "keeps_mma_ab",
                 tile_size_kv=cfg.tile_size_kv,
             )
-            if cutlass.const_expr(
-                cfg.native_sparse_pages and cfg.logical_seq_len_q == 1
-            )
+            if cutlass.const_expr(cfg.sparse_d512 and cfg.logical_seq_len_q == 1)
             else raw_mask_routes
         )
 
@@ -554,7 +549,7 @@ class TmemSResource(MlaResource):
         should_apply_dense_mask = (
             (seq_len_kv % Int32(cfg.tile_size_kv)) != Int32(0)
         ) or (next_tile_offset_k > seq_len_kv)
-        if cutlass.const_expr(cfg.is_dynamic_token_sparse):
+        if cutlass.const_expr(cfg.sparse_d576):
             # Every tile may carry -1 (empty) slots; the validity ring is
             # consulted unconditionally.
             should_apply_dense_mask = cutlass.Boolean(True)
@@ -573,7 +568,7 @@ class TmemSResource(MlaResource):
             should_apply_dense_mask = should_apply_dense_mask or (
                 next_tile_offset_k > min_seq_len_kv
             )
-        if cutlass.const_expr(cfg.native_sparse_pages):
+        if cutlass.const_expr(cfg.sparse_d512):
             if cutlass.const_expr(cfg.logical_seq_len_q == 1):
                 # Cached route bits include the live prefix boundary.
                 should_apply_dense_mask = (mask_routes.low | mask_routes.high) != Int32(
@@ -603,11 +598,11 @@ class TmemSResource(MlaResource):
                         local_row_idx,
                         self.cu_seqlens_q,
                     )
-                fp8_token_sparse = cutlass.const_expr(
-                    cfg.is_dynamic_token_sparse and not needs_row_causal_mask
+                fp8_d576 = cutlass.const_expr(
+                    cfg.sparse_d576 and not needs_row_causal_mask
                 )
-                if cutlass.const_expr(fp8_token_sparse):
-                    # E4M3 token-sparse: this thread's 64 columns are tokens
+                if cutlass.const_expr(fp8_d576):
+                    # E4M3 D576 sparse: this thread's 64 columns are tokens
                     # [local_col_base, + 64) of the tile, validity words
                     # (local_col_base >> 5) + {0, 1}.  One test covers the
                     # common all-valid span; only a span that crosses the
@@ -643,7 +638,7 @@ class TmemSResource(MlaResource):
                                 == Int32(0)
                             ):
                                 s_vals[reg_idx] = neg_max_f32()
-                if cutlass.const_expr(not fp8_token_sparse):
+                if cutlass.const_expr(not fp8_d576):
                     for reg_idx in cutlass.range_constexpr(num_s_regs_per_thread(cfg)):
                         token_idx = tile_offset_k + local_col_base + Int32(reg_idx)
                         if invalid_sparse_token(
@@ -651,12 +646,10 @@ class TmemSResource(MlaResource):
                             row_seq_len_kv,
                             mask_routes,
                             batch_idx,
-                            sparse=cfg.native_sparse_pages,
+                            sparse=cfg.sparse_d512,
                         ):
                             s_vals[reg_idx] = neg_max_f32()
-                if cutlass.const_expr(
-                    cfg.is_dynamic_token_sparse and not fp8_token_sparse
-                ):
+                if cutlass.const_expr(cfg.sparse_d576 and not fp8_d576):
                     from .smem_resources import SPARSE_MASK_SLOTS, SPARSE_MASK_WORDS
 
                     half_cols = cfg.tile_size_kv // 2
@@ -720,7 +713,7 @@ class TmemSResource(MlaResource):
                         seq_len_kv_0,
                         mask_routes,
                         batch_idx,
-                        sparse=cfg.native_sparse_pages,
+                        sparse=cfg.sparse_d512,
                     ):
                         s_vals[s_base + 0] = neg_max_f32()
                     if invalid_sparse_token(
@@ -728,7 +721,7 @@ class TmemSResource(MlaResource):
                         seq_len_kv_1,
                         mask_routes,
                         batch_idx,
-                        sparse=cfg.native_sparse_pages,
+                        sparse=cfg.sparse_d512,
                     ):
                         s_vals[s_base + 1] = neg_max_f32()
                     token_idx = (
@@ -739,7 +732,7 @@ class TmemSResource(MlaResource):
                         seq_len_kv_0,
                         mask_routes,
                         batch_idx,
-                        sparse=cfg.native_sparse_pages,
+                        sparse=cfg.sparse_d512,
                     ):
                         s_vals[s_base + 2] = neg_max_f32()
                     if invalid_sparse_token(
@@ -747,7 +740,7 @@ class TmemSResource(MlaResource):
                         seq_len_kv_1,
                         mask_routes,
                         batch_idx,
-                        sparse=cfg.native_sparse_pages,
+                        sparse=cfg.sparse_d512,
                     ):
                         s_vals[s_base + 3] = neg_max_f32()
                     token_idx = (
@@ -760,7 +753,7 @@ class TmemSResource(MlaResource):
                         seq_len_kv_0,
                         mask_routes,
                         batch_idx,
-                        sparse=cfg.native_sparse_pages,
+                        sparse=cfg.sparse_d512,
                     ):
                         s_vals[s_second_panel_base + 0] = neg_max_f32()
                     if invalid_sparse_token(
@@ -768,7 +761,7 @@ class TmemSResource(MlaResource):
                         seq_len_kv_1,
                         mask_routes,
                         batch_idx,
-                        sparse=cfg.native_sparse_pages,
+                        sparse=cfg.sparse_d512,
                     ):
                         s_vals[s_second_panel_base + 1] = neg_max_f32()
                     token_idx = (
@@ -781,7 +774,7 @@ class TmemSResource(MlaResource):
                         seq_len_kv_0,
                         mask_routes,
                         batch_idx,
-                        sparse=cfg.native_sparse_pages,
+                        sparse=cfg.sparse_d512,
                     ):
                         s_vals[s_second_panel_base + 2] = neg_max_f32()
                     if invalid_sparse_token(
@@ -789,7 +782,7 @@ class TmemSResource(MlaResource):
                         seq_len_kv_1,
                         mask_routes,
                         batch_idx,
-                        sparse=cfg.native_sparse_pages,
+                        sparse=cfg.sparse_d512,
                     ):
                         s_vals[s_second_panel_base + 3] = neg_max_f32()
 

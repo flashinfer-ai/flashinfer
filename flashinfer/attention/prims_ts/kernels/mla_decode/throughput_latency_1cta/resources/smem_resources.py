@@ -78,7 +78,7 @@ from .common import (
     MlaResource,
 )
 
-# Token-sparse per-key validity ring: ``SPARSE_MASK_SLOTS`` tiles x four
+# D576 sparse per-key validity ring: ``SPARSE_MASK_SLOTS`` tiles x four
 # 32-bit words. Word ``w`` bit ``l`` is token ``32 * w + l`` of the 128-token
 # tile (a warp ballot over tokens ``32w .. 32w + 31``).
 SPARSE_MASK_SLOTS = 16
@@ -452,13 +452,13 @@ class SmemPageOffsetsResource(MlaResource):
 
     @property
     def sparse_mask_word_base(self) -> int:
-        """Int32 index of the token-sparse validity ring inside this allocation."""
+        """Int32 index of the D576 sparse validity ring inside this allocation."""
         return self.cfg.page_offsets_stages * self.cfg.page_offsets_entries_per_stage
 
     @property
     def total_words(self) -> int:
         words = self.sparse_mask_word_base
-        if self.cfg.is_dynamic_token_sparse:
+        if self.cfg.sparse_d576:
             words += SPARSE_MASK_SLOTS * SPARSE_MASK_WORDS
         return words
 
@@ -507,11 +507,11 @@ class SmemPageOffsetsResource(MlaResource):
             cache_slots
             * (
                 self.cfg.sparse_cache_words
-                if self.cfg.native_sparse_pages
+                if self.cfg.sparse_d512
                 else self.cfg.pages_per_kv_tile
             ),
         )
-        if self.cfg.is_dynamic_token_sparse:
+        if self.cfg.sparse_d576:
             # The Gather4 loader reads its four row indices per lane straight
             # from the SMEM stage; a 128-entry register cache would not fit.
             # With uniform quads each loader warp caches only its own 32 rows.
@@ -536,7 +536,7 @@ class SmemPageOffsetsResource(MlaResource):
 
     @cute.jit
     def token_row(self, entry_idx):
-        """Return one staged token row index (token-sparse stages, dynamic entry)."""
+        """Return one staged token row index (D576 sparse stages, dynamic entry)."""
         offset = self.consumer_work_stage * Int32(
             self.cfg.page_offsets_entries_per_stage
         ) + Int32(entry_idx)
@@ -554,7 +554,7 @@ class SmemPageOffsetsResource(MlaResource):
         """Load page ids for one K or V producer stage into SMEM."""
         if cutlass.const_expr(self.page_offsets is None):
             return
-        if cutlass.const_expr(self.cfg.is_dynamic_token_sparse):
+        if cutlass.const_expr(self.cfg.sparse_d576):
             self._producer_load_token_rows(stage_info, inst_id, is_v, section=section)
             return
         cfg = self.cfg
@@ -652,7 +652,7 @@ class SmemPageOffsetsResource(MlaResource):
         *,
         section: cutlass.Constexpr[MlaStage],
     ):
-        """Token-sparse stage: lane ``l`` stages row indices of tokens ``4l .. 4l+3``.
+        """D576 sparse stage: lane ``l`` stages row indices of tokens ``4l .. 4l+3``.
 
         Four independent 4-byte ``cp.async`` copies per lane keep the producer
         fully asynchronous (a synchronous load per stage would serialize the
@@ -745,7 +745,7 @@ class SmemPageOffsetsResource(MlaResource):
         # The load task waits on the page-offset stage, snapshots the page ids
         # into registers, and keeps swaps K0/K1 live until their delayed V use.
         del stage_info
-        if cutlass.const_expr(self.cfg.is_dynamic_token_sparse):
+        if cutlass.const_expr(self.cfg.sparse_d576):
             assert self.cfg.cache_uniform_sparse_quads
             # Snapshot this warp's eight quads once per K / V tile as
             # warp-uniform coordinates; every head-dimension stage of the
@@ -767,7 +767,7 @@ class SmemPageOffsetsResource(MlaResource):
                         Int32(rows[j])
                     )
             return cached_page_ids
-        if cutlass.const_expr(self.cfg.native_sparse_pages):
+        if cutlass.const_expr(self.cfg.sparse_d512):
             lane = lane_idx_from_thread(cute.arch.thread_idx()[0])
             warp = cute.arch.thread_idx()[0] // 32 - self.cfg.load_warp_idx
             groups_per_warp = self.cfg.tile_size_kv // (4 * self.cfg.load_num_warps)
@@ -891,7 +891,7 @@ class SmemKvResource(MlaResource):
     tma_desc_v: object = None
     tma_desc_bulk_extra: object = None
     c_rope_tensor: object = None
-    # Token-sparse: GMEM tensor holding two encoded CUtensorMaps (128 B each)
+    # D576 sparse: GMEM tensor holding two encoded CUtensorMaps (128 B each)
     # over the flat ``[576 B, N]`` KV pool: [0] 128 B box / SWIZZLE_128B for the
     # latent D128 slices, [1] 64 B box / SWIZZLE_64B for the RoPE slice.
     raw_gather4_descs: object = None
@@ -1040,7 +1040,7 @@ class SmemKvResource(MlaResource):
         *,
         stage_idx: cutlass.Constexpr[int],
         section: cutlass.Constexpr[MlaStage],
-        cached_page_ids=None,
+        cached_page_ids,
         page_id_slot: cutlass.Constexpr[int] = 0,
     ):
         """Load one staged K or V tile using the consumed page-id payload."""
@@ -1061,9 +1061,7 @@ class SmemKvResource(MlaResource):
             dim_offset = head_dim_cta_offset_v(cfg, cta_idx_head_dim_v) + Int32(
                 qk_stage_idx * cfg.head_dim_per_stage_v
             )
-            tma_desc = (
-                self.tma_desc_c_latent if cfg.native_sparse_pages else self.tma_desc_v
-            )
+            tma_desc = self.tma_desc_c_latent if cfg.sparse_d512 else self.tma_desc_v
         else:
             active_width = cfg.qk_head_stage_width(qk_stage_idx)
             if cutlass.const_expr(
@@ -1094,7 +1092,7 @@ class SmemKvResource(MlaResource):
         stage_base = self._stage_base(stage_info)
         inner_width = min(tma_inner_dim_elems(cfg), active_width)
         uses_compact_fp8_rope_stage = (
-            (cfg.load_num_warps == 1 or cfg.is_dynamic_token_sparse)
+            (cfg.load_num_warps == 1 or cfg.sparse_d576)
             and cfg.is_fp8_qkv()
             and not is_v
             and cfg.rope_dim == 64
@@ -1105,7 +1103,7 @@ class SmemKvResource(MlaResource):
         # Each lane owns four adjacent index-list entries. Bulk TMA requires
         # a verified 32-row physical run within one source; irregular rows
         # use gather4. The separate empty-window path only zero-fills padding.
-        if cutlass.const_expr(cfg.native_sparse_pages):
+        if cutlass.const_expr(cfg.sparse_d512):
             warp = cute.arch.thread_idx()[0] // 32 - cfg.load_warp_idx
             groups_per_warp = cfg.tile_size_kv // (4 * cfg.load_num_warps)
             base = page_id_slot * cfg.sparse_cache_words
@@ -1197,8 +1195,8 @@ class SmemKvResource(MlaResource):
                             )
             return
 
-        if cutlass.const_expr(cfg.is_dynamic_token_sparse):
-            # Token-sparse K/V stage: each loader warp issues its quads (one
+        if cutlass.const_expr(cfg.sparse_d576):
+            # D576 sparse K/V stage: each loader warp issues its quads (one
             # Gather4 of four token rows each) from the warp-uniform rows that
             # read_offsets cached for this tile.  The four rows land at
             # consecutive SMEM rows of the stage, so the TMA swizzle (SW128
@@ -1207,7 +1205,7 @@ class SmemKvResource(MlaResource):
             # still count toward the stage's transaction bytes; only -1 slots
             # are also masked in softmax.
             assert cfg.cache_uniform_sparse_quads, (
-                "token-sparse loads issue from the cached uniform quads"
+                "D576 sparse loads issue from the cached uniform quads"
             )
             is_rope_stage = (not is_v) and (
                 qk_stage_idx >= cfg.latent_dim // cfg.head_dim_per_stage_kv
@@ -1235,7 +1233,7 @@ class SmemKvResource(MlaResource):
                 # ring (one tile of stages plus one in flight) rules out.
                 assert cfg.kv_stages // (cfg.v_head_dim_stages + 1) + 2 < (
                     SPARSE_MASK_SLOTS
-                ), "token-sparse validity ring too short for the K/V ring depth"
+                ), "D576 sparse validity ring too short for the K/V ring depth"
                 ring = self.page_offsets_kv
                 lane_idx = lane_idx_from_thread(cute.arch.thread_idx()[0])
                 mask_base = Int32(ring.sparse_mask_word_base) + (
@@ -1403,7 +1401,7 @@ class SmemKvResource(MlaResource):
         *,
         stage_idx: cutlass.Constexpr[int],
         section: cutlass.Constexpr[MlaStage],
-        cached_page_ids=None,
+        cached_page_ids,
         page_id_slot: cutlass.Constexpr[int] = 0,
     ):
         """Load K instance 0 into the acquired K/V SMEM stage."""
@@ -1427,7 +1425,7 @@ class SmemKvResource(MlaResource):
         *,
         stage_idx: cutlass.Constexpr[int],
         section: cutlass.Constexpr[MlaStage],
-        cached_page_ids=None,
+        cached_page_ids,
         page_id_slot: cutlass.Constexpr[int] = 0,
     ):
         """Load K instance 1 into the acquired K/V SMEM stage."""
@@ -1451,7 +1449,7 @@ class SmemKvResource(MlaResource):
         *,
         stage_idx: cutlass.Constexpr[int],
         section: cutlass.Constexpr[MlaStage],
-        cached_page_ids=None,
+        cached_page_ids,
         page_id_slot: cutlass.Constexpr[int] = 0,
     ):
         """Load deferred V instance 0 into the acquired K/V SMEM stage."""
@@ -1475,7 +1473,7 @@ class SmemKvResource(MlaResource):
         *,
         stage_idx: cutlass.Constexpr[int],
         section: cutlass.Constexpr[MlaStage],
-        cached_page_ids=None,
+        cached_page_ids,
         page_id_slot: cutlass.Constexpr[int] = 0,
     ):
         """Load deferred V instance 1 into the acquired K/V SMEM stage."""

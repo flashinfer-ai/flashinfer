@@ -199,12 +199,6 @@ class MlaConfig:
     # JIT code.
     kernel_variant: str = "swaps_mma_ab"
     use_paged_kv: int = 1
-    # Token-sparse (DSA) decode: every page-table entry is one physical token
-    # row of a flat KV pool, gathered four rows per Gather4 TMA; the per-token
-    # K domain arrives through ``cache_seqs`` (one "batch" per query token).
-    is_dynamic_token_sparse: int = 0
-    # setmaxnreg budget of the K/V loader task (defaults to mma_load_regs).
-    load_regs: int = 0
     supports_var_seq_lens: int = 1
     use_persistent_scheduler: int = 1
     use_clc_dynamic_persistent_scheduler: int = 0
@@ -216,22 +210,25 @@ class MlaConfig:
     attention_window_size: int = 0
 
     @property
-    def native_sparse_pages(self) -> bool:
-        """One token per page on the native sparse path (RoPE folded into D512).
+    def sparse_d512(self) -> bool:
+        """Two-source D512 sparse MLA: one token row per index (page size
+        one), RoPE folded into the 512 columns."""
+        return self.num_tokens_per_page == 1 and self.rope_dim == 0
 
-        Token-sparse DSA decode also addresses one token row per page-table
-        entry, but it stages its own routes and validity masks, so it is
-        excluded here.
-        """
-        return self.num_tokens_per_page == 1 and not self.is_dynamic_token_sparse
+    @property
+    def sparse_d576(self) -> bool:
+        """D576 sparse MLA (DSA): one token row per index (page size one) with
+        a separate 64-wide RoPE tail; each query token is one batch row whose
+        K domain arrives through ``cache_seqs``."""
+        return self.num_tokens_per_page == 1 and self.rope_dim > 0
 
     @property
     def keeps_ilp_softmax(self) -> bool:
         """Keeps-MMA-AB softmax with a 4-way row max, FFMA2 exp arguments, four
         packed sum accumulators and the running max / sum in registers (short
         dependency chains, no per-tile SMEM round trip or named barrier): the
-        native sparse path and the token-sparse path."""
-        return self.native_sparse_pages or bool(self.is_dynamic_token_sparse)
+        native sparse path and the D576 sparse path."""
+        return self.num_tokens_per_page == 1
 
     @property
     def one_insts_kv_swap(self) -> bool:
@@ -767,7 +764,7 @@ def keeps_mma_ab_config_kwargs(
     profile: MlaProfile,
     qkv_dtype: str,
     *,
-    is_dynamic_token_sparse: bool = False,
+    sparse_d576: bool = False,
 ) -> dict[str, int]:
     """Return keeps-MMA-AB scheduler, pipeline, and register traits."""
 
@@ -805,8 +802,8 @@ def keeps_mma_ab_config_kwargs(
         "use_persistent_scheduler": use_persistent_scheduler,
         "use_clc_dynamic_persistent_scheduler": use_clc_dynamic_persistent_scheduler,
     }
-    if is_dynamic_token_sparse:
-        # Token-sparse: one warp cannot issue 32 Gather4 per 16 KB stage fast
+    if sparse_d576:
+        # D576 sparse: one warp cannot issue 32 Gather4 per 16 KB stage fast
         # enough (~0.6 us per stage measured), so the K/V loader spans warps
         # 12-15 (8 gathers each, issued from warp-uniform cached rows) and
         # warp 9 pads.  Register budget for 16 warps: 4x168 + 4x160 + 8x80 =
@@ -828,7 +825,6 @@ def keeps_mma_ab_config_kwargs(
                 "softmax_regs": 168,
                 "correction_regs": 160,
                 "mma_load_regs": 80,
-                "load_regs": 80,
             }
         )
     return kwargs
@@ -1580,7 +1576,6 @@ def make_throughput_latency_mla_config(
     explicit_persistent: bool | None = None,
     mask_type: MaskType | str = MaskType.CAUSAL,
     softmax_rescale_threshold_log2: float = 0.0,
-    is_dynamic_token_sparse: bool = False,
 ) -> MlaConfig:
     """Return throughput-latency 1CTA MLA traits for a concrete profile."""
 
@@ -1612,16 +1607,13 @@ def make_throughput_latency_mla_config(
         raise ValueError("latent_dim must be positive")
     if rope_dim < 0:
         raise ValueError("rope_dim must be non-negative")
-    if is_dynamic_token_sparse:
-        if num_tokens_per_page != 1:
-            raise ValueError(
-                "token-sparse 1CTA MLA addresses one physical token per page-table "
-                f"entry and requires num_tokens_per_page=1, got {num_tokens_per_page}"
-            )
+    # Page size one addresses individual token rows (sparse MLA): without
+    # RoPE it is the two-source D512 path, with RoPE the D576 path.
+    sparse_d576 = num_tokens_per_page == 1 and rope_dim > 0
+    if sparse_d576:
         if qkv_dtype != "e4m3" or rope_dim != 64 or latent_dim != 512:
             raise ValueError(
-                "token-sparse 1CTA MLA currently supports E4M3 Q/K/V with the "
-                "576 = 512 + 64 DSA geometry"
+                "D576 sparse 1CTA MLA supports E4M3 Q/K/V with 576 = 512 + 64 rows"
             )
     elif num_tokens_per_page not in SUPPORTED_MLA_PAGE_SIZES and not (
         num_tokens_per_page == 1 and rope_dim == 0
@@ -1645,7 +1637,7 @@ def make_throughput_latency_mla_config(
         else MlaConfig.page_offsets_entries_per_stage
     )
     page_offsets_stages = MlaConfig.page_offsets_stages
-    if is_dynamic_token_sparse:
+    if sparse_d576:
         page_offsets_stages = 4
     if pages_per_kv_tile > page_offsets_entries_per_stage:
         raise ValueError(
@@ -1674,8 +1666,8 @@ def make_throughput_latency_mla_config(
         latent_dim=latent_dim,
         rope_dim=rope_dim,
         # Profile enumeration only checks that the page size is a dense one;
-        # the token-sparse page size of one is validated above.
-        num_tokens_per_page=(16 if is_dynamic_token_sparse else num_tokens_per_page),
+        # the D576 sparse page size of one is validated above.
+        num_tokens_per_page=(16 if sparse_d576 else num_tokens_per_page),
         max_active_clusters=max_active_clusters,
         qkv_dtype=qkv_dtype,
         tile_size_q=tile_size_q,
@@ -1780,7 +1772,6 @@ def make_throughput_latency_mla_config(
         max_num_pages_per_seq_kv=max(1, ceil(seq_len_kv / num_tokens_per_page)),
         page_offsets_entries_per_stage=page_offsets_entries_per_stage,
         page_offsets_stages=page_offsets_stages,
-        is_dynamic_token_sparse=int(is_dynamic_token_sparse),
         tmem_s_cols=tile_size_q,
         tmem_stats_cols=MlaConfig.tmem_stats_cols,
         tmem_o_cols=tile_size_q,
@@ -1799,7 +1790,7 @@ def make_throughput_latency_mla_config(
             keeps_mma_ab_config_kwargs(
                 selected_profile,
                 qkv_dtype,
-                is_dynamic_token_sparse=is_dynamic_token_sparse,
+                sparse_d576=sparse_d576,
             )
         )
     cfg = MlaConfig(**config_kwargs)

@@ -36,12 +36,12 @@ import torch
 from .kernels.mla_decode.helpers.math import (
     canonicalize_softmax_rescale_threshold_log2,
 )
-from .kernels.mla_decode.throughput_latency_1cta.token_sparse_launch import (
+from .kernels.mla_decode.throughput_latency_1cta.sparse_mla_d576_launch import (
     HEAD_DIM,
     V_DIM,
-    compile_dsa_sparse_kernel,
-    dsa_split_workspace_bytes,
-    launch_dsa_sparse_kernel,
+    compile_sparse_mla_d576_kernel,
+    sparse_mla_d576_workspace_bytes,
+    launch_sparse_mla_d576_kernel,
 )
 
 KV_LORA_RANK = 512
@@ -112,23 +112,18 @@ def check_plan(
 ) -> None:
     """Reject wrapper options the DSA schedule does not implement."""
     if q_data_type != torch.float8_e4m3fn:
-        raise ValueError("DSA sparse MLA (qk_rope_head_dim=64) requires E4M3 Q / KV")
+        raise ValueError("D576 sparse MLA (qk_rope_head_dim=64) requires E4M3 Q / KV")
     if num_heads not in _SUPPORTED_HEADS:
         raise ValueError(
-            "DSA sparse MLA supports 64 or 128 query heads (64-row tiles), "
+            "D576 sparse MLA supports 64 or 128 query heads (64-row tiles), "
             f"got {num_heads}"
         )
-    if max_topk % 4:
-        raise ValueError(
-            "DSA sparse MLA requires max_topk to be a multiple of 4 "
-            "(rows are gathered four at a time)"
-        )
     if max_extra_topk:
-        raise ValueError("DSA sparse MLA attends to one KV pool (max_extra_topk=0)")
+        raise ValueError("D576 sparse MLA attends to one KV pool (max_extra_topk=0)")
     if has_sinks:
-        raise ValueError("DSA sparse MLA does not support attention sinks")
+        raise ValueError("D576 sparse MLA does not support attention sinks")
     if output_quant_block_size is not None:
-        raise ValueError("DSA sparse MLA does not support output quantization")
+        raise ValueError("D576 sparse MLA does not support output quantization")
 
 
 def resolve_split(device_index: int, max_rows: int, num_heads: int, max_topk: int):
@@ -144,7 +139,7 @@ def resolve_split(device_index: int, max_rows: int, num_heads: int, max_topk: in
 
 def workspace_bytes(max_rows: int, num_heads: int, split_kv: int) -> int:
     """BF16 partial O / FP32 LSE scratch of a split plan (0 without split-KV)."""
-    return dsa_split_workspace_bytes(max_rows, num_heads, split_kv)
+    return sparse_mla_d576_workspace_bytes(max_rows, num_heads, split_kv)
 
 
 def compile_plan(
@@ -163,11 +158,12 @@ def compile_plan(
         else softmax_rescale_threshold_log2,
         qkv_dtype="e4m3",
     )
-    return compile_dsa_sparse_kernel(
+    return compile_sparse_mla_d576_kernel(
         device_index,
         num_heads=num_heads,
-        # Every top-k up to one 128-key tile runs the same one-tile kernel.
-        sparse_mla_top_k=max(max_topk, 128),
+        # The kernel uses the capacity only through its 128-key tile count:
+        # capacities in one tile bucket share a kernel.
+        sparse_mla_top_k=-(-max_topk // 128) * 128,
         softmax_rescale_threshold_log2=threshold,
         split_kv=split_kv,
         head_dim_split=head_dim_split,
@@ -215,7 +211,7 @@ def launch(
     split_kv: int,
 ) -> None:
     """Launch one planned DSA kernel over ``[T, H, 576]`` queries."""
-    launch_dsa_sparse_kernel(
+    launch_sparse_mla_d576_kernel(
         compiled,
         query=query,
         kv_pool=kv,

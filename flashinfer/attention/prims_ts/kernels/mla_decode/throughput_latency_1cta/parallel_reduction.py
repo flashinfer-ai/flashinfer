@@ -308,13 +308,11 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
                     batch_idx,
                     cu_seqlens_q,
                 )
-                # Finalized attention and token-sparse (DSA) plans publish
+                # Finalized attention and D576 sparse (DSA) plans publish
                 # natural-log LSE; global_lse stays base 2 for the weights below.
                 (lse.iterator.raw_ptr() + stats_output_query_row).store(
                     global_lse * Float32(LN_2)
-                    if cutlass.const_expr(
-                        finalize_attention or cfg.is_dynamic_token_sparse
-                    )
+                    if cutlass.const_expr(finalize_attention or cfg.sparse_d576)
                     else global_lse
                 )
 
@@ -786,8 +784,8 @@ def _run_parallel_gmem_reduction_shared_stats(
             )
             if head_dim_cta_idx == Int32(0) and dim_in_cta == Int32(0):
                 public_lse = smem_global_lse[row_in_slice]
-                if cutlass.const_expr(cfg.is_dynamic_token_sparse):
-                    # Token-sparse (DSA) plans publish natural-log LSE (this
+                if cutlass.const_expr(cfg.sparse_d576):
+                    # D576 sparse (DSA) plans publish natural-log LSE (this
                     # cluster path never finalizes attention).
                     public_lse = public_lse * Float32(LN_2)
                 (lse.iterator.raw_ptr() + output_query_row).store(public_lse)
