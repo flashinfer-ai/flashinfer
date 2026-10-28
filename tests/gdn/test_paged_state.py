@@ -661,10 +661,12 @@ def test_output_state_indices_without_checkpoints(state_dtype, index_dtype):
             assert torch.equal(pool[row], before[row]), f"row {row} changed"
 
 
-def test_one_selected_state_per_sequence():
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_one_selected_state_per_sequence(state_dtype):
     """One chunk-aligned intermediate state per sequence (or none) goes straight
     to its own row: every other 64-token checkpoint entry is -1, so nothing
-    else is stored and no gather follows."""
+    else is stored and no gather follows. The call passes no initial or final
+    state, so the checkpoint buffer alone sets the state dtype."""
     _skip_if_unsupported()
     random.seed(6)
     torch.manual_seed(6)
@@ -688,7 +690,7 @@ def test_one_selected_state_per_sequence():
     wanted = pos > 0
     entries[(starts + pos // CHUNK - 1)[wanted]] = rows[wanted]
 
-    guarded = GuardedPool(8, 4, torch.float32, row_pad=64)
+    guarded = GuardedPool(8, 4, state_dtype, row_pad=64)
     states = guarded.pool
     states.copy_(torch.randn_like(states))
     before = states.clone()
