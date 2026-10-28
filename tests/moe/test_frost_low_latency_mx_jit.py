@@ -228,7 +228,7 @@ def _native_mx_pipeline(format_name, device_index):
 
 
 @pytest.mark.parametrize("format_name", ["MXFP4", "MXFP8"])
-def test_native_mx_cross_arch_pipeline_in_fresh_process(format_name):
+def test_native_mx_cross_arch_pipeline_in_fresh_process(format_name, tmp_path):
     pytest.importorskip("cutlass", minversion="4.8")
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
         (10, 0),
@@ -237,6 +237,16 @@ def test_native_mx_cross_arch_pipeline_in_fresh_process(format_name):
         pytest.skip("Native MX cross-architecture regression requires SM100/SM103")
     environment = os.environ.copy()
     environment["CUTE_DSL_ARCH"] = "sm_90a"
+    # Changing the compiler target needs a private cache namespace. Inherit
+    # cache validation, but never reuse or invalidate another worker's cache.
+    environment.update(
+        FLASHINFER_WORKSPACE_BASE=str(tmp_path),
+        FLASHINFER_CACHE_DIR=str(tmp_path / ".cache" / "flashinfer"),
+        CUTE_DSL_CACHE_DIR=str(tmp_path / "cute_dsl"),
+        TRITON_CACHE_DIR=str(tmp_path / "triton"),
+        TORCH_EXTENSIONS_DIR=str(tmp_path / "torch_extensions"),
+        TVM_FFI_CACHE_DIR=str(tmp_path / "tvm_ffi"),
+    )
     child = subprocess.run(
         [
             sys.executable,
