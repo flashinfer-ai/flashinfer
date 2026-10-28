@@ -877,24 +877,32 @@ BLOCK_M_VALUES = (8, 16)
 #   LC   : one cluster of num_tokens CTAs (a single CTA for one token, 2, 4, 8
 #          or 16 CTAs otherwise) exchanging selected ids through distributed
 #          shared memory; one kernel per row count, non-cooperative launch
+#   LC1_NC: the one-token LC kernel with its bias and logits loads in the
+#          read-only form (one token at block_m 16), same launch
 #   LCG  : one non-portable cluster of 16 CTAs of two row groups each, any
 #          num_tokens <= 32 (the 32-token cell: the counts up to 32 that are
 #          not an LC row count); non-cooperative launch
 #   LCG_LW: the LCG kernel waiting for its cluster after the row selection
-#          instead of at entry, same cluster / launch / token range
+#          instead of at entry, same cluster / launch / token range (SM100 at
+#          block_m 16: from 29 tokens)
 #   M    : one-join bitmap plan builder, 128 <= num_tokens <= 256 (SM100) /
 #          2048 (SM103); on SM103 the cooperative grid is launched with an
 #          explicit cluster of one CTA
 #   Q4S  : arm M's cp.async ID stream in 4-CTA clusters (cooperative cluster
 #          launch) at four CTAs per SM, 128 <= num_tokens <= 2048
+#   Q4S_E16: the Q4S kernel whose plan emit gives each lane 16 tokens instead
+#          of 32 (SM100, the 512-token cell), same cluster / launch bounds /
+#          grid rule
 #   Q4SB : the Q4S kernel with a register prefetch of the next row's logits
 #          (SM103), same cluster / launch bounds / grid rule
 #   Q4SP : the Q4S kernel with a register prefetch of the next row's logits,
 #          same cluster / launch bounds / grid rule
-#   Q4SPW: the Q4SP kernel selecting one row per warp (SM100 at block_m 16),
-#          same cluster / launch bounds / grid rule
-#   Q4SPW_LR: the Q4SPW kernel whose owner CTAs rank the route pairs in their
-#          own shared memory, same cluster / launch bounds / grid rule
+#   Q4SP_PG: the Q4SP kernel skipping the emit word pass a batch of at most
+#          1024 tokens leaves without a bitmap word (SM100 at block_m 8), same
+#          cluster / launch bounds / grid rule
+#   Q4SPW_LR: the Q4SP kernel selecting one row per warp whose owner CTAs rank
+#          the route pairs in their own shared memory, same cluster / launch
+#          bounds / grid rule
 #   GW   : two-join persistent warp-per-row kernel for the largest batches; a
 #          cooperative grid of 2-CTA clusters
 ARMS = (
@@ -902,13 +910,15 @@ ARMS = (
     "LP",
     "LPC",
     "LC",
+    "LC1_NC",
     "LCG",
     "LCG_LW",
     "M",
     "Q4S",
+    "Q4S_E16",
     "Q4SB",
     "Q4SP",
-    "Q4SPW",
+    "Q4SP_PG",
     "Q4SPW_LR",
     "GW",
 )
@@ -975,10 +985,11 @@ def _header_dirs():
 #
 # The generated binding launches the kernel (cooperative and cluster attributes
 # included) but exposes no occupancy query.  The persistent grids of the
-# 4-CTA-cluster arms (Q4S, Q4SB, Q4SP, Q4SPW, Q4SPW_LR) and of the CTA-pair arm
-# GW must be bounded by the number of co-resident clusters the driver admits
-# (GPC placement, not just CTAs per SM), and the 16-CTA non-portable clusters
-# of the sixteen-token kernel and of arms LCG and LCG_LW need at least one.
+# 4-CTA-cluster arms (Q4S, Q4S_E16, Q4SB, Q4SP, Q4SP_PG, Q4SPW_LR) and of the
+# CTA-pair arm GW must be bounded by the number of co-resident clusters the
+# driver admits (GPC placement, not just CTAs per SM), and the 16-CTA
+# non-portable clusters of the sixteen-token kernel and of arms LCG and LCG_LW
+# need at least one.
 # For exactly those programs the registry record carries the kernel declaration
 # (``kernel_declaration``, taken from the generated source by the export), and
 # this package adds one translation unit that forwards it to
