@@ -45,6 +45,9 @@ static constexpr int32_t MaxNumTokensSingleClusterWithCoop = 4096;
 // Token count up to which one CTA permutes the expanded indexes faster than a cluster, whose
 // barriers and distributed shared memory reads cost more than the extra work per thread.
 static constexpr int32_t MaxNumTokensBlockPermutation = 512;
+// Token count up to which the single-block kernels, which let the next kernel launch while they
+// run, beat the single-CTA permutation.
+static constexpr int32_t MaxNumTokensSingleBlockOverBlockPermutation = 8;
 
 // Implementation of shared post-topK pipeline for all routing methods.
 // When topK is already computed (mPtrTopKIds or mPtrTopKPacked), we don't need
@@ -103,10 +106,19 @@ void runPostTopKPipeline(DataType const& data, void* stream) {
   int32_t const maxNumTokensSingleCluster =
       canUseCoop ? MaxNumTokensSingleClusterWithCoop : routingCustom::MaxNumTokensSingleCluster;
   bool const useSingleCluster = (smMajor >= 9) && (data.mNumTokens <= maxNumTokensSingleCluster);
+  bool const useSingleBlock = useStaticBlock || useDynBlock;
   bool const useBlockPermutation =
-      (smMajor >= 9) && (data.mNumTokens <= MaxNumTokensBlockPermutation);
+      (smMajor >= 9) && (data.mNumTokens <= MaxNumTokensBlockPermutation) &&
+      (data.mNumTokens > MaxNumTokensSingleBlockOverBlockPermutation || !useSingleBlock);
 
-  if (useDynBlock) {
+  if (useBlockPermutation) {
+    bool const launched = routingCustom::launchBlockPermutationKernel(customData, stream);
+    FLASHINFER_CHECK(
+        launched, "runPostTopKPipeline: no compiled tier covers numExperts=", data.mNumExperts,
+        " topK=", data.mTopK,
+        " for the post-topK permutation (block path). Add a matching Tier<E, K> to "
+        "PolicyTraits<NoOpPreprocess, SoftmaxPostprocess> in RoutingCustomPolicy.cuh.");
+  } else if (useDynBlock) {
     bool const launched = routingCustom::launchDynBlockKernel(customData, numThreadsHist, stream);
     FLASHINFER_CHECK(
         launched, "runPostTopKPipeline: no compiled tier covers numExperts=", data.mNumExperts,
@@ -120,13 +132,6 @@ void runPostTopKPipeline(DataType const& data, void* stream) {
         " topK=", data.mTopK,
         " for the post-topK permutation (static-block path). Add a matching Tier<E, K> "
         "to PolicyTraits<NoOpPreprocess, SoftmaxPostprocess> in RoutingCustomPolicy.cuh.");
-  } else if (useBlockPermutation) {
-    bool const launched = routingCustom::launchBlockPermutationKernel(customData, stream);
-    FLASHINFER_CHECK(
-        launched, "runPostTopKPipeline: no compiled tier covers numExperts=", data.mNumExperts,
-        " topK=", data.mTopK,
-        " for the post-topK permutation (block path). Add a matching Tier<E, K> to "
-        "PolicyTraits<NoOpPreprocess, SoftmaxPostprocess> in RoutingCustomPolicy.cuh.");
   } else if (useSingleCluster) {
     bool const launched = routingCustom::launchClusterKernel(customData, stream);
     FLASHINFER_CHECK(launched,
