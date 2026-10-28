@@ -836,7 +836,14 @@ def test_cake_fmha_context_fp8_split_plan(
     assert 2 <= num_splits <= cake_api._CONTEXT_FP8_SPLIT_MAX
     assert split_blocks >= 1 and -(-max(blocks) // split_blocks) >= num_splits
     costs = cake_api._CONTEXT_FP8_SPLIT_COSTS[target]
-    whole = cake_api._context_fp8_split_makespan(blocks, sm_count, 0, 1, 1, costs)
+    whole = cake_api._context_fp8_split_makespan(
+        blocks,
+        sm_count,
+        0,
+        1,
+        1,
+        cake_api._context_fp8_whole_costs(target, max_q, max_kv, pack, costs),
+    )
     split = cake_api._context_fp8_split_makespan(blocks, sm_count, *plan, costs)
     assert split <= whole * (1 - cake_api._CONTEXT_FP8_SPLIT_REL_MARGIN)
     assert whole - split >= cake_api._CONTEXT_FP8_SPLIT_ABS_MARGIN
@@ -848,9 +855,11 @@ _SPLIT_MARGIN_ROWS = [
     # B200: 0.58 us (2.1 %) predicted; GB300: no split predicted faster
     ("sm100a", 2, 300, 1500, 32, 8, True),
     ("sm103a", 2, 300, 1500, 32, 8, False),
-    # GB300: 0.84 us (3.0 % and 2.2 %) predicted
-    ("sm103a", 2, 300, 2000, 32, 8, True),
-    ("sm103a", 2, 300, 3000, 32, 8, True),
+    # GB300: the split's 0.84 us (3.0 % and 2.2 %) over whole tiles priced
+    # like split units is gone: the whole tiles run the swapped P placement
+    # (_CONTEXT_FP8_SPLIT_WHOLE_BLOCK)
+    ("sm103a", 2, 300, 2000, 32, 8, False),
+    ("sm103a", 2, 300, 3000, 32, 8, False),
     # 16 requests of 256 query tokens over 2048 keys, one head per tile: B200
     # 2.7 % predicted; GB300 1.5 %, below the margin
     ("sm100a", 16, 256, 2048, 32, 1, True),
@@ -981,7 +990,14 @@ def test_cake_fmha_context_fp8_split_choice(
         assert plan == found[0]
     costs = cake_api._context_fp8_split_costs
     time = cake_api._context_fp8_split_makespan(
-        blocks, sm_count, *(own or (0, 1, 1)), costs(target, max_q, pack)
+        blocks,
+        sm_count,
+        *(own or (0, 1, 1)),
+        costs(target, max_q, pack)
+        if own
+        else cake_api._context_fp8_whole_costs(
+            target, max_q, max_kv, pack, costs(target, max_q, pack)
+        ),
     )
     faster = cake_api._context_fp8_split_makespan(
         smaller, sm_count, *plan, costs(target, max_q, chosen)

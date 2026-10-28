@@ -4288,6 +4288,15 @@ _CONTEXT_FP8_SPLIT_ROWS: dict[str, tuple[float, float]] = {
     "sm100a": (0.640, 0.302),
     "sm103a": (0.591, 0.124),
 }
+# The KV block of a whole-tile launch of more than 256 keys whose tiles hold
+# all 256 query rows costs this share of a split unit's: on sm103a those
+# tiles run the swapped P placement (the next QK product issued while P is
+# written), the split units the default one.  Set from timed whole-tile and
+# split launches of full tiles (GB300): the least-squares share (0.83) also
+# moves long-KV launches whose split units fill a short last wave to whole
+# tiles that time slower; at this share no timed launch does.  Tiles of
+# fewer query rows keep the split units' cost.
+_CONTEXT_FP8_SPLIT_WHOLE_BLOCK: dict[str, float] = {"sm103a": 0.880}
 # A split must be predicted faster than the whole-tile schedule by both
 # margins (2 % and 0.5 us: the smallest that timed plans of B200 and GB300
 # support; at 1 % some predicted gains measure as losses); a launch of more
@@ -4352,6 +4361,25 @@ def _context_fp8_split_costs(
         merge1 * store_share,
         extra,
     )
+
+
+def _context_fp8_whole_costs(
+    target: str,
+    max_q_len: int,
+    max_kv_len: int,
+    pack: int,
+    costs: tuple[float, ...] | None,
+) -> tuple[float, ...] | None:
+    """``costs`` for the whole-tile schedule of a launch of ``pack``: the KV
+    block scaled by :data:`_CONTEXT_FP8_SPLIT_WHOLE_BLOCK` for launches of
+    more than 256 keys whose tiles hold 256 query rows (several m-blocks, or
+    ``max_q_len x pack`` of at least 256)."""
+
+    share = _CONTEXT_FP8_SPLIT_WHOLE_BLOCK.get(target)
+    full = max_q_len > 2 * (128 // pack) or max_q_len * pack >= 256
+    if costs is None or share is None or max_kv_len <= 256 or not full:
+        return costs
+    return (costs[0], costs[1] * share, *costs[2:])
 
 
 def _context_fp8_split_makespan(
@@ -4439,7 +4467,14 @@ def _context_fp8_split_search(
     tiles = len(blocks)
     if costs is None or not tiles or tiles > _CONTEXT_FP8_SPLIT_MAX_WAVES * sm_count:
         return None
-    whole = _context_fp8_split_makespan(blocks, sm_count, 0, 1, 1, costs)
+    whole = _context_fp8_split_makespan(
+        blocks,
+        sm_count,
+        0,
+        1,
+        1,
+        _context_fp8_whole_costs(target, max_q_len, max_kv_len, pack, costs),
+    )
     tail = tiles % sm_count or sm_count
     idle = sm_count - tail
     split_counts = {tiles if tiles <= sm_count else tail, tail}
@@ -4546,7 +4581,14 @@ def _context_fp8_split_choice(
         for smaller in (*_CONTEXT_FP8_RUNTIME_PACKS, 1)
         if smaller < pack and pack % smaller == 0
     ]
-    time = _context_fp8_split_makespan(blocks, sm_count, *(plan or (0, 1, 1)), costs)
+    time = _context_fp8_split_makespan(
+        blocks,
+        sm_count,
+        *(plan or (0, 1, 1)),
+        costs
+        if plan
+        else _context_fp8_whole_costs(target, max_q_len, max_kv_len, pack, costs),
+    )
     if plan is not None and max_q_len > tokens and plan[0] == len(blocks):
         repack: tuple[int, tuple[int, int, int]] | None = None
         repack_time = time
