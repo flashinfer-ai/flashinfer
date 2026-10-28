@@ -1,6 +1,6 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""CPU: the plan LRU behind the functional decode entry -- its KEY (buckets differing only in the list form, the prepare fusion, the
+"""CPU: the plan LRU behind the functional decode entry -- its KEY (buckets differing only in the list form, the prepare fusion, the sparse core's body knob, the
 ring-slots arm, the table arm, the ring's capacity or the indexer cache dtype are DIFFERENT plans; the same bucket with another
 side-cache STRIDE is the SAME plan: the kernels bind those strides symbolically) and the Qwen 3.5 ownership contract (an eager-only plan
 freed at eviction, a captured one retained and revived, a cold bucket under capture refused typed).  The real LRU, lookup and plan
@@ -156,6 +156,10 @@ def test_the_key_separates_the_forms_knobs_and_cache_forms_but_not_the_side_cach
         _bucket(api, 1, cap=12),  # the ring's capacity (its FORM)
         _bucket(api, 1, q_len_per_req=4, cap=8),
         _bucket(api, 1, use_pdl=False),
+        _bucket(
+            api, 1, sparse_tile_form="tcgen05"
+        ),  # the sparse core's body knob: two bodies are two compiled plans
+        _bucket(api, 1, sparse_tile_form="lean"),
     ]
     assert all(p is not base for p in distinct) and len(
         {id(p) for p in distinct}
@@ -164,6 +168,9 @@ def test_the_key_separates_the_forms_knobs_and_cache_forms_but_not_the_side_cach
     assert len(api._PLANS) == 1 + len(distinct)
     assert _bucket(api, 1, kv_cache_dtype=torch.bfloat16) is base, (
         "kv_cache_dtype=bf16 names the activation dtype: the same pools, the same plan"
+    )
+    assert _bucket(api, 1, sparse_tile_form="auto") is base, (
+        "sparse_tile_form='auto' is the default spelled out: the same plan"
     )
 
 
