@@ -45,6 +45,9 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_HISTOGRAM_OFF 0
 #define SMEM_HISTOGRAM_STAGE_BYTES 1024
 #define SMEM_HISTOGRAM_STRIDE 1024
+#define SMEM_OWNER_BINS_OFF 0
+#define SMEM_OWNER_BINS_STAGE_BYTES 128
+#define SMEM_OWNER_BINS_STRIDE 128
 #define SMEM_TOTAL 1024
 #define THREADS 1024
 
@@ -58,6 +61,7 @@ kernel_cake_mok_count_32_8(int* __restrict__ topk_all, int* __restrict__ counts,
     const int warp = make_warp_uniform(tid / 32);
     const int lane = tid % 32;
 
+    __shared__ __align__(16) unsigned char smem_static_raw[128];
     extern __shared__ __align__(128) char smem_raw[];
     int smem;
 #if __CUDA_ARCH__ == 1000
@@ -75,14 +79,19 @@ kernel_cake_mok_count_32_8(int* __restrict__ topk_all, int* __restrict__ counts,
     // Kernel setup ops
     int* histogram = reinterpret_cast<int*>(smem_raw + SMEM_HISTOGRAM_OFF);
     const int histogram_addr = smem + SMEM_HISTOGRAM_OFF;
+    int* owner_bins = reinterpret_cast<int*>(smem_static_raw + 0);
+    const int owner_bins_addr = (int)(unsigned long long)__cvta_generic_to_shared(owner_bins);
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int rank_stride = local_tokens * top_k;
     int route_count = 32 * rank_stride;
     int first_expert = rank * 8;
     int last_expert = first_expert + 8;
     for (int i = tid; i < 256; i += 1024) {
         histogram[i] = 0;
+    }
+    for (int i_1 = tid; i_1 < 32; i_1 += 1024) {
+        owner_bins[i_1] = 0;
     }
     __syncthreads();
     for (int idx = bid * 1024 + tid; idx < route_count; idx += num_bids * 1024) {
@@ -91,12 +100,21 @@ kernel_cake_mok_count_32_8(int* __restrict__ topk_all, int* __restrict__ counts,
         if (expert >= first_expert && expert < last_expert) {
             atomicAdd(&histogram[(expert - first_expert) * 32 + peer], 1);
         }
+        if (expert >= 0 && expert < 256) {
+            atomicAdd(&owner_bins[expert / 8], 1);
+        }
     }
     __syncthreads();
-    for (int i_1 = tid; i_1 < 256; i_1 += 1024) {
-        int value = histogram[i_1];
+    for (int i_2 = tid; i_2 < 256; i_2 += 1024) {
+        int value = histogram[i_2];
         if (value != 0) {
-            atomicAdd(&counts[i_1], value);
+            atomicAdd(&counts[i_2], value);
+        }
+    }
+    for (int i_3 = tid; i_3 < 32; i_3 += 1024) {
+        int total = owner_bins[i_3];
+        if (total != 0) {
+            atomicAdd(&counts[256 + i_3], total);
         }
     }
 }

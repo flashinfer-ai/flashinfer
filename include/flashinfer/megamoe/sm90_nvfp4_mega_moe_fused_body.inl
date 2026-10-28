@@ -803,6 +803,12 @@ if (warp_idx < kNumDispatchWarps) {
     if (thread_idx == 0) stamp_max(2);  // pool ready (pull done)
   }  // !kPushDispatch
 
+  // `cleanup_workspace` derives each expert's pool block offset from the calling warp's
+  // cached expert counts; dispatch warps that skipped the pull loop never fetched them.
+  if constexpr (!kPushDispatch) {
+    if (warp_idx >= kNumActiveDispatchWarps) scheduler.fetch_expert_recv_count();
+  }
+
   // Cleanup workspace, overlapping with combine
   ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
 

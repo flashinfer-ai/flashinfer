@@ -1168,13 +1168,27 @@ def test_mla_split_kv_cap():
         48,
         48,
     ]
-    assert _get_split_kv_and_workspace_size(1, 8, 12, 512, 212)[0] == 48
-    assert _get_split_kv_and_workspace_size(2, 1, 128, 512, 212)[0] == 48
+    # Above the static cap the reducer grows to the covering power of two, up to 128.
+    assert [_get_reducer_max_splits(s) for s in (53, 104, 128)] == [64, 128, 128]
+    # One or two work units may split past 48 so every 2-CTA cluster stays busy.
+    assert _get_split_kv_and_workspace_size(1, 8, 12, 512, 212)[0] == 106
+    assert _get_split_kv_and_workspace_size(1, 8, 12, 512, 148)[0] == 74
+    assert _get_split_kv_and_workspace_size(1, 8, 12, 512, 1024)[0] == 128
+    assert _get_split_kv_and_workspace_size(2, 1, 128, 512, 212)[0] == 53
+    # Three or more work units keep the static cap.
+    assert _get_split_kv_and_workspace_size(3, 1, 128, 512, 288)[0] == 48
     assert _get_split_kv_and_workspace_size(4, 1, 128, 512, 212)[0] == 26
     # A known short max_seq_len still trims empty splits.
     assert (
         _get_split_kv_and_workspace_size(1, 1, 12, 512, 212, max_seq_len=4096)[0] == 32
     )
+    # The raised cap needs >= 8 KV tiles per split: 8K-32K keep the static-cap
+    # counts, 64K and 128K use the raised cap.
+    for seq, expected in ((8192, 32), (32768, 43), (65536, 64), (131072, 103)):
+        assert (
+            _get_split_kv_and_workspace_size(1, 1, 12, 512, 212, max_seq_len=seq)[0]
+            == expected
+        )
 
 
 @pytest.mark.parametrize("d_tiles", [1, 2, 4])

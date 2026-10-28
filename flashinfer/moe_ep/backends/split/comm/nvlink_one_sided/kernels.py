@@ -8,11 +8,11 @@ from typing import Any
 
 
 @functools.cache
-def get_nvlink_one_sided_module() -> Any:
+def get_nvlink_one_sided_alltoall_module() -> Any:
     """Build (on first use) and load the JIT module backing ``NVLinkOneSidedAlltoAll``."""
-    from ......jit.comm import gen_moe_ep_nvlink_one_sided_module
+    from ......jit.comm import gen_nvlink_one_sided_alltoall_module
 
-    return gen_moe_ep_nvlink_one_sided_module().build_and_load()
+    return gen_nvlink_one_sided_alltoall_module().build_and_load()
 
 
 @functools.cache
@@ -22,7 +22,9 @@ def layout_constants() -> SimpleNamespace:
     Attribute names drop the ``MOE_A2A_`` prefix of the C++ constants, e.g.
     ``layout_constants().COMBINE_INPUT_OFFSET_INDEX`` or ``.MAX_RANKS``.
     """
-    names, values = get_nvlink_one_sided_module().moe_a2a_get_metainfo_index_pairs()
+    names, values = (
+        get_nvlink_one_sided_alltoall_module().moe_a2a_get_metainfo_index_pairs()
+    )
     return SimpleNamespace(
         **{
             str(name).removeprefix("MOE_A2A_"): int(value)

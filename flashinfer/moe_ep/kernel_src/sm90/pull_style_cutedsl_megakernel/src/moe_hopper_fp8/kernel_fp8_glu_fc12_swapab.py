@@ -419,6 +419,14 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             stride=(1, self.wgmma_warpgroup_count),
         )
 
+    @cute.jit
+    def _allocate_weight_aux_smem(self, smem, layout, tidx):
+        return smem.allocate_tensor(
+            element_type=self._weight_aux_smem_dtype(),
+            layout=layout,
+            byte_alignment=16,
+        )
+
     def _bind_static_fc1_weight(
         self,
         fc1_weight: cute.Tensor,
@@ -2004,10 +2012,8 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             weight_sf_smem_layout_staged = (
                 self._weight_aux_smem_layout_staged()
             )
-            sWeightSf = smem.allocate_tensor(
-                element_type=self._weight_aux_smem_dtype(),
-                layout=weight_sf_smem_layout_staged,
-                byte_alignment=16,
+            sWeightSf = self._allocate_weight_aux_smem(
+                smem, weight_sf_smem_layout_staged, tidx
             )
         else:
             sWeightSf = sB

@@ -69,6 +69,10 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
             return x
         return pack_mxfp8_dispatch_payload(x)
 
+    @property
+    def packs_dispatch_payload(self) -> bool:
+        return self._mxfp8_dispatch
+
     def preprocess_weights(
         self,
         weights: MoEWeightPack,
@@ -133,6 +137,7 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
                 ctx.recv_topk_weights,
                 num_local_experts=self._moe_config.experts.local_num_experts,
                 local_expert_offset=offset,
+                num_experts=self._moe_config.routing.num_experts,
                 quant=quant,
                 per_token_activation=per_token_activation,
                 mxfp8_dispatch=self._mxfp8_dispatch,

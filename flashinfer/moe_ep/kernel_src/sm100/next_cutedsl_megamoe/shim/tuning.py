@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Host-only candidate generation for Blackwell GenPhase configuration tuning.
+"""Candidate generation for Blackwell standard and GenPhase kernels.
 
 The estimate ranks the first candidate; it is not a measured performance
 guarantee. Collective tuning must validate and time candidates on the actual
@@ -146,3 +146,108 @@ def sm100_genphase_candidates(
             "no admitted Blackwell GenPhase candidates satisfy the constraints"
         )
     return candidates
+
+
+STANDARD_KNOB_KEYS = (
+    "mma_tiler_mnk",
+    "cluster_shape_mn",
+    "fallback_cluster_shape_mn",
+    "schedule_policy",
+    "work_id_mode",
+    "fc2_use_bulk",
+    "fc2_tma_stages",
+    "epi_flag_batches",
+    "token_in_flag_batch",
+    "token_back_mode",
+    "reduce_topk_in_kernel",
+)
+
+
+def knob_keys(config):
+    return KNOB_KEYS if config.kernel_variant == "genphase" else STANDARD_KNOB_KEYS
+
+
+def is_valid_sm100_knobs(knobs, config):
+    if config.kernel_variant == "genphase":
+        return is_valid_sm100_genphase_knobs(knobs, config)
+    if unknown := set(knobs) - set(STANDARD_KNOB_KEYS):
+        raise ValueError(f"unknown Blackwell standard knob keys: {sorted(unknown)}")
+    try:
+        dataclasses.replace(config, **knobs)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def sm100_standard_candidates(config, *, allow_nondeterministic=False):
+    """Sweep tile, launch, epilogue batching and FC2 stores at fixed numerics.
+
+    Keep the caller's initial configuration in the grid. In-kernel reduction
+    is opt-in and cannot replace a custom or persistent finalizer.
+    """
+    base = {key: getattr(config, key) for key in STANDARD_KNOB_KEYS}
+    base["mma_tiler_mnk"] = config.resolved_mma_tiler_mnk
+    proposed = [base]
+    reduction = (
+        (False, True)
+        if (
+            allow_nondeterministic
+            and config.combine_dtype == "bf16"
+            and config.apply_routing_weights_before_fc2
+            and not config.use_custom_finalize
+            and not config.use_persistent_finalize_kernel
+        )
+        else (False,)
+    )
+    for tile_n in (128, 256):
+        for cluster, fallback, schedule, work in (
+            ((2, 1), None, ("grouped", None), "grid_stride"),
+            ((4, 1), (2, 1), ("phase_interleave", None), "atomic_counter"),
+        ):
+            for epi in ((1, 4), (2, 4)):
+                for bulk in (False, True):
+                    for reduce in reduction:
+                        proposed.append(
+                            dict(
+                                # K128 admits both N tiles on Blackwell. Keep
+                                # the caller's original K depth in base above.
+                                mma_tiler_mnk=(256, tile_n, 128),
+                                cluster_shape_mn=cluster,
+                                fallback_cluster_shape_mn=fallback,
+                                schedule_policy=schedule,
+                                work_id_mode=work,
+                                fc2_use_bulk=bulk,
+                                fc2_tma_stages=2 if bulk else None,
+                                epi_flag_batches=epi,
+                                token_in_flag_batch=1,
+                                token_back_mode="epi_warps",
+                                reduce_topk_in_kernel=reduce,
+                            )
+                        )
+    candidates = []
+    for knobs in proposed:
+        if knobs["reduce_topk_in_kernel"] and not allow_nondeterministic:
+            continue
+        if knobs not in candidates and is_valid_sm100_knobs(knobs, config):
+            candidates.append(knobs)
+    if not candidates:
+        raise ValueError("no valid Blackwell standard tuning candidates")
+    return candidates
+
+
+def sm100_schedule_candidates(base, config):
+    """Sweep phase-interleave hints and token-input batching at fixed geometry."""
+    return [
+        knobs
+        for hint in (None, 3, 4, 6)
+        for batch in (1, 4)
+        if is_valid_sm100_knobs(
+            knobs := {
+                **base,
+                "schedule_policy": ("phase_interleave", hint),
+                "work_id_mode": "atomic_counter",
+                "token_in_flag_batch": batch,
+            },
+            config,
+        )
+    ]

@@ -159,6 +159,57 @@ _BASE_TACTICS = (
         fold_producer_warps=True,
     ),
     _tactic((256, 16, 256), group_hint=512, stages=1),
+    # Keep a folded N64 option when intermediate is not divisible by K256.
+    # The complete producer/publication combination was measured on H100/H200.
+    _tactic(
+        (256, 64, 128),
+        group_hint=330,
+        stages=1,
+        cluster=(1, 1, 1),
+        active_dispatch_warps=1,
+        fc1_early_done_publish=True,
+        fold_producer_warps=True,
+    ),
+    # H200 token sweeps favor N16 at small loads and different folded N64
+    # scheduling groups at larger loads; keep these as autotune candidates.
+    _tactic(
+        (256, 16, 128),
+        group_hint=330,
+        stages=1,
+        cluster=(1, 1, 1),
+        active_dispatch_warps=2,
+        fc1_store_offload=True,
+    ),
+    _tactic(
+        (256, 64, 128),
+        group_hint=264,
+        stages=1,
+        cluster=(1, 1, 1),
+        active_dispatch_warps=1,
+        fc1_early_done_publish=True,
+        fold_producer_warps=True,
+    ),
+    _tactic(
+        (256, 64, 128),
+        group_hint=132,
+        stages=1,
+        cluster=(1, 1, 1),
+        active_dispatch_warps=1,
+        fc1_early_done_publish=True,
+        fold_producer_warps=True,
+    ),
+    dict(
+        _tactic(
+            (256, 64, 128),
+            group_hint=132,
+            stages=1,
+            cluster=(1, 2, 1),
+            active_dispatch_warps=1,
+            fc1_early_done_publish=True,
+            fold_producer_warps=True,
+        ),
+        tail_split_pairs=True,
+    ),
 )
 
 # Indices into _BASE_TACTICS for the token buckets above.

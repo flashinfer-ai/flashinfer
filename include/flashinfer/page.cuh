@@ -329,6 +329,26 @@ __device__ __forceinline__ void nvfp4_append_quantize_block(
         precise_rounding ? amax * __frcp_rn(6.0f * global_scale) : amax / (6.0f * global_scale);
   }
   __nv_fp8_e4m3 sf_fp8 = __nv_fp8_e4m3(sf_value);
+#ifdef FLASHINFER_NVFP4_APPEND_4OVER6
+  // page_nvfp4_4over6 also tries the block scale mapping amax to 4, kept on a strictly lower MSE.
+  auto error = [&](float sf) {
+    const float scale =
+        precise_rounding ? __frcp_rn(sf * global_scale) : 1.0f / (sf * global_scale);
+    float sum = 0.0f;
+#pragma unroll
+    for (uint32_t i = 0; i < 16; ++i) {
+      const uint32_t level = nvfp4_append_quantize_e2m1(values[i] * scale) & 0x7;
+      const float mag = level < 4 ? 0.5f * level : (level < 6 ? level - 2.0f : 2.0f * level - 8.0f);
+      const float diff = mag * sf * global_scale - fabsf(values[i]);
+      sum += diff * diff;
+    }
+    return sum;
+  };
+  const __nv_fp8_e4m3 sf4_fp8 = __nv_fp8_e4m3(sf_value * 1.5f);
+  if (error(static_cast<float>(sf4_fp8)) < error(static_cast<float>(sf_fp8))) {
+    sf_fp8 = sf4_fp8;
+  }
+#endif
   *sf_out = sf_fp8.__x;
 
   const float sf_rounded = static_cast<float>(sf_fp8);

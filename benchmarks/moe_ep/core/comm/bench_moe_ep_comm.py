@@ -24,10 +24,16 @@ Launch on one node, for example:
         --backend nvlink_one_sided --profile deepseek_v4_pro --perfect_router \\
         --kernel_breakdown --iter_stats -b 1 -e 1024 -f 2 --output_file out.json
 
-    # Pin nvlink_one_sided to its CFT counted-write transport (or "off" for the
-    # fence transport); "auto" leaves the choice to the backend.
+    # Pin nvlink_one_sided to its CFT counted-write transport ("off": no CFT, so
+    # small steps take the Lamport transport unless --lamport off); "auto" leaves
+    # the choice to the backend.
     torchrun --standalone --nproc-per-node=8 benchmarks/moe_ep/core/comm/bench_moe_ep_comm.py \\
         --backend nvlink_one_sided --profile kimi_k3 --cft on -b 1 -e 1024 -f 2
+
+    # Compare nvlink_one_sided with and without its Lamport transport, which takes
+    # the small steps ahead of CFT ("auto" turns it off under --cft on).
+    torchrun --standalone --nproc-per-node=8 benchmarks/moe_ep/core/comm/bench_moe_ep_comm.py \\
+        --backend nvlink_one_sided --profile deepseek_v3 --lamport off -b 1 -e 128 -f 2
 
 Omit --backend to benchmark every backend available on all ranks. Multi-node
 runs use the usual torchrun rendezvous flags instead of --standalone.
@@ -51,12 +57,14 @@ FP4_E2M1_MAX = 6.0
 DISPATCH_FORMATS = {
     "bf16": None,
     "fp8": "FP8PerTensor",
+    "fp8_block_scale": "DeepSeekFp8",
     "mxfp8": "MXFP8",
     "nvfp4": "NVFP4",
 }
 QUANT_FORMATS = tuple(DISPATCH_FORMATS)
-# NVLinkOneSidedConfig.cft for each --cft choice.
+# NVLinkOneSidedConfig.cft and .lamport for each --cft / --lamport choice.
 _CFT_MODES = {"auto": None, "on": True, "off": False}
+_LAMPORT_MODES = {"auto": None, "on": True, "off": False}
 
 
 @dataclass(frozen=True)
@@ -105,7 +113,9 @@ def _backend_configs(args: argparse.Namespace) -> Dict[str, Callable[[], Any]]:
     low_precision = bool(args.use_low_precision_combine)
     return {
         "nvlink_one_sided": lambda: NVLinkOneSidedConfig(
-            use_low_precision_combine=low_precision, cft=_CFT_MODES[args.cft]
+            use_low_precision_combine=low_precision,
+            cft=_CFT_MODES[args.cft],
+            lamport=_LAMPORT_MODES[args.lamport],
         ),
         "cake": lambda: CakeAlltoAllConfig(use_low_precision_combine=low_precision),
         "nvlink_two_sided": NVLinkTwoSidedConfig,
@@ -151,6 +161,17 @@ def quantize_fp8_per_tensor(x: torch.Tensor) -> Tuple[torch.Tensor, None]:
     """FP8 E4M3 with one per-tensor scale; the scalar scale is not dispatched."""
     amax = x.abs().amax().float().clamp(min=1e-12)
     return (x.float() * (FP8_E4M3_MAX / amax)).to(torch.float8_e4m3fn), None
+
+
+def quantize_fp8_block_scale(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """DeepSeek FP8: E4M3 values with one FP32 scale per 128 elements."""
+    num_tokens, hidden = x.shape
+    if hidden % 128:
+        raise ValueError(f"fp8_block_scale needs hidden_size % 128 == 0, got {hidden}")
+    blocks = x.float().view(num_tokens, hidden // 128, 128)
+    scales = blocks.abs().amax(-1, keepdim=True).clamp(min=1e-12) / FP8_E4M3_MAX
+    values = (blocks / scales).to(torch.float8_e4m3fn)
+    return values.view(num_tokens, hidden), scales.squeeze(-1)
 
 
 def quantize_mxfp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -208,6 +229,8 @@ def quantize_input(
         return x, None
     if quant == "fp8":
         return quantize_fp8_per_tensor(x)
+    if quant == "fp8_block_scale":
+        return quantize_fp8_block_scale(x)
     if quant == "mxfp8":
         return quantize_mxfp8(x)
     if quant == "nvfp4":
@@ -503,7 +526,7 @@ def _time_dispatch_and_combine(
             topk_ids,
             topk_weights,
             hidden_states_scale=hidden_states_scale,
-            max_tokens_per_rank=step_max_tokens,
+            runtime_max_tokens_per_rank=step_max_tokens,
         )
         return received.hidden_states
 
@@ -767,11 +790,22 @@ def parse_args() -> argparse.Namespace:
         "to its token-count limits), on (every supported step) or off.",
     )
     parser.add_argument(
+        "--lamport",
+        choices=sorted(_LAMPORT_MODES),
+        default="auto",
+        help="Lamport transport of nvlink_one_sided, which takes the small steps "
+        "ahead of CFT: auto (where supported; off under --cft on), on (not with "
+        "--cft on) or off.",
+    )
+    parser.add_argument(
         "--no_cuda_graph",
         action="store_true",
         help="Run eagerly instead of replaying one CUDA graph.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.lamport == "on" and args.cft == "on":
+        parser.error("--lamport on and --cft on both ask for every eligible step")
+    return args
 
 
 def _local_batch_sizes(args: argparse.Namespace) -> List[int]:
@@ -877,6 +911,7 @@ def main() -> None:
         "perfect_router": bool(args.perfect_router),
         "use_low_precision_combine": bool(args.use_low_precision_combine),
         "cft": args.cft,
+        "lamport": args.lamport,
         "random_seed": int(args.random_seed),
         "device": torch.cuda.get_device_name(device),
         "cuda_graph": not args.no_cuda_graph,
@@ -922,10 +957,11 @@ def main() -> None:
 
         for local_num_tokens in local_batch_sizes:
             step_max_tokens = max(_allgather(int(local_num_tokens)))
-            if not comm.is_workload_feasible(step_max_tokens):
+            if step_max_tokens > comm.params.max_tokens_per_rank:
                 _print_rank0(
                     f"[bench_moe_ep_comm] Skipping {backend_name} @ "
-                    f"local_batch_size={local_num_tokens}: workload not feasible."
+                    f"local_batch_size={local_num_tokens}: exceeds "
+                    f"max_tokens_per_rank={comm.params.max_tokens_per_rank}."
                 )
                 continue
             hidden_states, hidden_states_scale, topk_ids, topk_weights = _make_inputs(
