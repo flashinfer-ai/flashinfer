@@ -1623,7 +1623,7 @@ def test_gemm_launches_use_local_expert_count():
         "build_fp8_block_scale_launch_io": 2,
         "build_fp8_per_tensor_launch_io": 2,
         "build_mxfp4_bf16_launch_io": 2,
-        "build_mxfp4_mxfp8_launch_io": 4,
+        "build_mxfp4_mxfp8_launch_io": 3,
         "build_nvfp4_launch_io": 2,
     }
     direct_values = [
