@@ -2471,15 +2471,15 @@ class FmhaDecodeConfig:
     def _in_grouped_q_selection_scope(self) -> bool:
         """Whether the grouped-Q cost model may select this launch's Q tile.
 
-        It covers fixed multi-token grouped launches over paged K/V with 4- to
-        128-token pages and no attention sinks; the selector also requires the
-        caller to leave the MMA and launch fields unpinned.
+        It covers multi-token grouped launches, fixed or packed Q, over paged
+        K/V with 4- to 128-token pages and no attention sinks; a packed launch
+        scores its maximum Q length, which sizes its grid. The selector also
+        requires the caller to leave the MMA and launch fields unpinned.
         """
         return (
             self.groups_tokens_heads_q
             and self.use_paged_kv
             and self.num_tokens_per_page in (4, 8, 16, 32, 64, 128)
-            and not self.use_variable_seqlens_q
             and self.max_seq_len_q > 1
             and not self.use_attention_sinks
         )
@@ -2499,9 +2499,9 @@ class FmhaDecodeConfig:
         automatic selection, with or without a cost comparison, takes a recipe
         only on the launches it is qualified for. Paged FP8 qualifies the
         established cost-model recipes everywhere and every paged FP8 recipe
-        on the fixed multi-token launches that the grouped-Q cost model
-        scores. Paged 16-bit Q128 qualifies those launches only. Single-token
-        and variable-length launches keep their previous tiles.
+        on the multi-token launches that the grouped-Q cost model scores.
+        Paged 16-bit Q128 qualifies those launches only. Single-token launches
+        keep their previous tiles.
         """
         if not self.supports_grouped_keeps:
             return False
@@ -4646,10 +4646,10 @@ def _apply_auto_grouped_q_mma_config(
     max_splits_kv: int | None,
     split_kv: bool = True,
 ) -> GroupedQLaunchCandidate | None:
-    """Select a legal fixed multi-Q MMA and KV-split recipe when unpinned.
+    """Select a legal multi-Q MMA and KV-split recipe when unpinned.
 
-    SQ1, packed/variable Q, explicit launch modes, ungrouped layouts, and
-    caller-provided MMA fields retain the existing path. Explicit fanout
+    SQ1, explicit launch modes, ungrouped layouts, and caller-provided MMA
+    fields retain the existing path. Explicit fanout
     controls bypass this selector together with explicit launch and MMA fields.
     Mixed-precision candidates use SwapsMmaAb since Keeps is not supported yet.
     """

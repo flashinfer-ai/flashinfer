@@ -14,7 +14,7 @@ choice described under [Query pairing](#query-pairing), there is no public
 scheduler or tuning knob, and there is no fallback to another attention
 backend.
 
-Fixed multi-query paged plans compare legal Swaps Q8/Q16/Q32 and Keeps Q64/Q128 candidates across page sizes 4, 8, 16, 32, 64, and 128. Each candidate passes the shared profile validator; eligibility does not imply every dtype, MMA orientation, or reducer supports every combination. Sliding-window scoring uses the visible union, bounded by `window_size + Q - 1`, instead of the model context capacity. Partial final query groups remain candidates: the cost model uses the ceil-divided Q grid and complete per-CTA cost. Q1, packed variable-Q, and explicitly pinned choices retain their existing selection paths. Windowed split-KV remains disabled.
+Fixed and packed multi-query paged plans compare legal Swaps Q8/Q16/Q32 and Keeps Q64/Q128 candidates across page sizes 4, 8, 16, 32, 64, and 128. Each candidate passes the shared profile validator; eligibility does not imply every dtype, MMA orientation, or reducer supports every combination. Sliding-window scoring uses the visible union, bounded by `window_size + Q - 1`, instead of the model context capacity. Partial final query groups remain candidates: the cost model uses the ceil-divided Q grid and complete per-CTA cost. A packed plan is scored at its maximum Q length, which sizes its grid. Q1 and explicitly pinned choices retain their existing selection paths. Windowed split-KV remains disabled.
 
 D192 Keeps retains 128-wide SMEM stages while issuing PV N128+N64 into 192 logical O columns. Swaps keeps its padded PV computation and transposed output staging; output stores mask channels beyond D192. `smem_q_head_dim` expresses the 128-byte TMA fragment alignment: 192 elements for FP16/BF16, 256 for FP8. It does not widen the public Q tensor.
 
@@ -156,7 +156,7 @@ supported. Rows may have padding between them; each row must be contiguous.
 | Head dimension | 64, 128, 192, or 256 |
 | Fixed Q length | Any positive integer representable by the metadata and tensor extents |
 | Packed Q | Positive per-request lengths no greater than a positive static maximum |
-| Head mapping | MHA/GQA; `Hq` must be divisible by `Hkv`, with `1 <= Hq/Hkv <= 128`. Qualified fixed-Q FP8 D64/D128/D256 paged profiles use grouped Swaps Q8/Q16/Q32 through ratio 32, Keeps Q64 through ratio 64, and Keeps Q128 through ratio 128, which also runs packed Q on direct launches. FP16/BF16 and QK-BF16/PV-FP8 D128 plans add grouped Keeps Q128 on direct launches; automatic selection takes it for fixed multi-token launches with page sizes 4 to 128. Paged grouped Keeps profiles run a causal sliding window on direct launches only. |
+| Head mapping | MHA/GQA; `Hq` must be divisible by `Hkv`, with `1 <= Hq/Hkv <= 128`. Qualified fixed-Q FP8 D64/D128/D256 paged profiles use grouped Swaps Q8/Q16/Q32 through ratio 32, Keeps Q64 through ratio 64, and Keeps Q128 through ratio 128, which also runs packed Q on direct launches. FP16/BF16 and QK-BF16/PV-FP8 D128 plans add grouped Keeps Q128 on direct launches; automatic selection takes it for multi-token launches, fixed or packed Q, with page sizes 4 to 128. Paged grouped Keeps profiles run a causal sliding window on direct launches only. |
 | Q/K dtype | Matching `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
 | V dtype | Equal to Q/K, or `torch.float8_e4m3fn` with `torch.bfloat16` Q/K (`v_data_type`; defaults to `k_data_type`) |
 | Output dtype | `torch.float16` for `torch.float16` input; `torch.bfloat16` for `torch.bfloat16` input; `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` for `torch.float8_e4m3fn` input |
@@ -208,9 +208,9 @@ bound the kernel and the paired grid needs fewer CTA waves.
 `plan()`, the one-shot and prepared launches, and workspace sizing take
 `query_paired`; pass the same value to workspace sizing as to the launch:
 
-- `None` (default): the automatic tile selection of fixed multi-token
-  launches on 4- to 128-token pages scores the paired tile with the
-  unpaired ones and pairs the plan when that costs less.
+- `None` (default): the automatic tile selection of multi-token launches,
+  fixed or packed Q, on 4- to 128-token pages scores the paired tile with
+  the unpaired ones and pairs the plan when that costs less.
 - `True`: pair whenever the launch supports it: an FP16, BF16,
   QK-BF16/PV-FP8, FP8, or Sage recipe with head dim 128 (64 or 128 for
   FP8), at least two Q tiles in a request, and enough unpaired Q tiles to

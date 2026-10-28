@@ -5991,9 +5991,9 @@ def test_attention_ts_decode_auto_config_selects_kv256(monkeypatch, dtype):
             32,
             128,
             False,
-            1,
-            False,
-            ("q", "kv", "launch"),
+            2,
+            True,
+            ("q", "kv"),
             id="variable-q",
         ),
         pytest.param(
@@ -7852,9 +7852,10 @@ def test_attention_ts_decode_packed_q_sliding_window_clc_persistent():
     """Run live packed offsets and sliding bounds through the CLC scheduler."""
 
     # The scheduler picks CLC persistence only when the direct launch exceeds
-    # one wave, so scale the 22-request shape (sized for 148 SMs) with the SM count.
+    # one wave: 88 requests of up to seven tokens take two Q32 tiles each, 176
+    # CTAs on 148 SMs. Scale the request count with the SM count.
     sm_count = torch.cuda.get_device_properties("cuda").multi_processor_count
-    num_requests = 22 * -(-sm_count // 148)
+    num_requests = 88 * -(-sm_count // 148)
     q_lens = tuple((3, 5, 7)[batch_idx % 3] for batch_idx in range(num_requests))
     max_seq_len_q = max(q_lens)
     case = _make_decode_case(
