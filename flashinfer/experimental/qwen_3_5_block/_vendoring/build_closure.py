@@ -28,7 +28,7 @@ ap.add_argument("--fe", required=True)
 ap.add_argument("--traces", required=True)
 ap.add_argument("--out", required=True)
 ap.add_argument("--tables", default=None)
-ap.add_argument("--commit", default="d8b0a7ed5")
+ap.add_argument("--commit", default="977757763")
 args = ap.parse_args()
 FE = Path(args.fe)
 PKG = FE / "python" / "cudnn"
@@ -86,6 +86,7 @@ EXCLUDE = {
     "cudnn._compiled_module": "the nanobind extension (.so): NOT vendored; its Python-visible surface is shimmed",
     "cudnn.graph": "the classic graph API facade (graph / jit / graph_cache): the block never uses it",
     "cudnn.gated_attention_block.api_bwd": "the training half (backward); dropped from the vendored package __init__ (patch P0)",
+    "cudnn.gated_attention_block.kernels.qsa_kv_upcast": "the e4m3 KV-cache arm of the block-sparse decode mode (the gathered cast + the dense decode tile over a caller list): lazily imported by gated_attention_block/api.py under kv_cache_dtype=torch.float8_e4m3fn, which the Qwen 3.8 decode form declines by name until the sparse core's in-kernel dequant arm lands",
 }
 EXTRA = {
     # the template FILES the route executes by path are modules of the tree too -- vendored as files:

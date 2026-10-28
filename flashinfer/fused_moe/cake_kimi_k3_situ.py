@@ -403,6 +403,10 @@ def _validate_contract(options, *, size_query=False):
 
 def _cake_situ_workspace_size(options):
     # No device query, module load, CUDA allocation or initialization.
+    from .cake_w4a16 import _cake_w4a16_workspace_size, is_cake_w4a16_form
+
+    if is_cake_w4a16_form(options):
+        return _cake_w4a16_workspace_size(options)
     _validate_contract(options, size_query=True)
     max_tokens = options["max_num_tokens"]
     # ``_workspace_layout`` is not monotonic in ``num_tokens``: the token counts
@@ -955,6 +959,10 @@ def _cake_situ_stage_bindings(options, prepared):
 
 
 def _cake_situ_fused_moe(options):
+    from .cake_w4a16 import _cake_w4a16_fused_moe, is_cake_w4a16_form
+
+    if is_cake_w4a16_form(options):
+        return _cake_w4a16_fused_moe(options)
     _validate_contract(options)
     prepared = _prepared(options["workspace_buffer"], options["input"].shape[0])
     call = _cake_situ_call_args(options, prepared)

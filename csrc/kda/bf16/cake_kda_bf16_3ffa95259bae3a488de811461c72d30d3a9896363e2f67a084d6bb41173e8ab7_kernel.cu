@@ -1758,6 +1758,7 @@ kernel_cake_kda_bf16_3ffa95259bae3a488de811461c72d30d3a9896363e2f67a084d6bb41173
                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
                         : "=f"(_tmem_load_3[0]), "=f"(_tmem_load_3[1]), "=f"(_tmem_load_3[2]), "=f"(_tmem_load_3[3]), "=f"(_tmem_load_3[4]), "=f"(_tmem_load_3[5]), "=f"(_tmem_load_3[6]), "=f"(_tmem_load_3[7]), "=f"(_tmem_load_3[8]), "=f"(_tmem_load_3[9]), "=f"(_tmem_load_3[10]), "=f"(_tmem_load_3[11]), "=f"(_tmem_load_3[12]), "=f"(_tmem_load_3[13]), "=f"(_tmem_load_3[14]), "=f"(_tmem_load_3[15]), "=f"(_tmem_load_3[16]), "=f"(_tmem_load_3[17]), "=f"(_tmem_load_3[18]), "=f"(_tmem_load_3[19]), "=f"(_tmem_load_3[20]), "=f"(_tmem_load_3[21]), "=f"(_tmem_load_3[22]), "=f"(_tmem_load_3[23]), "=f"(_tmem_load_3[24]), "=f"(_tmem_load_3[25]), "=f"(_tmem_load_3[26]), "=f"(_tmem_load_3[27]), "=f"(_tmem_load_3[28]), "=f"(_tmem_load_3[29]), "=f"(_tmem_load_3[30]), "=f"(_tmem_load_3[31])
                         : "r"(taddr + 64 + (unsigned int)tmem_row_base + (unsigned int)(state_col_block_2 * 32)));
+                    asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                     {
                         #pragma unroll
                         for (int state_vec = 0; state_vec < 4; state_vec++) {
@@ -2220,6 +2221,7 @@ kernel_cake_kda_bf16_3ffa95259bae3a488de811461c72d30d3a9896363e2f67a084d6bb41173
                     :: "r"(tmem_tmem_out), "r"(_mma_b_lo_10), "r"(tmem_tmem_u2_inp), "r"(1));
                 elect_commit(final_ready_addr + (mma_stage) * 8);
                 {
+                    __syncwarp();
                     if (elect_sync()) {
                         asm volatile("cp.async.bulk.wait_group.read 0;");
                         mbarrier_arrive(raw_inputs_free_addr + (mma_stage) * 8);
@@ -4278,6 +4280,7 @@ kernel_cake_kda_bf16_3ffa95259bae3a488de811461c72d30d3a9896363e2f67a084d6bb41173
                     int byte_off_4 = (int)prep_stage * 41984 + (prep_local_warp * 16 + 8 + lane_row) * 128 + prep_local_warp * 16 * 2;
                     int swizzled_off_5 = byte_off_4 ^ (byte_off_4 >> 7 & 7) << 4;
                     int o_addr = smem_inv_work_addr + (unsigned int)swizzled_off_5;
+                    __syncwarp();
                     uint32_t _stmatrix_addr_10 = static_cast<uint32_t>((unsigned long long)o_addr);
                     asm volatile("stmatrix.sync.aligned.m8n8.x1.shared.b16 [%0], {%1};\n"
                         :: "r"(_stmatrix_addr_10), "r"(*reinterpret_cast<const uint32_t*>(&o_bf16[0]))

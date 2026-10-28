@@ -33,8 +33,8 @@ capacity without another collective. Calls with at most 512 padded local
 rows at world sizes 4 and 8 whose ``N`` is within the route's width ceiling
 (``loader.sm_push_max_cols``: 10240 at 128 padded rows, 4096 at 512), and the
 calls in the device architecture's SM push bands
-(``loader.SM_PUSH_BANDS_BY_ARCH``: on ``sm_103a`` the eight-rank calls of
-exactly 1024 padded rows with ``N <= 1619``), replace the copy-engine pushes
+(``loader.SM_PUSH_BANDS_BY_ARCH``: on both architectures the eight-rank calls
+of exactly 1024 padded rows with ``N <= 1619``), replace the copy-engine pushes
 with one SM push kernel chained to the main kernel through programmatic
 dependent launch; wider GEMMs overlap the copy-engine pushes instead.
 Every symmetric rendezvous is checked against the tensor it was returned

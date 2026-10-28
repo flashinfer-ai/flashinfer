@@ -86,6 +86,8 @@ def test_distinct_descriptor_or_runtime_retries(monkeypatch, change):
         output=None,
         initial_state=None,
     )
+    if change == "frontend":
+        monkeypatch.setattr(la.cudnn, "__version__", "1.31.0")
     la._try_cudnn_auto(decline, q, **options)
     la._try_cudnn_auto(decline, q.clone(), **options)
     assert len(calls) == 1

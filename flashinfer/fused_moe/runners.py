@@ -4968,9 +4968,18 @@ class CuteDslRunner(MoERunner):
     supported_quant_variants = (
         (QuantFormat.NVFP4, QuantFormat.NVFP4),
         (QuantFormat.MXFP4, QuantFormat.MXFP8),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8),
         (QuantFormat.NVFP4, QuantFormat.BF16),
     )
-    supported_activation_classes = (SwiGLU, GeGLUTanh, ReLU2, SiTU)
+    supported_activation_classes_by_quant: ClassVar[
+        dict[tuple[QuantFormat, QuantFormat], tuple[type[ActivationConfig], ...]]
+    ] = {
+        (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU, GeGLUTanh, ReLU2, SiTU),
+        # MXFP8 activations: _check_support() rejects SiTU.
+        (QuantFormat.MXFP4, QuantFormat.MXFP8): (SwiGLU, GeGLUTanh, ReLU2),
+        (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, GeGLUTanh, ReLU2),
+        (QuantFormat.NVFP4, QuantFormat.BF16): (SwiGLU, GeGLUTanh, ReLU2, SiTU),
+    }
     # The GEMM2 input is quantized by nvfp4_quantize_per_token_cute_dsl, which
     # takes the recipe as an argument; _check_support() below narrows this to
     # the per-token path, the only one that runs that quantizer.
@@ -5003,16 +5012,26 @@ class CuteDslRunner(MoERunner):
                 f"{self.config.quant.weight.name}×{self.config.quant.activation.name} "
                 "activation scales."
             )
-        mxfp4_mxfp8 = self.config.quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
-        if mxfp4_mxfp8 and isinstance(self.config.activation, SiTU):
-            raise NotImplementedError("CuTe-DSL W4A8 does not support SiTU.")
-        if mxfp4_mxfp8 and not self.config.finalize.use_fused_finalize:
-            raise NotImplementedError("CuTe-DSL W4A8 requires fused finalize.")
-        if mxfp4_mxfp8 and hasattr(self, "device"):
+        # W4A8 (MXFP4 weights) and MXFP8 (MXFP8 weights) share the MXFP8
+        # activation path and its limits.
+        mxfp8_act = self.config.quant.pair in (
+            (QuantFormat.MXFP4, QuantFormat.MXFP8),
+            (QuantFormat.MXFP8, QuantFormat.MXFP8),
+        )
+        mode = (
+            "MXFP8"
+            if self.config.quant.pair == (QuantFormat.MXFP8, QuantFormat.MXFP8)
+            else "W4A8"
+        )
+        if mxfp8_act and isinstance(self.config.activation, SiTU):
+            raise NotImplementedError(f"CuTe-DSL {mode} does not support SiTU.")
+        if mxfp8_act and not self.config.finalize.use_fused_finalize:
+            raise NotImplementedError(f"CuTe-DSL {mode} requires fused finalize.")
+        if mxfp8_act and hasattr(self, "device"):
             from ..utils import get_compute_capability
 
             if get_compute_capability(self.device) == (10, 7):
-                raise NotImplementedError("CuTe-DSL W4A8 does not support SM107.")
+                raise NotImplementedError(f"CuTe-DSL {mode} does not support SM107.")
         if (
             isinstance(self.config.quant.nvfp4_4over6, NVFP44Over6Config)
             and not self.config.quant.per_token_scale
@@ -5116,6 +5135,7 @@ class CuteDslRunner(MoERunner):
         if self.config.quant.pair in (
             (QuantFormat.NVFP4, QuantFormat.NVFP4),
             (QuantFormat.MXFP4, QuantFormat.MXFP8),
+            (QuantFormat.MXFP8, QuantFormat.MXFP8),
         ):
             self._inner = CuteDslFusedMoERunner(
                 forward_impl=_cute_dsl_fused_moe_impl,
@@ -5126,11 +5146,11 @@ class CuteDslRunner(MoERunner):
                 use_fused_finalize=self.config.finalize.use_fused_finalize,
                 enable_pdl=enable_pdl,
                 use_per_token_activation=bool(self.config.quant.per_token_scale),
-                quant_mode=(
-                    "w4a8"
-                    if self.config.quant.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
-                    else "w4a4"
-                ),
+                quant_mode={
+                    (QuantFormat.NVFP4, QuantFormat.NVFP4): "w4a4",
+                    (QuantFormat.MXFP4, QuantFormat.MXFP8): "w4a8",
+                    (QuantFormat.MXFP8, QuantFormat.MXFP8): "mxfp8",
+                }[self.config.quant.pair],
                 **_cute_dsl_activation_kwargs(self.config.activation),
             )
         elif self.config.quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16):
@@ -5226,13 +5246,16 @@ class CuteDslRunner(MoERunner):
             in (
                 (QuantFormat.NVFP4, QuantFormat.NVFP4),
                 (QuantFormat.MXFP4, QuantFormat.MXFP8),
+                (QuantFormat.MXFP8, QuantFormat.MXFP8),
             )
             and not use_per_token_activation
             and act.hidden_states_scale is not None
             and act.per_token_scale is None
         ):
-            is_mxfp4 = pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
-            hidden_size = act.hidden_states_q.shape[1] * (1 if is_mxfp4 else 2)
+            # MXFP8 activations (W4A8 and MXFP8): one E4M3 byte per element and
+            # row-major E8M0 scales, no GEMM2 input scale.
+            mxfp8_act = pair != (QuantFormat.NVFP4, QuantFormat.NVFP4)
+            hidden_size = act.hidden_states_q.shape[1] * (1 if mxfp8_act else 2)
             moe_output = act.hidden_states_q.new_empty(
                 (num_tokens, hidden_size), dtype=torch.bfloat16
             )
@@ -5240,15 +5263,15 @@ class CuteDslRunner(MoERunner):
                 act.hidden_states_q,
                 (
                     act.hidden_states_scale
-                    if is_mxfp4
+                    if mxfp8_act
                     else act.hidden_states_scale.unsqueeze(-1)
-                ).view(torch.uint8 if is_mxfp4 else act.hidden_states_scale.dtype),
+                ).view(torch.uint8 if mxfp8_act else act.hidden_states_scale.dtype),
                 act.topk_ids,
                 act.topk_weights,
                 v["w1_weight"],
                 v["w1_weight_sf"],
                 v["w1_alpha"],
-                None if is_mxfp4 else v["fc2_input_scale"],
+                None if mxfp8_act else v["fc2_input_scale"],
                 v["w2_weight"],
                 v["w2_weight_sf"],
                 v["w2_alpha"],

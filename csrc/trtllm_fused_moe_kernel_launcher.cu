@@ -575,10 +575,10 @@ struct MXINT4DABodyBuffers {
 struct MoeRunResultBuffers {
   // FFI[0] final or FC2 output.
   // Sync with flashinfer/fused_moe/core.py:_unpack_trtllm_moe_output.
-  Tensor primary_output;
-  // FFI[1] routing weights; an undefined tensor preserves the borrowed-buffer slot.
+  Optional<Tensor> primary_output;
+  // FFI[1] routing weights; an absent tensor preserves the borrowed-buffer slot.
   // Sync with flashinfer/fused_moe/core.py:_unpack_trtllm_moe_output.
-  Tensor expert_weights;
+  Optional<Tensor> expert_weights;
   // Optional next FFI item, layout map.
   // Sync with flashinfer/fused_moe/core.py:_unpack_trtllm_moe_output.
   Optional<Tensor> expanded_to_permuted_indices;
@@ -590,14 +590,14 @@ struct MoeRunResultBuffers {
   bool is_finalized{true};
 
   /** Construct a result whose stable FFI layout is fixed by its output mode. */
-  MoeRunResultBuffers(bool finalized, Tensor primary)
+  MoeRunResultBuffers(bool finalized, Optional<Tensor> primary)
       : primary_output(std::move(primary)), is_finalized(finalized) {}
 
   /** Encode the typed launch result in the existing public FFI tensor order. */
-  Array<Tensor> to_ffi() const {
-    Array<Tensor> tensors{primary_output};
+  Array<Optional<Tensor>> to_ffi() const {
+    Array<Optional<Tensor>> tensors{primary_output};
     // Unfinalized calls always reserve FFI[1] for expert weights. Some launchers borrow the
-    // caller's buffer, so the undefined tensor is intentional and Python substitutes its input.
+    // caller's buffer, so the absent tensor is intentional and Python substitutes its input.
     if (!is_finalized) {
       tensors.push_back(expert_weights);
     }
@@ -1125,13 +1125,14 @@ std::pair<int64_t, int64_t> resolveMoeTileAndConfig(
   const int64_t tile_N = config_index[0];
   const int64_t config = config_index[1];
 
-  if (tile_N == -1 || config == -1) {
+  if (tile_N == -1) {
     // Use fallback tactic
     auto const default_tile_N =
         selectDefaultTileN(ascending_supported_tile_sizes, num_tokens, top_k, num_local_experts);
     return {default_tile_N, -1};
   }
 
+  // Preserve an explicit tile even when its default configuration is requested.
   return {tile_N, config};
 }
 
@@ -1319,22 +1320,24 @@ class FusedMoeLauncher {
 
   /**
    * Scratch footprint of an ordinary run() of this tile, measured by the allocation code itself.
-   * It depends on the tile, not the tactic: every shipped batched-GEMM config needs a zero-byte
-   * workspace, so the tile's default tactic stands for all of them, and a tactic that ever needs
-   * more allocates the excess per call (see TensorAllocator). Returns 0 when the tile has no
-   * runnable tactic, since such a tile can never be selected.
+   * With tactic=-1, use the tile's default configuration and return 0 for unsupported tiles.
+   * An explicit tactic measures that configuration, returning 0 if it cannot run.
+   * Every shipped batched-GEMM config needs a zero-byte workspace, so the default
+   * configuration currently represents all configurations of a tile.
    */
-  int64_t measure_workspace_size() {
-    int64_t tactic = -1;
+  int64_t measure_workspace_size(int64_t tactic = -1) {
+    scratch_.begin_measure();
+    // Routing initializes mode flags (including DeepSeek FP8) used to select the runner.
+    // Match run()'s ordering, while counting routing scratch without device work.
+    prepare_routing();
     try {
       prepare_moe_runner(tactic);
     } catch (std::exception const&) {
       // Some advertised tiles have no kernels, or no valid tactic, for this problem; run()
       // would reject them the same way.
+      scratch_.end();
       return 0;
     }
-    scratch_.begin_measure();
-    prepare_routing();
     prepare_moe(tactic);
     int64_t const bytes = scratch_.used();
     scratch_.end();
@@ -1526,12 +1529,12 @@ class FusedMoeLauncher {
   Tensor total_num_padded_tokens;
   Tensor expanded_idx_to_permuted_idx;
   Tensor permuted_idx_to_token_idx;
-  Tensor permuted_idx_to_expanded_idx;
+  Optional<Tensor> permuted_idx_to_expanded_idx;
   // Launcher-owned routing weights, returned by run() on the do_finalize=false
-  // rows. Stays empty when a derived launcher borrows a caller-supplied buffer
+  // rows. Stays absent when a derived launcher borrows a caller-supplied buffer
   // instead, in which case only workspace.expert_weights points at it and the
   // caller must substitute its own buffer for that slot.
-  Tensor expert_weights;
+  Optional<Tensor> expert_weights;
   Tensor expert_indexes;
   Tensor expert_count_histogram;
   Tensor cta_idx_xy_to_batch_idx;
@@ -1539,8 +1542,9 @@ class FusedMoeLauncher {
   Tensor num_non_exiting_ctas;
 
   void* permuted_idx_to_expanded_idx_ptr() const {
-    return permuted_idx_to_expanded_idx.defined() ? permuted_idx_to_expanded_idx.data_ptr()
-                                                  : nullptr;
+    return permuted_idx_to_expanded_idx.has_value()
+               ? permuted_idx_to_expanded_idx.value().data_ptr()
+               : nullptr;
   }
 
   void prepare_routing_common() {
@@ -1616,7 +1620,7 @@ class FusedMoeLauncher {
   Tensor gemm2_output;
   Tensor workspace_fc1;
   Tensor workspace_fc2;
-  Tensor output;
+  Optional<Tensor> output;
   int64_t moe_tactic{-1};
   // Non-owning; points into the thread-local runner cache in prepare_moe_common().
   tensorrt_llm::kernels::trtllmgen_moe::MoE::Runner* moe_runner{nullptr};
@@ -1809,7 +1813,8 @@ class FusedMoeLauncher {
     moe_runner->run(*args, workspace, hidden_states.device().device_id, moe_stream, moe_tactic,
                     enable_pdl);
 
-    MoeRunResultBuffers result(args->do_finalize, args->do_finalize ? output : gemm2_output);
+    MoeRunResultBuffers result(args->do_finalize,
+                               args->do_finalize ? output : Optional<Tensor>(gemm2_output));
     if (!args->do_finalize) {
       result.expert_weights = FusedMoeLauncher::expert_weights;
     }
@@ -1974,7 +1979,7 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
       // surfaced to the caller verbatim on do_finalize=false. See #3595.
       FusedMoeLauncher::expert_weights =
           _alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
-      workspace.expert_weights = FusedMoeLauncher::expert_weights.data_ptr();
+      workspace.expert_weights = FusedMoeLauncher::expert_weights.value().data_ptr();
     }
   }
 
@@ -2039,7 +2044,7 @@ class Bf16MoeLauncher : public FusedMoeLauncher {
       output =
           alloc_tensor({args->num_tokens, args->hidden_size_output.value_or(args->hidden_size)},
                        dl_bfloat16, hidden_states.device());
-      args->output = output.data_ptr();
+      args->output = output.value().data_ptr();
     }
     args->output_scale = nullptr;
     args->gemm1_alpha =
@@ -2189,7 +2194,7 @@ class StagedMoeLauncher : public FusedMoeLauncher {
     bool has_precomputed_weights = expert_weights.ndim() == 2 && expert_weights.size(0) > 0;
     if (has_precomputed_weights) {
       // Caller-owned precomputed weights are consumed directly by the routing kernel.
-      // Slot 0 in collect_routing_outputs() is intentionally undefined in this
+      // Slot 0 in collect_routing_outputs() is intentionally absent in this
       // mode; Python substitutes the caller tensor for downstream use.
       workspace.expert_weights = const_cast<void*>(expert_weights.data_ptr());
     } else {
@@ -2199,7 +2204,7 @@ class StagedMoeLauncher : public FusedMoeLauncher {
       // and makes the staged finalize path consume the wrong values.
       FusedMoeLauncher::expert_weights = alloc_tensor(
           {args->num_tokens, args->top_k}, expert_weight_storage_dtype(), hidden_states.device());
-      workspace.expert_weights = FusedMoeLauncher::expert_weights.data_ptr();
+      workspace.expert_weights = FusedMoeLauncher::expert_weights.value().data_ptr();
     }
   }
 
@@ -2254,10 +2259,10 @@ class StagedMoeLauncher : public FusedMoeLauncher {
         norm_topk_prob, replay_ptr, enable_pdl);
   }
 
-  Tensor expert_weights_tensor() const { return FusedMoeLauncher::expert_weights; }
+  Optional<Tensor> expert_weights_tensor() const { return FusedMoeLauncher::expert_weights; }
 
-  Array<Tensor> collect_routing_outputs() const {
-    Array<Tensor> result;
+  Array<Optional<Tensor>> collect_routing_outputs() const {
+    Array<Optional<Tensor>> result;
     result.push_back(expert_weights_tensor());
     result.push_back(expanded_idx_to_permuted_idx);
     result.push_back(permuted_idx_to_token_idx);
@@ -2430,8 +2435,8 @@ class Fp4Nvfp4StagedMoeLauncher : public StagedMoeLauncher {
     workspace.gemm2_output_scale = nullptr;
   }
 
-  Array<Tensor> collect_routing_outputs() const {
-    Array<Tensor> result;
+  Array<Optional<Tensor>> collect_routing_outputs() const {
+    Array<Optional<Tensor>> result;
     result.push_back(expert_weights_tensor());
     result.push_back(expanded_idx_to_permuted_idx);
     result.push_back(permuted_idx_to_token_idx);
@@ -2629,8 +2634,8 @@ class Fp8PerTensorStagedMoeLauncher : public StagedMoeLauncher {
     workspace.gemm2_output_scale = nullptr;
   }
 
-  Array<Tensor> collect_routing_outputs() const {
-    Array<Tensor> result;
+  Array<Optional<Tensor>> collect_routing_outputs() const {
+    Array<Optional<Tensor>> result;
     result.push_back(expert_weights_tensor());
     result.push_back(expanded_idx_to_permuted_idx);
     result.push_back(permuted_idx_to_token_idx);
@@ -2868,8 +2873,8 @@ class Fp8BlockScaleStagedMoeLauncher : public StagedMoeLauncher {
     workspace.gemm2_output_scale = nullptr;
   }
 
-  Array<Tensor> collect_routing_outputs() const {
-    Array<Tensor> result;
+  Array<Optional<Tensor>> collect_routing_outputs() const {
+    Array<Optional<Tensor>> result;
     result.push_back(expert_weights_tensor());
     result.push_back(expanded_idx_to_permuted_idx);
     result.push_back(permuted_idx_to_token_idx);
@@ -3220,7 +3225,7 @@ std::unique_ptr<Fp8BlockScaleStagedMoeLauncher> make_fp8_block_scale_staged_laun
 
 }  // namespace
 
-Array<Tensor> trtllm_moe_run_routing(
+Array<Optional<Tensor>> trtllm_moe_run_routing(
     Optional<TensorView> const& routing_logits, Optional<TensorView> const& routing_bias,
     TensorView const& expert_indices, TensorView const& expert_weights,
     TensorView const& hidden_states, Optional<TensorView> const& gemm1_weights,
@@ -3416,7 +3421,7 @@ void trtllm_moe_run_deepseek_fp8_activation(TensorView gemm1_output, TensorView 
   sync_check_cuda_error(stream);
 }
 
-Array<Tensor> trtllm_moe_run_routing_fp4_nvfp4(
+Array<Optional<Tensor>> trtllm_moe_run_routing_fp4_nvfp4(
     Optional<TensorView> const& routing_logits, Optional<TensorView> const& routing_bias,
     TensorView const& expert_indices, TensorView const& expert_weights,
     TensorView const& hidden_states, TensorView const& hidden_states_scale,
@@ -3468,7 +3473,7 @@ Array<Tensor> trtllm_moe_run_routing_fp4_nvfp4(
   return launcher->collect_routing_outputs();
 }
 
-Array<Tensor> trtllm_moe_run_routing_fp4_mxfp4_mxfp8(
+Array<Optional<Tensor>> trtllm_moe_run_routing_fp4_mxfp4_mxfp8(
     Optional<TensorView> const& routing_logits, Optional<TensorView> const& routing_bias,
     TensorView const& expert_indices, TensorView const& expert_weights,
     TensorView const& hidden_states, TensorView const& hidden_states_scale,
@@ -3528,7 +3533,7 @@ Array<Tensor> trtllm_moe_run_routing_fp4_mxfp4_mxfp8(
   return launcher->collect_routing_outputs();
 }
 
-Array<Tensor> trtllm_moe_run_routing_fp4_mxfp4_bf16(
+Array<Optional<Tensor>> trtllm_moe_run_routing_fp4_mxfp4_bf16(
     Optional<TensorView> const& routing_logits, Optional<TensorView> const& routing_bias,
     TensorView const& expert_indices, TensorView const& expert_weights,
     TensorView const& hidden_states, Optional<TensorView> const& gemm1_weights,
@@ -3586,7 +3591,7 @@ Array<Tensor> trtllm_moe_run_routing_fp4_mxfp4_bf16(
   return launcher->collect_routing_outputs();
 }
 
-Array<Tensor> trtllm_moe_run_routing_fp8_per_tensor(
+Array<Optional<Tensor>> trtllm_moe_run_routing_fp8_per_tensor(
     Optional<TensorView> const& routing_logits, Optional<TensorView> const& routing_bias,
     TensorView const& expert_indices, TensorView const& expert_weights,
     TensorView const& hidden_states, Optional<TensorView> const& gemm1_weights,
@@ -3635,7 +3640,7 @@ Array<Tensor> trtllm_moe_run_routing_fp8_per_tensor(
   return launcher->collect_routing_outputs();
 }
 
-Array<Tensor> trtllm_moe_run_routing_fp8_block_scale(
+Array<Optional<Tensor>> trtllm_moe_run_routing_fp8_block_scale(
     Optional<TensorView> const& routing_logits, Optional<TensorView> const& routing_bias,
     TensorView const& expert_indices, TensorView const& expert_weights,
     TensorView const& hidden_states, TensorView const& hidden_states_scale,
@@ -3803,7 +3808,7 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
     } else {
       FusedMoeLauncher::expert_weights =
           _alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
-      workspace.expert_weights = FusedMoeLauncher::expert_weights.data_ptr();
+      workspace.expert_weights = FusedMoeLauncher::expert_weights.value().data_ptr();
     }
     if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
       if (is_unpacked_routing() && expert_weights.value().dtype() == dl_float32) {
@@ -3902,7 +3907,7 @@ class Fp8PerTensorLauncher : public FusedMoeLauncher {
       output =
           alloc_tensor({args->num_tokens, args->hidden_size_output.value_or(args->hidden_size)},
                        dl_bfloat16, hidden_states.device());
-      args->output = output.data_ptr();
+      args->output = output.value().data_ptr();
     }
     args->output_scale = nullptr;
 
@@ -4106,7 +4111,7 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
     } else {
       FusedMoeLauncher::expert_weights =
           _alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
-      workspace.expert_weights = FusedMoeLauncher::expert_weights.data_ptr();
+      workspace.expert_weights = FusedMoeLauncher::expert_weights.value().data_ptr();
     }
 
     if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Llama4) {
@@ -4219,7 +4224,7 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
     if (args->do_finalize && args->output == nullptr) {
       output =
           alloc_tensor({args->num_tokens, args->hidden_size}, dl_bfloat16, hidden_states.device());
-      args->output = output.data_ptr();
+      args->output = output.value().data_ptr();
     }
     args->output_scale = nullptr;
 
@@ -4467,7 +4472,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
       // do_finalize=false. See #3595.
       FusedMoeLauncher::expert_weights = _alloc_tensor({args->num_tokens, totalExpertsPerToken},
                                                        dl_bfloat16, hidden_states.device());
-      workspace.expert_weights = FusedMoeLauncher::expert_weights.data_ptr();
+      workspace.expert_weights = FusedMoeLauncher::expert_weights.value().data_ptr();
     } else {
       if (is_unpacked_routing()) {
         args->mDtypeExpW = expert_weights_dtype(expert_weights);
@@ -4638,7 +4643,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     if (args->do_finalize && args->output == nullptr) {
       output =
           alloc_tensor({args->num_tokens, args->hidden_size}, dl_bfloat16, hidden_states.device());
-      args->output = output.data_ptr();
+      args->output = output.value().data_ptr();
     }
     args->output_scale = nullptr;
 
@@ -4806,7 +4811,8 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
     moe_runner->run(*args, workspace, hidden_states.device().device_id, moe_stream, moe_tactic,
                     enable_pdl);
 
-    MoeRunResultBuffers result(args->do_finalize, args->do_finalize ? output : gemm2_output);
+    MoeRunResultBuffers result(args->do_finalize,
+                               args->do_finalize ? output : Optional<Tensor>(gemm2_output));
     if (!args->do_finalize) {
       result.expert_weights = FusedMoeLauncher::expert_weights;
     }
@@ -4965,7 +4971,7 @@ class MxInt4BlockScaleLauncher : public FusedMoeLauncher {
       // do_finalize=false. See #3595.
       FusedMoeLauncher::expert_weights =
           _alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
-      workspace.expert_weights = FusedMoeLauncher::expert_weights.data_ptr();
+      workspace.expert_weights = FusedMoeLauncher::expert_weights.value().data_ptr();
     }
   }
 
@@ -5426,7 +5432,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
   }
 
   /** Return the launcher-owned finalized output handle used by the existing DA result ABI. */
-  Tensor finalized_da_output() const { return output; }
+  Optional<Tensor> finalized_da_output() const { return output; }
 
  private:
   Optional<TensorView> hidden_states_scale;
@@ -5509,7 +5515,8 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
     moe_runner->run(*args, workspace, hidden_states.device().device_id, moe_stream, moe_tactic,
                     enable_pdl);
 
-    MoeRunResultBuffers result(args->do_finalize, args->do_finalize ? output : gemm2_output);
+    MoeRunResultBuffers result(args->do_finalize,
+                               args->do_finalize ? output : Optional<Tensor>(gemm2_output));
     if (!args->do_finalize) {
       result.expert_weights = FusedMoeLauncher::expert_weights;
     }
@@ -5563,7 +5570,7 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
 };
 
 /** Return a workspace-size query result as a one-element CPU int64 tensor. */
-Array<Tensor> moe_workspace_size_result(int64_t bytes) {
+Array<Optional<Tensor>> moe_workspace_size_result(int64_t bytes) {
   Tensor result = alloc_tensor({1}, dl_int64, DLDevice{kDLCPU, 0});
   static_cast<int64_t*>(result.data_ptr())[0] = bytes;
   return {result};
@@ -5571,15 +5578,18 @@ Array<Tensor> moe_workspace_size_result(int64_t bytes) {
 
 /**
  * Apply the workspace arguments shared by the ordinary MoE entry points. A size query returns
- * the largest scratch footprint over every tile at this token count, so one buffer fits
- * whichever tactic the autotuner (or the default heuristic) later selects.
+ * the selected configuration's footprint when explicit, otherwise the maximum over tiles.
  * Otherwise the caller-owned buffer, if any, is attached to the selected launcher.
  */
 template <typename Launcher>
-Optional<Array<Tensor>> apply_moe_workspace_args(
+Optional<Array<Optional<Tensor>>> apply_moe_workspace_args(
     std::unordered_map<int32_t, std::unique_ptr<Launcher>> const& launchers, Launcher& selected,
-    Optional<TensorView> const& workspace_buffer, bool query_workspace_size, bool is_da_launch) {
+    Optional<TensorView> const& workspace_buffer, int64_t config, bool explicit_tile,
+    bool query_workspace_size, bool is_da_launch) {
   if (query_workspace_size) {
+    if (explicit_tile) {
+      return moe_workspace_size_result(selected.measure_workspace_size(config));
+    }
     int64_t bytes = 0;
     for (auto const& entry : launchers) {
       bytes = std::max(bytes, entry.second->measure_workspace_size());
@@ -5590,10 +5600,10 @@ Optional<Array<Tensor>> apply_moe_workspace_args(
   TVM_FFI_ICHECK(!workspace_buffer.has_value() || !is_da_launch)
       << "workspace_buffer is not supported by distribution-aware MoE launches.";
   selected.set_workspace_buffer(workspace_buffer);
-  return Optional<Array<Tensor>>();
+  return std::nullopt;
 }
 
-Array<Tensor> trtllm_bf16_moe(
+Array<Optional<Tensor>> trtllm_bf16_moe(
     int64_t routing_input_mode, Optional<TensorView> const& routing_logits,
     Optional<TensorView> const& routing_bias, TensorView const& expert_indices,
     TensorView const& expert_weights, TensorView const& hidden_states,
@@ -5685,7 +5695,7 @@ Array<Tensor> trtllm_bf16_moe(
                    "Internal error: missing BF16 MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
   if (auto size = apply_moe_workspace_args(launchers_map, *selected_launcher, workspace_buffer,
-                                           query_workspace_size,
+                                           config, moe_tactic[0] != -1, query_workspace_size,
                                            is_da_body_preparation || !da_routing_metadata.empty());
       size.has_value()) {
     return size.value();
@@ -5695,7 +5705,8 @@ Array<Tensor> trtllm_bf16_moe(
     TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
         << "DA preparation cannot consume an existing body workspace.";
     auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
-    return selected_launcher->prepare_da_body(routing, config).to_ffi();
+    auto tensors = selected_launcher->prepare_da_body(routing, config).to_ffi();
+    return Array<Optional<Tensor>>(tensors.begin(), tensors.end());
   }
   if (!da_routing_metadata.empty()) {
     auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
@@ -5714,7 +5725,7 @@ Array<Tensor> trtllm_bf16_moe(
       .to_ffi();
 }
 
-Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
+Array<Optional<Tensor>> trtllm_fp8_per_tensor_scale_moe(
     TensorView routing_logits, Optional<TensorView> routing_bias, TensorView hidden_states,
     TensorView gemm1_weights, TensorView output1_scales_scalar,
     TensorView output1_scales_gate_scalar, TensorView gemm2_weights,
@@ -5804,7 +5815,7 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
                    "Internal error: missing FP8 per-tensor MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
   if (auto size = apply_moe_workspace_args(launchers_map, *selected_launcher, workspace_buffer,
-                                           query_workspace_size,
+                                           config, config_index[0] != -1, query_workspace_size,
                                            is_da_body_preparation || !da_routing_metadata.empty());
       size.has_value()) {
     return size.value();
@@ -5814,7 +5825,8 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
     TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
         << "DA preparation cannot consume an existing body workspace.";
     auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
-    return selected_launcher->prepare_da_body(routing, config).to_ffi();
+    auto tensors = selected_launcher->prepare_da_body(routing, config).to_ffi();
+    return Array<Optional<Tensor>>(tensors.begin(), tensors.end());
   }
   if (!da_routing_metadata.empty()) {
     auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
@@ -5829,7 +5841,7 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_moe(
   return selected_launcher->run(config, enable_pdl, use_routing_scales_on_input).to_ffi();
 }
 
-Array<Tensor> trtllm_fp8_per_tensor_scale_routed_moe(
+Array<Optional<Tensor>> trtllm_fp8_per_tensor_scale_routed_moe(
     int64_t routing_input_mode, TensorView expert_indices, TensorView expert_weights,
     Optional<TensorView> routing_bias, TensorView hidden_states, TensorView gemm1_weights,
     TensorView output1_scales_scalar, TensorView output1_scales_gate_scalar,
@@ -5929,7 +5941,7 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_routed_moe(
                    "Internal error: missing FP8 per-tensor MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
   if (auto size = apply_moe_workspace_args(launchers_map, *selected_launcher, workspace_buffer,
-                                           query_workspace_size,
+                                           config, config_index[0] != -1, query_workspace_size,
                                            is_da_body_preparation || !da_routing_metadata.empty());
       size.has_value()) {
     return size.value();
@@ -5939,7 +5951,8 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_routed_moe(
     TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
         << "DA preparation cannot consume an existing body workspace.";
     auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
-    return selected_launcher->prepare_da_body(routing, config).to_ffi();
+    auto tensors = selected_launcher->prepare_da_body(routing, config).to_ffi();
+    return Array<Optional<Tensor>>(tensors.begin(), tensors.end());
   }
   if (!da_routing_metadata.empty()) {
     auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
@@ -5954,7 +5967,7 @@ Array<Tensor> trtllm_fp8_per_tensor_scale_routed_moe(
   return selected_launcher->run(config, enable_pdl, use_routing_scales_on_input).to_ffi();
 }
 
-Array<Tensor> trtllm_fp8_per_channel_scale_moe(
+Array<Optional<Tensor>> trtllm_fp8_per_channel_scale_moe(
     Optional<TensorView> routing_logits, TensorView expert_indices, TensorView expert_weights,
     Optional<TensorView> routing_bias, TensorView hidden_states, TensorView hidden_states_scale,
     TensorView gemm1_weights, TensorView gemm1_per_channel_weight_scale,
@@ -6001,7 +6014,16 @@ Array<Tensor> trtllm_fp8_per_channel_scale_moe(
     return launcher;
   };
 
+  auto const [tile_N, config] = resolveMoeTileAndConfig(config_index, supported_tile_nums,
+                                                        num_tokens, top_k, local_num_experts);
   if (query_workspace_size) {
+    if (config_index[0] != -1) {
+      TVM_FFI_ICHECK(std::find(supported_tile_nums.begin(), supported_tile_nums.end(), tile_N) !=
+                     supported_tile_nums.end())
+          << "Unsupported MoE tile_N=" << tile_N;
+      return moe_workspace_size_result(
+          make_launcher(static_cast<int32_t>(tile_N))->measure_workspace_size(config));
+    }
     // Same bound as apply_moe_workspace_args(): the largest footprint over every tile.
     int64_t bytes = 0;
     for (int32_t tile : supported_tile_nums) {
@@ -6010,14 +6032,12 @@ Array<Tensor> trtllm_fp8_per_channel_scale_moe(
     return moe_workspace_size_result(bytes);
   }
 
-  auto const [tile_N, config] = resolveMoeTileAndConfig(config_index, supported_tile_nums,
-                                                        num_tokens, top_k, local_num_experts);
   auto launcher = make_launcher(static_cast<int32_t>(tile_N));
   launcher->set_workspace_buffer(workspace_buffer);
   return launcher->run(config, enable_pdl, use_routing_scales_on_input).to_ffi();
 }
 
-Array<Tensor> trtllm_fp8_block_scale_moe(
+Array<Optional<Tensor>> trtllm_fp8_block_scale_moe(
     int64_t routing_input_mode, Optional<TensorView> routing_logits, TensorView expert_indices,
     TensorView expert_weights, Optional<TensorView> routing_bias, TensorView hidden_states,
     TensorView hidden_states_scale, TensorView gemm1_weights, TensorView gemm1_weights_scale,
@@ -6173,7 +6193,7 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
                    "Internal error: missing FP8 block-scale MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
   if (auto size = apply_moe_workspace_args(launchers_map, *selected_launcher, workspace_buffer,
-                                           query_workspace_size,
+                                           config, config_index[0] != -1, query_workspace_size,
                                            is_da_body_preparation || !da_routing_metadata.empty());
       size.has_value()) {
     return size.value();
@@ -6184,9 +6204,11 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
         << "DA preparation cannot consume an existing body workspace.";
     auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
     if (quantization_type == Fp8QuantizationType::DeepSeekFp8) {
-      return selected_launcher->prepare_deepseek_da_body(routing, config).to_ffi();
+      auto tensors = selected_launcher->prepare_deepseek_da_body(routing, config).to_ffi();
+      return Array<Optional<Tensor>>(tensors.begin(), tensors.end());
     }
-    return selected_launcher->prepare_mxfp8_da_body(routing, config).to_ffi();
+    auto tensors = selected_launcher->prepare_mxfp8_da_body(routing, config).to_ffi();
+    return Array<Optional<Tensor>>(tensors.begin(), tensors.end());
   }
   if (!da_routing_metadata.empty()) {
     auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
@@ -6210,7 +6232,7 @@ Array<Tensor> trtllm_fp8_block_scale_moe(
       .to_ffi();
 }
 
-Array<Tensor> trtllm_fp4_block_scale_moe(
+Array<Optional<Tensor>> trtllm_fp4_block_scale_moe(
     int64_t routing_input_mode, Optional<TensorView> routing_logits, TensorView topk_ids,
     TensorView topk_weights, Optional<TensorView> routing_bias, TensorView hidden_states,
     Optional<TensorView> hidden_states_scale, TensorView gemm1_weights,
@@ -6374,7 +6396,7 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
                    "Internal error: missing FP4 block-scale MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
   if (auto size = apply_moe_workspace_args(launchers_map, *selected_launcher, workspace_buffer,
-                                           query_workspace_size,
+                                           config, config_index[0] != -1, query_workspace_size,
                                            is_da_body_preparation || !da_routing_metadata.empty());
       size.has_value()) {
     return size.value();
@@ -6384,7 +6406,8 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
     TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
         << "DA body preparation does not accept an existing body workspace.";
     auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
-    return selected_launcher->prepare_da_body(routing, config).to_ffi();
+    auto tensors = selected_launcher->prepare_da_body(routing, config).to_ffi();
+    return Array<Optional<Tensor>>(tensors.begin(), tensors.end());
   }
   if (!da_routing_metadata.empty()) {
     auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
@@ -6406,7 +6429,7 @@ Array<Tensor> trtllm_fp4_block_scale_moe(
       .to_ffi();
 }
 
-Array<Tensor> trtllm_mxint4_block_scale_moe(
+Array<Optional<Tensor>> trtllm_mxint4_block_scale_moe(
     Optional<TensorView> const& routing_logits, Optional<TensorView> routing_bias,
     TensorView const& expert_indices, TensorView const& expert_weights, TensorView hidden_states,
     TensorView gemm1_weights, TensorView gemm1_weights_scale, Optional<TensorView> gemm1_alpha,
@@ -6513,7 +6536,7 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
                    "Internal error: missing MXINT4 block-scale MoE launcher for tile_N=", tile_N);
   auto& selected_launcher = launcher_it->second;
   if (auto size = apply_moe_workspace_args(launchers_map, *selected_launcher, workspace_buffer,
-                                           query_workspace_size,
+                                           config, config_index[0] != -1, query_workspace_size,
                                            is_da_body_preparation || !da_routing_metadata.empty());
       size.has_value()) {
     return size.value();
@@ -6523,7 +6546,8 @@ Array<Tensor> trtllm_mxint4_block_scale_moe(
     TVM_FFI_ICHECK_EQ(da_body_workspace.size(), 0)
         << "DA preparation cannot consume an existing body workspace.";
     auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
-    return selected_launcher->prepare_da_body(routing, config).to_ffi();
+    auto tensors = selected_launcher->prepare_da_body(routing, config).to_ffi();
+    return Array<Optional<Tensor>>(tensors.begin(), tensors.end());
   }
   if (!da_routing_metadata.empty()) {
     auto const routing = RoutingMetadataBuffers::from_ffi(da_routing_metadata);
