@@ -34,15 +34,26 @@ token count.  On one buffer reused over realistic token-count sequences:
   properties at every replay;
 * the default workspaces (``workspace=None``: one buffer per power-of-two
   token-count bucket) give bitwise the fresh-workspace outputs across the
-  token counts of one bucket.
+  token counts of one bucket;
+* the sequence of FlashInfer issue #7763 (``backward_finish`` at 7832 tokens,
+  then at 7435 tokens, on the default workspace of a fresh process, and the
+  reverse order) finds the ticket words of every call zero before and after
+  the call and gives bitwise the fresh-workspace outputs.  Each sequence runs
+  in its own process, so its default workspaces start unused and a sticky
+  CUDA error cannot reach the other tests.
 """
 
 from __future__ import annotations
 
+import json
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 import torch
 
-from tests.test_helpers.cake_package import cake_package
+from tests.test_helpers.cake_package import PACKAGES, cake_package
 
 pkg = cake_package("cake_mhc_train")
 loader = cake_package("cake_mhc_train", "cake_jit")
@@ -61,6 +72,8 @@ SEQUENCES = {
 }
 GRAPHS = ((4096, 3000), (8192, 4500), (16263, 14928))
 DEFAULT_BUCKETS = ((4096, 3000, 2100, 4096), (8192, 6000, 4500, 8192))
+# The backward token-count sequences of FlashInfer issue #7763 (one 8192-token default bucket).
+REPORTED_SEQUENCES = ((7832, 7435), (7435, 7832))
 OUTPUTS = ("U", "stats", "Y", "dB", "gstats", "dX", "dfn", "dscale", "dbase")
 
 
@@ -237,3 +250,76 @@ def test_default_workspace_bucket_across_token_counts(Ts: tuple) -> None:
         got = _snapshot(_step(_inputs(T), None, None))
         torch.cuda.synchronize()
         _assert_bitwise(ref, got, f"default workspace call {n} (T={T}) of {Ts}")
+
+
+# One process per sequence: the inputs of the issue's reproduction (one CPU generator seeded 0, drawn in call order),
+# each ``backward_finish`` on the default workspace, then the same call on a fresh zeroed exact-size workspace.
+_REPORTED_CHILD = r"""
+import importlib, json, sys
+import torch
+pkg = importlib.import_module(sys.argv[1])
+loader = importlib.import_module(sys.argv[1] + ".cake_jit")
+dev = torch.device("cuda:0")
+gen = torch.Generator(device="cpu").manual_seed(0)
+def r(*shape, dtype=torch.float32, scale=1.0):
+    return (torch.randn(shape, generator=gen) * scale).to(dtype).to(dev)
+for T in (int(t) for t in sys.argv[2].split(",")):
+    args = [r(T, 4, 4096, dtype=torch.bfloat16), r(T, 4, 4096, dtype=torch.bfloat16, scale=1e-3),
+            r(T, 4096, dtype=torch.bfloat16, scale=1e-3), None, r(24, 16384, scale=0.05), r(3, scale=0.1),
+            r(24), r(T, 64), r(T, 32, scale=1e-3)]
+    layout = loader.workspace_layout("bwd", T, device_index=0)
+    ticket = layout["regions"]["ticket"]
+    key = (0, "bwd", 1 << (T - 1).bit_length())
+    def nonzero():
+        torch.cuda.synchronize()
+        ws = pkg._DEFAULT_WORKSPACES.get(key)
+        return 0 if ws is None else int(torch.count_nonzero(ws[ticket["offset"] : ticket["offset"] + ticket["bytes"]]))
+    call = {"T": T, "ticket_before": nonzero()}
+    print(json.dumps(call), flush=True)
+    got = [t.clone() for t in pkg.cake_mhc_train_backward_finish(*args)]
+    call["ticket_after"] = nonzero()
+    fresh = torch.zeros(layout["total_bytes"], dtype=torch.uint8, device=dev)
+    ref = pkg.cake_mhc_train_backward_finish(*args, workspace=fresh)
+    torch.cuda.synchronize()
+    call["differs"] = [n for n, a, b in zip(("dX", "dfn", "dscale", "dbase"), got, ref) if not torch.equal(a, b)]
+    print(json.dumps(call), flush=True)
+"""
+
+
+@pytest.mark.parametrize(
+    "Ts", REPORTED_SEQUENCES, ids=lambda Ts: "-".join(map(str, Ts))
+)
+def test_default_workspace_reported_sequence(Ts: tuple) -> None:
+    run = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _REPORTED_CHILD,
+            PACKAGES["cake_mhc_train"],
+            ",".join(map(str, Ts)),
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    calls = [
+        json.loads(line) for line in run.stdout.splitlines() if line.startswith("{")
+    ]
+    tail = "\n".join((run.stdout + run.stderr).strip().splitlines()[-6:])
+    assert run.returncode == 0, (
+        f"backward_finish over {Ts} on the default workspace: exit {run.returncode}\n{tail}"
+    )
+    done = [c for c in calls if "differs" in c]
+    assert [c["T"] for c in done] == list(Ts), tail
+    for c in done:
+        what = f"default workspace, backward_finish at T={c['T']} of {Ts}"
+        assert c["ticket_before"] == 0, (
+            f"{what}: {c['ticket_before']} non-zero ticket bytes before the call"
+        )
+        assert c["ticket_after"] == 0, (
+            f"{what}: {c['ticket_after']} non-zero ticket bytes after the call"
+        )
+        assert not c["differs"], (
+            f"{what}: {c['differs']} differ from the fresh-workspace call"
+        )
