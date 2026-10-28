@@ -702,11 +702,12 @@ def test_gvr2_clus_rows_far_below_envelope(rows, msl_c, top_k, next_n, cr, hinte
 )
 @pytest.mark.parametrize("rows", [32, 64])
 def test_gvr2_clus_adversarial_short_rows(pattern, rows):
-    """Tie floods and degenerate samples drive the retry ladder, the crossing
-    narrowing and the whole-row degen path of the cluster family through both
-    solo rows (rank 0 alone, CTA barriers) and cluster rows (all ranks); the
-    ramps put the whole top-k at the live row's tail (the last chunk, the
-    ragged n % 4 tail) or head."""
+    """Tie floods, two values, quantized levels and huge floods above and below
+    K (the cluster family's whole-row degen path), and ramps that put the whole
+    top-k at the live row's tail (the last chunk, the ragged n % 4 tail) or
+    head, on every kind of clus row in one launch: register-path rows (2,049
+    and 4,096 columns), solo rows (16,388 and 32,768: rank 0 alone, CTA
+    barriers) and cluster rows (40,000 and 131,072: all ranks)."""
     top_k, msl_c = 1024, 262144
     gen = torch.Generator(device=_DEV).manual_seed(rows + len(pattern))
     logits = _adversarial_logits(pattern, rows, msl_c, top_k, gen)
@@ -726,18 +727,18 @@ def test_gvr2_clus_adversarial_short_rows(pattern, rows):
 @pytest.mark.parametrize("rows", [32, 64])
 def test_gvr2_clus_graph_replay_lengths_change(rows):
     """A clus launch captured at a large envelope, replayed with lengths
-    changed after capture: all rows solo at capture, then rows up to the
-    envelope (every rank busy), then a mix crossing the solo bound and the
-    short path. The solo choice comes from seq_lens at replay time and is
-    never frozen into the graph."""
+    changed after capture: register-path rows at capture, then rows up to the
+    envelope (every rank busy), then a mix of short, register-path, solo and
+    cluster rows, then register-path rows again. Each row's path comes from
+    seq_lens at replay time and is never frozen into the graph."""
     top_k, msl = 512, 262144
     gen = torch.Generator(device=_DEV).manual_seed(rows)
     logits = torch.randn(rows, msl, generator=gen, device=_DEV) - 2.0
     phases = [
-        [2048 + 97 * r for r in range(rows)],  # capture: all solo
+        [2048 + 97 * r for r in range(rows)],  # capture: register-path rows
         [msl - 13 * r for r in range(rows)],  # up to the envelope: all cluster
         [[300, 513, 8192, 32768, 32772, 70001, msl, 0][r % 8] for r in range(rows)],
-        [1000 + 31 * r for r in range(rows)],  # back to solo
+        [1000 + 31 * r for r in range(rows)],  # back to register-path rows
     ]
     seq_lens = torch.tensor(phases[0], dtype=torch.int32, device=_DEV)
     out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
@@ -1636,7 +1637,9 @@ _MISS_CASES = [
     (160, 163840, 2048, "main", None),
     (300, 131072, 1024, "main", None),  # one CTA per row, 256 threads
     (128, 262144, 1024, "main", None),  # one CTA per row, 1024 threads
-    (4, 262144, 512, "main", None),  # SPLIT, R 32: dense-sample rows and plain ones
+    # SPLIT. On B200 both of its slab rows (131,075 and 65,543 columns) are
+    # dense-sample rows; its 32,771- and 16,389-column rows take the cluster band.
+    (4, 262144, 512, "main", None),
     (32, 262144, 512, "clus", None),  # CS 4: solo and multi-chunk rows
     (64, 262144, 1024, "clus", None),  # CS 2
     (32, 262144, 1024, "clus", 64),  # paged
