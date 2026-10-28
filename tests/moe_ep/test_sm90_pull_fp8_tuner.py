@@ -194,11 +194,20 @@ class TestIsValid:
     def test_hybrid_configs_keep_1x64_geometry(self):
         pkg = _pkg()
         # The fused MXFP4 / NVFP4 x FP8 configs validate through a blockwise
-        # proxy, but their hybrid FC2 activation keeps 1x64 scale blocks, so
-        # the swap-AB M=128 tiles (cooperative and ping-pong) stay legal.
+        # proxy; with 1x64 hybrid h blocks the swap-AB M=128 tiles
+        # (cooperative and ping-pong) stay legal.  The default is 1x128.
         for config_cls in (pkg.MegaMoEHopperMxfp4Config, pkg.MegaMoEHopperNvfp4Config):
+            assert (
+                config_cls(**_CFG_BASE, mma_tiler_mnk=(256, 32, 128)).fc2_act_scale_k
+                == 128
+            )
             for pingpong in (False, True):
-                config_cls(**_CFG_BASE, pingpong=pingpong, mma_tiler_mnk=(128, 32, 128))
+                config_cls(
+                    **_CFG_BASE,
+                    pingpong=pingpong,
+                    mma_tiler_mnk=(128, 32, 128),
+                    fc2_act_scale_k=64,
+                )
             # Their kernels never received the deterministic slot path.
             with pytest.raises(ValueError, match="deterministic"):
                 config_cls(**_CFG_BASE, deterministic=True)
@@ -225,28 +234,61 @@ class TestIsValid:
                 with pytest.raises(ValueError, match="fc2_act_scale_k"):
                     config_cls(**_CFG_BASE, fc2_act_scale_k=scale_k)
 
-    def test_hybrid_h128_rejects_shim_autotune(self):
-        _pkg()
-        from types import SimpleNamespace
-
-        from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.autotune import (
-            autotune_hopper_mxfp4_mega_moe,
+    def test_hybrid_h128_tuning_identity_and_fallback(self):
+        pkg = _pkg()
+        from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim import (
+            mxfp4_tuner,
         )
-        from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.nvfp4_autotune import (
-            autotune_hopper_nvfp4_mega_moe,
+        from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.nvfp4_tuner import (
+            hopper_nvfp4_cache_provenance_sha256,
         )
 
-        # Rejected before any device work: the tuning cache is shared with
-        # 1x64 sessions and the candidate union includes M128 tactics.
-        symm_buffer = SimpleNamespace(
-            _frontend=SimpleNamespace(config=SimpleNamespace(fc2_act_scale_k=128))
+        # 1x64 keeps the historical cache identity; 1x128 winners get their own.
+        mx_prov = mxfp4_tuner.hopper_mxfp4_cache_provenance_sha256
+        assert mx_prov() == mx_prov(fc2_act_scale_k=64) != mx_prov(fc2_act_scale_k=128)
+        nv_shape = dict(
+            routing_profile="block_permutation_v1",
+            kperm=64,
+            overlap=None,
+            max_tokens=128,
+            hidden=7168,
+            intermediate=3072,
+            num_experts=384,
+            world_size=4,
         )
-        for autotune in (
-            autotune_hopper_mxfp4_mega_moe,
-            autotune_hopper_nvfp4_mega_moe,
+        assert hopper_nvfp4_cache_provenance_sha256(
+            **nv_shape
+        ) != hopper_nvfp4_cache_provenance_sha256(**nv_shape, fc2_act_scale_k=128)
+
+        # Heuristic fallback (and autotune) keep only tactics that can form the
+        # h block: M=256 cooperative for 1x128.
+        shape = dict(hidden=7168, intermediate=3072)
+        h128 = mxfp4_tuner._ordered_base_candidates(128, **shape, fc2_act_scale_k=128)
+        assert h128
+        assert all(c["mma_tiler_mnk"][0] == 256 and not c["pingpong"] for c in h128)
+        h64 = mxfp4_tuner._ordered_base_candidates(128, **shape)
+        assert any(c["mma_tiler_mnk"][0] == 128 for c in h64)
+
+        # Manual mode picks an M=256 tile for the default 1x128 block.
+        common = dict(
+            num_total_experts=4,
+            num_max_tokens=64,
+            num_topk=4,
+            hidden=1024,
+            intermediate=512,
+            rank=0,
+            world_size=1,
+            swap_ab=True,
+        )
+        for resolve in (
+            pkg._resolve_hopper_mxfp4_mega_moe_config,
+            pkg._resolve_hopper_nvfp4_mega_moe_config,
         ):
-            with pytest.raises(ValueError, match="fc2_act_scale_k=64"):
-                autotune(None, None, None, symm_buffer)
+            config = resolve(**common)
+            assert config.fc2_act_scale_k == 128
+            assert config.mma_tiler_mnk[0] == 256
+            config = resolve(**common, fc2_act_scale_k=64)
+            assert config.mma_tiler_mnk[0] == 128
 
     def test_deterministic_rules(self):
         pkg = _pkg()

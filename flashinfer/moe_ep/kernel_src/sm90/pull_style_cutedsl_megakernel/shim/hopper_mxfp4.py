@@ -73,6 +73,8 @@ _Fp4Buffer = TypeVar("_Fp4Buffer", bound="MegaMoEHopperMxfp4SymmBuffer")
 _Fp4Inputs = TypeVar("_Fp4Inputs", bound="MegaMoEHopperMxfp4Inputs")
 
 _MXFP4_MMA_TILER_DEFAULT = (128, 32, 128)
+# Manual-mode tile when fc2_act_scale_k=128 (one h block per M=256 task tile).
+_MXFP4_H128_MMA_TILER_DEFAULT = (256, 32, 128)
 _MXFP4_CLUSTER_SHAPE_DEFAULT = (1, 1, 1)
 
 _MXFP4_GROUP_SIZE = 32
@@ -157,10 +159,11 @@ class MegaMoEHopperMxfp4Config(MegaMoEHopperFp8Config):
     # Only these two bounded performance strategies are optional.
     fc2_tail_n8: bool = field(default=False, kw_only=True)
     fc1_ready_mode: Literal["tile", "k256"] = field(default="tile", kw_only=True)
-    # FC1-output channels per FC2-activation (h) scale.  128 forms one scale
-    # per M256 task tile (the FP8 blockwise rule: no M128 / ping-pong tiles)
-    # and promotes FC2 once per K128 instead of per K64.
-    fc2_act_scale_k: Literal[64, 128] = field(default=64, kw_only=True)
+    # FC1-output channels per FC2-activation (h) scale.  128 (the default)
+    # forms one scale per M256 task tile (the FP8 blockwise rule: no M128 /
+    # ping-pong tiles) and promotes FC2 once per K128 instead of per K64;
+    # 64 admits every tactic.
+    fc2_act_scale_k: Literal[64, 128] = field(default=128, kw_only=True)
     routing_profile: str = field(
         default=SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
         kw_only=True,
@@ -895,8 +898,13 @@ def resolve_hopper_mxfp4_knobs(
     num_max_tokens: int,
     gate_up_clamp: Optional[float] = None,
     routing_profile: str = SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
+    fc2_act_scale_k: int = 128,
 ) -> Dict[str, Any]:
-    """Resolve only MXFP4-keyed knobs; never consult FP8 heuristics/cache."""
+    """Resolve only MXFP4-keyed knobs; never consult FP8 heuristics/cache.
+
+    Cache entries are keyed by the h block, and the heuristic falls back only
+    to tactics that can form it (M=256 cooperative for 1x128).
+    """
     routing_profile = normalize_sm90_routing_profile(routing_profile)
     if isinstance(knobs, dict):
         return _validate_complete_mxfp4_tactic(
@@ -915,6 +923,7 @@ def resolve_hopper_mxfp4_knobs(
     from .mxfp4_tuner import (
         _ordered_base_candidates,
         hopper_mxfp4_cache_provenance_sha256,
+        is_hopper_mxfp4_tactic_h_block_compatible,
         is_hopper_mxfp4_tactic_shape_compatible,
         require_hopper_mxfp4_fused_tuning_device,
     )
@@ -933,6 +942,7 @@ def resolve_hopper_mxfp4_knobs(
         routing_profile=routing_profile,
         tuning_provenance_sha256=hopper_mxfp4_cache_provenance_sha256(
             routing_profile=routing_profile,
+            fc2_act_scale_k=fc2_act_scale_k,
         ),
     )
     if cached is not None:
@@ -944,10 +954,13 @@ def resolve_hopper_mxfp4_knobs(
             tactic,
             hidden=hidden,
             intermediate=intermediate,
+        ) or not is_hopper_mxfp4_tactic_h_block_compatible(
+            tactic, fc2_act_scale_k=fc2_act_scale_k
         ):
             raise ValueError(
                 "MXFP4 tuning-cache tactic is incompatible with "
-                f"hidden={hidden}, intermediate={intermediate}"
+                f"hidden={hidden}, intermediate={intermediate}, "
+                f"fc2_act_scale_k={fc2_act_scale_k}"
             )
         return tactic
 
@@ -959,6 +972,7 @@ def resolve_hopper_mxfp4_knobs(
             hidden=hidden,
             intermediate=intermediate,
             routing_profile=routing_profile,
+            fc2_act_scale_k=fc2_act_scale_k,
         )[0],
         source="MXFP4 legacy heuristic",
     )
@@ -1004,7 +1018,7 @@ def _resolve_hopper_mxfp4_mega_moe_config(
     flag_batch: int = 1,
     epi_flag_batch: Tuple[int, int] = (2, 4),
     routing_profile: str = SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
-    fc2_act_scale_k: int = 64,
+    fc2_act_scale_k: int = 128,
 ) -> MegaMoEHopperMxfp4Config:
     """Resolve the complete MXFP4 constructor request without allocation."""
 
@@ -1050,7 +1064,11 @@ def _resolve_hopper_mxfp4_mega_moe_config(
             swap_ab=True if swap_ab is None else swap_ab,
             pingpong=False if pingpong is None else pingpong,
             mma_tiler_mnk=(
-                _MXFP4_MMA_TILER_DEFAULT
+                (
+                    _MXFP4_H128_MMA_TILER_DEFAULT
+                    if fc2_act_scale_k == 128
+                    else _MXFP4_MMA_TILER_DEFAULT
+                )
                 if mma_tiler_mnk is None
                 else tuple(mma_tiler_mnk)
             ),
@@ -1071,6 +1089,7 @@ def _resolve_hopper_mxfp4_mega_moe_config(
             num_max_tokens=num_max_tokens,
             gate_up_clamp=clamp,
             routing_profile=routing_profile,
+            fc2_act_scale_k=fc2_act_scale_k,
         )
         # Match the established FP8 shim's precedence rule: an explicit
         # caller token-back choice wins over a cache entry.
@@ -1121,6 +1140,9 @@ def _resolve_hopper_mxfp4_mega_moe_config(
         flag_batch=flag_batch,
         epi_flag_batch=epi_flag_batch,
         routing_profile=routing_profile,
+        # Placeholder valid for the M=128 base geometry; the requested h
+        # block is applied together with the resolved geometry below.
+        fc2_act_scale_k=_MXFP4_FC2_ACTIVATION_SCALE_K,
     )
     if resolved or fc2_act_scale_k != config.fc2_act_scale_k:
         # External knob/cache/heuristic dicts were already validated as a
@@ -1177,7 +1199,7 @@ def get_symm_buffer_for_hopper_mxfp4_mega_moe(
     flag_batch: int = 1,
     epi_flag_batch: Tuple[int, int] = (2, 4),
     routing_profile: str = SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
-    fc2_act_scale_k: int = 64,
+    fc2_act_scale_k: int = 128,
 ) -> MegaMoEHopperMxfp4SymmBuffer:
     """Allocate symmetric inputs and a fused Humming MXFP4 frontend.
 

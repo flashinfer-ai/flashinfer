@@ -56,13 +56,11 @@ class Sm90PullNvfp4MegaKernelBackend(Sm90PullMxfp4MegaKernelBackend):
         return {
             "nvfp4_kperm": k.nvfp4_kperm,
             "nvfp4_fc1_k256_overlap": k.nvfp4_fc1_k256_overlap,
+            "fc2_act_scale_k": k.fc2_act_scale_k,
         }
 
     def _format_config_kwargs(self) -> dict[str, Any]:
-        return {
-            **self._knob_resolver_kwargs(),
-            "fc2_act_scale_k": self._kernel_config.fc2_act_scale_k,
-        }
+        return self._knob_resolver_kwargs()
 
     def _validate_transformed_kwargs(self) -> dict[str, Any]:
         return {"nvfp4_kperm": self._kernel_config.nvfp4_kperm}

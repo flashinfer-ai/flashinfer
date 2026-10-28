@@ -510,6 +510,7 @@ def autotune_hopper_mxfp4_mega_moe(
     from .mxfp4_tuner import (
         hopper_mxfp4_cache_provenance_sha256,
         _base_candidates,
+        is_hopper_mxfp4_tactic_h_block_compatible,
         is_hopper_mxfp4_tactic_shape_compatible,
         require_hopper_mxfp4_fused_tuning_device,
     )
@@ -521,22 +522,23 @@ def autotune_hopper_mxfp4_mega_moe(
     )
 
     cfg = symm_buffer._frontend.config
-    if cfg.fc2_act_scale_k != 64:
-        # Tuning-cache entries are shared with 1x64 sessions and the
-        # candidate union includes M128 / ping-pong tactics.
-        raise ValueError(
-            "MXFP4 autotune supports only fc2_act_scale_k=64; pass an M256 "
-            "tactic explicitly for fc2_act_scale_k=128."
-        )
     require_hopper_mxfp4_fused_tuning_device()
-    full_candidates = hopper_mxfp4_candidates(
-        cfg.num_tokens_per_rank,
-        hidden=cfg.hidden,
-        intermediate=cfg.intermediate,
-        num_experts=cfg.num_total_experts,
-        world_size=cfg.world_size,
-        routing_profile=cfg.routing_profile,
-    )
+    # A 1x128 h block admits only M=256 cooperative tactics; the winner is
+    # recorded under the h block's own cache identity.
+    full_candidates = [
+        candidate
+        for candidate in hopper_mxfp4_candidates(
+            cfg.num_tokens_per_rank,
+            hidden=cfg.hidden,
+            intermediate=cfg.intermediate,
+            num_experts=cfg.num_total_experts,
+            world_size=cfg.world_size,
+            routing_profile=cfg.routing_profile,
+        )
+        if is_hopper_mxfp4_tactic_h_block_compatible(
+            candidate, fc2_act_scale_k=cfg.fc2_act_scale_k
+        )
+    ]
     if candidates is None:
         candidates = full_candidates
     else:
@@ -616,6 +618,7 @@ def autotune_hopper_mxfp4_mega_moe(
                 routing_profile=record_cfg.routing_profile,
                 tuning_provenance_sha256=hopper_mxfp4_cache_provenance_sha256(
                     routing_profile=record_cfg.routing_profile,
+                    fc2_act_scale_k=record_cfg.fc2_act_scale_k,
                 ),
                 p50_us=p50_s * 1e6,
                 source=(

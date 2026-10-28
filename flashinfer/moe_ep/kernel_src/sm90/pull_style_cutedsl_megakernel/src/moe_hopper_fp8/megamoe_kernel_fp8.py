@@ -1686,8 +1686,9 @@ class Sm90MegaMoESwapABMxfp4Fp8Kernel(
             raise ValueError("MXFP4 currently requires generate_c=False")
         self._mxfp4_fc2_tail_n8 = mxfp4_fc2_tail_n8
         self._mxfp4_fc1_ready_mode = mxfp4_fc1_ready_mode
-        # FC1-output channels per FC2-activation scale: 64 (default) or 128
-        # (one promotion per K128 in FC2; needs M256 cooperative tiles).
+        # FC1-output channels per FC2-activation scale: 64 (kernel default)
+        # or 128 (one promotion per K128 in FC2; needs M256 cooperative
+        # tiles).  The flashinfer MXFP4 / NVFP4 configs default to 128.
         self._mxfp4_fc2_act_scale_k = mxfp4_fc2_act_scale_k
         # The workspace layout is built by the Mega constructor. No device
         # storage is allocated here; final effective-policy validation below

@@ -331,8 +331,8 @@ def _factory_conversion_knobs():
 
 @pytest.mark.parametrize(
     "conversion_layout,fc2_act_scale_k",
-    [("fallback", 64), ("factory", 64), ("factory", 128)],
-    ids=["fallback", "factory", "factory-h128"],
+    [("fallback", 64), ("fallback", 128), ("factory", 64), ("factory", 128)],
+    ids=["fallback", "fallback-h128", "factory", "factory-h128"],
 )
 def test_sm90_nvfp4_public_ep4_matches_raw_weight_oracles(
     conversion_layout, fc2_act_scale_k

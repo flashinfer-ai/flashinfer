@@ -582,8 +582,13 @@ def resolve_hopper_nvfp4_knobs(
     nvfp4_fc1_k256_overlap: Optional[bool] = None,
     routing_profile: str = SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
     use_tuning_cache: bool = True,
+    fc2_act_scale_k: int = 128,
 ) -> Dict[str, Any]:
-    """Read a compatible NV tuning entry, then use the reference heuristic."""
+    """Read a compatible NV tuning entry, then use the reference heuristic.
+
+    Cache entries are keyed by the h block; every choice must be able to
+    form it (M=256 cooperative for 1x128).
+    """
     if type(use_tuning_cache) is not bool:
         raise ValueError("use_tuning_cache must be a bool")
     routing_profile = normalize_sm90_routing_profile(routing_profile)
@@ -615,9 +620,15 @@ def resolve_hopper_nvfp4_knobs(
     if effective_overlap is None and profile is not None:
         effective_overlap = profile["requested_config"]["nvfp4_fc1_k256_overlap"]
 
+    from .mxfp4_tuner import is_hopper_mxfp4_tactic_h_block_compatible
+
     def compatible(tactic: Dict[str, Any]) -> bool:
         tile = tactic["mma_tiler_mnk"]
         if hidden % tile[2] or intermediate % tile[2]:
+            return False
+        if not is_hopper_mxfp4_tactic_h_block_compatible(
+            tactic, fc2_act_scale_k=fc2_act_scale_k
+        ):
             return False
         try:
             validate_nvfp4_fc1_overlap_override(
@@ -659,6 +670,7 @@ def resolve_hopper_nvfp4_knobs(
                 intermediate=intermediate,
                 num_experts=num_total_experts,
                 world_size=world_size,
+                fc2_act_scale_k=fc2_act_scale_k,
             ),
         )
         if cached is not None:
@@ -679,6 +691,7 @@ def resolve_hopper_nvfp4_knobs(
             hidden=hidden,
             intermediate=intermediate,
             routing_profile=routing_profile,
+            fc2_act_scale_k=fc2_act_scale_k,
         )
     )
     for candidate in choices:
@@ -734,7 +747,7 @@ def _resolve_hopper_nvfp4_mega_moe_config(
     nvfp4_kperm: int = 64,
     nvfp4_fc1_k256_overlap: Optional[bool] = None,
     routing_profile: str = SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
-    fc2_act_scale_k: int = 64,
+    fc2_act_scale_k: int = 128,
 ) -> MegaMoEHopperNvfp4Config:
     """Resolve the complete NVFP4 constructor request without allocation."""
 
@@ -785,8 +798,11 @@ def _resolve_hopper_nvfp4_mega_moe_config(
             pingpong=False if pingpong is None else pingpong,
             mma_tiler_mnk=(
                 (
-                    (128, 32, 256)
+                    # One 1x128 h block per M=256 task tile.
+                    (256 if fc2_act_scale_k == 128 else 128, 32, 256)
                     if nvfp4_fc1_k256_overlap is True
+                    else (256, 32, 128)
+                    if fc2_act_scale_k == 128
                     else _NVFP4_MMA_TILER_DEFAULT
                 )
                 if mma_tiler_mnk is None
@@ -811,6 +827,7 @@ def _resolve_hopper_nvfp4_mega_moe_config(
             routing_profile=routing_profile,
             nvfp4_kperm=nvfp4_kperm,
             nvfp4_fc1_k256_overlap=nvfp4_fc1_k256_overlap,
+            fc2_act_scale_k=fc2_act_scale_k,
         )
         # Match the established FP8 shim's precedence rule: an explicit
         # caller token-back choice wins over a cache entry.
@@ -861,6 +878,9 @@ def _resolve_hopper_nvfp4_mega_moe_config(
         epi_flag_batch=epi_flag_batch,
         nvfp4_kperm=nvfp4_kperm,
         routing_profile=routing_profile,
+        # Placeholder valid for the M=128 base geometry; the requested h
+        # block is applied together with the resolved geometry below.
+        fc2_act_scale_k=64,
     )
     if resolved or fc2_act_scale_k != config.fc2_act_scale_k:
         # External knob/cache/heuristic dicts were already validated as a
@@ -940,7 +960,7 @@ def get_symm_buffer_for_hopper_nvfp4_mega_moe(
     nvfp4_kperm: int = 64,
     nvfp4_fc1_k256_overlap: Optional[bool] = None,
     routing_profile: str = SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
-    fc2_act_scale_k: int = 64,
+    fc2_act_scale_k: int = 128,
 ) -> MegaMoEHopperNvfp4SymmBuffer:
     """Allocate symmetric inputs and a fused NVFP4 frontend.
 

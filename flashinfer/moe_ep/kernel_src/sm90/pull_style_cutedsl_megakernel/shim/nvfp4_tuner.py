@@ -155,6 +155,7 @@ def hopper_nvfp4_cache_provenance_sha256(
     intermediate: int,
     num_experts: int,
     world_size: int,
+    fc2_act_scale_k: int = 64,
 ) -> str:
     """Bind NV layout/schedule and source policy, excluding capacity buckets.
 
@@ -172,6 +173,7 @@ def hopper_nvfp4_cache_provenance_sha256(
         overlap=overlap,
         geometry_provenance=hopper_mxfp4_cache_provenance_sha256(
             routing_profile=routing_profile,
+            fc2_act_scale_k=fc2_act_scale_k,
         ),
     )
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()

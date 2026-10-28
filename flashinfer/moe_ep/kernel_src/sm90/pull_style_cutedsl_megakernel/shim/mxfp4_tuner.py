@@ -489,8 +489,14 @@ def _base_candidate_union_sha256() -> str:
 def hopper_mxfp4_cache_provenance_sha256(
     *,
     routing_profile: str = MXFP4_BLOCK_PERMUTATION_ROUTING_PROFILE,
+    fc2_act_scale_k: int = 64,
 ) -> str:
-    """Return the exact cache identity for the shipped tuning domain."""
+    """Return the exact cache identity for the shipped tuning domain.
+
+    Winners measured with 1x128 h scales (``fc2_act_scale_k=128``) get their
+    own identity; 1x64 keeps the historical one so existing entries still
+    match.
+    """
 
     profile = normalize_hopper_mxfp4_routing_profile(routing_profile)
     candidate_union_sha256 = _base_candidate_union_sha256()
@@ -514,6 +520,8 @@ def hopper_mxfp4_cache_provenance_sha256(
         "tail_split_pairs": [False, True],
         "tail_candidate_extension": mxfp4_tail_candidate_provenance(),
     }
+    if fc2_act_scale_k != 64:
+        payload["fc2_act_scale_k"] = int(fc2_act_scale_k)
     canonical = json.dumps(
         payload,
         ensure_ascii=True,
@@ -536,6 +544,22 @@ def is_hopper_mxfp4_tactic_shape_compatible(
     normalized = validate_hopper_mxfp4_tactic(tactic)
     tile_k = int(normalized["mma_tiler_mnk"][2])
     return hidden % tile_k == 0 and intermediate % tile_k == 0
+
+
+def is_hopper_mxfp4_tactic_h_block_compatible(
+    tactic: Mapping[str, Any],
+    *,
+    fc2_act_scale_k: int,
+) -> bool:
+    """Whether a tactic can form the FC2-activation (h) scale block.
+
+    A 1x128 block is the output of one M=256 cooperative task tile (both
+    epilogue warpgroups), so it excludes M=128 and ping-pong tactics.
+    """
+
+    if fc2_act_scale_k == 64:
+        return True
+    return int(tactic["mma_tiler_mnk"][0]) == 256 and not tactic["pingpong"]
 
 
 def _token_bucket(max_tokens: int) -> int:
@@ -563,6 +587,7 @@ def _ordered_base_candidates(
     hidden: int,
     intermediate: int,
     routing_profile: str = MXFP4_BLOCK_PERMUTATION_ROUTING_PROFILE,
+    fc2_act_scale_k: int = 64,
 ) -> list[dict[str, Any]]:
     """Put a legal default first, otherwise keep the base union's order."""
     profile = normalize_hopper_mxfp4_routing_profile(routing_profile)
@@ -572,10 +597,14 @@ def _ordered_base_candidates(
         if is_hopper_mxfp4_tactic_shape_compatible(
             tactic, hidden=hidden, intermediate=intermediate
         )
+        and is_hopper_mxfp4_tactic_h_block_compatible(
+            tactic, fc2_act_scale_k=fc2_act_scale_k
+        )
     ]
     if not legal:
         raise ValueError(
-            f"no runtime MXFP4 fused tactic supports hidden={hidden}, intermediate={intermediate}"
+            f"no runtime MXFP4 fused tactic supports hidden={hidden}, "
+            f"intermediate={intermediate}, fc2_act_scale_k={fc2_act_scale_k}"
         )
     default = hopper_mxfp4_default_tactic(max_tokens, routing_profile=profile)
     if default not in legal:
@@ -591,6 +620,7 @@ __all__ = [
     "Mxfp4RoutingProfile",
     "hopper_mxfp4_cache_provenance_sha256",
     "hopper_mxfp4_default_tactic",
+    "is_hopper_mxfp4_tactic_h_block_compatible",
     "is_hopper_mxfp4_tactic_shape_compatible",
     "is_valid_hopper_mxfp4_tactic",
     "normalize_hopper_mxfp4_routing_profile",

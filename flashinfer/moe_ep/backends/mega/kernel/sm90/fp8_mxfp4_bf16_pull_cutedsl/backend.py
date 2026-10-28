@@ -86,7 +86,7 @@ class Sm90PullMxfp4MegaKernelBackend(MegaKernelBackend):
         }
 
     def _knob_resolver_kwargs(self) -> dict[str, Any]:
-        return {}
+        return {"fc2_act_scale_k": self._kernel_config.fc2_act_scale_k}
 
     def _staging_kwargs(self) -> dict[str, Any]:
         return {}

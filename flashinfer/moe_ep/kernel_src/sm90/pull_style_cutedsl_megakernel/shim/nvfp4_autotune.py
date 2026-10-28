@@ -32,7 +32,10 @@ def autotune_hopper_nvfp4_mega_moe(
         _build_nvfp4_inputs,
         hopper_nvfp4_mega_moe,
     )
-    from .mxfp4_tuner import require_hopper_mxfp4_fused_tuning_device
+    from .mxfp4_tuner import (
+        is_hopper_mxfp4_tactic_h_block_compatible,
+        require_hopper_mxfp4_fused_tuning_device,
+    )
     from .nvfp4_tuner import (
         hopper_nvfp4_candidates,
         normalize_hopper_nvfp4_tactic,
@@ -41,13 +44,6 @@ def autotune_hopper_nvfp4_mega_moe(
     )
 
     cfg = symm_buffer._frontend.config
-    if cfg.fc2_act_scale_k != 64:
-        # Tuning-cache entries are shared with 1x64 sessions and the
-        # candidate union includes M128 / ping-pong tactics.
-        raise ValueError(
-            "NVFP4 autotune supports only fc2_act_scale_k=64; pass an M256 "
-            "tactic explicitly for fc2_act_scale_k=128."
-        )
     require_hopper_mxfp4_fused_tuning_device()
     full = hopper_nvfp4_candidates(
         cfg.num_tokens_per_rank,
@@ -60,6 +56,15 @@ def autotune_hopper_nvfp4_mega_moe(
     )
     if cfg.nvfp4_fc1_k256_overlap is True:
         full = [c for c in full if c["mma_tiler_mnk"][2] == 256 and not c["pingpong"]]
+    # A 1x128 h block admits only M=256 cooperative tactics; the winner is
+    # recorded under the h block's own cache identity.
+    full = [
+        c
+        for c in full
+        if is_hopper_mxfp4_tactic_h_block_compatible(
+            c, fc2_act_scale_k=cfg.fc2_act_scale_k
+        )
+    ]
     selected = (
         full
         if candidates is None
@@ -106,6 +111,7 @@ def autotune_hopper_nvfp4_mega_moe(
                     intermediate=cfg.intermediate,
                     num_experts=cfg.num_total_experts,
                     world_size=cfg.world_size,
+                    fc2_act_scale_k=cfg.fc2_act_scale_k,
                 ),
                 p50_us=p50_s * 1e6,
                 source=f"autotune:sm90_nvfp4_fused:{union_sha}",

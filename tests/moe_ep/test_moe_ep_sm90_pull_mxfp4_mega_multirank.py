@@ -460,6 +460,8 @@ def _fused_tactic() -> dict:
 def _run_raw_oracle(
     routing_pattern, *, tactic=None, capture_graph=False, fc2_act_scale_k=K64
 ):
+    """``tactic="heuristic"`` with ``fc2_act_scale_k=None`` builds the config
+    with every selector and the h block at their defaults."""
     """Production raw ABI vs independent global math on 1, 2, 4, or 8 ranks."""
     import torch
     import torch.distributed as dist
@@ -500,13 +502,22 @@ def _run_raw_oracle(
         load_balance_mode="static",
         token_back_mode="epi_warps",
     )
+    selectors = (
+        {}
+        if tactic == "heuristic"
+        else geometry
+        if tactic is None
+        else {"knobs": tactic}
+    )
+    if fc2_act_scale_k is not None:
+        selectors["fc2_act_scale_k"] = fc2_act_scale_k
     config = Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig(
         intermediate_size=INTERMEDIATE,
         top_k=world_size,
         gate_up_clamp=GATE_UP_CLAMP,
-        fc2_act_scale_k=fc2_act_scale_k,
-        **(geometry if tactic is None else {"knobs": tactic}),
+        **selectors,
     )
+    fc2_act_scale_k = config.fc2_act_scale_k
     registry_kernel = create_mega_kernel(config)
     runtime = bootstrap_moe_ep_runtime(
         bootstrap,
@@ -663,6 +674,26 @@ def test_moe_ep_sm90_pull_mxfp4_h128_independent_oracle(monkeypatch, tile_k):
         fc1_early_done_publish=True,
     )
     _run_raw_oracle("cross_rank", tactic=tactic, fc2_act_scale_k=128)
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_hopper
+def test_moe_ep_sm90_pull_mxfp4_default_config_independent_oracle(monkeypatch):
+    """No selectors and no h block: the heuristic M256 tactic with the
+    default 1x128 FC2-activation scales."""
+    import sys
+
+    from flashinfer.moe_ep import Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig
+
+    default = Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig(
+        intermediate_size=768, top_k=2
+    )
+    assert default.fc2_act_scale_k == 128
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "HIDDEN", 1024)
+    monkeypatch.setattr(module, "INTERMEDIATE", 768)
+    monkeypatch.setattr(module, "TOKENS_PER_RANK", 33)
+    _run_raw_oracle("cross_rank", tactic="heuristic", fc2_act_scale_k=None)
 
 
 @pytest.mark.gpu_4
@@ -1046,8 +1077,13 @@ def test_mxfp4_bulk_offsets_match_cpasync_after_repeat_and_reset(
         load_balance_mode="atomic_counter",
         token_back_mode="reuse_dispatch_warps",
     )
+    # The real failing geometry is an M=128 tactic: keep the 1x64 h block.
     config = Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig(
-        intermediate_size=3072, top_k=6, gate_up_clamp=10.0, knobs=tactic
+        intermediate_size=3072,
+        top_k=6,
+        gate_up_clamp=10.0,
+        knobs=tactic,
+        fc2_act_scale_k=64,
     )
     runtime = bootstrap_moe_ep_runtime(
         bootstrap, create_mega_kernel(config).runtime_requirements(bootstrap)

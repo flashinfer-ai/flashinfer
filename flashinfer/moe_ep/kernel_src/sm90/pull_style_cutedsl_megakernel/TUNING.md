@@ -263,9 +263,11 @@ N256 / M256 non-ping-pong geometries are legal there, see below).
   4), hence blockwise needs N=256 non-swap / M=256 swap-AB tiles and has
   no ping-pong geometry; the config, `tuner.is_valid` and the kernels
   reject the rest.  The Hopper MXFP4 / NVFP4 x FP8 backends
-  (`mxfp4_hybrid`) share these code paths with a 1x64 h block by default;
-  their `fc2_act_scale_k=128` opts into the 1x128 block under the same tile
-  rules (see "1x128 hybrid h scales" in the Humming MXFP4 section).
+  (`mxfp4_hybrid`) share these code paths. Since 2026-10-28 their
+  `fc2_act_scale_k` defaults to 128 (the 1x128 block, same tile rules);
+  `fc2_act_scale_k=64` restores the 1x64 block, which also admits M=128 and
+  ping-pong tactics (see "1x128 hybrid h scales" in the Humming MXFP4
+  section).
 - `swap_ab` + `pingpong` + `mma_tiler_mnk` + `cluster_shape_mnk` — layout,
   scheduling, tile, and CGA shape.  Leave ALL four `None` to use the drop's
   token-bucket heuristic table (`moe_hopper_fp8/heuristic_config.py`, keyed
@@ -1113,21 +1115,24 @@ provenance and clock observations.
 
 ### 1x128 hybrid h scales (`fc2_act_scale_k=128`, 2026-10-27)
 
-By default the MXFP4 / NVFP4 x FP8 path quantizes the FC1 output (h, FC2's
-A operand) with one FP32 scale per routed row and 64 channels.
-`fc2_act_scale_k=128` on the MXFP4 / NVFP4 backend configs (and the shim
-configs) uses one scale per 128 channels, as FP8 blockwise does: the two FC1
+The MXFP4 / NVFP4 x FP8 path quantizes the FC1 output (h, FC2's A operand)
+with one FP32 scale per routed row and block of channels. Since 2026-10-28
+the backend and shim configs default to `fc2_act_scale_k=128`: one scale per
+128 channels, as FP8 blockwise does (`fc2_act_scale_k=64` keeps the original
+64-channel block). With 128, the two FC1
 epilogue warpgroups fold each other's amax, and FC2 sums both K64 halves of
 each K128 in one WGMMA accumulator and promotes once instead of twice. Where
 registers allow (folded producer warps, or N16 tiles), the second half's FP4
 conversion overlaps the first half's WGMMA; the unfolded layout runs at 128
 registers, where that overlap spilled from N32 up (ptxas `-v`: 28 B at K128,
 52 B at K256), so it waits for the first half instead. A block is
-the output of one M=256 task tile, so the option needs swap-AB M=256 without
-ping-pong and is not available with `knobs="auto"`; every current MXFP4 and
-NVFP4 default tactic qualifies.
+the output of one M=256 task tile, so it needs swap-AB M=256 without
+ping-pong; every current MXFP4 and NVFP4 default tactic qualifies. Autotune
+(`knobs="auto"`) and the heuristic fallback consider only those tactics, and
+1x128 winners are cached under their own tuning identity (1x64 entries keep
+theirs). Manual geometry without a tile defaults to M=256 for 1x128.
 
-It stays opt-in because it changes numerics. On synthetic data (the
+The block size changes numerics. On synthetic data (the
 benchmark's BF16 randn/sqrt(K) weights quantized to MXFP4, per-token FP8
 input, clamp 10, H2048/I1024, 512 tokens) the FC2 output error against an
 unquantized h grows from 2.09% to 2.26% relative L2 (+8%); with 1% of the h
@@ -1161,6 +1166,38 @@ draining the WGMMA pipeline once per K128 instead of twice. At N16 and N32
 overlapping, T256 was 1.1% (MXFP4) and 0.8% (NVFP4) slower with 128 in every
 round. The T32 / T2048 / T8192 rows, the T512 / T1024 / T4096 rows and the
 T256 row come from three sessions on the same node.
+
+### Folded producer warps and token tile N at small capacities (2026-10-28)
+
+The defaults below T512 use the unfolded layout (one to four dispatch warps,
+128 registers per thread because setmaxnreg is not applied there) with N16
+or N32 tiles; T512 and above fold the producer warps (168 entry registers,
+setmaxnreg effective) with N64. A sweep checked whether folding, and the
+larger N its register budget allows, helps the small capacities. Each arm
+kept the bucket's default tactic, then set one dispatch warp, folded producer
+warps (with early FC1 publication and no store offload) and N16, N32 or N64;
+N8 tails and K256 readiness were turned off where N is not 64. Four H200
+GPUs at 1980 MHz, EP4, H7168/I3072/E384, top-k 6, block-permutation routing,
+`fc2_act_scale_k=128`, four alternating rounds; the change is the median of
+the per-round ratios against the default tactic (every arm's output matched
+the default bitwise; the N64 arm at T512 and above is the default tactic, an
+A/A control within 0.4%):
+
+| Tokens/rank | Default | MX fold N16 | MX fold N32 | MX fold N64 | NV fold N16 | NV fold N32 | NV fold N64 |
+|---:|:---|---:|---:|---:|---:|---:|---:|
+| 32 | N16, unfolded | +1.5% | +8.4% | +30.4% | +1.7% | +6.6% | +25.2% |
+| 128 | N16, unfolded | +1.2% | +5.8% | +28.5% | +1.4% | +5.7% | +24.2% |
+| 256 | N32, unfolded | +34.5% | -2.3% | +19.6% | +30.4% | +0.8% | +17.1% |
+| 512 | N64, folded | +53.8% | +8.8% | -0.1% | +50.1% | +11.1% | +0.4% |
+| 1024 | N64, folded | +102.4% | +35.0% | -0.1% | +101.9% | +41.6% | +0.3% |
+| 2048 | N64, folded | +117.4% | +37.8% | -0.1% | +115.3% | +33.4% | +0.0% |
+
+The best N follows the routed tokens per expert (about 2 at T32, 8 at T128,
+16 at T256): a larger N only adds padded MMA work, so the folded register
+budget does not pay below T512, and folding at the default N costs 1-2% at
+T32 and T128. The one gain, MXFP4 T256 folded N32 (-2.3%, K128), comes from
+the 1x128 FC2 conversion overlap that only the folded layout keeps; the
+heuristic table is unchanged.
 
 ### Reproducing tuning and direct benchmark runs
 

@@ -280,6 +280,15 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "bypasses cache/heuristic selection and conflicts with manual tactic flags.",
     )
     p.add_argument(
+        "--fc2-act-scale-k",
+        type=int,
+        choices=(64, 128),
+        default=None,
+        help="MXFP4 FC2-activation (h) scale block; omitted uses the backend "
+        "default (128, M=256 cooperative tactics only). Pass 64 to replay M=128 "
+        "or ping-pong tactics.",
+    )
+    p.add_argument(
         "--group-hint",
         type=int,
         default=None,
@@ -1117,6 +1126,11 @@ def _megakernel_config(
             gate_up_clamp=args.gate_up_clamp,
             enable_in_kernel_fc2_reduce=False,
             routing_profile=sm90_routing_profile_from_benchmark_mode(args.routing_mode),
+            **(
+                {}
+                if args.fc2_act_scale_k is None
+                else {"fc2_act_scale_k": args.fc2_act_scale_k}
+            ),
         )
 
     from flashinfer.moe_ep import Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig

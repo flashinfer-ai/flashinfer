@@ -27,10 +27,11 @@ Fp8Fc2ActivationScaleK = 128
 Fp8ActSfPlanes = 4
 Fp8Fc2ActSfPlanesPerKTile = Fp8BlockScaleK // Fp8Fc2ActivationScaleK
 Fp8Fc2ActSfKTilesPerGroup = Fp8ActSfPlanes // Fp8Fc2ActSfPlanesPerKTile
-# The Hopper MXFP4 / NVFP4 x FP8 backends (fp8_scale_mode="mxfp4_hybrid")
+# The Hopper MXFP4 / NVFP4 x FP8 kernels (fp8_scale_mode="mxfp4_hybrid")
 # default to a 1x64 h block (two scale planes per K128 tile); the MXFP4 mega
-# kernel's mxfp4_fc2_act_scale_k=128 opts into the 1x128 block.  Shared kernel
-# code asks the kernel (_fc2_activation_scale_k()) for the block in use.
+# kernel's mxfp4_fc2_act_scale_k=128 selects the 1x128 block, which the
+# flashinfer MXFP4 / NVFP4 configs use by default (fc2_act_scale_k).  Shared
+# kernel code asks the kernel (_fc2_activation_scale_k()) for the block in use.
 Fp8Mxfp4HybridFc2ActivationScaleK = 64
 
 
