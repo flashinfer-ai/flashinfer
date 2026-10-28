@@ -1084,6 +1084,10 @@ export FLASHINFER_JIT_CACHE_PROVIDER_ARCHS="9.0a"
 python -m build --no-isolation --wheel flashinfer-jit-cache
 ```
 
+Provider builds explicitly enable `add_cute_dsl`; generic AOT builds default it
+to false. Matching CuTe objects also require the builder's Python ABI, Torch,
+TVM-FFI, and DSL fingerprint; otherwise runtime falls back to JIT.
+
 The provider build runs `flashinfer/aot.py`, which calls the registered
 `gen_*_module()` functions and pre-compiles them for exactly one architecture.
 The shim contains metadata and exact dependencies, not compiled kernels. Use

@@ -91,7 +91,7 @@ def _get_sm100_block_scaled_tactics(
                             device
                         ).multi_processor_count
                         cta_wave_ratio = cta_nums / sm_count
-                        if not (0.5 < cta_wave_ratio < 1.0 or real_k >= 8192):
+                        if not (0.5 < cta_wave_ratio < 1.0):
                             continue
 
                     valid_tactics.append(

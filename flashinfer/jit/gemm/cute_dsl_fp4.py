@@ -47,7 +47,7 @@ def mm_fp4_aot_configs(arch: str) -> dict[str, tuple]:
     sm_version = int(arch[2:-1])
     _get_mm_fp4_kernel_classes(sm_version, require_native=True)
 
-    payloads: dict[str, tuple] = {}
+    configs: dict[str, tuple] = {}
     for use_nvfp4, dtype, pdl in product(
         (True, False), (torch.float16, torch.bfloat16), (False, True)
     ):
@@ -85,10 +85,10 @@ def mm_fp4_aot_configs(arch: str) -> dict[str, tuple]:
                     policy,
                 )
                 name = _blockscaled_kernel_disk_name(key, 1, None)
-                if name in payloads and payloads[name] != key:
+                if name in configs and configs[name] != key:
                     raise RuntimeError(f"FP4 specialization name collision: {name}")
-                payloads[name] = key
-    return dict(sorted(payloads.items()))
+                configs[name] = key
+    return dict(sorted(configs.items()))
 
 
 def make_mm_fp4_aot_spec(cache_key):

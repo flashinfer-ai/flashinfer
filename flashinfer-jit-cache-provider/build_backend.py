@@ -118,7 +118,7 @@ def _build_aot_modules(verbose: bool = True) -> None:
         out_dir=jit_cache_dir,
         build_dir=build_dir,
         project_root=PROJECT_ROOT,
-        config=None,
+        config={"add_cute_dsl": True},
         verbose=verbose,
         skip_prebuilt=False,
     )

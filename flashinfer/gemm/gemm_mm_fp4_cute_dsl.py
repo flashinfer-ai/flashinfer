@@ -46,7 +46,7 @@ def _get_mm_fp4_kernel_classes(sm_version: int, require_native: bool = False):
     """Resolve optional FP4 families without making runtime/AOT callers import them.
 
     SM103 currently uses the SM100 family. Native Rubin and 3xFP4 families
-    are offered on SM107 when their DSL APIs are present; AOT requires both.
+    are offered on SM107 when their DSL APIs are present; AOT requires Rubin.
     """
     sm103 = sm107 = None
     if sm_version == 107:
@@ -57,8 +57,7 @@ def _get_mm_fp4_kernel_classes(sm_version: int, require_native: bool = False):
 
             sm103 = Sm103BlockScaledPersistentDenseGemmKernel
         except ImportError:
-            if require_native:
-                raise
+            pass
         try:
             from .kernels.dense_blockscaled_gemm_sm107 import (
                 Sm107BlockScaledPersistentDenseGemmKernel,
@@ -147,17 +146,12 @@ def _get_mm_fp4_cute_dsl_tactics(
                     )
                 )
 
-    # Shared by the SM103 and SM107 tactic blocks below. Hoisted out of
-    # the SM103 block: the two blocks have independent guards (the SM103
-    # kernel needs the internal cutlass-dsl wheel, the SM107 one needs
-    # rubin_helpers), so on a public DSL with Sm103Kernel None but
-    # Sm107Kernel present the SM107 block would otherwise reference these
-    # before assignment.
+    # Alignment checks shared by the optional 3xFP4 and native Rubin families.
     batch_size = 1
     m_aligned = m % 8 == 0
     n_aligned = n % 8 == 0
 
-    # --- SM103 tactics (only on SM103) ---
+    # 3xFP4 tactics when the optional family is available.
     if sm_version in [103, 107] and Sm103Kernel is not None:
         sm103_mma_tiler_candidates = [
             (128, 128),
@@ -304,7 +298,6 @@ def _blockscaled_gemm_cache_key_files() -> tuple:
     from .kernels import (
         dense_blockscaled_gemm_sm100,
         dense_blockscaled_gemm_sm100_common,
-        dense_blockscaled_gemm_sm103,
         dense_blockscaled_gemm_sm100_splitk,
         epilogue_utils,
         utils,
@@ -315,7 +308,9 @@ def _blockscaled_gemm_cache_key_files() -> tuple:
         os.path.join(os.path.dirname(__file__), "gemm_mm_mxfp8_cute_dsl.py"),
         dense_blockscaled_gemm_sm100.__file__,
         dense_blockscaled_gemm_sm100_common.__file__,
-        dense_blockscaled_gemm_sm103.__file__,
+        os.path.join(
+            os.path.dirname(__file__), "kernels", "dense_blockscaled_gemm_sm103.py"
+        ),
         dense_blockscaled_gemm_sm100_splitk.__file__,
         epilogue_utils.__file__,
         utils.__file__,
@@ -348,7 +343,7 @@ def _compile_block_scaled_gemm(
     """Compile a block-scaled GEMM kernel via CuTe DSL and cache it.
 
     ``make_gemm_kernel`` is a zero-arg callable that returns a kernel instance
-    (Sm100 or Sm103).  It is only invoked on a cache miss.
+    It is only invoked on a cache miss.
 
     TVM-FFI compilation pattern:
       - A, B, C, alpha: make_fake_compact_tensor -> torch tensors
@@ -374,6 +369,7 @@ def _compile_block_scaled_gemm(
     launch_cluster_size = cluster_shape_mn[0] * cluster_shape_mn[1] * cluster_shape_k
     max_active_clusters = get_max_active_clusters(launch_cluster_size)
 
+    dynamic_occupancy = cache_module_name in ("mm_fp4", "mm_mxfp8")
     compile_kernel = _make_blockscaled_gemm_compile_fn(
         gemm,
         ab_cutlass_dtype=ab_cutlass_dtype,
@@ -387,7 +383,7 @@ def _compile_block_scaled_gemm(
         batch_size=batch_size,
         max_active_clusters=max_active_clusters,
         per_token_alpha=per_token_alpha,
-        dynamic_max_active_clusters=cache_module_name in ("mm_fp4", "mm_mxfp8"),
+        dynamic_max_active_clusters=dynamic_occupancy,
     )
 
     if cache_module_name is None:
@@ -400,9 +396,7 @@ def _compile_block_scaled_gemm(
             _blockscaled_kernel_disk_name(
                 cache_key,
                 batch_size,
-                None
-                if cache_module_name in ("mm_fp4", "mm_mxfp8")
-                else max_active_clusters,
+                None if dynamic_occupancy else max_active_clusters,
             ),
             compile_kernel,
             extra_key_files=_blockscaled_gemm_cache_key_files(),

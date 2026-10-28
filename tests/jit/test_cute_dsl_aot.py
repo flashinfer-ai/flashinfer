@@ -1,4 +1,4 @@
-"""Runtime cache compatibility and numerical FP4 provider-loading tests."""
+"""Runtime cache compatibility and numerical GEMM provider-loading tests."""
 
 import json
 
@@ -74,16 +74,28 @@ def test_provider_objects_are_loaded_read_only(monkeypatch, tmp_path, mismatch):
     assert obj.read_bytes() == b"object"
 
 
-@pytest.mark.parametrize("use_nvfp4", [True, False])
-@pytest.mark.parametrize("per_token", [False, True])
+@pytest.mark.parametrize(
+    "use_nvfp4,per_token,family,pdl",
+    [
+        (True, False, "sm100", True),
+        (False, False, "sm100", False),
+        (True, True, "sm100", False),
+        (False, True, "sm100", True),
+        (True, False, "sm100sk", True),
+        (True, False, "sm103", False),
+        (True, False, "sm107", False),
+    ],
+)
 def test_fp4_runs_from_provider_with_jit_disabled(
-    monkeypatch, tmp_path, use_nvfp4, per_token
+    monkeypatch, tmp_path, use_nvfp4, per_token, family, pdl
 ):
     if not torch.cuda.is_available():
         pytest.skip("Requires SM100/103/107 GPU")
     major, minor = torch.cuda.get_device_capability()
     if (major, minor) not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("Requires SM100/103/107 GPU")
+    if family in ("sm103", "sm107") and minor != 7:
+        pytest.skip("Requires Rubin kernel families")
     if minor == 7 and per_token:
         pytest.skip("Public per-token alpha is not supported on Rubin")
     import cutlass.cute as cute
@@ -97,15 +109,21 @@ def test_fp4_runs_from_provider_with_jit_disabled(
     monkeypatch.setenv("CUTE_DSL_ARCH", arch.replace("sm", "sm_", 1))
     monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path / "build")
     monkeypatch.setattr(jit_env, "FLASHINFER_AOT_PROVIDERS", ())
-    tactic = ((128, 128), (1, 1), False, False, "sm100", None)
+    m = 8 if family == "sm100sk" else 128
+    tactic = {
+        "sm100": ((128, 128), (1, 1), False, False, "sm100", None),
+        "sm100sk": ((128, 8), (1, 1), True, False, "sm100sk", 2),
+        "sm103": ((128, 128), (1, 1), False, False, "sm103", False),
+        "sm107": ((128, 128), (1, 1), False, False, "sm107", (128, 128, 128, 256, 0)),
+    }[family]
 
     config = _mm_fp4_cache_key(
         16 if use_nvfp4 else 32,
         tactic,
-        False,
+        pdl,
         torch.bfloat16,
         "m" if per_token else None,
-        "b_ef",
+        "b_ef" if family == "sm100" else None,
     )
     name = _blockscaled_kernel_disk_name(config, 1, None)
     _compile_aot_kernel(MM_FP4_OPERATION, name, config, arch, tmp_path / "build")
@@ -121,26 +139,31 @@ def test_fp4_runs_from_provider_with_jit_disabled(
     monkeypatch.setattr(jit_env, "FLASHINFER_AOT_PROVIDERS", (provider,))
     monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path / "empty")
     monkeypatch.setattr(gemm_base, "_CUTE_DSL_MM_FP4_KERNEL_CACHE", {})
+    # The DSL initializes a separate device-occupancy probe with cute.compile.
+    # Warm that probe before forbidding GEMM compilation below.
+    from flashinfer.cute_dsl.utils import get_max_active_clusters
+
+    get_max_active_clusters(2 if family == "sm100sk" else 1)
     monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
     monkeypatch.setattr(
         cute, "compile", lambda *args, **kwargs: pytest.fail("JIT compiled")
     )
     # FP4 code 2 is 1.0; E4M3 code 56 and E8M0 code 127 are both 1.0.
-    a = torch.full((128, 256), 0x22, dtype=torch.uint8, device="cuda")
-    b = a.clone()
+    a = torch.full((m, 256), 0x22, dtype=torch.uint8, device="cuda")
+    b = torch.full((128, 256), 0x22, dtype=torch.uint8, device="cuda")
     scales = torch.full(
         (128, 32), 56 if use_nvfp4 else 127, dtype=torch.uint8, device="cuda"
     )
-    alpha = torch.linspace(0.5, 1.0, 128 if per_token else 1, device="cuda")
-    out = torch.empty((128, 128), dtype=torch.bfloat16, device="cuda")
+    alpha = torch.linspace(0.5, 1.0, m if per_token else 1, device="cuda")
+    out = torch.empty((m, 128), dtype=torch.bfloat16, device="cuda")
     runner = gemm_base._cute_dsl_gemm_fp4_runner(
-        major, minor, False, out.dtype, use_nvfp4
+        major, minor, pdl, out.dtype, use_nvfp4
     )
     runner.forward(
         (a, b.T, scales, scales.T, alpha, None, out, None, None, None), tactic=tactic
     )
     expected = (
-        (512 * alpha).expand(128, 128).T if per_token else torch.full_like(out, 256)
+        (512 * alpha).expand(128, m).T if per_token else torch.full_like(out, 256)
     )
     torch.testing.assert_close(out.float(), expected.float(), rtol=0.01, atol=0)
     assert not (tmp_path / "empty" / module_name).exists()
@@ -191,6 +214,11 @@ def test_mxfp8_runs_from_provider_with_jit_disabled(monkeypatch, tmp_path, famil
     monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path / "empty")
     monkeypatch.setattr(gemm_base, "_CUTE_DSL_MM_MXFP8_KERNEL_CACHE", {})
     monkeypatch.setattr(gemm_base, "_CUTE_DSL_MM_MXFP8_SM107_KERNEL_CACHE", {})
+    # The DSL initializes a separate device-occupancy probe with cute.compile.
+    # Warm that probe before forbidding GEMM compilation below.
+    from flashinfer.cute_dsl.utils import get_max_active_clusters
+
+    get_max_active_clusters(2 if family == "cluster_splitk" else 1)
     monkeypatch.setenv("FLASHINFER_DISABLE_JIT", "1")
     monkeypatch.setattr(
         cute, "compile", lambda *args, **kwargs: pytest.fail("JIT compiled")

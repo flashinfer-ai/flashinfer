@@ -514,7 +514,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
         sfb_tensor: cute.Tensor,
         c_tensor: cute.Tensor,
         alpha: cute.Tensor,  # Single-element tensor containing alpha value
-        max_active_clusters: cutlass.Constexpr,
+        max_active_clusters: cutlass.Int32,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
@@ -531,7 +531,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
             sfa_tensor (cute.Tensor): Scale factor tensor A
             sfb_tensor (cute.Tensor): Scale factor tensor B
             c_tensor (cute.Tensor): Output tensor C
-            max_active_clusters (cutlass.Constexpr): Maximum number of active clusters
+            max_active_clusters (cutlass.Int32): Maximum number of active clusters
             stream (cuda.CUstream): CUDA stream for asynchronous execution
             epilogue_op (cutlass.Constexpr): Optional elementwise lambda function to apply to the output tensor
 
