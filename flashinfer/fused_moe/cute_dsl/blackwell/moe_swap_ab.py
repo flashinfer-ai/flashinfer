@@ -96,7 +96,6 @@ def _run_blockscaled_gemm(
     use_clc_scheduler,
     sm_count=None,
     publish_routing_before_signal=False,
-    weight_scale_cache_policy: str = "normal",
     activation_cache_policy: str = "normal",
 ):
     cache_policies = {
@@ -104,10 +103,10 @@ def _run_blockscaled_gemm(
         "evict_first": 0x12F0000000000000,
         "evict_last": 0x14F0000000000000,
     }
-    for policy in (weight_scale_cache_policy, activation_cache_policy):
-        if policy not in cache_policies:
-            raise ValueError(f"Unsupported block-scaled cache policy: {policy!r}")
-    weight_scale_cache_hint = cache_policies[weight_scale_cache_policy]
+    if activation_cache_policy not in cache_policies:
+        raise ValueError(
+            f"Unsupported block-scaled cache policy: {activation_cache_policy!r}"
+        )
     activation_cache_hint = cache_policies[activation_cache_policy]
     if output.dtype == torch.uint8:
         output_dtype = cutlass.Float4E2M1FN
@@ -220,7 +219,6 @@ def _run_blockscaled_gemm(
         pdl_signal_at,
         use_clc_scheduler,
         publish_routing_before_signal,
-        weight_scale_cache_hint,
         activation_cache_hint,
         activation_type,
         swiglu_alpha,
@@ -259,7 +257,6 @@ def _run_blockscaled_gemm(
             num_tile_info_stages=1,
             prefetch_weights_before_wait=enable_pdl,
             publish_routing_before_signal=publish_routing_before_signal,
-            weight_scale_cache_policy=weight_scale_cache_hint,
             activation_cache_policy=activation_cache_hint,
             generate_sfc=output_sf is not None,
             output_dtype=output_dtype,
@@ -470,7 +467,6 @@ def launch_gather_gemm(
         overlap_activation_accumulators=None,
         pdl_signal_at="startup",
         publish_routing_before_signal=enable_pdl,
-        weight_scale_cache_policy="evict_first",
         activation_cache_policy="evict_last",
         use_clc_scheduler=use_clc_scheduler,
         sm_count=sm_count,
@@ -583,7 +579,6 @@ def launch_finalize_gemm(
         k_steps=k_steps,
         overlap_activation_accumulators=False,
         pdl_signal_at="producer_exit",
-        weight_scale_cache_policy="evict_first",
         activation_cache_policy="evict_last",
         use_clc_scheduler=use_clc_scheduler,
         sm_count=sm_count,

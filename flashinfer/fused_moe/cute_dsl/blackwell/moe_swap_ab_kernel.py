@@ -1324,7 +1324,6 @@ class Sm100BlockScaledGroupedGemmKernel:
         generate_sfc=False,
         prefetch_weights_before_wait=False,
         publish_routing_before_signal=False,
-        weight_scale_cache_policy=0,
         activation_cache_policy=0,
         enable_iket=False,
     ):
@@ -1349,7 +1348,6 @@ class Sm100BlockScaledGroupedGemmKernel:
         self.pdl_signal_at = pdl_signal_at
         self.prefetch_weights_before_wait = prefetch_weights_before_wait
         self.publish_routing_before_signal = publish_routing_before_signal
-        self.weight_scale_cache_policy = weight_scale_cache_policy
         self.activation_cache_policy = activation_cache_policy
         self.enable_iket = enable_iket
         if enable_iket:
@@ -1466,6 +1464,8 @@ class Sm100BlockScaledGroupedGemmKernel:
         self.requested_num_stages = num_stages
         self.num_stages = num_stages
         self.overlap_epilogue = overlap_epilogue
+        # TMA-only producers need one warp when the epilogue has its own warpgroup.
+        self.producer_warps = 1 if self.tma_sfb and self.overlap_epilogue else 4
         self.threads_per_cta = 288 if self.overlap_epilogue else 160
         self.mma_warp = self.threads_per_cta // 32 - 1
         self.schedule_warp = self.threads_per_cta // 32
@@ -1489,8 +1489,6 @@ class Sm100BlockScaledGroupedGemmKernel:
         self.tmem_cols = (
             1 << (self.acc_stages * self.acc_cols + scale_cols - 1).bit_length()
         )
-        # Stream weights while preserving activation reuse across channel tiles.
-        self.weight_cache_policy = 0x12F0000000000000  # EVICT_FIRST
         self.epilogue = Sm100BlockScaledMoeEpilogue(
             mma_tiler_mnk=(128, mma_tiler_mnk[1], mma_tiler_mnk[2]),
             activation_type=activation_type,
@@ -2304,6 +2302,19 @@ class Sm100BlockScaledGroupedGemmKernel:
         return tile, expert, valid, state
 
     @cute.jit
+    def weight_cache_hint(self, route, expert, expert_idx, num_routes):
+        # Preserve weights reused by other token tiles of the same expert.
+        has_next = (route + 1 < num_routes) & (
+            expert_idx[cutlass.min(route + 1, num_routes - 1)] == expert
+        )
+        has_previous = (route > 0) & (expert_idx[cutlass.max(route - 1, 0)] == expert)
+        return (
+            cutlass.Int64(0)
+            if has_next | has_previous
+            else cutlass.Int64(0x12F0000000000000)
+        )
+
+    @cute.jit
     def load_weight_stage(
         self,
         a_pipe,
@@ -2318,6 +2329,7 @@ class Sm100BlockScaledGroupedGemmKernel:
         total_m_tiles,
         k_tile,
         expert,
+        weight_cache_hint,
     ):
         # TMA copy lowering elects internally; keep the whole warp active.
         if cutlass.const_expr(self.enable_iket):
@@ -2344,7 +2356,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                     )
                 ],
                 tma_bar_ptr=a_pipe.producer_get_barrier(producer),
-                cache_policy=cutlass.Int64(self.weight_cache_policy),
+                cache_policy=weight_cache_hint,
             )
             cute.copy(
                 tma_atom_sfa,
@@ -2363,7 +2375,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                     )
                 ],
                 tma_bar_ptr=a_pipe.producer_get_barrier(producer),
-                cache_policy=cutlass.Int64(self.weight_scale_cache_policy),
+                cache_policy=weight_cache_hint,
             )
         if cutlass.const_expr(self.enable_iket):
             _iket.range_pop()
@@ -2461,7 +2473,8 @@ class Sm100BlockScaledGroupedGemmKernel:
                 num_stages=self.num_tile_info_stages,
                 producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
                 consumer_group=pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread, self.threads_per_cta - 32
+                    pipeline.Agent.Thread,
+                    32 * (self.producer_warps + 4 * int(self.overlap_epilogue) + 1),
                 ),
                 defer_sync=True,
             )
@@ -2551,6 +2564,12 @@ class Sm100BlockScaledGroupedGemmKernel:
             if warp == 0:
                 if first_tile_valid and first_tile < num_tiles[0] * total_m_tiles:
                     first_expert = expert_idx[first_tile // total_m_tiles]
+                    first_weight_hint = self.weight_cache_hint(
+                        first_tile // total_m_tiles,
+                        first_expert,
+                        expert_idx,
+                        num_tiles[0],
+                    )
                     first_producer = pipeline.make_pipeline_state(
                         pipeline.PipelineUserType.Producer, self.num_stages
                     )
@@ -2570,6 +2589,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                             total_m_tiles,
                             k_tile,
                             first_expert,
+                            first_weight_hint,
                         )
                         first_producer.advance()
                     if cutlass.const_expr(self.enable_iket):
@@ -2614,7 +2634,7 @@ class Sm100BlockScaledGroupedGemmKernel:
             )
         padded_k = cute.ceil_div(weights.shape[1], self.sf_block_k) * self.sf_block_k
 
-        if warp < 4:
+        if warp < self.producer_warps:
             copy_sf = cute.make_copy_atom(
                 cpasync.CopyG2SOp(), self.sf_dtype, num_bits_per_copy=32
             )
@@ -2665,6 +2685,11 @@ class Sm100BlockScaledGroupedGemmKernel:
                     cute.group_modes(sB_copy, 0, 2),
                     cute.group_modes(gB, 0, 2),
                 )
+                weight_hint = cutlass.Int64(0)
+                if warp == 0:
+                    weight_hint = self.weight_cache_hint(
+                        route_idx, expert, expert_idx, num_routed_tiles
+                    )
                 # Give each lane a different SMEM bank for its four scale bytes.
                 sf_row = 8 * warp + 32 * ((tidx % 32) // 8) + tidx % 8
                 activation_sf_offsets = cute.make_rmem_tensor(
@@ -2706,6 +2731,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                                     total_m_tiles,
                                     k_tile,
                                     expert,
+                                    weight_hint,
                                 )
                         else:
                             self.load_weight_stage(
@@ -2721,6 +2747,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                                 total_m_tiles,
                                 k_tile,
                                 expert,
+                                weight_hint,
                             )
                         if cutlass.const_expr(self.enable_iket):
                             _iket.range_push("producer_activation_tma")
@@ -2847,7 +2874,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                     griddepcontrol_launch_dependents()
                 # One empty completion protects all operand storage, including SF.
                 a_pipe.producer_tail(producer.clone())
-        elif warp < (8 if self.overlap_epilogue else 4):
+        elif warp >= 4 and warp < (8 if self.overlap_epilogue else 4):
             # Normalization is invariant across experts and scheduled tiles.
             norm = cutlass.Float32(1.0)
             if cutlass.const_expr(norm_const is not None):
@@ -3206,4 +3233,3 @@ class Sm100BlockScaledGroupedGemmKernel:
         if warp == 0:
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr, num_columns=self.tmem_cols)
-

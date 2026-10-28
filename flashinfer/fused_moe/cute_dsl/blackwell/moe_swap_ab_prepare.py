@@ -115,6 +115,10 @@ class PrepareRouted:
             num_bits_per_copy=self.copy_bits,
         )
         values = cute.make_rmem_tensor((self.vector_words,), cutlass.Uint32)
+        if cutlass.const_expr(self.sf_blocks > 0):
+            sf_values = cute.make_rmem_tensor(
+                (cute.ceil_div(self.sf_blocks, self.threads),), cutlass.Uint32
+            )
         for row in cutlass.range(bidx, rows, self.grid):
             valid = cutlass.Boolean(False)
             source = cutlass.Int32(0)
@@ -125,6 +129,18 @@ class PrepareRouted:
                 valid = row < limits[row // self.route_tile]
                 if valid:
                     source = mapping[row] // self.top_k
+            if cutlass.const_expr(self.sf_blocks > 0):
+                for iteration in cutlass.range_constexpr(
+                    cute.ceil_div(self.sf_blocks, self.threads)
+                ):
+                    block = tidx + iteration * self.threads
+                    sf_values[iteration] = cutlass.Uint32(0)
+                    if valid and block < self.sf_blocks:
+                        src = cute.make_tensor(
+                            sf_ptr + cutlass.Int64(source) * self.sf_blocks + block,
+                            cute.make_layout((1,)),
+                        )
+                        sf_values[iteration] = cutlass.Uint32(src[0])
             if valid:
                 for iteration in cutlass.range_constexpr(
                     cute.ceil_div(self.payload_words, self.threads * self.vector_words)
@@ -159,13 +175,6 @@ class PrepareRouted:
                 ):
                     block = tidx + iteration * self.threads
                     if block < self.sf_blocks:
-                        value = cutlass.Uint32(0)
-                        if valid:
-                            src = cute.make_tensor(
-                                sf_ptr + cutlass.Int64(source) * self.sf_blocks + block,
-                                cute.make_layout((1,)),
-                            )
-                            value = cutlass.Uint32(src[0])
                         offset = (
                             cutlass.Int64(row // 128) * self.sf_blocks * 128
                             + block * 128
@@ -175,7 +184,7 @@ class PrepareRouted:
                         target = cute.make_tensor(
                             routed_sf_ptr + offset, cute.make_layout((1,))
                         )
-                        target[0] = value
+                        target[0] = sf_values[iteration]
 
 
 def _sf_columns(activation, sf_vec_size):
@@ -227,7 +236,9 @@ def prepare(
         if routed_sf is not None:
             raise ValueError("unscaled preparation requires no SF storage")
         if any(x.data_ptr() % 16 for x in (activation, routed)) or payload_bytes % 16:
-            raise ValueError("W4A16 permutation requires 16-byte aligned rows and storage")
+            raise ValueError(
+                "W4A16 permutation requires 16-byte aligned rows and storage"
+            )
         sf_columns = 0
     else:
         if routed_sf is None:
