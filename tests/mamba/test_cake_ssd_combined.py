@@ -4590,8 +4590,9 @@ def test_source_host_template_binds_stage_arguments_in_loader_order():
 
 
 def test_source_runner_binds_preprocess_status_without_gpu(monkeypatch):
-    """The runner owns two zeroed int32 status words per device, binds them as
-    ``preprocess_status`` on every call and exposes word 0 through the
+    """The runner owns zeroed int32 status words per device -- two, then one
+    per pair of SMs and one per 32 pairs (none on this one-SM device) -- binds
+    them as ``preprocess_status`` on every call and exposes word 0 through the
     synchronizing debug accessor ``seq_idx_status``; word 1 is the item
     counter of the sm_107a claim programs, which every launch leaves 0."""
 
@@ -4802,16 +4803,19 @@ def test_source_program_table_names_shipped_sources():
         "exactone_f16_varlen_tableroles",
         "exactone_f32_varlen_tablefirst",
         "exactone_f32_varlen_tableroles",
-    }
+    } | {f"exactpre_{state}_varlen_tailone" for state in ("bf16", "f16", "f32")}
     # The sm_107a-only programs (the claim programs, the two-kernel and fused
-    # initial-state bulk programs and the one-launch programs in the
-    # tablefirst / tableroles prologue forms): their ``_SM107_MODULES`` entry
-    # is their sole source.
+    # initial-state bulk programs, the two-kernel one-CTA pair programs and
+    # the one-launch programs in the tablefirst / tableroles prologue forms):
+    # their ``_SM107_MODULES`` entry is their sole source.
     assert {
         "exactpre_bf16_varlen_claim",
         "exactpre_f32_varlen_claim",
         "exactpre_bf16_varlen_ibulk",
         "exactpre_f16_varlen_ibulk",
+        "exactpre_bf16_varlen_tailone",
+        "exactpre_f16_varlen_tailone",
+        "exactpre_f32_varlen_tailone",
         "exactfused_bf16_varlen_ibulk",
         "exactfused_f16_varlen_ibulk",
         "exactone_bf16_varlen_tablefirst",
@@ -4894,7 +4898,7 @@ def test_source_program_table_names_shipped_sources():
         }
         | module._SM107_ONLY_PROGRAMS
     )
-    assert len(module._SM107_MODULES) == 52
+    assert len(module._SM107_MODULES) == 55
     assert set(module._SM107_MODULES) <= set(module._PROGRAMS)
     assert set(module._PROGRAMS) - set(module._SM107_MODULES) == {
         name for name in module._PROGRAMS if name.startswith(("exact_", "exactmeta_"))
@@ -4967,6 +4971,7 @@ def test_source_program_table_names_shipped_sources():
             assert variant_name in (
                 "noring",
                 "tail",
+                "tailone",
                 "claim",
                 "ibulk",
                 "tablefirst",
@@ -4979,8 +4984,10 @@ def test_source_program_table_names_shipped_sources():
                 "exactone",
                 "exactpre",
             )
-            if variant_name in ("tail", "claim"):
+            if variant_name in ("tail", "tailone", "claim"):
                 assert family == "exactpre"
+            if variant_name == "tailone":
+                assert mode == "varlen"
             if variant_name == "ibulk":
                 assert family in ("exactpre", "exactfused")
             if variant_name == "claim":
@@ -4989,9 +4996,8 @@ def test_source_program_table_names_shipped_sources():
                 assert (state_key, mode) in (("bf16", "varlen"), ("f16", "varlen"))
             if variant_name in ("tablefirst", "tableroles"):
                 assert family == "exactone" and mode == "varlen"
-            assert (variant_name in ("claim", "ibulk", "tablefirst", "tableroles")) == (
-                name in module._SM107_ONLY_PROGRAMS
-            )
+            sm107_only = ("claim", "ibulk", "tailone", "tablefirst", "tableroles")
+            assert (variant_name in sm107_only) == (name in module._SM107_ONLY_PROGRAMS)
             smem_bytes = module._VARIANT_SMEM_BYTES[(family, variant_name)]
             assert (
                 smem_bytes
@@ -5005,6 +5011,7 @@ def test_source_program_table_names_shipped_sources():
                     ("exactpre", "tail"): module._EXACTPRE_TAIL_SMEM_BYTES,
                     ("exactpre", "claim"): module._EXACTPRE_CLAIM_SMEM_BYTES,
                     ("exactpre", "ibulk"): module._EXACTPRE_IBULK_SMEM_BYTES,
+                    ("exactpre", "tailone"): module._EXACTPRE_TAILONE_SMEM_BYTES,
                     ("exactfused", "ibulk"): module._EXACTFUSED_IBULK_SMEM_BYTES,
                 }[(family, variant_name)]
             )
@@ -7193,9 +7200,10 @@ def test_source_exact_scan_variant_programs():
         len([name for name in module._PROGRAMS if name.startswith("exactfused_")]) == 13
     )
     # the two-kernel family: six ring and six ``_tail`` programs, no ``_noring``,
-    # and the sm_107a-only programs: two ``_claim`` and two ``_ibulk``
+    # and the sm_107a-only programs: two ``_claim``, two ``_ibulk`` and three
+    # ``_tailone``
     assert (
-        len([name for name in module._PROGRAMS if name.startswith("exactpre_")]) == 16
+        len([name for name in module._PROGRAMS if name.startswith("exactpre_")]) == 19
     )
     assert not any(name.endswith("_noring") for name in module._EXACTPRE_MODULES)
     assert len([name for name in module._PROGRAMS if name.startswith("chunkpar_")]) == 6
@@ -7213,7 +7221,7 @@ def test_source_exact_scan_variant_programs():
     assert (
         len([name for name in module._PROGRAMS if name.startswith("exactone_")]) == 11
     )
-    assert len(module._PROGRAMS) == 68
+    assert len(module._PROGRAMS) == 71
 
 
 @pytest.mark.parametrize(
@@ -7701,6 +7709,94 @@ def test_source_sm107_long_varlen_items_take_the_tail_pair_program(
         assert name == "exactpre_bf16_varlen_tail"
     else:
         assert name == "exactpre_bf16_varlen"
+
+
+def test_source_sm107_tail_one_cta_rule():
+    """``tail_one_cta_selected``: on SM107 a packed-varlen pair-program call
+    whose items span fewer host-known chunks than the full-grid admission's
+    ``long_chunks_varlen`` runs the one-CTA pair program; batched calls,
+    longer items and other capabilities keep the 2-CTA pair program."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    assert frozenset({(10, 7)}) == module._TAIL_ONE_CTA_CAPABILITIES
+    long_chunks = module.tail_full_grid_rule((10, 7)).long_chunks_varlen
+    assert long_chunks == 16
+
+    def one(**over):
+        kwargs = {"capability": (10, 7), "mode_varlen": True, "chunks_per_item": 8}
+        kwargs.update(over)
+        return module.tail_one_cta_selected(**kwargs)
+
+    assert one()
+    assert one(chunks_per_item=long_chunks - 1)
+    assert not one(chunks_per_item=long_chunks)
+    assert not one(chunks_per_item=32)
+    assert not one(mode_varlen=False)
+    assert not one(capability=(10, 3))
+    assert not one(capability=(10, 0))
+    assert not one(capability=None)
+    # the programs it selects are exactly the sm_107a-only one-CTA entries:
+    # the two-kernel family's PDL launch, no cluster, their own SMEM literal
+    assert {
+        module._program_name("exactpre", state_dtype, True, "tailone")
+        for state_dtype in (torch.bfloat16, torch.float16, torch.float32)
+    } == {name for name in module._SM107_ONLY_PROGRAMS if name.endswith("_tailone")}
+    for state in ("bf16", "f16", "f32"):
+        name = f"exactpre_{state}_varlen_tailone"
+        program = module._arch_program(name, "sm_107a")
+        assert program.family == "exactpre" and program.variant == "tailone"
+        assert program.cluster_dims == (1, 1, 1)
+        assert program.main_smem_bytes == module._EXACTPRE_TAILONE_SMEM_BYTES
+        assert module._main_pdl(name, "sm_107a")
+        assert program.main.kernel == (
+            f"kernel_mamba_ssd_q_tmem_alias_{state}_varlen_precomputed_tailone"
+        )
+
+
+@pytest.mark.parametrize("has_z", (False, True))
+def test_source_sm107_short_varlen_pair_calls_take_the_one_cta_pair_program(
+    monkeypatch, has_z
+):
+    """On SM107 a packed-varlen call of 32 sequences x 1024 tokens x 8 heads
+    (256 items of 8 chunks on 212 SMs, the full-grid pair admission), with or
+    without z, runs the one-CTA pair program on the pair grid; the runner's
+    status words hold one per pair of SMs and one per 32 pairs past the first
+    two."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = []
+    runner = _cpu_forwarding_runner(
+        module,
+        monkeypatch,
+        calls,
+        nheads=8,
+        ngroups=8,
+        has_varlen=True,
+        has_initial_states=True,
+        has_z=has_z,
+        arch="sm_107a",
+    )
+    monkeypatch.setattr(module, "_sm_count", lambda _: 212)
+    num_seqs, tokens = 32, 1024
+    seqlen = num_seqs * tokens
+    x = torch.empty((1, seqlen, 8, 64), dtype=torch.bfloat16)
+    dt = torch.empty((1, seqlen, 8), dtype=torch.float32)
+    A = torch.empty((8,), dtype=torch.float32)
+    B = torch.empty((1, seqlen, 8, 128), dtype=torch.bfloat16)
+    C = torch.empty_like(B)
+    kwargs = {
+        "cu_seqlens": torch.arange(0, seqlen + 1, tokens, dtype=torch.int32),
+        "initial_states": torch.empty((num_seqs, 8, 64, 128), dtype=torch.bfloat16),
+    }
+    if has_z:
+        kwargs["z"] = torch.empty_like(x)
+    runner.run(x, dt, A, B, C, **kwargs)
+    ((name, launch),) = calls
+    assert name == "exactpre_bf16_varlen_tailone"
+    assert launch["main_grid"] == (module._tail_grid_size(sm_count=212), 1, 1)
+    status = launch["main"]["preprocess_status"]
+    assert tuple(status.shape) == (2 + 106 + 4,) and status.dtype == torch.int32
+    assert launch["preprocess"]["preprocess_status"] is status
 
 
 def test_source_sm107_ibulk_rule():

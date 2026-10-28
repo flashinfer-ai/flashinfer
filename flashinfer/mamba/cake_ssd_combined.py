@@ -126,7 +126,9 @@ class _Program:
     ``variant`` is the schedule variant of the exact-scan families: ``""``
     (the ring program), ``"noring"``, ``"tail"`` (the two-kernel family's
     2-CTA pair program, ``cluster_dims`` ``(2, 1, 1)``, launched on the even
-    grid :func:`_tail_grid_size`), ``"claim"`` (the two-kernel family's
+    grid :func:`_tail_grid_size`), ``"tailone"`` (the two-kernel family's
+    sm_107a varlen pair program launched as one-CTA clusters on the same
+    grid, :func:`tail_one_cta_selected`), ``"claim"`` (the two-kernel family's
     sm_107a varlen ring program that draws its work items at run time,
     :func:`claim_selected`) or ``"ibulk"`` (the two-kernel family's sm_107a
     packed-varlen ring program loading a work item's initial state as one
@@ -300,9 +302,11 @@ _EXACTONE_MODULES = {
 # the render of the SM100 form (the caller-table and cu_seqlens forms) and
 # the ``exactone_*`` entry the one-launch render, which derives the sequence
 # table in-kernel.  The two-kernel claim programs
-# (``exactpre_<state>_varlen_claim``, :func:`claim_selected`) and
-# initial-state bulk programs (``exactpre_<state>_varlen_ibulk``,
-# :func:`ibulk_selected`) exist on sm_107a only (``_SM107_ONLY_PROGRAMS``),
+# (``exactpre_<state>_varlen_claim``, :func:`claim_selected`), initial-state
+# bulk programs (``exactpre_<state>_varlen_ibulk``, :func:`ibulk_selected`)
+# and one-CTA pair programs (``exactpre_<state>_varlen_tailone``,
+# :func:`tail_one_cta_selected`) exist on sm_107a only
+# (``_SM107_ONLY_PROGRAMS``),
 # as do the fused initial-state bulk programs
 # (``exactfused_<state>_varlen_ibulk``, :func:`fused_ibulk_selected`):
 # their entries are their sole sources (no fold module, never built for
@@ -360,6 +364,9 @@ _SM107_MODULES = {
     "exactone_f32_varlen_tableroles": "mamba_ssd_q_tmem_alias_f32_varlen_tableroles_fd7c260936",
     "exactfused_bf16_varlen_ibulk": "mamba_ssd_q_tmem_alias_bf16_varlen_ibulk_7e3e039507",
     "exactfused_f16_varlen_ibulk": "mamba_ssd_q_tmem_alias_f16_varlen_ibulk_ad95ebc012",
+    "exactpre_bf16_varlen_tailone": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tailone_cb5978f317",
+    "exactpre_f16_varlen_tailone": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_tailone_ed8277f475",
+    "exactpre_f32_varlen_tailone": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_tailone_a6f49c4f67",
 }
 
 _SEGMENT_PREPROCESS = _Kernel(
@@ -454,6 +461,12 @@ _EXACTPRE_IBULK_SMEM_BYTES = 232448
 # initial-state bulk copy's mbarrier); the Cake export reads it for the launch
 # of the ``exactfused_*_ibulk`` table entries.
 _EXACTFUSED_IBULK_SMEM_BYTES = 232448
+# Main dynamic SMEM of the sm_107a one-CTA pair programs
+# (``exactpre_*_varlen_tailone``: the varlen tail-pair programs launched
+# without the 2-CTA cluster, with the rank ticket's slot past the segment
+# bounds); the Cake export reads it for the launch of the
+# ``exactpre_*_tailone`` table entries.
+_EXACTPRE_TAILONE_SMEM_BYTES = 232448
 
 
 # Positional launcher ABI shared by every program: preprocess arguments, its
@@ -729,6 +742,7 @@ _VARIANT_SMEM_BYTES = {
     ("exactpre", "tail"): _EXACTPRE_TAIL_SMEM_BYTES,
     ("exactpre", "claim"): _EXACTPRE_CLAIM_SMEM_BYTES,
     ("exactpre", "ibulk"): _EXACTPRE_IBULK_SMEM_BYTES,
+    ("exactpre", "tailone"): _EXACTPRE_TAILONE_SMEM_BYTES,
     ("exactfused", "ibulk"): _EXACTFUSED_IBULK_SMEM_BYTES,
     ("exactone", "tablefirst"): _EXACTONE_SMEM_BYTES,
     ("exactone", "tableroles"): _EXACTONE_SMEM_BYTES,
@@ -792,10 +806,11 @@ _PROGRAMS: dict[str, _Program] = {
         *_EXACTONE_MODULES.items(),
     )
 }
-# The sm_107a-only programs (the claim and initial-state bulk programs, and
-# the one-launch programs' table forms): their ``_SM107_MODULES`` entry is
-# their main module on every architecture; only capability (10, 7) routes to
-# them (:func:`claim_selected`, :func:`ibulk_selected`,
+# The sm_107a-only programs (the claim, initial-state bulk and one-CTA pair
+# programs, and the one-launch programs' table forms): their
+# ``_SM107_MODULES`` entry is their main module on every architecture; only
+# capability (10, 7) routes to them (:func:`claim_selected`,
+# :func:`ibulk_selected`, :func:`tail_one_cta_selected`,
 # :func:`fused_ibulk_selected`, :func:`exactone_table_variant`).
 _SM107_ONLY_PROGRAMS = frozenset(_SM107_MODULES) - frozenset(_PROGRAMS)
 _PROGRAMS.update(
@@ -810,9 +825,9 @@ def _program_name(
     """The program of ``family`` serving a state dtype in batched or
     packed-varlen mode; ``variant`` names a non-default schedule variant of the
     family (``"noring"`` for the exact-scan families other than the two-kernel
-    one, ``"tail"``, ``"claim"`` or ``"ibulk"`` for the two-kernel exact-scan
-    family, ``"ibulk"`` for the fused one, ``"tablefirst"`` or ``"tableroles"``
-    for the one-launch family)."""
+    one, ``"tail"``, ``"tailone"``, ``"claim"`` or ``"ibulk"`` for the
+    two-kernel exact-scan family, ``"ibulk"`` for the fused one,
+    ``"tablefirst"`` or ``"tableroles"`` for the one-launch family)."""
 
     mode_key = "varlen" if mode_varlen else "batched"
     suffix = f"_{variant}" if variant else ""
@@ -2118,7 +2133,8 @@ def _full_grid_tail_selected(
 
 
 def _tail_grid_size(*, sm_count: int) -> int:
-    """Grid of a ``_tail`` program: one 2-CTA cluster per SM pair."""
+    """Grid of a ``_tail`` program (one 2-CTA cluster per SM pair) and of its
+    one-CTA form ``_tailone`` (CTAs ``2 p`` and ``2 p + 1`` pair ``p``)."""
 
     return 2 * (sm_count // 2)
 
@@ -2161,6 +2177,47 @@ def tail_selected(
     persistent_makespan = -(-total_work // balanced_grid)
     pair_makespan = -(-total_work // pairs) / 2
     return pair_makespan < persistent_makespan
+
+
+# The one-CTA form of the varlen pair program (``_tailone``, sm_107a only):
+# the same pair plan, scan and hand-off over global memory as ``_tail``,
+# launched on the same even grid without the 2-CTA cluster.  CTAs ``2 p`` and
+# ``2 p + 1`` form pair ``p``; each draws its rank from the pair's ticket word
+# in ``preprocess_status`` (the first to draw runs the split item's head), and
+# the receiver of a split item waits on the pair's flag bit, which the head's
+# CTA sets once the parked state is in global memory.  The receiver only waits
+# on a partner that has already drawn its ticket (so it is running), and the
+# head's CTA waits on no other CTA: no co-residency is assumed.  Every complete
+# launch leaves the ticket word and the flag bit 0.  Measured on R200: faster
+# than the 2-CTA cluster launch on the 256-item varlen calls of 8 chunks
+# (perf_varlen_32x8 without z, nem_v1024x2 with z), slower on varlen calls of
+# 32 chunks, which keep the cluster program.
+_TAIL_ONE_CTA_CAPABILITIES = frozenset({(10, 7)})
+
+
+def tail_one_cta_selected(
+    *,
+    capability: Optional[Tuple[int, int]],
+    mode_varlen: bool,
+    chunks_per_item: int,
+) -> bool:
+    """Whether a call :func:`tail_selected` sends to the ``_tail`` pair
+    program runs its one-CTA form ``_tailone`` instead: on SM107, packed
+    varlen, with or without ``z``, items of fewer host-known chunks
+    (:func:`host_chunks_per_item`) than the full-grid admission's
+    ``long_chunks_varlen`` (:class:`_TailFullGridRule`).  Outputs are bitwise
+    those of the pair program."""
+
+    if capability is None:
+        return False
+    key = (int(capability[0]), int(capability[1]))
+    rule = _TAIL_FULL_GRID_RULES.get(key)
+    return (
+        key in _TAIL_ONE_CTA_CAPABILITIES
+        and rule is not None
+        and mode_varlen
+        and chunks_per_item < rule.long_chunks_varlen
+    )
 
 
 def _sequence_arguments(
@@ -2793,12 +2850,18 @@ class CakeSSDCombined:
         self._allocations_in_last_run += 1
 
     def _preprocess_status_buffer(self, device: torch.device) -> torch.Tensor:
-        """The runner-owned ``preprocess_status`` words (two int32 per device).
+        """The runner-owned ``preprocess_status`` words (int32, per device).
 
         The preprocess stores 1 into word 0 when a packed-sequence id is out of
         range or non-monotonic (see the class docstring).  Word 1 is the item
-        counter the sm_107a claim programs draw from (:func:`claim_selected`);
-        every complete launch leaves it 0, so a stream's launches see it 0.
+        counter the sm_107a claim programs draw from (:func:`claim_selected`).
+        The sm_107a one-CTA pair programs (:func:`tail_one_cta_selected`) use
+        the words after them, sized by the device's tail grid
+        (:func:`_tail_grid_size`): pair ``p``'s rank ticket in word ``2 + p``,
+        its hand-off flag in bit ``p % 32`` of word ``2 + pairs + p // 32``
+        (on 212 SMs 112 words, within one 512-byte allocator block like the
+        two words alone).  Every complete launch leaves word 1 and the words
+        after it 0, so a stream's launches see them 0.
         Like the runner's other per-device workspace (the delta and cumsum
         tiles, the grid barriers), the words serve one stream at a time: a
         runner is not used concurrently on two streams.  Both are allocated
@@ -2808,7 +2871,9 @@ class CakeSSDCombined:
         status = self._preprocess_status.get(device.index)
         if status is None:
             self._allocating("the preprocess status words")
-            status = torch.zeros(2, dtype=torch.int32, device=device)
+            pairs = _tail_grid_size(sm_count=_sm_count(device.index)) // 2
+            words = 2 + pairs + (pairs + 31) // 32
+            status = torch.zeros(words, dtype=torch.int32, device=device)
             self._preprocess_status[device.index] = status
         return status
 
@@ -3167,6 +3232,19 @@ class CakeSSDCombined:
                 )
             ):
                 variant = "ibulk"
+            # sm_107a: the pair calls ``tail_one_cta_selected`` admits run the
+            # pair program's one-CTA form.
+            if variant == "tail" and tail_one_cta_selected(
+                capability=capability,
+                mode_varlen=self.has_varlen,
+                chunks_per_item=host_chunks_per_item(
+                    mode_varlen=self.has_varlen,
+                    num_sequences=num_sequences,
+                    # packed varlen: x is [1, total tokens, nheads, 64]
+                    seqlen=batch * seqlen if self.has_varlen else seqlen,
+                ),
+            ):
+                variant = "tailone"
         if program_family == "exactone":
             variant = exactone_table_variant(
                 capability=capability,
@@ -4086,9 +4164,10 @@ class CakeSSDCombined:
             # cu_seqlens form may never address; the kernel reads the real
             # tile count from ``seq_chunk_cumsum[sequence_count]``.
             grid = max(1, min(num_segments * self.nheads, sm_count))
-        elif program.variant == "tail":
-            # One 2-CTA cluster per SM pair; the pair plan is computed in-kernel
-            # from this grid (``tail_selected`` chose the program).
+        elif program.variant in ("tail", "tailone"):
+            # One 2-CTA cluster (``_tailone``: one CTA pair) per SM pair; the
+            # pair plan is computed in-kernel from this grid (``tail_selected``
+            # chose the program).
             grid = _tail_grid_size(sm_count=sm_count)
         else:
             grid = _persistent_grid_size(
