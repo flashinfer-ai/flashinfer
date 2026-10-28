@@ -48,6 +48,16 @@ SHAPES = {
     "dsv3": (7168, 2048, 256, 8, 0),
     "qwen3_235b": (4096, 1536, 128, 8, 0),
     "qwen3_30b": (2048, 768, 128, 8, 0),
+    "minimax_m3": (6144, 3072, 128, 4, 7),
+    "kimi_k3": (3584, 3072, 896, 16, 0),
+    "kimi_k3_e512": (3584, 3072, 512, 16, 0),
+    "qwen38_flash": (2560, 640, 512, 10, 0),
+}
+# Activation kernel-config fields per shape; every other shape uses plain SwiGLU.
+ACTIVATIONS = {
+    "minimax_m3": {"swiglu_alpha": 1.702, "swiglu_beta": 1.0},
+    "kimi_k3": {"activation": "situ", "situ_beta": 4.0, "situ_linear_beta": 25.0},
+    "kimi_k3_e512": {"activation": "situ", "situ_beta": 4.0, "situ_linear_beta": 25.0},
 }
 L2_FLUSH_BYTES = 256 << 20
 
@@ -60,6 +70,13 @@ def _parse_args() -> argparse.Namespace:
         nargs="+",
         default=["noshared", "fp8shared"],
         choices=("noshared", "fp8shared"),
+    )
+    p.add_argument(
+        "--return-codecs",
+        nargs="+",
+        default=["bf16"],
+        choices=("bf16", "int8"),
+        help="return_codec of the device build (one layer per codec)",
     )
     p.add_argument(
         "--tokens",
@@ -162,13 +179,19 @@ def main() -> None:
             f"{torch.cuda.get_device_name()}, cold L2={flush is not None}"
         )
         print(
-            f"{'shape':11} {'variant':9} {'tokens':>6} {'kernel_us':>10} {'forward_us':>11} "
+            f"{'shape':11} {'variant':9} {'codec':5} {'tokens':>6} {'kernel_us':>10} {'forward_us':>11} "
             f"{'bucket_us':>9} {'graph_us':>9}  instance"
         )
     for shape in args.shapes:
         hidden, inter, experts, top_k, limit = SHAPES[shape]
+        if experts % world or experts // world > 128:
+            if rank == 0:
+                print(f"# skip {shape}: {experts} experts on {world} ranks")
+            continue
         geometry = Geometry(hidden, inter, experts, top_k)
-        for variant in args.variants:
+        for variant, codec in (
+            (v, c) for v in args.variants for c in args.return_codecs
+        ):
             shared = variant == "fp8shared"
             weights = random_weights(
                 rank, world, geometry, shared=shared, seed=args.seed
@@ -182,6 +205,8 @@ def main() -> None:
                 shared=shared,
                 transport_table=_table_spec(args.table, world),
                 swiglu_limit=limit,
+                activation=ACTIVATIONS.get(shape),
+                return_codec=codec,
             )
             layer.warmup(
                 random_inputs(min(256, capacity), geometry, seed=args.seed + rank)
@@ -220,10 +245,13 @@ def main() -> None:
                 del graph
                 error = layer._kernel.protocol_error(ws)
                 if _max_rank(float(error)) != 0:
-                    raise RuntimeError(f"protocol_error at {shape} {variant} {tokens}")
+                    raise RuntimeError(
+                        f"protocol_error at {shape} {variant} {codec} {tokens}"
+                    )
                 row = {
                     "shape": shape,
                     "variant": variant,
+                    "return_codec": codec,
                     "ep": world,
                     "tokens_per_rank": tokens,
                     "table": ws.transport_table.name,
@@ -239,7 +267,7 @@ def main() -> None:
                 rows.append(row)
                 if rank == 0:
                     print(
-                        f"{shape:11} {variant:9} {tokens:6d} {row['kernel_us']:10.1f} "
+                        f"{shape:11} {variant:9} {codec:5} {tokens:6d} {row['kernel_us']:10.1f} "
                         f"{row['forward_us']:11.1f} {row['bucket_us']:9.1f} {row['graph_us']:9.1f}  "
                         f"{row['instance']} ({row['table']})",
                         flush=True,

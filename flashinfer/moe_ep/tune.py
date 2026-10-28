@@ -26,7 +26,7 @@ backend (``transport_table="tuned"``) on the launched topology::
 
     torchrun --nproc_per_node=8 -m flashinfer.moe_ep.tune --dtype sm120_mxfp4_mxfp8 \\
         --hidden 4096 --intermediate 2048 --num-experts 256 --topk 6 \\
-        --max-tokens 512 2048 8192 [--shared-expert]
+        --max-tokens 512 2048 8192 [--shared-expert] [--return-codec int8]
 
 Atomic reduction candidates require
 ``--allow-nondeterministic`` and an engine configuration that enables IKR.
@@ -104,6 +104,12 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--shared-expert",
         action="store_true",
         help="sm120_mxfp4_mxfp8: tune the in-kernel FP8 shared-expert variant",
+    )
+    parser.add_argument(
+        "--return-codec",
+        choices=("bf16", "int8"),
+        default="bf16",
+        help="sm120_mxfp4_mxfp8: return_codec of the tuned build",
     )
     parser.add_argument("--hidden", type=int, required=True)
     parser.add_argument(
@@ -339,6 +345,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         return tuner.run_tuning(args)
     if args.shared_expert:
         print("--shared-expert requires --dtype sm120_mxfp4_mxfp8", file=sys.stderr)
+        return 2
+    if args.return_codec != "bf16":
+        print("--return-codec requires --dtype sm120_mxfp4_mxfp8", file=sys.stderr)
         return 2
     if args.dtype == "sm90_mxfp4":
         if args.arch not in ("auto", "sm90"):
