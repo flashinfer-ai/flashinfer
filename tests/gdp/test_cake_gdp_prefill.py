@@ -556,6 +556,25 @@ def test_write_only_pool_begins_at_zeros() -> None:
     _check(c, out, state)
 
 
+def test_write_only_pool_begins_at_zeros_on_the_split_route() -> None:
+    """A single H = 10, L = 8192, n = 3 sequence is a merged-class row (384 chunks, the split program with p > 1
+    on 132 SMs): with ``state_indices``, an output pool and no ``initial_state`` the route must still send it to
+    the merged body (a V6-routed run fails here), the sequence begins at zeros, its final state lands in the named
+    slot and the other pool rows keep their pre-launch values."""
+    c = _make(Case(lens=(8192,), H=10, n=3, initial="pool_disjoint", seed=11))
+    c.initial_state, c.initial_before = None, None
+    c.output_state.fill_(SENTINEL)
+    c.output_state_before = c.output_state.clone()
+    sm_count = loader.sm_count(0)
+    classes = loader.prefill_body_classes(c.cu_host, c.n, c.H, sm_count)
+    assert classes == [loader.ROUTE_BODY_P3], classes
+    (chunks,) = loader.route_chunk_steps(c.cu_host, c.n)
+    p, _span = loader.split_count(chunks, c.H, c.n, sm_count)
+    assert chunks == 384 and p > 1, (chunks, p, sm_count)
+    out, state = _run(c)
+    _check(c, out, state)
+
+
 @pytest.mark.parametrize("final", (True, False))
 def test_invalid_pool_slots(final: bool) -> None:
     """A negative or out-of-range slot: the sequence begins at zeros, its output rows are written, nothing is
