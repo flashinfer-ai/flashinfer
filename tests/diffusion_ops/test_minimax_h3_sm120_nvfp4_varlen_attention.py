@@ -546,6 +546,62 @@ def test_minimax_h3_sm120_varlen_attention_nvfp4_concurrent_streams_are_bitwise(
     assert _control_words_are_zero([(device.index, s.cuda_stream) for s in streams])
 
 
+# Plans of the fused pre-processing with a short attention-weighted mean segment, whose overlapped form takes a
+# width of the light table (``_OVERLAP_LIGHT_WIDTHS``): 1024 tokens (every SM count and route) and 2048 tokens (188
+# SMs, and the uncompensated route on 170 SMs; the compensated route on 170 SMs keeps the shipped width).
+LIGHT_CU_SEQLENS = [
+    (0, 1024, 2048, 3072, 4096),
+    (0, 2048, 4096),
+]
+
+
+@requires_sm120
+@pytest.mark.parametrize("cu_seqlens", LIGHT_CU_SEQLENS)
+@pytest.mark.parametrize("delta", [True, False])
+def test_minimax_h3_sm120_varlen_attention_nvfp4_light_overlap_widths_are_bitwise_sequential(
+    cu_seqlens, delta, monkeypatch
+) -> None:
+    """A plan whose overlap width follows its attention-weighted mean segment launches the grids of that width,
+    matches the separate launches bit for bit and leaves the zero-start words zero."""
+    device = torch.device("cuda:0")
+    sms = nvfp4_ops._sm_count(device.index)
+    if sms not in nvfp4_ops._OVERLAP_WIDTH:
+        pytest.skip(f"no overlap width on {sms} SMs")
+    monkeypatch.setattr(nvfp4_ops, "_NVFP4_LAUNCHES", OrderedDict())
+    fn = _route(delta)
+    cu = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
+    q, k, v = synthetic_inputs(
+        cu_seqlens[-1], MINIMAX_H3_NUM_HEADS, seed=23, device=device
+    )
+    plan = quant_ops._plan(cu_seqlens, MINIMAX_H3_NUM_HEADS, device)
+    expected = nvfp4_ops.minimax_h3_sm120_nvfp4_overlap_grids(
+        sms,
+        num_units=plan.num_units,
+        padded_tokens=plan.padded_tokens,
+        total_tokens=plan.total_tokens,
+        work=plan.work,
+        delta=delta,
+    )
+    if cu_seqlens[1] == 1024:
+        assert expected[2] > nvfp4_ops._OVERLAP_WIDTH[sms]
+    owner = nvfp4_ops._owner(device.index, nvfp4_ops._current_stream(device.index))
+    launch = nvfp4_ops._nvfp4_launch(
+        plan, delta, owner, nvfp4_ops._nvfp4_target(device.index)
+    )
+    # (lead grid, tail slot, tail grid) of the overlapped form
+    assert launch.args[-3] >= 0
+    assert (launch.args[-4], launch.args[-2]) == (expected[0], expected[2])
+    overlapped = [fn(q, k, v, cu, cu_seqlens_host=cu_seqlens) for _call in range(2)]
+    _await((torch.cuda.current_stream(),), "overlapped calls")
+    assert _control_words_are_zero([owner])
+    monkeypatch.setattr(nvfp4_ops, "_OVERLAP_WIDTH", {})
+    monkeypatch.setattr(nvfp4_ops, "_NVFP4_LAUNCHES", OrderedDict())
+    sequential = fn(q, k, v, cu, cu_seqlens_host=cu_seqlens)
+    torch.cuda.synchronize()
+    for out in overlapped:
+        assert torch.equal(out, sequential)
+
+
 # The plan of the graph, host-thread and serialized-launch tests: the fused pre-processing (the overlapped form
 # on 170 and 188 SMs).
 FUSED_CU_SEQLENS = (0, 1100, 2100)
