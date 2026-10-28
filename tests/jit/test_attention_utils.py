@@ -1,14 +1,17 @@
+import inspect
+import itertools
 from pathlib import Path
 import re
 
 import pytest
 import torch
 
-from flashinfer import prefill
+from flashinfer import BatchAttentionWithAttentionSinkWrapper, prefill
 from flashinfer.jit import core
 from flashinfer.jit import env as jit_env
 from flashinfer.jit.attention import modules as attention_modules
 from flashinfer.jit.attention.modules import gen_customize_batch_prefill_module
+from flashinfer.utils import PosEncodingMode
 
 
 @pytest.fixture
@@ -232,7 +235,9 @@ def test_attention_sink_stays_independent_full(generated_sources):
         False,
     )
     spec = attention_modules.gen_batch_prefill_attention_sink_module(*args)
-    assert spec.name == attention_modules.get_batch_prefill_attention_sink_uri(*args)
+    assert spec.name == attention_modules.get_batch_prefill_attention_sink_uri(
+        *args, False
+    )
     assert len(spec.sources) == 10
 
     generated_dir = generated_sources / spec.name
@@ -247,6 +252,104 @@ def test_attention_sink_stays_independent_full(generated_sources):
         ).read_text()
         assert "/*SAME_KV_STRIDES=*/true" not in paged_text
         assert "/*SAME_KV_STRIDES=*/false" in paged_text
+
+
+def _capture_sink_wrapper_jit_args(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        prefill.BatchPrefillWithPagedKVCacheWrapper,
+        "__init__",
+        lambda self, **kwargs: calls.append(kwargs),
+    )
+    return calls
+
+
+def test_attention_sink_wrapper_uri_names_every_codegen_parameter(monkeypatch):
+    calls = _capture_sink_wrapper_jit_args(monkeypatch)
+    configs = list(
+        itertools.product(
+            ["fa2", "fa3"],
+            [torch.float16, torch.bfloat16],
+            [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.uint8],
+            [64, 128],
+            [64, 128],
+            ["NONE", "ROPE_LLAMA", "ALIBI"],
+            [False, True],
+            [-1, 128],
+        )
+    )
+    for (
+        backend,
+        dtype_q,
+        dtype_kv,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+        use_fp16_qk_reduction,
+        window_left,
+    ) in configs:
+        BatchAttentionWithAttentionSinkWrapper(
+            torch.empty(0, dtype=torch.uint8),
+            backend=backend,
+            pos_encoding_mode=pos_encoding_mode,
+            use_fp16_qk_reduction=use_fp16_qk_reduction,
+            q_data_type=dtype_q,
+            kv_data_type=dtype_kv,
+            head_dim_qk=head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            window_left=window_left,
+        )
+    # Each config generates a different module, so each needs its own name.
+    assert len({call["jit_args"][0] for call in calls}) == len(configs)
+
+
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA", "ALIBI"])
+@pytest.mark.parametrize("window_left", [-1, 128])
+def test_attention_sink_wrapper_requests_aot_module(
+    monkeypatch, backend, dtype, pos_encoding_mode, window_left
+):
+    # aot.py prebuilds the sink modules with gen_batch_prefill_attention_sink_module;
+    # the wrapper only loads them if it requests the same module under the same name.
+    calls = _capture_sink_wrapper_jit_args(monkeypatch)
+    BatchAttentionWithAttentionSinkWrapper(
+        torch.empty(0, dtype=torch.uint8),
+        backend=backend,
+        pos_encoding_mode=pos_encoding_mode,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        head_dim_qk=64,
+        head_dim_vo=64,
+        window_left=window_left,
+    )
+    signature = inspect.signature(gen_customize_batch_prefill_module)
+    wrapper_request = signature.bind(
+        backend, *calls[0]["jit_args"], **calls[0]["jit_kwargs"]
+    )
+
+    generator_requests = []
+    monkeypatch.setattr(
+        attention_modules,
+        "gen_customize_batch_prefill_module",
+        lambda *args, **kwargs: generator_requests.append(
+            signature.bind(*args, **kwargs)
+        ),
+    )
+    attention_modules.gen_batch_prefill_attention_sink_module(
+        backend,
+        dtype,
+        dtype,
+        dtype,
+        torch.int32,
+        64,
+        64,
+        PosEncodingMode[pos_encoding_mode].value,
+        window_left >= 0,
+    )
+    for request in (wrapper_request, *generator_requests):
+        request.apply_defaults()
+    assert [wrapper_request.arguments] == [r.arguments for r in generator_requests]
 
 
 def test_batch_prefill_nvfp4_requires_sf_tensors():
