@@ -645,10 +645,12 @@ kernel_cake_dense_projection_gemm_9475731f174aaefb2e44(const __grid_constant__ C
                         __syncwarp();
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         unsigned int inc = ((lane == 0) ? 1 : 0);
-                        int aidx = ((lane == 0) ? cidx_e : 4096 + (cta_rank * 8 + (warp - 2)) * 32 + lane);
-                        unsigned int _atomic_fetch_add_0;
-                        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
-                            : "=r"(_atomic_fetch_add_0) : "l"(&counters[aidx]), "r"(static_cast<uint32_t>(inc)) : "memory");
+                        int aidx = cidx_e;
+                        unsigned int _atomic_fetch_add_0 = 0;
+                        if (lane == 0) {
+                            asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
+                                : "=r"(_atomic_fetch_add_0) : "l"(&counters[aidx]), "r"(static_cast<uint32_t>(inc)) : "memory");
+                        }
                         unsigned int _shfl_0 = __shfl_sync(0xFFFFFFFF, _atomic_fetch_add_0, 0);
                         if (_shfl_0 == 0) {
                             role = 1;
@@ -658,16 +660,19 @@ kernel_cake_dense_projection_gemm_9475731f174aaefb2e44(const __grid_constant__ C
                                 #pragma unroll 1
                                 for (int _spin = 0; _spin < 1073741824; _spin++) {
                                     unsigned int inc_0 = ((lane == 0) ? 0 : 0);
-                                    int aidx_1 = ((lane == 0) ? cidx_e : 4096 + (cta_rank * 8 + (warp - 2)) * 32 + lane);
-                                    unsigned int _atomic_fetch_add_2;
-                                    asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
-                                        : "=r"(_atomic_fetch_add_2) : "l"(&counters[aidx_1]), "r"(static_cast<uint32_t>(inc_0)) : "memory");
+                                    int aidx_1 = cidx_e;
+                                    unsigned int _atomic_fetch_add_2 = 0;
+                                    if (lane == 0) {
+                                        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
+                                            : "=r"(_atomic_fetch_add_2) : "l"(&counters[aidx_1]), "r"(static_cast<uint32_t>(inc_0)) : "memory");
+                                    }
                                     unsigned int _shfl_sync_1 = __shfl_sync(0xFFFFFFFF, _atomic_fetch_add_2, 0);
                                     if (_shfl_sync_1 >= 3) {
                                         break;
                                     }
                                 }
                             }
+                            __syncwarp();
                         }
                     }
                     if (nseg_2 <= seg_2 + 1) {
@@ -873,10 +878,12 @@ kernel_cake_dense_projection_gemm_9475731f174aaefb2e44(const __grid_constant__ C
                         asm volatile("tcgen05.fence::before_thread_sync;");
                         __syncwarp();
                         unsigned int inc_1 = ((lane == 0) ? 1 : 0);
-                        int aidx_2 = ((lane == 0) ? cidx_e : 4096 + (cta_rank * 8 + (warp - 2)) * 32 + lane);
-                        unsigned int _atomic_fetch_add_3;
-                        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
-                            : "=r"(_atomic_fetch_add_3) : "l"(&counters[aidx_2]), "r"(static_cast<uint32_t>(inc_1)) : "memory");
+                        int aidx_2 = cidx_e;
+                        unsigned int _atomic_fetch_add_3 = 0;
+                        if (lane == 0) {
+                            asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
+                                : "=r"(_atomic_fetch_add_3) : "l"(&counters[aidx_2]), "r"(static_cast<uint32_t>(inc_1)) : "memory");
+                        }
                         unsigned int _shfl_1 = __shfl_sync(0xFFFFFFFF, _atomic_fetch_add_3, 0);
                     }
                     if (role == 2) {
