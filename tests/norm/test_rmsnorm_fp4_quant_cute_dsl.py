@@ -27,7 +27,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 from flashinfer.cute_dsl.utils import is_cute_dsl_available
-from tests.test_helpers.utils_fp4 import cast_from_fp4
+from tests.test_helpers.utils_fp4 import cast_from_fp4, ref_fp4_quant
 
 
 def get_cc():
@@ -428,6 +428,29 @@ class TestRMSNormFP4QuantCuteDSL:
 class TestRMSNormFP4QuantMXFP4:
     """Tests for MXFP4 format (block_size=32, UE8M0 scales)."""
 
+    def test_mxfp4_bf16_scale_reduction_avoids_product_rounding(self):
+        """Keep BF16 product rounding from crossing the UE8M0 scale boundary."""
+        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant
+
+        x = torch.full((1, 64), 99 / 128, device="cuda", dtype=torch.bfloat16)
+        x[0, 0] = 0.75
+        weight = torch.full((64,), 6.0, device="cuda", dtype=torch.bfloat16)
+        eps = 1e-6
+        rstd = torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + eps)
+        reference = x.float() * rstd * weight.float()
+        rounded_product = (x * weight).float() * rstd
+        reference_max = reference.view(1, 2, 32).abs().amax(dim=-1)
+        rounded_max = rounded_product.view(1, 2, 32).abs().amax(dim=-1)
+        # A maximum above 6 needs scale 2 (encoded 128), rather than scale 1.
+        assert torch.all(reference_max > 6.0)
+        assert torch.all(rounded_max < 6.0)
+        expected_scale = torch.full((1, 2), 128, device="cuda", dtype=torch.uint8)
+
+        _, actual_scale = rmsnorm_fp4quant(
+            x, weight, eps=eps, block_size=32, scale_format="ue8m0"
+        )
+        torch.testing.assert_close(actual_scale, expected_scale, rtol=0, atol=0)
+
     @pytest.mark.parametrize("batch_size", [1, 4, 16, 7, 25, 128, 8192])
     @pytest.mark.parametrize("hidden_size", [128, 256, 512, 1536, 2048, 4096])
     @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -641,9 +664,16 @@ class TestFusedVsSeparateFP4Quantize:
             .to(torch.float32)
         )
 
-        scale_match = (scale_fused == scale_separate).float().mean().item()
+        scale_reference = scale_separate
+        if dtype == torch.bfloat16:
+            # The fused BF16 path keeps normalized values in FP32. The separate
+            # path rounds them back to BF16, which can cross an E4M3 midpoint.
+            # Compare fused scales against the FP32 quantization reference.
+            y_rmsnorm_f32 = llama_rms_norm(x.float(), weight, eps=eps)
+            _, scale_reference = ref_fp4_quant(y_rmsnorm_f32, global_scale, block_size)
+        scale_match = (scale_fused == scale_reference).float().mean().item()
         assert scale_match > 0.90, (
-            f"Block scale mismatch: only {scale_match * 100:.1f}% of scales match"
+            f"Block scale mismatch: only {scale_match * 100:.1f}% match the reference"
         )
 
         # === Also verify dequantized values are close ===
