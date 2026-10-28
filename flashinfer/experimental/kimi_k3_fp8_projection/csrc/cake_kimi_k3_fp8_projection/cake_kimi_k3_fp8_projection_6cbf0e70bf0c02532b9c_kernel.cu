@@ -624,28 +624,28 @@ kernel_cake_kimi_k3_fp8_projection_6cbf0e70bf0c02532b9c(const __grid_constant__ 
                             int tok8_1 = tok0 + (tok_g0 + 32) + row8_1;
                             int feat8_1 = n_tile_e * 128 + f8_1;
                             if (tok_g0 + 32 + row8_1 >= 0 && tok_g0 + 32 + row8_1 < 64 && tok8_1 < M && feat8_1 < n_valid) {
-                                unsigned int _packed_3[4];
+                                unsigned int packed[4];
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
                                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals8_1[_lp*2 + 0], vals8_1[_lp*2+1 + 0]));
-                                    _packed_3[_lp] = *(uint32_t*)&_bf2;
+                                    packed[_lp] = *(uint32_t*)&_bf2;
                                 }
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
                                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals8_1[_lp*2 + 2], vals8_1[_lp*2+1 + 2]));
-                                    _packed_3[_lp + 1] = *(uint32_t*)&_bf2;
+                                    packed[_lp + 1] = *(uint32_t*)&_bf2;
                                 }
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
                                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals8_1[_lp*2 + 4], vals8_1[_lp*2+1 + 4]));
-                                    _packed_3[_lp + 2] = *(uint32_t*)&_bf2;
+                                    packed[_lp + 2] = *(uint32_t*)&_bf2;
                                 }
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
                                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals8_1[_lp*2 + 6], vals8_1[_lp*2+1 + 6]));
-                                    _packed_3[_lp + 3] = *(uint32_t*)&_bf2;
+                                    packed[_lp + 3] = *(uint32_t*)&_bf2;
                                 }
-                                reinterpret_cast<int4*>(out + ((unsigned long long)tok8_1 * (unsigned long long)ldo + (unsigned long long)feat8_1))[0] = reinterpret_cast<int4*>(_packed_3)[0];
+                                reinterpret_cast<int4*>(out + ((unsigned long long)tok8_1 * (unsigned long long)ldo + (unsigned long long)feat8_1))[0] = reinterpret_cast<int4*>(packed)[0];
                             }
                         }
                     } else if (store_vec == 4) {
@@ -669,18 +669,18 @@ kernel_cake_kimi_k3_fp8_projection_6cbf0e70bf0c02532b9c(const __grid_constant__ 
                             int tok4_1 = tok0 + (tok_g0 + 32) + row4_1;
                             int feat4_1 = n_tile_e * 128 + f4_1;
                             if (tok_g0 + 32 + row4_1 >= 0 && tok_g0 + 32 + row4_1 < 64 && tok4_1 < M && feat4_1 < n_valid) {
-                                unsigned int _packed_4[2];
+                                unsigned int packed_1[2];
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
                                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals4_1[_lp*2 + 0], vals4_1[_lp*2+1 + 0]));
-                                    _packed_4[_lp] = *(uint32_t*)&_bf2;
+                                    packed_1[_lp] = *(uint32_t*)&_bf2;
                                 }
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
                                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals4_1[_lp*2 + 2], vals4_1[_lp*2+1 + 2]));
-                                    _packed_4[_lp + 1] = *(uint32_t*)&_bf2;
+                                    packed_1[_lp + 1] = *(uint32_t*)&_bf2;
                                 }
-                                reinterpret_cast<int2*>(out + ((unsigned long long)tok4_1 * (unsigned long long)ldo + (unsigned long long)feat4_1))[0] = reinterpret_cast<int2*>(_packed_4)[0];
+                                reinterpret_cast<int2*>(out + ((unsigned long long)tok4_1 * (unsigned long long)ldo + (unsigned long long)feat4_1))[0] = reinterpret_cast<int2*>(packed_1)[0];
                             }
                         }
                     } else {
@@ -703,13 +703,13 @@ kernel_cake_kimi_k3_fp8_projection_6cbf0e70bf0c02532b9c(const __grid_constant__ 
                             int tok2_1 = tok0 + (tok_g0 + 32) + row2_1;
                             int feat2_1 = n_tile_e * 128 + f2_1;
                             if (tok_g0 + 32 + row2_1 >= 0 && tok_g0 + 32 + row2_1 < 64 && tok2_1 < M && feat2_1 < n_valid) {
-                                unsigned int _packed_5[1];
+                                unsigned int packed_2[1];
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
                                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(vals2_1[_lp*2 + 0], vals2_1[_lp*2+1 + 0]));
-                                    _packed_5[_lp] = *(uint32_t*)&_bf2;
+                                    packed_2[_lp] = *(uint32_t*)&_bf2;
                                 }
-                                reinterpret_cast<unsigned*>(out + ((unsigned long long)tok2_1 * (unsigned long long)ldo + (unsigned long long)feat2_1))[0] = reinterpret_cast<unsigned*>(_packed_5)[0];
+                                reinterpret_cast<unsigned*>(out + ((unsigned long long)tok2_1 * (unsigned long long)ldo + (unsigned long long)feat2_1))[0] = reinterpret_cast<unsigned*>(packed_2)[0];
                             }
                         }
                     }

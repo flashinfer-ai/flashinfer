@@ -747,38 +747,38 @@ kernel_cake_kimi_k3_fp8_projection_3635cca336bd2fa19bad(const __grid_constant__ 
                         absmax_r[it_2] = _reg_array_reduce_2;
                     }
                     #pragma unroll
+                    for (int it_1_0 = 0; it_1_0 < 8; it_1_0++) {
+                        float o_r_1_0 = __shfl_xor_sync(0xFFFFFFFF, absmax_r[it_1_0], 1);
+                        absmax_r[it_1_0] = max_noftz(absmax_r[it_1_0], o_r_1_0);
+                    }
+                    #pragma unroll
+                    for (int it_1_1 = 0; it_1_1 < 8; it_1_1++) {
+                        float o_r_1_1 = __shfl_xor_sync(0xFFFFFFFF, absmax_r[it_1_1], 2);
+                        absmax_r[it_1_1] = max_noftz(absmax_r[it_1_1], o_r_1_1);
+                    }
+                    #pragma unroll
+                    for (int it_1_2 = 0; it_1_2 < 8; it_1_2++) {
+                        float o_r_1_2 = __shfl_xor_sync(0xFFFFFFFF, absmax_r[it_1_2], 4);
+                        absmax_r[it_1_2] = max_noftz(absmax_r[it_1_2], o_r_1_2);
+                    }
+                    #pragma unroll
+                    for (int it_1_3 = 0; it_1_3 < 8; it_1_3++) {
+                        float o_r_1_3 = __shfl_xor_sync(0xFFFFFFFF, absmax_r[it_1_3], 8);
+                        absmax_r[it_1_3] = max_noftz(absmax_r[it_1_3], o_r_1_3);
+                    }
+                    #pragma unroll
                     for (int it_3 = 0; it_3 < 8; it_3++) {
-                        float o_r = __shfl_xor_sync(0xFFFFFFFF, absmax_r[it_3], 1);
-                        absmax_r[it_3] = max_noftz(absmax_r[it_3], o_r);
-                    }
-                    #pragma unroll
-                    for (int it_4 = 0; it_4 < 8; it_4++) {
-                        float o_r_1 = __shfl_xor_sync(0xFFFFFFFF, absmax_r[it_4], 2);
-                        absmax_r[it_4] = max_noftz(absmax_r[it_4], o_r_1);
-                    }
-                    #pragma unroll
-                    for (int it_5 = 0; it_5 < 8; it_5++) {
-                        float o_r_2 = __shfl_xor_sync(0xFFFFFFFF, absmax_r[it_5], 4);
-                        absmax_r[it_5] = max_noftz(absmax_r[it_5], o_r_2);
-                    }
-                    #pragma unroll
-                    for (int it_6 = 0; it_6 < 8; it_6++) {
-                        float o_r_3 = __shfl_xor_sync(0xFFFFFFFF, absmax_r[it_6], 8);
-                        absmax_r[it_6] = max_noftz(absmax_r[it_6], o_r_3);
-                    }
-                    #pragma unroll
-                    for (int it_7 = 0; it_7 < 8; it_7++) {
-                        int unit_r = (it_7 * 8 + qwarp) * 2 + half;
+                        int unit_r = (it_3 * 8 + qwarp) * 2 + half;
                         int tok_local_r = unit_r >> 1;
                         int kb_r = unit_r & 1;
                         int tok_r2 = tok0_r + tok_local_r;
                         float vals_r[8];
                         #pragma unroll
                         for (int j_4 = 0; j_4 < 8; j_4++) {
-                            vals_r[j_4] = xv_all[8 * it_7 + j_4];
+                            vals_r[j_4] = xv_all[8 * it_3 + j_4];
                         }
                         float amax_r;
-                        asm("max.f32 %0, %1, %2;" : "=f"(amax_r) : "f"(absmax_r[it_7]), "f"(1e-04f));
+                        asm("max.f32 %0, %1, %2;" : "=f"(amax_r) : "f"(absmax_r[it_3]), "f"(1e-04f));
                         float scale_r = amax_r / 448.0f;
                         unsigned int scale_bits_r = __as_u32(scale_r);
                         unsigned int exponent_r = scale_bits_r >> 23 & 255;
