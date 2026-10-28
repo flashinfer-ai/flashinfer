@@ -453,6 +453,26 @@ def test_kimi_k3_ep_capacity_uses_local_experts():
     assert capacity == 183 * 128
 
 
+@pytest.mark.parametrize(
+    ("rank", "world", "expected"),
+    [
+        (None, None, [0, 1, 2, 3, 4, 5, 6, 7]),
+        ("0", "4", [0, 1, 2, 3, 4, 5, 6, 7]),
+        ("1", "4", [2, 3, 4, 5, 6, 7, 0, 1]),
+        ("3", "4", [6, 7, 0, 1, 2, 3, 4, 5]),
+    ],
+)
+def test_precompile_order_is_rotated_per_local_rank(monkeypatch, rank, world, expected):
+    from flashinfer.prims_ts.moe.runner import _node_rank_rotated
+
+    for name, value in (("LOCAL_RANK", rank), ("LOCAL_WORLD_SIZE", world)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    assert _node_rank_rotated(list(range(8))) == expected
+
+
 def test_kimi_k3_low_latency_fast_drain_fc2_config_is_buildable():
     # This assertion describes an SM100 menu row, independent of the host GPU.
     kwargs = dict(
