@@ -345,14 +345,14 @@ kernel_cake_dense_projection_gemm_ebbb505a3077e8da0a50(const __grid_constant__ C
                             "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                             "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [remAddr32], %2;\n\t"
                             "}"
-                            :: "r"(work_full_addr + work_stage * 8), "r"(0), "r"((uint32_t)(16)) : "memory");
+                            :: "r"(work_full_addr + (work_stage) * 8), "r"(0), "r"((uint32_t)(16)) : "memory");
                         asm volatile(
                             "{\n\t"
                             ".reg .b32 remAddr32;\n\t"
                             "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                             "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [remAddr32], %2;\n\t"
                             "}"
-                            :: "r"(work_full_addr + work_stage * 8), "r"(1), "r"((uint32_t)(16)) : "memory");
+                            :: "r"(work_full_addr + (work_stage) * 8), "r"(1), "r"((uint32_t)(16)) : "memory");
                         asm volatile(
                             "fence.proxy.async.shared::cta;\n\t"
                             "clusterlaunchcontrol.try_cancel.async.shared::cta"
@@ -391,7 +391,7 @@ kernel_cake_dense_projection_gemm_ebbb505a3077e8da0a50(const __grid_constant__ C
                         if (load_stage == 4) { load_stage = 0; _phase_mma_done ^= 1; }
                     }
                     mbarrier_wait(work_full_addr + (work_stage) * 8, _phase_work_full);
-                    uint32_t _clc_valid_0 = 0;
+                    uint32_t clc_valid = 0;
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p1;\n\t"
@@ -400,10 +400,10 @@ kernel_cake_dense_projection_gemm_ebbb505a3077e8da0a50(const __grid_constant__ C
                         "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                         "selp.u32 %0, 1, 0, p1;\n\t"
                         "}\n"
-                        : "=r"(_clc_valid_0)
+                        : "=r"(clc_valid)
                         : "r"(work_response_addr + work_stage * 16 + 0 * 16)
                         : "memory");
-                    uint32_t _clc_ctaid_0 = 0;
+                    uint32_t clc_ctaid = 0;
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p1;\n\t"
@@ -412,7 +412,7 @@ kernel_cake_dense_projection_gemm_ebbb505a3077e8da0a50(const __grid_constant__ C
                         "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                         "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                         "}\n"
-                        : "+r"(_clc_ctaid_0)
+                        : "+r"(clc_ctaid)
                         : "r"(work_response_addr + work_stage * 16 + 0 * 16)
                         : "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -422,13 +422,13 @@ kernel_cake_dense_projection_gemm_ebbb505a3077e8da0a50(const __grid_constant__ C
                         "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                         "}"
-                        :: "r"(work_empty_addr + work_stage * 8), "r"(0) : "memory");
+                        :: "r"(work_empty_addr + (work_stage) * 8), "r"(0) : "memory");
                     work_stage += 1;
                     if (work_stage == 4) { work_stage = 0; _phase_work_empty ^= 1; _phase_work_full ^= 1; }
-                    if (_clc_valid_0 == 0) {
+                    if (clc_valid == 0) {
                         break;
                     }
-                    this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                    this_bid = clc_ctaid + (unsigned int)cta_rank;
                 }
             }
         }
@@ -661,7 +661,7 @@ kernel_cake_dense_projection_gemm_ebbb505a3077e8da0a50(const __grid_constant__ C
                     mma_epi_stage += 1;
                     if (mma_epi_stage == 2) { mma_epi_stage = 0; _phase_epilogue_done ^= 1; }
                     mbarrier_wait(work_full_addr + (work_stage_1) * 8, _phase_work_full_1);
-                    uint32_t _clc_valid_2 = 0;
+                    uint32_t clc_valid_1 = 0;
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p1;\n\t"
@@ -670,10 +670,10 @@ kernel_cake_dense_projection_gemm_ebbb505a3077e8da0a50(const __grid_constant__ C
                         "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                         "selp.u32 %0, 1, 0, p1;\n\t"
                         "}\n"
-                        : "=r"(_clc_valid_2)
+                        : "=r"(clc_valid_1)
                         : "r"(work_response_addr + work_stage_1 * 16 + 0 * 16)
                         : "memory");
-                    uint32_t _clc_ctaid_2 = 0;
+                    uint32_t clc_ctaid_1 = 0;
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p1;\n\t"
@@ -682,7 +682,7 @@ kernel_cake_dense_projection_gemm_ebbb505a3077e8da0a50(const __grid_constant__ C
                         "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                         "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                         "}\n"
-                        : "+r"(_clc_ctaid_2)
+                        : "+r"(clc_ctaid_1)
                         : "r"(work_response_addr + work_stage_1 * 16 + 0 * 16)
                         : "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -693,10 +693,10 @@ kernel_cake_dense_projection_gemm_ebbb505a3077e8da0a50(const __grid_constant__ C
                         "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                         "}"
-                        :: "r"(work_empty_addr + work_stage_1 * 8), "r"(0) : "memory");
+                        :: "r"(work_empty_addr + (work_stage_1) * 8), "r"(0) : "memory");
                     work_stage_1 += 1;
                     if (work_stage_1 == 4) { work_stage_1 = 0; _phase_work_full_1 ^= 1; }
-                    if (_clc_valid_2 == 0) {
+                    if (clc_valid_1 == 0) {
                         break;
                     }
                 }
@@ -825,7 +825,7 @@ kernel_cake_dense_projection_gemm_ebbb505a3077e8da0a50(const __grid_constant__ C
                     }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_2) * 8, _phase_work_full_2);
-                uint32_t _clc_valid_3 = 0;
+                uint32_t clc_valid_2 = 0;
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p1;\n\t"
@@ -834,10 +834,10 @@ kernel_cake_dense_projection_gemm_ebbb505a3077e8da0a50(const __grid_constant__ C
                     "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                     "selp.u32 %0, 1, 0, p1;\n\t"
                     "}\n"
-                    : "=r"(_clc_valid_3)
+                    : "=r"(clc_valid_2)
                     : "r"(work_response_addr + work_stage_2 * 16 + 0 * 16)
                     : "memory");
-                uint32_t _clc_ctaid_3 = 0;
+                uint32_t clc_ctaid_2 = 0;
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p1;\n\t"
@@ -846,7 +846,7 @@ kernel_cake_dense_projection_gemm_ebbb505a3077e8da0a50(const __grid_constant__ C
                     "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                     "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                     "}\n"
-                    : "+r"(_clc_ctaid_3)
+                    : "+r"(clc_ctaid_2)
                     : "r"(work_response_addr + work_stage_2 * 16 + 0 * 16)
                     : "memory");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -857,13 +857,13 @@ kernel_cake_dense_projection_gemm_ebbb505a3077e8da0a50(const __grid_constant__ C
                     "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                     "}"
-                    :: "r"(work_empty_addr + work_stage_2 * 8), "r"(0) : "memory");
+                    :: "r"(work_empty_addr + (work_stage_2) * 8), "r"(0) : "memory");
                 work_stage_2 += 1;
                 if (work_stage_2 == 4) { work_stage_2 = 0; _phase_work_full_2 ^= 1; }
-                if (_clc_valid_3 == 0) {
+                if (clc_valid_2 == 0) {
                     break;
                 }
-                this_bid_1 = _clc_ctaid_3 + (unsigned int)cta_rank;
+                this_bid_1 = clc_ctaid_2 + (unsigned int)cta_rank;
             }
         }
     }
@@ -927,116 +927,116 @@ kernel_cake_dense_projection_gemm_ebbb505a3077e8da0a50(const __grid_constant__ C
                         asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_1) : "r"(__as_u32(s0)), "r"(__as_u32(s1)));
                         pl[0] = _prmt_1;
                         float v0_0 = __uint_as_float(w0[2]);
-                        float v1_1 = __uint_as_float(w0[3]);
-                        unsigned int pk_2 = __as_u32(__float22bfloat162_rn(make_float2(v0_0, v1_1)));
-                        float r0_3 = v0_0 - __uint_as_float(pk_2 << 16);
-                        float r1_4 = v1_1 - __uint_as_float(pk_2 & 4294901760u);
-                        unsigned int m0_5 = __as_u32(r0_3) & 4294901760u;
-                        unsigned int m1_6 = __as_u32(r1_4) & 4294901760u;
-                        float s0_7 = r0_3 - __uint_as_float(m0_5);
-                        float s1_8 = r1_4 - __uint_as_float(m1_6);
-                        ph[1] = pk_2;
+                        float v1_0 = __uint_as_float(w0[3]);
+                        unsigned int pk_0 = __as_u32(__float22bfloat162_rn(make_float2(v0_0, v1_0)));
+                        float r0_0 = v0_0 - __uint_as_float(pk_0 << 16);
+                        float r1_0 = v1_0 - __uint_as_float(pk_0 & 4294901760u);
+                        unsigned int m0_0 = __as_u32(r0_0) & 4294901760u;
+                        unsigned int m1_0 = __as_u32(r1_0) & 4294901760u;
+                        float s0_0 = r0_0 - __uint_as_float(m0_0);
+                        float s1_0 = r1_0 - __uint_as_float(m1_0);
+                        ph[1] = pk_0;
                         uint32_t _prmt_2;
-                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_2) : "r"(m0_5), "r"(m1_6));
+                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_2) : "r"(m0_0), "r"(m1_0));
                         pm[1] = _prmt_2;
                         uint32_t _prmt_3;
-                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_3) : "r"(__as_u32(s0_7)), "r"(__as_u32(s1_8)));
+                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_3) : "r"(__as_u32(s0_0)), "r"(__as_u32(s1_0)));
                         pl[1] = _prmt_3;
-                        float v0_9 = __uint_as_float(w1[0]);
-                        float v1_10 = __uint_as_float(w1[1]);
-                        unsigned int pk_11 = __as_u32(__float22bfloat162_rn(make_float2(v0_9, v1_10)));
-                        float r0_12 = v0_9 - __uint_as_float(pk_11 << 16);
-                        float r1_13 = v1_10 - __uint_as_float(pk_11 & 4294901760u);
-                        unsigned int m0_14 = __as_u32(r0_12) & 4294901760u;
-                        unsigned int m1_15 = __as_u32(r1_13) & 4294901760u;
-                        float s0_16 = r0_12 - __uint_as_float(m0_14);
-                        float s1_17 = r1_13 - __uint_as_float(m1_15);
-                        ph[2] = pk_11;
+                        float v0_1 = __uint_as_float(w1[0]);
+                        float v1_1 = __uint_as_float(w1[1]);
+                        unsigned int pk_1 = __as_u32(__float22bfloat162_rn(make_float2(v0_1, v1_1)));
+                        float r0_1 = v0_1 - __uint_as_float(pk_1 << 16);
+                        float r1_1 = v1_1 - __uint_as_float(pk_1 & 4294901760u);
+                        unsigned int m0_1 = __as_u32(r0_1) & 4294901760u;
+                        unsigned int m1_1 = __as_u32(r1_1) & 4294901760u;
+                        float s0_1 = r0_1 - __uint_as_float(m0_1);
+                        float s1_1 = r1_1 - __uint_as_float(m1_1);
+                        ph[2] = pk_1;
                         uint32_t _prmt_4;
-                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_4) : "r"(m0_14), "r"(m1_15));
+                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_4) : "r"(m0_1), "r"(m1_1));
                         pm[2] = _prmt_4;
                         uint32_t _prmt_5;
-                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_5) : "r"(__as_u32(s0_16)), "r"(__as_u32(s1_17)));
+                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_5) : "r"(__as_u32(s0_1)), "r"(__as_u32(s1_1)));
                         pl[2] = _prmt_5;
-                        float v0_18 = __uint_as_float(w1[2]);
-                        float v1_19 = __uint_as_float(w1[3]);
-                        unsigned int pk_20 = __as_u32(__float22bfloat162_rn(make_float2(v0_18, v1_19)));
-                        float r0_21 = v0_18 - __uint_as_float(pk_20 << 16);
-                        float r1_22 = v1_19 - __uint_as_float(pk_20 & 4294901760u);
-                        unsigned int m0_23 = __as_u32(r0_21) & 4294901760u;
-                        unsigned int m1_24 = __as_u32(r1_22) & 4294901760u;
-                        float s0_25 = r0_21 - __uint_as_float(m0_23);
-                        float s1_26 = r1_22 - __uint_as_float(m1_24);
-                        ph[3] = pk_20;
+                        float v0_2 = __uint_as_float(w1[2]);
+                        float v1_2 = __uint_as_float(w1[3]);
+                        unsigned int pk_2 = __as_u32(__float22bfloat162_rn(make_float2(v0_2, v1_2)));
+                        float r0_2 = v0_2 - __uint_as_float(pk_2 << 16);
+                        float r1_2 = v1_2 - __uint_as_float(pk_2 & 4294901760u);
+                        unsigned int m0_2 = __as_u32(r0_2) & 4294901760u;
+                        unsigned int m1_2 = __as_u32(r1_2) & 4294901760u;
+                        float s0_2 = r0_2 - __uint_as_float(m0_2);
+                        float s1_2 = r1_2 - __uint_as_float(m1_2);
+                        ph[3] = pk_2;
                         uint32_t _prmt_6;
-                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_6) : "r"(m0_23), "r"(m1_24));
+                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_6) : "r"(m0_2), "r"(m1_2));
                         pm[3] = _prmt_6;
                         uint32_t _prmt_7;
-                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_7) : "r"(__as_u32(s0_25)), "r"(__as_u32(s1_26)));
+                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_7) : "r"(__as_u32(s0_2)), "r"(__as_u32(s1_2)));
                         pl[3] = _prmt_7;
-                        float v0_27 = __uint_as_float(w2[0]);
-                        float v1_28 = __uint_as_float(w2[1]);
-                        unsigned int pk_29 = __as_u32(__float22bfloat162_rn(make_float2(v0_27, v1_28)));
-                        float r0_30 = v0_27 - __uint_as_float(pk_29 << 16);
-                        float r1_31 = v1_28 - __uint_as_float(pk_29 & 4294901760u);
-                        unsigned int m0_32 = __as_u32(r0_30) & 4294901760u;
-                        unsigned int m1_33 = __as_u32(r1_31) & 4294901760u;
-                        float s0_34 = r0_30 - __uint_as_float(m0_32);
-                        float s1_35 = r1_31 - __uint_as_float(m1_33);
-                        ph[4] = pk_29;
+                        float v0_3 = __uint_as_float(w2[0]);
+                        float v1_3 = __uint_as_float(w2[1]);
+                        unsigned int pk_3 = __as_u32(__float22bfloat162_rn(make_float2(v0_3, v1_3)));
+                        float r0_3 = v0_3 - __uint_as_float(pk_3 << 16);
+                        float r1_3 = v1_3 - __uint_as_float(pk_3 & 4294901760u);
+                        unsigned int m0_3 = __as_u32(r0_3) & 4294901760u;
+                        unsigned int m1_3 = __as_u32(r1_3) & 4294901760u;
+                        float s0_3 = r0_3 - __uint_as_float(m0_3);
+                        float s1_3 = r1_3 - __uint_as_float(m1_3);
+                        ph[4] = pk_3;
                         uint32_t _prmt_8;
-                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_8) : "r"(m0_32), "r"(m1_33));
+                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_8) : "r"(m0_3), "r"(m1_3));
                         pm[4] = _prmt_8;
                         uint32_t _prmt_9;
-                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_9) : "r"(__as_u32(s0_34)), "r"(__as_u32(s1_35)));
+                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_9) : "r"(__as_u32(s0_3)), "r"(__as_u32(s1_3)));
                         pl[4] = _prmt_9;
-                        float v0_36 = __uint_as_float(w2[2]);
-                        float v1_37 = __uint_as_float(w2[3]);
-                        unsigned int pk_38 = __as_u32(__float22bfloat162_rn(make_float2(v0_36, v1_37)));
-                        float r0_39 = v0_36 - __uint_as_float(pk_38 << 16);
-                        float r1_40 = v1_37 - __uint_as_float(pk_38 & 4294901760u);
-                        unsigned int m0_41 = __as_u32(r0_39) & 4294901760u;
-                        unsigned int m1_42 = __as_u32(r1_40) & 4294901760u;
-                        float s0_43 = r0_39 - __uint_as_float(m0_41);
-                        float s1_44 = r1_40 - __uint_as_float(m1_42);
-                        ph[5] = pk_38;
+                        float v0_4 = __uint_as_float(w2[2]);
+                        float v1_4 = __uint_as_float(w2[3]);
+                        unsigned int pk_4 = __as_u32(__float22bfloat162_rn(make_float2(v0_4, v1_4)));
+                        float r0_4 = v0_4 - __uint_as_float(pk_4 << 16);
+                        float r1_4 = v1_4 - __uint_as_float(pk_4 & 4294901760u);
+                        unsigned int m0_4 = __as_u32(r0_4) & 4294901760u;
+                        unsigned int m1_4 = __as_u32(r1_4) & 4294901760u;
+                        float s0_4 = r0_4 - __uint_as_float(m0_4);
+                        float s1_4 = r1_4 - __uint_as_float(m1_4);
+                        ph[5] = pk_4;
                         uint32_t _prmt_10;
-                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_10) : "r"(m0_41), "r"(m1_42));
+                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_10) : "r"(m0_4), "r"(m1_4));
                         pm[5] = _prmt_10;
                         uint32_t _prmt_11;
-                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_11) : "r"(__as_u32(s0_43)), "r"(__as_u32(s1_44)));
+                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_11) : "r"(__as_u32(s0_4)), "r"(__as_u32(s1_4)));
                         pl[5] = _prmt_11;
-                        float v0_45 = __uint_as_float(w3[0]);
-                        float v1_46 = __uint_as_float(w3[1]);
-                        unsigned int pk_47 = __as_u32(__float22bfloat162_rn(make_float2(v0_45, v1_46)));
-                        float r0_48 = v0_45 - __uint_as_float(pk_47 << 16);
-                        float r1_49 = v1_46 - __uint_as_float(pk_47 & 4294901760u);
-                        unsigned int m0_50 = __as_u32(r0_48) & 4294901760u;
-                        unsigned int m1_51 = __as_u32(r1_49) & 4294901760u;
-                        float s0_52 = r0_48 - __uint_as_float(m0_50);
-                        float s1_53 = r1_49 - __uint_as_float(m1_51);
-                        ph[6] = pk_47;
+                        float v0_5 = __uint_as_float(w3[0]);
+                        float v1_5 = __uint_as_float(w3[1]);
+                        unsigned int pk_5 = __as_u32(__float22bfloat162_rn(make_float2(v0_5, v1_5)));
+                        float r0_5 = v0_5 - __uint_as_float(pk_5 << 16);
+                        float r1_5 = v1_5 - __uint_as_float(pk_5 & 4294901760u);
+                        unsigned int m0_5 = __as_u32(r0_5) & 4294901760u;
+                        unsigned int m1_5 = __as_u32(r1_5) & 4294901760u;
+                        float s0_5 = r0_5 - __uint_as_float(m0_5);
+                        float s1_5 = r1_5 - __uint_as_float(m1_5);
+                        ph[6] = pk_5;
                         uint32_t _prmt_12;
-                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_12) : "r"(m0_50), "r"(m1_51));
+                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_12) : "r"(m0_5), "r"(m1_5));
                         pm[6] = _prmt_12;
                         uint32_t _prmt_13;
-                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_13) : "r"(__as_u32(s0_52)), "r"(__as_u32(s1_53)));
+                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_13) : "r"(__as_u32(s0_5)), "r"(__as_u32(s1_5)));
                         pl[6] = _prmt_13;
-                        float v0_54 = __uint_as_float(w3[2]);
-                        float v1_55 = __uint_as_float(w3[3]);
-                        unsigned int pk_56 = __as_u32(__float22bfloat162_rn(make_float2(v0_54, v1_55)));
-                        float r0_57 = v0_54 - __uint_as_float(pk_56 << 16);
-                        float r1_58 = v1_55 - __uint_as_float(pk_56 & 4294901760u);
-                        unsigned int m0_59 = __as_u32(r0_57) & 4294901760u;
-                        unsigned int m1_60 = __as_u32(r1_58) & 4294901760u;
-                        float s0_61 = r0_57 - __uint_as_float(m0_59);
-                        float s1_62 = r1_58 - __uint_as_float(m1_60);
-                        ph[7] = pk_56;
+                        float v0_6 = __uint_as_float(w3[2]);
+                        float v1_6 = __uint_as_float(w3[3]);
+                        unsigned int pk_6 = __as_u32(__float22bfloat162_rn(make_float2(v0_6, v1_6)));
+                        float r0_6 = v0_6 - __uint_as_float(pk_6 << 16);
+                        float r1_6 = v1_6 - __uint_as_float(pk_6 & 4294901760u);
+                        unsigned int m0_6 = __as_u32(r0_6) & 4294901760u;
+                        unsigned int m1_6 = __as_u32(r1_6) & 4294901760u;
+                        float s0_6 = r0_6 - __uint_as_float(m0_6);
+                        float s1_6 = r1_6 - __uint_as_float(m1_6);
+                        ph[7] = pk_6;
                         uint32_t _prmt_14;
-                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_14) : "r"(m0_59), "r"(m1_60));
+                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_14) : "r"(m0_6), "r"(m1_6));
                         pm[7] = _prmt_14;
                         uint32_t _prmt_15;
-                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_15) : "r"(__as_u32(s0_61)), "r"(__as_u32(s1_62)));
+                        asm("prmt.b32 %0, %1, %2, 0x7632;" : "=r"(_prmt_15) : "r"(__as_u32(s0_6)), "r"(__as_u32(s1_6)));
                         pl[7] = _prmt_15;
                         #pragma unroll
                         for (int q_2 = 0; q_2 < 2; q_2++) {
@@ -1055,7 +1055,7 @@ kernel_cake_dense_projection_gemm_ebbb505a3077e8da0a50(const __grid_constant__ C
                     if (p_stage == 4) { p_stage = 0; _phase_raw_full ^= 1; }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_3) * 8, _phase_work_full_3);
-                uint32_t _clc_valid_1 = 0;
+                uint32_t clc_valid_3 = 0;
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p1;\n\t"
@@ -1064,10 +1064,10 @@ kernel_cake_dense_projection_gemm_ebbb505a3077e8da0a50(const __grid_constant__ C
                     "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                     "selp.u32 %0, 1, 0, p1;\n\t"
                     "}\n"
-                    : "=r"(_clc_valid_1)
+                    : "=r"(clc_valid_3)
                     : "r"(work_response_addr + work_stage_3 * 16 + 0 * 16)
                     : "memory");
-                uint32_t _clc_ctaid_1 = 0;
+                uint32_t clc_ctaid_3 = 0;
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p1;\n\t"
@@ -1076,7 +1076,7 @@ kernel_cake_dense_projection_gemm_ebbb505a3077e8da0a50(const __grid_constant__ C
                     "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                     "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                     "}\n"
-                    : "+r"(_clc_ctaid_1)
+                    : "+r"(clc_ctaid_3)
                     : "r"(work_response_addr + work_stage_3 * 16 + 0 * 16)
                     : "memory");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -1086,13 +1086,13 @@ kernel_cake_dense_projection_gemm_ebbb505a3077e8da0a50(const __grid_constant__ C
                     "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                     "}"
-                    :: "r"(work_empty_addr + work_stage_3 * 8), "r"(0) : "memory");
+                    :: "r"(work_empty_addr + (work_stage_3) * 8), "r"(0) : "memory");
                 work_stage_3 += 1;
                 if (work_stage_3 == 4) { work_stage_3 = 0; _phase_work_full_3 ^= 1; }
-                if (_clc_valid_1 == 0) {
+                if (clc_valid_3 == 0) {
                     break;
                 }
-                this_bid_2 = _clc_ctaid_1 + (unsigned int)cta_rank;
+                this_bid_2 = clc_ctaid_3 + (unsigned int)cta_rank;
             }
         }
     }
