@@ -780,6 +780,28 @@ SF_RING_FORM_CELLS: dict[
         (28672, 8192): ((5889, 8192, "g8"),),
     },
 }
+# The cluster-of-8 multicast form of the CLC ring program without raster groups
+# (``mc42`` tactics, ``_sfr_mc42`` keys): the launch asks for clusters of 8 CTAs over
+# the required pairs and walks the pair tiles in 2 x 2 blocks (two token tiles by two
+# weight tiles), so the pairs that share a token or weight tile split its operand and
+# scale loads and multicast them.  It needs even token and weight tile counts.  The
+# MMA sequence of every tile and so the outputs are those of the ring program.  On
+# SF_RING_ARCH at its measured SM count, a K = 96 pair program with 256-wide weight
+# tiles (SF_RING_FORM_KEYS, SF_RING_G8_KEYS, SF_RING_CLC_KEYS) takes it on the measured
+# cells of SF_RING_MC42_CELLS before the other ring rules: per kind, keyed by
+# ``(K, N)``, the token range.
+SF_RING_MC42_CELLS: dict[str, dict[tuple[int, int], tuple[int, int]]] = {
+    "gemm": {
+        (8192, 8192): (1793, 2048),
+        (7168, 18432): (1793, 2048),
+        (8192, 28672): (1793, 2048),
+    },
+    "chain": {
+        (8192, 8192): (1793, 2048),
+        (7168, 18432): (1793, 2048),
+        (8192, 28672): (1793, 2048),
+    },
+}
 # Cluster split-K 2 for the unsplit swapped-orientation rows whose 128-row weight-tile
 # grid fills at most half the SMs at K >= SPLITK2_MIN_K.
 SPLITK2_MIN_K = 16384
@@ -1192,6 +1214,8 @@ def gemm_kernel_key(tactic: dict[str, Any], out_f16: bool) -> str:
         parts.append("b2" + str(tactic["b2"]))
     if tactic.get("sf_ring"):
         parts.append("sfr")
+    if tactic.get("mc42"):
+        parts.append("mc42")
     return "gemm:" + "_".join(parts)
 
 
@@ -1306,6 +1330,7 @@ KNOWN_TACTIC_KEYS = frozenset(
         "fold",
         "half_m",
         "l2_promo",
+        "mc42",
         "num_stages",
         "raster_group",
         "ring_overlay",
@@ -1521,6 +1546,15 @@ def _gemm_plan(
             " weight tiles and evict-last operands: the static schedule with raster"
             " groups of 8 or the CLC schedule with groups of 16 or without groups"
         )
+    if tactic.get("mc42") and (
+        not tactic.get("sf_ring")
+        or not sched_is_clc(tactic)
+        or int(tactic.get("raster_group") or 0)
+    ):
+        raise ValueError(
+            "mc42 is a form of the sf_ring program on the CLC schedule without raster"
+            " groups"
+        )
     # 2-CTA pairs cover 256 token rows (128 per CTA), half-M pairs 128 (64 per CTA).
     tok_tile = (
         tile_n
@@ -1571,6 +1605,11 @@ def _gemm_plan(
         tok_tiles = 1
     w_tiles = (n + w_tile - 1) // w_tile
     num_tiles = tok_tiles * w_tiles
+    if tactic.get("mc42") and (tok_tiles % 2 or w_tiles % 2):
+        raise ValueError(
+            "mc42 walks the pair tiles in 2 x 2 blocks: it needs even token and"
+            f" weight tile counts, got {tok_tiles} x {w_tiles}"
+        )
     sched = str(tactic.get("sched", "static"))
     if two_cta:
         grid = (
@@ -2424,10 +2463,31 @@ def _sf_ring_tactic(plan: GemmPlan, kind: str) -> Optional[dict[str, Any]]:
     :data:`SF_RING_CLC_KEYS` program, or a :data:`SF_RING_G8_KEYS` program on a cell of
     ``SF_RING_G8_CELLS[kind]``, and the ring program is registered; for a
     :data:`SF_RING_FORM_KEYS` program on a cell of ``SF_RING_FORM_CELLS[kind]``, the
-    ring tactic of the cell's form (:data:`SF_RING_FORMS`); else ``None``."""
+    ring tactic of the cell's form (:data:`SF_RING_FORMS`); first, for any of these
+    programs on a cell of ``SF_RING_MC42_CELLS[kind]`` with even token and weight tile
+    counts, the cluster-of-8 multicast form (``mc42``) of the CLC ring program without
+    raster groups; else ``None``."""
     if plan.arch != SF_RING_ARCH or MEASURED_SM_COUNT.get(plan.arch) != plan.sm_count:
         return None
-    if plan.kernel_key in SF_RING_FORM_KEYS:
+    mc42_cell = SF_RING_MC42_CELLS[kind].get((plan.K, plan.N))
+    if (
+        mc42_cell is not None
+        and mc42_cell[0] <= plan.M <= mc42_cell[1]
+        and plan.tok_tiles % 2 == 0
+        and plan.w_tiles % 2 == 0
+        and (
+            plan.kernel_key in SF_RING_FORM_KEYS
+            or plan.kernel_key in SF_RING_G8_KEYS
+            or plan.kernel_key in SF_RING_CLC_KEYS
+        )
+    ):
+        tactic = {
+            name: value
+            for name, value in plan.tactic.items()
+            if name not in ("sched", "raster_group", "stream_k", "sk_split")
+        }
+        tactic.update(sched="clc", sf_ring=True, mc42=True)
+    elif plan.kernel_key in SF_RING_FORM_KEYS:
         form = next(
             (
                 form
