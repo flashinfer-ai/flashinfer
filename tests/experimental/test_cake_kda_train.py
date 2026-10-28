@@ -5498,7 +5498,7 @@ def _real_chunks(lengths) -> int:
 
 @pytest.mark.parametrize("shape", D_ROWS, ids=_shape_id)
 def test_batched_arena_gives_the_default_results_bitwise(
-    device, manifest, shape
+    device, manifest, shape, monkeypatch
 ) -> None:
     """Two groups, three and one document per group, with and without the lean layouts: the batched forward gives
     the default's ``out``, token rows, tables and saved states bit for bit, the batched backward the default's
@@ -5634,15 +5634,29 @@ def test_batched_arena_gives_the_default_results_bitwise(
             assert tws.bytes == p.arena_bytes(
                 save_mode="tape", arena=arena, doc_lengths=lengths
             )
-            # the saved tapes come from freed memory filled with NaN: a v_new row no group writes would show
-            torch.empty(
-                2 * (ref_v_new.nbytes + saved_t.h.nbytes),
-                dtype=torch.uint8,
-                device=device,
-            ).fill_(0xFF)
+            # the saved v_new comes from its allocation filled with NaN: a row no group writes would show
+            original_alloc, poisoned = cake_backend._alloc, []
+
+            def nan_v_new(
+                shape_,
+                dtype,
+                device_,
+                _orig=original_alloc,
+                _hit=poisoned,
+                _ref=ref_v_new,
+            ):
+                t = _orig(shape_, dtype, device_)
+                if dtype == _ref.dtype and tuple(shape_) == tuple(_ref.shape):
+                    t.view(torch.uint8).fill_(0xFF)
+                    _hit.append(t.data_ptr())
+                return t
+
+            monkeypatch.setattr(cake_backend, "_alloc", nan_v_new)
             o, saved_tb = cake_backend.chunk_kda_fwd(
                 q, k, v, g, beta, cu, workspace=tws, doc_lengths=lengths
             )
+            monkeypatch.setattr(cake_backend, "_alloc", original_alloc)
+            assert poisoned == [saved_tb.v_new.data_ptr()], tag
             assert (
                 _bits_equal(o, ref_out)
                 and saved_tb.version == cake_backend.SAVED_VERSION_TAPE
@@ -5972,7 +5986,7 @@ def test_batched_arena_on_a_row_that_saves_the_states(device, manifest) -> None:
         del ws
 
 
-def test_batched_arena_with_exact_zero_values(device, manifest) -> None:
+def test_batched_arena_with_exact_zero_values(device, manifest, monkeypatch) -> None:
     """Rows with exact zeros in ``v`` and ``dout`` (a zero token row, a zero chunk at a group's first chunk, a whole
     zero document at an odd chunk): the paired WY programs accumulate ``0 * partner`` for the other chunk of a
     pair, so a changed partner could only change the sign of an exactly-zero entry; the bit-pattern comparison of
@@ -6037,15 +6051,29 @@ def test_batched_arena_with_exact_zero_values(device, manifest) -> None:
             tws = KdaWorkspace.for_problem(
                 S, N, heads, device, save_mode="tape", arena=arena, doc_lengths=lengths
             )
-            # the saved tapes come from freed memory filled with NaN: a v_new row no group writes would show
-            torch.empty(
-                2 * (ref_v_new.nbytes + saved_t.h.nbytes),
-                dtype=torch.uint8,
-                device=device,
-            ).fill_(0xFF)
+            # the saved v_new comes from its allocation filled with NaN: a row no group writes would show
+            original_alloc, poisoned = cake_backend._alloc, []
+
+            def nan_v_new(
+                shape_,
+                dtype,
+                device_,
+                _orig=original_alloc,
+                _hit=poisoned,
+                _ref=ref_v_new,
+            ):
+                t = _orig(shape_, dtype, device_)
+                if dtype == _ref.dtype and tuple(shape_) == tuple(_ref.shape):
+                    t.view(torch.uint8).fill_(0xFF)
+                    _hit.append(t.data_ptr())
+                return t
+
+            monkeypatch.setattr(cake_backend, "_alloc", nan_v_new)
             o, saved_tb = cake_backend.chunk_kda_fwd(
                 q, k, v, g, beta, cu_t, workspace=tws, doc_lengths=lengths
             )
+            monkeypatch.setattr(cake_backend, "_alloc", original_alloc)
+            assert poisoned == [saved_tb.v_new.data_ptr()], tag
             assert _bits_equal(o, ref_out), tag
             assert _bits_equal(saved_tb.h[:real], ref_h), tag
             # v_new whole, its pad rows included: zero in both (the rows after the last group's slice too)
