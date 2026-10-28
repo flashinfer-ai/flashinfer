@@ -1140,8 +1140,10 @@ class Sm100W4A16GroupedGemmKernel:
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
         mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
         is_leader_cta = mma_tile_coord_v == 0
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(
-            cute.arch.block_idx_in_cluster()
+        cta_rank_in_cluster = (
+            cutlass.Int32(0)
+            if cutlass.const_expr(cute.size(self.cluster_shape_mn) == 1)
+            else cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         )
         is_first_cta_in_cluster = cta_rank_in_cluster == 0
         block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(
