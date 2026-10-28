@@ -691,6 +691,19 @@ class BatchedGemmConfig:
     with PTX ``createpolicy``.
     """
 
+    fused_finalize_top_k: int = 0
+    """Top-k of a MoE finalize fused into this swap-AB BF16 epilogue, or ``0``
+    for a plain C store.
+
+    With ``k > 0`` every output column (permuted token row) whose token has
+    exactly one expert in this launch is scaled by that expert's routing
+    weight and stored straight into the token's row of the MoE output; the
+    columns of tokens with several experts go to C unscaled, for the finalize
+    kernel to reduce. The launch then also takes the MoE output, the
+    expanded-to-permuted index map and the expert weights
+    (:func:`validate_config`).
+    """
+
     use_pdl: int = 0
     """Enable programmatic dependent launch (PDL). ``0``/``1``.
 
@@ -3596,6 +3609,29 @@ def validate_config(
             raise ValueError("weight_l2_evict_first requires swap-AB (BatchN)")
         if cfg.token_cluster_dim != 1:
             raise ValueError("weight_l2_evict_first requires token-cluster width one")
+
+    if not 0 <= cfg.fused_finalize_top_k <= 32:
+        raise ValueError(
+            f"fused_finalize_top_k must be in [0, 32], got {cfg.fused_finalize_top_k}"
+        )
+    if cfg.fused_finalize_top_k and not (
+        cfg.is_swap_ab
+        and cfg.use_tma_store
+        and cfg.dtype_c == int(DType.BF16)
+        and cfg.tile_m == 128
+        and cfg.token_cluster_dim == 1
+        and not cfg.has_activation_epilogue
+        and not cfg.use_deepseek_fp8
+        and not cfg.has_output_block_scaling
+        and not cfg.uses_fp8_output
+        and not cfg.has_per_token_sf_a
+        and not cfg.has_per_token_sf_b
+    ):
+        raise ValueError(
+            "fused_finalize_top_k needs a swap-AB BF16 TMA-store epilogue with "
+            "tile_m 128, token-cluster width one and no activation, per-token "
+            "scales, output quantization or DeepSeek FP8 scaling"
+        )
 
     if cfg.use_max_tmem_overlap not in (0, 1):
         raise ValueError(
