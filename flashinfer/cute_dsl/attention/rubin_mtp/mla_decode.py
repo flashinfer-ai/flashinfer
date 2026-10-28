@@ -398,7 +398,7 @@ def prepare_cute_dsl_mla_decode(
     num_kv_splits=None,
 ):
     """Compile before capture; return a monolithic-compatible prepared launch."""
-    splits, size = _get_split_kv_and_workspace_size(
+    _, size = _get_split_kv_and_workspace_size(
         batch_size,
         seq_len_q,
         num_heads,
@@ -416,7 +416,9 @@ def prepare_cute_dsl_mla_decode(
         qk_rope_head_dim=qk_rope_head_dim,
         num_heads=num_heads,
         seq_len_q=seq_len_q,
-        reducer_max_splits=max(4, 1 << (splits - 1).bit_length()),
+        # The scalar reducer rounds every supported budget to one warp.
+        # Keep a single cache key when only the runtime split count changes.
+        reducer_max_splits=MAX_SPLITS,
         is_workspace_size_zero=size == 0,
     )
 
