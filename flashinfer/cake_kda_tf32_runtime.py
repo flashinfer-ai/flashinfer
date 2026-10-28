@@ -111,6 +111,15 @@ if TYPE_CHECKING:
 HEAD_DIM = 128
 BF16_M128_CHUNK = 32
 BF16_N16_M128_CHUNK = 16
+# Most 32-token chunks of the longest sequence of a work-binned direct M128 N32
+# serving launch that takes the loader's turnover build of its module (see
+# _work_bin_turnover_route): with such short tasks a bin turns its state over
+# often enough that loading the next task's initial state and storing the
+# previous task's final state beside the current task's chunks pays.  A launch
+# with a longer sequence keeps the routed work-binned program.  Measured per
+# part: BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS_GB300 on a 152-SM sm_103a.
+BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS = 8
+BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS_GB300 = 16
 BF16_BETA_TMA_MIN_HEADS = 8
 BF16_DIRECT_ORDER_MAX_PASSES = 1
 BF16_DIRECT_INSERTION_MAX_SEQUENCES = 16
@@ -908,13 +917,16 @@ class _CorrectionMergeUnavailable(Exception):
 def _is_fused_m128_row(factory) -> bool:
     """``factory`` is the plain fused M128 factory row.
 
-    That is ``partial(_factory, "compiled_bf16_fused_m128", ...)``.  The fold
-    and merge interceptors rewrite only this factory; they raise their
-    ``...Unavailable`` exception for every other one (fail closed).
+    That is ``partial(_factory, "compiled_bf16_fused_m128", ...)``, or the same
+    row through the work-bin turnover factory (``_work_bin_turnover_factory``,
+    which resolves the row like ``_factory``).  The fold and merge interceptors
+    rewrite only this factory row, as they would ``_factory``'s; they raise
+    their ``...Unavailable`` exception for every other one (fail closed).
     """
-    return getattr(factory, "func", None) is _factory and factory.args == (
-        "compiled_bf16_fused_m128",
-    )
+    return getattr(factory, "func", None) in (
+        _factory,
+        _work_bin_turnover_factory,
+    ) and factory.args == ("compiled_bf16_fused_m128",)
 
 
 def _built_from_table(launch, table: str) -> bool:
@@ -1071,6 +1083,79 @@ def _m64_pair_share_factory(name, *args, **kwargs):
     if program is None:
         return _factory(name, *args, **kwargs)
     return _kda_registry.PreparedKernel(program, arch)
+
+
+def _work_bin_turnover_program(
+    name,
+    *args,
+    route_heads=None,
+    route_work_bins=False,
+    owner_helper=False,
+    owner_helper_pool=False,
+    **kwargs,
+):
+    """The turnover build of the factory row's work-binned module, or ``None``.
+
+    ``None`` for a call without work bins or with owner/helper CTAs (pooled or
+    not), when the row has no module on this device, when the head-count routes
+    take the module elsewhere at ``route_heads``, when the loader names no
+    work-binned build of the module (``_factory`` would not take work bins), or
+    when it names no turnover build of it (``_RENDERED_WORK_BIN_TURN_ROUTES``).
+    The routing keywords are not part of the row's key (as in ``_factory``).
+    """
+    if not route_work_bins or owner_helper or owner_helper_pool:
+        return None
+    arch = detect_gpu_arch()
+    rows = _kda_registry.FACTORIES.get(arch, {}).get(name, {})
+    module = rows.get(_kda_registry._key(args, kwargs))
+    if module is None:
+        return None
+    heads = getattr(_kda_registry, "_RENDERED_HEAD_ROUTES", {})
+    if route_heads in heads.get(arch, {}).get(module, {}):
+        return None
+    if module not in _kda_registry._RENDERED_WORK_BIN_ROUTES.get(arch, {}):
+        return None
+    return _kda_registry._RENDERED_WORK_BIN_TURN_ROUTES.get(arch, {}).get(module)
+
+
+def _work_bin_turnover_factory(name, *args, **kwargs):
+    """The turnover build of the factory row's work-binned module.
+
+    The same bins, bits and argument plan as the module's work-binned program,
+    with each bin's state turned over in the background.  ``_build_body``
+    takes this factory only where ``_work_bin_turnover_program`` names a
+    build; any other call resolves through ``_factory``.
+    """
+    program = _work_bin_turnover_program(name, *args, **kwargs)
+    if program is None:
+        return _factory(name, *args, **kwargs)
+    return _kda_registry.PreparedKernel(program, detect_gpu_arch())
+
+
+def _work_bin_turnover_route(
+    *,
+    route_work_bins: bool,
+    direct_n16: bool,
+    n32_ft_slab: bool,
+    max_seq_len: int,
+    gpu_arch: str,
+    sm_count: int,
+) -> bool:
+    """Whether a direct M128 launch may take its module's turnover build.
+
+    Only a work-binned N32 serving launch whose longest sequence has at most
+    the part's turnover chunk count.  Affine split parts (``_n32_ft_slab``)
+    never do: their slab modules have no turnover build, and the composite's
+    Fold / Merge classes intercept the factory for their own builds.
+    """
+    if not route_work_bins or direct_n16 or n32_ft_slab:
+        return False
+    limit = (
+        BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS_GB300
+        if gpu_arch == "sm_103a" and sm_count == 152
+        else BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS
+    )
+    return max_seq_len <= BF16_M128_CHUNK * limit
 
 
 # Bodies that reach an operand only through its TMA descriptor never
@@ -1912,8 +1997,25 @@ class FlashKDABlackwellBF16FusedLaunch:
     _affine_main_indexed_initial = False
     _active_beta_f32 = False
 
-    def _build_body(self, factory, *args, **kwargs):
-        """Build one body and record which raw q / k / v pointers it never reads."""
+    def _build_body(self, factory, *args, work_bin_turnover=False, **kwargs):
+        """Build one body and record which raw q / k / v pointers it never reads.
+
+        With ``work_bin_turnover`` a ``_factory`` build takes the loader's
+        turnover build of the resolved module (``_work_bin_turnover_factory``)
+        where ``_work_bin_turnover_program`` names one; every other build keeps
+        ``factory``.
+        """
+        if (
+            work_bin_turnover
+            and getattr(factory, "func", None) is _factory
+            and _work_bin_turnover_program(
+                *factory.args, *args, **{**factory.keywords, **kwargs}
+            )
+            is not None
+        ):
+            factory = partial(
+                _work_bin_turnover_factory, *factory.args, **factory.keywords
+            )
         module = self._build_kda_module(factory, *args, **kwargs)
         self._qkv_carrier_names[id(module)] = _qkv_raw_pointer_names(factory)
         return module
@@ -2656,6 +2758,16 @@ class FlashKDABlackwellBF16FusedLaunch:
                 ),
             )
         )
+        # A work-binned N32 serving launch whose longest sequence has at most
+        # the part's turnover chunk count may take its module's turnover build.
+        route_work_bin_turnover = _work_bin_turnover_route(
+            route_work_bins=route_work_bins,
+            direct_n16=use_direct_m128_n16,
+            n32_ft_slab=self._n32_ft_slab,
+            max_seq_len=max_seq_len,
+            gpu_arch=gpu_arch,
+            sm_count=sm_count,
+        )
         # The bounded N32 body without the early state pack is faster on the
         # short H12 grids and bitwise identical to the early-pack body, so the
         # prepared path keeps it for every length; it also has the work-binned
@@ -3070,6 +3182,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                     **({"owner_helper_pool": True} if owner_helper_pool else {}),
                 ),
                 BF16_N16_M128_CHUNK if use_direct_m128_n16 else BF16_M128_CHUNK,
+                work_bin_turnover=route_work_bin_turnover,
                 serving_native_abi=serving_native_abi,
                 gate_kind=gate_kind,
                 checkpoint_tma=bool(checkpoint_every_n_tokens and use_direct_m128_n16),
@@ -3378,6 +3491,10 @@ class FlashKDABlackwellBF16FusedLaunch:
                     "work bins replace the one-CTA-per-task direct grid only"
                 )
             self.grid = (num_work_bins, 1, 1)
+            if getattr(self.module, "name", None) in (
+                _kda_registry._RENDERED_WORK_BIN_TURN_ROUTES.get(gpu_arch, {}).values()
+            ):
+                self.schedule += "_turnover"
         self.owner_helpers = (
             owner_helpers if getattr(self.module, "owner_helper", False) else 0
         )

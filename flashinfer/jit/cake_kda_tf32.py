@@ -4675,6 +4675,19 @@ _RENDERED_PAIR_SHARE_ROUTES = {
     },
 }
 
+# architecture -> shipped module -> generated work-binned build that also turns
+# a bin's state over in the background: the next task's initial state loads and
+# the previous task's final state stores beside the current task's chunks. The
+# runtime takes it instead of the ``_RENDERED_WORK_BIN_ROUTES`` program on
+# work-binned launches of short tasks (see
+# ``BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS``); every other launch of the module
+# keeps its routed program. ``PreparedKernel`` reads a program this table names
+# as built with work bins.
+_RENDERED_WORK_BIN_TURN_ROUTES = {
+    "sm_100a": {},
+    "sm_103a": {},
+}
+
 MODULES = {
     **{name: _module_record(name, *row) for name, row in _MODULE_ROWS.items()},
     **_RENDERED_MODULES,
@@ -5759,8 +5772,10 @@ class PreparedKernel:
         self.arch = arch
         self.schedule = None
         # A program the work-bin routes name is built with work bins.
-        self.work_bins = bool(record.get("work_bins", False)) or (
-            name in _RENDERED_WORK_BIN_ROUTES.get(arch, {}).values()
+        self.work_bins = (
+            bool(record.get("work_bins", False))
+            or name in _RENDERED_WORK_BIN_ROUTES.get(arch, {}).values()
+            or name in _RENDERED_WORK_BIN_TURN_ROUTES.get(arch, {}).values()
         )
         native = load(name, arch)
         entry = record["ffi_entry"]
