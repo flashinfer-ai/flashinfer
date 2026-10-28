@@ -43,7 +43,10 @@ small launch, without a host synchronization. The rows depend only on the
 batch, so a model can compute them once per step with
 ``gdn_paged_prefill_slots`` (``gdn_paged_decode_slots`` for decode) and pass
 them as ``slots`` to every layer's call, which then launches only the GDN
-kernel. The call:
+kernel. The rows come from a Triton kernel; on SM107 its compilation needs a
+``ptxas`` from CUDA 13.4 or newer on ``PATH`` (or in
+``TRITON_PTXAS_BLACKWELL_PATH``), since older ones do not know ``sm_107a``.
+The call:
 
 - It reads the initial state from the page that holds the last prefix token,
   or starts from the zero state when the prefix is empty.
