@@ -1934,7 +1934,7 @@ def test_plan_pin_route_rule(monkeypatch):
     the kernel-tests reference planner states the same statistic."""
     module = planner
 
-    assert planner.PIN_MIN_CTA_LOOP_ITERS == 14
+    assert planner.PIN_MIN_CTA_LOOP_ITERS == 8
     g = 4
     long_mask = _topk_mask(2, 64, 64, 32)  # h8-m4096-n4096-k32 at g = 4
     long = plan_vsa_sm90(long_mask, sms=132, gqa=g)
@@ -4093,7 +4093,20 @@ def test_fp8_gqa_routes_match_the_fp8_mha_route_on_replicated_inputs(
     gqa = _fp8_gqa_plan_for(mask, h, scales, scale, route)
     mha = _fp8_plan_for(mask_rep, scales_rep, scale, route)
     assert gqa.fp8 and gqa.gqa == g and loader.stage_dtype(gqa.stage) == "e4m3"
-    assert gqa.stage == _gqa_stage_of(mha.stage) and loader.stage_gqa(gqa.stage)
+    # the Sage-FP8 route serves static grouped-query plans whose lightest CTA runs at least
+    # PIN_MIN_CTA_LOOP_ITERS main-loop iterations on the position-selected static program
+    # (the pair plan of this list runs 13 and takes it from the threshold 8 on); its MHA twin
+    # is the plain static program, and the bitwise checks below hold on it (pin == static
+    # bits).  The expectation comes from the planner decision on the plan's own device, not
+    # from the stage the route picked, so a plan routed away from the pin program fails here.
+    expected_stage = _gqa_stage_of(mha.stage)
+    sms = torch.cuda.get_device_properties(gqa.device).multi_processor_count
+    if planner.fp8_gqa_pin(
+        plan_vsa_sm90(mask.cpu(), sms=sms, gqa=g, split_tile_order="group")
+    ):
+        assert expected_stage == "attention_fp8_gqa"
+        expected_stage = "attention_fp8_gqa_pin"
+    assert gqa.stage == expected_stage and loader.stage_gqa(gqa.stage)
     assert gqa.mode == mha.mode
     record_property(f"fp8_repair_split_g{g}", gqa.repair_split)
     if gqa.small_kmax is None:
