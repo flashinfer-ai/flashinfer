@@ -673,6 +673,45 @@ def test_tuner_checks_gemm2_output_dtype(monkeypatch, output_dtype, arch):
     assert checked_dtypes == [torch_to_cutlass_dtype(output_dtype)]
 
 
+@cute_dsl_available
+@pytest.mark.parametrize(
+    "output_dtype,expected",
+    [
+        (torch.bfloat16, ["plain", "swizzle", "store_warps"]),
+        (torch.float32, ["plain", "swizzle"]),
+    ],
+)
+def test_tuner_filters_gemm2_epilogue_tactics(monkeypatch, output_dtype, expected):
+    """Store-warp tactics need two 16-bit C stages in shared memory."""
+    from flashinfer.fused_moe.cute_dsl import tuner
+
+    gemm1 = ((256, 256), (2, 1), False)
+    tactics = {
+        "plain": (256, gemm1, ((256, 256), (2, 1), False)),
+        "swizzle": (256, gemm1, ((256, 256), (2, 1), True, (1, 0, 4))),
+        "store_warps": (256, gemm1, ((256, 256), (2, 1), True, (2, 2, 4))),
+    }
+    for tactic in tactics.values():
+        assert tactic in tuner.ALL_BLACKWELL_MOE_TACTICS
+    monkeypatch.setattr(tuner, "_get_arch_tactics", lambda: list(tactics.values()))
+
+    inputs = [None] * 11
+    inputs[0] = torch.empty((128, 128), dtype=torch.uint8)
+    inputs[3] = torch.ones((128, 1), dtype=torch.float32)
+    inputs[4] = torch.empty((1, 512, 128), dtype=torch.uint8)
+    inputs[8] = torch.empty((1, 256, 128), dtype=torch.uint8)
+    runner = tuner.CuteDslFusedMoERunner(
+        forward_impl=lambda **kwargs: None,
+        num_experts=1,
+        top_k=1,
+        num_local_experts=1,
+        output_dtype=output_dtype,
+    )
+    assert runner.get_valid_tactics(inputs, profile=None) == [
+        tactics[name] for name in expected
+    ]
+
+
 def test_localized_runner_uses_shard_shapes_and_separate_cache_key():
     from flashinfer.fused_moe.cute_dsl.tuner import (
         CuteDslFusedMoERunner,
@@ -1178,7 +1217,7 @@ class TestTacticEnumeration:
         tactics = get_blackwell_gemm2_valid_tactics(tile_size)
         assert len(tactics) > 0, f"no gemm2 tactics returned at tile_size={tile_size}"
         expected_cluster_m = tile_size // 128
-        for mma_tiler_mn, cluster_shape_mn, _ in tactics:
+        for mma_tiler_mn, cluster_shape_mn, *_ in tactics:
             assert mma_tiler_mn[0] == tile_size, (
                 f"gemm2 mma_tiler[0]={mma_tiler_mn[0]} does not match "
                 f"tile_size={tile_size}; tactic={(mma_tiler_mn, cluster_shape_mn)}"

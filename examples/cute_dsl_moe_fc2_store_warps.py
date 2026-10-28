@@ -28,7 +28,9 @@ Measured with 384 experts, H=4096, I=768, top-k=20, 15900 tokens: FC2 went
 from 0.79 to 0.72 ms on B300 and from ~0.89 to 0.79 ms on B200 (whole MoE
 forward -4% / -5%). Non-fused output is bitwise identical to the default
 epilogue; fused output differs only by BF16 atomic-add order (~2e-3 rel L2).
-The autotuner does not search these tactics; pass the tactic explicitly.
+The autotuner searches the epilogues in BLACKWELL_GEMM2_EPILOGUE_CANDIDATES
+(flashinfer/fused_moe/cute_dsl/tuner.py); pass a tactic to pin one. For a
+sweep over token counts, see benchmarks/bench_cute_dsl_moe_fc2_epilogue.py.
 """
 
 import argparse

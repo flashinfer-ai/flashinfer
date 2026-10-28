@@ -2416,10 +2416,12 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     st_copy_size = cutlass.Int32(
                         st_valid_columns * (self.out_dtype.width // 8)
                     )
+                    # A swizzled raster rounds the N tile count up to a multiple
+                    # of swizzle_size; the padded tiles lie past the output.
                     for r in cutlass.range(
                         st_tidx, self.cta_tile_shape_mnk[0], num_st_threads
                     ):
-                        if r < valid_rows:
+                        if r < valid_rows and st_valid_columns > 0:
                             st_dst = cute.domain_offset(
                                 (sCTokenIdx[(r, st_stage)], st_coord_n, 0), out
                             )

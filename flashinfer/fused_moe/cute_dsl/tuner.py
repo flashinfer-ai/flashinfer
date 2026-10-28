@@ -22,7 +22,9 @@ enabling automatic performance tuning across different GEMM tactics.
 
 Tactic format follows TRT-LLM's style and is architecture-dependent:
 - Blackwell (SM100): tactic = (mma_tiler_mn, cluster_shape_mn, raster_along_m)
-  for both GEMM1 (Gather + FC1 activation) and GEMM2 (Finalize)
+  for both GEMM1 (Gather + FC1 activation) and GEMM2 (Finalize). A GEMM2
+  tactic may carry a 4th element, the store-warp/swizzle epilogue
+  (num_c_stage, num_store_warps, swizzle_size).
 - Rubin (SM107): tactic = (mma_tiler, mma_inst_shape, cluster_shape_mn, raster_along_m)
 
 Reference: TensorRT-LLM/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
@@ -109,7 +111,9 @@ def get_blackwell_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
     1-CTA tactic at tile_size=256 yields a layout mismatch and incorrect output
     (bug #3067, fixed upstream by #3171).
 
-    Format: (mma_tiler_mn, cluster_shape_mn, raster_along_m)
+    Format: (mma_tiler_mn, cluster_shape_mn, raster_along_m), optionally followed
+    by an epilogue (num_c_stage, num_store_warps, swizzle_size); see
+    BLACKWELL_GEMM2_EPILOGUE_CANDIDATES.
     """
     mma_tiler_mn_candidates = [(tile_size, 128), (tile_size, 256)]
     cluster_shape_mn_candidates = [
@@ -118,7 +122,7 @@ def get_blackwell_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
     ]
     raster_along_m_candidates = [False]
 
-    return [
+    tactics = [
         (mma_tiler_mn, cluster_shape_mn, raster_along_m)
         for mma_tiler_mn, cluster_shape_mn, raster_along_m in itertools.product(
             mma_tiler_mn_candidates,
@@ -126,6 +130,35 @@ def get_blackwell_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
             raster_along_m_candidates,
         )
     ]
+    if tile_size == 256:
+        tactics += [
+            ((256, 256), (2, 1), True, epilogue)
+            for epilogue in BLACKWELL_GEMM2_EPILOGUE_CANDIDATES
+        ]
+    return tactics
+
+
+# GEMM2 epilogue variants (num_c_stage, num_store_warps, swizzle_size), offered
+# only on the (256, 256) 2-CTA tile with raster_along_m=True, where they were
+# measured with benchmarks/bench_cute_dsl_moe_fc2_epilogue.py (B300, 384
+# experts, H=4096, I=768, top-k=20, balanced routing, 4k-54k tokens); FC2
+# speedups are over the best plain tactic:
+# * Swizzle only, (1, 0, s): keeps the default epilogue but visits s N tiles per
+#   M tile, so the output columns being reduced stay in L2. FC2 is 1.10-1.33x
+#   faster from 16k tokens, where the output outgrows L2, and neutral below.
+# * Store warps + swizzle, (2, w, s): w dedicated warps drain one of two smem C
+#   tiles while the epilogue fills the other. FC2 is 1.03-1.09x faster below
+#   16k tokens and 1.23-1.40x from 16k.
+# With autotuning, the whole MoE is 1.02-1.09x faster than the best plain
+# tactic below 24k tokens and 1.14-1.22x from 24k.
+# Store warps without swizzle and swizzle 8 lose at large token counts, and other
+# GEMM2 tiles did not benefit, so they are not searched.
+BLACKWELL_GEMM2_EPILOGUE_CANDIDATES: Tuple[Tuple[int, int, int], ...] = (
+    (1, 0, 2),
+    (1, 0, 4),
+    (2, 2, 4),
+    (2, 4, 4),
+)
 
 
 def get_blackwell_moe_valid_tactics() -> List[Tuple]:
@@ -963,6 +996,15 @@ class CuteDslFusedMoERunner(TunableRunner):
 
                 gemm1_mma_tiler_mn, gemm1_cluster_shape_mn, _ = gemm1_tactic
                 gemm2_mma_tiler_mn, gemm2_cluster_shape_mn = gemm2_tactic[:2]
+
+                # Two C stages of a 32-bit output tile leave no shared memory
+                # for the A/B pipeline.
+                if (
+                    len(gemm2_tactic) > 3
+                    and gemm2_tactic[3][0] > 1
+                    and gemm2_out_dtype.width > 16
+                ):
+                    return False
 
                 gemm1_ok = BlockScaledContiguousGatherGroupedGemmKernel.can_implement(
                     a_dtype=a_dtype,
