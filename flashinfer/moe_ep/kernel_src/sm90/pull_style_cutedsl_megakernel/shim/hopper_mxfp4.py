@@ -928,8 +928,23 @@ def resolve_hopper_mxfp4_knobs(
             )
         return tactic
 
-    # Prefer the bucket winner when legal; smaller shapes may require the
-    # first legal tactic in the stable manifest union instead.
+    from .mxfp4_optimization import hopper_mxfp4_fused_default_tactic
+
+    default = hopper_mxfp4_fused_default_tactic(
+        num_max_tokens,
+        hidden=hidden,
+        intermediate=intermediate,
+        num_experts=num_total_experts,
+        world_size=world_size,
+        routing_profile=routing_profile,
+        num_topk=num_topk,
+    )
+    if default is not None:
+        return _validate_complete_mxfp4_tactic(
+            default, source="MXFP4 per-bucket default"
+        )
+    # Otherwise prefer the legacy bucket winner when legal; smaller shapes may
+    # require the first legal tactic in the stable manifest union instead.
     return _validate_complete_mxfp4_tactic(
         _ordered_base_candidates(
             num_max_tokens,

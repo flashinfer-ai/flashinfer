@@ -122,10 +122,12 @@ def hopper_nvfp4_candidates(
         num_experts=num_experts,
         world_size=world_size,
     )
+    # The MXFP4 per-bucket defaults were measured for MXFP4 only.
     seeds = list(
         hopper_mxfp4_candidates(
             max_tokens,
             routing_profile=routing_profile,
+            include_fused_defaults=False,
             **shape,
         )
     )
@@ -219,6 +221,7 @@ def hopper_nvfp4_cache_provenance_sha256(
         overlap=overlap,
         geometry_provenance=hopper_mxfp4_cache_provenance_sha256(
             routing_profile=routing_profile,
+            include_fused_defaults=False,
         ),
     )
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
