@@ -769,13 +769,13 @@ def test_blackwell_cached_cluster_partial_tile_trip_cap_per_arch(
         (204808, 0),  # 11-tile 10-CTA chunks keep 16 CTAs
     ],
 )
-@pytest.mark.parametrize("rows", [23, 24, 28, 29])
+@pytest.mark.parametrize("rows", [21, 22, 23, 24, 28, 29])
 @pytest.mark.parametrize("temperature_kind", ["scalar", "scalar_pdl", "per_row"])
 def test_blackwell_cached_cluster_ten_cta_rows_per_arch(
     vocab_size, ten_cta_tiles, rows, temperature_kind
 ):
-    # On sm_103 these batches take the 10-CTA kernel from 6/7 of its resident
-    # clusters up to all of them (24 to 28 rows on GB300), unless the
+    # On sm_103 these batches take the 10-CTA kernel from 11/14 of its resident
+    # clusters up to all of them (22 to 28 rows on GB300), unless the
     # temperature is per row; on sm_100 they keep 16 CTAs.
     _skip_unless_b200_or_gb300()
     torch.manual_seed(7)
@@ -794,7 +794,7 @@ def test_blackwell_cached_cluster_ten_cta_rows_per_arch(
         torch.cuda.get_device_capability() == (10, 3)
         and temperature_kind != "per_row"
         and ten_cta_tiles > 0
-        and 24 <= rows <= 28
+        and 22 <= rows <= 28
     )
     assert kernel[:2] == ((10, ten_cta_tiles) if ten else (16, 8))
     probs = flashinfer.sampling.softmax(
@@ -811,10 +811,24 @@ def test_blackwell_cached_cluster_ten_cta_rows_per_arch(
         (8, 100000, "scalar", 6272, 6272),
         (28, 48000, "none", 3008, 3008),
         (55, 120000, "none", 7520, 7520),
-        # 8-CTA shared-tile and persistent kernels (sm_100; whole tiles on sm_103).
-        (45, 81928, "none", 10272, 12288),
-        (320, 69632, "none", 8704, 10240),
-        (82, 70000, "none", 8768, 10240),
+        # 8-CTA shared-tile and persistent kernels (on sm_103 the persistent
+        # kernel only with a cut of at least 1/10).
+        (45, 81928, "none", 10272, 10272),
+        (320, 69632, "none", 8704, 8704),
+        (82, 70000, "none", 8768, 8768),
+        (52, 100000, "scalar_pdl", 12512, 12512),
+        (370, 66000, "none", 10240, 8256),  # five waves of shared-tile clusters (GB300)
+        (48, 76000, "none", 9504, 9504),
+        (82, 76000, "none", 9504, 9504),
+        (50, 110000, "none", 14336, 13760),
+        (52, 90000, "scalar_pdl", 11264, 11264),
+        (89, 73728, "none", 9216, 9216),  # a cut of exactly 1/10
+        (128, 100000, "none", 12512, 12512),
+        (96, 100000, "scalar_pdl", 12512, 12512),
+        (87, 76000, "none", 9504, 10240),
+        (85, 90000, "none", 11264, 12288),
+        (54, 105000, "none", 13152, 14336),
+        (64, 120000, "none", 15008, 16384),
         # 16-CTA shared-tile and persistent kernels with a cut of at least 1/10,
         # or on sm_100 past one wave.
         (30, 140000, "none", 8768, 8768),
@@ -824,13 +838,17 @@ def test_blackwell_cached_cluster_ten_cta_rows_per_arch(
         (64, 180000, "none", 11264, 12288),
         # Whole tiles: the wide row kernel, a one-wave 16-CTA chunk with a cut
         # under 1/10, a one-wave 4-tile 16-CTA row kernel with a cut of at most
-        # 1/16, the 8-tile 16-CTA row kernel, and rows past five persistent waves
-        # (sm_100).
+        # 1/16, the 8-tile 16-CTA row kernel, and rows past five waves (180
+        # rows are five persistent waves on GB300) or past one wave with a cut
+        # of at most 1/16.
         (8, 256000, "none", 26624, 22528),
         (24, 151936, "none", 10240, 16384),
         (8, 126464, "none", 8192, 8192),
         (1, 151936, "none", 10240, 10240),
-        (180, 71680, "none", 10240, 10240),
+        (180, 71680, "none", 10240, 8960),
+        (181, 71680, "none", 10240, 10240),
+        (371, 66000, "none", 10240, 10240),
+        (76, 92000, "none", 12288, 12288),
     ],
 )
 def test_blackwell_cached_cluster_balanced_chunk_per_arch(
@@ -842,15 +860,18 @@ def test_blackwell_cached_cluster_balanced_chunk_per_arch(
     torch.manual_seed(11)
     logits = torch.randn(rows, vocab_size, device="cuda")
     temperature = None if temperature_kind == "none" else 0.7
+    enable_pdl = temperature_kind == "scalar_pdl"
     probs_ref = torch.softmax(
         logits if temperature is None else logits / temperature, dim=-1
     )
     kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
-        logits, temperature=temperature
+        logits, temperature=temperature, enable_pdl=enable_pdl
     )
     on_sm100 = torch.cuda.get_device_capability() == (10, 0)
     assert kernel[5] == (sm100_chunk if on_sm100 else sm103_chunk)
-    probs = flashinfer.sampling.softmax(logits, temperature=temperature)
+    probs = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
     torch.testing.assert_close(probs, probs_ref, atol=1e-3, rtol=1e-3)
 
 
