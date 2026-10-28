@@ -1249,12 +1249,7 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "pf": 1,
             "tstore": True,
         },
-        "96,28,512": {
-            "route": "gemm",
-            "gemm_bn": 352,
-            "gemm_rstaged_bn": 384,
-            "tstore_twins": {"quant:u4": "quant:u4_xef_qel"},
-        },
+        "96,28,512": {"route": "gemm", "gemm_bn": 384},
         "96,28,2048": {"route": "gemm", "gemm_skf": 1, "gemm_bk": 128},
         "96,28,16384": {"route": "gemm", "gemm_bn": 384},
         "144,6,1": {
@@ -1333,6 +1328,18 @@ DECODE_TABLE_M_RANGES: dict[
         ),
     },
     "sm_103a": {
+        "96,28,512": (
+            (
+                497,
+                512,
+                {
+                    "route": "gemm",
+                    "gemm_bn": 352,
+                    "gemm_rstaged_bn": 384,
+                    "tstore_twins": {"quant:u4": "quant:u4_xef_qel"},
+                },
+            ),
+        ),
         "50,28,2048": (
             (
                 1537,
