@@ -408,6 +408,7 @@ struct SM120BlockScaledGemmKernel {
       cutlass::arch::fence_barrier_init();
     }
     __syncthreads();
+    asm volatile("griddepcontrol.wait;" ::: "memory");
 
     int32_t num_sf_cycles = sm120_common::math::ceil_div(
         params.K, int(KT::SFConfig::PACK_NK * KT::SFConfig::SF_Stages));

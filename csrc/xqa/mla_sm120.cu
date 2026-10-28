@@ -1648,6 +1648,7 @@ __launch_bounds__(32 * 4 * 3, 1) __cluster_dims__(cgaSize, 1, 1) void kernel_mha
     PartialResult* __restrict__ const partialResults =
         nullptr)  // [totalNbInputTokens][maxNbSubSeq]
 {
+  acqBulk();
   float const qScaleValue = qScalePtr != nullptr ? qScalePtr[0] : qScale;
   float const kvCacheScaleValue = kvScalePtr != nullptr ? kvScalePtr[0] : kvCacheScale;
   assert(blockDim.x == 32 * 12 && blockDim.y == 1 && blockDim.z == 1);

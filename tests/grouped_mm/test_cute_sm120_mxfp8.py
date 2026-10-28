@@ -30,6 +30,7 @@ from flashinfer.grouped_mm.cute_sm120_mxfp8_groupwise.core import (
     _MXFP8_MOE_PLAIN_TACTICS,
 )
 from flashinfer.utils import is_sm120a_supported
+from tests.test_helpers.pdl import late_store
 
 COS_SIM_THRESHOLD = 0.99
 
@@ -515,6 +516,62 @@ def test_moe_gemm_mxfp8_nt_groupwise_forced_tactic(
     assert cos_sim > COS_SIM_THRESHOLD, (
         f"forced tactic cos_sim={cos_sim:.4f} < {COS_SIM_THRESHOLD}"
     )
+
+
+@pytest.mark.parametrize(
+    "is_gated,k_gran,tactic",
+    [
+        (False, k_gran, tactic)
+        for k_gran in (32, 128)
+        for tactic in _MXFP8_MOE_PLAIN_TACTICS
+    ]
+    + [(True, 32, tactic) for tactic in _MXFP8_MOE_GATED_TACTICS]
+    + [(True, 128, tactic) for tactic in _MXFP8_MOE_GATED_TACTICS_GRANK128],
+)
+def test_moe_gemm_mxfp8_nt_groupwise_pdl_waits_for_a_scale(tactic, is_gated, k_gran):
+    skip_if_not_sm120()
+    torch.random.manual_seed(0)
+    num_groups, rows, physical_n, k = 4, 8, 256, 2176
+    m_indptr = torch.arange(
+        0, (num_groups + 1) * rows, rows, dtype=torch.int32, device="cuda"
+    )
+    a = torch.randn((num_groups * rows, k), dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(
+        (num_groups, physical_n, k), dtype=torch.bfloat16, device="cuda"
+    ) / math.sqrt(k)
+    a_fp8, a_sf = per_token_cast_to_mxfp8_for_moe_gemm(a, m_indptr, gran_k=k_gran)
+    b_fp8_and_sf = [
+        per_block_cast_to_fp8(b[group_idx], use_ue8m0=True, gran_k=k_gran)
+        for group_idx in range(num_groups)
+    ]
+    b_fp8 = torch.stack([item[0] for item in b_fp8_and_sf], dim=0)
+    b_sf = transform_sf_into_required_layout(
+        torch.stack([item[1] for item in b_fp8_and_sf], dim=0),
+        mn=physical_n,
+        k=k,
+        recipe=(k_gran, k_gran),
+        num_groups=num_groups,
+        is_sfa=False,
+    )
+    out_n = physical_n // 2 if is_gated else physical_n
+    runner = _CuteSm120Mxfp8MoeRunner(
+        torch.empty((num_groups * rows, out_n), dtype=torch.bfloat16, device="cuda"),
+        is_gated,
+        (1, 1, k_gran),
+        "MN",
+    )
+    inputs = [a_fp8, b_fp8, a_sf, b_sf, m_indptr]
+    expected = runner(inputs, tactic=tactic).clone()
+
+    # Token 0's scales are what the previous kernel is still producing; the low
+    # byte is its first UE8M0 exponent, so +2 scales that block by 4.
+    # No other kernel may run between that producer and the GEMM.
+    a_sf_value = a_sf[0, 0].item()
+    a_sf[0, 0] = a_sf_value + 2
+    late_store(a_sf, a_sf_value)
+    out = runner(inputs, tactic=tactic)
+
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("bad_scale", ["a_m", "a_k", "b_expert", "b_n", "b_k"])
