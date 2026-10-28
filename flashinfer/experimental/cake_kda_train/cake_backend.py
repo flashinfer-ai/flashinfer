@@ -59,8 +59,8 @@ checkpoint-replay path: before the prep where the intra program writes the
 tables the prep reads, after it otherwise], [WY], [the state recurrence
 recompute], [dA / dv],
 the adjoint state recurrence, the fused dq / dk / dg, GLM intra and, on
-``sm_100a`` / ``sm_107a``, the gate epilogue (the GLM intra program of ``sm_103a``
-writes the gate gradients itself).  The bracketed launches depend on the path
+``sm_100a``, the gate epilogue (the GLM intra programs of ``sm_103a`` / ``sm_107a``
+write the gate gradients themselves).  The bracketed launches depend on the path
 and the row: from a version-2 (tape) saved set there is no recurrence
 recompute; from a version-4 set carrying the segment-boundary states the
 segmented recompute is pass 2 alone; the rows whose version-4 set carries the
@@ -202,7 +202,7 @@ class KdaArena:
     ``saved=None``; ``torch.utils.checkpoint`` never replays: the node's backward reads the recomputed saved set)
     and no row that dispatches the separate ``dav`` program (H 9-15, outside the contract's head counts).
     ``tail_passes = B`` (which implies ``lean``) runs the three chunk-parallel tail stages of the backward (the
-    fused gradient, GLM intra and, on ``sm_107a``, the gate epilogue) once per range of ``ceil(NC_pad / B)`` chunks
+    fused gradient, GLM intra and, on ``sm_100a``, the gate epilogue) once per range of ``ceil(NC_pad / B)`` chunks
     on offset views of the whole-sequence buffers, with the per-pass buffers (``dq_f, dk_f, dg_f, db_f, dAkk, dAqk``
     and, where the gate epilogue launches, ``dg_int, db_int``) sized for one range: the same kernels on the same bytes (bitwise the same gradients), ``B - 1`` more launches
     per tail stage.  The arena bytes: :func:`workspace_bytes` / :func:`memory_report` with ``arena=``; the floor
