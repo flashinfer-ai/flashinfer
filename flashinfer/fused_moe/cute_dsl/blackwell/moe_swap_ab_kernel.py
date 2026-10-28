@@ -150,6 +150,7 @@ def _blockscaled_dynamic_mma(
     instruction,
     descriptor,
     cta_group,
+    num_k_atoms,
     loc=None,
     ip=None,
 ):
@@ -161,7 +162,7 @@ def _blockscaled_dynamic_mma(
     n_bits = (
         ((cutlass.Int32(valid_tokens) + n_alignment - 1) & -n_alignment) >> 3
     ) << 17
-    for inner_k in range(cute.size(a, mode=[2])):
+    for inner_k in range(num_k_atoms):
         a_atom = a[(None, 0, inner_k)]
         b_atom = b[(None, 0, inner_k)]
         sfa_atom = sfa[(None, 0, inner_k)]
@@ -2798,88 +2799,106 @@ class Sm100BlockScaledGroupedGemmKernel:
                 acc_pipe.producer_acquire(producer)
                 if cutlass.const_expr(self.enable_iket):
                     _iket.range_pop()
-                for k_tile in cutlass.range(k_tiles):
-                    if cutlass.const_expr(self.enable_iket):
-                        _iket.range_push("mma_tma_ready")
-                    operand_pipe.consumer_wait(consumer)
-                    if cutlass.const_expr(self.enable_iket):
-                        _iket.range_pop()
-                        _iket.range_push("mma_sf_copy_issue")
-                    sf_stage = (None, None, None, None, consumer.index)
-                    sf_stage_a = (
-                        None,
-                        None,
-                        None,
-                        None,
-                        consumer.index * self.channel_tiles,
+                # The reduction is static: emit a separate short final stage
+                # rather than testing the valid K extent at each MMA instruction.
+                full_k_tiles = weights.shape[1] // self.tile_k
+                tail_k = weights.shape[1] % self.tile_k
+                atoms_per_stage = cute.size(fragment_a, mode=[2])
+                atom_k = self.tile_k // atoms_per_stage
+                for section in cutlass.range_constexpr(1 + (tail_k != 0)):
+                    first_stage = 0 if section == 0 else full_k_tiles
+                    last_stage = full_k_tiles if section == 0 else k_tiles
+                    num_k_atoms = (
+                        atoms_per_stage
+                        if section == 0
+                        else cute.ceil_div(tail_k, atom_k)
                     )
-                    cute.copy(copy_a, source_a[sf_stage_a], target_a)
-                    cute.copy(copy_b, source_b[sf_stage], target_b)
-                    if cutlass.const_expr(self.channel_tiles == 2):
-                        sf_stage_a1 = (
-                            None,
-                            None,
-                            None,
-                            None,
-                            consumer.index * self.channel_tiles + 1,
-                        )
-                        cute.copy(copy_a1, source_a1[sf_stage_a1], target_a1)
-                    if cutlass.const_expr(self.enable_iket):
-                        _iket.range_pop()
-                        _iket.range_push("mma_umma0_issue")
-                    _blockscaled_dynamic_mma(
-                        mma_accumulator,
-                        fragment_a[
-                            (None, None, None, consumer.index * self.channel_tiles)
-                        ],
-                        fragment_b[(None, None, None, consumer.index)],
-                        tSFA,
-                        tSFB,
-                        valid,
-                        k_tile,
-                        self.instruction,
-                        self.descriptor,
-                        self.cta_group_size,
-                    )
-                    if cutlass.const_expr(self.enable_iket):
-                        _iket.range_pop()
-                    if cutlass.const_expr(self.channel_tiles == 2):
+                    for k_tile in cutlass.range(
+                        first_stage, last_stage, unroll_full=(section == 1)
+                    ):
                         if cutlass.const_expr(self.enable_iket):
-                            _iket.range_push("mma_umma1_issue")
-                        mma_accumulator1 = cute.make_tensor(
-                            mma_accumulator.iterator
-                            + cute.assume(self.allocated_n, divby=32),
-                            acc_layout,
+                            _iket.range_push("mma_tma_ready")
+                        operand_pipe.consumer_wait(consumer)
+                        if cutlass.const_expr(self.enable_iket):
+                            _iket.range_pop()
+                            _iket.range_push("mma_sf_copy_issue")
+                        sf_stage = (None, None, None, None, consumer.index)
+                        sf_stage_a = (
+                            None,
+                            None,
+                            None,
+                            None,
+                            consumer.index * self.channel_tiles,
                         )
+                        cute.copy(copy_a, source_a[sf_stage_a], target_a)
+                        cute.copy(copy_b, source_b[sf_stage], target_b)
+                        if cutlass.const_expr(self.channel_tiles == 2):
+                            sf_stage_a1 = (
+                                None,
+                                None,
+                                None,
+                                None,
+                                consumer.index * self.channel_tiles + 1,
+                            )
+                            cute.copy(copy_a1, source_a1[sf_stage_a1], target_a1)
+                        if cutlass.const_expr(self.enable_iket):
+                            _iket.range_pop()
+                            _iket.range_push("mma_umma0_issue")
                         _blockscaled_dynamic_mma(
-                            mma_accumulator1,
+                            mma_accumulator,
                             fragment_a[
-                                (
-                                    None,
-                                    None,
-                                    None,
-                                    consumer.index * self.channel_tiles + 1,
-                                )
+                                (None, None, None, consumer.index * self.channel_tiles)
                             ],
                             fragment_b[(None, None, None, consumer.index)],
-                            tSFA1,
+                            tSFA,
                             tSFB,
                             valid,
                             k_tile,
                             self.instruction,
                             self.descriptor,
                             self.cta_group_size,
+                            num_k_atoms,
                         )
                         if cutlass.const_expr(self.enable_iket):
                             _iket.range_pop()
-                    if cutlass.const_expr(self.enable_iket):
-                        _iket.range_push("mma_release_issue")
-                    # Both channel tiles must finish reading the shared B/SFB
-                    # stage before any operand pipeline can overwrite it.
-                    operand_pipe.consumer_release(consumer)
-                    if cutlass.const_expr(self.enable_iket):
-                        _iket.range_pop()
-                    consumer.advance()
+                        if cutlass.const_expr(self.channel_tiles == 2):
+                            if cutlass.const_expr(self.enable_iket):
+                                _iket.range_push("mma_umma1_issue")
+                            mma_accumulator1 = cute.make_tensor(
+                                mma_accumulator.iterator
+                                + cute.assume(self.allocated_n, divby=32),
+                                acc_layout,
+                            )
+                            _blockscaled_dynamic_mma(
+                                mma_accumulator1,
+                                fragment_a[
+                                    (
+                                        None,
+                                        None,
+                                        None,
+                                        consumer.index * self.channel_tiles + 1,
+                                    )
+                                ],
+                                fragment_b[(None, None, None, consumer.index)],
+                                tSFA1,
+                                tSFB,
+                                valid,
+                                k_tile,
+                                self.instruction,
+                                self.descriptor,
+                                self.cta_group_size,
+                                num_k_atoms,
+                            )
+                            if cutlass.const_expr(self.enable_iket):
+                                _iket.range_pop()
+                        if cutlass.const_expr(self.enable_iket):
+                            _iket.range_push("mma_release_issue")
+                        # Both channel tiles must finish reading the shared B/SFB
+                        # stage before any operand pipeline can overwrite it.
+                        operand_pipe.consumer_release(consumer)
+                        if cutlass.const_expr(self.enable_iket):
+                            _iket.range_pop()
+                        consumer.advance()
                 acc_pipe.producer_commit(producer)
                 producer.advance()
                 tile, scheduled_expert, scheduled_valid, info_state = self.next_work(
