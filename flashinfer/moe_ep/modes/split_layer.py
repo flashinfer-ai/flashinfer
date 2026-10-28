@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import logging
 import weakref
 from typing import TYPE_CHECKING, Optional, Sequence, Union
@@ -56,6 +57,7 @@ from ..core.validation.common import (
 )
 from ..weights import MoEWeightPack
 from .config import SplitConfig
+from ..backends.split.comm.nvlink_one_sided.config import NVLinkOneSidedConfig
 from ..backends.split.kernel.identity.config import IdentityConfig
 
 if TYPE_CHECKING:
@@ -296,6 +298,21 @@ class _StageTimer:
         end = torch.cuda.Event(enable_timing=True)
         end.record()
         self._timings[self._stage] = (self._start, end)
+
+
+def _communication_backend(backend, kernel: SplitKernelBackend):
+    """The communication config for this kernel. A kernel that packs its
+    dispatch rows keeps NVLink one-sided's Lamport transport off: it rewrites
+    payload words equal to its sentinel, which preserves BF16 values but not
+    other bytes. The backend's name stands for its default config, which has
+    the transport on."""
+    if not kernel.packs_dispatch_payload:
+        return backend
+    if isinstance(backend, str) and backend == NVLinkOneSidedConfig.backend_name:
+        backend = NVLinkOneSidedConfig()
+    if getattr(backend, "lamport", False) is not False:
+        return dataclasses.replace(backend, lamport=False)
+    return backend
 
 
 class MoEEpSplitLayer(nn.Module):
@@ -845,7 +862,7 @@ class MoEEpSplitLayer(nn.Module):
                     hidden_size=fp.token_hidden_size,
                     dtype=_TOKEN_DTYPE_BY_BYTES[fp.dtype_bytes],
                 ),
-                self._comm_backend,
+                _communication_backend(self._comm_backend, self._kernel),
             )
         elif self._communication.params.top_k != top_k:
             raise MoEEpConfigError(

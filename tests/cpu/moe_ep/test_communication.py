@@ -637,7 +637,9 @@ def fake_one_sided(monkeypatch):
         staticmethod(lambda mapping, config=None: None),
     )
     monkeypatch.setattr(
-        mnnvl.MnnvlMemory, "get_comm", staticmethod(lambda mapping: None)
+        mnnvl.MnnvlMemory,
+        "get_comm",
+        staticmethod(lambda mapping: SimpleNamespace(allgather=lambda data: (data,))),
     )
     monkeypatch.setattr(mnnvl, "all_ranks_agree", lambda comm, local: local)
     monkeypatch.setattr(
@@ -698,6 +700,222 @@ def test_nvlink_one_sided_cft_selection(fake_one_sided) -> None:
     assert fake_one_sided.module.calls["layout"][5] == 6 * 8
     assert comm._use_cft(2, 2) and not comm._use_cft(3, 2)
     assert _one_sided(cft=True)._use_cft(3, 2)
+
+
+def _fake_lamport(monkeypatch, module) -> list:
+    """Lamport support on the fake one-sided module: BF16 rows of 8 values and
+    a default limit of 1 token. Returns the limits the regions were sized for."""
+    from types import SimpleNamespace
+
+    from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided import (
+        communication as one_sided,
+    )
+
+    extended = []
+
+    def extend(metainfo, max_tokens, fmt, hidden):
+        extended.append(max_tokens)
+        metainfo[_ONE_SIDED_LAYOUT["WORKSPACE_SIZE_INDEX"]] += 1 << 12
+
+    module.moe_a2a_lamport_extend_workspace_layout = extend
+    monkeypatch.setattr(
+        one_sided,
+        "layout_constants",
+        lambda: SimpleNamespace(**_ONE_SIDED_LAYOUT, LAMPORT_FORMAT_BF16=0),
+    )
+    monkeypatch.setattr(one_sided, "_lamport_unsupported_reason", lambda *a: None)
+    row = one_sided._LamportRow(16, 0, 1, 64)
+    monkeypatch.setattr(one_sided, "_lamport_row", lambda *a: row)
+    monkeypatch.setattr(one_sided, "_default_lamport_max_tokens", lambda *a: 1)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=152),
+    )
+    return extended
+
+
+@pytest.mark.cpu_only
+def test_nvlink_one_sided_lamport_ahead_of_cft(fake_one_sided, monkeypatch) -> None:
+    """The Lamport transport takes the steps it carries ahead of CFT counted
+    writes, which take the others within their token limit, and the fence path
+    the rest. lamport=None allocates the Lamport regions also where CFT is
+    available, cft=True leaves every step to CFT, and lamport=True with
+    cft=True is refused."""
+    from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided import (
+        communication as one_sided,
+    )
+
+    extended = _fake_lamport(monkeypatch, fake_one_sided.module)
+    params = _params(num_experts=8, top_k=4)
+    hidden = torch.ones(3, 8, dtype=torch.bfloat16)
+    ids = torch.zeros(3, 4, dtype=torch.int32)
+    weights = torch.ones(3, 4)
+
+    def transports(comm, tokens, eplb_local_stats=None):
+        payloads = [hidden, ids, weights]
+        return comm._dispatch_transports(
+            tokens, payloads, hidden, None, weights, eplb_local_stats
+        )
+
+    request = one_sided._lamport_request
+    assert request(NVLinkOneSidedConfig()) is None
+    assert request(NVLinkOneSidedConfig(cft=False)) is None
+    assert request(NVLinkOneSidedConfig(cft=True)) is False
+    assert request(NVLinkOneSidedConfig(lamport=True)) is True
+    assert request(NVLinkOneSidedConfig(lamport=False)) is False
+
+    auto = _one_sided(params, cft_max_tokens_for_dispatch=2)
+    assert auto._cft_enabled and auto.lamport_max_tokens == 1 and extended == [1]
+    assert transports(auto, 1) == (True, False)  # CFT would take it too
+    assert transports(auto, 2) == (False, True)  # above the Lamport limit
+    assert transports(auto, 3) == (False, False)  # above both limits: fence
+    stats = torch.zeros(8, dtype=torch.int32)
+    assert transports(auto, 1, stats) == (False, True)  # EPLB statistics
+    no_cft = _one_sided(params, cft=False)
+    assert transports(no_cft, 1) == (True, False)
+    assert transports(no_cft, 2) == (False, False)
+    cft = _one_sided(params, cft=True)
+    assert cft.lamport_max_tokens == 0 and extended == [1, 1]
+    assert transports(cft, 1) == (False, True)
+    forced = _one_sided(params, lamport=True)
+    assert forced.lamport_max_tokens == 1 and extended == [1, 1, 1]
+    assert transports(forced, 1) == (True, False)
+    with pytest.raises(ValueError, match="lamport=True and cft=True"):
+        _one_sided(params, cft=True, lamport=True)
+    assert extended == [1, 1, 1]
+
+
+@pytest.mark.cpu_only
+def test_split_layer_step_bound_selects_lamport(
+    fake_one_sided, monkeypatch, isolated_single_rank_gloo
+) -> None:
+    """MoEEpSplitLayer passes MoEEpTensors.runtime_max_tokens_per_rank to
+    dispatch, so a layer step within lamport_max_tokens takes the Lamport
+    transport; a larger bound, or none (the capacity), does not."""
+    _fake_lamport(monkeypatch, fake_one_sided.module)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)  # host workspace
+    layer = _split_layer(NVLinkOneSidedConfig(cft=False))
+    calls = fake_one_sided.module.calls
+    for bound, lamport in ((1, True), (2, False), (None, False)):
+        layer(
+            MoEEpTensors(
+                hidden_states=torch.ones(1, 8, dtype=torch.bfloat16),
+                topk_ids=torch.tensor([[0, 3]]),
+                topk_weights=torch.ones(1, 2),
+                runtime_max_tokens_per_rank=bound,
+            )
+        )
+        _, _, tokens_per_rank, args = calls["dispatch"]
+        assert (tokens_per_rank, args[8]) == (bound or 3, lamport)
+    layer.destroy()
+
+
+@pytest.mark.cpu_only
+def test_nvlink_one_sided_mixed_configs(fake_one_sided, monkeypatch) -> None:
+    """Each rank votes its own CFT and Lamport decisions, so a rank that turns
+    a transport off turns it off on every rank, and ranks that pass different
+    lamport_max_tokens fail alike. Every rank constructs on its own thread; the
+    group's collectives (the handle-type precheck among them) must pair up."""
+    import threading
+    from types import SimpleNamespace
+
+    from flashinfer.comm import mnnvl
+    from flashinfer.moe_ep.backends.split.comm.nvlink_one_sided import (
+        communication as one_sided,
+    )
+
+    class Group:
+        def __init__(self, size):
+            self.barrier = threading.Barrier(size, timeout=30)
+            self.slots = [None] * size
+
+        def allgather(self, rank, data):
+            self.slots[rank] = data
+            self.barrier.wait()
+            gathered = list(self.slots)
+            self.barrier.wait()
+            return gathered
+
+    group: dict = {}
+    sms = threading.local()
+
+    def get_comm(mapping):
+        rank = mapping.rank
+        return SimpleNamespace(allgather=lambda data: group["g"].allgather(rank, data))
+
+    def uses_fabric_handles(comm, dev_id):
+        assert set(comm.allgather("precheck")) == {"precheck"}, "collectives differ"
+        return True
+
+    monkeypatch.setattr(mnnvl.MnnvlMemory, "get_comm", staticmethod(get_comm))
+    monkeypatch.setattr(
+        mnnvl.MnnvlMemory, "uses_fabric_handles", staticmethod(uses_fabric_handles)
+    )
+    fake_one_sided.module.moe_a2a_lamport_extend_workspace_layout = (
+        lambda metainfo, max_tokens, fmt, hidden: None
+    )
+    monkeypatch.setattr(
+        one_sided,
+        "layout_constants",
+        lambda: SimpleNamespace(
+            **_ONE_SIDED_LAYOUT, LAMPORT_FORMAT_BF16=0, LAMPORT_MAX_TOKENS_PER_RANK=512
+        ),
+    )
+    monkeypatch.setattr(one_sided, "_lamport_unsupported_reason", lambda *a: None)
+    monkeypatch.setattr(
+        one_sided, "_lamport_row", lambda *a: one_sided._LamportRow(16, 0, 1, 64)
+    )
+    # The default limit is the group's smallest SM count here.
+    monkeypatch.setattr(
+        one_sided, "_default_lamport_max_tokens", lambda ep, num_sms, *a: num_sms
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=sms.count),
+    )
+
+    def construct(*configs, sm_counts=(3, 3)):
+        group["g"] = Group(len(configs))
+        results: list = [None] * len(configs)
+
+        def rank_main(rank):
+            sms.count = sm_counts[rank]
+            try:
+                results[rank] = create_communication(
+                    BootstrapConfig(world_size=len(configs), rank=rank),
+                    _params(),
+                    NVLinkOneSidedConfig(**configs[rank]),
+                )
+            except Exception as exc:  # noqa: BLE001 - checked by the caller
+                results[rank] = exc
+
+        threads = [
+            threading.Thread(target=rank_main, args=(r,)) for r in range(len(configs))
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        return results
+
+    def transports(results):
+        assert all(isinstance(r, NVLinkOneSidedAlltoAll) for r in results), results
+        return [(r._cft_enabled, r.lamport_max_tokens) for r in results]
+
+    assert transports(construct({}, {}, sm_counts=(3, 2))) == [(True, 2)] * 2
+    assert transports(construct({"cft": False}, {})) == [(False, 3)] * 2
+    assert transports(construct({}, {"lamport": False})) == [(True, 0)] * 2
+    # Auto Lamport is off under cft=True, so on every rank.
+    assert transports(construct({"cft": True}, {})) == [(True, 0)] * 2
+    assert transports(construct({"lamport": False}, {"cft": False})) == [(False, 0)] * 2
+    assert transports(construct(*[{"lamport_max_tokens": 2}] * 2)) == [(True, 2)] * 2
+    for limits in ((2, None), (2, 3)):
+        results = construct(*[{"lamport_max_tokens": n} for n in limits])
+        for result in results:
+            assert isinstance(result, ValueError), results
+            assert "lamport_max_tokens must be the same on every EP rank" in str(result)
 
 
 @pytest.mark.cpu_only
