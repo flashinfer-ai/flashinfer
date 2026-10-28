@@ -32,8 +32,9 @@ bits, including signed zero: ``atol=0`` and ``rtol=0`` on integer views.
 
 The numerical accumulation model supports only finite NV E2M1 x E2M1
 with SF16 UE4M3, and MX E4M3 x E4M3 or mixed E2M1/E4M3 in either order
-with SF32 UE8M0. It starts from zero and truncates at each K64 NV or K32 MX
-update. FP64 holds the required low-precision products and aligned sums exactly;
+with SF32 UE8M0. It starts from zero and truncates at each native update:
+K64/K96 for NV or K32 for MX. K96 follows the selected pipeline stage plan.
+FP64 holds the required low-precision products and aligned sums exactly;
 the final FP32 round-toward-zero conversion gives the carried update rounding.
 Unsupported formats, nonfinite operands/scales, negative nonzero NV scales,
 and overflowing FP32 updates are rejected. The per-update rules are empirically qualified
@@ -133,29 +134,27 @@ def _blockscaled_matmul_kernel(
     FORMAT_B: tl.constexpr,
     SCALE_FORMAT: tl.constexpr,
     OUTPUTS: tl.constexpr,
+    MMA_K_OFFSETS,
+    UPDATES: tl.constexpr,
+    UPDATE: tl.constexpr,
 ):
-    if SCALE_FORMAT == "ue4m3":
-        UPDATE: tl.constexpr = 64
-    elif SCALE_FORMAT == "ue8m0":
-        UPDATE: tl.constexpr = 32
-    else:
-        tl.static_assert(False, "Unsupported scale format")
-
     output = tl.program_id(0) * OUTPUTS + tl.arange(0, OUTPUTS)
     row_a, row_b = output // N, output % N
     valid = output < M * N
     carry = tl.full((OUTPUTS,), 0, tl.float32)
     status = tl.full((OUTPUTS,), 0, tl.int32)
-    for start in range(0, K, UPDATE):
+    for step in range(UPDATES):
+        if MMA_K_OFFSETS is None:
+            start, stop = step * UPDATE, (step + 1) * UPDATE
+        else:
+            start = tl.load(MMA_K_OFFSETS + step)
+            stop = tl.load(MMA_K_OFFSETS + step + 1)
         k = start + tl.arange(0, UPDATE)[None, :]
-        av, ae, ai = _decode_operand(A, row_a[:, None], k, K, FORMAT_A, valid[:, None])
-        bv, be, bi = _decode_operand(B, row_b[:, None], k, K, FORMAT_B, valid[:, None])
-        sa, se_a, si_a = _decode_scale(
-            SA, row_a[:, None], k, K, SCALE_FORMAT, valid[:, None]
-        )
-        sb, se_b, si_b = _decode_scale(
-            SB, row_b[:, None], k, K, SCALE_FORMAT, valid[:, None]
-        )
+        active = valid[:, None] & (k < stop)
+        av, ae, ai = _decode_operand(A, row_a[:, None], k, K, FORMAT_A, active)
+        bv, be, bi = _decode_operand(B, row_b[:, None], k, K, FORMAT_B, active)
+        sa, se_a, si_a = _decode_scale(SA, row_a[:, None], k, K, SCALE_FORMAT, active)
+        sb, se_b, si_b = _decode_scale(SB, row_b[:, None], k, K, SCALE_FORMAT, active)
         status |= (tl.sum((ai | bi | si_a | si_b).to(tl.int32), 1) != 0).to(tl.int32)
 
         product = ((av * bv) * sa) * sb
@@ -184,8 +183,8 @@ def _blockscaled_matmul_kernel(
         quantum_exponent = tl.where(largest_exponent == -1024, 0, quantum_exponent)
 
         if SCALE_FORMAT == "ue4m3":
-            sum4 = tl.sum(tl.reshape(product, (OUTPUTS, 16, 4)), 2)
-            sum16 = tl.sum(tl.reshape(product, (OUTPUTS, 4, 16)), 2)
+            sum4 = tl.sum(tl.reshape(product, (OUTPUTS, UPDATE // 4, 4)), 2)
+            sum16 = tl.sum(tl.reshape(product, (OUTPUTS, UPDATE // 16, 16)), 2)
             units4 = tl.sum(
                 libdevice.trunc(libdevice.ldexp(sum4, -quantum_exponent[:, None])), 1
             )
@@ -220,13 +219,19 @@ def _blockscaled_matmul_kernel(
     tl.atomic_or(STATUS, tl.max(tl.where(valid, status, 0), 0), sem="relaxed")
 
 
-def blockscaled_matmul(a, b, scale_a, scale_b, format_a, format_b, scale_format):
+def blockscaled_matmul(
+    a, b, scale_a, scale_b, format_a, format_b, scale_format, mma_k_plan=None
+):
     """Return FP32 ``a[M, K] @ b[N, K].T`` with zero initial accumulator.
 
     E2M1 is uint8 packed low nibble first; E4M3 is raw uint8 or
     torch.float8_e4m3fn. Scales have logical shape [rows, K / block_size],
     with block_size 16 for UE4M3 and 32 for UE8M0. They may be uint8 bytes
     or their matching torch float8 dtype. Noncontiguous inputs are copied.
+
+    ``mma_k_plan`` lists the native instruction widths in execution order.
+    NVFP4 K96 plans must preserve each pipeline stage and its final K tail;
+    omitted plans use K64 for NVFP4 and K32 for MX formats.
 
     Only finite values and finite FP32 update results are supported. Invalid
     inputs or overflow raise ValueError after one device-status read. This
@@ -272,6 +277,24 @@ def blockscaled_matmul(a, b, scale_a, scale_b, format_a, format_b, scale_format)
     if scale_a.shape != (m, k // block_size) or scale_b.shape != (n, k // block_size):
         raise ValueError(f"Logical scales must have shape [rows, K / {block_size}]")
 
+    offsets = None
+    updates = k // update
+    if mma_k_plan is not None:
+        allowed = (64, 96) if scale_format == "ue4m3" else (32,)
+        if (
+            not mma_k_plan
+            or any(
+                type(width) is not int or width not in allowed for width in mma_k_plan
+            )
+            or sum(mma_k_plan) != k
+        ):
+            raise ValueError("Native MMA widths must cover K exactly")
+        offsets = torch.tensor(
+            (0, *mma_k_plan), device=a.device, dtype=torch.int32
+        ).cumsum(0, dtype=torch.int32)
+        updates = len(mma_k_plan)
+        update = tr.next_power_of_2(max(mma_k_plan))
+
     raw = tuple(t.contiguous().view(torch.uint8) for t in tensors)
     result = torch.empty((m, n), dtype=torch.float32, device=a.device)
     status = torch.zeros((), dtype=torch.int32, device=a.device)
@@ -286,6 +309,9 @@ def blockscaled_matmul(a, b, scale_a, scale_b, format_a, format_b, scale_format)
         format_b,
         scale_format,
         8,
+        offsets,
+        updates,
+        update,
         num_warps=4,
         enable_fp_fusion=False,
     )
@@ -786,15 +812,19 @@ def cute_dsl_moe_reference(
     b_dtype="float4_e2m1fn",
     sf_vec_size=16,
     swap_ab=True,
+    mma_k_plans=(None, None),
 ):
     """Evaluate unfused swap-AB MoE from the exact prepared kernel operands.
 
     Routing IDs may name experts outside the local contiguous expert window;
     those slots contribute nothing. Gated weights use up16/gate16 interleave.
     Input scales are linear; weight scales use the six-dimensional MMA view.
+    ``mma_k_plans`` supplies the selected FC1/FC2 native instruction sequences.
     """
     if swap_ab is not True:
         raise ValueError("The bit-exact block-scaled reference requires swap_ab=True")
+    if not isinstance(mma_k_plans, (tuple, list)) or len(mma_k_plans) != 2:
+        raise ValueError("mma_k_plans must contain the FC1 and FC2 instruction plans")
     formats = {
         ("float4_e2m1fn", "float4_e2m1fn", 16),
         ("float8_e4m3fn", "float8_e4m3fn", 32),
@@ -853,6 +883,7 @@ def cute_dsl_moe_reference(
             weight_format,
             activation_format,
             scale_format,
+            mma_k_plans[0],
         ).T.contiguous()
         activated = activate_fc1(
             acc,
@@ -901,6 +932,7 @@ def cute_dsl_moe_reference(
             weight_format,
             activation_format,
             scale_format,
+            mma_k_plans[1],
         ).T.contiguous()
         routes[token_ids, slots] = scale_fc2(
             acc2,

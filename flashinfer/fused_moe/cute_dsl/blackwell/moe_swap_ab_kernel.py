@@ -151,6 +151,7 @@ def _blockscaled_dynamic_mma(
     descriptor,
     cta_group,
     num_k_atoms,
+    use_k96,
     loc=None,
     ip=None,
 ):
@@ -162,30 +163,73 @@ def _blockscaled_dynamic_mma(
     n_bits = (
         ((cutlass.Int32(valid_tokens) + n_alignment - 1) & -n_alignment) >> 3
     ) << 17
-    for inner_k in range(num_k_atoms):
-        a_atom = a[(None, 0, inner_k)]
-        b_atom = b[(None, 0, inner_k)]
-        sfa_atom = sfa[(None, 0, inner_k)]
-        sfb_atom = sfb[(None, 0, inner_k)]
+    widths = (
+        (96, 96) * (num_k_atoms * 64 // 192) + (64,) * ((num_k_atoms * 64 % 192) // 64)
+        if use_k96
+        else (0,) * num_k_atoms
+    )
+    if use_k96:
+        stage_descriptors = []
+        for operand in (a, b):
+            value = tcgen05.make_umma_smem_desc(
+                operand.iterator, operand[(None, 0, 0)].layout, "k"
+            )
+            value = cutlass.Uint64(builtin.unrealized_conversion_cast([i64], [value]))
+            stage_descriptors.append(
+                (cutlass.Uint32(value), cutlass.Uint32(value >> 32))
+            )
+    start = 0
+    for inner_k, width in enumerate(widths):
+        if use_k96:
+            values = []
+            for operand, (lo, hi) in zip((a, b), stage_descriptors, strict=True):
+                offset = cute.crd2idx(((0, start % 64), 0, start // 64), operand.layout)
+                # A 1024B-aligned stage and row-zero offsets preserve SW128.
+                assert offset % 32 == 0 and (offset // 32) & 0x38 == 0
+                if width == 96:
+                    next_k = ((start + width - 1) // 256) * 256
+                    next_offset = cute.crd2idx(
+                        ((0, 0), 0, next_k // 64), operand.layout
+                    )
+                    assert next_offset % 32 == 0 and (next_offset // 32) & 0x38 == 0
+                    # Absolute LBO points at the next segment; all other fields
+                    # are invariant, including the high word's SW128 base.
+                    address = lo & 0x3FFF
+                    lo = address | ((address + next_offset // 32) << 16)
+                    hi = hi | (1 << 20)
+                values.append(
+                    (
+                        cutlass.Uint64(lo + offset // 32) | (cutlass.Uint64(hi) << 32)
+                    ).ir_value()
+                )
+            a_value, b_value = values
+            sfa_atom = sfa[(None, 0, start // 16)]
+            sfb_atom = sfb[(None, 0, start // 16)]
+        else:
+            a_atom = a[(None, 0, inner_k)]
+            b_atom = b[(None, 0, inner_k)]
+            sfa_atom = sfa[(None, 0, inner_k)]
+            sfb_atom = sfb[(None, 0, inner_k)]
+            a_value = (
+                a_atom.iterator.value
+                if hasattr(a_atom.iterator, "value")
+                else a_atom.iterator
+            )
+            b_value = (
+                b_atom.iterator.value
+                if hasattr(b_atom.iterator, "value")
+                else b_atom.iterator
+            )
         acc_atom = acc[(None, 0, 0)]
-        a_value = (
-            a_atom.iterator.value
-            if hasattr(a_atom.iterator, "value")
-            else a_atom.iterator
-        )
         a_desc = builtin.unrealized_conversion_cast([i64], [a_value])
-        b_value = (
-            b_atom.iterator.value
-            if hasattr(b_atom.iterator, "value")
-            else b_atom.iterator
-        )
         b_desc = builtin.unrealized_conversion_cast([i64], [b_value])
         a_sf = builtin.unrealized_conversion_cast([i32], [sfa_atom.iterator.value])
         b_sf = builtin.unrealized_conversion_cast([i32], [sfb_atom.iterator.value])
         dst = builtin.unrealized_conversion_cast([i32], [acc_atom.iterator.value])
-        desc = cutlass.Int32(descriptor) | n_bits
+        desc = cutlass.Int32(descriptor | ((1 << 31) if width == 96 else 0)) | n_bits
         desc = desc | (((cutlass.Int32(a_sf) >> 30) & 3) << 29)
         desc = desc | (((cutlass.Int32(b_sf) >> 30) & 3) << 4)
+        start += width
         accumulate = k_tile != 0 if inner_k == 0 else True
         with cute.arch.elect_one():
             llvm.inline_asm(
@@ -1308,6 +1352,7 @@ class Sm100BlockScaledGroupedGemmKernel:
         publish_routing_before_signal=False,
         activation_cache_policy=0,
         enable_iket=False,
+        use_k96=False,
     ):
         if not self.is_valid_dtypes(
             activation_dtype, weight_dtype, sf_dtype, sf_vec_size
@@ -1352,6 +1397,10 @@ class Sm100BlockScaledGroupedGemmKernel:
         if mma_tiler_mnk[0] not in (128, 256, 512):
             raise ValueError("Unsupported logical output-channel tile")
         self.channel_tiles = max(1, mma_tiler_mnk[0] // 256)
+        if use_k96 and not (both_fp4 and sf_vec_size == 16):
+            raise ValueError("K96 requires FP4 operands with SF16")
+        self.use_k96 = use_k96
+        self.operand_alignment = 1024 if use_k96 else 128
         self.gather_k = 256 if both_fp4 else 128
         if mma_tiler_mnk[2] != self.gather_k:
             raise ValueError("Unsupported public blockscaled K tile")
@@ -1377,6 +1426,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                 self.bulk_output_bytes,
                 use_clc_scheduler,
                 num_tile_info_stages,
+                self.operand_alignment,
             )
         self.k_steps = k_steps
         self.tile_k = self.gather_k * self.k_steps // 4
@@ -1523,12 +1573,13 @@ class Sm100BlockScaledGroupedGemmKernel:
         acc_stages,
         use_clc_scheduler,
         num_tile_info_stages,
+        operand_alignment=128,
     ):
         # The CLC response has its own 16-byte alignment inside the slab.
         scheduler_bytes = 32 * num_tile_info_stages + 48 if use_clc_scheduler else 0
         return (
             ((num_stages * 2 + acc_stages * 2) * 8 + 4 + scheduler_bytes + 127) // 128
-        ) * 128 + 128
+        ) * 128 + operand_alignment
 
     @staticmethod
     def _epilogue_storage(available_bytes, element_bytes):
@@ -1548,6 +1599,7 @@ class Sm100BlockScaledGroupedGemmKernel:
         acc_stages,
         use_clc_scheduler,
         num_tile_info_stages,
+        operand_alignment=128,
     ):
         capacity = utils.get_smem_capacity_in_bytes("sm_100")
         available = (
@@ -1558,6 +1610,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                 acc_stages,
                 use_clc_scheduler,
                 num_tile_info_stages,
+                operand_alignment,
             )
         )
         _, _, scratch_bytes = cls._epilogue_storage(available, bulk_output_bytes)
@@ -1570,6 +1623,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                 acc_stages,
                 use_clc_scheduler,
                 num_tile_info_stages,
+                operand_alignment,
             )
             > capacity
         ):
@@ -1586,6 +1640,7 @@ class Sm100BlockScaledGroupedGemmKernel:
         bulk_output_bytes,
         use_clc_scheduler,
         num_tile_info_stages,
+        operand_alignment=128,
     ):
         """Return the operand-ring capacity and accumulator overlap eligibility."""
         logical_m, route_tile, tile_k = mma_tiler_mnk
@@ -1614,6 +1669,7 @@ class Sm100BlockScaledGroupedGemmKernel:
             acc_stages,
             use_clc_scheduler,
             num_tile_info_stages,
+            operand_alignment,
         ), can_overlap
 
     @classmethod
@@ -1628,6 +1684,7 @@ class Sm100BlockScaledGroupedGemmKernel:
         bulk_output_bytes,
         use_clc_scheduler,
         num_tile_info_stages,
+        operand_alignment=128,
     ):
         """Maximize staged reduction coverage within the actual storage budget.
 
@@ -1661,6 +1718,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                 bulk_output_bytes,
                 use_clc_scheduler,
                 num_tile_info_stages,
+                operand_alignment,
             )
             if preserve_overlap and not can_overlap:
                 continue
@@ -1734,6 +1792,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                 self.acc_stages,
                 self.use_clc_scheduler,
                 self.num_tile_info_stages,
+                self.operand_alignment,
             )
             if num_stages < 1:
                 raise ValueError("Not enough SM100 shared memory for one operand stage")
@@ -1748,6 +1807,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                 self.acc_stages,
                 self.use_clc_scheduler,
                 self.num_tile_info_stages,
+                self.operand_alignment,
             )
         )
         (self.epilogue.bulk_tokens, self.epilogue.bulk_stages, scratch_bytes) = (
@@ -2140,13 +2200,13 @@ class Sm100BlockScaledGroupedGemmKernel:
                 cute.struct.MemRange[
                     self.a_storage_dtype, cute.cosize(self.a_layout.outer)
                 ],
-                128,
+                self.operand_alignment,
             ]
             b: cute.struct.Align[
                 cute.struct.MemRange[
                     self.activation_dtype, cute.cosize(self.b_layout.outer)
                 ],
-                128,
+                self.operand_alignment,
             ]
             sfa: cute.struct.Align[
                 cute.struct.MemRange[self.sf_dtype, cute.cosize(self.sfa_layout)],
@@ -2762,8 +2822,34 @@ class Sm100BlockScaledGroupedGemmKernel:
                     tSFA.layout,
                 )
                 copy_a1, source_a1, target_a1 = self._s2t_partition(sSFA, tSFA1)
-            fragment_a = tiled_mma.make_fragment_A(sA)
-            fragment_b = tiled_mma.make_fragment_B(sB)
+            if cutlass.const_expr(self.use_k96):
+                # Preserve the existing SF copy layout, but address individual
+                # SF16 entries for the mixed six/four-scale MMA updates.
+                sfa_iter = cute.make_layout(
+                    ((((32, 4), 1), (self.sf_vec_size, 1)), 1, self.sf_cols)
+                )
+                sfb_iter = cute.make_layout(
+                    (
+                        (((32, 4), self.sfb_row_blocks), (self.sf_vec_size, 1)),
+                        1,
+                        self.sf_cols,
+                    )
+                )
+                sfa_mma_layout = blockscaled_utils.make_tmem_layout_sfa(
+                    tiled_mma, self.physical_tiler, self.sf_vec_size, sfa_iter
+                )
+                sfb_mma_layout = blockscaled_utils.make_tmem_layout_sfb(
+                    tiled_mma, self.physical_tiler, self.sf_vec_size, sfb_iter
+                )
+                tSFA = cute.make_tensor(tSFA.iterator, sfa_mma_layout)
+                tSFB = cute.make_tensor(tSFB.iterator, sfb_mma_layout)
+                if cutlass.const_expr(self.channel_tiles == 2):
+                    tSFA1 = cute.make_tensor(tSFA1.iterator, sfa_mma_layout)
+                fragment_a = sA
+                fragment_b = sB
+            else:
+                fragment_a = tiled_mma.make_fragment_A(sA)
+                fragment_b = tiled_mma.make_fragment_B(sB)
             consumer = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_stages
             )
@@ -2784,6 +2870,31 @@ class Sm100BlockScaledGroupedGemmKernel:
                     if cutlass.const_expr(self.use_clc_scheduler)
                     else cutlass.min(self.route_tile, mn_limit[route_idx] - route_start)
                 )
+                tile_target_b = target_b
+                tile_sfb = tSFB
+                if cutlass.const_expr(self.use_k96 and self.sfb_row_blocks > 1):
+                    # K96 crosses SF words using the instruction's actual N.
+                    # Compact the first bank for narrow tiles and place the
+                    # unused bank after it in the same allocated TMEM region.
+                    wide_sf = cutlass.Int32(valid > 128)
+                    sf_words = self.sf_cols // 4
+                    sf_word_stride = target_b.stride[1]
+                    sf_k_stride = sf_word_stride * (1 + wide_sf)
+                    sf_n_stride = sf_word_stride * (sf_words - (sf_words - 1) * wide_sf)
+                    tile_target_b = cute.make_tensor(
+                        target_b.iterator,
+                        cute.make_layout(
+                            target_b.shape,
+                            stride=(target_b.stride[0], sf_n_stride, 0, sf_k_stride),
+                        ),
+                    )
+                    tile_sfb = cute.make_tensor(
+                        tSFB.iterator,
+                        cute.make_layout(
+                            tSFB.shape,
+                            stride=(tSFB.stride[0], 0, (1, sf_k_stride)),
+                        ),
+                    )
                 mma_accumulator = cute.make_tensor(
                     tmem_ptr
                     + cute.assume(
@@ -2831,7 +2942,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                             consumer.index * self.channel_tiles,
                         )
                         cute.copy(copy_a, source_a[sf_stage_a], target_a)
-                        cute.copy(copy_b, source_b[sf_stage], target_b)
+                        cute.copy(copy_b, source_b[sf_stage], tile_target_b)
                         if cutlass.const_expr(self.channel_tiles == 2):
                             sf_stage_a1 = (
                                 None,
@@ -2851,13 +2962,14 @@ class Sm100BlockScaledGroupedGemmKernel:
                             ],
                             fragment_b[(None, None, None, consumer.index)],
                             tSFA,
-                            tSFB,
+                            tile_sfb,
                             valid,
                             k_tile,
                             self.instruction,
                             self.descriptor,
                             self.cta_group_size,
                             num_k_atoms,
+                            self.use_k96,
                         )
                         if cutlass.const_expr(self.enable_iket):
                             _iket.range_pop()
@@ -2881,13 +2993,14 @@ class Sm100BlockScaledGroupedGemmKernel:
                                 ],
                                 fragment_b[(None, None, None, consumer.index)],
                                 tSFA1,
-                                tSFB,
+                                tile_sfb,
                                 valid,
                                 k_tile,
                                 self.instruction,
                                 self.descriptor,
                                 self.cta_group_size,
                                 num_k_atoms,
+                                self.use_k96,
                             )
                             if cutlass.const_expr(self.enable_iket):
                                 _iket.range_pop()

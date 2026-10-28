@@ -270,6 +270,11 @@ def _run_blockscaled_gemm(
             use_fused_finalize=use_fused_finalize,
             enable_pdl=enable_pdl,
             max_active_clusters=num_sms,
+            use_k96=(
+                get_compute_capability(activation.device) == (10, 3)
+                and activation_dtype is weight_dtype is cutlass.Float4E2M1FN
+                and sf_vec_size == 16
+            ),
         )
         compiled = cute.compile(kernel.wrapper, *args, stream=stream)
         _blockscaled_kernel_cache[key] = compiled
