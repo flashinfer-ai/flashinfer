@@ -931,6 +931,31 @@ def test_ep1_direct_place_switch(monkeypatch) -> None:
     assert id(_warm_runner(off, device)) not in runners
 
 
+def test_ep1_direct_place_defaults(monkeypatch) -> None:
+    """The shipped per-EP default of direct placement: on at the EP sizes of
+    DIRECT_PLACE_DEFAULTS with their round bound, off at the others, and the
+    environment fallbacks override it (host-only check)."""
+    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import (
+        cake_runner,
+    )
+
+    assert cake_runner.DIRECT_PLACE_DEFAULTS == {8: 513, 4: 513}
+    monkeypatch.delenv(cake_runner.DIRECT_PLACE_ENV, raising=False)
+    monkeypatch.delenv(cake_runner.DIRECT_PLACE_MIN_TOKENS_ENV, raising=False)
+    for ep, on in ((1, False), (2, False), (4, True), (8, True), (16, False)):
+        assert cake_runner._direct_place_default(ep) is on, ep
+        assert cake_runner._direct_place_min_tokens_default(ep) == 513, ep
+    monkeypatch.setenv(cake_runner.DIRECT_PLACE_ENV, "0")
+    assert cake_runner._direct_place_default(8) is False
+    monkeypatch.setenv(cake_runner.DIRECT_PLACE_ENV, "1")
+    assert cake_runner._direct_place_default(2) is True
+    monkeypatch.setenv(cake_runner.DIRECT_PLACE_ENV, "on")
+    with pytest.raises(ValueError, match="0 or 1"):
+        cake_runner._direct_place_default(8)
+    monkeypatch.setenv(cake_runner.DIRECT_PLACE_MIN_TOKENS_ENV, "700")
+    assert cake_runner._direct_place_min_tokens_default(8) == 700
+
+
 @requires_sm90
 def test_ep1_direct_place_small_capacity() -> None:
     """A layer none of whose rounds can be placed directly (token capacity below the
@@ -1861,6 +1886,63 @@ def test_ep_direct_place_bitwise(mode: str, wire: str) -> None:
         seed=223,
         label=f"{wire} {mode} direct_place",
     )
+    dist.barrier()
+
+
+@requires_dist
+def test_ep_direct_place_default(monkeypatch) -> None:
+    """With no config value and no environment override, direct placement is on at
+    the EP sizes of DIRECT_PLACE_DEFAULTS (grid rounds of at least their bound are
+    placed directly) and off at the others; the bytes equal the inbox path."""
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim.cake_runner import (
+        DIRECT_PLACE_DEFAULTS,
+        DIRECT_PLACE_ENV,
+        DIRECT_PLACE_MIN_TOKENS_ENV,
+    )
+
+    monkeypatch.delenv(DIRECT_PLACE_ENV, raising=False)
+    monkeypatch.delenv(DIRECT_PLACE_MIN_TOKENS_ENV, raising=False)
+    rank, world_size = _dist_setup()
+    device = torch.device("cuda", rank)
+    common = dict(token_capacity=640, compact_form=1, **DISPATCH_PATHS)
+    off, w13, w2 = _build_layer(world_size, rank, device, direct_place=False, **common)
+    # own pool key (see test_ep_per_route_publish_pdl_bitwise)
+    layer, _w13, _w2 = _build_layer(
+        world_size, rank, device, init_timeout_s=613.0, **common
+    )
+    runner = _warm_runner(layer, device)
+    on = world_size in DIRECT_PLACE_DEFAULTS
+    bound = DIRECT_PLACE_DEFAULTS.get(world_size, 513)
+    assert runner.direct_place is on
+    assert runner.direct_place_min_tokens == bound
+    assert (runner._a1_symm is not None) is on
+    for index, num_tokens in enumerate((512, 513, 600, 640)):
+        x, ids, weights = _make_inputs(
+            num_tokens,
+            LOCAL_EXPERTS * world_size,
+            281 + 7 * index + rank,
+            device,
+            rank=rank,
+            world_size=world_size,
+        )
+        reference = _forward(off, x, ids, weights).clone()
+        torch.cuda.synchronize()
+        output = _forward(layer, x, ids, weights).clone()
+        torch.cuda.synchronize()
+        expected = int(on and num_tokens >= bound)
+        assert runner._direct_flag() == expected, f"T={num_tokens}"
+        assert torch.equal(output, reference), f"T={num_tokens}"
+        _check(
+            output,
+            x,
+            ids,
+            weights,
+            w13,
+            w2,
+            label=f" ep{world_size} rank{rank} direct_place default T={num_tokens}",
+        )
     dist.barrier()
 
 

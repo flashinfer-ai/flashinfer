@@ -55,6 +55,7 @@ __all__ = [
     "COMBINE_WIRE_ENV",
     "COMPACT_FORM_ENV",
     "COPY_FORMS",
+    "DIRECT_PLACE_DEFAULTS",
     "DIRECT_PLACE_ENV",
     "DIRECT_PLACE_MIN_TOKENS_ENV",
     "FC2_EARLY_MAX_TOKENS",
@@ -220,16 +221,22 @@ PREFIX_FORM_ENV = "FLASHINFER_SM90_CAKE_BF16_PREFIX_FORM"
 # have copied it to, and the compact copies only the later routes of the token to
 # the same rank (from the carrier's row).  A round is direct only when every rank
 # dispatches it this way (decided on the device, the same on every rank); other
-# rounds use the inbox path.  Requested with 1 (``direct_place=True``; default 0);
-# effective only when every rank requests it and its pipe allows it (dedup
-# dispatch, the grid dispatch on, compact form 1, at most 1024 (expert, rank) keys,
-# a token capacity of at least both round bounds below), and then for grid-dispatch
-# rounds with at least DIRECT_PLACE_MIN_TOKENS_ENV (``direct_place_min_tokens``;
-# default the grid-dispatch bound) local tokens.  A pipe that cannot use it keeps
-# the regular activation matrix.
+# rounds use the inbox path.  Requested with 1 (``direct_place=True``; by default
+# on for the EP sizes in DIRECT_PLACE_DEFAULTS, off for the others); effective only
+# when every rank requests it and its pipe allows it (dedup dispatch, the grid
+# dispatch on, compact form 1, at most 1024 (expert, rank) keys, a token capacity of
+# at least both round bounds below), and then for grid-dispatch rounds with at least
+# DIRECT_PLACE_MIN_TOKENS_ENV (``direct_place_min_tokens``; default the EP size's
+# bound in DIRECT_PLACE_DEFAULTS, else the grid-dispatch bound) local tokens.  A pipe
+# that cannot use it keeps the regular activation matrix.
 # Bit-identical outputs.
 DIRECT_PLACE_ENV = "FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE"
 DIRECT_PLACE_MIN_TOKENS_ENV = "FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE_MIN_TOKENS"
+# EP size -> smallest local token count of a direct round, for the EP sizes where
+# direct placement was measured faster than the inbox path on H100 (on by default
+# there).  Other EP sizes (EP 2: no measured gain) keep the inbox path unless
+# direct placement is requested.
+DIRECT_PLACE_DEFAULTS: dict[int, int] = {8: 513, 4: 513}
 _DIRECT_PLACE_MAX_KEYS = 1024  # E * ep: the pipelined compact's segment tables
 _DIRECT_PLACE_MAX_ROWS = 1 << 30  # the SlotMeta row field (bits 0..29)
 
@@ -324,16 +331,21 @@ def _fc2_early_max_tokens_default() -> int:
     return FC2_EARLY_MAX_TOKENS if raw is None else int(raw.strip())
 
 
-def _direct_place_default() -> bool:
-    raw = os.environ.get(DIRECT_PLACE_ENV, "0").strip()
+def _direct_place_default(ep: int) -> bool:
+    raw = os.environ.get(DIRECT_PLACE_ENV)
+    if raw is None:
+        return ep in DIRECT_PLACE_DEFAULTS
+    raw = raw.strip()
     if raw not in ("0", "1"):
         raise ValueError(f"{DIRECT_PLACE_ENV} must be 0 or 1, got {raw!r}")
     return raw == "1"
 
 
-def _direct_place_min_tokens_default() -> int:
+def _direct_place_min_tokens_default(ep: int) -> int:
     raw = os.environ.get(DIRECT_PLACE_MIN_TOKENS_ENV)
-    return GRID_DISPATCH_MIN_TOKENS if raw is None else int(raw.strip())
+    if raw is not None:
+        return int(raw.strip())
+    return DIRECT_PLACE_DEFAULTS.get(ep, GRID_DISPATCH_MIN_TOKENS)
 
 
 def _align256(nbytes: int) -> int:
@@ -452,7 +464,8 @@ class Sm90CakeBf16MoERunner:
     bit-identical and a peer rank may use any of them.
 
     Direct placement (``direct_place``; ``None`` = ``DIRECT_PLACE_ENV``, default
-    off): grid-dispatch rounds store each token's row for a rank straight into
+    on for the EP sizes in ``DIRECT_PLACE_DEFAULTS``): grid-dispatch rounds store
+    each token's row for a rank straight into
     that rank's activation matrix (a symmetric buffer), so the compact copies only
     the later routes of a token to the same rank.  It is effective only when every
     rank of the pipe requests it and can run it; a round is direct only when every
@@ -590,7 +603,7 @@ class Sm90CakeBf16MoERunner:
         self._gemm_sched: torch.Tensor | None = None
         self._prefix_form = _form(prefix_form, PREFIX_FORM_ENV, "prefix_form")
         if direct_place is None:
-            requested = _direct_place_default()
+            requested = _direct_place_default(pipe.ep)
         elif direct_place in (0, 1):  # bool or 0 / 1
             requested = bool(direct_place)
         else:
@@ -598,7 +611,7 @@ class Sm90CakeBf16MoERunner:
                 f"direct_place must be a bool or None, got {direct_place!r}"
             )
         direct_min = (
-            _direct_place_min_tokens_default()
+            _direct_place_min_tokens_default(pipe.ep)
             if direct_place_min_tokens is None
             else int(direct_place_min_tokens)
         )

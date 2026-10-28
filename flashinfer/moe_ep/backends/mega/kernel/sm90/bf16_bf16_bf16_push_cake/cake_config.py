@@ -127,7 +127,8 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     dispatch with at least ``direct_place_min_tokens`` local tokens; other rounds
     take the inbox path.
     It changes no stored value.  ``None`` reads
-    ``FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE`` (``0`` or ``1``, default ``0``) and
+    ``FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE`` (``0`` or ``1``; unset = on at EP
+    sizes 8 and 4, where it was measured faster, and off at the others) and
     ``FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE_MIN_TOKENS`` (default ``513``, the
     grid-dispatch bound).
     """
