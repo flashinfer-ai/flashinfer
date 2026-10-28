@@ -39,6 +39,8 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Int16, Int32, Uint32
+from cutlass.base_dsl.arch import Arch
+from cutlass.cutlass_dsl import BaseDSL
 
 from ...api_logging import flashinfer_api
 from ...cute_dsl.fp4_common import (
@@ -79,18 +81,32 @@ def _broadcast_low_byte(value: Int32) -> Int32:
     )
 
 
+def _has_packed_e4m3_e2m1_mul() -> bool:
+    """Whether the compile target has the packed E4M3 x E2M1 multiply.
+
+    PTX 9.4 (CUDA 13.4) adds it for sm_100a and sm_103a only; every other
+    supported target (SM107, SM110, SM120, SM121 and the family targets)
+    takes the f16x2 path.
+    """
+    if not cutlass.target_version(min_version="13.4"):
+        return False
+    arch = BaseDSL._get_dsl().get_arch_enum()
+    return arch in (Arch.sm_100a, Arch.sm_103a)
+
+
 @cute.jit
 def _mul_packed_e2m1x4_e4m3x4(packed_fp4: Int16, packed_sf: Int32) -> Int32:
     """Apply four E4M3 scales to four contiguous packed E2M1 nibbles."""
-    if cutlass.const_expr(cutlass.target_version(min_version="13.4")):
+    if cutlass.const_expr(_has_packed_e4m3_e2m1_mul()):
         return cute.arch.inline_ptx(
             "mul.e4m3x4.e2m1x4.e4m3x4.satfinite {$w0}, {$r0}, {$r1};",
             write_only_types=[Int32],
             read_only_args=[packed_fp4, packed_sf],
         )
     else:
-        # Fallback for toolchains predating PTX 9.4. The E2M1 * E4M3 product
-        # is exact in FP16, so both paths round once to E4M3 and match.
+        # Without the packed multiply: widen to FP16, multiply, narrow to E4M3.
+        # FP16 holds every E2M1 x E4M3 product exactly, so the only rounding
+        # is the final narrowing, the same as the packed instruction.
         return cute.arch.inline_ptx(
             """
             {
