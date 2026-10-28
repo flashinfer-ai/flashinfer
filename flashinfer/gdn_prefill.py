@@ -1700,15 +1700,18 @@ def chunk_gated_delta_rule(
         if checkpoint_state_indices is None:
             if not state_checkpoints.is_contiguous():
                 raise RuntimeError("state_checkpoints must be contiguous")
-        elif state_checkpoints.stride()[1:] != (
-            head_size * head_size,
-            head_size,
-            1,
-        ) or state_checkpoints.stride(0) < num_sab_heads * head_size * head_size:
-            raise RuntimeError(
-                "state_checkpoints pool rows must be dense [H, V, K] blocks "
-                "with a row stride of at least H * V * K elements"
+        else:
+            row_size = num_sab_heads * head_size * head_size
+            dense_rows = state_checkpoints.stride()[1:] == (
+                head_size * head_size,
+                head_size,
+                1,
             )
+            if not dense_rows or state_checkpoints.stride(0) < row_size:
+                raise RuntimeError(
+                    "state_checkpoints pool rows must be dense [H, V, K] blocks "
+                    "with a row stride of at least H * V * K elements"
+                )
 
     # Allocate output if not provided
     if output is None:

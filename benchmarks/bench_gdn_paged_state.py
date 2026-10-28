@@ -1,0 +1,351 @@
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
+"""
+Paged recurrent-state GDN prefill and decode (flashinfer.gdn_paged).
+
+Prefill compares, on batches whose prefixes end on page boundaries (the only
+case the packed API can serve):
+
+- paged: ``chunk_gated_delta_rule_paged`` reads the prefix page and writes every
+  page boundary and the final state into the pool in one call.
+- packed+copy: what a caller does with the packed checkpoint API: gather the
+  prefix states, run ``chunk_gated_delta_rule`` with a packed initial state,
+  packed final state and a packed ``state_checkpoints`` buffer
+  (``checkpoint_every_n_tokens=page_len``), then scatter the checkpoints and
+  final states into their pages.
+- no-ckpt: ``chunk_gated_delta_rule`` with ``state_indices`` and no
+  checkpoints, the cost of the recurrence alone (its final state overwrites
+  the prefix page, so it is a timing reference, not a correct caching scheme).
+
+Decode compares ``gated_delta_rule_decode_paged`` with
+``gated_delta_rule_decode_pretranspose`` given precomputed read/write rows.
+
+Every arm is captured in a CUDA graph and timed by replay
+(``bench_gpu_time(use_cuda_graph=True)``, warm L2), so the copies and index
+arithmetic around the kernels are inside the number. ``extra MiB`` is the
+memory an arm needs beyond the inputs, the output and the pool: the buffers it
+owns plus the peak of its transient allocations in one eager call.
+
+Usage:
+  python benchmarks/bench_gdn_paged_state.py
+  python benchmarks/bench_gdn_paged_state.py --heads 16 16 32 --page-len 1024
+"""
+
+import argparse
+import math
+import statistics
+
+import torch
+import torch.nn.functional as F
+
+from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
+from flashinfer.gdn_paged import (
+    chunk_gated_delta_rule_paged,
+    gated_delta_rule_decode_paged,
+)
+from flashinfer.gdn_prefill import chunk_gated_delta_rule
+from flashinfer.testing import bench_gpu_time
+
+D = 128
+
+# (name, [(prefix_len, new_len), ...]) with page-aligned prefixes.
+PREFILL_WORKLOADS = [
+    ("1x new 8K", [(0, 8192)]),
+    ("4x reuse 4K + 2K", [(4096, 2048)] * 4),
+    ("16x reuse 8K + 1K", [(8192, 1024)] * 16),
+    ("8x mixed", [(0, 3000), (1024, 4096), (2048, 777), (0, 1024)] * 2),
+    ("64x reuse 16K + 256", [(16384, 256)] * 64),
+]
+
+
+def _cu(lens, device="cuda", dtype=torch.int32):
+    out = [0]
+    for n in lens:
+        out.append(out[-1] + n)
+    return torch.tensor(out, dtype=dtype, device=device)
+
+
+def _median_ms(fn):
+    times = bench_gpu_time(fn, use_cuda_graph=True, cold_l2_cache=False)
+    return statistics.median(times)
+
+
+def _extra_mib(fn, owned_bytes=0):
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    fn()
+    torch.cuda.synchronize()
+    return (owned_bytes + torch.cuda.max_memory_allocated() - base) / 2**20
+
+
+def _prefill_row(name, spans, heads, page_len, state_dtype):
+    hq, hk, hv = heads
+    h = max(hq, hv)
+    scale = 1.0 / math.sqrt(D)
+    assert all(p % page_len == 0 for p, _ in spans)
+    prefix = [p for p, _ in spans]
+    new = [n for _, n in spans]
+    totals = [p + n for p, n in spans]
+    num_pages = [max(1, math.ceil(t / page_len)) for t in totals]
+    b = len(spans)
+    t_new = sum(new)
+    q = torch.randn(t_new, hq, D, dtype=torch.bfloat16, device="cuda") * 0.1
+    k = F.normalize(torch.randn(t_new, hk, D, device="cuda"), dim=-1).to(torch.bfloat16)
+    v = torch.randn(t_new, hv, D, dtype=torch.bfloat16, device="cuda") * 0.1
+    g = 0.9 + 0.1 * torch.rand(t_new, h, device="cuda")
+    beta = torch.rand(t_new, h, device="cuda")
+    cu = _cu(new)
+
+    pool_pages = sum(num_pages)
+    perm = torch.randperm(pool_pages, device="cuda").to(torch.int32)
+    indptr = _cu(num_pages)
+    last = torch.tensor(
+        [t - (m - 1) * page_len for t, m in zip(totals, num_pages, strict=True)],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    pool = torch.randn(pool_pages, h, D, D, device="cuda").to(state_dtype) * 0.01
+
+    # Host-side rows for the packed+copy arm (a caller knows them anyway).
+    starts = indptr.tolist()
+    page_ids = perm.tolist()
+    read_rows, final_rows, final_src, ckpt_rows = [], [], [], []
+    ckpt_counts = []
+    for i in range(b):
+        pages = page_ids[starts[i] : starts[i + 1]]
+        p, t = prefix[i], totals[i]
+        read_rows.append(pages[p // page_len - 1] if p else -1)
+        first = p // page_len
+        count = t // page_len - first
+        ckpt_counts.append(count)
+        ckpt_rows += pages[first : first + count]
+        if t % page_len:
+            final_rows.append(pages[-1])
+            final_src.append(i)
+    has_prefix = torch.tensor([r >= 0 for r in read_rows], device="cuda")
+    read_idx = torch.tensor([max(r, 0) for r in read_rows], device="cuda")
+    final_idx = torch.tensor(final_rows, dtype=torch.long, device="cuda")
+    final_src_idx = torch.tensor(final_src, dtype=torch.long, device="cuda")
+    ckpt_idx = torch.tensor(ckpt_rows, dtype=torch.long, device="cuda")
+    ckpt_cu = _cu(ckpt_counts)
+    n_ckpt = max(sum(ckpt_counts), 1)
+    init_buf = torch.empty(b, h, D, D, dtype=state_dtype, device="cuda")
+    final_buf = torch.empty_like(init_buf)
+    ckpt_buf = torch.empty(n_ckpt, h, D, D, dtype=state_dtype, device="cuda")
+    out = torch.empty(t_new, max(hq, hv), D, dtype=torch.bfloat16, device="cuda")
+    owned_bytes = (
+        init_buf.numel() + final_buf.numel() + ckpt_buf.numel()
+    ) * init_buf.element_size()
+
+    def paged():
+        chunk_gated_delta_rule_paged(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            cu_seqlens=cu,
+            state_pool=pool,
+            page_indices=perm,
+            page_indptr=indptr,
+            page_len=page_len,
+            last_page_len=last,
+            output=out,
+        )
+
+    def packed_copy():
+        torch.index_select(pool, 0, read_idx, out=init_buf)
+        init_buf.mul_(has_prefix.view(-1, 1, 1, 1))
+        chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            initial_state=init_buf,
+            output_final_state=True,
+            cu_seqlens=cu,
+            output=out,
+            output_state=final_buf,
+            state_checkpoints=ckpt_buf,
+            checkpoint_cu_starts=ckpt_cu,
+            checkpoint_every_n_tokens=page_len,
+            use_cp=False,
+        )
+        if ckpt_rows:
+            pool.index_copy_(0, ckpt_idx, ckpt_buf[: len(ckpt_rows)])
+        if final_rows:
+            pool.index_copy_(0, final_idx, final_buf[final_src_idx])
+
+    no_ckpt_rows = torch.tensor(
+        [page_ids[starts[i + 1] - 1] for i in range(b)],
+        dtype=torch.int32,
+        device="cuda",
+    )
+
+    def no_ckpt():
+        chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            initial_state=pool,
+            output_final_state=True,
+            cu_seqlens=cu,
+            output=out,
+            output_state=pool,
+            state_indices=no_ckpt_rows,
+            use_cp=False,
+        )
+
+    # Same pool contents after one call of either caching arm.
+    start = pool.clone()
+    paged()
+    paged_pool = pool.clone()
+    pool.copy_(start)
+    packed_copy()
+    torch.testing.assert_close(pool.float(), paged_pool.float(), atol=2e-2, rtol=2e-2)
+    pool.copy_(start)
+    mib_paged = _extra_mib(paged)
+    mib_packed = _extra_mib(packed_copy, owned_bytes)
+    no_ckpt()
+
+    t_paged = _median_ms(paged)
+    t_packed = _median_ms(packed_copy)
+    t_plain = _median_ms(no_ckpt)
+    return (
+        name,
+        b,
+        t_new,
+        sum(ckpt_counts),
+        t_paged,
+        t_packed,
+        t_plain,
+        mib_paged,
+        mib_packed,
+    )
+
+
+def bench_prefill(heads, page_len, state_dtype, workloads):
+    rows = []
+    for name, spans in workloads:
+        rows.append(_prefill_row(name, spans, heads, page_len, state_dtype))
+        torch.cuda.empty_cache()
+    return rows
+
+
+def bench_decode(heads, state_dtype, batches):
+    hq, hk, hv = heads
+    rows = []
+    for b in batches:
+        q = torch.randn(b, 1, hq, D, dtype=torch.bfloat16, device="cuda")
+        k = torch.randn(b, 1, hk, D, dtype=torch.bfloat16, device="cuda")
+        v = torch.randn(b, 1, hv, D, dtype=torch.bfloat16, device="cuda")
+        A_log = torch.rand(hv, device="cuda") - 2.0
+        a = torch.randn(b, 1, hv, dtype=torch.bfloat16, device="cuda")
+        dt_bias = torch.randn(hv, device="cuda")
+        bb = torch.randn(b, 1, hv, dtype=torch.bfloat16, device="cuda")
+        # Two pages per sequence; every other sequence opens its second page.
+        pool = torch.randn(2 * b, hv, D, D, device="cuda").to(state_dtype) * 0.01
+        indices = torch.randperm(2 * b, device="cuda").to(torch.int32)
+        indptr = _cu([2] * b)
+        last = torch.tensor(
+            [1 if i % 2 else 77 for i in range(b)], dtype=torch.int32, device="cuda"
+        )
+        write = indices[1::2].contiguous()
+        read = torch.where(last > 1, write, indices[0::2]).contiguous()
+        out = torch.empty(b, 1, hv, D, dtype=torch.bfloat16, device="cuda")
+
+        def paged():
+            gated_delta_rule_decode_paged(
+                q,
+                k,
+                v,
+                A_log,
+                a,
+                dt_bias,
+                bb,
+                output=out,
+                state_pool=pool,
+                page_indices=indices,
+                page_indptr=indptr,
+                last_page_len=last,
+            )
+
+        def explicit_rows():
+            gated_delta_rule_decode_pretranspose(
+                q,
+                k,
+                v,
+                None,
+                A_log,
+                a,
+                dt_bias,
+                bb,
+                output=out,
+                initial_state=pool,
+                initial_state_indices=read,
+                output_state_indices=write,
+            )
+
+        rows.append((b, _median_ms(paged), _median_ms(explicit_rows)))
+    return rows
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--heads", type=int, nargs=3, default=[16, 16, 32])
+    parser.add_argument("--page-len", type=int, default=1024)
+    parser.add_argument(
+        "--state-dtype", choices=["float32", "bfloat16"], default="float32"
+    )
+    parser.add_argument("--decode-batches", type=int, nargs="*", default=[1, 32, 256])
+    args = parser.parse_args()
+    state_dtype = getattr(torch, args.state_dtype)
+    dev = torch.cuda.get_device_properties(0)
+    print(
+        f"# {dev.name} (sm_{dev.major}{dev.minor}), torch {torch.__version__}, "
+        f"CUDA {torch.version.cuda}, heads q/k/v={tuple(args.heads)}, "
+        f"page_len={args.page_len}, state {args.state_dtype}"
+    )
+    print(
+        "| workload | seqs | new tokens | page ckpts | paged ms | packed+copy ms "
+        "| speedup | no-ckpt ms | paged extra MiB | packed+copy extra MiB |"
+    )
+    print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for name, b, t, n, tp, tc, t0, mp, mc in bench_prefill(
+        tuple(args.heads), args.page_len, state_dtype, PREFILL_WORKLOADS
+    ):
+        print(
+            f"| {name} | {b} | {t} | {n} | {tp:.4f} | {tc:.4f} | {tc / tp:.3f} "
+            f"| {t0:.4f} | {mp:.1f} | {mc:.1f} |"
+        )
+    if args.decode_batches:
+        hq, hk, hv = args.heads
+        print("\n| decode batch | paged ms | explicit rows ms | ratio |")
+        print("|---:|---:|---:|---:|")
+        for b, tp, te in bench_decode((hq, hk, hv), state_dtype, args.decode_batches):
+            print(f"| {b} | {tp:.4f} | {te:.4f} | {te / tp:.3f} |")
+
+
+if __name__ == "__main__":
+    main()

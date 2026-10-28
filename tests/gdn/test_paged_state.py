@@ -174,7 +174,10 @@ class PagedBatch:
         )
         indptr = _cu(self.num_pages, "cuda").to(index_dtype)
         last = torch.tensor(
-            [n - (m - 1) * self.page_len for n, m in zip(self.total_lens, self.num_pages)],
+            [
+                n - (m - 1) * self.page_len
+                for n, m in zip(self.total_lens, self.num_pages, strict=True)
+            ],
             dtype=index_dtype,
             device="cuda",
         )
@@ -187,7 +190,11 @@ class PagedBatch:
 def _assert_state(actual, expected, *, msg):
     tol = 1e-2 if actual.dtype == torch.float32 else 3e-2
     torch.testing.assert_close(
-        actual.float(), expected.float(), atol=tol, rtol=tol, msg=lambda m: f"{msg}: {m}"
+        actual.float(),
+        expected.float(),
+        atol=tol,
+        rtol=tol,
+        msg=lambda m: f"{msg}: {m}",
     )
 
 
@@ -201,7 +208,7 @@ def _run_paged_prefill_case(
     index_dtype=torch.int32,
 ):
     num_q_heads, num_k_heads, num_v_heads = heads
-    totals = [p + n for p, n in zip(prefix_lens, new_lens)]
+    totals = [p + n for p, n in zip(prefix_lens, new_lens, strict=True)]
     streams = Streams(totals, num_q_heads, num_k_heads, num_v_heads, dtype)
     batch = PagedBatch(totals, page_len, streams.num_sab_heads, state_dtype)
     num_seqs = len(totals)
@@ -240,7 +247,9 @@ def _run_paged_prefill_case(
     ref_rows = torch.cat(
         [
             torch.arange(start + p, start + t)
-            for start, p, t in zip(_cu(totals, "cpu").tolist(), prefix_lens, totals)
+            for start, p, t in zip(
+                _cu(totals, "cpu").tolist(), prefix_lens, totals, strict=True
+            )
         ]
     ).cuda()
     torch.testing.assert_close(
@@ -256,9 +265,7 @@ def _run_paged_prefill_case(
             page = batch.pages[b][j]
             written.add(page)
             end = min((j + 1) * page_len, t)
-            expected = (
-                ref_final[b] if end == t else ref_ckpts[b][end // CHUNK - 1]
-            )
+            expected = ref_final[b] if end == t else ref_ckpts[b][end // CHUNK - 1]
             _assert_state(batch.pool[page], expected, msg=f"seq {b} page {j}")
     for page in range(batch.pool.size(0)):
         if page not in written:
@@ -376,7 +383,7 @@ def test_chunked_prefill_continuation_at_unaligned_offsets():
     scale = 1.0 / math.sqrt(HEAD_SIZE)
     done = [0, 0]
     for chunk in ([1024, 0], [16, 1008], [0, 42]):
-        new_done = [d + c for d, c in zip(done, chunk)]
+        new_done = [d + c for d, c in zip(done, chunk, strict=True)]
         q, k, v, g, beta = streams.slices(done, new_done)
         pages = [math.ceil(n / L) if n else 1 for n in new_done]
         used = [batch.pages[b][: pages[b]] for b in range(2)]
@@ -395,7 +402,7 @@ def test_chunked_prefill_continuation_at_unaligned_offsets():
             page_indptr=_cu(pages, "cuda"),
             page_len=L,
             last_page_len=torch.tensor(
-                [max(n - (m - 1) * L, 1) for n, m in zip(new_done, pages)],
+                [max(n - (m - 1) * L, 1) for n, m in zip(new_done, pages, strict=True)],
                 dtype=torch.int32,
                 device="cuda",
             ),
@@ -475,13 +482,13 @@ def test_prefix_lens_absolute_checkpoints():
     torch.manual_seed(5)
     prefix = [100, 64, 0]
     new = [200, 192, 130]
-    totals = [p + n for p, n in zip(prefix, new)]
+    totals = [p + n for p, n in zip(prefix, new, strict=True)]
     streams = Streams(totals, 4, 4, 4, torch.bfloat16)
     _, prefix_final, _ = _oracle(streams, prefix)
     ref_out, ref_final, ref_ckpts = _oracle(streams, totals)
     q, k, v, g, beta = streams.slices(prefix, totals)
     N = 128
-    counts = [(p + n) // N - p // N for p, n in zip(prefix, new)]
+    counts = [(p + n) // N - p // N for p, n in zip(prefix, new, strict=True)]
     ckpts = torch.zeros(sum(counts), 4, HEAD_SIZE, HEAD_SIZE, device="cuda")
     init = prefix_final.clone()
     final = torch.zeros_like(init)
@@ -505,7 +512,7 @@ def test_prefix_lens_absolute_checkpoints():
     ref_rows = torch.cat(
         [
             torch.arange(s + p, s + t)
-            for s, p, t in zip(_cu(totals, "cpu").tolist(), prefix, totals)
+            for s, p, t in zip(_cu(totals, "cpu").tolist(), prefix, totals, strict=True)
         ]
     ).cuda()
     torch.testing.assert_close(
@@ -518,7 +525,9 @@ def test_prefix_lens_absolute_checkpoints():
         for j in range(counts[b]):
             position = (first + j) * N
             _assert_state(
-                ckpts[row], ref_ckpts[b][position // CHUNK - 1], msg=f"seq {b} @{position}"
+                ckpts[row],
+                ref_ckpts[b][position // CHUNK - 1],
+                msg=f"seq {b} @{position}",
             )
             row += 1
 
@@ -607,23 +616,29 @@ def test_paged_decode_reads_previous_page_on_a_new_page(state_dtype, heads):
     before = pool.clone()
     q, k, v, A_log, a, dt_bias, b = _decode_inputs(len(pages), heads)
 
-    read = [p[-2] if n == 1 else p[-1] for p, n in zip(pages, last)]
+    read = [p[-2] if n == 1 else p[-1] for p, n in zip(pages, last, strict=True)]
     write = [p[-1] for p in pages]
     expected_state = before[read].clone()
-    expected_out, _ = gated_delta_rule_decode_pretranspose(
-        q, k, v, expected_state, A_log, a, dt_bias, b, use_qk_l2norm=True
-    ) if state_dtype == torch.float32 else gated_delta_rule_decode_pretranspose(
-        q,
-        k,
-        v,
-        None,
-        A_log,
-        a,
-        dt_bias,
-        b,
-        use_qk_l2norm=True,
-        initial_state=expected_state,
-        initial_state_indices=torch.arange(len(pages), dtype=torch.int32, device="cuda"),
+    expected_out, _ = (
+        gated_delta_rule_decode_pretranspose(
+            q, k, v, expected_state, A_log, a, dt_bias, b, use_qk_l2norm=True
+        )
+        if state_dtype == torch.float32
+        else gated_delta_rule_decode_pretranspose(
+            q,
+            k,
+            v,
+            None,
+            A_log,
+            a,
+            dt_bias,
+            b,
+            use_qk_l2norm=True,
+            initial_state=expected_state,
+            initial_state_indices=torch.arange(
+                len(pages), dtype=torch.int32, device="cuda"
+            ),
+        )
     )
 
     out = gated_delta_rule_decode_paged(
@@ -688,7 +703,9 @@ def test_paged_prefill_then_decode_end_to_end():
         page_indices=torch.tensor(pages[:2], dtype=torch.int32, device="cuda"),
         page_indptr=_cu([2], "cuda"),
         page_len=page_len,
-        last_page_len=torch.tensor([prompt - page_len], dtype=torch.int32, device="cuda"),
+        last_page_len=torch.tensor(
+            [prompt - page_len], dtype=torch.int32, device="cuda"
+        ),
         **gate_kwargs,
     )
     outs = []
