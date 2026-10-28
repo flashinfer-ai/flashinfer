@@ -1025,65 +1025,65 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a(int* __restrict_
                     } while (((_wait_acquire_mask_2 ^ static_cast<unsigned int>(sched_ticket ^ sched_tag)) & static_cast<unsigned int>(sched_tag)) != 0);
                 }
                 __syncwarp();
-                unsigned int expert_1 = lane;
+                unsigned int expert_11_0 = lane;
                 counts[0] = 0;
-                if (expert_1 < 384) {
-                    counts[0] = (unsigned int)expert_counts[expert_1];
+                if (expert_11_0 < 384) {
+                    counts[0] = (unsigned int)expert_counts[expert_11_0];
                 }
-                unsigned int expert_0 = 32 + lane;
+                unsigned int expert_11_1 = 32 + lane;
                 counts[1] = 0;
-                if (expert_0 < 384) {
-                    counts[1] = (unsigned int)expert_counts[expert_0];
+                if (expert_11_1 < 384) {
+                    counts[1] = (unsigned int)expert_counts[expert_11_1];
                 }
-                unsigned int expert_1_1 = 64 + lane;
+                unsigned int expert_11_2 = 64 + lane;
                 counts[2] = 0;
-                if (expert_1_1 < 384) {
-                    counts[2] = (unsigned int)expert_counts[expert_1_1];
+                if (expert_11_2 < 384) {
+                    counts[2] = (unsigned int)expert_counts[expert_11_2];
                 }
-                unsigned int expert_2 = 96 + lane;
+                unsigned int expert_11_3 = 96 + lane;
                 counts[3] = 0;
-                if (expert_2 < 384) {
-                    counts[3] = (unsigned int)expert_counts[expert_2];
+                if (expert_11_3 < 384) {
+                    counts[3] = (unsigned int)expert_counts[expert_11_3];
                 }
-                unsigned int expert_3 = 128 + lane;
+                unsigned int expert_11_4 = 128 + lane;
                 counts[4] = 0;
-                if (expert_3 < 384) {
-                    counts[4] = (unsigned int)expert_counts[expert_3];
+                if (expert_11_4 < 384) {
+                    counts[4] = (unsigned int)expert_counts[expert_11_4];
                 }
-                unsigned int expert_4 = 160 + lane;
+                unsigned int expert_11_5 = 160 + lane;
                 counts[5] = 0;
-                if (expert_4 < 384) {
-                    counts[5] = (unsigned int)expert_counts[expert_4];
+                if (expert_11_5 < 384) {
+                    counts[5] = (unsigned int)expert_counts[expert_11_5];
                 }
-                unsigned int expert_5 = 192 + lane;
+                unsigned int expert_11_6 = 192 + lane;
                 counts[6] = 0;
-                if (expert_5 < 384) {
-                    counts[6] = (unsigned int)expert_counts[expert_5];
+                if (expert_11_6 < 384) {
+                    counts[6] = (unsigned int)expert_counts[expert_11_6];
                 }
-                unsigned int expert_6 = 224 + lane;
+                unsigned int expert_11_7 = 224 + lane;
                 counts[7] = 0;
-                if (expert_6 < 384) {
-                    counts[7] = (unsigned int)expert_counts[expert_6];
+                if (expert_11_7 < 384) {
+                    counts[7] = (unsigned int)expert_counts[expert_11_7];
                 }
-                unsigned int expert_7 = 256 + lane;
+                unsigned int expert_11_8 = 256 + lane;
                 counts[8] = 0;
-                if (expert_7 < 384) {
-                    counts[8] = (unsigned int)expert_counts[expert_7];
+                if (expert_11_8 < 384) {
+                    counts[8] = (unsigned int)expert_counts[expert_11_8];
                 }
-                unsigned int expert_8 = 288 + lane;
+                unsigned int expert_11_9 = 288 + lane;
                 counts[9] = 0;
-                if (expert_8 < 384) {
-                    counts[9] = (unsigned int)expert_counts[expert_8];
+                if (expert_11_9 < 384) {
+                    counts[9] = (unsigned int)expert_counts[expert_11_9];
                 }
-                unsigned int expert_9 = 320 + lane;
+                unsigned int expert_11_10 = 320 + lane;
                 counts[10] = 0;
-                if (expert_9 < 384) {
-                    counts[10] = (unsigned int)expert_counts[expert_9];
+                if (expert_11_10 < 384) {
+                    counts[10] = (unsigned int)expert_counts[expert_11_10];
                 }
-                unsigned int expert_10 = 352 + lane;
+                unsigned int expert_11_11 = 352 + lane;
                 counts[11] = 0;
-                if (expert_10 < 384) {
-                    counts[11] = (unsigned int)expert_counts[expert_10];
+                if (expert_11_11 < 384) {
+                    counts[11] = (unsigned int)expert_counts[expert_11_11];
                 }
                 __syncwarp();
                 unsigned int num_blocks = 0;
@@ -1135,137 +1135,137 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a(int* __restrict_
                 state[3] = 0;
                 state[4] = 0;
                 unsigned int block_offset = 0;
-                unsigned int tokens = counts[0];
-                unsigned int blocks = (tokens + 32 - 1) / 32;
-                uint32_t inclusive = blocks;
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive, 1, 32); if (lane >= 1) { inclusive += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive, 2, 32); if (lane >= 2) { inclusive += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive, 4, 32); if (lane >= 4) { inclusive += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive, 8, 32); if (lane >= 8) { inclusive += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive, 16, 32); if (lane >= 16) { inclusive += peer; } }
-                offsets[0] = block_offset + inclusive - blocks;
-                unsigned int _shfl_sync_3 = __shfl_sync(0xFFFFFFFF, inclusive, 31);
+                unsigned int tokens_1_0 = counts[0];
+                unsigned int blocks_1_0 = (tokens_1_0 + 32 - 1) / 32;
+                uint32_t inclusive_1_0 = blocks_1_0;
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_0, 1, 32); if (lane >= 1) { inclusive_1_0 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_0, 2, 32); if (lane >= 2) { inclusive_1_0 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_0, 4, 32); if (lane >= 4) { inclusive_1_0 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_0, 8, 32); if (lane >= 8) { inclusive_1_0 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_0, 16, 32); if (lane >= 16) { inclusive_1_0 += peer; } }
+                offsets[0] = block_offset + inclusive_1_0 - blocks_1_0;
+                unsigned int _shfl_sync_3 = __shfl_sync(0xFFFFFFFF, inclusive_1_0, 31);
                 block_offset += _shfl_sync_3;
-                unsigned int tokens_11 = counts[1];
-                unsigned int blocks_12 = (tokens_11 + 32 - 1) / 32;
-                uint32_t inclusive_13 = blocks_12;
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_13, 1, 32); if (lane >= 1) { inclusive_13 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_13, 2, 32); if (lane >= 2) { inclusive_13 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_13, 4, 32); if (lane >= 4) { inclusive_13 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_13, 8, 32); if (lane >= 8) { inclusive_13 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_13, 16, 32); if (lane >= 16) { inclusive_13 += peer; } }
-                offsets[1] = block_offset + inclusive_13 - blocks_12;
-                unsigned int _shfl_sync_4 = __shfl_sync(0xFFFFFFFF, inclusive_13, 31);
+                unsigned int tokens_1_1 = counts[1];
+                unsigned int blocks_1_1 = (tokens_1_1 + 32 - 1) / 32;
+                uint32_t inclusive_1_1 = blocks_1_1;
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_1, 1, 32); if (lane >= 1) { inclusive_1_1 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_1, 2, 32); if (lane >= 2) { inclusive_1_1 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_1, 4, 32); if (lane >= 4) { inclusive_1_1 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_1, 8, 32); if (lane >= 8) { inclusive_1_1 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_1, 16, 32); if (lane >= 16) { inclusive_1_1 += peer; } }
+                offsets[1] = block_offset + inclusive_1_1 - blocks_1_1;
+                unsigned int _shfl_sync_4 = __shfl_sync(0xFFFFFFFF, inclusive_1_1, 31);
                 block_offset += _shfl_sync_4;
-                unsigned int tokens_14 = counts[2];
-                unsigned int blocks_15 = (tokens_14 + 32 - 1) / 32;
-                uint32_t inclusive_16 = blocks_15;
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_16, 1, 32); if (lane >= 1) { inclusive_16 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_16, 2, 32); if (lane >= 2) { inclusive_16 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_16, 4, 32); if (lane >= 4) { inclusive_16 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_16, 8, 32); if (lane >= 8) { inclusive_16 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_16, 16, 32); if (lane >= 16) { inclusive_16 += peer; } }
-                offsets[2] = block_offset + inclusive_16 - blocks_15;
-                unsigned int _shfl_sync_5_1 = __shfl_sync(0xFFFFFFFF, inclusive_16, 31);
+                unsigned int tokens_1_2 = counts[2];
+                unsigned int blocks_1_2 = (tokens_1_2 + 32 - 1) / 32;
+                uint32_t inclusive_1_2 = blocks_1_2;
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_2, 1, 32); if (lane >= 1) { inclusive_1_2 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_2, 2, 32); if (lane >= 2) { inclusive_1_2 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_2, 4, 32); if (lane >= 4) { inclusive_1_2 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_2, 8, 32); if (lane >= 8) { inclusive_1_2 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_2, 16, 32); if (lane >= 16) { inclusive_1_2 += peer; } }
+                offsets[2] = block_offset + inclusive_1_2 - blocks_1_2;
+                unsigned int _shfl_sync_5_1 = __shfl_sync(0xFFFFFFFF, inclusive_1_2, 31);
                 block_offset += _shfl_sync_5_1;
-                unsigned int tokens_17 = counts[3];
-                unsigned int blocks_18 = (tokens_17 + 32 - 1) / 32;
-                uint32_t inclusive_19 = blocks_18;
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_19, 1, 32); if (lane >= 1) { inclusive_19 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_19, 2, 32); if (lane >= 2) { inclusive_19 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_19, 4, 32); if (lane >= 4) { inclusive_19 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_19, 8, 32); if (lane >= 8) { inclusive_19 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_19, 16, 32); if (lane >= 16) { inclusive_19 += peer; } }
-                offsets[3] = block_offset + inclusive_19 - blocks_18;
-                unsigned int _shfl_sync_6_1 = __shfl_sync(0xFFFFFFFF, inclusive_19, 31);
+                unsigned int tokens_1_3 = counts[3];
+                unsigned int blocks_1_3 = (tokens_1_3 + 32 - 1) / 32;
+                uint32_t inclusive_1_3 = blocks_1_3;
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_3, 1, 32); if (lane >= 1) { inclusive_1_3 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_3, 2, 32); if (lane >= 2) { inclusive_1_3 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_3, 4, 32); if (lane >= 4) { inclusive_1_3 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_3, 8, 32); if (lane >= 8) { inclusive_1_3 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_3, 16, 32); if (lane >= 16) { inclusive_1_3 += peer; } }
+                offsets[3] = block_offset + inclusive_1_3 - blocks_1_3;
+                unsigned int _shfl_sync_6_1 = __shfl_sync(0xFFFFFFFF, inclusive_1_3, 31);
                 block_offset += _shfl_sync_6_1;
-                unsigned int tokens_20 = counts[4];
-                unsigned int blocks_21 = (tokens_20 + 32 - 1) / 32;
-                uint32_t inclusive_22 = blocks_21;
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_22, 1, 32); if (lane >= 1) { inclusive_22 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_22, 2, 32); if (lane >= 2) { inclusive_22 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_22, 4, 32); if (lane >= 4) { inclusive_22 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_22, 8, 32); if (lane >= 8) { inclusive_22 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_22, 16, 32); if (lane >= 16) { inclusive_22 += peer; } }
-                offsets[4] = block_offset + inclusive_22 - blocks_21;
-                unsigned int _shfl_sync_7 = __shfl_sync(0xFFFFFFFF, inclusive_22, 31);
+                unsigned int tokens_1_4 = counts[4];
+                unsigned int blocks_1_4 = (tokens_1_4 + 32 - 1) / 32;
+                uint32_t inclusive_1_4 = blocks_1_4;
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_4, 1, 32); if (lane >= 1) { inclusive_1_4 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_4, 2, 32); if (lane >= 2) { inclusive_1_4 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_4, 4, 32); if (lane >= 4) { inclusive_1_4 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_4, 8, 32); if (lane >= 8) { inclusive_1_4 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_4, 16, 32); if (lane >= 16) { inclusive_1_4 += peer; } }
+                offsets[4] = block_offset + inclusive_1_4 - blocks_1_4;
+                unsigned int _shfl_sync_7 = __shfl_sync(0xFFFFFFFF, inclusive_1_4, 31);
                 block_offset += _shfl_sync_7;
-                unsigned int tokens_23 = counts[5];
-                unsigned int blocks_24 = (tokens_23 + 32 - 1) / 32;
-                uint32_t inclusive_25 = blocks_24;
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_25, 1, 32); if (lane >= 1) { inclusive_25 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_25, 2, 32); if (lane >= 2) { inclusive_25 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_25, 4, 32); if (lane >= 4) { inclusive_25 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_25, 8, 32); if (lane >= 8) { inclusive_25 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_25, 16, 32); if (lane >= 16) { inclusive_25 += peer; } }
-                offsets[5] = block_offset + inclusive_25 - blocks_24;
-                unsigned int _shfl_sync_8 = __shfl_sync(0xFFFFFFFF, inclusive_25, 31);
+                unsigned int tokens_1_5 = counts[5];
+                unsigned int blocks_1_5 = (tokens_1_5 + 32 - 1) / 32;
+                uint32_t inclusive_1_5 = blocks_1_5;
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_5, 1, 32); if (lane >= 1) { inclusive_1_5 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_5, 2, 32); if (lane >= 2) { inclusive_1_5 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_5, 4, 32); if (lane >= 4) { inclusive_1_5 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_5, 8, 32); if (lane >= 8) { inclusive_1_5 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_5, 16, 32); if (lane >= 16) { inclusive_1_5 += peer; } }
+                offsets[5] = block_offset + inclusive_1_5 - blocks_1_5;
+                unsigned int _shfl_sync_8 = __shfl_sync(0xFFFFFFFF, inclusive_1_5, 31);
                 block_offset += _shfl_sync_8;
-                unsigned int tokens_26 = counts[6];
-                unsigned int blocks_27 = (tokens_26 + 32 - 1) / 32;
-                uint32_t inclusive_28 = blocks_27;
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_28, 1, 32); if (lane >= 1) { inclusive_28 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_28, 2, 32); if (lane >= 2) { inclusive_28 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_28, 4, 32); if (lane >= 4) { inclusive_28 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_28, 8, 32); if (lane >= 8) { inclusive_28 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_28, 16, 32); if (lane >= 16) { inclusive_28 += peer; } }
-                offsets[6] = block_offset + inclusive_28 - blocks_27;
-                unsigned int _shfl_sync_9 = __shfl_sync(0xFFFFFFFF, inclusive_28, 31);
+                unsigned int tokens_1_6 = counts[6];
+                unsigned int blocks_1_6 = (tokens_1_6 + 32 - 1) / 32;
+                uint32_t inclusive_1_6 = blocks_1_6;
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_6, 1, 32); if (lane >= 1) { inclusive_1_6 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_6, 2, 32); if (lane >= 2) { inclusive_1_6 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_6, 4, 32); if (lane >= 4) { inclusive_1_6 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_6, 8, 32); if (lane >= 8) { inclusive_1_6 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_6, 16, 32); if (lane >= 16) { inclusive_1_6 += peer; } }
+                offsets[6] = block_offset + inclusive_1_6 - blocks_1_6;
+                unsigned int _shfl_sync_9 = __shfl_sync(0xFFFFFFFF, inclusive_1_6, 31);
                 block_offset += _shfl_sync_9;
-                unsigned int tokens_29 = counts[7];
-                unsigned int blocks_30 = (tokens_29 + 32 - 1) / 32;
-                uint32_t inclusive_31 = blocks_30;
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_31, 1, 32); if (lane >= 1) { inclusive_31 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_31, 2, 32); if (lane >= 2) { inclusive_31 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_31, 4, 32); if (lane >= 4) { inclusive_31 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_31, 8, 32); if (lane >= 8) { inclusive_31 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_31, 16, 32); if (lane >= 16) { inclusive_31 += peer; } }
-                offsets[7] = block_offset + inclusive_31 - blocks_30;
-                unsigned int _shfl_sync_10 = __shfl_sync(0xFFFFFFFF, inclusive_31, 31);
+                unsigned int tokens_1_7 = counts[7];
+                unsigned int blocks_1_7 = (tokens_1_7 + 32 - 1) / 32;
+                uint32_t inclusive_1_7 = blocks_1_7;
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_7, 1, 32); if (lane >= 1) { inclusive_1_7 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_7, 2, 32); if (lane >= 2) { inclusive_1_7 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_7, 4, 32); if (lane >= 4) { inclusive_1_7 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_7, 8, 32); if (lane >= 8) { inclusive_1_7 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_7, 16, 32); if (lane >= 16) { inclusive_1_7 += peer; } }
+                offsets[7] = block_offset + inclusive_1_7 - blocks_1_7;
+                unsigned int _shfl_sync_10 = __shfl_sync(0xFFFFFFFF, inclusive_1_7, 31);
                 block_offset += _shfl_sync_10;
-                unsigned int tokens_32 = counts[8];
-                unsigned int blocks_33 = (tokens_32 + 32 - 1) / 32;
-                uint32_t inclusive_34 = blocks_33;
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_34, 1, 32); if (lane >= 1) { inclusive_34 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_34, 2, 32); if (lane >= 2) { inclusive_34 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_34, 4, 32); if (lane >= 4) { inclusive_34 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_34, 8, 32); if (lane >= 8) { inclusive_34 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_34, 16, 32); if (lane >= 16) { inclusive_34 += peer; } }
-                offsets[8] = block_offset + inclusive_34 - blocks_33;
-                unsigned int _shfl_sync_11 = __shfl_sync(0xFFFFFFFF, inclusive_34, 31);
+                unsigned int tokens_1_8 = counts[8];
+                unsigned int blocks_1_8 = (tokens_1_8 + 32 - 1) / 32;
+                uint32_t inclusive_1_8 = blocks_1_8;
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_8, 1, 32); if (lane >= 1) { inclusive_1_8 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_8, 2, 32); if (lane >= 2) { inclusive_1_8 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_8, 4, 32); if (lane >= 4) { inclusive_1_8 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_8, 8, 32); if (lane >= 8) { inclusive_1_8 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_8, 16, 32); if (lane >= 16) { inclusive_1_8 += peer; } }
+                offsets[8] = block_offset + inclusive_1_8 - blocks_1_8;
+                unsigned int _shfl_sync_11 = __shfl_sync(0xFFFFFFFF, inclusive_1_8, 31);
                 block_offset += _shfl_sync_11;
-                unsigned int tokens_35 = counts[9];
-                unsigned int blocks_36 = (tokens_35 + 32 - 1) / 32;
-                uint32_t inclusive_37 = blocks_36;
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_37, 1, 32); if (lane >= 1) { inclusive_37 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_37, 2, 32); if (lane >= 2) { inclusive_37 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_37, 4, 32); if (lane >= 4) { inclusive_37 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_37, 8, 32); if (lane >= 8) { inclusive_37 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_37, 16, 32); if (lane >= 16) { inclusive_37 += peer; } }
-                offsets[9] = block_offset + inclusive_37 - blocks_36;
-                unsigned int _shfl_sync_12 = __shfl_sync(0xFFFFFFFF, inclusive_37, 31);
+                unsigned int tokens_1_9 = counts[9];
+                unsigned int blocks_1_9 = (tokens_1_9 + 32 - 1) / 32;
+                uint32_t inclusive_1_9 = blocks_1_9;
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_9, 1, 32); if (lane >= 1) { inclusive_1_9 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_9, 2, 32); if (lane >= 2) { inclusive_1_9 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_9, 4, 32); if (lane >= 4) { inclusive_1_9 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_9, 8, 32); if (lane >= 8) { inclusive_1_9 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_9, 16, 32); if (lane >= 16) { inclusive_1_9 += peer; } }
+                offsets[9] = block_offset + inclusive_1_9 - blocks_1_9;
+                unsigned int _shfl_sync_12 = __shfl_sync(0xFFFFFFFF, inclusive_1_9, 31);
                 block_offset += _shfl_sync_12;
-                unsigned int tokens_38 = counts[10];
-                unsigned int blocks_39 = (tokens_38 + 32 - 1) / 32;
-                uint32_t inclusive_40 = blocks_39;
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_40, 1, 32); if (lane >= 1) { inclusive_40 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_40, 2, 32); if (lane >= 2) { inclusive_40 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_40, 4, 32); if (lane >= 4) { inclusive_40 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_40, 8, 32); if (lane >= 8) { inclusive_40 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_40, 16, 32); if (lane >= 16) { inclusive_40 += peer; } }
-                offsets[10] = block_offset + inclusive_40 - blocks_39;
-                unsigned int _shfl_sync_13 = __shfl_sync(0xFFFFFFFF, inclusive_40, 31);
+                unsigned int tokens_1_10 = counts[10];
+                unsigned int blocks_1_10 = (tokens_1_10 + 32 - 1) / 32;
+                uint32_t inclusive_1_10 = blocks_1_10;
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_10, 1, 32); if (lane >= 1) { inclusive_1_10 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_10, 2, 32); if (lane >= 2) { inclusive_1_10 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_10, 4, 32); if (lane >= 4) { inclusive_1_10 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_10, 8, 32); if (lane >= 8) { inclusive_1_10 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_10, 16, 32); if (lane >= 16) { inclusive_1_10 += peer; } }
+                offsets[10] = block_offset + inclusive_1_10 - blocks_1_10;
+                unsigned int _shfl_sync_13 = __shfl_sync(0xFFFFFFFF, inclusive_1_10, 31);
                 block_offset += _shfl_sync_13;
-                unsigned int tokens_41 = counts[11];
-                unsigned int blocks_42 = (tokens_41 + 32 - 1) / 32;
-                uint32_t inclusive_43 = blocks_42;
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_43, 1, 32); if (lane >= 1) { inclusive_43 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_43, 2, 32); if (lane >= 2) { inclusive_43 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_43, 4, 32); if (lane >= 4) { inclusive_43 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_43, 8, 32); if (lane >= 8) { inclusive_43 += peer; } }
-                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_43, 16, 32); if (lane >= 16) { inclusive_43 += peer; } }
-                offsets[11] = block_offset + inclusive_43 - blocks_42;
-                unsigned int _shfl_sync_14 = __shfl_sync(0xFFFFFFFF, inclusive_43, 31);
+                unsigned int tokens_1_11 = counts[11];
+                unsigned int blocks_1_11 = (tokens_1_11 + 32 - 1) / 32;
+                uint32_t inclusive_1_11 = blocks_1_11;
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_11, 1, 32); if (lane >= 1) { inclusive_1_11 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_11, 2, 32); if (lane >= 2) { inclusive_1_11 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_11, 4, 32); if (lane >= 4) { inclusive_1_11 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_11, 8, 32); if (lane >= 8) { inclusive_1_11 += peer; } }
+                { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive_1_11, 16, 32); if (lane >= 16) { inclusive_1_11 += peer; } }
+                offsets[11] = block_offset + inclusive_1_11 - blocks_1_11;
+                unsigned int _shfl_sync_14 = __shfl_sync(0xFFFFFFFF, inclusive_1_11, 31);
                 block_offset += _shfl_sync_14;
                 #pragma unroll 1
                 for (int iteration = 0; iteration < 13249; iteration++) {
@@ -1753,19 +1753,19 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a(int* __restrict_
                                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                                     :: "r"((tmem_empty_addr + (accum_stage_1) * 8) & 0xFEFFFFFF) : "memory");
                             }
-                            __nv_bfloat162 _bf16x2_0 = __float22bfloat162_rn(make_float2(_tmem_load_0[0], _tmem_load_0[1]));
-                            __nv_bfloat162 _bf16x2_1 = __float22bfloat162_rn(make_float2(_tmem_load_0[2], _tmem_load_0[3]));
-                            __nv_bfloat162 _bf16x2_2 = __float22bfloat162_rn(make_float2(10.0f, 10.0f));
-                            __nv_bfloat162 _bf16x2_3 = __float22bfloat162_rn(make_float2(-10.0f, -10.0f));
-                            __nv_bfloat162 _min_0 = __hmin2(_bf16x2_0, _bf16x2_2);
-                            __nv_bfloat162 _min_1_1 = __hmin2(__hmax2(_bf16x2_1, _bf16x2_3), _bf16x2_2);
-                            float2 _cvt_f32_0 = cake_bf16x2_to_f32x2(_min_0);
-                            float2 _cvt_f32_1 = cake_bf16x2_to_f32x2(_min_1_1);
+                            __nv_bfloat162 bf16x2 = __float22bfloat162_rn(make_float2(_tmem_load_0[0], _tmem_load_0[1]));
+                            __nv_bfloat162 bf16x2_1 = __float22bfloat162_rn(make_float2(_tmem_load_0[2], _tmem_load_0[3]));
+                            __nv_bfloat162 bf16x2_2 = __float22bfloat162_rn(make_float2(10.0f, 10.0f));
+                            __nv_bfloat162 bf16x2_3 = __float22bfloat162_rn(make_float2(-10.0f, -10.0f));
+                            __nv_bfloat162 min_1 = __hmin2(bf16x2, bf16x2_2);
+                            __nv_bfloat162 min_2 = __hmin2(__hmax2(bf16x2_1, bf16x2_3), bf16x2_2);
+                            float2 cvt_f32 = cake_bf16x2_to_f32x2(min_1);
+                            float2 cvt_f32_1 = cake_bf16x2_to_f32x2(min_2);
                             float denominator[2];
                             float2 activated_gate;
-                            float _exp_0 = __expf(-_cvt_f32_0.x);
+                            float _exp_0 = __expf(-cvt_f32.x);
                             denominator[0] = _exp_0;
-                            float _exp_1 = __expf(-_cvt_f32_0.y);
+                            float _exp_1 = __expf(-cvt_f32.y);
                             denominator[1] = _exp_1;
                             const float2 _add2_2 = {1.0f, 1.0f};
                             #pragma unroll
@@ -1774,27 +1774,27 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a(int* __restrict_
                             }
                             float _rcp_3 = approx_rcp(denominator[0]);
                             float _rcp_4 = approx_rcp(denominator[1]);
-                            activated_gate = mul_f32x2_noftz(_cvt_f32_0, make_float2(_rcp_3, _rcp_4));
+                            activated_gate = mul_f32x2_noftz(cvt_f32, make_float2(_rcp_3, _rcp_4));
                             float2 gated_up;
-                            asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&gated_up) : "l"(*(const unsigned long long*)&activated_gate), "l"(*(const unsigned long long*)&_cvt_f32_1));
+                            asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&gated_up) : "l"(*(const unsigned long long*)&activated_gate), "l"(*(const unsigned long long*)&cvt_f32_1));
                             float2 _f32x2_mul_b_5 = make_float2(first_weight, second_weight);
                             float2 activated;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&activated) : "l"(*(const unsigned long long*)&gated_up), "l"(*(const unsigned long long*)&_f32x2_mul_b_5));
                             activation[i_2 * 4] = activated.x;
                             activation[i_2 * 4 + 1] = activated.y;
-                            __nv_bfloat162 _bf16x2_4 = __float22bfloat162_rn(make_float2(_tmem_load_1[0], _tmem_load_1[1]));
-                            __nv_bfloat162 _bf16x2_5 = __float22bfloat162_rn(make_float2(_tmem_load_1[2], _tmem_load_1[3]));
-                            __nv_bfloat162 _bf16x2_6 = __float22bfloat162_rn(make_float2(10.0f, 10.0f));
-                            __nv_bfloat162 _bf16x2_7 = __float22bfloat162_rn(make_float2(-10.0f, -10.0f));
-                            __nv_bfloat162 _min_2 = __hmin2(_bf16x2_4, _bf16x2_6);
-                            __nv_bfloat162 _min_3 = __hmin2(__hmax2(_bf16x2_5, _bf16x2_7), _bf16x2_6);
-                            float2 _cvt_f32_2 = cake_bf16x2_to_f32x2(_min_2);
-                            float2 _cvt_f32_3 = cake_bf16x2_to_f32x2(_min_3);
+                            __nv_bfloat162 bf16x2_0 = __float22bfloat162_rn(make_float2(_tmem_load_1[0], _tmem_load_1[1]));
+                            __nv_bfloat162 bf16x2_1_0 = __float22bfloat162_rn(make_float2(_tmem_load_1[2], _tmem_load_1[3]));
+                            __nv_bfloat162 bf16x2_2_0 = __float22bfloat162_rn(make_float2(10.0f, 10.0f));
+                            __nv_bfloat162 bf16x2_3_0 = __float22bfloat162_rn(make_float2(-10.0f, -10.0f));
+                            __nv_bfloat162 min_1_0 = __hmin2(bf16x2_0, bf16x2_2_0);
+                            __nv_bfloat162 min_2_0 = __hmin2(__hmax2(bf16x2_1_0, bf16x2_3_0), bf16x2_2_0);
+                            float2 cvt_f32_0 = cake_bf16x2_to_f32x2(min_1_0);
+                            float2 cvt_f32_1_0 = cake_bf16x2_to_f32x2(min_2_0);
                             float denominator_0[2];
-                            float2 activated_gate_1;
-                            float _exp_6 = __expf(-_cvt_f32_2.x);
+                            float2 activated_gate_0;
+                            float _exp_6 = __expf(-cvt_f32_0.x);
                             denominator_0[0] = _exp_6;
-                            float _exp_7 = __expf(-_cvt_f32_2.y);
+                            float _exp_7 = __expf(-cvt_f32_0.y);
                             denominator_0[1] = _exp_7;
                             const float2 _add2_8 = {1.0f, 1.0f};
                             #pragma unroll
@@ -1803,14 +1803,14 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t1024_sm103a(int* __restrict_
                             }
                             float _rcp_9 = approx_rcp(denominator_0[0]);
                             float _rcp_10 = approx_rcp(denominator_0[1]);
-                            activated_gate_1 = mul_f32x2_noftz(_cvt_f32_2, make_float2(_rcp_9, _rcp_10));
-                            float2 gated_up_2;
-                            asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&gated_up_2) : "l"(*(const unsigned long long*)&activated_gate_1), "l"(*(const unsigned long long*)&_cvt_f32_3));
+                            activated_gate_0 = mul_f32x2_noftz(cvt_f32_0, make_float2(_rcp_9, _rcp_10));
+                            float2 gated_up_0;
+                            asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&gated_up_0) : "l"(*(const unsigned long long*)&activated_gate_0), "l"(*(const unsigned long long*)&cvt_f32_1_0));
                             float2 _f32x2_mul_b_11 = make_float2(first_weight, second_weight);
-                            float2 activated_3;
-                            asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&activated_3) : "l"(*(const unsigned long long*)&gated_up_2), "l"(*(const unsigned long long*)&_f32x2_mul_b_11));
-                            activation[i_2 * 4 + 2] = activated_3.x;
-                            activation[i_2 * 4 + 3] = activated_3.y;
+                            float2 activated_0;
+                            asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&activated_0) : "l"(*(const unsigned long long*)&gated_up_0), "l"(*(const unsigned long long*)&_f32x2_mul_b_11));
+                            activation[i_2 * 4 + 2] = activated_0.x;
+                            activation[i_2 * 4 + 3] = activated_0.y;
                             float first_max;
                             asm("max.f32 %0, %1, %2;" : "=f"(first_max) : "f"(fabsf(activation[i_2 * 4])), "f"(fabsf(activation[i_2 * 4 + 2])));
                             float second_max;

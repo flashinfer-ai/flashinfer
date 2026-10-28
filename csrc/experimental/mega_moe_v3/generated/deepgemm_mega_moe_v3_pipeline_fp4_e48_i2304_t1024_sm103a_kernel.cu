@@ -984,15 +984,15 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1024_sm103a(int* __restrict_
                     } while (((_wait_acquire_mask_2 ^ static_cast<unsigned int>(sched_ticket ^ sched_tag)) & static_cast<unsigned int>(sched_tag)) != 0);
                 }
                 __syncwarp();
-                unsigned int expert_1 = lane;
+                unsigned int expert_1_0 = lane;
                 counts[0] = 0;
-                if (expert_1 < 48) {
-                    counts[0] = (unsigned int)expert_counts[expert_1];
+                if (expert_1_0 < 48) {
+                    counts[0] = (unsigned int)expert_counts[expert_1_0];
                 }
-                unsigned int expert_0 = 32 + lane;
+                unsigned int expert_1_1 = 32 + lane;
                 counts[1] = 0;
-                if (expert_0 < 48) {
-                    counts[1] = (unsigned int)expert_counts[expert_0];
+                if (expert_1_1 < 48) {
+                    counts[1] = (unsigned int)expert_counts[expert_1_1];
                 }
                 __syncwarp();
                 unsigned int num_blocks = 0;
@@ -1070,7 +1070,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1024_sm103a(int* __restrict_
                         task_3[6] = shape_n;
                         task_3[7] = shape_k;
                         unsigned int block_offset = 0;
-                        unsigned int expert_1_1 = lane;
+                        unsigned int expert_1 = lane;
                         unsigned int tokens = counts[0];
                         unsigned int blocks = (tokens + 32 - 1) / 32;
                         uint32_t inclusive = blocks;
@@ -1080,13 +1080,13 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1024_sm103a(int* __restrict_
                         { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive, 8, 32); if (lane >= 8) { inclusive += peer; } }
                         { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, inclusive, 16, 32); if (lane >= 16) { inclusive += peer; } }
                         unsigned int lane_offset = block_offset + inclusive - blocks;
-                        unsigned int owner_mask = __ballot_sync(0xFFFFFFFF, expert_1_1 < 48 && (pool_block >= lane_offset && pool_block < lane_offset + blocks));
+                        unsigned int owner_mask = __ballot_sync(0xFFFFFFFF, expert_1 < 48 && (pool_block >= lane_offset && pool_block < lane_offset + blocks));
                         if (owner_mask != 0) {
                             int _find_first_set_7 = __ffs(owner_mask);
                             unsigned int owner_lane = _find_first_set_7 - 1;
                             unsigned int local_block = pool_block - lane_offset;
                             unsigned int valid = ((tokens - local_block * 32) < (32) ? (tokens - local_block * 32) : (32));
-                            unsigned int _shfl_sync_8 = __shfl_sync(0xFFFFFFFF, expert_1_1, owner_lane);
+                            unsigned int _shfl_sync_8 = __shfl_sync(0xFFFFFFFF, expert_1, owner_lane);
                             task_3[1] = _shfl_sync_8;
                             unsigned int _shfl_sync_9 = __shfl_sync(0xFFFFFFFF, local_block, owner_lane);
                             task_3[2] = _shfl_sync_9;
@@ -1290,19 +1290,19 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1024_sm103a(int* __restrict_
                                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                                     :: "r"((tmem_empty_addr + (accum_stage_1) * 8) & 0xFEFFFFFF) : "memory");
                             }
-                            __nv_bfloat162 _bf16x2_0 = __float22bfloat162_rn(make_float2(_tmem_load_0[0], _tmem_load_0[1]));
-                            __nv_bfloat162 _bf16x2_1 = __float22bfloat162_rn(make_float2(_tmem_load_0[2], _tmem_load_0[3]));
-                            __nv_bfloat162 _bf16x2_2 = __float22bfloat162_rn(make_float2(10.0f, 10.0f));
-                            __nv_bfloat162 _bf16x2_3 = __float22bfloat162_rn(make_float2(-10.0f, -10.0f));
-                            __nv_bfloat162 _min_0 = __hmin2(_bf16x2_0, _bf16x2_2);
-                            __nv_bfloat162 _min_1_1 = __hmin2(__hmax2(_bf16x2_1, _bf16x2_3), _bf16x2_2);
-                            float2 _cvt_f32_0 = cake_bf16x2_to_f32x2(_min_0);
-                            float2 _cvt_f32_1 = cake_bf16x2_to_f32x2(_min_1_1);
+                            __nv_bfloat162 bf16x2 = __float22bfloat162_rn(make_float2(_tmem_load_0[0], _tmem_load_0[1]));
+                            __nv_bfloat162 bf16x2_1 = __float22bfloat162_rn(make_float2(_tmem_load_0[2], _tmem_load_0[3]));
+                            __nv_bfloat162 bf16x2_2 = __float22bfloat162_rn(make_float2(10.0f, 10.0f));
+                            __nv_bfloat162 bf16x2_3 = __float22bfloat162_rn(make_float2(-10.0f, -10.0f));
+                            __nv_bfloat162 min_1 = __hmin2(bf16x2, bf16x2_2);
+                            __nv_bfloat162 min_2 = __hmin2(__hmax2(bf16x2_1, bf16x2_3), bf16x2_2);
+                            float2 cvt_f32 = cake_bf16x2_to_f32x2(min_1);
+                            float2 cvt_f32_1 = cake_bf16x2_to_f32x2(min_2);
                             float denominator[2];
                             float2 activated_gate;
-                            float _exp_0 = __expf(-_cvt_f32_0.x);
+                            float _exp_0 = __expf(-cvt_f32.x);
                             denominator[0] = _exp_0;
-                            float _exp_1 = __expf(-_cvt_f32_0.y);
+                            float _exp_1 = __expf(-cvt_f32.y);
                             denominator[1] = _exp_1;
                             const float2 _add2_2 = {1.0f, 1.0f};
                             #pragma unroll
@@ -1311,27 +1311,27 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1024_sm103a(int* __restrict_
                             }
                             float _rcp_3 = approx_rcp(denominator[0]);
                             float _rcp_4 = approx_rcp(denominator[1]);
-                            activated_gate = mul_f32x2_noftz(_cvt_f32_0, make_float2(_rcp_3, _rcp_4));
+                            activated_gate = mul_f32x2_noftz(cvt_f32, make_float2(_rcp_3, _rcp_4));
                             float2 gated_up;
-                            asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&gated_up) : "l"(*(const unsigned long long*)&activated_gate), "l"(*(const unsigned long long*)&_cvt_f32_1));
+                            asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&gated_up) : "l"(*(const unsigned long long*)&activated_gate), "l"(*(const unsigned long long*)&cvt_f32_1));
                             float2 _f32x2_mul_b_5 = make_float2(first_weight, second_weight);
                             float2 activated;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&activated) : "l"(*(const unsigned long long*)&gated_up), "l"(*(const unsigned long long*)&_f32x2_mul_b_5));
                             activation[i_2 * 4] = activated.x;
                             activation[i_2 * 4 + 1] = activated.y;
-                            __nv_bfloat162 _bf16x2_4 = __float22bfloat162_rn(make_float2(_tmem_load_1[0], _tmem_load_1[1]));
-                            __nv_bfloat162 _bf16x2_5 = __float22bfloat162_rn(make_float2(_tmem_load_1[2], _tmem_load_1[3]));
-                            __nv_bfloat162 _bf16x2_6 = __float22bfloat162_rn(make_float2(10.0f, 10.0f));
-                            __nv_bfloat162 _bf16x2_7 = __float22bfloat162_rn(make_float2(-10.0f, -10.0f));
-                            __nv_bfloat162 _min_2 = __hmin2(_bf16x2_4, _bf16x2_6);
-                            __nv_bfloat162 _min_3 = __hmin2(__hmax2(_bf16x2_5, _bf16x2_7), _bf16x2_6);
-                            float2 _cvt_f32_2 = cake_bf16x2_to_f32x2(_min_2);
-                            float2 _cvt_f32_3 = cake_bf16x2_to_f32x2(_min_3);
+                            __nv_bfloat162 bf16x2_0 = __float22bfloat162_rn(make_float2(_tmem_load_1[0], _tmem_load_1[1]));
+                            __nv_bfloat162 bf16x2_1_0 = __float22bfloat162_rn(make_float2(_tmem_load_1[2], _tmem_load_1[3]));
+                            __nv_bfloat162 bf16x2_2_0 = __float22bfloat162_rn(make_float2(10.0f, 10.0f));
+                            __nv_bfloat162 bf16x2_3_0 = __float22bfloat162_rn(make_float2(-10.0f, -10.0f));
+                            __nv_bfloat162 min_1_0 = __hmin2(bf16x2_0, bf16x2_2_0);
+                            __nv_bfloat162 min_2_0 = __hmin2(__hmax2(bf16x2_1_0, bf16x2_3_0), bf16x2_2_0);
+                            float2 cvt_f32_0 = cake_bf16x2_to_f32x2(min_1_0);
+                            float2 cvt_f32_1_0 = cake_bf16x2_to_f32x2(min_2_0);
                             float denominator_0[2];
-                            float2 activated_gate_1;
-                            float _exp_6 = __expf(-_cvt_f32_2.x);
+                            float2 activated_gate_0;
+                            float _exp_6 = __expf(-cvt_f32_0.x);
                             denominator_0[0] = _exp_6;
-                            float _exp_7 = __expf(-_cvt_f32_2.y);
+                            float _exp_7 = __expf(-cvt_f32_0.y);
                             denominator_0[1] = _exp_7;
                             const float2 _add2_8 = {1.0f, 1.0f};
                             #pragma unroll
@@ -1340,14 +1340,14 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t1024_sm103a(int* __restrict_
                             }
                             float _rcp_9 = approx_rcp(denominator_0[0]);
                             float _rcp_10 = approx_rcp(denominator_0[1]);
-                            activated_gate_1 = mul_f32x2_noftz(_cvt_f32_2, make_float2(_rcp_9, _rcp_10));
-                            float2 gated_up_2;
-                            asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&gated_up_2) : "l"(*(const unsigned long long*)&activated_gate_1), "l"(*(const unsigned long long*)&_cvt_f32_3));
+                            activated_gate_0 = mul_f32x2_noftz(cvt_f32_0, make_float2(_rcp_9, _rcp_10));
+                            float2 gated_up_0;
+                            asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&gated_up_0) : "l"(*(const unsigned long long*)&activated_gate_0), "l"(*(const unsigned long long*)&cvt_f32_1_0));
                             float2 _f32x2_mul_b_11 = make_float2(first_weight, second_weight);
-                            float2 activated_3;
-                            asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&activated_3) : "l"(*(const unsigned long long*)&gated_up_2), "l"(*(const unsigned long long*)&_f32x2_mul_b_11));
-                            activation[i_2 * 4 + 2] = activated_3.x;
-                            activation[i_2 * 4 + 3] = activated_3.y;
+                            float2 activated_0;
+                            asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&activated_0) : "l"(*(const unsigned long long*)&gated_up_0), "l"(*(const unsigned long long*)&_f32x2_mul_b_11));
+                            activation[i_2 * 4 + 2] = activated_0.x;
+                            activation[i_2 * 4 + 3] = activated_0.y;
                             float first_max;
                             asm("max.f32 %0, %1, %2;" : "=f"(first_max) : "f"(fabsf(activation[i_2 * 4])), "f"(fabsf(activation[i_2 * 4 + 2])));
                             float second_max;
