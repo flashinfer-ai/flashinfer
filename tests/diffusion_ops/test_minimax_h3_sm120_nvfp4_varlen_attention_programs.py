@@ -407,31 +407,38 @@ def test_fused_plans_take_the_overlapped_form_on_the_overlap_sm_counts(
 
 
 @pytest.mark.parametrize(
-    ("bounds", "num_sms", "delta_overlaps"),
+    ("bounds", "num_sms", "delta_overlaps", "nodelta_overlaps"),
     [
-        ((0, 16385), 170, True),
-        ((0, 16385), 188, True),
-        ((0, 5000, 5000, 21000, 21129), 170, True),
-        ((0, 5000, 5000, 21000, 21129), 188, True),
-        ((0, 8368, 16736, 25104, 33472), 170, True),
-        ((0, 8368, 16736, 25104, 33472), 188, True),
-        ((0, 33472), 170, True),
-        ((0, 33472), 188, True),
-        # the compensated route overlaps every long plan on 170 and 188 SMs
-        ((0, 36864), 188, True),
-        ((0, 36865), 188, True),
-        ((0, 38592), 188, True),
-        ((0, 38592), 170, True),
-        ((0, 40960), 170, True),
-        ((0, 40961), 170, True),
-        ((0, 48768), 170, True),
-        ((0, 48768), 188, True),
-        ((0, 109901, 109952), 170, True),
-        ((0, 109901, 109952), 188, True),
+        ((0, 16385), 170, True, True),
+        ((0, 16385), 188, True, True),
+        ((0, 5000, 5000, 21000, 21129), 170, True, True),
+        ((0, 5000, 5000, 21000, 21129), 188, True, True),
+        ((0, 8368, 16736, 25104, 33472), 170, True, True),
+        ((0, 8368, 16736, 25104, 33472), 188, True, True),
+        ((0, 33472), 170, True, True),
+        ((0, 33472), 188, True, True),
+        # the compensated route overlaps every long plan on 170 and 188 SMs; on 188 SMs the uncompensated route
+        # overlaps up to an attention-weighted mean segment of 40960 tokens
+        ((0, 36864), 188, True, True),
+        ((0, 36865), 188, True, True),
+        ((0, 38592), 188, True, True),
+        ((0, 38592), 170, True, True),
+        ((0, 40960), 170, True, True),
+        ((0, 40960), 188, True, True),
+        ((0, 40961), 170, True, True),
+        ((0, 40961), 188, True, False),
+        ((0, 48768), 170, True, True),
+        ((0, 48768), 188, True, False),
+        ((0, 109901, 109952), 170, True, True),
+        ((0, 109901, 109952), 188, True, False),
+        # a plan whose separate launches would not take the warp-specialised attention (mean segment, empty
+        # segments included, below 1536 tokens) keeps the overlap
+        ((0,) * 33 + (49152,), 188, True, True),
+        ((0,) * 32 + (49152,), 188, True, False),
     ],
 )
 def test_long_plans_take_the_overlapped_form_below_the_segment_bound(
-    bounds, num_sms, delta_overlaps
+    bounds, num_sms, delta_overlaps, nodelta_overlaps
 ) -> None:
     plan = _plan(bounds)
     programs = ops.minimax_h3_sm120_nvfp4_programs(plan, num_sms)
@@ -439,10 +446,11 @@ def test_long_plans_take_the_overlapped_form_below_the_segment_bound(
         assert programs == OVERLAP
     else:
         assert programs == (STATS, QUANTIZE_KV_HBLK64, ATTENTION)
-    # the uncompensated route overlaps every long plan
-    assert ops.minimax_h3_sm120_nvfp4_programs(plan, num_sms, delta=False) == (
-        OVERLAP_NODELTA
-    )
+    programs = ops.minimax_h3_sm120_nvfp4_programs(plan, num_sms, delta=False)
+    if nodelta_overlaps:
+        assert programs == OVERLAP_NODELTA
+    else:
+        assert programs == (STATS, QUANTIZE_KV_HBLK64, ATTENTION_WS_NODELTA)
     # an SM count without an overlap width keeps the separate launches
     for delta in (True, False):
         assert PREPROCESS_HEAD_MAJOR not in ops.minimax_h3_sm120_nvfp4_programs(
