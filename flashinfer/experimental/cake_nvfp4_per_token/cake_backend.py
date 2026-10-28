@@ -57,10 +57,11 @@ package.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, NamedTuple, Optional
 
 import functools
+import math
 
 import torch
 import tvm_ffi
@@ -358,6 +359,9 @@ class QuantizePlan:
     padded_cols: int
     kernel_key: str
     cluster_split: int = 1  # CTAs per token row (one cluster of that many CTAs)
+    # The key the planner selected when ``arch`` does not register it and the plan runs
+    # the nearest registered program instead (None: the plan runs its own program).
+    unregistered_key: Optional[str] = None
 
 
 def static_k_for(k: int, m: int, x_row_stride: Optional[int] = None) -> Optional[int]:
@@ -453,7 +457,7 @@ def quant_plan(
             -(-8 * cols // (CLUSTER_SPLIT_PAD_CHUNKS * split)) if m % ROW_TILE else 0
         )
         grid = (m + pad_clusters) * split
-    return QuantizePlan(
+    plan = QuantizePlan(
         arch=arch,
         sm_count=int(sm_count),
         M=m,
@@ -479,6 +483,76 @@ def quant_plan(
             split,
         ),
         cluster_split=split,
+    )
+    if plan.kernel_key in KERNELS.get(arch, {}):
+        return plan
+    contiguous = m == 1 or x_row_stride is None or x_row_stride == k
+    return _registered_quant_plan(plan, contiguous)
+
+
+def _quant_shape_of_key(
+    key: str,
+) -> Optional[tuple[int, int, int, bool, bool, str, Optional[int]]]:
+    """``(threads, blocks_per_thread, min_blocks, is_bf16, fold, store_hint, k_static)`` of
+    a one-CTA-per-row quantizer key of :func:`quant_kernel_key`, else ``None``."""
+    head = key.removeprefix("quant:").split("_")
+    if not key.startswith("quant:") or len(head) < 4:
+        return None
+    t, b, mb, dtype, *rest = head
+    if not (t[1:].isdigit() and b[1:].isdigit() and mb[2:].isdigit()):
+        return None
+    k_static = next((int(p[1:]) for p in rest if p[1:].isdigit()), None)
+    hint = STORE_HINT_LARGE_ROW if "sl" in rest else STORE_HINT_DEFAULT
+    shape = (int(t[1:]), int(b[1:]), int(mb[2:]), dtype == "bf16", "fold" in rest)
+    if quant_kernel_key(*shape, hint, k_static) != key:
+        return None
+    return (*shape, hint, k_static)
+
+
+def _registered_quant_plan(plan: QuantizePlan, contiguous: bool) -> QuantizePlan:
+    """The plan of the registered one-CTA-per-row quantizer program nearest to
+    ``plan``'s unregistered instance that runs its rows: the same input dtype and folded
+    scale, a CTA holding the row (threads x register blocks x 16 >= K) and a compiled-in
+    width only for contiguous rows of that width; the same CTA width first, then the
+    closest register capacity, occupancy, store policy, then the key.  The result records
+    ``plan``'s key in ``unregistered_key``; ``plan`` itself when no registered program
+    runs the rows."""
+    best: Optional[tuple[tuple[Any, ...], str, tuple]] = None
+    for key in KERNELS.get(plan.arch, {}):
+        shape = _quant_shape_of_key(key)
+        if shape is None:
+            continue
+        threads, blocks, min_blocks, is_bf16, fold, hint, k_static = shape
+        if (is_bf16, fold) != (plan.is_bf16, plan.fold) or (
+            threads * blocks * SF_VEC < plan.K
+        ):
+            continue
+        if k_static is not None and (k_static != plan.K or not contiguous):
+            continue
+        cost = (
+            threads != plan.threads,
+            abs(blocks - plan.blocks_per_thread),
+            min_blocks != plan.min_blocks,
+            hint != plan.store_hint,
+            k_static != plan.k_static,
+            key,
+        )
+        if best is None or cost < best[0]:
+            best = (cost, key, shape)
+    if best is None:
+        return plan
+    threads, blocks, min_blocks, _, _, hint, k_static = best[2]
+    return replace(
+        plan,
+        threads=threads,
+        blocks_per_thread=blocks,
+        min_blocks=min_blocks,
+        store_hint=hint,
+        k_static=k_static,
+        grid=plan.padded_rows,
+        kernel_key=best[1],
+        cluster_split=1,
+        unregistered_key=plan.kernel_key,
     )
 
 
@@ -1040,6 +1114,13 @@ class GemmPlan:
     sk_tiles: int = 0
     sk_slices: int = 0
     sk_pairs: int = 0
+    # The key of the default tactic when ``arch`` does not register it and the plan runs
+    # the nearest registered program instead (None: the plan runs its own program).
+    unregistered_key: Optional[str] = None
+    # The key of the registered program the default tactic resolves to when that program's
+    # TMA boxes do not fit the operands (:func:`_tma_boxes_fit`) and the plan runs the
+    # nearest registered program whose boxes fit instead (None: no such replacement).
+    unfit_key: Optional[str] = None
 
     @property
     def alpha_n(self) -> bool:
@@ -1202,15 +1283,24 @@ def gemm_plan(
             m, n, k, out_f16, arch, sm_count, tactic={**plan.tactic, "b2": "fold"}
         )
     measured = MEASURED_SM_COUNT.get(arch, int(sm_count))
-    if (
-        tactic is not None
-        or int(sm_count) == measured
-        or plan.kernel_key in KERNELS.get(arch, {})
-    ):
+    if tactic is not None:
         return plan
-    reference = _gemm_plan(m, n, k, out_f16, arch, measured)
-    fallback = _gemm_plan(m, n, k, out_f16, arch, sm_count, tactic=reference.tactic)
-    return fallback if fallback.kernel_key in KERNELS.get(arch, {}) else plan
+    if plan.kernel_key in KERNELS.get(arch, {}):
+        return _tma_fitting_plan(plan)  # unless the binding refuses the shape
+    if int(sm_count) != measured:
+        reference = _gemm_plan(m, n, k, out_f16, arch, measured)
+        fallback = _gemm_plan(m, n, k, out_f16, arch, sm_count, tactic=reference.tactic)
+        if fallback.kernel_key in KERNELS.get(arch, {}):
+            return _tma_fitting_plan(fallback)
+        # Outside the registered matrix on the measured part too: the program the
+        # measured part runs (:func:`_nearest_registered_plan`), when this grid reaches it.
+        nearest = _nearest_registered_plan(reference)
+        fallback = _gemm_plan(m, n, k, out_f16, arch, sm_count, tactic=nearest.tactic)
+        if nearest.unregistered_key and fallback.kernel_key == nearest.kernel_key:
+            return replace(fallback, unregistered_key=plan.kernel_key)
+    # A default plan whose kernel is still not registered (a shape outside the
+    # registered matrix) runs the nearest registered program.
+    return _nearest_registered_plan(plan)
 
 
 def _gemm_plan(
@@ -1420,6 +1510,166 @@ def _gemm_plan(
         sk_slices=sk_slices,
         sk_pairs=sk_pairs,
     )
+
+
+# Key parts of :func:`gemm_kernel_key` that set one tactic knob, and the count prefixes.
+_KEY_FLAGS: dict[str, tuple[str, Any]] = {
+    "k512": ("deep_k", True),
+    "2cta": ("two_cta", True),
+    "hm": ("half_m", True),
+    "clc": ("sched", "clc"),
+    "ro": ("ring_overlay", True),
+    "l2256b": ("l2_promo", L2_PROMO_DEFAULT),
+    "aF": ("a_hint", "evict_first"),
+    "aL": ("a_hint", "evict_last"),
+    "bF": ("b_hint", "evict_first"),
+    "bL": ("b_hint", "evict_last"),
+}
+_KEY_COUNTS = {
+    "skt": "sk_split",
+    "sk": "split_k",
+    "g": "raster_group",
+    "s": "num_stages",
+    "o": "blocks_per_sm",
+    "w": "w_rows",
+    "ep": "ep_stages",
+}
+# Knobs the registered-program fallback compares, with their unset values.
+_FALLBACK_KNOBS: dict[str, Any] = {
+    "deep_k": False,
+    "split_k": 1,
+    "half_m": False,
+    "sched": "static",
+    "raster_group": None,
+    "sk_split": None,
+    "blocks_per_sm": 1,
+    "w_rows": BLOCK_M,
+    "num_stages": None,
+    "ring_overlay": False,
+    "a_hint": None,
+    "b_hint": None,
+    "l2_promo": None,
+}
+
+
+def _tactic_of_key(key: str) -> Optional[tuple[dict[str, Any], bool]]:
+    """``(tactic, out_f16)`` whose :func:`gemm_kernel_key` is ``key``, or ``None`` for a key
+    of another form."""
+    head, *parts = key.removeprefix("gemm:").split("_")
+    if head[:1] not in ("m", "n") or not head[1:].isdigit():
+        return None
+    tactic: dict[str, Any] = {
+        "tile_n": int(head[1:]),
+        "deep_k": False,
+        "alpha_n": head[0] == "n",
+        "a_hint": None,
+        "b_hint": None,
+        "l2_promo": None,
+    }
+    out_f16 = None
+    for part in parts:
+        name = part.rstrip("0123456789")
+        if part in ("bf16", "f16"):
+            out_f16 = part == "f16"
+        elif part in _KEY_FLAGS:
+            tactic[_KEY_FLAGS[part][0]] = _KEY_FLAGS[part][1]
+        elif name in _KEY_COUNTS and name != part:
+            tactic[_KEY_COUNTS[name]] = int(part[len(name) :])
+            if name == "skt":
+                tactic["stream_k"] = True
+        else:
+            return None
+    if out_f16 is None or gemm_kernel_key(tactic, out_f16) != key:
+        return None
+    return tactic, out_f16
+
+
+def _knob_distance(a: dict[str, Any], b: dict[str, Any]) -> int:
+    """Differing knobs of two tactics: one each, the raster group one per halving
+    (16 -> 8 -> none) and the scheduler two (CLC launches one CTA pair per tile)."""
+    distance = 0
+    for name, unset in _FALLBACK_KNOBS.items():
+        x, y = a.get(name) or unset, b.get(name) or unset
+        if name == "raster_group":
+            level = [int(g).bit_length() - 3 if g else 0 for g in (x, y)]
+            distance += abs(level[0] - level[1])
+        elif x != y:
+            distance += 2 if name == "sched" else 1
+    return distance
+
+
+def _tma_boxes_fit(plan: GemmPlan) -> bool:
+    """True when the host binding of ``plan``'s program accepts its operands: each
+    program stores the output through a TMA box 32 weight columns wide (64 in the
+    swapped orientation), the 2-CTA programs also check the box's token rows (128;
+    half-M pair: 64) and the 2-CTA programs wider than 128 columns load the weight
+    block scales in two-atom boxes (``N`` beyond one 128-row scale atom)."""
+    m, n, tactic = plan.M, plan.N, plan.tactic
+    if n < (64 if tactic["alpha_n"] else 32):
+        return False
+    if not tactic.get("two_cta"):
+        return True
+    if m < (BLOCK_M // 2 if tactic.get("half_m") else BLOCK_M):
+        return False
+    return int(tactic["tile_n"]) <= ROW_TILE or padded_rows(n) >= 2 * ROW_TILE
+
+
+def _tma_fitting_plan(plan: GemmPlan) -> GemmPlan:
+    """``plan`` of a registered program, or, when that program's host binding would
+    refuse the shape (a TMA box larger than its operand, :func:`_tma_boxes_fit`), the
+    plan of the nearest registered program whose boxes fit, which records ``plan``'s key
+    in ``unfit_key``; ``plan`` itself when no registered program fits (an output
+    narrower than 32 columns)."""
+    if _tma_boxes_fit(plan):
+        return plan
+    nearest = _nearest_registered_plan(plan)
+    if not _tma_boxes_fit(nearest):
+        return plan
+    return replace(nearest, unregistered_key=None, unfit_key=plan.kernel_key)
+
+
+def _nearest_registered_plan(plan: GemmPlan) -> GemmPlan:
+    """The plan, for ``plan``'s shape and SM count, of the registered program of its
+    output dtype nearest to ``plan``'s tactic: one whose TMA boxes fit the operands
+    (:func:`_tma_boxes_fit`) first, then the same orientation and CTA group, then the
+    closest tile width, then the fewest differing knobs (:func:`_knob_distance`), then
+    the key; programs with the entry prefetch are not candidates.  The result records
+    ``plan``'s key in ``unregistered_key``; ``plan`` itself when no registered program
+    runs the shape."""
+    want = plan.tactic
+    best: Optional[tuple[tuple[Any, ...], GemmPlan]] = None
+    for key in KERNELS.get(plan.arch, {}):
+        parsed = _tactic_of_key(key)
+        if parsed is None or parsed[1] != plan.out_f16 or parsed[0].get("ep_stages"):
+            continue
+        try:
+            candidate = _gemm_plan(
+                plan.M,
+                plan.N,
+                plan.K,
+                plan.out_f16,
+                plan.arch,
+                plan.sm_count,
+                tactic=parsed[0],
+            )
+        except ValueError:
+            continue
+        if candidate.kernel_key != key:
+            continue  # e.g. a stream-K slice count this grid does not reach
+        have = candidate.tactic
+        cost = (
+            not _tma_boxes_fit(candidate),
+            have["alpha_n"] != want["alpha_n"],
+            bool(have.get("two_cta")) != bool(want.get("two_cta")),
+            abs(math.log2(int(have["tile_n"]) / int(want["tile_n"]))),
+            _knob_distance(have, want),
+            key,
+        )
+        if best is None or cost < best[0]:
+            best = (cost, candidate)
+    if best is None:
+        return plan
+    return replace(best[1], unregistered_key=plan.kernel_key)
 
 
 # ---------------------------------------------------------------------------
