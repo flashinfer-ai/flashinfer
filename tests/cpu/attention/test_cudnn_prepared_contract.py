@@ -24,6 +24,7 @@ from flashinfer.cudnn import decode, prefill
 from flashinfer.cudnn.utils import supports_ordered_cudnn_execution
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "version,backend,native,runtime,expected",
     [
@@ -66,6 +67,7 @@ def test_paged_auto_requires_qualified_runtime(
         prefill._cudnn_supports_paged_auto.cache_clear()
 
 
+@pytest.mark.cpu_only
 def test_attention_handle_binds_current_stream_by_device(monkeypatch):
     import concurrent.futures
     import contextlib
@@ -123,6 +125,7 @@ def test_attention_handle_binds_current_stream_by_device(monkeypatch):
         utils.get_cudnn_attention_handle(backend, explicit, device=device)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("fallback", ["cold", "missing", "implicit", "default"])
 def test_attention_handle_keeps_torch_stream_fallback(monkeypatch, fallback):
     import contextlib
@@ -165,6 +168,7 @@ def test_attention_handle_keeps_torch_stream_fallback(monkeypatch, fallback):
     assert set(utils._attention_handles.handles) == {resolved}
 
 
+@pytest.mark.cpu_only
 def test_ordered_execution_feature_detection():
     class Legacy:
         def execute(self, tensor_dict, workspace=None, handle=None):
@@ -178,6 +182,7 @@ def test_ordered_execution_feature_detection():
     assert supports_ordered_cudnn_execution(Ordered)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "version,features,mla,d128",
     [
@@ -240,6 +245,7 @@ def test_bounded_ragged_requires_matching_native_feature(
         prefill._cudnn_supports_bounded_ragged.cache_clear()
 
 
+@pytest.mark.cpu_only
 def test_ordered_execution_errors_are_not_retried(monkeypatch):
     calls = []
 
@@ -274,6 +280,7 @@ def test_ordered_execution_errors_are_not_retried(monkeypatch):
     assert calls[0][1]["workspace"] is tensor
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("ordered", [False, True])
 def test_planned_prefill_rebinds_tensors_and_metadata(monkeypatch, ordered):
     monkeypatch.setattr(prefill, "_cudnn_supports_shape_override", lambda: False)
@@ -356,6 +363,7 @@ def decode_inputs(monkeypatch):
     )
 
 
+@pytest.mark.cpu_only
 def test_decode_public_allocation_and_copy_prepared_boundary(
     monkeypatch, decode_inputs
 ):
@@ -399,6 +407,7 @@ def test_decode_public_allocation_and_copy_prepared_boundary(
         )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "buffer,fault",
     [
@@ -432,6 +441,7 @@ def test_decode_public_prepared_share_cold_validation(decode_inputs, buffer, fau
                 )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("name", ["batch_offsets_q", "batch_offsets_o"])
 @pytest.mark.parametrize("fault", ["shape", "dtype", "device", "values"])
 def test_decode_public_rejects_unsupported_offsets(decode_inputs, name, fault):
@@ -453,6 +463,7 @@ def test_decode_public_rejects_unsupported_offsets(decode_inputs, name, fault):
         )
 
 
+@pytest.mark.cpu_only
 def test_decode_cubin_preserves_offsets(monkeypatch, decode_inputs):
     q, k, v, kwargs = decode_inputs
     monkeypatch.setattr(decode, "CUDNN_AVAILABLE", False)
@@ -480,6 +491,7 @@ def test_decode_cubin_preserves_offsets(monkeypatch, decode_inputs):
     assert calls[0][11] is offsets_o
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("ordered", [False, True])
 def test_decode_binding_is_per_call_and_lse_is_base2(
     monkeypatch, decode_inputs, ordered
@@ -537,6 +549,7 @@ def test_decode_binding_is_per_call_and_lse_is_base2(
     assert packs[-1][decode.UIDs.SINK_UID.value].shape == (1, 4, 1, 1)
 
 
+@pytest.mark.cpu_only
 def test_prefill_match_uses_complete_build_metadata(monkeypatch):
     monkeypatch.setattr(prefill, "CUDNN_AVAILABLE", True)
     q = torch.empty(3, 4, 8, dtype=torch.bfloat16)
@@ -573,6 +586,7 @@ def test_prefill_match_uses_complete_build_metadata(monkeypatch):
     assert not matches(replace(metadata, causal=True))
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("paged", [False, True])
 @pytest.mark.parametrize("override", [False, True])
 @pytest.mark.parametrize("return_lse", [False, True])
@@ -669,6 +683,7 @@ def test_prefill_preparation_history_rebinds_current_plan(
     assert oldest not in cache
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("paged", [False, True])
 def test_prefill_workspace_reset_clears_preparation_history(monkeypatch, paged):
     from flashinfer.prefill import (
@@ -698,6 +713,7 @@ def test_prefill_workspace_reset_clears_preparation_history(monkeypatch, paged):
     assert wrapper._cudnn_prepared_cache == []
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "lse_base,expected", [("ln", 1.0), ("log2", 1.4426950408889634)]
 )
@@ -745,6 +761,7 @@ def test_prefill_metadata_rebind_and_lse_base(monkeypatch, lse_base, expected):
     assert seen[0][prefill.UIDs.ACTUAL_SEQ_LENS_Q_UID.value] is indptr
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("mode", ["error", "backend"])
 def test_prefill_hn_decline_is_remembered_in_prepared_match(monkeypatch, mode):
     monkeypatch.setattr(prefill, "_CUDNN_NATIVE_HN_SUPPORTED", True)
@@ -798,6 +815,7 @@ def test_prefill_hn_decline_is_remembered_in_prepared_match(monkeypatch, mode):
     assert len(set(keys)) == 3
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("supported", [False, True])
 def test_prefill_hn_override_key_ignores_runtime_token_count(monkeypatch, supported):
     monkeypatch.setattr(prefill, "_CUDNN_NATIVE_HN_SUPPORTED", supported)
@@ -828,6 +846,7 @@ def test_prefill_hn_override_key_ignores_runtime_token_count(monkeypatch, suppor
         assert (keys[1] == keys[2]) == (supported and override is not None)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("backend_lowering", [None, False, True])
 def test_prefill_hn_same_plan_rebinds_current_output_stride(
     monkeypatch, backend_lowering
@@ -922,6 +941,7 @@ def test_prefill_hn_same_plan_rebinds_current_output_stride(
     assert observations == [True]  # The graph layout is observed once, before reuse.
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("supported", [False, True])
 @pytest.mark.parametrize("shape_override", [False, True])
 def test_prefill_capacity_is_a_plan_descriptor(monkeypatch, supported, shape_override):

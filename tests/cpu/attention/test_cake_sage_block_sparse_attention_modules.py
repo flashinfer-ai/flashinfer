@@ -34,6 +34,7 @@ def _parse_definitions(definitions):
     return parsed
 
 
+@pytest.mark.cpu_only
 def test_sm120_module_names_are_distinct():
     # One JIT module (and so one build directory) per specialization.
     names = list(SM120_MODULES.values())
@@ -42,6 +43,7 @@ def test_sm120_module_names_are_distinct():
     assert not any(name.endswith(".cu") for name in names)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("key", _KEYS, ids=["_".join(map(str, key)) for key in _KEYS])
 def test_sm120_compile_definitions_encode_the_key(key):
     definitions = sm120_compile_definitions(key)
@@ -53,12 +55,14 @@ def test_sm120_compile_definitions_encode_the_key(key):
     }
 
 
+@pytest.mark.cpu_only
 def test_sm120_contiguous_rows_are_uniform():
     # Contiguous block indices are only specialized together with a uniform
     # non-empty block count; the dispatcher clears the flag otherwise.
     assert all(key[3] == 1 for key in _KEYS if key[4] == 1)
 
 
+@pytest.mark.cpu_only
 def test_flat_offset_guard_refuses_tensors_beyond_int32():
     """The kernels index tensors with 32-bit element offsets; the host refuses larger ones before any launch."""
     import torch

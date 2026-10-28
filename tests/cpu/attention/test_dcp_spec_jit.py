@@ -33,6 +33,7 @@ from flashinfer.trace.templates.attention import (
 )
 
 
+@pytest.mark.cpu_only
 def test_public_decode_api_adds_optional_dcp_arguments() -> None:
     parameters = inspect.signature(trtllm_batch_decode_with_kv_cache).parameters
     assert parameters["cp_world"].default == 1
@@ -43,6 +44,7 @@ def test_public_decode_api_adds_optional_dcp_arguments() -> None:
     ).index("causal_seqlens_kv_global")
 
 
+@pytest.mark.cpu_only
 def test_public_decode_api_rejects_pdl_for_dcp() -> None:
     with pytest.raises(ValueError, match="does not support enable_pdl=True"):
         trtllm_batch_decode_with_kv_cache(
@@ -60,6 +62,7 @@ def test_public_decode_api_rejects_pdl_for_dcp() -> None:
         )
 
 
+@pytest.mark.cpu_only
 def test_dcp_workspace_and_counter_sizes_are_caller_owned_exact_views() -> None:
     # B=8, Q=4, Hq=64, split=6: BF16 O[...128] + FP32 LSE per row.
     rows = 8 * 4 * 64 * 6
@@ -71,6 +74,7 @@ def test_dcp_workspace_and_counter_sizes_are_caller_owned_exact_views() -> None:
     assert cake_dcp.get_dcp_spec_counter_bytes is get_dcp_spec_counter_bytes
 
 
+@pytest.mark.cpu_only
 def test_dcp_decode_rejects_an_empty_batch_before_split_selection() -> None:
     with pytest.raises(ValueError, match="non-empty batch"):
         run_dcp_spec_decode(
@@ -93,6 +97,7 @@ def test_dcp_decode_rejects_an_empty_batch_before_split_selection() -> None:
         )
 
 
+@pytest.mark.cpu_only
 def test_dcp_split_selector_matches_promoted_policy() -> None:
     assert _select_num_split(logical_tiles=32, sm_count=148, local_blocks=9) == 1
     assert _select_num_split(logical_tiles=32, sm_count=148, local_blocks=32) == 4
@@ -118,6 +123,7 @@ def test_dcp_split_selector_matches_promoted_policy() -> None:
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("capability", "target"),
     [
@@ -135,6 +141,7 @@ def test_dcp_target_keeps_independent_architecture_baselines(
     assert dcp._select_target(None) == target
 
 
+@pytest.mark.cpu_only
 def test_dcp_trace_dispatch_distinguishes_combined_and_split_kv() -> None:
     marker = object()
     assert (
@@ -179,6 +186,7 @@ def _empty_rank_inputs(
     }
 
 
+@pytest.mark.cpu_only
 def test_dcp_all_empty_rank_reaches_native_v1_route(monkeypatch) -> None:
     dcp = importlib.import_module("flashinfer.cake_dcp")
     launches = []
@@ -193,6 +201,7 @@ def test_dcp_all_empty_rank_reaches_native_v1_route(monkeypatch) -> None:
     assert len(launches) == 1
 
 
+@pytest.mark.cpu_only
 def test_fp8_page64_q3_reaches_single_native_launch_with_fused_scales(
     monkeypatch,
 ) -> None:
@@ -220,6 +229,7 @@ def test_fp8_page64_q3_reaches_single_native_launch_with_fused_scales(
     assert args[14] == pytest.approx(0.25)
 
 
+@pytest.mark.cpu_only
 def test_fp8_page64_underfill_uses_split3_and_caller_owned_scratch(
     monkeypatch,
 ) -> None:
@@ -261,6 +271,7 @@ def test_fp8_page64_underfill_uses_split3_and_caller_owned_scratch(
     assert args[7].data_ptr() == inputs["completion_buffer"].data_ptr()
 
 
+@pytest.mark.cpu_only
 def test_bf16_page16_rejects_nonunit_bmm2_scale(monkeypatch) -> None:
     dcp = importlib.import_module("flashinfer.cake_dcp")
     monkeypatch.setattr(dcp, "get_device_sm_count", lambda _device: 148)
@@ -269,6 +280,7 @@ def test_bf16_page16_rejects_nonunit_bmm2_scale(monkeypatch) -> None:
         run_dcp_spec_decode(**_empty_rank_inputs(bmm2_scale=0.5))
 
 
+@pytest.mark.cpu_only
 def test_bf16_page16_q3_reaches_native_v1_route(monkeypatch) -> None:
     dcp = importlib.import_module("flashinfer.cake_dcp")
     launches = []
@@ -283,11 +295,13 @@ def test_bf16_page16_q3_reaches_native_v1_route(monkeypatch) -> None:
     assert len(launches) == 1
 
 
+@pytest.mark.cpu_only
 def test_dcp_rejects_non_int32_local_seq_lens() -> None:
     with pytest.raises(ValueError, match="contiguous int32"):
         run_dcp_spec_decode(**_empty_rank_inputs(torch.int64))
 
 
+@pytest.mark.cpu_only
 def test_dcp_static_registry_lists_each_program_once() -> None:
     registry = get_dcp_spec_registry()
     programs = registry["programs"]
@@ -314,6 +328,7 @@ def test_dcp_static_registry_lists_each_program_once() -> None:
             assert (Path(get_cake_fmha_csrc_dir()) / source).is_file(), (name, source)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("target", ["sm100a", "sm103a", "sm100f"])
 def test_dcp_static_uri_names_the_program_target_and_constants(target) -> None:
     constants = {
@@ -384,6 +399,7 @@ def _dcp_static_sources(program) -> list[str]:
     return [kernel, f"cuda/dcp_spec/{family}_binding.cu"]
 
 
+@pytest.mark.cpu_only
 def test_dcp_static_programs_share_one_folded_source_per_family() -> None:
     """Each program compiles its family's folded sources; its flags pin the text."""
 
@@ -424,12 +440,13 @@ def test_dcp_static_programs_share_one_folded_source_per_family() -> None:
             assert opened == text.count(f"#endif  // {macro}\n") > 0, (source, knob)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("target", ["sm100a", "sm103a", "sm100f"])
 def test_dcp_static_jit_passes_the_program_knobs_and_folded_sources(
     monkeypatch, target
 ) -> None:
     jit_dcp = importlib.import_module("flashinfer.jit.cake_dcp")
-    source_dir = Path(__file__).resolve().parents[2] / "csrc" / "cake_fmha"
+    source_dir = Path(__file__).resolve().parents[3] / "csrc" / "cake_fmha"
     monkeypatch.setattr(jit_dcp, "get_cake_fmha_csrc_dir", lambda: source_dir)
     monkeypatch.setattr(
         jit_dcp, "gen_jit_spec", lambda **kwargs: SimpleNamespace(**kwargs)

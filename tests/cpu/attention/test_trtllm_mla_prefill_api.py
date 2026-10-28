@@ -61,6 +61,7 @@ _TRTLLM_MLA_PARAMETERS = (
 _NUM_REQUIRED_PARAMETERS = 9
 
 
+@pytest.mark.cpu_only
 def test_trtllm_mla_prefill_has_exact_approved_exports():
     prefill_api = flashinfer.mla.trtllm_prefill_with_kv_cache_mla
     decode_api = flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla
@@ -75,6 +76,7 @@ def test_trtllm_mla_prefill_has_exact_approved_exports():
     assert decode_api.__name__ == "trtllm_batch_decode_with_kv_cache_mla"
 
 
+@pytest.mark.cpu_only
 def test_trtllm_mla_prefill_signature_annotations_and_defaults_match_decode():
     prefill_api = flashinfer.mla.trtllm_prefill_with_kv_cache_mla
     decode_api = flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla
@@ -108,6 +110,7 @@ def _patch_shared_impl_and_forbid_decode_routing(monkeypatch):
     return calls, result
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "api_name",
     ["trtllm_batch_decode_with_kv_cache_mla", "trtllm_prefill_with_kv_cache_mla"],
@@ -129,6 +132,7 @@ def test_trtllm_mla_forwards_every_argument_to_shared_impl(monkeypatch, api_name
         assert forwarded.arguments[name] is value
 
 
+@pytest.mark.cpu_only
 def test_trtllm_mla_prefill_forwards_required_only_call_with_decode_defaults(
     monkeypatch,
 ):
