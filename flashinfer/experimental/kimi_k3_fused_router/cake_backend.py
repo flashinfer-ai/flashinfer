@@ -50,7 +50,7 @@ logits loads in the read-only form, which serves one token at block_m 16; 16
 CTAs of two row groups for LCG and LCG_LW, which serve every other count
 up to 32, LCG_LW being the LCG kernel that waits for its cluster after the row
 selection instead of before it, on SM100 at block_m 16 from 29 tokens
-(``CELL32_LOW_ROUTES``); a 16-CTA cluster is above the portable maximum
+(``CELL_LOW_ROUTES``); a 16-CTA cluster is above the portable maximum
 of 8 and the generated program opts into it with the non-portable cluster-size
 attribute).  Nothing is
 planned on the host and nothing is allocated at launch, so a prepared runner
@@ -144,8 +144,9 @@ ARM_Q4S_CTAS_PER_SM = 4
 # Arm Q4SP: the Q4S body with a register prefetch of the next row's logits, a
 # second kernel of the same family; arm Q4S_E16: the Q4S kernel whose plan emit
 # gives each lane of an expert's warp 16 tokens instead of 32 (the 512-token
-# cells); arm Q4SB: the Q4S kernel with the same next-row prefetch; arm Q4SP_PG:
-# the Q4SP kernel skipping the emit word pass that a batch of at most 1024
+# cells; on SM103 from 384 tokens, see ``CELL_LOW_ROUTES``); arm Q4SB: the Q4S
+# kernel with the same next-row prefetch; arm Q4SP_PG: the Q4SP kernel skipping
+# the emit word pass that a batch of at most 1024
 # tokens leaves without a bitmap word (SM100 at block_m 8, 832 < num_tokens <=
 # 1024); arm Q4SP_LR: the Q4SP kernel whose owner CTAs rank the route pairs of
 # their own quarter of the tokens in their own shared memory (SM100, C <
@@ -228,7 +229,7 @@ MAIN_KWARGS = (
 # (ARM_L_FAMILY) and in one 32-token cell (ARM_LCG_FAMILY; see
 # _SM103_SHAPE_ROUTE below).  On both architectures the capacity rule
 # (CAPACITY_ROUTES) refines the arms of the 512- to 2048-token cells, and
-# CELL32_LOW_ROUTES the arm of the smaller counts of a 32-token cell.
+# CELL_LOW_ROUTES the arm of the smaller counts of a 32- or 512-token cell.
 _SM100_SHAPE_ROUTE: dict[tuple[int, int], str] = {
     (1, 8): "LC",
     (1, 16): "LC1_NC",
@@ -241,15 +242,15 @@ _SM100_SHAPE_ROUTE: dict[tuple[int, int], str] = {
     (16, 8): "LC",
     (16, 16): "LC",
     (32, 8): "LCG_LW",  # sm_103a: LCG
-    (32, 16): "LCG_LW",  # up to 28 tokens: LCG (CELL32_LOW_ROUTES)
+    (32, 16): "LCG_LW",  # up to 28 tokens: LCG (CELL_LOW_ROUTES)
     (64, 8): "LPC",  # sm_103a: LP
     (64, 16): "LPC",  # sm_103a: L
     (128, 8): "L",  # sm_103a: LP
     (128, 16): "L",
     (256, 8): "M",
     (256, 16): "M",
-    (512, 8): "Q4S_E16",
-    (512, 16): "Q4S_E16",
+    (512, 8): "Q4S_E16",  # sm_103a: Q4S up to 383 tokens (CELL_LOW_ROUTES)
+    (512, 16): "Q4S_E16",  # sm_103a: Q4S up to 383 tokens (CELL_LOW_ROUTES)
     (1024, 8): "Q4S",
     (1024, 16): "Q4S",
     (2048, 8): "Q4SP",
@@ -275,11 +276,14 @@ SHAPE_ROUTES = {"sm_100a": _SM100_SHAPE_ROUTE, "sm_103a": _SM103_SHAPE_ROUTE}
 MEASURED_NUM_TOKENS = tuple(sorted({rows for rows, _ in _SM100_SHAPE_ROUTE}))
 # Token counts below this cell that are not an LC row count take its arm.
 _SMALLEST_SHARED_CELL = 32
-# Counts of the 32-token cell up to a bound that run another arm than the
-# cell's, per (architecture, block_m): ``(largest num_tokens, arm)``.  On
-# sm_100a at block_m 16 the cell runs LCG_LW from 29 tokens and LCG below.
-CELL32_LOW_ROUTES: dict[tuple[str, int], tuple[int, str]] = {
-    ("sm_100a", 16): (28, "LCG"),
+# Counts of a cell up to a bound that run another arm than the cell's, per
+# (architecture, cell, block_m): ``(largest num_tokens, arm)``.  On sm_100a at
+# block_m 16 the 32-token cell runs LCG_LW from 29 tokens and LCG below; on
+# sm_103a the 512-token cells run Q4S_E16 from 384 tokens and Q4S below.
+CELL_LOW_ROUTES: dict[tuple[str, int, int], tuple[int, str]] = {
+    ("sm_100a", 32, 16): (28, "LCG"),
+    ("sm_103a", 512, 8): (383, "Q4S"),
+    ("sm_103a", 512, 16): (383, "Q4S"),
 }
 
 
@@ -406,8 +410,8 @@ def route_arm(
 
     Measured cells map through the architecture's table; other token counts
     take the arm of :func:`route_cell`; counts above ``MAX_NUM_TOKENS`` are
-    rejected (no kernel serves them); a 32-token cell listed in
-    ``CELL32_LOW_ROUTES`` sends its smaller counts to the listed arm.  With
+    rejected (no kernel serves them); a cell listed in ``CELL_LOW_ROUTES``
+    sends its counts up to the listed bound to the listed arm.  With
     ``cluster_capacity`` (C of
     ``CAPACITY_ROUTES``, see :func:`route_capacity`) an ``(arch, block_m)``
     pair listed in ``CAPACITY_ROUTES`` applies its capacity rule to the
@@ -430,8 +434,8 @@ def route_arm(
     cell = route_cell(rows)
     assert cell is not None
     arm = table[(cell, block_m)]
-    low = CELL32_LOW_ROUTES.get((arch, block_m))
-    if cell == _SMALLEST_SHARED_CELL and low is not None and rows <= low[0]:
+    low = CELL_LOW_ROUTES.get((arch, cell, block_m))
+    if low is not None and rows <= low[0]:
         arm = low[1]
     rule = CAPACITY_ROUTES.get((arch, block_m))
     if rule is not None and cluster_capacity is not None:
@@ -777,7 +781,7 @@ def generated_program_available(
         for (rule_arch, _), rule in CAPACITY_ROUTES.items():
             if rule_arch == arch:
                 needed.update(rule.arms())
-        for (low_arch, _), (_, low_arm) in CELL32_LOW_ROUTES.items():
+        for (low_arch, _, _), (_, low_arm) in CELL_LOW_ROUTES.items():
             if low_arch == arch:
                 needed.add(low_arm)
         return bool(MODULES) and needed <= registered

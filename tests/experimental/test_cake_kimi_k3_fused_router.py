@@ -36,7 +36,7 @@ from flashinfer.experimental.kimi_k3_fused_router.cake_backend import (
     BLOCK_M_VALUES,
     CAPACITY_PROGRAM_ARM,
     CAPACITY_ROUTES,
-    CELL32_LOW_ROUTES,
+    CELL_LOW_ROUTES,
     MEASURED_NUM_TOKENS,
     NUM_EXPERTS,
     OWNER_CTAS,
@@ -70,8 +70,9 @@ WORKSPACE_POISON = -91
 MEASURED_SHAPES = [(rows, bm) for bm in BLOCK_M_VALUES for rows in MEASURED_NUM_TOKENS]
 # Token counts between the measured cells, one or two per arm range (including
 # the first count above every cell boundary up to the 8192-token limit), both
-# sides of the 32-token cell's split on SM100 at block_m 16 (28 / 29), the
-# first count above the 512-token cell (513), and both sides of the capacity
+# sides of the 32-token cell's split on SM100 at block_m 16 (28 / 29), both
+# sides of the 512-token cell's split on SM103 (383 / 384), the first count
+# above the 512-token cell (513), and both sides of the capacity
 # rule's thresholds on a 148-SM B200 (C = 568) and a 152-SM GB300 (C = 592): C,
 # the ends of the local-rank bands (832 / 833 and 1055 / 1056 on the B200,
 # 1039 / 1040 on the GB300), the end of the 1024-token bands (1025), 2C (1136 /
@@ -90,6 +91,8 @@ ARBITRARY_NUM_TOKENS = (
     200,
     257,
     300,
+    383,
+    384,
     513,
     568,
     569,
@@ -328,7 +331,11 @@ def test_route_tables_cover_the_measured_cells():
     }
     assert differing == {(32, 8), (64, 8), (64, 16), (128, 8)}
     assert ARM_LCG_FAMILY == ("LCG", "LCG_LW")
-    assert CELL32_LOW_ROUTES == {("sm_100a", 16): (28, "LCG")}
+    assert CELL_LOW_ROUTES == {
+        ("sm_100a", 32, 16): (28, "LCG"),
+        ("sm_103a", 512, 8): (383, "Q4S"),
+        ("sm_103a", 512, 16): (383, "Q4S"),
+    }
     # One token: LC at block_m 8, LC1_NC (the same kernel with the read-only
     # loads) at block_m 16, on both architectures.
     assert ARM_LC1_NC == "LC1_NC"
@@ -403,7 +410,7 @@ def test_route_cell_and_arbitrary_token_counts():
         assert route_cell(rows) == 32
         for arch in SHAPE_ROUTES:
             for bm in BLOCK_M_VALUES:
-                low = CELL32_LOW_ROUTES.get((arch, bm))
+                low = CELL_LOW_ROUTES.get((arch, 32, bm))
                 expected = SHAPE_ROUTES[arch][(32, bm)]
                 if low is not None and rows <= low[0]:
                     expected = low[1]
@@ -431,11 +438,18 @@ def test_route_cell_and_arbitrary_token_counts():
                 route_arm(arch, rows, 8)
         assert route_arm(arch, 100, 16) == "L"
         assert route_arm(arch, 200, 8) == "M"
-        assert route_arm(arch, 300, 8) == "Q4S_E16"
+        assert route_arm(arch, 384, 8) == "Q4S_E16"
         assert route_arm(arch, 513, 8) == "Q4S"
         assert route_arm(arch, 1000, 16) == "Q4S"
         assert route_arm(arch, 2047, 8) == "Q4SP"
         assert route_arm(arch, 3000, 16) == "GW"
+    # The 512-token cells: Q4S_E16 on SM100; on SM103 Q4S up to 383 tokens.
+    for bm in BLOCK_M_VALUES:
+        for rows in (257, 300, 383):
+            assert route_arm("sm_100a", rows, bm) == "Q4S_E16"
+            assert route_arm("sm_103a", rows, bm) == "Q4S"
+        for rows in (384, 512):
+            assert route_arm("sm_103a", rows, bm) == "Q4S_E16"
     assert route_arm("sm_100a", 33, 8) == "LPC"
     assert route_arm("sm_103a", 33, 8) == "LP"
     assert route_arm("sm_100a", 33, 16) == "LPC"
@@ -682,12 +696,15 @@ def test_capacity_rule_routes_q4s_cells():
         ("sm_103a", 8): CapacityRule(sm103, "Q4SPW_LR", 0),
         ("sm_103a", 16): CapacityRule(sm103, "Q4SPW_LR", 64),
     } == CAPACITY_ROUTES
-    # GB300 (152 SMs): C = 592; Q4S_E16 up to 512 tokens and Q4S up to C; above
+    # GB300 (152 SMs): C = 592; Q4S up to 383 tokens, Q4S_E16 up to 512 and Q4S
+    # up to C; above
     # C Q4SB up to 1024 tokens, Q4SP up to 1039 and Q4SP_LR from 1040; the wide
     # arm starts at 2C = 1184 at block_m 8 and at 2C + 64 = 1248 at block_m 16.
     gb300 = {
         256: "M",
-        257: "Q4S_E16",
+        257: "Q4S",
+        383: "Q4S",
+        384: "Q4S_E16",
         512: "Q4S_E16",
         513: "Q4S",
         592: "Q4S",
@@ -861,7 +878,7 @@ def test_registry_keys_are_dispatch_arms():
         for (rule_arch, _), rule in CAPACITY_ROUTES.items():
             if rule_arch == arch:
                 keys.update(rule.arms())
-        for (low_arch, _), (_, low_arm) in CELL32_LOW_ROUTES.items():
+        for (low_arch, _, _), (_, low_arm) in CELL_LOW_ROUTES.items():
             if low_arch == arch:
                 keys.add(low_arm)
         assert keys == set(cake_jit.ROUTES[arch]), arch

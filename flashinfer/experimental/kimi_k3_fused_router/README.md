@@ -55,7 +55,8 @@ the expert-aligned route plan consumed by grouped MoE GEMMs in **one launch**:
   holds 256 rows on SM100 and 2048 on SM103), a 4-CTA-cluster variant at four
   CTAs per SM for 257 to 2048 tokens (the 512-token cells use a kernel of
   that family whose plan emit gives each lane of an expert's warp 16 tokens
-  instead of 32; the 2048-token cell uses a second kernel of that
+  instead of 32, on SM103 from 384 tokens with the plain kernel below; the
+  2048-token cell uses a second kernel of that
   family which prefetches the next row's logits into registers) and a
   warp-per-row two-join persistent kernel launched as CTA pairs from 2049
   tokens up. The two architectures' tables differ only in four small-batch
