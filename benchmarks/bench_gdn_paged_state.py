@@ -416,7 +416,9 @@ def bench_decode(heads, state_dtype, batches):
         last = torch.tensor(
             [1 if i % 2 else 77 for i in range(b)], dtype=torch.int32, device="cuda"
         )
-        write = indices[1::2].contiguous()
+        # clone(): a one-element view is already "contiguous" and would keep
+        # its 4-byte offset, which the decode kernels' index tensors reject.
+        write = indices[1::2].clone()
         read = torch.where(last > 1, write, indices[0::2]).contiguous()
         out = torch.empty(b, 1, hv, D, dtype=torch.bfloat16, device="cuda")
 
