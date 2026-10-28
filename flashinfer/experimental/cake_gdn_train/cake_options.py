@@ -42,14 +42,17 @@ Public fields (defaults are the shipped behaviour)::
     graph           "off" | "replay"        keyed CUDA-graph capture / replay of a call
     reuse_recompute_tapes  True | False | "auto"   under torch.utils.checkpoint(use_reentrant=False) the light
                                             backward binds the forward tapes of torch's recompute of the same backward
-                                            pass instead of running its own replay of #1 and the tape walk.  True =
-                                            always (the shipped default); "auto" = only when the GDN node is the last
-                                            operation of the checkpointed region that saves a tensor (the same frame
-                                            proof as recompute_output="auto"): then its backward is the region's first
-                                            and the kept tapes die before any other backward runs; with a later saver
-                                            (an output projection, an MLP) the kept tapes would live through those
+                                            pass instead of running its own replay of #1 and the tape walk.  "auto"
+                                            (the shipped default) = only when the GDN node is the last operation of
+                                            the checkpointed region that saves a tensor (the same frame proof as
+                                            recompute_output="auto"): then its backward is the region's first and the
+                                            kept tapes die before any other backward runs; with a later saver (an
+                                            output projection, an MLP) the kept tapes would live through those
                                             operations' backward and raise the region's backward peak by the full
-                                            tape set, so "auto" takes the replay form there; False = the replay form.
+                                            tape set (+2323 MiB on a 261,987-token (2, 6) region with a 768-wide
+                                            projection and MLP: 9251 vs 6927 MiB, step 21.3 vs 22.7 ms on one GB300),
+                                            so "auto" takes the replay form there; True = always; False = the replay
+                                            form.
                                             None = the default, which is False with graph="replay", the one mode that
                                             excludes the kept tapes; an explicit True / "auto" with graph="replay" is
                                             refused; a forward outside a backward pass, the direct autograd path and
@@ -105,9 +108,9 @@ GROUP_REDUCE_DEFAULT = "fused"
 GRAPH_MODES = ("off", "replay")
 GRAPH_DEFAULT = "off"
 REUSE_RECOMPUTE_TAPES = (True, False, "auto")
-# the checkpoint-aware light backward is the shipped default (False with graph="replay"; False = the replay form;
-# "auto" = kept tapes only when the node closes the checkpointed region)
-REUSE_RECOMPUTE_TAPES_DEFAULT: bool | str = True
+# "auto" (the shipped default) = the checkpoint-aware light backward keeps the recompute's tapes only when the node
+# closes the checkpointed region; True = always; False = the replay form (the default with graph="replay")
+REUSE_RECOMPUTE_TAPES_DEFAULT: bool | str = "auto"
 RECOMPUTE_OUTPUTS = ("auto", "always")
 RECOMPUTE_OUTPUT_DEFAULT = "auto"  # the recompute's dead output program is skipped when torch's checkpoint frame proves it dead
 BACKENDS = ("kernels", "fake")

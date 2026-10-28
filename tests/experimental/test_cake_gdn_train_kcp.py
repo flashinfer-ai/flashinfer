@@ -2768,6 +2768,9 @@ def test_recompute_output_skipped_once_when_the_node_closes_the_segment() -> Non
     assert kcp.kept_registry_size() == 0
 
 
+# The recompute_output tests below pin reuse_recompute_tapes=True: they check the output program's gate under the
+# kept-tape form (the recompute launches #1 and hands the tapes off); the shipped default "auto" takes the replay form
+# in several of these scenarios (a later saver, a failed frame proof), which the reuse_recompute_tapes tests cover.
 def test_recompute_output_launched_when_a_later_op_of_the_segment_saves_the_output() -> (
     None
 ):
@@ -2789,7 +2792,16 @@ def test_recompute_output_launched_when_a_later_op_of_the_segment_saves_the_outp
 
         def fn(q, k, v, g, beta, w_):
             out = kcp.chunk_gdn_kcp(
-                q, k, v, g, beta, ctx, backend="fake", segments=2, **o
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ctx,
+                backend="fake",
+                segments=2,
+                reuse_recompute_tapes=True,
+                **o,
             )
             return out * w_
 
@@ -2827,7 +2839,7 @@ def test_recompute_output_multi_layer_segment_skips_only_the_last_layer() -> Non
     kcp, ctx, ops = _ckpt_setup()
     layers = 3
     ws = kcp.KcpWorkspace()
-    base = dict(segments=2, layers=layers, workspace=ws)
+    base = dict(segments=2, layers=layers, workspace=ws, reuse_recompute_tapes=True)
     direct = _ckpt_autograd(kcp, ctx, ops, ckpt=False, **base)
     seen, rec = _fwd_o_launches(kcp)
     previous = kcp.set_backend("fake", rec)
@@ -2917,13 +2929,17 @@ def test_recompute_output_needs_the_verified_torch_version(monkeypatch) -> None:
     launches #5 as before (reason ``torch_version``; the frame is never read, so the counters stay), gradients
     unchanged."""
     kcp, ctx, ops = _ckpt_setup()
-    direct = _ckpt_autograd(kcp, ctx, ops, ckpt=False, segments=2)
+    direct = _ckpt_autograd(
+        kcp, ctx, ops, ckpt=False, segments=2, reuse_recompute_tapes=True
+    )
     monkeypatch.setattr(kcp, "RECOMPUTE_OUTPUT_TORCH_VERSIONS", ("0.0.0",))
     seen, rec = _fwd_o_launches(kcp)
     previous = kcp.set_backend("fake", rec)
     try:
         before = dict(kcp.RECOMPUTE_OUTPUT_STATS)
-        res = _ckpt_autograd(kcp, ctx, ops, ckpt=True, segments=2)
+        res = _ckpt_autograd(
+            kcp, ctx, ops, ckpt=True, segments=2, reuse_recompute_tapes=True
+        )
         assert _launches(seen, "fwd_o") == [False, True]
         assert kcp.LAST_CALL["fwd"]["fwd_o"] == "launched"
         assert kcp.LAST_CALL["fwd"]["fwd_o_reason"] == "torch_version"
@@ -2944,7 +2960,17 @@ def test_recompute_output_launched_under_a_reentrant_checkpoint() -> None:
         leaves = _ckpt_leaves(ops)
 
         def fn(q, k, v, g, beta):
-            return kcp.chunk_gdn_kcp(q, k, v, g, beta, ctx, backend="fake", segments=2)
+            return kcp.chunk_gdn_kcp(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ctx,
+                backend="fake",
+                segments=2,
+                reuse_recompute_tapes=True,
+            )
 
         out = checkpoint(fn, *leaves, use_reentrant=True) if ckpt else fn(*leaves)
         out.backward(ops["dout"])
@@ -2982,7 +3008,9 @@ def test_recompute_output_launched_for_a_non_executable_layer_before_the_node() 
 
     def run(ckpt: bool, **o) -> list[torch.Tensor]:
         leaves = _ckpt_leaves(ops)
-        opt = dict(backend="fake", segments=2, workspace=ws, **o)
+        opt = dict(
+            backend="fake", segments=2, workspace=ws, reuse_recompute_tapes=True, **o
+        )
 
         def fn(q, k, v, g, beta):
             first = kcp.chunk_gdn_kcp(
@@ -3049,7 +3077,16 @@ def test_recompute_output_launched_under_no_grad_inside_the_recompute() -> None:
         def fn(q, k, v, g, beta, w_):
             with torch.no_grad():
                 out = kcp.chunk_gdn_kcp(
-                    q, k, v, g, beta, ctx, backend="fake", segments=2, **o
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    ctx,
+                    backend="fake",
+                    segments=2,
+                    reuse_recompute_tapes=True,
+                    **o,
                 )
             return out * w_
 
@@ -3093,7 +3130,17 @@ def test_recompute_output_launched_when_early_stop_is_off() -> None:
         leaves = _ckpt_leaves(ops)
 
         def fn(q, k, v, g, beta):
-            return kcp.chunk_gdn_kcp(q, k, v, g, beta, ctx, backend="fake", segments=2)
+            return kcp.chunk_gdn_kcp(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ctx,
+                backend="fake",
+                segments=2,
+                reuse_recompute_tapes=True,
+            )
 
         if ckpt:
             with set_checkpoint_early_stop(False):
@@ -3143,7 +3190,15 @@ def test_recompute_output_launched_under_a_users_saved_tensors_hooks() -> None:
         def fn(q, k, v, g, beta, w_):
             with torch.autograd.graph.saved_tensors_hooks(lambda t: t, lambda t: t):
                 out = kcp.chunk_gdn_kcp(
-                    q, k, v, g, beta, ctx, backend="fake", segments=2
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    ctx,
+                    backend="fake",
+                    segments=2,
+                    reuse_recompute_tapes=True,
                 )
             return out * w_
 
@@ -3313,7 +3368,9 @@ def test_recompute_output_auto_resolves_on_every_cuda_build_of_the_release(
         pytest.skip(
             "the running torch is not a verified release: the frame proof cannot be exercised"
         )
-    direct = _ckpt_autograd(kcp, ctx, ops, ckpt=False, segments=2)
+    direct = _ckpt_autograd(
+        kcp, ctx, ops, ckpt=False, segments=2, reuse_recompute_tapes=True
+    )
     expect = {
         "2.14.1+cu130": ("dead", [False], "skipped"),
         "2.14.1+cu132": ("dead", [False], "skipped"),
@@ -3325,7 +3382,9 @@ def test_recompute_output_auto_resolves_on_every_cuda_build_of_the_release(
         seen, rec = _fwd_o_launches(kcp)
         previous = kcp.set_backend("fake", rec)
         try:
-            res = _ckpt_autograd(kcp, ctx, ops, ckpt=True, segments=2)
+            res = _ckpt_autograd(
+                kcp, ctx, ops, ckpt=True, segments=2, reuse_recompute_tapes=True
+            )
             assert kcp.LAST_CALL["fwd"]["fwd_o_reason"] == reason, build
             assert kcp.LAST_CALL["fwd"]["fwd_o"] == decision, build
             assert _launches(seen, "fwd_o") == fwd_o, build
