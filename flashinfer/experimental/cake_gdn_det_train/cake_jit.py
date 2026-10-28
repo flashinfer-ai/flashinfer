@@ -51,7 +51,8 @@ with ``dv_local`` fused, tcgen05, TMA ring fills), ``dqkwg``,
 ``wy_bwd`` / ``wy_bwd_bf16``, ``finalize`` / ``finalize_mlp``, and ``tail_g2``
 / ``tail_g2_bf16`` (``dqkwg``, the WY pullback and the finalize of a
 value-head group of two in one tcgen05 cluster kernel).  Every launch is a
-plain stream-ordered launch: nothing cooperative, no PDL.
+plain stream-ordered launch: nothing cooperative, no PDL (the chain may put
+two launches of one stage on two streams, each over its own sequences).
 """
 
 from __future__ import annotations

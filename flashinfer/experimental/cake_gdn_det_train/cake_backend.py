@@ -31,9 +31,17 @@ without ``flashinfer.jit`` loads every library from ``aot/``
 Launches go through :func:`launch_stage` (the chain's positional call: the
 kernel parameters in ``arg_plan`` order, then the grid) or :func:`run_module`
 (the same call with the parameters named).  The kernel runs on the current
-torch stream.  Every launch is a plain stream-ordered launch: nothing
-cooperative, no PDL.  Nothing here reads an environment variable,
-synchronizes, reads device memory or allocates.
+torch stream.  :func:`launch_stage` resolves a stage once per device -- its
+record, the arity, the library and the FFI entry -- and launches from that
+cached entry afterwards.  It takes PyTorch tensors, as the chain passes them,
+and enters no stream context: a tvm-ffi call whose arguments include PyTorch
+CUDA tensors sets the FFI stream of the first one's device to PyTorch's
+current stream for the call (a CUDA graph's capture stream during capture),
+and the binding launches there.  :func:`run_module` enters
+``tvm_ffi.use_torch_stream()`` for any argument type.  Every launch is a
+plain stream-ordered launch: nothing cooperative, no PDL.  Nothing here
+reads an environment variable, synchronizes, reads device memory or
+allocates.
 """
 
 from __future__ import annotations
@@ -181,6 +189,31 @@ def parameters(name: str) -> tuple[str, ...]:
     return tuple(names)
 
 
+# (stage, device index) -> (FFI entry, kernel parameter count, record name), filled by the stage's first launch on
+# the device; a device index keeps its architecture for the process (``device_arch``)
+_ENTRIES: dict[tuple[str, int], tuple[Any, int, str]] = {}
+
+
+def _arity_error(stage: str, name: str, count: int) -> ValueError:
+    expected = parameters(name)
+    return ValueError(
+        f"stage {stage} ({name}) takes {len(expected)} arguments {expected}; got {count}"
+    )
+
+
+def _stage_entry(stage: str, device_index: int, count: int) -> tuple[Any, int, str]:
+    """Resolve ``stage`` on the device once: the record serving it on the device's architecture, its parameter count
+    (``count`` arguments must match it before the library loads), the loaded library and its FFI entry."""
+    arch = device_arch(device_index)
+    name = stage_record(stage, arch)
+    arity = len(parameters(name))
+    if count != arity:
+        raise _arity_error(stage, name, count)
+    entry = getattr(load(name, arch), record(name)["ffi_entry"])
+    found = _ENTRIES[(stage, device_index)] = (entry, arity, name)
+    return found
+
+
 def launch_stage(
     stage: str,
     grid: tuple[int, int, int],
@@ -189,18 +222,17 @@ def launch_stage(
     device_index: int,
 ) -> None:
     """Launch the record serving ``stage`` on the device's architecture with ``values`` in ``arg_plan`` order (the
-    kernel's parameter order) on ``grid``, on the current torch stream."""
-    arch = device_arch(device_index)
-    name = stage_record(stage, arch)
-    expected = parameters(name)
-    if len(values) != len(expected):
-        raise ValueError(
-            f"stage {stage} ({name}) takes {len(expected)} arguments {expected}; got {len(values)}"
-        )
-    module = load(name, arch)
-    entry = getattr(module, record(name)["ffi_entry"])
-    with tvm_ffi.use_torch_stream():
-        entry(*values, int(grid[0]), int(grid[1]), int(grid[2]))
+    kernel's parameter order) on ``grid``, on the current torch stream of the device.  The tensors of ``values`` are
+    PyTorch tensors on the device: tvm-ffi passes that stream with them, so no stream context is entered here.  The
+    first launch of a stage on a device resolves it (:func:`_stage_entry`, with its errors); later launches check the
+    arity and call the cached FFI entry."""
+    found = _ENTRIES.get((stage, device_index))
+    if found is None:
+        found = _stage_entry(stage, device_index, len(values))
+    entry, arity, name = found
+    if len(values) != arity:
+        raise _arity_error(stage, name, len(values))
+    entry(*values, int(grid[0]), int(grid[1]), int(grid[2]))
 
 
 def run_module(
