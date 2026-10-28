@@ -1251,6 +1251,45 @@ class TestMxFc2HighThroughput:
             problem_k=tile_k,
         )
 
+    def test_mxfp4_mxfp8_tile64_k128_deep_pipeline(self):
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+            DType,
+            SfLayout,
+            TileScheduler,
+        )
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
+            reference_check,
+        )
+
+        cfg = {
+            **_mx_fc2_base(dtype_a=DType.MXE2M1, dtype_b=DType.MXE4M3),
+            "tile_n": 64,
+            "mma_n": 64,
+            "epi_tile_n": 64,
+            "tile_k": 128,
+            "mma_m": 256,
+            "umma_cta_count": 2,
+            "sf_layout_b": int(SfLayout.R8c4),
+            **uniform_pipeline_stage_overrides(9),
+            "tile_scheduler": int(TileScheduler.PERSISTENT),
+            "num_stages_tmem_acc": 2,
+            "epilogue_regs": 168,
+            "mma_regs": 96,
+            "load_regs": 96,
+            "load_sf_regs": 96,
+            "copy_sf_regs": 96,
+            "workid_regs": 96,
+            "padding_regs": 96,
+            "load_b_regs": 96,
+        }
+        assert reference_check(
+            num_experts=2,
+            num_tokens=256,
+            top_k=1,
+            problem_k=2304,
+            **_finalize_tmem(cfg),
+        )
+
 
 class TestMxFc1LowLatency:
     def test_mxfp4_mxfp8_tile8_k512_persistent(self):
@@ -1414,6 +1453,27 @@ class TestMxFc1HighThroughput:
             "epilogue_regs": 168,
         }
         _run_mx_fc1(cfg, num_tokens=256, problem_k=128)
+
+    @pytest.mark.parametrize("tile_k,stages", [(256, 5), (128, 9), (128, 10)])
+    def test_mxfp4_mxfp8_tile64_deep_pipeline(self, tile_k, stages):
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+            DType,
+            SfLayout,
+        )
+
+        cfg = {
+            **_mx_fc1_base(dtype_a=DType.MXE2M1),
+            "tile_n": 64,
+            "mma_n": 64,
+            "epi_tile_n": 64,
+            "tile_k": tile_k,
+            **uniform_pipeline_stage_overrides(stages),
+            "mma_m": 256,
+            "umma_cta_count": 2,
+            "sf_layout_c": int(SfLayout.R8c4),
+            "epilogue_regs": 168,
+        }
+        _run_mx_fc1(cfg, num_tokens=256, problem_n=512, problem_k=2048)
 
     def test_mxfp8_mxfp8_tile128_k128_cluster_persistent(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
