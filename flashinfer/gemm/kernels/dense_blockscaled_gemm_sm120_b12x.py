@@ -2296,6 +2296,7 @@ class DenseGemmKernel:
 
                 for _k_tile in range(0, k_tile_iter_cnt, 1, unroll=2):  # type: ignore[call-overload]
                     mainloop_pipeline.producer_acquire(mainloop_producer_state)
+                    cute.arch.fence_proxy("async.shared", space="cta")
 
                     k_tile_global = k_tile_start + mainloop_producer_state.count
                     if cutlass.const_expr(self.load_path == "tma"):
