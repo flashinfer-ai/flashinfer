@@ -52,7 +52,7 @@ import torch
 
 from .api_logging import flashinfer_experimental_api
 
-_FEATURE = "Cake packed-varlen HD256 GQA training attention (SM100/SM103)"
+_FEATURE = "Cake packed-varlen HD256 GQA training attention (SM100/SM103/SM107)"
 
 
 def _pkg():

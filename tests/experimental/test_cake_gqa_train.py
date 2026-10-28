@@ -24,7 +24,8 @@ On SM100 / SM103 / SM107: the output, the LSE and every gradient against an FP64
 layouts (unequal lengths, tails that are no multiple of a tile, keys fewer than queries, empty segments) in the three
 dK / dV forms, under the accuracy budget declared below; rows that see no key exactly (``out = 0``, ``lse = -inf``,
 zero gradients); document isolation; repeated destination rows accumulated into an existing FP32 destination;
-dynamic shapes through one reused workspace; non-reentrant checkpointing (nothing retained, gradients equal to the
+dynamic shapes through one reused workspace; launches on the operands' device and stream while another device is
+current; non-reentrant checkpointing (nothing retained, gradients equal to the
 eager pair); no device synchronization in steady state; and the speed of the forward and the backward beside a
 kernel resident on another stream.
 
@@ -553,6 +554,35 @@ def test_dynamic_shapes_reuse_one_workspace(device) -> None:
         for q in ((3000, 77), (1,), (500, 0, 260), (2900, 300))
     )
     assert ws.nbytes - ws.tile_counter().untyped_storage().nbytes() == need
+
+
+def test_launches_on_the_operands_device_and_stream(device) -> None:
+    """Operands on ``device`` with another device current: every launch runs on ``device``'s current stream."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs a second CUDA device to make current")
+    other = 1 if device.index == 0 else 0
+    x = _inputs((700, 300, 41), (2000, 300, 900), 24, 4, device, seed=3)
+    with torch.cuda.device(device):
+        ref = _run(x, "fp32")
+        torch.cuda.synchronize(device)
+    prev_device = torch.cuda.current_device()
+    prev_stream = torch.cuda.current_stream(device)
+    side = torch.cuda.Stream(device)
+    try:
+        torch.cuda.set_stream(side)  # also makes ``device`` current
+        torch.cuda.set_device(other)  # ``device`` keeps ``side`` as its current stream
+        assert torch.cuda.current_device() == other
+        assert torch.cuda.current_stream(device) == side
+        side.wait_stream(prev_stream)
+        got = _run(x, "fp32")
+        side.synchronize()
+    finally:
+        torch.cuda.set_stream(prev_stream)
+        torch.cuda.set_device(prev_device)
+    for t in ("out", "lse", "dk", "dv"):
+        assert got[t].device == device, t
+        assert torch.equal(got[t], ref[t]), t
+    _assert_dq_close(got["dq"], ref["dq"])
 
 
 def _ckpt_retained_mib(fn, *inputs) -> float:

@@ -193,7 +193,7 @@ def run_record(
     device_index: int,
 ) -> None:
     """Launch record ``name`` with its kernel parameters named in ``values`` on ``grid``, on the current torch
-    stream of the device."""
+    stream of device ``device_index`` (the operands' device, made current for the launch)."""
     args = []
     for key in parameters(name):
         try:
@@ -201,7 +201,7 @@ def run_record(
         except KeyError:
             raise ValueError(f"record {name} needs argument {key!r}") from None
     entry = getattr(load(name, device_arch(device_index)), record(name)["ffi_entry"])
-    with tvm_ffi.use_torch_stream():
+    with torch.cuda.device(device_index), tvm_ffi.use_torch_stream():
         entry(*args, int(grid[0]), int(grid[1]), int(grid[2]))
 
 
