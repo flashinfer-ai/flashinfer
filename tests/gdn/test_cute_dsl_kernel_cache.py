@@ -580,3 +580,22 @@ def test_nontranspose_disk_cache_round_trip(monkeypatch, tmp_path):
     )
     torch.testing.assert_close(out1, out2, atol=0, rtol=0)
     torch.testing.assert_close(state1, state2, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "cc,B,HV,expected",
+    [
+        ((10, 0), 1, 24, (2, 16)),
+        ((9, 0), 2, 32, (2, 16)),
+        ((8, 9), 8, 24, (2, 8)),
+        ((10, 0), 8, 48, (3, 4)),
+        ((10, 0), 128, 24, (3, 4)),
+        ((10, 7), 1, 24, (2, 8)),
+        ((10, 7), 32, 24, (3, 4)),
+        ((10, 7), 128, 24, (5, 4)),
+    ],
+)
+def test_pretranspose_launch_config_by_state_count(cc, B, HV, expected):
+    from flashinfer.gdn_kernels.gdn_decode_pretranspose import _decode_launch_config
+
+    assert _decode_launch_config(*cc, B, HV) == expected

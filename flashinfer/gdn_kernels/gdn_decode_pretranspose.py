@@ -911,15 +911,21 @@ def _decode_launch_config(major: int, minor: int, B: int, HV: int) -> tuple:
     """(num_stages, blocks_per_state) for the pipelined pretranspose kernel.
 
     SM107 needs more bytes in flight per CTA once there are enough states to
-    fill the GPU; other archs keep the default.
+    fill the GPU; elsewhere few states want more CTAs per state and many want
+    fewer, so each CTA amortizes its prologue over more V rows.
     """
+    num_states = B * HV
     if (major, minor) == (10, 7):
-        num_states = B * HV
         if num_states >= 3072:
             return 5, 4
         if num_states >= 256:
             return 3, 4
-    return NUM_STAGES, NUM_BLOCKS_PER_STATE
+        return NUM_STAGES, NUM_BLOCKS_PER_STATE
+    if num_states <= 64:
+        return NUM_STAGES, 16
+    if num_states < 384:
+        return NUM_STAGES, NUM_BLOCKS_PER_STATE
+    return 3, 4
 
 
 def _pretranspose_kernel_name(
