@@ -726,9 +726,10 @@ def test_ep1_direct_place_switch(monkeypatch) -> None:
     monkeypatch.delenv(DIRECT_PLACE_ENV, raising=False)
     monkeypatch.delenv(DIRECT_PLACE_MIN_TOKENS_ENV, raising=False)
     device = torch.device("cuda", 0)
-    # distinct token capacities per case: the switches are resolved when the pooled
+    # distinct token capacities per case (at least the round bounds, see
+    # test_ep1_direct_place_small_capacity): the switches are resolved when the pooled
     # runner is built
-    for raw, expected, capacity in (("1", True, 41), ("0", False, 42)):
+    for raw, expected, capacity in (("1", True, 541), ("0", False, 542)):
         monkeypatch.setenv(DIRECT_PLACE_ENV, raw)
         layer, _w13, _w2 = _build_layer(
             1, 0, device, token_capacity=capacity, compact_form=1, **DISPATCH_PATHS
@@ -737,7 +738,7 @@ def test_ep1_direct_place_switch(monkeypatch) -> None:
     monkeypatch.setenv(DIRECT_PLACE_ENV, "2")
     with pytest.raises(Exception, match="0 or 1"):
         layer, _w13, _w2 = _build_layer(
-            1, 0, device, token_capacity=45, **DISPATCH_PATHS
+            1, 0, device, token_capacity=545, **DISPATCH_PATHS
         )
         _warm_runner(layer, device)
     monkeypatch.delenv(DIRECT_PLACE_ENV)
@@ -746,7 +747,7 @@ def test_ep1_direct_place_switch(monkeypatch) -> None:
         1,
         0,
         device,
-        token_capacity=47,
+        token_capacity=747,
         direct_place=True,
         compact_form=1,
         **DISPATCH_PATHS,
@@ -755,9 +756,9 @@ def test_ep1_direct_place_switch(monkeypatch) -> None:
     assert runner.direct_place and runner.direct_place_min_tokens == 700
     monkeypatch.delenv(DIRECT_PLACE_MIN_TOKENS_ENV)
     for capacity, kwargs in (
-        (49, dict(compact_form=0)),
-        (51, dict(grid_dispatch_min_tokens=0)),
-        (53, dict(dedup_dispatch=False)),
+        (549, dict(compact_form=0)),
+        (551, dict(grid_dispatch_min_tokens=0)),
+        (553, dict(dedup_dispatch=False)),
     ):
         layer, _w13, _w2 = _build_layer(
             1, 0, device, token_capacity=capacity, direct_place=True, **kwargs
@@ -780,6 +781,58 @@ def test_ep1_direct_place_switch(monkeypatch) -> None:
     runners = {id(_warm_runner(layer, device)) for layer in on}
     assert len(runners) == 1
     assert id(_warm_runner(off, device)) not in runners
+
+
+@requires_sm90
+def test_ep1_direct_place_small_capacity() -> None:
+    """A layer none of whose rounds can be placed directly (token capacity below the
+    grid-dispatch bound or the direct-placement bound) keeps the regular activation
+    matrix (no symmetric buffer) and writes the same bytes as the inbox path; at a
+    capacity equal to both bounds the layer places its largest rounds directly."""
+    device = torch.device("cuda", 0)
+    for capacity, bounds in (
+        (512, {}),
+        (639, dict(direct_place_min_tokens=640)),
+        (599, dict(grid_dispatch_min_tokens=600)),
+    ):
+        kwargs = {**DISPATCH_PATHS, **DIRECT_PLACE, **bounds}
+        off_kwargs = {**kwargs, "direct_place": False}
+        off, w13, w2 = _build_layer(1, 0, device, token_capacity=capacity, **off_kwargs)
+        layer, _w13, _w2 = _build_layer(1, 0, device, token_capacity=capacity, **kwargs)
+        runner = _warm_runner(layer, device)
+        assert not runner.direct_place, (capacity, bounds)
+        assert runner._a1_symm is None and runner.a1 is not None, (capacity, bounds)
+        for num_tokens in (1, capacity // 2, capacity):
+            x, ids, weights = _make_inputs(
+                num_tokens, LOCAL_EXPERTS, 307 + num_tokens, device
+            )
+            reference = _forward(off, x, ids, weights).clone()
+            output = _forward(layer, x, ids, weights).clone()
+            torch.cuda.synchronize()
+            assert runner._direct_flag() == 0, (capacity, num_tokens)
+            assert torch.equal(output, reference), (capacity, num_tokens)
+        # one more token of capacity reaches both bounds: the symmetric matrix and a
+        # direct round at the capacity
+        layer, _w13, _w2 = _build_layer(
+            1, 0, device, token_capacity=capacity + 1, **kwargs
+        )
+        runner = _warm_runner(layer, device)
+        assert runner.direct_place and runner._a1_symm is not None, (capacity, bounds)
+        x, ids, weights = _make_inputs(
+            capacity + 1, LOCAL_EXPERTS, 307 + capacity, device
+        )
+        output = _forward(layer, x, ids, weights).clone()
+        torch.cuda.synchronize()
+        assert runner._direct_flag() == 1, (capacity, bounds)
+        _check(
+            output,
+            x,
+            ids,
+            weights,
+            w13,
+            w2,
+            label=f" ep1 capacity {capacity + 1} direct_place",
+        )
 
 
 @requires_sm90

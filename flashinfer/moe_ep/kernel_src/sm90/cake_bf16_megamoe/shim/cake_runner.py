@@ -204,9 +204,11 @@ PREFIX_FORM_ENV = "FLASHINFER_SM90_CAKE_BF16_PREFIX_FORM"
 # dispatches it this way (decided on the device, the same on every rank); other
 # rounds use the inbox path.  Requested with 1 (``direct_place=True``; default 0);
 # effective only when every rank requests it and its pipe allows it (dedup
-# dispatch, the grid dispatch on, compact form 1, at most 1024 (expert, rank) keys),
-# and then for grid-dispatch rounds with at least DIRECT_PLACE_MIN_TOKENS_ENV
-# (``direct_place_min_tokens``; default the grid-dispatch bound) local tokens.
+# dispatch, the grid dispatch on, compact form 1, at most 1024 (expert, rank) keys,
+# a token capacity of at least both round bounds below), and then for grid-dispatch
+# rounds with at least DIRECT_PLACE_MIN_TOKENS_ENV (``direct_place_min_tokens``;
+# default the grid-dispatch bound) local tokens.  A pipe that cannot use it keeps
+# the regular activation matrix.
 # Bit-identical outputs.
 DIRECT_PLACE_ENV = "FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE"
 DIRECT_PLACE_MIN_TOKENS_ENV = "FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE_MIN_TOKENS"
@@ -556,6 +558,8 @@ class Sm90CakeBf16MoERunner:
             and self._compact_form == 1
             and pipe.E * pipe.ep <= _DIRECT_PLACE_MAX_KEYS
             and output_row_capacity(pipe.m_cap) < _DIRECT_PLACE_MAX_ROWS
+            # a pipe none of whose rounds can be placed directly keeps the regular a1
+            and pipe.token_capacity >= max(direct_min, self._grid_dispatch_min_tokens)
         )
         self._direct = False
         # symmetric a1 + count all-gather area (direct placement)

@@ -114,10 +114,12 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     copied it to; the compact then copies only the later routes of the token to
     the same rank.  It is effective only when every EP rank sets it and every
     rank's pipe can run it (dedup dispatch, the grid dispatch and compact form
-    ``1`` on, at most 1024 (expert, rank) keys); otherwise the layer keeps the
-    inbox path without an error.  A round is placed directly only when every rank
-    dispatches it through the grid dispatch with at least
-    ``direct_place_min_tokens`` local tokens; other rounds take the inbox path.
+    ``1`` on, at most 1024 (expert, rank) keys, ``max_tokens_per_rank`` at least
+    the grid-dispatch bound and ``direct_place_min_tokens``); otherwise the layer
+    keeps the inbox path and its regular activation matrix without an error.  A
+    round is placed directly only when every rank dispatches it through the grid
+    dispatch with at least ``direct_place_min_tokens`` local tokens; other rounds
+    take the inbox path.
     It changes no stored value.  ``None`` reads
     ``FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE`` (``0`` or ``1``, default ``0``) and
     ``FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE_MIN_TOKENS`` (default ``513``, the
