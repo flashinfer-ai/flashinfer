@@ -32,6 +32,7 @@ from flashinfer.gemm.cake_grouped_fp8_gemm import (
     BS_SWAP_RUN32_ROUTE,
     BS_SWAP_S16_ROUTE,
     BS_SWAP_SM100_SMALL_ARCHS,
+    BS_SWAP_SM100_SMALL_KEEP,
     BS_SWAP_SMALL_ARCHS,
     DEEPK_C2_AB6_SCALE1_DIRECT_STORE_ROUTE,
     DEEPK_C2_AB6_SCALE1_ROUTE,
@@ -1324,8 +1325,8 @@ def test_block_scaled_swap_small_block_rule_on_sm_100a():
     its launch is one wave or the layout has at most 20 32-row blocks, the
     one-CTA program otherwise.  For N an odd multiple of 128, the one-CTA
     program for any alignment at 128 <= K <= 512.  K of at most 4096 and at
-    most ``3 * sm_count`` tiles of 32 x 128 rows; an unknown ``sm_count`` keeps
-    the other routes.
+    most ``3 * sm_count`` tiles of 32 x 128 rows; an unknown ``sm_count`` and
+    the layouts of ``BS_SWAP_SM100_SMALL_KEEP`` keep the other routes.
     """
     rule = functools.partial(bs_swap_route_for_shape, num_groups=8, arch="sm_100a")
     small = functools.partial(bs_swap_small_route, arch="sm_100a")
@@ -1366,6 +1367,17 @@ def test_block_scaled_swap_small_block_rule_on_sm_100a():
     # An unknown sm_count keeps the other routes.
     assert small(384, 4096, 1024, alignment=32, sm_count=None) is None
     assert rule(384, 4096, 1024, alignment=32) == BS_SWAP_RUN32_ROUTE
+    # The layouts of BS_SWAP_SM100_SMALL_KEEP keep the other swap-AB routes.
+    for m, n, k, alignment in BS_SWAP_SM100_SMALL_KEEP:
+        assert small(m, n, k, alignment=alignment, sm_count=148) is None
+    assert rule(384, 3072, 1024, alignment=32, sm_count=148) == BS_SWAP_RP32_ROUTE
+    assert rule(512, 2560, 2048, alignment=32, sm_count=148) == BS_SWAP_RUN32_ROUTE
+    assert rule(512, 2048, 2048, alignment=64, sm_count=148) == BS_SWAP_RP32_ROUTE
+    # ... on sm_100a only.
+    assert (
+        bs_swap_small_route(1152, 512, 256, alignment=32, arch="sm_103a", sm_count=152)
+        == BS_SWAP_C1_ROUTE
+    )
     # sm_103a keeps its one-wave rule.
     assert (
         bs_swap_route_for_shape(
@@ -1595,14 +1607,15 @@ def test_launch_plan_takes_the_swap_routes_with_the_architecture():
 # most 1536 rows within the rp32 tile bound; longer multi-run; K > 512 below
 # 100 rows per group; K <= 256 at 2..20 rows per group).  A dict names the
 # route per architecture: sm_100a sends the multi-run layouts of at most 1536
-# rows to the small-block programs up to K 4096 (148 SMs).
+# rows to the small-block programs up to K 4096 (148 SMs), except the layouts
+# of BS_SWAP_SM100_SMALL_KEEP (the rp32 case: 640 rows, N 1024, K 1024).
 BLOCK_SCALED_SWAP_CASES = [
     pytest.param(
         [5, 33, 0, 0, 97, 32, 1, 129],
         1024,
         1024,
         32,
-        {"sm_100a": BS_SWAP_C1_ROUTE, "sm_103a": BS_SWAP_RP32_ROUTE},
+        BS_SWAP_RP32_ROUTE,
         id="rp32",
     ),
     pytest.param(

@@ -468,12 +468,41 @@ BS_SWAP_SM100_SMALL_ARCHS = frozenset({"sm_100a"})
 BS_SWAP_SM100_SMALL_MAX_K = 4096
 BS_SWAP_SM100_SMALL_TILES_PER_SM = 3
 BS_SWAP_SM100_S11_MAX_BLOCKS = 20
+# These compact layouts, ``(m, n, k, alignment)``, keep the other swap-AB
+# routes on BS_SWAP_SM100_SMALL_ARCHS: on a 148-SM B200 the small-block
+# programs were less than 3 % faster than those routes on them, or slower.
+BS_SWAP_SM100_SMALL_KEEP = frozenset(
+    {
+        (256, 4096, 1024, 32),
+        (384, 1024, 128, 32),
+        (384, 2048, 1024, 32),
+        (384, 2560, 2048, 32),
+        (384, 3072, 1024, 32),
+        (512, 2048, 1024, 32),
+        (512, 2048, 2048, 32),
+        (512, 2048, 2048, 64),
+        (512, 2560, 2048, 32),
+        (512, 3072, 1024, 32),
+        (640, 1024, 512, 32),
+        (640, 1024, 768, 32),
+        (640, 1024, 1024, 32),
+        (768, 1536, 1024, 32),
+        (896, 1024, 512, 64),
+        (896, 1280, 1024, 64),
+        (1152, 512, 256, 32),
+        (1152, 1024, 512, 32),
+        (1152, 1024, 1024, 32),
+        (1280, 512, 4096, 32),
+    }
+)
 
 
 def _bs_swap_small_route_sm100(
     m: int, n: int, k: int, *, alignment: int, sm_count: int
 ) -> str | None:
     """The small-block route of ``BS_SWAP_SM100_SMALL_ARCHS`` (see :func:`bs_swap_small_route`)."""
+    if (m, n, k, alignment) in BS_SWAP_SM100_SMALL_KEEP:
+        return None
     blocks = math.ceil(m / BS_SUB_ROWS)
     if (
         k > BS_SWAP_SM100_SMALL_MAX_K
@@ -530,6 +559,9 @@ def bs_swap_small_route(
     - for N an odd multiple of 128, any alignment at
       ``BS_SWAP_C1_N128_MIN_K <= k <= BS_SWAP_C1_N128_MAX_K``:
       ``BS_SWAP_C1_ROUTE``.
+
+    On ``BS_SWAP_SM100_SMALL_ARCHS`` the layouts of ``BS_SWAP_SM100_SMALL_KEEP``
+    keep the other swap-AB routes.
 
     Every 32-row block of a layout whose alignment is a multiple of 32 holds
     one group's rows, so both programs serve the single-run and the multi-run
