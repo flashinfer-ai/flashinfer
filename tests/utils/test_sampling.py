@@ -544,41 +544,10 @@ def test_blackwell_cached_cluster_one_row_over_takes_wide_kernel(
         )
 
 
-@pytest.mark.parametrize(
-    "rows,vocab_size,sm100_route,sm103_route",
-    [
-        # 8-tile 8-CTA chunks: the 4-tile 16-CTA kernel in two waves.
-        (40, 128000, "row", "row"),
-        # 7-tile 8-CTA chunks: two waves on sm_100, the shared-tile kernel on sm_103.
-        (40, 100000, "row", "shared_tiles"),
-        # 7-tile chunks past one wave of shared-tile clusters: the persistent kernel.
-        (84, 100000, "persistent", "persistent"),
-        # 6-tile chunks: the trip rule on sm_100, under 2.5 rows per persistent cluster on sm_103.
-        (80, 90000, "persistent", "shared_tiles"),
-        # 7-tile 16-CTA chunks: the trip rule on sm_100, under 2.5 rows per persistent cluster on sm_103.
-        (24, 212992, "persistent", "shared_tiles"),
-        # 5-tile 8-CTA chunks from 2.5 rows per persistent cluster on.
-        (256, 80000, "persistent", "persistent"),
-        # ... whose fifth tile is more than 1/4 (sm_100) or at least 3/8 (sm_103) full.
-        (160, 70000, "persistent", "shared_tiles"),
-        (128, 68000, "shared_tiles", "shared_tiles"),
-        (320, 69632, "shared_tiles", "shared_tiles"),
-        (160, 71680, "persistent", "persistent"),
-        # 5-tile 16-CTA chunks filling 9/10 of three persistent trips.
-        (40, 151936, "persistent", "persistent"),
-        # Full 16-CTA chunks: 10 (sm_100) or 8 (sm_103) rows per shared-tile cluster.
-        (288, 256000, "persistent", "shared_tiles"),
-    ],
-)
-def test_blackwell_cached_cluster_route_rules_per_arch(
-    rows, vocab_size, sm100_route, sm103_route
-):
-    capability = torch.cuda.get_device_capability()
-    if capability not in ((10, 0), (10, 3)):
-        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
-
+def _check_cached_cluster_route(rows, vocab_size, sm100_route, sm103_route):
     torch.manual_seed(7)
     logits = torch.randn(rows, vocab_size, device="cuda")
+    capability = torch.cuda.get_device_capability()
     expected = sm100_route if capability == (10, 0) else sm103_route
     routes = {
         "row": flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER,
@@ -594,6 +563,145 @@ def test_blackwell_cached_cluster_route_rules_per_arch(
     )
     if expected == "row":
         assert kernel[:2] == (16, 4)
+    probs = flashinfer.sampling.softmax(logits, temperature=0.5)
+    torch.testing.assert_close(
+        probs, torch.softmax(logits / 0.5, dim=-1), atol=1e-3, rtol=1e-3
+    )
+
+
+def _skip_unless_b200_or_gb300():
+    capability = torch.cuda.get_device_capability()
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+    if (capability, sm_count) not in (((10, 0), 148), ((10, 3), 152)):
+        pytest.skip("These expectations are stated for B200 and GB300")
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size,sm100_route,sm103_route",
+    [
+        # 8-tile 8-CTA chunks: the 4-tile 16-CTA kernel in two waves.
+        (40, 128000, "row", "row"),
+        # 7-tile 8-CTA chunks: two waves on sm_100, the shared-tile kernel on sm_103.
+        (40, 100000, "row", "shared_tiles"),
+        # 7-tile chunks past one wave of shared-tile clusters: the persistent kernel.
+        (84, 100000, "persistent", "persistent"),
+        # 6-tile chunks: the trip rule on sm_100, under 2.5 rows per persistent cluster on sm_103.
+        (80, 90000, "persistent", "shared_tiles"),
+        # 7-tile 16-CTA chunks: the trip rule on sm_100, under 2.5 rows per persistent cluster on sm_103.
+        (24, 212992, "persistent", "shared_tiles"),
+        # 5-tile 8-CTA chunks: the persistent kernel from three persistent trips on
+        # when the fifth tile is at least 3/8 full, otherwise from 2.5 rows per
+        # persistent cluster on (sm_100).
+        (256, 80000, "persistent", "persistent"),
+        # ... whose fifth tile is more than 1/4 (sm_100) or at least 3/8 (sm_103) full.
+        (160, 70000, "persistent", "shared_tiles"),
+        (128, 68000, "shared_tiles", "shared_tiles"),
+        (320, 69632, "shared_tiles", "shared_tiles"),
+        (160, 71680, "persistent", "persistent"),
+        # 5-tile 16-CTA chunks filling 9/10 of three persistent trips.
+        (40, 151936, "persistent", "persistent"),
+        # Full 16-CTA chunks: 10 (sm_100) or 8 (sm_103) rows per shared-tile cluster.
+        (256, 256000, "persistent", "persistent"),
+        (352, 256000, "shared_tiles", "shared_tiles"),
+    ],
+)
+def test_blackwell_cached_cluster_route_rules_per_arch(
+    rows, vocab_size, sm100_route, sm103_route
+):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+    _check_cached_cluster_route(rows, vocab_size, sm100_route, sm103_route)
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size,sm100_route,sm103_route",
+    [
+        # 8-tile 8-CTA chunks: the 4-tile 16-CTA kernel in two waves up to 9/5
+        # (sm_100) of its resident clusters; on sm_103 past 7/10 of the resident
+        # 8-CTA shared-tile clusters up to 5/3.
+        (51, 128000, "row", "shared_tiles"),
+        (52, 128000, "row", "row"),
+        (56, 128000, "persistent", "persistent"),
+        # 6-tile 8-CTA chunks: two waves up to 10/7 on sm_100.
+        (44, 90000, "row", "shared_tiles"),
+        (45, 90000, "shared_tiles", "shared_tiles"),
+        (56, 90000, "persistent", "shared_tiles"),
+        # 7-tile 8-CTA chunks: the trip rule.
+        (48, 100000, "shared_tiles", "shared_tiles"),
+        (52, 100000, "persistent", "shared_tiles"),
+        # 8-tile 8-CTA chunks: the trip rule.
+        (68, 128000, "shared_tiles", "persistent"),
+        # 6-tile chunks: the trip rule (sm_100), under 2.5 rows per persistent
+        # cluster (sm_103).
+        (64, 90000, "persistent", "shared_tiles"),
+        (68, 90000, "shared_tiles", "shared_tiles"),
+        (73, 90000, "persistent", "shared_tiles"),
+        (89, 90000, "persistent", "shared_tiles"),
+        (90, 90000, "persistent", "persistent"),
+        # 5-tile 8-CTA chunks whose rows fill at least 4/5 of the persistent trips:
+        # the persistent kernel from three persistent trips on when the fifth tile
+        # is at least 3/8 full (otherwise from 2.5 rows per persistent cluster on
+        # sm_100), below 7 rows per shared-tile cluster.
+        (57, 80000, "shared_tiles", "shared_tiles"),
+        (58, 80000, "shared_tiles", "shared_tiles"),
+        (62, 70000, "shared_tiles", "shared_tiles"),
+        (66, 80000, "shared_tiles", "shared_tiles"),
+        (70, 80000, "shared_tiles", "shared_tiles"),
+        (80, 80000, "persistent", "shared_tiles"),
+        (86, 80000, "persistent", "shared_tiles"),
+        (88, 80000, "persistent", "persistent"),
+        (496, 80000, "persistent", "persistent"),
+        (497, 80000, "shared_tiles", "persistent"),
+        (544, 80000, "shared_tiles", "shared_tiles"),
+        # 5-tile 16-CTA chunks of four persistent trips keep the shared-tile kernel.
+        (48, 151936, "shared_tiles", "shared_tiles"),
+        (56, 163840, "shared_tiles", "shared_tiles"),
+        # Full 16-CTA chunks: 10 (sm_100) or 8 (sm_103) rows per shared-tile cluster.
+        (263, 256000, "persistent", "persistent"),
+        (264, 256000, "persistent", "shared_tiles"),
+        (309, 256000, "persistent", "shared_tiles"),
+        (310, 256000, "shared_tiles", "shared_tiles"),
+        (320, 256000, "shared_tiles", "shared_tiles"),
+        (336, 256000, "shared_tiles", "shared_tiles"),
+    ],
+)
+def test_blackwell_cached_cluster_route_boundaries_per_arch(
+    rows, vocab_size, sm100_route, sm103_route
+):
+    # These rows sit at the boundaries set by the resident clusters of each part.
+    _skip_unless_b200_or_gb300()
+    _check_cached_cluster_route(rows, vocab_size, sm100_route, sm103_route)
+
+
+@pytest.mark.parametrize(
+    "extra_rows,vocab_size,sm100_ctas",
+    [
+        (0, 32000, 8),  # rows * 4 CTAs == 2 * SMs: sm_100 keeps spreading to 8 CTAs
+        (0, 28672, 8),  # from 14 tiles of vocabulary
+        (0, 28664, 4),
+        (2, 32768, 8),  # up to 8 CTAs past it from 15 tiles of vocabulary
+        (2, 30712, 4),
+        (3, 32768, 4),
+    ],
+)
+def test_blackwell_cached_cluster_four_tile_chunks_spread_at_twice_the_sms(
+    extra_rows, vocab_size, sm100_ctas
+):
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+    if sm_count % 2:
+        pytest.skip("The rule is stated for an even SM count")
+
+    torch.manual_seed(7)
+    rows = sm_count // 2 + extra_rows
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        logits, temperature=0.5
+    )
+    expected = sm100_ctas if capability == (10, 0) else 4
+    assert kernel[:2] == (expected, 4)
     probs = flashinfer.sampling.softmax(logits, temperature=0.5)
     torch.testing.assert_close(
         probs, torch.softmax(logits / 0.5, dim=-1), atol=1e-3, rtol=1e-3
