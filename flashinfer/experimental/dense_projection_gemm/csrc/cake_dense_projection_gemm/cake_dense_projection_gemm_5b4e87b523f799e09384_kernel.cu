@@ -149,13 +149,13 @@ kernel_cake_dense_projection_gemm_5b4e87b523f799e09384(float* __restrict__ src, 
             lo[2 * j_2] = r_a - m_a;
             lo[2 * j_2 + 1] = r_b - m_b;
         }
-        unsigned long long pk_off = e0;
-        unsigned long long part_bits = (unsigned long long)(parts + pk_off);
-        int part_vec = full;
-        if ((part_bits & 15) != 0) {
-            part_vec = 0;
+        unsigned long long pk_off_1_0 = e0;
+        unsigned long long part_bits_2_0 = (unsigned long long)(parts + pk_off_1_0);
+        int part_vec_1_0 = full;
+        if ((part_bits_2_0 & 15) != 0) {
+            part_vec_1_0 = 0;
         }
-        if (part_vec == 1) {
+        if (part_vec_1_0 == 1) {
             unsigned int _packed_0[4];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
@@ -177,22 +177,22 @@ kernel_cake_dense_projection_gemm_5b4e87b523f799e09384(float* __restrict__ src, 
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(hi[_lp*2 + 6], hi[_lp*2+1 + 6]));
                 _packed_0[_lp + 3] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<int4*>(parts + pk_off)[0] = reinterpret_cast<int4*>(_packed_0)[0];
+            reinterpret_cast<int4*>(parts + pk_off_1_0)[0] = reinterpret_cast<int4*>(_packed_0)[0];
         } else {
             #pragma unroll
-            for (int j_3 = 0; j_3 < 8; j_3++) {
-                if (nn > e0 + (unsigned long long)j_3) {
-                    *(reinterpret_cast<__nv_bfloat16*>(parts + (pk_off + (unsigned long long)j_3)) + (0)) = (__nv_bfloat16)hi[j_3];
+            for (int j_1_0 = 0; j_1_0 < 8; j_1_0++) {
+                if (nn > e0 + (unsigned long long)j_1_0) {
+                    *(reinterpret_cast<__nv_bfloat16*>(parts + (pk_off_1_0 + (unsigned long long)j_1_0)) + (0)) = (__nv_bfloat16)hi[j_1_0];
                 }
             }
         }
-        unsigned long long pk_off_0 = nn + e0;
-        unsigned long long part_bits_1 = (unsigned long long)(parts + pk_off_0);
-        int part_vec_2 = full;
-        if ((part_bits_1 & 15) != 0) {
-            part_vec_2 = 0;
+        unsigned long long pk_off_1_1 = nn + e0;
+        unsigned long long part_bits_2_1 = (unsigned long long)(parts + pk_off_1_1);
+        int part_vec_1_1 = full;
+        if ((part_bits_2_1 & 15) != 0) {
+            part_vec_1_1 = 0;
         }
-        if (part_vec_2 == 1) {
+        if (part_vec_1_1 == 1) {
             unsigned int _packed_1[4];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
@@ -214,22 +214,22 @@ kernel_cake_dense_projection_gemm_5b4e87b523f799e09384(float* __restrict__ src, 
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(mid[_lp*2 + 6], mid[_lp*2+1 + 6]));
                 _packed_1[_lp + 3] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<int4*>(parts + pk_off_0)[0] = reinterpret_cast<int4*>(_packed_1)[0];
+            reinterpret_cast<int4*>(parts + pk_off_1_1)[0] = reinterpret_cast<int4*>(_packed_1)[0];
         } else {
             #pragma unroll
-            for (int j_4 = 0; j_4 < 8; j_4++) {
-                if (nn > e0 + (unsigned long long)j_4) {
-                    *(reinterpret_cast<__nv_bfloat16*>(parts + (pk_off_0 + (unsigned long long)j_4)) + (0)) = (__nv_bfloat16)mid[j_4];
+            for (int j_1_1 = 0; j_1_1 < 8; j_1_1++) {
+                if (nn > e0 + (unsigned long long)j_1_1) {
+                    *(reinterpret_cast<__nv_bfloat16*>(parts + (pk_off_1_1 + (unsigned long long)j_1_1)) + (0)) = (__nv_bfloat16)mid[j_1_1];
                 }
             }
         }
-        unsigned long long pk_off_3 = nn * 2 + e0;
-        unsigned long long part_bits_4 = (unsigned long long)(parts + pk_off_3);
-        int part_vec_5 = full;
-        if ((part_bits_4 & 15) != 0) {
-            part_vec_5 = 0;
+        unsigned long long pk_off_1_2 = nn * 2 + e0;
+        unsigned long long part_bits_2_2 = (unsigned long long)(parts + pk_off_1_2);
+        int part_vec_1_2 = full;
+        if ((part_bits_2_2 & 15) != 0) {
+            part_vec_1_2 = 0;
         }
-        if (part_vec_5 == 1) {
+        if (part_vec_1_2 == 1) {
             unsigned int _packed_2[4];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
@@ -251,12 +251,12 @@ kernel_cake_dense_projection_gemm_5b4e87b523f799e09384(float* __restrict__ src, 
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lo[_lp*2 + 6], lo[_lp*2+1 + 6]));
                 _packed_2[_lp + 3] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<int4*>(parts + pk_off_3)[0] = reinterpret_cast<int4*>(_packed_2)[0];
+            reinterpret_cast<int4*>(parts + pk_off_1_2)[0] = reinterpret_cast<int4*>(_packed_2)[0];
         } else {
             #pragma unroll
-            for (int j_5 = 0; j_5 < 8; j_5++) {
-                if (nn > e0 + (unsigned long long)j_5) {
-                    *(reinterpret_cast<__nv_bfloat16*>(parts + (pk_off_3 + (unsigned long long)j_5)) + (0)) = (__nv_bfloat16)lo[j_5];
+            for (int j_1_2 = 0; j_1_2 < 8; j_1_2++) {
+                if (nn > e0 + (unsigned long long)j_1_2) {
+                    *(reinterpret_cast<__nv_bfloat16*>(parts + (pk_off_1_2 + (unsigned long long)j_1_2)) + (0)) = (__nv_bfloat16)lo[j_1_2];
                 }
             }
         }

@@ -192,6 +192,17 @@ POOL_SMALL_TILE_POS = 1
 # other measured shape keeps the lever form.
 COMPACT_MAX_TILE_POS = 6
 COMPACT_MIN_TILES = 4
+# Position-selected FP8 static grouped-query program (``attention_fp8_gqa_pin``): the
+# static program with the shared-transposer program's u16-carrier P pack and pinned V
+# release, selected for static grouped-query plans whose lightest CTA runs at least this
+# many main-loop iterations (``cta_loop_iters``: per tile the larger of the two warpgroups'
+# owned ring positions minus one, summed over the CTA's tiles).  The gain is per iteration
+# (CAKE-4389 round 16, H100, paired, cold L2): the rows of 0..3 iterations per warpgroup
+# read inside their null band and keep ``attention_fp8_gqa`` byte for byte.  Queue, compact
+# and tagged plans and every BF16 / MHA plan never take it.  14 = the measured route; a
+# value above every plan's loop count disables the program.  Mirrors the kernel-tests
+# reference planner (``PIN_MIN_CTA_LOOP_ITERS``); the two must agree.
+PIN_MIN_CTA_LOOP_ITERS = 14
 # Tile ORDER of static UNIFORM plans before the
 # list schedule.  The queue kernel balances its pooled tiles at run time and ragged plans
 # are already list-scheduled costliest first, so both keep the legacy order; the mode and
@@ -324,6 +335,17 @@ def fp8_gqa_xshare(plan: dict) -> bool:
     return (
         int(plan.get("gqa", 1)) > 1 and bool(plan["queue"]) and plan["mode"] == "pair"
     )
+
+
+def fp8_gqa_pin(plan: dict) -> bool:
+    """Whether a grouped-query persistent plan of the Sage-FP8 route runs the
+    position-selected static program (``attention_fp8_gqa_pin``).  The planner decides
+    it inside :func:`plan_vsa_sm90` (plan key ``pin``: a static plan, neither queue nor
+    compact nor tagged, whose lightest CTA runs at least ``PIN_MIN_CTA_LOOP_ITERS``
+    main-loop iterations, plan key ``cta_loop_iters``); this reads the key only.  MHA
+    plans (``gqa`` 1) never take it; the kernel-tests reference planner states the same
+    rule."""
+    return int(plan.get("gqa", 1)) > 1 and bool(plan.get("pin", False))
 
 
 def _replicated(mask: torch.Tensor, gqa: int) -> torch.Tensor:
@@ -1690,6 +1712,20 @@ def plan_vsa_sm90(
         and kv_tags_pay(readers)
     )
     tseqs = kv_single_reader_tags(infos, seqs, readers, key_word) if tagged else seqs
+    # Position-selected FP8 static grouped-query program (PIN_MIN_CTA_LOOP_ITERS):
+    # main-loop iterations per warpgroup on the lightest CTA of the final lists (a
+    # 1-position tile contributes 0), decided here and carried as plan keys; the
+    # kernel-tests reference planner computes the same statistic.
+    cta_loop_iters = min(
+        sum(max(len(own) for own in owns[t]) - 1 for t in lst) for lst in lists
+    )
+    pin = bool(
+        gqa > 1
+        and not queue
+        and not compact
+        and not tagged
+        and cta_loop_iters >= PIN_MIN_CTA_LOOP_ITERS
+    )
     for c, st in enumerate(static):
         t = st[0]
         n_hdr = min(HDR_ISSUE, lens[t])
@@ -1753,6 +1789,8 @@ def plan_vsa_sm90(
         "repair_rule": repair_split,
         "MB": mb,
         "NB": nb,
+        "cta_loop_iters": int(cta_loop_iters),
+        "pin": pin,
     }
 
 

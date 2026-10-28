@@ -510,7 +510,8 @@ FWD_TAPES_ARENA_AFTER_FWD: tuple[str, ...] = tuple(
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# Checkpoint-aware light backward (keyword ``reuse_recompute_tapes``; shipped default ``True``, ``False`` under graph="replay")
+# Checkpoint-aware light backward (keyword ``reuse_recompute_tapes``: ``True`` = the shipped default, ``False`` under
+# graph="replay"; ``"auto"`` = kept tapes only when the node closes the checkpointed region, see _fwd_body)
 #
 # ``torch.utils.checkpoint(use_reentrant=False)`` re-runs the checkpointed forward inside ``.backward()``: in the
 # unpack hook of the first saved tensor a backward node reads, synchronously, under the autograd engine's graph task
@@ -576,8 +577,10 @@ def _graph_task_id() -> int:
 #      :func:`chunk_gdn_kcp` right before ``apply``: inside ``forward`` grad mode is always off).  Only then does
 #      autograd create the node and pack its saved tensors; a non-executable ``apply`` packs nothing, so the holders
 #      still waiting would be a later op's and the count below could match by coincidence;
-#   1. ``torch.__version__`` is one of :data:`RECOMPUTE_OUTPUT_TORCH_VERSIONS` (the frame read below is the verified
-#      torch's; one constant, no environment variable);
+#   1. the torch release (:func:`torch_release`: ``torch.__version__`` without its local ``+<build>`` tag, so
+#      ``2.14.1+cu130`` and ``2.14.1+cu132`` are one release) is one of :data:`RECOMPUTE_OUTPUT_TORCH_VERSIONS`
+#      (the frame read below is that release's ``torch/utils/checkpoint.py``, the same file in every CUDA build of
+#      the release; one constant, no environment variable);
 #   2. the top saved-tensors hook pair is a checkpoint-internal one (``_checkpoint_internal``) and its pack hook,
 #      unwrapped from ``torch._dynamo.disable``, is the recomputation hook: closure ``target_frame_ref`` (a weakref to
 #      the ``_CheckpointFrame``) and ``gid`` (the graph task id or ``GraphExecGroup`` torch keys the recompute on);
@@ -593,7 +596,23 @@ def _graph_task_id() -> int:
 # forward (:class:`ChunkGDNKcpFunction`, the one that saves exactly those tensors right after) may skip;
 # :func:`chunk_gdn_kcp_fwd` and a captured graph (``graph="replay"``) never do.  No tensor content is read.
 
-RECOMPUTE_OUTPUT_TORCH_VERSIONS: tuple[str, ...] = ("2.14.1+cu130",)
+# torch RELEASES the frame proof was verified on, compared through torch_release(): the local build tag is not part
+# of the identity (the proof reads torch/utils/checkpoint.py, the same file in every CUDA build of a release)
+RECOMPUTE_OUTPUT_TORCH_VERSIONS: tuple[str, ...] = ("2.14.1",)
+
+
+def torch_release(version: str | None = None) -> str:
+    """The release of a torch version string (default: the running torch): ``"2.14.1+cu132"`` -> ``"2.14.1"``.
+    The local ``+<build>`` tag is dropped; a pre-release tag (``2.15.0.dev20260901``) is kept -- that source is not
+    a release's."""
+    return str(torch.__version__ if version is None else version).split("+", 1)[0]
+
+
+def torch_release_verified(version: str | None = None) -> bool:
+    """Whether ``version`` (default: the running torch) is a release of :data:`RECOMPUTE_OUTPUT_TORCH_VERSIONS`."""
+    return torch_release(version) in RECOMPUTE_OUTPUT_TORCH_VERSIONS
+
+
 # q, k, v, g, beta: what ChunkGDNKcpFunction.forward saves besides the saved set
 _SAVED_OPERANDS = 5
 RECOMPUTE_OUTPUT_STATS: dict[str, int] = {
@@ -607,7 +626,7 @@ def _recompute_output_dead(n_saved: int) -> tuple[bool, str]:
     """Whether the forward running now is torch's non-reentrant checkpoint recompute of a region this node closes
     (its ``n_saved`` tensors fill the frame's remaining holders) -- then nothing reads the recompute's output.
     ``(dead, reason)``; every unreadable or unexpected state is ``(False, reason)``."""
-    if torch.__version__ not in RECOMPUTE_OUTPUT_TORCH_VERSIONS:
+    if not torch_release_verified():
         return False, "torch_version"
     try:
         top = torch._C._autograd._top_saved_tensors_default_hooks(False)
@@ -1101,14 +1120,22 @@ class KernelBackend(Backend):
 
     def run(self, name: str, args: dict[str, Any]) -> None:
         call: KcpCall = args["_call"]
-        record, values, grid, is_test = resolve_launch(
-            name, args, cols_per_cta=self.cols_per_cta
-        )
         be = self.launcher()
         device_index = (
             call.device.index
             if call.device.index is not None
             else torch.cuda.current_device()
+        )
+        grid_args = args.get("_grid_args")
+        if grid_args and "sm_count" in grid_args:
+            # Persistent grids (#5 / #6 / #8): the record's per-architecture CTA factor
+            # reads the architecture this launch loads the library for.
+            args = {
+                **args,
+                "_grid_args": {**grid_args, "arch": be.device_arch(device_index)},
+            }
+        record, values, grid, is_test = resolve_launch(
+            name, args, cols_per_cta=self.cols_per_cta
         )
         module = None
         if is_test:  # a build.test.json record: loaded through load_test, never selected by default
@@ -1915,7 +1942,8 @@ class _Tables:
         k = ("kcp", key, str(device), dtype, content)
         t = cache.get(k)
         if t is None:
-            t = torch.tensor(list(k[4]), dtype=dtype, device=device)
+            # one asynchronous pinned copy (no synchronizing call; cake_kcp_plan.upload_tables)
+            t = cake_kcp_plan.upload_tables({"t": (k[4], dtype, None)}, device)["t"]
             cache[k] = t
         return t
 
@@ -2998,6 +3026,9 @@ def _record(kind: str, call: KcpCall) -> None:
         "fwd_o_reason": call.scratch.get(
             "fwd_o_reason"
         ),  # forward: "always" | "dead" | "not_executable" | why the frame proof did not hold (the decision, recorded on every rank)
+        "hand_off_reason": call.scratch.get(
+            "hand_off_reason"
+        ),  # forward: "always" (True) | "off" | "not_executable" | the frame reason under "auto" ("dead" = kept)
     }
 
 
@@ -4142,6 +4173,24 @@ def _fwd_entry(
     return _ranked(out, batched), saved
 
 
+def _saved_count(call: KcpCall, save: bool) -> int:
+    """What :class:`ChunkGDNKcpFunction` saves for this forward: the five operands and the saved set's tensors
+    (:meth:`KcpSaved.tensors`: ``S_in``; the c1 receive tensor under ``save_transfer``; ``M_seg`` under
+    ``save_transfer`` at ``P > 1``; the saved tapes of the ``save_mode`` when the rank holds tokens) -- known before
+    the forward runs, so the frame proof can decide a hand-off (``reuse_recompute_tapes="auto"``)."""
+    if not save:
+        return _SAVED_OPERANDS
+    opts, tb = call.opts, call.tb
+    n = (
+        1
+        + (1 if opts.save_transfer else 0)
+        + (1 if (opts.save_transfer and tb.P > 1) else 0)
+    )
+    if call.T_r > 0:
+        n += len(saved_tapes(opts.save_mode))
+    return _SAVED_OPERANDS + n
+
+
 def _fwd_body(
     call: KcpCall,
     *,
@@ -4157,6 +4206,28 @@ def _fwd_body(
     checkpoint recompute whose output nothing reads (:func:`_recompute_output_dead`; ``out`` is allocated as ever,
     never written) -- only for an ``executable`` node (the one that packs the saved tensors the proof counts); a
     non-executable one launches with the static reason ``not_executable``."""
+    proof: dict[
+        int, tuple[bool, str]
+    ] = {}  # the checkpoint-frame proof, read once per saved count
+
+    def frame_proof(n_saved: int) -> tuple[bool, str]:
+        if n_saved not in proof:
+            proof[n_saved] = _recompute_output_dead(n_saved)
+        return proof[n_saved]
+
+    hand_off_reason = "always" if hand_off else "off"
+    if hand_off and call.opts.reuse_recompute_tapes == "auto":
+        # keep the tapes only when this node closes the checkpointed region (the frame proof of
+        # recompute_output="auto"): then its backward is the region's first and the kept tapes die before any other
+        # backward runs.  With a later saver in the region (an output projection, an MLP) the kept set would live
+        # through those operations' backward and raise the region's backward peak by the full tape set, so the
+        # replay form is taken there; every unreadable state (another torch release, early stop off, user hooks, a
+        # non-executable node) is the replay form as well.
+        if not (autograd_node and executable and call.opts.graph == "off"):
+            hand_off, hand_off_reason = False, "not_executable"
+        else:
+            hand_off, hand_off_reason = frame_proof(_saved_count(call, save))
+    call.scratch["hand_off_reason"] = hand_off_reason
     if hand_off:
         _kept_evict_all()  # one live entry: the previous set is freed before this forward materialises its own
     _forward(call, save=save, replay=False, hand_off=hand_off)
@@ -4187,7 +4258,7 @@ def _fwd_body(
             reason = "not_executable"
         else:
             # the Function saves the five operands and saved.tensors() right after this forward returns
-            dead, reason = _recompute_output_dead(
+            dead, reason = frame_proof(
                 _SAVED_OPERANDS + (len(saved.tensors()) if saved is not None else 0)
             )
             launch = not dead
@@ -4537,7 +4608,12 @@ class ChunkGDNKcpFunction(torch.autograd.Function):
                 key = _kept_key(
                     gid, q, k, v, g, beta, saved.S_in, saved.T_r, saved.H_qk, saved.HV
                 )
-                kept = _kept_take(key)
+                # under "auto" a forward that did not hand off leaves no entry by design: no miss is counted
+                kept = (
+                    _kept_take(key)
+                    if (opts.reuse_recompute_tapes is True or key in _KEPT)
+                    else None
+                )
             if kept is not None:
                 saved = dataclasses.replace(saved, kept=kept)
         if not dout.is_contiguous():
@@ -4701,4 +4777,6 @@ __all__ = [
     "tape_spec",
     "test_record",
     "tile_index",
+    "torch_release",
+    "torch_release_verified",
 ]

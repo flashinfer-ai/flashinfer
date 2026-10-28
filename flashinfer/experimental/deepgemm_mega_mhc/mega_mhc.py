@@ -43,6 +43,8 @@ FNP_ROWS = 32
 # layout of the hidden-4096 route is a program of its own, storing the BF16 output and its quantization.
 FP8_LAYOUTS = ("col", "extra")
 QUANT_LAYOUTS = ("fp8_group128", "nvfp4")
+# The architectures whose exported programs include the quantized variants' tail forms (mhc_infer_variant_program).
+VARIANT_TAIL_ARCHES = ("sm_107a",)
 FP8_GROUP = 128
 FP4_GROUP = 16
 
@@ -249,7 +251,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "shared_sf": False,
         "shared_sf_block_m": 0,
         "num_splits": "runtime",
-        "arches": ["sm_107a"],
+        "arches": ["sm_107a", "sm_100a", "sm_103a"],
         "compile_flags": [],
         "compile_options": ["--fmad=true"],
         "compile_time_sm_count": False,
@@ -303,7 +305,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "shared_sf": False,
         "shared_sf_block_m": 0,
         "num_splits": "runtime",
-        "arches": ["sm_107a"],
+        "arches": ["sm_107a", "sm_100a", "sm_103a"],
         "compile_flags": [],
         "compile_options": ["--fmad=true"],
         "compile_time_sm_count": False,
@@ -357,7 +359,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "shared_sf": False,
         "shared_sf_block_m": 0,
         "num_splits": "runtime",
-        "arches": ["sm_107a"],
+        "arches": ["sm_107a", "sm_100a", "sm_103a"],
         "compile_flags": [],
         "compile_options": ["--fmad=true"],
         "compile_time_sm_count": False,
@@ -411,7 +413,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "shared_sf": False,
         "shared_sf_block_m": 0,
         "num_splits": "runtime",
-        "arches": ["sm_107a"],
+        "arches": ["sm_107a", "sm_100a", "sm_103a"],
         "compile_flags": [],
         "compile_options": ["--fmad=true"],
         "compile_time_sm_count": False,
@@ -468,6 +470,177 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "shared_sf": False,
         "shared_sf_block_m": 0,
         "num_splits": "runtime",
+        "arches": ["sm_107a", "sm_100a", "sm_103a"],
+        "compile_flags": [],
+        "compile_options": ["--fmad=true"],
+        "compile_time_sm_count": False,
+        "arg_plan": [
+            ["tma_buffer", "residual_map"],
+            ["tma_buffer", "x_map"],
+            ["tma_buffer", "fnp_map"],
+            ["tma_buffer", "post_map"],
+            ["tma_buffer", "comb_map"],
+            ["tma_buffer", "new_residual_map"],
+            ["buffer", "mix_scales"],
+            ["buffer", "mix_bases"],
+            ["buffer", "new_post_mix"],
+            ["buffer", "new_comb_res_mix"],
+            ["buffer", "rmsnorm_weight"],
+            ["buffer", "new_residual"],
+            ["buffer", "y_bf16"],
+            ["buffer", "scratch"],
+            ["buffer", "split_barriers"],
+            ["buffer", "launch_epochs"],
+            ["parameter", "num_tokens"],
+            ["parameter", "num_splits"],
+            ["parameter", "split_div"],
+            ["parameter", "num_ctas"],
+            ["parameter", "hc_norm_eps"],
+            ["parameter", "hc_pre_eps"],
+            ["parameter", "hc_post_scale"],
+            ["parameter", "sinkhorn_eps"],
+            ["parameter", "num_sinkhorn_iters"],
+            ["parameter", "rmsnorm_eps"],
+            ["parameter", "rmsnorm_scale"],
+            ["buffer", "y_fp4"],
+            ["buffer", "y_fp4_sf"],
+            ["buffer", "fp4_global_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [768, 1, 1],
+            "dynamic_smem_bytes": 208896,
+            "cooperative": True,
+            "use_pdl": False,
+        },
+    },
+    "cake_mega_mhc_ed3f407e5a68eb65478e": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_ed3f407e5a68eb65478e_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_ed3f407e5a68eb65478e_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_ed3f407e5a68eb65478e",
+        "hidden": 4096,
+        "shifted": False,
+        "shared_sf": False,
+        "shared_sf_block_m": 0,
+        "num_splits": "runtime",
+        "arches": ["sm_107a"],
+        "compile_flags": [],
+        "compile_options": ["--fmad=true"],
+        "compile_time_sm_count": False,
+        "arg_plan": [
+            ["tma_buffer", "residual_map"],
+            ["tma_buffer", "x_map"],
+            ["tma_buffer", "fnp_map"],
+            ["tma_buffer", "post_map"],
+            ["tma_buffer", "comb_map"],
+            ["tma_buffer", "new_residual_map"],
+            ["buffer", "mix_scales"],
+            ["buffer", "mix_bases"],
+            ["buffer", "new_post_mix"],
+            ["buffer", "new_comb_res_mix"],
+            ["buffer", "rmsnorm_weight"],
+            ["buffer", "new_residual"],
+            ["buffer", "y_bf16"],
+            ["buffer", "scratch"],
+            ["buffer", "split_barriers"],
+            ["buffer", "launch_epochs"],
+            ["parameter", "num_tokens"],
+            ["parameter", "num_splits"],
+            ["parameter", "split_div"],
+            ["parameter", "num_ctas"],
+            ["parameter", "hc_norm_eps"],
+            ["parameter", "hc_pre_eps"],
+            ["parameter", "hc_post_scale"],
+            ["parameter", "sinkhorn_eps"],
+            ["parameter", "num_sinkhorn_iters"],
+            ["parameter", "rmsnorm_eps"],
+            ["parameter", "rmsnorm_scale"],
+            ["buffer", "y_fp8"],
+            ["buffer", "y_fp8_sf"],
+            ["parameter", "fp8_sf_ue8m0"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [768, 1, 1],
+            "dynamic_smem_bytes": 208896,
+            "cooperative": True,
+            "use_pdl": False,
+        },
+    },
+    "cake_mega_mhc_892d774130f06423fd7c": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_892d774130f06423fd7c_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_892d774130f06423fd7c_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_892d774130f06423fd7c",
+        "hidden": 4096,
+        "shifted": False,
+        "shared_sf": False,
+        "shared_sf_block_m": 0,
+        "num_splits": "runtime",
+        "arches": ["sm_107a"],
+        "compile_flags": [],
+        "compile_options": ["--fmad=true"],
+        "compile_time_sm_count": False,
+        "arg_plan": [
+            ["tma_buffer", "residual_map"],
+            ["tma_buffer", "x_map"],
+            ["tma_buffer", "fnp_map"],
+            ["tma_buffer", "post_map"],
+            ["tma_buffer", "comb_map"],
+            ["tma_buffer", "new_residual_map"],
+            ["buffer", "mix_scales"],
+            ["buffer", "mix_bases"],
+            ["buffer", "new_post_mix"],
+            ["buffer", "new_comb_res_mix"],
+            ["buffer", "rmsnorm_weight"],
+            ["buffer", "new_residual"],
+            ["buffer", "y_bf16"],
+            ["buffer", "scratch"],
+            ["buffer", "split_barriers"],
+            ["buffer", "launch_epochs"],
+            ["parameter", "num_tokens"],
+            ["parameter", "num_splits"],
+            ["parameter", "split_div"],
+            ["parameter", "num_ctas"],
+            ["parameter", "hc_norm_eps"],
+            ["parameter", "hc_pre_eps"],
+            ["parameter", "hc_post_scale"],
+            ["parameter", "sinkhorn_eps"],
+            ["parameter", "num_sinkhorn_iters"],
+            ["parameter", "rmsnorm_eps"],
+            ["parameter", "rmsnorm_scale"],
+            ["buffer", "y_fp8"],
+            ["buffer", "y_fp8_sf"],
+            ["parameter", "fp8_sf_ue8m0"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [768, 1, 1],
+            "dynamic_smem_bytes": 217088,
+            "cooperative": True,
+            "use_pdl": False,
+        },
+    },
+    "cake_mega_mhc_5018692c75652529e6fd": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_5018692c75652529e6fd_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_5018692c75652529e6fd_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_5018692c75652529e6fd",
+        "hidden": 4096,
+        "shifted": False,
+        "shared_sf": False,
+        "shared_sf_block_m": 0,
+        "num_splits": "runtime",
         "arches": ["sm_107a"],
         "compile_flags": [],
         "compile_options": ["--fmad=true"],
@@ -510,6 +683,63 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "launch": {
             "block": [768, 1, 1],
             "dynamic_smem_bytes": 208896,
+            "cooperative": True,
+            "use_pdl": False,
+        },
+    },
+    "cake_mega_mhc_12e5bcc41e7940e7d511": {
+        "sources": [
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_12e5bcc41e7940e7d511_kernel.cu",
+            "csrc/experimental/deepgemm_mega_mhc/generated/cake_mega_mhc_12e5bcc41e7940e7d511_binding.cu",
+        ],
+        "kernel_symbol": "kernel_cake_mega_mhc_12e5bcc41e7940e7d511",
+        "hidden": 4096,
+        "shifted": False,
+        "shared_sf": False,
+        "shared_sf_block_m": 0,
+        "num_splits": "runtime",
+        "arches": ["sm_107a"],
+        "compile_flags": [],
+        "compile_options": ["--fmad=true"],
+        "compile_time_sm_count": False,
+        "arg_plan": [
+            ["tma_buffer", "residual_map"],
+            ["tma_buffer", "x_map"],
+            ["tma_buffer", "fnp_map"],
+            ["tma_buffer", "post_map"],
+            ["tma_buffer", "comb_map"],
+            ["tma_buffer", "new_residual_map"],
+            ["buffer", "mix_scales"],
+            ["buffer", "mix_bases"],
+            ["buffer", "new_post_mix"],
+            ["buffer", "new_comb_res_mix"],
+            ["buffer", "rmsnorm_weight"],
+            ["buffer", "new_residual"],
+            ["buffer", "y_bf16"],
+            ["buffer", "scratch"],
+            ["buffer", "split_barriers"],
+            ["buffer", "launch_epochs"],
+            ["parameter", "num_tokens"],
+            ["parameter", "num_splits"],
+            ["parameter", "split_div"],
+            ["parameter", "num_ctas"],
+            ["parameter", "hc_norm_eps"],
+            ["parameter", "hc_pre_eps"],
+            ["parameter", "hc_post_scale"],
+            ["parameter", "sinkhorn_eps"],
+            ["parameter", "num_sinkhorn_iters"],
+            ["parameter", "rmsnorm_eps"],
+            ["parameter", "rmsnorm_scale"],
+            ["buffer", "y_fp4"],
+            ["buffer", "y_fp4_sf"],
+            ["buffer", "fp4_global_scale"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "launch": {
+            "block": [768, 1, 1],
+            "dynamic_smem_bytes": 217088,
             "cooperative": True,
             "use_pdl": False,
         },
@@ -677,6 +907,7 @@ ROUTES: list[dict[str, Any]] = [
     {
         "hidden": 4096,
         "num_splits": "runtime",
+        "regime": "bf16",
         "shifted": False,
         "shared_sf": False,
         "sf_layout": "fp8_group128",
@@ -686,10 +917,51 @@ ROUTES: list[dict[str, Any]] = [
     {
         "hidden": 4096,
         "num_splits": "runtime",
+        "regime": "bf16",
         "shifted": False,
         "shared_sf": False,
         "sf_layout": "nvfp4",
         "program": "cake_mega_mhc_1c61fed11caf93d1b762",
+        "defines": {},
+    },
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "tailpipe",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "program": "cake_mega_mhc_ed3f407e5a68eb65478e",
+        "defines": {},
+    },
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "tailpipe_wsmem",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "program": "cake_mega_mhc_892d774130f06423fd7c",
+        "defines": {},
+    },
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "tailpipe",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "nvfp4",
+        "program": "cake_mega_mhc_5018692c75652529e6fd",
+        "defines": {},
+    },
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "tailpipe_wsmem",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "nvfp4",
+        "program": "cake_mega_mhc_12e5bcc41e7940e7d511",
         "defines": {},
     },
 ]
@@ -790,6 +1062,8 @@ TAIL_PIPE_MAX_SPLITS = 22  # the largest split count the tailpipe program is lau
 # when the tasks run in at least WEIGHT_SMEM_MIN_WAVES waves of the grid (mhc_infer_tail_program).
 WEIGHT_SMEM_MAX_SPLITS = 16
 WEIGHT_SMEM_MIN_WAVES = 5
+VARIANT_WSMEM_REGIME_SPLITS = 8  # the quantized variants' count in that regime
+VARIANT_PLAIN_MIN_WAVES = 7  # ... from this many task waves of the production count on
 
 
 def mhc_infer_num_splits(
@@ -861,6 +1135,74 @@ def mhc_infer_tail_program(
         if (m_blocks * splits + grid - 1) // grid >= WEIGHT_SMEM_MIN_WAVES:
             return "tailpipe_wsmem"
     return "tailpipe" if splits <= TAIL_PIPE_MAX_SPLITS else "bf16"
+
+
+def mhc_infer_variant_num_splits(
+    num_tokens: int, num_sms: int, deterministic: bool = False
+) -> int:
+    """Splits of the quantized-output variants (``sf_layout`` ``"fp8_group128"`` / ``"nvfp4"``): the production rule's
+    count (:func:`mhc_infer_num_splits`), except VARIANT_WSMEM_REGIME_SPLITS = 8 where that rule launches the production
+    program as ``"tailpipe_wsmem"`` (:func:`mhc_infer_tail_program`) and its tasks run in at least
+    VARIANT_PLAIN_MIN_WAVES = 7 waves of the grid (``ceil(m_blocks * splits / grid)``: T >= 3521 on 148 SMs, 3649 on
+    152, 4993 on 208). The variants are the plain program: over that many rounds the two-warp fold of every token
+    costs the helper warps their concurrent tail (what the weight_smem program avoids by keeping the one-warp fold),
+    and 8 splits halve the fold records per token and the tasks per round. Measured on three boards (16 -> 8 splits):
+    8 wins at 7 waves (T = 4096 on 148 and 152 SMs, 5-6 %: nvfp4 99.857 -> 94.241 us and 92.407 -> 86.344 us,
+    fp8_group128 98.935 -> 92.792 us), at 10 waves (T = 8192 on 208 SMs, 1-1.5 %: fp8_group128 125.032 -> 123.119 us,
+    nvfp4 115.792 -> 114.640 us) and at 14 waves (T = 8192 on 148 and 152 SMs, 4-5 %: nvfp4 195.091 -> 186.994 us
+    and 183.975 -> 174.863 us, fp8_group128 194.872 -> 186.456 us); 16 wins at 5 waves (T = 4096 on 208 SMs:
+    fp8_group128 62.168 -> 63.384 us, nvfp4 57.175 -> 57.912 us) and the two counts are mixed at 4 waves (T = 2048 on
+    152 SMs, below the regime), so a T between the tailpipe_wsmem switch and the 7-wave switch keeps the production
+    count, and below that regime (the tailpipe counts) fewer splits are neutral or slower. The outputs of the two
+    counts differ in their last bits (a split's record is the Kahan sum of its own K blocks' chunk partials, so the
+    fold's operands regroup with the count): the count is part of a launch's identity. In deterministic mode the count
+    stays the production rule's 16 unconditionally, because the wave count depends on the SM count and deterministic
+    outputs must stay host-independent: deterministic quantized launches at T >= the 7-wave switch keep 16 splits and
+    the plain program's multi-round cost."""
+    splits = mhc_infer_num_splits(num_tokens, num_sms, deterministic)
+    if deterministic:
+        return splits
+    if mhc_infer_tail_program(num_tokens, num_sms, deterministic) == "tailpipe_wsmem":
+        m_blocks = (num_tokens + 63) // 64
+        grid = mhc_infer_num_ctas(num_tokens, num_sms, splits)
+        if (m_blocks * splits + grid - 1) // grid >= VARIANT_PLAIN_MIN_WAVES:
+            return VARIANT_WSMEM_REGIME_SPLITS
+    return splits
+
+
+def mhc_infer_variant_program(
+    num_tokens: int,
+    num_sms: int,
+    sf_layout: str,
+    deterministic: bool = False,
+    tail_variants: bool = False,
+) -> str:
+    """The program of a quantized-output variant's launch (``sf_layout`` ``"fp8_group128"`` / ``"nvfp4"``) at its split
+    count (:func:`mhc_infer_variant_num_splits`). ``"bf16"`` (the plain variant program) unless the arch ships the
+    variants' tail forms: ``tail_variants`` is the caller's statement of the programs it has (the sm_107a
+    ``mhc_infer_step`` entries with ``sf_layout`` and ``tail_pipe`` [+ ``weight_smem``]), never inferred from the SM
+    count. Then the production program's form (:func:`mhc_infer_tail_program`: ``"tailpipe"`` / ``"tailpipe_wsmem"``,
+    ``"bf16"`` at 32 and 64 splits: T < 385 on 208 SMs), except where the plain program stays: where the production
+    program is ``"tailpipe"`` and all tasks fit one wave of the grid, ``"fp8_group128"`` at fewer than 16 splits
+    (T = 833..1280 on 208 SMs) and ``"nvfp4"`` at 16 splits or more (T = 385..832 on 208 SMs), and both layouts in
+    deterministic mode below the tailpipe_wsmem regime; in those ranges the tail form measured slower than the plain
+    program at some counts. A tail form reorders loads, not arithmetic: at the same split count it writes bitwise the
+    plain variant's outputs, so the choice never changes a launch's outputs."""
+    if not tail_variants:
+        return "bf16"
+    program = mhc_infer_tail_program(num_tokens, num_sms, deterministic)
+    if program != "tailpipe":
+        return program
+    if deterministic:
+        return "bf16"
+    splits = mhc_infer_num_splits(num_tokens, num_sms, deterministic)
+    m_blocks = (num_tokens + 63) // 64
+    grid = mhc_infer_num_ctas(num_tokens, num_sms, splits)
+    if m_blocks * splits <= grid and (
+        splits < 16 if sf_layout == "fp8_group128" else splits >= 16
+    ):
+        return "bf16"
+    return program
 
 
 def split_fn(fn, out=None):
@@ -1184,9 +1526,12 @@ class MegaMHCPlan:
     [T, H // 16] in the linear layout) under the caller's ``fp4_global_scale``
     (float32 [1] on the device), as ``scaled_fp4_quant(y_bf16, fp4_global_scale,
     is_sf_swizzled_layout=False)`` does, a zero scale guarded as there. Any token
-    count in [1, 2**20] is accepted; the split count follows the token count (or
-    ``deterministic``), and the program for that split count must be exported
-    for ``hidden`` with that layout on the device's architecture. The BF16-output
+    count in [1, 2**20] is accepted; the split count follows the token count and
+    the SM count (or ``deterministic``): ``mhc_infer_num_splits`` for the BF16
+    output, ``mhc_infer_variant_num_splits`` for the quantized layouts (8 splits
+    from seven task waves of the production count on), and the program for that
+    split count must be exported for ``hidden`` with that layout on the device's
+    architecture. The BF16-output
     route runs one program per split regime, named by ``mhc_infer_tail_program``
     from the token count and the SM count (``"tailpipe_wsmem"`` up to
     ``WEIGHT_SMEM_MAX_SPLITS`` (16) splits over ``WEIGHT_SMEM_MIN_WAVES`` (5) task
@@ -1201,7 +1546,11 @@ class MegaMHCPlan:
     later change of ``fn`` reaches the kernel through ``update_fn()``, which
     re-splits into the retained buffer on the current stream.
 
-    Scratch, split_barriers, launch_epochs and fnp may be caller-owned. Fresh
+    Scratch, split_barriers, launch_epochs and fnp may be caller-owned. A
+    caller-owned ``scratch`` holds ``mhc_infer_scratch_floats(tokens, splits)``
+    floats of the plan's own split count (``plan.config["num_splits"]``): for a
+    quantized layout at the token counts where that count is 8, a buffer sized
+    from the production count is refused. Fresh
     barriers/epochs must be zeroed once before first use and retained across
     ordinary calls and CUDA Graph replay. Epoch storage always has num_sms
     entries, including CTAs omitted by a selected launch grid. One plan must
@@ -1285,8 +1634,17 @@ class MegaMHCPlan:
             splits = num_splits(tokens, hidden, sms, deterministic)
             regime = None
         else:
-            splits = mhc_infer_num_splits(tokens, sms, deterministic)
-            regime = mhc_infer_tail_program(tokens, sms, deterministic)
+            # The quantized variants take their own count: 8 from seven task waves of
+            # the production count on (inside the weight-staging regime), the
+            # production count elsewhere; the regime names the BF16-output program.
+            if sf_layout in QUANT_LAYOUTS:
+                splits = mhc_infer_variant_num_splits(tokens, sms, deterministic)
+                regime = mhc_infer_variant_program(
+                    tokens, sms, sf_layout, deterministic, arch in VARIANT_TAIL_ARCHES
+                )
+            else:
+                splits = mhc_infer_num_splits(tokens, sms, deterministic)
+                regime = mhc_infer_tail_program(tokens, sms, deterministic)
         program, defines = select_program(
             hidden, splits, shifted, shared_sf, sf_layout, arch, regime=regime
         )

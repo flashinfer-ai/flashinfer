@@ -5,19 +5,24 @@ ranks that own its experts; the combine kernel reads the expert outputs back
 from those ranks and reduces them locally. Where the platform supports it,
 either direction can instead use CFT counted writes: the sender pushes over the
 NVLink fabric with ``fabric.try_put.counted`` and the receiver waits on
-hardware byte counters instead of per-round completion flags.
+hardware byte counters instead of per-round completion flags. Small steps can
+use the Lamport transport (``include/flashinfer/comm/moe_alltoall_lamport.cuh``):
+every pushed vector carries its own arrival, so neither direction waits for
+flags.
 
 One symmetric workspace, laid out by ``moe_a2a_get_workspace_layout``, holds
 the round state, the dispatch receive buffers and the combine buffers of a
-rank. Its size grows with ``ep_size * max_tokens_per_rank``. Instances with the
-same layout share one workspace.
+rank. Its size grows with ``ep_size * max_tokens_per_rank``; the Lamport
+regions, appended by ``moe_a2a_lamport_extend_workspace_layout``, grow with
+``ep_size * lamport_max_tokens``. Instances with the same layout share one
+workspace.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from typing import TYPE_CHECKING, Any, ClassVar, Optional, Sequence
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Optional, Sequence
 
 from .....core.comm.communication import (
     MoEEpCommParams,
@@ -49,6 +54,21 @@ _CFT_MIN_DRIVER_BRANCH = 615
 _CFT_ALIGNMENT_BYTES = 16
 # Top-k values the kernels are specialized for.
 _SUPPORTED_TOP_K = (1, 2, 3, 4, 6, 8, 10, 12, 14, 16, 18, 22)
+# Lamport transport: its payload format (layout constant suffix) per dispatch format.
+_LAMPORT_FORMATS = {
+    None: "BF16",
+    "BF16": "BF16",
+    "MXFP8": "MXFP8",
+    "DeepSeekFp8": "FP8_BLOCK128",
+    "NVFP4": "NVFP4",
+}
+# Default token limit of the Lamport transport (_default_lamport_max_tokens). Up to 159 tokens
+# per rank the transport was faster than the fence transport in every configuration measured
+# (GB300, EP 4 to 64, hidden 3584 to 7168, every payload format), so the default never goes below.
+_LAMPORT_MIN_DEFAULT_MAX_TOKENS = 159
+# Above it the default keeps the ep_size * limit rows a Lamport step polls, copies out and re-arms
+# within this: a speed bound, not a memory budget; the largest that kept every GB300 case faster.
+_LAMPORT_MAX_DEFAULT_REGION_BYTES = 64 << 20
 
 
 def _driver_branch() -> Optional[int]:
@@ -114,14 +134,134 @@ def _probe_cft_support(device_index: int) -> Optional[str]:
     return None
 
 
+class _LamportRow(NamedTuple):
+    """Row geometry of a Lamport payload format, from the kernel module."""
+
+    hidden_bytes: int  # one token's hidden states
+    scale_bytes: int  # one token's scales (0 for BF16)
+    blocks_per_token: int  # dispatch blocks per token slot
+    bytes_per_row: int  # Lamport workspace bytes per (source rank, token) row
+
+
+def _lamport_row(
+    module: Any, index: Any, lamport_format: str, params: MoEEpCommParams
+) -> _LamportRow:
+    """Raises if the kernels do not take rows of ``params.hidden_size``."""
+    return _LamportRow(
+        *map(
+            int,
+            module.moe_a2a_lamport_row_bytes(
+                getattr(index, f"LAMPORT_FORMAT_{lamport_format}"),
+                params.hidden_size,
+                params.top_k,
+            ),
+        )
+    )
+
+
+def _probe_lamport_support(
+    module: Any,
+    params: MoEEpCommParams,
+    config: NVLinkOneSidedConfig,
+    ep_size: int,
+    index: Any,
+) -> Optional[str]:
+    import torch
+
+    if not module.moe_a2a_lamport_available():
+        return "the kernel module has no Lamport kernels for this GPU"
+    if ep_size > index.LAMPORT_MAX_RANKS:
+        return f"it supports at most {index.LAMPORT_MAX_RANKS} EP ranks"
+    if params.top_k > index.LAMPORT_MAX_TOP_K:
+        return f"it supports top_k <= {index.LAMPORT_MAX_TOP_K}"
+    if params.token_dtype != torch.bfloat16:
+        return "it combines BF16 expert outputs only"
+    if config.use_low_precision_combine:
+        return "it has no FP8 combine"
+    if ((params.invalid_expert_id - index.LAMPORT_IDS_SENTINEL) & 0xFFFFFFFF) == 0:
+        return "invalid_expert_id equals its expert-id sentinel as an int32"
+    name = getattr(params.dispatch_format, "name", None)
+    if name not in _LAMPORT_FORMATS:
+        return f"it does not carry the dispatch format {name}"
+    _lamport_row(module, index, _LAMPORT_FORMATS[name], params)
+    return None
+
+
+def _lamport_unsupported_reason(
+    module: Any,
+    params: MoEEpCommParams,
+    config: NVLinkOneSidedConfig,
+    ep_size: int,
+    index: Any,
+) -> Optional[str]:
+    """Why this rank cannot use the Lamport transport, or ``None`` if it can.
+
+    Never raises: every rank must reach the collective Lamport agreement, and a
+    rank whose probe fails falls back to the other transports with the others.
+    """
+    try:
+        return _probe_lamport_support(module, params, config, ep_size, index)
+    except Exception as exc:  # CUDA queries and the kernels' row checks alike
+        return f"the Lamport support probe failed: {type(exc).__name__}: {exc}"
+
+
+def _default_lamport_max_tokens(
+    ep_size: int, num_sms: int, row: _LamportRow, index: Any
+) -> int:
+    """Default token limit of the Lamport transport, in this order of precedence:
+
+    1. at least ``_LAMPORT_MIN_DEFAULT_MAX_TOKENS`` (159);
+    2. else the largest step whose dispatch grid stays below one full wave of
+       resident blocks (from a full wave on, the fence transport catches up),
+       at most the kernels' 512;
+    3. lowered while the Lamport regions (landing, combine and receive rows,
+       ``ep_size * limit`` of them) would exceed
+       ``_LAMPORT_MAX_DEFAULT_REGION_BYTES`` per rank.
+
+    The caller caps it by ``max_tokens_per_rank``.
+    """
+    below_one_wave = (
+        index.LAMPORT_DISPATCH_BLOCKS_PER_SM * num_sms - 1
+    ) // row.blocks_per_token
+    by_region_bytes = _LAMPORT_MAX_DEFAULT_REGION_BYTES // (ep_size * row.bytes_per_row)
+    return max(
+        min(below_one_wave, index.LAMPORT_MAX_TOKENS_PER_RANK, by_region_bytes),
+        _LAMPORT_MIN_DEFAULT_MAX_TOKENS,
+    )
+
+
+def _lamport_request(config: NVLinkOneSidedConfig) -> Optional[bool]:
+    """``config.lamport``, with auto (``None``) off under ``cft=True``: an explicit
+    CFT request keeps every step for CFT counted writes. (``lamport=True`` with
+    ``cft=True`` is refused at construction.)"""
+    if config.lamport is None and config.cft is True:
+        return False
+    return config.lamport
+
+
+def _log_unavailable(
+    transport: str, requested: Optional[bool], available: bool, reason: Optional[str]
+) -> None:
+    """Log why a transport asked for (warning) or left to auto (info) is off."""
+    if requested is not False and not available:
+        (logger.warning if requested else logger.info)(
+            "NVLink one-sided %s disabled: %s",
+            transport,
+            reason or "another EP rank does not support it or turned it off",
+        )
+
+
 @register_communication("nvlink_one_sided")
 class NVLinkOneSidedAlltoAll(MoEEpCommunication):
     """Rank-major dispatch/combine with NVLink one-sided put/get kernels.
 
     ``hidden_states``, its optional scale factors, ``topk_ids`` and
     ``topk_weights`` travel as payloads of a single dispatch. Received rows
-    beyond each source rank's token count get ``invalid_expert_id`` routing.
-    See :class:`NVLinkOneSidedConfig` for CFT counted writes and timeouts.
+    beyond each source rank's token count get ``invalid_expert_id`` routing;
+    after a Lamport step, row ``source_rank * tokens_per_rank + token`` holds
+    that token and rows of tokens not routed here get ``invalid_expert_id``.
+    See :class:`NVLinkOneSidedConfig` for CFT counted writes, the Lamport
+    transport and timeouts.
     """
 
     # Workspaces shared by instances with the same layout, keyed by
@@ -138,10 +278,16 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
     ) -> None:
         import torch
 
-        from ......comm.mnnvl import MnnvlMemory, all_ranks_agree
+        from ......comm.mnnvl import MnnvlMemory
         from ......utils import device_support_pdl
 
         self.config = config = NVLinkOneSidedConfig() if config is None else config
+        # Before any collective, so that every rank fails alike.
+        if config.lamport is True and config.cft is True:
+            raise ValueError(
+                "lamport=True and cft=True both ask for every eligible step; "
+                "set one of them to None or False"
+            )
         # Collective platform check across the EP group; it runs before the
         # base class's local check so that no rank fails alone.
         mapping, mnnvl_config = mnnvl_mapping_and_config(bootstrap, config.comm_backend)
@@ -162,6 +308,12 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             or config.cft_max_tokens_for_combine < 0
         ):
             raise ValueError("CFT token-count limits must be non-negative")
+        if config.lamport_max_tokens is not None and (
+            isinstance(config.lamport_max_tokens, bool)
+            or not isinstance(config.lamport_max_tokens, int)
+            or config.lamport_max_tokens <= 0
+        ):
+            raise ValueError("lamport_max_tokens must be a positive integer or None")
         if params.top_k not in _SUPPORTED_TOP_K:
             raise ValueError(
                 f"NVLinkOneSidedAlltoAll supports top_k in {_SUPPORTED_TOP_K}, "
@@ -186,20 +338,46 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             else config.enable_pdl
         )
 
-        # Every rank must agree on CFT: it changes the workspace layout and
-        # the endpoint exchange is collective. The handle type is the one the
-        # workspace allocation will start with; _bind_cft checks the one it ends with.
-        reason = None
-        if config.cft is not False:
-            fabric_handles = MnnvlMemory.uses_fabric_handles(comm, device.index)
-            reason = _cft_unsupported_reason(device.index, fabric_handles)
-        cft_capable = all_ranks_agree(comm, config.cft is not False and reason is None)
-        if config.cft is not False and not cft_capable:
-            log = logger.warning if config.cft else logger.info
-            log(
-                "NVLink one-sided CFT counted writes disabled: %s",
-                reason or "another EP rank does not support them",
+        # Every rank must agree on CFT and on the Lamport transport (each changes
+        # the workspace layout; the CFT endpoint exchange is collective), on an
+        # explicit Lamport limit and, for the default one, on one SM count: one
+        # collective for all. Each rank votes its own decision, so a rank that
+        # turns a transport off turns it off on every rank. The CFT handle type
+        # is the one the workspace allocation will start with; _bind_cft checks
+        # the one it ends with. Its precheck is collective, so every rank runs it.
+        fabric_handles = MnnvlMemory.uses_fabric_handles(comm, device.index)
+        cft_reason = lamport_reason = num_sms = None
+        lamport = _lamport_request(config)
+        if lamport is False and config.lamport is None:
+            logger.info(
+                "NVLink one-sided Lamport transport off: cft=True keeps every step "
+                "for CFT counted writes"
             )
+        if config.cft is not False:
+            cft_reason = _cft_unsupported_reason(device.index, fabric_handles)
+        if lamport is not False:
+            lamport_reason = _lamport_unsupported_reason(
+                self._module, params, config, self.ep_size, index
+            )
+            if lamport_reason is None:
+                num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+        votes = comm.allgather(
+            (
+                config.cft is not False and cft_reason is None,
+                lamport is not False and lamport_reason is None,
+                num_sms,
+                config.lamport_max_tokens,
+            )
+        )
+        if len({v[3] for v in votes}) > 1:
+            raise ValueError(
+                "lamport_max_tokens must be the same on every EP rank, got "
+                + ", ".join(sorted({repr(v[3]) for v in votes}))
+            )
+        cft_capable = all(v[0] for v in votes)
+        lamport_capable = all(v[1] for v in votes)
+        _log_unavailable("CFT counted writes", config.cft, cft_capable, cft_reason)
+        _log_unavailable("Lamport transport", lamport, lamport_capable, lamport_reason)
 
         tokens = self.ep_size * params.max_tokens_per_rank
         alignment = index.WORKSPACE_ALIGNMENT
@@ -237,6 +415,38 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             cft_capable,
             metainfo,
         )
+        # Largest step of the Lamport transport; 0 when the instance does not use it.
+        self.lamport_max_tokens = 0
+        self._lamport_format: Optional[str] = None
+        self._lamport_row: Optional[_LamportRow] = None
+        self._lamport_workspace_bytes = 0
+        if lamport_capable:
+            lamport_format = _LAMPORT_FORMATS[
+                getattr(params.dispatch_format, "name", None)
+            ]
+            row = _lamport_row(self._module, index, lamport_format, params)
+            if config.lamport_max_tokens is None:  # every rank voted its SM count
+                max_tokens = _default_lamport_max_tokens(
+                    self.ep_size, min(v[2] for v in votes), row, index
+                )
+            else:
+                max_tokens = min(
+                    config.lamport_max_tokens, index.LAMPORT_MAX_TOKENS_PER_RANK
+                )
+            max_tokens = min(max_tokens, params.max_tokens_per_rank)
+            size_before = int(metainfo[index.WORKSPACE_SIZE_INDEX])
+            self._module.moe_a2a_lamport_extend_workspace_layout(
+                metainfo,
+                max_tokens,
+                getattr(index, f"LAMPORT_FORMAT_{lamport_format}"),
+                params.hidden_size,
+            )
+            self.lamport_max_tokens = max_tokens
+            self._lamport_format = lamport_format
+            self._lamport_row = row
+            self._lamport_workspace_bytes = (
+                int(metainfo[index.WORKSPACE_SIZE_INDEX]) - size_before
+            )
         self._state = self._acquire_workspace(mapping, comm, metainfo, cft_capable)
         self.workspace: "torch.Tensor" = self._state["workspace"]
         self.metainfo: "torch.Tensor" = self._state["metainfo"]
@@ -267,6 +477,13 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             # No peer may publish into this workspace until every rank has
             # cleared its own slice.
             comm.barrier()
+            if self.lamport_max_tokens and self.ep_rank == 0:
+                logger.info(
+                    "NVLink one-sided Lamport transport: steps of up to %d tokens per "
+                    "rank, %.1f MiB of workspace per rank",
+                    self.lamport_max_tokens,
+                    self._lamport_workspace_bytes / (1 << 20),
+                )
             state = {
                 "key": key,
                 "mnnvl_mem": mnnvl_mem,
@@ -375,7 +592,7 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         return nvlink_platform_supported()
 
     @property
-    def cft_enabled(self) -> bool:
+    def _cft_enabled(self) -> bool:
         """Whether CFT counted writes are available to this instance's steps."""
         return self._state is not None and self._state["cft_ready"]
 
@@ -411,10 +628,103 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             views[key] = view
         return view
 
+    @property
+    def lamport_enabled(self) -> bool:
+        """Whether the Lamport transport is available to this instance's steps."""
+        return self._state is not None and self.lamport_max_tokens > 0
+
+    def _lamport_carries(
+        self,
+        tokens_per_rank: int,
+        hidden_states: "torch.Tensor",
+        hidden_states_scale: "torch.Tensor | None",
+        topk_weights: "torch.Tensor | None",
+        eplb_local_stats: "torch.Tensor | None",
+    ) -> bool:
+        """Whether the Lamport transport can carry this step: few enough tokens,
+        no EPLB statistics and payloads in the instance's format.
+
+        Depends only on values every rank passes alike, so all ranks take the
+        same transport.
+        """
+        if tokens_per_rank > self.lamport_max_tokens or eplb_local_stats is not None:
+            return False
+        row = self._lamport_row
+
+        def row_bytes(tensor: "torch.Tensor | None") -> int:
+            if tensor is None:
+                return 0
+            return tensor.shape[1] * tensor.element_size() if tensor.dim() == 2 else -1
+
+        if (row_bytes(hidden_states), row_bytes(hidden_states_scale)) != (
+            row.hidden_bytes,
+            row.scale_bytes,
+        ):
+            return False
+        # Senders rewrite payload words equal to a sentinel the way the format
+        # keeps its values (NaN stays NaN), so the dtype must be the format's.
+        if self._lamport_format == "BF16":
+            import torch
+
+            if hidden_states.dtype != torch.bfloat16:
+                return False
+        elif hidden_states.element_size() != 1:  # quantized values are bytes
+            return False
+        return topk_weights is None or (
+            topk_weights.dim() == 2
+            and (topk_weights.shape[1], topk_weights.element_size())
+            == (self.params.top_k, 4)
+        )
+
+    def _dispatch_transports(
+        self,
+        tokens_per_rank: int,
+        payloads: "Sequence[torch.Tensor]",
+        hidden_states: "torch.Tensor",
+        hidden_states_scale: "torch.Tensor | None",
+        topk_weights: "torch.Tensor | None",
+        eplb_local_stats: "torch.Tensor | None",
+    ) -> tuple[bool, bool]:
+        """``(use_lamport, use_cft)`` of a dispatch.
+
+        The Lamport transport takes every step it can carry, ahead of CFT: its
+        combine receives and reduces each token in the same kernel as it lands.
+        CFT counted writes take the other steps within their token limit when
+        every payload row meets their alignment; the fence path the rest.
+        """
+        use_lamport = self._lamport_carries(
+            tokens_per_rank,
+            hidden_states,
+            hidden_states_scale,
+            topk_weights,
+            eplb_local_stats,
+        )
+        use_cft = (
+            not use_lamport
+            and self._use_cft(tokens_per_rank, self.config.cft_max_tokens_for_dispatch)
+            and all(
+                p.shape[1] * p.element_size() % _CFT_ALIGNMENT_BYTES == 0
+                for p in payloads
+            )
+        )
+        return use_lamport, use_cft
+
     def _use_cft(self, tokens_per_rank: int, max_tokens: int) -> bool:
-        if not self.cft_enabled:
+        if not self._cft_enabled:
             return False
         return self.config.cft is True or tokens_per_rank <= max_tokens
+
+    def _combine_uses_cft(
+        self, tokens_per_rank: int, hidden: int, element_size: int
+    ) -> bool:
+        """Whether a non-Lamport combine of this step uses CFT counted writes."""
+        wire_bytes = hidden * (
+            1 if self.config.use_low_precision_combine else element_size
+        )
+        return (
+            self._use_cft(tokens_per_rank, self.config.cft_max_tokens_for_combine)
+            and wire_bytes % _CFT_ALIGNMENT_BYTES == 0
+        )
 
     def _check_rank_mask(self, active_rank_mask: "torch.Tensor | None") -> None:
         import torch
@@ -437,7 +747,7 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         topk_weights: "torch.Tensor | None" = None,
         *,
         hidden_states_scale: "torch.Tensor | None" = None,
-        max_tokens_per_rank: Optional[int] = None,
+        runtime_max_tokens_per_rank: Optional[int] = None,
         eplb_local_stats: "torch.Tensor | None" = None,
         active_rank_mask: "torch.Tensor | None" = None,
     ) -> MoEEpDispatchResult:
@@ -446,6 +756,19 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         ``active_rank_mask`` is a CPU ``uint64`` mask from
         :meth:`active_rank_mask`; tokens routed to a masked-off rank are
         dropped. Requires ``enable_rank_mask=True``.
+
+        A step takes the Lamport transport only if its
+        ``runtime_max_tokens_per_rank`` (the capacity when ``None``) is at most
+        ``lamport_max_tokens``; :class:`NVLinkOneSidedConfig` lists the other
+        conditions.
+
+        Every rank passes ``topk_weights`` in a step or none does (a rank
+        without tokens passes an empty ``[0, top_k]`` tensor, not ``None``),
+        as every rank passes the same ``runtime_max_tokens_per_rank``. A
+        mismatch is not detected: on the fence path a rank that passes weights
+        reads, for a peer that passed none, whatever an earlier step left in
+        its weight rows; a Lamport step can also leave a stale weight row for a
+        later step, or time out (``timeout_sec``).
         """
         import torch
 
@@ -454,16 +777,9 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         check_round_owner(self, self._state)
         self._check_rank_mask(active_rank_mask)
         params = self.params
-        tokens_per_rank = (
-            params.max_tokens_per_rank
-            if max_tokens_per_rank is None
-            else max_tokens_per_rank
+        tokens_per_rank = self._resolve_runtime_max_tokens_per_rank(
+            runtime_max_tokens_per_rank
         )
-        if not 0 < tokens_per_rank <= params.max_tokens_per_rank:
-            raise ValueError(
-                f"max_tokens_per_rank={tokens_per_rank} must be in "
-                f"(0, {params.max_tokens_per_rank}]"
-            )
         if topk_ids.dtype != torch.int32:
             topk_ids = topk_ids.to(torch.int32)
 
@@ -475,10 +791,13 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         if topk_weights is not None:
             payloads.append(topk_weights)
 
-        use_cft = self._use_cft(
-            tokens_per_rank, self.config.cft_max_tokens_for_dispatch
-        ) and all(
-            p.shape[1] * p.element_size() % _CFT_ALIGNMENT_BYTES == 0 for p in payloads
+        use_lamport, use_cft = self._dispatch_transports(
+            tokens_per_rank,
+            payloads,
+            hidden_states,
+            hidden_states_scale,
+            topk_weights,
+            eplb_local_stats,
         )
         recv_offsets, combine_offset, eplb_offset = self._module.moe_a2a_dispatch(
             topk_ids,
@@ -492,8 +811,9 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             params.num_experts,
             eplb_local_stats,
             use_cft,
-            expert_id_index if use_cft else -1,
+            expert_id_index if use_cft or use_lamport else -1,
             params.invalid_expert_id,
+            use_lamport,
             self.config.enable_rank_mask,
             active_rank_mask,
             self.config.timeout_sec,
@@ -508,8 +828,8 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             )
             for offset, payload in zip(recv_offsets, payloads, strict=True)
         ]
-        if not use_cft:
-            # CFT dispatch fills the padding rows' expert ids itself.
+        if not (use_cft or use_lamport):
+            # CFT and Lamport dispatches fill the padding rows' expert ids themselves.
             self._module.moe_a2a_sanitize_expert_ids(
                 recv[expert_id_index],
                 self.workspace,
@@ -529,6 +849,7 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             "tokens_per_rank": tokens_per_rank,
             "local_num_tokens": topk_ids.shape[0],
             "combine_offset": int(combine_offset),
+            "lamport": use_lamport,
         }
         self._state["round_owner"] = self
         recv = [t.flatten(0, 1) for t in recv]
@@ -594,12 +915,10 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
                 dtype=payload.dtype,
                 device=payload.device,
             )
-        wire_bytes = hidden * (
-            1 if self.config.use_low_precision_combine else payload.element_size()
-        )
-        use_cft = (
-            self._use_cft(tokens_per_rank, self.config.cft_max_tokens_for_combine)
-            and wire_bytes % _CFT_ALIGNMENT_BYTES == 0
+        # A Lamport dispatch is followed by a Lamport combine.
+        use_lamport = state["lamport"]
+        use_cft = not use_lamport and self._combine_uses_cft(
+            tokens_per_rank, hidden, payload.element_size()
         )
         self._module.moe_a2a_combine(
             payload,
@@ -619,19 +938,33 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             output,
             self.config.timeout_sec,
             self._enable_pdl,
+            use_lamport,
         )
         self._round = None
         self._state["round_owner"] = None
         return output
 
     def checkpoint_prepare(self) -> None:
-        """Release the workspace's physical memory and CFT endpoints, e.g. so
-        that the process can be checkpointed.
+        """Release the workspace's physical memory and CFT endpoints before a
+        process checkpoint.
 
-        The virtual addresses stay reserved: CUDA graphs captured on the
-        workspace replay correctly after :meth:`checkpoint_restore`. Collective
-        over the EP group and only valid between rounds. Instances sharing the
-        workspace may call it again, which does nothing.
+        A CUDA process checkpoint cannot save the workspace's MNNVL physical
+        memory, which peer processes import, nor its CFT logical endpoints.
+        This method releases both but keeps the workspace's virtual addresses
+        reserved, so CUDA graphs captured on the workspace replay correctly
+        once :meth:`checkpoint_restore` has backed it with new memory:
+
+        .. code-block:: python
+
+            communication.checkpoint_prepare()
+            # checkpoint and restore the process
+            communication.checkpoint_restore(comm_backend)
+
+        Collective over the EP group: every rank calls it in the same order,
+        after all work on the workspace has completed and only between
+        rounds. Instances sharing the workspace may call it again, which does
+        nothing. If it raises once unmapping has begun, the workspace cannot be
+        reused: restart the rank rather than retry.
         """
         state = self._state
         if state is None:
@@ -648,13 +981,16 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         unmap_mnnvl_memory(state["mnnvl_mem"], release_cft)
 
     def checkpoint_restore(self, comm_backend: "CommBackend") -> None:
-        """Back the workspace with new memory after :meth:`checkpoint_prepare`
-        and recreate its CFT endpoints.
+        """Back the workspace with new memory after :meth:`checkpoint_prepare`,
+        re-arm its Lamport regions and recreate its CFT endpoints.
 
-        Collective over ``comm_backend``, which must span the EP group with
-        the original ranks. Does nothing when the workspace is mapped. The CFT
+        Collective over ``comm_backend``, a fresh backend that must span the
+        EP group with the original ranks and world size. Every rank calls it
+        in the same order. Does nothing when the workspace is mapped. The CFT
         endpoints are recreated under the IDs they had, which CUDA graphs
         captured before the checkpoint use; raises if that is not possible.
+        If it raises once remapping has begun, the workspace cannot be reused:
+        restart the rank rather than retry.
         """
         from ......comm.mnnvl import all_ranks_agree
 

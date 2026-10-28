@@ -58,7 +58,7 @@ void Run(TensorView a_x, TensorView a_b, TensorView a_stats, TensorView a_y, int
   check_same_device(a_stats, a_x, "stats", "x");
   check_contiguous(a_y, "y");
   check_same_device(a_y, a_x, "y", "x");
-  TVM_FFI_CHECK((a_T >= 0), ValueError)
+  TVM_FFI_CHECK((a_T >= 0LL), ValueError)
       << KERNEL_NAME << ": requires (T >= 0)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";

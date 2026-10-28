@@ -43,7 +43,7 @@ The package is a self-contained Cake package (FlashInfer issue #6553):
 | `csrc/cake_ffi_checks.h` | The tvm-ffi checks the bindings use; no FlashInfer header is included. |
 | `csrc/cake_sm110_gqa_decode_<digest>_{kernel,binding}.cu` | One device translation unit and one tvm-ffi binding (`run`, `build_cuda_version`) per program. |
 | `csrc/cake_sm110_gqa_decode_device_abi.cuh` | The device ABI block every kernel translation unit includes first: fixed-width typedefs, the `CakeTensorMap64` / `CUtensorMap` size and alignment asserts, the CUDA headers, `make_warp_uniform` and `CAKE_INF`. |
-| `csrc/cake_sm110_gqa_decode_device_helpers.cuh` | The device helper library the kernel translation units share; a unit selects the guarded helpers it uses with `CAKE_SM110_GQA_DECODE_NEED_*` defines before the include. |
+| `csrc/cake_sm110_gqa_decode_device_helpers.cuh` | The device helper library the kernel translation units share; every kernel translation unit includes the whole library, and the helpers a unit does not call emit no code. |
 | `csrc/cake_sm110_gqa_decode_binding_helpers_tma.h` | The host helpers the six TMA bindings share (CUDA and driver error checks, tensor-view accessors, TMA extent and stride conversion), included once per binding inside its namespace after `KERNEL_NAME`. |
 | `backend.py` | Argument validation, routing, the workspace and the launches of both public APIs. |
 
@@ -117,8 +117,7 @@ prepared object and tensors alive until all work and captured Graphs finish.
 Order tensor updates before launch, and allocate separate prepared instances
 for concurrently executing streams or Graphs because workspace is mutable.
 The prepared state records `route` (the registry record), `num_splits` (the
-run-time split count), `grid`, `workspace`, `launch_names` and
-`workspace_bytes`.
+run-time split count), `grid`, `workspace` and `workspace_bytes`.
 
 This API is experimental because its tensor layout and fixed head geometry are
 serving-workload specific. Graduation requires broader workload validation,

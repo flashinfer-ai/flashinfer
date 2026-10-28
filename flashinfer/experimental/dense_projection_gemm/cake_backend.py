@@ -171,6 +171,10 @@ L2_PROMOS = (
     "l2_128b",
     "l2_256b",
 )  # TMA descriptor L2 promotion  [Cake L772]
+W8_FORMS = (
+    "w8r",
+    "w8rs",
+)  # the eight-warp CTA form of the input-gradient GEMM (instance_key field 37; ``_w8r`` / ``_w8rs`` symbols)
 PD_CHOICES = (
     0,
     1,
@@ -568,6 +572,9 @@ def instance_key(
     pro: int = 0,
     sk_first: bool = False,
     lw: bool = False,
+    mg: bool = False,
+    sw: int = 0,
+    form: str = "",
 ) -> tuple:
     """The instance tuple the Cake kernel module traces one program per (validation included):
     ``(a_mn, b_mn, out_f32, out_t, block_n, stages, diag, epi, slots, box_rows, cta_rows, pf,
@@ -631,7 +638,33 @@ def instance_key(
     ``sk_slab`` 2, ``stt``, ``sk_sync`` or ``htail``).  ``lw`` (the round-2 shapes tranche, field 34 = LAST, symbol
     ``_lw`` after ``_or`` and before ``_pro``) lets the load warp leave the pair prelude before the post-allocation CTA
     rendezvous (the first TMA loads issue once the cluster rendezvous and the barrier init are done); pair programs
-    whose MMA warp allocates TMEM only (``pro`` bit 4, never ``cta1``).
+    whose MMA warp allocates TMEM only (``pro`` bit 4, never ``cta1``).  ``mg`` (field 35 = LAST, symbol ``_mg``
+    directly after ``_lw``) selects the whole-tile tile resolve: the load warp and the MMA warp take the whole-tile
+    constant arm of the work-item walk (one segment per item, no division) and the load warp resolves the raster's
+    three quotients through an fp32 reciprocal with an exact +-1 correction (four reciprocals set up once per CTA);
+    the epilogue keeps the plain path.  Whole tiles only (the kernel requires a plan without stream-K units and
+    fewer than 2**21 cluster tiles), so it excludes the batch raster, the column-grouped raster, the half-height
+    tail and every stream-K form (``sk_exact`` / ``sk_first`` / ``sk_sync`` / ``sk_slab`` / ``stt``); every other
+    field is unchanged and the OFF form renders byte-identical.  ``sw`` (field 36, symbol ``_sw<n>``
+    directly after ``_mg`` and before ``_pro``; 0 = off) paces the output stores of the bf16 TMA-store pd-2 drain:
+    each epilogue warp delays its bulk tensor store issue, after the staging write and its fences, by a per-warp
+    number of steps of ``sw`` dependent u32 multiply-adds seeded by a clock sample (even chunks (9 - warp) steps,
+    odd chunks (warp - 2) steps), so each per-item eight-store burst becomes a seven-step ramp; the stores and
+    bytes are unchanged.  A step count >= 0 that needs that drain (``slots`` > 0, ``pd`` 2, no fp32 output);
+    every other field is unchanged and the OFF form renders byte-identical.  ``form`` (field 37 = LAST, symbol
+    ``_w8r`` / ``_w8rs`` directly after ``_pro<n>`` and before the diag tokens; "" = the ten-warp pipeline of every
+    other program) selects the eight-warp CTA form of the same GEMM: ``w8r`` = four epilogue warps, a loader, a
+    scheduler and the MMA warp on CTA-pair 256 x 256 tiles over six 32 KiB stages, whole tiles through
+    cluster-launch-control items, the BF16 output through the TMA store and the raster quotients resolved by four
+    fast divisors the host passes (``fd_tiles_l`` / ``fd_tiles_g`` / ``fd_group`` / ``fd_last``), with the
+    accumulator released by every epilogue warp after its last read; ``w8rs`` = the same with the loader's elected
+    lane issuing the cluster-launch-control queries (no scheduler warp).  It is refused with every field it cannot
+    carry: a layout other than ``kn``, an fp32 or transposed output, the single-CTA form, a tile other than the
+    128 x 256 pair tile, an epilogue other than the one-slot TMA store, a narrow B panel, a box cap, any tail or
+    raster form (``sk_exact`` / ``sk_first`` / ``sk_sync`` / ``sk_slab`` / ``htail`` / ``cgrp`` / ``batch_group`` /
+    ``stt`` / ``ovl`` / ``ovr`` / ``park``) and any pair-program knob off its plain value (``pd`` / ``pro`` / ``lw`` /
+    ``mg`` / ``sw`` / a non-default stage count / ``hints`` / ``pf`` / ``sh`` / ``store_hint`` / ``store_ef`` /
+    ``quad_store`` / ``f32_v8``); the OFF form renders byte-identical.
     [Cake ``instance_key``]"""
     a_mn, b_mn, out_f32, out_t = bool(a_mn), bool(b_mn), bool(out_f32), bool(out_t)
     block_n, cta_rows, pf = int(block_n), int(cta_rows), int(pf)
@@ -924,6 +957,80 @@ def instance_key(
             f"lw (the load warp out of the pair prelude) needs the cluster pair with the MMA-warp allocator (pro bit 4); "
             f"got cta1={cta1}, pro={pro}"
         )
+    mg = bool(mg)
+    if mg and (
+        batch_group
+        or cgrp
+        or htail
+        or sk_exact
+        or sk_first
+        or sk_sync
+        or sk_slab
+        or stt
+    ):
+        raise ValueError(
+            "mg (whole-tile tile resolve) is written for the plain row-grouped raster and the whole-tile walk: no "
+            f"batch_group, cgrp, htail or stream-K form (got batch_group={batch_group}, cgrp={cgrp}, htail={htail}, "
+            f"sk_exact={bool(sk_exact)}, sk_first={sk_first}, sk_sync={sk_sync}, sk_slab={sk_slab}, stt={stt})"
+        )
+    sw = int(sw)
+    if sw < 0 or (sw and (epi != "tma" or not slots or int(pd) != 2 or out_f32)):
+        # the paced output stores are written for the bf16 TMA-store pd-2 drain (the kernel's refusal)
+        raise ValueError(
+            f"sw (paced output stores) is a step count >= 0 and needs the bf16 TMA-store pd 2 drain (slots > 0, pd 2, "
+            f"no out_f32); got sw={sw}, epi={epi!r}, slots={slots}, pd={pd}, out_f32={out_f32}"
+        )
+    form = str(form or "")
+    if form and (
+        form not in W8_FORMS
+        or a_mn
+        or not b_mn
+        or out_f32
+        or out_t
+        or cta1
+        or block_n != 256
+        or cta_rows != 128
+        or epi != "tma"
+        or slots != 1
+        or b_swz != 128
+        or box_rows
+        or sk_exact
+        or sk_first
+        or sk_sync
+        or sk_slab
+        or htail
+        or cgrp
+        or batch_group
+        or stt
+        or ovl
+        or ovr
+        or park
+        or pd
+        or pro
+        or lw
+        or mg
+        or sw
+        or stages != default_stages(slots, cta_rows, block_n, b_mn, b_swz, cg, stt)
+        or hints != ("none", "none")
+        or pf
+        or sh
+        or store_hint != "none"
+        or store_ef
+        or quad_store
+        or f32_v8
+    ):
+        # the eight-warp CTA form is written for the kn bf16 row-major 128 x 256 pair tile with the one-slot TMA-store
+        # epilogue, whole tiles and none of the pair programs' pipeline knobs (the kernel's frozen configurations)
+        raise ValueError(
+            f"form (the eight-warp CTA form) must be one of {W8_FORMS} on the kn bf16 row-major 128 x 256 pair tile "
+            f"with the one-slot TMA-store epilogue, the default stage count, plain hints and no tail, raster or "
+            f"pipeline knob; got form={form!r}, a_mn={a_mn}, b_mn={b_mn}, out_f32={out_f32}, out_t={out_t}, "
+            f"cta1={cta1}, block_n={block_n}, cta_rows={cta_rows}, epi={epi!r}, slots={slots}, b_swz={b_swz}, "
+            f"box_rows={box_rows}, stages={stages}, hints={hints}, pd={pd}, pro={pro}, lw={lw}, mg={mg}, sw={sw}, "
+            f"sk_exact={bool(sk_exact)}, sk_first={sk_first}, sk_sync={sk_sync}, sk_slab={sk_slab}, htail={htail}, "
+            f"cgrp={cgrp}, batch_group={batch_group}, stt={stt}, ovl={ovl}, ovr={ovr}, park={park}, pf={pf}, "
+            f"sh={sh}, store_hint={store_hint!r}, store_ef={store_ef}, quad_store={quad_store}, f32_v8={f32_v8}"
+        )
     return (
         a_mn,
         b_mn,
@@ -959,6 +1066,9 @@ def instance_key(
         pro,
         sk_first,
         lw,
+        mg,
+        sw,
+        form,
     )
 
 
@@ -978,7 +1088,9 @@ def instance_symbol(key: tuple) -> str:
     after ``_sks`` for the transposed stmatrix / TMA-store staging (round 27); a trailing ``_pro<n>`` after ``_or`` for
     the pair prologue / cleanup sync form (round 33; absent when 0 - the single-CTA ``_c1`` programs never carry it);
     the round-2 shapes tranche adds ``_skf`` directly after ``_skx`` (``sk_first``) and ``_lw`` between ``_or`` and
-    ``_pro`` (``lw``)).
+    ``_pro`` (``lw``); ``_mg`` directly after ``_lw`` for the whole-tile tile resolve (``mg``); ``_sw<n>`` directly
+    after ``_mg`` for the paced output stores (``sw``, absent when 0); ``_w8r`` / ``_w8rs`` directly after ``_pro<n>``
+    and before the diag tokens for the eight-warp CTA form (``form``, absent when "")).
     [Cake ``instance_symbol``]"""
     (
         a_mn,
@@ -1015,6 +1127,9 @@ def instance_symbol(key: tuple) -> str:
         pro,
         sk_first,
         lw,
+        mg,
+        sw,
+        form,
     ) = key
     cg = 1 if cta1 else CTA_GROUP
     so = {
@@ -1066,7 +1181,10 @@ def instance_symbol(key: tuple) -> str:
         + ("_cg" if cgrp else "")
         + ("_or" if ovr else "")
         + ("_lw" if lw else "")
+        + ("_mg" if mg else "")
+        + (f"_sw{sw}" if sw else "")
         + (f"_pro{pro}" if pro else "")
+        + (f"_{form}" if form else "")
         + "".join(f"_{d}" for d in diag)
     )
 
@@ -1082,10 +1200,22 @@ def swap_small_m(L: int, M: int, N: int, transposed_out: bool) -> bool:
 # Per-architecture, per-row knob overrides measured in Cake round 2, keyed by the static row identity
 # (arch, A MN-major, B MN-major, fp32 output, transposed output, batched, N, K, M); the ragged token
 # count never keys a rule (M = None for forward / input gradients, K = None for weight gradients).
-# The round-2 to round-33 rules are byte-identical to Cake ``ROW_RULES``; the shapes tranche below them (sm_100a and
+# The round-2 to round-33 rules mirror the former launcher's row table; the shapes tranche below them (sm_100a and
 # sm_103a) was measured with this package's planner and extends it per architecture (three round-33 sm_100a keys were
 # re-measured and re-valued there).  An architecture-wide default (``ARCH_RULE_DEFAULTS``, round 33) sits under every rule
-# of that architecture (``row_rule`` merges it; a row rule overrides).
+# of that architecture (``row_rule`` merges it; a row rule overrides).  Three sm_103a input-gradient rows (4096 -> 512,
+# 5120 -> 512 and the kv_a 6144 -> 576) carry ``mg`` with ``sk: False``: the whole-tile tile resolve (``_mg`` programs)
+# measured faster than the row's program above the pair spread at both T on GB300, and those programs run whole tiles
+# only (the planner drops a rule's ``mg`` where the plan carries stream-K units and refuses a caller-forced one there).
+# Two sm_103a input-gradient rows (5120 -> 512 and 5120 -> 1024) carry ``sw`` 25: the paced output stores (``_sw25``
+# programs) measured faster than the row's program above the pair spread at both T on GB300; the knob needs the bf16
+# TMA-store pd-2 drain (the planner drops a rule's ``sw`` where the planned program is not that drain or a caller forces
+# the single-CTA form, and refuses a caller-forced one there).  Three sm_103a input-gradient rows (4096 -> 512, 5120 -> 512
+# and the kv_a 6144 -> 576) carry ``form``: the eight-warp CTA form of the same GEMM (``_w8r`` / ``_w8rs`` programs)
+# measured faster than the row's program above the pair spread at both T on GB300; the knobs after it are the row's
+# program where the form yields (the planner drops a rule's form where the plan carries stream-K units, the single-CTA
+# form, another tile or output class, the register epilogue or a caller-forced pipeline knob, and refuses a caller-forced
+# form there).
 ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, False, False, False, False, 32, 6144, None): {"cta1": True},
     ('sm_100a', False, False, False, False, False, 128, 6144, None): {"cta1": True},
@@ -1308,7 +1438,7 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_103a', False, True, False, False, False, 4096, 48, None): {"epi": 'tma', "slots": 2, "pro": 15, "htail": True, "lw": True},
     ('sm_103a', False, True, False, False, False, 4096, 64, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2, "lw": True, "group_m": 32},
     ('sm_103a', False, True, False, False, False, 4096, 128, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2, "lw": True, "group_m": 32},
-    ('sm_103a', False, True, False, False, False, 4096, 512, None): {"epi": 'tma', "slots": 1, "pro": 15, "pd": 2, "lw": True, "promo": 'l2_256b'},
+    ('sm_103a', False, True, False, False, False, 4096, 512, None): {"form": 'w8rs', "epi": 'tma', "slots": 1, "pro": 15, "pd": 2, "lw": True, "promo": 'l2_256b', "mg": True, "sk": False},
     ('sm_103a', False, True, False, False, False, 4096, 1024, None): {"pd": 2, "pro": 15},
     ('sm_103a', False, True, False, False, False, 4096, 4096, None): {"htail": True, "cgrp": True, "group_m": 16, "pro": 15},
     ('sm_103a', False, True, False, False, False, 4096, 12288, None): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 16},
@@ -1316,10 +1446,14 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_103a', False, True, False, False, False, 5120, 48, None): {"epi": 'tma', "slots": 2, "pro": 15, "htail": True, "lw": True},
     ('sm_103a', False, True, False, False, False, 5120, 64, None): {"epi": 'tma', "slots": 2, "cta1": True, "pd": 3},
     ('sm_103a', False, True, False, False, False, 5120, 128, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2, "lw": True, "group_m": 32},
-    ('sm_103a', False, True, False, False, False, 5120, 512, None): {"epi": 'tma', "slots": 1, "pro": 15, "pd": 2, "group_m": 8, "promo": 'l2_256b'},
-    ('sm_103a', False, True, False, False, False, 5120, 1024, None): {"pd": 2, "pro": 15},
+    ('sm_103a', False, True, False, False, False, 5120, 512, None): {"form": 'w8r', "epi": 'tma', "slots": 1, "pro": 15, "pd": 2, "group_m": 12, "promo": 'l2_256b', "mg": True, "sk": False, "sw": 25},
+    ('sm_103a', False, True, False, False, False, 5120, 1024, None): {"pd": 2, "pro": 15, "sw": 25},
     ('sm_103a', False, True, False, False, False, 5120, 5120, None): {"cgrp": True, "group_m": 12, "pro": 15},
     ('sm_103a', False, True, False, False, False, 5120, 17408, None): {"cta_rows": 256, "ovr": True, "htail": True},
+    # the kv_a input gradient (6144 -> 576): the inherited sm_100a knobs restated so that this row keeps its program
+    # where the eight-warp form yields and when it takes the whole-tile tile resolve (an sm_103a rule stops the parent
+    # lookup); the raster group of 12 row tiles is the row's measured launch parameter
+    ('sm_103a', False, True, False, False, False, 6144, 576, None): {"form": 'w8rs', "group_m": 12, "slots": 1, "epi": 'tma', "pd": 2, "pro": 15, "mg": True, "sk": False},
     ('sm_103a', False, True, False, False, False, 8192, 128, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2},
     ('sm_103a', False, True, False, False, False, 12288, 4096, None): {"cgrp": True, "group_m": 16, "pro": 15},
     ('sm_103a', False, True, False, False, False, 17408, 5120, None): {"cgrp": True, "group_m": 16, "pro": 15},
@@ -1865,6 +1999,19 @@ class GemmPlan:
     # no launch argument
     sk_first: bool = False
     lw: bool = False
+    # the whole-tile tile resolve (instance_key field 35, ``_mg``): the load warp and the MMA warp walk whole tiles with
+    # the raster quotients resolved through corrected fp32 reciprocals; a program knob of plans without stream-K units
+    # (``sk_units`` 0, the kernel's launch contract) - no launch argument, no plan arithmetic
+    mg: bool = False
+    # the paced output stores (instance_key field 36, ``_sw<n>``): the per-warp step count by which each epilogue warp of
+    # the bf16 TMA-store pd-2 drain delays its bulk tensor store issue - a program knob, no launch argument, no plan
+    # arithmetic (0 = off)
+    sw: int = 0
+    # the eight-warp CTA form (instance_key field 37, ``_w8r`` / ``_w8rs``; "" = the ten-warp pipeline): the same GEMM
+    # through four epilogue warps, a loader, a scheduler (``w8r``) or the loader's elected lane in its place (``w8rs``)
+    # and the MMA warp, whole kn bf16 TMA-store tiles only; a program knob that adds the raster's four fast divisors to
+    # the launch (``_k1_values``) and changes no plan arithmetic
+    form: str = ""
     # FlashInfer-only: the rule's exact-wave BLOCK_N (224) yielded to the default tile because the device's CTA pairs do
     # not fit its tiles in whole waves and the default tile needs fewer waves (``exact_waves``)
     wave_fallback: bool = False
@@ -1975,6 +2122,9 @@ def plan_dense_projection_gemm(
     pro: Optional[int] = None,
     sk_first: Optional[bool] = None,
     lw: Optional[bool] = None,
+    mg: Optional[bool] = None,
+    sw: Optional[int] = None,
+    form: Optional[str] = None,
     arch: str = "sm_100a",
     _fallback: bool = True,
     _allow_swap: bool = True,
@@ -2011,7 +2161,28 @@ def plan_dense_projection_gemm(
     rule with its ``sk_exact`` and dropped with it where the split is not admitted; ``lw`` (``_lw``) is the row's
     load-warp prelude form - taken from the rule and dropped where the planned program cannot carry it (the single-CTA
     form, a ``pro`` without bit 4, a caller-forced tile family); a caller-forced value of either is admitted or refused by
-    ``instance_key``.  Neither changes a launch argument or the plan arithmetic.
+    ``instance_key``.  Neither changes a launch argument or the plan arithmetic.  ``mg`` (``_mg``) is the row's
+    whole-tile tile resolve - taken from the rule (the three sm_103a input-gradient rules that carry it also pin
+    ``sk: False``) and dropped where the planned program cannot carry it: a plan with stream-K units or over the
+    kernel's cluster-tile bound (a caller ``sk`` / ``sk_max_units`` / ``sk_parts`` / exact or synchronised split), a
+    caller-forced raster or tail form the program excludes (``batch_group`` / ``cgrp`` / ``htail`` / ``sk_first`` /
+    ``stt``), the single-CTA form or a caller-forced tile family; a caller-forced ``mg`` is admitted or refused by
+    ``instance_key`` and refused on a plan with stream-K units (the kernel's launch contract: ``sk_units`` is 0 on
+    every ``_mg`` program).  It changes neither a launch argument nor the plan arithmetic.  ``sw`` (``_sw<n>``) is the
+    row's paced output stores - taken from the rule (the two sm_103a input-gradient rules that carry it, 5120 -> 512
+    and 5120 -> 1024, name bf16 TMA-store pd-2 rows) and dropped where the planned program is not the bf16 TMA-store
+    pd-2 drain (a caller-forced register epilogue or ``slots`` 0, another ``pd``, the fp32 output) or is the
+    single-CTA form; a caller-forced ``sw`` is admitted or refused by ``instance_key`` (the kernel's refusal: a step
+    count >= 0 on that drain only).  It changes neither a launch argument nor the plan arithmetic.  ``form``
+    (``_w8r`` / ``_w8rs``) is the row's eight-warp CTA form - taken from the rule (the three sm_103a input-gradient
+    rules that carry it, 4096 -> 512, 5120 -> 512 and the kv_a 6144 -> 576, name whole-tile kn bf16 TMA-store rows)
+    and dropped where the plan is not whole-tile or a caller forces a pipeline, tile, output, epilogue, tail or raster
+    knob (the row's program above the form runs the plan asked for); where it survives, the rule's pair-program knobs
+    (``pd`` / ``pro`` / ``lw`` / ``mg`` / ``sw`` / ``stages`` / ``hints`` / ``pf`` / ``sh`` / ``store_hint`` /
+    ``store_ef`` / ``quad_store`` / ``f32_v8``) are cleared before the key: the eight-warp programs carry none of them.
+    A caller-forced ``form`` is admitted or refused by ``instance_key`` and refused on a plan with stream-K units.  It
+    changes no plan arithmetic; the launch adds the raster's four fast divisors (``fd_tiles_l`` / ``fd_tiles_g`` /
+    ``fd_group`` / ``fd_last``), which the ten-warp programs' argument plans do not name.
     [Cake ``dense_projection_gemm`` L1234-L1358]
 
     One FlashInfer-only deviation: the Cake host applies ``swap_small_m`` unconditionally because it compiles
@@ -2071,6 +2242,9 @@ def plan_dense_projection_gemm(
         pro=pro,
         sk_first=sk_first,
         lw=lw,
+        mg=mg,
+        sw=sw,
+        form=form,
         arch=arch,
     )
     if A.dtype != torch.bfloat16 or B.dtype != torch.bfloat16:
@@ -2158,6 +2332,8 @@ def plan_dense_projection_gemm(
                 "stt",
                 "pro",
                 "lw",
+                "mg",
+                "sw",
             )
         }
     if cta1 is None:
@@ -2265,6 +2441,40 @@ def plan_dense_projection_gemm(
         # form or another ``pro`` on the row keeps that form without it (a caller-forced ``lw`` is admitted or refused by
         # ``instance_key``)
         lw = False
+    rule_mg = mg is None
+    if mg is None:
+        # the whole-tile tile resolve of the row's rule (the ``_mg`` programs): the load warp and the MMA warp walk
+        # whole tiles with the raster quotients resolved through corrected fp32 reciprocals; the rules that carry it
+        # pin ``sk: False`` (read below), and the whole-tile guard before ``instance_key`` drops it from a plan that
+        # still carries stream-K units
+        mg = rule.get("mg", False)
+    mg = bool(mg)
+    if mg and rule_mg and cta1:
+        # the measured ``_mg`` programs are pair programs: a caller-forced single-CTA form keeps the row's single-CTA
+        # program without it (a caller-forced ``mg`` is admitted or refused by ``instance_key``)
+        mg = False
+    rule_sw = sw is None
+    if sw is None:
+        # the paced output stores of the row's rule (the ``_sw<n>`` programs): each epilogue warp of the bf16
+        # TMA-store pd-2 drain delays its bulk tensor store issue by a per-warp number of dependent multiply-add
+        # steps; the drain guard before ``instance_key`` drops it from a plan that is not that drain
+        sw = rule.get("sw", 0)
+    sw = int(sw)
+    if sw and rule_sw and cta1:
+        # the measured ``_sw<n>`` programs are pair programs: a caller-forced single-CTA form keeps the row's
+        # single-CTA program without it (a caller-forced ``sw`` is admitted or refused by ``instance_key``)
+        sw = 0
+    rule_form = form is None
+    if form is None:
+        # the eight-warp CTA form of the row's rule (the ``_w8r`` / ``_w8rs`` programs): the whole-tile guard before
+        # ``instance_key`` drops it from a plan that is not whole-tile or that a caller shaped with a tile, output,
+        # epilogue, tail, raster or pipeline knob
+        form = rule.get("form", "")
+    form = str(form or "")
+    if form not in ("", *W8_FORMS):
+        raise ValueError(
+            f"dense_projection_gemm: form must be one of {W8_FORMS} (the eight-warp CTA form) or '', got {form!r}"
+        )
     if htail is None:
         htail = rule.get("htail", False)
     if b_swz is None:
@@ -2501,6 +2711,74 @@ def plan_dense_projection_gemm(
                 a_mn, b_mn, m_tiles, n_tiles, K, group_m, units, int(l2_bytes)
             ),
         )
+    # The whole-tile guard of ``mg``: the ``_mg`` programs require a plan without stream-K units and fewer than 2**21
+    # cluster tiles (the kernel's ``requires``), and exclude the raster / tail forms ``instance_key`` refuses with it.
+    # A rule's ``mg`` yields where the plan or a caller-forced form breaks that (a caller ``sk`` / ``sk_max_units`` /
+    # ``sk_parts``, an exact or synchronised split, ``htail``, ``cgrp``, ``stt``, ``sk_first``, a batch raster): the
+    # plain program runs the plan asked for.  A caller-forced ``mg`` is refused on such a plan (the forms by
+    # ``instance_key``, the stream-K units and the tile bound here).
+    whole_tiles = sk_units == 0 and (num_full + sk_units) * CTA_GROUP < 2**22
+    if mg and rule_mg:
+        if (
+            not whole_tiles
+            or htail
+            or cgrp
+            or stt
+            or sk_first
+            or exact_plan is not None
+            or sync_plan is not None
+            or batch_group
+        ):
+            mg = False
+    elif mg and not whole_tiles:
+        raise ValueError(
+            f"dense_projection_gemm: mg (whole-tile tile resolve) needs a whole-tile plan under 2**21 cluster tiles "
+            f"(got {sk_units} stream-K units over {num_full + sk_units} cluster tiles)"
+        )
+    # The drain guard of ``sw``: the ``_sw<n>`` programs pace the bf16 TMA-store pd-2 drain and the kernel refuses the
+    # knob elsewhere.  A rule's ``sw`` yields where the planned program is not that drain (a caller-forced register
+    # epilogue or ``slots`` 0, another ``pd``, the fp32 output): the row's unpaced program runs the plan asked for.  A
+    # caller-forced ``sw`` is admitted or refused by ``instance_key``.
+    if sw and rule_sw and (mode != "tma" or nslots == 0 or int(pd) != 2 or out_f32):
+        sw = 0
+    # The whole-tile guard of ``form``: the eight-warp programs run whole kn bf16 128 x 256 pair tiles through the
+    # one-slot TMA-store epilogue under the kernel's cluster-tile bound, with none of the pair programs' pipeline knobs.
+    # A rule's ``form`` yields where the plan or a caller-forced knob breaks that (stream-K units, the single-CTA form,
+    # another tile, output class or epilogue, a tail or raster form, a forced pipeline knob - ``_W8_FIXED``): the row's
+    # program above the form runs the plan asked for.  Where it survives, the rule-derived pair-program knobs are
+    # cleared: the eight-warp programs carry none of them.  A caller-forced ``form`` reaches ``instance_key`` with the
+    # caller's knobs and is refused there (the stream-K units here).
+    if form and rule_form:
+        if (
+            not whole_tiles
+            or cta1
+            or out_f32
+            or transposed_out
+            or a_mn
+            or not b_mn
+            or int(block_n) != 256
+            or int(cta_rows) != 128
+            or mode != "tma"
+            or nslots != 1
+            or htail
+            or cgrp
+            or stt
+            or sk_first
+            or exact_plan is not None
+            or sync_plan is not None
+            or batch_group
+            or any(_caller_knobs.get(k) is not None for k in _W8_FIXED)
+        ):
+            form = ""
+        else:
+            lw, mg, sw, pd, pro, stages = False, False, 0, 0, 0, None
+            hints, pf, sh = _PLAIN_HINTS, 0, 0
+            store_hint, store_ef, quad_store, f32_v8 = "none", False, False, False
+    elif form and not whole_tiles:
+        raise ValueError(
+            f"dense_projection_gemm: form (the eight-warp CTA form) needs a whole-tile kn bf16 plan on 128 x 256 pair "
+            f"tiles under 2**21 cluster tiles (got {sk_units} stream-K units over {num_full + sk_units} cluster tiles)"
+        )
     key = instance_key(
         a_mn=a_mn,
         b_mn=b_mn,
@@ -2537,6 +2815,9 @@ def plan_dense_projection_gemm(
         pro=pro,
         sk_first=sk_first,
         lw=lw,
+        mg=mg,
+        sw=sw,
+        form=form,
     )
     plan = GemmPlan(
         L=L,
@@ -2589,6 +2870,9 @@ def plan_dense_projection_gemm(
         pro=int(key[31]),
         sk_first=bool(key[32]),
         lw=bool(key[33]),
+        mg=bool(key[34]),
+        sw=int(key[35]),
+        form=str(key[36]),
         wave_fallback=wave_fallback,
     )
     check_stream_k_plan(plan)
@@ -2720,6 +3004,41 @@ _CTA1_CLEARED = (
     "sk_first",
     "lw",
 )
+# The caller knobs the eight-warp CTA form yields to (``plan_dense_projection_gemm``): a value a caller forces for any
+# of them shapes the pipeline, tile, epilogue, tail or raster the form cannot carry, so the row's ten-warp program runs
+# the plan asked for.  Every name is a planner keyword whose default is None (a default call never yields).
+_W8_FIXED = (
+    "stages",
+    "epi",
+    "slots",
+    "pf",
+    "hints",
+    "f32_v8",
+    "quad_store",
+    "park",
+    "ovl",
+    "htail",
+    "b_swz",
+    "sk_exact",
+    "batch_group",
+    "store_ef",
+    "store_hint",
+    "pd",
+    "sh",
+    "sk_sync",
+    "sk_sync_m",
+    "sk_slab",
+    "cgrp",
+    "ovr",
+    "stt",
+    "pro",
+    "sk_first",
+    "lw",
+    "mg",
+    "sw",
+    "sk_max_units",
+    "sk_parts",
+)
 _TEMPLATE_PREFIX = "dense_proj_gemm_"
 _HINT_OF_LETTER = {"e": "evict_first", "l": "evict_last", "n": "none"}
 _STORE_HINT_OF_LETTER = {
@@ -2769,6 +3088,12 @@ def _template_class(tokens: tuple[str, ...]) -> tuple[str, bool, bool]:
     return tokens[0], "f32" in tokens, "t" in tokens
 
 
+def _template_form(tokens: tuple[str, ...]) -> str:
+    """The eight-warp CTA form token of a symbol (``w8r`` / ``w8rs``), "" for the ten-warp programs: a class of its
+    own for the registry fallback (a ten-warp row never falls onto an eight-warp program, nor the reverse)."""
+    return next((token for token in tokens if token in W8_FORMS), "")
+
+
 def _template_knobs(
     template: str, *, sk_exact_parts: Optional[int] = None
 ) -> Optional[dict[str, Any]]:
@@ -2779,7 +3104,8 @@ def _template_knobs(
     arithmetic drops a tail policy (the plan names the template without it).  Launch parameters (promo, group_m) are
     not in the symbol and stay unset; ``_skx`` carries no part count, so ``sk_exact`` takes ``sk_exact_parts`` (the
     row's rule) or the kernel tests' 3 parts on 128-row / 2 on 64-row tiles (``_skf`` = its tail-first order,
-    ``_lw`` = the load-warp prelude form); a single-CTA program leaves ``pro`` to
+    ``_lw`` = the load-warp prelude form, ``_mg`` = the whole-tile tile resolve, ``_sw<n>`` = the paced output stores,
+    ``_w8r`` / ``_w8rs`` = the eight-warp CTA form); a single-CTA program leaves ``pro`` to
     the planner (``instance_key`` refuses a forced one).  ``None`` for a symbol outside the family or carrying a token
     the planner never emits (``_box<rows>``, diagnostics)."""
     tokens = _template_tokens(template)
@@ -2814,6 +3140,9 @@ def _template_knobs(
         pro=0,
         sk_first=False,
         lw=False,
+        mg=False,
+        sw=0,
+        form="",
     )
     for token in tokens[1:]:
         if token in ("f32", "t"):
@@ -2874,8 +3203,14 @@ def _template_knobs(
             knobs["ovr"] = True
         elif token == "lw":
             knobs["lw"] = True
+        elif token == "mg":
+            knobs["mg"] = True
+        elif m := re.fullmatch(r"sw(\d+)", token):
+            knobs["sw"] = int(m[1])
         elif m := re.fullmatch(r"pro(\d+)", token):
             knobs["pro"] = int(m[1])
+        elif token in W8_FORMS:
+            knobs["form"] = token
         else:
             return None  # _box<rows> / a diagnostic: not a planner knob
     if knobs["block_n"] is None:
@@ -2897,9 +3232,9 @@ def _template_distance(wanted: tuple[str, ...], candidate: tuple[str, ...]) -> f
 def _registry_variants(
     template: str, arch: str, batched: bool, *, sk_exact_parts: Optional[int] = None
 ) -> tuple[dict[str, Any], ...]:
-    """The knob sets of the generated programs of ``arch`` in the layout / output class of ``template``, nearest
-    symbol first (:func:`_template_distance`, then the name); the batch-raster programs (``_bf`` / ``_bg<n>``) only
-    for a batched row (a batch of one plans no batch raster)."""
+    """The knob sets of the generated programs of ``arch`` in the layout / output class and the CTA form of
+    ``template``, nearest symbol first (:func:`_template_distance`, then the name); the batch-raster programs (``_bf``
+    / ``_bg<n>``) only for a batched row (a batch of one plans no batch raster)."""
     wanted = _template_tokens(template)
     if wanted is None:
         return ()
@@ -2910,6 +3245,8 @@ def _registry_variants(
             continue
         if _template_class(tokens) != _template_class(wanted):
             continue
+        if bool(_template_form(tokens)) != bool(_template_form(wanted)):
+            continue  # the eight-warp CTA form is a class of its own (its programs fall back onto each other only)
         knobs = _template_knobs(candidate, sk_exact_parts=sk_exact_parts)
         if knobs is None or (knobs["batch_group"] and not batched):
             continue
@@ -3542,6 +3879,12 @@ def _k1_values(
         num_full=plan.num_full,
         iters_per_unit=plan.iters_per_unit,
         sk_iters=plan.sk_iters,
+        # the eight-warp programs' raster fast divisors: tiles per batch entry, tiles per raster group, the group's row
+        # tiles and the last group's (the ten-warp programs' argument plans do not name them)
+        fd_tiles_l=plan.m_tiles * plan.n_tiles,
+        fd_tiles_g=plan.group_m * plan.n_tiles,
+        fd_group=plan.group_m,
+        fd_last=plan.m_tiles % plan.group_m or plan.group_m,
     )
 
 
@@ -3583,6 +3926,7 @@ def prepare_dense_projection_gemm(
     ovr: Optional[bool] = None,
     stt: Optional[bool] = None,
     pro: Optional[int] = None,
+    form: Optional[str] = None,
 ) -> PreparedGemm:
     """Validate one binding, plan it for the device and prepare its launch (the only
     allocations of the K1 backend: the stream-K partial slabs and the slice counters).  See the module docstring for the view contract; the keyword
@@ -3620,6 +3964,7 @@ def prepare_dense_projection_gemm(
         ovr=ovr,
         stt=stt,
         pro=pro,
+        form=form,
     )
     plan, a_desc, b_desc, O3, arch, module_name = _k1_plan(
         A, B, out, transposed_out=transposed_out, knobs=knobs

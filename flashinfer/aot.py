@@ -167,9 +167,8 @@ from .jit.mamba.cake_selective_state_update import (
     gen_cake_selective_state_update_modules,
 )
 from .jit.mhc import gen_mhc_module
-from .jit.cake_minimax_h3_mxfp8 import (
-    MiniMaxH3Mxfp8Target,
-    gen_minimax_h3_mxfp8_aot_modules,
+from .jit.cake_minimax_h3_mxfp8_pre_attention import (
+    aot_specs as gen_cake_minimax_h3_mxfp8_pre_attention_aot_modules,
 )
 from .jit.cake_minimax_h3_nvfp4_pre_attention import (
     aot_specs as gen_cake_minimax_h3_nvfp4_pre_attention_aot_modules,
@@ -179,6 +178,7 @@ from .jit.cake_minimax_h3_qkv_quantize_pack import (
 )
 from .jit.mla import (
     gen_mla_module,
+    gen_mla_swa_sm90_module,
     gen_sparse_mla_sm120_module,
 )
 from .jit.cake_sparse_mla_sm120_dsv4_nvfp4 import (
@@ -198,6 +198,9 @@ from .jit.cake_concat_mla_kv_quant_fp8 import (
 )
 from .jit.cake_grouped_mxfp8_quantize import (
     aot_specs as gen_cake_grouped_mxfp8_quantize_aot_modules,
+)
+from .jit.cake_bf16_bmm_swap_ab import (
+    aot_specs as gen_cake_bf16_bmm_swap_ab_aot_modules,
 )
 from .jit.mla_kv_pack import gen_mla_kv_pack_fp8_module
 from .jit.api_log_stats import gen_api_log_stats_module
@@ -317,6 +320,7 @@ def gen_attention(
     has_sm90: bool,
     has_sm100: bool,
     has_sm103: bool,
+    has_sm110: bool,
     add_gemma: bool,
     add_oai_oss: bool,
 ) -> Iterator[JitSpec]:
@@ -492,7 +496,7 @@ def gen_attention(
 
     # fmha_cutlass_sm100a
     # NOTE: currently there's only one uri.
-    if has_sm100 or has_sm103:
+    if has_sm100 or has_sm103 or has_sm110:
         yield gen_fmha_cutlass_sm100a_module(
             dtype_q=torch.bfloat16,
             dtype_kv=torch.bfloat16,
@@ -505,7 +509,8 @@ def gen_attention(
             use_logits_soft_cap=False,
         )
 
-        # trtllm_gen_fmha
+    if has_sm100 or has_sm103:
+        # trtllm_gen_fmha loads prebuilt SM10x cubins, so SM110 cannot share it.
         yield gen_trtllm_gen_fmha_module()
 
     # MLA
@@ -524,8 +529,8 @@ def gen_attention(
                 use_profiler=False,
             )
 
-    # MLA SM100
-    if has_sm100 or has_sm103:
+    # MLA SM100 (also builds for SM110)
+    if has_sm100 or has_sm103 or has_sm110:
         yield gen_mla_module()
 
 
@@ -624,7 +629,14 @@ def _gen_blackwell_bf16_bmm_aot_specs(sm_capabilities: dict) -> List[JitSpec]:
         targets.append("sm100a")
     if sm_capabilities.get("sm103a_exact", False):
         targets.append("sm103a")
-    return [gen_blackwell_bf16_bmm_module(target) for target in targets]
+    specs = [gen_blackwell_bf16_bmm_module(target) for target in targets]
+    # The generated swap-AB programs serving the decode rows of
+    # bmm_bf16(backend="cake"), one library each per exact target.
+    if sm_capabilities.get("sm100a_exact", False):
+        specs.extend(gen_cake_bf16_bmm_swap_ab_aot_modules("sm_100a"))
+    if sm_capabilities.get("sm103a_exact", False):
+        specs.extend(gen_cake_bf16_bmm_swap_ab_aot_modules("sm_103a"))
+    return specs
 
 
 def gen_all_modules(
@@ -713,6 +725,7 @@ def gen_all_modules(
             has_sm90,
             has_sm100,
             has_sm103,
+            has_sm110,
             add_gemma,
             add_oai_oss,
         )
@@ -750,13 +763,12 @@ def gen_all_modules(
                 for variant in BLACKWELL_MSA_VARIANTS_BY_TARGET[blackwell_msa_target]
             )
 
-    minimax_h3_targets: tuple[tuple[MiniMaxH3Mxfp8Target, bool], ...] = (
-        ("sm100a", sm_capabilities.get("sm100a_exact", False)),
-        ("sm103a", sm_capabilities.get("sm103a_exact", False)),
-    )
-    for minimax_h3_target, enabled in minimax_h3_targets:
-        if enabled:
-            jit_specs.extend(gen_minimax_h3_mxfp8_aot_modules(minimax_h3_target))
+    # Cake MiniMax-H3 MXFP8 pre-attention: the norm stage and the fused GEMM of
+    # each exact sm_100a / sm_103a target.
+    if has_sm100a_exact:
+        jit_specs.extend(gen_cake_minimax_h3_mxfp8_pre_attention_aot_modules("sm_100a"))
+    if has_sm103a_exact:
+        jit_specs.extend(gen_cake_minimax_h3_mxfp8_pre_attention_aot_modules("sm_103a"))
 
     # Cake MiniMax-H3 NVFP4 pre-attention: the norm stage and, per output
     # format, the fused GEMM of each exact sm_100a / sm_103a target.
@@ -954,8 +966,10 @@ def gen_all_modules(
             # SM103 registers its own FP4 quantization, CUTLASS fused MoE and FP4 GEMM
             # below, and takes the SM100f TGV GEMMs instead of these sm_100a ones.
             jit_specs.append(gen_fp4_quantization_sm100_module())
-            jit_specs.append(gen_cutlass_fused_moe_sm100_module())
             jit_specs.append(gen_gemm_sm100_module_cutlass_fp4())
+        if has_sm100 or has_sm107 or has_sm110:
+            # The SM100-named MoE also serves SM107 (via SM100f) and SM110.
+            jit_specs.append(gen_cutlass_fused_moe_sm100_module())
         # Both TGV variants share a module name, so a build that also targets SM103
         # must keep only the SM100f one, which runs on both.
         if has_sm100 and not has_sm103:
@@ -972,11 +986,15 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_low_latency_gemm_module())
             jit_specs.append(gen_gemm_sm100_module())
             jit_specs.append(gen_gemm_sm100_module_cutlass_nvfp4_svdquant())
-            jit_specs.append(gen_gemm_sm100_module_cutlass_fp8())
-            jit_specs.append(gen_gemm_sm100_module_cutlass_mxfp8())
-            jit_specs.append(gen_mxfp8_quantization_sm100_module())
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module())
             jit_specs.append(gen_trtllm_gen_routing_module())
+        if has_sm100 or has_sm103 or has_sm107 or has_sm110:
+            # SM107 (via SM100f) and SM110 load this SM100-named FP8 GEMM too.
+            jit_specs.append(gen_gemm_sm100_module_cutlass_fp8())
+        if has_sm100 or has_sm103 or has_sm110:
+            # These SM100-named modules also build for SM110, which loads them at runtime.
+            jit_specs.append(gen_gemm_sm100_module_cutlass_mxfp8())
+            jit_specs.append(gen_mxfp8_quantization_sm100_module())
         if has_sm100f or has_sm103:
             # Add TGV GEMM modules compiled with SM100f flags for both bf16 and fp16
             jit_specs.append(
@@ -1008,11 +1026,13 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_gen_gemm_module(enable_rubin=True))
             jit_specs.append(gen_trtllm_low_latency_gemm_module(enable_rubin=True))
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module(enable_rubin=True))
+            jit_specs.append(gen_trtllm_gen_routing_module())
         if has_sm110:
             jit_specs.append(gen_fp4_quantization_sm110_module())
-            # fused_moe_100 also targets SM110 and must ship in its provider.
+            # fp4_gemm_cutlass also targets SM110 and must ship in its provider
+            # (fused_moe_100 is registered with SM100/SM107 above).
             if not has_sm100:
-                jit_specs.append(gen_cutlass_fused_moe_sm100_module())
+                jit_specs.append(gen_gemm_sm100_module_cutlass_fp4())
         if has_sm120:
             jit_specs.extend(
                 gen_cudnn_frost_moe_module(dtype, "sm_120a") for dtype in FROST_DTYPES
@@ -1075,9 +1095,11 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_comm_module())
         if has_sm100 or has_sm103:
             jit_specs.append(gen_trtllm_mnnvl_comm_module())
+        if has_sm100 or has_sm103 or has_sm110:
             # dcp_alltoall: kernel itself supports SM90+, but ptxas 12.6.0 has
             # a known state-space inference bug on cp.async.bulk that aborts
-            # compilation. has_sm100/has_sm103 imply CUDA >= 12.8, which avoids the bug.
+            # compilation. has_sm100/has_sm103 imply CUDA >= 12.8 and has_sm110
+            # implies CUDA >= 13.0, which avoids the bug.
             # SM90/SM12x users still get this via JIT.
             jit_specs.append(gen_dcp_alltoall_module())
         if (
@@ -1242,7 +1264,7 @@ def gen_all_modules(
                         *dtype_combo, dim, dstate, ntokens, cs_dtype, na_dtype
                     )
                 )
-        if has_sm90 or has_sm100 or has_sm103:
+        if has_sm90 or has_sm100 or has_sm103 or has_sm107:
             jit_specs.append(gen_trtllm_utils_module())
         # FP4 KV cache quantization/dequantization
         jit_specs.append(gen_fp4_kv_dequantization_module())
@@ -1274,6 +1296,9 @@ def gen_all_modules(
                 has_sm121,
             )
         )
+
+    if has_sm90:
+        jit_specs.append(gen_mla_swa_sm90_module())
 
     # Sparse-MLA paged attention for SM120 family (DSv4 + DSv3.2 / GLM5.1).
     if has_sm120 or has_sm121:

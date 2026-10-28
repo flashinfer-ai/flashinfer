@@ -14,6 +14,8 @@ from typing import Literal
 
 import torch
 
+from flashinfer.moe_ep._compat import deprecated_aliases
+
 from .block_scaled import (
     BlockScaledMoeConfig,
     BlockScaledSymmBuffer,
@@ -31,6 +33,7 @@ from .kernel_helpers import (
 )
 
 
+@deprecated_aliases(apply_topk_at_fc1="apply_routing_weights_before_fc2")
 @dataclasses.dataclass(frozen=True)
 class Sm100GenphaseMoeConfig(BlockScaledMoeConfig):
     """MXFP8 E4M3, BF16 combine, grouped GenPhase on SM100/103.
@@ -112,8 +115,8 @@ class Sm100GenphaseSymmBuffer(BlockScaledSymmBuffer):
     def retune(self, knobs) -> None:
         """Collectively replace kernel storage before capture, preserving I/O views.
 
-        Only performance knobs may change. The backend calls this once after
-        its explicit warmup sweep, on an unpooled workspace.
+        Only performance knobs may change. Automatic selection instead uses
+        ``install_tuned_knobs()`` to prepare the winner with its weights.
         """
         from . import comm
         from .tuning import is_valid_sm100_genphase_knobs

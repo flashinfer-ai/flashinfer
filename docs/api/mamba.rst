@@ -29,7 +29,13 @@ fixed-order reduce; no cooperative grid, so kernels resident on other streams
 never stall it) whose SiLU' is evaluated at the BF16-rounded
 preactivation (default) or, with ``silu_grad_preactivation="fp32"``, at the
 unrounded FP32 one for a weight gradient within about 2e-7 rel-L2 of exact, and
-an autograd wrapper that saves only the forward's inputs.
+an autograd wrapper that saves only the forward's inputs.  The forward's
+co-resident CTAs take each channel tile's tokens in chunks from int32 counters
+in a forward workspace (``cake_causal_conv1d_train_forward_workspace`` /
+``cake_causal_conv1d_train_forward_workspace_bytes``; zero before its first
+launch and left zero by every launch, so one buffer serves every later call of
+one stream); when the caller passes none the package keeps one per device and
+stream.
 
 .. currentmodule:: flashinfer.cake_causal_conv1d_train
 
@@ -37,6 +43,7 @@ an autograd wrapper that saves only the forward's inputs.
     :toctree: ../generated
 
     cake_causal_conv1d
+    cake_causal_conv1d_kcp
     cake_causal_conv1d_train_forward
     cake_causal_conv1d_train_backward
     cake_causal_conv1d_train_backward_workspace_bytes

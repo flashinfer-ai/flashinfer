@@ -96,11 +96,14 @@ from .cake_jit import (
     PROGRAM_KEYS,
     PROGRAMS,
     STAGES,
+    TICKET_TAIL_PROGRAMS,
     TRACKING_ISSUE,
     load_program,
 )
 from .cake_policy import (
     MERGE_KEY,
+    SAMPLE_SHIFT_PERMILLE_BOUNDS,
+    TICKET_TAIL_BYTES,
     DispatchPolicy,
     ProgramChoice,
     finalize_grid,
@@ -562,7 +565,11 @@ def plan_dsa_indexer_topk(
     if sample_tiles_max is not None:
         _check_int("sample_tiles_max", sample_tiles_max, 0, 256)
     if sample_shift_permille is not None:
-        _check_int("sample_shift_permille", sample_shift_permille, -1000, 10000)
+        _check_int(
+            "sample_shift_permille",
+            sample_shift_permille,
+            *SAMPLE_SHIFT_PERMILLE_BOUNDS,
+        )
     if far_sample is not None:
         _check_int("far_sample", far_sample, 0, 1)
     if check_period is not None:
@@ -729,6 +736,9 @@ class DSAIndexerRunner:
     workspace: torch.Tensor = field(default=None, repr=False)
     workspace_bytes: int = 0
     grid: tuple[int, int, int] = (1, 1, 1)
+    # the workspace's 128-byte ticket tail, zeroed before every run of a dynamic-ticket
+    # scan program (``TICKET_TAIL_PROGRAMS``); None for the other programs
+    ticket_tail: Optional[torch.Tensor] = field(default=None, repr=False)
 
     @property
     def indices(self) -> torch.Tensor:
@@ -752,6 +762,10 @@ class DSAIndexerRunner:
 
     def run(self) -> tuple[torch.Tensor, torch.Tensor]:
         with _ffi_stream_context(self.device_index):
+            if self.ticket_tail is not None:
+                # the ticket word must read 0 when the scan starts: one 128-byte memset on
+                # the stream (CUDA-graph capturable), only for the dynamic-ticket programs
+                self.ticket_tail.zero_()
             for launch in self.launches:
                 launch()
         return self.tensors["Indices"], self.tensors["Scores"]
@@ -814,10 +828,13 @@ def prepare_dsa_indexer_topk(
     count), ``candidate_multiplier`` (candidate buffer per query in multiples
     of ``top_k``), ``check_period`` (key tiles between selection-trigger
     checks), ``sample_tiles_max`` / ``sample_shift_permille`` (sampled first
-    threshold; ``0`` disables sampling), ``far_sample`` (``1``: the sampled first
-    threshold of the ascending-tile-order scan programs ranks the far sample
-    tiles only, leaving out the sample tile nearest the diagonal; ``0``: every
-    sample tile; the descending-order and wide programs ignore it) and
+    threshold; ``0`` disables sampling and sizes the candidate buffers by the
+    record's unsampled capacity values; the shift defaults to the record's
+    value for the call's ``top_k``, ``sample_shift_rule`` where the record sets
+    one), ``far_sample`` (``1``: the sampled first threshold of the
+    ascending-tile-order scan programs ranks the far sample tiles only,
+    leaving out the sample tile nearest the diagonal; ``0``: every sample
+    tile; the descending-order and wide programs ignore it) and
     ``finalize_threads`` (an admissible registered finalize program) change
     only the internal partition and scheduling of the work: results are
     bitwise identical for every admissible value.  ``T == 0`` returns a runner
@@ -921,7 +938,11 @@ def prepare_dsa_indexer_topk(
         else torch.empty((num_queries, int(top_k)), dtype=torch.float32, device=device),
         "Cand": cand,
         # the split staging [T, n_split, top_k] lives behind the persistent candidate buffers (merge stage only)
-        "Staging": cand[choice.scan_entries :] if choice.split else None,
+        "Staging": cand[
+            choice.scan_entries : choice.scan_entries + choice.staging_entries
+        ]
+        if choice.split
+        else None,
     }
     scalars: dict[str, Any] = dict(
         num_segments=num_segments,
@@ -965,6 +986,12 @@ def prepare_dsa_indexer_topk(
         stages.append(fin_role)
     elif num_queries > 0:
         _padded_outputs(num_queries, int(top_k), device, t["Indices"], t["Scores"])
+    # the dynamic-ticket programs read their next unit from the workspace's 128-byte
+    # tail (behind the candidate buffers and the staging); the runner zeroes it before
+    # every run.  Other programs: no tail view, nothing zeroed.
+    ticket_tail = None
+    if launches and arch in TICKET_TAIL_PROGRAMS.get(programs["scan"], ()):
+        ticket_tail = flat[workspace_bytes - TICKET_TAIL_BYTES : workspace_bytes]
     return DSAIndexerRunner(
         arch=arch,
         abi=abi,
@@ -978,6 +1005,7 @@ def prepare_dsa_indexer_topk(
         workspace=flat,
         workspace_bytes=workspace_bytes,
         grid=grid,
+        ticket_tail=ticket_tail,
     )
 
 

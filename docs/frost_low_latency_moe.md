@@ -1,7 +1,9 @@
 # FROST low-latency routed MoE
 
 `FrostLowLatencyConfig` adds an explicit low-token candidate to `MoELayer` on
-SM100/SM103/SM107, with FMA-only support on SM90 and SM120.
+SM100/SM103/SM107, with FMA coverage on SM80, SM90 and SM120 and bounded
+grouped Tensor Core candidates on SM80/SM90/SM120.
+SM80 admits BF16/FP16 inputs and weights; its other quantized formats remain unsupported.
 SM90 admits BF16, FP16, ordinary per-tensor FP8, DeepSeek block FP8 and
 NVFP4/MXFP4/MXINT4 weights with BF16/FP16 activations. MXFP8 inputs and NVFP4 activations remain
 unsupported on SM90. The MX Tensor Core path uses
@@ -21,6 +23,47 @@ the complete pipelines. The MX untuned default remains Tensor Core on SM100/103/
 and uses FMA on SM120. BF16, FP16 and ordinary per-tensor FP8 use
 shared FMA kernels and independently tune one, two, four or eight output
 columns per warp in FC1 and FC2.
+
+Ampere SM80, Hopper and SM120 additionally offer grouped Tensor Core tactics for the qualified BF16 input,
+weight and output workload: default SwiGLU, H=2048, I=512, top-k=10,
+T=4 or T=8, with finalization. Hopper offers three WGMMA pipeline depths: T4 uses K128 and T8 uses K64,
+with two matching routes per weight load. SM120 offers two warp-MMA
+configurations at T4 and four at T8, varying route-group size, K tile and depth.
+They were selected from 15 valid configurations; warm and cold cases can prefer
+different groups and tiles.
+SM80 offers one cp.async + warp-MMA configuration per token count:
+T4 uses group4/K128/stages4 and T8 uses group4/K64/stages2.
+It also admits H7168/I2048/top-k8 at T4/T8 with group8/K64/stages2.
+At H2048/I512/top-k10, SM80 also offers the same small-shape choices for
+FP16 SwiGLU and BF16/FP16 ReLU2 with matching input/weight/output types.
+On SM90/SM120, FP16 input/weight/output adds the same default SwiGLU shape at T4/T8.
+On Hopper it offers group2/stages4 with K64 or K128 at T4 and K64 at T8.
+BF16 and FP16 ReLU2 are additionally offered at T8 on Hopper (group2/stages4/K128),
+and T4/T8 on SM120 using the same bounded warp-MMA choices.
+BF16/FP16 GeGLU also uses T4/T8; Hopper uses group2/stages4 with K128 at T4
+and K64 at T8. SiLU follows the ReLU2 bounds: Hopper T8, SM120 T4/T8.
+SM120 additionally offers BF16/FP16 GeGLUTanh and default SiTU/SwiGLUStep
+at T4/T8 with the same bounded warp-MMA choices. Supported custom SwiGLU/
+SwiGLUStep parameters, mixed output dtypes and other activations retain FMA-only
+candidates. Custom SiTU parameters remain unsupported by both paths.
+The grouped implementation, typed epilogues and buffer ownership are shared;
+on SM90/SM120 this extension changes candidate admission, not the device pipeline.
+The original 16 FMA choices remain available and the untuned default remains FMA.
+Other workloads retain their existing advertised tactics.
+
+All three paths read the same prepared weights as FMA. Each CTA discovers live
+matching expert IDs and loads original up/gate weight slices. SM80 uses cooperative
+128-bit cp.async copies; Hopper and SM120 use TMA. The projections use
+WGMMA on Hopper and warp MMA on SM80/SM120. FC1 applies the shared activation before writing
+the typed intermediate. FC2 writes typed expert partials, followed by the same
+ascending-slot FP32 multiply/add combine contract. It needs neither an offline
+interleaved weight copy nor FP32 projection scratch. Repeated, invalid and
+changing routes are handled at execution time; no route values enter the compile
+cache. The shared runtime binds current input/output buffers and stream for every
+call, including replay with changed routes and independently captured buffers.
+Reuse-heavy cases can benefit, while disjoint routes still favor FMA.
+An autotuned choice remains dependent on the profiling routes and cache state;
+this is not a universal token-count heuristic.
 
 Frost uses the existing FlashInfer autotuner. Each runner retains its own
 tuning policy; cross-backend selection measures packing plus forward with the
@@ -326,7 +369,7 @@ the BF16 table or the earlier unclamped-SwiGLU cohort.
 
 | Property | Support |
 |---|---|
-| Architecture | SM90: BF16/FP16/per-tensor FP8/DeepSeek block FP8/NVFP4-MXFP4-MXINT4-weight BF16/FP16-activation FMA only, top-k <= 32; SM100/103/107: FMA and MX Tensor Core; SM120: FMA only, top-k <= 32 |
+| Architecture | SM80: BF16/FP16 FMA and bounded grouped BF16/FP16 warp MMA, top-k <= 32; SM90: BF16/FP16/per-tensor FP8/DeepSeek block FP8/NVFP4-MXFP4-MXINT4-weight BF16/FP16-activation FMA, top-k <= 32, plus grouped BF16/FP16 WGMMA for the qualified workload above; SM100/103/107: FMA and MX Tensor Core; SM120: FMA, top-k <= 32, plus grouped BF16/FP16 warp MMA for the qualified workload above |
 | Input | Static per-tensor E4M3 FP8; E4M3 MXFP8 with linear group-32 UE8M0 scales; packed NVFP4 with linear group-16 E4M3 scales; or unquantized BF16/FP16 |
 | Weights | Per-tensor FP8 input: per-expert E4M3 FP8 with static calibration; MX input: MXFP4 or MXFP8 with group-32 UE8M0 scales; NVFP4 input: NVFP4 with group-16 E4M3 scales; unquantized input: matching BF16/FP16 weights, or E4M3/NVFP4/MXFP4/MXINT4 weight-only checkpoints with BF16/FP16 input and output |
 | Output | Quantized paths: BF16; unquantized paths: BF16 or FP16. Finalized or raw token/slot-ordered expert rows |
@@ -335,6 +378,8 @@ the BF16 table or the earlier unclamped-SwiGLU cohort.
 | FP16 / per-tensor FP8 / DeepSeek block FP8 activation | Same eleven activations and scalar restrictions as BF16 |
 | BF16 parameters | SwiGLU alpha/beta/limit, SwiGLUStep limit, and PowLU m/optional limit; other activations require their default parameters |
 | MX parameters | Same typed scalar restrictions as BF16; activation remains FP32 before MXFP8 quantization |
+| MX prepared storage | MXFP4 weight bases must be 32-byte aligned; MXFP8 weights and MX scale tensors must be 16-byte aligned. `prepare_weights` supplies suitable storage; manually sliced views must preserve alignment |
+| MX repeated routes | If top-k exceeds E, default and autotuned execution use FMA with top-k <= 32. MX Tensor Core tactics require top-k <= E |
 | NVFP4 | NVFP4 weights and inputs, BF16 output; shared FMA, the same eleven activations, H divisible by 512, I by 128, top-k <= 32; no 4over6 intermediate quantization |
 | BF16/FP16/per-tensor FP8/DeepSeek block FP8 FMA | top-k <= 32; FC1 and FC2 output columns 1/2/4/8 (16 combinations), default 1 and 4; GELU/GeGLU require compiler `erf` support |
 | MX/BF16/FP16/per-tensor FP8 geometry | H divisible by 128; logical I divisible by 32, padded to 128 |
@@ -1578,3 +1623,273 @@ python benchmarks/bench_frost_low_latency_w4a16.py \
   --activation-dtype fp16 --weight-format nvfp4 --native-backend sm120-tc \
   --tokens 8 --expert-reuse shared --cache-mode cold --output nvfp4-fp16.json
 ```
+
+## Reproducing grouped dtype and architecture coverage
+
+The grouped reproducer supports BF16 and FP16 inputs and records the exact
+activation, source hashes, routing pattern, native comparator and CUDA Graph
+GPU interval. It requires working CUPTI and fails before timing if it is absent.
+Run both shared and disjoint routes and both warm and cold cache conditions;
+route reuse and cache residency affect which candidate wins.
+
+```bash
+# SM90/SM120: native FP16 CUTLASS comparator, same checkpoint and activation.
+PYTHONPATH=. python benchmarks/bench_frost_low_latency_grouped_tc.py \
+  --tokens 8 --dtype fp16 --activation geglu --baseline cutlass_fp16 \
+  --reuses shared paired disjoint --output grouped-fp16-t8.json
+# BF16 supports cutlass_bf16, cutile_bf16 and cudnn_grouped_gemm_bf16 adapters.
+```
+
+The native FP16 comparator profiles each CUTLASS GEMM stage, then compares the
+Cartesian product of its two leading candidates and the heuristic choice. This
+is a bounded search, not exhaustive tuning of all possible stage pairs.
+
+On SM80, the additional standalone comparator loads the original vLLM matmul
+device functions from a local, pinned source file. It verifies the source hash,
+retains upstream attribution, and uses separate activation/combine wrappers.
+It supports BF16/FP16 SwiGLU and ReLU2. The baseline uses typed preactivation and
+weighted-before-cast expert output; Frost uses FP32 preactivation and casts each
+expert before combine. Each is checked against its own rounding reference.
+This adapter is a kernel comparison, not stock vLLM or serving throughput.
+
+```bash
+# Download the Apache-licensed source once, outside the timed program.
+curl -L https://raw.githubusercontent.com/vllm-project/vllm/71c20f73f2f1764576fed799c152319c9fd1c820/vllm/model_executor/layers/fused_moe/fused_moe.py \
+  -o /tmp/vllm-fused-moe.py
+PYTHONPATH=. python benchmarks/bench_frost_low_latency_grouped_tc.py \
+  --tokens 8 --dtype fp16 --activation swiglu --baseline vllm_device_triton \
+  --vllm-source /tmp/vllm-fused-moe.py --reuses shared paired disjoint \
+  --output sm80-fp16-t8.json
+# For the separate SM80 BF16 large shape, use --shape large with default SwiGLU.
+```
+
+The timed interval includes FC1, activation, FC2 and combine. Preparation, host
+submission, router-network evaluation, shared experts, communication and model
+throughput are outside its scope. Keep each ratio within one paired checkpoint,
+shape, dtype, activation, routing and cache cohort.
+
+## Grouped per-tensor FP8 on SM90 and SM120
+
+SM90 additionally offers a grouped E4M3 WGMMA candidate for default SwiGLU/SiTU
+at T4/T8 and ReLU2 at T8, H2048/I512/top-k10 and finalized BF16 output. Both weights and inputs
+use the existing per-tensor FP8 contract. SM90 uses group2/stages4/K128.
+SM120 offers native E4M3 warp MMA for default SwiGLU/SiTU/ReLU2 at T4/T8
+on that same shape, with group2 or group4, two stages and K128.
+All sixteen FMA choices and the untuned default remain. Other shapes, activations,
+T1/T2 and raw output retain existing choices. Representative routing and cache
+state must be profiled; shared-expert reuse does not establish a disjoint-route win.
+
+The shared architecture-specific projections keep the original checkpoint layout and read live
+per-expert dequantization and static intermediate quantization scales. FP8 partials
+spanning at most K64 are completed and promoted through separate FP32 additions,
+independently of the TMA staging tile width, before
+the existing BF16 preactivation boundary, activation and E4M3 intermediate
+quantization. This bounds the numerical drift of long native FP8 accumulation;
+FP16/BF16 retain their existing accumulation schedule. Expert partials are BF16
+and the shared finalizer preserves ordered FP32 multiplication/addition and
+skips invalid expert IDs before loading padding scores.
+
+Use the existing `benchmarks/bench_frost_low_latency_fp8.py` with `--tokens 4`
+or `8`, `--activation swiglu|relu2|situ`, both `--cache-mode warm` and `cold`,
+and shared/disjoint expert reuse. T4 ReLU2 remains FMA-only on SM90.
+Optional `--route-seed` shuffles expert addresses and slot order while preserving
+the reuse pattern and checkpoint; the default retains the original routing.
+The benchmark checks independent numerical references, tunes and freezes tactics
+before ABBA validation, and times the complete routed-expert CUDA Graph interval.
+It excludes host enqueue, preparation, router-network evaluation, shared experts
+and communication, and does not establish serving throughput.
+
+### Standalone vLLM device baseline routing
+
+The grouped Tensor Core reproducer's `--baseline vllm_device_triton` searches
+naive and expert-grouped route policies by default. The GEMM device functions
+remain unchanged at their pinned upstream commit. The standalone grouped wrapper
+uses FlashInfer GPU sorting and a padding adapter, both included in the timed
+call, alongside its existing activation/combine wrappers. It is not a stock
+vLLM or serving comparison. The two policies share the same checkpoint and
+native rounding reference. Use `--vllm-route-policy naive` to reproduce the
+earlier low-token policy, or `grouped` to isolate the grouped policy.
+
+Baseline routing can change the winner when several tokens select the same
+experts. A win over the naive policy or one native backend does not establish
+a win over the best expert-grouped implementation.
+
+
+## Grouped DeepSeek block-FP8 on SM90 and SM120
+
+The `DeepSeekFp8` weight/activation contract additionally offers grouped Tensor
+Core tactics on SM90 and SM120 for finalized `H=2048, I=512, top_k=10` calls.
+Default SwiGLU is admitted at T=4/8, and default ReLU2/SiLU at T=8. T=1/2,
+T=4 ReLU2/SiLU, custom activation parameters, other geometries and raw expert
+output retain their existing FMA candidates. All sixteen FMA tactics remain
+available inside the measured region; routing reuse and cache conditions can
+still favor FMA. This does not change cross-backend `auto` selection.
+
+Both BF16 input and prequantized E4M3 input with live FP32 `[H/128,T]` scales use
+the existing preparation API. The shared projection preserves 128x128 weight
+scales, promotes native FP8 partial accumulators at most every K64, applies the
+weight and input block scales, and accumulates in FP32. FC1 preactivation stays
+FP32 through activation and the existing dynamic 128-value quantizer. FC2
+produces BF16 expert values followed by the existing ordered FP32 weighted
+combine. Per-tensor FP8 and block-FP8 share the architecture-specific projection,
+with their different scaling and intermediate-rounding contracts explicit.
+
+SM90 candidates use group2/4, four stages and K128 for SwiGLU; ReLU2/SiLU use
+group2. SM120 uses group2/4, two stages and K128, with an additional group4,
+four-stage T4 SwiGLU choice. Compiled executables cache immutable metadata only;
+input pointers, scales, route values, scratch and streams are bound per call.
+
+The full-call reproducer now supports SM90 CUTLASS block-FP8 and SM120 native FP8,
+plus every advertised Frost FMA/grouped tactic. It includes input quantization,
+FC1, activation/requantization, FC2 and combine in the GPU interval. Each native
+backend is checked against its own documented typed boundaries. Hopper CUTLASS
+rounds FC1 and activation to BF16 before requantization; this is not bitwise
+identity with Frost's FP32 preactivation. SM120 native supports only SwiGLU in
+this harness, so ReLU2/SiLU reports explicitly contain an FMA-only comparison.
+The Hopper search uses the runner's per-stage top-two candidates plus its
+heuristic, not an exhaustive Cartesian search of all underlying GEMM configs.
+
+```bash
+python benchmarks/bench_frost_low_latency_deepseek_fp8.py \
+  --tokens 8 --activation swiglu --expert-reuse shared --route-seed 7223 \
+  --cache-mode warm --output block-fp8.json
+```
+
+Use `--expert-reuse paired` or `disjoint` and `--cache-mode cold` to probe reuse
+and cache boundaries. This measures routed-expert kernel GPU time with
+precomputed routes; it does not measure router evaluation, shared experts,
+communication, host enqueue or model token throughput.
+
+
+### Cooperative grouped projection staging
+
+Ampere K128 tiles distribute activation gathering across all four warps and
+use CUTLASS 128-bit `cp.async` copies for aligned inputs. Unaligned inputs
+retain a scalar fallback; missing route members are zero-filled. All threads
+participate in the existing copy-group completion and CTA synchronization.
+K64 gathering keeps its original schedule.
+
+Hopper distributes activation rows across four warps. BF16/FP16 weight TMA
+starts before gathering so the independent transfers can overlap; FP8 keeps
+gather-before-TMA ordering. Producers acquire a stage before any writer reuses
+it, publish every warp's activation stores, and synchronize the CTA before
+consumption. The weight TMA barrier alone does not publish those stores.
+
+These changes preserve the existing candidate domains, checkpoint layouts,
+activation and rounding contracts, workspace ownership, and default tactics.
+Use the existing grouped-TC and FP8 reproductions with warm/cold caches and
+shared/disjoint routing when measuring the scheduling change.
+
+### SM120 W8A16 grouped Tensor Core candidate
+
+For E4M3 weights with matching BF16 or FP16 inputs and outputs, finalized default SwiGLU or GeGLU
+T8/H2048/I512/K10 additionally offers group8/stages2/K128 warp MMA. Compact
+E4M3 tiles stay in shared memory and convert exactly to the input type in register fragments.
+Per-expert FP32 scales remain live and apply after the dot product, followed by
+the existing input-type preactivation/activation and output-type expert boundaries.
+There is no activation quantization. FC1, FC2 and the shared combine are separate
+kernels. All forty FMA choices and the untuned FMA default remain available.
+Matching FP16 also offers the same T8 candidate for default ReLU2 and SiLU.
+Their BF16 counterparts retain the existing FMA candidates. Cold or dispersed
+routing can favor FMA; T4, other activations,
+mixed input/output types and other architectures retain their existing advertised choices.
+
+`benchmarks/bench_frost_low_latency_w8a16.py --dtype fp16 --tokens 8
+--expert-reuse shared --output result.json` compares every advertised candidate
+against all forty FMA choices, with matched FP16 rounding. The BF16 default
+continues to search native cuTile. There is no equivalent FP16 cuTile adapter,
+so the FP16 result is explicitly a comparison with FMA, not a native-backend
+speedup. Use both cache modes and route patterns when tuning.
+
+
+Use `--activation geglu` to reproduce the GeGLU candidate with identical quantized
+weight tensors and typed boundaries, or `--dtype fp16 --activation relu2` / `silu`
+for the ungated candidates. BF16 cold runs may favor native cuTile, and both
+input types can favor FMA with less expert reuse.
+
+### SM90 BF16/FP16 W8A16 grouped candidates
+
+For matching FP16 inputs/outputs, default SwiGLU or GeGLU and finalized T8 at
+H2048/I512/K10, SM90 offers group4 and group8 with stages2/K128 alongside
+all sixteen FMA choices. Matching BF16 inputs/outputs with default SwiGLU, GeGLU,
+ReLU2 or SiLU
+at the same geometry offer group8/stages2/K128. These candidates reuse the
+compact-E4M3 TMA and warp-MMA implementation, with conversion to typed register
+fragments and
+live per-expert scales. Native FP8 activation execution retains its WGMMA
+projection. The untuned default is unchanged.
+
+BF16 GeGLU at the same H2048/I512/K10 geometry additionally offers
+group4/stages2/K256 at T4 and group8/stages2/K256 at T8. Wider K tiles
+amortize producer synchronization when tokens reuse experts. The existing T8
+K128 candidate and all sixteen FMA choices remain available. This extension
+does not admit K256 for FP16, other activations or other architectures.
+
+Shared expert routes can amortize fragment conversion; partial or disjoint
+routes still favor FMA. Cold BF16 execution can favor native cuTile. Tune with
+representative routes and cache conditions.
+Other activations, T1/T2, T4 outside BF16 GeGLU, other shapes, mixed output types and
+raw expert outputs keep their previous candidate sets.
+
+Use `benchmarks/bench_frost_low_latency_w8a16.py --baseline frost_fma
+--dtype fp16 --tokens 8 --expert-reuse shared --output result.json` and repeat with warm/cold caches
+and half/disjoint routes; add `--activation geglu` for GeGLU. The native cuTile
+W8A16 adapter accepts BF16 only; this command compares the available matching
+FP16 pipelines. For BF16 SwiGLU, GeGLU, ReLU2 or SiLU, use `--dtype bf16`
+with the corresponding `--activation` and compare with
+`--baseline cutile_w8a16` as well as `--baseline frost_fma`.
+
+### SM103 BF16/FP16 W8A16 grouped candidates
+
+The shared compact-E4M3 projection also offers bounded SM103 candidates for
+matching BF16 or FP16 inputs/outputs, default SwiGLU, finalized T4/T8 at
+H2048/I512/K10. BF16 T4 offers group4/K128 with two or four stages; FP16 T4
+offers group4/stages2/K128. T8 offers group8/stages2/K128 for both input types.
+The same T8 candidate is also available for BF16 at H7168/I2048/K8.
+At the smaller geometry, matching FP16 GeGLU also offers the T4/T8 candidates;
+FP16 ReLU2 and SiLU offer the T8 candidate. Matching BF16 GeGLU also offers
+the T4/T8 candidates at this geometry. BF16 ReLU2/SiLU and
+FP16 ReLU2/SiLU at T4 retain FMA only.
+
+BF16 GeGLU at T4 uses a serial gather producer to reduce synchronization.
+FP16 retains cooperative gathering; this scheduling choice does not generalize
+across the two input types. All FMA choices remain available for routes with
+less expert reuse.
+
+All sixteen FMA choices and the untuned default remain. The same TMA,
+register conversion, live scale, activation and combine implementation is
+compiled for SM103; this adds no second W8A16 pipeline. T2, FP16 at the larger
+geometry, custom activations, mixed output types and raw expert outputs retain
+the previous choices.
+
+Use `benchmarks/bench_frost_low_latency_w8a16.py --baseline frost_fma` for
+this architecture: the native cuTile W8A16 adapter does not support SM103.
+Shared expert routing can amortize the Tensor Core setup; partial/disjoint
+routing can strongly favor FMA. Tune using representative routing and cache
+conditions rather than selecting the TC tactic unconditionally.
+
+For example, add `--dtype fp16 --tokens 4 --expert-reuse shared` for the small
+FP16 case, or `--dtype bf16 --tokens 8 --hidden 7168 --intermediate 2048
+--experts 256 --top-k 8` for the larger BF16 geometry. Run each with warm/cold
+cache settings and shared/half/disjoint expert reuse. These are routed-expert
+GPU-time comparisons, not full-model throughput measurements.
+For the additional FP16 activations, use `--dtype fp16 --activation geglu
+--tokens 4` or `--dtype fp16 --activation relu2 --tokens 8` (and `silu`).
+For BF16 GeGLU, use `--dtype bf16 --activation geglu --tokens 4` or `--tokens 8`.
+
+### Larger BF16/FP16 W8A16 on SM120
+
+SM120 also offers group8/stages2/K128 for matching BF16 or FP16 inputs/outputs,
+default SwiGLU and finalized T8 at H7168/I2048/K8. It uses the existing
+compact-weight warp-MMA pipeline. All forty FMA choices remain available,
+and the untuned default is unchanged. Select using representative expert
+routing and cache conditions: shared experts amortize weight conversion,
+while disjoint routes can favor FMA. Other activations and neighboring
+geometries retain their existing candidate sets.
+
+Use `benchmarks/bench_frost_low_latency_w8a16.py --baseline frost_fma
+--dtype fp16 --tokens 8 --hidden 7168 --intermediate 2048 --experts 256
+--top-k 8 --output result.json`, with warm/cold cache settings and shared/half/disjoint routes.
+For BF16, use `--dtype bf16` and compare with `--baseline cutile_w8a16` as well as
+`--baseline frost_fma`. The interval includes both projections, activation
+and final combine.

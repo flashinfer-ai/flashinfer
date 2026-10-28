@@ -446,6 +446,7 @@ kernel_cake_kda_train_898a1eb972fbaf55789a(const __grid_constant__ CUtensorMap a
             unsigned int _phase_vp_ready_0 = 0;
             unsigned int _phase_h_tape_read_0 = 0;
             unsigned int _phase_h_ready_0 = 0;
+            unsigned int _phase_dec_done_0 = 0;
             #pragma unroll 1
             for (int c = 0; c < nc; c++) {
                 float _tmem_load_16[16];
@@ -606,6 +607,8 @@ kernel_cake_kda_train_898a1eb972fbaf55789a(const __grid_constant__ CUtensorMap a
                 }
                 mbarrier_wait(h_ready_addr, _phase_h_ready_0);
                 _phase_h_ready_0 ^= 1;
+                mbarrier_wait(dec_done_addr, _phase_dec_done_0);
+                _phase_dec_done_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
             }
             asm volatile("tcgen05.fence::before_thread_sync;");
@@ -1117,7 +1120,7 @@ kernel_cake_kda_train_898a1eb972fbaf55789a(const __grid_constant__ CUtensorMap a
             unsigned int _phase_qg_full_0 = 0;
             unsigned int _phase_o_drained_0 = 1;
             unsigned int _phase_bv_ready_0_1 = 0;
-            unsigned int _phase_dec_done_0 = 0;
+            unsigned int _phase_dec_done_0_1 = 0;
             unsigned int _phase_aqk_full_0 = 0;
             if (elect_sync()) {
                 if (nc_3 > 0) {
@@ -1444,8 +1447,8 @@ kernel_cake_kda_train_898a1eb972fbaf55789a(const __grid_constant__ CUtensorMap a
                     tcgen05_commit(qg_empty_addr);
                     mbarrier_wait(bv_ready_addr, _phase_bv_ready_0_1);
                     _phase_bv_ready_0_1 ^= 1;
-                    mbarrier_wait(dec_done_addr, _phase_dec_done_0);
-                    _phase_dec_done_0 ^= 1;
+                    mbarrier_wait(dec_done_addr, _phase_dec_done_0_1);
+                    _phase_dec_done_0_1 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                     int _mma_a_lo_1 = ((((kg_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (stage_1) * 1024;

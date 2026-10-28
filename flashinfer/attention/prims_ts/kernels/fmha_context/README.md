@@ -402,8 +402,9 @@ runtime tensors alive until every graph using that plan is destroyed.
   dtype; the mixed combinations are `torch.bfloat16` Q/K with
   `torch.float8_e4m3fn` V, and a Sage plan's `torch.int8` Q/K with
   `torch.float8_e4m3fn` V.
-- VC-Attention (E4M3 V tile residuals and restored tile means) runs only through the dense contiguous `BatchPrefillTSWrapper` and
-  `batch_prefill` at `head_dim=128`; see
+- VC-Attention (QK16 with bf16 Q/K or QK8 with E4M3 Q/K, both with E4M3 V
+  tile residuals and restored tile means) runs only through the dense
+  contiguous `BatchPrefillTSWrapper` and `batch_prefill` at `head_dim=128`; see
   [VC-Attention](../../README.md#vc-attention).
 - Sage attention covers only the contiguous dense fixed-length
   `head_dim=128` path; causal and variable-window masks, packed or paged

@@ -142,6 +142,7 @@ class _ProxySplitKRunner(TunableRunner):
     ):
         # call_fn(inputs, num_splits) -> output; lets one runner serve both the
         # bf16 and (longer-signature) fp4 proxy invocations.
+        """Wrap the compiled proxy-score call for the autotuner."""
         self._call = call_fn
         self._msq = int(max_seqlen_q)
         self._mkt = int(max_k_tiles)
@@ -153,11 +154,13 @@ class _ProxySplitKRunner(TunableRunner):
         self._reduce = bool(reduce_heads)
 
     def __hash__(self):
+        """Hash by type: tactics differ by cache-key extras, not by instance."""
         return hash(type(self))
 
     def get_valid_tactics(self, inputs, profile):
         # Powers of two up to ~4 SM-waves, capped by max_k_tiles; always include
         # the closed-form heuristic so a tuned op is never worse than eager.
+        """Split-K tactics worth timing on this device."""
         num_sms = get_device_sm_count(self._device)
         cap = min(self._mkt, max(1, -(-4 * num_sms // max(self._base, 1))))
         cands = {s for s in (1, 2, 4, 8, 16, 32) if s <= cap}
@@ -167,11 +170,13 @@ class _ProxySplitKRunner(TunableRunner):
     def get_cache_key_extras(self, inputs):
         # max_seqlen_q / max_k_tiles are varlen-derived (not in any tensor shape),
         # so they must key the cache; causal/paged/reduce flip the work pattern.
+        """Fields that must match for a cached tactic to apply."""
         return (self._causal, self._paged, self._reduce, self._msq, self._mkt)
 
     def forward(self, inputs, tactic: int = -1, do_preparation: bool = False, **kwargs):
         # tactic == -1 falls back to the closed-form heuristic, so eager
         # (un-tuned) behavior is unchanged.
+        """Run one tactic, or only prepare its workspace."""
         ns = (
             tactic
             if tactic >= 0
@@ -192,6 +197,7 @@ def _proxy_tuned_key(
 ):
     # base_ctas folds in batch/heads/max_seqlen_q, so this matches the autotuner's
     # own cache granularity (shape + get_cache_key_extras) closely enough to gate on.
+    """Autotuner cache key for this op."""
     return (
         op_name,
         bool(causal),
@@ -258,6 +264,7 @@ def _run_proxy_autotuned(
 def _proxy_dummies(device_index: int):
     # Signature fillers for paths that never read them; cached so repeat decode
     # calls do not launch fill kernels.
+    """Dummy inputs used to warm the autotuner on a device."""
     dev = torch.device("cuda", device_index)
     return (
         torch.zeros((1, 1), dtype=torch.int32, device=dev),

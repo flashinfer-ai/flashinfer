@@ -16,7 +16,7 @@ limitations under the License.
 
 # The fused mHC inference step of a four-route model (hidden 4096) with a
 # quantized output through the experimental ``prepare_mega_mhc`` API on an
-# SM107a GPU: beside the BF16 output the plan stores its quantization, what
+# SM100a, SM103a or SM107a GPU: beside the BF16 output the plan stores its quantization, what
 # vLLM computes from that output -- ``--layout fp8_group128``: ``y_fp8`` /
 # ``y_fp8_sf`` as ``per_token_group_quant_fp8(y_bf16, 128, use_ue8m0=True)``
 # (bitwise); ``--layout nvfp4``: ``y_fp4`` / ``y_fp4_sf`` as

@@ -746,21 +746,58 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
     for (int e_1 = 0; e_1 < 16; e_1++) {
       acc[e_1] = acc[e_1] * inv;
     }
-    {
-      __nv_bfloat162 _pk[8];
-      _pk[0] = __floats2bfloat162_rn(acc[0 + 0], acc[0 + 1]);
-      _pk[1] = __floats2bfloat162_rn(acc[0 + 2], acc[0 + 3]);
-      _pk[2] = __floats2bfloat162_rn(acc[0 + 4], acc[0 + 5]);
-      _pk[3] = __floats2bfloat162_rn(acc[0 + 6], acc[0 + 7]);
-      _pk[4] = __floats2bfloat162_rn(acc[0 + 8], acc[0 + 9]);
-      _pk[5] = __floats2bfloat162_rn(acc[0 + 10], acc[0 + 11]);
-      _pk[6] = __floats2bfloat162_rn(acc[0 + 12], acc[0 + 13]);
-      _pk[7] = __floats2bfloat162_rn(acc[0 + 14], acc[0 + 15]);
-      *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(O + (row * 512 + d0)))[0]) =
-          *reinterpret_cast<uint4*>(&_pk[0]);
-      *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(O + (row * 512 + d0)))[8]) =
-          *reinterpret_cast<uint4*>(&_pk[4]);
+    unsigned int _packed_0[8];
+#pragma unroll
+    for (int _lp = 0; _lp < 1; _lp++) {
+      __nv_bfloat162 _bf2 =
+          __float22bfloat162_rn(make_float2(acc[_lp * 2 + 0], acc[_lp * 2 + 1 + 0]));
+      _packed_0[_lp] = *(uint32_t*)&_bf2;
     }
+#pragma unroll
+    for (int _lp = 0; _lp < 1; _lp++) {
+      __nv_bfloat162 _bf2 =
+          __float22bfloat162_rn(make_float2(acc[_lp * 2 + 2], acc[_lp * 2 + 1 + 2]));
+      _packed_0[_lp + 1] = *(uint32_t*)&_bf2;
+    }
+#pragma unroll
+    for (int _lp = 0; _lp < 1; _lp++) {
+      __nv_bfloat162 _bf2 =
+          __float22bfloat162_rn(make_float2(acc[_lp * 2 + 4], acc[_lp * 2 + 1 + 4]));
+      _packed_0[_lp + 2] = *(uint32_t*)&_bf2;
+    }
+#pragma unroll
+    for (int _lp = 0; _lp < 1; _lp++) {
+      __nv_bfloat162 _bf2 =
+          __float22bfloat162_rn(make_float2(acc[_lp * 2 + 6], acc[_lp * 2 + 1 + 6]));
+      _packed_0[_lp + 3] = *(uint32_t*)&_bf2;
+    }
+#pragma unroll
+    for (int _lp = 0; _lp < 1; _lp++) {
+      __nv_bfloat162 _bf2 =
+          __float22bfloat162_rn(make_float2(acc[_lp * 2 + 8], acc[_lp * 2 + 1 + 8]));
+      _packed_0[_lp + 4] = *(uint32_t*)&_bf2;
+    }
+#pragma unroll
+    for (int _lp = 0; _lp < 1; _lp++) {
+      __nv_bfloat162 _bf2 =
+          __float22bfloat162_rn(make_float2(acc[_lp * 2 + 10], acc[_lp * 2 + 1 + 10]));
+      _packed_0[_lp + 5] = *(uint32_t*)&_bf2;
+    }
+#pragma unroll
+    for (int _lp = 0; _lp < 1; _lp++) {
+      __nv_bfloat162 _bf2 =
+          __float22bfloat162_rn(make_float2(acc[_lp * 2 + 12], acc[_lp * 2 + 1 + 12]));
+      _packed_0[_lp + 6] = *(uint32_t*)&_bf2;
+    }
+#pragma unroll
+    for (int _lp = 0; _lp < 1; _lp++) {
+      __nv_bfloat162 _bf2 =
+          __float22bfloat162_rn(make_float2(acc[_lp * 2 + 14], acc[_lp * 2 + 1 + 14]));
+      _packed_0[_lp + 7] = *(uint32_t*)&_bf2;
+    }
+    reinterpret_cast<int4*>(O + (row * 512 + d0))[0] = reinterpret_cast<int4*>(_packed_0)[0];
+    reinterpret_cast<int4*>(O + (row * 512 + d0 + 8))[0] =
+        reinterpret_cast<int4*>(_packed_0 + (4))[0];
     if (has_lse != 0) {
       if (part == 0) {
         if (lane_0 == 0) {
