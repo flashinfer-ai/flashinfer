@@ -1304,6 +1304,12 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
             "sm_103a": "8e61da7d4dfaa4d59176abbc6716ca485d97f70dd72db0e6fe6ae3a009348fb3",
         },
     },
+    "7e68f46d2c17ead412fc": {
+        "arg_plan": "gemm_2cta_ptr",
+        "closure_sha256": {
+            "sm_103a": "6ee07a908b3cdf352d8927f635cb7ecac7e3a1a6e0573164878a566b8e0fb8c1",
+        },
+    },
     "800dc1b69b288d010f61": {
         "arg_plan": "gemm",
         "closure_sha256": {
@@ -1625,6 +1631,12 @@ _PROGRAMS: dict[str, dict[str, Any]] = {
         "closure_sha256": {
             "sm_100a": "ba595ecce420b50635b3fa6e064538696a2d65b02720f872b4ff2837d36240eb",
             "sm_103a": "4c4979cf8c9e92bb97662c50d7b03d6759b1ed9ec025f4019de98e5587fd0bed",
+        },
+    },
+    "a4857feefa4431fea347": {
+        "arg_plan": "gemm_2cta_ptr",
+        "closure_sha256": {
+            "sm_103a": "b6b96c618710049845dd77d0878731fc71eda2dc9c33239c8113a1da9a3e1753",
         },
     },
     "a4c4b7bb3ae7574dd507": {
@@ -2438,6 +2450,7 @@ _KERNELS_ONLY: dict[str, dict[str, str]] = {
         "gemm:m256_2cta_bf16_aL_bL_l2256b": "cake_nvfp4_per_token_ae447cd8c8a488cbe10c",
         "gemm:m256_2cta_bf16_aL_bL_l2256b_clc": "cake_nvfp4_per_token_05cdc205d9b471f666a1",
         "gemm:m256_2cta_bf16_aL_bL_l2256b_clc_sfr": "cake_nvfp4_per_token_6d96bb93d7840b5b9b42",
+        "gemm:m256_2cta_bf16_aL_bL_l2256b_clc_sfr_mc42": "cake_nvfp4_per_token_a4857feefa4431fea347",
         "gemm:m256_2cta_bf16_aL_bL_l2256b_g16_clc": "cake_nvfp4_per_token_1957cf0620e9be66eee8",
         "gemm:m256_2cta_bf16_aL_bL_l2256b_g16_clc_sfr": "cake_nvfp4_per_token_ecef0c7e6fb2c77bd726",
         "gemm:m256_2cta_bf16_aL_bL_l2256b_g8": "cake_nvfp4_per_token_102a58d983738fb4ba20",
@@ -2446,6 +2459,7 @@ _KERNELS_ONLY: dict[str, dict[str, str]] = {
         "gemm:m256_2cta_f16_aL_bL_l2256b": "cake_nvfp4_per_token_60a084e22436164149fc",
         "gemm:m256_2cta_f16_aL_bL_l2256b_clc": "cake_nvfp4_per_token_34d44d8d6d4e632aea8c",
         "gemm:m256_2cta_f16_aL_bL_l2256b_clc_sfr": "cake_nvfp4_per_token_fb4cabc9f04a36b804d3",
+        "gemm:m256_2cta_f16_aL_bL_l2256b_clc_sfr_mc42": "cake_nvfp4_per_token_7e68f46d2c17ead412fc",
         "gemm:m256_2cta_f16_aL_bL_l2256b_g16_clc": "cake_nvfp4_per_token_3deb92b0859de2875bd4",
         "gemm:m256_2cta_f16_aL_bL_l2256b_g16_clc_sfr": "cake_nvfp4_per_token_afb177dad29f9232b073",
         "gemm:m256_2cta_f16_aL_bL_l2256b_g8": "cake_nvfp4_per_token_9db9fb4fa9cbe2095158",
