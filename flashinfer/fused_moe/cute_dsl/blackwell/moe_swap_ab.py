@@ -14,6 +14,7 @@
 
 """Host launchers for SM100 split MoE with activations on MMA operand B."""
 
+from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, Union
 
 import cuda.bindings.driver as cuda
@@ -48,17 +49,27 @@ _CUDA_GRID_Y_MAX = 65_535
 _blockscaled_kernel_cache: Dict[Tuple, Any] = {}
 
 
-def _use_compact_output(route_tile, output_dtype, use_fused_finalize):
+@dataclass
+class _CompactOutputWorkspace:
+    offsets: torch.Tensor
+    indices: torch.Tensor
+
+
+def _get_output_workspace(
+    route_tile, output_dtype, use_fused_finalize, tile_limits, route_mapping
+):
     # Automatic operand staging reserves the eligible epilogue's bulk slab.
-    return (
-        Sm100BlockScaledGroupedGemmKernel.bulk_output_element_bytes(
-            route_tile,
-            torch_to_cutlass_dtype(output_dtype),
-            True,
-            use_fused_finalize,
-            False,
-        )
-        > 0
+    if not Sm100BlockScaledGroupedGemmKernel.bulk_output_element_bytes(
+        route_tile,
+        torch_to_cutlass_dtype(output_dtype),
+        True,
+        use_fused_finalize,
+        False,
+    ):
+        return None
+    return _CompactOutputWorkspace(
+        offsets=torch.empty_like(tile_limits),
+        indices=torch.empty_like(route_mapping),
     )
 
 
@@ -111,10 +122,13 @@ def _run_blockscaled_gemm(
     sm_count=None,
     publish_routing_before_signal=False,
     activation_cache_policy: str = "normal",
-    output_is_routed: bool = False,
-    compact_offsets=None,
-    dense_indices=None,
+    _output_workspace=None,
 ):
+    output_is_routed = scatter_output and _output_workspace is not None
+    compact_offsets = (
+        _output_workspace.offsets if _output_workspace is not None else None
+    )
+    dense_indices = _output_workspace.indices if output_is_routed else None
     cache_policies = {
         "normal": 0,
         "evict_first": 0x12F0000000000000,
@@ -367,7 +381,7 @@ def launch_gather_gemm(
     gated: bool = True,
     k_steps: Optional[int] = None,
     use_clc_scheduler: bool = True,
-    compact_offsets=None,
+    _output_workspace=None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Prepare routed input and launch FC1 with the swap-AB weight layout."""
     _check_gemm_inputs(a, b, a_dtype, b_dtype, a_per_token_scale, k_steps)
@@ -492,7 +506,7 @@ def launch_gather_gemm(
         sf_dtype=sf_dtype_cutlass,
         sf_vec_size=sf_vec_size,
         prepare_input=True,
-        compact_offsets=compact_offsets,
+        _output_workspace=_output_workspace,
         scatter_output=False,
         per_token_scale_is_routed=False,
         k_steps=k_steps,
@@ -531,12 +545,10 @@ def launch_finalize_gemm(
     use_fused_finalize: bool = True,
     k_steps: Optional[int] = None,
     use_clc_scheduler: bool = False,
-    output_is_routed: bool = False,
-    compact_offsets=None,
-    dense_indices=None,
+    _output_workspace=None,
 ) -> torch.Tensor:
     """Launch FC2 with routed/expanded rows or fused atomic finalize."""
-    if output_is_routed and use_fused_finalize:
+    if _output_workspace is not None and use_fused_finalize:
         raise ValueError("Routed FC2 output requires deterministic finalize")
     _check_gemm_inputs(a, b, a_dtype, b_dtype, a_per_token_scale, k_steps)
     a_dtype_cutlass = get_cutlass_dtype(a_dtype)
@@ -612,9 +624,7 @@ def launch_finalize_gemm(
         sf_vec_size=sf_vec_size,
         prepare_input=False,
         scatter_output=True,
-        output_is_routed=output_is_routed,
-        compact_offsets=compact_offsets,
-        dense_indices=dense_indices,
+        _output_workspace=_output_workspace,
         per_token_scale_is_routed=True,
         k_steps=k_steps,
         overlap_activation_accumulators=False,

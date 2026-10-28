@@ -1780,7 +1780,7 @@ class Sm100BlockScaledGroupedGemmKernel:
         )
         return cls._operand_stage_capacity(
             stage_bytes,
-            bulk_output_bytes if route_tile >= 128 else 0,
+            bulk_output_bytes,
             acc_stages,
             use_clc_scheduler,
             num_tile_info_stages,
@@ -1813,12 +1813,9 @@ class Sm100BlockScaledGroupedGemmKernel:
         allocated_n = max(32, route_tile)
         acc_cols = allocated_n * channel_tiles
         tmem_capacity = cute.arch.get_max_tmem_alloc_cols("sm_100")
-        bulk_output = bulk_output_bytes > 0 and route_tile >= 128
-        bulk_overlap = (
-            bulk_output and channel_tiles == 1 and allocated_n == tmem_capacity // 2
-        )
         preserve_overlap = 2 * acc_cols == tmem_capacity and (
-            overlap_activation_accumulators is not False or bulk_overlap
+            overlap_activation_accumulators is not False
+            or (bulk_output_bytes > 0 and channel_tiles == 1)
         )
         minimum_stages = 2 if num_stages is None else num_stages
         selected_steps = None
@@ -2287,7 +2284,7 @@ class Sm100BlockScaledGroupedGemmKernel:
         # disjoint. The epilogue reads their shared interval before release.
         self.overlap_acc = (
             self.can_overlap_accumulators
-            and self.allocated_n == 256
+            and self.channel_tiles == 1
             and self.epilogue.bulk_tokens > 0
         ) or self.overlap_activation_accumulators
         if cutlass.const_expr(

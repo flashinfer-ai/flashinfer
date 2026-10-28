@@ -222,7 +222,7 @@ def moe_unpermute(
     top_k: int,
     enable_pdl: bool = False,
     input_is_expanded: bool = False,
-    dense_indices=None,
+    _output_workspace=None,
 ) -> None:
     """Reduce BF16 expert rows in ascending top-k order using FP32 FMA.
 
@@ -246,6 +246,7 @@ def moe_unpermute(
     guaranteed by ``moe_sort``; no device values are read on the host.
     Token count is a runtime parameter of the cached kernel.
     """
+    dense_indices = _output_workspace.indices if _output_workspace is not None else None
     if num_tokens < 0 or top_k <= 0:
         raise ValueError("num_tokens must be nonnegative and top_k positive")
     if permuted_input.dtype != torch.bfloat16 or output.dtype != torch.bfloat16:

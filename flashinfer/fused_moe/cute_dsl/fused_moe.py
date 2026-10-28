@@ -567,7 +567,6 @@ def _moe_core_impl(
     is_rubin = gemm1_mma_tiler is not None and gemm1_mma_inst_shape is not None
     gather_gemm: Callable[..., Tuple[torch.Tensor, Optional[torch.Tensor]]]
     finalize_gemm: Callable[..., torch.Tensor]
-    compact_output = False
     if swap_ab:
         for phase, mma_tiler_mn in (
             ("GEMM1", gemm1_mma_tiler_mn),
@@ -581,12 +580,9 @@ def _moe_core_impl(
         from .blackwell.moe_swap_ab import (
             launch_gather_gemm,
             launch_finalize_gemm,
-            _use_compact_output,
+            _get_output_workspace,
         )
 
-        compact_output = _use_compact_output(
-            gemm2_mma_tiler_mn[1], output_dtype, use_fused_finalize
-        )
         gather_gemm = launch_gather_gemm
         finalize_gemm = launch_finalize_gemm
         gemm1_options: Dict[str, Any] = {
@@ -596,7 +592,6 @@ def _moe_core_impl(
         gemm2_options: Dict[str, Any] = {
             "k_steps": gemm2_k_steps,
             "use_clc_scheduler": gemm2_use_clc_scheduler,
-            "output_is_routed": compact_output,
         }
     else:
         gather_gemm = blockscaled_contiguous_gather_grouped_gemm_act_fusion
@@ -669,14 +664,17 @@ def _moe_core_impl(
         **moe_sort_kwargs,
     )
 
-    compact_offsets = None
-    dense_indices = None
-    if compact_output:
-        compact_offsets = torch.empty_like(tile_idx_to_mn_limit)
-        dense_indices = torch.empty_like(expanded_idx_to_permuted_idx)
-        gemm1_options["compact_offsets"] = compact_offsets
-        gemm2_options["compact_offsets"] = compact_offsets
-        gemm2_options["dense_indices"] = dense_indices
+    output_workspace = None
+    if swap_ab:
+        output_workspace = _get_output_workspace(
+            gemm2_mma_tiler_mn[1],
+            output_dtype,
+            use_fused_finalize,
+            tile_idx_to_mn_limit,
+            expanded_idx_to_permuted_idx,
+        )
+        gemm1_options["_output_workspace"] = output_workspace
+        gemm2_options["_output_workspace"] = output_workspace
 
     if use_localized_path:
         # Allocate once: both domains fill disjoint columns of this buffer.
@@ -980,7 +978,7 @@ def _moe_core_impl(
             num_tokens=num_tokens,
             top_k=top_k,
             input_is_expanded=True,
-            dense_indices=dense_indices,
+            _output_workspace=output_workspace,
             enable_pdl=enable_pdl,
         )
 
