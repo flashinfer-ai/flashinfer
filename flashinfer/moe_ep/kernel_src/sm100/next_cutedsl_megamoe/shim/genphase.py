@@ -115,8 +115,8 @@ class Sm100GenphaseSymmBuffer(BlockScaledSymmBuffer):
     def retune(self, knobs) -> None:
         """Collectively replace kernel storage before capture, preserving I/O views.
 
-        Only performance knobs may change. The backend calls this once after
-        its explicit warmup sweep, on an unpooled workspace.
+        Only performance knobs may change. Automatic selection instead uses
+        ``install_tuned_knobs()`` to prepare the winner with its weights.
         """
         from . import comm
         from .tuning import is_valid_sm100_genphase_knobs

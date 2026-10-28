@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from .....config import FinalizeMode
@@ -18,9 +20,22 @@ from .....core.validation.common import (
 )
 from .....weights import PrequantizedMoEWeights
 
+if TYPE_CHECKING:
+    from .mxfp8_mxfp8_bf16_cutedsl.config import (
+        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from .nvfp4_nvfp4_bf16_cutedsl.config import (
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+
 
 class _StandardBlockScaledBackend(MegaKernelBackend):
+    _config: (
+        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
+        | Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+    )
     supports_output_view = True
+    supports_auto_workspaces = True
     quant_kind: str | None = None
 
     def __init__(self, config):
@@ -29,18 +44,24 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
             raise MoEEpConfigError(
                 "The standard backend requires kernel_variant='inference'."
             )
-        if config.knobs == "auto":
-            raise MoEEpConfigError(
-                "The standard backend requires fixed or default knobs."
-            )
-        if config.knobs is not None and not isinstance(config.knobs, dict):
-            raise MoEEpConfigError("knobs must be a dictionary or None.")
+        if config.knobs not in (None, "auto") and not isinstance(config.knobs, dict):
+            raise MoEEpConfigError("knobs must be a dictionary, 'auto', or None.")
         self.supports_unfinalized_output = config.finalize_mode is FinalizeMode.NONE
         if any(
             getattr(config, name, None) is not None
             for name in ("mma_tiler_mnk", "cluster_shape_mn", "schedule_policy")
         ):
             raise MoEEpConfigError("Use knobs for standard inference geometry.")
+
+    def coordinate_workspace_replacement(self, workspace):
+        from .automatic import coordinate_workspace_replacement
+
+        return coordinate_workspace_replacement(self, workspace)
+
+    def get_tuned_knobs(self, workspace=None):
+        from .automatic import get_tuned_knobs
+
+        return get_tuned_knobs(workspace)
 
     def _finalize_mode(self, fleet):
         mode = self._config.finalize_mode
@@ -98,7 +119,16 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
             combine_dtype=wire,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
         )
-        knobs.update(k.knobs or {})
+        from .....kernel_src.sm100.next_cutedsl_megamoe.shim.tuning import (
+            STANDARD_KNOB_KEYS,
+        )
+
+        native = isinstance(k.knobs, dict) and bool(
+            set(k.knobs)
+            & (set(STANDARD_KNOB_KEYS) - {"mma_tiler_mnk", "token_back_mode"})
+        )
+        if isinstance(k.knobs, dict) and not native:
+            knobs.update(k.knobs)
         if not knobs.pop("force_static_sched", True):
             raise MoEEpConfigError(
                 "force_static_sched=False has no standard-kernel mapping."
@@ -141,7 +171,7 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
         reduce = bool(knobs.get("in_kernel_fc2_reduce", False))
         if reduce and not k.enable_in_kernel_fc2_reduce:
             raise MoEEpConfigError("In-kernel reduction must be enabled in the config.")
-        return Sm100BlockScaledMoeConfig(
+        config = Sm100BlockScaledMoeConfig(
             num_total_experts=fleet.num_experts,
             max_tokens_per_rank=fleet.max_tokens_per_rank,
             num_topk=k.top_k,
@@ -178,6 +208,20 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
                 k, "enable_fc1_activation_per_token_scale", False
             ),
         )
+        if native:
+            import dataclasses
+            from .....kernel_src.sm100.next_cutedsl_megamoe.shim.tuning import (
+                is_valid_sm100_knobs,
+            )
+
+            if not is_valid_sm100_knobs(k.knobs, config):
+                raise MoEEpConfigError("Invalid native standard tuning knobs.")
+            config = dataclasses.replace(config, **k.knobs)
+            if config.reduce_topk_in_kernel and not k.enable_in_kernel_fc2_reduce:
+                raise MoEEpConfigError(
+                    "In-kernel reduction must be enabled in the config."
+                )
+        return config
 
     def preprocess_weights(self, weights, fleet_params):
         from .....kernel_src.sm100.next_cutedsl_megamoe import (
@@ -246,6 +290,8 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
         return workspace
 
     def _workspace_pool_key(self, fleet_params):
+        if self._config.knobs == "auto":
+            return None
         from .....core.kernel.workspace_pool import epilogue_pool_key
 
         return (
@@ -402,6 +448,12 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
             sm100_block_scaled_mega_moe,
         )
 
+        from .automatic import prepare_auto_configuration
+
+        if self._config.knobs == "auto":
+            prepare_auto_configuration(
+                self, workspace, transformed_weights, output, workspace.staged_tokens()
+            )
         if self.supports_unfinalized_output:
             raise ValueError("finalize_mode=NONE requires compute_unfinalized()")
         if not workspace.config.use_custom_finalize:
@@ -437,6 +489,12 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
 
         if not self.supports_unfinalized_output:
             raise ValueError("compute_unfinalized() requires finalize_mode=NONE")
+        if self._config.knobs == "auto":
+            from .automatic import prepare_auto_configuration
+
+            prepare_auto_configuration(
+                self, workspace, transformed_weights, None, workspace.staged_tokens()
+            )
         n = workspace.staged_tokens()
         if n is None:
             raise ValueError("compute_unfinalized() requires stage_inputs() first")

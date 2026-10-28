@@ -52,7 +52,10 @@ by `sm100/cutedsl_megamoe`, including Rubin's existing staging consumer. This
 export contains no second `inputs_process.py`. BF16/BF16 and BF16/MXFP8 remain
 in the legacy package.
 
-The standard adapter accepts `knobs=None` or a dictionary. Both dtypes support
+The standard adapter accepts `knobs=None`, a dictionary, or `knobs="auto"`.
+Automatic selection uses `autotune_v2()` for both standard and GenPhase kernels;
+the offline CLI writes managed results and the MegaMoE cache file by default.
+Both dtypes support
 parameterized SwiGLU, bounded or unbounded SiTU, early and late routing weights,
 and in-kernel BF16 reduction. NVFP4 also exposes per-token FC1 activation scales
 and quantized combine. MXFP8 supports 64-aligned hidden rows with padded scales.
@@ -66,8 +69,8 @@ workspace reuse. Persistent and deferred finalization cannot be combined.
 CAKE when supported, then persistent reduction when a live count is supplied,
 otherwise static reduction. In-kernel reduction needs no separate finalizer.
 
-Online autotuning and IKET capture are unavailable through the standard
-selectors. Legacy scheduler controls without a standard-kernel equivalent are
+IKET capture is unavailable through the standard selectors.
+Legacy scheduler controls without a standard-kernel equivalent are
 rejected before allocation. GenPhase retains its existing SwiGLU and separate
 BF16 finalization restrictions.
 

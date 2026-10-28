@@ -39,6 +39,8 @@ from flashinfer.cake_causal_conv1d_train import (
     cake_causal_conv1d_train_backward,
     cake_causal_conv1d_train_backward_workspace_bytes,
     cake_causal_conv1d_train_forward,
+    cake_causal_conv1d_train_forward_workspace,
+    cake_causal_conv1d_train_forward_workspace_bytes,
     is_cake_causal_conv1d_train_supported,
 )
 from flashinfer.cake_causal_conv1d_train_backend import cake_jit as loader
@@ -88,6 +90,15 @@ def test_function_signature_is_exported() -> None:
         flashinfer.cake_causal_conv1d_train_backward_workspace_bytes
         is cake_causal_conv1d_train_backward_workspace_bytes
     )
+    assert (
+        flashinfer.cake_causal_conv1d_train_forward_workspace_bytes
+        is cake_causal_conv1d_train_forward_workspace_bytes
+        is backend.cake_causal_conv1d_train_forward_workspace_bytes
+    )
+    assert (
+        cake_causal_conv1d_train_forward_workspace
+        is backend.cake_causal_conv1d_train_forward_workspace
+    )
     assert flashinfer.CakeCausalConv1dFunction is CakeCausalConv1dFunction
 
 
@@ -132,6 +143,11 @@ def test_facade_entry_points_match_the_backend() -> None:
     cu = torch.tensor([0, 369, 659, 868, S], dtype=torch.int32, device=_device())
     y = cake_causal_conv1d_train_forward(x, w, cu)
     assert torch.equal(y, backend.cake_causal_conv1d_train_forward(x, w, cu))
+    workspace = cake_causal_conv1d_train_forward_workspace(S, C, _device())
+    assert torch.equal(
+        y, cake_causal_conv1d_train_forward(x, w, cu, workspace=workspace)
+    )
+    assert int(torch.count_nonzero(workspace)) == 0
     dx, dw = cake_causal_conv1d_train_backward(x, w, cu, dy)
     dx_backend, dw_backend = backend.cake_causal_conv1d_train_backward(x, w, cu, dy)
     assert torch.equal(dx, dx_backend) and torch.equal(dw, dw_backend)

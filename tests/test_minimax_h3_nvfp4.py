@@ -131,6 +131,32 @@ def test_exact_architecture_router(monkeypatch, capability, expected) -> None:
     assert gemm is not ops.minimax_h3_nvfp4_programs(torch.device("cuda"), "nvfp4")[1]
 
 
+@pytest.mark.parametrize(
+    ("capability", "target"),
+    [((10, 0), "sm_100a"), ((10, 3), "sm_103a")],
+)
+def test_norm_program_follows_target_and_destinations(
+    monkeypatch, capability, target
+) -> None:
+    from flashinfer.diffusion_ops import cake_minimax_h3_nvfp4 as ops
+    from flashinfer.jit import cake_minimax_h3_nvfp4_pre_attention as programs
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: capability)
+    for P in (None, 1, 2, 4, 8):
+        for out_format in ("nvfp4", "e4m3"):
+            for M in (None, 1, 4824, 6095, 6096, 13744):
+                norm, _ = ops.minimax_h3_nvfp4_programs(
+                    torch.device("cuda"), out_format, P, M
+                )
+                staged = (target, P) == ("sm_103a", 4) or (
+                    (out_format, target, P) == ("nvfp4", "sm_103a", 8)
+                    and M is not None
+                    and M >= 6096
+                )
+                assert norm is (programs.NORM_V5 if staged else programs.NORM)
+                assert target in norm.targets
+
+
 @pytest.mark.parametrize("capability", [(9, 0), (10, 7), (12, 0)])
 def test_architecture_router_rejects_cross_routing(monkeypatch, capability) -> None:
     from flashinfer.diffusion_ops import cake_minimax_h3_nvfp4 as ops
@@ -242,7 +268,7 @@ def _prepare_zero_smoke(
         # preparation, so operand values a test depends on are set before the
         # operation is prepared (the E2M1 weight bytes are still read in place).
         configure(values)
-    norm, gemm = ops.minimax_h3_nvfp4_programs(device, out_format)
+    norm, gemm = ops.minimax_h3_nvfp4_programs(device, out_format, P)
     target = ops.minimax_h3_nvfp4_target(device)
     assert target in norm.targets and gemm.targets == (target,)
     operation = MiniMaxH3Nvfp4PreAttention(
@@ -815,7 +841,9 @@ def _make_numerical_values(M: int, P: int, device: torch.device) -> dict:
     }
 
 
-@pytest.mark.parametrize(("M", "P"), [(1, 8), (129, 8), (2048, 1), (4097, 2)])
+@pytest.mark.parametrize(
+    ("M", "P"), [(1, 8), (129, 8), (2048, 1), (4097, 2), (2048, 4)]
+)
 def test_numerical_reference(M: int, P: int) -> None:
     """The two stages match an independent torch oracle of the NVFP4 route.
 
@@ -962,6 +990,125 @@ def _e4m3_cast(values: torch.Tensor, out_scale: torch.Tensor) -> torch.Tensor:
     return scaled.to(torch.float8_e4m3fn)
 
 
+@pytest.mark.parametrize(
+    ("M", "P"), [(129, 4), (300, 4), (2048, 4), (6096, 8), (7368, 8)]
+)
+def test_staged_norm_program_writes_the_norm_bytes(monkeypatch, M: int, P: int) -> None:
+    """On ``sm_103a`` the staged norm program (``NORM_V5``) writes the bytes of ``NORM``.
+
+    It serves four destinations and, for ``out_format="nvfp4"``, eight
+    destinations from ``M = 6096`` tokens on.  Reference: the ``NORM`` program
+    on the same inputs, every output and debug buffer compared byte for byte.
+    The (129, 4) and (300, 4) inputs put E2M1 rounding ties in the activation:
+    the kernels form the encode factor with approximate reciprocals and the
+    torch oracle of ``test_numerical_reference`` with IEEE division, so at a tie
+    the two can pick neighbouring codes; the program-to-program comparison is
+    exact at every element.
+    """
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("requires SM103a")
+    pytest.importorskip("flashinfer.jit.cake_minimax_h3_nvfp4_pre_attention")
+    from flashinfer.diffusion_ops import cake_minimax_h3_nvfp4 as ops
+    from flashinfer.jit import cake_minimax_h3_nvfp4_pre_attention as programs
+
+    device = torch.device("cuda")
+
+    def run() -> dict:
+        values = _make_numerical_values(M, P, device)
+        debug = {
+            "debug_adaln_bf16": torch.full(
+                (M, _HIDDEN), float("nan"), dtype=torch.bfloat16, device=device
+            ),
+            "debug_q_bf16": torch.full(
+                (M, _NUM_HEADS, _HEAD_DIM),
+                float("nan"),
+                dtype=torch.bfloat16,
+                device=device,
+            ),
+            "debug_k_bf16": torch.full(
+                (M, _NUM_HEADS, _HEAD_DIM),
+                float("nan"),
+                dtype=torch.bfloat16,
+                device=device,
+            ),
+        }
+        activation_q = torch.full(
+            (M, _HIDDEN // 2), 0xA5, dtype=torch.uint8, device=device
+        )
+        activation_sf = torch.full(
+            (_round_up(M, 128) * (_HIDDEN // _FP4_BLOCK),),
+            0xA5,
+            dtype=torch.uint8,
+            device=device,
+        )
+        operation = MiniMaxH3Nvfp4PreAttention(
+            **values,
+            activation_q=activation_q,
+            activation_sf=activation_sf,
+            P=P,
+            **debug,
+        )
+        operation.run(**values, **debug)
+        torch.cuda.synchronize()
+        return {
+            "activation_q": activation_q,
+            "activation_sf": activation_sf,
+            "out_q": values["out_q"],
+            "out_sf": values["out_sf"],
+            **debug,
+        }
+
+    assert ops.minimax_h3_nvfp4_programs(device, "nvfp4", P, M)[0] is programs.NORM_V5
+    staged = run()
+    with monkeypatch.context() as patch:
+        patch.setattr(ops, "_NORM_PROGRAMS", {})
+        patch.setattr(ops, "_NORM_PROGRAMS_FROM_M", {})
+        assert ops.minimax_h3_nvfp4_programs(device, "nvfp4", P, M)[0] is programs.NORM
+        shared = run()
+    for name, tensor in staged.items():
+        assert torch.equal(tensor.view(torch.uint8), shared[name].view(torch.uint8)), (
+            name
+        )
+
+
+@pytest.mark.parametrize(
+    ("M", "out_format", "staged"),
+    [(6095, "nvfp4", False), (6096, "nvfp4", True), (6096, "e4m3", False)],
+)
+def test_prepared_operation_launches_the_routed_norm_program(
+    M: int, out_format: str, staged: bool
+) -> None:
+    """A prepared eight-destination operation on ``sm_103a`` launches the norm
+    program of its route: ``NORM_V5`` for ``out_format="nvfp4"`` from
+    ``M = 6096`` tokens on, ``NORM`` below that and for ``e4m3``.
+
+    The kernels of one run are read from the CUDA profiler trace, so the check
+    covers the programs the operation prepared, not only the routing table.
+    """
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("requires SM103a")
+    pytest.importorskip("flashinfer.jit.cake_minimax_h3_nvfp4_pre_attention")
+    from torch.profiler import ProfilerActivity, profile
+
+    from flashinfer.jit import cake_minimax_h3_nvfp4_pre_attention as programs
+
+    operation, values = _prepare_zero_smoke(-1, M=M, P=8, out_format=out_format)
+    operation.run(**values)
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as trace:
+        operation.run(**values)
+        torch.cuda.synchronize()
+    launched = sorted(
+        event.name
+        for event in trace.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+        and event.name.startswith("kernel_cake_minimax_h3_nvfp4_pre_attention_")
+    )
+    norm = programs.NORM_V5 if staged else programs.NORM
+    gemm = programs.FUSED_PACK_K96 if out_format == "nvfp4" else programs.FUSED_E4M3_K96
+    assert launched == sorted([norm.kernel, gemm.kernel])
+
+
 def _e4m3_step(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """One E4M3 code step at the larger magnitude: 2^(e - 3) for normals, 2^-9 below 2^-6."""
     magnitude = torch.maximum(a.abs(), b.abs()).clamp_min(2.0**-6)
@@ -1046,6 +1193,7 @@ def test_nvfp4_rejects_a_misaligned_scale_tile() -> None:
         (129, 8, (4.0 / 448, 4.0 / 448, 8.0 / 448)),
         (2048, 1, (0.3, 1.7, 0.9)),
         (4097, 2, (4.0 / 448, 4.0 / 448, 8.0 / 448)),
+        (2048, 4, (0.3, 1.7, 0.9)),
     ],
 )
 def test_e4m3_numerical_reference(M: int, P: int, qkv_scales) -> None:
