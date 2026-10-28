@@ -298,7 +298,7 @@ def _run_paged_prefill_case(
         [
             torch.arange(start + p, start + t)
             for start, p, t in zip(
-                _cu(totals, "cpu").tolist(), prefix_lens, totals, strict=True
+                _cu(totals, "cpu").tolist()[:-1], prefix_lens, totals, strict=True
             )
         ]
     ).cuda()
@@ -654,7 +654,9 @@ def test_prefix_lens_absolute_checkpoints():
     ref_rows = torch.cat(
         [
             torch.arange(s + p, s + t)
-            for s, p, t in zip(_cu(totals, "cpu").tolist(), prefix, totals, strict=True)
+            for s, p, t in zip(
+                _cu(totals, "cpu").tolist()[:-1], prefix, totals, strict=True
+            )
         ]
     ).cuda()
     torch.testing.assert_close(
