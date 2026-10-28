@@ -18,7 +18,7 @@ Invoked through the :mod:`flashinfer.moe_ep.tune` CLI shim::
 
     torchrun --nproc_per_node=8 -m flashinfer.moe_ep.tune --dtype sm120_mxfp4_mxfp8 \\
         --hidden 4096 --intermediate 2048 --num-experts 256 --topk 6 \\
-        --max-tokens 512 2048 8192 [--shared-expert]
+        --max-tokens 512 2048 8192 [--shared-expert] [--return-codec int8]
 
 For every row capacity it times each transport table the launched topology can serve
 (``all_gin``; ``lsa_where_reachable``; LSA only inside rank pairs ``(2i, 2i+1)``;
@@ -113,11 +113,12 @@ def tune_one(args: Any, rank: int, world: int, max_tokens: int) -> dict[str, Any
     import torch.distributed as dist
 
     from .cake_geometry import kernel_max_rows
-    from .cake_knob_cache import record_knobs, topology_digest
+    from .cake_knob_cache import record_knobs, topology_digest, variant_key
     from .cake_synthetic import Geometry, make_layer, random_inputs, random_weights
     from .cake_transport import gather_lsa_pair_matrix
 
     shared = bool(getattr(args, "shared_expert", False))
+    return_codec = getattr(args, "return_codec", "bf16")
     geometry = Geometry(args.hidden, args.intermediate, args.num_experts, args.topk)
     live = args.live_tokens if args.live_tokens is not None else max_tokens
     if live > max_tokens:
@@ -134,6 +135,7 @@ def tune_one(args: Any, rank: int, world: int, max_tokens: int) -> dict[str, Any
             max_tokens_per_rank=max_tokens,
             shared=shared,
             transport_table=spec,
+            return_codec=return_codec,
         )
 
     layer = build("all_gin")
@@ -170,7 +172,7 @@ def tune_one(args: Any, rank: int, world: int, max_tokens: int) -> dict[str, Any
             p50_us=timed[best][0],
             candidates_us={n: round(t, 1) for n, (t, _) in timed.items()},
             device=None,
-            variant="fp8shared" if shared else "noshared",
+            variant=variant_key("fp8shared" if shared else "noshared", return_codec),
             world_size=world,
             hidden=args.hidden,
             intermediate=args.intermediate,
