@@ -38,9 +38,12 @@ __device__ __forceinline__ DTypeOut Quantize8Bit(float value) {
   return DTypeOut(value);
 }
 
+// INT8 rounds half up (floor(x + 0.5)) to match the cuda.tile backend, which
+// has no round-to-nearest-even op. The caller clamps `value` to [-128, 127]
+// first, so the +0.5 cannot push the result out of the int8 range.
 template <>
 __device__ __forceinline__ int8_t Quantize8Bit<int8_t>(float value) {
-  return static_cast<int8_t>(__float2int_rn(value));
+  return static_cast<int8_t>(__float2int_rd(value + 0.5f));
 }
 
 // Round a positive, normal float up to the next power of two. The quantizer
@@ -105,7 +108,11 @@ __global__ void PerTokenGroupQuant8BitRegisterKernel(const DTypeIn* __restrict__
     absmax = fmaxf(absmax, __shfl_xor_sync(subgroup_mask, absmax, offset, kThreadsPerGroup));
   }
 
-  float scale = absmax / max_8bit;
+  // The module is compiled with -use_fast_math, under which `absmax / max_8bit`
+  // becomes a reciprocal multiply that is 1 ulp off the IEEE quotient for a
+  // large fraction of inputs. Use the correctly rounded division so the scale
+  // is bit-identical to the cuda.tile backend and to a float32 reference.
+  float scale = __fdiv_rn(absmax, max_8bit);
   if constexpr (SCALE_UE8M0) {
     scale = detail::RoundUpToPowerOfTwo(fmaxf(fabsf(scale), 1e-10f));
   }

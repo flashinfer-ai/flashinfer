@@ -13,12 +13,17 @@ def _reference(x: torch.Tensor, dst_dtype: torch.dtype, ue8m0: bool = False):
     qmax = 127.0 if dst_dtype == torch.int8 else torch.finfo(dst_dtype).max
     qmin = -128.0 if dst_dtype == torch.int8 else torch.finfo(dst_dtype).min
     absmax = grouped.abs().amax(dim=-1, keepdim=True).clamp(min=1e-10)
-    scale = absmax / qmax
+    # Divide by a device tensor: for a CUDA tensor divided by a Python scalar
+    # PyTorch multiplies by the reciprocal, which is not the IEEE quotient the
+    # kernel (and the cuda.tile backend) produce.
+    qmax_t = torch.tensor(qmax, device=x.device, dtype=torch.float32)
+    scale = absmax / qmax_t
     if ue8m0:
         scale = torch.exp2(torch.ceil(torch.log2(scale.abs().clamp(min=1e-10))))
     scaled = (grouped / scale).clamp(qmin, qmax)
     if dst_dtype == torch.int8:
-        scaled = scaled.round()
+        # Round half up, the convention shared with the cuda.tile backend.
+        scaled = torch.floor(scaled + 0.5)
     quantized = scaled.to(dst_dtype).reshape(x.shape)
     scales = scale.reshape(x.shape[:-1] + (x.shape[-1] // 128,)).float()
     return quantized, scales
@@ -40,6 +45,41 @@ def test_cuda_matches_reference(shape, input_dtype, dst_dtype):
 
     torch.testing.assert_close(actual_s, expected_s, rtol=0, atol=0)
     torch.testing.assert_close(actual_q.float(), expected_q.float(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("ue8m0", [False, True])
+def test_cuda_int8_rounds_half_up(ue8m0):
+    # absmax 254 gives the scale 254 / 127 = 2 exactly; with UE8M0, absmax 200
+    # gives 200 / 127 = 1.57..., rounded up to the power of two 2. Either way
+    # the inputs 1, 3, 5 land exactly on the ties 0.5, 1.5, 2.5, where
+    # round-half-up (the cuda.tile convention) gives 1, 2, 3 while
+    # round-to-nearest-even would give 0, 2, 2. The negative ties -0.5, -1.5,
+    # -2.5 go to 0, -1, -2 (nearest-even: 0, -2, -2).
+    absmax = 200.0 if ue8m0 else 254.0
+    x = torch.zeros((4, 128), device="cuda", dtype=torch.float16)
+    x[:, 0] = absmax
+    x[:, 1:7] = torch.tensor([1.0, 3.0, 5.0, -1.0, -3.0, -5.0], device="cuda")
+
+    actual_q, actual_s = per_token_group_quant_8bit(
+        x,
+        128,
+        dst_dtype=torch.int8,
+        column_major_scales=ue8m0,
+        scale_ue8m0=ue8m0,
+        backend="cuda",
+    )
+
+    expected_q = torch.zeros_like(x, dtype=torch.int8)
+    expected_q[:, 0] = 100 if ue8m0 else 127
+    expected_q[:, 1:7] = torch.tensor(
+        [1, 2, 3, 0, -1, -2], device="cuda", dtype=torch.int8
+    )
+    torch.testing.assert_close(actual_s, torch.full_like(actual_s, 2.0), rtol=0, atol=0)
+    torch.testing.assert_close(actual_q, expected_q, rtol=0, atol=0)
+
+    ref_q, ref_s = _reference(x, torch.int8, ue8m0)
+    torch.testing.assert_close(actual_s, ref_s, rtol=0, atol=0)
+    torch.testing.assert_close(actual_q, ref_q, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("num_tokens", [1, 130])

@@ -1153,7 +1153,9 @@ def per_token_group_quant_8bit(
     backend : str
         Implementation backend. ``"cutile"`` uses the cuda.tile Python
         backend. ``"cuda"`` uses a register-resident native CUDA kernel and
-        currently supports ``group_size=128`` with FP16/BF16 input.
+        currently supports ``group_size=128`` with FP16/BF16 input. Both
+        backends compute the scale with IEEE float32 division and, for
+        ``dst_dtype=torch.int8``, round half up (``floor(x + 0.5)``).
 
     Returns
     -------
