@@ -434,6 +434,57 @@ def test_minimax_h3_sm120_varlen_attention_fp8_overlapped_form_is_bitwise_sequen
 
 
 @requires_sm120
+@pytest.mark.parametrize(
+    "cu_seqlens",
+    [
+        # a short attention-weighted mean segment length: the light overlap width
+        (0, 1536, 3072, 4608, 6144),
+        # a long mean over more than 16384 padded tokens: the long overlap width
+        (0, 8368, 16736, 25104, 33472),
+    ],
+)
+def test_minimax_h3_sm120_varlen_attention_fp8_overlap_widths_are_bitwise_sequential(
+    cu_seqlens, fresh_caches, monkeypatch
+) -> None:
+    """The plans whose overlap width is not the shipped 32 match the sequential launches bit for bit
+    and leave the head-control words zero."""
+    device = torch.device("cuda:0")
+    _skip_without_overlap(device)
+    cu = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
+    q, k, v = synthetic_inputs(
+        cu_seqlens[-1], MINIMAX_H3_NUM_HEADS, seed=23, device=device
+    )
+    plan = fp8_ops._plan_at(cu_seqlens, MINIMAX_H3_NUM_HEADS, device.index)
+    assert plan.overlap
+    grids = fp8_ops.minimax_h3_sm120_quant_varlen_attention_overlap_grids(
+        fp8_ops._sm_count(device.index),
+        num_units=plan.num_units,
+        total_tokens=plan.total_tokens,
+        work=plan.work,
+        padded_tokens=plan.padded_tokens,
+    )
+    assert grids[2] > 32
+
+    def call() -> torch.Tensor:
+        return minimax_h3_sm120_varlen_attention_fp8(
+            q, k, v, cu, cu_seqlens_host=cu_seqlens
+        )
+
+    overlapped = [call() for _call in range(2)]
+    _await((torch.cuda.current_stream(),), "overlapped calls")
+    owner = (device.index, torch.cuda.current_stream().cuda_stream)
+    assert _control_words_are_zero([owner])
+    monkeypatch.setattr(fp8_ops, "_OVERLAP_WIDTH", {})
+    monkeypatch.setattr(fp8_ops, "_PLANS", OrderedDict())
+    monkeypatch.setattr(fp8_ops, "_STREAM_WORKSPACES", OrderedDict())
+    sequential = call()
+    torch.cuda.synchronize()
+    assert not fp8_ops._plan_at(cu_seqlens, MINIMAX_H3_NUM_HEADS, device.index).overlap
+    for out in overlapped:
+        assert torch.equal(out, sequential)
+
+
+@requires_sm120
 @pytest.mark.parametrize("overlap", [True, False])
 @pytest.mark.parametrize("num_streams", [2, 4])
 def test_minimax_h3_sm120_varlen_attention_fp8_concurrent_streams_are_bitwise(
