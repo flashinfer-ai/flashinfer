@@ -17,6 +17,10 @@ the last shared page instead of recomputing the prefix.
 
     chunk_gated_delta_rule_paged
     gated_delta_rule_decode_paged
+    gdn_paged_prefill_slots
+    gdn_paged_decode_slots
+    GDNPagedPrefillSlots
+    GDNPagedDecodeSlots
 
 Page table
 ----------
@@ -34,8 +38,12 @@ pages and ``last_page_len = 452``:
     page:     p0          p1             p2  (partial, last_page_len = 452)
     state:    after 1024  after 2048     after 2500
 
-``chunk_gated_delta_rule_paged`` derives every pool row on the device, without
-a host synchronization:
+``chunk_gated_delta_rule_paged`` derives every pool row on the device in one
+small launch, without a host synchronization. The rows depend only on the
+batch, so a model can compute them once per step with
+``gdn_paged_prefill_slots`` (``gdn_paged_decode_slots`` for decode) and pass
+them as ``slots`` to every layer's call, which then launches only the GDN
+kernel. The call:
 
 - It reads the initial state from the page that holds the last prefix token,
   or starts from the zero state when the prefix is empty.

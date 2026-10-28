@@ -36,6 +36,8 @@ from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
 from flashinfer.gdn_paged import (
     chunk_gated_delta_rule_paged,
     gated_delta_rule_decode_paged,
+    gdn_paged_decode_slots,
+    gdn_paged_prefill_slots,
 )
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 from flashinfer.utils import get_compute_capability
@@ -1043,3 +1045,94 @@ def test_paged_decode_cuda_graph_reads_live_page_tables():
         torch.testing.assert_close(
             pool, expected_pool, atol=1e-3, rtol=1e-3, msg=f"step {i}: pool"
         )
+
+
+# ── slot helpers ──────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_paged_prefill_slots_rows(index_dtype):
+    """The prefill rows, case by case (page_len 128)."""
+    L = 128
+    # (prefix, new tokens, pages)
+    cases = [
+        (0, 300, [7, 2, 9]),  # no prefix, ends inside page 2
+        (100, 200, [4, 11, 0]),  # mid-page prefix crossing two boundaries
+        (256, 128, [5, 6, 8]),  # page-aligned prefix, ends on a boundary
+        (129, 0, [1, 3]),  # no new token
+        (129, 10, [12, 13]),  # prefix one token into page 1
+        (0, 5, [10]),  # one partial page
+    ]
+    pages = [c[2] for c in cases]
+    totals = [p + n for p, n, _ in cases]
+    slots = gdn_paged_prefill_slots(
+        _cu([n for _, n, _ in cases], "cuda").to(index_dtype),
+        torch.tensor(sum(pages, []), dtype=index_dtype, device="cuda"),
+        _cu([len(ps) for ps in pages], "cuda").to(index_dtype),
+        L,
+        torch.tensor(
+            [t - (len(ps) - 1) * L for t, ps in zip(totals, pages, strict=True)],
+            dtype=index_dtype,
+            device="cuda",
+        ),
+    )
+    expected = {
+        "state_indices": [-1, 4, 6, 3, 13, -1],
+        "output_state_indices": [9, 0, -1, -1, 13, 10],
+        "checkpoint_cu_starts": [0, 3, 8, 10, 12, 13],
+        "prefix_lens": [0, 100, 256, 129, 129, 0],
+    }
+    for name, values in expected.items():
+        tensor = getattr(slots, name)
+        assert tensor.dtype == torch.int32, name
+        assert tensor.tolist() == values, name
+
+
+def test_paged_decode_slots_rows():
+    pages = [[3, 9], [5], [7, 0, 2], [1, 4]]
+    slots = gdn_paged_decode_slots(
+        torch.tensor(sum(pages, []), dtype=torch.int64, device="cuda"),
+        _cu([len(p) for p in pages], "cuda"),
+        torch.tensor([1, 17, 64, 1], dtype=torch.int32, device="cuda"),
+    )
+    assert slots.initial_state_indices.tolist() == [3, 5, 2, 1]
+    assert slots.output_state_indices.tolist() == [9, 5, 2, 4]
+
+
+def test_paged_prefill_slots_reused_across_layers():
+    """Rows computed once serve every layer: each layer's call with the shared
+    slots matches the call that derives them itself, bit for bit."""
+    _skip_if_unsupported()
+    torch.manual_seed(11)
+    random.seed(11)
+    L = 128
+    prefix, new = [0, 70, 256], [100, 130, 64]
+    totals = [p + n for p, n in zip(prefix, new, strict=True)]
+    batch = PagedBatch(totals, L, 4, torch.float32)
+    indices, indptr, last = batch.tables()
+    cu = _cu(new, "cuda")
+    slots = gdn_paged_prefill_slots(cu, indices, indptr, L, last)
+    for layer in range(2):
+        streams = Streams(totals, 4, 4, 4, torch.bfloat16)
+        q, k, v, g, beta = streams.slices(prefix, totals)
+        pools = [batch.pool.clone() + layer, batch.pool.clone() + layer]
+        outs = [
+            chunk_gated_delta_rule_paged(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                cu_seqlens=cu,
+                state_pool=pool,
+                page_indices=indices,
+                page_indptr=indptr,
+                page_len=L,
+                last_page_len=last,
+                slots=shared,
+            )
+            for pool, shared in zip(pools, (slots, None), strict=True)
+        ]
+        torch.cuda.synchronize()
+        assert torch.equal(outs[0], outs[1]), f"layer {layer} output"
+        assert torch.equal(pools[0], pools[1]), f"layer {layer} pool"

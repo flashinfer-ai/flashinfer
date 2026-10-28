@@ -21,11 +21,13 @@ V, K]`` and gives every sequence a list of page ids in CSR form
 sequence holds the state after the last token of that page, so a sequence that
 shares a full-page prefix with another one can start from the last shared
 page. Both entry points derive every pool row on the device from the page
-table and run the existing kernels with separate read and write rows; neither
-synchronizes with the host.
+table (one small launch, or none when the caller passes rows precomputed with
+:func:`gdn_paged_prefill_slots` / :func:`gdn_paged_decode_slots`, which every
+layer of a step can share) and run the existing kernels with separate read
+and write rows; nothing synchronizes with the host.
 """
 
-from typing import Literal, Optional
+from typing import Literal, NamedTuple, Optional
 
 import torch
 
@@ -56,14 +58,154 @@ def _check_page_table(
             raise ValueError(f"{name} must be on {device}, got {tensor.device}")
 
 
-def _gather_rows(
-    page_indices: torch.Tensor, entries: torch.Tensor, valid: torch.Tensor
-) -> torch.Tensor:
-    """``page_indices[entries]`` where ``valid``, else ``-1``."""
-    if page_indices.numel() == 0:
-        return torch.full_like(entries, -1, dtype=page_indices.dtype)
-    rows = page_indices[entries.clamp(0, page_indices.numel() - 1)]
-    return torch.where(valid, rows, torch.full_like(rows, -1))
+def _check_page_len(page_len: int) -> None:
+    if type(page_len) is not int:
+        raise ValueError(
+            f"page_len must be a Python int, got {type(page_len).__name__}"
+        )
+    if page_len <= 0 or page_len % 64 != 0:
+        raise ValueError(f"page_len must be a positive multiple of 64, got {page_len}")
+
+
+def _check_slots(slots: tuple, num_seqs: int, device: torch.device) -> None:
+    for name, tensor in zip(slots._fields, slots, strict=True):
+        if (
+            tensor.dtype != torch.int32
+            or tuple(tensor.shape) != (num_seqs,)
+            or tensor.device != device
+        ):
+            raise ValueError(
+                f"slots.{name} must be an int32 tensor of shape ({num_seqs},) "
+                f"on {device}"
+            )
+
+
+# Sequences per program of the slot kernels.
+_SLOTS_BLOCK = 128
+
+
+class GDNPagedPrefillSlots(NamedTuple):
+    """Per-sequence pool rows of a paged prefill batch, all ``[num_seqs]``
+    int32. See :func:`gdn_paged_prefill_slots`."""
+
+    state_indices: torch.Tensor
+    """Page holding the last prefix token, read as the initial state (``-1``:
+    empty prefix, zero state)."""
+    output_state_indices: torch.Tensor
+    """Last page, written with the final state (``-1``: no new token, or the
+    final state is the checkpoint of a page that ends there)."""
+    checkpoint_cu_starts: torch.Tensor
+    """``page_indices`` entry of the first page boundary the new tokens cross."""
+    prefix_lens: torch.Tensor
+    """Tokens before the new ones."""
+
+
+class GDNPagedDecodeSlots(NamedTuple):
+    """Per-sequence pool rows of a paged decode batch, both ``[B]`` int32. See
+    :func:`gdn_paged_decode_slots`."""
+
+    initial_state_indices: torch.Tensor
+    """Page read as the state before the decoded token."""
+    output_state_indices: torch.Tensor
+    """Last page, written with the state after the decoded token."""
+
+
+@flashinfer_api
+def gdn_paged_prefill_slots(
+    cu_seqlens: torch.Tensor,
+    page_indices: torch.Tensor,
+    page_indptr: torch.Tensor,
+    page_len: int,
+    last_page_len: torch.Tensor,
+) -> GDNPagedPrefillSlots:
+    r"""Pool rows that :func:`chunk_gated_delta_rule_paged` derives from a page
+    table, computed in one launch without a host synchronization.
+
+    The rows depend only on the batch (``cu_seqlens`` and the page table), not
+    on the layer, so a model can compute them once per step and pass them to
+    every layer's call as ``slots``.
+
+    Parameters
+    ----------
+    cu_seqlens, page_indices, page_indptr, page_len, last_page_len
+        As in :func:`chunk_gated_delta_rule_paged`.
+
+    Returns
+    -------
+    GDNPagedPrefillSlots
+        ``[num_seqs]`` int32 read rows, final-state rows, first checkpoint
+        entries and prefix lengths.
+    """
+    _check_page_len(page_len)
+    num_seqs = cu_seqlens.size(0) - 1
+    device = cu_seqlens.device
+    _check_page_table(page_indices, page_indptr, last_page_len, num_seqs, device)
+    if cu_seqlens.dtype not in (torch.int32, torch.int64) or cu_seqlens.ndim != 1:
+        raise ValueError("cu_seqlens must be a 1D int32 or int64 tensor")
+    slots = GDNPagedPrefillSlots(
+        *(torch.empty(num_seqs, dtype=torch.int32, device=device) for _ in range(4))
+    )
+    if num_seqs > 0:
+        from .triton.gdn_paged import gdn_paged_prefill_slots_kernel
+
+        with torch.cuda.device(device):
+            gdn_paged_prefill_slots_kernel[
+                ((num_seqs + _SLOTS_BLOCK - 1) // _SLOTS_BLOCK,)
+            ](
+                cu_seqlens,
+                page_indices,
+                page_indptr,
+                last_page_len,
+                *slots,
+                num_seqs,
+                page_len,
+                BLOCK=_SLOTS_BLOCK,
+            )
+    return slots
+
+
+@flashinfer_api
+def gdn_paged_decode_slots(
+    page_indices: torch.Tensor,
+    page_indptr: torch.Tensor,
+    last_page_len: torch.Tensor,
+) -> GDNPagedDecodeSlots:
+    r"""Pool rows that :func:`gated_delta_rule_decode_paged` derives from a page
+    table, computed in one launch without a host synchronization. Compute them
+    once per decode step and pass them to every layer's call as ``slots``.
+
+    Parameters
+    ----------
+    page_indices, page_indptr, last_page_len
+        As in :func:`gated_delta_rule_decode_paged`.
+
+    Returns
+    -------
+    GDNPagedDecodeSlots
+        ``[B]`` int32 read rows (the previous page when the decoded token
+        opens a new page, else the last page) and write rows (the last page).
+    """
+    num_seqs = page_indptr.size(0) - 1
+    device = page_indptr.device
+    _check_page_table(page_indices, page_indptr, last_page_len, num_seqs, device)
+    slots = GDNPagedDecodeSlots(
+        *(torch.empty(num_seqs, dtype=torch.int32, device=device) for _ in range(2))
+    )
+    if num_seqs > 0:
+        from .triton.gdn_paged import gdn_paged_decode_slots_kernel
+
+        with torch.cuda.device(device):
+            gdn_paged_decode_slots_kernel[
+                ((num_seqs + _SLOTS_BLOCK - 1) // _SLOTS_BLOCK,)
+            ](
+                page_indices,
+                page_indptr,
+                last_page_len,
+                *slots,
+                num_seqs,
+                BLOCK=_SLOTS_BLOCK,
+            )
+    return slots
 
 
 @flashinfer_api(trace=gdn_prefill_paged_trace)
@@ -90,6 +232,7 @@ def chunk_gated_delta_rule_paged(
     A_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     beta_is_logit: bool = False,
+    slots: Optional[GDNPagedPrefillSlots] = None,
 ) -> torch.Tensor:
     r"""Chunked GDN prefill that reads and writes a paged recurrent-state pool.
 
@@ -133,6 +276,11 @@ def chunk_gated_delta_rule_paged(
     last_page_len : torch.Tensor
         ``[num_seqs]`` int32/int64 number of tokens in the last page of each
         sequence after this call, in ``[1, page_len]``.
+    slots : GDNPagedPrefillSlots, optional
+        Rows from :func:`gdn_paged_prefill_slots` for the same ``cu_seqlens``
+        and page table, typically shared by every layer of a step. Without
+        them the call computes them (one extra launch). They are not checked
+        against the page table.
 
     Returns
     -------
@@ -145,12 +293,7 @@ def chunk_gated_delta_rule_paged(
     sequence of the same call. The page table and lengths are caller
     preconditions; they are not validated against each other on the device.
     """
-    if type(page_len) is not int:
-        raise ValueError(
-            f"page_len must be a Python int, got {type(page_len).__name__}"
-        )
-    if page_len <= 0 or page_len % 64 != 0:
-        raise ValueError(f"page_len must be a positive multiple of 64, got {page_len}")
+    _check_page_len(page_len)
     num_seqs = cu_seqlens.size(0) - 1
     _check_page_table(page_indices, page_indptr, last_page_len, num_seqs, q.device)
     # The kernels read page_indices directly as checkpoint rows.
@@ -161,26 +304,12 @@ def chunk_gated_delta_rule_paged(
             "state_pool must be [num_pages, num_sab_heads, head_size, head_size], "
             f"got shape {tuple(state_pool.shape)}"
         )
-
-    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-    page_starts = page_indptr[:-1]
-    total_lens = (page_indptr[1:] - page_starts - 1) * page_len + last_page_len
-    prefix_lens = total_lens - seq_lens
-    # The prefix's last token lives on entry (prefix - 1) // page_len; the
-    # first boundary crossed closes entry prefix // page_len.
-    read_entries = page_starts + torch.div(
-        prefix_lens - 1, page_len, rounding_mode="floor"
-    )
-    state_indices = _gather_rows(page_indices, read_entries, prefix_lens > 0)
-    # A final state that ends on a page boundary is that page's checkpoint.
-    output_state_indices = _gather_rows(
-        page_indices,
-        page_indptr[1:] - 1,
-        (seq_lens > 0) & (total_lens % page_len != 0),
-    )
-    checkpoint_starts = page_starts + torch.div(
-        prefix_lens, page_len, rounding_mode="floor"
-    )
+    if slots is None:
+        slots = gdn_paged_prefill_slots(
+            cu_seqlens, page_indices, page_indptr, page_len, last_page_len
+        )
+    else:
+        _check_slots(slots, num_seqs, q.device)
 
     output, _ = chunk_gated_delta_rule(
         q,
@@ -196,10 +325,10 @@ def chunk_gated_delta_rule_paged(
         output=output,
         output_state=state_pool,
         state_checkpoints=state_pool,
-        checkpoint_cu_starts=checkpoint_starts,
+        checkpoint_cu_starts=slots.checkpoint_cu_starts,
         checkpoint_every_n_tokens=page_len,
         use_cp=False,
-        state_indices=state_indices,
+        state_indices=slots.state_indices,
         max_seqlen=max_seqlen,
         gate_domain=gate_domain,
         use_gate_in_kernel=use_gate_in_kernel,
@@ -207,9 +336,9 @@ def chunk_gated_delta_rule_paged(
         dt_bias=dt_bias,
         beta_is_logit=beta_is_logit,
         cu_seqlens_cpu=cu_seqlens_cpu,
-        output_state_indices=output_state_indices,
+        output_state_indices=slots.output_state_indices,
         checkpoint_state_indices=page_indices,
-        prefix_lens=prefix_lens,
+        prefix_lens=slots.prefix_lens,
     )
     return output
 
@@ -232,6 +361,7 @@ def gated_delta_rule_decode_paged(
     page_indptr: torch.Tensor,
     last_page_len: torch.Tensor,
     backend: Literal["auto", "flashinfer", "cake_gdn", "rubin"] = "auto",
+    slots: Optional[GDNPagedDecodeSlots] = None,
 ) -> torch.Tensor:
     r"""Single-token GDN decode on a paged recurrent-state pool.
 
@@ -256,6 +386,11 @@ def gated_delta_rule_decode_paged(
     last_page_len : torch.Tensor
         ``[B]`` int32/int64 number of tokens in the last page including the
         decoded token, in ``[1, page_len]``.
+    slots : GDNPagedDecodeSlots, optional
+        Rows from :func:`gdn_paged_decode_slots` for the same page table,
+        typically shared by every layer of a step. Without them the call
+        computes them (one extra launch). They are not checked against the
+        page table.
 
     Returns
     -------
@@ -271,13 +406,10 @@ def gated_delta_rule_decode_paged(
     if T != 1:
         raise ValueError(f"gated_delta_rule_decode_paged decodes one token, got T={T}")
     _check_page_table(page_indices, page_indptr, last_page_len, B, q.device)
-
-    last_entries = page_indptr[1:] - 1
-    output_state_indices = page_indices[last_entries]
-    previous = page_indices[(last_entries - 1).clamp(min=0)]
-    initial_state_indices = torch.where(
-        last_page_len > 1, output_state_indices, previous
-    )
+    if slots is None:
+        slots = gdn_paged_decode_slots(page_indices, page_indptr, last_page_len)
+    else:
+        _check_slots(slots, B, q.device)
     output, _ = gated_delta_rule_decode_pretranspose(
         q,
         k,
@@ -291,8 +423,8 @@ def gated_delta_rule_decode_paged(
         output=output,
         use_qk_l2norm=use_qk_l2norm,
         initial_state=state_pool,
-        initial_state_indices=initial_state_indices,
-        output_state_indices=output_state_indices,
+        initial_state_indices=slots.initial_state_indices,
+        output_state_indices=slots.output_state_indices,
         backend=backend,
     )
     return output

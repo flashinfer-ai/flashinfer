@@ -21,7 +21,9 @@ Prefill compares, on batches whose prefixes end on page boundaries (the only
 case the packed API can serve):
 
 - paged: ``chunk_gated_delta_rule_paged`` reads the prefix page and writes every
-  page boundary and the final state into the pool in one call.
+  page boundary and the final state into the pool in one call, given the rows
+  of ``gdn_paged_prefill_slots`` (computed once per step and shared by all
+  layers; "slots ms" is that one-time cost, not included in "paged ms").
 - packed+copy: what a caller does with the packed checkpoint API: gather the
   prefix states (zero-filling sequences without a prefix), run
   ``chunk_gated_delta_rule`` with a packed initial state, packed final state
@@ -74,6 +76,7 @@ from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
 from flashinfer.gdn_paged import (
     chunk_gated_delta_rule_paged,
     gated_delta_rule_decode_paged,
+    gdn_paged_prefill_slots,
 )
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 from flashinfer.testing import bench_gpu_time
@@ -180,6 +183,11 @@ def _prefill_row(name, spans, heads, page_len, state_dtype):
         owned += init_buf.numel()
     owned_bytes = owned * init_buf.element_size()
 
+    def slots_fn():
+        return gdn_paged_prefill_slots(cu, perm, indptr, page_len, last)
+
+    slots = slots_fn()
+
     def paged():
         chunk_gated_delta_rule_paged(
             q,
@@ -195,6 +203,7 @@ def _prefill_row(name, spans, heads, page_len, state_dtype):
             page_len=page_len,
             last_page_len=last,
             output=out,
+            slots=slots,
         )
 
     def packed_copy():
@@ -262,6 +271,7 @@ def _prefill_row(name, spans, heads, page_len, state_dtype):
     no_ckpt()
 
     t_paged = _median_ms(paged)
+    t_slots = _median_ms(slots_fn)
     t_packed = _median_ms(packed_copy)
     t_plain = _median_ms(no_ckpt)
     return (
@@ -269,6 +279,7 @@ def _prefill_row(name, spans, heads, page_len, state_dtype):
         b,
         t_new,
         sum(ckpt_counts),
+        t_slots,
         t_paged,
         t_packed,
         t_plain,
@@ -463,16 +474,17 @@ def main():
         f"page_len={args.page_len}, state {args.state_dtype}"
     )
     print(
-        "| workload | seqs | new tokens | page ckpts | paged ms | packed+copy ms "
-        "| speedup | no-ckpt ms | paged extra MiB | packed+copy extra MiB |"
+        "| workload | seqs | new tokens | page ckpts | slots ms | paged ms "
+        "| packed+copy ms | speedup | no-ckpt ms | paged extra MiB "
+        "| packed+copy extra MiB |"
     )
-    print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
-    for name, b, t, n, tp, tc, t0, mp, mc in bench_prefill(
+    print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for name, b, t, n, ts, tp, tc, t0, mp, mc in bench_prefill(
         tuple(args.heads), args.page_len, state_dtype, PREFILL_WORKLOADS
     ):
         print(
-            f"| {name} | {b} | {t} | {n} | {tp:.4f} | {tc:.4f} | {tc / tp:.3f} "
-            f"| {t0:.4f} | {mp:.1f} | {mc:.1f} |"
+            f"| {name} | {b} | {t} | {n} | {ts:.4f} | {tp:.4f} | {tc:.4f} "
+            f"| {tc / tp:.3f} | {t0:.4f} | {mp:.1f} | {mc:.1f} |"
         )
     print(
         "\n| one state per seq | seqs | tokens | selected ms | all+gather ms "
