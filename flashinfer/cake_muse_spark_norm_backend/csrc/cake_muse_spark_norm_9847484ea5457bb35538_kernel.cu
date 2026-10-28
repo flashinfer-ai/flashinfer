@@ -253,17 +253,17 @@ kernel_cake_muse_spark_norm_9847484ea5457bb35538(__nv_bfloat16* __restrict__ bra
             acc = acc + acc2_8.y;
         }
         unsigned int spar = (unsigned int)((it & 1) * 8192);
-        int scol0 = cbase + 8 * t;
-        if (scol0 >= lo && scol0 < hi) {
-            unsigned int sbyte0 = spar + (unsigned int)((scol0 - lo) * 4);
-            asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(stage_addr + sbyte0), "f"(x[0]), "f"(x[1]), "f"(x[2]), "f"(x[3]) : "memory");
-            asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(stage_addr + sbyte0 + 16), "f"(x[4]), "f"(x[5]), "f"(x[6]), "f"(x[7]) : "memory");
+        int scol0_1_0 = cbase + 8 * t;
+        if (scol0_1_0 >= lo && scol0_1_0 < hi) {
+            unsigned int sbyte0_1_0 = spar + (unsigned int)((scol0_1_0 - lo) * 4);
+            asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(stage_addr + sbyte0_1_0), "f"(x[0]), "f"(x[1]), "f"(x[2]), "f"(x[3]) : "memory");
+            asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(stage_addr + sbyte0_1_0 + 16), "f"(x[4]), "f"(x[5]), "f"(x[6]), "f"(x[7]) : "memory");
         }
-        int scol1 = cbase + 4096 + 8 * t;
-        if (scol1 >= lo && scol1 < hi) {
-            unsigned int sbyte1 = spar + (unsigned int)((scol1 - lo) * 4);
-            asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(stage_addr + sbyte1), "f"(x[8]), "f"(x[9]), "f"(x[10]), "f"(x[11]) : "memory");
-            asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(stage_addr + sbyte1 + 16), "f"(x[12]), "f"(x[13]), "f"(x[14]), "f"(x[15]) : "memory");
+        int scol0_1_1 = cbase + 4096 + 8 * t;
+        if (scol0_1_1 >= lo && scol0_1_1 < hi) {
+            unsigned int sbyte0_1_1 = spar + (unsigned int)((scol0_1_1 - lo) * 4);
+            asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(stage_addr + sbyte0_1_1), "f"(x[8]), "f"(x[9]), "f"(x[10]), "f"(x[11]) : "memory");
+            asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(stage_addr + sbyte0_1_1 + 16), "f"(x[12]), "f"(x[13]), "f"(x[14]), "f"(x[15]) : "memory");
         }
         #pragma unroll
         for (int i = 0; i < 4; i++) {
