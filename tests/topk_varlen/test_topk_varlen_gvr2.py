@@ -673,6 +673,7 @@ def test_gvr2_clus_rows_far_below_envelope(rows, msl_c, top_k, next_n, cr, hinte
         kv, next_n, cr, top_k, seed=rows + top_k, msl_c=msl_c
     )
     out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    _forget_launcher(rows, msl_c, top_k, next_n, cr, hint_free=not hinted)
     _run_gvr2(
         logits,
         seq_lens,
@@ -715,6 +716,7 @@ def test_gvr2_clus_adversarial_short_rows(pattern, rows):
         logits[r, n_r[r] :] = 3e38  # per-row poison
     seq_lens = torch.tensor(n_r, dtype=torch.int32, device=_DEV)
     out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    _forget_launcher(rows, msl_c, top_k, 1, 1, hint_free=True)
     _run_gvr2(logits, seq_lens, top_k, None, out_indices=out)
     _assert_family(rows, msl_c, top_k, 1, 1, "clus", hint_free=True)
     _check_varlen_rows(logits, out, n_r, top_k)
@@ -741,6 +743,7 @@ def test_gvr2_clus_graph_replay_lengths_change(rows):
     out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
+    _forget_launcher(rows, msl, top_k, 1, 1, hint_free=True)
     with torch.cuda.stream(s):  # eager warm-up on the capturing stream
         _run_gvr2(logits, seq_lens, top_k, None, out_indices=out)
     torch.cuda.synchronize()
@@ -817,6 +820,7 @@ def test_gvr2_clus_register_rows(rows, msl_c, top_k, next_n, cr, hinted):
     logits, seq_lens, pre_idx, n_r, _ = _make_varlen_case(
         kv, next_n, cr, top_k, seed=rows + top_k, msl_c=msl_c
     )
+    _forget_launcher(rows, msl_c, top_k, next_n, cr, hint_free=not hinted)
     indices, _ = _run_gvr2(
         logits,
         seq_lens,
@@ -881,6 +885,7 @@ def test_gvr2_clus_register_adversarial(rows, pattern):
     ).to(torch.int32)
     for pre_idx in (None, hint):
         out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+        _forget_launcher(rows, msl_c, top_k, 1, 1, hint_free=pre_idx is None)
         _run_gvr2(logits, seq_lens, top_k, pre_idx, out_indices=out)
         torch.cuda.synchronize()
         _assert_family(rows, msl_c, top_k, 1, 1, "clus", hint_free=pre_idx is None)
@@ -2073,6 +2078,7 @@ def test_gvr2_register_escape_tail_element(
         )
         seq_lens = torch.tensor(n_r, dtype=torch.int32, device=_DEV)
         out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+        _forget_launcher(rows, width, top_k, 1, 1)
         _run_gvr2(logits, seq_lens, top_k, hint, out_indices=out)
         torch.cuda.synchronize()
         _assert_family(rows, width, top_k, 1, 1, family)
@@ -2180,6 +2186,15 @@ def test_gvr2_short_rows_every_family(rows, width, top_k, next_n, cr, family, pa
     exp = _short_expected(n_r, top_k, next_n, pt, page_size)
     for hint_free in (True, False) if not paged else (True,):
         out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+        _forget_launcher(
+            rows,
+            width,
+            top_k,
+            next_n,
+            cr,
+            hint_free=hint_free,
+            page_shift=6 if paged else None,
+        )
         _run_gvr2(
             logits,
             seq_lens,
@@ -2216,6 +2231,15 @@ def test_gvr2_short_rows_page_sizes(rows, width, top_k, next_n, cr, family, page
     own table entry) and with pages wider than a warp's positions."""
     logits, seq_lens, _, n_r, pt, kw = _short_case(
         rows, width, top_k, next_n, cr, page_size, seed=rows + page_size
+    )
+    _forget_launcher(
+        rows,
+        width,
+        top_k,
+        next_n,
+        cr,
+        hint_free=True,
+        page_shift=page_size.bit_length() - 1,
     )
     out, _ = _run_gvr2(
         logits, seq_lens, top_k, None, next_n=next_n, compress_ratio=cr, **kw
@@ -2277,6 +2301,15 @@ def test_gvr2_short_rows_graph_replay(rows, width, top_k, next_n, cr, family, pa
 
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
+    _forget_launcher(
+        rows,
+        width,
+        top_k,
+        next_n,
+        cr,
+        hint_free=True,
+        page_shift=6 if paged else None,
+    )
     with torch.cuda.stream(s):
         call()  # compile + this stream's workspace slab, outside capture
     torch.cuda.synchronize()
@@ -2412,6 +2445,7 @@ def test_gvr2_main_cluster_path_rows(rows, msl_c, top_k, next_n, cr):
             kv, next_n, cr, top_k, seed=rows + top_k + t, msl_c=msl_c
         )
         for hint_free in (False, True):
+            _forget_launcher(rows, msl_c, top_k, next_n, cr, hint_free=hint_free)
             indices, _ = _run_gvr2(
                 logits,
                 seq_lens,
@@ -2506,6 +2540,7 @@ def test_gvr2_main_cluster_path_adversarial(rows, msl_c, top_k, page_size, patte
     ).to(torch.int32)
     for pre_idx in (None, hint):
         out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+        _forget_launcher(rows, msl_c, top_k, 1, 1, hint_free=pre_idx is None)
         _run_gvr2(logits, seq_lens, top_k, pre_idx, out_indices=out)
         torch.cuda.synchronize()
         _assert_family(rows, msl_c, top_k, 1, 1, "main", hint_free=pre_idx is None)
@@ -2691,6 +2726,7 @@ def test_gvr2_main_slab_rows(rows, msl_c, top_k, next_n, cr):
             kv, next_n, cr, top_k, seed=rows + top_k + 17 * t, msl_c=msl_c
         )
         for hint_free in (False, True):
+            _forget_launcher(rows, msl_c, top_k, next_n, cr, hint_free=hint_free)
             indices, _ = _run_gvr2(
                 logits,
                 seq_lens,
@@ -2780,6 +2816,7 @@ def test_gvr2_main_slab_adversarial(rows, msl_c, top_k, pattern):
     ).to(torch.int32)
     for pre_idx in (None, hint):
         out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+        _forget_launcher(rows, msl_c, top_k, 1, 1, hint_free=pre_idx is None)
         _run_gvr2(logits, seq_lens, top_k, pre_idx, out_indices=out)
         torch.cuda.synchronize()
         _assert_family(rows, msl_c, top_k, 1, 1, "main", hint_free=pre_idx is None)
