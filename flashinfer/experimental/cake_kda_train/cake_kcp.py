@@ -2421,22 +2421,11 @@ class _Tables:
         self.splits = {k: tuple(int(x) for x in v) for k, v in hp.splits.items()}
         numel = {k: int(v) for k, v in hp.numel.items()}
         self.numel = numel
-        self.sizes = {
-            "c1_send": numel["c1_send"] + (self.n_out * H * TILE if P > 1 else 0),
-            "c1_recv": numel["c1_recv"],
-            "c2_send": numel["c2_send"],
-            "S_in": numel["c2_recv"],
-            "b1_send": max(numel["b1_send_d"], numel["b1_send_dm"]),
-            "b1_recv": max(numel["b1_recv_d"], numel["b1_recv_dm"]),
-            "b2_send": numel["b2_send"],
-            "b2_recv": numel["b2_recv"],
-            "stage_b": NSEG * H * TILE if P > 1 else 0,
-            "stage_m": NSEG * H * TILE if P > 1 else 0,
-            "carry": n_carry * H * TILE,
-            "eye": TILE,
-            "ring_out": max(self.n_in, self.n_out) * H * TILE,
-            "ring_in": max(self.n_in, self.n_out) * H * TILE,
-        }
+        # the plan module's pool sizes (the byte queries read the same function)
+        self.sizes = cake_kcp_plan.kcp_pool_numel(
+            ctx, H=H, fused_walks=self.fused_walks
+        )
+        assert self.sizes["carry"] == n_carry * H * TILE
         self._check_tiles()
         self._build_chains(starts, ins, outs, ends, in_slot, out_slot)
 
@@ -2959,19 +2948,7 @@ class _Tables:
         return form
 
     def pool_sizes(self, backward: bool) -> dict[str, int]:
-        names = [
-            "c1_send",
-            "c1_recv",
-            "c2_send",
-            "stage_b",
-            "stage_m",
-            "carry",
-            "eye",
-            "ring_out",
-            "ring_in",
-        ]
-        if backward:
-            names += ["b1_send", "b1_recv", "b2_send", "b2_recv"]
+        names = cake_kcp_plan.FWD_POOLS + (cake_kcp_plan.BWD_POOLS if backward else ())
         return {
             n: self.sizes[n] for n in names
         }  # zero-size pools included: every buffer name resolves
@@ -3016,11 +2993,15 @@ class KcpWorkspace:
 
     Pools (flat, ``state_dtype``): ``c1_send``, ``c1_recv``, ``c2_send``; ``b1_send``, ``b1_recv``, ``b2_send``,
     ``b2_recv`` (``backward``); at ``P > 1`` the staging planes ``stage_b`` / ``stage_m`` and the ``carry`` plane;
-    one identity tile ``eye``.  The saved-set tensors (``S_in`` = the c2 output, the c1 receive tensor under
-    ``save_transfer``, ``M_seg`` under ``save_transfer`` at ``P > 1``) are never arena slices: the calls allocate
-    them fresh (SPEC-4).  A workspace is reusable across calls and layers of the same ``(ctx, H)``; a call with a
-    larger need grows it.  ``bytes`` counts the pools plus the local arena (:func:`kcp_workspace_bytes` is the
-    plan module's prediction of the same quantity, CONSISTENCY-6)."""
+    one identity tile ``eye``.  The backward send pools share the storage of the forward ones
+    (``cake_kcp_plan.SHARED_POOLS``: ``b1_send`` = ``c1_send``, ``b2_send`` = ``c2_send``, one tensor of the larger
+    need; a call waits its c1 / c2 sends before a backward writes either).  The ring exchange's hop pools
+    ``ring_out`` / ``ring_in`` (``cake_kcp_plan.LAZY_POOLS``) are allocated by the first call that reads them.  The
+    saved-set tensors (``S_in`` = the c2 output, the c1 receive tensor under ``save_transfer``, ``M_seg`` under
+    ``save_transfer`` at ``P > 1``) are never arena slices: the calls allocate them fresh (SPEC-4).  A workspace is
+    reusable across calls and layers of the same ``(ctx, H)``; a call with a larger need grows it.  ``bytes`` counts
+    every pool storage once plus the local arena (:func:`kcp_workspace_bytes` is the plan module's prediction of the
+    same quantity for an a2a workspace, CONSISTENCY-6)."""
 
     def __init__(
         self,
@@ -3099,25 +3080,22 @@ class KcpWorkspace:
                 f"KcpWorkspace: lives on {self.device}, the call is on {device}"
             )
         tb = self.tables(ctx, H, fused_walks=fused_walks, walk_geometry=walk_geometry)
+        need = {
+            name: n
+            for name, n in tb.pool_sizes(backward).items()
+            if name
+            not in cake_kcp_plan.LAZY_POOLS  # allocated by the first call that reads them (pool())
+        }
+        for pair in cake_kcp_plan.SHARED_POOLS:  # one storage of the larger need
+            top = max((need[m] for m in pair if m in need), default=0)
+            for m in pair:
+                if m in need:
+                    need[m] = top
         replaced = False
-        for name, n in tb.pool_sizes(backward).items():
-            cur = self._pools.get(name)
-            if cur is None or cur.numel() < n:
-                self._pools[name] = _alloc((n,), self.state_dtype, device)
-                replaced = True
-                if name == "eye":
-                    self._pools[name].view(D, D).copy_(
-                        torch.eye(D, dtype=self.state_dtype, device=device)
-                    )
-        if (
-            replaced and self._slices
-        ):  # a superseded pool must not live on in the cached [:n] views
-            for key in [
-                k
-                for k, (t, _) in self._slices.items()
-                if self._pools.get(k[0]) is not t
-            ]:
-                del self._slices[key]
+        for name, n in need.items():
+            replaced |= self._grow(name, n, device)
+        if replaced and self._slices:
+            self._drop_stale_slices()
         if self.with_local and ctx.T_r > 0 and torch.device(device).type == "cuda":
             p = self.local.plan if self.local is not None else None
             if (
@@ -3137,9 +3115,46 @@ class KcpWorkspace:
             self._last_ensure = (ctx, sig, tb)
         return tb
 
+    def _grow(self, name: str, n: int, device: torch.device) -> bool:
+        """Make pool ``name`` hold ``n`` elements; a :data:`cake_kcp_plan.SHARED_POOLS` pair stays one tensor.
+        Returns whether a pool tensor was replaced."""
+        cur = self._pools.get(name)
+        if cur is not None and cur.numel() >= n:
+            return False
+        mate = next(
+            (
+                m
+                for pair in cake_kcp_plan.SHARED_POOLS
+                if name in pair
+                for m in pair
+                if m != name
+            ),
+            None,
+        )
+        mt = self._pools.get(mate) if mate is not None else None
+        if mt is not None and mt.numel() >= n:
+            self._pools[name] = mt  # the pair's storage is already large enough
+            return True
+        t = self._pools[name] = _alloc((n,), self.state_dtype, device)
+        if mt is not None:
+            self._pools[mate] = t
+        if name == "eye":
+            t.view(D, D).copy_(torch.eye(D, dtype=self.state_dtype, device=device))
+        return True
+
+    def _drop_stale_slices(self) -> None:
+        """A superseded pool must not live on in the cached ``[:n]`` views."""
+        for key in [
+            k for k, (t, _) in self._slices.items() if self._pools.get(k[0]) is not t
+        ]:
+            del self._slices[key]
+
     def pool(
         self, name: str, n: int | None = None, *, cached: bool = False
     ) -> torch.Tensor:
+        if name in cake_kcp_plan.LAZY_POOLS and n and self.device is not None:
+            if self._grow(name, n, self.device) and self._slices:
+                self._drop_stale_slices()
         t = self._pools.get(name)
         if t is None:
             if n not in (None, 0) or self.device is None:
@@ -3165,7 +3180,11 @@ class KcpWorkspace:
 
     @property
     def bytes(self) -> int:
-        kcp = sum(t.numel() * t.element_size() for t in self._pools.values())
+        # every storage once (the SHARED_POOLS pairs are one tensor)
+        kcp = sum(
+            t.numel() * t.element_size()
+            for t in {id(t): t for t in self._pools.values()}.values()
+        )
         local = 0
         if (
             self.local is not None
@@ -3177,6 +3196,8 @@ class KcpWorkspace:
 
     @property
     def pool_bytes(self) -> dict[str, int]:
+        """Bytes per pool name; the two names of a :data:`cake_kcp_plan.SHARED_POOLS` pair report the same
+        storage (:attr:`bytes` counts it once)."""
         return {k: t.numel() * t.element_size() for k, t in self._pools.items()}
 
 
@@ -4543,7 +4564,12 @@ def _graph_entry(
         id(ws),
         id(backend),
         id(ws.local),
-        tuple((n, t.data_ptr(), t.numel()) for n, t in ws._pools.items()),
+        tuple(
+            (n, t.data_ptr(), t.numel())
+            for n, t in ws._pools.items()
+            if n
+            not in cake_kcp_plan.LAZY_POOLS  # read by ring calls only, which are never captured
+        ),
         tuple(getattr(opts, f.name) for f in dataclasses.fields(opts)),
         None if scale is None else float(scale),
         flags,

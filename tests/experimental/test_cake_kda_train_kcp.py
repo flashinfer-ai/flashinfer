@@ -2298,26 +2298,30 @@ def test_byte_queries_and_knobs(monkeypatch) -> None:
     local = cake_backend.workspace_bytes(
         ctx.T_r, ctx.n_frag, 64, backward=True, save_mode="light", sm_count=SM_COUNT
     )
-    assert kp.kcp_arena_layout(ctx) == kp.kcp_arena_layout(ctx, save_transfer=True)
-    arena = kp.kcp_arena_layout(ctx, save_transfer=False)
-    assert ws == local + arena["arena"] and arena["arena"] == max(
-        arena["forward"], arena["backward"]
-    )
+    # the pools do not depend on save_transfer / C: the kept c1 tensor and the halo rows are per-call tensors (SPEC-4)
+    arena = kp.kcp_arena_layout(ctx)
     assert (
-        arena["fwd.c1_recv"] == hp.numel["c1_recv"] * 4
-        and kp.kcp_arena_layout(ctx, save_transfer=True)["fwd.c1_recv"] == 0
+        arena
+        == kp.kcp_arena_layout(ctx, save_transfer=False)
+        == kp.kcp_arena_layout(ctx, C=4096)
     )
+    assert ws == ws_t == local + arena["arena"]
+    assert arena["pool.c1_recv"] == hp.numel["c1_recv"] * 4
     assert (
-        arena["fwd.staging"]
-        == arena["bwd.staging"]
+        arena["pool.stage_b"] + arena["pool.stage_m"]
         == hp.NSEG * 64 * kp.SUMMARY_TILE * 4
     )
-    assert (
-        kp.kcp_arena_layout(ctx, save_transfer=True)["fwd.staging"]
-        == arena["fwd.staging"]
+    # one storage per SHARED_POOLS pair (b1_send = c1_send, b2_send = c2_send); the ring pools on first use
+    assert kp.SHARED_POOLS == (("c1_send", "b1_send"), ("c2_send", "b2_send"))
+    assert kp.LAZY_POOLS == ("ring_out", "ring_in")
+    alone = ("c1_recv", "stage_b", "stage_m", "carry", "eye", "b1_recv", "b2_recv")
+    assert arena["arena"] == sum(arena[f"pool.{n}"] for n in alone) + sum(
+        max(arena[f"pool.{a}"], arena[f"pool.{b}"]) for a, b in kp.SHARED_POOLS
     )
-    assert kp.kcp_workspace_bytes(ctx, backward=False, save_transfer=False) <= ws
-    assert ws_t <= ws  # the kept c1 tensor leaves the arena (SPEC-4)
+    assert arena["ring"] == arena["pool.ring_out"] + arena["pool.ring_in"] > 0
+    fwd = kp.kcp_arena_layout(ctx, backward=False)
+    assert "pool.b1_send" not in fwd and fwd["arena"] < arena["arena"]
+    assert kp.kcp_workspace_bytes(ctx, backward=False) < ws
     # knobs
     monkeypatch.delenv(kp.TEST_KNOBS_ENV, raising=False)
     assert kp.validate_test_knobs(None) == {
@@ -3956,6 +3960,56 @@ def test_host_trim_workspace_fast_paths() -> None:
         and v2.data_ptr() == ws._pools["c1_send"].data_ptr()
         and v2.shape == v0.shape
     )
+
+
+def test_workspace_pools_shared_lazy_and_predicted() -> None:
+    """The workspace's KCP pools against the plan module's byte query on the CPU (no local arena): every ``(ctx, H)``
+    of the C / Z / D partitions at W = 2 / 4 / 8 / 16, H = 4 / 64, allocates exactly ``kcp_arena_layout(...)["arena"]``
+    bytes for a forward and a backward workspace; each :data:`SHARED_POOLS` pair is one tensor of the larger need,
+    whichever ensure came first; the ring pools stay unallocated until a call reads them, then hold their size and
+    add ``kcp_arena_layout(...)["ring"]`` bytes; the pool sizes are the plan module's (:func:`kcp_pool_numel`)."""
+    seen_p = seen_ring = 0
+    for W in (2, 4, 8, 16):
+        for lengths, layout in (
+            ((3000,), "contiguous"),
+            ((40, 40), "zigzag"),
+            ((700, 1, 1300, 999), "zigzag_per_document"),
+        ):
+            part = _small_partition(W, lengths=lengths, layout=layout)
+            for r, ctx in enumerate(contexts(part)):
+                for H in (4, 64):
+                    tb = cake_kcp.KcpWorkspace(local=False).tables(ctx, H)
+                    assert tb.sizes == kp.kcp_pool_numel(ctx, H=H)
+                    seen_p += tb.P > 1
+                    full = kp.kcp_arena_layout(ctx, H=H)
+                    fwd = kp.kcp_arena_layout(ctx, H=H, backward=False)
+                    # forward first, then backward (the pair grows in place of both names)
+                    ws = cake_kcp.KcpWorkspace(local=False)
+                    ws.ensure(ctx, H, device="cpu", backward=False)
+                    assert ws.bytes == fwd["arena"], (W, layout, r, H)
+                    assert not ws.has("b1_send") and not ws.has("ring_out")
+                    ws.ensure(ctx, H, device="cpu", backward=True)
+                    assert ws.bytes == full["arena"], (W, layout, r, H)
+                    for a, b in kp.SHARED_POOLS:
+                        assert ws.pool(a) is ws.pool(b)
+                        assert ws.pool(a).numel() == max(tb.sizes[a], tb.sizes[b])
+                    for name in kp.FWD_POOLS + kp.BWD_POOLS:
+                        if name not in kp.LAZY_POOLS:
+                            assert ws.pool(name).numel() >= tb.sizes[name]
+                    assert not ws.has("ring_out") and not ws.has("ring_in")
+                    # a backward workspace from the start: the same storage
+                    ws2 = cake_kcp.KcpWorkspace(ctx, H, device="cpu", local=False)
+                    assert ws2.bytes == full["arena"]
+                    assert ws2.pool("c1_send") is ws2.pool("b1_send")
+                    # a ring call's first read allocates the hop pools (a zero need allocates nothing)
+                    for name in kp.LAZY_POOLS:
+                        v = ws.pool(name, tb.sizes[name])
+                        assert v.numel() == tb.sizes[name]
+                    assert ws.bytes == full["arena"] + full["ring"]
+                    seen_ring += full["ring"] > 0
+    assert (
+        seen_p > 0 and seen_ring > 0
+    )  # the rows cover the P > 1 and the crossing-fragment forms
 
 
 def test_host_trim_backward_walk_sublists_are_table_owned() -> None:

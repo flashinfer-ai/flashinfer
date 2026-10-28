@@ -599,8 +599,11 @@ def kcp_workspace_bytes(
     save_transfer: bool = False,
     C: int = 8192,
 ) -> int:
-    """Bytes of this rank's KCP workspace for ``H`` heads (the local arena of :func:`kda_train_workspace_bytes` plus
-    the boundary pools of the context's collectives; ``C`` channels of the convolution's halo rows)."""
+    """Bytes of this rank's KCP workspace for ``H`` heads: the local arena of :func:`kda_train_workspace_bytes` plus
+    the boundary pools of the context's collectives, as ``KcpWorkspace`` allocates them (the backward's send pools
+    share the forward's storage; the ring exchange's hop pools, allocated by the first ``exchange="ring"`` call, are
+    not counted).  The saved set and the convolution's halo rows are per-call tensors, so ``save_transfer`` and
+    ``C`` do not change it."""
     from .experimental.cake_kda_train import cake_kcp_plan
 
     return cake_kcp_plan.kcp_workspace_bytes(
