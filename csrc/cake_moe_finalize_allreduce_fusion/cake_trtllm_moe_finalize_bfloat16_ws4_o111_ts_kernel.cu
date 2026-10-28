@@ -104,6 +104,30 @@ __device__ inline unsigned int laneId()
 }
 } // namespace flashinfer_cake_moe_finalize_allreduce_fusion
 
+namespace flashinfer_cake_moe_finalize_allreduce_fusion {
+__device__ __forceinline__ unsigned int cake_ag_esc_enc(unsigned int w)
+{
+    unsigned int lo = w & 65535;
+    unsigned int hi = w >> 16;
+    lo = ((lo == 32768) ? 65535 : lo);
+    hi = ((hi == 32768) ? 65535 : hi);
+    unsigned int esc_word = lo | hi << 16;
+    return esc_word;
+}
+} // namespace flashinfer_cake_moe_finalize_allreduce_fusion
+
+namespace flashinfer_cake_moe_finalize_allreduce_fusion {
+__device__ __forceinline__ unsigned int cake_ag_esc_dec(unsigned int w)
+{
+    unsigned int lo = w & 65535;
+    unsigned int hi = w >> 16;
+    lo = ((lo == 65535) ? 32768 : lo);
+    hi = ((hi == 65535) ? 32768 : hi);
+    unsigned int esc_word = lo | hi << 16;
+    return esc_word;
+}
+} // namespace flashinfer_cake_moe_finalize_allreduce_fusion
+
 extern "C" {
 
 __global__ __launch_bounds__(224, LAUNCH_MIN_BLOCKS) __cluster_dims__(4,1,1) void
@@ -799,23 +823,10 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_ts(__nv_bfloat16* __restrict__
                 }
                 long long gather_offset = (long long)tokens * 7168 + (long long)owned_access * 8;
                 unsigned int gathered[4];
-                unsigned int negzero_mask = 0;
                 #pragma unroll
                 for (int w_4 = 0; w_4 < 4; w_4++) {
-                    unsigned int lo = sum_value_bf16_1[w_4] & 65535;
-                    unsigned int hi = sum_value_bf16_1[w_4] >> 16;
-                    if (lo == 32768) {
-                        negzero_mask = negzero_mask | 1 << (unsigned int)(2 * w_4);
-                        lo = 0;
-                    }
-                    if (hi == 32768) {
-                        negzero_mask = negzero_mask | 1 << (unsigned int)(2 * w_4 + 1);
-                        hi = 0;
-                    }
-                    gathered[w_4] = lo | hi << 16;
+                    gathered[w_4] = flashinfer_cake_moe_finalize_allreduce_fusion::cake_ag_esc_enc(sum_value_bf16_1[w_4]);
                 }
-                unsigned int mask_word = negzero_mask << 16 | negzero_mask ^ 65535;
-                long long mask_offset = (long long)tokens * 14336 + (long long)owned_access * 2;
                 long long peer_base_0[1];
                 {
                     uint64_t _scalar_bits_10;
@@ -825,7 +836,6 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_ts(__nv_bfloat16* __restrict__
                 }
                 __nv_bfloat16* peer_0 = reinterpret_cast<__nv_bfloat16*>(peer_base_0[0]) + data_base;
                 asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer_0 + gather_offset), "r"((gathered)[0]), "r"((gathered)[1]), "r"((gathered)[2]), "r"((gathered)[3]) : "memory");
-                asm volatile("st.volatile.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(peer_0 + mask_offset)), "r"(mask_word) : "memory");
                 long long peer_base_1[1];
                 {
                     uint64_t _scalar_bits_11;
@@ -835,7 +845,6 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_ts(__nv_bfloat16* __restrict__
                 }
                 __nv_bfloat16* peer_1 = reinterpret_cast<__nv_bfloat16*>(peer_base_1[0]) + data_base;
                 asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer_1 + gather_offset), "r"((gathered)[0]), "r"((gathered)[1]), "r"((gathered)[2]), "r"((gathered)[3]) : "memory");
-                asm volatile("st.volatile.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(peer_1 + mask_offset)), "r"(mask_word) : "memory");
                 long long peer_base_2[1];
                 {
                     uint64_t _scalar_bits_12;
@@ -845,7 +854,6 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_ts(__nv_bfloat16* __restrict__
                 }
                 __nv_bfloat16* peer_2 = reinterpret_cast<__nv_bfloat16*>(peer_base_2[0]) + data_base;
                 asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer_2 + gather_offset), "r"((gathered)[0]), "r"((gathered)[1]), "r"((gathered)[2]), "r"((gathered)[3]) : "memory");
-                asm volatile("st.volatile.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(peer_2 + mask_offset)), "r"(mask_word) : "memory");
                 long long peer_base_3[1];
                 {
                     uint64_t _scalar_bits_13;
@@ -855,7 +863,6 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_ts(__nv_bfloat16* __restrict__
                 }
                 __nv_bfloat16* peer_3 = reinterpret_cast<__nv_bfloat16*>(peer_base_3[0]) + data_base;
                 asm volatile("st.volatile.global.v4.b32 [%0], {%1, %2, %3, %4};" :: "l"(peer_3 + gather_offset), "r"((gathered)[0]), "r"((gathered)[1]), "r"((gathered)[2]), "r"((gathered)[3]) : "memory");
-                asm volatile("st.volatile.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(peer_3 + mask_offset)), "r"(mask_word) : "memory");
             }
         }
         if (step >= 2) {
@@ -883,31 +890,16 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_ts(__nv_bfloat16* __restrict__
             }
             float sum_value_1[8];
             long long gather_in = data_base + (long long)tokens * 7168 + (long long)access * 8;
-            long long mask_in = data_base + (long long)tokens * 14336 + (long long)access * 2;
-            unsigned int gathered_1[4];
-            unsigned int mask_word_1 = 0;
-            while (1) {
-                uint32_t words[4];
-                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(words[0]), "=r"(words[1]), "=r"(words[2]), "=r"(words[3]) : "l"(workspace_local + gather_in) : "memory");
-                uint32_t mask;
-                asm volatile("ld.volatile.global.u32 %0, [%1];" : "=r"(mask) : "l"(reinterpret_cast<unsigned int*>(workspace_local + mask_in)) : "memory");
-                gathered_1[0] = words[0];
-                gathered_1[1] = words[1];
-                gathered_1[2] = words[2];
-                gathered_1[3] = words[3];
-                mask_word_1 = mask;
-                if (!((gathered_1[0] & 65535) == 32768 || gathered_1[0] >> 16 == 32768 || (gathered_1[1] & 65535) == 32768 || gathered_1[1] >> 16 == 32768 || (gathered_1[2] & 65535) == 32768 || gathered_1[2] >> 16 == 32768 || (gathered_1[3] & 65535) == 32768 || gathered_1[3] >> 16 == 32768 || ((mask_word_1 >> 16 ^ mask_word_1) & 65535) != 65535)) {
-                    break;
-                }
-            }
+            uint32_t gathered_1[4];
+            do {
+                asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(gathered_1[0]), "=r"(gathered_1[1]), "=r"(gathered_1[2]), "=r"(gathered_1[3]) : "l"(workspace_local + gather_in) : "memory");
+            } while (
+                (((gathered_1[0] >> 0) & 0xffffu) == 0x8000u) || (((gathered_1[0] >> 16) & 0xffffu) == 0x8000u) || (((gathered_1[1] >> 0) & 0xffffu) == 0x8000u) || (((gathered_1[1] >> 16) & 0xffffu) == 0x8000u) ||
+                (((gathered_1[2] >> 0) & 0xffffu) == 0x8000u) || (((gathered_1[2] >> 16) & 0xffffu) == 0x8000u) || (((gathered_1[3] >> 0) & 0xffffu) == 0x8000u) || (((gathered_1[3] >> 16) & 0xffffu) == 0x8000u)
+            );
             #pragma unroll
             for (int w_5 = 0; w_5 < 4; w_5++) {
-                if ((mask_word_1 >> (unsigned int)(16 + 2 * w_5) & 1) != 0) {
-                    gathered_1[w_5] = gathered_1[w_5] & 4294901760u | 32768;
-                }
-                if ((mask_word_1 >> (unsigned int)(17 + 2 * w_5) & 1) != 0) {
-                    gathered_1[w_5] = gathered_1[w_5] & 65535 | 2147483648u;
-                }
+                gathered_1[w_5] = flashinfer_cake_moe_finalize_allreduce_fusion::cake_ag_esc_dec(gathered_1[w_5]);
             }
             #pragma unroll
             for (int _pair = 0; _pair < 4; _pair++) {
@@ -1174,7 +1166,7 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o111_ts(__nv_bfloat16* __restrict__
                 while (*_sysv_wait_p_34 != static_cast<int>(num_bids)) {}
             }
             control_0[2] = (control_current_word + 1) % 3;
-            control_0[4] = token_end * 16128;
+            control_0[4] = token_end * 14336;
             reinterpret_cast<unsigned int*>(control_0)[0] = 0;
         }
     }
