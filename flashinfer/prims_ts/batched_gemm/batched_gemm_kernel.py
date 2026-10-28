@@ -2517,10 +2517,17 @@ def gemm(
 
     # TMA route (gather4) reads compact (K, num_tokens) input storage.
     # GEMM M/N include routing padding and must not define its source bounds.
+    # An LDGSTS-gathered activation operand is never read through its
+    # TensorMap, which describes the same compact storage. As a padded
+    # (K, M or N, L) tensor its expert stride would be M*K or N*K elements,
+    # which the TensorMap encoding overflows (it scales strides to bits in
+    # 32-bit arithmetic) from 2**28 FP8 elements on: 8192 tokens at top-6
+    # over 48 experts with K=5120 and tile_n=128 already reach it.
     # TmaOobOpt: non-routed activations use a 4D out-of-bounds TMA descriptor.
     # Non-swapAB: A=activations (routed 2D), B=weights (3D).
     # SwapAB:     A=weights (3D), B=activations (routed 2D).
     # No route:   activation operand may be 4D OOB; weights stay 3D.
+    routed_act_is_compact = cfg.has_tma_route or cfg.has_gather
     if cutlass.const_expr(cfg.uses_block_major_k_weight_a):
         a_block_k = cfg.block_major_k_elems
         a_layout = cute.make_layout(
@@ -2533,7 +2540,7 @@ def gemm(
             ),
         )
         a_tensor = cute.make_tensor(a_ptr, a_layout)
-    elif cutlass.const_expr(cfg.has_tma_route and not cfg.is_swap_ab):
+    elif cutlass.const_expr(routed_act_is_compact and not cfg.is_swap_ab):
         a_layout = cute.make_layout(
             (cute.assume(k, 32), num_tokens), stride=(1, cute.assume(k, 32))
         )
@@ -2568,7 +2575,7 @@ def gemm(
                 cute.assume(n * k, 32),
             ),
         )
-    elif cutlass.const_expr(cfg.has_tma_route and cfg.is_swap_ab):
+    elif cutlass.const_expr(routed_act_is_compact and cfg.is_swap_ab):
         b_layout = cute.make_layout(
             (cute.assume(k, 32), num_tokens), stride=(1, cute.assume(k, 32))
         )
@@ -2637,7 +2644,7 @@ def gemm(
             swizzle=tma_swizzle,
             tma_format=tma_format_a,
         )
-    elif cutlass.const_expr(cfg.has_tma_route and not cfg.is_swap_ab):
+    elif cutlass.const_expr(routed_act_is_compact and not cfg.is_swap_ab):
         tma_a_desc = cuda.create_tensor_map_tiled_from_tensor(
             tensor=a_tensor,
             box_dims=(a_box_k, 1),
@@ -2670,7 +2677,7 @@ def gemm(
             tma_format=tma_format_a,
         )
 
-    if cutlass.const_expr(cfg.has_tma_route and cfg.is_swap_ab):
+    if cutlass.const_expr(routed_act_is_compact and cfg.is_swap_ab):
         tma_b_desc = cuda.create_tensor_map_tiled_from_tensor(
             tensor=b_tensor,
             box_dims=(b_box_k, 1),
