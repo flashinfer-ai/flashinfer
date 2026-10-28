@@ -14,6 +14,7 @@ pytest.importorskip("cutlass", minversion="4.7.0")
 triton = pytest.importorskip("triton")
 import triton.language as tl
 from flashinfer.attention.prims_ts import (
+    _dsa,
     BatchSparseMLADecodePagedTSWrapper,
     MLAAttentionTuning,
     batch_sparse_mla_decode_with_paged_kv_cache,
@@ -28,6 +29,7 @@ pytestmark = pytest.mark.skipif(
 
 
 # Reference: FP64 math, explicit masks, and an unchanged FP8 rounding bound.
+# Q/KV rows are 512 wide, or 576 for DSA (V is the leading 512 latent columns).
 def _reference(
     query,
     kv_cache,
@@ -44,8 +46,9 @@ def _reference(
     softmax_scale=512**-0.5,
     p_scale=448.0,
 ):
-    rows, heads = query.numel() // (query.shape[-2] * 512), query.shape[-2]
-    q = query.reshape(rows, heads, 512)
+    dim, heads = query.shape[-1], query.shape[-2]
+    rows = query.numel() // (heads * dim)
+    q = query.reshape(rows, heads, dim)
     output = torch.empty((rows, heads, 512), device=query.device, dtype=torch.float64)
     lse = torch.empty((rows, heads), device=query.device, dtype=torch.float64)
     bound = torch.empty_like(output)
@@ -86,9 +89,9 @@ def _reference(
         )
         normalizer = normalizer.masked_fill(empty[:, None], 0)
         weights = (logits - normalizer[..., None]).exp()
-        output[start:end] = torch.bmm(weights, kv) * output_scale
+        output[start:end] = torch.bmm(weights, kv[..., :512]) * output_scale
         lse[start:end] = row_lse
-        absolute = kv.abs()
+        absolute = kv[..., :512].abs()
         sensitivity = torch.bmm(weights, absolute)
         underflow = (logits.amax(-1) - normalizer).exp()[..., None] * absolute.sum(1)[
             :, None, :
@@ -101,10 +104,11 @@ def _reference(
             )
             + 1e-6
         ).masked_fill(empty[:, None, None], 0)
+    out_shape = (*query.shape[:-1], 512)
     return (
-        output.reshape(query.shape),
+        output.reshape(out_shape),
         lse.reshape(query.shape[:-1]),
-        bound.reshape(query.shape),
+        bound.reshape(out_shape),
     )
 
 
@@ -1239,3 +1243,221 @@ def test_softmax_rescale_threshold_log2_rejected(dtype, threshold):
             q_data_type=dtype,
             tuning=MLAAttentionTuning(softmax_rescale_threshold_log2=threshold),
         )
+
+
+# DSA (GLM-5.3 / DeepSeek-V3.2): plan(kv_lora_rank=512, qk_rope_head_dim=64)
+# attends E4M3 576-wide Q / KV rows of one pool; indices are storage rows
+# with -1 holes anywhere, and V is the 512-wide latent.
+_DSA_SCALE = 1.0 / 16
+
+
+def _dsa_inputs(rows, heads, topk, holes=0.0, pool=1 << 15, seed=0):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    q = torch.randn(rows, 1, heads, 576, device="cuda", generator=g) * 0.5
+    kv = torch.randn(pool, 576, device="cuda", generator=g) * 0.5
+    indices = torch.stack(
+        [torch.randperm(pool, device="cuda", generator=g)[:topk] for _ in range(rows)]
+    ).int()
+    indices[torch.rand(indices.shape, device="cuda", generator=g) < holes] = -1
+    lengths = torch.full((rows,), topk, device="cuda", dtype=torch.int32)
+    return q.to(torch.float8_e4m3fn), kv.to(torch.float8_e4m3fn), indices, lengths
+
+
+def _check_dsa(q, kv, indices, lengths, out, lse, threshold=0.0):
+    ref, ref_lse, bound = _reference(
+        q,
+        kv.reshape(-1, 1, 576),
+        None,
+        indices,
+        lengths=lengths,
+        softmax_scale=_DSA_SCALE,
+        p_scale=448.0 * 2.0**-threshold,
+    )
+    assert ((out.double() - ref).abs() <= bound).all()
+    torch.testing.assert_close(lse.double(), ref_lse, atol=2e-4, rtol=1e-4)
+
+
+def _dsa_plan(rows, heads, topk, threshold=0.0, **kwargs):
+    w = BatchSparseMLADecodePagedTSWrapper()
+    w.plan(
+        torch.device("cuda"),
+        rows,
+        heads,
+        max_topk=topk,
+        q_data_type=torch.float8_e4m3fn,
+        return_lse=True,
+        tuning=MLAAttentionTuning(softmax_rescale_threshold_log2=threshold),
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        **kwargs,
+    )
+    return w
+
+
+@pytest.mark.parametrize(
+    "rows,heads,topk,holes,threshold,layout",
+    [
+        pytest.param(1, 64, 2048, 0.3, 0.0, "flat", id="one-token-split"),
+        pytest.param(8, 64, 2048, 0.3, 8.0, "flat", id="skip-correction"),
+        pytest.param(4, 128, 2048, 0.1, 0.0, "nhd4", id="h128"),
+        pytest.param(300, 64, 2048, 0.0, 8.0, "flat", id="two-waves"),
+        pytest.param(3, 64, 4, 0.0, 0.0, "flat", id="topk4"),
+        pytest.param(40, 64, 136, 0.1, 0.0, "nhd3", id="topk136-unsplit"),
+        pytest.param(3, 64, 1028, 0.2, 0.0, "hnd4", id="topk1028"),
+    ],
+)
+def test_dsa_graph(rows, heads, topk, holes, threshold, layout):
+    q, kv, indices, lengths = _dsa_inputs(rows, heads, topk, holes)
+    views = {
+        "flat": (kv, "NHD"),
+        "nhd3": (kv.view(-1, 64, 576), "NHD"),
+        "nhd4": (kv.view(-1, 64, 1, 576), "NHD"),
+        "hnd4": (kv.view(-1, 1, 64, 576), "HND"),
+    }
+    pool, kv_layout = views[layout]
+    w = _dsa_plan(rows, heads, topk, threshold, kv_layout=kv_layout)
+    out = torch.empty(rows, 1, heads, 512, device="cuda", dtype=torch.bfloat16)
+    lse = torch.empty(rows, 1, heads, device="cuda")
+
+    def run(checked=False):
+        w.run(
+            q,
+            pool,
+            indices,
+            lengths,
+            softmax_scale=_DSA_SCALE,
+            out=out,
+            lse=lse,
+            validate=checked,
+        )
+
+    run(checked=True)
+    _check_dsa(q, kv, indices, lengths, out, lse, threshold)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    # Replay reads the live routes: duplicated rows, a fully masked first
+    # tile, ragged lengths and an empty last token.
+    indices.copy_(indices.flip(-1))
+    indices[:, 1::2] = indices[:, 0::2]
+    if topk > 128:
+        indices[0, :128] = -1
+    lengths[0] = topk
+    lengths[1:] = torch.randint(1, topk + 1, (rows - 1,), device="cuda")
+    lengths[-1] = 0
+    graph.replay()
+    torch.cuda.synchronize()
+    _check_dsa(q, kv, indices, lengths, out, lse, threshold)
+    assert torch.count_nonzero(out[-1]) == 0 and torch.isneginf(lse[-1]).all()
+
+
+def test_dsa_packed_query():
+    """Packed MTP queries match the fixed [B, 4, H, 576] layout bitwise."""
+    q, kv, indices, lengths = _dsa_inputs(12, 64, 2048, 0.1)
+    kwargs = dict(softmax_scale=_DSA_SCALE)
+    fixed = batch_sparse_mla_decode_with_paged_kv_cache(
+        q.view(3, 4, 64, 576), kv, indices, lengths, **kwargs
+    )
+    offsets = torch.arange(0, 13, 4, device="cuda", dtype=torch.int32)
+    packed = batch_sparse_mla_decode_with_paged_kv_cache(
+        q.view(12, 64, 576), kv, indices, lengths, qo_indptr=offsets, **kwargs
+    )
+    assert torch.equal(packed, fixed.view(12, 64, 512))
+    empty = batch_sparse_mla_decode_with_paged_kv_cache(
+        q[:0].view(0, 64, 576),
+        kv,
+        indices[:0],
+        lengths[:0],
+        qo_indptr=torch.zeros_like(offsets),
+        **kwargs,
+    )
+    assert empty.shape == (0, 64, 512)
+
+
+@pytest.mark.parametrize("topk", [2048, 1028])
+@pytest.mark.parametrize("split,head_dim_split", [(1, 1), (2, 4), (4, 2), (16, 4)])
+def test_dsa_forced_split(split, head_dim_split, topk, monkeypatch):
+    """Forced splits (incl. empty and one-tile splits, V head-dim splits) and
+    the direct store agree with the reference, natural-log LSE included."""
+    monkeypatch.setattr(_dsa, "_select_fp8_split", lambda *_: (split, head_dim_split))
+    q, kv, indices, lengths = _dsa_inputs(6, 64, topk, 0.3)
+    lengths[1:] = torch.randint(1, topk + 1, (5,), device="cuda")
+    lengths[2] = 0
+    w = _dsa_plan(6, 64, topk)
+    out, lse = w.run(q, kv, indices, lengths, softmax_scale=_DSA_SCALE)
+    _check_dsa(q, kv, indices, lengths, out, lse)
+
+
+def test_dsa_split_policy():
+    """E4M3 follows trtllm-gen: at least two tiles per split CTA within one wave
+    (one tile for a top-k of one tile pair), then a V head-dim split while the
+    grid fills at most a quarter / half of the SMs."""
+    select = _dsa._select_fp8_split
+    ctas = (1, 4, 5, 8, 9, 16, 18, 19, 37, 38, 74, 75, 96)
+    assert [select(t, 2048, 148) for t in ctas] == [
+        (8, 4),
+        (8, 4),
+        (8, 2),
+        (8, 2),
+        (8, 2),
+        (8, 1),
+        (8, 1),
+        (4, 1),
+        (4, 1),
+        (2, 1),
+        (2, 1),
+        (1, 1),
+        (1, 1),
+    ]
+    assert select(1, 512, 148) == (2, 4)  # two tile pairs
+    # One tile pair: one tile per CTA while the V split applies, else no split.
+    assert [select(t, 256, 148) for t in (1, 18, 32, 37, 38, 64)] == [
+        (2, 4),
+        (2, 4),
+        (2, 2),
+        (2, 2),
+        (1, 1),
+        (1, 1),
+    ]
+    assert select(1, 128, 148) == (1, 1)  # a single tile
+    assert select(48, 2048, 148) == (2, 1)  # e.g. 24 tokens with 128 heads
+
+
+@pytest.mark.parametrize(
+    "change,match",
+    [
+        pytest.param(dict(query="bf16"), "requires E4M3", id="query-bf16"),
+        pytest.param(dict(heads=32), "64 or 128 query heads", id="heads"),
+        pytest.param(dict(topk=66), "multiple of 4", id="topk"),
+        pytest.param(dict(extra=True), "one KV pool", id="extra-pool"),
+        pytest.param(dict(sinks=True), "attention sinks", id="sinks"),
+        pytest.param(dict(output_quant_block_size=32), "output quantization", id="oq"),
+        pytest.param(
+            dict(softmax_scale=torch.ones(1, device="cuda")),
+            "positive finite Python number",
+            id="tensor-scale",
+        ),
+        pytest.param(dict(kv="bf16"), "E4M3 tensor", id="cache-dtype"),
+        pytest.param(dict(kv="row512"), r"must have shape \[N,576\]", id="cache-row"),
+        pytest.param(dict(route=128), "outside pool", id="route-outside-pool"),
+    ],
+)
+def test_dsa_rejected(change, match):
+    change = dict(change)
+    heads, topk = change.pop("heads", 64), change.pop("topk", 64)
+    q, kv, indices, lengths = _dsa_inputs(2, heads, topk, pool=128)
+    if change.pop("query", None):
+        q = q.to(torch.bfloat16)
+    kv = {"bf16": kv.to(torch.bfloat16), "row512": kv[:, :512].contiguous()}.get(
+        change.pop("kv", None), kv
+    )
+    if "route" in change:
+        indices[0, 3] = change.pop("route")
+    if change.pop("extra", False):
+        change.update(extra_kv_cache=kv, extra_indices=indices, extra_lengths=lengths)
+    if change.pop("sinks", False):
+        change["sinks"] = torch.zeros(heads, device="cuda")
+    if "output_quant_block_size" in change:
+        change["num_output_groups"] = 1
+    with pytest.raises(ValueError, match=match):
+        batch_sparse_mla_decode_with_paged_kv_cache(q, kv, indices, lengths, **change)

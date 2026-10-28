@@ -669,6 +669,5 @@ pytest -q \
   tests/attention/test_attention_ts_mla_decode.py \
   tests/attention/test_attention_ts_sage.py \
   tests/attention/test_attention_ts_context_sage.py \
-  tests/attention/test_attention_ts_vc.py \
-  tests/attention/test_attention_ts_dsa.py
+  tests/attention/test_attention_ts_vc.py
 ```
