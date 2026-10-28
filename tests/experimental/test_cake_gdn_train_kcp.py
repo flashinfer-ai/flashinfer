@@ -2611,7 +2611,7 @@ def _forwards(seen) -> list[tuple[bool, str, str]]:
 
 def _verified_torch(kcp) -> bool:
     """Whether this torch build reads the frame proof (else every recompute launches #5, reason ``torch_version``)."""
-    return torch.__version__ in kcp.RECOMPUTE_OUTPUT_TORCH_VERSIONS
+    return kcp.torch_release_verified()
 
 
 def _frame_reason(kcp, reason: str) -> str:
@@ -2880,7 +2880,7 @@ def test_recompute_output_needs_the_verified_torch_version(monkeypatch) -> None:
     unchanged."""
     kcp, ctx, ops = _ckpt_setup()
     direct = _ckpt_autograd(kcp, ctx, ops, ckpt=False, segments=2)
-    monkeypatch.setattr(kcp, "RECOMPUTE_OUTPUT_TORCH_VERSIONS", ("0.0.0+unverified",))
+    monkeypatch.setattr(kcp, "RECOMPUTE_OUTPUT_TORCH_VERSIONS", ("0.0.0",))
     seen, rec = _fwd_o_launches(kcp)
     previous = kcp.set_backend("fake", rec)
     try:
@@ -3233,3 +3233,64 @@ def test_lpt_makespan_equals_the_list_form_and_the_greedy() -> None:
     )
     with pytest.raises(ValueError):
         gp.lpt_makespan([(1, 1)], 0)
+
+
+# --------------------------------------------------------------------------- issue #7074 (3): the recompute_output gate is a torch RELEASE check
+# Every CUDA build of the verified release (2.14.1+cu130, 2.14.1+cu132, ...) reads the frame proof; other releases launch #5 as before.
+
+
+@pytest.mark.parametrize(
+    "version,verified",
+    [
+        ("2.14.1+cu130", True),
+        ("2.14.1+cu132", True),
+        ("2.14.1", True),
+        ("2.14.0+cu130", False),
+        ("2.15.0+cu132", False),
+        ("2.14.1.dev20260901+cu130", False),
+    ],
+)
+def test_recompute_output_gate_is_a_torch_release_check(
+    monkeypatch, version, verified
+) -> None:
+    """The verified set names torch releases; the local ``+cuNNN`` build tag is not part of the identity."""
+    kcp = _package("cake_kcp")
+    assert kcp.RECOMPUTE_OUTPUT_TORCH_VERSIONS == ("2.14.1",)
+    assert kcp.torch_release(version) == version.split("+", 1)[0]
+    monkeypatch.setattr(torch, "__version__", version)
+    assert kcp.torch_release() == version.split("+", 1)[0]
+    assert kcp.torch_release_verified() is verified
+    dead, reason = kcp._recompute_output_dead(6)  # outside any checkpoint: never dead
+    assert dead is False
+    assert (reason == "torch_version") is (not verified), reason
+
+
+def test_recompute_output_auto_resolves_on_every_cuda_build_of_the_release(
+    monkeypatch,
+) -> None:
+    """The resolved mode of ``recompute_output="auto"`` per torch build string: the two CUDA builds of the verified
+    release skip the recompute's #5 (reason ``dead``), the neighbouring releases launch it (``torch_version``)."""
+    kcp, ctx, ops = _ckpt_setup()
+    if kcp.torch_release() not in kcp.RECOMPUTE_OUTPUT_TORCH_VERSIONS:
+        pytest.skip(
+            "the running torch is not a verified release: the frame proof cannot be exercised"
+        )
+    direct = _ckpt_autograd(kcp, ctx, ops, ckpt=False, segments=2)
+    expect = {
+        "2.14.1+cu130": ("dead", [False], "skipped"),
+        "2.14.1+cu132": ("dead", [False], "skipped"),
+        "2.14.0+cu130": ("torch_version", [False, True], "launched"),
+        "2.15.0+cu132": ("torch_version", [False, True], "launched"),
+    }
+    for build, (reason, fwd_o, decision) in expect.items():
+        monkeypatch.setattr(torch, "__version__", build)
+        seen, rec = _fwd_o_launches(kcp)
+        previous = kcp.set_backend("fake", rec)
+        try:
+            res = _ckpt_autograd(kcp, ctx, ops, ckpt=True, segments=2)
+            assert kcp.LAST_CALL["fwd"]["fwd_o_reason"] == reason, build
+            assert kcp.LAST_CALL["fwd"]["fwd_o"] == decision, build
+            assert _launches(seen, "fwd_o") == fwd_o, build
+        finally:
+            kcp.set_backend("fake", previous)
+        _assert_same(res, direct, build)

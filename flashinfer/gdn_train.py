@@ -279,8 +279,8 @@ def chunk_gdn_kcp(
     forward returns nothing, so when this node is the last operation of the checkpointed region that saves a tensor,
     the recompute's output is read by nothing; ``"auto"`` leaves that output program out after reading the proof from
     torch's checkpoint frame (the node is executable, the remaining saved-tensor holders are exactly this node's,
-    early stop is on, and ``torch.__version__`` is one of the package's verified builds,
-    ``cake_kcp.RECOMPUTE_OUTPUT_TORCH_VERSIONS``) and launches it as before in every other state -- a later operation
+    early stop is on, and the torch release -- ``torch.__version__`` without its local ``+cuNNN`` build tag -- is one
+    of the package's verified releases, ``cake_kcp.RECOMPUTE_OUTPUT_TORCH_VERSIONS``) and launches it as before in every other state -- a later operation
     of the region that saves the output (another layer, a norm), a reentrant checkpoint, a forward outside a
     recompute, a non-executable node, another torch build (``cake_kcp.LAST_CALL["fwd"]["fwd_o_reason"]`` records the
     decision and its reason).  The gradients and the retained bytes are unchanged either way; ``"always"`` is the
