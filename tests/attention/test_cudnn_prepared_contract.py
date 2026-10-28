@@ -573,6 +573,131 @@ def test_prefill_match_uses_complete_build_metadata(monkeypatch):
     assert not matches(replace(metadata, causal=True))
 
 
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("override", [False, True])
+@pytest.mark.parametrize("return_lse", [False, True])
+@pytest.mark.parametrize("ordered", [False, True])
+def test_prefill_preparation_history_rebinds_current_plan(
+    monkeypatch, paged, override, return_lse, ordered
+):
+    """Alternating geometries reuse preparations, never previous tensor bindings."""
+    monkeypatch.setattr(prefill, "CUDNN_AVAILABLE", True)
+    monkeypatch.setattr(prefill, "_cudnn_supports_shape_override", lambda: override)
+    monkeypatch.setattr(prefill, "_cudnn_supports_paged_auto", lambda: True)
+    # CPU tensors cannot satisfy the GPU eligibility predicate. Exercise the
+    # real override-key/binding path using an explicit declared graph shape.
+    monkeypatch.setattr(
+        prefill._PrefillMetadata,
+        "override_shape_from_plan",
+        lambda self, dtype, ragged: (
+            (self.actual_seq_lens_q.shape[0], 2, 4) if override else None
+        ),
+    )
+    monkeypatch.setattr(prefill, "_graph_workspace_size", lambda *args: 0)
+    monkeypatch.setattr(prefill, "supports_native_cudnn_log2", lambda *args: False)
+    monkeypatch.setattr(
+        prefill, "supports_ordered_cudnn_execution", lambda *args: ordered
+    )
+    builds, packs = [], []
+
+    def build(**kwargs):
+        builds.append(kwargs)
+        return SimpleNamespace(get_workspace_size=lambda: 0), []
+
+    def execute(self, q, out, lse, workspace, bindings, kwargs, base, tensor_uids=None):
+        pack = (
+            dict(zip(tensor_uids, bindings, strict=True)) if tensor_uids else bindings
+        )
+        packs.append(pack)
+        assert pack[prefill.UIDs.Q_UID.value] is q
+        assert pack[prefill.UIDs.O_UID.value] is out
+        if return_lse:
+            assert pack[prefill.UIDs.STATS_UID.value] is lse
+        return out, lse
+
+    monkeypatch.setattr(prefill, "_build_prefill_graph", build, raising=False)
+    monkeypatch.setattr(prefill.CudnnPrefillGraph, "_execute", execute)
+    cache, identities = [], {}
+    previous = None
+    workspace = torch.empty(0, dtype=torch.uint8)
+    for batch in [1, 3] * 4:
+        q = torch.empty(batch * 2, 4, 8, dtype=torch.bfloat16)
+        kv = torch.empty((16, 2, 4, 8) if paged else (batch * 4, 2, 8), dtype=q.dtype)
+        lengths = torch.full((batch, 1, 1, 1), 2, dtype=torch.int32)
+        metadata = prefill._PrefillMetadata(
+            2,
+            4,
+            False,
+            return_lse,
+            actual_seq_lens_q=lengths,
+            actual_seq_lens_kv=lengths.clone(),
+            block_tables=torch.zeros(batch, 1, dtype=torch.int32) if paged else None,
+        )
+        plan = prefill._CudnnPrefillPlan.prepare(metadata, q.dtype, q.device, previous)
+        assert (plan.override is not None) == override
+        prepared = prefill._reuse_cudnn_prefill_preparation(
+            cache, q, kv, kv, 0.5, workspace, plan=plan, return_lse=return_lse
+        )
+        assert (prepared.override_cache is not None) == override
+        assert prepared is identities.setdefault(batch, prepared)
+        # New output and metadata storage must be bound even after a cache hit.
+        for _ in range(2):
+            output = torch.empty_like(q)
+            stats = torch.empty(q.shape[:2]) if return_lse else None
+            prepared.run_planned(q, kv, kv, output, stats, workspace, plan=plan)
+            pack = packs[-1]
+            assert (
+                pack[prefill.UIDs.ACTUAL_SEQ_LENS_Q_UID.value].data_ptr()
+                == lengths.data_ptr()
+            )
+            assert pack[prefill.UIDs.K_UID.value] is kv
+        previous = plan
+    assert len(builds) == 2
+    assert len({id(pack) for pack in packs}) == len(packs)
+    assert all(item.__class__ is prefill.CudnnPrefillGraph for item in cache)
+
+    # Scale changes are graph facts. History is bounded and evicts the oldest
+    # preparation; it must not accidentally reuse a graph for a different scale.
+    oldest = cache[-1]
+    for scale in [0.25, 0.125, 0.0625, 0.03125]:
+        prepared = prefill._reuse_cudnn_prefill_preparation(
+            cache, q, kv, kv, scale, workspace, plan=plan, return_lse=return_lse
+        )
+        assert prepared.matches_plan(q, kv, kv, scale, plan, return_lse)
+        assert not prepared.matches_plan(q, kv, kv, 0.5, plan, return_lse)
+        assert len(cache) <= 4
+    assert oldest not in cache
+
+
+@pytest.mark.parametrize("paged", [False, True])
+def test_prefill_workspace_reset_clears_preparation_history(monkeypatch, paged):
+    from flashinfer.prefill import (
+        BatchPrefillWithPagedKVCacheWrapper,
+        BatchPrefillWithRaggedKVCacheWrapper,
+    )
+
+    cls = (
+        BatchPrefillWithPagedKVCacheWrapper
+        if paged
+        else BatchPrefillWithRaggedKVCacheWrapper
+    )
+    wrapper = cls.__new__(cls)
+    wrapper._cudnn_prepared = object()
+    wrapper._cudnn_prepared_cache = [object(), object()]
+    empty = torch.empty
+
+    def host_empty(*args, **kwargs):
+        kwargs.pop("pin_memory", None)
+        return empty(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "empty", host_empty)
+    wrapper.reset_workspace_buffer(
+        torch.empty(1024, dtype=torch.uint8), torch.empty(1024, dtype=torch.uint8)
+    )
+    assert wrapper._cudnn_prepared is None
+    assert wrapper._cudnn_prepared_cache == []
+
+
 @pytest.mark.parametrize(
     "lse_base,expected", [("ln", 1.0), ("log2", 1.4426950408889634)]
 )
