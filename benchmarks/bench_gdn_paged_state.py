@@ -31,8 +31,21 @@ case the packed API can serve):
   checkpoints, the cost of the recurrence alone (its final state overwrites
   the prefix page, so it is a timing reference, not a correct caching scheme).
 
+One selected state per sequence (a chunk-aligned, sequence-local position,
+different for every sequence) compares:
+
+- selected: ``checkpoint_every_n_tokens=64`` with ``checkpoint_state_indices``
+  that are ``-1`` except at the selected entry, which names the sequence's row
+  of a ``[num_seqs, H, V, K]`` buffer (the index array is built on the device
+  inside the timed region).
+- all+gather: every 64-token checkpoint into a packed buffer, then a gather of
+  the selected ones.
+- no-ckpt: no checkpoints.
+
 Decode compares ``gated_delta_rule_decode_paged`` with
 ``gated_delta_rule_decode_pretranspose`` given precomputed read/write rows.
+
+All prefill arms run the non-context-parallel kernels (``use_cp=False``).
 
 Every arm is captured in a CUDA graph and timed by replay
 (``bench_gpu_time(use_cuda_graph=True)``, warm L2), so the copies and index
@@ -93,6 +106,17 @@ def _extra_mib(fn, owned_bytes=0):
     return (owned_bytes + torch.cuda.max_memory_allocated() - base) / 2**20
 
 
+def _tokens(num_tokens, heads):
+    hq, hk, hv = heads
+    h = max(hq, hv)
+    q = torch.randn(num_tokens, hq, D, dtype=torch.bfloat16, device="cuda") * 0.1
+    k = F.normalize(torch.randn(num_tokens, hk, D, device="cuda"), dim=-1)
+    v = torch.randn(num_tokens, hv, D, dtype=torch.bfloat16, device="cuda") * 0.1
+    g = 0.9 + 0.1 * torch.rand(num_tokens, h, device="cuda")
+    beta = torch.rand(num_tokens, h, device="cuda")
+    return q, k.to(torch.bfloat16), v, g, beta
+
+
 def _prefill_row(name, spans, heads, page_len, state_dtype):
     hq, hk, hv = heads
     h = max(hq, hv)
@@ -104,11 +128,7 @@ def _prefill_row(name, spans, heads, page_len, state_dtype):
     num_pages = [max(1, math.ceil(t / page_len)) for t in totals]
     b = len(spans)
     t_new = sum(new)
-    q = torch.randn(t_new, hq, D, dtype=torch.bfloat16, device="cuda") * 0.1
-    k = F.normalize(torch.randn(t_new, hk, D, device="cuda"), dim=-1).to(torch.bfloat16)
-    v = torch.randn(t_new, hv, D, dtype=torch.bfloat16, device="cuda") * 0.1
-    g = 0.9 + 0.1 * torch.rand(t_new, h, device="cuda")
-    beta = torch.rand(t_new, h, device="cuda")
+    q, k, v, g, beta = _tokens(t_new, heads)
     cu = _cu(new)
 
     pool_pages = sum(num_pages)
@@ -253,6 +273,102 @@ def bench_prefill(heads, page_len, state_dtype, workloads):
     return rows
 
 
+# (name, sequence lengths); the selected position of sequence i is
+# (len // 64 - i % 3) * 64 tokens.
+SELECTED_WORKLOADS = [
+    ("1x 32K", [32768]),
+    ("8x 8K", [8192] * 8),
+    ("32x 2K", [2048] * 32),
+    ("64x 1K", [1024] * 64),
+]
+
+
+def _selected_row(name, lens, heads, state_dtype):
+    h = max(heads[0], heads[2])
+    scale = 1.0 / math.sqrt(D)
+    b = len(lens)
+    t = sum(lens)
+    q, k, v, g, beta = _tokens(t, heads)
+    cu = _cu(lens)
+    counts = [n // 64 for n in lens]
+    positions = torch.tensor(
+        [(n // 64 - i % 3) * 64 for i, n in enumerate(lens)],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    starts = _cu(counts)[:-1].contiguous()
+    rows = torch.arange(b, dtype=torch.int32, device="cuda")
+    selected_entries = (starts + positions // 64 - 1).long()
+    entries = torch.empty(sum(counts), dtype=torch.int32, device="cuda")
+    selected_buf = torch.empty(b, h, D, D, dtype=state_dtype, device="cuda")
+    all_buf = torch.empty(sum(counts), h, D, D, dtype=state_dtype, device="cuda")
+    all_cu = _cu(counts)
+    out = torch.empty(t, h, D, dtype=torch.bfloat16, device="cuda")
+    kwargs = dict(cu_seqlens=cu, output=out, use_cp=False)
+
+    def selected():
+        entries.fill_(-1)
+        entries.index_copy_(0, selected_entries, rows)
+        chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            state_checkpoints=selected_buf,
+            checkpoint_cu_starts=starts,
+            checkpoint_every_n_tokens=64,
+            checkpoint_state_indices=entries,
+            **kwargs,
+        )
+
+    def all_gather():
+        chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            state_checkpoints=all_buf,
+            checkpoint_cu_starts=all_cu,
+            checkpoint_every_n_tokens=64,
+            **kwargs,
+        )
+        torch.index_select(all_buf, 0, selected_entries, out=selected_buf)
+
+    def no_ckpt():
+        chunk_gated_delta_rule(q, k, v, g, beta, scale, **kwargs)
+
+    all_gather()
+    expected = selected_buf.clone()
+    selected_buf.zero_()
+    selected()
+    torch.testing.assert_close(
+        selected_buf.float(), expected.float(), atol=2e-2, rtol=2e-2
+    )
+    del expected
+    elem = selected_buf.element_size()
+    mib_sel = _extra_mib(
+        selected, selected_buf.numel() * elem + entries.numel() * entries.element_size()
+    )
+    mib_all = _extra_mib(all_gather, (selected_buf.numel() + all_buf.numel()) * elem)
+    no_ckpt()
+    t_sel = _median_ms(selected)
+    t_all = _median_ms(all_gather)
+    t_plain = _median_ms(no_ckpt)
+    return name, b, t, t_sel, t_all, t_plain, mib_sel, mib_all
+
+
+def bench_selected(heads, state_dtype, workloads):
+    rows = []
+    for name, lens in workloads:
+        rows.append(_selected_row(name, lens, heads, state_dtype))
+        torch.cuda.empty_cache()
+    return rows
+
+
 def bench_decode(heads, state_dtype, batches):
     hq, hk, hv = heads
     rows = []
@@ -338,6 +454,18 @@ def main():
         print(
             f"| {name} | {b} | {t} | {n} | {tp:.4f} | {tc:.4f} | {tc / tp:.3f} "
             f"| {t0:.4f} | {mp:.1f} | {mc:.1f} |"
+        )
+    print(
+        "\n| one state per seq | seqs | tokens | selected ms | all+gather ms "
+        "| speedup | no-ckpt ms | selected extra MiB | all+gather extra MiB |"
+    )
+    print("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for name, b, t, ts, ta, t0, ms, ma in bench_selected(
+        tuple(args.heads), state_dtype, SELECTED_WORKLOADS
+    ):
+        print(
+            f"| {name} | {b} | {t} | {ts:.4f} | {ta:.4f} | {ta / ts:.3f} "
+            f"| {t0:.4f} | {ms:.1f} | {ma:.1f} |"
         )
     if args.decode_batches:
         hq, hk, hv = args.heads
