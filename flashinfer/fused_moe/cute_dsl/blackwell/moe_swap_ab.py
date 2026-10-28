@@ -265,15 +265,21 @@ def _run_blockscaled_gemm(
         use_fused_finalize,
         enable_pdl,
     )
-    tile_k = (
-        256
+    tile_k, native_mma_k = (
+        (256, 64)
         if activation_dtype is cutlass.Float4E2M1FN
         and weight_dtype is cutlass.Float4E2M1FN
-        else 128
+        else (128, 32)
     )
     compiled = _blockscaled_kernel_cache.get(key)
     args = (*pointers, channels, routes, reduction, experts, num_tokens)
     if compiled is None:
+        if (
+            native_mma_k == 64
+            and sf_vec_size == 16
+            and get_compute_capability(activation.device) == (10, 3)
+        ):
+            native_mma_k = 96
         kernel = Sm100BlockScaledGroupedGemmKernel(
             mma_tiler_mnk=(mma_m, route_tile, tile_k),
             activation_type=activation_type,
@@ -281,6 +287,7 @@ def _run_blockscaled_gemm(
             weight_dtype=weight_dtype,
             sf_dtype=sf_dtype,
             sf_vec_size=sf_vec_size,
+            native_mma_k=native_mma_k,
             scatter_output=scatter_output,
             output_is_routed=output_is_routed,
             per_token_scale_is_routed=per_token_scale_is_routed,
@@ -306,11 +313,6 @@ def _run_blockscaled_gemm(
             use_fused_finalize=use_fused_finalize,
             enable_pdl=enable_pdl,
             max_active_clusters=num_sms,
-            use_k96=(
-                get_compute_capability(activation.device) == (10, 3)
-                and activation_dtype is weight_dtype is cutlass.Float4E2M1FN
-                and sf_vec_size == 16
-            ),
         )
         compiled = cute.compile(kernel.wrapper, *args, stream=stream)
         _blockscaled_kernel_cache[key] = compiled

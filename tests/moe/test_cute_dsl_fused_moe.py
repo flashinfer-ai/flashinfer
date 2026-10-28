@@ -100,7 +100,7 @@ def _observe_swap_ab_mma_plans():
         if isinstance(kernel, moe_swap_ab.Sm100BlockScaledGroupedGemmKernel):
             configs[id(compiled)] = (
                 kernel.scatter_output,
-                kernel.tile_k if kernel.use_k96 else None,
+                kernel.tile_k if kernel.native_mma_k == 96 else None,
             )
             record(compiled)
         return compiled

@@ -41,6 +41,7 @@ uses the tactic width while each MMA descriptor rounds the live routed-token
 count to 16 columns.
 """
 
+from math import lcm
 from typing import Optional
 
 import cuda.bindings.driver as cuda
@@ -149,26 +150,28 @@ def _blockscaled_dynamic_mma(
     k_tile,
     instruction,
     descriptor,
-    cta_group,
-    num_k_atoms,
-    use_k96,
+    tiled_mma,
+    stage_k,
+    native_mma_k,
     loc=None,
     ip=None,
 ):
     """Issue native blockscaled MMAs with a runtime token-width descriptor."""
     i32 = ir.IntegerType.get_signless(32)
     i64 = ir.IntegerType.get_signless(64)
+    cta_group = cute.size(tiled_mma.thr_id.shape)
+    atom_k = cute.size(tiled_mma.shape_mnk, mode=[2])
+    padded_stage_k = cute.ceil_div(stage_k, atom_k) * atom_k
+    group_k = lcm(atom_k, native_mma_k)
     # Blockscaled MMA requires eight columns per CTA in the group.
     n_alignment = 8 * cta_group
     n_bits = (
         ((cutlass.Int32(valid_tokens) + n_alignment - 1) & -n_alignment) >> 3
     ) << 17
-    widths = (
-        (96, 96) * (num_k_atoms * 64 // 192) + (64,) * ((num_k_atoms * 64 % 192) // 64)
-        if use_k96
-        else (0,) * num_k_atoms
-    )
-    if use_k96:
+    widths = (native_mma_k,) * (
+        padded_stage_k // group_k * (group_k // native_mma_k)
+    ) + (atom_k,) * ((padded_stage_k % group_k) // atom_k)
+    if native_mma_k == 96:
         stage_descriptors = []
         for operand in (a, b):
             value = tcgen05.make_umma_smem_desc(
@@ -180,7 +183,7 @@ def _blockscaled_dynamic_mma(
             )
     start = 0
     for inner_k, width in enumerate(widths):
-        if use_k96:
+        if native_mma_k == 96:
             values = []
             for operand, (lo, hi) in zip((a, b), stage_descriptors, strict=True):
                 offset = cute.crd2idx(((0, start % 64), 0, start // 64), operand.layout)
@@ -1423,6 +1426,7 @@ class Sm100BlockScaledGroupedGemmKernel:
         weight_dtype,
         sf_dtype,
         sf_vec_size,
+        native_mma_k,
         scatter_output,
         per_token_scale_is_routed,
         k_steps,
@@ -1450,7 +1454,6 @@ class Sm100BlockScaledGroupedGemmKernel:
         publish_routing_before_signal=False,
         activation_cache_policy=0,
         enable_iket=False,
-        use_k96=False,
         output_is_routed=False,
     ):
         if not self.is_valid_dtypes(
@@ -1499,11 +1502,14 @@ class Sm100BlockScaledGroupedGemmKernel:
         if mma_tiler_mnk[0] not in (128, 256, 512):
             raise ValueError("Unsupported logical output-channel tile")
         self.channel_tiles = max(1, mma_tiler_mnk[0] // 256)
-        if use_k96 and not (both_fp4 and sf_vec_size == 16):
-            raise ValueError("K96 requires FP4 operands with SF16")
-        self.use_k96 = use_k96
-        self.operand_alignment = 1024 if use_k96 else 128
-        self.gather_k = 256 if both_fp4 else 128
+        self.gather_k, atom_k = (256, 64) if both_fp4 else (128, 32)
+        if type(native_mma_k) is not int or (
+            native_mma_k != atom_k
+            and not (native_mma_k == 96 and both_fp4 and sf_vec_size == 16)
+        ):
+            raise ValueError("Unsupported native blockscaled MMA K")
+        self.native_mma_k = native_mma_k
+        self.operand_alignment = 1024 if native_mma_k == 96 else 128
         if mma_tiler_mnk[2] != self.gather_k:
             raise ValueError("Unsupported public blockscaled K tile")
         self.bulk_output_bytes = self.bulk_output_element_bytes(
@@ -2976,7 +2982,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                     tSFA.layout,
                 )
                 copy_a1, source_a1, target_a1 = self._s2t_partition(sSFA, tSFA1)
-            if cutlass.const_expr(self.use_k96):
+            if cutlass.const_expr(self.native_mma_k == 96):
                 # Preserve the existing SF copy layout, but address individual
                 # SF16 entries for the mixed six/four-scale MMA updates.
                 sfa_iter = cute.make_layout(
@@ -3026,7 +3032,9 @@ class Sm100BlockScaledGroupedGemmKernel:
                 )
                 tile_target_b = target_b
                 tile_sfb = tSFB
-                if cutlass.const_expr(self.use_k96 and self.sfb_row_blocks > 1):
+                if cutlass.const_expr(
+                    self.native_mma_k == 96 and self.sfb_row_blocks > 1
+                ):
                     # K96 crosses SF words using the instruction's actual N.
                     # Compact the first bank for narrow tiles and place the
                     # unused bank after it in the same allocated TMEM region.
@@ -3068,16 +3076,10 @@ class Sm100BlockScaledGroupedGemmKernel:
                 # rather than testing the valid K extent at each MMA instruction.
                 full_k_tiles = weights.shape[1] // self.tile_k
                 tail_k = weights.shape[1] % self.tile_k
-                atoms_per_stage = cute.size(fragment_a, mode=[2])
-                atom_k = self.tile_k // atoms_per_stage
                 for section in cutlass.range_constexpr(1 + (tail_k != 0)):
                     first_stage = 0 if section == 0 else full_k_tiles
                     last_stage = full_k_tiles if section == 0 else k_tiles
-                    num_k_atoms = (
-                        atoms_per_stage
-                        if section == 0
-                        else cute.ceil_div(tail_k, atom_k)
-                    )
+                    stage_k = self.tile_k if section == 0 else tail_k
                     for k_tile in cutlass.range(
                         first_stage, last_stage, unroll_full=(section == 1)
                     ):
@@ -3121,9 +3123,9 @@ class Sm100BlockScaledGroupedGemmKernel:
                             k_tile,
                             self.instruction,
                             self.descriptor,
-                            self.cta_group_size,
-                            num_k_atoms,
-                            self.use_k96,
+                            tiled_mma,
+                            stage_k,
+                            self.native_mma_k,
                         )
                         if cutlass.const_expr(self.enable_iket):
                             _iket.range_pop()
@@ -3152,9 +3154,9 @@ class Sm100BlockScaledGroupedGemmKernel:
                                 k_tile,
                                 self.instruction,
                                 self.descriptor,
-                                self.cta_group_size,
-                                num_k_atoms,
-                                self.use_k96,
+                                tiled_mma,
+                                stage_k,
+                                self.native_mma_k,
                             )
                             if cutlass.const_expr(self.enable_iket):
                                 _iket.range_pop()
