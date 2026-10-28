@@ -317,6 +317,7 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_109e69560598d8dbd610(const _
             if (tid == 0) {
                 unsigned int _atomic_fetch_add_0 = atomicAdd(&hctr[5 * num_heads], 1);
                 slot_cell[0] = (int)_atomic_fetch_add_0;
+                slot_cell[2] = 0;
             }
             asm volatile("barrier.sync 5, 256;" ::: "memory");
             unsigned int _phase_q_full_0 = 0;
@@ -326,6 +327,8 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_109e69560598d8dbd610(const _
             for (int it = 0; it < total_units; it++) {
                 int slot;
                 asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(slot) : "r"(slot_cell[it & 1]));
+                int pfv;
+                asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(pfv) : "r"(slot_cell[2]));
                 if (slot >= total_units) {
                     if (tid == 0) {
                         int _stage_s_empty = (int)((unsigned int)it % 2);
@@ -357,11 +360,13 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_109e69560598d8dbd610(const _
                 int kb_last = (seg_end_v - 1) / 128;
                 if (tid == 0) {
                     unsigned int nxt = atomicAdd(&hctr[5 * num_heads], 1);
-                    {
-                    unsigned int _acquire_observed;
-                    do {
-                    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_acquire_observed) : "l"((reinterpret_cast<unsigned int*>(hctr) + (3 * num_heads + head))) : "memory");
-                    } while (static_cast<unsigned int>(_acquire_observed - static_cast<unsigned int>(1)) >= static_cast<unsigned int>(1));
+                    if (pfv == 0) {
+                        {
+                        unsigned int _acquire_observed;
+                        do {
+                        asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_acquire_observed) : "l"((reinterpret_cast<unsigned int*>(hctr) + (3 * num_heads + head))) : "memory");
+                        } while (static_cast<unsigned int>(_acquire_observed - static_cast<unsigned int>(1)) >= static_cast<unsigned int>(1));
+                        }
                     }
                     unsigned int uold;
                     asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
@@ -381,13 +386,15 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_109e69560598d8dbd610(const _
                 asm volatile("barrier.sync 5, 256;" ::: "memory");
                 asm volatile("fence.proxy.async.global;" ::: "memory");
                 if (warp == 0) {
-                    if (elect_sync()) {
-                        mbarrier_arrive_expect_tx(q_full_addr, 8192);
-                        asm volatile(
-                            "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-                            " [%0], [%1, {%2, %3, %4}], [%5], %6;"
-                            :: "r"(Q_addr), "l"((&Q_map)), "r"(0), "r"(_vec_load_1[2] + (_vec_load_1[1] & 65535) * 128), "r"(_vec_load_1[1] >> 16),
-                               "r"(q_full_addr), "l"(0x12F0000000000000ULL) : "memory");
+                    if (pfv == 0) {
+                        if (elect_sync()) {
+                            mbarrier_arrive_expect_tx(q_full_addr, 8192);
+                            asm volatile(
+                                "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                :: "r"(Q_addr), "l"((&Q_map)), "r"(0), "r"(_vec_load_1[2] + (_vec_load_1[1] & 65535) * 128), "r"(_vec_load_1[1] >> 16),
+                                   "r"(q_full_addr), "l"(0x12F0000000000000ULL) : "memory");
+                        }
                     }
                 }
                 if (kb_first <= kb_last) {
@@ -474,6 +481,56 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_109e69560598d8dbd610(const _
                     : "memory");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("barrier.sync 5, 256;" ::: "memory");
+                if (warp == 0) {
+                    int nslot;
+                    asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(nslot) : "r"(slot_cell[it + 1 & 1]));
+                    int npf = 0;
+                    if (nslot < total_units) {
+                        int _pf_row[4];
+                        {
+                            const int4* _ivptr_2 = reinterpret_cast<const int4*>(unit_table + (4 * nslot) + 0);
+                            int4 _ivld_2;
+                            _ivld_2 = *_ivptr_2;
+                            _pf_row[0 + 0] = _ivld_2.x;
+                            _pf_row[0 + 1] = _ivld_2.y;
+                            _pf_row[0 + 2] = _ivld_2.z;
+                            _pf_row[0 + 3] = _ivld_2.w;
+                        }
+                        int nhead = _pf_row[1] >> 16;
+                        unsigned int nmiss = 0;
+                        {
+                            unsigned int _poll_v_3;
+                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_poll_v_3) : "l"((reinterpret_cast<unsigned int*>(hctr) + (3 * num_heads + nhead))) : "memory");
+                            #pragma unroll 1
+                            for (int _poll_trip_3 = 0; _poll_trip_3 < 0; _poll_trip_3++) {
+                                if (_poll_v_3 == static_cast<unsigned int>(1)) {
+                                    break;
+                                }
+                                asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_poll_v_3) : "l"((reinterpret_cast<unsigned int*>(hctr) + (3 * num_heads + nhead))) : "memory");
+                            }
+                            if (_poll_v_3 != static_cast<unsigned int>(1)) {
+                                nmiss = 1;
+                            }
+                        }
+                        unsigned int nmiss_w;
+                        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(nmiss_w) : "r"(nmiss));
+                        if (nmiss_w == 0) {
+                            asm volatile("fence.proxy.async.global;" ::: "memory");
+                            if (elect_sync()) {
+                                mbarrier_arrive_expect_tx(q_full_addr, 8192);
+                                asm volatile(
+                                    "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                                    " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                    :: "r"(Q_addr), "l"((&Q_map)), "r"(0), "r"(_pf_row[2] + (_pf_row[1] & 65535) * 128), "r"(_pf_row[1] >> 16),
+                                       "r"(q_full_addr), "l"(0x12F0000000000000ULL) : "memory");
+                            }
+                            npf = 1;
+                        }
+                    }
+                    if (lane == 0) {
+                        slot_cell[2] = npf;
+                    }
+                }
                 #pragma unroll 1
                 for (int kb = kb_first; kb < kb_last + 1; kb++) {
                     mbarrier_wait(k_full_addr + (kv_stage) * 8, _phase_k_full);
@@ -794,10 +851,10 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_109e69560598d8dbd610(const _
                     float a5_0 = fmaxf(a3_0, fmaxf(s_acc[10], s_acc[11]));
                     float a6_0 = fmaxf(a4_0, fmaxf(s_acc[12], s_acc[13]));
                     float a7_0 = fmaxf(a5_0, fmaxf(s_acc[14], s_acc[15]));
-                    float _shfl_xor_sync_2 = __shfl_xor_sync(0xFFFFFFFF, a6_0, 1);
-                    float a8_0 = fmaxf(a6_0, _shfl_xor_sync_2);
-                    float _shfl_xor_sync_3 = __shfl_xor_sync(0xFFFFFFFF, a7_0, 1);
-                    float a9_0 = fmaxf(a7_0, _shfl_xor_sync_3);
+                    float _shfl_xor_sync_4 = __shfl_xor_sync(0xFFFFFFFF, a6_0, 1);
+                    float a8_0 = fmaxf(a6_0, _shfl_xor_sync_4);
+                    float _shfl_xor_sync_5 = __shfl_xor_sync(0xFFFFFFFF, a7_0, 1);
+                    float a9_0 = fmaxf(a7_0, _shfl_xor_sync_5);
                     float a0_1 = fmaxf(s_acc[16], s_acc[17]);
                     float a1_1 = fmaxf(s_acc[18], s_acc[19]);
                     float a2_1 = fmaxf(a0_1, fmaxf(s_acc[20], s_acc[21]));
@@ -806,10 +863,10 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_109e69560598d8dbd610(const _
                     float a5_1 = fmaxf(a3_1, fmaxf(s_acc[26], s_acc[27]));
                     float a6_1 = fmaxf(a4_1, fmaxf(s_acc[28], s_acc[29]));
                     float a7_1 = fmaxf(a5_1, fmaxf(s_acc[30], s_acc[31]));
-                    float _shfl_xor_sync_4 = __shfl_xor_sync(0xFFFFFFFF, a6_1, 1);
-                    float a8_1 = fmaxf(a6_1, _shfl_xor_sync_4);
-                    float _shfl_xor_sync_5 = __shfl_xor_sync(0xFFFFFFFF, a7_1, 1);
-                    float a9_1 = fmaxf(a7_1, _shfl_xor_sync_5);
+                    float _shfl_xor_sync_6 = __shfl_xor_sync(0xFFFFFFFF, a6_1, 1);
+                    float a8_1 = fmaxf(a6_1, _shfl_xor_sync_6);
+                    float _shfl_xor_sync_7 = __shfl_xor_sync(0xFFFFFFFF, a7_1, 1);
+                    float a9_1 = fmaxf(a7_1, _shfl_xor_sync_7);
                     float a0_2 = fmaxf(s_acc[32], s_acc[33]);
                     float a1_2 = fmaxf(s_acc[34], s_acc[35]);
                     float a2_2 = fmaxf(a0_2, fmaxf(s_acc[36], s_acc[37]));
@@ -818,10 +875,10 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_109e69560598d8dbd610(const _
                     float a5_2 = fmaxf(a3_2, fmaxf(s_acc[42], s_acc[43]));
                     float a6_2 = fmaxf(a4_2, fmaxf(s_acc[44], s_acc[45]));
                     float a7_2 = fmaxf(a5_2, fmaxf(s_acc[46], s_acc[47]));
-                    float _shfl_xor_sync_6 = __shfl_xor_sync(0xFFFFFFFF, a6_2, 1);
-                    float a8_2 = fmaxf(a6_2, _shfl_xor_sync_6);
-                    float _shfl_xor_sync_7 = __shfl_xor_sync(0xFFFFFFFF, a7_2, 1);
-                    float a9_2 = fmaxf(a7_2, _shfl_xor_sync_7);
+                    float _shfl_xor_sync_8 = __shfl_xor_sync(0xFFFFFFFF, a6_2, 1);
+                    float a8_2 = fmaxf(a6_2, _shfl_xor_sync_8);
+                    float _shfl_xor_sync_9 = __shfl_xor_sync(0xFFFFFFFF, a7_2, 1);
+                    float a9_2 = fmaxf(a7_2, _shfl_xor_sync_9);
                     float a0_3 = fmaxf(s_acc[48], s_acc[49]);
                     float a1_3 = fmaxf(s_acc[50], s_acc[51]);
                     float a2_3 = fmaxf(a0_3, fmaxf(s_acc[52], s_acc[53]));
@@ -830,16 +887,16 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_109e69560598d8dbd610(const _
                     float a5_3 = fmaxf(a3_3, fmaxf(s_acc[58], s_acc[59]));
                     float a6_3 = fmaxf(a4_3, fmaxf(s_acc[60], s_acc[61]));
                     float a7_3 = fmaxf(a5_3, fmaxf(s_acc[62], s_acc[63]));
-                    float _shfl_xor_sync_8 = __shfl_xor_sync(0xFFFFFFFF, a6_3, 1);
-                    float a8_3 = fmaxf(a6_3, _shfl_xor_sync_8);
-                    float _shfl_xor_sync_9 = __shfl_xor_sync(0xFFFFFFFF, a7_3, 1);
-                    float a9_3 = fmaxf(a7_3, _shfl_xor_sync_9);
+                    float _shfl_xor_sync_10 = __shfl_xor_sync(0xFFFFFFFF, a6_3, 1);
+                    float a8_3 = fmaxf(a6_3, _shfl_xor_sync_10);
+                    float _shfl_xor_sync_11 = __shfl_xor_sync(0xFFFFFFFF, a7_3, 1);
+                    float a9_3 = fmaxf(a7_3, _shfl_xor_sync_11);
                     float max_1 = fmaxf(fmaxf(a8_0, a8_1), fmaxf(a8_2, a8_3));
                     float max_1_0 = fmaxf(fmaxf(a9_0, a9_1), fmaxf(a9_2, a9_3));
-                    float _shfl_xor_sync_10 = __shfl_xor_sync(0xFFFFFFFF, max_1, 2);
-                    float _max_42 = fmaxf(max_1, _shfl_xor_sync_10);
-                    float _shfl_xor_sync_11 = __shfl_xor_sync(0xFFFFFFFF, max_1_0, 2);
-                    float _max_43 = fmaxf(max_1_0, _shfl_xor_sync_11);
+                    float _shfl_xor_sync_12 = __shfl_xor_sync(0xFFFFFFFF, max_1, 2);
+                    float _max_42 = fmaxf(max_1, _shfl_xor_sync_12);
+                    float _shfl_xor_sync_13 = __shfl_xor_sync(0xFFFFFFFF, max_1_0, 2);
+                    float _max_43 = fmaxf(max_1_0, _shfl_xor_sync_13);
                     float _max_44 = fmaxf(m_state[0], _max_42 * softmax_scale_log2);
                     float _max_45 = fmaxf(m_state[1], _max_43 * softmax_scale_log2);
                     float _exp2_0 = approx_exp2(m_state[0] - _max_44);
@@ -932,8 +989,8 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_109e69560598d8dbd610(const _
                     s_acc[31] = e_31;
                     float s0_0 = __fmaf_rn(e_16 + e_17 + e_20 + e_21 + e_24 + e_25 + e_28 + e_29, ea_1 * 0.16666667f, (e_0 + e_1 + e_4 + e_5 + e_8 + e_9 + e_12 + e_13) * (ea_0 * 0.16666667f));
                     float s0_1 = __fmaf_rn(e_18 + e_19 + e_22 + e_23 + e_26 + e_27 + e_30 + e_31, eb_1 * 0.16666667f, (e_2 + e_3 + e_6 + e_7 + e_10 + e_11 + e_14 + e_15) * (eb_0 * 0.16666667f));
-                    unsigned int _shfl_xor_sync_12 = __shfl_xor_sync(0xFFFFFFFF, (((lane & 2) == 2) ? ((((lane & 1) == 1) ? (unsigned int)cv_0 >> 8 : (unsigned int)cv_0) & 255) << 8 : (((lane & 1) == 1) ? (unsigned int)cv_0 >> 8 : (unsigned int)cv_0) & 255) | (((lane & 2) == 2) ? ((((lane & 1) == 1) ? (unsigned int)cv_1 >> 8 : (unsigned int)cv_1) & 255) << 24 : ((((lane & 1) == 1) ? (unsigned int)cv_1 >> 8 : (unsigned int)cv_1) & 255) << 16), 2);
-                    psf[0] = (((lane & 2) == 2) ? ((((lane & 1) == 1) ? (unsigned int)cv_0 >> 8 : (unsigned int)cv_0) & 255) << 8 : (((lane & 1) == 1) ? (unsigned int)cv_0 >> 8 : (unsigned int)cv_0) & 255) | (((lane & 2) == 2) ? ((((lane & 1) == 1) ? (unsigned int)cv_1 >> 8 : (unsigned int)cv_1) & 255) << 24 : ((((lane & 1) == 1) ? (unsigned int)cv_1 >> 8 : (unsigned int)cv_1) & 255) << 16) | _shfl_xor_sync_12;
+                    unsigned int _shfl_xor_sync_14 = __shfl_xor_sync(0xFFFFFFFF, (((lane & 2) == 2) ? ((((lane & 1) == 1) ? (unsigned int)cv_0 >> 8 : (unsigned int)cv_0) & 255) << 8 : (((lane & 1) == 1) ? (unsigned int)cv_0 >> 8 : (unsigned int)cv_0) & 255) | (((lane & 2) == 2) ? ((((lane & 1) == 1) ? (unsigned int)cv_1 >> 8 : (unsigned int)cv_1) & 255) << 24 : ((((lane & 1) == 1) ? (unsigned int)cv_1 >> 8 : (unsigned int)cv_1) & 255) << 16), 2);
+                    psf[0] = (((lane & 2) == 2) ? ((((lane & 1) == 1) ? (unsigned int)cv_0 >> 8 : (unsigned int)cv_0) & 255) << 8 : (((lane & 1) == 1) ? (unsigned int)cv_0 >> 8 : (unsigned int)cv_0) & 255) | (((lane & 2) == 2) ? ((((lane & 1) == 1) ? (unsigned int)cv_1 >> 8 : (unsigned int)cv_1) & 255) << 24 : ((((lane & 1) == 1) ? (unsigned int)cv_1 >> 8 : (unsigned int)cv_1) & 255) << 16) | _shfl_xor_sync_14;
                     p_tmp[0] = s_acc[0];
                     p_tmp[1] = s_acc[1];
                     p_tmp[2] = s_acc[4];
@@ -1050,8 +1107,8 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_109e69560598d8dbd610(const _
                     s_acc[63] = e_63;
                     float s1_2 = __fmaf_rn(e_48 + e_49 + e_52 + e_53 + e_56 + e_57 + e_60 + e_61, ea_3 * 0.16666667f, s1_0);
                     float s1_3 = __fmaf_rn(e_50 + e_51 + e_54 + e_55 + e_58 + e_59 + e_62 + e_63, eb_3 * 0.16666667f, s1_1);
-                    unsigned int _shfl_xor_sync_13 = __shfl_xor_sync(0xFFFFFFFF, (((lane & 2) == 2) ? ((((lane & 1) == 1) ? (unsigned int)cv_2 >> 8 : (unsigned int)cv_2) & 255) << 8 : (((lane & 1) == 1) ? (unsigned int)cv_2 >> 8 : (unsigned int)cv_2) & 255) | (((lane & 2) == 2) ? ((((lane & 1) == 1) ? (unsigned int)cv_3 >> 8 : (unsigned int)cv_3) & 255) << 24 : ((((lane & 1) == 1) ? (unsigned int)cv_3 >> 8 : (unsigned int)cv_3) & 255) << 16), 2);
-                    psf[1] = (((lane & 2) == 2) ? ((((lane & 1) == 1) ? (unsigned int)cv_2 >> 8 : (unsigned int)cv_2) & 255) << 8 : (((lane & 1) == 1) ? (unsigned int)cv_2 >> 8 : (unsigned int)cv_2) & 255) | (((lane & 2) == 2) ? ((((lane & 1) == 1) ? (unsigned int)cv_3 >> 8 : (unsigned int)cv_3) & 255) << 24 : ((((lane & 1) == 1) ? (unsigned int)cv_3 >> 8 : (unsigned int)cv_3) & 255) << 16) | _shfl_xor_sync_13;
+                    unsigned int _shfl_xor_sync_15 = __shfl_xor_sync(0xFFFFFFFF, (((lane & 2) == 2) ? ((((lane & 1) == 1) ? (unsigned int)cv_2 >> 8 : (unsigned int)cv_2) & 255) << 8 : (((lane & 1) == 1) ? (unsigned int)cv_2 >> 8 : (unsigned int)cv_2) & 255) | (((lane & 2) == 2) ? ((((lane & 1) == 1) ? (unsigned int)cv_3 >> 8 : (unsigned int)cv_3) & 255) << 24 : ((((lane & 1) == 1) ? (unsigned int)cv_3 >> 8 : (unsigned int)cv_3) & 255) << 16), 2);
+                    psf[1] = (((lane & 2) == 2) ? ((((lane & 1) == 1) ? (unsigned int)cv_2 >> 8 : (unsigned int)cv_2) & 255) << 8 : (((lane & 1) == 1) ? (unsigned int)cv_2 >> 8 : (unsigned int)cv_2) & 255) | (((lane & 2) == 2) ? ((((lane & 1) == 1) ? (unsigned int)cv_3 >> 8 : (unsigned int)cv_3) & 255) << 24 : ((((lane & 1) == 1) ? (unsigned int)cv_3 >> 8 : (unsigned int)cv_3) & 255) << 16) | _shfl_xor_sync_15;
                     p_tmp[0] = s_acc[32];
                     p_tmp[1] = s_acc[33];
                     p_tmp[2] = s_acc[36];
@@ -1844,8 +1901,8 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_109e69560598d8dbd610(const _
                 rows1[0] = rows0[0] + 8;
                 lred[0] = lsum0[0];
                 lred[1] = lsum0[1];
-                float _shfl_xor_sync_3_1 = __shfl_xor_sync(0xFFFFFFFF, lred[0], 1);
-                lred[0] = lred[0] + _shfl_xor_sync_3_1;
+                float _shfl_xor_sync_3 = __shfl_xor_sync(0xFFFFFFFF, lred[0], 1);
+                lred[0] = lred[0] + _shfl_xor_sync_3;
                 float _shfl_xor_sync_4_1 = __shfl_xor_sync(0xFFFFFFFF, lred[0], 2);
                 lred[0] = lred[0] + _shfl_xor_sync_4_1;
                 float _shfl_xor_sync_5_1 = __shfl_xor_sync(0xFFFFFFFF, lred[1], 1);
