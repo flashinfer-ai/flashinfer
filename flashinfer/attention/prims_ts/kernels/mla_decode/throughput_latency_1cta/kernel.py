@@ -1395,7 +1395,6 @@ def _make_single_kv_pipe_task_graph(
         inst_id=0,
         scale_softmax_log2=scale_softmax_log2,
         cache_seqs=cache_seqs,
-        page_offsets_kv=smem_page_offsets if use_page_offsets else None,
         cu_seqlens_q=cu_seqlens_q,
         head_idx=head_idx,
         batch_idx=batch_idx,

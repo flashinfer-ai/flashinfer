@@ -125,10 +125,6 @@ class TmemSResource(MlaResource):
     cta_idx_q: object = None
     cta_idx_kv: object = None
     sync_barrier_id: cutlass.Constexpr[int] = 0
-    # D576 sparse: the page-offset resource whose allocation carries the
-    # per-tile validity ring (see ``SPARSE_MASK_SLOTS`` in smem_resources).
-    page_offsets_kv: object = None
-    _sparse_mask_words: object = None
     q_desc_current: object = None
     q_desc_rope_current: object = None
     new_max_state: object = None
@@ -248,13 +244,6 @@ class TmemSResource(MlaResource):
                 self._scratch_alloc,
                 Uint32,
                 softmax_scratch_words(self.cfg),
-            )
-        if cutlass.const_expr(self.cfg.sparse_d576):
-            self._sparse_mask_words = smem_array(
-                context,
-                self.page_offsets_kv._alloc,
-                Int32,
-                self.page_offsets_kv.total_words,
             )
         if cutlass.const_expr(
             self.cfg.kernel_variant == "keeps_mma_ab" and not self.cfg.keeps_ilp_softmax
@@ -499,7 +488,10 @@ class TmemSResource(MlaResource):
                 swaps=cfg.kernel_variant != "keeps_mma_ab",
                 tile_size_kv=cfg.tile_size_kv,
             )
-            if cutlass.const_expr(cfg.sparse_d512 and cfg.logical_seq_len_q == 1)
+            # D576 query rows of one CTA are heads of one token: one mask.
+            if cutlass.const_expr(
+                (cfg.sparse_d512 and cfg.logical_seq_len_q == 1) or cfg.sparse_d576
+            )
             else raw_mask_routes
         )
 
@@ -549,10 +541,6 @@ class TmemSResource(MlaResource):
         should_apply_dense_mask = (
             (seq_len_kv % Int32(cfg.tile_size_kv)) != Int32(0)
         ) or (next_tile_offset_k > seq_len_kv)
-        if cutlass.const_expr(cfg.sparse_d576):
-            # Every tile may carry -1 (empty) slots; the validity ring is
-            # consulted unconditionally.
-            should_apply_dense_mask = cutlass.Boolean(True)
         needs_row_causal_mask = cutlass.const_expr(
             cfg.mask_type == MaskType.CAUSAL.value and cfg.logical_seq_len_q > 1
         )
@@ -568,8 +556,8 @@ class TmemSResource(MlaResource):
             should_apply_dense_mask = should_apply_dense_mask or (
                 next_tile_offset_k > min_seq_len_kv
             )
-        if cutlass.const_expr(cfg.sparse_d512):
-            if cutlass.const_expr(cfg.logical_seq_len_q == 1):
+        if cutlass.const_expr(cfg.num_tokens_per_page == 1):
+            if cutlass.const_expr(cfg.logical_seq_len_q == 1 or cfg.sparse_d576):
                 # Cached route bits include the live prefix boundary.
                 should_apply_dense_mask = (mask_routes.low | mask_routes.high) != Int32(
                     0
@@ -598,78 +586,16 @@ class TmemSResource(MlaResource):
                         local_row_idx,
                         self.cu_seqlens_q,
                     )
-                fp8_d576 = cutlass.const_expr(
-                    cfg.sparse_d576 and not needs_row_causal_mask
-                )
-                if cutlass.const_expr(fp8_d576):
-                    # E4M3 D576 sparse: this thread's 64 columns are tokens
-                    # [local_col_base, + 64) of the tile, validity words
-                    # (local_col_base >> 5) + {0, 1}.  One test covers the
-                    # common all-valid span; only a span that crosses the
-                    # token length or holds a -1 slot masks per column (the
-                    # per-column selects cost ~3x the softmax ALU work).
-                    from .smem_resources import SPARSE_MASK_SLOTS, SPARSE_MASK_WORDS
-
-                    fp8_mask_base = (
-                        Int32(self.page_offsets_kv.sparse_mask_word_base)
-                        + (tile_idx % Int32(SPARSE_MASK_SLOTS))
-                        * Int32(SPARSE_MASK_WORDS)
-                        + (local_col_base >> Int32(5))
-                    )
-                    fp8_word_a = Int32(self._sparse_mask_words[fp8_mask_base])
-                    fp8_word_b = Int32(
-                        self._sparse_mask_words[fp8_mask_base + Int32(1)]
-                    )
-                    span_end = (
-                        tile_offset_k
-                        + local_col_base
-                        + Int32(num_s_regs_per_thread(cfg))
-                    )
-                    if ((fp8_word_a & fp8_word_b) != Int32(-1)) | (
-                        span_end > row_seq_len_kv
+                for reg_idx in cutlass.range_constexpr(num_s_regs_per_thread(cfg)):
+                    token_idx = tile_offset_k + local_col_base + Int32(reg_idx)
+                    if invalid_sparse_token(
+                        token_idx,
+                        row_seq_len_kv,
+                        mask_routes,
+                        batch_idx,
+                        sparse=cfg.num_tokens_per_page == 1,
                     ):
-                        for reg_idx in cutlass.range_constexpr(
-                            num_s_regs_per_thread(cfg)
-                        ):
-                            token_idx = tile_offset_k + local_col_base + Int32(reg_idx)
-                            mask_word = fp8_word_b if reg_idx >= 32 else fp8_word_a
-                            if (token_idx >= row_seq_len_kv) | (
-                                ((mask_word >> Int32(reg_idx & 31)) & Int32(1))
-                                == Int32(0)
-                            ):
-                                s_vals[reg_idx] = neg_max_f32()
-                if cutlass.const_expr(not fp8_d576):
-                    for reg_idx in cutlass.range_constexpr(num_s_regs_per_thread(cfg)):
-                        token_idx = tile_offset_k + local_col_base + Int32(reg_idx)
-                        if invalid_sparse_token(
-                            token_idx,
-                            row_seq_len_kv,
-                            mask_routes,
-                            batch_idx,
-                            sparse=cfg.sparse_d512,
-                        ):
-                            s_vals[reg_idx] = neg_max_f32()
-                if cutlass.const_expr(cfg.sparse_d576 and not fp8_d576):
-                    from .smem_resources import SPARSE_MASK_SLOTS, SPARSE_MASK_WORDS
-
-                    half_cols = cfg.tile_size_kv // 2
-                    hi_half = local_col_base >= Int32(half_cols)
-                    mask_base = Int32(self.page_offsets_kv.sparse_mask_word_base) + (
-                        tile_idx % Int32(SPARSE_MASK_SLOTS)
-                    ) * Int32(SPARSE_MASK_WORDS)
-                    mask_w0 = Int32(self._sparse_mask_words[mask_base])
-                    mask_w1 = Int32(self._sparse_mask_words[mask_base + Int32(1)])
-                    mask_w2 = Int32(self._sparse_mask_words[mask_base + Int32(2)])
-                    mask_w3 = Int32(self._sparse_mask_words[mask_base + Int32(3)])
-                    # Word w covers tokens 32w .. 32w+31 (bit = token & 31).
-                    # ``local_col_base`` is 0 or 64, so this thread's 64 tokens
-                    # use words (local_col_base >> 5) + {0, 1}.
-                    word_a = mask_w2 if hi_half else mask_w0
-                    word_b = mask_w3 if hi_half else mask_w1
-                    for reg_idx in cutlass.range_constexpr(num_s_regs_per_thread(cfg)):
-                        mask_word = word_b if reg_idx >= 32 else word_a
-                        if ((mask_word >> Int32(reg_idx & 31)) & Int32(1)) == Int32(0):
-                            s_vals[reg_idx] = neg_max_f32()
+                        s_vals[reg_idx] = neg_max_f32()
             else:
                 local_idx_k0 = warp_idx * Int32(WARP_LANES) + (
                     lane_idx >> Int32(QUAD_LANE_SHIFT)

@@ -78,12 +78,6 @@ from .common import (
     MlaResource,
 )
 
-# D576 sparse per-key validity ring: ``SPARSE_MASK_SLOTS`` tiles x four
-# 32-bit words. Word ``w`` bit ``l`` is token ``32 * w + l`` of the 128-token
-# tile (a warp ballot over tokens ``32w .. 32w + 31``).
-SPARSE_MASK_SLOTS = 16
-SPARSE_MASK_WORDS = 4
-
 # =====================================================================
 # SmemQResource — Q SMEM buffer with TmaUmmaAsync pipeline
 # =====================================================================
@@ -450,24 +444,16 @@ class SmemPageOffsetsResource(MlaResource):
             consumer_mask=base.consumer_mask,
         )
 
-    @property
-    def sparse_mask_word_base(self) -> int:
-        """Int32 index of the D576 sparse validity ring inside this allocation."""
-        return self.cfg.page_offsets_stages * self.cfg.page_offsets_entries_per_stage
-
-    @property
-    def total_words(self) -> int:
-        words = self.sparse_mask_word_base
-        if self.cfg.sparse_d576:
-            words += SPARSE_MASK_SLOTS * SPARSE_MASK_WORDS
-        return words
-
     def get_smem_requirements(self):
-        """Return the SMEM allocation for cached page offsets (+ sparse validity ring)."""
+        """Return the SMEM allocation for cached page offsets."""
         if self._alloc is None:
             self._alloc = SmemAllocation(
                 name=f"{self.name}",
-                size_bytes=self.total_words * PAGE_OFFSET_BYTES,
+                size_bytes=(
+                    self.cfg.page_offsets_stages
+                    * self.cfg.page_offsets_entries_per_stage
+                    * PAGE_OFFSET_BYTES
+                ),
                 alignment=128,
             )
         return [self._alloc]
@@ -476,7 +462,7 @@ class SmemPageOffsetsResource(MlaResource):
     def _init_smem_state(self, stage_info: StageInfo) -> None:
         """Create the SMEM page-offset array view."""
         context = stage_info.context
-        count = self.total_words
+        count = self.cfg.page_offsets_stages * self.cfg.page_offsets_entries_per_stage
         self._smem_page_offsets = smem_array(
             context,
             self._alloc,
@@ -512,14 +498,9 @@ class SmemPageOffsetsResource(MlaResource):
             ),
         )
         if self.cfg.sparse_d576:
-            # The Gather4 loader reads its four row indices per lane straight
-            # from the SMEM stage; a 128-entry register cache would not fit.
-            # With uniform quads each loader warp caches only its own 32 rows.
-            cache_entries = (
-                self.cfg.sparse_cache_words
-                if self.cfg.cache_uniform_sparse_quads
-                else 1
-            )
+            # Each loader warp caches only its own 32 uniform rows; a 128-entry
+            # register cache would not fit.
+            cache_entries = self.cfg.sparse_cache_words
         return cutlass.Array(
             Int32,
             cache_entries,
@@ -532,14 +513,6 @@ class SmemPageOffsetsResource(MlaResource):
         offset = self.consumer_work_stage * Int32(
             self.cfg.page_offsets_entries_per_stage
         ) + Int32(page_fragment_idx)
-        return Int32(self._smem_page_offsets[offset])
-
-    @cute.jit
-    def token_row(self, entry_idx):
-        """Return one staged token row index (D576 sparse stages, dynamic entry)."""
-        offset = self.consumer_work_stage * Int32(
-            self.cfg.page_offsets_entries_per_stage
-        ) + Int32(entry_idx)
         return Int32(self._smem_page_offsets[offset])
 
     @cute.jit
@@ -1164,36 +1137,6 @@ class SmemKvResource(MlaResource):
             descriptor = self.raw_gather4_descs.iterator
             if cutlass.const_expr(is_rope_stage):
                 descriptor = descriptor + Int64(128)
-            if cutlass.const_expr((not is_v) and qk_stage_idx == 0):
-                # First K slice of the tile: warp w publishes the validity word
-                # of tokens 32w .. 32w+31 (bit = token & 31).  With one loader
-                # warp all four words come from that warp.
-                #
-                # The words live outside the TS resource graph.  The softmax
-                # reads slot ``tile % SPARSE_MASK_SLOTS`` only after this
-                # tile's gathers landed, QK(tile) ran on them and its S stage
-                # was committed, so the store precedes the read by at least a
-                # full gather + MMA round trip; the slot is reused only after
-                # the loader runs SPARSE_MASK_SLOTS tiles ahead, which the K/V
-                # ring (one tile of stages plus one in flight) rules out.
-                assert cfg.kv_stages // (cfg.v_head_dim_stages + 1) + 2 < (
-                    SPARSE_MASK_SLOTS
-                ), "D576 sparse validity ring too short for the K/V ring depth"
-                ring = self.page_offsets_kv
-                lane_idx = lane_idx_from_thread(cute.arch.thread_idx()[0])
-                mask_base = Int32(ring.sparse_mask_word_base) + (
-                    Int32(tile_idx) % Int32(SPARSE_MASK_SLOTS)
-                ) * Int32(SPARSE_MASK_WORDS)
-                words_per_warp = max(1, SPARSE_MASK_WORDS // num_load_warps)
-                for word_sub in cutlass.range_constexpr(words_per_warp):
-                    word_idx = warp_in_task * Int32(words_per_warp) + Int32(word_sub)
-                    # With more loader warps than mask words only the first
-                    # SPARSE_MASK_WORDS warps publish (one word each).
-                    if word_idx < Int32(SPARSE_MASK_WORDS):
-                        row = ring.token_row(word_idx * Int32(32) + lane_idx)
-                        bits = Int32(cute.arch.vote_ballot_sync(row >= Int32(0)))
-                        if lane_idx == Int32(0):
-                            ring._smem_page_offsets[mask_base + word_idx] = bits
             quads_per_warp = 32 // num_load_warps
             gather4_cached_warp(
                 stage_base.data_ptr(
