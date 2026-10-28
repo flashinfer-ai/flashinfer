@@ -6610,7 +6610,21 @@ inline int32_t Fc1LaunchGridN(const warp_decode::Shape& shape,
                               const WorkspaceView& ws) {
   if (schedule.route_layout == warp_decode::RouteLayout::kDirect) return ws.route_extent;
   const int32_t grid_m = Fc1GridM(shape, schedule);
-  return std::min(ws.route_tiles, std::max(1, ws.workfeed_ctas / grid_m));
+  // Fused route-pack FC1 pool by row: a smaller pool balances the FC1 workfeed rounds and leaves SMs to the
+  // programmatically launched FC2.
+  int32_t pool = ws.workfeed_ctas;
+  if (schedule.route_packer == warp_decode::RoutePacker::kFusedFc1) {
+    if (shape.hidden_size == 3072 && shape.intermediate_size == 384 && shape.num_experts == 256 &&
+        shape.local_num_experts == 256 && shape.top_k == 8 && shape.num_tokens == 3)
+      pool = std::min<int32_t>(80, pool);  // h3072_e256_i384_k8 T3
+    if (shape.hidden_size == 4096 && shape.intermediate_size == 512 && shape.num_experts == 512 &&
+        shape.local_num_experts == 512 && shape.top_k == 10 && shape.num_tokens == 2)
+      pool = std::min<int32_t>(96, pool);  // h4096_e512_i512_k10 T2
+    if (shape.hidden_size == 4096 && shape.intermediate_size == 512 && shape.num_experts == 512 &&
+        shape.local_num_experts == 512 && shape.top_k == 10 && shape.num_tokens == 4)
+      pool = std::min<int32_t>(128, pool);  // h4096_e512_i512_k10 T4
+  }
+  return std::min(ws.route_tiles, std::max(1, pool / grid_m));
 }
 inline int32_t Fc2LaunchGridN(const warp_decode::Shape& shape,
                               const warp_decode::Schedule& schedule,
