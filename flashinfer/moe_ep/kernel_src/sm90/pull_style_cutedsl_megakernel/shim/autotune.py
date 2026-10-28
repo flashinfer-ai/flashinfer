@@ -521,6 +521,13 @@ def autotune_hopper_mxfp4_mega_moe(
     )
 
     cfg = symm_buffer._frontend.config
+    if cfg.fc2_act_scale_k != 64:
+        # Tuning-cache entries are shared with 1x64 sessions and the
+        # candidate union includes M128 / ping-pong tactics.
+        raise ValueError(
+            "MXFP4 autotune supports only fc2_act_scale_k=64; pass an M256 "
+            "tactic explicitly for fc2_act_scale_k=128."
+        )
     require_hopper_mxfp4_fused_tuning_device()
     full_candidates = hopper_mxfp4_candidates(
         cfg.num_tokens_per_rank,

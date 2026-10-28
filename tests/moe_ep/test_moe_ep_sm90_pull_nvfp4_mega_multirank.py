@@ -144,6 +144,7 @@ def _instruction_reference(
     *,
     hidden_size=HIDDEN,
     intermediate_size=INTERMEDIATE,
+    fc2_scale_k=64,
 ):
     """Raw-weight oracle with SM90 FP8 instruction and epilogue semantics.
 
@@ -172,7 +173,7 @@ def _instruction_reference(
     )
     x = (hidden / input_scale).to(torch.float8_e4m3fn)
     order = _k64_order(hidden_size, hidden.device)
-    group_order = _k64_order(64, hidden.device)
+    group_order = _k64_order(fc2_scale_k, hidden.device)
     terms = torch.zeros(
         hidden.shape[0],
         WORLD_SIZE,
@@ -193,17 +194,17 @@ def _instruction_reference(
         up = fc1[:, intermediate_size:].clamp(-CLAMP, CLAMP)
         activated = _swiglu_pair_hw_match_cuda(gate, up)
         activated *= route_weights[token, slot, None]
-        grouped = activated.reshape(-1, intermediate_size // 64, 64)
+        grouped = activated.reshape(-1, intermediate_size // fc2_scale_k, fc2_scale_k)
         scale = (grouped.abs().amax(-1, keepdim=True) * (1.0 / FP8_MAX)).clamp_min(
             1e-30
         )
         quantized = (grouped * torch.reciprocal(scale)).to(torch.float8_e4m3fn)
         fc2 = torch.zeros(token.numel(), hidden_size, device=hidden.device)
-        for block in range(intermediate_size // 64):
+        for block in range(intermediate_size // fc2_scale_k):
             a = quantized[:, block].index_select(1, group_order)
-            b = w2[expert, :, block * 64 : (block + 1) * 64].index_select(
-                1, group_order
-            )
+            b = w2[
+                expert, :, block * fc2_scale_k : (block + 1) * fc2_scale_k
+            ].index_select(1, group_order)
             fc2 = fma_add(fc2, _instruction_mm(a, b.T), scale[:, block])
         terms[token, slot] = (fc2 * (8 * g2[expert])).to(torch.bfloat16)
     return terms.float().sum(1).reshape(ranks, tokens, width)
@@ -218,6 +219,7 @@ def _reference(
     hidden_size=HIDDEN,
     intermediate_size=INTERMEDIATE,
     instruction_exact=False,
+    fc2_scale_k=64,
 ):
     """Global FP32 GEMMs with the public FP8/BF16 data-format contract."""
     if instruction_exact:
@@ -228,6 +230,7 @@ def _reference(
             raw,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            fc2_scale_k=fc2_scale_k,
         )
     import torch
     import torch.nn.functional as functional
@@ -247,7 +250,7 @@ def _reference(
     )
     x = (hidden / input_scale).to(torch.float8_e4m3fn).float()
     order = _k64_order(hidden_size, hidden.device)
-    group_order = _k64_order(64, hidden.device)
+    group_order = _k64_order(fc2_scale_k, hidden.device)
     terms = torch.zeros(
         hidden.shape[0],
         WORLD_SIZE,
@@ -264,17 +267,17 @@ def _reference(
         gate = fc1[:, :intermediate_size].clamp(max=CLAMP)
         up = fc1[:, intermediate_size:].clamp(-CLAMP, CLAMP)
         activated = functional.silu(gate) * up * route_weights[token, slot, None]
-        grouped = activated.reshape(-1, intermediate_size // 64, 64)
+        grouped = activated.reshape(-1, intermediate_size // fc2_scale_k, fc2_scale_k)
         scale = (grouped.abs().amax(-1, keepdim=True) * (1.0 / FP8_MAX)).clamp_min(
             1e-30
         )
         quantized = (grouped * torch.reciprocal(scale)).to(torch.float8_e4m3fn).float()
         fc2 = torch.zeros(token.numel(), hidden_size, device=hidden.device)
-        for block in range(intermediate_size // 64):
+        for block in range(intermediate_size // fc2_scale_k):
             a = quantized[:, block].index_select(1, group_order)
-            b = w2[expert, :, block * 64 : (block + 1) * 64].index_select(
-                1, group_order
-            )
+            b = w2[
+                expert, :, block * fc2_scale_k : (block + 1) * fc2_scale_k
+            ].index_select(1, group_order)
             fc2 += (a @ b.T) * scale[:, block]
         # The public BF16-combine path stores a BF16 term for each routed slot.
         terms[token, slot] = (fc2 * (8 * g2[expert])).to(torch.bfloat16)
@@ -326,8 +329,14 @@ def _factory_conversion_knobs():
     }
 
 
-@pytest.mark.parametrize("conversion_layout", ["fallback", "factory"])
-def test_sm90_nvfp4_public_ep4_matches_raw_weight_oracles(conversion_layout):
+@pytest.mark.parametrize(
+    "conversion_layout,fc2_act_scale_k",
+    [("fallback", 64), ("factory", 64), ("factory", 128)],
+    ids=["fallback", "factory", "factory-h128"],
+)
+def test_sm90_nvfp4_public_ep4_matches_raw_weight_oracles(
+    conversion_layout, fc2_act_scale_k
+):
     import torch
 
     _require_sm90_ep4()
@@ -355,6 +364,7 @@ def test_sm90_nvfp4_public_ep4_matches_raw_weight_oracles(conversion_layout):
         top_k=WORLD_SIZE,
         gate_up_clamp=CLAMP,
         knobs=knobs,
+        fc2_act_scale_k=fc2_act_scale_k,
     )
     assert config.nvfp4_kperm == 64
     weights = _raw_weights(
@@ -436,6 +446,7 @@ def test_sm90_nvfp4_public_ep4_matches_raw_weight_oracles(conversion_layout):
                     raw,
                     hidden_size=hidden_size,
                     intermediate_size=intermediate_size,
+                    fc2_scale_k=fc2_act_scale_k,
                 )
                 instruction_expected = _reference(
                     *gathered,
@@ -443,6 +454,7 @@ def test_sm90_nvfp4_public_ep4_matches_raw_weight_oracles(conversion_layout):
                     hidden_size=hidden_size,
                     intermediate_size=intermediate_size,
                     instruction_exact=True,
+                    fc2_scale_k=fc2_act_scale_k,
                 )
             finally:
                 torch.backends.cuda.matmul.allow_tf32 = allow_tf32

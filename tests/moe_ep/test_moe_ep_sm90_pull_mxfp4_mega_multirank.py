@@ -17,8 +17,8 @@ The layer receives the production raw ABI: packed E2M1 payload bytes and K32
 E8M0 exponent planes in ``PrequantizedMoEWeights``.  The oracle is deliberately
 test-owned.  It uses the independent Humming preprocessing reference, forms
 the transient E4M3 operands mathematically, and implements global expert
-routing, SwiGLU, per-token/K64 FC2-input quantization, and top-k reduction in
-this file.  It never imports the donor or the vendored raw kernel packages.
+routing, SwiGLU, per-token/K64 (or K128, ``fc2_act_scale_k=128``) FC2-input
+quantization, and top-k reduction in this file.  It never imports the donor or the vendored raw kernel packages.
 
 Every source token selects one expert on every EP rank.  Consequently the
 2-rank, 4-rank, and 8-rank launches exercise local and peer pulls, every
@@ -306,7 +306,13 @@ def _swiglu_sm90_formula(gate, up):
 
 
 def _global_route_reference(
-    hidden, topk_ids, topk_weights, raw_global, *, require_all_experts=True
+    hidden,
+    topk_ids,
+    topk_weights,
+    raw_global,
+    *,
+    require_all_experts=True,
+    fc2_scale_k=K64,
 ):
     """Compute all ranks' fused output from raw operands and global routing."""
     import torch
@@ -354,7 +360,7 @@ def _global_route_reference(
         swiglu = _swiglu_sm90_formula(gate, up).reshape(-1, INTERMEDIATE)
         swiglu.mul_(topk_weights[source_rank, source_token, source_slot].unsqueeze(1))
 
-        grouped = swiglu.reshape(-1, INTERMEDIATE // K64, K64)
+        grouped = swiglu.reshape(-1, INTERMEDIATE // fc2_scale_k, fc2_scale_k)
         fc2_scale = (grouped.abs().amax(dim=2, keepdim=True) / E4M3_MAX).clamp_min(
             1.0e-30
         )
@@ -363,9 +369,9 @@ def _global_route_reference(
         fc2_accum = torch.zeros(
             (routed.shape[0], HIDDEN), dtype=torch.float32, device=hidden.device
         )
-        for group in range(INTERMEDIATE // K64):
-            begin = group * K64
-            end = begin + K64
+        for group in range(INTERMEDIATE // fc2_scale_k):
+            begin = group * fc2_scale_k
+            end = begin + fc2_scale_k
             partial = _fast_fp8_mm(
                 fc2_input[:, group].contiguous(),
                 fc2[target_rank, local_expert, :, begin:end].transpose(0, 1),
@@ -451,7 +457,9 @@ def _fused_tactic() -> dict:
     }
 
 
-def _run_raw_oracle(routing_pattern, *, tactic=None, capture_graph=False):
+def _run_raw_oracle(
+    routing_pattern, *, tactic=None, capture_graph=False, fc2_act_scale_k=K64
+):
     """Production raw ABI vs independent global math on 1, 2, 4, or 8 ranks."""
     import torch
     import torch.distributed as dist
@@ -496,6 +504,7 @@ def _run_raw_oracle(routing_pattern, *, tactic=None, capture_graph=False):
         intermediate_size=INTERMEDIATE,
         top_k=world_size,
         gate_up_clamp=GATE_UP_CLAMP,
+        fc2_act_scale_k=fc2_act_scale_k,
         **(geometry if tactic is None else {"knobs": tactic}),
     )
     registry_kernel = create_mega_kernel(config)
@@ -595,6 +604,7 @@ def _run_raw_oracle(routing_pattern, *, tactic=None, capture_graph=False):
                 weights_global[launch],
                 raw_global,
                 require_all_experts=routing_pattern == "cross_rank",
+                fc2_scale_k=fc2_act_scale_k,
             )
             for launch in range(2)
         ]
@@ -630,6 +640,62 @@ def test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse(
     routing_pattern,
 ):
     _run_raw_oracle(routing_pattern)
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize("tile_k", (128, 256))
+def test_moe_ep_sm90_pull_mxfp4_h128_independent_oracle(monkeypatch, tile_k):
+    """fc2_act_scale_k=128: one FC2-activation scale per M256 task tile."""
+    import sys
+
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "HIDDEN", 1024)
+    monkeypatch.setattr(module, "INTERMEDIATE", 768)
+    monkeypatch.setattr(module, "TOKENS_PER_RANK", 129)
+    tactic = dict(
+        _fused_tactic(),
+        mma_tiler_mnk=(256, 64, tile_k),
+        group_hint=330,
+        num_sched_stages=1,
+        load_balance_mode="atomic_counter",
+        fc1_store_offload=False,
+        fc1_early_done_publish=True,
+    )
+    _run_raw_oracle("cross_rank", tactic=tactic, fc2_act_scale_k=128)
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize(
+    "bucket,tile",
+    [
+        pytest.param(32, None, id="t32"),
+        pytest.param(256, None, id="t256"),
+        # Unfolded N32 K256: the FC2 mainloop waits between K64 groups.
+        pytest.param(256, (256, 32, 256), id="t256-k256"),
+        pytest.param(2048, None, id="t2048"),
+    ],
+)
+def test_moe_ep_sm90_pull_mxfp4_h128_default_tactics_independent_oracle(
+    monkeypatch, bucket, tile
+):
+    """fc2_act_scale_k=128 under the default tactics' dispatch, store-offload,
+    dedup and cluster choices (every default is M256 cooperative)."""
+    import sys
+
+    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
+        hopper_mxfp4_default_tactic,
+    )
+
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "HIDDEN", 1024)
+    monkeypatch.setattr(module, "INTERMEDIATE", 768)
+    monkeypatch.setattr(module, "TOKENS_PER_RANK", 33)
+    tactic = hopper_mxfp4_default_tactic(bucket)
+    if tile is not None:
+        tactic = dict(tactic, mma_tiler_mnk=tile)
+    _run_raw_oracle("cross_rank", tactic=tactic, fc2_act_scale_k=128)
 
 
 @pytest.mark.gpu_2
@@ -811,8 +877,16 @@ def test_moe_ep_sm90_pull_mxfp4_tail_pairs_independent_oracle(
         pytest.param(7168, 512, 4, 4, (256, 64, 256), True, id="n8-tail"),
     ],
 )
+@pytest.mark.parametrize("fc2_act_scale_k", (64, 128), ids=("h64", "h128"))
 def test_moe_ep_sm90_pull_mxfp4_tail_candidates_other_shapes(
-    monkeypatch, hidden, intermediate, local_experts, tokens, tile, tail_n8
+    monkeypatch,
+    hidden,
+    intermediate,
+    local_experts,
+    tokens,
+    tile,
+    tail_n8,
+    fc2_act_scale_k,
 ):
     """Execute normal tuning candidates beyond the original model/EP shape."""
     import sys
@@ -847,6 +921,7 @@ def test_moe_ep_sm90_pull_mxfp4_tail_candidates_other_shapes(
     _run_raw_oracle(
         "cross_rank",
         tactic=tactic,
+        fc2_act_scale_k=fc2_act_scale_k,
     )
 
 
@@ -864,8 +939,9 @@ def test_moe_ep_sm90_pull_mxfp4_tail_candidates_other_shapes(
         pytest.param((256, 16, 256), 768, (2, 1, 1), False, id="k256-padded-cta"),
     ],
 )
+@pytest.mark.parametrize("fc2_act_scale_k", (64, 128), ids=("h64", "h128"))
 def test_moe_ep_sm90_pull_mxfp4_offset_m_boundary(
-    monkeypatch, tile, hidden, cluster, tail_pairs
+    monkeypatch, tile, hidden, cluster, tail_pairs, fc2_act_scale_k
 ):
     """Partial/padded weight tiles match the independent full-output reference."""
     import sys
@@ -880,7 +956,7 @@ def test_moe_ep_sm90_pull_mxfp4_offset_m_boundary(
         cluster_shape_mnk=cluster,
         tail_split_pairs=tail_pairs,
     )
-    _run_raw_oracle("cross_rank", tactic=tactic)
+    _run_raw_oracle("cross_rank", tactic=tactic, fc2_act_scale_k=fc2_act_scale_k)
 
 
 @pytest.mark.gpu_4
@@ -1110,7 +1186,9 @@ def _tiny_quantize_reference(x, *, fc2=False):
     return payload, torch.where(tiny, scale, old_scale)
 
 
-def _tiny_full_output_reference(hidden, ids, scores, raw, *, require_all_experts=True):
+def _tiny_full_output_reference(
+    hidden, ids, scores, raw, *, require_all_experts=True, fc2_scale_k=K64
+):
     import torch
 
     from tests.moe_ep._sm90_fp8_wgmma_reference import fma_add
@@ -1135,13 +1213,14 @@ def _tiny_full_output_reference(hidden, ids, scores, raw, *, require_all_experts
         activation = _swiglu_sm90_formula(gate, up).reshape(-1, INTERMEDIATE)
         activation = activation * scores[rank, token, slot, None]
         activation, scales = _tiny_quantize_reference(
-            activation.reshape(-1, INTERMEDIATE // 64, 64), fc2=True
+            activation.reshape(-1, INTERMEDIATE // fc2_scale_k, fc2_scale_k), fc2=True
         )
         output = torch.zeros((routes.shape[0], HIDDEN), device=hidden.device)
-        for group in range(INTERMEDIATE // 64):
+        for group in range(INTERMEDIATE // fc2_scale_k):
+            begin = group * fc2_scale_k
             partial = _fast_fp8_mm(
                 activation[:, group].contiguous(),
-                w2[owner, local, :, group * 64 : (group + 1) * 64].T,
+                w2[owner, local, :, begin : begin + fc2_scale_k].T,
             )
             output = fma_add(output, partial, scales[:, group])
         terms[rank, token, slot] = (output * common2[owner, local]).bfloat16()

@@ -44,8 +44,6 @@ from common.megamoe_constants import (
     Fp8E8M0SfVecSize,
     Fp8Fc2ActivationScaleK,
     Fp8Fc2ActSfKTilesPerGroup,
-    Fp8Mxfp4HybridFc2ActivationScaleK,
-    fp8_fc2_act_sf_k_tiles_per_group,
     Fp8GateUpInterleave,
     Fp8WeightScaleBlockK,
     Fp8WeightScaleBlockN,
@@ -190,6 +188,12 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 f"got {fp8_scale_mode!r}."
             )
         self.fp8_scale_mode = fp8_scale_mode
+        if fp8_scale_mode == "blockwise" and mma_tiler_mnk[2] != Fp8BlockScaleK:
+            # x and h are both 1x128 blocks, promoted once per K tile.
+            raise ValueError(
+                f"blockwise FP8 requires mma_tiler K={Fp8BlockScaleK}; "
+                f"got mma_tiler_mnk={mma_tiler_mnk}."
+            )
         if fp8_accum_mode not in ("1xacc", "2xacc"):
             raise ValueError(
                 "fp8_accum_mode must be '1xacc' or '2xacc', "
@@ -614,6 +618,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             epi_flag_batch=self.epi_flag_batch,
             glu_clamp=self.gate_up_clamp,
             fp8_scale_mode=self.fp8_scale_mode,
+            fc2_activation_scale_k=self._fc2_activation_scale_k(),
             fp8_output_rcp_limit=self.fp8_output_rcp_limit,
             pingpong=self.pingpong,
             enable_mxfp4_safe_quantization=(
@@ -1153,7 +1158,8 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             )
         elif cutlass.const_expr(self.fp8_scale_mode == "mxfp4_hybrid"):
             # FC1 carries one per-token scale replicated to a 16-byte row.
-            # FC2 carries one FP32 scale per token and K64 activation group.
+            # FC2 carries one FP32 scale per token and h scale block (K64, or
+            # K128 with mxfp4_fc2_act_scale_k=128).
             activation_sf_gemm = cute.make_tensor(
                 activation_sf.iterator,
                 cute.make_layout(
@@ -1170,7 +1176,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 cute.make_layout(
                     (
                         fc1_output_sf.shape[0],
-                        intermediate_downproj // Fp8Mxfp4HybridFc2ActivationScaleK,
+                        intermediate_downproj // self._fc2_activation_scale_k(),
                         1,
                     ),
                     stride=(
@@ -1648,12 +1654,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 work_tile_info.tile_n_idx,
                 sf_token_base // cutlass.Int32(self.token_tile_size),
                 k_tile_cnt,
-                k_tiles_per_scale_group=(
-                    1
-                    if self.fp8_scale_mode == "mxfp4_hybrid"
-                    and self.mma_tiler[2] == 256
-                    else fp8_fc2_act_sf_k_tiles_per_group(self.fp8_scale_mode)
-                ),
+                k_tiles_per_scale_group=self._fc2_act_sf_k_tiles_per_group(),
                 tma_cta_coord=tma_cta_coord,
                 tma_cta_layout=tma_cta_layout,
                 mcast_mask=mcast_mask,

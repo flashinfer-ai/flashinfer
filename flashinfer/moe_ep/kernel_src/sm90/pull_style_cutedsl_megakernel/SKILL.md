@@ -61,14 +61,15 @@ Interactions resolved by hand:
 
 - The Hopper MXFP4 / NVFP4 x FP8 backends (`fp8_scale_mode="mxfp4_hybrid"`)
   share the swap-AB epilogue, the FC2 scale TMA path and the base mainloop
-  with FP8 blockwise and keep the 1x64 h block, so shared code picks the
-  block with `common.megamoe_constants.fp8_fc2_activation_scale_k(mode)` /
-  `fp8_fc2_act_sf_k_tiles_per_group(mode)` instead of the bare
-  `Fp8Fc2ActivationScaleK` (128, FP8 blockwise only).  On the shim side the
-  MXFP4 / NVFP4 configs run the FP8 validation through a blockwise proxy
-  (`_HybridBlockwiseProxyConfig`) whose `_fc2_activation_scale_k` stays 64,
-  so the FP8 rule "tile N / 2 (M / 2 swap-AB) is a multiple of the h block"
-  admits their M=128 tiles.
+  with FP8 blockwise.  Their h block defaults to 1x64, so shared code asks
+  the kernel (`_fc2_activation_scale_k()` /
+  `_fc2_act_sf_k_tiles_per_group()`, overridden by the MXFP4 kernel) instead
+  of using the bare `Fp8Fc2ActivationScaleK` (128, FP8 blockwise only).  On
+  the shim side the MXFP4 / NVFP4 configs run the FP8 validation through a
+  blockwise proxy (`_HybridBlockwiseProxyConfig`, h block 64), so the FP8
+  rule "tile N / 2 (M / 2 swap-AB) is a multiple of the h block" admits
+  their M=128 tiles; with `fc2_act_scale_k=128` they validate against the
+  plain FP8 blockwise rules (M=256 cooperative only).
 - The same backends build on the top-k dedup / grouped combine of the FP8
   mega kernel, so that code stays; the internode NCCL GIN path and
   `deterministic` reject `dedup_dispatch`, `grouped_token_back` and the
@@ -181,6 +182,18 @@ not picked them up):
   builder shares its byte/row parameters between formats. Reapply these hooks
   when updating the drop, and
   compare complete MX and NV cubins before accepting a refactor.
+- Opt-in 1x128 hybrid h scales (2026-10-27; `fc2_act_scale_k=128` on the
+  MXFP4 / NVFP4 configs, kernel kwarg `mxfp4_fc2_act_scale_k`, default 64):
+  the swap-AB FC1 epilogue folds the other warpgroup's amax like FP8
+  blockwise and keeps the hybrid quantization reciprocal in a fifth amax
+  slot (slot 0 is still being read by the other warpgroup); the MXFP4 FC2
+  mainloop sums both K64 halves of each K128 before one promotion, and
+  overlaps the second half's conversion with the first half's WGMMA only
+  where registers allow (`_fc2_h128_overlap_conversion`: folded layout or
+  N16; the unfolded 128-register layout spilled).  FP8 blockwise kernels
+  now reject mma_tiler K != 128, which they never supported.  M=256
+  cooperative tiles only.  Measurements in [TUNING.md](TUNING.md).  Not in
+  the drop tree.
 
 ## Layout
 

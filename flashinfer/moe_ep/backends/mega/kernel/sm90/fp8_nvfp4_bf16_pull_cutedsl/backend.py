@@ -59,7 +59,10 @@ class Sm90PullNvfp4MegaKernelBackend(Sm90PullMxfp4MegaKernelBackend):
         }
 
     def _format_config_kwargs(self) -> dict[str, Any]:
-        return self._knob_resolver_kwargs()
+        return {
+            **self._knob_resolver_kwargs(),
+            "fc2_act_scale_k": self._kernel_config.fc2_act_scale_k,
+        }
 
     def _validate_transformed_kwargs(self) -> dict[str, Any]:
         return {"nvfp4_kperm": self._kernel_config.nvfp4_kperm}

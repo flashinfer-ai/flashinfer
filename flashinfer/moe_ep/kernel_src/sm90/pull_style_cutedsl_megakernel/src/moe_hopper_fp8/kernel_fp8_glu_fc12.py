@@ -37,12 +37,12 @@ from common.megamoe_constants import (
     Fp8DispatchScaleAtomK,
     Fp8E4M3RcpLimit,
     Fp8E5M2RcpLimit,
+    Fp8ActSfPlanes,
     Fp8E8M0SfVecSize,
     Fp8Fc2ActivationScaleK,
     Fp8Fc2ActSfKTilesPerGroup,
     Fp8Fc2ActSfPlanesPerKTile,
     fp8_fc2_activation_scale_k,
-    fp8_fc2_act_sf_k_tiles_per_group,
     Fp8GateUpInterleave,
     Fp8WeightScaleBlockK,
     Fp8WeightScaleBlockN,
@@ -223,6 +223,12 @@ class Sm90SwigluFp8Fc12Kernel:
                 f"got {fp8_scale_mode!r}."
             )
         self.fp8_scale_mode = fp8_scale_mode
+        if fp8_scale_mode == "blockwise" and mma_tiler_mnk[2] != Fp8BlockScaleK:
+            # x and h are both 1x128 blocks, promoted once per K tile.
+            raise ValueError(
+                f"blockwise FP8 requires mma_tiler K={Fp8BlockScaleK}; "
+                f"got mma_tiler_mnk={mma_tiler_mnk}."
+            )
         if fp8_accum_mode not in ("1xacc", "2xacc"):
             raise ValueError(
                 "fp8_accum_mode must be '1xacc' or '2xacc', "
@@ -639,6 +645,15 @@ class Sm90SwigluFp8Fc12Kernel:
         this to plug in its own epilogue class with the same geometry."""
         return Fp8GluEpilogue(**epi_common)
 
+    def _fc2_activation_scale_k(self) -> int:
+        """FC1-output channels per FC2-activation (h) scale (blockwise / hybrid)."""
+        return fp8_fc2_activation_scale_k(self.fp8_scale_mode)
+
+    def _fc2_act_sf_k_tiles_per_group(self) -> int:
+        """K tiles whose h scales one four-plane activation-scale TMA box carries."""
+        planes_per_k_tile = self.mma_tiler[2] // self._fc2_activation_scale_k()
+        return Fp8ActSfPlanes // planes_per_k_tile
+
     def _activation_sf_bytes_per_stage(self) -> int:
         if self.fp8_scale_mode not in ("blockwise", "mxfp4_hybrid"):
             return 0
@@ -941,7 +956,7 @@ class Sm90SwigluFp8Fc12Kernel:
         )
 
         if self.fp8_scale_mode in ("blockwise", "mxfp4_hybrid"):
-            h_scale_k = fp8_fc2_activation_scale_k(self.fp8_scale_mode)
+            h_scale_k = self._fc2_activation_scale_k()
             if intermediate_downproj % h_scale_k != 0:
                 raise ValueError(
                     "blockwise/hybrid FP8 requires intermediate_downproj divisible by "
@@ -1367,7 +1382,7 @@ class Sm90SwigluFp8Fc12Kernel:
         # below is the 1x64 form (two scale planes, two promotions per tile),
         # still used by the MXFP4-hybrid h scales.
         if cutlass.const_expr(
-            fp8_fc2_activation_scale_k(self.fp8_scale_mode) == Fp8BlockScaleK
+            self._fc2_activation_scale_k() == Fp8BlockScaleK
         ):
             full_k_path = k_tile_cnt > cutlass.Int32(-1)  # every phase
         else:
@@ -2563,7 +2578,7 @@ class Sm90SwigluFp8Fc12Kernel:
                     (
                         fc1_output_sf.shape[0],
                         intermediate_downproj
-                        // fp8_fc2_activation_scale_k(self.fp8_scale_mode),
+                        // self._fc2_activation_scale_k(),
                         1,
                     ),
                     stride=(fc1_output_sf.stride[0], fc1_output_sf.stride[1], 0),
@@ -3400,8 +3415,8 @@ class Sm90SwigluFp8Fc12Kernel:
                                 sf_token_base
                                 // cutlass.Int32(self.token_tile_size),
                                 k_tile_cnt,
-                                k_tiles_per_scale_group=fp8_fc2_act_sf_k_tiles_per_group(
-                                    self.fp8_scale_mode
+                                k_tiles_per_scale_group=(
+                                    self._fc2_act_sf_k_tiles_per_group()
                                 ),
                                 tma_cta_coord=a_cta_coord,
                                 tma_cta_layout=a_cta_layout,

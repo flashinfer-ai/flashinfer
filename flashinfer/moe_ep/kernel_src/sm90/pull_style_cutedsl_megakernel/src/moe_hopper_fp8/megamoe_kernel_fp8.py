@@ -92,7 +92,6 @@ from common.megamoe_constants import (
     Fp8DispatchScaleAtomK,
     Fp8E8M0SfVecSize,
     Fp8Fc2ActivationScaleK,
-    fp8_fc2_activation_scale_k,
 )
 
 # Reuse the region-layout helpers + module constants from the NVFP4 mega kernel
@@ -358,7 +357,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         self.intermediate_gateup = static_expert_shape[1]
         self.intermediate_downproj = self.intermediate_gateup // 2
         logical_fc2_activation_sf_cols = (
-            self.intermediate_downproj // fp8_fc2_activation_scale_k(fp8_scale_mode)
+            self.intermediate_downproj // self._fc2_activation_scale_k()
         )
         self.fc2_activation_sf_storage_cols = (
             _round_up(logical_fc2_activation_sf_cols, 4)
@@ -1666,7 +1665,7 @@ class Sm90MegaMoESwapABMxfp4Fp8Kernel(
 
     def __init__(
         self, *args, mxfp4_fc2_tail_n8=False,
-        mxfp4_fc1_ready_mode="tile", **kwargs,
+        mxfp4_fc1_ready_mode="tile", mxfp4_fc2_act_scale_k=64, **kwargs,
     ):
         from moe_hopper_fp8.mxfp4_policy import validate_mxfp4_optional_optimizations
 
@@ -1674,6 +1673,11 @@ class Sm90MegaMoESwapABMxfp4Fp8Kernel(
             fc2_tail_n8=mxfp4_fc2_tail_n8,
             fc1_ready_mode=mxfp4_fc1_ready_mode,
         )
+        if mxfp4_fc2_act_scale_k not in (64, 128):
+            raise ValueError(
+                "mxfp4_fc2_act_scale_k must be 64 or 128, got "
+                f"{mxfp4_fc2_act_scale_k!r}."
+            )
         # Keep the qualified MXFP4 dispatch storage and output ABI when the
         # shared FP8 constructor gains new optional layouts. The compact pull
         # buffer (one dispatch slot per active warp) is opt-in.
@@ -1682,6 +1686,9 @@ class Sm90MegaMoESwapABMxfp4Fp8Kernel(
             raise ValueError("MXFP4 currently requires generate_c=False")
         self._mxfp4_fc2_tail_n8 = mxfp4_fc2_tail_n8
         self._mxfp4_fc1_ready_mode = mxfp4_fc1_ready_mode
+        # FC1-output channels per FC2-activation scale: 64 (default) or 128
+        # (one promotion per K128 in FC2; needs M256 cooperative tiles).
+        self._mxfp4_fc2_act_scale_k = mxfp4_fc2_act_scale_k
         # The workspace layout is built by the Mega constructor. No device
         # storage is allocated here; final effective-policy validation below
         # still precedes allocation, including for raw-kernel callers.

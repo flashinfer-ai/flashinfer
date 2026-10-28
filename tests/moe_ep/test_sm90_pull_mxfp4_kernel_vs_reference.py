@@ -83,11 +83,9 @@ def _make_raw_leg(*, experts: int, rows: int, logical_k: int, salt: int):
     return _pack_e2m1_codes(codes), exponent.contiguous()
 
 
-def _single_rank_problem():
+def _single_rank_problem(*, hidden=128, intermediate=128):
     import torch
 
-    hidden = 128
-    intermediate = 128
     experts = 2
     topk = 2
     num_tokens = 13
@@ -259,13 +257,13 @@ def _decode_processed_leg(transformed):
     return encoded.view(torch.float8_e4m3fn), residual_x64.to(torch.float32)
 
 
-def _quantize_fc2_k64_reference(value):
+def _quantize_fc2_k64_reference(value, scale_k=FC2_SCALE_K):
     """Match the epilogue's one-reciprocal-then-multiply FP8 handoff."""
     import torch
 
     rows, columns = value.shape
-    assert columns % FC2_SCALE_K == 0
-    blocks = value.to(torch.float32).reshape(rows, columns // FC2_SCALE_K, 64)
+    assert columns % scale_k == 0
+    blocks = value.to(torch.float32).reshape(rows, columns // scale_k, scale_k)
     scale = (blocks.abs().amax(dim=-1) / E4M3_MAX).clamp_min(1.0e-30)
     reciprocal = torch.reciprocal(scale)
     quantized = (
@@ -276,24 +274,26 @@ def _quantize_fc2_k64_reference(value):
     return quantized, scale
 
 
-def _hybrid_wgmma_reference(activation, activation_scale, weight, residual_x64):
-    """FP8 WGMMA with independently promoted K64 activation-scale groups."""
+def _hybrid_wgmma_reference(
+    activation, activation_scale, weight, residual_x64, scale_k=FC2_SCALE_K
+):
+    """FP8 WGMMA with independently promoted activation-scale groups."""
     import torch
 
     rows, logical_k = activation.shape
     assert weight.shape[1] == logical_k
-    assert logical_k % FC2_SCALE_K == 0
-    assert activation_scale.shape == (rows, logical_k // FC2_SCALE_K)
+    assert logical_k % scale_k == 0
+    assert activation_scale.shape == (rows, logical_k // scale_k)
     accumulator = torch.zeros(
         (rows, weight.shape[0]), dtype=torch.float32, device=activation.device
     )
-    for k64 in range(logical_k // FC2_SCALE_K):
-        columns = slice(k64 * FC2_SCALE_K, (k64 + 1) * FC2_SCALE_K)
+    for group in range(logical_k // scale_k):
+        columns = slice(group * scale_k, (group + 1) * scale_k)
         partial = (
             activation[:, columns].to(torch.float32)
             @ weight[:, columns].to(torch.float32).T
         )
-        accumulator.add_(partial * activation_scale[:, k64].unsqueeze(1))
+        accumulator.add_(partial * activation_scale[:, group].unsqueeze(1))
     return accumulator * residual_x64
 
 
@@ -309,7 +309,9 @@ def _swiglu_sm90_reference(gate, up):
     return (up * gate) * sigmoid
 
 
-def _reference_reduced(*, problem, symm_buffer, transformed_l1, transformed_l2):
+def _reference_reduced(
+    *, problem, symm_buffer, transformed_l1, transformed_l2, fc2_scale_k=FC2_SCALE_K
+):
     """Independent fused FC1/top-k/FC2/combine reference."""
     import torch
 
@@ -360,21 +362,48 @@ def _reference_reduced(*, problem, symm_buffer, transformed_l1, transformed_l2):
             swiglu.mul_(
                 symm_buffer.topk_weights[tokens, slots].to(torch.float32).unsqueeze(1)
             )
-            fc2_activation, fc2_scale = _quantize_fc2_k64_reference(swiglu)
+            fc2_activation, fc2_scale = _quantize_fc2_k64_reference(swiglu, fc2_scale_k)
             all_fc2_scales.append(fc2_scale)
             fc2 = _hybrid_wgmma_reference(
                 fc2_activation,
                 fc2_scale,
                 fc2_weight[expert],
                 fc2_residual[expert],
+                fc2_scale_k,
             )
             terms[tokens, slots] = fc2.to(torch.bfloat16)
     finally:
         torch.backends.cuda.matmul.allow_tf32 = old_allow_tf32
 
     scales = torch.cat(all_fc2_scales, dim=0)
-    assert scales.shape[1] == intermediate // FC2_SCALE_K
+    assert scales.shape[1] == intermediate // fc2_scale_k
     return terms.to(torch.float32).sum(dim=1), scales
+
+
+def _assert_kernel_h_scales(symm_buffer, reference_scales, *, scale_k, intermediate):
+    """The compiled kernel uses the requested h block and stores the oracle's
+    per-route h scales.  Pool rows are expert-major in dispatch arrival order,
+    so rows are matched as a multiset."""
+    import torch
+
+    mega = symm_buffer._frontend._mega
+    assert mega is not None
+    assert mega.kernel._fc2_activation_scale_k() == scale_k
+    offset, _, _, shape = mega.kernel.region_view("fc1_output_sf")
+    columns = intermediate // scale_k
+    assert shape[1] == -(-columns // 4) * 4
+    count = shape[0] * shape[1]
+    stored = (
+        mega.local_workspace.view(torch.uint8)[offset : offset + 4 * count]
+        .view(torch.float32)
+        .reshape(shape)[:, :columns]
+    )
+    # The FC1 WGMMA accumulates in a different order than the oracle, so the
+    # amax-derived scales agree closely but not bitwise.
+    matched = torch.isclose(
+        stored.unsqueeze(0), reference_scales.unsqueeze(1), rtol=1.0e-2, atol=0.0
+    ).all(dim=-1)
+    assert matched.any(dim=1).all(), "an oracle h-scale row is missing from the pool"
 
 
 @pytest.mark.arch_hopper
@@ -383,6 +412,35 @@ def test_sm90_mxfp4_kernel_matches_independent_reference(
     monkeypatch, active_dispatch_warps
 ) -> None:
     """Raw MXFP4 ABI -> production preprocess -> fused public launch."""
+    _run_independent_reference(monkeypatch, active_dispatch_warps=active_dispatch_warps)
+
+
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize("mma_tiler_mnk", [(256, 32, 128), (256, 32, 256)])
+def test_sm90_mxfp4_kernel_h128_matches_independent_reference(
+    monkeypatch, mma_tiler_mnk
+) -> None:
+    """fc2_act_scale_k=128: one h scale per M256 task tile, promoted once per
+    K128 in FC2 (K128 and K256 mainloops, several K tiles per scale box)."""
+    _run_independent_reference(
+        monkeypatch,
+        active_dispatch_warps=1,
+        mma_tiler_mnk=mma_tiler_mnk,
+        fc2_act_scale_k=128,
+        hidden=512,
+        intermediate=512,
+    )
+
+
+def _run_independent_reference(
+    monkeypatch,
+    *,
+    active_dispatch_warps,
+    mma_tiler_mnk=MMA_TILER_MNK,
+    fc2_act_scale_k=FC2_SCALE_K,
+    hidden=128,
+    intermediate=128,
+) -> None:
     _require_hopper()
 
     import torch
@@ -399,7 +457,7 @@ def test_sm90_mxfp4_kernel_matches_independent_reference(
     # collective tests in the process.
     monkeypatch.setenv("MEGA_NO_DIST", "1")
     pkg = _sm90_tree()
-    problem = _single_rank_problem()
+    problem = _single_rank_problem(hidden=hidden, intermediate=intermediate)
 
     raw = PrequantizedMoEWeights(
         w13=problem["w13"],
@@ -423,10 +481,11 @@ def test_sm90_mxfp4_kernel_matches_independent_reference(
         1,
         swap_ab=True,
         pingpong=False,
-        mma_tiler_mnk=MMA_TILER_MNK,
+        mma_tiler_mnk=mma_tiler_mnk,
         active_dispatch_warps=active_dispatch_warps,
         cluster_shape_mnk=(1, 1, 1),
         gate_up_clamp=problem["gate_up_clamp"],
+        fc2_act_scale_k=fc2_act_scale_k,
     )
     try:
         stage_mega_moe_inputs(
@@ -446,6 +505,7 @@ def test_sm90_mxfp4_kernel_matches_independent_reference(
             symm_buffer=symm_buffer,
             transformed_l1=transformed_l1,
             transformed_l2=transformed_l2,
+            fc2_scale_k=fc2_act_scale_k,
         )
         assert torch.isfinite(fc2_scales).all()
         assert (fc2_scales > 0).all()
@@ -461,6 +521,12 @@ def test_sm90_mxfp4_kernel_matches_independent_reference(
             num_tokens=n,
             gate_up_clamp=problem["gate_up_clamp"],
             sync=True,
+        )
+        _assert_kernel_h_scales(
+            symm_buffer,
+            fc2_scales,
+            scale_k=fc2_act_scale_k,
+            intermediate=problem["intermediate"],
         )
 
         # Repeated launches and the output-view API must agree numerically.

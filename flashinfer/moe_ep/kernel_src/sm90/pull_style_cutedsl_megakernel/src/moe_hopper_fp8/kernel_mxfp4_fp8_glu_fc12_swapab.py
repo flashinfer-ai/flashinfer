@@ -38,6 +38,7 @@ from moe_hopper_fp8.mxfp4_cutedsl import (
 )
 from moe_nvfp4_swapab.fc1_fc2_fuse_sched import BlockPhase
 from moe_hopper_fp8.mxfp4_policy import resolve_mxfp4_optimizations
+from common.megamoe_constants import Fp8Mxfp4HybridFc2ActivationScaleK
 
 
 @dsl_user_op
@@ -207,6 +208,27 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
 
     def _uses_weight_aux_pipeline(self) -> bool:
         return True
+
+    def _fc2_activation_scale_k(self) -> int:
+        # Hybrid h scales default to K64 blocks; the mega kernel's
+        # mxfp4_fc2_act_scale_k=128 forms one block per M256 task tile.
+        if self.fp8_scale_mode != "mxfp4_hybrid":
+            return super()._fc2_activation_scale_k()
+        return getattr(
+            self, "_mxfp4_fc2_act_scale_k", Fp8Mxfp4HybridFc2ActivationScaleK
+        )
+
+    def _fc2_h128_overlap_conversion(self) -> bool:
+        # With one h scale per K128, the second K64 group's FP4 conversion
+        # can overlap the first group's RS WGMMA, which keeps both A
+        # fragments live.  The unfolded layout runs at 128 registers
+        # (setmaxnreg is not applied) and then spills from N=32 up (ptxas
+        # -v: 28 B at K128, 52 B at K256), so it waits for the first group
+        # instead; the folded layout and N16 tiles do not spill.
+        return (
+            bool(getattr(self, "fold_producer_warps", False))
+            or self.wgmma_tile_n <= 16
+        )
 
     def _weight_aux_smem_dtype(self) -> Type[cutlass.Numeric]:
         return cutlass.Int8
@@ -1363,56 +1385,122 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                             copy_view[(None, None, packed_k64)],
                         )
 
-                    for local_k64_group in cutlass.range_constexpr(2):
-                        local_k_block_begin = local_k64_group * 2
-                        global_k64_group = k128_half * 2 + local_k64_group
-                        global_k_block_begin = global_k64_group * 2
-                        scale_plane = cutlass.Int32(global_k64_group)
-                        self._convert_weight_group(
-                            packed_registers,
-                            fp8_fragment_a,
-                            partitioned_offsets,
-                            local_k_block_begin,
-                            global_k_block_begin,
-                            2,
-                            stage_idx,
-                            smem_weight_sf,
-                        )
-
+                    if cutlass.const_expr(
+                        self._fc2_activation_scale_k() == MXFP4_K_TILE
+                    ):
+                        # One h scale per K128 half: both K64 groups feed one
+                        # sum; where registers allow, the second conversion
+                        # overlaps the first group's WGMMA.  Two planes per
+                        # K256 tile.
                         tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
-                        warpgroup.fence()
-                        for k_offset in cutlass.range_constexpr(2):
-                            cute.gemm(
-                                tiled_mma,
-                                accum_temp,
-                                fp8_fragment_a[
-                                    (
-                                        None,
-                                        None,
-                                        local_k_block_begin + k_offset,
-                                    )
-                                ],
-                                tCrB[
-                                    (
-                                        None,
-                                        None,
-                                        global_k_block_begin + k_offset,
-                                        stage_idx,
-                                    )
-                                ],
-                                accum_temp,
+                        for local_k64_group in cutlass.range_constexpr(2):
+                            local_k_block_begin = local_k64_group * 2
+                            global_k64_group = k128_half * 2 + local_k64_group
+                            global_k_block_begin = global_k64_group * 2
+                            self._convert_weight_group(
+                                packed_registers,
+                                fp8_fragment_a,
+                                partitioned_offsets,
+                                local_k_block_begin,
+                                global_k_block_begin,
+                                2,
+                                stage_idx,
+                                smem_weight_sf,
                             )
-                            tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
-                        warpgroup.commit_group()
+                            warpgroup.fence()
+                            for k_offset in cutlass.range_constexpr(2):
+                                cute.gemm(
+                                    tiled_mma,
+                                    accum_temp,
+                                    fp8_fragment_a[
+                                        (
+                                            None,
+                                            None,
+                                            local_k_block_begin + k_offset,
+                                        )
+                                    ],
+                                    tCrB[
+                                        (
+                                            None,
+                                            None,
+                                            global_k_block_begin + k_offset,
+                                            stage_idx,
+                                        )
+                                    ],
+                                    accum_temp,
+                                )
+                                tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
+                            warpgroup.commit_group()
+                            if cutlass.const_expr(
+                                local_k64_group == 0
+                                and not self._fc2_h128_overlap_conversion()
+                            ):
+                                warpgroup.wait_group(0)
                         warpgroup.wait_group(0)
                         self._promote_accum_temp_blockwise_streaming(
                             accumulators=accumulators,
                             accum_temp=accum_temp,
                             smem_activation_sf=smem_activation_sf,
                             stage_idx=stage_idx,
-                            scale_plane=scale_plane,
+                            scale_plane=(
+                                k_tile
+                                % cutlass.Int32(self._fc2_act_sf_k_tiles_per_group())
+                            )
+                            * cutlass.Int32(2)
+                            + cutlass.Int32(k128_half),
                             tidx=tidx,
                         )
+                    else:
+                        for local_k64_group in cutlass.range_constexpr(2):
+                            local_k_block_begin = local_k64_group * 2
+                            global_k64_group = k128_half * 2 + local_k64_group
+                            global_k_block_begin = global_k64_group * 2
+                            scale_plane = cutlass.Int32(global_k64_group)
+                            self._convert_weight_group(
+                                packed_registers,
+                                fp8_fragment_a,
+                                partitioned_offsets,
+                                local_k_block_begin,
+                                global_k_block_begin,
+                                2,
+                                stage_idx,
+                                smem_weight_sf,
+                            )
+
+                            tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
+                            warpgroup.fence()
+                            for k_offset in cutlass.range_constexpr(2):
+                                cute.gemm(
+                                    tiled_mma,
+                                    accum_temp,
+                                    fp8_fragment_a[
+                                        (
+                                            None,
+                                            None,
+                                            local_k_block_begin + k_offset,
+                                        )
+                                    ],
+                                    tCrB[
+                                        (
+                                            None,
+                                            None,
+                                            global_k_block_begin + k_offset,
+                                            stage_idx,
+                                        )
+                                    ],
+                                    accum_temp,
+                                )
+                                tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
+                            warpgroup.commit_group()
+                            warpgroup.wait_group(0)
+                            self._promote_accum_temp_blockwise_streaming(
+                                accumulators=accumulators,
+                                accum_temp=accum_temp,
+                                smem_activation_sf=smem_activation_sf,
+                                stage_idx=stage_idx,
+                                scale_plane=scale_plane,
+                                tidx=tidx,
+                            )
 
                 weight_sf_pipeline.consumer_release(ab_consumer_state)
                 ab_pipeline.consumer_release(ab_consumer_state)
@@ -1492,66 +1580,123 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
                     smem_weight_sf,
                 )
 
-                scale_plane_base = (
-                    k_tile % cutlass.Int32(2)
-                ) * cutlass.Int32(2)
-                tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
-                warpgroup.fence()
-                for k_block in cutlass.range_constexpr(half_k_blocks):
-                    cute.gemm(
-                        tiled_mma,
-                        accum_temp,
-                        fp8_fragment_a[(None, None, k_block)],
-                        tCrB[(None, None, k_block, stage_idx)],
-                        accum_temp,
-                    )
-                    tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
-                warpgroup.commit_group()
-                warpgroup.wait_group(0)
-                self._promote_accum_temp_blockwise_streaming(
-                    accumulators=accumulators,
-                    accum_temp=accum_temp,
-                    smem_activation_sf=smem_activation_sf,
-                    stage_idx=stage_idx,
-                    scale_plane=scale_plane_base,
-                    tidx=tidx,
-                )
-
-                self._convert_weight_group(
-                    packed_registers,
-                    fp8_fragment_a,
-                    partitioned_offsets,
-                    half_k_blocks,
-                    half_k_blocks,
-                    num_k_blocks - half_k_blocks,
-                    stage_idx,
-                    smem_weight_sf,
-                )
-                tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
-                warpgroup.fence()
-                for k_block in cutlass.range_constexpr(
-                    half_k_blocks, num_k_blocks
+                if cutlass.const_expr(
+                    self._fc2_activation_scale_k() == MXFP4_K_TILE
                 ):
-                    cute.gemm(
-                        tiled_mma,
-                        accum_temp,
-                        fp8_fragment_a[(None, None, k_block)],
-                        tCrB[(None, None, k_block, stage_idx)],
-                        accum_temp,
+                    # One h scale per K128 tile: both K64 halves accumulate
+                    # into one sum (one promotion); where registers allow,
+                    # converting the second half overlaps the first half's
+                    # WGMMA.
+                    tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
+                    warpgroup.fence()
+                    for k_block in cutlass.range_constexpr(half_k_blocks):
+                        cute.gemm(
+                            tiled_mma,
+                            accum_temp,
+                            fp8_fragment_a[(None, None, k_block)],
+                            tCrB[(None, None, k_block, stage_idx)],
+                            accum_temp,
+                        )
+                        tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
+                    warpgroup.commit_group()
+                    if cutlass.const_expr(
+                        not self._fc2_h128_overlap_conversion()
+                    ):
+                        warpgroup.wait_group(0)
+                    self._convert_weight_group(
+                        packed_registers,
+                        fp8_fragment_a,
+                        partitioned_offsets,
+                        half_k_blocks,
+                        half_k_blocks,
+                        num_k_blocks - half_k_blocks,
+                        stage_idx,
+                        smem_weight_sf,
                     )
-                    tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
-                warpgroup.commit_group()
-                warpgroup.wait_group(0)
-                self._promote_accum_temp_blockwise_streaming(
-                    accumulators=accumulators,
-                    accum_temp=accum_temp,
-                    smem_activation_sf=smem_activation_sf,
-                    stage_idx=stage_idx,
-                    scale_plane=(
-                        scale_plane_base + cutlass.Int32(1)
-                    ),
-                    tidx=tidx,
-                )
+                    warpgroup.fence()
+                    for k_block in cutlass.range_constexpr(
+                        half_k_blocks, num_k_blocks
+                    ):
+                        cute.gemm(
+                            tiled_mma,
+                            accum_temp,
+                            fp8_fragment_a[(None, None, k_block)],
+                            tCrB[(None, None, k_block, stage_idx)],
+                            accum_temp,
+                        )
+                    warpgroup.commit_group()
+                    warpgroup.wait_group(0)
+                    self._promote_accum_temp_blockwise_streaming(
+                        accumulators=accumulators,
+                        accum_temp=accum_temp,
+                        smem_activation_sf=smem_activation_sf,
+                        stage_idx=stage_idx,
+                        scale_plane=k_tile % cutlass.Int32(
+                            self._fc2_act_sf_k_tiles_per_group()
+                        ),
+                        tidx=tidx,
+                    )
+                else:
+                    scale_plane_base = (
+                        k_tile % cutlass.Int32(2)
+                    ) * cutlass.Int32(2)
+                    tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
+                    warpgroup.fence()
+                    for k_block in cutlass.range_constexpr(half_k_blocks):
+                        cute.gemm(
+                            tiled_mma,
+                            accum_temp,
+                            fp8_fragment_a[(None, None, k_block)],
+                            tCrB[(None, None, k_block, stage_idx)],
+                            accum_temp,
+                        )
+                        tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
+                    warpgroup.commit_group()
+                    warpgroup.wait_group(0)
+                    self._promote_accum_temp_blockwise_streaming(
+                        accumulators=accumulators,
+                        accum_temp=accum_temp,
+                        smem_activation_sf=smem_activation_sf,
+                        stage_idx=stage_idx,
+                        scale_plane=scale_plane_base,
+                        tidx=tidx,
+                    )
+
+                    self._convert_weight_group(
+                        packed_registers,
+                        fp8_fragment_a,
+                        partitioned_offsets,
+                        half_k_blocks,
+                        half_k_blocks,
+                        num_k_blocks - half_k_blocks,
+                        stage_idx,
+                        smem_weight_sf,
+                    )
+                    tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
+                    warpgroup.fence()
+                    for k_block in cutlass.range_constexpr(
+                        half_k_blocks, num_k_blocks
+                    ):
+                        cute.gemm(
+                            tiled_mma,
+                            accum_temp,
+                            fp8_fragment_a[(None, None, k_block)],
+                            tCrB[(None, None, k_block, stage_idx)],
+                            accum_temp,
+                        )
+                        tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
+                    warpgroup.commit_group()
+                    warpgroup.wait_group(0)
+                    self._promote_accum_temp_blockwise_streaming(
+                        accumulators=accumulators,
+                        accum_temp=accum_temp,
+                        smem_activation_sf=smem_activation_sf,
+                        stage_idx=stage_idx,
+                        scale_plane=(
+                            scale_plane_base + cutlass.Int32(1)
+                        ),
+                        tidx=tidx,
+                    )
                 weight_sf_pipeline.consumer_release(ab_consumer_state)
                 ab_pipeline.consumer_release(ab_consumer_state)
                 ab_consumer_state.advance()

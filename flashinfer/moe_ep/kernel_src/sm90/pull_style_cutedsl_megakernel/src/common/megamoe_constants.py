@@ -28,22 +28,17 @@ Fp8ActSfPlanes = 4
 Fp8Fc2ActSfPlanesPerKTile = Fp8BlockScaleK // Fp8Fc2ActivationScaleK
 Fp8Fc2ActSfKTilesPerGroup = Fp8ActSfPlanes // Fp8Fc2ActSfPlanesPerKTile
 # The Hopper MXFP4 / NVFP4 x FP8 backends (fp8_scale_mode="mxfp4_hybrid")
-# keep the 1x64 h block: two scale planes per K tile, one TMA row per two K
-# tiles.  Shared kernel code picks the block with the helpers below.
+# default to a 1x64 h block (two scale planes per K128 tile); the MXFP4 mega
+# kernel's mxfp4_fc2_act_scale_k=128 opts into the 1x128 block.  Shared kernel
+# code asks the kernel (_fc2_activation_scale_k()) for the block in use.
 Fp8Mxfp4HybridFc2ActivationScaleK = 64
 
 
 def fp8_fc2_activation_scale_k(fp8_scale_mode: str) -> int:
-    """Channels per FC2-activation (h) scale for an FP8 scale mode."""
+    """Default channels per FC2-activation (h) scale for an FP8 scale mode."""
     if fp8_scale_mode == "mxfp4_hybrid":
         return Fp8Mxfp4HybridFc2ActivationScaleK
     return Fp8Fc2ActivationScaleK
-
-
-def fp8_fc2_act_sf_k_tiles_per_group(fp8_scale_mode: str) -> int:
-    """K tiles served by one 16-byte FC2 activation-scale TMA row."""
-    planes_per_k_tile = Fp8BlockScaleK // fp8_fc2_activation_scale_k(fp8_scale_mode)
-    return Fp8ActSfPlanes // planes_per_k_tile
 Fp8WeightScaleBlockN = 128
 Fp8WeightScaleBlockK = 128
 SfPaddingBlock = 128

@@ -263,7 +263,9 @@ N256 / M256 non-ping-pong geometries are legal there, see below).
   4), hence blockwise needs N=256 non-swap / M=256 swap-AB tiles and has
   no ping-pong geometry; the config, `tuner.is_valid` and the kernels
   reject the rest.  The Hopper MXFP4 / NVFP4 x FP8 backends
-  (`mxfp4_hybrid`) share these code paths and keep the 1x64 h block.
+  (`mxfp4_hybrid`) share these code paths with a 1x64 h block by default;
+  their `fc2_act_scale_k=128` opts into the 1x128 block under the same tile
+  rules (see "1x128 hybrid h scales" in the Humming MXFP4 section).
 - `swap_ab` + `pingpong` + `mma_tiler_mnk` + `cluster_shape_mnk` — layout,
   scheduling, tile, and CGA shape.  Leave ALL four `None` to use the drop's
   token-bucket heuristic table (`moe_hopper_fp8/heuristic_config.py`, keyed
@@ -1108,6 +1110,57 @@ Archive: `mxfp4-pr4843-review-fixes-20260921-v1/reports/` contains
 `performance.csv`, `performance-v2.json` and `winning-tactics.json`, with
 all rounds, per-point ranges, full requested/effective tactics, command
 provenance and clock observations.
+
+### 1x128 hybrid h scales (`fc2_act_scale_k=128`, 2026-10-27)
+
+By default the MXFP4 / NVFP4 x FP8 path quantizes the FC1 output (h, FC2's
+A operand) with one FP32 scale per routed row and 64 channels.
+`fc2_act_scale_k=128` on the MXFP4 / NVFP4 backend configs (and the shim
+configs) uses one scale per 128 channels, as FP8 blockwise does: the two FC1
+epilogue warpgroups fold each other's amax, and FC2 sums both K64 halves of
+each K128 in one WGMMA accumulator and promotes once instead of twice. Where
+registers allow (folded producer warps, or N16 tiles), the second half's FP4
+conversion overlaps the first half's WGMMA; the unfolded layout runs at 128
+registers, where that overlap spilled from N32 up (ptxas `-v`: 28 B at K128,
+52 B at K256), so it waits for the first half instead. A block is
+the output of one M=256 task tile, so the option needs swap-AB M=256 without
+ping-pong and is not available with `knobs="auto"`; every current MXFP4 and
+NVFP4 default tactic qualifies.
+
+It stays opt-in because it changes numerics. On synthetic data (the
+benchmark's BF16 randn/sqrt(K) weights quantized to MXFP4, per-token FP8
+input, clamp 10, H2048/I1024, 512 tokens) the FC2 output error against an
+unquantized h grows from 2.09% to 2.26% relative L2 (+8%); with 1% of the h
+channels scaled 20x, from 1.09% to 1.26% (+15%). At the A/B shape below, the
+128 and 64 outputs differ by 2.11-2.14% relative L2 for every bucket, rank
+and format. Model-level accuracy has not been measured.
+
+Same-node A/B on four H200 GPUs at 1980 MHz, EP4, H7168/I3072/E384, top-k 6,
+clamp 10, block-permutation routing and dense inputs. Both arms use the
+bucket's default tactic and differ only in `fc2_act_scale_k`; the benchmark
+checked the compiled kernel's h block for each arm. Compute is MegaMoE plus
+top-k reduction: 10 warmups, 50 iterations, 5-second cooldown, maximum of
+the four rank medians, four rounds in alternating order. Latency is the
+median over rounds; the change is the median of the per-round 128/64 ratios,
+with their range:
+
+| Tokens/rank | MX tile M,N,K | MXFP4 64 (µs) | MXFP4 128 (µs) | Change [range] | NVFP4 64 (µs) | NVFP4 128 (µs) | Change [range] |
+|---:|:---|---:|---:|:---|---:|---:|:---|
+| 32 | 256,16,256 | 795.1 | 789.7 | -0.7% [-0.8, -0.5] | 825.3 | 822.8 | -0.3% [-0.4, -0.0] |
+| 256 | 256,32,128 | 1002.1 | 995.8 | -0.6% [-0.9, -0.5] | 1029.5 | 1023.1 | -0.6% [-0.7, -0.5] |
+| 512 | 256,64,256 | 1271.6 | 1207.3 | -5.2% [-6.7, -3.7] | 1281.2 | 1240.3 | -3.8% [-8.0, -1.3] |
+| 1024 | 256,64,256 | 1686.1 | 1597.4 | -5.1% [-6.1, -4.3] | 1625.2 | 1571.8 | -3.2% [-3.4, -2.5] |
+| 2048 | 256,64,256 | 2948.8 | 2863.1 | -3.0% [-4.6, -1.0] | 2832.4 | 2705.6 | -4.4% [-5.0, -3.6] |
+| 4096 | 256,64,256 | 5419.1 | 5188.2 | -4.3% [-4.4, -2.7] | 5145.6 | 4989.9 | -3.1% [-3.3, -2.4] |
+| 8192 | 256,64,256 | 10155.2 | 9705.2 | -4.4% [-5.0, -3.4] | 9778.8 | 9381.3 | -4.1% [-4.1, -3.4] |
+
+NVFP4 uses the same tiles except 256,32,256 at T256. With N64 FC2 tiles
+(T512 and above) every round favored 128, by 1-8%, consistent with FC2
+draining the WGMMA pipeline once per K128 instead of twice. At N16 and N32
+(T32, T256) the gain is under 1%. Before the unfolded layout stopped
+overlapping, T256 was 1.1% (MXFP4) and 0.8% (NVFP4) slower with 128 in every
+round. The T32 / T2048 / T8192 rows, the T512 / T1024 / T4096 rows and the
+T256 row come from three sessions on the same node.
 
 ### Reproducing tuning and direct benchmark runs
 

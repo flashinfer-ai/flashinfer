@@ -79,7 +79,11 @@ class Sm90PullMxfp4MegaKernelBackend(MegaKernelBackend):
         return getattr(pkg, template.format(self._frontend_format))
 
     def _format_config_kwargs(self) -> dict[str, Any]:
-        return {"compact_pull_buffer": self._kernel_config.compact_pull_buffer}
+        k = self._kernel_config
+        return {
+            "compact_pull_buffer": k.compact_pull_buffer,
+            "fc2_act_scale_k": k.fc2_act_scale_k,
+        }
 
     def _knob_resolver_kwargs(self) -> dict[str, Any]:
         return {}

@@ -157,6 +157,10 @@ class MegaMoEHopperMxfp4Config(MegaMoEHopperFp8Config):
     # Only these two bounded performance strategies are optional.
     fc2_tail_n8: bool = field(default=False, kw_only=True)
     fc1_ready_mode: Literal["tile", "k256"] = field(default="tile", kw_only=True)
+    # FC1-output channels per FC2-activation (h) scale.  128 forms one scale
+    # per M256 task tile (the FP8 blockwise rule: no M128 / ping-pong tiles)
+    # and promotes FC2 once per K128 instead of per K64.
+    fc2_act_scale_k: Literal[64, 128] = field(default=64, kw_only=True)
     routing_profile: str = field(
         default=SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
         kw_only=True,
@@ -243,19 +247,41 @@ class MegaMoEHopperMxfp4Config(MegaMoEHopperFp8Config):
                 f"the production {self._weight_format} profile does not implement "
                 "deterministic dispatch slots."
             )
+        if isinstance(self.fc2_act_scale_k, bool) or self.fc2_act_scale_k not in (
+            64,
+            128,
+        ):
+            raise ValueError(
+                f"fc2_act_scale_k must be 64 or 128, got {self.fc2_act_scale_k!r}."
+            )
+        if self.fc2_act_scale_k == 128 and (
+            self.mma_tiler_mnk[0] != 256 or self.pingpong
+        ):
+            # One h block is the output of one M=256 task tile (both epilogue
+            # warpgroups); a cached or default M=128 tactic does not qualify.
+            raise ValueError(
+                f"{self._weight_format} fc2_act_scale_k=128 needs swap-AB "
+                "mma_tiler M=256 without ping-pong; got "
+                f"mma_tiler_mnk={self.mma_tiler_mnk}, pingpong={self.pingpong}."
+            )
 
         # Reuse the target FP8 config's rank, shape, scheduler, cluster,
         # ping-pong, token-back, and flag validation.  The generic base does
         # not recognize the dedicated hybrid string, so validate an otherwise
         # identical blockwise proxy (the common divisibility requirements are
-        # the same; its FC2 activation scale block stays 1x64) and apply
-        # MXFP4-only constraints below.
+        # the same; its FC2 activation scale block is fc2_act_scale_k) and
+        # apply MXFP4-only constraints below.
         base_kwargs = {
             item.name: getattr(self, item.name)
             for item in dataclasses.fields(MegaMoEHopperFp8Config)
         }
         base_kwargs["fp8_scale_mode"] = "blockwise"
-        _HybridBlockwiseProxyConfig(**base_kwargs)
+        proxy_cls = (
+            _HybridBlockwiseProxyConfig
+            if self.fc2_act_scale_k == _MXFP4_FC2_ACTIVATION_SCALE_K
+            else MegaMoEHopperFp8Config
+        )
+        proxy_cls(**base_kwargs)
 
         tile_m, _tile_n, tile_k = self.mma_tiler_mnk
         if tile_m not in (128, 256):
@@ -419,6 +445,7 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
             ("fc1_logical_storage_k", c.hidden, c.hidden // 2),
             ("fc2_logical_storage_k", c.intermediate, c.intermediate // 2),
             ("compact_pull_buffer", c.compact_pull_buffer),
+            ("fc2_act_scale_k", c.fc2_act_scale_k),
             *super()._mega_compile_key(),
         )
 
@@ -574,6 +601,7 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
             generate_c=False,
             mxfp4_fc2_tail_n8=c.fc2_tail_n8,
             mxfp4_fc1_ready_mode=c.fc1_ready_mode,
+            mxfp4_fc2_act_scale_k=c.fc2_act_scale_k,
             tail_split_pairs=c.tail_split_pairs,
             **self._kernel_extra_kwargs(),
         )
@@ -976,6 +1004,7 @@ def _resolve_hopper_mxfp4_mega_moe_config(
     flag_batch: int = 1,
     epi_flag_batch: Tuple[int, int] = (2, 4),
     routing_profile: str = SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
+    fc2_act_scale_k: int = 64,
 ) -> MegaMoEHopperMxfp4Config:
     """Resolve the complete MXFP4 constructor request without allocation."""
 
@@ -1093,13 +1122,16 @@ def _resolve_hopper_mxfp4_mega_moe_config(
         epi_flag_batch=epi_flag_batch,
         routing_profile=routing_profile,
     )
-    if resolved:
+    if resolved or fc2_act_scale_k != config.fc2_act_scale_k:
         # External knob/cache/heuristic dicts were already validated as a
         # complete tactic (legacy 17/19-field inputs reset omitted strategies).
         # Manual selection uses an internal geometry
         # mapping assembled above; the concrete config performs value
         # validation without pretending it is a complete external tactic.
-        config = dataclasses.replace(config, **resolved)
+        # The h scale block is validated against the final geometry.
+        config = dataclasses.replace(
+            config, **resolved, fc2_act_scale_k=fc2_act_scale_k
+        )
         if not isinstance(config, MegaMoEHopperMxfp4Config):
             raise RuntimeError("MXFP4 knob application changed config type.")
     return config
@@ -1145,6 +1177,7 @@ def get_symm_buffer_for_hopper_mxfp4_mega_moe(
     flag_batch: int = 1,
     epi_flag_batch: Tuple[int, int] = (2, 4),
     routing_profile: str = SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
+    fc2_act_scale_k: int = 64,
 ) -> MegaMoEHopperMxfp4SymmBuffer:
     """Allocate symmetric inputs and a fused Humming MXFP4 frontend.
 
@@ -1193,6 +1226,7 @@ def get_symm_buffer_for_hopper_mxfp4_mega_moe(
         flag_batch=flag_batch,
         epi_flag_batch=epi_flag_batch,
         routing_profile=routing_profile,
+        fc2_act_scale_k=fc2_act_scale_k,
     )
     return _get_symm_buffer_for_hopper_mxfp4_mega_moe_from_resolved_config(config)
 

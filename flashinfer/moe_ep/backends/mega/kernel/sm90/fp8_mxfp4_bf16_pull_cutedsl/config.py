@@ -76,6 +76,11 @@ class Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig:
         default=SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
         kw_only=True,
     )
+    # FC1-output channels per FC2-activation scale: 64, or 128 for one scale
+    # per M256 task tile and one FC2 promotion per K128 (no M128 / ping-pong
+    # tactics, so it needs an explicit or cached M256 tactic, not "auto").
+    # Not a tactic field.
+    fc2_act_scale_k: int = field(default=64, kw_only=True)
 
     _weight_format: ClassVar[str] = "MXFP4"
     _kind_contract: ClassVar[str] = "MXFP4 x FP8 Humming"
@@ -200,6 +205,18 @@ class Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig:
             raise ValueError(
                 "knobs= is mutually exclusive with explicit fused geometry or "
                 "execution axes"
+            )
+        if type(self.fc2_act_scale_k) is not int or self.fc2_act_scale_k not in (
+            64,
+            128,
+        ):
+            raise ValueError(
+                f"fc2_act_scale_k must be 64 or 128; got {self.fc2_act_scale_k!r}"
+            )
+        if self.fc2_act_scale_k == 128 and self.knobs == "auto":
+            raise ValueError(
+                "fc2_act_scale_k=128 does not support knobs='auto' (the candidate "
+                "set includes M128 / ping-pong tactics); pass an M256 tactic"
             )
 
 

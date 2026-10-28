@@ -367,6 +367,7 @@ class MegaMoEHopperNvfp4Frontend(MegaMoEHopperMxfp4Frontend):
             ("fc2_logical_storage_k", c.intermediate, c.intermediate // 2),
             ("nvfp4_conversion", dataclasses.astuple(c.nvfp4_conversion)),
             ("compact_pull_buffer", c.compact_pull_buffer),
+            ("fc2_act_scale_k", c.fc2_act_scale_k),
             *MegaMoEHopperFp8Frontend._mega_compile_key(self),
         )
 
@@ -733,6 +734,7 @@ def _resolve_hopper_nvfp4_mega_moe_config(
     nvfp4_kperm: int = 64,
     nvfp4_fc1_k256_overlap: Optional[bool] = None,
     routing_profile: str = SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
+    fc2_act_scale_k: int = 64,
 ) -> MegaMoEHopperNvfp4Config:
     """Resolve the complete NVFP4 constructor request without allocation."""
 
@@ -860,13 +862,16 @@ def _resolve_hopper_nvfp4_mega_moe_config(
         nvfp4_kperm=nvfp4_kperm,
         routing_profile=routing_profile,
     )
-    if resolved:
+    if resolved or fc2_act_scale_k != config.fc2_act_scale_k:
         # External knob/cache/heuristic dicts were already validated as a
         # complete tactic (legacy 17/19-field inputs reset omitted strategies).
         # Manual selection uses an internal geometry
         # mapping assembled above; the concrete config performs value
         # validation without pretending it is a complete external tactic.
-        config = dataclasses.replace(config, **resolved)
+        # The h scale block is validated against the final geometry.
+        config = dataclasses.replace(
+            config, **resolved, fc2_act_scale_k=fc2_act_scale_k
+        )
         if not isinstance(config, MegaMoEHopperNvfp4Config):
             raise RuntimeError("NVFP4 knob application changed config type.")
     if not manual_selector and knobs is None and nvfp4_fc1_k256_overlap is None:
@@ -935,6 +940,7 @@ def get_symm_buffer_for_hopper_nvfp4_mega_moe(
     nvfp4_kperm: int = 64,
     nvfp4_fc1_k256_overlap: Optional[bool] = None,
     routing_profile: str = SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
+    fc2_act_scale_k: int = 64,
 ) -> MegaMoEHopperNvfp4SymmBuffer:
     """Allocate symmetric inputs and a fused NVFP4 frontend.
 
@@ -989,6 +995,7 @@ def get_symm_buffer_for_hopper_nvfp4_mega_moe(
         nvfp4_kperm=nvfp4_kperm,
         nvfp4_fc1_k256_overlap=nvfp4_fc1_k256_overlap,
         routing_profile=routing_profile,
+        fc2_act_scale_k=fc2_act_scale_k,
     )
     return _get_symm_buffer_for_hopper_nvfp4_mega_moe_from_resolved_config(config)
 
