@@ -11,6 +11,7 @@ import hashlib
 import importlib.util
 import pathlib
 import re
+import sys
 
 import pytest
 
@@ -44,8 +45,10 @@ def _make_dist(tmp_path, names=(WHEEL,)):
     return dist
 
 
-def _index_for(out_dir, package="flashinfer-python", cuda=None):
-    base = pathlib.Path(out_dir) / "nightly"
+def _index_for(out_dir, package="flashinfer-python", cuda=None, nightly=True):
+    base = pathlib.Path(out_dir)
+    if nightly:
+        base = base / "nightly"
     if cuda:
         base = base / f"cu{cuda}"
     return base / package / "index.html"
@@ -62,22 +65,58 @@ def _run(whl_index, dist, out_dir, untested=False):
     )
 
 
-def test_default_row_has_no_marker(whl_index, tmp_path):
-    """The stable release path must keep producing plain anchor rows."""
+def _run_cli(whl_index, monkeypatch, dist, out_dir, *args):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "update_whl_index.py",
+            "--dist-dir",
+            str(dist),
+            "--output-dir",
+            str(out_dir),
+            *args,
+        ],
+    )
+    whl_index.main()
+
+
+def test_default_row_has_no_marker(whl_index, tmp_path, monkeypatch):
+    """The stable release path must keep producing plain anchor rows.
+
+    Invoked through the CLI the way release.yml does: no --nightly and no
+    --untested.
+    """
     dist = _make_dist(tmp_path)
     out = tmp_path / "whl"
-    _run(whl_index, dist, out)
+    _run_cli(whl_index, monkeypatch, dist, out, "--release-tag", "v0.6.18")
 
-    content = _index_for(out).read_text()
+    content = _index_for(out, nightly=False).read_text()
+    assert (
+        '<a href="https://github.com/flashinfer-ai/flashinfer/releases/download/'
+        f"v0.6.18/{WHEEL}#sha256="
+    ) in content
     assert f">{WHEEL}</a><br>" in content
     assert "data-untested" not in content
     assert "(untested)" not in content
 
 
-def test_untested_row_is_marked(whl_index, tmp_path):
+def test_untested_row_is_marked(whl_index, tmp_path, monkeypatch):
+    """Invoked through the CLI the way nightly-release.yml does on test failure."""
     dist = _make_dist(tmp_path)
     out = tmp_path / "whl"
-    _run(whl_index, dist, out, untested=True)
+    _run_cli(
+        whl_index,
+        monkeypatch,
+        dist,
+        out,
+        "--base-url",
+        "https://github.com/flashinfer-ai/whl/releases/download",
+        "--release-tag",
+        "nightly-v0.6.18-20260915",
+        "--nightly",
+        "--untested",
+    )
 
     content = _index_for(out).read_text()
     assert 'data-untested="true"' in content

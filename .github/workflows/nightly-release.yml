@@ -14,6 +14,17 @@ on:
         required: false
         type: string
 
+concurrency:
+  # One run at a time per ref. Runs on main recreate date-tagged releases and
+  # rewrite the shared wheel index; if two overlapped, an older run could write
+  # its index rows last, with hashes for assets a newer run has since replaced.
+  # update-wheel-index also runs when tests fail, so a slow failing run reaches
+  # that step too. Other refs are dry runs and only queue behind their own
+  # branch. GitHub keeps one pending run per group, so a newly queued run
+  # replaces an older pending one instead of queueing behind it.
+  group: nightly-release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   setup:
     runs-on: ubuntu-latest
