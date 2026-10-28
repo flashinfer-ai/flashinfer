@@ -317,9 +317,9 @@ the segmented route: a group of fewer documents would change every document's
 segments) and, on a lean workspace, the checkpoint replay (`saved=None`); a
 batched workspace that is not lean runs the replay group by group.  The costs
 per group are a table launch, the gathers of a group whose blocks are not one
-run (at most three state blocks of the group, `batch_scratch` of
-`memory_report`) and the smaller grids; the serial route's chains of different
-groups run one group after another.
+run (at most three state blocks per segment of the group, within
+`batch_scratch` of `memory_report`) and the smaller grids; the serial route's
+chains of different groups run one group after another.
 
 ```python
 arena = kda_train_arena(lean=True, tail_passes=4, batch_tokens=120_000)

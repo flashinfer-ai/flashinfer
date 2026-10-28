@@ -1676,8 +1676,9 @@ def memory_report(
     totals with the configured backward arena (the replay total keeps the default's: a lean workspace serves no
     replay).  A batched option reports the bound of every group (``arena_bwd_bound_batched``) and, with
     ``doc_lengths``, its exact groups (``batches`` as ``(d0, d1, S, N)``), ``largest_batch_rows``,
-    ``batch_scratch`` (the largest group's table buffer and three of its state blocks, allocated per call: a bound,
-    since a group's blocks of the saved states are gathered only where they are not one run of them) and
+    ``batch_scratch`` (allocated per call: the largest table buffer of a group and three state blocks per segment of
+    the group with the most segments; a group gathers its blocks of the saved states only where they are not one
+    run of them, at most three per segment) and
     ``arena_floor_batched`` (one document per group under the lean four-pass layouts: ``2820 * R_min * H + 3 * P *
     H * 64 KiB``, ``R_min`` the internal rows of the longest document; 2052 for the tape forms)."""
     if save_mode not in SAVE_MODES:
@@ -1754,11 +1755,13 @@ def memory_report(
         if doc_lengths is not None:
             groups = p.batches(arena, doc_lengths)
             batches = [(b.d0, b.d1, b.S, b.N) for b in groups]
-            big = max(groups, key=lambda b: b.NC_pad)
-            largest = big.NC_pad * BT
-            layout = _table_layout(big.NC_pad, big.N, p.batch_segments(big))
-            words = _round_up(layout[-1][1] + layout[-1][2], ALIGN // 4)
-            scratch = words * 4 + 3 * p.batch_segments(big) * H * D * D * 4
+            largest = max(b.NC_pad for b in groups) * BT
+            words = 0
+            for b in groups:
+                layout = _table_layout(b.NC_pad, b.N, p.batch_segments(b))
+                words = max(words, _round_up(layout[-1][1] + layout[-1][2], ALIGN // 4))
+            segments_b = max(p.batch_segments(b) for b in groups)
+            scratch = words * 4 + 3 * segments_b * H * D * D * 4
     if doc_lengths is not None:
         longest = max(p.check_doc_lengths(doc_lengths))
         nc_min = -(-longest // BT) + 1

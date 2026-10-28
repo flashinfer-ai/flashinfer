@@ -5325,23 +5325,21 @@ def test_memory_report_batched_fields() -> None:
             assert r2["arena_fwd_configured"] == p.arena_bytes(
                 backward=False, arena=arena, doc_lengths=lengths
             )
-            big = max(groups, key=lambda b: b.NC_pad)
-            blocks = 3 * p.batch_segments(big) * heads * D * D * 4
-            assert (
-                blocks
-                <= r2["batch_scratch"]
-                <= blocks
-                + 4
-                * (
-                    2 * big.NC_pad
-                    + 2 * big.N
-                    + 2
-                    + p.batch_segments(big)
-                    + 2 * big.N
-                    + 1
-                    + 5 * 64
+            # the largest table buffer of a group and three state blocks per segment of the group with the most
+            # segments (here the two-document group, not the one with the most chunks)
+            segments_b = max(p.batch_segments(b) for b in groups)
+            if p.recur == "seg":
+                assert (
+                    segments_b
+                    == p.batch_segments(groups[0])
+                    > max(p.batch_segments(b) for b in groups[1:])
                 )
+            blocks = 3 * segments_b * heads * D * D * 4
+            words = max(
+                2 * b.NC_pad + 2 * b.N + 2 + p.batch_segments(b) + 2 * b.N + 1 + 5 * 64
+                for b in groups
             )
+            assert blocks <= r2["batch_scratch"] <= blocks + 4 * words
             nc_min = -(-max(lengths) // BT) + 1
             rows_min = BT * (nc_min + nc_min % 2)
             block_min = p.P * heads * D * D * 4 if p.recur == "seg" else 0
