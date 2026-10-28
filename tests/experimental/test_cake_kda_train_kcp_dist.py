@@ -232,16 +232,19 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
     # while the others captured would run its collectives outside the graphs of its peers
     cake_kcp.graph_cache_clear()
     events = []
-    for _ in range(len(GRAPH_EVENTS)):
-        res_graph = {n: t.clone() for n, t in saved_pass(graph="replay").items()}
-        events.append(
-            [
-                str(cake_kcp.LAST_CALL["fwd"].get("graph_event")),
-                str(cake_kcp.LAST_CALL["bwd"].get("graph_event")),
-            ]
-        )
-    torch.cuda.synchronize(device)
-    cake_kcp.graph_cache_clear()
+    try:
+        for _ in range(len(GRAPH_EVENTS)):
+            res_graph = {n: t.clone() for n, t in saved_pass(graph="replay").items()}
+            events.append(
+                [
+                    str(cake_kcp.LAST_CALL["fwd"].get("graph_event")),
+                    str(cake_kcp.LAST_CALL["bwd"].get("graph_event")),
+                ]
+            )
+        torch.cuda.synchronize(device)
+    finally:
+        # a cached graph holding a NCCL collective blocks the process group's destruction
+        cake_kcp.graph_cache_clear()
     flags = {
         "saved_eq_replay": all(torch.equal(res[n], res_replay[n]) for n in TENSORS),
         "repeat": all(torch.equal(res[n], res_repeat[n]) for n in TENSORS),
@@ -342,6 +345,7 @@ def _spawn_entry(rank: int, W: int, row, port: int, result_dir: str) -> None:
             raise AssertionError(f"rank {rank}: {report}")
     finally:
         if dist.is_initialized():
+            cake_kcp.graph_cache_clear()
             dist.destroy_process_group()
 
 
