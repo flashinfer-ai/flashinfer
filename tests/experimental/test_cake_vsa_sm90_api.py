@@ -615,10 +615,11 @@ def test_facade_re_exports_the_backend():
     assert facade.GQA_GROUPS == backend.GQA_GROUPS == (1, 2, 4, 8)
     assert set(facade.__all__) <= set(dir(backend))
     # 19 BF16 + 19 FP8 twins + 2 quantizers + 19 + 19 GQA stages + the two round-2 FP8 GQA programs
-    assert len(facade.STAGES) == 80
+    # + the round-16 position-selected FP8 GQA static program
+    assert len(facade.STAGES) == 81
     assert len(facade.GQA_PERSISTENT_STAGES) + len(facade.GQA_SMALL_STAGES) == 19
     assert (
-        len(facade.FP8_GQA_PERSISTENT_STAGES) + len(facade.FP8_GQA_SMALL_STAGES) == 21
+        len(facade.FP8_GQA_PERSISTENT_STAGES) + len(facade.FP8_GQA_SMALL_STAGES) == 22
     )
     assert facade.sage_fp8_quantize_sm90 is backend.sage_fp8_quantize_sm90
     assert facade.FP8_DTYPE is torch.float8_e4m3fn and facade.K_SCALE_GROUP == 16
