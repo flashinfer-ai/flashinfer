@@ -1,13 +1,13 @@
 # Copyright (c) 2026 by FlashInfer team.
 # Licensed under the Apache License, Version 2.0.
-"""CPU contracts for optional process-based MLA prebuilding."""
+"""CPU contracts for optional process-based attention prebuilding."""
 
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from tests.test_helpers import prims_ts_mla_prebuild as prebuild
+from tests.test_helpers import prims_ts_attention_prebuild as prebuild
 
 
 def test_prebuild_selection_preserves_pytest_skip_and_fixture_ownership():
@@ -71,7 +71,7 @@ def test_prebuild_preserves_disabled_jit_modes(monkeypatch, disabled):
         pytest.fail("disabled prebuilding selected work")
 
     monkeypatch.setattr(prebuild, "selected_cases", unexpected_selection)
-    assert prebuild.prebuild_selected_mla_tests([object()]) == (0, [], 0)
+    assert prebuild.prebuild_selected_attention_tests([object()]) == (0, [], 0)
 
 
 def test_prebuild_defers_test_failures_but_preserves_interrupts(monkeypatch):

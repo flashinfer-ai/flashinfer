@@ -12,8 +12,8 @@ skip guards), compile them as one parallel ninja graph, and stage the
 resulting .so files into the AOT dir so test-time loads skip the
 per-module ninja dependency scan entirely.
 
-2.  Warm selected Prims-TS MLA cases in a bounded process pool, persisting all
-their CuTe-DSL plans, including later replans. Workers execute real kernels;
+2.  Warm selected Prims-TS context and MLA cases in a bounded process pool,
+persisting all their CuTe-DSL plans, including later replans. Workers execute real kernels;
 normal pytest then loads those artifacts and owns each test's final result.
 """
 
@@ -460,32 +460,41 @@ def pytest_collection_modifyitems(session, config, items):
                 "tests will load-only."
             )
 
-    mla_items = [
+    prims_ts_items = [
         item
         for item in items
         if item.path.name
-        in ("test_attention_ts_mla_decode.py", "test_attention_ts_sparse_mla.py")
+        in (
+            "test_attention_ts_mla_decode.py",
+            "test_attention_ts_sparse_mla.py",
+            "test_attention_ts_context.py",
+            "test_attention_ts_context_sage.py",
+        )
     ]
-    if mla_items:
-        from tests.test_helpers.prims_ts_mla_prebuild import prebuild_selected_mla_tests
+    if prims_ts_items:
+        from tests.test_helpers.prims_ts_attention_prebuild import (
+            prebuild_selected_attention_tests,
+        )
 
         started = time.monotonic()
         try:
             if reporter:
-                reporter.write_line("[jit-prebuild] Precompiling selected MLA plans...")
-            built, errors, cases = prebuild_selected_mla_tests(mla_items)
+                reporter.write_line(
+                    "[jit-prebuild] Precompiling selected Prims-TS attention plans..."
+                )
+            built, errors, cases = prebuild_selected_attention_tests(prims_ts_items)
             if reporter:
                 reporter.write_line(
-                    f"[jit-prebuild] MLA: {built} kernels built across {cases} "
+                    f"[jit-prebuild] Prims-TS: {built} kernels built across {cases} "
                     f"cases in {time.monotonic() - started:.1f}s; "
                     f"{len(errors)} warmup failures deferred to pytest."
                 )
                 for error in errors[:3]:
-                    reporter.write_line(f"[jit-prebuild] MLA fallback: {error}")
+                    reporter.write_line(f"[jit-prebuild] Prims-TS fallback: {error}")
         except Exception as error:
             if reporter:
                 reporter.write_line(
-                    f"[jit-prebuild] MLA prebuild failed ({error!r}); "
+                    f"[jit-prebuild] Prims-TS prebuild failed ({error!r}); "
                     "falling back to per-test JIT compilation."
                 )
 

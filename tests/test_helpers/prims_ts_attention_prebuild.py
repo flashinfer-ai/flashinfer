@@ -1,4 +1,4 @@
-"""Warm MLA compilation for selected tests in isolated processes.
+"""Warm Prims-TS attention compilation for selected tests in isolated processes.
 
 Workers execute fixture-free cases using real kernels and numerical checks,
 persisting every plan, including later replans. Tests then execute normally
@@ -20,7 +20,7 @@ from unittest.mock import patch
 @functools.cache
 def load_test_module(path):
     """Import test setup once per worker, without invoking pytest collection."""
-    name = f"mla_prebuild_{Path(path).stem}"
+    name = f"prims_ts_prebuild_{Path(path).stem}"
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
@@ -117,7 +117,7 @@ def selected_cases(items):
     for item in items:
         if item.get_closest_marker("skip") is not None:
             continue
-        # These MLA files use Boolean architecture guards. Unknown string
+        # These attention files use Boolean architecture guards. Unknown string
         # guards are left to normal pytest rather than evaluated here.
         if any(
             any(condition for condition in mark.args)
@@ -153,8 +153,8 @@ def prebuild_workers():
     return min(limits)
 
 
-def prebuild_selected_mla_tests(items):
-    """Warm MLA artifacts while preserving cache-disabled and single-worker modes."""
+def prebuild_selected_attention_tests(items):
+    """Warm attention artifacts while preserving cache-disabled and single-worker modes."""
     from flashinfer.jit.cute_dsl_core import cute_dsl_cache_disabled
 
     if cute_dsl_cache_disabled() or os.environ.get("FLASHINFER_DISABLE_JIT"):
@@ -164,18 +164,18 @@ def prebuild_selected_mla_tests(items):
     if workers < 2 or len(cases) < 2:
         return 0, [], 0
     # Dense MLA puts its longest multi-plan integration cases at the end.
-    # Start those chains first, leaving short cases to fill the tail. Sparse
-    # MLA already interleaves its expensive shapes in collection order.
+    # Start those chains first, leaving short cases to fill the tail. Other
+    # suites retain their collected order.
     dense = [
         case
         for case in cases
         if Path(case[0]).name == "test_attention_ts_mla_decode.py"
     ]
-    sparse = [
+    other_cases = [
         case
         for case in cases
         if Path(case[0]).name != "test_attention_ts_mla_decode.py"
     ]
-    cases = list(reversed(dense)) + sparse
+    cases = list(reversed(dense)) + other_cases
     built, errors = precompile_cases(cases, min(workers, len(cases)))
     return built, errors, len(cases)
