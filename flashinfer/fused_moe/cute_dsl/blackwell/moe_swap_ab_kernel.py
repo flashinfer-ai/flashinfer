@@ -92,7 +92,15 @@ _iket = None
 
 @dsl_user_op
 def _blockscaled_tma_sfb(
-    atom, destination, mbarrier, k_block, row_block, cta_group, loc=None, ip=None
+    atom,
+    destination,
+    mbarrier,
+    k_block,
+    row_block,
+    cta_group,
+    cache_policy,
+    loc=None,
+    ip=None,
 ):
     """Load one canonical 128-row SF block, replicated in each CTA."""
     executable = _cute_nvgpu_ir.atom_make_exec_tma(atom._trait.value, loc=loc, ip=ip)
@@ -116,7 +124,7 @@ def _blockscaled_tma_sfb(
             barrier.ir_value(loc=loc, ip=ip),
             cutlass.Int32(k_block).ir_value(loc=loc, ip=ip),
             cutlass.Int32(row_block).ir_value(loc=loc, ip=ip),
-            cutlass.Int64(0).ir_value(loc=loc, ip=ip),
+            cutlass.Int64(cache_policy).ir_value(loc=loc, ip=ip),
         ],
         "cp.async.bulk.tensor.3d.shared::cta.global."
         f"mbarrier::complete_tx::bytes.cta_group::{cta_group}.L2::cache_hint "
@@ -2392,7 +2400,8 @@ class Sm100BlockScaledGroupedGemmKernel:
                 producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
                 consumer_group=pipeline.CooperativeGroup(
                     pipeline.Agent.Thread,
-                    32 * 7,
+                    # Only the leader CTA's MMA warp consumes tile metadata.
+                    32 * (6 + cutlass.Int32(cta_rank == 0)),
                 ),
                 defer_sync=True,
             )
@@ -2433,27 +2442,25 @@ class Sm100BlockScaledGroupedGemmKernel:
         sSFB = storage.sfb.get_tensor(sfb_layout)
         total_m_tiles = cute.ceil_div(weights.shape[0], self.mma_m * self.channel_tiles)
         k_tiles = cute.ceil_div(weights.shape[1], self.tile_k)
-        waits_for_payload = cutlass.Boolean(True)
-        if cutlass.const_expr(self.prefetch_weights_before_wait):
-            # The same startup release that permits weight prefetch publishes
-            # routing metadata. Only payload readers need the dependency wait.
-            waits_for_payload = (warp == self.activation_warp) | (warp >= 4)
-        if waits_for_payload:
-            if cutlass.const_expr(self.enable_iket):
-                _iket.range_push("startup_dependency_wait")
-            griddepcontrol_wait()
-            if cutlass.const_expr(self.enable_iket):
-                _iket.range_pop()
-        if cutlass.const_expr(self.pdl_signal_at == "startup"):
+        if cutlass.const_expr(self.enable_pdl):
+            waits_for_payload = cutlass.Boolean(True)
+            if cutlass.const_expr(self.prefetch_weights_before_wait):
+                # The same startup release that permits weight prefetch publishes
+                # routing metadata. Only payload readers need the dependency wait.
+                waits_for_payload = (warp == self.activation_warp) | (warp >= 4)
+            if waits_for_payload:
+                if cutlass.const_expr(self.enable_iket):
+                    _iket.range_push("startup_dependency_wait")
+                griddepcontrol_wait()
+                if cutlass.const_expr(self.enable_iket):
+                    _iket.range_pop()
+        if cutlass.const_expr(self.enable_pdl and self.pdl_signal_at == "startup"):
             # The activation warp has acquired ancestor payload publication.
             # The weight and scheduler warps may still be running ahead of it.
             if warp == self.activation_warp:
                 if cutlass.const_expr(
-                    self.enable_pdl
-                    and (
-                        self.publish_routing_before_signal
-                        or (self.scatter_output and not self.use_fused_finalize)
-                    )
+                    self.publish_routing_before_signal
+                    or (self.scatter_output and not self.use_fused_finalize)
                 ):
                     if publishes_ancestors:
                         release_gpu()
@@ -2527,13 +2534,15 @@ class Sm100BlockScaledGroupedGemmKernel:
                 tile, scheduled_expert, _, info_state = self.next_work(
                     info_pipe, info_state, sInfo, tile + grid, total_tiles
                 )
-            if cutlass.const_expr(self.prefetch_weights_before_wait):
+            if cutlass.const_expr(
+                self.enable_pdl and self.prefetch_weights_before_wait
+            ):
                 griddepcontrol_wait()
-            if cutlass.const_expr(self.pdl_signal_at == "producer_exit"):
+            if cutlass.const_expr(
+                self.enable_pdl and self.pdl_signal_at == "producer_exit"
+            ):
                 if cutlass.const_expr(
-                    self.enable_pdl
-                    and self.scatter_output
-                    and not self.use_fused_finalize
+                    self.scatter_output and not self.use_fused_finalize
                 ):
                     if publishes_ancestors:
                         release_gpu()
@@ -2612,6 +2621,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                                 k_tile * (self.tile_k // self.sf_block_k),
                                 route_idx * self.sfb_row_blocks + row_block,
                                 self.cta_group_size,
+                                self.activation_cache_policy,
                             )
                     if cutlass.const_expr(self.enable_iket):
                         _iket.range_pop()
@@ -2722,7 +2732,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                 tile, scheduled_expert, scheduled_valid, info_state = self.next_work(
                     info_pipe, info_state, sInfo, tile + grid, total_tiles
                 )
-        elif warp == self.mma_warp:
+        elif (warp == self.mma_warp) & (cta_rank == 0):
             tSFA = cute.make_tensor(
                 cute.recast_ptr(tmem_ptr + self.acc_reserved_cols, dtype=self.sf_dtype),
                 blockscaled_utils.make_tmem_layout_sfa(
@@ -2791,47 +2801,74 @@ class Sm100BlockScaledGroupedGemmKernel:
                 )
                 if cutlass.const_expr(self.enable_iket):
                     _iket.range_push("mma_acc_empty")
-                if cta_rank == 0:
-                    acc_pipe.producer_acquire(producer)
+                acc_pipe.producer_acquire(producer)
                 if cutlass.const_expr(self.enable_iket):
                     _iket.range_pop()
                 for k_tile in cutlass.range(k_tiles):
-                    if cta_rank == 0:
-                        if cutlass.const_expr(self.enable_iket):
-                            _iket.range_push("mma_tma_ready")
-                        operand_pipe.consumer_wait(consumer)
-                        if cutlass.const_expr(self.enable_iket):
-                            _iket.range_pop()
-                            _iket.range_push("mma_sf_copy_issue")
-                        sf_stage = (None, None, None, None, consumer.index)
-                        sf_stage_a = (
+                    if cutlass.const_expr(self.enable_iket):
+                        _iket.range_push("mma_tma_ready")
+                    operand_pipe.consumer_wait(consumer)
+                    if cutlass.const_expr(self.enable_iket):
+                        _iket.range_pop()
+                        _iket.range_push("mma_sf_copy_issue")
+                    sf_stage = (None, None, None, None, consumer.index)
+                    sf_stage_a = (
+                        None,
+                        None,
+                        None,
+                        None,
+                        consumer.index * self.channel_tiles,
+                    )
+                    cute.copy(copy_a, source_a[sf_stage_a], target_a)
+                    cute.copy(copy_b, source_b[sf_stage], target_b)
+                    if cutlass.const_expr(self.channel_tiles == 2):
+                        sf_stage_a1 = (
                             None,
                             None,
                             None,
                             None,
-                            consumer.index * self.channel_tiles,
+                            consumer.index * self.channel_tiles + 1,
                         )
-                        cute.copy(copy_a, source_a[sf_stage_a], target_a)
-                        cute.copy(copy_b, source_b[sf_stage], target_b)
-                        if cutlass.const_expr(self.channel_tiles == 2):
-                            sf_stage_a1 = (
-                                None,
-                                None,
-                                None,
-                                None,
-                                consumer.index * self.channel_tiles + 1,
-                            )
-                            cute.copy(copy_a1, source_a1[sf_stage_a1], target_a1)
+                        cute.copy(copy_a1, source_a1[sf_stage_a1], target_a1)
+                    if cutlass.const_expr(self.enable_iket):
+                        _iket.range_pop()
+                        _iket.range_push("mma_umma0_issue")
+                    _blockscaled_dynamic_mma(
+                        mma_accumulator,
+                        fragment_a[
+                            (None, None, None, consumer.index * self.channel_tiles)
+                        ],
+                        fragment_b[(None, None, None, consumer.index)],
+                        tSFA,
+                        tSFB,
+                        valid,
+                        k_tile,
+                        self.instruction,
+                        self.descriptor,
+                        self.cta_group_size,
+                    )
+                    if cutlass.const_expr(self.enable_iket):
+                        _iket.range_pop()
+                    if cutlass.const_expr(self.channel_tiles == 2):
                         if cutlass.const_expr(self.enable_iket):
-                            _iket.range_pop()
-                            _iket.range_push("mma_umma0_issue")
+                            _iket.range_push("mma_umma1_issue")
+                        mma_accumulator1 = cute.make_tensor(
+                            mma_accumulator.iterator
+                            + cute.assume(self.allocated_n, divby=32),
+                            acc_layout,
+                        )
                         _blockscaled_dynamic_mma(
-                            mma_accumulator,
+                            mma_accumulator1,
                             fragment_a[
-                                (None, None, None, consumer.index * self.channel_tiles)
+                                (
+                                    None,
+                                    None,
+                                    None,
+                                    consumer.index * self.channel_tiles + 1,
+                                )
                             ],
                             fragment_b[(None, None, None, consumer.index)],
-                            tSFA,
+                            tSFA1,
                             tSFB,
                             valid,
                             k_tile,
@@ -2841,53 +2878,20 @@ class Sm100BlockScaledGroupedGemmKernel:
                         )
                         if cutlass.const_expr(self.enable_iket):
                             _iket.range_pop()
-                        if cutlass.const_expr(self.channel_tiles == 2):
-                            if cutlass.const_expr(self.enable_iket):
-                                _iket.range_push("mma_umma1_issue")
-                            mma_accumulator1 = cute.make_tensor(
-                                mma_accumulator.iterator
-                                + cute.assume(self.allocated_n, divby=32),
-                                acc_layout,
-                            )
-                            _blockscaled_dynamic_mma(
-                                mma_accumulator1,
-                                fragment_a[
-                                    (
-                                        None,
-                                        None,
-                                        None,
-                                        consumer.index * self.channel_tiles + 1,
-                                    )
-                                ],
-                                fragment_b[(None, None, None, consumer.index)],
-                                tSFA1,
-                                tSFB,
-                                valid,
-                                k_tile,
-                                self.instruction,
-                                self.descriptor,
-                                self.cta_group_size,
-                            )
-                            if cutlass.const_expr(self.enable_iket):
-                                _iket.range_pop()
-                        if cutlass.const_expr(self.enable_iket):
-                            _iket.range_push("mma_release_issue")
-                        # Both channel tiles must finish reading the shared B/SFB
-                        # stage before any operand pipeline can overwrite it.
-                        operand_pipe.consumer_release(consumer)
-                        if cutlass.const_expr(self.enable_iket):
-                            _iket.range_pop()
+                    if cutlass.const_expr(self.enable_iket):
+                        _iket.range_push("mma_release_issue")
+                    # Both channel tiles must finish reading the shared B/SFB
+                    # stage before any operand pipeline can overwrite it.
+                    operand_pipe.consumer_release(consumer)
+                    if cutlass.const_expr(self.enable_iket):
+                        _iket.range_pop()
                     consumer.advance()
-                if cta_rank == 0:
-                    acc_pipe.producer_commit(producer)
+                acc_pipe.producer_commit(producer)
                 producer.advance()
                 tile, scheduled_expert, scheduled_valid, info_state = self.next_work(
                     info_pipe, info_state, sInfo, tile + grid, total_tiles
                 )
-            if cta_rank == 0:
-                acc_pipe.producer_tail(producer)
-            if cutlass.const_expr(self.prefetch_weights_before_wait):
-                griddepcontrol_wait()
+            acc_pipe.producer_tail(producer)
         elif warp == self.schedule_warp:
             if cutlass.const_expr(self.use_clc_scheduler):
                 sched = utils.ClcDynamicPersistentTileScheduler.create(
@@ -2954,7 +2958,8 @@ class Sm100BlockScaledGroupedGemmKernel:
                 # The final CTA join drains all terminal metadata consumers.
                 if cta_rank == 0:
                     clc_pipe.producer_tail(clc_producer)
-            if cutlass.const_expr(self.prefetch_weights_before_wait):
+        if cutlass.const_expr(self.enable_pdl and self.prefetch_weights_before_wait):
+            if (warp == self.mma_warp) | (warp == self.schedule_warp):
                 griddepcontrol_wait()
         pipeline.NamedBarrier(
             barrier_id=1, num_threads=self.threads_per_cta
