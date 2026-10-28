@@ -726,7 +726,7 @@ def build_context_task_manager(
     is_persistent: bool = True,
     is_clc_dynamic: bool = False,
     clc_response_ptr: cute.Pointer | None = None,
-    exhaustive_deadlock_race_check: bool = True,
+    exhaustive_deadlock_race_check: bool | None = None,
 ) -> Tuple[
     TaskManager,
     list[MemoryResource],
@@ -797,9 +797,10 @@ def build_context_task_manager(
     clc_response_ptr : cute.Pointer, optional
         SMEM pointer for the CLC response buffer, required when
         ``is_clc_dynamic`` is true.
-    exhaustive_deadlock_race_check : bool
-        Whether TaskManager runs the exhaustive schedule checker during
-        construction.
+    exhaustive_deadlock_race_check : bool, optional
+        Whether TaskManager runs the exhaustive schedule checker. By default,
+        concrete offline domains enable it; symbolic JIT domains retain the
+        structural checks. An explicit Boolean overrides that default.
     Returns
     -------
     tuple
@@ -1853,6 +1854,10 @@ def build_context_task_manager(
     tmem_allocator.compute_layout()
 
     skip = not isinstance(num_kv_tiles, int)
+    # skip_validation only downgrades errors to warnings. Exhaustive searches
+    # over a symbolic JIT domain add cold-start cost without an offline proof.
+    if exhaustive_deadlock_race_check is None:
+        exhaustive_deadlock_race_check = not skip
     task_manager = TaskManager(
         tasks=task_list,
         resource_dependency_graph=resource_dependency_graph,
@@ -2807,7 +2812,7 @@ def build_fmha_task_manager(
     is_persistent: bool = True,
     is_clc_dynamic: bool = False,
     clc_response_ptr: cute.Pointer | None = None,
-    exhaustive_deadlock_race_check: bool = True,
+    exhaustive_deadlock_race_check: bool | None = None,
 ) -> Tuple[
     TaskManager,
     list[MemoryResource],
@@ -3023,7 +3028,7 @@ class FmhaTs:
         num_tokens_per_page: int = 32,
         max_kv_len: int = 1,
         causal_single_kv_tile: bool = False,
-        exhaustive_deadlock_race_check: bool = True,
+        exhaustive_deadlock_race_check: bool | None = None,
         d_v: int | None = None,
         vc_attention: str | None = None,
         use_blackwell_tma_oob_workaround: bool = False,
