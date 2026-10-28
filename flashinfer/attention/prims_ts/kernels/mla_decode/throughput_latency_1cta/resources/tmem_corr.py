@@ -149,6 +149,16 @@ class TmemCorrResource(MlaResource):
     _cluster_reduction_barrier: object = None
     _o_coalesce_alloc: object = None
     _smem_o_coalesce: object = None
+    _tail_sink: object = None
+
+    def _prefetches_tail_sink(self):
+        # Keep-AB fused epilogues read one sink per row-owning lane.
+        return (
+            self.inst_id == 1
+            and self.cfg.kernel_variant == "keeps_mma_ab"
+            and self.cfg.fuse_sparse_epilogue
+            and self.attention_sinks is not None
+        )
 
     def _keeps_direct_output(self):
         return (
@@ -303,6 +313,39 @@ class TmemCorrResource(MlaResource):
         # Producer aux work initializes the correction task's view of TMEM O.
         # Runtime SMEM views are initialized once in initialize_runtime_state_internal().
         self._init_tmem_state(stage_info)
+        if cutlass.const_expr(self._prefetches_tail_sink()):
+            # Persistent work-tile loops carry the per-tile sink; define it
+            # before the loop.
+            self._tail_sink = Float32(-Float32.inf)
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def prefetch_tail_inputs(self, stage_info: StageInfo) -> None:
+        """Load this work tile's row sinks before any wait for O.
+
+        The tail otherwise issues this global load after the final PV, where
+        its full L2 round trip precedes every output store.
+        """
+        if cutlass.const_expr(self._prefetches_tail_sink()):
+            task_cache = decode_gen_task_cache(stage_info)
+            logical_head = self._keeps_tail_logical_head(stage_info, task_cache)
+            sink = Float32(-Float32.inf)
+            if logical_head < self.cfg.logical_num_heads_q:
+                sink = Float32(self.attention_sinks[logical_head])
+            self._tail_sink = sink
+
+    @cute.jit
+    def _keeps_tail_logical_head(self, stage_info: StageInfo, task_cache):
+        """Logical query head of this lane's Keep-AB row (one per half-warp lane)."""
+        cfg = self.cfg
+        warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
+        lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
+        return (
+            cta_idx_q_for_stage(self.cta_idx_q, stage_info) * cfg.tile_size_q
+            + head_idx_for_stage(self.head_idx, cfg, stage_info)
+            + warp_idx * Int32(16)
+            + (lane_idx & Int32(15))
+        )
 
     @cute.jit
     def _o_base_col(self):
@@ -1638,7 +1681,9 @@ class TmemCorrResource(MlaResource):
                     norm_scale = Float32(0)
                     if logical_head < cfg.logical_num_heads_q and count > Float32(0):
                         sink = Float32(-Float32.inf)
-                        if cutlass.const_expr(self.attention_sinks is not None):
+                        if cutlass.const_expr(self._prefetches_tail_sink()):
+                            sink = self._tail_sink
+                        elif cutlass.const_expr(self.attention_sinks is not None):
                             sink = Float32(self.attention_sinks[logical_head])
                         if sink == Float32(-Float32.inf):
                             norm_scale = self.output_scale / reduced_sum[scale_idx]
@@ -1979,6 +2024,10 @@ class TmemCorrResource(MlaResource):
 
         rows_per_store = 32 // chunks_per_row
         chunk = lane_idx % Int32(chunks_per_row)
+        # Read every staged row and form every address before the predicated
+        # stores. A store branch holding its load or address math kept them
+        # adjacent, serializing one SMEM round trip per store.
+        staged_rows = []
         for store_idx in cutlass.range_constexpr(16 // rows_per_store):
             local_row = Int32(store_idx * rows_per_store) + lane_idx // Int32(
                 chunks_per_row
@@ -1990,7 +2039,12 @@ class TmemCorrResource(MlaResource):
                 mem_space=3,
                 dtype=Int32,
             )
-            values = src.load(count=4, alignment=16)
+            staged_rows.append(src.load(count=4, alignment=16))
+        for store_idx in cutlass.range_constexpr(16 // rows_per_store):
+            local_row = Int32(store_idx * rows_per_store) + lane_idx // Int32(
+                chunks_per_row
+            )
+            values = staged_rows[store_idx]
             global_head_idx = head_base_idx + warp_idx * Int32(16) + local_row
             storage_flat_query_row, _, _, _, valid_output_row = flat_query_row_state(
                 global_head_idx,
@@ -2001,22 +2055,23 @@ class TmemCorrResource(MlaResource):
                 cu_seqlens_q=self.cu_seqlens_q,
                 batch_idx=batch_idx,
             )
+            # Invalid rows form an unused address from safe coordinates.
+            output_query_row = public_query_flat_row(
+                cfg, storage_flat_query_row, batch_idx, self.cu_seqlens_q
+            )
+            col = (
+                head_dim_offset
+                + Int32(v_stage_idx * cfg.head_dim_per_stage_v)
+                + chunk * Int32(16 // cfg.o_dtype_bytes)
+            )
+            elem = Int64(output_query_row) * Int64(cfg.head_dim_v) + Int64(col)
+            dst_ptr = cutlass.inttoptr(
+                self.o_tensor.iterator.raw_ptr().toint(Int64)
+                + elem * Int64(cfg.o_dtype_bytes),
+                mem_space=1,
+                dtype=Int32,
+            )
             if global_head_idx < Int32(cfg.num_heads_q) and valid_output_row:
-                output_query_row = public_query_flat_row(
-                    cfg, storage_flat_query_row, batch_idx, self.cu_seqlens_q
-                )
-                col = (
-                    head_dim_offset
-                    + Int32(v_stage_idx * cfg.head_dim_per_stage_v)
-                    + chunk * Int32(16 // cfg.o_dtype_bytes)
-                )
-                elem = Int64(output_query_row) * Int64(cfg.head_dim_v) + Int64(col)
-                dst_ptr = cutlass.inttoptr(
-                    self.o_tensor.iterator.raw_ptr().toint(Int64)
-                    + elem * Int64(cfg.o_dtype_bytes),
-                    mem_space=1,
-                    dtype=Int32,
-                )
                 dst_ptr.store(values, alignment=16)
         # The next stage overwrites this warp's slice.
         cute.arch.sync_warp()

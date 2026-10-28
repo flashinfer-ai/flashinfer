@@ -236,8 +236,10 @@ group per D128 stage, and converts each stage from SMEM. These copies issue
 before the tile's first KV slot is acquired: reused slots are released only after
 the previous tile's PV, which the in-order MMA issues after the next QK. With
 bundled CUDA >= 13.2 the exact E2M1 * E4M3 product is formed in F16. Final BF16
-rows pass through 16 KiB of SMEM so global stores write whole lines. Two
-metadata stages let the next tile's row IDs load during the current tile.
+rows pass through 16 KiB of SMEM so global stores write whole lines; each warp
+reads its staged rows before its predicated stores, and row sinks load before
+the correction task's first wait. Two metadata stages let the next tile's row
+IDs load during the current tile.
 
 Capture requires caller output/workspace and eager warmup for the same declaration.
 Keep addresses alive/fixed and update values in place. Changing Python scales
