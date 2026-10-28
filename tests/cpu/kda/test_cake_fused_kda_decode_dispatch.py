@@ -113,6 +113,7 @@ def _fake_inputs(heads=12):
     }
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("capability", "target"), (((10, 0), "sm100a"), ((10, 3), "sm103a"))
 )
@@ -174,6 +175,7 @@ def test_cake_selector_uses_only_explicit_mode_and_tensor_metadata(
     ]
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("capability", ((9, 0), (10, 1), (10, 2), (12, 0)))
 def test_cake_selector_rejects_unregistered_architectures(monkeypatch, capability):
     inputs = _fake_inputs()
@@ -202,6 +204,7 @@ def test_cake_selector_rejects_unregistered_architectures(monkeypatch, capabilit
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("heads", (16, 64))
 @pytest.mark.parametrize("capability", ((10, 0), (10, 3)))
 def test_cake_selector_falls_back_for_heads_without_routes(
@@ -234,6 +237,7 @@ def test_cake_selector_falls_back_for_heads_without_routes(
     )
 
 
+@pytest.mark.cpu_only
 def test_cake_targets_share_programs_but_have_distinct_build_identities():
     sm100_variants = cake_jit.get_cake_fused_kda_decode_variants()
     sm103_variants = cake_jit.get_cake_fused_kda_decode_variants("sm103a")
@@ -264,6 +268,7 @@ def test_cake_targets_share_programs_but_have_distinct_build_identities():
     )
 
 
+@pytest.mark.cpu_only
 def test_registry_routes_every_variant_to_one_generated_program():
     variants = cake_jit.get_cake_fused_kda_decode_variants()
     assert set(cake_jit.ROUTES) == {variant.name for variant in variants}
@@ -293,6 +298,7 @@ def test_registry_routes_every_variant_to_one_generated_program():
         assert len(variant.source_sha256) == 64
 
 
+@pytest.mark.cpu_only
 def test_bindings_render_to_the_former_per_program_text():
     # Every program's tvm-ffi binding is rendered from the template of its launch
     # ABI; the sidecar pins the rendered text to the sha256 of the checked-in
@@ -459,6 +465,7 @@ _ROUTE_BODIES: dict[str, tuple[str, tuple[str, ...]]] = {
 }
 
 
+@pytest.mark.cpu_only
 def test_route_table_pins_shared_kernel_bodies_and_knob_defines():
     assert set(_ROUTE_BODIES) == set(cake_jit.ROUTES)
     variants = cake_jit.get_cake_fused_kda_decode_variants()
@@ -483,6 +490,7 @@ def test_route_table_pins_shared_kernel_bodies_and_knob_defines():
             assert define.partition("=")[0] in text
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))
 def test_cake_selector_resolves_requested_target_registry(target):
     variant = cake_jit.select_cake_fused_kda_decode_variant(
@@ -530,6 +538,7 @@ def _select_positive_route(target, heads, rows, *, lower_bound=-5.0, wide=False)
 # The generic stride-taking programs serve every layout: the evaluation layout
 # (padded strides, lower_bound -5, norm_eps 1e-5) selects the same kernels as any
 # other layout.
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))
 @pytest.mark.parametrize(
     ("heads", "rows", "expected"),
@@ -581,6 +590,7 @@ def test_positive_f32_producer_and_partial_wave_routes(target, heads, rows, expe
     assert variant.slot_offset_bits == 32
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))
 def test_positive_routes_preserve_wide_offsets_and_runtime_config(target):
     variant = _select_positive_route(target, 12, 24, wide=True)
@@ -591,6 +601,7 @@ def test_positive_routes_preserve_wide_offsets_and_runtime_config(target):
         assert variant.name == "high_work_positive_f32"
 
 
+@pytest.mark.cpu_only
 def test_no_variant_pins_a_layout_or_a_runtime_configuration():
     for variant in cake_jit.get_cake_fused_kda_decode_variants():
         for rule in variant.eligibility:
@@ -699,6 +710,7 @@ _H8_ROUTES = (
 )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))
 @pytest.mark.parametrize(
     ("state_dtype", "state_indices_mode", "rows", "expected"),
@@ -721,6 +733,7 @@ def test_h8_routes_follow_cake_bands(
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))
 def test_h8_routes_preserve_wide_offsets_and_runtime_config(target):
     for state_dtype, state_indices_mode, rows, expected in _H8_ROUTES:
@@ -742,6 +755,7 @@ def test_h8_routes_preserve_wide_offsets_and_runtime_config(target):
         assert variant.name == expected
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))
 def test_h8_never_selects_other_heads_specialisations(target):
     excluded = {
@@ -755,6 +769,7 @@ def test_h8_never_selects_other_heads_specialisations(target):
             )
 
 
+@pytest.mark.cpu_only
 def test_unsupported_head_counts_are_rejected():
     for heads in (1, 4, 16, 64, 128):
         with pytest.raises(ValueError, match="head count"):
@@ -775,6 +790,7 @@ def test_unsupported_head_counts_are_rejected():
             )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))
 @pytest.mark.parametrize(
     "name",
@@ -796,6 +812,7 @@ def test_cluster_variants_launch_two_ctas_per_work_item(target, name):
     assert rule.state_indices_modes == ("positive_unique",)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))
 def test_regcap128_is_the_h8_one_wave_instantiation_of_wide512(target):
     # "wide512_regcap128_positive_f32" is wide512_positive_f32's schedule with the
@@ -837,6 +854,7 @@ def test_regcap128_is_the_h8_one_wave_instantiation_of_wide512(target):
         assert cake_jit._positive_f32_variants(8, rows) == (expected,)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))
 @pytest.mark.parametrize("name", ("stream_bf16", "stream_bf16_wide_slot_offsets"))
 def test_persistent_stream_variants_size_the_grid_by_resident_ctas(target, name):
@@ -858,6 +876,7 @@ def test_persistent_stream_variants_size_the_grid_by_resident_ctas(target, name)
     assert grid(variant, num_heads=8, num_rows=10, sm_count=148) == (80, 1, 1)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))
 def test_repeated_safe_variants_take_a_single_head_grid(target):
     # The program binding loops the rows with this grid (one launch per row); the host passes all rows.
@@ -873,6 +892,7 @@ def test_repeated_safe_variants_take_a_single_head_grid(target):
     ) == (24, 7, 1)
 
 
+@pytest.mark.cpu_only
 def test_persistent_rows_abi_extends_the_standard_argument_plan():
     standard = cake_jit.CAKE_FUSED_KDA_DECODE_ABIS["standard"]
     persistent = cake_jit.CAKE_FUSED_KDA_DECODE_ABIS["persistent_rows"]
@@ -882,6 +902,7 @@ def test_persistent_rows_abi_extends_the_standard_argument_plan():
     assert persistent[19:] == standard[18:]
 
 
+@pytest.mark.cpu_only
 def test_lower_bound_is_passed_in_log2_units():
     assert cake_jit.cake_fused_kda_decode_lower_bound_log2(None) == 0.0
     assert cake_jit.cake_fused_kda_decode_lower_bound_log2(-5.0) == pytest.approx(
@@ -889,6 +910,7 @@ def test_lower_bound_is_passed_in_log2_units():
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(("target", "minor"), (("sm100a", 0), ("sm103a", 3)))
 @pytest.mark.parametrize(
     ("name", "min_blocks"),
@@ -934,6 +956,7 @@ def test_cake_jit_spec_uses_exact_target_flags(
     cake_jit.gen_cake_fused_kda_decode_module.cache_clear()
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("name", "data_ptr"),
     (("conv_state", 0x100004), ("state", 0x100010), ("output", 0x100004)),
@@ -1028,6 +1051,7 @@ def _fake_variant(abi_kind, *, cluster_x=1, device_index=False):
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("lower_bound", "expected_config"),
     ((None, (0, 0.0, 1e-5)), (-5.0, (1, -5.0 * _LOG2E, 1e-5))),
@@ -1074,6 +1098,7 @@ def test_cake_submit_binds_caller_owned_storage_through_the_argument_plan(
     assert bound["lower_bound_log2"] == pytest.approx(expected_config[1])
 
 
+@pytest.mark.cpu_only
 def test_cake_repeated_submit_passes_every_row_in_one_call(monkeypatch):
     """Repeated-slot rows reach the module in one call; the binding walks the rows."""
     calls = []
@@ -1102,6 +1127,7 @@ def test_cake_repeated_submit_passes_every_row_in_one_call(monkeypatch):
     assert bound["x_row_stride"] == tensors["x"].stride(0)
 
 
+@pytest.mark.cpu_only
 def test_cake_persistent_submit_passes_every_row_and_sizes_the_grid(monkeypatch):
     calls = []
     monkeypatch.setattr(
@@ -1142,6 +1168,7 @@ def _patch_validated_run(monkeypatch, cake_variant):
     return cake_calls, fallback_calls
 
 
+@pytest.mark.cpu_only
 def test_default_backend_preserves_cute_dsl_without_consulting_cake(monkeypatch):
     inputs = _fake_inputs()
     output = inputs.pop("output")
@@ -1157,11 +1184,13 @@ def test_default_backend_preserves_cute_dsl_without_consulting_cake(monkeypatch)
     assert len(fallback_calls) == 1
 
 
+@pytest.mark.cpu_only
 def test_strict_cake_requires_host_known_state_indices_mode():
     with pytest.raises(ValueError, match="requires the host-known state_indices_mode"):
         fused.run_fused_kda_decode(**_fake_inputs(), backend="cake")
 
 
+@pytest.mark.cpu_only
 def test_strict_cake_dispatches_without_cute_fallback(monkeypatch):
     inputs = _fake_inputs()
     output = inputs.pop("output")
@@ -1182,6 +1211,7 @@ def test_strict_cake_dispatches_without_cute_fallback(monkeypatch):
     assert fallback_calls == []
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("backend", ("cake", "auto"))
 def test_no_cake_route_is_strict_or_falls_back(monkeypatch, backend):
     inputs = _fake_inputs()

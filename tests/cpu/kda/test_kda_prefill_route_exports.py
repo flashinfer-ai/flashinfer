@@ -182,6 +182,7 @@ def _prepare(
     return prepare_bf16_kda_prefill(q, k, v, g, beta, **kwargs)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("beta_layout", ["dense", "strided"])
 @pytest.mark.parametrize("sm_count", SM_COUNTS)
 @pytest.mark.parametrize("capability", CAPABILITIES, ids=["sm100a", "sm103a"])
@@ -230,6 +231,7 @@ UNBOUNDED_ROWS = (
 )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("capability", "B", "H", "T", "lower_bound", "indexed", "cp", "expected"),
     [
@@ -350,6 +352,7 @@ def test_route_selection_pins(
     assert planner.requests[-1][1] == module
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("capability", CAPABILITIES, ids=["sm100a", "sm103a"])
 @pytest.mark.parametrize(("B", "binned"), [(4, False), (16, True), (64, True)])
 def test_n16_checkpoint_launch_asks_for_work_bins_where_a_bin_chains_tasks(
@@ -377,6 +380,7 @@ UNBOUNDED_COMPOSITE_CHAIN = (
 )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("capability", "T", "cp", "expected"),
     [

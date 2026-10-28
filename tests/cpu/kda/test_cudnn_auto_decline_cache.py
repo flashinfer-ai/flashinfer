@@ -33,6 +33,7 @@ def isolated_cache():
     la._la_auto_decline_scopes.clear()
 
 
+@pytest.mark.cpu_only
 def test_cache_does_not_retain_tensors_or_exception_tracebacks():
     calls = []
 
@@ -52,6 +53,7 @@ def test_cache_does_not_retain_tensors_or_exception_tracebacks():
     assert calls == [1]
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "change",
     [
@@ -121,6 +123,7 @@ def test_distinct_descriptor_or_runtime_retries(monkeypatch, change):
     assert len(calls) == 2
 
 
+@pytest.mark.cpu_only
 def test_decline_cache_is_bounded(monkeypatch):
     monkeypatch.setattr(la, "_LA_AUTO_DECLINE_LIMIT", 2)
     calls = []
@@ -137,6 +140,7 @@ def test_decline_cache_is_bounded(monkeypatch):
     assert len(la._la_auto_declines) == 2
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "error_type", [RuntimeError, MemoryError, TypeError, NotImplementedError]
 )
@@ -156,6 +160,7 @@ def test_unmarked_failures_are_never_cached(error_type):
     assert not la._la_auto_declines
 
 
+@pytest.mark.cpu_only
 def test_successful_calls_do_not_compute_decline_keys(monkeypatch):
     def unexpected(*args, **kwargs):
         pytest.fail("no negative-cache key work is needed before any decline")
@@ -166,6 +171,7 @@ def test_successful_calls_do_not_compute_decline_keys(monkeypatch):
         assert la._try_cudnn_auto(lambda value: value, q) is q
 
 
+@pytest.mark.cpu_only
 def test_capture_build_decline_does_not_poison_eager(monkeypatch):
     monkeypatch.setattr(torch.Tensor, "is_cuda", property(lambda self: True))
     monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
@@ -189,6 +195,7 @@ def test_capture_build_decline_does_not_poison_eager(monkeypatch):
     assert not la._la_auto_declines
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("other_family", [False, True])
 def test_other_shapes_and_families_skip_full_keys_after_decline(
     monkeypatch, other_family

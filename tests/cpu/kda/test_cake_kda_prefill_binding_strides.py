@@ -48,6 +48,7 @@ def _consumes_token_stride(kernel_text, operand):
     return len(re.findall(rf"\b{operand}_token_stride\b", kernel_text)) >= 2
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("operand", ["g", "beta"])
 def test_contiguity_checks_follow_the_kernel_token_stride_reads(operand):
     contiguous_check = _check_fragment("contiguous", operand)

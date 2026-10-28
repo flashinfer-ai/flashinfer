@@ -32,6 +32,7 @@ PREPARED_EXPORTS = ("run", "run_prepare_tma", "run_prepared")
 SHIPPED = {name: cake_kda_tf32.MODULES[name] for name in cake_kda_tf32._MODULE_ROWS}
 
 
+@pytest.mark.cpu_only
 def test_every_module_has_one_binding_row_and_one_kernel_source():
     assert sorted(BINDINGS) == sorted(SHIPPED)
     for record in SHIPPED.values():
@@ -42,6 +43,7 @@ def test_every_module_has_one_binding_row_and_one_kernel_source():
         ), source
 
 
+@pytest.mark.cpu_only
 def test_bindings_render_to_the_pinned_text():
     # The sidecar pins the sha256 of each rendered binding (keyed by module).
     sidecar = Path(__file__).with_name("cake_kda_prefill_binding_sha256.json")
@@ -70,6 +72,7 @@ def test_bindings_render_to_the_pinned_text():
     assert len(namespaces) == len(SHIPPED)
 
 
+@pytest.mark.cpu_only
 def test_prepared_launch_skips_descriptor_encoding():
     # Only the preparing actions encode and upload the TMA descriptors and opt
     # the kernel into its dynamic shared memory; the launch-only action reuses
@@ -93,6 +96,7 @@ def test_prepared_launch_skips_descriptor_encoding():
         assert preparing.count("EnsureMaxDynamicSharedMemory(") == opt_ins
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", cake_kda_tf32.ARCHES)
 def test_spec_lists_the_kernel_body_and_the_rendered_binding(
     monkeypatch, tmp_path, arch

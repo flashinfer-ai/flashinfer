@@ -45,6 +45,7 @@ def adapter(monkeypatch):
     return module
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "version,ordered,decline",
     [
@@ -142,6 +143,7 @@ def test_kda_state_update_survives_older_or_declining_frontend(
         assert rejected, "the simulated unsupported overwrite path was not exercised"
 
 
+@pytest.mark.cpu_only
 def test_kda_does_not_hide_an_unexpected_graph_build_failure(monkeypatch, adapter):
     monkeypatch.setattr(adapter.cudnn, "__version__", "1.30.0")
 
@@ -162,6 +164,7 @@ def test_kda_does_not_hide_an_unexpected_graph_build_failure(monkeypatch, adapte
         )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("inference_mode", [False, True])
 def test_kda_preserves_inference_tensor_mutation_rules(
     monkeypatch, adapter, inference_mode
@@ -209,6 +212,7 @@ def _pool_inputs():
     )
 
 
+@pytest.mark.cpu_only
 def test_kda_pool_requires_new_frontend_before_any_state_write(monkeypatch, adapter):
     monkeypatch.setattr(adapter.cudnn, "__version__", "1.30.0")
     inputs = _pool_inputs()
@@ -218,6 +222,7 @@ def test_kda_pool_requires_new_frontend_before_any_state_write(monkeypatch, adap
     torch.testing.assert_close(inputs["initial_state"], before)
 
 
+@pytest.mark.cpu_only
 def test_kda_pool_declining_plan_does_not_retry_with_compact_scratch(
     monkeypatch, adapter
 ):

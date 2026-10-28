@@ -12,7 +12,7 @@ import pytest
 
 _BENCHMARK = runpy.run_path(
     str(
-        Path(__file__).resolve().parents[2]
+        Path(__file__).resolve().parents[3]
         / "benchmarks"
         / "bench_cudnn_linear_attention.py"
     )
@@ -29,6 +29,7 @@ def adapter(monkeypatch):
     return adapter
 
 
+@pytest.mark.cpu_only
 def test_route_observes_success_without_frontend_private_frames(adapter):
     original = adapter._run_la_graph
     previous_profile = sys.getprofile()
@@ -41,6 +42,7 @@ def test_route_observes_success_without_frontend_private_frames(adapter):
     assert sys.getprofile() is previous_profile
 
 
+@pytest.mark.cpu_only
 def test_build_decline_followed_by_native_fallback_is_not_cudnn(adapter):
     def decline():
         raise NotImplementedError("unsupported build")
@@ -62,6 +64,7 @@ def test_build_decline_followed_by_native_fallback_is_not_cudnn(adapter):
     assert adapter._run_la_graph is decline
 
 
+@pytest.mark.cpu_only
 def test_execute_error_propagates_and_restores_observers(adapter):
     error = RuntimeError("execution failed")
 
@@ -77,17 +80,20 @@ def test_execute_error_propagates_and_restores_observers(adapter):
     assert sys.getprofile() is previous_profile
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("backend", ["native-auto", "cake_gdn"])
 def test_native_controls_reject_cudnn_execution(backend):
     with pytest.raises(AssertionError, match="unexpectedly executed cuDNN"):
         check_route(backend, dict(cudnn_executions=1, frontend_plans=[]))
 
 
+@pytest.mark.cpu_only
 def test_frontend_plan_cannot_hide_missing_adapter_observation():
     with pytest.raises(AssertionError, match="bypassed"):
         check_route("auto", dict(cudnn_executions=0, frontend_plans=[{}]))
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("eager", [0, 1])
 @pytest.mark.parametrize("captured", [0, 1])
 def test_eager_and_capture_must_execute_the_same_provider(eager, captured):
