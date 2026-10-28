@@ -5421,6 +5421,9 @@ def compile_w4a16_fused_moe(
                 "fused W4A16 FC1/FC2 selected different thread counts: "
                 f"{fc1_cta_threads} vs {fc2_cta_threads}"
             )
+    # These decode widening rules use the m8-only register specializations.
+    # Small expert banks may select larger route blocks; retain their generic
+    # tile selection instead of constructing an unsupported resource model.
     # TC-decode FC1 wide-N override (single-wave-collapse sizes only): in the m8
     # fused path the host right-sizes grid_x to the FC1 mn-tile count and forces
     # one whole mn-tile per CTA over the full K. With the default fc1_tile_n=128,
@@ -5446,6 +5449,7 @@ def compile_w4a16_fused_moe(
     )
     if (
         bool(tc_decode_fused_sum)
+        and int(moe_block_size) == 8
         and int(fc1_cols) % 256 == 0
         and fc1_tile_n == 128
         and (fc1_tile_n * fc1_tile_k) // 64 == 256
@@ -5479,6 +5483,7 @@ def compile_w4a16_fused_moe(
     # thread-geometry contract is preserved.
     if (
         bool(tc_decode_fused_sum)
+        and int(moe_block_size) == 8
         and int(hidden_size) % 256 == 0
         and fc2_tile_n == 128
         and fc1_cta_threads == 256
@@ -5524,6 +5529,7 @@ def compile_w4a16_fused_moe(
     )
     if (
         bool(tc_decode_fused_sum)
+        and int(moe_block_size) == 8
         and int(hidden_size) % 512 == 0
         and fc2_tile_n == 256
         and fc1_cta_threads == 256
