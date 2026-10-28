@@ -415,7 +415,8 @@ def test_paged_warmup_and_cuda_graph_replay():
 def test_paged_cluster_rows_far_below_envelope(rows):
     """Cluster family (CS = 4 / 2) at a large envelope with every row far
     below it (solo rows), through capture and a replay with longer lengths
-    (cluster rows), against the transformed local output."""
+    (cluster rows), against the transformed local output, which is itself
+    checked against torch.topk."""
     ncols, top_k, page_size = 131072, 512, 64
     assert _host._varlen_launcher(rows, ncols, top_k, ncols, 1, 1, True, 6)[0] == "clus"
     lg = torch.randn((rows, ncols), dtype=torch.float32, device=_DEV)
@@ -423,7 +424,24 @@ def test_paged_cluster_rows_far_below_envelope(rows):
     lens = torch.randint(top_k - 8, 9000, (rows,), generator=gen, device=_DEV)
     lens = lens.to(torch.int32)
     pt = _page_table(rows, ncols, page_size, seed=41)
-    loc, pg = _run_pair(lg, lens, top_k, pt, page_size)
+
+    def exact_pair():
+        loc, pg = _run_pair(lg, lens, top_k, pt, page_size)
+        for r in range(rows):
+            n = int(lens[r])
+            if n <= top_k:  # the whole row, then -1 padding
+                want = torch.arange(n, dtype=torch.int32, device=_DEV)
+                assert torch.equal(loc[r, :n].sort().values, want), f"row {r}"
+                assert bool((loc[r, n:] == -1).all()), f"row {r} padding"
+                continue
+            idx = loc[r].to(torch.int64)
+            assert int(idx.min()) >= 0 and int(idx.max()) < n
+            assert idx.unique().numel() == top_k, f"row {r} duplicates"
+            ref = torch.topk(lg[r, :n], top_k).values.sort().values
+            assert torch.equal(lg[r, idx].sort().values, ref), f"row {r} inexact"
+        return loc, pg
+
+    loc, pg = exact_pair()
     assert _same_rows(pg, _expected(loc, pt, 1, page_size))
     out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
     kw = dict(out_indices=out, backend="gvr_2", page_table=pt, page_size=page_size)
@@ -438,10 +456,10 @@ def test_paged_cluster_rows_far_below_envelope(rows):
         flashinfer.top_k_varlen(lg, lens, top_k, **kw)
     torch.cuda.current_stream().wait_stream(s)
     lens.copy_(torch.randint(20000, ncols + 1, (rows,), generator=gen, device=_DEV))
+    out.fill_(-7)
     g.replay()
     torch.cuda.synchronize()
-    loc, _ = flashinfer.top_k_varlen(lg, lens, top_k, backend="gvr_2")
-    torch.cuda.synchronize()
+    loc, _ = exact_pair()
     assert _same_rows(out, _expected(loc, pt, 1, page_size))
 
 
