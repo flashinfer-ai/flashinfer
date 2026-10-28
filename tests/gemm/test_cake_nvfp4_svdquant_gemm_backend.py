@@ -982,6 +982,10 @@ def test_tailsplit_units_schedule() -> None:
     assert units(m=4096, n=12288, sm_count=148) == (768, 796, 740, 2)
     # 192 pair tiles on 76 pairs: 2 waves + 40 tail tiles, 80 > 76 -> whole tiles.
     assert units(m=4096, n=3072, sm_count=152) == (192, 192, 192, 1)
+    # 1296 pair tiles (27 x 48) on 74 pairs: 17 waves + 38 tail tiles, 76 > 74 ->
+    # whole tiles; on 76 pairs 17 waves + 4 tail tiles -> 8 half units.
+    assert units(m=6889, n=12288, sm_count=148) == (1296, 1296, 1296, 1)
+    assert units(m=6889, n=12288, sm_count=152) == (1296, 1300, 1292, 2)
     # A whole number of waves: nothing to split.
     assert units(m=4096, n=3072, sm_count=128) == (192, 192, 192, 1)
     # Forced schedules and the admitted values.
@@ -992,15 +996,29 @@ def test_tailsplit_units_schedule() -> None:
 
 
 def test_tailsplit_rows_split_on_this_device() -> None:
-    """Every row routed to the tail-split program splits its tail on the
-    device the suite runs on (148 or 152 SMs)."""
+    """Every row routed to the tail-split program has a partial last wave on
+    the device the suite runs on (148 or 152 SMs), and splits it unless the
+    split would need more pairs than the device has: the tail tiles become half
+    units when twice their number fits the CTA pairs, otherwise they stay whole
+    tiles.  (6889, 12288) is such a row on 148 SMs: 1296 tiles are 17 waves of
+    74 pairs and 38 tail tiles, whose 76 half units exceed the 74 pairs; the
+    program still won that row on sm_100a by measurement."""
     sms = loader.sm_count(_device().index or 0)
+    pairs = sms // 2
     for row in (*PERF_ROWS, *COVERAGE_ROWS):
         m, n, k, rank, bias = row
         if loader.MODULES[_route(row)]["plan"]["grid_rule"] != "pair_tailsplit":
             continue
         tiles, units, full, split = loader.tailsplit_units(m=m, n=n, sm_count=sms)
-        assert split == 2 and full < units, (_row_id(row), sms)
+        tail = tiles % pairs
+        assert tail > 0, (_row_id(row), sms)
+        if 2 * tail <= pairs:
+            assert (units, full, split) == (tiles + tail, tiles - tail, 2), (
+                _row_id(row),
+                sms,
+            )
+        else:
+            assert (units, full, split) == (tiles, tiles, 1), (_row_id(row), sms)
 
 
 def _raster_tile(
