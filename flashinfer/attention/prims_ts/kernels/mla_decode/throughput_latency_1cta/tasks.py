@@ -651,6 +651,8 @@ def create_keeps_mma_ab_correction_task(
                     tail_o_stage_idx_0,
                     tail_o_stage_idx_1,
                 ) = work_tile_state
+            # Tail-only global inputs load before the first stats wait.
+            tmem_corr.prefetch_tail_inputs()
             local_state = load_initial_local_stats(local_state)
             with domain_loop(0, domain, 1):
                 (
