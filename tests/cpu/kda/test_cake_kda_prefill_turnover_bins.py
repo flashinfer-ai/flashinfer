@@ -1,3 +1,17 @@
+# Copyright (c) 2026 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Turnover work bins of short direct M128 N32 launches (CPU; no GPU needed).
 
 The strict bin test (``_use_direct_work_bins``) bins a direct launch only where
@@ -6,7 +20,10 @@ strict test keeps one task per CTA also asks for work bins, for its module's
 turnover build only, where bins that charge every task
 ``BF16_WORK_BIN_TURNOVER_TASK_COST`` chunks pay (``_use_turnover_work_bins``).
 It builds that assignment (``task_cost``) and keeps one task per CTA where its
-module has no turnover build; the composite's split parts never ask.
+module has no turnover build; the composite's split parts never ask.  Only an
+unbounded (softplus gate) launch asks (``_turnover_bins_route``): a bounded
+launch keeps one task per CTA, and its module's turnover build takes bounded
+work-binned launches only (``_bounded_turnover_route``).
 """
 
 from functools import partial
@@ -112,6 +129,75 @@ def test_turnover_bins_route_per_part(
             gpu_arch=arch,
             sm_count=sm_count,
         )
+
+
+def _route_facts(lengths, heads, arch, sm_count):
+    return dict(
+        route=runtime.BF16_ROUTE_DIRECT_M128,
+        tf32_direct=False,
+        n32_ft_slab=False,
+        seq_lens=tuple(lengths),
+        num_heads=heads,
+        sm_count=sm_count,
+        gpu_arch=arch,
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("unbounded", [True, False], ids=["unbounded", "bounded"])
+@pytest.mark.parametrize(("arch", "sm_count"), PARTS)
+@pytest.mark.parametrize(("lengths", "heads", "on_b200", "on_gb300"), SHAPES)
+def test_turnover_bins_route_takes_unbounded_launches_only(
+    arch, sm_count, lengths, heads, on_b200, on_gb300, unbounded
+):
+    """The launch's composed decision (``_turnover_bins_route``) on each part:
+    an unbounded direct N32 launch takes turnover bins exactly where the rule
+    does; a bounded launch never does, nor a work-binned, TF32 direct, N32 FT
+    slab or N16 launch."""
+    want = unbounded and (on_b200 if sm_count == 148 else on_gb300)
+    facts = dict(
+        _route_facts(lengths, heads, arch, sm_count),
+        strict=_strict(lengths, heads, sm_count),
+        unbounded=unbounded,
+    )
+    assert runtime._turnover_bins_route(**facts) == want
+    for change in (
+        dict(strict=True),
+        dict(tf32_direct=True),
+        dict(n32_ft_slab=True),
+        dict(route=runtime.BF16_ROUTE_DIRECT_M128_N16),
+    ):
+        assert not runtime._turnover_bins_route(**{**facts, **change}), change
+
+
+# Bounded launches the strict test keeps one task per CTA where, on both parts,
+# the turnover-bin rule and the bounded predicate (on the strict table) both
+# hold: the gate alone keeps them on one task per CTA.
+BOUNDED_ONE_TASK_SHAPES = [
+    pytest.param((256,) * 2 + (128,) * 12, 16, id="2x256+12x128-h16"),
+    pytest.param((256,) * 3 + (128,) * 14, 12, id="3x256+14x128-h12"),
+    pytest.param((256,) * 6 + (128,) * 4, 16, id="6x256+4x128-h16"),
+]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(("arch", "sm_count"), PARTS)
+@pytest.mark.parametrize(("lengths", "heads"), BOUNDED_ONE_TASK_SHAPES)
+def test_bounded_launches_never_ask_for_turnover_bins(arch, sm_count, lengths, heads):
+    assert not _strict(lengths, heads, sm_count)
+    assert runtime._use_turnover_work_bins(
+        tuple(lengths), num_heads=heads, sm_count=sm_count, gpu_arch=arch
+    )
+    assert runtime._bounded_turnover_route(
+        bounded_gate=True,
+        seq_lens=tuple(lengths),
+        num_heads=heads,
+        gpu_arch=arch,
+        sm_count=sm_count,
+    )
+    facts = dict(_route_facts(lengths, heads, arch, sm_count), strict=False)
+    assert runtime._turnover_bins_route(**facts, unbounded=True)
+    assert not runtime._turnover_bins_route(**facts, unbounded=False)
 
 
 @pytest.mark.cpu_only
