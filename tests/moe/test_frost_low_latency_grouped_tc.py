@@ -122,7 +122,17 @@ def test_route_members_order_and_live_graph_inputs(dtype, length, group):
 
 
 def _run_projection(
-    activation, dtype, outdtype, t, k, g, stages, tile_k, narrow, finalize
+    activation,
+    dtype,
+    outdtype,
+    t,
+    k,
+    g,
+    stages,
+    tile_k,
+    narrow,
+    finalize,
+    weight_first=False,
 ):
     _require_grouped_tc()
     from cutlass import cute
@@ -159,6 +169,7 @@ def _run_projection(
         finalize,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         int("".join(map(str, torch.cuda.get_device_capability()))),
+        weight_first,
         options=(
             f"--gpu-arch sm_{torch.cuda.get_device_capability()[0]}0"
             f"{'' if torch.cuda.get_device_capability() == (8, 0) else 'a'} --enable-tvm-ffi"
@@ -452,6 +463,8 @@ def test_bounded_tactics_share_original_weights(tokens, dtype, activation):
             else ((8, 2, 128), (4, 2, 64), (2, 2, 64), (2, 2, 128))
         )
         expected_tactics = [("warp_mma", *choice) for choice in choices]
+        if tokens == 8 and activation == SwiGLU():
+            expected_tactics += [("warp_mma", *choice, True) for choice in choices]
     assert grouped == expected_tactics
     assert len(tactics) == 16 + len(expected_tactics)
     # Repeated routes share weights; values change after each compiled choice.
@@ -766,3 +779,125 @@ def test_invalid_route_scores_are_ignored_after_graph_capture(
         assert torch.isfinite(got).all()
         assert delta.norm() / expected.double().norm() < 0.01
         assert delta.abs().max() / expected.double().abs().max() < 0.03
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_sm120_weight_first_cache_and_live_graphs(dtype, monkeypatch):
+    _require_grouped_tc()
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("Weight-first scheduling is qualified on SM120")
+    from cutlass import cute
+    from flashinfer.fused_moe.backends.frost_low_latency import runtime
+
+    # Isolate this test's metadata cache without clearing other tests' entries.
+    cache = {}
+    monkeypatch.setattr(runtime, "_COMPILED", cache)
+    cases = []
+    for _ in range(2):
+        cfg, x, w1, w2, ids, scores, weights = _inputs(
+            SwiGLU(),
+            tokens=8,
+            hidden=2048,
+            intermediate=512,
+            experts=19,
+            topk=10,
+            dtype=dtype,
+            output_dtype=dtype,
+        )
+        runner = FrostLowLatencyRunner(cfg, x.device)
+        runner.check_support()
+        runner.build()
+        inputs = runner.pack_inputs(MoEActivationPack(x, None, ids, scores), weights)
+        # Preparation owns copies of the checkpoint weights. Mutate the live
+        # prepared buffers, not the original pre-preparation tensors.
+        assert inputs[3].data_ptr() != w1.data_ptr()
+        assert inputs[4].data_ptr() != w2.data_ptr()
+        cases.append((runner, inputs, x, inputs[3], inputs[4], ids, scores))
+    old = ("warp_mma", 4, 2, 64)
+    overlap = (*old, True)
+    runner, inputs, *_ = cases[0]
+    a = runner.forward(inputs, old).clone()
+    b = runner.forward(inputs, overlap).clone()
+    torch.testing.assert_close(a, b, rtol=0, atol=0)
+    # Both scheduling choices must occupy distinct compile-cache entries.
+    assert len(cache) == 2
+    assert {key[4] for key in cache} == {old, overlap}
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("Live buffers with identical metadata recompiled")
+
+    monkeypatch.setattr(cute, "compile", unexpected)
+    graphs = []
+    for runner, inputs, *_ in cases:
+        for tactic in (old, overlap):
+            runner.forward(inputs, tactic)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                runner.forward(inputs, tactic)
+            graphs.append(graph)
+    for _epoch in range(2):
+        for index, (_runner, inputs, x, w1, w2, ids, scores) in enumerate(cases):
+            x.mul_(-0.75 if index else 0.5)
+            w1.mul_(0.75)
+            w2.neg_()
+            ids.add_(1).remainder_(19)
+            scores.copy_(scores.flip(1))
+            _, expected, _ = _reference(
+                x, w1, w2, ids, scores, SwiGLU(), True, output_dtype=dtype
+            )
+            for graph in graphs[2 * index : 2 * index + 2]:
+                for buf in inputs[5:8]:
+                    buf.fill_(float("nan"))
+                graph.replay()
+                torch.cuda.synchronize()
+                got = inputs[7]
+                error = (
+                    got.double() - expected.double()
+                ).norm() / expected.double().norm()
+                max_error = (
+                    got.double() - expected.double()
+                ).abs().max() / expected.double().abs().max()
+                assert torch.isfinite(got).all() and error < 0.01 and max_error < 0.03
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "tokens4",
+        "hidden",
+        "intermediate",
+        "topk",
+        "activation",
+        "output_dtype",
+        "finalize",
+    ],
+)
+def test_sm120_weight_first_rejects_unqualified_manual_tactics(case):
+    _require_grouped_tc()
+    if torch.cuda.get_device_capability() != (12, 0):
+        pytest.skip("Weight-first scheduling is qualified on SM120")
+    args = dict(tokens=8, hidden=2048, intermediate=512, experts=17, topk=10)
+    activation = SwiGLU()
+    if case == "tokens4":
+        args["tokens"] = 4
+    elif case == "hidden":
+        args["hidden"] = 1024
+    elif case == "intermediate":
+        args["intermediate"] = 256
+    elif case == "topk":
+        args["topk"] = 8
+    elif case == "activation":
+        activation = GeGLU()
+    elif case == "output_dtype":
+        args["output_dtype"] = torch.float16
+    cfg, x, _, _, ids, scores, weights = _inputs(activation, **args)
+    if case == "finalize":
+        cfg = replace(cfg, finalize=MoEFinalizeConfig(do_finalize=False))
+    runner = FrostLowLatencyRunner(cfg, x.device)
+    runner.check_support()
+    runner.build()
+    inputs = runner.pack_inputs(MoEActivationPack(x, None, ids, scores), weights)
+    tactic = ("warp_mma", 4, 2, 64, True)
+    assert tactic not in runner.get_valid_tactics(inputs, None)
+    with pytest.raises(ValueError, match="Weight-first grouped decode requires"):
+        runner.forward(inputs, tactic)
