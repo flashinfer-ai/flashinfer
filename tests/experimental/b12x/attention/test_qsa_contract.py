@@ -119,9 +119,36 @@ def _allocate_binding(
     caps: qsa.Caps,
     *,
     plan: qsa.Plan | None = None,
+    request_dtype: torch.dtype = torch.int64,
+    raw_state_slot_ids: torch.Tensor | None = None,
+    rope_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> qsa.Binding:
-    declaration = qsa.plan(caps, invocation=_invocation(caps)) if plan is None else plan
     device = caps.device
+    slot_ids = (
+        torch.arange(caps.max_batch, dtype=torch.int64, device=device)
+        if raw_state_slot_ids is None
+        else raw_state_slot_ids
+    )
+    rope_overrides = {}
+    if rope_cache is not None:
+        for name, tensor in zip(("rope_cos", "rope_sin"), rope_cache, strict=True):
+            rope_overrides[name] = {
+                "dtype": str(tensor.dtype).removeprefix("torch."),
+                "strides": tuple(tensor.stride()),
+            }
+    invocation = _invocation(
+        caps,
+        **rope_overrides,
+        request_ids={
+            "dtype": str(request_dtype).removeprefix("torch."),
+            "strides": (1,),
+        },
+        raw_state_slot_ids={
+            "dtype": str(slot_ids.dtype).removeprefix("torch."),
+            "strides": tuple(slot_ids.stride()),
+        },
+    )
+    declaration = qsa.plan(caps, invocation=invocation) if plan is None else plan
     main_k = torch.empty(
         (
             caps.num_main_cache_pages,
@@ -185,17 +212,17 @@ def _allocate_binding(
         dtype=torch.int64,
         device=device,
     )
-    slot_ids = torch.arange(
-        caps.max_batch, dtype=torch.int64, device=device
-    ).contiguous()
     q_weight = torch.zeros((caps.index_head_dim,), dtype=torch.float32, device=device)
     k_weight = torch.zeros_like(q_weight)
-    rope_cos = torch.ones(
-        (caps.max_seq_len, caps.index_rotary_dim // 2),
-        dtype=torch.float32,
-        device=device,
-    )
-    rope_sin = torch.zeros_like(rope_cos)
+    if rope_cache is None:
+        rope_cos = torch.ones(
+            (caps.max_seq_len, caps.index_rotary_dim // 2),
+            dtype=torch.float32,
+            device=device,
+        )
+        rope_sin = torch.zeros_like(rope_cos)
+    else:
+        rope_cos, rope_sin = rope_cache
     output = torch.empty(
         (caps.max_q_rows, caps.q_heads, caps.head_dim),
         dtype=torch.bfloat16,
@@ -534,11 +561,19 @@ def _dynamic_inputs(
         dtype=torch.float32,
         device="cpu",
     ).to(device=device, dtype=torch.bfloat16)
-    request_tensor = torch.tensor(request_ids, dtype=torch.int64, device=device)
-    position_tensor = torch.tensor(positions, dtype=torch.int64, device=device)
-    rope_positions = (
-        position_tensor[:, None].expand(rows, caps.position_axes).contiguous()
+    request_dtype = getattr(
+        torch, binding.state.abi["operands"]["request_ids"]["dtype"]
     )
+    request_tensor = torch.tensor(request_ids, dtype=request_dtype, device=device)
+    position_tensor = torch.tensor(positions, dtype=torch.int64, device=device)
+    rope_abi = binding.state.abi["operands"]["rope_positions"]
+    rope_positions = torch.empty_strided(
+        (rows, caps.position_axes),
+        tuple(rope_abi["strides"]),
+        dtype=getattr(torch, rope_abi["dtype"]),
+        device=device,
+    )
+    rope_positions.copy_(position_tensor[:, None])
     sequence_lengths = torch.zeros((caps.max_batch,), dtype=torch.int32, device=device)
     query_start_loc_values = [0]
     cursor = 0
@@ -819,7 +854,7 @@ def test_qsa_scaled_topk_scratch_executes_fixed_capacity_rows(rows: int) -> None
     result = qsa.run(binding, **dynamic)
 
     if rows > 204:
-        assert binding.plan._layout.topk_nbytes > 1024 * 1024
+        assert binding.state._layout.topk_nbytes > 1024 * 1024
     assert torch.isfinite(result).all()
     assert torch.all(binding.selected_positions[:rows, 0] == 0)
     assert torch.all(binding.selected_positions[:rows, 1:] == -1)
@@ -847,11 +882,12 @@ def test_qsa_binding_exposes_views_into_one_scratch_allocation() -> None:
 def test_qsa_binds_strided_int32_raw_state_column_and_int32_request_ids() -> None:
     device = require_sm120()
     caps = _caps(device)
-    binding = _allocate_binding(caps)
     raw_block_table = torch.tensor([[2, 91], [1, 92]], dtype=torch.int32, device=device)
     raw_state_slot_ids = raw_block_table[:, 0]
     assert raw_state_slot_ids.stride() == (2,)
-    binding = _rebind(binding, raw_state_slot_ids=raw_state_slot_ids)
+    binding = _allocate_binding(
+        caps, request_dtype=torch.int32, raw_state_slot_ids=raw_state_slot_ids
+    )
     binding.main_block_table[:, 0] = 0
     binding.compressed_block_table[0, 0] = 0
     binding.compressed_block_table[1, 0] = 1
@@ -881,16 +917,18 @@ def test_qsa_separate_raw_storage_can_exceed_compressed_page_bytes() -> None:
     device = require_sm120()
     caps = _caps(
         device,
+        index_head_dim=128,
+        index_rotary_dim=8,
         max_batch=1,
         max_raw_state_slots=1,
         max_q_rows=1,
-        main_page_size=32,
-        compressed_page_size=8,
+        main_page_size=16,
+        compressed_page_size=4,
         position_axes=3,
         mrope_sections=(2, 1, 1),
     )
-    assert caps.raw_page_nbytes == 264
-    assert caps.compressed_page_nbytes == 256
+    assert caps.raw_page_nbytes == 1160
+    assert caps.compressed_page_nbytes == 1024
     assert not caps.cache_requirements.shared_compressed_raw_storage_legal
     binding = _allocate_binding(caps)
     binding.main_block_table[0, 0] = 0
@@ -908,11 +946,13 @@ def test_qsa_shared_raw_storage_rejects_page_tail_overflow() -> None:
     device = require_sm120()
     caps = _caps(
         device,
+        index_head_dim=128,
+        index_rotary_dim=8,
         max_batch=1,
         max_raw_state_slots=1,
         max_q_rows=1,
-        main_page_size=32,
-        compressed_page_size=8,
+        main_page_size=16,
+        compressed_page_size=4,
         position_axes=3,
         mrope_sections=(2, 1, 1),
     )
@@ -1235,6 +1275,8 @@ def test_qsa_prepare_query_matches_scalar_and_mrope_reference(
     device = require_sm120()
     caps = _caps(
         device,
+        index_head_dim=128,
+        index_rotary_dim=8,
         position_axes=position_axes,
         mrope_sections=sections,
         mrope_interleaved=interleaved,
@@ -1360,6 +1402,8 @@ def test_qsa_completed_group_compression_matches_bf16_rounding_and_rope(
     sections = (2, 1, 1) if interleaved else None
     caps = _caps(
         device,
+        index_head_dim=128,
+        index_rotary_dim=8,
         position_axes=position_axes,
         mrope_sections=sections,
         mrope_interleaved=interleaved,
@@ -1676,9 +1720,15 @@ def test_qsa_cute_scores_preserve_paged_contract_under_graph_replay(
             caps=caps,
         )
 
+    cases = ((1, 0, 65), (4, 0, groups), (16, 32768, 32768))
+    # The Triton oracle specializes independently of the CuTe implementation.
+    # Warm its variants before freezing resolution; keep only one CuTe warm-up
+    # so the guard still checks reuse across the live row/chunk geometries.
+    for rows, offset, count in cases:
+        invoke(launch_score_representatives, rows, offset, count, False)
     invoke(launch_cute, 16, 0, groups, True)
     with kernel_resolution_guard("QSA score rows and chunks are runtime quantities"):
-        for rows, offset, count in ((1, 0, 65), (4, 0, groups), (16, 32768, 32768)):
+        for rows, offset, count in cases:
             graph = _cuda_graph()
             with torch.cuda.graph(graph):
                 invoke(launch_cute, rows, offset, count, True)
@@ -2444,13 +2494,27 @@ def test_qsa_tp4_geometry_matches_reference_under_cuda_graph_replay() -> None:
         mrope_sections=(11, 11, 10),
         mrope_interleaved=True,
     )
+    generator = torch.Generator(device="cpu").manual_seed(189223)
+    combined_rope_cache = torch.randn(
+        (caps.max_seq_len, caps.index_rotary_dim),
+        generator=generator,
+        dtype=torch.float32,
+        device="cpu",
+    ).to(device=device, dtype=torch.bfloat16)
+    rotary_half = caps.index_rotary_dim // 2
+    rope_cos = combined_rope_cache[:, :rotary_half]
+    rope_sin = combined_rope_cache[:, rotary_half:]
+    assert rope_cos.stride() == rope_sin.stride() == (caps.index_rotary_dim, 1)
     binding = _allocate_binding(
         caps,
+        rope_cache=(rope_cos, rope_sin),
         plan=qsa.plan(
             caps,
             invocation=_invocation(
                 caps,
                 rope_positions={"dtype": "int64", "strides": (1, 3)},
+                rope_cos={"dtype": "bfloat16", "strides": tuple(rope_cos.stride())},
+                rope_sin={"dtype": "bfloat16", "strides": tuple(rope_sin.stride())},
             ),
         ),
     )
@@ -2471,18 +2535,6 @@ def test_qsa_tp4_geometry_matches_reference_under_cuda_graph_replay() -> None:
     )
     prior_raw_keys = binding.raw_k_ring[0, :3].clone()
     prior_rope_positions = binding.raw_rope_positions[0, :3].clone()
-    generator = torch.Generator(device="cpu").manual_seed(189223)
-    combined_rope_cache = torch.randn(
-        (caps.max_seq_len, caps.index_rotary_dim),
-        generator=generator,
-        dtype=torch.float32,
-        device="cpu",
-    ).to(device=device, dtype=torch.bfloat16)
-    rotary_half = caps.index_rotary_dim // 2
-    rope_cos = combined_rope_cache[:, :rotary_half]
-    rope_sin = combined_rope_cache[:, rotary_half:]
-    assert rope_cos.stride() == rope_sin.stride() == (caps.index_rotary_dim, 1)
-    binding = _rebind(binding, rope_cos=rope_cos, rope_sin=rope_sin)
 
     dynamic = _dynamic_inputs(
         binding,
