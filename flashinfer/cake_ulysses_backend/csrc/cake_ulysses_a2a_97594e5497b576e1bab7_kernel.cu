@@ -2094,6 +2094,7 @@ kernel_cake_ulysses_a2a_97594e5497b576e1bab7(__half* __restrict__ inp, __half* o
     __syncthreads();
     if (tid_0 == 0) {
         asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(landed), "r"(epoch) : "memory");
+        asm volatile("fence.acq_rel.sys;" ::: "memory");
         {
         unsigned int _acquire_observed;
         do {
