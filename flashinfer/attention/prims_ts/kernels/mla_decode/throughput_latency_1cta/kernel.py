@@ -1852,6 +1852,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         self.direct_sparse = False
         self.assume_valid_prefix = False
         self.direct_sparse_capacities = (0, 0)
+        self.coalesce_keeps_output = False
 
         cfg = self._make_config()
         # Parallel standalone reduction requires a fixed split profile and a
@@ -2043,6 +2044,8 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 assume_valid_prefix=self.assume_valid_prefix,
                 source_capacities=self.direct_sparse_capacities,
             )
+        if self.coalesce_keeps_output:
+            cfg = dataclass_replace(cfg, coalesce_keeps_output=True)
         if self.split_kv_capacity is not None and cfg.use_multi_ctas_kv == 1:
             cfg = dataclass_replace(cfg, num_ctas_per_seq_kv=self.split_kv_capacity)
         if not self.fixed_seqlen:

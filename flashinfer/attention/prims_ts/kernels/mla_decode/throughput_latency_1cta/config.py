@@ -197,6 +197,8 @@ class MlaConfig(Nvfp4KVConfig):
     fuse_sparse_cluster_epilogue: bool = False
     fuse_sparse_reduction: bool = False
     sparse_direct: bool = False
+    # Keep-AB direct BF16 output staged through SMEM for full-line stores.
+    coalesce_keeps_output: bool = False
     sparse_valid_prefix: bool = False
     sparse_direct_capacities: tuple[int, int] = (0, 0)
     # Planned KV tiles per instruction group (1 Keeps, 2 Swaps); zero selects

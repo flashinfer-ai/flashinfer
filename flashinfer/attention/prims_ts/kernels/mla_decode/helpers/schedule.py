@@ -154,6 +154,11 @@ def staged_kv_load(
 ):
     """Issue all K/V producer stages for one logical K or V tile."""
     cached_page_ids = page_offsets_consume(smem_page_offsets, cached_page_ids)
+    # Optional producer-owned staging that needs no KV slot, e.g. raw cache
+    # bytes fetched while the first stage still waits for release.
+    prefetch = getattr(smem_kv, "prefetch_staged_tile", None)
+    if prefetch is not None:
+        prefetch(section=section, cached_page_ids=cached_page_ids)
     for stage_idx in range(1 if whole_kv else head_dim_stages):
         smem_kv.acquire()
         getattr(smem_kv, producer_label)(
