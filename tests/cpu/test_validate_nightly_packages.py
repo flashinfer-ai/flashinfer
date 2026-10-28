@@ -8,7 +8,7 @@ import pytest
 
 
 VALIDATOR_PATH = (
-    Path(__file__).resolve().parents[1] / "scripts" / "validate_nightly_packages.py"
+    Path(__file__).resolve().parents[2] / "scripts" / "validate_nightly_packages.py"
 )
 
 
@@ -63,6 +63,7 @@ def _configure_packages(
     )
 
 
+@pytest.mark.cpu_only
 def test_nightly_package_validation_accepts_matching_packages(monkeypatch) -> None:
     validator = _load_validator()
     _configure_packages(monkeypatch, validator)
@@ -70,6 +71,7 @@ def test_nightly_package_validation_accepts_matching_packages(monkeypatch) -> No
     assert validator._validation_errors() == []
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("overrides", "expected"),
     [

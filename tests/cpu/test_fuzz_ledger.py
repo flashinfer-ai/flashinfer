@@ -14,11 +14,13 @@ def _matches_one(cfg):
     return cfg.value == 1
 
 
+@pytest.mark.cpu_only
 def test_fuzz_ledger_requires_tracking_issue():
     with pytest.raises(ValueError, match="tracking issue"):
         FuzzLedger("test", (Finding(_matches_one, "missing issue"),))
 
 
+@pytest.mark.cpu_only
 def test_fuzz_ledger_quarantine_precedes_tolerated_overlap():
     tolerated = Finding(_matches_one, "wrong answer #100")
     quarantined = Finding(
@@ -35,6 +37,7 @@ def test_fuzz_ledger_quarantine_precedes_tolerated_overlap():
     assert ledger.find(cfg, backend="broken") is quarantined
 
 
+@pytest.mark.cpu_only
 def test_fuzz_ledger_backend_scope_is_exact():
     scoped = Finding(_matches_one, "backend bug #102", backend="broken")
     ledger = FuzzLedger("test", (scoped,))
@@ -45,6 +48,7 @@ def test_fuzz_ledger_backend_scope_is_exact():
     assert ledger.find(cfg, backend="broken") is scoped
 
 
+@pytest.mark.cpu_only
 def test_fuzz_ledger_global_quarantine_xfails_before_launch():
     ledger = FuzzLedger(
         "test",
@@ -55,6 +59,7 @@ def test_fuzz_ledger_global_quarantine_xfails_before_launch():
         ledger.xfail_if_quarantined(Config(1))
 
 
+@pytest.mark.cpu_only
 def test_fuzz_ledger_reports_accumulated_expected_failures_as_xfail():
     finding = Finding(_matches_one, "known mismatch #104", backend="broken")
     ledger = FuzzLedger("test", (finding,))
@@ -67,6 +72,7 @@ def test_fuzz_ledger_reports_accumulated_expected_failures_as_xfail():
         )
 
 
+@pytest.mark.cpu_only
 def test_fuzz_ledger_unexpected_pass_is_strict_failure():
     finding = Finding(_matches_one, "known mismatch #105")
     ledger = FuzzLedger("test", (finding,))

@@ -10,7 +10,7 @@ import build_utils
 import pytest
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 CUDA_TILE_COMPILE_REQUIREMENTS = [
     "nvidia-cuda-nvcc<13.4,>=13.2",
@@ -37,6 +37,7 @@ def load_ci_image_module():
     return module
 
 
+@pytest.mark.cpu_only
 def test_cuda_tile_compile_requirements_are_exact_and_return_a_copy() -> None:
     first = build_utils.get_cuda_tile_compile_dependency_requirements()
     second = build_utils.get_cuda_tile_compile_dependency_requirements()
@@ -50,6 +51,7 @@ def test_cuda_tile_compile_requirements_are_exact_and_return_a_copy() -> None:
     assert second == CUDA_TILE_COMPILE_REQUIREMENTS
 
 
+@pytest.mark.cpu_only
 def test_ci_installer_uses_shared_cuda_tile_compile_requirements_for_cuda13() -> None:
     installer = (
         REPO_ROOT / "docker" / "install" / "install_python_packages.sh"
@@ -80,6 +82,7 @@ def test_ci_installer_uses_shared_cuda_tile_compile_requirements_for_cuda13() ->
     assert resolver_install < compiler_install < cudnn_override
 
 
+@pytest.mark.cpu_only
 def test_build_backend_installs_shared_cuda_tile_compile_requirements(
     monkeypatch,
 ) -> None:
@@ -109,6 +112,7 @@ def test_build_backend_installs_shared_cuda_tile_compile_requirements(
     assert commands == [[sys.executable, "-m", "pip", "install", "--no-deps", sentinel]]
 
 
+@pytest.mark.cpu_only
 def test_build_backend_uses_system_cuda_tile_compiler(monkeypatch) -> None:
     monkeypatch.setattr(
         build_backend, "_system_cuda_tile_compiler_available", lambda: True
@@ -122,6 +126,7 @@ def test_build_backend_uses_system_cuda_tile_compiler(monkeypatch) -> None:
     build_backend._install_cuda_tile_compile_deps()
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("release", "expected"),
     [((13, 0), False), ((13, 4), True), ((13, 5), True), (None, False)],
@@ -136,6 +141,7 @@ def test_build_backend_system_cuda_tile_compiler_requires_cuda_13_4(
     assert build_backend._system_cuda_tile_compiler_available() is expected
 
 
+@pytest.mark.cpu_only
 def test_ci_image_validates_cuda_tile_versions_and_compiler(monkeypatch) -> None:
     ci_image = load_ci_image_module()
     compiler_path = "/opt/cuda-tile/bin/tileiras"
@@ -183,6 +189,7 @@ def test_ci_image_validates_cuda_tile_versions_and_compiler(monkeypatch) -> None
     ]
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("cuda_version", ["13.4", "13.5", "14.0"])
 def test_ci_image_uses_system_tileiras_for_cuda_13_4_and_newer(
     monkeypatch, cuda_version
@@ -222,6 +229,7 @@ def test_ci_image_uses_system_tileiras_for_cuda_13_4_and_newer(
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("cuda_version", ["13.4", "13.5", "14.0"])
 def test_ci_image_rejects_tileiras_wheel_for_cuda_13_4_and_newer(
     monkeypatch, cuda_version
@@ -239,6 +247,7 @@ def test_ci_image_rejects_tileiras_wheel_for_cuda_13_4_and_newer(
         ci_image._validate_cuda_tile_compiler(cuda_version)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("cuda_version", ["13.4", "13.5", "14.0"])
 def test_ci_image_rejects_system_tileiras_without_sm107(
     monkeypatch, cuda_version
@@ -272,6 +281,7 @@ def test_ci_image_rejects_system_tileiras_without_sm107(
         ci_image._validate_cuda_tile_compiler(cuda_version)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("expected_cuda", "expected_result", "expected_calls"),
     [
@@ -301,6 +311,7 @@ def test_ci_image_requires_cuda_tile_compiler_only_for_cuda13(
     assert calls == expected_calls
 
 
+@pytest.mark.cpu_only
 def test_ci_image_routes_triton_blackwell_to_the_system_toolkit() -> None:
     dockerfile = (REPO_ROOT / "docker" / "Dockerfile.ci").read_text()
 
@@ -308,6 +319,7 @@ def test_ci_image_routes_triton_blackwell_to_the_system_toolkit() -> None:
     assert 'ENV TRITON_PTXAS_BLACKWELL_PATH="/usr/local/cuda/bin/ptxas"' in dockerfile
 
 
+@pytest.mark.cpu_only
 def test_ci_image_rejects_cuda_tile_tune_import_failure(monkeypatch) -> None:
     ci_image = load_ci_image_module()
 
@@ -321,6 +333,7 @@ def test_ci_image_rejects_cuda_tile_tune_import_failure(monkeypatch) -> None:
         ci_image._validate_cuda_tile_compiler()
 
 
+@pytest.mark.cpu_only
 def test_ci_image_rejects_cuda_tile_compiler_discovery_failure(monkeypatch) -> None:
     ci_image = load_ci_image_module()
 
@@ -341,6 +354,7 @@ def test_ci_image_rejects_cuda_tile_compiler_discovery_failure(monkeypatch) -> N
         ci_image._validate_cuda_tile_compiler()
 
 
+@pytest.mark.cpu_only
 def test_ci_image_rejects_nonzero_cuda_tile_compiler(monkeypatch) -> None:
     ci_image = load_ci_image_module()
     compiler_path = "/opt/cuda-tile/bin/tileiras"
@@ -365,6 +379,7 @@ def test_ci_image_rejects_nonzero_cuda_tile_compiler(monkeypatch) -> None:
         ci_image._validate_cuda_tile_compiler()
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("expected_cuda", "distribution_name", "version"),
     [
@@ -389,6 +404,7 @@ def test_ci_image_accepts_matching_cuda_runtime_major(
     ]
 
 
+@pytest.mark.cpu_only
 def test_ci_image_rejects_mixed_cuda_runtime_majors(monkeypatch) -> None:
     ci_image = load_ci_image_module()
     distributions = [

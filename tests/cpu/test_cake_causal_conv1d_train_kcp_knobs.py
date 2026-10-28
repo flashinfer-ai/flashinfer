@@ -29,6 +29,7 @@ import torch
 from flashinfer.cake_causal_conv1d_train_backend import kcp as conv_kcp
 
 
+@pytest.mark.cpu_only
 def test_graph_knob_is_gated_and_validated(monkeypatch) -> None:
     monkeypatch.delenv(conv_kcp.TEST_KNOBS_ENV, raising=False)
     assert conv_kcp.GRAPH_MODES == ("off", "replay")
@@ -58,6 +59,7 @@ def test_graph_knob_is_gated_and_validated(monkeypatch) -> None:
         conv_kcp._set_test_knobs(None)
 
 
+@pytest.mark.cpu_only
 def test_host_trim_knob_is_gated_and_validated(monkeypatch) -> None:
     """``host_trim`` (the trimmed host path): refused without ``CAKE_KCP_TEST_KNOBS=1``,
     validated against ``HOST_TRIMS`` (1 shipped = the trimmed host path of the eager halo call,
@@ -100,6 +102,7 @@ def test_host_trim_knob_is_gated_and_validated(monkeypatch) -> None:
     assert conv_kcp._TEST_KNOBS == {"graph": "off", "host_trim": 1}
 
 
+@pytest.mark.cpu_only
 def test_graph_cache_key_and_eager_first_call(monkeypatch) -> None:
     monkeypatch.setenv(conv_kcp.TEST_KNOBS_ENV, "1")
     x = torch.empty(8, 16, dtype=torch.bfloat16)
@@ -152,6 +155,7 @@ def test_graph_cache_key_and_eager_first_call(monkeypatch) -> None:
         conv_kcp.LAST_CALL.clear()
 
 
+@pytest.mark.cpu_only
 def test_graph_public_keyword_mode_and_key(monkeypatch) -> None:
     """``graph=`` is a public keyword of the conv KCP calls (no environment gate): validated against
     ``GRAPH_MODES``, ``None`` = the module's shipped default (``GRAPH_DEFAULT == "off"``), keyed and recorded like the
@@ -211,6 +215,7 @@ def test_graph_public_keyword_mode_and_key(monkeypatch) -> None:
         conv_kcp.LAST_CALL.clear()
 
 
+@pytest.mark.cpu_only
 def test_host_trim_cache_is_per_context_and_bounded(monkeypatch) -> None:
     """The trimmed host path keeps one entry set per context object (by identity, the context pinned), bounded
     by ``HOST_CACHE_MAX`` (the oldest context dropped) and cleared by ``host_cache_clear()``."""
@@ -232,6 +237,7 @@ def test_host_trim_cache_is_per_context_and_bounded(monkeypatch) -> None:
     assert conv_kcp.host_cache_clear() == 2 and conv_kcp._HOST_CACHE == {}
 
 
+@pytest.mark.cpu_only
 def test_host_trim_ffi_device_and_cpu_refusal(monkeypatch) -> None:
     """Trimmed host path: the FFI device object is built once per index; the trimmed forward / backward are selected by the knob
     and refuse CPU tensors like today's path (the operand checks first, then the architecture check)."""

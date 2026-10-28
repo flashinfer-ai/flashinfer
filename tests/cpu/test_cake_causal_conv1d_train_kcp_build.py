@@ -122,6 +122,7 @@ def _identity(module: str, kwargs: dict) -> str:
     return f"cake_causal_conv1d_train_{digest[:20]}"
 
 
+@pytest.mark.cpu_only
 def test_program_names_follow_the_identity_rule() -> None:
     assert set(kcp_jit.MODULES) == set(PROGRAMS)
     for name, (module, kwargs, *_rest) in PROGRAMS.items():
@@ -131,6 +132,7 @@ def test_program_names_follow_the_identity_rule() -> None:
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("name", sorted(PROGRAMS))
 def test_record_matches_the_frozen_abi(name: str) -> None:
     _module, _kwargs, arches, role, plan, ctas_per_sm = PROGRAMS[name]
@@ -163,6 +165,7 @@ def test_record_matches_the_frozen_abi(name: str) -> None:
         assert record["workspace_rule"] is None
 
 
+@pytest.mark.cpu_only
 def test_routes_and_selection() -> None:
     assert kcp_jit.KINDS == ("kcp_fwd", "kcp_bwd", "kcp_bwd_head")
     for arch in ARCHES:
@@ -199,6 +202,7 @@ def test_routes_and_selection() -> None:
     assert kcp_jit.head_grid(head, n_frag=0, C=4096) == (1, 1, 1)
 
 
+@pytest.mark.cpu_only
 def test_build_manifest_lists_the_kcp_programs() -> None:
     libraries = cake_build.libraries_by_name()
     for name, record in kcp_jit.MODULES.items():
