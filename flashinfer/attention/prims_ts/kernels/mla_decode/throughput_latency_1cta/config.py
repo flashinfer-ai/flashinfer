@@ -1935,8 +1935,9 @@ def configure_sparse_mla(
         raise ValueError(
             "one-instance Swap-AB requires a supported tile/loader layout, one V owner and no cluster reduction"
         )
-    if reuse and cfg.num_ctas_per_head_dim != 1:
-        raise ValueError("retained KV requires one V owner")
+    if reuse and cfg.num_ctas_per_head_dim != 1 and not keep:
+        # Keep-AB V owners read their own D128 slices of the retained K tile.
+        raise ValueError("retained KV with a V split requires Keep-AB")
     if profile.kv_tile_size not in (64, 128) or (
         profile.kv_tile_size == 64 and (not keep or cfg.is_fp8_qkv() or not reuse)
     ):

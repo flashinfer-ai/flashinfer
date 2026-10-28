@@ -271,8 +271,9 @@ def staged_pv_mma(
         # QK and every PV feature slice consume the same complete latent tile.
         smem_kv.release()
     elif reuse_k:
-        # QK-only RoPE stages follow the retained V channels. They were
-        # consumed by QK and must retire before the next tile's V slices.
+        # Retained K stages this PV does not read (QK-only RoPE stages, or a
+        # V split's other owners' slices) were consumed by QK and must retire
+        # before the next tile's V slices.
         for _ in range(retained_k_stages - head_dim_stages):
             smem_kv.release()
     tmem_o.commit()
@@ -373,8 +374,9 @@ def staged_pv_mma_tmem_p(
     if whole_kv:
         smem_kv.release()
     elif reuse_k:
-        # QK-only RoPE stages follow the retained V channels. They were
-        # consumed by QK and must retire before the next tile's V slices.
+        # Retained K stages this PV does not read (QK-only RoPE stages, or a
+        # V split's other owners' slices) were consumed by QK and must retire
+        # before the next tile's V slices.
         for _ in range(retained_k_stages - head_dim_stages):
             smem_kv.release()
     tmem_o.commit()
