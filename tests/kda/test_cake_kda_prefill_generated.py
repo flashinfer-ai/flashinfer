@@ -27,8 +27,11 @@ serving shapes (FP32 in-place state pool, reversed int32 state indices, a
 strided BF16 beta-logit slice, checkpoint rows every 64 tokens) with the routes
 in place and with the routes cleared, each against an FP32 token-by-token
 reference, and a launch with work bins bit for bit against the one-task-per-CTA
-program and against the selection without work bins; replay the routed launch from a CUDA graph; and rebind it through a
-plan-cache hit.
+program and against the selection without work bins; hold a work-binned launch
+of short tasks to the turnover build (bit for bit the work-binned launch, with
+and without checkpoint rows, on both sides of the part's chunk limit); replay
+the routed launch from a CUDA graph (a turnover launch among the rows); and
+rebind it through a plan-cache hit.
 
 A program that takes tensor maps encodes them once per preparation into a host
 buffer (``("workspace", "tensor_maps")`` in its plan); the checks hold every
@@ -1236,19 +1239,65 @@ def test_chain_map_fold_is_bitwise_the_map_pass(lengths, heads, part, monkeypatc
     assert torch.equal(d["state"][untouched], d["initial_pool"][untouched])
 
 
-# The last three rows hold the launches that differ most from the others in a
-# graph: the 2-CTA cluster launch of the pair-share program, the cooperative
-# launch of the pooled owner/helper program, and the chain composite whose
-# main body writes the window maps (no map pass).
-GRAPH_ROWS = [
-    pytest.param(
-        [17, 64, 65, 127, 128, 200, 255, 96] * 2, 12, None, None, id="mixed-h12"
-    ),
-    pytest.param([64] * 16, 16, -5.0, None, id="bs16x64-h16-lb5"),
-    pytest.param([8128, 64, 8128, 64], 16, None, None, id="long-short-h16"),
-    pytest.param([8192] * 2, 16, -5.0, "pair-share", id="2x8192-h16-lb5-pair-share"),
-    pytest.param([4096] * 4, 16, None, "pool", id="4x4096-h16-pool"),
-    pytest.param([8192], 12, -5.0, "map-fold", id="8192-h12-lb5-map-fold"),
+def _turnover_chunk_limit():
+    """The part's turnover chunk limit, as ``_work_bin_turnover_route`` reads it."""
+    sm_count = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+    if registry.device_arch() == "sm_103a" and sm_count == 152:
+        return runtime.BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS_GB300
+    return runtime.BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS
+
+
+def _turn_programs():
+    return set(registry._RENDERED_WORK_BIN_TURN_ROUTES[registry.device_arch()].values())
+
+
+def _turn_of():
+    """Work-binned program -> its turnover build, for the turn table's modules."""
+    arch = registry.device_arch()
+    return {
+        registry._RENDERED_WORK_BIN_ROUTES[arch][module]: program
+        for module, program in registry._RENDERED_WORK_BIN_TURN_ROUTES[arch].items()
+    }
+
+
+def _without_turnover(patch):
+    patch.setattr(
+        registry,
+        "_RENDERED_WORK_BIN_TURN_ROUTES",
+        {arch: {} for arch in registry.ARCHES},
+    )
+
+
+def _assert_turnover_schedule(turn, plain, expect):
+    """``turn`` (the loader as shipped) against ``plain`` (the same call without
+    the turn table).  With ``expect`` ``plain`` takes a work-binned program the
+    turn table names and ``turn`` the same programs with that one replaced by
+    its turnover build, its schedule ``plain``'s with ``_turnover`` added;
+    without it both hold the same programs and the same schedule."""
+    schedule = str(turn.prepared.schedule)
+    plain_schedule = str(plain.prepared.schedule)
+    plain_programs = _modules(plain.prepared)
+    if expect:
+        turn_of = _turn_of()
+        assert plain_programs & set(turn_of), plain_schedule
+        assert schedule.count("_turnover") == 1, schedule
+        assert schedule.replace("_turnover", "", 1) == plain_schedule
+        assert _modules(turn.prepared) == {turn_of.get(p, p) for p in plain_programs}
+    else:
+        assert schedule == plain_schedule
+        assert _modules(turn.prepared) == plain_programs
+        assert not plain_programs & _turn_programs()
+
+
+# Work-binned short launches on a 148-SM sm_100a and a 152-SM sm_103a part
+# (``test_turnover_rows_take_the_route_on_both_parts``).
+TURNOVER_ROWS = [
+    pytest.param([64] * 16, 12, id="bs16x64-h12"),
+    pytest.param([64] * 64, 16, id="bs64x64-h16"),
+    pytest.param([17, 64, 65, 127, 128, 200, 255, 96] * 4, 12, id="mixed32-h12"),
+    pytest.param([1, 33, 64, 96] * 12, 16, id="short-mixed-h16"),
 ]
 
 
@@ -1275,14 +1324,166 @@ def _assert_route(route, prepared):
 
 
 @requires_blackwell
-@pytest.mark.parametrize("lengths,heads,lower_bound,route", GRAPH_ROWS)
-def test_routed_launch_replays_from_a_cuda_graph(lengths, heads, lower_bound, route):
+@pytest.mark.parametrize("rows", [True, False], ids=["rows", "no-rows"])
+@pytest.mark.parametrize("lengths,heads", TURNOVER_ROWS)
+def test_turnover_launch_is_bitwise_the_work_binned_launch(
+    lengths, heads, rows, monkeypatch
+):
+    """A work-binned launch of short tasks takes the turnover build: the same
+    bins, bits and argument plan as the work-binned program, the next task's
+    initial state loaded and the previous task's final state stored in the
+    background.  Bit for bit the work-binned launch, with and without
+    checkpoint rows, free memory and outputs poisoned before every launch, in
+    either order."""
+    d = _inputs(lengths, heads)
+    turn = _Call(d, None, rows=rows)
+    with monkeypatch.context() as patch:
+        _without_turnover(patch)
+        plain = _Call(d, None, rows=rows)
+    _assert_turnover_schedule(turn, plain, True)
+    got = turn.run()
+    want = plain.run()
+    _assert_bitwise(got, want, "turnover vs work-binned")
+    _assert_bitwise(turn.run(), want, "turnover after the work-binned launch")
+    _assert_bitwise(plain.run(), got, "work-binned repeat")
+
+
+TURNOVER_PARTS = [
+    pytest.param("sm_100a", None, 8, id="sm_100a"),
+    pytest.param("sm_103a", 152, 16, id="sm_103a-152"),
+]
+
+
+@requires_blackwell
+@pytest.mark.parametrize("side", ["at", "past"])
+@pytest.mark.parametrize("shape", ["uniform", "mixed"])
+@pytest.mark.parametrize("arch,sm_count,chunks", TURNOVER_PARTS)
+def test_turnover_route_takes_the_part_chunk_limit(
+    arch, sm_count, chunks, shape, side, monkeypatch
+):
+    """The turnover route's chunk limit on either side: a work-binned H16
+    launch whose longest sequence has the part's limit of 32-token chunks takes
+    the turnover build, one token more keeps the work-binned build (still work
+    binned); bit for bit either way.  Runs on the part the limit is for."""
+    sm = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+    if registry.device_arch() != arch or sm_count not in (None, sm):
+        pytest.skip(f"the {arch} limit; this device is {registry.device_arch()}")
+    assert _turnover_chunk_limit() == chunks
+    longest = runtime.BF16_M128_CHUNK * chunks + (side == "past")
+    # Enough work that bins hold several tasks (``_use_direct_work_bins``).
+    lengths = (
+        [longest] * 16 if shape == "uniform" else [longest] * 4 + [longest // 2] * 28
+    )
+    d = _inputs(lengths, 16)
+    turn = _Call(d, None)
+    with monkeypatch.context() as patch:
+        _without_turnover(patch)
+        plain = _Call(d, None)
+    # Past the limit the launch is still work binned: the limit, not the
+    # bins, keeps the work-binned build.
+    assert _modules(plain.prepared) & set(_turn_of()), str(plain.prepared.schedule)
+    _assert_turnover_schedule(turn, plain, side == "at")
+    _assert_bitwise(turn.run(), plain.run(), f"{side} the limit")
+
+
+TURNOVER_ROUTE_PARTS = [
+    pytest.param("sm_100a", 148, id="sm_100a-148"),
+    pytest.param("sm_103a", 152, id="sm_103a-152"),
+]
+
+
+@pytest.mark.parametrize("arch,sm_count", TURNOVER_ROUTE_PARTS)
+def test_turnover_rows_take_the_route_on_both_parts(arch, sm_count):
+    """The rows' turnover expectation on each part, from the route rule alone:
+    every turnover row asks for work bins (``_use_direct_work_bins``) and has
+    at most the part's chunk limit; of the unbounded graph rows only those
+    marked turnover do."""
+
+    def route(lengths, heads):
+        return runtime._work_bin_turnover_route(
+            route_work_bins=runtime._use_direct_work_bins(
+                tuple(lengths),
+                num_heads=heads,
+                sm_count=sm_count,
+                chunk_tokens=runtime.BF16_M128_CHUNK,
+            ),
+            direct_n16=False,
+            n32_ft_slab=False,
+            max_seq_len=max(lengths),
+            gpu_arch=arch,
+            sm_count=sm_count,
+        )
+
+    for row in TURNOVER_ROWS:
+        assert route(*row.values), row.id
+    for row in GRAPH_ROWS:
+        lengths, heads, lower_bound, launch, turnover = row.values
+        if lower_bound is None and launch is None:
+            assert route(lengths, heads) == turnover, row.id
+
+
+@requires_blackwell
+@pytest.mark.parametrize("lower_bound", [-5.0, None], ids=["lb5", "unbounded"])
+def test_bounded_and_long_launches_keep_their_build(lower_bound, monkeypatch):
+    """Launches the turn table does not cover: the bounded direct rows (their
+    module has no turnover build), composite rows and a short launch without
+    work bins keep the same programs and schedule with and without the turn
+    table."""
+    for lengths, heads in (
+        ([64] * 16, 16),
+        ([8192], 12),
+        ([17, 64, 65, 127, 128, 200, 255, 96] * 2, 12),
+    ):
+        if lower_bound is None and lengths == [64] * 16:
+            continue
+        d = _inputs(lengths, heads)
+        turn = _Call(d, lower_bound)
+        with monkeypatch.context() as patch:
+            _without_turnover(patch)
+            plain = _Call(d, lower_bound)
+        _assert_turnover_schedule(turn, plain, False)
+        _assert_bitwise(turn.run(), plain.run(), f"{lengths[:2]} h{heads}")
+
+
+# The fourth field names the launch a row is there for: the last three rows hold
+# the launches that differ most from the others in a graph (the 2-CTA cluster
+# launch of the pair-share program, the cooperative launch of the pooled
+# owner/helper program, and the chain composite whose main body writes the
+# window maps, no map pass).  The last field: whether the launch takes a
+# turnover build (work-binned unbounded N32 launches of short tasks on both
+# parts; the mixed H12 row is not work binned, its longest task alone sets the
+# makespan).
+GRAPH_ROWS = [
+    pytest.param(
+        [17, 64, 65, 127, 128, 200, 255, 96] * 2, 12, None, None, False, id="mixed-h12"
+    ),
+    pytest.param([64] * 16, 16, -5.0, None, False, id="bs16x64-h16-lb5"),
+    pytest.param([8128, 64, 8128, 64], 16, None, None, False, id="long-short-h16"),
+    pytest.param([64] * 16, 12, None, None, True, id="bs16x64-h12-turnover"),
+    pytest.param(
+        [8192] * 2, 16, -5.0, "pair-share", False, id="2x8192-h16-lb5-pair-share"
+    ),
+    pytest.param([4096] * 4, 16, None, "pool", False, id="4x4096-h16-pool"),
+    pytest.param([8192], 12, -5.0, "map-fold", False, id="8192-h12-lb5-map-fold"),
+]
+
+
+@requires_blackwell
+@pytest.mark.parametrize("lengths,heads,lower_bound,route,turnover", GRAPH_ROWS)
+def test_routed_launch_replays_from_a_cuda_graph(
+    lengths, heads, lower_bound, route, turnover
+):
     d = _inputs(lengths, heads)
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
         call = _Call(d, lower_bound)
         _assert_route(route, call.prepared)
+        schedule = str(call.prepared.schedule)
+        assert ("_turnover" in schedule) == turnover, schedule
+        assert bool(_modules(call.prepared) & _turn_programs()) == turnover
         eager = call.run()
     torch.cuda.current_stream().wait_stream(side)
     call.poison()
@@ -1298,8 +1499,10 @@ def test_routed_launch_replays_from_a_cuda_graph(lengths, heads, lower_bound, ro
 
 
 @requires_blackwell
-@pytest.mark.parametrize("lengths,heads,lower_bound,route", GRAPH_ROWS)
-def test_plan_cache_hit_matches_a_fresh_preparation(lengths, heads, lower_bound, route):
+@pytest.mark.parametrize("lengths,heads,lower_bound,route,turnover", GRAPH_ROWS)
+def test_plan_cache_hit_matches_a_fresh_preparation(
+    lengths, heads, lower_bound, route, turnover
+):
     cache = KDAPrefillPlanCache(8)
     first = _inputs(lengths, heads, seed=1)
     second = _inputs(lengths, heads, seed=2)
@@ -1309,6 +1512,7 @@ def test_plan_cache_hit_matches_a_fresh_preparation(lengths, heads, lower_bound,
     hit = _Call(second, lower_bound, plan_cache=cache)
     assert (cache.misses, cache.hits) == (1, 1)
     _assert_route(route, hit.prepared)
+    assert ("_turnover" in str(hit.prepared.schedule)) == turnover
     got = hit.run()
     fresh = _Call(second, lower_bound)
     _assert_bitwise(got, fresh.run(), "plan-cache hit")
