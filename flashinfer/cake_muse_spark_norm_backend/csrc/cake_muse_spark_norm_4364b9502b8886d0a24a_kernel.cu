@@ -427,12 +427,12 @@ kernel_cake_muse_spark_norm_4364b9502b8886d0a24a(const __nv_bfloat16* branch, co
                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
                 :: "l"((void*)(residual_out + (rbase + 8) + (0))), "r"(_stv8_21_0), "r"(_stv8_21_1), "r"(_stv8_21_2), "r"(_stv8_21_3), "r"(_stv8_21_4), "r"(_stv8_21_5), "r"(_stv8_21_6), "r"(_stv8_21_7) : "memory");
         }
-        float _warp_reduce_1 = p2;
+        float warp_reduce = p2;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_1 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset);
+            warp_reduce += __shfl_xor_sync(0xFFFFFFFF, warp_reduce, offset);
         if (lane_1 == 0) {
-            slots[16 + warp_0] = _warp_reduce_1;
+            slots[16 + warp_0] = warp_reduce;
         }
         __syncthreads();
         int idx_0 = ((lane_1) < (15) ? (lane_1) : (15));

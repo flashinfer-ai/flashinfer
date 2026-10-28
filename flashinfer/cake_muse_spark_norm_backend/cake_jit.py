@@ -1759,7 +1759,7 @@ MODULES: dict[str, dict[str, Any]] = {
                 ],
                 "sm_107a": [
                     [
-                        255,
+                        128,
                         None,
                     ],
                 ],
@@ -11717,6 +11717,161 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
+    "cake_muse_spark_norm_5938861bddd404bb656a": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "branch",
+            ],
+            [
+                "buffer",
+                "residual",
+            ],
+            [
+                "buffer",
+                "alpha",
+            ],
+            [
+                "buffer",
+                "beta",
+            ],
+            [
+                "buffer",
+                "next_weight",
+            ],
+            [
+                "buffer",
+                "post_weight",
+            ],
+            [
+                "buffer",
+                "residual_out",
+            ],
+            [
+                "buffer",
+                "ffn_input",
+            ],
+            [
+                "parameter",
+                "M",
+            ],
+            [
+                "parameter",
+                "post_eps",
+            ],
+            [
+                "parameter",
+                "next_eps",
+            ],
+            [
+                "parameter",
+                "post_gain_center",
+            ],
+            [
+                "parameter",
+                "next_gain_center",
+            ],
+            [
+                "parameter",
+                "alpha_value",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "H": 8192,
+            "cluster": 8,
+            "threads": 128,
+            "vec": 8,
+            "persistent": True,
+            "prefetch": True,
+            "prefetch_depth": 1,
+            "resident": True,
+            "exit_sync": False,
+            "tensor_alpha": False,
+            "post_weight": True,
+            "pdl": False,
+            "rsqrt_approx": False,
+            "min_blocks": 0,
+            "load_order": "vectors_first",
+            "l2_hint": None,
+            "packed": False,
+            "wait_form": "cta",
+            "issue_order": "early",
+            "reload_fp32": False,
+            "expect_hoist": False,
+            "store_all_lanes": False,
+            "tma_stages": 0,
+            "pdl_launch": "statistic",
+            "ring": None,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 8,
+            "kind": "persistent_rows",
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_5938861bddd404bb656a",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                8,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 1280,
+            "use_pdl": False,
+        },
+        "library": "cake_muse_spark_norm_5938861bddd404bb656a",
+        "logical": {
+            "M": "rows",
+            "alpha": "alpha",
+            "alpha_value": "alpha_value",
+            "beta": "beta",
+            "branch": "branch",
+            "ffn_input": "ffn_input",
+            "next_eps": "next_eps",
+            "next_gain_center": "next_gain_center",
+            "next_weight": "next_weight",
+            "post_eps": "post_eps",
+            "post_gain_center": "post_gain_center",
+            "post_weight": "post_weight",
+            "residual": "residual",
+            "residual_out": "residual_out",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "gated_residual_next_rmsnorm",
+        "route": "gated_residual_next_rmsnorm_alpha_scalar_pw",
+        "select_rule": {
+            "kind": "rows_between",
+            "windows": {
+                "sm_107a": [
+                    [
+                        0,
+                        128,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
 }
 
 ROUTES: dict[str, dict[str, list[str]]] = {
@@ -11863,6 +12018,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_muse_spark_norm_522af30ebd95334001f7",
         ],
         "gated_residual_next_rmsnorm_alpha_scalar_pw": [
+            "cake_muse_spark_norm_5938861bddd404bb656a",
             "cake_muse_spark_norm_2a058ff6cb48dc03fd53",
         ],
         "gated_residual_next_rmsnorm_alpha_tensor_pw": [
