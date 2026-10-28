@@ -1685,6 +1685,7 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         },
         "12,1,4096": {
             "quant:u1": "quant:u1_xef_qel",
+            "gemm_tstore_n192_k128_gs": "gemm_tstore_n192_k128_gs_ts3_tde_prg",
         },
         "12,28,64": {
             "decode:t32_p4_cs4_pf1": "decode:t32_p4_cs4_pf1_csrt",

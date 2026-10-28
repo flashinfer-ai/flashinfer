@@ -1835,7 +1835,8 @@ def test_decode_config_round6_continuation_rules(arch):
     # Round 12 batch 4 (lever ARS): the sm_100a 192,2,1024 / 192,2,4096 / 192,2,16384 cells (tp1:kv_b) launch the A-resident
     # form of the 256-wide ``_gs`` program (``gemm_ars`` 1 next to ``gemm_gs`` 1; the 192,2,2048 cell takes it for M > 1280 only,
     # through ``DECODE_TABLE_M_RANGES``).  Round 12 D: the sm_103a 96,1,512 cell (tp1:f_b:512) takes the 192-wide ``_gs`` form and
-    # its ``_ts3_tde_prg`` twin.  Round 12 F: so does the sm_103a 192,2,256 cell (tp1:kv_b:256).
+    # its ``_ts3_tde_prg`` twin.  Round 12 F: so does the sm_103a 192,2,256 cell (tp1:kv_b:256), and the sm_103a 12,1,4096 cell
+    # (tp8:f_b:4096) launches the same twin of its ``_gs`` program.
     gs_rows = {k for k, e in decode_table(arch).items() if e.get("gemm_gs")}
     assert (
         gs_rows
