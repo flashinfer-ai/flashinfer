@@ -1163,6 +1163,10 @@ def _child_main(body, args, rendezvous, rank, world, device, pipe) -> None:
 
     try:
         torch.cuda.set_device(device)
+        # A child of a torchrun worker inherits TORCHELASTIC_USE_AGENT_STORE,
+        # with which a tcp:// rendezvous only connects to a store that the
+        # elastic agent hosts. The children's store is hosted by rank 0's child.
+        os.environ.pop("TORCHELASTIC_USE_AGENT_STORE", None)
         dist.init_process_group(
             "gloo",
             init_method=rendezvous,
