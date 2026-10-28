@@ -147,9 +147,48 @@ def _inputs(lengths, heads):
     )
 
 
+def _poison_free_cuda_memory(reserve=2 << 30, small_reserve=16 << 20):
+    """Fill every free block of the CUDA caching allocator (this device and
+    stream, outside graph pools) with 0xFF bytes, NaN in BF16 and FP32, after
+    growing the free pools to ``reserve`` / ``small_reserve`` bytes.  A launch
+    that skips a producer then reads poison, not what another arm or an
+    earlier call left in memory the allocator hands out again (a copy of
+    test_cake_kda_prefill_generated.py's)."""
+    torch.cuda.synchronize()
+    device = torch.cuda.current_device()
+    stream = torch.cuda.current_stream().cuda_stream
+    sizes, free = [], {"large": 0, "small": 0}
+    for segment in torch.cuda.memory_snapshot():
+        if (
+            segment["device"] != device
+            or segment["stream"] != stream
+            or tuple(segment.get("segment_pool_id", (0, 0))) != (0, 0)
+        ):
+            continue
+        kind = segment["segment_type"]
+        for block in segment["blocks"]:
+            if block["state"] != "inactive":
+                continue
+            size = block["size"]
+            free[kind] += size
+            # The small pool serves requests up to 1 MiB.
+            step = 1 << 20 if kind == "small" else size
+            sizes += [min(step, size - offset) for offset in range(0, size, step)]
+    sizes.sort(reverse=True)
+    grow = max(0, reserve - free["large"])
+    sizes += [256 << 20] * -(-grow // (256 << 20))
+    sizes += [1 << 20] * -(-max(0, small_reserve - free["small"]) // (1 << 20))
+    held = [torch.empty(n, dtype=torch.uint8, device="cuda") for n in sizes]
+    for tensor in held:
+        tensor.fill_(0xFF)
+    torch.cuda.synchronize()
+
+
 def _run(d, lengths, heads, launches, *, checkpoints=True):
     """Launch one prepared call ``launches`` times from the same initial pool
-    (``checkpoints=False``: without checkpoint rows)."""
+    (``checkpoints=False``: without checkpoint rows).  Free CUDA memory is
+    poisoned before the call is prepared and before every launch, the output
+    and checkpoint rows before every launch."""
     state0 = d["state"].clone()
     out = torch.empty_like(d["q"])
     rows = (
@@ -160,6 +199,7 @@ def _run(d, lengths, heads, launches, *, checkpoints=True):
         else None
     )
     pool = d["state"].clone()
+    _poison_free_cuda_memory()
     call = prepare_bf16_kda_prefill(
         d["q"],
         d["k"],
@@ -183,7 +223,11 @@ def _run(d, lengths, heads, launches, *, checkpoints=True):
     )
     results = []
     for _ in range(launches):
+        _poison_free_cuda_memory()
         pool.copy_(state0)
+        out.fill_(float("nan"))
+        if checkpoints:
+            rows.fill_(float("nan"))
         call.launch()
         torch.cuda.synchronize()
         results.append(

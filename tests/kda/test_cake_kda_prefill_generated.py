@@ -737,6 +737,42 @@ def _checkpoint_dtype(lower_bound):
     return torch.float32 if supported else torch.bfloat16
 
 
+def _poison_free_cuda_memory(reserve=2 << 30, small_reserve=16 << 20):
+    """Fill every free block of the CUDA caching allocator (this device and
+    stream, outside graph pools) with 0xFF bytes, NaN in BF16 and FP32, after
+    growing the free pools to ``reserve`` / ``small_reserve`` bytes.  A launch
+    that skips a producer then reads poison, not what another arm or an
+    earlier call left in memory the allocator hands out again."""
+    torch.cuda.synchronize()
+    device = torch.cuda.current_device()
+    stream = torch.cuda.current_stream().cuda_stream
+    sizes, free = [], {"large": 0, "small": 0}
+    for segment in torch.cuda.memory_snapshot():
+        if (
+            segment["device"] != device
+            or segment["stream"] != stream
+            or tuple(segment.get("segment_pool_id", (0, 0))) != (0, 0)
+        ):
+            continue
+        kind = segment["segment_type"]
+        for block in segment["blocks"]:
+            if block["state"] != "inactive":
+                continue
+            size = block["size"]
+            free[kind] += size
+            # The small pool serves requests up to 1 MiB.
+            step = 1 << 20 if kind == "small" else size
+            sizes += [min(step, size - offset) for offset in range(0, size, step)]
+    sizes.sort(reverse=True)
+    grow = max(0, reserve - free["large"])
+    sizes += [256 << 20] * -(-grow // (256 << 20))
+    sizes += [1 << 20] * -(-max(0, small_reserve - free["small"]) // (1 << 20))
+    held = [torch.empty(n, dtype=torch.uint8, device="cuda") for n in sizes]
+    for tensor in held:
+        tensor.fill_(0xFF)
+    torch.cuda.synchronize()
+
+
 class _Call:
     """One prepared launch with its own output and checkpoint rows.
 
@@ -745,6 +781,8 @@ class _Call:
     checkpoint rows; ``indexed=False`` passes one dense FP32 state per
     sequence (the indexed call's slots, in sequence order) in place, and
     ``initial=False`` with it starts from the zero state into that tensor.
+    Free CUDA memory is poisoned before the call is prepared and before every
+    launch, and its outputs before every launch (``run``).
     """
 
     def __init__(
@@ -784,6 +822,7 @@ class _Call:
             initial_state = self.dense if initial else None
             final_state = self.dense
             state_indices = None
+        _poison_free_cuda_memory()
         self.prepared = prepare_bf16_kda_prefill(
             d["q"],
             d["k"],
@@ -819,6 +858,7 @@ class _Call:
             self.checkpoints.fill_(float("nan"))
 
     def run(self):
+        _poison_free_cuda_memory()
         self.poison()
         self.prepared.launch()
         torch.cuda.synchronize()
@@ -1547,6 +1587,87 @@ def test_composite_falls_back_when_its_interceptor_does_not_apply(
         assert suffix not in str(wrong_body.prepared.schedule)
         assert not _modules(wrong_body.prepared) & programs
         _assert_bitwise(wrong_body.run(), routed_result, "body check")
+
+
+def _drop_map_producer(dropped):
+    """``_map_records`` without the window-map producer: the map pass, or the
+    pair-map producer ahead of the apply route's prefix chain."""
+    records = runtime.FlashKDABlackwellAffineSplitLaunch._map_records
+
+    def without_producer(self):
+        kept = records(self)
+        if self._apply_route and self._lean_map:
+            dropped.append(len(kept) - 1)
+            return kept[-1:]
+        dropped.append(len(kept))
+        return []
+
+    return without_producer
+
+
+def _drop_merging_correction(dropped):
+    """``_settled_launch_records`` without the merging correction windows."""
+    settled = runtime._settled_launch_records
+
+    def without_merge(launch):
+        merging = runtime.FlashKDABlackwellFP32SlabM128PDLConsumerMergeLaunch
+        if isinstance(launch, merging):
+            dropped.append(len(settled(launch)))
+            return []
+        return settled(launch)
+
+    return without_merge
+
+
+DROPPED_PRODUCERS = [
+    pytest.param("_RENDERED_MAP_FOLD_ROUTES", -5.0, "_mapfold", id="map-pass"),
+    pytest.param("_RENDERED_FOLD_ROUTES", None, "_pairfold", id="pair-map-producer"),
+    pytest.param(
+        "_RENDERED_MERGE_ROUTES", -5.0, "_correction_merge", id="merging-correction"
+    ),
+]
+
+
+@requires_blackwell
+@pytest.mark.parametrize("table,lower_bound,suffix", DROPPED_PRODUCERS)
+def test_poisoned_bitwise_compare_sees_a_dropped_producer(
+    table, lower_bound, suffix, monkeypatch
+):
+    """Seeded negative for the bitwise composite tests.  The map-fold, pair-map
+    fold and merging builds let a composite drop a producer (the map pass, the
+    pair-map producer, the epilogue).  A composite that drops the producer
+    without such a body leaves its maps or outputs unwritten.  A first call
+    with the producer leaves the right maps in memory the allocator hands out
+    again; with free memory and outputs poisoned before every arm, the bitwise
+    compare still fails on the call without it."""
+    d = _inputs([8192], 12)
+    routed = _Call(d, lower_bound)
+    if suffix not in str(routed.prepared.schedule):
+        pytest.skip(f"{routed.prepared.schedule}: no {suffix} build here")
+    want = routed.run()
+    dropped = []
+    with monkeypatch.context() as patch:
+        if table == "_RENDERED_MERGE_ROUTES":
+            drop = (runtime, "_settled_launch_records", _drop_merging_correction)
+        else:
+            # The composite without the fold build: its producer writes the maps.
+            patch.setattr(registry, table, {name: {} for name in registry.ARCHES})
+            drop = (
+                runtime.FlashKDABlackwellAffineSplitLaunch,
+                "_map_records",
+                _drop_map_producer,
+            )
+        kept = _Call(d, lower_bound)
+        if table != "_RENDERED_MERGE_ROUTES":
+            assert suffix not in str(kept.prepared.schedule)
+        _assert_bitwise(kept.run(), want, "producer kept")
+        del kept
+        patch.setattr(drop[0], drop[1], drop[2](dropped))
+        without = _Call(d, lower_bound)
+        got = without.run()
+        assert dropped and all(dropped), f"no producer launch dropped: {dropped}"
+        with pytest.raises(AssertionError, match="differs"):
+            _assert_bitwise(got, want, "producer dropped")
 
 
 @requires_blackwell
