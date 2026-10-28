@@ -1487,8 +1487,12 @@ class GatedDeltaNetChunkedKernel:
                         kv_acc_handle = kv_acc_consumer.wait_and_advance()
                         kv_acc_handle.release()
                 elif cutlass.const_expr(
-                    self.store_final_state and self.use_initial_state
+                    self.store_final_state
+                    and self.use_initial_state
+                    and not self.use_output_state_indices
                 ):
+                    # With output_state_indices an empty sequence writes
+                    # nothing: row output_state_indices[b] keeps its contents.
                     self._store_empty_final_state(
                         tidx,
                         mS_init,
@@ -1496,7 +1500,6 @@ class GatedDeltaNetChunkedKernel:
                         mS_indices,
                         head_idx,
                         batch_idx,
-                        mS_out_indices,
                     )
 
                 scheduler.advance_to_next_work()
@@ -1698,23 +1701,27 @@ class GatedDeltaNetChunkedKernel:
                     if cutlass.const_expr(self.use_prefix_lens):
                         # Descriptors span exactly the sequence's own rows, so
                         # the leading identity rows (negative coordinates) and
-                        # the padded tail both read zero.
+                        # the padded tail both read zero. The row strides are
+                        # static ints, so the start is widened before the
+                        # multiply: an Int32 product wraps for a sequence that
+                        # starts at 2**31 / (H * D) tokens or later.
+                        seq_start = cutlass.Int64(batch_start)
                         bounded_q = cute.make_tensor(
-                            mQ.iterator + batch_start * mQ.stride[0],
+                            mQ.iterator + seq_start * mQ.stride[0],
                             cute.make_layout(
                                 (real_seqlen_b, mQ.shape[1], mQ.shape[2]),
                                 stride=(mQ.stride[0], mQ.stride[1], mQ.stride[2]),
                             ),
                         )
                         bounded_k = cute.make_tensor(
-                            mK.iterator + batch_start * mK.stride[0],
+                            mK.iterator + seq_start * mK.stride[0],
                             cute.make_layout(
                                 (real_seqlen_b, mK.shape[1], mK.shape[2]),
                                 stride=(mK.stride[0], mK.stride[1], mK.stride[2]),
                             ),
                         )
                         bounded_v = cute.make_tensor(
-                            mV.iterator + batch_start * mV.stride[1],
+                            mV.iterator + seq_start * mV.stride[1],
                             cute.make_layout(
                                 (mV.shape[0], real_seqlen_b, mV.shape[2]),
                                 stride=(mV.stride[0], mV.stride[1], mV.stride[2]),
@@ -1850,9 +1857,10 @@ class GatedDeltaNetChunkedKernel:
                     if cutlass.const_expr(self.use_prefix_lens):
                         # The descriptor spans exactly the sequence's own rows:
                         # stores of the leading identity rows (negative
-                        # coordinates) and of the padded tail are dropped.
+                        # coordinates) and of the padded tail are dropped. The
+                        # start is widened before the multiply, as for Q/K/V.
                         bounded_o = cute.make_tensor(
-                            mO.iterator + batch_start * mO.stride[1],
+                            mO.iterator + cutlass.Int64(batch_start) * mO.stride[1],
                             cute.make_layout(
                                 (mO.shape[0], real_seqlen_b, mO.shape[2]),
                                 stride=(mO.stride[0], mO.stride[1], mO.stride[2]),
@@ -4228,13 +4236,12 @@ class GatedDeltaNetChunkedKernel:
         mS_indices,
         head_idx,
         batch_idx,
-        mS_out_indices,
     ):
         """Copy initial state to final state for a sequence containing no tokens.
 
-        Slot mode reads row ``state_indices[b]`` (zero state if negative) and
-        writes row ``output_state_indices[b]`` (or the read row), skipping a
-        negative write row.
+        Slot mode (never with ``output_state_indices``, whose empty sequences
+        write nothing) copies row ``state_indices[b]`` to the same row and
+        skips a negative row.
         """
         num_threads_cg1 = self.threads_per_warp * len(self.compute_group_1_warp_ids)
         cg1_tidx = tidx % num_threads_cg1
@@ -4244,19 +4251,15 @@ class GatedDeltaNetChunkedKernel:
         else:
             state_row = batch_idx
         if cutlass.const_expr(self.slot_mode):
-            out_row = state_row
-            if cutlass.const_expr(self.use_output_state_indices):
-                out_row = cutlass.Int32(mS_out_indices[batch_idx])
-            if out_row >= 0:
+            if state_row >= 0:
                 for linear_idx in cutlass.range(
                     cg1_tidx, state_elements, num_threads_cg1, unroll=1
                 ):
                     key_idx = linear_idx // self.mma_tiler_kv[0]
                     value_idx = linear_idx - key_idx * self.mma_tiler_kv[0]
-                    value = mS_init.element_type(0.0)
-                    if state_row >= 0:
-                        value = mS_init[value_idx, key_idx, head_idx, state_row]
-                    mS_out[value_idx, key_idx, head_idx, out_row] = value
+                    mS_out[value_idx, key_idx, head_idx, state_row] = mS_init[
+                        value_idx, key_idx, head_idx, state_row
+                    ]
         else:
             for linear_idx in cutlass.range(
                 cg1_tidx, state_elements, num_threads_cg1, unroll=1
