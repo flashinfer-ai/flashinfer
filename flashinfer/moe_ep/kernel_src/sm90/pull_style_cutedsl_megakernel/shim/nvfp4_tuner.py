@@ -19,9 +19,11 @@ from .nvfp4_candidate_data import (
     NVFP4_SF0_CANDIDATE_SEEDS,
     _H200_REFERENCE,
     NVFP4_DEFAULT_TACTICS_BY_TOKENS,
+    NVFP4_SF2_CANDIDATE_SEEDS,
+    _scale_ring_tactic,
 )
 
-NVFP4_TUNING_VERSION = "nvfp4_single_k64_candidates_v2"
+NVFP4_TUNING_VERSION = "nvfp4_single_k64_scale_ring_candidates_v2"
 
 
 def normalize_hopper_nvfp4_tactic(tactic: Mapping[str, Any]) -> dict[str, Any]:
@@ -51,7 +53,49 @@ def _validate_candidate(tactic, *, hidden, intermediate, num_experts, world_size
         num_experts=num_experts,
         world_size=world_size,
     )
+    if selected["nvfp4_sf_stages"] and (
+        selected["mma_tiler_mnk"][1:] != (64, 256) or selected["pingpong"]
+    ):
+        raise ValueError("NVFP4 scale-ring candidates require non-pingpong N64/K256")
     return selected
+
+
+def expand_nvfp4_sf2_candidates(
+    seeds: Iterable[Mapping[str, Any]],
+    *,
+    hidden: int,
+    intermediate: int,
+    num_experts: int,
+    world_size: int,
+    kperm: int = 64,
+) -> list[dict[str, Any]]:
+    """Keep unique legal sf0 seeds and append R1/R2 for N64/K256 cores.
+
+    No device-name, clamp, live-token or overlap gate is applied. The kernel
+    constructor checks the real layout budget and requires four AB stages.
+    """
+    validate_nvfp4_kperm(kperm)
+    shape = dict(
+        hidden=hidden,
+        intermediate=intermediate,
+        num_experts=num_experts,
+        world_size=world_size,
+    )
+    result = []
+    for seed in seeds:
+        selected = _validate_candidate(seed, **shape)
+        if selected["nvfp4_sf_stages"]:
+            raise ValueError("scale-ring expansion requires sf0 seeds")
+        if selected not in result:
+            result.append(selected)
+    for seed in tuple(result):
+        if seed["mma_tiler_mnk"][1:] != (64, 256) or seed["pingpong"]:
+            continue
+        for replicas in (1, 2):
+            candidate = _scale_ring_tactic(seed, replicas)
+            if candidate not in result:
+                result.append(candidate)
+    return result
 
 
 def hopper_nvfp4_candidates(
@@ -84,6 +128,7 @@ def hopper_nvfp4_candidates(
         )
     )
     seeds.extend(NVFP4_SF0_CANDIDATE_SEEDS)
+    seeds.extend(NVFP4_SF2_CANDIDATE_SEEDS)
     result = []
     for seed in seeds:
         try:
