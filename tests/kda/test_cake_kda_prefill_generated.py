@@ -1161,32 +1161,47 @@ def test_pair_map_fold_is_bitwise_the_pair_map_producer(lengths, heads, monkeypa
     assert torch.equal(d["state"][untouched], d["initial_pool"][untouched])
 
 
+def _sm_count():
+    return torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+
+
 MAP_FOLD_ROWS = [
-    pytest.param([8192], 12, id="8192-h12"),
-    pytest.param([3000, 13384], 16, id="3000+13384-h16"),
-    pytest.param([8128, 64, 8128, 64], 12, id="8128+64x4-h12"),
-    pytest.param([16384], 16, id="16384-h16"),
+    pytest.param([8192], 12, None, id="8192-h12"),
+    pytest.param([3000, 13384], 16, None, id="3000+13384-h16"),
+    # The cost model takes the chain composite for this row on a 152-SM
+    # sm_103a part only (44-chunk windows, 426 us against the sequential
+    # body's 436 us); a 148-SM sm_100a part keeps the sequential M64 program
+    # (471 against 461 us), which has no map pass.
+    pytest.param([8128, 64, 8128, 64], 12, ("sm_103a", 152), id="8128+64x4-h12"),
+    pytest.param([16384], 16, None, id="16384-h16"),
 ]
 
 
 @requires_blackwell
-@pytest.mark.parametrize("lengths,heads", MAP_FOLD_ROWS)
-def test_chain_map_fold_is_bitwise_the_map_pass(lengths, heads, monkeypatch):
+@pytest.mark.parametrize("lengths,heads,part", MAP_FOLD_ROWS)
+def test_chain_map_fold_is_bitwise_the_map_pass(lengths, heads, part, monkeypatch):
     """A chain composite whose main body writes the window maps equals, bit for
     bit, the composite that launches the map pass (the loader without map-fold
     builds): output, pool slots and checkpoint rows, every element written over
-    NaN, the other pool slots untouched."""
+    NaN, the other pool slots untouched.  Every row takes the chain composite
+    (on the part it names), whose main module has a map-fold build."""
     arch = registry.device_arch()
+    if part is not None and part != (arch, _sm_count()):
+        pytest.skip(f"only a {part[1]}-SM {part[0]} part takes the chain composite")
     folding = registry._RENDERED_MAP_FOLD_ROUTES[arch]
     d = _inputs(lengths, heads)
     untouched = torch.ones(d["state"].shape[0], dtype=torch.bool, device="cuda")
     untouched[d["state_indices"].long()] = False
 
     folded = _Call(d, -5.0)
+    schedule = str(folded.prepared.schedule)
+    assert schedule.startswith("split_seq_affine_prefix"), schedule
     folded_result = folded.run()
     fold = bool(_modules(folded.prepared) & set(folding.values()))
-    assert fold == ("_mapfold" in str(folded.prepared.schedule))
-    if _chain_map_fold_enabled() and lengths in ([8192], [3000, 13384]):
+    assert fold == ("_mapfold" in schedule), schedule
+    if _chain_map_fold_enabled():
         assert fold, "the chain composite launched the map pass"
     assert torch.equal(d["state"][untouched], d["initial_pool"][untouched])
     _assert_bitwise(folded.run(), folded_result, "folded repeat")
@@ -1540,7 +1555,7 @@ def test_chain_map_fold_is_bitwise_the_map_pass_off_the_serving_path(
     assert schedule.startswith("split_seq_affine_prefix"), schedule
     fold = bool(_modules(folded.prepared) & folding)
     assert fold == ("_mapfold" in schedule), schedule
-    if rows and _chain_map_fold_enabled():
+    if _chain_map_fold_enabled():
         assert fold, "the chain composite launched the map pass"
     folded_result = folded.run()
     assert torch.equal(d["state"][untouched], d["initial_pool"][untouched])
