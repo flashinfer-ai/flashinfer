@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
 def _load_module(name: str, path: Path):
@@ -58,6 +58,7 @@ def release_verifier_module():
         sys.path.remove(str(scripts_dir))
 
 
+@pytest.mark.cpu_only
 def test_provider_release_matrices_are_explicit(cuda_config_module):
     config = json.loads((REPO_ROOT / "ci" / "cuda-versions.json").read_text())
 
@@ -77,6 +78,7 @@ def test_provider_release_matrices_are_explicit(cuda_config_module):
     assert all(entry["provider_tag"] != "sm86" for entry in provider_matrix)
 
 
+@pytest.mark.cpu_only
 def test_provider_release_matrix_rejects_duplicate_architectures(
     cuda_config_module,
 ):
@@ -90,6 +92,7 @@ def test_provider_release_matrix_rejects_duplicate_architectures(
         cuda_config_module.validate_cuda_config(invalid_config, REPO_ROOT)
 
 
+@pytest.mark.cpu_only
 def test_jit_cache_python_setup_hardens_incomplete_downloads(tmp_path):
     common_script = REPO_ROOT / "scripts" / "jit_cache_build_common.sh"
     fake_python = tmp_path / "python"
@@ -125,6 +128,7 @@ test "${{PIP_BUILD_CONSTRAINT}}" = /tmp/original-build-constraint
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("cuda_version", ["13.0", "130", "13.4", "134", "14.0"])
 def test_sccache_uses_release_for_all_cuda_versions(cuda_version):
     common_script = REPO_ROOT / "scripts" / "jit_cache_build_common.sh"
@@ -144,6 +148,7 @@ printf ' %s %s' "${{FLASHINFER_SCCACHE_INSTALL_SOURCE}}" "${{FLASHINFER_SCCACHE_
     assert result.stdout == "0.18.0 x86_64 github-release v0.18.0"
 
 
+@pytest.mark.cpu_only
 def test_pr_aot_matrix_waits_for_published_cuda_image_tag():
     workflow = (REPO_ROOT / ".github" / "workflows" / "pr-test.yml").read_text()
 
@@ -151,6 +156,7 @@ def test_pr_aot_matrix_waits_for_published_cuda_image_tag():
     assert "AOT image not published" in workflow
 
 
+@pytest.mark.cpu_only
 def test_release_verifier_rejects_duplicate_wheel_distributions(
     monkeypatch, tmp_path, release_verifier_module
 ):
@@ -174,6 +180,7 @@ def test_release_verifier_rejects_duplicate_wheel_distributions(
         release_verifier_module.load_wheels(tmp_path)
 
 
+@pytest.mark.cpu_only
 def test_release_verifier_requires_exact_provider_set(release_verifier_module):
     shim = release_verifier_module.Wheel(
         path=Path(
@@ -212,6 +219,7 @@ def test_release_verifier_requires_exact_provider_set(release_verifier_module):
         )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("filename", "expected_package"),
     [

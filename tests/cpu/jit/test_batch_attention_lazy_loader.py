@@ -43,6 +43,7 @@ def _isolate_caches_and_cuda(monkeypatch):
     attention.get_holistic_attention_independent_module.cache_clear()
 
 
+@pytest.mark.cpu_only
 def test_factories_load_primary_but_only_construct_independent(monkeypatch):
     primary = _FakeSpec(object())
     independent = _FakeSpec(object())
@@ -105,6 +106,7 @@ def _wrapper(monkeypatch):
     return wrapper, spec, calls, devices
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("changed_axis", [0, 1, 2])
 def test_wrapper_selects_original_data_strides_each_run(monkeypatch, changed_axis):
     wrapper, spec, calls, devices = _wrapper(monkeypatch)
@@ -127,6 +129,7 @@ def test_wrapper_selects_original_data_strides_each_run(monkeypatch, changed_axi
     assert devices and all(device == q.device for device in devices)
 
 
+@pytest.mark.cpu_only
 def test_stride_predicate_does_not_narrow_large_original_values(monkeypatch):
     wrapper, spec, calls, _ = _wrapper(monkeypatch)
     q = torch.empty(1, 8, 8)
@@ -137,6 +140,7 @@ def test_stride_predicate_does_not_narrow_large_original_values(monkeypatch):
     assert calls[0][0] == "independent" and spec.build_count == 1
 
 
+@pytest.mark.cpu_only
 def test_prewarm_requires_plan_and_valid_variant(monkeypatch):
     unplanned = attention.BatchAttention.__new__(attention.BatchAttention)
     with pytest.raises(RuntimeError, match=r"plan\(\)"):

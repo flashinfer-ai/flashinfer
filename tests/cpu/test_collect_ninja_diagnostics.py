@@ -1,10 +1,12 @@
+import pytest
+
 import json
 import sys
 import tarfile
 from pathlib import Path
 
 
-sys.path.insert(0, str(Path(__file__).parents[1]))
+sys.path.insert(0, str(Path(__file__).parents[2]))
 
 from scripts.collect_ninja_diagnostics import (
     collect,
@@ -13,6 +15,7 @@ from scripts.collect_ninja_diagnostics import (
 )
 
 
+@pytest.mark.cpu_only
 def test_collects_completed_edge_timings_and_raw_state(tmp_path: Path) -> None:
     build_root = tmp_path / "aot-providers"
     cached_ops = build_root / "sm90a" / "cached_ops"
@@ -56,6 +59,7 @@ def test_collects_completed_edge_timings_and_raw_state(tmp_path: Path) -> None:
         }
 
 
+@pytest.mark.cpu_only
 def test_uses_latest_invocation_from_appended_log(tmp_path: Path) -> None:
     log_path = tmp_path / ".ninja_log"
     log_path.write_text(
@@ -73,6 +77,7 @@ def test_uses_latest_invocation_from_appended_log(tmp_path: Path) -> None:
     assert [entry.output for entry in latest] == ["new-a.o", "new-b.o"]
 
 
+@pytest.mark.cpu_only
 def test_writes_empty_report_when_ninja_never_started(tmp_path: Path) -> None:
     output_dir = tmp_path / "diagnostics"
 

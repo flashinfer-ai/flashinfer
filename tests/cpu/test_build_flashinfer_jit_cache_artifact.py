@@ -1,3 +1,5 @@
+import pytest
+
 import json
 import os
 import shutil
@@ -5,7 +7,7 @@ import subprocess
 from pathlib import Path
 
 
-REPO_ROOT = Path(__file__).parents[1]
+REPO_ROOT = Path(__file__).parents[2]
 ARTIFACT_SCRIPT = REPO_ROOT / "scripts" / "build_flashinfer_jit_cache_artifact.sh"
 
 
@@ -96,6 +98,7 @@ def _calls_for(docker_calls, command):
     return [args for args in docker_calls if args[0] == command]
 
 
+@pytest.mark.cpu_only
 def test_cached_image_skips_pull_and_disables_implicit_pull(tmp_path):
     result, docker_calls, sleeps = _run_artifact_script(tmp_path)
 
@@ -107,6 +110,7 @@ def test_cached_image_skips_pull_and_disables_implicit_pull(tmp_path):
     assert sleeps == []
 
 
+@pytest.mark.cpu_only
 def test_image_pull_recovers_with_exponential_backoff(tmp_path):
     result, docker_calls, sleeps = _run_artifact_script(
         tmp_path, inspect_exit=1, pull_failures=3
@@ -118,6 +122,7 @@ def test_image_pull_recovers_with_exponential_backoff(tmp_path):
     assert sleeps == ["5", "10", "20"]
 
 
+@pytest.mark.cpu_only
 def test_image_pull_exhaustion_does_not_start_build(tmp_path):
     result, docker_calls, sleeps = _run_artifact_script(
         tmp_path, inspect_exit=1, pull_failures=4
@@ -130,6 +135,7 @@ def test_image_pull_exhaustion_does_not_start_build(tmp_path):
     assert "Failed to pull" in result.stderr
 
 
+@pytest.mark.cpu_only
 def test_build_failure_is_propagated_without_retry(tmp_path):
     result, docker_calls, sleeps = _run_artifact_script(tmp_path, run_exit=42)
 

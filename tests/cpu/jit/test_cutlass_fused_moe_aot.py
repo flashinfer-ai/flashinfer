@@ -20,6 +20,7 @@ from unittest.mock import Mock
 import pytest
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("capabilities", "expected_count"),
     [
@@ -77,6 +78,7 @@ def test_aot_registers_cutlass_fused_moe_for_supported_targets(
     assert [spec.name for spec in specs].count("fused_moe_100") == expected_count
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("generator", "module_name", "option"),
     [

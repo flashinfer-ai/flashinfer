@@ -6,6 +6,7 @@ from tests import conftest
 from flashinfer.jit import JitSpecCuteDsl, MissingJITCacheError
 
 
+@pytest.mark.cpu_only
 def test_missing_cute_dsl_cache_is_reported_and_skipped(monkeypatch):
     monkeypatch.delenv("FLASHINFER_STRICT_MOE_EP_TESTS", raising=False)
     monkeypatch.setenv("CUTE_DSL_ARCH", "sm_100a")

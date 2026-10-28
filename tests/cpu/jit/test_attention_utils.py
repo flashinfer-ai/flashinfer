@@ -19,11 +19,12 @@ def generated_sources(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(jit_env, "FLASHINFER_GEN_SRC_DIR", tmp_path)
     monkeypatch.setattr(
-        jit_env, "FLASHINFER_CSRC_DIR", Path(__file__).resolve().parents[2] / "csrc"
+        jit_env, "FLASHINFER_CSRC_DIR", Path(__file__).resolve().parents[3] / "csrc"
     )
     return tmp_path
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "backend,mode",
     [("fa2", None), ("fa2", "independent"), ("fa3", None), ("fa3", "runtime")],
@@ -70,10 +71,11 @@ def test_custom_prefill_adapter_preserves_stride_specialization(
         )
 
 
+@pytest.mark.cpu_only
 def test_batch_prefill_nvfp4_swa_paged_params_declares_sf_strides(
     tmp_path, monkeypatch
 ):
-    repo_root = Path(__file__).resolve().parents[2]
+    repo_root = Path(__file__).resolve().parents[3]
     monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
     monkeypatch.setattr(
         attention_modules.current_compilation_context,
@@ -125,6 +127,7 @@ def test_batch_prefill_nvfp4_swa_paged_params_declares_sf_strides(
         assert f"uint32_t {field}_stride_n;" in generated
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "factory,suffix,source_count,variants",
     [
@@ -176,6 +179,7 @@ def test_batch_prefill_stride_module_surface(
         )
 
 
+@pytest.mark.cpu_only
 def test_gen_attention_aot_matrix_contains_equal_primaries_only(generated_sources):
     import flashinfer.aot as flashinfer_aot
 
@@ -220,6 +224,7 @@ def test_gen_attention_aot_matrix_contains_equal_primaries_only(generated_source
     )
 
 
+@pytest.mark.cpu_only
 def test_attention_sink_stays_independent_full(generated_sources):
     args = (
         "fa2",
@@ -250,6 +255,7 @@ def test_attention_sink_stays_independent_full(generated_sources):
         assert "/*SAME_KV_STRIDES=*/false" in paged_text
 
 
+@pytest.mark.cpu_only
 def test_batch_prefill_nvfp4_requires_sf_tensors():
     try:
         gen_customize_batch_prefill_module(
@@ -316,6 +322,7 @@ def _assert_persistent_module_surface(directory, variants):
         assert f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({entrypoint}," in binding
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "factory,suffix,mode,variants",
     [
@@ -357,6 +364,7 @@ def test_batch_attention_stride_module_surface(
     _assert_persistent_module_surface(directory, variants)
 
 
+@pytest.mark.cpu_only
 def test_custom_batch_attention_preserves_caller_uri_and_dual_surface(
     generated_sources,
 ):
@@ -386,6 +394,7 @@ def test_custom_batch_attention_preserves_caller_uri_and_dual_surface(
     _assert_persistent_module_surface(directory, ("true", "false"))
 
 
+@pytest.mark.cpu_only
 def test_persistent_warmup_contains_equal_primaries_only(generated_sources):
     from tests.test_helpers.jit_utils import gen_persistent_batch_attention_modules
 

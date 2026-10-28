@@ -14,6 +14,8 @@
 
 """CPU checks of the generated FlashKDA module table and its registry."""
 
+import pytest
+
 import json
 import re
 
@@ -199,6 +201,7 @@ def _table_rows():
     return json.loads(path.read_text())["modules"]
 
 
+@pytest.mark.cpu_only
 def test_generated_module_table_lists_each_module_once_with_its_archs():
     rows = _table_rows()
     assert len(rows) == EXPECTED_ROWS
@@ -210,6 +213,7 @@ def test_generated_module_table_lists_each_module_once_with_its_archs():
     assert sum(len(row["archs"]) for row in rows) == EXPECTED_REGISTRY_ENTRIES
 
 
+@pytest.mark.cpu_only
 def test_generated_registry_expands_each_table_row_per_arch():
     rows = _table_rows()
     registry = flash_kda.get_flash_kda_generated_registry()
@@ -242,6 +246,7 @@ def test_generated_registry_expands_each_table_row_per_arch():
         assert all(registry[variant_id].target == target for variant_id in variant_ids)
 
 
+@pytest.mark.cpu_only
 def test_folded_generated_bodies_select_each_row_by_its_knobs():
     rows = {row["module_ident"]: row for row in _table_rows()}
     registry = flash_kda.get_flash_kda_generated_registry()
@@ -282,6 +287,7 @@ def test_folded_generated_bodies_select_each_row_by_its_knobs():
                 assert registry[f"{arch}:{module_ident}"].defines == ()
 
 
+@pytest.mark.cpu_only
 def test_every_generated_body_file_is_referenced_by_the_table():
     csrc_dir = flash_kda._get_flash_kda_csrc_dir()
     bodies = {row["body"] for row in _table_rows()}

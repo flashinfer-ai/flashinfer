@@ -99,6 +99,7 @@ def _registered_generators(monkeypatch, sm_capabilities, overrides=None):
     return {spec.name for spec in specs}
 
 
+@pytest.mark.cpu_only
 def test_sm103_only_build_registers_shared_sm100_modules(monkeypatch):
     registered = _registered_generators(
         monkeypatch, {"sm103": True, "sm103a_exact": True}
@@ -108,6 +109,7 @@ def test_sm103_only_build_registers_shared_sm100_modules(monkeypatch):
     assert not SM100_ONLY_MODULES & registered
 
 
+@pytest.mark.cpu_only
 def test_sm100_only_build_registers_shared_and_sm100_modules(monkeypatch):
     registered = _registered_generators(
         monkeypatch, {"sm100": True, "sm100a_exact": True, "sm100f": True}
@@ -117,6 +119,7 @@ def test_sm100_only_build_registers_shared_and_sm100_modules(monkeypatch):
     assert not SM103_ONLY_MODULES & registered
 
 
+@pytest.mark.cpu_only
 def test_combined_build_registers_both_variants(monkeypatch):
     registered = _registered_generators(
         monkeypatch,
@@ -132,6 +135,7 @@ def test_combined_build_registers_both_variants(monkeypatch):
     assert registered >= SM103_SHARED_MODULES | SM100_ONLY_MODULES | SM103_ONLY_MODULES
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("sm_capabilities", "expected_use_sm_100f"),
     [
@@ -168,6 +172,7 @@ def test_registered_tgv_gemm_runs_on_every_targeted_arch(
     assert calls[0] is expected_use_sm_100f
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     ("arch_list", "expected"),
     [

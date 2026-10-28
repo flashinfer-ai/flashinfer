@@ -85,6 +85,7 @@ def bgmv_moe_workspace(tmp_path, monkeypatch):
     bgmv_moe_jit.gen_bgmv_moe_module.cache_clear()
 
 
+@pytest.mark.cpu_only
 def test_restaging_unchanged_sources_keeps_built_artifact_fresh(
     bgmv_moe_workspace,
 ):

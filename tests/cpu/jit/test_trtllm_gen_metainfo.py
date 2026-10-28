@@ -49,6 +49,7 @@ def _archs(source: str) -> list:
     return re.findall(r"gemm::SmVersion::(Sm\w+)\},", source)
 
 
+@pytest.mark.cpu_only
 def test_blackwell_keeps_only_blackwell_kernels():
     out, kept, dropped = filter_metainfo(HEADER, BLACKWELL_CUBIN_ARCHS)
     assert _archs(out) == ["Sm100f", "Sm103a", "Sm100a"]
@@ -56,6 +57,7 @@ def test_blackwell_keeps_only_blackwell_kernels():
     assert "bmm_c_sm107a" not in out
 
 
+@pytest.mark.cpu_only
 def test_rubin_keeps_only_rubin_kernels():
     out, kept, dropped = filter_metainfo(HEADER, RUBIN_CUBIN_ARCHS)
     assert _archs(out) == ["Sm107a"]
@@ -65,6 +67,7 @@ def test_rubin_keeps_only_rubin_kernels():
     assert "bmm_a_sm100f" not in out
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("archs", [BLACKWELL_CUBIN_ARCHS, RUBIN_CUBIN_ARCHS])
 def test_declared_length_matches_emitted_array(archs):
     out, kept, _ = filter_metainfo(HEADER, archs)
@@ -72,6 +75,7 @@ def test_declared_length_matches_emitted_array(archs):
     assert out.count("\n{nullptr, 0, ") == kept
 
 
+@pytest.mark.cpu_only
 def test_variants_partition_the_manifest():
     """Every entry lands in exactly one variant; none is lost or duplicated."""
     bw, n_bw, _ = filter_metainfo(HEADER, BLACKWELL_CUBIN_ARCHS)
@@ -80,17 +84,20 @@ def test_variants_partition_the_manifest():
     assert set(_archs(bw)).isdisjoint(_archs(rb))
 
 
+@pytest.mark.cpu_only
 def test_non_entry_lines_are_preserved():
     out, _, _ = filter_metainfo(HEADER, BLACKWELL_CUBIN_ARCHS)
     for line in ("#pragma once", "namespace kernels {", "} // namespace batchedGemm"):
         assert line in out
 
 
+@pytest.mark.cpu_only
 def test_unknown_arch_selection_fails_loudly():
     with pytest.raises(MetaInfoFilterError, match="kept 0"):
         filter_metainfo(HEADER, ["Sm999z"])
 
 
+@pytest.mark.cpu_only
 def test_missing_list_declaration_fails_loudly():
     broken = HEADER.replace(
         "static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {",
@@ -100,6 +107,7 @@ def test_missing_list_declaration_fails_loudly():
         filter_metainfo(broken, BLACKWELL_CUBIN_ARCHS)
 
 
+@pytest.mark.cpu_only
 def test_missing_list_length_fails_loudly():
     broken = HEADER.replace(
         "static constexpr size_t tllmGenBatchedGemmListLen = 4;", ""
@@ -108,12 +116,14 @@ def test_missing_list_length_fails_loudly():
         filter_metainfo(broken, BLACKWELL_CUBIN_ARCHS)
 
 
+@pytest.mark.cpu_only
 def test_unterminated_entry_fails_loudly():
     broken = HEADER.replace(" }, gemm::SmVersion::Sm100a},", " }, gemm::SmVersion::")
     with pytest.raises(MetaInfoFilterError, match="unterminated"):
         filter_metainfo(broken, BLACKWELL_CUBIN_ARCHS)
 
 
+@pytest.mark.cpu_only
 def test_gemm_manifest_uses_the_same_shape():
     gemm_header = HEADER.replace("tllmGenBatchedGemmList", "tllmGenGemmList").replace(
         "batchedGemm::BatchedGemmConfig", "gemm::GemmConfig"

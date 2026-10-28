@@ -25,6 +25,7 @@ def _routes(target):
     return loader.ROUTES[target]
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("target", ["sm100a", "sm103a"])
 def test_every_route_names_a_program_built_for_its_target(target):
     arch = loader._TARGET_ARCH[target]
@@ -33,6 +34,7 @@ def test_every_route_names_a_program_built_for_its_target(target):
         assert loader.route_program(key, target) == name
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("target", ["sm100a", "sm103a"])
 def test_jit_spec_is_target_specific(target):
     name = next(iter(_routes(target).values()))
@@ -41,6 +43,7 @@ def test_jit_spec_is_target_specific(target):
     assert loader.gen_blackwell_msa_module(name, target) is spec
 
 
+@pytest.mark.cpu_only
 def test_every_record_names_a_registered_arg_plan():
     """Every program names one ``ARG_PLANS`` entry and every plan is named."""
     named = set()
@@ -52,6 +55,7 @@ def test_every_record_names_a_registered_arg_plan():
     assert named == set(loader.ARG_PLANS)
 
 
+@pytest.mark.cpu_only
 def test_jit_package_reexports_resolve():
     """Every name ``flashinfer/jit/__init__.py`` imports from the loader exists."""
     import ast
@@ -71,6 +75,7 @@ def test_jit_package_reexports_resolve():
     assert not missing, missing
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("target", ["sm100a", "sm103a"])
 def test_variant_registry_lists_every_routed_program(target):
     variants = loader.BLACKWELL_MSA_VARIANTS_BY_TARGET[target]
@@ -96,6 +101,7 @@ def _blackwell_msa_csrc():
     return Path(loader.__file__).resolve().parents[2] / "csrc"
 
 
+@pytest.mark.cpu_only
 def test_shared_bindings_take_each_record_from_its_compile_flags():
     """Every ``#ifndef CAKE_* / #error`` selector of a shared binding source is set
     exactly once, per target, by the record's compile flags; the kernel symbol and the
@@ -123,6 +129,7 @@ def test_shared_bindings_take_each_record_from_its_compile_flags():
                 assert len(hits) == 1, (name, target, macro, hits)
 
 
+@pytest.mark.cpu_only
 def test_shared_bindings_have_the_generated_form():
     """Each shared binding source carries the generated -D-selected form and no digest."""
     import re
@@ -141,6 +148,7 @@ def test_shared_bindings_have_the_generated_form():
         assert not re.search(r"[0-9a-f]{20}", text), binding
 
 
+@pytest.mark.cpu_only
 def test_shared_bindings_serve_one_arg_plan_each():
     """Records sharing a binding source share one argument plan and no two carry the
     same full compile-flag set."""
