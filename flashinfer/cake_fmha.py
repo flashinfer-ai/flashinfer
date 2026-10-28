@@ -366,6 +366,18 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         1,
         False,
     ),
+    # sm103a, launches of at most 256 keys (_CONTEXT_FP8_SHORT_KV_ROUTES): the
+    # 4-stage ring with each stage's P tile in its own S columns.
+    ("context_fp8", "B256_KV4"): (
+        "cake_fmha_context_fp8_6371b7f525b7e1adee0c",
+        1,
+        False,
+    ),
+    ("context_fp8", "B256_SCALE_PTR_KV4"): (
+        "cake_fmha_context_fp8_87833354af3317307113",
+        1,
+        False,
+    ),
     ("context_nvfp4", "Q511_SM100A"): (
         "cake_fmha_context_nvfp4_41e0f7b224fcc4acfc54",
         16,
@@ -540,6 +552,27 @@ _CONTEXT_FP8_RUNTIME_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
         (4, None): "RUNTIME_PACK4_PX",
         (2, None): "RUNTIME_PACK2_PX",
         (1, None): "RUNTIME_PACK1_PX",
+    },
+}
+# Short sm103a launches keep each stage's P tile in its own S columns: the
+# program an exact or runtime-size route names maps to the same schedule
+# and arguments with the default P placement, for launches of at most the
+# keys the entry names.  With one 128-key block per tile the swapped
+# schedule has no next QK product to issue while P is written; the exact
+# programs keep the default placement up to two blocks per tile, where
+# their launches of many tiles run slower swapped.
+_CONTEXT_FP8_SHORT_KV_ROUTES: dict[str, dict[str, tuple[str, int]]] = {
+    "sm103a": {
+        "B256_PX": ("B256_KV4", 256),
+        "B256_SCALE_PTR_PX": ("B256_SCALE_PTR_KV4", 256),
+        "RUNTIME_PACK8_PX": ("RUNTIME_PACK8", 128),
+        "RUNTIME_PACK4_PX": ("RUNTIME_PACK4", 128),
+        "RUNTIME_PACK2_PX": ("RUNTIME_PACK2", 128),
+        "RUNTIME_PACK1_PX": ("RUNTIME_PACK1", 128),
+        "RUNTIME_PACK8_PAGE64_PX": ("RUNTIME_PACK8_PAGE64", 128),
+        "RUNTIME_PACK4_PAGE64_PX": ("RUNTIME_PACK4_PAGE64", 128),
+        "RUNTIME_PACK2_PAGE64_PX": ("RUNTIME_PACK2_PAGE64", 128),
+        "RUNTIME_PACK1_PAGE64_PX": ("RUNTIME_PACK1_PAGE64", 128),
     },
 }
 # The packs the runtime programs ship besides 1: a pack serves every GQA group
@@ -5061,6 +5094,12 @@ def select_cake_fmha_context_route(
                 )
                 total_bh = batch_size * (num_q_heads // pack)
                 l2_swizzle = 8 if total_bh % 8 == 0 else 1
+        # An FP8 call of at most the keys of its route's short-KV entry, where
+        # the target names one: the entry's program (the same schedule, pack,
+        # m-blocks and arguments).
+        short = _CONTEXT_FP8_SHORT_KV_ROUTES.get(target, {}).get(program)
+        if component == "context_fp8" and short and max_kv_len <= short[1]:
+            program = short[0]
         # An FP8 call an exact or runtime-size program serves, whose tiles
         # leave SMs idle: the split-KV program of the pack the split choice
         # names (:func:`_context_fp8_split_choice`) and the page size, where the

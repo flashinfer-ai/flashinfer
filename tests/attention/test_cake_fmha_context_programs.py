@@ -64,6 +64,11 @@ SHAPE_ROWS = {
         "context_fp8", 256, 32, 1024, 32, 4, 64, True,
         {"sm100a": "B256", "sm103a": "B256_PX"},
     ),
+    # At most 128 keys: sm103a takes the short-KV program of the route.
+    "fp8_b16_q32_k128": (
+        "context_fp8", 16, 32, 128, 32, 4, 64, True,
+        {"sm100a": "B256", "sm103a": "B256_KV4"},
+    ),
     "nvfp4_b4_q511_k2047": (
         "context_nvfp4", 4, 511, 2047, 32, 4, 16, True,
         {"sm100a": "Q511_SM100A", "sm103a": "Q511_SM103A"},
@@ -73,6 +78,10 @@ SHAPE_ROWS = {
     "fp8_b64_q32_k1024_g4": (
         "context_fp8", 64, 32, 1024, 32, 8, 64, True,
         {"sm100a": "RUNTIME_PACK4_PAGE64", "sm103a": "RUNTIME_PACK4_PAGE64_PX"},
+    ),
+    "fp8_b16_q32_k128_g4": (
+        "context_fp8", 16, 32, 128, 32, 8, 64, True,
+        {"sm100a": "RUNTIME_PACK4_PAGE64", "sm103a": "RUNTIME_PACK4_PAGE64"},
     ),
     "fp8_b16_q32_k1024_g16_page16": (
         "context_fp8", 16, 32, 1024, 32, 2, 16, False,
@@ -92,6 +101,7 @@ SHAPE_ROWS = {
 _DEVICE_SCALE_PROGRAM = {
     "B256": "B256_SCALE_PTR",
     "B256_PX": "B256_SCALE_PTR_PX",
+    "B256_KV4": "B256_SCALE_PTR_KV4",
     "Q511_SM100A": "Q511_SCALE_PTR_SM100A",
     "Q511_SM103A": "Q511_SCALE_PTR_SM103A",
 }
@@ -149,6 +159,11 @@ def test_cake_fmha_context_program_table_matches_the_generated_loaders() -> None
                 served.setdefault(("context_fp8", identifier), set()).add(
                     _TARGET_ARCH[target]
                 )
+    for target, short in cake_api._CONTEXT_FP8_SHORT_KV_ROUTES.items():
+        for identifier, _ in short.values():
+            served.setdefault(("context_fp8", identifier), set()).add(
+                _TARGET_ARCH[target]
+            )
     assert set(served) == set(cake_api._CONTEXT_PROGRAMS)
     for (component, identifier), (
         name,
@@ -692,6 +707,52 @@ def test_cake_fmha_context_fp8_exact_routes_come_first(monkeypatch, target) -> N
             route
         )
         assert route.num_m_blocks == -(-33 // (2 * (128 // pack)))
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+def test_cake_fmha_context_fp8_short_kv_routes(monkeypatch, target) -> None:
+    """A launch of at most the keys of its exact or runtime-size route's
+    short-KV entry, where the target names one, takes the entry's program
+    (sm103a: the same schedule with each stage's P tile in its own S
+    columns; 256 keys for the exact programs, 128 for the runtime-size
+    ones), for host and device scales alike; one key more keeps the
+    route's program."""
+
+    short = cake_api._CONTEXT_FP8_SHORT_KV_ROUTES.get(target, {})
+    routed = {
+        *cake_api._CONTEXT_PROGRAM_ROUTES[target].values(),
+        *cake_api._CONTEXT_FP8_RUNTIME_ROUTES[target].values(),
+    }
+    assert set(short) <= routed and (target == "sm103a") == bool(short)
+    for swapped, (identifier, keys) in short.items():
+        assert keys == (256 if identifier.startswith("B256") else 128)
+        assert (
+            cake_api._CONTEXT_PROGRAMS[("context_fp8", swapped)][1:]
+            == cake_api._CONTEXT_PROGRAMS[("context_fp8", identifier)][1:]
+        )
+        assert swapped == f"{identifier.removesuffix('_KV4')}_PX"
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    for row in ("fp8_b16_q32_k128", "fp8_b16_q32_k128_g4"):
+        component, batch, q_len, _, hq, hkv, page, shared, _ = SHAPE_ROWS[row]
+        short_program = SHAPE_ROWS[row][-1][target]
+        swapped = {v[0]: k for k, v in short.items()}.get(short_program)
+        keys = short[swapped][1] if swapped else 128
+        for kv_len in (keys, keys + 1):
+            shape = (component, batch, q_len, kv_len, hq, hkv, page, shared, None)
+            for device_scales in (False, True):
+                kwargs = _context_kwargs(
+                    shape, device_scales=device_scales, device="meta"
+                )
+                route = cake_api.select_cake_fmha_context_route(
+                    torch.device("meta"), **kwargs
+                )
+                assert route is not None and route.program is not None
+                program = short_program
+                if kv_len > keys and swapped:
+                    program = swapped
+                if device_scales:
+                    program = _device_scale_program(program)
+                assert route.program == program, (row, kv_len, route)
 
 
 # --- The FP8 split-KV route (host-only) --------------------------------------
@@ -1865,6 +1926,11 @@ def test_cake_context_quantized_programs_match_reference(
         program = {"B256": _FP8_EXACT[target]}.get(
             program, _DEVICE_SCALE_PROGRAM[_FP8_EXACT[target]]
         )
+        # a launch of at most the keys of the route's short-KV entry takes
+        # the entry's program
+        short = cake_api._CONTEXT_FP8_SHORT_KV_ROUTES.get(target, {}).get(program)
+        if short and case["max_kv_len"] <= short[1]:
+            program = short[0]
     original = prefill.trtllm_batch_context_with_kv_cache
 
     def cake_context(*args, **kwargs):
@@ -1906,6 +1972,8 @@ BITWISE_ROWS = {
     "fp8_b16_q32_k1024_g16_page16": ("fp8_b16_q32_k1024_g16_page16", 16, 32),
     "fp8_b2_q256_k2048_g3_page32": ("fp8_b2_q256_k2048_g3_page32", 2, 256),
     "fp8_b4_q128_k1024_g6_page16": ("fp8_b4_q128_k1024_g6_page16", 4, 128),
+    "fp8_b16_q32_k128": ("fp8_b16_q32_k128", 16, 32),
+    "fp8_b16_q32_k128_g4": ("fp8_b16_q32_k128_g4", 16, 32),
     **WIDENED_ROWS,
 }
 _SCALES = {"context_bf16": (128**-0.5, 1.0)}
