@@ -115,14 +115,11 @@ ARG_PLANS: dict[str, list[list[str]]] = {
         ["grid", "grid_z"],
     ],
 }
-# The scan programs that draw their work units from the workspace's ticket tail
-# (``cake_policy.TICKET_TAIL_BYTES``), per architecture: the sm_103a gate-warpgroup
-# wide programs.  The host zeroes the tail right before launching one of them
-# (``cake_backend``); every other (program, arch) pair leaves it unused.
-TICKET_TAIL_PROGRAMS: dict[str, tuple[str, ...]] = {
-    "cake_dsa_indexer_topk_3c6dc460295ddf3c44de": ("sm_103a",),
-    "cake_dsa_indexer_topk_808a62a6315ae38034c6": ("sm_103a",),
-}
+# The architectures whose scan programs draw every work unit from the workspace's
+# ticket tail (``cake_policy.TICKET_TAIL_BYTES``): every sm_100a / sm_103a scan
+# program.  The host zeroes the tail right before every scan launch on them
+# (``cake_backend``); sm_107a keeps the static unit enumeration and leaves it unused.
+TICKET_TAIL_ARCHES: tuple[str, ...] = ("sm_100a", "sm_103a")
 PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_dsa_indexer_topk_0d38735ee8e81ae6f5e8": {
         "role": "scan",
