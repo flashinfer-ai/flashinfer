@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import dataclasses
 import glob
 import re
 from pathlib import Path
@@ -321,6 +322,8 @@ def test_quantizer_alone_cluster_split_rows():
                             m, k, True, chain.k_static, arch, sm_count
                         ):
                             pass
+                        elif alone.out_scale_read != "entry":
+                            pass  # test_quantizer_alone_out_scale_read_rows
                         elif chain.cluster_split == split:
                             assert alone == chain, (arch, k, m, fold)
                         else:
@@ -378,6 +381,45 @@ def test_chain_one_cta_quantizer_rows():
                         == split
                     ), (arch, k, m, fold)
         assert served == {m for m in set(REACHABLE_M) | {lo, hi} if lo <= m <= hi}, arch
+
+
+def test_chain_one_cta_measured_cells():
+    """The quantize + GEMM chain runs one CTA per bf16 row, with a generated program, on the
+    token counts CHAIN_ONE_CTA_MEASURED_CELLS gives the GEMM's ``(K, N)`` at the measured
+    SM count of the architecture; another weight shape, a chain without a weight shape,
+    the other SM count and the quantizer alone keep their own split."""
+    other = {"sm_100a": 152, "sm_103a": 148}
+    for arch, cells in cb.CHAIN_ONE_CTA_MEASURED_CELLS.items():
+        sm_count = cb.MEASURED_SM_COUNT[arch]
+        for (k, n), (lo, hi) in cells.items():
+            for m in sorted({max(lo - 1, 1), lo, hi, hi + 1}):
+                for fold in (False, True):
+                    split = cb.chain_cluster_split(m, k, True, fold, arch, sm_count)
+                    chain = _registered(
+                        cb.quant_plan(m, k, True, fold, arch, sm_count, n=n), arch
+                    )
+                    if lo <= m <= hi:
+                        assert chain.cluster_split == 1, (arch, k, n, m, fold)
+                        assert chain.grid == cb.padded_rows(m), (arch, k, n, m, fold)
+                    else:
+                        assert chain.cluster_split == split, (arch, k, n, m, fold)
+                    assert (
+                        cb.chain_cluster_split(m, k, True, fold, arch, sm_count, n + 8)
+                        == split
+                    ), (arch, k, n, m, fold)
+                    assert cb.chain_cluster_split(
+                        m, k, True, fold, arch, other[arch], n
+                    ) == cb.chain_cluster_split(m, k, True, fold, arch, other[arch]), (
+                        arch,
+                        k,
+                        n,
+                        m,
+                        fold,
+                    )
+                    alone = cb.quant_plan(m, k, True, fold, arch, sm_count, alone=True)
+                    assert alone.cluster_split == cb.quant_alone_cluster_split(
+                        m, k, True, fold, arch, sm_count
+                    ), (arch, k, n, m, fold)
 
 
 def test_f16_quantizer_shapes_match_the_validated_f16_rows():
@@ -889,6 +931,137 @@ def test_quantizer_alone_pad_chunked_rows():
                         ) == cb.quant_plan(m, k, False, fold, arch, sm_count)
 
 
+def test_quantizer_alone_out_scale_read_rows():
+    """The quantizer alone reads ``out_scale`` at its use (``_ru``) on the folded bf16 rows of
+    QUANT_ALONE_OUT_SCALE_READ at the measured SM count of each architecture: the chain's
+    instance and grid with the suffixed generated program.  Next to the range, without the
+    fold, for fp16 activations, at the other SM count and in the chain the plan reads it at
+    entry."""
+    other = {"sm_100a": 152, "sm_103a": 148}
+    suffix = cb.OUT_SCALE_READ_SUFFIX
+    for arch, table in cb.QUANT_ALONE_OUT_SCALE_READ.items():
+        sm_count = cb.MEASURED_SM_COUNT[arch]
+        for k, ranges in table.items():
+            for lo, hi, read in ranges:
+                for m in sorted({lo, lo + 1, 1000, 2048, 4097, 8192, 32768}):
+                    if not lo <= m <= hi:
+                        continue
+                    chain = cb.quant_plan(m, k, True, True, arch, sm_count)
+                    alone = _registered(
+                        cb.quant_plan(m, k, True, True, arch, sm_count, alone=True),
+                        arch,
+                    )
+                    assert alone.out_scale_read == read, (arch, k, m)
+                    assert alone.kernel_key == chain.kernel_key + suffix[read]
+                    entry_plan = dataclasses.replace(
+                        alone, kernel_key=chain.kernel_key, out_scale_read="entry"
+                    )
+                    assert entry_plan == chain, (arch, k, m)
+                    assert chain.out_scale_read == "entry"
+                    for sms, fold, bf16 in (
+                        (other[arch], True, True),
+                        (sm_count, False, True),
+                        (sm_count, True, False),
+                    ):
+                        got = cb.quant_plan(m, k, bf16, fold, arch, sms, alone=True)
+                        want = cb.quant_plan(m, k, bf16, fold, arch, sms)
+                        assert got == want, (arch, sms, k, m)
+                for m in (lo - 1, hi + 1):
+                    near = cb.quant_plan(m, k, True, True, arch, sm_count, alone=True)
+                    assert near.out_scale_read == "entry", (arch, k, m)
+
+
+def test_quantizer_alone_out_scale_read_keeps_row_strided_rows():
+    """The ``_ru`` program takes contiguous rows only: a row-strided row of a
+    QUANT_ALONE_OUT_SCALE_READ range keeps the plan of the row without the range (the
+    entry read), while the contiguous row of the same shape reads ``out_scale`` at its
+    use."""
+    suffix = cb.OUT_SCALE_READ_SUFFIX
+    for arch, table in cb.QUANT_ALONE_OUT_SCALE_READ.items():
+        sm_count = cb.MEASURED_SM_COUNT[arch]
+        for k, ranges in table.items():
+            for lo, hi, read in ranges:
+                for m in sorted({lo, hi}):
+                    stride = k + 64
+                    strided = cb.quant_plan(
+                        m, k, True, True, arch, sm_count, stride, alone=True
+                    )
+                    assert strided.out_scale_read == "entry", (arch, k, m)
+                    assert not strided.kernel_key.endswith(suffix[read]), (arch, k, m)
+                    assert strided == cb.quant_plan(
+                        m, k, True, True, arch, sm_count, stride
+                    ), (arch, k, m)
+                    for row_stride in (None, k):
+                        contiguous = cb.quant_plan(
+                            m, k, True, True, arch, sm_count, row_stride, alone=True
+                        )
+                        assert contiguous.out_scale_read == read, (arch, k, m)
+                        assert contiguous.kernel_key.endswith(suffix[read])
+    plan = cb.quant_plan(512, 28672, True, True, "sm_103a", 152, 28736, alone=True)
+    assert plan.kernel_key == "quant:t256_b7_mb3_bf16_fold_sl"
+
+
+_ALONE_OUT_SCALE_READ_CASES = sorted(
+    {
+        (k, m)
+        for table in cb.QUANT_ALONE_OUT_SCALE_READ.values()
+        for k, ranges in table.items()
+        for lo, hi, _ in ranges
+        for m in (lo, hi, hi + 1)
+    }
+)
+
+
+@pytest.mark.parametrize("k,m", _ALONE_OUT_SCALE_READ_CASES)
+def test_quantizer_alone_out_scale_read_matches_the_chain_quantizer(k, m):
+    """Reading ``out_scale`` late writes the same codes, block scales (padding included)
+    and per-token scales as the quantize + GEMM chain's quantizer, bit for bit."""
+    device = _require_program()
+    g = torch.Generator(device=device).manual_seed(5000 + m + k)
+    x = torch.randn(m, k, device=device, dtype=torch.bfloat16, generator=g)
+    gs_inv = torch.tensor([GLOBAL_SCALE_INV], dtype=torch.float32, device=device)
+    out_scale = torch.tensor([0.37], dtype=torch.float32, device=device)
+    got = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    want = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    for t in (*got, *want):
+        t.view(torch.uint8).fill_(0xFF)
+    cb.prepare_nvfp4_per_token_quantize(x, gs_inv, got, out_scale=out_scale)()
+    cb._prepare_quantize(x, gs_inv, want, out_scale=out_scale, alone=False)()
+    torch.cuda.synchronize()
+    for a, b in zip(got, want, strict=True):
+        assert torch.equal(a.reshape(-1), b.reshape(-1))
+    _check_against_reference(x, gs_inv, out_scale, *got)
+
+
+@pytest.mark.parametrize("k,m", _ALONE_OUT_SCALE_READ_CASES)
+def test_quantizer_alone_out_scale_read_row_strided_matches_contiguous(k, m):
+    """A row-strided view of a QUANT_ALONE_OUT_SCALE_READ row runs (its plan keeps the
+    entry read) and writes the same codes, block scales (padding included) and per-token
+    scales as the contiguous copy, bit for bit."""
+    device = _require_program()
+    g = torch.Generator(device=device).manual_seed(6000 + m + k)
+    full = torch.randn(m, k + 64, device=device, dtype=torch.bfloat16, generator=g)
+    x = full[:, :k]
+    assert not x.is_contiguous()
+    gs_inv = torch.tensor([GLOBAL_SCALE_INV], dtype=torch.float32, device=device)
+    out_scale = torch.tensor([0.37], dtype=torch.float32, device=device)
+    got = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    want = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    for t in (*got, *want):
+        t.view(torch.uint8).fill_(0xFF)
+    cb.prepare_nvfp4_per_token_quantize(x, gs_inv, got, out_scale=out_scale)()
+    cb.prepare_nvfp4_per_token_quantize(
+        x.contiguous(), gs_inv, want, out_scale=out_scale
+    )()
+    torch.cuda.synchronize()
+    for a, b in zip(got, want, strict=True):
+        assert torch.equal(a.reshape(-1), b.reshape(-1))
+    public = cb.nvfp4_quantize_per_token(x, gs_inv, out_scale=out_scale)
+    torch.cuda.synchronize()
+    for a, b in zip(public, got, strict=True):
+        assert torch.equal(a.reshape(-1), b.reshape(-1))
+
+
 _ALONE_PAD_CHUNKED_CASES = sorted(
     {
         (k, m, fold)
@@ -990,6 +1163,43 @@ def test_chain_one_cta_quantizer_matches_the_quantizer_alone(k, m, fold):
     for t in (*got, *want):
         t.view(torch.uint8).fill_(0xFF)
     cb._prepare_quantize(x, gs_inv, got, out_scale=out_scale, alone=False)()
+    cb.prepare_nvfp4_per_token_quantize(x, gs_inv, want, out_scale=out_scale)()
+    torch.cuda.synchronize()
+    for a, b in zip(got, want, strict=True):
+        assert torch.equal(a.reshape(-1), b.reshape(-1))
+    _check_against_reference(x, gs_inv, out_scale, *got)
+
+
+# The chain's one-CTA-per-row cells of a weight shape (CHAIN_ONE_CTA_MEASURED_CELLS), with
+# and without the folded out_scale.
+_CHAIN_ONE_CTA_MEASURED_CASES = sorted(
+    {
+        (k, n, m, fold)
+        for cells in cb.CHAIN_ONE_CTA_MEASURED_CELLS.values()
+        for (k, n), (lo, hi) in cells.items()
+        for m in sorted({lo, hi})
+        for fold in (False, True)
+    }
+)
+
+
+@pytest.mark.parametrize("k,n,m,fold", _CHAIN_ONE_CTA_MEASURED_CASES)
+def test_chain_one_cta_measured_quantizer_matches_the_quantizer_alone(k, n, m, fold):
+    """The quantize + GEMM chain's quantizer of a CHAIN_ONE_CTA_MEASURED_CELLS weight shape
+    writes the same codes, block scales (padding included) and per-token scales as the
+    public quantizer, bit for bit."""
+    device = _require_program()
+    g = torch.Generator(device=device).manual_seed(6000 + m + k)
+    x = torch.randn(m, k, device=device, dtype=torch.bfloat16, generator=g)
+    gs_inv = torch.tensor([GLOBAL_SCALE_INV], dtype=torch.float32, device=device)
+    out_scale = (
+        torch.tensor([0.37], dtype=torch.float32, device=device) if fold else None
+    )
+    got = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    want = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    for t in (*got, *want):
+        t.view(torch.uint8).fill_(0xFF)
+    cb._prepare_quantize(x, gs_inv, got, out_scale=out_scale, alone=False, n=n)()
     cb.prepare_nvfp4_per_token_quantize(x, gs_inv, want, out_scale=out_scale)()
     torch.cuda.synchronize()
     for a, b in zip(got, want, strict=True):
