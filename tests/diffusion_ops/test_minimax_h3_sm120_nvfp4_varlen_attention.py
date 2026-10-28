@@ -48,6 +48,7 @@ from flashinfer.diffusion_ops import (
     minimax_h3_sm120_varlen_attention_nvfp4_nodelta,
 )
 import flashinfer.diffusion_ops.cake_minimax_h3_sm120_nvfp4_varlen_attention as nvfp4_ops
+import flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_varlen_attention as quant_ops
 from flashinfer.diffusion_ops.cake_minimax_h3_sm120_nvfp4_varlen_attention import (
     minimax_h3_sm120_nvfp4_fp8pv_programs,
     workspace_bytes_nvfp4,
@@ -566,6 +567,56 @@ def test_minimax_h3_sm120_varlen_attention_nvfp4_graphs_one_capture_stream() -> 
                 graph.replay()
         _await(streams, "two graphs replayed concurrently")
         for out, want in zip(outs, expected, strict=True):
+            assert torch.equal(out, want)
+            out.zero_()
+    assert _control_words_are_zero(owners)
+
+
+@requires_sm120
+def test_minimax_h3_sm120_owner_asks_cuda_when_the_call_device_is_not_current(
+    monkeypatch,
+) -> None:
+    """While another device is current, torch's capture query reads that device's stream; the owner of a
+    call then asks CUDA about the call's own stream, which sees the capture (one GPU: the other current
+    device and its idle stream are reported by patched torch queries inside a real capture)."""
+    x = torch.zeros(16, device="cuda:0")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        x.add_(1)
+        raw = torch.cuda.current_stream().cuda_stream
+        with monkeypatch.context() as patch:
+            patch.setattr(torch.cuda, "current_device", lambda: 1)
+            patch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+            owner = quant_ops._owner(0, raw)
+    assert len(owner) == 3 and owner[:2] == (0, raw) and owner[2] != 0
+    # the same stream after the capture is an eager owner
+    assert quant_ops._owner(0, raw) == (0, raw)
+
+
+@requires_sm120
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two CUDA devices")
+def test_minimax_h3_sm120_varlen_attention_nvfp4_capture_on_another_device(
+    monkeypatch,
+) -> None:
+    """A call on device 1 captured into a graph while device 0 is current gets a capture owner and no eager
+    warm-up launch inside the capture, and its replays reproduce the eager result bit for bit."""
+    device = torch.device("cuda:1")
+    with torch.cuda.device(device):
+        cu, ((q, k, v),), (want,) = _fused_case(device, (43,))
+    out = torch.zeros_like(q)
+    # the plan's first call on this device again: the warm-up gate must see the capture
+    monkeypatch.setattr(nvfp4_ops, "_NVFP4_OVERLAP_LOADED", set())
+    before = set(nvfp4_ops._ZERO_STREAM_WORKSPACES)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.device(device), torch.cuda.graph(graph), torch.cuda.device(0):
+        _fused_call(q, k, v, cu, out)
+    owners = _new_capture_owners(before)
+    assert len(owners) == 1 and owners[0][0] == device.index
+    assert not nvfp4_ops._NVFP4_OVERLAP_LOADED
+    with torch.cuda.device(device):
+        for _round in range(4):
+            graph.replay()
+            torch.cuda.synchronize()
             assert torch.equal(out, want)
             out.zero_()
     assert _control_words_are_zero(owners)

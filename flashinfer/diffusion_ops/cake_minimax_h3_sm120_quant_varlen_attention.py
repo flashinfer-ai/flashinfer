@@ -418,6 +418,18 @@ def _capture_id(stream: int) -> int:
     return int(info[2])
 
 
+def _capturing(index: int, stream: int) -> bool:
+    """Whether the raw stream ``stream`` of device ``index`` takes part in a CUDA-graph capture.
+
+    ``torch.cuda.is_current_stream_capturing`` reads the current stream of the current device, which is
+    ``stream`` only when ``index`` is the current device; a call whose tensors live on another device asks
+    CUDA about ``stream`` itself.
+    """
+    if index == torch.cuda.current_device():
+        return torch.cuda.is_current_stream_capturing()
+    return _capture_id(stream) != 0
+
+
 def _owner(index: int, stream: int) -> Tuple[int, ...]:
     """The workspace owner of a call on device ``index`` and raw stream ``stream``: ``(index, stream)`` for
     an eager call, ``(index, stream, capture id)`` for a call captured into a CUDA graph.
@@ -434,7 +446,7 @@ def _owner(index: int, stream: int) -> Tuple[int, ...]:
     # Concurrency: safe on any number of streams, host threads, CUDA graphs and MPS clients. Exec graphs
     # instantiated more than once from one captured graph (or cloned as child graphs) share this op's
     # workspace and must not run concurrently.
-    if torch.cuda.is_current_stream_capturing():
+    if _capturing(index, stream):
         capture = _capture_id(stream)
         if capture:
             return (index, stream, capture)
