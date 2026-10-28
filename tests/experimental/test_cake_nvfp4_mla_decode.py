@@ -184,30 +184,38 @@ def reference(
     return O.to(torch.bfloat16), LSE
 
 
-def make_inputs(kv_lens, num_heads, *, q_len, enable_sink, device, seed=0):
-    """Deterministic NVFP4 paged decode inputs with a peaked softmax."""
-    gen = torch.Generator(device=device).manual_seed(seed)
+def make_inputs(
+    kv_lens, num_heads, *, q_len, enable_sink, device, seed=0, rng_device=None
+):
+    """Deterministic NVFP4 paged decode inputs with a peaked softmax.
+
+    ``rng_device="cpu"`` draws them on the host, so every GPU sees the same
+    inputs (a CUDA generator's stream depends on the device's SM count)."""
+    rng = rng_device or device
+    gen = torch.Generator(device=rng).manual_seed(seed)
     batch = len(kv_lens)
     pages_per_seq = [kv_pages(kv) for kv in kv_lens]
     total_pages = sum(pages_per_seq)
     max_pages = max(pages_per_seq)
     k_full = torch.randn(
-        (total_pages, PAGE_SIZE, HEAD_DIM), generator=gen, device=device
-    )
-    permutation = torch.randperm(total_pages, generator=gen, device=device).to(
-        torch.int32
+        (total_pages, PAGE_SIZE, HEAD_DIM), generator=gen, device=rng
+    ).to(device)
+    permutation = torch.randperm(total_pages, generator=gen, device=rng).to(
+        device=device, dtype=torch.int32
     )
     block_tables = torch.zeros((batch, max_pages), dtype=torch.int32, device=device)
     offset = 0
     for b, count in enumerate(pages_per_seq):
         block_tables[b, :count] = permutation[offset : offset + count]
         offset += count
-    q = torch.randn((batch * q_len, num_heads, HEAD_DIM), generator=gen, device=device)
+    q = torch.randn((batch * q_len, num_heads, HEAD_DIM), generator=gen, device=rng).to(
+        device
+    )
     for b in range(batch):
         for i in range(q_len):
             visible = kv_lens[b] - q_len + i + 1
             target = int(
-                torch.randint(0, visible, (1,), generator=gen, device=device).item()
+                torch.randint(0, visible, (1,), generator=gen, device=rng).item()
             )
             page = int(block_tables[b, target // PAGE_SIZE].item())
             q[b * q_len + i] += 0.2 * k_full[page, target % PAGE_SIZE]
@@ -215,7 +223,9 @@ def make_inputs(kv_lens, num_heads, *, q_len, enable_sink, device, seed=0):
     kv_cache, kv_scale = quantize_nvfp4(k_full)
     sinks = None
     if enable_sink:
-        sinks = torch.randn((num_heads,), generator=gen, device=device) * 0.5 + 1.0
+        sinks = (
+            torch.randn((num_heads,), generator=gen, device=rng).to(device) * 0.5 + 1.0
+        )
     seq_lens = torch.tensor(kv_lens, dtype=torch.int32, device=device)
     return dict(
         query=query,
@@ -1077,6 +1087,9 @@ def test_select_decode_record_spec_uh_needs_the_records(monkeypatch, spec_record
 
 
 SPEC_PAIRS_KV = [300, 600, 900, 1200, 9000]
+# Inputs of the item-pair rows, drawn on the host so every GPU sees the same
+# values (seed 15: the largest margin to the reference bound of the seeds tried).
+SPEC_PAIRS_INPUTS = {"seed": 15, "rng_device": "cpu"}
 
 
 @pytest.mark.parametrize("num_sms", [148, 152])
@@ -1762,6 +1775,8 @@ def assert_programs_match_bitwise(
     enable_sink=True,
     schedule="auto",
     tiles_per_split=None,
+    seed=0,
+    rng_device=None,
 ):
     """The selector binds further record ``name`` for the problem, and the
     stage's own record and ``name`` run it to the same bits."""
@@ -1792,7 +1807,13 @@ def assert_programs_match_bitwise(
     if getattr(cake_backend, selector)(plan, arch) != name:
         pytest.skip(f"the selector keeps the {stage} program at {num_sms} SMs")
     inputs = make_inputs(
-        kv_lens, num_heads, q_len=q_len, enable_sink=enable_sink, device="cuda"
+        kv_lens,
+        num_heads,
+        q_len=q_len,
+        enable_sink=enable_sink,
+        device="cuda",
+        seed=seed,
+        rng_device=rng_device,
     )
     if tiles_per_split is None:
         nbytes = nvfp4_mla_decode_workspace_size(
@@ -1893,7 +1914,7 @@ def test_xv_decode_matches_the_decode_bitwise(monkeypatch, label, kv_lens):
         ("bs32_q6_kv4096", [4096] * 32, {}),
         ("bs23_q6_kv8448", [8448] * 23, {}),
         ("bs24_q6_kv8320", [8320] * 24, {}),
-        ("spec_pairs_h64_q6", SPEC_PAIRS_KV, {}),
+        ("spec_pairs_h64_q6", SPEC_PAIRS_KV, SPEC_PAIRS_INPUTS),
     ],
 )
 def test_short_decode_matches_the_decode_bitwise(monkeypatch, label, kv_lens, options):
@@ -1909,7 +1930,11 @@ def test_short_decode_matches_the_decode_bitwise(monkeypatch, label, kv_lens, op
         ("h1_q32_tail32", EPI_BOUNDARY_KV, {"num_heads": 1, "q_len": 32, **SPLIT16}),
         ("h8_q4_tail32", EPI_BOUNDARY_KV, {"num_heads": 8, "q_len": 4, **SPLIT16}),
         ("h16_q6_tail32", [4096] * 8, {"num_heads": 16}),
-        ("spec_pairs_h8_q4", SPEC_PAIRS_KV, {"num_heads": 8, "q_len": 4}),
+        (
+            "spec_pairs_h8_q4",
+            SPEC_PAIRS_KV,
+            {"num_heads": 8, "q_len": 4, **SPEC_PAIRS_INPUTS},
+        ),
     ],
 )
 def test_short_epi_decode_matches_the_decode_bitwise(
@@ -1928,7 +1953,7 @@ def test_short_epi_decode_matches_the_decode_bitwise(
         ("h1_q31_tail31", EPI_BOUNDARY_KV, {"num_heads": 1, "q_len": 31, **SPLIT16}),
         ("h8_q3_tail24", EPI_BOUNDARY_KV, {"num_heads": 8, "q_len": 3, **SPLIT16}),
         ("bs32_q6_kv4096", [4096] * 32, {}),
-        ("spec_pairs_h64_q6_uniform", SPEC_PAIRS_KV, SPLIT16),
+        ("spec_pairs_h64_q6_uniform", SPEC_PAIRS_KV, {**SPLIT16, **SPEC_PAIRS_INPUTS}),
     ],
 )
 def test_short_spec_decode_matches_the_decode_bitwise(
@@ -1950,7 +1975,7 @@ def test_short_spec_decode_matches_the_decode_bitwise(
         (
             "spec_pairs_h8_q4_uniform",
             SPEC_PAIRS_KV,
-            {"num_heads": 8, "q_len": 4, **SPLIT16},
+            {"num_heads": 8, "q_len": 4, **SPLIT16, **SPEC_PAIRS_INPUTS},
         ),
     ],
 )
