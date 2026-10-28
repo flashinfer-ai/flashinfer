@@ -64,11 +64,13 @@
 // rank owns a peer-writable activation matrix a1 (symmetric memory) followed by a
 // count all-gather area (one flag per source, then one row of per-key counts per
 // source).  In phase 2 block 0 also stores its per-key totals into every peer's
-// all-gather row and, per destination d, releases its flag on d before its base
-// cell on d.  After the reserve it waits for the base cell of every source and
-// reads that source's flag: the round is DIRECT only if every source released its
-// flag this round (only this instance writes flags), so every rank of the round
-// reaches the same decision; otherwise the whole round takes the inbox path.  In a
+// all-gather row and, per destination d, releases its flag on d before it reserves
+// on d (and so before its base cell on d).  After the reserve it waits, per source,
+// for that source's flag or else its base cell, whichever carries the round's tag
+// first; a base cell without the flag means the source runs another instance.  The
+// round is DIRECT only if every source released its flag this round (only this
+// instance writes flags), so every rank of the round reaches the same decision;
+// otherwise the whole round takes the inbox path.  In a
 // DIRECT round the payload row of a carrier route r (token t, destination d) goes
 // straight to row(r) of d's a1, the row the compact would have copied it to:
 //   row(r) = X[key] - X[d * E] + P[key] + loff[r],   key = expert id of r,
@@ -344,6 +346,35 @@ __device__ __forceinline__ int32_t* ag_row(const DirectArgs& D, int eps, int p, 
          static_cast<uint64_t>(s) * D.ag_stride;
 }
 
+// One source's placement vote: 1 once its flag carries the round's tag, 0 once its base
+// cell carries the tag without the flag (a source releases its flag, if any, before its
+// base cell).  Abort and timeout handling of wait_tag_u64.
+__device__ __forceinline__ int wait_flag_or_base(PushLayout const& L, const uint64_t* flag,
+                                                 const uint64_t* base, uint32_t tag) {
+  auto start = globaltimer_ns();
+  while (true) {
+    if (static_cast<uint32_t>(ld_acquire_sys_u64(flag) >> 32) == tag) return 1;
+    if (static_cast<uint32_t>(ld_acquire_sys_u64(base) >> 32) == tag) {
+      return static_cast<uint32_t>(ld_acquire_sys_u64(flag) >> 32) == tag ? 1 : 0;
+    }
+    uint64_t const abort = ld_acquire_sys_u64(L.abort_cell(L.rank));
+    uint32_t const abort_rank_plus_one = static_cast<uint32_t>(abort);
+    if (abort_rank_plus_one != 0) {
+      uint32_t const abort_tag = static_cast<uint32_t>(abort >> 32);
+      publish_abort_all(L, abort_tag);
+      printf("sm90_cake_bf16: rank %d aborted round %u while waiting for a placement vote\n",
+             static_cast<int>(abort_rank_plus_one) - 1, abort_tag);
+      __trap();
+    }
+    __nanosleep(64);
+    if (FLASHINFER_SM90_PUSH_CHECK_TIMEOUT(start)) {
+      publish_abort_all(L, tag);
+      printf("sm90_cake_bf16: placement vote wait timed out (round %u)\n", tag);
+      __trap();
+    }
+  }
+}
+
 // Dynamic smem (ints): A [nkeys] | B [nkeys + 1] | C [eps] | D [eps].
 //   phase 1: A = per-key counts -> bases, C = per-destination carrier counts -> bases
 //   phase 2 (block 0): A = per-key totals (kept for phase 4), B = exclusive scan, C = meta bases
@@ -492,6 +523,11 @@ __global__ void __launch_bounds__(kThreads, kMinBlocks)
     __syncthreads();
     if (tid < eps) {
       int const d = tid;
+      if constexpr (DIRECT) {  // the block's all-gather row stores (barrier above), then the
+                               // flag, before the reserve round trip on d
+        __threadfence_system();
+        st_release_sys_u64(ag_flag(D, d, L.rank), pack_count_tag(1, tag));
+      }
       int const total_meta = sB[(d + 1) * E] - sB[d * E];
       int const total_payload = __ldcg(s.lc + nkeys + d);
       int meta_base = 0, payload_base = 0;
@@ -510,11 +546,6 @@ __global__ void __launch_bounds__(kThreads, kMinBlocks)
           asm volatile("trap;");
         }
       }
-      if constexpr (DIRECT) {  // the block's row stores (barrier above), then the flag, then the
-                               // base
-        __threadfence_system();
-        st_release_sys_u64(ag_flag(D, d, L.rank), pack_count_tag(1, tag));
-      }
       st_release_sys_u64(L.base_cell(d, L.rank), pack_count_tag(meta_base, tag));
       s.bases[d] = meta_base;
       s.bases[eps + d] = payload_base;
@@ -527,9 +558,8 @@ __global__ void __launch_bounds__(kThreads, kMinBlocks)
     }
     if constexpr (DIRECT) {  // DIRECT round? then the a1 row base of every key
       bool ok = true;
-      if (tid < eps) {  // source tid released its flag before its base cell (this round's tag)
-        wait_tag_u64(L, L.base_cell(L.rank, tid), tag);
-        ok = static_cast<uint32_t>(ld_acquire_sys_u64(ag_flag(D, L.rank, tid)) >> 32) == tag;
+      if (tid < eps) {  // source tid: its flag (released before its reserve) or its base cell
+        ok = wait_flag_or_base(L, ag_flag(D, L.rank, tid), L.base_cell(L.rank, tid), tag) != 0;
       }
       int const direct = __syncthreads_and(ok);  // also: sB (key scan) is consumed
       if (direct) {
