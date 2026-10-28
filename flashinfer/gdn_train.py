@@ -305,7 +305,9 @@ def chunk_gdn_kcp(
 
 @flashinfer_experimental_api(feature=_FEATURE)
 def gdn_kcp_workspace_bytes(ctx: Any, *, H_qk: int, HV: int, **kw: Any) -> int:
-    r"""Caller-held workspace bytes of one rank for ``(ctx, H_qk, HV)`` (exchange pools, staging, tapes)."""
+    r"""Caller-held workspace bytes of one rank for ``(ctx, H_qk, HV)`` (exchange pools, staging, tapes): the most
+    the workspace binds in the forward or the backward of the given options (``reuse_recompute_tapes`` as a keyword;
+    the per-phase terms are ``gdn_kcp_workspace_layout`` of the package)."""
     return _pkg().gdn_kcp_workspace_bytes(ctx, H_qk=H_qk, HV=HV, **kw)
 
 

@@ -169,7 +169,11 @@ gdn_kcp_comm_bytes(ctx, *, H_qk, HV, C) -> {rank: {c1_send, c1_recv, c2_recv, b1
     b1_send = s * n_in(r) * (1 if save_transfer else 2)
     c1_recv / b1_recv on an owner = 2 * s_owner * (fragments it owns)      halo = rows(r) * C * 2
 gdn_kcp_saved_bytes(ctx, *, H_qk, HV, save_mode, save_transfer=True, P=None) -> per rank (the table above)
-gdn_kcp_workspace_bytes(ctx, *, H_qk, HV, P=None) -> per rank: summary / transfer / compose scratch + exchange buffers + tables
+gdn_kcp_workspace_bytes(ctx, *, H_qk, HV, P=None, reuse_recompute_tapes=None) -> per rank: the most the caller-held
+    workspace binds in the forward (the tape walk: pools + the eight live tapes) or the backward (its phases: the
+    exchange, the adjoint tape walk, the end state); under the kept-tape backward (the default) the ten forward
+    tapes are the recompute forward's hand-off tensors outside the workspace (`gdn_kcp_workspace_layout` lists them
+    as `bwd.kept_tapes` and the total as `backward_transient`), under the replay form they are workspace again
 ```
 
 `H_qk` enters the halo and strided-view terms; the exchange terms depend on

@@ -92,6 +92,7 @@ from .cake_kcp_plan import (
     STATE_TILE_BYTES,
     KcpContext,
 )
+from .cake_options import REUSE_RECOMPUTE_TAPES_DEFAULT
 
 SAVE_MODES = ("light", "full")
 BOUNDARY_MODES = ("saved", "replay")
@@ -109,6 +110,32 @@ TAPE_BF16_TILE = HEAD_DIM * HEAD_DIM * 2  # h, dh: bf16 [NC_pad, HV, 128, 128]
 TICKET_SITES = ("fwd_o", "bwd_prep", "bwd_dqkg")
 TICKET_SLOT_BYTES = 128
 TICKET_BYTES = len(TICKET_SITES) * TICKET_SLOT_BYTES
+# The identity tile pool ``eye`` (one FP32 [128, 128] state; the zero block's never-read base, the merge's identity
+# operand): built once per context and bound by every workspace of it.
+EYE_BYTES = STATE_TILE_BYTES
+# Tape lifetimes of the arena (this module's spellings; mirrors of cake_kcp.FWD_DEAD_AFTER_PREP / FWD_TAPES_ARENA_AFTER_FWD,
+# asserted equal by the tests): #1's backward-only outputs leave an eager forward's arena right after #1; the four
+# tapes #5 reads are what an eager forward leaves bound, and what a kept-tape backward re-adopts after #8.
+FWD_TAPES_DEAD_AFTER_PREP = ("akk", "gcum")
+FWD_TAPES_ARENA_AFTER_FWD = ("aqk", "qscale", "h_tape", "v_new")
+TAPE_NAME_OF = {"gcum": "g_cum"}  # this module's spelling -> cake_kcp's
+
+
+def _kept_form(reuse_recompute_tapes: bool | str | None) -> bool:
+    """Whether the workspace terms are the kept-tape backward's (``True``; ``None`` = the package default) or the
+    replay form's (``False``; ``"auto"`` = the bound of both forms, the replay's)."""
+    value = (
+        REUSE_RECOMPUTE_TAPES_DEFAULT
+        if reuse_recompute_tapes is None
+        else reuse_recompute_tapes
+    )
+    if value is True:
+        return True
+    if value is False or value == "auto":
+        return False
+    raise ValueError(
+        f"reuse_recompute_tapes must be True, False, 'auto' or None, got {reuse_recompute_tapes!r}"
+    )
 
 
 def _check(H_qk: int, HV: int) -> tuple[int, int]:
@@ -354,15 +381,38 @@ def gdn_kcp_workspace_layout(
     C: int | None = None,
     P: int | None = None,
     group_reduce: str = "fused",
+    reuse_recompute_tapes: bool | str | None = None,
 ) -> dict[str, int]:
-    """The caller-held workspace of one rank, term by term (``fwd.*`` / ``bwd.*`` in bytes), with the lifetime sums
-    ``forward`` / ``backward`` and their maximum ``workspace`` (module docstring).  Saved-set tensors are counted by
-    :func:`gdn_kcp_saved_layout`, never here."""
+    """The caller-held workspace of one rank, term by term (``fwd.*`` / ``bwd.*`` in bytes), with the lifetime
+    maxima ``forward`` / ``backward`` and their maximum ``workspace`` (module docstring).  Saved-set tensors are
+    counted by :func:`gdn_kcp_saved_layout`, never here.
+
+    The terms follow the arena's lifetimes (the host drops a buffer at its last reader, so a lifetime's figure is
+    the most the workspace binds in it, not the sum of everything it ever binds):
+
+    * ``forward``: the tape walk of an eager forward -- the pools plus the eight forward tapes live then (#1's
+      backward-only outputs ``akk`` / ``gcum`` are dropped right after #1; the six tapes #5 does not read go before
+      the output, so the forward's end state is below its peak).
+    * ``backward``: the largest of its phases -- the adjoint exchange (every backward pool plus the tapes #6 wrote),
+      the adjoint tape walk (``carry`` / ``b2_recv`` plus ``dh``; the exchange pools and staging planes are gone)
+      and the end state (the tapes #8 / #9 read, every pool but ``eye`` released) -- with the forward tapes of the
+      form: the replay form (``reuse_recompute_tapes=False``) re-creates the ten light tapes in the arena; the
+      kept-tape form (``True``; the ``None`` default resolves to the package default) binds none of them during
+      the backward (the ten tapes are the recompute forward's hand-off tensors, outside the workspace:
+      ``bwd.kept_tapes``) and re-adopts the four an eager forward leaves bound (``aqk`` / ``qscale`` / ``h`` /
+      ``v_new``) after #8, so its end state is the arena a forward leaves plus the backward tapes; that form's
+      recompute forward keeps every tape in the arena until the hand-off (``bwd.recompute_forward``) and counts as a
+      phase too.  ``"auto"`` reports the replay form (the bound the workspace may reach when a later operation of the
+      checkpointed region saves a tensor).  ``save_mode="full"`` saves the forward tapes as fresh tensors: none is
+      workspace in either lifetime.  ``backward_transient`` = the backward's phase maximum with the hand-off tensors
+      added (the memory a backward needs besides the saved set; the same figure in both forms).
+    """
     H_qk, HV = _check(H_qk, HV)
     C = _channels(H_qk, HV, C)
     _mode(save_mode, SAVE_MODES, "save_mode")
     _mode(boundary_mode, BOUNDARY_MODES, "boundary_mode")
     _mode(group_reduce, GROUP_REDUCE, "group_reduce")
+    kept_form = _kept_form(reuse_recompute_tapes)
     hp = ctx.heads(HV)
     P = hp.P if P is None else int(P)
     if P < 1:
@@ -372,17 +422,15 @@ def gdn_kcp_workspace_layout(
     s = state_bytes(HV)
     saved = boundary_mode == "saved"
     full = save_mode == "full"
+    kept = kept_form and not full  # the kept-tape backward is the light form's
     # staging planes at P > 1: stage_b always; stage_m only when the call does not bind the saved M_seg^T for it
     # (save_transfer under boundary_mode="saved" saves M_seg: the pool of that name is not sized, cake_kcp
     # SAVE_TRANSFER_FRESH_POOLS); the ring pools are sized only under exchange="ring" and are not workspace here
     plane = (hp.NSEG * HV * STATE_TILE_BYTES) if P > 1 else 0
     staging = plane + (0 if (boundary_mode == "saved" and save_transfer) else plane)
     carry = (ctx.n_frag * (P - 1) * s) if P > 1 else 0
-    # tapes the forward writes (#1 outputs + the #2 tape walk); in "light" they are workspace in the forward and again
-    # in the backward (the replay re-runs #1 and the walk: every one of them is allocated anew), in "full" they are
-    # saved-set bytes (counted by gdn_kcp_saved_layout), not workspace.  Under a non-reentrant checkpoint with
-    # reuse_recompute_tapes the backward binds the recompute forward's tapes instead of replaying: the same bytes,
-    # live from that forward's end to #8 instead of from the replay to #8 (the backward's count below is unchanged)
+    # the forward tapes (#1 outputs + the #2 tape walk); in "light" they are workspace in the forward and, replayed,
+    # in the backward; in "full" they are saved-set bytes (gdn_kcp_saved_layout), not workspace
     light_tapes = {
         "w": R * HV * ROW_BF16_128,
         "u": R * HV * ROW_BF16_128,
@@ -395,20 +443,30 @@ def gdn_kcp_workspace_layout(
         "rowscale": R * HV * ROW_F32,
         "qscale": R * HV * ROW_F32,
     }
-    fwd = {
+    light_sum = sum(light_tapes.values())
+    fwd_pools = {
         "c1_send": n["c1_send"] * 4,
         "c1_recv": 0 if (saved and save_transfer) else n["c1_recv"] * 4,
         "c2_send": n["c2_send"] * 4,
         "staging": staging,
         "carry": carry,
         "halo_send": sum(halo.fwd_send_rows) * C * 2 if with_conv else 0,
+        "eye": EYE_BYTES,  # the identity tile pool (one FP32 state), every workspace of the context
         "tickets": TICKET_BYTES,  # the persistent programs' ticket slots (every site, allocated together)
-        **({} if full else light_tapes),
     }
+    # the forward's peak (the tape walk): #1's backward-only outputs are already dropped (FWD_TAPES_DEAD_AFTER_PREP)
+    fwd_tapes = (
+        {}
+        if full
+        else {
+            k: v for k, v in light_tapes.items() if k not in FWD_TAPES_DEAD_AFTER_PREP
+        }
+    )
+    fwd = {**fwd_pools, **fwd_tapes}
     # the b1 buffers are the plan's split tables (their map half pairs with the crossing-in slots; the design's
     # per-rank b1 QUERY is in gdn_kcp_comm_bytes -- the workspace counts what the host allocates)
     b1_send, b1_recv = hp.b1_splits(saved and not save_transfer)
-    bwd = {
+    bwd_pools = {
         "b1_send": sum(b1_send) * 4,
         "b1_recv": sum(b1_recv) * 4,
         "b2_send": n["b2_send"] * 4,
@@ -417,20 +475,11 @@ def gdn_kcp_workspace_layout(
         "carry": carry,
         "dpre_head": halo.n_head_rows * C * 4 if with_conv else 0,
         "dpre_tail": halo.n_tail_rows * C * 4 if with_conv else 0,
+        "eye": EYE_BYTES,
         "tickets": TICKET_BYTES,
-        **({} if full else light_tapes),  # the replay of #1 + the #2 tape walk
-        "do_g": R * HV * ROW_BF16_128,
-        "dv_intra": R * HV * ROW_BF16_128,
-        "dh_tape": NC_pad * HV * TAPE_BF16_TILE,
-        "dv_new": 0,  # stored in place of dv_intra (one buffer: cake_kcp.TAPE_ALIASES)
-        "dg_part": R * HV * ROW_F32,
-        "gamma_dot": NC_pad * HV * CHUNK_F32,
-        "group_partials": (2 * T_r * HV * HEAD_DIM * 4)
-        if group_reduce == "host"
-        else 0,
     }
     if not saved:  # replay of the whole boundary: the forward exchange buffers live again in the backward
-        bwd.update(
+        bwd_pools.update(
             {
                 "c1_send": n["c1_send"] * 4,
                 "c1_recv": n["c1_recv"] * 4,
@@ -438,11 +487,68 @@ def gdn_kcp_workspace_layout(
                 "c2_recv": n["c2_recv"] * 4,
             }
         )
+    # the forward tapes the backward's arena holds: the replay re-creates all ten; the kept form none (the hand-off
+    # tensors) until #8, then the four an eager forward leaves bound return to the arena; "full" binds saved tensors
+    bwd_fwd_tapes: dict[str, int]
+    bwd_fwd_tapes_end: dict[str, int]
+    if full:
+        bwd_fwd_tapes, bwd_fwd_tapes_end = {}, {}
+    elif kept:
+        bwd_fwd_tapes = {}
+        bwd_fwd_tapes_end = {k: light_tapes[k] for k in FWD_TAPES_ARENA_AFTER_FWD}
+    else:
+        bwd_fwd_tapes = bwd_fwd_tapes_end = light_tapes
+    bwd_tapes = {
+        "do_g": R * HV * ROW_BF16_128,  # #6
+        "dv_intra": R * HV * ROW_BF16_128,  # #6
+        "dh_tape": NC_pad * HV * TAPE_BF16_TILE,  # the adjoint tape walk
+        "dv_new": 0,  # stored in place of dv_intra (one buffer: cake_kcp.TAPE_ALIASES)
+        "dg_part": R * HV * ROW_F32,  # #8
+        "gamma_dot": NC_pad * HV * CHUNK_F32,  # #8
+        "group_partials": (2 * T_r * HV * HEAD_DIM * 4)
+        if group_reduce == "host"
+        else 0,  # #8, the host form of the grouped reduction
+    }
+    bwd = {**bwd_pools, **bwd_fwd_tapes_end, **bwd_tapes}
+    # the backward's phases (the host drops the exchange pools after the adjoint merge, the staging planes before the
+    # adjoint tape walk and carry / b2_recv before #8; the kept entry is re-adopted after #8)
+    pools_exchange = sum(bwd_pools.values())
+    pools_walk = sum(
+        bwd_pools[k]
+        for k in ("carry", "b2_recv", "eye", "tickets", "dpre_head", "dpre_tail")
+    )
+    pools_end = (
+        bwd_pools["eye"]
+        + bwd_pools["tickets"]
+        + bwd_pools["dpre_head"]
+        + bwd_pools["dpre_tail"]
+    )
+    fwd_arena = sum(bwd_fwd_tapes.values())
+    phase_exchange = (
+        pools_exchange + fwd_arena + bwd_tapes["do_g"] + bwd_tapes["dv_intra"]
+    )
+    phase_walk = phase_exchange - pools_exchange + pools_walk + bwd_tapes["dh_tape"]
+    phase_end = pools_end + sum(bwd_fwd_tapes_end.values()) + sum(bwd_tapes.values())
+    phases = {"exchange": phase_exchange, "walk": phase_walk, "end": phase_end}
+    if kept:
+        # the recompute forward of the kept form drops no tape before handing all ten over
+        phases["recompute_forward"] = sum(fwd_pools.values()) + light_sum
     out = {f"fwd.{k}": v for k, v in fwd.items()}
     if backward:
         out.update({f"bwd.{k}": v for k, v in bwd.items()})
+        out["bwd.kept_tapes"] = light_sum if kept else 0
+        out.update({f"bwd.phase.{k}": v for k, v in phases.items()})
     out["forward"] = sum(fwd.values())
-    out["backward"] = sum(bwd.values()) if backward else 0
+    out["backward"] = max(phases.values()) if backward else 0
+    # the hand-off tensors added to the phase they live through (the kept form's #8): the same figure as the replay
+    out["backward_transient"] = (
+        (
+            max(phase_exchange, phase_walk, phase_end - sum(bwd_fwd_tapes_end.values()))
+            + light_sum
+        )
+        if (backward and kept)
+        else out["backward"]
+    )
     out["workspace"] = max(out["forward"], out["backward"])
     return out
 
@@ -460,8 +566,10 @@ def gdn_kcp_workspace_bytes(
     C: int | None = None,
     P: int | None = None,
     group_reduce: str = "fused",
+    reuse_recompute_tapes: bool | str | None = None,
 ) -> int:
-    """Caller-held workspace bytes of one rank (the ``workspace`` entry of :func:`gdn_kcp_workspace_layout`)."""
+    """Caller-held workspace bytes of one rank (the ``workspace`` entry of :func:`gdn_kcp_workspace_layout`): the
+    most the workspace binds in the forward or the backward of these options."""
     return gdn_kcp_workspace_layout(
         ctx,
         H_qk=H_qk,
@@ -474,6 +582,7 @@ def gdn_kcp_workspace_bytes(
         C=C,
         P=P,
         group_reduce=group_reduce,
+        reuse_recompute_tapes=reuse_recompute_tapes,
     )["workspace"]
 
 
@@ -484,6 +593,10 @@ __all__ = [
     "TICKET_BYTES",
     "TICKET_SITES",
     "TICKET_SLOT_BYTES",
+    "EYE_BYTES",
+    "FWD_TAPES_ARENA_AFTER_FWD",
+    "FWD_TAPES_DEAD_AFTER_PREP",
+    "TAPE_NAME_OF",
     "gdn_kcp_comm_bytes",
     "gdn_kcp_saved_bytes",
     "gdn_kcp_saved_layout",

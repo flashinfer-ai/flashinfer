@@ -327,3 +327,96 @@ def test_context_preparation_does_not_synchronize(device) -> None:
         assert dev_t.data_ptr() % plan.UPLOAD_ALIGN_BYTES == 0, name
         assert torch.equal(dev_t.cpu(), cpu_t), name
     assert prepared.P == ref_prepared.P
+
+
+# --------------------------------------------------------------------------- issue #7074 (4): the workspace bytes the backward binds (one GPU)
+
+
+class _PeakWorkspace:
+    """A ``KcpWorkspace`` recording the most bytes it binds (every allocation / release path)."""
+
+    def __new__(cls, kcp):
+        class Tracked(kcp.KcpWorkspace):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self.peak = 0
+
+            def _upd(self):
+                self.peak = max(self.peak, self.bytes)
+
+            def tape(self, name):
+                t = super().tape(name)
+                self._upd()
+                return t
+
+            def pool(self, name, n=None):
+                t = super().pool(name, n)
+                self._upd()
+                return t
+
+            def ensure(self, *a, **k):
+                tb = super().ensure(*a, **k)
+                self._upd()
+                return tb
+
+            def adopt_tape(self, name, t):
+                r = super().adopt_tape(name, t)
+                self._upd()
+                return r
+
+        return Tracked()
+
+
+@pytest.mark.parametrize(
+    ("cu", "heads"),
+    [(ISSUE_CU, (2, 6)), ([0, 11000, 23000, 32768], (16, 48))],
+    ids=["issue-2x6", "32k-16x48"],
+)
+def test_workspace_bytes_match_what_the_backward_binds(device, cu, heads) -> None:
+    """``gdn_kcp_workspace_layout`` is what a caller-held workspace binds (tolerance 0): the forward's tape-walk peak,
+    and the backward's phase maximum of each tape form -- the kept-tape form (the ten light tapes are the recompute's
+    hand-off tensors, four of them re-adopted after #8) and the replay form (the ten light tapes are workspace)."""
+    import gc
+
+    from torch.utils.checkpoint import checkpoint
+
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train.cake_kcp")
+    gb = pytest.importorskip("flashinfer.experimental.cake_gdn_train.cake_bytes")
+    H, HV = heads
+    inputs = make_inputs(cu, H, HV)
+    ctx = _local_context(cu, device)
+    ctx.prepare(H, HV)
+    leaves = [inputs[n].to(device).detach().requires_grad_(True) for n in OPERANDS]
+    dout = inputs["dout"].to(device)
+    for form in (True, False):
+        layout = gb.gdn_kcp_workspace_layout(
+            ctx, H_qk=H, HV=HV, reuse_recompute_tapes=form
+        )
+        ws = _PeakWorkspace(kcp)
+
+        def fn(*a, _ws=ws, _form=form):
+            return gdn_api.chunk_gdn_kcp(
+                *a, ctx, workspace=_ws, reuse_recompute_tapes=_form
+            )
+
+        out = checkpoint(fn, *leaves, use_reentrant=False)
+        torch.cuda.synchronize(device)
+        assert ws.peak == layout["forward"], (form, ws.peak, layout["forward"])
+        ws.peak = 0
+        out.backward(dout)
+        torch.cuda.synchronize(device)
+        assert ws.peak == layout["backward"], (form, ws.peak, layout["backward"])
+        assert ws.bytes == layout["bwd.phase.end"], (
+            form,
+            ws.bytes,
+            layout["bwd.phase.end"],
+        )
+        assert gdn_api.gdn_kcp_workspace_bytes(
+            ctx, H_qk=H, HV=HV, reuse_recompute_tapes=form
+        ) == max(layout["forward"], layout["backward"])
+        for lf in leaves:
+            lf.grad = None
+        del out, ws
+        gc.collect()
+        torch.cuda.empty_cache()
+    assert kcp.kept_registry_size() == 0

@@ -1064,8 +1064,46 @@ def test_byte_queries(W) -> None:
                     assert ws["forward"] == sum(
                         v for k, v in ws.items() if k.startswith("fwd.")
                     )
-                    assert ws["backward"] == sum(
-                        v for k, v in ws.items() if k.startswith("bwd.")
+                    # the backward is the largest of its lifetime phases, each below the sum of what the arena
+                    # can hold; the kept form lists the hand-off tensors apart and both forms need the same
+                    # transient memory besides the saved set
+                    phases = {k: v for k, v in ws.items() if k.startswith("bwd.phase.")}
+                    parts = sum(
+                        v
+                        for k, v in ws.items()
+                        if k.startswith("bwd.")
+                        and not k.startswith("bwd.phase.")
+                        and k != "bwd.kept_tapes"
+                    )
+                    assert ws["backward"] == max(phases.values())
+                    assert all(
+                        phases[f"bwd.phase.{p}"] <= parts
+                        for p in ("exchange", "walk", "end")
+                    )
+                    kept_ws, replay_ws = (
+                        gb.gdn_kcp_workspace_layout(
+                            ctx,
+                            H_qk=H_qk,
+                            HV=HV,
+                            save_mode=save_mode,
+                            boundary_mode=boundary_mode,
+                            save_transfer=save_transfer,
+                            C=C_CONV,
+                            reuse_recompute_tapes=form,
+                        )
+                        for form in (True, False)
+                    )
+                    tapes = ctx.NC_pad * HV * (32768 + 4) + ctx.R * HV * (
+                        3 * 256 + 2 * 128 + 3 * 4
+                    )
+                    assert kept_ws["bwd.kept_tapes"] == (
+                        0 if save_mode == "full" else tapes
+                    )
+                    assert replay_ws["bwd.kept_tapes"] == 0
+                    assert (
+                        kept_ws["backward_transient"]
+                        == replay_ws["backward_transient"]
+                        == replay_ws["backward"]
                     )
                     assert (
                         ws["bwd.dv_new"] == 0 and ws["bwd.dv_intra"] == ctx.R * HV * 256
@@ -3294,3 +3332,152 @@ def test_recompute_output_auto_resolves_on_every_cuda_build_of_the_release(
         finally:
             kcp.set_backend("fake", previous)
         _assert_same(res, direct, build)
+
+
+# --------------------------------------------------------------------------- issue #7074 (4): gdn_kcp_workspace_layout follows the arena's lifetimes
+# What a caller-held workspace binds, per tape form: the forward's tape-walk peak and the backward's phase maximum.
+
+
+class _PeakWorkspace:
+    """A ``KcpWorkspace`` recording the most bytes it binds (every allocation / release path)."""
+
+    def __new__(cls, kcp):
+        class Tracked(kcp.KcpWorkspace):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self.peak = 0
+
+            def _upd(self):
+                self.peak = max(self.peak, self.bytes)
+
+            def tape(self, name):
+                t = super().tape(name)
+                self._upd()
+                return t
+
+            def pool(self, name, n=None):
+                t = super().pool(name, n)
+                self._upd()
+                return t
+
+            def ensure(self, *a, **k):
+                tb = super().ensure(*a, **k)
+                self._upd()
+                return tb
+
+            def adopt_tape(self, name, t):
+                r = super().adopt_tape(name, t)
+                self._upd()
+                return r
+
+        return Tracked()
+
+
+def test_workspace_layout_follows_the_arena_lifetimes() -> None:
+    """``gdn_kcp_workspace_layout`` is what a caller-held workspace binds: the forward's tape-walk peak, and the
+    backward's phase maximum of the form -- the kept-tape form ends with the four re-adopted forward tapes beside the
+    backward tapes (the ten kept tapes are hand-off tensors outside the workspace, ``bwd.kept_tapes``), the replay
+    form holds the ten light tapes through the backward; both forms need the same transient bytes."""
+    kcp, ctx, ops = _ckpt_setup()
+    gb = _package("cake_bytes")
+    H_qk, HV = 2, 6
+    assert (
+        tuple(gb.TAPE_NAME_OF.get(n, n) for n in gb.FWD_TAPES_DEAD_AFTER_PREP)
+        == kcp.FWD_DEAD_AFTER_PREP
+    )
+    assert (
+        tuple(gb.TAPE_NAME_OF.get(n, n) for n in gb.FWD_TAPES_ARENA_AFTER_FWD)
+        == kcp.FWD_TAPES_ARENA_AFTER_FWD
+    )
+    assert gb.EYE_BYTES == gb.STATE_TILE_BYTES == 128 * 128 * 4
+    from torch.utils.checkpoint import checkpoint
+
+    layouts = {}
+    for form in (True, False):
+        layout = gb.gdn_kcp_workspace_layout(
+            ctx, H_qk=H_qk, HV=HV, reuse_recompute_tapes=form
+        )
+        layouts[form] = layout
+        ws = _PeakWorkspace(kcp)
+        leaves = [
+            ops[n].detach().clone().requires_grad_(True)
+            for n in ("q", "k", "v", "g", "beta")
+        ]
+
+        def fn(q, k, v, g, beta, _ws=ws, _form=form):
+            return kcp.chunk_gdn_kcp(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ctx,
+                workspace=_ws,
+                backend="fake",
+                reuse_recompute_tapes=_form,
+            )
+
+        out = checkpoint(fn, *leaves, use_reentrant=False)
+        assert ws.peak == layout["forward"], (form, ws.peak, layout["forward"])
+        ws.peak = 0
+        out.backward(ops["dout"])
+        assert ws.peak == layout["backward"], (form, ws.peak, layout["backward"])
+        assert ws.bytes == layout["bwd.phase.end"], (
+            form,
+            ws.bytes,
+            layout["bwd.phase.end"],
+        )
+        assert layout["bwd.phase.end"] == layout["bwd.eye"] + layout[
+            "bwd.tickets"
+        ] + sum(
+            layout[f"bwd.{n}"]
+            for n in ("do_g", "dv_intra", "dh_tape", "dg_part", "gamma_dot")
+        ) + sum(
+            layout[f"bwd.{n}"]
+            for n in (
+                gb.FWD_TAPES_ARENA_AFTER_FWD
+                if form
+                else tuple(k for k in gb.FWD_TAPES_ARENA_AFTER_FWD)
+                + ("w", "u", "akk", "gamma", "gcum", "rowscale")
+            )
+        )
+        assert kcp.kept_registry_size() == 0
+    kept, replay = layouts[True], layouts[False]
+    assert kept["backward"] < replay["backward"]
+    assert kept["bwd.kept_tapes"] == sum(
+        replay[f"bwd.{n}"]
+        for n in (
+            "w",
+            "u",
+            "aqk",
+            "akk",
+            "h_tape",
+            "v_new",
+            "gamma",
+            "gcum",
+            "rowscale",
+            "qscale",
+        )
+    )
+    assert replay["bwd.kept_tapes"] == 0
+    assert (
+        kept["backward_transient"] == replay["backward_transient"] == replay["backward"]
+    )
+    assert kept["forward"] == replay["forward"]
+    # the keyword resolves through the package default, and the bytes query is the layout's maximum
+    default = gb.gdn_kcp_workspace_layout(ctx, H_qk=H_qk, HV=HV)
+    opt = _package("cake_options")
+    assert default == layouts[opt.REUSE_RECOMPUTE_TAPES_DEFAULT is True]
+    assert (
+        gb.gdn_kcp_workspace_layout(ctx, H_qk=H_qk, HV=HV, reuse_recompute_tapes="auto")
+        == replay
+    )
+    for form in (True, False):
+        assert (
+            gb.gdn_kcp_workspace_bytes(
+                ctx, H_qk=H_qk, HV=HV, reuse_recompute_tapes=form
+            )
+            == layouts[form]["workspace"]
+        )
+    with pytest.raises(ValueError, match="reuse_recompute_tapes must be"):
+        gb.gdn_kcp_workspace_layout(ctx, H_qk=H_qk, HV=HV, reuse_recompute_tapes="yes")
