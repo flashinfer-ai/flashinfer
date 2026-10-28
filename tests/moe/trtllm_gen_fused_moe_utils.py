@@ -509,9 +509,11 @@ class FP4Moe(Moe):
             hidden_states_quant, hidden_states_scale = mxfp8_quantize(
                 hidden_states, is_swizzling
             )
-            hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn).reshape(
-                *hidden_states.shape[:-1], -1
-            )
+            hidden_states_scale = hidden_states_scale.view(torch.float8_e4m3fn)
+            if not is_swizzling:
+                hidden_states_scale = hidden_states_scale.reshape(
+                    *hidden_states.shape[:-1], -1
+                )
             return {
                 "hidden_states": hidden_states_quant,
                 "hidden_states_scale": hidden_states_scale,

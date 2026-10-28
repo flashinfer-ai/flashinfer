@@ -105,6 +105,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.page",
     "flashinfer.pod",
     "flashinfer.prefill",
+    "flashinfer.qsa",
     "flashinfer.quantization.fp4_quantization",
     "flashinfer.quantization.fp8_quantization",
     "flashinfer.rope",

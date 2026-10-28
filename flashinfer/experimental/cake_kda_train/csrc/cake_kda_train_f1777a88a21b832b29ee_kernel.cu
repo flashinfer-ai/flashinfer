@@ -448,7 +448,7 @@ kernel_cake_kda_train_f1777a88a21b832b29ee(const __grid_constant__ CUtensorMap k
                 decay = _exp2_0;
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
-                mbarrier_arrive(dhs_ready_addr + (tw) * 8);
+                mbarrier_arrive(dhs_ready_addr);
                 float sc[16];
                 #pragma unroll
                 for (int j = 0; j < 16; j++) {
@@ -490,7 +490,7 @@ kernel_cake_kda_train_f1777a88a21b832b29ee(const __grid_constant__ CUtensorMap k
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                mbarrier_arrive(bdv_ready_addr + (tw) * 8);
+                mbarrier_arrive(bdv_ready_addr + ((int)((unsigned int)rc % 2)) * 8);
                 tw = 1 - tw;
                 if (nc > rc + 1) {
                     long long gn_next_1 = ((long long)(row0 + c * 64 - 1) * (long long)num_heads + (long long)head) * 128 + (long long)k_row;
@@ -545,7 +545,7 @@ kernel_cake_kda_train_f1777a88a21b832b29ee(const __grid_constant__ CUtensorMap k
                     }
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
-                    mbarrier_arrive(dhs_ready_addr + (tw) * 8);
+                    mbarrier_arrive(dhs_ready_addr + ((int)((unsigned int)(rc + 1) % 2)) * 8);
                     float sc_2[16];
                     #pragma unroll
                     for (int j_4 = 0; j_4 < 16; j_4++) {
@@ -667,7 +667,7 @@ kernel_cake_kda_train_f1777a88a21b832b29ee(const __grid_constant__ CUtensorMap k
                     tma_store_3d((&dv2), vbase_1, head_1, trow, bdv_addr + (unsigned int)(tl * 4096));
                     asm volatile("cp.async.bulk.commit_group;");
                     asm volatile("cp.async.bulk.wait_group.read 0;");
-                    mbarrier_arrive(tapes_read_addr + (tl) * 8);
+                    mbarrier_arrive(tapes_read_addr + ((int)((unsigned int)rc_1 % 2)) * 8);
                     tl = 1 - tl;
                     if (nc_1 > rc_1 + 1) {
                         mbarrier_wait(w_empty_addr, _phase_w_empty);

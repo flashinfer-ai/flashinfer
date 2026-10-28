@@ -63,6 +63,7 @@ class WarpGroupedProjection:
         parameters=None,
         block_scaled=False,
         serial_gather=False,
+        weight_first=False,
     ):
         if (
             group_size not in (2, 4, 8)
@@ -83,6 +84,7 @@ class WarpGroupedProjection:
         self.parameters = parameters
         self.block_scaled = block_scaled
         self.serial_gather = serial_gather
+        self.weight_first = weight_first
         self.rows_per_tile = 32 if self.split_gate else 64
         self.acc_dtype = cutlass.Float32
         self.cluster_shape_mn = (1, 1)
@@ -222,7 +224,9 @@ class WarpGroupedProjection:
         # explicitly selects the serial producer.
         # Dense 16-bit weights use it at T >= 8 to overlap the weight copy;
         # smaller dense decode retains the serial producer.
-        self.cooperative_gather = (
+        # The optional dense weight-first tactic retains a serial activation
+        # producer; the original tactics keep main's cooperative schedule.
+        self.cooperative_gather = not self.weight_first and (
             self.packed_nvfp4
             or (self.a_dtype == cutlass.Float8E4M3FN and not self.serial_gather)
             or cute.size(ids) >= 8 * self.top_k
@@ -543,7 +547,9 @@ class WarpGroupedProjection:
                         )
                         tAgA_k = tAgA_mkl[None, mainloop_producer_state.count]
                         tAsA_pipe = tAsA[None, mainloop_producer_state.index]
-                        if cutlass.const_expr(self.cooperative_gather):
+                        if cutlass.const_expr(
+                            self.cooperative_gather or self.weight_first
+                        ):
                             if warp_idx == 0:
                                 mainloop_pipeline.producer_acquire(
                                     mainloop_producer_state, cutlass.Boolean(True)
@@ -567,9 +573,10 @@ class WarpGroupedProjection:
                                         ),
                                         mcast_mask=a_mcast_mask,
                                     )
-                                mainloop_pipeline.producer_commit(
-                                    mainloop_producer_state
-                                )
+                                if cutlass.const_expr(self.cooperative_gather):
+                                    mainloop_pipeline.producer_commit(
+                                        mainloop_producer_state
+                                    )
                         # Live scales share the producer stage and CTA barriers.
                         if cutlass.const_expr(self.packed_nvfp4):
                             for sf_chunk in cutlass.range_constexpr(
@@ -630,28 +637,29 @@ class WarpGroupedProjection:
                         else:
                             cute.arch.sync_warp()
                         if cutlass.const_expr(not self.cooperative_gather):
-                            mainloop_pipeline.producer_acquire(
-                                mainloop_producer_state, cutlass.Boolean(True)
-                            )
-                            cute.copy(
-                                tma_atom_a,
-                                tAgA_k,
-                                tAsA_pipe,
-                                tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
-                                    mainloop_producer_state
-                                ),
-                                mcast_mask=a_mcast_mask,
-                            )
-                            if cutlass.const_expr(self.split_gate):
+                            if cutlass.const_expr(not self.weight_first):
+                                mainloop_pipeline.producer_acquire(
+                                    mainloop_producer_state, cutlass.Boolean(True)
+                                )
                                 cute.copy(
                                     tma_atom_a,
-                                    tGgA_mkl[None, mainloop_producer_state.count],
-                                    tGsA[None, mainloop_producer_state.index],
+                                    tAgA_k,
+                                    tAsA_pipe,
                                     tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
                                         mainloop_producer_state
                                     ),
                                     mcast_mask=a_mcast_mask,
                                 )
+                                if cutlass.const_expr(self.split_gate):
+                                    cute.copy(
+                                        tma_atom_a,
+                                        tGgA_mkl[None, mainloop_producer_state.count],
+                                        tGsA[None, mainloop_producer_state.index],
+                                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                            mainloop_producer_state
+                                        ),
+                                        mcast_mask=a_mcast_mask,
+                                    )
                             mainloop_pipeline.producer_commit(mainloop_producer_state)
                         mainloop_producer_state.advance()
                 accumulators.fill(0.0)
@@ -663,6 +671,8 @@ class WarpGroupedProjection:
                 )
                 for _k_tile in cutlass.range(k_tile_cnt, unroll=1):
                     mainloop_pipeline.consumer_wait(consumer)
+                    # The TMA barrier orders weights only. This CTA barrier also
+                    # waits for the software activation stores in either schedule.
                     cute.arch.sync_threads()
                     if cutlass.const_expr(self.packed_nvfp4):
                         # NVFP4 E2M1 * finite E4M3 block scale is exact in FP16/BF16.
@@ -736,7 +746,9 @@ class WarpGroupedProjection:
                         )
                         tAgA_k = tAgA_mkl[None, mainloop_producer_state.count]
                         tAsA_pipe = tAsA[None, mainloop_producer_state.index]
-                        if cutlass.const_expr(self.cooperative_gather):
+                        if cutlass.const_expr(
+                            self.cooperative_gather or self.weight_first
+                        ):
                             if warp_idx == 0:
                                 mainloop_pipeline.producer_acquire(
                                     mainloop_producer_state, cutlass.Boolean(True)
@@ -760,9 +772,10 @@ class WarpGroupedProjection:
                                         ),
                                         mcast_mask=a_mcast_mask,
                                     )
-                                mainloop_pipeline.producer_commit(
-                                    mainloop_producer_state
-                                )
+                                if cutlass.const_expr(self.cooperative_gather):
+                                    mainloop_pipeline.producer_commit(
+                                        mainloop_producer_state
+                                    )
                         # Live scales share the producer stage and CTA barriers.
                         if cutlass.const_expr(self.packed_nvfp4):
                             for sf_chunk in cutlass.range_constexpr(
@@ -823,28 +836,29 @@ class WarpGroupedProjection:
                         else:
                             cute.arch.sync_warp()
                         if cutlass.const_expr(not self.cooperative_gather):
-                            mainloop_pipeline.producer_acquire(
-                                mainloop_producer_state, cutlass.Boolean(True)
-                            )
-                            cute.copy(
-                                tma_atom_a,
-                                tAgA_k,
-                                tAsA_pipe,
-                                tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
-                                    mainloop_producer_state
-                                ),
-                                mcast_mask=a_mcast_mask,
-                            )
-                            if cutlass.const_expr(self.split_gate):
+                            if cutlass.const_expr(not self.weight_first):
+                                mainloop_pipeline.producer_acquire(
+                                    mainloop_producer_state, cutlass.Boolean(True)
+                                )
                                 cute.copy(
                                     tma_atom_a,
-                                    tGgA_mkl[None, mainloop_producer_state.count],
-                                    tGsA[None, mainloop_producer_state.index],
+                                    tAgA_k,
+                                    tAsA_pipe,
                                     tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
                                         mainloop_producer_state
                                     ),
                                     mcast_mask=a_mcast_mask,
                                 )
+                                if cutlass.const_expr(self.split_gate):
+                                    cute.copy(
+                                        tma_atom_a,
+                                        tGgA_mkl[None, mainloop_producer_state.count],
+                                        tGsA[None, mainloop_producer_state.index],
+                                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                            mainloop_producer_state
+                                        ),
+                                        mcast_mask=a_mcast_mask,
+                                    )
                             mainloop_pipeline.producer_commit(mainloop_producer_state)
                         mainloop_producer_state.advance()
                 if cute.size(self.cluster_shape_mn) > 1:

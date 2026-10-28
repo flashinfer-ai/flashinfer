@@ -197,3 +197,66 @@ def test_module_records_match_the_binding() -> None:
         assert set(record["arches"]) <= {"sm_100a", "sm_103a"}
         for source in record["sources"]:
             assert (source_dir / source).is_file(), source
+
+
+def _program_table(binding: str, name: str) -> list[str | None]:
+    """Entries of one [dtype][world size index][quant epilogue] table of the binding, in
+    order (float16 then bfloat16; world sizes 2, 4, 8; o110 then o111)."""
+    start = binding.index(f"const void* const {name}[2][3][2] = {{")
+    body = binding[start : binding.index("};", start)]
+    entries = re.findall(r"reinterpret_cast<const void\*>\((\w+)\)|(nullptr)", body)
+    assert len(entries) == 12, (name, entries)
+    return [kernel or None for kernel, _ in entries]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("table", "suffix", "world_sizes"),
+    [
+        ("kSmallKernels", "_small", (2, 4, 8)),
+        ("kKernels", "", (2, 4)),
+        ("kLargeTokenKernels", "_lt", (2,)),
+        ("kTwoShotKernels", "_ts", (4, 8)),
+    ],
+)
+def test_program_tables_list_one_program_kind(
+    table: str, suffix: str, world_sizes: tuple[int, ...]
+) -> None:
+    source_dir = cake_moe_finalize_comm._source_dir()
+    binding = (
+        source_dir / f"{cake_moe_finalize_comm.SOURCE_PACKAGE}_binding.cu"
+    ).read_text()
+    entries = iter(_program_table(binding, table))
+    for dtype in ("float16", "bfloat16"):
+        for world_size in (2, 4, 8):
+            for output_profile in ("110", "111"):
+                expected = (
+                    f"kernel_cake_trtllm_moe_finalize_{dtype}_ws{world_size}"
+                    f"_o{output_profile}{suffix}"
+                    if world_size in world_sizes
+                    else None
+                )
+                assert next(entries) == expected
+
+
+@pytest.mark.cpu_only
+def test_program_tables_cover_the_module_records() -> None:
+    source_dir = cake_moe_finalize_comm._source_dir()
+    binding = (
+        source_dir / f"{cake_moe_finalize_comm.SOURCE_PACKAGE}_binding.cu"
+    ).read_text()
+    tabled = [
+        kernel
+        for table in (
+            "kSmallKernels",
+            "kKernels",
+            "kLargeTokenKernels",
+            "kTwoShotKernels",
+        )
+        for kernel in _program_table(binding, table)
+        if kernel is not None
+    ]
+    assert len(tabled) == len(set(tabled))
+    assert set(tabled) == {
+        record["kernel"] for record in cake_moe_finalize_comm.MODULES.values()
+    }

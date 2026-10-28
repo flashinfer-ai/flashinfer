@@ -118,11 +118,10 @@ MODULES: dict[str, dict[str, Any]] = {
         "route": "row",
         "select_rule": None,
     },
-    # The forward, rowwise: the route's fallback on sm_107a; on sm_100a it runs
-    # when M * K >= 2^20 and no record of a higher threshold admits the call.
-    "cake_gated_act_mxfp8_489b9d3fcd80a220d649": {
+    # The forward, rowwise, with 4 CTAs per SM and the inline band path: the
+    # route's fallback on sm_107a (no select_rule).
+    "cake_gated_act_mxfp8_7711f8af92d5b9756501": {
         "arches": [
-            "sm_100a",
             "sm_107a",
         ],
         "arg_plan": [
@@ -143,8 +142,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "tile_cols": 128,
             "tile_rows": 32,
         },
-        "kernel": "cake_gated_act_mxfp8_489b9d3fcd80a220d649",
-        "kernel_symbol": "kernel_cake_gated_act_mxfp8_489b9d3fcd80a220d649",
+        "kernel": "cake_gated_act_mxfp8_7711f8af92d5b9756501",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_7711f8af92d5b9756501",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -152,7 +151,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_gated_act_mxfp8_489b9d3fcd80a220d649",
+        "library": "cake_gated_act_mxfp8_7711f8af92d5b9756501",
         "logical": {
             "K": "K",
             "M": "M",
@@ -164,20 +163,14 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "role": "fwd",
         "route": "row",
-        "select_rule": {
-            "elements": {
-                "sm_100a": 1048576,
-            },
-            "kind": "elements_at_least",
-        },
+        "select_rule": None,
     },
-    # The forward, rowwise, with no_allocate loads and 8 CTAs per SM (on
-    # sm_100a and sm_103a only): it runs when M * K >= 2^28 and no record of a
-    # higher threshold admits the call.
-    "cake_gated_act_mxfp8_58e6d65694f03b3f7b33": {
+    # The forward, rowwise, with 8 CTAs per SM, the packed sigmoid and the
+    # inline band path (on sm_100a only): it runs when M * K >= 2^20 and no
+    # record of a higher threshold admits the call.
+    "cake_gated_act_mxfp8_7ed7c74a790b9b536276": {
         "arches": [
             "sm_100a",
-            "sm_103a",
         ],
         "arg_plan": [
             ["buffer", "gated_input"],
@@ -197,8 +190,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "tile_cols": 128,
             "tile_rows": 32,
         },
-        "kernel": "cake_gated_act_mxfp8_58e6d65694f03b3f7b33",
-        "kernel_symbol": "kernel_cake_gated_act_mxfp8_58e6d65694f03b3f7b33",
+        "kernel": "cake_gated_act_mxfp8_7ed7c74a790b9b536276",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_7ed7c74a790b9b536276",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -206,7 +199,60 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_gated_act_mxfp8_58e6d65694f03b3f7b33",
+        "library": "cake_gated_act_mxfp8_7ed7c74a790b9b536276",
+        "logical": {
+            "K": "K",
+            "M": "M",
+            "col_output": "col_output",
+            "col_scales": "col_scales",
+            "gated_input": "gated_input",
+            "row_output": "row_output",
+            "row_scales": "row_scales",
+        },
+        "role": "fwd",
+        "route": "row",
+        "select_rule": {
+            "elements": {
+                "sm_100a": 1048576,
+            },
+            "kind": "elements_at_least",
+        },
+    },
+    # The forward, rowwise, with no_allocate loads, 8 CTAs per SM, the packed
+    # sigmoid and the inline band path (on sm_100a only): it runs when M * K >=
+    # 2^28 and no record of a higher threshold admits the call.
+    "cake_gated_act_mxfp8_baf6fbeb97918f613cef": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "gated_input"],
+            ["buffer", "row_output"],
+            ["buffer", "col_output"],
+            ["buffer", "row_scales"],
+            ["buffer", "col_scales"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "tile_cols": 128,
+            "tile_rows": 32,
+        },
+        "kernel": "cake_gated_act_mxfp8_baf6fbeb97918f613cef",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_baf6fbeb97918f613cef",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_gated_act_mxfp8_baf6fbeb97918f613cef",
         "logical": {
             "K": "K",
             "M": "M",
@@ -221,7 +267,6 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "elements": {
                 "sm_100a": 268435456,
-                "sm_103a": 268435456,
             },
             "kind": "elements_at_least",
         },
@@ -274,6 +319,59 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "elements": {
                 "sm_103a": 1048576,
+            },
+            "kind": "elements_at_least",
+        },
+    },
+    # The forward, rowwise, with no_allocate loads, 8 CTAs per SM and the
+    # inline band path (on sm_103a only): it runs when M * K >= 2^28 and no
+    # record of a higher threshold admits the call.
+    "cake_gated_act_mxfp8_69fc759322d18bf4aa70": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "gated_input"],
+            ["buffer", "row_output"],
+            ["buffer", "col_output"],
+            ["buffer", "row_scales"],
+            ["buffer", "col_scales"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "tile_cols": 128,
+            "tile_rows": 32,
+        },
+        "kernel": "cake_gated_act_mxfp8_69fc759322d18bf4aa70",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_69fc759322d18bf4aa70",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_gated_act_mxfp8_69fc759322d18bf4aa70",
+        "logical": {
+            "K": "K",
+            "M": "M",
+            "col_output": "col_output",
+            "col_scales": "col_scales",
+            "gated_input": "gated_input",
+            "row_output": "row_output",
+            "row_scales": "row_scales",
+        },
+        "role": "fwd",
+        "route": "row",
+        "select_rule": {
+            "elements": {
+                "sm_103a": 268435456,
             },
             "kind": "elements_at_least",
         },
@@ -431,8 +529,9 @@ MODULES: dict[str, dict[str, Any]] = {
         "route": "col",
         "select_rule": None,
     },
-    # The forward, colwise: the route's fallback on sm_107a (no select_rule).
-    "cake_gated_act_mxfp8_f3d5bac90719f391b705": {
+    # The forward, colwise, with 4 CTAs per SM and the inline band path: the
+    # route's fallback on sm_107a (no select_rule).
+    "cake_gated_act_mxfp8_b1cad9a96b5541f4e8c3": {
         "arches": [
             "sm_107a",
         ],
@@ -454,8 +553,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "tile_cols": 128,
             "tile_rows": 32,
         },
-        "kernel": "cake_gated_act_mxfp8_f3d5bac90719f391b705",
-        "kernel_symbol": "kernel_cake_gated_act_mxfp8_f3d5bac90719f391b705",
+        "kernel": "cake_gated_act_mxfp8_b1cad9a96b5541f4e8c3",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_b1cad9a96b5541f4e8c3",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -463,7 +562,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 8192,
             "use_pdl": False,
         },
-        "library": "cake_gated_act_mxfp8_f3d5bac90719f391b705",
+        "library": "cake_gated_act_mxfp8_b1cad9a96b5541f4e8c3",
         "logical": {
             "K": "K",
             "M": "M",
@@ -530,14 +629,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "elements_at_least",
         },
     },
-    # The forward, colwise, with two rows per thread: it runs when M * K >=
-    # 2^24 (2^23 on sm_107a) and no record of a higher threshold admits the
-    # call.
-    "cake_gated_act_mxfp8_b51156b593447fe2aadc": {
+    # The forward, colwise, with two rows per thread, 5 CTAs per SM, the packed
+    # sigmoid and the called band path (on sm_100a only): it runs when M * K >=
+    # 2^24 and no record of a higher threshold admits the call.
+    "cake_gated_act_mxfp8_039a5afd9072a9295001": {
         "arches": [
             "sm_100a",
-            "sm_103a",
-            "sm_107a",
         ],
         "arg_plan": [
             ["buffer", "gated_input"],
@@ -557,8 +654,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "tile_cols": 128,
             "tile_rows": 64,
         },
-        "kernel": "cake_gated_act_mxfp8_b51156b593447fe2aadc",
-        "kernel_symbol": "kernel_cake_gated_act_mxfp8_b51156b593447fe2aadc",
+        "kernel": "cake_gated_act_mxfp8_039a5afd9072a9295001",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_039a5afd9072a9295001",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -566,7 +663,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 16384,
             "use_pdl": False,
         },
-        "library": "cake_gated_act_mxfp8_b51156b593447fe2aadc",
+        "library": "cake_gated_act_mxfp8_039a5afd9072a9295001",
         "logical": {
             "K": "K",
             "M": "M",
@@ -581,19 +678,16 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "elements": {
                 "sm_100a": 16777216,
-                "sm_103a": 16777216,
-                "sm_107a": 8388608,
             },
             "kind": "elements_at_least",
         },
     },
-    # The forward, colwise, with two rows per thread and no_allocate loads (on
-    # sm_100a and sm_103a only): it runs when M * K >= 2^26 and no record of a
-    # higher threshold admits the call.
-    "cake_gated_act_mxfp8_d4edc57ff03b5fc922ab": {
+    # The forward, colwise, with two rows per thread, no_allocate loads, 5 CTAs
+    # per SM and the inline band path (on sm_100a only): it runs when M * K >=
+    # 2^26 and no record of a higher threshold admits the call.
+    "cake_gated_act_mxfp8_0b9dfb9aa4b837a6b7a4": {
         "arches": [
             "sm_100a",
-            "sm_103a",
         ],
         "arg_plan": [
             ["buffer", "gated_input"],
@@ -613,8 +707,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "tile_cols": 128,
             "tile_rows": 64,
         },
-        "kernel": "cake_gated_act_mxfp8_d4edc57ff03b5fc922ab",
-        "kernel_symbol": "kernel_cake_gated_act_mxfp8_d4edc57ff03b5fc922ab",
+        "kernel": "cake_gated_act_mxfp8_0b9dfb9aa4b837a6b7a4",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_0b9dfb9aa4b837a6b7a4",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -622,7 +716,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 16384,
             "use_pdl": False,
         },
-        "library": "cake_gated_act_mxfp8_d4edc57ff03b5fc922ab",
+        "library": "cake_gated_act_mxfp8_0b9dfb9aa4b837a6b7a4",
         "logical": {
             "K": "K",
             "M": "M",
@@ -637,7 +731,60 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "elements": {
                 "sm_100a": 67108864,
-                "sm_103a": 67108864,
+            },
+            "kind": "elements_at_least",
+        },
+    },
+    # The forward, colwise, with two rows per thread, no_allocate loads, 5 CTAs
+    # per SM, the packed sigmoid and the called band path (on sm_100a only): it
+    # runs when M * K >= 2^27 and no record of a higher threshold admits the
+    # call.
+    "cake_gated_act_mxfp8_b7975e9eda41aefb0456": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "gated_input"],
+            ["buffer", "row_output"],
+            ["buffer", "col_output"],
+            ["buffer", "row_scales"],
+            ["buffer", "col_scales"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "tile_cols": 128,
+            "tile_rows": 64,
+        },
+        "kernel": "cake_gated_act_mxfp8_b7975e9eda41aefb0456",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_b7975e9eda41aefb0456",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 16384,
+            "use_pdl": False,
+        },
+        "library": "cake_gated_act_mxfp8_b7975e9eda41aefb0456",
+        "logical": {
+            "K": "K",
+            "M": "M",
+            "col_output": "col_output",
+            "col_scales": "col_scales",
+            "gated_input": "gated_input",
+            "row_output": "row_output",
+            "row_scales": "row_scales",
+        },
+        "role": "fwd",
+        "route": "col",
+        "select_rule": {
+            "elements": {
+                "sm_100a": 134217728,
             },
             "kind": "elements_at_least",
         },
@@ -743,6 +890,216 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "elements": {
                 "sm_103a": 8388608,
+            },
+            "kind": "elements_at_least",
+        },
+    },
+    # The forward, colwise, with two rows per thread (on sm_103a only): it runs
+    # when M * K >= 2^24 and no record of a higher threshold admits the call.
+    "cake_gated_act_mxfp8_b51156b593447fe2aadc": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "gated_input"],
+            ["buffer", "row_output"],
+            ["buffer", "col_output"],
+            ["buffer", "row_scales"],
+            ["buffer", "col_scales"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "tile_cols": 128,
+            "tile_rows": 64,
+        },
+        "kernel": "cake_gated_act_mxfp8_b51156b593447fe2aadc",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_b51156b593447fe2aadc",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 16384,
+            "use_pdl": False,
+        },
+        "library": "cake_gated_act_mxfp8_b51156b593447fe2aadc",
+        "logical": {
+            "K": "K",
+            "M": "M",
+            "col_output": "col_output",
+            "col_scales": "col_scales",
+            "gated_input": "gated_input",
+            "row_output": "row_output",
+            "row_scales": "row_scales",
+        },
+        "role": "fwd",
+        "route": "col",
+        "select_rule": {
+            "elements": {
+                "sm_103a": 16777216,
+            },
+            "kind": "elements_at_least",
+        },
+    },
+    # The forward, colwise, with two rows per thread, no_allocate loads, 5 CTAs
+    # per SM and the ffs band path (on sm_103a only): it runs when M * K >=
+    # 2^26 and no record of a higher threshold admits the call.
+    "cake_gated_act_mxfp8_74232aea4bcc3c884369": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "gated_input"],
+            ["buffer", "row_output"],
+            ["buffer", "col_output"],
+            ["buffer", "row_scales"],
+            ["buffer", "col_scales"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "tile_cols": 128,
+            "tile_rows": 64,
+        },
+        "kernel": "cake_gated_act_mxfp8_74232aea4bcc3c884369",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_74232aea4bcc3c884369",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 16384,
+            "use_pdl": False,
+        },
+        "library": "cake_gated_act_mxfp8_74232aea4bcc3c884369",
+        "logical": {
+            "K": "K",
+            "M": "M",
+            "col_output": "col_output",
+            "col_scales": "col_scales",
+            "gated_input": "gated_input",
+            "row_output": "row_output",
+            "row_scales": "row_scales",
+        },
+        "role": "fwd",
+        "route": "col",
+        "select_rule": {
+            "elements": {
+                "sm_103a": 67108864,
+            },
+            "kind": "elements_at_least",
+        },
+    },
+    # The forward, colwise (on sm_107a only): it runs when M * K >= 2^20 and no
+    # record of a higher threshold admits the call.
+    "cake_gated_act_mxfp8_f3d5bac90719f391b705": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "gated_input"],
+            ["buffer", "row_output"],
+            ["buffer", "col_output"],
+            ["buffer", "row_scales"],
+            ["buffer", "col_scales"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "tile_cols": 128,
+            "tile_rows": 32,
+        },
+        "kernel": "cake_gated_act_mxfp8_f3d5bac90719f391b705",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_f3d5bac90719f391b705",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 8192,
+            "use_pdl": False,
+        },
+        "library": "cake_gated_act_mxfp8_f3d5bac90719f391b705",
+        "logical": {
+            "K": "K",
+            "M": "M",
+            "col_output": "col_output",
+            "col_scales": "col_scales",
+            "gated_input": "gated_input",
+            "row_output": "row_output",
+            "row_scales": "row_scales",
+        },
+        "role": "fwd",
+        "route": "col",
+        "select_rule": {
+            "elements": {
+                "sm_107a": 1048576,
+            },
+            "kind": "elements_at_least",
+        },
+    },
+    # The forward, colwise, with two rows per thread and the called band path
+    # (on sm_107a only): it runs when M * K >= 2^23 and no record of a higher
+    # threshold admits the call.
+    "cake_gated_act_mxfp8_96497ddc9daf22dc35a5": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "gated_input"],
+            ["buffer", "row_output"],
+            ["buffer", "col_output"],
+            ["buffer", "row_scales"],
+            ["buffer", "col_scales"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "tile_cols": 128,
+            "tile_rows": 64,
+        },
+        "kernel": "cake_gated_act_mxfp8_96497ddc9daf22dc35a5",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_96497ddc9daf22dc35a5",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 16384,
+            "use_pdl": False,
+        },
+        "library": "cake_gated_act_mxfp8_96497ddc9daf22dc35a5",
+        "logical": {
+            "K": "K",
+            "M": "M",
+            "col_output": "col_output",
+            "col_scales": "col_scales",
+            "gated_input": "gated_input",
+            "row_output": "row_output",
+            "row_scales": "row_scales",
+        },
+        "role": "fwd",
+        "route": "col",
+        "select_rule": {
+            "elements": {
+                "sm_107a": 8388608,
             },
             "kind": "elements_at_least",
         },
@@ -902,12 +1259,118 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "elements_at_least",
         },
     },
-    # The forward, rowwise and colwise, with 8 CTAs per SM and the packed
-    # sigmoid (on sm_100a and sm_103a only): it runs when M * K >= 2^22 and no
-    # record of a higher threshold admits the call.
-    "cake_gated_act_mxfp8_03452b1f2ae3d40b1bcc": {
+    # The forward, rowwise and colwise, with 8 CTAs per SM, the packed sigmoid
+    # and the called band path (on sm_100a only): it runs when M * K >= 2^22
+    # and no record of a higher threshold admits the call.
+    "cake_gated_act_mxfp8_f536b838e9f5b329b548": {
         "arches": [
             "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "gated_input"],
+            ["buffer", "row_output"],
+            ["buffer", "col_output"],
+            ["buffer", "row_scales"],
+            ["buffer", "col_scales"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "tile_cols": 128,
+            "tile_rows": 32,
+        },
+        "kernel": "cake_gated_act_mxfp8_f536b838e9f5b329b548",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_f536b838e9f5b329b548",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 8192,
+            "use_pdl": False,
+        },
+        "library": "cake_gated_act_mxfp8_f536b838e9f5b329b548",
+        "logical": {
+            "K": "K",
+            "M": "M",
+            "col_output": "col_output",
+            "col_scales": "col_scales",
+            "gated_input": "gated_input",
+            "row_output": "row_output",
+            "row_scales": "row_scales",
+        },
+        "role": "fwd",
+        "route": "both",
+        "select_rule": {
+            "elements": {
+                "sm_100a": 4194304,
+            },
+            "kind": "elements_at_least",
+        },
+    },
+    # The forward, rowwise and colwise, with two rows per thread, no_allocate
+    # loads, 4 CTAs per SM, the packed sigmoid and the ffs band path (on
+    # sm_100a only): it runs when M * K >= 2^24 and no record of a higher
+    # threshold admits the call.
+    "cake_gated_act_mxfp8_926bcb202902eef2465c": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "gated_input"],
+            ["buffer", "row_output"],
+            ["buffer", "col_output"],
+            ["buffer", "row_scales"],
+            ["buffer", "col_scales"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "tile_cols": 128,
+            "tile_rows": 64,
+        },
+        "kernel": "cake_gated_act_mxfp8_926bcb202902eef2465c",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_926bcb202902eef2465c",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 16384,
+            "use_pdl": False,
+        },
+        "library": "cake_gated_act_mxfp8_926bcb202902eef2465c",
+        "logical": {
+            "K": "K",
+            "M": "M",
+            "col_output": "col_output",
+            "col_scales": "col_scales",
+            "gated_input": "gated_input",
+            "row_output": "row_output",
+            "row_scales": "row_scales",
+        },
+        "role": "fwd",
+        "route": "both",
+        "select_rule": {
+            "elements": {
+                "sm_100a": 16777216,
+            },
+            "kind": "elements_at_least",
+        },
+    },
+    # The forward, rowwise and colwise, with 8 CTAs per SM and the packed
+    # sigmoid (on sm_103a only): it runs when M * K >= 2^22 and no record of a
+    # higher threshold admits the call.
+    "cake_gated_act_mxfp8_03452b1f2ae3d40b1bcc": {
+        "arches": [
             "sm_103a",
         ],
         "arg_plan": [
@@ -951,19 +1414,16 @@ MODULES: dict[str, dict[str, Any]] = {
         "route": "both",
         "select_rule": {
             "elements": {
-                "sm_100a": 4194304,
                 "sm_103a": 4194304,
             },
             "kind": "elements_at_least",
         },
     },
     # The forward, rowwise and colwise, with two rows per thread, no_allocate
-    # loads and 4 CTAs per SM (on sm_100a and sm_103a only): it runs when M * K
-    # >= 2^26 (2^24 on sm_100a) and no record of a higher threshold admits the
-    # call.
+    # loads and 4 CTAs per SM (on sm_103a only): it runs when M * K >= 2^26 and
+    # no record of a higher threshold admits the call.
     "cake_gated_act_mxfp8_c2957071a449135dded9": {
         "arches": [
-            "sm_100a",
             "sm_103a",
         ],
         "arg_plan": [
@@ -1007,7 +1467,6 @@ MODULES: dict[str, dict[str, Any]] = {
         "route": "both",
         "select_rule": {
             "elements": {
-                "sm_100a": 16777216,
                 "sm_103a": 67108864,
             },
             "kind": "elements_at_least",
@@ -1173,12 +1632,108 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "elements_at_least",
         },
     },
-    # The backward, rowwise, with a 32 x 32 tile: the route's fallback (no
-    # select_rule).
-    "cake_gated_act_mxfp8_8da8bc14e105ce409f74": {
+    # The backward, rowwise, with a 32 x 32 tile, 12 CTAs per SM and the called
+    # band path: the route's fallback on sm_100a (no select_rule).
+    "cake_gated_act_mxfp8_9c68fc985d41586ecbe8": {
         "arches": [
             "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "gated_input"],
+            ["buffer", "grad"],
+            ["buffer", "row_output"],
+            ["buffer", "col_output"],
+            ["buffer", "row_scales"],
+            ["buffer", "col_scales"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "tile_cols": 32,
+            "tile_rows": 32,
+        },
+        "kernel": "cake_gated_act_mxfp8_9c68fc985d41586ecbe8",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_9c68fc985d41586ecbe8",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_gated_act_mxfp8_9c68fc985d41586ecbe8",
+        "logical": {
+            "K": "K",
+            "M": "M",
+            "col_output": "col_output",
+            "col_scales": "col_scales",
+            "gated_input": "gated_input",
+            "grad": "grad_output",
+            "row_output": "row_output",
+            "row_scales": "row_scales",
+        },
+        "role": "bwd",
+        "route": "row",
+        "select_rule": None,
+    },
+    # The backward, rowwise, with a 32 x 32 tile, 12 CTAs per SM and the inline
+    # band path: the route's fallback on sm_103a (no select_rule).
+    "cake_gated_act_mxfp8_54573bbcd9b4aadbd39f": {
+        "arches": [
             "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "gated_input"],
+            ["buffer", "grad"],
+            ["buffer", "row_output"],
+            ["buffer", "col_output"],
+            ["buffer", "row_scales"],
+            ["buffer", "col_scales"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "tile_cols": 32,
+            "tile_rows": 32,
+        },
+        "kernel": "cake_gated_act_mxfp8_54573bbcd9b4aadbd39f",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_54573bbcd9b4aadbd39f",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_gated_act_mxfp8_54573bbcd9b4aadbd39f",
+        "logical": {
+            "K": "K",
+            "M": "M",
+            "col_output": "col_output",
+            "col_scales": "col_scales",
+            "gated_input": "gated_input",
+            "grad": "grad_output",
+            "row_output": "row_output",
+            "row_scales": "row_scales",
+        },
+        "role": "bwd",
+        "route": "row",
+        "select_rule": None,
+    },
+    # The backward, rowwise, with a 32 x 32 tile: the route's fallback on
+    # sm_107a (no select_rule).
+    "cake_gated_act_mxfp8_8da8bc14e105ce409f74": {
+        "arches": [
             "sm_107a",
         ],
         "arg_plan": [
@@ -1224,12 +1779,177 @@ MODULES: dict[str, dict[str, Any]] = {
         "route": "row",
         "select_rule": None,
     },
-    # The backward, rowwise, with the packed sigmoid: it runs when M * K >=
-    # 2^20 (2^18 on sm_107a) and no record of a higher threshold admits the
-    # call.
-    "cake_gated_act_mxfp8_957f6d5f3e03426c0964": {
+    # The backward, rowwise, with 9 CTAs per SM, the packed sigmoid and the
+    # called band path (on sm_100a only): it runs when M * K >= 2^20 and no
+    # record of a higher threshold admits the call.
+    "cake_gated_act_mxfp8_5bf054fcafaa9784cea3": {
         "arches": [
             "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "gated_input"],
+            ["buffer", "grad"],
+            ["buffer", "row_output"],
+            ["buffer", "col_output"],
+            ["buffer", "row_scales"],
+            ["buffer", "col_scales"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "tile_cols": 64,
+            "tile_rows": 32,
+        },
+        "kernel": "cake_gated_act_mxfp8_5bf054fcafaa9784cea3",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_5bf054fcafaa9784cea3",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_gated_act_mxfp8_5bf054fcafaa9784cea3",
+        "logical": {
+            "K": "K",
+            "M": "M",
+            "col_output": "col_output",
+            "col_scales": "col_scales",
+            "gated_input": "gated_input",
+            "grad": "grad_output",
+            "row_output": "row_output",
+            "row_scales": "row_scales",
+        },
+        "role": "bwd",
+        "route": "row",
+        "select_rule": {
+            "elements": {
+                "sm_100a": 1048576,
+            },
+            "kind": "elements_at_least",
+        },
+    },
+    # The backward, rowwise, with no_allocate loads, 12 CTAs per SM and the ffs
+    # band path (on sm_100a only): it runs when M * K >= 2^26 and no record of
+    # a higher threshold admits the call.
+    "cake_gated_act_mxfp8_0e06658456a152d0b214": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "gated_input"],
+            ["buffer", "grad"],
+            ["buffer", "row_output"],
+            ["buffer", "col_output"],
+            ["buffer", "row_scales"],
+            ["buffer", "col_scales"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "tile_cols": 64,
+            "tile_rows": 32,
+        },
+        "kernel": "cake_gated_act_mxfp8_0e06658456a152d0b214",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_0e06658456a152d0b214",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_gated_act_mxfp8_0e06658456a152d0b214",
+        "logical": {
+            "K": "K",
+            "M": "M",
+            "col_output": "col_output",
+            "col_scales": "col_scales",
+            "gated_input": "gated_input",
+            "grad": "grad_output",
+            "row_output": "row_output",
+            "row_scales": "row_scales",
+        },
+        "role": "bwd",
+        "route": "row",
+        "select_rule": {
+            "elements": {
+                "sm_100a": 67108864,
+            },
+            "kind": "elements_at_least",
+        },
+    },
+    # The backward, rowwise, with two rows per thread, no_allocate loads, 7
+    # CTAs per SM, the packed sigmoid and the called band path (on sm_100a
+    # only): it runs when M * K >= 2^28 and no record of a higher threshold
+    # admits the call.
+    "cake_gated_act_mxfp8_bdbe30b9562eca355986": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "gated_input"],
+            ["buffer", "grad"],
+            ["buffer", "row_output"],
+            ["buffer", "col_output"],
+            ["buffer", "row_scales"],
+            ["buffer", "col_scales"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "tile_cols": 64,
+            "tile_rows": 64,
+        },
+        "kernel": "cake_gated_act_mxfp8_bdbe30b9562eca355986",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_bdbe30b9562eca355986",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_gated_act_mxfp8_bdbe30b9562eca355986",
+        "logical": {
+            "K": "K",
+            "M": "M",
+            "col_output": "col_output",
+            "col_scales": "col_scales",
+            "gated_input": "gated_input",
+            "grad": "grad_output",
+            "row_output": "row_output",
+            "row_scales": "row_scales",
+        },
+        "role": "bwd",
+        "route": "row",
+        "select_rule": {
+            "elements": {
+                "sm_100a": 268435456,
+            },
+            "kind": "elements_at_least",
+        },
+    },
+    # The backward, rowwise, with the packed sigmoid (on sm_103a and sm_107a
+    # only): it runs when M * K >= 2^20 (2^18 on sm_107a) and no record of a
+    # higher threshold admits the call.
+    "cake_gated_act_mxfp8_957f6d5f3e03426c0964": {
+        "arches": [
             "sm_103a",
             "sm_107a",
         ],
@@ -1276,19 +1996,17 @@ MODULES: dict[str, dict[str, Any]] = {
         "route": "row",
         "select_rule": {
             "elements": {
-                "sm_100a": 1048576,
                 "sm_103a": 1048576,
                 "sm_107a": 262144,
             },
             "kind": "elements_at_least",
         },
     },
-    # The backward, rowwise, with no_allocate loads and 12 CTAs per SM (on
-    # sm_100a and sm_103a only): it runs when M * K >= 2^26 and no record of a
-    # higher threshold admits the call.
-    "cake_gated_act_mxfp8_077a568b810590574917": {
+    # The backward, rowwise, with no_allocate loads, 10 CTAs per SM and the
+    # packed sigmoid (on sm_103a only): it runs when M * K >= 2^26 and no
+    # record of a higher threshold admits the call.
+    "cake_gated_act_mxfp8_3e0ac746df31b17317e0": {
         "arches": [
-            "sm_100a",
             "sm_103a",
         ],
         "arg_plan": [
@@ -1310,8 +2028,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "tile_cols": 64,
             "tile_rows": 32,
         },
-        "kernel": "cake_gated_act_mxfp8_077a568b810590574917",
-        "kernel_symbol": "kernel_cake_gated_act_mxfp8_077a568b810590574917",
+        "kernel": "cake_gated_act_mxfp8_3e0ac746df31b17317e0",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_3e0ac746df31b17317e0",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1319,7 +2037,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_gated_act_mxfp8_077a568b810590574917",
+        "library": "cake_gated_act_mxfp8_3e0ac746df31b17317e0",
         "logical": {
             "K": "K",
             "M": "M",
@@ -1334,71 +2052,15 @@ MODULES: dict[str, dict[str, Any]] = {
         "route": "row",
         "select_rule": {
             "elements": {
-                "sm_100a": 67108864,
                 "sm_103a": 67108864,
             },
             "kind": "elements_at_least",
         },
     },
-    # The backward, rowwise, with two rows per thread and no_allocate loads (on
-    # sm_100a only): it runs when M * K >= 2^28 and no record of a higher
-    # threshold admits the call.
-    "cake_gated_act_mxfp8_ea5e588e23b6923737f2": {
-        "arches": [
-            "sm_100a",
-        ],
-        "arg_plan": [
-            ["buffer", "gated_input"],
-            ["buffer", "grad"],
-            ["buffer", "row_output"],
-            ["buffer", "col_output"],
-            ["buffer", "row_scales"],
-            ["buffer", "col_scales"],
-            ["parameter", "M"],
-            ["parameter", "K"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "grid_rule": {
-            "kind": "tiles",
-            "tile_cols": 64,
-            "tile_rows": 64,
-        },
-        "kernel": "cake_gated_act_mxfp8_ea5e588e23b6923737f2",
-        "kernel_symbol": "kernel_cake_gated_act_mxfp8_ea5e588e23b6923737f2",
-        "launch": {
-            "block": (128, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 0,
-            "use_pdl": False,
-        },
-        "library": "cake_gated_act_mxfp8_ea5e588e23b6923737f2",
-        "logical": {
-            "K": "K",
-            "M": "M",
-            "col_output": "col_output",
-            "col_scales": "col_scales",
-            "gated_input": "gated_input",
-            "grad": "grad_output",
-            "row_output": "row_output",
-            "row_scales": "row_scales",
-        },
-        "role": "bwd",
-        "route": "row",
-        "select_rule": {
-            "elements": {
-                "sm_100a": 268435456,
-            },
-            "kind": "elements_at_least",
-        },
-    },
-    # The backward, rowwise, with two rows per thread, no_allocate loads and 6
-    # CTAs per SM (on sm_107a only): it runs when M * K >= 2^26 and no record
-    # of a higher threshold admits the call.
-    "cake_gated_act_mxfp8_42c891e228049ae01e1d": {
+    # The backward, rowwise, with two rows per thread, no_allocate loads, 6
+    # CTAs per SM and the ffs band path (on sm_107a only): it runs when M * K
+    # >= 2^26 and no record of a higher threshold admits the call.
+    "cake_gated_act_mxfp8_471449952da8cd17dc1b": {
         "arches": [
             "sm_107a",
         ],
@@ -1421,8 +2083,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "tile_cols": 64,
             "tile_rows": 64,
         },
-        "kernel": "cake_gated_act_mxfp8_42c891e228049ae01e1d",
-        "kernel_symbol": "kernel_cake_gated_act_mxfp8_42c891e228049ae01e1d",
+        "kernel": "cake_gated_act_mxfp8_471449952da8cd17dc1b",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_471449952da8cd17dc1b",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1430,7 +2092,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_gated_act_mxfp8_42c891e228049ae01e1d",
+        "library": "cake_gated_act_mxfp8_471449952da8cd17dc1b",
         "logical": {
             "K": "K",
             "M": "M",
@@ -1450,12 +2112,108 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "elements_at_least",
         },
     },
-    # The backward, colwise, with a 32 x 32 tile: the route's fallback (no
-    # select_rule).
-    "cake_gated_act_mxfp8_2513ecc12f03a6081c2e": {
+    # The backward, colwise, with a 32 x 32 tile, 12 CTAs per SM and the inline
+    # band path: the route's fallback on sm_100a (no select_rule).
+    "cake_gated_act_mxfp8_dd19cc9df9f6cf060a97": {
         "arches": [
             "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "gated_input"],
+            ["buffer", "grad"],
+            ["buffer", "row_output"],
+            ["buffer", "col_output"],
+            ["buffer", "row_scales"],
+            ["buffer", "col_scales"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "tile_cols": 32,
+            "tile_rows": 32,
+        },
+        "kernel": "cake_gated_act_mxfp8_dd19cc9df9f6cf060a97",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_dd19cc9df9f6cf060a97",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 4096,
+            "use_pdl": False,
+        },
+        "library": "cake_gated_act_mxfp8_dd19cc9df9f6cf060a97",
+        "logical": {
+            "K": "K",
+            "M": "M",
+            "col_output": "col_output",
+            "col_scales": "col_scales",
+            "gated_input": "gated_input",
+            "grad": "grad_output",
+            "row_output": "row_output",
+            "row_scales": "row_scales",
+        },
+        "role": "bwd",
+        "route": "col",
+        "select_rule": None,
+    },
+    # The backward, colwise, with a 32 x 32 tile, 12 CTAs per SM and the ffs
+    # band path: the route's fallback on sm_103a (no select_rule).
+    "cake_gated_act_mxfp8_9aca7aee2d3a502d0c59": {
+        "arches": [
             "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "gated_input"],
+            ["buffer", "grad"],
+            ["buffer", "row_output"],
+            ["buffer", "col_output"],
+            ["buffer", "row_scales"],
+            ["buffer", "col_scales"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "tile_cols": 32,
+            "tile_rows": 32,
+        },
+        "kernel": "cake_gated_act_mxfp8_9aca7aee2d3a502d0c59",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_9aca7aee2d3a502d0c59",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 4096,
+            "use_pdl": False,
+        },
+        "library": "cake_gated_act_mxfp8_9aca7aee2d3a502d0c59",
+        "logical": {
+            "K": "K",
+            "M": "M",
+            "col_output": "col_output",
+            "col_scales": "col_scales",
+            "gated_input": "gated_input",
+            "grad": "grad_output",
+            "row_output": "row_output",
+            "row_scales": "row_scales",
+        },
+        "role": "bwd",
+        "route": "col",
+        "select_rule": None,
+    },
+    # The backward, colwise, with a 32 x 32 tile, 9 CTAs per SM and the inline
+    # band path: the route's fallback on sm_107a (no select_rule).
+    "cake_gated_act_mxfp8_c6ab778cd390eb44c75a": {
+        "arches": [
             "sm_107a",
         ],
         "arg_plan": [
@@ -1477,8 +2235,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "tile_cols": 32,
             "tile_rows": 32,
         },
-        "kernel": "cake_gated_act_mxfp8_2513ecc12f03a6081c2e",
-        "kernel_symbol": "kernel_cake_gated_act_mxfp8_2513ecc12f03a6081c2e",
+        "kernel": "cake_gated_act_mxfp8_c6ab778cd390eb44c75a",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_c6ab778cd390eb44c75a",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1486,7 +2244,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 4096,
             "use_pdl": False,
         },
-        "library": "cake_gated_act_mxfp8_2513ecc12f03a6081c2e",
+        "library": "cake_gated_act_mxfp8_c6ab778cd390eb44c75a",
         "logical": {
             "K": "K",
             "M": "M",
@@ -1560,66 +2318,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "elements_at_least",
         },
     },
-    # The backward, colwise, with two rows per thread, no_allocate loads and 6
-    # CTAs per SM (on sm_100a only): it runs when M * K >= 2^24 and no record
-    # of a higher threshold admits the call.
-    "cake_gated_act_mxfp8_8511a80499e75655d79e": {
+    # The backward, colwise, with two rows per thread, no_allocate loads, 6
+    # CTAs per SM, the packed sigmoid and the called band path: it runs when M
+    # * K >= 2^24 and no record of a higher threshold admits the call.
+    "cake_gated_act_mxfp8_6ee084f4ded4d19cd8cd": {
         "arches": [
             "sm_100a",
-        ],
-        "arg_plan": [
-            ["buffer", "gated_input"],
-            ["buffer", "grad"],
-            ["buffer", "row_output"],
-            ["buffer", "col_output"],
-            ["buffer", "row_scales"],
-            ["buffer", "col_scales"],
-            ["parameter", "M"],
-            ["parameter", "K"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "ffi_entry": "run",
-        "grid_rule": {
-            "kind": "tiles",
-            "tile_cols": 64,
-            "tile_rows": 64,
-        },
-        "kernel": "cake_gated_act_mxfp8_8511a80499e75655d79e",
-        "kernel_symbol": "kernel_cake_gated_act_mxfp8_8511a80499e75655d79e",
-        "launch": {
-            "block": (128, 1, 1),
-            "cluster": (1, 1, 1),
-            "cooperative": False,
-            "dynamic_smem_bytes": 16384,
-            "use_pdl": False,
-        },
-        "library": "cake_gated_act_mxfp8_8511a80499e75655d79e",
-        "logical": {
-            "K": "K",
-            "M": "M",
-            "col_output": "col_output",
-            "col_scales": "col_scales",
-            "gated_input": "gated_input",
-            "grad": "grad_output",
-            "row_output": "row_output",
-            "row_scales": "row_scales",
-        },
-        "role": "bwd",
-        "route": "col",
-        "select_rule": {
-            "elements": {
-                "sm_100a": 16777216,
-            },
-            "kind": "elements_at_least",
-        },
-    },
-    # The backward, colwise, with two rows per thread, no_allocate loads, 6
-    # CTAs per SM and the packed sigmoid (on sm_103a and sm_107a only): it runs
-    # when M * K >= 2^24 and no record of a higher threshold admits the call.
-    "cake_gated_act_mxfp8_78399261002caf386d19": {
-        "arches": [
             "sm_103a",
             "sm_107a",
         ],
@@ -1642,8 +2346,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "tile_cols": 64,
             "tile_rows": 64,
         },
-        "kernel": "cake_gated_act_mxfp8_78399261002caf386d19",
-        "kernel_symbol": "kernel_cake_gated_act_mxfp8_78399261002caf386d19",
+        "kernel": "cake_gated_act_mxfp8_6ee084f4ded4d19cd8cd",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_6ee084f4ded4d19cd8cd",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1651,7 +2355,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 16384,
             "use_pdl": False,
         },
-        "library": "cake_gated_act_mxfp8_78399261002caf386d19",
+        "library": "cake_gated_act_mxfp8_6ee084f4ded4d19cd8cd",
         "logical": {
             "K": "K",
             "M": "M",
@@ -1666,8 +2370,63 @@ MODULES: dict[str, dict[str, Any]] = {
         "route": "col",
         "select_rule": {
             "elements": {
+                "sm_100a": 16777216,
                 "sm_103a": 16777216,
                 "sm_107a": 16777216,
+            },
+            "kind": "elements_at_least",
+        },
+    },
+    # The backward, colwise, with a 32 x 32 tile (on sm_103a only): it runs
+    # when M * K >= 2^15 and no record of a higher threshold admits the call.
+    "cake_gated_act_mxfp8_2513ecc12f03a6081c2e": {
+        "arches": [
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "gated_input"],
+            ["buffer", "grad"],
+            ["buffer", "row_output"],
+            ["buffer", "col_output"],
+            ["buffer", "row_scales"],
+            ["buffer", "col_scales"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "tile_cols": 32,
+            "tile_rows": 32,
+        },
+        "kernel": "cake_gated_act_mxfp8_2513ecc12f03a6081c2e",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_2513ecc12f03a6081c2e",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 4096,
+            "use_pdl": False,
+        },
+        "library": "cake_gated_act_mxfp8_2513ecc12f03a6081c2e",
+        "logical": {
+            "K": "K",
+            "M": "M",
+            "col_output": "col_output",
+            "col_scales": "col_scales",
+            "gated_input": "gated_input",
+            "grad": "grad_output",
+            "row_output": "row_output",
+            "row_scales": "row_scales",
+        },
+        "role": "bwd",
+        "route": "col",
+        "select_rule": {
+            "elements": {
+                "sm_103a": 32768,
             },
             "kind": "elements_at_least",
         },
@@ -1727,12 +2486,61 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "elements_at_least",
         },
     },
-    # The backward, rowwise and colwise, with a 32 x 32 tile: the route's
-    # fallback (no select_rule).
-    "cake_gated_act_mxfp8_8c43730c1e3d76ce89f1": {
+    # The backward, rowwise and colwise, with a 32 x 32 tile, 12 CTAs per SM
+    # and the ffs band path: the route's fallback on sm_100a and sm_103a (no
+    # select_rule).
+    "cake_gated_act_mxfp8_383546f101950463dcf8": {
         "arches": [
             "sm_100a",
             "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "gated_input"],
+            ["buffer", "grad"],
+            ["buffer", "row_output"],
+            ["buffer", "col_output"],
+            ["buffer", "row_scales"],
+            ["buffer", "col_scales"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "tile_cols": 32,
+            "tile_rows": 32,
+        },
+        "kernel": "cake_gated_act_mxfp8_383546f101950463dcf8",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_383546f101950463dcf8",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 4096,
+            "use_pdl": False,
+        },
+        "library": "cake_gated_act_mxfp8_383546f101950463dcf8",
+        "logical": {
+            "K": "K",
+            "M": "M",
+            "col_output": "col_output",
+            "col_scales": "col_scales",
+            "gated_input": "gated_input",
+            "grad": "grad_output",
+            "row_output": "row_output",
+            "row_scales": "row_scales",
+        },
+        "role": "bwd",
+        "route": "both",
+        "select_rule": None,
+    },
+    # The backward, rowwise and colwise, with a 32 x 32 tile, 8 CTAs per SM and
+    # the ffs band path: the route's fallback on sm_107a (no select_rule).
+    "cake_gated_act_mxfp8_c31a8bcd7bef054bac83": {
+        "arches": [
             "sm_107a",
         ],
         "arg_plan": [
@@ -1754,8 +2562,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "tile_cols": 32,
             "tile_rows": 32,
         },
-        "kernel": "cake_gated_act_mxfp8_8c43730c1e3d76ce89f1",
-        "kernel_symbol": "kernel_cake_gated_act_mxfp8_8c43730c1e3d76ce89f1",
+        "kernel": "cake_gated_act_mxfp8_c31a8bcd7bef054bac83",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_c31a8bcd7bef054bac83",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1763,7 +2571,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 4096,
             "use_pdl": False,
         },
-        "library": "cake_gated_act_mxfp8_8c43730c1e3d76ce89f1",
+        "library": "cake_gated_act_mxfp8_c31a8bcd7bef054bac83",
         "logical": {
             "K": "K",
             "M": "M",
@@ -1836,10 +2644,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "elements_at_least",
         },
     },
-    # The backward, rowwise and colwise, with 10 CTAs per SM (on sm_100a only):
-    # it runs when M * K >= 2^22 and no record of a higher threshold admits the
-    # call.
-    "cake_gated_act_mxfp8_b25fe627c7656aebe218": {
+    # The backward, rowwise and colwise, with 10 CTAs per SM, the packed
+    # sigmoid and the ffs band path (on sm_100a only): it runs when M * K >=
+    # 2^22 and no record of a higher threshold admits the call.
+    "cake_gated_act_mxfp8_905451a649b11b2d28aa": {
         "arches": [
             "sm_100a",
         ],
@@ -1862,8 +2670,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "tile_cols": 64,
             "tile_rows": 32,
         },
-        "kernel": "cake_gated_act_mxfp8_b25fe627c7656aebe218",
-        "kernel_symbol": "kernel_cake_gated_act_mxfp8_b25fe627c7656aebe218",
+        "kernel": "cake_gated_act_mxfp8_905451a649b11b2d28aa",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_905451a649b11b2d28aa",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1871,7 +2679,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 8192,
             "use_pdl": False,
         },
-        "library": "cake_gated_act_mxfp8_b25fe627c7656aebe218",
+        "library": "cake_gated_act_mxfp8_905451a649b11b2d28aa",
         "logical": {
             "K": "K",
             "M": "M",
@@ -1891,8 +2699,64 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "elements_at_least",
         },
     },
+    # The backward, rowwise and colwise, with two rows per thread, no_allocate
+    # loads, 7 CTAs per SM, the packed sigmoid and the called band path (on
+    # sm_100a only): it runs when M * K >= 2^24 and no record of a higher
+    # threshold admits the call.
+    "cake_gated_act_mxfp8_44395eef5de97bba1695": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "gated_input"],
+            ["buffer", "grad"],
+            ["buffer", "row_output"],
+            ["buffer", "col_output"],
+            ["buffer", "row_scales"],
+            ["buffer", "col_scales"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "tile_cols": 64,
+            "tile_rows": 64,
+        },
+        "kernel": "cake_gated_act_mxfp8_44395eef5de97bba1695",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_44395eef5de97bba1695",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 16384,
+            "use_pdl": False,
+        },
+        "library": "cake_gated_act_mxfp8_44395eef5de97bba1695",
+        "logical": {
+            "K": "K",
+            "M": "M",
+            "col_output": "col_output",
+            "col_scales": "col_scales",
+            "gated_input": "gated_input",
+            "grad": "grad_output",
+            "row_output": "row_output",
+            "row_scales": "row_scales",
+        },
+        "role": "bwd",
+        "route": "both",
+        "select_rule": {
+            "elements": {
+                "sm_100a": 16777216,
+            },
+            "kind": "elements_at_least",
+        },
+    },
     # The backward, rowwise and colwise, with two rows per thread and
-    # no_allocate loads (on sm_100a only): it runs when M * K >= 2^24 and no
+    # no_allocate loads (on sm_100a only): it runs when M * K >= 2^27 and no
     # record of a higher threshold admits the call.
     "cake_gated_act_mxfp8_e96f02e396eaf24e2caa": {
         "arches": [
@@ -1941,7 +2805,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "route": "both",
         "select_rule": {
             "elements": {
-                "sm_100a": 16777216,
+                "sm_100a": 134217728,
             },
             "kind": "elements_at_least",
         },
@@ -2002,13 +2866,11 @@ MODULES: dict[str, dict[str, Any]] = {
         },
     },
     # The backward, rowwise and colwise, with two rows per thread, no_allocate
-    # loads and the packed sigmoid (on sm_103a and sm_107a only): it runs when
-    # M * K >= 2^24 (2^23 on sm_107a) and no record of a higher threshold
-    # admits the call.
+    # loads and the packed sigmoid (on sm_103a only): it runs when M * K >=
+    # 2^24 and no record of a higher threshold admits the call.
     "cake_gated_act_mxfp8_eb924283e8b660bdeea8": {
         "arches": [
             "sm_103a",
-            "sm_107a",
         ],
         "arg_plan": [
             ["buffer", "gated_input"],
@@ -2054,6 +2916,61 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "elements": {
                 "sm_103a": 16777216,
+            },
+            "kind": "elements_at_least",
+        },
+    },
+    # The backward, rowwise and colwise, with two rows per thread, no_allocate
+    # loads, 6 CTAs per SM, the packed sigmoid and the ffs band path (on
+    # sm_107a only): it runs when M * K >= 2^23 and no record of a higher
+    # threshold admits the call.
+    "cake_gated_act_mxfp8_43b7d4d5cc26486e8036": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "gated_input"],
+            ["buffer", "grad"],
+            ["buffer", "row_output"],
+            ["buffer", "col_output"],
+            ["buffer", "row_scales"],
+            ["buffer", "col_scales"],
+            ["parameter", "M"],
+            ["parameter", "K"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "tile_cols": 64,
+            "tile_rows": 64,
+        },
+        "kernel": "cake_gated_act_mxfp8_43b7d4d5cc26486e8036",
+        "kernel_symbol": "kernel_cake_gated_act_mxfp8_43b7d4d5cc26486e8036",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 16384,
+            "use_pdl": False,
+        },
+        "library": "cake_gated_act_mxfp8_43b7d4d5cc26486e8036",
+        "logical": {
+            "K": "K",
+            "M": "M",
+            "col_output": "col_output",
+            "col_scales": "col_scales",
+            "gated_input": "gated_input",
+            "grad": "grad_output",
+            "row_output": "row_output",
+            "row_scales": "row_scales",
+        },
+        "role": "bwd",
+        "route": "both",
+        "select_rule": {
+            "elements": {
                 "sm_107a": 8388608,
             },
             "kind": "elements_at_least",
@@ -2065,35 +2982,37 @@ ROUTES: dict[str, dict[str, list[str]]] = {
     "sm_100a": {
         "fwd_row": [
             "cake_gated_act_mxfp8_70d1cafb2bb8a175a516",
-            "cake_gated_act_mxfp8_489b9d3fcd80a220d649",
-            "cake_gated_act_mxfp8_58e6d65694f03b3f7b33",
+            "cake_gated_act_mxfp8_7ed7c74a790b9b536276",
+            "cake_gated_act_mxfp8_baf6fbeb97918f613cef",
         ],
         "fwd_col": [
             "cake_gated_act_mxfp8_7e191474abd37ba82e73",
             "cake_gated_act_mxfp8_ff6e1cf61c61f4b595fa",
-            "cake_gated_act_mxfp8_b51156b593447fe2aadc",
-            "cake_gated_act_mxfp8_d4edc57ff03b5fc922ab",
+            "cake_gated_act_mxfp8_039a5afd9072a9295001",
+            "cake_gated_act_mxfp8_0b9dfb9aa4b837a6b7a4",
+            "cake_gated_act_mxfp8_b7975e9eda41aefb0456",
         ],
         "fwd_both": [
             "cake_gated_act_mxfp8_34e92b6e8ad60c86843d",
-            "cake_gated_act_mxfp8_03452b1f2ae3d40b1bcc",
-            "cake_gated_act_mxfp8_c2957071a449135dded9",
+            "cake_gated_act_mxfp8_f536b838e9f5b329b548",
+            "cake_gated_act_mxfp8_926bcb202902eef2465c",
         ],
         "bwd_row": [
-            "cake_gated_act_mxfp8_8da8bc14e105ce409f74",
-            "cake_gated_act_mxfp8_957f6d5f3e03426c0964",
-            "cake_gated_act_mxfp8_077a568b810590574917",
-            "cake_gated_act_mxfp8_ea5e588e23b6923737f2",
+            "cake_gated_act_mxfp8_9c68fc985d41586ecbe8",
+            "cake_gated_act_mxfp8_5bf054fcafaa9784cea3",
+            "cake_gated_act_mxfp8_0e06658456a152d0b214",
+            "cake_gated_act_mxfp8_bdbe30b9562eca355986",
         ],
         "bwd_col": [
-            "cake_gated_act_mxfp8_2513ecc12f03a6081c2e",
+            "cake_gated_act_mxfp8_dd19cc9df9f6cf060a97",
             "cake_gated_act_mxfp8_848a93885f596fa4cbf9",
-            "cake_gated_act_mxfp8_8511a80499e75655d79e",
+            "cake_gated_act_mxfp8_6ee084f4ded4d19cd8cd",
         ],
         "bwd_both": [
-            "cake_gated_act_mxfp8_8c43730c1e3d76ce89f1",
+            "cake_gated_act_mxfp8_383546f101950463dcf8",
             "cake_gated_act_mxfp8_6d1956b2f454b08e6d34",
-            "cake_gated_act_mxfp8_b25fe627c7656aebe218",
+            "cake_gated_act_mxfp8_905451a649b11b2d28aa",
+            "cake_gated_act_mxfp8_44395eef5de97bba1695",
             "cake_gated_act_mxfp8_e96f02e396eaf24e2caa",
         ],
     },
@@ -2101,14 +3020,14 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         "fwd_row": [
             "cake_gated_act_mxfp8_70d1cafb2bb8a175a516",
             "cake_gated_act_mxfp8_52421da70218abf13caf",
-            "cake_gated_act_mxfp8_58e6d65694f03b3f7b33",
+            "cake_gated_act_mxfp8_69fc759322d18bf4aa70",
         ],
         "fwd_col": [
             "cake_gated_act_mxfp8_7e191474abd37ba82e73",
             "cake_gated_act_mxfp8_f1232b8d8f9b3a7f66cf",
             "cake_gated_act_mxfp8_363476aea39117786ffc",
             "cake_gated_act_mxfp8_b51156b593447fe2aadc",
-            "cake_gated_act_mxfp8_d4edc57ff03b5fc922ab",
+            "cake_gated_act_mxfp8_74232aea4bcc3c884369",
         ],
         "fwd_both": [
             "cake_gated_act_mxfp8_34e92b6e8ad60c86843d",
@@ -2118,17 +3037,18 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_gated_act_mxfp8_a133fc612a9b9a21e84b",
         ],
         "bwd_row": [
-            "cake_gated_act_mxfp8_8da8bc14e105ce409f74",
+            "cake_gated_act_mxfp8_54573bbcd9b4aadbd39f",
             "cake_gated_act_mxfp8_957f6d5f3e03426c0964",
-            "cake_gated_act_mxfp8_077a568b810590574917",
+            "cake_gated_act_mxfp8_3e0ac746df31b17317e0",
         ],
         "bwd_col": [
+            "cake_gated_act_mxfp8_9aca7aee2d3a502d0c59",
             "cake_gated_act_mxfp8_2513ecc12f03a6081c2e",
             "cake_gated_act_mxfp8_848a93885f596fa4cbf9",
-            "cake_gated_act_mxfp8_78399261002caf386d19",
+            "cake_gated_act_mxfp8_6ee084f4ded4d19cd8cd",
         ],
         "bwd_both": [
-            "cake_gated_act_mxfp8_8c43730c1e3d76ce89f1",
+            "cake_gated_act_mxfp8_383546f101950463dcf8",
             "cake_gated_act_mxfp8_6d1956b2f454b08e6d34",
             "cake_gated_act_mxfp8_f4e33162da7e5d60c9b4",
             "cake_gated_act_mxfp8_eb924283e8b660bdeea8",
@@ -2136,13 +3056,14 @@ ROUTES: dict[str, dict[str, list[str]]] = {
     },
     "sm_107a": {
         "fwd_row": [
-            "cake_gated_act_mxfp8_489b9d3fcd80a220d649",
+            "cake_gated_act_mxfp8_7711f8af92d5b9756501",
             "cake_gated_act_mxfp8_5b2f99c68aa8e10a26fd",
             "cake_gated_act_mxfp8_d482e0e2dc5d60ddeb62",
         ],
         "fwd_col": [
+            "cake_gated_act_mxfp8_b1cad9a96b5541f4e8c3",
             "cake_gated_act_mxfp8_f3d5bac90719f391b705",
-            "cake_gated_act_mxfp8_b51156b593447fe2aadc",
+            "cake_gated_act_mxfp8_96497ddc9daf22dc35a5",
             "cake_gated_act_mxfp8_6902c8391e6f660586a4",
         ],
         "fwd_both": [
@@ -2153,18 +3074,18 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         "bwd_row": [
             "cake_gated_act_mxfp8_8da8bc14e105ce409f74",
             "cake_gated_act_mxfp8_957f6d5f3e03426c0964",
-            "cake_gated_act_mxfp8_42c891e228049ae01e1d",
+            "cake_gated_act_mxfp8_471449952da8cd17dc1b",
         ],
         "bwd_col": [
-            "cake_gated_act_mxfp8_2513ecc12f03a6081c2e",
+            "cake_gated_act_mxfp8_c6ab778cd390eb44c75a",
             "cake_gated_act_mxfp8_848a93885f596fa4cbf9",
-            "cake_gated_act_mxfp8_78399261002caf386d19",
+            "cake_gated_act_mxfp8_6ee084f4ded4d19cd8cd",
             "cake_gated_act_mxfp8_49303287790d1f318420",
         ],
         "bwd_both": [
-            "cake_gated_act_mxfp8_8c43730c1e3d76ce89f1",
+            "cake_gated_act_mxfp8_c31a8bcd7bef054bac83",
             "cake_gated_act_mxfp8_6d1956b2f454b08e6d34",
-            "cake_gated_act_mxfp8_eb924283e8b660bdeea8",
+            "cake_gated_act_mxfp8_43b7d4d5cc26486e8036",
         ],
     },
 }

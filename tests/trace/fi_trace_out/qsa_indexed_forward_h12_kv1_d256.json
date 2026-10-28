@@ -1,0 +1,91 @@
+{
+  "name": "qsa_indexed_forward_h12_kv1_d256",
+  "description": "Packed BF16 QSA forward with caller-selected causal token IDs.",
+  "op_type": "qsa_indexed_forward",
+  "tags": [
+    "fi_api:flashinfer.qsa.qsa_indexed_forward"
+  ],
+  "axes": {
+    "num_tokens": {
+      "type": "var"
+    },
+    "selection_width": {
+      "type": "var"
+    },
+    "num_q_heads": {
+      "type": "const",
+      "value": 12
+    },
+    "num_kv_heads": {
+      "type": "const",
+      "value": 1
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 256
+    }
+  },
+  "inputs": {
+    "q": {
+      "shape": [
+        "num_tokens",
+        "num_q_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k": {
+      "shape": [
+        "num_tokens",
+        "num_kv_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "v": {
+      "shape": [
+        "num_tokens",
+        "num_kv_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "indices": {
+      "shape": [
+        "num_tokens",
+        "selection_width"
+      ],
+      "dtype": "int32"
+    },
+    "scale": {
+      "shape": null,
+      "dtype": "float32"
+    }
+  },
+  "outputs": {
+    "out": {
+      "shape": [
+        "num_tokens",
+        "num_q_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "out_fp32": {
+      "shape": [
+        "num_tokens",
+        "num_q_heads",
+        "head_dim"
+      ],
+      "dtype": "float32"
+    },
+    "lse": {
+      "shape": [
+        "num_q_heads",
+        "num_tokens"
+      ],
+      "dtype": "float32"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

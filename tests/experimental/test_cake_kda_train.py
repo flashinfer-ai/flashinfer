@@ -137,10 +137,12 @@ CARRY_V8_ARCHES = ARCHES
 CARRY_V8_MAX_H = 2
 CARRY_S_HOPS = 14
 CARRY_FLAG_WORDS_PER_CTA = 3
-# the architectures whose GLM intra program (glm_intra_v14) writes the gate gradients itself: no gate_epilogue
-# launch, no dg_int / db_int buffers in their layouts; sm_100a / sm_107a keep glm_intra + gate_epilogue.  A byte query
+# the architectures whose GLM intra program (glm_intra_v14 on sm_103a, glm_intra_v18 on sm_107a: the same program
+# with every named-barrier slot an immediate, two CTAs per SM there) writes the gate gradients itself: no gate_epilogue
+# launch, no dg_int / db_int buffers in their layouts; sm_100a keeps glm_intra + gate_epilogue.  A byte query
 # without an architecture takes the first exported one's answer.
-GATE_FUSED_ARCHES = ("sm_103a",)
+GATE_FUSED_ARCHES = ("sm_103a", "sm_107a")
+GATE_FUSED_RECORD = {"sm_103a": "glm_intra_v14", "sm_107a": "glm_intra_v18"}
 # The light saved set (version 4) carries the fold's qg on every row (the light backward's prep, bwd_prep_g8_noqg,
 # writes none) and the WY representation w / u on the paired serial WU_SAVED_H-head rows (the 32-column form) of
 # WU_SAVED_ARCHES and on the segmented WU_SAVED_H-head rows of WU_SEG_SAVED_ARCHES above WU_SEG_MIN_CHAINS (document,
@@ -309,12 +311,13 @@ GRID_KINDS = (
     "segments_heads",
 )
 # the records delivered for a subset of the architectures (every other record ships on all three, the two-level
-# carry and the no-kb prep among them): the gate epilogue and its unfused GLM intra program on sm_100a / sm_107a, the
-# fused one on sm_103a
+# carry and the no-kb prep among them): the gate epilogue and its unfused GLM intra program on sm_100a, the fused
+# ones on sm_103a (glm_intra_v14) and sm_107a (glm_intra_v18)
 RECORD_ARCHES = {
-    "glm_intra": ("sm_100a", "sm_107a"),
+    "glm_intra": ("sm_100a",),
     "glm_intra_v14": ("sm_103a",),
-    "gate_epilogue": ("sm_100a", "sm_107a"),
+    "glm_intra_v18": ("sm_107a",),
+    "gate_epilogue": ("sm_100a",),
 }
 # The records of the segmented adjoint recurrence launch twice per stage (the carry between the passes); the
 # forward recurrence's passes are two stages (fwdh, fwdh_p3).
@@ -407,8 +410,8 @@ def _route_rule(route: str) -> dict:
 
 
 def test_registry_records_are_well_formed() -> None:
-    assert len(cake_jit.MODULES) == 66
-    assert len({r["library"] for r in cake_jit.MODULES.values()}) == 64
+    assert len(cake_jit.MODULES) == 67
+    assert len({r["library"] for r in cake_jit.MODULES.values()}) == 65
     assert tuple(cake_jit.PATHS) == PATHS
     assert tuple(cake_jit.OPTIONAL_STAGES) == OPTIONAL_STAGES
     assert {
@@ -751,12 +754,14 @@ def test_registry_records_are_well_formed() -> None:
             },
         ],
     }
-    # the GLM intra program and the gate epilogue: fused on sm_103a, two launches on sm_100a / sm_107a
+    # the GLM intra program and the gate epilogue: fused on sm_103a (glm_intra_v14) and sm_107a (glm_intra_v18), two
+    # launches on sm_100a
     unfused = [a for a in ARCHES if a not in GATE_FUSED_ARCHES]
-    assert cake_jit.MODULES["glm_intra_v14"]["select_rule"] == {
-        "kind": "arch_in",
-        "arches": list(GATE_FUSED_ARCHES),
-    }
+    for arch, fused_record in GATE_FUSED_RECORD.items():
+        assert cake_jit.MODULES[fused_record]["select_rule"] == {
+            "kind": "arch_in",
+            "arches": [arch],
+        }
     assert cake_jit.MODULES["glm_intra"]["select_rule"] == {
         "kind": "arch_in",
         "arches": unfused,
@@ -765,7 +770,7 @@ def test_registry_records_are_well_formed() -> None:
         "kind": "arch_in",
         "arches": unfused,
     }
-    for name in ("glm_intra", "glm_intra_v14", "gate_epilogue"):
+    for name in ("glm_intra", "glm_intra_v14", "glm_intra_v18", "gate_epilogue"):
         assert cake_jit.MODULES[name]["grid_rule"] == {"kind": "chunks", "x_factor": 1}
     # the fused gradient's dAqk-hosting form: the serial route from 16 heads and every segmented row, with the
     # hints on sm_100a / sm_103a or below 16 heads; the sm_107a rows from 16 heads take the _nohint build on
@@ -923,7 +928,7 @@ def _expected_records(
         if fused_fwd
         else ("wy_fwd_rows" if (ov1 and save) or paired or paired_v1 else "wy_fwd"),
         "seg_carry": carry,
-        "glm_intra": "glm_intra_v14" if gate_fused else "glm_intra",
+        "glm_intra": GATE_FUSED_RECORD[arch] if gate_fused else "glm_intra",
         "gate_epilogue": None if gate_fused else "gate_epilogue",
     }
     if path == "tape":
@@ -1032,6 +1037,7 @@ def _expected_grid(
         "bwd_prep_g8_noqg_nokb",
         "glm_intra",
         "glm_intra_v14",
+        "glm_intra_v18",
         "gate_epilogue",
     ):
         return (nc_pad, h, 1)
@@ -1545,6 +1551,7 @@ def test_the_backward_reads_the_token_rows_without_chunk_layout_copies() -> None
     logical = cake_jit.MODULES["glm_intra"]["logical"]
     assert (logical["k_e"], logical["q_e"]) == ("k", "q")
     assert {"k", "q"} <= set(cake_jit.MODULES["glm_intra_v14"]["logical"].values())
+    assert {"k", "q"} <= set(cake_jit.MODULES["glm_intra_v18"]["logical"].values())
     preps = (
         "bwd_prep_g8",
         "bwd_prep_g8_replay",
@@ -1574,8 +1581,10 @@ def test_the_backward_reads_the_token_rows_without_chunk_layout_copies() -> None
     # the fused GLM intra program writes the token-row gate gradients itself and binds no epilogue buffer; the
     # unfused one hands them to the gate epilogue through dg_int / db_int
     v14 = set(cake_jit.MODULES["glm_intra_v14"]["logical"].values())
+    v18 = set(cake_jit.MODULES["glm_intra_v18"]["logical"].values())
     unfused = set(cake_jit.MODULES["glm_intra"]["logical"].values())
     epilogue = set(cake_jit.MODULES["gate_epilogue"]["logical"].values())
+    assert v18 == v14  # the same program: v18 differs in its named-barrier slots alone
     assert {"dg", "dbeta"} <= v14 and not {"dg_int", "db_int"} & v14
     assert {"dg_int", "db_int"} <= unfused and not {"dg", "dbeta"} & unfused
     assert {"dg_int", "db_int", "dg", "dbeta"} <= epilogue
@@ -2149,8 +2158,8 @@ def test_the_light_set_saves_qg_everywhere_and_w_u_where_the_prep_writes_no_kb()
 def test_gate_fused_architectures_lay_the_arena_out_without_the_epilogue_buffers() -> (
     None
 ):
-    # glm_intra_v14 (sm_103a) writes the gate gradients itself: no gate_epilogue record, no dg_int / db_int in the
-    # layouts.  The default layouts keep their bytes (the two shared slots with h / do_int); the lean single-pass
+    # glm_intra_v14 (sm_103a) / glm_intra_v18 (sm_107a) write the gate gradients themselves: no gate_epilogue record,
+    # no dg_int / db_int in the layouts.  The default layouts keep their bytes (the two shared slots with h / do_int); the lean single-pass
     # layout loses the 4-byte db_int slot; the multi-pass per-pass set loses both buffers.  A query without an
     # architecture takes sm_100a's answer: the epilogue's buffers stay.
     assert cake_backend._gate_fused(None) is _gate_fused(None) is False
@@ -2164,7 +2173,7 @@ def test_gate_fused_architectures_lay_the_arena_out_without_the_epilogue_buffers
             assert p.gate_fused is fused
             assert p.dispatched("gate_epilogue", "light") is not fused
             assert p.records["light"]["glm_intra"] == (
-                "glm_intra_v14" if fused else "glm_intra"
+                GATE_FUSED_RECORD[arch] if fused else "glm_intra"
             )
             R, H, NC, NSEG = p.R, p.H, p.NC_pad, p.NSEG
             for mode in cake_backend.MODES:
@@ -2985,9 +2994,12 @@ def test_tail_stages_bind_only_range_safe_operands() -> None:
                 )
                 assert logical <= allowed, (name, sorted(logical - allowed))
                 seen.add(name)
-    assert {"glm_intra", "glm_intra_v14", "gate_epilogue"} <= seen and any(
-        n.startswith("dqkg") for n in seen
-    )
+    assert {
+        "glm_intra",
+        "glm_intra_v14",
+        "glm_intra_v18",
+        "gate_epilogue",
+    } <= seen and any(n.startswith("dqkg") for n in seen)
 
 
 def test_manifest_is_well_formed(manifest: dict) -> None:
@@ -2997,8 +3009,8 @@ def test_manifest_is_well_formed(manifest: dict) -> None:
     assert set(ARCHES) <= set(arch_flags)
     libraries = manifest["libraries"]
     names = [entry["name"] for entry in libraries]
-    # The 64 programs of cake_jit.MODULES, each built for the architectures its record delivers (61 on all three,
-    # the three of RECORD_ARCHES on their subsets: 188 libraries), plus the KCP programs of cake_kcp_jit.MODULES
+    # The 65 programs of cake_jit.MODULES, each built for the architectures its record delivers (61 on all three,
+    # the four of RECORD_ARCHES on one each: 187 libraries), plus the KCP programs of cake_kcp_jit.MODULES
     # on every architecture (its test-only TEST_MODULES live in build.test.json, never here).
     kcp_libraries = {record["library"] for record in cake_kcp_jit.MODULES.values()}
     train_libraries = {
@@ -3006,8 +3018,8 @@ def test_manifest_is_well_formed(manifest: dict) -> None:
         for record in cake_jit.MODULES.values()
         for arch in record["arches"]
     }
-    assert len(train_libraries) == 188
-    assert len(names) == len(set(names)) == 188 + len(kcp_libraries) * len(ARCHES)
+    assert len(train_libraries) == 187
+    assert len(names) == len(set(names)) == 187 + len(kcp_libraries) * len(ARCHES)
     for entry in libraries:
         assert entry["arch"] in ARCHES
         assert entry["entry"] == "run"

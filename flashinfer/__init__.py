@@ -154,12 +154,16 @@ from .fused_moe import (
 _PRIMS_TS_LAZY_EXPORTS = frozenset(
     {
         "prims_ts_bf16_moe",
+        "prims_ts_bf16_moe_partitioned",
         "prims_ts_bf16_routed_moe",
         "prims_ts_fp4_block_scale_moe",
+        "prims_ts_fp4_block_scale_moe_partitioned",
         "prims_ts_fp4_block_scale_routed_moe",
         "prims_ts_fp8_block_scale_moe",
+        "prims_ts_fp8_block_scale_moe_partitioned",
         "prims_ts_fp8_block_scale_routed_moe",
         "prims_ts_fp8_per_tensor_scale_moe",
+        "prims_ts_fp8_per_tensor_scale_moe_partitioned",
     }
 )
 
@@ -283,6 +287,9 @@ from .cake_causal_conv1d_train import (
 from .cake_causal_conv1d_train import (
     cake_causal_conv1d_train_forward as cake_causal_conv1d_train_forward,
 )
+from .cake_causal_conv1d_train import (
+    cake_causal_conv1d_train_forward_workspace_bytes as cake_causal_conv1d_train_forward_workspace_bytes,
+)
 from .cake_mhc_train import CakeMHCTrainFinishFunction as CakeMHCTrainFinishFunction
 from .cake_mhc_train import CakeMHCTrainPrepareFunction as CakeMHCTrainPrepareFunction
 from .cake_mhc_train import (
@@ -376,6 +383,8 @@ from .prefill import (
 )
 from .quantization import packbits as packbits
 from .quantization import segment_packbits as segment_packbits
+from .qsa import qsa_forward as qsa_forward
+from .qsa import qsa_indexed_forward as qsa_indexed_forward
 from .rope import apply_llama31_rope as apply_llama31_rope
 from .rope import apply_llama31_rope_inplace as apply_llama31_rope_inplace
 from .rope import apply_llama31_rope_pos_ids as apply_llama31_rope_pos_ids
