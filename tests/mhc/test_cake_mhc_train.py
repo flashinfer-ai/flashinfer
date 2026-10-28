@@ -1661,7 +1661,7 @@ def test_argument_validation() -> None:
     with pytest.raises(ValueError):
         forward_prepare(X.cpu(), fn.cpu(), scale.cpu(), base.cpu())
     # The epsilons are launch arguments of the compiled programs (any finite positive value runs); the Sinkhorn
-    # iteration count is a compile-time constant keyed by the delivered programs (only the shipped counts run).
+    # iteration count is an integer from 1 to SINKHORN_ITERS_MAX (test_cake_mhc_train_iters.py runs the counts).
     for kwargs in (
         {"rms_eps": 1e-6},
         {"hc_eps": 1e-5},
@@ -1677,12 +1677,13 @@ def test_argument_validation() -> None:
         with pytest.raises(ValueError):
             forward_prepare(X, fn, scale, base, **kwargs)
     for kwargs in (
-        {"sinkhorn_iters": 19},
-        {"sinkhorn_iters": 21},
+        {"sinkhorn_iters": 0},
         {"sinkhorn_iters": 20.5},
     ):
-        with pytest.raises(NotImplementedError):
+        with pytest.raises(ValueError):
             forward_prepare(X, fn, scale, base, **kwargs)
+    with pytest.raises(NotImplementedError):
+        forward_prepare(X, fn, scale, base, sinkhorn_iters=pkg.SINKHORN_ITERS_MAX + 1)
     assert pkg.SHIPPED_SINKHORN_ITERS == (SINKHORN_ITERS,)
     U, stats = forward_prepare(X, fn, scale, base)
     with pytest.raises(ValueError):
