@@ -305,7 +305,7 @@ def test_sm120_block_fp8_weight_first_cache_and_live_graphs(
     runner, inputs, _ = cases[0]
     choices = runner.get_valid_tactics(inputs, None)
     assert old in choices and overlap in choices
-    assert "block-fp8-grouped-tc-v3" in runner._cache_key_extras()
+    assert "block-fp8-grouped-tc-w8-weight-first-v4" in runner._cache_key_extras()
     a = runner.forward(inputs, old).clone()
     b = runner.forward(inputs, overlap).clone()
     torch.testing.assert_close(a, b, rtol=0, atol=0)
