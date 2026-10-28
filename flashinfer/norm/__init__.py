@@ -434,7 +434,13 @@ def supports_gated_residual_rmsnorm(
 ) -> bool:
     """Return whether tensors satisfy the SM100/SM103/SM107 fused-kernel contract
     and ``backend`` (``"auto"``: the Cake package or the CuTe DSL kernel) can run
-    the call on their device."""
+    the call on their device.  ``"auto"`` answers for the call's row count as
+    well: a row count in a gap of the Cake package's windows runs on the CuTe DSL
+    kernel, so the answer is false there only where that kernel is unavailable.
+    ``"cake"`` answers whether the package ships a program for the device, the
+    variant and the tensors' storage; an explicit cake call still raises for a
+    row count in a gap (``is_cake_gated_residual_rmsnorm_supported`` of
+    :mod:`flashinfer.cake_muse_spark_norm_backend` answers for the row count)."""
     return (
         _gated_residual_rmsnorm_tensors_ok(branch, residual, weight, alpha, beta)
         and _gated_residual_rmsnorm_backend(
@@ -442,6 +448,7 @@ def supports_gated_residual_rmsnorm(
             branch.device,
             weight_before_norm=weight is not None,
             enable_pdl=_resolved_pdl(branch.device, enable_pdl),
+            rows=branch.shape[0] or None,
             cake_layout=_cake_norm_layout(branch, residual, weight, alpha, beta),
         )
         is not None
@@ -509,7 +516,13 @@ def supports_gated_residual_next_rmsnorm(
 ) -> bool:
     """Return whether inputs satisfy the SM100/SM103/SM107 two-norm kernel contract
     and ``backend`` (``"auto"``: the Cake package or the CuTe DSL kernel) can run
-    the call on their device."""
+    the call on their device.  ``"auto"`` answers for the call's row count as
+    well: a row count in a gap of the Cake package's windows runs on the CuTe DSL
+    kernel, so the answer is false there only where that kernel is unavailable.
+    ``"cake"`` answers whether the package ships a program for the device and the
+    variant; an explicit cake call still raises for a row count in a gap
+    (``is_cake_gated_residual_next_rmsnorm_supported`` of
+    :mod:`flashinfer.cake_muse_spark_norm_backend` answers for the row count)."""
     tensors: tuple[torch.Tensor, ...] = (branch, residual, next_weight, beta)
     if isinstance(alpha, torch.Tensor):
         if (
@@ -551,6 +564,7 @@ def supports_gated_residual_next_rmsnorm(
             branch.device,
             tensor_alpha=isinstance(alpha, torch.Tensor),
             has_post_weight=post_weight is not None,
+            rows=branch.shape[0] or None,
         )
         is not None
     )
