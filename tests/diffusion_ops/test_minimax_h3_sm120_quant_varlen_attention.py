@@ -56,13 +56,33 @@ CU_SEQLENS = [
 def _supported() -> bool:
     if not torch.cuda.is_available():
         return False
-    major, _minor = get_compute_capability(torch.device("cuda:0"))
-    return major == 12
+    return get_compute_capability(torch.device("cuda:0")) == (12, 0)
 
 
 requires_sm120 = pytest.mark.skipif(
-    not _supported(), reason="requires an SM120 (RTX 5090 / RTX PRO 6000 Blackwell) GPU"
+    not _supported(),
+    reason="generated programs require exact compute capability 12.0 (sm_120a)",
 )
+
+
+@pytest.mark.parametrize(
+    "cuda_available, capability, expected",
+    [
+        (False, (12, 0), False),
+        (True, (12, 0), True),
+        (True, (12, 1), False),
+        (True, (10, 0), False),
+    ],
+)
+def test_supported_requires_exact_sm120(
+    monkeypatch, cuda_available, capability, expected
+):
+    # The generated programs ship sm_120a only; Spark must not enter the numerical suite.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda_available)
+    monkeypatch.setitem(
+        _supported.__globals__, "get_compute_capability", lambda device: capability
+    )
+    assert _supported() is expected
 
 
 def synthetic_inputs(tokens: int, heads: int, seed: int, device: torch.device):
@@ -230,6 +250,17 @@ def test_minimax_h3_sm120_varlen_attention_fp8_workspace_reuse_is_bitwise() -> N
     assert torch.equal(first, again) and torch.equal(first, on_side)
     assert torch.equal(large_first, large_again)
     _check(first, fp32_oracle(q, k, v, small))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_minimax_h3_sm120_varlen_attention_fp8_rejects_unsupported_device() -> None:
+    device = torch.device("cuda:0")
+    if get_compute_capability(device) == (12, 0):
+        pytest.skip("SM120 is supported; numerical tests cover this device")
+    q, k, v = synthetic_inputs(1, 1, seed=0, device=device)
+    cu = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    with pytest.raises(RuntimeError, match=r"requires exact compute capability 12\.0"):
+        minimax_h3_sm120_varlen_attention_fp8(q, k, v, cu, cu_seqlens_host=(0, 1))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
