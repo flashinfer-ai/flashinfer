@@ -1395,8 +1395,8 @@ def chunk_gated_delta_rule(
         ``output_final_state=True``. Sequence ``i`` then reads its initial
         state from row ``state_indices[i]`` of ``initial_state`` and writes
         its final state to row ``output_state_indices[i]`` of
-        ``output_state``, which may be the same pool. A negative read id
-        starts the sequence from the zero state; a negative write id skips
+        ``output_state``, which may be the same pool. A read id of ``-1``
+        starts the sequence from the zero state; a write id of ``-1`` skips
         its final-state write. Rows written by one sequence must not be read
         or written by another sequence of the same call.
     checkpoint_state_indices : torch.Tensor, optional
@@ -1405,8 +1405,8 @@ def chunk_gated_delta_rule(
         state pool ``[N_pool, num_sab_heads, head_size, head_size]`` (it may
         be the ``initial_state``/``output_state`` pool) and the ``j``-th
         checkpoint of sequence ``i`` is written to row
-        ``checkpoint_state_indices[checkpoint_cu_starts[i] + j]``; a negative
-        row skips that checkpoint. ``checkpoint_cu_starts`` (``[num_seqs]``
+        ``checkpoint_state_indices[checkpoint_cu_starts[i] + j]``; a row of
+        ``-1`` skips that checkpoint. ``checkpoint_cu_starts`` (``[num_seqs]``
         or ``[num_seqs + 1]`` entries) only gives each sequence's first entry,
         so a paged caller can pass its page table directly (see
         :func:`flashinfer.gdn_paged.chunk_gated_delta_rule_paged`).
