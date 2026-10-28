@@ -796,6 +796,7 @@ def test_glm_next_cache_writer_rejects_invalid_contracts(
     error: type[Exception],
     match: str,
 ) -> None:
+    """Reject invalid writer storage contracts during planning, before CUDA work."""
     kv_c, cache, slots = _valid_glm_next_writer_args()
     if case == "source_shape":
         kv_c = torch.empty((2, 511), dtype=torch.bfloat16)
