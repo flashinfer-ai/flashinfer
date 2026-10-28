@@ -36,6 +36,7 @@ import json
 import math
 import os
 import pathlib
+import random
 import re
 
 import pytest
@@ -1063,8 +1064,46 @@ def test_byte_queries(W) -> None:
                     assert ws["forward"] == sum(
                         v for k, v in ws.items() if k.startswith("fwd.")
                     )
-                    assert ws["backward"] == sum(
-                        v for k, v in ws.items() if k.startswith("bwd.")
+                    # the backward is the largest of its lifetime phases, each below the sum of what the arena
+                    # can hold; the kept form lists the hand-off tensors apart and both forms need the same
+                    # transient memory besides the saved set
+                    phases = {k: v for k, v in ws.items() if k.startswith("bwd.phase.")}
+                    parts = sum(
+                        v
+                        for k, v in ws.items()
+                        if k.startswith("bwd.")
+                        and not k.startswith("bwd.phase.")
+                        and k != "bwd.kept_tapes"
+                    )
+                    assert ws["backward"] == max(phases.values())
+                    assert all(
+                        phases[f"bwd.phase.{p}"] <= parts
+                        for p in ("exchange", "walk", "end")
+                    )
+                    kept_ws, replay_ws = (
+                        gb.gdn_kcp_workspace_layout(
+                            ctx,
+                            H_qk=H_qk,
+                            HV=HV,
+                            save_mode=save_mode,
+                            boundary_mode=boundary_mode,
+                            save_transfer=save_transfer,
+                            C=C_CONV,
+                            reuse_recompute_tapes=form,
+                        )
+                        for form in (True, False)
+                    )
+                    tapes = ctx.NC_pad * HV * (32768 + 4) + ctx.R * HV * (
+                        3 * 256 + 2 * 128 + 3 * 4
+                    )
+                    assert kept_ws["bwd.kept_tapes"] == (
+                        0 if save_mode == "full" else tapes
+                    )
+                    assert replay_ws["bwd.kept_tapes"] == 0
+                    assert (
+                        kept_ws["backward_transient"]
+                        == replay_ws["backward_transient"]
+                        == replay_ws["backward"]
                     )
                     assert (
                         ws["bwd.dv_new"] == 0 and ws["bwd.dv_intra"] == ctx.R * HV * 256
@@ -2314,9 +2353,7 @@ def test_checkpoint_backward_reuses_the_recompute_tapes(
     # in the first one only; any other torch build launches it in both
     assert [h for n, bwd, h, _ in seen if not bwd and n == "fwd_prep"] == [False, True]
     assert [h for n, bwd, h, _ in seen if not bwd and n == "fwd_o"] == (
-        [False]
-        if torch.__version__ in kcp.RECOMPUTE_OUTPUT_TORCH_VERSIONS
-        else [False, True]
+        [False] if kcp.torch_release_verified() else [False, True]
     )
     # the hand-off forward's #2 tape launches are the replay's (same list lengths in the same order)
     kept_walks = [
@@ -2612,7 +2649,7 @@ def _forwards(seen) -> list[tuple[bool, str, str]]:
 
 def _verified_torch(kcp) -> bool:
     """Whether this torch build reads the frame proof (else every recompute launches #5, reason ``torch_version``)."""
-    return torch.__version__ in kcp.RECOMPUTE_OUTPUT_TORCH_VERSIONS
+    return kcp.torch_release_verified()
 
 
 def _frame_reason(kcp, reason: str) -> str:
@@ -2731,6 +2768,9 @@ def test_recompute_output_skipped_once_when_the_node_closes_the_segment() -> Non
     assert kcp.kept_registry_size() == 0
 
 
+# The recompute_output tests below pin reuse_recompute_tapes=True: they check the output program's gate under the
+# kept-tape form (the recompute launches #1 and hands the tapes off); the shipped default "auto" takes the replay form
+# in several of these scenarios (a later saver, a failed frame proof), which the reuse_recompute_tapes tests cover.
 def test_recompute_output_launched_when_a_later_op_of_the_segment_saves_the_output() -> (
     None
 ):
@@ -2752,7 +2792,16 @@ def test_recompute_output_launched_when_a_later_op_of_the_segment_saves_the_outp
 
         def fn(q, k, v, g, beta, w_):
             out = kcp.chunk_gdn_kcp(
-                q, k, v, g, beta, ctx, backend="fake", segments=2, **o
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ctx,
+                backend="fake",
+                segments=2,
+                reuse_recompute_tapes=True,
+                **o,
             )
             return out * w_
 
@@ -2790,7 +2839,7 @@ def test_recompute_output_multi_layer_segment_skips_only_the_last_layer() -> Non
     kcp, ctx, ops = _ckpt_setup()
     layers = 3
     ws = kcp.KcpWorkspace()
-    base = dict(segments=2, layers=layers, workspace=ws)
+    base = dict(segments=2, layers=layers, workspace=ws, reuse_recompute_tapes=True)
     direct = _ckpt_autograd(kcp, ctx, ops, ckpt=False, **base)
     seen, rec = _fwd_o_launches(kcp)
     previous = kcp.set_backend("fake", rec)
@@ -2880,13 +2929,17 @@ def test_recompute_output_needs_the_verified_torch_version(monkeypatch) -> None:
     launches #5 as before (reason ``torch_version``; the frame is never read, so the counters stay), gradients
     unchanged."""
     kcp, ctx, ops = _ckpt_setup()
-    direct = _ckpt_autograd(kcp, ctx, ops, ckpt=False, segments=2)
-    monkeypatch.setattr(kcp, "RECOMPUTE_OUTPUT_TORCH_VERSIONS", ("0.0.0+unverified",))
+    direct = _ckpt_autograd(
+        kcp, ctx, ops, ckpt=False, segments=2, reuse_recompute_tapes=True
+    )
+    monkeypatch.setattr(kcp, "RECOMPUTE_OUTPUT_TORCH_VERSIONS", ("0.0.0",))
     seen, rec = _fwd_o_launches(kcp)
     previous = kcp.set_backend("fake", rec)
     try:
         before = dict(kcp.RECOMPUTE_OUTPUT_STATS)
-        res = _ckpt_autograd(kcp, ctx, ops, ckpt=True, segments=2)
+        res = _ckpt_autograd(
+            kcp, ctx, ops, ckpt=True, segments=2, reuse_recompute_tapes=True
+        )
         assert _launches(seen, "fwd_o") == [False, True]
         assert kcp.LAST_CALL["fwd"]["fwd_o"] == "launched"
         assert kcp.LAST_CALL["fwd"]["fwd_o_reason"] == "torch_version"
@@ -2907,7 +2960,17 @@ def test_recompute_output_launched_under_a_reentrant_checkpoint() -> None:
         leaves = _ckpt_leaves(ops)
 
         def fn(q, k, v, g, beta):
-            return kcp.chunk_gdn_kcp(q, k, v, g, beta, ctx, backend="fake", segments=2)
+            return kcp.chunk_gdn_kcp(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ctx,
+                backend="fake",
+                segments=2,
+                reuse_recompute_tapes=True,
+            )
 
         out = checkpoint(fn, *leaves, use_reentrant=True) if ckpt else fn(*leaves)
         out.backward(ops["dout"])
@@ -2945,7 +3008,9 @@ def test_recompute_output_launched_for_a_non_executable_layer_before_the_node() 
 
     def run(ckpt: bool, **o) -> list[torch.Tensor]:
         leaves = _ckpt_leaves(ops)
-        opt = dict(backend="fake", segments=2, workspace=ws, **o)
+        opt = dict(
+            backend="fake", segments=2, workspace=ws, reuse_recompute_tapes=True, **o
+        )
 
         def fn(q, k, v, g, beta):
             first = kcp.chunk_gdn_kcp(
@@ -3012,7 +3077,16 @@ def test_recompute_output_launched_under_no_grad_inside_the_recompute() -> None:
         def fn(q, k, v, g, beta, w_):
             with torch.no_grad():
                 out = kcp.chunk_gdn_kcp(
-                    q, k, v, g, beta, ctx, backend="fake", segments=2, **o
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    ctx,
+                    backend="fake",
+                    segments=2,
+                    reuse_recompute_tapes=True,
+                    **o,
                 )
             return out * w_
 
@@ -3056,7 +3130,17 @@ def test_recompute_output_launched_when_early_stop_is_off() -> None:
         leaves = _ckpt_leaves(ops)
 
         def fn(q, k, v, g, beta):
-            return kcp.chunk_gdn_kcp(q, k, v, g, beta, ctx, backend="fake", segments=2)
+            return kcp.chunk_gdn_kcp(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ctx,
+                backend="fake",
+                segments=2,
+                reuse_recompute_tapes=True,
+            )
 
         if ckpt:
             with set_checkpoint_early_stop(False):
@@ -3106,7 +3190,15 @@ def test_recompute_output_launched_under_a_users_saved_tensors_hooks() -> None:
         def fn(q, k, v, g, beta, w_):
             with torch.autograd.graph.saved_tensors_hooks(lambda t: t, lambda t: t):
                 out = kcp.chunk_gdn_kcp(
-                    q, k, v, g, beta, ctx, backend="fake", segments=2
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    ctx,
+                    backend="fake",
+                    segments=2,
+                    reuse_recompute_tapes=True,
                 )
             return out * w_
 
@@ -3131,3 +3223,426 @@ def test_recompute_output_launched_under_a_users_saved_tensors_hooks() -> None:
     for a, d in zip(res, direct, strict=True):
         assert torch.equal(a, d)
     assert kcp.kept_registry_size() == 0
+
+
+# --------------------------------------------------------------------------- issue #7074 (1): sync-free context preparation (CPU)
+# The tables of a context and its head plan travel in pinned, asynchronous copies (upload_tables); the values are those of
+# torch.tensor(values, dtype).  The no-sync contract itself is measured on a device (test_cake_gdn_train.py, the dist test).
+
+
+def test_upload_tables_matches_torch_tensor() -> None:
+    gp = _package("cake_kcp_plan")
+    specs = {
+        "a": ([1, 2, 3], torch.int32, None),
+        "b": ([[1, 2], [3, 4], [5, 6]], torch.int32, (3, 2)),
+        "c": ((7, 8), torch.int64, None),
+        "e": ([], torch.int32, (0, 4)),
+        "f": ([[[9]]], torch.int32, None),
+        "g": ([], torch.int64, None),
+    }
+    out = gp.upload_tables(specs, "cpu")
+    assert set(out) == set(specs)
+    for name, (values, dtype, shape) in specs.items():
+        ref = torch.tensor(list(values), dtype=dtype)
+        ref = ref.reshape(shape) if shape is not None else ref
+        assert out[name].dtype == dtype, name
+        assert tuple(out[name].shape) == tuple(ref.shape), name
+        assert torch.equal(out[name], ref), name
+    with pytest.raises(ValueError, match="holds 3 values"):
+        gp.upload_tables({"x": ([1, 2, 3], torch.int32, (2, 2))}, "cpu")
+    assert gp.UPLOAD_ALIGN_BYTES % 128 == 0
+
+
+def _lpt_makespan_list(chains, machines):
+    """The list form of the greedy's water filling (one load per machine): the reference the multiset form equals."""
+    loads = [0] * machines
+    for L, m in sorted(chains, reverse=True):
+        L, m = int(L), int(m)
+        if L <= 0 or m <= 0:
+            continue
+
+        def needed(level):
+            return sum(-(-(level - load) // L) for load in loads if load < level)
+
+        lo = min(loads)
+        hi = lo + (m + 1) * L
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if needed(mid) <= m:
+                lo = mid
+            else:
+                hi = mid - 1
+        counts = [(-(-(lo - load) // L) if load < lo else 0) for load in loads]
+        rest = m - sum(counts)
+        loads = [load + c * L for load, c in zip(loads, counts, strict=True)]
+        if rest:
+            for i in sorted(range(machines), key=loads.__getitem__)[:rest]:
+                loads[i] += L
+    return max(loads)
+
+
+def _lpt_makespan_greedy(chains, machines):
+    """Job by job: longest first, each to the least-loaded machine."""
+    loads = [0] * machines
+    for L, m in sorted(chains, reverse=True):
+        for _ in range(int(m)):
+            if L > 0:
+                loads[loads.index(min(loads))] += int(L)
+    return max(loads)
+
+
+def test_lpt_makespan_equals_the_list_form_and_the_greedy() -> None:
+    """The multiset water filling returns the list form's integer on every instance (the plan's ``P`` vectors are
+    untouched) and the job-by-job greedy's on small ones."""
+    rng = random.Random(7074)
+    for trial in range(400):
+        machines = rng.choice([1, 2, 3, 7, 16, 132, 148, 152])
+        chains = [
+            (
+                rng.randint(0, 40),
+                rng.randint(0, 600) if rng.random() < 0.8 else rng.randint(0, 8),
+            )
+            for _ in range(rng.randint(0, 9))
+        ]
+        got = (
+            gp.lpt_makespan(chains, machines)
+            if any(L > 0 and m > 0 for L, m in chains)
+            else None
+        )
+        if got is None:
+            assert gp.lpt_makespan(chains, machines) == 0
+            continue
+        assert got == _lpt_makespan_list(chains, machines), (trial, machines, chains)
+        if sum(m for _, m in chains) <= 300:
+            assert got == _lpt_makespan_greedy(chains, machines), (
+                trial,
+                machines,
+                chains,
+            )
+    # the issue's single-rank layout: two fragments of 2048 chunks, P * HV chains each, 152 SMs
+    assert gp.lpt_makespan([(2048, 6), (2048, 6)], 152) == 2048
+    assert gp.lpt_makespan([(8, 6 * 256), (8, 6 * 256)], 152) == 8 * -(
+        -(2 * 6 * 256) // 152
+    )
+    with pytest.raises(ValueError):
+        gp.lpt_makespan([(1, 1)], 0)
+
+
+# --------------------------------------------------------------------------- issue #7074 (3): the recompute_output gate is a torch RELEASE check
+# Every CUDA build of the verified release (2.14.1+cu130, 2.14.1+cu132, ...) reads the frame proof; other releases launch #5 as before.
+
+
+@pytest.mark.parametrize(
+    "version,verified",
+    [
+        ("2.14.1+cu130", True),
+        ("2.14.1+cu132", True),
+        ("2.14.1", True),
+        ("2.14.0+cu130", False),
+        ("2.15.0+cu132", False),
+        ("2.14.1.dev20260901+cu130", False),
+    ],
+)
+def test_recompute_output_gate_is_a_torch_release_check(
+    monkeypatch, version, verified
+) -> None:
+    """The verified set names torch releases; the local ``+cuNNN`` build tag is not part of the identity."""
+    kcp = _package("cake_kcp")
+    assert kcp.RECOMPUTE_OUTPUT_TORCH_VERSIONS == ("2.14.1",)
+    assert kcp.torch_release(version) == version.split("+", 1)[0]
+    monkeypatch.setattr(torch, "__version__", version)
+    assert kcp.torch_release() == version.split("+", 1)[0]
+    assert kcp.torch_release_verified() is verified
+    dead, reason = kcp._recompute_output_dead(6)  # outside any checkpoint: never dead
+    assert dead is False
+    assert (reason == "torch_version") is (not verified), reason
+
+
+def test_recompute_output_auto_resolves_on_every_cuda_build_of_the_release(
+    monkeypatch,
+) -> None:
+    """The resolved mode of ``recompute_output="auto"`` per torch build string: the two CUDA builds of the verified
+    release skip the recompute's #5 (reason ``dead``), the neighbouring releases launch it (``torch_version``)."""
+    kcp, ctx, ops = _ckpt_setup()
+    if kcp.torch_release() not in kcp.RECOMPUTE_OUTPUT_TORCH_VERSIONS:
+        pytest.skip(
+            "the running torch is not a verified release: the frame proof cannot be exercised"
+        )
+    direct = _ckpt_autograd(
+        kcp, ctx, ops, ckpt=False, segments=2, reuse_recompute_tapes=True
+    )
+    expect = {
+        "2.14.1+cu130": ("dead", [False], "skipped"),
+        "2.14.1+cu132": ("dead", [False], "skipped"),
+        "2.14.0+cu130": ("torch_version", [False, True], "launched"),
+        "2.15.0+cu132": ("torch_version", [False, True], "launched"),
+    }
+    for build, (reason, fwd_o, decision) in expect.items():
+        monkeypatch.setattr(torch, "__version__", build)
+        seen, rec = _fwd_o_launches(kcp)
+        previous = kcp.set_backend("fake", rec)
+        try:
+            res = _ckpt_autograd(
+                kcp, ctx, ops, ckpt=True, segments=2, reuse_recompute_tapes=True
+            )
+            assert kcp.LAST_CALL["fwd"]["fwd_o_reason"] == reason, build
+            assert kcp.LAST_CALL["fwd"]["fwd_o"] == decision, build
+            assert _launches(seen, "fwd_o") == fwd_o, build
+        finally:
+            kcp.set_backend("fake", previous)
+        _assert_same(res, direct, build)
+
+
+# --------------------------------------------------------------------------- issue #7074 (4): gdn_kcp_workspace_layout follows the arena's lifetimes
+# What a caller-held workspace binds, per tape form: the forward's tape-walk peak and the backward's phase maximum.
+
+
+class _PeakWorkspace:
+    """A ``KcpWorkspace`` recording the most bytes it binds (every allocation / release path)."""
+
+    def __new__(cls, kcp):
+        class Tracked(kcp.KcpWorkspace):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self.peak = 0
+
+            def _upd(self):
+                self.peak = max(self.peak, self.bytes)
+
+            def tape(self, name):
+                t = super().tape(name)
+                self._upd()
+                return t
+
+            def pool(self, name, n=None):
+                t = super().pool(name, n)
+                self._upd()
+                return t
+
+            def ensure(self, *a, **k):
+                tb = super().ensure(*a, **k)
+                self._upd()
+                return tb
+
+            def adopt_tape(self, name, t):
+                r = super().adopt_tape(name, t)
+                self._upd()
+                return r
+
+        return Tracked()
+
+
+def test_workspace_layout_follows_the_arena_lifetimes() -> None:
+    """``gdn_kcp_workspace_layout`` is what a caller-held workspace binds: the forward's tape-walk peak, and the
+    backward's phase maximum of the form -- the kept-tape form ends with the four re-adopted forward tapes beside the
+    backward tapes (the ten kept tapes are hand-off tensors outside the workspace, ``bwd.kept_tapes``), the replay
+    form holds the ten light tapes through the backward; both forms need the same transient bytes."""
+    kcp, ctx, ops = _ckpt_setup()
+    gb = _package("cake_bytes")
+    H_qk, HV = 2, 6
+    assert (
+        tuple(gb.TAPE_NAME_OF.get(n, n) for n in gb.FWD_TAPES_DEAD_AFTER_PREP)
+        == kcp.FWD_DEAD_AFTER_PREP
+    )
+    assert (
+        tuple(gb.TAPE_NAME_OF.get(n, n) for n in gb.FWD_TAPES_ARENA_AFTER_FWD)
+        == kcp.FWD_TAPES_ARENA_AFTER_FWD
+    )
+    assert gb.EYE_BYTES == gb.STATE_TILE_BYTES == 128 * 128 * 4
+    from torch.utils.checkpoint import checkpoint
+
+    layouts = {}
+    for form in (True, False):
+        layout = gb.gdn_kcp_workspace_layout(
+            ctx, H_qk=H_qk, HV=HV, reuse_recompute_tapes=form
+        )
+        layouts[form] = layout
+        ws = _PeakWorkspace(kcp)
+        leaves = [
+            ops[n].detach().clone().requires_grad_(True)
+            for n in ("q", "k", "v", "g", "beta")
+        ]
+
+        def fn(q, k, v, g, beta, _ws=ws, _form=form):
+            return kcp.chunk_gdn_kcp(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ctx,
+                workspace=_ws,
+                backend="fake",
+                reuse_recompute_tapes=_form,
+            )
+
+        out = checkpoint(fn, *leaves, use_reentrant=False)
+        assert ws.peak == layout["forward"], (form, ws.peak, layout["forward"])
+        ws.peak = 0
+        out.backward(ops["dout"])
+        assert ws.peak == layout["backward"], (form, ws.peak, layout["backward"])
+        assert ws.bytes == layout["bwd.phase.end"], (
+            form,
+            ws.bytes,
+            layout["bwd.phase.end"],
+        )
+        assert layout["bwd.phase.end"] == layout["bwd.eye"] + layout[
+            "bwd.tickets"
+        ] + sum(
+            layout[f"bwd.{n}"]
+            for n in ("do_g", "dv_intra", "dh_tape", "dg_part", "gamma_dot")
+        ) + sum(
+            layout[f"bwd.{n}"]
+            for n in (
+                gb.FWD_TAPES_ARENA_AFTER_FWD
+                if form
+                else tuple(k for k in gb.FWD_TAPES_ARENA_AFTER_FWD)
+                + ("w", "u", "akk", "gamma", "gcum", "rowscale")
+            )
+        )
+        assert kcp.kept_registry_size() == 0
+    kept, replay = layouts[True], layouts[False]
+    assert kept["backward"] < replay["backward"]
+    assert kept["bwd.kept_tapes"] == sum(
+        replay[f"bwd.{n}"]
+        for n in (
+            "w",
+            "u",
+            "aqk",
+            "akk",
+            "h_tape",
+            "v_new",
+            "gamma",
+            "gcum",
+            "rowscale",
+            "qscale",
+        )
+    )
+    assert replay["bwd.kept_tapes"] == 0
+    assert (
+        kept["backward_transient"] == replay["backward_transient"] == replay["backward"]
+    )
+    assert kept["forward"] == replay["forward"]
+    # the keyword resolves through the package default, and the bytes query is the layout's maximum
+    default = gb.gdn_kcp_workspace_layout(ctx, H_qk=H_qk, HV=HV)
+    opt = _package("cake_options")
+    assert default == layouts[opt.REUSE_RECOMPUTE_TAPES_DEFAULT is True]
+    assert (
+        gb.gdn_kcp_workspace_layout(ctx, H_qk=H_qk, HV=HV, reuse_recompute_tapes="auto")
+        == replay
+    )
+    for form in (True, False):
+        assert (
+            gb.gdn_kcp_workspace_bytes(
+                ctx, H_qk=H_qk, HV=HV, reuse_recompute_tapes=form
+            )
+            == layouts[form]["workspace"]
+        )
+    with pytest.raises(ValueError, match="reuse_recompute_tapes must be"):
+        gb.gdn_kcp_workspace_layout(ctx, H_qk=H_qk, HV=HV, reuse_recompute_tapes="yes")
+
+
+# --------------------------------------------------------------------------- issue #7074 (2): reuse_recompute_tapes="auto"
+# The recompute's tapes are kept only when the GDN node closes the checkpointed region (the frame proof); with a later saver the
+# kept set would live through that operation's backward and raise the region's peak by the full tape set, so "auto" replays there.
+
+
+def _ckpt_autograd_region(
+    kcp, ctx, ops, *, ckpt: bool, later_saver: bool, **opts
+) -> tuple[dict[str, torch.Tensor], torch.Tensor | None]:
+    """``out`` and the gradients of a region that ends with the GDN call (``later_saver=False``) or continues with an
+    operation that saves tensors for its backward (a scaling by a leaf, ``later_saver=True``), directly or under a
+    non-reentrant checkpoint; the leaf's gradient comes beside the result."""
+    leaves = [
+        ops[n].detach().clone().requires_grad_(True)
+        for n in ("q", "k", "v", "g", "beta")
+    ]
+    scale = torch.full((), 1.5, dtype=torch.bfloat16, requires_grad=True)
+    o = {"backend": "fake", **opts}
+
+    def fn(q, k, v, g, beta):
+        out = kcp.chunk_gdn_kcp(q, k, v, g, beta, ctx, **o)
+        return out * scale if later_saver else out
+
+    if ckpt:
+        from torch.utils.checkpoint import checkpoint
+
+        out = checkpoint(fn, *leaves, use_reentrant=False)
+    else:
+        out = fn(*leaves)
+    out.backward(ops["dout"])
+    res = {"out": out.detach()}
+    res.update({n: lf.grad for n, lf in zip(CKPT_GRADS, leaves, strict=True)})
+    return res, (scale.grad if later_saver else None)
+
+
+@pytest.mark.parametrize("segments,save_transfer", [(1, True), (2, True), (2, False)])
+def test_reuse_recompute_tapes_auto_keeps_tapes_only_when_the_node_closes_the_region(
+    segments, save_transfer
+) -> None:
+    """``"auto"``: the recompute hands its tapes to the backward when the GDN node is the region's last saver (the
+    frame proof ``dead``; the backward of the region then starts with this node) and takes the replay form when a
+    later operation of the region saves a tensor (``holders_remain``) -- so the kept set never outlives the GDN
+    backward.  ``True`` always hands off, ``False`` never; every form is bitwise the direct autograd result, and
+    the registry is empty afterwards.  On an unverified torch release ``"auto"`` is the replay form."""
+    kcp, ctx, ops = _ckpt_setup()
+    base = {"segments": segments, "save_transfer": save_transfer}
+    for later_saver in (False, True):
+        direct, direct_scale = _ckpt_autograd_region(
+            kcp, ctx, ops, ckpt=False, later_saver=later_saver, **base
+        )
+        for mode in (True, False, "auto"):
+            before = dict(kcp.KEPT_STATS)
+            res, scale_grad = _ckpt_autograd_region(
+                kcp,
+                ctx,
+                ops,
+                ckpt=True,
+                later_saver=later_saver,
+                reuse_recompute_tapes=mode,
+                **base,
+            )
+            what = f"later_saver={later_saver} mode={mode!r} {base}"
+            _assert_same(res, direct, what)
+            if later_saver:
+                assert torch.equal(scale_grad, direct_scale), what
+            delta = _stats_delta(kcp, before)
+            reason = kcp.LAST_CALL["fwd"]["hand_off_reason"]
+            source = kcp.LAST_CALL["bwd"]["tapes_source"]
+            if mode is True:
+                expect, kept = (1, 1, 0), True
+                assert reason == "always", what
+            elif mode is False:
+                expect, kept = (0, 0, 0), False
+                assert reason == "off", what
+            elif later_saver or not _verified_torch(kcp):
+                expect, kept = (0, 0, 0), False
+                assert reason == _frame_reason(kcp, "holders_remain"), what
+            else:
+                expect, kept = (1, 1, 0), True
+                assert reason == "dead", what
+            assert (delta["put"], delta["take"], delta["miss"]) == expect, (what, delta)
+            assert source == ("kept" if kept else "replay"), (what, source)
+            assert kcp.kept_registry_size() == 0, what
+
+
+def test_reuse_recompute_tapes_auto_is_an_option_value() -> None:
+    opt = _package("cake_options")
+    assert opt.REUSE_RECOMPUTE_TAPES == (True, False, "auto")
+    assert opt.REUSE_RECOMPUTE_TAPES_DEFAULT in opt.REUSE_RECOMPUTE_TAPES
+    assert (
+        opt.KcpOptions(reuse_recompute_tapes="auto").check().reuse_recompute_tapes
+        == "auto"
+    )
+    assert (
+        opt.KcpOptions().check().reuse_recompute_tapes
+        == opt.REUSE_RECOMPUTE_TAPES_DEFAULT
+    )
+    assert opt.KcpOptions(graph="replay").check().reuse_recompute_tapes is False
+    with pytest.raises(ValueError, match="needs graph='off'"):
+        opt.KcpOptions(graph="replay", reuse_recompute_tapes="auto").check()
+    with pytest.raises(ValueError, match="needs graph='off'"):
+        opt.KcpOptions(graph="replay", reuse_recompute_tapes=True).check()
+    for bad in ("yes", 1, 0, "AUTO"):
+        with pytest.raises(TypeError, match="must be a bool or 'auto'"):
+            opt.KcpOptions(reuse_recompute_tapes=bad).check()

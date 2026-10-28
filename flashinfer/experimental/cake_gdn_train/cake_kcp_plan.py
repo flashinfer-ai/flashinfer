@@ -338,6 +338,72 @@ class KcpPartition:
         }
 
 
+# ----------------------------------------------------------------------------------------------------------------
+# Host-built integer tables on the device without a synchronizing call
+
+UPLOAD_ALIGN_BYTES = 256  # every table starts on a 256-byte boundary of its shared buffer (vector loads, TMA)
+
+
+# one host-built table on its way to the device: (values, dtype, shape); ``values`` a flat or nested list or tuple of
+# ints, ``shape`` None = the sequence's own shape (a type alias; the module imports torch and dataclasses only)
+TableSpec = tuple[list | tuple, torch.dtype, tuple[int, ...] | None]
+
+
+def upload_tables(
+    specs: dict[str, TableSpec],
+    device: torch.device | str,
+) -> dict[str, torch.Tensor]:
+    """Device copies of integer tables built on the host (``name -> (values, dtype, shape)``; ``values`` a flat or
+    nested sequence of ints, ``shape`` ``None`` = the sequence's own shape), without a synchronizing CUDA call.
+
+    ``torch.tensor(values, device=cuda)`` copies from pageable host memory and synchronizes the stream once per
+    table (``torch.cuda.set_sync_debug_mode`` reports every one of them), so a context prepared behind queued
+    device work waited for that work.  Here every table of one dtype is laid out in one pinned host buffer
+    (each table at a 256-byte boundary) and copied with one asynchronous ``copy_``: a pinned non-blocking
+    host-to-device copy enqueues ``cudaMemcpyAsync`` on the current stream and records the staging block on it, so
+    the host never waits and the staging memory is reused only after the copy has run.  Each returned tensor is a
+    contiguous view of its dtype's device buffer; the values are those of ``torch.tensor(values, dtype)``.  On a
+    non-CUDA device the tables are plain CPU tensors."""
+    device = torch.device(device)
+    groups: dict[torch.dtype, list[tuple[str, torch.Tensor, tuple[int, ...]]]] = {}
+    for name, (values, dtype, shape) in specs.items():
+        cpu = torch.tensor(list(values), dtype=dtype)
+        shape = tuple(cpu.shape) if shape is None else tuple(int(x) for x in shape)
+        flat = cpu.reshape(-1)
+        numel = 1
+        for x in shape:
+            numel *= x
+        if flat.numel() != numel:
+            raise ValueError(
+                f"upload_tables: table {name!r} holds {flat.numel()} values, shape {shape} needs {numel}"
+            )
+        groups.setdefault(dtype, []).append((name, flat, shape))
+    out: dict[str, torch.Tensor] = {}
+    if device.type != "cuda":
+        for items in groups.values():
+            for name, flat, shape in items:
+                out[name] = flat.view(shape).to(device)
+        return out
+    for dtype, items in groups.items():
+        step = max(1, UPLOAD_ALIGN_BYTES // torch.empty((), dtype=dtype).element_size())
+        offsets, total = [], 0
+        for _name, flat, _shape in items:
+            offsets.append(total)
+            total += -(-flat.numel() // step) * step
+        host = torch.zeros(
+            (total,), dtype=dtype, pin_memory=True
+        )  # the alignment padding is defined, never read
+        for (_name, flat, _shape), off in zip(items, offsets, strict=True):
+            host[off : off + flat.numel()].copy_(flat)
+        buf = torch.empty((total,), dtype=dtype, device=device)
+        buf.copy_(
+            host, non_blocking=True
+        )  # cudaMemcpyAsync; the pinned block is held until the copy has run
+        for (name, flat, shape), off in zip(items, offsets, strict=True):
+            out[name] = buf[off : off + flat.numel()].view(shape)
+    return out
+
+
 def _as_cu_seqlens(cu_seqlens) -> tuple[int, ...]:
     if isinstance(cu_seqlens, torch.Tensor):
         if cu_seqlens.device.type != "cpu":
@@ -673,9 +739,14 @@ def lpt_makespan(chains: "list[tuple[int, int]]", machines: int) -> int:
     """Greedy LPT list-scheduling makespan (longest jobs first, each job to the least-loaded machine) of jobs given
     as ``(length, count)`` groups on ``machines`` identical machines (one CTA per SM).  Exact: a group of ``count``
     equal jobs is placed by water filling, which is the greedy's result for identical jobs (it raises the least-loaded
-    machine each time); integer arithmetic throughout, order of equal-length groups irrelevant."""
+    machine each time); integer arithmetic throughout, order of equal-length groups irrelevant.  The machines are
+    held as a multiset ``load -> count`` (the greedy's result depends on the loads only, not on which machine
+    carries which; the filling leaves a handful of distinct loads), so a level query costs the number of distinct
+    loads instead of the SM count."""
     machines = int(machines)
-    loads = [0] * machines
+    if machines < 1:
+        raise ValueError(f"lpt_makespan: machines must be >= 1, got {machines}")
+    loads: dict[int, int] = {0: machines}
     for L, m in sorted(chains, reverse=True):
         L, m = int(L), int(m)
         if L <= 0 or m <= 0:
@@ -684,7 +755,11 @@ def lpt_makespan(chains: "list[tuple[int, int]]", machines: int) -> int:
         def needed(
             level: int,
         ) -> int:  # jobs that raise every machine to at least `level`
-            return sum(-(-(level - load) // L) for load in loads if load < level)
+            return sum(
+                cnt * (-(-(level - load) // L))
+                for load, cnt in loads.items()
+                if load < level
+            )
 
         lo = min(loads)
         hi = lo + (m + 1) * L  # needed(hi) >= m + 1 from the least-loaded machine alone
@@ -694,12 +769,22 @@ def lpt_makespan(chains: "list[tuple[int, int]]", machines: int) -> int:
                 lo = mid
             else:
                 hi = mid - 1
-        counts = [(-(-(lo - load) // L) if load < lo else 0) for load in loads]
-        rest = m - sum(counts)
-        loads = [load + c * L for load, c in zip(loads, counts, strict=True)]
-        if rest:  # the leftover jobs (fewer than the machines at `lo`) go to the least-loaded machines, one each
-            for i in sorted(range(machines), key=loads.__getitem__)[:rest]:
-                loads[i] += L
+        raised: dict[int, int] = {}
+        placed = 0
+        for load, cnt in loads.items():
+            c = -(-(lo - load) // L) if load < lo else 0
+            placed += cnt * c
+            raised[load + c * L] = raised.get(load + c * L, 0) + cnt
+        loads = raised
+        rest = m - placed
+        while rest:  # the leftover jobs (fewer than the machines at `lo`) go to the least-loaded machines, one each
+            low = min(loads)
+            take = min(rest, loads[low])
+            loads[low] -= take
+            if not loads[low]:
+                del loads[low]
+            loads[low + L] = loads.get(low + L, 0) + take
+            rest -= take
     return max(loads)
 
 
@@ -1708,50 +1793,44 @@ def _build_head_plan(ctx: KcpContext, HV: int, *, P: int | None = None) -> KcpHe
     )  # lever L-B's carry plane
     dev = ctx.device
     i32, i64 = torch.int32, torch.int64
-
-    def t(values, dtype=i32):
-        return torch.tensor(list(values), dtype=dtype, device=dev)
-
-    device_tables = {
-        "seg_chunk_start": t(seg_table),
-        "h0_index": t(h0_index),
-        "carry_index": t(carry_index),
-        "dht_index": t(dht_index),
-        "dcarry_index": t(dcarry_index),
-        "out_index": t(out_index),
-        "walk_seg_offset": t(walk_offset),
-        "walk_seg_tape": t(walk_tape),
-        "out_tile": torch.tensor(
-            [list(x) for x in out_tile], dtype=i32, device=dev
-        ).reshape(len(out_tile), HV),
-        "h0_tile": torch.tensor(
-            [list(x) for x in h0_tile], dtype=i32, device=dev
-        ).reshape(len(h0_tile), HV),
-        "dht_tile": torch.tensor(
-            [list(x) for x in dht_tile], dtype=i32, device=dev
-        ).reshape(len(dht_tile), HV),
-        "b1_d_tile_d": torch.tensor(
-            [list(x) for x in b1_d_tile_d], dtype=i32, device=dev
-        ).reshape(len(b1_d_tile_d), HV),
-        "b1_d_tile_dm": torch.tensor(
-            [list(x) for x in b1_d_tile_dm], dtype=i32, device=dev
-        ).reshape(len(b1_d_tile_dm), HV),
-        "b1_m_tile_dm": torch.tensor(
-            [list(x) for x in b1_m_tile_dm], dtype=i32, device=dev
-        ).reshape(len(b1_m_tile_dm), HV),
-        "fwd_chain_start": t(fwd_start),
-        "fwd_chain_doc": t(fwd_doc),
-        "fwd_m_off": t(fwd_m, i64),
-        "fwd_b_off": t(fwd_b, i64),
-        "fwd_out_off": t(fwd_out, i64),
-        "adj_chain_start": t(adj_start),
-        "adj_chain_doc": t(adj_doc),
-        "adj_d_off_d": t(adj_dd, i64),
-        "adj_d_off_dm": t(adj_ddm, i64),
-        "adj_m_off_b1": t(adj_mb1, i64),
-        "adj_m_off_c1": t(adj_mc1, i64),
-        "adj_out_off": t(adj_out, i64),
+    # every table of the head plan in one asynchronous upload (upload_tables: no synchronizing call)
+    tiles = {
+        "out_tile": out_tile,
+        "h0_tile": h0_tile,
+        "dht_tile": dht_tile,
+        "b1_d_tile_d": b1_d_tile_d,
+        "b1_d_tile_dm": b1_d_tile_dm,
+        "b1_m_tile_dm": b1_m_tile_dm,
     }
+    device_tables = upload_tables(
+        {
+            "seg_chunk_start": (seg_table, i32, None),
+            "h0_index": (h0_index, i32, None),
+            "carry_index": (carry_index, i32, None),
+            "dht_index": (dht_index, i32, None),
+            "dcarry_index": (dcarry_index, i32, None),
+            "out_index": (out_index, i32, None),
+            "walk_seg_offset": (walk_offset, i32, None),
+            "walk_seg_tape": (walk_tape, i32, None),
+            **{
+                name: ([list(x) for x in rows], i32, (len(rows), HV))
+                for name, rows in tiles.items()
+            },
+            "fwd_chain_start": (fwd_start, i32, None),
+            "fwd_chain_doc": (fwd_doc, i32, None),
+            "fwd_m_off": (fwd_m, i64, None),
+            "fwd_b_off": (fwd_b, i64, None),
+            "fwd_out_off": (fwd_out, i64, None),
+            "adj_chain_start": (adj_start, i32, None),
+            "adj_chain_doc": (adj_doc, i32, None),
+            "adj_d_off_d": (adj_dd, i64, None),
+            "adj_d_off_dm": (adj_ddm, i64, None),
+            "adj_m_off_b1": (adj_mb1, i64, None),
+            "adj_m_off_c1": (adj_mc1, i64, None),
+            "adj_out_off": (adj_out, i64, None),
+        },
+        dev,
+    )
     return KcpHeadPlan(
         HV=HV,
         Hg=Hg,
@@ -2088,10 +2167,6 @@ def build_kcp_context(
     tables_cpu = chunk_tables(local_cu)
     nc_max, nc_pad, rows = chunk_geometry(T_r, n_frag)
     i32 = torch.int32
-    tables = {
-        name: torch.tensor(list(values), dtype=i32, device=device)
-        for name, values in tables_cpu.items()
-    }
     flags = [
         (FLAG_CROSSING_IN if f.crossing_in else 0)
         | (FLAG_CROSSING_OUT if f.crossing_out else 0)
@@ -2101,23 +2176,38 @@ def build_kcp_context(
     frag_rows = [
         [f.doc, f.off, f.length, fl] for f, fl in zip(mine, flags, strict=True)
     ]
-    frag_table = torch.tensor(frag_rows, dtype=i32, device=device).reshape(n_frag, 4)
     halo_plan = _halo_plan(part, rank, halo, local_cu)
-    halo_tables = {
-        "hist_row_off": torch.tensor(
-            [list(r) for r in halo_plan.hist_row_off], dtype=i32, device=device
-        ).reshape(n_frag, halo),
-        "tail_row_off": torch.tensor(
-            [list(r) for r in halo_plan.tail_row_off], dtype=i32, device=device
-        ).reshape(n_frag, halo),
-        "head_row_off": torch.tensor(
-            [[list(c) for c in r] for r in halo_plan.head_row_off],
-            dtype=i32,
-            device=device,
-        ).reshape(n_frag, halo, halo),
-        "hist_index": torch.tensor(
-            list(halo_plan.hist_index), dtype=torch.int64, device=device
+    # every table of the context in one asynchronous upload (upload_tables: no synchronizing call)
+    extra: dict[str, TableSpec] = {
+        "frag_table": (frag_rows, i32, (n_frag, 4)),
+        "hist_row_off": (
+            [list(r) for r in halo_plan.hist_row_off],
+            i32,
+            (n_frag, halo),
         ),
+        "tail_row_off": (
+            [list(r) for r in halo_plan.tail_row_off],
+            i32,
+            (n_frag, halo),
+        ),
+        "head_row_off": (
+            [[list(c) for c in r] for r in halo_plan.head_row_off],
+            i32,
+            (n_frag, halo, halo),
+        ),
+        "hist_index": (list(halo_plan.hist_index), torch.int64, None),
+        "cu_seqlens_local": (list(local_cu), i32, None),
+    }
+    assert not set(extra) & set(tables_cpu), set(extra) & set(tables_cpu)
+    uploaded = upload_tables(
+        {**{name: (values, i32, None) for name, values in tables_cpu.items()}, **extra},
+        device,
+    )
+    tables = {name: uploaded[name] for name in tables_cpu}
+    frag_table = uploaded["frag_table"]
+    halo_tables = {
+        name: uploaded[name]
+        for name in ("hist_row_off", "tail_row_off", "head_row_off", "hist_index")
     }
     return KcpContext(
         partition=part,
@@ -2131,7 +2221,7 @@ def build_kcp_context(
         T_r=T_r,
         n_frag=n_frag,
         cu_seqlens_local_cpu=local_cu,
-        cu_seqlens_local=torch.tensor(list(local_cu), dtype=i32, device=device),
+        cu_seqlens_local=uploaded["cu_seqlens_local"],
         frag_table=frag_table,
         in_slot=in_slot_all[rank],
         out_slot=out_slot_all[rank],
@@ -2199,6 +2289,8 @@ __all__ = [
     "near_equal",
     "owner_of_head",
     "seg_chunk_start",
+    "upload_tables",
+    "UPLOAD_ALIGN_BYTES",
     "WAVE_FILL_N_FRAG_MAX",
     "WAVE_MIN_NC_MAX_FRAG",
     "WAVE_N_FRAG_MAX",
