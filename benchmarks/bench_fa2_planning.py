@@ -26,15 +26,19 @@ def main():
     parser.add_argument("--dtype", choices=("float16", "bfloat16"), default="float16")
     parser.add_argument("--causal", action="store_true")
     parser.add_argument("--samples", type=int, default=101)
+    parser.add_argument("--warmup-ms", type=int, default=500)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--runs-per-plan", type=int, nargs="+", default=[0, 1, 8, 32])
     args = parser.parse_args()
     if (
         args.samples <= 0
+        or args.warmup_ms < 0
         or args.output.exists()
         or any(n < 0 for n in args.runs_per_plan)
     ):
-        parser.error("use positive samples and a fresh output filename")
+        parser.error(
+            "use positive samples, nonnegative warmup and a fresh output filename"
+        )
     torch.set_num_threads(4)
     torch.manual_seed(20261027)
     dtype = getattr(torch, args.dtype)
@@ -97,6 +101,19 @@ def main():
     torch.testing.assert_close(lse.cpu(), reference_lse, rtol=1e-2, atol=1e-2)
     rows = []
     for runs in args.runs_per_plan:
+        # A single-run warmup does not stabilize the longer run loops. Warm
+        # the same plan/run/prime sequence before timing each workload.
+        warmup_start = time.perf_counter_ns()
+        warmup_iterations = 0
+        while time.perf_counter_ns() - warmup_start < args.warmup_ms * 1_000_000:
+            run()
+            torch.cuda.synchronize()
+            wrapper.plan(**metadata)
+            for _ in range(runs):
+                run()
+            torch.cuda.synchronize()
+            warmup_iterations += 1
+        warmup_us = (time.perf_counter_ns() - warmup_start) / 1000
         samples = []
         for _ in range(args.samples):
             run()
@@ -112,6 +129,8 @@ def main():
                 runs_per_plan=runs,
                 median_us=statistics.median(samples),
                 samples_us=samples,
+                warmup_iterations=warmup_iterations,
+                warmup_us=warmup_us,
             )
         )
     torch.testing.assert_close(out.cpu().float(), reference, rtol=1e-2, atol=1e-2)
