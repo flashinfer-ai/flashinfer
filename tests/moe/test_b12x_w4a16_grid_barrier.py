@@ -37,7 +37,10 @@ def _compile_barrier_probe(arch, blocks, threads, rounds):
     @cute.jit
     def launch(data, observed, locks, stream):
         kernel(data, observed, locks).launch(
-            grid=(blocks, 1, 1), block=(threads, 1, 1), stream=stream
+            grid=(blocks, 1, 1),
+            block=(threads, 1, 1),
+            cooperative=True,
+            stream=stream,
         )
 
     tensors = [
