@@ -4647,6 +4647,10 @@ class W4A16FusedMoeKernel:
         grid_x: Int32,
     ):
         cute.arch.sync_threads()
+        # Publish all CTA writes before incrementing the arrival counter. The
+        # last CTA acquires the arrival chain before releasing the new sense;
+        # its fence alone cannot release writes from earlier arriving CTAs.
+        threadfence()
         if tid == Int32(0):
             count_addr = get_ptr_as_int64(locks_i32_flat, Int32(self.barrier_count_off))
             sense_addr = get_ptr_as_int64(locks_i32_flat, Int32(self.barrier_sense_off))
