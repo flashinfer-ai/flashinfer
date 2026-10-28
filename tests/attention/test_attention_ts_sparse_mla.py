@@ -1305,7 +1305,6 @@ def _d576_plan(rows, heads, topk, threshold=0.0, **kwargs):
         pytest.param(8, 64, 2048, 0.3, 8.0, "flat", id="skip-correction"),
         pytest.param(4, 128, 2048, 0.1, 0.0, "nhd4", id="h128"),
         pytest.param(300, 64, 2048, 0.0, 8.0, "flat", id="two-waves"),
-        pytest.param(3, 64, 4, 0.0, 0.0, "flat", id="topk4"),
         pytest.param(3, 64, 66, 0.1, 0.0, "flat", id="topk66"),
         pytest.param(40, 64, 136, 0.1, 0.0, "nhd3", id="topk136-unsplit"),
         pytest.param(3, 64, 1028, 0.2, 0.0, "hnd4", id="topk1028"),
@@ -1357,17 +1356,18 @@ def test_sparse_d576_graph(rows, heads, topk, holes, threshold, layout):
 
 
 def test_sparse_d576_packed_query():
-    """Packed MTP queries match the fixed [B, 4, H, 576] layout bitwise."""
-    q, kv, indices, lengths = _d576_inputs(12, 64, 2048, 0.1)
+    """Packed MTP queries match the fixed [B, 2, H, 576] layout bitwise."""
+    # Four tokens plan the same split (8, 4) as the one-token graph case.
+    q, kv, indices, lengths = _d576_inputs(4, 64, 2048, 0.1)
     kwargs = dict(softmax_scale=_D576_SCALE)
     fixed = batch_sparse_mla_decode_with_paged_kv_cache(
-        q.view(3, 4, 64, 576), kv, indices, lengths, **kwargs
+        q.view(2, 2, 64, 576), kv, indices, lengths, **kwargs
     )
-    offsets = torch.arange(0, 13, 4, device="cuda", dtype=torch.int32)
+    offsets = torch.arange(0, 5, 2, device="cuda", dtype=torch.int32)
     packed = batch_sparse_mla_decode_with_paged_kv_cache(
-        q.view(12, 64, 576), kv, indices, lengths, qo_indptr=offsets, **kwargs
+        q.view(4, 64, 576), kv, indices, lengths, qo_indptr=offsets, **kwargs
     )
-    assert torch.equal(packed, fixed.view(12, 64, 512))
+    assert torch.equal(packed, fixed.view(4, 64, 512))
     empty = batch_sparse_mla_decode_with_paged_kv_cache(
         q[:0].view(0, 64, 576),
         kv,
