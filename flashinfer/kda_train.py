@@ -265,7 +265,8 @@ def kda_train_arena(
     three state blocks on the floor, the same gradients bitwise, some speed cost (see the package README).
     ``batch_tokens`` runs the forward and the backward over groups of whole, contiguous documents of at most that
     many tokens (and at most ``max_docs_per_batch`` documents, which needs ``batch_tokens``) in an arena sized for
-    the largest group; the calls then take ``doc_lengths``.  Bitwise the same results, except that an exactly-zero
+    the largest group (at ``tail_passes``; each group runs its tail in the fewest passes up to that which fit the
+    arena); the calls then take ``doc_lengths``.  Bitwise the same results, except that an exactly-zero
     ``u`` / ``w`` entry of a chunk whose pair partner changed may change sign; refused on the rows with at most four
     (document, head) chains on the segmented route."""
     from .experimental.cake_kda_train import cake_backend

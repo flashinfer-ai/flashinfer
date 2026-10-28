@@ -4113,7 +4113,13 @@ def test_the_arena_options_never_synchronize_the_host(device, manifest) -> None:
         lean = cake_backend.KdaArena(lean=True, tail_passes=4)
         batched = cake_backend.KdaArena(lean=True, tail_passes=4, batch_tokens=budget)
         assert len(plan.batches(batched, lengths)) == 2
-        packing = cake_backend._host_packing(plan, batched, tuple(lengths))
+        packing = cake_backend._host_packing(
+            plan,
+            batched,
+            tuple(lengths),
+            nbytes=plan.arena_bytes(arena=batched, doc_lengths=lengths),
+            save_mode="light",
+        )
         assert tuple(b is not None for b in packing.blocks) == runs
         options = (
             ((lean, None), (batched, lengths)) if runs[0] else ((batched, lengths),)
@@ -5391,13 +5397,40 @@ def _group_rows_sliced(path: str) -> bool:
     return path not in ("fwd_nosave", "replay")
 
 
-def _expected_batched_launches(p, arena, lengths, path, *, tail_passes=1):
+def _fewest_tail_passes(pb, arena, nbytes, save_mode="light") -> int:
+    """The tail passes of a group's backward (group plan ``pb``) on an arena of ``nbytes``, the package's rule
+    restated: the fewest up to the option's ``tail_passes`` whose lean layouts fit (``bwd_tape_lean`` on a
+    tape-mode workspace, also ``bwd_lean`` on a light one), else the option's."""
+    modes = ("bwd_tape_lean",) if save_mode == "tape" else ("bwd_lean", "bwd_tape_lean")
+    return next(
+        (
+            t
+            for t in range(1, arena.tail_passes)
+            if all(pb.workspace_bytes(mode, t) <= nbytes for mode in modes)
+        ),
+        arena.tail_passes,
+    )
+
+
+def _group_passes(p, arena, lengths, path, *, nbytes, save_mode="light") -> list[int]:
+    """Per group of a batched call on ``path``, the tail passes of its backward (:func:`_fewest_tail_passes`)."""
+    return [
+        _fewest_tail_passes(
+            p.batch_plan(b, tape=_group_rows_sliced(path)), arena, nbytes, save_mode
+        )
+        for b in p.batches(arena, lengths)
+    ]
+
+
+def _expected_batched_launches(p, arena, lengths, path, *, passes=None):
     """The launch order of a batched call: on the saving forward the whole problem's tables by the saved-set
     paths' table program, then every group's forward list (its own tables where the row dispatches a table program
     on the forward); on the backward every group's list with the group's tables first (the saved set's describe the
-    whole problem) and the tail once per range of the group's chunk bound."""
+    whole problem) and the tail once per range of the group's chunk bound at the group's tail passes (``passes``,
+    one per group: :func:`_group_passes`; ``None``: one pass each)."""
     seq = []
     batches = p.batches(arena, lengths)
+    passes = [1] * len(batches) if passes is None else passes
     if path in ("fwd", "fwd_nosave"):
         if path == "fwd" and p.dispatched("table", "light"):
             seq.append(p.record("table", "light"))
@@ -5407,20 +5440,22 @@ def _expected_batched_launches(p, arena, lengths, path, *, tail_passes=1):
             pb = p.batch_plan(b, tape=_group_rows_sliced(path))
             seq += _expected_launches(pb, path)
         return seq
-    for b in batches:
+    for b, t in zip(batches, passes, strict=True):
         seq += _expected_launches(
             p.batch_plan(b, tape=_group_rows_sliced(path)),
             path,
             saved_tables=False,
-            tail_passes=tail_passes,
+            tail_passes=t,
         )
     return seq
 
 
-def _check_group_launches(launched, p, arena, lengths, path, *, tail_passes=1) -> None:
+def _check_group_launches(launched, p, arena, lengths, path, *, passes=None) -> None:
     """Every launch of a group carries the group's scalars (``num_seqs``, ``num_chunks_pad``) and one of the
-    group plan's grids; the tail passes carry ``num_seqs = 0`` and their range's chunk count."""
+    group plan's grids; the tail passes (``passes``, one per group, ``None``: one pass each) carry
+    ``num_seqs = 0`` and their range's chunk count."""
     batches = p.batches(arena, lengths)
+    passes = [1] * len(batches) if passes is None else passes
     forward = path in ("fwd", "fwd_nosave")
     pos = 0
     if forward and path == "fwd" and p.dispatched("table", "light"):
@@ -5428,24 +5463,22 @@ def _check_group_launches(launched, p, arena, lengths, path, *, tail_passes=1) -
         for name, grid, num_seqs, nc in launched[:head]:
             assert (num_seqs, nc) == (p.N, p.NC_pad) and grid in p.grids[name], name
         pos = head
-    for b in batches:
+    for b, t in zip(batches, passes, strict=True):
         pb = p.batch_plan(b, tape=_group_rows_sliced(path))
         expected = (
             _expected_launches(pb, path)
             if forward
-            else _expected_launches(
-                pb, path, saved_tables=False, tail_passes=tail_passes
-            )
+            else _expected_launches(pb, path, saved_tables=False, tail_passes=t)
         )
         group = launched[pos : pos + len(expected)]
         pos += len(expected)
         assert [n for n, *_ in group] == expected
         tail_names = set() if forward else set(_tail_records(pb, path))
         width = len(tail_names)
-        ranges = cake_backend._tail_ranges(pb.NC_pad, tail_passes)
+        ranges = cake_backend._tail_ranges(pb.NC_pad, t)
         tails = []
         for name, grid, num_seqs, nc in group:
-            if name in tail_names and tail_passes > 1:
+            if name in tail_names and t > 1:
                 tails.append((name, grid, num_seqs, nc))
                 continue
             assert (num_seqs, nc) == (pb.N, pb.NC_pad), (name, b)
@@ -5468,26 +5501,29 @@ def _check_group_launches(launched, p, arena, lengths, path, *, tail_passes=1) -
     assert pos == len(launched)
 
 
-def _check_tail_counts(counts, p, arena, lengths, path, *, tail_passes=1) -> None:
+def _check_tail_counts(counts, p, arena, lengths, path, *, passes=None) -> None:
     """The one-entry chunk counts of a batched backward's tail launches (``seq_chunk_start`` at ``num_seqs = 0``, in
-    launch order): every launch of a group's range ``c0`` reads ``clamp(real_b - c0, 0, ceil(NC_pad_b / B))``, the
-    device rule the host reproduces from ``doc_lengths``; none without a tail split."""
-    if tail_passes == 1:
-        assert counts == []
-        return
+    launch order): every launch of a group's range ``c0`` reads ``clamp(real_b - c0, 0, ceil(NC_pad_b / b))`` at
+    the group's tail passes ``b`` (``passes``, one per group, ``None``: one pass each), the device rule the host
+    reproduces from ``doc_lengths``; none for a group in one pass."""
+    batches = p.batches(arena, lengths)
+    passes = [1] * len(batches) if passes is None else passes
     torch.cuda.synchronize()
     pos = 0
-    for b in p.batches(arena, lengths):
+    for b, t in zip(batches, passes, strict=True):
+        if t == 1:
+            continue
         pb = p.batch_plan(b, tape=_group_rows_sliced(path))
         width = len(_tail_records(pb, path))
         real = _real_chunks(lengths[b.d0 : b.d1])
-        ranges = cake_backend._tail_ranges(pb.NC_pad, tail_passes)
+        ranges = cake_backend._tail_ranges(pb.NC_pad, t)
         for c0, _length in ranges:
             want = min(max(real - c0, 0), ranges[0][1])
             for _ in range(width):
                 assert counts[pos].tolist() == [want], (b, c0)
                 pos += 1
-    assert pos == len(counts) > 0
+    assert pos == len(counts)
+    assert (pos > 0) == any(t > 1 for t in passes)
 
 
 def _real_chunks(lengths) -> int:
@@ -5749,8 +5785,10 @@ def test_batched_arena_launches_per_group(device, manifest) -> None:
     """The batched call's launch list is every group's list in turn (the whole problem's tables first on the saving
     forward; the group's tables first on the backward), each launch at the group's scalars and grids (the saving
     forward's groups in the tape geometry: they write slices of the saved qg / w / u); the overlap pair's and the
-    two-level carry's epoch advances once per group through the shared counter; the tail passes read the host's
-    chunk counts of their ranges; the group tables are slices of the whole problem's."""
+    two-level carry's epoch advances once per group through the shared counter; every group runs its tail in the
+    fewest passes that fit the arena (groups in several passes and in one, within a call too), whose launches read
+    the host's chunk counts of their ranges; the group tables are slices of the whole problem's."""
+    seen = {"multi": 0, "one_pass": 0, "mixed": 0}
     for lengths, heads in (
         ((63, 1, 65), 4),
         ((100, 0, 300), 2),
@@ -5851,12 +5889,22 @@ def test_batched_arena_launches_per_group(device, manifest) -> None:
                 )
                 _check_bits(got, ref_grads, tag=case)
                 path = p.light_path
+                # every group's tail in the fewest passes up to t that fit the arena, as its view has it
+                passes = _group_passes(p, arena, lengths, path, nbytes=ws.bytes)
+                assert [
+                    ws.batch_view(b, tape=_group_rows_sliced(path)).tail_passes
+                    for b in batches
+                ] == passes, case
+                if t > 1:
+                    seen["multi"] += sum(x > 1 for x in passes)
+                    seen["one_pass"] += passes.count(1)
+                    seen["mixed"] += len(set(passes)) > 1
                 names = [n for n, *_ in launched]
                 assert names == _expected_batched_launches(
-                    p, arena, lengths, path, tail_passes=t
+                    p, arena, lengths, path, passes=passes
                 ), case
-                _check_group_launches(launched, p, arena, lengths, path, tail_passes=t)
-                _check_tail_counts(counts, p, arena, lengths, path, tail_passes=t)
+                _check_group_launches(launched, p, arena, lengths, path, passes=passes)
+                _check_tail_counts(counts, p, arena, lengths, path, passes=passes)
                 if t == 1:  # the replay group by group
                     launched.clear()
                     got = cake_backend.chunk_kda_bwd(
@@ -5899,6 +5947,7 @@ def test_batched_arena_launches_per_group(device, manifest) -> None:
                         and not tb[1][real_b : b.NC_pad].any()
                     )
                 del ws
+    assert min(seen.values()) > 0, seen
 
 
 def test_batched_arena_on_a_row_that_saves_the_states(device, manifest) -> None:
@@ -6440,9 +6489,10 @@ def test_host_chain_ranks_and_block_runs_follow_the_tables_rule() -> None:
     and a batched packing (``_Packing``) holds the kernels' block layout: per group the whole problem's first block
     where the group's blocks are one run of the whole problem's, else their indices, and the tail passes' chunk
     counts of the device rule at both of the group's chunk bounds.  On every architecture, over the rank packs and
-    their groupings; the issue's two groups of the lean four-pass budget are the runs [0, 76) and [76, 152) on a
-    152-SM ``sm_100a``, and the serial route has no blocks."""
-    seen = {"run": 0, "index": 0, "tail": 0}
+    their groupings, with the counts at each group's own tail passes (:func:`_fewest_tail_passes`; none for a
+    group in one pass); the issue's two groups of the lean four-pass budget are the runs [0, 76) and [76, 152) on
+    a 152-SM ``sm_100a``, and the serial route has no blocks."""
+    seen = {"run": 0, "index": 0, "tail": 0, "one_pass": 0}
     for lengths, heads in RANK_PACKS:
         lengths = tuple(lengths)
         S, N = sum(lengths), len(lengths)
@@ -6459,7 +6509,10 @@ def test_host_chain_ranks_and_block_runs_follow_the_tables_rule() -> None:
             for kw in groupings:
                 for t in (1, 4):
                     arena = cake_backend.KdaArena(lean=t > 1, tail_passes=t, **kw)
-                    packing = cake_backend._host_packing(p, arena, lengths)
+                    nbytes = p.arena_bytes(arena=arena, doc_lengths=lengths)
+                    packing = cake_backend._host_packing(
+                        p, arena, lengths, nbytes=nbytes, save_mode="light"
+                    )
                     case = (lengths, arch, kw, t)
                     assert packing.batches == p.batches(arena, lengths), case
                     assert packing.words[:N] == lengths and packing.P == p.P, case
@@ -6478,10 +6531,13 @@ def test_host_chain_ranks_and_block_runs_follow_the_tables_rule() -> None:
                             seen["index"] += 1
                         real = _real_chunks(lengths[b.d0 : b.d1])
                         for nc_pad in (b.NC_pad, b.NC_pad_tape):
-                            if t == 1:
+                            pb = p.batch_plan(b, tape=nc_pad != b.NC_pad)
+                            passes = _fewest_tail_passes(pb, arena, nbytes)
+                            if passes == 1:
                                 assert (i, nc_pad) not in packing.tail_at, (case, b)
+                                seen["one_pass"] += t > 1
                                 continue
-                            ranges = cake_backend._tail_ranges(nc_pad, t)
+                            ranges = cake_backend._tail_ranges(nc_pad, passes)
                             want = [
                                 min(max(real - c0, 0), ranges[0][1])
                                 for c0, _n in ranges
@@ -6496,14 +6552,26 @@ def test_host_chain_ranks_and_block_runs_follow_the_tables_rule() -> None:
     S = sum(ISSUE_LENGTHS)
     p = cake_backend.plan(S, len(ISSUE_LENGTHS), ISSUE_HEADS, 152, "sm_100a")
     arena = cake_backend.KdaArena(lean=True, tail_passes=4, batch_tokens=200000)
-    packing = cake_backend._host_packing(p, arena, ISSUE_LENGTHS)
+    packing = cake_backend._host_packing(
+        p,
+        arena,
+        ISSUE_LENGTHS,
+        nbytes=p.arena_bytes(arena=arena, doc_lengths=ISSUE_LENGTHS),
+        save_mode="light",
+    )
     assert [(b.d0, b.d1, b.c0) for b in packing.batches] == [(0, 2, 0), (2, 4, 2981)]
     assert (p.P, p.NSEG, packing.blocks, packing.index) == (38, 152, (0, 76), ())
     # the split pack: its first group by index, its second one run from the second chain
     for arch in ARCHES:
         p = cake_backend.plan(sum(SPLIT_LENGTHS), 4, 4, 148, arch)
         arena = cake_backend.KdaArena(batch_tokens=SPLIT_LENGTHS[0] + SPLIT_LENGTHS[1])
-        packing = cake_backend._host_packing(p, arena, SPLIT_LENGTHS)
+        packing = cake_backend._host_packing(
+            p,
+            arena,
+            SPLIT_LENGTHS,
+            nbytes=p.arena_bytes(arena=arena, doc_lengths=SPLIT_LENGTHS),
+            save_mode="light",
+        )
         assert [(b.d0, b.d1) for b in packing.batches] == [(0, 2), (2, 4)]
         assert packing.blocks == (None, p.P), arch
         assert packing.index == tuple(range(p.P)) + tuple(range(3 * p.P, 4 * p.P))
@@ -6511,9 +6579,109 @@ def test_host_chain_ranks_and_block_runs_follow_the_tables_rule() -> None:
     p = cake_backend.plan(129, 3, 64, 148, ARCHES[0])
     assert p.recur == "serial"
     arena = cake_backend.KdaArena(batch_tokens=65)
-    packing = cake_backend._host_packing(p, arena, (63, 1, 65))
+    packing = cake_backend._host_packing(
+        p,
+        arena,
+        (63, 1, 65),
+        nbytes=p.arena_bytes(arena=arena, doc_lengths=(63, 1, 65)),
+        save_mode="light",
+    )
     assert packing.blocks == (None, None)
     assert packing.index == () and not packing.index_at
+
+
+def test_batched_groups_take_the_fewest_tail_passes_that_fit() -> None:
+    """Under a batched option with ``tail_passes = B`` every group runs its tail in the fewest passes up to ``B``
+    whose lean layouts at the group's geometry fit the arena (``_group_tail_passes``, which the group views and the
+    host's chunk counts take): the restated rule's count, between one and ``B``, fitting the arena, no fewer
+    fitting; the bound of every group (a larger arena) never takes more than the exact groups.  Over the rank packs
+    and their groupings on every architecture, light and tape, groups in one pass and in several, within one call
+    too.  The issue's pack on a 152-SM ``sm_100a`` under the lean four-pass budget of two groups: the first group,
+    which sizes the arena, keeps four passes and the second fits one (three and one on the bound's arena), so the
+    host's counts are the first group's alone and the tail launches five times per stage instead of eight."""
+    seen = {"multi": 0, "one_pass": 0, "mixed": 0}
+    for lengths, heads in RANK_PACKS:
+        lengths = tuple(lengths)
+        S, N = sum(lengths), len(lengths)
+        groupings = list(RANK_GROUPINGS.get(lengths, ()))
+        groupings += [kw for _label, kw in _partitions(lengths) if kw not in groupings]
+        for arch in ARCHES:
+            p = cake_backend.plan(S, N, heads, 148, arch)
+            for kw in groupings:
+                for t in (1, 2, 3, 4):
+                    arena = cake_backend.KdaArena(lean=t > 1, tail_passes=t, **kw)
+                    batches = p.batches(arena, lengths)
+                    for save_mode in ("light", "tape"):
+                        modes = ("bwd_tape_lean",)
+                        if save_mode == "light":
+                            modes += ("bwd_lean",)
+                        sized = {
+                            sizing: p.arena_bytes(
+                                save_mode=save_mode, arena=arena, doc_lengths=doc
+                            )
+                            for sizing, doc in (("exact", lengths), ("bound", None))
+                        }
+                        got = {}
+                        for (sizing, nbytes), b in itertools.product(
+                            sized.items(), batches
+                        ):
+                            for nc_pad in sorted({b.NC_pad, b.NC_pad_tape}):
+                                pb = p.batch_plan(b, tape=nc_pad != b.NC_pad)
+                                passes = cake_backend._group_tail_passes(
+                                    p,
+                                    b,
+                                    nc_pad,
+                                    arena,
+                                    nbytes=nbytes,
+                                    save_mode=save_mode,
+                                )
+                                case = (lengths, arch, kw, t, save_mode, sizing, b)
+                                fits = [
+                                    all(
+                                        pb.workspace_bytes(m, x) <= nbytes
+                                        for m in modes
+                                    )
+                                    for x in range(1, t + 1)
+                                ]
+                                assert passes == _fewest_tail_passes(
+                                    pb, arena, nbytes, save_mode
+                                ), case
+                                assert 1 <= passes <= t and fits[passes - 1], case
+                                assert not any(fits[: passes - 1]), case
+                                got[(sizing, b, nc_pad)] = passes
+                        for (sizing, b, nc_pad), passes in got.items():
+                            assert passes <= got[("exact", b, nc_pad)], (lengths, t)
+                            if t > 1 and sizing == "exact":
+                                seen["multi" if passes > 1 else "one_pass"] += 1
+                        if t > 1:
+                            seen["mixed"] += (
+                                len({got[("exact", b, b.NC_pad)] for b in batches}) > 1
+                            )
+    assert min(seen.values()) > 0, seen
+    # the issue's pack: four passes for the group that sizes the arena, one for the other
+    S = sum(ISSUE_LENGTHS)
+    p = cake_backend.plan(S, len(ISSUE_LENGTHS), ISSUE_HEADS, 152, "sm_100a")
+    arena = cake_backend.KdaArena(lean=True, tail_passes=4, batch_tokens=200000)
+    batches = p.batches(arena, ISSUE_LENGTHS)
+    assert [(b.NC_pad, b.NC_pad_tape) for b in batches] == [(2982, 2982), (1108, 1108)]
+    light = p.arena_bytes(arena=arena, doc_lengths=ISSUE_LENGTHS)
+    assert light == 2212534272
+    assert p.batch_plan(batches[0]).workspace_bytes("bwd_lean", 3) > light
+    for save_mode in ("light", "tape"):
+        for doc, want in ((ISSUE_LENGTHS, [4, 1]), (None, [3, 1])):
+            nbytes = p.arena_bytes(save_mode=save_mode, arena=arena, doc_lengths=doc)
+            got = [
+                cake_backend._group_tail_passes(
+                    p, b, b.NC_pad, arena, nbytes=nbytes, save_mode=save_mode
+                )
+                for b in batches
+            ]
+            assert got == want, (save_mode, doc, got)
+    packing = cake_backend._host_packing(
+        p, arena, ISSUE_LENGTHS, nbytes=light, save_mode="light"
+    )
+    assert packing.tail_at == {(0, 2982): (4, 4)}
+    assert packing.words[4:8] == (746, 746, 746, 743)
 
 
 # the device rows of the host ranks: every seq_order writer (table_v3 and fwd_intra_v14 on the segmented route up to
@@ -6588,7 +6756,8 @@ def test_batched_block_runs_give_the_default_results_bitwise(
     ``hseg`` (its offsets / transfers two contiguous copies; the tape's transfers one) and scatters the other groups'
     by index; the backward reads views of a one-run group's saved ``hseg`` and transfers (``light_states``: its pass
     2 bound to the arena's ``seg_state``, poisoned here with the rest of the arena) or ``seg_m`` (``tape``) and
-    gathers the others'; the lean tail passes take the host's chunk counts.  Over the issue's pack (two groups, the
+    gathers the others'; the lean tail passes take the host's chunk counts, a group whose one-pass lean layout fits
+    the arena running its tail in one pass.  Over the issue's pack (two groups, the
     second at an odd chunk; one document per group), a pack above the size rule with a group that is not one run,
     tied chunk counts, zero-length documents, interleaved ties, one document and a small pack with a group that is
     not one run, under their groupings.  The saved state blocks start as NaN (every block must be written) and
@@ -6656,8 +6825,17 @@ def test_batched_block_runs_give_the_default_results_bitwise(
                         assert (packing.blocks[i] is not None) == one_run, (case, b)
                         key = (path, "run" if one_run else "index")
                         hits[key] = hits.get(key, 0) + 1
-                        if packing.tail_counts(i, b.NC_pad_tape) is not None:
+                        # the group's tail in its own passes, with the host's counts where it takes several
+                        group_passes = ws.batch_view(b, tape=True).tail_passes
+                        assert group_passes == _fewest_tail_passes(
+                            ws.batch_view(b, tape=True).plan, arena, ws.bytes, save_mode
+                        ), (case, b)
+                        counted = packing.tail_counts(i, b.NC_pad_tape) is not None
+                        assert counted == (group_passes > 1), (case, b)
+                        if counted:
                             hits["tail"] = hits.get("tail", 0) + 1
+                        elif t > 1:
+                            hits["one_pass"] = hits.get("one_pass", 0) + 1
                     count = [0]
 
                     def same(a, b_, what, _case=case, _count=count):
@@ -6725,6 +6903,7 @@ def test_batched_block_runs_give_the_default_results_bitwise(
         ("tape", "run"),
         ("tape", "index"),
         "tail",
+        "one_pass",
     ):
         assert hits.get(key, 0) > 0, (key, hits)
     assert total > 0
@@ -6732,9 +6911,9 @@ def test_batched_block_runs_give_the_default_results_bitwise(
 
 def test_a_warmed_batched_workspace_captures_its_calls(device, manifest) -> None:
     """A caller-owned batched workspace that ran its ``doc_lengths`` once holds their device copy (the lengths, the
-    tail counts and the block indices of its group that is not one run), so a forward and a backward captured in
-    one CUDA graph make no copy, and the replay gives the eager results bit for bit; a workspace without the copy
-    still refuses the capture."""
+    tail counts of its group in several passes and the block indices of its group that is not one run), so a
+    forward and a backward captured in one CUDA graph make no copy, and the replay gives the eager results bit for
+    bit; a workspace without the copy still refuses the capture."""
     lengths, heads = (640, 64, 320), 2
     S, N = sum(lengths), len(lengths)
     inputs = make_inputs(lengths, heads, device)
@@ -6757,7 +6936,14 @@ def test_a_warmed_batched_workspace_captures_its_calls(device, manifest) -> None
     packing = ws._doc_cache[lengths]
     assert packing.blocks[0] is None and packing.blocks[1] is not None
     assert packing.words_dev is not None and packing.index_dev is not None
-    assert packing.tail_counts(1, packing.batches[1].NC_pad_tape) is not None
+    counted = [
+        packing.tail_counts(i, b.NC_pad_tape) is not None
+        for i, b in enumerate(packing.batches)
+    ]
+    assert counted == [
+        ws.batch_view(b, tape=True).tail_passes > 1 for b in packing.batches
+    ]
+    assert any(counted)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -6788,10 +6974,10 @@ def test_a_warmed_batched_workspace_captures_its_calls(device, manifest) -> None
 def test_a_batched_workspace_keeps_the_device_copy_its_graph_reads(
     device, manifest
 ) -> None:
-    """A captured graph reads the device copy of its ``doc_lengths`` (the lengths, the tail counts and the block
-    indices of its group that is not one run) at each replay, so the workspace keeps that packing for its
-    lifetime: nine other packs run eagerly after the capture (the cache's eight and one more) evict the oldest of
-    them, never the captured one, and the replay still gives the eager results bit for bit."""
+    """A captured graph reads the device copy of its ``doc_lengths`` (the lengths, the tail counts of the groups in
+    several passes and the block indices of its group that is not one run) at each replay, so the workspace keeps
+    that packing for its lifetime: nine other packs run eagerly after the capture (the cache's eight and one more)
+    evict the oldest of them, never the captured one, and the replay still gives the eager results bit for bit."""
     lengths, heads = (640, 64, 320), 2
     others = [
         (640, 320, 64),
@@ -6808,8 +6994,11 @@ def test_a_batched_workspace_keeps_the_device_copy_its_graph_reads(
     assert all(sum(o) == S and len(o) == N for o in others)
     names = ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
     arena = cake_backend.KdaArena(lean=True, tail_passes=3, batch_tokens=704)
-    # sized for the bound of every group, so every pack of the problem fits
-    ws = KdaWorkspace.for_problem(S, N, heads, device, save_mode="tape", arena=arena)
+    # sized for the groups of the captured pack, whose first group then runs two tail passes; the other packs' groups
+    # (at most two documents of at most 704 tokens) fit that arena too
+    ws = KdaWorkspace.for_problem(
+        S, N, heads, device, save_mode="tape", arena=arena, doc_lengths=lengths
+    )
     assert ws.plan.recur == "seg"
 
     def fwd_bwd(pack, inputs):
@@ -6826,7 +7015,14 @@ def test_a_batched_workspace_keeps_the_device_copy_its_graph_reads(
     reference = [x.clone() for x in fwd_bwd(lengths, inputs)]
     packing = ws._doc_cache[lengths]
     assert packing.blocks[0] is None and packing.index_dev is not None
-    assert packing.tail_counts(1, packing.batches[1].NC_pad_tape) is not None
+    counted = [
+        packing.tail_counts(i, b.NC_pad_tape) is not None
+        for i, b in enumerate(packing.batches)
+    ]
+    assert counted == [
+        ws.batch_view(b, tape=True).tail_passes > 1 for b in packing.batches
+    ]
+    assert any(counted)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
