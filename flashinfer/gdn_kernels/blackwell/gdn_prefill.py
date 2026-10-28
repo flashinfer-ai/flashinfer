@@ -351,6 +351,7 @@ def chunk_gated_delta_rule_sm100(
     )
     # Pools (indexed rows, possibly padded) restore their stride alignment from
     # this divisibility; a checkpoint pool joins the state pools.
+    pools: tuple[Optional[torch.Tensor], ...]
     if use_checkpoint_state_indices:
         pools = (_initial_state, _output_state, output_checkpoints)
     elif use_state_indices:
@@ -364,7 +365,7 @@ def chunk_gated_delta_rule_sm100(
     num_sm = get_num_sm(q.device)
     kernel_variant = _prefill_kernel_variant(target.major, target.minor)
     kernel_cls = _PREFILL_KERNEL_CLASSES[kernel_variant]
-    cache_key = (
+    cache_key: tuple = (
         kernel_variant,
         target.compile_key,
         num_sm,

@@ -1391,7 +1391,10 @@ class GatedDeltaNetChunkedKernel:
                             checkpoint_phase = self._checkpoint_phase(
                                 mPrefix_lens, batch_idx, checkpoint_every_n_tokens
                             )
-                        slot_checkpoint_args = (checkpoint_phase, mCheckpoint_indices)
+                        slot_checkpoint_args = (  # type: ignore[assignment]
+                            checkpoint_phase,
+                            mCheckpoint_indices,
+                        )
                         slot_final_args = (
                             mS_out_indices,
                             checkpoint_phase,
@@ -1881,7 +1884,7 @@ class GatedDeltaNetChunkedKernel:
                         )
                         o_first_row = batch_start
                         gate_first_row = batch_start
-                        gate_row_lo = ()
+                        gate_row_lo = ()  # type: ignore[assignment]
                     tensormap_manager.update_tensormap(
                         (bounded_o,),
                         (tma_o.atom,),
