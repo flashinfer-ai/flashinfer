@@ -611,52 +611,48 @@ class Sm100BlockScaledMoeEpilogue:
         return result
 
     @cute.jit
-    def _store(self, values, output, output_sf, row, channel, norm_const, absmax):
+    def _quantization_params(self, absmax, norm_const):
+        if cutlass.const_expr(self.is_mxfp8_output):
+            # Match mxfp8_quantize's saturating round-up E8M0 code, including
+            # code zero for an all-zero block. Keep raw bytes for its store.
+            sf = float_to_ue8m0_fast(absmax * cutlass.Float32(1.0 / 448.0))
+            scale = ue8m0_to_inv_scale_fast(sf)
+            sf = sf.to(cutlass.Uint8)
+        elif cutlass.const_expr(
+            self.output_dtype == cutlass.Float4E2M1FN
+            and self.sf_dtype == cutlass.Float8E4M3FN
+            and self.sf_vec_size == 16
+        ):
+            # Share standalone standard fast quantization while keeping
+            # the activation values in FP32 through the FP4 conversion.
+            sf, scale = _nvfp4_standard_quant_from_amax(absmax, norm_const, False)
+            sf = sf.bitcast(cutlass.Float8E4M3FN)
+        elif cutlass.const_expr(self.output_dtype == cutlass.Float4E2M1FN):
+            sf = (absmax * cutlass.Float32(1.0 / 6.0) * norm_const).to(self.sf_dtype)
+            scale = fmin(
+                norm_const * cute.arch.rcp_approx(cutlass.Float32(sf)),
+                cutlass.Float32(3.40282346638528859812e38),
+                nan=True,
+            )
+        elif cutlass.const_expr(self.output_dtype == cutlass.Float8E4M3FN):
+            sf = (absmax * cutlass.Float32(1.0 / 448.0) * norm_const).to(self.sf_dtype)
+            scale = fmin(
+                norm_const * cute.arch.rcp_approx(cutlass.Float32(sf)),
+                cutlass.Float32(3.40282346638528859812e38),
+                nan=True,
+            )
+        return sf, scale
+
+    @cute.jit
+    def _store(self, values, output, output_sf, row, channel, quantization):
         converted = cute.make_rmem_tensor((16,), self.output_dtype)
         if cutlass.const_expr(self.generate_sfc):
-            sf_row = (
-                row // self.tile_n * (cute.ceil_div(self.tile_n, 128) * 128)
-                + row % self.tile_n
+            sf, scale = quantization
+            sf_row = row + row // self.tile_n * (
+                cute.ceil_div(self.tile_n, 128) * 128 - self.tile_n
             )
-            if cutlass.const_expr(self.is_mxfp8_output):
-                # Match mxfp8_quantize's saturating round-up E8M0 code, including
-                # code zero for an all-zero block. Keep raw bytes for its store.
-                sf = float_to_ue8m0_fast(absmax * cutlass.Float32(1.0 / 448.0))
-                scale = ue8m0_to_inv_scale_fast(sf)
-                if channel % self.sf_vec_size == 0:
-                    output_sf[sf_row, channel] = sf.to(cutlass.Uint8)
-            elif cutlass.const_expr(
-                self.output_dtype == cutlass.Float4E2M1FN
-                and self.sf_dtype == cutlass.Float8E4M3FN
-                and self.sf_vec_size == 16
-            ):
-                # Share standalone standard fast quantization while keeping
-                # the activation values in FP32 through the FP4 conversion.
-                sf, scale = _nvfp4_standard_quant_from_amax(absmax, norm_const, False)
-                if channel % self.sf_vec_size == 0:
-                    output_sf[sf_row, channel] = sf.bitcast(cutlass.Float8E4M3FN)
-            elif cutlass.const_expr(self.output_dtype == cutlass.Float4E2M1FN):
-                sf = (absmax * cutlass.Float32(1.0 / 6.0) * norm_const).to(
-                    self.sf_dtype
-                )
-                if channel % self.sf_vec_size == 0:
-                    output_sf[sf_row, channel] = sf
-                scale = fmin(
-                    norm_const * cute.arch.rcp_approx(cutlass.Float32(sf)),
-                    cutlass.Float32(3.40282346638528859812e38),
-                    nan=True,
-                )
-            elif cutlass.const_expr(self.output_dtype == cutlass.Float8E4M3FN):
-                sf = (absmax * cutlass.Float32(1.0 / 448.0) * norm_const).to(
-                    self.sf_dtype
-                )
-                if channel % self.sf_vec_size == 0:
-                    output_sf[sf_row, channel] = sf
-                scale = fmin(
-                    norm_const * cute.arch.rcp_approx(cutlass.Float32(sf)),
-                    cutlass.Float32(3.40282346638528859812e38),
-                    nan=True,
-                )
+            if channel % self.sf_vec_size == 0:
+                output_sf[sf_row, channel] = sf
             for i in cutlass.range_constexpr(0, 16, 2):
                 values[i], values[i + 1] = cute.arch.mul_packed_f32x2(
                     (values[i], values[i + 1]), (scale, scale)
@@ -787,14 +783,16 @@ class Sm100BlockScaledMoeEpilogue:
             channel = channel_start // 2 + warp * 16
             if token_start + lane < valid_tokens:
                 if channel < output_tensor.shape[1]:
+                    quantization = None
+                    if cutlass.const_expr(self.generate_sfc):
+                        quantization = self._quantization_params(absmax, norm_const)
                     self._store(
                         values,
                         output_tensor,
                         output_sf_tensor,
                         route_start + token_start + lane,
                         channel,
-                        norm_const,
-                        absmax,
+                        quantization,
                     )
         elif cutlass.const_expr(
             self.activation_type is None
@@ -864,9 +862,10 @@ class Sm100BlockScaledMoeEpilogue:
                     bottom[i], bottom[i + 1] = cute.arch.mul_packed_f32x2(
                         (bottom[i], bottom[i + 1]), (scale, scale)
                     )
-            absmax = cutlass.Float32(0.0)
+            shared_quantization = None
             if cutlass.const_expr(self.generate_sfc and self.sf_vec_size == 32):
                 absmax = cute.arch.fmax(self._absmax(top), self._absmax(bottom))
+                shared_quantization = self._quantization_params(absmax, norm_const)
             for half in cutlass.range_constexpr(2):
                 values = top if half == 0 else bottom
                 if cutlass.const_expr(self.generate_sfc and self.sf_vec_size == 16):
@@ -874,14 +873,18 @@ class Sm100BlockScaledMoeEpilogue:
                 channel = channel_start + warp * 32 + half * 16
                 if token_start + lane < valid_tokens:
                     if channel < output_tensor.shape[1]:
+                        quantization = shared_quantization
+                        if cutlass.const_expr(
+                            self.generate_sfc and self.sf_vec_size == 16
+                        ):
+                            quantization = self._quantization_params(absmax, norm_const)
                         self._store(
                             values,
                             output_tensor,
                             output_sf_tensor,
                             output_row,
                             channel,
-                            norm_const,
-                            absmax,
+                            quantization,
                         )
 
     @cute.jit
