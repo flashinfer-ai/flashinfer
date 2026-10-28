@@ -477,10 +477,16 @@ _GROUPED_Q_REDUCTION_COST = {
 }
 _GROUPED_Q_REDUCTION_SEQ_LEN_FACTOR = 128.0
 # A query-paired CTA loads each K/V tile once for its two Q128 tiles; per Q
-# tile its mainloop costs this fraction of an unpaired CTA's, by K/V width.
-# Multi-wave paged launches measure a median of 0.94 (16-bit) and 0.93 to
-# 0.98 (8-bit) on B200, and 0.91 and 0.83 to 0.90 on GB300.
-_QUERY_PAIRED_MAINLOOP_SCALE = {8: 0.95, 16: 0.93}
+# tile its mainloop costs this fraction of an unpaired CTA's, by GPU and K/V
+# width. The fractions are the median of paired over unpaired Q128 time on
+# multi-wave paged launches, each scaled by the launches' whole-wave counts.
+# SM103's doubled MUFU exponential rate leaves the K/V loads a larger share
+# of its mainloop than on SM100, so pairing saves more there. Other GPUs
+# take the SM100 fractions.
+_QUERY_PAIRED_MAINLOOP_SCALE = {
+    (10, 0): {8: 0.94, 16: 0.90},
+    (10, 3): {8: 0.85, 16: 0.87},
+}
 
 
 def enumerate_grouped_q_mma_candidates(
@@ -4585,7 +4591,14 @@ def _resolve_grouped_q_launch_candidates(
     mainloop_scale = 1.0
     if candidate.query_paired:
         # A paired CTA runs its Q tiles over one K/V stream and never splits it.
-        mainloop_scale = 2 * _QUERY_PAIRED_MAINLOOP_SCALE[cost_kv_width]
+        import torch
+
+        scales = _QUERY_PAIRED_MAINLOOP_SCALE[(10, 0)]
+        if torch.cuda.is_available():
+            scales = _QUERY_PAIRED_MAINLOOP_SCALE.get(
+                torch.cuda.get_device_capability(), scales
+            )
+        mainloop_scale = 2 * scales[cost_kv_width]
 
     split_candidates = enumerate_auto_splits_kv(
         seq_len_kv=seq_len_kv,
