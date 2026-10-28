@@ -80,9 +80,14 @@ def gen_w8a16_fp8_gemm_module(act_dtype: torch.dtype = torch.bfloat16) -> JitSpe
 def gen_w8a16_fp8_gemm_sm100_module(
     act_dtype: torch.dtype = torch.bfloat16,
 ) -> JitSpec:
-    """W8A16 GEMM, Blackwell (sm_100a): CUTLASS mixed-input mainloop, same contract."""
+    """W8A16 GEMM, Blackwell (sm_100a): CUTLASS mixed-input mainloop, same contract.
+
+    Rubin (CC 10.7) builds the sm_100f family target like the other Blackwell
+    modules: the bundled CUTLASS has no native compute_107a support, and an
+    sm_107a build traps at launch.
+    """
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10]
+        supported_major_versions=[10], map_sm107_to_100f=True
     )
     uri = f"w8a16_fp8_gemm_sm100_{filename_safe_dtype_map[act_dtype]}"
     return gen_jit_spec(
