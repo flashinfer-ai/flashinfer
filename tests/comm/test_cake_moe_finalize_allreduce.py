@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import multiprocessing as mp
-import socket
 import time
+from pathlib import Path
 
 import pytest
 import torch
@@ -108,12 +108,6 @@ def _decode_fp4_output(
     return (values.reshape(rows, scale_columns, 16) * scales.unsqueeze(-1)).reshape(
         rows, columns
     )
-
-
-def _open_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def _bounded_rand(
@@ -349,12 +343,12 @@ def _run_backend(
     return residual_out, norm_out, quant_out, scale_out
 
 
-def _worker(world_size: int, rank: int, dtype: torch.dtype, port: int) -> None:
+def _worker(world_size: int, rank: int, dtype: torch.dtype, init_method: str) -> None:
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
     dist.init_process_group(
         backend="nccl",
-        init_method=f"tcp://127.0.0.1:{port}",
+        init_method=init_method,
         rank=rank,
         world_size=world_size,
     )
@@ -530,7 +524,9 @@ def _worker(world_size: int, rank: int, dtype: torch.dtype, port: int) -> None:
 
 @pytest.mark.parametrize("world_size", [2, 4, 8])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_cake_moe_finalize_allreduce(world_size: int, dtype: torch.dtype) -> None:
+def test_cake_moe_finalize_allreduce(
+    world_size: int, dtype: torch.dtype, tmp_path: Path
+) -> None:
     if torch.cuda.device_count() < world_size:
         pytest.skip(f"test requires {world_size} CUDA devices")
     capabilities = {
@@ -539,10 +535,11 @@ def test_cake_moe_finalize_allreduce(world_size: int, dtype: torch.dtype) -> Non
     if len(capabilities) != 1 or not capabilities.issubset({(10, 0), (10, 3)}):
         pytest.skip("test requires one homogeneous SM100 or SM103 node")
 
-    port = _open_port()
+    # File rendezvous: a probed free TCP port can be taken before rank 0 binds it.
+    init_method = f"file://{tmp_path / 'rendezvous'}"
     context = mp.get_context("spawn")
     processes = [
-        context.Process(target=_worker, args=(world_size, rank, dtype, port))
+        context.Process(target=_worker, args=(world_size, rank, dtype, init_method))
         for rank in range(world_size)
     ]
     for process in processes:
