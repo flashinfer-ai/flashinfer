@@ -238,9 +238,19 @@ class MegaMoEHopperMxfp4Config(MegaMoEHopperFp8Config):
             for item in dataclasses.fields(MegaMoEHopperFp8Config)
         }
         base_kwargs["fp8_scale_mode"] = "blockwise"
+        tile_m, tile_n, tile_k = self.mma_tiler_mnk
+        # Packed FP4 adds swap-AB token tiles N72/N80: one task holds an
+        # expert's 65-80 rows where N64 needs a second, nearly empty tile.
+        # FP8 keeps its own widths; the proxy only checks the whitelist on N.
+        if tile_n in (72, 80):
+            base_kwargs["mma_tiler_mnk"] = (tile_m, 64, tile_k)
         MegaMoEHopperFp8Config(**base_kwargs)
 
-        tile_m, _tile_n, tile_k = self.mma_tiler_mnk
+        if tile_n in (72, 80) and tile_m != 256:
+            raise ValueError(
+                f"Hopper {self._weight_format} x FP8 token tiles N72/N80 require M=256; "
+                f"got mma_tiler_mnk={self.mma_tiler_mnk}."
+            )
         if tile_m not in (128, 256):
             raise ValueError(
                 f"Hopper {self._weight_format} x FP8 requires swap-AB MMA tile M=128 or 256; "
@@ -531,7 +541,10 @@ class MegaMoEHopperMxfp4Frontend(MegaMoEHopperFp8Frontend):
             use_2cta_instrs=c.use_2cta_instrs,
             group_hint=group_hint,
             token_padding_block=token_padding_block,
-            sf_padding_block=SfPaddingBlock,
+            # The activation-SF TMA addresses a token tile as (expert SF base +
+            # tile * N) // N, so every expert's SF base must be a multiple of N.
+            sf_padding_block=-(-SfPaddingBlock // token_padding_block)
+            * token_padding_block,
             load_balance_mode=c.load_balance_mode,
             static_expert_shape=static_expert_shape,
             force_static_sched=c.force_static_sched,

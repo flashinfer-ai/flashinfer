@@ -45,7 +45,8 @@ from moe_hopper_fp8.epilogue_fp8_common import (
 Fc1EpilogueStoreTileN = 64
 SwapABTileMChoices = (128, 256)
 # 8 is experimental (wgmma m64n8k32; every n-derived count divides): see TUNING.md.
-SwapABTokenTileNChoices = (8, 16, 32, 64, 128)
+# 72/80 are admitted by the packed-FP4 configs only (one task for 65-80 rows).
+SwapABTokenTileNChoices = (8, 16, 32, 64, 72, 80, 128)
 SwapABBlockwiseFc1GroupChunkChoices = (1, 2, 4, 8)
 SwapABBlockwiseFc1GroupChunks = int(
     os.environ.get("MEGA_SWAPAB_FC1_GROUP_CHUNKS", "1")

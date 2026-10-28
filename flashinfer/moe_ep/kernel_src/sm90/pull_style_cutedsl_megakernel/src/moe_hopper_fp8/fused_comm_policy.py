@@ -54,7 +54,8 @@ def resolve_fused_comm_optimizations(
         shared_protocol
         and bf16_output
         and combine_format == "bf16"
-        and tile[:2] == (256, 64)
+        and tile[0] == 256
+        and tile[1] in (64, 72, 80)
         and shape is not None
         and shape[2] > 0
         and cluster[0] > 0

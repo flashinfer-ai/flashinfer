@@ -363,7 +363,7 @@ def validate_hopper_mxfp4_tactic(tactic: Mapping[str, Any]) -> dict[str, Any]:
     m, n, k = tile
     if (
         m not in (128, 256)
-        or n not in (16, 32, 64, 128)
+        or n not in (16, 32, 64, 72, 80, 128)
         or k
         not in (
             128,
@@ -371,6 +371,8 @@ def validate_hopper_mxfp4_tactic(tactic: Mapping[str, Any]) -> dict[str, Any]:
         )
     ):
         raise ValueError("illegal MXFP4 fused tile")
+    if n in (72, 80) and m != 256:
+        raise ValueError("MXFP4 fused N72/N80 token tiles require M256")
     if tactic["pingpong"] and m != 128:
         raise ValueError("MXFP4 fused pingpong requires M128")
     cluster = _triple(tactic["cluster_shape_mnk"], "cluster_shape_mnk")

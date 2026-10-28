@@ -184,6 +184,16 @@ not picked them up):
   SHA and tuning-cache provenance (which the NV provenance embeds), so MXFP4
   and NVFP4 tuning caches re-tune; the kernels do not read it. Not in the
   drop tree.
+- Swap-AB token tiles N72/N80 for packed FP4 (2026-10-28, measured on
+  H2560/I640/E512/top10/EP2): `src/moe_hopper_fp8/epilogue_fp8_swapab.py` admits 72 and 80
+  in `SwapABTokenTileNChoices`, and `fused_comm_policy.py` enables paired BF16
+  stores for M256 x N64/N72/N80. Only the MXFP4/NVFP4 shim configs admit the
+  new widths (FP8 keeps its list). The MX frontend pads the activation-SF pool
+  to a multiple of the token tile, because the SF TMA addresses a tile as
+  `(expert SF base + tile * N) // N`; every existing N keeps 128. One N80 task
+  holds an expert's 65-80 rows, where N64 needs a second, nearly empty tile;
+  the 224-register consumers do not spill in the main loops. Not in the drop
+  tree.
 
 ## Layout
 
