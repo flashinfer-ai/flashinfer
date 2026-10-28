@@ -15,7 +15,7 @@ limitations under the License.
 
 The KCP registry (``cake_kcp_jit``) and manifests of the Cake packed KDA training package: the records against the
 frozen kernel ABIs, the program names against the identity rule, ``build.json`` (the shipped programs, never a
-test-only one) and ``build.test.json`` (the test-only programs, loadable only under ``CAKE_KCP_TEST_KNOBS=1``).
+test-only one) and ``build.test.json`` (the test-only programs, loadable only after ``cake_kcp_plan.enable_test_knobs()``).
 No device is needed; nothing is built or launched.
 """
 
@@ -32,6 +32,7 @@ from tests.test_helpers.cake_package import cake_package
 cake_build = cake_package("cake_kda_train", "cake_build")
 cake_jit = cake_package("cake_kda_train", "cake_jit")
 kcp_jit = cake_package("cake_kda_train", "cake_kcp_jit")
+kcp_plan = cake_package("cake_kda_train", "cake_kcp_plan")
 
 PACKAGE_DIR = Path(cake_build.__file__).parent
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
@@ -415,11 +416,11 @@ def test_test_manifest_is_the_test_only_programs_under_the_opt_in(
     if not path.is_file():
         pytest.skip(f"{kcp_jit.TEST_MANIFEST} is not shipped here")
     kcp_jit.test_manifest.cache_clear()
-    monkeypatch.delenv(kcp_jit.TEST_KNOBS_ENV, raising=False)
+    monkeypatch.setattr(kcp_plan, "_TEST_KNOBS_ENABLED", False)
     assert kcp_jit.test_knobs_enabled() is False
-    with pytest.raises(RuntimeError, match=kcp_jit.TEST_KNOBS_ENV):
+    with pytest.raises(RuntimeError, match="enable_test_knobs"):
         kcp_jit.test_manifest()
-    monkeypatch.setenv(kcp_jit.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(kcp_plan, "_TEST_KNOBS_ENABLED", True)
     kcp_jit.test_manifest.cache_clear()
     assert kcp_jit.test_knobs_enabled() is True
     document = kcp_jit.test_manifest()

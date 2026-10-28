@@ -410,13 +410,13 @@ def test_multi_gpu_rows_match_the_exact_reference(row) -> None:
 def test_public_api_cannot_select_a_precision_mode(monkeypatch) -> None:
     """The private test hook is refused without the environment variable; the public options never reach K3's
     non-shipped programs (SPEC-11)."""
-    monkeypatch.delenv(cake_kcp_plan.TEST_KNOBS_ENV, raising=False)
+    monkeypatch.setattr(cake_kcp_plan, "_TEST_KNOBS_ENABLED", False)
     with pytest.raises(ValueError):
         cake_kcp._options({"_kcp_test_knobs": {"precision_mode": 2}})
     with pytest.raises(TypeError):
         cake_kcp._options({"precision_mode": 1})
     assert cake_kcp._options({}).precision_mode == 0
-    monkeypatch.setenv(cake_kcp_plan.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(cake_kcp_plan, "_TEST_KNOBS_ENABLED", True)
     assert (
         cake_kcp._options({"_kcp_test_knobs": {"precision_mode": 1}}).precision_mode
         == 1
@@ -428,13 +428,13 @@ def test_public_api_cannot_select_a_precision_mode(monkeypatch) -> None:
 def test_public_api_cannot_select_a_transfer_walk(monkeypatch) -> None:
     """The ``transfer_walk`` knob (K3's ``tf32_hilo`` / ``bf16x3`` programs of ``build.test.json``) is reachable only through
     the gated test hook; the public options never select a non-shipped transfer-walk program (SPEC-11)."""
-    monkeypatch.delenv(cake_kcp_plan.TEST_KNOBS_ENV, raising=False)
+    monkeypatch.setattr(cake_kcp_plan, "_TEST_KNOBS_ENABLED", False)
     with pytest.raises(TypeError):
         cake_kcp._options({"transfer_walk": "bf16x3"})
     with pytest.raises(ValueError):
         cake_kcp._options({"_kcp_test_knobs": {"transfer_walk": "bf16x3"}})
     assert cake_kcp._options({}).transfer_walk == "bf16x3_hw64"
-    monkeypatch.setenv(cake_kcp_plan.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(cake_kcp_plan, "_TEST_KNOBS_ENABLED", True)
     assert (
         cake_kcp._options(
             {"_kcp_test_knobs": {"transfer_walk": "bf16x3"}}
