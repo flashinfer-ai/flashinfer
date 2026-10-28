@@ -606,7 +606,8 @@ runtime cannot name the captured node, the capture continues without the cap
 after one warning (`LAST_CALL[kind]["cache_config"] == "unavailable"`); the
 results are bitwise identical either way. The previous replay form stays
 reachable for A/B records through the private test knob `graph_cap`
-(`CAKE_KCP_TEST_KNOBS=1`); `graph="off"` is the shipped default. The A/B
+(after `cake_kcp_plan.enable_test_knobs()`); `graph="off"` is the shipped
+default. The A/B
 record was taken with pointer-stable harness inputs; its gain is an upper
 bound of what a framework sees.
 
@@ -649,7 +650,7 @@ and restores it before the next launch; a launch issued by another thread of
 the same process during that bracket would take the PreferL1 occupancy for
 itself (occupancy only -- results never depend on the geometry). The earlier
 geometry stays reachable for A/B records through the private test knob
-`walk_geometry` (`CAKE_KCP_TEST_KNOBS=1`).
+`walk_geometry` (after `cake_kcp_plan.enable_test_knobs()`).
 
 Host path: the eager KCP calls reuse the call-independent host work -- the
 validated options, the workspace's last tables and pool views, the local
@@ -661,8 +662,9 @@ reference the table set only weakly, so a training loop that builds a new
 context and workspace per step releases everything with them. The kernels,
 their arguments and their order are unchanged, so the results are bitwise
 those of the previous host path, which stays reachable for A/B records
-through the private test knob `host_trim` (`CAKE_KCP_TEST_KNOBS=1`; the conv
-module's `_set_test_knobs({"host_trim": 0})`).
+through the private test knob `host_trim` (after
+`cake_kcp_plan.enable_test_knobs()`; the conv module's
+`_set_test_knobs({"host_trim": 0})`).
 
 Options of the KDA entry points: `save_transfer` keeps the owner's c1 receive
 tensor (and `M_seg`) for the backward instead of re-sending it in the backward
@@ -722,9 +724,10 @@ The KCP kernels live beside the single-rank programs:
   (the TF32 hi/lo transfer walk, its static `precision_mode` 1 and 2 forms,
   and the full-width BF16x3 walk).  `build.json` never lists them and the
   shipped route never loads them: `cake_kcp_jit.load_test` JIT-builds an
-  entry only under the environment variable `CAKE_KCP_TEST_KNOBS=1`, which
-  also admits the test knobs (`precision_mode`, `transfer_walk`) of the
-  package's own tests; without the file those tests skip.
+  entry only after `cake_kcp_plan.enable_test_knobs()`, which also admits
+  the test knobs (`precision_mode`, `transfer_walk`) of the package's own
+  tests; without the file those tests skip.  The package reads no
+  environment variable.
 * `csrc/cake_kda_train_<digest>_{kernel,binding}.cu` of the thirteen KCP
   programs, rendered like the single-rank ones (digests in `build.json` and
   `build.test.json`).

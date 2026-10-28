@@ -209,8 +209,8 @@ def test_plan_parity_with_kda_on_rows(path, monkeypatch) -> None:
     kp = importlib.import_module(
         "flashinfer.experimental.cake_kda_train.cake_kcp_plan"
     )  # the test only
-    # the KDA module accepts its private test hook only under this environment variable
-    monkeypatch.setenv(kp.TEST_KNOBS_ENV, "1")
+    # the KDA module accepts its private test hook only after its opt-in (enable_test_knobs)
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     with open(path) as fh:
         row = json.load(fh)
     H_qk, HV = (int(x) for x in row["heads"])

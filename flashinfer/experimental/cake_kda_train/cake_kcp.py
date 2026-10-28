@@ -206,7 +206,6 @@ from __future__ import annotations
 import ctypes
 import dataclasses
 import functools
-import os
 import warnings
 import weakref
 from collections.abc import Sequence
@@ -233,7 +232,6 @@ TRANSFER_WALKS = (
     "bf16x3",
 )  # K3 program family: the shipped BF16x3 half-width walk first (the others only via _kcp_test_knobs)  # exchange="auto" picks the ring when every chain has at most this many hops (SPEC-2)
 KCP_SAVED_VERSION = 2  # saved set {tables, S_in [, c1 receive tensor, M_seg, carry plane] -- the optional members travel as flags}; version 1 also held the token-row Aqk / Akk
-TEST_KNOBS_ENV = "CAKE_KCP_TEST_KNOBS"
 # Host / plan knobs (test knob class: reachable only through _kcp_test_knobs):
 SCHEDULES = (
     "overlap",
@@ -3432,9 +3430,9 @@ def _options(kwargs: dict[str, Any]) -> KcpOptions:
         None  # unset: the shipped walk (the hi/lo walk under precision_mode)
     )
     if isinstance(raw, dict) and "transfer_walk" in raw:
-        if os.environ.get(cake_kcp_plan.TEST_KNOBS_ENV) != "1":
+        if not cake_kcp_plan.test_knobs_enabled():
             raise ValueError(
-                f"_kcp_test_knobs is a private test hook: it is accepted only with {cake_kcp_plan.TEST_KNOBS_ENV}=1 in the environment"
+                f"_kcp_test_knobs is a private test hook: it is accepted only after {cake_kcp_plan.ENABLE_TEST_KNOBS}"
             )
         raw = dict(raw)
         transfer_walk = str(raw.pop("transfer_walk"))
@@ -3446,9 +3444,9 @@ def _options(kwargs: dict[str, Any]) -> KcpOptions:
     if isinstance(raw, dict) and any(
         k in raw for k in P2_KNOBS
     ):  # the earlier knobs: the same gate
-        if os.environ.get(cake_kcp_plan.TEST_KNOBS_ENV) != "1":
+        if not cake_kcp_plan.test_knobs_enabled():
             raise ValueError(
-                f"_kcp_test_knobs is a private test hook: it is accepted only with {cake_kcp_plan.TEST_KNOBS_ENV}=1 in the environment"
+                f"_kcp_test_knobs is a private test hook: it is accepted only after {cake_kcp_plan.ENABLE_TEST_KNOBS}"
             )
         raw = dict(raw)
         for key in P2_KNOBS:

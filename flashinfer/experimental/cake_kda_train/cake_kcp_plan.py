@@ -76,7 +76,7 @@ generalised to unequal fragments) not above the makespan at the base rule's ``P`
 ``"wave_fill1"`` (the previous rule), ``"wave"`` (the earlier rule), ``"occ"`` and
 ``"wave_fill"`` (the fill on every rank with at most three fragments; implemented,
 not adopted) stay selectable through the private test knob
-``_kcp_test_knobs={"p_rule": ...}`` (``CAKE_KCP_TEST_KNOBS=1``) for the A/B
+``_kcp_test_knobs={"p_rule": ...}`` (after :func:`enable_test_knobs`) for the A/B
 record.  Every rule is a pure function of (fragment table, H, SM count).  A ``P``
 change alters the segment recomposition (not bitwise in general);
 for the tie line the bitwise proof set found every changed gate row
@@ -102,7 +102,6 @@ Exchange layouts (one ``all_to_all_single`` per direction; ``s`` = one FP32
 from __future__ import annotations
 
 import dataclasses
-import os
 
 import torch
 import torch.distributed as dist
@@ -200,7 +199,9 @@ TILE_D = 0  # half 0 of a b1 pair tile [2][128][128]: the adjoint offset d_f (ha
 TILE_STRIDE_PLANE = 1  # kernel argument tile_stride: dense plane (c2 S_in, b2 dS_out, b1 offsets-only, carry, the P > 1 staging planes)
 TILE_STRIDE_PAIR = 2  # interleaved pair (c1 [B_f | M_f^T], b1 [d_f | M_f^T] with maps)
 SUMMARY_TILE = 2 * TILE  # elements of one c1 summary tile of one head
-TEST_KNOBS_ENV = "CAKE_KCP_TEST_KNOBS"
+# The process's opt-in to the private ``_kcp_test_knobs`` hook and the test-only record set (``build.test.json``):
+# :func:`enable_test_knobs` sets it; the package reads no environment variable.
+_TEST_KNOBS_ENABLED = False
 PRECISION_MODES = (
     0,
     1,
@@ -1852,7 +1853,7 @@ def build_kcp_context(
     CUDA device's multiprocessor count; ``1`` on a non-CUDA device = no occupancy pressure, ``P = P_chain``).
     Out-of-range problems are rejected here, before any launch: ``n_frag > 65536`` (the layout table's document
     search), int32 overflows of the kernels' offsets (``heads(H)``).  ``_kcp_test_knobs`` is the private test hook
-    (SPEC-11; accepted only with ``CAKE_KCP_TEST_KNOBS=1``): its ``p_rule`` selects the plan's ``P`` rule for this
+    (SPEC-11; accepted only after :func:`enable_test_knobs`): its ``p_rule`` selects the plan's ``P`` rule for this
     context (:data:`P_RULE_DEFAULT` = ``"wave_fill1_p1tie"`` without the knob;
     ``"wave_fill1"`` = the previous rule (the fill without the tie line), ``"wave"`` = the equal-segment wave rule
     above the chain cap alone, ``"occ"`` = the occupancy rule, ``"wave_fill"`` = the unadopted fill on every rank with
@@ -2321,10 +2322,26 @@ def kcp_workspace_bytes(
 # Private test knobs (the design note §10.1, SPEC-11)
 
 
+ENABLE_TEST_KNOBS = "cake_kcp_plan.enable_test_knobs()"
+
+
+def enable_test_knobs(enabled: bool = True) -> bool:
+    """Opt this process into (``True``) or out of (``False``) the private ``_kcp_test_knobs`` hook of the KCP entry
+    points and the test-only programs of ``build.test.json``; returns the previous setting.  A test hook: the shipped
+    route never needs it, and without it no option reaches a test-only program (SPEC-11)."""
+    global _TEST_KNOBS_ENABLED
+    previous, _TEST_KNOBS_ENABLED = _TEST_KNOBS_ENABLED, bool(enabled)
+    return previous
+
+
+def test_knobs_enabled() -> bool:
+    """Whether the process opted into the private test hook (:func:`enable_test_knobs`)."""
+    return _TEST_KNOBS_ENABLED
+
+
 def validate_test_knobs(knobs) -> dict:
     """Normalize ``_kcp_test_knobs``: ``None`` -> the public defaults ``{"precision_mode": 0, "p_rule":
-    P_RULE_DEFAULT}`` (``"wave_fill1_p1tie"``); a dict is accepted only when the environment variable ``CAKE_KCP_TEST_KNOBS=1``
-    is set, holds only known keys and selects a known ``precision_mode`` (0 the hi/lo form of the TF32 walk; 1 the explicit
+    P_RULE_DEFAULT}`` (``"wave_fill1_p1tie"``); a dict is accepted only after :func:`enable_test_knobs`, holds only known keys and selects a known ``precision_mode`` (0 the hi/lo form of the TF32 walk; 1 the explicit
     three-MMA form of the R1 bitwise test; 2 plain TF32, the optional G2 cross-check) and a known ``p_rule``
     (:data:`P_RULES`; ``"wave_fill1"`` = the previous rule (the fill without the tie line), ``"wave"`` = the equal-segment
     wave rule above the chain cap alone, ``"occ"`` = the occupancy rule, ``"wave_fill"`` = the unadopted fill; read by
@@ -2332,9 +2349,9 @@ def validate_test_knobs(knobs) -> dict:
     therefore never select a non-zero mode or a P rule other than the shipped one."""
     if knobs is None:
         return {"precision_mode": 0, "p_rule": P_RULE_DEFAULT}
-    if os.environ.get(TEST_KNOBS_ENV) != "1":
+    if not test_knobs_enabled():
         raise ValueError(
-            f"_kcp_test_knobs is a private test hook: it is accepted only with {TEST_KNOBS_ENV}=1 in the environment"
+            f"_kcp_test_knobs is a private test hook: it is accepted only after {ENABLE_TEST_KNOBS}"
         )
     if not isinstance(knobs, dict):
         raise TypeError(f"_kcp_test_knobs must be a dict, got {type(knobs).__name__}")
@@ -2382,7 +2399,9 @@ __all__ = [
     "STATE_TILE_BYTES",
     "SUMMARY_TILE",
     "TABLE_NAMES",
-    "TEST_KNOBS_ENV",
+    "ENABLE_TEST_KNOBS",
+    "enable_test_knobs",
+    "test_knobs_enabled",
     "TILE",
     "TILE_B",
     "TILE_M",

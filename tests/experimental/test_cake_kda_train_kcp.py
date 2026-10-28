@@ -1010,8 +1010,8 @@ def test_kcp_plan_wave_rule_on_q1_c(monkeypatch, W) -> None:
         8: [2, 3, 2, 3, 2, 3, 3, 3],
         16: [3, 2, 3, 3, 2, 3, 3, 3, 2, 3, 3, 3, 3, 3, 3, 3],
     }[W]
-    monkeypatch.delenv(kp.TEST_KNOBS_ENV, raising=False)
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
+    with pytest.raises(ValueError, match="enable_test_knobs"):
         kp.build_kcp_context(
             part,
             None,
@@ -1021,7 +1021,7 @@ def test_kcp_plan_wave_rule_on_q1_c(monkeypatch, W) -> None:
             sm_count=SM_COUNT,
             _kcp_test_knobs={"p_rule": "wave"},
         )
-    monkeypatch.setenv(kp.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     expect_wave = [7] * W if W in (4, 8) else expect_occ
     expect_dflt = (
         [7] * W if W in (4, 8) else [2] * W
@@ -1135,7 +1135,7 @@ def test_kcp_plan_wave_rule_lane_rows(monkeypatch, case) -> None:
     name, W, lay, H = case
     row = kcp_shapes.ROWS[name]
     _frags, part = harness_partition(row, W, lay)
-    monkeypatch.setenv(kp.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     ranks = []
     for r in range(W):
         mine = part.fragments[r]
@@ -1351,11 +1351,11 @@ def test_kcp_plan_wave_fill_examples() -> None:
 
 
 def test_wave_fill_knobs_are_gated(monkeypatch) -> None:
-    monkeypatch.delenv(kp.TEST_KNOBS_ENV, raising=False)
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
+    with pytest.raises(ValueError, match="enable_test_knobs"):
         kp.validate_test_knobs({"p_rule": "wave_fill1"})
     assert kp.validate_test_knobs(None)["p_rule"] == "wave_fill1_p1tie"
-    monkeypatch.setenv(kp.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     for rule in ("wave_fill1", "wave_fill"):
         assert kp.validate_test_knobs({"p_rule": rule}) == {
             "precision_mode": 0,
@@ -1403,7 +1403,7 @@ def test_kcp_plan_wave_fill_lane_rows(monkeypatch, case) -> None:
     name, W, lay, H = case
     row = kcp_shapes.ROWS[name]
     _frags, part = harness_partition(row, W, lay)
-    monkeypatch.setenv(kp.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     ranks = []
     for r in range(W):
         mine = part.fragments[r]
@@ -1642,8 +1642,8 @@ def _two_doc_two_rank_partition(chunks: int = 100):
 
 
 def test_p1tie_knob_is_gated_and_plans(monkeypatch) -> None:
-    monkeypatch.delenv(kp.TEST_KNOBS_ENV, raising=False)
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
+    with pytest.raises(ValueError, match="enable_test_knobs"):
         kp.validate_test_knobs({"p_rule": "wave_fill1_p1tie"})
     part = _two_doc_two_rank_partition(100)
     ctx0 = kp.build_kcp_context(part, None, 0, "cpu", 4, sm_count=SM_COUNT)
@@ -1652,7 +1652,7 @@ def test_p1tie_knob_is_gated_and_plans(monkeypatch) -> None:
         1,
         2,
     )
-    monkeypatch.setenv(kp.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     ctx_fill1 = kp.build_kcp_context(
         part,
         None,
@@ -1780,7 +1780,7 @@ def test_kcp_plan_p1tie_lane_rows(monkeypatch, case) -> None:
     name, W, lay, H = case
     row = kcp_shapes.ROWS[name]
     _frags, part = harness_partition(row, W, lay)
-    monkeypatch.setenv(kp.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     assert (
         kp.P_RULE_DEFAULT == "wave_fill1_p1tie"
         and kp.P1_TIE_BASE[kp.P_RULE_DEFAULT] == "wave_fill1"
@@ -1875,17 +1875,17 @@ def test_merge_fuse_knob_and_fused_carry_chains(monkeypatch) -> None:
     carry_both / dcarry_both are the concatenation of carry_start + carry_in / dcarry_end + dcarry_cross (same pools; every
     chain keeps its elements, initial state and final slot), non-empty at P > 1 on a rank holding both fragment kinds, empty
     at P = 1; the default options and the other families are untouched."""
-    monkeypatch.delenv(cake_kcp.TEST_KNOBS_ENV, raising=False)
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
     assert cake_kcp.MERGE_FUSES == ("none", "carry")
     assert cake_kcp.MERGE_FUSE_DEFAULT == "none"
     assert cake_kcp.P2_KNOBS["merge_fuse"] == cake_kcp.MERGE_FUSES
     assert cake_kcp._options({}).merge_fuse == "none"
     assert "merge_fuse" not in cake_kcp._OPTION_KEYS
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
+    with pytest.raises(ValueError, match="enable_test_knobs"):
         cake_kcp._options({"_kcp_test_knobs": {"merge_fuse": "carry"}})
     with pytest.raises(TypeError):
         cake_kcp._options({"merge_fuse": "carry"})
-    monkeypatch.setenv(cake_kcp.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     o = cake_kcp._options({"_kcp_test_knobs": {"merge_fuse": "carry"}})
     assert (o.merge_fuse, o.schedule, o.fused_walks, o.cols_rule) == (
         "carry",
@@ -2323,19 +2323,19 @@ def test_byte_queries_and_knobs(monkeypatch) -> None:
     assert "pool.b1_send" not in fwd and fwd["arena"] < arena["arena"]
     assert kp.kcp_workspace_bytes(ctx, backward=False) < ws
     # knobs
-    monkeypatch.delenv(kp.TEST_KNOBS_ENV, raising=False)
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
     assert kp.validate_test_knobs(None) == {
         "precision_mode": 0,
         "p_rule": "wave_fill1_p1tie",
     }
     assert kp.validate_test_knobs(None)["p_rule"] == kp.P_RULE_DEFAULT
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
+    with pytest.raises(ValueError, match="enable_test_knobs"):
         kp.validate_test_knobs({"precision_mode": 2})
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
+    with pytest.raises(ValueError, match="enable_test_knobs"):
         kp.validate_test_knobs({"precision_mode": 0})
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
+    with pytest.raises(ValueError, match="enable_test_knobs"):
         kp.validate_test_knobs({"p_rule": "wave"})
-    monkeypatch.setenv(kp.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     assert kp.validate_test_knobs({"precision_mode": 1}) == {
         "precision_mode": 1,
         "p_rule": "wave_fill1_p1tie",
@@ -2378,11 +2378,11 @@ LEVER_TENSORS = ("out", "dq", "dk", "dv", "dg", "dbeta")
 
 def test_round1_knobs_are_gated_and_validated(monkeypatch) -> None:
     """``schedule``, ``fused_walks`` and ``cols_rule`` are test knobs: refused
-    without ``CAKE_KCP_TEST_KNOBS=1``, never public keywords (``graph`` is the exception, public
+    without :func:`cake_kcp_plan.enable_test_knobs`, never public keywords (``graph`` is the exception, public
     since this revision), validated against their admitted values; the
     shipped defaults since an earlier revision are the pair wait_first + fused_walks=1 (one tape launch per
     phase) with the registry's K4 records (cols_rule fixed); overlap / fused_walks=0 stay selectable."""
-    monkeypatch.delenv(cake_kcp.TEST_KNOBS_ENV, raising=False)
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
     o = cake_kcp._options({})
     assert (o.schedule, o.fused_walks, o.cols_rule) == ("wait_first", 1, "fixed")
     assert (
@@ -2393,7 +2393,7 @@ def test_round1_knobs_are_gated_and_validated(monkeypatch) -> None:
         {"fused_walks": 1},
         {"cols_rule": "by_chains"},
     ):
-        with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
+        with pytest.raises(ValueError, match="enable_test_knobs"):
             cake_kcp._options({"_kcp_test_knobs": knob})
     for key in cake_kcp.P2_KNOBS:
         if (
@@ -2404,7 +2404,7 @@ def test_round1_knobs_are_gated_and_validated(monkeypatch) -> None:
             continue
         with pytest.raises(TypeError):
             cake_kcp._options({key: 1})
-    monkeypatch.setenv(cake_kcp.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     o = cake_kcp._options(
         {
             "_kcp_test_knobs": {
@@ -2460,17 +2460,17 @@ def test_ring_exchange_contract() -> None:
 
 def test_host_trim_knob_is_gated_and_validated(monkeypatch) -> None:
     """``host_trim`` is a private test knob: refused without
-    ``CAKE_KCP_TEST_KNOBS=1``, never a public keyword, validated against :data:`HOST_TRIMS`; the shipped default is 1
+    :func:`cake_kcp_plan.enable_test_knobs`, never a public keyword, validated against :data:`HOST_TRIMS`; the shipped default is 1
     (the trimmed host path of the eager call), 0 selects the previous host path (the same launches
     in the same order) for the A/B record."""
-    monkeypatch.delenv(cake_kcp.TEST_KNOBS_ENV, raising=False)
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
     assert cake_kcp.HOST_TRIM_DEFAULT == 1 and cake_kcp.HOST_TRIMS == (0, 1)
     assert cake_kcp._options({}).host_trim == 1
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
+    with pytest.raises(ValueError, match="enable_test_knobs"):
         cake_kcp._options({"_kcp_test_knobs": {"host_trim": 0}})
     with pytest.raises(TypeError):
         cake_kcp._options({"host_trim": 1})
-    monkeypatch.setenv(cake_kcp.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     assert cake_kcp._options({"_kcp_test_knobs": {"host_trim": 1}}).host_trim == 1
     assert cake_kcp._options({"_kcp_test_knobs": {"host_trim": 0}}).host_trim == 0
     o = cake_kcp._options(
@@ -2495,22 +2495,22 @@ def test_host_trim_knob_is_gated_and_validated(monkeypatch) -> None:
 
 
 def test_saved_carry_knob_is_gated_and_validated(monkeypatch) -> None:
-    """``saved_carry`` is a private test knob: refused without ``CAKE_KCP_TEST_KNOBS=1``, never a public keyword,
+    """``saved_carry`` is a private test knob: refused without :func:`cake_kcp_plan.enable_test_knobs`, never a public keyword,
     validated against :data:`SAVED_CARRIES`; the shipped default is 1 (the forward of a ``P > 1`` rank keeps its
     carry plane in the saved set -- ``KcpSaved.carry``, an optional tensor that travels through ``tensors()`` /
     ``flags()`` / ``from_tensors`` like the other two -- and the saved-mode backward reads it), 0 selects the re-walk
     of the forward carries for the A/B record."""
-    monkeypatch.delenv(cake_kcp.TEST_KNOBS_ENV, raising=False)
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
     assert cake_kcp.SAVED_CARRY_DEFAULT == 1 and cake_kcp.SAVED_CARRIES == (0, 1)
     assert cake_kcp.P2_KNOBS["saved_carry"] == cake_kcp.SAVED_CARRIES
     assert cake_kcp._options({}).saved_carry == 1
     assert cake_kcp.KcpOptions().saved_carry == 1
     assert "saved_carry" not in cake_kcp._OPTION_KEYS
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
+    with pytest.raises(ValueError, match="enable_test_knobs"):
         cake_kcp._options({"_kcp_test_knobs": {"saved_carry": 0}})
     with pytest.raises(TypeError):
         cake_kcp._options({"saved_carry": 0})
-    monkeypatch.setenv(cake_kcp.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     assert cake_kcp._options({"_kcp_test_knobs": {"saved_carry": 1}}).saved_carry == 1
     assert cake_kcp._options({"_kcp_test_knobs": {"saved_carry": 0}}).saved_carry == 0
     assert cake_kcp._options({"_kcp_test_knobs": {"saved_carry": "0"}}).saved_carry == 0
@@ -2611,16 +2611,16 @@ def test_graph_knob_is_gated_and_validated(monkeypatch) -> None:
     """``graph`` is a public keyword of the entry points since this
     revision (validated against ``GRAPH_MODES``; shipped default ``GRAPH_DEFAULT == "off"``, the eager path)
     and stays reachable through the gated ``_kcp_test_knobs`` for the A/B record (refused without
-    ``CAKE_KCP_TEST_KNOBS=1``; a knob value contradicting the keyword is a ``ValueError``).  A call is never
+    :func:`cake_kcp_plan.enable_test_knobs`; a knob value contradicting the keyword is a ``ValueError``).  A call is never
     captured without a caller-owned workspace, under ``exchange="ring"``
     or ``debug_sequence``; the validity key tells operands apart by data pointer, shape, stride and dtype, keeps one
     entry per key, and the first call of a key is eager bookkeeping only."""
-    monkeypatch.delenv(cake_kcp.TEST_KNOBS_ENV, raising=False)
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
     assert cake_kcp.GRAPH_MODES == ("off", "replay")
     assert cake_kcp.P2_KNOBS["graph"] == cake_kcp.GRAPH_MODES
     assert cake_kcp.GRAPH_DEFAULT == "off" and "GRAPH_DEFAULT" in cake_kcp.__all__
     assert cake_kcp._options({}).graph == "off"
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
+    with pytest.raises(ValueError, match="enable_test_knobs"):
         cake_kcp._options({"_kcp_test_knobs": {"graph": "replay"}})
     # the public keyword needs no environment gate and is validated like every option
     assert "graph" in cake_kcp._OPTION_KEYS
@@ -2630,7 +2630,7 @@ def test_graph_knob_is_gated_and_validated(monkeypatch) -> None:
         cake_kcp._options({"graph": "capture"})
     with pytest.raises(ValueError, match="graph"):
         cake_kcp.KcpOptions(graph="capture").check()
-    monkeypatch.setenv(cake_kcp.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     on = cake_kcp._options({"_kcp_test_knobs": {"graph": "replay"}})
     assert on.graph == "replay"
     # the knob form (A/B record) and the keyword may agree, never contradict
@@ -2669,10 +2669,10 @@ def test_graph_knob_is_gated_and_validated(monkeypatch) -> None:
         cake_kcp._options({"_kcp_test_knobs": {"graph_cap": "always"}})
     with pytest.raises(TypeError):
         cake_kcp._options({"graph_cap": "none"})
-    monkeypatch.delenv(cake_kcp.TEST_KNOBS_ENV, raising=False)
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
+    with pytest.raises(ValueError, match="enable_test_knobs"):
         cake_kcp._options({"_kcp_test_knobs": {"graph_cap": "none"}})
-    monkeypatch.setenv(cake_kcp.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     ctx = object()
     t = [torch.empty(4, 2, 128, dtype=torch.bfloat16) for _ in range(5)]
     flags = (True, "light")
@@ -3023,9 +3023,9 @@ INDEX_TABLES = (
 def test_walk_geometry_knob_is_gated_and_validated(monkeypatch) -> None:
     """``walk_geometry`` is a test knob: shipped default ``"lpt_tape_one_cta_per_sm"`` since this
     revision (``"shipped"`` = the earlier geometry, selectable through the knob), refused
-    without ``CAKE_KCP_TEST_KNOBS=1``, never a public keyword, validated against :data:`WALK_GEOMETRIES` in the
+    without :func:`cake_kcp_plan.enable_test_knobs`, never a public keyword, validated against :data:`WALK_GEOMETRIES` in the
     options and in the tables; the knob is recorded by the tables' ``describe()``."""
-    monkeypatch.delenv(cake_kcp.TEST_KNOBS_ENV, raising=False)
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
     assert cake_kcp.WALK_GEOMETRY_DEFAULT == "lpt_tape_one_cta_per_sm"
     assert cake_kcp.WALK_GEOMETRIES == (
         "shipped",
@@ -3037,13 +3037,13 @@ def test_walk_geometry_knob_is_gated_and_validated(monkeypatch) -> None:
     )
     assert cake_kcp.P2_KNOBS["walk_geometry"] == cake_kcp.WALK_GEOMETRIES
     assert cake_kcp._options({}).walk_geometry == "lpt_tape_one_cta_per_sm"
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
+    with pytest.raises(ValueError, match="enable_test_knobs"):
         cake_kcp._options({"_kcp_test_knobs": {"walk_geometry": "shipped"}})
-    with pytest.raises(ValueError, match="CAKE_KCP_TEST_KNOBS"):
+    with pytest.raises(ValueError, match="enable_test_knobs"):
         cake_kcp._options({"_kcp_test_knobs": {"walk_geometry": "lpt_chains"}})
     with pytest.raises(TypeError):
         cake_kcp._options({"walk_geometry": "lpt_chains"})
-    monkeypatch.setenv(cake_kcp.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     for g in cake_kcp.WALK_GEOMETRIES:
         o = cake_kcp._options({"_kcp_test_knobs": {"walk_geometry": g}})
         assert (o.walk_geometry, o.schedule, o.fused_walks) == (g, "wait_first", 1)
@@ -3571,7 +3571,7 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap, walk_form) 
     forms the calls launched (``LAST_CALL[kind]["walk_forms"]``): under ``walk_form="auto"`` the registry's rule
     decides per launch, under ``"full"`` every launch is full-width and the bracket / skip / node-attribute paths are
     exercised."""
-    monkeypatch.setenv(cake_kcp.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
     knobs = {"_kcp_test_knobs": {"graph_cap": graph_cap, "walk_form": walk_form}}
     backend = cake_kcp.get_backend()
     programs = backend.programs() if hasattr(backend, "programs") else None
@@ -3922,8 +3922,8 @@ def test_spec3_probe_is_a_keyword_and_the_package_reads_no_environment_switch(
     monkeypatch,
 ) -> None:
     """The SPEC-3 probe's mode is the entry points' ``spec3_probe`` keyword (``"record"`` by default, ``"off"``,
-    ``"warn"``, ``"assert"``); no environment variable selects it.  The package's sources read the environment only
-    in the gate of the private ``_kcp_test_knobs`` hook, which a public call never passes."""
+    ``"warn"``, ``"assert"``); no environment variable selects it.  The package's sources read no environment
+    variable: the private ``_kcp_test_knobs`` hook opens only after :func:`cake_kcp_plan.enable_test_knobs`."""
     assert cake_kcp._options({}).spec3_probe == "record"
     for mode in cake_kcp.SPEC3_PROBES:
         assert cake_kcp._options({"spec3_probe": mode}).spec3_probe == mode
@@ -3933,14 +3933,27 @@ def test_spec3_probe_is_a_keyword_and_the_package_reads_no_environment_switch(
     assert not hasattr(cake_kcp, "SPEC3_ENV")
     monkeypatch.setenv("CAKE_KCP_SPEC3", "0")
     assert cake_kcp.KernelBackend()._spec3_pending
+    # the earlier environment opt-in of the test hook opens nothing
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", False)
+    monkeypatch.setenv("CAKE_KCP_TEST_KNOBS", "1")
+    assert not kp.test_knobs_enabled() and not cake_kcp_jit.test_knobs_enabled()
+    with pytest.raises(ValueError, match="enable_test_knobs"):
+        cake_kcp._options({"_kcp_test_knobs": {"precision_mode": 1}})
+    assert kp.enable_test_knobs() is False and kp.test_knobs_enabled()
+    assert (
+        cake_kcp._options({"_kcp_test_knobs": {"precision_mode": 1}}).precision_mode
+        == 1
+    )
+    assert kp.enable_test_knobs(False) is True and not kp.test_knobs_enabled()
     package = os.path.dirname(cake_kcp.__file__)
     for name in sorted(os.listdir(package)):
         if not name.endswith(".py"):
             continue
         with open(os.path.join(package, name), encoding="utf-8") as f:
             for number, line in enumerate(f, 1):
-                if "os.environ" in line or "getenv" in line:
-                    assert "TEST_KNOBS_ENV" in line, f"{name}:{number}: {line.strip()}"
+                assert "os.environ" not in line and "getenv" not in line, (
+                    f"{name}:{number}: {line.strip()}"
+                )
 
 
 def test_host_trim_options_passthrough() -> None:

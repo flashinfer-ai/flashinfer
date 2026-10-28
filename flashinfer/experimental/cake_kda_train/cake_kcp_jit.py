@@ -80,8 +80,8 @@ lists, slot tables and chain tables to cached device copies, the pools to
 base-pointer views, the operand and tape tensors from the call's local stage
 values -- onto :func:`run_module`.
 
-Test-only record set (``build.test.json``, loaded only under the environment
-variable ``CAKE_KCP_TEST_KNOBS=1``): the TF32 hi/lo transfer walk
+Test-only record set (``build.test.json``, loaded only after
+:func:`cake_kcp_plan.enable_test_knobs`): the TF32 hi/lo transfer walk
 (``transfer_walk`` knob ``tf32_hilo``: the previous shipped program, one CTA
 per segment and head) with its static ``precision_mode`` forms 1 (the
 explicit three-MMA TF32x3 form of the bitwise unit test) and 2 (plain TF32, a
@@ -106,7 +106,6 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
-import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -166,7 +165,6 @@ WALK_FORM_RULES = {
 WALK_FORM_FIT_STEP_RATIO = 0.9
 # Launches per form since import (evidence of the rule's choices).
 WALK_FORM_STATS = {"full": 0, "split": 0}
-TEST_KNOBS_ENV = "CAKE_KCP_TEST_KNOBS"
 TEST_MANIFEST = "build.test.json"
 
 # Logical argument names :func:`run_program` binds; every record maps its
@@ -1557,8 +1555,8 @@ _MANIFEST_SCHEMA = "cake-build/1"
 
 
 def test_knobs_enabled() -> bool:
-    """Whether the process opted into the test-only programs (``CAKE_KCP_TEST_KNOBS=1``)."""
-    return os.environ.get(TEST_KNOBS_ENV) == "1"
+    """Whether the process opted into the test-only programs (:func:`cake_kcp_plan.enable_test_knobs`)."""
+    return cake_kcp_plan.test_knobs_enabled()
 
 
 def test_record(
@@ -1604,15 +1602,24 @@ def test_walk_record(program: str, form: str) -> tuple[str, dict[str, Any]]:
     raise ValueError(f"no test-only record of {program!r} carries the knobs {wanted}")
 
 
-@functools.cache
-def test_manifest() -> dict[str, Any]:
-    """The parsed ``build.test.json`` (schema ``cake-build/1``, the test-only libraries), read on first use and
-    only under ``CAKE_KCP_TEST_KNOBS=1``: the shipped route never opens it."""
+def _require_test_knobs() -> None:
     if not test_knobs_enabled():
         raise RuntimeError(
-            f"the test-only KCP programs are loaded only with {TEST_KNOBS_ENV}=1 in the environment; the shipped "
+            f"the test-only KCP programs are loaded only after {cake_kcp_plan.ENABLE_TEST_KNOBS}; the shipped "
             "route (precision_mode 0) uses build.json alone"
         )
+
+
+def test_manifest() -> dict[str, Any]:
+    """The parsed ``build.test.json`` (schema ``cake-build/1``, the test-only libraries), read on first use and
+    only after :func:`cake_kcp_plan.enable_test_knobs`: the shipped route never opens it.  The opt-in is checked on
+    every call, the parse is cached (an opt-out after a load closes it again)."""
+    _require_test_knobs()
+    return _test_manifest()
+
+
+@functools.cache
+def _test_manifest() -> dict[str, Any]:
     try:
         text = _TEST_MANIFEST_PATH.read_text(encoding="utf-8")
     except FileNotFoundError as exc:
@@ -1687,10 +1694,16 @@ def test_jit_spec(library: str) -> Any:
     )
 
 
-@functools.cache
 def load_test(name: str, arch: str) -> Any:
     """The loaded tvm-ffi module of test-only record ``name`` (a key of ``TEST_MODULES``) built for ``arch``,
-    JIT-built from ``build.test.json`` (never prebuilt, never from ``build.json``)."""
+    JIT-built from ``build.test.json`` (never prebuilt, never from ``build.json``); the opt-in is checked on every
+    call, the loaded module is cached."""
+    _require_test_knobs()
+    return _load_test(name, arch)
+
+
+@functools.cache
+def _load_test(name: str, arch: str) -> Any:
     return test_jit_spec(test_library_name(name, arch)).build_and_load()
 
 
@@ -2032,7 +2045,6 @@ __all__ = [
     "MODULES",
     "PRECISION_MODES",
     "PROGRAMS",
-    "TEST_KNOBS_ENV",
     "TEST_MANIFEST",
     "TEST_MODULES",
     "TILE",
