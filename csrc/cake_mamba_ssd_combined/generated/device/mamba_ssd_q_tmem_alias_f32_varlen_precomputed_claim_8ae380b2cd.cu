@@ -84,9 +84,9 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_SMEM_GEOMETRY_OFF 232064
 #define SMEM_SMEM_GEOMETRY_STAGE_BYTES 8
 #define SMEM_SMEM_GEOMETRY_STRIDE 8
-#define SMEM_SMEM_CLAIM_OFF 232072
-#define SMEM_SMEM_CLAIM_STAGE_BYTES 8
-#define SMEM_SMEM_CLAIM_STRIDE 8
+#define SMEM_SMEM_CLAIM_OFF 232080
+#define SMEM_SMEM_CLAIM_STAGE_BYTES 32
+#define SMEM_SMEM_CLAIM_STRIDE 32
 #define SMEM_SMEM_Y_OFF 196608
 #define SMEM_SMEM_Y_STAGE_BYTES 16384
 #define SMEM_SMEM_Y_STRIDE 16384
@@ -285,7 +285,7 @@ kernel_mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim(const __grid_constant
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 #endif
 
-    const int mbar_base = smem + 232080;
+    const int mbar_base = smem + 232112;
     #define bc_full_addr (mbar_base + 0)
     #define bc_empty_addr (mbar_base + 16)
     #define x_full_addr (mbar_base + 32)
@@ -334,75 +334,75 @@ kernel_mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim(const __grid_constant
     const int smem_bscale_addr = smem + 231552;
     int* smem_geometry = reinterpret_cast<int*>(smem_raw + 232064);
     const int smem_geometry_addr = smem + 232064;
-    unsigned int* smem_claim = reinterpret_cast<unsigned int*>(smem_raw + 232072);
-    const int smem_claim_addr = smem + 232072;
+    unsigned int* smem_claim = reinterpret_cast<unsigned int*>(smem_raw + 232080);
+    const int smem_claim_addr = smem + 232080;
     __nv_bfloat16* smem_y = reinterpret_cast<__nv_bfloat16*>(smem_raw + 196608);
     const int smem_y_addr = smem + 196608;
 
     // Mbarrier init (19 pipeline groups, 0 ordered-sequence groups, 34 barriers)
-    // Mbarriers at smem_raw[232080..232352)
+    // Mbarriers at smem_raw[232112..232384)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
         if (leader) {
             // --- pipeline 'input_pipe' ---
             // bc_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 232080, 1);
-            mbarrier_init(smem + 232088, 1);
-            // bc_empty: 2 barriers, init_count=3
-            mbarrier_init(smem + 232096, 3);
-            mbarrier_init(smem + 232104, 3);
-            // x_full: 2 barriers, init_count=1
             mbarrier_init(smem + 232112, 1);
             mbarrier_init(smem + 232120, 1);
-            // x_empty: 2 barriers, init_count=3
+            // bc_empty: 2 barriers, init_count=3
             mbarrier_init(smem + 232128, 3);
             mbarrier_init(smem + 232136, 3);
+            // x_full: 2 barriers, init_count=1
+            mbarrier_init(smem + 232144, 1);
+            mbarrier_init(smem + 232152, 1);
+            // x_empty: 2 barriers, init_count=3
+            mbarrier_init(smem + 232160, 3);
+            mbarrier_init(smem + 232168, 3);
             // aux_full: 2 barriers, init_count=32
-            mbarrier_init(smem + 232144, 32);
-            mbarrier_init(smem + 232152, 32);
+            mbarrier_init(smem + 232176, 32);
+            mbarrier_init(smem + 232184, 32);
             // aux_empty: 2 barriers, init_count=384
-            mbarrier_init(smem + 232160, 384);
-            mbarrier_init(smem + 232168, 384);
+            mbarrier_init(smem + 232192, 384);
+            mbarrier_init(smem + 232200, 384);
             // --- pipeline 'intra1_acc_pipe' ---
             // cb_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 232176, 1);
-            mbarrier_init(smem + 232184, 1);
-            // cb_empty: 2 barriers, init_count=2
-            mbarrier_init(smem + 232192, 2);
-            mbarrier_init(smem + 232200, 2);
-            // q_full: 2 barriers, init_count=1
             mbarrier_init(smem + 232208, 1);
             mbarrier_init(smem + 232216, 1);
+            // cb_empty: 2 barriers, init_count=2
+            mbarrier_init(smem + 232224, 2);
+            mbarrier_init(smem + 232232, 2);
+            // q_full: 2 barriers, init_count=1
+            mbarrier_init(smem + 232240, 1);
+            mbarrier_init(smem + 232248, 1);
             // scaled_b_full: 1 barriers, init_count=1
-            mbarrier_init(smem + 232224, 1);
+            mbarrier_init(smem + 232256, 1);
             // --- pipeline 'state_pipe' ---
             // state_operand_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 232232, 1);
-            mbarrier_init(smem + 232240, 1);
-            // state_read_released: 2 barriers, init_count=1
-            mbarrier_init(smem + 232248, 1);
-            mbarrier_init(smem + 232256, 1);
-            // state_delta_full: 1 barriers, init_count=1
             mbarrier_init(smem + 232264, 1);
+            mbarrier_init(smem + 232272, 1);
+            // state_read_released: 2 barriers, init_count=1
+            mbarrier_init(smem + 232280, 1);
+            mbarrier_init(smem + 232288, 1);
+            // state_delta_full: 1 barriers, init_count=1
+            mbarrier_init(smem + 232296, 1);
             // --- pipeline 'intra1_acc_pipe' ---
             // intra_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 232272, 1);
-            mbarrier_init(smem + 232280, 1);
-            // intra_empty: 2 barriers, init_count=4
-            mbarrier_init(smem + 232288, 4);
-            mbarrier_init(smem + 232296, 4);
-            // inter_full: 1 barriers, init_count=1
             mbarrier_init(smem + 232304, 1);
+            mbarrier_init(smem + 232312, 1);
+            // intra_empty: 2 barriers, init_count=4
+            mbarrier_init(smem + 232320, 4);
+            mbarrier_init(smem + 232328, 4);
+            // inter_full: 1 barriers, init_count=1
+            mbarrier_init(smem + 232336, 1);
             // inter_empty: 1 barriers, init_count=4
-            mbarrier_init(smem + 232312, 4);
+            mbarrier_init(smem + 232344, 4);
             // --- pipeline 'claim_pipe' ---
             // claim_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 232320, 1);
-            mbarrier_init(smem + 232328, 1);
+            mbarrier_init(smem + 232352, 1);
+            mbarrier_init(smem + 232360, 1);
             // claim_empty: 2 barriers, init_count=15
-            mbarrier_init(smem + 232336, 15);
-            mbarrier_init(smem + 232344, 15);
+            mbarrier_init(smem + 232368, 15);
+            mbarrier_init(smem + 232376, 15);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -410,9 +410,9 @@ kernel_mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim(const __grid_constant
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 232352);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 232384);
     if (warp == 12) {
-        int _tmem_hold = smem + 232352;
+        int _tmem_hold = smem + 232384;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
@@ -447,6 +447,14 @@ kernel_mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim(const __grid_constant
             unsigned int state_stage = 0;
             unsigned int claim_stage = 0;
             unsigned int claim_step = (unsigned int)num_bids;
+            int ahead_first = 0;
+            int ahead_end = 0;
+            int ahead_chunk = 0;
+            if ((unsigned int)bid < (unsigned int)(sequence_count * nheads)) {
+                int ahead_sequence = (unsigned int)bid / (unsigned int)nheads;
+                ahead_first = seq_chunk_cumsum[ahead_sequence];
+                ahead_end = seq_chunk_cumsum[ahead_sequence + 1];
+            }
             unsigned int _phase_bc_full = 0;
             unsigned int _phase_state_operand_full = 0;
             unsigned int _phase_inter_empty_0 = 1;
@@ -455,14 +463,8 @@ kernel_mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim(const __grid_constant
             #pragma unroll 1
             for (unsigned int work = bid; work < sequence_count * nheads; work += claim_step) {
                 int sequence = work / (unsigned int)nheads;
-                int first_logical = sequence * nchunks;
-                int logical_end = first_logical + nchunks;
-                int item_lo = 0;
-                int item_hi = 0;
-                int item_checkpoint = -1;
-                int checkpoint_rank = 1073741824;
-                first_logical = seq_chunk_cumsum[sequence];
-                logical_end = seq_chunk_cumsum[sequence + 1];
+                int first_logical = ahead_first;
+                int logical_end = ahead_end;
                 int uniform = make_warp_uniform(first_logical);
                 first_logical = uniform;
                 int uniform_1 = make_warp_uniform(logical_end);
@@ -577,7 +579,10 @@ kernel_mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim(const __grid_constant
                     if (state_stage == 2) { state_stage = 0; _phase_state_operand_full ^= 1; }
                 }
                 mbarrier_wait(claim_full_addr + (claim_stage) * 8, _phase_claim_full);
-                unsigned int claim_word = smem_claim[claim_stage];
+                unsigned int claim_word = smem_claim[claim_stage * 4];
+                ahead_first = (int)smem_claim[claim_stage * 4 + 1];
+                ahead_end = (int)smem_claim[claim_stage * 4 + 2];
+                ahead_chunk = (int)smem_claim[claim_stage * 4 + 3];
                 int claim_next = make_warp_uniform(claim_word);
                 __syncwarp();
                 if (elect_sync()) {
@@ -596,6 +601,14 @@ kernel_mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim(const __grid_constant
             unsigned int acc_stage = 0;
             unsigned int claim_stage_1 = 0;
             unsigned int claim_step_1 = (unsigned int)num_bids;
+            int ahead_first_1 = 0;
+            int ahead_end_1 = 0;
+            int ahead_chunk_1 = 0;
+            if ((unsigned int)bid < (unsigned int)(sequence_count * nheads)) {
+                int ahead_sequence_1 = (unsigned int)bid / (unsigned int)nheads;
+                ahead_first_1 = seq_chunk_cumsum[ahead_sequence_1];
+                ahead_end_1 = seq_chunk_cumsum[ahead_sequence_1 + 1];
+            }
             unsigned int _phase_q_full = 0;
             unsigned int _phase_intra_empty = 1;
             unsigned int _phase_x_full = 0;
@@ -603,14 +616,8 @@ kernel_mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim(const __grid_constant
             #pragma unroll 1
             for (unsigned int work_1 = bid; work_1 < sequence_count * nheads; work_1 += claim_step_1) {
                 int sequence_1 = work_1 / (unsigned int)nheads;
-                int first_logical_1 = sequence_1 * nchunks;
-                int logical_end_1 = first_logical_1 + nchunks;
-                int item_lo_1 = 0;
-                int item_hi_1 = 0;
-                int item_checkpoint_1 = -1;
-                int checkpoint_rank_1 = 1073741824;
-                first_logical_1 = seq_chunk_cumsum[sequence_1];
-                logical_end_1 = seq_chunk_cumsum[sequence_1 + 1];
+                int first_logical_1 = ahead_first_1;
+                int logical_end_1 = ahead_end_1;
                 int uniform_2 = make_warp_uniform(first_logical_1);
                 first_logical_1 = uniform_2;
                 int uniform_1_1 = make_warp_uniform(logical_end_1);
@@ -680,7 +687,10 @@ kernel_mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim(const __grid_constant
                     if (acc_stage == 2) { acc_stage = 0; _phase_q_full ^= 1; _phase_intra_empty ^= 1; }
                 }
                 mbarrier_wait(claim_full_addr + (claim_stage_1) * 8, _phase_claim_full_1);
-                unsigned int claim_word_1 = smem_claim[claim_stage_1];
+                unsigned int claim_word_1 = smem_claim[claim_stage_1 * 4];
+                ahead_first_1 = (int)smem_claim[claim_stage_1 * 4 + 1];
+                ahead_end_1 = (int)smem_claim[claim_stage_1 * 4 + 2];
+                ahead_chunk_1 = (int)smem_claim[claim_stage_1 * 4 + 3];
                 int claim_next_1 = make_warp_uniform(claim_word_1);
                 __syncwarp();
                 if (elect_sync()) {
@@ -700,6 +710,17 @@ kernel_mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim(const __grid_constant
             unsigned int cb_acc_stage = 0;
             unsigned int claim_stage_2 = 0;
             unsigned int claim_step_2 = (unsigned int)num_bids;
+            int ahead_first_2 = 0;
+            int ahead_end_2 = 0;
+            int ahead_chunk_2 = 0;
+            if ((unsigned int)bid < (unsigned int)(sequence_count * nheads)) {
+                int ahead_sequence_2 = (unsigned int)bid / (unsigned int)nheads;
+                ahead_first_2 = seq_chunk_cumsum[ahead_sequence_2];
+                ahead_end_2 = seq_chunk_cumsum[ahead_sequence_2 + 1];
+                if (ahead_first_2 < ahead_end_2) {
+                    ahead_chunk_2 = chunk_indices[ahead_first_2];
+                }
+            }
             unsigned int _phase_bc_empty = 1;
             unsigned int _phase_bc_full_1 = 0;
             unsigned int _phase_cb_empty = 1;
@@ -709,18 +730,13 @@ kernel_mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim(const __grid_constant
                 int sequence_2 = work_2 / (unsigned int)nheads;
                 int head = work_2 % (unsigned int)nheads;
                 int group = head * ngroups / nheads;
-                int first_logical_2 = sequence_2 * nchunks;
-                int logical_end_2 = first_logical_2 + nchunks;
-                int item_lo_2 = 0;
-                int item_hi_2 = 0;
-                int item_checkpoint_2 = -1;
-                int checkpoint_rank_2 = 1073741824;
-                first_logical_2 = seq_chunk_cumsum[sequence_2];
-                logical_end_2 = seq_chunk_cumsum[sequence_2 + 1];
+                int first_logical_2 = ahead_first_2;
+                int logical_end_2 = ahead_end_2;
                 int uniform_3 = make_warp_uniform(first_logical_2);
                 first_logical_2 = uniform_3;
                 int uniform_1_2 = make_warp_uniform(logical_end_2);
                 logical_end_2 = uniform_1_2;
+                int first_chunk = ahead_chunk_2;
                 int physical_batch = 0;
                 int refill_first = 0;
                 int next_work = work_2 + (unsigned int)num_bids;
@@ -736,8 +752,7 @@ kernel_mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim(const __grid_constant
                 int next_physical = 0;
                 int next_token = 0;
                 if (first_logical_2 < logical_end_2) {
-                    int chunk = first_logical_2 - sequence_2 * nchunks;
-                    chunk = chunk_indices[first_logical_2];
+                    int chunk = first_chunk;
                     int first_token = chunk * 128;
                     mbarrier_wait(bc_empty_addr + (input_stage_2) * 8, _phase_bc_empty);
                     if (elect_sync()) {
@@ -847,7 +862,10 @@ kernel_mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim(const __grid_constant
                     }
                 }
                 mbarrier_wait(claim_full_addr + (claim_stage_2) * 8, _phase_claim_full_2);
-                unsigned int claim_word_2 = smem_claim[claim_stage_2];
+                unsigned int claim_word_2 = smem_claim[claim_stage_2 * 4];
+                ahead_first_2 = (int)smem_claim[claim_stage_2 * 4 + 1];
+                ahead_end_2 = (int)smem_claim[claim_stage_2 * 4 + 2];
+                ahead_chunk_2 = (int)smem_claim[claim_stage_2 * 4 + 3];
                 int claim_next_2 = make_warp_uniform(claim_word_2);
                 __syncwarp();
                 if (elect_sync()) {
@@ -865,30 +883,35 @@ kernel_mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim(const __grid_constant
             unsigned int input_stage_3 = 0;
             unsigned int claim_stage_3 = 0;
             unsigned int claim_step_3 = (unsigned int)num_bids;
+            int ahead_first_3 = 0;
+            int ahead_end_3 = 0;
+            int ahead_chunk_3 = 0;
+            if ((unsigned int)bid < (unsigned int)(sequence_count * nheads)) {
+                int ahead_sequence_3 = (unsigned int)bid / (unsigned int)nheads;
+                ahead_first_3 = seq_chunk_cumsum[ahead_sequence_3];
+                ahead_end_3 = seq_chunk_cumsum[ahead_sequence_3 + 1];
+                if (ahead_first_3 < ahead_end_3) {
+                    ahead_chunk_3 = chunk_indices[ahead_first_3];
+                }
+            }
             unsigned int _phase_aux_empty = 1;
             unsigned int _phase_claim_empty = 1;
             #pragma unroll 1
             for (unsigned int work_3 = bid; work_3 < sequence_count * nheads; work_3 += claim_step_3) {
                 int sequence_3 = work_3 / (unsigned int)nheads;
                 int head_1 = work_3 % (unsigned int)nheads;
-                int first_logical_3 = sequence_3 * nchunks;
-                int logical_end_3 = first_logical_3 + nchunks;
-                int item_lo_3 = 0;
-                int item_hi_3 = 0;
-                int item_checkpoint_3 = -1;
-                int checkpoint_rank_3 = 1073741824;
-                first_logical_3 = seq_chunk_cumsum[sequence_3];
-                logical_end_3 = seq_chunk_cumsum[sequence_3 + 1];
+                int first_logical_3 = ahead_first_3;
+                int logical_end_3 = ahead_end_3;
                 int uniform_4 = make_warp_uniform(first_logical_3);
                 first_logical_3 = uniform_4;
                 int uniform_1_3 = make_warp_uniform(logical_end_3);
                 logical_end_3 = uniform_1_3;
+                int first_chunk_1 = ahead_chunk_3;
                 #pragma unroll 1
                 for (int logical_3 = first_logical_3; logical_3 < logical_end_3; logical_3++) {
-                    int physical_chunk = logical_3 - sequence_3 * nchunks;
+                    int physical_chunk = ((logical_3 == first_logical_3) ? first_chunk_1 : chunk_indices[logical_3]);
                     int segment_offset = 0;
                     int segment_limit = 128;
-                    physical_chunk = chunk_indices[logical_3];
                     segment_offset = chunk_offsets[logical_3];
                     if (logical_3 + 1 < num_logical_chunks) {
                         int next_chunk = chunk_indices[logical_3 + 1];
@@ -946,6 +969,17 @@ kernel_mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim(const __grid_constant
                 }
                 unsigned int _shfl_sync_1 = __shfl_sync(0xFFFFFFFF, claim_drawn, 0);
                 unsigned int claim_next_3 = _shfl_sync_1 + (unsigned int)num_bids;
+                ahead_first_3 = 0;
+                ahead_end_3 = 0;
+                ahead_chunk_3 = 0;
+                if (claim_next_3 < (unsigned int)(sequence_count * nheads)) {
+                    int ahead_drawn_sequence = claim_next_3 / (unsigned int)nheads;
+                    ahead_first_3 = seq_chunk_cumsum[ahead_drawn_sequence];
+                    ahead_end_3 = seq_chunk_cumsum[ahead_drawn_sequence + 1];
+                    if (ahead_first_3 < ahead_end_3) {
+                        ahead_chunk_3 = chunk_indices[ahead_first_3];
+                    }
+                }
                 if (has_initial != 0) {
                     int pf_work = claim_next_3;
                     if (pf_work < sequence_count * nheads) {
@@ -958,7 +992,10 @@ kernel_mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim(const __grid_constant
                 }
                 mbarrier_wait(claim_empty_addr + (claim_stage_3) * 8, _phase_claim_empty);
                 if (elect_sync()) {
-                    smem_claim[claim_stage_3] = claim_next_3;
+                    smem_claim[claim_stage_3 * 4] = claim_next_3;
+                    smem_claim[claim_stage_3 * 4 + 1] = (unsigned int)ahead_first_3;
+                    smem_claim[claim_stage_3 * 4 + 2] = (unsigned int)ahead_end_3;
+                    smem_claim[claim_stage_3 * 4 + 3] = (unsigned int)ahead_chunk_3;
                     mbarrier_arrive(claim_full_addr + (claim_stage_3) * 8);
                 }
                 claim_stage_3 += 1;
@@ -978,6 +1015,14 @@ kernel_mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim(const __grid_constant
             float state_values[64];
             unsigned int claim_stage_4 = 0;
             unsigned int claim_step_4 = (unsigned int)num_bids;
+            int ahead_first_4 = 0;
+            int ahead_end_4 = 0;
+            int ahead_chunk_4 = 0;
+            if ((unsigned int)bid < (unsigned int)(sequence_count * nheads)) {
+                int ahead_sequence_4 = (unsigned int)bid / (unsigned int)nheads;
+                ahead_first_4 = seq_chunk_cumsum[ahead_sequence_4];
+                ahead_end_4 = seq_chunk_cumsum[ahead_sequence_4 + 1];
+            }
             unsigned int _phase_aux_full = 0;
             unsigned int _phase_state_read_released = 1;
             unsigned int _phase_cb_full = 0;
@@ -1008,14 +1053,8 @@ kernel_mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim(const __grid_constant
                         }
                     }
                 }
-                int first_logical_4 = sequence_4 * nchunks;
-                int logical_end_4 = first_logical_4 + nchunks;
-                int item_lo_4 = 0;
-                int item_hi_4 = 0;
-                int item_checkpoint_4 = -1;
-                int checkpoint_rank_4 = 1073741824;
-                first_logical_4 = seq_chunk_cumsum[sequence_4];
-                logical_end_4 = seq_chunk_cumsum[sequence_4 + 1];
+                int first_logical_4 = ahead_first_4;
+                int logical_end_4 = ahead_end_4;
                 int uniform_5 = make_warp_uniform(first_logical_4);
                 first_logical_4 = uniform_5;
                 int uniform_1_4 = make_warp_uniform(logical_end_4);
@@ -1214,7 +1253,10 @@ kernel_mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim(const __grid_constant
                     }
                 }
                 mbarrier_wait(claim_full_addr + (claim_stage_4) * 8, _phase_claim_full_3);
-                unsigned int claim_word_3 = smem_claim[claim_stage_4];
+                unsigned int claim_word_3 = smem_claim[claim_stage_4 * 4];
+                ahead_first_4 = (int)smem_claim[claim_stage_4 * 4 + 1];
+                ahead_end_4 = (int)smem_claim[claim_stage_4 * 4 + 2];
+                ahead_chunk_4 = (int)smem_claim[claim_stage_4 * 4 + 3];
                 int claim_next_4 = make_warp_uniform(claim_word_3);
                 __syncwarp();
                 if (elect_sync()) {
@@ -1237,20 +1279,22 @@ kernel_mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim(const __grid_constant
             int taddr_0_1 = taddr;
             unsigned int claim_stage_5 = 0;
             unsigned int claim_step_5 = (unsigned int)num_bids;
+            int ahead_first_5 = 0;
+            int ahead_end_5 = 0;
+            int ahead_chunk_5 = 0;
+            if ((unsigned int)bid < (unsigned int)(sequence_count * nheads)) {
+                int ahead_sequence_5 = (unsigned int)bid / (unsigned int)nheads;
+                ahead_first_5 = seq_chunk_cumsum[ahead_sequence_5];
+                ahead_end_5 = seq_chunk_cumsum[ahead_sequence_5 + 1];
+            }
             unsigned int _phase_cb_full_1 = 0;
             unsigned int _phase_aux_full_1 = 0;
             unsigned int _phase_claim_full_4 = 0;
             #pragma unroll 1
             for (unsigned int work_5 = bid; work_5 < sequence_count * nheads; work_5 += claim_step_5) {
                 int sequence_5 = work_5 / (unsigned int)nheads;
-                int first_logical_5 = sequence_5 * nchunks;
-                int logical_end_5 = first_logical_5 + nchunks;
-                int item_lo_5 = 0;
-                int item_hi_5 = 0;
-                int item_checkpoint_5 = -1;
-                int checkpoint_rank_5 = 1073741824;
-                first_logical_5 = seq_chunk_cumsum[sequence_5];
-                logical_end_5 = seq_chunk_cumsum[sequence_5 + 1];
+                int first_logical_5 = ahead_first_5;
+                int logical_end_5 = ahead_end_5;
                 int uniform_6 = make_warp_uniform(first_logical_5);
                 first_logical_5 = uniform_6;
                 int uniform_1_5 = make_warp_uniform(logical_end_5);
@@ -1329,7 +1373,10 @@ kernel_mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim(const __grid_constant
                     if (acc_stage_2 == 2) { acc_stage_2 = 0; _phase_cb_full_1 ^= 1; }
                 }
                 mbarrier_wait(claim_full_addr + (claim_stage_5) * 8, _phase_claim_full_4);
-                unsigned int claim_word_4 = smem_claim[claim_stage_5];
+                unsigned int claim_word_4 = smem_claim[claim_stage_5 * 4];
+                ahead_first_5 = (int)smem_claim[claim_stage_5 * 4 + 1];
+                ahead_end_5 = (int)smem_claim[claim_stage_5 * 4 + 2];
+                ahead_chunk_5 = (int)smem_claim[claim_stage_5 * 4 + 3];
                 int claim_next_5 = make_warp_uniform(claim_word_4);
                 __syncwarp();
                 if (elect_sync()) {
@@ -1354,6 +1401,17 @@ kernel_mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim(const __grid_constant
             int taddr_0_2 = taddr;
             unsigned int claim_stage_6 = 0;
             unsigned int claim_step_6 = (unsigned int)num_bids;
+            int ahead_first_6 = 0;
+            int ahead_end_6 = 0;
+            int ahead_chunk_6 = 0;
+            if ((unsigned int)bid < (unsigned int)(sequence_count * nheads)) {
+                int ahead_sequence_6 = (unsigned int)bid / (unsigned int)nheads;
+                ahead_first_6 = seq_chunk_cumsum[ahead_sequence_6];
+                ahead_end_6 = seq_chunk_cumsum[ahead_sequence_6 + 1];
+                if (ahead_first_6 < ahead_end_6) {
+                    ahead_chunk_6 = chunk_indices[ahead_first_6];
+                }
+            }
             unsigned int _phase_intra_full = 0;
             unsigned int _phase_inter_full_0 = 0;
             unsigned int _phase_aux_full_2 = 0;
@@ -1397,22 +1455,16 @@ kernel_mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim(const __grid_constant
                     }
                 }
                 asm volatile("barrier.sync 10, 128;" ::: "memory");
-                int first_logical_6 = sequence_6 * nchunks;
-                int logical_end_6 = first_logical_6 + nchunks;
-                int item_lo_6 = 0;
-                int item_hi_6 = 0;
-                int item_checkpoint_6 = -1;
-                int checkpoint_rank_6 = 1073741824;
-                first_logical_6 = seq_chunk_cumsum[sequence_6];
-                logical_end_6 = seq_chunk_cumsum[sequence_6 + 1];
+                int first_logical_6 = ahead_first_6;
+                int logical_end_6 = ahead_end_6;
                 int uniform_7 = make_warp_uniform(first_logical_6);
                 first_logical_6 = uniform_7;
                 int uniform_1_6 = make_warp_uniform(logical_end_6);
                 logical_end_6 = uniform_1_6;
+                int first_chunk_2 = ahead_chunk_6;
                 #pragma unroll 1
                 for (int logical_6 = first_logical_6; logical_6 < logical_end_6; logical_6++) {
-                    int chunk_4 = logical_6 - sequence_6 * nchunks;
-                    chunk_4 = chunk_indices[logical_6];
+                    int chunk_4 = ((logical_6 == first_logical_6) ? first_chunk_2 : chunk_indices[logical_6]);
                     int segment_offset_3 = 0;
                     int segment_limit_3 = 128;
                     int chunk_tokens_1 = 128;
@@ -2205,7 +2257,10 @@ kernel_mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim(const __grid_constant
                     if (acc_stage_3 == 2) { acc_stage_3 = 0; _phase_intra_full ^= 1; }
                 }
                 mbarrier_wait(claim_full_addr + (claim_stage_6) * 8, _phase_claim_full_5);
-                unsigned int claim_word_5 = smem_claim[claim_stage_6];
+                unsigned int claim_word_5 = smem_claim[claim_stage_6 * 4];
+                ahead_first_6 = (int)smem_claim[claim_stage_6 * 4 + 1];
+                ahead_end_6 = (int)smem_claim[claim_stage_6 * 4 + 2];
+                ahead_chunk_6 = (int)smem_claim[claim_stage_6 * 4 + 3];
                 int claim_next_6 = make_warp_uniform(claim_word_5);
                 __syncwarp();
                 if (elect_sync()) {
