@@ -37,6 +37,7 @@ import pytest
 import torch
 
 from flashinfer import utils
+from tests.test_helpers.cake_profiler import cuda_kernel_names
 
 _FP8_MAX = 448.0
 _GROUP = 128
@@ -546,14 +547,7 @@ def test_alphamoe_sm100_m8_quad_cluster_capacity(m, top_k, block_m):
         pytest.skip(f"no measured quad cluster capacity for {sms} SMs")
     seed = 29700 + m * top_k + block_m
     case = _make_case(m, 256, 7168, 257, top_k, block_m, False, 0.8, 1.0, seed)
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CUDA]
-    ) as prof:
-        _launch(case)
-        torch.cuda.synchronize()
-    names = [
-        e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA
-    ]
+    names = cuda_kernel_names(lambda: _launch(case))
     quad = any("w8a8_i2" in x or "w8a8_im" in x for x in names)
     pair = any("w8a8_p2" in x or "w8a8_pl" in x for x in names)
     bound = m * top_k * block_m // 8

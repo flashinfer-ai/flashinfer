@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from flashinfer.jit import cake_megamoe_topk_reduce as reducer
+from tests.test_helpers.cake_profiler import cuda_kernel_names
 
 _ARCHS = ("sm_100a", "sm_103a")
 _CAPABILITIES = {"sm_100a": (10, 0), "sm_103a": (10, 3)}
@@ -231,24 +232,11 @@ def _random_partials(
 
 
 def _profiled_kernel_names(fn) -> list[str]:
-    """CUDA kernel names of one call of ``fn``.  The profiler's warm-up step runs
-    one call whose records are discarded: CUDA activity collection starts
-    asynchronously once the profiler is entered."""
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CUDA],
-        schedule=torch.profiler.schedule(wait=0, warmup=1, active=1, repeat=1),
-    ) as profile:
-        fn()
-        torch.cuda.synchronize()
-        profile.step()
-        fn()
-        torch.cuda.synchronize()
-    return [
-        event.name
-        for event in profile.events()
-        if event.device_type == torch.autograd.DeviceType.CUDA
-        and not event.name.startswith(("Memcpy", "Memset"))
-    ]
+    """CUDA kernel names of one call of ``fn`` (memcpy / memset records dropped), read
+    from a sentinel-bracketed profiler session: a session that loses its device records
+    (``CUPTI-LOST-RECORDS``) is retried, and the test skips rather than reporting a
+    launch it cannot see."""
+    return cuda_kernel_names(fn)
 
 
 @pytest.mark.arch_blackwell
