@@ -191,7 +191,7 @@ __device__ __forceinline__ void tma_store_3d(
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_batch_deepgemm_fp8_03cebdfa6c1d557162f4(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, int* __restrict__ SFA_bits, int* __restrict__ SFB_bits, int* __restrict__ masked_m, const __grid_constant__ CUtensorMap C_tma, unsigned int num_groups, unsigned int shape_m, unsigned int shape_n, unsigned int grid_n, unsigned int k_tiles, unsigned int sf_cols)
+kernel_cake_batch_deepgemm_fp8_5c18fc9715455fdbe5b1(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, int* __restrict__ SFA_bits, int* __restrict__ SFB_bits, int* __restrict__ masked_m, const __grid_constant__ CUtensorMap C_tma, unsigned int num_groups, unsigned int shape_m, unsigned int shape_n, unsigned int grid_n, unsigned int k_tiles, unsigned int sf_cols)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -510,6 +510,61 @@ kernel_cake_batch_deepgemm_fp8_03cebdfa6c1d557162f4(const __grid_constant__ CUte
                 unsigned int off_m_1 = m_block_2 * 128;
                 unsigned int sfa_row0 = current_group_idx_2 * shape_m + off_m_1;
                 unsigned int sfb_row = current_group_idx_2 * grid_n + n_block_1;
+                int sp_b[4];
+                {
+                    const int4* _ivptr_0 = reinterpret_cast<const int4*>(SFB_bits + (sfb_row * sf_cols) + 0);
+                    int4 _ivld_0;
+                    _ivld_0 = *_ivptr_0;
+                    sp_b[0 + 0] = _ivld_0.x;
+                    sp_b[0 + 1] = _ivld_0.y;
+                    sp_b[0 + 2] = _ivld_0.z;
+                    sp_b[0 + 3] = _ivld_0.w;
+                }
+                int sp_a[16];
+                if (off_m_1 + (unsigned int)0 + sf_lane < shape_m) {
+                    {
+                        const int4* _ivptr_1 = reinterpret_cast<const int4*>(SFA_bits + ((sfa_row0 + (unsigned int)0 + sf_lane) * sf_cols) + 0);
+                        int4 _ivld_1;
+                        _ivld_1 = *_ivptr_1;
+                        sp_a[0 + 0] = _ivld_1.x;
+                        sp_a[0 + 1] = _ivld_1.y;
+                        sp_a[0 + 2] = _ivld_1.z;
+                        sp_a[0 + 3] = _ivld_1.w;
+                    }
+                }
+                if (off_m_1 + (unsigned int)32 + sf_lane < shape_m) {
+                    {
+                        const int4* _ivptr_2 = reinterpret_cast<const int4*>(SFA_bits + ((sfa_row0 + (unsigned int)32 + sf_lane) * sf_cols) + 0);
+                        int4 _ivld_2;
+                        _ivld_2 = *_ivptr_2;
+                        sp_a[4 + 0] = _ivld_2.x;
+                        sp_a[4 + 1] = _ivld_2.y;
+                        sp_a[4 + 2] = _ivld_2.z;
+                        sp_a[4 + 3] = _ivld_2.w;
+                    }
+                }
+                if (off_m_1 + (unsigned int)64 + sf_lane < shape_m) {
+                    {
+                        const int4* _ivptr_3 = reinterpret_cast<const int4*>(SFA_bits + ((sfa_row0 + (unsigned int)64 + sf_lane) * sf_cols) + 0);
+                        int4 _ivld_3;
+                        _ivld_3 = *_ivptr_3;
+                        sp_a[8 + 0] = _ivld_3.x;
+                        sp_a[8 + 1] = _ivld_3.y;
+                        sp_a[8 + 2] = _ivld_3.z;
+                        sp_a[8 + 3] = _ivld_3.w;
+                    }
+                }
+                if (off_m_1 + (unsigned int)96 + sf_lane < shape_m) {
+                    {
+                        const int4* _ivptr_4 = reinterpret_cast<const int4*>(SFA_bits + ((sfa_row0 + (unsigned int)96 + sf_lane) * sf_cols) + 0);
+                        int4 _ivld_4;
+                        _ivld_4 = *_ivptr_4;
+                        sp_a[12 + 0] = _ivld_4.x;
+                        sp_a[12 + 1] = _ivld_4.y;
+                        sp_a[12 + 2] = _ivld_4.z;
+                        sp_a[12 + 3] = _ivld_4.w;
+                    }
+                }
                 #pragma unroll 1
                 for (int iter_k_2 = 0; iter_k_2 < k_tiles; iter_k_2++) {
                     mbarrier_wait_hint(tma_free_addr + (sf_stage) * 8, _phase_tma_free_1, 10000000);
@@ -517,17 +572,7 @@ kernel_cake_batch_deepgemm_fp8_03cebdfa6c1d557162f4(const __grid_constant__ CUte
                         unsigned int sf_col = (unsigned int)iter_k_2;
                         unsigned int sfa_base = (unsigned int)(smem_sfa_addr + sf_stage * 25600);
                         unsigned int sfb_base = (unsigned int)(smem_sfb_addr + sf_stage * 25600);
-                        int _vec_load_0[4];
-                        {
-                            const int4* _ivptr_0 = reinterpret_cast<const int4*>(SFB_bits + (sfb_row * sf_cols + sf_col) + 0);
-                            int4 _ivld_0;
-                            _ivld_0 = *_ivptr_0;
-                            _vec_load_0[0 + 0] = _ivld_0.x;
-                            _vec_load_0[0 + 1] = _ivld_0.y;
-                            _vec_load_0[0 + 2] = _ivld_0.z;
-                            _vec_load_0[0 + 3] = _ivld_0.w;
-                        }
-                        unsigned int sfb_word = (unsigned int)_vec_load_0[0] >> 23 & 255 | ((unsigned int)_vec_load_0[1] >> 23 & 255) << 8 | ((unsigned int)_vec_load_0[2] >> 23 & 255) << 16 | ((unsigned int)_vec_load_0[3] >> 23 & 255) << 24;
+                        unsigned int sfb_word = (unsigned int)sp_b[0] >> 23 & 255 | ((unsigned int)sp_b[1] >> 23 & 255) << 8 | ((unsigned int)sp_b[2] >> 23 & 255) << 16 | ((unsigned int)sp_b[3] >> 23 & 255) << 24;
                         asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfb_base + sf_lane * 16), "r"(sfb_word));
                         asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfb_base + sf_lane * 16 + 4), "r"(sfb_word));
                         asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfb_base + sf_lane * 16 + 8), "r"(sfb_word));
@@ -535,68 +580,83 @@ kernel_cake_batch_deepgemm_fp8_03cebdfa6c1d557162f4(const __grid_constant__ CUte
                         unsigned int sf_row = (unsigned int)0 + sf_lane;
                         unsigned int sfa_word = (unsigned int)2139062143;
                         if (off_m_1 + sf_row < shape_m) {
-                            int _vec_load_1[4];
-                            {
-                                const int4* _ivptr_1 = reinterpret_cast<const int4*>(SFA_bits + ((sfa_row0 + sf_row) * sf_cols + sf_col) + 0);
-                                int4 _ivld_1;
-                                _ivld_1 = *_ivptr_1;
-                                _vec_load_1[0 + 0] = _ivld_1.x;
-                                _vec_load_1[0 + 1] = _ivld_1.y;
-                                _vec_load_1[0 + 2] = _ivld_1.z;
-                                _vec_load_1[0 + 3] = _ivld_1.w;
-                            }
-                            sfa_word = (unsigned int)_vec_load_1[0] >> 23 & 255 | ((unsigned int)_vec_load_1[1] >> 23 & 255) << 8 | ((unsigned int)_vec_load_1[2] >> 23 & 255) << 16 | ((unsigned int)_vec_load_1[3] >> 23 & 255) << 24;
+                            sfa_word = (unsigned int)sp_a[0] >> 23 & 255 | ((unsigned int)sp_a[1] >> 23 & 255) << 8 | ((unsigned int)sp_a[2] >> 23 & 255) << 16 | ((unsigned int)sp_a[3] >> 23 & 255) << 24;
                         }
                         asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfa_base + sf_lane * 16), "r"(sfa_word));
                         unsigned int sf_row_0 = (unsigned int)32 + sf_lane;
                         unsigned int sfa_word_1 = (unsigned int)2139062143;
                         if (off_m_1 + sf_row_0 < shape_m) {
-                            int _vec_load_2[4];
-                            {
-                                const int4* _ivptr_2 = reinterpret_cast<const int4*>(SFA_bits + ((sfa_row0 + sf_row_0) * sf_cols + sf_col) + 0);
-                                int4 _ivld_2;
-                                _ivld_2 = *_ivptr_2;
-                                _vec_load_2[0 + 0] = _ivld_2.x;
-                                _vec_load_2[0 + 1] = _ivld_2.y;
-                                _vec_load_2[0 + 2] = _ivld_2.z;
-                                _vec_load_2[0 + 3] = _ivld_2.w;
-                            }
-                            sfa_word_1 = (unsigned int)_vec_load_2[0] >> 23 & 255 | ((unsigned int)_vec_load_2[1] >> 23 & 255) << 8 | ((unsigned int)_vec_load_2[2] >> 23 & 255) << 16 | ((unsigned int)_vec_load_2[3] >> 23 & 255) << 24;
+                            sfa_word_1 = (unsigned int)sp_a[4] >> 23 & 255 | ((unsigned int)sp_a[5] >> 23 & 255) << 8 | ((unsigned int)sp_a[6] >> 23 & 255) << 16 | ((unsigned int)sp_a[7] >> 23 & 255) << 24;
                         }
                         asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfa_base + 4 + sf_lane * 16), "r"(sfa_word_1));
                         unsigned int sf_row_2 = (unsigned int)64 + sf_lane;
                         unsigned int sfa_word_3 = (unsigned int)2139062143;
                         if (off_m_1 + sf_row_2 < shape_m) {
-                            int _vec_load_3[4];
-                            {
-                                const int4* _ivptr_3 = reinterpret_cast<const int4*>(SFA_bits + ((sfa_row0 + sf_row_2) * sf_cols + sf_col) + 0);
-                                int4 _ivld_3;
-                                _ivld_3 = *_ivptr_3;
-                                _vec_load_3[0 + 0] = _ivld_3.x;
-                                _vec_load_3[0 + 1] = _ivld_3.y;
-                                _vec_load_3[0 + 2] = _ivld_3.z;
-                                _vec_load_3[0 + 3] = _ivld_3.w;
-                            }
-                            sfa_word_3 = (unsigned int)_vec_load_3[0] >> 23 & 255 | ((unsigned int)_vec_load_3[1] >> 23 & 255) << 8 | ((unsigned int)_vec_load_3[2] >> 23 & 255) << 16 | ((unsigned int)_vec_load_3[3] >> 23 & 255) << 24;
+                            sfa_word_3 = (unsigned int)sp_a[8] >> 23 & 255 | ((unsigned int)sp_a[9] >> 23 & 255) << 8 | ((unsigned int)sp_a[10] >> 23 & 255) << 16 | ((unsigned int)sp_a[11] >> 23 & 255) << 24;
                         }
                         asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfa_base + 8 + sf_lane * 16), "r"(sfa_word_3));
                         unsigned int sf_row_4 = (unsigned int)96 + sf_lane;
                         unsigned int sfa_word_5 = (unsigned int)2139062143;
                         if (off_m_1 + sf_row_4 < shape_m) {
-                            int _vec_load_4[4];
-                            {
-                                const int4* _ivptr_4 = reinterpret_cast<const int4*>(SFA_bits + ((sfa_row0 + sf_row_4) * sf_cols + sf_col) + 0);
-                                int4 _ivld_4;
-                                _ivld_4 = *_ivptr_4;
-                                _vec_load_4[0 + 0] = _ivld_4.x;
-                                _vec_load_4[0 + 1] = _ivld_4.y;
-                                _vec_load_4[0 + 2] = _ivld_4.z;
-                                _vec_load_4[0 + 3] = _ivld_4.w;
-                            }
-                            sfa_word_5 = (unsigned int)_vec_load_4[0] >> 23 & 255 | ((unsigned int)_vec_load_4[1] >> 23 & 255) << 8 | ((unsigned int)_vec_load_4[2] >> 23 & 255) << 16 | ((unsigned int)_vec_load_4[3] >> 23 & 255) << 24;
+                            sfa_word_5 = (unsigned int)sp_a[12] >> 23 & 255 | ((unsigned int)sp_a[13] >> 23 & 255) << 8 | ((unsigned int)sp_a[14] >> 23 & 255) << 16 | ((unsigned int)sp_a[15] >> 23 & 255) << 24;
                         }
                         asm volatile("st.shared.b32 [%0], %1;" :: "r"(sfa_base + 12 + sf_lane * 16), "r"(sfa_word_5));
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                        if ((unsigned int)iter_k_2 + 4 < (unsigned int)k_tiles) {
+                            {
+                                const int4* _ivptr_5 = reinterpret_cast<const int4*>(SFB_bits + (sfb_row * sf_cols + sf_col + 4) + 0);
+                                int4 _ivld_5;
+                                _ivld_5 = *_ivptr_5;
+                                sp_b[0 + 0] = _ivld_5.x;
+                                sp_b[0 + 1] = _ivld_5.y;
+                                sp_b[0 + 2] = _ivld_5.z;
+                                sp_b[0 + 3] = _ivld_5.w;
+                            }
+                            if (off_m_1 + (unsigned int)0 + sf_lane < shape_m) {
+                                {
+                                    const int4* _ivptr_6 = reinterpret_cast<const int4*>(SFA_bits + ((sfa_row0 + (unsigned int)0 + sf_lane) * sf_cols + sf_col + 4) + 0);
+                                    int4 _ivld_6;
+                                    _ivld_6 = *_ivptr_6;
+                                    sp_a[0 + 0] = _ivld_6.x;
+                                    sp_a[0 + 1] = _ivld_6.y;
+                                    sp_a[0 + 2] = _ivld_6.z;
+                                    sp_a[0 + 3] = _ivld_6.w;
+                                }
+                            }
+                            if (off_m_1 + (unsigned int)32 + sf_lane < shape_m) {
+                                {
+                                    const int4* _ivptr_7 = reinterpret_cast<const int4*>(SFA_bits + ((sfa_row0 + (unsigned int)32 + sf_lane) * sf_cols + sf_col + 4) + 0);
+                                    int4 _ivld_7;
+                                    _ivld_7 = *_ivptr_7;
+                                    sp_a[4 + 0] = _ivld_7.x;
+                                    sp_a[4 + 1] = _ivld_7.y;
+                                    sp_a[4 + 2] = _ivld_7.z;
+                                    sp_a[4 + 3] = _ivld_7.w;
+                                }
+                            }
+                            if (off_m_1 + (unsigned int)64 + sf_lane < shape_m) {
+                                {
+                                    const int4* _ivptr_8 = reinterpret_cast<const int4*>(SFA_bits + ((sfa_row0 + (unsigned int)64 + sf_lane) * sf_cols + sf_col + 4) + 0);
+                                    int4 _ivld_8;
+                                    _ivld_8 = *_ivptr_8;
+                                    sp_a[8 + 0] = _ivld_8.x;
+                                    sp_a[8 + 1] = _ivld_8.y;
+                                    sp_a[8 + 2] = _ivld_8.z;
+                                    sp_a[8 + 3] = _ivld_8.w;
+                                }
+                            }
+                            if (off_m_1 + (unsigned int)96 + sf_lane < shape_m) {
+                                {
+                                    const int4* _ivptr_9 = reinterpret_cast<const int4*>(SFA_bits + ((sfa_row0 + (unsigned int)96 + sf_lane) * sf_cols + sf_col + 4) + 0);
+                                    int4 _ivld_9;
+                                    _ivld_9 = *_ivptr_9;
+                                    sp_a[12 + 0] = _ivld_9.x;
+                                    sp_a[12 + 1] = _ivld_9.y;
+                                    sp_a[12 + 2] = _ivld_9.z;
+                                    sp_a[12 + 3] = _ivld_9.w;
+                                }
+                            }
+                        }
                     }
                     asm volatile(
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
