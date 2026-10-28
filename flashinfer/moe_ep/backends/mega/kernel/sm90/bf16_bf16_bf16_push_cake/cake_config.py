@@ -100,6 +100,12 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     bits).  ``0`` disables it.  ``None`` reads
     ``FLASHINFER_SM90_CAKE_BF16_FC2_EARLY_MAX_TOKENS`` (default ``128``).
 
+    ``fc2_early_windows`` also runs the FC2 early start in larger rounds whose
+    local token count lies in the measured window of the pipe's shape
+    (hidden size, intermediate size, total experts, top_k, EP size); shapes
+    without a window are unaffected.  Same bits.  ``None`` reads
+    ``FLASHINFER_SM90_CAKE_BF16_FC2_EARLY_WINDOWS`` (default on).
+
     ``prefix_form`` selects how the single-launch dispatches compute the
     receiver-side prefix (``fused_begin`` 2): ``1`` lets the fused dispatch of
     rounds with ``T * top_k <= 1024`` and the grid dispatch compute it with the
@@ -147,3 +153,4 @@ class Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig:
     prefix_form: int | None = None
     direct_place: bool | None = None
     direct_place_min_tokens: int | None = None
+    fc2_early_windows: bool | None = None

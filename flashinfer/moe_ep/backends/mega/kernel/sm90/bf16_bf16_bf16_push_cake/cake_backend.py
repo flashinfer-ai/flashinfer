@@ -272,6 +272,12 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
             raise MoEEpConfigError(
                 f"{_NAME} per_route_publish_pdl must be a bool or None, got {kcfg.per_route_publish_pdl!r}"
             )
+        if kcfg.fc2_early_windows is not None and not isinstance(
+            kcfg.fc2_early_windows, bool
+        ):
+            raise MoEEpConfigError(
+                f"{_NAME} fc2_early_windows must be a bool or None, got {kcfg.fc2_early_windows!r}"
+            )
         if kcfg.fc2_early_max_tokens is not None and not (
             isinstance(kcfg.fc2_early_max_tokens, int)
             and not isinstance(kcfg.fc2_early_max_tokens, bool)
@@ -414,6 +420,7 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
                 prefix_form=kcfg.prefix_form,
                 direct_place=kcfg.direct_place,
                 direct_place_min_tokens=kcfg.direct_place_min_tokens,
+                fc2_early_windows=kcfg.fc2_early_windows,
             )
         except Exception:
             pipe.destroy()
@@ -452,6 +459,7 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
             kcfg.prefix_form,
             kcfg.direct_place,
             kcfg.direct_place_min_tokens,
+            kcfg.fc2_early_windows,
             float(kcfg.init_timeout_s),
         )
 

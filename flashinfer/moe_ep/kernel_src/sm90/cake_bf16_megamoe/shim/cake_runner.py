@@ -59,6 +59,8 @@ __all__ = [
     "DIRECT_PLACE_MIN_TOKENS_ENV",
     "FC2_EARLY_MAX_TOKENS",
     "FC2_EARLY_MAX_TOKENS_ENV",
+    "FC2_EARLY_WINDOWS",
+    "FC2_EARLY_WINDOWS_ENV",
     "FUSED_BEGIN_ENV",
     "FUSED_COMBINE_TAIL_ENV",
     "FUSED_DISPATCH_ENV",
@@ -189,6 +191,22 @@ COPY_FORMS = (0, 1)
 # 0 disables it.  FC1 and FC2 are rank-local, so ranks may differ per round.
 FC2_EARLY_MAX_TOKENS_ENV = "FLASHINFER_SM90_CAKE_BF16_FC2_EARLY_MAX_TOKENS"
 FC2_EARLY_MAX_TOKENS = 128
+# FC2 early start above the decode window: rounds whose local token count lies in
+# the window (lo, hi] of the pipe's shape also run the early-start pair.  Keyed
+# by host-known values only: (hidden size, intermediate size, total experts,
+# top_k, EP size).  The windows hold the measured shapes and token ranges where
+# the early-start pair was faster than the regular pair on H100; other shapes and
+# rounds keep the decode window alone (there the early FC2 tiles slowed FC1 by
+# more than they saved, or made no difference).  Same tiles, same bits.  0 disables the windows (the decode window is
+# unaffected).  Rank-local, so ranks may differ.
+FC2_EARLY_WINDOWS_ENV = "FLASHINFER_SM90_CAKE_BF16_FC2_EARLY_WINDOWS"
+FC2_EARLY_WINDOWS: dict[tuple[int, int, int, int, int], tuple[int, int]] = {
+    # (hidden, intermediate, total experts, top_k, ep): (lo, hi)
+    (7168, 2048, 256, 8, 8): (128, 4096),
+    (7168, 2048, 256, 8, 4): (128, 1024),
+    (7168, 2048, 256, 8, 2): (128, 1024),
+    (7168, 3072, 384, 6, 8): (512, 1024),
+}
 # Receiver-side prefix inside the single-launch dispatches (fused_begin 2): 1
 # (default) = the small-round fused dispatch and the grid dispatch compute the
 # integer prefix sums over the E x ep (expert, source) keys with the whole block,
@@ -341,6 +359,38 @@ def _drain_live_runners() -> None:
 atexit.register(_drain_live_runners)
 
 
+def _fc2_early_windows_default() -> bool:
+    raw = os.environ.get(FC2_EARLY_WINDOWS_ENV, "1").strip().lower()
+    return raw not in ("0", "false", "off", "no", "")
+
+
+def fc2_early_window_for(
+    hidden_size: int, intermediate_size: int, num_experts: int, top_k: int, ep: int
+) -> tuple[int, int] | None:
+    """The FC2 early-start window (lo, hi] above the decode window for a pipe
+    shape (``num_experts`` = total experts over the EP group), or ``None``."""
+    return FC2_EARLY_WINDOWS.get(
+        (
+            int(hidden_size),
+            int(intermediate_size),
+            int(num_experts),
+            int(top_k),
+            int(ep),
+        )
+    )
+
+
+def fc2_early_round(
+    num_tokens: int, max_tokens: int, window: tuple[int, int] | None
+) -> bool:
+    """True when a round of ``num_tokens`` local tokens runs the FC2 early-start
+    pair: the decode window ``0 < T <= max_tokens`` or the shape window
+    ``lo < T <= hi``."""
+    if 0 < num_tokens <= max_tokens:
+        return True
+    return window is not None and window[0] < num_tokens <= window[1]
+
+
 def _combine_wire_default(token_capacity: int) -> str:
     """Default combine wire: the environment override when set, otherwise the
     per-shape default (``per_route`` when ``token_capacity`` is at or below
@@ -438,6 +488,7 @@ class Sm90CakeBf16MoERunner:
         prefix_form: int | None = None,
         direct_place: bool | None = None,
         direct_place_min_tokens: int | None = None,
+        fc2_early_windows: bool | None = None,
     ) -> None:
         self.pipe = pipe
         self._state = _RunnerState.IDLE
@@ -530,6 +581,12 @@ class Sm90CakeBf16MoERunner:
                 f"fc2_early_max_tokens must be >= 0, got {fc2_early_max_tokens!r}"
             )
         self._fc2_early_max_tokens = early_max  # effective value fixed after the JIT
+        self._fc2_early_windows = (
+            _fc2_early_windows_default()
+            if fc2_early_windows is None
+            else bool(fc2_early_windows)
+        )
+        self._fc2_early_window: tuple[int, int] | None = None  # fixed after the JIT
         self._gemm_sched: torch.Tensor | None = None
         self._prefix_form = _form(prefix_form, PREFIX_FORM_ENV, "prefix_form")
         if direct_place is None:
@@ -675,13 +732,18 @@ class Sm90CakeBf16MoERunner:
                 else None
             )
             self.gemm = gemm if gemm is not None else create_grouped_gemm(clamp=clamp)
-            if not (
+            early_ok = (
                 pipe.E <= 1023  # the FC2 tile id carries the expert in 10 bits
                 and min(pipe.H, self.I) >= 256  # >= 4 k-stages per FC2 tile
                 and getattr(self.gemm, "supports_early_start", False)
-            ):
+            )
+            if not early_ok:
                 self._fc2_early_max_tokens = 0
-            if self._fc2_early_max_tokens > 0:
+            if early_ok and self._fc2_early_windows:
+                self._fc2_early_window = fc2_early_window_for(
+                    pipe.H, self.I, pipe.E * pipe.ep, pipe.K, pipe.ep
+                )
+            if self._fc2_early_max_tokens > 0 or self._fc2_early_window is not None:
                 # FC2 tile ticket, FC2 exit ticket, FC1 go word, FC1 CTA count, then one
                 # FC1 readiness counter per m-tile: zeroed once here and kept zeroed by
                 # FC2's last CTA every round (no per-round memset, graph-safe)
@@ -752,6 +814,16 @@ class Sm90CakeBf16MoERunner:
     def fc2_early_max_tokens(self) -> int:
         """Largest round (local tokens) that starts FC2 in FC1's tail wave (0 = off)."""
         return self._fc2_early_max_tokens
+
+    @property
+    def fc2_early_windows(self) -> bool:
+        """True when the per-shape FC2 early-start windows are enabled."""
+        return self._fc2_early_windows
+
+    @property
+    def fc2_early_window(self) -> tuple[int, int] | None:
+        """This pipe's FC2 early-start window (lo, hi] above the decode window, or None."""
+        return self._fc2_early_window
 
     @property
     def prefix_form(self) -> int:
@@ -1250,10 +1322,13 @@ class Sm90CakeBf16MoERunner:
                             self._pdl_flag(PDL_EDGE_COMPACT),
                             self._compact_form,
                         )
-                # FC2 early start in the decode window (rank-local: no cross-rank protocol)
+                # FC2 early start in the decode window or the shape's window above
+                # it (rank-local: no cross-rank protocol)
                 sched = (
                     self._gemm_sched
-                    if 0 < num_tokens <= self._fc2_early_max_tokens
+                    if fc2_early_round(
+                        num_tokens, self._fc2_early_max_tokens, self._fc2_early_window
+                    )
                     else None
                 )
                 with _record_stage("fc1", nv):

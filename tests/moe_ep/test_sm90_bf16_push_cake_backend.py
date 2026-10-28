@@ -376,6 +376,7 @@ ROUND_SWITCH_ENVS = (
     "FLASHINFER_SM90_CAKE_BF16_PREFIX_FORM",
     "FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE",
     "FLASHINFER_SM90_CAKE_BF16_DIRECT_PLACE_MIN_TOKENS",
+    "FLASHINFER_SM90_CAKE_BF16_FC2_EARLY_WINDOWS",
 )
 
 
@@ -402,6 +403,8 @@ def test_ep1_round_switch_defaults(monkeypatch) -> None:
     assert runner.compact_form == 1 and runner.publish_form == 1
     assert runner.per_route_publish_pdl is True
     assert runner.fc2_early_max_tokens == 128
+    assert runner.fc2_early_windows is True
+    assert runner.fc2_early_window is None  # no window for this test shape
     assert runner.prefix_form == 1
     assert runner.direct_place is False
     assert runner.direct_place_min_tokens == 513
@@ -517,15 +520,160 @@ def _fc2_early_rounds(layer, ref, spy, w13, w2, mode, wire, device) -> None:
     assert torch.equal(output2, reference2)
 
 
+# The shipped per-shape FC2 early-start windows: (hidden, intermediate, total experts,
+# top_k, ep) -> (lo, hi).
+FC2_EARLY_SHIPPED_WINDOWS = {
+    (7168, 2048, 256, 8, 8): (128, 4096),
+    (7168, 2048, 256, 8, 4): (128, 1024),
+    (7168, 2048, 256, 8, 2): (128, 1024),
+    (7168, 3072, 384, 6, 8): (512, 1024),
+}
+# Round sizes around a shape window (128, 160] above the decode window (<= 128).
+FC2_EARLY_SHAPE_WINDOW = (128, 160)
+FC2_EARLY_SHAPE_TOKENS = (1, 128, 129, 160, 161, 192)
+
+
+@requires_sm90
+@pytest.mark.parametrize("wire", WIRES)
+@pytest.mark.parametrize("mode", ["random", "hot", "masked"])
+def test_ep1_fc2_early_shape_window_bitwise(mode: str, wire: str, monkeypatch) -> None:
+    """Rounds in the pipe shape's window (lo, hi] above the decode window also run the
+    early-start GEMM pair and write the same bytes as the regular pair; rounds above
+    the window run the regular pair."""
+    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import (
+        cake_runner,
+    )
+
+    monkeypatch.delenv(cake_runner.FC2_EARLY_WINDOWS_ENV, raising=False)
+    monkeypatch.setitem(
+        cake_runner.FC2_EARLY_WINDOWS,
+        (HIDDEN, INTERMEDIATE, LOCAL_EXPERTS, TOP_K, 1),
+        FC2_EARLY_SHAPE_WINDOW,
+    )
+    device = torch.device("cuda", 0)
+    # a token capacity no other test uses: the pooled runner resolves its window at build
+    capacity = 193
+    ref, w13, w2 = _build_layer(
+        1,
+        0,
+        device,
+        combine_wire=wire,
+        token_capacity=capacity,
+        fc2_early_max_tokens=0,
+        fc2_early_windows=False,
+    )
+    layer, _w13, _w2 = _build_layer(
+        1,
+        0,
+        device,
+        combine_wire=wire,
+        token_capacity=capacity,
+        fc2_early_max_tokens=128,
+        fc2_early_windows=True,
+    )
+    ref_runner = _warm_runner(ref, device)
+    assert ref_runner.fc2_early_max_tokens == 0
+    assert ref_runner.fc2_early_window is None
+    runner = _warm_runner(layer, device)
+    assert runner.fc2_early_window == FC2_EARLY_SHAPE_WINDOW
+    spy = _GemmSpy(runner.gemm)
+    runner.gemm = spy
+    try:
+        for num_tokens in (0,) + FC2_EARLY_SHAPE_TOKENS:
+            x, ids, weights = _make_inputs(
+                num_tokens, LOCAL_EXPERTS, 83 + num_tokens, device, mode=mode
+            )
+            spy.calls.clear()
+            output = _forward(layer, x, ids, weights).clone()
+            reference = _forward(ref, x, ids, weights).clone()
+            torch.cuda.synchronize()
+            early = 0 < num_tokens <= FC2_EARLY_SHAPE_WINDOW[1]
+            if num_tokens:
+                assert spy.calls == [("fc1", early), ("fc2", early)], (
+                    num_tokens,
+                    spy.calls,
+                )
+            else:
+                assert not any(e for _, e in spy.calls), spy.calls
+            assert torch.equal(output, reference), f"T={num_tokens}"
+            if num_tokens:
+                _check(
+                    output,
+                    x,
+                    ids,
+                    weights,
+                    w13,
+                    w2,
+                    label=f" ep1 {wire} {mode} T={num_tokens} fc2_early window",
+                )
+        # graph replay of a window round, then a round above the window
+        x, ids, weights = _make_inputs(150, LOCAL_EXPERTS, 89, device, mode=mode)
+        reference = _forward(ref, x, ids, weights).clone()
+        static = [t.clone() for t in (x, ids, weights)]
+        side_stream = torch.cuda.Stream()
+        side_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side_stream):
+            _forward(layer, *static)
+        torch.cuda.current_stream().wait_stream(side_stream)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_output = _forward(layer, *static)
+        for _ in range(3):
+            graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(static_output, reference)
+        x2, ids2, weights2 = _make_inputs(192, LOCAL_EXPERTS, 97, device, mode=mode)
+        output2 = _forward(layer, x2, ids2, weights2).clone()
+        reference2 = _forward(ref, x2, ids2, weights2).clone()
+        torch.cuda.synchronize()
+        assert torch.equal(output2, reference2)
+    finally:
+        runner.gemm = spy._gemm
+
+
+def test_ep1_fc2_early_windows_table() -> None:
+    """The shipped windows sit above the decode window and the round predicate
+    switches exactly at each window's bounds (host-only check)."""
+    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import (
+        cake_runner,
+    )
+
+    dmax = cake_runner.FC2_EARLY_MAX_TOKENS
+    assert cake_runner.FC2_EARLY_WINDOWS == FC2_EARLY_SHIPPED_WINDOWS
+    for key, (lo, hi) in cake_runner.FC2_EARLY_WINDOWS.items():
+        assert dmax <= lo < hi, (key, lo, hi)
+        assert cake_runner.fc2_early_window_for(*key) == (lo, hi)
+        win = (lo, hi)
+        assert cake_runner.fc2_early_round(lo, dmax, win) == (lo <= dmax), key
+        assert cake_runner.fc2_early_round(lo + 1, dmax, win), key
+        assert cake_runner.fc2_early_round(hi, dmax, win), key
+        assert not cake_runner.fc2_early_round(hi + 1, dmax, win), key
+        assert not cake_runner.fc2_early_round(hi + 1, dmax, None), key
+        assert not cake_runner.fc2_early_round(0, dmax, win), key
+        # windows are per shape: a different EP size or top_k has its own entry or none
+        for other in (
+            (key[0], key[1], key[2], key[3], key[4] * 2),
+            (key[0], key[1], key[2], key[3] + 1, key[4]),
+        ):
+            expected = cake_runner.FC2_EARLY_WINDOWS.get(other)
+            assert cake_runner.fc2_early_window_for(*other) == expected
+    assert cake_runner.fc2_early_round(dmax, dmax, None)
+    assert not cake_runner.fc2_early_round(dmax + 1, dmax, None)
+
+
 @requires_sm90
 def test_ep1_fc2_early_switch_validation() -> None:
-    """fc2_early_max_tokens rejects negative and non-int values."""
+    """fc2_early_max_tokens rejects negative and non-int values; fc2_early_windows
+    rejects non-bool values."""
     from flashinfer.moe_ep import MoEEpConfigError
 
     device = torch.device("cuda", 0)
     for kwargs in (
         {"fc2_early_max_tokens": -1},
         {"fc2_early_max_tokens": True},
+        {"fc2_early_windows": 1},
+        {"fc2_early_windows": "on"},
     ):
         with pytest.raises((MoEEpConfigError, ValueError)):
             _build_layer(1, 0, device, token_capacity=33, **kwargs)
