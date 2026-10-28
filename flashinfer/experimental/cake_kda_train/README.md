@@ -293,9 +293,14 @@ saved tables describe the whole problem); the whole token tensors and
 gradients (every program reaches the tokens through the absolute `chunk_bos`
 offsets of its tables); the group's slices of a saved `h` / `v_new` tape; and
 its state blocks, recomputed in the view on the `light` and `replay` paths,
-gathered from the saved `hseg` / `seg_state` / `seg_m` by chain rank on
-`light_states` and `tape`, and scattered back from the view when the forward
-saves them.  The records, the segment count per document (`P`, with the
+taken from the saved `hseg` / `seg_state` / `seg_m` by chain rank on
+`light_states` and `tape`, and written back when the forward saves them.  The
+host ranks the chains from `doc_lengths` by the tables' rule (chunk count,
+most first, ties in document order), so a group whose blocks are one run of
+the saved ones reads views of them and its forward carry writes the saved
+`hseg` directly (the offsets / transfers are contiguous copies); a group whose
+blocks are not one run gathers and scatters them by index.  The records, the
+segment count per document (`P`, with the
 non-proportional block table) and the saved set are the whole problem's; the
 saving forward therefore writes the whole problem's tables once with the
 saved-set paths' table program (`table_v3` / `table_v2`) before its groups.
@@ -311,7 +316,8 @@ table gives the documents proportional segment counts (`num_docs * H <= 4` on
 the segmented route: a group of fewer documents would change every document's
 segments) and, on a lean workspace, the checkpoint replay (`saved=None`); a
 batched workspace that is not lean runs the replay group by group.  The costs
-per group are a table launch, the gathers (three state blocks of the group,
+per group are a table launch, the gathers of a group whose blocks are not one
+run (at most three state blocks per segment of the group, within
 `batch_scratch` of `memory_report`) and the smaller grids; the serial route's
 chains of different groups run one group after another.
 
