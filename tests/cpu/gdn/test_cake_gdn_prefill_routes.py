@@ -25,12 +25,14 @@ ROUTED = sorted(
 )
 
 
+@pytest.mark.cpu_only
 def test_sm107a_default_body_is_the_int64_metadata_twin():
     assert DEFAULT == {"sm_107a": "i64meta"}
     assert all(arch == "sm_107a" for (arch, _schedule) in TABLE)
     assert "i64meta" not in TABLE.values()
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("schedule", ROUTED)
 def test_sm107a_routes_the_vec2_state_io_twins_per_shipped_schedule(schedule):
     body = TABLE[("sm_107a", schedule)]
@@ -54,6 +56,7 @@ def test_sm107a_routes_the_vec2_state_io_twins_per_shipped_schedule(schedule):
             assert shipped == schedule
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "schedule",
     (
@@ -93,6 +96,7 @@ def _prefill_records_by_key():
     return by_key
 
 
+@pytest.mark.cpu_only
 def test_every_shipped_sm107a_record_is_a_twin_with_int64_metadata():
     twins = 0
     for records in _prefill_records_by_key().values():
@@ -107,6 +111,7 @@ def test_every_shipped_sm107a_record_is_a_twin_with_int64_metadata():
     assert twins > 0
 
 
+@pytest.mark.cpu_only
 def test_every_shipped_base_record_the_rule_routes_has_its_sm107a_twin_record():
     by_key = _prefill_records_by_key()
     checked = 0

@@ -26,6 +26,7 @@ def _check(indices, state, output, return_state=True):
     )
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "problem",
     [
@@ -82,6 +83,7 @@ def test_rejects_invalid_pool_before_execution(problem):
         _check(indices, state, output)
 
 
+@pytest.mark.cpu_only
 def test_pool_check_does_not_read_indices(monkeypatch):
     state = torch.empty(6, 4, 64, 64)
     # Values deliberately outside the caller precondition: only metadata is
@@ -98,6 +100,7 @@ def test_pool_check_does_not_read_indices(monkeypatch):
     assert not _check(indices, state, None, return_state=False)
 
 
+@pytest.mark.cpu_only
 def test_inference_pool_is_checked_before_native_write():
     with torch.inference_mode():
         state = torch.empty(6, 4, 64, 64)
@@ -108,6 +111,7 @@ def test_inference_pool_is_checked_before_native_write():
         assert _check(indices, state, state)
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("family", ["gdn2", "gdp"])
 def test_new_family_pool_requires_frontend_131_before_mutation(monkeypatch, family):
     from flashinfer.cudnn import linear_attention as adapter

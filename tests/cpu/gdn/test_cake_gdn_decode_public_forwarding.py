@@ -36,6 +36,7 @@ _PROMOTED_BF16_ROWS = [
 ]
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ("sm_100a", "sm_103a", "sm_107a"))
 @pytest.mark.parametrize(
     "batch_size,seq_len,num_q_heads,num_v_heads,strided,disable,cache,cache_steps",
@@ -93,6 +94,7 @@ def _inputs(*, state_dtype, seq_len=2):
     )
 
 
+@pytest.mark.cpu_only
 def test_public_bf16_verify_forwards_caller_cache_and_no_update(monkeypatch):
     tensors = _inputs(state_dtype=torch.bfloat16)
     cache = torch.empty(1, 4, 1, 128, 128, dtype=torch.bfloat16)
@@ -115,6 +117,7 @@ def test_public_bf16_verify_forwards_caller_cache_and_no_update(monkeypatch):
     assert returned_state is tensors["initial_state"]
 
 
+@pytest.mark.cpu_only
 def test_public_fp32_checkpoint_forwards_caller_cache_and_update(monkeypatch):
     tensors = _inputs(state_dtype=torch.float32)
     cache = torch.empty(1, 3, 1, 128, 128, dtype=torch.float32)
@@ -136,6 +139,7 @@ def test_public_fp32_checkpoint_forwards_caller_cache_and_update(monkeypatch):
     assert returned_state is tensors["initial_state"]
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "kwargs,match",
     [
