@@ -67,7 +67,7 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import Int32
-from cutlass._mlir.dialects import llvm
+from cutlass._mlir.dialects import llvm, cute_nvgpu as cute_nvgpu_ir
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
@@ -75,6 +75,7 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from .._fp8_mqa_constants import _COMPUTE_BLOCK_KV
 from .._math_policy import _validate_math_mode
 from .fp8_paged_mqa_logits import _FP8MQAEngineMixin
+from ...cute_dsl.attention.dsa.gather4_utils import _CopyBulkTensor2DGather4G2SOp
 
 from .._selective_contract import (
     _COUNT_SEGMENTS,
@@ -479,6 +480,7 @@ class FP8MQASelectiveLogitsKernel(_FP8MQAEngineMixin):
         )
         self.tmem_retrieve_threads = 288 if self.uses_single_umma_producer else 320
         self.mode = mode
+        self.sparse_sample_load_warps = 0
         self.sample_internal = sample_internal
         self.capacity = capacity
         self.radix_shift = radix_shift
@@ -625,7 +627,7 @@ class FP8MQASelectiveLogitsKernel(_FP8MQAEngineMixin):
         num_phys_blocks: cutlass.Int32,
         batch_size: cutlass.Int32,
         stream: cuda.CUstream,
-        sample_page_indices: cute.Tensor = None,
+        sample_page_indices=None,
     ):
         # The common engine carries both the physical page table and selective
         # output counters. The public dense-logits path supplies its block table
@@ -785,6 +787,12 @@ class FP8MQASelectiveLogitsKernel(_FP8MQAEngineMixin):
             (scale_tma_tile,),
         )
 
+        gather_atom, gather_tensor = tma_atom_a, tma_tensor_a
+        if cutlass.const_expr(self.sparse_sample_load_warps > 0):
+            gather_atom, gather_tensor = self._make_sparse_gather4_atom(
+                kv_fused, num_phys_blocks
+            )
+
         b_copy_size = cute.size_in_bytes(b_dtype, b_smem_layout)
         w_copy_size = self.N * self.epi_bytes
         # Per sub-block: phys_block_kv * head_dim (KV) + phys_block_kv * 4 (scales)
@@ -825,6 +833,9 @@ class FP8MQASelectiveLogitsKernel(_FP8MQAEngineMixin):
             tile_meta,
             policy_values,
             sample_page_indices,
+            kv_fused,
+            gather_atom,
+            gather_tensor,
             batch_size,
             self.cluster_layout_vmnk,
             self.a_smem_layout_staged,
@@ -1315,6 +1326,35 @@ class FP8MQASelectiveLogitsKernel(_FP8MQAEngineMixin):
         """Apply the specialized register budget to the reserved warp."""
         cute.arch.setmaxregister_decrease(self.specialized_wg_registers)
 
+    @cute.jit
+    def _make_kv_pipeline(self, storage, cluster_layout, tidx):
+        if cutlass.const_expr(self.sparse_sample_load_warps > 0):
+            # Every loader contributes one deferred noinc arrival after issuing
+            # all stage copies; the full count is exactly the loader count.
+            # Every math thread releases after its last scale read; UMMA waits
+            # on the same full barrier without contributing an empty arrival.
+            return pipeline.PipelineAsync.create(
+                barrier_storage=storage,
+                num_stages=self.num_kv_stages,
+                producer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread,
+                    self.sparse_sample_load_warps * 16,
+                ),
+                consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 128),
+                defer_sync=True,
+            )
+        else:
+            return pipeline.PipelineTmaAsync.create(
+                barrier_storage=storage,
+                num_stages=self.num_kv_stages,
+                producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+                consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 4),
+                tx_count=self.num_kv_scale_tma_bytes,
+                cta_layout_vmnk=cluster_layout,
+                tidx=tidx,
+                defer_sync=True,
+            )
+
     @cute.kernel
     def kernel(
         self,
@@ -1334,7 +1374,10 @@ class FP8MQASelectiveLogitsKernel(_FP8MQAEngineMixin):
         mScheduleMeta: cute.Tensor,  # [num_sms+1, 2] int32
         mTileMeta: cute.Tensor,  # selective request metadata or paged placeholder
         mPolicyValues: cute.Tensor,  # selective row policy or paged placeholder
-        mSamplePages: cute.Tensor,
+        mSamplePages,
+        mSparseKV: cute.Tensor,
+        gather_atom: cute.CopyAtom,
+        gather_tensor: cute.Tensor,
         batch_size: cutlass.Int32,
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -1426,42 +1469,31 @@ class FP8MQASelectiveLogitsKernel(_FP8MQAEngineMixin):
         # Like DeepGEMM: KV data and scales share one barrier.
         # TMA loads both under one barrier. Math is consumer (releases).
         # UMMA also waits on this barrier (for KV GEMM) but does NOT release.
-        math_warps_per_group = self.num_math_warps // 2  # 4 warps
-        kv_cons_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, math_warps_per_group
+        kv_pipeline_0 = self._make_kv_pipeline(
+            storage.kv_mbar.data_ptr(), cluster_layout_vmnk, tidx
         )
-        kv_pipeline_0 = pipeline.PipelineTmaAsync.create(
-            barrier_storage=storage.kv_mbar.data_ptr(),
-            num_stages=self.num_kv_stages,
-            producer_group=prod_group,
-            consumer_group=kv_cons_group,
-            tx_count=self.num_kv_scale_tma_bytes,
-            cta_layout_vmnk=cluster_layout_vmnk,
-            tidx=tidx,
-            defer_sync=True,
-        )
-        kv_pipeline_1 = pipeline.PipelineTmaAsync.create(
-            barrier_storage=storage.kv_mbar.data_ptr() + self.num_kv_stages * 2,
-            num_stages=self.num_kv_stages,
-            producer_group=prod_group,
-            consumer_group=kv_cons_group,
-            tx_count=self.num_kv_scale_tma_bytes,
-            cta_layout_vmnk=cluster_layout_vmnk,
-            tidx=tidx,
-            defer_sync=True,
+        kv_pipeline_1 = self._make_kv_pipeline(
+            storage.kv_mbar.data_ptr() + self.num_kv_stages * 2,
+            cluster_layout_vmnk,
+            tidx,
         )
         math_pipeline_ring = min(warpgroup_idx, cutlass.Int32(1))
-        kv_pipeline_math = pipeline.PipelineTmaAsync.create(
-            barrier_storage=storage.kv_mbar.data_ptr()
-            + math_pipeline_ring * self.num_kv_stages * 2,
-            num_stages=self.num_kv_stages,
-            producer_group=prod_group,
-            consumer_group=kv_cons_group,
-            tx_count=self.num_kv_scale_tma_bytes,
-            cta_layout_vmnk=cluster_layout_vmnk,
-            tidx=tidx,
-            defer_sync=True,
+        kv_pipeline_math = self._make_kv_pipeline(
+            storage.kv_mbar.data_ptr() + math_pipeline_ring * self.num_kv_stages * 2,
+            cluster_layout_vmnk,
+            tidx,
         )
+        if cutlass.const_expr(self.sparse_sample_load_warps > 0):
+            sparse_ring = min(
+                max(warp_idx - 12, cutlass.Int32(0))
+                // (self.sparse_sample_load_warps // 2),
+                cutlass.Int32(1),
+            )
+            kv_pipeline_sparse = self._make_kv_pipeline(
+                storage.kv_mbar.data_ptr() + sparse_ring * self.num_kv_stages * 2,
+                cluster_layout_vmnk,
+                tidx,
+            )
 
         # UMMA pipelines (per-group)
         math_threads_per_group = self.num_math_threads // 2
@@ -1596,6 +1628,13 @@ class FP8MQASelectiveLogitsKernel(_FP8MQAEngineMixin):
         )
         sScales_0 = sScales[(None, None, 0)]
         sScales_1 = sScales[(None, None, 1)]
+        sparse_coords = sScales
+        if cutlass.const_expr(self.sparse_sample_load_warps > 0):
+            sparse_coords = smem.allocate_tensor(
+                element_type=cutlass.Int32,
+                layout=cute.make_layout((128, self.num_kv_stages, 2)),
+                byte_alignment=128,
+            )
         if cutlass.const_expr(self.has_store_warp):
             store_score_layout = cute.make_layout(
                 (next_n, block_kv_val, 2, 2),
@@ -1983,7 +2022,33 @@ class FP8MQASelectiveLogitsKernel(_FP8MQAEngineMixin):
                     warpgroup_idx,
                 )
         elif is_store_warp:
-            if cutlass.const_expr(self.has_store_warp):
+            if cutlass.const_expr(self.sparse_sample_load_warps > 0):
+                cute.arch.setmaxregister_decrease(32)
+                self._run_sparse_sample_loaders(
+                    mSparseKV,
+                    mSamplePages,
+                    mBlockTable,
+                    mTileMeta,
+                    mContextLens,
+                    batch_size,
+                    end_q_idx,
+                    end_kv_idx,
+                    next_q_idx,
+                    next_kv_idx,
+                    next_num_kv,
+                    has_work,
+                    tidx,
+                    sparse_ring,
+                    kv_pipeline_sparse,
+                    sKV_0,
+                    sKV_1,
+                    sScales,
+                    a_tma_view_layout,
+                    gather_atom,
+                    gather_tensor,
+                    sparse_coords,
+                )
+            elif cutlass.const_expr(self.has_store_warp):
                 self._run_store_warp(
                     NUM_MATH_WG,
                     NUM_STORE_WARPS,
@@ -2025,7 +2090,7 @@ class FP8MQASelectiveLogitsKernel(_FP8MQAEngineMixin):
         schedule_meta: cute.Tensor,
         tile_meta: cute.Tensor,
         policy_values: cute.Tensor,
-        sample_page_indices: cute.Tensor,
+        sample_page_indices,
         num_phys_blocks: cutlass.Int32,
         num_tiles: cutlass.Int32,
         stream: cuda.CUstream,
@@ -3067,3 +3132,345 @@ class FP8MQASelectiveH64CandidateKernel(FP8MQASelectiveLogitsKernel):
             pipeline.NamedBarrier(barrier_id=2, num_threads=512).arrive_and_wait()
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
+
+
+@cute.jit
+def sparse_sample_position(position, extent, denominator, limit):
+    """Space sample positions uniformly with wide arithmetic and physical clamping."""
+    logical = (
+        cutlass.Int64(position) * cutlass.Int64(extent) // cutlass.Int64(denominator)
+    )
+    return min(logical, cutlass.Int64(limit))
+
+
+class FP8MQASparseGather4SampleKernel(FP8MQASelectiveLogitsKernel):
+    """TMA gather4 key ingress with cp.async scale completion for sparse SAMPLE.
+
+    Four or eight load warps split evenly between two KV rings, sharing the
+    query producer, UMMA pipeline and scoring epilogue with whole-page SAMPLE.
+    """
+
+    def __init__(self, *, load_warps: int, group_rows: int, on_the_fly=False, **kwargs):
+        super().__init__(**kwargs)
+        if self.mode != _SelectiveLogitsMode.SAMPLE or load_warps not in (4, 8):
+            raise ValueError("sparse loading requires SAMPLE and 4 or 8 load warps")
+        if self.head_dim != 128 or group_rows % self.next_n:
+            raise ValueError("sparse loading requires D128 and complete query groups")
+        if self.phys_block_kv not in (32, 64, 128):
+            raise ValueError("gather4 SAMPLE requires 32/64/128-key pages")
+        self.sparse_sample_load_warps = load_warps
+        self.sparse_sample_group_rows = group_rows
+        self.sparse_sample_on_the_fly = on_the_fly
+        self.threads_per_cta = (12 + load_warps) * 32
+        # Leave register-allocation headroom with the second loader WG.
+        # Both variants budget 60,416 logical registers per CTA.
+        self.math_wg_registers = 208 if load_warps == 4 else 192
+
+    @cute.jit
+    def _lookup_fp8_page(
+        self,
+        mBlockTable,
+        mSamplePages,
+        request,
+        page,
+        internal_sample: cutlass.Constexpr,
+    ):
+        # The inherited Q producer still walks the task cursor, but its KV
+        # ingress is disabled. Only dedicated loaders interpret sparse keys.
+        return cutlass.Int32(0)
+
+    @cute.jit
+    def _issue_paged_kv_tile(
+        self,
+        kv_pipeline,
+        kv_prod_state,
+        phys_blks,
+        tma_atom_a,
+        tAgA,
+        tAsA,
+        tma_atom_s,
+        tSgS,
+        tSsS,
+        a_mcast_mask,
+    ):
+        return kv_prod_state
+
+    @cute.jit
+    def _issue_umma_group(
+        self,
+        tiled_mma,
+        tCrA,
+        tCrB,
+        tCtAcc_base,
+        q_stage,
+        kv_pipeline,
+        kv_cons_state,
+        umma_pipeline,
+        umma_prod_state,
+        paired_poll: cutlass.Constexpr,
+    ):
+        # Gather4 keys and cp.async scales complete asynchronously. Order the
+        # shared-memory view after their full-barrier wait and before UMMA.
+        if cutlass.const_expr(paired_poll):
+            ready = kv_pipeline.consumer_try_wait(kv_cons_state)
+            empty = umma_pipeline.producer_try_acquire(umma_prod_state)
+            kv_pipeline.consumer_wait(kv_cons_state, ready)
+            umma_pipeline.producer_acquire(umma_prod_state, empty)
+        else:
+            kv_pipeline.consumer_wait(kv_cons_state)
+            umma_pipeline.producer_acquire(umma_prod_state)
+        cute.arch.fence_view_async_shared()
+        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+        kv_stage = kv_cons_state.index
+        tCtAcc = tCtAcc_base[(None, None, None, umma_prod_state.index)]
+        for k_block in cutlass.range_constexpr(cute.size(tCrA.shape[2])):
+            cute.gemm(
+                tiled_mma,
+                tCtAcc,
+                tCrA[None, None, k_block, kv_stage],
+                tCrB[None, None, k_block, q_stage],
+                tCtAcc,
+            )
+            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+        kv_cons_state.advance()
+        umma_pipeline.producer_commit(umma_prod_state)
+        umma_prod_state.advance()
+        return tiled_mma, kv_cons_state, umma_prod_state
+
+    @cute.jit
+    def _sample_position(self, indices, sample_group, position):
+        if cutlass.const_expr(self.sparse_sample_on_the_fly):
+            # The group's causal range and common count are request-local.
+            extent, denominator, limit = sample_group
+            return sparse_sample_position(position, extent, denominator, limit)
+        else:
+            # Oracle-only stored positions validate the production on-the-fly
+            # mapping without changing its scoring pipeline.
+            return cutlass.Int64(indices[(sample_group, position)])
+
+    @cute.jit
+    def _run_sparse_sample_loaders(
+        self,
+        source,
+        indices,
+        block_table,
+        tile_meta,
+        context_lens,
+        batch_size,
+        end_q_idx,
+        end_kv_idx,
+        next_q_idx,
+        next_kv_idx,
+        next_num_kv,
+        has_work,
+        tidx,
+        group,
+        kv_pipeline,
+        shared_kv_0,
+        shared_kv_1,
+        shared_scales,
+        key_layout,
+        gather_atom,
+        gather_tensor,
+        sparse_coords,
+    ):
+        key_iterator = shared_kv_0.iterator
+        if group == 1:
+            key_iterator = shared_kv_1.iterator
+        shared_keys = cute.make_tensor(
+            cute.recast_ptr(
+                key_iterator, dtype=cutlass.Uint8, swizzle_=key_layout.inner
+            ),
+            key_layout.outer,
+        )
+        local_thread = (tidx - 12 * 32) % (self.sparse_sample_load_warps * 16)
+        state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.num_kv_stages
+        )
+        while has_work:
+            q_idx, kv_idx, num_kv = next_q_idx, next_kv_idx, next_num_kv
+            request = tile_meta[(q_idx, 1)]
+            sample_group = tile_meta[(q_idx, 0)] // self.sparse_sample_group_rows
+            if cutlass.const_expr(self.sparse_sample_on_the_fly):
+                row_ends, valid_counts, qo, physical_kv = indices
+                query = tile_meta[(q_idx, 0)]
+                first = (
+                    qo[request]
+                    + ((query - qo[request]) // self.sparse_sample_group_rows)
+                    * self.sparse_sample_group_rows
+                )
+                sample_group = (
+                    max(row_ends[first] - 1, 0),
+                    max(valid_counts[first] - 1, 1),
+                    max(physical_kv[request + 1] - physical_kv[request] - 1, 0),
+                )
+            kv_pipeline.producer_acquire(state)
+            self._copy_sparse_sample_tile(
+                source,
+                indices,
+                block_table,
+                request,
+                sample_group,
+                (kv_idx + group) * self.block_kv,
+                state.index,
+                local_thread,
+                group,
+                shared_keys,
+                shared_scales,
+                gather_atom,
+                gather_tensor,
+                sparse_coords,
+                kv_pipeline.producer_get_barrier(state),
+            )
+            # Both aligned halves are produced, including padding. UMMA and
+            # the existing epilogue consume/release both rings unconditionally.
+            cute.arch.cp_async_mbarrier_arrive_noinc(
+                kv_pipeline.producer_get_barrier(state)
+            )
+            state.advance()
+            next_kv_idx = kv_idx + 2
+            if next_kv_idx >= num_kv:
+                next_q_idx = q_idx + 1
+                next_kv_idx = 0
+                if next_q_idx < batch_size:
+                    next_num_kv = (
+                        context_lens[next_q_idx] + self.block_kv - 1
+                    ) // self.block_kv
+                while (
+                    (next_num_kv == 0)
+                    & (next_q_idx < batch_size)
+                    & ((next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx))
+                ):
+                    next_q_idx = next_q_idx + 1
+                    if next_q_idx < batch_size:
+                        next_num_kv = (
+                            context_lens[next_q_idx] + self.block_kv - 1
+                        ) // self.block_kv
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+
+    @cute.jit
+    def _make_sparse_gather4_atom(self, source, num_pages):
+        stride_rows = source.layout.stride[0] // 128
+        storage_rows = (num_pages - 1) * stride_rows + self.phys_block_kv * (
+            self.head_dim + 4
+        ) // 128
+        pool = cute.make_tensor(
+            cute.recast_ptr(source.iterator, dtype=cutlass.Float8E4M3FN),
+            cute.make_layout((storage_rows, 128), stride=(128, 1)),
+        )
+        coords = cute.make_tensor(
+            cute.recast_ptr(source.iterator, dtype=cutlass.Int32),
+            cute.make_layout(pool.shape, stride=(1, 0)),
+        )
+        # Four independently issued row subtiles retain the full MMA layout.
+        smem_layout = cute.make_composed_layout(
+            self.a_tma_view_layout.inner,
+            0,
+            cute.make_layout(((32, 128),), stride=((128, 1),)),
+        )
+        identity = cute.make_identity_layout(pool.shape)
+        tile = cute.composition(identity, (32, 128))
+        mapping = cute.flat_divide(tile, (32,))
+        mapping = cute.select(mapping, mode=[0, 2])
+        mapping = cute.zipped_divide(mapping, (32, 128))
+        mapping = cute.select(mapping, mode=[0])
+        op = _CopyBulkTensor2DGather4G2SOp(cta_group=tcgen05.CtaGroup.ONE)
+        layout_ir = smem_layout.value if hasattr(smem_layout, "value") else smem_layout
+        result = cute_nvgpu_ir.atom_make_non_exec_2d_gather4_tma_load(
+            pool.value,
+            coords.layout,
+            layout_ir,
+            mapping,
+            op._to_ir(),
+            num_multicast=1,
+        )
+        return cute.CopyAtom(
+            op, cpasync.CopyBulkTensorTileG2SNonExecTrait(result[0])
+        ), result[1]
+
+    @cute.jit
+    def _copy_sparse_sample_tile(
+        self,
+        source,
+        indices,
+        block_table,
+        request,
+        sample_group,
+        sample_base,
+        stage,
+        local_thread,
+        group,
+        shared_keys,
+        shared_scales,
+        gather_atom,
+        gather_tensor,
+        sparse_coords,
+        full_barrier,
+    ):
+        loaders = self.sparse_sample_load_warps * 16
+        page_stride = cutlass.Int64(source.layout.stride[0])
+        scale_atom = cute.make_copy_atom(
+            cpasync.CopyG2SOp(), cutlass.Float32, num_bits_per_copy=32
+        )
+        for item in cutlass.range_constexpr(128 // loaders):
+            row = local_thread + item * loaders
+            position = min(sample_base + row, cutlass.Int32(self.capacity - 1))
+            logical = self._sample_position(indices, sample_group, position)
+            page = cutlass.Int64(block_table[(request, logical // self.phys_block_kv)])
+            offset = logical % self.phys_block_kv
+            sparse_coords[(row, stage, group)] = cutlass.Int32(
+                page * (page_stride // 128) + offset
+            )
+            ptr = cute.recast_ptr(
+                source.iterator
+                + cute.assume(
+                    page * page_stride + self.phys_block_kv * 128 + offset * 4,
+                    divby=4,
+                ),
+                dtype=cutlass.Float32,
+            )
+            destination = cute.make_tensor(
+                shared_scales.iterator
+                + cute.crd2idx((row, stage, group), shared_scales.layout),
+                cute.make_layout(1),
+            )
+            cute.copy(
+                scale_atom, cute.make_tensor(ptr, cute.make_layout(1)), destination
+            )
+        # Generic SMEM coordinates must be visible to every issuing warp.
+        # Arm key bytes without an arrival. The loader join orders this before
+        # every deferred noinc arrival, including padding-only lanes.
+        if local_thread == 0:
+            cute.arch.mbarrier_expect_tx(full_barrier, 128 * 128)
+        if group == 0:
+            sync_warp_roles(3, loaders)
+        else:
+            sync_warp_roles(4, loaders)
+        coord_base = sparse_coords[(None, stage, group)]
+        coord_tensor = cute.make_tensor(
+            coord_base.iterator,
+            cute.make_layout((128, 128), stride=(1, 0)),
+        )
+        tile = cute.zipped_divide(gather_tensor, (32, 128))
+        coord_tile = cute.zipped_divide(coord_tensor, (32, 128))
+        key_stage = cute.make_tensor(
+            shared_keys.iterator + stage * 128 * 128,
+            cute.make_layout(((32, 128), 4), stride=((128, 1), 4096)),
+        )
+        dst, src, idx = cpasync.tma_partition(
+            gather_atom,
+            0,
+            cute.make_layout(1),
+            key_stage,
+            [tile, coord_tile],
+        )
+        warps = self.sparse_sample_load_warps // 2
+        warp = local_thread // 32
+        for item in cutlass.range_constexpr(4 // warps):
+            subtile = warp + item * warps
+            cute.copy(
+                gather_atom,
+                [src[None, (subtile, 0)], idx[None, (subtile, 0)]],
+                dst[None, subtile],
+                tma_bar_ptr=full_barrier,
+            )

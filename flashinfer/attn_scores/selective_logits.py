@@ -77,6 +77,24 @@ _SAMPLE_CAPACITY = 3840
 _MAX_TARGET_CANDIDATES = 4096
 
 
+def _select_sparse_sample_group_rows(query_tile: int) -> int:
+    """Keep 128-row sharing where legal; otherwise share one complete tile."""
+    return 128 if 128 % query_tile == 0 else query_tile
+
+
+def _sparse_sample_gather4_serves(
+    num_pages: int, page_stride: int, page_size: int, head_dim: int
+) -> bool:
+    """Admit gather4 only when its padded byte pool has int32 row coordinates."""
+    return (
+        head_dim == 128
+        and page_size in (32, 64, 128)
+        and page_stride % 128 == 0
+        and (num_pages - 1) * (page_stride // 128) + page_size * (head_dim + 4) // 128
+        <= 2**31 - 1
+    )
+
+
 def _validate_selective_device(device: torch.device) -> None:
     """Reject devices outside the selective kernels' supported architectures."""
     if get_compute_capability(device) not in ((10, 0), (10, 3)):
@@ -572,6 +590,25 @@ def _h64_candidate_variant_serves(page_size: int) -> bool:
     return page_size == _COMPUTE_BLOCK_KV
 
 
+def _h4_pooled_candidate_serves(
+    num_heads: int,
+    head_dim: int,
+    query_tile: int,
+    page_size: int,
+    top_k: int,
+    long_query: bool,
+) -> bool:
+    """Use warp-ranked banks for the qualified H4 long-query shape."""
+    return (
+        long_query
+        and num_heads == 4
+        and head_dim == 128
+        and query_tile == 16
+        and page_size == _COMPUTE_BLOCK_KV
+        and _candidate_target(top_k) == _MAX_TARGET_CANDIDATES
+    )
+
+
 def _select_candidate_schedule(
     device: torch.device,
     num_heads: int,
@@ -608,7 +645,8 @@ def _select_candidate_schedule(
     _, sample_count_segments = _select_candidate_publication(
         split_kv, lane_local=long_query
     )
-    # H8 uses lane-local publication; H64 split>1 keeps vector banks.
+    # H8/H4 start with lane-local publication; eligible H4 prefill is pooled
+    # below. H64 split>1 keeps vector banks.
     warp_ranked_prefill = (
         long_query and num_heads == 64 and head_dim == 128 and split_kv <= 4
     )
@@ -621,14 +659,18 @@ def _select_candidate_schedule(
         publication == "lane_local"
         and _candidate_target(top_k) == _MAX_TARGET_CANDIDATES
     ):
-        # Lane-local publication splits the row 32 * split_kv ways, so one
-        # full lane bank, not the row total, sets the overflow sentinel. At
-        # 6144 slots the 64 banks of split 2 hold 96 each and overflow near
-        # 4.6K candidates, inside the sampling spread of the capped 4096
-        # target (K >= 1024). The candidate arena is already repair-wide, so
-        # widen those lane banks; smaller targets keep 6144, where the wider
-        # PackedTopK costs more than the few overflows it would avoid.
+        # A lane-bank overflow sets the row sentinel before total capacity is
+        # reached. Large targets need wider banks; a later H4 pooling override
+        # retains this repair-wide arena. Smaller targets use narrower TopK.
         candidate_capacity = _REPAIR_CAPACITY
+    if _h4_pooled_candidate_serves(
+        num_heads, head_dim, tiling.next_n, page_size, top_k, long_query
+    ):
+        # A warp prefix compacts eligible values into four shared stripes,
+        # rather than overflowing one of the 32 * split lane-local quotas.
+        # Preserve the independently selected SAMPLE topology above.
+        split_kv = 1
+        publication, count_segments = _WARP_STRIPED_PUBLICATION, 4
     h64_candidate = False
     if warp_ranked_prefill and _h64_single_pool_topology(
         num_heads,
@@ -1414,6 +1456,7 @@ def _runtime_args(
     prepared: _PreparedFP8MQASelectiveLogits,
     policy_words: torch.Tensor,
     sample_page_indices: torch.Tensor | None,
+    sparse_sample_metadata: tuple[torch.Tensor, ...] | None = None,
 ) -> Tuple[Any, ...]:
     q_view = q.reshape(q.shape[0] * prepared.num_heads, prepared.head_dim).unsqueeze(-1)
     kv_flat = kv_fused.flatten(1)
@@ -1440,7 +1483,14 @@ def _runtime_args(
         from_dlpack(policy_words, assumed_align=16).mark_compact_shape_dynamic(
             mode=0, divisibility=1
         ),
-        (
+        tuple(
+            from_dlpack(tensor, assumed_align=16).mark_compact_shape_dynamic(
+                mode=0, divisibility=1
+            )
+            for tensor in sparse_sample_metadata
+        )
+        if sparse_sample_metadata is not None
+        else (
             from_dlpack(sample_page_indices, assumed_align=16).mark_layout_dynamic(
                 leading_dim=1
             )
@@ -1468,6 +1518,9 @@ def _fp8_mqa_selective_logits(
     _clear_counts: bool = True,
     _candidate_counts_precleared: bool = False,
     _h64_candidate: bool = False,
+    _sparse_sample_load_warps: int = 0,
+    _sparse_sample_group_rows: int = 128,
+    _sparse_sample_metadata: tuple[torch.Tensor, ...] | None = None,
 ) -> None:
     """Run one explicitly selected logits phase into caller-owned storage.
 
@@ -1519,6 +1572,24 @@ def _fp8_mqa_selective_logits(
     ``flashinfer_api`` wrapper.
     """
     _require_cute()
+    if _sparse_sample_load_warps and not _sparse_sample_gather4_serves(
+        kv_fused.shape[0],
+        kv_fused.stride(0),
+        prepared.page_size,
+        prepared.head_dim,
+    ):
+        raise ValueError(
+            "gather4 SAMPLE requires 32/64/128-key pages, "
+            "a 128-byte-aligned page pitch and int32 row coordinates"
+        )
+    if _sparse_sample_load_warps and (
+        mode != _SelectiveLogitsMode.SAMPLE
+        or _sparse_sample_load_warps not in (4, 8)
+        or _sparse_sample_group_rows <= 0
+        or _sparse_sample_group_rows % prepared.query_tile
+        or (sample_page_indices is None and _sparse_sample_metadata is None)
+    ):
+        raise ValueError("sparse SAMPLE requires 4/8 loaders and complete index groups")
     if _h64_candidate and "active_rows" in prepared._metadata_modes:
         raise ValueError(
             "the H64 candidate variant does not support active_rows metadata"
@@ -1535,6 +1606,28 @@ def _fp8_mqa_selective_logits(
         values,
         index_counts,
     )
+    if _sparse_sample_metadata is not None:
+        if (
+            not _sparse_sample_load_warps
+            or sample_page_indices is not None
+            or len(_sparse_sample_metadata) != 4
+            or any(
+                tensor.dtype != torch.int32
+                or tensor.device != q.device
+                or tensor.ndim != 1
+                or not tensor.is_contiguous()
+                for tensor in _sparse_sample_metadata
+            )
+            or any(t.numel() < prepared.rows for t in _sparse_sample_metadata[:2])
+            or any(
+                t.numel() != prepared.batches + 1 for t in _sparse_sample_metadata[2:]
+            )
+        ):
+            raise ValueError(
+                "on-the-fly SAMPLE requires row ends/counts and request prefixes"
+            )
+        _require_aligned(_sparse_sample_metadata)
+        launch_tensors = (*launch_tensors, *_sparse_sample_metadata)
     if policy_values is not None:
         launch_tensors = (*launch_tensors, policy_values)
     if sample_page_indices is not None:
@@ -1543,8 +1636,15 @@ def _fp8_mqa_selective_logits(
             or sample_page_indices.dtype != torch.int64
             or sample_page_indices.device != q.device
             or sample_page_indices.ndim != 2
-            or sample_page_indices.shape[0] != prepared.batches
+            or sample_page_indices.shape[0]
+            != (
+                (prepared.rows + _sparse_sample_group_rows - 1)
+                // _sparse_sample_group_rows
+                if _sparse_sample_load_warps
+                else prepared.batches
+            )
             or sample_page_indices.shape[1] == 0
+            or (_sparse_sample_load_warps and sample_page_indices.shape[1] < capacity)
             or not sample_page_indices.is_contiguous()
         ):
             raise ValueError(
@@ -1577,6 +1677,9 @@ def _fp8_mqa_selective_logits(
         cached_required_words,
         sample_page_indices is not None,
         _h64_candidate,
+        _sparse_sample_load_warps,
+        _sparse_sample_group_rows,
+        _sparse_sample_metadata is not None,
         prepared.math_mode
         if isinstance(prepared, _PreparedFP8MQASelectiveLogits)
         else None,
@@ -1939,6 +2042,7 @@ def _fp8_mqa_selective_logits(
             prepared,
             policy_words,
             sample_page_indices,
+            _sparse_sample_metadata,
         ),
         cutlass.Int32(kv_fused.shape[0]),
         cutlass.Int32(prepared.context_lens.shape[0]),
@@ -1978,6 +2082,9 @@ def _fp8_mqa_selective_logits(
         sample_page_indices is not None,
         prepared.math_mode,
         _h64_candidate,
+        _sparse_sample_load_warps,
+        _sparse_sample_group_rows,
+        _sparse_sample_metadata is not None,
     )
     if mode in (
         _SelectiveLogitsMode.SAMPLE,
@@ -2011,12 +2118,22 @@ def _fp8_mqa_selective_logits(
     if compiled is None:
         from .kernels._fp8_mqa_selective import (
             FP8MQASelectiveLogitsKernel,
+            FP8MQASparseGather4SampleKernel,
             SELECTIVE_LOGITS_TILING,
         )
 
+        kernel_class: Any = FP8MQASelectiveLogitsKernel
+        sparse_options = {}
+        if _sparse_sample_load_warps:
+            kernel_class = FP8MQASparseGather4SampleKernel
+            sparse_options = dict(
+                load_warps=_sparse_sample_load_warps,
+                group_rows=_sparse_sample_group_rows,
+                on_the_fly=_sparse_sample_metadata is not None,
+            )
         compiled = _compile_for_device(
             q.device,
-            FP8MQASelectiveLogitsKernel(
+            kernel_class(
                 num_heads=prepared.num_heads,
                 head_dim=prepared.head_dim,
                 phys_block_kv=prepared.page_size,
@@ -2041,6 +2158,7 @@ def _fp8_mqa_selective_logits(
                     num_epi_subtiles=prepared.num_epi_subtiles,
                     num_umma_stages=prepared.num_umma_stages,
                 ),
+                **sparse_options,
             ),
             *args,
             stream,
@@ -2289,6 +2407,7 @@ class _FP8PagedMQASelectiveTopKEngine:
         self._sample_ladder: torch.Tensor | None = None
         self._sample_populations: torch.Tensor | None = None
         self._sample_page_indices: torch.Tensor | None = None
+        self._sample_sparse_metadata: tuple[torch.Tensor, ...] | None = None
         self._candidate_schedule: _CandidateSchedule | None = None
         self._prepared: _PreparedFP8MQASelectiveLogits | None = None
         self._repair_prepared: _PreparedFP8MQASelectiveLogits | None = None
@@ -3300,7 +3419,18 @@ class _FP8PagedMQASelectiveTopKEngine:
             capacity=_SAMPLE_CAPACITY,
             values=self._sample_scores,
             index_counts=self._sample_scratch,
-            sample_page_indices=self._sample_page_indices,
+            sample_page_indices=(
+                self._sample_page_indices
+                if self._sample_sparse_metadata is None
+                else None
+            ),
+            _sparse_sample_metadata=self._sample_sparse_metadata,
+            _sparse_sample_load_warps=4
+            if self._sample_sparse_metadata is not None
+            else 0,
+            _sparse_sample_group_rows=_select_sparse_sample_group_rows(
+                self._sample_prepared.query_tile
+            ),
             _compile_only=True,
         )
         _fp8_mqa_selective_logits(
@@ -3861,7 +3991,18 @@ class _FP8PagedMQASelectiveTopKEngine:
                 capacity=_SAMPLE_CAPACITY,
                 values=self._sample_scores,
                 index_counts=self._sample_scratch,
-                sample_page_indices=self._sample_page_indices,
+                sample_page_indices=(
+                    self._sample_page_indices
+                    if self._sample_sparse_metadata is None
+                    else None
+                ),
+                _sparse_sample_metadata=self._sample_sparse_metadata,
+                _sparse_sample_load_warps=4
+                if self._sample_sparse_metadata is not None
+                else 0,
+                _sparse_sample_group_rows=_select_sparse_sample_group_rows(
+                    self._sample_prepared.query_tile
+                ),
             )
             if capturing:
                 _check_capture_status(capture_stream, "sample scorer")

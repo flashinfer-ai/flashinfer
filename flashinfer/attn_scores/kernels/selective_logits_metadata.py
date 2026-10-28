@@ -347,19 +347,27 @@ class SelectiveCapacitySampleMetadataKernel:
     including first/last; unused slots are 0 and consumers use valid counts.
     Empty/inactive rows get count/rank 0. All outputs are rewritten each launch.
 
+    With group_rows > 0, request-local groups share the first causal end and
+    score min(end, sample_capacity) uniformly spaced keys. Every row uses that
+    same count and rank; a short group's keys are enumerated exactly. Page
+    coordinates are consumed only with group_rows == 0 by whole-page SAMPLE;
+    grouped sparse SAMPLE computes individual key positions directly.
+
     The fixed grid has ceil(max(B*P,R)/256) CTAs. Call after capacity refresh
     on the same stream; no raw caller prefix or map is read here. Coordinates
     index columns of the original page table, not physical KV page IDs.
     """
 
-    def __init__(self, page_size, target_candidates):
+    def __init__(self, page_size, target_candidates, group_rows=0):
         self.page_size = page_size
         self.target_candidates = target_candidates
+        self.group_rows = group_rows
 
     @cute.jit
     def __call__(
         self,
         physical_kv: cute.Tensor,
+        qo_indptr: cute.Tensor,
         row_ends: cute.Tensor,
         row_requests: cute.Tensor,
         page_indices: cute.Tensor,
@@ -369,7 +377,13 @@ class SelectiveCapacitySampleMetadataKernel:
     ):
         items = max(page_indices.shape[0] * page_indices.shape[1], row_ends.shape[0])
         self.kernel(
-            physical_kv, row_ends, row_requests, page_indices, sample_ends, sample_ranks
+            physical_kv,
+            qo_indptr,
+            row_ends,
+            row_requests,
+            page_indices,
+            sample_ends,
+            sample_ranks,
         ).launch(
             grid=(cute.ceil_div(items, 256), 1, 1), block=(256, 1, 1), stream=stream
         )
@@ -378,6 +392,7 @@ class SelectiveCapacitySampleMetadataKernel:
     def kernel(
         self,
         physical_kv: cute.Tensor,
+        qo_indptr: cute.Tensor,
         row_ends: cute.Tensor,
         row_requests: cute.Tensor,
         page_indices: cute.Tensor,
@@ -403,28 +418,43 @@ class SelectiveCapacitySampleMetadataKernel:
             rank = cutlass.Int32(0)
             owner = row_requests[item]
             if owner >= 0:
-                length = physical_kv[owner + 1] - physical_kv[owner]
-                pages = cutlass.Int32(
-                    cute.ceil_div(cutlass.Int64(length), self.page_size)
-                )
-                selected = min(pages, page_indices.shape[1])
-                end = row_ends[item]
-                end_page = end // self.page_size
-                # Count sampled pages before this row's exclusive causal end.
-                low = cutlass.Int32(0)
-                high = selected
-                while low < high:
-                    middle = (low + high) // 2
-                    page = cutlass.Int64(middle) * (pages - 1) // max(selected - 1, 1)
-                    if page < end_page:
-                        low = middle + 1
-                    else:
-                        high = middle
-                count = low * self.page_size
-                if low < selected:
-                    page = cutlass.Int64(low) * (pages - 1) // max(selected - 1, 1)
-                    if page == end_page:
-                        count = count + end % self.page_size
+                end = cutlass.Int32(0)
+                if cutlass.const_expr(self.group_rows > 0):
+                    first = (
+                        qo_indptr[owner]
+                        + ((item - qo_indptr[owner]) // self.group_rows)
+                        * self.group_rows
+                    )
+                    # Shared positions cover the first row's causal range.
+                    # Every query in the group must score the same positions,
+                    # including exact enumeration when that range is short.
+                    end = row_ends[first]
+                    count = min(end, page_indices.shape[1] * self.page_size)
+                else:
+                    length = physical_kv[owner + 1] - physical_kv[owner]
+                    pages = cutlass.Int32(
+                        cute.ceil_div(cutlass.Int64(length), self.page_size)
+                    )
+                    selected = min(pages, page_indices.shape[1])
+                    end = row_ends[item]
+                    end_page = end // self.page_size
+                    # Count sampled pages before this row's exclusive causal end.
+                    low = cutlass.Int32(0)
+                    high = selected
+                    while low < high:
+                        middle = (low + high) // 2
+                        page = (
+                            cutlass.Int64(middle) * (pages - 1) // max(selected - 1, 1)
+                        )
+                        if page < end_page:
+                            low = middle + 1
+                        else:
+                            high = middle
+                    count = low * self.page_size
+                    if low < selected:
+                        page = cutlass.Int64(low) * (pages - 1) // max(selected - 1, 1)
+                        if page == end_page:
+                            count = count + end % self.page_size
                 if end > 0:
                     rank = max(
                         1,

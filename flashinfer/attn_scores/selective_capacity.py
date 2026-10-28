@@ -347,6 +347,7 @@ class _CapacityStepInputs:
             from_dlpack(tensor, assumed_align=4)
             for tensor in (
                 self.physical_kv_indptr,
+                self.safe_qo_indptr,
                 self.row_ends,
                 self.row_requests,
                 self.sample_page_indices,
@@ -358,6 +359,18 @@ class _CapacityStepInputs:
             self.capacity.page_size, _candidate_target(top_k)
         )
         self._sample_compiled = None
+
+    def _set_sample_group_rows(self, group_rows: int, *, refresh: bool = True) -> None:
+        """Bind group-consistent counts before compiling sparse SAMPLE consumers."""
+        if self._sample_kernel.group_rows != group_rows:
+            self._sample_kernel = type(self._sample_kernel)(
+                self._sample_kernel.page_size,
+                self._sample_kernel.target_candidates,
+                group_rows,
+            )
+            self._sample_compiled = None
+            if refresh:
+                self.refresh_sampling()
 
     @property
     def is_prepared(self) -> bool:
@@ -658,6 +671,25 @@ class _CapacitySelectiveTopKPlan:
             math_mode=self.math_mode,
             _capacity_bounds=True,
         )
+        # Loader groups begin at request-local query prefixes. The count/rank
+        # refresh and loader use the same complete-query-tile group size.
+        from .selective_logits import (
+            _select_sparse_sample_group_rows,
+            _sparse_sample_gather4_serves,
+        )
+
+        if engine._needs_sampling and _sparse_sample_gather4_serves(
+            kv_fused.shape[0], kv_fused.stride(0), capacity.page_size, capacity.head_dim
+        ):
+            state._set_sample_group_rows(
+                _select_sparse_sample_group_rows(engine._sample_prepared.query_tile)
+            )
+            engine._sample_sparse_metadata = (
+                engine._row_ends,
+                engine._sample_ends,
+                state.safe_qo_indptr,
+                state.physical_kv_indptr,
+            )
         # Bind auxiliary kernels only after all stable metadata/output owners
         # have their final addresses. No predecessor graph is captured here.
         engine._compile_auxiliary_launches()
@@ -893,13 +925,45 @@ class _CapacitySelectiveTopKPlan:
         Pool-specific parent graphs own their nested repair bodies and retain
         pool/launch owners until clear_pools or destruction.
         """
-        from .selective_logits import _capture_cuda_graph
+        from .selective_logits import (
+            _capture_cuda_graph,
+            _select_request_tiling,
+            _select_sparse_sample_group_rows,
+            _sparse_sample_gather4_serves,
+        )
 
         key = self._pool_key(kv_fused)
         with torch.cuda.device(self._state.device):
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("prepare_pool must run outside CUDA graph capture")
             if not self._state.is_prepared:
+                capacity = self._capacity
+                if self._needs_sampling and _sparse_sample_gather4_serves(
+                    kv_fused.shape[0],
+                    kv_fused.stride(0),
+                    capacity.page_size,
+                    capacity.head_dim,
+                ):
+                    # Match the capacity-family geometry used by _build_engine
+                    # before the first metadata compilation.
+                    rows = min(
+                        capacity.max_chunk_size,
+                        capacity.max_batch_size * capacity.max_context_length,
+                    )
+                    batches = capacity.max_batch_size
+                    lengths = [
+                        rows // batches + (request < rows % batches)
+                        for request in range(batches)
+                    ]
+                    tile = _select_request_tiling(
+                        self._state.device,
+                        capacity.num_heads,
+                        capacity.head_dim,
+                        lengths,
+                    ).next_n
+                    self._state._set_sample_group_rows(
+                        _select_sparse_sample_group_rows(tile), refresh=False
+                    )
                 self._state.prepare()
                 self._state.refresh()
                 if self._needs_sampling:

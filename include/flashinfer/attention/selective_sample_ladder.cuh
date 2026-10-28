@@ -26,11 +26,24 @@
 namespace flashinfer {
 namespace attention {
 
-__device__ __forceinline__ int SampleLadderBin(float value) {
+__device__ __forceinline__ uint16_t SampleLadderKey(float value) {
   uint16_t bits = __half_as_ushort(__float2half_rn(value));
   uint16_t key = bits;
   if (!(bits & 0x8000)) key = (bits ^ 0xffff) & 0x7fff;
-  return key >> 5;
+  return key;
+}
+
+__device__ __forceinline__ int SampleLadderBin(float value) { return SampleLadderKey(value) >> 5; }
+
+// Descending FP32 keys let atomicMax publish the lowest actual score in a
+// selected FP16 sub-bin, without rounding that conservative floor upward.
+__device__ __forceinline__ uint32_t SampleLadderScoreKey(float value) {
+  const uint32_t bits = __float_as_uint(value);
+  return bits & 0x80000000u ? bits : (~bits & 0x7fffffffu);
+}
+
+__device__ __forceinline__ float SampleLadderScoreFromKey(uint32_t key) {
+  return __uint_as_float(key & 0x80000000u ? key : (~key & 0x7fffffffu));
 }
 
 __device__ __forceinline__ float SampleLadderBinFloor(int bin) {
@@ -55,8 +68,16 @@ static __global__ void SelectiveSampleLadder(const float* samples, int64_t sampl
   __shared__ typename Scan::TempStorage scan_storage;
   __shared__ int histogram[kBins];
   __shared__ int chosen_bins[3];
+  __shared__ int before_bins[3];
+  __shared__ int refine_row;
+  __shared__ int fine_histogram[3][32];
+  __shared__ uint32_t fine_floors[3][32];
   const int tid = threadIdx.x, row = blockIdx.x, count = valid[row];
   for (int bin = tid; bin < kBins; bin += kThreads) histogram[bin] = 0;
+  if (tid < 96) {
+    fine_histogram[tid / 32][tid % 32] = 0;
+    fine_floors[tid / 32][tid % 32] = 0;
+  }
   __syncthreads();
   for (int item = tid; item < count; item += kThreads) {
     atomicAdd(histogram + SampleLadderBin(samples[row * sample_stride + item]), 1);
@@ -74,17 +95,72 @@ static __global__ void SelectiveSampleLadder(const float* samples, int64_t sampl
       if (prefix[i] < target && prefix[i] + counts[i] >= target) {
         const int bin = tid * kItems + i;
         chosen_bins[rung] = bin;
+        before_bins[rung] = prefix[i];
         ladder[row * 3 + rung] = SampleLadderBinFloor(bin);
         populations[row * 3 + rung] = prefix[i] + counts[i];
       }
     }
     if (count == 0 && tid == 0) {
       chosen_bins[rung] = kBins - 1;
+      before_bins[rung] = 0;
       ladder[row * 3 + rung] = -CUDART_INF_F;
       populations[row * 3 + rung] = 0;
     }
   }
   __syncthreads();
+  // One CTA owns one row. Skip the second sample pass only when at least
+  // one coarse rung already passes the existing population/bank confidence
+  // checks. This gate uses samples, never oracle score or repair information.
+  if (tid == 0) {
+    refine_row = count > 0 && ends[row] >= top_k;
+#pragma unroll
+    for (int rung = 0; rung < 3; ++rung) {
+      const float hits = populations[row * 3 + rung];
+      const float sigma = sqrtf(fmaxf(hits, 1.f));
+      const float scale = float(ends[row]) / float(max(count, 1));
+      const float lower = fmaxf(0.f, hits - 3.f * sigma) * scale;
+      const float upper = (hits + 3.f * sigma) * scale;
+      const float bank_mean = upper / float(count_segments);
+      const float bank_upper = fmaf(3.f, sqrtf(fmaxf(bank_mean, 1.f)), bank_mean);
+      if (lower >= top_k && bank_upper < capacity / count_segments) refine_row = 0;
+    }
+  }
+  __syncthreads();
+  if (refine_row) {
+    // Refine only the three boundary bins, reusing the existing sample scores.
+    // Candidate scoring still runs once. Keep chosen_bins coarse: underfilled
+    // candidate rows use that encoding to expand the exact-repair threshold.
+    for (int item = tid; item < count; item += kThreads) {
+      const float score = samples[row * sample_stride + item];
+      const uint16_t key = SampleLadderKey(score);
+      const int bin = key >> 5, fine = key & 31;
+#pragma unroll
+      for (int rung = 0; rung < 3; ++rung) {
+        if (bin == chosen_bins[rung]) {
+          atomicAdd(&fine_histogram[rung][fine], 1);
+          atomicMax(&fine_floors[rung][fine], SampleLadderScoreKey(score));
+        }
+      }
+    }
+    __syncthreads();
+    if (tid < 96) {
+      const int rung = tid / 32, lane = tid % 32;
+      const int own = fine_histogram[rung][lane];
+      int inclusive = own;
+#pragma unroll
+      for (int delta = 1; delta < 32; delta <<= 1) {
+        const int prior = __shfl_up_sync(0xffffffffu, inclusive, delta);
+        if (lane >= delta) inclusive += prior;
+      }
+      const int target = max(1, min(count, ranks[row]) / (4 >> rung));
+      const int before = before_bins[rung] + inclusive - own;
+      if (count > 0 && before < target && before + own >= target) {
+        ladder[row * 3 + rung] = SampleLadderScoreFromKey(fine_floors[rung][lane]);
+        populations[row * 3 + rung] = before + own;
+      }
+    }
+    __syncthreads();
+  }
   if (tid == 0) {
     int chosen = 2;
 #pragma unroll

@@ -6303,7 +6303,6 @@ def test_h64_candidate_nan_scores_rank_as_negative_infinity(math_mode):
 def test_sample_candidate_overflow_and_exact_modes(math_mode):
     from flashinfer.attn_scores.selective_logits import (
         _finalize_fp8_mqa_packed_candidates,
-        _shared_engine_source_token,
     )
 
     inputs = _inputs()
@@ -6318,16 +6317,8 @@ def test_sample_candidate_overflow_and_exact_modes(math_mode):
         _launch("sample", width, sampled, unused, prepared, inputs)
     _launch(_SelectiveLogitsMode.SAMPLE, width, sampled, unused, prepared, inputs)
     assert prepared._launches
-    cache_key = (
-        _SelectiveLogitsMode.SAMPLE,
-        width,
-        0,
-        1,
-        False,
-        False,
-        prepared.math_mode,
-        _shared_engine_source_token(),
-    )
+    assert len(prepared._launches) == 1
+    cache_key = next(iter(prepared._launches))
     cached_sample_launch = prepared._launches[cache_key]
     unused.zero_()
     _launch(_SelectiveLogitsMode.SAMPLE, width, sampled, unused, prepared, inputs)
@@ -6361,15 +6352,8 @@ def test_sample_candidate_overflow_and_exact_modes(math_mode):
         thresholds,
     )
     torch.cuda.synchronize()
-    candidate_cache_key = (
-        _SelectiveLogitsMode.CANDIDATE,
-        capacity,
-        0,
-        1,
-        False,
-        False,
-        prepared.math_mode,
-        _shared_engine_source_token(),
+    candidate_cache_key = next(
+        key for key in prepared._launches if key[0] == _SelectiveLogitsMode.CANDIDATE
     )
     cached_candidate_launch = prepared._launches[candidate_cache_key]
     thresholds.add_(0.0)
@@ -7096,16 +7080,8 @@ def test_cached_launch_rebinds_prepared_metadata_storage(metadata_name):
 
     _launch(_SelectiveLogitsMode.SAMPLE, 130, values, counts, prepared, inputs)
     torch.cuda.synchronize()
-    cache_key = (
-        _SelectiveLogitsMode.SAMPLE,
-        130,
-        0,
-        1,
-        False,
-        False,
-        prepared.math_mode,
-        sl._shared_engine_source_token(),
-    )
+    assert len(prepared._launches) == 1
+    cache_key = next(iter(prepared._launches))
     cached = prepared._launches[cache_key]
 
     metadata = getattr(prepared, metadata_name)
@@ -8165,6 +8141,431 @@ def _clear_paged_input_cache():
 # Sample threshold and parallel ladder
 
 
+@_requires_selective_sm100
+@pytest.mark.parametrize("page_size", [32, 64])
+@pytest.mark.parametrize("load_warps", [4, 8])
+def test_sparse_gather4_sample_small_pages(page_size, load_warps):
+    """Gather key rows and scales across shuffled sub-tile physical pages."""
+    import flashinfer.attn_scores.selective_logits as sl
+
+    rows, length, samples = 16, 4096, 256
+    q, kv, scales, weights, qo, kv_prefix = _inputs(rows, length, 64)
+    qo = torch.tensor([0, rows], dtype=torch.int32, device="cuda")
+    kv_prefix = torch.tensor([0, length], dtype=torch.int32, device="cuda")
+    weights.abs_()
+    fused, table = _paged_inputs((q, kv, scales, weights, qo, kv_prefix), page_size)
+    positions = torch.div(
+        torch.arange(samples, device="cuda") * (length - 1),
+        samples - 1,
+        rounding_mode="floor",
+    )
+    starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    ends = torch.full_like(starts, samples)
+    prepared = sl._prepare_fp8_mqa_selective_logits(
+        q,
+        fused,
+        weights,
+        qo,
+        kv_prefix,
+        table,
+        row_starts=starts,
+        row_ends=ends,
+        query_tile=2,
+        num_heads=64,
+        head_dim=128,
+        num_sms=1,
+    )
+    sample_prefix = torch.tensor([0, samples], dtype=torch.int32, device="cuda")
+    packed, packed_table = _paged_inputs(
+        (q, kv[positions], scales[positions], weights, qo, sample_prefix), page_size
+    )
+    native_prepared = sl._prepare_fp8_mqa_selective_logits(
+        q,
+        packed,
+        weights,
+        qo,
+        sample_prefix,
+        packed_table,
+        row_starts=starts,
+        row_ends=ends,
+        query_tile=2,
+        num_heads=64,
+        head_dim=128,
+        num_sms=1,
+    )
+    actual = torch.empty((rows, samples), device="cuda")
+    on_the_fly = torch.empty_like(actual)
+    native = torch.empty_like(actual)
+    counts = torch.zeros((rows, 1), dtype=torch.int32, device="cuda")
+    indices = positions.view(1, -1).contiguous()
+    physical_ends = torch.full_like(ends, length)
+
+    def run():
+        sl._fp8_mqa_selective_logits(
+            q,
+            fused,
+            weights,
+            table,
+            prepared,
+            mode=sl._SelectiveLogitsMode.SAMPLE,
+            capacity=samples,
+            values=actual,
+            index_counts=counts,
+            sample_page_indices=indices,
+            _sparse_sample_load_warps=load_warps,
+            _sparse_sample_group_rows=rows,
+        )
+        sl._fp8_mqa_selective_logits(
+            q,
+            fused,
+            weights,
+            table,
+            prepared,
+            mode=sl._SelectiveLogitsMode.SAMPLE,
+            capacity=samples,
+            values=on_the_fly,
+            index_counts=counts,
+            _sparse_sample_load_warps=load_warps,
+            _sparse_sample_group_rows=rows,
+            _sparse_sample_metadata=(physical_ends, ends, qo, kv_prefix),
+        )
+        sl._fp8_mqa_selective_logits(
+            q,
+            packed,
+            weights,
+            packed_table,
+            native_prepared,
+            mode=sl._SelectiveLogitsMode.SAMPLE,
+            capacity=samples,
+            values=native,
+            index_counts=counts,
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for changed in (False, True):
+        if changed:
+            fused.copy_(fused.flip(0))
+            table.copy_(fused.shape[0] - 1 - table)
+        graph.replay()
+        torch.testing.assert_close(actual, native, rtol=0, atol=0)
+        torch.testing.assert_close(on_the_fly, actual, rtol=0, atol=0)
+        reference = (
+            (q.float() @ kv[positions].float().T).relu() * weights[:, :, None]
+        ).sum(1) * scales[positions][None, :]
+        torch.testing.assert_close(actual, reference, rtol=1e-4, atol=1e-4)
+
+
+def test_sparse_sample_groups_contain_whole_query_tiles():
+    for tile in range(1, 17):
+        group = sl._select_sparse_sample_group_rows(tile)
+        assert group == (128 if 128 % tile == 0 else tile)
+        assert group % tile == 0
+
+
+def test_sparse_sample_gather4_coordinate_bounds():
+    max_pages = (2**31 - 1) // 132
+    assert sl._sparse_sample_gather4_serves(max_pages, 128 * 132, 128, 128)
+    assert not sl._sparse_sample_gather4_serves(max_pages + 1, 128 * 132, 128, 128)
+    assert not sl._sparse_sample_gather4_serves(8, 128 * 132 + 16, 128, 128)
+    assert not sl._sparse_sample_gather4_serves(8, 128 * 68, 128, 64)
+
+
+@_requires_selective_sm100
+def test_capacity_sparse_sample_unsupported_layout_uses_pages(monkeypatch):
+    """Exercise the wide-pool selection without allocating a 256 GiB pool."""
+    supports = sl._sparse_sample_gather4_serves
+    monkeypatch.setattr(
+        sl,
+        "_sparse_sample_gather4_serves",
+        lambda pages, stride, page_size, dim: supports(
+            (2**31 - 1) // 132 + 1, stride, page_size, dim
+        ),
+    )
+    inputs = _request_inputs([4], [8192], heads=64)
+    q, _, _, weights, qo, kv = inputs
+    fused, table = _paged_inputs(inputs)
+    wrapper = FP8PagedMQATopKWrapper(
+        strategy="selective",
+        num_heads=64,
+        top_k=512,
+        max_context_length=8192,
+        max_chunk_size=4,
+        max_batch_size=1,
+        kv_layout=fused,
+    )
+    wrapper.plan(qo, kv, table)
+    selected = wrapper.run(q, weights, fused)
+    engine = wrapper._capacity_plan._engine
+    assert engine._sample_sparse_metadata is None
+    assert wrapper._capacity_plan._state._sample_kernel.group_rows == 0
+    _check_selection(selected, _oracle_rows(inputs), 512)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.plan(qo, kv, table)
+        captured = wrapper.run(q, weights, fused)
+    graph.replay()
+    _check_selection(captured, _oracle_rows(inputs), 512)
+    assert wrapper.error.item() == wrapper.repair_error.item() == 0
+
+
+@_requires_selective_sm100
+@pytest.mark.parametrize("heads,tile,rows", [(8, 5, 15), (64, 2, 256), (4, 16, 256)])
+def test_sparse_sample_tile_groups_match_indexed(heads, tile, rows):
+    """Q5 shares whole tiles; H64/H4 share 128 request-local rows."""
+    q, keys, scales, weights, _, _ = _inputs(rows, 8192, heads)
+    qo = torch.tensor([0, rows], device="cuda", dtype=torch.int32)
+    kv = torch.tensor([0, 8192], device="cuda", dtype=torch.int32)
+    fused, table = _paged_inputs((q, keys, scales, weights, qo, kv))
+    samples = 3840
+    group = sl._select_sparse_sample_group_rows(tile)
+    assert group == (5 if heads == 8 else 128)
+    assert group == (128 if rows % 128 == 0 else tile)
+    ends = torch.arange(rows, device="cuda", dtype=torch.int32) + 4096
+    valid = torch.full_like(ends, samples)
+
+    def reference_positions():
+        return (
+            torch.div(
+                torch.arange(samples, device="cuda")[None, :]
+                * (ends.long().view(-1, group)[:, :1] - 1).clamp_min(0),
+                (valid.long().view(-1, group)[:, :1] - 1).clamp_min(1),
+                rounding_mode="floor",
+            )
+            .clamp(min=0, max=8191)
+            .contiguous()
+        )
+
+    positions = reference_positions()
+    prepared = sl._prepare_fp8_mqa_selective_logits(
+        q,
+        fused,
+        weights,
+        qo,
+        kv,
+        table,
+        row_starts=torch.zeros_like(ends),
+        row_ends=valid,
+        query_tile=tile,
+        num_heads=heads,
+        head_dim=128,
+        num_sms=1,
+    )
+    padded = (rows + 15) // 16 * 16
+    indexed = torch.empty((padded, samples), device="cuda")
+    onfly = torch.empty_like(indexed)
+    counts = torch.zeros((padded, 1), device="cuda", dtype=torch.int32)
+
+    def run():
+        for output, extra in (
+            (indexed, dict(sample_page_indices=positions)),
+            (onfly, dict(_sparse_sample_metadata=(ends, valid, qo, kv))),
+        ):
+            sl._fp8_mqa_selective_logits(
+                q,
+                fused,
+                weights,
+                table,
+                prepared,
+                mode=sl._SelectiveLogitsMode.SAMPLE,
+                capacity=samples,
+                values=output,
+                index_counts=counts,
+                _sparse_sample_load_warps=4,
+                _sparse_sample_group_rows=group,
+                **extra,
+            )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for change in (0, 17):
+        ends.add_(change)
+        positions.copy_(reference_positions())
+        graph.replay()
+        torch.testing.assert_close(onfly[:rows], indexed[:rows], rtol=0, atol=0)
+        for row in range(rows):
+            sample_keys = positions[row // group]
+            dots = q[row].float() @ keys[sample_keys].float().T
+            expected = (dots.relu() * weights[row, :, None]).sum(0) * scales[
+                sample_keys
+            ]
+            torch.testing.assert_close(onfly[row], expected, atol=1e-4, rtol=1e-4)
+
+
+@_requires_selective_sm100
+def test_sparse_sample_positions_match_int64_reference():
+    """Production int32 metadata produces wide, exact sample coordinates."""
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+
+    from flashinfer.attn_scores.kernels._fp8_mqa_selective import sparse_sample_position
+    from flashinfer.attn_scores.selective_logits import _current_stream
+
+    class Positions:
+        @cute.kernel
+        def kernel(self, metadata, output):
+            tid, _, _ = cute.arch.thread_idx()
+            row, _, _ = cute.arch.block_idx()
+            for offset in cutlass.range_constexpr(15):
+                i = tid + offset * 256
+                output[row, i] = sparse_sample_position(
+                    i, metadata[row, 0], metadata[row, 1], metadata[row, 2]
+                )
+
+        @cute.jit
+        def __call__(self, metadata, output, stream):
+            self.kernel(metadata, output).launch(
+                grid=(output.shape[0], 1, 1), block=(256, 1, 1), stream=stream
+            )
+
+    cases = [(0, 1, 0), (0, 1, 16), (31, 31, 31)] + [
+        (end - 1, count - 1, end + 127)
+        for end in (6143, 6144, 6145, 32768, 560001, 1048576)
+        for count in (128, 256, 3840)
+    ]
+    metadata = torch.tensor(cases, device="cuda", dtype=torch.int32)
+    output = torch.empty((len(cases), 3840), device="cuda", dtype=torch.int64)
+    args = (from_dlpack(metadata), from_dlpack(output))
+    stream = _current_stream(output.device)
+    compiled = cute.compile(Positions(), *args, stream)
+    compiled(*args, stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        compiled(*args, _current_stream(output.device))
+    for changed in (False, True):
+        if changed:
+            metadata[:, 0].add_(17)
+        graph.replay()
+        # Form the reference product in int64 before dividing and clamping.
+        expected = torch.div(
+            torch.arange(3840, device="cuda")[None, :] * metadata[:, :1],
+            metadata[:, 1:2],
+            rounding_mode="floor",
+        ).minimum(metadata[:, 2:3])
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+@_requires_selective_sm100
+@pytest.mark.parametrize(
+    "heads,page_size,ratio,prefix",
+    [
+        (64, 128, 1, (0, 129, 129, 260)),
+        (64, 64, 4, (0, 129, 129, 260)),
+        (8, 32, 1, (0, 5, 5, 15)),
+    ],
+)
+def test_capacity_sparse_sample_ragged_score_oracle(
+    monkeypatch, heads, page_size, ratio, prefix
+):
+    """Each causal group shares its count/rank and enumerates short ranges."""
+    rows = prefix[-1]
+    q, keys, scales, weights, _, _ = _inputs(rows, 8192, heads)
+    weights.abs_()
+    fused = _fuse_paged_kv(keys, scales, page_size)
+    qo = torch.tensor(prefix, device=q.device, dtype=torch.int32)
+    kv = torch.tensor(
+        [0, 257 * ratio, 257 * ratio, 769 * ratio], device=q.device, dtype=torch.int32
+    )
+    pages = fused.shape[0]
+    table = torch.stack(
+        [
+            torch.arange(pages, device=q.device, dtype=torch.int32).roll(request * 7)
+            for request in range(3)
+        ]
+    )
+    compiled_groups = []
+    compile_for_device = sl._compile_for_device
+
+    def record_compile(device, kernel, *args, **kwargs):
+        if type(kernel).__name__ == "SelectiveCapacitySampleMetadataKernel":
+            compiled_groups.append(kernel.group_rows)
+        return compile_for_device(device, kernel, *args, **kwargs)
+
+    monkeypatch.setattr(sl, "_compile_for_device", record_compile)
+    wrapper = FP8PagedMQATopKWrapper(
+        strategy="selective",
+        num_heads=heads,
+        page_size=page_size,
+        compression_ratio=ratio,
+        top_k=512,
+        max_context_length=8192 * ratio,
+        max_chunk_size=rows,
+        max_batch_size=3,
+        kv_layout=fused,
+    )
+    wrapper.plan(qo, kv, table)
+    wrapper.run(q, weights, fused)
+    engine = wrapper._capacity_plan._engine
+    group = sl._select_sparse_sample_group_rows(engine._sample_prepared.query_tile)
+    assert compiled_groups == [group]
+
+    def check(lengths):
+        counts = engine._sample_ends.tolist()
+        ranks = engine._sample_ranks.tolist()
+        for request, (begin, end) in enumerate(
+            zip(prefix[:-1], prefix[1:], strict=True)
+        ):
+            for first in range(begin, end, group):
+                first_end = (
+                    lengths[request] * ratio - (end - begin) + first - begin + 1
+                ) // ratio
+                count = min(first_end, 3840)
+                rank = min(count, math.ceil(2048 * count / first_end))
+                last = min(first + group, end)
+                assert counts[first:last] == [count] * (last - first)
+                assert ranks[first:last] == [rank] * (last - first)
+                positions = torch.div(
+                    torch.arange(count, device=q.device, dtype=torch.int64)
+                    * (first_end - 1),
+                    max(count - 1, 1),
+                    rounding_mode="floor",
+                )
+                assert positions.unique().numel() == count
+                assert int(positions[-1]) <= first_end - 1
+                if first_end <= 3840:
+                    torch.testing.assert_close(
+                        positions, torch.arange(first_end, device=q.device)
+                    )
+                physical = (
+                    table[request, positions // page_size].long() * page_size
+                    + positions % page_size
+                )
+                for row in range(first, last):
+                    dots = q[row].float() @ keys[physical].float().T
+                    expected = (dots.relu() * weights[row, :, None]).sum(0) * scales[
+                        physical
+                    ]
+                    torch.testing.assert_close(
+                        engine._sample_scores[row, :count],
+                        expected,
+                        atol=1e-4,
+                        rtol=1e-4,
+                    )
+        assert wrapper.error.item() == wrapper.repair_error.item() == 0
+
+    check((257, 0, 512))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.plan(qo, kv, table)
+        wrapper.run(q, weights, fused)
+    for lengths in ((4096, 0, 8192), (257, 0, 512)):
+        kv.copy_(
+            torch.tensor(
+                [0, lengths[0] * ratio, lengths[0] * ratio, sum(lengths) * ratio],
+                device=q.device,
+                dtype=torch.int32,
+            )
+        )
+        table.copy_(table.roll(1, dims=1))
+        graph.replay()
+        check(lengths)
+
+
 def _sample_ladder_reference(samples, valid, ranks, ends, top_k, segments):
     """Independent histogram crossings and bank estimates; no production helper."""
     rows, device = valid.numel(), samples.device
@@ -8176,21 +8577,44 @@ def _sample_ladder_reference(samples, valid, ranks, ends, top_k, segments):
         count = int(valid[row])
         bits = samples[row, :count].half().view(torch.uint16).long()
         keys = torch.where(bits & 0x8000 != 0, bits, (bits ^ 0xFFFF) & 0x7FFF)
-        prefix = torch.bincount(keys >> 5, minlength=2048).cumsum(0)
+        prefix = torch.bincount(keys, minlength=65536).cumsum(0)
         bins = []
+        coarse_values, coarse_hits = [], []
         for rung in range(3):
             target = max(1, min(count, int(ranks[row])) // (4 >> rung))
-            index = int(torch.searchsorted(prefix, target)) if count else 2047
-            bins.append(index)
-            key = min(0xFC00, (index << 5) + 31)
-            floor_bits = key if key & 0x8000 else (key ^ 0xFFFF) & 0x7FFF
-            expected_ladder[row, rung] = (
-                torch.tensor(floor_bits, dtype=torch.uint16, device=device)
+            index = int(torch.searchsorted(prefix, target)) if count else 65535
+            bins.append(index >> 5)
+            coarse_hits.append(int(prefix[min((index | 31), 65535)]) if count else 0)
+            floor = min(0xFC00, index | 31)
+            encoding = floor if floor & 0x8000 else (floor ^ 0xFFFF) & 0x7FFF
+            coarse_values.append(
+                torch.tensor(encoding, dtype=torch.int32, device=device)
+                .short()
                 .view(torch.float16)
                 .float()
+                if count
+                else torch.tensor(float("-inf"), device=device)
             )
+            expected_ladder[row, rung] = float("-inf")
             if count:
+                expected_ladder[row, rung] = samples[row, :count][keys == index].min()
                 expected_populations[row, rung] = prefix[index]
+
+        def fits(hits):
+            sigma = math.sqrt(max(hits, 1))
+            scale = int(ends[row]) / max(count, 1)
+            lower = max(0, hits - 3 * sigma) * scale
+            mean = (hits + 3 * sigma) * scale / segments
+            return (
+                lower >= top_k and mean + 3 * math.sqrt(max(mean, 1)) < 6144 // segments
+            )
+
+        refine = (
+            count > 0 and int(ends[row]) >= top_k and not any(map(fits, coarse_hits))
+        )
+        if not refine:
+            expected_ladder[row] = torch.stack(coarse_values)
+            expected_populations[row] = torch.tensor(coarse_hits, device=device)
         chosen = 2
         for rung in (2, 1, 0):
             hits = int(expected_populations[row, rung])
@@ -8248,6 +8672,46 @@ def test_native_ladder_matches_signed_histogram(segments):
 
 
 # Native sample ladder
+
+
+@_requires_selective_sm100
+def test_native_ladder_refines_boundary_bin_without_rounding_floor_up():
+    """A dense coarse bin must not force the whole sampled population through."""
+    from flashinfer.jit.selective_sample_ladder import (
+        get_selective_sample_ladder_module,
+    )
+
+    positive = torch.linspace(8.001, 8.24, 3840, device="cuda")
+    samples = torch.stack((positive, -positive))
+    valid = torch.full((2,), 3840, dtype=torch.int32, device="cuda")
+    ranks = torch.full_like(valid, 1024)
+    ends = torch.full_like(valid, 32768)
+    actual = (
+        torch.empty(2, device="cuda"),
+        torch.empty_like(valid),
+        torch.empty((2, 3), device="cuda"),
+        torch.empty((2, 3), dtype=torch.int32, device="cuda"),
+    )
+    module = get_selective_sample_ladder_module()
+
+    def run():
+        module.run(samples, valid, ranks, ends, *actual, 512, 6144, 4)
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for _ in range(2):
+        expected = _sample_ladder_reference(samples, valid, ranks, ends, 512, 4)
+        graph.replay()
+        for got, want in zip(actual, expected, strict=True):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+        assert bool((actual[3] < valid[:, None]).all())
+        # Populations describe the actual FP32 floor, not the rounded FP16
+        # center (which can lie above some scores assigned to the same bin).
+        observed = (samples[:, None, :] >= actual[2][:, :, None]).sum(-1)
+        torch.testing.assert_close(observed.int(), actual[3], rtol=0, atol=0)
+        samples.copy_(samples.flip(0).contiguous())
 
 
 @_requires_selective_sm100
@@ -8644,6 +9108,106 @@ def test_lane_local8192_changed_map_tail_graph(top_k, ratio, monkeypatch):
                 atol=5e-5,
                 rtol=1e-5,
             )
+
+
+@pytest.mark.parametrize(
+    ("heads", "dimension", "tile", "page", "top_k", "long_query", "expected"),
+    [
+        (4, 128, 16, 128, 1024, True, True),
+        (4, 128, 16, 128, 2048, True, True),
+        (4, 128, 16, 128, 512, True, False),
+        (4, 128, 16, 128, 2048, False, False),
+        (4, 128, 8, 128, 2048, True, False),
+        (4, 128, 16, 64, 2048, True, False),
+        (4, 256, 16, 128, 2048, True, False),
+        (8, 128, 16, 128, 2048, True, False),
+        (32, 128, 16, 128, 2048, True, False),
+        (64, 128, 16, 128, 2048, True, False),
+    ],
+)
+def test_h4_pooled_candidate_gate(
+    heads, dimension, tile, page, top_k, long_query, expected
+):
+    from flashinfer.attn_scores.selective_logits import _h4_pooled_candidate_serves
+
+    assert (
+        _h4_pooled_candidate_serves(heads, dimension, tile, page, top_k, long_query)
+        is expected
+    )
+
+
+@_requires_selective_sm100
+def test_capacity_h4_pooled_candidate_removes_lane_bank_overflow(monkeypatch):
+    """Four striped warp pools absorb a skew that overflows lane quotas."""
+    from flashinfer import FP8PagedMQATopKWrapper
+    import flashinfer.attn_scores.selective_logits as sl
+
+    physical, rows, ratio = 131072, 32, 4
+    q, kv, scales, weights, _, _ = _inputs(rows, physical, 4)
+    q.fill_(1)
+    weights.fill_(1)
+    scales.fill_(1)
+    signs = torch.where(torch.arange(physical, device="cuda") % 128 < 4, 1.0, -1.0)
+    kv.copy_(signs[:, None].expand(-1, 128).to(kv.dtype))
+    qo = torch.tensor([0, rows], dtype=torch.int32, device="cuda")
+    physical_prefix = torch.tensor([0, physical], dtype=torch.int32, device="cuda")
+    fused, table = _paged_inputs((q, kv, scales, weights, qo, physical_prefix))
+    tokens = physical * ratio
+    kv_prefix = torch.tensor([0, tokens], dtype=torch.int32, device="cuda")
+    with monkeypatch.context() as control:
+        control.setattr(sl, "_h4_pooled_candidate_serves", lambda *args: False)
+        previous = sl._select_candidate_schedule(
+            q.device,
+            4,
+            128,
+            [rows],
+            [physical],
+            num_sms=torch.cuda.get_device_properties(q.device).multi_processor_count,
+            top_k=2048,
+        )
+    wrapper = FP8PagedMQATopKWrapper(
+        strategy="selective",
+        num_heads=4,
+        head_dim=128,
+        page_size=128,
+        top_k=2048,
+        compression_ratio=ratio,
+        max_context_length=tokens,
+        max_chunk_size=rows,
+        max_batch_size=1,
+        kv_layout=fused,
+    )
+    wrapper.plan(qo, kv_prefix, table)
+    wrapper.prepare_pool(fused)
+    engine = wrapper._capacity_plan._engine
+    schedule = engine._candidate_schedule
+    assert (schedule.publication, schedule.count_segments, schedule.split_kv) == (
+        "warp_striped",
+        4,
+        1,
+    )
+    assert schedule.candidate_capacity == 8192
+    assert schedule.sample_count_segments == previous.sample_count_segments
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        selected = wrapper.run(q, weights, fused)
+    for factor in (1.0, 0.75):
+        weights.fill_(factor)
+        graph.replay()
+        scores = (q[0].float() @ kv.float().T).relu().mul(weights[0, :, None]).sum(0)
+        for row in range(rows):
+            end = (tokens - rows + row + 1) // ratio
+            ids = selected[row].long()
+            assert ((ids >= 0) & (ids < end)).all()
+            assert ids.unique().numel() == 2048
+            torch.testing.assert_close(
+                scores[ids].sort().values,
+                scores[:end].topk(2048).values.sort().values,
+                rtol=0,
+                atol=0,
+            )
+        assert not bool(engine._repair_flags[:rows].any())
+        assert int(wrapper.error) == int(wrapper.repair_error) == 0
 
 
 @_requires_selective_sm100
@@ -10890,6 +11454,93 @@ def _force_h64_candidate_layout(monkeypatch, variant: bool) -> None:
     )
 
 
+@_requires_selective_sm100
+@pytest.mark.parametrize("heads,ratio", [(8, 4), (64, 1)])
+@pytest.mark.parametrize("decode", [False, True])
+def test_capacity_sparse_sample_dynamic_groups(heads, ratio, decode):
+    """Request-local groups and heterogeneous B148 use refreshed device metadata."""
+    rows, batches = (148, 148) if decode else (260, 3)
+    q, keys, scales, weights, _, _ = _inputs(rows, 8192, num_heads=heads)
+    fused = _fuse_paged_kv(keys, scales)
+    table = (
+        torch.arange(batches * 64, device=q.device, dtype=torch.int32)
+        .remainder(fused.shape[0])
+        .view(batches, 64)
+    )
+    top_k = 512 if heads == 8 else 2048
+    wrapper = FP8PagedMQATopKWrapper(
+        strategy="selective",
+        num_heads=heads,
+        top_k=top_k,
+        compression_ratio=ratio,
+        max_context_length=8192 * ratio,
+        max_chunk_size=rows,
+        max_batch_size=batches,
+        kv_layout=fused,
+    )
+    wrapper.prepare_pool(fused)
+    assert wrapper._capacity_plan._engine._sample_sparse_metadata is not None
+    qo = torch.zeros(batches + 1, dtype=torch.int32, device=q.device)
+    kv = torch.zeros_like(qo)
+
+    def update(step):
+        if decode:
+            q_lengths = [int(step != 1 or r % 3 != 0) for r in range(batches)]
+            kv_lengths = [
+                max(q_lengths[r], ((r * 193 + step * 61) % 8193) * ratio)
+                for r in range(batches)
+            ]
+        else:
+            q_lengths = ([129, 0, 131], [64, 129, 67], [1, 0, 0])[step]
+            kv_lengths = (
+                [8192 * ratio, 0, 7011 * ratio],
+                [6145 * ratio, 8003 * ratio, 4099 * ratio],
+                [1, 0, 0],
+            )[step]
+        qo.copy_(
+            torch.tensor(
+                [0, *torch.tensor(q_lengths).cumsum(0).tolist()], device=q.device
+            )
+        )
+        kv.copy_(
+            torch.tensor(
+                [0, *torch.tensor(kv_lengths).cumsum(0).tolist()], device=q.device
+            )
+        )
+        table.copy_(table.roll(1, dims=1))
+        return q_lengths, kv_lengths
+
+    def check(selected, lengths):
+        torch.cuda.synchronize()
+        assert wrapper.error.item() == wrapper.repair_error.item() == 0
+        expected, offset = [], 0
+        for request, (ql, kl) in enumerate(zip(*lengths, strict=True)):
+            for local in range(ql):
+                end = (kl - ql + local + 1) // ratio
+                slots = torch.arange(end, device=q.device)
+                physical = table[request, slots // 128].long() * 128 + slots % 128
+                dots = q[offset + local].float() @ keys[physical].float().T
+                expected.append(
+                    (dots.relu() * weights[offset + local, :, None]).sum(0)
+                    * scales[physical]
+                )
+            offset += ql
+        _check_selection(selected, expected, top_k)
+        assert (selected[offset:] == -1).all()
+
+    lengths = update(0)
+    wrapper.plan(qo, kv, table, num_query_rows=rows)
+    check(wrapper.run(q, weights, fused), lengths)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.plan(qo, kv, table, num_query_rows=rows)
+        selected = wrapper.run(q, weights, fused)
+    for step in (0, 1, 2, 0):
+        lengths = update(step)
+        graph.replay()
+        check(selected, lengths)
+
+
 def _check_selection(selected, expected_rows, top_k):
     for row, scores in enumerate(expected_rows):
         count = min(top_k, scores.numel())
@@ -11379,6 +12030,15 @@ def test_query4_mixed_empty_short_and_tail_request(top_k):
 def _check_rank_bounds(wrapper, top_k):
     valid = wrapper._sample_ends.cpu().tolist()
     ends = wrapper._row_ends.cpu().tolist()
+    if wrapper._sample_sparse_metadata is not None:
+        qo = wrapper._cu_q.cpu().tolist()
+        group = sl._select_sparse_sample_group_rows(wrapper._sample_prepared.query_tile)
+        ends = [
+            ends[begin + (row - begin) // group * group]
+            for begin, last in zip(qo[:-1], qo[1:], strict=True)
+            for row in range(begin, last)
+        ]
+        assert valid == [min(end, 3840) for end in ends]
     # Independent expected population targets for K512 and K2048.
     target = {512: 2048, 2048: 4096}[top_k]
     expected = [
@@ -11420,6 +12080,7 @@ def test_k2048_changed_lengths_refresh_ranks_and_repair(heads):
         wrapper.plan(cu_q, inputs[5], table)
         selected = wrapper.run(q, weights, fused)
         _check_rank_bounds(engine, 2048)
+        assert engine._row_ends[-1].item() == length
         ranks = engine._sample_ranks.cpu().tolist()
         if rank_pointer is None:
             rank_pointer = engine._sample_ranks.data_ptr()
@@ -11430,7 +12091,9 @@ def test_k2048_changed_lengths_refresh_ranks_and_repair(heads):
             )
         else:
             assert engine._sample_ranks.data_ptr() == rank_pointer
-            assert ranks != prior_ranks
+            # A one-token change can retain the group's rounded target rank.
+            if generation != 1:
+                assert ranks != prior_ranks
             assert all(
                 current is original
                 for current, original in zip(
