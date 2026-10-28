@@ -554,36 +554,35 @@ def test_glm_next_nvfp4_cache_abi_is_fixed_by_plan_and_binding() -> None:
     assert caps.fp8_rope is False
     assert caps.latent_scale_per_token is True
 
-    plan = sparse_mla.plan(caps)
+    from b12x.attention.sparse_mla._scratch import plan_sparse_mla_scratch
+
+    plan = plan_sparse_mla_scratch(caps)
     spec = plan.scratch_specs()[0]
     bind_kwargs = dict(
         scratch=torch.empty(spec.shape, dtype=spec.dtype),
         q=torch.empty((1, 8, 512), dtype=torch.bfloat16),
         selected_indices=torch.zeros((1, 1), dtype=torch.int32),
-        cache_lengths=torch.ones((1,), dtype=torch.int32),
-        selected_lengths=torch.ones((1,), dtype=torch.int32),
+        cache_seqlens_int32=torch.ones((1,), dtype=torch.int32),
+        nsa_cache_seqlens_int32=torch.ones((1,), dtype=torch.int32),
     )
     with pytest.raises(ValueError, match="does not match the sparse MLA plan"):
-        sparse_mla.bind(
-            plan,
+        plan.bind(
             kv_cache=torch.empty((1, 1, 528), dtype=torch.uint8),
             **bind_kwargs,
         )
     with pytest.raises(ValueError, match="page size does not match"):
-        sparse_mla.bind(
-            plan,
+        plan.bind(
             kv_cache=torch.empty(
                 (2, 2, _GLM_NEXT_NVFP4_RECORD_BYTES + 1), dtype=torch.uint8
             )[:, :, :_GLM_NEXT_NVFP4_RECORD_BYTES],
             **bind_kwargs,
         )
-    binding = sparse_mla.bind(
-        plan,
+    binding = plan.bind(
         kv_cache=torch.empty((1, 1, _GLM_NEXT_NVFP4_RECORD_BYTES), dtype=torch.uint8),
         **bind_kwargs,
     )
     assert binding.kv_cache is not None
-    assert binding.runtime.scratch.cache_traits == caps.cache_traits
+    assert binding.scratch.cache_traits == caps.cache_traits
 
 
 def test_binding_owned_cache_omits_runtime_recipe_selection(
@@ -831,7 +830,7 @@ def test_glm_next_cache_writer_rejects_invalid_contracts(
         raise AssertionError(f"unknown case {case}")
 
     with pytest.raises(error, match=match):
-        concat_and_cache_glm_next_mla(kv_c, cache, slots)
+        sparse_mla.plan_cache_writer(kv_c, cache, slots)
 
 
 @pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
@@ -915,8 +914,26 @@ def test_glm_next_nvfp4_writer_uses_inline_scale_record(
     latent = (torch.randn((4, 512), device=device) / 4).to(torch.bfloat16)
     slots = torch.tensor([0, -1, 65, 128], dtype=slot_dtype, device=device)
 
-    sparse_mla.compile_glm_next_mla_cache_writer(latent, cache, slots)
-    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+    from b12x.preparation import PreparationSession, PreparedCall
+
+    writer_plan = sparse_mla.plan_cache_writer(latent, cache, slots)
+    session = PreparationSession(
+        device=latent.device, autotune=False, compile_workers=2
+    )
+    result = session.prepare(
+        (
+            writer_plan.request(
+                name="glm-next-nvfp4-cache-writer",
+                prepare_call=lambda state: PreparedCall(
+                    run=lambda: state.run(latent, cache, slots),
+                    owners=(latent, cache, slots),
+                ),
+            ),
+        )
+    )
+    # Preparation executes a trial write; the public call must write anew.
+    cache.fill_(0xA5)
+    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots, plan=writer_plan)
     torch.cuda.synchronize(device)
 
     assert torch.all(cache[0, 1] == 0xA5)
