@@ -217,12 +217,12 @@ kernel_cake_muse_spark_norm_559f873dee91a2a06ac5(const __nv_bfloat16* branch, co
         for (int j = 0; j < 16; j++) {
             pa = __fmaf_rn(bb[j], bb[j], pa);
         }
-        float _warp_reduce_0 = pa;
+        float warp_reduce = pa;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_0 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset);
+            warp_reduce += __shfl_xor_sync(0xFFFFFFFF, warp_reduce, offset);
         if (lane_1 == 0) {
-            slots[warp_0] = _warp_reduce_0;
+            slots[warp_0] = warp_reduce;
         }
         #pragma unroll
         for (int j_1 = 0; j_1 < 16; j_1++) {
@@ -248,12 +248,12 @@ kernel_cake_muse_spark_norm_559f873dee91a2a06ac5(const __nv_bfloat16* branch, co
             cur_r[j_2] = __fmaf_rn(bb[j_2], r1, cur_r[j_2]);
             p2 = __fmaf_rn(cur_r[j_2], cur_r[j_2], p2);
         }
-        float _warp_reduce_1 = p2;
+        float warp_reduce_0 = p2;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_1 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset);
+            warp_reduce_0 += __shfl_xor_sync(0xFFFFFFFF, warp_reduce_0, offset);
         if (lane_1 == 0) {
-            slots[16 + warp_0] = _warp_reduce_1;
+            slots[16 + warp_0] = warp_reduce_0;
         }
         {
             unsigned _stv8_8_0 = __float_as_uint(cur_r[0 + 0]);

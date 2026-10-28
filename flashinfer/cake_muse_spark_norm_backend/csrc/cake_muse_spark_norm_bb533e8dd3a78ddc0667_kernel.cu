@@ -357,9 +357,9 @@ kernel_cake_muse_spark_norm_bb533e8dd3a78ddc0667(const __nv_bfloat16* branch, co
     int krow = 0;
     if (warp == 0) {
         if (elect_sync()) {
-            int prow = first;
-            if (prow < M) {
-                long long nb = (long long)prow * 8192;
+            int prow_2_0 = first;
+            if (prow_2_0 < M) {
+                long long nb = (long long)prow_2_0 * 8192;
                 mbarrier_arrive_expect_tx(rows_full_addr, 49152);
                 asm volatile(
                     "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
@@ -372,9 +372,9 @@ kernel_cake_muse_spark_norm_bb533e8dd3a78ddc0667(const __nv_bfloat16* branch, co
                     :: "r"(rview_addr), "l"(residual + nb), "r"((uint32_t)(32768)), "r"(rows_full_addr)
                     : "memory");
             }
-            int prow_0 = first + stride;
-            if (prow_0 < M) {
-                long long nb_1 = (long long)prow_0 * 8192;
+            int prow_2_1 = first + stride;
+            if (prow_2_1 < M) {
+                long long nb_1 = (long long)prow_2_1 * 8192;
                 mbarrier_arrive_expect_tx(rows_full_addr + 8, 49152);
                 asm volatile(
                     "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
@@ -387,9 +387,9 @@ kernel_cake_muse_spark_norm_bb533e8dd3a78ddc0667(const __nv_bfloat16* branch, co
                     :: "r"(rview_addr + 49152), "l"(residual + nb_1), "r"((uint32_t)(32768)), "r"(rows_full_addr + 8)
                     : "memory");
             }
-            int prow_1 = first + 2 * stride;
-            if (prow_1 < M) {
-                long long nb_2 = (long long)prow_1 * 8192;
+            int prow_2_2 = first + 2 * stride;
+            if (prow_2_2 < M) {
+                long long nb_2 = (long long)prow_2_2 * 8192;
                 mbarrier_arrive_expect_tx(rows_full_addr + 16, 49152);
                 asm volatile(
                     "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
@@ -543,12 +543,12 @@ kernel_cake_muse_spark_norm_bb533e8dd3a78ddc0667(const __nv_bfloat16* branch, co
                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
                 :: "l"((void*)(residual_out + rb_1 + (0))), "r"(_stv8_16_0), "r"(_stv8_16_1), "r"(_stv8_16_2), "r"(_stv8_16_3), "r"(_stv8_16_4), "r"(_stv8_16_5), "r"(_stv8_16_6), "r"(_stv8_16_7) : "memory");
         }
-        float _warp_reduce_2 = p2;
+        float warp_reduce = p2;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_2 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_2, offset);
+            warp_reduce += __shfl_xor_sync(0xFFFFFFFF, warp_reduce, offset);
         if (lane_1 == 0) {
-            slots[16 + warp_0] = _warp_reduce_2;
+            slots[16 + warp_0] = warp_reduce;
         }
         __syncthreads();
         int idx_0 = ((lane_1) < (15) ? (lane_1) : (15));
