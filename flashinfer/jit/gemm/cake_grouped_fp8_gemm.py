@@ -103,6 +103,18 @@ ARG_PLANS: dict[str, list[list[str]]] = {
 }
 
 PROGRAMS: dict[str, dict[str, Any]] = {
+    "cake_grouped_fp8_gemm_005d45335e5b2a81f511": {
+        "kernel": "kernel_cake_grouped_fp8_gemm_005d45335e5b2a81f511",
+        "sources": [
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_005d45335e5b2a81f511_kernel.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_005d45335e5b2a81f511_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan3",
+        "arches": ["sm_103a"],
+    },
     "cake_grouped_fp8_gemm_007fd314577a65b33485": {
         "kernel": "kernel_cake_grouped_fp8_gemm_007fd314577a65b33485",
         "sources": [
@@ -198,6 +210,18 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "tma_abi": "grid_constant",
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
+    },
+    "cake_grouped_fp8_gemm_31c7f6826b9f7a2db092": {
+        "kernel": "kernel_cake_grouped_fp8_gemm_31c7f6826b9f7a2db092",
+        "sources": [
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_31c7f6826b9f7a2db092_kernel.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_31c7f6826b9f7a2db092_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan3",
+        "arches": ["sm_103a"],
     },
     "cake_grouped_fp8_gemm_377ece00c70003b8d19f": {
         "kernel": "kernel_cake_grouped_fp8_gemm_377ece00c70003b8d19f",
@@ -453,6 +477,10 @@ PROGRAMS: dict[str, dict[str, Any]] = {
 }
 
 MODULES: dict[str, dict[str, str]] = {
+    "cake_grouped_fp8_gemm_005d45335e5b2a81f511_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_grouped_fp8_gemm_005d45335e5b2a81f511",
+    },
     "cake_grouped_fp8_gemm_007fd314577a65b33485_sm_100a": {
         "arch": "sm_100a",
         "program": "cake_grouped_fp8_gemm_007fd314577a65b33485",
@@ -516,6 +544,10 @@ MODULES: dict[str, dict[str, str]] = {
     "cake_grouped_fp8_gemm_28b94ccb85e6d2d50961_sm_103a": {
         "arch": "sm_103a",
         "program": "cake_grouped_fp8_gemm_28b94ccb85e6d2d50961",
+    },
+    "cake_grouped_fp8_gemm_31c7f6826b9f7a2db092_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_grouped_fp8_gemm_31c7f6826b9f7a2db092",
     },
     "cake_grouped_fp8_gemm_377ece00c70003b8d19f_sm_100a": {
         "arch": "sm_100a",
@@ -687,9 +719,11 @@ ROUTES: dict[str, Any] = {
     "bs_ue8m0_n256_run32": "cake_grouped_fp8_gemm_6da15715d9ab967a1cc3",
     "bs_ue8m0_n256_s16": "cake_grouped_fp8_gemm_007fd314577a65b33485",
     "bs_ue8m0_swap": "cake_grouped_fp8_gemm_7ee216a957327349cf41",
+    "bs_ue8m0_swap_c1": "cake_grouped_fp8_gemm_31c7f6826b9f7a2db092",
     "bs_ue8m0_swap_carry": "cake_grouped_fp8_gemm_07c6b16218daec7a1273",
     "bs_ue8m0_swap_carry_s16": "cake_grouped_fp8_gemm_4c6307d24f3915e88028",
     "bs_ue8m0_swap_rp32": "cake_grouped_fp8_gemm_7bcd26069f3a219a87e7",
+    "bs_ue8m0_swap_rp32_s11": "cake_grouped_fp8_gemm_005d45335e5b2a81f511",
     "bs_ue8m0_swap_run32": "cake_grouped_fp8_gemm_9bbdce371d7ecbc3fc43",
     "bs_ue8m0_swap_s16": "cake_grouped_fp8_gemm_01c4698d7aa0a8a6e940",
     "deepk_c2_ab6_scale1_direct_store_m32": "cake_grouped_fp8_gemm_c8a9c3fa0b10ff00c03a",
@@ -719,9 +753,11 @@ ROUTE_GEOMETRY: dict[str, dict[str, int]] = {
     "bs_ue8m0_n256_run32": {"tile_m": 128, "tile_n": 256, "cluster_ctas": 1},
     "bs_ue8m0_n256_s16": {"tile_m": 128, "tile_n": 256, "cluster_ctas": 1},
     "bs_ue8m0_swap": {"tile_m": 128, "tile_n": 256, "cluster_ctas": 2},
+    "bs_ue8m0_swap_c1": {"tile_m": 32, "tile_n": 128, "cluster_ctas": 1},
     "bs_ue8m0_swap_carry": {"tile_m": 128, "tile_n": 256, "cluster_ctas": 2},
     "bs_ue8m0_swap_carry_s16": {"tile_m": 128, "tile_n": 256, "cluster_ctas": 2},
     "bs_ue8m0_swap_rp32": {"tile_m": 32, "tile_n": 256, "cluster_ctas": 2},
+    "bs_ue8m0_swap_rp32_s11": {"tile_m": 32, "tile_n": 256, "cluster_ctas": 2},
     "bs_ue8m0_swap_run32": {"tile_m": 128, "tile_n": 256, "cluster_ctas": 2},
     "bs_ue8m0_swap_s16": {"tile_m": 128, "tile_n": 256, "cluster_ctas": 2},
     "deepk_c2_ab6_scale1_direct_store_m32": {

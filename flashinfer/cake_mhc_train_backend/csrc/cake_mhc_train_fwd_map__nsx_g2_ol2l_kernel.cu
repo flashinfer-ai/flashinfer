@@ -297,7 +297,7 @@ kernel_cake_mhc_train_fwd_map__nsx_g2_ol2l(const __grid_constant__ CUtensorMap X
                         l_stage += 1;
                         if (l_stage == 4) { l_stage = 0; _phase_a_empty ^= 1; }
                         int k0 = k_base + st * 64;
-                        mbarrier_arrive_expect_tx(a_full_addr + (slot_j) * 8, 28672);
+                        mbarrier_arrive_expect_tx(a_full_addr + (((l_stage + 2 >= 4) ? l_stage + 2 - 4 : l_stage + 2)) * 8, 28672);
                         int sw = (st & 3) + 1 >> 2;
                         int p_slot0 = sw * 2;
                         int p_slot1 = (sw + 1 & 1) * 2;
@@ -305,12 +305,12 @@ kernel_cake_mhc_train_fwd_map__nsx_g2_ol2l(const __grid_constant__ CUtensorMap X
                             "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                             " [%0], [%1, {%2, %3}], [%4], %5;"
                             :: "r"(a_s_addr + slot_j * 28672), "l"((&X)), "r"(k0), "r"(t0),
-                               "r"(a_full_addr + (slot_j) * 8), "l"(0x12F0000000000000ULL) : "memory");
-                        tma_3d_gmem2smem(b1_s_addr + slot_j * 28672, (&FNP), k0, 0, p_slot0, a_full_addr + (slot_j) * 8);
-                        tma_3d_gmem2smem(b2_s_addr + slot_j * 28672, (&FNP), k0, 0, p_slot1, a_full_addr + (slot_j) * 8);
-                        tma_3d_gmem2smem(b3_s_addr + slot_j * 28672, (&FNP), k0, 0, 1, a_full_addr + (slot_j) * 8);
+                               "r"(a_full_addr + (((l_stage + 2 >= 4) ? l_stage + 2 - 4 : l_stage + 2)) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                        tma_3d_gmem2smem(b1_s_addr + slot_j * 28672, (&FNP), k0, 0, p_slot0, a_full_addr + (((l_stage + 2 >= 4) ? l_stage + 2 - 4 : l_stage + 2)) * 8);
+                        tma_3d_gmem2smem(b2_s_addr + slot_j * 28672, (&FNP), k0, 0, p_slot1, a_full_addr + (((l_stage + 2 >= 4) ? l_stage + 2 - 4 : l_stage + 2)) * 8);
+                        tma_3d_gmem2smem(b3_s_addr + slot_j * 28672, (&FNP), k0, 0, 1, a_full_addr + (((l_stage + 2 >= 4) ? l_stage + 2 - 4 : l_stage + 2)) * 8);
                         int k0_1 = k_base + (st + 1) * 64;
-                        mbarrier_arrive_expect_tx(a_full_addr + (slot_j_0) * 8, 28672);
+                        mbarrier_arrive_expect_tx(a_full_addr + (((l_stage + 3 >= 4) ? l_stage + 3 - 4 : l_stage + 3)) * 8, 28672);
                         int sw_2 = (st + 1 & 3) + 1 >> 2;
                         int p_slot0_3 = sw_2 * 2;
                         int p_slot1_4 = (sw_2 + 1 & 1) * 2;
@@ -318,10 +318,10 @@ kernel_cake_mhc_train_fwd_map__nsx_g2_ol2l(const __grid_constant__ CUtensorMap X
                             "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                             " [%0], [%1, {%2, %3}], [%4], %5;"
                             :: "r"(a_s_addr + slot_j_0 * 28672), "l"((&X)), "r"(k0_1), "r"(t0),
-                               "r"(a_full_addr + (slot_j_0) * 8), "l"(0x12F0000000000000ULL) : "memory");
-                        tma_3d_gmem2smem(b1_s_addr + slot_j_0 * 28672, (&FNP), k0_1, 0, p_slot0_3, a_full_addr + (slot_j_0) * 8);
-                        tma_3d_gmem2smem(b2_s_addr + slot_j_0 * 28672, (&FNP), k0_1, 0, p_slot1_4, a_full_addr + (slot_j_0) * 8);
-                        tma_3d_gmem2smem(b3_s_addr + slot_j_0 * 28672, (&FNP), k0_1, 0, 1, a_full_addr + (slot_j_0) * 8);
+                               "r"(a_full_addr + (((l_stage + 3 >= 4) ? l_stage + 3 - 4 : l_stage + 3)) * 8), "l"(0x12F0000000000000ULL) : "memory");
+                        tma_3d_gmem2smem(b1_s_addr + slot_j_0 * 28672, (&FNP), k0_1, 0, p_slot0_3, a_full_addr + (((l_stage + 3 >= 4) ? l_stage + 3 - 4 : l_stage + 3)) * 8);
+                        tma_3d_gmem2smem(b2_s_addr + slot_j_0 * 28672, (&FNP), k0_1, 0, p_slot1_4, a_full_addr + (((l_stage + 3 >= 4) ? l_stage + 3 - 4 : l_stage + 3)) * 8);
+                        tma_3d_gmem2smem(b3_s_addr + slot_j_0 * 28672, (&FNP), k0_1, 0, 1, a_full_addr + (((l_stage + 3 >= 4) ? l_stage + 3 - 4 : l_stage + 3)) * 8);
                     }
                 }
             }

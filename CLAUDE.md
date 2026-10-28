@@ -144,7 +144,7 @@ boundaries.
 
 ## cuDNN linear attention
 
-Use `nvidia-cudnn-frontend>=1.31.0`; KDA and GDN normalization use additive
+Use `nvidia-cudnn-frontend>=1.32.0`; KDA and GDN normalization use additive
 `1e-6` without an epsilon argument. Auto selection also requires CuTe DSL 4.7+.
 The bounded KDA SM100/SM103 and GDN SM100 policies live in `kda.py` and
 `gdn_prefill.py`. KDA's head/length regions are documented in `docs/api/kda.rst`.
@@ -156,6 +156,17 @@ Use `benchmarks/bench_cudnn_linear_attention.py` for public-call comparisons.
 Its raw-gate GDN baseline includes Torch gate transforms; it is not a vLLM
 fused-producer baseline. Keep host CPU, completed wall and reset-inclusive
 CUDA graph times separate.
+
+## cuDNN query sparse attention
+
+`flashinfer.qsa_forward` accepts packed BF16 QSA block bitmaps;
+`flashinfer.qsa_indexed_forward` accepts existing causal token IDs. Both call
+the public `cudnn.ops` API and return BF16 output, FP32 output and natural-log
+LSE. They do not register autograd. Keep cuDNN imports lazy, preserve its input
+contract, and test changed selection during CUDA graph replay.
+Indexed forward is not bitwise repeatable because cuDNN's index compaction
+can change accumulation order. Cover both sides of the bitmap dispatch
+boundary at 512/513 tokens when testing cuDNN Frontend 1.32.
 
 ## Testing
 
@@ -294,6 +305,10 @@ the live tokens, without a host readback.
 Replay an old capture only with lengths inside its declared bounds and compatible
 buffers. Keep numerical and lifetime tests independent of heuristic winners and
 timing thresholds.
+
+Also capture with a caller-supplied table from the first plan, then change Q
+partitions while auto falls back. Table ownership does not tell whether an old
+cuDNN capture still needs its wrapper-owned length buffers refreshed.
 
 Valid attention lengths and physical ragged offsets are separate operands:
 `seq_lens_q` can be shorter than its query slot. Infer lengths from adjacent
@@ -950,6 +965,18 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_KDA_PTX_CACHE_DIR` | `FLASHINFER_JIT_DIR/kda_ptx` | `flashinfer/kda_kernels/ptx/static_runtime.py` | Override the cache directory for cubins assembled from retained KDA PTX. Defaults to `FLASHINFER_JIT_DIR/kda_ptx`; the selected directory is created on demand. |
 | `FLASHINFER_SM90_CAKE_BF16_DEV_LAUNCHER` | unset | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_gemm.py` | Development-only factory for building the SM90 BF16 CAKE grouped-GEMM kernels in process. Set to `module` or `module:attribute` (default attribute: `create_grouped_gemm`); unset, empty, or `0` selects the shipped launcher. |
 | `FLASHINFER_SM90_CAKE_BF16_COMBINE_WIRE` | shape-dependent | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | When `combine_wire=None`, select `per_route`, `prereduced`, or `prereduced_hilo`; unset chooses `per_route` for token capacities up to 8 and `prereduced` above. Every rank in a pipe must use the same value. |
+| `FLASHINFER_SM90_CAKE_BF16_FUSED_TAIL` | `1` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `fused_combine_tail` keyword when it is `None`: `0` / `false` / `off` / `no` runs the vendored wait, reduce and ack combine-tail kernels with the per-round combine-inbox fill instead of the one-kernel fused tail. Bit-identical outputs; ranks may differ. The pre-reduced combine wires require the fused tail. |
+| `FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH` | `1` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `fused_dispatch` keyword when it is `None`: `0` / `false` / `off` / `no` keeps the vendored three-kernel dispatch for small rounds instead of the single cooperative dispatch launch. Bit-identical outputs; ranks may differ. |
+| `FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH_MAX_TOKENS` | `512` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `fused_dispatch_max_tokens` keyword when it is `None`: dedup rounds with at most this many tokens per rank (and `T * top_k <= 4096`) use the fused dispatch launch. Must be in `[1, 512]`. |
+| `FLASHINFER_SM90_CAKE_BF16_GRID_DISPATCH_MIN_TOKENS` | `513` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `grid_dispatch_min_tokens` keyword when it is `None`: dedup rounds with at least this many tokens per rank use the grid-strided single-launch dispatch instead of the vendored kernels; `0` disables it. Must be `>= 0`. Bit-identical outputs; ranks may differ. |
+| `FLASHINFER_SM90_CAKE_BF16_PDL` | `6` (FC1 and FC2) | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `pdl` keyword when it is `None`: which kernels of the round get a programmatic dependent launch. `0` / `false` / `off` / `no` none, `1` / `true` / `on` / `yes` all, or an integer mask of compact `1`, FC1 `2`, FC2 `4`, combine publish `8`, combine tail `16`. |
+| `FLASHINFER_SM90_CAKE_BF16_PDL_LATE` | `1` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `pdl_late` keyword when it is `None`: `1` lets the PDL dependents of the package's small kernels be scheduled only when those kernels exit; `0` / `false` / `off` / `no` triggers them right after their own grid-dependency wait. |
+| `FLASHINFER_SM90_CAKE_BF16_PER_ROUTE_PUBLISH_PDL` | `1` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `per_route_publish_pdl` keyword when it is `None`: with the per-route combine wire, `1` launches the combine publish with PDL as if bit `8` were in the `FLASHINFER_SM90_CAKE_BF16_PDL` mask; `0`, `false`, `off`, `no` or empty does not. Pipes on the pre-reduced wires are unaffected. |
+| `FLASHINFER_SM90_CAKE_BF16_FUSED_BEGIN` | `2` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `fused_begin` keyword when it is `None`: `0` (or `false` / `off` / `no`) keeps the round opening in its own launches, `1` folds the tag bump and the ack wait into the single-launch dispatch, `2` also folds the receiver prefix. The fused dispatch takes the level when the fused tail, the fused dispatch and dedup dispatch are on (`2` falls back to `1` there when `E * ep + 2 * ep` exceeds 1024 keys); the grid dispatch takes it when the fused tail and dedup dispatch are on. Other values raise `ValueError`. |
+| `FLASHINFER_SM90_CAKE_BF16_COMPACT_FORM` | `1` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `compact_form` keyword when it is `None`: `1` the latency-pipelined compact, `0` the one-block-per-row compact. Both write the same bytes; other values raise `ValueError`. |
+| `FLASHINFER_SM90_CAKE_BF16_PUBLISH_FORM` | `1` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `publish_form` keyword when it is `None`: `1` the load-hoisted pre-reduced combine publish, `0` the route-serial publish. Both write the same bytes; other values raise `ValueError`. |
+| `FLASHINFER_SM90_CAKE_BF16_FC2_EARLY_MAX_TOKENS` | `128` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `fc2_early_max_tokens` keyword when it is `None`: rounds with `0 < T <= value` tokens per rank start FC2 inside FC1's tail wave (FC1 releases per-m-tile readiness counters, FC2 claims ready tiles; same bits). `0` disables it. It is off when the layer has more than 1023 experts, when `min(hidden_size, intermediate_size) < 256`, or when the GEMM implementation does not support early start. |
+| `FLASHINFER_SM90_CAKE_BF16_PREFIX_FORM` | `1` | `flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/shim/cake_runner.py` | Fallback of the runner's `prefix_form` keyword when it is `None`: `1` computes the receiver prefix with a whole-block integer scan in the grid dispatch and in the fused dispatch's small-route instance (`T * top_k <= 1024`); the large-route instance (`T * top_k > 1024`) walks the keys with one thread for both values. `0` walks the keys with one thread everywhere. Both write the same values; other values raise `ValueError`. |
 | `FLASHINFER_GDN_SM107_PREFILL_KERNEL` | `sm107` | `flashinfer/gdn_kernels/blackwell/gdn_prefill.py` | `sm100` makes `chunk_gated_delta_rule` on SM107 (Rubin) run the Blackwell chunked-prefill kernel class instead of the Rubin subclass. For A/B measurements and bisection. |
 | `FLASHINFER_QKV_EXCHANGE_FOLD_BARRIER` | `auto` | `flashinfer/comm/cake_qkv_norm_rope_exchange_overlap.py` | Launch path of the fused QKV exchange session: `1` the producer with the folded cross-rank rendezvous (two launches per call), `0` the separate barrier kernel before the producer (three launches), `auto` the architecture default (folded on SM90 / SM100 / SM103 / SM107). The `fold_barrier` keyword takes precedence. Every rank of a group must use the same value. |
 | `FLASHINFER_QKV_EXCHANGE_SHAPE_GATES` | `auto` | `flashinfer/comm/cake_qkv_norm_rope_exchange_overlap.py` | Row-count gates of the session's host plan: `auto` the per-(architecture, world size) default, `off` every gate off, or `gate=value` pairs over `words_capacity_small_m`, `reserved_sms_large_m`, `per_dest_large_m` and `pair_off_large_m` (`0` = never, `auto` = that gate's default, `all` = every row for `words_capacity_small_m`). The first three change the host plan only; `pair_off_large_m` (off everywhere) runs the rows it fires on with the single-CTA producer, which no delivered Blackwell route ships today; SM90 with 8 ranks ships `words_capacity_small_m=all`; no gate changes the stored bits. Every rank of a group must use the same value. |

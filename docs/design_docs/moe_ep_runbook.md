@@ -302,11 +302,31 @@ hand-edited generated file fails the JIT loader closed (sha256 mismatch).
 On the receiving rank the combine tail (wait for every source, fp32 top-k
 reduce, ack) runs as one fused kernel without a per-round combine-inbox fill;
 `FLASHINFER_SM90_CAKE_BF16_FUSED_TAIL=0` selects the vendored three-kernel
-tail (bit-identical output) for A/B checks, and peers may mix the two. Small
-dedup rounds (`T <= 128`, `T * top_k <= 1024`) dispatch through one cooperative
-kernel (count + reserve + store_publish); `FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH=0`
-selects the vendored dispatch kernels, which larger rounds and non-dedup pipes
-always use. The dispatch wire format is the vendored one in every combination.
+tail (bit-identical output) for A/B checks, and peers may mix the two. Dedup
+rounds of up to 512 tokens per rank dispatch through one cooperative kernel
+(count + reserve + store_publish, with the round opening and the receiver-side
+prefix folded in), larger dedup rounds through one grid-strided cooperative
+kernel over the co-resident blocks; `FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH=0`
+plus `FLASHINFER_SM90_CAKE_BF16_GRID_DISPATCH_MIN_TOKENS=0` select the vendored
+dispatch kernels, which non-dedup pipes always use. The dispatch wire format is
+the vendored one in every combination.
+
+The round's other switches are config fields of
+`Sm90_Bf16_Bf16_Bf16_PushCake_MegaMoeConfig`; `None` reads the environment
+variable `FLASHINFER_SM90_CAKE_BF16_<NAME>` and otherwise the shipped default.
+None of them changes an output byte (the section tests compare them bitwise).
+
+| Field (`<NAME>`) | Default | Effect |
+|---|---|---|
+| `pdl` (`PDL`) | `6` | Edge mask of the kernels launched as programmatic dependent launches: compact 1, FC1 2, FC2 4, publish 8, tail 16 (`True` = all). |
+| `pdl_late` (`PDL_LATE`) | `True` | The small kernels release their dependents when they exit. |
+| `per_route_publish_pdl` (`PER_ROUTE_PUBLISH_PDL`) | `True` | On the per-route wire, the combine publish is a programmatic dependent launch too. |
+| `fused_begin` (`FUSED_BEGIN`) | `2` | Round opening folded into the dispatch launch: 1 = tag bump and ack wait, 2 = also the receiver-side prefix. |
+| `fused_dispatch_max_tokens` (`FUSED_DISPATCH_MAX_TOKENS`) | `512` | Largest round (tokens per rank) of the fused dispatch kernel (at most 512). |
+| `grid_dispatch_min_tokens` (`GRID_DISPATCH_MIN_TOKENS`) | `513` | Smallest round of the grid-strided dispatch kernel; `0` = off. |
+| `compact_form`, `publish_form` (`COMPACT_FORM`, `PUBLISH_FORM`) | `1` | Latency-pipelined compact and load-hoisted pre-reduced publish; `0` = the one-row-per-block compact and the route-serial publish. |
+| `fc2_early_max_tokens` (`FC2_EARLY_MAX_TOKENS`) | `128` | Rounds with 1 to this many tokens on the rank start FC2 inside FC1's tail wave: FC1 releases a readiness counter per 128-row tile and FC2 claims the ready tiles (same tiles and per-tile instructions). Needs at most 1023 local experts and hidden and intermediate sizes of at least 256, otherwise off; `0` = off. Rank-local, so ranks may differ. |
+| `prefix_form` (`PREFIX_FORM`) | `1` | Receiver prefix inside the single-launch dispatches (`fused_begin` 2): `1` = the fused dispatch of rounds with `T * top_k <= 1024` and the grid dispatch compute the integer prefix sums with the whole block; `0` = one thread walks the (expert, source) keys in every dispatch. Same values; rank-local. |
 
 The combine wire (expert rank -> token owner) is selected by
 `combine_wire` on the config (`None` reads

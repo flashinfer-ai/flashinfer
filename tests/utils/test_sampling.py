@@ -381,6 +381,37 @@ def test_blackwell_cached_cluster_route_is_selected_and_correct(
 @pytest.mark.parametrize(
     "rows,vocab_size",
     [
+        (240, 256000),  # 16-CTA persistent clusters, about 18 rows each
+        (480, 128000),  # 8-CTA persistent clusters, about 13 rows each
+    ],
+)
+def test_blackwell_persistent_softmax_every_launch_reads_its_own_rows(rows, vocab_size):
+    # The persistent route keeps clusters resident and walks each one over many
+    # rows; a shared-memory tile slot takes the next row's bulk copy once every
+    # thread has read it. Every launch must match the softmax of its own rows.
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    torch.manual_seed(7)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=None, enable_pdl=False
+    )
+    assert (
+        route == flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_PERSISTENT
+    )
+    probs_ref = torch.softmax(logits.double(), dim=-1).float()
+    launches = 4000
+    bad = torch.zeros((), dtype=torch.int64, device="cuda")
+    for _ in range(launches):
+        probs = flashinfer.sampling.softmax(logits, temperature=None, enable_pdl=False)
+        bad += ~((probs - probs_ref).abs() <= 1e-8).all()
+    assert bad.item() == 0, f"{bad.item()} of {launches} launches differ"
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size",
+    [
         (31, 32000),  # B200: as many rows as resident 16-CTA clusters
         (32, 32000),  # B200: fewer resident 16-CTA clusters than rows
         (33, 32000),  # GB300: as many rows as resident 16-CTA clusters

@@ -11,6 +11,14 @@ may already be captured (no plan constant, no allocation, no host read on the ex
 small LRU of plans keyed on exactly the facts a plan compiles in (the Qwen 3.5 package's rules: a plan a CUDA graph was captured
 over outlives its eviction and is released by ``clear_plan_cache`` only).  The vendored tree is the Qwen 3.5 package's
 (``..qwen_3_5_block._cudnn_frost``) and so are the cache roots (``configure_vendored_tree``) and the operand helpers.
+
+The sparse core's BODY knob (``sparse_tile_form``, appended with the 7301fad21 pin; performance-only): ``"auto"`` (the default) lets
+the vendored tree pick the body -- on cc 10.7 the LEAN decode tile at ``batch x H_kv <= 4`` CTAs per chunk (the bound's unit since the
+977757763 pin: the step's rows ride inside the CTA, so ``q_len`` is not in it) at every served ``q_len`` 1..4 the body admits -- under the
+in-block indexer the list is per row, which the lean tile serves at ``q_len_per_req == 1`` only, so ``batch <= 2`` at ``q_len 1`` on two KV
+heads --, the tcgen05 core everywhere else --, ``"lean"`` /
+``"tcgen05"`` pin a body (an explicit body the step does not admit is the tree's typed decline).  The body a plan compiled reads back
+in ``plan.sparse_tile`` (its ``kernel_template``) and ``plan.declaration``; it is a plan-cache key.
 """
 
 from __future__ import annotations
@@ -41,6 +49,8 @@ from .support import (
     INDEX_STATE_ROWS_EXTRA,
     PAGE_SIZE_ALIGN,
     PAGE_SIZES,
+    SPARSE_TILE_FORM_AUTO,
+    SPARSE_TILE_FORMS,
     Qwen38BlockGeometry,
     next_pow2,
 )
@@ -424,6 +434,10 @@ class Qwen38BlockPlan:
         torch.bfloat16
     )  #: the pools' dtype (bf16; the e4m3 pool is a typed decline today)
     _position_tables: Optional[PositionTables] = field(default=None, repr=False)
+    # appended (the lean decode tile): the sparse core's body this plan compiled -- the resolved form ("lean" / "tcgen05") and its
+    # kernel_template (support.SPARSE_TILE_LEAN / SPARSE_TILE_TCGEN05), pinned by the vendored block against the kernel that compiled
+    sparse_tile_form: Optional[str] = None
+    sparse_tile: Optional[str] = None
 
     @property
     def num_tokens(self) -> int:
@@ -725,10 +739,16 @@ class Qwen38BlockPlan:
 
 
 def _light_decode_gates(
-    geometry: Qwen38BlockGeometry, page_size: int, q_len: int, kv_cache_dtype, use_pdl
+    geometry: Qwen38BlockGeometry,
+    page_size: int,
+    q_len: int,
+    kv_cache_dtype,
+    use_pdl,
+    sparse_tile_form: str = SPARSE_TILE_FORM_AUTO,
 ) -> None:
     """The decode form's typed declines that need no vendored code (the mirrored constants): the page sizes the paged scorer addresses,
-    the scorer's query-row envelope, the e4m3 pool.  The vendored declaration repeats them with the envelope's own texts."""
+    the scorer's query-row envelope, the e4m3 pool, the sparse core's body vocabulary.  The vendored declaration repeats them with the
+    envelope's own texts."""
     if page_size not in PAGE_SIZES:
         raise NotImplementedError(
             f"{_PKG} (decode): the paged scorer splits a block id into its page and row by a shift, so page_size must be one of {PAGE_SIZES} "
@@ -749,6 +769,14 @@ def _light_decode_gates(
     if use_pdl is not None and not isinstance(use_pdl, bool):
         raise TypeError(
             f"{_PKG}: use_pdl must be None (the vendored default) or a bool, got {type(use_pdl).__name__}"
+        )
+    if (
+        not isinstance(sparse_tile_form, str)
+        or sparse_tile_form not in SPARSE_TILE_FORMS
+    ):
+        raise ValueError(
+            f"{_PKG}: sparse_tile_form must be one of {SPARSE_TILE_FORMS} ('auto' = the vendored placement rule: the lean decode tile on cc 10.7 "
+            f"at batch x H_kv <= 4 CTAs per chunk where the body admits the step, the tcgen05 core elsewhere; 'lean' / 'tcgen05' explicit), got {sparse_tile_form!r}"
         )
 
 
@@ -781,6 +809,7 @@ def prepare(
     use_pdl: Optional[bool] = None,
     kv_cache_dtype: Optional[torch.dtype] = None,
     _declaration_overrides: Optional[Dict[str, Any]] = None,
+    sparse_tile_form: str = SPARSE_TILE_FORM_AUTO,
 ) -> Qwen38BlockPlan:
     """Declare, check and compile the block for one decode shape bucket; see :func:`flashinfer.qwen_3_8_block.prepare_qwen_3_8_block_bf16`.
 
@@ -837,7 +866,9 @@ def prepare(
         raise ValueError(
             f"{_PKG}: decode_split_kv must be None or an int >= 1, got {decode_split_kv!r}"
         )
-    _light_decode_gates(geometry, page_size, q, kv_cache_dtype, use_pdl)
+    _light_decode_gates(
+        geometry, page_size, q, kv_cache_dtype, use_pdl, sparse_tile_form
+    )
     pool_dtype = dtype if kv_cache_dtype is None else kv_cache_dtype
     _check_weights(weights, w_o, geometry, dtype, dev)
     k, v = kv_views(
@@ -965,13 +996,21 @@ def prepare(
         sample_index_state_block_table=ring_table,
         index_state_slot_mapping_present=ring_slots,
         rope_position_tables_only=rope_position_tables_only,
+        sparse_tile_form=sparse_tile_form,
         **knobs,
     )
     # The projection GEMMs on the capture-safe JIT route by construction (the band slab's 128-row tile at batch x q_len <= 128); the
     # hook reaches into the vendored block -- a re-vendor that renames these attributes must fail here, loudly, not drop the route.
     missing = [
         a
-        for a in ("_proj", "_out_proj", "_stages", "_indexer_decode")
+        for a in (
+            "_proj",
+            "_out_proj",
+            "_stages",
+            "_indexer_decode",
+            "sparse_tile_form",
+            "sparse_tile",
+        )
         if not hasattr(blk, a)
     ]
     if missing:
@@ -1066,6 +1105,14 @@ def prepare(
         capture_rows_max=DECODE_CAPTURE_ROWS_MAX,
         capture_safe_rows=bool(batch_size * q <= DECODE_CAPTURE_ROWS_MAX),
         position_table_rows=int(cos_pos.shape[1]),
+        # appended: the sparse core's body (the lean decode tile beside the tcgen05 core): the declaration, the resolved body, its
+        # kernel_template (pinned by the vendored block against the compiled kernel) and the lean tile's sub-tiles per CTA (None on the core)
+        sparse_tile_form_requested=getattr(
+            blk, "sparse_tile_form_requested", sparse_tile_form
+        ),
+        sparse_tile_form=getattr(blk, "sparse_tile_form", None),
+        sparse_tile=getattr(blk, "sparse_tile", None),
+        sparse_sub_tiles_per_cta=getattr(blk, "sparse_sub_tiles_per_cta", None),
     )
     return Qwen38BlockPlan(
         form=form,
@@ -1096,6 +1143,8 @@ def prepare(
         use_pdl=bool(getattr(blk, "use_pdl", False)),
         kv_cache_dtype=pool_dtype,
         _position_tables=(cos_pos, sin_pos),
+        sparse_tile_form=getattr(blk, "sparse_tile_form", None),
+        sparse_tile=getattr(blk, "sparse_tile", None),
     )
 
 
@@ -1112,6 +1161,7 @@ def workspace_size(
     decode_split_kv: Optional[int] = None,
     fuse_prepare: Optional[bool] = None,
     ring_cap: Optional[int] = None,
+    sparse_tile_form: str = SPARSE_TILE_FORM_AUTO,
 ) -> int:
     """The workspace bytes a plan of this shape bucket needs, with no plan kept -- what a serving stack sizes its one shared
     workspace with at init (before its memory profiling run, when the caches do not exist yet): the vendored block is declared on
@@ -1119,7 +1169,9 @@ def workspace_size(
     COMPILED (the carve includes the projection engines' scratch, which is the compiled plan's; the kernels come from the in-process
     memo or the compiled-plan cache after the first process) and its workspace carve read.  The carve depends on the bucket
     (``batch_size x q_len_per_req`` rows, ``max_pages x page_size / block_size`` compressed rows, the split), never on the caches' page
-    count or strides, so the number equals the compiled plan's (``test_decode.py`` pins it).  Same typed declines as :func:`prepare`."""
+    count or strides, so the number equals the compiled plan's (``test_decode.py`` pins it).  ``sparse_tile_form`` (appended) must be the
+    plan's: the carve is the BODY's (the lean tile's split writes a wider partial slab than the core's).  Same typed declines as
+    :func:`prepare`."""
     if form not in _support.ALL_FORMS:
         raise ValueError(
             f"{_PKG}: form must be one of {_support.ALL_FORMS}, got {form!r}"
@@ -1149,7 +1201,7 @@ def workspace_size(
         raise ValueError(
             f"{_PKG}: max_pages must be a positive int (the block table's columns), got {max_pages!r}"
         )
-    _light_decode_gates(geometry, page_size, q, None, None)
+    _light_decode_gates(geometry, page_size, q, None, None, sparse_tile_form)
     cap = int(ring_cap) if ring_cap is not None else q + INDEX_STATE_ROWS_EXTRA
     if cap < q + INDEX_STATE_ROWS_EXTRA:
         raise ValueError(
@@ -1192,6 +1244,7 @@ def workspace_size(
             batch_size, 1, dtype=torch.int32, device=dev
         ),
         rope_position_tables_only=True,
+        sparse_tile_form=sparse_tile_form,
     )
     for st in (blk._proj, blk._out_proj):
         if st is not None:
@@ -1266,7 +1319,7 @@ def cached_plan(
     """The plan of the functional entry point: an LRU keyed on exactly what a plan compiles in -- the Qwen 3.5 key (the form, the
     geometry with its indexer fields, the dtype, the device, the pools' layout / shape / strides, the batch, the query rows, the table's
     columns and row stride, the KV bound, the split) plus the side caches' FORM (shapes, dtypes), the two input-contract flags, the knobs
-    and the pools' dtype.  NOT in the key: the side caches' strides (symbolic in the kernels: a stack may re-allocate them with other
+    (the sparse core's body knob included: two bodies are two compiled plans) and the pools' dtype.  NOT in the key: the side caches' strides (symbolic in the kernels: a stack may re-allocate them with other
     strides without a new plan) and the position tables (the functional entry hands THIS call's pair to every run, checked against the
     plan's form there; the pair the first call compiled in is only the plan's default for an explicit run that hands none).
 
@@ -1307,6 +1360,7 @@ def cached_plan(
         kw.get("fuse_prepare"),
         kw.get("use_pdl"),
         pool_dtype,
+        kw.get("sparse_tile_form", SPARSE_TILE_FORM_AUTO),
     )
     capturing = _capturing()
     with _PLANS_LOCK:
@@ -1368,10 +1422,12 @@ def decode(
     plan=None,
     block_ids_out=None,
     block_lens_out=None,
+    sparse_tile_form=SPARSE_TILE_FORM_AUTO,
 ):
     """The functional decode entry: the bucket's cached plan (the LRU; a cold bucket under capture refused) or the given one.  The
     arms follow the arguments: ``rope_cos / rope_sin`` None = the position-table arm (``position_tables`` then REQUIRED), given = the
-    per-token arm (the position tables still required for the block starts); ``index_state_slot_mapping`` given = the ring-slots arm."""
+    per-token arm (the position tables still required for the block starts); ``index_state_slot_mapping`` given = the ring-slots arm;
+    ``sparse_tile_form`` (appended) is the sparse core's body knob of the bucket's plan (a plan-cache key; ignored with ``plan``)."""
     if plan is None:
         if position_tables is None:
             raise ValueError(
@@ -1406,6 +1462,7 @@ def decode(
             position_tables=position_tables,
             rope_position_tables_only=rope_cos is None and rope_sin is None,
             ring_slots=index_state_slot_mapping is not None,
+            sparse_tile_form=sparse_tile_form,
         )
     return plan.run(
         hidden_states,
