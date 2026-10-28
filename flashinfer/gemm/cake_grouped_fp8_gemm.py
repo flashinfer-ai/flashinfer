@@ -21,8 +21,8 @@ of the compact MoE layout (skipped, output rows unspecified) and expert runs
 start on multiples of ``alignment`` rows (128-multiples select the single-run
 schedule, other multiples of 32 the slower multi-run schedule).  When the
 packed words are DeepGEMM's MN-major activation words and the row-repeated
-weight words and ``N`` is a multiple of 256 (on sm_103a also an odd multiple
-of 128, see :func:`bs_swap_small_route`), the host may route a problem to
+weight words and ``N`` is a multiple of 256 (also an odd multiple of 128,
+see :func:`bs_swap_small_route`), the host may route a problem to
 the swap-AB programs (:func:`bs_swap_route_for_shape`): the weight rows fill
 the 256-row side of a two-CTA MMA and the routed tokens its N side.  With the
 same words, a single-run layout of at most 128 routed rows per group runs the
@@ -452,6 +452,49 @@ BS_SWAP_C1_MAX_K = 512
 BS_SWAP_C1_MAX_N = 512
 BS_SWAP_C1_N128_MIN_K = 128
 BS_SWAP_C1_N128_MAX_K = 512
+# On these architectures the small-block programs also take launches of more
+# than one wave, ahead of the other swap-AB routes: at most
+# BS_SWAP_SM100_SMALL_TILES_PER_SM one-CTA tiles (32 x 128, ``ceil(m / 32) *
+# n / 128`` of them) per SM and K of at most BS_SWAP_SM100_SMALL_MAX_K.  They
+# serve the multi-run layouts within the 32-row-block program's bounds (an
+# alignment of at most BS_SWAP_RP32_MAX_ALIGNMENT, ``m`` of at most
+# BS_SWAP_RP32_MAX_ROWS) at N a multiple of 256, and any layout at N an odd
+# multiple of 128 with BS_SWAP_C1_N128_MIN_K <= K <= BS_SWAP_C1_N128_MAX_K.
+# BS_SWAP_RP32_S11_ROUTE takes N a multiple of 256 at K of at least
+# BS_SWAP_RP32_S11_MIN_K while its launch is one wave or the layout has at
+# most BS_SWAP_SM100_S11_MAX_BLOCKS 32-row blocks; BS_SWAP_C1_ROUTE takes the
+# others.  Without ``sm_count`` none of these is taken.
+BS_SWAP_SM100_SMALL_ARCHS = frozenset({"sm_100a"})
+BS_SWAP_SM100_SMALL_MAX_K = 4096
+BS_SWAP_SM100_SMALL_TILES_PER_SM = 3
+BS_SWAP_SM100_S11_MAX_BLOCKS = 20
+
+
+def _bs_swap_small_route_sm100(
+    m: int, n: int, k: int, *, alignment: int, sm_count: int
+) -> str | None:
+    """The small-block route of ``BS_SWAP_SM100_SMALL_ARCHS`` (see :func:`bs_swap_small_route`)."""
+    blocks = math.ceil(m / BS_SUB_ROWS)
+    if (
+        k > BS_SWAP_SM100_SMALL_MAX_K
+        or blocks * (n // 128) > BS_SWAP_SM100_SMALL_TILES_PER_SM * sm_count
+    ):
+        return None
+    if n % 256:
+        if BS_SWAP_C1_N128_MIN_K <= k <= BS_SWAP_C1_N128_MAX_K:
+            return BS_SWAP_C1_ROUTE
+        return None
+    if (
+        alignment % BS_BLOCK_M == 0
+        or alignment > BS_SWAP_RP32_MAX_ALIGNMENT
+        or m > BS_SWAP_RP32_MAX_ROWS
+    ):
+        return None
+    if k >= BS_SWAP_RP32_S11_MIN_K and (
+        2 * blocks * (n // 256) <= sm_count or blocks <= BS_SWAP_SM100_S11_MAX_BLOCKS
+    ):
+        return BS_SWAP_RP32_S11_ROUTE
+    return BS_SWAP_C1_ROUTE
 
 
 def bs_swap_small_route(
@@ -459,8 +502,9 @@ def bs_swap_small_route(
 ) -> str | None:
     """Select a small-block swap-AB route, or ``None`` for the other swap-AB routes.
 
-    Only on ``BS_SWAP_SMALL_ARCHS`` with a known ``sm_count``, N a multiple of
-    128 and K a multiple of 128, and only while the launch is one wave:
+    Only with a known ``sm_count``, N a multiple of 128, K a multiple of 128
+    and an alignment that is a multiple of 32.  On ``BS_SWAP_SMALL_ARCHS``
+    only while the launch is one wave:
 
     - ``BS_SWAP_RP32_S11_ROUTE`` for N a multiple of 256 and
       K >= ``BS_SWAP_RP32_S11_MIN_K`` when
@@ -473,18 +517,36 @@ def bs_swap_small_route(
       multi-run layouts) and ``BS_SWAP_C1_N128_MIN_K <= k <=
       BS_SWAP_C1_N128_MAX_K``.
 
+    On ``BS_SWAP_SM100_SMALL_ARCHS`` (same preconditions) a launch may take
+    up to ``BS_SWAP_SM100_SMALL_TILES_PER_SM`` one-CTA tiles per SM, at K of
+    at most ``BS_SWAP_SM100_SMALL_MAX_K``:
+
+    - for N a multiple of 256, the multi-run layouts with an alignment of at
+      most ``BS_SWAP_RP32_MAX_ALIGNMENT`` and ``m`` of at most
+      ``BS_SWAP_RP32_MAX_ROWS``: ``BS_SWAP_RP32_S11_ROUTE`` at
+      K >= ``BS_SWAP_RP32_S11_MIN_K`` when ``2 * ceil(m / 32) * n / 256 <=
+      sm_count`` or ``ceil(m / 32) <= BS_SWAP_SM100_S11_MAX_BLOCKS``,
+      ``BS_SWAP_C1_ROUTE`` otherwise;
+    - for N an odd multiple of 128, any alignment at
+      ``BS_SWAP_C1_N128_MIN_K <= k <= BS_SWAP_C1_N128_MAX_K``:
+      ``BS_SWAP_C1_ROUTE``.
+
     Every 32-row block of a layout whose alignment is a multiple of 32 holds
     one group's rows, so both programs serve the single-run and the multi-run
     layouts.
     """
     if (
-        arch not in BS_SWAP_SMALL_ARCHS
+        (arch not in BS_SWAP_SMALL_ARCHS and arch not in BS_SWAP_SM100_SMALL_ARCHS)
         or sm_count is None
         or n % 128
         or k % BS_BLOCK_K
         or alignment % BS_SUB_ROWS
     ):
         return None
+    if arch in BS_SWAP_SM100_SMALL_ARCHS:
+        return _bs_swap_small_route_sm100(
+            m, n, k, alignment=alignment, sm_count=sm_count
+        )
     blocks = math.ceil(m / BS_SUB_ROWS)
     if n % 256:
         if (
@@ -523,8 +585,9 @@ def bs_swap_route_for_shape(
     layout less each group's largest alignment padding.
 
     - Take the route of :func:`bs_swap_small_route` when it selects one
-      (``BS_SWAP_SMALL_ARCHS`` only, one wave of CTAs, any group count; its
-      one-CTA program also takes N an odd multiple of 128).
+      (``BS_SWAP_SMALL_ARCHS`` one wave of CTAs, ``BS_SWAP_SM100_SMALL_ARCHS``
+      up to ``BS_SWAP_SM100_SMALL_TILES_PER_SM`` tiles per SM; any group
+      count; its one-CTA program also takes N an odd multiple of 128).
     - Otherwise keep the non-swapped routes when N is not a multiple of 256
       (the swapped tile height) or the group count is unknown.
     - Swap every layout whose alignment is not a multiple of 128 (the 32-row
