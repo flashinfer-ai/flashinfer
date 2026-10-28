@@ -1460,6 +1460,29 @@ class TestMxFc1HighThroughput:
         }
         _run_mx_fc1(cfg, num_tokens=256, problem_n=512, problem_k=1024)
 
+    @pytest.mark.parametrize("tile_k,stages", [(256, 4), (128, 5), (128, 6), (128, 7)])
+    def test_mxfp4_mxfp8_tile128_deep_pipeline(self, tile_k, stages):
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+            DType,
+            SfLayout,
+        )
+
+        cfg = {
+            **_mx_fc1_base(dtype_a=DType.MXE2M1),
+            "tile_n": 128,
+            "mma_n": 128,
+            "epi_tile_n": 32,
+            "tile_k": tile_k,
+            **uniform_pipeline_stage_overrides(stages),
+            "mma_m": 256,
+            "umma_cta_count": 2,
+            "sf_layout_c": int(SfLayout.R128c4),
+            "num_load_b_warps": 8,
+            "num_load_sfb_warps": 4,
+            "epilogue_regs": 152,
+        }
+        _run_mx_fc1(cfg, num_tokens=256, problem_n=512, problem_k=2048)
+
     def test_mxfp8_mxfp8_tile256_k128_tma_overlap(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
             DType,
