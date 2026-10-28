@@ -568,14 +568,32 @@ def test_dsv4_compressed_decode_routes_to_sm120_and_matches_reference(
     del monkeypatch
 
     q, cache, idx, lengths = _make_dsv4_compressed_case(device, topk=topk, seed=topk)
-    scratch = _make_dsv4_scratch(device, topk=topk, max_chunks=8)
+    from b12x.attention import compressed_sparse_mla
+    from tests.experimental.b12x.attention._prepared_compressed_test_utils import (
+        prepare_compressed_binding,
+    )
 
-    out = compressed_sparse_mla_decode_forward(
-        q_all=q,
+    owners = prepare_compressed_binding(
+        caps=B12XCompressedSparseMLAScratchCaps(
+            device=q.device,
+            num_q_heads=_DSV4_HEADS,
+            max_q_rows=1,
+            max_width=topk,
+            head_dim=_DSV4_HEAD_DIM,
+            v_head_dim=_DSV4_HEAD_DIM,
+            max_chunks_per_row=8,
+            page_size=_DSV4_PAGE,
+        ),
+        q=q,
         swa_k_cache=cache,
         swa_indices=idx,
-        swa_topk_lengths=lengths,
-        workspace=scratch,
+        swa_lengths=lengths,
+        sm_scale=_DSV4_SM_SCALE,
+    )
+    binding = owners[3]
+    out = compressed_sparse_mla.run(
+        binding=binding,
+        swa_k_cache=cache,
         sm_scale=_DSV4_SM_SCALE,
         swa_page_size=_DSV4_PAGE,
     )

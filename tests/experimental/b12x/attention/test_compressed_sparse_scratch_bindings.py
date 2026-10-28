@@ -840,11 +840,13 @@ def test_compressed_sparse_mla_decode_binding_supplies_runtime_tensors(
         dtype=torch.uint8,
     )
     calls = {}
+    prepared = object()
 
     def fail_stage(**kwargs):
         raise AssertionError("binding path should not stage compressed MLA inputs")
 
     def fake_forward(**kwargs):
+        assert kwargs["prepared"] is prepared
         calls["q_all"] = kwargs["q_all"]
         calls["swa_indices"] = kwargs["swa_indices"]
         calls["swa_lengths"] = kwargs["swa_topk_lengths"]
@@ -859,13 +861,14 @@ def test_compressed_sparse_mla_decode_binding_supplies_runtime_tensors(
         compressed_sparse_mla_impl, "_use_sm120_sparse_mla", lambda **_: True
     )
     monkeypatch.setattr(
-        compressed_sparse_mla_kernel, "run_unified_decode", fake_forward
+        compressed_sparse_mla_kernel, "run_prepared_unified_decode", fake_forward
     )
 
     out = compressed_sparse_mla_impl.compressed_sparse_mla_decode_forward(
         binding=binding,
         swa_k_cache=swa_cache,
         sm_scale=1.0,
+        prepared=prepared,
     )
 
     assert calls["q_all"].data_ptr() == q.data_ptr()

@@ -396,24 +396,43 @@ def test_declared_decode_capacity_matches_reference_under_graph_replay(
         device=device,
     )
     split_cap = math.ceil(width / 64)
-    binding = _make_compressed_binding(
-        device=device,
-        rows=rows,
-        topk=width,
-        max_kv_rows=rows * width,
+    from b12x.attention import compressed_sparse_mla
+    from tests.experimental.b12x.attention._prepared_compressed_test_utils import (
+        prepare_compressed_binding,
+    )
+
+    owners = prepare_compressed_binding(
+        caps=B12XCompressedSparseMLAScratchCaps(
+            device=q.device,
+            dtype=torch.bfloat16,
+            kv_dtype=torch.uint8,
+            num_q_heads=_LOCAL_Q_HEADS,
+            head_dim=_COMPRESSED_HEAD_DIM,
+            v_head_dim=_COMPRESSED_HEAD_DIM,
+            max_width=width,
+            max_q_rows=rows,
+            max_batch=rows,
+            max_kv_rows=rows * width,
+            max_chunks_per_row=split_cap,
+            mode="decode",
+            decode_row_capacity=rows,
+            use_cuda_graph=True,
+            page_size=COMPRESSED_SPARSE_MLA_DSV4_PAGE_SIZE,
+        ),
         q=q,
+        swa_k_cache=swa_cache,
         swa_indices=swa_indices,
         swa_lengths=swa_lengths,
-        use_cuda_graph=True,
-        max_chunks_per_row=split_cap,
-        decode_row_capacity=rows,
+        attn_sink=attn_sink,
+        sm_scale=_SM_SCALE,
     )
+    binding = owners[3]
 
     captured_out: torch.Tensor | None = None
 
     def run() -> torch.Tensor:
         nonlocal captured_out
-        captured_out = compressed_sparse_mla_decode_forward(
+        captured_out = compressed_sparse_mla.run(
             swa_k_cache=swa_cache,
             binding=binding,
             attn_sink=attn_sink,
