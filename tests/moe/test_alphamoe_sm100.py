@@ -160,6 +160,16 @@ CONTRACT_CASES = [
     ("width_n1024_m8_e4_k256_top2", 8, 1024, 256, 4, 2, 8, False, 1.0, 2.5, 28011),
 ]
 
+# Plans the host dispatch runs on the CTA-pair variant, at K <= 512 and K >= 1024.
+# (label, M, N, K, E, top_k, block_m, shared_expert, balancedness, scaling, seed)
+PAIR_CASES = [
+    ("pair_m4_k384_e16_top4_bm16", 4, 256, 384, 16, 4, 16, False, 0.8, 2.5, 28020),
+    ("pair_m8_k512_e64_top8", 8, 256, 512, 64, 8, 8, False, 0.8, 1.0, 28021),
+    ("pair_m8_k2048_e64_top8", 8, 256, 2048, 64, 8, 8, False, 0.8, 1.0, 28022),
+    ("pair_m32_k1024_e32_top4_bm16", 32, 256, 1024, 32, 4, 16, False, 0.8, 2.5, 28023),
+    ("pair_m16_k4096_e16_top4_bm16", 16, 256, 4096, 16, 4, 16, False, 0.8, 2.5, 28024),
+]
+
 
 def _make_case(
     m,
@@ -362,8 +372,8 @@ def _launch(case, *, out=None, num_tokens_post_padded=None):
 
 @pytest.mark.parametrize(
     "label,m,n,k,num_experts,top_k,block_m,shared_expert,balancedness,scaling_factor,seed",
-    CONTRACT_CASES,
-    ids=[case[0] for case in CONTRACT_CASES],
+    CONTRACT_CASES + PAIR_CASES,
+    ids=[case[0] for case in CONTRACT_CASES + PAIR_CASES],
 )
 def test_alphamoe_sm100_matches_reference(
     label,
