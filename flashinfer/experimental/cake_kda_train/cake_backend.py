@@ -3235,6 +3235,9 @@ def _forward(
                     seg_state.index_copy_(1, index, a.seg_state)
                 else:
                     seg_m.index_copy_(0, index, a.seg_state[1])
+        if tape:  # the last group's slice ends inside the whole tape: no group writes the v_new pad rows after it
+            last, ws_last = views_b[-1]
+            v_new[BT * (last.c0 + ws_last.plan.NC_pad) :].zero_()
     saved = None
     if save_for_backward:
         if tape:

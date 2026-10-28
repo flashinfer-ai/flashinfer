@@ -5520,7 +5520,7 @@ def test_batched_arena_gives_the_default_results_bitwise(
     _, saved_t = cake_backend.chunk_kda_fwd(
         q, k, v, g, beta, cu, workspace=tape_default
     )
-    ref_h, ref_v_new = saved_t.h[:real].clone(), saved_t.v_new[: BT * real].clone()
+    ref_h, ref_v_new = saved_t.h[:real].clone(), saved_t.v_new.clone()
     ref_seg_m = None if saved_t.seg_m is None else saved_t.seg_m.clone()
     del tape_default
     for label, kw in _partitions(lengths):
@@ -5633,6 +5633,12 @@ def test_batched_arena_gives_the_default_results_bitwise(
             assert tws.bytes == p.arena_bytes(
                 save_mode="tape", arena=arena, doc_lengths=lengths
             )
+            # the saved tapes come from freed memory filled with NaN: a v_new row no group writes would show
+            torch.empty(
+                2 * (ref_v_new.nbytes + saved_t.h.nbytes),
+                dtype=torch.uint8,
+                device=device,
+            ).fill_(0xFF)
             o, saved_tb = cake_backend.chunk_kda_fwd(
                 q, k, v, g, beta, cu, workspace=tws, doc_lengths=lengths
             )
@@ -5641,7 +5647,8 @@ def test_batched_arena_gives_the_default_results_bitwise(
                 and saved_tb.version == cake_backend.SAVED_VERSION_TAPE
             ), tag
             assert _bits_equal(saved_tb.h[:real], ref_h), tag
-            assert _bits_equal(saved_tb.v_new[: BT * real], ref_v_new), tag
+            # v_new whole, its pad rows included: zero in both (the rows after the last group's slice too)
+            assert _bits_equal(saved_tb.v_new, ref_v_new), tag
             assert (saved_tb.seg_m is None) == (ref_seg_m is None), tag
             if ref_seg_m is not None:
                 assert _bits_equal(saved_tb.seg_m, ref_seg_m), tag
@@ -5998,7 +6005,7 @@ def test_batched_arena_with_exact_zero_values(device, manifest) -> None:
         _, saved_t = cake_backend.chunk_kda_fwd(
             q, k, v, g, beta, cu_t, workspace=tape_default
         )
-        ref_h, ref_v_new = saved_t.h[:real].clone(), saved_t.v_new[: BT * real].clone()
+        ref_h, ref_v_new = saved_t.h[:real].clone(), saved_t.v_new.clone()
         del tape_default
         for label, kw in _partitions(lengths):
             arena = cake_backend.KdaArena(lean=True, tail_passes=2, **kw)
@@ -6029,12 +6036,19 @@ def test_batched_arena_with_exact_zero_values(device, manifest) -> None:
             tws = KdaWorkspace.for_problem(
                 S, N, heads, device, save_mode="tape", arena=arena, doc_lengths=lengths
             )
+            # the saved tapes come from freed memory filled with NaN: a v_new row no group writes would show
+            torch.empty(
+                2 * (ref_v_new.nbytes + saved_t.h.nbytes),
+                dtype=torch.uint8,
+                device=device,
+            ).fill_(0xFF)
             o, saved_tb = cake_backend.chunk_kda_fwd(
                 q, k, v, g, beta, cu_t, workspace=tws, doc_lengths=lengths
             )
             assert _bits_equal(o, ref_out), tag
             assert _bits_equal(saved_tb.h[:real], ref_h), tag
-            assert _bits_equal(saved_tb.v_new[: BT * real], ref_v_new), tag
+            # v_new whole, its pad rows included: zero in both (the rows after the last group's slice too)
+            assert _bits_equal(saved_tb.v_new, ref_v_new), tag
             got = cake_backend.chunk_kda_bwd(
                 q,
                 k,
