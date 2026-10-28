@@ -1083,26 +1083,23 @@ def test_prepared_operation_launches_the_routed_norm_program(
     ``M = 6096`` tokens on, ``NORM`` below that and for ``e4m3``.
 
     The kernels of one run are read from the CUDA profiler trace, so the check
-    covers the programs the operation prepared, not only the routing table.
+    covers the programs the operation prepared, not only the routing table.  A
+    profiler session that loses its device records (``CUPTI-LOST-RECORDS``) is
+    retried, and the test skips rather than reporting a launch it cannot see.
     """
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
         pytest.skip("requires SM103a")
     pytest.importorskip("flashinfer.jit.cake_minimax_h3_nvfp4_pre_attention")
-    from torch.profiler import ProfilerActivity, profile
-
     from flashinfer.jit import cake_minimax_h3_nvfp4_pre_attention as programs
+    from tests.test_helpers.cake_profiler import cuda_kernel_names
 
     operation, values = _prepare_zero_smoke(-1, M=M, P=8, out_format=out_format)
     operation.run(**values)
     torch.cuda.synchronize()
-    with profile(activities=[ProfilerActivity.CUDA]) as trace:
-        operation.run(**values)
-        torch.cuda.synchronize()
     launched = sorted(
-        event.name
-        for event in trace.events()
-        if event.device_type == torch.autograd.DeviceType.CUDA
-        and event.name.startswith("kernel_cake_minimax_h3_nvfp4_pre_attention_")
+        name
+        for name in cuda_kernel_names(lambda: operation.run(**values))
+        if name.startswith("kernel_cake_minimax_h3_nvfp4_pre_attention_")
     )
     norm = programs.NORM_V5 if staged else programs.NORM
     gemm = programs.FUSED_PACK_K96 if out_format == "nvfp4" else programs.FUSED_E4M3_K96
