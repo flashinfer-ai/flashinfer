@@ -79,7 +79,11 @@ def _check_page_len(page_len: int) -> None:
         raise ValueError(f"page_len must be a positive multiple of 64, got {page_len}")
 
 
-def _check_slots(slots: tuple, num_seqs: int, device: torch.device) -> None:
+def _check_slots(
+    slots: "GDNPagedPrefillSlots | GDNPagedDecodeSlots",
+    num_seqs: int,
+    device: torch.device,
+) -> None:
     for name, tensor in zip(slots._fields, slots, strict=True):
         if (
             tensor.dtype != torch.int32

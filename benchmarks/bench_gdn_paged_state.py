@@ -511,7 +511,9 @@ def main():
             f"| {name} | {b} | {t} | {ts:.4f} | {ta:.4f} | {ta / ts:.3f} "
             f"| {t0:.4f} | {ms:.1f} | {ma:.1f} |"
         )
-    if args.decode_batches:
+    if args.decode_batches and dev.major < 9:
+        print("\n(decode skipped: GDN decode needs SM90 or newer)")
+    elif args.decode_batches:
         hq, hk, hv = args.heads
         print("\n| decode batch | slots ms | paged ms | explicit rows ms | ratio |")
         print("|---:|---:|---:|---:|---:|")
