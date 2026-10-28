@@ -2652,6 +2652,7 @@ def _make_packs_and_config(
     max_tokens: int | None = None,
     activation=None,
     quant: QuantConfig = _NVFP4_NVFP4,
+    swap_ab: bool = False,
 ):
     """Build (act_pack, weight_pack, config, tensors_dict) for a given shape.
 
@@ -2676,6 +2677,7 @@ def _make_packs_and_config(
         num_experts=num_experts,
         num_local_experts=local_num_experts,
         top_k=top_k,
+        **({} if isinstance(activation, ReLU2) else {"swap_ab": swap_ab}),
     )
 
     w4a16 = quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16)
@@ -2697,6 +2699,7 @@ def _make_packs_and_config(
             "w2_weight": tensors["w2_weight"],
             "w2_weight_sf": tensors["w2_weight_sf"],
             "w2_alpha": tensors["w2_alpha"],
+            **({"swap_ab": True} if swap_ab else {}),
         },
     )
     # CuteDSL W4A16 is NVFP4×BF16; TRTLLM W4A16 is MXFP4×BF16, so this helper
@@ -2724,7 +2727,9 @@ def _make_packs_and_config(
             local_num_experts=local_num_experts,
         ),
         activation=activation,
-        backend=BackendOptions(candidates=(CuteDslConfig(), TrtllmFp4Config())),
+        backend=BackendOptions(
+            candidates=(CuteDslConfig(swap_ab=swap_ab), TrtllmFp4Config())
+        ),
         execution=ExecutionConfig(tune_max_num_tokens=max_tokens),
     )
     return act_pack, weight_pack, config, tensors
@@ -2778,6 +2783,7 @@ def _compute_ref(act_pack, tensors, shape, activation=None, wrong_formula=False)
 
 
 @cute_dsl_sm100_required
+@pytest.mark.parametrize("swap_ab", [False, True])
 @pytest.mark.parametrize(
     "quant",
     (
@@ -2794,7 +2800,9 @@ def _compute_ref(act_pack, tensors, shape, activation=None, wrong_formula=False)
         ReLU2(),
     ),
 )
-def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation):
+def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation, swap_ab):
+    if swap_ab and get_compute_capability(torch.device("cuda")) == (10, 7):
+        pytest.skip("swap_ab requires SM100 or SM103")
     if (
         get_compute_capability(torch.device("cuda")) == (10, 7)
         and quant.activation is QuantFormat.NVFP4
@@ -2815,9 +2823,10 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation):
         8,
         activation=activation,
         quant=quant,
+        swap_ab=swap_ab,
         **shape,
     )
-    if quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16):
+    if swap_ab or quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16):
         config = dataclasses.replace(
             config,
             finalize=dataclasses.replace(config.finalize, use_fused_finalize=False),
@@ -2828,12 +2837,53 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation):
         raise ValueError(f"Unsupported test quantization pair {quant.pair!r}")
     config = dataclasses.replace(
         config,
-        backend=BackendOptions(candidates=(CuteDslConfig(),)),
+        backend=BackendOptions(candidates=(CuteDslConfig(swap_ab=swap_ab),)),
     )
     layer = MoELayer(config)
     runner = layer.runners[0]
     layer._select_winner = lambda *_: (runner, -1)
     actual = layer(act_pack, weight_pack)
+    if swap_ab and quant.pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
+        from tests.test_helpers.cute_dsl_moe_swap_ab_reference import (
+            assert_cute_dsl_moe_bits,
+            cute_dsl_moe_reference,
+        )
+
+        activation_options = {"activation_type": activation.type}
+        if isinstance(activation, SwiGLU):
+            activation_options.update(
+                swiglu_alpha=activation.alpha,
+                swiglu_beta=activation.beta,
+                swiglu_limit=activation.limit,
+            )
+        elif isinstance(activation, SiTU):
+            activation_options.update(
+                activation_type=ActivationType.Swiglu,
+                situ_beta=activation.gate_scale,
+                situ_linear_beta=activation.linear_scale,
+            )
+        elif isinstance(activation, (GeGLUTanh, ReLU2)):
+            pass
+        else:
+            raise ValueError(f"Unsupported test activation {activation!r}")
+        reference = cute_dsl_moe_reference(
+            x=act_pack.hidden_states_q,
+            x_sf=act_pack.hidden_states_scale,
+            token_selected_experts=act_pack.topk_ids,
+            token_final_scales=act_pack.topk_weights,
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            local_expert_offset=config.experts.local_expert_offset,
+            swap_ab=True,
+            **activation_options,
+        )
+        assert_cute_dsl_moe_bits(actual, reference)
+        return
     if quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16):
         from tests.test_helpers.w4a16_reference import (
             assert_w4a16_bits,
@@ -2863,6 +2913,7 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation):
                 token_final_scales=act_pack.topk_weights,
                 local_expert_offset=config.experts.local_expert_offset,
                 wrong_formula=wrong_formula,
+                swap_ab=swap_ab,
                 **activation_options,
             )
 
