@@ -660,6 +660,8 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
             alpha_pipeline.producer_commit(alpha_producer_state)
             alpha_producer_state.advance()
 
+        # The context-parallel subclass overrides issue_beta_stage without a
+        # tok_begin parameter, so pass it only when it is set.
         if cutlass.const_expr(tok_begin is None):
             beta_producer_state = self.issue_beta_stage(
                 sBeta,
@@ -830,6 +832,12 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
             v_idx, k_idx = tKVcKV[i]
             gKV[k_idx, v_idx] = tKVrKV[i].to(gKV.element_type)
 
+    @property
+    def slot_ckpt(self) -> bool:
+        """Checkpoints at absolute positions or into pool rows (``prefix_lens``
+        or ``checkpoint_state_indices``), scheduled in shared memory."""
+        return self.use_prefix_lens or self.use_checkpoint_state_indices
+
     @cute.jit
     def maybe_store_checkpoint(
         self,
@@ -845,23 +853,19 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         total_checkpoints: cutlass.Int32,
         block_end: cutlass.Int32,
         seq_len: cutlass.Int32,
-        g_checkpoint_rows: cute.Tensor = None,
-        s_ckpt_key: cute.Tensor = None,
+        s_ckpt: cute.Tensor = None,
     ):
         """Checkpoint when the block ends on a period multiple; the tail is not one.
 
-        With ``prefix_lens`` or ``checkpoint_state_indices`` the due test, the
-        entry and its pool row are computed here, so no checkpoint key or
-        prefetched row stays in a register across the block loop: the sm_80
-        math loop already uses all 255 registers. With ``prefix_lens`` the
-        sequence's key (``checkpoint_entry_key``) is read from shared memory
-        (``s_ckpt_key``); a key register, or a per-block load of
-        ``prefix_lens``, made ptxas spill in the loop.
+        With ``prefix_lens`` or ``checkpoint_state_indices`` (``slot_ckpt``)
+        ``stage_checkpoint`` has already decided for this block: its slot in
+        ``s_ckpt`` holds the pool row (``checkpoint_state_indices``) or the
+        packed entry of the checkpoint due at ``block_end``, or -1. No key,
+        entry or row stays in a register across the block loop (the sm_80
+        math loop already uses all 255 registers; one more live value made
+        ptxas spill in the loop), and the store path does no division.
         """
-        if cutlass.const_expr(
-            self.needs_checkpointing
-            and not (self.use_prefix_lens or self.use_checkpoint_state_indices)
-        ):
+        if cutlass.const_expr(self.needs_checkpointing and not self.slot_ckpt):
             if (
                 block_end <= seq_len
                 and block_end % checkpoint_every_n_tokens == cutlass.Int32(0)
@@ -884,27 +888,9 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
                 )
                 self.kv_store(tKVrKV, gCheckpointKV, kv_thr_mma)
         elif cutlass.const_expr(self.needs_checkpointing):
-            # The j-th checkpoint due in this call is entry
-            # checkpoint_cu_starts[seq] + j. Without prefix_lens a checkpoint
-            # is due when the block end is a period multiple; with it, when
-            # key + block end is one, and its quotient is the entry.
-            pos = block_end
-            if cutlass.const_expr(self.use_prefix_lens):
-                pos = block_end + s_ckpt_key[0]
-            if (
-                block_end <= seq_len
-                and pos % checkpoint_every_n_tokens == cutlass.Int32(0)
-            ):
-                # pos >= 0 here: the key is at least -N and block_end > 0.
-                entry = pos // checkpoint_every_n_tokens
-                if cutlass.const_expr(not self.use_prefix_lens):
-                    entry = (
-                        entry
-                        + cutlass.Int32(checkpoint_cu_starts[seq_idx])
-                        - cutlass.Int32(1)
-                    )
+            target = s_ckpt[self._ckpt_slot(block_end)]
+            if target >= cutlass.Int32(0):
                 if cutlass.const_expr(self.use_checkpoint_state_indices):
-                    # Skipped when the row is negative.
                     self._store_slot_checkpoint(
                         tKVrKV,
                         g_state_checkpoints,
@@ -918,7 +904,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
                         block_end,
                         seq_len,
                         None,
-                        cutlass.Int32(g_checkpoint_rows[entry]),
+                        target,
                         v_row_offset=v_row_offset,
                     )
                 else:
@@ -936,9 +922,78 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
                     )
                     gCheckpointKV = cute.domain_offset(
                         (cutlass.Int32(0), v_row_offset),
-                        mCheckpoint[None, None, o_head_idx, entry],
+                        mCheckpoint[None, None, o_head_idx, target],
                     )
                     self.kv_store(tKVrKV, gCheckpointKV, kv_thr_mma)
+
+    def _ckpt_slot(self, block_end: cutlass.Int32):
+        """``s_ckpt`` slot of the block ending at ``block_end``: 2 + block parity."""
+        return cutlass.Int32(2) + (
+            block_end // cutlass.Int32(self.BLK_KV)
+        ) % cutlass.Int32(2)
+
+    @cute.jit
+    def init_checkpoint_schedule(
+        self,
+        s_ckpt: cute.Tensor,
+        checkpoint_cu_starts: cute.Tensor,
+        checkpoint_every_n_tokens: cutlass.Int32,
+        seq_idx: cutlass.Int32,
+        ckpt_origin,
+        tidx: cutlass.Int32,
+    ):
+        """Thread 0 writes the work item's first due block end (``s_ckpt[0]``)
+        and its entry (``s_ckpt[1]``) before the barrier that starts the math.
+
+        A checkpoint is due where the absolute position is a multiple of N
+        (``checkpoint_every_n_tokens``, a multiple of the 64-token block):
+        at block end N without ``prefix_lens``, at N - origin % N with it
+        (``origin``: absolute position of the first, 64-aligned row). The
+        first due checkpoint is entry ``checkpoint_cu_starts[seq]``.
+        """
+        if cutlass.const_expr(self.needs_checkpointing and self.slot_ckpt):
+            if tidx == cutlass.Int32(0):
+                due = checkpoint_every_n_tokens
+                if cutlass.const_expr(self.use_prefix_lens):
+                    due = (
+                        checkpoint_every_n_tokens
+                        - ckpt_origin % checkpoint_every_n_tokens
+                    )
+                s_ckpt[0] = due
+                s_ckpt[1] = cutlass.Int32(checkpoint_cu_starts[seq_idx])
+
+    @cute.jit
+    def stage_checkpoint(
+        self,
+        g_checkpoint_rows,
+        s_ckpt: cute.Tensor,
+        checkpoint_every_n_tokens: cutlass.Int32,
+        block_end: cutlass.Int32,
+        seq_len: cutlass.Int32,
+        tidx: cutlass.Int32,
+    ):
+        """Thread 0 decides whether a checkpoint is due at ``block_end`` and
+        writes its pool row (``checkpoint_state_indices``) or packed entry to
+        the block's ``s_ckpt`` slot, or -1, for ``maybe_store_checkpoint``.
+
+        Called after the block's tile loads are issued: the row load overlaps
+        theirs, and the barrier after the first tile wait publishes the slot.
+        Loading the row at the store put one global-load latency on every due
+        block (every block with a 64-token period). The due test compares
+        with the next due block end, so no thread divides by N in the loop.
+        Two slots by block parity: the previous block's store may still read
+        the other one.
+        """
+        if cutlass.const_expr(self.needs_checkpointing and self.slot_ckpt):
+            if tidx == cutlass.Int32(0):
+                target = cutlass.Int32(-1)
+                if block_end == s_ckpt[0] and block_end <= seq_len:
+                    target = s_ckpt[1]
+                    s_ckpt[0] = block_end + checkpoint_every_n_tokens
+                    s_ckpt[1] = target + cutlass.Int32(1)
+                    if cutlass.const_expr(self.use_checkpoint_state_indices):
+                        target = cutlass.Int32(g_checkpoint_rows[target])
+                s_ckpt[self._ckpt_slot(block_end)] = target
 
     # ─── compute_loop_body ───────────────────────────────────────────────────
     # Translates the C++ compute_loop_body lambda captured inside compute().
@@ -1385,7 +1440,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         checkpoint_every_n_tokens: cutlass.Int32,
         g_output_state_indices: cute.Tensor = None,
         g_checkpoint_rows: cute.Tensor = None,
-        s_ckpt_key: cute.Tensor = None,
+        s_ckpt: cute.Tensor = None,
         tok_begin=None,
     ):
         self._math_order_init(wg_idx)
@@ -1530,6 +1585,14 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
                 warp_idx,
                 tok_begin=tok_begin,
             )
+            self.stage_checkpoint(
+                g_checkpoint_rows,
+                s_ckpt,
+                checkpoint_every_n_tokens,
+                cutlass.Int32(self.BLK_KV),
+                work_desc.seq_len,
+                tidx,
+            )
             (
                 q_consumer_state,
                 k_consumer_state,
@@ -1619,6 +1682,14 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
                 warp_idx,
                 tok_begin=tok_begin,
             )
+            self.stage_checkpoint(
+                g_checkpoint_rows,
+                s_ckpt,
+                checkpoint_every_n_tokens,
+                cutlass.Int32(self.BLK_KV),
+                work_desc.seq_len,
+                tidx,
+            )
             (
                 q_consumer_state,
                 k_consumer_state,
@@ -1678,8 +1749,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
             total_checkpoints,
             cutlass.Int32(self.BLK_KV),
             work_desc.seq_len,
-            g_checkpoint_rows=g_checkpoint_rows,
-            s_ckpt_key=s_ckpt_key,
+            s_ckpt=s_ckpt,
         )
 
         # Virtual left padding (fewer than BLK_KV rows) lies in block 0 only:
@@ -1727,6 +1797,14 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
                 num_sab_heads,
                 tidx,
                 warp_idx,
+            )
+            self.stage_checkpoint(
+                g_checkpoint_rows,
+                s_ckpt,
+                checkpoint_every_n_tokens,
+                (blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
+                work_desc.seq_len,
+                tidx,
             )
             (
                 q_consumer_state,
@@ -1786,8 +1864,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
                 total_checkpoints,
                 (blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
                 work_desc.seq_len,
-                g_checkpoint_rows=g_checkpoint_rows,
-                s_ckpt_key=s_ckpt_key,
+                s_ckpt=s_ckpt,
             )
 
         if num_blocks != cutlass.Int32(1):
@@ -1833,6 +1910,14 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
                 num_sab_heads,
                 tidx,
                 warp_idx,
+            )
+            self.stage_checkpoint(
+                g_checkpoint_rows,
+                s_ckpt,
+                checkpoint_every_n_tokens,
+                (last_blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
+                work_desc.seq_len,
+                tidx,
             )
             (
                 q_consumer_state,
@@ -1892,8 +1977,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
                 total_checkpoints,
                 (last_blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
                 work_desc.seq_len,
-                g_checkpoint_rows=g_checkpoint_rows,
-                s_ckpt_key=s_ckpt_key,
+                s_ckpt=s_ckpt,
             )
         if cutlass.const_expr(self.use_output_state_indices):
             write_idx = cutlass.Int32(g_output_state_indices[work_desc.seq_idx])
@@ -2070,10 +2154,11 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
                 type("SharedStorage", (), {"__annotations__": annotations})
             )
 
-        if cutlass.const_expr(self.use_prefix_lens and self.needs_checkpointing):
-            # One word for the checkpoint key of the sequence.
+        if cutlass.const_expr(self.needs_checkpointing and self.slot_ckpt):
+            # The checkpoint schedule: next due block end, its entry, and one
+            # slot per block parity (see stage_checkpoint).
             annotations = dict(storage_cls._annotations)  # type: ignore[attr-defined]
-            annotations["smem_ckpt_key"] = cute.struct.Align[
+            annotations["smem_ckpt"] = cute.struct.Align[
                 cute.struct.MemRange[cutlass.Int32, 4], 16
             ]
             storage_cls = cute.struct(
@@ -2170,18 +2255,17 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
         # ── Smem allocation ───────────────────────────────────────────────────
         allocator = cutlass.utils.SmemAllocator()
         storage = allocator.allocate(self.shared_storage)
-        s_ckpt_key = None
-        if cutlass.const_expr(self.use_prefix_lens and self.needs_checkpointing):
-            # The sequence's checkpoint key, published by the barrier before
-            # the math (see maybe_store_checkpoint).
-            s_ckpt_key = storage.smem_ckpt_key.get_tensor(cute.make_layout(4))
-            if tidx == cutlass.Int32(0):
-                s_ckpt_key[0] = self.checkpoint_entry_key(
-                    checkpoint_cu_starts,
-                    checkpoint_every_n_tokens,
-                    work_desc.seq_idx,
-                    ckpt_origin,
-                )
+        s_ckpt = None
+        if cutlass.const_expr(self.needs_checkpointing and self.slot_ckpt):
+            s_ckpt = storage.smem_ckpt.get_tensor(cute.make_layout(4))
+            self.init_checkpoint_schedule(
+                s_ckpt,
+                checkpoint_cu_starts,
+                checkpoint_every_n_tokens,
+                work_desc.seq_idx,
+                ckpt_origin,
+                tidx,
+            )
 
         qkv_smem_layout_atom = warpgroup.make_smem_layout_atom(
             warpgroup.SmemLayoutAtomKind.K_SW128,
@@ -2326,7 +2410,7 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
                 checkpoint_every_n_tokens,
                 g_output_state_indices,
                 g_checkpoint_rows,
-                s_ckpt_key,
+                s_ckpt,
                 tok_begin,
             )
 
