@@ -29,6 +29,9 @@ typedef short int          int16_t;
 struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
 static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
 static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+struct CakeFastDivmod { int32_t divisor; uint32_t multiplier; uint32_t shift_right; };
+static_assert(sizeof(CakeFastDivmod) == 12, "CakeFastDivmod CUDA ABI must be 12 bytes");
+static_assert(alignof(CakeFastDivmod) == 4, "CakeFastDivmod CUDA ABI must be 4-byte aligned");
 
 #if defined(__CUDACC_RTC__)
 typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
@@ -49,7 +52,7 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define TMEM_OUTPUT_0_OFFSET 256
 #define TMEM_OUTPUT_1_OFFSET 384
 #define NUM_Q_STAGES 2
-#define NUM_KV_STAGES 4
+#define NUM_KV_STAGES 3
 #define NUM_PO_STAGES 6
 #define NUM_ACC_STAGES 1
 #define NUM_ORDER_P01_STAGES 1
@@ -68,27 +71,17 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_SMEM_V_OFF 36864
 #define SMEM_SMEM_V_STAGE_BYTES 16384
 #define SMEM_SMEM_V_STRIDE 16384
-#define SMEM_SMEM_PAGES_OFF 102400
+#define SMEM_SMEM_PAGES_OFF 86016
 #define SMEM_SMEM_PAGES_STAGE_BYTES 384
 #define SMEM_SMEM_PAGES_STRIDE 384
-#define SMEM_WORK_ID_SLOT_OFF 102784
+#define SMEM_WORK_ID_SLOT_OFF 86400
 #define SMEM_WORK_ID_SLOT_STAGE_BYTES 4
 #define SMEM_WORK_ID_SLOT_STRIDE 4
-#define SMEM_TOTAL 102912
-#define IS_CAUSAL 1
-#define NUM_M_BLOCKS 1
-#define NUM_Q_HEADS 32
-#define HEADS_PER_GROUP 8
-#define PACK_G 8
-#define TOK_PER_STAGE 16
-#define L2_SWIZZLE 8
-#define RETURN_LSE 0
-#define ENABLE_SINK 0
+#define SMEM_TOTAL 86528
 #define BLOCK_M 128
 #define BLOCK_N 128
 #define HEAD_DIM 128
 #define MMA_K 32
-#define PAGE_SIZE 64
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -368,7 +361,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_fmha_context_fp8_7bc99d2dda53eeaad98b(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, uint8_t* __restrict__ O_ptr, float* __restrict__ LSE_ptr, float* __restrict__ sinks, int* __restrict__ page_table_k, int* __restrict__ page_table_v, int* __restrict__ seq_lens_q, int* __restrict__ seq_lens_kv, int* __restrict__ cu_seq_lens_q, float softmax_scale_log2, float output_scale, int total_bh, int page_row_stride, int num_ctas, unsigned int* __restrict__ dynamic_counter, float* __restrict__ bmm1_scale_ptr, float* __restrict__ bmm2_scale_ptr, int bmm1_is_log2)
+kernel_cake_fmha_context_fp8_b96d739e01c1d4a734e0(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, uint8_t* __restrict__ O_ptr, float* __restrict__ LSE_ptr, float* __restrict__ sinks, int* __restrict__ page_table_k, int* __restrict__ page_table_v, int* __restrict__ seq_lens_q, int* __restrict__ seq_lens_kv, int* __restrict__ cu_seq_lens_q, float softmax_scale_log2, float output_scale, int total_bh, int page_row_stride, int num_ctas, unsigned int* __restrict__ dynamic_counter, float* __restrict__ bmm1_scale_ptr, float* __restrict__ bmm2_scale_ptr, int bmm1_is_log2, int scale_source, CakeFastDivmod num_m_blocks, unsigned int full_sections, CakeFastDivmod num_bh_units, int num_q_heads, CakeFastDivmod heads_per_group, int page_shift)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -386,21 +379,21 @@ kernel_cake_fmha_context_fp8_7bc99d2dda53eeaad98b(const __grid_constant__ CUtens
     const int mbar_base = smem;
     #define q_full_addr (mbar_base + 0)
     #define kv_full_addr (mbar_base + 16)
-    #define kv_empty_addr (mbar_base + 48)
-    #define s_full_addr (mbar_base + 80)
-    #define p_full_addr (mbar_base + 96)
-    #define p_full_2_addr (mbar_base + 112)
-    #define corr_sig_addr (mbar_base + 128)
-    #define corr_done_addr (mbar_base + 144)
-    #define stats_full_addr (mbar_base + 160)
-    #define order_p01_0_addr (mbar_base + 176)
-    #define order_p01_1_addr (mbar_base + 184)
-    #define o_full_addr (mbar_base + 192)
-    #define q_empty_addr (mbar_base + 208)
-    #define page_full_addr (mbar_base + 216)
-    #define page_empty_addr (mbar_base + 264)
-    #define work_id_full_addr (mbar_base + 312)
-    #define work_id_empty_addr (mbar_base + 320)
+    #define kv_empty_addr (mbar_base + 40)
+    #define s_full_addr (mbar_base + 64)
+    #define p_full_addr (mbar_base + 80)
+    #define p_full_2_addr (mbar_base + 96)
+    #define corr_sig_addr (mbar_base + 112)
+    #define corr_done_addr (mbar_base + 128)
+    #define stats_full_addr (mbar_base + 144)
+    #define order_p01_0_addr (mbar_base + 160)
+    #define order_p01_1_addr (mbar_base + 168)
+    #define o_full_addr (mbar_base + 176)
+    #define q_empty_addr (mbar_base + 192)
+    #define page_full_addr (mbar_base + 200)
+    #define page_empty_addr (mbar_base + 248)
+    #define work_id_full_addr (mbar_base + 296)
+    #define work_id_empty_addr (mbar_base + 304)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -418,16 +411,16 @@ kernel_cake_fmha_context_fp8_7bc99d2dda53eeaad98b(const __grid_constant__ CUtens
     const int smem_kv_addr = smem + 36864;
     uint8_t* smem_v = reinterpret_cast<uint8_t*>(smem_raw + 36864);
     const int smem_v_addr = smem + 36864;
-    int* smem_pages = reinterpret_cast<int*>(smem_raw + 102400);
-    const int smem_pages_addr = smem + 102400;
-    unsigned int* work_id_slot = reinterpret_cast<unsigned int*>(smem_raw + 102784);
-    const int work_id_slot_addr = smem + 102784;
+    int* smem_pages = reinterpret_cast<int*>(smem_raw + 86016);
+    const int smem_pages_addr = smem + 86016;
+    unsigned int* work_id_slot = reinterpret_cast<unsigned int*>(smem_raw + 86400);
+    const int work_id_slot_addr = smem + 86400;
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Q))) : "memory"); }
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&K))) : "memory"); }
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&V))) : "memory"); }
 
-    // Mbarrier init (17 pipeline groups, 0 ordered-sequence groups, 41 barriers)
-    // Mbarriers at smem_raw[0..328)
+    // Mbarrier init (17 pipeline groups, 0 ordered-sequence groups, 39 barriers)
+    // Mbarriers at smem_raw[0..312)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -436,63 +429,61 @@ kernel_cake_fmha_context_fp8_7bc99d2dda53eeaad98b(const __grid_constant__ CUtens
             mbarrier_init(smem + 0, 1);
             mbarrier_init(smem + 8, 1);
             // --- pipeline 'kv' ---
-            // kv_full: 4 barriers, init_count=1
+            // kv_full: 3 barriers, init_count=1
             mbarrier_init(smem + 16, 1);
             mbarrier_init(smem + 24, 1);
             mbarrier_init(smem + 32, 1);
+            // kv_empty: 3 barriers, init_count=1
             mbarrier_init(smem + 40, 1);
-            // kv_empty: 4 barriers, init_count=1
             mbarrier_init(smem + 48, 1);
             mbarrier_init(smem + 56, 1);
+            // s_full: 2 barriers, init_count=1
             mbarrier_init(smem + 64, 1);
             mbarrier_init(smem + 72, 1);
-            // s_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 80, 1);
-            mbarrier_init(smem + 88, 1);
             // p_full: 2 barriers, init_count=256
-            mbarrier_init(smem + 96, 256);
-            mbarrier_init(smem + 104, 256);
+            mbarrier_init(smem + 80, 256);
+            mbarrier_init(smem + 88, 256);
             // p_full_2: 2 barriers, init_count=128
+            mbarrier_init(smem + 96, 128);
+            mbarrier_init(smem + 104, 128);
+            // corr_sig: 2 barriers, init_count=128
             mbarrier_init(smem + 112, 128);
             mbarrier_init(smem + 120, 128);
-            // corr_sig: 2 barriers, init_count=128
+            // corr_done: 2 barriers, init_count=128
             mbarrier_init(smem + 128, 128);
             mbarrier_init(smem + 136, 128);
-            // corr_done: 2 barriers, init_count=128
+            // stats_full: 2 barriers, init_count=128
             mbarrier_init(smem + 144, 128);
             mbarrier_init(smem + 152, 128);
-            // stats_full: 2 barriers, init_count=128
-            mbarrier_init(smem + 160, 128);
-            mbarrier_init(smem + 168, 128);
             // --- pipeline 'order_p01' ---
             // order_p01_0: 1 barriers, init_count=128
-            mbarrier_init(smem + 176, 128);
+            mbarrier_init(smem + 160, 128);
             // order_p01_1: 1 barriers, init_count=128
-            mbarrier_init(smem + 184, 128);
+            mbarrier_init(smem + 168, 128);
             // o_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 192, 1);
-            mbarrier_init(smem + 200, 1);
+            mbarrier_init(smem + 176, 1);
+            mbarrier_init(smem + 184, 1);
             // q_empty: 1 barriers, init_count=1
-            mbarrier_init(smem + 208, 1);
+            mbarrier_init(smem + 192, 1);
             // --- pipeline 'po' ---
             // page_full: 6 barriers, init_count=1
+            mbarrier_init(smem + 200, 1);
+            mbarrier_init(smem + 208, 1);
             mbarrier_init(smem + 216, 1);
             mbarrier_init(smem + 224, 1);
             mbarrier_init(smem + 232, 1);
             mbarrier_init(smem + 240, 1);
+            // page_empty: 6 barriers, init_count=1
             mbarrier_init(smem + 248, 1);
             mbarrier_init(smem + 256, 1);
-            // page_empty: 6 barriers, init_count=1
             mbarrier_init(smem + 264, 1);
             mbarrier_init(smem + 272, 1);
             mbarrier_init(smem + 280, 1);
             mbarrier_init(smem + 288, 1);
-            mbarrier_init(smem + 296, 1);
-            mbarrier_init(smem + 304, 1);
             // work_id_full: 1 barriers, init_count=1
-            mbarrier_init(smem + 312, 1);
+            mbarrier_init(smem + 296, 1);
             // work_id_empty: 1 barriers, init_count=480
-            mbarrier_init(smem + 320, 480);
+            mbarrier_init(smem + 304, 480);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -500,9 +491,9 @@ kernel_cake_fmha_context_fp8_7bc99d2dda53eeaad98b(const __grid_constant__ CUtens
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 328);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 312);
     if (warp == 0) {
-        int _tmem_hold = smem + 328;
+        int _tmem_hold = smem + 312;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
@@ -529,25 +520,27 @@ kernel_cake_fmha_context_fp8_7bc99d2dda53eeaad98b(const __grid_constant__ CUtens
         asm volatile("setmaxnreg.inc.sync.aligned.u32 184;");
         { // softmax_main
             float smx_scale = softmax_scale_log2;
-            smx_scale = bmm1_scale_ptr[0];
-            unsigned int raw_bits = __as_u32(smx_scale);
-            if (bmm1_is_log2 == 0) {
-                smx_scale = (float)((double)smx_scale * 1.4426950216293335);
-            }
-            smx_scale = (float)((double)smx_scale / 1.4426950408889634 * 1.4426950408889634);
-            if (bmm1_is_log2 == 0 && (raw_bits & 2147483647) - 1 < 8388607) {
-                double wide = (double)(int)(raw_bits & 8388607) * 1.401298464324817e-45;
-                if (raw_bits >= 2147483648u) {
-                    wide = -wide;
+            if (scale_source != 0) {
+                smx_scale = bmm1_scale_ptr[0];
+                unsigned int raw_bits = __as_u32(smx_scale);
+                if (bmm1_is_log2 == 0) {
+                    smx_scale = (float)((double)smx_scale * 1.4426950216293335);
                 }
-                smx_scale = (float)(wide * 1.4426950216293335);
                 smx_scale = (float)((double)smx_scale / 1.4426950408889634 * 1.4426950408889634);
+                if (bmm1_is_log2 == 0 && (raw_bits & 2147483647) - 1 < 8388607) {
+                    double wide = (double)(int)(raw_bits & 8388607) * 1.401298464324817e-45;
+                    if (raw_bits >= 2147483648u) {
+                        wide = -wide;
+                    }
+                    smx_scale = (float)(wide * 1.4426950216293335);
+                    smx_scale = (float)((double)smx_scale / 1.4426950408889634 * 1.4426950408889634);
+                }
             }
             unsigned int stage = make_warp_uniform(warp / 4);
             int tmem_s_off = make_warp_uniform(stage * 128);
             int tmem_p_off = make_warp_uniform(stage * 128 + 64);
             int scale_off = make_warp_uniform(stage * (unsigned int)BLOCK_M);
-            unsigned int total_tiles = NUM_M_BLOCKS * total_bh;
+            unsigned int total_tiles = ((uint32_t)(num_m_blocks.divisor)) * (unsigned int)total_bh;
             unsigned int max_rounds = total_tiles + 1;
             int order_p01_start = ((stage == 0) ? -1 : 0);
             int order_p01_seen = order_p01_start;
@@ -565,40 +558,40 @@ kernel_cake_fmha_context_fp8_7bc99d2dda53eeaad98b(const __grid_constant__ CUtens
                 }
                 unsigned int m_block;
                 unsigned int bh;
-                {
-                    unsigned int l2section = L2_SWIZZLE * NUM_M_BLOCKS;
-                    unsigned int section = tile_idx / l2section;
-                    unsigned int l2_mod = tile_idx % l2section;
-                    {
-                        bool tail = section >= (unsigned int)total_bh / (unsigned int)L2_SWIZZLE;
-                        m_block = ((tail) ? l2_mod % (unsigned int)NUM_M_BLOCKS : l2_mod / (unsigned int)L2_SWIZZLE);
-                        bh = section * (unsigned int)L2_SWIZZLE + ((tail) ? l2_mod / (unsigned int)NUM_M_BLOCKS : l2_mod % (unsigned int)L2_SWIZZLE);
-                    }
-                    m_block = (unsigned int)(NUM_M_BLOCKS - 1) - m_block;
+                uint32_t tile_section = (num_m_blocks.divisor != 1) ? (__umulhi((uint32_t)(tile_idx >> 3), num_m_blocks.multiplier) >> num_m_blocks.shift_right) : (uint32_t)(tile_idx >> 3);
+                uint32_t tile_sw_m = (uint32_t)(tile_idx >> 3) - tile_section * (uint32_t)(num_m_blocks.divisor);
+                if (tile_section >= full_sections) {
+                    unsigned int tile_tail = tile_idx - tile_section * 8 * ((uint32_t)(num_m_blocks.divisor));
+                    uint32_t tail_unit = (num_m_blocks.divisor != 1) ? (__umulhi((uint32_t)(tile_tail), num_m_blocks.multiplier) >> num_m_blocks.shift_right) : (uint32_t)(tile_tail);
+                    uint32_t tail_m = (uint32_t)(tile_tail) - tail_unit * (uint32_t)(num_m_blocks.divisor);
+                    m_block = tail_m;
+                    bh = tile_section * 8 + tail_unit;
+                } else {
+                    m_block = tile_sw_m;
+                    bh = tile_section * 8 + (tile_idx & 7);
                 }
-                int seqlen_kv_bh = seq_lens_kv[bh / (unsigned int)(NUM_Q_HEADS / PACK_G)];
-                int seqlen_q_bh = cu_seq_lens_q[bh / (unsigned int)(NUM_Q_HEADS / PACK_G) + 1] - cu_seq_lens_q[bh / (unsigned int)(NUM_Q_HEADS / PACK_G)];
+                m_block = ((uint32_t)(num_m_blocks.divisor)) - 1 - m_block;
+                uint32_t b_idx = (num_bh_units.divisor != 1) ? (__umulhi((uint32_t)(bh), num_bh_units.multiplier) >> num_bh_units.shift_right) : (uint32_t)(bh);
+                uint32_t unit = (uint32_t)(bh) - b_idx * (uint32_t)(num_bh_units.divisor);
+                int seqlen_kv_bh = seq_lens_kv[b_idx];
+                int seqlen_q_bh = cu_seq_lens_q[b_idx + 1] - cu_seq_lens_q[b_idx];
                 unsigned int num_n_blocks = (seqlen_kv_bh + BLOCK_N - 1) / BLOCK_N;
-                {
-                    int kv_shift = seqlen_kv_bh - seqlen_q_bh;
-                    unsigned int max_n = (m_block * 2 + 2) * (unsigned int)TOK_PER_STAGE + (unsigned int)kv_shift;
-                    if (max_n < (unsigned int)seqlen_kv_bh) {
-                        num_n_blocks = (max_n + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N;
-                    }
+                int tile_kv_shift = seqlen_kv_bh - seqlen_q_bh;
+                unsigned int tile_max_n = (m_block * 2 + 2) * 32 + (unsigned int)tile_kv_shift;
+                if (tile_max_n < (unsigned int)seqlen_kv_bh) {
+                    num_n_blocks = (tile_max_n + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N;
                 }
                 unsigned int _max_0 = ((num_n_blocks) > (1) ? (num_n_blocks) : (1));
                 num_n_blocks = _max_0;
                 int causal_row;
                 unsigned int num_masked_iters;
-                {
-                    int kv_shift_1 = seqlen_kv_bh - seqlen_q_bh;
-                    causal_row = (m_block * 2 + stage) * (unsigned int)TOK_PER_STAGE + (unsigned int)((warp % 4 * 32 + lane) / PACK_G) + (unsigned int)kv_shift_1;
-                    int causal_row_min = (m_block * 2 + stage) * (unsigned int)TOK_PER_STAGE + (unsigned int)kv_shift_1;
-                    unsigned int n_block_no_mask_limit = (causal_row_min + 1) / BLOCK_N;
-                    num_masked_iters = num_n_blocks - n_block_no_mask_limit;
-                    if (num_masked_iters > num_n_blocks) {
-                        num_masked_iters = num_n_blocks;
-                    }
+                int kv_shift = seqlen_kv_bh - seqlen_q_bh;
+                causal_row = (m_block * 2 + stage) * 32 + (unsigned int)((warp % 4 * 32 + lane) / 4) + (unsigned int)kv_shift;
+                int causal_row_min = (m_block * 2 + stage) * 32 + (unsigned int)kv_shift;
+                unsigned int n_block_no_mask_limit = (causal_row_min + 1) / BLOCK_N;
+                num_masked_iters = num_n_blocks - n_block_no_mask_limit;
+                if (num_masked_iters > num_n_blocks) {
+                    num_masked_iters = num_n_blocks;
                 }
                 float row_max_val = -CUDART_INF_F;
                 float row_sum_val = 0.0f;
@@ -2319,22 +2312,24 @@ kernel_cake_fmha_context_fp8_7bc99d2dda53eeaad98b(const __grid_constant__ CUtens
         { // correction_main
             float smx_scale_c = softmax_scale_log2;
             float out_scale_c = output_scale;
-            smx_scale_c = bmm1_scale_ptr[0];
-            unsigned int raw_bits_c = __as_u32(smx_scale_c);
-            if (bmm1_is_log2 == 0) {
-                smx_scale_c = (float)((double)smx_scale_c * 1.4426950216293335);
-            }
-            smx_scale_c = (float)((double)smx_scale_c / 1.4426950408889634 * 1.4426950408889634);
-            if (bmm1_is_log2 == 0 && (raw_bits_c & 2147483647) - 1 < 8388607) {
-                double wide_c = (double)(int)(raw_bits_c & 8388607) * 1.401298464324817e-45;
-                if (raw_bits_c >= 2147483648u) {
-                    wide_c = -wide_c;
+            if (scale_source != 0) {
+                smx_scale_c = bmm1_scale_ptr[0];
+                unsigned int raw_bits_c = __as_u32(smx_scale_c);
+                if (bmm1_is_log2 == 0) {
+                    smx_scale_c = (float)((double)smx_scale_c * 1.4426950216293335);
                 }
-                smx_scale_c = (float)(wide_c * 1.4426950216293335);
                 smx_scale_c = (float)((double)smx_scale_c / 1.4426950408889634 * 1.4426950408889634);
+                if (bmm1_is_log2 == 0 && (raw_bits_c & 2147483647) - 1 < 8388607) {
+                    double wide_c = (double)(int)(raw_bits_c & 8388607) * 1.401298464324817e-45;
+                    if (raw_bits_c >= 2147483648u) {
+                        wide_c = -wide_c;
+                    }
+                    smx_scale_c = (float)(wide_c * 1.4426950216293335);
+                    smx_scale_c = (float)((double)smx_scale_c / 1.4426950408889634 * 1.4426950408889634);
+                }
+                out_scale_c = bmm2_scale_ptr[0];
             }
-            out_scale_c = bmm2_scale_ptr[0];
-            unsigned int total_tiles_1 = NUM_M_BLOCKS * total_bh;
+            unsigned int total_tiles_1 = ((uint32_t)(num_m_blocks.divisor)) * (unsigned int)total_bh;
             unsigned int max_rounds_1 = total_tiles_1 + 1;
             int p_full_block = 0;
             unsigned int _phase_work_id_full_0_1 = 0;
@@ -2356,34 +2351,35 @@ kernel_cake_fmha_context_fp8_7bc99d2dda53eeaad98b(const __grid_constant__ CUtens
                 }
                 unsigned int m_block_1;
                 unsigned int bh_1;
-                {
-                    unsigned int l2section_1 = L2_SWIZZLE * NUM_M_BLOCKS;
-                    unsigned int section_1 = tile_idx_1 / l2section_1;
-                    unsigned int l2_mod_1 = tile_idx_1 % l2section_1;
-                    {
-                        bool tail_1 = section_1 >= (unsigned int)total_bh / (unsigned int)L2_SWIZZLE;
-                        m_block_1 = ((tail_1) ? l2_mod_1 % (unsigned int)NUM_M_BLOCKS : l2_mod_1 / (unsigned int)L2_SWIZZLE);
-                        bh_1 = section_1 * (unsigned int)L2_SWIZZLE + ((tail_1) ? l2_mod_1 / (unsigned int)NUM_M_BLOCKS : l2_mod_1 % (unsigned int)L2_SWIZZLE);
-                    }
-                    m_block_1 = (unsigned int)(NUM_M_BLOCKS - 1) - m_block_1;
+                uint32_t tile_section_1 = (num_m_blocks.divisor != 1) ? (__umulhi((uint32_t)(tile_idx_1 >> 3), num_m_blocks.multiplier) >> num_m_blocks.shift_right) : (uint32_t)(tile_idx_1 >> 3);
+                uint32_t tile_sw_m_1 = (uint32_t)(tile_idx_1 >> 3) - tile_section_1 * (uint32_t)(num_m_blocks.divisor);
+                if (tile_section_1 >= full_sections) {
+                    unsigned int tile_tail_1 = tile_idx_1 - tile_section_1 * 8 * ((uint32_t)(num_m_blocks.divisor));
+                    uint32_t tail_unit_1 = (num_m_blocks.divisor != 1) ? (__umulhi((uint32_t)(tile_tail_1), num_m_blocks.multiplier) >> num_m_blocks.shift_right) : (uint32_t)(tile_tail_1);
+                    uint32_t tail_m_1 = (uint32_t)(tile_tail_1) - tail_unit_1 * (uint32_t)(num_m_blocks.divisor);
+                    m_block_1 = tail_m_1;
+                    bh_1 = tile_section_1 * 8 + tail_unit_1;
+                } else {
+                    m_block_1 = tile_sw_m_1;
+                    bh_1 = tile_section_1 * 8 + (tile_idx_1 & 7);
                 }
-                int seqlen_kv_bh_1 = seq_lens_kv[bh_1 / (unsigned int)(NUM_Q_HEADS / PACK_G)];
-                int seqlen_q_bh_1 = cu_seq_lens_q[bh_1 / (unsigned int)(NUM_Q_HEADS / PACK_G) + 1] - cu_seq_lens_q[bh_1 / (unsigned int)(NUM_Q_HEADS / PACK_G)];
+                m_block_1 = ((uint32_t)(num_m_blocks.divisor)) - 1 - m_block_1;
+                uint32_t b_idx_1 = (num_bh_units.divisor != 1) ? (__umulhi((uint32_t)(bh_1), num_bh_units.multiplier) >> num_bh_units.shift_right) : (uint32_t)(bh_1);
+                uint32_t unit_1 = (uint32_t)(bh_1) - b_idx_1 * (uint32_t)(num_bh_units.divisor);
+                int seqlen_kv_bh_1 = seq_lens_kv[b_idx_1];
+                int seqlen_q_bh_1 = cu_seq_lens_q[b_idx_1 + 1] - cu_seq_lens_q[b_idx_1];
                 unsigned int num_n_blocks_1 = (seqlen_kv_bh_1 + BLOCK_N - 1) / BLOCK_N;
-                {
-                    int kv_shift_2 = seqlen_kv_bh_1 - seqlen_q_bh_1;
-                    unsigned int max_n_1 = (m_block_1 * 2 + 2) * (unsigned int)TOK_PER_STAGE + (unsigned int)kv_shift_2;
-                    if (max_n_1 < (unsigned int)seqlen_kv_bh_1) {
-                        num_n_blocks_1 = (max_n_1 + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N;
-                    }
+                int tile_kv_shift_1 = seqlen_kv_bh_1 - seqlen_q_bh_1;
+                unsigned int tile_max_n_1 = (m_block_1 * 2 + 2) * 32 + (unsigned int)tile_kv_shift_1;
+                if (tile_max_n_1 < (unsigned int)seqlen_kv_bh_1) {
+                    num_n_blocks_1 = (tile_max_n_1 + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N;
                 }
                 unsigned int _max_0_1 = ((num_n_blocks_1) > (1) ? (num_n_blocks_1) : (1));
                 num_n_blocks_1 = _max_0_1;
-                int unit = bh_1 % (unsigned int)(NUM_Q_HEADS / PACK_G);
-                int q_head_base = unit * PACK_G;
-                int row_tok = (warp % 4 * 32 + lane) / PACK_G;
-                int row_head = q_head_base + (warp % 4 * 32 + lane) % PACK_G;
-                int tok_base = cu_seq_lens_q[bh_1 / (unsigned int)(NUM_Q_HEADS / PACK_G)];
+                int q_head_base = unit_1 * 4;
+                int row_tok = (warp % 4 * 32 + lane) / 4;
+                int row_head = q_head_base + (warp % 4 * 32 + lane) % 4;
+                int tok_base = cu_seq_lens_q[b_idx_1];
                 mbarrier_arrive(p_full_addr);
                 mbarrier_arrive(p_full_addr + 8);
                 p_full_block += 1;
@@ -2464,11 +2460,11 @@ kernel_cake_fmha_context_fp8_7bc99d2dda53eeaad98b(const __grid_constant__ CUtens
                     } else {
                         final_scale = 0.0f;
                     }
-                    int q_tok0 = (m_block_1 * 2 + (unsigned int)stage_1) * (unsigned int)TOK_PER_STAGE;
+                    int q_tok0 = (m_block_1 * 2 + (unsigned int)stage_1) * 32;
                     if (q_tok0 < seqlen_q_bh_1) {
-                        int row_valid = warp % 4 * 32 + lane < TOK_PER_STAGE * PACK_G && seqlen_q_bh_1 > q_tok0 + row_tok;
+                        int row_valid = warp % 4 * 32 + lane < 128 && seqlen_q_bh_1 > q_tok0 + row_tok;
                         long long o_tok = tok_base + q_tok0 + row_tok;
-                        long long o_row = o_tok * (long long)NUM_Q_HEADS + (long long)row_head;
+                        long long o_row = o_tok * (long long)num_q_heads + (long long)row_head;
                         #pragma unroll
                         for (int ce_col = 0; ce_col < HEAD_DIM / 16; ce_col++) {
                             int ce_addr = taddr + (unsigned int)tmem_o_off + (unsigned int)(warp % 4 * 32 << 16) + (unsigned int)(ce_col * 16);
@@ -2545,7 +2541,7 @@ kernel_cake_fmha_context_fp8_7bc99d2dda53eeaad98b(const __grid_constant__ CUtens
     // ---- Role: mma ----
     if (warp == 12) {
         { // mma_main
-            unsigned int total_tiles_2 = NUM_M_BLOCKS * total_bh;
+            unsigned int total_tiles_2 = ((uint32_t)(num_m_blocks.divisor)) * (unsigned int)total_bh;
             unsigned int max_rounds_2 = total_tiles_2 + 1;
             unsigned int mma_kv_stage = 0;
             unsigned int _phase_work_id_full_0_2 = 0;
@@ -2568,26 +2564,28 @@ kernel_cake_fmha_context_fp8_7bc99d2dda53eeaad98b(const __grid_constant__ CUtens
                 }
                 unsigned int m_block_2;
                 unsigned int bh_2;
-                {
-                    unsigned int l2section_2 = L2_SWIZZLE * NUM_M_BLOCKS;
-                    unsigned int section_2 = tile_idx_2 / l2section_2;
-                    unsigned int l2_mod_2 = tile_idx_2 % l2section_2;
-                    {
-                        bool tail_2 = section_2 >= (unsigned int)total_bh / (unsigned int)L2_SWIZZLE;
-                        m_block_2 = ((tail_2) ? l2_mod_2 % (unsigned int)NUM_M_BLOCKS : l2_mod_2 / (unsigned int)L2_SWIZZLE);
-                        bh_2 = section_2 * (unsigned int)L2_SWIZZLE + ((tail_2) ? l2_mod_2 / (unsigned int)NUM_M_BLOCKS : l2_mod_2 % (unsigned int)L2_SWIZZLE);
-                    }
-                    m_block_2 = (unsigned int)(NUM_M_BLOCKS - 1) - m_block_2;
+                uint32_t tile_section_2 = (num_m_blocks.divisor != 1) ? (__umulhi((uint32_t)(tile_idx_2 >> 3), num_m_blocks.multiplier) >> num_m_blocks.shift_right) : (uint32_t)(tile_idx_2 >> 3);
+                uint32_t tile_sw_m_2 = (uint32_t)(tile_idx_2 >> 3) - tile_section_2 * (uint32_t)(num_m_blocks.divisor);
+                if (tile_section_2 >= full_sections) {
+                    unsigned int tile_tail_2 = tile_idx_2 - tile_section_2 * 8 * ((uint32_t)(num_m_blocks.divisor));
+                    uint32_t tail_unit_2 = (num_m_blocks.divisor != 1) ? (__umulhi((uint32_t)(tile_tail_2), num_m_blocks.multiplier) >> num_m_blocks.shift_right) : (uint32_t)(tile_tail_2);
+                    uint32_t tail_m_2 = (uint32_t)(tile_tail_2) - tail_unit_2 * (uint32_t)(num_m_blocks.divisor);
+                    m_block_2 = tail_m_2;
+                    bh_2 = tile_section_2 * 8 + tail_unit_2;
+                } else {
+                    m_block_2 = tile_sw_m_2;
+                    bh_2 = tile_section_2 * 8 + (tile_idx_2 & 7);
                 }
-                int seqlen_kv_bh_2 = seq_lens_kv[bh_2 / (unsigned int)(NUM_Q_HEADS / PACK_G)];
-                int seqlen_q_bh_2 = cu_seq_lens_q[bh_2 / (unsigned int)(NUM_Q_HEADS / PACK_G) + 1] - cu_seq_lens_q[bh_2 / (unsigned int)(NUM_Q_HEADS / PACK_G)];
+                m_block_2 = ((uint32_t)(num_m_blocks.divisor)) - 1 - m_block_2;
+                uint32_t b_idx_2 = (num_bh_units.divisor != 1) ? (__umulhi((uint32_t)(bh_2), num_bh_units.multiplier) >> num_bh_units.shift_right) : (uint32_t)(bh_2);
+                uint32_t unit_2 = (uint32_t)(bh_2) - b_idx_2 * (uint32_t)(num_bh_units.divisor);
+                int seqlen_kv_bh_2 = seq_lens_kv[b_idx_2];
+                int seqlen_q_bh_2 = cu_seq_lens_q[b_idx_2 + 1] - cu_seq_lens_q[b_idx_2];
                 unsigned int num_n_blocks_2 = (seqlen_kv_bh_2 + BLOCK_N - 1) / BLOCK_N;
-                {
-                    int kv_shift_3 = seqlen_kv_bh_2 - seqlen_q_bh_2;
-                    unsigned int max_n_2 = (m_block_2 * 2 + 2) * (unsigned int)TOK_PER_STAGE + (unsigned int)kv_shift_3;
-                    if (max_n_2 < (unsigned int)seqlen_kv_bh_2) {
-                        num_n_blocks_2 = (max_n_2 + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N;
-                    }
+                int tile_kv_shift_2 = seqlen_kv_bh_2 - seqlen_q_bh_2;
+                unsigned int tile_max_n_2 = (m_block_2 * 2 + 2) * 32 + (unsigned int)tile_kv_shift_2;
+                if (tile_max_n_2 < (unsigned int)seqlen_kv_bh_2) {
+                    num_n_blocks_2 = (tile_max_n_2 + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N;
                 }
                 unsigned int _max_0_2 = ((num_n_blocks_2) > (1) ? (num_n_blocks_2) : (1));
                 num_n_blocks_2 = _max_0_2;
@@ -2649,14 +2647,14 @@ kernel_cake_fmha_context_fp8_7bc99d2dda53eeaad98b(const __grid_constant__ CUtens
                 elect_commit(s_full_addr + 8);
                 elect_commit(kv_empty_addr + (mma_kv_stage) * 8);
                 mma_kv_stage += 1;
-                if (mma_kv_stage == 4) { mma_kv_stage = 0; _phase_kv_full ^= 1; }
+                if (mma_kv_stage == 3) { mma_kv_stage = 0; _phase_kv_full ^= 1; }
                 unsigned int first_pv = 1;
                 #pragma unroll 1
                 for (unsigned int n_iter_3 = 0; n_iter_3 < num_n_blocks_2 - 1; n_iter_3++) {
                     mbarrier_wait(kv_full_addr + (mma_kv_stage) * 8, _phase_kv_full);
                     unsigned int v_stage = mma_kv_stage;
                     mma_kv_stage += 1;
-                    if (mma_kv_stage == 4) { mma_kv_stage = 0; _phase_kv_full ^= 1; }
+                    if (mma_kv_stage == 3) { mma_kv_stage = 0; _phase_kv_full ^= 1; }
                     int first_pv_flag = first_pv;
                     mbarrier_wait(p_full_addr, _phase_p_full_0);
                     _phase_p_full_0 ^= 1;
@@ -2696,7 +2694,7 @@ kernel_cake_fmha_context_fp8_7bc99d2dda53eeaad98b(const __grid_constant__ CUtens
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     unsigned int k_stage = mma_kv_stage;
                     mma_kv_stage += 1;
-                    if (mma_kv_stage == 4) { mma_kv_stage = 0; _phase_kv_full ^= 1; }
+                    if (mma_kv_stage == 3) { mma_kv_stage = 0; _phase_kv_full ^= 1; }
                     int _mma_a_lo_2 = make_warp_uniform(((smem_q0_addr) >> 4) & 0x3FFF);
                     int _mma_b_lo_4 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (k_stage) * 1024);
                     {
@@ -2756,7 +2754,7 @@ kernel_cake_fmha_context_fp8_7bc99d2dda53eeaad98b(const __grid_constant__ CUtens
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     int _mma_b_lo_6 = make_warp_uniform(((((smem_v_addr) >> 4) & 0x3FFF) | 0x4000000) + (v_stage) * 1024);
                     mma_ts_step(tmem_output_1, tmem_softmax_1 + 24, _mma_b_lo_6 + 768, 0x40004040, 136380432, 1);
-                    elect_commit(kv_empty_addr + (((mma_kv_stage + 2 >= 4) ? mma_kv_stage + 2 - 4 : mma_kv_stage + 2)) * 8);
+                    elect_commit(kv_empty_addr + (((mma_kv_stage + 1 < 3) ? mma_kv_stage + 1 : (unsigned int)0)) * 8);
                     int _mma_a_lo_3 = make_warp_uniform(((smem_q1_addr) >> 4) & 0x3FFF);
                     int _mma_b_lo_7 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (k_stage) * 1024);
                     {
@@ -2782,7 +2780,7 @@ kernel_cake_fmha_context_fp8_7bc99d2dda53eeaad98b(const __grid_constant__ CUtens
                         }
                     }
                     elect_commit(s_full_addr + 8);
-                    elect_commit(kv_empty_addr + (((mma_kv_stage + 3 >= 4) ? mma_kv_stage + 3 - 4 : mma_kv_stage + 3)) * 8);
+                    elect_commit(kv_empty_addr + (((mma_kv_stage + 2 >= 3) ? mma_kv_stage + 2 - 3 : mma_kv_stage + 2)) * 8);
                     first_pv = 0;
                 }
                 elect_commit(q_empty_addr);
@@ -2858,7 +2856,7 @@ kernel_cake_fmha_context_fp8_7bc99d2dda53eeaad98b(const __grid_constant__ CUtens
                 mma_ts_step(tmem_output_1, tmem_softmax_1 + 24, _mma_b_lo_11 + 768, 0x40004040, 136380432, 1);
                 elect_commit(kv_empty_addr + (mma_kv_stage) * 8);
                 mma_kv_stage += 1;
-                if (mma_kv_stage == 4) { mma_kv_stage = 0; _phase_kv_full ^= 1; }
+                if (mma_kv_stage == 3) { mma_kv_stage = 0; _phase_kv_full ^= 1; }
                 elect_commit2(o_full_addr, o_full_addr + 8);
             }
         }
@@ -2866,9 +2864,11 @@ kernel_cake_fmha_context_fp8_7bc99d2dda53eeaad98b(const __grid_constant__ CUtens
     // ---- Role: page_offsets ----
     if (warp == 13) {
         { // page_offsets_main
-            unsigned int total_tiles_3 = NUM_M_BLOCKS * total_bh;
+            unsigned int total_tiles_3 = ((uint32_t)(num_m_blocks.divisor)) * (unsigned int)total_bh;
             unsigned int max_rounds_3 = total_tiles_3 + 1;
             unsigned int po_stage = 0;
+            unsigned int po_shift;
+            po_shift = 6;
             unsigned int _phase_work_id_full_0_3 = 0;
             unsigned int _phase_page_empty = 1;
             #pragma unroll 1
@@ -2882,37 +2882,39 @@ kernel_cake_fmha_context_fp8_7bc99d2dda53eeaad98b(const __grid_constant__ CUtens
                 }
                 unsigned int m_block_3;
                 unsigned int bh_3;
-                {
-                    unsigned int l2section_3 = L2_SWIZZLE * NUM_M_BLOCKS;
-                    unsigned int section_3 = tile_idx_3 / l2section_3;
-                    unsigned int l2_mod_3 = tile_idx_3 % l2section_3;
-                    {
-                        bool tail_3 = section_3 >= (unsigned int)total_bh / (unsigned int)L2_SWIZZLE;
-                        m_block_3 = ((tail_3) ? l2_mod_3 % (unsigned int)NUM_M_BLOCKS : l2_mod_3 / (unsigned int)L2_SWIZZLE);
-                        bh_3 = section_3 * (unsigned int)L2_SWIZZLE + ((tail_3) ? l2_mod_3 / (unsigned int)NUM_M_BLOCKS : l2_mod_3 % (unsigned int)L2_SWIZZLE);
-                    }
-                    m_block_3 = (unsigned int)(NUM_M_BLOCKS - 1) - m_block_3;
+                uint32_t tile_section_3 = (num_m_blocks.divisor != 1) ? (__umulhi((uint32_t)(tile_idx_3 >> 3), num_m_blocks.multiplier) >> num_m_blocks.shift_right) : (uint32_t)(tile_idx_3 >> 3);
+                uint32_t tile_sw_m_3 = (uint32_t)(tile_idx_3 >> 3) - tile_section_3 * (uint32_t)(num_m_blocks.divisor);
+                if (tile_section_3 >= full_sections) {
+                    unsigned int tile_tail_3 = tile_idx_3 - tile_section_3 * 8 * ((uint32_t)(num_m_blocks.divisor));
+                    uint32_t tail_unit_3 = (num_m_blocks.divisor != 1) ? (__umulhi((uint32_t)(tile_tail_3), num_m_blocks.multiplier) >> num_m_blocks.shift_right) : (uint32_t)(tile_tail_3);
+                    uint32_t tail_m_3 = (uint32_t)(tile_tail_3) - tail_unit_3 * (uint32_t)(num_m_blocks.divisor);
+                    m_block_3 = tail_m_3;
+                    bh_3 = tile_section_3 * 8 + tail_unit_3;
+                } else {
+                    m_block_3 = tile_sw_m_3;
+                    bh_3 = tile_section_3 * 8 + (tile_idx_3 & 7);
                 }
-                int seqlen_kv_bh_3 = seq_lens_kv[bh_3 / (unsigned int)(NUM_Q_HEADS / PACK_G)];
-                int seqlen_q_bh_3 = cu_seq_lens_q[bh_3 / (unsigned int)(NUM_Q_HEADS / PACK_G) + 1] - cu_seq_lens_q[bh_3 / (unsigned int)(NUM_Q_HEADS / PACK_G)];
+                m_block_3 = ((uint32_t)(num_m_blocks.divisor)) - 1 - m_block_3;
+                uint32_t b_idx_3 = (num_bh_units.divisor != 1) ? (__umulhi((uint32_t)(bh_3), num_bh_units.multiplier) >> num_bh_units.shift_right) : (uint32_t)(bh_3);
+                uint32_t unit_3 = (uint32_t)(bh_3) - b_idx_3 * (uint32_t)(num_bh_units.divisor);
+                int seqlen_kv_bh_3 = seq_lens_kv[b_idx_3];
+                int seqlen_q_bh_3 = cu_seq_lens_q[b_idx_3 + 1] - cu_seq_lens_q[b_idx_3];
                 unsigned int num_n_blocks_3 = (seqlen_kv_bh_3 + BLOCK_N - 1) / BLOCK_N;
-                {
-                    int kv_shift_4 = seqlen_kv_bh_3 - seqlen_q_bh_3;
-                    unsigned int max_n_3 = (m_block_3 * 2 + 2) * (unsigned int)TOK_PER_STAGE + (unsigned int)kv_shift_4;
-                    if (max_n_3 < (unsigned int)seqlen_kv_bh_3) {
-                        num_n_blocks_3 = (max_n_3 + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N;
-                    }
+                int tile_kv_shift_3 = seqlen_kv_bh_3 - seqlen_q_bh_3;
+                unsigned int tile_max_n_3 = (m_block_3 * 2 + 2) * 32 + (unsigned int)tile_kv_shift_3;
+                if (tile_max_n_3 < (unsigned int)seqlen_kv_bh_3) {
+                    num_n_blocks_3 = (tile_max_n_3 + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N;
                 }
                 unsigned int _max_0_3 = ((num_n_blocks_3) > (1) ? (num_n_blocks_3) : (1));
                 num_n_blocks_3 = _max_0_3;
-                unsigned int b_idx = bh_3 / (unsigned int)(NUM_Q_HEADS / PACK_G);
-                int pt_base = b_idx * (unsigned int)page_row_stride;
+                int pt_base = b_idx_3 * (unsigned int)page_row_stride;
                 int _max_1 = ((seqlen_kv_bh_3 - 1) > (0) ? (seqlen_kv_bh_3 - 1) : (0));
-                unsigned int last_slot = (unsigned int)_max_1 / (unsigned int)PAGE_SIZE;
+                unsigned int last_slot = (unsigned int)_max_1 >> po_shift;
+                unsigned int block_pages = (((unsigned int)BLOCK_N >> po_shift) > (1) ? ((unsigned int)BLOCK_N >> po_shift) : (1));
                 #pragma unroll 1
                 for (unsigned int ni = 0; ni < num_n_blocks_3; ni++) {
                     unsigned int n = num_n_blocks_3 - 1 - ni;
-                    int base_tok = n * (unsigned int)BLOCK_N;
+                    unsigned int first_slot = n * (unsigned int)BLOCK_N >> po_shift;
                     mbarrier_wait(page_empty_addr + (po_stage) * 8, _phase_page_empty);
                     if (elect_sync()) {
                         int pg_idx = po_stage * 16;
@@ -2922,8 +2924,6 @@ kernel_cake_fmha_context_fp8_7bc99d2dda53eeaad98b(const __grid_constant__ CUtens
                                 smem_pages[pg_idx + slot] = 1073741824;
                             }
                         } else {
-                            unsigned int block_pages = (((unsigned int)BLOCK_N / (unsigned int)PAGE_SIZE) > (1) ? ((unsigned int)BLOCK_N / (unsigned int)PAGE_SIZE) : (1));
-                            unsigned int first_slot = (unsigned int)base_tok / (unsigned int)PAGE_SIZE;
                             #pragma unroll
                             for (int j = 0; j < 8; j++) {
                                 if ((unsigned int)j < block_pages) {
@@ -2945,7 +2945,7 @@ kernel_cake_fmha_context_fp8_7bc99d2dda53eeaad98b(const __grid_constant__ CUtens
     // ---- Role: scheduler ----
     if (warp == 14) {
         { // scheduler_main
-            unsigned int total_tiles_4 = NUM_M_BLOCKS * total_bh;
+            unsigned int total_tiles_4 = ((uint32_t)(num_m_blocks.divisor)) * (unsigned int)total_bh;
             unsigned int max_rounds_4 = total_tiles_4 + 1;
             bool static_first = (unsigned int)num_ctas <= total_tiles_4;
             unsigned int _phase_work_id_empty_0 = 1;
@@ -2987,10 +2987,21 @@ kernel_cake_fmha_context_fp8_7bc99d2dda53eeaad98b(const __grid_constant__ CUtens
     // ---- Role: load ----
     if (warp == 15) {
         { // load_main
-            unsigned int total_tiles_5 = NUM_M_BLOCKS * total_bh;
+            unsigned int total_tiles_5 = ((uint32_t)(num_m_blocks.divisor)) * (unsigned int)total_bh;
             unsigned int max_rounds_5 = total_tiles_5 + 1;
             unsigned int load_kv_stage = 0;
             unsigned int load_po_stage = 0;
+            unsigned int ld_shift;
+            ld_shift = 6;
+            unsigned int page_mask = (1 << ld_shift) - 1;
+            int chunk_page0 = 0 >> ld_shift;
+            int chunk_page1 = 16 >> ld_shift;
+            int chunk_page2 = 32 >> ld_shift;
+            int chunk_page3 = 48 >> ld_shift;
+            int chunk_page4 = 64 >> ld_shift;
+            int chunk_page5 = 80 >> ld_shift;
+            int chunk_page6 = 96 >> ld_shift;
+            int chunk_page7 = 112 >> ld_shift;
             unsigned int _phase_work_id_full_0_4 = 0;
             unsigned int _phase_q_empty_0 = 1;
             unsigned int _phase_page_full = 0;
@@ -3006,85 +3017,88 @@ kernel_cake_fmha_context_fp8_7bc99d2dda53eeaad98b(const __grid_constant__ CUtens
                 }
                 unsigned int m_block_4;
                 unsigned int bh_4;
-                {
-                    unsigned int l2section_4 = L2_SWIZZLE * NUM_M_BLOCKS;
-                    unsigned int section_4 = tile_idx_4 / l2section_4;
-                    unsigned int l2_mod_4 = tile_idx_4 % l2section_4;
-                    {
-                        bool tail_4 = section_4 >= (unsigned int)total_bh / (unsigned int)L2_SWIZZLE;
-                        m_block_4 = ((tail_4) ? l2_mod_4 % (unsigned int)NUM_M_BLOCKS : l2_mod_4 / (unsigned int)L2_SWIZZLE);
-                        bh_4 = section_4 * (unsigned int)L2_SWIZZLE + ((tail_4) ? l2_mod_4 / (unsigned int)NUM_M_BLOCKS : l2_mod_4 % (unsigned int)L2_SWIZZLE);
-                    }
-                    m_block_4 = (unsigned int)(NUM_M_BLOCKS - 1) - m_block_4;
+                uint32_t tile_section_4 = (num_m_blocks.divisor != 1) ? (__umulhi((uint32_t)(tile_idx_4 >> 3), num_m_blocks.multiplier) >> num_m_blocks.shift_right) : (uint32_t)(tile_idx_4 >> 3);
+                uint32_t tile_sw_m_4 = (uint32_t)(tile_idx_4 >> 3) - tile_section_4 * (uint32_t)(num_m_blocks.divisor);
+                if (tile_section_4 >= full_sections) {
+                    unsigned int tile_tail_4 = tile_idx_4 - tile_section_4 * 8 * ((uint32_t)(num_m_blocks.divisor));
+                    uint32_t tail_unit_4 = (num_m_blocks.divisor != 1) ? (__umulhi((uint32_t)(tile_tail_4), num_m_blocks.multiplier) >> num_m_blocks.shift_right) : (uint32_t)(tile_tail_4);
+                    uint32_t tail_m_4 = (uint32_t)(tile_tail_4) - tail_unit_4 * (uint32_t)(num_m_blocks.divisor);
+                    m_block_4 = tail_m_4;
+                    bh_4 = tile_section_4 * 8 + tail_unit_4;
+                } else {
+                    m_block_4 = tile_sw_m_4;
+                    bh_4 = tile_section_4 * 8 + (tile_idx_4 & 7);
                 }
-                int seqlen_kv_bh_4 = seq_lens_kv[bh_4 / (unsigned int)(NUM_Q_HEADS / PACK_G)];
-                int seqlen_q_bh_4 = cu_seq_lens_q[bh_4 / (unsigned int)(NUM_Q_HEADS / PACK_G) + 1] - cu_seq_lens_q[bh_4 / (unsigned int)(NUM_Q_HEADS / PACK_G)];
+                m_block_4 = ((uint32_t)(num_m_blocks.divisor)) - 1 - m_block_4;
+                uint32_t b_idx_4 = (num_bh_units.divisor != 1) ? (__umulhi((uint32_t)(bh_4), num_bh_units.multiplier) >> num_bh_units.shift_right) : (uint32_t)(bh_4);
+                uint32_t unit_4 = (uint32_t)(bh_4) - b_idx_4 * (uint32_t)(num_bh_units.divisor);
+                int seqlen_kv_bh_4 = seq_lens_kv[b_idx_4];
+                int seqlen_q_bh_4 = cu_seq_lens_q[b_idx_4 + 1] - cu_seq_lens_q[b_idx_4];
                 unsigned int num_n_blocks_4 = (seqlen_kv_bh_4 + BLOCK_N - 1) / BLOCK_N;
-                {
-                    int kv_shift_5 = seqlen_kv_bh_4 - seqlen_q_bh_4;
-                    unsigned int max_n_4 = (m_block_4 * 2 + 2) * (unsigned int)TOK_PER_STAGE + (unsigned int)kv_shift_5;
-                    if (max_n_4 < (unsigned int)seqlen_kv_bh_4) {
-                        num_n_blocks_4 = (max_n_4 + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N;
-                    }
+                int tile_kv_shift_4 = seqlen_kv_bh_4 - seqlen_q_bh_4;
+                unsigned int tile_max_n_4 = (m_block_4 * 2 + 2) * 32 + (unsigned int)tile_kv_shift_4;
+                if (tile_max_n_4 < (unsigned int)seqlen_kv_bh_4) {
+                    num_n_blocks_4 = (tile_max_n_4 + (unsigned int)BLOCK_N - 1) / (unsigned int)BLOCK_N;
                 }
                 unsigned int _max_0_4 = ((num_n_blocks_4) > (1) ? (num_n_blocks_4) : (1));
                 num_n_blocks_4 = _max_0_4;
-                int unit_1 = bh_4 % (unsigned int)(NUM_Q_HEADS / PACK_G);
-                int kv_head = unit_1 * PACK_G / HEADS_PER_GROUP;
-                int tok_q0 = (unsigned int)cu_seq_lens_q[bh_4 / (unsigned int)(NUM_Q_HEADS / PACK_G)] + m_block_4 * 2 * (unsigned int)TOK_PER_STAGE;
-                int tok_q1 = tok_q0 + TOK_PER_STAGE;
+                uint32_t group_head = (heads_per_group.divisor != 1) ? (__umulhi((uint32_t)(unit_4 * 4), heads_per_group.multiplier) >> heads_per_group.shift_right) : (uint32_t)(unit_4 * 4);
+                uint32_t group_rank = (uint32_t)(unit_4 * 4) - group_head * (uint32_t)(heads_per_group.divisor);
+                int kv_head = group_head;
+                int tok_q0 = (unsigned int)cu_seq_lens_q[b_idx_4] + m_block_4 * 2 * 32;
+                int tok_q1 = tok_q0 + 32;
                 mbarrier_wait(q_empty_addr, _phase_q_empty_0);
                 _phase_q_empty_0 ^= 1;
                 if (elect_sync()) {
-                    mbarrier_arrive_expect_tx(q_full_addr, TOK_PER_STAGE * PACK_G * 128);
-                    tma_5d_gmem2smem(smem_q0_addr, (&Q), 0, 0, tok_q0, 0, unit_1, q_full_addr);
+                    mbarrier_arrive_expect_tx(q_full_addr, 16384);
+                    tma_5d_gmem2smem(smem_q0_addr, (&Q), 0, 0, tok_q0, 0, unit_4, q_full_addr);
                 }
                 if (elect_sync()) {
-                    mbarrier_arrive_expect_tx(q_full_addr + 8, TOK_PER_STAGE * PACK_G * 128);
-                    tma_5d_gmem2smem(smem_q1_addr, (&Q), 0, 0, tok_q1, 0, unit_1, q_full_addr + 8);
+                    mbarrier_arrive_expect_tx(q_full_addr + 8, 16384);
+                    tma_5d_gmem2smem(smem_q1_addr, (&Q), 0, 0, tok_q1, 0, unit_4, q_full_addr + 8);
                 }
                 #pragma unroll 1
                 for (unsigned int ni_1 = 0; ni_1 < num_n_blocks_4; ni_1++) {
                     unsigned int n_1 = num_n_blocks_4 - 1 - ni_1;
-                    int base_tok_1 = n_1 * (unsigned int)BLOCK_N;
-                    int w0 = (unsigned int)base_tok_1 % (unsigned int)PAGE_SIZE;
-                    int w1 = (unsigned int)(base_tok_1 + 16) % (unsigned int)PAGE_SIZE;
-                    int w2 = (unsigned int)(base_tok_1 + 32) % (unsigned int)PAGE_SIZE;
-                    int w3 = (unsigned int)(base_tok_1 + 48) % (unsigned int)PAGE_SIZE;
-                    int w4 = (unsigned int)(base_tok_1 + 64) % (unsigned int)PAGE_SIZE;
-                    int w5 = (unsigned int)(base_tok_1 + 80) % (unsigned int)PAGE_SIZE;
-                    int w6 = (unsigned int)(base_tok_1 + 96) % (unsigned int)PAGE_SIZE;
-                    int w7 = (unsigned int)(base_tok_1 + 112) % (unsigned int)PAGE_SIZE;
+                    int base_tok = n_1 * (unsigned int)BLOCK_N;
+                    int w0 = (unsigned int)(base_tok + 0) & page_mask;
+                    int w1 = (unsigned int)(base_tok + 16) & page_mask;
+                    int w2 = (unsigned int)(base_tok + 32) & page_mask;
+                    int w3 = (unsigned int)(base_tok + 48) & page_mask;
+                    int w4 = (unsigned int)(base_tok + 64) & page_mask;
+                    int w5 = (unsigned int)(base_tok + 80) & page_mask;
+                    int w6 = (unsigned int)(base_tok + 96) & page_mask;
+                    int w7 = (unsigned int)(base_tok + 112) & page_mask;
                     mbarrier_wait(page_full_addr + (load_po_stage) * 8, _phase_page_full);
                     int pg_idx_1 = load_po_stage * 16;
                     mbarrier_wait(kv_empty_addr + (load_kv_stage) * 8, _phase_kv_empty);
                     if (elect_sync()) {
                         mbarrier_arrive_expect_tx(kv_full_addr + (load_kv_stage) * 8, 16384);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384, (&K), 0, w0, 0, kv_head, smem_pages[pg_idx_1 + 0 / PAGE_SIZE], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 2048, (&K), 0, w1, 0, kv_head, smem_pages[pg_idx_1 + 16 / PAGE_SIZE], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 4096, (&K), 0, w2, 0, kv_head, smem_pages[pg_idx_1 + 32 / PAGE_SIZE], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 6144, (&K), 0, w3, 0, kv_head, smem_pages[pg_idx_1 + 48 / PAGE_SIZE], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 8192, (&K), 0, w4, 0, kv_head, smem_pages[pg_idx_1 + 64 / PAGE_SIZE], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 10240, (&K), 0, w5, 0, kv_head, smem_pages[pg_idx_1 + 80 / PAGE_SIZE], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 12288, (&K), 0, w6, 0, kv_head, smem_pages[pg_idx_1 + 96 / PAGE_SIZE], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 14336, (&K), 0, w7, 0, kv_head, smem_pages[pg_idx_1 + 112 / PAGE_SIZE], kv_full_addr + (load_kv_stage) * 8);
+                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384, (&K), 0, w0, 0, kv_head, smem_pages[pg_idx_1 + chunk_page0], kv_full_addr + (load_kv_stage) * 8);
+                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 2048, (&K), 0, w1, 0, kv_head, smem_pages[pg_idx_1 + chunk_page1], kv_full_addr + (load_kv_stage) * 8);
+                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 4096, (&K), 0, w2, 0, kv_head, smem_pages[pg_idx_1 + chunk_page2], kv_full_addr + (load_kv_stage) * 8);
+                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 6144, (&K), 0, w3, 0, kv_head, smem_pages[pg_idx_1 + chunk_page3], kv_full_addr + (load_kv_stage) * 8);
+                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 8192, (&K), 0, w4, 0, kv_head, smem_pages[pg_idx_1 + chunk_page4], kv_full_addr + (load_kv_stage) * 8);
+                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 10240, (&K), 0, w5, 0, kv_head, smem_pages[pg_idx_1 + chunk_page5], kv_full_addr + (load_kv_stage) * 8);
+                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 12288, (&K), 0, w6, 0, kv_head, smem_pages[pg_idx_1 + chunk_page6], kv_full_addr + (load_kv_stage) * 8);
+                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 14336, (&K), 0, w7, 0, kv_head, smem_pages[pg_idx_1 + chunk_page7], kv_full_addr + (load_kv_stage) * 8);
                     }
                     load_kv_stage += 1;
-                    if (load_kv_stage == 4) { load_kv_stage = 0; _phase_kv_empty ^= 1; }
+                    if (load_kv_stage == 3) { load_kv_stage = 0; _phase_kv_empty ^= 1; }
                     mbarrier_wait(kv_empty_addr + (load_kv_stage) * 8, _phase_kv_empty);
                     if (elect_sync()) {
                         mbarrier_arrive_expect_tx(kv_full_addr + (load_kv_stage) * 8, 16384);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384, (&V), 0, w0, 0, kv_head, smem_pages[pg_idx_1 + 8 + 0 / PAGE_SIZE], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 2048, (&V), 0, w1, 0, kv_head, smem_pages[pg_idx_1 + 8 + 16 / PAGE_SIZE], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 4096, (&V), 0, w2, 0, kv_head, smem_pages[pg_idx_1 + 8 + 32 / PAGE_SIZE], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 6144, (&V), 0, w3, 0, kv_head, smem_pages[pg_idx_1 + 8 + 48 / PAGE_SIZE], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 8192, (&V), 0, w4, 0, kv_head, smem_pages[pg_idx_1 + 8 + 64 / PAGE_SIZE], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 10240, (&V), 0, w5, 0, kv_head, smem_pages[pg_idx_1 + 8 + 80 / PAGE_SIZE], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 12288, (&V), 0, w6, 0, kv_head, smem_pages[pg_idx_1 + 8 + 96 / PAGE_SIZE], kv_full_addr + (load_kv_stage) * 8);
-                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 14336, (&V), 0, w7, 0, kv_head, smem_pages[pg_idx_1 + 8 + 112 / PAGE_SIZE], kv_full_addr + (load_kv_stage) * 8);
+                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384, (&V), 0, w0, 0, kv_head, smem_pages[pg_idx_1 + 8 + chunk_page0], kv_full_addr + (load_kv_stage) * 8);
+                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 2048, (&V), 0, w1, 0, kv_head, smem_pages[pg_idx_1 + 8 + chunk_page1], kv_full_addr + (load_kv_stage) * 8);
+                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 4096, (&V), 0, w2, 0, kv_head, smem_pages[pg_idx_1 + 8 + chunk_page2], kv_full_addr + (load_kv_stage) * 8);
+                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 6144, (&V), 0, w3, 0, kv_head, smem_pages[pg_idx_1 + 8 + chunk_page3], kv_full_addr + (load_kv_stage) * 8);
+                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 8192, (&V), 0, w4, 0, kv_head, smem_pages[pg_idx_1 + 8 + chunk_page4], kv_full_addr + (load_kv_stage) * 8);
+                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 10240, (&V), 0, w5, 0, kv_head, smem_pages[pg_idx_1 + 8 + chunk_page5], kv_full_addr + (load_kv_stage) * 8);
+                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 12288, (&V), 0, w6, 0, kv_head, smem_pages[pg_idx_1 + 8 + chunk_page6], kv_full_addr + (load_kv_stage) * 8);
+                        tma_5d_gmem2smem(smem_kv_addr + load_kv_stage * 16384 + 14336, (&V), 0, w7, 0, kv_head, smem_pages[pg_idx_1 + 8 + chunk_page7], kv_full_addr + (load_kv_stage) * 8);
                     }
                     load_kv_stage += 1;
-                    if (load_kv_stage == 4) { load_kv_stage = 0; _phase_kv_empty ^= 1; }
+                    if (load_kv_stage == 3) { load_kv_stage = 0; _phase_kv_empty ^= 1; }
                     if (elect_sync()) {
                         mbarrier_arrive(page_empty_addr + (load_po_stage) * 8);
                     }

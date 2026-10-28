@@ -62,7 +62,7 @@ SHAPE_ROWS = {
     ),
     "fp8_b256_q32_k1024": (
         "context_fp8", 256, 32, 1024, 32, 4, 64, True,
-        {"sm100a": "B256", "sm103a": "B256_KV4"},
+        {"sm100a": "B256", "sm103a": "B256_PX"},
     ),
     "nvfp4_b4_q511_k2047": (
         "context_nvfp4", 4, 511, 2047, 32, 4, 16, True,
@@ -72,32 +72,35 @@ SHAPE_ROWS = {
     # (the largest shipped pack dividing the JIT pack) and the page size.
     "fp8_b64_q32_k1024_g4": (
         "context_fp8", 64, 32, 1024, 32, 8, 64, True,
-        {"sm100a": "RUNTIME_PACK4_PAGE64", "sm103a": "RUNTIME_PACK4_PAGE64"},
+        {"sm100a": "RUNTIME_PACK4_PAGE64", "sm103a": "RUNTIME_PACK4_PAGE64_PX"},
     ),
     "fp8_b16_q32_k1024_g16_page16": (
         "context_fp8", 16, 32, 1024, 32, 2, 16, False,
-        {"sm100a": "RUNTIME_PACK8", "sm103a": "RUNTIME_PACK8"},
+        {"sm100a": "RUNTIME_PACK8", "sm103a": "RUNTIME_PACK8_PX"},
     ),
     "fp8_b2_q256_k2048_g3_page32": (
         "context_fp8", 2, 256, 2048, 30, 10, 32, True,
-        {"sm100a": "RUNTIME_PACK1", "sm103a": "RUNTIME_PACK1"},
+        {"sm100a": "RUNTIME_PACK1", "sm103a": "RUNTIME_PACK1_PX"},
     ),
     "fp8_b4_q128_k1024_g6_page16": (
         "context_fp8", 4, 128, 1024, 30, 5, 16, True,
-        {"sm100a": "RUNTIME_PACK2", "sm103a": "RUNTIME_PACK2"},
+        {"sm100a": "RUNTIME_PACK2", "sm103a": "RUNTIME_PACK2_PX"},
     ),
 }  # fmt: skip
 # The device-scale program of a host-scale one; a runtime-size program serves
 # both scale forms itself.
 _DEVICE_SCALE_PROGRAM = {
     "B256": "B256_SCALE_PTR",
-    "B256_KV4": "B256_SCALE_PTR_KV4",
+    "B256_PX": "B256_SCALE_PTR_PX",
     "Q511_SM100A": "Q511_SCALE_PTR_SM100A",
     "Q511_SM103A": "Q511_SCALE_PTR_SM103A",
 }
 # The exact FP8 program of a target (host scales): sm103a ships the 4-stage
-# K/V ring build.
-_FP8_EXACT = {"sm100a": "B256", "sm103a": "B256_KV4"}
+# K/V ring build with each stage's P tile in the other stage's S columns.
+_FP8_EXACT = {"sm100a": "B256", "sm103a": "B256_PX"}
+# The suffix of a target's runtime-size programs: sm103a ships the 4-stage
+# K/V ring builds with each stage's P tile in the other stage's S columns.
+_RUNTIME_SUFFIX = {"sm100a": "", "sm103a": "_PX"}
 # runtime-size program identifier -> its pack
 _RUNTIME_PACK = {
     identifier: pack
@@ -658,7 +661,8 @@ def test_cake_fmha_context_fp8_runtime_route(
     if serves:
         pack = cake_api._context_fp8_runtime_pack(pack_g)
         assert pack_g % pack == 0 and pack in (1, 2, 4, 8)
-        assert route.program == f"RUNTIME_PACK{pack}" and route.pack_g == pack
+        assert route.program == f"RUNTIME_PACK{pack}{_RUNTIME_SUFFIX[target]}"
+        assert route.pack_g == pack
     else:
         assert route.program is None and route.pack_g == pack_g
 
@@ -684,7 +688,9 @@ def test_cake_fmha_context_fp8_exact_routes_come_first(monkeypatch, target) -> N
         )
         route = cake_api.select_cake_fmha_context_route(torch.device("meta"), **kwargs)
         assert route is not None and route.device_scales is device_scales
-        assert route.program == f"RUNTIME_PACK{pack}_PAGE64", route
+        assert route.program == f"RUNTIME_PACK{pack}_PAGE64{_RUNTIME_SUFFIX[target]}", (
+            route
+        )
         assert route.num_m_blocks == -(-33 // (2 * (128 // pack)))
 
 
@@ -701,7 +707,7 @@ def test_cake_fmha_context_fp8_split_routes_mirror_the_runtime_routes() -> None:
     assert set(cake_api._CONTEXT_FP8_SPLIT_ROUTES) == set(runtime)
     for target, routes in runtime.items():
         assert cake_api._CONTEXT_FP8_SPLIT_ROUTES[target] == {
-            key: "RUNTIME_SK" + identifier.removeprefix("RUNTIME")
+            key: "RUNTIME_SK" + identifier.removeprefix("RUNTIME").removesuffix("_PX")
             for key, identifier in routes.items()
         }
     assert frozenset(_SPLIT_PACK) == cake_api._CONTEXT_FP8_SPLIT_PROGRAMS
@@ -1070,7 +1076,9 @@ def test_cake_fmha_context_fp8_split_route_without_a_runtime_pack_plan(
             {key: name for key, name in routes.items() if key[0] != pack},
         )
     route = cake_api.select_cake_fmha_context_route(meta, **kwargs)
-    assert route.program == (_FP8_EXACT[target] if page == 64 else "RUNTIME_PACK8")
+    assert route.program == (
+        _FP8_EXACT[target] if page == 64 else f"RUNTIME_PACK8{_RUNTIME_SUFFIX[target]}"
+    )
     assert (route.pack_g, route.num_m_blocks) == (8, 1)
 
 
@@ -1878,7 +1886,7 @@ def test_cake_context_quantized_programs_match_reference(
     if program == "RUNTIME_PACK":
         # 16-token pages: no exact route; a runtime-size program of any page
         assert served_programs and all(
-            served in _RUNTIME_PACK and not served.endswith("_PAGE64")
+            served in _RUNTIME_PACK and "_PAGE64" not in served
             for served in served_programs
         ), served_programs
         return

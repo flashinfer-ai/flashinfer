@@ -313,8 +313,8 @@ _CONTEXT_PROGRAM_ROUTES: dict[
         ("context_bf16", "host", 32, 4, 8, 2, 16, None): "B128",
         ("context_bf16", "host", 10, 2, 5, 11, 32, "q511"): "Q511_SM103A",
         ("context_bf16", "host", 10, 2, 5, 6, 1024, "q257"): "Q257_SM103A",
-        ("context_fp8", "host", 32, 4, 8, 1, 64, None): "B256_KV4",
-        ("context_fp8", "device", 32, 4, 8, 1, 64, None): "B256_SCALE_PTR_KV4",
+        ("context_fp8", "host", 32, 4, 8, 1, 64, None): "B256_PX",
+        ("context_fp8", "device", 32, 4, 8, 1, 64, None): "B256_SCALE_PTR_PX",
         ("context_nvfp4", "host", 32, 4, 8, 16, 16, None): "Q511_SM103A",
         ("context_nvfp4", "device", 32, 4, 8, 16, 16, None): "Q511_SCALE_PTR_SM103A",
     },
@@ -350,19 +350,19 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
         6,
         True,
     ),
-    ("context_fp8", "B256"): ("cake_fmha_context_fp8_f57014e4e03dcbce72d8", 1, False),
+    ("context_fp8", "B256"): ("cake_fmha_context_fp8_d910d4336baa2166efb0", 1, False),
     ("context_fp8", "B256_SCALE_PTR"): (
-        "cake_fmha_context_fp8_45b03632970269bac548",
+        "cake_fmha_context_fp8_7e4d0a44e40dc1f1247c",
         1,
         False,
     ),
-    ("context_fp8", "B256_KV4"): (
-        "cake_fmha_context_fp8_64a9d449f206e9476fd4",
+    ("context_fp8", "B256_PX"): (
+        "cake_fmha_context_fp8_4782f3647c66d51d7afd",
         1,
         False,
     ),
-    ("context_fp8", "B256_SCALE_PTR_KV4"): (
-        "cake_fmha_context_fp8_7bc99d2dda53eeaad98b",
+    ("context_fp8", "B256_SCALE_PTR_PX"): (
+        "cake_fmha_context_fp8_a2998bcf7a6a1882f77e",
         1,
         False,
     ),
@@ -388,42 +388,84 @@ _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
     ),
     # The FP8 runtime-size programs: the m-block count is a launch argument.
     ("context_fp8", "RUNTIME_PACK8"): (
-        "cake_fmha_context_fp8_3fd021cb557d23a90ca8",
+        "cake_fmha_context_fp8_809f7648ae1ba0d4cb90",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK4"): (
-        "cake_fmha_context_fp8_be3f7f385a3af5fe43b8",
+        "cake_fmha_context_fp8_89f2802d8725cab82cf4",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK2"): (
-        "cake_fmha_context_fp8_caade70bb69e18537405",
+        "cake_fmha_context_fp8_264e3da0b4929630f571",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK1"): (
-        "cake_fmha_context_fp8_ce1b2c2352f741d468e8",
+        "cake_fmha_context_fp8_0309871edc2d4619b6cf",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK8_PAGE64"): (
-        "cake_fmha_context_fp8_1930bf723069ae9f5446",
+        "cake_fmha_context_fp8_91daae9aea6f16cda8d5",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK4_PAGE64"): (
-        "cake_fmha_context_fp8_91a83484d11d796aaf30",
+        "cake_fmha_context_fp8_b96d739e01c1d4a734e0",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK2_PAGE64"): (
-        "cake_fmha_context_fp8_d427125833943a3251b5",
+        "cake_fmha_context_fp8_0a3559fc0ccfd7267bae",
         None,
         False,
     ),
     ("context_fp8", "RUNTIME_PACK1_PAGE64"): (
-        "cake_fmha_context_fp8_34939d99183a1a6e0baa",
+        "cake_fmha_context_fp8_a6afa5117f7829d05480",
+        None,
+        False,
+    ),
+    # The sm103a runtime-size programs: the same schedules with a 4-stage
+    # K/V ring and each stage's P tile in the other stage's S columns.
+    ("context_fp8", "RUNTIME_PACK8_PX"): (
+        "cake_fmha_context_fp8_381e248f81da35ee587d",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_PX"): (
+        "cake_fmha_context_fp8_956feb628cf9665f5a58",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_PX"): (
+        "cake_fmha_context_fp8_08fd0d337028b2729d39",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1_PX"): (
+        "cake_fmha_context_fp8_c11f7145bce6e53f6010",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK8_PAGE64_PX"): (
+        "cake_fmha_context_fp8_b46d73f530910e92964f",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK4_PAGE64_PX"): (
+        "cake_fmha_context_fp8_399a59e37ae3a18661ad",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK2_PAGE64_PX"): (
+        "cake_fmha_context_fp8_976d72f1eb0bab9cc58a",
+        None,
+        False,
+    ),
+    ("context_fp8", "RUNTIME_PACK1_PAGE64_PX"): (
+        "cake_fmha_context_fp8_d0cac43fda05c9893f79",
         None,
         False,
     ),
@@ -490,14 +532,14 @@ _CONTEXT_FP8_RUNTIME_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
         (1, None): "RUNTIME_PACK1",
     },
     "sm103a": {
-        (8, 64): "RUNTIME_PACK8_PAGE64",
-        (4, 64): "RUNTIME_PACK4_PAGE64",
-        (2, 64): "RUNTIME_PACK2_PAGE64",
-        (1, 64): "RUNTIME_PACK1_PAGE64",
-        (8, None): "RUNTIME_PACK8",
-        (4, None): "RUNTIME_PACK4",
-        (2, None): "RUNTIME_PACK2",
-        (1, None): "RUNTIME_PACK1",
+        (8, 64): "RUNTIME_PACK8_PAGE64_PX",
+        (4, 64): "RUNTIME_PACK4_PAGE64_PX",
+        (2, 64): "RUNTIME_PACK2_PAGE64_PX",
+        (1, 64): "RUNTIME_PACK1_PAGE64_PX",
+        (8, None): "RUNTIME_PACK8_PX",
+        (4, None): "RUNTIME_PACK4_PX",
+        (2, None): "RUNTIME_PACK2_PX",
+        (1, None): "RUNTIME_PACK1_PX",
     },
 }
 # The packs the runtime programs ship besides 1: a pack serves every GQA group
@@ -507,13 +549,15 @@ _CONTEXT_FP8_RUNTIME_PACKS = (8, 4, 2)
 # with the key range of the first ``split_tiles`` tiles split over work units
 # of ``split_blocks`` KV blocks (at most ``num_splits`` per tile), whose FP32
 # partials the tile's last unit merges.  Per target, ``(pack_g, page_size)``
-# names the program as for the runtime-size programs.  The host routes an FP8
+# names the program as for the runtime-size programs (the sm103a split-KV
+# programs are those of the sm100a runtime-size builds).  The host routes an FP8
 # call to one only where its split plan
 # (:func:`_context_fp8_split_plan`) predicts a gain over the whole-tile
 # program; other calls keep their route.
 _CONTEXT_FP8_SPLIT_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
     target: {
-        key: "RUNTIME_SK" + name.removeprefix("RUNTIME") for key, name in routes.items()
+        key: "RUNTIME_SK" + name.removeprefix("RUNTIME").removesuffix("_PX")
+        for key, name in routes.items()
     }
     for target, routes in _CONTEXT_FP8_RUNTIME_ROUTES.items()
 }

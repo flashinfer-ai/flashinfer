@@ -2972,7 +2972,7 @@ def test_cake_fmha_context_route_is_optimized_only_on_exact_bf16_domain(
         is_causal=True,
         return_lse=False,
         enable_sink=False,
-        program="B256_KV4",
+        program="B256_PX",
     )
     assert cake_api.select_cake_fmha_context_route(
         fp8_query.device,
@@ -2998,7 +2998,7 @@ def test_cake_fmha_context_route_is_optimized_only_on_exact_bf16_domain(
         is_causal=True,
         lse=None,
     ) == dataclasses.replace(
-        fp8_route, device_scales=True, program="B256_SCALE_PTR_KV4"
+        fp8_route, device_scales=True, program="B256_SCALE_PTR_PX"
     )
     assert cake_api.cake_fmha_route_is_optimized(fp8_route)
 
