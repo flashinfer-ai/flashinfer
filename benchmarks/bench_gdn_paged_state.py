@@ -49,8 +49,10 @@ compares:
   the selected ones.
 - no-ckpt: no checkpoints.
 
-Decode compares ``gated_delta_rule_decode_paged`` with
-``gated_delta_rule_decode_pretranspose`` given precomputed read/write rows.
+Decode compares ``gated_delta_rule_decode_paged``, given the rows of
+``gdn_paged_decode_slots`` (computed once per step and shared by all layers;
+"slots ms" is that one-time cost), with ``gated_delta_rule_decode_pretranspose``
+given the same read/write rows built by the caller.
 
 All prefill arms run the non-context-parallel kernels (``use_cp=False``).
 
@@ -76,6 +78,7 @@ from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
 from flashinfer.gdn_paged import (
     chunk_gated_delta_rule_paged,
     gated_delta_rule_decode_paged,
+    gdn_paged_decode_slots,
     gdn_paged_prefill_slots,
 )
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
@@ -417,6 +420,11 @@ def bench_decode(heads, state_dtype, batches):
         read = torch.where(last > 1, write, indices[0::2]).contiguous()
         out = torch.empty(b, 1, hv, D, dtype=torch.bfloat16, device="cuda")
 
+        def slots_fn():
+            return gdn_paged_decode_slots(indices, indptr, last)
+
+        slots = slots_fn()
+
         def paged():
             gated_delta_rule_decode_paged(
                 q,
@@ -431,6 +439,7 @@ def bench_decode(heads, state_dtype, batches):
                 page_indices=indices,
                 page_indptr=indptr,
                 last_page_len=last,
+                slots=slots,
             )
 
         def explicit_rows():
@@ -449,7 +458,9 @@ def bench_decode(heads, state_dtype, batches):
                 output_state_indices=write,
             )
 
-        rows.append((b, _median_ms(paged), _median_ms(explicit_rows)))
+        rows.append(
+            (b, _median_ms(slots_fn), _median_ms(paged), _median_ms(explicit_rows))
+        )
     return rows
 
 
@@ -500,10 +511,12 @@ def main():
         )
     if args.decode_batches:
         hq, hk, hv = args.heads
-        print("\n| decode batch | paged ms | explicit rows ms | ratio |")
-        print("|---:|---:|---:|---:|")
-        for b, tp, te in bench_decode((hq, hk, hv), state_dtype, args.decode_batches):
-            print(f"| {b} | {tp:.4f} | {te:.4f} | {te / tp:.3f} |")
+        print("\n| decode batch | slots ms | paged ms | explicit rows ms | ratio |")
+        print("|---:|---:|---:|---:|---:|")
+        for b, ts, tp, te in bench_decode(
+            (hq, hk, hv), state_dtype, args.decode_batches
+        ):
+            print(f"| {b} | {ts:.4f} | {tp:.4f} | {te:.4f} | {te / tp:.3f} |")
 
 
 if __name__ == "__main__":
