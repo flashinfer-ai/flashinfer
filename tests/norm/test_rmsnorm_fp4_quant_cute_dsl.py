@@ -202,6 +202,43 @@ blackwell_required = pytest.mark.skipif(
 class TestRMSNormFP4QuantCuteDSL:
     """Tests for CuTe-DSL RMSNorm + FP4 Quantization."""
 
+    def test_nvfp4_bf16_packed_values_avoid_product_rounding(self):
+        """Check signed FP4 bytes across value boundaries with unchanged E4M3 scales."""
+        from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant
+
+        x = torch.full((1, 64), 129 / 128, device="cuda", dtype=torch.bfloat16)
+        weight = torch.full((64,), 0.75, device="cuda", dtype=torch.bfloat16)
+        weight[1::2] = -0.75
+        weight[::16] = 6.0
+        weight[16::32] = -6.0
+        eps = 1e-4
+        global_scale = torch.ones(1, device=x.device, dtype=torch.float32)
+        rstd = torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + eps)
+        reference = x.float() * rstd * weight.float()
+        rounded_product = (x * weight).float() * rstd
+        assert reference[0, 2] < 0.75 < rounded_product[0, 2]
+        assert rounded_product[0, 1] < -0.75 < reference[0, 1]
+
+        reference_values, reference_scales = ref_fp4_quant(reference, global_scale, 16)
+        _, rounded_scales = ref_fp4_quant(rounded_product, global_scale, 16)
+        assert torch.all(reference_scales == 1.0)
+        torch.testing.assert_close(rounded_scales, reference_scales, rtol=0, atol=0)
+        levels = torch.tensor(E2M1_TO_FLOAT32[:8], device=x.device)
+        codes = torch.searchsorted(levels, reference_values.abs()).to(torch.uint8)
+        codes |= torch.signbit(reference_values).to(torch.uint8) << 3
+        expected_bytes = codes[:, 0::2] | (codes[:, 1::2] << 4)
+
+        actual_fp4, actual_scales = rmsnorm_fp4quant(
+            x, weight, global_scale=global_scale, eps=eps, block_size=16
+        )
+        assert actual_scales.dtype == torch.float8_e4m3fn
+        torch.testing.assert_close(
+            actual_scales.float(), reference_scales, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            actual_fp4.view(torch.uint8), expected_bytes, rtol=0, atol=0
+        )
+
     def test_nvfp4_bf16_scale_reduction_avoids_product_rounding(self):
         """Keep a BF16 product-rounding error from crossing an E4M3 midpoint."""
         from flashinfer.cute_dsl.rmsnorm_fp4quant import rmsnorm_fp4quant
