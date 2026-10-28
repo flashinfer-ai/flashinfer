@@ -256,8 +256,8 @@ def main():
 
     device = torch.device("cuda")
     major, minor = get_compute_capability(device)
-    if major < 9:
-        print(f"GDN requires SM90+, got SM{major}{minor}")
+    if major < 8:
+        print(f"GDN requires SM80+, got SM{major}{minor}")
         sys.exit(1)
 
     arch_label = {9: "Hopper (SM90)", 10: "Blackwell (SM100)"}.get(

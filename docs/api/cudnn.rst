@@ -31,7 +31,7 @@ takes cuDNN only with a caller-owned ``block_tables`` (the auto-built table cann
 grow once captured), and the resolution is frozen after the first plan. The
 performance-driven choice also requires that the frontend's FROST engines can run
 on the install: its own CuTe-DSL check (``nvidia-cutlass-dsl`` 4.7.0 or newer,
-above the 4.6.2 the packages' dependency metadata admit) must pass, otherwise the
+satisfied by FlashInfer's package minimum of 4.8.0) must pass, otherwise the
 backend engine would serve the graph and fa2 is kept. Callers passing
 ``fixed_split_size`` or ``disable_split_kv`` (fa2's batch-invariance controls)
 keep fa2 wherever fa2 can serve the rows. A CUDA-graph wrapper also tells
@@ -73,14 +73,41 @@ head dimensions, dtypes, tensor strides, attention scale, mask and requested
 Stats layout remain part of the graph signature; they are not padded into a
 larger head-count class.
 
-On SM100, BF16 expanded MLA (D192/V128, equal Q/KV heads) with cuDNN Frontend
-1.31 or newer and its matching native extension uses bounded batch/Q/KV
-classes for short-Q, long-KV prefixes.
+On SM100/SM107, qualified BF16 expanded MLA (D192/V128, equal Q/KV heads)
+and FP16/BF16 D128/V128 ragged prefill with cuDNN Frontend 1.31 or newer and its matching
+native extension use bounded batch/Q/KV classes for short-Q, long-KV prefixes.
+The qualified range is B1–4, 4–64 query heads, Q2–1024, and KV2K–32K with
+KV at least four times Q; D128 supports integral GQA groups 1/2/4/8/16.
+Q2–128 share the Q128 class, while Q=1 keeps the separate decode class.
 Batch and lengths round up to powers of two within the qualified range;
 Q129 and Q241 can share the same Q256 graph. The graph also receives a packed
 Q capacity, allowing either cuDNN provider to reserve workspace and choose
 parallelism from useful bounds. A bounded declaration does not force an engine
-or split count. Other inputs retain their existing cache policy.
+or split count. In CUDA Graph mode, the wrapper's initialized total-query
+capacity also bounds packed workspace and is part of the graph cache key.
+Replanning fewer live tokens preserves that lifetime capacity, so older captures
+remain valid. No device length read or extra preparation is added to ``run()``.
+Wrappers without an initialized lifetime capacity retain the batch/Q envelope.
+Other inputs retain their existing cache policy.
+
+Paged ``backend="auto"`` additionally considers cuDNN on SM100 for causal
+BF16 HND D128/V128 prefixes with page size 16, B1–4, 8–64 query heads,
+GQA1/2/4/8/16, Q64–1024, and KV2K–32K at least four times Q. Small workloads
+with ``total_query_tokens * Hq * max_KV < 8 * 1024 * 1024`` retain FA2 to
+avoid paged setup and split/combine overhead. This admission
+requires stable cuDNN Frontend 1.32 or newer, its matching native paged
+capability, a compatible FROST runtime, and cuDNN 9.27 or newer. Older stacks
+and unsupported attention options retain their existing auto route.
+The wrapper reuses bounded plans and refreshes metadata in ``plan()``;
+first use of a new bucket still requires prewarming. GPU replay gains do not
+imply lower eager submission cost or higher serving throughput.
+
+For FP16/BF16 cuDNN prefill, runtime ``q_scale`` and ``k_scale`` multiply the
+attention score scale, and ``v_scale`` multiplies the output without changing
+LSE. Python scalars are fixed within a capture; scalar float32 CUDA tensors
+are read again on replay. Tensor Q/K scales use cuDNN's tensor attention-scale
+contract, so the frontend may choose a different engine than for a constant
+scale. Calls without calibration scales retain the prepared execution path.
 
 A new graph signature can require graph construction and kernel compilation.
 Warm the signatures needed by the serving schedule **before** CUDA Graph

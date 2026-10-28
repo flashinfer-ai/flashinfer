@@ -2,6 +2,8 @@
 
 Launched via torchrun:
     torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_communication_multirank.py -v
+or via an MPI launcher, including across nodes:
+    mpirun -np 8 pytest tests/moe_ep/test_moe_ep_communication_multirank.py -v
 
 Each rank applies a synthetic expert computation to the rows it receives: a
 token routed to expert ``e`` with weight ``w`` contributes ``w * (e + 1) * x``.
@@ -12,13 +14,18 @@ cross-rank reduction together.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 from datetime import timedelta
 
 import pytest
 
+from ._mpi_launch import adopt_mpi_launch
+
 _PG_TIMEOUT = timedelta(minutes=60)
 _BACKENDS = ["nvlink_one_sided", "cake", "nvlink_two_sided"]
+# At import, so that collection's multi-rank checks see WORLD_SIZE.
+adopt_mpi_launch()
 
 
 def _init_dist():
@@ -112,7 +119,7 @@ def test_dispatch_combine_matches_local_reference(backend, top_k):
     try:
         for _ in range(2):  # the second round reuses the workspace
             received = comm.dispatch(
-                x, topk_ids, topk_weights, max_tokens_per_rank=int(step_max)
+                x, topk_ids, topk_weights, runtime_max_tokens_per_rank=int(step_max)
             )
             rows = comm.ep_size * received.tokens_per_rank
             assert received.hidden_states.shape == (rows, hidden)
@@ -265,6 +272,11 @@ def test_split_layer_cuda_graph_replays_new_inputs(backend):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             out = layer.forward(t, graph_state=state)
+        with pytest.raises(ValueError, match="runtime_max_tokens_per_rank"):
+            layer.forward(
+                dataclasses.replace(t, runtime_max_tokens_per_rank=num_tokens),
+                graph_state=state,
+            )
         for _ in range(3):
             load_next_step()
             graph.replay()
@@ -274,6 +286,204 @@ def test_split_layer_cuda_graph_replays_new_inputs(backend):
                 _identity_round_trip_reference(
                     t.hidden_states, t.topk_ids, world_size, 4
                 ),
+            )
+    finally:
+        torch.cuda.synchronize()
+        dist.barrier()
+        layer.destroy()
+
+
+def _fused_moe_split_config(comm, quant_pair, *, rank, world_size, num_experts):
+    from flashinfer.fused_moe.api import (
+        BackendOptions,
+        CuteDslConfig,
+        ExecutionConfig,
+        ExpertConfig,
+        MoEConfig,
+        QuantConfig,
+        QuantFormat,
+        RoutingConfig,
+        TrtllmFp4Config,
+    )
+    from flashinfer.moe_ep import FusedMoeKernelConfig, SplitConfig
+
+    weight, activation = (QuantFormat[name] for name in quant_pair)
+    local_num_experts = num_experts // world_size
+    candidate = TrtllmFp4Config() if weight is QuantFormat.NVFP4 else CuteDslConfig()
+    moe_config = MoEConfig(
+        routing=RoutingConfig(num_experts=num_experts, top_k=2),
+        quant=QuantConfig(weight=weight, activation=activation),
+        experts=ExpertConfig(
+            intermediate_size=512,
+            local_expert_offset=rank * local_num_experts,
+            local_num_experts=local_num_experts,
+        ),
+        backend=BackendOptions(candidates=(candidate,)),
+        execution=ExecutionConfig(tune_max_num_tokens=16 * world_size),
+    )
+    return SplitConfig(comm=comm, kernel=FusedMoeKernelConfig(moe_config=moe_config))
+
+
+@pytest.mark.gpu_2
+@pytest.mark.parametrize("quant_pair", [("NVFP4", "NVFP4"), ("MXFP4", "MXFP8")])
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_split_layer_quantizes_tokens_before_dispatch(backend, quant_pair):
+    """Quantized activations travel over the wire and match receiver-side
+    quantization.
+
+    NVFP4 and MXFP8 quantize each token row on its own, so a layer that
+    quantizes before dispatch must produce the output of one that dispatches
+    BF16 rows and quantizes them on the receiving rank.
+    """
+    import torch
+    import torch.distributed as dist
+
+    from flashinfer.fused_moe.api import QuantFormat
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        EpAlgorithm,
+        EpLayout,
+        FleetParams,
+        MoEEpLayer,
+        MoEEpTensors,
+        MoEWeightPack,
+    )
+
+    rank, world_size = _init_dist()
+    _backend_config(backend)
+    num_tokens, hidden, intermediate = 16, 1024, 512
+    num_experts = 4 * world_size
+    generator = torch.Generator().manual_seed(23 + rank)
+    x = torch.randn(num_tokens, hidden, generator=generator).to("cuda", torch.bfloat16)
+    topk_ids, topk_weights = _random_routing(num_tokens, num_experts, 2, generator)
+    t = MoEEpTensors(
+        hidden_states=x, topk_ids=topk_ids.long(), topk_weights=topk_weights
+    )
+    weight_generator = torch.Generator().manual_seed(1000 + rank)
+    w13 = torch.randn(4, 2 * intermediate, hidden, generator=weight_generator) * 0.05
+    w2 = torch.randn(4, hidden, intermediate, generator=weight_generator) * 0.05
+
+    def build_layer():
+        return MoEEpLayer(
+            BootstrapConfig(world_size=world_size, rank=rank),
+            FleetParams(
+                num_experts=num_experts,
+                max_tokens_per_rank=num_tokens,
+                token_hidden_size=hidden,
+                algorithm=EpAlgorithm.LOW_LATENCY,
+                layout=EpLayout.RANK_MAJOR,
+            ),
+            MoEWeightPack(
+                w13=w13.to("cuda", torch.bfloat16), w2=w2.to("cuda", torch.bfloat16)
+            ),
+            backend=_fused_moe_split_config(
+                _backend_config(backend),
+                quant_pair,
+                rank=rank,
+                world_size=world_size,
+                num_experts=num_experts,
+            ),
+        )
+
+    quantized = build_layer()
+    unquantized = build_layer()
+    # Dispatch BF16 rows, so the receiving rank quantizes them.
+    unquantized._kernel.dispatch_format = lambda: None
+    try:
+        out = quantized(t)
+        expected = unquantized(t)
+        assert (
+            quantized._communication.params.dispatch_format
+            is QuantFormat[quant_pair[1]]
+        )
+        assert unquantized._communication.params.dispatch_format is None
+        torch.testing.assert_close(out, expected, atol=0, rtol=0)
+    finally:
+        torch.cuda.synchronize()
+        dist.barrier()
+        quantized.destroy()
+        unquantized.destroy()
+
+
+@pytest.mark.gpu_2
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_split_layer_dispatches_runtime_max_tokens_per_rank(backend):
+    """MoEEpTensors.runtime_max_tokens_per_rank sizes the layer's dispatch.
+
+    Ranks hold different token counts below the capacity; the dispatch
+    reserves only the busiest rank's count per source rank and the round
+    trip stays exact.
+    """
+    import torch
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        EpAlgorithm,
+        EpLayout,
+        FleetParams,
+        IdentityConfig,
+        MoEEpConfigError,
+        MoEEpLayer,
+        MoEEpTensors,
+        SplitConfig,
+        dummy_moe_weights,
+    )
+
+    rank, world_size = _init_dist()
+    config = _backend_config(backend)
+    capacity, hidden, top_k = 32, 1024, 2
+    num_experts = 4 * world_size
+    counts = [3 + 2 * r for r in range(world_size)]
+    runtime_max = max(counts)
+    num_tokens = counts[rank]
+    generator = torch.Generator().manual_seed(21 + rank)
+    x = torch.randn(num_tokens, hidden, generator=generator).to("cuda", torch.bfloat16)
+    topk_ids, topk_weights = _random_routing(num_tokens, num_experts, top_k, generator)
+
+    layer = MoEEpLayer(
+        BootstrapConfig(world_size=world_size, rank=rank),
+        FleetParams(
+            num_experts=num_experts,
+            max_tokens_per_rank=capacity,
+            token_hidden_size=hidden,
+            algorithm=EpAlgorithm.LOW_LATENCY,
+            layout=EpLayout.RANK_MAJOR,
+        ),
+        dummy_moe_weights(num_local_experts=4, hidden=hidden),
+        backend=SplitConfig(comm=config, kernel=IdentityConfig()),
+    )
+    try:
+        comm = layer._ensure_communication(top_k)
+        dispatch = comm.dispatch
+        tokens_per_rank = []
+
+        def recording_dispatch(*args, **kwargs):
+            result = dispatch(*args, **kwargs)
+            tokens_per_rank.append(result.tokens_per_rank)
+            return result
+
+        comm.dispatch = recording_dispatch
+        out = layer(
+            MoEEpTensors(
+                hidden_states=x,
+                topk_ids=topk_ids.long(),
+                topk_weights=topk_weights,
+                runtime_max_tokens_per_rank=runtime_max,
+            )
+        )
+        assert tokens_per_rank == [runtime_max]
+        torch.testing.assert_close(
+            out.float(), _identity_round_trip_reference(x, topk_ids, world_size, 4)
+        )
+        with pytest.raises(MoEEpConfigError, match="runtime_max_tokens_per_rank"):
+            layer(
+                MoEEpTensors(
+                    hidden_states=x,
+                    topk_ids=topk_ids.long(),
+                    topk_weights=topk_weights,
+                    runtime_max_tokens_per_rank=num_tokens - 1,
+                )
             )
     finally:
         torch.cuda.synchronize()
@@ -325,7 +535,7 @@ def test_nvlink_one_sided_low_precision_eplb_and_rank_mask():
             x,
             topk_ids,
             topk_weights,
-            max_tokens_per_rank=int(step_max),
+            runtime_max_tokens_per_rank=int(step_max),
             eplb_local_stats=stats_base + 1000 * rank,
             active_rank_mask=mask,
         )
@@ -439,7 +649,7 @@ def test_checkpoint_restore_keeps_captured_graph_valid(backend):
         replay_and_check(graph, out)
 
         memory = comm._state["mnnvl_mem"]
-        cft_enabled = getattr(comm, "cft_enabled", None)
+        cft_enabled = getattr(comm, "_cft_enabled", None)
         comm.checkpoint_prepare()
         comm.checkpoint_prepare()
         assert not MnnvlMemory.allocated_map[memory.ptr].mapped
@@ -448,7 +658,7 @@ def test_checkpoint_restore_keeps_captured_graph_valid(backend):
         comm.checkpoint_restore(fresh_backend)
         assert MnnvlMemory.allocated_map[memory.ptr].mapped
         if backend == "nvlink_one_sided":
-            assert comm.cft_enabled == cft_enabled
+            assert comm._cft_enabled == cft_enabled
 
         for _ in range(2):
             replay_and_check(graph, out)

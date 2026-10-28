@@ -26,6 +26,7 @@ State layout: ``[N, H, V, K]``.
 """
 
 import functools
+import os
 from typing import Optional
 
 import torch
@@ -39,6 +40,7 @@ from flashinfer.cute_dsl.utils import get_num_sm
 
 from ..device_target import gdn_compile_options, gdn_device_target, target_arch
 from .gated_delta_net_chunked import GatedDeltaNetChunkedKernel
+from .gated_delta_net_chunked_sm107 import RubinGatedDeltaNetChunkedKernel
 from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from ..cute_dsl_cache_naming import make_kernel_name
 
@@ -55,16 +57,36 @@ _CUTE_DSL_MODULE = "gdn_blackwell_prefill"
 
 def _kernel_source_files() -> tuple:
     """Source files whose content invalidates the on-disk kernel cache."""
-    from . import gated_delta_net_chunked, gated_delta_net_tile_scheduler
+    from . import (
+        gated_delta_net_chunked,
+        gated_delta_net_chunked_sm107,
+        gated_delta_net_tile_scheduler,
+    )
 
     return (
         __file__,
         gated_delta_net_chunked.__file__,
+        gated_delta_net_chunked_sm107.__file__,
         gated_delta_net_tile_scheduler.__file__,
     )
 
 
+def _prefill_kernel_variant(major: int, minor: int) -> str:
+    """``"sm107"`` on Rubin unless FLASHINFER_GDN_SM107_PREFILL_KERNEL=sm100."""
+    if (major, minor) == (10, 7):
+        forced = os.environ.get("FLASHINFER_GDN_SM107_PREFILL_KERNEL", "sm107")
+        return "sm100" if forced == "sm100" else "sm107"
+    return "sm100"
+
+
+_PREFILL_KERNEL_CLASSES = {
+    "sm100": GatedDeltaNetChunkedKernel,
+    "sm107": RubinGatedDeltaNetChunkedKernel,
+}
+
+
 def _prefill_kernel_name(
+    kernel_variant: str,
     target_key: tuple,
     num_sm: int,
     io_dtype_str: str,
@@ -81,6 +103,7 @@ def _prefill_kernel_name(
     cu_checkpoints_dtype_str: str,
     initial_state_inner_strides,
     output_state_inner_strides,
+    state_stride_divisibility: int,
 ) -> str:
     """Specialization name within the gdn_blackwell_prefill module.
 
@@ -88,7 +111,8 @@ def _prefill_kernel_name(
     which the compile below bakes in as ``max_active_clusters``.
     """
     return make_kernel_name(
-        target_arch(target_key),
+        target_arch(target_key)
+        + ("" if kernel_variant == "sm100" else f"_{kernel_variant}"),
         num_sm,
         io_dtype_str,
         state_dtype_str,
@@ -104,11 +128,13 @@ def _prefill_kernel_name(
         cu_checkpoints_dtype_str,
         initial_state_inner_strides,
         output_state_inner_strides,
+        state_stride_divisibility,
     )
 
 
 @functools.cache
 def _get_compiled_cache(
+    kernel_variant: str,
     target_key: tuple,
     num_sm: int,
     io_dtype_str: str,
@@ -125,6 +151,7 @@ def _get_compiled_cache(
     cu_checkpoints_dtype_str: str,
     initial_state_inner_strides: tuple[int, ...] | None,
     output_state_inner_strides: tuple[int, ...] | None,
+    state_stride_divisibility: int,
 ):
     """Return a mutable dict that lazily stores the compiled kernel.
 
@@ -165,6 +192,21 @@ def _cutlass_state_dtype(torch_dtype: torch.dtype):
         )
 
 
+def _state_stride_divisibility(states, max_divisibility: int) -> int:
+    """Largest power of two <= ``max_divisibility`` dividing all slot/head/V strides."""
+    divisibility = max_divisibility
+    for state in states:
+        if state is None:
+            continue
+        strides = state.stride()
+        if strides[3] != 1:
+            return 1
+        for stride in strides[:3]:
+            while divisibility > 1 and stride % divisibility:
+                divisibility //= 2
+    return divisibility
+
+
 def _mark_state_layout(s_cute, use_state_indices: bool, DK: int) -> None:
     """Mark the recurrent-state tensor layout for compilation.
 
@@ -173,21 +215,10 @@ def _mark_state_layout(s_cute, use_state_indices: bool, DK: int) -> None:
     makes the layout dynamic (stride-1 K dim auto-deduced) and attaches a
     ``divisibility=DK`` hint on the K dim for wider vectorized state copies.
 
-    Pool/indexed mode (``use_state_indices=True``): the caller passes its real
-    SSM state pool ``[N_pool, H, V, K]`` whose dim-0 (slot) stride is padded by
-    the mamba conv+ssm cache packing, i.e. ``stride[0] > H*V*K`` -> the layout is
-    NON-COMPACT. ``mark_compact_shape_dynamic`` asserts a compact layout and
-    raises ``RuntimeError: The stride_order is not consistent with the layout``.
-    ``mark_layout_dynamic()`` alone pins the single stride-1 dim (mode 3 = K) to
-    stride 1 and carries every other stride (including the padded dim-0) through
-    as a dynamic runtime value. The kernel addresses the state purely via
-    ``s.stride[...]`` (reshape at ~475-497 and ``mS_init/mS_out[..., state_row]``),
-    so a padded dim-0 stride is handled correctly. cutlass-dsl offers no way to
-    attach a divisibility hint without also requiring compactness, so this path
-    drops the ``divisibility=DK`` hint; the stride-1 K dim is retained, so the
-    128x128 state autovec copy still vectorizes (possibly a narrower vector).
-    That copy is a negligible fraction of the kernel, so correctness is kept
-    with no meaningful perf cost.
+    Pool/indexed mode (``use_state_indices=True``): the caller passes its SSM
+    state pool ``[N_pool, H, V, K]``, whose slot stride may be padded, so only
+    ``mark_layout_dynamic()`` applies. It carries no stride alignment; the
+    kernel restores it from ``state_stride_divisibility`` via ``cute.assume``.
     """
     if use_state_indices:
         s_cute.mark_layout_dynamic()
@@ -260,11 +291,19 @@ def chunk_gated_delta_rule_sm100(
     _output_state = output_state if store_final_state else None
     use_state_indices = state_indices is not None
     _state_indices = state_indices if use_state_indices else None
+    state_stride_divisibility = (
+        _state_stride_divisibility((_initial_state, _output_state), DK)
+        if use_state_indices
+        else 1
+    )
 
     # num_sm is baked in as max_active_clusters, so it belongs to the key.
     target = gdn_device_target(q.device)
     num_sm = get_num_sm(q.device)
+    kernel_variant = _prefill_kernel_variant(target.major, target.minor)
+    kernel_cls = _PREFILL_KERNEL_CLASSES[kernel_variant]
     cache_key = (
+        kernel_variant,
         target.compile_key,
         num_sm,
         str(q.dtype),
@@ -289,6 +328,7 @@ def chunk_gated_delta_rule_sm100(
             if use_state_indices and output_state is not None
             else None
         ),
+        state_stride_divisibility,
     )
     cache = _get_compiled_cache(*cache_key)
 
@@ -296,7 +336,7 @@ def chunk_gated_delta_rule_sm100(
         # --- First call: compile the kernel ---
         max_active_clusters = num_sm
 
-        gdn = GatedDeltaNetChunkedKernel(
+        gdn = kernel_cls(
             io_dtype=io_dtype,
             # The kernel requires the triangular-inverse dtype to match io_dtype
             # (asserted in its __init__); pass io_dtype so bf16 uses the same
@@ -315,6 +355,7 @@ def chunk_gated_delta_rule_sm100(
             store_final_state=store_final_state,
             enable_checkpoints=enable_checkpoints,
             is_persistent=True,
+            state_stride_divisibility=state_stride_divisibility,
         )
 
         # Convert PyTorch tensors to CuTe tensors for compilation.

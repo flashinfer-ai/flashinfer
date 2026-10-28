@@ -198,6 +198,12 @@ kernel_cake_deepgemm_mixed_gemm_883f34018b1552e06e4b(const __grid_constant__ CUt
                     if (stage == 7) { stage = 0; _phase_empty ^= 1; }
                 }
             }
+            #pragma unroll 1
+            for (int _ = 0; _ < 7; _++) {
+                mbarrier_wait(empty_addr + (stage) * 8, _phase_empty);
+                stage += 1;
+                if (stage == 7) { stage = 0; _phase_empty ^= 1; }
+            }
         }
     }
     // ---- Role: mma ----

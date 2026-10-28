@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from ......config import BootstrapConfig, FleetParams
+from ......config import BootstrapConfig, FinalizeMode, FleetParams
 from ......core.kernel.base import MegaKernelBackend
 from ......core.kernel.registry import register_mega_kernel
 from ......core.runtime import mxfp8_cutedsl_runtime_requirements
@@ -54,11 +54,21 @@ def _resolve_gate_up_clamp(
     "sm100_mxfp8_mxfp8_bf16_cutedsl", deprecated_aliases=("mxfp8_cutedsl",)
 )
 class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
+    _config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
     supports_output_view = True
 
     def __init__(self, config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig) -> None:
         """Validate pipeline options and initialize deferred tuning state."""
         super().__init__(config)
+        if (
+            config.activation != "swiglu"
+            or config.swiglu_alpha is not None
+            or not config.apply_routing_weights_before_fc2
+        ):
+            raise MoEEpConfigError(
+                "Activation controls and late routing weights require "
+                "kernel_name='sm100_mxfp8_mxfp8_bf16_cutedsl_next'."
+            )
         self._kernel_config: Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig = config
         if config.kernel_variant not in ("inference", "genphase"):
             raise MoEEpConfigError(
@@ -78,6 +88,12 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             if config.enable_in_kernel_fc2_reduce:
                 raise MoEEpConfigError(
                     "Blackwell GenPhase requires separate reduction."
+                )
+            if config.resolved_finalize_mode is not FinalizeMode.DEFAULT:
+                raise MoEEpConfigError(
+                    "Blackwell GenPhase supports only the default finalize "
+                    "kernel; persistent or unfinalized output requires "
+                    "kernel_variant='inference'."
                 )
             policy = config.schedule_policy
             if policy is not None and (
@@ -103,9 +119,13 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
                 "kernel_variant='genphase'; "
                 "use knobs for the inference pipeline."
             )
-        # knobs="auto": tune at the first compute() (weights + staged inputs
-        # exist there), then keep the winner for the session.
-        self._autotune_pending = config.knobs == "auto"
+        self.supports_unfinalized_output = config.finalize_mode is FinalizeMode.NONE
+        # Legacy inference tunes at the first compute(). GenPhase uses the
+        # workspace's v2 selection state.
+        self.supports_auto_workspaces = config.kernel_variant == "genphase"
+        self._autotune_pending = (
+            config.knobs == "auto" and not self.supports_auto_workspaces
+        )
         if self._autotune_pending:
             import warnings
 
@@ -118,6 +138,20 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
                 UserWarning,
                 stacklevel=3,
             )
+
+    def coordinate_workspace_replacement(self, workspace):
+        if not self.supports_auto_workspaces:
+            return False
+        from ..automatic import coordinate_workspace_replacement
+
+        return coordinate_workspace_replacement(self, workspace)
+
+    def get_tuned_knobs(self, workspace=None):
+        if not self.supports_auto_workspaces:
+            return super().get_tuned_knobs(workspace)
+        from ..automatic import get_tuned_knobs
+
+        return get_tuned_knobs(workspace)
 
     @classmethod
     def kernel_name(cls) -> str:
@@ -164,9 +198,8 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
     def _genphase_config(self, fleet_params: FleetParams):
         """Memoize cache or heuristic selection for one workload and device.
 
-        Auto tuning bypasses the disk cache here and retunes its default
-        workspace during warmup. Public auto layers cannot create additional
-        capacity profiles through ``create_workspace()``.
+        Automatic workspaces start from the capacity heuristic. Their v2
+        selection uses the actual staged batch size during warmup or forward.
         """
         from ......kernel_src.sm100.next_cutedsl_megamoe import resolve_genphase_knobs
 
@@ -182,14 +215,16 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
                 if props is not None
                 else None
             )
-            key = (base, repr(constraints), fleet_params.tuning_live_tokens, hardware)
+            automatic = self._kernel_config.knobs == "auto"
+            live_tokens = None if automatic else fleet_params.tuning_live_tokens
+            key = (base, repr(constraints), live_tokens, hardware)
             if key not in self._genphase_configs:
                 knobs, _ = resolve_genphase_knobs(
                     base,
                     sm_count=sms,
-                    live_tokens=fleet_params.tuning_live_tokens,
+                    live_tokens=live_tokens,
                     constraints=constraints,
-                    use_cache=gpu and self._kernel_config.knobs != "auto",
+                    use_cache=gpu and not automatic,
                 )
                 self._genphase_configs[key] = dataclasses.replace(base, **knobs)
             return self._genphase_configs[key]
@@ -337,6 +372,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             topk=k.top_k,
             max_tokens=fleet_params.max_tokens_per_rank,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
+            use_custom_finalize=k.finalize_mode is FinalizeMode.NONE,
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
@@ -355,7 +391,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
 
         k = self._kernel_config
         fp = fleet_params
-        return get_symm_buffer_for_mxfp8_mega_moe(
+        workspace = get_symm_buffer_for_mxfp8_mega_moe(
             fp.num_experts,
             fp.max_tokens_per_rank,
             k.top_k,
@@ -367,15 +403,28 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             gate_up_clamp=_resolve_gate_up_clamp(k),
             activation_clamp=k.activation_clamp,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
+            use_persistent_finalize_kernel=k.resolved_finalize_mode
+            is FinalizeMode.PERSISTENT,
+            use_custom_finalize=k.finalize_mode is FinalizeMode.NONE,
+            num_valid_tokens_tensor=k.num_valid_tokens_tensor,
             knobs=self._workspace_knobs(fleet_params),
         )
+        if k.finalize_mode is FinalizeMode.NONE:
+            workspace._unfinalized_route_map = torch.arange(
+                fp.max_tokens_per_rank * k.top_k,
+                dtype=torch.int32,
+                device=workspace.topk_idx.device,
+            ).view(fp.max_tokens_per_rank, k.top_k)
+            # The kernel folds routing weights into FC1.
+            workspace._unfinalized_weights = torch.ones_like(workspace.topk_weights)
+        return workspace
 
     def validate_capture_ready(self, workspace, transformed_weights):
-        """Reject GenPhase capture until collective auto warmup has completed."""
-        if self._kernel_config.kernel_variant == "genphase" and self._autotune_pending:
-            raise MoEEpConfigError(
-                "GenPhase knobs='auto' requires collective warmup before CUDA graph capture"
-            )
+        if (
+            self._kernel_config.kernel_variant == "genphase"
+            and workspace._compiled is None
+        ):
+            raise MoEEpConfigError("Warm up GenPhase before CUDA graph capture")
 
     def validate_forward(
         self,
@@ -478,23 +527,11 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             num_tokens = (
                 output.shape[0] if output is not None else workspace.staged_tokens()
             )
-            if self._autotune_pending:
-                from ......kernel_src.sm100.next_cutedsl_megamoe import (
-                    autotune_sm100_genphase_mega_moe,
-                )
+            from ..automatic import prepare_auto_configuration
 
-                winner = autotune_sm100_genphase_mega_moe(
-                    output,
-                    transformed_weights[0],
-                    transformed_weights[1],
-                    workspace,
-                    num_tokens=num_tokens,
-                    constraints=self._genphase_constraints(),
-                    process_group=self._ep_comm_group,
-                )
-                workspace.retune(winner)
-                self._autotune_winner = winner
-                self._autotune_pending = False
+            prepare_auto_configuration(
+                self, workspace, transformed_weights, output, num_tokens
+            )
             view = sm100_genphase_mega_moe(
                 output,
                 transformed_weights[0],
@@ -506,6 +543,8 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             return output if output is not None else view
         from ......kernel_src.sm100.cutedsl_megamoe import mxfp8_mega_moe, staged_tokens
 
+        if self.supports_unfinalized_output:
+            raise ValueError("finalize_mode=NONE requires compute_unfinalized()")
         if output is not None:
             num_tokens = output.shape[0]
         else:
@@ -555,6 +594,50 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
         # ordering (valid until the next launch on this session's buffers).
         return output if output is not None else view
 
+    def compute_unfinalized(
+        self,
+        workspace: Any,
+        transformed_weights: TransformedMegaWeights,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        from ......kernel_src.sm100.cutedsl_megamoe import (
+            MegaMoEMxfp8Inputs,
+            staged_tokens,
+        )
+
+        if not self.supports_unfinalized_output:
+            raise ValueError("compute_unfinalized() requires finalize_mode=NONE")
+        num_tokens = staged_tokens(workspace.topk_idx)
+        if num_tokens is None:
+            raise ValueError("compute_unfinalized() requires stage_inputs() first")
+        clamp = _resolve_gate_up_clamp(self._kernel_config)
+        if clamp is not None:
+            workspace._frontend.set_gate_up_clamp(clamp)
+        # Launch the full padded buffer even when this rank has no live tokens.
+        workspace._frontend.run(
+            MegaMoEMxfp8Inputs(
+                activation=workspace.x,
+                activation_sf=workspace.x_sf,
+                topk_idx=workspace.topk_idx,
+                topk_weights=workspace.topk_weights,
+                fc1_weight=transformed_weights[0][0],
+                fc1_weight_sf=transformed_weights[0][1],
+                fc2_weight=transformed_weights[1][0],
+                fc2_weight_sf=transformed_weights[1][1],
+                output_activation=workspace.output_activation,
+                num_valid_tokens=workspace.num_valid_tokens,
+            ),
+            num_tokens=None,
+            sync=False,
+        )
+        partials, _root, _region = workspace._frontend.custom_finalize_workspace()
+        return (
+            partials[:num_tokens].view(
+                num_tokens * self._kernel_config.top_k, workspace.hidden
+            ),
+            workspace._unfinalized_weights[:num_tokens],
+            workspace._unfinalized_route_map[:num_tokens],
+        )
+
     def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
         """Key immutable workspace configurations; return None for auto tuning."""
         k = self._kernel_config
@@ -572,7 +655,7 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             # Autotune retunes (and recompiles) the workspace's shared
             # frontend at first compute; give each session its own buffer.
             return None
-        from ......core.kernel.workspace_pool import knobs_pool_key
+        from ......core.kernel.workspace_pool import epilogue_pool_key, knobs_pool_key
 
         fp = fleet_params
         return (
@@ -589,6 +672,8 @@ class Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             k.kind,
             _resolve_gate_up_clamp(k),
             k.enable_in_kernel_fc2_reduce,
+            k.resolved_finalize_mode,
+            epilogue_pool_key(k.num_valid_tokens_tensor),
             knobs_pool_key(self._workspace_knobs(fleet_params)),
         )
 

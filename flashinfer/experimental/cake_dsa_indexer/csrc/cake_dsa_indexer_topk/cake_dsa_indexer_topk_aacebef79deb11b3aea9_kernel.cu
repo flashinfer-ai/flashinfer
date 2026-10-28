@@ -35,22 +35,53 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_S_OUT_SC_STAGE_BYTES 16384
 #define SMEM_S_OUT_SC_STRIDE 16384
 #define SMEM_S_BITS_OFF 32768
+#ifndef SMEM_S_BITS_STAGE_BYTES
 #define SMEM_S_BITS_STAGE_BYTES 2048
+#endif
+#ifndef SMEM_S_BITS_STRIDE
 #define SMEM_S_BITS_STRIDE 2048
+#endif
+#ifndef SMEM_S_PREF_OFF
 #define SMEM_S_PREF_OFF 34816
+#endif
+#ifndef SMEM_S_PREF_STAGE_BYTES
 #define SMEM_S_PREF_STAGE_BYTES 1024
+#endif
+#ifndef SMEM_S_PREF_STRIDE
 #define SMEM_S_PREF_STRIDE 1024
+#endif
+#ifndef SMEM_S_XCH_OFF
 #define SMEM_S_XCH_OFF 35840
+#endif
+#ifndef SMEM_S_XCH_STAGE_BYTES
 #define SMEM_S_XCH_STAGE_BYTES 608
+#endif
+#ifndef SMEM_S_XCH_STRIDE
 #define SMEM_S_XCH_STRIDE 608
+#endif
+#ifndef SMEM_TOTAL
 #define SMEM_TOTAL 36480
+#endif
 #define THREADS 256
+#ifndef RANK_XCH_PAD
 #define RANK_XCH_PAD 16
+#endif
+
+// Shared by every build.json entry that names this translation unit in its sources: the entry's -D
+// defines select the rank window constants (SMEM_S_BITS_STAGE_BYTES / SMEM_S_BITS_STRIDE /
+// SMEM_S_PREF_OFF / SMEM_S_PREF_STAGE_BYTES / SMEM_S_PREF_STRIDE / SMEM_S_XCH_OFF /
+// SMEM_S_XCH_STAGE_BYTES / SMEM_S_XCH_STRIDE / SMEM_TOTAL / RANK_XCH_PAD; the guarded defaults
+// above are this file's own values) and the kernel symbol (-DCAKE_PROGRAM_KERNEL=<its own symbol>;
+// every library of the family exports a distinct kernel); without them the defaults name this
+// file's own program.
+#ifndef CAKE_PROGRAM_KERNEL
+#define CAKE_PROGRAM_KERNEL kernel_cake_dsa_indexer_topk_aacebef79deb11b3aea9
+#endif
 
 extern "C" {
 
 __global__ __launch_bounds__(THREADS) void
-kernel_cake_dsa_indexer_topk_aacebef79deb11b3aea9(int* __restrict__ Indices, float* __restrict__ Scores, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, int top_k, int num_segments)
+CAKE_PROGRAM_KERNEL(int* __restrict__ Indices, float* __restrict__ Scores, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, int top_k, int num_segments)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
