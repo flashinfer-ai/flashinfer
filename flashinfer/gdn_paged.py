@@ -32,6 +32,7 @@ import torch
 from .api_logging import flashinfer_api
 from .gdn_decode import gated_delta_rule_decode_pretranspose
 from .gdn_prefill import chunk_gated_delta_rule
+from .trace.templates.gdn import gdn_decode_paged_trace, gdn_prefill_paged_trace
 
 
 def _check_page_table(
@@ -65,7 +66,7 @@ def _gather_rows(
     return torch.where(valid, rows, torch.full_like(rows, -1))
 
 
-@flashinfer_api
+@flashinfer_api(trace=gdn_prefill_paged_trace)
 def chunk_gated_delta_rule_paged(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -213,7 +214,7 @@ def chunk_gated_delta_rule_paged(
     return output
 
 
-@flashinfer_api
+@flashinfer_api(trace=gdn_decode_paged_trace)
 def gated_delta_rule_decode_paged(
     q: torch.Tensor,
     k: torch.Tensor,
