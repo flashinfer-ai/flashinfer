@@ -16,6 +16,7 @@ import copy
 import functools
 
 import pytest
+import torch
 
 from flashinfer import dense_mqa
 from flashinfer.experimental.deepgemm_dense_mqa import dense_mqa as _runtime
@@ -236,6 +237,28 @@ def test_dense_route_available_rejects_out_of_contract_points(catalog_variant):
             assert expected == served.startswith(
                 ("fp8:qle128:short", "fp8:qle2048:short")
             ), (arch, queries, keys, served)
+
+
+@pytest.mark.parametrize("enforce_admission", [True, False])
+def test_plan_rejection_uses_the_admitted_route(monkeypatch, enforce_admission):
+    """Runtime diagnostics follow the served route; export admission stays architecture-independent."""
+    monkeypatch.setattr(_runtime, "_resolve_device", lambda q, sms: ("sm_100a", 148))
+    queries, keys = 129, 40013
+    q = torch.empty((queries, 32, 128), device="meta")
+    kv = torch.empty((keys, 128), device="meta")
+    weights = torch.empty((queries, 32), device="meta")
+    # Invalid dtype deliberately stops export validation after its admission gate.
+    starts = torch.empty(queries, device="meta")
+    ends = torch.empty_like(starts)
+    expected = (
+        "fp8:partial:le2048 requires K % 256 == 0 on sm_100a"
+        if enforce_admission
+        else "starts and ends must be equal-shaped int32 vectors"
+    )
+    with pytest.raises(ValueError, match=expected):
+        _runtime.DenseMqaPlan(
+            "fp8", q, kv, weights, starts, ends, enforce_admission=enforce_admission
+        )
 
 
 def test_plan_refuses_a_withheld_route_by_name(monkeypatch):
