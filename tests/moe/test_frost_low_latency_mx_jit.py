@@ -4,6 +4,8 @@
 
 import gc
 import os
+import subprocess
+import sys
 from contextlib import nullcontext
 from dataclasses import replace
 from functools import partial
@@ -169,3 +171,86 @@ def test_cross_target_device_object_rebinds_and_replays():
         x.fill_(value)
         graph.replay()
         torch.testing.assert_close(y, x - 4, rtol=0, atol=0)
+
+
+def _native_mx_pipeline(format_name, device_index):
+    """Run in a child whose compiler default was set before importing CuTe."""
+    from flashinfer.fused_moe.backends.frost_low_latency import runtime
+    from flashinfer.fused_moe.backends.frost_low_latency.runner import (
+        FrostLowLatencyRunner,
+    )
+    from tests.moe.test_frost_low_latency import _assert_near
+    from tests.moe.test_frost_low_latency_mx_contracts_gpu import _case
+
+    assert os.environ["CUTE_DSL_ARCH"] == "sm_90a"
+    torch.cuda.set_device(device_index)
+    assert torch.cuda.get_device_capability() in ((10, 0), (10, 3))
+    runtime._COMPILED.clear()
+    load_events = []
+    original_load = runtime._load_cross_compiled
+
+    def record_load(entry):
+        load_events.append(entry.engine is None)
+        return original_load(entry)
+
+    runtime._load_cross_compiled = record_load
+    held = []
+    runner = None
+    for step in range(3):
+        config, act, pack, expected = _case(QuantFormat[format_name], top_k=2)
+        act.topk_ids.add_(step).remainder_(config.routing.num_experts)
+        act.topk_weights.mul_(step + 1).sub_(0.25)
+        if runner is None:
+            runner = FrostLowLatencyRunner(config, act.hidden_states_q.device)
+            runner.check_support()
+            runner.build()
+        inputs = runner.pack_inputs(act, pack)
+        # Holding every call's tensors prevents allocator reuse from concealing
+        # stale bindings. An explicit K128 tactic exercises Pipeline.launch.
+        held.append(inputs)
+        _assert_near(runner.forward(inputs, tactic=128), expected())
+    assert len(load_events) == 1
+    assert len({inputs[0].data_ptr() for inputs in held}) == 3
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = runner.forward(inputs, tactic=128)
+    for step in range(3):
+        act.topk_ids.add_(1).remainder_(config.routing.num_experts)
+        act.topk_weights.fill_(0.125 * (step + 1))
+        # Packed score conversion was allocated outside capture; update the
+        # actual bound input as well as the FP32 reference scores.
+        inputs[3].copy_(act.topk_weights)
+        graph.replay()
+        _assert_near(output, expected())
+    assert len(load_events) == 1
+    assert os.environ["CUTE_DSL_ARCH"] == "sm_90a"
+    print(f"native {format_name}: 3 calls, 3 replays, load fallbacks={load_events}")
+
+
+@pytest.mark.parametrize("format_name", ["MXFP4", "MXFP8"])
+def test_native_mx_cross_arch_pipeline_in_fresh_process(format_name):
+    pytest.importorskip("cutlass", minversion="4.8")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("Native MX cross-architecture regression requires SM100/SM103")
+    environment = os.environ.copy()
+    environment["CUTE_DSL_ARCH"] = "sm_90a"
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; from tests.moe.test_frost_low_latency_mx_jit import "
+            "_native_mx_pipeline; _native_mx_pipeline(sys.argv[1], int(sys.argv[2]))",
+            format_name,
+            str(torch.cuda.current_device()),
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        env=environment,
+        text=True,
+        capture_output=True,
+        timeout=600,
+    )
+    assert child.returncode == 0, child.stdout + child.stderr
+    print(child.stdout)
