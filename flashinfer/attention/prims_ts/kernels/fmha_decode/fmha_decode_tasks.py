@@ -3247,9 +3247,11 @@ def _softmax_schedule_body(
     # The ``sfK`` words sit in the instance's ring, which the load warp fills
     # with each tile. They are read in place, so the ring stage stays held
     # through the last pass that reads them: the max pass for dequantized
-    # scores, else the P pass.
+    # scores and complete rows, which keep their words in registers, else
+    # the P pass.
     releases_sage_stage_after_max = (
         cfg.sage_score_scaling() is SageScoreScaling.DEQUANTIZED
+        or cfg.keeps_sage_row_words
     )
     compute_softmax_loop = {
         (False, False): tmem_s.compute_softmax_loop,
@@ -3311,7 +3313,7 @@ def _softmax_schedule_body(
             **softmax_loop_kwargs
         )
         if cutlass.const_expr(releases_sage_stage_after_max):
-            # The scores came back dequantized; the P pass reads no words.
+            # The P pass reads no words from the ring.
             sage_k_scales.release()
         if cutlass.const_expr(not cfg.use_keeps_mma_ab or not cfg.uses_tmem_p):
             # ConsRelease: free S once the scores are in registers unless

@@ -2755,10 +2755,9 @@ class FmhaDecodeConfig:
         Softmax holds the complete score row in registers and releases S after
         the max pass, so the MMA warp issues the next QK before this tile's PV
         and the exponentials overlap that QK. Dense 8-bit Q/K/V tiles take it,
-        Sage included; an 8-bit P tile fits beside the K/V ring. Sage's max
-        pass dequantizes the row in registers one K32 chunk of ``sfK`` groups
-        at a time, so its P pass reads no scale words. Block-sparse routes
-        keep the streamed TMEM P.
+        Sage included; an 8-bit P tile fits beside the K/V ring. A Sage row
+        keeps its raw scores with K blocks of 16 tokens or more
+        (``sage_score_scaling``). Block-sparse routes keep the streamed TMEM P.
         """
         return (
             self.use_keeps_mma_ab
@@ -2771,6 +2770,20 @@ class FmhaDecodeConfig:
             and self.v_dtype.width == 8
             and not self.use_block_sparse
         )
+
+    @property
+    def keeps_sage_row_words(self) -> bool:
+        """Whether a block-scaled complete Sage row keeps its ``sfK`` words in registers."""
+        return (
+            self.stages_q128_p_in_smem
+            and self.sage_score_scaling() is SageScoreScaling.BLOCK
+        )
+
+    @property
+    def sage_keeps_row_groups(self) -> int:
+        """Return the ``sfK`` groups of one complete Keeps score row."""
+        chunks = self.num_s_regs_per_thread // self.keeps_score_chunk_regs
+        return chunks * self.sage_k_groups_per_fragment()
 
     @property
     def streams_tmem_p_fragments(self) -> bool:
@@ -2945,18 +2958,21 @@ class FmhaDecodeConfig:
         """Return how the softmax applies a route kind's ``sfK`` to its scores.
 
         A complete-row SMEM-P tile (``stages_q128_p_in_smem``) dequantizes its
-        register-resident row in every geometry. A streamed kind is dequantized
+        register-resident row for K blocks under 16 tokens, whose words would
+        not fit in registers beside the scores. A streamed kind is dequantized
         only with one scale per score (the one-token K block): the max pass
         writes its scores back multiplied. Either way the P pass reads neither
-        ``sfK`` nor the INT32 bias. Other streamed geometries scale blocks of
+        ``sfK`` nor the INT32 bias. Other geometries scale blocks of
         ``sage_k_scale_block_size`` columns, avoiding a TMEM round trip per
-        tile. Every kind's words come through the ``SageKScalesResource`` ring
+        tile; a complete row keeps its words in registers for the P pass. Every
+        kind's words come through the ``SageKScalesResource`` ring
         (``SageKTransport.SMEM``).
         """
         if not self.use_sage_attention:
             return None
         if (
             self.stages_q128_p_in_smem
+            and self.sage_k_scale_block_size(proxy) < 16
             or self.sage_k_groups_per_fragment(proxy) == self.keeps_score_chunk_regs
         ):
             return SageScoreScaling.DEQUANTIZED
