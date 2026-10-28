@@ -178,6 +178,12 @@ not picked them up):
   keep the in-order loop, compiled exactly as before. The K256 paths
   (`*_k256*`, NV's FC1 K256 override) are unchanged. NV K128 tiles share
   these loops. Not in the drop tree.
+- MXFP4 optimization version `fused_local_v4` (2026-10-27):
+  `src/moe_hopper_fp8/mxfp4_policy.py::MXFP4_OPTIMIZATION_VERSION` moves from
+  v3 for the two K128 changes above. It enters the MX compile key, candidate
+  SHA and tuning-cache provenance (which the NV provenance embeds), so MXFP4
+  and NVFP4 tuning caches re-tune; the kernels do not read it. Not in the
+  drop tree.
 
 ## Layout
 

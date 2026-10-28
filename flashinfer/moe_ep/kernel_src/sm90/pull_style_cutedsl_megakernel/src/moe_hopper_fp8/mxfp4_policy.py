@@ -13,8 +13,10 @@ from dataclasses import dataclass
 from .fused_comm_policy import resolve_fused_comm_optimizations
 
 
-# Register-A fence ordering is part of the compiled implementation.
-MXFP4_OPTIMIZATION_VERSION = "fused_local_v3"
+# Register-A fence ordering is part of the compiled implementation. v4: K128
+# paired FC2 stores and the N>=64 next-stage prefetch change compiled K128
+# performance, so MXFP4 and NVFP4 tuning caches re-tune.
+MXFP4_OPTIMIZATION_VERSION = "fused_local_v4"
 MXFP4_READY_MODES = ("tile", "k256")
 
 
