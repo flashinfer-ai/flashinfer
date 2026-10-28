@@ -2458,7 +2458,14 @@ class FmhaDecodeConfig:
             and self.tile_size_kv == 128
             and self.q_dtype == self.k_dtype == self.v_dtype == Float8E4M3FN
         ):
-            return profile in _AUTO_GROUPED_KEEPS_PAGED_FP8_PROFILES
+            # DSL 4.8 measurements also qualify D128 FP8 -> 16-bit fixed
+            # multi-Q recipes. Let the existing cost model compare them;
+            # retaining only Swaps Q32 leaves a substantial runtime-split gap.
+            return profile in _AUTO_GROUPED_KEEPS_PAGED_FP8_PROFILES or (
+                self._in_grouped_q_selection_scope
+                and self.headdim == 128
+                and self.out_dtype in (Float16, BFloat16)
+            )
         return True
 
     @property

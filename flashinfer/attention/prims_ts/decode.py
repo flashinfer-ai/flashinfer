@@ -4055,6 +4055,15 @@ class BatchDecodePagedTSWrapper:
         uniform_kv = (
             not packed_query
             and not cfg.use_sliding_window_causal
+            # Keep FP8 Keeps multi-Q arithmetic identical to standalone calls,
+            # whose KV bounds are runtime metadata rather than static lengths.
+            and not (
+                cfg.use_keeps_mma_ab
+                and cfg.use_fp8_qkv
+                and head_dim == 128
+                and seq_len_q > 1
+                and cfg.o_dtype_bytes == 2
+            )
             and specialization_seq_lens_kv is not None
             and all(length == max_kv_len for length in specialization_seq_lens_kv)
             and ((max_kv_len + cfg.tile_size_kv - 1) // cfg.tile_size_kv)
