@@ -42,6 +42,27 @@ def _json(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
+def record_key(record: dict[str, Any]) -> str:
+    """Identify one native workload result in the managed cache."""
+    return hashlib.sha256(
+        _json(
+            {
+                k: v
+                for k, v in record.items()
+                if k
+                not in (
+                    "knobs",
+                    "p50_us",
+                    "source",
+                    "tuned_at",
+                    "measurement_policy",
+                    "profiling_policy",
+                )
+            }
+        ).encode()
+    ).hexdigest()
+
+
 class RubinTuningProtocol:
     """Retain native candidates, inputs, numerical checks and event timing."""
 
@@ -367,23 +388,7 @@ class RubinTuningProtocol:
         if cfg.rank == 0:
             try:
                 record = {**record, "protocol_contract": contract}
-                key = hashlib.sha256(
-                    _json(
-                        {
-                            k: v
-                            for k, v in record.items()
-                            if k
-                            not in (
-                                "knobs",
-                                "p50_us",
-                                "source",
-                                "tuned_at",
-                                "measurement_policy",
-                                "profiling_policy",
-                            )
-                        }
-                    ).encode()
-                ).hexdigest()
+                key = record_key(record)
                 context.publish(key, record)
                 # File consumers must see winners selected from either cache.
                 if context.disk_cache_enabled:

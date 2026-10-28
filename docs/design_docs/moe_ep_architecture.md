@@ -320,6 +320,22 @@ with the same kernel configuration and capacity. The getter performs no tuning
 or file access and raises before a successful automatic search or after layer
 destruction. `warmup()` continues to return `None`.
 
+On Rubin, `kernel_variant="auto"` together with `knobs="auto"` selects between
+inference and GenPhase. An enabled `autotune_v2()` warmup first resolves native
+knobs within each eligible variant, then compares forwards including input
+staging and output copies. The same numerical settings apply to both variants;
+GenPhase is excluded when its capacity or combine requirements are not met.
+The outer result uses a separate managed-cache entry. A replay miss uses the
+inference heuristic and leaves selection pending.
+
+Use `layer.get_tuned_config()` to reconstruct a fixed layer after variant
+selection. It returns the concrete kernel config with the selected variant and
+knobs. The knobs-only getter retains its meaning; those knobs alone do not
+identify the variant. Weight preprocessing is shared between Rubin variants.
+Automatic workspace handles own separate selection state. Later selection can
+replace a captured default workspace while its old storage remains available to
+existing graphs; captured explicit handles require a new handle.
+
 For serving several token capacities with one layer and one transformed weight
 set, allocate explicit profiles before capture:
 

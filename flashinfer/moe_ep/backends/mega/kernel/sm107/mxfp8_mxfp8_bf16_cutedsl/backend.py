@@ -64,6 +64,14 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         super().__init__(config)
         self._kernel_config = config
 
+    @classmethod
+    def create(cls, config):
+        if config.kernel_variant == "auto":
+            from ..variant_selection import RubinVariantBackend
+
+            return RubinVariantBackend(config, cls)
+        return cls(config)
+
     def coordinate_workspace_replacement(
         self, workspace: Sm107BlockScaledSymmBuffer
     ) -> bool:

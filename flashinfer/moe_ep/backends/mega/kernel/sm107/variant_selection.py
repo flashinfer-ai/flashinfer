@@ -1,0 +1,716 @@
+"""Complete-forward selection between Rubin MegaMoE variants."""
+
+from __future__ import annotations
+
+import dataclasses
+import hashlib
+import json
+import math
+import os
+import statistics
+from copy import deepcopy
+from typing import TYPE_CHECKING
+
+import torch
+
+from flashinfer.autotuner import AutoTuner, TuningContext, TuningResult
+
+from .....core.kernel.base import MegaKernelBackend
+from .....core.tuning_state import AutoTuningState
+from .....core.validation.common import MoEEpConfigError
+
+if TYPE_CHECKING:
+    from .....config import FleetParams
+    from .....tensors import MoEEpTensors
+    from .....kernel_src.sm107.next_cutedsl_megamoe.shim.block_scaled import (
+        Sm107BlockScaledSymmBuffer,
+    )
+    from .automatic import RubinBackend
+    from .mxfp8_mxfp8_bf16_cutedsl.config import (
+        Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from .mxfp8_mxfp4_bf16_cutedsl.config import (
+        Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from .nvfp4_nvfp4_bf16_cutedsl.config import (
+        Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
+    from .nvfp4_nvfp4_bf16_cutedsl.weights import TransformedMegaWeights
+
+NAMESPACE = "moe_ep.sm107.cutedsl.variants.v1"
+
+
+def _json(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def _context() -> TuningContext:
+    from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+        validate_context,
+    )
+
+    context = AutoTuner.get().protocol_context(NAMESPACE)
+    validate_context(context)
+    return context
+
+
+def _cache_identity(context: TuningContext) -> tuple:
+    from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+        NAMESPACE as NATIVE_NAMESPACE,
+    )
+
+    return context.cache_identity, context.tuner.protocol_context(
+        NATIVE_NAMESPACE
+    ).skipped
+
+
+def _identity(context: TuningContext) -> tuple:
+    from .....core.tuning_measurement import measurement_settings
+
+    return _cache_identity(context), measurement_settings(context)
+
+
+def _pending(state: AutoTuningState, context: TuningContext) -> bool:
+    if state.cache_identity != _cache_identity(context):
+        return True
+    if context.tuning_enabled:
+        return state.tuned_identity != _identity(context)
+    return state.winner is None and state.lookup_scope != (
+        context.scope,
+        _cache_identity(context),
+    )
+
+
+@dataclasses.dataclass
+class VariantWorkspace:
+    fleet: FleetParams
+    kernel: RubinBackend
+    workspace: Sm107BlockScaledSymmBuffer
+    _tuning_state: AutoTuningState = dataclasses.field(default_factory=AutoTuningState)
+    tensors: MoEEpTensors | None = None
+    quantize_input: bool = True
+
+
+class RubinVariantBackend(MegaKernelBackend):
+    """Own one selected workspace; retain native tuning within each variant."""
+
+    _config: (
+        Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
+        | Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
+        | Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+    )
+    supports_output_view = True
+    supports_auto_workspaces = True
+
+    def __init__(self, config, backend_type):
+        super().__init__(config)
+        if config.knobs != "auto":
+            raise MoEEpConfigError("kernel_variant='auto' requires knobs='auto'")
+        self._backend_type = backend_type
+        self._fallback = backend_type(
+            dataclasses.replace(config, kernel_variant="inference")
+        )
+
+    @classmethod
+    def kernel_name(cls):
+        return NAMESPACE
+
+    def bind_ep_bootstrap(self, bootstrap):
+        super().bind_ep_bootstrap(bootstrap)
+        self._fallback.bind_ep_bootstrap(bootstrap)
+
+    def runtime_requirements(self, bootstrap):
+        return self._fallback.runtime_requirements(bootstrap)
+
+    def validate_init(self, bootstrap, fleet_params):
+        self._ensure_ep_bootstrap(bootstrap)
+        self._fallback.validate_init(bootstrap, fleet_params)
+
+    def preprocess_weights(self, weights, fleet_params):
+        # Both variants consume the same format-specific weight layout.
+        return self._fallback.preprocess_weights(weights, fleet_params)
+
+    def validate_transformed_weights(self, weights, bootstrap, fleet_params):
+        self._fallback.validate_transformed_weights(weights, bootstrap, fleet_params)
+
+    def validate_forward(self, t, fleet_params, *, quantize_input):
+        self._fallback.validate_forward(t, fleet_params, quantize_input=quantize_input)
+
+    def _gather(self, value):
+        if self.ep_world_size == 1:
+            return [value]
+        import torch.distributed as dist
+
+        values = [None] * self.ep_world_size
+        dist.all_gather_object(values, value, group=self.ep_comm_group)
+        return values
+
+    def _backend(self, variant, knobs="auto"):
+        backend = self._backend_type(
+            dataclasses.replace(
+                self._config, kernel_variant=variant, knobs=deepcopy(knobs)
+            )
+        )
+        backend.bind_ep_bootstrap(self._ep_bootstrap)
+        return backend
+
+    def _fixed_backend(self, workspace):
+        from .....kernel_src.sm107.next_cutedsl_megamoe import KNOB_KEYS
+
+        knobs = {key: getattr(workspace.config, key) for key in KNOB_KEYS}
+        return self._backend(workspace.config.kernel_variant, knobs)
+
+    def _allocate_workspace(self, fleet_params):
+        workspace = self._fallback.prepare_workspace(self._ep_bootstrap, fleet_params)
+        return VariantWorkspace(fleet_params, self._fixed_backend(workspace), workspace)
+
+    def _eligible(self, fleet):
+        from .....kernel_src.sm107.next_cutedsl_megamoe import (
+            Sm107BlockScaledSymmBuffer,
+            sm107_candidates,
+        )
+        from .....kernel_src.sm107.next_cutedsl_megamoe.shim.autotune import (
+            is_valid_sm107,
+        )
+
+        eligible = []
+        for variant in ("inference", "genphase"):
+            backend = self._backend(variant)
+            error = None
+            try:
+                cfg = backend._resolved_config(fleet)
+                valid = False
+                for knobs in sm107_candidates(
+                    cfg.quant_kind,
+                    kernel_variant=variant,
+                    allow_in_kernel_fc2_reduce=self._config.in_kernel_fc2_reduce
+                    and cfg.combine_dtype == "bf16",
+                ):
+                    if not is_valid_sm107(knobs, cfg):
+                        continue
+                    try:
+                        Sm107BlockScaledSymmBuffer._build_kernel(
+                            dataclasses.replace(cfg, **knobs)
+                        )
+                    except (ValueError, NotImplementedError):
+                        continue
+                    valid = True
+                    break
+                if not valid:
+                    error = "no native candidate supports this configuration"
+            except (ValueError, MoEEpConfigError, NotImplementedError) as exc:
+                error = str(exc)
+            if not any(self._gather(error)):
+                eligible.append(variant)
+        if not eligible:
+            raise MoEEpConfigError(
+                "no Rubin MegaMoE variant supports this configuration"
+            )
+        return eligible
+
+    def coordinate_workspace_replacement(self, workspace):
+        context = _context()
+        state = workspace._tuning_state
+        if torch.cuda.is_current_stream_capturing():
+            if state.cache_identity != _cache_identity(context):
+                raise RuntimeError(
+                    "Warm up variant selection after changing the autotune context"
+                )
+            return False
+        replace = (
+            state.graph_captured
+            and _pending(state, context)
+            and (
+                context.tuning_enabled
+                or state.cache_identity != _cache_identity(context)
+            )
+        )
+        decisions = self._gather((context.tuning_enabled, replace))
+        if any(enabled != context.tuning_enabled for enabled, _ in decisions):
+            raise ValueError("EP ranks disagree on whether variant tuning is enabled")
+        return any(replace for _, replace in decisions)
+
+    def validate_capture_ready(self, workspace, weights):
+        context = _context()
+        if _pending(workspace._tuning_state, context) and context.tuning_enabled:
+            raise RuntimeError(
+                "Warm up pending variant tuning before CUDA graph capture"
+            )
+        workspace.workspace.prepare(*weights)
+
+    def stage_inputs(self, t, workspace, *, quantize_input):
+        workspace.tensors = t
+        workspace.quantize_input = quantize_input
+        workspace.kernel.stage_inputs(
+            t, workspace.workspace, quantize_input=quantize_input
+        )
+
+    def workspace_output(self, workspace):
+        return workspace.workspace.output_activation
+
+    def get_tuned_knobs(self, workspace=None):
+        if workspace is None or workspace._tuning_state.winner is None:
+            raise RuntimeError(
+                "MegaMoE has no completed variant selection for this workspace"
+            )
+        return deepcopy(workspace._tuning_state.winner["knobs"])
+
+    def get_tuned_config(self, workspace=None):
+        knobs = self.get_tuned_knobs(workspace)
+        return dataclasses.replace(
+            self._config,
+            kernel_variant=workspace._tuning_state.winner["variant"],
+            knobs=knobs,
+        )
+
+    def compute(self, workspace, transformed_weights, *, output):
+        context = _context()
+        state = workspace._tuning_state
+        if torch.cuda.is_current_stream_capturing():
+            state.graph_captured = True
+        else:
+            decisions = self._gather(
+                (
+                    context.tuning_enabled,
+                    _pending(state, context),
+                    state.graph_captured,
+                    context.skipped and state.winner is not None,
+                )
+            )
+            if any(enabled != context.tuning_enabled for enabled, *_ in decisions):
+                raise ValueError(
+                    "EP ranks disagree on whether variant tuning is enabled"
+                )
+            select = any(pending for _, pending, _, _ in decisions)
+            if select and any(captured for _, _, captured, _ in decisions):
+                if context.tuning_enabled or any(
+                    fallback for *_, fallback in decisions
+                ):
+                    raise RuntimeError(
+                        "Create another explicit workspace before later variant selection"
+                    )
+                # Another replay context may retry an earlier miss. Captured
+                # storage keeps its prepared fallback without another lookup.
+                select = False
+            if select:
+                AutoTuner.get().choose_with_protocol(
+                    NAMESPACE,
+                    _VariantProtocol(self, workspace, transformed_weights, output),
+                )
+                # Selection can replace the staged storage.
+                workspace.kernel.stage_inputs(
+                    workspace.tensors,
+                    workspace.workspace,
+                    quantize_input=workspace.quantize_input,
+                )
+        return workspace.kernel.compute(
+            workspace.workspace, transformed_weights, output=output
+        )
+
+    def destroy(self, workspace):
+        if workspace is not None:
+            workspace.kernel.destroy(workspace.workspace)
+
+
+class _ForwardTrial:
+    def __init__(
+        self,
+        owner: VariantWorkspace,
+        weights: TransformedMegaWeights,
+        output: torch.Tensor | None,
+    ):
+        if owner.tensors is None:
+            raise RuntimeError("Stage inputs before measuring a variant")
+        self.tensors = owner.tensors
+        self.owner, self.weights, self.output = owner, weights, output
+        self.config = owner.workspace.config
+        self.device = owner.workspace.device
+
+    def launch(self):
+        owner = self.owner
+        owner.kernel.stage_inputs(
+            self.tensors, owner.workspace, quantize_input=owner.quantize_input
+        )
+        owner.kernel.compute(owner.workspace, self.weights, output=self.output)
+
+
+class _VariantProtocol:
+    def __init__(
+        self,
+        backend: RubinVariantBackend,
+        owner: VariantWorkspace,
+        weights: TransformedMegaWeights,
+        output: torch.Tensor | None,
+    ):
+        if owner.tensors is None:
+            raise RuntimeError("Stage inputs before selecting a variant")
+        self.tensors = owner.tensors
+        self.backend, self.owner = backend, owner
+        self.weights, self.output = weights, output
+
+    def _contract(self, variants, context):
+        from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+            RubinTuningProtocol,
+        )
+
+        owner = self.owner
+        # Native compatibility covers numerical settings, SM budget and environment.
+        native = RubinTuningProtocol(
+            self.output,
+            self.weights[0],
+            self.weights[1],
+            owner.workspace,
+            num_tokens=self.tensors.num_tokens,
+        )._contract()
+        native["config"].pop("kernel_variant")
+        inputs = {}
+        for name in (
+            "hidden_states",
+            "topk_ids",
+            "topk_weights",
+            "scales",
+            "fc1_alpha",
+            "fc2_alpha",
+            "fc1_norm_const",
+        ):
+            value = getattr(self.tensors, name)
+            inputs[name] = (
+                None
+                if value is None
+                else [str(value.dtype), list(value.shape[1:]), list(value.stride())]
+            )
+        output = (
+            None
+            if self.output is None
+            else [str(self.output.dtype), list(self.output.stride())]
+        )
+        return {
+            "native": native,
+            "variants": variants,
+            "allow_nondeterministic": self.backend._config.in_kernel_fc2_reduce,
+            "native_skipped": _cache_identity(context)[1],
+            "capacity": owner.fleet.max_tokens_per_rank,
+            "input_norm_const": getattr(self.backend._config, "input_norm_const", 1.0),
+            "staging": {
+                name: os.environ.get(name, "1")
+                for name in (
+                    "FLASHINFER_MEGA_FUSED_STAGE",
+                    "FLASHINFER_SM107_MEGA_CHECK_ROUTES",
+                    "FLASHINFER_SM107_FUSED_ROUTE_CHECK",
+                    "FLASHINFER_SM107_PREP_TVM_FFI",
+                )
+            },
+            "inputs": self.backend._gather(
+                [self.tensors.num_tokens, inputs, output, owner.quantize_input]
+            ),
+            "measurement_policy": context.measurement_policy.manifest_fields()
+            if context.measurement_policy
+            else {},
+        }
+
+    def _install(self, record):
+        from .....kernel_src.sm107.next_cutedsl_megamoe.shim.autotune import (
+            _prepare_collectively,
+        )
+
+        backend, owner = self.backend, self.owner
+        kernel = backend._backend(record["variant"], record["knobs"])
+        workspace = kernel._allocate_workspace(owner.fleet)
+        _prepare_collectively(
+            lambda: workspace.prepare(*self.weights),
+            backend.ep_world_size,
+            backend.ep_comm_group if backend.ep_world_size > 1 else None,
+        )
+        owner.kernel.destroy(owner.workspace)
+        owner.kernel, owner.workspace = kernel, workspace
+
+    def _compatible(self, record, contract, measurement, context):
+        if not isinstance(record, dict) or record.get("contract") != contract:
+            return False
+        if context.tuning_enabled and record.get("measurement") != measurement:
+            return False
+        if record.get("variant") not in contract["variants"]:
+            return False
+        try:
+            from .....kernel_src.sm107.next_cutedsl_megamoe import (
+                Sm107BlockScaledSymmBuffer,
+            )
+            from .....kernel_src.sm107.next_cutedsl_megamoe.shim.knob_cache import (
+                _knobs_from_json,
+            )
+
+            knobs = _knobs_from_json(record["knobs"])
+            native_record = record.get("native_record")
+            if native_record is not None and (
+                not isinstance(native_record, dict)
+                or _knobs_from_json(native_record["knobs"]) != knobs
+            ):
+                return False
+            kernel = self.backend._backend(record["variant"], knobs)
+            cfg = kernel._resolved_config(self.owner.fleet)
+            if (
+                cfg.reduce_topk_in_kernel
+                and not self.backend._config.in_kernel_fc2_reduce
+            ):
+                return False
+            Sm107BlockScaledSymmBuffer._build_kernel(cfg)
+            return True
+        except Exception as exc:
+            from flashinfer.jit.core import logger
+
+            # Cached resource checks do not allocate or launch collective kernels.
+            logger.warning(f"[Autotuner]: Ignoring invalid MegaMoE variant: {exc}")
+            return False
+
+    def run(self, context: TuningContext):
+        from .....core.tuning_measurement import (
+            CaptureUnsupported,
+            measure_samples,
+            measurement_settings,
+        )
+        from .....kernel_src.sm107.next_cutedsl_megamoe.shim.autotune import (
+            _prepare_collectively,
+        )
+
+        backend, owner = self.backend, self.owner
+        state = owner._tuning_state
+        measurement = measurement_settings(context)
+        controls = (
+            context.tuning_enabled,
+            context.force_tune,
+            context.skipped,
+            context.disk_cache_enabled,
+            _cache_identity(context)[1],
+            measurement,
+        )
+        if any(value != controls for value in backend._gather(controls)):
+            raise ValueError("EP ranks disagree on variant tuning controls")
+        if context.skipped:
+            if state.winner is not None:
+                replacement = backend._allocate_workspace(owner.fleet)
+                owner.kernel.destroy(owner.workspace)
+                owner.kernel, owner.workspace = (
+                    replacement.kernel,
+                    replacement.workspace,
+                )
+            state.lookup_scope = (context.scope, _cache_identity(context))
+            state.record_selection(None, _cache_identity(context), None)
+            return TuningResult(None)
+        variants = backend._eligible(owner.fleet)
+        contract = self._contract(variants, context)
+        if any(value != contract for value in backend._gather(contract)):
+            raise ValueError(
+                "EP ranks disagree on variant geometry or numerical policy"
+            )
+        key = hashlib.sha256(_json(contract).encode()).hexdigest()
+        record = None
+        if not context.force_tune:
+            records = backend._gather(context.lookup(key))
+            valid = [
+                self._compatible(value, contract, measurement, context)
+                for value in records
+            ]
+            validity = backend._gather(valid)
+            record = next(
+                (
+                    value
+                    for i, value in enumerate(records)
+                    if all(rank[i] for rank in validity)
+                ),
+                None,
+            )
+        cache_hit = record is not None
+        if record is None and not context.tuning_enabled:
+            if state.winner is not None:
+                replacement = backend._allocate_workspace(owner.fleet)
+                owner.kernel.destroy(owner.workspace)
+                owner.kernel, owner.workspace = (
+                    replacement.kernel,
+                    replacement.workspace,
+                )
+            state.lookup_scope = (context.scope, _cache_identity(context))
+            state.record_selection(None, _cache_identity(context), None)
+            return TuningResult(None)
+        if record is None:
+            import torch.distributed as dist
+            from .....kernel_src.sm107.next_cutedsl_megamoe import KNOB_KEYS
+            from .....kernel_src.sm107.next_cutedsl_megamoe.shim import knob_cache
+            from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+                NAMESPACE as NATIVE_NAMESPACE,
+            )
+
+            candidates = []
+            for variant in variants:
+                kernel = backend._backend(variant)
+                workspace = kernel.prepare_workspace(backend._ep_bootstrap, owner.fleet)
+                _prepare_collectively(
+                    lambda: workspace.prepare(*self.weights),
+                    backend.ep_world_size,
+                    backend.ep_comm_group if backend.ep_world_size > 1 else None,
+                )
+                kernel.stage_inputs(
+                    self.tensors, workspace, quantize_input=owner.quantize_input
+                )
+                kernel.compute(workspace, self.weights, output=self.output)
+                fixed = backend._fixed_backend(workspace)
+                trial_owner = VariantWorkspace(
+                    owner.fleet,
+                    fixed,
+                    workspace,
+                    tensors=self.tensors,
+                    quantize_input=owner.quantize_input,
+                )
+                trial = _ForwardTrial(trial_owner, self.weights, self.output)
+                for _ in range(3):
+                    trial.launch()
+                torch.cuda.synchronize()
+                from .....kernel_src.sm107.next_cutedsl_megamoe.shim.correctness import (
+                    sampled_reference,
+                    output_error,
+                )
+
+                indices, expected = sampled_reference(
+                    workspace,
+                    *self.weights,
+                    self.tensors.num_tokens,
+                    process_group=backend.ep_comm_group
+                    if backend.ep_world_size > 1
+                    else None,
+                )
+                try:
+                    samples = measure_samples(
+                        trial,
+                        (),
+                        10,
+                        measurement,
+                        backend.ep_comm_group if backend.ep_world_size > 1 else None,
+                    )
+                except CaptureUnsupported:
+                    # Capture rejection is already coordinated by the timer.
+                    fixed.destroy(workspace)
+                    continue
+                times = torch.tensor(
+                    samples, dtype=torch.float64, device=workspace.device
+                )
+                if backend.ep_world_size > 1:
+                    dist.all_reduce(
+                        times, op=dist.ReduceOp.MAX, group=backend.ep_comm_group
+                    )
+                actual = (
+                    workspace.output_activation[: self.tensors.num_tokens]
+                    if self.output is None
+                    else self.output
+                )
+                error = torch.tensor(
+                    output_error(actual, indices, expected),
+                    dtype=torch.float64,
+                    device=workspace.device,
+                )
+                if backend.ep_world_size > 1:
+                    dist.all_reduce(
+                        error, op=dist.ReduceOp.MAX, group=backend.ep_comm_group
+                    )
+                tolerance = 0.06 if workspace.config.quant_kind == "nvfp4" else 0.02
+                if not math.isfinite(float(error)) or float(error) > tolerance:
+                    fixed.destroy(workspace)
+                    continue
+                knobs = workspace._tuning_state.winner or {
+                    name: getattr(workspace.config, name) for name in KNOB_KEYS
+                }
+                native_context = context.tuner.protocol_context(NATIVE_NAMESPACE)
+                from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+                    RubinTuningProtocol,
+                )
+
+                native_protocol = RubinTuningProtocol(
+                    self.output,
+                    self.weights[0],
+                    self.weights[1],
+                    workspace,
+                    num_tokens=self.tensors.num_tokens,
+                    allow_nondeterministic=backend._config.in_kernel_fc2_reduce,
+                    process_group=backend.ep_comm_group
+                    if backend.ep_world_size > 1
+                    else None,
+                )
+                query = native_protocol._query(
+                    max(backend._gather(self.tensors.num_tokens))
+                )
+                native_records = [
+                    value
+                    for value in native_context.records().values()
+                    if isinstance(value, dict)
+                    and knob_cache._knobs_from_json(value.get("knobs", {})) == knobs
+                ]
+                native_record = native_protocol._lookup(
+                    native_records,
+                    query,
+                    native_protocol._contract(),
+                    native_context,
+                    measurement_settings(native_context),
+                )
+                candidates.append(
+                    {
+                        "variant": variant,
+                        "knobs": knobs,
+                        "p50_us": statistics.median(times.tolist()),
+                        "native_record": native_record,
+                    }
+                )
+                fixed.destroy(workspace)
+            if not candidates:
+                raise RuntimeError(
+                    "No Rubin variant passed complete-forward validation"
+                )
+            record = {
+                **min(candidates, key=lambda candidate: candidate["p50_us"]),
+                "contract": contract,
+                "measurement": measurement,
+            }
+        # Managed JSON decoding preserves payload lists; native knobs use tuples.
+        from .....kernel_src.sm107.next_cutedsl_megamoe.shim import knob_cache
+
+        record = deepcopy(record)
+        record["knobs"] = knob_cache._knobs_from_json(record["knobs"])
+        self._install(record)
+        error = None
+        if backend.ep_rank == 0:
+            try:
+                context.publish(key, record)
+                native_record = record.get("native_record")
+                if native_record is not None:
+                    from .....kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_protocol import (
+                        NAMESPACE as NATIVE_NAMESPACE,
+                        record_key,
+                    )
+
+                    native_context = context.tuner.protocol_context(NATIVE_NAMESPACE)
+                    native_context.publish(record_key(native_record), native_record)
+                if (
+                    context.disk_cache_enabled
+                    and record.get("native_record") is not None
+                ):
+                    from flashinfer.jit.core import logger
+
+                    try:
+                        knob_cache.write_record(record["native_record"])
+                    except Exception as exc:
+                        logger.warning(
+                            f"[Autotuner]: Cannot write MegaMoE cache file: {exc}"
+                        )
+            except Exception as exc:
+                error = str(exc)
+        errors = backend._gather(error)
+        if any(errors):
+            raise RuntimeError(f"Variant result publication failed: {errors}")
+        state.record_selection(
+            record,
+            _cache_identity(context),
+            _identity(context) if context.tuning_enabled else None,
+        )
+        return TuningResult(
+            record,
+            cache_hit=cache_hit,
+            candidates=0 if cache_hit else len(variants),
+            successful_candidates=0 if cache_hit else len(candidates),
+        )
