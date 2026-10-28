@@ -203,6 +203,13 @@ class SdpaDenseBinder:
     # the typed decline below, and the vendored ``prepared.py`` reads this flag to decline the padded-Q form by name before it
     # builds the plan.  The vendored shim's ``_SdpaDenseBinder`` carries the same value (``vendor.py``, ``PYTHON_BINDER_FLAGS``).
     supports_combine_q_lens = False
+    # The native D576x512 dense form of the extension's binder (the 7301fad21 pin) is not validated through this binder (the block's forms
+    # are d256): False here and in the shim (``PYTHON_BINDER_FLAGS``), so the vendored ``prepared.py`` declines such a plan by name.
+    supports_native_d576 = False
+    # The quantized (fp8) split attention-sink combine of the extension's binder (the 977757763 pin): this binder declines a split plan
+    # with a sink altogether (``supports_combine_q_lens`` above; the block declares no sink), so False here and in the shim, and the
+    # vendored ``prepared.py`` / ``api_dsl.py`` decline such a plan by name.
+    supports_quantized_split_sink = False
 
     def __init__(self, spec):
         _half_plan_only(spec, "SdpaDenseBinder")
@@ -272,6 +279,22 @@ class SdpaThdBinder:
     supports_nonpaged_d128_packed_split = True
     supports_epilogue_gate = True
     supports_paged_epilogue_gate = True
+    # The 7301fad21 pin's THD binder flags: the wave policy / geometry (``ThdLaunchSpec.wave_policy`` / ``wave_geometry``) are host
+    # arithmetic on ``n_thd_units`` inside the vendored frame implementation ``bind_thd`` delegates to, so they are served; the per-role
+    # PHYSICAL ORIGINS (``ThdLaunchSpec.origin_specs``, bound from the ``thd_origins.ROLES`` offset operands) are not gathered by this
+    # binder (``execute`` packs ``_NATIVE_THD_ROLES`` only), so every origins arm reads False here and in the shim (``PYTHON_BINDER_FLAGS``)
+    # and the vendored ``prepared.py`` declines a plan with origins by name; the block's packed declarations carry none.
+    supports_initial_waves = True
+    supports_initial_wave_geometry = True
+    supports_physical_origins = False
+    supports_paged_physical_origins = False
+    supports_paged_split_physical_origins = False
+    supports_paged_fp8_physical_origins = False
+    # The native D576x512 PACKED forms of the extension's THD binder (the 977757763 pin: the unsplit form, the packed split): not validated
+    # through this binder (the block's packed forms are d256), so False here and in the shim (``PYTHON_BINDER_FLAGS``) and the vendored
+    # ``engines.py`` / ``api_dsl.py`` decline such a plan by name, as the dense binder's ``supports_native_d576`` does.
+    supports_native_d576 = False
+    supports_native_d576_packed_split = False
 
     def __init__(self, spec):
         _half_plan_only(spec, "SdpaThdBinder")

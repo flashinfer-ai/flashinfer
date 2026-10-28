@@ -23,10 +23,12 @@ schedules are adapted from cursor/mixture-of-kittens, Copyright 2026 Cursor
 Research, under Apache-2.0.
 Source: https://github.com/cursor/mixture-of-kittens/tree/caeb2963f855c7ad53bb50c8bbf211086405cb98
 
-The Qwen 3.5 gated attention block (flashinfer/experimental/qwen_3_5_block/_cudnn_frost/) is a subset of the
-cuDNN Frontend Python package (python/cudnn and one file of its test tree), Copyright (c) 2024-2026 NVIDIA
-CORPORATION & AFFILIATES, vendored byte-faithfully with its import roots rewritten; each file keeps its own
-SPDX header: 59 files under the MIT License (licenses/LICENSE.cudnn-frontend-MIT.txt), 43 under Apache-2.0
-and one under "Apache-2.0 AND MIT". The pinned revision, the per-file digests and the declared patches
-are listed in that directory's VENDOR.md and VENDOR_MANIFEST.json.
-Source: https://github.com/NVIDIA/cudnn-frontend/tree/d8b0a7ed56cd8e62bc1e05f367f339624f6dbb4e
+The Qwen 3.5 and Qwen 3.8 Flash-Next gated attention blocks (flashinfer/experimental/qwen_3_5_block/_cudnn_frost/,
+shared by flashinfer/experimental/qwen_3_8_block/) are a subset of the cuDNN Frontend Python package (python/cudnn
+and one file of its test tree), Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES, vendored byte-faithfully
+with its import roots rewritten; each file keeps its own SPDX header: 64 files under the MIT License
+(licenses/LICENSE.cudnn-frontend-MIT.txt; one of them the file from the test tree), 53 under Apache-2.0 and one under
+"Apache-2.0 AND MIT". The pinned
+revision, the per-file digests and the declared patches are listed in that directory's VENDOR.md and
+VENDOR_MANIFEST.json.
+Source: https://github.com/NVIDIA/cudnn-frontend/tree/977757763dd57317b42f6151023a7ae3dd5b1750

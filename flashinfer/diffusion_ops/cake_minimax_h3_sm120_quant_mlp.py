@@ -26,6 +26,7 @@ import torch
 from ..api_logging import flashinfer_api
 from ..jit.cake_minimax_h3_sm120_quant_mlp import gen_minimax_h3_sm120_quant_mlp_module
 from ..utils import register_custom_op, register_fake_op, supported_compute_capability
+from .cake_minimax_h3_sm120_quant_gate import require_sm120
 from .cake_minimax_h3_sm120_quant_fc1_swiglu import (
     E4M3_MAX,
     MINIMAX_H3_EPS,
@@ -118,6 +119,7 @@ def _check_common(
 ) -> Tuple[int, torch.device]:
     rows = _check_rows(x)
     device = x.device
+    require_sm120(device, "MLP")
     _require("x", x, torch.bfloat16, (rows, MINIMAX_H3_HIDDEN), device)
     _require(
         "x_norm_weight", x_norm_weight, torch.bfloat16, (MINIMAX_H3_HIDDEN,), device

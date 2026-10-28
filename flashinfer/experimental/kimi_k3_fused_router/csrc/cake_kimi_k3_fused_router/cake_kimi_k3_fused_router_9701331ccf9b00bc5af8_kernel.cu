@@ -937,46 +937,46 @@ kernel_cake_kimi_k3_fused_router_9701331ccf9b00bc5af8(float* __restrict__ logits
         asm volatile(
             "mapa.shared::cluster.u32 %0, %1, %2;"
             : "=r"(_cluster_mapa_4) : "r"(selected_ids_addr + (unsigned int)(early_pair * 4)), "r"(0));
-        uint32_t _cluster_mapa_5;
-        asm volatile(
+        uint32_t _mbar_peer_5;
+        asm(
             "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_cluster_mapa_5) : "r"(ids_full_addr), "r"(0));
+            : "=r"(_mbar_peer_5) : "r"(ids_full_addr), "r"(0));
         asm volatile(
             "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-            :: "r"(_cluster_mapa_4), "r"(early_id), "r"(_cluster_mapa_5) : "memory");
+            :: "r"(_cluster_mapa_4), "r"(early_id), "r"(_mbar_peer_5) : "memory");
         uint32_t _cluster_mapa_6;
         asm volatile(
             "mapa.shared::cluster.u32 %0, %1, %2;"
             : "=r"(_cluster_mapa_6) : "r"(selected_ids_addr + (unsigned int)(early_pair * 4)), "r"(1));
-        uint32_t _cluster_mapa_7;
-        asm volatile(
+        uint32_t _mbar_peer_7;
+        asm(
             "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_cluster_mapa_7) : "r"(ids_full_addr), "r"(1));
+            : "=r"(_mbar_peer_7) : "r"(ids_full_addr), "r"(1));
         asm volatile(
             "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-            :: "r"(_cluster_mapa_6), "r"(early_id), "r"(_cluster_mapa_7) : "memory");
+            :: "r"(_cluster_mapa_6), "r"(early_id), "r"(_mbar_peer_7) : "memory");
         uint32_t _cluster_mapa_8;
         asm volatile(
             "mapa.shared::cluster.u32 %0, %1, %2;"
             : "=r"(_cluster_mapa_8) : "r"(selected_ids_addr + (unsigned int)(early_pair * 4)), "r"(2));
-        uint32_t _cluster_mapa_9;
-        asm volatile(
+        uint32_t _mbar_peer_9;
+        asm(
             "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_cluster_mapa_9) : "r"(ids_full_addr), "r"(2));
+            : "=r"(_mbar_peer_9) : "r"(ids_full_addr), "r"(2));
         asm volatile(
             "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-            :: "r"(_cluster_mapa_8), "r"(early_id), "r"(_cluster_mapa_9) : "memory");
+            :: "r"(_cluster_mapa_8), "r"(early_id), "r"(_mbar_peer_9) : "memory");
         uint32_t _cluster_mapa_10;
         asm volatile(
             "mapa.shared::cluster.u32 %0, %1, %2;"
             : "=r"(_cluster_mapa_10) : "r"(selected_ids_addr + (unsigned int)(early_pair * 4)), "r"(3));
-        uint32_t _cluster_mapa_11;
-        asm volatile(
+        uint32_t _mbar_peer_11;
+        asm(
             "mapa.shared::cluster.u32 %0, %1, %2;"
-            : "=r"(_cluster_mapa_11) : "r"(ids_full_addr), "r"(3));
+            : "=r"(_mbar_peer_11) : "r"(ids_full_addr), "r"(3));
         asm volatile(
             "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-            :: "r"(_cluster_mapa_10), "r"(early_id), "r"(_cluster_mapa_11) : "memory");
+            :: "r"(_cluster_mapa_10), "r"(early_id), "r"(_mbar_peer_11) : "memory");
         float selected_sum = 0.0f;
         #pragma unroll
         for (int route_sum = 0; route_sum < TOP_K; route_sum++) {

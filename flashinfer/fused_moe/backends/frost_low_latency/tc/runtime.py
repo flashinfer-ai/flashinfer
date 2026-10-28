@@ -130,7 +130,9 @@ def launch_fp8(
     weight_first: cutlass.Constexpr = False,
 ):
     top_k = cute.size(ids, mode=[1])
-    if cutlass.const_expr(architecture == 90):
+    if cutlass.const_expr(
+        architecture == 90 and x.element_type == cutlass.Float8E4M3FN
+    ):
         first_hopper = HopperGroupedProjection(
             True, group_size, stages, tile_k, top_k, activation, gated, parameters
         )
@@ -139,7 +141,26 @@ def launch_fp8(
         )
         first_hopper(w1, x, ids, mid, stream, dq1, aq2)
         second_hopper(w2, mid, ids, routes, stream, dq2, aq2)
-    elif cutlass.const_expr(architecture == 120):
+    elif cutlass.const_expr(
+        architecture == 120
+        or (
+            architecture in (90, 103)
+            and w1.element_type == cutlass.Float8E4M3FN
+            and x.element_type in (cutlass.BFloat16, cutlass.Float16)
+        )
+    ):
+        # This BF16 T4 schedule reduces producer synchronization. FP16 retains
+        # cooperative gathering; the same substitution regresses that path.
+        serial_w8_t4 = (
+            architecture == 103
+            and x.element_type == cutlass.BFloat16
+            and w1.element_type == cutlass.Float8E4M3FN
+            and cute.size(x, mode=[0]) == 4
+            and cute.size(x, mode=[1]) == 2048
+            and cute.size(mid, mode=[1]) == 512
+            and top_k == 10
+            and activation == "geglu"
+        )
         first_warp = WarpGroupedProjection(
             True,
             group_size,
@@ -149,15 +170,24 @@ def launch_fp8(
             activation,
             gated,
             parameters,
+            serial_gather=serial_w8_t4,
             weight_first=weight_first,
         )
         second_warp = WarpGroupedProjection(
-            False, group_size, stages, tile_k, top_k, weight_first=weight_first
+            False,
+            group_size,
+            stages,
+            tile_k,
+            top_k,
+            serial_gather=serial_w8_t4,
+            weight_first=weight_first,
         )
         first_warp(w1, x, ids, mid, stream, dq1, aq2)
         second_warp(w2, mid, ids, routes, stream, dq2, aq2)
     else:
-        raise ValueError("Grouped per-tensor FP8 requires SM90 or SM120")
+        raise ValueError(
+            "Grouped scaled projection requires SM90/SM120 or SM103 BF16/FP16 W8A16"
+        )
     if cutlass.const_expr(finalize):
         combine_kernel(
             routes, ids, scores, output, cute.size(w1, mode=[0]), narrow
@@ -168,22 +198,26 @@ def launch_fp8(
         )
 
 
-_TACTICS = tuple(
-    (kind, group, stages, tile_k)
-    for kind in ("wgmma", "ampere_mma")
-    for group in (2, 4, 8)
-    for stages in (2, 4, 8)
-    for tile_k in (64, 128)
-) + tuple(
-    ("warp_mma", group, stages, tile_k)
-    for group in (2, 4, 8)
-    for tile_k in (64, 128)
-    for stages in ((2, 4) if tile_k == 128 else (2, 4, 8))
+_TACTICS = (
+    tuple(
+        (kind, group, stages, tile_k)
+        for kind in ("wgmma", "ampere_mma")
+        for group in (2, 4, 8)
+        for stages in (2, 4, 8)
+        for tile_k in (64, 128)
+    )
+    + tuple(
+        ("warp_mma", group, stages, tile_k)
+        for group in (2, 4, 8)
+        for tile_k in (64, 128)
+        for stages in ((2, 4) if tile_k == 128 else (2, 4, 8))
+    )
+    + (("warp_mma", 4, 2, 256), ("warp_mma", 8, 2, 256))
 )
 
 
 # Preserve the original four-element tactics and their scheduling. Weight-first
-# overlap is an additional choice: cold weights can benefit while
+# overlap is an additional dense-only choice: cold weights can benefit while
 # cache-resident weights favor the original gather-first order.
 _WEIGHT_FIRST_TACTICS = tuple(
     ("warp_mma", *choice, True)
@@ -191,7 +225,7 @@ _WEIGHT_FIRST_TACTICS = tuple(
 )
 
 
-# Keep ordinary FP8's existing gather-first choices. Its cache/reuse boundary
+# Keep ordinary FP8's existing scheduling choices. Its cache/reuse boundary
 # differs from dense, so only the separately measured FP8 tiles are admitted.
 _FP8_WEIGHT_FIRST_TACTICS = tuple(("warp_mma", group, 2, 128, True) for group in (2, 4))
 
@@ -214,19 +248,33 @@ def execute(inputs, config, tactic):
         )
     x, ids, scores, w1, w2, mid, routes, output, narrow = inputs[:9]
     fp8 = x.dtype == torch.float8_e4m3fn
-    if fp8 and (tactic[0] not in ("wgmma", "warp_mma") or len(inputs) != 12):
+    weight_only = w1.dtype == torch.float8_e4m3fn and x.dtype in (
+        torch.bfloat16,
+        torch.float16,
+    )
+    scaled = fp8 or weight_only
+    if scaled and (tactic[0] not in ("wgmma", "warp_mma") or len(inputs) != 12):
         raise ValueError("Grouped FP8 requires SM90/SM120 and per-tensor scales")
+    capability = get_compute_capability(x.device)
+    if weight_only and (
+        tactic[0] != "warp_mma" or capability not in ((9, 0), (10, 3), (12, 0))
+    ):
+        raise ValueError("Grouped W8A16 requires SM90, SM103 or SM120 warp MMA")
     architecture = {"wgmma": 90, "warp_mma": 120, "ampere_mma": 80}[tactic[0]]
+    if tactic[0] == "warp_mma" and capability == (10, 3) and weight_only:
+        architecture = 103
+    if weight_only and tactic[0] == "warp_mma" and capability == (9, 0):
+        architecture = 90
     expected = (architecture // 10, architecture % 10)
-    if get_compute_capability(x.device) != expected:
+    if capability != expected:
         raise ValueError(f"Grouped {tactic[0]} decode requires SM{architecture}")
     if (
         x.dtype not in (torch.bfloat16, torch.float16, torch.float8_e4m3fn)
-        or w1.dtype != x.dtype
-        or w2.dtype != x.dtype
+        or w1.dtype != w2.dtype
+        or (not weight_only and w1.dtype != x.dtype)
     ):
         raise ValueError(
-            "Grouped TC decode requires matching BF16/FP16/E4M3 inputs and weights"
+            "Grouped TC requires matching BF16/FP16/E4M3 or supported E4M3 weights with 16-bit inputs"
         )
     if x.shape[0] > 8 or ids.shape[1] > 32 or mid.shape[1] % 128 or x.shape[1] % 128:
         raise ValueError("Grouped TC decode requires T<=8, top-k<=32 and aligned H/I")
@@ -252,7 +300,8 @@ def execute(inputs, config, tactic):
                     "T4/T8/H2048/I512/top-k10, BF16 output and finalization"
                 )
         elif (
-            tactic not in _WEIGHT_FIRST_TACTICS
+            weight_only
+            or tactic not in _WEIGHT_FIRST_TACTICS
             or (x.shape[0], x.shape[1], mid.shape[1], ids.shape[1])
             != (8, 2048, 512, 10)
             or output.dtype != x.dtype
@@ -264,11 +313,26 @@ def execute(inputs, config, tactic):
                 "T8/H2048/I512/top-k10, matching output dtype and finalization"
             )
     finalize = config.finalize.do_finalize
+    if tile_k == 256:
+        from ....api import GeGLU
+
+        if not (
+            architecture == 90
+            and weight_only
+            and x.dtype == torch.bfloat16
+            and output.dtype == torch.bfloat16
+            and x.shape == (group_size, 2048)
+            and mid.shape[1] == 512
+            and ids.shape[1] == 10
+            and config.activation == GeGLU()
+            and finalize
+        ):
+            raise ValueError("K256 W8A16 requires SM90 BF16 GeGLU T4/T8 H2048/I512/K10")
     tensors = (x, w1, ids, mid, w2, routes, scores, output)
-    if fp8:
+    if scaled:
         tensors += tuple(inputs[9:])
     key = (
-        "grouped-tc-ffi-v5",
+        "grouped-tc-ffi-w8a16-hopper-k256-v13",
         architecture,
         tuple((v.dtype, tuple(v.shape), tuple(v.stride()), v.device) for v in tensors),
         config.activation,
@@ -288,7 +352,7 @@ def execute(inputs, config, tactic):
                 if compiled is None:
                     name, parameters = lower_activation(config.activation)
                     compiled = cute.compile(
-                        launch_fp8 if fp8 else launch,
+                        launch_fp8 if scaled else launch,
                         # pack_inputs validates weight alignment. Ampere's
                         # 128-bit cp.async atom needs that fact in its IR.
                         *(

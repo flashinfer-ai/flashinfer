@@ -1149,7 +1149,7 @@ kernel_cake_kda_train_ecf750512be27b9043fa(const __grid_constant__ CUtensorMap d
                 }
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 mbarrier_arrive(d_drained_addr);
-                it_i = it_i + 1;
+                it_i += 1;
             }
             asm volatile("barrier.sync 1, 512;" ::: "memory");
             if (warp == 0) {

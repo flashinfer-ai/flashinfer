@@ -665,10 +665,14 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
             int xchg_idx = n_half * 64 + row_c;
             int xchg_bar = make_warp_uniform(2 + quadrant % 2);
             int rank_s = cta_rank;
-            int p_stage_s = 0;
-            int p_phase_s = 1;
-            int s_stage_s = 0;
-            int s_phase_s = 0;
+            int p_stage_s = 1;
+            unsigned int _phase_p_empty = 0;
+            p_stage_s += 1;
+            if (p_stage_s == 2) { p_stage_s = 0; _phase_p_empty ^= 1; }
+            int s_stage_s = 1;
+            unsigned int _phase_s_full = 1;
+            s_stage_s += 1;
+            if (s_stage_s == 2) { s_stage_s = 0; _phase_s_full ^= 1; }
             int unit_s = cluster_id;
             int item_lo_s = unit_first[unit_s];
             int item_hi_s = unit_first[unit_s + 1];
@@ -712,8 +716,7 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                     float pm1 = -CUDART_INF_F;
 #else
 #endif
-                    int s_slot0 = s_stage_s;
-                    mbarrier_wait(s_full_addr + (s_stage_s) * 8, s_phase_s);
+                    mbarrier_wait(s_full_addr + (s_stage_s) * 8, _phase_s_full);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     {
 #if __CUDA_ARCH__ == 1030
@@ -735,8 +738,8 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                             : "r"(taddr + (unsigned int)lane_base + (unsigned int)(s_stage_s * 32)));
                     }
                     s_stage_s += 1;
-                    if (s_stage_s == 2) { s_stage_s = 0; s_phase_s ^= 1; }
-                    mbarrier_wait(s_full_addr + (s_stage_s) * 8, s_phase_s);
+                    if (s_stage_s == 2) { s_stage_s = 0; _phase_s_full ^= 1; }
+                    mbarrier_wait(s_full_addr + (s_stage_s) * 8, _phase_s_full);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     {
 #if __CUDA_ARCH__ == 1030
@@ -759,7 +762,7 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                         "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                         "}"
-                        :: "r"(s_empty_addr + (unsigned int)(s_slot0 * 8)), "r"(0) : "memory");
+                        :: "r"(s_empty_addr + (((s_stage_s + 1 < 2) ? s_stage_s + 1 : (int)0)) * 8), "r"(0) : "memory");
 #if __CUDA_ARCH__ == 1030
 #else
                     {
@@ -778,9 +781,9 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                         "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                         "}"
-                        :: "r"(s_empty_addr + (unsigned int)(s_stage_s * 8)), "r"(0) : "memory");
+                        :: "r"(s_empty_addr + (s_stage_s) * 8), "r"(0) : "memory");
                     s_stage_s += 1;
-                    if (s_stage_s == 2) { s_stage_s = 0; s_phase_s ^= 1; }
+                    if (s_stage_s == 2) { s_stage_s = 0; _phase_s_full ^= 1; }
                     int tile_base_s = (tile_start_s + it_s) * 128 + n_half * 32;
                     int _max_0 = ((row_limit - tile_base_s) > (0) ? (row_limit - tile_base_s) : (0));
                     int valid_0 = ((_max_0) < (32) ? (_max_0) : (32));
@@ -788,7 +791,7 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                     int valid_1 = ((_max_1) < (32) ? (_max_1) : (32));
 #if __CUDA_ARCH__ == 1030
 #else
-                    uint32_t _mbar_token_0 = mbarrier_test_wait(p_empty_addr + (p_stage_s) * 8, p_phase_s);
+                    uint32_t _mbar_token_0 = mbarrier_test_wait(p_empty_addr + (p_stage_s) * 8, _phase_p_empty);
 #endif
                     float tile_max = 0.0f;
                     {
@@ -1038,7 +1041,7 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                     mbarrier_arrive(corr_sig_addr);
 #if __CUDA_ARCH__ == 1030
 #else
-                    mbarrier_wait_token(p_empty_addr + (p_stage_s) * 8, p_phase_s, _mbar_token_0);
+                    mbarrier_wait_token(p_empty_addr + (p_stage_s) * 8, _phase_p_empty, _mbar_token_0);
 #endif
                     float block_sum = 0.0f;
                     {
@@ -1190,7 +1193,7 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                     }
                     row_sum = __fmaf_rn(row_sum, alpha, block_sum);
 #if __CUDA_ARCH__ == 1030
-                    mbarrier_wait(p_empty_addr + (p_stage_s) * 8, p_phase_s);
+                    mbarrier_wait(p_empty_addr + (p_stage_s) * 8, _phase_p_empty);
 #else
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 #endif
@@ -1418,9 +1421,9 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                         "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                         "}"
-                        :: "r"(p_full_addr + (unsigned int)(p_stage_s * 8)), "r"(0) : "memory");
+                        :: "r"(p_full_addr + (p_stage_s) * 8), "r"(0) : "memory");
                     p_stage_s += 1;
-                    if (p_stage_s == 2) { p_stage_s = 0; p_phase_s ^= 1; }
+                    if (p_stage_s == 2) { p_stage_s = 0; _phase_p_empty ^= 1; }
                 }
                 mbarrier_wait(o_full_addr, _phase_o_full_0);
                 _phase_o_full_0 ^= 1;
@@ -3303,11 +3306,14 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
             int row_cc = quadrant_c % 2 * 32 + lane;
             int lane_base_c = quadrant_c * 32 << 16;
             int p_stage_c = 0;
-            int p_phase_c = 0;
-            int raw_stage_c = 0;
-            int raw_phase_c = 0;
-            int sf_stage_c = 0;
-            int sf_phase_c = 1;
+            int raw_stage_c = 2;
+            unsigned int _phase_raw_full = 1;
+            raw_stage_c += 1;
+            if (raw_stage_c == 3) { raw_stage_c = 0; _phase_raw_full ^= 1; }
+            int sf_stage_c = 1;
+            unsigned int _phase_sf_empty = 0;
+            sf_stage_c += 1;
+            if (sf_stage_c == 2) { sf_stage_c = 0; _phase_sf_empty ^= 1; }
             int unit_c = cluster_id;
             int item_lo_c = unit_first[unit_c];
             int item_hi_c = unit_first[unit_c + 1];
@@ -3539,8 +3545,8 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                     "}"
                     :: "r"(sfa_full_addr), "r"(0) : "memory");
-                mbarrier_wait(raw_full_addr + (raw_stage_c) * 8, raw_phase_c);
-                mbarrier_wait(sf_empty_addr + (sf_stage_c) * 8, sf_phase_c);
+                mbarrier_wait(raw_full_addr + (raw_stage_c) * 8, _phase_raw_full);
+                mbarrier_wait(sf_empty_addr + (sf_stage_c) * 8, _phase_sf_empty);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 int sfb_base_c = taddr + (unsigned int)lane_base_c + 352 + (unsigned int)(sf_stage_c * 32);
                 unsigned int k_words_c[8];
@@ -3594,11 +3600,11 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                     "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                     "}"
-                    :: "r"(sf_full_addr + (unsigned int)(sf_stage_c * 8)), "r"(0) : "memory");
+                    :: "r"(sf_full_addr + (sf_stage_c) * 8), "r"(0) : "memory");
                 sf_stage_c += 1;
-                if (sf_stage_c == 2) { sf_stage_c = 0; sf_phase_c ^= 1; }
-                mbarrier_wait(raw_full_addr + (raw_stage_c) * 8, raw_phase_c);
-                mbarrier_wait(sf_empty_addr + (sf_stage_c) * 8, sf_phase_c);
+                if (sf_stage_c == 2) { sf_stage_c = 0; _phase_sf_empty ^= 1; }
+                mbarrier_wait(raw_full_addr + (raw_stage_c) * 8, _phase_raw_full);
+                mbarrier_wait(sf_empty_addr + (sf_stage_c) * 8, _phase_sf_empty);
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 int sfb_base_c_3 = taddr + (unsigned int)lane_base_c + 352 + (unsigned int)(sf_stage_c * 32);
                 unsigned int k_words_c_4[8];
@@ -3647,7 +3653,7 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 mbarrier_arrive(raw_empty_addr + (raw_stage_c) * 8);
                 raw_stage_c += 1;
-                if (raw_stage_c == 3) { raw_stage_c = 0; raw_phase_c ^= 1; }
+                if (raw_stage_c == 3) { raw_stage_c = 0; _phase_raw_full ^= 1; }
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 asm volatile(
@@ -3656,12 +3662,12 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                     "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                     "}"
-                    :: "r"(sf_full_addr + (unsigned int)(sf_stage_c * 8)), "r"(0) : "memory");
+                    :: "r"(sf_full_addr + (sf_stage_c) * 8), "r"(0) : "memory");
                 sf_stage_c += 1;
-                if (sf_stage_c == 2) { sf_stage_c = 0; sf_phase_c ^= 1; }
+                if (sf_stage_c == 2) { sf_stage_c = 0; _phase_sf_empty ^= 1; }
                 if (num_tiles_c > 1) {
-                    mbarrier_wait(raw_full_addr + (raw_stage_c) * 8, raw_phase_c);
-                    mbarrier_wait(sf_empty_addr + (sf_stage_c) * 8, sf_phase_c);
+                    mbarrier_wait(raw_full_addr + (raw_stage_c) * 8, _phase_raw_full);
+                    mbarrier_wait(sf_empty_addr + (sf_stage_c) * 8, _phase_sf_empty);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     int sfb_base_c_0 = taddr + (unsigned int)lane_base_c + 352 + (unsigned int)(sf_stage_c * 32);
                     unsigned int k_words_c_1[8];
@@ -3715,11 +3721,11 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                         "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                         "}"
-                        :: "r"(sf_full_addr + (unsigned int)(sf_stage_c * 8)), "r"(0) : "memory");
+                        :: "r"(sf_full_addr + (sf_stage_c) * 8), "r"(0) : "memory");
                     sf_stage_c += 1;
-                    if (sf_stage_c == 2) { sf_stage_c = 0; sf_phase_c ^= 1; }
-                    mbarrier_wait(raw_full_addr + (raw_stage_c) * 8, raw_phase_c);
-                    mbarrier_wait(sf_empty_addr + (sf_stage_c) * 8, sf_phase_c);
+                    if (sf_stage_c == 2) { sf_stage_c = 0; _phase_sf_empty ^= 1; }
+                    mbarrier_wait(raw_full_addr + (raw_stage_c) * 8, _phase_raw_full);
+                    mbarrier_wait(sf_empty_addr + (sf_stage_c) * 8, _phase_sf_empty);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     int sfb_base_c_4 = taddr + (unsigned int)lane_base_c + 352 + (unsigned int)(sf_stage_c * 32);
                     unsigned int k_words_c_5[8];
@@ -3768,7 +3774,7 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(raw_empty_addr + (raw_stage_c) * 8);
                     raw_stage_c += 1;
-                    if (raw_stage_c == 3) { raw_stage_c = 0; raw_phase_c ^= 1; }
+                    if (raw_stage_c == 3) { raw_stage_c = 0; _phase_raw_full ^= 1; }
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile(
@@ -3777,9 +3783,9 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                         "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                         "}"
-                        :: "r"(sf_full_addr + (unsigned int)(sf_stage_c * 8)), "r"(0) : "memory");
+                        :: "r"(sf_full_addr + (sf_stage_c) * 8), "r"(0) : "memory");
                     sf_stage_c += 1;
-                    if (sf_stage_c == 2) { sf_stage_c = 0; sf_phase_c ^= 1; }
+                    if (sf_stage_c == 2) { sf_stage_c = 0; _phase_sf_empty ^= 1; }
                 }
                 #pragma unroll 1
                 for (int it_c = 0; it_c < num_tiles_c; it_c++) {
@@ -3821,7 +3827,7 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                         "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                         "}"
-                        :: "r"(p_full_addr + (unsigned int)(p_stage_c * 8)), "r"(0) : "memory");
+                        :: "r"(p_full_addr + (p_stage_c) * 8), "r"(0) : "memory");
                     if (it_c > 0) {
                         if (need_rescale == 0) {
                             mbarrier_wait(pv_done_addr, _phase_pv_done_0);
@@ -3829,10 +3835,10 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                         }
                     }
                     p_stage_c += 1;
-                    if (p_stage_c == 2) { p_stage_c = 0; p_phase_c ^= 1; }
+                    if (p_stage_c == 2) { p_stage_c = 0; }
                     if (num_tiles_c > it_c + 2) {
-                        mbarrier_wait(raw_full_addr + (raw_stage_c) * 8, raw_phase_c);
-                        mbarrier_wait(sf_empty_addr + (sf_stage_c) * 8, sf_phase_c);
+                        mbarrier_wait(raw_full_addr + (raw_stage_c) * 8, _phase_raw_full);
+                        mbarrier_wait(sf_empty_addr + (sf_stage_c) * 8, _phase_sf_empty);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         int sfb_base_c_0_1 = taddr + (unsigned int)lane_base_c + 352 + (unsigned int)(sf_stage_c * 32);
                         unsigned int k_words_c_1_1[8];
@@ -3886,11 +3892,11 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                             "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                             "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                             "}"
-                            :: "r"(sf_full_addr + (unsigned int)(sf_stage_c * 8)), "r"(0) : "memory");
+                            :: "r"(sf_full_addr + (sf_stage_c) * 8), "r"(0) : "memory");
                         sf_stage_c += 1;
-                        if (sf_stage_c == 2) { sf_stage_c = 0; sf_phase_c ^= 1; }
-                        mbarrier_wait(raw_full_addr + (raw_stage_c) * 8, raw_phase_c);
-                        mbarrier_wait(sf_empty_addr + (sf_stage_c) * 8, sf_phase_c);
+                        if (sf_stage_c == 2) { sf_stage_c = 0; _phase_sf_empty ^= 1; }
+                        mbarrier_wait(raw_full_addr + (raw_stage_c) * 8, _phase_raw_full);
+                        mbarrier_wait(sf_empty_addr + (sf_stage_c) * 8, _phase_sf_empty);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         int sfb_base_c_4_1 = taddr + (unsigned int)lane_base_c + 352 + (unsigned int)(sf_stage_c * 32);
                         unsigned int k_words_c_5_1[8];
@@ -3939,7 +3945,7 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                         asm volatile("tcgen05.fence::before_thread_sync;");
                         mbarrier_arrive(raw_empty_addr + (raw_stage_c) * 8);
                         raw_stage_c += 1;
-                        if (raw_stage_c == 3) { raw_stage_c = 0; raw_phase_c ^= 1; }
+                        if (raw_stage_c == 3) { raw_stage_c = 0; _phase_raw_full ^= 1; }
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                         asm volatile("tcgen05.fence::before_thread_sync;");
                         asm volatile(
@@ -3948,9 +3954,9 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                             "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                             "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                             "}"
-                            :: "r"(sf_full_addr + (unsigned int)(sf_stage_c * 8)), "r"(0) : "memory");
+                            :: "r"(sf_full_addr + (sf_stage_c) * 8), "r"(0) : "memory");
                         sf_stage_c += 1;
-                        if (sf_stage_c == 2) { sf_stage_c = 0; sf_phase_c ^= 1; }
+                        if (sf_stage_c == 2) { sf_stage_c = 0; _phase_sf_empty ^= 1; }
                     }
                 }
                 mbarrier_wait(pv_done_addr, _phase_pv_done_0);
@@ -3962,10 +3968,14 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
     // ---- Role: transform ----
     if (warp >= 8 && warp <= 13) {
         { // transform_main
-            int raw_stage_t = 0;
-            int raw_phase_t = 0;
-            int v_stage_t = 0;
-            int v_phase_t = 1;
+            int raw_stage_t = 2;
+            unsigned int _phase_raw_full_1 = 1;
+            raw_stage_t += 1;
+            if (raw_stage_t == 3) { raw_stage_t = 0; _phase_raw_full_1 ^= 1; }
+            int v_stage_t = 1;
+            unsigned int _phase_v_empty = 0;
+            v_stage_t += 1;
+            if (v_stage_t == 2) { v_stage_t = 0; _phase_v_empty ^= 1; }
             int role_tid = (warp - 8) * 32 + lane;
             int rank_t = cta_rank;
             int unit_t = cluster_id;
@@ -4004,8 +4014,8 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                 int num_tiles_t = tile_end_t - tile_start_t;
                 #pragma unroll 1
                 for (int it_t = 0; it_t < num_tiles_t; it_t++) {
-                    mbarrier_wait(raw_full_addr + (raw_stage_t) * 8, raw_phase_t);
-                    mbarrier_wait(v_empty_addr + (v_stage_t) * 8, v_phase_t);
+                    mbarrier_wait(raw_full_addr + (raw_stage_t) * 8, _phase_raw_full_1);
+                    mbarrier_wait(v_empty_addr + (v_stage_t) * 8, _phase_v_empty);
                     asm volatile("nanosleep.u32 %0;" :: "r"(200));
 #if __CUDA_ARCH__ == 1030
 #else
@@ -4593,12 +4603,12 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                         "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                         "}"
-                        :: "r"(v_full_addr + (unsigned int)(v_stage_t * 8)), "r"(0) : "memory");
+                        :: "r"(v_full_addr + (v_stage_t) * 8), "r"(0) : "memory");
                     mbarrier_arrive(raw_empty_addr + (raw_stage_t) * 8);
                     raw_stage_t += 1;
-                    if (raw_stage_t == 3) { raw_stage_t = 0; raw_phase_t ^= 1; }
+                    if (raw_stage_t == 3) { raw_stage_t = 0; _phase_raw_full_1 ^= 1; }
                     v_stage_t += 1;
-                    if (v_stage_t == 2) { v_stage_t = 0; v_phase_t ^= 1; }
+                    if (v_stage_t == 2) { v_stage_t = 0; _phase_v_empty ^= 1; }
                 }
                 gt_t = gt_t + num_tiles_t;
             }
@@ -4607,8 +4617,10 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
     // ---- Role: load ----
     if (warp == 14) {
         { // load_main
-            int raw_stage_l = 0;
-            int raw_phase_l = 1;
+            int raw_stage_l = 2;
+            unsigned int _phase_raw_empty = 0;
+            raw_stage_l += 1;
+            if (raw_stage_l == 3) { raw_stage_l = 0; _phase_raw_empty ^= 1; }
             int unit_l = cluster_id;
             int rank_l = cta_rank;
             int item_lo_l = unit_first[unit_l];
@@ -4655,7 +4667,7 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                     if (num_pages_l <= 2 * (tile_start_l + it_l) + 1) {
                         page_b = page_a;
                     }
-                    mbarrier_wait(raw_empty_addr + (raw_stage_l) * 8, raw_phase_l);
+                    mbarrier_wait(raw_empty_addr + (raw_stage_l) * 8, _phase_raw_empty);
                     if (elect_sync()) {
                         mbarrier_arrive_expect_tx(raw_full_addr + (raw_stage_l) * 8, 28672);
                         int kv_row_own_h = page_a * 64 + rank_l * 32;
@@ -4688,7 +4700,7 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                         tma_2d_gmem2smem(smem_ks_addr + (unsigned int)(raw_stage_l * 28672) + 2048, (&KVS), 0, page_b * 64, raw_full_addr + (raw_stage_l) * 8);
                     }
                     raw_stage_l += 1;
-                    if (raw_stage_l == 3) { raw_stage_l = 0; raw_phase_l ^= 1; }
+                    if (raw_stage_l == 3) { raw_stage_l = 0; _phase_raw_empty ^= 1; }
                 }
                 gt_l = gt_l + num_tiles_l;
             }
@@ -4697,16 +4709,26 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
     // ---- Role: mma ----
     if (warp == 15) {
         { // mma_main
-            int raw_stage_m = 0;
-            int raw_phase_m = 0;
-            int v_stage_m = 0;
-            int v_phase_m = 0;
-            int p_stage_m = 0;
-            int p_phase_m = 0;
-            int s_stage_m = 0;
-            int s_phase_m = 1;
-            int sf_stage_m = 0;
-            int sf_phase_m = 0;
+            int raw_stage_m = 2;
+            unsigned int _phase_raw_full_2 = 1;
+            raw_stage_m += 1;
+            if (raw_stage_m == 3) { raw_stage_m = 0; _phase_raw_full_2 ^= 1; }
+            int v_stage_m = 1;
+            unsigned int _phase_v_full = 1;
+            v_stage_m += 1;
+            if (v_stage_m == 2) { v_stage_m = 0; _phase_v_full ^= 1; }
+            int p_stage_m = 1;
+            unsigned int _phase_p_full = 1;
+            p_stage_m += 1;
+            if (p_stage_m == 2) { p_stage_m = 0; _phase_p_full ^= 1; }
+            int s_stage_m = 1;
+            unsigned int _phase_s_empty = 0;
+            s_stage_m += 1;
+            if (s_stage_m == 2) { s_stage_m = 0; _phase_s_empty ^= 1; }
+            int sf_stage_m = 1;
+            unsigned int _phase_sf_full = 1;
+            sf_stage_m += 1;
+            if (sf_stage_m == 2) { sf_stage_m = 0; _phase_sf_full ^= 1; }
             int unit_m = cluster_id;
             int item_lo_m = unit_first[unit_m];
             int item_hi_m = unit_first[unit_m + 1];
@@ -4728,9 +4750,9 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                         _phase_sfa_full_0 ^= 1;
                         #pragma unroll 1
                         for (int it_m = 0; it_m < num_tiles_m; it_m++) {
-                            mbarrier_wait(raw_full_addr + (raw_stage_m) * 8, raw_phase_m);
-                            mbarrier_wait(sf_full_addr + (sf_stage_m) * 8, sf_phase_m);
-                            mbarrier_wait(s_empty_addr + (s_stage_m) * 8, s_phase_m);
+                            mbarrier_wait(raw_full_addr + (raw_stage_m) * 8, _phase_raw_full_2);
+                            mbarrier_wait(sf_full_addr + (sf_stage_m) * 8, _phase_sf_full);
+                            mbarrier_wait(s_empty_addr + (s_stage_m) * 8, _phase_s_empty);
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             if (s_stage_m == 0) {
                                 int _smem_desc_lo_0 = (((smem_kq0h0_addr) >> 4) & 0x3FFF) + (raw_stage_m) * 1792;
@@ -4786,12 +4808,12 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                             tcgen05_commit_cg2_multicast(s_full_addr + (s_stage_m) * 8, (uint16_t)(3));
                             tcgen05_commit_cg2_multicast(sf_empty_addr + (sf_stage_m) * 8, (uint16_t)(3));
                             sf_stage_m += 1;
-                            if (sf_stage_m == 2) { sf_stage_m = 0; sf_phase_m ^= 1; }
+                            if (sf_stage_m == 2) { sf_stage_m = 0; _phase_sf_full ^= 1; }
                             s_stage_m += 1;
-                            if (s_stage_m == 2) { s_stage_m = 0; s_phase_m ^= 1; }
-                            mbarrier_wait(raw_full_addr + (raw_stage_m) * 8, raw_phase_m);
-                            mbarrier_wait(sf_full_addr + (sf_stage_m) * 8, sf_phase_m);
-                            mbarrier_wait(s_empty_addr + (s_stage_m) * 8, s_phase_m);
+                            if (s_stage_m == 2) { s_stage_m = 0; _phase_s_empty ^= 1; }
+                            mbarrier_wait(raw_full_addr + (raw_stage_m) * 8, _phase_raw_full_2);
+                            mbarrier_wait(sf_full_addr + (sf_stage_m) * 8, _phase_sf_full);
+                            mbarrier_wait(s_empty_addr + (s_stage_m) * 8, _phase_s_empty);
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             if (s_stage_m == 0) {
                                 int _smem_desc_lo_8 = (((smem_kq0h1_addr) >> 4) & 0x3FFF) + (raw_stage_m) * 1792;
@@ -4848,19 +4870,19 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                             tcgen05_commit_cg2_multicast(sf_empty_addr + (sf_stage_m) * 8, (uint16_t)(3));
                             tcgen05_commit_cg2_multicast(raw_empty_addr + (raw_stage_m) * 8, (uint16_t)(3));
                             raw_stage_m += 1;
-                            if (raw_stage_m == 3) { raw_stage_m = 0; raw_phase_m ^= 1; }
+                            if (raw_stage_m == 3) { raw_stage_m = 0; _phase_raw_full_2 ^= 1; }
                             sf_stage_m += 1;
-                            if (sf_stage_m == 2) { sf_stage_m = 0; sf_phase_m ^= 1; }
+                            if (sf_stage_m == 2) { sf_stage_m = 0; _phase_sf_full ^= 1; }
                             s_stage_m += 1;
-                            if (s_stage_m == 2) { s_stage_m = 0; s_phase_m ^= 1; }
+                            if (s_stage_m == 2) { s_stage_m = 0; _phase_s_empty ^= 1; }
                             if (it_m >= 1) {
                                 if (it_m - 1 == 0) {
                                     mbarrier_wait(o_empty_addr, _phase_o_empty_0);
                                     _phase_o_empty_0 ^= 1;
                                 }
                                 int first_pv_flag = ((it_m - 1 == 0) ? 1 : 0);
-                                mbarrier_wait(v_full_addr + (v_stage_m) * 8, v_phase_m);
-                                mbarrier_wait(p_full_addr + (p_stage_m) * 8, p_phase_m);
+                                mbarrier_wait(v_full_addr + (v_stage_m) * 8, _phase_v_full);
+                                mbarrier_wait(p_full_addr + (p_stage_m) * 8, _phase_p_full);
                                 asm volatile("tcgen05.fence::after_thread_sync;");
                                 {
                                     int _smem_desc_lo_16 = (((smem_p_addr) >> 4) & 0x3FFF) + (p_stage_m) * 512;
@@ -5081,22 +5103,23 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                                 tcgen05_commit_cg2_multicast(p_empty_addr + (p_stage_m) * 8, (uint16_t)(3));
                                 tcgen05_commit_cg2_multicast(v_empty_addr + (v_stage_m) * 8, (uint16_t)(3));
                                 p_stage_m += 1;
-                                if (p_stage_m == 2) { p_stage_m = 0; p_phase_m ^= 1; }
+                                if (p_stage_m == 2) { p_stage_m = 0; _phase_p_full ^= 1; }
                                 v_stage_m += 1;
-                                if (v_stage_m == 2) { v_stage_m = 0; v_phase_m ^= 1; }
+                                if (v_stage_m == 2) { v_stage_m = 0; _phase_v_full ^= 1; }
                                 if (it_m - 1 + 1 == num_tiles_m) {
                                     tcgen05_commit_cg2_multicast(o_full_addr, (uint16_t)(3));
                                 }
                             }
                         }
                         tcgen05_commit_cg2_multicast(q_empty_addr, (uint16_t)(3));
+                        gt_m += num_tiles_m;
                         if (num_tiles_m - 1 == 0) {
                             mbarrier_wait(o_empty_addr, _phase_o_empty_0);
                             _phase_o_empty_0 ^= 1;
                         }
                         int first_pv_flag_1 = ((num_tiles_m - 1 == 0) ? 1 : 0);
-                        mbarrier_wait(v_full_addr + (v_stage_m) * 8, v_phase_m);
-                        mbarrier_wait(p_full_addr + (p_stage_m) * 8, p_phase_m);
+                        mbarrier_wait(v_full_addr + (v_stage_m) * 8, _phase_v_full);
+                        mbarrier_wait(p_full_addr + (p_stage_m) * 8, _phase_p_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         {
 #if __CUDA_ARCH__ == 1030
@@ -5328,13 +5351,12 @@ kernel_cake_nvfp4_mla_decode_4cd8124d834b7ab3a055(const __grid_constant__ CUtens
                         tcgen05_commit_cg2_multicast(p_empty_addr + (p_stage_m) * 8, (uint16_t)(3));
                         tcgen05_commit_cg2_multicast(v_empty_addr + (v_stage_m) * 8, (uint16_t)(3));
                         p_stage_m += 1;
-                        if (p_stage_m == 2) { p_stage_m = 0; p_phase_m ^= 1; }
+                        if (p_stage_m == 2) { p_stage_m = 0; _phase_p_full ^= 1; }
                         v_stage_m += 1;
-                        if (v_stage_m == 2) { v_stage_m = 0; v_phase_m ^= 1; }
+                        if (v_stage_m == 2) { v_stage_m = 0; _phase_v_full ^= 1; }
                         if (num_tiles_m - 1 + 1 == num_tiles_m) {
                             tcgen05_commit_cg2_multicast(o_full_addr, (uint16_t)(3));
                         }
-                        gt_m = gt_m + num_tiles_m;
                     }
                 }
             }

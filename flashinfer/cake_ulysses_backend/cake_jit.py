@@ -34,15 +34,16 @@ element type (``bf16`` / ``f16`` / ``f32``) and ``world_size`` the group size
 (2, 4, 6 or 8).  Batch, sequence and head counts are runtime scalars, so a
 changed problem size never recompiles anything.
 
-Two routes share one signal protocol.  The staged route (records
+Two routes share one signal allocation.  The staged route (records
 ``<scatter|gather>_<dtype>_w<world_size>``) takes any output: it moves every
 rank's blocks through the communicator's symmetric staging allocations.  The
 direct route (records ``direct_<scatter|gather>_<dtype>_w<world_size>``)
 writes every block straight into its destination rank's output, so it takes
 only an output every rank allocated together and exchanged over CUDA IPC
-(``UlyssesCommunicator.allocate_output``).  Both kernels count the same epoch
-word and keep their flags in disjoint words, so one communicator may alternate
-them call by call.
+(``UlyssesCommunicator.allocate_output``).  The two kernels keep their epochs
+and flags in disjoint words of that allocation (the staged kernel one epoch
+word for the launch, the direct kernel one per CTA), so one communicator may
+alternate them call by call.
 
 Each kernel takes the caller's input and output, two by-value peer tables of
 exactly :data:`PEER_TABLE_CAPACITY` device addresses (entry ``r`` is rank
