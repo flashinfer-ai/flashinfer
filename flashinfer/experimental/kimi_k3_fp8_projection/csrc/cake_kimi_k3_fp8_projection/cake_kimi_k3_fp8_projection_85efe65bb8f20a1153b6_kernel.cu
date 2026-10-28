@@ -618,14 +618,14 @@ kernel_cake_kimi_k3_fp8_projection_85efe65bb8f20a1153b6(const __grid_constant__ 
                     } else {
                         int _max_10 = ((0) > (1 - my_rank) ? (0) : (1 - my_rank));
                         int _min_9 = ((1) < (_max_10) ? (1) : (_max_10));
-                        int o_idx_1 = 1 - _min_9;
-                        unsigned int stg_b_1 = (unsigned int)(o_idx_1 * 2560) + line_b;
+                        int o_idx_0 = 1 - _min_9;
+                        unsigned int stg_b_0 = (unsigned int)(o_idx_0 * 2560) + line_b;
                         {
-                            uint32_t _addr_11 = static_cast<uint32_t>(smem_stg_addr + stg_b_1);
+                            uint32_t _addr_11 = static_cast<uint32_t>(smem_stg_addr + stg_b_0);
                             asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_11), "f"(_tmem_load_0[2]) : "memory");
                         }
                         {
-                            uint32_t _addr_12 = static_cast<uint32_t>(smem_stg_addr + (stg_b_1 + 4));
+                            uint32_t _addr_12 = static_cast<uint32_t>(smem_stg_addr + (stg_b_0 + 4));
                             asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_12), "f"(_tmem_load_0[3]) : "memory");
                         }
                     }
@@ -641,14 +641,14 @@ kernel_cake_kimi_k3_fp8_projection_85efe65bb8f20a1153b6(const __grid_constant__ 
                     } else {
                         int _max_16 = ((0) > (2 - my_rank) ? (0) : (2 - my_rank));
                         int _min_15 = ((1) < (_max_16) ? (1) : (_max_16));
-                        int o_idx_2 = 2 - _min_15;
-                        unsigned int stg_b_2 = (unsigned int)(o_idx_2 * 2560) + line_b;
+                        int o_idx_1 = 2 - _min_15;
+                        unsigned int stg_b_1 = (unsigned int)(o_idx_1 * 2560) + line_b;
                         {
-                            uint32_t _addr_17 = static_cast<uint32_t>(smem_stg_addr + stg_b_2);
+                            uint32_t _addr_17 = static_cast<uint32_t>(smem_stg_addr + stg_b_1);
                             asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_17), "f"(_tmem_load_0[4]) : "memory");
                         }
                         {
-                            uint32_t _addr_18 = static_cast<uint32_t>(smem_stg_addr + (stg_b_2 + 4));
+                            uint32_t _addr_18 = static_cast<uint32_t>(smem_stg_addr + (stg_b_1 + 4));
                             asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_18), "f"(_tmem_load_0[5]) : "memory");
                         }
                     }
@@ -664,14 +664,14 @@ kernel_cake_kimi_k3_fp8_projection_85efe65bb8f20a1153b6(const __grid_constant__ 
                     } else {
                         int _max_22 = ((0) > (3 - my_rank) ? (0) : (3 - my_rank));
                         int _min_21 = ((1) < (_max_22) ? (1) : (_max_22));
-                        int o_idx_3 = 3 - _min_21;
-                        unsigned int stg_b_3 = (unsigned int)(o_idx_3 * 2560) + line_b;
+                        int o_idx_2 = 3 - _min_21;
+                        unsigned int stg_b_2 = (unsigned int)(o_idx_2 * 2560) + line_b;
                         {
-                            uint32_t _addr_23 = static_cast<uint32_t>(smem_stg_addr + stg_b_3);
+                            uint32_t _addr_23 = static_cast<uint32_t>(smem_stg_addr + stg_b_2);
                             asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_23), "f"(_tmem_load_0[6]) : "memory");
                         }
                         {
-                            uint32_t _addr_24 = static_cast<uint32_t>(smem_stg_addr + (stg_b_3 + 4));
+                            uint32_t _addr_24 = static_cast<uint32_t>(smem_stg_addr + (stg_b_2 + 4));
                             asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_24), "f"(_tmem_load_0[7]) : "memory");
                         }
                     }
@@ -684,7 +684,7 @@ kernel_cake_kimi_k3_fp8_projection_85efe65bb8f20a1153b6(const __grid_constant__ 
                     if (0 != my_rank) {
                         int _max_27 = ((0) > (-my_rank) ? (0) : (-my_rank));
                         int _min_26 = ((1) < (_max_27) ? (1) : (_max_27));
-                        int o_idx_c = -_min_26;
+                        int o_idx_c_0 = -_min_26;
                         uint32_t _mbar_peer_28;
                         asm(
                             "mapa.shared::cluster.u32 %0, %1, %2;"
@@ -696,7 +696,7 @@ kernel_cake_kimi_k3_fp8_projection_85efe65bb8f20a1153b6(const __grid_constant__ 
                         asm volatile(
                             "cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes"
                             " [%0], [%1], %2, [%3];"
-                            :: "r"(_cluster_mapa_29), "r"(smem_stg_addr + (unsigned int)(o_idx_c * 2560)), "r"((uint32_t)(2560)), "r"(_mbar_peer_28)
+                            :: "r"(_cluster_mapa_29), "r"(smem_stg_addr + (unsigned int)(o_idx_c_0 * 2560)), "r"((uint32_t)(2560)), "r"(_mbar_peer_28)
                             : "memory");
                     }
                     if (1 != my_rank) {
