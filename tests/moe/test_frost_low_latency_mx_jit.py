@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from flashinfer.fused_moe import QuantFormat
+from flashinfer.utils import is_sm100a_supported
 from tests.moe.test_frost_low_latency_mx_contracts import (
     _TensorMetadata,
     _packs,
@@ -245,11 +246,14 @@ def _native_mx_pipeline(format_name, device_index, top_k=2):
 @pytest.mark.parametrize("top_k", [2, 6])
 def test_native_mx_cross_arch_pipeline_in_fresh_process(format_name, top_k, tmp_path):
     pytest.importorskip("cutlass", minversion="4.8")
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
-        (10, 0),
-        (10, 3),
+    if (
+        not torch.cuda.is_available()
+        or torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
+        or not is_sm100a_supported(torch.device("cuda", torch.cuda.current_device()))
     ):
-        pytest.skip("Native MX cross-architecture regression requires SM100/SM103")
+        pytest.skip(
+            "Native MX cross-architecture regression requires SM100/SM103 and CUDA 12.8+"
+        )
     environment = os.environ.copy()
     environment["CUTE_DSL_ARCH"] = "sm_90a"
     # Changing the compiler target needs a private cache namespace. Inherit
