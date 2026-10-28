@@ -149,6 +149,7 @@ def make_moe_tuning_config(
     init_packed_topk_ids: Callable | None,
     tune_max_num_tokens: int = 8192,
     act_sf_layout: SfLayout = SUPPORTED_MOE_ACT_SF_LAYOUT,
+    keep_empty_expert_weights_static: bool = False,
     **kwargs: Any,
 ) -> TuningConfig:
     """Build a TuningConfig for a MoE runner instance.
@@ -157,6 +158,11 @@ def make_moe_tuning_config(
     ``hidden_states_scale``; resolve it in the caller with
     :func:`~flashinfer.fused_moe.shared.validation.resolve_moe_act_sf_layout`
     so its DeprecationWarning is attributed to the user's call site.
+
+    ``keep_empty_expert_weights_static`` preserves an empty routing sentinel
+    instead of synthesizing a token-shaped tensor. It is opt-in so backends
+    whose persisted cache keys historically bucketized empty placeholders keep
+    their existing profile shape.
     """
 
     spec = {
@@ -169,7 +175,9 @@ def make_moe_tuning_config(
         # Empty routed placeholders remain dynamic inputs so their historical
         # bucketed cache-key shape is preserved. They carry no route payload.
         spec["topk_ids"] = init_packed_topk_ids or autotuner_initializer_empty
-    if moe_inputs.expert_weights is not None:
+    if moe_inputs.expert_weights is not None and not (
+        keep_empty_expert_weights_static and moe_inputs.expert_weights.numel() == 0
+    ):
         spec["expert_weights"] = autotuner_initializer_ones
     if moe_inputs.hidden_states_scale is not None:
         spec["hidden_states_scale"] = autotuner_initializer_ones
