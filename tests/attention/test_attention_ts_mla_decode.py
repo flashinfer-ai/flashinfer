@@ -1673,6 +1673,51 @@ def test_attention_ts_mla_explicit_split_preserves_explicit_profile():
         )
 
 
+def test_attention_ts_mla_build_advisories_are_opt_in(monkeypatch, capsys):
+    """Quiet default builds retain errors and expose advisories in debug mode."""
+    import warnings
+
+    from flashinfer.attention.prims_ts.kernels.mla_decode.helpers.diagnostics import (
+        mla_build_diagnostics,
+    )
+    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.config import (
+        make_mla_decode_config,
+    )
+    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.kernel import (
+        build_mla_decode_task_manager,
+    )
+
+    monkeypatch.setenv("FLASHINFER_PRIMS_TS_DEBUG_CHECKS", "0")
+    with warnings.catch_warnings(record=True) as emitted:
+        warnings.simplefilter("always")
+        with mla_build_diagnostics():
+            manager, _, _ = build_mla_decode_task_manager(
+                make_mla_decode_config(),
+                domain=2,
+                exhaustive_deadlock_race_check=False,
+            )
+            warnings.warn("unrelated build warning", UserWarning, stacklevel=2)
+    assert "[head-loop-overlap]" not in capsys.readouterr().out
+    assert [str(item.message) for item in emitted] == ["unrelated build warning"]
+
+    monkeypatch.setenv("FLASHINFER_PRIMS_TS_DEBUG_CHECKS", "1")
+    with warnings.catch_warnings(record=True) as emitted:
+        warnings.simplefilter("always")
+        with mla_build_diagnostics():
+            build_mla_decode_task_manager(
+                make_mla_decode_config(),
+                domain=2,
+                exhaustive_deadlock_race_check=False,
+            )
+    assert "[head-loop-overlap]" in capsys.readouterr().out
+    assert any("never routed" in str(item.message) for item in emitted)
+
+    monkeypatch.setenv("FLASHINFER_PRIMS_TS_DEBUG_CHECKS", "0")
+    manager.tasks[0].num_registers = 512
+    with pytest.raises(ValueError), mla_build_diagnostics():
+        manager.print_and_verify()
+
+
 def test_attention_ts_mla_partial_tail_rejects_cluster_reduction():
     """Keep partial flat-row tails on the predicated standalone reducer."""
 

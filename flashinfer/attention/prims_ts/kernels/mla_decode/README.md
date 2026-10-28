@@ -44,6 +44,36 @@ Use `BatchMLADecodePagedTSWrapper` for dense pages and
 docstrings define tensor layouts, workspace ownership, validation and capture
 requirements. The one-shot helpers are eager interfaces; plan before capture.
 
+For serving, validate metadata invariants upstream and use `run(validate=False)`
+in the hot path. The default `validate=True` checks GPU values on the host and
+synchronizes. Q quantization and query RoPE are caller-owned preparation.
+
+Fixed plans retain their B/Sq geometry. A sparse wrapper can serve a range of
+independent row counts with one profile: plan `batch_size=1`,
+`packed_query=True`, `max_seq_len_q=row_capacity`, then pass `[rows,H,D]` Q and
+CUDA INT32 `qo_indptr=[0,rows]` with `rows <= row_capacity`. Choose capacity for
+the desired workload range; each graph retains its captured views and addresses.
+
+The 1CTA persistent/CLC scheduler requires `split_kv=1`: its work queue does
+not enumerate KV splits. Whole-tile K/V reuse can still run with split-KV using
+a nonpersistent schedule. Low-level profile overrides must obey this constraint;
+2CTA scheduling has its own split-aware work queue.
+
+Quantized H16/H32 plans retain whole converted K/V tiles for small grids too.
+Below half an SM wave, a nonpersistent power-of-two KV split fills one wave
+while keeping at least two KV tiles per split. Larger grids use the persistent
+reuse schedule. The resource layout therefore does not fall back to duplicated
+conversion just because the planned row count is small.
+
+Quantized persistent 2CTA launches balance their waves using live tensor
+extents. The compilation key retains the physical SM limit, so different
+row buckets that choose the same profile reuse one compiled kernel.
+
+Routine task-builder HEAD/LOOP overlap and unused-routing advisories are quiet
+by default. Set `FLASHINFER_PRIMS_TS_DEBUG_CHECKS=1` before a cold build to display
+them. Runtime `validate` controls input checks separately; other compiler and
+schedule warnings/errors remain visible.
+
 Native dense 2CTA loaders cache 32 page IDs per warp. FP8 K/V loaders also
 prefetch the next window before waiting for a free data stage; the first
 window is loaded synchronously. Sparse NVFP4 loaders use source-tagged row

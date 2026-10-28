@@ -466,23 +466,30 @@ def select_sparse_mla_profile(
         and rope_dim in (0, 64)
         and heads <= 32
         and capacity >= 512
-        and rows * 2 >= sm_count
+        and (rows * 2 >= sm_count or heads >= 16)
     ):
-        # A resident query grid amortizes the separate raw gather and eight
-        # converters. Retain two complete tiles, independent of Q tile width.
+        # Retain complete converted tiles even when the query grid is small.
+        # Fill one resident wave with power-of-two KV partitions, preserving
+        # at least two tiles per split for the eight-issuer steady-state loop.
+        # Persistent 1CTA queues do not enumerate KV splits, so small grids
+        # use the same reuse resources with a nonpersistent split schedule.
+        persistent = rows * 2 >= sm_count
+        split_limit = min(capacity // 128 // 2, max(1, sm_count // rows))
+        splits = 1 if persistent else 1 << (split_limit.bit_length() - 1)
         # Above sixteen heads, WS M64 wins on GB300: its N256 PV consumes
         # Dv512 in two passes, whereas the narrow Swap-AB path needs four.
         keep = heads > 16
         return SparseMlaProfile(
             family="keep" if keep else "swap",
             tile_size_q=64 if keep else 8 if heads <= 8 else 16,
+            split_kv=splits,
             gather_issue_warps=8,
             reuse_kv=True,
             whole_kv_tile=True,
             single_kv_stream=not keep,
             uniform_offset_cache=keep,
             paired_correction=keep,
-            scheduler="clc",
+            scheduler="clc" if persistent else "nonpersistent",
         )
     choose = _choose_fp8 if dtype == "fp8" else _choose_bf16
     profile = choose(rows, heads, query_length, capacity, sm_count)

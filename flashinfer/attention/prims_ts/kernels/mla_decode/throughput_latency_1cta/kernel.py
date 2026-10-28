@@ -50,7 +50,7 @@ from cutlass.experimental.task_scheduling.resources import (
     WorkQueue,
     WorkTileInfo,
 )
-from cutlass.experimental.task_scheduling.task_manager import TaskManager
+from ..helpers.diagnostics import MlaTaskManager as TaskManager
 
 from .config import (
     MlaConfig,

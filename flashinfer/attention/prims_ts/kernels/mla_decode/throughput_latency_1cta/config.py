@@ -1090,7 +1090,10 @@ def persistent_override_profile(
         return profile
     if profile.use_multi_ctas_kv == 1:
         if explicit_persistent:
-            raise ValueError("persistent scheduling is not supported with split-KV")
+            raise ValueError(
+                "1CTA persistent scheduling is not supported with split-KV; "
+                "use split_kv=1 or nonpersistent scheduling"
+            )
         return profile
     if explicit_persistent:
         return replace(
@@ -1450,7 +1453,10 @@ def enumerate_throughput_latency_mla_profiles(
     )
     if explicit_split_kv is not None and explicit_split_kv > 0:
         if explicit_split_kv > 1 and explicit_persistent is True:
-            raise ValueError("persistent scheduling is not supported with split-KV")
+            raise ValueError(
+                "1CTA persistent scheduling is not supported with split-KV; "
+                "use split_kv=1 or nonpersistent scheduling"
+            )
         if explicit_split_kv == 1 and explicit_persistent is not None:
             if selected_tile_size_q >= 64:
                 profile = keeps_mma_ab_forced_persistent_profile(
@@ -1715,7 +1721,10 @@ def make_throughput_latency_mla_config(
         # Persistent work queues enumerate Q/head-dimension tiles, not KV
         # splits. Direct MlaProfile callers must obey the same restriction
         # as persistent_override_profile, or only split zero gets produced.
-        raise ValueError("persistent scheduling is not supported with split-KV")
+        raise ValueError(
+            "1CTA persistent scheduling is not supported with split-KV; "
+            "use split_kv=1 or nonpersistent scheduling"
+        )
     tile_size_q = tile_size_q_for_profile(
         selected_profile, num_heads_q, seq_len_q, tile_size_q
     )

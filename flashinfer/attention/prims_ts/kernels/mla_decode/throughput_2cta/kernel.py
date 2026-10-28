@@ -43,7 +43,7 @@ from cutlass.experimental.task_scheduling.resources import (
     TileSchedulerConfig,
 )
 from cutlass.experimental.task_scheduling.enums import SignalingThreads
-from cutlass.experimental.task_scheduling.task_manager import TaskManager
+from ..helpers.diagnostics import MlaTaskManager as TaskManager
 from ...tensor_map import (
     create_tensor_map_ragged_from_tensor,
     create_tensor_map_tiled_from_view,
@@ -1575,8 +1575,19 @@ class MlaDecodeTs(Nvfp4KVConfig):
             )
             grid = clc_tile_sched_params.get_grid_shape()
         else:
+            launch_clusters = Int32(self.max_active_clusters)
+            if cutlass.const_expr(
+                self.direct_sparse and self.has_nvfp4_kv and self.is_persistent
+            ):
+                # Equalize the persistent waves using the live host-side
+                # tensor extent. Baking this row-dependent cap into self
+                # creates a new JIT key for many otherwise identical graph
+                # buckets. Only the physical SM limit remains static.
+                work_clusters = batch_size * Int32(num_query_tiles) * kernel_split_kv
+                waves = (work_clusters + launch_clusters - Int32(1)) // launch_clusters
+                launch_clusters = (work_clusters + waves - Int32(1)) // waves
             grid = MLAStaticTileScheduler.get_grid_shape(
-                tile_sched_params, self.max_active_clusters
+                tile_sched_params, launch_clusters
             )
 
         # Initialize workspace for split_kv > 1

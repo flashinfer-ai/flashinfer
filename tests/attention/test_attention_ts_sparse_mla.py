@@ -1260,14 +1260,14 @@ def test_softmax_rescale_threshold_log2_rejected(dtype, threshold):
 
 
 @pytest.mark.parametrize(
-    "heads,precision",
-    [(h, "nvfp4") for h in (8, 12, 16, 32, 64, 128)]
-    + [(h, p) for h in (64, 128) for p in ("fp8", "bf16")],
+    "heads,precision,rows,topk",
+    [(h, "nvfp4", 160, 513) for h in (8, 12, 16, 32, 64, 128)]
+    + [(16, "nvfp4", 4, 2049), (32, "nvfp4", 32, 513)]
+    + [(h, p, 160, 513) for h in (64, 128) for p in ("fp8", "bf16")],
 )
-def test_d576_sparse_graph(heads, precision):
+def test_d576_sparse_graph(heads, precision, rows, topk):
     """Native352 cache mapping, tails, holes and live graph inputs on both families."""
     torch.manual_seed(123)
-    rows, topk = 160, 513
     q = (torch.randn(rows, 1, heads, 576, device="cuda") * 0.2).to(
         torch.bfloat16 if precision == "bf16" else torch.float8_e4m3fn
     )
@@ -1294,8 +1294,9 @@ def test_d576_sparse_graph(heads, precision):
         ref_cache = cache
     indices = torch.randint(1024, (rows, topk), device="cuda", dtype=torch.int32)
     lengths = torch.full((rows,), topk, device="cuda", dtype=torch.int32)
-    lengths[:6] = torch.tensor([0, 1, 127, 128, 129, 512], device="cuda")
-    indices[6, 17::31] = -1
+    boundary_lengths = torch.tensor([0, 1, 127, 128, 129, 512], device="cuda")
+    lengths[: min(rows, 6)] = boundary_lengths[:rows]
+    indices[min(6, rows - 1), 17::31] = -1
     w = BatchSparseMLADecodePagedTSWrapper()
     w.plan(
         q.device,
@@ -1377,7 +1378,14 @@ def make_tensor_fp8_cache(pages, page_size):
 @pytest.mark.parametrize(
     "heads,rows,topk,extra",
     [(h, 160, 513, 129) for h in (8, 16, 32, 64, 128)]
-    + [(8, 2, 33, 17), (64, 2, 129, 129), (128, 8, 513, 129), (64, 16, 2049, 129)],
+    + [
+        (8, 2, 33, 17),
+        (16, 4, 2049, 129),
+        (32, 32, 513, 129),
+        (64, 2, 129, 129),
+        (128, 8, 513, 129),
+        (64, 16, 2049, 129),
+    ],
 )
 def test_d512_nvfp4_sources_graph(
     heads,
@@ -1533,7 +1541,7 @@ def test_nvfp4_format_contract():
 @pytest.mark.parametrize(
     "heads,rows,topk,extra",
     [(h, 160, 129, 513) for h in (8, 16, 32, 64, 128)]
-    + [(8, 2, 33, 17), (128, 32, 129, 2049)],
+    + [(8, 2, 33, 17), (16, 4, 129, 2049), (32, 32, 129, 513), (128, 32, 129, 2049)],
 )
 def test_tensor_fp8_nvfp4_sources_graph(heads, rows, topk, extra):
     """Check FP8-primary/NVFP4-extra attention with host scales and live source boundaries."""
@@ -1585,14 +1593,14 @@ def test_tensor_fp8_nvfp4_rescale_threshold_graph(heads):
     )
 
 
-@pytest.mark.parametrize("heads", [64, 128])
-def test_tensor_fp8_nvfp4_host_scales_packed_capacity_graph(heads):
+@pytest.mark.parametrize("heads,capacity", [(64, 32), (128, 32), (128, 153)])
+def test_tensor_fp8_nvfp4_host_scales_packed_capacity_graph(heads, capacity):
     """One host-scale plan serves varying row counts; graphs retain captured scales."""
     from unittest.mock import patch
     import flashinfer.attention.prims_ts.mla_decode as mla_decode_module
 
     torch.manual_seed(127)
-    capacity, topk = 32, 129
+    topk = 129
     query = (torch.randn(capacity + 1, heads, 512, device="cuda") * 0.2).to(
         torch.float8_e4m3fn
     )
@@ -1625,7 +1633,7 @@ def test_tensor_fp8_nvfp4_host_scales_packed_capacity_graph(heads):
             return_lse=True,
         )
         assert compile_calls.call_count == 1
-        for rows in (1, 7, capacity):
+        for rows in (1, 7, capacity // 2 + 1, capacity):
             qo_indptr = torch.tensor([0, rows], device="cuda", dtype=torch.int32)
             kwargs = dict(
                 qo_indptr=qo_indptr,
@@ -1693,3 +1701,34 @@ def test_tensor_fp8_nvfp4_host_scales_packed_capacity_graph(heads):
                 wrapper.run(query[:capacity], primary, indices, lengths, **invalid)
         with pytest.raises(ValueError, match="packed query total rows"):
             wrapper.run(query, primary, indices, lengths)
+
+
+@pytest.mark.parametrize("cache_format", ["nvfp4", "nvfp4.fp8rope", "fp8"])
+def test_quantized_kv_reuses_compiled_kernel_across_row_buckets(
+    monkeypatch, cache_format
+):
+    """Graph batch buckets share a compiled profile while balancing their live grids."""
+    import flashinfer.attention.prims_ts.mla_decode as mla_decode_module
+
+    compile_kernel = mla_decode_module._get_compiled_mla_decode
+    kernels = []
+
+    def record_kernel(spec):
+        """Observe real cached kernels while preserving compilation and numerical execution."""
+        compiled = compile_kernel(spec)
+        kernels.append(compiled)
+        return compiled
+
+    monkeypatch.setattr(mla_decode_module, "_get_compiled_mla_decode", record_kernel)
+    clusters = torch.cuda.get_device_properties("cuda").multi_processor_count // 2
+    for rows in (clusters, clusters + 1, 2 * clusters + 1):
+        test_d512_nvfp4_sources_graph(
+            128,
+            rows,
+            129 if cache_format == "fp8" else 513,
+            513 if cache_format == "fp8" else 129,
+            rope_dim=64 if cache_format == "nvfp4.fp8rope" else 0,
+            primary_format="fp8" if cache_format == "fp8" else "nvfp4",
+        )
+    assert len(kernels) == 3
+    assert all(kernel is kernels[0] for kernel in kernels)

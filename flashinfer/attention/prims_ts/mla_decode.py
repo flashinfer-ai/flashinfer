@@ -1273,26 +1273,30 @@ def _get_compiled_mla_decode(
     # Task objects carry loop-local state through generated control flow, so
     # select the public staged frontend for this compilation.
     def compile_kernel():
-        return cute.compile[cute.FrontendNext](
-            kernel,
-            q_latent_fake,
-            q_rope_fake,
-            c_latent_fake,
-            c_rope_fake,
-            page_offsets_fake,
-            out_fake,
-            lse_fake,
-            workspace_fake,
-            cutlass.Int32(compile_spec.split_kv),
-            cache_seqs_fake,
-            qo_indptr_fake,
-            sparse_inputs_fake,
-            cutlass.Float32(1.0),
-            cutlass.Float32(1.0),
-            stream_fake,
-            output_quant_args=output_quant_args,
-            options=_COMPILE_OPTIONS,
-        )
+        """Compile MLA with opt-in task-builder advisory diagnostics."""
+        from .kernels.mla_decode.helpers.diagnostics import mla_build_diagnostics
+
+        with mla_build_diagnostics():
+            return cute.compile[cute.FrontendNext](
+                kernel,
+                q_latent_fake,
+                q_rope_fake,
+                c_latent_fake,
+                c_rope_fake,
+                page_offsets_fake,
+                out_fake,
+                lse_fake,
+                workspace_fake,
+                cutlass.Int32(compile_spec.split_kv),
+                cache_seqs_fake,
+                qo_indptr_fake,
+                sparse_inputs_fake,
+                cutlass.Float32(1.0),
+                cutlass.Float32(1.0),
+                stream_fake,
+                output_quant_args=output_quant_args,
+                options=_COMPILE_OPTIONS,
+            )
 
     with torch.cuda.device(device_index):
         compiled = build_and_load_attention_kernel(
@@ -1536,7 +1540,12 @@ def _launch_mla_decode(
 
 
 class BatchMLADecodePagedTSWrapper:
-    """Compile and reuse task-scheduled paged MLA decode launches."""
+    """Compile and reuse task-scheduled paged MLA decode launches.
+
+    Prepare Q in the planned dtype and apply query RoPE upstream. For serving,
+    validate input invariants during setup and use ``run(validate=False)``:
+    the default runtime value checks synchronize CUDA metadata to the host.
+    """
 
     @flashinfer_experimental_api
     def __init__(self) -> None:
@@ -1578,6 +1587,13 @@ class BatchMLADecodePagedTSWrapper:
         every run. ``max_seq_len_q`` is then the per-request capacity.
         Individual packed requests may be empty; an all-empty run returns its
         empty output without dispatching a GPU kernel.
+
+        The request count B remains fixed in both modes. Fixed mode also fixes
+        the total query rows B*SQ; packed mode accepts changing per-request
+        lengths within the planned capacity. Sparse independent rows can use
+        the capacity-plan recipe on :class:`BatchSparseMLADecodePagedTSWrapper`.
+        Q quantization and RoPE are caller-owned preparation; the kernel uses
+        Q in ``q_data_type`` directly.
 
         If ``workspace_buffer`` is omitted, the plan allocates private scratch.
         A workspace is mutable and exclusive to one in-flight launch or graph
@@ -2320,10 +2336,8 @@ def _resolve_sparse_mla_plan(
     dtype_name = "bf16" if q_data_type == torch.bfloat16 else "e4m3"
     if family == "2cta":
         active_clusters = sm_count // 2
-        if kv_cache_format != "native" and profile.scheduler != "nonpersistent":
-            work_clusters = max_rows * ((num_heads + 127) // 128) * splits
-            waves = (work_clusters + active_clusters - 1) // active_clusters
-            active_clusters = (work_clusters + waves - 1) // waves
+        # Keep the physical device limit batch-independent. Quantized
+        # persistent launches balance their grid from live tensor extents.
         kernel = MlaDecodeTs(
             page_size=1,
             max_active_clusters=active_clusters,
@@ -2452,6 +2466,12 @@ class BatchSparseMLADecodePagedTSWrapper:
     plan with ``batch_size=1``, ``packed_query=True`` and
     ``max_seq_len_q=row_capacity``. Run with ``[rows,H,D]`` queries and
     ``qo_indptr=[0,rows]`` for any ``rows <= row_capacity``.
+
+    Q quantization and query RoPE belong to the caller. For a serving hot path,
+    establish valid metadata upstream and pass ``run(validate=False)``.
+    The default ``validate=True`` reads CUDA metadata values on the host and
+    therefore synchronizes. Kernel-builder advisories are controlled separately
+    at plan/JIT time by ``FLASHINFER_PRIMS_TS_DEBUG_CHECKS=1``.
     """
 
     @flashinfer_experimental_api
@@ -2513,6 +2533,35 @@ class BatchSparseMLADecodePagedTSWrapper:
         window. Prepared indices already include the physical page stride, so
         the core uses page size one regardless of the pools' external pages.
         Planning compiles no metadata-preparation kernel.
+
+        Fixed queries use exactly ``batch_size * max_seq_len_q`` rows. To reuse
+        one dispatch profile over a range of independent query-row counts,
+        use ``batch_size=1``, ``packed_query=True`` and
+        ``max_seq_len_q=row_capacity``. Supply ``[rows,H,D]`` Q and CUDA INT32
+        ``qo_indptr=[0,rows]`` to each run, with ``rows <= row_capacity``.
+        Index/length tensors and outputs use the same live row count. The
+        profile is chosen for the planned capacity; each captured graph keeps
+        its captured views and addresses. For example::
+
+            wrapper.plan("cuda", 1, heads, max_topk=topk,
+                         max_seq_len_q=row_capacity, packed_query=True,
+                         q_data_type=torch.float8_e4m3fn,
+                         kv_cache_format="nvfp4", return_lse=True)
+            # Q is already quantized/rotated; update metadata upstream.
+            wrapper.run(q, cache, indices, lengths, qo_indptr=qo_indptr,
+                        out=out, lse=lse, validate=False)
+
+        Whole-tile K/V reuse supports nonpersistent split-KV schedules.
+        The 1CTA persistent/CLC scheduler requires ``split_kv=1`` because its
+        work queue enumerates query/head tiles without a KV-split coordinate.
+        Low-level profile overrides must use a nonpersistent scheduler with
+        multiple KV splits; this restriction does not apply to 2CTA profiles.
+
+        Routine task-builder overlap and unused-routing advisories are quiet
+        by default. Set ``FLASHINFER_PRIMS_TS_DEBUG_CHECKS=1`` before a cold
+        plan/JIT build to show them. This controls build diagnostics separately
+        from :meth:`run`'s runtime input validation; other warnings/errors are
+        retained.
 
         Output quantization is disabled by default. When enabled, G must divide
         the local query-head count H. Blocks of 32 with UE8M0 scales implement
@@ -2761,6 +2810,14 @@ class BatchSparseMLADecodePagedTSWrapper:
         Omit both extra tensors when no extra pool was planned. Input widths
         and live lengths need no 128-entry padding: the kernel aligns source
         execution spans internally and bounds all source reads.
+
+        ``validate=True`` (default) checks CUDA metadata contents using host
+        reads, which synchronize the device. Serving should establish index,
+        length, offset and position bounds upstream and use ``validate=False``
+        on the hot path and during CUDA graph capture. Shape, dtype, device,
+        stride and alignment checks still run without reading CUDA values.
+        Q must already use the planned dtype and include the required query
+        RoPE; run() performs neither Q quantization nor query rotation.
 
         ``softmax_scale`` and ``output_scale`` are positive finite Python
         host scalars, passed as runtime FP32 kernel arguments. They are already combined:
