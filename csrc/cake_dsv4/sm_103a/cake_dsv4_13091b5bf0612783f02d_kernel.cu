@@ -268,16 +268,6 @@ __device__ __forceinline__ float2 mul_f32x2_rn_noftz(float2 a, float2 b) {
 
 
 
-__device__ __forceinline__ void tma_4d_gmem2smem_cta2(
-    int dst, const void *tmap_ptr, int x, int y, int z, int w, int mbar_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.4d.shared::cluster.global"
-        ".mbarrier::complete_tx::bytes.cta_group::2"
-        " [%0], [%1, {%2, %3, %4, %5}], [%6];"
-        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(w),
-           "r"(mbar_addr) : "memory");
-}
-
 
 
 
@@ -310,7 +300,7 @@ __device__ __forceinline__ void tmem_ld_x4(float* dst, int tmem_addr) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_dsv4_e1d1d0c1efb1b88595b4(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_k, const __grid_constant__ CUtensorMap tmap_compressed_k, const __grid_constant__ CUtensorMap tmap_swa_v, const __grid_constant__ CUtensorMap tmap_compressed_v, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int num_query_tokens, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int has_sinks, int total_work_items, int ragged_query, int max_q_len, int batch_size)
+kernel_cake_dsv4_13091b5bf0612783f02d(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_k, const __grid_constant__ CUtensorMap tmap_compressed_k, const __grid_constant__ CUtensorMap tmap_swa_v, const __grid_constant__ CUtensorMap tmap_compressed_v, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int num_query_tokens, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int has_sinks, int total_work_items, int ragged_query, int max_q_len, int batch_size)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1223,7 +1213,15 @@ kernel_cake_dsv4_e1d1d0c1efb1b88595b4(const __grid_constant__ CUtensorMap tmap_q
                         if (elect_sync()) {
                             #pragma unroll
                             for (int q_stage = 0; q_stage < 8; q_stage++) {
-                                tma_4d_gmem2smem_cta2(smem_q_addr + (unsigned int)(q_stage * 8192), (&tmap_q), 0, cta_rank * 64, q_stage, query_idx_2, ((q_full_addr) & 0xFEFFFFFF));
+                                unsigned long long q_l2_policy = 1152921504606846976;
+                                if (sparse_topk > 256) {
+                                    q_l2_policy = 1364590687093260288;
+                                }
+                                asm volatile(
+                                    "cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
+                                    " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+                                    :: "r"(smem_q_addr + (unsigned int)(q_stage * 8192)), "l"((&tmap_q)), "r"(0), "r"(cta_rank * 64), "r"(q_stage), "r"(query_idx_2),
+                                       "r"(((q_full_addr) & 0xFEFFFFFF)), "l"(q_l2_policy) : "memory");
                             }
                         }
                     }

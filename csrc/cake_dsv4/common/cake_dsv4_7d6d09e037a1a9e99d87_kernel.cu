@@ -288,7 +288,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_dsv4_afd91858722f8906db48(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ O, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int num_query_tokens, int has_sinks, int ragged_query, int max_q_len, int batch_size)
+kernel_cake_dsv4_7d6d09e037a1a9e99d87(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ O, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int num_query_tokens, int has_sinks, int ragged_query, int max_q_len, int batch_size)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -321,10 +321,7 @@ kernel_cake_dsv4_afd91858722f8906db48(const __grid_constant__ CUtensorMap tmap_q
     #define throttle_full_addr (mbar_base + 288)
     #define throttle_empty_addr (mbar_base + 304)
     #define tmem_free_addr (mbar_base + 320)
-#if __CUDA_ARCH__ == 1030
-#else
     #define o_lo_full_addr (mbar_base + 328)
-#endif
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -343,13 +340,8 @@ kernel_cake_dsv4_afd91858722f8906db48(const __grid_constant__ CUtensorMap tmap_q
     unsigned int* work_response = reinterpret_cast<unsigned int*>(smem_raw + 203776);
     const int work_response_addr = smem + 203776;
 
-#if __CUDA_ARCH__ == 1030
-    // Mbarrier init (17 pipeline groups, 0 ordered-sequence groups, 41 barriers)
-    // Mbarriers at smem_raw[0..328)
-#else
     // Mbarrier init (18 pipeline groups, 0 ordered-sequence groups, 42 barriers)
     // Mbarriers at smem_raw[0..336)
-#endif
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -416,11 +408,8 @@ kernel_cake_dsv4_afd91858722f8906db48(const __grid_constant__ CUtensorMap tmap_q
             mbarrier_init(smem + 312, 32);
             // tmem_free: 1 barriers, init_count=128
             mbarrier_init(smem + 320, 128);
-#if __CUDA_ARCH__ == 1030
-#else
             // o_lo_full: 1 barriers, init_count=1
             mbarrier_init(smem + 328, 1);
-#endif
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -428,17 +417,9 @@ kernel_cake_dsv4_afd91858722f8906db48(const __grid_constant__ CUtensorMap tmap_q
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
-#if __CUDA_ARCH__ == 1030
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 328);
-#else
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 336);
-#endif
     if (warp == 0) {
-#if __CUDA_ARCH__ == 1030
-        int _tmem_hold = smem + 328;
-#else
         int _tmem_hold = smem + 336;
-#endif
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
@@ -925,13 +906,8 @@ kernel_cake_dsv4_afd91858722f8906db48(const __grid_constant__ CUtensorMap tmap_q
                 mbarrier_wait(stats_addr + (tail_stats_stage_1) * 8, _parity_stats_3);
                 mbarrier_arrive(stats_empty_addr + (tail_stats_stage_1) * 8);
                 stats_cursor_1 += 1;
-#if __CUDA_ARCH__ == 1030
-                int _parity_o_full_1 = (int)((unsigned int)(int)(global_tile_1 - 1) % 2);
-                mbarrier_wait(o_full_addr, _parity_o_full_1);
-#else
                 int _parity_o_lo_full = (int)((unsigned int)(int)work_iter_1 % 2);
                 mbarrier_wait(o_lo_full_addr, _parity_o_lo_full);
-#endif
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 float final_sum = _tmem_load_3[0];
                 float inv_sum = approx_rcp(final_sum);
@@ -964,14 +940,11 @@ kernel_cake_dsv4_afd91858722f8906db48(const __grid_constant__ CUtensorMap tmap_q
                 unsigned int valid_1 = clc_valid_1;
                 #pragma unroll
                 for (int v_stage_1 = 0; v_stage_1 < 4; v_stage_1++) {
-#if __CUDA_ARCH__ == 1030
-#else
                     if (v_stage_1 == 2) {
                         int _parity_o_full_1 = (int)((unsigned int)(int)(global_tile_1 - 1) % 2);
                         mbarrier_wait(o_full_addr, _parity_o_full_1);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                     }
-#endif
                     int output_addr_1 = taddr + 256 + (unsigned int)((v_stage_1 & 1) * 128) + (unsigned int)((v_stage_1 >> 1) * 16 << 16) + (unsigned int)(tmem_row_origin_1 << 16);
                     float _tmem_load_4[64];
                     asm volatile(
@@ -1323,12 +1296,9 @@ kernel_cake_dsv4_afd91858722f8906db48(const __grid_constant__ CUtensorMap tmap_q
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"((tmem_tmem + (output_addr_3))), "r"(_mma_b_lo_3), "r"(tmem_tmem + (last_score_col + 32 + ((v_stage_3 >> 1) * 16 << 16))), "r"(((last_tile == 0) ? 0 : 1)) : "memory");
-#if __CUDA_ARCH__ == 1030
-#else
                         if (v_stage_3 == 1) {
                             elect_commit(o_lo_full_addr);
                         }
-#endif
                         elect_commit(kv_empty_addr + (v_stage_3) * 8);
                     }
                     elect_commit(o_full_addr);

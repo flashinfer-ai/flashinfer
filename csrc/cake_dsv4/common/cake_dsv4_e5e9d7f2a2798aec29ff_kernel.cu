@@ -1379,17 +1379,40 @@ kernel_cake_dsv4_e5e9d7f2a2798aec29ff(const __grid_constant__ CUtensorMap tmap_q
             unsigned int mma_batch = blockIdx.z;
             mbarrier_wait(score_empty_addr, 1);
             mbarrier_wait(score_empty_addr + 8, 1);
+#if __CUDA_ARCH__ == 1030
+            int smh_have = 0;
+            int smh_valid = 1;
+            int smh_qb = 0;
+            int smh_qe = 0;
+            int smh_tk = 0;
+            unsigned int smh_q = 0;
+            unsigned int smh_h = 0;
+            unsigned int smh_b = 0;
+#else
+#endif
             unsigned int _phase_q_full = 0;
             unsigned int _phase_work_full_2 = 0;
             #pragma unroll 1
             for (unsigned int _work_2 = 0; _work_2 < total_work_items; _work_2++) {
+#if __CUDA_ARCH__ == 1030
+                const int smh_cur = smh_have;
+                smh_have = 0;
+                int q_begin_2 = ((smh_cur != 0) ? smh_qb : cum_seq_lens_q[(int)mma_batch]);
+                int q_end_2 = ((smh_cur != 0) ? smh_qe : cum_seq_lens_q[(int)(mma_batch + 1)]);
+#else
                 int q_begin_2 = cum_seq_lens_q[(int)mma_batch];
                 int q_end_2 = cum_seq_lens_q[(int)(mma_batch + 1)];
+#endif
                 int q_local_2 = (int)mma_q;
                 int work_valid_2 = q_local_2 < q_end_2 - q_begin_2;
                 if (work_valid_2 != 0) {
                     int query_idx_2 = q_begin_2 + q_local_2;
+#if __CUDA_ARCH__ == 1030
+                    const int smh_t = ((smh_cur != 0) ? smh_tk : sparse_topk_lens[query_idx_2]);
+                    int _max_0_3 = ((smh_t + sparse_topk_lens_offset) > (0) ? (smh_t + sparse_topk_lens_offset) : (0));
+#else
                     int _max_0_3 = ((sparse_topk_lens[query_idx_2] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[query_idx_2] + sparse_topk_lens_offset) : (0));
+#endif
                     int active_topk_2 = ((_max_0_3) < (sparse_topk) ? (_max_0_3) : (sparse_topk));
                     int _max_1_2 = ((active_topk_2) > (1) ? (active_topk_2) : (1));
                     int num_tiles_2 = (_max_1_2 + 128 - 1) / 128;
@@ -1655,6 +1678,77 @@ kernel_cake_dsv4_e5e9d7f2a2798aec29ff(const __grid_constant__ CUtensorMap tmap_q
                         int p_stage_1 = (int)((unsigned int)score_cursor_2 % 2);
                         #pragma unroll
                         for (int v_half_1 = 0; v_half_1 < 2; v_half_1++) {
+#if __CUDA_ARCH__ == 1030
+                            if (v_half_1 == 1) {
+                                if (smh_have == 0) {
+                                    smh_have = 1;
+                                    mbarrier_wait(work_full_addr + (mma_work_stage) * 8, _phase_work_full_2);
+                                    uint32_t _smh_v = 0;
+                                    asm volatile(
+                                        "{\n\t"
+                                        ".reg .pred p1;\n\t"
+                                        ".reg .b128 clc_r;\n\t"
+                                        "ld.shared.b128 clc_r, [%1];\n\t"
+                                        "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                                        "selp.u32 %0, 1, 0, p1;\n\t"
+                                        "}\n"
+                                        : "=r"(_smh_v)
+                                        : "r"(work_response_addr + mma_work_stage * 16 + 0 * 16)
+                                        : "memory");
+                                    uint32_t _smh_q = 0;
+                                    asm volatile(
+                                        "{\n\t"
+                                        ".reg .pred p1;\n\t"
+                                        ".reg .b128 clc_r;\n\t"
+                                        "ld.shared.b128 clc_r, [%1];\n\t"
+                                        "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                                        "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
+                                        "}\n"
+                                        : "+r"(_smh_q)
+                                        : "r"(work_response_addr + mma_work_stage * 16 + 0 * 16)
+                                        : "memory");
+                                    uint32_t _smh_h = 0;
+                                    asm volatile(
+                                        "{\n\t"
+                                        ".reg .pred p1;\n\t"
+                                        ".reg .b128 clc_r;\n\t"
+                                        "ld.shared.b128 clc_r, [%1];\n\t"
+                                        "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                                        "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::y.b32.b128 %0, clc_r;\n\t"
+                                        "}\n"
+                                        : "+r"(_smh_h)
+                                        : "r"(work_response_addr + mma_work_stage * 16 + 0 * 16)
+                                        : "memory");
+                                    uint32_t _smh_b = 0;
+                                    asm volatile(
+                                        "{\n\t"
+                                        ".reg .pred p1;\n\t"
+                                        ".reg .b128 clc_r;\n\t"
+                                        "ld.shared.b128 clc_r, [%1];\n\t"
+                                        "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                                        "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::z.b32.b128 %0, clc_r;\n\t"
+                                        "}\n"
+                                        : "+r"(_smh_b)
+                                        : "r"(work_response_addr + mma_work_stage * 16 + 0 * 16)
+                                        : "memory");
+                                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                                    asm volatile("tcgen05.fence::before_thread_sync;");
+                                    mbarrier_arrive(work_empty_addr + (mma_work_stage) * 8);
+                                    mma_work_stage += 1;
+                                    if (mma_work_stage == 2) { mma_work_stage = 0; _phase_work_full_2 ^= 1; }
+                                    smh_valid = (int)_smh_v;
+                                    smh_q = _smh_q;
+                                    smh_h = _smh_h;
+                                    smh_b = _smh_b;
+                                    if (smh_valid != 0) {
+                                        smh_qb = cum_seq_lens_q[(int)smh_b];
+                                        smh_qe = cum_seq_lens_q[(int)(smh_b + 1)];
+                                        smh_tk = (((int)smh_q < smh_qe - smh_qb) ? sparse_topk_lens[smh_qb + (int)smh_q] : 0);
+                                    }
+                                }
+                            }
+#else
+#endif
                             int _parity_o_empty_1 = (int)((unsigned int)score_cursor_2 % 2) ^ 1;
                             mbarrier_wait(o_empty_addr + (v_half_1) * 8, _parity_o_empty_1);
                             asm volatile("tcgen05.fence::after_thread_sync;");
@@ -1696,72 +1790,91 @@ kernel_cake_dsv4_e5e9d7f2a2798aec29ff(const __grid_constant__ CUtensorMap tmap_q
                         score_cursor_2 += 1;
                     }
                 }
+#if __CUDA_ARCH__ == 1030
+                if (smh_have != 0) {
+                    if (smh_valid == 0) {
+                        break;
+                    }
+                    mma_q = smh_q;
+                    mma_head = smh_h;
+                    mma_batch = smh_b;
+                } else {
+                    mbarrier_wait(work_full_addr + (mma_work_stage) * 8, _phase_work_full_2);
+                    uint32_t _clc_valid_2 = 0;
+                    asm volatile(
+                        "{\n\t"
+                        ".reg .pred p1;\n\t"
+                        ".reg .b128 clc_r;\n\t"
+                        "ld.shared.b128 clc_r, [%1];\n\t"
+                        "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                        "selp.u32 %0, 1, 0, p1;\n\t"
+                        "}\n"
+                        : "=r"(_clc_valid_2)
+                        : "r"(work_response_addr + mma_work_stage * 16 + 0 * 16)
+                        : "memory");
+                    uint32_t _clc_ctaid_6 = 0;
+                    asm volatile(
+                        "{\n\t"
+                        ".reg .pred p1;\n\t"
+                        ".reg .b128 clc_r;\n\t"
+                        "ld.shared.b128 clc_r, [%1];\n\t"
+                        "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                        "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
+                        "}\n"
+                        : "+r"(_clc_ctaid_6)
+                        : "r"(work_response_addr + mma_work_stage * 16 + 0 * 16)
+                        : "memory");
+                    uint32_t _clc_ctaid_7 = 0;
+                    asm volatile(
+                        "{\n\t"
+                        ".reg .pred p1;\n\t"
+                        ".reg .b128 clc_r;\n\t"
+                        "ld.shared.b128 clc_r, [%1];\n\t"
+                        "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                        "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::y.b32.b128 %0, clc_r;\n\t"
+                        "}\n"
+                        : "+r"(_clc_ctaid_7)
+                        : "r"(work_response_addr + mma_work_stage * 16 + 0 * 16)
+                        : "memory");
+                    uint32_t _clc_ctaid_8 = 0;
+                    asm volatile(
+                        "{\n\t"
+                        ".reg .pred p1;\n\t"
+                        ".reg .b128 clc_r;\n\t"
+                        "ld.shared.b128 clc_r, [%1];\n\t"
+                        "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                        "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::z.b32.b128 %0, clc_r;\n\t"
+                        "}\n"
+                        : "+r"(_clc_ctaid_8)
+                        : "r"(work_response_addr + mma_work_stage * 16 + 0 * 16)
+                        : "memory");
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    asm volatile("tcgen05.fence::before_thread_sync;");
+                    mbarrier_arrive(work_empty_addr + (mma_work_stage) * 8);
+                    mma_work_stage += 1;
+                    if (mma_work_stage == 2) { mma_work_stage = 0; _phase_work_full_2 ^= 1; }
+                    if (_clc_valid_2 == 0) {
+                        break;
+                    }
+                    mma_q = _clc_ctaid_6;
+                    mma_head = _clc_ctaid_7;
+                    mma_batch = _clc_ctaid_8;
+#else
                 mbarrier_wait(work_full_addr + (mma_work_stage) * 8, _phase_work_full_2);
                 uint32_t _clc_valid_2 = 0;
-#if __CUDA_ARCH__ == 1030
-#else
                 uint32_t _clc_ctaid_x_2;
                 uint32_t _clc_ctaid_y_2;
                 uint32_t _clc_ctaid_z_2;
-#endif
                 asm volatile(
                     "{\n\t"
                     ".reg .pred p1;\n\t"
                     ".reg .b128 clc_r;\n\t"
-#if __CUDA_ARCH__ == 1030
-                    "ld.shared.b128 clc_r, [%1];\n\t"
-#else
                     "ld.shared.b128 clc_r, [%4];\n\t"
-#endif
                     "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
-#if __CUDA_ARCH__ == 1030
-                    "selp.u32 %0, 1, 0, p1;\n\t"
-#else
                     "selp.u32 %3, 1, 0, p1;\n\t"
                     "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid.v4.b32.b128 {%0, %1, %2, _}, clc_r;\n\t"
-#endif
                     "}\n"
-#if __CUDA_ARCH__ == 1030
-                    : "=r"(_clc_valid_2)
-                    : "r"(work_response_addr + mma_work_stage * 16 + 0 * 16)
-                    : "memory");
-                uint32_t _clc_ctaid_6 = 0;
-                asm volatile(
-                    "{\n\t"
-                    ".reg .pred p1;\n\t"
-                    ".reg .b128 clc_r;\n\t"
-                    "ld.shared.b128 clc_r, [%1];\n\t"
-                    "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
-                    "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
-                    "}\n"
-                    : "+r"(_clc_ctaid_6)
-                    : "r"(work_response_addr + mma_work_stage * 16 + 0 * 16)
-                    : "memory");
-                uint32_t _clc_ctaid_7 = 0;
-                asm volatile(
-                    "{\n\t"
-                    ".reg .pred p1;\n\t"
-                    ".reg .b128 clc_r;\n\t"
-                    "ld.shared.b128 clc_r, [%1];\n\t"
-                    "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
-                    "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::y.b32.b128 %0, clc_r;\n\t"
-                    "}\n"
-                    : "+r"(_clc_ctaid_7)
-                    : "r"(work_response_addr + mma_work_stage * 16 + 0 * 16)
-                    : "memory");
-                uint32_t _clc_ctaid_8 = 0;
-                asm volatile(
-                    "{\n\t"
-                    ".reg .pred p1;\n\t"
-                    ".reg .b128 clc_r;\n\t"
-                    "ld.shared.b128 clc_r, [%1];\n\t"
-                    "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
-                    "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::z.b32.b128 %0, clc_r;\n\t"
-                    "}\n"
-                    : "+r"(_clc_ctaid_8)
-#else
                     : "=r"(_clc_ctaid_x_2), "=r"(_clc_ctaid_y_2), "=r"(_clc_ctaid_z_2), "=r"(_clc_valid_2)
-#endif
                     : "r"(work_response_addr + mma_work_stage * 16 + 0 * 16)
                     : "memory");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -1771,11 +1884,9 @@ kernel_cake_dsv4_e5e9d7f2a2798aec29ff(const __grid_constant__ CUtensorMap tmap_q
                 if (mma_work_stage == 2) { mma_work_stage = 0; _phase_work_full_2 ^= 1; }
                 if (_clc_valid_2 == 0) {
                     break;
+#endif
                 }
 #if __CUDA_ARCH__ == 1030
-                mma_q = _clc_ctaid_6;
-                mma_head = _clc_ctaid_7;
-                mma_batch = _clc_ctaid_8;
 #else
                 mma_q = _clc_ctaid_x_2;
                 mma_head = _clc_ctaid_y_2;
