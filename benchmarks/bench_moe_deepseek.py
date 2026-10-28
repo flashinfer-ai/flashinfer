@@ -194,15 +194,17 @@ EP_CONFIGS = {
 }
 
 
-def _autotune_context(do_autotune, cache):
-    """Create a tuning, cache-only, or ordinary no-cache benchmark scope."""
-    from flashinfer.autotuner import autotune
+def _autotune_context(do_autotune, cache, measurement_policy=None):
+    """Use the same managed cache and measurement policy for tuning and replay."""
+    from flashinfer.autotune_cache import autotune_v2
 
-    if cache is not None:
-        return autotune(do_autotune, cache=cache)
-    if do_autotune:
-        return autotune(True)
-    return contextlib.nullcontext()
+    return autotune_v2(
+        mode="tune" if do_autotune else "replay",
+        persistent_cache=cache is not None,
+        cache_root=cache,
+        cache_scope="context",
+        measurement_policy=measurement_policy,
+    )
 
 
 def is_sm100_family():
@@ -576,9 +578,9 @@ def bench_cute_dsl(
     Args:
         use_wrapper: If True, use CuteDslMoEWrapper API (recommended for CUDA graph).
                     If False, use cute_dsl_fused_moe functional API.
-        do_autotune: If True, run the pre-warm pass under autotune(True) so the
+        do_autotune: If True, run the pre-warm pass with tuning enabled so the
                     autotuner profiles all buckets and populates its cache. The
-                    measurement loop runs OUTSIDE the autotune context so that
+                    measurement loop runs with tuning disabled so that
                     choose_one cache lookups don't appear inside the CUDA-event
                     interval when bench_gpu_time falls back to events (i.e. when
                     both CUDA graphs and CUPTI are disabled).
@@ -788,9 +790,6 @@ def bench_cute_dsl(
             use_fused_finalize=use_fused_finalize,
             quant_mode=quant_mode,
             swap_ab=swap_ab,
-            autotune_use_cuda_graph=(
-                use_cuda_graph if quant_mode in ("w4a8", "mxfp8") else False
-            ),
             **activation_kwargs,
         )
 
@@ -833,9 +832,6 @@ def bench_cute_dsl(
                 local_expert_offset=local_expert_offset,
                 quant_mode=quant_mode,
                 swap_ab=swap_ab,
-                autotune_use_cuda_graph=(
-                    use_cuda_graph if quant_mode in ("w4a8", "mxfp8") else False
-                ),
                 per_token_scale=per_token_scale,
                 nvfp4_4over6=activation_recipe,
                 use_fused_finalize=use_fused_finalize,
@@ -866,21 +862,28 @@ def bench_cute_dsl(
     # runs outside the autotune context so that choose_one in the
     # measurement loop returns the cached tactic via the non-tuning fast
     # path (no host-side tactic-walking inside the CUDA-event interval).
+    measurement_policy = None
+    if use_cuda_graph and quant_mode in ("w4a8", "mxfp8"):
+        from flashinfer.autotune_cache import MeasurementPolicy
+
+        measurement_policy = MeasurementPolicy(execution_mode="cuda_graph")
     with _per_token_quantization(use_per_token_activation):
-        with _autotune_context(do_autotune, autotune_cache):
+        with _autotune_context(do_autotune, autotune_cache, measurement_policy):
             run(**input_kwargs)
             torch.cuda.synchronize()
 
-        return _measure_or_profile(
-            run,
-            input_kwargs,
-            warmup,
-            iters,
-            use_cuda_graph,
-            use_cupti,
-            profile_cuda,
-            profile_iters,
-        )
+        # Capture-time lookup must use the same policy as tuning.
+        with _autotune_context(False, autotune_cache, measurement_policy):
+            return _measure_or_profile(
+                run,
+                input_kwargs,
+                warmup,
+                iters,
+                use_cuda_graph,
+                use_cupti,
+                profile_cuda,
+                profile_iters,
+            )
 
 
 def bench_cutlass(
@@ -994,16 +997,17 @@ def bench_cutlass(
         run(**input_kwargs)
         torch.cuda.synchronize()
 
-    return _measure_or_profile(
-        run,
-        input_kwargs,
-        warmup,
-        iters,
-        use_cuda_graph,
-        use_cupti,
-        profile_cuda,
-        profile_iters,
-    )
+    with _autotune_context(False, autotune_cache):
+        return _measure_or_profile(
+            run,
+            input_kwargs,
+            warmup,
+            iters,
+            use_cuda_graph,
+            use_cupti,
+            profile_cuda,
+            profile_iters,
+        )
 
 
 def bench_trtllm(
@@ -1398,16 +1402,17 @@ def bench_trtllm(
             run(**input_kwargs)
             torch.cuda.synchronize()
 
-        return _measure_or_profile(
-            run,
-            input_kwargs,
-            warmup,
-            iters,
-            use_cuda_graph,
-            use_cupti,
-            profile_cuda,
-            profile_iters,
-        )
+        with _autotune_context(False, autotune_cache):
+            return _measure_or_profile(
+                run,
+                input_kwargs,
+                warmup,
+                iters,
+                use_cuda_graph,
+                use_cupti,
+                profile_cuda,
+                profile_iters,
+            )
 
 
 # =============================================================================
@@ -1473,12 +1478,12 @@ def run_benchmark(
     """
     Unified benchmark for the selected MoE model and precision family.
 
-    Autotuning runs in each backend's pre-warm step (under ``autotune(True)``)
+    Autotuning runs in each backend's pre-warm step
     so the autotuner profiles all tactics on the default stream before
     ``bench_gpu_time`` switches to a side stream / captures into a CUDA graph.
     This guarantees the autotuner sees the same API (wrapper vs functional),
     EP config, and weight shapes as the timed runs, avoiding cache-key
-    mismatches; the measurement loop itself runs outside ``autotune(True)``
+    mismatches; the measurement loop itself runs with tuning disabled
     so ``choose_one`` takes the non-tuning fast path and host-side cache
     walks don't appear inside the CUDA-event interval.
 
@@ -1528,7 +1533,7 @@ def run_benchmark(
     results = []
     rows_and_histograms = []
 
-    # Note: autotune(True) is now scoped to each bench_*'s pre-warm rather than
+    # Note: tuning is scoped to each bench_*'s pre-warm rather than
     # wrapping the entire measurement loop.  See bench_cute_dsl for rationale.
     for n in token_counts:
         row, histogram_record = _benchmark_single(
@@ -2043,7 +2048,7 @@ def main():
         "--tuning-cache",
         "--bundle-output",
         dest="cache",
-        help="Shared AutoTuner JSON cache path",
+        help="Managed autotuning cache directory shared across backends",
     )
     parser.add_argument(
         "--num-experts",

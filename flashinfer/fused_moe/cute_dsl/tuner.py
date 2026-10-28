@@ -735,7 +735,7 @@ class CuteDslFusedMoERunner(TunableRunner):
             self.enable_pdl,
         )
         if self.swap_ab:
-            extras += ("swap_ab", "blockscaled_route_n_v5")
+            extras += ("swap_ab",)
         if self.use_cuda_graph:
             extras += ("cuda_graph",)
         return extras + self._localization_signature()
@@ -990,7 +990,8 @@ class CuteDslFusedMoERunner(TunableRunner):
                  w1_weight, w1_weight_sf, w1_alpha, fc2_input_scale,
                  w2_weight, w2_weight_sf, w2_alpha, per_token_scale (optional),
                  moe_output (optional)]
-            tactic: Tactic tuple (tile_size, gemm1_tactic, gemm2_tactic) or None for default.
+            tactic: Tactic tuple (tile_size, gemm1_tactic, gemm2_tactic), with
+                k_steps_pair and use_clc appended for swap-AB, or None for default.
             do_preparation: If True, perform one-time setup (not used).
             **kwargs: Additional keyword arguments passed to forward_impl.
 
@@ -1000,14 +1001,11 @@ class CuteDslFusedMoERunner(TunableRunner):
         if self.swap_ab:
             from .blackwell.moe_swap_ab_tuner import (
                 DEFAULT_SWAP_AB_MOE_TACTIC,
-                canonicalize_swap_ab_tactic,
                 extract_swap_ab_tactic_params,
             )
 
             if tactic is None or tactic == -1:
                 tactic = DEFAULT_SWAP_AB_MOE_TACTIC
-            elif self.quant_mode in ("w4a8", "mxfp8"):
-                tactic = canonicalize_swap_ab_tactic(tactic)
             params = extract_swap_ab_tactic_params(tactic)
             kwargs.update(
                 gemm1_k_steps=params["gemm1_k_steps"],

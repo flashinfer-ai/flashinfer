@@ -2564,7 +2564,7 @@ def prepare_cute_dsl_weights(
     device: Optional[torch.device] = None,
     nvfp4_4over6: Optional[NVFP44Over6Config] = None,
     swap_ab: bool = False,
-) -> Dict[str, Union[torch.Tensor, bool]]:
+) -> Dict[str, torch.Tensor]:
     """Build the CuteDSL ``cute_dsl`` weight view.
 
     Gemm1 weights get the linear/gate interleave only for gated activations;
@@ -2598,8 +2598,7 @@ def prepare_cute_dsl_weights(
     dict
         Keys expected by ``CuteDslRunner.pack_inputs``: ``w1_weight``,
         ``w1_weight_sf``, ``w1_alpha``, ``fc2_input_scale``, ``w2_weight``,
-        ``w2_weight_sf``, ``w2_alpha``. The swap-AB view also carries
-        ``swap_ab=True``; untagged views retain the original layout.
+        ``w2_weight_sf``, ``w2_alpha``.
     """
     from ..cute_dsl.utils import convert_sf_to_mma_layout
     from ..fp4_quantization import fp4_quantize
@@ -2650,9 +2649,7 @@ def prepare_cute_dsl_weights(
     activation = _normalize_activation(activation)
     gemm1_rows = _gemm1_rows(intermediate_size, activation)
     w1_interleaved = (
-        _interleave_linear_and_gate(
-            w1_bf16, group_size=group_size, dim=1
-        )
+        _interleave_linear_and_gate(w1_bf16, group_size=group_size, dim=1)
         if activation.is_gated
         else w1_bf16
     )
@@ -2691,8 +2688,6 @@ def prepare_cute_dsl_weights(
         "w2_weight_sf": w2_weight_sf,
         "w2_alpha": ones,
     }
-    if swap_ab:
-        view["swap_ab"] = True
     if not (is_mxfp4 or is_mxfp8):
         # A pinned recipe fixes the GEMM2-input scale to 1 / (6 * e4m3_max).
         # w2_bf16 is passed for its device only.

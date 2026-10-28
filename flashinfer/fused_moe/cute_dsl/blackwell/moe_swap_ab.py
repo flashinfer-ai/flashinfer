@@ -339,7 +339,7 @@ def launch_gather_gemm(
     situ_linear_beta: Optional[float] = None,
     gated: bool = True,
     k_steps: Optional[int] = None,
-    use_clc_scheduler: Optional[bool] = None,
+    use_clc_scheduler: bool = True,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Prepare routed input and launch FC1 with the swap-AB weight layout."""
     _check_gemm_inputs(a, b, a_dtype, b_dtype, a_per_token_scale, k_steps)
@@ -354,10 +354,8 @@ def launch_gather_gemm(
     validate_cute_dsl_moe_situ_config(
         normalized_activation_type, situ_beta, situ_linear_beta
     )
-    if use_clc_scheduler is None:
-        use_clc_scheduler = True
-    elif type(use_clc_scheduler) is not bool:
-        raise ValueError("use_clc_scheduler must be None or a boolean")
+    if type(use_clc_scheduler) is not bool:
+        raise ValueError("use_clc_scheduler must be a boolean")
 
     n = b.shape[1]
     intermediate_size = n // (2 if gated else 1)

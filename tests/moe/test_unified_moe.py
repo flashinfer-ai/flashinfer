@@ -2699,7 +2699,6 @@ def _make_packs_and_config(
             "w2_weight": tensors["w2_weight"],
             "w2_weight_sf": tensors["w2_weight_sf"],
             "w2_alpha": tensors["w2_alpha"],
-            **({"swap_ab": True} if swap_ab else {}),
         },
     )
     # CuteDSL W4A16 is NVFP4×BF16; TRTLLM W4A16 is MXFP4×BF16, so this helper

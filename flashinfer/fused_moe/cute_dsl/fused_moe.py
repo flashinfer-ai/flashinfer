@@ -356,7 +356,7 @@ def _moe_core_impl(
     weight_dtype: Optional[str] = None,
     gemm1_k_steps: Optional[int] = None,
     gemm2_k_steps: Optional[int] = None,
-    gemm1_use_clc_scheduler: Optional[bool] = None,
+    gemm1_use_clc_scheduler: bool = True,
     gemm2_use_clc_scheduler: bool = False,
     swap_ab: bool = False,
 ) -> torch.Tensor:
@@ -1043,7 +1043,6 @@ class CuteDslMoEWrapper:
         situ_linear_beta: Optional[float] = None,
         use_fused_finalize: bool = True,
         quant_mode: str = "w4a4",
-        autotune_use_cuda_graph: bool = False,
         swap_ab: bool = False,
     ):
         r"""Configure the CuTe-DSL block-scaled fused-MoE wrapper.
@@ -1111,10 +1110,6 @@ class CuteDslMoEWrapper:
             up64/gate64 rows when False (default). W4A16 always uses weights
             on A and activations on B; False handles the original 64-row
             layout with an in-kernel transpose.
-        autotune_use_cuda_graph : bool
-            Profile autotuning candidates with CUDA Graph replay. Defaults to
-            ``False`` independently of ``use_cuda_graph``, which controls the
-            wrapper's persistent stream/event resources. Not supported for W4A16.
         """
         activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         quant_mode = _canonicalize_quant_mode(quant_mode)
@@ -1145,8 +1140,6 @@ class CuteDslMoEWrapper:
             from ..prepare import _cute_dsl_gated_weight_group_size
 
             _cute_dsl_gated_weight_group_size(torch.device(device), swap_ab)
-        if quant_mode == "w4a16" and autotune_use_cuda_graph:
-            raise ValueError("autotune_use_cuda_graph is not supported for W4A16")
         if quant_mode in ("w4a8", "mxfp8"):
             if not swap_ab:
                 if not use_fused_finalize:
@@ -1211,7 +1204,6 @@ class CuteDslMoEWrapper:
                 situ_linear_beta=situ_linear_beta,
                 use_per_token_activation=False,
                 quant_mode=quant_mode,
-                use_cuda_graph=autotune_use_cuda_graph,
                 swap_ab=swap_ab,
             )
             if quant_mode == "w4a4":
@@ -1232,7 +1224,6 @@ class CuteDslMoEWrapper:
                     situ_linear_beta=situ_linear_beta,
                     use_per_token_activation=True,
                     quant_mode=quant_mode,
-                    use_cuda_graph=autotune_use_cuda_graph,
                     swap_ab=swap_ab,
                 )
 
@@ -1298,7 +1289,7 @@ class CuteDslMoEWrapper:
         nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
         gemm1_k_steps: Optional[int] = None,
         gemm2_k_steps: Optional[int] = None,
-        gemm1_use_clc_scheduler: Optional[bool] = None,
+        gemm1_use_clc_scheduler: bool = True,
         gemm2_use_clc_scheduler: bool = False,
         swap_ab: bool = False,
         **kwargs,
@@ -1622,7 +1613,7 @@ def _cute_dsl_fused_moe_impl(
     sm_count: Optional[int] = None,
     gemm1_k_steps: Optional[int] = None,
     gemm2_k_steps: Optional[int] = None,
-    gemm1_use_clc_scheduler: Optional[bool] = None,
+    gemm1_use_clc_scheduler: bool = True,
     gemm2_use_clc_scheduler: bool = False,
     swap_ab: bool = False,
 ) -> torch.Tensor:

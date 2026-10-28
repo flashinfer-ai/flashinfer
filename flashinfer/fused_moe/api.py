@@ -3793,8 +3793,7 @@ class MoEWeightPack:
 
     Holding multiple materializations is intentional — that's the memory cost
     the user pays for cross-backend autotune.  Each view is the exact kwargs
-    dict that runner's ``forward`` expects for weight-side arguments, with
-    optional layout metadata checked by the runner.
+    dict that runner's ``forward`` expects for weight-side arguments.
 
     Every ``XxxConfig.prepare_weights`` takes the same canonical source
     layout: ``w1`` is ``[E, 2I, H]`` for gated activations with rows in
@@ -3803,14 +3802,14 @@ class MoEWeightPack:
     want ``[gate, up]`` swap halves inside their prepare helper.
     """
 
-    native_views: Dict[str, Dict[str, Union[Tensor, bool]]] = field(default_factory=dict)
+    native_views: Dict[str, Dict[str, Tensor]] = field(default_factory=dict)
 
-    def prepare_for(self, backend_key: str, view: Dict[str, Union[Tensor, bool]]) -> None:
+    def prepare_for(self, backend_key: str, view: Dict[str, Tensor]) -> None:
         """Register a backend-native weight view.  Caller owns the quantization
         / swizzle / layout conversion — this method just stores the result."""
         self.native_views[backend_key] = view
 
-    def get_view(self, backend_key: str) -> Dict[str, Union[Tensor, bool]]:
+    def get_view(self, backend_key: str) -> Dict[str, Tensor]:
         if backend_key not in self.native_views:
             raise KeyError(
                 f"Weights not prepared for backend {backend_key!r}. "

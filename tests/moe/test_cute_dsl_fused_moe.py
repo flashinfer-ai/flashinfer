@@ -5499,8 +5499,20 @@ def test_swap_ab_gemm_k_tail(k, num_tokens, tile_n):
 @pytest.mark.parametrize(
     "tactic",
     [
-        (16, ((128, 16), (1, 1), False), ((128, 16), (1, 1), False)),
-        (128, ((256, 128), (2, 1), False), ((256, 128), (2, 1), False)),
+        (
+            16,
+            ((128, 16), (1, 1), False),
+            ((128, 16), (1, 1), False),
+            (None, None),
+            True,
+        ),
+        (
+            128,
+            ((256, 128), (2, 1), False),
+            ((256, 128), (2, 1), False),
+            (None, None),
+            True,
+        ),
     ],
     ids=["n16", "n128-two-cta"],
 )
@@ -5537,7 +5549,6 @@ def test_mxfp_unfused_public_apis(quant_mode, tactic, situ_beta, situ_linear_bet
         hidden_size=hidden,
         intermediate_size=intermediate,
     )
-    weights.pop("swap_ab")
     inputs = dict(
         x=x,
         x_sf=x_sf,
@@ -5565,7 +5576,6 @@ def test_mxfp_unfused_public_apis(quant_mode, tactic, situ_beta, situ_linear_bet
         hidden_size=hidden,
         intermediate_size=intermediate,
         use_cuda_graph=True,
-        autotune_use_cuda_graph=True,
     )
     actual = wrapper.run(**inputs, tactic=tactic)
     reference_kwargs = dict(
@@ -5579,7 +5589,6 @@ def test_mxfp_unfused_public_apis(quant_mode, tactic, situ_beta, situ_linear_bet
     reference = cute_dsl_moe_reference(**inputs, **reference_kwargs)
     assert_cute_dsl_moe_bits(functional, reference)
     assert_cute_dsl_moe_bits(actual, reference)
-    assert wrapper._runner.use_cuda_graph
 
     if situ_beta is not None:
         swiglu_reference = cute_dsl_moe_reference(

@@ -551,7 +551,6 @@ def _run_worker(args):
             quant_mode=args.quant_mode,
             use_fused_finalize=False,
             use_cuda_graph=True,
-            autotune_use_cuda_graph=False,
             swap_ab=True,
         )
         per_token, tokens = args.per_token, args.local_tokens

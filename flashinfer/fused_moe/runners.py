@@ -5245,13 +5245,6 @@ class CuteDslRunner(MoERunner):
         self._require_built()
         self._validate_pack_contract(act)
         v = weights.get_view(self.backend_key)
-        # Untagged views use the original 64-row contract.
-        prepared_swap_ab = v["swap_ab"] if "swap_ab" in v else False
-        if not isinstance(prepared_swap_ab, bool) or prepared_swap_ab != self.swap_ab:
-            raise ValueError(
-                "CuTe DSL weights and CuteDslConfig must use the same swap_ab; "
-                "prepare the weights with the selected mode."
-            )
         num_tokens = act.hidden_states_q.shape[0]
         _validate_prerouted_inputs(act, num_tokens, self._inner.top_k, "CuteDslRunner")
         # prepare_weights defaults to SwiGLU, so a non-gated config paired with a

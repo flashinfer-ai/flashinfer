@@ -828,7 +828,6 @@ def _create_shared_ep_weights(rank, world_size, device, swap_ab=False):
     split.prepare_for(
         "cute_dsl",
         {
-            "swap_ab": swap_ab,
             "w1_weight": w13_split,
             "w1_weight_sf": split_scale(w13_sf_split, 2 * intermediate, hidden),
             "w1_alpha": alpha,
