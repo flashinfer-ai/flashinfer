@@ -20,10 +20,13 @@ concurrency:
   # its index rows last, with hashes for assets a newer run has since replaced.
   # update-wheel-index also runs when tests fail, so a slow failing run reaches
   # that step too. Other refs are dry runs and only queue behind their own
-  # branch. GitHub keeps one pending run per group, so a newly queued run
-  # replaces an older pending one instead of queueing behind it.
+  # branch. `queue: max` keeps every pending run (up to GitHub's limit of 100)
+  # instead of the default single slot, where a newly queued run cancels the
+  # pending one: a scheduled run waiting behind a manual dispatch would
+  # otherwise be dropped by the next dispatch, and its date never published.
   group: nightly-release-${{ github.ref }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
   setup:
