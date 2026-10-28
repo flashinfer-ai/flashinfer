@@ -227,8 +227,14 @@ def get_gemm_module():
 
     def cublas_fp8_gemm_runner():
         class CublasFp8GemmRunner(TunableRunner):
+            # Same contract as the BF16 cuBLASLt runner: the instance is memoized
+            # (process-lived), so the algo cache is keyed on the exact launch,
+            # device included, bounded, and locked.
+            _ALGO_CACHE_MAX = 256
+
             def __init__(self):
-                self._algo_cache: dict = {}
+                self._algo_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
+                self._algo_cache_lock = threading.Lock()
 
             def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
                 # Must be synthesis-invariant: including a.shape (dynamic M)
@@ -239,17 +245,32 @@ def get_gemm_module():
                 return (a.dtype, b.dtype, out.dtype)
 
             def _algo_cache_key(self, inputs: List[torch.Tensor]) -> tuple:
-                # Internal cuBLASLt algo-enumeration cache: this one is
-                # shape-specific, so key on full shapes (incl. M).
+                # The algo list is enumerated per exact problem descriptor.
                 a, b, _, _, out, _ = inputs
-                return (a.shape, b.shape, a.dtype, b.dtype, out.dtype)
+                dev = a.device
+                major, minor = get_compute_capability(dev)
+                return (
+                    dev.index,
+                    major,
+                    minor,
+                    tuple(a.shape),
+                    tuple(b.shape),
+                    tuple(a.stride()),
+                    tuple(b.stride()),
+                    tuple(out.stride()),
+                    a.dtype,
+                    b.dtype,
+                    out.dtype,
+                )
 
             def _get_algos(self, inputs):
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
                 key = self._algo_cache_key(inputs)
-                cached = self._algo_cache.get(key)
-                if cached is not None:
-                    return cached
+                with self._algo_cache_lock:
+                    cached = self._algo_cache.get(key)
+                    if cached is not None:
+                        self._algo_cache.move_to_end(key)
+                        return cached
                 algo_buf = torch.empty(
                     _CUBLASLT_MAX_ALGOS * _CUBLASLT_ALGO_BYTES,
                     dtype=torch.uint8,
@@ -265,7 +286,10 @@ def get_gemm_module():
                     algo_buf,
                 )
                 result = (algo_buf, count)
-                self._algo_cache[key] = result
+                with self._algo_cache_lock:
+                    self._algo_cache[key] = result
+                    if len(self._algo_cache) > self._ALGO_CACHE_MAX:
+                        self._algo_cache.popitem(last=False)
                 return result
 
             def get_valid_tactics(
@@ -354,7 +378,7 @@ def get_gemm_module():
 
     # Register the module
     _gemm_module = SimpleNamespace(
-        cublas_fp8_gemm_runner=cublas_fp8_gemm_runner,
+        cublas_fp8_gemm_runner=functools.lru_cache(maxsize=64)(cublas_fp8_gemm_runner),
         cutlass_segment_gemm=cutlass_segment_gemm,
     )
 
@@ -2077,7 +2101,9 @@ def get_gemm_sm120_module_cutlass_fp8():
 
     # Register the module
     return SimpleNamespace(
-        cutlass_fp8_gemm_runner=cutlass_fp8_gemm_runner,
+        cutlass_fp8_gemm_runner=functools.lru_cache(maxsize=64)(
+            cutlass_fp8_gemm_runner
+        ),
     )
 
 
@@ -2117,7 +2143,9 @@ def get_gemm_sm100_module_cutlass_fp8():
 
     # Register the module
     return SimpleNamespace(
-        cutlass_fp8_gemm_runner=cutlass_fp8_gemm_runner,
+        cutlass_fp8_gemm_runner=functools.lru_cache(maxsize=64)(
+            cutlass_fp8_gemm_runner
+        ),
     )
 
 
@@ -3086,7 +3114,7 @@ def fp8_gemm_sm100(
             get_gemm_sm120_module_cutlass_fp8().cutlass_fp8_gemm_runner()
         ),
         "cublas": lambda: get_gemm_module().cublas_fp8_gemm_runner(),
-        "cudnn": _cudnn_gemm_fp8_runner,
+        "cudnn": lambda: _cudnn_gemm_fp8_runner(),
         "cute-dsl_sm107": _cute_dsl_fp8_gemm_runner_sm107,
     }
     runners = [
@@ -3151,7 +3179,9 @@ def _create_cutlass_fp4_gemm_module(module, op_name: str, tuner_name: str):
         return CutlassFp4GemmRunner()
 
     return SimpleNamespace(
-        cutlass_fp4_gemm_runner=cutlass_fp4_gemm_runner,
+        cutlass_fp4_gemm_runner=functools.lru_cache(maxsize=64)(
+            cutlass_fp4_gemm_runner
+        ),
     )
 
 
@@ -5407,6 +5437,7 @@ def _cudnn_gemm_fp8(
     return out
 
 
+@functools.lru_cache(maxsize=64)
 def _cudnn_gemm_fp8_runner():
     class CudnnFp8GemmRunner(TunableRunner):
         def __init__(self):
@@ -6026,14 +6057,21 @@ def _cudnn_gemm_bf16_runner(
 
 def _get_real_fp4_shape_from_packed_uint8(packed_fp4_tensor):
     # the FP4 data are packed into uint8, we need to expand the shape and stride information to get the real shape and stride to be used in the cuDNN graph.
-    is_column_major = packed_fp4_tensor.stride(-2) == 1
-    real_shape = list(packed_fp4_tensor.shape)
-    real_stride = list(packed_fp4_tensor.stride())
+    return _real_fp4_shape_stride(
+        tuple(packed_fp4_tensor.shape), tuple(packed_fp4_tensor.stride())
+    )
+
+
+@functools.lru_cache(maxsize=1024)
+def _real_fp4_shape_stride(shape: tuple, stride: tuple):
+    is_column_major = stride[-2] == 1
+    real_shape = list(shape)
+    real_stride = list(stride)
 
     # this function will be used for both mm and bmm, so we need to insert batch dimension if the tensor is 2d
     if len(real_shape) == 2:
         real_shape.insert(0, 1)
-        real_stride.insert(0, packed_fp4_tensor.numel())
+        real_stride.insert(0, shape[0] * shape[1])
 
     # each packed uint8 contains 2 fp4 elements
     real_shape[-2 if is_column_major else -1] *= 2
@@ -6448,7 +6486,9 @@ def _create_cutlass_mxfp8_gemm_module(module, op_name: str, tuner_name: str):
         return CutlassMxfp8GemmRunner()
 
     return SimpleNamespace(
-        cutlass_mxfp8_gemm_runner=cutlass_mxfp8_gemm_runner,
+        cutlass_mxfp8_gemm_runner=functools.lru_cache(maxsize=64)(
+            cutlass_mxfp8_gemm_runner
+        ),
     )
 
 
@@ -6900,6 +6940,7 @@ def _sm107_low_m_split_k(
     return 1
 
 
+@functools.lru_cache(maxsize=64)
 def _cute_dsl_gemm_mxfp8_runner(
     sm_major: int,
     sm_minor: int,
@@ -7504,6 +7545,7 @@ def _cute_dsl_mxfp8_runners_sm107(
     return [sm107, low_m] + tail
 
 
+@functools.lru_cache(maxsize=64)
 def _cudnn_mm_mxfp8_runner():
     """Build a TunableRunner for the cuDNN MXFP8 (2D mm) backend.
 
@@ -7920,6 +7962,7 @@ def _cudnn_gemm_fp4(
     return out
 
 
+@functools.lru_cache(maxsize=64)
 def _cudnn_gemm_fp4_runner(tuning_config):
     """Build a CudnnFp4GemmRunner.
 
@@ -8439,6 +8482,7 @@ def _b12x_gemm_fp4_requirement(
 _CUTEDSL_LOW_LATENCY_BLOCK_SCALED_KERNEL_CACHE: dict[tuple, Callable] = {}
 
 
+@functools.lru_cache(maxsize=64)
 def _cutedsl_low_latency_blockscaled_gemm_runner(
     sm_version: int,
     enable_pdl: bool,
@@ -8845,6 +8889,7 @@ def _select_sm100_mm_fp4_splitk_tactic(
     return (tile, (1, 1), True, False, _SM100_SPLITK_KERNEL_TYPE, split_k_slices)
 
 
+@functools.lru_cache(maxsize=64)
 def _cute_dsl_gemm_fp4_runner(
     sm_major: int,
     sm_minor: int,
@@ -10902,9 +10947,11 @@ def _get_trtllm_gemm_module_impl(enable_rubin: bool):
 
     # Register the module
     return SimpleNamespace(
-        trtllm_gemm_runner=trtllm_gemm_runner,
-        trtllm_fp4_gemm_runner=trtllm_fp4_gemm_runner,
-        trtllm_mxfp8_gemm_runner=trtllm_mxfp8_gemm_runner,
+        trtllm_gemm_runner=functools.lru_cache(maxsize=64)(trtllm_gemm_runner),
+        trtllm_fp4_gemm_runner=functools.lru_cache(maxsize=64)(trtllm_fp4_gemm_runner),
+        trtllm_mxfp8_gemm_runner=functools.lru_cache(maxsize=64)(
+            trtllm_mxfp8_gemm_runner
+        ),
         trtllm_gemm=op.trtllm_gemm,
     )
 
