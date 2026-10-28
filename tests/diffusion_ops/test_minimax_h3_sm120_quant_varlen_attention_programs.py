@@ -297,6 +297,45 @@ def test_overlap_grids_take_one_producer_cta_per_free_sm(
 
 
 @pytest.mark.parametrize(
+    ("bounds", "num_sms", "width"),
+    [
+        # attention-weighted mean segment length (work / tokens) at most 1792 on 170 SMs and 2304 on
+        # 188 SMs: width 64
+        ((0, 1536, 3072, 4608, 6144), 170, 64),
+        ((0, 1536, 3072, 4608, 6144), 188, 64),
+        ((0, 1792, 3584, 5376, 7168), 170, 64),
+        ((0, 1793, 3586, 5379, 7172), 170, 32),
+        ((0, 2048, 4096), 188, 64),
+        ((0, 2048, 4096), 170, 32),
+        ((0, 2304, 4608), 188, 64),
+        ((0, 2305, 4610), 188, 32),
+        # a mean of at least 4096 over more than 16384 padded tokens: 64 on 170 SMs, 48 on 188 SMs
+        ((0, 8368, 16736, 25104, 33472), 170, 64),
+        ((0, 8368, 16736, 25104, 33472), 188, 48),
+        ((0, 4096, 8192, 12288, 16384, 20480), 188, 48),
+        ((0, 4095, 8190, 12285, 16380, 20475), 188, 32),
+        ((0, 16385), 188, 48),
+        # the rest keep the shipped width
+        ((0, 16384), 170, 32),
+        ((0, 257, 4567, 4824), 188, 32),
+        ((0, 4096), 170, 32),
+    ],
+)
+def test_overlap_width_follows_the_plan(bounds, num_sms, width) -> None:
+    plan = ops.MiniMaxH3VarlenPlan(bounds, 56, torch.device("cpu"), num_sms)
+    assert plan.overlap
+    grids = ops.minimax_h3_sm120_quant_varlen_attention_overlap_grids(
+        num_sms,
+        num_units=plan.num_units,
+        total_tokens=plan.total_tokens,
+        work=plan.work,
+        padded_tokens=plan.padded_tokens,
+    )
+    lead = max(1, min(num_sms - width, plan.num_units))
+    assert grids == (lead, min(2 * width, num_sms - lead), width)
+
+
+@pytest.mark.parametrize(
     ("bounds", "heads", "num_sms", "overlap"),
     [
         # the band's edges: 2 x 2048 (2^23) and one 24576-token segment (24576^2)

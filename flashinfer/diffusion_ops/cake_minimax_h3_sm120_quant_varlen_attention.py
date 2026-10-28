@@ -67,6 +67,17 @@ _PREP_CTAS_PER_SM = 4
 # computes what the sequential launches compute for it, so the output is bitwise the sequential
 # form's.
 _OVERLAP_WIDTH = {170: 32, 188: 32}
+# The overlap width P of a plan also follows its attention-weighted mean segment length (the sum of
+# the squared segment lengths over the token count: the attention work per pre-processed token).  A
+# plan whose mean is at most ``_OVERLAP_LIGHT_MAX_SEGMENT`` tokens (per SM count) is bound by its
+# producers and takes the width ``_OVERLAP_WIDTH_LIGHT``; a plan of more than
+# ``_OVERLAP_LONG_MIN_PADDED`` padded tokens whose mean is at least ``_OVERLAP_LONG_MIN_SEGMENT``
+# tokens takes ``_OVERLAP_WIDTH_LONG``; the rest keep ``_OVERLAP_WIDTH``.
+_OVERLAP_WIDTH_LIGHT = {170: 64, 188: 64}
+_OVERLAP_LIGHT_MAX_SEGMENT = {170: 1792, 188: 2304}
+_OVERLAP_WIDTH_LONG = {170: 64, 188: 48}
+_OVERLAP_LONG_MIN_PADDED = 16384
+_OVERLAP_LONG_MIN_SEGMENT = 4096
 _OVERLAP_PRODUCER_WORKERS = 2
 _HCTR_WORDS_PER_HEAD = 4
 _HCTR_TAIL_WORDS = 8
@@ -339,7 +350,11 @@ class _Launch:
         overlap_grids = (0, 0, 0)
         if plan.overlap:
             grids = minimax_h3_sm120_quant_varlen_attention_overlap_grids(
-                _sm_count(index), num_units=plan.num_units
+                _sm_count(index),
+                num_units=plan.num_units,
+                total_tokens=plan.total_tokens,
+                work=plan.work,
+                padded_tokens=plan.padded_tokens,
             )
             assert grids is not None, "an overlap plan has an overlap width"
             overlap_grids = grids
@@ -612,20 +627,43 @@ def minimax_h3_sm120_quant_varlen_attention_launch_grids(
 
 
 def minimax_h3_sm120_quant_varlen_attention_overlap_grids(
-    num_sms: int, *, num_units: int
+    num_sms: int,
+    *,
+    num_units: int,
+    total_tokens: Optional[int] = None,
+    work: Optional[int] = None,
+    padded_tokens: Optional[int] = None,
 ) -> Optional[Tuple[int, int, int]]:
     """The overlapped form's ``(lead, producers, tail)`` grids on a device of ``num_sms`` SMs, or
     ``None`` when that SM count has no overlap width ``P``: the lead attention over
     ``max(1, min(num_sms - P, num_units))`` CTAs (one per SM), the producers over
     ``min(2 * P, num_sms - lead)`` CTAs (one CTA of two workers on each SM the lead leaves) and the
     tail attention over ``P`` CTAs.  The tuple is in grid order; the launch order is the producers,
-    the lead, the tail."""
+    the lead, the tail.  ``P`` is 32 on 170 and 188 SMs; with the plan's ``total_tokens`` and
+    ``work`` (the sum of the squared segment lengths) it is 64 when ``work`` is at most 1792 (170
+    SMs) or 2304 (188 SMs) times ``total_tokens``, else, with ``padded_tokens`` above 16384 and
+    ``work`` at least 4096 times ``total_tokens``, 64 on 170 SMs and 48 on 188 SMs."""
     sms = int(num_sms)
     if sms <= 0:
         raise ValueError(f"num_sms must be positive, got {num_sms}")
     width = _OVERLAP_WIDTH.get(sms)
     if width is None:
         return None
+    if (
+        total_tokens is not None
+        and work is not None
+        and int(total_tokens) > 0
+        and int(work) <= _OVERLAP_LIGHT_MAX_SEGMENT.get(sms, 0) * int(total_tokens)
+    ):
+        width = _OVERLAP_WIDTH_LIGHT.get(sms, width)
+    elif (
+        total_tokens is not None
+        and work is not None
+        and padded_tokens is not None
+        and int(padded_tokens) > _OVERLAP_LONG_MIN_PADDED
+        and int(work) >= _OVERLAP_LONG_MIN_SEGMENT * int(total_tokens)
+    ):
+        width = _OVERLAP_WIDTH_LONG.get(sms, width)
     lead = max(1, min(sms - width, int(num_units)))
     return lead, min(_OVERLAP_PRODUCER_WORKERS * width, sms - lead), width
 
