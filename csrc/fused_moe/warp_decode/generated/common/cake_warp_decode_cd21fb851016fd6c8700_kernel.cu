@@ -263,7 +263,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_warp_decode_6675952d378f489966f0(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, int M, int K, int grid_m, int grid_n, int K_tiles, int* __restrict__ pack_ready, int* __restrict__ done_counter, int initial_work, int launch_ctas)
+kernel_cake_warp_decode_cd21fb851016fd6c8700(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, int M, int K, int grid_m, int grid_n, int K_tiles, int* __restrict__ pack_ready, int* __restrict__ done_counter, int initial_work, int launch_ctas)
 {
     // Grid-dependency payloads: written while the kernel runs, read with coherent loads only.
     asm volatile("" : "+l"(tile_expert));
@@ -515,7 +515,7 @@ kernel_cake_warp_decode_6675952d378f489966f0(const __grid_constant__ CUtensorMap
                 if (elect_sync()) {
                     mbarrier_arrive(mma_free_addr + (acc_stage) * 8);
                 }
-                int token = wide_token;
+                int token_1_0 = wide_token;
                 wide_values[0] = _tmem_load_0[0] * output_scale;
                 wide_values[1] = _tmem_load_0[2] * output_scale;
                 wide_values[2] = _tmem_load_1[0] * output_scale;
@@ -527,11 +527,11 @@ kernel_cake_warp_decode_6675952d378f489966f0(const __grid_constant__ CUtensorMap
                 }
                 wide_word = (unsigned long long)wide_packed[0] | (unsigned long long)wide_packed[1] << 32;
                 if (wide_feature < 64) {
-                    epi_staging_u64[(token * 64 + wide_feature) / 4] = wide_word;
+                    epi_staging_u64[(token_1_0 * 64 + wide_feature) / 4] = wide_word;
                 } else {
-                    epi_staging_u64[(512 + token * 64 + wide_feature - 64) / 4] = wide_word;
+                    epi_staging_u64[(512 + token_1_0 * 64 + wide_feature - 64) / 4] = wide_word;
                 }
-                int token_0 = wide_token + 1;
+                int token_1_1 = wide_token + 1;
                 wide_values[0] = _tmem_load_0[1] * output_scale;
                 wide_values[1] = _tmem_load_0[3] * output_scale;
                 wide_values[2] = _tmem_load_1[1] * output_scale;
@@ -543,9 +543,9 @@ kernel_cake_warp_decode_6675952d378f489966f0(const __grid_constant__ CUtensorMap
                 }
                 wide_word = (unsigned long long)wide_packed[0] | (unsigned long long)wide_packed[1] << 32;
                 if (wide_feature < 64) {
-                    epi_staging_u64[(token_0 * 64 + wide_feature) / 4] = wide_word;
+                    epi_staging_u64[(token_1_1 * 64 + wide_feature) / 4] = wide_word;
                 } else {
-                    epi_staging_u64[(512 + token_0 * 64 + wide_feature - 64) / 4] = wide_word;
+                    epi_staging_u64[(512 + token_1_1 * 64 + wide_feature - 64) / 4] = wide_word;
                 }
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("barrier.sync 8, 128;" ::: "memory");
@@ -607,44 +607,44 @@ kernel_cake_warp_decode_6675952d378f489966f0(const __grid_constant__ CUtensorMap
                     mbarrier_wait(sfb_full_addr + (stage) * 8, _phase_sfb_full);
                     mbarrier_wait(k_done_addr + (stage) * 8, _phase_k_done);
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    const int q = 0;
-                    for (int reg = 0; reg < 1; reg++) {
-                        word[reg] = 0;
-                        if (lane_0 + reg * 32 < 8) {
-                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&word[reg])) : "r"(smem_sfb_addr + stage * 128 + (unsigned int)((reg * 4 + lane_0 / 8) * 128) + (unsigned int)(q * 32) + (unsigned int)(lane_0 % 8 * 4)));
+                    const int q_3_0 = 0;
+                    for (int reg_1_0 = 0; reg_1_0 < 1; reg_1_0++) {
+                        word[reg_1_0] = 0;
+                        if (lane_0 + reg_1_0 * 32 < 8) {
+                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&word[reg_1_0])) : "r"(smem_sfb_addr + stage * 128 + (unsigned int)((reg_1_0 * 4 + lane_0 / 8) * 128) + (unsigned int)(q_3_0 * 32) + (unsigned int)(lane_0 % 8 * 4)));
                         }
                     }
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x1.b32"
                         " [%0], {%1};"
                         :: "r"((unsigned int)tmem_sfb + (unsigned int)(tmem_lane_base << 16) + stage * 16), "r"(word[0]));
-                    const int q_0 = 1;
-                    for (int reg_1 = 0; reg_1 < 1; reg_1++) {
-                        word[reg_1] = 0;
-                        if (lane_0 + reg_1 * 32 < 8) {
-                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&word[reg_1])) : "r"(smem_sfb_addr + stage * 128 + (unsigned int)((reg_1 * 4 + lane_0 / 8) * 128) + (unsigned int)(q_0 * 32) + (unsigned int)(lane_0 % 8 * 4)));
+                    const int q_3_1 = 1;
+                    for (int reg_1_1 = 0; reg_1_1 < 1; reg_1_1++) {
+                        word[reg_1_1] = 0;
+                        if (lane_0 + reg_1_1 * 32 < 8) {
+                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&word[reg_1_1])) : "r"(smem_sfb_addr + stage * 128 + (unsigned int)((reg_1_1 * 4 + lane_0 / 8) * 128) + (unsigned int)(q_3_1 * 32) + (unsigned int)(lane_0 % 8 * 4)));
                         }
                     }
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x1.b32"
                         " [%0], {%1};"
                         :: "r"((unsigned int)tmem_sfb + (unsigned int)(tmem_lane_base << 16) + stage * 16 + 4), "r"(word[0]));
-                    const int q_1 = 2;
-                    for (int reg_2 = 0; reg_2 < 1; reg_2++) {
-                        word[reg_2] = 0;
-                        if (lane_0 + reg_2 * 32 < 8) {
-                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&word[reg_2])) : "r"(smem_sfb_addr + stage * 128 + (unsigned int)((reg_2 * 4 + lane_0 / 8) * 128) + (unsigned int)(q_1 * 32) + (unsigned int)(lane_0 % 8 * 4)));
+                    const int q_3_2 = 2;
+                    for (int reg_1_2 = 0; reg_1_2 < 1; reg_1_2++) {
+                        word[reg_1_2] = 0;
+                        if (lane_0 + reg_1_2 * 32 < 8) {
+                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&word[reg_1_2])) : "r"(smem_sfb_addr + stage * 128 + (unsigned int)((reg_1_2 * 4 + lane_0 / 8) * 128) + (unsigned int)(q_3_2 * 32) + (unsigned int)(lane_0 % 8 * 4)));
                         }
                     }
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x1.b32"
                         " [%0], {%1};"
                         :: "r"((unsigned int)tmem_sfb + (unsigned int)(tmem_lane_base << 16) + stage * 16 + 8), "r"(word[0]));
-                    const int q_2 = 3;
-                    for (int reg_3 = 0; reg_3 < 1; reg_3++) {
-                        word[reg_3] = 0;
-                        if (lane_0 + reg_3 * 32 < 8) {
-                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&word[reg_3])) : "r"(smem_sfb_addr + stage * 128 + (unsigned int)((reg_3 * 4 + lane_0 / 8) * 128) + (unsigned int)(q_2 * 32) + (unsigned int)(lane_0 % 8 * 4)));
+                    const int q_3_3 = 3;
+                    for (int reg_1_3 = 0; reg_1_3 < 1; reg_1_3++) {
+                        word[reg_1_3] = 0;
+                        if (lane_0 + reg_1_3 * 32 < 8) {
+                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&word[reg_1_3])) : "r"(smem_sfb_addr + stage * 128 + (unsigned int)((reg_1_3 * 4 + lane_0 / 8) * 128) + (unsigned int)(q_3_3 * 32) + (unsigned int)(lane_0 % 8 * 4)));
                         }
                     }
                     asm volatile(
