@@ -3012,6 +3012,8 @@ kernel_cake_trtllm_moe_allreduce_union_ws4_bf16_two_shot_b5(__nv_bfloat16* __res
     int rs_item = cluster_thread / 4;
     int rs_slot_items = tokens * 224;
     __nv_bfloat16* rs_source_base = reinterpret_cast<__nv_bfloat16*>(workspace_tensor[8 + rs_src]);
+    int lead_rs_token = (int)cluster_id + (int)num_clusters;
+    unsigned int lead_rs_words[4];
     if ((int)cluster_id < tokens) {
         unsigned int first_rs_words[4];
         uint32_t _sysv_ld_0[4];
@@ -3020,11 +3022,19 @@ kernel_cake_trtllm_moe_allreduce_union_ws4_bf16_two_shot_b5(__nv_bfloat16* __res
         for (int word = 0; word < 4; word++) {
             first_rs_words[word] = _sysv_ld_0[word];
         }
+        if (lead_rs_token < tokens) {
+            uint32_t _sysv_ld_1[4];
+            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_ld_1[0]), "=r"(_sysv_ld_1[1]), "=r"(_sysv_ld_1[2]), "=r"(_sysv_ld_1[3]) : "l"(workspace_local + ((long long)data_epoch * comm_stride_elems + (long long)(rs_src * rs_slot_items + lead_rs_token * 224 + rs_item) * 8)) : "memory");
+            #pragma unroll
+            for (int word_1 = 0; word_1 < 4; word_1++) {
+                lead_rs_words[word_1] = _sysv_ld_1[word_1];
+            }
+        }
         int pending = 0;
         #pragma unroll
-        for (int word_1 = 0; word_1 < 4; word_1++) {
-            pending = (((first_rs_words[word_1] & 65535) == 32768) ? 1 : pending);
-            pending = ((first_rs_words[word_1] >> 16 == 32768) ? 1 : pending);
+        for (int word_2 = 0; word_2 < 4; word_2++) {
+            pending = (((first_rs_words[word_2] & 65535) == 32768) ? 1 : pending);
+            pending = ((first_rs_words[word_2] >> 16 == 32768) ? 1 : pending);
         }
         if (pending == 1) {
             uint32_t _sysv_poll_group_0[4];
@@ -3038,8 +3048,8 @@ kernel_cake_trtllm_moe_allreduce_union_ws4_bf16_two_shot_b5(__nv_bfloat16* __res
                 }
             } while (_sysv_pending_87 != 0u);
             #pragma unroll
-            for (int word_2 = 0; word_2 < 4; word_2++) {
-                first_rs_words[word_2] = _sysv_poll_group_0[word_2];
+            for (int word_3 = 0; word_3 < 4; word_3++) {
+                first_rs_words[word_3] = _sysv_poll_group_0[word_3];
             }
         }
         unsigned int ag_words[4];
@@ -3048,19 +3058,19 @@ kernel_cake_trtllm_moe_allreduce_union_ws4_bf16_two_shot_b5(__nv_bfloat16* __res
         unsigned int _shfl_2 = __shfl_sync(4294967295, first_rs_words[0], 2, 4);
         unsigned int _shfl_3 = __shfl_sync(4294967295, first_rs_words[0], 3, 4);
         float lanes[2];
-        unsigned int word_3[1];
-        word_3[0] = _shfl_0;
+        unsigned int word_4[1];
+        word_4[0] = _shfl_0;
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&lanes[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_3[_pair]) << 16);
-            (&lanes[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_3[_pair]) & 0xffff0000u);
+            (&lanes[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_4[_pair]) << 16);
+            (&lanes[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_4[_pair]) & 0xffff0000u);
         }
         float received_lanes[2];
-        word_3[0] = _shfl_1;
+        word_4[0] = _shfl_1;
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&received_lanes[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_3[_pair]) << 16);
-            (&received_lanes[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_3[_pair]) & 0xffff0000u);
+            (&received_lanes[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_4[_pair]) << 16);
+            (&received_lanes[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_4[_pair]) & 0xffff0000u);
         }
         #pragma unroll
         for (int j_80 = 0; j_80 < 2; j_80++) {
@@ -3077,11 +3087,11 @@ kernel_cake_trtllm_moe_allreduce_union_ws4_bf16_two_shot_b5(__nv_bfloat16* __res
             (&lanes[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_bf16[_pair]) << 16);
             (&lanes[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_bf16[_pair]) & 0xffff0000u);
         }
-        word_3[0] = _shfl_2;
+        word_4[0] = _shfl_2;
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&received_lanes[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_3[_pair]) << 16);
-            (&received_lanes[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_3[_pair]) & 0xffff0000u);
+            (&received_lanes[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_4[_pair]) << 16);
+            (&received_lanes[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_4[_pair]) & 0xffff0000u);
         }
         #pragma unroll
         for (int j_81 = 0; j_81 < 2; j_81++) {
@@ -3098,11 +3108,11 @@ kernel_cake_trtllm_moe_allreduce_union_ws4_bf16_two_shot_b5(__nv_bfloat16* __res
             (&lanes[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_bf16_0[_pair]) << 16);
             (&lanes[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_bf16_0[_pair]) & 0xffff0000u);
         }
-        word_3[0] = _shfl_3;
+        word_4[0] = _shfl_3;
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&received_lanes[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_3[_pair]) << 16);
-            (&received_lanes[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_3[_pair]) & 0xffff0000u);
+            (&received_lanes[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_4[_pair]) << 16);
+            (&received_lanes[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_4[_pair]) & 0xffff0000u);
         }
         #pragma unroll
         for (int j_82 = 0; j_82 < 2; j_82++) {
@@ -3137,19 +3147,19 @@ kernel_cake_trtllm_moe_allreduce_union_ws4_bf16_two_shot_b5(__nv_bfloat16* __res
         unsigned int _shfl_6 = __shfl_sync(4294967295, first_rs_words[1], 2, 4);
         unsigned int _shfl_7 = __shfl_sync(4294967295, first_rs_words[1], 3, 4);
         float lanes_3[2];
-        unsigned int word_4[1];
-        word_4[0] = _shfl_4;
+        unsigned int word_4_1[1];
+        word_4_1[0] = _shfl_4;
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&lanes_3[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_4[_pair]) << 16);
-            (&lanes_3[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_4[_pair]) & 0xffff0000u);
+            (&lanes_3[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_4_1[_pair]) << 16);
+            (&lanes_3[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_4_1[_pair]) & 0xffff0000u);
         }
         float received_lanes_5[2];
-        word_4[0] = _shfl_5;
+        word_4_1[0] = _shfl_5;
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&received_lanes_5[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_4[_pair]) << 16);
-            (&received_lanes_5[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_4[_pair]) & 0xffff0000u);
+            (&received_lanes_5[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_4_1[_pair]) << 16);
+            (&received_lanes_5[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_4_1[_pair]) & 0xffff0000u);
         }
         #pragma unroll
         for (int j_83 = 0; j_83 < 2; j_83++) {
@@ -3166,11 +3176,11 @@ kernel_cake_trtllm_moe_allreduce_union_ws4_bf16_two_shot_b5(__nv_bfloat16* __res
             (&lanes_3[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_3_bf16[_pair]) << 16);
             (&lanes_3[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_3_bf16[_pair]) & 0xffff0000u);
         }
-        word_4[0] = _shfl_6;
+        word_4_1[0] = _shfl_6;
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&received_lanes_5[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_4[_pair]) << 16);
-            (&received_lanes_5[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_4[_pair]) & 0xffff0000u);
+            (&received_lanes_5[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_4_1[_pair]) << 16);
+            (&received_lanes_5[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_4_1[_pair]) & 0xffff0000u);
         }
         #pragma unroll
         for (int j_84 = 0; j_84 < 2; j_84++) {
@@ -3187,11 +3197,11 @@ kernel_cake_trtllm_moe_allreduce_union_ws4_bf16_two_shot_b5(__nv_bfloat16* __res
             (&lanes_3[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_3_bf16_6[_pair]) << 16);
             (&lanes_3[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_3_bf16_6[_pair]) & 0xffff0000u);
         }
-        word_4[0] = _shfl_7;
+        word_4_1[0] = _shfl_7;
         #pragma unroll
         for (int _pair = 0; _pair < 1; _pair++) {
-            (&received_lanes_5[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_4[_pair]) << 16);
-            (&received_lanes_5[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_4[_pair]) & 0xffff0000u);
+            (&received_lanes_5[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_4_1[_pair]) << 16);
+            (&received_lanes_5[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_4_1[_pair]) & 0xffff0000u);
         }
         #pragma unroll
         for (int j_85 = 0; j_85 < 2; j_85++) {
@@ -3405,49 +3415,435 @@ kernel_cake_trtllm_moe_allreduce_union_ws4_bf16_two_shot_b5(__nv_bfloat16* __res
             reinterpret_cast<int4*>(_gst_88)[0] = reinterpret_cast<int4*>(ag_words)[0];
         }
     }
+    if (lead_rs_token < tokens) {
+        int pending_1 = 0;
+        #pragma unroll
+        for (int word_5 = 0; word_5 < 4; word_5++) {
+            pending_1 = (((lead_rs_words[word_5] & 65535) == 32768) ? 1 : pending_1);
+            pending_1 = ((lead_rs_words[word_5] >> 16 == 32768) ? 1 : pending_1);
+        }
+        if (pending_1 == 1) {
+            uint32_t _sysv_poll_group_0_1[4];
+            uint32_t _sysv_pending_89 = 1u;
+            do {
+                if (_sysv_pending_89 & 1u) {
+                    asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0_1[0]), "=r"(_sysv_poll_group_0_1[1]), "=r"(_sysv_poll_group_0_1[2]), "=r"(_sysv_poll_group_0_1[3]) : "l"(workspace_local + ((long long)data_epoch * comm_stride_elems + (long long)(rs_src * rs_slot_items + lead_rs_token * 224 + rs_item) * 8)) : "memory");
+                }
+                if (_sysv_pending_89 & 1u) {
+                    if (!((((_sysv_poll_group_0_1[0] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0_1[0] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0_1[1] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0_1[1] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0_1[2] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0_1[2] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0_1[3] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0_1[3] >> 16) & 0xffffu) == 0x8000u))) _sysv_pending_89 &= ~1u;
+                }
+            } while (_sysv_pending_89 != 0u);
+            #pragma unroll
+            for (int word_6 = 0; word_6 < 4; word_6++) {
+                lead_rs_words[word_6] = _sysv_poll_group_0_1[word_6];
+            }
+        }
+        unsigned int ag_words_1[4];
+        unsigned int _shfl_0_1 = __shfl_sync(4294967295, lead_rs_words[0], 0, 4);
+        unsigned int _shfl_1_1 = __shfl_sync(4294967295, lead_rs_words[0], 1, 4);
+        unsigned int _shfl_2_1 = __shfl_sync(4294967295, lead_rs_words[0], 2, 4);
+        unsigned int _shfl_3_1 = __shfl_sync(4294967295, lead_rs_words[0], 3, 4);
+        float lanes_1[2];
+        unsigned int word_7[1];
+        word_7[0] = _shfl_0_1;
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&lanes_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_7[_pair]) << 16);
+            (&lanes_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_7[_pair]) & 0xffff0000u);
+        }
+        float received_lanes_1[2];
+        word_7[0] = _shfl_1_1;
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&received_lanes_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_7[_pair]) << 16);
+            (&received_lanes_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_7[_pair]) & 0xffff0000u);
+        }
+        #pragma unroll
+        for (int j_92 = 0; j_92 < 2; j_92++) {
+            lanes_1[j_92] = lanes_1[j_92] + received_lanes_1[j_92];
+        }
+        unsigned int lanes_bf16_3[1];
+        #pragma unroll
+        for (int _lp = 0; _lp < 1; _lp++) {
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_1[_lp*2 + 0], lanes_1[_lp*2+1 + 0]));
+            lanes_bf16_3[_lp] = *(uint32_t*)&_bf2;
+        }
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&lanes_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_bf16_3[_pair]) << 16);
+            (&lanes_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_bf16_3[_pair]) & 0xffff0000u);
+        }
+        word_7[0] = _shfl_2_1;
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&received_lanes_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_7[_pair]) << 16);
+            (&received_lanes_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_7[_pair]) & 0xffff0000u);
+        }
+        #pragma unroll
+        for (int j_93 = 0; j_93 < 2; j_93++) {
+            lanes_1[j_93] = lanes_1[j_93] + received_lanes_1[j_93];
+        }
+        unsigned int lanes_bf16_0_1[1];
+        #pragma unroll
+        for (int _lp = 0; _lp < 1; _lp++) {
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_1[_lp*2 + 0], lanes_1[_lp*2+1 + 0]));
+            lanes_bf16_0_1[_lp] = *(uint32_t*)&_bf2;
+        }
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&lanes_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_bf16_0_1[_pair]) << 16);
+            (&lanes_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_bf16_0_1[_pair]) & 0xffff0000u);
+        }
+        word_7[0] = _shfl_3_1;
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&received_lanes_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_7[_pair]) << 16);
+            (&received_lanes_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_7[_pair]) & 0xffff0000u);
+        }
+        #pragma unroll
+        for (int j_94 = 0; j_94 < 2; j_94++) {
+            lanes_1[j_94] = lanes_1[j_94] + received_lanes_1[j_94];
+        }
+        unsigned int lanes_bf16_1_1[1];
+        #pragma unroll
+        for (int _lp = 0; _lp < 1; _lp++) {
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_1[_lp*2 + 0], lanes_1[_lp*2+1 + 0]));
+            lanes_bf16_1_1[_lp] = *(uint32_t*)&_bf2;
+        }
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&lanes_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_bf16_1_1[_pair]) << 16);
+            (&lanes_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_bf16_1_1[_pair]) & 0xffff0000u);
+        }
+        unsigned int lanes_bf16_2_1[1];
+        #pragma unroll
+        for (int _lp = 0; _lp < 1; _lp++) {
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_1[_lp*2 + 0], lanes_1[_lp*2+1 + 0]));
+            lanes_bf16_2_1[_lp] = *(uint32_t*)&_bf2;
+        }
+        unsigned int low_1 = lanes_bf16_2_1[0] & 65535;
+        unsigned int high_1 = lanes_bf16_2_1[0] >> 16;
+        low_1 = ((low_1 == 65535) ? 65534 : low_1);
+        high_1 = ((high_1 == 65535) ? 65534 : high_1);
+        low_1 = ((low_1 == 32768) ? 65535 : low_1);
+        high_1 = ((high_1 == 32768) ? 65535 : high_1);
+        ag_words_1[0] = low_1 | high_1 << 16;
+        unsigned int _shfl_4_1 = __shfl_sync(4294967295, lead_rs_words[1], 0, 4);
+        unsigned int _shfl_5_1 = __shfl_sync(4294967295, lead_rs_words[1], 1, 4);
+        unsigned int _shfl_6_1 = __shfl_sync(4294967295, lead_rs_words[1], 2, 4);
+        unsigned int _shfl_7_1 = __shfl_sync(4294967295, lead_rs_words[1], 3, 4);
+        float lanes_3_1[2];
+        unsigned int word_4_2[1];
+        word_4_2[0] = _shfl_4_1;
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&lanes_3_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_4_2[_pair]) << 16);
+            (&lanes_3_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_4_2[_pair]) & 0xffff0000u);
+        }
+        float received_lanes_5_1[2];
+        word_4_2[0] = _shfl_5_1;
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&received_lanes_5_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_4_2[_pair]) << 16);
+            (&received_lanes_5_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_4_2[_pair]) & 0xffff0000u);
+        }
+        #pragma unroll
+        for (int j_95 = 0; j_95 < 2; j_95++) {
+            lanes_3_1[j_95] = lanes_3_1[j_95] + received_lanes_5_1[j_95];
+        }
+        unsigned int lanes_3_bf16_1[1];
+        #pragma unroll
+        for (int _lp = 0; _lp < 1; _lp++) {
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_3_1[_lp*2 + 0], lanes_3_1[_lp*2+1 + 0]));
+            lanes_3_bf16_1[_lp] = *(uint32_t*)&_bf2;
+        }
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&lanes_3_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_3_bf16_1[_pair]) << 16);
+            (&lanes_3_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_3_bf16_1[_pair]) & 0xffff0000u);
+        }
+        word_4_2[0] = _shfl_6_1;
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&received_lanes_5_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_4_2[_pair]) << 16);
+            (&received_lanes_5_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_4_2[_pair]) & 0xffff0000u);
+        }
+        #pragma unroll
+        for (int j_96 = 0; j_96 < 2; j_96++) {
+            lanes_3_1[j_96] = lanes_3_1[j_96] + received_lanes_5_1[j_96];
+        }
+        unsigned int lanes_3_bf16_6_1[1];
+        #pragma unroll
+        for (int _lp = 0; _lp < 1; _lp++) {
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_3_1[_lp*2 + 0], lanes_3_1[_lp*2+1 + 0]));
+            lanes_3_bf16_6_1[_lp] = *(uint32_t*)&_bf2;
+        }
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&lanes_3_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_3_bf16_6_1[_pair]) << 16);
+            (&lanes_3_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_3_bf16_6_1[_pair]) & 0xffff0000u);
+        }
+        word_4_2[0] = _shfl_7_1;
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&received_lanes_5_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_4_2[_pair]) << 16);
+            (&received_lanes_5_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_4_2[_pair]) & 0xffff0000u);
+        }
+        #pragma unroll
+        for (int j_97 = 0; j_97 < 2; j_97++) {
+            lanes_3_1[j_97] = lanes_3_1[j_97] + received_lanes_5_1[j_97];
+        }
+        unsigned int lanes_3_bf16_7_1[1];
+        #pragma unroll
+        for (int _lp = 0; _lp < 1; _lp++) {
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_3_1[_lp*2 + 0], lanes_3_1[_lp*2+1 + 0]));
+            lanes_3_bf16_7_1[_lp] = *(uint32_t*)&_bf2;
+        }
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&lanes_3_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_3_bf16_7_1[_pair]) << 16);
+            (&lanes_3_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_3_bf16_7_1[_pair]) & 0xffff0000u);
+        }
+        unsigned int lanes_3_bf16_8_1[1];
+        #pragma unroll
+        for (int _lp = 0; _lp < 1; _lp++) {
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_3_1[_lp*2 + 0], lanes_3_1[_lp*2+1 + 0]));
+            lanes_3_bf16_8_1[_lp] = *(uint32_t*)&_bf2;
+        }
+        unsigned int low_9_1 = lanes_3_bf16_8_1[0] & 65535;
+        unsigned int high_10_1 = lanes_3_bf16_8_1[0] >> 16;
+        low_9_1 = ((low_9_1 == 65535) ? 65534 : low_9_1);
+        high_10_1 = ((high_10_1 == 65535) ? 65534 : high_10_1);
+        low_9_1 = ((low_9_1 == 32768) ? 65535 : low_9_1);
+        high_10_1 = ((high_10_1 == 32768) ? 65535 : high_10_1);
+        ag_words_1[1] = low_9_1 | high_10_1 << 16;
+        unsigned int _shfl_8_1 = __shfl_sync(4294967295, lead_rs_words[2], 0, 4);
+        unsigned int _shfl_9_1 = __shfl_sync(4294967295, lead_rs_words[2], 1, 4);
+        unsigned int _shfl_10_1 = __shfl_sync(4294967295, lead_rs_words[2], 2, 4);
+        unsigned int _shfl_11_1 = __shfl_sync(4294967295, lead_rs_words[2], 3, 4);
+        float lanes_11_1[2];
+        unsigned int word_12_1[1];
+        word_12_1[0] = _shfl_8_1;
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&lanes_11_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_12_1[_pair]) << 16);
+            (&lanes_11_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_12_1[_pair]) & 0xffff0000u);
+        }
+        float received_lanes_13_1[2];
+        word_12_1[0] = _shfl_9_1;
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&received_lanes_13_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_12_1[_pair]) << 16);
+            (&received_lanes_13_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_12_1[_pair]) & 0xffff0000u);
+        }
+        #pragma unroll
+        for (int j_98 = 0; j_98 < 2; j_98++) {
+            lanes_11_1[j_98] = lanes_11_1[j_98] + received_lanes_13_1[j_98];
+        }
+        unsigned int lanes_11_bf16_1[1];
+        #pragma unroll
+        for (int _lp = 0; _lp < 1; _lp++) {
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_11_1[_lp*2 + 0], lanes_11_1[_lp*2+1 + 0]));
+            lanes_11_bf16_1[_lp] = *(uint32_t*)&_bf2;
+        }
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&lanes_11_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_11_bf16_1[_pair]) << 16);
+            (&lanes_11_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_11_bf16_1[_pair]) & 0xffff0000u);
+        }
+        word_12_1[0] = _shfl_10_1;
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&received_lanes_13_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_12_1[_pair]) << 16);
+            (&received_lanes_13_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_12_1[_pair]) & 0xffff0000u);
+        }
+        #pragma unroll
+        for (int j_99 = 0; j_99 < 2; j_99++) {
+            lanes_11_1[j_99] = lanes_11_1[j_99] + received_lanes_13_1[j_99];
+        }
+        unsigned int lanes_11_bf16_14_1[1];
+        #pragma unroll
+        for (int _lp = 0; _lp < 1; _lp++) {
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_11_1[_lp*2 + 0], lanes_11_1[_lp*2+1 + 0]));
+            lanes_11_bf16_14_1[_lp] = *(uint32_t*)&_bf2;
+        }
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&lanes_11_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_11_bf16_14_1[_pair]) << 16);
+            (&lanes_11_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_11_bf16_14_1[_pair]) & 0xffff0000u);
+        }
+        word_12_1[0] = _shfl_11_1;
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&received_lanes_13_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_12_1[_pair]) << 16);
+            (&received_lanes_13_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_12_1[_pair]) & 0xffff0000u);
+        }
+        #pragma unroll
+        for (int j_100 = 0; j_100 < 2; j_100++) {
+            lanes_11_1[j_100] = lanes_11_1[j_100] + received_lanes_13_1[j_100];
+        }
+        unsigned int lanes_11_bf16_15_1[1];
+        #pragma unroll
+        for (int _lp = 0; _lp < 1; _lp++) {
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_11_1[_lp*2 + 0], lanes_11_1[_lp*2+1 + 0]));
+            lanes_11_bf16_15_1[_lp] = *(uint32_t*)&_bf2;
+        }
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&lanes_11_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_11_bf16_15_1[_pair]) << 16);
+            (&lanes_11_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_11_bf16_15_1[_pair]) & 0xffff0000u);
+        }
+        unsigned int lanes_11_bf16_16_1[1];
+        #pragma unroll
+        for (int _lp = 0; _lp < 1; _lp++) {
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_11_1[_lp*2 + 0], lanes_11_1[_lp*2+1 + 0]));
+            lanes_11_bf16_16_1[_lp] = *(uint32_t*)&_bf2;
+        }
+        unsigned int low_17_1 = lanes_11_bf16_16_1[0] & 65535;
+        unsigned int high_18_1 = lanes_11_bf16_16_1[0] >> 16;
+        low_17_1 = ((low_17_1 == 65535) ? 65534 : low_17_1);
+        high_18_1 = ((high_18_1 == 65535) ? 65534 : high_18_1);
+        low_17_1 = ((low_17_1 == 32768) ? 65535 : low_17_1);
+        high_18_1 = ((high_18_1 == 32768) ? 65535 : high_18_1);
+        ag_words_1[2] = low_17_1 | high_18_1 << 16;
+        unsigned int _shfl_12_1 = __shfl_sync(4294967295, lead_rs_words[3], 0, 4);
+        unsigned int _shfl_13_1 = __shfl_sync(4294967295, lead_rs_words[3], 1, 4);
+        unsigned int _shfl_14_1 = __shfl_sync(4294967295, lead_rs_words[3], 2, 4);
+        unsigned int _shfl_15_1 = __shfl_sync(4294967295, lead_rs_words[3], 3, 4);
+        float lanes_19_1[2];
+        unsigned int word_20_1[1];
+        word_20_1[0] = _shfl_12_1;
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&lanes_19_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_20_1[_pair]) << 16);
+            (&lanes_19_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_20_1[_pair]) & 0xffff0000u);
+        }
+        float received_lanes_21_1[2];
+        word_20_1[0] = _shfl_13_1;
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&received_lanes_21_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_20_1[_pair]) << 16);
+            (&received_lanes_21_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_20_1[_pair]) & 0xffff0000u);
+        }
+        #pragma unroll
+        for (int j_101 = 0; j_101 < 2; j_101++) {
+            lanes_19_1[j_101] = lanes_19_1[j_101] + received_lanes_21_1[j_101];
+        }
+        unsigned int lanes_19_bf16_1[1];
+        #pragma unroll
+        for (int _lp = 0; _lp < 1; _lp++) {
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_19_1[_lp*2 + 0], lanes_19_1[_lp*2+1 + 0]));
+            lanes_19_bf16_1[_lp] = *(uint32_t*)&_bf2;
+        }
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&lanes_19_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_19_bf16_1[_pair]) << 16);
+            (&lanes_19_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_19_bf16_1[_pair]) & 0xffff0000u);
+        }
+        word_20_1[0] = _shfl_14_1;
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&received_lanes_21_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_20_1[_pair]) << 16);
+            (&received_lanes_21_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_20_1[_pair]) & 0xffff0000u);
+        }
+        #pragma unroll
+        for (int j_102 = 0; j_102 < 2; j_102++) {
+            lanes_19_1[j_102] = lanes_19_1[j_102] + received_lanes_21_1[j_102];
+        }
+        unsigned int lanes_19_bf16_22_1[1];
+        #pragma unroll
+        for (int _lp = 0; _lp < 1; _lp++) {
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_19_1[_lp*2 + 0], lanes_19_1[_lp*2+1 + 0]));
+            lanes_19_bf16_22_1[_lp] = *(uint32_t*)&_bf2;
+        }
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&lanes_19_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_19_bf16_22_1[_pair]) << 16);
+            (&lanes_19_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_19_bf16_22_1[_pair]) & 0xffff0000u);
+        }
+        word_20_1[0] = _shfl_15_1;
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&received_lanes_21_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_20_1[_pair]) << 16);
+            (&received_lanes_21_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_20_1[_pair]) & 0xffff0000u);
+        }
+        #pragma unroll
+        for (int j_103 = 0; j_103 < 2; j_103++) {
+            lanes_19_1[j_103] = lanes_19_1[j_103] + received_lanes_21_1[j_103];
+        }
+        unsigned int lanes_19_bf16_23_1[1];
+        #pragma unroll
+        for (int _lp = 0; _lp < 1; _lp++) {
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_19_1[_lp*2 + 0], lanes_19_1[_lp*2+1 + 0]));
+            lanes_19_bf16_23_1[_lp] = *(uint32_t*)&_bf2;
+        }
+        #pragma unroll
+        for (int _pair = 0; _pair < 1; _pair++) {
+            (&lanes_19_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_19_bf16_23_1[_pair]) << 16);
+            (&lanes_19_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_19_bf16_23_1[_pair]) & 0xffff0000u);
+        }
+        unsigned int lanes_19_bf16_24_1[1];
+        #pragma unroll
+        for (int _lp = 0; _lp < 1; _lp++) {
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_19_1[_lp*2 + 0], lanes_19_1[_lp*2+1 + 0]));
+            lanes_19_bf16_24_1[_lp] = *(uint32_t*)&_bf2;
+        }
+        unsigned int low_25_1 = lanes_19_bf16_24_1[0] & 65535;
+        unsigned int high_26_1 = lanes_19_bf16_24_1[0] >> 16;
+        low_25_1 = ((low_25_1 == 65535) ? 65534 : low_25_1);
+        high_26_1 = ((high_26_1 == 65535) ? 65534 : high_26_1);
+        low_25_1 = ((low_25_1 == 32768) ? 65535 : low_25_1);
+        high_26_1 = ((high_26_1 == 32768) ? 65535 : high_26_1);
+        ag_words_1[3] = low_25_1 | high_26_1 << 16;
+        {
+            auto _gst_90 = rs_source_base + ((long long)data_epoch * comm_stride_elems + (long long)tokens * 7168 + (long long)(lead_rs_token * 896 + rank * 224 + rs_item) * 8);
+            __builtin_assume(__isGlobal(_gst_90));
+            reinterpret_cast<int4*>(_gst_90)[0] = reinterpret_cast<int4*>(ag_words_1)[0];
+        }
+    }
     unsigned int _phase_rms_exchange = 0;
     #pragma unroll 1
     for (int token_1 = cluster_id; token_1 < tokens; token_1 += (int)num_clusters) {
         long long data_base = (long long)data_epoch * comm_stride_elems;
-        int rs_token = token_1 + (int)num_clusters;
+        int rs_token = token_1 + 2 * (int)num_clusters;
         unsigned int rs_words[4];
         if (rs_token < tokens) {
-            uint32_t _sysv_ld_1[4];
-            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_ld_1[0]), "=r"(_sysv_ld_1[1]), "=r"(_sysv_ld_1[2]), "=r"(_sysv_ld_1[3]) : "l"(workspace_local + (data_base + (long long)(rs_src * rs_slot_items + rs_token * 224 + rs_item) * 8)) : "memory");
+            uint32_t _sysv_ld_1_1[4];
+            asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_ld_1_1[0]), "=r"(_sysv_ld_1_1[1]), "=r"(_sysv_ld_1_1[2]), "=r"(_sysv_ld_1_1[3]) : "l"(workspace_local + (data_base + (long long)(rs_src * rs_slot_items + rs_token * 224 + rs_item) * 8)) : "memory");
             #pragma unroll
-            for (int word_5 = 0; word_5 < 4; word_5++) {
-                rs_words[word_5] = _sysv_ld_1[word_5];
+            for (int word_8 = 0; word_8 < 4; word_8++) {
+                rs_words[word_8] = _sysv_ld_1_1[word_8];
             }
         }
         int prefetch_elem = access * 8;
         float _vec_load_79[8];
         {
-            const uint4* _vptr_89 = reinterpret_cast<const uint4*>(residual + prefetch_elem + 0);
-            uint4 _vld_89[1];
+            const uint4* _vptr_91 = reinterpret_cast<const uint4*>(residual + prefetch_elem + 0);
+            uint4 _vld_91[1];
             #pragma unroll
             for (int _blk = 0; _blk < 1; _blk++) {
                 asm volatile("ld.global.nc.L1::no_allocate.L2::cache_hint.v4.b32 {%0, %1, %2, %3}, [%4], %5;"
-                    : "=r"(_vld_89[_blk].x), "=r"(_vld_89[_blk].y), "=r"(_vld_89[_blk].z), "=r"(_vld_89[_blk].w) : "l"((const void*)(_vptr_89 + _blk)), "l"(0x12F0000000000000ULL) : "memory");
-                uint32_t* _vpairs_89 = reinterpret_cast<uint32_t*>(&_vld_89[_blk]);
+                    : "=r"(_vld_91[_blk].x), "=r"(_vld_91[_blk].y), "=r"(_vld_91[_blk].z), "=r"(_vld_91[_blk].w) : "l"((const void*)(_vptr_91 + _blk)), "l"(0x12F0000000000000ULL) : "memory");
+                uint32_t* _vpairs_91 = reinterpret_cast<uint32_t*>(&_vld_91[_blk]);
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
-                    (&_vec_load_79[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_89[_pair]) << 16);
-                    (&_vec_load_79[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_89[_pair]) & 0xffff0000u);
+                    (&_vec_load_79[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_91[_pair]) << 16);
+                    (&_vec_load_79[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_91[_pair]) & 0xffff0000u);
                 }
             }
         }
         float _vec_load_80[8];
         {
-            const uint4* _vptr_90 = reinterpret_cast<const uint4*>(gamma + (lane_access * 8) + 0);
-            uint4 _vld_90[1];
+            const uint4* _vptr_92 = reinterpret_cast<const uint4*>(gamma + (lane_access * 8) + 0);
+            uint4 _vld_92[1];
             #pragma unroll
             for (int _blk = 0; _blk < 1; _blk++) {
-                _vld_90[_blk] = _vptr_90[_blk];
-                uint32_t* _vpairs_90 = reinterpret_cast<uint32_t*>(&_vld_90[_blk]);
+                _vld_92[_blk] = _vptr_92[_blk];
+                uint32_t* _vpairs_92 = reinterpret_cast<uint32_t*>(&_vld_92[_blk]);
                 #pragma unroll
                 for (int _pair = 0; _pair < 4; _pair++) {
-                    (&_vec_load_80[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_90[_pair]) << 16);
-                    (&_vec_load_80[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_90[_pair]) & 0xffff0000u);
+                    (&_vec_load_80[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_92[_pair]) << 16);
+                    (&_vec_load_80[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_92[_pair]) & 0xffff0000u);
                 }
             }
         }
@@ -3455,425 +3851,425 @@ kernel_cake_trtllm_moe_allreduce_union_ws4_bf16_two_shot_b5(__nv_bfloat16* __res
         uint32_t _sysv_ld_2[4];
         asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_ld_2[0]), "=r"(_sysv_ld_2[1]), "=r"(_sysv_ld_2[2]), "=r"(_sysv_ld_2[3]) : "l"(workspace_local + (data_base + (long long)tokens * 7168 + (long long)access * 8)) : "memory");
         #pragma unroll
-        for (int word_6 = 0; word_6 < 4; word_6++) {
-            ag_probe[word_6] = _sysv_ld_2[word_6];
+        for (int word_9 = 0; word_9 < 4; word_9++) {
+            ag_probe[word_9] = _sysv_ld_2[word_9];
         }
         if (rs_token < tokens) {
-            int pending_1 = 0;
+            int pending_2 = 0;
             #pragma unroll
-            for (int word_7 = 0; word_7 < 4; word_7++) {
-                pending_1 = (((rs_words[word_7] & 65535) == 32768) ? 1 : pending_1);
-                pending_1 = ((rs_words[word_7] >> 16 == 32768) ? 1 : pending_1);
+            for (int word_10 = 0; word_10 < 4; word_10++) {
+                pending_2 = (((rs_words[word_10] & 65535) == 32768) ? 1 : pending_2);
+                pending_2 = ((rs_words[word_10] >> 16 == 32768) ? 1 : pending_2);
             }
-            if (pending_1 == 1) {
+            if (pending_2 == 1) {
                 uint32_t _sysv_poll_group_1[4];
-                uint32_t _sysv_pending_91 = 1u;
+                uint32_t _sysv_pending_93 = 1u;
                 do {
-                    if (_sysv_pending_91 & 1u) {
+                    if (_sysv_pending_93 & 1u) {
                         asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_1[0]), "=r"(_sysv_poll_group_1[1]), "=r"(_sysv_poll_group_1[2]), "=r"(_sysv_poll_group_1[3]) : "l"(workspace_local + (data_base + (long long)(rs_src * rs_slot_items + rs_token * 224 + rs_item) * 8)) : "memory");
                     }
-                    if (_sysv_pending_91 & 1u) {
-                        if (!((((_sysv_poll_group_1[0] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[0] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[1] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[1] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[2] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[2] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[3] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[3] >> 16) & 0xffffu) == 0x8000u))) _sysv_pending_91 &= ~1u;
+                    if (_sysv_pending_93 & 1u) {
+                        if (!((((_sysv_poll_group_1[0] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[0] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[1] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[1] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[2] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[2] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[3] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_1[3] >> 16) & 0xffffu) == 0x8000u))) _sysv_pending_93 &= ~1u;
                     }
-                } while (_sysv_pending_91 != 0u);
+                } while (_sysv_pending_93 != 0u);
                 #pragma unroll
-                for (int word_8 = 0; word_8 < 4; word_8++) {
-                    rs_words[word_8] = _sysv_poll_group_1[word_8];
+                for (int word_11 = 0; word_11 < 4; word_11++) {
+                    rs_words[word_11] = _sysv_poll_group_1[word_11];
                 }
             }
-            unsigned int ag_words_1[4];
+            unsigned int ag_words_2[4];
             unsigned int _shfl_16 = __shfl_sync(4294967295, rs_words[0], 0, 4);
             unsigned int _shfl_17 = __shfl_sync(4294967295, rs_words[0], 1, 4);
             unsigned int _shfl_18 = __shfl_sync(4294967295, rs_words[0], 2, 4);
             unsigned int _shfl_19 = __shfl_sync(4294967295, rs_words[0], 3, 4);
-            float lanes_1[2];
-            unsigned int word_9[1];
-            word_9[0] = _shfl_16;
+            float lanes_2[2];
+            unsigned int word_13[1];
+            word_13[0] = _shfl_16;
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&lanes_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_9[_pair]) << 16);
-                (&lanes_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_9[_pair]) & 0xffff0000u);
+                (&lanes_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_13[_pair]) << 16);
+                (&lanes_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_13[_pair]) & 0xffff0000u);
             }
-            float received_lanes_1[2];
-            word_9[0] = _shfl_17;
+            float received_lanes_2[2];
+            word_13[0] = _shfl_17;
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&received_lanes_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_9[_pair]) << 16);
-                (&received_lanes_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_9[_pair]) & 0xffff0000u);
+                (&received_lanes_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_13[_pair]) << 16);
+                (&received_lanes_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_13[_pair]) & 0xffff0000u);
             }
             #pragma unroll
-            for (int j_92 = 0; j_92 < 2; j_92++) {
-                lanes_1[j_92] = lanes_1[j_92] + received_lanes_1[j_92];
+            for (int j_104 = 0; j_104 < 2; j_104++) {
+                lanes_2[j_104] = lanes_2[j_104] + received_lanes_2[j_104];
             }
-            unsigned int lanes_bf16_3[1];
+            unsigned int lanes_bf16_4[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
-                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_1[_lp*2 + 0], lanes_1[_lp*2+1 + 0]));
-                lanes_bf16_3[_lp] = *(uint32_t*)&_bf2;
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_2[_lp*2 + 0], lanes_2[_lp*2+1 + 0]));
+                lanes_bf16_4[_lp] = *(uint32_t*)&_bf2;
             }
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&lanes_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_bf16_3[_pair]) << 16);
-                (&lanes_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_bf16_3[_pair]) & 0xffff0000u);
+                (&lanes_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_bf16_4[_pair]) << 16);
+                (&lanes_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_bf16_4[_pair]) & 0xffff0000u);
             }
-            word_9[0] = _shfl_18;
+            word_13[0] = _shfl_18;
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&received_lanes_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_9[_pair]) << 16);
-                (&received_lanes_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_9[_pair]) & 0xffff0000u);
+                (&received_lanes_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_13[_pair]) << 16);
+                (&received_lanes_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_13[_pair]) & 0xffff0000u);
             }
             #pragma unroll
-            for (int j_93 = 0; j_93 < 2; j_93++) {
-                lanes_1[j_93] = lanes_1[j_93] + received_lanes_1[j_93];
+            for (int j_105 = 0; j_105 < 2; j_105++) {
+                lanes_2[j_105] = lanes_2[j_105] + received_lanes_2[j_105];
             }
-            unsigned int lanes_bf16_0_1[1];
+            unsigned int lanes_bf16_0_2[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
-                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_1[_lp*2 + 0], lanes_1[_lp*2+1 + 0]));
-                lanes_bf16_0_1[_lp] = *(uint32_t*)&_bf2;
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_2[_lp*2 + 0], lanes_2[_lp*2+1 + 0]));
+                lanes_bf16_0_2[_lp] = *(uint32_t*)&_bf2;
             }
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&lanes_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_bf16_0_1[_pair]) << 16);
-                (&lanes_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_bf16_0_1[_pair]) & 0xffff0000u);
+                (&lanes_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_bf16_0_2[_pair]) << 16);
+                (&lanes_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_bf16_0_2[_pair]) & 0xffff0000u);
             }
-            word_9[0] = _shfl_19;
+            word_13[0] = _shfl_19;
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&received_lanes_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_9[_pair]) << 16);
-                (&received_lanes_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_9[_pair]) & 0xffff0000u);
+                (&received_lanes_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_13[_pair]) << 16);
+                (&received_lanes_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_13[_pair]) & 0xffff0000u);
             }
             #pragma unroll
-            for (int j_94 = 0; j_94 < 2; j_94++) {
-                lanes_1[j_94] = lanes_1[j_94] + received_lanes_1[j_94];
+            for (int j_106 = 0; j_106 < 2; j_106++) {
+                lanes_2[j_106] = lanes_2[j_106] + received_lanes_2[j_106];
             }
-            unsigned int lanes_bf16_1_1[1];
+            unsigned int lanes_bf16_1_2[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
-                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_1[_lp*2 + 0], lanes_1[_lp*2+1 + 0]));
-                lanes_bf16_1_1[_lp] = *(uint32_t*)&_bf2;
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_2[_lp*2 + 0], lanes_2[_lp*2+1 + 0]));
+                lanes_bf16_1_2[_lp] = *(uint32_t*)&_bf2;
             }
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&lanes_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_bf16_1_1[_pair]) << 16);
-                (&lanes_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_bf16_1_1[_pair]) & 0xffff0000u);
+                (&lanes_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_bf16_1_2[_pair]) << 16);
+                (&lanes_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_bf16_1_2[_pair]) & 0xffff0000u);
             }
-            unsigned int lanes_bf16_2_1[1];
+            unsigned int lanes_bf16_2_2[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
-                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_1[_lp*2 + 0], lanes_1[_lp*2+1 + 0]));
-                lanes_bf16_2_1[_lp] = *(uint32_t*)&_bf2;
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_2[_lp*2 + 0], lanes_2[_lp*2+1 + 0]));
+                lanes_bf16_2_2[_lp] = *(uint32_t*)&_bf2;
             }
-            unsigned int low_1 = lanes_bf16_2_1[0] & 65535;
-            unsigned int high_1 = lanes_bf16_2_1[0] >> 16;
-            low_1 = ((low_1 == 65535) ? 65534 : low_1);
-            high_1 = ((high_1 == 65535) ? 65534 : high_1);
-            low_1 = ((low_1 == 32768) ? 65535 : low_1);
-            high_1 = ((high_1 == 32768) ? 65535 : high_1);
-            ag_words_1[0] = low_1 | high_1 << 16;
+            unsigned int low_2 = lanes_bf16_2_2[0] & 65535;
+            unsigned int high_2 = lanes_bf16_2_2[0] >> 16;
+            low_2 = ((low_2 == 65535) ? 65534 : low_2);
+            high_2 = ((high_2 == 65535) ? 65534 : high_2);
+            low_2 = ((low_2 == 32768) ? 65535 : low_2);
+            high_2 = ((high_2 == 32768) ? 65535 : high_2);
+            ag_words_2[0] = low_2 | high_2 << 16;
             unsigned int _shfl_20 = __shfl_sync(4294967295, rs_words[1], 0, 4);
             unsigned int _shfl_21 = __shfl_sync(4294967295, rs_words[1], 1, 4);
             unsigned int _shfl_22 = __shfl_sync(4294967295, rs_words[1], 2, 4);
             unsigned int _shfl_23 = __shfl_sync(4294967295, rs_words[1], 3, 4);
-            float lanes_3_1[2];
-            unsigned int word_4_1[1];
-            word_4_1[0] = _shfl_20;
+            float lanes_3_2[2];
+            unsigned int word_4_3[1];
+            word_4_3[0] = _shfl_20;
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&lanes_3_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_4_1[_pair]) << 16);
-                (&lanes_3_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_4_1[_pair]) & 0xffff0000u);
+                (&lanes_3_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_4_3[_pair]) << 16);
+                (&lanes_3_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_4_3[_pair]) & 0xffff0000u);
             }
-            float received_lanes_5_1[2];
-            word_4_1[0] = _shfl_21;
+            float received_lanes_5_2[2];
+            word_4_3[0] = _shfl_21;
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&received_lanes_5_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_4_1[_pair]) << 16);
-                (&received_lanes_5_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_4_1[_pair]) & 0xffff0000u);
+                (&received_lanes_5_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_4_3[_pair]) << 16);
+                (&received_lanes_5_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_4_3[_pair]) & 0xffff0000u);
             }
             #pragma unroll
-            for (int j_95 = 0; j_95 < 2; j_95++) {
-                lanes_3_1[j_95] = lanes_3_1[j_95] + received_lanes_5_1[j_95];
+            for (int j_107 = 0; j_107 < 2; j_107++) {
+                lanes_3_2[j_107] = lanes_3_2[j_107] + received_lanes_5_2[j_107];
             }
-            unsigned int lanes_3_bf16_1[1];
+            unsigned int lanes_3_bf16_2[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
-                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_3_1[_lp*2 + 0], lanes_3_1[_lp*2+1 + 0]));
-                lanes_3_bf16_1[_lp] = *(uint32_t*)&_bf2;
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_3_2[_lp*2 + 0], lanes_3_2[_lp*2+1 + 0]));
+                lanes_3_bf16_2[_lp] = *(uint32_t*)&_bf2;
             }
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&lanes_3_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_3_bf16_1[_pair]) << 16);
-                (&lanes_3_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_3_bf16_1[_pair]) & 0xffff0000u);
+                (&lanes_3_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_3_bf16_2[_pair]) << 16);
+                (&lanes_3_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_3_bf16_2[_pair]) & 0xffff0000u);
             }
-            word_4_1[0] = _shfl_22;
+            word_4_3[0] = _shfl_22;
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&received_lanes_5_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_4_1[_pair]) << 16);
-                (&received_lanes_5_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_4_1[_pair]) & 0xffff0000u);
+                (&received_lanes_5_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_4_3[_pair]) << 16);
+                (&received_lanes_5_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_4_3[_pair]) & 0xffff0000u);
             }
             #pragma unroll
-            for (int j_96 = 0; j_96 < 2; j_96++) {
-                lanes_3_1[j_96] = lanes_3_1[j_96] + received_lanes_5_1[j_96];
+            for (int j_108 = 0; j_108 < 2; j_108++) {
+                lanes_3_2[j_108] = lanes_3_2[j_108] + received_lanes_5_2[j_108];
             }
-            unsigned int lanes_3_bf16_6_1[1];
+            unsigned int lanes_3_bf16_6_2[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
-                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_3_1[_lp*2 + 0], lanes_3_1[_lp*2+1 + 0]));
-                lanes_3_bf16_6_1[_lp] = *(uint32_t*)&_bf2;
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_3_2[_lp*2 + 0], lanes_3_2[_lp*2+1 + 0]));
+                lanes_3_bf16_6_2[_lp] = *(uint32_t*)&_bf2;
             }
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&lanes_3_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_3_bf16_6_1[_pair]) << 16);
-                (&lanes_3_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_3_bf16_6_1[_pair]) & 0xffff0000u);
+                (&lanes_3_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_3_bf16_6_2[_pair]) << 16);
+                (&lanes_3_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_3_bf16_6_2[_pair]) & 0xffff0000u);
             }
-            word_4_1[0] = _shfl_23;
+            word_4_3[0] = _shfl_23;
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&received_lanes_5_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_4_1[_pair]) << 16);
-                (&received_lanes_5_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_4_1[_pair]) & 0xffff0000u);
+                (&received_lanes_5_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_4_3[_pair]) << 16);
+                (&received_lanes_5_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_4_3[_pair]) & 0xffff0000u);
             }
             #pragma unroll
-            for (int j_97 = 0; j_97 < 2; j_97++) {
-                lanes_3_1[j_97] = lanes_3_1[j_97] + received_lanes_5_1[j_97];
+            for (int j_109 = 0; j_109 < 2; j_109++) {
+                lanes_3_2[j_109] = lanes_3_2[j_109] + received_lanes_5_2[j_109];
             }
-            unsigned int lanes_3_bf16_7_1[1];
+            unsigned int lanes_3_bf16_7_2[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
-                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_3_1[_lp*2 + 0], lanes_3_1[_lp*2+1 + 0]));
-                lanes_3_bf16_7_1[_lp] = *(uint32_t*)&_bf2;
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_3_2[_lp*2 + 0], lanes_3_2[_lp*2+1 + 0]));
+                lanes_3_bf16_7_2[_lp] = *(uint32_t*)&_bf2;
             }
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&lanes_3_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_3_bf16_7_1[_pair]) << 16);
-                (&lanes_3_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_3_bf16_7_1[_pair]) & 0xffff0000u);
+                (&lanes_3_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_3_bf16_7_2[_pair]) << 16);
+                (&lanes_3_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_3_bf16_7_2[_pair]) & 0xffff0000u);
             }
-            unsigned int lanes_3_bf16_8_1[1];
+            unsigned int lanes_3_bf16_8_2[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
-                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_3_1[_lp*2 + 0], lanes_3_1[_lp*2+1 + 0]));
-                lanes_3_bf16_8_1[_lp] = *(uint32_t*)&_bf2;
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_3_2[_lp*2 + 0], lanes_3_2[_lp*2+1 + 0]));
+                lanes_3_bf16_8_2[_lp] = *(uint32_t*)&_bf2;
             }
-            unsigned int low_9_1 = lanes_3_bf16_8_1[0] & 65535;
-            unsigned int high_10_1 = lanes_3_bf16_8_1[0] >> 16;
-            low_9_1 = ((low_9_1 == 65535) ? 65534 : low_9_1);
-            high_10_1 = ((high_10_1 == 65535) ? 65534 : high_10_1);
-            low_9_1 = ((low_9_1 == 32768) ? 65535 : low_9_1);
-            high_10_1 = ((high_10_1 == 32768) ? 65535 : high_10_1);
-            ag_words_1[1] = low_9_1 | high_10_1 << 16;
+            unsigned int low_9_2 = lanes_3_bf16_8_2[0] & 65535;
+            unsigned int high_10_2 = lanes_3_bf16_8_2[0] >> 16;
+            low_9_2 = ((low_9_2 == 65535) ? 65534 : low_9_2);
+            high_10_2 = ((high_10_2 == 65535) ? 65534 : high_10_2);
+            low_9_2 = ((low_9_2 == 32768) ? 65535 : low_9_2);
+            high_10_2 = ((high_10_2 == 32768) ? 65535 : high_10_2);
+            ag_words_2[1] = low_9_2 | high_10_2 << 16;
             unsigned int _shfl_24 = __shfl_sync(4294967295, rs_words[2], 0, 4);
             unsigned int _shfl_25 = __shfl_sync(4294967295, rs_words[2], 1, 4);
             unsigned int _shfl_26 = __shfl_sync(4294967295, rs_words[2], 2, 4);
             unsigned int _shfl_27 = __shfl_sync(4294967295, rs_words[2], 3, 4);
-            float lanes_11_1[2];
-            unsigned int word_12_1[1];
-            word_12_1[0] = _shfl_24;
+            float lanes_11_2[2];
+            unsigned int word_12_2[1];
+            word_12_2[0] = _shfl_24;
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&lanes_11_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_12_1[_pair]) << 16);
-                (&lanes_11_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_12_1[_pair]) & 0xffff0000u);
+                (&lanes_11_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_12_2[_pair]) << 16);
+                (&lanes_11_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_12_2[_pair]) & 0xffff0000u);
             }
-            float received_lanes_13_1[2];
-            word_12_1[0] = _shfl_25;
+            float received_lanes_13_2[2];
+            word_12_2[0] = _shfl_25;
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&received_lanes_13_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_12_1[_pair]) << 16);
-                (&received_lanes_13_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_12_1[_pair]) & 0xffff0000u);
+                (&received_lanes_13_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_12_2[_pair]) << 16);
+                (&received_lanes_13_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_12_2[_pair]) & 0xffff0000u);
             }
             #pragma unroll
-            for (int j_98 = 0; j_98 < 2; j_98++) {
-                lanes_11_1[j_98] = lanes_11_1[j_98] + received_lanes_13_1[j_98];
+            for (int j_110 = 0; j_110 < 2; j_110++) {
+                lanes_11_2[j_110] = lanes_11_2[j_110] + received_lanes_13_2[j_110];
             }
-            unsigned int lanes_11_bf16_1[1];
+            unsigned int lanes_11_bf16_2[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
-                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_11_1[_lp*2 + 0], lanes_11_1[_lp*2+1 + 0]));
-                lanes_11_bf16_1[_lp] = *(uint32_t*)&_bf2;
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_11_2[_lp*2 + 0], lanes_11_2[_lp*2+1 + 0]));
+                lanes_11_bf16_2[_lp] = *(uint32_t*)&_bf2;
             }
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&lanes_11_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_11_bf16_1[_pair]) << 16);
-                (&lanes_11_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_11_bf16_1[_pair]) & 0xffff0000u);
+                (&lanes_11_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_11_bf16_2[_pair]) << 16);
+                (&lanes_11_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_11_bf16_2[_pair]) & 0xffff0000u);
             }
-            word_12_1[0] = _shfl_26;
+            word_12_2[0] = _shfl_26;
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&received_lanes_13_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_12_1[_pair]) << 16);
-                (&received_lanes_13_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_12_1[_pair]) & 0xffff0000u);
+                (&received_lanes_13_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_12_2[_pair]) << 16);
+                (&received_lanes_13_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_12_2[_pair]) & 0xffff0000u);
             }
             #pragma unroll
-            for (int j_99 = 0; j_99 < 2; j_99++) {
-                lanes_11_1[j_99] = lanes_11_1[j_99] + received_lanes_13_1[j_99];
+            for (int j_111 = 0; j_111 < 2; j_111++) {
+                lanes_11_2[j_111] = lanes_11_2[j_111] + received_lanes_13_2[j_111];
             }
-            unsigned int lanes_11_bf16_14_1[1];
+            unsigned int lanes_11_bf16_14_2[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
-                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_11_1[_lp*2 + 0], lanes_11_1[_lp*2+1 + 0]));
-                lanes_11_bf16_14_1[_lp] = *(uint32_t*)&_bf2;
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_11_2[_lp*2 + 0], lanes_11_2[_lp*2+1 + 0]));
+                lanes_11_bf16_14_2[_lp] = *(uint32_t*)&_bf2;
             }
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&lanes_11_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_11_bf16_14_1[_pair]) << 16);
-                (&lanes_11_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_11_bf16_14_1[_pair]) & 0xffff0000u);
+                (&lanes_11_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_11_bf16_14_2[_pair]) << 16);
+                (&lanes_11_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_11_bf16_14_2[_pair]) & 0xffff0000u);
             }
-            word_12_1[0] = _shfl_27;
+            word_12_2[0] = _shfl_27;
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&received_lanes_13_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_12_1[_pair]) << 16);
-                (&received_lanes_13_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_12_1[_pair]) & 0xffff0000u);
+                (&received_lanes_13_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_12_2[_pair]) << 16);
+                (&received_lanes_13_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_12_2[_pair]) & 0xffff0000u);
             }
             #pragma unroll
-            for (int j_100 = 0; j_100 < 2; j_100++) {
-                lanes_11_1[j_100] = lanes_11_1[j_100] + received_lanes_13_1[j_100];
+            for (int j_112 = 0; j_112 < 2; j_112++) {
+                lanes_11_2[j_112] = lanes_11_2[j_112] + received_lanes_13_2[j_112];
             }
-            unsigned int lanes_11_bf16_15_1[1];
+            unsigned int lanes_11_bf16_15_2[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
-                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_11_1[_lp*2 + 0], lanes_11_1[_lp*2+1 + 0]));
-                lanes_11_bf16_15_1[_lp] = *(uint32_t*)&_bf2;
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_11_2[_lp*2 + 0], lanes_11_2[_lp*2+1 + 0]));
+                lanes_11_bf16_15_2[_lp] = *(uint32_t*)&_bf2;
             }
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&lanes_11_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_11_bf16_15_1[_pair]) << 16);
-                (&lanes_11_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_11_bf16_15_1[_pair]) & 0xffff0000u);
+                (&lanes_11_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_11_bf16_15_2[_pair]) << 16);
+                (&lanes_11_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_11_bf16_15_2[_pair]) & 0xffff0000u);
             }
-            unsigned int lanes_11_bf16_16_1[1];
+            unsigned int lanes_11_bf16_16_2[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
-                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_11_1[_lp*2 + 0], lanes_11_1[_lp*2+1 + 0]));
-                lanes_11_bf16_16_1[_lp] = *(uint32_t*)&_bf2;
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_11_2[_lp*2 + 0], lanes_11_2[_lp*2+1 + 0]));
+                lanes_11_bf16_16_2[_lp] = *(uint32_t*)&_bf2;
             }
-            unsigned int low_17_1 = lanes_11_bf16_16_1[0] & 65535;
-            unsigned int high_18_1 = lanes_11_bf16_16_1[0] >> 16;
-            low_17_1 = ((low_17_1 == 65535) ? 65534 : low_17_1);
-            high_18_1 = ((high_18_1 == 65535) ? 65534 : high_18_1);
-            low_17_1 = ((low_17_1 == 32768) ? 65535 : low_17_1);
-            high_18_1 = ((high_18_1 == 32768) ? 65535 : high_18_1);
-            ag_words_1[2] = low_17_1 | high_18_1 << 16;
+            unsigned int low_17_2 = lanes_11_bf16_16_2[0] & 65535;
+            unsigned int high_18_2 = lanes_11_bf16_16_2[0] >> 16;
+            low_17_2 = ((low_17_2 == 65535) ? 65534 : low_17_2);
+            high_18_2 = ((high_18_2 == 65535) ? 65534 : high_18_2);
+            low_17_2 = ((low_17_2 == 32768) ? 65535 : low_17_2);
+            high_18_2 = ((high_18_2 == 32768) ? 65535 : high_18_2);
+            ag_words_2[2] = low_17_2 | high_18_2 << 16;
             unsigned int _shfl_28 = __shfl_sync(4294967295, rs_words[3], 0, 4);
             unsigned int _shfl_29 = __shfl_sync(4294967295, rs_words[3], 1, 4);
             unsigned int _shfl_30 = __shfl_sync(4294967295, rs_words[3], 2, 4);
             unsigned int _shfl_31 = __shfl_sync(4294967295, rs_words[3], 3, 4);
-            float lanes_19_1[2];
-            unsigned int word_20_1[1];
-            word_20_1[0] = _shfl_28;
+            float lanes_19_2[2];
+            unsigned int word_20_2[1];
+            word_20_2[0] = _shfl_28;
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&lanes_19_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_20_1[_pair]) << 16);
-                (&lanes_19_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_20_1[_pair]) & 0xffff0000u);
+                (&lanes_19_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_20_2[_pair]) << 16);
+                (&lanes_19_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_20_2[_pair]) & 0xffff0000u);
             }
-            float received_lanes_21_1[2];
-            word_20_1[0] = _shfl_29;
+            float received_lanes_21_2[2];
+            word_20_2[0] = _shfl_29;
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&received_lanes_21_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_20_1[_pair]) << 16);
-                (&received_lanes_21_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_20_1[_pair]) & 0xffff0000u);
+                (&received_lanes_21_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_20_2[_pair]) << 16);
+                (&received_lanes_21_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_20_2[_pair]) & 0xffff0000u);
             }
             #pragma unroll
-            for (int j_101 = 0; j_101 < 2; j_101++) {
-                lanes_19_1[j_101] = lanes_19_1[j_101] + received_lanes_21_1[j_101];
+            for (int j_113 = 0; j_113 < 2; j_113++) {
+                lanes_19_2[j_113] = lanes_19_2[j_113] + received_lanes_21_2[j_113];
             }
-            unsigned int lanes_19_bf16_1[1];
+            unsigned int lanes_19_bf16_2[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
-                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_19_1[_lp*2 + 0], lanes_19_1[_lp*2+1 + 0]));
-                lanes_19_bf16_1[_lp] = *(uint32_t*)&_bf2;
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_19_2[_lp*2 + 0], lanes_19_2[_lp*2+1 + 0]));
+                lanes_19_bf16_2[_lp] = *(uint32_t*)&_bf2;
             }
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&lanes_19_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_19_bf16_1[_pair]) << 16);
-                (&lanes_19_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_19_bf16_1[_pair]) & 0xffff0000u);
+                (&lanes_19_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_19_bf16_2[_pair]) << 16);
+                (&lanes_19_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_19_bf16_2[_pair]) & 0xffff0000u);
             }
-            word_20_1[0] = _shfl_30;
+            word_20_2[0] = _shfl_30;
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&received_lanes_21_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_20_1[_pair]) << 16);
-                (&received_lanes_21_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_20_1[_pair]) & 0xffff0000u);
+                (&received_lanes_21_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_20_2[_pair]) << 16);
+                (&received_lanes_21_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_20_2[_pair]) & 0xffff0000u);
             }
             #pragma unroll
-            for (int j_102 = 0; j_102 < 2; j_102++) {
-                lanes_19_1[j_102] = lanes_19_1[j_102] + received_lanes_21_1[j_102];
+            for (int j_114 = 0; j_114 < 2; j_114++) {
+                lanes_19_2[j_114] = lanes_19_2[j_114] + received_lanes_21_2[j_114];
             }
-            unsigned int lanes_19_bf16_22_1[1];
+            unsigned int lanes_19_bf16_22_2[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
-                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_19_1[_lp*2 + 0], lanes_19_1[_lp*2+1 + 0]));
-                lanes_19_bf16_22_1[_lp] = *(uint32_t*)&_bf2;
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_19_2[_lp*2 + 0], lanes_19_2[_lp*2+1 + 0]));
+                lanes_19_bf16_22_2[_lp] = *(uint32_t*)&_bf2;
             }
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&lanes_19_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_19_bf16_22_1[_pair]) << 16);
-                (&lanes_19_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_19_bf16_22_1[_pair]) & 0xffff0000u);
+                (&lanes_19_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_19_bf16_22_2[_pair]) << 16);
+                (&lanes_19_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_19_bf16_22_2[_pair]) & 0xffff0000u);
             }
-            word_20_1[0] = _shfl_31;
+            word_20_2[0] = _shfl_31;
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&received_lanes_21_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_20_1[_pair]) << 16);
-                (&received_lanes_21_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_20_1[_pair]) & 0xffff0000u);
+                (&received_lanes_21_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(word_20_2[_pair]) << 16);
+                (&received_lanes_21_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(word_20_2[_pair]) & 0xffff0000u);
             }
             #pragma unroll
-            for (int j_103 = 0; j_103 < 2; j_103++) {
-                lanes_19_1[j_103] = lanes_19_1[j_103] + received_lanes_21_1[j_103];
+            for (int j_115 = 0; j_115 < 2; j_115++) {
+                lanes_19_2[j_115] = lanes_19_2[j_115] + received_lanes_21_2[j_115];
             }
-            unsigned int lanes_19_bf16_23_1[1];
+            unsigned int lanes_19_bf16_23_2[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
-                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_19_1[_lp*2 + 0], lanes_19_1[_lp*2+1 + 0]));
-                lanes_19_bf16_23_1[_lp] = *(uint32_t*)&_bf2;
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_19_2[_lp*2 + 0], lanes_19_2[_lp*2+1 + 0]));
+                lanes_19_bf16_23_2[_lp] = *(uint32_t*)&_bf2;
             }
             #pragma unroll
             for (int _pair = 0; _pair < 1; _pair++) {
-                (&lanes_19_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_19_bf16_23_1[_pair]) << 16);
-                (&lanes_19_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_19_bf16_23_1[_pair]) & 0xffff0000u);
+                (&lanes_19_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(lanes_19_bf16_23_2[_pair]) << 16);
+                (&lanes_19_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(lanes_19_bf16_23_2[_pair]) & 0xffff0000u);
             }
-            unsigned int lanes_19_bf16_24_1[1];
+            unsigned int lanes_19_bf16_24_2[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
-                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_19_1[_lp*2 + 0], lanes_19_1[_lp*2+1 + 0]));
-                lanes_19_bf16_24_1[_lp] = *(uint32_t*)&_bf2;
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lanes_19_2[_lp*2 + 0], lanes_19_2[_lp*2+1 + 0]));
+                lanes_19_bf16_24_2[_lp] = *(uint32_t*)&_bf2;
             }
-            unsigned int low_25_1 = lanes_19_bf16_24_1[0] & 65535;
-            unsigned int high_26_1 = lanes_19_bf16_24_1[0] >> 16;
-            low_25_1 = ((low_25_1 == 65535) ? 65534 : low_25_1);
-            high_26_1 = ((high_26_1 == 65535) ? 65534 : high_26_1);
-            low_25_1 = ((low_25_1 == 32768) ? 65535 : low_25_1);
-            high_26_1 = ((high_26_1 == 32768) ? 65535 : high_26_1);
-            ag_words_1[3] = low_25_1 | high_26_1 << 16;
+            unsigned int low_25_2 = lanes_19_bf16_24_2[0] & 65535;
+            unsigned int high_26_2 = lanes_19_bf16_24_2[0] >> 16;
+            low_25_2 = ((low_25_2 == 65535) ? 65534 : low_25_2);
+            high_26_2 = ((high_26_2 == 65535) ? 65534 : high_26_2);
+            low_25_2 = ((low_25_2 == 32768) ? 65535 : low_25_2);
+            high_26_2 = ((high_26_2 == 32768) ? 65535 : high_26_2);
+            ag_words_2[3] = low_25_2 | high_26_2 << 16;
             {
-                auto _gst_92 = rs_source_base + (data_base + (long long)tokens * 7168 + (long long)(rs_token * 896 + rank * 224 + rs_item) * 8);
-                __builtin_assume(__isGlobal(_gst_92));
-                reinterpret_cast<int4*>(_gst_92)[0] = reinterpret_cast<int4*>(ag_words_1)[0];
+                auto _gst_94 = rs_source_base + (data_base + (long long)tokens * 7168 + (long long)(rs_token * 896 + rank * 224 + rs_item) * 8);
+                __builtin_assume(__isGlobal(_gst_94));
+                reinterpret_cast<int4*>(_gst_94)[0] = reinterpret_cast<int4*>(ag_words_2)[0];
             }
         }
-        int pending_2 = 0;
+        int pending_3 = 0;
         #pragma unroll
-        for (int word_10 = 0; word_10 < 4; word_10++) {
-            pending_2 = (((ag_probe[word_10] & 65535) == 32768) ? 1 : pending_2);
-            pending_2 = ((ag_probe[word_10] >> 16 == 32768) ? 1 : pending_2);
+        for (int word_14 = 0; word_14 < 4; word_14++) {
+            pending_3 = (((ag_probe[word_14] & 65535) == 32768) ? 1 : pending_3);
+            pending_3 = ((ag_probe[word_14] >> 16 == 32768) ? 1 : pending_3);
         }
-        if (pending_2 == 1) {
+        if (pending_3 == 1) {
             uint32_t _sysv_poll_group_2[4];
-            uint32_t _sysv_pending_93 = 1u;
+            uint32_t _sysv_pending_95 = 1u;
             do {
-                if (_sysv_pending_93 & 1u) {
+                if (_sysv_pending_95 & 1u) {
                     asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_2[0]), "=r"(_sysv_poll_group_2[1]), "=r"(_sysv_poll_group_2[2]), "=r"(_sysv_poll_group_2[3]) : "l"(workspace_local + (data_base + (long long)tokens * 7168 + (long long)access * 8)) : "memory");
                 }
-                if (_sysv_pending_93 & 1u) {
-                    if (!((((_sysv_poll_group_2[0] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_2[0] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_2[1] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_2[1] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_2[2] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_2[2] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_2[3] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_2[3] >> 16) & 0xffffu) == 0x8000u))) _sysv_pending_93 &= ~1u;
+                if (_sysv_pending_95 & 1u) {
+                    if (!((((_sysv_poll_group_2[0] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_2[0] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_2[1] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_2[1] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_2[2] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_2[2] >> 16) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_2[3] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_2[3] >> 16) & 0xffffu) == 0x8000u))) _sysv_pending_95 &= ~1u;
                 }
-            } while (_sysv_pending_93 != 0u);
+            } while (_sysv_pending_95 != 0u);
             #pragma unroll
-            for (int word_11 = 0; word_11 < 4; word_11++) {
-                ag_probe[word_11] = _sysv_poll_group_2[word_11];
+            for (int word_15 = 0; word_15 < 4; word_15++) {
+                ag_probe[word_15] = _sysv_poll_group_2[word_15];
             }
         }
         unsigned int sum_words[4];
         #pragma unroll
-        for (int word_13 = 0; word_13 < 4; word_13++) {
-            unsigned int low_2 = ag_probe[word_13] & 65535;
-            unsigned int high_2 = ag_probe[word_13] >> 16;
-            low_2 = ((low_2 == 65535) ? 32768 : low_2);
-            high_2 = ((high_2 == 65535) ? 32768 : high_2);
-            sum_words[word_13] = low_2 | high_2 << 16;
+        for (int word_16 = 0; word_16 < 4; word_16++) {
+            unsigned int low_3 = ag_probe[word_16] & 65535;
+            unsigned int high_3 = ag_probe[word_16] >> 16;
+            low_3 = ((low_3 == 65535) ? 32768 : low_3);
+            high_3 = ((high_3 == 65535) ? 32768 : high_3);
+            sum_words[word_16] = low_3 | high_3 << 16;
         }
         float sum_value[8];
         float _unpack_bf16_0[8];
@@ -3883,8 +4279,8 @@ kernel_cake_trtllm_moe_allreduce_union_ws4_bf16_two_shot_b5(__nv_bfloat16* __res
             (&_unpack_bf16_0[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(sum_words[_pair]) & 0xffff0000u);
         }
         #pragma unroll
-        for (int j_104 = 0; j_104 < 8; j_104++) {
-            sum_value[j_104] = _unpack_bf16_0[j_104];
+        for (int j_116 = 0; j_116 < 8; j_116++) {
+            sum_value[j_116] = _unpack_bf16_0[j_116];
         }
         int access_in_token = lane_access;
         int elem_0_1 = access * 8;
@@ -3911,8 +4307,8 @@ kernel_cake_trtllm_moe_allreduce_union_ws4_bf16_two_shot_b5(__nv_bfloat16* __res
         }
         asm volatile("st.global.L1::no_allocate.L2::cache_hint.v4.b32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(moe_allreduce_out + elem_0_1), "r"(_packed_0[(0) + 0]), "r"(_packed_0[(0) + 1]), "r"(_packed_0[(0) + 2]), "r"(_packed_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
         #pragma unroll
-        for (int j_105 = 0; j_105 < 8; j_105++) {
-            _vec_load_79[j_105] = _vec_load_79[j_105] + sum_value[j_105];
+        for (int j_117 = 0; j_117 < 8; j_117++) {
+            _vec_load_79[j_117] = _vec_load_79[j_117] + sum_value[j_117];
         }
         unsigned int _vec_load_79_bf16[4];
         #pragma unroll
@@ -3949,14 +4345,14 @@ kernel_cake_trtllm_moe_allreduce_union_ws4_bf16_two_shot_b5(__nv_bfloat16* __res
         asm volatile("st.global.L1::no_allocate.L2::cache_hint.v4.b32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(residual_out + elem_0_1), "r"(_packed_1[(0) + 0]), "r"(_packed_1[(0) + 1]), "r"(_packed_1[(0) + 2]), "r"(_packed_1[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
         float square_sum = 0.0f;
         #pragma unroll
-        for (int j_106 = 0; j_106 < 8; j_106++) {
-            square_sum = __fmaf_rn(_vec_load_79[j_106], _vec_load_79[j_106], square_sum);
+        for (int j_118 = 0; j_118 < 8; j_118++) {
+            square_sum = __fmaf_rn(_vec_load_79[j_118], _vec_load_79[j_118], square_sum);
         }
-        float _warp_reduce_94 = square_sum;
+        float _warp_reduce_96 = square_sum;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_94 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_94, offset);
-        square_sum = _warp_reduce_94;
+            _warp_reduce_96 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_96, offset);
+        square_sum = _warp_reduce_96;
         int rms_parity = (int)(rms_trip & 1);
         if (lane == 0) {
             reduce_smem[rms_parity * 7 + warp] = square_sum;
@@ -3966,27 +4362,40 @@ kernel_cake_trtllm_moe_allreduce_union_ws4_bf16_two_shot_b5(__nv_bfloat16* __res
         if (tid < 7) {
             block_sum = reduce_smem[rms_parity * 7 + tid];
         }
-        float _warp_reduce_95 = block_sum;
+        float _warp_reduce_97 = block_sum;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_95 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_95, offset);
-        block_sum = _warp_reduce_95;
+            _warp_reduce_97 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_97, offset);
+        block_sum = _warp_reduce_97;
         int slot_base = rms_parity * 4;
         if (tid < 4) {
-            uint32_t _cluster_mapa_96;
+            uint32_t _cluster_mapa_98;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_96) : "r"(rms_partials_addr), "r"(tid));
-            uint32_t _mbar_peer_97;
+                : "=r"(_cluster_mapa_98) : "r"(rms_partials_addr), "r"(tid));
+            uint32_t _mbar_peer_99;
             asm(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mbar_peer_97) : "r"(rms_exchange_addr + (rms_exchange_rms_trip) * 8), "r"(tid));
+                : "=r"(_mbar_peer_99) : "r"(rms_exchange_addr + (rms_exchange_rms_trip) * 8), "r"(tid));
             asm volatile(
                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];"
-                :: "r"(_cluster_mapa_96 + (unsigned int)((slot_base + cta_rank) * 4)), "f"(block_sum), "r"(_mbar_peer_97) : "memory");
+                :: "r"(_cluster_mapa_98 + (unsigned int)((slot_base + cta_rank) * 4)), "f"(block_sum), "r"(_mbar_peer_99) : "memory");
         }
         if (tid == 0) {
             mbarrier_arrive_expect_tx(rms_exchange_addr + (rms_exchange_rms_trip) * 8, 16);
+        }
+        unsigned int clr_words[4];
+        #pragma unroll
+        for (int clr_word = 0; clr_word < 4; clr_word++) {
+            clr_words[clr_word] = 2147516416;
+        }
+        long long clr_base = (long long)clear_epoch * comm_stride_elems;
+        int clr_high = access + tokens * 896;
+        if (access < clear_size / 8) {
+            asm volatile("st.global.L1::no_allocate.L2::cache_hint.v4.b32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(workspace_local + (clr_base + (long long)access * 8)), "r"(clr_words[(0) + 0]), "r"(clr_words[(0) + 1]), "r"(clr_words[(0) + 2]), "r"(clr_words[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+        }
+        if (clr_high < clear_size / 8) {
+            asm volatile("st.global.L1::no_allocate.L2::cache_hint.v4.b32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(workspace_local + (clr_base + (long long)clr_high * 8)), "r"(clr_words[(0) + 0]), "r"(clr_words[(0) + 1]), "r"(clr_words[(0) + 2]), "r"(clr_words[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
         }
         asm volatile("{ .reg .pred P1; WAIT: mbarrier.try_wait.parity.relaxed.cluster.shared::cta.b64 P1, [%0], %1, %2; @P1 bra.uni DONE; bra.uni WAIT; DONE: }" :: "r"(rms_exchange_addr + (rms_exchange_rms_trip) * 8), "r"(uint32_t(_phase_rms_exchange)), "r"(uint32_t(10000000)) : "memory");
         asm volatile("fence.acquire.sync_restrict::shared::cluster.cluster;" ::: "memory");
@@ -4001,8 +4410,8 @@ kernel_cake_trtllm_moe_allreduce_union_ws4_bf16_two_shot_b5(__nv_bfloat16* __res
         if (rms_exchange_rms_trip == 2) { rms_exchange_rms_trip = 0; _phase_rms_exchange ^= 1; }
         float norm_value[8];
         #pragma unroll
-        for (int j_107 = 0; j_107 < 8; j_107++) {
-            norm_value[j_107] = _vec_load_79[j_107] * rstd * (_vec_load_80[j_107] + weight_bias);
+        for (int j_119 = 0; j_119 < 8; j_119++) {
+            norm_value[j_119] = _vec_load_79[j_119] * rstd * (_vec_load_80[j_119] + weight_bias);
         }
         unsigned int norm_value_bf16[4];
         #pragma unroll
@@ -4016,19 +4425,19 @@ kernel_cake_trtllm_moe_allreduce_union_ws4_bf16_two_shot_b5(__nv_bfloat16* __res
     asm volatile("barrier.cluster.arrive.relaxed.aligned;");
     unsigned int clear_words[4];
     #pragma unroll
-    for (int word_14 = 0; word_14 < 4; word_14++) {
-        clear_words[word_14] = 2147516416;
+    for (int word_17 = 0; word_17 < 4; word_17++) {
+        clear_words[word_17] = 2147516416;
     }
     long long clear_base = (long long)clear_epoch * comm_stride_elems;
     #pragma unroll 4
-    for (int access_1 = first_access; access_1 < clear_size / 8; access_1 += access_stride) {
+    for (int access_1 = access + tokens * 896; access_1 < clear_size / 8; access_1 += access_stride) {
         asm volatile("st.global.L1::no_allocate.L2::cache_hint.v4.b32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(workspace_local + (clear_base + (long long)access_1 * 8)), "r"(clear_words[(0) + 0]), "r"(clear_words[(0) + 1]), "r"(clear_words[(0) + 2]), "r"(clear_words[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
     }
     if (bid == 0) {
         if (tid == 0) {
             {
-                volatile int* _sysv_wait_p_98 = reinterpret_cast<volatile int*>(completion) + (0);
-                while (*_sysv_wait_p_98 != static_cast<int>(num_bids)) {}
+                volatile int* _sysv_wait_p_100 = reinterpret_cast<volatile int*>(completion) + (0);
+                while (*_sysv_wait_p_100 != static_cast<int>(num_bids)) {}
             }
             flag_addr[0] = (flag + 1) % 3;
             clear_addr[0] = tokens * 7168 * 2;
