@@ -153,6 +153,9 @@ def compile_sparse_mla_d576_kernel(
             f"{head_dim_split} V head-dim CTAs and GMEM reduction; got {cfg.num_ctas_per_seq_kv}, "
             f"{cfg.num_ctas_per_head_dim}, cluster={cfg.use_cluster_reduction}"
         )
+    if split_kv > 1 and not kernel.use_parallel_reduction:
+        # Only the parallel GMEM reducer publishes the D576 natural-log LSE.
+        raise NotImplementedError("D576 split-KV requires the parallel GMEM reducer")
 
     total_q = cute.sym_int()
     pool_rows = cute.sym_int()

@@ -1511,3 +1511,11 @@ def test_sparse_d576_capture_without_eager_run():
     graph.replay()
     torch.cuda.synchronize()
     _check_d576(q, kv, indices, lengths, out, lse)
+
+
+@pytest.mark.parametrize(
+    "option", [dict(assume_valid_prefix=True), dict(num_output_groups=1)]
+)
+def test_sparse_d576_rejects_d512_plan_options(option):
+    with pytest.raises(ValueError, match="does not take"):
+        _d576_plan(2, 64, 64, **option)

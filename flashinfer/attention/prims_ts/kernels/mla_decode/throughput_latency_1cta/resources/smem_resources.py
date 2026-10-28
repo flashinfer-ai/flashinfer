@@ -56,7 +56,9 @@ from ...helpers.math import (
     qkv_smem_swizzle,
     qkv_smem_swizzle_for_head_dim,
 )
-from ...helpers.ops import lane_idx_from_thread
+from ...helpers.ops import (
+    lane_idx_from_thread,
+)
 from ...helpers.query import query_batch_bounds
 from ...helpers.stage import MlaStage
 from ...helpers.tile import (
@@ -267,12 +269,6 @@ class SmemQResource(MlaResource):
             self.tma_desc_q_latent is None or self.tma_desc_q_rope is None
         ):
             return
-        # A multi-warp loader splits the Q stages across its warps
-        # (``_load_q_stage``), matching the per-warp transaction bytes.
-        self._load_q_all_stages(stage_info)
-
-    @cute.jit
-    def _load_q_all_stages(self, stage_info: StageInfo):
         cfg = self.cfg
         stage_elems = cfg.q_smem_tile_elements
         stage_base = self._smem_q.subview(stage_info.stage_idx * Int32(stage_elems))
@@ -1134,7 +1130,7 @@ class SmemKvResource(MlaResource):
             descriptor = (
                 self.tma_desc_c_rope if is_rope_stage else self.tma_desc_c_latent
             )
-            quads_per_warp = 32 // num_load_warps
+            quads_per_warp = cfg.tile_size_kv // (4 * num_load_warps)
             gather4_cached_warp(
                 stage_base.data_ptr(
                     warp_in_task * Int32(quads_per_warp * 4 * active_width)

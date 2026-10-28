@@ -29,16 +29,18 @@ D576 details:
 - **Kernel.** The 1CTA keeps-MMA-AB q64 schedule in a D576 sparse
   configuration: one CTA per (token, 64 heads), with Gather4 loads of the
   routed rows. H is 64 or 128.
-- **Split-KV below 96 CTAs.** `plan()` chooses the split from
-  `batch_size * max_seq_len_q`, so every run of a plan, and a CUDA graph
-  captured from it, uses one compiled kernel. Each top-k list is split into
-  S ∈ {16, 8, 4, 2} ranges of at least two 128-key tiles (trtllm-gen's rule);
-  while the split grid fills at most a half or a quarter of the SMs, the 512 V
-  columns are split as well. A reducer merges the BF16 partials, so a split
+- **Split-KV below one wave.** `plan()` chooses the split from
+  `batch_size * max_seq_len_q` (`sparse_policy.select_sparse_mla_d576_split`),
+  so every run of a plan, and a CUDA graph captured from it, uses one compiled
+  kernel. While the split grid fits one wave, each top-k list is split into
+  S ∈ {16, 8, 4, 2} ranges of at least two 128-key tiles (trtllm-gen's rule;
+  one tile for a top-k of one tile pair); while the split grid fills at most a
+  half or a quarter of the SMs, the 512 V columns are split as well. A reducer merges the BF16 partials, so a split
   launch is not bitwise equal to an unsplit one.
 - **Run time.** `lse` is the natural-log log-sum-exp, as for D512.
   `softmax_scale` / `output_scale` are Python numbers, and a captured graph
-  keeps their capture-time values. The KV pool must be contiguous. A plan
+  keeps their capture-time values. The KV pool must be contiguous (no page
+  padding). A plan
   covers at most 65535 query tokens (one grid-z slice each). Compiled
   kernels are cached on disk with the other PrimTS MLA kernels.
 

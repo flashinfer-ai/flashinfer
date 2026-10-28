@@ -2538,6 +2538,11 @@ class BatchSparseMLADecodePagedTSWrapper:
         there.
         """
         if (kv_lora_rank, qk_rope_head_dim) != (512, 0):
+            if assume_valid_prefix or num_output_groups is not None:
+                raise ValueError(
+                    "D576 sparse MLA does not take assume_valid_prefix or "
+                    "num_output_groups"
+                )
             return self._plan_sparse_d576(
                 device,
                 batch_size,
