@@ -199,10 +199,15 @@ COMPACT_MIN_TILES = 4
 # owned ring positions minus one, summed over the CTA's tiles).  The gain is per iteration
 # (CAKE-4389 round 16, H100, paired, cold L2): the rows of 0..3 iterations per warpgroup
 # read inside their null band and keep ``attention_fp8_gqa`` byte for byte.  Queue, compact
-# and tagged plans and every BF16 / MHA plan never take it.  14 = the measured route; a
-# value above every plan's loop count disables the program.  Mirrors the kernel-tests
-# reference planner (``PIN_MIN_CTA_LOOP_ITERS``); the two must agree.
-PIN_MIN_CTA_LOOP_ITERS = 14
+# and tagged plans and every BF16 / MHA plan never take it.  8 = the measured route
+# (CAKE-4389 round 17, H100, paired, cold L2: the 5 static grouped-query ids whose
+# lightest CTA runs 8..13 iterations gain 672..959 ns per launch (1.0267..1.0282 x) in
+# a 9 x 256 confirm and 609..1025 ns in two 3 x 128 processes, every group positive,
+# against null bands of at most 224 ns; the N <= 7 rows stay unrouted (their twins at
+# 2..3 iterations read inside the band in round 16)); a value above every plan's loop
+# count disables the program.  Mirrors the kernel-tests reference planner
+# (``PIN_MIN_CTA_LOOP_ITERS``); the two must agree.
+PIN_MIN_CTA_LOOP_ITERS = 8
 # Tile ORDER of static UNIFORM plans before the
 # list schedule.  The queue kernel balances its pooled tiles at run time and ragged plans
 # are already list-scheduled costliest first, so both keep the legacy order; the mode and
