@@ -222,6 +222,15 @@ MAIN_KWARGS = (
     "M",
     "grid",
 )
+# Arguments the kernels access 16 bytes at a time (vector loads / stores).
+VECTOR_ACCESSED_TENSORS = (
+    "logits",
+    "bias",
+    "topk_ids",
+    "expert_counts",
+    "expert_offsets",
+    "expert_scatter_offsets",
+)
 
 # Measured dispatch cells, keyed by (num_tokens, block_m): the 28 shapes the
 # generated program was benchmarked at on each architecture.  Both tables cover
@@ -304,7 +313,10 @@ class KimiK3RoutePlan(NamedTuple):
     valid extent of both.  ``expert_counts`` are the per-expert pair counts,
     ``expert_offsets`` the padded prefix sums (897 entries) and
     ``expert_scatter_offsets`` equals ``expert_counts`` after the launch.
-    Capacity beyond the valid extent is left untouched.
+    Capacity beyond the valid extent is left untouched.  ``topk_ids``,
+    ``expert_counts``, ``expert_offsets`` and ``expert_scatter_offsets`` must
+    start at 16-byte aligned addresses, as :func:`allocate_kimi_k3_route_plan`
+    allocates them.
     """
 
     topk_weights: torch.Tensor
@@ -578,6 +590,11 @@ def _validate_problem(num_tokens: Any, block_m: Any) -> tuple[int, int]:
     return num_tokens, block_m
 
 
+def _require_aligned(name: str, tensor: torch.Tensor, prefix: str = "") -> None:
+    if name in VECTOR_ACCESSED_TENSORS and tensor.data_ptr() % 16:
+        raise ValueError(f"{prefix}{name} must be 16-byte aligned")
+
+
 def validate_kimi_k3_fused_router_inputs(
     logits: torch.Tensor, bias: torch.Tensor, block_m: int
 ) -> tuple[int, int]:
@@ -596,6 +613,8 @@ def validate_kimi_k3_fused_router_inputs(
         raise ValueError(f"bias must have shape [{NUM_EXPERTS}]")
     if not logits.is_contiguous() or not bias.is_contiguous():
         raise ValueError("logits and bias must be contiguous")
+    _require_aligned("logits", logits)
+    _require_aligned("bias", bias)
     return _validate_problem(int(logits.shape[0]), block_m)
 
 
@@ -636,6 +655,7 @@ def _validate_plan(
                 f"plan.{name} needs capacity {min_numel} for num_tokens={num_tokens}, "
                 f"block_m={block_m}; got {tensor.numel()}"
             )
+        _require_aligned(name, tensor, "plan.")
 
 
 def _require_nonoverlapping(tensors: dict[str, torch.Tensor]) -> None:

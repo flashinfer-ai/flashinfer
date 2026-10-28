@@ -65,6 +65,15 @@ WEIGHT_RTOL = 1e-5
 SORTED_POISON = -1_234_567
 EXPERT_POISON = -7_654_321
 WORKSPACE_POISON = -91
+# Tensors the kernels access 16 bytes at a time; each must be 16-byte aligned.
+ALIGNED_TENSORS = (
+    "logits",
+    "bias",
+    "topk_ids",
+    "expert_counts",
+    "expert_offsets",
+    "expert_scatter_offsets",
+)
 
 # The 28 measured cells: num_tokens in {1, 2, ..., 8192} x block_m in {8, 16}.
 MEASURED_SHAPES = [(rows, bm) for bm in BLOCK_M_VALUES for rows in MEASURED_NUM_TOKENS]
@@ -139,6 +148,14 @@ def make_inputs(num_tokens, device, seed=0):
     logits = logits + expert.reshape(1, -1) * 1.0e-5 + token * 1.0e-7
     bias = torch.randn((NUM_EXPERTS,), generator=gen, device=device) * 0.05
     return logits.contiguous(), bias.contiguous()
+
+
+def misaligned_view(tensor):
+    """Contiguous view shaped like ``tensor`` whose start is not 16-byte aligned."""
+    flat = torch.empty(tensor.numel() + 1, dtype=tensor.dtype, device=tensor.device)
+    view = flat[1:].view(tensor.shape)
+    assert view.is_contiguous() and view.data_ptr() % 16 != 0
+    return view
 
 
 # Two ulps of a unit-scale FP32 score.  The kernel reproduces the SGLang
@@ -929,6 +946,30 @@ def test_validate_inputs():
         validate_kimi_k3_fused_router_inputs(logits, bias, 32)
     with pytest.raises(TypeError):
         validate_kimi_k3_fused_router_inputs(logits, bias, 8.0)
+    # A row slice stays 16-byte aligned (one row is 3584 bytes).
+    assert validate_kimi_k3_fused_router_inputs(logits[5:], bias, 8) == (11, 8)
+    with pytest.raises(ValueError, match="logits must be 16-byte aligned"):
+        validate_kimi_k3_fused_router_inputs(misaligned_view(logits), bias, 8)
+    with pytest.raises(ValueError, match="bias must be 16-byte aligned"):
+        validate_kimi_k3_fused_router_inputs(logits, misaligned_view(bias), 8)
+
+
+def test_plan_requires_vector_alignment():
+    """Only the plan tensors the kernels access 16 bytes at a time need alignment."""
+    device = torch.device("cpu")
+    plan = allocate_kimi_k3_route_plan(16, 8, device)
+    cake_backend._validate_plan(plan, num_tokens=16, block_m=8, device=device)
+    for name in KimiK3RoutePlan._fields:
+        shifted = plan._replace(**{name: misaligned_view(getattr(plan, name))})
+        if name in ALIGNED_TENSORS:
+            with pytest.raises(ValueError, match=f"plan.{name} must be 16-byte"):
+                cake_backend._validate_plan(
+                    shifted, num_tokens=16, block_m=8, device=device
+                )
+        else:
+            cake_backend._validate_plan(
+                shifted, num_tokens=16, block_m=8, device=device
+            )
 
 
 def test_selection_tie_tolerance():
@@ -1145,3 +1186,23 @@ def test_prepare_rejects_bad_plan_and_shapes():
         prepare_kimi_k3_fused_router(logits, bias.cpu(), block_m=8)
     with pytest.raises(ValueError, match="backend"):
         prepare_kimi_k3_fused_router(logits, bias, block_m=8, backend="triton")
+
+
+def test_prepare_rejects_misaligned_tensors():
+    """Preparation rejects each misaligned vector-accessed tensor before a launch."""
+    device = _require_program(1, 8)
+    logits, bias = make_inputs(1, device, seed=17)
+    plan = allocate_kimi_k3_route_plan(1, 8, device)
+    runner = prepare_kimi_k3_fused_router(logits, bias, block_m=8, plan=plan)
+    assert runner.plan is plan
+    for name in ALIGNED_TENSORS:
+        inputs = {"logits": logits, "bias": bias}
+        bound = plan
+        if name in inputs:
+            inputs[name] = misaligned_view(inputs[name])
+            message = f"{name} must be 16-byte aligned"
+        else:
+            bound = plan._replace(**{name: misaligned_view(getattr(plan, name))})
+            message = f"plan.{name} must be 16-byte aligned"
+        with pytest.raises(ValueError, match=message):
+            prepare_kimi_k3_fused_router(**inputs, block_m=8, plan=bound)

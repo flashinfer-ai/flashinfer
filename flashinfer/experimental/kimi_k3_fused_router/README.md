@@ -125,6 +125,10 @@ the expert-aligned route plan consumed by grouped MoE GEMMs in **one launch**:
 
 `max_route_blocks = min(896, pairs) + (pairs - min(896, pairs)) // block_m`
 with `pairs = num_tokens * 16` (`cake_backend.max_route_blocks`).
+`logits`, `bias`, `topk_ids`, `expert_counts`, `expert_offsets` and
+`expert_scatter_offsets` are read or written 16 bytes at a time, so each must
+start at a 16-byte aligned address (`allocate_kimi_k3_route_plan` and
+`torch.empty` allocate them so; a row slice such as `logits[k:]` keeps it).
 
 ```python
 import torch
@@ -148,8 +152,8 @@ logits.copy_(torch.randn_like(logits))
 runner()  # same runner (or a captured graph), new logits
 ```
 
-Preparation validates shapes, dtypes, contiguity, plan capacity and that no
-two buffers overlap, selects the dispatch arm for the device architecture and
+Preparation validates shapes, dtypes, contiguity, alignment, plan capacity
+and that no two buffers overlap, selects the dispatch arm for the device architecture and
 token count (and the device's cluster capacity), loads the arm's JIT module and computes the launch grid from the
 device facts cached per device (compute capability, SM count, cluster
 occupancy); it makes no host copy of the inputs.
