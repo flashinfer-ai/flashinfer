@@ -614,6 +614,7 @@ def test_blackwell_cached_cluster_route_rules_per_arch(
 ):
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+    _skip_unless_b200_or_gb300()
     _check_cached_cluster_route(rows, vocab_size, sm100_route, sm103_route)
 
 
