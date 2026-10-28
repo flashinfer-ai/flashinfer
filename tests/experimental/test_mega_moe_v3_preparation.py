@@ -1,8 +1,13 @@
-"""Host-side contract of the generated MegaMoE v3 pipeline preparation (no GPU required)."""
+"""Host-side contract of the generated MegaMoE v3 pipeline preparation.
+
+No GPU is required except by the binding tests, which allocate a small
+route's workspace on the device and skip without one.
+"""
 
 import pytest
 
 from flashinfer.experimental.mega_moe_v3 import preparation
+from flashinfer.experimental.mega_moe_v3.preparation import SF_GRAN
 
 GEOMETRY = dict(top_k=6, hidden=5120, routed_weight_dtype="fp4", activation_clamp=10.0)
 
@@ -208,3 +213,93 @@ def test_dispatch_reference_all_remote_routes_no_row():
     assert max(ref["M_total"], preparation.ALIGN_M) == 256
     masked = preparation._mega_dispatch_reference(torch.full((4, 6), -1), 48)
     assert masked["M_total"] == 0 and masked["total_m_tiles"] == 0
+
+
+# The source form the short TP/EP rows state (one and four tokens: per-block
+# readiness, no slot list, 16-row tiles).
+SHORT_ROW_METADATA = {"block_m": 16, "readiness": "block", "slot_list": False}
+
+
+def cuda_torch():
+    """``torch`` with a CUDA device, else skip: the binding tests allocate the
+    route's pools and counters on the device the way a real call does."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    return torch
+
+
+def small_pipeline_inputs(torch, device="cuda"):
+    """A packed FP4 call at the smallest geometry the preparation accepts:
+    four tokens, two experts, top-1, hidden 256 (one 256-wide K tile),
+    intermediate 128 (one 128-wide step). Random weight and activation bytes
+    with unit scales; nothing is launched on them."""
+    T, E, H, I = 4, 2, 256, 128
+    generator = torch.Generator(device=device).manual_seed(0)
+
+    def packed(*shape):
+        return torch.randint(
+            0, 256, shape, dtype=torch.uint8, device=device, generator=generator
+        )
+
+    def scales(*shape):
+        return torch.ones(shape, dtype=torch.float32, device=device)
+
+    return dict(
+        num_tokens=T,
+        num_experts=E,
+        top_k=1,
+        hidden=H,
+        intermediate=I,
+        routed_weight_dtype="fp4",
+        activation_clamp=10.0,
+        x_fp8_packed=packed(T, H),
+        x_sf_packed=packed(T, H // SF_GRAN).view(torch.int32),
+        topk_idx=torch.arange(T, device=device).remainder(E).reshape(T, 1),
+        topk_weights=torch.ones(T, 1, dtype=torch.float32, device=device),
+        w1_fp4=packed(E, 2 * I, H // 2),
+        w1_sf=scales(E, 2 * I, H // SF_GRAN),
+        w2_fp4=packed(E, H, I // 2),
+        w2_sf=scales(E, H, I // SF_GRAN),
+    )
+
+
+@pytest.mark.parametrize("a_source", ["x", "pool", None])
+def test_pipeline_bindings_take_the_a_map_from_the_stated_source(a_source):
+    """A route whose metadata states ``a_source`` ``"x"`` binds the FC1 ``A``
+    map to the activation storage itself: the contiguous ``[T, H]`` byte view
+    of ``x_fp8_packed`` (one byte per element, row pitch ``H``), the bytes the
+    ``x_fp8`` word view also hands the dispatch. The pool stays allocated and
+    bound. ``"pool"`` and an absent key (every route rendered before the key
+    existed) bind the dispatch pool rows, as before."""
+    torch = cuda_torch()
+    inputs = small_pipeline_inputs(torch)
+    metadata = dict(SHORT_ROW_METADATA)
+    if a_source is not None:
+        metadata["a_source"] = a_source
+    data = preparation.prepare_pipeline_bindings(inputs, 4, route_metadata=metadata)
+    bindings = data["bindings"]
+    A, pool, x = bindings["A"], bindings["pool_fp8"], bindings["x_fp8"]
+    T, H = inputs["num_tokens"], inputs["hidden"]
+    assert A.dtype == torch.uint8 and A.is_contiguous()
+    assert x.data_ptr() == inputs["x_fp8_packed"].data_ptr()
+    assert pool.shape == (data["M_total"], H // 4) and pool.dtype == torch.int32
+    if a_source == "x":
+        assert A.shape == (T, H) and A.stride() == (H, 1)
+        assert A.data_ptr() == inputs["x_fp8_packed"].data_ptr() == x.data_ptr()
+        assert A.data_ptr() != pool.data_ptr()
+        assert torch.equal(A, inputs["x_fp8_packed"])
+    else:
+        assert A.shape == (data["M_total"], H)
+        assert A.data_ptr() == pool.data_ptr()
+
+
+def test_pipeline_bindings_refuse_an_unknown_a_source():
+    """The metadata is refused before any input is touched, so the inputs
+    may live on the host here."""
+    torch = pytest.importorskip("torch")
+    inputs = small_pipeline_inputs(torch, device="cpu")
+    for bad in ("pool_fp8", "", None, 1):
+        metadata = dict(SHORT_ROW_METADATA, a_source=bad)
+        with pytest.raises(ValueError, match="a_source"):
+            preparation.prepare_pipeline_bindings(inputs, 4, route_metadata=metadata)

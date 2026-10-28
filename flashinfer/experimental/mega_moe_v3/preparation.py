@@ -395,14 +395,24 @@ def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
     scalar (without the filter the call must describe a single-rank window:
     offset 0, every id below ``num_experts``), and ``w1_expert_map`` states
     that the program streams ``B1`` through a per-expert three-dimensional TMA
-    map (``w1_launch_view``). Without metadata (the original routes) the host
-    uses the original heuristics.
+    map (``w1_launch_view``), and ``a_source`` names the storage the program's
+    FC1 ``A`` tensor map describes: ``"pool"`` (the default) the dispatch pool
+    rows, ``"x"`` the activations themselves, the contiguous
+    ``[num_tokens, hidden]`` bytes of ``x_fp8_packed`` (a program that reads
+    every routed row straight from the activations and copies no pool row).
+    Without metadata (the original routes) the host uses the original
+    heuristics.
     """
     import torch
 
     metadata = {} if route_metadata is None else route_metadata
     local_expert_filter = bool(metadata.get("local_expert_filter", False))
     w1_expert_map = bool(metadata.get("w1_expert_map", False))
+    a_source = metadata.get("a_source", "pool")
+    if a_source not in ("x", "pool"):
+        raise ValueError(
+            f"route metadata 'a_source' must be 'x' or 'pool'; got {a_source!r}"
+        )
     args = pipeline_route_args(inputs)
     E, TK, T, H, I = (
         args[k]
@@ -509,6 +519,21 @@ def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
     B2 = w2.contiguous().view(torch.uint8)
     SFB2 = _sf_float_to_u32_words(w2_sf).view(torch.uint32)
     pool_fp8 = torch.zeros(M_total, H // 4, dtype=torch.int32, device="cuda")
+    # The FC1 ``A`` map: the pool rows the dispatch fills, or the activation
+    # bytes themselves for a program that reads the routed rows in place
+    # (``a_source`` ``"x"``): ``[T, H]``, one byte per element, row pitch
+    # ``H``, the extent its tensor map describes. ``x_fp8`` is the contiguous
+    # ``[T, H // 4]`` word view of the same bytes the dispatch reads.
+    if a_source == "x":
+        A = x_fp8.view(torch.uint8)
+        if tuple(A.shape) != (T, H) or not A.is_contiguous():
+            raise ValueError(
+                "MegaMoE input 'x_fp8_packed' must bind as a contiguous "
+                f"[{T}, {H}] byte view for a route that reads A from the "
+                f"activations; got shape {tuple(A.shape)}, strides {A.stride()}"
+            )
+    else:
+        A = pool_fp8.view(torch.uint8)
     pool_sf = torch.zeros(M_total, H // 128, dtype=torch.int32, device="cuda")
     routing_weight_pool = torch.zeros(M_total, dtype=torch.float32, device="cuda")
     token_to_permuted = torch.full((T * TK,), -1, dtype=torch.int32, device="cuda")
@@ -550,7 +575,7 @@ def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
         topk_weights=topk_weights_flat,
         x_fp8=x_fp8,
         x_sf=x_sf,
-        A=pool_fp8.view(torch.uint8),
+        A=A,
         pool_fp8=pool_fp8,
         pool_sf=pool_sf.view(torch.uint32),
         routing_weight_pool=routing_weight_pool,
