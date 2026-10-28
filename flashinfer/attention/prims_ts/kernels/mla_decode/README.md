@@ -38,7 +38,8 @@ D576 details:
   launch is not bitwise equal to an unsplit one.
 - **Run time.** `lse` is the natural-log log-sum-exp, as for D512.
   `softmax_scale` / `output_scale` are Python numbers, and a captured graph
-  keeps their capture-time values. The KV pool must be contiguous. Compiled
+  keeps their capture-time values. The KV pool must be contiguous. A plan
+  covers at most 65535 query tokens (one grid-z slice each). Compiled
   kernels are cached on disk with the other PrimTS MLA kernels.
 
 This directory contains the CuTe DSL task-scheduled (TS) Multi-head Latent
