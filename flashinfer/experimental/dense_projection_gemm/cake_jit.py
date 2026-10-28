@@ -203,9 +203,9 @@ KERNELS: dict[str, dict[str, str]] = {
 # the manifest.
 
 # The architectures this checkout registers programs for (``KERNELS`` keys and
-# every record's ``arches`` are drawn from it).  SM103 (B300 / GB300) has no
-# registered program: a CC 10.3 device ends in ``NotImplementedError`` from
-# ``select_module``.
+# every record's ``arches`` are drawn from it).  SM103 (B300 / GB300) registers
+# its own builds of the shared programs and, for three input-gradient rows, the
+# eight-warp CTA programs (the ``_w8r`` / ``_w8rs`` templates).
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 TRACKING_ISSUE = "flashinfer-ai/flashinfer#5677"
 
