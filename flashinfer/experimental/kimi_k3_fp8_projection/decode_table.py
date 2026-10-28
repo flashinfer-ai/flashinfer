@@ -503,7 +503,6 @@ DECODE_TABLE: dict[str, dict[str, Any]] = {
         "fused": True,
         "persist": True,
     },
-    "192,2,256": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128},
     "192,2,2048": {"route": "gemm", "gemm_bk": 128},
     "384,28,8": {
         "route": "decode",
@@ -907,6 +906,7 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "persist": True,
             "tstore": True,
         },
+        "192,2,256": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128},
         "192,2,512": {"route": "gemm", "gemm_bk": 128, "gemm_gs": 1},
         "192,2,1024": {
             "route": "gemm",
@@ -1272,6 +1272,7 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
             "tstore": True,
             "pw": 2,
         },
+        "192,2,256": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128, "gemm_gs": 1},
         "192,2,512": {"route": "gemm", "gemm_bk": 128},
         "192,2,1024": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128},
         "192,2,4096": {"route": "gemm", "gemm_bk": 128},
@@ -1876,6 +1877,9 @@ ROUTE_TWINS: dict[str, dict[str, dict[str, str]]] = {
         "144,6,256": {
             "quant:u1": "quant:u1_xef_qel",
             "gemm_tstore_k128": "gemm_tstore_k128_bef",
+        },
+        "192,2,256": {
+            "gemm_tstore_n192_k128_gs": "gemm_tstore_n192_k128_gs_ts3_tde_prg",
         },
         "384,28,1": {
             "decode:t16_p4_fused": "decode:t16_p4_fused_wef",
