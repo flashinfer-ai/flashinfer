@@ -1407,8 +1407,9 @@ def chunk_gated_delta_rule(
         its final state to row ``output_state_indices[i]`` of
         ``output_state``, which may be the same pool. A read id of ``-1``
         starts the sequence from the zero state; a write id of ``-1`` skips
-        its final-state write. Rows written by one sequence must not be read
-        or written by another sequence of the same call.
+        its final-state write. A zero-length sequence writes nothing: its
+        write row keeps its contents. Rows written by one sequence must not be
+        read or written by another sequence of the same call.
     checkpoint_state_indices : torch.Tensor, optional
         Int32 or int64 destination rows for checkpoints. Requires
         ``checkpoint_every_n_tokens > 0``. ``state_checkpoints`` is then a

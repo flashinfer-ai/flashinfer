@@ -89,7 +89,8 @@ cache layouts can use directly:
 ``output_state_indices``
     Pool row of each sequence's final state, separate from the read row
     ``state_indices``. A read row of ``-1`` starts from the zero state; a write
-    row of ``-1`` skips the final-state store.
+    row of ``-1`` skips the final-state store. A zero-length sequence writes
+    nothing.
 
 ``checkpoint_state_indices``
     Pool rows of the checkpoints: the ``j``-th checkpoint of sequence ``i``
