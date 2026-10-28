@@ -1391,13 +1391,22 @@ class GatedDeltaNetChunkedKernel:
                             checkpoint_phase = self._checkpoint_phase(
                                 mPrefix_lens, batch_idx, checkpoint_every_n_tokens
                             )
+                        checkpoint_cursor = None
+                        if cutlass.const_expr(self.enable_checkpoints):
+                            checkpoint_cursor = self._init_checkpoint_cursor(
+                                mCheckpoint_indices,
+                                checkpoint_offset,
+                                checkpoint_phase,
+                                checkpoint_every_n_tokens,
+                                seqlen_b,
+                            )
                         slot_checkpoint_args = (  # type: ignore[assignment]
-                            checkpoint_phase,
+                            checkpoint_cursor,
                             mCheckpoint_indices,
                         )
                         slot_final_args = (
                             mS_out_indices,
-                            checkpoint_phase,
+                            checkpoint_cursor,
                             mCheckpoint_indices,
                         )
                     if cutlass.const_expr(self.use_initial_state):
@@ -4135,6 +4144,50 @@ class GatedDeltaNetChunkedKernel:
         return cutlass.Int32((prefix - prefix % self.b_t) % checkpoint_every_n_tokens)
 
     @cute.jit
+    def _init_checkpoint_cursor(
+        self,
+        mCheckpoint_indices: Optional[cute.Tensor],
+        checkpoint_offset,
+        checkpoint_phase,
+        checkpoint_every_n_tokens: cutlass.Int32,
+        seqlen_b: cutlass.Int32,
+    ) -> cute.Tensor:
+        """Registers ``[next due position, its pool row]`` of a sequence's checkpoints.
+
+        Position ``t`` (tokens after the first chunk start) is due when
+        ``0 < t <= seqlen_b`` and ``(t + phase) % N == 0``: ``t = N - phase``, then
+        every ``N`` tokens. The chunks compare against the cursor instead of
+        dividing, and the pool row of the next due entry is loaded ahead of the
+        chunk that stores it (only when that entry exists).
+        """
+        cursor = cute.make_rmem_tensor((2,), cutlass.Int32)
+        first_due = checkpoint_every_n_tokens
+        if cutlass.const_expr(self.use_prefix_lens):
+            first_due = checkpoint_every_n_tokens - checkpoint_phase
+        cursor[0] = first_due
+        cursor[1] = cutlass.Int32(-1)
+        if cutlass.const_expr(self.use_checkpoint_state_indices):
+            if first_due <= seqlen_b:
+                cursor[1] = cutlass.Int32(mCheckpoint_indices[checkpoint_offset])
+        return cursor
+
+    @cute.jit
+    def _advance_checkpoint_cursor(
+        self,
+        cursor: cute.Tensor,
+        mCheckpoint_indices: Optional[cute.Tensor],
+        checkpoint_offset,
+        checkpoint_every_n_tokens: cutlass.Int32,
+        seqlen_b: cutlass.Int32,
+    ):
+        """Move the cursor past a stored checkpoint; ``checkpoint_offset`` is the
+        next entry, whose pool row is loaded if that checkpoint exists."""
+        cursor[0] = cursor[0] + checkpoint_every_n_tokens
+        if cutlass.const_expr(self.use_checkpoint_state_indices):
+            if cursor[0] <= seqlen_b:
+                cursor[1] = cutlass.Int32(mCheckpoint_indices[checkpoint_offset])
+
+    @cute.jit
     def _load_initial_state(
         self,
         tidx,
@@ -4290,7 +4343,7 @@ class GatedDeltaNetChunkedKernel:
         mS_checkpoints,
         checkpoint_offset,
         checkpoint_every_n_tokens,
-        # Slot mode: (mS_out_indices, checkpoint_phase, mCheckpoint_indices); else None
+        # Slot mode: (mS_out_indices, checkpoint_cursor, mCheckpoint_indices); else None
         slot_args,
     ):
         """Store final recurrent state from TMEM (fp32) to GMEM mS_out.
@@ -4301,7 +4354,23 @@ class GatedDeltaNetChunkedKernel:
         num_threads_cg1 = self.threads_per_warp * len(self.compute_group_1_warp_ids)
         cg1_tidx = tidx % num_threads_cg1
         if cutlass.const_expr(self.slot_mode):
-            mS_out_indices, checkpoint_phase, mCheckpoint_indices = slot_args
+            mS_out_indices, checkpoint_cursor, mCheckpoint_indices = slot_args
+            # Rows and the end-checkpoint test are resolved before the wait,
+            # once per sequence (not per sub-tile, behind the stores).
+            if cutlass.const_expr(self.store_final_state):
+                if cutlass.const_expr(self.use_output_state_indices):
+                    final_row = cutlass.Int32(mS_out_indices[batch_idx])
+                elif cutlass.const_expr(mS_indices is not None):
+                    final_row = cutlass.Int32(mS_indices[batch_idx])
+                else:
+                    final_row = cutlass.Int32(batch_idx)
+            if cutlass.const_expr(self.enable_checkpoints):
+                # The end is a checkpoint when it is the next due position; an
+                # odd chunk count stored it at the padded chunk.
+                end_checkpoint = (checkpoint_cursor[0] == seqlen_b) and (
+                    cute.ceil_div(seqlen_b, self.b_t) % 2 == 0
+                )
+                end_checkpoint_row = checkpoint_cursor[1]
 
         # Build state TMEM layout (mirrors compute_group_1 setup)
         state_acc_shape = tiled_mma_kv.partition_shape_C(
@@ -4335,38 +4404,30 @@ class GatedDeltaNetChunkedKernel:
         # Wait for last GEMM-7 to finish.
         kv_acc_handle = kv_acc_consumer.wait_and_advance()
 
-        for sub in cutlass.range(tTR_rState.shape[2]):
-            cute.copy(
-                tiled_state_t2r,
-                tTR_tCtState[None, 0, sub, kv_acc_handle.index],
-                tTR_rState[None, 0, sub],
-            )
-            if cutlass.const_expr(self.acc_dtype != self.state_dtype):
-                tRG_rState[None, 0, sub].store(
-                    tTR_rState[None, 0, sub].load().to(self.state_dtype)
+        if cutlass.const_expr(self.slot_mode):
+            for sub in cutlass.range(tTR_rState.shape[2]):
+                cute.copy(
+                    tiled_state_t2r,
+                    tTR_tCtState[None, 0, sub, kv_acc_handle.index],
+                    tTR_rState[None, 0, sub],
                 )
-            else:
-                tRG_rState = tTR_rState
-            if cutlass.const_expr(self.enable_checkpoints):
-                # The end is a checkpoint when its (absolute) position is a
-                # multiple of N; an odd chunk count stored it at the padded chunk.
-                checkpoint_pos = seqlen_b
-                if cutlass.const_expr(self.use_prefix_lens):
-                    checkpoint_pos = seqlen_b + checkpoint_phase
-                if checkpoint_pos % checkpoint_every_n_tokens == 0:
-                    num_valid_chunks_b = cute.ceil_div(seqlen_b, self.b_t)
-                    if num_valid_chunks_b % 2 == 0:
+                if cutlass.const_expr(self.acc_dtype != self.state_dtype):
+                    tRG_rState[None, 0, sub].store(
+                        tTR_rState[None, 0, sub].load().to(self.state_dtype)
+                    )
+                else:
+                    tRG_rState = tTR_rState
+                if cutlass.const_expr(self.enable_checkpoints):
+                    if end_checkpoint:
                         if cutlass.const_expr(self.use_checkpoint_state_indices):
-                            checkpoint_row = cutlass.Int32(
-                                mCheckpoint_indices[checkpoint_offset]
-                            )
-                            if checkpoint_row >= 0:
+                            # A negative pool row skips the checkpoint.
+                            if end_checkpoint_row >= 0:
                                 self._store_state_row(
                                     tRG_rState[None, 0, sub],
                                     thr_state_t2r,
                                     mS_checkpoints,
                                     head_idx,
-                                    checkpoint_row,
+                                    end_checkpoint_row,
                                     sub,
                                 )
                         else:
@@ -4380,26 +4441,50 @@ class GatedDeltaNetChunkedKernel:
                                 tSgCheckpoints[None, 0, sub],
                                 l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
                             )
-            if cutlass.const_expr(self.store_final_state):
-                if cutlass.const_expr(mS_indices is not None):
-                    state_row = cutlass.Int32(mS_indices[batch_idx])
-                else:
-                    state_row = batch_idx
-                if cutlass.const_expr(self.slot_mode):
+                if cutlass.const_expr(self.store_final_state):
                     # Final-state row: output_state_indices, else the read row;
                     # a negative row skips the store.
-                    if cutlass.const_expr(self.use_output_state_indices):
-                        state_row = cutlass.Int32(mS_out_indices[batch_idx])
-                    if state_row >= 0:
+                    if final_row >= 0:
                         self._store_state_row(
                             tRG_rState[None, 0, sub],
                             thr_state_t2r,
                             mS_out,
                             head_idx,
-                            state_row,
+                            final_row,
                             sub,
                         )
+        else:
+            for sub in cutlass.range(tTR_rState.shape[2]):
+                cute.copy(
+                    tiled_state_t2r,
+                    tTR_tCtState[None, 0, sub, kv_acc_handle.index],
+                    tTR_rState[None, 0, sub],
+                )
+                if cutlass.const_expr(self.acc_dtype != self.state_dtype):
+                    tRG_rState[None, 0, sub].store(
+                        tTR_rState[None, 0, sub].load().to(self.state_dtype)
+                    )
                 else:
+                    tRG_rState = tTR_rState
+                if cutlass.const_expr(self.enable_checkpoints):
+                    if seqlen_b % checkpoint_every_n_tokens == 0:
+                        num_valid_chunks_b = cute.ceil_div(seqlen_b, self.b_t)
+                        if num_valid_chunks_b % 2 == 0:
+                            gS_checkpoints = cute.flat_divide(
+                                mS_checkpoints[None, None, head_idx, checkpoint_offset],
+                                (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
+                            )[None, None, 0, 0]
+                            tSgCheckpoints = thr_state_t2r.partition_D(gS_checkpoints)
+                            cute.autovec_copy(
+                                tRG_rState[None, 0, sub],
+                                tSgCheckpoints[None, 0, sub],
+                                l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
+                            )
+                if cutlass.const_expr(self.store_final_state):
+                    if cutlass.const_expr(mS_indices is not None):
+                        state_row = cutlass.Int32(mS_indices[batch_idx])
+                    else:
+                        state_row = batch_idx
                     gS_out = cute.flat_divide(
                         mS_out[None, None, head_idx, state_row],
                         (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
@@ -4462,7 +4547,7 @@ class GatedDeltaNetChunkedKernel:
                 mS_checkpoints,
                 checkpoint_offset,
                 checkpoint_every_n_tokens,
-                checkpoint_phase,
+                checkpoint_cursor,
                 mCheckpoint_indices,
             ) = checkpoint_args
         else:
@@ -4733,47 +4818,79 @@ class GatedDeltaNetChunkedKernel:
             cute.arch.fence_view_async_tmem_store()
             state_inp_handle.commit()
             checkpoint_token = self.b_t * chunk_iter
-            # With prefix_lens the chunk grid starts at an absolute 64-multiple
-            # and checkpoints follow absolute positions.
-            checkpoint_pos = checkpoint_token
-            if cutlass.const_expr(self.use_prefix_lens):
-                checkpoint_pos = checkpoint_token + checkpoint_phase
-            if cutlass.const_expr(self.enable_checkpoints):
-                if checkpoint_token > 0:
-                    if checkpoint_token <= seqlen_b:
-                        if checkpoint_pos % checkpoint_every_n_tokens == 0:
-                            if cutlass.const_expr(self.use_checkpoint_state_indices):
-                                # Pool row of this entry; a negative row skips it.
-                                checkpoint_row = cutlass.Int32(
-                                    mCheckpoint_indices[checkpoint_offset]
+            if cutlass.const_expr(self.slot_mode and self.enable_checkpoints):
+                # Slot mode: the cursor holds the next due position and its pool
+                # row (loaded one due chunk ahead), so no division or dependent
+                # load sits on this path.
+                is_checkpoint = (checkpoint_token == checkpoint_cursor[0]) and (
+                    checkpoint_token <= seqlen_b
+                )
+                if is_checkpoint:
+                    if cutlass.const_expr(self.use_checkpoint_state_indices):
+                        # Pool row of this entry; a negative row skips it.
+                        checkpoint_row = checkpoint_cursor[1]
+                        if checkpoint_row >= 0:
+                            if cutlass.const_expr(self.state_dtype != self.acc_dtype):
+                                tRG_rState[None, 0, None].store(
+                                    tTR_rState[None, 0, None]
+                                    .load()
+                                    .to(self.state_dtype)
                                 )
-                                if checkpoint_row >= 0:
-                                    if cutlass.const_expr(
-                                        self.state_dtype != self.acc_dtype
-                                    ):
-                                        tRG_rState[None, 0, None].store(
-                                            tTR_rState[None, 0, None]
-                                            .load()
-                                            .to(self.state_dtype)
-                                        )
-                                        self._store_state_row(
-                                            tRG_rState[None, 0, None],
-                                            thr_state_t2r,
-                                            mS_checkpoints,
-                                            head_idx,
-                                            checkpoint_row,
-                                            None,
-                                        )
-                                    else:
-                                        self._store_state_row(
-                                            tTR_rState[None, 0, None],
-                                            thr_state_t2r,
-                                            mS_checkpoints,
-                                            head_idx,
-                                            checkpoint_row,
-                                            None,
-                                        )
+                                self._store_state_row(
+                                    tRG_rState[None, 0, None],
+                                    thr_state_t2r,
+                                    mS_checkpoints,
+                                    head_idx,
+                                    checkpoint_row,
+                                    None,
+                                )
                             else:
+                                self._store_state_row(
+                                    tTR_rState[None, 0, None],
+                                    thr_state_t2r,
+                                    mS_checkpoints,
+                                    head_idx,
+                                    checkpoint_row,
+                                    None,
+                                )
+                    else:
+                        gS_checkpoints = cute.flat_divide(
+                            mS_checkpoints[None, None, head_idx, checkpoint_offset],
+                            (self.mma_tiler_kv[0], self.mma_tiler_kv[1]),
+                        )[None, None, 0, 0]
+                        tSgCheckpoints = thr_state_t2r.partition_D(gS_checkpoints)
+                        if cutlass.const_expr(self.state_dtype != self.acc_dtype):
+                            tRG_rState[None, 0, None].store(
+                                tTR_rState[None, 0, None].load().to(self.state_dtype)
+                            )
+                        else:
+                            tRG_rState = tTR_rState
+                        cute.autovec_copy(
+                            tRG_rState[None, 0, None],
+                            tSgCheckpoints[None, 0, None],
+                            l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
+                        )
+                for k in cutlass.range(cute.size(tTR_rState), vectorize=True):
+                    tTR_rState[k] = tTR_rState[k] * cumprod_total
+                cute.copy(
+                    tiled_state_r2t,
+                    tTR_rState[None, 0, None],
+                    tRT_tCtState[None, 0, None, kv_prev_handle.index],
+                )
+                if is_checkpoint:
+                    checkpoint_offset += 1
+                    self._advance_checkpoint_cursor(
+                        checkpoint_cursor,
+                        mCheckpoint_indices,
+                        checkpoint_offset,
+                        checkpoint_every_n_tokens,
+                        seqlen_b,
+                    )
+            else:
+                if cutlass.const_expr(self.enable_checkpoints):
+                    if checkpoint_token > 0:
+                        if checkpoint_token <= seqlen_b:
+                            if checkpoint_token % checkpoint_every_n_tokens == 0:
                                 gS_checkpoints = cute.flat_divide(
                                     mS_checkpoints[
                                         None,
@@ -4804,18 +4921,18 @@ class GatedDeltaNetChunkedKernel:
                                     tSgCheckpoints[None, 0, None],
                                     l1c_evict_priority=cute.nvgpu.CacheEvictionPriority.NO_ALLOCATE,
                                 )
-            for k in cutlass.range(cute.size(tTR_rState), vectorize=True):
-                tTR_rState[k] = tTR_rState[k] * cumprod_total
-            cute.copy(
-                tiled_state_r2t,
-                tTR_rState[None, 0, None],
-                tRT_tCtState[None, 0, None, kv_prev_handle.index],
-            )
-            if cutlass.const_expr(self.enable_checkpoints):
-                if checkpoint_token > 0:
-                    if checkpoint_token <= seqlen_b:
-                        if checkpoint_pos % checkpoint_every_n_tokens == 0:
-                            checkpoint_offset += 1
+                for k in cutlass.range(cute.size(tTR_rState), vectorize=True):
+                    tTR_rState[k] = tTR_rState[k] * cumprod_total
+                cute.copy(
+                    tiled_state_r2t,
+                    tTR_rState[None, 0, None],
+                    tRT_tCtState[None, 0, None, kv_prev_handle.index],
+                )
+                if cutlass.const_expr(self.enable_checkpoints):
+                    if checkpoint_token > 0:
+                        if checkpoint_token <= seqlen_b:
+                            if checkpoint_token % checkpoint_every_n_tokens == 0:
+                                checkpoint_offset += 1
             cute.arch.fence_view_async_tmem_store()
             kv_prev_handle.release()
         for k in cutlass.range_constexpr(cute.size(tTR_tCcShared)):

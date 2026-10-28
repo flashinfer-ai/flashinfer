@@ -173,11 +173,14 @@ def _slot_key(
     checkpoint_state_indices: Optional[torch.Tensor],
     prefix_lens: Optional[torch.Tensor],
     output_checkpoints: Optional[torch.Tensor],
+    state_align: tuple = (16, 16),
 ) -> tuple | None:
     """Compile key of the slot arguments; None when no slot argument is given.
 
     Each argument is a compile-time switch, so its presence and dtype select the
-    kernel; a checkpoint pool also keys its inner strides like the state pools.
+    kernel; a checkpoint pool also keys its inner strides like the state pools,
+    and the assumed byte alignments (stored, loaded) of the state tensors are
+    part of the key.
     """
     slot_args = (output_state_indices, checkpoint_state_indices, prefix_lens)
     if all(t is None for t in slot_args):
@@ -195,7 +198,19 @@ def _slot_key(
             if checkpoint_state_indices is not None
             else None
         ),
+        state_align,
     )
+
+
+def _state_align(*states: Optional[torch.Tensor]) -> int:
+    """32 when every given state tensor starts on a 32-byte boundary, else 16.
+
+    Slot calls compile with this alignment so the state rows move in 256-bit
+    accesses (full 32-byte sectors) when the tensors allow it.
+    """
+    if all(s.data_ptr() % 32 == 0 for s in states if s is not None):
+        return 32
+    return 16
 
 
 def _cutlass_io_dtype(torch_dtype: torch.dtype):
@@ -350,8 +365,34 @@ def chunk_gated_delta_rule_sm100(
     use_output_state_indices = output_state_indices is not None
     use_checkpoint_state_indices = checkpoint_state_indices is not None
     use_prefix_lens = prefix_lens is not None
+    slot_call = not (
+        output_state_indices is None
+        and checkpoint_state_indices is None
+        and prefix_lens is None
+    )
+    target = gdn_device_target(q.device)
+    kernel_variant = _prefill_kernel_variant(target.major, target.minor)
+    # Slot calls store final states and checkpoints with 256-bit accesses when
+    # those tensors are 32-byte aligned; the initial state is loaded that way
+    # too except on SM107, where the wider load measured slower.
+    store_align = (
+        _state_align(
+            output_state if store_final_state else None,
+            output_checkpoints if enable_checkpoints else None,
+        )
+        if slot_call
+        else 16
+    )
+    load_align = (
+        _state_align(initial_state) if slot_call and kernel_variant != "sm107" else 16
+    )
+    state_align = (store_align, load_align)
     slot_key = _slot_key(
-        output_state_indices, checkpoint_state_indices, prefix_lens, output_checkpoints
+        output_state_indices,
+        checkpoint_state_indices,
+        prefix_lens,
+        output_checkpoints,
+        state_align,
     )
     # Pools (indexed rows, possibly padded) restore their stride alignment from
     # this divisibility; a checkpoint pool joins the state pools.
@@ -365,9 +406,7 @@ def chunk_gated_delta_rule_sm100(
     state_stride_divisibility = _state_stride_divisibility(pools, DK) if pools else 1
 
     # num_sm is baked in as max_active_clusters, so it belongs to the key.
-    target = gdn_device_target(q.device)
     num_sm = get_num_sm(q.device)
-    kernel_variant = _prefill_kernel_variant(target.major, target.minor)
     kernel_cls = _PREFILL_KERNEL_CLASSES[kernel_variant]
     cache_key: tuple = (
         kernel_variant,
@@ -461,12 +500,12 @@ def chunk_gated_delta_rule_sm100(
 
         s_in_cute = None
         if use_initial_state:
-            s_in_cute = from_dlpack(_initial_state, assumed_align=16)
+            s_in_cute = from_dlpack(_initial_state, assumed_align=load_align)
             _mark_state_layout(s_in_cute, use_state_indices, DK)
 
         s_out_cute = None
         if store_final_state:
-            s_out_cute = from_dlpack(_output_state, assumed_align=16)
+            s_out_cute = from_dlpack(_output_state, assumed_align=store_align)
             _mark_state_layout(s_out_cute, use_state_indices, DK)
 
         s_indices_cute = None
@@ -478,7 +517,9 @@ def chunk_gated_delta_rule_sm100(
         s_checkpoints_cute = None
         cu_checkpoints_cute = None
         if enable_checkpoints:
-            s_checkpoints_cute = from_dlpack(output_checkpoints, assumed_align=16)
+            s_checkpoints_cute = from_dlpack(
+                output_checkpoints, assumed_align=store_align
+            )
             if use_checkpoint_state_indices:
                 # A checkpoint pool may pad its row stride like the state pools.
                 _mark_state_layout(s_checkpoints_cute, True, DK)
