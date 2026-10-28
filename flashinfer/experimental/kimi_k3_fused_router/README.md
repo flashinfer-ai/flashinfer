@@ -37,7 +37,10 @@ the expert-aligned route plan consumed by grouped MoE GEMMs in **one launch**:
   `num_tokens` CTAs -- 2, 4, 8 or 16 -- exchanging the selected ids through
   distributed shared memory; these are the only kernels bound to their exact
   token count), one cluster of 16 CTAs of two row groups each for every other
-  count up to 32 (the 32-token cell, so 3 or 17 tokens take it), one-join plan
+  count up to 32 (the 32-token cell, so 3 or 17 tokens take it; two kernels
+  serve it, one waiting for its cluster at entry and one after its row
+  selection: SM100 takes the second at `block_m = 8` and the first at
+  `block_m = 16`, SM103 the other way round), one-join plan
   builders for 33 to 128 tokens (the 64- and 128-token cells use a second
   kernel of the builder's family which loads the bias and the first row's
   logits into registers before its prologue barrier; the plain builder keeps
@@ -55,14 +58,17 @@ the expert-aligned route plan consumed by grouped MoE GEMMs in **one launch**:
 - The 4-CTA-cluster cells follow the batch against the device's capacity
   `C`, four times the co-resident clusters the driver reports for the
   next-row-prefetch kernel (568 on a 148-SM B200, 592 on a 152-SM GB300): up
-  to `C` tokens keep the cell's arm (every CTA selects at most one row), above
-  `C` the next-row-prefetch kernel runs (a CTA then selects a second row,
-  which the prefetch covers) and from `2C + 64` up a third kernel of the
-  family selects one row per warp (1200 tokens on a B200, 1248 on a GB300);
-  on SM103 at `block_m` 8 the third kernel starts at `2C` (1184 tokens on a
-  GB300). `C` is queried once per device and `block_m`, so the rule follows
-  smaller devices and MIG slices (`cake_backend.CAPACITY_ROUTES`,
-  `cake_backend.CAPACITY_WIDE_OFFSET`).
+  to `C` tokens keep the cell's arm (every CTA selects at most one row). Above
+  `C` a CTA selects a second row, which a next-row prefetch covers: SM100 runs
+  the next-row-prefetch kernel; SM103 runs the first kernel of the family with
+  the same prefetch up to 1024 tokens and the next-row-prefetch kernel above.
+  From `2C + 64` up a kernel of the family that selects one row per warp runs
+  (1200 tokens on a B200, 1248 on a GB300), on SM103 at `block_m` 8 from `2C`
+  (1184 tokens on a GB300). That kernel ranks the route pairs of its owner
+  CTAs in their own shared memory, except on SM100 at `block_m` 16, where the
+  ranking goes through the cluster peers. `C` is queried once per device and
+  `block_m`, so the rule follows smaller devices and MIG slices
+  (`cake_backend.CAPACITY_ROUTES`, keyed by architecture and `block_m`).
 - Every arm but the small-batch cluster ones (one kernel per token count and
   the 16-CTA two-row-group kernel) is a cooperative persistent launch whose
   grid is bounded by the device SM count (three CTAs per SM on CC 10.0, four
@@ -75,7 +81,7 @@ the expert-aligned route plan consumed by grouped MoE GEMMs in **one launch**:
   clusters the driver reports for the kernel (`cudaOccupancyMaxActiveClusters`,
   queried once per device and program through a small helper linked next to
   the generated binding of exactly the cluster-bounded programs). The 16-CTA
-  clusters of the `num_tokens = 16` kernel and of the 32-token cell's kernel
+  clusters of the `num_tokens = 16` kernel and of the 32-token cell's kernels
   exceed the portable cluster size; the generated program sets the
   non-portable cluster-size attribute on those kernels before launching them,
   and preparation requires the driver to admit at least one such cluster on

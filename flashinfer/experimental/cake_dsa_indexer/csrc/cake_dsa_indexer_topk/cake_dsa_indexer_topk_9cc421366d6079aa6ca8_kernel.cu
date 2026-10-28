@@ -136,6 +136,7 @@ kernel_cake_dsa_indexer_topk_9cc421366d6079aa6ca8(const __grid_constant__ CUtens
             mbarrier_init(smem + 136, 256);
             mbarrier_init(smem + 144, 256);
             mbarrier_init(smem + 152, 256);
+            // --- pipeline 'verdict_pipe' ---
             // verdict_bar: 1 barriers, init_count=8
             mbarrier_init(smem + 160, 8);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
@@ -167,6 +168,7 @@ kernel_cake_dsa_indexer_topk_9cc421366d6079aa6ca8(const __grid_constant__ CUtens
         { // load_q_main
             unsigned int load_q_stage = 0;
             unsigned int _phase_q_empty = 1;
+            unsigned int _phase_verdict_bar = 0;
             if (elect_sync()) {
                 int unit_base_q = 0;
                 unsigned int vphase_q = 0;
@@ -193,8 +195,8 @@ kernel_cake_dsa_indexer_topk_9cc421366d6079aa6ca8(const __grid_constant__ CUtens
                                 load_q_stage += 1;
                                 if (load_q_stage == 2) { load_q_stage = 0; _phase_q_empty ^= 1; }
                                 if (attempt == 0) {
-                                    mbarrier_wait(verdict_bar_addr, vphase_q);
-                                    vphase_q ^= 1;
+                                    mbarrier_wait(verdict_bar_addr, _phase_verdict_bar);
+                                    _phase_verdict_bar ^= 1;
                                     int f = s_fail[0] | s_fail[1] | s_fail[2] | s_fail[3];
                                     if (f == 0) {
                                         break;
@@ -214,6 +216,7 @@ kernel_cake_dsa_indexer_topk_9cc421366d6079aa6ca8(const __grid_constant__ CUtens
         { // load_k_main
             unsigned int load_k_stage = 0;
             unsigned int _phase_k_empty = 1;
+            unsigned int _phase_verdict_bar_1 = 0;
             if (elect_sync()) {
                 int unit_base_k = 0;
                 unsigned int vphase_k = 0;
@@ -305,8 +308,8 @@ kernel_cake_dsa_indexer_topk_9cc421366d6079aa6ca8(const __grid_constant__ CUtens
                                     }
                                 }
                                 if (attempt_1 == 0) {
-                                    mbarrier_wait(verdict_bar_addr, vphase_k);
-                                    vphase_k ^= 1;
+                                    mbarrier_wait(verdict_bar_addr, _phase_verdict_bar_1);
+                                    _phase_verdict_bar_1 ^= 1;
                                     int f_1 = s_fail[0] | s_fail[1] | s_fail[2] | s_fail[3];
                                     if (f_1 == 0) {
                                         break;
@@ -332,6 +335,7 @@ kernel_cake_dsa_indexer_topk_9cc421366d6079aa6ca8(const __grid_constant__ CUtens
             unsigned int _phase_q_full = 0;
             unsigned int _phase_k_full = 0;
             unsigned int _phase_umma_empty = 1;
+            unsigned int _phase_verdict_bar_2 = 0;
             #pragma unroll 1
             for (int seg_2 = 0; seg_2 < num_segments; seg_2++) {
                 int q0_2 = cu_seqlens_q[seg_2];
@@ -450,8 +454,8 @@ kernel_cake_dsa_indexer_topk_9cc421366d6079aa6ca8(const __grid_constant__ CUtens
                             mma_q_stage += 1;
                             if (mma_q_stage == 2) { mma_q_stage = 0; _phase_q_full ^= 1; }
                             if (attempt_2 == 0) {
-                                mbarrier_wait(verdict_bar_addr, vphase_m);
-                                vphase_m ^= 1;
+                                mbarrier_wait(verdict_bar_addr, _phase_verdict_bar_2);
+                                _phase_verdict_bar_2 ^= 1;
                                 int vread_m = 0;
                                 if (lane == 0) {
                                     uint32_t _shared_weak_0;
@@ -504,6 +508,7 @@ kernel_cake_dsa_indexer_topk_9cc421366d6079aa6ca8(const __grid_constant__ CUtens
             unsigned int math_tmem_stage = 0;
             unsigned int math_tmem_phase = 0;
             int unit_base = 0;
+            int verdict_unit = 0;
             int keep_cap = ((top_k + 64) < (cand_cap - 128 * check_period) ? (top_k + 64) : (cand_cap - 128 * check_period));
             int trigger_room = 128 * check_period;
             long long stage_base = (long long)grid_ctas * (long long)(4 * cand_cap);
@@ -511,6 +516,7 @@ kernel_cake_dsa_indexer_topk_9cc421366d6079aa6ca8(const __grid_constant__ CUtens
             pad_u = pad_u << 32 | 4294967295;
             long long split_pad = (long long)pad_u;
             unsigned int _phase_q_full_1 = 0;
+            unsigned int _phase_umma_full = 0;
             #pragma unroll 1
             for (int seg_3 = 0; seg_3 < num_segments; seg_3++) {
                 int q0_3 = cu_seqlens_q[seg_3];
@@ -672,7 +678,7 @@ kernel_cake_dsa_indexer_topk_9cc421366d6079aa6ca8(const __grid_constant__ CUtens
                                 } else {
                                     d_pos += 1;
                                 }
-                                mbarrier_wait(umma_full_addr + (math_tmem_stage) * 8, math_tmem_phase);
+                                mbarrier_wait(umma_full_addr + (math_tmem_stage) * 8, _phase_umma_full);
                                 asm volatile("tcgen05.fence::after_thread_sync;");
                                 float _tmem_load_0[64];
                                 asm volatile(
@@ -766,10 +772,7 @@ kernel_cake_dsa_indexer_topk_9cc421366d6079aa6ca8(const __grid_constant__ CUtens
                                     Cand[slot_1] = (long long)entry_1;
                                 }
                                 math_tmem_stage += 1;
-                                if (math_tmem_stage >= 4) {
-                                    math_tmem_stage -= 4;
-                                    math_tmem_phase ^= 1;
-                                }
+                                if (math_tmem_stage == 4) { math_tmem_stage = 0; _phase_umma_full ^= 1; }
                                 int sample_now = ((ti_2 + 1 == n_s) ? 1 : 0);
                                 int do_check = ((until_check == 0) ? 1 : 0);
                                 do_check = do_check | sample_now;
@@ -1152,6 +1155,7 @@ kernel_cake_dsa_indexer_topk_9cc421366d6079aa6ca8(const __grid_constant__ CUtens
                                 if (elect_sync()) {
                                     mbarrier_arrive(verdict_bar_addr);
                                 }
+                                verdict_unit += 1;
                             }
                             int n_sel = ((top_k) < (c_final) ? (top_k) : (c_final));
                             asm volatile("barrier.sync %0, 128;" :: "r"(1 + wg) : "memory");

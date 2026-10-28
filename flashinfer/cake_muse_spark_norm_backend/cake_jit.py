@@ -6561,7 +6561,134 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_muse_spark_norm_20b424e339bbe5210ad5": {
+    "cake_muse_spark_norm_0b979435de8b4c05214f": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "x",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "parameter",
+                "tokens",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "x_stride",
+            ],
+            [
+                "parameter",
+                "gate_stride",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "threads": 64,
+            "lanes": 8,
+            "rows_per_thread": 4,
+            "width": 128,
+            "pdl": True,
+            "pdl_late": False,
+            "pdl_launch_top": False,
+            "tail": "none",
+            "clobber": True,
+            "x_hint": "none",
+            "g_hint": "none",
+            "y_hint": "none",
+            "packed": True,
+            "cluster": 1,
+            "addr": "i64",
+            "sigmoid": "exp2",
+            "static": None,
+            "tcluster": 1,
+            "g_nc": True,
+            "order": "tokens",
+            "interleave": 1,
+            "tpc": 1,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 1,
+            "interleave": 1,
+            "kind": "tokens_heads",
+            "order": "tokens",
+            "rows_per_cta": 32,
+            "tcluster": 1,
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_0b979435de8b4c05214f",
+        "launch": {
+            "block": (
+                64,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": True,
+        },
+        "library": "cake_muse_spark_norm_0b979435de8b4c05214f",
+        "logical": {
+            "eps": "eps",
+            "gate": "gate",
+            "gate_stride": "gate_stride",
+            "heads": "heads",
+            "tokens": "tokens",
+            "x": "input",
+            "x_stride": "input_stride",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "rmsnorm_sigmoid_gate",
+        "route": "rmsnorm_sigmoid_gate_bf16_pdl",
+        "select_rule": {
+            "kind": "tokens_heads_between",
+            "windows": {
+                "sm_107a": [
+                    [
+                        128,
+                        511,
+                        512,
+                    ],
+                    [
+                        32,
+                        2047,
+                        2048,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_0b9a1a6c1d1c3c614200": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -6631,6 +6758,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "g_nc": True,
             "order": "tokens",
             "interleave": 1,
+            "tpc": 1,
         },
         "ffi_entry": "run",
         "grid_rule": {
@@ -6641,7 +6769,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_cta": 16,
             "tcluster": 1,
         },
-        "kernel_symbol": "kernel_cake_muse_spark_norm_20b424e339bbe5210ad5",
+        "kernel_symbol": "kernel_cake_muse_spark_norm_0b9a1a6c1d1c3c614200",
         "launch": {
             "block": (
                 128,
@@ -6657,7 +6785,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_muse_spark_norm_20b424e339bbe5210ad5",
+        "library": "cake_muse_spark_norm_0b9a1a6c1d1c3c614200",
         "logical": {
             "eps": "eps",
             "gate": "gate",
@@ -6723,394 +6851,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_muse_spark_norm_21dccf5cd73a70753e08": {
-        "arches": [
-            "sm_100a",
-            "sm_103a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "x",
-            ],
-            [
-                "buffer",
-                "gate",
-            ],
-            [
-                "parameter",
-                "tokens",
-            ],
-            [
-                "parameter",
-                "heads",
-            ],
-            [
-                "parameter",
-                "x_stride",
-            ],
-            [
-                "parameter",
-                "gate_stride",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "threads": 128,
-            "lanes": 8,
-            "rows_per_thread": 1,
-            "width": 128,
-            "pdl": True,
-            "pdl_late": True,
-            "pdl_launch_top": False,
-            "tail": "none",
-            "clobber": True,
-            "x_hint": "none",
-            "g_hint": "none",
-            "y_hint": "none",
-            "packed": False,
-            "cluster": 1,
-            "addr": "i64",
-            "sigmoid": "exp2",
-            "static": None,
-            "tcluster": 16,
-            "g_nc": True,
-            "order": "tokens",
-            "interleave": 1,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "cluster": 1,
-            "interleave": 1,
-            "kind": "tokens_heads",
-            "order": "tokens",
-            "rows_per_cta": 16,
-            "tcluster": 16,
-        },
-        "kernel_symbol": "kernel_cake_muse_spark_norm_21dccf5cd73a70753e08",
-        "launch": {
-            "block": (
-                128,
-                1,
-                1,
-            ),
-            "cluster": (
-                16,
-                1,
-                1,
-            ),
-            "cooperative": False,
-            "dynamic_smem_bytes": 0,
-            "use_pdl": True,
-        },
-        "library": "cake_muse_spark_norm_21dccf5cd73a70753e08",
-        "logical": {
-            "eps": "eps",
-            "gate": "gate",
-            "gate_stride": "gate_stride",
-            "heads": "heads",
-            "tokens": "tokens",
-            "x": "input",
-            "x_stride": "input_stride",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "op": "rmsnorm_sigmoid_gate",
-        "route": "rmsnorm_sigmoid_gate_bf16_pdl",
-        "select_rule": {
-            "kind": "tokens_heads_between",
-            "windows": {
-                "sm_100a": [
-                    [
-                        16,
-                        8,
-                        256,
-                    ],
-                ],
-                "sm_103a": [
-                    [
-                        16,
-                        8,
-                        64,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": None,
-    },
-    "cake_muse_spark_norm_39db7b9998130983e8f9": {
-        "arches": [
-            "sm_107a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "x",
-            ],
-            [
-                "buffer",
-                "gate",
-            ],
-            [
-                "parameter",
-                "tokens",
-            ],
-            [
-                "parameter",
-                "heads",
-            ],
-            [
-                "parameter",
-                "x_stride",
-            ],
-            [
-                "parameter",
-                "gate_stride",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "threads": 256,
-            "lanes": 8,
-            "rows_per_thread": 2,
-            "width": 128,
-            "pdl": False,
-            "pdl_late": False,
-            "pdl_launch_top": False,
-            "tail": "clamp",
-            "clobber": True,
-            "x_hint": "none",
-            "g_hint": "none",
-            "y_hint": "none",
-            "packed": False,
-            "cluster": 1,
-            "addr": "i64",
-            "sigmoid": "exp2",
-            "static": None,
-            "tcluster": 1,
-            "g_nc": True,
-            "order": "tokens",
-            "interleave": 1,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "cluster": 1,
-            "interleave": 1,
-            "kind": "tokens_heads",
-            "order": "tokens",
-            "rows_per_cta": 64,
-            "tcluster": 1,
-        },
-        "kernel_symbol": "kernel_cake_muse_spark_norm_39db7b9998130983e8f9",
-        "launch": {
-            "block": (
-                256,
-                1,
-                1,
-            ),
-            "cluster": (
-                1,
-                1,
-                1,
-            ),
-            "cooperative": False,
-            "dynamic_smem_bytes": 0,
-            "use_pdl": False,
-        },
-        "library": "cake_muse_spark_norm_39db7b9998130983e8f9",
-        "logical": {
-            "eps": "eps",
-            "gate": "gate",
-            "gate_stride": "gate_stride",
-            "heads": "heads",
-            "tokens": "tokens",
-            "x": "input",
-            "x_stride": "input_stride",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "op": "rmsnorm_sigmoid_gate",
-        "route": "rmsnorm_sigmoid_gate_bf16",
-        "select_rule": {
-            "kind": "tokens_heads_between",
-            "windows": {
-                "sm_107a": [
-                    [
-                        128,
-                        64,
-                        256,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": None,
-    },
-    "cake_muse_spark_norm_3cd64c9702f99e24eed8": {
-        "arches": [
-            "sm_100a",
-            "sm_103a",
-            "sm_107a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "x",
-            ],
-            [
-                "buffer",
-                "gate",
-            ],
-            [
-                "parameter",
-                "tokens",
-            ],
-            [
-                "parameter",
-                "heads",
-            ],
-            [
-                "parameter",
-                "x_stride",
-            ],
-            [
-                "parameter",
-                "gate_stride",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "threads": 256,
-            "lanes": 32,
-            "rows_per_thread": 1,
-            "width": 128,
-            "pdl": False,
-            "pdl_late": False,
-            "pdl_launch_top": False,
-            "tail": "none",
-            "clobber": True,
-            "x_hint": "none",
-            "g_hint": "none",
-            "y_hint": "none",
-            "packed": False,
-            "cluster": 16,
-            "addr": "i64",
-            "sigmoid": "exp2",
-            "static": None,
-            "tcluster": 1,
-            "g_nc": True,
-            "order": "tokens",
-            "interleave": 1,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "cluster": 16,
-            "interleave": 1,
-            "kind": "tokens_heads",
-            "order": "tokens",
-            "rows_per_cta": 8,
-            "tcluster": 1,
-        },
-        "kernel_symbol": "kernel_cake_muse_spark_norm_3cd64c9702f99e24eed8",
-        "launch": {
-            "block": (
-                256,
-                1,
-                1,
-            ),
-            "cluster": (
-                16,
-                1,
-                1,
-            ),
-            "cooperative": False,
-            "dynamic_smem_bytes": 0,
-            "use_pdl": False,
-        },
-        "library": "cake_muse_spark_norm_3cd64c9702f99e24eed8",
-        "logical": {
-            "eps": "eps",
-            "gate": "gate",
-            "gate_stride": "gate_stride",
-            "heads": "heads",
-            "tokens": "tokens",
-            "x": "input",
-            "x_stride": "input_stride",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "op": "rmsnorm_sigmoid_gate",
-        "route": "rmsnorm_sigmoid_gate_bf16",
-        "select_rule": {
-            "kind": "tokens_heads_between",
-            "windows": {
-                "sm_100a": [
-                    [
-                        128,
-                        0,
-                        8,
-                    ],
-                ],
-                "sm_103a": [
-                    [
-                        128,
-                        0,
-                        8,
-                    ],
-                ],
-                "sm_107a": [
-                    [
-                        128,
-                        1,
-                        2,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": None,
-    },
-    "cake_muse_spark_norm_49015ea91c011bd1740a": {
+    "cake_muse_spark_norm_0e50091274e6013faa20": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -7180,6 +6921,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "g_nc": True,
             "order": "tokens",
             "interleave": 1,
+            "tpc": 1,
         },
         "ffi_entry": "run",
         "grid_rule": {
@@ -7190,7 +6932,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_cta": 8,
             "tcluster": 1,
         },
-        "kernel_symbol": "kernel_cake_muse_spark_norm_49015ea91c011bd1740a",
+        "kernel_symbol": "kernel_cake_muse_spark_norm_0e50091274e6013faa20",
         "launch": {
             "block": (
                 256,
@@ -7206,7 +6948,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": True,
         },
-        "library": "cake_muse_spark_norm_49015ea91c011bd1740a",
+        "library": "cake_muse_spark_norm_0e50091274e6013faa20",
         "logical": {
             "eps": "eps",
             "gate": "gate",
@@ -7252,7 +6994,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_muse_spark_norm_4c2847f766bb9a2330d6": {
+    "cake_muse_spark_norm_1d29611fac2391f74182": {
         "arches": [
             "sm_103a",
             "sm_107a",
@@ -7321,6 +7063,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "g_nc": True,
             "order": "tokens",
             "interleave": 1,
+            "tpc": 1,
         },
         "ffi_entry": "run",
         "grid_rule": {
@@ -7331,7 +7074,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_cta": 32,
             "tcluster": 16,
         },
-        "kernel_symbol": "kernel_cake_muse_spark_norm_4c2847f766bb9a2330d6",
+        "kernel_symbol": "kernel_cake_muse_spark_norm_1d29611fac2391f74182",
         "launch": {
             "block": (
                 256,
@@ -7347,7 +7090,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": True,
         },
-        "library": "cake_muse_spark_norm_4c2847f766bb9a2330d6",
+        "library": "cake_muse_spark_norm_1d29611fac2391f74182",
         "logical": {
             "eps": "eps",
             "gate": "gate",
@@ -7386,1516 +7129,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_muse_spark_norm_5698a0f364604f387ddf": {
-        "arches": [
-            "sm_107a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "x",
-            ],
-            [
-                "buffer",
-                "gate",
-            ],
-            [
-                "parameter",
-                "tokens",
-            ],
-            [
-                "parameter",
-                "heads",
-            ],
-            [
-                "parameter",
-                "x_stride",
-            ],
-            [
-                "parameter",
-                "gate_stride",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "threads": 128,
-            "lanes": 8,
-            "rows_per_thread": 1,
-            "width": 128,
-            "pdl": False,
-            "pdl_late": False,
-            "pdl_launch_top": False,
-            "tail": "none",
-            "clobber": True,
-            "x_hint": "none",
-            "g_hint": "none",
-            "y_hint": "none",
-            "packed": False,
-            "cluster": 1,
-            "addr": "i64",
-            "sigmoid": "exp2",
-            "static": None,
-            "tcluster": 8,
-            "g_nc": True,
-            "order": "tokens",
-            "interleave": 1,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "cluster": 1,
-            "interleave": 1,
-            "kind": "tokens_heads",
-            "order": "tokens",
-            "rows_per_cta": 16,
-            "tcluster": 8,
-        },
-        "kernel_symbol": "kernel_cake_muse_spark_norm_5698a0f364604f387ddf",
-        "launch": {
-            "block": (
-                128,
-                1,
-                1,
-            ),
-            "cluster": (
-                8,
-                1,
-                1,
-            ),
-            "cooperative": False,
-            "dynamic_smem_bytes": 0,
-            "use_pdl": False,
-        },
-        "library": "cake_muse_spark_norm_5698a0f364604f387ddf",
-        "logical": {
-            "eps": "eps",
-            "gate": "gate",
-            "gate_stride": "gate_stride",
-            "heads": "heads",
-            "tokens": "tokens",
-            "x": "input",
-            "x_stride": "input_stride",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "op": "rmsnorm_sigmoid_gate",
-        "route": "rmsnorm_sigmoid_gate_bf16",
-        "select_rule": {
-            "kind": "tokens_heads_between",
-            "windows": {
-                "sm_107a": [
-                    [
-                        32,
-                        64,
-                        256,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": None,
-    },
-    "cake_muse_spark_norm_75b324d65c3bc77cc36b": {
-        "arches": [
-            "sm_100a",
-            "sm_103a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "x",
-            ],
-            [
-                "buffer",
-                "gate",
-            ],
-            [
-                "parameter",
-                "tokens",
-            ],
-            [
-                "parameter",
-                "heads",
-            ],
-            [
-                "parameter",
-                "x_stride",
-            ],
-            [
-                "parameter",
-                "gate_stride",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "threads": 256,
-            "lanes": 8,
-            "rows_per_thread": 1,
-            "width": 128,
-            "pdl": False,
-            "pdl_late": False,
-            "pdl_launch_top": False,
-            "tail": "none",
-            "clobber": True,
-            "x_hint": "none",
-            "g_hint": "none",
-            "y_hint": "none",
-            "packed": False,
-            "cluster": 1,
-            "addr": "i64",
-            "sigmoid": "exp2",
-            "static": None,
-            "tcluster": 1,
-            "g_nc": True,
-            "order": "tokens",
-            "interleave": 1,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "cluster": 1,
-            "interleave": 1,
-            "kind": "tokens_heads",
-            "order": "tokens",
-            "rows_per_cta": 32,
-            "tcluster": 1,
-        },
-        "kernel_symbol": "kernel_cake_muse_spark_norm_75b324d65c3bc77cc36b",
-        "launch": {
-            "block": (
-                256,
-                1,
-                1,
-            ),
-            "cluster": (
-                1,
-                1,
-                1,
-            ),
-            "cooperative": False,
-            "dynamic_smem_bytes": 0,
-            "use_pdl": False,
-        },
-        "library": "cake_muse_spark_norm_75b324d65c3bc77cc36b",
-        "logical": {
-            "eps": "eps",
-            "gate": "gate",
-            "gate_stride": "gate_stride",
-            "heads": "heads",
-            "tokens": "tokens",
-            "x": "input",
-            "x_stride": "input_stride",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "op": "rmsnorm_sigmoid_gate",
-        "route": "rmsnorm_sigmoid_gate_bf16",
-        "select_rule": {
-            "kind": "tokens_heads_between",
-            "routes": {
-                "rmsnorm_sigmoid_gate_bf16_pdl": {"sm_103a": [[32, 1024, 8192]]},
-            },
-            "windows": {
-                "sm_100a": [
-                    [
-                        32,
-                        1024,
-                        None,
-                    ],
-                ],
-                "sm_103a": [
-                    [
-                        32,
-                        1024,
-                        None,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": None,
-    },
-    "cake_muse_spark_norm_94e9c266281fb6f1f23e": {
-        "arches": [
-            "sm_100a",
-            "sm_103a",
-            "sm_107a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "x",
-            ],
-            [
-                "buffer",
-                "gate",
-            ],
-            [
-                "parameter",
-                "tokens",
-            ],
-            [
-                "parameter",
-                "heads",
-            ],
-            [
-                "parameter",
-                "x_stride",
-            ],
-            [
-                "parameter",
-                "gate_stride",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "threads": 128,
-            "lanes": 8,
-            "rows_per_thread": 1,
-            "width": 128,
-            "pdl": False,
-            "pdl_late": False,
-            "pdl_launch_top": False,
-            "tail": "none",
-            "clobber": True,
-            "x_hint": "none",
-            "g_hint": "none",
-            "y_hint": "none",
-            "packed": False,
-            "cluster": 1,
-            "addr": "i64",
-            "sigmoid": "exp2",
-            "static": None,
-            "tcluster": 16,
-            "g_nc": True,
-            "order": "tokens",
-            "interleave": 1,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "cluster": 1,
-            "interleave": 1,
-            "kind": "tokens_heads",
-            "order": "tokens",
-            "rows_per_cta": 16,
-            "tcluster": 16,
-        },
-        "kernel_symbol": "kernel_cake_muse_spark_norm_94e9c266281fb6f1f23e",
-        "launch": {
-            "block": (
-                128,
-                1,
-                1,
-            ),
-            "cluster": (
-                16,
-                1,
-                1,
-            ),
-            "cooperative": False,
-            "dynamic_smem_bytes": 0,
-            "use_pdl": False,
-        },
-        "library": "cake_muse_spark_norm_94e9c266281fb6f1f23e",
-        "logical": {
-            "eps": "eps",
-            "gate": "gate",
-            "gate_stride": "gate_stride",
-            "heads": "heads",
-            "tokens": "tokens",
-            "x": "input",
-            "x_stride": "input_stride",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "op": "rmsnorm_sigmoid_gate",
-        "route": "rmsnorm_sigmoid_gate_bf16",
-        "select_rule": {
-            "kind": "tokens_heads_between",
-            "windows": {
-                "sm_100a": [
-                    [
-                        16,
-                        0,
-                        1024,
-                    ],
-                ],
-                "sm_103a": [
-                    [
-                        16,
-                        0,
-                        1024,
-                    ],
-                ],
-                "sm_107a": [
-                    [
-                        16,
-                        0,
-                        1024,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": None,
-    },
-    "cake_muse_spark_norm_ab406ebf6c070ea32e7a": {
-        "arches": [
-            "sm_100a",
-            "sm_103a",
-            "sm_107a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "x",
-            ],
-            [
-                "buffer",
-                "gate",
-            ],
-            [
-                "parameter",
-                "tokens",
-            ],
-            [
-                "parameter",
-                "heads",
-            ],
-            [
-                "parameter",
-                "x_stride",
-            ],
-            [
-                "parameter",
-                "gate_stride",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "threads": 256,
-            "lanes": 8,
-            "rows_per_thread": 1,
-            "width": 128,
-            "pdl": False,
-            "pdl_late": False,
-            "pdl_launch_top": False,
-            "tail": "none",
-            "clobber": True,
-            "x_hint": "none",
-            "g_hint": "none",
-            "y_hint": "none",
-            "packed": False,
-            "cluster": 1,
-            "addr": "i64",
-            "sigmoid": "exp2",
-            "static": None,
-            "tcluster": 16,
-            "g_nc": True,
-            "order": "tokens",
-            "interleave": 1,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "cluster": 1,
-            "interleave": 1,
-            "kind": "tokens_heads",
-            "order": "tokens",
-            "rows_per_cta": 32,
-            "tcluster": 16,
-        },
-        "kernel_symbol": "kernel_cake_muse_spark_norm_ab406ebf6c070ea32e7a",
-        "launch": {
-            "block": (
-                256,
-                1,
-                1,
-            ),
-            "cluster": (
-                16,
-                1,
-                1,
-            ),
-            "cooperative": False,
-            "dynamic_smem_bytes": 0,
-            "use_pdl": False,
-        },
-        "library": "cake_muse_spark_norm_ab406ebf6c070ea32e7a",
-        "logical": {
-            "eps": "eps",
-            "gate": "gate",
-            "gate_stride": "gate_stride",
-            "heads": "heads",
-            "tokens": "tokens",
-            "x": "input",
-            "x_stride": "input_stride",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "op": "rmsnorm_sigmoid_gate",
-        "route": "rmsnorm_sigmoid_gate_bf16",
-        "select_rule": {
-            "kind": "tokens_heads_between",
-            "windows": {
-                "sm_100a": [
-                    [
-                        128,
-                        8,
-                        256,
-                    ],
-                    [
-                        32,
-                        0,
-                        1024,
-                    ],
-                ],
-                "sm_103a": [
-                    [
-                        128,
-                        8,
-                        256,
-                    ],
-                    [
-                        32,
-                        0,
-                        1024,
-                    ],
-                ],
-                "sm_107a": [
-                    [
-                        32,
-                        0,
-                        9,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": None,
-    },
-    "cake_muse_spark_norm_b9d6ae2cfefaff467cf7": {
-        "arches": [
-            "sm_107a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "x",
-            ],
-            [
-                "buffer",
-                "gate",
-            ],
-            [
-                "parameter",
-                "tokens",
-            ],
-            [
-                "parameter",
-                "heads",
-            ],
-            [
-                "parameter",
-                "x_stride",
-            ],
-            [
-                "parameter",
-                "gate_stride",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "threads": 256,
-            "lanes": 8,
-            "rows_per_thread": 1,
-            "width": 128,
-            "pdl": False,
-            "pdl_late": False,
-            "pdl_launch_top": False,
-            "tail": "none",
-            "clobber": True,
-            "x_hint": "none",
-            "g_hint": "none",
-            "y_hint": "none",
-            "packed": False,
-            "cluster": 1,
-            "addr": "i64",
-            "sigmoid": "exp2",
-            "static": None,
-            "tcluster": 16,
-            "g_nc": True,
-            "order": "heads",
-            "interleave": 1,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "cluster": 1,
-            "interleave": 1,
-            "kind": "tokens_heads",
-            "order": "heads",
-            "rows_per_cta": 32,
-            "tcluster": 16,
-        },
-        "kernel_symbol": "kernel_cake_muse_spark_norm_b9d6ae2cfefaff467cf7",
-        "launch": {
-            "block": (
-                256,
-                1,
-                1,
-            ),
-            "cluster": (
-                1,
-                16,
-                1,
-            ),
-            "cooperative": False,
-            "dynamic_smem_bytes": 0,
-            "use_pdl": False,
-        },
-        "library": "cake_muse_spark_norm_b9d6ae2cfefaff467cf7",
-        "logical": {
-            "eps": "eps",
-            "gate": "gate",
-            "gate_stride": "gate_stride",
-            "heads": "heads",
-            "tokens": "tokens",
-            "x": "input",
-            "x_stride": "input_stride",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "op": "rmsnorm_sigmoid_gate",
-        "route": "rmsnorm_sigmoid_gate_bf16",
-        "select_rule": {
-            "kind": "tokens_heads_between",
-            "windows": {
-                "sm_107a": [
-                    [
-                        128,
-                        8,
-                        64,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": None,
-    },
-    "cake_muse_spark_norm_c2e68308fdb46f236ac4": {
-        "arches": [
-            "sm_100a",
-            "sm_103a",
-            "sm_107a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "x",
-            ],
-            [
-                "buffer",
-                "gate",
-            ],
-            [
-                "parameter",
-                "tokens",
-            ],
-            [
-                "parameter",
-                "heads",
-            ],
-            [
-                "parameter",
-                "x_stride",
-            ],
-            [
-                "parameter",
-                "gate_stride",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "threads": 256,
-            "lanes": 8,
-            "rows_per_thread": 1,
-            "width": 128,
-            "pdl": False,
-            "pdl_late": False,
-            "pdl_launch_top": False,
-            "tail": "none",
-            "clobber": True,
-            "x_hint": "none",
-            "g_hint": "none",
-            "y_hint": "none",
-            "packed": False,
-            "cluster": 1,
-            "addr": "i64",
-            "sigmoid": "exp2",
-            "static": None,
-            "tcluster": 1,
-            "g_nc": True,
-            "order": "heads",
-            "interleave": 1,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "cluster": 1,
-            "interleave": 1,
-            "kind": "tokens_heads",
-            "order": "heads",
-            "rows_per_cta": 32,
-            "tcluster": 1,
-        },
-        "kernel_symbol": "kernel_cake_muse_spark_norm_c2e68308fdb46f236ac4",
-        "launch": {
-            "block": (
-                256,
-                1,
-                1,
-            ),
-            "cluster": (
-                1,
-                1,
-                1,
-            ),
-            "cooperative": False,
-            "dynamic_smem_bytes": 0,
-            "use_pdl": False,
-        },
-        "library": "cake_muse_spark_norm_c2e68308fdb46f236ac4",
-        "logical": {
-            "eps": "eps",
-            "gate": "gate",
-            "gate_stride": "gate_stride",
-            "heads": "heads",
-            "tokens": "tokens",
-            "x": "input",
-            "x_stride": "input_stride",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "op": "rmsnorm_sigmoid_gate",
-        "route": "rmsnorm_sigmoid_gate_bf16",
-        "select_rule": {
-            "kind": "tokens_heads_between",
-            "routes": {
-                "rmsnorm_sigmoid_gate_bf16_pdl": {"sm_103a": [[128, 256, 2048]]},
-            },
-            "windows": {
-                "sm_100a": [
-                    [
-                        128,
-                        256,
-                        None,
-                    ],
-                ],
-                "sm_103a": [
-                    [
-                        128,
-                        256,
-                        None,
-                    ],
-                ],
-                "sm_107a": [
-                    [
-                        128,
-                        256,
-                        383,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": None,
-    },
-    "cake_muse_spark_norm_c7c7921f8495c0384ee7": {
-        "arches": [
-            "sm_100a",
-            "sm_103a",
-            "sm_107a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "x",
-            ],
-            [
-                "buffer",
-                "gate",
-            ],
-            [
-                "parameter",
-                "tokens",
-            ],
-            [
-                "parameter",
-                "heads",
-            ],
-            [
-                "parameter",
-                "x_stride",
-            ],
-            [
-                "parameter",
-                "gate_stride",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "threads": 256,
-            "lanes": 8,
-            "rows_per_thread": 1,
-            "width": 128,
-            "pdl": True,
-            "pdl_late": False,
-            "pdl_launch_top": False,
-            "tail": "none",
-            "clobber": True,
-            "x_hint": "none",
-            "g_hint": "none",
-            "y_hint": "none",
-            "packed": False,
-            "cluster": 1,
-            "addr": "i64",
-            "sigmoid": "exp2",
-            "static": None,
-            "tcluster": 1,
-            "g_nc": True,
-            "order": "heads",
-            "interleave": 1,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "cluster": 1,
-            "interleave": 1,
-            "kind": "tokens_heads",
-            "order": "heads",
-            "rows_per_cta": 32,
-            "tcluster": 1,
-        },
-        "kernel_symbol": "kernel_cake_muse_spark_norm_c7c7921f8495c0384ee7",
-        "launch": {
-            "block": (
-                256,
-                1,
-                1,
-            ),
-            "cluster": (
-                1,
-                1,
-                1,
-            ),
-            "cooperative": False,
-            "dynamic_smem_bytes": 0,
-            "use_pdl": True,
-        },
-        "library": "cake_muse_spark_norm_c7c7921f8495c0384ee7",
-        "logical": {
-            "eps": "eps",
-            "gate": "gate",
-            "gate_stride": "gate_stride",
-            "heads": "heads",
-            "tokens": "tokens",
-            "x": "input",
-            "x_stride": "input_stride",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "op": "rmsnorm_sigmoid_gate",
-        "route": "rmsnorm_sigmoid_gate_bf16_pdl",
-        "select_rule": {
-            "kind": "tokens_heads_between",
-            "windows": {
-                "sm_100a": [
-                    [
-                        128,
-                        256,
-                        None,
-                    ],
-                ],
-                "sm_103a": [
-                    [
-                        128,
-                        2048,
-                        None,
-                    ],
-                ],
-                "sm_107a": [
-                    [
-                        128,
-                        256,
-                        383,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": None,
-    },
-    "cake_muse_spark_norm_fb5857b9f0bbd10ec74b": {
-        "arches": [
-            "sm_100a",
-            "sm_103a",
-            "sm_107a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "x",
-            ],
-            [
-                "buffer",
-                "gate",
-            ],
-            [
-                "parameter",
-                "tokens",
-            ],
-            [
-                "parameter",
-                "heads",
-            ],
-            [
-                "parameter",
-                "x_stride",
-            ],
-            [
-                "parameter",
-                "gate_stride",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "threads": 256,
-            "lanes": 8,
-            "rows_per_thread": 1,
-            "width": 128,
-            "pdl": True,
-            "pdl_late": False,
-            "pdl_launch_top": False,
-            "tail": "none",
-            "clobber": True,
-            "x_hint": "none",
-            "g_hint": "none",
-            "y_hint": "none",
-            "packed": False,
-            "cluster": 1,
-            "addr": "i64",
-            "sigmoid": "exp2",
-            "static": None,
-            "tcluster": 1,
-            "g_nc": True,
-            "order": "tokens",
-            "interleave": 1,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "cluster": 1,
-            "interleave": 1,
-            "kind": "tokens_heads",
-            "order": "tokens",
-            "rows_per_cta": 32,
-            "tcluster": 1,
-        },
-        "kernel_symbol": "kernel_cake_muse_spark_norm_fb5857b9f0bbd10ec74b",
-        "launch": {
-            "block": (
-                256,
-                1,
-                1,
-            ),
-            "cluster": (
-                1,
-                1,
-                1,
-            ),
-            "cooperative": False,
-            "dynamic_smem_bytes": 0,
-            "use_pdl": True,
-        },
-        "library": "cake_muse_spark_norm_fb5857b9f0bbd10ec74b",
-        "logical": {
-            "eps": "eps",
-            "gate": "gate",
-            "gate_stride": "gate_stride",
-            "heads": "heads",
-            "tokens": "tokens",
-            "x": "input",
-            "x_stride": "input_stride",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "op": "rmsnorm_sigmoid_gate",
-        "route": "rmsnorm_sigmoid_gate_bf16_pdl",
-        "select_rule": {
-            "kind": "tokens_heads_between",
-            "windows": {
-                "sm_100a": [
-                    [
-                        32,
-                        1024,
-                        None,
-                    ],
-                ],
-                "sm_103a": [
-                    [
-                        32,
-                        8192,
-                        None,
-                    ],
-                ],
-                "sm_107a": [
-                    [
-                        32,
-                        257,
-                        767,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": None,
-    },
-    "cake_muse_spark_norm_fba020bb2e3b8aaf63f0": {
-        "arches": [
-            "sm_100a",
-            "sm_103a",
-            "sm_107a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "x",
-            ],
-            [
-                "buffer",
-                "gate",
-            ],
-            [
-                "parameter",
-                "tokens",
-            ],
-            [
-                "parameter",
-                "heads",
-            ],
-            [
-                "parameter",
-                "x_stride",
-            ],
-            [
-                "parameter",
-                "gate_stride",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "threads": 128,
-            "lanes": 8,
-            "rows_per_thread": 1,
-            "width": 128,
-            "pdl": True,
-            "pdl_late": False,
-            "pdl_launch_top": False,
-            "tail": "none",
-            "clobber": True,
-            "x_hint": "none",
-            "g_hint": "none",
-            "y_hint": "none",
-            "packed": False,
-            "cluster": 1,
-            "addr": "i64",
-            "sigmoid": "exp2",
-            "static": None,
-            "tcluster": 16,
-            "g_nc": True,
-            "order": "tokens",
-            "interleave": 1,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "cluster": 1,
-            "interleave": 1,
-            "kind": "tokens_heads",
-            "order": "tokens",
-            "rows_per_cta": 16,
-            "tcluster": 16,
-        },
-        "kernel_symbol": "kernel_cake_muse_spark_norm_fba020bb2e3b8aaf63f0",
-        "launch": {
-            "block": (
-                128,
-                1,
-                1,
-            ),
-            "cluster": (
-                16,
-                1,
-                1,
-            ),
-            "cooperative": False,
-            "dynamic_smem_bytes": 0,
-            "use_pdl": True,
-        },
-        "library": "cake_muse_spark_norm_fba020bb2e3b8aaf63f0",
-        "logical": {
-            "eps": "eps",
-            "gate": "gate",
-            "gate_stride": "gate_stride",
-            "heads": "heads",
-            "tokens": "tokens",
-            "x": "input",
-            "x_stride": "input_stride",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "op": "rmsnorm_sigmoid_gate",
-        "route": "rmsnorm_sigmoid_gate_bf16_pdl",
-        "select_rule": {
-            "kind": "tokens_heads_between",
-            "windows": {
-                "sm_100a": [
-                    [
-                        16,
-                        1,
-                        8,
-                    ],
-                    [
-                        16,
-                        256,
-                        1024,
-                    ],
-                ],
-                "sm_103a": [
-                    [
-                        16,
-                        1,
-                        8,
-                    ],
-                    [
-                        16,
-                        64,
-                        1024,
-                    ],
-                ],
-                "sm_107a": [
-                    [
-                        16,
-                        1,
-                        1024,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": None,
-    },
-    "cake_muse_spark_norm_feff5e270b2146886c6c": {
-        "arches": [
-            "sm_100a",
-            "sm_103a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "x",
-            ],
-            [
-                "buffer",
-                "gate",
-            ],
-            [
-                "parameter",
-                "tokens",
-            ],
-            [
-                "parameter",
-                "heads",
-            ],
-            [
-                "parameter",
-                "x_stride",
-            ],
-            [
-                "parameter",
-                "gate_stride",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "threads": 256,
-            "lanes": 8,
-            "rows_per_thread": 1,
-            "width": 128,
-            "pdl": True,
-            "pdl_late": True,
-            "pdl_launch_top": False,
-            "tail": "none",
-            "clobber": True,
-            "x_hint": "none",
-            "g_hint": "none",
-            "y_hint": "none",
-            "packed": False,
-            "cluster": 1,
-            "addr": "i64",
-            "sigmoid": "exp2",
-            "static": None,
-            "tcluster": 16,
-            "g_nc": True,
-            "order": "tokens",
-            "interleave": 1,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "cluster": 1,
-            "interleave": 1,
-            "kind": "tokens_heads",
-            "order": "tokens",
-            "rows_per_cta": 32,
-            "tcluster": 16,
-        },
-        "kernel_symbol": "kernel_cake_muse_spark_norm_feff5e270b2146886c6c",
-        "launch": {
-            "block": (
-                256,
-                1,
-                1,
-            ),
-            "cluster": (
-                16,
-                1,
-                1,
-            ),
-            "cooperative": False,
-            "dynamic_smem_bytes": 0,
-            "use_pdl": True,
-        },
-        "library": "cake_muse_spark_norm_feff5e270b2146886c6c",
-        "logical": {
-            "eps": "eps",
-            "gate": "gate",
-            "gate_stride": "gate_stride",
-            "heads": "heads",
-            "tokens": "tokens",
-            "x": "input",
-            "x_stride": "input_stride",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "op": "rmsnorm_sigmoid_gate",
-        "route": "rmsnorm_sigmoid_gate_bf16_pdl",
-        "select_rule": {
-            "kind": "tokens_heads_between",
-            "windows": {
-                "sm_100a": [
-                    [
-                        128,
-                        8,
-                        16,
-                    ],
-                    [
-                        128,
-                        64,
-                        256,
-                    ],
-                    [
-                        32,
-                        1,
-                        64,
-                    ],
-                    [
-                        32,
-                        128,
-                        192,
-                    ],
-                    [
-                        32,
-                        257,
-                        1024,
-                    ],
-                ],
-                "sm_103a": [
-                    [
-                        128,
-                        64,
-                        256,
-                    ],
-                    [
-                        32,
-                        8,
-                        64,
-                    ],
-                    [
-                        32,
-                        128,
-                        192,
-                    ],
-                    [
-                        32,
-                        256,
-                        1024,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": None,
-    },
-    "cake_muse_spark_norm_2521f234c1e0fc6b9599": {
-        "arches": [
-            "sm_107a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "x",
-            ],
-            [
-                "buffer",
-                "gate",
-            ],
-            [
-                "parameter",
-                "tokens",
-            ],
-            [
-                "parameter",
-                "heads",
-            ],
-            [
-                "parameter",
-                "x_stride",
-            ],
-            [
-                "parameter",
-                "gate_stride",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "threads": 256,
-            "lanes": 8,
-            "rows_per_thread": 4,
-            "width": 128,
-            "pdl": True,
-            "pdl_late": False,
-            "pdl_launch_top": False,
-            "tail": "none",
-            "clobber": True,
-            "x_hint": "none",
-            "g_hint": "none",
-            "y_hint": "none",
-            "packed": True,
-            "cluster": 1,
-            "addr": "i64",
-            "sigmoid": "exp2",
-            "static": None,
-            "tcluster": 1,
-            "g_nc": True,
-            "order": "tokens",
-            "interleave": 1,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "cluster": 1,
-            "interleave": 1,
-            "kind": "tokens_heads",
-            "order": "tokens",
-            "rows_per_cta": 128,
-            "tcluster": 1,
-        },
-        "kernel_symbol": "kernel_cake_muse_spark_norm_2521f234c1e0fc6b9599",
-        "launch": {
-            "block": (
-                256,
-                1,
-                1,
-            ),
-            "cluster": (
-                1,
-                1,
-                1,
-            ),
-            "cooperative": False,
-            "dynamic_smem_bytes": 0,
-            "use_pdl": True,
-        },
-        "library": "cake_muse_spark_norm_2521f234c1e0fc6b9599",
-        "logical": {
-            "eps": "eps",
-            "gate": "gate",
-            "gate_stride": "gate_stride",
-            "heads": "heads",
-            "tokens": "tokens",
-            "x": "input",
-            "x_stride": "input_stride",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "op": "rmsnorm_sigmoid_gate",
-        "route": "rmsnorm_sigmoid_gate_bf16_pdl",
-        "select_rule": {
-            "kind": "tokens_heads_between",
-            "windows": {
-                "sm_107a": [
-                    [
-                        128,
-                        383,
-                        511,
-                    ],
-                    [
-                        128,
-                        2560,
-                        None,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": None,
-    },
-    "cake_muse_spark_norm_293cf74593c85cb92113": {
+    "cake_muse_spark_norm_20723bd85c3bbf3e0ba1": {
         "arches": [
             "sm_107a",
         ],
@@ -8946,7 +7180,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "lanes": 8,
             "rows_per_thread": 2,
             "width": 128,
-            "pdl": True,
+            "pdl": False,
             "pdl_late": False,
             "pdl_launch_top": False,
             "tail": "clamp",
@@ -8963,6 +7197,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "g_nc": True,
             "order": "tokens",
             "interleave": 1,
+            "tpc": 1,
         },
         "ffi_entry": "run",
         "grid_rule": {
@@ -8973,7 +7208,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_cta": 64,
             "tcluster": 1,
         },
-        "kernel_symbol": "kernel_cake_muse_spark_norm_293cf74593c85cb92113",
+        "kernel_symbol": "kernel_cake_muse_spark_norm_20723bd85c3bbf3e0ba1",
         "launch": {
             "block": (
                 256,
@@ -8987,9 +7222,9 @@ MODULES: dict[str, dict[str, Any]] = {
             ),
             "cooperative": False,
             "dynamic_smem_bytes": 0,
-            "use_pdl": True,
+            "use_pdl": False,
         },
-        "library": "cake_muse_spark_norm_293cf74593c85cb92113",
+        "library": "cake_muse_spark_norm_20723bd85c3bbf3e0ba1",
         "logical": {
             "eps": "eps",
             "gate": "gate",
@@ -9001,7 +7236,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "occupancy_entry": "max_active_clusters",
         "op": "rmsnorm_sigmoid_gate",
-        "route": "rmsnorm_sigmoid_gate_bf16_pdl",
+        "route": "rmsnorm_sigmoid_gate_bf16",
         "select_rule": {
             "kind": "tokens_heads_between",
             "windows": {
@@ -9016,7 +7251,155 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_muse_spark_norm_4f82e90b4819f5daf019": {
+    "cake_muse_spark_norm_2206e897092d7ba2b069": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "x",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "parameter",
+                "tokens",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "x_stride",
+            ],
+            [
+                "parameter",
+                "gate_stride",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "threads": 256,
+            "lanes": 8,
+            "rows_per_thread": 1,
+            "width": 128,
+            "pdl": False,
+            "pdl_late": False,
+            "pdl_launch_top": False,
+            "tail": "none",
+            "clobber": True,
+            "x_hint": "none",
+            "g_hint": "none",
+            "y_hint": "none",
+            "packed": False,
+            "cluster": 1,
+            "addr": "i64",
+            "sigmoid": "exp2",
+            "static": None,
+            "tcluster": 16,
+            "g_nc": True,
+            "order": "tokens",
+            "interleave": 1,
+            "tpc": 1,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 1,
+            "interleave": 1,
+            "kind": "tokens_heads",
+            "order": "tokens",
+            "rows_per_cta": 32,
+            "tcluster": 16,
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_2206e897092d7ba2b069",
+        "launch": {
+            "block": (
+                256,
+                1,
+                1,
+            ),
+            "cluster": (
+                16,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_muse_spark_norm_2206e897092d7ba2b069",
+        "logical": {
+            "eps": "eps",
+            "gate": "gate",
+            "gate_stride": "gate_stride",
+            "heads": "heads",
+            "tokens": "tokens",
+            "x": "input",
+            "x_stride": "input_stride",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "rmsnorm_sigmoid_gate",
+        "route": "rmsnorm_sigmoid_gate_bf16",
+        "select_rule": {
+            "kind": "tokens_heads_between",
+            "windows": {
+                "sm_100a": [
+                    [
+                        128,
+                        8,
+                        256,
+                    ],
+                    [
+                        32,
+                        0,
+                        1024,
+                    ],
+                ],
+                "sm_103a": [
+                    [
+                        128,
+                        8,
+                        256,
+                    ],
+                    [
+                        32,
+                        0,
+                        1024,
+                    ],
+                ],
+                "sm_107a": [
+                    [
+                        32,
+                        0,
+                        9,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_25a7f9c3f3bc6d00fda4": {
         "arches": [
             "sm_107a",
         ],
@@ -9064,9 +7447,9 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "build": {
             "threads": 128,
-            "lanes": 8,
+            "lanes": 4,
             "rows_per_thread": 2,
-            "width": 128,
+            "width": 256,
             "pdl": False,
             "pdl_late": False,
             "pdl_launch_top": False,
@@ -9080,10 +7463,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "addr": "i64",
             "sigmoid": "exp2",
             "static": None,
-            "tcluster": 16,
+            "tcluster": 1,
             "g_nc": True,
             "order": "tokens",
             "interleave": 1,
+            "tpc": 4,
         },
         "ffi_entry": "run",
         "grid_rule": {
@@ -9091,10 +7475,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "interleave": 1,
             "kind": "tokens_heads",
             "order": "tokens",
-            "rows_per_cta": 32,
-            "tcluster": 16,
+            "rows_per_cta": 64,
+            "tcluster": 1,
+            "tpc": 4,
         },
-        "kernel_symbol": "kernel_cake_muse_spark_norm_4f82e90b4819f5daf019",
+        "kernel_symbol": "kernel_cake_muse_spark_norm_25a7f9c3f3bc6d00fda4",
         "launch": {
             "block": (
                 128,
@@ -9102,127 +7487,6 @@ MODULES: dict[str, dict[str, Any]] = {
                 1,
             ),
             "cluster": (
-                16,
-                1,
-                1,
-            ),
-            "cooperative": False,
-            "dynamic_smem_bytes": 0,
-            "use_pdl": False,
-        },
-        "library": "cake_muse_spark_norm_4f82e90b4819f5daf019",
-        "logical": {
-            "eps": "eps",
-            "gate": "gate",
-            "gate_stride": "gate_stride",
-            "heads": "heads",
-            "tokens": "tokens",
-            "x": "input",
-            "x_stride": "input_stride",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "op": "rmsnorm_sigmoid_gate",
-        "route": "rmsnorm_sigmoid_gate_bf16",
-        "select_rule": {
-            "kind": "tokens_heads_between",
-            "windows": {
-                "sm_107a": [
-                    [
-                        32,
-                        767,
-                        2047,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": None,
-    },
-    "cake_muse_spark_norm_65359794baed7e3e4bc9": {
-        "arches": [
-            "sm_107a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "x",
-            ],
-            [
-                "buffer",
-                "gate",
-            ],
-            [
-                "parameter",
-                "tokens",
-            ],
-            [
-                "parameter",
-                "heads",
-            ],
-            [
-                "parameter",
-                "x_stride",
-            ],
-            [
-                "parameter",
-                "gate_stride",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "threads": 64,
-            "lanes": 8,
-            "rows_per_thread": 4,
-            "width": 128,
-            "pdl": False,
-            "pdl_late": False,
-            "pdl_launch_top": False,
-            "tail": "none",
-            "clobber": True,
-            "x_hint": "none",
-            "g_hint": "none",
-            "y_hint": "none",
-            "packed": True,
-            "cluster": 1,
-            "addr": "i64",
-            "sigmoid": "exp2",
-            "static": None,
-            "tcluster": 1,
-            "g_nc": True,
-            "order": "tokens",
-            "interleave": 1,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "cluster": 1,
-            "interleave": 1,
-            "kind": "tokens_heads",
-            "order": "tokens",
-            "rows_per_cta": 32,
-            "tcluster": 1,
-        },
-        "kernel_symbol": "kernel_cake_muse_spark_norm_65359794baed7e3e4bc9",
-        "launch": {
-            "block": (
-                64,
-                1,
-                1,
-            ),
-            "cluster": (
                 1,
                 1,
                 1,
@@ -9231,7 +7495,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_muse_spark_norm_65359794baed7e3e4bc9",
+        "library": "cake_muse_spark_norm_25a7f9c3f3bc6d00fda4",
         "logical": {
             "eps": "eps",
             "gate": "gate",
@@ -9250,14 +7514,9 @@ MODULES: dict[str, dict[str, Any]] = {
                 "rmsnorm_sigmoid_gate_bf16_pdl": {
                     "sm_107a": [
                         [
-                            128,
-                            512,
-                            2560,
-                        ],
-                        [
-                            32,
-                            2048,
-                            None,
+                            16,
+                            12287,
+                            32767,
                         ],
                     ],
                 },
@@ -9265,13 +7524,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "windows": {
                 "sm_107a": [
                     [
-                        128,
-                        511,
-                        2560,
-                    ],
-                    [
-                        32,
-                        2047,
+                        16,
+                        8191,
                         None,
                     ],
                 ],
@@ -9279,7 +7533,394 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_muse_spark_norm_7adf8d9bb6ed90fcfff4": {
+    "cake_muse_spark_norm_37ea5413e1d3e395761f": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "x",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "parameter",
+                "tokens",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "x_stride",
+            ],
+            [
+                "parameter",
+                "gate_stride",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "threads": 256,
+            "lanes": 8,
+            "rows_per_thread": 2,
+            "width": 128,
+            "pdl": True,
+            "pdl_late": False,
+            "pdl_launch_top": False,
+            "tail": "clamp",
+            "clobber": True,
+            "x_hint": "none",
+            "g_hint": "none",
+            "y_hint": "none",
+            "packed": False,
+            "cluster": 1,
+            "addr": "i64",
+            "sigmoid": "exp2",
+            "static": None,
+            "tcluster": 1,
+            "g_nc": True,
+            "order": "tokens",
+            "interleave": 1,
+            "tpc": 1,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 1,
+            "interleave": 1,
+            "kind": "tokens_heads",
+            "order": "tokens",
+            "rows_per_cta": 64,
+            "tcluster": 1,
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_37ea5413e1d3e395761f",
+        "launch": {
+            "block": (
+                256,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": True,
+        },
+        "library": "cake_muse_spark_norm_37ea5413e1d3e395761f",
+        "logical": {
+            "eps": "eps",
+            "gate": "gate",
+            "gate_stride": "gate_stride",
+            "heads": "heads",
+            "tokens": "tokens",
+            "x": "input",
+            "x_stride": "input_stride",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "rmsnorm_sigmoid_gate",
+        "route": "rmsnorm_sigmoid_gate_bf16_pdl",
+        "select_rule": {
+            "kind": "tokens_heads_between",
+            "windows": {
+                "sm_107a": [
+                    [
+                        128,
+                        64,
+                        256,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_402f58bba74e553f32f7": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "x",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "parameter",
+                "tokens",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "x_stride",
+            ],
+            [
+                "parameter",
+                "gate_stride",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "threads": 128,
+            "lanes": 8,
+            "rows_per_thread": 1,
+            "width": 128,
+            "pdl": True,
+            "pdl_late": False,
+            "pdl_launch_top": False,
+            "tail": "none",
+            "clobber": True,
+            "x_hint": "none",
+            "g_hint": "none",
+            "y_hint": "none",
+            "packed": False,
+            "cluster": 1,
+            "addr": "i64",
+            "sigmoid": "exp2",
+            "static": None,
+            "tcluster": 1,
+            "g_nc": True,
+            "order": "tokens",
+            "interleave": 1,
+            "tpc": 1,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 1,
+            "interleave": 1,
+            "kind": "tokens_heads",
+            "order": "tokens",
+            "rows_per_cta": 16,
+            "tcluster": 1,
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_402f58bba74e553f32f7",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": True,
+        },
+        "library": "cake_muse_spark_norm_402f58bba74e553f32f7",
+        "logical": {
+            "eps": "eps",
+            "gate": "gate",
+            "gate_stride": "gate_stride",
+            "heads": "heads",
+            "tokens": "tokens",
+            "x": "input",
+            "x_stride": "input_stride",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "rmsnorm_sigmoid_gate",
+        "route": "rmsnorm_sigmoid_gate_bf16_pdl",
+        "select_rule": {
+            "kind": "tokens_heads_between",
+            "windows": {
+                "sm_107a": [
+                    [
+                        128,
+                        8,
+                        24,
+                    ],
+                    [
+                        32,
+                        9,
+                        12,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_455dd018e9c2b6f6ffeb": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "x",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "parameter",
+                "tokens",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "x_stride",
+            ],
+            [
+                "parameter",
+                "gate_stride",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "threads": 128,
+            "lanes": 8,
+            "rows_per_thread": 1,
+            "width": 128,
+            "pdl": False,
+            "pdl_late": False,
+            "pdl_launch_top": False,
+            "tail": "none",
+            "clobber": True,
+            "x_hint": "none",
+            "g_hint": "none",
+            "y_hint": "none",
+            "packed": False,
+            "cluster": 1,
+            "addr": "i64",
+            "sigmoid": "exp2",
+            "static": None,
+            "tcluster": 16,
+            "g_nc": True,
+            "order": "tokens",
+            "interleave": 1,
+            "tpc": 1,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 1,
+            "interleave": 1,
+            "kind": "tokens_heads",
+            "order": "tokens",
+            "rows_per_cta": 16,
+            "tcluster": 16,
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_455dd018e9c2b6f6ffeb",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                16,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_muse_spark_norm_455dd018e9c2b6f6ffeb",
+        "logical": {
+            "eps": "eps",
+            "gate": "gate",
+            "gate_stride": "gate_stride",
+            "heads": "heads",
+            "tokens": "tokens",
+            "x": "input",
+            "x_stride": "input_stride",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "rmsnorm_sigmoid_gate",
+        "route": "rmsnorm_sigmoid_gate_bf16",
+        "select_rule": {
+            "kind": "tokens_heads_between",
+            "windows": {
+                "sm_100a": [
+                    [
+                        16,
+                        0,
+                        1024,
+                    ],
+                ],
+                "sm_103a": [
+                    [
+                        16,
+                        0,
+                        1024,
+                    ],
+                ],
+                "sm_107a": [
+                    [
+                        16,
+                        0,
+                        1024,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_4dffe3ae22bb749cbf54": {
         "arches": [
             "sm_107a",
         ],
@@ -9347,6 +7988,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "g_nc": True,
             "order": "tokens",
             "interleave": 1,
+            "tpc": 1,
         },
         "ffi_entry": "run",
         "grid_rule": {
@@ -9357,7 +7999,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_cta": 32,
             "tcluster": 16,
         },
-        "kernel_symbol": "kernel_cake_muse_spark_norm_7adf8d9bb6ed90fcfff4",
+        "kernel_symbol": "kernel_cake_muse_spark_norm_4dffe3ae22bb749cbf54",
         "launch": {
             "block": (
                 128,
@@ -9373,7 +8015,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": True,
         },
-        "library": "cake_muse_spark_norm_7adf8d9bb6ed90fcfff4",
+        "library": "cake_muse_spark_norm_4dffe3ae22bb749cbf54",
         "logical": {
             "eps": "eps",
             "gate": "gate",
@@ -9400,135 +8042,10 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_muse_spark_norm_92b5ec4d44467dae88ff": {
+    "cake_muse_spark_norm_4f35be1b624190afed66": {
         "arches": [
-            "sm_107a",
-        ],
-        "arg_plan": [
-            [
-                "buffer",
-                "x",
-            ],
-            [
-                "buffer",
-                "gate",
-            ],
-            [
-                "parameter",
-                "tokens",
-            ],
-            [
-                "parameter",
-                "heads",
-            ],
-            [
-                "parameter",
-                "x_stride",
-            ],
-            [
-                "parameter",
-                "gate_stride",
-            ],
-            [
-                "parameter",
-                "eps",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "build": {
-            "threads": 64,
-            "lanes": 8,
-            "rows_per_thread": 4,
-            "width": 128,
-            "pdl": True,
-            "pdl_late": False,
-            "pdl_launch_top": False,
-            "tail": "none",
-            "clobber": True,
-            "x_hint": "none",
-            "g_hint": "none",
-            "y_hint": "none",
-            "packed": True,
-            "cluster": 1,
-            "addr": "i64",
-            "sigmoid": "exp2",
-            "static": None,
-            "tcluster": 1,
-            "g_nc": True,
-            "order": "tokens",
-            "interleave": 1,
-        },
-        "ffi_entry": "run",
-        "grid_rule": {
-            "cluster": 1,
-            "interleave": 1,
-            "kind": "tokens_heads",
-            "order": "tokens",
-            "rows_per_cta": 32,
-            "tcluster": 1,
-        },
-        "kernel_symbol": "kernel_cake_muse_spark_norm_92b5ec4d44467dae88ff",
-        "launch": {
-            "block": (
-                64,
-                1,
-                1,
-            ),
-            "cluster": (
-                1,
-                1,
-                1,
-            ),
-            "cooperative": False,
-            "dynamic_smem_bytes": 0,
-            "use_pdl": True,
-        },
-        "library": "cake_muse_spark_norm_92b5ec4d44467dae88ff",
-        "logical": {
-            "eps": "eps",
-            "gate": "gate",
-            "gate_stride": "gate_stride",
-            "heads": "heads",
-            "tokens": "tokens",
-            "x": "input",
-            "x_stride": "input_stride",
-        },
-        "occupancy_entry": "max_active_clusters",
-        "op": "rmsnorm_sigmoid_gate",
-        "route": "rmsnorm_sigmoid_gate_bf16_pdl",
-        "select_rule": {
-            "kind": "tokens_heads_between",
-            "windows": {
-                "sm_107a": [
-                    [
-                        128,
-                        511,
-                        512,
-                    ],
-                    [
-                        32,
-                        2047,
-                        2048,
-                    ],
-                ],
-            },
-        },
-        "workspace_rule": None,
-    },
-    "cake_muse_spark_norm_975fa1305148fe1b7d25": {
-        "arches": [
-            "sm_107a",
+            "sm_100a",
+            "sm_103a",
         ],
         "arg_plan": [
             [
@@ -9575,25 +8092,26 @@ MODULES: dict[str, dict[str, Any]] = {
         "build": {
             "threads": 256,
             "lanes": 8,
-            "rows_per_thread": 4,
+            "rows_per_thread": 1,
             "width": 128,
-            "pdl": False,
-            "pdl_late": False,
+            "pdl": True,
+            "pdl_late": True,
             "pdl_launch_top": False,
             "tail": "none",
             "clobber": True,
             "x_hint": "none",
             "g_hint": "none",
             "y_hint": "none",
-            "packed": True,
+            "packed": False,
             "cluster": 1,
             "addr": "i64",
             "sigmoid": "exp2",
             "static": None,
-            "tcluster": 1,
+            "tcluster": 16,
             "g_nc": True,
             "order": "tokens",
             "interleave": 1,
+            "tpc": 1,
         },
         "ffi_entry": "run",
         "grid_rule": {
@@ -9601,10 +8119,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "interleave": 1,
             "kind": "tokens_heads",
             "order": "tokens",
-            "rows_per_cta": 128,
-            "tcluster": 1,
+            "rows_per_cta": 32,
+            "tcluster": 16,
         },
-        "kernel_symbol": "kernel_cake_muse_spark_norm_975fa1305148fe1b7d25",
+        "kernel_symbol": "kernel_cake_muse_spark_norm_4f35be1b624190afed66",
         "launch": {
             "block": (
                 256,
@@ -9612,15 +8130,15 @@ MODULES: dict[str, dict[str, Any]] = {
                 1,
             ),
             "cluster": (
-                1,
+                16,
                 1,
                 1,
             ),
             "cooperative": False,
             "dynamic_smem_bytes": 0,
-            "use_pdl": False,
+            "use_pdl": True,
         },
-        "library": "cake_muse_spark_norm_975fa1305148fe1b7d25",
+        "library": "cake_muse_spark_norm_4f35be1b624190afed66",
         "logical": {
             "eps": "eps",
             "gate": "gate",
@@ -9632,27 +8150,64 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "occupancy_entry": "max_active_clusters",
         "op": "rmsnorm_sigmoid_gate",
-        "route": "rmsnorm_sigmoid_gate_bf16",
+        "route": "rmsnorm_sigmoid_gate_bf16_pdl",
         "select_rule": {
             "kind": "tokens_heads_between",
             "windows": {
-                "sm_107a": [
+                "sm_100a": [
                     [
                         128,
-                        383,
-                        511,
+                        8,
+                        16,
                     ],
                     [
                         128,
-                        2560,
-                        None,
+                        64,
+                        256,
+                    ],
+                    [
+                        32,
+                        1,
+                        64,
+                    ],
+                    [
+                        32,
+                        128,
+                        192,
+                    ],
+                    [
+                        32,
+                        257,
+                        1024,
+                    ],
+                ],
+                "sm_103a": [
+                    [
+                        128,
+                        64,
+                        256,
+                    ],
+                    [
+                        32,
+                        8,
+                        64,
+                    ],
+                    [
+                        32,
+                        128,
+                        192,
+                    ],
+                    [
+                        32,
+                        256,
+                        1024,
                     ],
                 ],
             },
         },
         "workspace_rule": None,
     },
-    "cake_muse_spark_norm_a91a924b3947a3daac51": {
+    "cake_muse_spark_norm_52fa7700c74897e3d56b": {
         "arches": [
             "sm_107a",
         ],
@@ -9720,6 +8275,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "g_nc": True,
             "order": "tokens",
             "interleave": 1,
+            "tpc": 1,
         },
         "ffi_entry": "run",
         "grid_rule": {
@@ -9730,7 +8286,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "rows_per_cta": 16,
             "tcluster": 1,
         },
-        "kernel_symbol": "kernel_cake_muse_spark_norm_a91a924b3947a3daac51",
+        "kernel_symbol": "kernel_cake_muse_spark_norm_52fa7700c74897e3d56b",
         "launch": {
             "block": (
                 64,
@@ -9746,7 +8302,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_muse_spark_norm_a91a924b3947a3daac51",
+        "library": "cake_muse_spark_norm_52fa7700c74897e3d56b",
         "logical": {
             "eps": "eps",
             "gate": "gate",
@@ -9767,7 +8323,7 @@ MODULES: dict[str, dict[str, Any]] = {
                         [
                             16,
                             2047,
-                            None,
+                            6143,
                         ],
                     ],
                 },
@@ -9777,6 +8333,1884 @@ MODULES: dict[str, dict[str, Any]] = {
                     [
                         16,
                         2047,
+                        8191,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_5cf73e7885cf18f1c89a": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "x",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "parameter",
+                "tokens",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "x_stride",
+            ],
+            [
+                "parameter",
+                "gate_stride",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "threads": 128,
+            "lanes": 8,
+            "rows_per_thread": 1,
+            "width": 128,
+            "pdl": False,
+            "pdl_late": False,
+            "pdl_launch_top": False,
+            "tail": "none",
+            "clobber": True,
+            "x_hint": "none",
+            "g_hint": "none",
+            "y_hint": "none",
+            "packed": False,
+            "cluster": 1,
+            "addr": "i64",
+            "sigmoid": "exp2",
+            "static": None,
+            "tcluster": 8,
+            "g_nc": True,
+            "order": "tokens",
+            "interleave": 1,
+            "tpc": 1,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 1,
+            "interleave": 1,
+            "kind": "tokens_heads",
+            "order": "tokens",
+            "rows_per_cta": 16,
+            "tcluster": 8,
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_5cf73e7885cf18f1c89a",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                8,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_muse_spark_norm_5cf73e7885cf18f1c89a",
+        "logical": {
+            "eps": "eps",
+            "gate": "gate",
+            "gate_stride": "gate_stride",
+            "heads": "heads",
+            "tokens": "tokens",
+            "x": "input",
+            "x_stride": "input_stride",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "rmsnorm_sigmoid_gate",
+        "route": "rmsnorm_sigmoid_gate_bf16",
+        "select_rule": {
+            "kind": "tokens_heads_between",
+            "windows": {
+                "sm_107a": [
+                    [
+                        32,
+                        64,
+                        256,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_73cdd3ec3d059d8e95a9": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "x",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "parameter",
+                "tokens",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "x_stride",
+            ],
+            [
+                "parameter",
+                "gate_stride",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "threads": 256,
+            "lanes": 8,
+            "rows_per_thread": 1,
+            "width": 128,
+            "pdl": False,
+            "pdl_late": False,
+            "pdl_launch_top": False,
+            "tail": "none",
+            "clobber": True,
+            "x_hint": "none",
+            "g_hint": "none",
+            "y_hint": "none",
+            "packed": False,
+            "cluster": 1,
+            "addr": "i64",
+            "sigmoid": "exp2",
+            "static": None,
+            "tcluster": 16,
+            "g_nc": True,
+            "order": "heads",
+            "interleave": 1,
+            "tpc": 1,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 1,
+            "interleave": 1,
+            "kind": "tokens_heads",
+            "order": "heads",
+            "rows_per_cta": 32,
+            "tcluster": 16,
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_73cdd3ec3d059d8e95a9",
+        "launch": {
+            "block": (
+                256,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                16,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_muse_spark_norm_73cdd3ec3d059d8e95a9",
+        "logical": {
+            "eps": "eps",
+            "gate": "gate",
+            "gate_stride": "gate_stride",
+            "heads": "heads",
+            "tokens": "tokens",
+            "x": "input",
+            "x_stride": "input_stride",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "rmsnorm_sigmoid_gate",
+        "route": "rmsnorm_sigmoid_gate_bf16",
+        "select_rule": {
+            "kind": "tokens_heads_between",
+            "windows": {
+                "sm_107a": [
+                    [
+                        128,
+                        8,
+                        64,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_7c0cd927f0f3fea9f941": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "x",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "parameter",
+                "tokens",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "x_stride",
+            ],
+            [
+                "parameter",
+                "gate_stride",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "threads": 128,
+            "lanes": 8,
+            "rows_per_thread": 1,
+            "width": 128,
+            "pdl": True,
+            "pdl_late": True,
+            "pdl_launch_top": False,
+            "tail": "none",
+            "clobber": True,
+            "x_hint": "none",
+            "g_hint": "none",
+            "y_hint": "none",
+            "packed": False,
+            "cluster": 1,
+            "addr": "i64",
+            "sigmoid": "exp2",
+            "static": None,
+            "tcluster": 16,
+            "g_nc": True,
+            "order": "tokens",
+            "interleave": 1,
+            "tpc": 1,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 1,
+            "interleave": 1,
+            "kind": "tokens_heads",
+            "order": "tokens",
+            "rows_per_cta": 16,
+            "tcluster": 16,
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_7c0cd927f0f3fea9f941",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                16,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": True,
+        },
+        "library": "cake_muse_spark_norm_7c0cd927f0f3fea9f941",
+        "logical": {
+            "eps": "eps",
+            "gate": "gate",
+            "gate_stride": "gate_stride",
+            "heads": "heads",
+            "tokens": "tokens",
+            "x": "input",
+            "x_stride": "input_stride",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "rmsnorm_sigmoid_gate",
+        "route": "rmsnorm_sigmoid_gate_bf16_pdl",
+        "select_rule": {
+            "kind": "tokens_heads_between",
+            "windows": {
+                "sm_100a": [
+                    [
+                        16,
+                        8,
+                        256,
+                    ],
+                ],
+                "sm_103a": [
+                    [
+                        16,
+                        8,
+                        64,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_8e6e989e8e2bab5d8163": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "x",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "parameter",
+                "tokens",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "x_stride",
+            ],
+            [
+                "parameter",
+                "gate_stride",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "threads": 256,
+            "lanes": 8,
+            "rows_per_thread": 1,
+            "width": 128,
+            "pdl": True,
+            "pdl_late": False,
+            "pdl_launch_top": False,
+            "tail": "none",
+            "clobber": True,
+            "x_hint": "none",
+            "g_hint": "none",
+            "y_hint": "none",
+            "packed": False,
+            "cluster": 1,
+            "addr": "i64",
+            "sigmoid": "exp2",
+            "static": None,
+            "tcluster": 1,
+            "g_nc": True,
+            "order": "heads",
+            "interleave": 1,
+            "tpc": 1,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 1,
+            "interleave": 1,
+            "kind": "tokens_heads",
+            "order": "heads",
+            "rows_per_cta": 32,
+            "tcluster": 1,
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_8e6e989e8e2bab5d8163",
+        "launch": {
+            "block": (
+                256,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": True,
+        },
+        "library": "cake_muse_spark_norm_8e6e989e8e2bab5d8163",
+        "logical": {
+            "eps": "eps",
+            "gate": "gate",
+            "gate_stride": "gate_stride",
+            "heads": "heads",
+            "tokens": "tokens",
+            "x": "input",
+            "x_stride": "input_stride",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "rmsnorm_sigmoid_gate",
+        "route": "rmsnorm_sigmoid_gate_bf16_pdl",
+        "select_rule": {
+            "kind": "tokens_heads_between",
+            "windows": {
+                "sm_100a": [
+                    [
+                        128,
+                        256,
+                        None,
+                    ],
+                ],
+                "sm_103a": [
+                    [
+                        128,
+                        2048,
+                        None,
+                    ],
+                ],
+                "sm_107a": [
+                    [
+                        128,
+                        256,
+                        383,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_94dab509c0a287b9d339": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "x",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "parameter",
+                "tokens",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "x_stride",
+            ],
+            [
+                "parameter",
+                "gate_stride",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "threads": 256,
+            "lanes": 8,
+            "rows_per_thread": 1,
+            "width": 128,
+            "pdl": False,
+            "pdl_late": False,
+            "pdl_launch_top": False,
+            "tail": "none",
+            "clobber": True,
+            "x_hint": "none",
+            "g_hint": "none",
+            "y_hint": "none",
+            "packed": False,
+            "cluster": 1,
+            "addr": "i64",
+            "sigmoid": "exp2",
+            "static": None,
+            "tcluster": 1,
+            "g_nc": True,
+            "order": "tokens",
+            "interleave": 1,
+            "tpc": 1,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 1,
+            "interleave": 1,
+            "kind": "tokens_heads",
+            "order": "tokens",
+            "rows_per_cta": 32,
+            "tcluster": 1,
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_94dab509c0a287b9d339",
+        "launch": {
+            "block": (
+                256,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_muse_spark_norm_94dab509c0a287b9d339",
+        "logical": {
+            "eps": "eps",
+            "gate": "gate",
+            "gate_stride": "gate_stride",
+            "heads": "heads",
+            "tokens": "tokens",
+            "x": "input",
+            "x_stride": "input_stride",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "rmsnorm_sigmoid_gate",
+        "route": "rmsnorm_sigmoid_gate_bf16",
+        "select_rule": {
+            "kind": "tokens_heads_between",
+            "routes": {
+                "rmsnorm_sigmoid_gate_bf16_pdl": {
+                    "sm_103a": [
+                        [
+                            32,
+                            1024,
+                            8192,
+                        ],
+                    ],
+                },
+            },
+            "windows": {
+                "sm_100a": [
+                    [
+                        32,
+                        1024,
+                        None,
+                    ],
+                ],
+                "sm_103a": [
+                    [
+                        32,
+                        1024,
+                        None,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_a34f5c08681c31eddf44": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "x",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "parameter",
+                "tokens",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "x_stride",
+            ],
+            [
+                "parameter",
+                "gate_stride",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "threads": 128,
+            "lanes": 8,
+            "rows_per_thread": 2,
+            "width": 128,
+            "pdl": False,
+            "pdl_late": False,
+            "pdl_launch_top": False,
+            "tail": "none",
+            "clobber": True,
+            "x_hint": "none",
+            "g_hint": "none",
+            "y_hint": "none",
+            "packed": False,
+            "cluster": 1,
+            "addr": "i64",
+            "sigmoid": "exp2",
+            "static": None,
+            "tcluster": 16,
+            "g_nc": True,
+            "order": "tokens",
+            "interleave": 1,
+            "tpc": 1,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 1,
+            "interleave": 1,
+            "kind": "tokens_heads",
+            "order": "tokens",
+            "rows_per_cta": 32,
+            "tcluster": 16,
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_a34f5c08681c31eddf44",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                16,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_muse_spark_norm_a34f5c08681c31eddf44",
+        "logical": {
+            "eps": "eps",
+            "gate": "gate",
+            "gate_stride": "gate_stride",
+            "heads": "heads",
+            "tokens": "tokens",
+            "x": "input",
+            "x_stride": "input_stride",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "rmsnorm_sigmoid_gate",
+        "route": "rmsnorm_sigmoid_gate_bf16",
+        "select_rule": {
+            "kind": "tokens_heads_between",
+            "windows": {
+                "sm_107a": [
+                    [
+                        32,
+                        767,
+                        2047,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_a37e58e6a7d00cf8c622": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "x",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "parameter",
+                "tokens",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "x_stride",
+            ],
+            [
+                "parameter",
+                "gate_stride",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "threads": 256,
+            "lanes": 8,
+            "rows_per_thread": 1,
+            "width": 128,
+            "pdl": False,
+            "pdl_late": False,
+            "pdl_launch_top": False,
+            "tail": "none",
+            "clobber": True,
+            "x_hint": "none",
+            "g_hint": "none",
+            "y_hint": "none",
+            "packed": False,
+            "cluster": 1,
+            "addr": "i64",
+            "sigmoid": "exp2",
+            "static": None,
+            "tcluster": 1,
+            "g_nc": True,
+            "order": "heads",
+            "interleave": 1,
+            "tpc": 1,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 1,
+            "interleave": 1,
+            "kind": "tokens_heads",
+            "order": "heads",
+            "rows_per_cta": 32,
+            "tcluster": 1,
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_a37e58e6a7d00cf8c622",
+        "launch": {
+            "block": (
+                256,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_muse_spark_norm_a37e58e6a7d00cf8c622",
+        "logical": {
+            "eps": "eps",
+            "gate": "gate",
+            "gate_stride": "gate_stride",
+            "heads": "heads",
+            "tokens": "tokens",
+            "x": "input",
+            "x_stride": "input_stride",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "rmsnorm_sigmoid_gate",
+        "route": "rmsnorm_sigmoid_gate_bf16",
+        "select_rule": {
+            "kind": "tokens_heads_between",
+            "routes": {
+                "rmsnorm_sigmoid_gate_bf16_pdl": {
+                    "sm_103a": [
+                        [
+                            128,
+                            256,
+                            2048,
+                        ],
+                    ],
+                },
+            },
+            "windows": {
+                "sm_100a": [
+                    [
+                        128,
+                        256,
+                        None,
+                    ],
+                ],
+                "sm_103a": [
+                    [
+                        128,
+                        256,
+                        None,
+                    ],
+                ],
+                "sm_107a": [
+                    [
+                        128,
+                        256,
+                        383,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_a9ffd668e885ed4c7e0b": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "x",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "parameter",
+                "tokens",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "x_stride",
+            ],
+            [
+                "parameter",
+                "gate_stride",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "threads": 256,
+            "lanes": 8,
+            "rows_per_thread": 1,
+            "width": 128,
+            "pdl": True,
+            "pdl_late": False,
+            "pdl_launch_top": False,
+            "tail": "none",
+            "clobber": True,
+            "x_hint": "none",
+            "g_hint": "none",
+            "y_hint": "none",
+            "packed": False,
+            "cluster": 1,
+            "addr": "i64",
+            "sigmoid": "exp2",
+            "static": None,
+            "tcluster": 1,
+            "g_nc": True,
+            "order": "tokens",
+            "interleave": 1,
+            "tpc": 1,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 1,
+            "interleave": 1,
+            "kind": "tokens_heads",
+            "order": "tokens",
+            "rows_per_cta": 32,
+            "tcluster": 1,
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_a9ffd668e885ed4c7e0b",
+        "launch": {
+            "block": (
+                256,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": True,
+        },
+        "library": "cake_muse_spark_norm_a9ffd668e885ed4c7e0b",
+        "logical": {
+            "eps": "eps",
+            "gate": "gate",
+            "gate_stride": "gate_stride",
+            "heads": "heads",
+            "tokens": "tokens",
+            "x": "input",
+            "x_stride": "input_stride",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "rmsnorm_sigmoid_gate",
+        "route": "rmsnorm_sigmoid_gate_bf16_pdl",
+        "select_rule": {
+            "kind": "tokens_heads_between",
+            "windows": {
+                "sm_100a": [
+                    [
+                        32,
+                        1024,
+                        None,
+                    ],
+                ],
+                "sm_103a": [
+                    [
+                        32,
+                        8192,
+                        None,
+                    ],
+                ],
+                "sm_107a": [
+                    [
+                        32,
+                        257,
+                        767,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_b246ba16efbd44a244f6": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "x",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "parameter",
+                "tokens",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "x_stride",
+            ],
+            [
+                "parameter",
+                "gate_stride",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "threads": 64,
+            "lanes": 8,
+            "rows_per_thread": 4,
+            "width": 128,
+            "pdl": False,
+            "pdl_late": False,
+            "pdl_launch_top": False,
+            "tail": "none",
+            "clobber": True,
+            "x_hint": "none",
+            "g_hint": "none",
+            "y_hint": "none",
+            "packed": True,
+            "cluster": 1,
+            "addr": "i64",
+            "sigmoid": "exp2",
+            "static": None,
+            "tcluster": 1,
+            "g_nc": True,
+            "order": "tokens",
+            "interleave": 1,
+            "tpc": 1,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 1,
+            "interleave": 1,
+            "kind": "tokens_heads",
+            "order": "tokens",
+            "rows_per_cta": 32,
+            "tcluster": 1,
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_b246ba16efbd44a244f6",
+        "launch": {
+            "block": (
+                64,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_muse_spark_norm_b246ba16efbd44a244f6",
+        "logical": {
+            "eps": "eps",
+            "gate": "gate",
+            "gate_stride": "gate_stride",
+            "heads": "heads",
+            "tokens": "tokens",
+            "x": "input",
+            "x_stride": "input_stride",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "rmsnorm_sigmoid_gate",
+        "route": "rmsnorm_sigmoid_gate_bf16",
+        "select_rule": {
+            "kind": "tokens_heads_between",
+            "routes": {
+                "rmsnorm_sigmoid_gate_bf16_pdl": {
+                    "sm_107a": [
+                        [
+                            128,
+                            512,
+                            2560,
+                        ],
+                        [
+                            32,
+                            2048,
+                            None,
+                        ],
+                    ],
+                },
+            },
+            "windows": {
+                "sm_107a": [
+                    [
+                        128,
+                        511,
+                        2560,
+                    ],
+                    [
+                        32,
+                        2047,
+                        None,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_b61c2310cd41e8e79bf8": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "x",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "parameter",
+                "tokens",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "x_stride",
+            ],
+            [
+                "parameter",
+                "gate_stride",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "threads": 128,
+            "lanes": 8,
+            "rows_per_thread": 1,
+            "width": 128,
+            "pdl": True,
+            "pdl_late": False,
+            "pdl_launch_top": False,
+            "tail": "none",
+            "clobber": True,
+            "x_hint": "none",
+            "g_hint": "none",
+            "y_hint": "none",
+            "packed": False,
+            "cluster": 1,
+            "addr": "i64",
+            "sigmoid": "exp2",
+            "static": None,
+            "tcluster": 16,
+            "g_nc": True,
+            "order": "tokens",
+            "interleave": 1,
+            "tpc": 1,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 1,
+            "interleave": 1,
+            "kind": "tokens_heads",
+            "order": "tokens",
+            "rows_per_cta": 16,
+            "tcluster": 16,
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_b61c2310cd41e8e79bf8",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                16,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": True,
+        },
+        "library": "cake_muse_spark_norm_b61c2310cd41e8e79bf8",
+        "logical": {
+            "eps": "eps",
+            "gate": "gate",
+            "gate_stride": "gate_stride",
+            "heads": "heads",
+            "tokens": "tokens",
+            "x": "input",
+            "x_stride": "input_stride",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "rmsnorm_sigmoid_gate",
+        "route": "rmsnorm_sigmoid_gate_bf16_pdl",
+        "select_rule": {
+            "kind": "tokens_heads_between",
+            "windows": {
+                "sm_100a": [
+                    [
+                        16,
+                        1,
+                        8,
+                    ],
+                    [
+                        16,
+                        256,
+                        1024,
+                    ],
+                ],
+                "sm_103a": [
+                    [
+                        16,
+                        1,
+                        8,
+                    ],
+                    [
+                        16,
+                        64,
+                        1024,
+                    ],
+                ],
+                "sm_107a": [
+                    [
+                        16,
+                        1,
+                        1024,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_ba936288601d077849a2": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "x",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "parameter",
+                "tokens",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "x_stride",
+            ],
+            [
+                "parameter",
+                "gate_stride",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "threads": 256,
+            "lanes": 32,
+            "rows_per_thread": 1,
+            "width": 128,
+            "pdl": False,
+            "pdl_late": False,
+            "pdl_launch_top": False,
+            "tail": "none",
+            "clobber": True,
+            "x_hint": "none",
+            "g_hint": "none",
+            "y_hint": "none",
+            "packed": False,
+            "cluster": 16,
+            "addr": "i64",
+            "sigmoid": "exp2",
+            "static": None,
+            "tcluster": 1,
+            "g_nc": True,
+            "order": "tokens",
+            "interleave": 1,
+            "tpc": 1,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 16,
+            "interleave": 1,
+            "kind": "tokens_heads",
+            "order": "tokens",
+            "rows_per_cta": 8,
+            "tcluster": 1,
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_ba936288601d077849a2",
+        "launch": {
+            "block": (
+                256,
+                1,
+                1,
+            ),
+            "cluster": (
+                16,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_muse_spark_norm_ba936288601d077849a2",
+        "logical": {
+            "eps": "eps",
+            "gate": "gate",
+            "gate_stride": "gate_stride",
+            "heads": "heads",
+            "tokens": "tokens",
+            "x": "input",
+            "x_stride": "input_stride",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "rmsnorm_sigmoid_gate",
+        "route": "rmsnorm_sigmoid_gate_bf16",
+        "select_rule": {
+            "kind": "tokens_heads_between",
+            "windows": {
+                "sm_100a": [
+                    [
+                        128,
+                        0,
+                        8,
+                    ],
+                ],
+                "sm_103a": [
+                    [
+                        128,
+                        0,
+                        8,
+                    ],
+                ],
+                "sm_107a": [
+                    [
+                        128,
+                        1,
+                        2,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_c7a321ceb4da94672252": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "x",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "parameter",
+                "tokens",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "x_stride",
+            ],
+            [
+                "parameter",
+                "gate_stride",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "threads": 256,
+            "lanes": 8,
+            "rows_per_thread": 4,
+            "width": 128,
+            "pdl": False,
+            "pdl_late": False,
+            "pdl_launch_top": False,
+            "tail": "none",
+            "clobber": True,
+            "x_hint": "none",
+            "g_hint": "none",
+            "y_hint": "none",
+            "packed": True,
+            "cluster": 1,
+            "addr": "i64",
+            "sigmoid": "exp2",
+            "static": None,
+            "tcluster": 1,
+            "g_nc": True,
+            "order": "tokens",
+            "interleave": 1,
+            "tpc": 1,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 1,
+            "interleave": 1,
+            "kind": "tokens_heads",
+            "order": "tokens",
+            "rows_per_cta": 128,
+            "tcluster": 1,
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_c7a321ceb4da94672252",
+        "launch": {
+            "block": (
+                256,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": False,
+        },
+        "library": "cake_muse_spark_norm_c7a321ceb4da94672252",
+        "logical": {
+            "eps": "eps",
+            "gate": "gate",
+            "gate_stride": "gate_stride",
+            "heads": "heads",
+            "tokens": "tokens",
+            "x": "input",
+            "x_stride": "input_stride",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "rmsnorm_sigmoid_gate",
+        "route": "rmsnorm_sigmoid_gate_bf16",
+        "select_rule": {
+            "kind": "tokens_heads_between",
+            "windows": {
+                "sm_107a": [
+                    [
+                        128,
+                        383,
+                        511,
+                    ],
+                    [
+                        128,
+                        2560,
+                        None,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_eb8b5c0195ced737054a": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "x",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "parameter",
+                "tokens",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "x_stride",
+            ],
+            [
+                "parameter",
+                "gate_stride",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "threads": 128,
+            "lanes": 4,
+            "rows_per_thread": 2,
+            "width": 256,
+            "pdl": True,
+            "pdl_late": False,
+            "pdl_launch_top": False,
+            "tail": "none",
+            "clobber": True,
+            "x_hint": "none",
+            "g_hint": "none",
+            "y_hint": "none",
+            "packed": False,
+            "cluster": 1,
+            "addr": "i64",
+            "sigmoid": "exp2",
+            "static": None,
+            "tcluster": 1,
+            "g_nc": True,
+            "order": "tokens",
+            "interleave": 1,
+            "tpc": 4,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 1,
+            "interleave": 1,
+            "kind": "tokens_heads",
+            "order": "tokens",
+            "rows_per_cta": 64,
+            "tcluster": 1,
+            "tpc": 4,
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_eb8b5c0195ced737054a",
+        "launch": {
+            "block": (
+                128,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": True,
+        },
+        "library": "cake_muse_spark_norm_eb8b5c0195ced737054a",
+        "logical": {
+            "eps": "eps",
+            "gate": "gate",
+            "gate_stride": "gate_stride",
+            "heads": "heads",
+            "tokens": "tokens",
+            "x": "input",
+            "x_stride": "input_stride",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "rmsnorm_sigmoid_gate",
+        "route": "rmsnorm_sigmoid_gate_bf16_pdl",
+        "select_rule": {
+            "kind": "tokens_heads_between",
+            "windows": {
+                "sm_107a": [
+                    [
+                        16,
+                        6143,
+                        8191,
+                    ],
+                    [
+                        16,
+                        8191,
+                        12287,
+                    ],
+                    [
+                        16,
+                        32767,
+                        None,
+                    ],
+                ],
+            },
+        },
+        "workspace_rule": None,
+    },
+    "cake_muse_spark_norm_f5cfa44f264f852f4db4": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            [
+                "buffer",
+                "x",
+            ],
+            [
+                "buffer",
+                "gate",
+            ],
+            [
+                "parameter",
+                "tokens",
+            ],
+            [
+                "parameter",
+                "heads",
+            ],
+            [
+                "parameter",
+                "x_stride",
+            ],
+            [
+                "parameter",
+                "gate_stride",
+            ],
+            [
+                "parameter",
+                "eps",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "build": {
+            "threads": 256,
+            "lanes": 8,
+            "rows_per_thread": 4,
+            "width": 128,
+            "pdl": True,
+            "pdl_late": False,
+            "pdl_launch_top": False,
+            "tail": "none",
+            "clobber": True,
+            "x_hint": "none",
+            "g_hint": "none",
+            "y_hint": "none",
+            "packed": True,
+            "cluster": 1,
+            "addr": "i64",
+            "sigmoid": "exp2",
+            "static": None,
+            "tcluster": 1,
+            "g_nc": True,
+            "order": "tokens",
+            "interleave": 1,
+            "tpc": 1,
+        },
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cluster": 1,
+            "interleave": 1,
+            "kind": "tokens_heads",
+            "order": "tokens",
+            "rows_per_cta": 128,
+            "tcluster": 1,
+        },
+        "kernel_symbol": "kernel_cake_muse_spark_norm_f5cfa44f264f852f4db4",
+        "launch": {
+            "block": (
+                256,
+                1,
+                1,
+            ),
+            "cluster": (
+                1,
+                1,
+                1,
+            ),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "use_pdl": True,
+        },
+        "library": "cake_muse_spark_norm_f5cfa44f264f852f4db4",
+        "logical": {
+            "eps": "eps",
+            "gate": "gate",
+            "gate_stride": "gate_stride",
+            "heads": "heads",
+            "tokens": "tokens",
+            "x": "input",
+            "x_stride": "input_stride",
+        },
+        "occupancy_entry": "max_active_clusters",
+        "op": "rmsnorm_sigmoid_gate",
+        "route": "rmsnorm_sigmoid_gate_bf16_pdl",
+        "select_rule": {
+            "kind": "tokens_heads_between",
+            "windows": {
+                "sm_107a": [
+                    [
+                        128,
+                        383,
+                        511,
+                    ],
+                    [
+                        128,
+                        2560,
                         None,
                     ],
                 ],
@@ -9834,21 +10268,21 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_muse_spark_norm_8e2e17ebd97563f6a23a",
         ],
         "rmsnorm_sigmoid_gate_bf16": [
-            "cake_muse_spark_norm_3cd64c9702f99e24eed8",
-            "cake_muse_spark_norm_ab406ebf6c070ea32e7a",
-            "cake_muse_spark_norm_c2e68308fdb46f236ac4",
-            "cake_muse_spark_norm_75b324d65c3bc77cc36b",
-            "cake_muse_spark_norm_94e9c266281fb6f1f23e",
-            "cake_muse_spark_norm_20b424e339bbe5210ad5",
+            "cake_muse_spark_norm_ba936288601d077849a2",
+            "cake_muse_spark_norm_2206e897092d7ba2b069",
+            "cake_muse_spark_norm_a37e58e6a7d00cf8c622",
+            "cake_muse_spark_norm_94dab509c0a287b9d339",
+            "cake_muse_spark_norm_455dd018e9c2b6f6ffeb",
+            "cake_muse_spark_norm_0b9a1a6c1d1c3c614200",
         ],
         "rmsnorm_sigmoid_gate_bf16_pdl": [
-            "cake_muse_spark_norm_49015ea91c011bd1740a",
-            "cake_muse_spark_norm_feff5e270b2146886c6c",
-            "cake_muse_spark_norm_c7c7921f8495c0384ee7",
-            "cake_muse_spark_norm_fb5857b9f0bbd10ec74b",
-            "cake_muse_spark_norm_fba020bb2e3b8aaf63f0",
-            "cake_muse_spark_norm_21dccf5cd73a70753e08",
-            "cake_muse_spark_norm_20b424e339bbe5210ad5",
+            "cake_muse_spark_norm_0e50091274e6013faa20",
+            "cake_muse_spark_norm_4f35be1b624190afed66",
+            "cake_muse_spark_norm_8e6e989e8e2bab5d8163",
+            "cake_muse_spark_norm_a9ffd668e885ed4c7e0b",
+            "cake_muse_spark_norm_b61c2310cd41e8e79bf8",
+            "cake_muse_spark_norm_7c0cd927f0f3fea9f941",
+            "cake_muse_spark_norm_0b9a1a6c1d1c3c614200",
         ],
     },
     "sm_103a": {
@@ -9896,24 +10330,24 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_muse_spark_norm_b886dd6347cac2b58cf3",
         ],
         "rmsnorm_sigmoid_gate_bf16": [
-            "cake_muse_spark_norm_3cd64c9702f99e24eed8",
-            "cake_muse_spark_norm_ab406ebf6c070ea32e7a",
-            "cake_muse_spark_norm_c2e68308fdb46f236ac4",
-            "cake_muse_spark_norm_75b324d65c3bc77cc36b",
-            "cake_muse_spark_norm_94e9c266281fb6f1f23e",
-            "cake_muse_spark_norm_20b424e339bbe5210ad5",
+            "cake_muse_spark_norm_ba936288601d077849a2",
+            "cake_muse_spark_norm_2206e897092d7ba2b069",
+            "cake_muse_spark_norm_a37e58e6a7d00cf8c622",
+            "cake_muse_spark_norm_94dab509c0a287b9d339",
+            "cake_muse_spark_norm_455dd018e9c2b6f6ffeb",
+            "cake_muse_spark_norm_0b9a1a6c1d1c3c614200",
         ],
         "rmsnorm_sigmoid_gate_bf16_pdl": [
-            "cake_muse_spark_norm_49015ea91c011bd1740a",
-            "cake_muse_spark_norm_4c2847f766bb9a2330d6",
-            "cake_muse_spark_norm_feff5e270b2146886c6c",
-            "cake_muse_spark_norm_c2e68308fdb46f236ac4",
-            "cake_muse_spark_norm_c7c7921f8495c0384ee7",
-            "cake_muse_spark_norm_75b324d65c3bc77cc36b",
-            "cake_muse_spark_norm_fb5857b9f0bbd10ec74b",
-            "cake_muse_spark_norm_fba020bb2e3b8aaf63f0",
-            "cake_muse_spark_norm_21dccf5cd73a70753e08",
-            "cake_muse_spark_norm_20b424e339bbe5210ad5",
+            "cake_muse_spark_norm_0e50091274e6013faa20",
+            "cake_muse_spark_norm_1d29611fac2391f74182",
+            "cake_muse_spark_norm_4f35be1b624190afed66",
+            "cake_muse_spark_norm_a37e58e6a7d00cf8c622",
+            "cake_muse_spark_norm_8e6e989e8e2bab5d8163",
+            "cake_muse_spark_norm_94dab509c0a287b9d339",
+            "cake_muse_spark_norm_a9ffd668e885ed4c7e0b",
+            "cake_muse_spark_norm_b61c2310cd41e8e79bf8",
+            "cake_muse_spark_norm_7c0cd927f0f3fea9f941",
+            "cake_muse_spark_norm_0b9a1a6c1d1c3c614200",
         ],
     },
     "sm_107a": {
@@ -9958,32 +10392,36 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_muse_spark_norm_4e76b0cecea57bf56f1f",
         ],
         "rmsnorm_sigmoid_gate_bf16": [
-            "cake_muse_spark_norm_3cd64c9702f99e24eed8",
-            "cake_muse_spark_norm_b9d6ae2cfefaff467cf7",
-            "cake_muse_spark_norm_39db7b9998130983e8f9",
-            "cake_muse_spark_norm_c2e68308fdb46f236ac4",
-            "cake_muse_spark_norm_975fa1305148fe1b7d25",
-            "cake_muse_spark_norm_65359794baed7e3e4bc9",
-            "cake_muse_spark_norm_ab406ebf6c070ea32e7a",
-            "cake_muse_spark_norm_5698a0f364604f387ddf",
-            "cake_muse_spark_norm_4f82e90b4819f5daf019",
-            "cake_muse_spark_norm_94e9c266281fb6f1f23e",
-            "cake_muse_spark_norm_20b424e339bbe5210ad5",
-            "cake_muse_spark_norm_a91a924b3947a3daac51",
+            "cake_muse_spark_norm_ba936288601d077849a2",
+            "cake_muse_spark_norm_73cdd3ec3d059d8e95a9",
+            "cake_muse_spark_norm_20723bd85c3bbf3e0ba1",
+            "cake_muse_spark_norm_a37e58e6a7d00cf8c622",
+            "cake_muse_spark_norm_c7a321ceb4da94672252",
+            "cake_muse_spark_norm_b246ba16efbd44a244f6",
+            "cake_muse_spark_norm_2206e897092d7ba2b069",
+            "cake_muse_spark_norm_5cf73e7885cf18f1c89a",
+            "cake_muse_spark_norm_a34f5c08681c31eddf44",
+            "cake_muse_spark_norm_455dd018e9c2b6f6ffeb",
+            "cake_muse_spark_norm_0b9a1a6c1d1c3c614200",
+            "cake_muse_spark_norm_52fa7700c74897e3d56b",
+            "cake_muse_spark_norm_25a7f9c3f3bc6d00fda4",
         ],
         "rmsnorm_sigmoid_gate_bf16_pdl": [
-            "cake_muse_spark_norm_49015ea91c011bd1740a",
-            "cake_muse_spark_norm_293cf74593c85cb92113",
-            "cake_muse_spark_norm_c7c7921f8495c0384ee7",
-            "cake_muse_spark_norm_2521f234c1e0fc6b9599",
-            "cake_muse_spark_norm_92b5ec4d44467dae88ff",
-            "cake_muse_spark_norm_65359794baed7e3e4bc9",
-            "cake_muse_spark_norm_4c2847f766bb9a2330d6",
-            "cake_muse_spark_norm_fb5857b9f0bbd10ec74b",
-            "cake_muse_spark_norm_7adf8d9bb6ed90fcfff4",
-            "cake_muse_spark_norm_fba020bb2e3b8aaf63f0",
-            "cake_muse_spark_norm_20b424e339bbe5210ad5",
-            "cake_muse_spark_norm_a91a924b3947a3daac51",
+            "cake_muse_spark_norm_0e50091274e6013faa20",
+            "cake_muse_spark_norm_402f58bba74e553f32f7",
+            "cake_muse_spark_norm_37ea5413e1d3e395761f",
+            "cake_muse_spark_norm_8e6e989e8e2bab5d8163",
+            "cake_muse_spark_norm_f5cfa44f264f852f4db4",
+            "cake_muse_spark_norm_0b979435de8b4c05214f",
+            "cake_muse_spark_norm_b246ba16efbd44a244f6",
+            "cake_muse_spark_norm_1d29611fac2391f74182",
+            "cake_muse_spark_norm_a9ffd668e885ed4c7e0b",
+            "cake_muse_spark_norm_4dffe3ae22bb749cbf54",
+            "cake_muse_spark_norm_b61c2310cd41e8e79bf8",
+            "cake_muse_spark_norm_0b9a1a6c1d1c3c614200",
+            "cake_muse_spark_norm_52fa7700c74897e3d56b",
+            "cake_muse_spark_norm_eb8b5c0195ced737054a",
+            "cake_muse_spark_norm_25a7f9c3f3bc6d00fda4",
         ],
     },
 }
@@ -10200,10 +10638,18 @@ def tokens_heads_grid(
     """The grid of a ``tokens_heads`` rule for ``tokens`` tokens of ``heads`` heads (the kernel's own
     arithmetic): ``(ceil(heads / rows_per_cta), tokens rounded up to tcluster, 1)`` for a cluster over the head
     blocks or the head-major order, else ``(tokens rounded up to max(tcluster, interleave), ceil(heads /
-    rows_per_cta), 1)``."""
+    rows_per_cta), 1)``; for a multi-token program (the rule's ``tpc`` above one: a CTA holding ``tpc`` whole
+    tokens) ``(ceil(tokens / tpc), ceil(heads / (rows_per_cta / tpc)), 1)``."""
     if tokens <= 0 or heads <= 0:
         raise ValueError(
             f"Cake norm tokens_heads launches need positive counts, got tokens={tokens}, heads={heads}"
+        )
+    tpc = int(rule.get("tpc", 1))
+    if tpc > 1:
+        return (
+            -(-int(tokens) // tpc),
+            -(-int(heads) // (int(rule["rows_per_cta"]) // tpc)),
+            1,
         )
     blocks = -(-int(heads) // int(rule["rows_per_cta"]))
     tcluster, interleave = int(rule.get("tcluster", 1)), int(rule.get("interleave", 1))

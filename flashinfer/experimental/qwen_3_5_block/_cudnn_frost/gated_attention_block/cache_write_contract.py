@@ -1,17 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Metadata validation for paged cache writes, independent of CuTeDSL kernels.
+"""Metadata validation for paged cache writes, and the fused prepare launch's declaration-time record, independent of CuTeDSL kernels.
 
 Declarations and execute preflight must remain usable on the package's supported
-DSL floor, before a stage checks the newer version its kernel requires.
+DSL floor, before a stage checks the newer version its kernel requires.  That is
+why :class:`QsaPrepareIndexArms` -- which indexer arms the prepare launch traces;
+the block builds the record at DECLARATION under ``fuse_prepare`` -- lives here
+and not in ``kernels/qsa_prepare.py``, which imports the DSL at module scope and
+re-exports the name for its own callers (Rule 7).
 """
 
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import torch
 
 _SLOT_DTYPES = (torch.int32, torch.int64)
+
+DEFAULT_POOL = 4
+"""Tokens per compressed block -- the QSA compress ratio (``indexer_compress_ratio``; ``QsaSpec.block_size``'s pinned value).  The ONE
+definition: ``kernels/qsa_compress.py`` and ``kernels/qsa_prepare.py`` import it (DSL-free here, so a declaration can read it)."""
 
 
 def check_pool(pool: torch.Tensor, name: str, *, h: int, page_size: int, d: int, dtype, device=None) -> None:
@@ -55,3 +63,38 @@ def check_slot_mapping(slot: torch.Tensor, name: str, *, t: int, device=None, t_
         raise ValueError(f"{name} must be contiguous, got strides {tuple(slot.stride())}")
     if device is not None and slot.device != torch.device(device):
         raise ValueError(f"{name} must live on {device}, got {slot.device}")
+
+
+class QsaPrepareIndexArms(NamedTuple):
+    """Which indexer arms an artifact traces (every one a compile key), and the band geometry they address.
+
+    ``raw_pool``: the raw indexer key's write-through pool (the cache-write kernel's second launch); ``query``: the
+    indexer queries' norm + RoPE into a compact ``[T, H_i, D_i]`` buffer (the compress kernel at pool 1); ``compress``:
+    the ring + the compressed-key cache (the compress kernel's step form; ``n_commit`` traces its accepted-prefix load).
+    ``heads`` / ``head_dim`` are the band's ``index_heads`` / ``index_head_dim``; ``pool`` the compress ratio.
+
+    Appended (the serving step's forms, each a compile key): ``paged`` -- the compress arm over the stack's PAGED ring and
+    compressed-key cache through their block tables with the positions from ``kv_lens`` (needs ``compress``);
+    ``ring_slots`` -- the ring WRITE rows from the stack's own slot mapping (needs ``paged``; the slots share the
+    artifact's slot dtype); ``rope_table`` -- the Q / K and indexer-query rotations read from the position-indexed
+    ``cos_pos`` / ``sin_pos`` at ``pos0 + j`` instead of per-token rows (needs ``compress`` and a rotation)."""
+
+    heads: int
+    head_dim: int
+    raw_pool: bool = True
+    query: bool = False
+    compress: bool = False
+    n_commit: bool = False
+    pool: int = DEFAULT_POOL
+    paged: bool = False
+    ring_slots: bool = False
+    rope_table: bool = False
+
+    @property
+    def raw(self) -> bool:
+        """Whether the raw-key arm exists at all (any of its three jobs)."""
+        return bool(self.raw_pool or self.compress)
+
+    @property
+    def any(self) -> bool:
+        return bool(self.raw or self.query)

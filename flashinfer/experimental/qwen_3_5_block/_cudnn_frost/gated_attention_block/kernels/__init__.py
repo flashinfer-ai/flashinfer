@@ -21,6 +21,14 @@ stage of the pipeline in ``api.py``::
     elementwise.py              stage (5) sigmoid gate, and (3b) V compaction
     cache_write.py              (4w) serving write-through: post-RoPE K / V (and the raw indexer key) into paged pools
                                 at a slot mapping -- two operands per launch, HND / NHD / unified-row pools by strides
+    qsa_prepare.py              (2+3+4w) under the block knob ``fuse_prepare``: the Q / K norm + RoPE in place and the paged
+                                write-through of the post-RoPE K, the V and the raw indexer key as ONE launch; it also carries
+                                the indexer's decode-step arms (the queries' norm + RoPE, the raw-key ring, the incremental compress;
+                                the e4m3 store arm of the query and compress outputs under the e4m3 indexer cache)
+    qsa_compress.py             (4i) the in-block indexer's key side: the raw indexer keys mean-pooled per 4-token block, RMSNormed
+                                and rotated at the block start (the prefill form), the same body at pool 1 for the indexer
+                                queries, and the step form (the raw-key ring + the incremental compress of the compressed-key cache);
+                                the e4m3 store arm (the e4m3 cast of the bf16 row) on the pool-1 and the step outputs
     sigmoid_gate_bwd.py         BACKWARD of stage (5): dO, dG into the GATE band, optional O_gated
     qk_norm_rope_bwd.py         BACKWARD of stages (2)+(3): exact RoPE adjoint + RMSNorm backward into
                                 the Q / K bands, dW_norm partials + fixed-order reduce, the V band copy
@@ -32,6 +40,18 @@ stage of the pipeline in ``api.py``::
     mxfp8_bwd_fused.py          the MXFP8 BACKWARD's two fused launches -- PROLOGUE (scalar init, dY amax partials, the Q / K
                                 rebuild with its MX epilogue: q8 / q_T8 / k8 / k_T8 from a 32-token tile, v8) and EPILOGUE
                                 (dW_norm reduce, the dual-axis canonical dqkvg cast): block-range dispatch over the bodies
+    qsa_score_paged.py          the decode indexer's SCORER over the PAGED compressed-key cache (one compressed row per 4 tokens
+                                on the main block table): fp32 ReLU-summed head scores per visible block + the per-row visible
+                                counts -- the input contract of the decode top-k; one warp-level mma.sync per 8 keys x 16 D over
+                                the (s, h) query rows padded to 16, the query tile staged once per CTA (one CTA barrier), the keys
+                                streamed by cp.async through a per-warp SMEM ring, any CuTe DSL device from sm_80 (bf16 compressed rows;
+                                the e4m3 READ arm -- e4m3 rows and queries on the fp8 mma.sync.m16n8k32, sm_89+); its standalone selector
+                                ``qsa_select_decode_paged_forward`` (scorer + radix top-k) is the DSL-free host entry ``../../QSA/selection_paged.py``,
+                                which also owns the kernel's host-side facts and gates the DSL floor BEFORE importing this module (Rule 7)
+    qsa_topk_decode.py          the block-sparse indexer's DECODE top-k: one thread block per query row, the row's fp32 logits
+                                in registers, one 4096-bin histogram pass plus an exact rank of the k-th bin's candidates,
+                                the list written in canonical order (ids descending, -1 last); the DSL-free host entry is
+                                ``gated_attention_block/qsa_topk.py`` -- standalone until the decode indexer binds it
 
 **The SDPA stage owns no file here.**  It drives the shipped forward adapter
 ``cudnn.sdpa.fwd.api_dsl.SdpaFwdDslSm100`` in EVERY configuration; the

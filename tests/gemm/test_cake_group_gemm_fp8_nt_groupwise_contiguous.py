@@ -21,12 +21,16 @@ from flashinfer.gemm.cake_grouped_fp8_gemm import (
     BS_N256_S16_ROUTE,
     BS_ROUTES,
     BS_STORE16_ROUTES,
+    BS_SWAP_C1_ROUTE,
     BS_SWAP_CARRY_ROUTE,
     BS_SWAP_CARRY_S16_ROUTE,
     BS_SWAP_ROUTE,
     BS_SWAP_ROUTES,
+    BS_SWAP_RP32_ROUTE,
+    BS_SWAP_RP32_S11_ROUTE,
     BS_SWAP_RUN32_ROUTE,
     BS_SWAP_S16_ROUTE,
+    BS_SWAP_SMALL_ARCHS,
     DEEPK_C2_AB6_SCALE1_DIRECT_STORE_ROUTE,
     DEEPK_C2_AB6_SCALE1_ROUTE,
     DEEPK_C2_KG1_DIRECT_STORE_ROUTE,
@@ -49,6 +53,7 @@ from flashinfer.gemm.cake_grouped_fp8_gemm import (
     bs_route_for_shape,
     bs_store16,
     bs_swap_route_for_shape,
+    bs_swap_small_route,
     device_sm_count,
     is_group_gemm_fp8_nt_groupwise_contiguous_prepared_available,
     launch_plan,
@@ -910,7 +915,12 @@ def test_block_scaled_packed_scales_match_reference(group_counts, n, k, alignmen
     assert prepared.route in BS_ROUTES | BS_SWAP_ROUTES
     assert (
         prepared.route
-        in (BS_N128_RUN32_ROUTE, BS_N256_RUN32_ROUTE, BS_SWAP_RUN32_ROUTE)
+        in (
+            BS_N128_RUN32_ROUTE,
+            BS_N256_RUN32_ROUTE,
+            BS_SWAP_RUN32_ROUTE,
+            BS_SWAP_RP32_ROUTE,
+        )
     ) == (alignment % 128 != 0)
     assert (prepared.route in BS_STORE16_ROUTES.values()) == bs_store16(
         int(m_indices.numel()), alignment=alignment, num_groups=len(group_counts)
@@ -1131,6 +1141,118 @@ def test_block_scaled_swap_route_needs_groups_and_arch():
     )
 
 
+def test_block_scaled_swap_rp32_rule():
+    """The 32-row-block program takes 32- and 64-row alignments of at most 1536 rows.
+
+    Its tiles also meet the architecture's bound: on sm_100a
+    ``ceil(m / 32) * n / 256`` 32 x 256 tiles of at most ``sm_count``, on
+    sm_103a three times ``ceil(m / 128) * n / 256`` 128 x 256 tiles of at most
+    ``sm_count``.  Without ``sm_count`` both keep the run32 program.
+    """
+    rule = functools.partial(bs_swap_route_for_shape, k=1024, num_groups=8)
+    # N 1024 on 148 SMs: 37 * 4 = 148 tiles of 32 rows fit sm_100a, 38 * 4 = 152
+    # do not; sm_103a takes 3 * 10 * 4 = 120 for both.
+    for m, sm_100a in ((1184, BS_SWAP_RP32_ROUTE), (1216, BS_SWAP_RUN32_ROUTE)):
+        assert rule(m, 1024, alignment=32, arch="sm_100a", sm_count=148) == sm_100a
+        assert (
+            rule(m, 1024, alignment=32, arch="sm_103a", sm_count=148)
+            == BS_SWAP_RP32_ROUTE
+        )
+    # N 2048 on 148 SMs: 3 * 6 * 8 = 144 tiles of 128 rows fit sm_103a,
+    # 3 * 7 * 8 = 168 do not.
+    for m, sm_103a in ((768, BS_SWAP_RP32_ROUTE), (800, BS_SWAP_RUN32_ROUTE)):
+        assert rule(m, 2048, alignment=32, arch="sm_103a", sm_count=148) == sm_103a
+    for arch in ("sm_100a", "sm_103a"):
+        assert rule(640, 1024, alignment=32, arch=arch) == BS_SWAP_RUN32_ROUTE
+        # At most 1536 rows.
+        assert (
+            rule(1536, 256, alignment=32, arch=arch, sm_count=148) == BS_SWAP_RP32_ROUTE
+        )
+        assert (
+            rule(1568, 256, alignment=32, arch=arch, sm_count=148)
+            == BS_SWAP_RUN32_ROUTE
+        )
+        # Alignments of at most 64 rows.
+        assert (
+            rule(1024, 512, alignment=64, arch=arch, sm_count=148) == BS_SWAP_RP32_ROUTE
+        )
+        assert (
+            rule(1024, 512, alignment=96, arch=arch, sm_count=148)
+            == BS_SWAP_RUN32_ROUTE
+        )
+
+
+def test_block_scaled_swap_small_block_rule():
+    """The small-block programs take sm_103a launches of one wave of CTAs.
+
+    The 11-stage two-CTA program takes K >= 2048 when ``2 * ceil(m / 32) *
+    n / 256`` CTAs fit ``sm_count``; the one-CTA program takes the 32-row
+    alignment at 256 <= K <= 512 and N <= 512 when ``ceil(m / 32) * n / 128``
+    CTAs fit.  sm_100a and an unknown ``sm_count`` keep the other routes.
+    """
+    rule = functools.partial(bs_swap_route_for_shape, num_groups=8)
+    # K 4096, N 256: 2 * 76 = 152 CTAs of 32-row blocks fit 152 SMs, not 148.
+    s11 = functools.partial(rule, 2432, 256, 4096, alignment=128)
+    assert s11(arch="sm_103a", sm_count=152) == BS_SWAP_RP32_S11_ROUTE
+    assert s11(arch="sm_103a", sm_count=148) == BS_SWAP_ROUTE
+    assert s11(arch="sm_103a") == BS_SWAP_ROUTE
+    assert s11(arch="sm_100a", sm_count=152) == BS_SWAP_ROUTE
+    # Any alignment: 2 * 16 * 4 = 128 CTAs at K 2048, not at K 1920.
+    for k, sm_103a in ((2048, BS_SWAP_RP32_S11_ROUTE), (1920, BS_SWAP_RP32_ROUTE)):
+        assert rule(512, 1024, k, alignment=32, arch="sm_103a", sm_count=152) == sm_103a
+    assert (
+        rule(512, 1024, 2048, alignment=32, arch="sm_103a", sm_count=120)
+        == BS_SWAP_RP32_ROUTE
+    )
+    assert (
+        rule(512, 1024, 2048, alignment=32, arch="sm_100a", sm_count=152)
+        == BS_SWAP_RP32_ROUTE
+    )
+    # The one-CTA program: 36 * 4 = 144 CTAs fit 152 SMs, not 140.
+    c1 = functools.partial(rule, 1152, 512, alignment=32)
+    for k in (256, 512):
+        assert c1(k, arch="sm_103a", sm_count=152) == BS_SWAP_C1_ROUTE
+        assert c1(k, arch="sm_103a", sm_count=140) == BS_SWAP_RP32_ROUTE
+        assert c1(k, arch="sm_103a") == BS_SWAP_RUN32_ROUTE
+        assert c1(k, arch="sm_100a", sm_count=152) == BS_SWAP_RP32_ROUTE
+    # Its K range, its largest N and its alignment.
+    for k in (128, 640, 1024):
+        assert c1(k, arch="sm_103a", sm_count=152) == BS_SWAP_RP32_ROUTE
+    assert (
+        rule(384, 1024, 256, alignment=32, arch="sm_103a", sm_count=152)
+        == BS_SWAP_RP32_ROUTE
+    )
+    assert (
+        rule(1152, 512, 256, alignment=64, arch="sm_103a", sm_count=152)
+        == BS_SWAP_RP32_ROUTE
+    )
+    assert sorted(BS_SWAP_SMALL_ARCHS) == ["sm_103a"]
+    for arch in ("sm_100a", "sm_120a"):
+        assert (
+            bs_swap_small_route(1152, 512, 256, alignment=32, arch=arch, sm_count=152)
+            is None
+        )
+    assert {BS_SWAP_RP32_S11_ROUTE, BS_SWAP_C1_ROUTE} <= BS_SWAP_ROUTES
+
+
+def test_launch_plan_takes_the_small_block_routes_on_sm_103a():
+    """The small-block launches: two-CTA clusters of 32 x 256 tiles, one CTA per 32 x 128 tile."""
+    plan = functools.partial(
+        launch_plan, scalar_output=False, block_scaled=True, sm_count=152
+    )
+    route, grid = plan(512, 1024, 2048, alignment=32, num_groups=8, arch="sm_103a")
+    assert route == BS_SWAP_RP32_S11_ROUTE and grid == (2 * 16 * 4, 1, 1)
+    route, grid = plan(2432, 256, 4096, alignment=128, num_groups=8, arch="sm_103a")
+    assert route == BS_SWAP_RP32_S11_ROUTE and grid == (2 * 76, 1, 1)
+    route, grid = plan(1152, 512, 256, alignment=32, num_groups=12, arch="sm_103a")
+    assert route == BS_SWAP_C1_ROUTE and grid == (36 * 4, 1, 1)
+    assert route_geometry(BS_SWAP_RP32_S11_ROUTE) == (32, 256, 2)
+    assert route_geometry(BS_SWAP_C1_ROUTE) == (32, 128, 1)
+    for arch in ("sm_100a", None):
+        route, _ = plan(1152, 512, 256, alignment=32, num_groups=12, arch=arch)
+        assert route != BS_SWAP_C1_ROUTE
+
+
 @pytest.mark.parametrize(
     ("m", "n", "k", "num_groups", "alignment", "sm_100a", "sm_103a"),
     [
@@ -1183,17 +1305,28 @@ def test_launch_plan_takes_the_swap_routes_with_the_architecture():
         )
         assert route == BS_SWAP_S16_ROUTE
         assert grid == (2 * min(148 // 2, (65408 // 128) * (512 // 256)), 1, 1)
-    route, grid = launch_plan(
-        640,
-        1024,
-        256,
-        sm_count=152,
+    multi_run = functools.partial(
+        launch_plan,
+        k=256,
         scalar_output=False,
         block_scaled=True,
         alignment=32,
         num_groups=8,
-        arch="sm_103a",
     )
+    for arch in ("sm_100a", "sm_103a"):
+        # 20 * 4 tiles of 32 x 256 rows on 76 two-CTA clusters.
+        route, grid = multi_run(640, 1024, sm_count=152, arch=arch)
+        assert route == BS_SWAP_RP32_ROUTE and grid == (2 * 76, 1, 1)
+        # More than 1536 rows: 14 * 4 tiles of 128 x 256 rows.
+        route, grid = multi_run(1792, 1024, sm_count=152, arch=arch)
+        assert route == BS_SWAP_RUN32_ROUTE and grid == (2 * 14 * 4, 1, 1)
+    # launch_plan passes its sm_count: 80 tiles of 32 rows exceed 64 SMs on
+    # sm_100a; 3 * 20 tiles of 128 rows fit 64 SMs on sm_103a, not 56.
+    route, grid = multi_run(640, 1024, sm_count=64, arch="sm_100a")
+    assert route == BS_SWAP_RUN32_ROUTE and grid == (2 * 5 * 4, 1, 1)
+    route, grid = multi_run(640, 1024, sm_count=64, arch="sm_103a")
+    assert route == BS_SWAP_RP32_ROUTE and grid == (2 * 32, 1, 1)
+    route, grid = multi_run(640, 1024, sm_count=56, arch="sm_103a")
     assert route == BS_SWAP_RUN32_ROUTE and grid == (2 * 5 * 4, 1, 1)
     route, _ = launch_plan(
         65408,
@@ -1209,11 +1342,23 @@ def test_launch_plan_takes_the_swap_routes_with_the_architecture():
 
 
 # (group_counts, N, K, alignment, route): compact layouts the swap-AB rule sends to
-# each swap route on both architectures (multi-run; K > 512 below 100 rows per
-# group; K <= 256 at 2..20 rows per group).
+# each swap route on both architectures with at least 80 SMs (multi-run of at
+# most 1536 rows within the rp32 tile bound; longer multi-run; K > 512 below
+# 100 rows per group; K <= 256 at 2..20 rows per group).
 BLOCK_SCALED_SWAP_CASES = [
     pytest.param(
         [5, 33, 0, 0, 97, 32, 1, 129],
+        1024,
+        1024,
+        32,
+        BS_SWAP_RP32_ROUTE,
+        id="rp32",
+    ),
+    pytest.param(
+        [20, 0, 31, 7, 64, 1, 2, 40], 512, 1024, 64, BS_SWAP_RP32_ROUTE, id="rp32_a64"
+    ),
+    pytest.param(
+        [200, 300, 0, 150, 400, 1, 260, 129],
         1024,
         1024,
         32,
@@ -1247,7 +1392,13 @@ def test_block_scaled_swap_routes_match_the_non_swapped_routes(
     m = int(m_indices.numel())
     assert (
         bs_swap_route_for_shape(
-            m, n, k, alignment=alignment, num_groups=len(group_counts), arch=arch
+            m,
+            n,
+            k,
+            alignment=alignment,
+            num_groups=len(group_counts),
+            arch=arch,
+            sm_count=device_sm_count(torch.cuda.current_device()),
         )
         == route
     )
@@ -1270,6 +1421,80 @@ def test_block_scaled_swap_routes_match_the_non_swapped_routes(
             assert prepared.route in BS_ROUTES
         elif bs_store16(m, alignment=alignment, num_groups=len(group_counts)):
             assert prepared.route == BS_STORE16_ROUTES[expected_route]
+        else:
+            assert prepared.route == expected_route
+        prepared.launch()
+        outs.append(out)
+    torch.cuda.synchronize()
+    expected = _reference(a, b, a_scale, b_scale, m_indices)
+    _assert_block_scaled(outs[0], expected, m_indices)
+    routed = m_indices >= 0
+    assert torch.equal(
+        outs[0][routed].view(torch.int16), outs[1][routed].view(torch.int16)
+    )
+
+
+# (group_counts, N, K, alignment, route): compact layouts the small-block rule
+# sends to each small-block route on sm_103a (at most 80 CTAs: one wave).
+BLOCK_SCALED_SMALL_CASES = [
+    pytest.param(
+        [5, 33, 0, 0, 97, 32, 1, 129],
+        256,
+        2048,
+        32,
+        BS_SWAP_RP32_S11_ROUTE,
+        id="rp32_s11",
+    ),
+    pytest.param(
+        [20, 0, 31, 7, 64, 1, 2, 40],
+        256,
+        2048,
+        128,
+        BS_SWAP_RP32_S11_ROUTE,
+        id="rp32_s11_single_run",
+    ),
+    pytest.param([10, 3, 0, 17, 20, 9, 12, 9], 512, 512, 32, BS_SWAP_C1_ROUTE, id="c1"),
+    pytest.param(
+        [100, 0, 3, 69, 128, 200, 1, 64],
+        256,
+        256,
+        32,
+        BS_SWAP_C1_ROUTE,
+        id="c1_k256",
+    ),
+]
+
+
+@pytest.mark.parametrize("group_counts,n,k,alignment,route", BLOCK_SCALED_SMALL_CASES)
+def test_block_scaled_small_block_routes_match_the_non_swapped_routes(
+    group_counts, n, k, alignment, route
+):
+    """A small-block route writes the bits of the non-swapped route on the same problem."""
+    device = torch.device("cuda")
+    if device_arch(torch.cuda.current_device()) not in BS_SWAP_SMALL_ARCHS:
+        pytest.skip("the small-block swap-AB programs are registered on sm_103a only")
+    inputs = _make_block_scaled_inputs(
+        group_counts, n, k, alignment=alignment, seed=4790 + k, device=device
+    )
+    a, b, a_scale, b_scale, a_packed, b_packed, m_indices = inputs
+    m = int(m_indices.numel())
+    block_rows = _make_block_scaled_inputs(
+        group_counts,
+        n,
+        k,
+        alignment=alignment,
+        seed=4790 + k,
+        device=device,
+        weight_rows_repeated=False,
+    )[5]
+    outs = []
+    for weight_scale, expected_route in ((b_packed, route), (block_rows, None)):
+        out = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device=device)
+        prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+            a, b, a_packed, weight_scale, m_indices, out=out, alignment=alignment
+        )
+        if expected_route is None:
+            assert prepared.route in BS_ROUTES
         else:
             assert prepared.route == expected_route
         prepared.launch()
@@ -1408,9 +1633,14 @@ def test_route_rule_reads_the_layout_alignment():
     assert _route(4095, 2048, 4096, aligned=True) == DEEPK_CG2_AB7_BSCALE_PREFETCH_ROUTE
     assert _route(16385, 4096, 1024, aligned=True) == DEEPK_CG2_RECURRENCE_ROUTE
     assert route_for_shape(4095, 2048, 4096) == DEEPK_C2_AB6_SCALE1_ROUTE
-    # K=128 keeps its static-K route; K=384 runs the K-loop route for at most
-    # four 128x128 tiles.
-    assert _route(1, 128, 128, sm_count=148) == K128_ROUTE
+    # K=128 runs the K-loop K-group 1 route for at most sm_count 128x128 tiles
+    # (one wave), else its static-K route; K=384 runs the K-loop route for at
+    # most four 128x128 tiles.
+    assert _route(1, 128, 128, sm_count=148) == DEEPK_C2_KG1_ROUTE
+    assert _route(512, 4736, 128, sm_count=148) == DEEPK_C2_KG1_ROUTE
+    assert _route(512, 4864, 128, sm_count=148) == K128_ROUTE
+    assert _route(512, 4864, 128, sm_count=152) == DEEPK_C2_KG1_ROUTE
+    assert route_for_shape(1, 128, 128) == K128_ROUTE
     assert _route(131072, 4096, 128, sm_count=152) == K128_ROUTE
     assert _route(64, 256, 384, sm_count=148) == DEEPK_C2_KG1_ROUTE
     assert _route(256, 256, 384, sm_count=152) == DEEPK_C2_KG1_ROUTE
@@ -1535,6 +1765,7 @@ def test_direct_store_route_only_when_every_tile_is_small():
         ((1, 128, 256), (DEEPK_C2_KG1_DIRECT_STORE_ROUTE, (1, 1, 1))),
         ((32, 256, 384), (DEEPK_C2_KG1_DIRECT_STORE_ROUTE, (2, 1, 1))),
         ((32, 2048, 640), (DEEPK_C2_KG1_DIRECT_STORE_ROUTE, (16, 1, 1))),
+        ((32, 128, 128), (DEEPK_C2_KG1_DIRECT_STORE_ROUTE, (1, 1, 1))),
         ((1, 128, 512), (DEEPK_C2_AB6_SCALE1_DIRECT_STORE_ROUTE, (1, 1, 1))),
         ((32, 2048, 4096), (DEEPK_C2_AB6_SCALE1_DIRECT_STORE_ROUTE, (16, 1, 1))),
     ):
@@ -1547,9 +1778,15 @@ def test_direct_store_route_only_when_every_tile_is_small():
         ((32, 2176, 640), (DEEPK_C2_KG1_ROUTE, (17, 1, 1))),
         ((129, 256, 512), (DEEPK_C2_AB6_SCALE1_ROUTE, (4, 1, 1))),
         ((32, 4096, 512), (DEEPK_C2_ROUTE, (32, 1, 1))),
-        ((32, 128, 128), (K128_ROUTE, (1, 1, 1))),
+        ((32, 19072, 128), (K128_ROUTE, (75, 1, 1))),
     ):
         assert launch_plan(m, n, k, sm_count=148, scalar_output=False) == plan
+    # K=128 past one wave of 128x128 tiles takes the static-K route, which has no
+    # direct-store program, on at most 16 CTAs too.
+    assert launch_plan(32, 2560, 128, sm_count=16, scalar_output=False) == (
+        K128_ROUTE,
+        (10, 1, 1),
+    )
     assert launch_plan(32, 128, 256, sm_count=148, scalar_output=True) == (
         DEEPK_C2_SCALAR_OUTPUT_ROUTE,
         (1, 1, 1),

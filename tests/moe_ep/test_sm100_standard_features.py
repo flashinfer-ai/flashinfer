@@ -35,7 +35,9 @@ from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
         ("mxfp8_e4m3", "situ_unbounded", "DEFAULT", True, "bf16", True),
     ],
 )
-def test_standard_features(kind, activation, mode, early, wire, in_kernel, monkeypatch):
+def test_standard_features(
+    kind, activation, mode, early, wire, in_kernel, monkeypatch, *, autotune=False
+):
     if not torch.cuda.is_available():
         pytest.skip("requires Blackwell")
     rank, world = (
@@ -77,6 +79,8 @@ def test_standard_features(kind, activation, mode, early, wire, in_kernel, monke
         enable_in_kernel_fc2_reduce=in_kernel,
         knobs={"in_kernel_fc2_reduce": True} if in_kernel else None,
     )
+    if autotune:
+        options["knobs"] = "auto"
     if activation.startswith("minimax"):
         options.update(swiglu_alpha=1.702, swiglu_beta=1.0, gate_up_clamp=7.0)
     else:
@@ -150,6 +154,8 @@ def test_standard_features(kind, activation, mode, early, wire, in_kernel, monke
     graph = None
     try:
         layer.warmup(current)
+        if autotune:
+            assert layer.get_tuned_knobs()
         ws = layer._ensure_workspace()
         if mode != "NONE":
             owned = layer.forward(current)

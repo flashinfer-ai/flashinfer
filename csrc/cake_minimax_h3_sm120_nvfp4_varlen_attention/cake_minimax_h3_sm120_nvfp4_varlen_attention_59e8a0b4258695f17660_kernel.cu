@@ -688,6 +688,7 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_59e8a0b4258695f17660(const _
                         : "+f"(s_acc[60]), "+f"(s_acc[(60) + 1]), "+f"(s_acc[(60) + 2]), "+f"(s_acc[(60) + 3])
                         : "r"(q_frags[4]), "r"(q_frags[(4) + 1]), "r"(q_frags[(4) + 2]), "r"(q_frags[(4) + 3]), "r"(k_frag[6]), "r"(k_frag[(6) + 1]), "r"((uint32_t)(qsf[1])), "h"((uint16_t)0), "h"((uint16_t)0), "r"((uint32_t)(smem_regs_14[1])), "h"((uint16_t)0), "h"((uint16_t)0));
                     asm volatile("barrier.arrive %0, 256;" :: "r"(2 - warp / 4) : "memory");
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     if (kb_first == kb || kb_last == kb) {
                         s_acc[0] = ((seg_begin_v > kb * 128 + 2 * (lane & 3) || seg_end_v <= kb * 128 + 2 * (lane & 3)) ? -CUDART_INF_F : s_acc[0]);
                         s_acc[1] = ((seg_begin_v > kb * 128 + 2 * (lane & 3) + 1 || seg_end_v <= kb * 128 + 2 * (lane & 3) + 1) ? -CUDART_INF_F : s_acc[1]);
@@ -813,7 +814,6 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_59e8a0b4258695f17660(const _
                     float _exp2_0 = approx_exp2(m_state[0] - _max_44);
                     float _exp2_1 = approx_exp2(m_state[1] - _max_45);
                     int _vote_0 = __any_sync(0xFFFFFFFF, _max_44 > m_state[0] || _max_45 > m_state[1]);
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     __syncwarp();
                     if (elect_sync()) {
                         mbarrier_arrive(k_empty_addr + (kv_stage) * 8);

@@ -1897,22 +1897,22 @@ def test_paged_capture_replan_changes_indices_and_lengths(
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
 @pytest.mark.parametrize("lse_layout", ["NH", "HN"])
 @pytest.mark.parametrize("device_lengths", [False, True])
-@pytest.mark.parametrize("external_table", [False, True])
+@pytest.mark.parametrize("table_mode", ["owned", "owned_to_external", "external"])
 @pytest.mark.parametrize("capture_backend", ["cudnn", "fa2"])
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
 def test_paged_auto_fallback_refreshes_retained_capture(
     monkeypatch,
     lse_layout,
     device_lengths,
-    external_table,
+    table_mode,
     capture_backend,
     use_cuda_graph,
 ):
     if (
         not prefill._cudnn_supports_paged_auto()
-        or torch.cuda.get_device_capability() not in ((10, 0), (10, 7))
+        or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7))
     ):
-        pytest.skip("requires the qualified SM100/SM107 paged-auto runtime")
+        pytest.skip("requires a supported paged-auto runtime")
     # Override shape admission only after checking the real runtime capability:
     # older backends can reject the reserved page table before capture begins.
     # Control admission to exercise the transition independently of performance
@@ -1936,10 +1936,19 @@ def test_paged_auto_fallback_refreshes_retained_capture(
         paged_kv_last_page_len_buf=torch.empty_like(last, device=q.device),
     )
 
+    caller_table = torch.zeros((2, 8), device=q.device, dtype=torch.int32)
+
     def plan(use_external=False):
         kwargs = {}
         if use_external:
-            table = torch.zeros((2, 8), device=q.device, dtype=torch.int32)
+            # A caller can keep the captured table alive and update it in place.
+            # Its presence must not prevent refreshing wrapper-owned lengths.
+            table = (
+                caller_table
+                if table_mode == "external"
+                else torch.zeros_like(caller_table)
+            )
+            table.zero_()
             for i in range(2):
                 table[i, : ip[i + 1] - ip[i]].copy_(ix[ip[i] : ip[i + 1]])
             kwargs["block_tables"] = table
@@ -1972,7 +1981,7 @@ def test_paged_auto_fallback_refreshes_retained_capture(
             lse if lse_layout == "NH" else lse.T, stats, atol=0.001, rtol=0.001
         )
 
-    plan()
+    plan(table_mode == "external")
     assert wrapper._backend == capture_backend
     run()
     check()
@@ -1987,7 +1996,7 @@ def test_paged_auto_fallback_refreshes_retained_capture(
             qo = torch.tensor([0, 2, 5], dtype=torch.int32)
             ip = torch.tensor([0, 2, 5], dtype=torch.int32)
             ix = torch.tensor([5, 2, 4, 3, 1], device=q.device, dtype=torch.int32)
-            plan(external_table)
+            plan(table_mode != "owned")
             # Both sequences reach FA2 before the first retained replay.
             # Graph wrappers keep its planner; eager wrappers may switch back.
             expected_backend = "cudnn" if selected and not use_cuda_graph else "fa2"

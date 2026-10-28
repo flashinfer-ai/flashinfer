@@ -58,7 +58,13 @@ limitations under the License.
 # their ``y`` stores and the K23 CTAs wait for ``M`` arrivals before they
 # read ``y``, so the tail needs no second launch.  The four-token program
 # serves ``M <= 4``, the eight-token program ``5 <= M <= 8``; the rank is a
-# launch argument and its column width only sizes the grid.
+# launch argument and its column width only sizes the grid.  Its CTAs wait
+# for CTAs of the same grid with other indices (the low tail CTAs gather the
+# columns the owner CTAs of every rank write, and each owner reduce polls
+# the slots that tail CTAs of other indices scatter), so the grid is
+# co-resident: it launches cooperatively (with PDL), and the driver either
+# dispatches all of its at most 88 CTAs, one per SM, at once or refuses the
+# launch.
 #
 # Rows ``M <= 4`` and ``M > 8`` are bitwise identical to the round-4 / round-5
 # routes (the K23 role keeps the numerics of the round-4 K2-stream + fp32-add
@@ -69,6 +75,27 @@ limitations under the License.
 # ESS / persistent boundary by a paired A/B of the two tail routes at 640 to
 # 1056 tokens on both.
 #
+# Concurrency and provisioning.  A workspace is collective state, like an
+# NCCL communicator: the kernels rotate its Lamport epoch on every call, so
+# the calls that share it run one at a time and in the same order on every
+# rank.  A launch from another stream than the previous launch on the
+# workspace is ordered after it with an event wait (outside CUDA Graph
+# capture); concurrent graph replays and several host threads are not
+# ordered and must not share a workspace.  The one-launch program
+# (``M <= 8``) needs its whole grid resident at once on every rank:
+# ``M + 80`` SMs on the 640-column ranks and ``M + 64`` on the 512-column
+# ranks.  Under a green context or MPS partition with fewer SMs the launch
+# raises a RuntimeError (and leaves no CUDA error behind) instead of
+# spinning, and a CUDA Graph capture on such a partition fails, so give
+# every rank at least 88 SMs.  Do not overlap two ``M <= 8`` calls, or one
+# and another cooperative peer-waiting kernel, on one GPU, even with
+# separate workspaces: the two grids do not fit together, and an admission
+# order that differs between ranks deadlocks the group.  A co-runner that
+# never frees the grid's SMs on one rank stalls every rank; the kernels'
+# waits are unbounded and the caller's watchdog is the deadline.  The
+# persistent tails map token ``t`` to CTA ``t mod P`` on every rank, so
+# ``P`` is the group's smallest SM count.
+#
 # The three Lamport workspaces are FlashInfer's own MNNVL all-reduce
 # workspaces (``MNNVLAllReduceFusionWorkspace``: three rotating symmetric
 # buffers initialised to negative zero, multicast mapping, nine-word flags),
@@ -78,7 +105,9 @@ limitations under the License.
 
 from __future__ import annotations
 
+import ctypes
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -307,6 +336,22 @@ def _device_arch(device: torch.device) -> str:
     return arch
 
 
+def group_sm_count(comm_backend: Any, local_sm_count: int) -> int:
+    """The smallest SM count of the group (collective: every rank must call it).
+
+    The persistent tails map token ``t`` to CTA ``t mod P`` and their peer waits pair CTAs of equal index across the
+    ranks, so ``P`` must be equal on every rank.
+    """
+    if not isinstance(local_sm_count, int) or local_sm_count <= 0:
+        raise ValueError(
+            f"local_sm_count must be a positive integer, got {local_sm_count!r}"
+        )
+    counts = [int(count) for count in comm_backend.allgather(local_sm_count)]
+    if not counts or min(counts) <= 0:
+        raise ValueError(f"the group reported SM counts {counts}")
+    return min(counts)
+
+
 def generated_program_available(device: torch.device) -> bool:
     """True when every kernel of the route is registered for ``device``'s architecture."""
     capability = torch.cuda.get_device_capability(device)
@@ -332,6 +377,12 @@ class KimiK3Tp12TailWorkspace:
     once (collective: every rank of ``group`` must call it), reuse it for every
     token count up to ``max_tokens``, and :meth:`destroy` it before the
     process group is destroyed.
+
+    The workspace is collective state, like an NCCL communicator: the calls
+    that share it run one at a time and in the same order on every rank.  A
+    call from another stream than the previous call waits for it
+    (:meth:`order_after_previous_stream`; not under CUDA Graph capture).
+    ``sm_count`` is the smallest SM count of the group.
     """
 
     def __init__(
@@ -374,9 +425,10 @@ class KimiK3Tp12TailWorkspace:
         if device.index is not None:
             torch.cuda.set_device(device.index)
         self.device = torch.device("cuda", torch.cuda.current_device())
-        # persistent K3 grid: one CTA per SM and column half (the Cake runtime's default k3p_ctas)
+        # persistent K3 grid: one CTA per SM and column half (the Cake runtime's default k3p_ctas), the group's
+        # smallest SM count, so the token -> CTA map is the same on every rank
         props = torch.cuda.get_device_properties(self.device)
-        self.sm_count = int(props.multi_processor_count)
+        self.sm_count = group_sm_count(comm_backend, int(props.multi_processor_count))
         self.rank = rank
         self.world_size = WORLD_SIZE
         self.max_tokens = int(max_tokens)
@@ -387,6 +439,8 @@ class KimiK3Tp12TailWorkspace:
         self.buffers: dict[str, MNNVLAllReduceFusionWorkspace] = {}
         self.peer_ptrs: dict[str, torch.Tensor] = {}
         self._destroyed = False
+        #: the stream of the previous launch on this workspace (outside capture)
+        self._last_stream: Optional[torch.cuda.Stream] = None
         try:
             for name, size in workspace_buffer_bytes(self.max_tokens).items():
                 ws = MNNVLAllReduceFusionWorkspace(
@@ -419,6 +473,22 @@ class KimiK3Tp12TailWorkspace:
             ws.destroy()
         self.buffers.clear()
         self.peer_ptrs.clear()
+
+    def order_after_previous_stream(self) -> None:
+        """Order a launch from another stream than the previous launch on this workspace after it.
+
+        The current stream waits on an event recorded on the previous stream, so the calls run one at a time; one
+        stream costs a stream compare.  Skipped under CUDA Graph capture: the caller orders graph replays.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            return
+        current = torch.cuda.current_stream(self.device)
+        previous = self._last_stream
+        if previous is not None and previous != current:
+            event = torch.cuda.Event()
+            event.record(previous)
+            current.wait_event(event)
+        self._last_stream = current
 
     def flags(self, name: str) -> torch.Tensor:
         return self.buffers[name].buffer_flags
@@ -483,7 +553,8 @@ class KimiK3Tp12TailRunner:
     the runner (or a CUDA Graph capturing it) replays for new values written
     into the same buffers.  Every rank of the group must launch the same
     token count; prepare a new runner when a shape or a tensor binding
-    changes.
+    changes.  A launch from another stream than the previous launch on the
+    workspace first waits for it (outside capture).
     """
 
     num_tokens: int
@@ -498,6 +569,10 @@ class KimiK3Tp12TailRunner:
     out: torch.Tensor
     #: cuBLAS ``torch.mm`` between K1 and the tail (``M > K23_MAX_TOKENS``); False = the one-launch program
     cublas: bool
+    #: the workspace the launches use; orders a launch from another stream after the previous one
+    workspace: Optional[KimiK3Tp12TailWorkspace] = field(
+        default=None, repr=False, compare=False
+    )
 
     @property
     def kernel_keys(self) -> tuple[str, ...]:
@@ -521,7 +596,12 @@ class KimiK3Tp12TailRunner:
         return 3 if self.cublas else 2
 
     def launch(self) -> torch.Tensor:
+        if self.workspace is not None:
+            self.workspace.order_after_previous_stream()
         with tvm_ffi.use_torch_stream():
+            if self.k3 is None:
+                _launch_one_launch_program(self.k1, self.num_tokens, self.rank)
+                return self.out
             self.k1()
             if self.cublas:
                 torch.mm(self.y, self.up_weight_slice.t(), out=self.gemm)
@@ -530,6 +610,41 @@ class KimiK3Tp12TailRunner:
         return self.out
 
     __call__ = launch
+
+
+def _clear_cuda_last_error() -> None:
+    """Reset the CUDA runtime's last error (``cudaGetLastError``).
+
+    The generated bindings and torch share the process's ``libcudart``, so the call goes to that library, loaded
+    already (``RTLD_NOLOAD``); ``cuda.bindings.runtime`` keeps a runtime state of its own and does not reset it.
+    """
+    major = (torch.version.cuda or "").split(".")[0]
+    try:
+        cudart = ctypes.CDLL(f"libcudart.so.{major}", mode=os.RTLD_NOLOAD | os.RTLD_NOW)
+    except OSError:
+        return
+    cudart.cudaGetLastError.restype = ctypes.c_int
+    cudart.cudaGetLastError()
+
+
+def _launch_one_launch_program(launch: _Launch, num_tokens: int, rank: int) -> None:
+    """Launch the one-launch program; a refused cooperative launch raises a RuntimeError and leaves no CUDA error.
+
+    The driver refuses the cooperative launch when the grid cannot be resident at once, for example on a green
+    context or MPS partition with fewer SMs than the grid.  Nothing runs, but the refusal stays as the runtime's last
+    error, which the next launch check that reads it (torch's, for example) would raise; it is cleared here.
+    """
+    try:
+        launch()
+    except Exception as err:
+        if "cooperative launch" not in str(err):
+            raise
+        _clear_cuda_last_error()
+        raise RuntimeError(
+            f"kimi_k3_tp12_tail: the one-launch program ({launch.key}, {num_tokens} tokens) needs "
+            f"{k123_grid(num_tokens, rank)[0]} SMs resident at once on rank {rank}; the current stream's SMs cannot "
+            "hold its grid, so the cooperative launch was refused and nothing ran"
+        ) from None
 
 
 def _check(
@@ -776,6 +891,7 @@ def prepare_kimi_k3_tp12_tail(
             up_weight_slice=up_weight_slice,
             out=out,
             cublas=cublas,
+            workspace=workspace,
         )
     k3_key = keys[1]
     k3_module = kernel_module_name(arch, k3_key)
@@ -802,6 +918,7 @@ def prepare_kimi_k3_tp12_tail(
         up_weight_slice=up_weight_slice,
         out=out,
         cublas=cublas,
+        workspace=workspace,
     )
 
 
@@ -829,6 +946,7 @@ __all__ = [
     "WORLD_SIZE",
     "col_begin",
     "generated_program_available",
+    "group_sm_count",
     "k1_kernel_key",
     "k123_grid",
     "k3_form_for",
