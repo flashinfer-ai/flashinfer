@@ -355,6 +355,70 @@ def test_head_major_unit_table_publishes_heads_in_order() -> None:
         assert [(seg, t) for seg, _head, t in chunk] == first_head
 
 
+def test_overlapped_form_warms_up_once_outside_capture(monkeypatch) -> None:
+    # The producers, then the lead and the tail attention.  The first call on a device whose own
+    # stream takes part in no graph capture first runs the three programs once with no work on the
+    # call's head-control words; a call whose stream is capturing runs none.  The capture query
+    # asks about the call's own device and stream.
+    launches = []
+    monkeypatch.setattr(
+        ops,
+        "_overlap_entries",
+        lambda _target: tuple(
+            lambda *args, _slot=slot: launches.append((_slot, args))
+            for slot in ("producers", "lead", "tail")
+        ),
+    )
+    monkeypatch.setattr(ops, "_OVERLAP_LOADED", set())
+    queries = []
+    capturing = [True]
+
+    def query(index: int, stream: int) -> bool:
+        queries.append((index, stream))
+        return capturing[0]
+
+    monkeypatch.setattr(ops, "_capturing", query)
+    producer_tensors = ("q", "k", "v", "hctr")
+    attention_tensors = ("q8_rows", "out", "unit_table_head_major")
+    # statistics tiles, tokens, padded tokens, segments, heads, 128-key blocks
+    producer_facts = (5, 2100, 2176, 3, 56, 17)
+    # units, heads, 128-key blocks, log2-domain scale, head-control words
+    attention_facts = (51, 56, 17, 0.25, "hctr")
+
+    def call() -> None:
+        ops._launch_overlapped(
+            "sm_120a",
+            1,
+            4321,
+            producer_tensors,
+            producer_facts,
+            attention_tensors,
+            attention_facts,
+            (138, 64, 32),
+        )
+
+    work = [
+        ("producers", (*producer_tensors, *producer_facts, 64, 1, 1)),
+        ("lead", (*attention_tensors, *attention_facts, 138, 32, 138, 1, 1)),
+        ("tail", (*attention_tensors, *attention_facts, 138, 32, 32, 1, 1)),
+    ]
+    no_work = [
+        ("producers", (*producer_tensors, 0, 2100, 2176, 1, 1, 0, 1, 1, 1)),
+        ("lead", (*attention_tensors, 0, 1, 1, 0.25, "hctr", 1, 1, 1, 1, 1)),
+        ("tail", (*attention_tensors, 0, 1, 1, 0.25, "hctr", 1, 1, 1, 1, 1)),
+    ]
+    call()  # the call's own stream is capturing: the call's launches only
+    assert launches == work
+    launches.clear()
+    capturing[0] = False
+    call()  # the first eager call: the no-work instance, then the call
+    assert launches == no_work + work
+    launches.clear()
+    call()
+    assert launches == work
+    assert queries == [(1, 4321), (1, 4321)]
+
+
 def test_softmax_scale_log2_rounds_as_the_kernel_takes_it() -> None:
     scale = 1.0 / math.sqrt(128)
     value = ops._softmax_scale_log2(scale)

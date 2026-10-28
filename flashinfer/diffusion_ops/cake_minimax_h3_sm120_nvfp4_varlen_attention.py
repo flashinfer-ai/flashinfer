@@ -54,6 +54,7 @@ from .cake_minimax_h3_sm120_quant_varlen_attention import (
     _MAX_PLANS,
     MINIMAX_H3_HEAD_DIM,
     MINIMAX_H3_NUM_HEADS,
+    _capturing,
     _ceil_div,
     _check_thd,
     _current_stream,
@@ -1240,9 +1241,8 @@ def _minimax_h3_sm120_varlen_attention_nvfp4_impl(
                 v_sf,
             )
             key = (q.device.index, attention)
-            if (
-                key not in _NVFP4_OVERLAP_LOADED
-                and not torch.cuda.is_current_stream_capturing()
+            if key not in _NVFP4_OVERLAP_LOADED and not _capturing(
+                q.device.index, stream
             ):
                 _load_overlap(
                     target,

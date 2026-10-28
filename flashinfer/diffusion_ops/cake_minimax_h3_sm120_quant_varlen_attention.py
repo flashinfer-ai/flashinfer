@@ -493,6 +493,18 @@ def _capture_id(stream: int) -> int:
     return int(info[2])
 
 
+def _capturing(index: int, stream: int) -> bool:
+    """Whether the raw stream ``stream`` of device ``index`` takes part in a CUDA-graph capture.
+
+    ``torch.cuda.is_current_stream_capturing`` reads the current stream of the current device, which is
+    ``stream`` only when ``index`` is the current device; a call whose tensors live on another device asks
+    CUDA about ``stream`` itself.
+    """
+    if index == torch.cuda.current_device():
+        return torch.cuda.is_current_stream_capturing()
+    return _capture_id(stream) != 0
+
+
 def _owner(index: int, stream: int) -> Tuple[int, ...]:
     """The workspace owner of a call on device ``index`` and raw stream ``stream``: ``(index, stream)`` for
     an eager call, ``(index, stream, capture id)`` for a call captured into a CUDA graph.
@@ -509,7 +521,7 @@ def _owner(index: int, stream: int) -> Tuple[int, ...]:
     # Concurrency: safe on any number of streams, host threads, CUDA graphs and MPS clients. Exec graphs
     # instantiated more than once from one captured graph (or cloned as child graphs) share this op's
     # workspace and must not run concurrently.
-    if torch.cuda.is_current_stream_capturing():
+    if _capturing(index, stream):
         capture = _capture_id(stream)
         if capture:
             return (index, stream, capture)
@@ -699,6 +711,7 @@ def _minimax_h3_sm120_varlen_attention_fp8_impl(
             _launch_overlapped(
                 target,
                 q.device.index,
+                stream,
                 (
                     q,
                     k,
@@ -863,6 +876,7 @@ _OVERLAP_LOADED: set = set()
 def _launch_overlapped(
     target: str,
     index: int,
+    stream: int,
     producer_tensors: Tuple[Any, ...],
     producer_facts: Tuple[int, ...],
     attention_tensors: Tuple[Any, ...],
@@ -877,15 +891,15 @@ def _launch_overlapped(
     ``total_units`` through ``hctr``; ``grids`` is ``(lead, producers, tail)``.  The caller holds the
     stream's host lock (``_stream_lock``), so the three launches are contiguous on the stream.
 
-    The first overlapped call on a device outside a graph capture first runs the three programs once
-    with no work, in the same order on the call's own head-control words (read as one head's, left
-    zero), so their modules load before the call's own launches.  This only keeps a module load out of
-    the first call's overlap: a CTA of the overlap waits only on CTAs of the earlier launches of its
-    call, so a lazy module load delays a call and never blocks it.
+    The first overlapped call on a device whose raw stream ``stream`` takes part in no graph capture
+    (``_capturing``) first runs the three programs once with no work, in the same order on the call's
+    own head-control words (read as one head's, left zero), so their modules load before the call's
+    own launches.  This only keeps a module load out of the first call's overlap: a CTA of the overlap
+    waits only on CTAs of the earlier launches of its call, so a lazy module load delays a call and
+    never blocks it.
     """
     producers, lead, tail = _overlap_entries(target)
-    capturing = torch.cuda.is_current_stream_capturing()
-    if not capturing and (index, target) not in _OVERLAP_LOADED:
+    if (index, target) not in _OVERLAP_LOADED and not _capturing(index, stream):
         # one head, no statistics tile, no 128-key block, one segment, no unit
         tokens, padded_tokens = producer_facts[1], producer_facts[2]
         producers(*producer_tensors, 0, tokens, padded_tokens, 1, 1, 0, 1, 1, 1)

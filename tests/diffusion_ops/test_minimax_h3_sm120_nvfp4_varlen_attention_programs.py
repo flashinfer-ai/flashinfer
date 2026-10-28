@@ -546,7 +546,7 @@ def test_overlapped_form_launches_the_producers_first(overlap, monkeypatch) -> N
     monkeypatch.setattr(ops, "_ffi_device", lambda _index: None)
     monkeypatch.setattr(ops, "_NVFP4_OVERLAP_LOADED", set())
     capturing = [True]
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing[0])
+    monkeypatch.setattr(ops, "_capturing", lambda _index, _stream: capturing[0])
     producers, lead, tail = (ops._NVFP4_PROGRAMS.index(program) for program in overlap)
     tokens, heads, scale = 2100, 3, 0.25
     q = torch.empty(tokens, heads, MINIMAX_H3_HEAD_DIM)
@@ -619,6 +619,7 @@ def test_workspace_owners_and_stream_locks(monkeypatch) -> None:
     """An eager call's workspace owner is its (device, stream); a call during graph capture also carries
     the capture's id, so graphs captured one after another on one stream get separate workspace sets.  The
     host lock is one per (device, stream), whatever the capture."""
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     assert quant_ops._owner(0, 1234) == (0, 1234)
     capture_ids = iter((7, 8, 0))
@@ -628,6 +629,14 @@ def test_workspace_owners_and_stream_locks(monkeypatch) -> None:
     assert quant_ops._owner(0, 1234) == (0, 1234, 8)
     # a stream that takes part in no capture is an eager owner
     assert quant_ops._owner(0, 1234) == (0, 1234)
+    # torch's capture query reads the current device's stream; a call on another device asks CUDA about
+    # its own stream, capturing or not
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(quant_ops, "_capture_id", lambda _stream: 9)
+    assert quant_ops._owner(1, 4321) == (1, 4321, 9)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(quant_ops, "_capture_id", lambda _stream: 0)
+    assert quant_ops._owner(1, 4321) == (1, 4321)
     lock = quant_ops._stream_lock(0, 1234)
     assert lock is quant_ops._stream_lock(0, 1234)
     assert lock is not quant_ops._stream_lock(0, 1235)
