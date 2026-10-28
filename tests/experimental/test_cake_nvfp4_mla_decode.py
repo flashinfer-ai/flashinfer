@@ -65,7 +65,9 @@ ROWS_PER_TILE = cake_backend.ROWS_PER_TILE
 SF_ROW_BYTES = cake_backend.SF_ROW_BYTES
 SF_VEC = cake_backend.SF_VEC
 SHORT_EPI_RECORD = cake_backend.SHORT_EPI_RECORD
+SHORT_EPI_SPEC_RECORD = cake_backend.SHORT_EPI_SPEC_RECORD
 SHORT_RECORD = cake_backend.SHORT_RECORD
+SHORT_SPEC_RECORD = cake_backend.SHORT_SPEC_RECORD
 V_HALVES = cake_backend.V_HALVES
 XV_RECORD = cake_backend.XV_RECORD
 build_work_plan = cake_backend.build_work_plan
@@ -92,6 +94,12 @@ FURTHER_RECORDS = {
         "decode",
         cake_jit.ARCHES,
         {"short_rows": True, "epi_warp": True},
+    ),
+    SHORT_SPEC_RECORD: ("decode", ("sm_100a",), {"short_rows": True, "spec_uh": True}),
+    SHORT_EPI_SPEC_RECORD: (
+        "decode",
+        cake_jit.ARCHES,
+        {"short_rows": True, "epi_warp": True, "spec_uh": True},
     ),
     REDUCE_GENERAL_RECORD: ("reduce", cake_jit.ARCHES, {"general_splits": True}),
 }
@@ -608,16 +616,37 @@ def xv_record(monkeypatch):
     return _register_further(monkeypatch, XV_RECORD)
 
 
+def _without_spec_records(monkeypatch):
+    """Drops the short-row records that load their unit's first item in the
+    kernel setup, so a test of the short-row rules sees the programs without."""
+    for name in (SHORT_SPEC_RECORD, SHORT_EPI_SPEC_RECORD):
+        monkeypatch.delitem(cake_jit.MODULES, name, raising=False)
+
+
 @pytest.fixture
 def short_record(monkeypatch):
-    """Registers the short-row decode record for both architectures."""
+    """Registers the short-row decode record for both architectures (without
+    the records of ``spec_records``)."""
+    _without_spec_records(monkeypatch)
     return _register_further(monkeypatch, SHORT_RECORD)
 
 
 @pytest.fixture
 def short_epi_record(monkeypatch):
-    """Registers the per-warp epilogue short-row record for both architectures."""
+    """Registers the per-warp epilogue short-row record for both architectures
+    (without the records of ``spec_records``)."""
+    _without_spec_records(monkeypatch)
     return _register_further(monkeypatch, SHORT_EPI_RECORD)
+
+
+@pytest.fixture
+def spec_records(monkeypatch, short_record, short_epi_record):
+    """Registers both short-row records and, beside them, the two that load
+    their unit's first item in the kernel setup (the short-row one for SM100)."""
+    return {
+        name: _register_further(monkeypatch, name)
+        for name in (SHORT_SPEC_RECORD, SHORT_EPI_SPEC_RECORD)
+    }
 
 
 @pytest.fixture
@@ -1002,6 +1031,87 @@ def test_select_decode_record_short_epi_boundary_of_uniform_plans(
     want = SHORT_EPI_RECORD if tail_rows >= 32 else SHORT_RECORD
     for arch in cake_jit.ARCHES:
         assert select_decode_record(plan, arch) == want
+
+
+@pytest.mark.parametrize(
+    "num_heads,q_len,epi", [(64, 6, False), (64, 1, False), (8, 4, True), (8, 6, True)]
+)
+def test_select_decode_record_spec_uh_needs_one_item_pair_per_unit(
+    spec_records, num_heads, q_len, epi
+):
+    """The programs loading their unit's first item in the kernel setup run a
+    short plan whose every unit holds one item pair; a unit of several pairs
+    (or of none) keeps the program without that load."""
+    short, spec = (
+        (SHORT_EPI_RECORD, SHORT_EPI_SPEC_RECORD)
+        if epi
+        else (SHORT_RECORD, SHORT_SPEC_RECORD)
+    )
+    one = _hand_plan([8], [16], [1], q_len=q_len, num_heads=num_heads)
+    several = _hand_plan([8], [4, 4], q_len=q_len, num_heads=num_heads)
+    empty = _hand_plan([8], [], q_len=q_len, num_heads=num_heads)
+    assert select_decode_record(one, "sm_100a") == spec
+    assert select_decode_record(several, "sm_100a") == short
+    assert select_decode_record(empty, "sm_100a") == short
+    # SM103 has no short-row program with that load; the epilogue one it has.
+    assert select_decode_record(one, "sm_103a") == (spec if epi else short)
+    assert select_decode_record(several, "sm_103a") == short
+    # The short-row rule first: a long unit runs neither.
+    long = _hand_plan([8], [400], q_len=q_len, num_heads=num_heads)
+    assert select_decode_record(long, "sm_100a") not in (short, spec)
+
+
+def test_select_decode_record_spec_uh_needs_the_records(monkeypatch, spec_records):
+    one = _hand_plan([8], [8])
+    one_epi = _hand_plan([8], [8], q_len=4, num_heads=8)
+    assert select_decode_record(one, "sm_100a") == SHORT_SPEC_RECORD
+    assert select_decode_record(one_epi, "sm_100a") == SHORT_EPI_SPEC_RECORD
+    spec_records[SHORT_EPI_SPEC_RECORD]["arches"] = ["sm_103a"]
+    assert select_decode_record(one_epi, "sm_100a") == SHORT_EPI_RECORD
+    monkeypatch.delitem(cake_jit.MODULES, SHORT_SPEC_RECORD)
+    assert select_decode_record(one, "sm_100a") == SHORT_RECORD
+    # Only in place of the short-row records: without them the plan runs the decode.
+    spec_records[SHORT_EPI_SPEC_RECORD]["arches"] = list(cake_jit.ARCHES)
+    monkeypatch.delitem(cake_jit.MODULES, SHORT_RECORD)
+    assert select_decode_record(one_epi, "sm_103a") == "decode"
+
+
+SPEC_PAIRS_KV = [300, 600, 900, 1200, 9000]
+
+
+@pytest.mark.parametrize("num_sms", [148, 152])
+@pytest.mark.parametrize("num_heads,q_len,epi", [(64, 6, False), (8, 4, True)])
+def test_select_decode_record_spec_uh_boundary_of_balanced_plans(
+    spec_records, num_sms, num_heads, q_len, epi
+):
+    """Four short requests beside a long one: the balanced partition joins the
+    end of one short request and the start of the next in one unit, so the
+    plan keeps the programs without the setup load; the uniform plan of the
+    same requests (one item pair per unit) runs them."""
+    short, spec = (
+        (SHORT_EPI_RECORD, SHORT_EPI_SPEC_RECORD)
+        if epi
+        else (SHORT_RECORD, SHORT_SPEC_RECORD)
+    )
+    kwargs = dict(num_heads=num_heads, num_sms=num_sms, q_len=q_len, enable_sink=True)
+    balanced = build_work_plan(SPEC_PAIRS_KV, **kwargs)
+    assert balanced.schedule == "balanced"
+    pairs = [
+        (last - first) // V_HALVES
+        for first, last in zip(
+            balanced.unit_first, balanced.unit_first[1:], strict=False
+        )
+    ]
+    assert min(pairs) == 1 and max(pairs) > 1
+    uniform = build_work_plan(
+        SPEC_PAIRS_KV, schedule="uniform", tiles_per_split=16, **kwargs
+    )
+    for arch in cake_jit.ARCHES:
+        limit = cake_backend.SHORT_MAX_UNIT_TILES[arch]
+        assert max(unit_tiles(balanced)) <= limit and max(unit_tiles(uniform)) <= limit
+        assert select_decode_record(balanced, arch) == short
+        want = spec if arch in FURTHER_RECORDS[spec][1] else short
+        assert select_decode_record(uniform, arch) == want
 
 
 def test_select_decode_record_short_needs_the_record_and_a_threshold(
@@ -1783,6 +1893,7 @@ def test_xv_decode_matches_the_decode_bitwise(monkeypatch, label, kv_lens):
         ("bs32_q6_kv4096", [4096] * 32, {}),
         ("bs23_q6_kv8448", [8448] * 23, {}),
         ("bs24_q6_kv8320", [8320] * 24, {}),
+        ("spec_pairs_h64_q6", SPEC_PAIRS_KV, {}),
     ],
 )
 def test_short_decode_matches_the_decode_bitwise(monkeypatch, label, kv_lens, options):
@@ -1798,6 +1909,7 @@ def test_short_decode_matches_the_decode_bitwise(monkeypatch, label, kv_lens, op
         ("h1_q32_tail32", EPI_BOUNDARY_KV, {"num_heads": 1, "q_len": 32, **SPLIT16}),
         ("h8_q4_tail32", EPI_BOUNDARY_KV, {"num_heads": 8, "q_len": 4, **SPLIT16}),
         ("h16_q6_tail32", [4096] * 8, {"num_heads": 16}),
+        ("spec_pairs_h8_q4", SPEC_PAIRS_KV, {"num_heads": 8, "q_len": 4}),
     ],
 )
 def test_short_epi_decode_matches_the_decode_bitwise(
@@ -1806,6 +1918,52 @@ def test_short_epi_decode_matches_the_decode_bitwise(
     """Short plans whose requests end in a CTA of at least 32 valid query
     rows run the per-warp epilogue and the decode programs to the same bits."""
     assert_programs_match_bitwise(monkeypatch, SHORT_EPI_RECORD, kv_lens, **options)
+
+
+@pytest.mark.parametrize(
+    "label,kv_lens,options",
+    [
+        ("smoke_forced_two_splits", [256, 300], {"tiles_per_split": 2}),
+        ("no_sink_q1", [64, 65, 4096, 777], {"q_len": 1, "enable_sink": False}),
+        ("h1_q31_tail31", EPI_BOUNDARY_KV, {"num_heads": 1, "q_len": 31, **SPLIT16}),
+        ("h8_q3_tail24", EPI_BOUNDARY_KV, {"num_heads": 8, "q_len": 3, **SPLIT16}),
+        ("bs32_q6_kv4096", [4096] * 32, {}),
+        ("spec_pairs_h64_q6_uniform", SPEC_PAIRS_KV, SPLIT16),
+    ],
+)
+def test_short_spec_decode_matches_the_decode_bitwise(
+    monkeypatch, label, kv_lens, options
+):
+    """Short plans of one item pair per unit run the short-row program that
+    loads its unit's first item in the kernel setup (SM100) and the decode
+    program to the same bits."""
+    assert_programs_match_bitwise(monkeypatch, SHORT_SPEC_RECORD, kv_lens, **options)
+
+
+@pytest.mark.parametrize(
+    "label,kv_lens,options",
+    [
+        ("partial_pages_h8", [1000, 8192, 5000], {"num_heads": 8, **SPLIT16}),
+        ("h1_q32_tail32", EPI_BOUNDARY_KV, {"num_heads": 1, "q_len": 32, **SPLIT16}),
+        ("h8_q4_tail32", EPI_BOUNDARY_KV, {"num_heads": 8, "q_len": 4, **SPLIT16}),
+        ("h16_q6_tail32", [4096] * 8, {"num_heads": 16}),
+        (
+            "spec_pairs_h8_q4_uniform",
+            SPEC_PAIRS_KV,
+            {"num_heads": 8, "q_len": 4, **SPLIT16},
+        ),
+    ],
+)
+def test_short_epi_spec_decode_matches_the_decode_bitwise(
+    monkeypatch, label, kv_lens, options
+):
+    """Short plans of one item pair per unit whose requests end in a CTA of at
+    least 32 valid query rows run the per-warp epilogue program that loads its
+    unit's first item in the kernel setup and the decode program to the same
+    bits."""
+    assert_programs_match_bitwise(
+        monkeypatch, SHORT_EPI_SPEC_RECORD, kv_lens, **options
+    )
 
 
 @pytest.mark.parametrize(

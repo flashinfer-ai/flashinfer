@@ -35,7 +35,11 @@ the kernel setup and frees its tensor memory once the last epilogue has read
 it, which ``select_decode_record`` picks for plans of short units, and
 ``decode_short_epi_warp``, that decode with its epilogue store path picked
 per softmax warp, which ``select_decode_record`` picks in its place when
-every request ends in a CTA of at least 32 valid query rows; the combine's is
+every request ends in a CTA of at least 32 valid query rows, and
+``decode_short_spec_uh`` (SM100) and ``decode_short_epi_warp_spec_uh``, those
+two decodes loading the first item of their unit in the kernel setup, which
+``select_decode_record`` picks in place of either when every unit holds one
+item pair; the combine's is
 ``reduce_general``, a combine that reads the first pair of splits of a row
 from its top loads, which ``select_reduce_record`` picks for plans of more
 than two splits per row.  A renamed program still changes no host code.  A
@@ -73,8 +77,8 @@ digits of the SHA-256 of the compact JSON ``{"build": <build keywords, sorted,
 every default spelled>, "module": <dotted source module>}`` of the kernel the
 program was rendered from; a changed keyword is a new program.  The exception
 is a keyword at its implicit default (``qk_ahead``, ``short_rows``, ``xv``,
-``epi_warp`` and ``general_splits`` at ``False``): the name omits it, so
-programs named before the keyword existed keep their names.
+``epi_warp``, ``spec_uh`` and ``general_splits`` at ``False``): the name omits
+it, so programs named before the keyword existed keep their names.
 """
 
 from __future__ import annotations
