@@ -38,6 +38,7 @@ from flashinfer.gemm.cake_grouped_fp8_gemm import (
     DEEPK_C2_AB6_SCALE1_ROUTE,
     DEEPK_C2_KG1_DIRECT_STORE_ROUTE,
     DEEPK_C2_KG1_EXPERT_ALIGNED_ROUTE,
+    DEEPK_C2_KG1_N64_ROUTE,
     DEEPK_C2_KG1_ROUTE,
     DEEPK_C2_ROUTE,
     DEEPK_C2_SCALAR_OUTPUT_ROUTE,
@@ -2177,10 +2178,15 @@ def test_direct_store_route_only_when_every_tile_is_small():
     ):
         assert launch_plan(m, n, k, sm_count=148, scalar_output=False) == plan
         assert plan[0] in ROUTES
-    # A full tile, more than 16 CTAs or another route keeps the route's program.
+    # More than 32 rows on the KG1 route take its 128 x 64 program when those
+    # tiles fit in one wave (see test_kg1_n64_route_when_its_tiles_fit_in_one_wave).
     for (m, n, k), plan in (
-        ((33, 128, 256), (DEEPK_C2_KG1_ROUTE, (1, 1, 1))),
-        ((64, 256, 384), (DEEPK_C2_KG1_ROUTE, (2, 1, 1))),
+        ((33, 128, 256), (DEEPK_C2_KG1_N64_ROUTE, (2, 1, 1))),
+        ((64, 256, 384), (DEEPK_C2_KG1_N64_ROUTE, (4, 1, 1))),
+    ):
+        assert launch_plan(m, n, k, sm_count=148, scalar_output=False) == plan
+    # More than 16 CTAs or another route keeps the route's program.
+    for (m, n, k), plan in (
         ((32, 2176, 640), (DEEPK_C2_KG1_ROUTE, (17, 1, 1))),
         ((129, 256, 512), (DEEPK_C2_AB6_SCALE1_ROUTE, (4, 1, 1))),
         ((32, 4096, 512), (DEEPK_C2_ROUTE, (32, 1, 1))),
@@ -2200,17 +2206,22 @@ def test_direct_store_route_only_when_every_tile_is_small():
 
 
 @pytest.mark.parametrize(
-    "group_counts,n,k",
+    "group_counts,n,k,full_route",
     [
-        pytest.param([1], 256, 640, id="kg1_m1"),
-        pytest.param([5, 0, 27], 2048, 640, id="kg1_m32_three_experts"),
-        pytest.param([16], 256, 512, id="ab6_m16"),
-        pytest.param([3, 29], 256, 4096, id="ab6_m32_two_experts"),
+        pytest.param([1], 256, 640, DEEPK_C2_KG1_N64_ROUTE, id="kg1_m1"),
+        pytest.param(
+            [5, 0, 27], 2048, 640, DEEPK_C2_KG1_N64_ROUTE, id="kg1_m32_three_experts"
+        ),
+        pytest.param([16], 256, 512, DEEPK_C2_AB6_SCALE1_ROUTE, id="ab6_m16"),
+        pytest.param(
+            [3, 29], 256, 4096, DEEPK_C2_AB6_SCALE1_ROUTE, id="ab6_m32_two_experts"
+        ),
     ],
 )
-def test_direct_store_programs_match_the_route_programs(group_counts, n, k):
+def test_direct_store_programs_match_the_route_programs(group_counts, n, k, full_route):
     """A launch of at most 32 rows runs the direct-store program; its output equals
-    the same rows of a 33-row launch, which runs the route's TMA-store program."""
+    the same rows of a 33-row launch, which runs the route's TMA-store program (on
+    the KG1 route, its 128 x 64 program: those tiles fit in one wave)."""
     device = torch.device("cuda")
     m = sum(group_counts)
     longer = [*group_counts[:-1], group_counts[-1] + 33 - m]
@@ -2223,11 +2234,11 @@ def test_direct_store_programs_match_the_route_programs(group_counts, n, k):
     full = prepare_group_gemm_fp8_nt_groupwise_contiguous(
         a, b, a_scale, b_scale, m_indices
     )
-    assert full.route in (DEEPK_C2_KG1_ROUTE, DEEPK_C2_AB6_SCALE1_ROUTE)
+    assert full.route == full_route
     assert (
         short.route
         == {
-            DEEPK_C2_KG1_ROUTE: DEEPK_C2_KG1_DIRECT_STORE_ROUTE,
+            DEEPK_C2_KG1_N64_ROUTE: DEEPK_C2_KG1_DIRECT_STORE_ROUTE,
             DEEPK_C2_AB6_SCALE1_ROUTE: DEEPK_C2_AB6_SCALE1_DIRECT_STORE_ROUTE,
         }[full.route]
     )
@@ -2236,6 +2247,23 @@ def test_direct_store_programs_match_the_route_programs(group_counts, n, k):
     torch.cuda.synchronize()
     assert torch.equal(out, expect[:m])
     _assert_close(out, _reference(a[:m], b, a_scale[:m], b_scale, m_indices[:m]))
+
+
+def test_kg1_n64_route_when_its_tiles_fit_in_one_wave():
+    """A KG1 launch of more than 32 rows takes the KG1 program with 128 x 64 tiles
+    when ceil(M / 128) * ceil(N / 64) <= the SM count, one CTA per tile; at most 32
+    rows, or more tiles than SMs, keep the 128 x 128 program."""
+    assert route_geometry(DEEPK_C2_KG1_N64_ROUTE) == (128, 64, 1)
+    assert DEEPK_C2_KG1_N64_ROUTE in ROUTES
+    for (m, n, k, sm_count), plan in (
+        ((256, 4736, 640, 148), (DEEPK_C2_KG1_N64_ROUTE, (148, 1, 1))),
+        ((256, 4864, 640, 148), (DEEPK_C2_KG1_ROUTE, (76, 1, 1))),
+        ((256, 4864, 640, 152), (DEEPK_C2_KG1_N64_ROUTE, (152, 1, 1))),
+        ((33, 2176, 640, 148), (DEEPK_C2_KG1_N64_ROUTE, (34, 1, 1))),
+        ((32, 2176, 640, 148), (DEEPK_C2_KG1_ROUTE, (17, 1, 1))),
+        ((127, 128, 256, 148), (DEEPK_C2_KG1_N64_ROUTE, (2, 1, 1))),
+    ):
+        assert launch_plan(m, n, k, sm_count=sm_count, scalar_output=False) == plan
 
 
 def test_rejects_invalid_inputs():

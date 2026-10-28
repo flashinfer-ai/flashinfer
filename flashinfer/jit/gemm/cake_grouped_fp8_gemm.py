@@ -271,6 +271,18 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_grouped_fp8_gemm_488f15389de98fd92896": {
+        "kernel": "kernel_cake_grouped_fp8_gemm_488f15389de98fd92896",
+        "sources": [
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_488f15389de98fd92896_kernel.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_488f15389de98fd92896_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan0",
+        "arches": ["sm_100a", "sm_103a"],
+    },
     "cake_grouped_fp8_gemm_4c6307d24f3915e88028": {
         "kernel": "kernel_cake_grouped_fp8_gemm_4c6307d24f3915e88028",
         "sources": [
@@ -589,6 +601,14 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_103a",
         "program": "cake_grouped_fp8_gemm_3be71ae2bb86939e1cd8",
     },
+    "cake_grouped_fp8_gemm_488f15389de98fd92896_sm_100a": {
+        "arch": "sm_100a",
+        "program": "cake_grouped_fp8_gemm_488f15389de98fd92896",
+    },
+    "cake_grouped_fp8_gemm_488f15389de98fd92896_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_grouped_fp8_gemm_488f15389de98fd92896",
+    },
     "cake_grouped_fp8_gemm_4c6307d24f3915e88028_sm_100a": {
         "arch": "sm_100a",
         "program": "cake_grouped_fp8_gemm_4c6307d24f3915e88028",
@@ -739,6 +759,7 @@ ROUTES: dict[str, Any] = {
     "deepk_c2_k_multiple_512": "cake_grouped_fp8_gemm_917859181466ebe2dd3b",
     "deepk_c2_kg1_direct_store_m32": "cake_grouped_fp8_gemm_a14c6ac9847f0cefb838",
     "deepk_c2_kg1_expert_aligned": "cake_grouped_fp8_gemm_ff32d0570617af1d5c2e",
+    "deepk_c2_kg1_n64_k_blocks": "cake_grouped_fp8_gemm_488f15389de98fd92896",
     "deepk_c2_kg1_non_kg4_k_blocks": "cake_grouped_fp8_gemm_12f65758f84c60eb3d18",
     "deepk_c2_scalar_output": "cake_grouped_fp8_gemm_3be71ae2bb86939e1cd8",
     "deepk_cg2_ab5_x16_four_load_wait_grid128_kg4": "cake_grouped_fp8_gemm_e032da34f6810f0aa5b6",
@@ -781,6 +802,7 @@ ROUTE_GEOMETRY: dict[str, dict[str, int]] = {
     "deepk_c2_k_multiple_512": {"tile_m": 128, "tile_n": 128, "cluster_ctas": 1},
     "deepk_c2_kg1_direct_store_m32": {"tile_m": 128, "tile_n": 128, "cluster_ctas": 1},
     "deepk_c2_kg1_expert_aligned": {"tile_m": 128, "tile_n": 128, "cluster_ctas": 1},
+    "deepk_c2_kg1_n64_k_blocks": {"tile_m": 128, "tile_n": 64, "cluster_ctas": 1},
     "deepk_c2_kg1_non_kg4_k_blocks": {"tile_m": 128, "tile_n": 128, "cluster_ctas": 1},
     "deepk_c2_scalar_output": {"tile_m": 128, "tile_n": 128, "cluster_ctas": 1},
     "deepk_cg2_ab5_x16_four_load_wait_grid128_kg4": {
