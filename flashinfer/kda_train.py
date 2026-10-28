@@ -475,7 +475,8 @@ def chunk_kda_kcp_fwd(
     workspace : KcpWorkspace, optional
         A reused workspace of this rank; without one the call allocates its own.
     **options
-        Further KCP options (``save_transfer``, ``exchange``, ``head_groups``, ``offset_class``), forwarded.
+        Further KCP options (``save_transfer``, ``exchange``, ``head_groups``, ``offset_class``, ``graph``),
+        forwarded.
 
     Returns
     -------
@@ -526,7 +527,9 @@ def chunk_kda_kcp_bwd(
     saved : KcpSaved, optional
         The forward's saved set; without one the forward is replayed (checkpointing).
     scale, save_mode, workspace, **options
-        As for :func:`chunk_kda_kcp_fwd`.
+        As for :func:`chunk_kda_kcp_fwd`; the backward reads its own options, among them ``spec3_probe``: the
+        debug probe of the first saved-mode backward, ``"record"`` by default, ``"off"``, ``"warn"`` or
+        ``"assert"`` (the same value on every rank).
 
     Returns
     -------

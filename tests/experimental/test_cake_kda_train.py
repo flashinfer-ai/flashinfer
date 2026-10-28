@@ -241,6 +241,18 @@ def _device_or_skip() -> torch.device:
     return torch.device("cuda", index)
 
 
+def _current_arch() -> str:
+    """The architecture :func:`cake_backend.plan` takes without ``arch``: the current CUDA device's where it is an
+    exported target, else the first exported architecture."""
+    if torch.cuda.is_available():
+        arch = cake_jit.arch_for_capability(
+            torch.cuda.get_device_capability(torch.cuda.current_device())
+        )
+        if arch is not None:
+            return arch
+    return ARCHES[0]
+
+
 def _manifest_or_skip() -> dict:
     path = PACKAGE_DIR / "build.json"
     if not path.exists():
@@ -1201,9 +1213,9 @@ def test_segment_args_follow_the_proportional_rule() -> None:
         _route, segments, _nseg = cake_jit.segment_plan(3, 2, sm)
         assert cake_jit.segment_args(3, 2, sm) == (0, segments)
         assert cake_jit.segment_args(1, 16, sm) == (0, 1)  # the serial route
-    p = cake_backend.plan(1024, 4, 1, 148)
+    p = cake_backend.plan(1024, 4, 1, 148, ARCHES[0])  # the sm_100a rows of record
     assert (p.proportional, p.seg_arg) == (1, -4)
-    p = cake_backend.plan(1024, 7, 8, 148)
+    p = cake_backend.plan(1024, 7, 8, 148, ARCHES[0])
     assert (p.proportional, p.seg_arg) == (0, p.P)
 
 
@@ -1251,8 +1263,11 @@ def test_the_16_head_rows_of_two_architectures_take_the_segmented_route() -> Non
             ("serial", 1, 0) if arch == "sm_100a" else ("seg", 9, 9)
         )
         assert ("light_states" in p.records) is (arch != "sm_100a")
-    # arch=None is the first exported architecture's plan: the serial walk
-    assert cake_backend.plan(4096, 1, 16, 148).recur == "serial"
+    # arch=None is the current device's plan (the first exported architecture's without one)
+    assert (
+        cake_backend.plan(4096, 1, 16, 148).recur
+        == cake_backend.plan(4096, 1, 16, 148, _current_arch()).recur
+    )
 
 
 def test_carry_choice_picks_the_shortest_critical_path_that_fits() -> None:
@@ -1480,8 +1495,11 @@ def test_few_chains_cap_the_segment_count() -> None:
             p = cake_backend.plan(1024, 4, 1, sm, arch)
             assert (p.recur, p.P, p.NSEG) == ("seg", small, 4 * small)
             assert cake_backend.plan(1024, 8, 1, sm, arch).P == 64
-        # plan(arch=None) is the first exported architecture's plan, segment count included
-        assert cake_backend.plan(1024, 4, 1, sm).P == 37
+        # plan(arch=None) is the current device's plan, segment count included
+        assert (
+            cake_backend.plan(1024, 4, 1, sm).P
+            == cake_backend.plan(1024, 4, 1, sm, _current_arch()).P
+        )
     # below the clamp the cap is inert: four chains on a 32-SM device give 32
     assert cake_jit.segment_plan(4, 1, 32) == ("seg", 32, 128)
     assert cake_jit.segment_plan(4, 1, 32, "sm_100a") == ("seg", 32, 128)
@@ -1839,6 +1857,49 @@ def _expected_launch_count(
     return count
 
 
+def test_plan_is_cached_on_its_scalars(monkeypatch) -> None:
+    """A repeated problem returns the same plan without selecting a record again (the default entry plans a
+    repeated shape once); every scalar and the architecture are part of the key, and a refused problem raises
+    on every call."""
+    first = cake_backend.plan(261393, 4, 4, 152, "sm_100a")
+    calls: list = []
+    original = cake_jit.select_record
+
+    def counting(*args, **kwargs):
+        calls.append(args)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(cake_jit, "select_record", counting)
+    assert cake_backend.plan(261393, 4, 4, 152, "sm_100a") is first
+    assert cake_backend.plan(261393.0, 4, 4, 152, "sm_100a") is first
+    assert calls == []
+    for scalars in ((261392, 4, 4, 152), (261393, 3, 4, 152), (261393, 4, 2, 152)):
+        assert cake_backend.plan(*scalars, "sm_100a") is not first
+    assert cake_backend.plan(261393, 4, 4, 148, "sm_100a").sm_count == 148
+    for arch in ARCHES[1:]:
+        assert cake_backend.plan(261393, 4, 4, 152, arch).arch == arch
+    for _ in range(2):
+        with pytest.raises(ValueError, match="must all be >= 1"):
+            cake_backend.plan(0, 1, 1, 148, "sm_100a")
+
+
+def test_plan_without_arch_takes_the_current_device(monkeypatch) -> None:
+    """``plan(..., arch=None)`` selects the records of the current CUDA device's architecture, so its plan serves a
+    workspace there on every exported target; without a CUDA device, or on a device no record targets, it takes
+    the first exported architecture (whose records the byte queries also take without an ``arch``)."""
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    for arch in ARCHES:
+        monkeypatch.setattr(cake_backend, "_capability_arch", lambda index, a=arch: a)
+        p = cake_backend.plan(4096, 1, 16, 148)
+        assert p.arch == arch
+        assert p.records == cake_backend.plan(4096, 1, 16, 148, arch).records
+    monkeypatch.setattr(cake_backend, "_capability_arch", lambda index: None)
+    assert cake_backend.plan(4096, 1, 16, 148).arch == ARCHES[0]
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert cake_backend.plan(4096, 1, 16, 148).arch == ARCHES[0]
+
+
 def test_plan_follows_the_chunk_bound_formulas() -> None:
     for lengths, heads in SHAPES:
         S, N = sum(lengths), len(lengths)
@@ -1978,10 +2039,10 @@ def test_launch_counts_of_the_paths() -> None:
                 h,
                 arch,
             )
-    # plan(arch=None) is the first exported architecture's
+    # plan(arch=None) is the current device's (the first exported architecture's without one)
     for n, h in counts_by_arch:
         assert cake_backend.plan(4096, n, h, 148).records == (
-            cake_backend.plan(4096, n, h, 148, ARCHES[0]).records
+            cake_backend.plan(4096, n, h, 148, _current_arch()).records
         )
     # the 16-head row of sm_100a: the light set carries w / u, so the light path launches no wy program (six launches:
     # the prep, the recompute, the adjoint, the fused gradient, GLM intra, the gate epilogue)
@@ -2210,16 +2271,19 @@ def test_seg_state_rule_is_a_pure_function_of_the_scalars() -> None:
     for nseg in (1, 64, 153, 256):
         assert rule(k * nseg, nseg) is True and rule(k * nseg - 1, nseg) is False
     assert rule(10**9, 0) is False  # the serial route has no segment states
+    # the sm_100a rule (a plan without an arch takes the current device's)
+    a0 = cake_jit.ARCHES[0]
     for n, h, sm in ((1, 1, 148), (4, 4, 152), (3, 8, 148), (4, 1, 152)):
-        nseg = cake_backend.plan(1, n, h, sm).NSEG  # independent of S
-        assert (  # a plan without an architecture is the sm_100a plan
+        nseg = cake_backend.plan(1, n, h, sm, a0).NSEG  # independent of S
+        assert (
             nseg
-            == cake_backend.plan(k * nseg, n, h, sm).NSEG
-            == _expected_segments(n, h, sm, cake_jit.ARCHES[0])[2]
+            == cake_backend.plan(k * nseg, n, h, sm, a0).NSEG
+            == _expected_segments(n, h, sm, a0)[2]
         )
-        assert cake_backend.plan(k * nseg, n, h, sm).seg_save is True
-        assert cake_backend.plan(k * nseg - 1, n, h, sm).seg_save is False
-    assert cake_backend.plan(10**6, 1, 16, 148).seg_save is False  # the serial route
+        assert cake_backend.plan(k * nseg, n, h, sm, a0).seg_save is True
+        assert cake_backend.plan(k * nseg - 1, n, h, sm, a0).seg_save is False
+    # the serial route
+    assert cake_backend.plan(10**6, 1, 16, 148, a0).seg_save is False
 
 
 def test_byte_queries_follow_the_arena_layout() -> None:
@@ -3177,6 +3241,29 @@ def _clone_all(out, grads):
     return out.clone(), {name: t.clone() for name, t in grads.items()}
 
 
+def _spy_call_workspaces(monkeypatch) -> list:
+    """Record the workspace every call without one runs in (``_entry_acquire``): its option, direction, bytes, save
+    mode and ``doc_lengths``, not the workspace itself (a strong reference would be "retained")."""
+    created: list = []
+    original = cake_backend._entry_acquire
+
+    def spy(*args, **kwargs):
+        ws_, key = original(*args, **kwargs)
+        created.append(
+            types.SimpleNamespace(
+                arena_option=ws_.arena_option,
+                backward=ws_.backward,
+                bytes=ws_.bytes,
+                save_mode=ws_.save_mode,
+                doc_lengths=ws_.doc_lengths,
+            )
+        )
+        return ws_, key
+
+    monkeypatch.setattr(cake_backend, "_entry_acquire", spy)
+    return created
+
+
 @pytest.mark.parametrize("shape", SHAPES, ids=_shape_id)
 def test_forward_and_backward_match_the_exact_reference(
     device, manifest, shape
@@ -3902,6 +3989,178 @@ def test_a_checkpointed_forward_retains_no_workspace(device, manifest) -> None:
             assert torch.equal(leaf.grad, reference_grads[name]), (fn.__name__, name)
 
 
+# The issue's pack: four documents of S = 261393 tokens, H = 4 (a segmented row whose light set saves the states).
+ISSUE_LENGTHS, ISSUE_HEADS = (120001, 70707, 65537, 5148), 4
+
+
+def _autograd_step(inputs, **kwargs):
+    """One forward and backward through the autograd entry on fresh leaves: ``out`` (detached) and the five
+    gradients in ``(dq, dk, dv, dbeta, dg)`` order."""
+    leaves = [
+        inputs[n].detach().clone().requires_grad_(True)
+        for n in ("q", "k", "v", "g", "beta")
+    ]
+    out = cake_backend.chunk_kda(*leaves, inputs["cu_seqlens"], **kwargs)
+    dq, dk, dv, dg, dbeta = torch.autograd.grad(out, leaves, inputs["dout"])
+    return out.detach(), (dq, dk, dv, dbeta, dg)
+
+
+def test_the_default_entry_plans_a_repeated_problem_once_and_keeps_no_device_memory(
+    device, manifest, monkeypatch
+) -> None:
+    """The default entry (no workspace) plans a repeated problem once and reuses its workspaces: no record is
+    selected and no workspace is built again on a repeat, under every arena option.  Its arena, eye and
+    ``doc_lengths`` copy live for the call alone, so the kept workspaces hold no device memory; a call on another
+    stream runs in a workspace of its own; the results are bitwise those of a caller-owned workspace."""
+    lengths, heads = (100, 640, 77, 1000, 129), 2
+    S, N = sum(lengths), len(lengths)
+    inputs = make_inputs(lengths, heads, device)
+    plan = cake_backend.plan(S, N, heads, cake_jit.sm_count(device.index))
+    assert plan.arch == cake_jit.device_arch(device.index)
+    for arena, doc in (
+        (None, None),
+        (cake_backend.KdaArena(lean=True, tail_passes=4), None),
+        (cake_backend.KdaArena(lean=True, tail_passes=2, batch_tokens=1000), lengths),
+    ):
+        ws = KdaWorkspace(plan, device, backward=True, arena=arena, doc_lengths=doc)
+        ref_out, ref_grads = _autograd_step(inputs, workspace=ws, doc_lengths=doc)
+        del ws
+        _autograd_step(
+            inputs, arena=arena, doc_lengths=doc
+        )  # the first call builds the workspaces
+        selected: list = []
+        original = cake_jit.select_record
+
+        def counting(*args, _sel=selected, _orig=original, **kwargs):
+            _sel.append(args)
+            return _orig(*args, **kwargs)
+
+        monkeypatch.setattr(cake_jit, "select_record", counting)
+        built: list = []
+        original_init = KdaWorkspace.__init__
+
+        def counting_init(self, *args, _built=built, _orig=original_init, **kwargs):
+            _built.append(args)
+            _orig(self, *args, **kwargs)
+
+        monkeypatch.setattr(KdaWorkspace, "__init__", counting_init)
+        out, grads = _autograd_step(inputs, arena=arena, doc_lengths=doc)
+        assert selected == [] and built == [], arena
+        assert _bits_equal(out, ref_out), arena
+        _check_bits(
+            grads,
+            dict(zip(("dq", "dk", "dv", "dbeta", "dg"), ref_grads, strict=True)),
+            tag=arena,
+        )
+        monkeypatch.setattr(cake_jit, "select_record", original)
+        monkeypatch.setattr(KdaWorkspace, "__init__", original_init)
+        del out, grads, ref_out, ref_grads
+        # the baseline holds no kept workspace: building them again and reusing them leaves the device memory as
+        # it was, so a kept workspace that held its arena, eye or doc_lengths copy would show here
+        cake_backend._entry_pool.clear()
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_allocated()
+        for _ in range(2):
+            _autograd_step(inputs, arena=arena, doc_lengths=doc)
+        torch.cuda.synchronize()
+        assert cake_backend._entry_pool, arena
+        assert torch.cuda.memory_allocated() == before, arena
+    # a call on another stream takes a workspace of its own (no two queued calls share an eye)
+    created = _spy_call_workspaces(monkeypatch)
+    keys = []
+    original_acquire = cake_backend._entry_acquire
+
+    def keyed(*args, **kwargs):
+        ws_, key = original_acquire(*args, **kwargs)
+        keys.append(key)
+        return ws_, key
+
+    monkeypatch.setattr(cake_backend, "_entry_acquire", keyed)
+    side = torch.cuda.Stream(device)
+    side.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(side):
+        _autograd_step(inputs)
+    torch.cuda.current_stream(device).wait_stream(side)
+    _autograd_step(inputs)
+    assert len(created) == 4 and len(set(keys)) == 4
+    assert {key[1] for key in keys} == {
+        side.cuda_stream,
+        torch.cuda.current_stream(device).cuda_stream,
+    }
+
+
+def test_the_arena_options_never_synchronize_the_host(device, manifest) -> None:
+    """The issue's pack through the default entry and through a caller-owned workspace: the lean arena with four
+    tail passes and the batched option over two document groups (``doc_lengths``) run the forward and the backward
+    without one host synchronization (PyTorch's sync debug mode raises on any it routes), on the first call of a
+    problem as on a repeat, with the default arena's results bitwise."""
+    lengths, heads = ISSUE_LENGTHS, ISSUE_HEADS
+    S, N = sum(lengths), len(lengths)
+    inputs = make_inputs(lengths, heads, device)
+    ref_out, ref_grads = _autograd_step(inputs)
+    reference = dict(zip(("dq", "dk", "dv", "dbeta", "dg"), ref_grads, strict=True))
+    plan = cake_backend.plan(S, N, heads, cake_jit.sm_count(device.index))
+    lean = cake_backend.KdaArena(lean=True, tail_passes=4)
+    batched = cake_backend.KdaArena(lean=True, tail_passes=4, batch_tokens=200000)
+    assert len(plan.batches(batched, lengths)) == 2
+    for arena, doc in ((lean, None), (batched, lengths)):
+        ws = KdaWorkspace(plan, device, backward=True, arena=arena, doc_lengths=doc)
+        for kwargs in (
+            {"arena": arena},
+            {"arena": arena},
+            {"workspace": ws},
+            {"workspace": ws},
+        ):
+            torch.cuda.synchronize()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                out, grads = _autograd_step(inputs, doc_lengths=doc, **kwargs)
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+            tag = (arena, tuple(kwargs))
+            assert _bits_equal(out, ref_out), tag
+            _check_bits(grads, reference, tag=tag)
+
+
+def test_plan_without_arch_serves_a_workspace_on_the_device(device, manifest) -> None:
+    """A plan made without ``arch`` selects the device's records, so a workspace accepts it on every exported
+    target (the plan of another architecture is refused, naming both)."""
+    lengths, heads = (100, 640, 77), 4
+    S, N = sum(lengths), len(lengths)
+    p = cake_backend.plan(S, N, heads, cake_jit.sm_count(device.index))
+    assert p.arch == cake_jit.device_arch(device.index)
+    ws = KdaWorkspace(p, device)
+    inputs = make_inputs(lengths, heads, device)
+    out, grads, _ = _run_fwd_bwd(inputs, workspace=ws)
+    ref_out, ref_grads, _ = _run_fwd_bwd(inputs)
+    assert _bits_equal(out, ref_out)
+    _check_bits(list(grads.values()), ref_grads)
+    for arch in ARCHES:
+        if arch != p.arch:
+            other = cake_backend.plan(S, N, heads, p.sm_count, arch)
+            with pytest.raises(ValueError, match=f"records of {arch}, the device is"):
+                KdaWorkspace(other, device)
+
+
+def test_a_batched_default_entry_under_capture_asks_for_a_warmed_workspace(
+    device, manifest
+) -> None:
+    """Under CUDA-graph capture the default entry's workspace is the captured call's alone, so a batched arena
+    would capture a copy of ``doc_lengths`` from a host buffer the graph does not own: it raises instead,
+    naming the caller-owned workspace that ran these ``doc_lengths`` before the capture."""
+    lengths, heads = (100, 640, 77, 1000, 129), 2
+    inputs = make_inputs(lengths, heads, device)
+    args = [inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens")]
+    batched = cake_backend.KdaArena(lean=True, tail_passes=2, batch_tokens=1000)
+    # eager first: the programs are loaded and the default entry's own copy is made outside the capture
+    cake_backend.chunk_kda_fwd(*args, arena=batched, doc_lengths=lengths)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    refused = pytest.raises(RuntimeError, match="under CUDA-graph capture needs")
+    with refused, torch.cuda.graph(graph):
+        cake_backend.chunk_kda_fwd(*args, arena=batched, doc_lengths=lengths)
+
+
 def test_the_node_holds_the_workspace_weakly(device, manifest) -> None:
     """A caller-owned workspace serves the backward (its launcher records the backward's launches); a per-call
     workspace dropped after the forward is freed at once (the node holds no strong reference), and the backward
@@ -4495,24 +4754,7 @@ def test_lean_arena_serves_the_saved_states_and_the_tape_paths(
     del out, grads
     assert saved.version == cake_backend.SAVED_VERSION and saved.hseg is not None
     assert saved.qg is not None
-    created: list = []
-    original = cake_backend.KdaWorkspace.for_problem
-
-    def spy(
-        *args, **kwargs
-    ):  # records the option, not the workspace: a strong reference would be "retained"
-        ws_ = original(*args, **kwargs)
-        created.append(
-            types.SimpleNamespace(
-                arena_option=ws_.arena_option,
-                backward=ws_.backward,
-                bytes=ws_.bytes,
-                save_mode=ws_.save_mode,
-            )
-        )
-        return ws_
-
-    monkeypatch.setattr(cake_backend.KdaWorkspace, "for_problem", spy)
+    created = _spy_call_workspaces(monkeypatch)
     launched: list = []
 
     def recording(name, values, *, grid, device_index):
@@ -4609,24 +4851,7 @@ def test_lean_arena_under_checkpointing_and_a_dropped_workspace(
     plan = cake_backend.plan(
         S, N, heads, cake_jit.sm_count(device.index), cake_jit.device_arch(device.index)
     )
-    created: list = []
-    original = cake_backend.KdaWorkspace.for_problem
-
-    def spy(
-        *args, **kwargs
-    ):  # records the option, not the workspace: a strong reference would be "retained"
-        ws_ = original(*args, **kwargs)
-        created.append(
-            types.SimpleNamespace(
-                arena_option=ws_.arena_option,
-                backward=ws_.backward,
-                bytes=ws_.bytes,
-                save_mode=ws_.save_mode,
-            )
-        )
-        return ws_
-
-    monkeypatch.setattr(cake_backend.KdaWorkspace, "for_problem", spy)
+    created = _spy_call_workspaces(monkeypatch)
 
     def leaves():
         return [
@@ -5810,24 +6035,7 @@ def test_batched_arena_under_checkpointing_and_a_dropped_workspace(
     ]
     exact = plan.arena_bytes(arena=arena, doc_lengths=lengths)
     assert exact < plan.arena_bytes(arena=arena) < plan.arena_bytes()
-    created: list = []
-    original = cake_backend.KdaWorkspace.for_problem
-
-    def spy(
-        *args, **kwargs
-    ):  # records the option, not the workspace: a strong reference would be "retained"
-        ws_ = original(*args, **kwargs)
-        created.append(
-            types.SimpleNamespace(
-                arena_option=ws_.arena_option,
-                backward=ws_.backward,
-                bytes=ws_.bytes,
-                doc_lengths=ws_.doc_lengths,
-            )
-        )
-        return ws_
-
-    monkeypatch.setattr(cake_backend.KdaWorkspace, "for_problem", spy)
+    created = _spy_call_workspaces(monkeypatch)
 
     def leaves():
         return [
