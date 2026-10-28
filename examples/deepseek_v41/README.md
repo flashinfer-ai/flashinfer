@@ -331,7 +331,7 @@ The generic sparse MLA suite, complete integration, checkpoint/full-model
 equivalence, rare-path cost, performance and backend crossovers remain unqualified
 by these runs.
 
-Native example and benchmark usage (the benchmark was not run):
+Native example and benchmark usage:
 
 ```bash
 python examples/deepseek_v41/decode.py --backend prims-ts
@@ -346,4 +346,43 @@ its own represented-input FP64 reference before graph/event timing. Native-only
 runs do not require importing the other decoder for provenance. JSON records
 source/toolchain fingerprints, representations, numerical contracts and samples.
 Timing covers public GPU replay, excluding cache writing, allocation, JIT, capture
-and host overhead; these are not model-token latencies or measured speedups.
+and host overhead; these are not model-token latencies.
+
+### Measured performance (B200)
+
+Warm CUDA Graph replay, 32 calls per replay, symmetric ABBA order, 3 rounds of
+30 samples; median us per call. Both arms ran in one process on one B200 (148
+SMs), which other users' short jobs shared intermittently; per-round medians
+stayed within 1%. The fixture is the benchmark's seeded one: context 32768 per
+request, 128 SWA rows plus `K` selected FP4 main rows, H64/D512, sinks enabled.
+Each arm passed its own FP64 gate first. Toolchain: PyTorch 2.14.1+cu130,
+CuTe-DSL 4.8.0 (bundled CUDA 13.4).
+
+The arms differ in precision contract. Prims-TS runs E4M3 x E4M3 QK and PV MMAs
+with E4M3 Q/SWA, main FP4 rounded to E4M3 and P quantized to E4M3. Upstream
+[FlashMLA](https://github.com/deepseek-ai/FlashMLA) (`395cb3a`, 2026-10-26, built
+with nvcc 13.3; its SM100 head64 no-split sparse decode kernels at these shapes)
+runs BF16 x BF16 MMAs with BF16 Q and P, over MXFP8 SWA and FP4 main exactly
+dequantized to BF16 from its per-token interleaved layout. B200 FP8 MMA peak is
+twice BF16, so part of the gap reflects that contract rather than scheduling.
+
+| Batch | K | Prims-TS before | Prims-TS after | FlashMLA | FlashMLA / after |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 512 | 29.45 | 13.36 | 20.55 | 1.54 |
+| 1 | 128 | 17.29 | 7.55 | 12.34 | 1.63 |
+| 1 | 0 | 13.64 | 5.95 | 9.30 | 1.56 |
+| 16 | 512 | 29.76 | 14.36 | 20.98 | 1.46 |
+| 16 | 128 | 17.86 | 8.30 | 12.19 | 1.47 |
+| 64 | 512 | 30.69 | 16.55 | 22.24 | 1.34 |
+| 64 | 128 | 18.81 | 9.74 | 12.81 | 1.31 |
+| 128 | 512 | 33.13 | 18.47 | 23.95 | 1.30 |
+| 128 | 128 | 19.64 | 11.18 | 14.12 | 1.26 |
+| 128 | 0 | 16.31 | 8.51 | 10.61 | 1.25 |
+| 256 | 512 | 87.74 | 37.95 | 45.81 | 1.21 |
+| 256 | 128 | 37.36 | 20.74 | 27.72 | 1.34 |
+| 256 | 0 | 30.77 | 15.94 | 21.50 | 1.35 |
+
+"Before" is the branch revision preceding the loader/epilogue/V-split changes,
+timed on the same GPU in the same process configuration; its FlashMLA arm agreed
+with this one within 4.8%. "After" splits V over four CTAs for batches 1-16, two
+for 64 and none from 128 (148 SMs).

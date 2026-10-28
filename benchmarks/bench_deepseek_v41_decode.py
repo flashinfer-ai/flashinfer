@@ -28,9 +28,9 @@ and joint attention/finalization. Cache writing, allocation, JIT, capture and
 host overhead are excluded for every arm.
 
 Prims-TS requires CuTe-DSL >= 4.8 with its bundled CUDA 13 compiler, split 1 and
-a nonpersistent schedule. Historical GPU results do not qualify the native
-joint/shared-scale/caller-workspace revision. This benchmark revision has not
-run; native performance and backend crossovers are unmeasured.
+a nonpersistent schedule. Measured B200 Prims-TS and upstream FlashMLA latencies
+are recorded in examples/deepseek_v41/README.md; backend crossovers against the
+cute-dsl arm remain unmeasured.
 See examples/deepseek_v41/README.md for scope and reproducer commands.
 """
 
