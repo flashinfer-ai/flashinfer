@@ -10,8 +10,11 @@ passes), the page tables the launch passes (views of the caller's storage)
 and the sizes a runtime-size program takes per launch.
 GPU: the BF16 programs (the one-tile ones at uniform query lengths, the
 persistent one at ragged query lengths; ragged KV lengths, CUDA graph replay
-with new lengths) against an FP32 reference; the FP8 / NVFP4 programs (host
-and device scales) through the shared prefill test against its reference; and
+with new lengths) against an FP32 reference; the BF16 JIT route on tiles
+without a visible key (an empty request, a request without keys, causal tiles
+whose rows see no key) against the reference and, on such rows, against the
+one-tile programs; the FP8 / NVFP4 programs (host and device scales) through
+the shared prefill test against its reference; and
 every program bitwise against the component's JIT route on its row and its
 widened class, plus the invariances a launch must keep bitwise (NHD and HND
 caches, shared and separate page tables, a column-sliced page table, graph
@@ -1802,6 +1805,229 @@ def test_cake_context_bf16_programs_match_reference_and_replay(
     )
     torch.testing.assert_close(out.float(), expected_short, atol=1e-2, rtol=1e-2)
     assert not counter.any()
+
+
+def _bf16_batch(heads, q_lens, kv_lens, page_size, *, shared=True, seed=20261028):
+    """Random BF16 inputs on the GPU: an HND pool of shuffled pages (one more,
+    all NaN, last) behind a shared (or a K / V) page table, the query and KV
+    offsets, a zeroed workspace and ticket.  A request without keys names the
+    NaN page in every slot of its table rows."""
+
+    device = torch.device("cuda")
+    batch = len(q_lens)
+    hq, hkv = heads
+    max_q, max_kv = max(q_lens), max(kv_lens)
+    generator = torch.Generator(device="cpu").manual_seed(seed + max_q)
+    pages = (max_kv + page_size - 1) // page_size
+    total_pages = 2 * batch * pages
+    query = (torch.randn((sum(q_lens), hq, 128), generator=generator) * 2).to(
+        device=device, dtype=torch.bfloat16
+    )
+    key, value = (
+        torch.randn((total_pages + 1, hkv, page_size, 128), generator=generator).to(
+            device=device, dtype=torch.bfloat16
+        )
+        for _ in range(2)
+    )
+    key[total_pages] = float("nan")
+    value[total_pages] = float("nan")
+    order = torch.randperm(total_pages, generator=generator).to(torch.int32)
+    tables_k = order[: batch * pages].view(batch, pages).clone()
+    tables_v = tables_k if shared else order[batch * pages :].view(batch, pages).clone()
+    for b, kv_len in enumerate(kv_lens):
+        if kv_len == 0:
+            tables_k[b] = total_pages
+            tables_v[b] = total_pages
+    return SimpleNamespace(
+        heads=heads,
+        q_lens=q_lens,
+        kv_lens=kv_lens,
+        shared=shared,
+        query=query,
+        key=key,
+        value=value,
+        tables_k=tables_k.to(device),
+        tables_v=tables_v.to(device),
+        block_tables=(
+            tables_k if shared else torch.stack((tables_k, tables_v), dim=1)
+        ).to(device),
+        seq_lens=torch.tensor(kv_lens, dtype=torch.int32, device=device),
+        cum_q=torch.cat(
+            (torch.zeros(1, dtype=torch.int32), torch.tensor(q_lens).cumsum(0).int())
+        ).to(device),
+        cum_kv=torch.cat(
+            (torch.zeros(1, dtype=torch.int32), torch.tensor(kv_lens).cumsum(0).int())
+        ).to(device),
+        workspace=torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device),
+        counter=torch.zeros(
+            get_trtllm_gen_multi_ctas_kv_counter_bytes(
+                batch, hq, get_device_sm_count(device)
+            ),
+            dtype=torch.uint8,
+            device=device,
+        ),
+    )
+
+
+def _run_bf16_batch(case, *, return_lse=False):
+    """One causal launch of the batch, output and LSE filled with NaN first."""
+
+    out = torch.full_like(case.query, float("nan"))
+    lse = None
+    if return_lse:
+        lse = torch.full(
+            case.query.shape[:2], float("nan"), dtype=torch.float32, device="cuda"
+        )
+    prefill.trtllm_batch_context_with_kv_cache(
+        case.query,
+        (case.key, case.value),
+        case.workspace,
+        case.block_tables,
+        case.seq_lens,
+        max(case.q_lens),
+        max(case.kv_lens),
+        128**-0.5,
+        1.0,
+        len(case.q_lens),
+        case.cum_q,
+        case.cum_kv,
+        out=out,
+        lse=lse,
+        return_lse=return_lse,
+        kv_layout="HND",
+        uses_shared_paged_kv_idx=case.shared,
+        multi_ctas_kv_counter_buffer=case.counter,
+        backend="cake",
+    )
+    torch.cuda.synchronize()
+    assert not case.counter.any()
+    return out, lse
+
+
+def _rows_without_keys(q_lens, kv_lens):
+    """The query rows that see no key under the bottom-right causal mask: every
+    row of a request without keys, and the first ``q_len - kv_len`` rows of a
+    request with fewer keys than query tokens."""
+
+    rows, start = [], 0
+    for q_len, kv_len in zip(q_lens, kv_lens, strict=True):
+        rows += range(start, start + max(0, q_len - kv_len))
+        start += q_len
+    return rows
+
+
+def _check_rows_with_and_without_keys(case, out, lse):
+    """Rows with a visible key match the FP32 reference; rows without one are
+    exactly 0 (their LSE -inf)."""
+
+    blank = _rows_without_keys(case.q_lens, case.kv_lens)
+    seen = torch.ones(out.shape[0], dtype=torch.bool, device=out.device)
+    seen[blank] = False
+    expected = _reference_context(
+        case.query,
+        case.key,
+        case.value,
+        case.tables_k,
+        case.tables_v,
+        case.q_lens,
+        case.kv_lens,
+        scale=128**-0.5,
+    )
+    torch.testing.assert_close(out.float()[seen], expected[seen], atol=1e-2, rtol=1e-2)
+    assert torch.equal(out[blank], torch.zeros_like(out[blank]))
+    if lse is not None:
+        assert bool((lse[blank] == -math.inf).all())
+        assert bool(torch.isfinite(lse[seen]).all())
+
+
+def _tiles_without_keys(heads, q_lens, kv_lens):
+    """The (request, m-block) tiles of the generic route whose causal block
+    count is 0 before the clamp: KV length 0, or ``q - kv = 2T (m + 1)`` with
+    ``T = 128 / pack`` query tokens per stage."""
+
+    pack = cake_api._context_pack_g(max(q_lens), max(kv_lens), *heads)
+    tokens = 128 // pack
+    blocks = (max(q_lens) + 2 * tokens - 1) // (2 * tokens)
+    return [
+        (b, m)
+        for b, (q_len, kv_len) in enumerate(zip(q_lens, kv_lens, strict=True))
+        for m in range(blocks)
+        if kv_len == 0 or q_len - kv_len == 2 * tokens * (m + 1)
+    ]
+
+
+@_GPU
+@pytest.mark.parametrize(
+    ("heads", "q_lens", "kv_lens", "page_size", "return_lse"),
+    [
+        # An empty request (no query token, no key) between others.
+        ((10, 2), (300, 0, 37, 64), (900, 0, 100, 130), 32, False),
+        # A request with query tokens but no key, with and without the LSE.
+        ((32, 4), (200, 5, 64), (700, 0, 64), 16, False),
+        ((32, 4), (200, 5, 64), (700, 0, 64), 16, True),
+        # Causal tiles whose rows see no key (q - kv = 2 * 128 at pack 1 and
+        # 2 * 16 at pack 8) in requests that hold keys.
+        ((10, 2), (511, 257, 511, 511), (2047, 1, 1024, 600), 32, False),
+        ((32, 4), (64, 100), (32, 300), 16, True),
+    ],
+)
+def test_cake_context_bf16_jit_route_runs_tiles_without_keys(
+    monkeypatch, served_programs, heads, q_lens, kv_lens, page_size, return_lse
+) -> None:
+    """The component's JIT route (no generated program serves these batches)
+    on tiles without a visible key: the launch completes, rows with a visible
+    key match the FP32 reference, rows without one are 0 (LSE -inf) although
+    a request without keys names a NaN page, and the ticket resets."""
+
+    loaded = []
+    load = cake_api.load_cake_fmha_context_bf16_module
+
+    def spy(*args, **kwargs):
+        loaded.append(args)
+        return load(*args, **kwargs)
+
+    monkeypatch.setattr(cake_api, "load_cake_fmha_context_bf16_module", spy)
+    assert _tiles_without_keys(heads, q_lens, kv_lens)
+    # Every batch but the one with the empty request has rows without a key.
+    assert _rows_without_keys(q_lens, kv_lens) or 0 in q_lens
+    case = _bf16_batch(heads, q_lens, kv_lens, page_size)
+    out, lse = _run_bf16_batch(case, return_lse=return_lse)
+    assert loaded and not served_programs
+    _check_rows_with_and_without_keys(case, out, lse)
+
+
+@_GPU
+@pytest.mark.parametrize(
+    ("program", "q_lens", "kv_lens", "page_size", "shared"),
+    [
+        # Rows without a visible key in the exact program (pack 5: q - kv = 50)
+        # and in the JIT route (pack 1: q - kv = 256), and a request without keys.
+        ("Q511", (511,) * 4, (2047, 0, 461, 255), 32, True),
+        ("Q257", (257,) * 4, (1024, 0, 207, 157), 1024, False),
+    ],
+)
+def test_cake_context_bf16_program_and_jit_route_agree_on_rows_without_keys(
+    monkeypatch, served_programs, program, q_lens, kv_lens, page_size, shared
+) -> None:
+    """A batch the one-tile BF16 program serves, with a request without keys
+    and causal tiles without a visible key: the program and the JIT route
+    (the exact profile off) both complete, give the same bits (0) on every row
+    without a visible key and match the FP32 reference on the others."""
+
+    target = cake_api._cake_fmha_target(torch.device("cuda"))
+    program = f"{program}_SM{_TARGET_ARCH[target][3:].upper()}"
+    case = _bf16_batch((10, 2), q_lens, kv_lens, page_size, shared=shared)
+    out, _ = _run_bf16_batch(case)
+    assert served_programs == [program]
+    _check_rows_with_and_without_keys(case, out, None)
+    monkeypatch.setattr(cake_api, "_context_bf16_exact_profile", lambda *a, **k: None)
+    assert _tiles_without_keys((10, 2), q_lens, kv_lens)
+    jit_out, _ = _run_bf16_batch(case)
+    assert served_programs == [program]
+    _check_rows_with_and_without_keys(case, jit_out, None)
+    blank = _rows_without_keys(q_lens, kv_lens)
+    assert blank
+    assert torch.equal(_bits(jit_out[blank]), _bits(out[blank]))
 
 
 @_GPU
