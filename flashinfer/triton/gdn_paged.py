@@ -33,7 +33,7 @@ def gdn_paged_prefill_slots_kernel(
     checkpoint_starts,
     prefix_lens,
     num_seqs,
-    page_len,
+    page_size,
     BLOCK: tl.constexpr,
 ):
     seq = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -43,24 +43,24 @@ def gdn_paged_prefill_slots_kernel(
     )
     first = tl.load(page_indptr + seq, mask=valid, other=0)
     end = tl.load(page_indptr + seq + 1, mask=valid, other=1)
-    total = (end - first - 1) * page_len + tl.load(
+    total = (end - first - 1) * page_size + tl.load(
         last_page_len + seq, mask=valid, other=0
     )
     prefix = total - seq_len
-    # The last prefix token lives on entry (prefix - 1) // page_len.
-    read_entry = first + tl.maximum(prefix - 1, 0) // page_len
+    # The last prefix token lives on entry (prefix - 1) // page_size.
+    read_entry = first + tl.maximum(prefix - 1, 0) // page_size
     read = tl.load(page_indices + read_entry, mask=valid & (prefix > 0), other=-1)
     # A final state that ends on a page boundary is that page's checkpoint.
     write = tl.load(
         page_indices + end - 1,
-        mask=valid & (seq_len > 0) & (total % page_len != 0),
+        mask=valid & (seq_len > 0) & (total % page_size != 0),
         other=-1,
     )
     tl.store(read_rows + seq, read.to(tl.int32), mask=valid)
     tl.store(write_rows + seq, write.to(tl.int32), mask=valid)
-    # The first page boundary crossed closes entry prefix // page_len.
+    # The first page boundary crossed closes entry prefix // page_size.
     tl.store(
-        checkpoint_starts + seq, (first + prefix // page_len).to(tl.int32), mask=valid
+        checkpoint_starts + seq, (first + prefix // page_size).to(tl.int32), mask=valid
     )
     tl.store(prefix_lens + seq, prefix.to(tl.int32), mask=valid)
 

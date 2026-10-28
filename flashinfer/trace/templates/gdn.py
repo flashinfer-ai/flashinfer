@@ -705,6 +705,15 @@ _gdn_prefill_gates_trace.inputs.update(
 
 
 def gdn_prefill_trace(**kwargs):
+    # The slot arguments (output_state_indices, checkpoint_state_indices,
+    # prefix_lens) have no template here: such a call is not traced, and Apply
+    # keeps the original call. The paged APIs (gdn_prefill_paged_trace) carry
+    # their own definitions.
+    if any(
+        kwargs.get(name) is not None
+        for name in ("output_state_indices", "checkpoint_state_indices", "prefix_lens")
+    ):
+        return None
     if (
         kwargs.get("gate_domain", "linear") != "linear"
         or kwargs.get("use_gate_in_kernel", False)
@@ -1474,7 +1483,7 @@ def _gdn_prefill_paged_reference(
     state_pool,
     page_indices,
     page_indptr,
-    page_len,
+    page_size,
     last_page_len,
     use_qk_l2norm_in_kernel=False,
     gate_domain="linear",
@@ -1486,18 +1495,18 @@ def _gdn_prefill_paged_reference(
     """Token recurrence of ``chunk_gated_delta_rule_paged`` on a paged pool.
 
     Sequence ``b`` owns pages ``page_indices[page_indptr[b]:page_indptr[b+1]]``
-    and holds ``total = (num_pages_b - 1) * page_len + last_page_len[b]``
+    and holds ``total = (num_pages_b - 1) * page_size + last_page_len[b]``
     tokens after the call. Its new tokens are the last ``seq_len`` of them,
     so ``prefix = total - seq_len``. Page ``j`` holds the state after token
-    ``(j + 1) * page_len`` (the last page: after the last token).
+    ``(j + 1) * page_size`` (the last page: after the last token).
 
     - The initial state is the page holding token ``prefix - 1``, or zero
       when ``prefix == 0``.
     - After each new token whose absolute position ``prefix + n``
-      (``1 <= n <= seq_len``) is a multiple of ``page_len``, the state is
+      (``1 <= n <= seq_len``) is a multiple of ``page_size``, the state is
       written to the page that ends there.
     - The final state is written to the last page, unless ``seq_len == 0``
-      (the pool is unchanged) or ``total % page_len == 0`` (the boundary
+      (the pool is unchanged) or ``total % page_size == 0`` (the boundary
       write already stored it there).
 
     Pages that end at or before the prefix are only read. The gates and
@@ -1543,10 +1552,10 @@ def _gdn_prefill_paged_reference(
         start, end = int(cu_seqlens[seq]), int(cu_seqlens[seq + 1])
         pages = page_indices[int(page_indptr[seq]) : int(page_indptr[seq + 1])]
         pages = [int(page) for page in pages]
-        total = (len(pages) - 1) * page_len + int(last_page_len[seq])
+        total = (len(pages) - 1) * page_size + int(last_page_len[seq])
         prefix = total - (end - start)
         if prefix > 0:
-            hidden = state_pool[pages[(prefix - 1) // page_len]].float().clone()
+            hidden = state_pool[pages[(prefix - 1) // page_size]].float().clone()
         else:
             hidden = torch.zeros(heads, v.shape[-1], dim, device=q.device)
         for token in range(start, end):
@@ -1559,9 +1568,9 @@ def _gdn_prefill_paged_reference(
                 q.dtype
             )
             position = prefix + token - start + 1
-            if position % page_len == 0:
-                state_pool[pages[position // page_len - 1]] = hidden
-        if end > start and total % page_len != 0:
+            if position % page_size == 0:
+                state_pool[pages[position // page_size - 1]] = hidden
+        if end > start and total % page_size != 0:
             state_pool[pages[-1]] = hidden
     return output, state_pool
 
@@ -1576,7 +1585,7 @@ def _gdn_prefill_paged_init(
     num_q_heads: int = 4,
     num_v_heads: int = 8,
     head_size: int = 128,
-    page_len: int = 64,
+    page_size: int = 64,
     device: str = "cuda",
     seed: int = 0,
 ):
@@ -1584,9 +1593,9 @@ def _gdn_prefill_paged_init(
 
     The ``total_seq_len`` new tokens are split raggedly over ``num_seqs``
     sequences (sequence 0 gets at least one; others may get none). The
-    prefixes cycle through no prefix, ``page_len + 37`` tokens (inside a
+    prefixes cycle through no prefix, ``page_size + 37`` tokens (inside a
     page, not 64-aligned), two full pages and 5 tokens, plus ``seq // 4``
-    pages. Each sequence owns ``ceil((prefix + seq_len) / page_len)`` page
+    pages. Each sequence owns ``ceil((prefix + seq_len) / page_size)`` page
     ids, drawn without replacement from a shuffled pool with spare rows.
     Page tables and lengths are int32. Keys use the query heads (GVA) or
     the value heads (GQA): ``num_k_heads = min(num_q_heads, num_v_heads)``.
@@ -1611,12 +1620,12 @@ def _gdn_prefill_paged_init(
     weight_sum = sum(weights)
     seq_lens = [total_seq_len * w // weight_sum for w in weights]
     seq_lens[0] += total_seq_len - sum(seq_lens)
-    prefix_cycle = [0, page_len + 37, 2 * page_len, 5]
+    prefix_cycle = [0, page_size + 37, 2 * page_size, 5]
     prefixes = [
-        prefix_cycle[seq % 4] + (seq // 4) * page_len for seq in range(num_seqs)
+        prefix_cycle[seq % 4] + (seq // 4) * page_size for seq in range(num_seqs)
     ]
     totals = [p + n for p, n in zip(prefixes, seq_lens, strict=True)]
-    pages_per_seq = [-(-total // page_len) for total in totals]
+    pages_per_seq = [-(-total // page_size) for total in totals]
     used = sum(pages_per_seq)
     rows = max(num_pages, used + 3)
     gen = torch.Generator().manual_seed(seed)
@@ -1637,10 +1646,10 @@ def _gdn_prefill_paged_init(
         state_pool=0.1 * torch.randn(rows, heads, head_size, head_size, device=device),
         page_indices=page_ids.to(torch.int32).to(device),
         page_indptr=_int32(page_indptr),
-        page_len=page_len,
+        page_size=page_size,
         last_page_len=_int32(
             [
-                total - (pages - 1) * page_len
+                total - (pages - 1) * page_size
                 for total, pages in zip(totals, pages_per_seq, strict=True)
             ]
         ),
@@ -1656,7 +1665,7 @@ gdn_prefill_paged_trace = TraceTemplate(
     description=(
         "Chunked GDN prefill on a paged recurrent-state pool [num_pages, H, V, K]. "
         "Each sequence owns a CSR list of page ids; page j holds the state after "
-        "token (j + 1) * page_len. The call reads the page holding the last "
+        "token (j + 1) * page_size. The call reads the page holding the last "
         "prefix token (zero state without a prefix), writes the state at every "
         "page boundary its new tokens cross and the final state to the last "
         "page. Pages that end at or before the prefix are only read."
@@ -1678,8 +1687,8 @@ gdn_prefill_paged_trace = TraceTemplate(
             description="Head dimension (K in query/key space, V in value space).",
             abbrev="d",
         ),
-        "page_len": Const(
-            description="Tokens per page, a positive multiple of 64.", abbrev="pl"
+        "page_size": Const(
+            description="Tokens per page, a positive multiple of 64.", abbrev="ps"
         ),
         "num_pages": Var(description="Rows of the recurrent-state pool."),
         "num_page_indices": Var(description="Length of page_indices."),
@@ -1723,10 +1732,10 @@ gdn_prefill_paged_trace = TraceTemplate(
             ["len_cu_seqlens"],
             description="CSR offsets: sequence b owns page_indices[page_indptr[b]:page_indptr[b + 1]].",
         ),
-        "page_len": Scalar("int32", description="Tokens per page."),
+        "page_size": Scalar("int32", description="Tokens per page."),
         "last_page_len": Tensor(
             ["num_seqs"],
-            description="Tokens in each sequence's last page after the call, in [1, page_len].",
+            description="Tokens in each sequence's last page after the call, in [1, page_size].",
         ),
         "use_qk_l2norm_in_kernel": Scalar(
             "bool", optional=True, description="L2-normalize q and k (eps 1e-6)."
@@ -1773,7 +1782,7 @@ gdn_prefill_paged_trace = TraceTemplate(
         "len_cu_seqlens == num_seqs + 1",
         "total_seq_len == cu_seqlens[-1].item()",
         "num_page_indices == page_indptr[-1].item()",
-        "page_len % 64 == 0",
+        "page_size % 64 == 0",
     ],
     tags=["stage:prefill", "status:verified"],
     reference=_gdn_prefill_paged_reference,
@@ -1791,8 +1800,8 @@ def _gdn_decode_paged_reference(
     dt_bias,
     b,
     scale=None,
-    use_qk_l2norm=True,
     *,
+    use_qk_l2norm=True,
     state_pool,
     page_indices,
     page_indptr,
@@ -1852,7 +1861,7 @@ def _gdn_decode_paged_init(
     num_q_heads: int = 4,
     num_v_heads: int = 8,
     head_size: int = 128,
-    page_len: int = 64,
+    page_size: int = 64,
     device: str = "cuda",
     seed: int = 0,
 ):
@@ -1878,7 +1887,7 @@ def _gdn_decode_paged_init(
         seed=seed,
     )
     del inputs["state"]
-    cases = [(2, 1), (1, 17), (3, page_len), (3, 1)]
+    cases = [(2, 1), (1, 17), (3, page_size), (3, 1)]
     pages_per_seq = [cases[seq % 4][0] + seq // 4 for seq in range(batch_size)]
     used = sum(pages_per_seq)
     rows = max(num_pages, used + 3)
@@ -1973,7 +1982,7 @@ gdn_decode_paged_trace = TraceTemplate(
         ),
         "last_page_len": Tensor(
             ["batch_size"],
-            description="Tokens in the last page including the decoded token, in [1, page_len].",
+            description="Tokens in the last page including the decoded token, in [1, page_size].",
         ),
     },
     outputs={

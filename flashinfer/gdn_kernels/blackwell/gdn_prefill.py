@@ -289,7 +289,8 @@ def chunk_gated_delta_rule_sm100(
 ) -> None:
     """Execute the Blackwell chunked GDN prefill kernel.
 
-    All tensors must be contiguous and on the same CUDA device.
+    All tensors are on the same CUDA device and contiguous, except the indexed
+    state and checkpoint pools, whose row stride may be padded.
 
     Args:
         q: ``(total_tokens, HQ, DK)`` float16/bfloat16
@@ -303,8 +304,11 @@ def chunk_gated_delta_rule_sm100(
         output_state: ``(num_seqs, HO, DK, DK)`` float32/bfloat16/float16/fp8, or None
         scale: attention scale factor (must not be 0)
         checkpoint_every_n_tokens: store intermediate state every N tokens (0 = disabled)
-        cu_checkpoints: ``(num_seqs + 1,)`` int32, cumulative checkpoint counts
-        output_checkpoints: ``(total_checkpoints, HO, DK, DK)`` float32/bfloat16/float16/fp8, or None
+        cu_checkpoints: ``(num_seqs + 1,)`` int32/int64 cumulative checkpoint counts;
+            with ``checkpoint_state_indices`` only entry ``b`` is read, so
+            ``(num_seqs,)`` first entries are accepted
+        output_checkpoints: ``(total_checkpoints, HO, DK, DK)`` float32/bfloat16/float16/fp8,
+            or, with ``checkpoint_state_indices``, a ``[C, HO, DK, DK]`` pool; or None
         state_indices: ``(num_seqs,)`` int32/int64 rows of the initial/output state pools
         output_state_indices: ``(num_seqs,)`` int32/int64 final-state rows of ``output_state``
         checkpoint_state_indices: int32/int64 ``output_checkpoints`` pool row of each

@@ -45,7 +45,7 @@ gdn_mtp_qk4_v8_d128.json
 gdn_replayssm_commit_k2_v8_d128.json
 gdn_prefill_qk4_v8_d128.json
 gdn_prefill_gates_q4_k4_v8_d128.json
-gdn_prefill_paged_q4_k4_v8_d128_pl64.json
+gdn_prefill_paged_q4_k4_v8_d128_ps64.json
 gdn2_prefill_qk4_v8_d128.json
 gdp_prefill_n2_qk4_v8_d128.json
 recurrent_kda_q8_v16_d128.json
@@ -1202,11 +1202,11 @@ from flashinfer.trace.templates.gdn import (
 )
 
 flashinfer.gdn_paged.chunk_gated_delta_rule_paged.fi_trace(
-    **gdn_prefill_paged_trace.init(total_seq_len=256, page_len=64, device=device),
+    **gdn_prefill_paged_trace.init(total_seq_len=256, page_size=64, device=device),
     save_dir=SAVE_DIR,
 )
 flashinfer.gdn_paged.gated_delta_rule_decode_paged.fi_trace(
-    **gdn_decode_paged_trace.init(batch_size=4, page_len=64, device=device),
+    **gdn_decode_paged_trace.init(batch_size=4, page_size=64, device=device),
     save_dir=SAVE_DIR,
 )
 

@@ -27,9 +27,9 @@ Page table
 
 A sequence ``b`` owns pages ``page_indices[page_indptr[b]:page_indptr[b + 1]]``
 (any page ids, in any order) and has
-``(num_pages_b - 1) * page_len + last_page_len[b]`` tokens after the call. Its
+``(num_pages_b - 1) * page_size + last_page_len[b]`` tokens after the call. Its
 new tokens in ``q``/``k``/``v`` are the last ones; the tokens before them are
-its prefix. With ``page_len = 1024``, a sequence of 2500 tokens owns three
+its prefix. With ``page_size = 1024``, a sequence of 2500 tokens owns three
 pages and ``last_page_len = 452``:
 
 .. code-block:: text
@@ -42,8 +42,9 @@ pages and ``last_page_len = 452``:
 small launch, without a host synchronization. The rows depend only on the
 batch, so a model can compute them once per step with
 ``gdn_paged_prefill_slots`` (``gdn_paged_decode_slots`` for decode) and pass
-them as ``slots`` to every layer's call, which then launches only the GDN
-kernel. The rows come from a Triton kernel; on SM107 its compilation needs a
+them as ``slots`` to every layer's call, which then skips that launch. The
+``slots`` are contiguous int32 ``[num_seqs]`` tensors on the device of ``q``;
+they are not checked against the page table. The rows come from a Triton kernel; on SM107 its compilation needs a
 ``ptxas`` from CUDA 13.4 or newer on ``PATH`` (or in
 ``TRITON_PTXAS_BLACKWELL_PATH``), since older ones do not know ``sm_107a``.
 The call:
@@ -57,12 +58,25 @@ The call:
   continues that page in place.
 
 Prefix lengths need not be multiples of the 64-token chunk, so chunked prefill
-can split a prompt at any token. ``page_len`` must be a positive multiple of
-64. Zero-length sequences leave the pool unchanged.
+can split a prompt at any token. A prefix that is not a multiple of 64 costs
+one more chunk of work, because the kernels pad the first chunk on the left.
+``page_size`` must be a positive multiple of 64. Zero-length sequences leave
+the pool unchanged.
 
-``gated_delta_rule_decode_paged`` decodes one token per sequence. When the
-token opens a new page (``last_page_len[b] == 1``) it reads the previous page
-and writes the new one; otherwise it updates the last page in place.
+``gated_delta_rule_decode_paged`` decodes one token per sequence (``T = 1``).
+When the token opens a new page (``last_page_len[b] == 1``) it reads the
+previous page and writes the new one; otherwise it updates the last page in
+place. Every sequence must hold at least one token before the decoded one, so a
+sequence whose token opens a new page owns at least two pages.
+
+A pool that both entry points use must have the 4D layout
+``[num_pages, H, V, K]`` (not the 5D pool of
+:func:`flashinfer.gdn_decode.ugpu_state_pool`) and a state dtype both support.
+The page tables hold real page ids only: ``-1`` is not a padding value. To pad
+a batch, for example to a CUDA graph's batch size, give each padded sequence
+its own scratch page. A padded prefill sequence has no new tokens and one
+scratch page. A padded decode sequence uses a scratch page with
+``last_page_len >= 2``.
 
 .. code-block:: python
 
@@ -74,7 +88,7 @@ and writes the new one; otherwise it updates the last page in place.
         state_pool=pool,                       # [num_pages, H, 128, 128]
         page_indices=torch.tensor([7, 3, 12], dtype=torch.int32, device="cuda"),
         page_indptr=torch.tensor([0, 3], dtype=torch.int32, device="cuda"),
-        page_len=1024,
+        page_size=1024,
         last_page_len=torch.tensor([452], dtype=torch.int32, device="cuda"),
     )
     # Reads page 3, writes page 12; pages 7 and 3 are unchanged.
@@ -105,8 +119,15 @@ cache layouts can use directly:
     then has ``(prefix_lens[i] + seq_len_i) // N - prefix_lens[i] // N``
     checkpoints (``N = checkpoint_every_n_tokens``).
 
+These arguments need ``state_indices``, an ``output_state`` buffer and
+``output_final_state=True`` for ``output_state_indices``, and
+``checkpoint_every_n_tokens > 0`` for ``checkpoint_state_indices`` and
+``prefix_lens``. Each is a contiguous int32 or int64 tensor on the device of
+``q``.
+
 ``initial_state``, ``output_state`` and ``state_checkpoints`` may be the same
-pool. Rows written by one sequence must not be read or written by another
-sequence of the same call. The native non-context-parallel kernels (SM8x,
+pool. With ``checkpoint_state_indices`` every pool row must be one dense
+``[H, V, K]`` block; the row stride may be padded. Rows written by one sequence
+must not be read or written by another sequence of the same call. The native non-context-parallel kernels (SM8x,
 SM90, SM100/SM103/SM107 and SM120) serve these arguments; ``use_cp=True``,
 ``backend="cake_gdn"`` and ``backend="cudnn"`` reject them.

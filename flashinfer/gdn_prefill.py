@@ -320,7 +320,6 @@ def _validate_slot_args(
     q: torch.Tensor,
     cu_seqlens: Optional[torch.Tensor],
     state_indices: Optional[torch.Tensor],
-    initial_state: Optional[torch.Tensor],
     output_state: Optional[torch.Tensor],
     output_final_state: bool,
     checkpoint_every_n_tokens: int,
@@ -1252,9 +1251,10 @@ def chunk_gated_delta_rule(
         checkpoint_every_n_tokens``). With ``checkpoint_state_indices`` only
         ``checkpoint_cu_starts[i]`` is read and ``[num_seqs]`` entries are
         also accepted.  Required when
-        ``checkpoint_every_n_tokens > 0``. The values must be monotonic and
-        consistent with ``cu_seqlens``; this caller precondition is not checked
-        at launch to avoid a device-to-host synchronization.
+        ``checkpoint_every_n_tokens > 0``. Without ``checkpoint_state_indices``
+        the values must be monotonic and consistent with ``cu_seqlens``; this
+        caller precondition is not checked at launch to avoid a device-to-host
+        synchronization.
     checkpoint_every_n_tokens : int
         Store intermediate state every N tokens.  Must be a multiple of the
         chunk size (64).  ``0`` disables checkpointing (default).
@@ -1400,7 +1400,8 @@ def chunk_gated_delta_rule(
         a buffer rewritten in place is always read live, including on CUDA
         Graph replay.
     output_state_indices : torch.Tensor, optional
-        Int32 or int64 tensor of shape ``[num_seqs]``. Requires
+        Contiguous int32 or int64 tensor of shape ``[num_seqs]`` on the device
+        of ``q``. Requires
         ``state_indices``, an explicit ``output_state`` pool and
         ``output_final_state=True``. Sequence ``i`` then reads its initial
         state from row ``state_indices[i]`` of ``initial_state`` and writes
@@ -1411,10 +1412,12 @@ def chunk_gated_delta_rule(
         write row keeps its contents. Rows written by one sequence must not be
         read or written by another sequence of the same call.
     checkpoint_state_indices : torch.Tensor, optional
-        Int32 or int64 destination rows for checkpoints. Requires
-        ``checkpoint_every_n_tokens > 0``. ``state_checkpoints`` is then a
-        state pool ``[N_pool, num_sab_heads, head_size, head_size]`` (it may
-        be the ``initial_state``/``output_state`` pool) and the ``j``-th
+        Contiguous int32 or int64 destination rows for checkpoints, on the
+        device of ``q``. Requires ``checkpoint_every_n_tokens > 0``.
+        ``state_checkpoints`` is then a state pool ``[N_pool, num_sab_heads,
+        head_size, head_size]`` whose rows are dense ``[H, V, K]`` blocks (the
+        row stride may be padded), so a pool it shares with
+        ``initial_state``/``output_state`` needs that layout too. The ``j``-th
         checkpoint of sequence ``i`` is written to row
         ``checkpoint_state_indices[checkpoint_cu_starts[i] + j]``; a row of
         ``-1`` skips that checkpoint. ``checkpoint_cu_starts`` (``[num_seqs]``
@@ -1422,10 +1425,10 @@ def chunk_gated_delta_rule(
         so a paged caller can pass its page table directly (see
         :func:`flashinfer.gdn_paged.chunk_gated_delta_rule_paged`).
     prefix_lens : torch.Tensor, optional
-        Int32 or int64 tensor of shape ``[num_seqs]``: the number of tokens of
-        each sequence processed before this call. Requires
-        ``checkpoint_every_n_tokens > 0``. Checkpoints are then taken at
-        absolute token positions: sequence ``i`` stores a checkpoint after
+        Contiguous int32 or int64 tensor of shape ``[num_seqs]`` on the device
+        of ``q``: the number of tokens of each sequence processed before this
+        call. Requires ``checkpoint_every_n_tokens > 0``. Checkpoints are then
+        taken at absolute token positions: sequence ``i`` stores a checkpoint after
         its ``n``-th new token whenever ``prefix_lens[i] + n`` is a multiple
         of ``checkpoint_every_n_tokens`` (``1 <= n <= seq_len_i``). Prefix
         lengths need not be multiples of the 64-token chunk; a sequence whose
@@ -1528,7 +1531,6 @@ def chunk_gated_delta_rule(
         q=q,
         cu_seqlens=cu_seqlens,
         state_indices=state_indices,
-        initial_state=initial_state,
         output_state=output_state,
         output_final_state=output_final_state,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,

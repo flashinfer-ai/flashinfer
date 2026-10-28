@@ -61,22 +61,26 @@ def _check_page_table(
             raise ValueError(f"{name} must be contiguous")
 
 
-def _check_cu_seqlens(cu_seqlens: torch.Tensor) -> None:
+def _check_cu_seqlens(cu_seqlens: torch.Tensor, device: torch.device) -> None:
     if (
         cu_seqlens.dtype not in (torch.int32, torch.int64)
         or cu_seqlens.ndim != 1
         or not cu_seqlens.is_contiguous()
     ):
         raise ValueError("cu_seqlens must be a contiguous 1D int32 or int64 tensor")
+    if cu_seqlens.device != device:
+        raise ValueError(f"cu_seqlens must be on {device}, got {cu_seqlens.device}")
 
 
-def _check_page_len(page_len: int) -> None:
-    if type(page_len) is not int:
+def _check_page_size(page_size: int) -> None:
+    if type(page_size) is not int:
         raise ValueError(
-            f"page_len must be a Python int, got {type(page_len).__name__}"
+            f"page_size must be a Python int, got {type(page_size).__name__}"
         )
-    if page_len <= 0 or page_len % 64 != 0:
-        raise ValueError(f"page_len must be a positive multiple of 64, got {page_len}")
+    if page_size <= 0 or page_size % 64 != 0:
+        raise ValueError(
+            f"page_size must be a positive multiple of 64, got {page_size}"
+        )
 
 
 def _check_slots(
@@ -132,7 +136,7 @@ def gdn_paged_prefill_slots(
     cu_seqlens: torch.Tensor,
     page_indices: torch.Tensor,
     page_indptr: torch.Tensor,
-    page_len: int,
+    page_size: int,
     last_page_len: torch.Tensor,
 ) -> GDNPagedPrefillSlots:
     r"""Pool rows that :func:`chunk_gated_delta_rule_paged` derives from a page
@@ -144,7 +148,7 @@ def gdn_paged_prefill_slots(
 
     Parameters
     ----------
-    cu_seqlens, page_indices, page_indptr, page_len, last_page_len
+    cu_seqlens, page_indices, page_indptr, page_size, last_page_len
         As in :func:`chunk_gated_delta_rule_paged`.
 
     Returns
@@ -153,10 +157,12 @@ def gdn_paged_prefill_slots(
         ``[num_seqs]`` int32 read rows, final-state rows, first checkpoint
         entries and prefix lengths.
     """
-    _check_page_len(page_len)
-    _check_cu_seqlens(cu_seqlens)
-    num_seqs = cu_seqlens.size(0) - 1
+    _check_page_size(page_size)
     device = cu_seqlens.device
+    if device.type != "cuda":
+        raise ValueError(f"cu_seqlens must be a CUDA tensor, got {device}")
+    _check_cu_seqlens(cu_seqlens, device)
+    num_seqs = cu_seqlens.size(0) - 1
     _check_page_table(page_indices, page_indptr, last_page_len, num_seqs, device)
     slots = GDNPagedPrefillSlots(
         *(torch.empty(num_seqs, dtype=torch.int32, device=device) for _ in range(4))
@@ -174,7 +180,7 @@ def gdn_paged_prefill_slots(
                 last_page_len,
                 *slots,
                 num_seqs,
-                page_len,
+                page_size,
                 BLOCK=_SLOTS_BLOCK,
             )
     return slots
@@ -237,12 +243,10 @@ def chunk_gated_delta_rule_paged(
     state_pool: torch.Tensor,
     page_indices: torch.Tensor,
     page_indptr: torch.Tensor,
-    page_len: int,
+    page_size: int,
     last_page_len: torch.Tensor,
     use_qk_l2norm_in_kernel: bool = False,
     output: Optional[torch.Tensor] = None,
-    max_seqlen: Optional[int] = None,
-    cu_seqlens_cpu=None,
     gate_domain: Literal["linear", "log"] = "linear",
     use_gate_in_kernel: bool = False,
     A_log: Optional[torch.Tensor] = None,
@@ -254,7 +258,7 @@ def chunk_gated_delta_rule_paged(
 
     For every sequence ``b`` the call processes its new tokens
     ``q[cu_seqlens[b]:cu_seqlens[b + 1]]``, which are the last tokens of the
-    sequence's ``(num_pages_b - 1) * page_len + last_page_len[b]`` tokens
+    sequence's ``(num_pages_b - 1) * page_size + last_page_len[b]`` tokens
     (``num_pages_b = page_indptr[b + 1] - page_indptr[b]``). The tokens before
     them form its prefix. The call
 
@@ -270,7 +274,7 @@ def chunk_gated_delta_rule_paged(
 
     Parameters
     ----------
-    q, k, v, g, beta, scale, use_qk_l2norm_in_kernel, output, max_seqlen, cu_seqlens_cpu, gate_domain, use_gate_in_kernel, A_log, dt_bias, beta_is_logit
+    q, k, v, g, beta, scale, use_qk_l2norm_in_kernel, output, gate_domain, use_gate_in_kernel, A_log, dt_bias, beta_is_logit
         As in :func:`flashinfer.gdn_prefill.chunk_gated_delta_rule`.
     cu_seqlens : torch.Tensor
         ``[num_seqs + 1]`` contiguous int32/int64 offsets of the new tokens of
@@ -288,11 +292,11 @@ def chunk_gated_delta_rule_paged(
         ``page_indices``.
         Sequence ``b`` owns ``page_indices[page_indptr[b]:page_indptr[b + 1]]``
         and must own at least one page.
-    page_len : int
+    page_size : int
         Tokens per page, a positive multiple of 64.
     last_page_len : torch.Tensor
         ``[num_seqs]`` contiguous int32/int64 number of tokens in the last page
-        of each sequence after this call, in ``[1, page_len]``.
+        of each sequence after this call, in ``[1, page_size]``.
     slots : GDNPagedPrefillSlots, optional
         Rows from :func:`gdn_paged_prefill_slots` for the same ``cu_seqlens``
         and page table, typically shared by every layer of a step. Without
@@ -310,8 +314,8 @@ def chunk_gated_delta_rule_paged(
     sequence of the same call. The page table and lengths are caller
     preconditions; they are not validated against each other on the device.
     """
-    _check_page_len(page_len)
-    _check_cu_seqlens(cu_seqlens)
+    _check_page_size(page_size)
+    _check_cu_seqlens(cu_seqlens, q.device)
     num_seqs = cu_seqlens.size(0) - 1
     _check_page_table(page_indices, page_indptr, last_page_len, num_seqs, q.device)
     if state_pool.ndim != 4:
@@ -321,7 +325,7 @@ def chunk_gated_delta_rule_paged(
         )
     if slots is None:
         slots = gdn_paged_prefill_slots(
-            cu_seqlens, page_indices, page_indptr, page_len, last_page_len
+            cu_seqlens, page_indices, page_indptr, page_size, last_page_len
         )
     else:
         _check_slots(slots, num_seqs, q.device)
@@ -341,16 +345,14 @@ def chunk_gated_delta_rule_paged(
         output_state=state_pool,
         state_checkpoints=state_pool,
         checkpoint_cu_starts=slots.checkpoint_cu_starts,
-        checkpoint_every_n_tokens=page_len,
+        checkpoint_every_n_tokens=page_size,
         use_cp=False,
         state_indices=slots.state_indices,
-        max_seqlen=max_seqlen,
         gate_domain=gate_domain,
         use_gate_in_kernel=use_gate_in_kernel,
         A_log=A_log,
         dt_bias=dt_bias,
         beta_is_logit=beta_is_logit,
-        cu_seqlens_cpu=cu_seqlens_cpu,
         output_state_indices=slots.output_state_indices,
         checkpoint_state_indices=page_indices,
         prefix_lens=slots.prefix_lens,
@@ -368,8 +370,8 @@ def gated_delta_rule_decode_paged(
     dt_bias: torch.Tensor,
     b: torch.Tensor,
     scale: Optional[float] = None,
-    use_qk_l2norm: bool = True,
     output: Optional[torch.Tensor] = None,
+    use_qk_l2norm: bool = True,
     *,
     state_pool: torch.Tensor,
     page_indices: torch.Tensor,
@@ -389,7 +391,7 @@ def gated_delta_rule_decode_paged(
 
     Parameters
     ----------
-    q, k, v, A_log, a, dt_bias, b, scale, use_qk_l2norm, output, backend
+    q, k, v, A_log, a, dt_bias, b, scale, output, use_qk_l2norm, backend
         As in :func:`flashinfer.gdn_decode.gated_delta_rule_decode_pretranspose`
         with ``T = 1``.
     state_pool : torch.Tensor
@@ -401,7 +403,7 @@ def gated_delta_rule_decode_paged(
         :func:`chunk_gated_delta_rule_paged`.
     last_page_len : torch.Tensor
         ``[B]`` contiguous int32/int64 number of tokens in the last page
-        including the decoded token, in ``[1, page_len]``.
+        including the decoded token, in ``[1, page_size]``.
     slots : GDNPagedDecodeSlots, optional
         Rows from :func:`gdn_paged_decode_slots` for the same page table,
         typically shared by every layer of a step. Without them the call

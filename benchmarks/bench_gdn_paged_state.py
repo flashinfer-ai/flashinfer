@@ -28,14 +28,14 @@ case the packed API can serve):
   prefix states (zero-filling sequences without a prefix), run
   ``chunk_gated_delta_rule`` with a packed initial state, packed final state
   and a packed ``state_checkpoints`` buffer
-  (``checkpoint_every_n_tokens=page_len``), then scatter the checkpoints and
+  (``checkpoint_every_n_tokens=page_size``), then scatter the checkpoints and
   the final states that do not end on a page boundary into their pages.
 - no-ckpt: ``chunk_gated_delta_rule`` with ``state_indices`` and no
   checkpoints: each sequence reads and overwrites its last page. This is the
   cost of the recurrence alone, a timing reference, not a correct caching
   scheme.
 
-Workloads whose prefixes are not multiples of ``--page-len`` are skipped.
+Workloads whose prefixes are not multiples of ``--page-size`` are skipped.
 
 One selected state per sequence (a chunk-aligned, sequence-local position: one
 of the last three chunk ends of the sequence, chosen by its index modulo 3)
@@ -64,7 +64,7 @@ owns plus the peak of its transient allocations in one eager call.
 
 Usage:
   python benchmarks/bench_gdn_paged_state.py
-  python benchmarks/bench_gdn_paged_state.py --heads 16 16 32 --page-len 1024
+  python benchmarks/bench_gdn_paged_state.py --heads 16 16 32 --page-size 1024
 """
 
 import argparse
@@ -128,15 +128,15 @@ def _tokens(num_tokens, heads):
     return q, k.to(torch.bfloat16), v, g, beta
 
 
-def _prefill_row(name, spans, heads, page_len, state_dtype):
+def _prefill_row(name, spans, heads, page_size, state_dtype):
     hq, hk, hv = heads
     h = max(hq, hv)
     scale = 1.0 / math.sqrt(D)
-    assert all(p % page_len == 0 for p, _ in spans)
+    assert all(p % page_size == 0 for p, _ in spans)
     prefix = [p for p, _ in spans]
     new = [n for _, n in spans]
     totals = [p + n for p, n in spans]
-    num_pages = [max(1, math.ceil(t / page_len)) for t in totals]
+    num_pages = [max(1, math.ceil(t / page_size)) for t in totals]
     b = len(spans)
     t_new = sum(new)
     q, k, v, g, beta = _tokens(t_new, heads)
@@ -146,7 +146,7 @@ def _prefill_row(name, spans, heads, page_len, state_dtype):
     perm = torch.randperm(pool_pages, device="cuda").to(torch.int32)
     indptr = _cu(num_pages)
     last = torch.tensor(
-        [t - (m - 1) * page_len for t, m in zip(totals, num_pages, strict=True)],
+        [t - (m - 1) * page_size for t, m in zip(totals, num_pages, strict=True)],
         dtype=torch.int32,
         device="cuda",
     )
@@ -160,12 +160,12 @@ def _prefill_row(name, spans, heads, page_len, state_dtype):
     for i in range(b):
         pages = page_ids[starts[i] : starts[i + 1]]
         p, t = prefix[i], totals[i]
-        read_rows.append(pages[p // page_len - 1] if p else -1)
-        first = p // page_len
-        count = t // page_len - first
+        read_rows.append(pages[p // page_size - 1] if p else -1)
+        first = p // page_size
+        count = t // page_size - first
         ckpt_counts.append(count)
         ckpt_rows += pages[first : first + count]
-        if t % page_len:
+        if t % page_size:
             final_rows.append(pages[-1])
             final_src.append(i)
     no_prefix = [i for i, r in enumerate(read_rows) if r < 0]
@@ -187,7 +187,7 @@ def _prefill_row(name, spans, heads, page_len, state_dtype):
     owned_bytes = owned * init_buf.element_size()
 
     def slots_fn():
-        return gdn_paged_prefill_slots(cu, perm, indptr, page_len, last)
+        return gdn_paged_prefill_slots(cu, perm, indptr, page_size, last)
 
     slots = slots_fn()
 
@@ -203,7 +203,7 @@ def _prefill_row(name, spans, heads, page_len, state_dtype):
             state_pool=pool,
             page_indices=perm,
             page_indptr=indptr,
-            page_len=page_len,
+            page_size=page_size,
             last_page_len=last,
             output=out,
             slots=slots,
@@ -228,7 +228,7 @@ def _prefill_row(name, spans, heads, page_len, state_dtype):
             output_state=final_buf,
             state_checkpoints=ckpt_buf,
             checkpoint_cu_starts=ckpt_cu,
-            checkpoint_every_n_tokens=page_len,
+            checkpoint_every_n_tokens=page_size,
             use_cp=False,
         )
         if ckpt_rows:
@@ -291,13 +291,13 @@ def _prefill_row(name, spans, heads, page_len, state_dtype):
     )
 
 
-def bench_prefill(heads, page_len, state_dtype, workloads):
+def bench_prefill(heads, page_size, state_dtype, workloads):
     rows = []
     for name, spans in workloads:
-        if any(p % page_len for p, _ in spans):
-            print(f"# skipped {name}: a prefix is not a multiple of page_len")
+        if any(p % page_size for p, _ in spans):
+            print(f"# skipped {name}: a prefix is not a multiple of page_size")
             continue
-        rows.append(_prefill_row(name, spans, heads, page_len, state_dtype))
+        rows.append(_prefill_row(name, spans, heads, page_size, state_dtype))
         torch.cuda.empty_cache()
     return rows
 
@@ -471,20 +471,20 @@ def main():
         description=DESCRIPTION, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("--heads", type=int, nargs=3, default=[16, 16, 32])
-    parser.add_argument("--page-len", type=int, default=1024)
+    parser.add_argument("--page-size", type=int, default=1024)
     parser.add_argument(
         "--state-dtype", choices=["float32", "bfloat16"], default="float32"
     )
     parser.add_argument("--decode-batches", type=int, nargs="*", default=[1, 32, 256])
     args = parser.parse_args()
-    if args.page_len <= 0 or args.page_len % 64:
-        parser.error("--page-len must be a positive multiple of 64")
+    if args.page_size <= 0 or args.page_size % 64:
+        parser.error("--page-size must be a positive multiple of 64")
     state_dtype = getattr(torch, args.state_dtype)
     dev = torch.cuda.get_device_properties(0)
     print(
         f"# {dev.name} (sm_{dev.major}{dev.minor}), torch {torch.__version__}, "
         f"CUDA {torch.version.cuda}, heads q/k/v={tuple(args.heads)}, "
-        f"page_len={args.page_len}, state {args.state_dtype}"
+        f"page_size={args.page_size}, state {args.state_dtype}"
     )
     print(
         "| workload | seqs | new tokens | page ckpts | slots ms | paged ms "
@@ -493,7 +493,7 @@ def main():
     )
     print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for name, b, t, n, ts, tp, tc, t0, mp, mc in bench_prefill(
-        tuple(args.heads), args.page_len, state_dtype, PREFILL_WORKLOADS
+        tuple(args.heads), args.page_size, state_dtype, PREFILL_WORKLOADS
     ):
         print(
             f"| {name} | {b} | {t} | {n} | {ts:.4f} | {tp:.4f} | {tc:.4f} "

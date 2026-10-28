@@ -34,6 +34,8 @@ import torch.nn.functional as F
 
 from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
 from flashinfer.gdn_paged import (
+    GDNPagedDecodeSlots,
+    GDNPagedPrefillSlots,
     chunk_gated_delta_rule_paged,
     gated_delta_rule_decode_paged,
     gdn_paged_decode_slots,
@@ -152,11 +154,11 @@ class PagedBatch:
     """A page table over a shuffled pool, sized for ``total_lens`` tokens."""
 
     def __init__(
-        self, total_lens, page_len, num_sab_heads, state_dtype, spare=7, row_pad=0
+        self, total_lens, page_size, num_sab_heads, state_dtype, spare=7, row_pad=0
     ):
-        self.page_len = page_len
+        self.page_size = page_size
         self.total_lens = list(total_lens)
-        self.num_pages = [max(1, math.ceil(n / page_len)) for n in total_lens]
+        self.num_pages = [max(1, math.ceil(n / page_size)) for n in total_lens]
         pool_pages = sum(self.num_pages) + spare
         ids = list(range(pool_pages))
         random.shuffle(ids)
@@ -180,7 +182,7 @@ class PagedBatch:
         indptr = _cu(self.num_pages, "cuda").to(index_dtype)
         last = torch.tensor(
             [
-                n - (m - 1) * self.page_len
+                n - (m - 1) * self.page_size
                 for n, m in zip(self.total_lens, self.num_pages, strict=True)
             ],
             dtype=index_dtype,
@@ -189,7 +191,7 @@ class PagedBatch:
         return indices, indptr, last
 
     def page_of(self, b: int, token: int) -> int:
-        return self.pages[b][token // self.page_len]
+        return self.pages[b][token // self.page_size]
 
 
 def _assert_state(actual, expected, *, msg):
@@ -250,7 +252,7 @@ def _assert_output_guard(buf):
 def _run_paged_prefill_case(
     prefix_lens,
     new_lens,
-    page_len,
+    page_size,
     heads,
     dtype,
     state_dtype,
@@ -261,7 +263,7 @@ def _run_paged_prefill_case(
     totals = [p + n for p, n in zip(prefix_lens, new_lens, strict=True)]
     streams = Streams(totals, num_q_heads, num_k_heads, num_v_heads, dtype)
     batch = PagedBatch(
-        totals, page_len, streams.num_sab_heads, state_dtype, row_pad=row_pad
+        totals, page_size, streams.num_sab_heads, state_dtype, row_pad=row_pad
     )
     num_seqs = len(totals)
 
@@ -269,11 +271,11 @@ def _run_paged_prefill_case(
     # page that holds the last prefix token.
     _, prefix_final, prefix_ckpts = _oracle(streams, prefix_lens, state_dtype)
     for b, p in enumerate(prefix_lens):
-        for j in range(p // page_len):
+        for j in range(p // page_size):
             batch.pool[batch.pages[b][j]] = prefix_ckpts[b][
-                (j + 1) * page_len // CHUNK - 1
+                (j + 1) * page_size // CHUNK - 1
             ]
-        if p % page_len:
+        if p % page_size:
             batch.pool[batch.page_of(b, p - 1)] = prefix_final[b]
     pool_before = batch.pool.clone()
 
@@ -291,7 +293,7 @@ def _run_paged_prefill_case(
         state_pool=batch.pool,
         page_indices=indices,
         page_indptr=indptr,
-        page_len=page_len,
+        page_size=page_size,
         last_page_len=last,
         output=out,
     )
@@ -317,10 +319,10 @@ def _run_paged_prefill_case(
         p, t = prefix_lens[b], totals[b]
         if t == p:
             continue
-        for j in range(p // page_len, batch.num_pages[b]):
+        for j in range(p // page_size, batch.num_pages[b]):
             page = batch.pages[b][j]
             written.add(page)
-            end = min((j + 1) * page_len, t)
+            end = min((j + 1) * page_size, t)
             expected = ref_final[b] if end == t else ref_ckpts[b][end // CHUNK - 1]
             _assert_state(batch.pool[page], expected, msg=f"seq {b} page {j}")
     for page in range(batch.pool.size(0)):
@@ -330,19 +332,19 @@ def _run_paged_prefill_case(
             )
 
 
-@pytest.mark.parametrize("page_len", [64, 128, 256])
+@pytest.mark.parametrize("page_size", [64, 128, 256])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("heads", [(4, 4, 4), (2, 2, 4), (4, 1, 1)])
-def test_paged_prefill_ragged(page_len, state_dtype, dtype, heads):
+def test_paged_prefill_ragged(page_size, state_dtype, dtype, heads):
     """Ragged batch mixing no prefix, page-aligned, chunk-aligned and unaligned
     prefixes with new spans that stop short of, on and past page boundaries."""
     _skip_if_unsupported()
     if dtype == torch.float16 and state_dtype == torch.bfloat16:
         pytest.skip("covered by the bfloat16 inputs")
-    random.seed(page_len)
-    torch.manual_seed(page_len)
-    L = page_len
+    random.seed(page_size)
+    torch.manual_seed(page_size)
+    L = page_size
     prefix_lens = [0, 0, L, 2 * L, CHUNK, L + 2 * CHUNK, 37, L + 5, 3 * L - 1, L - 1]
     new_lens = [1, 3 * L + 17, L, 5, 2 * L, L + 7, L - 37, 2 * L + 63, 1, 1]
     _run_paged_prefill_case(prefix_lens, new_lens, L, heads, dtype, state_dtype)
@@ -423,7 +425,7 @@ def test_prefix_reuse_does_not_write_shared_pages():
             state_pool=pool,
             page_indices=torch.tensor(pages, dtype=torch.int32, device="cuda"),
             page_indptr=_cu([len(pages)], "cuda"),
-            page_len=L,
+            page_size=L,
             last_page_len=torch.tensor(
                 [total - (len(pages) - 1) * L], dtype=torch.int32, device="cuda"
             ),
@@ -479,7 +481,7 @@ def test_chunked_prefill_continuation_at_unaligned_offsets():
                 used[0] + used[1], dtype=torch.int32, device="cuda"
             ),
             page_indptr=_cu(pages, "cuda"),
-            page_len=L,
+            page_size=L,
             last_page_len=torch.tensor(
                 [max(n - (m - 1) * L, 1) for n, m in zip(new_done, pages, strict=True)],
                 dtype=torch.int32,
@@ -539,10 +541,13 @@ def _idx(values, bits):
     return torch.tensor(values, dtype=dtype, device="cuda")
 
 
+@pytest.mark.parametrize("full_starts", [False, True])
 @pytest.mark.parametrize("index_dtypes", list(_INDEX_DTYPES))
-def test_slot_arguments_match_packed_api(index_dtypes):
+def test_slot_arguments_match_packed_api(index_dtypes, full_starts):
     """The low-level slot arguments against the packed API: -1 read rows start
-    from zero, -1 write rows and -1 checkpoint rows are skipped."""
+    from zero, -1 write rows and -1 checkpoint rows are skipped. With
+    checkpoint rows, ``checkpoint_cu_starts`` may have ``num_seqs`` or
+    ``num_seqs + 1`` entries."""
     _skip_if_unsupported()
     bits = _INDEX_DTYPES[index_dtypes]
     random.seed(4)
@@ -574,7 +579,9 @@ def test_slot_arguments_match_packed_api(index_dtypes):
         cu,
         output_state=pool,
         state_checkpoints=pool,
-        checkpoint_cu_starts=_idx([0, 2, 3], bits["starts"]),
+        checkpoint_cu_starts=_idx(
+            [0, 2, 3, 6] if full_starts else [0, 2, 3], bits["starts"]
+        ),
         checkpoint_every_n_tokens=CHUNK,
         state_indices=read,
         output_state_indices=write,
@@ -722,6 +729,39 @@ def test_one_selected_state_per_sequence(state_dtype):
             assert torch.equal(states[row], before[row]), f"row {row} changed"
 
 
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_packed_checkpoints_without_state(state_dtype):
+    """The packed API with checkpoints only, no initial or final state: the
+    checkpoint buffer sets the state dtype."""
+    _skip_if_unsupported()
+    random.seed(9)
+    torch.manual_seed(9)
+    lens = [130, 64, 257]
+    streams = Streams(lens, 4, 4, 4, torch.bfloat16)
+    q, k, v, g, beta = streams.slices([0] * len(lens), lens)
+    ref_out, _, ref_ckpts = _oracle(streams, lens, state_dtype)
+    counts = [n // CHUNK for n in lens]
+    ckpts = torch.zeros(
+        sum(counts), 4, HEAD_SIZE, HEAD_SIZE, dtype=state_dtype, device="cuda"
+    )
+    out = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        1.0 / math.sqrt(HEAD_SIZE),
+        cu_seqlens=_cu(lens, "cuda"),
+        state_checkpoints=ckpts,
+        checkpoint_cu_starts=_cu(counts, "cuda"),
+        checkpoint_every_n_tokens=CHUNK,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.float(), ref_out.float(), atol=1e-2, rtol=1e-2)
+    for i, expected in enumerate(torch.cat(ref_ckpts)):
+        _assert_state(ckpts[i], expected, msg=f"checkpoint {i}")
+
+
 @pytest.mark.parametrize("index_dtypes", list(_INDEX_DTYPES))
 def test_prefix_lens_absolute_checkpoints(index_dtypes):
     """``prefix_lens`` moves the checkpoint grid to absolute positions; an
@@ -789,6 +829,72 @@ def test_prefix_lens_absolute_checkpoints(index_dtypes):
             row += 1
 
 
+@pytest.mark.parametrize("omit", ["g", "beta", "both"])
+def test_prefix_lens_without_gates(omit):
+    """``prefix_lens`` with ``g`` or ``beta`` omitted: the identity rows that
+    pad the first chunk of an unaligned prefix still continue the
+    whole-stream result."""
+    _skip_if_unsupported()
+    random.seed(13)
+    torch.manual_seed(13)
+    prefix, new = [100, 37], [200, 91]
+    totals = [p + n for p, n in zip(prefix, new, strict=True)]
+    streams = Streams(totals, 4, 4, 4, torch.bfloat16)
+
+    def run(lo, hi, initial_state=None, prefix_lens=None):
+        q, k, v, g, beta = streams.slices(lo, hi)
+        if omit in ("g", "both"):
+            g = None
+        if omit in ("beta", "both"):
+            beta = None
+        base = prefix_lens or [0] * len(lo)
+        counts = [
+            (p + h - l) // CHUNK - p // CHUNK
+            for p, l, h in zip(base, lo, hi, strict=True)
+        ]
+        ckpts = torch.zeros(sum(counts), 4, HEAD_SIZE, HEAD_SIZE, device="cuda")
+        out, final = chunk_gated_delta_rule(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            1.0 / math.sqrt(HEAD_SIZE),
+            initial_state,
+            True,
+            _cu([h - l for l, h in zip(lo, hi, strict=True)], "cuda"),
+            state_checkpoints=ckpts,
+            checkpoint_cu_starts=_cu(counts, "cuda"),
+            checkpoint_every_n_tokens=CHUNK,
+            prefix_lens=None
+            if prefix_lens is None
+            else torch.tensor(prefix_lens, dtype=torch.int32, device="cuda"),
+        )
+        starts = _cu(counts, "cpu").tolist()
+        return out, final, [ckpts[starts[b] : starts[b + 1]] for b in range(len(lo))]
+
+    ref_out, ref_final, ref_ckpts = run([0, 0], totals)
+    _, prefix_final, _ = run([0, 0], prefix)
+    out, final, ckpts = run(prefix, totals, prefix_final, prefix)
+    torch.cuda.synchronize()
+    ref_rows = torch.cat(
+        [
+            torch.arange(s + p, s + t)
+            for s, p, t in zip(streams.starts[:-1], prefix, totals, strict=True)
+        ]
+    ).cuda()
+    torch.testing.assert_close(
+        out.float(), ref_out[ref_rows].float(), atol=1e-2, rtol=1e-2
+    )
+    for b in range(len(prefix)):
+        _assert_state(final[b], ref_final[b], msg=f"seq {b} final")
+        for j, ckpt in enumerate(ckpts[b]):
+            position = (prefix[b] // CHUNK + 1 + j) * CHUNK
+            _assert_state(
+                ckpt, ref_ckpts[b][position // CHUNK - 1], msg=f"seq {b} @{position}"
+            )
+
+
 @pytest.mark.parametrize(
     "kwargs, match",
     [
@@ -820,6 +926,108 @@ def test_slot_arguments_reject_other_routes(kwargs, match):
         )
 
 
+def _strided(x: torch.Tensor) -> torch.Tensor:
+    """``x`` as column 0 of a ``[n, 2]`` table (stride 2)."""
+    return torch.stack([x, x], 1)[:, 0]
+
+
+@pytest.mark.parametrize(
+    "case, match",
+    [
+        ("write_without_read", "output_state_indices requires state_indices"),
+        ("write_without_output_state", "explicit output_state pool"),
+        ("write_without_final_state", "explicit output_state pool"),
+        ("checkpoint_rows_without_every_n", "checkpoint_every_n_tokens > 0"),
+        ("prefix_without_every_n", "checkpoint_every_n_tokens > 0"),
+        ("float_rows", "must be int32 or int64"),
+        ("2d_rows", "must be 1D"),
+        ("long_rows", "must be 1D of 2 entries"),
+        ("cpu_rows", "must be on cuda"),
+        ("strided_rows", "output_state_indices must be contiguous"),
+        ("starts_length", "checkpoint_cu_starts must have 2 or 3 elements"),
+        ("sparse_checkpoint_rows", "pool rows must be dense"),
+    ],
+)
+def test_slot_arguments_reject_bad_inputs(case, match):
+    """Every check fires on the host, before any launch."""
+    _skip_if_unsupported()
+    q, k, v = gen_qkv([64, 64], 4, 4, 4, HEAD_SIZE, torch.bfloat16)
+    pool = torch.zeros(4, 4, HEAD_SIZE, HEAD_SIZE, device="cuda")
+    rows = torch.tensor([1, 2], dtype=torch.int32, device="cuda")
+    kwargs = dict(
+        initial_state=pool,
+        output_final_state=True,
+        cu_seqlens=_cu([64, 64], "cuda"),
+        output_state=pool,
+        state_indices=rows,
+        output_state_indices=rows,
+    )
+    if case == "write_without_read":
+        del kwargs["state_indices"]
+    elif case == "write_without_output_state":
+        del kwargs["output_state"]
+    elif case == "write_without_final_state":
+        kwargs["output_final_state"] = False
+    elif case == "checkpoint_rows_without_every_n":
+        del kwargs["output_state_indices"]
+        kwargs["checkpoint_state_indices"] = rows
+    elif case == "prefix_without_every_n":
+        del kwargs["output_state_indices"]
+        kwargs["prefix_lens"] = rows
+    elif case == "float_rows":
+        kwargs["output_state_indices"] = rows.float()
+    elif case == "2d_rows":
+        kwargs["output_state_indices"] = rows.view(1, 2)
+    elif case == "long_rows":
+        kwargs["output_state_indices"] = torch.cat([rows, rows[:1]])
+    elif case == "cpu_rows":
+        kwargs["output_state_indices"] = rows.cpu()
+    elif case == "strided_rows":
+        kwargs["output_state_indices"] = _strided(rows)
+    else:
+        # One 64-token checkpoint per sequence, routed to pool rows.
+        del kwargs["output_state_indices"]
+        checkpoints = pool
+        starts = rows[:1]
+        if case == "sparse_checkpoint_rows":
+            # Rows of [H, V, K + 8]: each [H, V, K] row is not one dense block.
+            checkpoints = torch.zeros(4, 4, HEAD_SIZE, HEAD_SIZE + 8, device="cuda")[
+                ..., :HEAD_SIZE
+            ]
+            starts = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+        kwargs.update(
+            state_checkpoints=checkpoints,
+            checkpoint_cu_starts=starts,
+            checkpoint_every_n_tokens=CHUNK,
+            checkpoint_state_indices=rows,
+        )
+    with pytest.raises((ValueError, RuntimeError), match=match):
+        chunk_gated_delta_rule(q.cuda(), k.cuda(), v.cuda(), **kwargs)
+
+
+def test_slot_calls_are_not_traced():
+    """``chunk_gated_delta_rule``'s trace has no slot arguments: a slot call
+    gets no template, so it is not dumped and Apply keeps the original call."""
+    from flashinfer.trace.templates.gdn import gdn_prefill_trace
+
+    rows = torch.zeros(1, dtype=torch.int32)
+    for name in ("output_state_indices", "checkpoint_state_indices", "prefix_lens"):
+        assert gdn_prefill_trace(save_dir=None, name=None, **{name: rows}) is None
+    assert gdn_prefill_trace(save_dir=None, name=None) is not None
+
+
+def test_checkpoint_key_range():
+    """The 32-bit checkpoint key of the SM8x/SM90/SM120 slot paths."""
+    from flashinfer.gdn_kernels.delta_rule_dsl.varlen_helper import (
+        check_checkpoint_key_range,
+    )
+
+    # (entries + 2) * N + tokens must stay below 2**31.
+    check_checkpoint_key_range(2**31 // CHUNK - 3, CHUNK, CHUNK - 1)
+    with pytest.raises(RuntimeError, match="exceeds 32 bits"):
+        check_checkpoint_key_range(2**31 // CHUNK - 3, CHUNK, CHUNK)
+
+
 def _page_tables(values: dict, strided=None):
     """int32 tensors of ``values``; the one named ``strided`` is column 0 of a
     ``[n, 2]`` table (stride 2), as a view into a caller's metadata would be."""
@@ -834,7 +1042,7 @@ def _page_tables(values: dict, strided=None):
 
 
 @pytest.mark.parametrize(
-    "page_len, strided, match",
+    "page_size, strided, match",
     [
         (100, None, "multiple of 64"),
         (128.0, None, "Python int"),
@@ -844,7 +1052,7 @@ def _page_tables(values: dict, strided=None):
         (128, "cu_seqlens", "cu_seqlens must be a contiguous"),
     ],
 )
-def test_paged_prefill_rejects_bad_arguments(page_len, strided, match):
+def test_paged_prefill_rejects_bad_arguments(page_size, strided, match):
     q, k, v = gen_qkv([16], 4, 4, 4, HEAD_SIZE, torch.bfloat16)
     pool = torch.zeros(4, 4, HEAD_SIZE, HEAD_SIZE, device="cuda")
     # Two sequences of 8 new tokens, on pages [0, 1] and [2].
@@ -863,7 +1071,28 @@ def test_paged_prefill_rejects_bad_arguments(page_len, strided, match):
             k.cuda(),
             v.cuda(),
             state_pool=pool,
-            page_len=page_len,
+            page_size=page_size,
+            **tables,
+        )
+
+
+def test_paged_prefill_rejects_cu_seqlens_off_device():
+    q, k, v = gen_qkv([16], 4, 4, 4, HEAD_SIZE, torch.bfloat16)
+    pool = torch.zeros(4, 4, HEAD_SIZE, HEAD_SIZE, device="cuda")
+    tables = _page_tables(
+        {"page_indices": [0, 1, 2], "page_indptr": [0, 2, 3], "last_page_len": [8, 8]}
+    )
+    cu = _cu([8, 8], "cpu")
+    with pytest.raises(ValueError, match="cu_seqlens must be a CUDA tensor"):
+        gdn_paged_prefill_slots(cu, page_size=128, **tables)
+    with pytest.raises(ValueError, match="cu_seqlens must be on cuda"):
+        chunk_gated_delta_rule_paged(
+            q.cuda(),
+            k.cuda(),
+            v.cuda(),
+            cu_seqlens=cu,
+            state_pool=pool,
+            page_size=128,
             **tables,
         )
 
@@ -892,10 +1121,10 @@ def test_paged_decode_reads_previous_page_on_a_new_page(state_dtype, heads):
     if major < 9:
         pytest.skip("GDN decode needs SM90+")
     torch.manual_seed(6)
-    page_len = 64
+    page_size = 64
     # last_page_len per sequence: new page, mid page, full page, new page.
     pages = [[3, 9], [5], [7, 0, 2], [1, 4]]
-    last = [1, 17, page_len, 1]
+    last = [1, 17, page_size, 1]
     num_v_heads = heads[2]
     pool = torch.randn(12, num_v_heads, HEAD_SIZE, HEAD_SIZE, device="cuda").to(
         state_dtype
@@ -975,7 +1204,7 @@ def test_paged_prefill_then_decode_end_to_end():
         pytest.skip("GDN decode needs SM90+")
     _skip_if_unsupported()
     torch.manual_seed(7)
-    page_len, prompt, steps, H = 64, 126, 4, 4
+    page_size, prompt, steps, H = 64, 126, 4, 4
     total = prompt + steps
     dtype = torch.bfloat16
     q, k, v = gen_qkv([total], H, H, H, HEAD_SIZE, dtype)
@@ -1003,15 +1232,15 @@ def test_paged_prefill_then_decode_end_to_end():
         state_pool=pool,
         page_indices=torch.tensor(pages[:2], dtype=torch.int32, device="cuda"),
         page_indptr=_cu([2], "cuda"),
-        page_len=page_len,
+        page_size=page_size,
         last_page_len=torch.tensor(
-            [prompt - page_len], dtype=torch.int32, device="cuda"
+            [prompt - page_size], dtype=torch.int32, device="cuda"
         ),
         **gate_kwargs,
     )
     outs = []
     for t in range(prompt, total):
-        n_pages = math.ceil((t + 1) / page_len)
+        n_pages = math.ceil((t + 1) / page_size)
         outs.append(
             gated_delta_rule_decode_paged(
                 q[t].view(1, 1, H, HEAD_SIZE),
@@ -1029,7 +1258,9 @@ def test_paged_prefill_then_decode_end_to_end():
                 ),
                 page_indptr=_cu([n_pages], "cuda"),
                 last_page_len=torch.tensor(
-                    [t + 1 - (n_pages - 1) * page_len], dtype=torch.int32, device="cuda"
+                    [t + 1 - (n_pages - 1) * page_size],
+                    dtype=torch.int32,
+                    device="cuda",
                 ),
             ).view(H, HEAD_SIZE)
         )
@@ -1049,7 +1280,7 @@ def test_paged_prefill_then_decode_end_to_end():
         output_state=torch.zeros(1, H, HEAD_SIZE, HEAD_SIZE, device="cuda"),
         state_checkpoints=ckpts,
         checkpoint_cu_starts=_cu([2], "cuda"),
-        checkpoint_every_n_tokens=page_len,
+        checkpoint_every_n_tokens=page_size,
         use_cp=False,
         **gate_kwargs,
     )
@@ -1111,7 +1342,7 @@ def test_paged_prefill_cuda_graph_reads_live_page_tables():
             state_pool=state_pool,
             page_indices=indices,
             page_indptr=indptr,
-            page_len=L,
+            page_size=L,
             last_page_len=last,
             output=out,
         )
@@ -1193,7 +1424,7 @@ def test_paged_decode_cuda_graph_reads_live_page_tables():
 
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 def test_paged_prefill_slots_rows(index_dtype):
-    """The prefill rows, case by case (page_len 128)."""
+    """The prefill rows, case by case (page_size 128)."""
     L = 128
     # (prefix, new tokens, pages)
     cases = [
@@ -1268,7 +1499,7 @@ def test_paged_prefill_slots_reused_across_layers():
                 state_pool=pool,
                 page_indices=indices,
                 page_indptr=indptr,
-                page_len=L,
+                page_size=L,
                 last_page_len=last,
                 slots=shared,
             )
@@ -1277,3 +1508,96 @@ def test_paged_prefill_slots_reused_across_layers():
         torch.cuda.synchronize()
         assert torch.equal(outs[0], outs[1]), f"layer {layer} output"
         assert torch.equal(pools[0], pools[1]), f"layer {layer} pool"
+
+
+def test_paged_decode_slots_reused_across_layers():
+    """Decode rows computed once serve every layer, bit for bit."""
+    major, _ = get_compute_capability(torch.device("cuda"))
+    if major < 9:
+        pytest.skip("GDN decode needs SM90+")
+    torch.manual_seed(12)
+    pages = [[3, 9], [5], [7, 0, 2], [1, 4]]
+    indices = torch.tensor(sum(pages, []), dtype=torch.int32, device="cuda")
+    indptr = _cu([len(p) for p in pages], "cuda")
+    last = torch.tensor([1, 17, 64, 1], dtype=torch.int32, device="cuda")
+    slots = gdn_paged_decode_slots(indices, indptr, last)
+    for layer in range(2):
+        q, k, v, A_log, a, dt_bias, b = _decode_inputs(len(pages), (4, 4, 8))
+        pool = torch.randn(12, 8, HEAD_SIZE, HEAD_SIZE, device="cuda").to(
+            torch.bfloat16
+        )
+        pools = [pool.clone(), pool.clone()]
+        outs = [
+            gated_delta_rule_decode_paged(
+                q,
+                k,
+                v,
+                A_log,
+                a,
+                dt_bias,
+                b,
+                use_qk_l2norm=True,
+                state_pool=state_pool,
+                page_indices=indices,
+                page_indptr=indptr,
+                last_page_len=last,
+                slots=shared,
+            )
+            for state_pool, shared in zip(pools, (slots, None), strict=True)
+        ]
+        torch.cuda.synchronize()
+        assert torch.equal(outs[0], outs[1]), f"layer {layer} output"
+        assert torch.equal(pools[0], pools[1]), f"layer {layer} pool"
+
+
+@pytest.mark.parametrize("bad", ["int64", "length", "strided", "cpu"])
+@pytest.mark.parametrize("entry", ["prefill", "decode"])
+def test_paged_rejects_bad_slots(entry, bad):
+    def corrupt(x: torch.Tensor) -> torch.Tensor:
+        if bad == "int64":
+            return x.long()
+        if bad == "length":
+            return torch.cat([x, x[:1]])
+        if bad == "strided":
+            return _strided(x)
+        return x.cpu()
+
+    rows = torch.zeros(2, dtype=torch.int32, device="cuda")
+    pool = torch.zeros(4, 4, HEAD_SIZE, HEAD_SIZE, device="cuda")
+    match = r"slots\.\w+ must be a contiguous int32 tensor of shape \(2,\)"
+    if entry == "prefill":
+        q, k, v = gen_qkv([16], 4, 4, 4, HEAD_SIZE, torch.bfloat16)
+        tables = _page_tables(
+            {
+                "cu_seqlens": [0, 8, 16],
+                "page_indices": [0, 1, 2],
+                "page_indptr": [0, 2, 3],
+                "last_page_len": [8, 8],
+            }
+        )
+        slots = GDNPagedPrefillSlots(rows, rows, rows, rows)
+        slots = slots._replace(prefix_lens=corrupt(rows))
+        with pytest.raises(ValueError, match=match):
+            chunk_gated_delta_rule_paged(
+                q.cuda(),
+                k.cuda(),
+                v.cuda(),
+                state_pool=pool,
+                page_size=128,
+                slots=slots,
+                **tables,
+            )
+    else:
+        q, k, v, A_log, a, dt_bias, b = _decode_inputs(2, (4, 4, 4))
+        tables = _page_tables(
+            {
+                "page_indices": [0, 1, 2],
+                "page_indptr": [0, 2, 3],
+                "last_page_len": [1, 5],
+            }
+        )
+        slots = GDNPagedDecodeSlots(rows, corrupt(rows))
+        with pytest.raises(ValueError, match=match):
+            gated_delta_rule_decode_paged(
+                q, k, v, A_log, a, dt_bias, b, state_pool=pool, slots=slots, **tables
+            )
