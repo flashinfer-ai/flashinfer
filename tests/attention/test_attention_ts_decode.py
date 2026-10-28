@@ -1459,17 +1459,10 @@ _FMHA_CASES = (
             out_dtype=torch.float16,
             mask_type="causal",
         ),
-        _policy(
-            "swaps_mma_ab",
-            32,
-            splits=4,
-            split=True,
-            cluster=True,
-            separate=False,
-            persistent=False,
-        ),
+        # FP8 multi-Q may select Swaps or Keeps through the cost model.
+        {},
         "mixed",
-        id="F5-fp8-fp16-sq4-swaps-q32-cluster",
+        id="F5-fp8-fp16-sq4-runtime-causal",
     ),
     _param(
         _case(
