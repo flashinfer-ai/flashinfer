@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any, ClassVar, Optional
 
 from cutlass.experimental import primitives as prims
+from ....task_compat import consumer_work_stage
 from ....tensor_map import transform_ragged_coords
 
 import cutlass
@@ -785,7 +786,7 @@ class SmemPageOffsetsResource(MlaResource):
     @cute.jit
     def page_id(self, page_fragment_idx: int):
         """Return one cached logical page id from the consumer stage."""
-        offset = self.consumer_work_stage * Int32(
+        offset = consumer_work_stage(self) * Int32(
             self.cfg.page_offsets_entries_per_stage
         ) + Int32(page_fragment_idx)
         return Int32(self._smem_page_offsets[offset])
@@ -1089,7 +1090,7 @@ class SmemPageOffsetsResource(MlaResource):
             if lane < groups_per_warp:
                 quad = warp * groups_per_warp + lane
                 offset = (
-                    self.consumer_work_stage * self.cfg.page_offsets_entries_per_stage
+                    consumer_work_stage(self) * self.cfg.page_offsets_entries_per_stage
                     + quad * 4
                 )
                 values = self._smem_page_offsets.data_ptr(offset).load(
