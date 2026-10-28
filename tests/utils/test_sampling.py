@@ -678,14 +678,29 @@ def test_blackwell_cached_cluster_route_rules_per_arch(
         (497, 70008, "shared_tiles", "shared_tiles"),
         # 6- and 7-tile 16-CTA chunks on sm_100: the persistent kernel past 4 rows
         # per shared-tile cluster up to 20 (6 tiles) or 22 (7 tiles) persistent
-        # trips.
+        # trips, or up to 24 trips when the last tile holds at most 6/8 (6 tiles)
+        # or 4/8 (7 tiles) of a tile.
         (123, 180000, "persistent", "persistent"),
         (124, 180000, "persistent", "persistent"),
         (280, 180000, "persistent", "shared_tiles"),
-        (281, 180000, "shared_tiles", "shared_tiles"),
+        (281, 180000, "persistent", "shared_tiles"),
+        (336, 180000, "persistent", "shared_tiles"),
+        (337, 180000, "shared_tiles", "shared_tiles"),
+        (281, 188416, "persistent", "shared_tiles"),
+        (281, 188432, "shared_tiles", "shared_tiles"),
+        (336, 192000, "shared_tiles", "shared_tiles"),
+        (280, 196608, "persistent", "shared_tiles"),
+        (281, 196608, "shared_tiles", "shared_tiles"),
         (124, 210000, "persistent", "persistent"),
         (308, 210000, "persistent", "shared_tiles"),
-        (309, 210000, "shared_tiles", "shared_tiles"),
+        (309, 210000, "persistent", "shared_tiles"),
+        (336, 210000, "persistent", "shared_tiles"),
+        (337, 210000, "shared_tiles", "shared_tiles"),
+        (309, 212992, "persistent", "shared_tiles"),
+        (309, 213008, "shared_tiles", "shared_tiles"),
+        (336, 224000, "shared_tiles", "shared_tiles"),
+        (308, 229376, "persistent", "shared_tiles"),
+        (309, 229376, "shared_tiles", "shared_tiles"),
         # 5-tile 16-CTA chunks of four persistent trips keep the shared-tile kernel.
         (48, 151936, "shared_tiles", "shared_tiles"),
         (56, 163840, "shared_tiles", "shared_tiles"),
@@ -704,6 +719,44 @@ def test_blackwell_cached_cluster_route_boundaries_per_arch(
     # These rows sit at the boundaries set by the resident clusters of each part.
     _skip_unless_b200_or_gb300()
     _check_cached_cluster_route(rows, vocab_size, sm100_route, sm103_route)
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size", [(281, 180000), (336, 180000), (309, 210000), (336, 210000)]
+)
+@pytest.mark.parametrize("temperature_kind", ["scalar", "scalar_pdl", "per_row"])
+def test_blackwell_cached_cluster_partial_tile_trip_cap_per_arch(
+    rows, vocab_size, temperature_kind
+):
+    # On sm_100, 6- and 7-tile 16-CTA chunks whose last tile holds at most 6/8
+    # (6 tiles) or 4/8 (7 tiles) of a tile keep the persistent kernel up to 24
+    # persistent trips, unless the temperature is per row; sm_103 takes the
+    # shared-tile kernel.
+    _skip_unless_b200_or_gb300()
+    torch.manual_seed(7)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    enable_pdl = temperature_kind == "scalar_pdl"
+    if temperature_kind == "per_row":
+        temperature = torch.rand(rows, device="cuda") * 0.9 + 0.1
+        probs_ref = torch.softmax(logits / temperature[:, None], dim=-1)
+    else:
+        temperature = 0.5
+        probs_ref = torch.softmax(logits / temperature, dim=-1)
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    persistent = (
+        torch.cuda.get_device_capability() == (10, 0) and temperature_kind != "per_row"
+    )
+    assert route == (
+        flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_PERSISTENT
+        if persistent
+        else flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_SHARED_TILES
+    )
+    probs = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    torch.testing.assert_close(probs, probs_ref, atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.parametrize(

@@ -105,9 +105,14 @@ constexpr uint64_t kFifthTileLateMaxDenSm100 = 1024;
 constexpr uint64_t kFiveTileLateRowsNumSm100 = 15;
 constexpr uint64_t kFiveTileLateRowsDenSm100 = 2;
 // sm_100, 6- and 7-tile 16-CTA chunks: the persistent kernel's trip cap past 4
-// rows per shared-tile cluster.
+// rows per shared-tile cluster, raised to the persistent kernel's 24-trip fast
+// path when the last tile of the chunk holds at most 6/8 (6 tiles) or 4/8
+// (7 tiles) of a tile, unless the temperature is per row.
 constexpr uint64_t kSixTileC16MaxTripsSm100 = 20;
 constexpr uint64_t kSevenTileC16MaxTripsSm100 = 22;
+constexpr uint64_t kPartialTileC16MaxTripsSm100 = 24;
+constexpr uint32_t kSixTilePartialMaxElementsSm100 = 1536;
+constexpr uint32_t kSevenTilePartialMaxElementsSm100 = 1024;
 // sm_103, 6-tile 8-CTA chunks below 2.5 rows per persistent cluster: the
 // persistent kernel from 20/9 rows per persistent cluster on (80 to 89 rows on
 // GB300).
@@ -765,8 +770,15 @@ cudaError_t select_cached_route(uint32_t rows, uint32_t vocab_size, ParameterKin
                                           : kSharedTilesRowsPerClusterFullChunkC16Sm103;
     use_shared_tiles = short_last_trip || rows64 >= rows_per_cluster * shared_clusters;
   } else {
-    const uint64_t max_trips =
-        chunk_tiles == 6 ? kSixTileC16MaxTripsSm100 : kSevenTileC16MaxTripsSm100;
+    const uint32_t per_cta = ceil_div(vocab_size, static_cast<uint32_t>(variant.cluster_ctas));
+    const uint32_t last_tile = per_cta % kCachedTileElements;
+    const bool partial_last_tile =
+        parameter_kind != ParameterKind::kPerRow && last_tile != 0 &&
+        last_tile <= (chunk_tiles == 6 ? kSixTilePartialMaxElementsSm100
+                                       : kSevenTilePartialMaxElementsSm100);
+    const uint64_t max_trips = partial_last_tile  ? kPartialTileC16MaxTripsSm100
+                               : chunk_tiles == 6 ? kSixTileC16MaxTripsSm100
+                                                  : kSevenTileC16MaxTripsSm100;
     const bool many_rows = rows64 >= kSharedTilesRowsPerCluster * shared_clusters &&
                            !(device_minor == 0 && sixteen && trips <= max_trips);
     bool few_rows =
