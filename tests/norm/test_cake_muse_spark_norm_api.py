@@ -2097,3 +2097,147 @@ def test_gated_residual_next_rmsnorm_routes_window_the_row_count_on_sm_100a(
                 tensor_alpha=tensor_alpha,
                 has_post_weight=has_post_weight,
             ), (tensor_alpha, has_post_weight, rows)
+
+
+OP_B_SM103A_WINDOWS = {
+    "alpha_tensor_pw": [
+        [(0, 32)],
+        [(32, 64), (128, 512)],
+        [(64, 128)],
+        [(512, 768), (1151, 3584)],
+        [(768, 1151)],
+        [(3584, None)],
+    ],
+    "alpha_scalar_nopw": [
+        [(0, 32)],
+        [(32, 128), (320, 384), (2560, None)],
+        [(128, 256)],
+        [(256, 320), (384, 2560)],
+    ],
+    "alpha_scalar_pw": [[(0, None)]],
+}
+OP_B_SM103A_POSITIONS = {
+    "alpha_tensor_pw": (
+        (1, 0),
+        (32, 0),
+        (33, 1),
+        (64, 1),
+        (65, 2),
+        (128, 2),
+        (129, 1),
+        (512, 1),
+        (513, 3),
+        (768, 3),
+        (769, 4),
+        (1024, 4),
+        (1151, 4),
+        (1152, 3),
+        (2048, 3),
+        (3072, 3),
+        (3584, 3),
+        (3585, 5),
+        (10**6, 5),
+    ),
+    "alpha_scalar_nopw": (
+        (1, 0),
+        (32, 0),
+        (33, 1),
+        (128, 1),
+        (129, 2),
+        (256, 2),
+        (257, 3),
+        (320, 3),
+        (321, 1),
+        (384, 1),
+        (385, 3),
+        (1024, 3),
+        (2048, 3),
+        (2560, 3),
+        (2561, 1),
+        (10**6, 1),
+    ),
+    "alpha_scalar_pw": ((1, 0), (255, 0), (256, 0), (10**6, 0)),
+}
+OP_B_SM103A_EDGE_ROWS = (
+    1,
+    32,
+    33,
+    64,
+    65,
+    128,
+    129,
+    256,
+    257,
+    320,
+    321,
+    384,
+    385,
+    512,
+    513,
+    768,
+    769,
+    1151,
+    1152,
+    2560,
+    2561,
+    3584,
+    3585,
+    10**6,
+)
+
+
+def test_gated_residual_next_rmsnorm_routes_window_the_row_count_on_sm_103a(
+    monkeypatch,
+):
+    """Op B's sm_103a routes: the route with a tensor alpha and a post weight holds six records (the
+    persistent four-CTA program with a two-row L2 prefetch owns 513-768 and 1152-3584 rows and differs
+    from the plain persistent four-CTA program, which owns 33-64 and 129-512, only by that prefetch; the
+    quarter-row ring program that owned 1537-3072 rows is gone, so no record of the route rings its rows),
+    the route with a scalar alpha and no post weight holds four (the L2 load-hint form owns 257-320 and
+    385-2560 rows and differs from its neighbour, which owns 33-128, 321-384 and 2561 up, only by the
+    hint), and the route with a scalar alpha and a post weight holds one; the two new programs ship on
+    sm_103a alone, and every row count from 1 up is served on all three routes."""
+    for variant, expected in OP_B_SM103A_WINDOWS.items():
+        route = loader.route_key(OP, variant)
+        names = loader.route_modules("sm_103a", route)
+        assert len(names) == len(expected), route
+        windows = [
+            [
+                tuple(window)
+                for window in loader.MODULES[name]["select_rule"]["windows"]["sm_103a"]
+            ]
+            for name in names
+        ]
+        assert windows == expected, route
+        for rows, position in OP_B_SM103A_POSITIONS[variant]:
+            assert loader.selected_module("sm_103a", route, rows) == names[position], (
+                route,
+                rows,
+            )
+    tensor_pw = loader.route_modules("sm_103a", loader.route_key(OP, "alpha_tensor_pw"))
+    plain, prefetch = (loader.MODULES[tensor_pw[i]]["build"] for i in (1, 3))
+    assert prefetch["prefetch_l2"] == 2 and plain["prefetch_l2"] == 0
+    assert _build_without(tensor_pw[3], "prefetch_l2") == _build_without(
+        tensor_pw[1], "prefetch_l2"
+    )
+    assert loader.MODULES[tensor_pw[3]]["arches"] == ["sm_103a"]
+    assert all(loader.MODULES[name]["build"]["ring"] is None for name in tensor_pw)
+    scalar_nopw = loader.route_modules(
+        "sm_103a", loader.route_key(OP, "alpha_scalar_nopw")
+    )
+    neighbour, hinted = (loader.MODULES[scalar_nopw[i]]["build"] for i in (1, 3))
+    assert hinted["l2_hint"] == "ld_ll" and neighbour["l2_hint"] is None
+    assert _build_without(scalar_nopw[3], "l2_hint") == _build_without(
+        scalar_nopw[1], "l2_hint"
+    )
+    assert loader.MODULES[scalar_nopw[3]]["arches"] == ["sm_103a"]
+    device = torch.device("cuda", 0)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (10, 3))
+    for tensor_alpha, has_post_weight in ((True, True), (False, False), (False, True)):
+        for rows in OP_B_SM103A_EDGE_ROWS:
+            assert pkg.is_cake_gated_residual_next_rmsnorm_supported(
+                device,
+                rows=rows,
+                tensor_alpha=tensor_alpha,
+                has_post_weight=has_post_weight,
+            ), (tensor_alpha, has_post_weight, rows)
