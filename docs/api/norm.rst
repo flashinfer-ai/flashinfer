@@ -61,3 +61,25 @@ fusion and an autograd wrapper.
     cake_rmsnorm_train_backward_workspace_bytes
     cake_rmsnorm_train_backward_workspace
     CakeRMSNormFunction
+
+Training SiLU-gated RMSNorm (Cake)
+----------------------------------
+
+``RMSNorm(x) * weight * SiLU(z)`` with a separate gate input ``z``, forward /
+backward for training on SM100, SM103 and SM107: rows of 128 (``[T, H, 128]``
+or ``[T * H, 128]``) normalized per head with FP32 statistics and gate, BF16
+inputs, outputs and gradients, a weight shared by every token and head whose
+gradient is summed in a fixed order (repeated calls return the same bits), and
+an autograd wrapper that saves only its inputs.
+
+.. currentmodule:: flashinfer.cake_rmsnorm_silu_gate_train
+
+.. autosummary::
+    :toctree: ../generated
+
+    cake_rmsnorm_silu_gate
+    cake_rmsnorm_silu_gate_train_forward
+    cake_rmsnorm_silu_gate_train_backward
+    cake_rmsnorm_silu_gate_train_backward_workspace_bytes
+    cake_rmsnorm_silu_gate_train_backward_workspace
+    CakeRMSNormSiLUGateFunction
