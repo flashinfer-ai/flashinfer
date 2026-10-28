@@ -144,7 +144,7 @@ boundaries.
 
 ## cuDNN linear attention
 
-Use `nvidia-cudnn-frontend>=1.31.0`; KDA and GDN normalization use additive
+Use `nvidia-cudnn-frontend>=1.32.0`; KDA and GDN normalization use additive
 `1e-6` without an epsilon argument. Auto selection also requires CuTe DSL 4.7+.
 The bounded KDA SM100/SM103 and GDN SM100 policies live in `kda.py` and
 `gdn_prefill.py`. KDA's head/length regions are documented in `docs/api/kda.rst`.
@@ -156,6 +156,17 @@ Use `benchmarks/bench_cudnn_linear_attention.py` for public-call comparisons.
 Its raw-gate GDN baseline includes Torch gate transforms; it is not a vLLM
 fused-producer baseline. Keep host CPU, completed wall and reset-inclusive
 CUDA graph times separate.
+
+## cuDNN query sparse attention
+
+`flashinfer.qsa_forward` accepts packed BF16 QSA block bitmaps;
+`flashinfer.qsa_indexed_forward` accepts existing causal token IDs. Both call
+the public `cudnn.ops` API and return BF16 output, FP32 output and natural-log
+LSE. They do not register autograd. Keep cuDNN imports lazy, preserve its input
+contract, and test changed selection during CUDA graph replay.
+Indexed forward is not bitwise repeatable because cuDNN's index compaction
+can change accumulation order. Cover both sides of the bitmap dispatch
+boundary at 512/513 tokens when testing cuDNN Frontend 1.32.
 
 ## Testing
 
