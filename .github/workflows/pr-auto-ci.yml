@@ -85,31 +85,30 @@ jobs:
       - name: Check author is flashinfer-ci org member
         id: org-check
         env:
-          # Needs org:read scope to check membership.
-          GH_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           AUTHOR: ${{ steps.pr.outputs.author }}
+          REPO: ${{ github.repository }}
         run: |
-          if [[ -z "$GH_TOKEN" ]]; then
-            echo "::error::FLASHINFER_GITHUB_TOKEN secret is not set"
-            echo "is_member=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # 204 = member, 404 = not a member, 302 = requester lacks org admin
-          # (falls back to public membership check).
-          HTTP_CODE=$(gh api \
+          # First try the repo collaborator role — works with GITHUB_TOKEN on
+          # public repos and doesn't need the org-scoped PAT.  This lets the
+          # workflow function on fork synchronize events where secrets aren't
+          # available.
+          ROLE=$(gh api \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "/orgs/flashinfer-ci/members/${AUTHOR}" \
-            --silent -i 2>/dev/null | head -1 | awk '{print $2}') || HTTP_CODE="000"
+            "/repos/${REPO}/collaborators/${AUTHOR}/permission" \
+            --jq '.role_name' 2>/dev/null) || ROLE="none"
 
-          if [[ "$HTTP_CODE" == "204" ]]; then
-            echo "$AUTHOR is a flashinfer-ci org member"
-            echo "is_member=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "$AUTHOR is NOT a flashinfer-ci org member (HTTP $HTTP_CODE)"
-            echo "is_member=false" >> "$GITHUB_OUTPUT"
-          fi
+          case "$ROLE" in
+            admin|maintain|write|triage)
+              echo "$AUTHOR is authorized by repository role ($ROLE)"
+              echo "is_member=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          echo "$AUTHOR does not have a sufficient repo role ($ROLE)"
+          echo "is_member=false" >> "$GITHUB_OUTPUT"
 
       - name: Check PR has an approval
         id: approval-check
@@ -233,7 +232,7 @@ jobs:
           && steps.approval-check.outputs.approved == 'true'
           && steps.ci-check.outputs.needs_ci == 'true'
         env:
-          GH_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN || github.token }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
           REPO: ${{ github.repository }}
@@ -447,9 +446,12 @@ jobs:
           && steps.approval-check.outputs.approved == 'true'
           && steps.ci-check.outputs.needs_ci == 'true'
           && steps.publish-scope.outcome != 'failure'
+          && secrets.FLASHINFER_BOT_TOKEN != ''
         env:
           # Use the bot PAT so the labeled event triggers pr-test.yml.
           # (Events from GITHUB_TOKEN do not trigger other workflows.)
+          # On fork synchronize events this secret is unavailable — the step
+          # is skipped and CI relies on the approval-event trigger instead.
           GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           HAS_RUN_CI: ${{ steps.pr.outputs.has_run_ci }}
