@@ -1539,14 +1539,17 @@ class _FullyFusedDeltaRuleSm80(_FullyFusedDeltaRuleSm120):
             else:
                 self.kv_load(tKVrKV, gInitKV, kv_thr_mma)
 
-        if cutlass.const_expr(self.slot_mode and self.needs_init_state):
+        if cutlass.const_expr(
+            self.needs_init_state and (self.slot_mode or self.needs_checkpointing)
+        ):
             # One loop over every block: one code copy of the masked block body
             # (first and last block) and one of the full one. The schedule
             # below instantiates the masked body twice and the loads, O store
             # and checkpoint store three times; a work item of a few blocks
-            # runs mostly that straight-line code, and the larger slot kernels
-            # paid for it in instruction fetch. Later blocks take tok_begin
-            # too: no row of theirs lies before it, so nothing changes.
+            # runs mostly that straight-line code, and the larger slot and
+            # checkpoint kernels paid for it in instruction fetch. Later blocks
+            # take tok_begin too: no row of theirs lies before it, so nothing
+            # changes.
             for blk in cutlass.range(
                 cutlass.Int32(0), num_blocks, cutlass.Int32(1), unroll=1
             ):
