@@ -13,7 +13,8 @@ for launches that ask for a program built with work bins,
 ``_RENDERED_OWNER_HELPER_ROUTES`` for the owner/helper build a call selects when the
 device holds its grid, ``_RENDERED_OWNER_HELPER_POOL_ROUTES`` for its pooled build,
 ``_RENDERED_M64_OWNER_HELPER_ROUTES`` for the owner/helper build of an M64 value-split
-module).
+module, ``_RENDERED_WORK_BIN_MIX_ROUTES`` for the bin-mix build of a module's
+work-bin turnover build).
 """
 
 from functools import cache
@@ -5077,6 +5078,18 @@ _RENDERED_M64_OWNER_HELPER_ROUTES = {
     },
 }
 
+# architecture -> shipped module -> generated bin-mix build of the module's
+# work-bin turnover build (``_RENDERED_WORK_BIN_TURN_ROUTES``): a bin of two
+# tasks hands the last chunks of its second task to a paired bin of one task,
+# which prepares them after its own task and passes each through a global
+# ring.  The runtime launches it cooperatively instead of the turnover build on
+# the launches whose bin table the bin-mix rule admits (``_work_bin_mix_plan``);
+# every other launch of the module keeps the turnover build.
+_RENDERED_WORK_BIN_MIX_ROUTES: dict[str, dict[str, str]] = {
+    "sm_100a": {},
+    "sm_103a": {},
+}
+
 MODULES = {
     **{name: _module_record(name, *row) for name, row in _MODULE_ROWS.items()},
     **_RENDERED_MODULES,
@@ -6165,6 +6178,7 @@ class PreparedKernel:
             bool(record.get("work_bins", False))
             or name in _RENDERED_WORK_BIN_ROUTES.get(arch, {}).values()
             or name in _RENDERED_WORK_BIN_TURN_ROUTES.get(arch, {}).values()
+            or name in _RENDERED_WORK_BIN_MIX_ROUTES.get(arch, {}).values()
         )
         native = load(name, arch)
         entry = record["ffi_entry"]

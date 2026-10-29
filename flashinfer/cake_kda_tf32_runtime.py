@@ -213,6 +213,28 @@ M64_OWNER_HELPER_WORD_STRIDE = 3
 # the measured sweep); 36 tasks is the largest count measured.
 M64_OWNER_HELPER_MIN_SEQ_LEN: tuple[tuple[int, ...], ...] = ((36, 1024),)
 M64_OWNER_HELPER_MIN_SEQ_LEN_GB300: tuple[tuple[int, ...], ...] = ((36, 1024),)
+# The bin-mix build of a work-bin turnover program (see _work_bin_mix_plan):
+# the work-bin table of a launch with more tasks than SMs leaves bins of two
+# tasks beside bins of one, and the two-task bins set the span.  Each two-task
+# bin (owner) pairs in order with a one-task bin (helper); the helper prepares
+# the owner's last ``give`` 32-token chunks after its own task and hands each
+# through WORK_BIN_MIX_SLOTS ring slots of WORK_BIN_MIX_SLOT_ELEMENTS BF16
+# elements per owner and one ready word per slot, which the owner zeroes as it
+# takes the chunk.  The plan holds four words per bin after the bin table,
+# then WORK_BIN_MIX_MAGIC.  With ``d`` the pair's chunk difference,
+# give = min(WORK_BIN_MIX_MAX_GIVE, d // 2 + d // 8, owner chunks - 1), and a
+# pair below one chunk keeps its bins whole.  Measured on B200 and GB300 with
+# 16 sequences of 64 to 256 tokens and 12 heads (two-task bins of 4 to 16
+# chunks); 32-token sequences (d = 1) keep the turnover build.
+WORK_BIN_MIX_MAGIC = 0x58313221
+# Architectures whose admitted launches take the bin-mix build.  On a 152-SM
+# sm_103a part the rule's admitted launches of held-out sequence-length mixes
+# ran 0.7 to 5.1 % slower than the turnover build, so every sm_103a launch keeps
+# the turnover build.
+WORK_BIN_MIX_ARCHES = ("sm_100a",)
+WORK_BIN_MIX_MAX_GIVE = 8
+WORK_BIN_MIX_SLOTS = 8
+WORK_BIN_MIX_SLOT_ELEMENTS = 16384
 # Architectures whose one-wave BF16 grid sweep selected the M64 value split over
 # every direct M128 tile (see _should_use_bf16_one_wave_dvsplit).
 BF16_ONE_WAVE_DVSPLIT_ARCHES = ("sm_100a", "sm_103a")
@@ -1317,6 +1339,7 @@ _COOPERATIVE_REFUSALS = (
     "CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE",
 )
 _M64_OWNER_HELPER_REFUSAL_WARNED = False
+_WORK_BIN_MIX_REFUSAL_WARNED = False
 
 
 def _cooperative_launch_refused(error: BaseException) -> bool:
@@ -1388,6 +1411,77 @@ def _work_bin_turnover_factory(name, *args, **kwargs):
     if program is None:
         return _factory(name, *args, **kwargs)
     return _kda_registry.PreparedKernel(program, detect_gpu_arch())
+
+
+def _work_bin_mix_program(program, gpu_arch: str):
+    """The ``_RENDERED_WORK_BIN_MIX_ROUTES`` build beside the work-bin turnover
+    build ``program`` (``_RENDERED_WORK_BIN_TURN_ROUTES``), or ``None``; always
+    ``None`` on an architecture outside ``WORK_BIN_MIX_ARCHES``."""
+    if program is None or gpu_arch not in WORK_BIN_MIX_ARCHES:
+        return None
+    mix = getattr(_kda_registry, "_RENDERED_WORK_BIN_MIX_ROUTES", {}).get(gpu_arch, {})
+    if not mix:
+        return None
+    turn = _kda_registry._RENDERED_WORK_BIN_TURN_ROUTES.get(gpu_arch, {})
+    for module, turnover in turn.items():
+        if turnover == program and module in mix:
+            return mix[module]
+    return None
+
+
+@cache
+def _work_bin_mix_plan(
+    table: tuple[int, ...],
+    num_bins: int,
+    seq_lens: tuple[int, ...],
+    num_heads: int,
+) -> Optional[tuple[int, ...]]:
+    """The bin-mix plan words of a work-bin table, or ``None`` to keep the
+    turnover build.
+
+    ``table`` is a ``_make_direct_work_bins`` table of 32-token chunks.  The
+    rule takes it only when every bin holds one or two tasks, some hold two,
+    and the one-task bins are at least as many as the two-task bins.  The
+    two-task bins (owners) pair in order with the one-task bins (helpers);
+    with ``d`` the owner's chunks minus the helper's, the owner gives
+    ``g = min(WORK_BIN_MIX_MAX_GIVE, d // 2 + d // 8, owner chunks - 1)``
+    chunks and keeps ``tf`` = owner chunks - ``g``: owner words
+    ``(g, tf, 0, 0)``, helper words ``(-g, owner, helper chunks, tf)``.  A
+    pair with ``g < 1`` keeps zero words, and a table without a pair that
+    gives keeps the turnover build.  The words follow the table, four per
+    bin, then ``WORK_BIN_MIX_MAGIC``.
+    """
+    if num_bins < 2 or len(table) != num_bins + 1 + len(seq_lens) * num_heads:
+        return None
+    chunks = [(length + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK for length in seq_lens]
+    tasks = [table[table[index] : table[index + 1]] for index in range(num_bins)]
+    owners = [index for index, bin_tasks in enumerate(tasks) if len(bin_tasks) == 2]
+    helpers = [index for index, bin_tasks in enumerate(tasks) if len(bin_tasks) == 1]
+    if (
+        not owners
+        or len(owners) + len(helpers) != num_bins
+        or len(helpers) < len(owners)
+    ):
+        return None
+    loads = [
+        sum(chunks[task // num_heads] for task in bin_tasks) for bin_tasks in tasks
+    ]
+    words = [0] * (4 * num_bins)
+    for owner, helper in zip(owners, helpers, strict=False):
+        difference = loads[owner] - loads[helper]
+        give = min(
+            WORK_BIN_MIX_MAX_GIVE,
+            difference // 2 + difference // 8,
+            loads[owner] - 1,
+        )
+        if give < 1:
+            continue
+        keep = loads[owner] - give
+        words[4 * owner : 4 * owner + 4] = [give, keep, 0, 0]
+        words[4 * helper : 4 * helper + 4] = [-give, owner, loads[helper], keep]
+    if not any(words):
+        return None
+    return (*words, WORK_BIN_MIX_MAGIC)
 
 
 def _work_bin_turnover_route(
@@ -2590,6 +2684,9 @@ class FlashKDABlackwellBF16FusedLaunch:
     #: Helper CTAs per task of the M64 owner/helper build the plan launches
     #: (0: another program).
     m64_owner_helpers = 0
+    #: Whether the plan launches the bin-mix build of its turnover program
+    #: (``_work_bin_mix_plan``; False: another program).
+    work_bin_mix = False
 
     def _build_body(
         self,
@@ -4037,6 +4134,7 @@ class FlashKDABlackwellBF16FusedLaunch:
         self.early_n32_state_pack = use_early_n32_state_pack
         self.ir = self.module.schedule
         num_work_bins = 0
+        bin_mix_plan = None
         if getattr(self.module, "work_bins", False):
             # A body built with work bins reads its bin table through seq_order
             # and runs one CTA per bin.
@@ -4058,8 +4156,20 @@ class FlashKDABlackwellBF16FusedLaunch:
                     else {}
                 ),
             )
+            # A turnover launch whose bins the bin-mix rule admits takes the
+            # module's bin-mix build: its plan words follow the table.
+            bin_mix_program = (
+                _work_bin_mix_program(getattr(self.module, "name", None), gpu_arch)
+                if uses_default_fused_m128 and not use_direct_m128_n16
+                else None
+            )
+            if bin_mix_program is not None:
+                bin_mix_plan = _work_bin_mix_plan(
+                    tuple(work_bin_table), num_work_bins, seq_lens, num_heads
+                )
             work_bin_upload = _upload_int32_batch(
-                q.device, {"seq_order": list(work_bin_table)}
+                q.device,
+                {"seq_order": list(work_bin_table) + list(bin_mix_plan or ())},
             )
             self._work_bin_host = work_bin_upload["_host_pinned"]
             seq_order = work_bin_upload["seq_order"]
@@ -4146,6 +4256,19 @@ class FlashKDABlackwellBF16FusedLaunch:
                 _kda_registry._RENDERED_WORK_BIN_TURN_ROUTES.get(gpu_arch, {}).values()
             ):
                 self.schedule += "_turnover"
+            if bin_mix_plan is not None:
+                # The bin-mix build runs the same bins on the same grid; a
+                # refused cooperative launch takes the turnover program
+                # (_fall_back_from_work_bin_mix).
+                bin_mix_fallback = (self.module, self.grid, self.schedule)
+                bin_mix_module = _kda_registry.PreparedKernel(bin_mix_program, gpu_arch)
+                self._qkv_carrier_names[id(bin_mix_module)] = (
+                    self._qkv_carrier_names.get(id(self.module), ())
+                )
+                self.module = bin_mix_module
+                self.ir = bin_mix_module.schedule
+                self.schedule += "_bin_mix"
+                self.work_bin_mix = True
         self.owner_helpers = (
             owner_helpers if getattr(self.module, "owner_helper", False) else 0
         )
@@ -4286,6 +4409,32 @@ class FlashKDABlackwellBF16FusedLaunch:
             self.args.update(
                 initial_state_f32=initial_state_f32_pointer,
                 final_state_f32=final_state_f32_pointer,
+            )
+        if self.work_bin_mix:
+            # The give ring (chunk_state) and its ready words (zero_workspace):
+            # the owner zeroes each word it takes, so the program leaves every
+            # word zero and one zeroed allocation serves every launch of the
+            # plan.  The turnover program keeps its own bindings and reads the
+            # table alone.
+            self._work_bin_mix_fallback = (
+                *bin_mix_fallback,
+                {
+                    "chunk_state": self.args["chunk_state"],
+                    "zero_workspace": self.args["zero_workspace"],
+                    "seq_order": seq_order[: len(work_bin_table)],
+                },
+            )
+            self.args.update(
+                chunk_state=torch.empty(
+                    num_work_bins * WORK_BIN_MIX_SLOTS * WORK_BIN_MIX_SLOT_ELEMENTS,
+                    dtype=torch.bfloat16,
+                    device=q.device,
+                ),
+                zero_workspace=torch.zeros(
+                    num_work_bins * WORK_BIN_MIX_SLOTS,
+                    dtype=torch.uint32,
+                    device=q.device,
+                ),
             )
         if self.owner_helpers:
             # The packet ring (chunk_state) and its two word arrays: the ready
@@ -4518,6 +4667,8 @@ class FlashKDABlackwellBF16FusedLaunch:
         records.append(
             self._m64_owner_helper_record()
             if self.m64_owner_helpers
+            else self._work_bin_mix_record()
+            if self.work_bin_mix
             else _prepared_kernel_record(self.module, self.grid, self.args)
         )
         return records
@@ -4566,6 +4717,53 @@ class FlashKDABlackwellBF16FusedLaunch:
             logger.warning(
                 "KDA prefill: the device refused a cooperative M64 owner/helper "
                 "launch; the plan runs %s instead",
+                schedule,
+            )
+
+    def _work_bin_mix_record(self) -> tuple:
+        """The launch record of the bin-mix build.
+
+        A helper bin's chunks reach their owner through the ring while both
+        CTAs run, so the build is launched cooperatively.  The first refused
+        launch switches the plan for good to the turnover program
+        (_fall_back_from_work_bin_mix) and launches that instead; a refused
+        launch leaves the ring words untouched.
+        """
+        call, arguments = _prepared_kernel_record(self.module, self.grid, self.args)
+
+        def launch(*packed):
+            if self.work_bin_mix:
+                try:
+                    call(*packed)
+                    return
+                except RuntimeError as error:
+                    if not _cooperative_launch_refused(error):
+                        raise
+                self._fall_back_from_work_bin_mix()
+            _run_launch_records(
+                (_prepared_kernel_record(self.module, self.grid, self.args),)
+            )
+
+        return launch, arguments
+
+    def _fall_back_from_work_bin_mix(self) -> None:
+        """Switch the plan to the turnover program of its bins."""
+        global _WORK_BIN_MIX_REFUSAL_WARNED
+        module, grid, schedule, bindings = self._work_bin_mix_fallback
+        _clear_cuda_launch_error()
+        self.args.update(bindings)
+        self.module, self.grid, self.schedule = module, grid, schedule
+        self.ir = module.schedule
+        self.work_bin_mix = False
+        module.prepare(grid=grid, **self.args)
+        self.__dict__.pop("_launch_records", None)
+        if not _WORK_BIN_MIX_REFUSAL_WARNED:
+            _WORK_BIN_MIX_REFUSAL_WARNED = True
+            from flashinfer.jit.core import logger
+
+            logger.warning(
+                "KDA prefill: the device refused a cooperative bin-mix launch; "
+                "the plan runs %s instead",
                 schedule,
             )
 
