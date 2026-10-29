@@ -1536,7 +1536,7 @@ def test_nvfp4_format_contract():
     plan = dict(
         device="cuda",
         batch_size=1,
-        num_heads=8,
+        num_qo_heads=8,
         max_topk=1,
         q_dtype=torch.float8_e4m3fn,
         kv_cache_format="nvfp4",
