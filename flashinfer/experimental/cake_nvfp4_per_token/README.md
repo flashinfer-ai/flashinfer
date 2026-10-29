@@ -38,7 +38,12 @@ single-token-tile overrides: a 2-CTA
 on the 148-SM part when more 128-wide weight tiles than SMs exist, and no L2 promotion
 when one wave of 128-wide tiles covers the row.  The 1-CTA 64-wide tile, and on SM100 that
 128-wide two-wave tile, stage their output over the start of the mainloop ring, which takes
-one more stage; the epilogue hands the overlaid stages back to the CTA's next tile.  The quantizer's CTA
+one more stage; the epilogue hands the overlaid stages back to the CTA's next tile.  In the
+quantize + GEMM chain (`prepare_nvfp4_per_token_chain`) the 1-CTA and split-K GEMM programs of the
+cells of `cake_backend.CHAIN_EP_RULES` (the 8 / 16 / 32-token tiles and the single-token-tile 128-token
+rows, per architecture) prefetch the weight operand and its scales of their first tile's first four K
+tiles into L2 before the grid dependency wait, so the weights load while the quantizer still runs;
+the GEMM alone keeps the programs above.  The quantizer's CTA
 width and occupancy follow `cake_backend.cta_config`; for row sets of 512 tokens or more its fp4 and
 scale stores carry the L2 evict-last policy, so the outputs the dependent GEMM reads next stay
 resident instead of being written back into the quantizer's own read stream.  Every rule is a
@@ -64,10 +69,24 @@ Validated matrix (`validated_problems` in `tests/test_helpers/cake_nvfp4_per_tok
 x bf16 / fp16 output, ragged `M` in {3, 1000, 4097}, fp16 activations and a folded
 output scale on the first family, and the quantizer alone for `K` in {7168, 8192,
 16384, 18432, 28672}.  Only the kernels those shapes select are registered
-(`cake_jit.KERNELS`); a shape outside the matrix raises `NotImplementedError` naming
-the missing kernel.  The dispatch depends on the SM count (148 on B200, 152 on GB300); on
+(`cake_jit.KERNELS`).  The dispatch depends on the SM count (148 on B200, 152 on GB300); on
 GB200 (SM100, 152 SMs) and B300 (SM103, 148 SMs) a shape whose own tactic selects a kernel
-the architecture does not register runs the tactic of B200 / GB300 instead.
+the architecture does not register runs the tactic of B200 / GB300 instead.  A GEMM shape
+outside the matrix whose tactic selects a kernel that is not registered runs the nearest
+registered program: the same orientation, CTA group and closest tile width, with the raster
+group, stream-K tail, scheduler or cache hints of that program (on GB200 / B300 the program
+B200 / GB300 runs); its plan records the replaced key in `unregistered_key`.  A quantizer
+shape whose instance is not registered runs the nearest registered one-CTA-per-row program
+of the same activation dtype and folded scale whose CTA holds the row (a compiled-in row
+width only for contiguous rows of that width), and records the replaced key the same way.
+fp16 activations without such a program (row widths other than 7168, a folded output
+scale, row-strided rows) raise `NotImplementedError` naming the missing kernel.  A GEMM
+plan whose program's TMA boxes exceed the operands (its host binding would refuse the
+shape: the 64-row output box of the half-M 2-CTA pair at 33-63 tokens, the 64-column
+output box of the swapped orientation at `N` < 64) runs the nearest registered program
+whose boxes fit and records the replaced key in `unfit_key`.  Every GEMM program stores
+the output through a box at least 32 columns wide, so `N` in {8, 16, 24} raises
+`ValueError` at prepare.
 
 Correctness: quantizer outputs bitwise equal to the CuTe-DSL per-token kernel; GEMM
 `|out - ref| <= 1e-2 + 1e-2 |ref| + half an output ulp` against the FP32 dequantized

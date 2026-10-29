@@ -58,15 +58,21 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   cast.  The saved FP32 accumulators are re-scaled, never mutated, so a
   retained graph may run the backward repeatedly.
 * `chunked_lm_head_logprob` returns the differentiable `logp [T]` for
-  arbitrary downstream losses; its forward saves only the FP32 row statistics
-  (`lse` and the selected logit) and the backward recomputes each chunk's
-  logits from the saved inputs (four GEMMs per chunk).
+  arbitrary downstream losses; its forward saves the FP32 row statistic `lse`
+  and the valid-row index, and the backward recomputes each chunk's logits
+  from the saved inputs (four GEMMs per chunk) without counting the rows again
+  (no host synchronization).
 * Valid-row compaction (`compact_rows`, a keyword of every eager and autograd
   entry point, default `True`; `prepare_lm_head_loss` takes it as a bool or the
   valid-row tensor, default `False`): when some labels are `-100` the chunk loop runs over the valid rows
   only.  The int64 row index
   `(labels >= 0).nonzero()` is formed once per call (one device
-  synchronization for the count, one for the index), every chunk gathers its
+  synchronization: `nonzero` returns the count and the index together; a call
+  of at most `HOST_COUNT_MAX_ROWS` (1024) rows reads the bool mask back instead
+  and forms the same index on the host, without `nonzero`'s count and select kernels
+  (with some rows ignored, its index copy back makes this step a few microseconds
+  slower than `nonzero` from about 128 rows up);
+  the log-probability backward reuses the forward's index), every chunk gathers its
   rows of `X` into one reusable BF16 `[chunk_size, H]` buffer (`x_c`, a
   workspace region; a strided `X` then needs no contiguous copy), the row
   operands (`labels`, `infer_logp`, `loss_weights`, `dlogp`) are compacted to
@@ -78,7 +84,15 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   K-slice count agrees; `loss` and `dW` are fixed-order reductions over
   different chunk boundaries and differ by FP32 rounding (deterministic run to
   run).  All rows valid: the uncompacted path (no gather, no scatter).  Every
-  row ignored: zeros without a launch.  The prepared runner
+  row ignored: zeros without a launch.  On this host-count path (the calls the
+  hidden valid-row count below does not serve: one and two chunks) a
+  remembered forward launches chunk 0's row gather and logits GEMM right
+  behind the count and binds the rest of the call -- the compacted labels, the
+  policy operands, the row vectors, the accumulators -- behind them
+  (`cake_backend.forward_early_keys`; the log-probability forward's
+  label-column GEMM binds the labels first): the same kernels on the same
+  operands in the same stream order per kernel, so every output is bitwise
+  the in-order sequence's.  The prepared runner
   (`prepare_lm_head_loss(..., compact_rows=True)`) fixes the valid-row set at
   preparation and returns the compact forms (`runner.scatter` restores `[T]`).
 * Fused weight-gradient cast (`fuse_dw_cast`, keyword, default `True`): the
@@ -162,6 +176,20 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   unchanged.  The chunk buffers and the gather buffer exist at the buffer
   extent before the count is known (`memory_report(..., hidden_count=True)`;
   `cake_backend.hidden_count_eligible` / `_hidden_count_begin`).
+* Log-probability logits GEMM arms (`logprob_dz` / `logprob_lbl`, keywords of
+  the log-probability entry points, default `True`; `False` restores the
+  previous path): the backward's recompute of each chunk is one
+  `gemm_logits_dz` launch whose epilogue writes
+  `dz_c = bf16(d_t * (1[v = y_t] - exp(z - lse_t)))` -- the per-element
+  sequence of `row_grad` on the same BF16-rounded logits, zeros on ignored
+  rows -- in place of the logits, so the logits store and the `row_grad`
+  launch disappear; the forward's logits GEMM `gemm_logits_lbl` writes the row
+  statistics and the logit at the (clamped) label column alone, the one
+  element `row_finalize` reads.  The same arithmetic per element, so `lse`,
+  `logp`, `dX` and `dW` are bitwise the previous path's.  A record that does
+  not register an arm keeps the previous stages; the hidden valid-row count's
+  chunk 0 keeps its device-count GEMM (`gemm_logits_mcnt` /
+  `gemm_logits_nostats_mcnt` + `row_grad`).
 * Memory rule: no logits, probability or `dlogits` buffer ever spans more than
   `chunk_size` tokens; a batch smaller than `chunk_size` is one chunk, a tail
   `T % chunk_size` is neither dropped nor padded, and `T == 0` returns loss 0,
@@ -198,7 +226,8 @@ Every switch above is a keyword argument of each entry point it affects
 `backward_loss`, `forward_logprob`, `backward_logprob`,
 `prepare_lm_head_loss`; `prepare_lm_head_loss` takes `compact_rows` as a bool or
 the valid-row tensor, default `False`, and no `hidden_count`; `forward_logprob`
-and `backward_loss` take no `dw_stream`), `None` selecting the documented default
+and `backward_loss` take no `dw_stream`; `logprob_lbl` belongs to the
+log-probability forward and `logprob_dz` to its backward), `None` selecting the documented default
 (`cake_backend.compact_rows_default()` and friends return the constants); the
 autograd entries resolve every switch once in the forward.  **The package reads
 no environment variable.**  The `FLASHINFER_CAKE_LM_HEAD_LOSS_*` variables are
@@ -207,7 +236,8 @@ switch keyword left at `None` there falls back to its variable and the resolved
 value is passed down; the two binding-cache variables are read when that
 module is imported and applied through `BINDING_CACHE.configure` when it first
 reaches the backend.  A build that vendors the package without the wrapper
-sees the backend defaults.
+sees the backend defaults.  The wrapper leaves `logprob_dz` / `logprob_lbl`
+at their backend defaults (no variable).
 
 | Keyword (backend default) | Variable read by `flashinfer.chunked_lm_head` | Parsing |
 | --- | --- | --- |
@@ -234,7 +264,10 @@ gather and logits GEMM ran before the count was known, see
   per-(row, 256-column tile) online `(max, sum-exp)` partials of the
   BF16-rounded logits, written from the epilogue.  The log-probability
   backward's recompute uses `gemm_logits_nostats`, the same GEMM without the
-  statistics.
+  statistics.  The log-probability entry's arms (`logprob_lbl` /
+  `logprob_dz`): `gemm_logits_lbl` writes the partials and `z_c` at the label
+  column only (forward); `gemm_logits_dz` writes `dz_c` (the `row_grad`
+  sequence below) in place of `z_c` (backward recompute, no `row_grad`).
 * `row_finalize`: one warp per row merges the partials into `lse`, gathers
   the selected logit, writes `logp` (0 on ignored rows) and, per objective,
   the per-row logit-gradient scale `d_t` and the loss term; the
@@ -316,11 +349,49 @@ a record serves every admissible geometry and the host never selects by shape:
   (`cake_backend.dx_stages_variant`, `DX_LONG_CHUNK_STAGES`); the 256-wide
   fallback keeps its depth.  Bitwise: the ring depth only changes when a stage
   is refilled;
+* `_split`: the 512-wide `dX` tile whose launch's last wave would leave SM
+  pairs idle: when the `W` wide work items (row pairs x `H / 512` x
+  `k_slices`) leave `r = W mod P` items in the last wave of the `P` SM pairs
+  with `0 < r <= P / 2`, the last `r` wide items run as `2 r` 256-wide half
+  items in the same launch (the grid carries `W + r` clusters; the split count
+  is the launch scalar `dx_split`).  Taken on both architectures for chunks
+  that are not a whole number of 512-token tiles; for chunks of whole
+  512-token tiles below `H` 7168 on sm_103a in every call
+  (`DX_SPLIT_WHOLE_ARCHES`) and on sm_100a in calls of fewer than three
+  chunks, whose dW accumulate shares the dX stream
+  (`DX_SPLIT_WHOLE_FEW_CHUNKS_ARCHES`, `DW_STREAM_MIN_CHUNKS`); on the
+  long-chunk ring (`_st3_split`) on sm_103a only
+  (`cake_backend.dx_split_rule`, `cake_backend.dx_split_eligible`,
+  `DX_SPLIT_ARCHES`, `DX_SPLIT_LONG_RING_ARCHES`).  Bitwise: the same K
+  slices and per-element K order on both widths;
+* `_swab`: the swapped 512-wide `dX` tile (`dX^T = W^T dz^T`: a CTA's 128
+  hidden columns of `W` on the MMA's M, the chunk's 512-token tile on its N,
+  the output stored per thread), at the table ring depth, on sm_103a only
+  (`DX_SWAB_ARCHES`): a chunk of whole 512-token tiles of a cross-entropy
+  loss call (the loss entry point with objective `"ce"`) of at least three
+  chunks (`DW_STREAM_MIN_CHUNKS`) takes it ahead of the split-tail rule
+  (`cake_backend.dx_swab_rule`); the policy objective, the log-probability
+  entry point and calls of fewer chunks keep the other forms.  Bitwise: the
+  same bf16 products summed over the same K slices in the same K order.
+
+On sm_100a the record's 512-wide `dX` stages (`gemm_dx`, `gemm_dx_s`, their
+`_st3` and `_split` forms) run programs built with a 3-deep operand ring and a
+4-deep epilogue staging of the output tile (one program serves a base form and
+its `_st3` form); sm_103a keeps the table depths.  Bitwise: only the pipeline
+depths differ.
 * `_gn`: the 2-D blocked raster of the weight-gradient accumulate and the fp32
   fused cast below `H` 7168 for chunks of 2049 .. 4096 rows on both
   architectures, with `group_n` = 12 column tiles per block
   (`cake_backend.dw_block_variant`, `DW_BLOCK_GROUPS`); the bf16 cast keeps the
   1-D raster.  Bitwise: a permutation of the same tiles.
+* `_tma`: the TMA-epilogue form of the bf16 fused weight-gradient cast
+  (`gemm_dw_cast_bf16_tma`): the deferred cast of the last chunk of a call of
+  at least two chunks whose last chunk has at most 1792 rows
+  (`DW_CAST_TMA_MAX_ROWS`, both architectures; `cake_backend.dw_cast_tma_rule`)
+  reads the old FP32 sum and stores the bf16 tile as TMA sub-tiles.  A
+  one-chunk call (no old sum) and a longer last chunk keep the shipped cast;
+  an explicit `"epi_store"` knob of `gemm_tuning`'s `"dw"` wins over the rule.
+  Bitwise: the same per-element `(old + acc) * g` and round-to-nearest.
 
 The raster height is a scalar of the base forms: `group_m` 16 for the logits
 GEMMs and 32 for the weight-gradient GEMMs (accumulate and fused cast) at
@@ -344,8 +415,15 @@ architecture's rules can reach (`cake_backend.reachable_variants`, checked by
 autograd entry point; default `None` = no explicit knob) pins knobs explicitly
 per GEMM --
 `{"logits": {"group_m": 16}, "dx": {"tile_n": 256, "k_slices": 2, "stages": 4},
-"dw": {"group_m": 32, "group_n": 0}}`, a knob given as `null` pins the default
--- and wins over the rule for the knobs it names.
+"dw": {"group_m": 32, "group_n": 0}}`; the `dX` GEMM also takes `"split"` (the
+number of trailing wide items run as half items) and `"swap_ab"` (the `_swab`
+tile) -- a knob given as `null` pins the default -- and wins over the rule for
+the knobs it names.  An explicit `"split"`, or a `"stages"` other than the
+table ring depth 4, keeps that form and turns the `_swab` rule off.
+`"swap_ab": true` applies to every chunk; it raises with such a `"stages"`,
+with a nonzero `"split"`, on an architecture without the swapped program
+(only SM103 has it), and on a chunk whose dX tile is the 256-column one
+(pin `"tile_n": 512` as well).
 
 Grid rules live in the registry record (e.g. `rows_c/8` CTAs for
 `row_finalize`, `V/8/1024 x rows_c` for `row_grad`) and are evaluated by the
@@ -388,24 +466,21 @@ workspace; the logits GEMM's output descriptor covers the chunk's rows only.
 * `cake_backend.py` -- validation, chunk plans, workspace layout, memory
   accounting, argument-plan binding, the prepared runner, the torch reference
   path, the autograd `Function`s and the eager entry points.
-* `csrc/cake_lm_head_loss/` -- generated kernel translation units
-  (`cake_lm_head_loss_<unit>_kernel.cu`, one architecture-neutral unit per
-  kernel family shared by the records of both architectures, the sibling
-  forms of a family selected by compile definitions and the per-architecture
-  lowering under `__CUDA_ARCH__` guards -- the four logits GEMM forms share
-  one unit across both architectures, and their sm_103a lowering, which
-  stages the C tile in shared memory for a TMA store behind a six-stage
-  operand pipeline while sm_100a stores from registers behind seven, sits in
-  a definition-keyed arm of it) and their launch stubs
-  (`..._launch.cu`: `#define CAKE_KERNEL_SYMBOL`, the compile definitions the
-  shared launcher reads for that kernel, + the include of the shared
-  launcher); `csrc/cake_lm_head_loss/shim/` -- the shared tvm-ffi launchers
-  (`cake_lm_head_loss_shim_<digest>.cuh`, one per launch shape, the stub's
-  compile definitions selecting the operand types, the C descriptor form,
-  dynamic shared memory and cluster form within it: descriptor encoders,
-  argument checks, dynamic shared memory and launch geometry);
-  `csrc/cake_ffi_checks.h` -- the tvm-ffi tensor checks the launchers
-  include (shipped with the package, no FlashInfer header).
+* `csrc/cake_lm_head_loss/` -- generated translation units, two per program
+  `cake_lm_head_loss_<unit>`: the kernel unit
+  (`cake_lm_head_loss_<unit>_kernel.cu`, architecture-neutral, the
+  per-architecture lowering under `__CUDA_ARCH__` guards) and the tvm-ffi
+  binding (`cake_lm_head_loss_<unit>_binding.cu`: argument checks, the
+  descriptor encoders, the dynamic shared memory and the launch).  Sibling
+  forms of one kernel share a kernel unit: the shared body defines its
+  kernel through `CAKE_PROGRAM_KERNEL` and the knob macros select each form's
+  lines (`#if` arms), set per library by the compile definitions of its
+  `build.json` entry -- the eight logits GEMM forms of both architectures,
+  the 512-wide and the 256-wide `dX` forms, the weight-gradient accumulate
+  forms, the fused casts and the two scale casts.  Equal bindings are one
+  file whose kernel is `CAKE_KERNEL_SYMBOL`, likewise set per library;
+  `csrc/cake_ffi_checks.h` -- the tvm-ffi tensor checks the bindings include
+  (shipped with the package, no FlashInfer header).
   `.clang-format` disables formatting: the sources are identity-checked by
   the manifest's digests.
 
@@ -414,7 +489,7 @@ workspace; the logits GEMM's output descriptor covers the chunk's rows only.
 The registry holds one record per architecture (`sm_100a`, `sm_103a`),
 `cake_lm_head_loss_<arch>`, geometry-free (`H` / `V` and the rules' outputs are
 launch scalars: every `H` a multiple of 512 and `V` a multiple of 256 runs on
-it), with the fourteen base stages above plus the nine structural forms the
+it), with the sixteen base stages above plus the sixteen structural forms the
 rules can reach (`abi = lm_head_loss_v1`), exported from the kernel snapshot
 named in the pull request.
 

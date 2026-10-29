@@ -85,9 +85,18 @@ The backend is a self-contained package. `cake_jit.py` holds the registry of
 the generated programs and the loader glue (`launch_grid`, `launch_args`,
 `load`). The registry's `MODULES` holds one record per program, each naming
 the stage it fills: `decode`, the persistent decode, and `reduce`, the split-KV
-combine. On SM100 the decode stage has a second program, `decode_qk_ahead`,
-which the host selects once per plan for long balanced plans; both decode
-programs give bitwise-identical outputs. Each record carries the host plan: the
+combine. A stage may have further programs, which the host selects once per
+plan; the programs of one stage give bitwise-identical outputs. The decode
+stage's are `decode_qk_ahead` (SM100), for long balanced plans, `decode_xv`
+(SM103), for plans whose every work unit streams long pieces,
+`decode_short`, for plans whose work units are all short, and
+`decode_short_epi_warp`, which takes the place of `decode_short` when every
+request ends in a CTA of at least 32 valid query rows, and
+`decode_short_spec_uh` and `decode_short_epi_warp_spec_uh`, which load
+the first item of their work unit in the kernel setup and take the place of
+either when every work unit holds one item pair; the combine's is
+`reduce_general`, for plans of more than two splits per row. Each record
+carries the host plan: the
 architectures it is delivered for, its launch record, the argument plan of its
 `run` entry, the grid rule a launch follows, the kernel-parameter to
 logical-argument map and the work-table and partial-buffer constants the

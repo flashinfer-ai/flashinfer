@@ -131,8 +131,13 @@ into the saved set.
 
 A workspace is one arena (a `uint8` tensor) holding the internal-layout
 intermediates of one `(S, num_docs, H)` problem; `chunk_kda_fwd` /
-`chunk_kda_bwd` allocate only their outputs and the saved set when given one,
-and without one each call allocates a workspace of its own.  The arena is not
+`chunk_kda_bwd` allocate only their outputs and the saved set when given one.
+Without one, each call allocates its arena when it starts and frees it when it
+returns, so no device memory outlives the call.  The host side of that
+workspace (the plan, which `cake_backend.plan` caches per `(S, num_docs, H,
+sm_count, arch)`, and the layout views) is kept per device, stream and arena
+option, so a repeated problem costs the host about what a caller-owned
+workspace costs.  The arena is not
 initialized: every element a launch reads is written earlier in the same
 call, so the content at allocation never reaches a result (`zero_init=True`
 zero-fills it for diagnostics).  The autograd node of `chunk_kda` holds a
@@ -199,13 +204,13 @@ heads) with `ValueError` when a backward workspace is built and in the byte
 queries; it serves the contract's head counts 1, 2, 4, 8, 16, 32 and 64.
 
 `tail_passes = B` runs the chunk-parallel tail stages of the backward (the
-fused gradient `dqkg`, the GLM intra program and, on `sm_100a` / `sm_107a`,
+fused gradient `dqkg`, the GLM intra program and, on `sm_100a`,
 the gate epilogue `gate_epilogue`: the last launch steps of the backward's
 lifetime tables) once per range of `ceil(NC_pad / B)` chunks.  Each pass takes views of the
 whole-sequence buffers (`gk`, `v_new`, `dv2`, `beta_int`, the `h` / `dh`
 tapes) offset to the range's first chunk, the range's slices of the chunk
 tables and the per-pass buffers (`dq_f`, `dk_f`, `dg_f`, `db_f`, `dAkk`,
-`dAqk` and, on `sm_100a` / `sm_107a`, the gate epilogue's `dg_int`, `db_int`), which are
+`dAqk` and, on `sm_100a`, the gate epilogue's `dg_int`, `db_int`), which are
 sized for one range; the token tensors
 (`q`, `k`, `v`, `dout`, the saved `Aqk` / `Akk`, the gradients) are passed
 whole, every kernel reaching them through the absolute `chunk_bos` offsets.
@@ -230,14 +235,14 @@ shared with the state blocks.  Two passes give
 `slack` is the ceil slack of the last range (the per-pass buffers are sized
 for `R_b = 64 * ceil(NC_pad / tail_passes)` rows; it is zero when
 `tail_passes` divides `NC_pad`); passes above four buy nothing more.  On
-`sm_103a`, where the GLM intra program hosts the gate epilogue, its inputs
+`sm_103a` / `sm_107a`, where the GLM intra program hosts the gate epilogue, its inputs
 `dg_int` (512 B) and `db_int` (4 B) leave the lean layouts: one
 pass gives 4104 (tape 3336), the per-pass set is 2052 and two passes give
 `2820 * R * H + max(3 * block, 258 * R * H)` (3078; tape 2310); the default
 layouts are unchanged (the two buffers share slots there).  Against the
 default's 4488 the light constants are about 8 % (one pass), 26 % (two
-passes; 31 % on `sm_103a`) and 37 % (four or more) smaller.  The table
-gives the constants (`sm_100a` / `sm_107a`; `sm_103a` where they differ);
+passes; 31 % on `sm_103a` / `sm_107a`) and 37 % (four or more) smaller.  The table
+gives the constants (`sm_100a`; `sm_103a` / `sm_107a` where they differ);
 the state blocks and the slack come on top where the formulas say so:
 
 | arena | light: B per internal token-head | tape: B per internal token-head | checkpoint replay (`saved=None`) |
@@ -288,9 +293,14 @@ saved tables describe the whole problem); the whole token tensors and
 gradients (every program reaches the tokens through the absolute `chunk_bos`
 offsets of its tables); the group's slices of a saved `h` / `v_new` tape; and
 its state blocks, recomputed in the view on the `light` and `replay` paths,
-gathered from the saved `hseg` / `seg_state` / `seg_m` by chain rank on
-`light_states` and `tape`, and scattered back from the view when the forward
-saves them.  The records, the segment count per document (`P`, with the
+taken from the saved `hseg` / `seg_state` / `seg_m` by chain rank on
+`light_states` and `tape`, and written back when the forward saves them.  The
+host ranks the chains from `doc_lengths` by the tables' rule (chunk count,
+most first, ties in document order), so a group whose blocks are one run of
+the saved ones reads views of them and its forward carry writes the saved
+`hseg` directly (the offsets / transfers are contiguous copies); a group whose
+blocks are not one run gathers and scatters them by index.  The records, the
+segment count per document (`P`, with the
 non-proportional block table) and the saved set are the whole problem's; the
 saving forward therefore writes the whole problem's tables once with the
 saved-set paths' table program (`table_v3` / `table_v2`) before its groups.
@@ -305,8 +315,18 @@ patterns on rows built for this case.  The option refuses the rows whose block
 table gives the documents proportional segment counts (`num_docs * H <= 4` on
 the segmented route: a group of fewer documents would change every document's
 segments) and, on a lean workspace, the checkpoint replay (`saved=None`); a
-batched workspace that is not lean runs the replay group by group.  The costs
-per group are a table launch, the gathers (three state blocks of the group,
+batched workspace that is not lean runs the replay group by group.  With
+`tail_passes = B` the arena is sized for the largest group (over `doc_lengths`,
+or the bound of every group) at `B` passes, and each group runs its tail in the
+fewest passes `b <= B` whose lean layout at the group's geometry fits that arena
+(`b = 1`: the one-pass lean layout): each tail stage launches once per range of
+`ceil(NC_pad / b)` chunks instead of `ceil(NC_pad / B)`, with the same gradients
+bit for bit and the same arena bytes.  `b` is the `tail_passes` of the group
+view the backward runs: `KdaWorkspace.batch_view(group, tape=True)` (at the
+group's `NC_pad_tape`) where the call reads slices of a saved tape or of the
+saved `qg` / `w` / `u`, else `batch_view(group)`.  The costs
+per group are a table launch, the gathers of a group whose blocks are not one
+run (at most three state blocks per segment of the group, within
 `batch_scratch` of `memory_report`) and the smaller grids; the serial route's
 chains of different groups run one group after another.
 
@@ -466,10 +486,12 @@ build `dhu_v3r_f` (their `_wt` forms behind `fwdh_p3_wy`, their `_replay`
 forms on the replay)); `dqkg` (fused dq / dk / dg / dbeta partials and
 `dA_kk`; `_davq` forms host `dA_qk`; `_int` forms read the internal rows on
 the replay; persistent grid of `min(NC_pad * H, sm_count)` CTAs);
-then the GLM intra program: `glm_intra_v14` on `sm_103a` (the intra-chunk
-terms, the GLM gate chain and the gate epilogue's token-row `dg` / `dbeta` in
-one launch: no `gate_epilogue` stage there) or `glm_intra` and `gate_epilogue`
-(the token-row `dg` and `dbeta`) on `sm_100a` / `sm_107a`.
+then the GLM intra program: `glm_intra_v14` on `sm_103a` and `glm_intra_v18`
+on `sm_107a` (the intra-chunk terms, the GLM gate chain and the gate epilogue's
+token-row `dg` / `dbeta` in one launch: no `gate_epilogue` stage there;
+`glm_intra_v18` is the same program with every named-barrier slot an
+immediate, so two of its CTAs share an SM on `sm_107a`) or `glm_intra` and
+`gate_epilogue` (the token-row `dg` and `dbeta`) on `sm_100a`.
 
 Launches per call (148 SMs; the table programs of a saved-set path count only
 when the set carries no tables), on `sm_100a`:
@@ -497,16 +519,18 @@ launches as on `sm_100a`: 1 document, 16 heads (segmented, `P = 9`) 5 / 11 /
 The selection and grid rules are data in `cake_jit.MODULES` (`select_rule`,
 `grid_rule`) and are evaluated by `cake_jit.select_record` / `launch_grid` /
 `segment_plan` / `segment_args`; `cake_backend.plan(S, num_docs, H, sm_count,
-arch)` resolves them once per problem into `Plan.records[path][stage]`, and
+arch)` resolves them once per problem into `Plan.records[path][stage]` (cached
+on its arguments; `arch=None` takes the current CUDA device's architecture, or
+the first exported one when no exported device is present), and
 `Plan.launch_count(path)` is the launch count of each path (`"bwd"`: the
 backward from the plan's own light saved set).
 
 ### Programs by stage
 
-66 records naming 64 programs from 38 kernels (`fwdh_v3` and `fwdh_p3` are
+67 records naming 65 programs from 39 kernels (`fwdh_v3` and `fwdh_p3` are
 one program, the two passes of the segmented walk; `bwd_prep_g8_noqg` and
-`bwd_prep_g8_noqg_nokb` are two keyword forms of one kernel; three records
-ship on some of the architectures only: `glm_intra_v14`, `glm_intra` and
+`bwd_prep_g8_noqg_nokb` are two keyword forms of one kernel; four records
+ship on some of the architectures only: `glm_intra_v14`, `glm_intra_v18`, `glm_intra` and
 `gate_epilogue`; `wy_bwd` and `wy_fwd_rows`
 are one program, the WY representation from the saved `Akk` on the backward
 and on the saving forward's overlap and paired serial rows; `fwdh_p3_o_ov`,
@@ -530,8 +554,8 @@ those rows; "64-column form" `num_docs * H * 4 > 4 * sm_count`,
 | `dav` | `dav_serial`, `dav_serial_replay` | serial rows below 16 heads (`dA_qk` alone, no `dv1` output); the `_replay` form on the replay; none elsewhere (the fused gradient hosts `dA_qk`) |
 | `dhu` | `dhu_v1`, `dhu_v1_replay`, `dhu_v1_wt`, `dhu_v1_wt_replay`, `dhu_v2t`, `dhu_v2t_replay`, `dhu_v3_f`, `dhu_v3_f_wt`, `dhu_v3_f_replay`, `dhu_v3p_f`, `dhu_v3p_f_wt`, `dhu_v3p_f_replay`, `dhu_v3r_f`, `dhu_v3r_f_wt`, `dhu_v3r_f_replay`, `dhu_v3s_f`, `dhu_v3s_f_wt`, `dhu_v3s_f_replay` | serial 64-column form: `dhu_v1_wt*` behind the fused recompute (from 64 heads on `light` / replay), `dhu_v1*` otherwise; 32-column form: `dhu_v2t*`; segmented, two launches each, every form accumulating `dv1`: few chains `dhu_v3s_f` (`light`, `tape`), `dhu_v3s_f_wt` (`light_states`), `dhu_v3s_f_replay`; above four chains `dhu_v3_f*` (TMA tapes) when `NSEG * H < 4 * sm_count` (`<=` at `H <= 4`) -- on `sm_103a` `dhu_v3p_f*` (the form prefetching the next chunk's tiles) below `4 * sm_count` and `dhu_v3_f*` at the boundary alone -- else `dhu_v3r_f*`: the plain form on `light` / `tape` (and `light_states` above 32 chains), `_wt` on `light_states` with at most 32 chains, `_replay` on the replay |
 | `dqkg` | `dqkg`, `dqkg_int`, `dqkg_davq`, `dqkg_int_davq`, `dqkg_davq_nohint`, `dqkg_int_davq_nohint` | backward; `_davq` from 16 serial heads and on every segmented row (hosts `dA_qk`), `_int` on the replay; on `sm_107a` from 16 heads the `_nohint` builds of the two `_davq` forms (the L2 prefetch and evict-first hints off; the hinted builds elsewhere); reads `q` / `k` / `v` on the token rows |
-| `glm_intra` | `glm_intra_v14`, `glm_intra` | backward; reads `k` / `q` on the token rows; `glm_intra_v14` on `sm_103a` (the gate epilogue fused: it writes the token-row `dg` / `dbeta` itself), `glm_intra` on `sm_100a` / `sm_107a` |
-| `gate_epilogue` | `gate_epilogue` | backward on `sm_100a` / `sm_107a` (the GLM intra program of `sm_103a` hosts it) |
+| `glm_intra` | `glm_intra_v14`, `glm_intra_v18`, `glm_intra` | backward; reads `k` / `q` on the token rows; `glm_intra_v14` on `sm_103a` and `glm_intra_v18` on `sm_107a` (the gate epilogue fused: they write the token-row `dg` / `dbeta` themselves; `glm_intra_v18` names every named-barrier slot with an immediate, so two CTAs share an SM on `sm_107a`), `glm_intra` on `sm_100a` |
+| `gate_epilogue` | `gate_epilogue` | backward on `sm_100a` (the GLM intra programs of `sm_103a` / `sm_107a` host it) |
 
 ## Context-parallel training (KCP)
 
@@ -597,7 +621,8 @@ runtime cannot name the captured node, the capture continues without the cap
 after one warning (`LAST_CALL[kind]["cache_config"] == "unavailable"`); the
 results are bitwise identical either way. The previous replay form stays
 reachable for A/B records through the private test knob `graph_cap`
-(`CAKE_KCP_TEST_KNOBS=1`); `graph="off"` is the shipped default. The A/B
+(after `cake_kcp_plan.enable_test_knobs()`); `graph="off"` is the shipped
+default. The A/B
 record was taken with pointer-stable harness inputs; its gain is an upper
 bound of what a framework sees.
 
@@ -608,6 +633,15 @@ than 256 chunk steps (the segment plan's bounds); the byte queries
 `kcp_comm_bytes(ctx, H=..., C=...)` size the rank's workspace, saved set and
 one step's traffic before any allocation.  Every rank of the group calls the
 same entry points in the same order; the collectives are issued inside them.
+
+Workspace of a rank (`KcpWorkspace`, caller-held, reused across calls and
+layers): the local arena of the token-side stages plus the boundary pools.
+The backward's b1 / b2 send pools reuse the storage of the forward's c1 / c2
+send pools (a call waits its sends before a backward writes either), and the
+ring exchange's hop pools are allocated by the first `exchange="ring"` call.
+`kcp_workspace_bytes` is the number of bytes an a2a workspace allocates
+(`KcpWorkspace.bytes` after its first backward); the saved set and the
+convolution's halo rows are per-call tensors outside it.
 
 Saved set of a rank (`KcpSaved`, `boundary_mode="saved"`): the fresh `S_in`
 (the initial states of its fragments), with `save_transfer` the owner's c1
@@ -631,7 +665,7 @@ and restores it before the next launch; a launch issued by another thread of
 the same process during that bracket would take the PreferL1 occupancy for
 itself (occupancy only -- results never depend on the geometry). The earlier
 geometry stays reachable for A/B records through the private test knob
-`walk_geometry` (`CAKE_KCP_TEST_KNOBS=1`).
+`walk_geometry` (after `cake_kcp_plan.enable_test_knobs()`).
 
 Host path: the eager KCP calls reuse the call-independent host work -- the
 validated options, the workspace's last tables and pool views, the local
@@ -643,8 +677,9 @@ reference the table set only weakly, so a training loop that builds a new
 context and workspace per step releases everything with them. The kernels,
 their arguments and their order are unchanged, so the results are bitwise
 those of the previous host path, which stays reachable for A/B records
-through the private test knob `host_trim` (`CAKE_KCP_TEST_KNOBS=1`; the conv
-module's `_set_test_knobs({"host_trim": 0})`).
+through the private test knob `host_trim` (after
+`cake_kcp_plan.enable_test_knobs()`; the conv module's
+`_set_test_knobs({"host_trim": 0})`).
 
 Options of the KDA entry points: `save_transfer` keeps the owner's c1 receive
 tensor (and `M_seg`) for the backward instead of re-sending it in the backward
@@ -653,6 +688,20 @@ exchange -- the default with the all-to-all exchange (an earlier revision).
 receives no such tensor, so `save_transfer` resolves to `False` there
 automatically; an explicit `save_transfer=True` together with the ring is a
 `ValueError`. `KcpSaved.save_transfer` always reports the value that was used.
+`spec3_probe` sets the debug probe of the backend's first saved-mode backward,
+which compares the backward's prep and WY rows with the forward's: `"off"` (the
+default) skips it, `"record"` stores the comparison in
+`LAST_CALL["bwd"]["spec3"]`, `"warn"` warns on a difference, `"assert"` raises
+`KcpPreconditionError`.  A probing backward keeps five token-row planes (about
+`ctx.R * H * 1536` bytes: 1.5 KiB per head for every row of the rank's
+chunk-padded token layout) allocated through its prep and WY programs, so its
+peak memory is higher by up to that amount.
+The backward reads the value of its own call (pass it to
+`chunk_kda_kcp_bwd`; the forward's is not kept in `KcpSaved`).  Pass the
+same value on every rank: the probe is a rank-local check, so `"assert"`
+serves single-process debugging.  Under `graph="replay"` the probing
+backward runs eagerly; a rank without tokens does not hold back its capture.
+No environment variable selects it.
 
 The segment plan splits every fragment into `P` segments: above the 256-chunk
 chain cap the equal-segment wave rule on ranks with at most three fragments,
@@ -694,9 +743,10 @@ The KCP kernels live beside the single-rank programs:
   (the TF32 hi/lo transfer walk, its static `precision_mode` 1 and 2 forms,
   and the full-width BF16x3 walk).  `build.json` never lists them and the
   shipped route never loads them: `cake_kcp_jit.load_test` JIT-builds an
-  entry only under the environment variable `CAKE_KCP_TEST_KNOBS=1`, which
-  also admits the test knobs (`precision_mode`, `transfer_walk`) of the
-  package's own tests; without the file those tests skip.
+  entry only after `cake_kcp_plan.enable_test_knobs()`, which also admits
+  the test knobs (`precision_mode`, `transfer_walk`) of the package's own
+  tests; without the file those tests skip.  The package reads no
+  environment variable.
 * `csrc/cake_kda_train_<digest>_{kernel,binding}.cu` of the thirteen KCP
   programs, rendered like the single-rank ones (digests in `build.json` and
   `build.test.json`).
@@ -715,9 +765,9 @@ The KCP kernels live beside the single-rank programs:
   `run_module(name, values, grid=, device_index=)`.
 * `cake_build.py` + `build.json` -- the loader shared by every Cake-exported
   package (byte-identical copies) and this package's build manifest (schema
-  `cake-build/1`): one entry per `<library>_<arch>` (the 64 programs on the
+  `cake-build/1`): one entry per `<library>_<arch>` (the 65 programs on the
   architectures each ships on: 61 on all three, `glm_intra_v14` on `sm_103a`,
-  `glm_intra` and `gate_epilogue` on `sm_100a` / `sm_107a`) with its two translation units, digests, nvcc flags
+  `glm_intra_v18` on `sm_107a`, `glm_intra` and `gate_epilogue` on `sm_100a`) with its two translation units, digests, nvcc flags
   (`--use_fast_math`), closure digest and `aot/<name>.so` path.
   `cake_build.load_library(name)` loads the prebuilt library when `aot/` holds
   it and otherwise JIT-builds the entry through FlashInfer (`gen_jit_spec`,
@@ -729,14 +779,14 @@ The KCP kernels live beside the single-rank programs:
 * `csrc/cake_ffi_checks.h` -- the TVM-FFI helper header the bindings include,
   shipped by the export so the package compiles without FlashInfer's `csrc/`.
 * `csrc/cake_kda_train_<digest>_{kernel,binding}.cu` -- the generated device
-  and binding translation units of the 64 programs, shared by the
+  and binding translation units of the 65 programs, shared by the
   architectures a program ships on (per-architecture lines under `#if
   __CUDA_ARCH__`) and compiled once per architecture.  The sources are identity-checked by the
   digests in `build.json`.
 
 ## Status
 
-The registry holds the 66 records (64 programs) for `sm_100a`, `sm_103a` and
+The registry holds the 67 records (65 programs) for `sm_100a`, `sm_103a` and
 `sm_107a` (three of them on a subset of the architectures: see the programs by
 stage), exported from the kernel snapshot named in the pull request.
 

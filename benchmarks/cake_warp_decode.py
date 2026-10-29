@@ -123,9 +123,7 @@ class Geometry:
 
 GEOMETRIES = (
     Geometry("e512_i512_k10", 2048, 512, 512, 10, (1, 3, 4, 32)),
-    Geometry(
-        "e60_i1536_k4", 2048, 1536, 60, 4, (1, 4, 5, 10, 11, 12, 14, 15, 16, 17, 32)
-    ),
+    Geometry("e60_i1536_k4", 2048, 1536, 60, 4, (1, 4, 5, 10, 11, 12, 14, 15, 32)),
     Geometry("e192_i1536_k4_silu", 6144, 1536, 192, 4, (1, 32), SiLU()),
     Geometry(
         "e256_i2048_k6_clamp10",
@@ -138,9 +136,9 @@ GEOMETRIES = (
     ),
     Geometry("e384_i768_k4", 2560, 768, 384, 4, (1, 32)),
     Geometry("e128_i768_k8", 2048, 768, 128, 8, (1, 7, 8, 15, 16, 32)),
-    Geometry("e128_i1536_k8", 4096, 1536, 128, 8, (1, 11, 12, 32)),
-    Geometry("e256_i512_k8", 2048, 512, 256, 8, (1, 15, 16, 32)),
-    Geometry("e512_i1024_k10", 4096, 1024, 512, 10, (1, 2, 32)),
+    Geometry("e128_i1536_k8", 4096, 1536, 128, 8, (1, 6, 11, 12, 32)),
+    Geometry("e256_i512_k8", 2048, 512, 256, 8, (1, 15, 16, 18, 19, 30, 32)),
+    Geometry("e512_i1024_k10", 4096, 1024, 512, 10, (1, 2, 5, 6, 8, 25, 26, 32)),
     Geometry("e256_i1536_k8", 3072, 1536, 256, 8, (1, 15, 16, 32)),
     Geometry(
         "e128_i3072_k4_swiglu_oa",
@@ -148,7 +146,7 @@ GEOMETRIES = (
         3072,
         128,
         4,
-        (1, 3, 4, 32),
+        (1, 3, 4, 15, 16, 32),
         SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
     ),
     Geometry(
@@ -164,7 +162,7 @@ GEOMETRIES = (
     Geometry("h4096_e512_i512_k10", 4096, 512, 512, 10, (1, 2, 16, 32)),
     Geometry("h4096_e512_i256_k10", 4096, 256, 512, 10, (1, 2, 16, 32)),
     Geometry("h3072_e256_i768_k8", 3072, 768, 256, 8, (1, 2, 16, 32)),
-    Geometry("h3072_e256_i384_k8", 3072, 384, 256, 8, (1, 2, 16, 32)),
+    Geometry("h3072_e256_i384_k8", 3072, 384, 256, 8, (1, 2, 8, 9, 10, 16, 32)),
 )
 
 
@@ -181,7 +179,11 @@ def _uses_activation_params(geometry: Geometry) -> bool:
 
 
 def _selector_bucket(geometry: Geometry, num_tokens: int) -> str:
-    """Name the fixed schedule/route-packer bucket exercised by a row."""
+    """Name the fixed schedule/route-packer bucket exercised by a row.
+
+    The e60_i1536_k4 buckets name the sm_103a selection; the other geometries
+    report a coarse label.
+    """
     if geometry.activation == SwiGLU(limit=10.0):
         # Names describe the semantic selection; generated inventory supplies
         # exact kernel identities, not a second heuristic selector.
@@ -211,9 +213,7 @@ def _selector_bucket(geometry: Geometry, num_tokens: int) -> str:
         return "persistent_direct_padded_sfb"
     if num_tokens == 11:
         return "persistent_e64_scan1_padded_sfb"
-    if num_tokens <= 16:
-        return "persistent_e64_scan2"
-    return "persistent_general_route_packer"
+    return "persistent_fused_route_packer"
 
 
 @dataclass

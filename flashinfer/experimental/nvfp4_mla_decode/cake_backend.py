@@ -69,12 +69,43 @@ MIN_TILES_PER_UNIT = 8  # balanced schedule: minimum pipeline tiles per cluster
 # per unit instead of tiles. Must match the Cake host plan.
 BOUNDARY_COST_TILES = 2.5
 BALANCED_MIN_KV = 8192  # auto schedule: balanced partition from this KV length on
-# Second SM100 decode program (``select_decode_record``): the QK-ahead program
-# pays off when every cluster streams a long range made of at least one long
-# piece. Both decode programs' outputs are bitwise identical.
+# Further decode programs (``select_decode_record``), each giving the decode
+# program's outputs bit for bit. The SM100 QK-ahead program pays off when every
+# cluster streams a long range made of at least one long piece.
 QK_AHEAD_RECORD = "decode_qk_ahead"
 QK_AHEAD_MIN_UNIT_TILES = 512  # pipeline tiles of every unit
 QK_AHEAD_MIN_PIECE_TILES = 257  # pipeline tiles of the longest piece of every unit
+# The short-row program reads its unit range in the kernel setup and frees its
+# tensor memory once the last epilogue has read it; it pays off when every
+# cluster streams a short range.
+SHORT_RECORD = "decode_short"
+SHORT_MAX_UNIT_TILES = {"sm_100a": 32, "sm_103a": 64}  # pipeline tiles of every unit
+# The short-row program with a per-warp epilogue store path: a softmax warp
+# whose 32 query rows are all valid takes the bulk store path in a partially
+# valid CTA too. It runs in place of the short-row program when every request
+# ends in a CTA of at least ``SHORT_EPI_MIN_TAIL_ROWS`` valid query rows.
+SHORT_EPI_RECORD = "decode_short_epi_warp"
+SHORT_EPI_MIN_TAIL_ROWS = 32  # valid query rows of the last CTA of a request
+# The short-row programs that also load the fields of item ``2 * cluster`` in
+# the kernel setup, ahead of the cluster rendezvous, and start the load warp on
+# them when that item is the first of the unit. They run in place of
+# ``SHORT_RECORD`` and ``SHORT_EPI_RECORD`` when every unit holds one item
+# pair: item ``2 * cluster`` is then every unit's first, and it lies in the
+# table, which the setup load requires.
+SHORT_SPEC_RECORD = "decode_short_spec_uh"
+SHORT_EPI_SPEC_RECORD = "decode_short_epi_warp_spec_uh"
+# The SM103 decode with its row-pair max exchange gated by a vote on the
+# exchange barrier. Each piece pays a warm-up worth about ``XV_WARMUP_TILES``
+# tiles of the saving, so it pays off when every cluster streams at least
+# ``XV_MIN_STEADY_TILES`` pipeline tiles past that warm-up of its pieces.
+XV_RECORD = "decode_xv"
+XV_WARMUP_TILES = 48  # pipeline tiles of every piece
+XV_MIN_STEADY_TILES = 307  # pipeline tiles of every unit past the warm-ups
+# Further combine program (``select_reduce_record``), giving the combine
+# program's outputs bit for bit: it reads the first pair of splits of a row
+# from its top loads, which pays off for rows of more than two splits.
+REDUCE_GENERAL_RECORD = "reduce_general"
+REDUCE_GENERAL_MIN_SPLITS = 3  # KV splits of the plan's most split row
 WORKSPACE_ALIGNMENT = 256
 
 # Keyword names the two stages are bound with (arg plans refer to these names).
@@ -205,7 +236,8 @@ class WorkPlan:
     row tile): a piece with more than one split goes through the BF16 partials
     and the split-KV combine kernel, a single-split piece keeps
     ``FLAG_DIRECT_OUT`` and its CTAs write ``O`` / ``LSE`` directly, even when
-    other pieces of the batch are split.
+    other pieces of the batch are split. ``q_len`` and ``num_heads`` are the
+    query tokens per request and the heads the plan was built for.
     """
 
     schedule: str
@@ -213,6 +245,8 @@ class WorkPlan:
     unit_first: tuple
     max_splits: int
     tiles_per_split: Optional[int]
+    q_len: int
+    num_heads: int
 
     @property
     def num_items(self) -> int:
@@ -318,6 +352,8 @@ def _uniform_plan(kv_lens, *, q_len, num_heads, num_sms, enable_sink, tiles_per_
         unit_first=tuple(range(0, len(items) + 1, CLUSTER_PAIR)),
         max_splits=max_splits,
         tiles_per_split=tiles_per_split,
+        q_len=q_len,
+        num_heads=num_heads,
     )
 
 
@@ -446,6 +482,8 @@ def _balanced_plan(kv_lens, *, q_len, num_heads, num_units, enable_sink):
         unit_first=tuple(unit_first),
         max_splits=max_splits,
         tiles_per_split=None,
+        q_len=q_len,
+        num_heads=num_heads,
     )
 
 
@@ -521,28 +559,92 @@ def build_work_plan(
     return plan
 
 
+def _delivered(name: str, arch: str) -> bool:
+    """True when the registry delivers record ``name`` for ``arch``."""
+    record = MODULES.get(name)
+    return record is not None and arch in record["arches"]
+
+
 def select_decode_record(plan: WorkPlan, arch: str) -> str:
     """Registry record of the decode program that runs ``plan`` on ``arch``.
 
     A pure host function of the plan, fixed at prepare time, so a captured
-    CUDA graph replays one fixed program. ``QK_AHEAD_RECORD`` (the same
-    kernel with the QK MMAs issued two tiles ahead of PV, delivered for SM100
-    only) runs a balanced plan when the registry delivers it for ``arch`` and
-    every unit holds at least ``QK_AHEAD_MIN_UNIT_TILES`` pipeline tiles with
-    a piece of at least ``QK_AHEAD_MIN_PIECE_TILES``; every other plan runs
-    ``"decode"``. The two programs' outputs are bitwise identical.
+    CUDA graph replays one fixed program. A record runs only where the
+    registry delivers it for ``arch``, and the rules apply in this order:
+    ``QK_AHEAD_RECORD`` (the same kernel with the QK MMAs issued two tiles
+    ahead of PV, delivered for SM100 only) runs a balanced plan when every
+    unit holds at least ``QK_AHEAD_MIN_UNIT_TILES`` pipeline tiles with a
+    piece of at least ``QK_AHEAD_MIN_PIECE_TILES``; ``XV_RECORD`` (the
+    decode with its row-pair max exchange gated by a vote, delivered for
+    SM103 only) runs a plan of either schedule when every unit holds at least
+    ``XV_MIN_STEADY_TILES`` pipeline tiles past ``XV_WARMUP_TILES`` tiles of
+    each of its pieces; ``SHORT_RECORD`` runs a plan of either schedule when
+    every unit holds at most ``SHORT_MAX_UNIT_TILES[arch]`` pipeline tiles,
+    and ``SHORT_EPI_RECORD`` (the short-row program with a per-warp epilogue
+    store path) runs such a plan in its place when the last CTA of every
+    request holds at least ``SHORT_EPI_MIN_TAIL_ROWS`` valid query rows;
+    ``SHORT_SPEC_RECORD`` and ``SHORT_EPI_SPEC_RECORD`` (those two programs
+    loading the first item of their unit in the kernel setup) run in place of
+    either when every unit holds one item pair; every other plan runs
+    ``"decode"``. The decode programs' outputs are bitwise identical.
     """
-    record = MODULES.get(QK_AHEAD_RECORD)
-    if record is None or arch not in record["arches"] or plan.schedule != "balanced":
-        return "decode"
-    for u in range(plan.num_units):
-        # One item per piece: both rows of a pair share the piece's tile range
-        # (item fields 3 and 4: tile_start, tile_end).
-        pieces = plan.items[plan.unit_first[u] : plan.unit_first[u + 1] : V_HALVES]
-        lens = [it[4] - it[3] for it in pieces]
-        if sum(lens) < QK_AHEAD_MIN_UNIT_TILES or max(lens) < QK_AHEAD_MIN_PIECE_TILES:
-            return "decode"
-    return QK_AHEAD_RECORD
+    # One item per piece: both rows of a pair share the piece's tile range
+    # (item fields 3 and 4: tile_start, tile_end).
+    units = [
+        [it[4] - it[3] for it in plan.items[first:last:V_HALVES]]
+        for first, last in zip(plan.unit_first, plan.unit_first[1:], strict=False)
+    ]
+    if (
+        _delivered(QK_AHEAD_RECORD, arch)
+        and plan.schedule == "balanced"
+        and all(
+            sum(lens) >= QK_AHEAD_MIN_UNIT_TILES
+            and max(lens) >= QK_AHEAD_MIN_PIECE_TILES
+            for lens in units
+        )
+    ):
+        return QK_AHEAD_RECORD
+    if _delivered(XV_RECORD, arch) and all(
+        sum(max(0, tiles - XV_WARMUP_TILES) for tiles in lens) >= XV_MIN_STEADY_TILES
+        for lens in units
+    ):
+        return XV_RECORD
+    limit = SHORT_MAX_UNIT_TILES.get(arch)
+    if (
+        _delivered(SHORT_RECORD, arch)
+        and limit is not None
+        and all(sum(lens) <= limit for lens in units)
+    ):
+        tail_rows = (plan.q_len * plan.num_heads) % ROWS_PER_CTA
+        one_pair = all(
+            last - first == V_HALVES
+            for first, last in zip(plan.unit_first, plan.unit_first[1:], strict=False)
+        )
+        if _delivered(SHORT_EPI_RECORD, arch) and tail_rows >= SHORT_EPI_MIN_TAIL_ROWS:
+            if one_pair and _delivered(SHORT_EPI_SPEC_RECORD, arch):
+                return SHORT_EPI_SPEC_RECORD
+            return SHORT_EPI_RECORD
+        if one_pair and _delivered(SHORT_SPEC_RECORD, arch):
+            return SHORT_SPEC_RECORD
+        return SHORT_RECORD
+    return "decode"
+
+
+def select_reduce_record(plan: WorkPlan, arch: str) -> str:
+    """Registry record of the combine program that runs ``plan`` on ``arch``.
+
+    A pure host function of the plan, fixed at prepare time (the combine runs
+    only when the plan splits a row). ``REDUCE_GENERAL_RECORD`` runs a plan
+    whose most split row has at least ``REDUCE_GENERAL_MIN_SPLITS`` KV splits
+    when the registry delivers it for ``arch``; every other plan runs
+    ``"reduce"``. The combine programs' outputs are bitwise identical.
+    """
+    if (
+        _delivered(REDUCE_GENERAL_RECORD, arch)
+        and plan.max_splits >= REDUCE_GENERAL_MIN_SPLITS
+    ):
+        return REDUCE_GENERAL_RECORD
+    return "reduce"
 
 
 def work_table_rows(plan: WorkPlan) -> torch.Tensor:
@@ -768,7 +870,8 @@ class NVFP4MLADecodeRunner:
     ``host_tables`` keeps the pinned host image of the plan tables alive
     while its asynchronous upload may still be in flight. ``main_program`` is
     the library of the decode record ``select_decode_record`` picked for the
-    plan.
+    plan, ``reduce_program`` that of the combine record
+    ``select_reduce_record`` picked (``None`` when the plan splits no row).
 
     Stream contract: ``prepare_nvfp4_batch_decode_with_kv_cache_mla`` issues
     the plan-table upload on the stream current at prepare time and
@@ -866,11 +969,12 @@ def bind_decode_payload(
     host_tables: Optional[torch.Tensor] = None,
     *,
     decode_record: str = "decode",
+    reduce_record: str = "reduce",
 ) -> NVFP4MLADecodeRunner:
     """Bind the prepared buffers to the generated programs' argument plans.
 
-    ``decode_record`` names the decode-stage record whose program runs the
-    plan (``select_decode_record``).
+    ``decode_record`` and ``reduce_record`` name the records whose programs
+    run the plan (``select_decode_record``, ``select_reduce_record``).
     """
     main_record = _check_record(decode_record)
     main_program = main_record["library"]
@@ -880,12 +984,10 @@ def bind_decode_payload(
     reduce_entry = None
     reduce_arguments = ()
     if reduce_kwargs is not None:
-        reduce_record = _check_record("reduce")
-        reduce_program = reduce_record["library"]
-        reduce_entry = getattr(load("reduce", arch), reduce_record["ffi_entry"])
-        reduce_arguments = launch_args(
-            reduce_record, reduce_kwargs, reduce_kwargs["grid"]
-        )
+        combine = _check_record(reduce_record)
+        reduce_program = combine["library"]
+        reduce_entry = getattr(load(reduce_record, arch), combine["ffi_entry"])
+        reduce_arguments = launch_args(combine, reduce_kwargs, reduce_kwargs["grid"])
     return NVFP4MLADecodeRunner(
         arch,
         main_program,
@@ -1007,8 +1109,9 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
     neither. The upload is asynchronous on the current stream: launch on
     this stream, or have the launch stream ``wait_stream`` on it first (see
     ``NVFP4MLADecodeRunner``). ``schedule`` / ``tiles_per_split`` expose the
-    host work-plan policy for tests and benchmarks. The decode program is
-    picked here, once per plan (``select_decode_record``).
+    host work-plan policy for tests and benchmarks. The decode and combine
+    programs are picked here, once per plan (``select_decode_record``,
+    ``select_reduce_record``).
     """
     if backend != "cake":
         raise ValueError("NVFP4 MLA decode supports backend='cake'")
@@ -1063,6 +1166,7 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
         tiles_per_split=tiles_per_split,
     )
     decode_record = select_decode_record(plan, arch)
+    reduce_record = select_reduce_record(plan, arch)
     layout = workspace_layout(plan, batch=batch, num_heads=num_heads, q_len=q_len)
     flat = workspace_buffer.view(-1).view(torch.uint8)
     if flat.numel() < layout["total"]:
@@ -1159,7 +1263,9 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
             total_q=total_q,
             num_heads=num_heads,
             max_splits=max_splits,
-            grid=launch_grid(MODULES["reduce"], total_q=total_q, num_heads=num_heads),
+            grid=launch_grid(
+                MODULES[reduce_record], total_q=total_q, num_heads=num_heads
+            ),
         )
     assert tuple(main_kwargs) == MAIN_KWARGS
     assert reduce_kwargs is None or tuple(reduce_kwargs) == REDUCE_KWARGS
@@ -1173,4 +1279,5 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
         return_lse,
         tables,
         decode_record=decode_record,
+        reduce_record=reduce_record,
     )

@@ -2461,8 +2461,36 @@ def test_attention_ts_context_uses_ldtm_stat_default_follows_gpu():
 
         expected = expected and hasattr(prims, "tcgen05_ld_red")
     assert (
-        context_module._default_uses_ldtm_stat(torch.cuda.current_device()) is expected
+        context_module._default_uses_ldtm_stat(torch.cuda.current_device(), 8, 8)
+        is expected
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_attention_ts_context_sm107_defaults_follow_the_path():
+    """SM107 pairs CTAs and issues K=64 fp8 PV on the bf16-QK paths, deepens the
+    K/V ring and keeps the register row max on the dense fp8-V paths. Other GPUs
+    keep their defaults."""
+    device_index = torch.cuda.current_device()
+    capability = torch.cuda.get_device_capability()
+    sm107 = capability == (10, 7)
+    assert context_module._default_two_cta_umma(device_index, 16) is (
+        sm107 or capability == (10, 3)
+    )
+    assert context_module._default_two_cta_umma(device_index, 8) is (
+        capability == (10, 3)
+    )
+    assert context_module._default_umma_fp8_k64(device_index, 16) is sm107
+    assert context_module._default_umma_fp8_k64(device_index, 8) is False
+    assert context_module._default_kv_ring_stages(device_index, 8, 8) == (
+        6 if sm107 else 0
+    )
+    assert context_module._default_kv_ring_stages(device_index, 16, 8) == (
+        4 if sm107 else 0
+    )
+    assert context_module._default_kv_ring_stages(device_index, 16, 16) == 0
+    if sm107:
+        assert context_module._default_uses_ldtm_stat(device_index, 16, 8) is False
 
 
 @pytest.mark.parametrize("uses_ldtm_stat", (False, True))
@@ -5664,7 +5692,7 @@ def test_attention_ts_context_two_cta_matches_single_cta(
         case = replace(case, v=case.v.to(_FP8))
 
     monkeypatch.setattr(
-        context_module, "_default_two_cta_umma", lambda device_index: True
+        context_module, "_default_two_cta_umma", lambda device_index, qk_bits: True
     )
     two_cta = BatchPrefillTSWrapper()
     _plan_wrapper(two_cta, case)
@@ -5674,7 +5702,7 @@ def test_attention_ts_context_two_cta_matches_single_cta(
     _assert_context_correct(out_two_cta, case)
 
     monkeypatch.setattr(
-        context_module, "_default_two_cta_umma", lambda device_index: False
+        context_module, "_default_two_cta_umma", lambda device_index, qk_bits: False
     )
     single_cta = BatchPrefillTSWrapper()
     _plan_wrapper(single_cta, case)

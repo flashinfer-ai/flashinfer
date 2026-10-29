@@ -449,6 +449,7 @@ def test_mnnvl_group_fp8_rejects_invalid_vector_buffers(name, invalid_kind):
 
 @pytest.mark.parametrize("group_size", [None, 0, -1, 12, 128.0, True])
 def test_mnnvl_group_fp8_rejects_invalid_group_size(group_size):
+    """Reject invalid group sizes before allocating a workspace or launching CUDA."""
     from flashinfer.comm.trtllm_mnnvl_ar import (
         MNNVLQuantType,
         trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant,
@@ -468,6 +469,7 @@ def test_mnnvl_group_fp8_rejects_invalid_group_size(group_size):
 
 @pytest.mark.parametrize("shape", [(0, 128), (3, 0)])
 def test_mnnvl_group_fp8_rejects_empty_input(shape):
+    """Reject empty token or hidden dimensions before kernel grid construction."""
     from flashinfer.comm.trtllm_mnnvl_ar import (
         MNNVLQuantType,
         trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant,

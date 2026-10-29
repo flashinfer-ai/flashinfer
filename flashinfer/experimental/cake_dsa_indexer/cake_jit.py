@@ -115,6 +115,14 @@ ARG_PLANS: dict[str, list[list[str]]] = {
         ["grid", "grid_z"],
     ],
 }
+# The architectures whose scan programs draw every work unit from the workspace's
+# ticket tail (``cake_policy.TICKET_TAIL_BYTES``): every sm_100a / sm_103a scan
+# program.  Every completed scan launch leaves the ticket word at 0; the host
+# (``cake_backend``) zeroes the tail once when it prepares a runner on its own
+# workspace, and before every run on a caller-owned ``workspace_buffer`` (others
+# may write that buffer between runs).  sm_107a keeps the static unit
+# enumeration and leaves the tail unused.
+TICKET_TAIL_ARCHES: tuple[str, ...] = ("sm_100a", "sm_103a")
 PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_dsa_indexer_topk_0d38735ee8e81ae6f5e8": {
         "role": "scan",
@@ -608,7 +616,8 @@ POLICY: dict[str, dict[str, Any]] = {
         "candidate_multiplier": 4,
         "candidate_slack": 128,
         "cand_mult_rule": [384.0, 8],
-        "cand_cap_floor": 16384,
+        "cand_cap_floor": 8192,
+        "cand_cap_floor_rule": [1024, 16384],
         "candidate_multiplier_unsampled": 4,
         "cand_mult_rule_unsampled": [384.0, 8],
         "cand_cap_floor_unsampled": 8192,
@@ -635,6 +644,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "sample_tiles_tiny_units": 8,
         "sample_dispatch_tiny_tiles_max": 128.0,
         "sample_shift_permille": 250,
+        "sample_shift_rule": None,
         "far_sample": 0,
         "check_period_max": 32,
         "check_period_knob_max": 64,
@@ -677,6 +687,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "candidate_slack": 128,
         "cand_mult_rule": [384.0, 8],
         "cand_cap_floor": 16384,
+        "cand_cap_floor_rule": None,
         "candidate_multiplier_unsampled": 4,
         "cand_mult_rule_unsampled": [384.0, 8],
         "cand_cap_floor_unsampled": 8192,
@@ -703,6 +714,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "sample_tiles_tiny_units": 8,
         "sample_dispatch_tiny_tiles_max": 128.0,
         "sample_shift_permille": 250,
+        "sample_shift_rule": [4096, 375],
         "far_sample": 0,
         "check_period_max": 32,
         "check_period_knob_max": 64,
@@ -745,6 +757,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "candidate_slack": 128,
         "cand_mult_rule": [384.0, 8],
         "cand_cap_floor": 8192,
+        "cand_cap_floor_rule": None,
         "candidate_multiplier_unsampled": 4,
         "cand_mult_rule_unsampled": [384.0, 8],
         "cand_cap_floor_unsampled": 8192,
@@ -787,6 +800,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "sample_tiles_tiny_units": 8,
         "sample_dispatch_tiny_tiles_max": 128.0,
         "sample_shift_permille": 250,
+        "sample_shift_rule": None,
         "far_sample": 0,
         "check_period_max": 32,
         "check_period_knob_max": 64,

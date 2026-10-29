@@ -41,11 +41,13 @@ limitations under the License.
 #   (``torch.mm``, BF16 slice) above;
 # * the tail  owner reduce of the scattered ``shared_partial`` columns, add of
 #   the up-projection slice, one BF16 rounding, multicast all-gather into the
-#   caller-owned ``out``: ``k3_ess:grouped`` (one CTA per token and column
-#   half) for ``8 < M < K3_PERSIST_MIN_TOKENS`` (961); from there on the
-#   persistent token pipeline (``min(M, SM count)`` CTAs per column half, own
-#   scatter of ``shared_partial``) with ``cp.async.bulk`` reduce-scatter
-#   pushes, ``k3_persist_bulk:pinned``.
+#   caller-owned ``out``, by ``ROUTE_TABLE``: ``k3_ess:grouped`` (one CTA per
+#   token and column half) for ``8 < M < 320``; the persistent reduce mode
+#   ``k3_reduce:grouped`` (``min(M, SM count)`` CTAs per column half over the
+#   slots the ESS K1 filled) for ``320 <= M < K3_PERSIST_MIN_TOKENS`` (961);
+#   from there on the persistent token pipeline (``min(M, SM count)`` CTAs per
+#   column half, own scatter of ``shared_partial``) with ``cp.async.bulk``
+#   reduce-scatter pushes, ``k3_persist_bulk:pinned``.
 #
 # For ``M <= K23_MAX_TOKENS`` one program, ``k123:c<capacity>``, runs both
 # stages as two CTA roles of one grid ``(M + cols / K23_ROWS, 1, 1)``: the
@@ -56,7 +58,13 @@ limitations under the License.
 # their ``y`` stores and the K23 CTAs wait for ``M`` arrivals before they
 # read ``y``, so the tail needs no second launch.  The four-token program
 # serves ``M <= 4``, the eight-token program ``5 <= M <= 8``; the rank is a
-# launch argument and its column width only sizes the grid.
+# launch argument and its column width only sizes the grid.  Its CTAs wait
+# for CTAs of the same grid with other indices (the low tail CTAs gather the
+# columns the owner CTAs of every rank write, and each owner reduce polls
+# the slots that tail CTAs of other indices scatter), so the grid is
+# co-resident: it launches cooperatively (with PDL), and the driver either
+# dispatches all of its at most 88 CTAs, one per SM, at once or refuses the
+# launch.
 #
 # Rows ``M <= 4`` and ``M > 8`` are bitwise identical to the round-4 / round-5
 # routes (the K23 role keeps the numerics of the round-4 K2-stream + fp32-add
@@ -67,6 +75,27 @@ limitations under the License.
 # ESS / persistent boundary by a paired A/B of the two tail routes at 640 to
 # 1056 tokens on both.
 #
+# Concurrency and provisioning.  A workspace is collective state, like an
+# NCCL communicator: the kernels rotate its Lamport epoch on every call, so
+# the calls that share it run one at a time and in the same order on every
+# rank.  A launch from another stream than the previous launch on the
+# workspace is ordered after it with an event wait (outside CUDA Graph
+# capture); concurrent graph replays and several host threads are not
+# ordered and must not share a workspace.  The one-launch program
+# (``M <= 8``) needs its whole grid resident at once on every rank:
+# ``M + 80`` SMs on the 640-column ranks and ``M + 64`` on the 512-column
+# ranks.  Under a green context or MPS partition with fewer SMs the launch
+# raises a RuntimeError (and leaves no CUDA error behind) instead of
+# spinning, and a CUDA Graph capture on such a partition fails, so give
+# every rank at least 88 SMs.  Do not overlap two ``M <= 8`` calls, or one
+# and another cooperative peer-waiting kernel, on one GPU, even with
+# separate workspaces: the two grids do not fit together, and an admission
+# order that differs between ranks deadlocks the group.  A co-runner that
+# never frees the grid's SMs on one rank stalls every rank; the kernels'
+# waits are unbounded and the caller's watchdog is the deadline.  The
+# persistent tails map token ``t`` to CTA ``t mod P`` on every rank, so
+# ``P`` is the group's smallest SM count.
+#
 # The three Lamport workspaces are FlashInfer's own MNNVL all-reduce
 # workspaces (``MNNVLAllReduceFusionWorkspace``: three rotating symmetric
 # buffers initialised to negative zero, multicast mapping, nine-word flags),
@@ -76,7 +105,9 @@ limitations under the License.
 
 from __future__ import annotations
 
+import ctypes
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -122,7 +153,8 @@ K23_ROWS = 8
 #: The tail runs the persistent token pipeline (``k3_persist*:*``, grid ``(min(M, SM count), 2, 1)``: CTA ``b`` walks
 #: tokens ``b, b + P, ...`` scattering token ``t_k`` while reducing ``t_{k-1}`` and gathering ``t_{k-2}``) from this many
 #: tokens on; below it an early-shared-scatter K1 (``k1_*_ess``) scatters ``shared_partial`` and the one-CTA-per-token
-#: K3-ESS form (``k3_ess:grouped``, grid ``(M, 2, 1)``) reduces, adds and gathers.  In a paired A/B on GB200 and GB300
+#: K3-ESS form (``k3_ess:grouped``, grid ``(M, 2, 1)``) or, by ``ROUTE_TABLE``, the persistent tail's reduce mode
+#: (``k3_reduce:grouped``) reduces, adds and gathers.  In a paired A/B on GB200 and GB300
 #: NVL72 the ESS route is 1.6-7.2 us faster than the persistent one from 640 through 960 tokens and ties or loses from
 #: 1023 tokens on.
 K3_PERSIST_MIN_TOKENS = GROUPED_MAX_TOKENS + 1
@@ -131,6 +163,25 @@ K3_PERSIST_MIN_TOKENS = GROUPED_MAX_TOKENS + 1
 #: tail ``k3_persist:grouped`` and the plain grouped two-shot K1 ``k1_twoshot:grouped`` stay registered, but no token
 #: count selects them.
 BULK_MIN_TOKENS = K3_PERSIST_MIN_TOKENS
+#: Tail route for ``M > ONESHOT_MAX_TOKENS``: ``(first token count, form)`` rows in increasing first-count order; ``M``
+#: takes the last row whose first count is ``<= M``.  Forms:
+#:
+#: * ``"ess"``: ESS two-shot K1 -> cuBLAS -> K3-ESS (``k3_ess:grouped``, one CTA per token and column half);
+#: * ``"reduce"``: ESS two-shot K1 -> cuBLAS -> the persistent tail's reduce mode (``k3_reduce:grouped``, grid
+#:   ``(min(M, SM count), 2, 1)``: CTA ``b`` reduces token ``t_k`` of tokens ``b, b + P, ...`` over the slots the ESS K1
+#:   filled while it gathers the multicast row of ``t_{k-2}``);
+#: * ``"persist"``: plain two-shot K1 -> cuBLAS -> the persistent K3 with its own scatter and ``cp.async.bulk`` pushes
+#:   (``k3_persist_bulk:pinned``).
+#:
+#: Every form writes the same packets into the same slots and reduces them in the same order, so ``out`` is bitwise
+#: identical across forms.  The ESS K1 forms serve the grouped poll-schedule range only (``M <= GROUPED_MAX_TOKENS``).
+#: In a paired A/B on GB300 NVL72 the reduce form ties K3-ESS at 320 and 321 tokens and is 0.6-4.9 us faster from 383
+#: through 960 tokens.
+ROUTE_TABLE: tuple[tuple[int, str], ...] = (
+    (ONESHOT_MAX_TOKENS + 1, "ess"),
+    (320, "reduce"),
+    (K3_PERSIST_MIN_TOKENS, "persist"),
+)
 DEFAULT_MAX_TOKENS = 4096
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 
@@ -155,15 +206,28 @@ def poll_schedule_for(num_tokens: int) -> str:
     return "grouped" if num_tokens <= GROUPED_MAX_TOKENS else "pinned"
 
 
+def route_form_for(num_tokens: int) -> str:
+    """The ``ROUTE_TABLE`` form of ``num_tokens > ONESHOT_MAX_TOKENS``."""
+    if num_tokens <= ONESHOT_MAX_TOKENS:
+        raise ValueError(
+            f"num_tokens={num_tokens} <= {ONESHOT_MAX_TOKENS} runs the one-shot routes (no route-table row)"
+        )
+    form = ROUTE_TABLE[0][1]
+    for first, row_form in ROUTE_TABLE:
+        if first <= num_tokens:
+            form = row_form
+    return form
+
+
 def k1_kernel_key(num_tokens: int, rank: int) -> str:
     """The K1 kernel key: the one-launch program ``k123:c<capacity>`` (K1 and the fused K23 tail in one grid) for
-    ``num_tokens <= K23_MAX_TOKENS``, the early-shared-scatter (ESS) forms below ``K3_PERSIST_MIN_TOKENS``, plain
-    two-shot above."""
+    ``num_tokens <= K23_MAX_TOKENS``, the one-shot early-shared-scatter (ESS) form up to ``ONESHOT_MAX_TOKENS``, then
+    the two-shot ESS form for the ``"ess"`` / ``"reduce"`` routes and the plain two-shot form for ``"persist"``."""
     if num_tokens <= K23_MAX_TOKENS:
         return f"k123:c{k23_capacity_for(num_tokens)}"
     if num_tokens <= ONESHOT_MAX_TOKENS:
         return "k1_oneshot_ess"
-    if num_tokens < K3_PERSIST_MIN_TOKENS:
+    if route_form_for(num_tokens) in ("ess", "reduce"):
         return f"k1_twoshot_ess:{poll_schedule_for(num_tokens)}"
     return f"k1_twoshot:{poll_schedule_for(num_tokens)}"
 
@@ -185,13 +249,17 @@ def k23_capacity_for(num_tokens: int) -> int:
 
 def k3_form_for(num_tokens: int) -> str:
     """Tail form for ``num_tokens``: ``"k123"`` (the K23 role of the one-launch program, ``M <= K23_MAX_TOKENS``: no
-    tail launch of its own), ``"ess"`` (one CTA per token and column half after an ESS K1, ``M <
-    K3_PERSIST_MIN_TOKENS``), ``"persist"`` (persistent token pipeline, ``M < BULK_MIN_TOKENS``: an empty range while
-    the two thresholds are equal) or ``"persist_bulk"`` (persistent pipeline with ``cp.async.bulk`` pushes)."""
+    tail launch of its own), ``"ess"`` (one CTA per token and column half after an ESS K1: the one-shot rows and the
+    ``"ess"`` route), ``"reduce"`` (the persistent reduce mode after an ESS K1: the ``"reduce"`` route), ``"persist"``
+    (persistent token pipeline with its own scatter, ``M < BULK_MIN_TOKENS``: an empty range while the two thresholds
+    are equal) or ``"persist_bulk"`` (the same with ``cp.async.bulk`` pushes) for the ``"persist"`` route."""
     if num_tokens <= K23_MAX_TOKENS:
         return "k123"
-    if num_tokens < K3_PERSIST_MIN_TOKENS:
+    if num_tokens <= ONESHOT_MAX_TOKENS:
         return "ess"
+    form = route_form_for(num_tokens)
+    if form in ("ess", "reduce"):
+        return form
     if num_tokens < BULK_MIN_TOKENS:
         return "persist"
     return "persist_bulk"
@@ -268,6 +336,22 @@ def _device_arch(device: torch.device) -> str:
     return arch
 
 
+def group_sm_count(comm_backend: Any, local_sm_count: int) -> int:
+    """The smallest SM count of the group (collective: every rank must call it).
+
+    The persistent tails map token ``t`` to CTA ``t mod P`` and their peer waits pair CTAs of equal index across the
+    ranks, so ``P`` must be equal on every rank.
+    """
+    if not isinstance(local_sm_count, int) or local_sm_count <= 0:
+        raise ValueError(
+            f"local_sm_count must be a positive integer, got {local_sm_count!r}"
+        )
+    counts = [int(count) for count in comm_backend.allgather(local_sm_count)]
+    if not counts or min(counts) <= 0:
+        raise ValueError(f"the group reported SM counts {counts}")
+    return min(counts)
+
+
 def generated_program_available(device: torch.device) -> bool:
     """True when every kernel of the route is registered for ``device``'s architecture."""
     capability = torch.cuda.get_device_capability(device)
@@ -293,6 +377,12 @@ class KimiK3Tp12TailWorkspace:
     once (collective: every rank of ``group`` must call it), reuse it for every
     token count up to ``max_tokens``, and :meth:`destroy` it before the
     process group is destroyed.
+
+    The workspace is collective state, like an NCCL communicator: the calls
+    that share it run one at a time and in the same order on every rank.  A
+    call from another stream than the previous call waits for it
+    (:meth:`order_after_previous_stream`; not under CUDA Graph capture).
+    ``sm_count`` is the smallest SM count of the group.
     """
 
     def __init__(
@@ -335,9 +425,10 @@ class KimiK3Tp12TailWorkspace:
         if device.index is not None:
             torch.cuda.set_device(device.index)
         self.device = torch.device("cuda", torch.cuda.current_device())
-        # persistent K3 grid: one CTA per SM and column half (the Cake runtime's default k3p_ctas)
+        # persistent K3 grid: one CTA per SM and column half (the Cake runtime's default k3p_ctas), the group's
+        # smallest SM count, so the token -> CTA map is the same on every rank
         props = torch.cuda.get_device_properties(self.device)
-        self.sm_count = int(props.multi_processor_count)
+        self.sm_count = group_sm_count(comm_backend, int(props.multi_processor_count))
         self.rank = rank
         self.world_size = WORLD_SIZE
         self.max_tokens = int(max_tokens)
@@ -348,6 +439,8 @@ class KimiK3Tp12TailWorkspace:
         self.buffers: dict[str, MNNVLAllReduceFusionWorkspace] = {}
         self.peer_ptrs: dict[str, torch.Tensor] = {}
         self._destroyed = False
+        #: the stream of the previous launch on this workspace (outside capture)
+        self._last_stream: Optional[torch.cuda.Stream] = None
         try:
             for name, size in workspace_buffer_bytes(self.max_tokens).items():
                 ws = MNNVLAllReduceFusionWorkspace(
@@ -380,6 +473,22 @@ class KimiK3Tp12TailWorkspace:
             ws.destroy()
         self.buffers.clear()
         self.peer_ptrs.clear()
+
+    def order_after_previous_stream(self) -> None:
+        """Order a launch from another stream than the previous launch on this workspace after it.
+
+        The current stream waits on an event recorded on the previous stream, so the calls run one at a time; one
+        stream costs a stream compare.  Skipped under CUDA Graph capture: the caller orders graph replays.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            return
+        current = torch.cuda.current_stream(self.device)
+        previous = self._last_stream
+        if previous is not None and previous != current:
+            event = torch.cuda.Event()
+            event.record(previous)
+            current.wait_event(event)
+        self._last_stream = current
 
     def flags(self, name: str) -> torch.Tensor:
         return self.buffers[name].buffer_flags
@@ -435,7 +544,8 @@ class KimiK3Tp12TailRunner:
     ``launch()`` submits the one-launch program alone for
     ``M <= K23_MAX_TOKENS`` (``k3`` is None); above, K1 (the
     early-shared-scatter form below ``K3_PERSIST_MIN_TOKENS``), cuBLAS for
-    the up-projection slice (``cublas``) and the tail kernel -- K3-ESS below
+    the up-projection slice (``cublas``) and the tail kernel -- K3-ESS or the
+    persistent reduce mode (by ``ROUTE_TABLE``) below
     ``K3_PERSIST_MIN_TOKENS``, the persistent K3 with ``cp.async.bulk``
     pushes from there on -- in
     order on the current torch stream with no CUDA allocation and no host
@@ -443,7 +553,8 @@ class KimiK3Tp12TailRunner:
     the runner (or a CUDA Graph capturing it) replays for new values written
     into the same buffers.  Every rank of the group must launch the same
     token count; prepare a new runner when a shape or a tensor binding
-    changes.
+    changes.  A launch from another stream than the previous launch on the
+    workspace first waits for it (outside capture).
     """
 
     num_tokens: int
@@ -458,6 +569,10 @@ class KimiK3Tp12TailRunner:
     out: torch.Tensor
     #: cuBLAS ``torch.mm`` between K1 and the tail (``M > K23_MAX_TOKENS``); False = the one-launch program
     cublas: bool
+    #: the workspace the launches use; orders a launch from another stream after the previous one
+    workspace: Optional[KimiK3Tp12TailWorkspace] = field(
+        default=None, repr=False, compare=False
+    )
 
     @property
     def kernel_keys(self) -> tuple[str, ...]:
@@ -481,7 +596,12 @@ class KimiK3Tp12TailRunner:
         return 3 if self.cublas else 2
 
     def launch(self) -> torch.Tensor:
+        if self.workspace is not None:
+            self.workspace.order_after_previous_stream()
         with tvm_ffi.use_torch_stream():
+            if self.k3 is None:
+                _launch_one_launch_program(self.k1, self.num_tokens, self.rank)
+                return self.out
             self.k1()
             if self.cublas:
                 torch.mm(self.y, self.up_weight_slice.t(), out=self.gemm)
@@ -490,6 +610,41 @@ class KimiK3Tp12TailRunner:
         return self.out
 
     __call__ = launch
+
+
+def _clear_cuda_last_error() -> None:
+    """Reset the CUDA runtime's last error (``cudaGetLastError``).
+
+    The generated bindings and torch share the process's ``libcudart``, so the call goes to that library, loaded
+    already (``RTLD_NOLOAD``); ``cuda.bindings.runtime`` keeps a runtime state of its own and does not reset it.
+    """
+    major = (torch.version.cuda or "").split(".")[0]
+    try:
+        cudart = ctypes.CDLL(f"libcudart.so.{major}", mode=os.RTLD_NOLOAD | os.RTLD_NOW)
+    except OSError:
+        return
+    cudart.cudaGetLastError.restype = ctypes.c_int
+    cudart.cudaGetLastError()
+
+
+def _launch_one_launch_program(launch: _Launch, num_tokens: int, rank: int) -> None:
+    """Launch the one-launch program; a refused cooperative launch raises a RuntimeError and leaves no CUDA error.
+
+    The driver refuses the cooperative launch when the grid cannot be resident at once, for example on a green
+    context or MPS partition with fewer SMs than the grid.  Nothing runs, but the refusal stays as the runtime's last
+    error, which the next launch check that reads it (torch's, for example) would raise; it is cleared here.
+    """
+    try:
+        launch()
+    except Exception as err:
+        if "cooperative launch" not in str(err):
+            raise
+        _clear_cuda_last_error()
+        raise RuntimeError(
+            f"kimi_k3_tp12_tail: the one-launch program ({launch.key}, {num_tokens} tokens) needs "
+            f"{k123_grid(num_tokens, rank)[0]} SMs resident at once on rank {rank}; the current stream's SMs cannot "
+            "hold its grid, so the cooperative launch was refused and nothing ran"
+        ) from None
 
 
 def _check(
@@ -634,8 +789,8 @@ def _k3_launch_kwargs(
             grid=grid,
         )
     else:
-        # persistent K3 (cp.async.bulk pushes; the unselected plain form takes the same arguments): scatters
-        # shared_partial itself
+        # persistent K3 (cp.async.bulk pushes; the unselected plain form and the reduce mode take the same
+        # arguments): scatters shared_partial itself, or (reduce mode) reads the slots the ESS K1 filled
         k3_kwargs = dict(
             shared=shared_partial,
             gemm_slice=gemm,
@@ -736,6 +891,7 @@ def prepare_kimi_k3_tp12_tail(
             up_weight_slice=up_weight_slice,
             out=out,
             cublas=cublas,
+            workspace=workspace,
         )
     k3_key = keys[1]
     k3_module = kernel_module_name(arch, k3_key)
@@ -762,6 +918,7 @@ def prepare_kimi_k3_tp12_tail(
         up_weight_slice=up_weight_slice,
         out=out,
         cublas=cublas,
+        workspace=workspace,
     )
 
 
@@ -783,11 +940,13 @@ __all__ = [
     "ONESHOT_MAX_TOKENS",
     "PARTITION",
     "RMS_EPS",
+    "ROUTE_TABLE",
     "SUPPORTED_COMPUTE_CAPABILITIES",
     "THREADS",
     "WORLD_SIZE",
     "col_begin",
     "generated_program_available",
+    "group_sm_count",
     "k1_kernel_key",
     "k123_grid",
     "k3_form_for",
@@ -796,6 +955,7 @@ __all__ = [
     "k3_kernel_key",
     "poll_schedule_for",
     "prepare_kimi_k3_tp12_tail",
+    "route_form_for",
     "route_kernel_keys",
     "up_proj_form_for",
     "workspace_buffer_bytes",

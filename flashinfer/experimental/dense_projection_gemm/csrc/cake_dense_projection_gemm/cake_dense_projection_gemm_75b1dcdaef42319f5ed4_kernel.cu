@@ -299,15 +299,15 @@ kernel_cake_dense_projection_gemm_75b1dcdaef42319f5ed4(const __grid_constant__ C
             if (elect_sync()) {
                 unsigned int this_bid = bid;
                 float rd = approx_rcp((float)(m_tiles * n_tiles));
-                float rd_0 = approx_rcp((float)(group_m * n_tiles));
-                float rd_1 = approx_rcp((float)group_m);
-                int q0 = (int)((float)m_tiles * rd_1);
+                float rd_3 = approx_rcp((float)(group_m * n_tiles));
+                float rd_4 = approx_rcp((float)group_m);
+                int q0 = (int)((float)m_tiles * rd_4);
                 int r0 = m_tiles - q0 * group_m;
                 int q1 = ((r0 < 0) ? q0 - 1 : q0);
                 int r1 = ((r0 < 0) ? r0 + group_m : r0);
                 int q = ((r1 >= group_m) ? q1 + 1 : q1);
                 int r = ((r1 >= group_m) ? r1 - group_m : r1);
-                float rd_2 = approx_rcp((float)(((r > 0) ? r : group_m)));
+                float rd_5 = approx_rcp((float)(((r > 0) ? r : group_m)));
                 #pragma unroll 1
                 for (unsigned int _tile_iter = 0; _tile_iter < num_cluster_tiles; _tile_iter++) {
                     if (cta_rank == 0) {
@@ -318,14 +318,14 @@ kernel_cake_dense_projection_gemm_75b1dcdaef42319f5ed4(const __grid_constant__ C
                             "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                             "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [remAddr32], %2;\n\t"
                             "}"
-                            :: "r"(work_full_addr + work_stage * 8), "r"(0), "r"((uint32_t)(16)) : "memory");
+                            :: "r"(work_full_addr + (work_stage) * 8), "r"(0), "r"((uint32_t)(16)) : "memory");
                         asm volatile(
                             "{\n\t"
                             ".reg .b32 remAddr32;\n\t"
                             "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                             "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [remAddr32], %2;\n\t"
                             "}"
-                            :: "r"(work_full_addr + work_stage * 8), "r"(1), "r"((uint32_t)(16)) : "memory");
+                            :: "r"(work_full_addr + (work_stage) * 8), "r"(1), "r"((uint32_t)(16)) : "memory");
                         asm volatile(
                             "fence.proxy.async.shared::cta;\n\t"
                             "clusterlaunchcontrol.try_cancel.async.shared::cta"
@@ -346,30 +346,30 @@ kernel_cake_dense_projection_gemm_75b1dcdaef42319f5ed4(const __grid_constant__ C
                         int tiles_per_l = m_tiles * n_tiles;
                         int tiles_per_group = group_m * n_tiles;
                         int q0_0 = (int)((float)tile_bid * rd);
-                        int r0_1 = tile_bid - q0_0 * tiles_per_l;
-                        int q1_2 = ((r0_1 < 0) ? q0_0 - 1 : q0_0);
-                        int r1_3 = ((r0_1 < 0) ? r0_1 + tiles_per_l : r0_1);
-                        int q_4 = ((r1_3 >= tiles_per_l) ? q1_2 + 1 : q1_2);
-                        int r_5 = ((r1_3 >= tiles_per_l) ? r1_3 - tiles_per_l : r1_3);
-                        int q0_6 = (int)((float)r_5 * rd_0);
-                        int r0_7 = r_5 - q0_6 * tiles_per_group;
-                        int q1_8 = ((r0_7 < 0) ? q0_6 - 1 : q0_6);
-                        int r1_9 = ((r0_7 < 0) ? r0_7 + tiles_per_group : r0_7);
-                        int q_10 = ((r1_9 >= tiles_per_group) ? q1_8 + 1 : q1_8);
-                        int r_11 = ((r1_9 >= tiles_per_group) ? r1_9 - tiles_per_group : r1_9);
-                        int first_m = q_10 * group_m;
+                        int r0_0 = tile_bid - q0_0 * tiles_per_l;
+                        int q1_0 = ((r0_0 < 0) ? q0_0 - 1 : q0_0);
+                        int r1_0 = ((r0_0 < 0) ? r0_0 + tiles_per_l : r0_0);
+                        int q_0 = ((r1_0 >= tiles_per_l) ? q1_0 + 1 : q1_0);
+                        int r_0 = ((r1_0 >= tiles_per_l) ? r1_0 - tiles_per_l : r1_0);
+                        int q0_1 = (int)((float)r_0 * rd_3);
+                        int r0_1 = r_0 - q0_1 * tiles_per_group;
+                        int q1_1 = ((r0_1 < 0) ? q0_1 - 1 : q0_1);
+                        int r1_1 = ((r0_1 < 0) ? r0_1 + tiles_per_group : r0_1);
+                        int q_1 = ((r1_1 >= tiles_per_group) ? q1_1 + 1 : q1_1);
+                        int r_2 = ((r1_1 >= tiles_per_group) ? r1_1 - tiles_per_group : r1_1);
+                        int first_m = q_1 * group_m;
                         int remaining = m_tiles - first_m;
                         int group_size = ((remaining >= group_m) ? group_m : remaining);
-                        float r_gs = ((remaining >= group_m) ? rd_1 : rd_2);
-                        int q0_12 = (int)((float)r_11 * r_gs);
-                        int r0_13 = r_11 - q0_12 * group_size;
-                        int q1_14 = ((r0_13 < 0) ? q0_12 - 1 : q0_12);
-                        int r1_15 = ((r0_13 < 0) ? r0_13 + group_size : r0_13);
-                        int q_16 = ((r1_15 >= group_size) ? q1_14 + 1 : q1_14);
-                        int r_17 = ((r1_15 >= group_size) ? r1_15 - group_size : r1_15);
-                        int bid_m = first_m + r_17;
+                        float r_gs = ((remaining >= group_m) ? rd_4 : rd_5);
+                        int q0_2 = (int)((float)r_2 * r_gs);
+                        int r0_2 = r_2 - q0_2 * group_size;
+                        int q1_2 = ((r0_2 < 0) ? q0_2 - 1 : q0_2);
+                        int r1_2 = ((r0_2 < 0) ? r0_2 + group_size : r0_2);
+                        int q_2 = ((r1_2 >= group_size) ? q1_2 + 1 : q1_2);
+                        int r_3 = ((r1_2 >= group_size) ? r1_2 - group_size : r1_2);
+                        int bid_m = first_m + r_3;
                         int off_m = bid_m * 128;
-                        int off_n = q_16 * 256;
+                        int off_n = q_2 * 256;
                         int b_col = off_n + cta_rank * 128;
                         int klen = kend - kbeg;
                         #pragma unroll 1
@@ -378,13 +378,13 @@ kernel_cake_dense_projection_gemm_75b1dcdaef42319f5ed4(const __grid_constant__ C
                             int k0 = (kbeg + iter_k) * 64;
                             #pragma unroll
                             for (int r_1 = 0; r_1 < 1; r_1++) {
-                                tma_3d_gmem2smem_cta2(smem_a_addr + load_stage * 32768 + (unsigned int)(r_1 * 16384), (&A), k0, off_m + 128 * r_1, q_4, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                                tma_3d_gmem2smem_cta2(smem_a_addr + load_stage * 32768 + (unsigned int)(r_1 * 16384), (&A), k0, off_m + 128 * r_1, q_0, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
                             }
                             #pragma unroll
                             for (int p = 0; p < 2; p++) {
                                 #pragma unroll
                                 for (int kh = 0; kh < 1; kh++) {
-                                    tma_3d_gmem2smem_cta2(smem_b_addr + load_stage * 32768 + (unsigned int)(p * 8192 + kh * 8192), (&B), b_col + 64 * p, k0 + 64 * kh, q_4, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                                    tma_3d_gmem2smem_cta2(smem_b_addr + load_stage * 32768 + (unsigned int)(p * 8192 + kh * 8192), (&B), b_col + 64 * p, k0 + 64 * kh, q_0, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
                                 }
                             }
                             asm volatile(
@@ -395,7 +395,7 @@ kernel_cake_dense_projection_gemm_75b1dcdaef42319f5ed4(const __grid_constant__ C
                         }
                     }
                     mbarrier_wait(work_full_addr + (work_stage) * 8, _phase_work_full);
-                    uint32_t _clc_valid_0 = 0;
+                    uint32_t clc_valid = 0;
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p1;\n\t"
@@ -404,10 +404,10 @@ kernel_cake_dense_projection_gemm_75b1dcdaef42319f5ed4(const __grid_constant__ C
                         "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                         "selp.u32 %0, 1, 0, p1;\n\t"
                         "}\n"
-                        : "=r"(_clc_valid_0)
+                        : "=r"(clc_valid)
                         : "r"(work_response_addr + work_stage * 16 + 0 * 16)
                         : "memory");
-                    uint32_t _clc_ctaid_0 = 0;
+                    uint32_t clc_ctaid = 0;
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p1;\n\t"
@@ -416,7 +416,7 @@ kernel_cake_dense_projection_gemm_75b1dcdaef42319f5ed4(const __grid_constant__ C
                         "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                         "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                         "}\n"
-                        : "+r"(_clc_ctaid_0)
+                        : "+r"(clc_ctaid)
                         : "r"(work_response_addr + work_stage * 16 + 0 * 16)
                         : "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -426,13 +426,13 @@ kernel_cake_dense_projection_gemm_75b1dcdaef42319f5ed4(const __grid_constant__ C
                         "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                         "}"
-                        :: "r"(work_empty_addr + work_stage * 8), "r"(0) : "memory");
+                        :: "r"(work_empty_addr + (work_stage) * 8), "r"(0) : "memory");
                     work_stage += 1;
                     if (work_stage == 4) { work_stage = 0; _phase_work_empty ^= 1; _phase_work_full ^= 1; }
-                    if (_clc_valid_0 == 0) {
+                    if (clc_valid == 0) {
                         break;
                     }
-                    this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                    this_bid = clc_ctaid + (unsigned int)cta_rank;
                 }
                 #pragma unroll
                 for (int _xs = 0; _xs < 6; _xs++) {
@@ -525,7 +525,7 @@ kernel_cake_dense_projection_gemm_75b1dcdaef42319f5ed4(const __grid_constant__ C
                         if (mma_epi_stage == 2) { mma_epi_stage = 0; _phase_epilogue_done ^= 1; }
                     }
                     mbarrier_wait(work_full_addr + (work_stage_1) * 8, _phase_work_full_1);
-                    uint32_t _clc_valid_1 = 0;
+                    uint32_t clc_valid_1 = 0;
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p1;\n\t"
@@ -534,10 +534,10 @@ kernel_cake_dense_projection_gemm_75b1dcdaef42319f5ed4(const __grid_constant__ C
                         "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                         "selp.u32 %0, 1, 0, p1;\n\t"
                         "}\n"
-                        : "=r"(_clc_valid_1)
+                        : "=r"(clc_valid_1)
                         : "r"(work_response_addr + work_stage_1 * 16 + 0 * 16)
                         : "memory");
-                    uint32_t _clc_ctaid_1 = 0;
+                    uint32_t clc_ctaid_1 = 0;
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p1;\n\t"
@@ -546,7 +546,7 @@ kernel_cake_dense_projection_gemm_75b1dcdaef42319f5ed4(const __grid_constant__ C
                         "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                         "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                         "}\n"
-                        : "+r"(_clc_ctaid_1)
+                        : "+r"(clc_ctaid_1)
                         : "r"(work_response_addr + work_stage_1 * 16 + 0 * 16)
                         : "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -557,13 +557,13 @@ kernel_cake_dense_projection_gemm_75b1dcdaef42319f5ed4(const __grid_constant__ C
                         "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                         "}"
-                        :: "r"(work_empty_addr + work_stage_1 * 8), "r"(0) : "memory");
+                        :: "r"(work_empty_addr + (work_stage_1) * 8), "r"(0) : "memory");
                     work_stage_1 += 1;
                     if (work_stage_1 == 4) { work_stage_1 = 0; _phase_work_full_1 ^= 1; }
-                    if (_clc_valid_1 == 0) {
+                    if (clc_valid_1 == 0) {
                         break;
                     }
-                    this_bid_1 = _clc_ctaid_1 + (unsigned int)cta_rank;
+                    this_bid_1 = clc_ctaid_1 + (unsigned int)cta_rank;
                 }
                 #pragma unroll
                 for (int _xe = 0; _xe < 2; _xe++) {
@@ -625,20 +625,20 @@ kernel_cake_dense_projection_gemm_75b1dcdaef42319f5ed4(const __grid_constant__ C
                 int nseg_2 = n;
                 #pragma unroll 1
                 for (int seg_2 = 0; seg_2 < nseg_2; seg_2++) {
-                    int u_0 = (int)this_bid_2 / 2 - num_full;
-                    int lin0_1 = u_0 * iters_per_unit;
-                    int lin1_raw_2 = lin0_1 + iters_per_unit;
-                    int lin1_3 = ((lin1_raw_2 > sk_iters) ? sk_iters : lin1_raw_2);
-                    int t = lin0_1 / k_iters + seg_2;
+                    int u_1_1 = (int)this_bid_2 / 2 - num_full;
+                    int lin0_0 = u_1_1 * iters_per_unit;
+                    int lin1_raw_0 = lin0_0 + iters_per_unit;
+                    int lin1_0 = ((lin1_raw_0 > sk_iters) ? sk_iters : lin1_raw_0);
+                    int t = lin0_0 / k_iters + seg_2;
                     int tb = t * k_iters;
-                    int kb0 = lin0_1 - tb;
+                    int kb0 = lin0_0 - tb;
                     int kbeg_t = ((kb0 > 0) ? kb0 : 0);
-                    int ke0 = lin1_3 - tb;
+                    int ke0 = lin1_0 - tb;
                     int kend_t = ((ke0 > k_iters) ? k_iters : ke0);
-                    int tile_bid_2 = ((u_0 < 0) ? (int)this_bid_2 : 2 * (num_full + t) + cta_rank);
-                    int kbeg_2 = ((u_0 < 0) ? 0 : kbeg_t);
-                    int kend_2 = ((u_0 < 0) ? k_iters : kend_t);
-                    int tail_t_2 = ((u_0 < 0) ? -1 : t);
+                    int tile_bid_2 = ((u_1_1 < 0) ? (int)this_bid_2 : 2 * (num_full + t) + cta_rank);
+                    int kbeg_2 = ((u_1_1 < 0) ? 0 : kbeg_t);
+                    int kend_2 = ((u_1_1 < 0) ? k_iters : kend_t);
+                    int tail_t_2 = ((u_1_1 < 0) ? -1 : t);
                     int tiles_per_l_1 = m_tiles * n_tiles;
                     int tiles_per_group_1 = group_m * n_tiles;
                     int head = tile_bid_2 / tiles_per_l_1;
@@ -654,7 +654,7 @@ kernel_cake_dense_projection_gemm_75b1dcdaef42319f5ed4(const __grid_constant__ C
                     int off_n_1 = bid_n * 256;
                     int bidx = head;
                     int part_4 = ((kbeg_2 > 0) ? 1 : ((kend_2 < k_iters) ? 1 : 0));
-                    int slab = u_0 + tail_t_2;
+                    int slab = u_1_1 + tail_t_2;
                     int global_row = off_m_1 + local_row;
                     int row0 = off_m_1 + warp_row0;
                     int col0 = slice_col0;
@@ -690,9 +690,9 @@ kernel_cake_dense_projection_gemm_75b1dcdaef42319f5ed4(const __grid_constant__ C
                             asm volatile("tcgen05.fence::before_thread_sync;");
                             __syncwarp();
                             #pragma unroll
-                            for (int q_1 = 0; q_1 < 8; q_1++) {
-                                int s0 = c * 32 + q_1 * 4;
-                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(slot + row_off + (unsigned int)((q_1 ^ swz) * 16)), "r"(acc0_bf16[s0]), "r"(acc0_bf16[s0 + 1]), "r"(acc0_bf16[s0 + 2]), "r"(acc0_bf16[s0 + 3]));
+                            for (int q_3 = 0; q_3 < 8; q_3++) {
+                                int s0 = c * 32 + q_3 * 4;
+                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(slot + row_off + (unsigned int)((q_3 ^ swz) * 16)), "r"(acc0_bf16[s0]), "r"(acc0_bf16[s0 + 1]), "r"(acc0_bf16[s0 + 2]), "r"(acc0_bf16[s0 + 3]));
                             }
                             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                             __syncwarp();
@@ -737,10 +737,10 @@ kernel_cake_dense_projection_gemm_75b1dcdaef42319f5ed4(const __grid_constant__ C
                             for (int g = 0; g < 4; g++) {
                                 if (nvalid > g * 16) {
                                     #pragma unroll
-                                    for (int q_2 = 0; q_2 < 4; q_2++) {
+                                    for (int q_4 = 0; q_4 < 4; q_4++) {
                                         {
-                                            float4 _v4 = make_float4(acc0[(g * 4 + q_2) * 4 + 0], acc0[(g * 4 + q_2) * 4 + 1], acc0[(g * 4 + q_2) * 4 + 2], acc0[(g * 4 + q_2) * 4 + 3]);
-                                            *reinterpret_cast<float4*>((ws + (off_0 + (unsigned long long)((j0 + g * 4 + q_2) * 128))) + 0) = _v4;
+                                            float4 _v4 = make_float4(acc0[(g * 4 + q_4) * 4 + 0], acc0[(g * 4 + q_4) * 4 + 1], acc0[(g * 4 + q_4) * 4 + 2], acc0[(g * 4 + q_4) * 4 + 3]);
+                                            *reinterpret_cast<float4*>((ws + (off_0 + (unsigned long long)((j0 + g * 4 + q_4) * 128))) + 0) = _v4;
                                         }
                                     }
                                 }
@@ -791,7 +791,7 @@ kernel_cake_dense_projection_gemm_75b1dcdaef42319f5ed4(const __grid_constant__ C
                             "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                             "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                             "}"
-                            :: "r"(work_empty_addr + work_stage_2 * 8), "r"(0) : "memory");
+                            :: "r"(work_empty_addr + (work_stage_2) * 8), "r"(0) : "memory");
                         valid_pd = _clc_valid_2;
                         next_pd = _clc_ctaid_2 + (unsigned int)cta_rank;
                         work_stage_2 += 1;
@@ -836,9 +836,9 @@ kernel_cake_dense_projection_gemm_75b1dcdaef42319f5ed4(const __grid_constant__ C
                             asm volatile("tcgen05.fence::before_thread_sync;");
                             __syncwarp();
                             #pragma unroll
-                            for (int q_3 = 0; q_3 < 8; q_3++) {
-                                int s0_1 = c_1 * 32 + q_3 * 4;
-                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(slot_1 + row_off_1 + (unsigned int)((q_3 ^ swz_1) * 16)), "r"(_tmem_load_0_bf16[s0_1]), "r"(_tmem_load_0_bf16[s0_1 + 1]), "r"(_tmem_load_0_bf16[s0_1 + 2]), "r"(_tmem_load_0_bf16[s0_1 + 3]));
+                            for (int q_5 = 0; q_5 < 8; q_5++) {
+                                int s0_1 = c_1 * 32 + q_5 * 4;
+                                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(slot_1 + row_off_1 + (unsigned int)((q_5 ^ swz_1) * 16)), "r"(_tmem_load_0_bf16[s0_1]), "r"(_tmem_load_0_bf16[s0_1 + 1]), "r"(_tmem_load_0_bf16[s0_1 + 2]), "r"(_tmem_load_0_bf16[s0_1 + 3]));
                             }
                             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                             __syncwarp();
@@ -883,10 +883,10 @@ kernel_cake_dense_projection_gemm_75b1dcdaef42319f5ed4(const __grid_constant__ C
                             for (int g_1 = 0; g_1 < 4; g_1++) {
                                 if (nvalid_1 > 64 + g_1 * 16) {
                                     #pragma unroll
-                                    for (int q_5 = 0; q_5 < 4; q_5++) {
+                                    for (int q_6 = 0; q_6 < 4; q_6++) {
                                         {
-                                            float4 _v4 = make_float4(_tmem_load_0[(g_1 * 4 + q_5) * 4 + 0], _tmem_load_0[(g_1 * 4 + q_5) * 4 + 1], _tmem_load_0[(g_1 * 4 + q_5) * 4 + 2], _tmem_load_0[(g_1 * 4 + q_5) * 4 + 3]);
-                                            *reinterpret_cast<float4*>((ws + (off_0_1 + (unsigned long long)((j0_1 + g_1 * 4 + q_5) * 128))) + 0) = _v4;
+                                            float4 _v4 = make_float4(_tmem_load_0[(g_1 * 4 + q_6) * 4 + 0], _tmem_load_0[(g_1 * 4 + q_6) * 4 + 1], _tmem_load_0[(g_1 * 4 + q_6) * 4 + 2], _tmem_load_0[(g_1 * 4 + q_6) * 4 + 3]);
+                                            *reinterpret_cast<float4*>((ws + (off_0_1 + (unsigned long long)((j0_1 + g_1 * 4 + q_6) * 128))) + 0) = _v4;
                                         }
                                     }
                                 }
@@ -940,10 +940,10 @@ kernel_cake_dense_projection_gemm_75b1dcdaef42319f5ed4(const __grid_constant__ C
                                     for (int g_2 = 0; g_2 < 8; g_2++) {
                                         if (nvalid_2 > g_2 * 16) {
                                             #pragma unroll
-                                            for (int q_6 = 0; q_6 < 4; q_6++) {
+                                            for (int q_7 = 0; q_7 < 4; q_7++) {
                                                 float _vec_load_1[4];
                                                 {
-                                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (off_0_2 + (unsigned long long)((g_2 * 4 + q_6) * 128)) + 0);
+                                                    float4 _v4 = *reinterpret_cast<const float4*>(ws + (off_0_2 + (unsigned long long)((g_2 * 4 + q_7) * 128)) + 0);
                                                     _vec_load_1[0 + 0] = _v4.x;
                                                     _vec_load_1[0 + 1] = _v4.y;
                                                     _vec_load_1[0 + 2] = _v4.z;
@@ -951,7 +951,7 @@ kernel_cake_dense_projection_gemm_75b1dcdaef42319f5ed4(const __grid_constant__ C
                                                 }
                                                 #pragma unroll
                                                 for (int i_1 = 0; i_1 < 4; i_1++) {
-                                                    red[(g_2 * 4 + q_6) * 4 + i_1] = red[(g_2 * 4 + q_6) * 4 + i_1] + _vec_load_1[i_1];
+                                                    red[(g_2 * 4 + q_7) * 4 + i_1] = red[(g_2 * 4 + q_7) * 4 + i_1] + _vec_load_1[i_1];
                                                 }
                                             }
                                         }
@@ -975,9 +975,9 @@ kernel_cake_dense_projection_gemm_75b1dcdaef42319f5ed4(const __grid_constant__ C
                                 }
                                 __syncwarp();
                                 #pragma unroll
-                                for (int q_7 = 0; q_7 < 8; q_7++) {
-                                    int s0_2 = c_2 * 32 + q_7 * 4;
-                                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(slot_2 + row_off_2 + (unsigned int)((q_7 ^ swz_2) * 16)), "r"(red_bf16[s0_2]), "r"(red_bf16[s0_2 + 1]), "r"(red_bf16[s0_2 + 2]), "r"(red_bf16[s0_2 + 3]));
+                                for (int q_8 = 0; q_8 < 8; q_8++) {
+                                    int s0_2 = c_2 * 32 + q_8 * 4;
+                                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(slot_2 + row_off_2 + (unsigned int)((q_8 ^ swz_2) * 16)), "r"(red_bf16[s0_2]), "r"(red_bf16[s0_2 + 1]), "r"(red_bf16[s0_2 + 2]), "r"(red_bf16[s0_2 + 3]));
                                 }
                                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                                 __syncwarp();

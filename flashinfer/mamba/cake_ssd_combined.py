@@ -124,9 +124,16 @@ class _Program:
     (``preprocess_args``: ``_PREPROCESS_ARGS``, or ``_METADATA_ARGS`` for the
     light metadata stage).
     ``variant`` is the schedule variant of the exact-scan families: ``""``
-    (the ring program), ``"noring"`` or ``"tail"`` (the two-kernel family's
+    (the ring program), ``"noring"``, ``"tail"`` (the two-kernel family's
     2-CTA pair program, ``cluster_dims`` ``(2, 1, 1)``, launched on the even
-    grid :func:`_tail_grid_size`).
+    grid :func:`_tail_grid_size`), ``"tailone"`` (the two-kernel family's
+    sm_107a varlen pair program launched as one-CTA clusters on the same
+    grid, :func:`tail_one_cta_selected`), ``"claim"`` (the two-kernel family's
+    sm_107a varlen ring program that draws its work items at run time,
+    :func:`claim_selected`) or ``"ibulk"`` (the two-kernel family's sm_107a
+    packed-varlen ring program loading a work item's initial state as one
+    bulk copy, :func:`ibulk_selected`; the fused family's sm_107a
+    packed-varlen ring program doing the same, :func:`fused_ibulk_selected`).
     """
 
     family: str
@@ -181,6 +188,17 @@ class _Program:
 # inside the fused window reaches the pair program's chunk floor, so the fused
 # family ships none.
 _SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_2904ce6fee"
+# The sm_107a (Rubin) render of the segment preprocess: the same kernel symbol,
+# arguments, launch grid and bitwise outputs, with the Rubin load and store
+# schedule; the loader builds it on capability (10, 7) in place of the shared
+# module (:func:`_arch_program`).  Refreshed by the Cake export.
+_SM107_SEGMENT_PREPROCESS_MODULE = "factorized_persistent_segment_preprocess_3fdd933bec"
+# Its twin that triggers the dependent launch at its start
+# (``griddepcontrol.launch_dependents``), the sm_107a preprocess of the
+# ``_PDL_TRIGGER_FAMILIES`` programs.  Refreshed by the Cake export.
+_SM107_SEGMENT_PREPROCESS_TRIGGER_MODULE = (
+    "factorized_persistent_segment_preprocess_4a4134cc42"
+)
 # Retained start programs (the FlashInfer 36fd76859292 files): a literal the
 # Cake export does not fill.
 _SCAN_MODULES = {
@@ -267,46 +285,104 @@ _EXACTONE_MODULES = {
     "exactone_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_1100526c71",
     "exactone_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_948223063c",
 }
-# sm_107a (Rubin) device modules of the programs whose Rubin render was
-# regenerated with its own geometry (the fused and one-launch varlen scans,
-# the look-back chunk-parallel program and the two-kernel varlen ring
-# program), filled by the Cake export; the loader builds these modules for
-# capability (10, 7) (:func:`_main_module`).  Every other program builds its
-# fold module on every architecture: the retained start ``exact_*``
-# programs, the ``exactmeta_*`` programs (SM100 only,
-# ``_LIGHT_STAGE_CAPABILITIES``) and the programs whose Rubin render differed
-# from the fold only by the tcgen05 SMEM descriptor address mask (15 bits on
-# sm_107a, ``0x7FFF``; 14 bits, ``0x3FFF``, on sm_100a and sm_103a), which
-# the fold source now selects by ``__CUDA_ARCH__``.  The preprocess and
-# metadata kernels are shared.  A fused varlen suffix has two sm_107a
+# sm_107a (Rubin) device modules, filled by the Cake export: every
+# ``exactfused_*``, ``exactone_*``, ``exactpre_*`` (tail included),
+# ``chunkpar_*`` and ``chunkpar3_*`` program builds its own sm_107a render for
+# capability (10, 7) (:func:`_main_module`).  The retained start ``exact_*``
+# programs and the ``exactmeta_*`` programs (SM100 only,
+# ``_LIGHT_STAGE_CAPABILITIES``) build their fold module on every
+# architecture; the fold source selects the tcgen05 SMEM descriptor address
+# mask by ``__CUDA_ARCH__`` (15 bits on sm_107a, ``0x7FFF``; 14 bits,
+# ``0x3FFF``, on sm_100a and sm_103a).  The metadata kernel is
+# shared; the segment preprocess builds its own sm_107a render
+# (``_SM107_SEGMENT_PREPROCESS``, or its early-trigger twin
+# ``_SM107_SEGMENT_PREPROCESS_TRIGGER`` for the ``_PDL_TRIGGER_FAMILIES``
+# programs).  A fused varlen suffix has two sm_107a
 # sources, as SM103 has two texts: the ``exactfused_*`` varlen entry names
 # the render of the SM100 form (the caller-table and cu_seqlens forms) and
 # the ``exactone_*`` entry the one-launch render, which derives the sequence
-# table in-kernel.
+# table in-kernel.  The two-kernel claim programs
+# (``exactpre_<state>_varlen_claim``, :func:`claim_selected`), initial-state
+# bulk programs (``exactpre_<state>_varlen_ibulk``, :func:`ibulk_selected`)
+# and one-CTA pair programs (``exactpre_<state>_varlen_tailone``,
+# :func:`tail_one_cta_selected`) exist on sm_107a only
+# (``_SM107_ONLY_PROGRAMS``),
+# as do the fused initial-state bulk programs
+# (``exactfused_<state>_varlen_ibulk``, :func:`fused_ibulk_selected`):
+# their entries are their sole sources (no fold module, never built for
+# another architecture).
 _SM107_MODULES = {
-    "exactfused_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_09cfaa7d95",
-    "exactfused_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_963449dd82",
-    "exactfused_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_4055fb7a96",
-    "exactfused_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_ded2a71f22",
-    "exactfused_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_ebe1153e72",
-    "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_v3_bf16_batched_d8bcac8052",
-    "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_v3_bf16_varlen_1ac41d4988",
-    "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_v3_f16_batched_3e4982bea4",
-    "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_v3_f16_varlen_043d7b5645",
-    "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_v3_f32_batched_1f694d38d5",
-    "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_v3_f32_varlen_e925221730",
-    "exactpre_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_cfc501cc89",
-    "exactpre_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_655d231457",
-    "exactpre_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_97f655eea0",
-    "exactone_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_5b650e6211",
-    "exactone_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_e0ec22c79d",
-    "exactone_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_75d76aff25",
-    "exactone_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_c0be08ce76",
-    "exactone_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_cdfc327504",
+    "exactfused_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_2cbbfc3dd6",
+    "exactfused_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_9a77db3ad6",
+    "exactfused_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_ca9cc524b2",
+    "exactfused_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_ad5e3246eb",
+    "exactfused_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_622868a1e1",
+    "chunkpar_bf16_batched": "mamba_ssd_chunk_parallel_v3_bf16_batched_0d36ddcff6",
+    "chunkpar_bf16_varlen": "mamba_ssd_chunk_parallel_v3_bf16_varlen_cc9360d18a",
+    "chunkpar_f16_batched": "mamba_ssd_chunk_parallel_v3_f16_batched_74041d25de",
+    "chunkpar_f16_varlen": "mamba_ssd_chunk_parallel_v3_f16_varlen_fd7ee521e3",
+    "chunkpar_f32_batched": "mamba_ssd_chunk_parallel_v3_f32_batched_77be0da401",
+    "chunkpar_f32_varlen": "mamba_ssd_chunk_parallel_v3_f32_varlen_b7f2b1f440",
+    "exactpre_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_d143ae24ea",
+    "exactpre_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_ae77ddc912",
+    "exactpre_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_ee7d6500e5",
+    "exactone_bf16_varlen": "mamba_ssd_q_tmem_alias_bf16_varlen_8cf6f8fef2",
+    "exactone_f16_varlen": "mamba_ssd_q_tmem_alias_f16_varlen_7e8ffa5e3b",
+    "exactone_f32_varlen": "mamba_ssd_q_tmem_alias_f32_varlen_e9ab92eb70",
+    "exactone_bf16_varlen_noring": "mamba_ssd_q_tmem_alias_bf16_varlen_noring_afc73d515a",
+    "exactone_f16_varlen_noring": "mamba_ssd_q_tmem_alias_f16_varlen_noring_36f7d06ed4",
+    "exactfused_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_a926c4b548",
+    "exactfused_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_20a770476a",
+    "exactfused_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_52f18e0520",
+    "exactfused_bf16_batched_noring": "mamba_ssd_q_tmem_alias_bf16_batched_noring_3c6cf7b844",
+    "exactfused_f16_batched_noring": "mamba_ssd_q_tmem_alias_f16_batched_noring_d33767ff60",
+    "exactfused_f32_batched_noring": "mamba_ssd_q_tmem_alias_f32_batched_noring_f26078282e",
+    "exactpre_bf16_batched": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_542047a878",
+    "exactpre_f16_batched": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_8a0418850b",
+    "exactpre_f32_batched": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_5bb1e2274f",
+    "exactpre_bf16_batched_tail": "mamba_ssd_q_tmem_alias_bf16_batched_precomputed_tail_a0ea2820d8",
+    "exactpre_f16_batched_tail": "mamba_ssd_q_tmem_alias_f16_batched_precomputed_tail_48e80d8704",
+    "exactpre_bf16_varlen_tail": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tail_8edaef9799",
+    "exactpre_f16_varlen_tail": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_tail_4ff710621d",
+    "exactpre_f32_batched_tail": "mamba_ssd_q_tmem_alias_f32_batched_precomputed_tail_fc388577dc",
+    "exactpre_f32_varlen_tail": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_tail_7fd866a0ea",
+    "chunkpar3_bf16_batched": "mamba_ssd_chunk_parallel_bf16_batched_39bb8597d5",
+    "chunkpar3_f16_batched": "mamba_ssd_chunk_parallel_f16_batched_35f6e66f75",
+    "chunkpar3_bf16_varlen": "mamba_ssd_chunk_parallel_bf16_varlen_3449e8c0f2",
+    "chunkpar3_f16_varlen": "mamba_ssd_chunk_parallel_f16_varlen_ebf7470866",
+    "chunkpar3_f32_batched": "mamba_ssd_chunk_parallel_f32_batched_43dad44ea0",
+    "chunkpar3_f32_varlen": "mamba_ssd_chunk_parallel_f32_varlen_5d526eacf5",
+    "exactpre_bf16_varlen_claim": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_claim_57675d132c",
+    "exactpre_f32_varlen_claim": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_claim_8ae380b2cd",
+    "exactpre_bf16_varlen_ibulk": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_ibulk_272db07349",
+    "exactpre_f16_varlen_ibulk": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_ibulk_ae9645a9b3",
+    "exactone_bf16_varlen_tablefirst": "mamba_ssd_q_tmem_alias_bf16_varlen_tablefirst_76a8f20d0d",
+    "exactone_f16_varlen_tablefirst": "mamba_ssd_q_tmem_alias_f16_varlen_tablefirst_494f203d00",
+    "exactone_f32_varlen_tablefirst": "mamba_ssd_q_tmem_alias_f32_varlen_tablefirst_13c07efd3e",
+    "exactone_bf16_varlen_tableroles": "mamba_ssd_q_tmem_alias_bf16_varlen_tableroles_cd9bb4215b",
+    "exactone_f16_varlen_tableroles": "mamba_ssd_q_tmem_alias_f16_varlen_tableroles_b7f24c6017",
+    "exactone_f32_varlen_tableroles": "mamba_ssd_q_tmem_alias_f32_varlen_tableroles_fd7c260936",
+    "exactfused_bf16_varlen_ibulk": "mamba_ssd_q_tmem_alias_bf16_varlen_ibulk_7e3e039507",
+    "exactfused_f16_varlen_ibulk": "mamba_ssd_q_tmem_alias_f16_varlen_ibulk_ad95ebc012",
+    "exactpre_bf16_varlen_tailone": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_tailone_cb5978f317",
+    "exactpre_f16_varlen_tailone": "mamba_ssd_q_tmem_alias_f16_varlen_precomputed_tailone_ed8277f475",
+    "exactpre_f32_varlen_tailone": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_tailone_a6f49c4f67",
 }
 
 _SEGMENT_PREPROCESS = _Kernel(
     _SEGMENT_PREPROCESS_MODULE,
+    "kernel_factorized_persistent_segment_preprocess",
+    threads=256,
+    fast_math=False,
+)
+_SM107_SEGMENT_PREPROCESS = _Kernel(
+    _SM107_SEGMENT_PREPROCESS_MODULE,
+    "kernel_factorized_persistent_segment_preprocess",
+    threads=256,
+    fast_math=False,
+)
+_SM107_SEGMENT_PREPROCESS_TRIGGER = _Kernel(
+    _SM107_SEGMENT_PREPROCESS_TRIGGER_MODULE,
     "kernel_factorized_persistent_segment_preprocess",
     threads=256,
     fast_math=False,
@@ -364,6 +440,33 @@ _EXACTPRE_SMEM_BYTES = 232320
 # mbarrier); refreshed by the Cake export with the ``exactpre_*_tail`` table
 # entries.
 _EXACTPRE_TAIL_SMEM_BYTES = 232320
+# Main dynamic SMEM of the sm_107a varlen tail-pair programs (the
+# ``_SM107_MODULES`` entries of ``exactpre_*_varlen_tail``): they keep each
+# chunk's segment bounds in shared memory, 8 bytes past the pool of the other
+# tail programs, which keep ``_EXACTPRE_TAIL_SMEM_BYTES``; the Cake export
+# reads it for the launch of those table entries.
+_EXACTPRE_TAIL_VARLEN_SM107_SMEM_BYTES = 232448
+# Main dynamic SMEM of the sm_107a claim programs (``exactpre_*_claim``: the
+# two-kernel varlen ring programs with the 8-byte item hand-off slots and the
+# two claim mbarrier pairs); the Cake export reads it for the launch of the
+# ``exactpre_*_claim`` table entries.
+_EXACTPRE_CLAIM_SMEM_BYTES = 232448
+# Main dynamic SMEM of the sm_107a initial-state bulk programs
+# (``exactpre_*_ibulk``: the varlen ring programs with one more mbarrier, the
+# initial-state bulk copy's); the Cake export reads it for the launch of the
+# ``exactpre_*_ibulk`` table entries.
+_EXACTPRE_IBULK_SMEM_BYTES = 232448
+# Main dynamic SMEM of the sm_107a fused initial-state bulk programs
+# (``exactfused_*_ibulk``: the fused varlen ring programs with the
+# initial-state bulk copy's mbarrier); the Cake export reads it for the launch
+# of the ``exactfused_*_ibulk`` table entries.
+_EXACTFUSED_IBULK_SMEM_BYTES = 232448
+# Main dynamic SMEM of the sm_107a one-CTA pair programs
+# (``exactpre_*_varlen_tailone``: the varlen tail-pair programs launched
+# without the 2-CTA cluster, with the rank ticket's slot past the segment
+# bounds); the Cake export reads it for the launch of the
+# ``exactpre_*_tailone`` table entries.
+_EXACTPRE_TAILONE_SMEM_BYTES = 232448
 
 
 # Positional launcher ABI shared by every program: preprocess arguments, its
@@ -637,6 +740,19 @@ _VARIANT_SMEM_BYTES = {
     ("exactmeta", "noring"): _EXACTFUSED_NORING_SMEM_BYTES,
     ("exactone", "noring"): _EXACTONE_NORING_SMEM_BYTES,
     ("exactpre", "tail"): _EXACTPRE_TAIL_SMEM_BYTES,
+    ("exactpre", "claim"): _EXACTPRE_CLAIM_SMEM_BYTES,
+    ("exactpre", "ibulk"): _EXACTPRE_IBULK_SMEM_BYTES,
+    ("exactpre", "tailone"): _EXACTPRE_TAILONE_SMEM_BYTES,
+    ("exactfused", "ibulk"): _EXACTFUSED_IBULK_SMEM_BYTES,
+    ("exactone", "tablefirst"): _EXACTONE_SMEM_BYTES,
+    ("exactone", "tableroles"): _EXACTONE_SMEM_BYTES,
+}
+# Main dynamic SMEM of the sm_107a renders (``_SM107_MODULES`` entries) whose
+# pool differs from their family and variant literal, by (family, mode,
+# variant); every other program, and every program on sm_100a and sm_103a,
+# launches with the literal above.
+_SM107_VARIANT_SMEM_BYTES = {
+    ("exactpre", "varlen", "tail"): _EXACTPRE_TAIL_VARLEN_SM107_SMEM_BYTES,
 }
 # Cluster shape of the main kernels (the Cake export checks the generated
 # sources against it): the ``_tail`` pair programs launch as 2-CTA clusters
@@ -690,6 +806,17 @@ _PROGRAMS: dict[str, _Program] = {
         *_EXACTONE_MODULES.items(),
     )
 }
+# The sm_107a-only programs (the claim, initial-state bulk and one-CTA pair
+# programs, and the one-launch programs' table forms): their
+# ``_SM107_MODULES`` entry is their main module on every architecture; only
+# capability (10, 7) routes to them (:func:`claim_selected`,
+# :func:`ibulk_selected`, :func:`tail_one_cta_selected`,
+# :func:`fused_ibulk_selected`, :func:`exactone_table_variant`).
+_SM107_ONLY_PROGRAMS = frozenset(_SM107_MODULES) - frozenset(_PROGRAMS)
+_PROGRAMS.update(
+    (name, _program(name, _SM107_MODULES[name]))
+    for name in sorted(_SM107_ONLY_PROGRAMS)
+)
 
 
 def _program_name(
@@ -698,7 +825,9 @@ def _program_name(
     """The program of ``family`` serving a state dtype in batched or
     packed-varlen mode; ``variant`` names a non-default schedule variant of the
     family (``"noring"`` for the exact-scan families other than the two-kernel
-    one, ``"tail"`` for the two-kernel exact-scan family)."""
+    one, ``"tail"``, ``"tailone"``, ``"claim"`` or ``"ibulk"`` for the
+    two-kernel exact-scan family, ``"ibulk"`` for the fused one,
+    ``"tablefirst"`` or ``"tableroles"`` for the one-launch family)."""
 
     mode_key = "varlen" if mode_varlen else "batched"
     suffix = f"_{variant}" if variant else ""
@@ -718,14 +847,67 @@ def _main_module(name: str, arch: str) -> str:
 
 def _arch_program(name: str, arch: str) -> _Program:
     """Program ``name`` as built for ``arch``: the table binding with its main
-    kernel rebound to :func:`_main_module` (the same symbol, thread count and
-    build flags; only the module identity, hence the device source, differs)."""
+    kernel rebound to :func:`_main_module` and, on sm_107a, its main dynamic
+    SMEM to ``_SM107_VARIANT_SMEM_BYTES`` for a render of a kind it lists and
+    its segment preprocess rebound to ``_SM107_SEGMENT_PREPROCESS`` -- or to its
+    early-trigger twin ``_SM107_SEGMENT_PREPROCESS_TRIGGER`` when the main
+    kernel launches with programmatic dependent launch (:func:`_main_pdl`) and
+    the family is in ``_PDL_TRIGGER_FAMILIES`` (the same symbol, thread count
+    and build flags; only the module identity, hence the device source,
+    differs)."""
 
     program = _PROGRAMS[name]
     module = _main_module(name, arch)
-    if module == program.main.module:
+    main = program.main if module == program.main.module else _scan(module)
+    preprocess = program.preprocess
+    if arch == _SM107_ARCH and program.preprocess is _SEGMENT_PREPROCESS:
+        preprocess = (
+            _SM107_SEGMENT_PREPROCESS_TRIGGER
+            if _main_pdl(name, arch) and program.family in _PDL_TRIGGER_FAMILIES
+            else _SM107_SEGMENT_PREPROCESS
+        )
+    smem_bytes = program.main_smem_bytes
+    if arch == _SM107_ARCH and name in _SM107_MODULES:
+        mode = name.split("_")[2]
+        smem_bytes = _SM107_VARIANT_SMEM_BYTES.get(
+            (program.family, mode, program.variant), smem_bytes
+        )
+    if (
+        main is program.main
+        and preprocess is program.preprocess
+        and smem_bytes == program.main_smem_bytes
+    ):
         return program
-    return replace(program, main=_scan(module))
+    return replace(
+        program, main=main, preprocess=preprocess, main_smem_bytes=smem_bytes
+    )
+
+
+# The sm_107a two-kernel programs whose main kernel waits on the preprocess
+# grid (``griddepcontrol.wait`` ahead of its first access to the preprocess
+# outputs): their main stage launches with programmatic dependent launch, so
+# the main grid's launch and CTA prologue overlap the preprocess tail.  Every
+# other program, and every program on sm_100a and sm_103a, launches its main
+# kernel stream-ordered as before.
+_PDL_FAMILIES = frozenset({"exactpre", "chunkpar", "chunkpar3"})
+# The PDL families whose preprocess triggers the dependent launch at its start
+# (``_SM107_SEGMENT_PREPROCESS_TRIGGER``), so the main grid launches while the
+# preprocess still runs: the chunk-parallel three-phase programs.  The
+# ``exactpre`` and look-back (``chunkpar``) main kernels measured no gain with
+# the early launch and keep the preprocess that triggers at CTA exit.
+_PDL_TRIGGER_FAMILIES = frozenset({"chunkpar3"})
+
+
+def _main_pdl(name: str, arch: str) -> bool:
+    """Whether program ``name`` launches its main kernel with programmatic
+    dependent launch on ``arch``: the sm_107a render (``_SM107_MODULES``) of a
+    two-kernel family."""
+
+    return (
+        arch == _SM107_ARCH
+        and _PROGRAMS[name].family in _PDL_FAMILIES
+        and name in _SM107_MODULES
+    )
 
 
 def _direct_preprocess_inputs(
@@ -973,15 +1155,22 @@ _THREE_PHASE_MIN_CHUNKS = 64
 # chunk-parallel regime (three-phase / look-back 0.90-0.97 at 8 items x
 # 64-128 chunks, 16 items x 32-128 chunks and 32 items x 32 chunks, main
 # kernel, cold L2); the look-back stays ahead only at 32 items x 16 chunks
-# (1.01-1.02) and 8 items x 256 chunks (1.01).  Its rule: three-phase for
-# batched calls with at most ``_THREE_PHASE_MAX_TILES`` tiles or at least
-# ``_RUBIN_THREE_PHASE_MIN_CHUNKS`` chunks per item, except calls of at most
+# (1.01-1.02) and 8 items x 256 chunks (1.01).  With the PDL-triggered
+# preprocess (forced routes on R200, whole call, cold
+# L2) the look-back leads between ``_RUBIN_LOOKBACK_TILES`` tiles (more than
+# 512, at most 2048: 1.04-1.14x at 8-32 items x 32-128 chunks) and the
+# three-phase program on both sides (512 tiles at 32 chunks 0.97, 4096
+# tiles 0.96).  Its rule: three-phase for batched calls with at most
+# ``_THREE_PHASE_MAX_TILES`` tiles or at least
+# ``_RUBIN_THREE_PHASE_MIN_CHUNKS`` chunks per item, except calls inside
+# the ``_RUBIN_LOOKBACK_TILES`` band and calls of at most
 # ``_RUBIN_LOOKBACK_MAX_ITEMS`` items with at least
 # ``_RUBIN_LOOKBACK_MIN_CHUNKS`` chunks; varlen calls stay on the look-back.
 _RUBIN_THREE_PHASE_CAPABILITIES = ((10, 7),)
 _RUBIN_THREE_PHASE_MIN_CHUNKS = 32
 _RUBIN_LOOKBACK_MAX_ITEMS = 8
 _RUBIN_LOOKBACK_MIN_CHUNKS = 256
+_RUBIN_LOOKBACK_TILES = (512, 2048)  # exclusive lower, inclusive upper bound
 # Chunk-parallel workspace per (chunk, head) tile: the f32 [64, 128] state
 # increments (32 KB) plus the bf16 [64, 128] state operand (16 KB).
 _CHUNK_PARALLEL_WORKSPACE_BYTES_PER_TILE = _HEADDIM * _DSTATE * (4 + 2)
@@ -1310,14 +1499,18 @@ def three_phase_preferred(
     chunks per item; the look-back family otherwise.  On the
     ``_RUBIN_THREE_PHASE_CAPABILITIES`` the three-phase family also serves
     every batched call of at least ``_RUBIN_THREE_PHASE_MIN_CHUNKS`` chunks
-    per item, except at most ``_RUBIN_LOOKBACK_MAX_ITEMS`` items with at
-    least ``_RUBIN_LOOKBACK_MIN_CHUNKS`` chunks."""
+    per item, except calls whose tiles lie in the ``_RUBIN_LOOKBACK_TILES``
+    band and at most ``_RUBIN_LOOKBACK_MAX_ITEMS`` items with at least
+    ``_RUBIN_LOOKBACK_MIN_CHUNKS`` chunks."""
 
     if mode_varlen:
         return False
     if int(tiles) <= _THREE_PHASE_MAX_TILES:
         return True
     if tuple(capability) in _RUBIN_THREE_PHASE_CAPABILITIES:
+        low, high = _RUBIN_LOOKBACK_TILES
+        if low < int(tiles) <= high:
+            return False
         if (
             int(work_items) <= _RUBIN_LOOKBACK_MAX_ITEMS
             and int(chunks) >= _RUBIN_LOOKBACK_MIN_CHUNKS
@@ -1451,6 +1644,64 @@ _FUSED_ROUTE_MAX_CHUNK_ITEMS_VARLEN = 512
 # repaid only where the item spans several chunks; one-chunk items keep the
 # retained start program ``exact_*``.
 _TWO_KERNEL_ROUTE_MIN_CHUNKS = 2
+# sm_107a (R200, 212 SMs) only: one-chunk items take ``exactpre`` too where
+# the call has more items than SMs and at most this many (sequence, head)
+# items and runs the ring schedule (the ``noring`` start schedule exists for
+# the retained program only).  Forced routes on R200:
+# 512-2048 items 1.015-1.06x faster than ``exact``; 8192-20480 items
+# 0.99-1.02x (kept).
+_TWO_KERNEL_ONE_CHUNK_MAX_ITEMS = {(10, 7): 2048}
+# sm_107a: one-chunk ring calls with these state dtypes take ``exactpre``
+# above the item bound too (fp32 state, 8192-20480 items: 1.016-1.031x
+# faster than ``exact``).
+_ONE_CHUNK_EXACTPRE_STATE_DTYPES = {(10, 7): frozenset({torch.float32})}
+# sm_107a: a call the retained ``exact_*_noring`` program would serve takes
+# the fused one-kernel program instead (bf16 state, 8 x 64: 1.34x).
+_NORING_RETAINED_FUSED = frozenset({(10, 7)})
+# sm_107a: a packed-varlen call outside the fused window that the start
+# schedule (``noring``) would serve runs the ring schedule instead where it
+# has more than this many (sequence, head) items per SM and its ring
+# two-kernel family is ``exactpre`` (one-chunk items up to
+# ``_TWO_KERNEL_ONE_CHUNK_MAX_ITEMS``): there the ring program is faster than
+# the fused start schedule in every call form, outputs bitwise identical.
+# With fewer items per SM the two are close and the cu_seqlens form loses;
+# above ``_TWO_KERNEL_ONE_CHUNK_MAX_ITEMS`` items the ring family is the
+# retained ``exact`` program, which is slower, so those calls keep the fused
+# start schedule.
+_NORING_RING_EXACTPRE_MIN_ITEMS_PER_SM = {(10, 7): 4}
+# sm_107a: one-chunk varlen ring calls with more than this many (sequence,
+# head) items, at least ``_CLAIM_MIN_ITEMS_PER_CTA`` items per CTA of the
+# persistent grid and a state dtype listed in ``_CLAIM_STATE_DTYPES`` take the
+# claim program (``exactpre_<state>_varlen_claim``, :func:`claim_selected`):
+# the two-kernel ring program drawing each CTA's next item at run time from a
+# self-resetting counter (``preprocess_status[1]``) instead of the static
+# grid-stride order, so the CTAs on faster SMs take more items; the bf16
+# program updates the state as the retained start program does (bitwise its
+# outputs), the f32 program as ``exactpre`` does (bitwise its outputs).  On
+# R200, whose SMs do not run at one speed, both are faster than the programs
+# those calls ran before.
+_CLAIM_MIN_ITEMS = {(10, 7): 2048}
+_CLAIM_MIN_ITEMS_PER_CTA = 8
+_CLAIM_STATE_DTYPES = {(10, 7): frozenset({torch.bfloat16, torch.float32})}
+# sm_107a: packed-varlen two-kernel ring calls of many short items take the
+# ``_ibulk`` program (``exactpre_*_varlen_ibulk``, bf16 / f16 state), whose
+# pre_inter warps read each work item's initial state as one 16 KB bulk copy
+# into a state stage (the CTA's first item at role start, every later item
+# while the previous item's last chunk runs) instead of 64 scalar global
+# loads per thread; that per-item load sits on pre_inter, the binding role of
+# short items.  The final state keeps the scalar store.  Taken with at least
+# ``_IBULK_MIN_ITEMS_PER_SM`` items per SM (a CTA runs consecutive items) of
+# at most ``_IBULK_MAX_CHUNKS_PER_ITEM`` host-known chunks; a call with z
+# only with one host-known chunk per item and at least
+# ``_IBULK_Z_MIN_ITEMS_PER_SM`` items per SM, since with fewer items or
+# longer items its epilogue binds and the bulk load gains nothing.  Same
+# outputs bit for bit as the ring program.  Batched calls keep the ring
+# program (no gain measured).
+_IBULK_CAPABILITIES = frozenset({(10, 7)})
+_IBULK_STATE_DTYPES = frozenset({torch.bfloat16, torch.float16})
+_IBULK_MIN_ITEMS_PER_SM = 2
+_IBULK_MAX_CHUNKS_PER_ITEM = 8
+_IBULK_Z_MIN_ITEMS_PER_SM = 8
 
 
 def fused_selected(
@@ -1505,7 +1756,17 @@ def host_chunks_per_item(*, mode_varlen: bool, num_sequences: int, seqlen: int) 
     return -(-mean_tokens // _CHUNK_SIZE)
 
 
-def two_kernel_family(*, mode_varlen: bool, num_sequences: int, seqlen: int) -> str:
+def two_kernel_family(
+    *,
+    mode_varlen: bool,
+    num_sequences: int,
+    seqlen: int,
+    nheads: Optional[int] = None,
+    sm_count: Optional[int] = None,
+    capability: Optional[tuple[int, int]] = None,
+    variant: str = "",
+    state_dtype: Optional[torch.dtype] = None,
+) -> str:
     """Two-kernel program family of a call the chunk-parallel and fused routes
     left on the two-kernel form: ``"exactpre"`` (the round-6 render) where the
     host-known chunks per work item reach ``_TWO_KERNEL_ROUTE_MIN_CHUNKS``,
@@ -1518,12 +1779,236 @@ def two_kernel_family(*, mode_varlen: bool, num_sequences: int, seqlen: int) -> 
     per-sequence lengths live in ``cu_seqlens`` / ``seq_idx`` on the device
     and are not read), and the mean chunk count per item is what the table's
     fixed cost is amortized over.  A ``num_sequences`` of 0 counts as 1.
+    On a ``capability`` of ``_TWO_KERNEL_ONE_CHUNK_MAX_ITEMS`` one-chunk
+    items take ``exactpre`` as well when the call's ``num_sequences x
+    nheads`` items exceed ``sm_count`` and are at most that bound and its
+    scan ``variant`` is the ring schedule (``""``); on a ``capability`` of
+    ``_ONE_CHUNK_EXACTPRE_STATE_DTYPES`` a ``state_dtype`` it lists takes
+    ``exactpre`` above that bound too.
     """
 
     chunks = host_chunks_per_item(
         mode_varlen=mode_varlen, num_sequences=num_sequences, seqlen=seqlen
     )
-    return "exactpre" if chunks >= _TWO_KERNEL_ROUTE_MIN_CHUNKS else "exact"
+    if chunks >= _TWO_KERNEL_ROUTE_MIN_CHUNKS:
+        return "exactpre"
+    max_items = (
+        None
+        if capability is None or nheads is None or sm_count is None
+        else _TWO_KERNEL_ONE_CHUNK_MAX_ITEMS.get(
+            (int(capability[0]), int(capability[1]))
+        )
+    )
+    items = max(int(num_sequences), 1) * int(nheads or 0)
+    if max_items is not None and not variant and sm_count < items <= max_items:
+        return "exactpre"
+    if (
+        max_items is not None
+        and not variant
+        and sm_count < items
+        and state_dtype
+        in _ONE_CHUNK_EXACTPRE_STATE_DTYPES.get(
+            (int(capability[0]), int(capability[1])), ()
+        )
+    ):
+        return "exactpre"
+    return "exact"
+
+
+# sm_107a (R200, 212 SMs) only: calls without ``z`` whose fused program runs
+# without a stage ahead of it -- batched calls, the cu_seqlens form and the
+# seq_idx triple form with a caller ``seq_chunk_cumsum`` -- take the fused
+# program beyond the seed window (:func:`fused_selected`) up to these
+# (sequence, head) item bounds, where the fused kernel's in-CTA dt work costs
+# less than the segment preprocess launch it replaces: batched one-chunk
+# calls up to the seed's 2048 chunk-items, packed-varlen calls up to 512
+# items within the seed's 512 packed chunk-items (sequences of at most one
+# chunk); outputs are bitwise those of the two-kernel ``exactpre`` program.
+# Past these bounds the fused program stops winning.  With ``z`` it loses on
+# most shapes, so calls with ``z`` keep the seed window.
+_FUSED_NO_Z_MAX_ITEMS = {(10, 7): (2048, 512)}  # (batched, varlen)
+
+
+def fused_no_z_extended(
+    *,
+    capability,
+    nheads: int,
+    num_sequences: int,
+    nchunks: int,
+    mode_varlen: bool,
+    total_tokens: int,
+) -> bool:
+    """The fused-window extension of ``capability`` for calls without ``z``
+    (``_FUSED_NO_Z_MAX_ITEMS``; ``False`` on capabilities it does not list):
+    batched one-chunk calls (``nchunks`` 1) with at most its batched item
+    bound and ``_FUSED_ROUTE_MAX_CHUNK_ITEMS_BATCHED`` chunk-items;
+    packed-varlen calls with at most its varlen item bound and
+    ``_FUSED_ROUTE_MAX_CHUNK_ITEMS_VARLEN`` packed chunk-items.  The runner
+    applies it only where the fused program needs no stage ahead of it and
+    the call has no ``z``."""
+
+    bounds = _FUSED_NO_Z_MAX_ITEMS.get((int(capability[0]), int(capability[1])))
+    if bounds is None:
+        return False
+    max_items_batched, max_items_varlen = bounds
+    items = max(int(num_sequences), 1) * int(nheads)
+    if not mode_varlen:
+        return (
+            int(nchunks) == 1
+            and items <= max_items_batched
+            and items <= _FUSED_ROUTE_MAX_CHUNK_ITEMS_BATCHED
+        )
+    packed_chunks = -(-int(total_tokens) // _CHUNK_SIZE)
+    return (
+        items <= max_items_varlen
+        and packed_chunks * int(nheads) <= _FUSED_ROUTE_MAX_CHUNK_ITEMS_VARLEN
+    )
+
+
+def claim_selected(
+    *,
+    mode_varlen: bool,
+    num_sequences: int,
+    seqlen: int,
+    nheads: int,
+    sm_count: int,
+    capability: Optional[tuple[int, int]],
+    variant: str,
+    state_dtype: torch.dtype,
+) -> bool:
+    """Whether a two-kernel call runs the claim program
+    (``exactpre_<state>_varlen_claim``): on a ``capability`` of
+    ``_CLAIM_MIN_ITEMS``, a packed-varlen call of the ring schedule
+    (``variant`` ``""``) whose host-known chunks per item
+    (:func:`host_chunks_per_item`, ``seqlen`` the packed token count) is one,
+    with more than that many ``num_sequences x nheads`` items, at least
+    ``_CLAIM_MIN_ITEMS_PER_CTA`` items per CTA of its persistent grid
+    (:func:`_persistent_grid_size`) and a ``state_dtype`` of
+    ``_CLAIM_STATE_DTYPES``."""
+
+    if capability is None or not mode_varlen or variant:
+        return False
+    key = (int(capability[0]), int(capability[1]))
+    min_items = _CLAIM_MIN_ITEMS.get(key)
+    if min_items is None or state_dtype not in _CLAIM_STATE_DTYPES.get(key, ()):
+        return False
+    chunks = host_chunks_per_item(
+        mode_varlen=True, num_sequences=num_sequences, seqlen=seqlen
+    )
+    items = max(int(num_sequences), 1) * int(nheads)
+    grid = _persistent_grid_size(total_work=items, sm_count=int(sm_count))
+    return (
+        chunks == 1 and items > min_items and items >= _CLAIM_MIN_ITEMS_PER_CTA * grid
+    )
+
+
+def ibulk_selected(
+    *,
+    capability: tuple[int, int],
+    state_dtype: torch.dtype,
+    mode_varlen: bool,
+    total_work: int,
+    chunks_per_item: int,
+    sm_count: int,
+    has_z: bool,
+) -> bool:
+    """Whether a two-kernel ring call (``exactpre``, variant ``""``) takes the
+    ``_ibulk`` program: a packed-varlen call on a ``_IBULK_CAPABILITIES``
+    device with a ``_IBULK_STATE_DTYPES`` state and at least
+    ``_IBULK_MIN_ITEMS_PER_SM`` x ``sm_count`` (sequence, head) items of at
+    most ``_IBULK_MAX_CHUNKS_PER_ITEM`` host-known chunks
+    (:func:`host_chunks_per_item`); a call with z only with one chunk per item
+    and at least ``_IBULK_Z_MIN_ITEMS_PER_SM`` x ``sm_count`` items."""
+
+    if (int(capability[0]), int(capability[1])) not in _IBULK_CAPABILITIES:
+        return False
+    if not mode_varlen or state_dtype not in _IBULK_STATE_DTYPES:
+        return False
+    if has_z and (
+        chunks_per_item > 1 or total_work < _IBULK_Z_MIN_ITEMS_PER_SM * sm_count
+    ):
+        return False
+    return (
+        total_work >= _IBULK_MIN_ITEMS_PER_SM * sm_count
+        and chunks_per_item <= _IBULK_MAX_CHUNKS_PER_ITEM
+    )
+
+
+# sm_107a: packed-varlen fused ring calls (``exactfused_*`` varlen: the
+# cu_seqlens form and the seq_idx triple form with a caller
+# ``seq_chunk_cumsum``) with initial states, items of one host-known chunk
+# and more (sequence, head) items than SMs take the fused ``_ibulk`` program
+# (``exactfused_*_varlen_ibulk``, bf16 / f16 state): its pre_inter warps
+# read each work item's initial state as one 16 KB bulk copy through the
+# state stage -- the CTA's first item's at role start, every later item's
+# while the previous item's last chunk runs -- instead of 64 scalar global
+# loads per thread.  Same outputs bit for bit as the ring program.  Calls
+# with at most one item per SM (no CTA runs a second item), items of several
+# chunks and calls without initial states keep the ring program (no gain
+# measured).
+_FUSED_IBULK_CAPABILITIES = frozenset({(10, 7)})
+_FUSED_IBULK_MAX_CHUNKS_PER_ITEM = 1
+
+
+def fused_ibulk_selected(
+    *,
+    capability: tuple[int, int],
+    state_dtype: torch.dtype,
+    has_initial_states: bool,
+    total_work: int,
+    chunks_per_item: int,
+    sm_count: int,
+) -> bool:
+    """Whether a packed-varlen fused ring call (``exactfused``, variant
+    ``""``) takes the fused ``_ibulk`` program: on a
+    ``_FUSED_IBULK_CAPABILITIES`` device, with a ``_IBULK_STATE_DTYPES``
+    state, initial states, more than ``sm_count`` (sequence, head) items and
+    at most ``_FUSED_IBULK_MAX_CHUNKS_PER_ITEM`` host-known chunks per item
+    (:func:`host_chunks_per_item`)."""
+
+    if (int(capability[0]), int(capability[1])) not in _FUSED_IBULK_CAPABILITIES:
+        return False
+    if not has_initial_states or state_dtype not in _IBULK_STATE_DTYPES:
+        return False
+    return total_work > sm_count and chunks_per_item <= _FUSED_IBULK_MAX_CHUNKS_PER_ITEM
+
+
+# sm_107a: the one-launch ring programs (``exactone_<state>_varlen``) in
+# two further prologue forms, each a program of its own chosen by the
+# launch grid (:func:`_persistent_grid_size`).  Below
+# ``_EXACTONE_TABLE_ROLES_MIN_GRID`` CTAs ``tablefirst``: the CTA derives
+# its private sequence table before the barrier setup, so the derivation's
+# two dependent table loads overlap the mbarrier init and the TMEM alloc.
+# From it on ``tableroles``: each role passes the table barrier right
+# before its work loop instead of in the prologue, so its entry code runs
+# while the derivation's loads are in flight.  Integer table plumbing only:
+# the outputs are bitwise those of the ``exactone`` program.  The
+# ``noring`` calls keep their program.
+_EXACTONE_TABLE_ROLES_MIN_GRID = {(10, 7): 128}
+_EXACTONE_TABLE_STATE_DTYPES = frozenset({torch.bfloat16, torch.float16, torch.float32})
+
+
+def exactone_table_variant(
+    *,
+    capability: Optional[tuple[int, int]],
+    variant: str,
+    state_dtype: torch.dtype,
+    grid: int,
+) -> str:
+    """The variant of a one-launch (``exactone``) call: on a capability of
+    ``_EXACTONE_TABLE_ROLES_MIN_GRID``, a ring call (``variant`` ``""``)
+    of a ``_EXACTONE_TABLE_STATE_DTYPES`` state takes ``"tablefirst"`` at a
+    launch ``grid`` below that many CTAs and ``"tableroles"`` from it on;
+    every other call keeps ``variant``."""
+
+    if capability is None or variant or state_dtype not in _EXACTONE_TABLE_STATE_DTYPES:
+        return variant
+    roles_min = _EXACTONE_TABLE_ROLES_MIN_GRID.get(
+        (int(capability[0]), int(capability[1]))
+    )
+    if roles_min is None:
+        return variant
+    return "tablefirst" if grid < roles_min else "tableroles"
 
 
 # Tail-wave pair program (``_tail``): the two-kernel exact-scan kernel launched
@@ -1562,20 +2047,41 @@ class _TailFullGridRule:
     varlen chunk floor is 8: 256-item varlen calls of 8 chunks win 1.03-1.08x
     (perf_varlen_32x8, nem_v1024x2) and no varlen call above one item per SM
     with 8 chunks lies inside the fused window; the batched floor stays 16
-    (an 8-chunk batched call up to 256 items is a fused-window call)."""
+    (an 8-chunk batched call up to 256 items is a fused-window call).
+
+    The varlen pair render's cost is per item, so varlen calls without ``z``
+    whose items span at least ``long_chunks_varlen`` chunks spread it over
+    more chunk steps and take the smaller ``render_penalty_varlen_long``:
+    with the current varlen pair render those calls run faster on the pair
+    program in every call form, head count and state dtype measured, outputs
+    bitwise identical.  8-chunk items keep the larger penalty, and so do
+    calls with ``z``, whose pair epilogue gains little or nothing there.  The
+    rule reads the mean chunks per item: random sequence lengths win as much
+    as equal ones, but lengths that alternate long and short by sequence load
+    whole pairs unevenly and run slower on the pair program."""
 
     min_chunks_batched: int
     min_chunks_varlen: int
     render_penalty_batched: float
     render_penalty_varlen: float
+    long_chunks_varlen: int
+    render_penalty_varlen_long: float
 
     def min_chunks(self, mode_varlen: bool) -> int:
         return self.min_chunks_varlen if mode_varlen else self.min_chunks_batched
 
-    def render_penalty(self, mode_varlen: bool) -> float:
-        return (
-            self.render_penalty_varlen if mode_varlen else self.render_penalty_batched
-        )
+    def render_penalty(
+        self, mode_varlen: bool, chunks_per_item: int = 0, has_z: bool = False
+    ) -> float:
+        """The render penalty of the call form; a varlen call without ``z``
+        of at least ``long_chunks_varlen`` chunks per item takes the long-item
+        penalty."""
+
+        if not mode_varlen:
+            return self.render_penalty_batched
+        if not has_z and chunks_per_item >= self.long_chunks_varlen:
+            return self.render_penalty_varlen_long
+        return self.render_penalty_varlen
 
 
 # sm_107a (R200, 212 SMs) only; the Blackwell rule keeps the balanced-grid
@@ -1586,6 +2092,8 @@ _TAIL_FULL_GRID_RULES: dict[tuple[int, int], _TailFullGridRule] = {
         min_chunks_varlen=8,
         render_penalty_batched=1 / 12,
         render_penalty_varlen=1 / 5,
+        long_chunks_varlen=16,
+        render_penalty_varlen_long=1 / 8,
     ),
 }
 
@@ -1603,6 +2111,7 @@ def _full_grid_tail_selected(
     chunks_per_item: int,
     sm_count: int,
     mode_varlen: bool,
+    has_z: bool = False,
 ) -> bool:
     """:class:`_TailFullGridRule` on a call whose balanced grid is the full
     device: the pair makespan (half-item rounds) grown by the measured render
@@ -1617,13 +2126,15 @@ def _full_grid_tail_selected(
     pair_makespan = pair_rounds / 2
     hand_off = (pair_rounds % 2) / chunks_per_item
     return (
-        pair_makespan * (1.0 + rule.render_penalty(mode_varlen)) + hand_off
+        pair_makespan * (1.0 + rule.render_penalty(mode_varlen, chunks_per_item, has_z))
+        + hand_off
         < persistent_makespan
     )
 
 
 def _tail_grid_size(*, sm_count: int) -> int:
-    """Grid of a ``_tail`` program: one 2-CTA cluster per SM pair."""
+    """Grid of a ``_tail`` program (one 2-CTA cluster per SM pair) and of its
+    one-CTA form ``_tailone`` (CTAs ``2 p`` and ``2 p + 1`` pair ``p``)."""
 
     return 2 * (sm_count // 2)
 
@@ -1635,6 +2146,7 @@ def tail_selected(
     sm_count: int,
     mode_varlen: bool = False,
     full_grid_rule: Optional[_TailFullGridRule] = None,
+    has_z: bool = False,
 ) -> bool:
     """Whether a two-kernel exact-scan call of ``total_work`` (sequence, head)
     items with ``chunks_per_item`` host-known chunks per item
@@ -1644,7 +2156,8 @@ def tail_selected(
     2`` (half items count) is below the persistent program's ``ceil(items /
     grid)``.  A call whose balanced grid is the full device takes the pair
     program only under ``full_grid_rule`` (:class:`_TailFullGridRule`, the
-    sm_107a admission; ``None`` -- the Blackwell default -- never)."""
+    sm_107a admission, which also reads whether the call has ``z``; ``None``
+    -- the Blackwell default -- never)."""
 
     pairs = sm_count // 2
     if pairs < 1 or total_work <= sm_count:
@@ -1657,12 +2170,54 @@ def tail_selected(
             chunks_per_item=chunks_per_item,
             sm_count=sm_count,
             mode_varlen=mode_varlen,
+            has_z=has_z,
         )
     if chunks_per_item < _TAIL_MIN_CHUNKS:
         return False
     persistent_makespan = -(-total_work // balanced_grid)
     pair_makespan = -(-total_work // pairs) / 2
     return pair_makespan < persistent_makespan
+
+
+# The one-CTA form of the varlen pair program (``_tailone``, sm_107a only):
+# the same pair plan, scan and hand-off over global memory as ``_tail``,
+# launched on the same even grid without the 2-CTA cluster.  CTAs ``2 p`` and
+# ``2 p + 1`` form pair ``p``; each draws its rank from the pair's ticket word
+# in ``preprocess_status`` (the first to draw runs the split item's head), and
+# the receiver of a split item waits on the pair's flag bit, which the head's
+# CTA sets once the parked state is in global memory.  The receiver only waits
+# on a partner that has already drawn its ticket (so it is running), and the
+# head's CTA waits on no other CTA: no co-residency is assumed.  Every complete
+# launch leaves the ticket word and the flag bit 0.  Measured on R200: faster
+# than the 2-CTA cluster launch on the 256-item varlen calls of 8 chunks
+# (perf_varlen_32x8 without z, nem_v1024x2 with z), slower on varlen calls of
+# 32 chunks, which keep the cluster program.
+_TAIL_ONE_CTA_CAPABILITIES = frozenset({(10, 7)})
+
+
+def tail_one_cta_selected(
+    *,
+    capability: Optional[Tuple[int, int]],
+    mode_varlen: bool,
+    chunks_per_item: int,
+) -> bool:
+    """Whether a call :func:`tail_selected` sends to the ``_tail`` pair
+    program runs its one-CTA form ``_tailone`` instead: on SM107, packed
+    varlen, with or without ``z``, items of fewer host-known chunks
+    (:func:`host_chunks_per_item`) than the full-grid admission's
+    ``long_chunks_varlen`` (:class:`_TailFullGridRule`).  Outputs are bitwise
+    those of the pair program."""
+
+    if capability is None:
+        return False
+    key = (int(capability[0]), int(capability[1]))
+    rule = _TAIL_FULL_GRID_RULES.get(key)
+    return (
+        key in _TAIL_ONE_CTA_CAPABILITIES
+        and rule is not None
+        and mode_varlen
+        and chunks_per_item < rule.long_chunks_varlen
+    )
 
 
 def _sequence_arguments(
@@ -1766,12 +2321,18 @@ def _nvcc() -> Path:
     return Path(candidate).resolve()
 
 
-def _render_host_source(template: str, name: str, program: _Program) -> str:
+def _render_host_source(
+    template: str, name: str, program: _Program, *, main_pdl: bool = False
+) -> str:
     """Substitute one program's table values into the shared launcher.
 
     The program name becomes part of the launcher namespace so the inline
     launch helpers (and their function-local static kernel handles) of one
-    loaded program library are never unified with another's.
+    loaded program library are never unified with another's.  A template
+    with the ``CAKE_SSD_MAIN_PDL_LAUNCH`` statement ahead of its stream-ordered
+    main launch gets, with ``main_pdl`` (:func:`_main_pdl`), the same launch
+    through the extended launch API with the programmatic stream
+    serialization attribute (and returns), else a comment.
     """
 
     values = {
@@ -1785,6 +2346,27 @@ def _render_host_source(template: str, name: str, program: _Program) -> str:
         "CAKE_SSD_STATE_DTYPE_BITS": str(program.state_dtype_bits),
         "CAKE_SSD_MAIN_SMEM_BYTES": str(program.main_smem_bytes),
     }
+    if main_pdl or "CAKE_SSD_MAIN_PDL_LAUNCH" in template:
+        values["CAKE_SSD_MAIN_PDL_LAUNCH"] = (
+            "{\n"
+            "    // Programmatic dependent launch after the preprocess stage: the main\n"
+            "    // kernel's griddepcontrol.wait orders its accesses to the preprocess outputs.\n"
+            "    tvm::ffi::cuda_api::LaunchConfig config{};\n"
+            "    tvm::ffi::cuda_api::LaunchAttrType attr{};\n"
+            "    tvm::ffi::cuda_api::ConstructLaunchConfig(prepared.kernel->GetHandle(), "
+            f"stream, {program.main_smem_bytes}u, prepared.grid, prepared.block, 1, "
+            "config, attr);\n"
+            "    attr.id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;\n"
+            "    attr.value.programmaticStreamSerializationAllowed = 1;\n"
+            "    config.attrs = &attr;\n"
+            "    config.numAttrs = 1;\n"
+            "    TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(\n"
+            "        prepared.kernel->LaunchEx(prepared.kargs, config));\n"
+            "    return;\n"
+            "  }"
+            if main_pdl
+            else "// Stream-ordered main launch."
+        )
     source = template
     for placeholder in sorted(values, key=len, reverse=True):
         if placeholder not in source:
@@ -1951,11 +2533,13 @@ def _load_generated_program(name: str, arch: str):
     """Build one program for ``arch``; the loaded module serves every device."""
 
     program = _arch_program(name, arch)
+    main_pdl = _main_pdl(name, arch)
     source_dir = _source_dir()
     host_source = _render_host_source(
         (source_dir / program.host_template).read_text(encoding="utf-8"),
         name,
         program,
+        main_pdl=main_pdl,
     )
     nvcc = _nvcc()
     digest = hashlib.sha256()
@@ -1965,8 +2549,19 @@ def _load_generated_program(name: str, arch: str):
     device_sources: list[tuple[_Kernel, Path]] = []
     for kernel in program.kernels:
         source_path = source_dir / _DEVICE_DIR / kernel.source
+        source_bytes = source_path.read_bytes()
+        if (
+            main_pdl
+            and kernel is program.main
+            and b"griddepcontrol.wait" not in source_bytes
+        ):
+            raise RuntimeError(
+                f"Cake SSDCombined {name} ({arch}) launches its main kernel "
+                f"with programmatic dependent launch, but {kernel.source} "
+                "never waits on the preprocess grid"
+            )
         digest.update(kernel.module.encode())
-        digest.update(source_path.read_bytes())
+        digest.update(source_bytes)
         digest.update("\0".join(kernel.compile_flags).encode())
         device_sources.append((kernel, source_path))
 
@@ -2255,17 +2850,30 @@ class CakeSSDCombined:
         self._allocations_in_last_run += 1
 
     def _preprocess_status_buffer(self, device: torch.device) -> torch.Tensor:
-        """The runner-owned ``preprocess_status`` word (one int32 per device).
+        """The runner-owned ``preprocess_status`` words (int32, per device).
 
-        The preprocess stores 1 into it when a packed-sequence id is out of
-        range or non-monotonic (see the class docstring); it is allocated
+        The preprocess stores 1 into word 0 when a packed-sequence id is out of
+        range or non-monotonic (see the class docstring).  Word 1 is the item
+        counter the sm_107a claim programs draw from (:func:`claim_selected`).
+        The sm_107a one-CTA pair programs (:func:`tail_one_cta_selected`) use
+        the words after them, sized by the device's tail grid
+        (:func:`_tail_grid_size`): pair ``p``'s rank ticket in word ``2 + p``,
+        its hand-off flag in bit ``p % 32`` of word ``2 + pairs + p // 32``
+        (on 212 SMs 112 words, within one 512-byte allocator block like the
+        two words alone).  Every complete launch leaves word 1 and the words
+        after it 0, so a stream's launches see them 0.
+        Like the runner's other per-device workspace (the delta and cumsum
+        tiles, the grid barriers), the words serve one stream at a time: a
+        runner is not used concurrently on two streams.  Both are allocated
         zeroed once per device and never read on the launch path.
         """
 
         status = self._preprocess_status.get(device.index)
         if status is None:
-            self._allocating("the preprocess status word")
-            status = torch.zeros(1, dtype=torch.int32, device=device)
+            self._allocating("the preprocess status words")
+            pairs = _tail_grid_size(sm_count=_sm_count(device.index)) // 2
+            words = 2 + pairs + (pairs + 31) // 32
+            status = torch.zeros(words, dtype=torch.int32, device=device)
             self._preprocess_status[device.index] = status
         return status
 
@@ -2288,7 +2896,7 @@ class CakeSSDCombined:
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
         status = self._preprocess_status_buffer(device)
-        value = int(status.item())
+        value = int(status[0].item())
         if reset:
             status.zero_()
         return value
@@ -2307,6 +2915,7 @@ class CakeSSDCombined:
         workspace: dict[str, Any],
         name: str,
         value: Optional[torch.Tensor],
+        align: int = 1,
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Resolve graph-stable packed storage for a public strided input.
 
@@ -2317,10 +2926,11 @@ class CakeSSDCombined:
         dtype) lives in the workspace for its lifetime and is never replaced,
         so the address a captured graph copies into stays valid when a later
         eager call of the same shape brings, say, a bf16 ``dt`` instead of an
-        f32 one.
+        f32 one.  ``align`` is the byte alignment the program needs of the
+        bound address: a contiguous input at a lesser one is copied too.
         """
 
-        if value is None or value.is_contiguous():
+        if value is None or (value.is_contiguous() and value.data_ptr() % align == 0):
             return value, None
         buffers: dict[tuple[str, tuple[int, ...], torch.dtype], torch.Tensor]
         buffers = workspace["contiguous"]
@@ -2446,6 +3056,21 @@ class CakeSSDCombined:
                 total_tokens=batch * seqlen,
             )
         )
+        if (
+            not fused
+            and not chunk_parallel
+            and not derives_table
+            and not self.has_z
+            and fused_no_z_extended(
+                capability=capability,
+                nheads=self.nheads,
+                num_sequences=num_sequences,
+                nchunks=nchunks,
+                mode_varlen=self.has_varlen,
+                total_tokens=batch * seqlen,
+            )
+        ):
+            fused = True
         # The two-kernel pair program (``tail_selected``) is judged after the
         # fused route and before the ring / noring choice; its route and the
         # retained ``exact`` family are disjoint (16 chunks per item imply
@@ -2464,6 +3089,7 @@ class CakeSSDCombined:
                 sm_count=sm_count,
                 mode_varlen=self.has_varlen,
                 full_grid_rule=tail_full_grid_rule(capability),
+                has_z=self.has_z,
             )
         )
         variant = (
@@ -2483,6 +3109,56 @@ class CakeSSDCombined:
                 state_dtype=self.state_dtype,
             )
         )
+        # sm_107a: the start schedule of a packed-varlen call outside the
+        # fused window gives way to the ring ``exactpre`` program above
+        # ``_NORING_RING_EXACTPRE_MIN_ITEMS_PER_SM`` items per SM (judged
+        # before the retained-noring rule below, on the forms that rule
+        # sends to the fused program).
+        ring_items_per_sm = _NORING_RING_EXACTPRE_MIN_ITEMS_PER_SM.get(
+            (int(capability[0]), int(capability[1]))
+        )
+        if (
+            ring_items_per_sm is not None
+            and self.has_varlen
+            and not chunk_parallel
+            and not fused
+            and not tail
+            and variant == "noring"
+            and (not derives_table or light_stage or one_launch)
+            and num_sequences * self.nheads > ring_items_per_sm * sm_count
+            and two_kernel_family(
+                mode_varlen=self.has_varlen,
+                num_sequences=num_sequences,
+                seqlen=batch * seqlen,
+                nheads=self.nheads,
+                sm_count=sm_count,
+                capability=capability,
+                variant="",
+                state_dtype=self.state_dtype,
+            )
+            == "exactpre"
+        ):
+            variant = ""
+        if (
+            tuple(capability) in _NORING_RETAINED_FUSED
+            and not chunk_parallel
+            and not fused
+            and not tail
+            and variant == "noring"
+            and two_kernel_family(
+                mode_varlen=self.has_varlen,
+                num_sequences=num_sequences,
+                seqlen=batch * seqlen if self.has_varlen else seqlen,
+                nheads=self.nheads,
+                sm_count=sm_count,
+                capability=capability,
+                variant=variant,
+                state_dtype=self.state_dtype,
+            )
+            == "exact"
+            and (not derives_table or light_stage or one_launch)
+        ):
+            fused = True
         if chunk_parallel:
             program_family = family
         elif fused:
@@ -2493,12 +3169,90 @@ class CakeSSDCombined:
                 if one_launch
                 else "exactfused"
             )
+            if (
+                program_family == "exactfused"
+                and self.has_varlen
+                and not variant
+                and fused_ibulk_selected(
+                    capability=capability,
+                    state_dtype=self.state_dtype,
+                    has_initial_states=self.has_initial_states,
+                    total_work=num_sequences * self.nheads,
+                    chunks_per_item=host_chunks_per_item(
+                        mode_varlen=True,
+                        num_sequences=num_sequences,
+                        # packed varlen: x is [1, total tokens, nheads, 64]
+                        seqlen=batch * seqlen,
+                    ),
+                    sm_count=sm_count,
+                )
+            ):
+                variant = "ibulk"
         else:
             program_family = two_kernel_family(
                 mode_varlen=self.has_varlen,
                 num_sequences=num_sequences,
                 # packed varlen: x is [1, total tokens, nheads, 64]
                 seqlen=batch * seqlen if self.has_varlen else seqlen,
+                nheads=self.nheads,
+                sm_count=sm_count,
+                capability=capability,
+                variant=variant,
+                state_dtype=self.state_dtype,
+            )
+            if claim_selected(
+                mode_varlen=self.has_varlen,
+                num_sequences=num_sequences,
+                seqlen=batch * seqlen,
+                nheads=self.nheads,
+                sm_count=sm_count,
+                capability=capability,
+                variant=variant,
+                state_dtype=self.state_dtype,
+            ):
+                program_family, variant = "exactpre", "claim"
+            # The initial-state bulk program takes the ring calls the claim
+            # rule leaves: a call both rules admit keeps the claim program.
+            if (
+                program_family == "exactpre"
+                and not variant
+                and ibulk_selected(
+                    capability=capability,
+                    state_dtype=self.state_dtype,
+                    mode_varlen=self.has_varlen,
+                    total_work=num_sequences * self.nheads,
+                    chunks_per_item=host_chunks_per_item(
+                        mode_varlen=self.has_varlen,
+                        num_sequences=num_sequences,
+                        # packed varlen: x is [1, total tokens, nheads, 64]
+                        seqlen=batch * seqlen if self.has_varlen else seqlen,
+                    ),
+                    sm_count=sm_count,
+                    has_z=self.has_z,
+                )
+            ):
+                variant = "ibulk"
+            # sm_107a: the pair calls ``tail_one_cta_selected`` admits run the
+            # pair program's one-CTA form.
+            if variant == "tail" and tail_one_cta_selected(
+                capability=capability,
+                mode_varlen=self.has_varlen,
+                chunks_per_item=host_chunks_per_item(
+                    mode_varlen=self.has_varlen,
+                    num_sequences=num_sequences,
+                    # packed varlen: x is [1, total tokens, nheads, 64]
+                    seqlen=batch * seqlen if self.has_varlen else seqlen,
+                ),
+            ):
+                variant = "tailone"
+        if program_family == "exactone":
+            variant = exactone_table_variant(
+                capability=capability,
+                variant=variant,
+                state_dtype=self.state_dtype,
+                grid=_persistent_grid_size(
+                    total_work=num_sequences * self.nheads, sm_count=sm_count
+                ),
             )
         workspace: dict[str, Any] = {
             "program": _program_name(
@@ -3218,8 +3972,10 @@ class CakeSSDCombined:
         # graph-stable storage.  Resolve the storage now; copy later, together.
         pending_copies: list[tuple[torch.Tensor, torch.Tensor]] = []
 
-        def packed(name: str, value: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-            buffer, source = self._contiguous_input(workspace, name, value)
+        def packed(
+            name: str, value: Optional[torch.Tensor], align: int = 1
+        ) -> Optional[torch.Tensor]:
+            buffer, source = self._contiguous_input(workspace, name, value, align)
             if source is not None:
                 assert buffer is not None
                 pending_copies.append((buffer, source))
@@ -3230,7 +3986,13 @@ class CakeSSDCombined:
         D = packed("D", D)
         z = packed("z", z)
         dt_bias = packed("dt_bias", dt_bias)
-        initial_states = packed("initial_states", initial_states)
+        # The ``_ibulk`` programs read an item's initial state with one bulk
+        # copy, which needs a 16-byte aligned address.
+        initial_states = packed(
+            "initial_states",
+            initial_states,
+            16 if program.variant == "ibulk" else 1,
+        )
         seq_idx = packed("seq_idx", seq_idx)
         chunk_indices = packed("chunk_indices", chunk_indices)
         chunk_offsets = packed("chunk_offsets", chunk_offsets)
@@ -3322,6 +4084,13 @@ class CakeSSDCombined:
             dt_bias_float = workspace["dt_bias_float"]
             pending_copies.append((dt_bias_float, dt_bias))
         preprocess_status = self._preprocess_status_buffer(x.device)
+        # The sm_107a preprocess loads the dt rows of an aligned segment table
+        # before it reads the table, bounded by its ``seqlen`` argument; the
+        # batched form uses ``seqlen`` for nothing else, so there it is the
+        # token count of all rows.
+        preprocess_seqlen = seqlen
+        if arch == _SM107_ARCH and not mode_varlen:
+            preprocess_seqlen = batch * seqlen
         preprocess_values, preprocess_grid = _direct_preprocess_inputs(
             dt=dt_float,
             A=A,
@@ -3334,7 +4103,7 @@ class CakeSSDCombined:
             cumsum=workspace["cumsum"],
             num_segments=num_segments,
             nheads=self.nheads,
-            seqlen=seqlen,
+            seqlen=preprocess_seqlen,
             mode_varlen=mode_varlen,
             dt_softplus=bool(dt_softplus),
             dt_limit=(dt_min, dt_max),
@@ -3395,9 +4164,10 @@ class CakeSSDCombined:
             # cu_seqlens form may never address; the kernel reads the real
             # tile count from ``seq_chunk_cumsum[sequence_count]``.
             grid = max(1, min(num_segments * self.nheads, sm_count))
-        elif program.variant == "tail":
-            # One 2-CTA cluster per SM pair; the pair plan is computed in-kernel
-            # from this grid (``tail_selected`` chose the program).
+        elif program.variant in ("tail", "tailone"):
+            # One 2-CTA cluster (``_tailone``: one CTA pair) per SM pair; the
+            # pair plan is computed in-kernel from this grid (``tail_selected``
+            # chose the program).
             grid = _tail_grid_size(sm_count=sm_count)
         else:
             grid = _persistent_grid_size(

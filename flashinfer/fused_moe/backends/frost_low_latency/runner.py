@@ -140,6 +140,14 @@ class FrostLowLatencyRunner(MoERunner):
         if not self._supports_tc and self.config.routing.top_k > 32:
             raise NotImplementedError("Frost FMA requires top_k <= 32")
         if (
+            self.config.quant.activation is QuantFormat.MXFP8
+            and self.config.routing.top_k > self.config.routing.num_experts
+            and self.config.routing.top_k > 32
+        ):
+            raise NotImplementedError(
+                "Frost MX with top_k > num_experts requires top_k <= 32"
+            )
+        if (
             arch == (9, 0)
             and not self._fp4_weight_only
             and self.config.quant.weight
@@ -198,6 +206,15 @@ class FrostLowLatencyRunner(MoERunner):
                 "frost_low_latency requires intermediate_size divisible by 32"
             )
 
+    @property
+    def _supports_mx_tc(self):
+        # MX Tensor Core Geometry requires top_k <= E; repeated routes remain
+        # valid through FMA (up to 32 slots), including when top_k exceeds E.
+        return (
+            self._supports_tc
+            and self.config.routing.top_k <= self.config.routing.num_experts
+        )
+
     def _build(self):
         pass
 
@@ -227,10 +244,10 @@ class FrostLowLatencyRunner(MoERunner):
     def _cache_key_extras(self):
         return super()._cache_key_extras() + (
             # Do not reuse winners selected with the deferred individual-call timer.
-            "fp8-grouped-tc-v3"
+            "fp8-grouped-tc-w8-weight-first-v6"
             if self.config.quant.weight is QuantFormat.FP8PerTensor
             and self.config.quant.activation is QuantFormat.FP8PerTensor
-            else "block-fp8-grouped-tc-v1"
+            else "block-fp8-grouped-tc-w8-batch-v3"
             if self.config.quant.weight is QuantFormat.DeepSeekFp8
             else "mxint4-load-width-v1"
             if self.config.quant.weight is QuantFormat.MXINT4
@@ -238,17 +255,21 @@ class FrostLowLatencyRunner(MoERunner):
                 "fp4-route-reuse-load-width-lut-fp16-v8"
                 if self._fp4_weight_only
                 else (
-                    "w8a16-route-group-v1"
+                    "w8a16-grouped-tc-hopper-k256-v22"
                     if self.config.quant.weight is QuantFormat.FP8PerTensor
                     and self.config.quant.activation
                     in (QuantFormat.BF16, QuantFormat.FP16)
                     else (
-                        "bf16-grouped-tc-v6"
+                        "bf16-grouped-tc-w8-weight-first-v16"
                         if self.config.quant.weight is QuantFormat.BF16
                         else (
-                            "fp16-grouped-tc-v4"
+                            "fp16-grouped-tc-w8-weight-first-v14"
                             if self.config.quant.weight is QuantFormat.FP16
-                            else "unified-fma-tc-standard-timing-v5"
+                            else (
+                                "mx-tc-contracts-v6"
+                                if self.config.quant.activation is QuantFormat.MXFP8
+                                else "unified-fma-tc-standard-timing-v5"
+                            )
                         )
                     )
                 )
@@ -304,16 +325,131 @@ class FrostLowLatencyRunner(MoERunner):
         if (
             self.config.quant.weight is QuantFormat.FP8PerTensor
             and self.config.quant.activation in (QuantFormat.BF16, QuantFormat.FP16)
+            and self.config.quant.output is self.config.quant.activation
+            and capability == (9, 0)
+            and (
+                inputs[0].shape == (8, 2048)
+                or (
+                    inputs[0].shape == (4, 2048)
+                    and self.config.quant.activation is QuantFormat.BF16
+                    and self.config.activation == GeGLU()
+                )
+            )
+            and self.config.experts.intermediate_size == 512
+            and self.config.routing.top_k == 10
+            and (
+                self.config.activation in (SwiGLU(), GeGLU())
+                or (
+                    self.config.quant.activation is QuantFormat.BF16
+                    and self.config.activation in (ReLU2(), SiLU())
+                )
+            )
+            and self.config.finalize.do_finalize
+        ):
+            # Reused experts amortize typed fragment conversion. Keep FMA for
+            # sparse overlap, and both group sizes for warm/cold variation.
+            tactics = [("ffma", a, b) for a in (1, 2, 4, 8) for b in (1, 2, 4, 8)]
+            if (
+                self.config.quant.activation is QuantFormat.BF16
+                and self.config.activation == GeGLU()
+            ):
+                # Wider K tiles amortize producer synchronization for reused
+                # experts. Keep the existing T8 K128 choice for tuning.
+                tokens = inputs[0].shape[0]
+                tactics.append(("warp_mma", tokens, 2, 256))
+                if tokens == 4:
+                    return tactics
+            return tactics + [
+                ("warp_mma", group, 2, 128)
+                for group in (
+                    (4, 8) if self.config.quant.activation is QuantFormat.FP16 else (8,)
+                )
+            ]
+        if (
+            self.config.quant.weight is QuantFormat.FP8PerTensor
+            and self.config.quant.activation in (QuantFormat.BF16, QuantFormat.FP16)
+            and self.config.quant.output is self.config.quant.activation
+            and capability == (10, 3)
+            and (
+                (
+                    inputs[0].shape in ((4, 2048), (8, 2048))
+                    and self.config.experts.intermediate_size == 512
+                    and self.config.routing.top_k == 10
+                    and (
+                        self.config.activation in (SwiGLU(), GeGLU())
+                        or (
+                            self.config.quant.activation is QuantFormat.FP16
+                            and inputs[0].shape[0] == 8
+                            and self.config.activation in (ReLU2(), SiLU())
+                        )
+                    )
+                )
+                or (
+                    self.config.quant.activation is QuantFormat.BF16
+                    and self.config.activation == SwiGLU()
+                    and (
+                        *inputs[0].shape,
+                        self.config.experts.intermediate_size,
+                        self.config.routing.top_k,
+                    )
+                    == (8, 7168, 2048, 8)
+                )
+            )
+            and self.config.finalize.do_finalize
+        ):
+            # High expert reuse amortizes compact-weight fragment conversion;
+            # partial/disjoint routing still needs all original FMA choices.
+            tactics = [("ffma", a, b) for a in (1, 2, 4, 8) for b in (1, 2, 4, 8)]
+            if inputs[0].shape[0] == 4:
+                stages = (
+                    (2, 4) if self.config.quant.activation is QuantFormat.BF16 else (2,)
+                )
+                return tactics + [("warp_mma", 4, stage, 128) for stage in stages]
+            return tactics + [("warp_mma", 8, 2, 128)]
+        if (
+            self.config.quant.weight is QuantFormat.FP8PerTensor
+            and self.config.quant.activation in (QuantFormat.BF16, QuantFormat.FP16)
             and capability == (12, 0)
             and inputs[0].shape[0] >= 4
         ):
             # T=2 warm reuse gains did not offset its cold-cache regression.
-            return [("ffma", a, b) for a in (1, 2, 4, 8) for b in (1, 2, 4, 8)] + [
+            tactics = [("ffma", a, b) for a in (1, 2, 4, 8) for b in (1, 2, 4, 8)] + [
                 ("ffma", a, b, group)
                 for a in (1, 2, 4)
                 for b in (1, 2, 4, 8)
                 for group in (2, 4)
             ]
+            if (
+                self.config.quant.output is self.config.quant.activation
+                and (
+                    (
+                        inputs[0].shape == (8, 2048)
+                        and self.config.experts.intermediate_size == 512
+                        and self.config.routing.top_k == 10
+                        and (
+                            self.config.activation in (SwiGLU(), GeGLU())
+                            or (
+                                self.config.quant.activation is QuantFormat.FP16
+                                and self.config.activation in (ReLU2(), SiLU())
+                            )
+                        )
+                    )
+                    or (
+                        self.config.activation == SwiGLU()
+                        and (
+                            *inputs[0].shape,
+                            self.config.experts.intermediate_size,
+                            self.config.routing.top_k,
+                        )
+                        == (8, 7168, 2048, 8)
+                    )
+                )
+                and self.config.finalize.do_finalize
+            ):
+                # Shared T8 routes amortize fragment conversion. Preserve all
+                # FMA choices for colder or less-overlapping expert routing.
+                tactics.append(("warp_mma", 8, 2, 128))
+            return tactics
         if self._fp4_weight_only or self.config.quant.weight in (
             QuantFormat.BF16,
             QuantFormat.FP16,
@@ -349,6 +485,14 @@ class FrostLowLatencyRunner(MoERunner):
                     tactics.append(("wgmma", 2, 4, 128))
                 else:
                     tactics += [("warp_mma", group, 2, 128) for group in (2, 4)]
+                    if self.config.activation in (SwiGLU(), SiTU()) or (
+                        inputs[0].shape[0] == 8 and self.config.activation == ReLU2()
+                    ):
+                        # Retain the original schedule for cache/reuse controls;
+                        # serial weight-first is an additional tuning choice.
+                        tactics += [
+                            ("warp_mma", group, 2, 128, True) for group in (2, 4)
+                        ]
             if (
                 capability in ((9, 0), (12, 0))
                 and self.config.quant.weight is QuantFormat.DeepSeekFp8
@@ -466,10 +610,15 @@ class FrostLowLatencyRunner(MoERunner):
                         else ((8, 2, 128), (4, 2, 64), (2, 2, 64), (2, 2, 128))
                     )
                     tactics += [("warp_mma", *choice) for choice in choices]
+                    if inputs[0].shape[0] == 8 and self.config.activation == SwiGLU():
+                        # Keep both weight/activation issue orders available to
+                        # tuning; cold and cache-resident weights prefer different
+                        # schedules. Untuned selection remains the original FMA.
+                        tactics += [("warp_mma", *choice, True) for choice in choices]
             return tactics
         tactics = (
             [k for k in (128, 256) if inputs[0].shape[1] % k == 0]
-            if self._supports_tc
+            if self._supports_mx_tc
             else []
         )
         if self.config.routing.top_k <= 32:
@@ -560,8 +709,11 @@ class FrostLowLatencyRunner(MoERunner):
                 raise ValueError(
                     f"{name} must have shape {shape}, dtype {dtype}, and contiguous storage on {q.device}"
                 )
-            if value.data_ptr() % 16:
-                raise ValueError(f"{name} must be 16-byte aligned")
+            # Packed E2M1 TMA copies require a 32-byte base. MXFP8 values and
+            # the byte-encoded scale tensors retain their 16-byte contract.
+            alignment = 32 if wd is torch.uint8 and name.endswith("_weight") else 16
+            if value.data_ptr() % alignment:
+                raise ValueError(f"{name} must be {alignment}-byte aligned")
         if q.data_ptr() % 16:
             raise ValueError("hidden_states_q must be 16-byte aligned")
 
@@ -678,9 +830,12 @@ class FrostLowLatencyRunner(MoERunner):
                         QuantFormat.FP8PerTensor,
                         QuantFormat.DeepSeekFp8,
                     )
-                    or not self._supports_tc
+                    or not self._supports_mx_tc
                     else 128
                 )
-        if not self._supports_tc and not isinstance(tactic, tuple):
-            raise ValueError("Frost Tensor Core tactics require SM100, SM103 or SM107")
+        if not self._supports_mx_tc and not isinstance(tactic, tuple):
+            raise ValueError(
+                "Frost MX Tensor Core tactics require SM100, SM103 or SM107 "
+                "and top_k <= num_experts"
+            )
         return execute(inputs, self.config, tactic)

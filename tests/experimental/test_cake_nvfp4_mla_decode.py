@@ -57,12 +57,19 @@ ITEM_FIELDS = cake_backend.ITEM_FIELDS
 MAX_SPLITS = cake_backend.MAX_SPLITS
 PAGE_SIZE = cake_backend.PAGE_SIZE
 QK_AHEAD_RECORD = cake_backend.QK_AHEAD_RECORD
+REDUCE_GENERAL_RECORD = cake_backend.REDUCE_GENERAL_RECORD
 REDUCE_HEADS_PER_CTA = cake_backend.REDUCE_HEADS_PER_CTA
 ROW_BYTES = cake_backend.ROW_BYTES
+ROWS_PER_CTA = cake_backend.ROWS_PER_CTA
 ROWS_PER_TILE = cake_backend.ROWS_PER_TILE
 SF_ROW_BYTES = cake_backend.SF_ROW_BYTES
 SF_VEC = cake_backend.SF_VEC
+SHORT_EPI_RECORD = cake_backend.SHORT_EPI_RECORD
+SHORT_EPI_SPEC_RECORD = cake_backend.SHORT_EPI_SPEC_RECORD
+SHORT_RECORD = cake_backend.SHORT_RECORD
+SHORT_SPEC_RECORD = cake_backend.SHORT_SPEC_RECORD
 V_HALVES = cake_backend.V_HALVES
+XV_RECORD = cake_backend.XV_RECORD
 build_work_plan = cake_backend.build_work_plan
 check_pairs = cake_backend.check_pairs
 host_tables = cake_backend.host_tables
@@ -72,9 +79,34 @@ max_nvfp4_mla_decode_workspace_size = cake_backend.max_nvfp4_mla_decode_workspac
 nvfp4_mla_decode_workspace_size = cake_backend.nvfp4_mla_decode_workspace_size
 quantize_nvfp4 = cake_backend.quantize_nvfp4
 select_decode_record = cake_backend.select_decode_record
+select_reduce_record = cake_backend.select_reduce_record
 token_splits = cake_backend.token_splits
 work_table_rows = cake_backend.work_table_rows
 workspace_layout = cake_backend.workspace_layout
+
+# The registry's further records: their stage, architectures and build
+# keywords over the stage record's build.
+FURTHER_RECORDS = {
+    QK_AHEAD_RECORD: ("decode", ("sm_100a",), {"qk_ahead": True, "xv": True}),
+    XV_RECORD: ("decode", ("sm_103a",), {"xv": True}),
+    SHORT_RECORD: ("decode", cake_jit.ARCHES, {"short_rows": True}),
+    SHORT_EPI_RECORD: (
+        "decode",
+        cake_jit.ARCHES,
+        {"short_rows": True, "epi_warp": True},
+    ),
+    SHORT_SPEC_RECORD: (
+        "decode",
+        cake_jit.ARCHES,
+        {"short_rows": True, "spec_uh": True},
+    ),
+    SHORT_EPI_SPEC_RECORD: (
+        "decode",
+        cake_jit.ARCHES,
+        {"short_rows": True, "epi_warp": True, "spec_uh": True},
+    ),
+    REDUCE_GENERAL_RECORD: ("reduce", cake_jit.ARCHES, {"general_splits": True}),
+}
 
 ATOL = RTOL = 0.1
 REL_L2_MAX = 0.05
@@ -156,30 +188,38 @@ def reference(
     return O.to(torch.bfloat16), LSE
 
 
-def make_inputs(kv_lens, num_heads, *, q_len, enable_sink, device, seed=0):
-    """Deterministic NVFP4 paged decode inputs with a peaked softmax."""
-    gen = torch.Generator(device=device).manual_seed(seed)
+def make_inputs(
+    kv_lens, num_heads, *, q_len, enable_sink, device, seed=0, rng_device=None
+):
+    """Deterministic NVFP4 paged decode inputs with a peaked softmax.
+
+    ``rng_device="cpu"`` draws them on the host, so every GPU sees the same
+    inputs (a CUDA generator's stream depends on the device's SM count)."""
+    rng = rng_device or device
+    gen = torch.Generator(device=rng).manual_seed(seed)
     batch = len(kv_lens)
     pages_per_seq = [kv_pages(kv) for kv in kv_lens]
     total_pages = sum(pages_per_seq)
     max_pages = max(pages_per_seq)
     k_full = torch.randn(
-        (total_pages, PAGE_SIZE, HEAD_DIM), generator=gen, device=device
-    )
-    permutation = torch.randperm(total_pages, generator=gen, device=device).to(
-        torch.int32
+        (total_pages, PAGE_SIZE, HEAD_DIM), generator=gen, device=rng
+    ).to(device)
+    permutation = torch.randperm(total_pages, generator=gen, device=rng).to(
+        device=device, dtype=torch.int32
     )
     block_tables = torch.zeros((batch, max_pages), dtype=torch.int32, device=device)
     offset = 0
     for b, count in enumerate(pages_per_seq):
         block_tables[b, :count] = permutation[offset : offset + count]
         offset += count
-    q = torch.randn((batch * q_len, num_heads, HEAD_DIM), generator=gen, device=device)
+    q = torch.randn((batch * q_len, num_heads, HEAD_DIM), generator=gen, device=rng).to(
+        device
+    )
     for b in range(batch):
         for i in range(q_len):
             visible = kv_lens[b] - q_len + i + 1
             target = int(
-                torch.randint(0, visible, (1,), generator=gen, device=device).item()
+                torch.randint(0, visible, (1,), generator=gen, device=rng).item()
             )
             page = int(block_tables[b, target // PAGE_SIZE].item())
             q[b * q_len + i] += 0.2 * k_full[page, target % PAGE_SIZE]
@@ -187,7 +227,9 @@ def make_inputs(kv_lens, num_heads, *, q_len, enable_sink, device, seed=0):
     kv_cache, kv_scale = quantize_nvfp4(k_full)
     sinks = None
     if enable_sink:
-        sinks = torch.randn((num_heads,), generator=gen, device=device) * 0.5 + 1.0
+        sinks = (
+            torch.randn((num_heads,), generator=gen, device=rng).to(device) * 0.5 + 1.0
+        )
     seq_lens = torch.tensor(kv_lens, dtype=torch.int32, device=device)
     return dict(
         query=query,
@@ -226,6 +268,7 @@ def assert_plan_well_formed(plan, kv_lens, *, q_len, num_heads, enable_sink):
     unit ranges partition the table into whole row pairs of one piece; the
     launch grid is one cluster per unit.
     """
+    assert (plan.q_len, plan.num_heads) == (q_len, num_heads)
     m_tiles = math.ceil(q_len * num_heads / ROWS_PER_TILE)
     covered = Counter()
     pieces = {}
@@ -556,19 +599,74 @@ def test_auto_schedule_threshold():
         build_work_plan([5], num_heads=64, num_sms=148, q_len=6)
 
 
+def _stage_of(name):
+    return FURTHER_RECORDS[name][0] if name in FURTHER_RECORDS else name
+
+
+def _register_further(monkeypatch, name):
+    """Registers further record ``name`` (a copy of its stage record), whether
+    or not the registry delivers it."""
+    stage, arches, keywords = FURTHER_RECORDS[name]
+    base = cake_jit.MODULES[stage]
+    record = dict(
+        base,
+        stage=stage,
+        arches=list(arches),
+        build=dict(base["build"], **keywords),
+    )
+    monkeypatch.setitem(cake_jit.MODULES, name, record)
+    return record
+
+
 @pytest.fixture
 def qk_ahead_record(monkeypatch):
-    """Registers the SM100 QK-ahead decode record (a copy of the decode record),
-    whether or not the registry delivers it."""
-    decode = cake_jit.MODULES["decode"]
-    record = dict(
-        decode,
-        stage="decode",
-        arches=["sm_100a"],
-        build=dict(decode["build"], qk_ahead=True),
-    )
-    monkeypatch.setitem(cake_jit.MODULES, QK_AHEAD_RECORD, record)
-    return record
+    """Registers the SM100 QK-ahead decode record."""
+    return _register_further(monkeypatch, QK_AHEAD_RECORD)
+
+
+@pytest.fixture
+def xv_record(monkeypatch):
+    """Registers the SM103 vote-gated exchange decode record."""
+    return _register_further(monkeypatch, XV_RECORD)
+
+
+def _without_spec_records(monkeypatch):
+    """Drops the short-row records that load their unit's first item in the
+    kernel setup, so a test of the short-row rules sees the programs without."""
+    for name in (SHORT_SPEC_RECORD, SHORT_EPI_SPEC_RECORD):
+        monkeypatch.delitem(cake_jit.MODULES, name, raising=False)
+
+
+@pytest.fixture
+def short_record(monkeypatch):
+    """Registers the short-row decode record for both architectures (without
+    the records of ``spec_records``)."""
+    _without_spec_records(monkeypatch)
+    return _register_further(monkeypatch, SHORT_RECORD)
+
+
+@pytest.fixture
+def short_epi_record(monkeypatch):
+    """Registers the per-warp epilogue short-row record for both architectures
+    (without the records of ``spec_records``)."""
+    _without_spec_records(monkeypatch)
+    return _register_further(monkeypatch, SHORT_EPI_RECORD)
+
+
+@pytest.fixture
+def spec_records(monkeypatch, short_record, short_epi_record):
+    """Registers both short-row records and, beside them, the two that load
+    their unit's first item in the kernel setup."""
+    return {
+        name: _register_further(monkeypatch, name)
+        for name in (SHORT_SPEC_RECORD, SHORT_EPI_SPEC_RECORD)
+    }
+
+
+@pytest.fixture
+def general_reduce_record(monkeypatch):
+    """Registers the general combine record for both architectures."""
+    return _register_further(monkeypatch, REDUCE_GENERAL_RECORD)
 
 
 def _bs32_plan(kv_len, num_sms, **kwargs):
@@ -580,6 +678,14 @@ def _bs32_plan(kv_len, num_sms, **kwargs):
         enable_sink=True,
         **kwargs,
     )
+
+
+def unit_tiles(plan):
+    """Pipeline tiles of every unit of ``plan``."""
+    return [
+        sum(it[4] - it[3] for it in plan.items[a:b] if it[2] == 0)
+        for a, b in zip(plan.unit_first, plan.unit_first[1:], strict=False)
+    ]
 
 
 def qk_ahead_geometry(plan):
@@ -629,6 +735,8 @@ def test_select_decode_record_picks_qk_ahead_for_long_balanced_plans(
 def test_select_decode_record_keeps_decode(
     monkeypatch, qk_ahead_record, arch, kv_len, num_sms, schedule, registered
 ):
+    # Without the SM103 xv record (its rule: test_select_decode_record_xv_*).
+    monkeypatch.delitem(cake_jit.MODULES, XV_RECORD, raising=False)
     if not registered:
         monkeypatch.delitem(cake_jit.MODULES, QK_AHEAD_RECORD, raising=False)
     plan = _bs32_plan(kv_len, num_sms, schedule=schedule, tiles_per_split=None)
@@ -636,7 +744,7 @@ def test_select_decode_record_keeps_decode(
     assert select_decode_record(plan, arch) == "decode"
 
 
-def _hand_plan(*units):
+def _hand_plan(*units, q_len=6, num_heads=64):
     """Balanced plan whose unit ``u`` holds one piece per length in ``units[u]``."""
     items, unit_first = [], [0]
     for lens in units:
@@ -650,6 +758,8 @@ def _hand_plan(*units):
         unit_first=tuple(unit_first),
         max_splits=1,
         tiles_per_split=None,
+        q_len=q_len,
+        num_heads=num_heads,
     )
     check_pairs(plan)
     return plan
@@ -671,6 +781,402 @@ def test_select_decode_record_needs_every_unit(qk_ahead_record):
     assert select_decode_record(_hand_plan(long, long), "sm_100a") == QK_AHEAD_RECORD
     assert select_decode_record(_hand_plan(long, [256, 256]), "sm_100a") == "decode"
     assert select_decode_record(_hand_plan(long, [511]), "sm_100a") == "decode"
+
+
+SHORT_LIMITS = [("sm_100a", 32), ("sm_103a", 64)]
+
+
+@pytest.mark.parametrize("arch,limit", SHORT_LIMITS)
+@pytest.mark.parametrize("extra", [-1, 0, 1])
+def test_select_decode_record_short_threshold(short_record, arch, limit, extra):
+    assert dict(SHORT_LIMITS) == cake_backend.SHORT_MAX_UNIT_TILES
+    tiles = limit + extra
+    plan = _hand_plan([tiles // 2, tiles - tiles // 2], [1])
+    want = SHORT_RECORD if tiles <= limit else "decode"
+    assert select_decode_record(plan, arch) == want
+
+
+def test_select_decode_record_short_needs_every_unit(short_record):
+    plan = _hand_plan([64], [32, 32], [1])
+    assert select_decode_record(plan, "sm_103a") == SHORT_RECORD
+    assert select_decode_record(_hand_plan([64], [32, 33]), "sm_103a") == "decode"
+
+
+@pytest.mark.parametrize("arch,limit", SHORT_LIMITS)
+@pytest.mark.parametrize("extra", [0, 1])
+def test_select_decode_record_short_runs_uniform_plans(
+    short_record, arch, limit, extra
+):
+    plan = build_work_plan(
+        [(limit + 1) * cake_backend.TILE_KV] * 4,
+        num_heads=64,
+        num_sms=148,
+        q_len=6,
+        enable_sink=True,
+        schedule="uniform",
+        tiles_per_split=limit + extra,
+    )
+    assert max(unit_tiles(plan)) == limit + extra
+    want = SHORT_RECORD if extra == 0 else "decode"
+    assert select_decode_record(plan, arch) == want
+
+
+@pytest.mark.parametrize("num_sms", [148, 152])
+@pytest.mark.parametrize("kv_len,heaviest", [(4096, 32), (4160, 33)])
+def test_select_decode_record_short_boundary_of_the_auto_uniform_schedule(
+    short_record, num_sms, kv_len, heaviest
+):
+    """32 requests below the balanced threshold: the auto schedule runs one
+    split per request, so its heaviest unit holds the request's tiles."""
+    plan = _bs32_plan(kv_len, num_sms)
+    assert plan.schedule == "uniform" and plan.max_splits == 1
+    assert plan.tiles_per_split == kv_tiles(kv_len) == heaviest
+    assert max(unit_tiles(plan)) == heaviest
+    for arch, limit in SHORT_LIMITS:
+        want = SHORT_RECORD if heaviest <= limit else "decode"
+        assert select_decode_record(plan, arch) == want
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+@pytest.mark.parametrize(
+    "num_sms,batch,kv_len,heaviest",
+    [
+        (148, 23, 8448, 64),
+        (148, 23, 8512, 65),
+        (152, 24, 8320, 64),
+        (152, 24, 8384, 65),
+    ],
+)
+def test_select_decode_record_short_boundary_of_balanced_plans(
+    short_record, arch, num_sms, batch, kv_len, heaviest
+):
+    plan = build_work_plan(
+        [kv_len] * batch, num_heads=64, num_sms=num_sms, q_len=6, enable_sink=True
+    )
+    assert plan.schedule == "balanced"
+    assert max(unit_tiles(plan)) == heaviest
+    limit = cake_backend.SHORT_MAX_UNIT_TILES[arch]
+    want = SHORT_RECORD if heaviest <= limit else "decode"
+    assert select_decode_record(plan, arch) == want
+
+
+@pytest.mark.parametrize(
+    "arch,xv,want",
+    [
+        ("sm_100a", True, QK_AHEAD_RECORD),
+        ("sm_103a", True, XV_RECORD),
+        ("sm_103a", False, SHORT_RECORD),
+    ],
+)
+def test_select_decode_record_tries_qk_ahead_and_xv_before_short(
+    monkeypatch, qk_ahead_record, xv_record, short_record, arch, xv, want
+):
+    if not xv:
+        monkeypatch.delitem(cake_jit.MODULES, XV_RECORD)
+    limits = dict.fromkeys(cake_jit.ARCHES, 1 << 30)
+    monkeypatch.setattr(cake_backend, "SHORT_MAX_UNIT_TILES", limits)
+    assert select_decode_record(_bs32_plan(131072, 148), arch) == want
+
+
+@pytest.mark.parametrize("schedule", ["auto", "uniform"])
+def test_select_decode_record_tries_qk_ahead_before_xv(
+    qk_ahead_record, xv_record, schedule
+):
+    """Where both are delivered, a balanced plan of the QK-ahead rule runs
+    the QK-ahead record and a uniform one the xv record."""
+    xv_record["arches"] = list(cake_jit.ARCHES)
+    plan = _bs32_plan(131072, 148, schedule=schedule, tiles_per_split=None)
+    want = QK_AHEAD_RECORD if plan.schedule == "balanced" else XV_RECORD
+    assert select_decode_record(plan, "sm_100a") == want
+    assert select_decode_record(plan, "sm_103a") == XV_RECORD
+
+
+def xv_steady_tiles(plan):
+    """Fewest pipeline tiles of a unit of ``plan`` past the warm-up of each
+    of its pieces (the xv rule's measure)."""
+    return min(
+        sum(
+            max(0, it[4] - it[3] - cake_backend.XV_WARMUP_TILES)
+            for it in plan.items[a:b:V_HALVES]
+        )
+        for a, b in zip(plan.unit_first, plan.unit_first[1:], strict=False)
+    )
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+@pytest.mark.parametrize(
+    "pieces,steady",
+    [
+        ([354], 306),
+        ([355], 307),
+        ([356], 308),
+        ([200, 202, 48], 306),
+        ([200, 203, 48], 307),
+        ([200, 203, 47, 10], 307),
+        ([47] * 12, 0),
+    ],
+)
+def test_select_decode_record_xv_threshold(xv_record, arch, pieces, steady):
+    assert cake_backend.XV_WARMUP_TILES == 48
+    assert cake_backend.XV_MIN_STEADY_TILES == 307
+    plan = _hand_plan(pieces, [400])
+    assert xv_steady_tiles(plan) == steady
+    want = XV_RECORD if arch == "sm_103a" and steady >= 307 else "decode"
+    assert select_decode_record(plan, arch) == want
+    uniform = replace(plan, schedule="uniform")
+    assert select_decode_record(uniform, arch) == want
+
+
+def test_select_decode_record_xv_needs_every_unit_and_the_record(
+    monkeypatch, xv_record
+):
+    long = [355]
+    assert select_decode_record(_hand_plan(long, long), "sm_103a") == XV_RECORD
+    assert select_decode_record(_hand_plan(long, [354]), "sm_103a") == "decode"
+    assert select_decode_record(_hand_plan(long, [600, 47]), "sm_103a") == XV_RECORD
+    assert select_decode_record(_hand_plan(long, [47] * 20), "sm_103a") == "decode"
+    xv_record["arches"] = ["sm_100a"]
+    assert select_decode_record(_hand_plan(long), "sm_103a") == "decode"
+    monkeypatch.delitem(cake_jit.MODULES, XV_RECORD)
+    assert select_decode_record(_hand_plan(long), "sm_103a") == "decode"
+
+
+@pytest.mark.parametrize(
+    "num_sms,batch,kv_len,steady",
+    [
+        (148, 32, 32768, 208),
+        (148, 32, 49152, 352),
+        (148, 32, 65536, 519),
+        (148, 32, 131072, 1183),
+        (148, 16, 79488, 306),
+        (148, 16, 79616, 307),
+        (148, 16, 81920, 318),
+        (148, 64, 24576, 305),
+        (152, 32, 32768, 208),
+        (152, 32, 49152, 339),
+        (152, 32, 65536, 501),
+        (152, 32, 131072, 1148),
+        (152, 16, 81664, 306),
+        (152, 16, 81792, 307),
+        (152, 16, 81920, 307),
+        (152, 64, 16384, 160),
+        (152, 64, 24576, 292),
+    ],
+)
+def test_select_decode_record_xv_boundary_of_balanced_plans(
+    xv_record, num_sms, batch, kv_len, steady
+):
+    plan = build_work_plan(
+        [kv_len] * batch, num_heads=64, num_sms=num_sms, q_len=6, enable_sink=True
+    )
+    assert plan.schedule == "balanced"
+    assert xv_steady_tiles(plan) == steady
+    want = XV_RECORD if steady >= 307 else "decode"
+    assert select_decode_record(plan, "sm_103a") == want
+    assert select_decode_record(plan, "sm_100a") != XV_RECORD
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+@pytest.mark.parametrize(
+    "num_heads,q_len,tail_rows",
+    [
+        (64, 6, 0),
+        (128, 1, 0),
+        (8, 3, 24),
+        (1, 31, 31),
+        (1, 32, 32),
+        (8, 4, 32),
+        (8, 6, 48),
+        (16, 6, 32),
+        (2, 31, 62),
+        (64, 1, 0),
+    ],
+)
+def test_select_decode_record_short_epi_threshold(
+    short_record, short_epi_record, arch, num_heads, q_len, tail_rows
+):
+    assert cake_backend.SHORT_EPI_MIN_TAIL_ROWS == 32
+    assert (q_len * num_heads) % ROWS_PER_CTA == tail_rows
+    plan = _hand_plan([8], [8], q_len=q_len, num_heads=num_heads)
+    want = SHORT_EPI_RECORD if tail_rows >= 32 else SHORT_RECORD
+    assert select_decode_record(plan, arch) == want
+    long = _hand_plan([400], q_len=q_len, num_heads=num_heads)
+    assert select_decode_record(long, arch) not in (SHORT_RECORD, SHORT_EPI_RECORD)
+
+
+def test_select_decode_record_short_epi_needs_both_records(
+    monkeypatch, short_record, short_epi_record
+):
+    plan = _hand_plan([8], [8], q_len=4, num_heads=8)
+    assert select_decode_record(plan, "sm_100a") == SHORT_EPI_RECORD
+    short_epi_record["arches"] = ["sm_103a"]
+    assert select_decode_record(plan, "sm_100a") == SHORT_RECORD
+    assert select_decode_record(plan, "sm_103a") == SHORT_EPI_RECORD
+    monkeypatch.delitem(cake_jit.MODULES, SHORT_RECORD)
+    assert select_decode_record(plan, "sm_103a") == "decode"
+    monkeypatch.delitem(cake_jit.MODULES, SHORT_EPI_RECORD)
+    assert select_decode_record(plan, "sm_103a") == "decode"
+
+
+EPI_BOUNDARY_KV = [1000, 8192, 5000, 300, 2048, 777]
+SPLIT16 = {"schedule": "uniform", "tiles_per_split": 16}
+
+
+@pytest.mark.parametrize("num_sms", [148, 152])
+@pytest.mark.parametrize(
+    "num_heads,q_len,tail_rows", [(1, 31, 31), (1, 32, 32), (8, 3, 24), (8, 4, 32)]
+)
+def test_select_decode_record_short_epi_boundary_of_uniform_plans(
+    short_record, short_epi_record, num_sms, num_heads, q_len, tail_rows
+):
+    """Uniform plans of 16 pipeline tiles per split hold short units on both
+    architectures; the tail rows of a request pick the short-row program."""
+    plan = build_work_plan(
+        EPI_BOUNDARY_KV,
+        num_heads=num_heads,
+        num_sms=num_sms,
+        q_len=q_len,
+        enable_sink=True,
+        schedule="uniform",
+        tiles_per_split=16,
+    )
+    assert max(unit_tiles(plan)) <= 16
+    assert (q_len * num_heads) % ROWS_PER_CTA == tail_rows
+    want = SHORT_EPI_RECORD if tail_rows >= 32 else SHORT_RECORD
+    for arch in cake_jit.ARCHES:
+        assert select_decode_record(plan, arch) == want
+
+
+@pytest.mark.parametrize(
+    "num_heads,q_len,epi", [(64, 6, False), (64, 1, False), (8, 4, True), (8, 6, True)]
+)
+def test_select_decode_record_spec_uh_needs_one_item_pair_per_unit(
+    spec_records, num_heads, q_len, epi
+):
+    """The programs loading their unit's first item in the kernel setup run a
+    short plan whose every unit holds one item pair; a unit of several pairs
+    (or of none) keeps the program without that load."""
+    short, spec = (
+        (SHORT_EPI_RECORD, SHORT_EPI_SPEC_RECORD)
+        if epi
+        else (SHORT_RECORD, SHORT_SPEC_RECORD)
+    )
+    one = _hand_plan([8], [16], [1], q_len=q_len, num_heads=num_heads)
+    several = _hand_plan([8], [4, 4], q_len=q_len, num_heads=num_heads)
+    empty = _hand_plan([8], [], q_len=q_len, num_heads=num_heads)
+    assert select_decode_record(one, "sm_100a") == spec
+    assert select_decode_record(several, "sm_100a") == short
+    assert select_decode_record(empty, "sm_100a") == short
+    assert select_decode_record(one, "sm_103a") == spec
+    assert select_decode_record(several, "sm_103a") == short
+    # The short-row rule first: a long unit runs neither.
+    long = _hand_plan([8], [400], q_len=q_len, num_heads=num_heads)
+    assert select_decode_record(long, "sm_100a") not in (short, spec)
+
+
+def test_select_decode_record_spec_uh_needs_the_records(monkeypatch, spec_records):
+    one = _hand_plan([8], [8])
+    one_epi = _hand_plan([8], [8], q_len=4, num_heads=8)
+    assert select_decode_record(one, "sm_100a") == SHORT_SPEC_RECORD
+    assert select_decode_record(one_epi, "sm_100a") == SHORT_EPI_SPEC_RECORD
+    spec_records[SHORT_EPI_SPEC_RECORD]["arches"] = ["sm_103a"]
+    assert select_decode_record(one_epi, "sm_100a") == SHORT_EPI_RECORD
+    monkeypatch.delitem(cake_jit.MODULES, SHORT_SPEC_RECORD)
+    assert select_decode_record(one, "sm_100a") == SHORT_RECORD
+    # Only in place of the short-row records: without them the plan runs the decode.
+    spec_records[SHORT_EPI_SPEC_RECORD]["arches"] = list(cake_jit.ARCHES)
+    monkeypatch.delitem(cake_jit.MODULES, SHORT_RECORD)
+    assert select_decode_record(one_epi, "sm_103a") == "decode"
+
+
+SPEC_PAIRS_KV = [300, 600, 900, 1200, 9000]
+# Inputs of the item-pair rows, drawn on the host so every GPU sees the same
+# values (seed 15: the largest margin to the reference bound of the seeds tried).
+SPEC_PAIRS_INPUTS = {"seed": 15, "rng_device": "cpu"}
+
+
+@pytest.mark.parametrize("num_sms", [148, 152])
+@pytest.mark.parametrize("num_heads,q_len,epi", [(64, 6, False), (8, 4, True)])
+def test_select_decode_record_spec_uh_boundary_of_balanced_plans(
+    spec_records, num_sms, num_heads, q_len, epi
+):
+    """Four short requests beside a long one: the balanced partition joins the
+    end of one short request and the start of the next in one unit, so the
+    plan keeps the programs without the setup load; the uniform plan of the
+    same requests (one item pair per unit) runs them."""
+    short, spec = (
+        (SHORT_EPI_RECORD, SHORT_EPI_SPEC_RECORD)
+        if epi
+        else (SHORT_RECORD, SHORT_SPEC_RECORD)
+    )
+    kwargs = dict(num_heads=num_heads, num_sms=num_sms, q_len=q_len, enable_sink=True)
+    balanced = build_work_plan(SPEC_PAIRS_KV, **kwargs)
+    assert balanced.schedule == "balanced"
+    pairs = [
+        (last - first) // V_HALVES
+        for first, last in zip(
+            balanced.unit_first, balanced.unit_first[1:], strict=False
+        )
+    ]
+    assert min(pairs) == 1 and max(pairs) > 1
+    uniform = build_work_plan(
+        SPEC_PAIRS_KV, schedule="uniform", tiles_per_split=16, **kwargs
+    )
+    for arch in cake_jit.ARCHES:
+        limit = cake_backend.SHORT_MAX_UNIT_TILES[arch]
+        assert max(unit_tiles(balanced)) <= limit and max(unit_tiles(uniform)) <= limit
+        assert select_decode_record(balanced, arch) == short
+        want = spec if arch in FURTHER_RECORDS[spec][1] else short
+        assert select_decode_record(uniform, arch) == want
+
+
+def test_select_decode_record_short_needs_the_record_and_a_threshold(
+    monkeypatch, short_record
+):
+    plan = _hand_plan([8], [8])
+    assert select_decode_record(plan, "sm_100a") == SHORT_RECORD
+    monkeypatch.setattr(cake_backend, "SHORT_MAX_UNIT_TILES", {"sm_100a": 64})
+    assert select_decode_record(plan, "sm_103a") == "decode"
+    short_record["arches"] = ["sm_103a"]
+    assert select_decode_record(plan, "sm_100a") == "decode"
+    monkeypatch.delitem(cake_jit.MODULES, SHORT_RECORD)
+    assert select_decode_record(plan, "sm_100a") == "decode"
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+@pytest.mark.parametrize("max_splits", [1, 2, 3, 4, MAX_SPLITS])
+def test_select_reduce_record_threshold(general_reduce_record, arch, max_splits):
+    assert cake_backend.REDUCE_GENERAL_MIN_SPLITS == 3
+    plan = replace(_hand_plan([8]), max_splits=max_splits)
+    want = REDUCE_GENERAL_RECORD if max_splits >= 3 else "reduce"
+    assert select_reduce_record(plan, arch) == want
+
+
+@pytest.mark.parametrize("tiles_per_split,max_splits", [(2, 2), (1, 3)])
+def test_select_reduce_record_follows_the_most_split_row(
+    general_reduce_record, tiles_per_split, max_splits
+):
+    plan = build_work_plan(
+        [256, 300],
+        num_heads=64,
+        num_sms=148,
+        q_len=6,
+        enable_sink=True,
+        tiles_per_split=tiles_per_split,
+    )
+    assert plan.schedule == "uniform" and plan.max_splits == max_splits
+    want = REDUCE_GENERAL_RECORD if max_splits >= 3 else "reduce"
+    for arch in cake_jit.ARCHES:
+        assert select_reduce_record(plan, arch) == want
+
+
+def test_select_reduce_record_needs_the_record(monkeypatch, general_reduce_record):
+    plan = replace(_hand_plan([8]), max_splits=4)
+    assert select_reduce_record(plan, "sm_103a") == REDUCE_GENERAL_RECORD
+    general_reduce_record["arches"] = ["sm_100a"]
+    assert select_reduce_record(plan, "sm_103a") == "reduce"
+    monkeypatch.delitem(cake_jit.MODULES, REDUCE_GENERAL_RECORD)
+    assert select_reduce_record(plan, "sm_100a") == "reduce"
 
 
 def test_work_table_keeps_direct_out_on_single_split_items():
@@ -927,13 +1433,12 @@ def test_architectures_of_the_registry():
     assert cake_jit.ARCH_BY_CAPABILITY == {(10, 0): "sm_100a", (10, 3): "sm_103a"}
     assert cake_backend.SUPPORTED_COMPUTE_CAPABILITIES == cake_jit.ARCH_BY_CAPABILITY
     assert cake_jit.STAGES == ("decode", "reduce")
-    # Every stage has the record named after it; the only other record is the
-    # optional QK-ahead program of the decode stage.
+    # Every stage has the record named after it; the other records are the
+    # stages' optional further programs.
     assert set(cake_jit.STAGES) <= set(cake_jit.MODULES)
-    assert set(cake_jit.MODULES) <= {*cake_jit.STAGES, QK_AHEAD_RECORD}
+    assert set(cake_jit.MODULES) <= {*cake_jit.STAGES, *FURTHER_RECORDS}
     for name, record in cake_jit.MODULES.items():
-        stage = name if name != QK_AHEAD_RECORD else "decode"
-        assert record["stage"] == stage, name
+        assert record["stage"] == _stage_of(name), name
     assert cake_jit.arch_for_capability((10, 0)) == "sm_100a"
     assert cake_jit.arch_for_capability((10, 3)) == "sm_103a"
     for capability in [(9, 0), (10, 1), (10, 7), (11, 0), (12, 0), (10,)]:
@@ -950,13 +1455,13 @@ def test_records_carry_the_host_plan(name):
     record = cake_backend._check_record(name)
     stage = record["stage"]
     assert record is cake_jit.MODULES[name]
-    assert stage == (name if name != QK_AHEAD_RECORD else "decode")
+    assert stage == _stage_of(name)
     assert record["library"] == record["kernel"]
     assert re.fullmatch(r"cake_nvfp4_mla_decode_[0-9a-f]{20}", record["library"])
     assert record["kernel_symbol"] == "kernel_" + record["library"]
     assert record["ffi_entry"] == "run"
-    arches = ["sm_100a"] if name == QK_AHEAD_RECORD else list(cake_jit.ARCHES)
-    assert list(record["arches"]) == arches
+    arches = FURTHER_RECORDS[name][1] if name in FURTHER_RECORDS else cake_jit.ARCHES
+    assert list(record["arches"]) == list(arches)
     assert not {"sources", "source_sha256", "compile_flags", "cache_names"} & set(
         record
     )
@@ -977,24 +1482,28 @@ def test_check_record_refuses_a_different_host_plan(monkeypatch):
         cake_backend._check_record("decode")
 
 
-def test_check_record_holds_a_record_to_its_stage(qk_ahead_record):
-    assert cake_backend._check_record(QK_AHEAD_RECORD) is qk_ahead_record
-    qk_ahead_record["tile_kv"] = 2 * cake_backend.TILE_KV
-    with pytest.raises(RuntimeError, match=f"{QK_AHEAD_RECORD} record's host plan"):
-        cake_backend._check_record(QK_AHEAD_RECORD)
+@pytest.mark.parametrize("name", list(FURTHER_RECORDS))
+def test_check_record_holds_a_record_to_its_stage(monkeypatch, name):
+    record = _register_further(monkeypatch, name)
+    assert cake_backend._check_record(name) is record
+    record["grid_rule"] = {"kind": "units_by_cluster", "ctas": 1}
+    with pytest.raises(RuntimeError, match=f"{name} record's host plan"):
+        cake_backend._check_record(name)
 
 
-def test_qk_ahead_record_shares_the_decode_host_plan():
-    record = cake_jit.MODULES.get(QK_AHEAD_RECORD)
+@pytest.mark.parametrize("name", list(FURTHER_RECORDS))
+def test_further_records_share_their_stage_host_plan(name):
+    record = cake_jit.MODULES.get(name)
     if record is None:
-        pytest.skip("the registry does not deliver the QK-ahead decode program")
-    decode = cake_jit.MODULES["decode"]
-    assert record["build"] == dict(decode["build"], qk_ahead=True)
-    assert record["library"] != decode["library"]
+        pytest.skip(f"the registry does not deliver the {name} program")
+    stage, _, keywords = FURTHER_RECORDS[name]
+    base = cake_jit.MODULES[stage]
+    assert record["build"] == dict(base["build"], **keywords)
+    assert record["library"] != base["library"]
     shared = {"module", "stage", "ffi_entry", "arg_plan", "logical"}
-    for key in shared | set(cake_backend._RECORD_CONSTANTS["decode"]):
-        assert record[key] == decode[key], key
-    assert record["launch"]["cluster"] == decode["launch"]["cluster"]
+    for key in shared | set(cake_backend._RECORD_CONSTANTS[stage]):
+        assert record[key] == base[key], key
+    assert record["launch"]["cluster"] == base["launch"]["cluster"]
 
 
 @pytest.mark.parametrize("stage", ["decode", "reduce"])
@@ -1140,6 +1649,7 @@ def test_host_tables_image_matches_the_workspace_regions():
     "label,kv_lens,q_len,num_heads,enable_sink,tiles_per_split",
     [
         ("smoke_forced_two_splits", [256, 300], 6, 64, True, 2),
+        ("smoke_forced_three_splits", [256, 300], 6, 64, True, 1),
         ("partial_pages_h8", [1000, 8192, 5000], 6, 8, True, None),
         ("no_sink_q1", [64, 65, 4096, 777], 1, 64, False, None),
         ("bs32_q6_kv8k", [8192] * 32, 6, 64, True, None),
@@ -1224,7 +1734,8 @@ def test_nvfp4_mla_decode(
             total_q=total_q,
         )
         assert decode.reduce_kwargs["row_splits"].cpu().tolist() == expected_splits
-        reduce_record = cake_jit.MODULES["reduce"]
+        reduce_record = cake_jit.MODULES[select_reduce_record(decode.plan, decode.arch)]
+        assert decode.reduce_program == reduce_record["library"]
         assert decode.reduce_kwargs["grid"] == cake_jit.launch_grid(
             reduce_record, total_q=total_q, num_heads=num_heads
         )
@@ -1257,30 +1768,69 @@ def test_nvfp4_mla_decode(
     torch.testing.assert_close(lse, snapshot_lse, atol=0, rtol=0)
 
 
-def test_qk_ahead_decode_matches_the_decode_bitwise(monkeypatch):
-    """Both SM100 decode programs run one long balanced plan to the same bits."""
+def assert_programs_match_bitwise(
+    monkeypatch,
+    name,
+    kv_lens,
+    *,
+    q_len=6,
+    num_heads=64,
+    enable_sink=True,
+    schedule="auto",
+    tiles_per_split=None,
+    seed=0,
+    rng_device=None,
+):
+    """The selector binds further record ``name`` for the problem, and the
+    stage's own record and ``name`` run it to the same bits."""
     reason = _gpu_skip_reason()
     if reason:
         pytest.skip(reason)
     arch = cake_jit.arch_for_capability(torch.cuda.get_device_capability())
-    record = cake_jit.MODULES.get(QK_AHEAD_RECORD)
+    record = cake_jit.MODULES.get(name)
     if record is None or arch not in record["arches"]:
-        pytest.skip(f"no QK-ahead decode program registered for {arch}")
-    kv_lens, num_heads, q_len = [65536] * 32, 64, 6
+        pytest.skip(f"no {name} program registered for {arch}")
+    stage = FURTHER_RECORDS[name][0]
+    if stage == "decode":
+        selector, program, bound = "select_decode_record", "main_program", "main"
+    else:
+        selector, program, bound = "select_reduce_record", "reduce_program", "reduce"
     num_sms = torch.cuda.get_device_properties(
         torch.cuda.current_device()
     ).multi_processor_count
     plan = build_work_plan(
-        kv_lens, num_heads=num_heads, num_sms=num_sms, q_len=q_len, enable_sink=True
+        kv_lens,
+        num_heads=num_heads,
+        num_sms=num_sms,
+        q_len=q_len,
+        enable_sink=enable_sink,
+        schedule=schedule,
+        tiles_per_split=tiles_per_split,
     )
-    if select_decode_record(plan, arch) != QK_AHEAD_RECORD:
-        pytest.skip(f"the selector keeps the decode program at {num_sms} SMs")
+    if getattr(cake_backend, selector)(plan, arch) != name:
+        pytest.skip(f"the selector keeps the {stage} program at {num_sms} SMs")
     inputs = make_inputs(
-        kv_lens, num_heads, q_len=q_len, enable_sink=True, device="cuda"
+        kv_lens,
+        num_heads,
+        q_len=q_len,
+        enable_sink=enable_sink,
+        device="cuda",
+        seed=seed,
+        rng_device=rng_device,
     )
-    nbytes = nvfp4_mla_decode_workspace_size(
-        kv_lens, num_heads, num_sms=num_sms, q_len=q_len, enable_sink=True
-    )
+    if tiles_per_split is None:
+        nbytes = nvfp4_mla_decode_workspace_size(
+            kv_lens,
+            num_heads,
+            num_sms=num_sms,
+            q_len=q_len,
+            enable_sink=enable_sink,
+            schedule=schedule,
+        )
+    else:
+        nbytes = max_nvfp4_mla_decode_workspace_size(
+            len(kv_lens), num_heads, q_len=q_len
+        )
     workspace = torch.empty((nbytes,), dtype=torch.uint8, device="cuda")
 
     def prepare():
@@ -1299,11 +1849,13 @@ def test_qk_ahead_decode_matches_the_decode_bitwise(monkeypatch):
             out=torch.empty((*rows, HEAD_DIM), dtype=torch.bfloat16, device="cuda"),
             lse=torch.full(rows, float("nan"), dtype=torch.float32, device="cuda"),
             return_lse=True,
+            schedule=schedule,
+            tiles_per_split=tiles_per_split,
         )
 
-    # The real selector binds the QK-ahead program for this plan.
+    # The real selector binds the further program for this plan.
     selected = prepare()
-    assert selected.main_program == record["library"]
+    assert getattr(selected, program) == record["library"]
     ref_out, ref_lse = reference(
         inputs["query"],
         inputs["query_scale"],
@@ -1316,15 +1868,15 @@ def test_qk_ahead_decode_matches_the_decode_bitwise(monkeypatch):
         inputs["sinks"],
     )
     results = []
-    for key in ("decode", QK_AHEAD_RECORD):
-        monkeypatch.setattr(
-            cake_backend, "select_decode_record", lambda plan, arch, key=key: key
-        )
+    for key in (stage, name):
+        monkeypatch.setattr(cake_backend, selector, lambda plan, arch, key=key: key)
         decode = prepare()
-        main_record = cake_jit.MODULES[key]
-        assert decode.main_program == main_record["library"]
+        bound_record = cake_jit.MODULES[key]
+        assert getattr(decode, program) == bound_record["library"]
         assert_bound_to_the_record(
-            decode.main_arguments, main_record, decode.main_kwargs
+            getattr(decode, f"{bound}_arguments"),
+            bound_record,
+            getattr(decode, f"{bound}_kwargs"),
         )
         out, lse = decode()
         torch.cuda.synchronize()
@@ -1332,3 +1884,128 @@ def test_qk_ahead_decode_matches_the_decode_bitwise(monkeypatch):
         results.append((out, lse))
     (out_a, lse_a), (out_b, lse_b) = results
     assert torch.equal(out_a, out_b) and torch.equal(lse_a, lse_b)
+
+
+@pytest.mark.parametrize("kv_len", [52224, 65536, 131072])
+def test_qk_ahead_decode_matches_the_decode_bitwise(monkeypatch, kv_len):
+    """Both SM100 decode programs run long balanced plans to the same bits."""
+    assert_programs_match_bitwise(monkeypatch, QK_AHEAD_RECORD, [kv_len] * 32)
+
+
+@pytest.mark.parametrize(
+    "label,kv_lens",
+    [
+        ("bs32_q6_kv64k", [65536] * 32),
+        ("bs32_q6_kv128k", [131072] * 32),
+        ("bs32_q6_kv49152", [49152] * 32),
+        ("bs16_q6_kv81920", [81920] * 16),
+    ],
+)
+def test_xv_decode_matches_the_decode_bitwise(monkeypatch, label, kv_lens):
+    """Both SM103 decode programs run the plans of the xv rule to the same
+    bits (bs16_q6_kv81920: the rule's boundary row at 152 SMs)."""
+    assert_programs_match_bitwise(monkeypatch, XV_RECORD, kv_lens)
+
+
+@pytest.mark.parametrize(
+    "label,kv_lens,options",
+    [
+        ("smoke_forced_two_splits", [256, 300], {"tiles_per_split": 2}),
+        ("no_sink_q1", [64, 65, 4096, 777], {"q_len": 1, "enable_sink": False}),
+        ("h8_q3_tail24", EPI_BOUNDARY_KV, {"num_heads": 8, "q_len": 3, **SPLIT16}),
+        ("bs8_q6_kv8k", [8192] * 8, {}),
+        ("bs32_q6_kv4096", [4096] * 32, {}),
+        ("bs23_q6_kv8448", [8448] * 23, {}),
+        ("bs24_q6_kv8320", [8320] * 24, {}),
+        ("spec_pairs_h64_q6", SPEC_PAIRS_KV, SPEC_PAIRS_INPUTS),
+    ],
+)
+def test_short_decode_matches_the_decode_bitwise(monkeypatch, label, kv_lens, options):
+    """Plans of short units run the short-row and the decode programs to the
+    same bits (the boundary rows where the device's SM count selects them)."""
+    assert_programs_match_bitwise(monkeypatch, SHORT_RECORD, kv_lens, **options)
+
+
+@pytest.mark.parametrize(
+    "label,kv_lens,options",
+    [
+        ("partial_pages_h8", [1000, 8192, 5000], {"num_heads": 8}),
+        ("h1_q32_tail32", EPI_BOUNDARY_KV, {"num_heads": 1, "q_len": 32, **SPLIT16}),
+        ("h8_q4_tail32", EPI_BOUNDARY_KV, {"num_heads": 8, "q_len": 4, **SPLIT16}),
+        ("h16_q6_tail32", [4096] * 8, {"num_heads": 16}),
+        (
+            "spec_pairs_h8_q4",
+            SPEC_PAIRS_KV,
+            {"num_heads": 8, "q_len": 4, **SPEC_PAIRS_INPUTS},
+        ),
+    ],
+)
+def test_short_epi_decode_matches_the_decode_bitwise(
+    monkeypatch, label, kv_lens, options
+):
+    """Short plans whose requests end in a CTA of at least 32 valid query
+    rows run the per-warp epilogue and the decode programs to the same bits."""
+    assert_programs_match_bitwise(monkeypatch, SHORT_EPI_RECORD, kv_lens, **options)
+
+
+@pytest.mark.parametrize(
+    "label,kv_lens,options",
+    [
+        ("smoke_forced_two_splits", [256, 300], {"tiles_per_split": 2}),
+        ("no_sink_q1", [64, 65, 4096, 777], {"q_len": 1, "enable_sink": False}),
+        ("h1_q31_tail31", EPI_BOUNDARY_KV, {"num_heads": 1, "q_len": 31, **SPLIT16}),
+        ("h8_q3_tail24", EPI_BOUNDARY_KV, {"num_heads": 8, "q_len": 3, **SPLIT16}),
+        ("bs32_q6_kv4096", [4096] * 32, {}),
+        ("spec_pairs_h64_q6_uniform", SPEC_PAIRS_KV, {**SPLIT16, **SPEC_PAIRS_INPUTS}),
+    ],
+)
+def test_short_spec_decode_matches_the_decode_bitwise(
+    monkeypatch, label, kv_lens, options
+):
+    """Short plans of one item pair per unit run the short-row program that
+    loads its unit's first item in the kernel setup and the decode program to
+    the same bits."""
+    assert_programs_match_bitwise(monkeypatch, SHORT_SPEC_RECORD, kv_lens, **options)
+
+
+@pytest.mark.parametrize(
+    "label,kv_lens,options",
+    [
+        ("partial_pages_h8", [1000, 8192, 5000], {"num_heads": 8, **SPLIT16}),
+        ("h1_q32_tail32", EPI_BOUNDARY_KV, {"num_heads": 1, "q_len": 32, **SPLIT16}),
+        ("h8_q4_tail32", EPI_BOUNDARY_KV, {"num_heads": 8, "q_len": 4, **SPLIT16}),
+        ("h16_q6_tail32", [4096] * 8, {"num_heads": 16}),
+        (
+            "spec_pairs_h8_q4_uniform",
+            SPEC_PAIRS_KV,
+            {"num_heads": 8, "q_len": 4, **SPLIT16, **SPEC_PAIRS_INPUTS},
+        ),
+    ],
+)
+def test_short_epi_spec_decode_matches_the_decode_bitwise(
+    monkeypatch, label, kv_lens, options
+):
+    """Short plans of one item pair per unit whose requests end in a CTA of at
+    least 32 valid query rows run the per-warp epilogue program that loads its
+    unit's first item in the kernel setup and the decode program to the same
+    bits."""
+    assert_programs_match_bitwise(
+        monkeypatch, SHORT_EPI_SPEC_RECORD, kv_lens, **options
+    )
+
+
+@pytest.mark.parametrize(
+    "label,kv_lens,options",
+    [
+        ("smoke_forced_three_splits", [256, 300], {"tiles_per_split": 1}),
+        ("partial_pages_h8", [1000, 8192, 5000], {"num_heads": 8}),
+        ("bs4_q6_kv4k_16_splits", [4096] * 4, {"tiles_per_split": 2}),
+    ],
+)
+def test_general_reduce_matches_the_reduce_bitwise(
+    monkeypatch, label, kv_lens, options
+):
+    """Plans of more than two splits run both combine programs to the same bits."""
+    assert_programs_match_bitwise(
+        monkeypatch, REDUCE_GENERAL_RECORD, kv_lens, **options
+    )

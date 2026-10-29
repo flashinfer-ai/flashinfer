@@ -61,6 +61,13 @@ launch grid = the SM count).  The KV-split gate is the only SM-count dependent
 rule and is applied at the catalogued count, not the device's; it is consulted
 before the ``:short`` / ``:ts`` shape gates, so a call inside both it and the
 ``:ts`` gate is named by its KV-split plan.
+
+A ``:kvsplit`` route record of the full kind may carry ``stage_buckets``
+(``{arch: [{"kv_max": K, "stages": [[stage, program], ...]}, ...]}``): a plan
+whose KV length is at most an entry's ``kv_max`` launches the first such entry's
+stages on that architecture (:func:`route_stages`) -- its partial-kind twin's
+program, with the same host call, logits and schedule words as the record's
+program; the route name, its admission and its metadata buffer are the record's.
 """
 
 from __future__ import annotations
@@ -164,13 +171,25 @@ def stage_programs(stage, arches):
     return dict(by_arch)
 
 
+def route_stages(record, arch, keys):
+    """The stages a route record launches on ``arch`` for the KV length ``keys`` (``kv.shape[0]``): the first
+    ``stage_buckets[arch]`` entry with ``keys <= kv_max`` (``[[stage, program], ...]``, one program name per
+    stage), else the record's ``stages``."""
+    for bucket in record.get("stage_buckets", {}).get(arch, ()):
+        if keys <= int(bucket["kv_max"]):
+            return bucket["stages"]
+    return record["stages"]
+
+
 def program_names(route=None, arch=None):
-    """Names of the catalogued programs: all of them, those a route launches on ``arch`` (stage order, then
-    the sequence), or -- without ``arch`` -- the sorted union over the architectures of what the route launches."""
+    """Names of the catalogued programs: all of them, those a route may launch on ``arch`` (stage order, then
+    its ``stage_buckets`` programs for ``arch``, then the sequence; a plan's ``program_names`` are the ones it
+    launches), or -- without ``arch`` -- the sorted union over the architectures."""
     catalog = _catalog()
     if route is None:
         return sorted(catalog["programs"])
     record = catalog["routes"].get(route) or catalog["paged_routes"][route]
+    buckets = record.get("stage_buckets", {})
     if arch is None:
         names = sorted(
             {
@@ -178,9 +197,19 @@ def program_names(route=None, arch=None):
                 for stage in record["stages"]
                 for program in stage_programs(stage, catalog["arches"]).values()
             }
+            | {
+                program
+                for entries in buckets.values()
+                for entry in entries
+                for _stage, program in entry["stages"]
+            }
         )
     else:
         names = [stage_program(stage, arch) for stage in record["stages"]]
+        for entry in buckets.get(arch, ()):
+            for _stage, program in entry["stages"]:
+                if program not in names:
+                    names.append(program)
     if record.get("sequence"):
         names.append(record["sequence"])
     return names
@@ -1204,7 +1233,7 @@ class DenseMqaPlan:
         if sequence:
             selections = [(None, sequence)]
         else:
-            stages = self.route["stages"]
+            stages = route_stages(self.route, arch, keys)
             selections = [(stage[0], stage_program(stage, arch)) for stage in stages]
         self.program_names = [program for _stage, program in selections]
         for stage_name, program in selections:

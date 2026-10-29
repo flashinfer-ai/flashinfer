@@ -10,6 +10,8 @@ imports and launches never use it.
 """
 
 import bisect
+import copy
+import functools
 import re
 
 import pytest
@@ -1044,15 +1046,24 @@ def test_dense_route_table_is_catalog_driven():
         # architecture, so the union over the architectures may hold one program per architecture).
         programs = _runtime._catalog()["programs"]
         arches = sorted(_runtime._catalog()["arches"])
-        for r in _runtime._catalog()["routes"]:
+        for r, rec in _runtime._catalog()["routes"].items():
             if r.startswith("fp8:h64:"):
                 for a in arches:
                     names = _runtime.program_names(r, arch=a)
-                    assert len(names) == 1 and names[0] in programs, (r, a, names)
-                    assert a in programs[names[0]]["arches"], (r, a, names)
-                union = _runtime.program_names(r)
-                assert 1 <= len(union) <= len(arches), (r, union)
-                assert set(union) <= set(programs), (r, union)
+                    default = _runtime.stage_program(rec["stages"][0], a)
+                    extra = [
+                        p
+                        for e in rec.get("stage_buckets", {}).get(a, ())
+                        for _s, p in e["stages"]
+                    ]
+                    assert names == [
+                        default,
+                        *dict.fromkeys(p for p in extra if p != default),
+                    ], (r, a, names)
+                    assert all(
+                        n in programs and a in programs[n]["arches"] for n in names
+                    ), (r, a, names)
+                assert set(_runtime.program_names(r)) <= set(programs), r
     else:
         assert not _runtime.dense_route_available(64, 16, 4096)
     assert (
@@ -1073,6 +1084,11 @@ def test_dense_route_table_is_catalog_driven():
         (128, 4096, 32),
         (37, 4100, 64),
         (1, 8192, 64),
+        # 64-head full-kind qle2048 KV-split route on both sides of its sm_103a stage bucket (K <= 8192)
+        (128, 8192, 64),
+        (128, 8193, 64),
+        (1024, 8192, 64),
+        (1024, 8193, 64),
         # 32-head unaligned K (served only when the catalog publishes kv_alignment.fp8.32 == 1; skipped otherwise)
         (37, 4137, 32),
         (5, 300, 32),
@@ -1154,7 +1170,9 @@ def test_fp8_mqa_logits_one_shot(queries, keys, heads):
     torch.testing.assert_close(out[finite], native[finite], atol=1e-2, rtol=1e-2)
 
 
-@pytest.mark.parametrize("queries,keys,heads", [(16, 4096, 32), (37, 4100, 64)])
+@pytest.mark.parametrize(
+    "queries,keys,heads", [(16, 4096, 32), (37, 4100, 64), (128, 8192, 64)]
+)
 def test_fp8_mqa_logits_graph_replay(queries, keys, heads):
     """The one-shot entry captured in a CUDA graph launches on the capture
     stream: a replay after the captured output is poisoned reproduces the eager
@@ -1202,6 +1220,130 @@ def test_fp8_mqa_logits_graph_replay(queries, keys, heads):
     assert torch.equal(captured, changed) and not torch.equal(captured, eager)
 
 
+def _bucket_window(window, queries, keys):
+    """``(starts, ends)`` of one window shape: ``full`` [0, K); ``causal`` [0, K - Q + 1 + q) clamped to
+    [0, K]; ``multiseq2`` [0, K // 2) for the first Q // 2 queries and [K // 2, K) for the rest."""
+    q = torch.arange(queries, device="cuda", dtype=torch.int64)
+    if window == "full":
+        starts, ends = torch.zeros_like(q), torch.full_like(q, keys)
+    elif window == "causal":
+        starts, ends = torch.zeros_like(q), (keys - queries + 1 + q).clamp(0, keys)
+    else:
+        first = q < queries // 2
+        starts = torch.where(first, 0, keys // 2)
+        ends = torch.where(first, keys // 2, keys)
+    return starts.to(torch.int32), ends.to(torch.int32)
+
+
+@pytest.mark.parametrize("window", ["full", "causal", "multiseq2"])
+@pytest.mark.parametrize("side", ["low", "kv_max", "kv_max+1"])
+@pytest.mark.parametrize("queries", [66, 128, 302, 1024])
+def test_dense_stage_bucket_program_is_bitwise_to_the_default(
+    queries, side, window, monkeypatch
+):
+    """On the device's SM count, every stage bucket of a served route on the device's architecture: the shipped
+    catalog's plan launches the bucket's programs for ``K <= kv_max`` and the route's own above; the bucket's
+    programs forced over every K and the route's own (the bucket removed) compute bitwise-identical in-window
+    logits and ScheduleMeta words, each arm on caller-owned output and metadata poisoned differently, at the
+    route's smallest served K, at ``kv_max`` and at ``kv_max + 1``."""
+    _skip_unless_exported()
+    arch = _runtime.device_arch(torch.device("cuda"))
+    shipped = _runtime._catalog()
+    pairs = [
+        (route, entry)
+        for route, record in shipped["routes"].items()
+        for entry in record.get("stage_buckets", {}).get(arch, ())
+    ]
+    if not pairs:
+        pytest.skip(f"no stage bucket on {arch}")
+    sms = _runtime.device_facts(torch.cuda.current_device())[1]
+    gate = shipped["policy"]["dense_kvsplit"]
+    checked = 0
+    for route, entry in pairs:
+        record = shipped["routes"][route]
+        heads, bq = int(record["num_heads"]), int(record["block_q"])
+        bound = int(entry["kv_max"])
+        blocks = (queries + bq - 1) // bq
+        low = 1 + int(
+            gate["min_kv"]
+            if blocks < int(gate["sm_count"][arch])
+            else gate["fullgrid_min_kv"]
+        )
+        keys = {"low": low, "kv_max": bound, "kv_max+1": bound + 1}[side]
+        if _runtime.served_route("fp8", queries, keys, heads, arch=arch) != route:
+            continue
+        assert record["clean_logits"] == "raw", route
+        bucket = [program for _stage, program in entry["stages"]]
+        default = [_runtime.stage_program(stage, arch) for stage in record["stages"]]
+        torch.manual_seed(7)
+        q = torch.randn(queries, heads, 128, device="cuda").to(torch.float8_e4m3fn)
+        kv = torch.randn(keys, 128, device="cuda").to(torch.float8_e4m3fn)
+        scales = (torch.rand(_runtime.align4(keys), device="cuda") + 0.5)[:keys]
+        weights = torch.randn(queries, heads, device="cuda")
+        starts, ends = _bucket_window(window, queries, keys)
+        monkeypatch.setattr(_runtime, "_catalog", functools.cache(lambda: shipped))
+        served = _runtime.DenseMqaPlan(
+            "fp8", q, kv, weights, starts, ends, kv_scales=scales
+        )
+        assert served.program_names == (bucket if keys <= bound else default), (
+            route,
+            keys,
+            served.program_names,
+        )
+        forced = copy.deepcopy(shipped)
+        forced["routes"][route]["stage_buckets"][arch] = [
+            {"kv_max": 2**31 - 1, "stages": entry["stages"]}
+        ]
+        plain = copy.deepcopy(shipped)
+        del plain["routes"][route]["stage_buckets"]
+        words = _runtime.metadata_words(queries, sms, heads)
+        arms = {}
+        for arm, catalog, expected, poison in (
+            ("forced", forced, bucket, (0x7FC00001, -1)),
+            ("plain", plain, default, (0x7FC00002, -2)),
+        ):
+            monkeypatch.setattr(
+                _runtime, "_catalog", functools.cache(lambda catalog=catalog: catalog)
+            )
+            output = torch.empty(
+                (queries, _runtime.logits_stride(keys)),
+                dtype=torch.float32,
+                device="cuda",
+            )
+            output.view(torch.int32).fill_(poison[0])
+            metadata = torch.full((words,), poison[1], dtype=torch.int32, device="cuda")
+            plan = _runtime.DenseMqaPlan(
+                "fp8",
+                q,
+                kv,
+                weights,
+                starts,
+                ends,
+                kv_scales=scales,
+                output=output,
+                metadata=metadata,
+            )
+            assert plan.route_name == route and plan.program_names == expected, (
+                arm,
+                plan.program_names,
+            )
+            plan.run()
+            torch.cuda.synchronize()
+            arms[arm] = (output.view(torch.int32)[:, :keys], metadata)
+        (forced_out, forced_meta), (plain_out, plain_meta) = (
+            arms["forced"],
+            arms["plain"],
+        )
+        position = torch.arange(keys, device="cuda")[None, :]
+        inside = (position >= starts[:, None]) & (position < ends[:, None])
+        assert torch.equal(forced_out[inside], plain_out[inside]), (route, keys, window)
+        span = (3 * sms + 1) // 2 * 2
+        assert torch.equal(forced_meta[: 3 * sms], plain_meta[: 3 * sms]), route
+        assert torch.equal(forced_meta[span:], plain_meta[span:]), route
+        checked += 1
+    assert checked >= 1, (queries, side, window)
+
+
 _LADDER = re.compile(
     r"^#(?:el)?if (.+)\n#define CAKE_PROGRAM_KERNEL (\w+)(?:\n#define CAKE_PROGRAM_SHIM (\w+))?",
     re.MULTILINE,
@@ -1231,7 +1373,9 @@ def _program_identity(kernel_text, binding_text, definitions):
     if kernel is None and binding is None:
         symbol = re.search(r"^(kernel_cake_\w+)\(", kernel_text, re.MULTILINE).group(1)
         shim = re.search(
-            r"^namespace (cake_host_shim_[0-9a-f]{16}) \{", binding_text, re.MULTILINE
+            r"^namespace (cake_host_shim_[0-9a-f]{16}|cake_binding_kernel_cake_deepgemm_dense_mqa_[0-9a-f]{20}) \{",
+            binding_text,
+            re.MULTILINE,
         ).group(1)
         return symbol, shim
     assert kernel is not None and binding is not None and kernel[0] == binding[0], (
@@ -1301,6 +1445,16 @@ def test_catalog_programs_are_delivered_and_distinct():
                 table,
                 route,
             )
+            # A route's ``stage_buckets`` (dense ``routes`` only, never a sequence route) name catalogued programs
+            # delivered for the bucket's architecture.
+            for arch, entries in record.get("stage_buckets", {}).items():
+                assert table == "routes" and not record.get("sequence"), (table, route)
+                assert arch in expected, (table, route, arch)
+                for entry in entries:
+                    for _stage, program in entry["stages"]:
+                        where = (table, route, arch, program)
+                        assert program in programs, where
+                        assert arch in programs[program]["arches"], where
     referenced, kernels, instances, identities = set(), {}, {}, {}
     for name, record in programs.items():
         for source in record["sources"]:
@@ -1369,6 +1523,118 @@ def test_catalog_programs_are_delivered_and_distinct():
         if p.suffix == ".cu" and f"{generated}/{p.name}" not in referenced
     )
     assert not orphans, f"generated units not referenced by the catalog: {orphans}"
+
+
+_CALL_KEYS = ("arg_plan", "compile_flags", "ffi_entry", "kind", "role", "standalone")
+_ROUTE_KEYS = ("num_heads", "block_q", "clean_logits", "kv_min", "kv_alignment")
+_BUCKET_ROUTE = "fp8:h64:full:qle2048:kvsplit"
+_BUCKET_TWIN = "fp8:h64:partial:qle2048:kvsplit"
+
+
+def test_dense_stage_buckets_split_a_route_by_kv_length(monkeypatch):
+    """Host-only: a route record's ``stage_buckets`` (``{arch: [{"kv_max": K, "stages": [[stage, program],
+    ...]}]}``) sits only on a ``:kvsplit`` route of the full kind whose partial-kind twin is catalogued and agrees on
+    the route keys; each entry keeps the record's stage names and names, per stage, the twin's program on that
+    architecture -- not the record's own -- with the same host call; ``route_stages`` launches the first entry with
+    ``K <= kv_max`` and the record's ``stages`` otherwise.  The shipped bucket splits
+    ``fp8:h64:full:qle2048:kvsplit`` on sm_103a at K = 8192, served on both sides; sm_100a is unchanged; a withheld
+    route falls back to a route without buckets."""
+    catalog = _runtime._catalog()
+    routes, programs, arches = catalog["routes"], catalog["programs"], catalog["arches"]
+    seen = 0
+    for r, rec in routes.items():
+        buckets = rec.get("stage_buckets")
+        if buckets is None:
+            for a in arches:
+                for k in (1, 8192, 8193, 1 << 20):
+                    assert _runtime.route_stages(rec, a, k) is rec["stages"], (r, a, k)
+            continue
+        seen += 1
+        assert r.endswith(":kvsplit") and ":full:" in r, r
+        h = r.replace(":full:", ":partial:")
+        assert h in routes, r
+        assert all(rec[k] == routes[h][k] for k in _ROUTE_KEYS), r
+        assert not rec.get("sequence"), r
+        assert set(buckets) <= set(arches), r
+        stage_names = [stage for stage, _p in rec["stages"]]
+        for a in arches:
+            entries = buckets.get(a)
+            if entries is None:
+                assert _runtime.route_stages(rec, a, 1) is rec["stages"], (r, a)
+                continue
+            assert isinstance(entries, list) and entries, (r, a)
+            bounds = [e["kv_max"] for e in entries]
+            assert all(
+                isinstance(b, int) and not isinstance(b, bool) and b >= 1
+                for b in bounds
+            ), (r, a)
+            assert bounds == sorted(set(bounds)), (r, a)
+            for i, entry in enumerate(entries):
+                assert set(entry) == {"kv_max", "stages"}, (r, a)
+                assert [stage for stage, _p in entry["stages"]] == stage_names, (r, a)
+                for n, (_stage, p) in enumerate(entry["stages"]):
+                    default = _runtime.stage_program(rec["stages"][n], a)
+                    twin_p = _runtime.stage_program(routes[h]["stages"][n], a)
+                    assert isinstance(p, str), (r, a, p)
+                    assert p == twin_p, (r, a, p)
+                    assert p != default and p in programs, (r, a, p)
+                    assert a in programs[p]["arches"], (r, a, p)
+                    assert all(
+                        programs[p][k] == programs[default][k] for k in _CALL_KEYS
+                    ), (r, a, p)
+                bound = entry["kv_max"]
+                assert _runtime.route_stages(rec, a, bound) is entry["stages"]
+                after = (
+                    entries[i + 1]["stages"] if i + 1 < len(entries) else rec["stages"]
+                )
+                assert _runtime.route_stages(rec, a, bound + 1) is after
+    assert seen >= 1
+
+    # the shipped bucket: K <= 8192 of the full-kind qle2048 KV-split route on sm_103a launches the twin's program
+    rec = routes[_BUCKET_ROUTE]
+    twin = _runtime.stage_program(routes[_BUCKET_TWIN]["stages"][0], "sm_103a")
+    default_103 = _runtime.stage_program(rec["stages"][0], "sm_103a")
+    default_100 = _runtime.stage_program(rec["stages"][0], "sm_100a")
+    assert rec["stage_buckets"] == {
+        "sm_103a": [{"kv_max": 8192, "stages": [["logits", twin]]}]
+    }
+    for queries in (66, 128, 296, 302, 304, 1024):
+        low = 257 if queries < 304 else 2049
+        for keys in (low, 8192, 8193):
+            route = _runtime.served_route("fp8", queries, keys, 64, arch="sm_103a")
+            assert route == _BUCKET_ROUTE, (queries, keys, route)
+            selected = [
+                _runtime.stage_program(stage, "sm_103a")
+                for stage in _runtime.route_stages(rec, "sm_103a", keys)
+            ]
+            assert selected == ([twin] if keys <= 8192 else [default_103]), (
+                queries,
+                keys,
+            )
+        for keys in (8192, 8193):
+            route = _runtime.served_route("fp8", queries, keys, 64, arch="sm_100a")
+            assert route == _BUCKET_ROUTE, (queries, keys, route)
+            selected = [
+                _runtime.stage_program(stage, "sm_100a")
+                for stage in _runtime.route_stages(rec, "sm_100a", keys)
+            ]
+            assert selected == [default_100], (queries, keys)
+    assert _runtime.program_names(_BUCKET_ROUTE, "sm_103a") == [default_103, twin]
+    assert _runtime.program_names(_BUCKET_ROUTE, "sm_100a") == [default_100]
+
+    # a withheld route falls back to a grid-stride route, which carries no bucket
+    withheld = copy.deepcopy(catalog)
+    admission = withheld["policy"]["dense_admission"]
+    admission["admitted_routes"]["sm_103a"].remove(_BUCKET_ROUTE)
+    admission["withheld_routes"]["sm_103a"].append(_BUCKET_ROUTE)
+    monkeypatch.setattr(_runtime, "_catalog", functools.cache(lambda: withheld))
+    served = _runtime.served_route("fp8", 128, 8192, 64, arch="sm_103a")
+    assert served != _BUCKET_ROUTE, served
+    assert "stage_buckets" not in withheld["routes"][served], served
+    assert (
+        _runtime.route_stages(withheld["routes"][served], "sm_103a", 8192)
+        is withheld["routes"][served]["stages"]
+    )
 
 
 def test_h64_admission_matches_the_catalog_table():
@@ -1716,6 +1982,11 @@ def test_dense_bindings_cover_every_program_argument():
                 for program in sorted(
                     set(_runtime.stage_programs(stage, catalog["arches"]).values())
                 )
+            ] + [
+                (stage[0], stage[1])
+                for entries in record.get("stage_buckets", {}).values()
+                for entry in entries
+                for stage in entry["stages"]
             ]
         for stage, program in selections:
             missing = []

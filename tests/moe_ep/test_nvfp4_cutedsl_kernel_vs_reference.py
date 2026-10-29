@@ -194,6 +194,7 @@ def test_blackwell_standard_global_scales(kind, scalar, monkeypatch):
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize("persistent", [False, True])
 def test_blackwell_standard_nvfp4_padded_aot(monkeypatch, persistent):
+    """Compile a padded NVFP4 workspace with default or persistent finalization."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
         (10, 0),
         (10, 3),
@@ -223,9 +224,9 @@ def test_blackwell_standard_nvfp4_padded_aot(monkeypatch, persistent):
     )
     ws = pkg.Sm100BlockScaledSymmBuffer(
         cfg,
-        num_valid_tokens_tensor=torch.ones(1, dtype=torch.int32, device="cuda")
-        if persistent
-        else None,
+        num_valid_tokens_tensor=(
+            torch.ones(1, dtype=torch.int32, device="cuda") if persistent else None
+        ),
     )
     try:
         loaded = ws.kernel.aot_compile()
@@ -378,7 +379,9 @@ def test_blackwell_standard_backend_staging(kind, fused, monkeypatch):
         backend.destroy(ws)
 
 
-def _run_blackwell_genphase_graph(rank, world, capacity, early, tile_n, cluster_m):
+def _run_blackwell_genphase_graph(
+    rank, world, capacity, early, tile_n, cluster_m, kind="mxfp8_e4m3"
+):
     """Native reference plus changing-route graph replay for the GenPhase prototype."""
     import torch.distributed as dist
 
@@ -386,6 +389,7 @@ def _run_blackwell_genphase_graph(rank, world, capacity, early, tile_n, cluster_
     from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as genphase
 
     hidden, intermediate, topk, experts = 384, 192, 3, 8 * world
+    intermediate = 256 if kind == "mxfp4_mxfp8" else intermediate
     torch.manual_seed(6447 + rank)
     w13 = (
         torch.randn(8, 2 * intermediate, hidden, device="cuda") / hidden**0.5
@@ -394,7 +398,7 @@ def _run_blackwell_genphase_graph(rank, world, capacity, early, tile_n, cluster_
         torch.randn(8, hidden, intermediate, device="cuda") / intermediate**0.5
     ).bfloat16()
     weights = pkg.preprocess_genphase_weights(
-        w13, w2, quant_kind="mxfp8_e4m3", intermediate_size=intermediate
+        w13, w2, quant_kind=kind, intermediate_size=intermediate
     )
     cfg = pkg.Sm100GenphaseMoeConfig(
         num_total_experts=experts,
@@ -405,16 +409,23 @@ def _run_blackwell_genphase_graph(rank, world, capacity, early, tile_n, cluster_
         rank=rank,
         world_size=world,
         apply_routing_weights_before_fc2=early,
-        mma_tiler_mnk=(256, tile_n, 128),
+        quant_kind=kind,
+        mma_tiler_mnk=(256, tile_n, 256 if kind == "nvfp4" else 128),
         cluster_shape_mn=(cluster_m, 1),
     )
     ws = pkg.Sm100GenphaseSymmBuffer(cfg)
     try:
-        x, sf = pkg.quantize_genphase_mxfp8(
-            torch.randn(capacity, hidden, device="cuda"), torch.float8_e4m3fn
+        source = torch.randn(capacity, hidden, device="cuda")
+        x, sf = (
+            genphase.quantize_nvfp4_block16(source)
+            if kind == "nvfp4"
+            else pkg.quantize_genphase_mxfp8(
+                source,
+                torch.float8_e5m2 if kind == "mxfp8_e5m2" else torch.float8_e4m3fn,
+            )
         )
-        ws.x[:capacity].copy_(x)
-        ws.x_sf[:capacity, : sf.shape[1]].copy_(sf)
+        ws.x[:capacity].view(torch.uint8).copy_(x.view(torch.uint8))
+        ws.x_sf[:capacity, : sf.shape[1]].view(torch.uint8).copy_(sf.view(torch.uint8))
         ids = torch.arange(capacity * topk, device="cuda", dtype=torch.int32).view(
             capacity, topk
         )
@@ -1147,7 +1158,7 @@ def _check_nvfp4_kernel_matches_torch_reference(
     if mode == "w4a4":
         pack = MoEWeightPack(w13=problem["w13"], w2=problem["w2"])
     elif mode == "w4a16":
-        from .w4a16_reference import make_w4a16_weights
+        from tests.test_helpers.w4a16_reference import make_w4a16_weights
 
         pack = make_w4a16_weights(hidden, intermediate, num_experts)
     transformed_l1, transformed_l2 = preprocess_mega_weights(
@@ -1312,7 +1323,7 @@ def _assert_nvfp4_reference(y_kernel, reference, *, mode, in_kernel_fc2_reduce=F
                 y_kernel, reference, ikr=True, label="w4a16 atomic BF16 combine"
             )
         else:
-            from .w4a16_reference import assert_w4a16_bits
+            from tests.test_helpers.w4a16_reference import assert_w4a16_bits
 
             assert_w4a16_bits(y_kernel, reference)
         return
@@ -1353,7 +1364,7 @@ def _nvfp4_reference_from_weights(
     assert mode in NVFP4_MODES, mode
     assert isinstance(weights, PrequantizedMoEWeights), type(weights)
     if mode == "w4a16":
-        from .w4a16_reference import w4a16_reference
+        from tests.test_helpers.w4a16_reference import w4a16_reference
 
         return w4a16_reference(
             problem,
@@ -1415,7 +1426,7 @@ def test_nvfp4_w4a16_fp32_scales_and_routing(
         Sm100_Bf16_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     )
 
-    from .w4a16_reference import assert_w4a16_bits
+    from tests.test_helpers.w4a16_reference import assert_w4a16_bits
 
     _require_cuda()
     monkeypatch.setenv("MEGA_NO_DIST", "1")

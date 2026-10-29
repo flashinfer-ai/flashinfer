@@ -1958,9 +1958,10 @@ _CURATED = [
         topk_group=2,
         routed_scaling=1.0,
     ),  # BF16 FromLogits bias/group routing
-    # Deterministic typed-activation coverage. Keep CUTLASS-only activations
-    # pre-routed so they have an executable candidate.
+    # Deterministic typed-activation coverage. Keep activations not shared by
+    # every BF16 routing backend pre-routed so they have an executable candidate.
     Cfg(8, 256, 256, 8, 2, "bf16", "uniform", 900_014, activation="relu2"),
+    Cfg(8, 256, 256, 8, 2, "bf16", "uniform", 900_025, activation="silu"),
     Cfg(
         8,
         256,

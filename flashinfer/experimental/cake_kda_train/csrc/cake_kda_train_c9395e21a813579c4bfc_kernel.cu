@@ -724,10 +724,10 @@ kernel_cake_kda_train_c9395e21a813579c4bfc(const __grid_constant__ CUtensorMap q
             }
         }
     }
-    unsigned int _phase_ring_empty_0 = 1;
-    unsigned int _phase_ring_empty_1 = 1;
     unsigned int _phase_q_full = 0;
+    unsigned int _phase_ring_empty_0 = 1;
     unsigned int _phase_acc_done_0 = 0;
+    unsigned int _phase_ring_empty_1 = 1;
     #pragma unroll 1
     for (int i = 0; i < 4; i++) {
         int fill = fmask >> i * 4 + q4 & 1;

@@ -230,7 +230,9 @@ __device__ uint32_t cvt_warp_fp16_to_fp4(PackedVec<Type>& vec, float SFScaleVal,
   SFValue = static_cast<float>(tmp);
   // Get the output scale.
   // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal)) * reciprocal(SFScaleVal))
-  outputScale = vecMax != 0
+  // Guard the post-rounding SFValue, not vecMax: the fp8 SF conversion can underflow small
+  // vecMax values to zero, and reciprocal(0) = inf turns zero elements into NaN (see #2441).
+  outputScale = SFValue != 0
                     ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal))
                     : 0.0f;
 
@@ -379,8 +381,8 @@ __device__ __forceinline__ uint64_t quantizeSmoothed16(Bf16x8& lo, Bf16x8& hi, B
   uint8_t const fp8SFVal = tmp.__x;
   SFValue = static_cast<float>(tmp);
   float const outputScale =
-      vecMax != 0 ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal))
-                  : 0.0f;
+      SFValue != 0 ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal))
+                   : 0.0f;
 
   if (SFout != nullptr) *SFout = fp8SFVal;
 
@@ -406,9 +408,9 @@ __global__ void __launch_bounds__(512, 4)
   static_assert(NumCols % (4 * SF_VEC_SIZE) == 0);
   constexpr int NumSfCols = NumCols / SF_VEC_SIZE;
   constexpr int NumSfGroups = NumSfCols / 4;
-  float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
 
   cudaGridDependencySynchronize();
+  float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
 
   // Hot path: map a fixed number of complete rows onto each CTA. K=3072 uses two rows and 384
   // threads, so every thread owns exactly one 16-value scale block without a warp shuffle.
@@ -469,7 +471,6 @@ __global__ void __launch_bounds__(512, 4)
                                   Type const* pqs, float const* SFScale, uint32_t* out,
                                   uint32_t* SFout) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-  float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
   int64_t const numPaddedRowsForSf = padUp(numRows, 128);
   int64_t const numColsForSf = padUp(numPaddedCols, 4 * SF_VEC_SIZE);
   int const numColThreads = numCols / ELTS_PER_THREAD;
@@ -477,6 +478,7 @@ __global__ void __launch_bounds__(512, 4)
   int const numColThreadsForSf = static_cast<int>(numColsForSf / ELTS_PER_THREAD);
 
   cudaGridDependencySynchronize();
+  float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
   for (int64_t rowIdx = blockIdx.x; rowIdx < numPaddedRowsForSf; rowIdx += gridDim.x) {
     bool const isRowPadding = (rowIdx >= numRows);
     for (int colIdx = threadIdx.x; colIdx < numColThreadsForSf; colIdx += blockDim.x) {
