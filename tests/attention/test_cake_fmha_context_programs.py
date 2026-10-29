@@ -10,8 +10,16 @@ passes), the page tables the launch passes (views of the caller's storage)
 and the sizes a runtime-size program takes per launch.
 GPU: the BF16 programs (the one-tile ones at uniform query lengths, the
 persistent one at ragged query lengths; ragged KV lengths, CUDA graph replay
-with new lengths) against an FP32 reference; the FP8 / NVFP4 programs (host
-and device scales) through the shared prefill test against its reference; and
+with new lengths) against an FP32 reference; the BF16 JIT route on tiles
+without a visible key (an empty request, a request without keys, causal tiles
+whose rows see no key) against the reference and, on such rows, against the
+one-tile programs; the FP8, NVFP4, FP8 HD256 and FP16 HD256 JIT routes on such
+tiles against an FP32 reference and, on batches the FP8 / NVFP4 programs
+serve, against those programs bit for bit; the FP8 HD256 JIT route on batches
+that end with a partial L2 section against the reference and bit for bit
+against the same requests in whole sections; the FP8 / NVFP4 programs (host and
+device scales) through
+the shared prefill test against its reference; and
 every program bitwise against the component's JIT route on its row and its
 widened class, plus the invariances a launch must keep bitwise (NHD and HND
 caches, shared and separate page tables, a column-sliced page table, graph
@@ -37,6 +45,7 @@ from flashinfer.utils import (
     get_device_sm_count,
     get_trtllm_gen_multi_ctas_kv_counter_bytes,
 )
+from tests.test_helpers.test_helpers import assert_close_with_mismatch_tolerance
 
 _TARGET_ARCH = {"sm100a": "sm_100a", "sm103a": "sm_103a"}
 _COMPONENTS = ("context_bf16", "context_fp8", "context_nvfp4")
@@ -1954,6 +1963,727 @@ def test_cake_context_bf16_programs_match_reference_and_replay(
     )
     torch.testing.assert_close(out.float(), expected_short, atol=1e-2, rtol=1e-2)
     assert not counter.any()
+
+
+def _bf16_batch(heads, q_lens, kv_lens, page_size, *, shared=True, seed=20261028):
+    """Random BF16 inputs on the GPU: an HND pool of shuffled pages (one more,
+    all NaN, last) behind a shared (or a K / V) page table, the query and KV
+    offsets, a zeroed workspace and ticket.  A request without keys names the
+    NaN page in every slot of its table rows."""
+
+    device = torch.device("cuda")
+    batch = len(q_lens)
+    hq, hkv = heads
+    max_q, max_kv = max(q_lens), max(kv_lens)
+    generator = torch.Generator(device="cpu").manual_seed(seed + max_q)
+    pages = (max_kv + page_size - 1) // page_size
+    total_pages = 2 * batch * pages
+    query = (torch.randn((sum(q_lens), hq, 128), generator=generator) * 2).to(
+        device=device, dtype=torch.bfloat16
+    )
+    key, value = (
+        torch.randn((total_pages + 1, hkv, page_size, 128), generator=generator).to(
+            device=device, dtype=torch.bfloat16
+        )
+        for _ in range(2)
+    )
+    key[total_pages] = float("nan")
+    value[total_pages] = float("nan")
+    order = torch.randperm(total_pages, generator=generator).to(torch.int32)
+    tables_k = order[: batch * pages].view(batch, pages).clone()
+    tables_v = tables_k if shared else order[batch * pages :].view(batch, pages).clone()
+    for b, kv_len in enumerate(kv_lens):
+        if kv_len == 0:
+            tables_k[b] = total_pages
+            tables_v[b] = total_pages
+    return SimpleNamespace(
+        heads=heads,
+        q_lens=q_lens,
+        kv_lens=kv_lens,
+        shared=shared,
+        query=query,
+        key=key,
+        value=value,
+        tables_k=tables_k.to(device),
+        tables_v=tables_v.to(device),
+        block_tables=(
+            tables_k if shared else torch.stack((tables_k, tables_v), dim=1)
+        ).to(device),
+        seq_lens=torch.tensor(kv_lens, dtype=torch.int32, device=device),
+        cum_q=torch.cat(
+            (torch.zeros(1, dtype=torch.int32), torch.tensor(q_lens).cumsum(0).int())
+        ).to(device),
+        cum_kv=torch.cat(
+            (torch.zeros(1, dtype=torch.int32), torch.tensor(kv_lens).cumsum(0).int())
+        ).to(device),
+        workspace=torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device),
+        counter=torch.zeros(
+            get_trtllm_gen_multi_ctas_kv_counter_bytes(
+                batch, hq, get_device_sm_count(device)
+            ),
+            dtype=torch.uint8,
+            device=device,
+        ),
+    )
+
+
+def _run_bf16_batch(case, *, return_lse=False):
+    """One causal launch of the batch, output and LSE filled with NaN first."""
+
+    out = torch.full_like(case.query, float("nan"))
+    lse = None
+    if return_lse:
+        lse = torch.full(
+            case.query.shape[:2], float("nan"), dtype=torch.float32, device="cuda"
+        )
+    prefill.trtllm_batch_context_with_kv_cache(
+        case.query,
+        (case.key, case.value),
+        case.workspace,
+        case.block_tables,
+        case.seq_lens,
+        max(case.q_lens),
+        max(case.kv_lens),
+        128**-0.5,
+        1.0,
+        len(case.q_lens),
+        case.cum_q,
+        case.cum_kv,
+        out=out,
+        lse=lse,
+        return_lse=return_lse,
+        kv_layout="HND",
+        uses_shared_paged_kv_idx=case.shared,
+        multi_ctas_kv_counter_buffer=case.counter,
+        backend="cake",
+    )
+    torch.cuda.synchronize()
+    assert not case.counter.any()
+    return out, lse
+
+
+def _rows_without_keys(q_lens, kv_lens):
+    """The query rows that see no key under the bottom-right causal mask: every
+    row of a request without keys, and the first ``q_len - kv_len`` rows of a
+    request with fewer keys than query tokens."""
+
+    rows, start = [], 0
+    for q_len, kv_len in zip(q_lens, kv_lens, strict=True):
+        rows += range(start, start + max(0, q_len - kv_len))
+        start += q_len
+    return rows
+
+
+def _check_rows_with_and_without_keys(case, out, lse):
+    """Rows with a visible key match the FP32 reference; rows without one are
+    exactly 0 (their LSE -inf)."""
+
+    blank = _rows_without_keys(case.q_lens, case.kv_lens)
+    seen = torch.ones(out.shape[0], dtype=torch.bool, device=out.device)
+    seen[blank] = False
+    expected = _reference_context(
+        case.query,
+        case.key,
+        case.value,
+        case.tables_k,
+        case.tables_v,
+        case.q_lens,
+        case.kv_lens,
+        scale=128**-0.5,
+    )
+    torch.testing.assert_close(out.float()[seen], expected[seen], atol=1e-2, rtol=1e-2)
+    assert torch.equal(out[blank], torch.zeros_like(out[blank]))
+    if lse is not None:
+        assert bool((lse[blank] == -math.inf).all())
+        assert bool(torch.isfinite(lse[seen]).all())
+
+
+def _tiles_without_keys(heads, q_lens, kv_lens):
+    """The (request, m-block) tiles of the generic route whose causal block
+    count is 0 before the clamp: KV length 0, or ``q - kv = 2T (m + 1)`` with
+    ``T = 128 / pack`` query tokens per stage."""
+
+    pack = cake_api._context_pack_g(max(q_lens), max(kv_lens), *heads)
+    tokens = 128 // pack
+    blocks = (max(q_lens) + 2 * tokens - 1) // (2 * tokens)
+    return [
+        (b, m)
+        for b, (q_len, kv_len) in enumerate(zip(q_lens, kv_lens, strict=True))
+        for m in range(blocks)
+        if kv_len == 0 or q_len - kv_len == 2 * tokens * (m + 1)
+    ]
+
+
+@_GPU
+@pytest.mark.parametrize(
+    ("heads", "q_lens", "kv_lens", "page_size", "return_lse"),
+    [
+        # An empty request (no query token, no key) between others.
+        ((10, 2), (300, 0, 37, 64), (900, 0, 100, 130), 32, False),
+        # A request with query tokens but no key, with and without the LSE.
+        ((32, 4), (200, 5, 64), (700, 0, 64), 16, False),
+        ((32, 4), (200, 5, 64), (700, 0, 64), 16, True),
+        # Causal tiles whose rows see no key (q - kv = 2 * 128 at pack 1 and
+        # 2 * 16 at pack 8) in requests that hold keys.
+        ((10, 2), (511, 257, 511, 511), (2047, 1, 1024, 600), 32, False),
+        ((32, 4), (64, 100), (32, 300), 16, True),
+    ],
+)
+def test_cake_context_bf16_jit_route_runs_tiles_without_keys(
+    monkeypatch, served_programs, heads, q_lens, kv_lens, page_size, return_lse
+) -> None:
+    """The component's JIT route (no generated program serves these batches)
+    on tiles without a visible key: the launch completes, rows with a visible
+    key match the FP32 reference, rows without one are 0 (LSE -inf) although
+    a request without keys names a NaN page, and the ticket resets."""
+
+    loaded = []
+    load = cake_api.load_cake_fmha_context_bf16_module
+
+    def spy(*args, **kwargs):
+        loaded.append(args)
+        return load(*args, **kwargs)
+
+    monkeypatch.setattr(cake_api, "load_cake_fmha_context_bf16_module", spy)
+    assert _tiles_without_keys(heads, q_lens, kv_lens)
+    # Every batch but the one with the empty request has rows without a key.
+    assert _rows_without_keys(q_lens, kv_lens) or 0 in q_lens
+    case = _bf16_batch(heads, q_lens, kv_lens, page_size)
+    out, lse = _run_bf16_batch(case, return_lse=return_lse)
+    assert loaded and not served_programs
+    _check_rows_with_and_without_keys(case, out, lse)
+
+
+@_GPU
+@pytest.mark.parametrize(
+    ("program", "q_lens", "kv_lens", "page_size", "shared"),
+    [
+        # Rows without a visible key in the exact program (pack 5: q - kv = 50)
+        # and in the JIT route (pack 1: q - kv = 256), and a request without keys.
+        ("Q511", (511,) * 4, (2047, 0, 461, 255), 32, True),
+        ("Q257", (257,) * 4, (1024, 0, 207, 157), 1024, False),
+    ],
+)
+def test_cake_context_bf16_program_and_jit_route_agree_on_rows_without_keys(
+    monkeypatch, served_programs, program, q_lens, kv_lens, page_size, shared
+) -> None:
+    """A batch the one-tile BF16 program serves, with a request without keys
+    and causal tiles without a visible key: the program and the JIT route
+    (the exact profile off) both complete, give the same bits (0) on every row
+    without a visible key and match the FP32 reference on the others."""
+
+    target = cake_api._cake_fmha_target(torch.device("cuda"))
+    program = f"{program}_SM{_TARGET_ARCH[target][3:].upper()}"
+    case = _bf16_batch((10, 2), q_lens, kv_lens, page_size, shared=shared)
+    out, _ = _run_bf16_batch(case)
+    assert served_programs == [program]
+    _check_rows_with_and_without_keys(case, out, None)
+    monkeypatch.setattr(cake_api, "_context_bf16_exact_profile", lambda *a, **k: None)
+    assert _tiles_without_keys((10, 2), q_lens, kv_lens)
+    jit_out, _ = _run_bf16_batch(case)
+    assert served_programs == [program]
+    _check_rows_with_and_without_keys(case, jit_out, None)
+    blank = _rows_without_keys(q_lens, kv_lens)
+    assert blank
+    assert torch.equal(_bits(jit_out[blank]), _bits(out[blank]))
+
+
+# --- GPU: the other context JIT routes on tiles without a visible key -------
+
+#: The context JIT routes besides BF16: KV and output dtypes, head dim, layout
+#: and page tables the route takes, causal or not, (bmm1, bmm2) and the
+#: (atol, rtol) of the FP32 reference check with the share of values allowed
+#: outside it (the prefill tests' tolerances; an NVFP4 cache also needs a
+#: cosine similarity above 0.86).  NVFP4 caches pack two E2M1 values per byte
+#: under one FP8 scale per 16 values.  The HD256 routes stage the query, the cache and the metadata, and
+#: reset their tile ticket there.
+_JIT_ROUTES = {
+    "context_fp8": SimpleNamespace(
+        loader="load_cake_fmha_context_fp8_module",
+        head_dim=128,
+        query=torch.float8_e4m3fn,
+        cache=torch.float8_e4m3fn,
+        out=torch.float8_e4m3fn,
+        layout="HND",
+        shared=True,
+        causal=True,
+        scales=(0.0625, 0.75),
+        tol=(0.07, 0.05),
+        mismatch=0.0,
+    ),
+    "context_nvfp4": SimpleNamespace(
+        loader="load_cake_fmha_context_nvfp4_module",
+        head_dim=128,
+        query=torch.float8_e4m3fn,
+        cache=torch.uint8,
+        out=torch.float8_e4m3fn,
+        layout="HND",
+        shared=True,
+        causal=True,
+        scales=(0.0625, 0.75),
+        tol=(0.5, 0.5),
+        mismatch=0.1,
+    ),
+    "context_fp8_hd256": SimpleNamespace(
+        loader="load_cake_fmha_context_fp8_hd256_module",
+        head_dim=256,
+        query=torch.float8_e4m3fn,
+        cache=torch.float8_e4m3fn,
+        out=torch.bfloat16,
+        layout="NHD",
+        shared=False,
+        causal=True,
+        scales=(0.0625, 0.75),
+        tol=(0.06, 0.04),
+        mismatch=0.0,
+    ),
+    "context_fp16_hd256": SimpleNamespace(
+        loader="load_cake_fmha_context_fp16_hd256_module",
+        head_dim=256,
+        query=torch.float16,
+        cache=torch.float16,
+        out=torch.float16,
+        layout="NHD",
+        shared=False,
+        causal=False,
+        scales=(256**-0.5, 1.0),
+        tol=(1e-2, 1e-2),
+        mismatch=0.0,
+    ),
+}
+_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+_E2M1 = _E2M1 + tuple(-x for x in _E2M1)
+
+
+def _swizzle_v_scales(scales):
+    """The V block-scale order of the NVFP4 HND cache (pages, heads, page, 8)."""
+
+    pages, heads, page_size, scale_dim = scales.shape
+    return (
+        scales.reshape(pages, heads, page_size // 4, 4, 4, scale_dim // 4)
+        .permute(0, 1, 2, 4, 5, 3)
+        .reshape_as(scales)
+        .contiguous()
+    )
+
+
+def _jit_route_batch(component, heads, q_lens, kv_lens, page_size, *, seed=20261029):
+    """Random inputs of one JIT route on the GPU: a pool of shuffled pages (one
+    more, all NaN, last; NaN block scales for NVFP4) behind a shared (or a K /
+    V) page table, in the route's layout.  A request without keys names the
+    NaN page in every slot of its table rows."""
+
+    spec = _JIT_ROUTES[component]
+    device = torch.device("cuda")
+    batch = len(q_lens)
+    hq, hkv = heads
+    generator = torch.Generator(device="cpu").manual_seed(seed + max(q_lens))
+    pages = max(1, (max(kv_lens) + page_size - 1) // page_size)
+    total_pages = 2 * batch * pages
+    query = torch.randn((sum(q_lens), hq, spec.head_dim), generator=generator)
+    pool = (total_pages + 1, hkv, page_size)
+    scales = None
+    if component == "context_nvfp4":
+        key, value = (
+            torch.randint(0, 256, (*pool, 64), generator=generator, dtype=torch.uint8)
+            for _ in range(2)
+        )
+        scales = [
+            (torch.rand((*pool, 8), generator=generator) * 1.5 + 0.5).to(
+                torch.float8_e4m3fn
+            )
+            for _ in range(2)
+        ]
+        for sf in scales:
+            sf[total_pages] = float("nan")
+    else:
+        key, value = (
+            torch.randn((*pool, spec.head_dim), generator=generator).to(spec.cache)
+            for _ in range(2)
+        )
+        key[total_pages] = float("nan")
+        value[total_pages] = float("nan")
+    order = torch.randperm(total_pages, generator=generator).to(torch.int32)
+    tables_k = order[: batch * pages].view(batch, pages).clone()
+    tables_v = (
+        tables_k if spec.shared else order[batch * pages :].view(batch, pages).clone()
+    )
+    for b, kv_len in enumerate(kv_lens):
+        if kv_len == 0:
+            tables_k[b] = total_pages
+            tables_v[b] = total_pages
+    cache = (key, value)
+    if spec.layout == "NHD":
+        cache = tuple(x.transpose(1, 2).contiguous() for x in cache)
+    return SimpleNamespace(
+        component=component,
+        spec=spec,
+        heads=heads,
+        q_lens=q_lens,
+        kv_lens=kv_lens,
+        page_size=page_size,
+        query=query.to(device=device, dtype=spec.query),
+        key=key.to(device),
+        value=value.to(device),
+        scales=None if scales is None else [sf.to(device) for sf in scales],
+        cache=tuple(x.to(device) for x in cache),
+        kv_cache_sf=(
+            None
+            if scales is None
+            else (scales[0].to(device), _swizzle_v_scales(scales[1]).to(device))
+        ),
+        tables_k=tables_k.to(device),
+        tables_v=tables_v.to(device),
+        block_tables=(
+            tables_k if spec.shared else torch.stack((tables_k, tables_v), dim=1)
+        ).to(device),
+        seq_lens=torch.tensor(kv_lens, dtype=torch.int32, device=device),
+        cum_q=torch.cat(
+            (torch.zeros(1, dtype=torch.int32), torch.tensor(q_lens).cumsum(0).int())
+        ).to(device),
+        cum_kv=torch.cat(
+            (torch.zeros(1, dtype=torch.int32), torch.tensor(kv_lens).cumsum(0).int())
+        ).to(device),
+        workspace=torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device=device),
+        counter=torch.zeros(
+            get_trtllm_gen_multi_ctas_kv_counter_bytes(
+                batch, hq, get_device_sm_count(device)
+            ),
+            dtype=torch.uint8,
+            device=device,
+        ),
+    )
+
+
+def _run_jit_route_batch(case, *, return_lse=False):
+    """One launch of the batch, output and LSE filled with NaN first; the
+    ticket of an HD128 route is back at 0 after it."""
+
+    spec = case.spec
+    shape = (case.query.shape[0], case.heads[0], spec.head_dim)
+    out = torch.full(shape, float("nan"), device="cuda").to(spec.out)
+    lse = None
+    if return_lse:
+        lse = torch.full(shape[:2], float("nan"), dtype=torch.float32, device="cuda")
+    prefill.trtllm_batch_context_with_kv_cache(
+        case.query,
+        case.cache,
+        case.workspace,
+        case.block_tables,
+        case.seq_lens,
+        max(case.q_lens),
+        max(case.kv_lens),
+        *spec.scales,
+        len(case.q_lens),
+        case.cum_q,
+        case.cum_kv,
+        out=out,
+        out_dtype=spec.out,
+        lse=lse,
+        return_lse=return_lse,
+        causal=spec.causal,
+        kv_layout=spec.layout,
+        kv_cache_sf=case.kv_cache_sf,
+        uses_shared_paged_kv_idx=spec.shared,
+        multi_ctas_kv_counter_buffer=case.counter,
+        backend="cake",
+    )
+    torch.cuda.synchronize()
+    if spec.head_dim == 128:
+        assert not case.counter.any()
+    return out, lse
+
+
+def _jit_route_values(case, side, pages):
+    """FP32 values ``(heads, tokens, head_dim)`` of the given pool pages; an
+    NVFP4 value is its E2M1 code times its block scale, rounded to FP8 as the
+    kernel dequantizes it."""
+
+    data = (case.key if side == 0 else case.value)[pages]
+    if case.component == "context_nvfp4":
+        codes = torch.stack((data & 15, data >> 4), -1).flatten(-2).long()
+        levels = torch.tensor(_E2M1, device=data.device)[codes]
+        scale = case.scales[side][pages].float()
+        data = (
+            (levels.reshape(*data.shape[:-1], 8, 16) * scale.unsqueeze(-1))
+            .to(torch.float8_e4m3fn)
+            .flatten(-2)
+        )
+    return data.float().permute(1, 0, 2, 3).reshape(data.shape[1], -1, data.shape[-1])
+
+
+def _jit_route_reference(case):
+    """FP32 attention of the batch (the route's mask) and its base-2 LSE."""
+
+    spec = case.spec
+    hq, hkv = case.heads
+    bmm1, bmm2 = spec.scales
+    rows = case.query.shape[0]
+    out = torch.zeros((rows, hq, spec.head_dim), device="cuda")
+    lse = torch.full((rows, hq), -math.inf, device="cuda")
+    start = 0
+    for b, (q_len, kv_len) in enumerate(zip(case.q_lens, case.kv_lens, strict=True)):
+        if q_len == 0 or kv_len == 0:
+            start += q_len
+            continue
+        count = (kv_len + case.page_size - 1) // case.page_size
+        k, v = (
+            _jit_route_values(case, side, table[b, :count].long())[:, :kv_len]
+            for side, table in ((0, case.tables_k), (1, case.tables_v))
+        )
+        k = k.repeat_interleave(hq // hkv, dim=0)
+        v = v.repeat_interleave(hq // hkv, dim=0)
+        q = case.query[start : start + q_len].float().transpose(0, 1)
+        logits = torch.einsum("hqd,hkd->hqk", q, k) * bmm1
+        if spec.causal:
+            right = torch.arange(q_len, device="cuda")[:, None] + kv_len - q_len
+            logits.masked_fill_(torch.arange(kv_len, device="cuda") > right, -math.inf)
+        prob = torch.softmax(logits, dim=-1).nan_to_num(nan=0.0)
+        out[start : start + q_len] = (
+            torch.einsum("hqk,hkd->hqd", prob, v).transpose(0, 1) * bmm2
+        )
+        lse[start : start + q_len] = (
+            torch.logsumexp(logits, dim=-1) / math.log(2.0)
+        ).transpose(0, 1)
+        start += q_len
+    return out, lse
+
+
+def _jit_route_rows_without_keys(case):
+    """Every row of a request without keys and, causal, the first
+    ``q_len - kv_len`` rows of a request with fewer keys than query tokens."""
+
+    rows, start = [], 0
+    for q_len, kv_len in zip(case.q_lens, case.kv_lens, strict=True):
+        if kv_len == 0:
+            rows += range(start, start + q_len)
+        elif case.spec.causal:
+            rows += range(start, start + max(0, q_len - kv_len))
+        start += q_len
+    return rows
+
+
+def _check_jit_route_rows(case, out, lse):
+    """Rows with a visible key match the FP32 reference; rows without one are
+    0 (their LSE -inf)."""
+
+    blank = _jit_route_rows_without_keys(case)
+    seen = torch.ones(out.shape[0], dtype=torch.bool, device=out.device)
+    seen[blank] = False
+    expected, expected_lse = _jit_route_reference(case)
+    got, want = out.float()[seen], expected[seen]
+    atol, rtol = case.spec.tol
+    if case.spec.mismatch:
+        assert_close_with_mismatch_tolerance(
+            got,
+            want,
+            rtol=rtol,
+            atol=atol,
+            max_mismatched_elements=int(case.spec.mismatch * got.numel()),
+        )
+        cos = torch.nn.functional.cosine_similarity(
+            got.reshape(-1), want.reshape(-1), dim=0
+        )
+        assert cos.item() > 0.86
+    else:
+        torch.testing.assert_close(got, want, atol=atol, rtol=rtol)
+    assert bool((out.float()[blank] == 0).all())
+    if lse is not None:
+        assert bool((lse[blank] == -math.inf).all())
+        torch.testing.assert_close(lse[seen], expected_lse[seen], atol=3e-3, rtol=1e-3)
+
+
+class _RouteProbe(Exception):
+    pass
+
+
+def _jit_route_of(monkeypatch, case, *, return_lse=False):
+    """The route the dispatch computes for the batch (no launch)."""
+
+    def probe(device, route):
+        raise _RouteProbe(route)
+
+    with monkeypatch.context() as m:
+        m.setattr(cake_api, "get_cake_fmha_context_module", probe)
+        with pytest.raises(_RouteProbe) as caught:
+            _run_jit_route_batch(case, return_lse=return_lse)
+    return caught.value.args[0]
+
+
+def _jit_route_tiles_without_keys(case, route):
+    """The (request, m-block) tiles whose block count is 0 before the clamp:
+    KV length 0, or (causal) a key bound of exactly 0 for the tile: ``q - kv =
+    (m + 1) * rows`` with ``rows = 2 * 128 / pack`` (HD128) or 128 (HD256)."""
+
+    rows = 128 if case.spec.head_dim == 256 else 2 * (128 // route.pack_g)
+    return [
+        (b, m)
+        for b, (q_len, kv_len) in enumerate(zip(case.q_lens, case.kv_lens, strict=True))
+        for m in range(route.num_m_blocks)
+        if kv_len == 0 or (case.spec.causal and q_len - kv_len == rows * (m + 1))
+    ]
+
+
+@_GPU
+@pytest.mark.parametrize(
+    ("component", "heads", "q_lens", "kv_lens", "page_size", "return_lse"),
+    [
+        # An empty request (no query token, no key) between others.
+        ("context_fp8", (32, 4), (300, 0, 37, 64), (900, 0, 100, 130), 16, False),
+        ("context_nvfp4", (32, 4), (300, 0, 37, 64), (900, 0, 100, 130), 16, False),
+        ("context_fp8_hd256", (32, 8), (300, 0, 37, 64), (900, 0, 100, 130), 16, False),
+        ("context_fp16_hd256", (32, 8), (300, 0, 37, 64), (900, 0, 100, 130), 16, False),
+        # A request with query tokens but no key (with and without the LSE
+        # where the route returns one).
+        ("context_fp8", (32, 4), (200, 5, 64), (700, 0, 64), 16, False),
+        ("context_fp8", (32, 4), (200, 5, 64), (700, 0, 64), 16, True),
+        ("context_nvfp4", (32, 4), (200, 5, 64), (700, 0, 64), 16, False),
+        ("context_fp8_hd256", (32, 8), (200, 5, 64), (700, 0, 64), 16, False),
+        ("context_fp16_hd256", (32, 8), (200, 5, 64), (700, 0, 64), 16, False),
+        ("context_fp16_hd256", (16, 2), (2048, 300, 1), (2048, 0, 0), 16, False),
+        # Causal tiles whose rows see no key in requests that hold keys:
+        # q - kv = 2 * 128 / pack * (m + 1) (HD128) or 128 * (m + 1) (HD256).
+        ("context_fp8", (8, 8), (700, 257, 385), (1500, 1, 129), 16, False),
+        ("context_fp8", (32, 4), (64, 100), (32, 300), 16, True),
+        ("context_nvfp4", (8, 8), (700, 257, 385), (1500, 1, 129), 16, False),
+        ("context_nvfp4", (32, 4), (64, 100), (32, 300), 16, False),
+        ("context_fp8_hd256", (8, 8), (511, 129, 300), (2047, 1, 44), 16, False),
+    ],
+)  # fmt: skip
+def test_cake_context_jit_routes_run_tiles_without_keys(
+    monkeypatch,
+    served_programs,
+    component,
+    heads,
+    q_lens,
+    kv_lens,
+    page_size,
+    return_lse,
+) -> None:
+    """Each context JIT route (the program tables off) on tiles without a
+    visible key: the launch completes, rows with a visible key match the FP32
+    reference, rows without one are 0 (LSE -inf) although a request without
+    keys names a NaN page, and the ticket resets."""
+
+    _skip_without_nvfp4_programs(component)
+    monkeypatch.setattr(cake_api, "_CONTEXT_PROGRAM_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_FP8_RUNTIME_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_FP8_SPLIT_ROUTES", {})
+    spec = _JIT_ROUTES[component]
+    loaded = []
+    load = getattr(cake_api, spec.loader)
+
+    def spy(*args, **kwargs):
+        loaded.append(args)
+        return load(*args, **kwargs)
+
+    monkeypatch.setattr(cake_api, spec.loader, spy)
+    case = _jit_route_batch(component, heads, q_lens, kv_lens, page_size)
+    route = _jit_route_of(monkeypatch, case, return_lse=return_lse)
+    assert route.component == component and route.program is None
+    assert _jit_route_tiles_without_keys(case, route)
+    out, lse = _run_jit_route_batch(case, return_lse=return_lse)
+    assert loaded and not served_programs
+    _check_jit_route_rows(case, out, lse)
+
+
+def _jit_route_head(case, requests):
+    """The batch's first ``requests`` requests: the same pool, query rows and
+    table rows."""
+
+    rows = sum(case.q_lens[:requests])
+    return SimpleNamespace(
+        **{
+            **vars(case),
+            "q_lens": case.q_lens[:requests],
+            "kv_lens": case.kv_lens[:requests],
+            "query": case.query[:rows],
+            "tables_k": case.tables_k[:requests],
+            "tables_v": case.tables_v[:requests],
+            "block_tables": case.block_tables[:requests],
+            "seq_lens": case.seq_lens[:requests],
+            "cum_q": case.cum_q[: requests + 1],
+            "cum_kv": case.cum_kv[: requests + 1],
+        }
+    )
+
+
+@_GPU
+@pytest.mark.parametrize(
+    ("heads", "q_lens", "kv_lens", "page_size"),
+    [
+        # 30, 30 and 20 work units (requests x query heads) under test, at 3,
+        # 4 and 3 m-blocks; the last request (one query token, one key)
+        # completes 40 units.
+        ((10, 2), (300, 64, 1, 1), (900, 64, 17, 1), 32),
+        ((10, 2), (511, 511, 511, 1), (2047, 1024, 600, 1), 32),
+        ((20, 4), (257, 1), (300, 1), 16),
+    ],
+)  # fmt: skip
+def test_cake_context_fp8_hd256_jit_route_runs_a_partial_l2_section(
+    monkeypatch, served_programs, heads, q_lens, kv_lens, page_size
+) -> None:
+    """The FP8 HD256 JIT route takes its tiles in sections of 8 work units.  A
+    batch whose units are not a multiple of 8, with more than one m-block,
+    ends with a partial section: the launch completes, every row matches the
+    FP32 reference, and the rows carry the bits the same requests get in a
+    batch of whole sections (one more request, the same maxima)."""
+
+    monkeypatch.setattr(cake_api, "_CONTEXT_PROGRAM_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_FP8_RUNTIME_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_FP8_SPLIT_ROUTES", {})
+    whole = _jit_route_batch("context_fp8_hd256", heads, q_lens, kv_lens, page_size)
+    case = _jit_route_head(whole, len(q_lens) - 1)
+    assert len(case.q_lens) * heads[0] % 8 and not len(q_lens) * heads[0] % 8
+    route = _jit_route_of(monkeypatch, case)
+    assert route.component == "context_fp8_hd256" and route.program is None
+    assert route.num_m_blocks > 1 and not _jit_route_tiles_without_keys(case, route)
+    out, _ = _run_jit_route_batch(case)
+    assert not served_programs
+    _check_jit_route_rows(case, out, None)
+    whole_out, _ = _run_jit_route_batch(whole)
+    assert torch.equal(_bits(out), _bits(whole_out[: out.shape[0]]))
+
+
+@_GPU
+@pytest.mark.parametrize(
+    ("component", "program", "heads", "q_lens", "kv_lens", "page_size"),
+    [
+        # Requests without keys beside keyed ones (the exact FP8 program, pack
+        # 8) and causal tiles without a visible key (NVFP4 Q511, pack 8:
+        # q - kv = 32 (m + 1)).
+        ("context_fp8", "B256", (32, 4), (32,) * 4, (1024, 0, 17, 0), 64),
+        ("context_nvfp4", "Q511", (32, 4), (511,) * 4, (2047, 0, 479, 255), 16),
+    ],
+)  # fmt: skip
+def test_cake_context_quantized_program_and_jit_route_agree_on_rows_without_keys(
+    monkeypatch, served_programs, component, program, heads, q_lens, kv_lens, page_size
+) -> None:
+    """A batch an FP8 / NVFP4 program serves, with requests without keys or
+    causal tiles without a visible key: the program and the component's JIT
+    route (the program tables off) both complete and give the same bits on
+    every row, 0 on the rows without a visible key."""
+
+    _skip_without_nvfp4_programs(component)
+    _whole_tile_routes(monkeypatch)
+    target = cake_api._cake_fmha_target(torch.device("cuda"))
+    if program == "B256":
+        program = _FP8_EXACT[target]
+    else:
+        program = f"{program}_SM{_TARGET_ARCH[target][3:].upper()}"
+    case = _jit_route_batch(component, heads, q_lens, kv_lens, page_size)
+    out, _ = _run_jit_route_batch(case)
+    assert served_programs == [program]
+    _check_jit_route_rows(case, out, None)
+    monkeypatch.setattr(cake_api, "_CONTEXT_PROGRAM_ROUTES", {})
+    monkeypatch.setattr(cake_api, "_CONTEXT_FP8_RUNTIME_ROUTES", {})
+    route = _jit_route_of(monkeypatch, case)
+    assert route.component == component and route.program is None
+    assert _jit_route_tiles_without_keys(case, route)
+    jit_out, _ = _run_jit_route_batch(case)
+    assert served_programs == [program]
+    assert torch.equal(_bits(jit_out), _bits(out))
+    assert _jit_route_rows_without_keys(case)
 
 
 @_GPU
