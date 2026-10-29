@@ -195,7 +195,6 @@ class MlaConfig(Nvfp4KVConfig):
     fuse_sparse_cluster_epilogue: bool = False
     fuse_sparse_reduction: bool = False
     sparse_direct: bool = False
-    sparse_static_scales: bool = False
     sparse_valid_prefix: bool = False
     sparse_direct_capacities: tuple[int, int] = (0, 0)
     page_offsets_num_warps: int = 1

@@ -1010,7 +1010,6 @@ class MlaDecodeTs(Nvfp4KVConfig):
         # Sparse attention binds separate source lists; dense attention uses
         # the ordinary page table. Both reuse the staged KV loaders.
         self.direct_sparse = False
-        self.direct_static_scales = False
         self.sparse_gather_warps = 1
         self.sparse_kv_stages = 0
         self.sparse_uniform_pages = False
@@ -1082,7 +1081,6 @@ class MlaDecodeTs(Nvfp4KVConfig):
             self.fuse_sparse_epilogue,
             self.output_quant,
             self.direct_sparse,
-            self.direct_static_scales,
             self.assume_valid_prefix,
             self.direct_sparse_capacities,
             self.sparse_gather_warps,
@@ -1770,7 +1768,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
         if cutlass.const_expr(self.direct_sparse):
             from ..helpers.sparse_indices import bind_sparse_kv_indices
 
-            si, ci, sl, cl, sinks, ks, sm, os = block_split_kvs
+            si, ci, sl, cl, sinks, ks = block_split_kvs
             capacity = cutlass.const_expr(
                 max(
                     256,
@@ -1800,10 +1798,6 @@ class MlaDecodeTs(Nvfp4KVConfig):
                 has_extra=self.direct_sparse_capacities[1] > 0,
                 primary_tensor_scale=ks if self.kv_cache_format == "fp8" else None,
             )
-            if cutlass.const_expr(not self.direct_static_scales):
-                # Caller scales already include Q/K/V descales.
-                scale_softmax_log2 = Float32(sm[0]) * LOG2_E
-                output_scale = Float32(os[0])
         cfg = self._make_config()
         num_query_tiles = self.num_q_tiles
         use_clc_dynamic = self.is_persistent and not cfg.is_fp8_qkv()

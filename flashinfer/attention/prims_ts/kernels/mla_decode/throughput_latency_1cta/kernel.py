@@ -1815,7 +1815,6 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         # Sparse attention binds separate source lists; dense attention uses
         # the ordinary page table. Both reuse the staged KV loaders.
         self.direct_sparse = False
-        self.direct_static_scales = False
         self.assume_valid_prefix = False
         self.direct_sparse_capacities = (0, 0)
 
@@ -2005,11 +2004,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 )
                 // cfg.num_tokens_per_page,
             )
-        return dataclass_replace(
-            cfg,
-            lse_base_on_e=self.lse_base_on_e,
-            sparse_static_scales=self.direct_static_scales,
-        )
+        return dataclass_replace(cfg, lse_base_on_e=self.lse_base_on_e)
 
     def validate_split_kv_launch(self, split_kv: int, workspace) -> None:
         """Validate host-side split-KV arguments before compiling the JIT body."""
@@ -2590,7 +2585,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         if cutlass.const_expr(cfg.sparse_direct):
             from ..helpers.sparse_indices import bind_sparse_kv_indices
 
-            si, ci, sl, cl, sinks, ks, sm, os = sparse_inputs
+            si, ci, sl, cl, sinks, ks = sparse_inputs
             request = None
             if cutlass.const_expr(cfg.use_persistent_scheduler != 1):
                 request = cutlass.Int64(cute.arch.block_idx()[2])
@@ -2605,10 +2600,6 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 has_extra=cfg.sparse_direct_capacities[1] > 0,
                 primary_tensor_scale=ks if cfg.kv_cache_format == "fp8" else None,
             )
-            if cutlass.const_expr(not cfg.sparse_static_scales):
-                # Caller scales already include Q/K/V descales.
-                scale_softmax_log2 = cutlass.Float32(sm[0]) * LOG2_E
-                output_scale = cutlass.Float32(os[0])
             sparse_epilogue_params = sinks
         else:
             sparse_epilogue_params = None

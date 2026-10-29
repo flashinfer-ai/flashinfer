@@ -721,10 +721,8 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
         bl[0] = 0
     attention_sinks = torch.randn(heads, device="cuda")
     attention_sinks[0], attention_sinks[1] = torch.inf, -torch.inf
-    kv_scale = torch.tensor(
-        0.75 if dtype == torch.float8_e4m3fn else 1.0, device="cuda"
-    )
-    q_scale = torch.tensor(1.25 if dtype == torch.float8_e4m3fn else 1.0, device="cuda")
+    kv_scale = 0.75 if dtype == torch.float8_e4m3fn else 1.0
+    q_scale = 1.25 if dtype == torch.float8_e4m3fn else 1.0
     offsets = (
         torch.tensor([0, 1, 3], device="cuda", dtype=torch.int32) if packed else None
     )
@@ -748,22 +746,17 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
         return_lse=True,
         assume_valid_prefix=prefix,
     )
-    attention_scale = torch.tensor(512**-0.5, device=q.device)
-    output_multiplier = torch.tensor(0.75, device=q.device)
-    effective_softmax_scale = torch.empty_like(attention_scale)
-    effective_output_scale = torch.empty_like(output_multiplier)
+    attention_scale = 512**-0.5
+    output_multiplier = 0.75
     scales = dict(
-        softmax_scale=effective_softmax_scale,
-        output_scale=effective_output_scale,
+        softmax_scale=attention_scale * q_scale * kv_scale,
+        output_scale=output_multiplier * kv_scale,
         attention_sinks=attention_sinks,
     )
 
     def prepare(out=None):
-        # Upstream work combines descales into stable graph inputs. The oracle
-        # below keeps the original Q/K/V factors to check equivalence.
-        torch.mul(attention_scale, q_scale, out=effective_softmax_scale)
-        effective_softmax_scale.mul_(kv_scale)
-        torch.mul(output_multiplier, kv_scale, out=effective_output_scale)
+        """Refresh selected-row metadata in reusable graph-stable buffers."""
+        # Metadata remains live in replay; scales are host-composed before capture.
         return prepare_sparse_mla_indices(
             w,
             q,
@@ -781,6 +774,7 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
     lse = torch.empty(q.shape[:-1], device=q.device)
 
     def run(checked=False, target_lse=lse):
+        """Launch into caller-owned outputs using the current host-composed scales."""
         return w.run(
             q,
             primary,
@@ -794,6 +788,7 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
         )
 
     def check(target_lse=lse):
+        """Compare output and natural-log LSE with the independent FP64 oracle."""
         prefix_shape = q.shape[:-2]
         ref, ref_lse, bound = _reference(
             q,
@@ -803,10 +798,10 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
             bi.reshape(*prefix_shape, kb) if extra else None,
             lengths=al.reshape(prefix_shape),
             extra_lengths=bl.reshape(prefix_shape) if extra else None,
-            q_scale=q_scale.item(),
-            kv_scale=kv_scale.item(),
-            softmax_scale=attention_scale.item(),
-            output_scale=output_multiplier.item(),
+            q_scale=q_scale,
+            kv_scale=kv_scale,
+            softmax_scale=attention_scale,
+            output_scale=output_multiplier,
             attention_sinks=attention_sinks,
         )
         if dtype == torch.float8_e4m3fn:
@@ -830,14 +825,39 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
         bi.copy_(bi.flip(-1))
         bi[:, 3::11] = -1
         bl[0], bl[-1] = 1, 0
-    if dtype == torch.float8_e4m3fn:
-        kv_scale.fill_(1.25)
-        q_scale.fill_(0.5)
-    attention_scale.mul_(0.75)
-    output_multiplier.fill_(1.25)
     graph.replay()
     torch.cuda.synchronize()
     check()
+    # Host scales change between eager launches without planning or compiling.
+    # A captured graph retains its FP32 values; recapture for the new scales.
+    if dtype == torch.float8_e4m3fn:
+        kv_scale, q_scale = 1.25, 0.5
+    attention_scale *= 0.75
+    output_multiplier = 1.25
+    scales.update(
+        softmax_scale=attention_scale * q_scale * kv_scale,
+        output_scale=output_multiplier * kv_scale,
+    )
+    run(checked=True)
+    check()
+    updated_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(updated_graph):
+        prepare(out=meta)
+        run()
+    updated_graph.replay()
+    torch.cuda.synchronize()
+    check()
+    invalid_scales = dict(scales, softmax_scale=torch.ones((), device=q.device))
+    with pytest.raises(TypeError, match="Python int or float"):
+        w.run(
+            q,
+            primary,
+            **meta,
+            extra_kv_cache=secondary if extra else None,
+            qo_indptr=offsets,
+            validate=False,
+            **invalid_scales,
+        )
     assert torch.count_nonzero(out.reshape(rows, heads, 512)[-1]) == 0
     assert torch.isneginf(lse.reshape(rows, heads)[-1]).all()
     if packed:

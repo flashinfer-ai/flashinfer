@@ -202,6 +202,59 @@ def _store_parallel_reduction_result(
 
 
 @cute.jit
+def accumulate_parallel_reduction_slot(
+    acc_output,
+    smem_local_scale,
+    local_output,
+    row_in_tile,
+    query_tile_idx,
+    batch_idx,
+    element_idx,
+    slot_i,
+    rank_split_begin,
+    query_is_valid,
+    active_split_kv,
+    actual_splits: cutlass.Constexpr[int],
+    finalize_attention: cutlass.Constexpr[bool],
+):
+    """Add one valid split's BF16 vec4 partial into the FP32 register fragment.
+
+    ``slot_i`` indexes rank-local scales; ``rank_split_begin`` maps it into the
+    producer workspace. Inactive slots never load workspace, and sparse
+    finalization skips zero-weight partials. The updated fragment is returned
+    so both static and runtime merge loops share identical accumulation.
+    """
+    acc_output_ptr = acc_output.iterator.raw_ptr()
+    split_idx = rank_split_begin + Int32(slot_i)
+    active_slot = (
+        query_is_valid
+        & (split_idx < Int32(actual_splits))
+        & (split_idx < active_split_kv)
+    )
+    if active_slot:
+        split_scale = Float32(smem_local_scale[slot_i])
+        if not finalize_attention or split_scale > Float32(0):
+            partial_offset = Int64(
+                row_in_tile * acc_output.stride[0]
+                + split_idx * acc_output.stride[1]
+                + element_idx * acc_output.stride[2]
+                + query_tile_idx * acc_output.stride[3]
+                + batch_idx * acc_output.stride[4]
+            )
+            partial_output = (
+                (acc_output_ptr + partial_offset)
+                .load(
+                    count=PARALLEL_REDUCTION_ELEMENTS_PER_THREAD,
+                    alignment=8,
+                )
+                .to(Float32)
+            )
+            for j in cutlass.range_constexpr(PARALLEL_REDUCTION_ELEMENTS_PER_THREAD):
+                local_output[j] += partial_output[j] * split_scale
+    return local_output
+
+
+@cute.jit
 def run_parallel_reduction_kernel(
     num_heads: cutlass.Constexpr[int],
     seq_len_q: cutlass.Constexpr[int],
@@ -394,36 +447,43 @@ def run_parallel_reduction_kernel(
     for j in cutlass.range_constexpr(PARALLEL_REDUCTION_ELEMENTS_PER_THREAD):
         local_output[j] = Float32(0.0)
 
-    acc_output_ptr = acc_output.iterator.raw_ptr()
-    for slot_i in cutlass.range(live_rank_splits, unroll=4):
-        split_idx = rank_split_begin + Int32(slot_i)
-        active_slot = (
-            query_is_valid
-            & (split_idx < Int32(actual_splits))
-            & (split_idx < active_split_kv)
-        )
-        if active_slot:
-            split_scale = Float32(smem_local_scale[slot_i])
-            if not finalize_attention or split_scale > Float32(0):
-                partial_offset = Int64(
-                    row_in_tile * acc_output.stride[0]
-                    + split_idx * acc_output.stride[1]
-                    + element_idx * acc_output.stride[2]
-                    + query_tile_idx * acc_output.stride[3]
-                    + batch_idx * acc_output.stride[4]
-                )
-                partial_output = (
-                    (acc_output_ptr + partial_offset)
-                    .load(
-                        count=PARALLEL_REDUCTION_ELEMENTS_PER_THREAD,
-                        alignment=8,
-                    )
-                    .to(Float32)
-                )
-                for j in cutlass.range_constexpr(
-                    PARALLEL_REDUCTION_ELEMENTS_PER_THREAD
-                ):
-                    local_output[j] += partial_output[j] * split_scale
+    if cutlass.const_expr(finalize_attention):
+        # Sparse plans have fixed split capacity; stage each merge slot directly.
+        # Resolve fixed slot addresses before generating the staged merge loop.
+        for slot_i in cutlass.range_constexpr(slots_per_rank):
+            local_output = accumulate_parallel_reduction_slot(
+                acc_output,
+                smem_local_scale,
+                local_output,
+                row_in_tile,
+                query_tile_idx,
+                batch_idx,
+                element_idx,
+                slot_i,
+                rank_split_begin,
+                query_is_valid,
+                active_split_kv,
+                actual_splits,
+                finalize_attention,
+            )
+    else:
+        # Dense plans keep runtime split pruning within their prepared capacity.
+        for slot_i in cutlass.range(live_rank_splits, unroll=4):
+            local_output = accumulate_parallel_reduction_slot(
+                acc_output,
+                smem_local_scale,
+                local_output,
+                row_in_tile,
+                query_tile_idx,
+                batch_idx,
+                element_idx,
+                slot_i,
+                rank_split_begin,
+                query_is_valid,
+                active_split_kv,
+                actual_splits,
+                finalize_attention,
+            )
 
     local_lse_value = smem_local_lse[0]
 
