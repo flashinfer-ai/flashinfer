@@ -691,6 +691,7 @@ def _cfg(**overrides) -> SimpleNamespace:
         "num_padding_warps": 1,
         "padding_regs": 24,
         "use_early_exit": False,
+        "weight_l2_evict_first": 0,
     }
     values.update(overrides)
     return SimpleNamespace(**values, warp_layout=SimpleNamespace(**values))
