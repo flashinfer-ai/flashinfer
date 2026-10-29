@@ -2384,7 +2384,12 @@ def validate_minimax_h3_varlen_inputs(
 # (:func:`build_tile_tables` ``launch_pair``) fork from the caller's stream
 # onto a greatest-priority and a least-priority stream and join back.  A
 # prepared runner owns one stream set; the one-shot entries launch and join
-# inside the call, so the calls of one thread share that thread's set.
+# inside the call, so the calls of one thread on one caller stream share a
+# set.  The key is the caller stream's handle, as in the BF16 plan cache:
+# calls on two caller streams get their own sets and stay concurrent, and a
+# warm-up on a capture stream creates the set its capture uses.  A set holds
+# two pooled torch streams and four events, so the sets live as long as the
+# thread (one per caller stream handle; a reused handle reuses its set).
 _THREAD_SIDE_STREAMS = threading.local()
 
 
@@ -2406,16 +2411,18 @@ def _new_side_streams(device: torch.device) -> tuple:
 
 def _side_streams(device: torch.device, shared: bool) -> tuple:
     """A new stream set (``shared`` false: a prepared runner's) or the calling
-    thread's set for ``device`` (created once; the one-shot entries)."""
+    thread's set for ``device`` and its current stream (created once; the
+    one-shot entries)."""
     if not shared:
         return _new_side_streams(device)
     sets = getattr(_THREAD_SIDE_STREAMS, "sets", None)
     if sets is None:
         sets = _THREAD_SIDE_STREAMS.sets = {}
     index = _device_index(device)
-    side = sets.get(index)
+    key = (index, torch.cuda.current_stream(index).cuda_stream)
+    side = sets.get(key)
     if side is None:
-        side = sets[index] = _new_side_streams(torch.device("cuda", index))
+        side = sets[key] = _new_side_streams(torch.device("cuda", index))
     return side
 
 

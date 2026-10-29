@@ -2356,6 +2356,81 @@ def test_nvfp4_rejects_a_misaligned_workspace_tensor(pv_mode):
     )
 
 
+@pytest.mark.parametrize(
+    "route,cu,heads",
+    [
+        ("bf16", [0, 19296], 28),  # center_5s_p2: a tail-grid plan on B200
+        ("fp8", [0, 27488], 14),  # center_15s_p4: a tail-first plan on B200
+        ("fp4", [0, 19296], 28),  # center_5s_p2: a tail-grid plan on B200
+    ],
+)
+def test_one_shot_side_streams_follow_the_caller_stream(route, cu, heads):
+    """The one-shot entries take the calling thread's side streams per caller
+    stream: calls on two caller streams of one thread get their own stream
+    sets (so their two-launch schedules stay concurrent), a repeated call
+    reuses its stream's set and every output is bitwise the default stream's.
+    A BF16 call warmed up on a stream captures there with that stream's set
+    and the graph replays the same output.  Off the two-launch architectures
+    every plan runs on the caller's stream and no set is created."""
+    arch = _require_program(
+        "bf16" if route == "bf16" else cake_backend.NVFP4_VARIANT[route]
+    )
+    scheduled = arch in (
+        cake_backend.BF16_TAIL_GRID_ARCHES
+        if route == "bf16"
+        else cake_backend.NVFP4_TFS_ARCHES
+    )
+    q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=16)
+
+    def call():
+        if route == "bf16":
+            return minimax_h3_varlen_attention(q, k, v, cu_seqlens, cu_seqlens_host=cu)
+        return minimax_h3_varlen_nvfp4_attention(
+            q, k, v, cu_seqlens, pv_mode=route, cu_seqlens_host=cu
+        )
+
+    torch.cuda.synchronize()
+    cake_backend._THREAD_SIDE_STREAMS.sets = {}
+    main, x, y = torch.cuda.current_stream(), torch.cuda.Stream(), torch.cuda.Stream()
+    expected = call()
+    x.wait_stream(main)
+    y.wait_stream(main)
+    with torch.cuda.stream(x):
+        out_x = call()
+    with torch.cuda.stream(y):
+        out_y = call()
+    with torch.cuda.stream(x):
+        again_x = call()
+    torch.cuda.synchronize()
+    sets = cake_backend._THREAD_SIDE_STREAMS.sets
+    index = torch.cuda.current_device()
+    if scheduled:
+        assert set(sets) == {(index, s.cuda_stream) for s in (main, x, y)}, (
+            f"expected a two-launch plan on {arch}"
+        )
+        pairs = [sets[(index, c.cuda_stream)][:2] for c in (main, x, y)]
+        assert len({s.cuda_stream for pair in pairs for s in pair}) == 6
+    else:
+        assert not sets
+    for out in (out_x, out_y, again_x):
+        assert torch.equal(out, expected)
+    if route == "bf16":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=x):
+            captured = call()
+        assert len(sets) == (3 if scheduled else 0)
+        captured.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(captured, expected)
+    _check(
+        expected,
+        _reference(q, k, v, cu, 1.0 / math.sqrt(HEAD_DIM)),
+        BF16_ATOL if route == "bf16" else NVFP4_ATOL,
+        BF16_RTOL if route == "bf16" else NVFP4_RTOL,
+    )
+
+
 # Large offsets through the public calls: 301 segments of 8192 tokens, a ragged
 # split segment and a one-block segment (stored directly, not through a partial
 # slot) at 7 heads give T * H = 17296083 output rows (1.03 * 2^24: output
