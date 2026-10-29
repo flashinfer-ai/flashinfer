@@ -312,7 +312,7 @@ __device__ __forceinline__ void tma_store_4d(
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_dsv4_f0c84ff1c7e6bce419fb(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_k, const __grid_constant__ CUtensorMap tmap_compressed_k, const __grid_constant__ CUtensorMap tmap_swa_v, const __grid_constant__ CUtensorMap tmap_compressed_v, const __grid_constant__ CUtensorMap O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int num_query_tokens, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int has_sinks, int total_work_items, int ragged_query, int max_q_len, int batch_size)
+kernel_cake_dsv4_3eaffaa117944ce5e14e(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_k, const __grid_constant__ CUtensorMap tmap_compressed_k, const __grid_constant__ CUtensorMap tmap_swa_v, const __grid_constant__ CUtensorMap tmap_compressed_v, const __grid_constant__ CUtensorMap O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int num_query_tokens, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int has_sinks, int total_work_items, int ragged_query, int max_q_len, int batch_size)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -376,6 +376,27 @@ kernel_cake_dsv4_f0c84ff1c7e6bce419fb(const __grid_constant__ CUtensorMap tmap_q
     const int smem_epilogue_exchange_addr = smem + 219136;
     unsigned int* smem_index_valid = reinterpret_cast<unsigned int*>(smem_raw + 219648);
     const int smem_index_valid_addr = smem + 219648;
+#if __CUDA_ARCH__ == 1030
+#else
+    if (warp == 13 && cluster_id < (unsigned int)total_work_items) {
+        int prefetch_split = cluster_id % 4;
+        int prefetch_query = cluster_id / 4;
+        int prefetch_owner = prefetch_split * 128;
+        int* prefetch_swa = swa_indices + (prefetch_query * swa_index_stride);
+        int* prefetch_compressed = compressed_indices + (prefetch_query * compressed_index_stride);
+        #pragma unroll
+        for (int prefetch_pass = 0; prefetch_pass < 1; prefetch_pass++) {
+            int prefetch_offset = prefetch_pass * 128 + lane * 4;
+            int prefetch_col = prefetch_owner + prefetch_offset;
+            int* prefetch_src = ((prefetch_col < 128) ? (prefetch_swa + prefetch_col) : (prefetch_compressed + (prefetch_col - 128)));
+            if (prefetch_col + 4 <= sparse_topk) {
+                asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 16;"
+                    :: "r"(smem_indices_addr + (unsigned int)(prefetch_offset * 4)), "l"(prefetch_src));
+            }
+        }
+        asm volatile("cp.async.commit_group;");
+    }
+#endif
 
     // Mbarrier init (19 pipeline groups, 0 ordered-sequence groups, 33 barriers)
     // Mbarriers at smem_raw[0..264)
@@ -1475,6 +1496,7 @@ kernel_cake_dsv4_f0c84ff1c7e6bce419fb(const __grid_constant__ CUtensorMap tmap_q
                     }
                     if (combined_col + 4 <= sparse_topk) {
                         int _vec_load_0[4];
+#if __CUDA_ARCH__ == 1030
                         {
                             const int4* _ivptr_0 = reinterpret_cast<const int4*>(index_src + 0);
                             int4 _ivld_0;
@@ -1483,6 +1505,24 @@ kernel_cake_dsv4_f0c84ff1c7e6bce419fb(const __grid_constant__ CUtensorMap tmap_q
                             _vec_load_0[0 + 1] = _ivld_0.y;
                             _vec_load_0[0 + 2] = _ivld_0.z;
                             _vec_load_0[0 + 3] = _ivld_0.w;
+#else
+                        if (valid_iter_1 == 0) {
+                            asm volatile("cp.async.wait_group 0;");
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&_vec_load_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&_vec_load_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&_vec_load_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&_vec_load_0[(0) + 3]))
+                                : "r"(smem_indices_addr + (unsigned int)(index_offset_4 * 4)));
+                        } else {
+                            {
+                                const int4* _ivptr_0 = reinterpret_cast<const int4*>(index_src + 0);
+                                int4 _ivld_0;
+                                asm volatile("ld.global.nc.v4.b32 {%0, %1, %2, %3}, [%4];"
+                                    : "=r"(_ivld_0.x), "=r"(_ivld_0.y), "=r"(_ivld_0.z), "=r"(_ivld_0.w) : "l"((const void*)(_ivptr_0)) : "memory");
+                                _vec_load_0[0 + 0] = _ivld_0.x;
+                                _vec_load_0[0 + 1] = _ivld_0.y;
+                                _vec_load_0[0 + 2] = _ivld_0.z;
+                                _vec_load_0[0 + 3] = _ivld_0.w;
+                            }
+#endif
                         }
                         #pragma unroll
                         for (int i_1 = 0; i_1 < 4; i_1++) {
@@ -1493,18 +1533,40 @@ kernel_cake_dsv4_f0c84ff1c7e6bce419fb(const __grid_constant__ CUtensorMap tmap_q
                         #pragma unroll
                         for (int i_2 = 0; i_2 < 4; i_2++) {
                             if (combined_col + i_2 < sparse_topk) {
+#if __CUDA_ARCH__ == 1030
                                 values[i_2] = index_src[i_2];
+#else
+                                {
+                                    uint32_t _scalar_bits_1;
+                                    asm volatile("ld.global.nc.b32 %0, [%1];"
+                                        : "=r"(_scalar_bits_1) : "l"((const void*)(index_src + i_2 + (0))) : "memory");
+                                    values[i_2] = (int32_t)_scalar_bits_1;
+                                }
+#endif
                             }
                         }
                     }
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_indices_addr + (unsigned int)(index_offset_4 * 4)), "r"(values[0]), "r"(values[1]), "r"(values[2]), "r"(values[3]) : "memory");
                     unsigned int valid_word = (((values[0] >= 0) ? 1 : 0) | ((values[1] >= 0) ? 1 : 0) << 1 | ((values[2] >= 0) ? 1 : 0) << 2 | ((values[3] >= 0) ? 1 : 0) << 3) << (lane & 7) * 4;
+#if __CUDA_ARCH__ == 1030
                     unsigned int _shfl_xor_sync_1 = __shfl_xor_sync(0xFFFFFFFF, valid_word, 1);
                     valid_word = valid_word | _shfl_xor_sync_1;
                     unsigned int _shfl_xor_sync_2 = __shfl_xor_sync(0xFFFFFFFF, valid_word, 2);
+#else
+                    unsigned int _shfl_xor_sync_2 = __shfl_xor_sync(0xFFFFFFFF, valid_word, 1);
+#endif
                     valid_word = valid_word | _shfl_xor_sync_2;
+#if __CUDA_ARCH__ == 1030
                     unsigned int _shfl_xor_sync_3 = __shfl_xor_sync(0xFFFFFFFF, valid_word, 4);
+#else
+                    unsigned int _shfl_xor_sync_3 = __shfl_xor_sync(0xFFFFFFFF, valid_word, 2);
+#endif
                     valid_word = valid_word | _shfl_xor_sync_3;
+#if __CUDA_ARCH__ == 1030
+#else
+                    unsigned int _shfl_xor_sync_4 = __shfl_xor_sync(0xFFFFFFFF, valid_word, 4);
+                    valid_word = valid_word | _shfl_xor_sync_4;
+#endif
                     if ((lane & 7) == 0) {
                         smem_index_valid[valid_slot_1 * 36 + index_pass * 4 + (lane >> 3)] = valid_word;
                     }

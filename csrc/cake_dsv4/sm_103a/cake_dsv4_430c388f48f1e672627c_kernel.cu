@@ -841,14 +841,14 @@ kernel_cake_dsv4_430c388f48f1e672627c(const __grid_constant__ CUtensorMap tmap_q
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&helper_rows[0])), "=r"(*reinterpret_cast<uint32_t*>(&helper_rows[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&helper_rows[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&helper_rows[(0) + 3]))
                             : "r"(smem_sparse_indices_addr + (unsigned int)(helper_group * 16)));
-                        int hrow0 = ((helper_rows[0] >= 0) ? helper_rows[0] : 0);
-                        int hrow1 = ((helper_rows[1] >= 0) ? helper_rows[1] : 0);
-                        int hrow2 = ((helper_rows[2] >= 0) ? helper_rows[2] : 0);
-                        int hrow3 = ((helper_rows[3] >= 0) ? helper_rows[3] : 0);
+                        int row0_4 = ((helper_rows[0] >= 0) ? helper_rows[0] : 0);
+                        int row1_4 = ((helper_rows[1] >= 0) ? helper_rows[1] : 0);
+                        int row2_4 = ((helper_rows[2] >= 0) ? helper_rows[2] : 0);
+                        int row3_4 = ((helper_rows[3] >= 0) ? helper_rows[3] : 0);
                         if (first_tile_1 == 0) {
                             tma_gather4_gmem2smem(helper_dst + helper_group * 512, (&tmap_swa_kv), helper_stage * 128, helper_rows[0], helper_rows[1], helper_rows[2], helper_rows[3], kv_full_addr + ((int)((unsigned int)warp % 4)) * 8);
                         } else {
-                            tma_gather4_gmem2smem(helper_dst + helper_group * 512, (&tmap_compressed_kv), helper_stage * 128, hrow0, hrow1, hrow2, hrow3, kv_full_addr + ((int)((unsigned int)warp % 4)) * 8);
+                            tma_gather4_gmem2smem(helper_dst + helper_group * 512, (&tmap_compressed_kv), helper_stage * 128, row0_4, row1_4, row2_4, row3_4, kv_full_addr + ((int)((unsigned int)warp % 4)) * 8);
                         }
                     }
                 }
