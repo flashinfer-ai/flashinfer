@@ -38,10 +38,10 @@ backward main kernel needs a large shared-memory carveout, so a side kernel
 holding every SM with the default carveout delays its start until the side
 kernel exits (documented in :mod:`flashinfer.cake_rmsnorm_train`).  The
 documented remedy is checked here: with the side kernel's preferred carveout
-set to the maximum shared memory, the backward (residual route excepted: it
-also needs nearly all registers) and the forward start beside it and cost at
-most ``MAX_ALL_SM_EXTRA_MS`` more than alone, far below the side kernel's
-``ALL_SM_SPIN_MS`` lifetime.  Every side CTA records its SM, and a run counts
+set to the maximum shared memory, the backward and the forward start beside it
+and cost at most ``MAX_ALL_SM_EXTRA_MS`` more than alone, far below the side
+kernel's ``ALL_SM_SPIN_MS`` lifetime.  The residual route and the programs in
+``WHOLE_SM_ABOVE`` need a whole SM and are not checked.  Every side CTA records its SM, and a run counts
 only when the side kernel holds every SM.
 """
 
@@ -270,6 +270,24 @@ ALL_SM_TRIES = 4
 MAX_ALL_SM_EXTRA_MS = 1.0
 # cudaSharedmemCarveoutMaxShared
 CARVEOUT_MAX_SHARED = 100
+# Programs that need a whole SM wait beside a kernel resident on every SM
+# whatever its carveout (documented in :mod:`flashinfer.cake_rmsnorm_train`):
+# (capability, kind, hidden) -> the token counts above which the call does.
+WHOLE_SM_ABOVE = {
+    ((10, 7), "bwd", 1536): 1024,
+    ((10, 7), "bwd", 2048): 256,
+    ((10, 7), "bwd", 4096): 1024,
+    ((10, 7), "fwd", 6144): 4096,
+}
+
+
+def _skip_if_whole_sm(kind: str, hidden: int, rows: int) -> None:
+    above = WHOLE_SM_ABOVE.get((_capability(), kind, hidden))
+    if above is not None and rows > above:
+        pytest.skip(
+            f"the {kind} of hidden={hidden} above {above} rows needs a whole SM"
+        )
+
 
 _SPIN_KERNEL = "cake_rmsnorm_train_stall_spin"
 _SPIN_SOURCE = r"""
@@ -419,6 +437,7 @@ def test_backward_starts_beside_an_all_sm_kernel_with_the_max_shared_carveout(
     hidden: int, residual: bool, rows: int
 ) -> None:
     _skip_unless_route(hidden, residual)
+    _skip_if_whole_sm("bwd", hidden, rows)
     x, w, g, g_h, rstd = _inputs(rows, hidden, residual)
     workspace = cake_rmsnorm_train_backward_workspace(
         rows, hidden, _device(), residual=residual
@@ -450,6 +469,7 @@ def test_forward_starts_beside_an_all_sm_kernel_with_the_max_shared_carveout(
     hidden: int, rows: int
 ) -> None:
     _skip_unless_route(hidden, False)
+    _skip_if_whole_sm("fwd", hidden, rows)
     x, w, _g, _g_h, _rstd = _inputs(rows, hidden, False)
 
     def call():

@@ -44,11 +44,13 @@ delays the backward's start until that kernel exits.  Kernels that hold only
 some SMs (communication kernels with 16-32 CTAs) cost the backward no more
 than the SMs they hold.  Setting ``cudaFuncAttributePreferredSharedMemoryCarveout``
 to ``cudaSharedmemCarveoutMaxShared`` on such a resident kernel, or giving it a
-large dynamic shared-memory allocation, lets the backward start beside it.  The
-residual-fused H 6144 backward also needs nearly all of an SM's registers, so
-it waits beside any kernel resident on every SM.  Some forward programs also
-need more shared memory than a small carveout leaves and wait the same way; the
-same remedy applies to them.
+large dynamic shared-memory allocation, lets the backward start beside it.  Some
+forward programs also need more shared memory than a small carveout leaves and
+wait the same way; the same remedy applies to them.  Programs that need a whole
+SM wait beside any kernel resident on every SM, whatever its carveout: the
+residual-fused H 6144 backward, and on SM107 the backward of H 1536 above 1024
+tokens, H 2048 above 256 and H 4096 above 1024, and the H 6144 forward above
+4096 tokens.  Beside those, leave some SMs free of the resident kernel.
 
 Usage::
 
