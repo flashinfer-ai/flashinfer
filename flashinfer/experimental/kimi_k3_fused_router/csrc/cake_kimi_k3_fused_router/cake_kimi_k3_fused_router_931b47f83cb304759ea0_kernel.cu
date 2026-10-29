@@ -49,22 +49,25 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
-#define SMEM_BOUND_VALUES_OFF 49408
+#define SMEM_FLOOR_SLOTS_OFF 54784
+#define SMEM_FLOOR_SLOTS_STAGE_BYTES 32
+#define SMEM_FLOOR_SLOTS_STRIDE 32
+#define SMEM_BOUND_VALUES_OFF 22528
 #define SMEM_BOUND_VALUES_STAGE_BYTES 128
 #define SMEM_BOUND_VALUES_STRIDE 128
-#define SMEM_CAND_COUNTS_OFF 49536
+#define SMEM_CAND_COUNTS_OFF 22656
 #define SMEM_CAND_COUNTS_STAGE_BYTES 32
 #define SMEM_CAND_COUNTS_STRIDE 32
-#define SMEM_CAND_KEYS_OFF 49568
+#define SMEM_CAND_KEYS_OFF 22688
 #define SMEM_CAND_KEYS_STAGE_BYTES 896
 #define SMEM_CAND_KEYS_STRIDE 896
-#define SMEM_CAND_IDS_OFF 50464
+#define SMEM_CAND_IDS_OFF 23584
 #define SMEM_CAND_IDS_STAGE_BYTES 896
 #define SMEM_CAND_IDS_STRIDE 896
-#define SMEM_CAND_SCORES_OFF 51360
+#define SMEM_CAND_SCORES_OFF 24480
 #define SMEM_CAND_SCORES_STAGE_BYTES 896
 #define SMEM_CAND_SCORES_STRIDE 896
-#define SMEM_RANK_KEYS_OFF 52256
+#define SMEM_RANK_KEYS_OFF 25376
 #define SMEM_RANK_KEYS_STAGE_BYTES 128
 #define SMEM_RANK_KEYS_STRIDE 128
 #define SMEM_HISTOGRAM_OFF 0
@@ -91,7 +94,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_PLAN_COUNTS_OFF 0
 #define SMEM_PLAN_COUNTS_STAGE_BYTES 3584
 #define SMEM_PLAN_COUNTS_STRIDE 3584
-#define SMEM_PLAN_TOTALS_OFF 45824
+#define SMEM_PLAN_TOTALS_OFF 51200
 #define SMEM_PLAN_TOTALS_STAGE_BYTES 3584
 #define SMEM_PLAN_TOTALS_STRIDE 3584
 #define SMEM_PLAN_OFFSETS_OFF 3584
@@ -103,10 +106,16 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_OWN_ROUTES_OFF 9984
 #define SMEM_OWN_ROUTES_STAGE_BYTES 7168
 #define SMEM_OWN_ROUTES_STRIDE 7168
-#define SMEM_STREAM_RING_OFF 17152
+#define SMEM_SMEM_V18_OFF 8192
+#define SMEM_SMEM_V18_STAGE_BYTES 14336
+#define SMEM_SMEM_V18_STRIDE 14336
+#define SMEM_STREAM_RING_OFF 22528
 #define SMEM_STREAM_RING_STAGE_BYTES 28672
 #define SMEM_STREAM_RING_STRIDE 28672
-#define SMEM_TOTAL 52480
+#define SMEM_RANK_BASE_OFF 16512
+#define SMEM_RANK_BASE_STAGE_BYTES 112
+#define SMEM_RANK_BASE_STRIDE 112
+#define SMEM_TOTAL 54912
 #define THREADS 224
 #ifndef BLOCK_M
 #error "BLOCK_M is a downstream specialization of this program; define it on the compile line"
@@ -170,7 +179,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(224, LAUNCH_MIN_BLOCKS) __cluster_dims__(4,1,1) void
-kernel_cake_kimi_k3_fused_router_8af514ed6f78baebea7b(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
+kernel_cake_kimi_k3_fused_router_931b47f83cb304759ea0(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -195,18 +204,20 @@ kernel_cake_kimi_k3_fused_router_8af514ed6f78baebea7b(float* __restrict__ logits
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
     // Kernel setup ops
-    unsigned int* bound_values = reinterpret_cast<unsigned int*>(smem_raw + 49408);
-    const int bound_values_addr = smem + 49408;
-    int* cand_counts = reinterpret_cast<int*>(smem_raw + 49536);
-    const int cand_counts_addr = smem + 49536;
-    unsigned int* cand_keys = reinterpret_cast<unsigned int*>(smem_raw + 49568);
-    const int cand_keys_addr = smem + 49568;
-    int* cand_ids = reinterpret_cast<int*>(smem_raw + 50464);
-    const int cand_ids_addr = smem + 50464;
-    float* cand_scores = reinterpret_cast<float*>(smem_raw + 51360);
-    const int cand_scores_addr = smem + 51360;
-    unsigned int* rank_keys = reinterpret_cast<unsigned int*>(smem_raw + 52256);
-    const int rank_keys_addr = smem + 52256;
+    unsigned int* floor_slots = reinterpret_cast<unsigned int*>(smem_raw + 54784);
+    const int floor_slots_addr = smem + 54784;
+    unsigned int* bound_values = reinterpret_cast<unsigned int*>(smem_raw + 22528);
+    const int bound_values_addr = smem + 22528;
+    int* cand_counts = reinterpret_cast<int*>(smem_raw + 22656);
+    const int cand_counts_addr = smem + 22656;
+    unsigned int* cand_keys = reinterpret_cast<unsigned int*>(smem_raw + 22688);
+    const int cand_keys_addr = smem + 22688;
+    int* cand_ids = reinterpret_cast<int*>(smem_raw + 23584);
+    const int cand_ids_addr = smem + 23584;
+    float* cand_scores = reinterpret_cast<float*>(smem_raw + 24480);
+    const int cand_scores_addr = smem + 24480;
+    unsigned int* rank_keys = reinterpret_cast<unsigned int*>(smem_raw + 25376);
+    const int rank_keys_addr = smem + 25376;
     int* histogram = reinterpret_cast<int*>(smem_raw + 0);
     const int histogram_addr = smem + 0;
     int* tie_warp_sums = reinterpret_cast<int*>(smem_raw + 1040);
@@ -223,16 +234,20 @@ kernel_cake_kimi_k3_fused_router_8af514ed6f78baebea7b(float* __restrict__ logits
     const int phase2_warp_sums_addr = smem + 7168;
     int* plan_counts = reinterpret_cast<int*>(smem_raw + 0);
     const int plan_counts_addr = smem + 0;
-    int* plan_totals = reinterpret_cast<int*>(smem_raw + 45824);
-    const int plan_totals_addr = smem + 45824;
+    int* plan_totals = reinterpret_cast<int*>(smem_raw + 51200);
+    const int plan_totals_addr = smem + 51200;
     int* plan_offsets = reinterpret_cast<int*>(smem_raw + 3584);
     const int plan_offsets_addr = smem + 3584;
     unsigned int* own_bitmap = reinterpret_cast<unsigned int*>(smem_raw + 8192);
     const int own_bitmap_addr = smem + 8192;
     unsigned int* own_routes = reinterpret_cast<unsigned int*>(smem_raw + 9984);
     const int own_routes_addr = smem + 9984;
-    int* stream_ring = reinterpret_cast<int*>(smem_raw + 17152);
-    const int stream_ring_addr = smem + 17152;
+    unsigned int* smem_v18 = reinterpret_cast<unsigned int*>(smem_raw + 8192);
+    const int smem_v18_addr = smem + 8192;
+    int* stream_ring = reinterpret_cast<int*>(smem_raw + 22528);
+    const int stream_ring_addr = smem + 22528;
+    int* rank_base = reinterpret_cast<int*>(smem_raw + 16512);
+    const int rank_base_addr = smem + 16512;
 
     // === Task calls (declaration order) ===
     int global_thread = bid * THREADS + tid;
@@ -260,45 +275,25 @@ kernel_cake_kimi_k3_fused_router_8af514ed6f78baebea7b(float* __restrict__ logits
         _vec_load_0[0 + 2] = _v4.z;
         _vec_load_0[0 + 3] = _v4.w;
     }
-    float next4[4];
-    #pragma unroll
-    for (int next_init = 0; next_init < ITEMS_PER_THREAD; next_init++) {
-        next4[next_init] = 0.0f;
-    }
-    if (bid < M) {
-        {
-            float4 _v4 = *reinterpret_cast<const float4*>(logits + (unsigned long long)bid * (unsigned long long)NUM_EXPERTS + (unsigned long long)expert_base);
-            next4[0 + 0] = _v4.x;
-            next4[0 + 1] = _v4.y;
-            next4[0 + 2] = _v4.z;
-            next4[0 + 3] = _v4.w;
-        }
-    }
     #pragma unroll 1
     for (int token = bid; token < M; token += num_bids) {
-        float logits4[4];
-        #pragma unroll
-        for (int next_take = 0; next_take < ITEMS_PER_THREAD; next_take++) {
-            logits4[next_take] = next4[next_take];
-        }
-        int prefetch_token = token + num_bids;
-        if (prefetch_token < M) {
-            {
-                float4 _v4 = *reinterpret_cast<const float4*>(logits + (unsigned long long)prefetch_token * (unsigned long long)NUM_EXPERTS + (unsigned long long)expert_base);
-                next4[0 + 0] = _v4.x;
-                next4[0 + 1] = _v4.y;
-                next4[0 + 2] = _v4.z;
-                next4[0 + 3] = _v4.w;
-            }
+        unsigned long long row_base = (unsigned long long)token * (unsigned long long)NUM_EXPERTS;
+        float _vec_load_1[4];
+        {
+            float4 _v4 = *reinterpret_cast<const float4*>(logits + row_base + (unsigned long long)expert_base);
+            _vec_load_1[0 + 0] = _v4.x;
+            _vec_load_1[0 + 1] = _v4.y;
+            _vec_load_1[0 + 2] = _v4.z;
+            _vec_load_1[0 + 3] = _v4.w;
         }
         float unbiased[4];
         unsigned int keys[4];
         int active[4];
         #pragma unroll
         for (int item = 0; item < ITEMS_PER_THREAD; item++) {
-            float _exp_3 = __expf(-logits4[item]);
+            float _exp_2 = __expf(-_vec_load_1[item]);
             float score;
-            asm volatile("div.full.f32 %0, %1, %2;" : "=f"(score) : "f"(1.0f), "f"(1.0f + _exp_3));
+            asm volatile("div.full.f32 %0, %1, %2;" : "=f"(score) : "f"(1.0f), "f"(1.0f + _exp_2));
             float ranking = score + _vec_load_0[item];
             if (ranking == 0.0f) {
                 ranking = 0.0f;
@@ -320,8 +315,10 @@ kernel_cake_kimi_k3_fused_router_8af514ed6f78baebea7b(float* __restrict__ logits
             }
         }
         unsigned int published = 0;
+        unsigned int own_top[4];
         unsigned int warp_top0_1_0;
         asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_0) : "r"(lane_bound));
+        own_top[0] = warp_top0_1_0;
         if (lane == 0) {
             published = warp_top0_1_0;
         }
@@ -330,6 +327,7 @@ kernel_cake_kimi_k3_fused_router_8af514ed6f78baebea7b(float* __restrict__ logits
         }
         unsigned int warp_top0_1_1;
         asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_1) : "r"(lane_bound));
+        own_top[1] = warp_top0_1_1;
         if (lane == 1) {
             published = warp_top0_1_1;
         }
@@ -338,6 +336,7 @@ kernel_cake_kimi_k3_fused_router_8af514ed6f78baebea7b(float* __restrict__ logits
         }
         unsigned int warp_top0_1_2;
         asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_2) : "r"(lane_bound));
+        own_top[2] = warp_top0_1_2;
         if (lane == 2) {
             published = warp_top0_1_2;
         }
@@ -346,6 +345,7 @@ kernel_cake_kimi_k3_fused_router_8af514ed6f78baebea7b(float* __restrict__ logits
         }
         unsigned int warp_top0_1_3;
         asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_3) : "r"(lane_bound));
+        own_top[3] = warp_top0_1_3;
         if (lane == 3) {
             published = warp_top0_1_3;
         }
@@ -357,19 +357,45 @@ kernel_cake_kimi_k3_fused_router_8af514ed6f78baebea7b(float* __restrict__ logits
         }
         __syncthreads();
         unsigned int bound_mine = bound_values[lane];
-        int bound_part0 = ((bound_mine <= bound_values[0]) ? 1 : 0) + ((bound_mine <= bound_values[1]) ? 1 : 0) + ((bound_mine <= bound_values[2]) ? 1 : 0) + ((bound_mine <= bound_values[3]) ? 1 : 0);
-        int bound_part1 = ((bound_mine <= bound_values[4]) ? 1 : 0) + ((bound_mine <= bound_values[5]) ? 1 : 0) + ((bound_mine <= bound_values[6]) ? 1 : 0) + ((bound_mine <= bound_values[7]) ? 1 : 0);
-        int bound_part2 = ((bound_mine <= bound_values[8]) ? 1 : 0) + ((bound_mine <= bound_values[9]) ? 1 : 0) + ((bound_mine <= bound_values[10]) ? 1 : 0) + ((bound_mine <= bound_values[11]) ? 1 : 0);
-        int bound_part3 = ((bound_mine <= bound_values[12]) ? 1 : 0) + ((bound_mine <= bound_values[13]) ? 1 : 0) + ((bound_mine <= bound_values[14]) ? 1 : 0) + ((bound_mine <= bound_values[15]) ? 1 : 0);
-        int bound_part4 = ((bound_mine <= bound_values[16]) ? 1 : 0) + ((bound_mine <= bound_values[17]) ? 1 : 0) + ((bound_mine <= bound_values[18]) ? 1 : 0) + ((bound_mine <= bound_values[19]) ? 1 : 0);
-        int bound_part5 = ((bound_mine <= bound_values[20]) ? 1 : 0) + ((bound_mine <= bound_values[21]) ? 1 : 0) + ((bound_mine <= bound_values[22]) ? 1 : 0) + ((bound_mine <= bound_values[23]) ? 1 : 0);
-        int bound_part6 = ((bound_mine <= bound_values[24]) ? 1 : 0) + ((bound_mine <= bound_values[25]) ? 1 : 0) + ((bound_mine <= bound_values[26]) ? 1 : 0) + ((bound_mine <= bound_values[27]) ? 1 : 0);
-        int bound_at_least = bound_part0 + bound_part1 + (bound_part2 + bound_part3) + (bound_part4 + bound_part5 + bound_part6);
-        if (bound_at_least < 16) {
-            bound_mine = (unsigned int)0;
+        unsigned int own_b0 = __ballot_sync(0xFFFFFFFF, bound_mine >= own_top[0]);
+        unsigned int own_c0 = (unsigned int)0;
+        if ((int)(unsigned int)__popc(own_b0) >= 16) {
+            own_c0 = own_top[0];
+        }
+        unsigned int own_b1 = __ballot_sync(0xFFFFFFFF, bound_mine >= own_top[1]);
+        unsigned int own_c1 = (unsigned int)0;
+        if ((int)(unsigned int)__popc(own_b1) >= 16) {
+            own_c1 = own_top[1];
+        }
+        unsigned int own_b2 = __ballot_sync(0xFFFFFFFF, bound_mine >= own_top[2]);
+        unsigned int own_c2 = (unsigned int)0;
+        if ((int)(unsigned int)__popc(own_b2) >= 16) {
+            own_c2 = own_top[2];
+        }
+        unsigned int own_b3 = __ballot_sync(0xFFFFFFFF, bound_mine >= own_top[3]);
+        unsigned int own_c3 = (unsigned int)0;
+        if ((int)(unsigned int)__popc(own_b3) >= 16) {
+            own_c3 = own_top[3];
+        }
+        if (own_c1 > own_c0) {
+            own_c0 = own_c1;
+        }
+        if (own_c3 > own_c2) {
+            own_c2 = own_c3;
+        }
+        if (own_c2 > own_c0) {
+            own_c0 = own_c2;
+        }
+        if (lane == 0) {
+            floor_slots[warp] = own_c0;
+        }
+        __syncthreads();
+        unsigned int floor_seen = (unsigned int)0;
+        if (lane < 7) {
+            floor_seen = floor_slots[lane];
         }
         unsigned int cand_floor;
-        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(cand_floor) : "r"(bound_mine));
+        asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(cand_floor) : "r"(floor_seen));
         int cand_below = 0;
         int cand_warp = 0;
         #pragma unroll
@@ -463,9 +489,9 @@ kernel_cake_kimi_k3_fused_router_8af514ed6f78baebea7b(float* __restrict__ logits
                             warp_match_record = (unsigned int)(chosen_scan_bin & 255) | (unsigned int)(bin_above & 1023) << 8 | (unsigned int)(bin_count & 1023) << 18;
                         }
                     }
-                    unsigned int _warp_redux_4;
-                    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_4) : "r"(warp_match_record));
-                    warp_match_record = _warp_redux_4;
+                    unsigned int _warp_redux_3;
+                    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_3) : "r"(warp_match_record));
+                    warp_match_record = _warp_redux_3;
                     if (tid == 0) {
                         radix_match[match_base] = (int)warp_match_record;
                     }
@@ -890,9 +916,9 @@ kernel_cake_kimi_k3_fused_router_8af514ed6f78baebea7b(float* __restrict__ logits
             }
             int selected_id = winner_ids[tid];
             unsigned long long output_index = (unsigned long long)token * (unsigned long long)TOP_K + (unsigned long long)tid;
-            float _fdiv_5;
-            asm volatile("div.full.f32 %0, %1, %2;" : "=f"(_fdiv_5) : "f"(winner_scores[tid]), "f"(selected_norm));
-            topk_weights[output_index] = _fdiv_5;
+            float _fdiv_4;
+            asm volatile("div.full.f32 %0, %1, %2;" : "=f"(_fdiv_4) : "f"(winner_scores[tid]), "f"(selected_norm));
+            topk_weights[output_index] = _fdiv_4;
             topk_ids[output_index] = selected_id;
         }
         __syncthreads();
@@ -906,15 +932,11 @@ kernel_cake_kimi_k3_fused_router_8af514ed6f78baebea7b(float* __restrict__ logits
             plan_counts[count_clear] = 0;
         }
         #pragma unroll 1
-        for (int bitmap_clear = tid; bitmap_clear < NUM_WARPS * BITMAP_STRIDE; bitmap_clear += THREADS) {
-            own_bitmap[bitmap_clear] = (unsigned int)0;
+        for (int map_clear = tid; map_clear < CLUSTER_EXPERTS * 288 / 16; map_clear += THREADS) {
+            unsigned int map_zero = 0;
+            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_v18_addr + (unsigned int)(map_clear * 16)), "r"(map_zero), "r"(map_zero), "r"(map_zero), "r"(map_zero) : "memory");
         }
-        #pragma unroll 1
-        for (int route_clear = tid; route_clear < NUM_WARPS * ROUTE_STRIDE; route_clear += THREADS) {
-            own_routes[route_clear] = (unsigned int)0;
-        }
-        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+        __syncthreads();
     }
     if (bid < OWNER_CTAS) {
         cooperative_groups::this_grid().barrier_wait(static_cast<cooperative_groups::grid_group::arrival_token>(join_token));
@@ -935,6 +957,8 @@ kernel_cake_kimi_k3_fused_router_8af514ed6f78baebea7b(float* __restrict__ logits
                 :: "r"(stream_ring_addr + (unsigned int)(prologue_chunk * 16)), "l"(topk_ids + prologue_pair), "r"((prologue_pair < slice_end) ? 16 : 0));
         }
         asm volatile("cp.async.commit_group;");
+        int first_token = slice_begin >> 4;
+        unsigned int byte_dump = smem_v18_addr + (unsigned int)(CLUSTER_EXPERTS * 288 + tid);
         int stream_stage = 0;
         #pragma unroll 1
         for (int gather_base = slice_begin; gather_base < slice_end; gather_base += STAGE_PAIRS) {
@@ -961,7 +985,6 @@ kernel_cake_kimi_k3_fused_router_8af514ed6f78baebea7b(float* __restrict__ logits
                     : "=r"(*reinterpret_cast<uint32_t*>(&own_ids[own_copy * 4])), "=r"(*reinterpret_cast<uint32_t*>(&own_ids[(own_copy * 4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&own_ids[(own_copy * 4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&own_ids[(own_copy * 4) + 3]))
                     : "r"(stream_ring_addr + (unsigned int)(own_stage_bytes + (own_copy * THREADS + tid) * 16)));
             }
-            unsigned int hit_mask = 0;
             #pragma unroll
             for (int own_copy_1 = 0; own_copy_1 < COPIES_PER_THREAD; own_copy_1++) {
                 int copy_pair = gather_base + (own_copy_1 * THREADS + tid) * 4;
@@ -970,54 +993,79 @@ kernel_cake_kimi_k3_fused_router_8af514ed6f78baebea7b(float* __restrict__ logits
                     for (int copy_lane = 0; copy_lane < 4; copy_lane++) {
                         int copy_id = (int)own_ids[own_copy_1 * 4 + copy_lane];
                         atomicAdd(&plan_counts[copy_id], 1);
-                        int copy_slot = copy_id - cluster_expert_base;
-                        if (copy_slot >= 0 && copy_slot < CLUSTER_EXPERTS) {
-                            hit_mask |= (unsigned int)1 << (unsigned int)(own_copy_1 * 4 + copy_lane);
-                        }
                     }
                 }
             }
-            int hit_count = (int)(unsigned int)__popc(hit_mask);
-            #pragma unroll 1
-            for (int hit = 0; hit < hit_count; hit++) {
-                int _find_first_set_6 = __ffs(hit_mask);
-                int hit_bit = _find_first_set_6 - 1;
-                int hit_slot = (hit_bit >> 2) * THREADS * 4 + tid * 4 + (hit_bit & 3);
-                int hit_pair = gather_base + hit_slot;
-                int hit_id = stream_ring[stream_stage * STAGE_PAIRS + hit_slot];
-                int hit_cluster_slot = hit_id - cluster_expert_base;
-                int hit_peer = hit_cluster_slot / NUM_WARPS;
-                int hit_own_slot = hit_cluster_slot - hit_peer * NUM_WARPS;
-                int hit_token = hit_pair >> 4;
-                int hit_route = hit_pair & 15;
-                uint32_t hit_bitmap;
-                asm volatile(
-                    "mapa.shared::cluster.u32 %0, %1, %2;"
-                    : "=r"(hit_bitmap) : "r"(own_bitmap_addr), "r"(hit_peer));
-                asm volatile(
-                    "red.relaxed.cluster.shared::cluster.add.u32 [%0], %1;"
-                    :: "r"(hit_bitmap + (unsigned int)((hit_own_slot * BITMAP_STRIDE + (hit_token >> 5)) * 4)), "r"((unsigned int)1 << (unsigned int)(hit_token & 31)) : "memory");
-                uint32_t hit_routes;
-                asm volatile(
-                    "mapa.shared::cluster.u32 %0, %1, %2;"
-                    : "=r"(hit_routes) : "r"(own_routes_addr), "r"(hit_peer));
-                asm volatile(
-                    "red.relaxed.cluster.shared::cluster.add.u32 [%0], %1;"
-                    :: "r"(hit_routes + (unsigned int)((hit_own_slot * ROUTE_STRIDE + (hit_token >> 3)) * 4)), "r"((unsigned int)hit_route << (unsigned int)((hit_token & 7) * 4)) : "memory");
-                hit_mask = hit_mask & hit_mask - (unsigned int)1;
+            #pragma unroll
+            for (int byte_copy = 0; byte_copy < COPIES_PER_THREAD; byte_copy++) {
+                int byte_pair = gather_base + (byte_copy * THREADS + tid) * 4;
+                int byte_lt = (byte_pair >> 4) - first_token;
+                #pragma unroll
+                for (int byte_lane = 0; byte_lane < 4; byte_lane++) {
+                    int byte_slot = (int)own_ids[byte_copy * 4 + byte_lane] - cluster_expert_base;
+                    unsigned int byte_map = smem_v18_addr + (unsigned int)(byte_slot * 288 + (byte_lt >> 5) * 32 + (byte_lt & 7) * 4 + (byte_lt >> 3 & 3));
+                    unsigned int byte_addr = ((byte_pair < slice_end && (unsigned int)byte_slot < 28 && (unsigned int)byte_lt < 288) ? byte_map : byte_dump);
+                    {
+                        uint32_t _byte_5 = static_cast<uint32_t>((unsigned int)((byte_pair & 15) + byte_lane | 16)) & 0xFFu;
+                        uint32_t _addr_5 = static_cast<uint32_t>(byte_addr);
+                        asm volatile("st.shared.u8 [%0], %1;" :: "r"(_addr_5), "r"(_byte_5));
+                    }
+                }
             }
             stream_stage = 1 - stream_stage;
         }
-        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+        asm volatile("fence.release.sync_restrict::shared::cta.cluster;" ::: "memory");
+        __syncthreads();
+        asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+        int lb_slot = (lane >> 3) * NUM_WARPS + warp;
+        int lb_q = lane & 7;
+        int lb_lt = lb_q * 32;
+        if (M <= 512) {
+            lb_lt = lb_q * 16;
+        }
+        unsigned int lb_words[8];
+        #pragma unroll
+        for (int lb_half = 0; lb_half < 2; lb_half++) {
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&lb_words[lb_half * 4])), "=r"(*reinterpret_cast<uint32_t*>(&lb_words[(lb_half * 4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lb_words[(lb_half * 4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lb_words[(lb_half * 4) + 3]))
+                : "r"(smem_v18_addr + (unsigned int)(lb_slot * 288 + (lb_lt >> 5) * 32 + lb_half * 16)));
+        }
+        unsigned int lb_marks = 0;
+        #pragma unroll
+        for (int lb_mark_word = 0; lb_mark_word < 8; lb_mark_word++) {
+            lb_marks |= (lb_words[lb_mark_word] >> 4 & (unsigned int)16843009) << (unsigned int)lb_mark_word;
+        }
+        if (M <= 512) {
+            lb_marks = lb_marks >> (unsigned int)(lb_lt & 16) & (unsigned int)65535;
+            #pragma unroll
+            for (int lb_shift_word = 0; lb_shift_word < 8; lb_shift_word++) {
+                lb_words[lb_shift_word] = lb_words[lb_shift_word] >> (unsigned int)(lb_lt & 16);
+            }
+        }
+        int lb_count = (int)(unsigned int)__popc(lb_marks);
+        int lb_inclusive = lb_count;
+        int lb_peer_0 = __shfl_up_sync(0xFFFFFFFF, lb_inclusive, 1, 32);
+        if (lb_q >= 1) {
+            lb_inclusive += lb_peer_0;
+        }
+        int lb_peer_1 = __shfl_up_sync(0xFFFFFFFF, lb_inclusive, 2, 32);
+        if (lb_q >= 2) {
+            lb_inclusive += lb_peer_1;
+        }
+        int lb_peer_2 = __shfl_up_sync(0xFFFFFFFF, lb_inclusive, 4, 32);
+        if (lb_q >= 4) {
+            lb_inclusive += lb_peer_2;
+        }
+        int lb_total = __shfl_sync(0xFFFFFFFF, lb_inclusive, lane | 7);
         asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
         unsigned int peer_counts_base[4];
         #pragma unroll
         for (int count_peer_map = 0; count_peer_map < CLUSTER; count_peer_map++) {
-            uint32_t _cluster_mapa_7;
+            uint32_t _cluster_mapa_6;
             asm volatile(
                 "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_cluster_mapa_7) : "r"(plan_counts_addr), "r"(count_peer_map));
-            peer_counts_base[count_peer_map] = _cluster_mapa_7;
+                : "=r"(_cluster_mapa_6) : "r"(plan_counts_addr), "r"(count_peer_map));
+            peer_counts_base[count_peer_map] = _cluster_mapa_6;
         }
         int expert_vec_base = warp * 32 * ITEMS_PER_THREAD + lane * ITEMS_PER_THREAD;
         unsigned int peer_count_words[16];
@@ -1048,6 +1096,17 @@ kernel_cake_kimi_k3_fused_router_8af514ed6f78baebea7b(float* __restrict__ logits
             lane_prefixes[expert_slot_scan] = lane_total;
             int padded_count_scan = count_scan + BLOCK_MASK & ~BLOCK_MASK;
             lane_total += padded_count_scan;
+            int base_slot = expert_scan - cluster_expert_base;
+            if (base_slot >= 0 && base_slot < CLUSTER_EXPERTS) {
+                int count_before = 0;
+                #pragma unroll
+                for (int before_peer = 0; before_peer < CLUSTER; before_peer++) {
+                    if (before_peer < cta_rank) {
+                        count_before += (int)peer_count_words[before_peer * ITEMS_PER_THREAD + expert_slot_scan];
+                    }
+                }
+                rank_base[base_slot] = count_before;
+            }
         }
         int warp_inclusive = lane_total;
         int phase2_scan_peer_4_0 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 1, 32);
@@ -1111,61 +1170,69 @@ kernel_cake_kimi_k3_fused_router_8af514ed6f78baebea7b(float* __restrict__ logits
         int own_count = plan_totals[own_expert];
         int own_base = plan_offsets[own_expert];
         int own_padded = own_count + BLOCK_MASK & ~BLOCK_MASK;
-        int own_bitmap_base = warp * BITMAP_STRIDE;
-        int own_route_base = warp * ROUTE_STRIDE;
-        int emitted = 0;
-        if (own_count > 0) {
-            #pragma unroll
-            for (int word_pass = 0; word_pass < WORD_PASSES; word_pass++) {
-                if (word_pass * 32 < bitmap_words) {
-                    int pass_word = word_pass * 32 + lane;
-                    unsigned int pass_bits = 0;
-                    if (pass_word < bitmap_words) {
-                        pass_bits = own_bitmap[own_bitmap_base + pass_word];
-                    }
-                    unsigned int pass_routes[4];
-                    if (pass_word < bitmap_words) {
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&pass_routes[0])), "=r"(*reinterpret_cast<uint32_t*>(&pass_routes[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pass_routes[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pass_routes[(0) + 3]))
-                            : "r"(own_routes_addr + (unsigned int)((own_route_base + pass_word * 4) * 4)));
-                    }
-                    int pass_count = (int)(unsigned int)__popc(pass_bits);
-                    int pass_inclusive = pass_count;
-                    int pass_peer_4_0 = __shfl_up_sync(0xFFFFFFFF, pass_inclusive, 1, 32);
-                    if (lane >= 1) {
-                        pass_inclusive += pass_peer_4_0;
-                    }
-                    int pass_peer_4_1 = __shfl_up_sync(0xFFFFFFFF, pass_inclusive, 2, 32);
-                    if (lane >= 2) {
-                        pass_inclusive += pass_peer_4_1;
-                    }
-                    int pass_peer_4_2 = __shfl_up_sync(0xFFFFFFFF, pass_inclusive, 4, 32);
-                    if (lane >= 4) {
-                        pass_inclusive += pass_peer_4_2;
-                    }
-                    int pass_peer_4_3 = __shfl_up_sync(0xFFFFFFFF, pass_inclusive, 8, 32);
-                    if (lane >= 8) {
-                        pass_inclusive += pass_peer_4_3;
-                    }
-                    int pass_peer_4_4 = __shfl_up_sync(0xFFFFFFFF, pass_inclusive, 16, 32);
-                    if (lane >= 16) {
-                        pass_inclusive += pass_peer_4_4;
-                    }
-                    int lane_rank = own_base + emitted + pass_inclusive - pass_count;
-                    #pragma unroll 1
-                    for (int emit_bit = 0; emit_bit < pass_count; emit_bit++) {
-                        int _find_first_set_8 = __ffs(pass_bits);
-                        int emit_offset = _find_first_set_8 - 1;
-                        int emit_token = (pass_word << 5) + emit_offset;
-                        unsigned int route_word = (((emit_offset & 16) != 0) ? (((emit_offset & 8) != 0) ? pass_routes[3] : pass_routes[2]) : (((emit_offset & 8) != 0) ? pass_routes[1] : pass_routes[0]));
-                        unsigned int emit_route = route_word >> (unsigned int)((emit_token & 7) * 4) & (unsigned int)15;
-                        sorted_token_ids[lane_rank + emit_bit] = emit_token * TOP_K + (int)emit_route;
-                        pass_bits = pass_bits & pass_bits - (unsigned int)1;
-                    }
-                    int _shfl_sync_9 = __shfl_sync(0xFFFFFFFF, pass_inclusive, 31);
-                    emitted += _shfl_sync_9;
+        int lb_window_tokens = 256;
+        if (M <= 512) {
+            lb_window_tokens = 128;
+        }
+        int lb_windows = ((slice_end - 1 >> 4) - first_token + lb_window_tokens) / lb_window_tokens;
+        int lb_base = plan_offsets[cluster_expert_base + lb_slot] + rank_base[lb_slot];
+        #pragma unroll 1
+        for (int lb_window = 0; lb_window < lb_windows; lb_window++) {
+            if (lb_window > 0) {
+                lb_lt = lb_lt + lb_window_tokens;
+                #pragma unroll
+                for (int lb_zero = 0; lb_zero < 8; lb_zero++) {
+                    lb_words[lb_zero] = (unsigned int)0;
                 }
+                if (lb_lt < 288) {
+                    #pragma unroll
+                    for (int lb_half_w = 0; lb_half_w < 2; lb_half_w++) {
+                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                            : "=r"(*reinterpret_cast<uint32_t*>(&lb_words[lb_half_w * 4])), "=r"(*reinterpret_cast<uint32_t*>(&lb_words[(lb_half_w * 4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&lb_words[(lb_half_w * 4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&lb_words[(lb_half_w * 4) + 3]))
+                            : "r"(smem_v18_addr + (unsigned int)(lb_slot * 288 + (lb_lt >> 5) * 32 + lb_half_w * 16)));
+                    }
+                }
+                lb_marks = (unsigned int)0;
+                #pragma unroll
+                for (int lb_mark_word_w = 0; lb_mark_word_w < 8; lb_mark_word_w++) {
+                    lb_marks |= (lb_words[lb_mark_word_w] >> 4 & (unsigned int)16843009) << (unsigned int)lb_mark_word_w;
+                }
+                if (M <= 512) {
+                    lb_marks = lb_marks >> (unsigned int)(lb_lt & 16) & (unsigned int)65535;
+                    #pragma unroll
+                    for (int lb_shift_word_w = 0; lb_shift_word_w < 8; lb_shift_word_w++) {
+                        lb_words[lb_shift_word_w] = lb_words[lb_shift_word_w] >> (unsigned int)(lb_lt & 16);
+                    }
+                }
+                lb_count = (int)(unsigned int)__popc(lb_marks);
+                lb_inclusive = lb_count;
+                int lb_peer_w_0 = __shfl_up_sync(0xFFFFFFFF, lb_inclusive, 1, 32);
+                if (lb_q >= 1) {
+                    lb_inclusive += lb_peer_w_0;
+                }
+                int lb_peer_w_1 = __shfl_up_sync(0xFFFFFFFF, lb_inclusive, 2, 32);
+                if (lb_q >= 2) {
+                    lb_inclusive += lb_peer_w_1;
+                }
+                int lb_peer_w_2 = __shfl_up_sync(0xFFFFFFFF, lb_inclusive, 4, 32);
+                if (lb_q >= 4) {
+                    lb_inclusive += lb_peer_w_2;
+                }
+                int _shfl_sync_7 = __shfl_sync(0xFFFFFFFF, lb_inclusive, lane | 7);
+                lb_total = _shfl_sync_7;
             }
+            int lb_rank = lb_base + lb_inclusive - lb_count;
+            int lb_token = first_token + lb_lt;
+            #pragma unroll 1
+            for (int lb_bit = 0; lb_bit < lb_count; lb_bit++) {
+                int _find_first_set_8 = __ffs(lb_marks);
+                int lb_offset = _find_first_set_8 - 1;
+                unsigned int lb_word = (((lb_offset & 4) != 0) ? (((lb_offset & 2) != 0) ? (((lb_offset & 1) != 0) ? lb_words[7] : lb_words[6]) : (((lb_offset & 1) != 0) ? lb_words[5] : lb_words[4])) : (((lb_offset & 2) != 0) ? (((lb_offset & 1) != 0) ? lb_words[3] : lb_words[2]) : (((lb_offset & 1) != 0) ? lb_words[1] : lb_words[0])));
+                unsigned int lb_route = lb_word >> (unsigned int)((lb_offset >> 3) * 8) & (unsigned int)15;
+                sorted_token_ids[lb_rank + lb_bit] = (lb_token + lb_offset) * TOP_K + (int)lb_route;
+                lb_marks = lb_marks & lb_marks - (unsigned int)1;
+            }
+            lb_base += lb_total;
         }
         #pragma unroll 1
         for (int pad_slot = own_count + lane; pad_slot < own_padded; pad_slot += 32) {

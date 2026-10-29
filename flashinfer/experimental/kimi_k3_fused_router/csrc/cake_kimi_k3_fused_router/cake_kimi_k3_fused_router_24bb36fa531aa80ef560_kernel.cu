@@ -155,7 +155,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(224, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_kimi_k3_fused_router_fe39f52a822c7aa2a709(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
+kernel_cake_kimi_k3_fused_router_24bb36fa531aa80ef560(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -232,6 +232,13 @@ kernel_cake_kimi_k3_fused_router_fe39f52a822c7aa2a709(float* __restrict__ logits
     int expert_base = tid * ITEMS_PER_THREAD;
     int stash_base = warp * TOP_K;
     unsigned int join_token = 0;
+    int pf_lane = 0;
+    if (((unsigned long long)logits & 15) == 0) {
+        if (lane == 31) {
+            pf_lane = 1;
+        }
+    }
+    int pf_first = bid * NUM_WARPS + warp;
     int ae_now = 1;
     if (M <= num_bids * NUM_WARPS) {
         ae_now = 0;
@@ -270,6 +277,11 @@ kernel_cake_kimi_k3_fused_router_fe39f52a822c7aa2a709(float* __restrict__ logits
             _vec_load_0[0 + 1] = _v4.y;
             _vec_load_0[0 + 2] = _v4.z;
             _vec_load_0[0 + 3] = _v4.w;
+        }
+        if (pf_lane != 0) {
+            if (pf_first < M) {
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(reinterpret_cast<float*>(logits) + ((unsigned long long)pf_first * 896)), "r"((uint32_t)(3584)) : "memory");
+            }
         }
         #pragma unroll
         for (int f_slot = 0; f_slot < 4; f_slot++) {
@@ -504,154 +516,136 @@ kernel_cake_kimi_k3_fused_router_fe39f52a822c7aa2a709(float* __restrict__ logits
                 __syncwarp();
                 int p_id = 0;
                 float p_score = 0.0f;
-                unsigned long long p_comp = 0;
-                int comp_base = cand_base + 64 >> 1;
+                unsigned int p_full = 4294967295;
+                unsigned int p_lower = 0;
+                unsigned int p_key = 0;
                 if (p_total > lane) {
                     p_id = warp_hist[cand_base + lane];
                     p_score = hist_f32[hist_base + p_id];
-                    float p_ranking = p_score + bias_smem[p_id];
-                    unsigned int p_bits = __as_u32(p_ranking);
-                    unsigned int p_ordered = p_bits ^ ((unsigned int)((int)p_bits >> 31) | 2147483648u);
-                    p_comp = (unsigned long long)p_ordered << 32 | (unsigned long long)(1023 - p_id);
+                    unsigned int p_kbits = __as_u32(p_score + bias_smem[p_id]);
+                    p_key = p_kbits ^ ((unsigned int)((int)p_kbits >> 31) | 2147483648u);
                 }
-                cand_comp[comp_base + lane] = p_comp;
+                warp_hist[cand_base + 64 + lane] = (int)p_key;
+                int p_item_1 = p_id >> 5;
+                unsigned int p_eq = p_full >> (unsigned int)(32 - p_total);
+                unsigned int p_lt = 0;
+                unsigned int p_cb_0 = __ballot_sync(0xFFFFFFFF, (p_item_1 >> 4 & 1) != 0);
+                unsigned int p_bm_0 = (unsigned int)(-(p_item_1 >> 4 & 1));
+                p_lt |= p_eq & p_bm_0 & ~p_cb_0;
+                p_eq &= ~(p_cb_0 ^ p_bm_0);
+                unsigned int p_cb_1 = __ballot_sync(0xFFFFFFFF, (p_item_1 >> 3 & 1) != 0);
+                unsigned int p_bm_1 = (unsigned int)(-(p_item_1 >> 3 & 1));
+                p_lt |= p_eq & p_bm_1 & ~p_cb_1;
+                p_eq &= ~(p_cb_1 ^ p_bm_1);
+                unsigned int p_cb_2 = __ballot_sync(0xFFFFFFFF, (p_item_1 >> 2 & 1) != 0);
+                unsigned int p_bm_2 = (unsigned int)(-(p_item_1 >> 2 & 1));
+                p_lt |= p_eq & p_bm_2 & ~p_cb_2;
+                p_eq &= ~(p_cb_2 ^ p_bm_2);
+                unsigned int p_cb_3 = __ballot_sync(0xFFFFFFFF, (p_item_1 >> 1 & 1) != 0);
+                unsigned int p_bm_3 = (unsigned int)(-(p_item_1 >> 1 & 1));
+                p_lt |= p_eq & p_bm_3 & ~p_cb_3;
+                p_eq &= ~(p_cb_3 ^ p_bm_3);
+                unsigned int p_cb_4 = __ballot_sync(0xFFFFFFFF, (p_item_1 >> 0 & 1) != 0);
+                unsigned int p_bm_4 = (unsigned int)(-(p_item_1 >> 0 & 1));
+                p_lt |= p_eq & p_bm_4 & ~p_cb_4;
+                p_eq &= ~(p_cb_4 ^ p_bm_4);
+                p_lower = p_lt | p_eq & lanemask_lt;
                 __syncwarp();
                 int p_ra = 0;
                 int p_rb = 0;
                 int p_rc = 0;
                 int p_rd = 0;
-                unsigned int p_peers[16];
+                unsigned int p_keys[8];
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&p_peers[0])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(0) + 3]))
-                    : "r"(cand_comp_addr + (unsigned int)((comp_base + 0 + 0) * 8)));
+                    : "=r"(*reinterpret_cast<uint32_t*>(&p_keys[0])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(0) + 3]))
+                    : "r"(warp_hist_addr + (unsigned int)((cand_base + 64 + 0 + 0) * 4)));
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&p_peers[4])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(4) + 3]))
-                    : "r"(cand_comp_addr + (unsigned int)((comp_base + 0 + 2) * 8)));
+                    : "=r"(*reinterpret_cast<uint32_t*>(&p_keys[4])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(4) + 3]))
+                    : "r"(warp_hist_addr + (unsigned int)((cand_base + 64 + 0 + 4) * 4)));
+                p_ra += ((p_keys[0] > p_key) ? 1 : 0);
+                p_rb += ((p_keys[1] > p_key) ? 1 : 0);
+                p_rc += ((p_keys[2] > p_key) ? 1 : 0);
+                p_rd += ((p_keys[3] > p_key) ? 1 : 0);
+                p_ra += ((p_keys[4] > p_key) ? 1 : 0);
+                p_rb += ((p_keys[5] > p_key) ? 1 : 0);
+                p_rc += ((p_keys[6] > p_key) ? 1 : 0);
+                p_rd += ((p_keys[7] > p_key) ? 1 : 0);
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&p_peers[8])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(8) + 3]))
-                    : "r"(cand_comp_addr + (unsigned int)((comp_base + 0 + 4) * 8)));
+                    : "=r"(*reinterpret_cast<uint32_t*>(&p_keys[0])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(0) + 3]))
+                    : "r"(warp_hist_addr + (unsigned int)((cand_base + 64 + 8 + 0) * 4)));
                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&p_peers[12])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(12) + 3]))
-                    : "r"(cand_comp_addr + (unsigned int)((comp_base + 0 + 6) * 8)));
-                p_ra += ((p_comp < ((unsigned long long)p_peers[1] << 32 | (unsigned long long)p_peers[0])) ? 1 : 0);
-                p_rb += ((p_comp < ((unsigned long long)p_peers[3] << 32 | (unsigned long long)p_peers[2])) ? 1 : 0);
-                p_rc += ((p_comp < ((unsigned long long)p_peers[5] << 32 | (unsigned long long)p_peers[4])) ? 1 : 0);
-                p_rd += ((p_comp < ((unsigned long long)p_peers[7] << 32 | (unsigned long long)p_peers[6])) ? 1 : 0);
-                p_ra += ((p_comp < ((unsigned long long)p_peers[9] << 32 | (unsigned long long)p_peers[8])) ? 1 : 0);
-                p_rb += ((p_comp < ((unsigned long long)p_peers[11] << 32 | (unsigned long long)p_peers[10])) ? 1 : 0);
-                p_rc += ((p_comp < ((unsigned long long)p_peers[13] << 32 | (unsigned long long)p_peers[12])) ? 1 : 0);
-                p_rd += ((p_comp < ((unsigned long long)p_peers[15] << 32 | (unsigned long long)p_peers[14])) ? 1 : 0);
-                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&p_peers[0])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(0) + 3]))
-                    : "r"(cand_comp_addr + (unsigned int)((comp_base + 8 + 0) * 8)));
-                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&p_peers[4])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(4) + 3]))
-                    : "r"(cand_comp_addr + (unsigned int)((comp_base + 8 + 2) * 8)));
-                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&p_peers[8])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(8) + 3]))
-                    : "r"(cand_comp_addr + (unsigned int)((comp_base + 8 + 4) * 8)));
-                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&p_peers[12])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(12) + 3]))
-                    : "r"(cand_comp_addr + (unsigned int)((comp_base + 8 + 6) * 8)));
-                p_ra += ((p_comp < ((unsigned long long)p_peers[1] << 32 | (unsigned long long)p_peers[0])) ? 1 : 0);
-                p_rb += ((p_comp < ((unsigned long long)p_peers[3] << 32 | (unsigned long long)p_peers[2])) ? 1 : 0);
-                p_rc += ((p_comp < ((unsigned long long)p_peers[5] << 32 | (unsigned long long)p_peers[4])) ? 1 : 0);
-                p_rd += ((p_comp < ((unsigned long long)p_peers[7] << 32 | (unsigned long long)p_peers[6])) ? 1 : 0);
-                p_ra += ((p_comp < ((unsigned long long)p_peers[9] << 32 | (unsigned long long)p_peers[8])) ? 1 : 0);
-                p_rb += ((p_comp < ((unsigned long long)p_peers[11] << 32 | (unsigned long long)p_peers[10])) ? 1 : 0);
-                p_rc += ((p_comp < ((unsigned long long)p_peers[13] << 32 | (unsigned long long)p_peers[12])) ? 1 : 0);
-                p_rd += ((p_comp < ((unsigned long long)p_peers[15] << 32 | (unsigned long long)p_peers[14])) ? 1 : 0);
+                    : "=r"(*reinterpret_cast<uint32_t*>(&p_keys[4])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(4) + 3]))
+                    : "r"(warp_hist_addr + (unsigned int)((cand_base + 64 + 8 + 4) * 4)));
+                p_ra += ((p_keys[0] > p_key) ? 1 : 0);
+                p_rb += ((p_keys[1] > p_key) ? 1 : 0);
+                p_rc += ((p_keys[2] > p_key) ? 1 : 0);
+                p_rd += ((p_keys[3] > p_key) ? 1 : 0);
+                p_ra += ((p_keys[4] > p_key) ? 1 : 0);
+                p_rb += ((p_keys[5] > p_key) ? 1 : 0);
+                p_rc += ((p_keys[6] > p_key) ? 1 : 0);
+                p_rd += ((p_keys[7] > p_key) ? 1 : 0);
                 if (p_total > 16) {
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&p_peers[0])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(0) + 3]))
-                        : "r"(cand_comp_addr + (unsigned int)((comp_base + 16 + 0) * 8)));
+                        : "=r"(*reinterpret_cast<uint32_t*>(&p_keys[0])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(0) + 3]))
+                        : "r"(warp_hist_addr + (unsigned int)((cand_base + 64 + 16 + 0) * 4)));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&p_peers[4])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(4) + 3]))
-                        : "r"(cand_comp_addr + (unsigned int)((comp_base + 16 + 2) * 8)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&p_peers[8])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(8) + 3]))
-                        : "r"(cand_comp_addr + (unsigned int)((comp_base + 16 + 4) * 8)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&p_peers[12])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(12) + 3]))
-                        : "r"(cand_comp_addr + (unsigned int)((comp_base + 16 + 6) * 8)));
-                    p_ra += ((p_comp < ((unsigned long long)p_peers[1] << 32 | (unsigned long long)p_peers[0])) ? 1 : 0);
-                    p_rb += ((p_comp < ((unsigned long long)p_peers[3] << 32 | (unsigned long long)p_peers[2])) ? 1 : 0);
-                    p_rc += ((p_comp < ((unsigned long long)p_peers[5] << 32 | (unsigned long long)p_peers[4])) ? 1 : 0);
-                    p_rd += ((p_comp < ((unsigned long long)p_peers[7] << 32 | (unsigned long long)p_peers[6])) ? 1 : 0);
-                    p_ra += ((p_comp < ((unsigned long long)p_peers[9] << 32 | (unsigned long long)p_peers[8])) ? 1 : 0);
-                    p_rb += ((p_comp < ((unsigned long long)p_peers[11] << 32 | (unsigned long long)p_peers[10])) ? 1 : 0);
-                    p_rc += ((p_comp < ((unsigned long long)p_peers[13] << 32 | (unsigned long long)p_peers[12])) ? 1 : 0);
-                    p_rd += ((p_comp < ((unsigned long long)p_peers[15] << 32 | (unsigned long long)p_peers[14])) ? 1 : 0);
+                        : "=r"(*reinterpret_cast<uint32_t*>(&p_keys[4])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(4) + 3]))
+                        : "r"(warp_hist_addr + (unsigned int)((cand_base + 64 + 16 + 4) * 4)));
+                    p_ra += ((p_keys[0] > p_key) ? 1 : 0);
+                    p_rb += ((p_keys[1] > p_key) ? 1 : 0);
+                    p_rc += ((p_keys[2] > p_key) ? 1 : 0);
+                    p_rd += ((p_keys[3] > p_key) ? 1 : 0);
+                    p_ra += ((p_keys[4] > p_key) ? 1 : 0);
+                    p_rb += ((p_keys[5] > p_key) ? 1 : 0);
+                    p_rc += ((p_keys[6] > p_key) ? 1 : 0);
+                    p_rd += ((p_keys[7] > p_key) ? 1 : 0);
                 }
                 if (p_total > 24) {
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&p_peers[0])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(0) + 3]))
-                        : "r"(cand_comp_addr + (unsigned int)((comp_base + 24 + 0) * 8)));
+                        : "=r"(*reinterpret_cast<uint32_t*>(&p_keys[0])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(0) + 3]))
+                        : "r"(warp_hist_addr + (unsigned int)((cand_base + 64 + 24 + 0) * 4)));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&p_peers[4])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(4) + 3]))
-                        : "r"(cand_comp_addr + (unsigned int)((comp_base + 24 + 2) * 8)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&p_peers[8])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(8) + 3]))
-                        : "r"(cand_comp_addr + (unsigned int)((comp_base + 24 + 4) * 8)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&p_peers[12])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_peers[(12) + 3]))
-                        : "r"(cand_comp_addr + (unsigned int)((comp_base + 24 + 6) * 8)));
-                    p_ra += ((p_comp < ((unsigned long long)p_peers[1] << 32 | (unsigned long long)p_peers[0])) ? 1 : 0);
-                    p_rb += ((p_comp < ((unsigned long long)p_peers[3] << 32 | (unsigned long long)p_peers[2])) ? 1 : 0);
-                    p_rc += ((p_comp < ((unsigned long long)p_peers[5] << 32 | (unsigned long long)p_peers[4])) ? 1 : 0);
-                    p_rd += ((p_comp < ((unsigned long long)p_peers[7] << 32 | (unsigned long long)p_peers[6])) ? 1 : 0);
-                    p_ra += ((p_comp < ((unsigned long long)p_peers[9] << 32 | (unsigned long long)p_peers[8])) ? 1 : 0);
-                    p_rb += ((p_comp < ((unsigned long long)p_peers[11] << 32 | (unsigned long long)p_peers[10])) ? 1 : 0);
-                    p_rc += ((p_comp < ((unsigned long long)p_peers[13] << 32 | (unsigned long long)p_peers[12])) ? 1 : 0);
-                    p_rd += ((p_comp < ((unsigned long long)p_peers[15] << 32 | (unsigned long long)p_peers[14])) ? 1 : 0);
+                        : "=r"(*reinterpret_cast<uint32_t*>(&p_keys[4])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_keys[(4) + 3]))
+                        : "r"(warp_hist_addr + (unsigned int)((cand_base + 64 + 24 + 4) * 4)));
+                    p_ra += ((p_keys[0] > p_key) ? 1 : 0);
+                    p_rb += ((p_keys[1] > p_key) ? 1 : 0);
+                    p_rc += ((p_keys[2] > p_key) ? 1 : 0);
+                    p_rd += ((p_keys[3] > p_key) ? 1 : 0);
+                    p_ra += ((p_keys[4] > p_key) ? 1 : 0);
+                    p_rb += ((p_keys[5] > p_key) ? 1 : 0);
+                    p_rc += ((p_keys[6] > p_key) ? 1 : 0);
+                    p_rd += ((p_keys[7] > p_key) ? 1 : 0);
                 }
                 int p_rank = p_ra + p_rb + (p_rc + p_rd);
+                int p_win = 0;
                 if (p_total > lane) {
                     if (p_rank < TOP_K) {
-                        warp_hist[cand_base + 32 + p_rank] = p_id;
-                        hist_f32[cand_base + 48 + p_rank] = p_score;
+                        p_win = 1;
                     }
                 }
-                __syncwarp();
-                if (lane < TOP_K) {
-                    int p_win_id = warp_hist[cand_base + 32 + lane];
-                    float p_win_score = hist_f32[cand_base + 48 + lane];
-                    int p_sa = 0;
-                    int p_sb = 0;
-                    int p_sc = 0;
-                    int p_sd = 0;
-                    unsigned int p_wins[16];
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&p_wins[0])), "=r"(*reinterpret_cast<uint32_t*>(&p_wins[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_wins[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_wins[(0) + 3]))
-                        : "r"(warp_hist_addr + (unsigned int)((cand_base + 32 + 0) * 4)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&p_wins[4])), "=r"(*reinterpret_cast<uint32_t*>(&p_wins[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_wins[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_wins[(4) + 3]))
-                        : "r"(warp_hist_addr + (unsigned int)((cand_base + 32 + 4) * 4)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&p_wins[8])), "=r"(*reinterpret_cast<uint32_t*>(&p_wins[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_wins[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_wins[(8) + 3]))
-                        : "r"(warp_hist_addr + (unsigned int)((cand_base + 32 + 8) * 4)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&p_wins[12])), "=r"(*reinterpret_cast<uint32_t*>(&p_wins[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&p_wins[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&p_wins[(12) + 3]))
-                        : "r"(warp_hist_addr + (unsigned int)((cand_base + 32 + 12) * 4)));
-                    p_sa += ((p_win_id > (int)p_wins[0]) ? 1 : 0);
-                    p_sb += ((p_win_id > (int)p_wins[1]) ? 1 : 0);
-                    p_sc += ((p_win_id > (int)p_wins[2]) ? 1 : 0);
-                    p_sd += ((p_win_id > (int)p_wins[3]) ? 1 : 0);
-                    p_sa += ((p_win_id > (int)p_wins[4]) ? 1 : 0);
-                    p_sb += ((p_win_id > (int)p_wins[5]) ? 1 : 0);
-                    p_sc += ((p_win_id > (int)p_wins[6]) ? 1 : 0);
-                    p_sd += ((p_win_id > (int)p_wins[7]) ? 1 : 0);
-                    p_sa += ((p_win_id > (int)p_wins[8]) ? 1 : 0);
-                    p_sb += ((p_win_id > (int)p_wins[9]) ? 1 : 0);
-                    p_sc += ((p_win_id > (int)p_wins[10]) ? 1 : 0);
-                    p_sd += ((p_win_id > (int)p_wins[11]) ? 1 : 0);
-                    p_sa += ((p_win_id > (int)p_wins[12]) ? 1 : 0);
-                    p_sb += ((p_win_id > (int)p_wins[13]) ? 1 : 0);
-                    p_sc += ((p_win_id > (int)p_wins[14]) ? 1 : 0);
-                    p_sd += ((p_win_id > (int)p_wins[15]) ? 1 : 0);
-                    int p_win_slot = p_sa + p_sb + (p_sc + p_sd);
-                    winner_ids[stash_base + p_win_slot] = p_win_id;
-                    winner_scores[stash_base + p_win_slot] = p_win_score;
+                unsigned int p_w = __ballot_sync(0xFFFFFFFF, p_win != 0);
+                if ((int)(unsigned int)__popc(p_w) != TOP_K) {
+                    unsigned int p_eqk = 0;
+                    #pragma unroll 4
+                    for (int p_e = 0; p_e < p_total; p_e++) {
+                        if ((unsigned int)warp_hist[cand_base + 64 + p_e] == p_key) {
+                            p_eqk |= one_u32 << (unsigned int)p_e;
+                        }
+                    }
+                    p_rank += (int)(unsigned int)__popc(p_eqk & p_lower);
+                    p_win = 0;
+                    if (p_total > lane) {
+                        if (p_rank < TOP_K) {
+                            p_win = 1;
+                        }
+                    }
+                    unsigned int _warp_vote_28 = __ballot_sync(0xFFFFFFFF, p_win != 0);
+                    p_w = _warp_vote_28;
+                }
+                if (p_win != 0) {
+                    int p_s = (int)(unsigned int)__popc(p_w & p_lower);
+                    winner_ids[stash_base + p_s] = p_id;
+                    winner_scores[stash_base + p_s] = p_score;
                 }
                 __syncwarp();
             }
@@ -683,320 +677,354 @@ kernel_cake_kimi_k3_fused_router_fe39f52a822c7aa2a709(float* __restrict__ logits
                     int q_slot = (int)(q_incl - p_count);
                     unsigned int q_walk = p_mask;
                     while (q_walk != 0) {
-                        int _find_first_set_28 = __ffs((int)q_walk);
-                        int q_item = _find_first_set_28 - 1;
+                        int _find_first_set_29 = __ffs((int)q_walk);
+                        int q_item = _find_first_set_29 - 1;
                         warp_hist[q_base + q_slot] = q_item * 32 + lane;
                         q_walk = q_walk & q_walk - one_u32;
                         q_slot += 1;
                     }
                     __syncwarp();
-                    int q_comp_base = q_base + 64 >> 1;
                     int q_hi = lane + 32;
                     int q_id_lo = warp_hist[q_base + lane];
                     int q_id_hi = 0;
-                    float q_score_lo = 0.0f;
+                    float q_score_lo = hist_f32[hist_base + q_id_lo];
                     float q_score_hi = 0.0f;
-                    unsigned long long q_comp_lo = 0;
-                    unsigned long long q_comp_hi = 0;
-                    q_score_lo = hist_f32[hist_base + q_id_lo];
-                    q_comp_lo = (unsigned long long)(__as_u32(q_score_lo + bias_smem[q_id_lo]) ^ ((unsigned int)((int)__as_u32(q_score_lo + bias_smem[q_id_lo]) >> 31) | 2147483648u)) << 32 | (unsigned long long)(1023 - q_id_lo);
-                    cand_comp[q_comp_base + lane] = q_comp_lo;
+                    unsigned int q_full = 4294967295;
+                    unsigned int q_ll_lo = 0;
+                    unsigned int q_lh_lo = 0;
+                    unsigned int q_ll_hi = 0;
+                    unsigned int q_lh_hi = 0;
+                    unsigned int q_kb_lo = __as_u32(q_score_lo + bias_smem[q_id_lo]);
+                    unsigned int q_key_lo = q_kb_lo ^ ((unsigned int)((int)q_kb_lo >> 31) | 2147483648u);
+                    unsigned int q_key_hi = 0;
                     if (q_hi < p_total) {
                         q_id_hi = warp_hist[q_base + q_hi];
                         q_score_hi = hist_f32[hist_base + q_id_hi];
-                        q_comp_hi = (unsigned long long)(__as_u32(q_score_hi + bias_smem[q_id_hi]) ^ ((unsigned int)((int)__as_u32(q_score_hi + bias_smem[q_id_hi]) >> 31) | 2147483648u)) << 32 | (unsigned long long)(1023 - q_id_hi);
+                        unsigned int q_kb_hi = __as_u32(q_score_hi + bias_smem[q_id_hi]);
+                        q_key_hi = q_kb_hi ^ ((unsigned int)((int)q_kb_hi >> 31) | 2147483648u);
                     }
-                    cand_comp[q_comp_base + q_hi] = q_comp_hi;
+                    warp_hist[q_base + 64 + lane] = (int)q_key_lo;
+                    warp_hist[q_base + 64 + q_hi] = (int)q_key_hi;
+                    int q_it_lo = q_id_lo >> 5;
+                    int q_it_hi = q_id_hi >> 5;
+                    unsigned int q_eq_ll = q_full;
+                    unsigned int q_eq_lh = q_full >> (unsigned int)(64 - p_total);
+                    unsigned int q_eq_hl = q_full;
+                    unsigned int q_eq_hh = q_eq_lh;
+                    unsigned int q_lt_ll = 0;
+                    unsigned int q_lt_lh = 0;
+                    unsigned int q_lt_hl = 0;
+                    unsigned int q_lt_hh = 0;
+                    unsigned int q_cl_0 = __ballot_sync(0xFFFFFFFF, (q_it_lo >> 4 & 1) != 0);
+                    unsigned int q_ch_0 = __ballot_sync(0xFFFFFFFF, (q_it_hi >> 4 & 1) != 0);
+                    unsigned int q_bl_0 = (unsigned int)(-(q_it_lo >> 4 & 1));
+                    unsigned int q_bh_0 = (unsigned int)(-(q_it_hi >> 4 & 1));
+                    q_lt_ll |= q_eq_ll & q_bl_0 & ~q_cl_0;
+                    q_eq_ll &= ~(q_cl_0 ^ q_bl_0);
+                    q_lt_lh |= q_eq_lh & q_bl_0 & ~q_ch_0;
+                    q_eq_lh &= ~(q_ch_0 ^ q_bl_0);
+                    q_lt_hl |= q_eq_hl & q_bh_0 & ~q_cl_0;
+                    q_eq_hl &= ~(q_cl_0 ^ q_bh_0);
+                    q_lt_hh |= q_eq_hh & q_bh_0 & ~q_ch_0;
+                    q_eq_hh &= ~(q_ch_0 ^ q_bh_0);
+                    unsigned int q_cl_1 = __ballot_sync(0xFFFFFFFF, (q_it_lo >> 3 & 1) != 0);
+                    unsigned int q_ch_1 = __ballot_sync(0xFFFFFFFF, (q_it_hi >> 3 & 1) != 0);
+                    unsigned int q_bl_1 = (unsigned int)(-(q_it_lo >> 3 & 1));
+                    unsigned int q_bh_1 = (unsigned int)(-(q_it_hi >> 3 & 1));
+                    q_lt_ll |= q_eq_ll & q_bl_1 & ~q_cl_1;
+                    q_eq_ll &= ~(q_cl_1 ^ q_bl_1);
+                    q_lt_lh |= q_eq_lh & q_bl_1 & ~q_ch_1;
+                    q_eq_lh &= ~(q_ch_1 ^ q_bl_1);
+                    q_lt_hl |= q_eq_hl & q_bh_1 & ~q_cl_1;
+                    q_eq_hl &= ~(q_cl_1 ^ q_bh_1);
+                    q_lt_hh |= q_eq_hh & q_bh_1 & ~q_ch_1;
+                    q_eq_hh &= ~(q_ch_1 ^ q_bh_1);
+                    unsigned int q_cl_2 = __ballot_sync(0xFFFFFFFF, (q_it_lo >> 2 & 1) != 0);
+                    unsigned int q_ch_2 = __ballot_sync(0xFFFFFFFF, (q_it_hi >> 2 & 1) != 0);
+                    unsigned int q_bl_2 = (unsigned int)(-(q_it_lo >> 2 & 1));
+                    unsigned int q_bh_2 = (unsigned int)(-(q_it_hi >> 2 & 1));
+                    q_lt_ll |= q_eq_ll & q_bl_2 & ~q_cl_2;
+                    q_eq_ll &= ~(q_cl_2 ^ q_bl_2);
+                    q_lt_lh |= q_eq_lh & q_bl_2 & ~q_ch_2;
+                    q_eq_lh &= ~(q_ch_2 ^ q_bl_2);
+                    q_lt_hl |= q_eq_hl & q_bh_2 & ~q_cl_2;
+                    q_eq_hl &= ~(q_cl_2 ^ q_bh_2);
+                    q_lt_hh |= q_eq_hh & q_bh_2 & ~q_ch_2;
+                    q_eq_hh &= ~(q_ch_2 ^ q_bh_2);
+                    unsigned int q_cl_3 = __ballot_sync(0xFFFFFFFF, (q_it_lo >> 1 & 1) != 0);
+                    unsigned int q_ch_3 = __ballot_sync(0xFFFFFFFF, (q_it_hi >> 1 & 1) != 0);
+                    unsigned int q_bl_3 = (unsigned int)(-(q_it_lo >> 1 & 1));
+                    unsigned int q_bh_3 = (unsigned int)(-(q_it_hi >> 1 & 1));
+                    q_lt_ll |= q_eq_ll & q_bl_3 & ~q_cl_3;
+                    q_eq_ll &= ~(q_cl_3 ^ q_bl_3);
+                    q_lt_lh |= q_eq_lh & q_bl_3 & ~q_ch_3;
+                    q_eq_lh &= ~(q_ch_3 ^ q_bl_3);
+                    q_lt_hl |= q_eq_hl & q_bh_3 & ~q_cl_3;
+                    q_eq_hl &= ~(q_cl_3 ^ q_bh_3);
+                    q_lt_hh |= q_eq_hh & q_bh_3 & ~q_ch_3;
+                    q_eq_hh &= ~(q_ch_3 ^ q_bh_3);
+                    unsigned int q_cl_4 = __ballot_sync(0xFFFFFFFF, (q_it_lo >> 0 & 1) != 0);
+                    unsigned int q_ch_4 = __ballot_sync(0xFFFFFFFF, (q_it_hi >> 0 & 1) != 0);
+                    unsigned int q_bl_4 = (unsigned int)(-(q_it_lo >> 0 & 1));
+                    unsigned int q_bh_4 = (unsigned int)(-(q_it_hi >> 0 & 1));
+                    q_lt_ll |= q_eq_ll & q_bl_4 & ~q_cl_4;
+                    q_eq_ll &= ~(q_cl_4 ^ q_bl_4);
+                    q_lt_lh |= q_eq_lh & q_bl_4 & ~q_ch_4;
+                    q_eq_lh &= ~(q_ch_4 ^ q_bl_4);
+                    q_lt_hl |= q_eq_hl & q_bh_4 & ~q_cl_4;
+                    q_eq_hl &= ~(q_cl_4 ^ q_bh_4);
+                    q_lt_hh |= q_eq_hh & q_bh_4 & ~q_ch_4;
+                    q_eq_hh &= ~(q_ch_4 ^ q_bh_4);
+                    q_ll_lo = q_lt_ll | q_eq_ll & lanemask_lt;
+                    q_lh_lo = q_lt_lh;
+                    q_ll_hi = q_lt_hl | q_eq_hl;
+                    q_lh_hi = q_lt_hh | q_eq_hh & lanemask_lt;
                     __syncwarp();
                     int q_lo_a = 0;
                     int q_lo_b = 0;
                     int q_hi_a = 0;
                     int q_hi_b = 0;
-                    unsigned int q_peers[16];
+                    unsigned int q_keys[8];
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 3]))
-                        : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 0 + 0) * 8)));
+                        : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 3]))
+                        : "r"(warp_hist_addr + (unsigned int)((q_base + 64 + 0 + 0) * 4)));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 3]))
-                        : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 0 + 2) * 8)));
+                        : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 3]))
+                        : "r"(warp_hist_addr + (unsigned int)((q_base + 64 + 0 + 4) * 4)));
+                    q_lo_a += ((q_keys[0] > q_key_lo) ? 1 : 0);
+                    q_lo_b += ((q_keys[1] > q_key_lo) ? 1 : 0);
+                    q_hi_a += ((q_keys[0] > q_key_hi) ? 1 : 0);
+                    q_hi_b += ((q_keys[1] > q_key_hi) ? 1 : 0);
+                    q_lo_a += ((q_keys[2] > q_key_lo) ? 1 : 0);
+                    q_lo_b += ((q_keys[3] > q_key_lo) ? 1 : 0);
+                    q_hi_a += ((q_keys[2] > q_key_hi) ? 1 : 0);
+                    q_hi_b += ((q_keys[3] > q_key_hi) ? 1 : 0);
+                    q_lo_a += ((q_keys[4] > q_key_lo) ? 1 : 0);
+                    q_lo_b += ((q_keys[5] > q_key_lo) ? 1 : 0);
+                    q_hi_a += ((q_keys[4] > q_key_hi) ? 1 : 0);
+                    q_hi_b += ((q_keys[5] > q_key_hi) ? 1 : 0);
+                    q_lo_a += ((q_keys[6] > q_key_lo) ? 1 : 0);
+                    q_lo_b += ((q_keys[7] > q_key_lo) ? 1 : 0);
+                    q_hi_a += ((q_keys[6] > q_key_hi) ? 1 : 0);
+                    q_hi_b += ((q_keys[7] > q_key_hi) ? 1 : 0);
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[8])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(8) + 3]))
-                        : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 0 + 4) * 8)));
+                        : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 3]))
+                        : "r"(warp_hist_addr + (unsigned int)((q_base + 64 + 8 + 0) * 4)));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[12])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(12) + 3]))
-                        : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 0 + 6) * 8)));
-                    q_lo_a += ((((unsigned long long)q_peers[1] << 32 | (unsigned long long)q_peers[0]) > q_comp_lo) ? 1 : 0);
-                    q_lo_b += ((((unsigned long long)q_peers[3] << 32 | (unsigned long long)q_peers[2]) > q_comp_lo) ? 1 : 0);
-                    q_hi_a += ((((unsigned long long)q_peers[1] << 32 | (unsigned long long)q_peers[0]) > q_comp_hi) ? 1 : 0);
-                    q_hi_b += ((((unsigned long long)q_peers[3] << 32 | (unsigned long long)q_peers[2]) > q_comp_hi) ? 1 : 0);
-                    q_lo_a += ((((unsigned long long)q_peers[5] << 32 | (unsigned long long)q_peers[4]) > q_comp_lo) ? 1 : 0);
-                    q_lo_b += ((((unsigned long long)q_peers[7] << 32 | (unsigned long long)q_peers[6]) > q_comp_lo) ? 1 : 0);
-                    q_hi_a += ((((unsigned long long)q_peers[5] << 32 | (unsigned long long)q_peers[4]) > q_comp_hi) ? 1 : 0);
-                    q_hi_b += ((((unsigned long long)q_peers[7] << 32 | (unsigned long long)q_peers[6]) > q_comp_hi) ? 1 : 0);
-                    q_lo_a += ((((unsigned long long)q_peers[9] << 32 | (unsigned long long)q_peers[8]) > q_comp_lo) ? 1 : 0);
-                    q_lo_b += ((((unsigned long long)q_peers[11] << 32 | (unsigned long long)q_peers[10]) > q_comp_lo) ? 1 : 0);
-                    q_hi_a += ((((unsigned long long)q_peers[9] << 32 | (unsigned long long)q_peers[8]) > q_comp_hi) ? 1 : 0);
-                    q_hi_b += ((((unsigned long long)q_peers[11] << 32 | (unsigned long long)q_peers[10]) > q_comp_hi) ? 1 : 0);
-                    q_lo_a += ((((unsigned long long)q_peers[13] << 32 | (unsigned long long)q_peers[12]) > q_comp_lo) ? 1 : 0);
-                    q_lo_b += ((((unsigned long long)q_peers[15] << 32 | (unsigned long long)q_peers[14]) > q_comp_lo) ? 1 : 0);
-                    q_hi_a += ((((unsigned long long)q_peers[13] << 32 | (unsigned long long)q_peers[12]) > q_comp_hi) ? 1 : 0);
-                    q_hi_b += ((((unsigned long long)q_peers[15] << 32 | (unsigned long long)q_peers[14]) > q_comp_hi) ? 1 : 0);
+                        : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 3]))
+                        : "r"(warp_hist_addr + (unsigned int)((q_base + 64 + 8 + 4) * 4)));
+                    q_lo_a += ((q_keys[0] > q_key_lo) ? 1 : 0);
+                    q_lo_b += ((q_keys[1] > q_key_lo) ? 1 : 0);
+                    q_hi_a += ((q_keys[0] > q_key_hi) ? 1 : 0);
+                    q_hi_b += ((q_keys[1] > q_key_hi) ? 1 : 0);
+                    q_lo_a += ((q_keys[2] > q_key_lo) ? 1 : 0);
+                    q_lo_b += ((q_keys[3] > q_key_lo) ? 1 : 0);
+                    q_hi_a += ((q_keys[2] > q_key_hi) ? 1 : 0);
+                    q_hi_b += ((q_keys[3] > q_key_hi) ? 1 : 0);
+                    q_lo_a += ((q_keys[4] > q_key_lo) ? 1 : 0);
+                    q_lo_b += ((q_keys[5] > q_key_lo) ? 1 : 0);
+                    q_hi_a += ((q_keys[4] > q_key_hi) ? 1 : 0);
+                    q_hi_b += ((q_keys[5] > q_key_hi) ? 1 : 0);
+                    q_lo_a += ((q_keys[6] > q_key_lo) ? 1 : 0);
+                    q_lo_b += ((q_keys[7] > q_key_lo) ? 1 : 0);
+                    q_hi_a += ((q_keys[6] > q_key_hi) ? 1 : 0);
+                    q_hi_b += ((q_keys[7] > q_key_hi) ? 1 : 0);
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 3]))
-                        : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 8 + 0) * 8)));
+                        : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 3]))
+                        : "r"(warp_hist_addr + (unsigned int)((q_base + 64 + 16 + 0) * 4)));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 3]))
-                        : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 8 + 2) * 8)));
+                        : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 3]))
+                        : "r"(warp_hist_addr + (unsigned int)((q_base + 64 + 16 + 4) * 4)));
+                    q_lo_a += ((q_keys[0] > q_key_lo) ? 1 : 0);
+                    q_lo_b += ((q_keys[1] > q_key_lo) ? 1 : 0);
+                    q_hi_a += ((q_keys[0] > q_key_hi) ? 1 : 0);
+                    q_hi_b += ((q_keys[1] > q_key_hi) ? 1 : 0);
+                    q_lo_a += ((q_keys[2] > q_key_lo) ? 1 : 0);
+                    q_lo_b += ((q_keys[3] > q_key_lo) ? 1 : 0);
+                    q_hi_a += ((q_keys[2] > q_key_hi) ? 1 : 0);
+                    q_hi_b += ((q_keys[3] > q_key_hi) ? 1 : 0);
+                    q_lo_a += ((q_keys[4] > q_key_lo) ? 1 : 0);
+                    q_lo_b += ((q_keys[5] > q_key_lo) ? 1 : 0);
+                    q_hi_a += ((q_keys[4] > q_key_hi) ? 1 : 0);
+                    q_hi_b += ((q_keys[5] > q_key_hi) ? 1 : 0);
+                    q_lo_a += ((q_keys[6] > q_key_lo) ? 1 : 0);
+                    q_lo_b += ((q_keys[7] > q_key_lo) ? 1 : 0);
+                    q_hi_a += ((q_keys[6] > q_key_hi) ? 1 : 0);
+                    q_hi_b += ((q_keys[7] > q_key_hi) ? 1 : 0);
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[8])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(8) + 3]))
-                        : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 8 + 4) * 8)));
+                        : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 3]))
+                        : "r"(warp_hist_addr + (unsigned int)((q_base + 64 + 24 + 0) * 4)));
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[12])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(12) + 3]))
-                        : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 8 + 6) * 8)));
-                    q_lo_a += ((((unsigned long long)q_peers[1] << 32 | (unsigned long long)q_peers[0]) > q_comp_lo) ? 1 : 0);
-                    q_lo_b += ((((unsigned long long)q_peers[3] << 32 | (unsigned long long)q_peers[2]) > q_comp_lo) ? 1 : 0);
-                    q_hi_a += ((((unsigned long long)q_peers[1] << 32 | (unsigned long long)q_peers[0]) > q_comp_hi) ? 1 : 0);
-                    q_hi_b += ((((unsigned long long)q_peers[3] << 32 | (unsigned long long)q_peers[2]) > q_comp_hi) ? 1 : 0);
-                    q_lo_a += ((((unsigned long long)q_peers[5] << 32 | (unsigned long long)q_peers[4]) > q_comp_lo) ? 1 : 0);
-                    q_lo_b += ((((unsigned long long)q_peers[7] << 32 | (unsigned long long)q_peers[6]) > q_comp_lo) ? 1 : 0);
-                    q_hi_a += ((((unsigned long long)q_peers[5] << 32 | (unsigned long long)q_peers[4]) > q_comp_hi) ? 1 : 0);
-                    q_hi_b += ((((unsigned long long)q_peers[7] << 32 | (unsigned long long)q_peers[6]) > q_comp_hi) ? 1 : 0);
-                    q_lo_a += ((((unsigned long long)q_peers[9] << 32 | (unsigned long long)q_peers[8]) > q_comp_lo) ? 1 : 0);
-                    q_lo_b += ((((unsigned long long)q_peers[11] << 32 | (unsigned long long)q_peers[10]) > q_comp_lo) ? 1 : 0);
-                    q_hi_a += ((((unsigned long long)q_peers[9] << 32 | (unsigned long long)q_peers[8]) > q_comp_hi) ? 1 : 0);
-                    q_hi_b += ((((unsigned long long)q_peers[11] << 32 | (unsigned long long)q_peers[10]) > q_comp_hi) ? 1 : 0);
-                    q_lo_a += ((((unsigned long long)q_peers[13] << 32 | (unsigned long long)q_peers[12]) > q_comp_lo) ? 1 : 0);
-                    q_lo_b += ((((unsigned long long)q_peers[15] << 32 | (unsigned long long)q_peers[14]) > q_comp_lo) ? 1 : 0);
-                    q_hi_a += ((((unsigned long long)q_peers[13] << 32 | (unsigned long long)q_peers[12]) > q_comp_hi) ? 1 : 0);
-                    q_hi_b += ((((unsigned long long)q_peers[15] << 32 | (unsigned long long)q_peers[14]) > q_comp_hi) ? 1 : 0);
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 3]))
-                        : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 16 + 0) * 8)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 3]))
-                        : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 16 + 2) * 8)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[8])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(8) + 3]))
-                        : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 16 + 4) * 8)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[12])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(12) + 3]))
-                        : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 16 + 6) * 8)));
-                    q_lo_a += ((((unsigned long long)q_peers[1] << 32 | (unsigned long long)q_peers[0]) > q_comp_lo) ? 1 : 0);
-                    q_lo_b += ((((unsigned long long)q_peers[3] << 32 | (unsigned long long)q_peers[2]) > q_comp_lo) ? 1 : 0);
-                    q_hi_a += ((((unsigned long long)q_peers[1] << 32 | (unsigned long long)q_peers[0]) > q_comp_hi) ? 1 : 0);
-                    q_hi_b += ((((unsigned long long)q_peers[3] << 32 | (unsigned long long)q_peers[2]) > q_comp_hi) ? 1 : 0);
-                    q_lo_a += ((((unsigned long long)q_peers[5] << 32 | (unsigned long long)q_peers[4]) > q_comp_lo) ? 1 : 0);
-                    q_lo_b += ((((unsigned long long)q_peers[7] << 32 | (unsigned long long)q_peers[6]) > q_comp_lo) ? 1 : 0);
-                    q_hi_a += ((((unsigned long long)q_peers[5] << 32 | (unsigned long long)q_peers[4]) > q_comp_hi) ? 1 : 0);
-                    q_hi_b += ((((unsigned long long)q_peers[7] << 32 | (unsigned long long)q_peers[6]) > q_comp_hi) ? 1 : 0);
-                    q_lo_a += ((((unsigned long long)q_peers[9] << 32 | (unsigned long long)q_peers[8]) > q_comp_lo) ? 1 : 0);
-                    q_lo_b += ((((unsigned long long)q_peers[11] << 32 | (unsigned long long)q_peers[10]) > q_comp_lo) ? 1 : 0);
-                    q_hi_a += ((((unsigned long long)q_peers[9] << 32 | (unsigned long long)q_peers[8]) > q_comp_hi) ? 1 : 0);
-                    q_hi_b += ((((unsigned long long)q_peers[11] << 32 | (unsigned long long)q_peers[10]) > q_comp_hi) ? 1 : 0);
-                    q_lo_a += ((((unsigned long long)q_peers[13] << 32 | (unsigned long long)q_peers[12]) > q_comp_lo) ? 1 : 0);
-                    q_lo_b += ((((unsigned long long)q_peers[15] << 32 | (unsigned long long)q_peers[14]) > q_comp_lo) ? 1 : 0);
-                    q_hi_a += ((((unsigned long long)q_peers[13] << 32 | (unsigned long long)q_peers[12]) > q_comp_hi) ? 1 : 0);
-                    q_hi_b += ((((unsigned long long)q_peers[15] << 32 | (unsigned long long)q_peers[14]) > q_comp_hi) ? 1 : 0);
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 3]))
-                        : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 24 + 0) * 8)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 3]))
-                        : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 24 + 2) * 8)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[8])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(8) + 3]))
-                        : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 24 + 4) * 8)));
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[12])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(12) + 3]))
-                        : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 24 + 6) * 8)));
-                    q_lo_a += ((((unsigned long long)q_peers[1] << 32 | (unsigned long long)q_peers[0]) > q_comp_lo) ? 1 : 0);
-                    q_lo_b += ((((unsigned long long)q_peers[3] << 32 | (unsigned long long)q_peers[2]) > q_comp_lo) ? 1 : 0);
-                    q_hi_a += ((((unsigned long long)q_peers[1] << 32 | (unsigned long long)q_peers[0]) > q_comp_hi) ? 1 : 0);
-                    q_hi_b += ((((unsigned long long)q_peers[3] << 32 | (unsigned long long)q_peers[2]) > q_comp_hi) ? 1 : 0);
-                    q_lo_a += ((((unsigned long long)q_peers[5] << 32 | (unsigned long long)q_peers[4]) > q_comp_lo) ? 1 : 0);
-                    q_lo_b += ((((unsigned long long)q_peers[7] << 32 | (unsigned long long)q_peers[6]) > q_comp_lo) ? 1 : 0);
-                    q_hi_a += ((((unsigned long long)q_peers[5] << 32 | (unsigned long long)q_peers[4]) > q_comp_hi) ? 1 : 0);
-                    q_hi_b += ((((unsigned long long)q_peers[7] << 32 | (unsigned long long)q_peers[6]) > q_comp_hi) ? 1 : 0);
-                    q_lo_a += ((((unsigned long long)q_peers[9] << 32 | (unsigned long long)q_peers[8]) > q_comp_lo) ? 1 : 0);
-                    q_lo_b += ((((unsigned long long)q_peers[11] << 32 | (unsigned long long)q_peers[10]) > q_comp_lo) ? 1 : 0);
-                    q_hi_a += ((((unsigned long long)q_peers[9] << 32 | (unsigned long long)q_peers[8]) > q_comp_hi) ? 1 : 0);
-                    q_hi_b += ((((unsigned long long)q_peers[11] << 32 | (unsigned long long)q_peers[10]) > q_comp_hi) ? 1 : 0);
-                    q_lo_a += ((((unsigned long long)q_peers[13] << 32 | (unsigned long long)q_peers[12]) > q_comp_lo) ? 1 : 0);
-                    q_lo_b += ((((unsigned long long)q_peers[15] << 32 | (unsigned long long)q_peers[14]) > q_comp_lo) ? 1 : 0);
-                    q_hi_a += ((((unsigned long long)q_peers[13] << 32 | (unsigned long long)q_peers[12]) > q_comp_hi) ? 1 : 0);
-                    q_hi_b += ((((unsigned long long)q_peers[15] << 32 | (unsigned long long)q_peers[14]) > q_comp_hi) ? 1 : 0);
+                        : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 3]))
+                        : "r"(warp_hist_addr + (unsigned int)((q_base + 64 + 24 + 4) * 4)));
+                    q_lo_a += ((q_keys[0] > q_key_lo) ? 1 : 0);
+                    q_lo_b += ((q_keys[1] > q_key_lo) ? 1 : 0);
+                    q_hi_a += ((q_keys[0] > q_key_hi) ? 1 : 0);
+                    q_hi_b += ((q_keys[1] > q_key_hi) ? 1 : 0);
+                    q_lo_a += ((q_keys[2] > q_key_lo) ? 1 : 0);
+                    q_lo_b += ((q_keys[3] > q_key_lo) ? 1 : 0);
+                    q_hi_a += ((q_keys[2] > q_key_hi) ? 1 : 0);
+                    q_hi_b += ((q_keys[3] > q_key_hi) ? 1 : 0);
+                    q_lo_a += ((q_keys[4] > q_key_lo) ? 1 : 0);
+                    q_lo_b += ((q_keys[5] > q_key_lo) ? 1 : 0);
+                    q_hi_a += ((q_keys[4] > q_key_hi) ? 1 : 0);
+                    q_hi_b += ((q_keys[5] > q_key_hi) ? 1 : 0);
+                    q_lo_a += ((q_keys[6] > q_key_lo) ? 1 : 0);
+                    q_lo_b += ((q_keys[7] > q_key_lo) ? 1 : 0);
+                    q_hi_a += ((q_keys[6] > q_key_hi) ? 1 : 0);
+                    q_hi_b += ((q_keys[7] > q_key_hi) ? 1 : 0);
                     if (p_total > 32) {
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 3]))
-                            : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 32 + 0) * 8)));
+                            : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 3]))
+                            : "r"(warp_hist_addr + (unsigned int)((q_base + 96 + 0 + 0) * 4)));
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 3]))
-                            : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 32 + 2) * 8)));
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[8])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(8) + 3]))
-                            : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 32 + 4) * 8)));
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[12])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(12) + 3]))
-                            : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 32 + 6) * 8)));
-                        q_lo_a += ((((unsigned long long)q_peers[1] << 32 | (unsigned long long)q_peers[0]) > q_comp_lo) ? 1 : 0);
-                        q_lo_b += ((((unsigned long long)q_peers[3] << 32 | (unsigned long long)q_peers[2]) > q_comp_lo) ? 1 : 0);
-                        q_hi_a += ((((unsigned long long)q_peers[1] << 32 | (unsigned long long)q_peers[0]) > q_comp_hi) ? 1 : 0);
-                        q_hi_b += ((((unsigned long long)q_peers[3] << 32 | (unsigned long long)q_peers[2]) > q_comp_hi) ? 1 : 0);
-                        q_lo_a += ((((unsigned long long)q_peers[5] << 32 | (unsigned long long)q_peers[4]) > q_comp_lo) ? 1 : 0);
-                        q_lo_b += ((((unsigned long long)q_peers[7] << 32 | (unsigned long long)q_peers[6]) > q_comp_lo) ? 1 : 0);
-                        q_hi_a += ((((unsigned long long)q_peers[5] << 32 | (unsigned long long)q_peers[4]) > q_comp_hi) ? 1 : 0);
-                        q_hi_b += ((((unsigned long long)q_peers[7] << 32 | (unsigned long long)q_peers[6]) > q_comp_hi) ? 1 : 0);
-                        q_lo_a += ((((unsigned long long)q_peers[9] << 32 | (unsigned long long)q_peers[8]) > q_comp_lo) ? 1 : 0);
-                        q_lo_b += ((((unsigned long long)q_peers[11] << 32 | (unsigned long long)q_peers[10]) > q_comp_lo) ? 1 : 0);
-                        q_hi_a += ((((unsigned long long)q_peers[9] << 32 | (unsigned long long)q_peers[8]) > q_comp_hi) ? 1 : 0);
-                        q_hi_b += ((((unsigned long long)q_peers[11] << 32 | (unsigned long long)q_peers[10]) > q_comp_hi) ? 1 : 0);
-                        q_lo_a += ((((unsigned long long)q_peers[13] << 32 | (unsigned long long)q_peers[12]) > q_comp_lo) ? 1 : 0);
-                        q_lo_b += ((((unsigned long long)q_peers[15] << 32 | (unsigned long long)q_peers[14]) > q_comp_lo) ? 1 : 0);
-                        q_hi_a += ((((unsigned long long)q_peers[13] << 32 | (unsigned long long)q_peers[12]) > q_comp_hi) ? 1 : 0);
-                        q_hi_b += ((((unsigned long long)q_peers[15] << 32 | (unsigned long long)q_peers[14]) > q_comp_hi) ? 1 : 0);
+                            : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 3]))
+                            : "r"(warp_hist_addr + (unsigned int)((q_base + 96 + 0 + 4) * 4)));
+                        q_lo_a += ((q_keys[0] > q_key_lo) ? 1 : 0);
+                        q_lo_b += ((q_keys[1] > q_key_lo) ? 1 : 0);
+                        q_hi_a += ((q_keys[0] > q_key_hi) ? 1 : 0);
+                        q_hi_b += ((q_keys[1] > q_key_hi) ? 1 : 0);
+                        q_lo_a += ((q_keys[2] > q_key_lo) ? 1 : 0);
+                        q_lo_b += ((q_keys[3] > q_key_lo) ? 1 : 0);
+                        q_hi_a += ((q_keys[2] > q_key_hi) ? 1 : 0);
+                        q_hi_b += ((q_keys[3] > q_key_hi) ? 1 : 0);
+                        q_lo_a += ((q_keys[4] > q_key_lo) ? 1 : 0);
+                        q_lo_b += ((q_keys[5] > q_key_lo) ? 1 : 0);
+                        q_hi_a += ((q_keys[4] > q_key_hi) ? 1 : 0);
+                        q_hi_b += ((q_keys[5] > q_key_hi) ? 1 : 0);
+                        q_lo_a += ((q_keys[6] > q_key_lo) ? 1 : 0);
+                        q_lo_b += ((q_keys[7] > q_key_lo) ? 1 : 0);
+                        q_hi_a += ((q_keys[6] > q_key_hi) ? 1 : 0);
+                        q_hi_b += ((q_keys[7] > q_key_hi) ? 1 : 0);
                     }
                     if (p_total > 40) {
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 3]))
-                            : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 40 + 0) * 8)));
+                            : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 3]))
+                            : "r"(warp_hist_addr + (unsigned int)((q_base + 96 + 8 + 0) * 4)));
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 3]))
-                            : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 40 + 2) * 8)));
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[8])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(8) + 3]))
-                            : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 40 + 4) * 8)));
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[12])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(12) + 3]))
-                            : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 40 + 6) * 8)));
-                        q_lo_a += ((((unsigned long long)q_peers[1] << 32 | (unsigned long long)q_peers[0]) > q_comp_lo) ? 1 : 0);
-                        q_lo_b += ((((unsigned long long)q_peers[3] << 32 | (unsigned long long)q_peers[2]) > q_comp_lo) ? 1 : 0);
-                        q_hi_a += ((((unsigned long long)q_peers[1] << 32 | (unsigned long long)q_peers[0]) > q_comp_hi) ? 1 : 0);
-                        q_hi_b += ((((unsigned long long)q_peers[3] << 32 | (unsigned long long)q_peers[2]) > q_comp_hi) ? 1 : 0);
-                        q_lo_a += ((((unsigned long long)q_peers[5] << 32 | (unsigned long long)q_peers[4]) > q_comp_lo) ? 1 : 0);
-                        q_lo_b += ((((unsigned long long)q_peers[7] << 32 | (unsigned long long)q_peers[6]) > q_comp_lo) ? 1 : 0);
-                        q_hi_a += ((((unsigned long long)q_peers[5] << 32 | (unsigned long long)q_peers[4]) > q_comp_hi) ? 1 : 0);
-                        q_hi_b += ((((unsigned long long)q_peers[7] << 32 | (unsigned long long)q_peers[6]) > q_comp_hi) ? 1 : 0);
-                        q_lo_a += ((((unsigned long long)q_peers[9] << 32 | (unsigned long long)q_peers[8]) > q_comp_lo) ? 1 : 0);
-                        q_lo_b += ((((unsigned long long)q_peers[11] << 32 | (unsigned long long)q_peers[10]) > q_comp_lo) ? 1 : 0);
-                        q_hi_a += ((((unsigned long long)q_peers[9] << 32 | (unsigned long long)q_peers[8]) > q_comp_hi) ? 1 : 0);
-                        q_hi_b += ((((unsigned long long)q_peers[11] << 32 | (unsigned long long)q_peers[10]) > q_comp_hi) ? 1 : 0);
-                        q_lo_a += ((((unsigned long long)q_peers[13] << 32 | (unsigned long long)q_peers[12]) > q_comp_lo) ? 1 : 0);
-                        q_lo_b += ((((unsigned long long)q_peers[15] << 32 | (unsigned long long)q_peers[14]) > q_comp_lo) ? 1 : 0);
-                        q_hi_a += ((((unsigned long long)q_peers[13] << 32 | (unsigned long long)q_peers[12]) > q_comp_hi) ? 1 : 0);
-                        q_hi_b += ((((unsigned long long)q_peers[15] << 32 | (unsigned long long)q_peers[14]) > q_comp_hi) ? 1 : 0);
+                            : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 3]))
+                            : "r"(warp_hist_addr + (unsigned int)((q_base + 96 + 8 + 4) * 4)));
+                        q_lo_a += ((q_keys[0] > q_key_lo) ? 1 : 0);
+                        q_lo_b += ((q_keys[1] > q_key_lo) ? 1 : 0);
+                        q_hi_a += ((q_keys[0] > q_key_hi) ? 1 : 0);
+                        q_hi_b += ((q_keys[1] > q_key_hi) ? 1 : 0);
+                        q_lo_a += ((q_keys[2] > q_key_lo) ? 1 : 0);
+                        q_lo_b += ((q_keys[3] > q_key_lo) ? 1 : 0);
+                        q_hi_a += ((q_keys[2] > q_key_hi) ? 1 : 0);
+                        q_hi_b += ((q_keys[3] > q_key_hi) ? 1 : 0);
+                        q_lo_a += ((q_keys[4] > q_key_lo) ? 1 : 0);
+                        q_lo_b += ((q_keys[5] > q_key_lo) ? 1 : 0);
+                        q_hi_a += ((q_keys[4] > q_key_hi) ? 1 : 0);
+                        q_hi_b += ((q_keys[5] > q_key_hi) ? 1 : 0);
+                        q_lo_a += ((q_keys[6] > q_key_lo) ? 1 : 0);
+                        q_lo_b += ((q_keys[7] > q_key_lo) ? 1 : 0);
+                        q_hi_a += ((q_keys[6] > q_key_hi) ? 1 : 0);
+                        q_hi_b += ((q_keys[7] > q_key_hi) ? 1 : 0);
                     }
                     if (p_total > 48) {
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 3]))
-                            : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 48 + 0) * 8)));
+                            : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 3]))
+                            : "r"(warp_hist_addr + (unsigned int)((q_base + 96 + 16 + 0) * 4)));
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 3]))
-                            : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 48 + 2) * 8)));
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[8])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(8) + 3]))
-                            : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 48 + 4) * 8)));
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[12])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(12) + 3]))
-                            : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 48 + 6) * 8)));
-                        q_lo_a += ((((unsigned long long)q_peers[1] << 32 | (unsigned long long)q_peers[0]) > q_comp_lo) ? 1 : 0);
-                        q_lo_b += ((((unsigned long long)q_peers[3] << 32 | (unsigned long long)q_peers[2]) > q_comp_lo) ? 1 : 0);
-                        q_hi_a += ((((unsigned long long)q_peers[1] << 32 | (unsigned long long)q_peers[0]) > q_comp_hi) ? 1 : 0);
-                        q_hi_b += ((((unsigned long long)q_peers[3] << 32 | (unsigned long long)q_peers[2]) > q_comp_hi) ? 1 : 0);
-                        q_lo_a += ((((unsigned long long)q_peers[5] << 32 | (unsigned long long)q_peers[4]) > q_comp_lo) ? 1 : 0);
-                        q_lo_b += ((((unsigned long long)q_peers[7] << 32 | (unsigned long long)q_peers[6]) > q_comp_lo) ? 1 : 0);
-                        q_hi_a += ((((unsigned long long)q_peers[5] << 32 | (unsigned long long)q_peers[4]) > q_comp_hi) ? 1 : 0);
-                        q_hi_b += ((((unsigned long long)q_peers[7] << 32 | (unsigned long long)q_peers[6]) > q_comp_hi) ? 1 : 0);
-                        q_lo_a += ((((unsigned long long)q_peers[9] << 32 | (unsigned long long)q_peers[8]) > q_comp_lo) ? 1 : 0);
-                        q_lo_b += ((((unsigned long long)q_peers[11] << 32 | (unsigned long long)q_peers[10]) > q_comp_lo) ? 1 : 0);
-                        q_hi_a += ((((unsigned long long)q_peers[9] << 32 | (unsigned long long)q_peers[8]) > q_comp_hi) ? 1 : 0);
-                        q_hi_b += ((((unsigned long long)q_peers[11] << 32 | (unsigned long long)q_peers[10]) > q_comp_hi) ? 1 : 0);
-                        q_lo_a += ((((unsigned long long)q_peers[13] << 32 | (unsigned long long)q_peers[12]) > q_comp_lo) ? 1 : 0);
-                        q_lo_b += ((((unsigned long long)q_peers[15] << 32 | (unsigned long long)q_peers[14]) > q_comp_lo) ? 1 : 0);
-                        q_hi_a += ((((unsigned long long)q_peers[13] << 32 | (unsigned long long)q_peers[12]) > q_comp_hi) ? 1 : 0);
-                        q_hi_b += ((((unsigned long long)q_peers[15] << 32 | (unsigned long long)q_peers[14]) > q_comp_hi) ? 1 : 0);
+                            : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 3]))
+                            : "r"(warp_hist_addr + (unsigned int)((q_base + 96 + 16 + 4) * 4)));
+                        q_lo_a += ((q_keys[0] > q_key_lo) ? 1 : 0);
+                        q_lo_b += ((q_keys[1] > q_key_lo) ? 1 : 0);
+                        q_hi_a += ((q_keys[0] > q_key_hi) ? 1 : 0);
+                        q_hi_b += ((q_keys[1] > q_key_hi) ? 1 : 0);
+                        q_lo_a += ((q_keys[2] > q_key_lo) ? 1 : 0);
+                        q_lo_b += ((q_keys[3] > q_key_lo) ? 1 : 0);
+                        q_hi_a += ((q_keys[2] > q_key_hi) ? 1 : 0);
+                        q_hi_b += ((q_keys[3] > q_key_hi) ? 1 : 0);
+                        q_lo_a += ((q_keys[4] > q_key_lo) ? 1 : 0);
+                        q_lo_b += ((q_keys[5] > q_key_lo) ? 1 : 0);
+                        q_hi_a += ((q_keys[4] > q_key_hi) ? 1 : 0);
+                        q_hi_b += ((q_keys[5] > q_key_hi) ? 1 : 0);
+                        q_lo_a += ((q_keys[6] > q_key_lo) ? 1 : 0);
+                        q_lo_b += ((q_keys[7] > q_key_lo) ? 1 : 0);
+                        q_hi_a += ((q_keys[6] > q_key_hi) ? 1 : 0);
+                        q_hi_b += ((q_keys[7] > q_key_hi) ? 1 : 0);
                     }
                     if (p_total > 56) {
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(0) + 3]))
-                            : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 56 + 0) * 8)));
+                            : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(0) + 3]))
+                            : "r"(warp_hist_addr + (unsigned int)((q_base + 96 + 24 + 0) * 4)));
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(4) + 3]))
-                            : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 56 + 2) * 8)));
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[8])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(8) + 3]))
-                            : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 56 + 4) * 8)));
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&q_peers[12])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_peers[(12) + 3]))
-                            : "r"(cand_comp_addr + (unsigned int)((q_comp_base + 56 + 6) * 8)));
-                        q_lo_a += ((((unsigned long long)q_peers[1] << 32 | (unsigned long long)q_peers[0]) > q_comp_lo) ? 1 : 0);
-                        q_lo_b += ((((unsigned long long)q_peers[3] << 32 | (unsigned long long)q_peers[2]) > q_comp_lo) ? 1 : 0);
-                        q_hi_a += ((((unsigned long long)q_peers[1] << 32 | (unsigned long long)q_peers[0]) > q_comp_hi) ? 1 : 0);
-                        q_hi_b += ((((unsigned long long)q_peers[3] << 32 | (unsigned long long)q_peers[2]) > q_comp_hi) ? 1 : 0);
-                        q_lo_a += ((((unsigned long long)q_peers[5] << 32 | (unsigned long long)q_peers[4]) > q_comp_lo) ? 1 : 0);
-                        q_lo_b += ((((unsigned long long)q_peers[7] << 32 | (unsigned long long)q_peers[6]) > q_comp_lo) ? 1 : 0);
-                        q_hi_a += ((((unsigned long long)q_peers[5] << 32 | (unsigned long long)q_peers[4]) > q_comp_hi) ? 1 : 0);
-                        q_hi_b += ((((unsigned long long)q_peers[7] << 32 | (unsigned long long)q_peers[6]) > q_comp_hi) ? 1 : 0);
-                        q_lo_a += ((((unsigned long long)q_peers[9] << 32 | (unsigned long long)q_peers[8]) > q_comp_lo) ? 1 : 0);
-                        q_lo_b += ((((unsigned long long)q_peers[11] << 32 | (unsigned long long)q_peers[10]) > q_comp_lo) ? 1 : 0);
-                        q_hi_a += ((((unsigned long long)q_peers[9] << 32 | (unsigned long long)q_peers[8]) > q_comp_hi) ? 1 : 0);
-                        q_hi_b += ((((unsigned long long)q_peers[11] << 32 | (unsigned long long)q_peers[10]) > q_comp_hi) ? 1 : 0);
-                        q_lo_a += ((((unsigned long long)q_peers[13] << 32 | (unsigned long long)q_peers[12]) > q_comp_lo) ? 1 : 0);
-                        q_lo_b += ((((unsigned long long)q_peers[15] << 32 | (unsigned long long)q_peers[14]) > q_comp_lo) ? 1 : 0);
-                        q_hi_a += ((((unsigned long long)q_peers[13] << 32 | (unsigned long long)q_peers[12]) > q_comp_hi) ? 1 : 0);
-                        q_hi_b += ((((unsigned long long)q_peers[15] << 32 | (unsigned long long)q_peers[14]) > q_comp_hi) ? 1 : 0);
+                            : "=r"(*reinterpret_cast<uint32_t*>(&q_keys[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_keys[(4) + 3]))
+                            : "r"(warp_hist_addr + (unsigned int)((q_base + 96 + 24 + 4) * 4)));
+                        q_lo_a += ((q_keys[0] > q_key_lo) ? 1 : 0);
+                        q_lo_b += ((q_keys[1] > q_key_lo) ? 1 : 0);
+                        q_hi_a += ((q_keys[0] > q_key_hi) ? 1 : 0);
+                        q_hi_b += ((q_keys[1] > q_key_hi) ? 1 : 0);
+                        q_lo_a += ((q_keys[2] > q_key_lo) ? 1 : 0);
+                        q_lo_b += ((q_keys[3] > q_key_lo) ? 1 : 0);
+                        q_hi_a += ((q_keys[2] > q_key_hi) ? 1 : 0);
+                        q_hi_b += ((q_keys[3] > q_key_hi) ? 1 : 0);
+                        q_lo_a += ((q_keys[4] > q_key_lo) ? 1 : 0);
+                        q_lo_b += ((q_keys[5] > q_key_lo) ? 1 : 0);
+                        q_hi_a += ((q_keys[4] > q_key_hi) ? 1 : 0);
+                        q_hi_b += ((q_keys[5] > q_key_hi) ? 1 : 0);
+                        q_lo_a += ((q_keys[6] > q_key_lo) ? 1 : 0);
+                        q_lo_b += ((q_keys[7] > q_key_lo) ? 1 : 0);
+                        q_hi_a += ((q_keys[6] > q_key_hi) ? 1 : 0);
+                        q_hi_b += ((q_keys[7] > q_key_hi) ? 1 : 0);
                     }
                     int q_rank_lo = q_lo_a + q_lo_b;
                     int q_rank_hi = q_hi_a + q_hi_b;
-                    if (q_rank_lo < TOP_K) {
-                        warp_hist[cand_base + 32 + q_rank_lo] = q_id_lo;
-                        hist_f32[cand_base + 48 + q_rank_lo] = q_score_lo;
-                    }
+                    int q_whf = 0;
                     if (q_hi < p_total) {
                         if (q_rank_hi < TOP_K) {
-                            warp_hist[cand_base + 32 + q_rank_hi] = q_id_hi;
-                            hist_f32[cand_base + 48 + q_rank_hi] = q_score_hi;
+                            q_whf = 1;
                         }
                     }
-                    __syncwarp();
-                    if (lane < TOP_K) {
-                        int q_win_id = warp_hist[cand_base + 32 + lane];
-                        float q_win_score = hist_f32[cand_base + 48 + lane];
-                        int q_sa = 0;
-                        int q_sb = 0;
-                        int q_sc = 0;
-                        int q_sd = 0;
-                        unsigned int q_wins[16];
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&q_wins[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_wins[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_wins[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_wins[(0) + 3]))
-                            : "r"(warp_hist_addr + (unsigned int)((cand_base + 32 + 0) * 4)));
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&q_wins[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_wins[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_wins[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_wins[(4) + 3]))
-                            : "r"(warp_hist_addr + (unsigned int)((cand_base + 32 + 4) * 4)));
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&q_wins[8])), "=r"(*reinterpret_cast<uint32_t*>(&q_wins[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_wins[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_wins[(8) + 3]))
-                            : "r"(warp_hist_addr + (unsigned int)((cand_base + 32 + 8) * 4)));
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&q_wins[12])), "=r"(*reinterpret_cast<uint32_t*>(&q_wins[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_wins[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_wins[(12) + 3]))
-                            : "r"(warp_hist_addr + (unsigned int)((cand_base + 32 + 12) * 4)));
-                        q_sa += ((q_win_id > (int)q_wins[0]) ? 1 : 0);
-                        q_sb += ((q_win_id > (int)q_wins[1]) ? 1 : 0);
-                        q_sc += ((q_win_id > (int)q_wins[2]) ? 1 : 0);
-                        q_sd += ((q_win_id > (int)q_wins[3]) ? 1 : 0);
-                        q_sa += ((q_win_id > (int)q_wins[4]) ? 1 : 0);
-                        q_sb += ((q_win_id > (int)q_wins[5]) ? 1 : 0);
-                        q_sc += ((q_win_id > (int)q_wins[6]) ? 1 : 0);
-                        q_sd += ((q_win_id > (int)q_wins[7]) ? 1 : 0);
-                        q_sa += ((q_win_id > (int)q_wins[8]) ? 1 : 0);
-                        q_sb += ((q_win_id > (int)q_wins[9]) ? 1 : 0);
-                        q_sc += ((q_win_id > (int)q_wins[10]) ? 1 : 0);
-                        q_sd += ((q_win_id > (int)q_wins[11]) ? 1 : 0);
-                        q_sa += ((q_win_id > (int)q_wins[12]) ? 1 : 0);
-                        q_sb += ((q_win_id > (int)q_wins[13]) ? 1 : 0);
-                        q_sc += ((q_win_id > (int)q_wins[14]) ? 1 : 0);
-                        q_sd += ((q_win_id > (int)q_wins[15]) ? 1 : 0);
-                        int q_win_slot = q_sa + q_sb + (q_sc + q_sd);
-                        winner_ids[stash_base + q_win_slot] = q_win_id;
-                        winner_scores[stash_base + q_win_slot] = q_win_score;
+                    unsigned int q_wl = __ballot_sync(0xFFFFFFFF, q_rank_lo < TOP_K);
+                    unsigned int q_wh = __ballot_sync(0xFFFFFFFF, q_whf != 0);
+                    if ((int)((unsigned int)__popc(q_wl) + (unsigned int)__popc(q_wh)) != TOP_K) {
+                        unsigned int q_el_l = 0;
+                        unsigned int q_el_h = 0;
+                        unsigned int q_eh_l = 0;
+                        unsigned int q_eh_h = 0;
+                        #pragma unroll 4
+                        for (int q_e = 0; q_e < p_total; q_e++) {
+                            unsigned int q_ek = (unsigned int)warp_hist[q_base + 64 + q_e];
+                            if (q_e < 32) {
+                                if (q_ek == q_key_lo) {
+                                    q_el_l |= one_u32 << (unsigned int)q_e;
+                                }
+                                if (q_ek == q_key_hi) {
+                                    q_eh_l |= one_u32 << (unsigned int)q_e;
+                                }
+                            } else {
+                                if (q_ek == q_key_lo) {
+                                    q_el_h |= one_u32 << (unsigned int)(q_e - 32);
+                                }
+                                if (q_ek == q_key_hi) {
+                                    q_eh_h |= one_u32 << (unsigned int)(q_e - 32);
+                                }
+                            }
+                        }
+                        q_rank_lo += (int)((unsigned int)__popc(q_el_l & q_ll_lo) + (unsigned int)__popc(q_el_h & q_lh_lo));
+                        q_rank_hi += (int)((unsigned int)__popc(q_eh_l & q_ll_hi) + (unsigned int)__popc(q_eh_h & q_lh_hi));
+                        q_whf = 0;
+                        if (q_hi < p_total) {
+                            if (q_rank_hi < TOP_K) {
+                                q_whf = 1;
+                            }
+                        }
+                        unsigned int _warp_vote_30 = __ballot_sync(0xFFFFFFFF, q_rank_lo < TOP_K);
+                        q_wl = _warp_vote_30;
+                        unsigned int _warp_vote_31 = __ballot_sync(0xFFFFFFFF, q_whf != 0);
+                        q_wh = _warp_vote_31;
+                    }
+                    if (q_rank_lo < TOP_K) {
+                        int q_sl = (int)((unsigned int)__popc(q_wl & q_ll_lo) + (unsigned int)__popc(q_wh & q_lh_lo));
+                        winner_ids[stash_base + q_sl] = q_id_lo;
+                        winner_scores[stash_base + q_sl] = q_score_lo;
+                    }
+                    if (q_whf != 0) {
+                        int q_sh = (int)((unsigned int)__popc(q_wl & q_ll_hi) + (unsigned int)__popc(q_wh & q_lh_hi));
+                        winner_ids[stash_base + q_sh] = q_id_hi;
+                        winner_scores[stash_base + q_sh] = q_score_hi;
                     }
                     __syncwarp();
                 }
@@ -1090,8 +1118,8 @@ kernel_cake_kimi_k3_fused_router_fe39f52a822c7aa2a709(float* __restrict__ logits
                         int consume_round = 1;
                         if (spec_round != 0) {
                             spec_round = 0;
-                            int _shfl_sync_29 = __shfl_sync(0xFFFFFFFF, inclusive, 31);
-                            active_total = _shfl_sync_29;
+                            int _shfl_sync_32 = __shfl_sync(0xFFFFFFFF, inclusive, 31);
+                            active_total = _shfl_sync_32;
                             if (active_total < TOP_K) {
                                 threshold = (unsigned int)0;
                                 examined_mask = (unsigned int)0;
@@ -1115,8 +1143,8 @@ kernel_cake_kimi_k3_fused_router_fe39f52a822c7aa2a709(float* __restrict__ logits
                                     bin_below = run_prefix;
                                     bins_before += 1;
                                 } else {
-                                    int _min_30 = ((bin_top) < (run_prefix) ? (bin_top) : (run_prefix));
-                                    bin_top = _min_30;
+                                    int _min_33 = ((bin_top) < (run_prefix) ? (bin_top) : (run_prefix));
+                                    bin_top = _min_33;
                                 }
                             }
                             unsigned int warp_match_record = 0;
@@ -1192,10 +1220,10 @@ kernel_cake_kimi_k3_fused_router_fe39f52a822c7aa2a709(float* __restrict__ logits
                 if (lane < TOP_K) {
                     int score_col = winner_ids[stash_base + lane];
                     float score_logit = reinterpret_cast<volatile float*>(logits)[row_base + (unsigned long long)score_col];
-                    float _exp_32 = __expf(-score_logit);
-                    float _fdiv_31;
-                    asm volatile("div.full.f32 %0, %1, %2;" : "=f"(_fdiv_31) : "f"(1.0f), "f"(1.0f + _exp_32));
-                    winner_scores[stash_base + lane] = _fdiv_31;
+                    float _exp_35 = __expf(-score_logit);
+                    float _fdiv_34;
+                    asm volatile("div.full.f32 %0, %1, %2;" : "=f"(_fdiv_34) : "f"(1.0f), "f"(1.0f + _exp_35));
+                    winner_scores[stash_base + lane] = _fdiv_34;
                 }
                 __syncwarp();
             }
@@ -1217,16 +1245,16 @@ kernel_cake_kimi_k3_fused_router_fe39f52a822c7aa2a709(float* __restrict__ logits
                 if (selected_sum > 0.0f) {
                     selected_norm = selected_sum;
                 }
-                float _fdiv_33;
-                asm volatile("div.full.f32 %0, %1, %2;" : "=f"(_fdiv_33) : "f"(winner_scores[stash_base + lane]), "f"(selected_norm));
-                topk_weights[output_index] = _fdiv_33;
+                float _fdiv_36;
+                asm volatile("div.full.f32 %0, %1, %2;" : "=f"(_fdiv_36) : "f"(winner_scores[stash_base + lane]), "f"(selected_norm));
+                topk_weights[output_index] = _fdiv_36;
                 int local_rank = 0;
                 if (M * TOP_K >= NUM_EXPERTS * 8) {
-                    int _atomic_fetch_add_34 = atomicAdd(&sorted_token_ids[selected_id * 8], 1);
-                    local_rank = _atomic_fetch_add_34;
+                    int _atomic_fetch_add_37 = atomicAdd(&sorted_token_ids[selected_id * 8], 1);
+                    local_rank = _atomic_fetch_add_37;
                 } else {
-                    int _atomic_fetch_add_35 = atomicAdd(&expert_counts[selected_id], 1);
-                    local_rank = _atomic_fetch_add_35;
+                    int _atomic_fetch_add_38 = atomicAdd(&expert_counts[selected_id], 1);
+                    local_rank = _atomic_fetch_add_38;
                 }
                 unsigned int packed_rank = (unsigned int)local_rank;
                 unsigned int packed_expert = (unsigned int)selected_id;
@@ -1280,11 +1308,11 @@ kernel_cake_kimi_k3_fused_router_fe39f52a822c7aa2a709(float* __restrict__ logits
     } else {
         if (tid == 0) {
             {
-                unsigned int* _global_wait_zero_p_36 = (reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(expert_offsets)) + (0));
-                unsigned int _global_wait_zero_v_36;
+                unsigned int* _global_wait_zero_p_39 = (reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(expert_offsets)) + (0));
+                unsigned int _global_wait_zero_v_39;
                 do {
-                    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_global_wait_zero_v_36) : "l"(_global_wait_zero_p_36) : "memory");
-                } while (_global_wait_zero_v_36 != 0u);
+                    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_global_wait_zero_v_39) : "l"(_global_wait_zero_p_39) : "memory");
+                } while (_global_wait_zero_v_39 != 0u);
             }
         }
         __syncthreads();
@@ -1992,8 +2020,8 @@ kernel_cake_kimi_k3_fused_router_fe39f52a822c7aa2a709(float* __restrict__ logits
                         unsigned int walk = wa0;
                         int rank = rank_a;
                         while (walk != 0) {
-                            int _find_first_set_37 = __ffs((int)walk);
-                            int bit = _find_first_set_37 - 1;
+                            int _find_first_set_40 = __ffs((int)walk);
+                            int bit = _find_first_set_40 - 1;
                             int token_11 = (word0 << 5) + bit;
                             sorted_token_ids[rank] = token_11 * 16 + (int)route_a[token_11];
                             walk = walk & walk - 1;
@@ -2002,8 +2030,8 @@ kernel_cake_kimi_k3_fused_router_fe39f52a822c7aa2a709(float* __restrict__ logits
                         unsigned int walk_0 = wa1;
                         int rank_0 = rank_a + ca0;
                         while (walk_0 != 0) {
-                            int _find_first_set_38 = __ffs((int)walk_0);
-                            int bit_1 = _find_first_set_38 - 1;
+                            int _find_first_set_41 = __ffs((int)walk_0);
+                            int bit_1 = _find_first_set_41 - 1;
                             int token_12 = (word0 + 1 << 5) + bit_1;
                             sorted_token_ids[rank_0] = token_12 * 16 + (int)route_a[token_12];
                             walk_0 = walk_0 & walk_0 - 1;
@@ -2014,8 +2042,8 @@ kernel_cake_kimi_k3_fused_router_fe39f52a822c7aa2a709(float* __restrict__ logits
                         unsigned int walk_1 = wb0;
                         int rank_1 = rank_b;
                         while (walk_1 != 0) {
-                            int _find_first_set_39 = __ffs((int)walk_1);
-                            int bit_2 = _find_first_set_39 - 1;
+                            int _find_first_set_42 = __ffs((int)walk_1);
+                            int bit_2 = _find_first_set_42 - 1;
                             int token_13 = (word0 << 5) + bit_2;
                             sorted_token_ids[rank_1] = token_13 * 16 + (int)route_b[token_13];
                             walk_1 = walk_1 & walk_1 - 1;
@@ -2024,8 +2052,8 @@ kernel_cake_kimi_k3_fused_router_fe39f52a822c7aa2a709(float* __restrict__ logits
                         unsigned int walk_1_1 = wb1;
                         int rank_1_1 = rank_b + cb0;
                         while (walk_1_1 != 0) {
-                            int _find_first_set_40 = __ffs((int)walk_1_1);
-                            int bit_3 = _find_first_set_40 - 1;
+                            int _find_first_set_43 = __ffs((int)walk_1_1);
+                            int bit_3 = _find_first_set_43 - 1;
                             int token_14 = (word0 + 1 << 5) + bit_3;
                             sorted_token_ids[rank_1_1] = token_14 * 16 + (int)route_b[token_14];
                             walk_1_1 = walk_1_1 & walk_1_1 - 1;
