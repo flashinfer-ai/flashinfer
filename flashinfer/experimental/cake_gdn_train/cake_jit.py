@@ -52,8 +52,9 @@ Programs (``*`` = new program package, ``=`` = reused verbatim):
   #4 = ``kcp_affine_merge``  FP32 FFMA affine chains (``_c8`` state mode / ``_c16`` map mode)
   #5 * ``fwd_o``             ``o = qscale (q h_c) + (Aqk . mask) v_new``; persistent grid min(NC x HV, SMs), the
                              tiles beyond the grid drawn in units from the ``ticket`` word
-  #6 * ``bwd_prep``          ``do_g``, ``dv_intra``; persistent grid min(NC x HV, SMs), items beyond the grid drawn
-                             from the ``ticket`` word
+  #6 * ``bwd_prep``          ``do_g``, ``dv_intra``; persistent grid min(NC x HV, ctas_per_sm x SMs) with two
+                             CTAs per SM on sm_100a, sm_103a and sm_107a (the record's per-architecture
+                             ``ctas_per_sm``), items beyond the grid drawn from the ``ticket`` word
   #7 * ``kcp_dhu_offset``    adjoint walk from zero -> ``d_f``
      * ``kcp_dhu_tape``      adjoint walk from ``dS_out`` -> ``dh`` / ``dv_new`` tapes
                              (each form at value width ``vh`` 128 and, as the ``_vh64`` record with two CTAs per
@@ -278,7 +279,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 210176,
+            "dynamic_smem_bytes": 227328,
             "use_pdl": False,
         },
         "library": "cake_gdn_train_83eb8234f378bfe68bb1",
@@ -340,7 +341,10 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "grid_rule": {"kind": "chunks_heads_persistent"},
+        "grid_rule": {
+            "ctas_per_sm": {"sm_100a": 2, "sm_103a": 2, "sm_107a": 2},
+            "kind": "chunks_heads_persistent",
+        },
         "kernel_symbol": "kernel_cake_gdn_train_3f3dd0a8504039fd93f0",
         "launch": {
             "block": (192, 1, 1),
@@ -661,7 +665,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 115712,
+            "dynamic_smem_bytes": 116736,
             "use_pdl": False,
         },
         "library": "cake_gdn_train_f234e13206ecce204b46",
@@ -735,7 +739,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 82944,
+            "dynamic_smem_bytes": 83968,
             "use_pdl": False,
         },
         "library": "cake_gdn_train_ac5ce25cc84be93bb2a6",
@@ -883,7 +887,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 82944,
+            "dynamic_smem_bytes": 83968,
             "use_pdl": False,
         },
         "library": "cake_gdn_train_49450e259854e03ab17c",
@@ -1158,7 +1162,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 91136,
+            "dynamic_smem_bytes": 99328,
             "use_pdl": False,
         },
         "library": "cake_gdn_train_6e7a1ca02911aa5f1313",
@@ -1468,6 +1472,16 @@ def select_record(
     return admitted[0]
 
 
+def _ctas_per_sm(rule: Mapping[str, Any], arch: str | None) -> int:
+    """The persistent CTAs per SM a grid rule launches: its ``ctas_per_sm`` as one int for every architecture,
+    or as a mapping architecture -> int that reads 1 for an architecture it does not name and when the launch
+    names no architecture; 1 when the rule carries no ``ctas_per_sm``."""
+    per_sm = rule.get("ctas_per_sm", 1)
+    if isinstance(per_sm, Mapping):
+        return int(per_sm.get(arch, 1)) if arch is not None else 1
+    return int(per_sm)
+
+
 def launch_grid(
     name: str,
     *,
@@ -1479,11 +1493,14 @@ def launch_grid(
     ncols: int = 0,
     ctas_per_head: int | None = None,
     sm_count: int = 0,
+    arch: str | None = None,
 ) -> tuple[int, int, int]:
     """The launch grid of record ``name`` under its grid rule: ``chunks_by_qk_heads`` ``(NC, H_qk, 1)`` (one CTA
     per chunk and Q/K head: the ``HV / H_qk`` value heads of the group share ``k``), ``chunks_heads_persistent`` /
-    ``chunks_qk_heads_persistent`` ``(min(NC x HV, sm_count), 1, 1)`` / ``(min(NC x H_qk, sm_count), 1, 1)`` (a
-    persistent CTA walks the tiles ``b, b + gridDim.x, ...``; without ``sm_count`` the grid is the tile count),
+    ``chunks_qk_heads_persistent`` ``(min(NC x HV, k x sm_count), 1, 1)`` / ``(min(NC x H_qk, k x sm_count), 1, 1)``
+    (a persistent CTA walks the tiles ``b, b + gridDim.x, ...``; ``k`` is the record's ``ctas_per_sm`` for ``arch``,
+    the architecture the launch loads the library for -- 1 without the field, for an architecture the field does
+    not name, or without ``arch``; without ``sm_count`` the grid is the tile count),
     ``chunk_head_items`` ``(ceil(NC x HV / items_per_cta), 1, 1)`` (one thread per (chunk, head) item),
     ``kcp_segments_heads`` ``(n_walk x HV x ctas_per_head, 1, 1)`` (``ctas_per_head`` is the record's: 2
     for the half-width ``vh = 64`` ``_vh64`` records of the forward state walk, chosen per launch when
@@ -1510,7 +1527,12 @@ def launch_grid(
                 f"{'num_qk_heads' if qk else 'num_heads'}={heads} must be >= 1"
             )
         tiles = int(num_chunks) * int(heads)
-        return (min(tiles, int(sm_count)) if int(sm_count) >= 1 else tiles, 1, 1)
+        per_sm = _ctas_per_sm(rule, arch)
+        return (
+            min(tiles, per_sm * int(sm_count)) if int(sm_count) >= 1 else tiles,
+            1,
+            1,
+        )
     if kind == "chunk_head_items":
         per_cta = int(rule["items_per_cta"])
         if int(num_chunks) < 1 or int(num_heads) < 1:

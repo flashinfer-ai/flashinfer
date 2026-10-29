@@ -56,8 +56,8 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define TMEM_ACC_DW_OFFSET 256
 #define TMEM_ACC_DA_OFFSET 320
 #define TMEM_ACC_DAQ_OFFSET 384
-#define TMEM_ACC_DVB_OFFSET 256
-#define TMEM_ACC_DKGB_OFFSET 384
+#define TMEM_ACC_DVB_OFFSET 384
+#define TMEM_ACC_DKGB_OFFSET 256
 #define TMEM_ACC_DA1_OFFSET 256
 #define TMEM_ACC_DA2_OFFSET 320
 #define TMEM_ACC_DKSRC_OFFSET 256
@@ -68,48 +68,48 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_SMEM_V0_OFF 1024
 #define SMEM_SMEM_V0_STAGE_BYTES 8192
 #define SMEM_SMEM_V0_STRIDE 8192
-#define SMEM_SMEM_V1_OFF 17408
-#define SMEM_SMEM_V1_STAGE_BYTES 8192
-#define SMEM_SMEM_V1_STRIDE 8192
-#define SMEM_SMEM_V2_OFF 148480
-#define SMEM_SMEM_V2_STAGE_BYTES 8192
-#define SMEM_SMEM_V2_STRIDE 8192
-#define SMEM_SMEM_V3_OFF 99328
-#define SMEM_SMEM_V3_STAGE_BYTES 8192
-#define SMEM_SMEM_V3_STRIDE 8192
-#define SMEM_SMEM_V4_OFF 115712
-#define SMEM_SMEM_V4_STAGE_BYTES 8192
-#define SMEM_SMEM_V4_STRIDE 8192
-#define SMEM_SMEM_V5_OFF 132096
-#define SMEM_SMEM_V5_STAGE_BYTES 8192
-#define SMEM_SMEM_V5_STRIDE 8192
+#define SMEM_SMEM_V0_0_OFF 17408
+#define SMEM_SMEM_V0_0_STAGE_BYTES 8192
+#define SMEM_SMEM_V0_0_STRIDE 8192
+#define SMEM_SMEM_V0_1_OFF 148480
+#define SMEM_SMEM_V0_1_STAGE_BYTES 8192
+#define SMEM_SMEM_V0_1_STRIDE 8192
+#define SMEM_SMEM_V0_2_OFF 99328
+#define SMEM_SMEM_V0_2_STAGE_BYTES 8192
+#define SMEM_SMEM_V0_2_STRIDE 8192
+#define SMEM_SMEM_V0_3_OFF 115712
+#define SMEM_SMEM_V0_3_STAGE_BYTES 8192
+#define SMEM_SMEM_V0_3_STRIDE 8192
+#define SMEM_SMEM_V0_4_OFF 132096
+#define SMEM_SMEM_V0_4_STAGE_BYTES 8192
+#define SMEM_SMEM_V0_4_STRIDE 8192
 #define SMEM_SMEM_V6_OFF 1024
 #define SMEM_SMEM_V6_STAGE_BYTES 16384
 #define SMEM_SMEM_V6_STRIDE 16384
-#define SMEM_SMEM_V7_OFF 17408
-#define SMEM_SMEM_V7_STAGE_BYTES 16384
-#define SMEM_SMEM_V7_STRIDE 16384
-#define SMEM_SMEM_V8_OFF 148480
-#define SMEM_SMEM_V8_STAGE_BYTES 16384
-#define SMEM_SMEM_V8_STRIDE 16384
+#define SMEM_SMEM_V6_0_OFF 17408
+#define SMEM_SMEM_V6_0_STAGE_BYTES 16384
+#define SMEM_SMEM_V6_0_STRIDE 16384
+#define SMEM_SMEM_V6_1_OFF 148480
+#define SMEM_SMEM_V6_1_STAGE_BYTES 16384
+#define SMEM_SMEM_V6_1_STRIDE 16384
 #define SMEM_SMEM_V9_OFF 1024
 #define SMEM_SMEM_V9_STAGE_BYTES 16384
 #define SMEM_SMEM_V9_STRIDE 16384
-#define SMEM_SMEM_V10_OFF 17408
-#define SMEM_SMEM_V10_STAGE_BYTES 16384
-#define SMEM_SMEM_V10_STRIDE 16384
-#define SMEM_SMEM_V11_OFF 99328
-#define SMEM_SMEM_V11_STAGE_BYTES 16384
-#define SMEM_SMEM_V11_STRIDE 16384
-#define SMEM_SMEM_V12_OFF 115712
-#define SMEM_SMEM_V12_STAGE_BYTES 16384
-#define SMEM_SMEM_V12_STRIDE 16384
-#define SMEM_SMEM_V13_OFF 132096
-#define SMEM_SMEM_V13_STAGE_BYTES 16384
-#define SMEM_SMEM_V13_STRIDE 16384
-#define SMEM_SMEM_V14_OFF 132096
-#define SMEM_SMEM_V14_STAGE_BYTES 16384
-#define SMEM_SMEM_V14_STRIDE 16384
+#define SMEM_SMEM_V9_0_OFF 17408
+#define SMEM_SMEM_V9_0_STAGE_BYTES 16384
+#define SMEM_SMEM_V9_0_STRIDE 16384
+#define SMEM_SMEM_V6_2_OFF 99328
+#define SMEM_SMEM_V6_2_STAGE_BYTES 16384
+#define SMEM_SMEM_V6_2_STRIDE 16384
+#define SMEM_SMEM_V6_3_OFF 115712
+#define SMEM_SMEM_V6_3_STAGE_BYTES 16384
+#define SMEM_SMEM_V6_3_STRIDE 16384
+#define SMEM_SMEM_V6_4_OFF 132096
+#define SMEM_SMEM_V6_4_STAGE_BYTES 16384
+#define SMEM_SMEM_V6_4_STRIDE 16384
+#define SMEM_SMEM_V9_1_OFF 132096
+#define SMEM_SMEM_V9_1_STAGE_BYTES 16384
+#define SMEM_SMEM_V9_1_STRIDE 16384
 #define SMEM_H_P_OFF 33792
 #define SMEM_H_P_STAGE_BYTES 16384
 #define SMEM_H_P_STRIDE 16384
@@ -137,43 +137,43 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_DWBT_MN_OFF 33792
 #define SMEM_DWBT_MN_STAGE_BYTES 16384
 #define SMEM_DWBT_MN_STRIDE 16384
-#define SMEM_SMEM_V24_OFF 50176
-#define SMEM_SMEM_V24_STAGE_BYTES 16384
-#define SMEM_SMEM_V24_STRIDE 16384
-#define SMEM_SMEM_V25_OFF 66560
-#define SMEM_SMEM_V25_STAGE_BYTES 16384
-#define SMEM_SMEM_V25_STRIDE 16384
-#define SMEM_SMEM_V26_OFF 66560
-#define SMEM_SMEM_V26_STAGE_BYTES 16384
-#define SMEM_SMEM_V26_STRIDE 16384
-#define SMEM_SMEM_V27_OFF 173056
-#define SMEM_SMEM_V27_STAGE_BYTES 8192
-#define SMEM_SMEM_V27_STRIDE 8192
-#define SMEM_SMEM_V28_OFF 181248
-#define SMEM_SMEM_V28_STAGE_BYTES 8192
-#define SMEM_SMEM_V28_STRIDE 8192
-#define SMEM_SMEM_V29_OFF 181248
-#define SMEM_SMEM_V29_STAGE_BYTES 8192
-#define SMEM_SMEM_V29_STRIDE 8192
-#define SMEM_SMEM_V30_OFF 189440
-#define SMEM_SMEM_V30_STAGE_BYTES 8192
-#define SMEM_SMEM_V30_STRIDE 8192
-#define SMEM_SMEM_V31_OFF 189440
-#define SMEM_SMEM_V31_STAGE_BYTES 8192
-#define SMEM_SMEM_V31_STRIDE 8192
-#define SMEM_SMEM_V32_OFF 197632
-#define SMEM_SMEM_V32_STAGE_BYTES 8192
-#define SMEM_SMEM_V32_STRIDE 8192
-#define SMEM_SMEM_V33_OFF 197632
-#define SMEM_SMEM_V33_STAGE_BYTES 8192
-#define SMEM_SMEM_V33_STRIDE 8192
+#define SMEM_SMEM_V6_5_OFF 50176
+#define SMEM_SMEM_V6_5_STAGE_BYTES 16384
+#define SMEM_SMEM_V6_5_STRIDE 16384
+#define SMEM_SMEM_V6_6_OFF 210944
+#define SMEM_SMEM_V6_6_STAGE_BYTES 16384
+#define SMEM_SMEM_V6_6_STRIDE 16384
+#define SMEM_SMEM_V9_2_OFF 210944
+#define SMEM_SMEM_V9_2_STAGE_BYTES 16384
+#define SMEM_SMEM_V9_2_STRIDE 16384
+#define SMEM_SMEM_V20_0_OFF 173056
+#define SMEM_SMEM_V20_0_STAGE_BYTES 8192
+#define SMEM_SMEM_V20_0_STRIDE 8192
+#define SMEM_SMEM_V20_1_OFF 181248
+#define SMEM_SMEM_V20_1_STAGE_BYTES 8192
+#define SMEM_SMEM_V20_1_STRIDE 8192
+#define SMEM_SMEM_V21_0_OFF 181248
+#define SMEM_SMEM_V21_0_STAGE_BYTES 8192
+#define SMEM_SMEM_V21_0_STRIDE 8192
+#define SMEM_SMEM_V20_2_OFF 189440
+#define SMEM_SMEM_V20_2_STAGE_BYTES 8192
+#define SMEM_SMEM_V20_2_STRIDE 8192
+#define SMEM_SMEM_V21_1_OFF 189440
+#define SMEM_SMEM_V21_1_STAGE_BYTES 8192
+#define SMEM_SMEM_V21_1_STRIDE 8192
+#define SMEM_SMEM_V20_3_OFF 197632
+#define SMEM_SMEM_V20_3_STAGE_BYTES 8192
+#define SMEM_SMEM_V20_3_STRIDE 8192
+#define SMEM_SMEM_V21_2_OFF 197632
+#define SMEM_SMEM_V21_2_STAGE_BYTES 8192
+#define SMEM_SMEM_V21_2_STRIDE 8192
 #define SMEM_STAGE_DV_OFF 132096
 #define SMEM_STAGE_DV_STAGE_BYTES 16384
 #define SMEM_STAGE_DV_STRIDE 16384
-#define SMEM_STAGE_DQ_OFF 132096
+#define SMEM_STAGE_DQ_OFF 173056
 #define SMEM_STAGE_DQ_STAGE_BYTES 16384
 #define SMEM_STAGE_DQ_STRIDE 16384
-#define SMEM_STAGE_DK_OFF 148480
+#define SMEM_STAGE_DK_OFF 189440
 #define SMEM_STAGE_DK_STAGE_BYTES 16384
 #define SMEM_STAGE_DK_STRIDE 16384
 #define SMEM_BETA_S_OFF 205824
@@ -203,7 +203,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_TK_S_OFF 209984
 #define SMEM_TK_S_STAGE_BYTES 16
 #define SMEM_TK_S_STRIDE 16
-#define SMEM_TOTAL 210176
+#define SMEM_TOTAL 227328
 #define THREADS 384
 #define LAUNCH_MIN_BLOCKS 1
 
@@ -364,8 +364,12 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
     #define c_drained_addr (mbar_base + 144)
     #define d_drained_addr (mbar_base + 152)
     #define e_drained_addr (mbar_base + 160)
-    #define tk_full_addr (mbar_base + 168)
-    #define tk_empty_addr (mbar_base + 184)
+    #define dv_stored_addr (mbar_base + 168)
+    #define tk_full_addr (mbar_base + 176)
+    #define tk_empty_addr (mbar_base + 192)
+    #define e1_ready_addr (mbar_base + 208)
+    #define b1_ready_addr (mbar_base + 216)
+    #define daq_drained_addr (mbar_base + 224)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -375,34 +379,34 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
     // Kernel setup ops
     __nv_bfloat16* smem_v0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_v0_addr = smem + 1024;
-    __nv_bfloat16* smem_v1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
-    const int smem_v1_addr = smem + 17408;
-    __nv_bfloat16* smem_v2 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 148480);
-    const int smem_v2_addr = smem + 148480;
-    __nv_bfloat16* smem_v3 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 99328);
-    const int smem_v3_addr = smem + 99328;
-    __nv_bfloat16* smem_v4 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 115712);
-    const int smem_v4_addr = smem + 115712;
-    __nv_bfloat16* smem_v5 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 132096);
-    const int smem_v5_addr = smem + 132096;
+    __nv_bfloat16* smem_v0_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
+    const int smem_v0_addr_0 = smem + 17408;
+    __nv_bfloat16* smem_v0_1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 148480);
+    const int smem_v0_addr_1 = smem + 148480;
+    __nv_bfloat16* smem_v0_2 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 99328);
+    const int smem_v0_addr_2 = smem + 99328;
+    __nv_bfloat16* smem_v0_3 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 115712);
+    const int smem_v0_addr_3 = smem + 115712;
+    __nv_bfloat16* smem_v0_4 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 132096);
+    const int smem_v0_addr_4 = smem + 132096;
     __nv_bfloat16* smem_v6 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_v6_addr = smem + 1024;
-    __nv_bfloat16* smem_v7 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
-    const int smem_v7_addr = smem + 17408;
-    __nv_bfloat16* smem_v8 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 148480);
-    const int smem_v8_addr = smem + 148480;
+    __nv_bfloat16* smem_v6_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
+    const int smem_v6_addr_0 = smem + 17408;
+    __nv_bfloat16* smem_v6_1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 148480);
+    const int smem_v6_addr_1 = smem + 148480;
     __nv_bfloat16* smem_v9 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_v9_addr = smem + 1024;
-    __nv_bfloat16* smem_v10 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
-    const int smem_v10_addr = smem + 17408;
-    __nv_bfloat16* smem_v11 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 99328);
-    const int smem_v11_addr = smem + 99328;
-    __nv_bfloat16* smem_v12 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 115712);
-    const int smem_v12_addr = smem + 115712;
-    __nv_bfloat16* smem_v13 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 132096);
-    const int smem_v13_addr = smem + 132096;
-    __nv_bfloat16* smem_v14 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 132096);
-    const int smem_v14_addr = smem + 132096;
+    __nv_bfloat16* smem_v9_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
+    const int smem_v9_addr_0 = smem + 17408;
+    __nv_bfloat16* smem_v6_2 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 99328);
+    const int smem_v6_addr_2 = smem + 99328;
+    __nv_bfloat16* smem_v6_3 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 115712);
+    const int smem_v6_addr_3 = smem + 115712;
+    __nv_bfloat16* smem_v6_4 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 132096);
+    const int smem_v6_addr_4 = smem + 132096;
+    __nv_bfloat16* smem_v9_1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 132096);
+    const int smem_v9_addr_1 = smem + 132096;
     __nv_bfloat16* h_p = reinterpret_cast<__nv_bfloat16*>(smem_raw + 33792);
     const int h_p_addr = smem + 33792;
     __nv_bfloat16* dh_p = reinterpret_cast<__nv_bfloat16*>(smem_raw + 66560);
@@ -421,32 +425,32 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
     const int dwbt_k_addr = smem + 33792;
     __nv_bfloat16* dwbt_mn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 33792);
     const int dwbt_mn_addr = smem + 33792;
-    __nv_bfloat16* smem_v24 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 50176);
-    const int smem_v24_addr = smem + 50176;
-    __nv_bfloat16* smem_v25 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 66560);
-    const int smem_v25_addr = smem + 66560;
-    __nv_bfloat16* smem_v26 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 66560);
-    const int smem_v26_addr = smem + 66560;
-    __nv_bfloat16* smem_v27 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 173056);
-    const int smem_v27_addr = smem + 173056;
-    __nv_bfloat16* smem_v28 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 181248);
-    const int smem_v28_addr = smem + 181248;
-    __nv_bfloat16* smem_v29 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 181248);
-    const int smem_v29_addr = smem + 181248;
-    __nv_bfloat16* smem_v30 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 189440);
-    const int smem_v30_addr = smem + 189440;
-    __nv_bfloat16* smem_v31 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 189440);
-    const int smem_v31_addr = smem + 189440;
-    __nv_bfloat16* smem_v32 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 197632);
-    const int smem_v32_addr = smem + 197632;
-    __nv_bfloat16* smem_v33 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 197632);
-    const int smem_v33_addr = smem + 197632;
+    __nv_bfloat16* smem_v6_5 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 50176);
+    const int smem_v6_addr_5 = smem + 50176;
+    __nv_bfloat16* smem_v6_6 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 210944);
+    const int smem_v6_addr_6 = smem + 210944;
+    __nv_bfloat16* smem_v9_2 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 210944);
+    const int smem_v9_addr_2 = smem + 210944;
+    __nv_bfloat16* smem_v20_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 173056);
+    const int smem_v20_addr_0 = smem + 173056;
+    __nv_bfloat16* smem_v20_1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 181248);
+    const int smem_v20_addr_1 = smem + 181248;
+    __nv_bfloat16* smem_v21_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 181248);
+    const int smem_v21_addr_0 = smem + 181248;
+    __nv_bfloat16* smem_v20_2 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 189440);
+    const int smem_v20_addr_2 = smem + 189440;
+    __nv_bfloat16* smem_v21_1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 189440);
+    const int smem_v21_addr_1 = smem + 189440;
+    __nv_bfloat16* smem_v20_3 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 197632);
+    const int smem_v20_addr_3 = smem + 197632;
+    __nv_bfloat16* smem_v21_2 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 197632);
+    const int smem_v21_addr_2 = smem + 197632;
     __nv_bfloat16* stage_dv = reinterpret_cast<__nv_bfloat16*>(smem_raw + 132096);
     const int stage_dv_addr = smem + 132096;
-    __nv_bfloat16* stage_dq = reinterpret_cast<__nv_bfloat16*>(smem_raw + 132096);
-    const int stage_dq_addr = smem + 132096;
-    __nv_bfloat16* stage_dk = reinterpret_cast<__nv_bfloat16*>(smem_raw + 148480);
-    const int stage_dk_addr = smem + 148480;
+    __nv_bfloat16* stage_dq = reinterpret_cast<__nv_bfloat16*>(smem_raw + 173056);
+    const int stage_dq_addr = smem + 173056;
+    __nv_bfloat16* stage_dk = reinterpret_cast<__nv_bfloat16*>(smem_raw + 189440);
+    const int stage_dk_addr = smem + 189440;
     float* beta_s = reinterpret_cast<float*>(smem_raw + 205824);
     const int beta_s_addr = smem + 205824;
     float* eg_s = reinterpret_cast<float*>(smem_raw + 206080);
@@ -466,8 +470,8 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
     unsigned int* tk_s = reinterpret_cast<unsigned int*>(smem_raw + 209984);
     const int tk_s_addr = smem + 209984;
 
-    // Mbarrier init (23 pipeline groups, 0 ordered-sequence groups, 25 barriers)
-    // Mbarriers at smem_raw[0..200)
+    // Mbarrier init (27 pipeline groups, 0 ordered-sequence groups, 29 barriers)
+    // Mbarriers at smem_raw[0..232)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -515,13 +519,22 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
             mbarrier_init(smem + 152, 256);
             // e_drained: 1 barriers, init_count=256
             mbarrier_init(smem + 160, 256);
+            // dv_stored: 1 barriers, init_count=256
+            mbarrier_init(smem + 168, 256);
             // --- pipeline 'tk_pipe' ---
             // tk_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 168, 1);
             mbarrier_init(smem + 176, 1);
+            mbarrier_init(smem + 184, 1);
             // tk_empty: 2 barriers, init_count=9
-            mbarrier_init(smem + 184, 9);
             mbarrier_init(smem + 192, 9);
+            mbarrier_init(smem + 200, 9);
+            // --- pipeline 'one' ---
+            // e1_ready: 1 barriers, init_count=1
+            mbarrier_init(smem + 208, 1);
+            // b1_ready: 1 barriers, init_count=1
+            mbarrier_init(smem + 216, 1);
+            // daq_drained: 1 barriers, init_count=256
+            mbarrier_init(smem + 224, 256);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -529,9 +542,9 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 200);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 232);
     if (warp == 0) {
-        int _tmem_hold = smem + 200;
+        int _tmem_hold = smem + 232;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
@@ -550,8 +563,8 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
     const int tmem_acc_dw = taddr + 256;
     const int tmem_acc_da = taddr + 320;
     const int tmem_acc_daq = taddr + 384;
-    const int tmem_acc_dvb = taddr + 256;
-    const int tmem_acc_dkgb = taddr + 384;
+    const int tmem_acc_dvb = taddr + 384;
+    const int tmem_acc_dkgb = taddr + 256;
     const int tmem_acc_da1 = taddr + 256;
     const int tmem_acc_da2 = taddr + 320;
     const int tmem_acc_dksrc = taddr + 256;
@@ -582,15 +595,17 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
             unsigned int kpk[16];
             unsigned int ck_stage = 0;
             unsigned int _phase_tk_full = 0;
-            unsigned int _phase_qk_full_0 = 0;
             unsigned int _phase_h_full_0 = 0;
             unsigned int _phase_dh_full_0 = 0;
+            unsigned int _phase_qk_full_0 = 0;
             unsigned int _phase_a_ready_0 = 0;
-            unsigned int _phase_b_ready_0 = 0;
+            unsigned int _phase_b1_ready_0 = 0;
             unsigned int _phase_v_full_0 = 0;
             unsigned int _phase_dvn_full_0 = 0;
+            unsigned int _phase_b_ready_0 = 0;
             unsigned int _phase_c_ready_0 = 0;
             unsigned int _phase_d_ready_0 = 0;
+            unsigned int _phase_e1_ready_0 = 0;
             unsigned int _phase_e_ready_0 = 0;
             #pragma unroll 1
             for (int _j = 0; _j < ngroups_c + 1; _j++) {
@@ -641,112 +656,12 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                         rs_s[tid_1] = rsv;
                     }
                     asm volatile("barrier.sync 1, 256;" ::: "memory");
-                    mbarrier_wait(qk_full_addr, _phase_qk_full_0);
-                    _phase_qk_full_0 ^= 1;
-                    if (hl == 0) {
-                        unsigned int w0[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w0[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + t0 * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + t0 * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[0] = w0[0];
-                        unsigned int w1[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w1[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 1) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 1) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[0] = kpk[0] | w1[0] << 16;
-                        unsigned int w2[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w2[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 2) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 2) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[1] = w2[0];
-                        unsigned int w3[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w3[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 3) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 3) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[1] = kpk[1] | w3[0] << 16;
-                        unsigned int w4[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w4[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 4) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 4) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[2] = w4[0];
-                        unsigned int w5[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w5[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 5) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 5) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[2] = kpk[2] | w5[0] << 16;
-                        unsigned int w6[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w6[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 6) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 6) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[3] = w6[0];
-                        unsigned int w7[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w7[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 7) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 7) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[3] = kpk[3] | w7[0] << 16;
-                        unsigned int w8[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w8[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 8) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 8) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[4] = w8[0];
-                        unsigned int w9[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w9[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 9) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 9) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[4] = kpk[4] | w9[0] << 16;
-                        unsigned int w10[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w10[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 10) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 10) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[5] = w10[0];
-                        unsigned int w11[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w11[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 11) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 11) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[5] = kpk[5] | w11[0] << 16;
-                        unsigned int w12[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w12[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 12) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 12) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[6] = w12[0];
-                        unsigned int w13[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w13[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 13) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 13) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[6] = kpk[6] | w13[0] << 16;
-                        unsigned int w14[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w14[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 14) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 14) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[7] = w14[0];
-                        unsigned int w15[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w15[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 15) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 15) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[7] = kpk[7] | w15[0] << 16;
-                        unsigned int w16[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w16[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 16) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 16) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[8] = w16[0];
-                        unsigned int w17[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w17[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 17) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 17) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[8] = kpk[8] | w17[0] << 16;
-                        unsigned int w18[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w18[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 18) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 18) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[9] = w18[0];
-                        unsigned int w19[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w19[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 19) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 19) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[9] = kpk[9] | w19[0] << 16;
-                        unsigned int w20[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w20[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 20) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 20) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[10] = w20[0];
-                        unsigned int w21[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w21[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 21) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 21) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[10] = kpk[10] | w21[0] << 16;
-                        unsigned int w22[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w22[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 22) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 22) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[11] = w22[0];
-                        unsigned int w23[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w23[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 23) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 23) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[11] = kpk[11] | w23[0] << 16;
-                        unsigned int w24[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w24[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 24) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 24) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[12] = w24[0];
-                        unsigned int w25[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w25[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 25) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 25) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[12] = kpk[12] | w25[0] << 16;
-                        unsigned int w26[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w26[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 26) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 26) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[13] = w26[0];
-                        unsigned int w27[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w27[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 27) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 27) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[13] = kpk[13] | w27[0] << 16;
-                        unsigned int w28[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w28[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 28) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 28) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[14] = w28[0];
-                        unsigned int w29[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w29[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 29) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 29) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[14] = kpk[14] | w29[0] << 16;
-                        unsigned int w30[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w30[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 30) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 30) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[15] = w30[0];
-                        unsigned int w31[1];
-                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w31[0])) : "r"((smem_v7_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 31) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 31) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                        kpk[15] = kpk[15] | w31[0] << 16;
-                    }
                     mbarrier_wait(h_full_addr, _phase_h_full_0);
                     _phase_h_full_0 ^= 1;
                     mbarrier_wait(dh_full_addr, _phase_dh_full_0);
                     _phase_dh_full_0 ^= 1;
                     float hd = 0.0f;
-                    int krow = tid_1 >> 1;
+                    int krow = tid_1 >> 1 ^ (tid_1 & 1) << 2;
                     int vh0 = (tid_1 & 1) * 64;
                     #pragma unroll
                     for (int seg = 0; seg < 4; seg++) {
@@ -773,10 +688,51 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                             (&_unpack_bf16_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(dhraw[_pair]) << 16);
                             (&_unpack_bf16_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(dhraw[_pair]) & 0xffff0000u);
                         }
+                        float _hd_prod[16];
+                        _hd_prod[0] = _unpack_bf16_0[0] * _unpack_bf16_1[0];
+                        _hd_prod[1] = _unpack_bf16_0[1] * _unpack_bf16_1[1];
+                        _hd_prod[2] = _unpack_bf16_0[2] * _unpack_bf16_1[2];
+                        _hd_prod[3] = _unpack_bf16_0[3] * _unpack_bf16_1[3];
+                        _hd_prod[4] = _unpack_bf16_0[4] * _unpack_bf16_1[4];
+                        _hd_prod[5] = _unpack_bf16_0[5] * _unpack_bf16_1[5];
+                        _hd_prod[6] = _unpack_bf16_0[6] * _unpack_bf16_1[6];
+                        _hd_prod[7] = _unpack_bf16_0[7] * _unpack_bf16_1[7];
+                        _hd_prod[8] = _unpack_bf16_0[8] * _unpack_bf16_1[8];
+                        _hd_prod[9] = _unpack_bf16_0[9] * _unpack_bf16_1[9];
+                        _hd_prod[10] = _unpack_bf16_0[10] * _unpack_bf16_1[10];
+                        _hd_prod[11] = _unpack_bf16_0[11] * _unpack_bf16_1[11];
+                        _hd_prod[12] = _unpack_bf16_0[12] * _unpack_bf16_1[12];
+                        _hd_prod[13] = _unpack_bf16_0[13] * _unpack_bf16_1[13];
+                        _hd_prod[14] = _unpack_bf16_0[14] * _unpack_bf16_1[14];
+                        _hd_prod[15] = _unpack_bf16_0[15] * _unpack_bf16_1[15];
+                        unsigned int _hd_prod_bf16[8];
                         #pragma unroll
-                        for (int j = 0; j < 16; j++) {
-                            hd = hd + (float)(__nv_bfloat16)(_unpack_bf16_0[j] * _unpack_bf16_1[j]);
+                        for (int _lp = 0; _lp < 8; _lp++) {
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_hd_prod[_lp*2 + 0], _hd_prod[_lp*2+1 + 0]));
+                            _hd_prod_bf16[_lp] = *(uint32_t*)&_bf2;
                         }
+                        float _hd_prod_r[16];
+                        #pragma unroll
+                        for (int _pair = 0; _pair < 8; _pair++) {
+                            (&_hd_prod_r[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_hd_prod_bf16[_pair]) << 16);
+                            (&_hd_prod_r[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_hd_prod_bf16[_pair]) & 0xffff0000u);
+                        }
+                        hd = hd + _hd_prod_r[0];
+                        hd = hd + _hd_prod_r[1];
+                        hd = hd + _hd_prod_r[2];
+                        hd = hd + _hd_prod_r[3];
+                        hd = hd + _hd_prod_r[4];
+                        hd = hd + _hd_prod_r[5];
+                        hd = hd + _hd_prod_r[6];
+                        hd = hd + _hd_prod_r[7];
+                        hd = hd + _hd_prod_r[8];
+                        hd = hd + _hd_prod_r[9];
+                        hd = hd + _hd_prod_r[10];
+                        hd = hd + _hd_prod_r[11];
+                        hd = hd + _hd_prod_r[12];
+                        hd = hd + _hd_prod_r[13];
+                        hd = hd + _hd_prod_r[14];
+                        hd = hd + _hd_prod_r[15];
                     }
                     float hd_w = 0.0f;
                     float s = hd;
@@ -794,6 +750,106 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                     if (lane_0 == 0) {
                         red_hd[warp] = hd_w;
                     }
+                    mbarrier_wait(qk_full_addr, _phase_qk_full_0);
+                    _phase_qk_full_0 ^= 1;
+                    if (hl == 0) {
+                        unsigned int w0[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w0[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + t0 * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + t0 * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[0] = w0[0];
+                        unsigned int w1[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w1[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 1) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 1) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[0] = kpk[0] | w1[0] << 16;
+                        unsigned int w2[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w2[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 2) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 2) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[1] = w2[0];
+                        unsigned int w3[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w3[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 3) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 3) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[1] = kpk[1] | w3[0] << 16;
+                        unsigned int w4[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w4[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 4) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 4) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[2] = w4[0];
+                        unsigned int w5[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w5[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 5) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 5) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[2] = kpk[2] | w5[0] << 16;
+                        unsigned int w6[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w6[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 6) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 6) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[3] = w6[0];
+                        unsigned int w7[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w7[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 7) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 7) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[3] = kpk[3] | w7[0] << 16;
+                        unsigned int w8[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w8[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 8) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 8) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[4] = w8[0];
+                        unsigned int w9[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w9[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 9) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 9) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[4] = kpk[4] | w9[0] << 16;
+                        unsigned int w_r_r_r_0[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_r_r_r_0[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 10) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 10) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[5] = w_r_r_r_0[0];
+                        unsigned int w_r_r_r_r_0[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_r_r_r_r_0[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 11) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 11) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[5] = kpk[5] | w_r_r_r_r_0[0] << 16;
+                        unsigned int w_r_r_r_1[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_r_r_r_1[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 12) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 12) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[6] = w_r_r_r_1[0];
+                        unsigned int w_r_r_r_r_1[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_r_r_r_r_1[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 13) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 13) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[6] = kpk[6] | w_r_r_r_r_1[0] << 16;
+                        unsigned int w_r_r_r_2[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_r_r_r_2[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 14) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 14) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[7] = w_r_r_r_2[0];
+                        unsigned int w_r_r_r_r_2[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_r_r_r_r_2[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 15) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 15) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[7] = kpk[7] | w_r_r_r_r_2[0] << 16;
+                        unsigned int w16[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w16[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 16) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 16) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[8] = w16[0];
+                        unsigned int w_r_0[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_r_0[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 17) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 17) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[8] = kpk[8] | w_r_0[0] << 16;
+                        unsigned int w_r_r_0[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_r_r_0[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 18) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 18) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[9] = w_r_r_0[0];
+                        unsigned int w_r_1[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_r_1[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 19) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 19) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[9] = kpk[9] | w_r_1[0] << 16;
+                        unsigned int w_r_r_1[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_r_r_1[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 20) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 20) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[10] = w_r_r_1[0];
+                        unsigned int w_r_2[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_r_2[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 21) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 21) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[10] = kpk[10] | w_r_2[0] << 16;
+                        unsigned int w_r_r_2[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_r_r_2[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 22) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 22) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[11] = w_r_r_2[0];
+                        unsigned int w_r_3[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_r_3[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 23) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 23) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[11] = kpk[11] | w_r_3[0] << 16;
+                        unsigned int w_r_r_3[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_r_r_3[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 24) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 24) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[12] = w_r_r_3[0];
+                        unsigned int w_r_4[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_r_4[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 25) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 25) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[12] = kpk[12] | w_r_4[0] << 16;
+                        unsigned int w_r_r_4[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_r_r_4[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 26) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 26) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[13] = w_r_r_4[0];
+                        unsigned int w_r_5[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_r_5[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 27) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 27) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[13] = kpk[13] | w_r_5[0] << 16;
+                        unsigned int w_r_r_5[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_r_r_5[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 28) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 28) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[14] = w_r_r_5[0];
+                        unsigned int w_r_6[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_r_6[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 29) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 29) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[14] = kpk[14] | w_r_6[0] << 16;
+                        unsigned int w_r_r_6[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_r_r_6[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 30) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 30) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[15] = w_r_r_6[0];
+                        unsigned int w31[1];
+                        asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w31[0])) : "r"((smem_v6_addr_0 + (unsigned int)(d_row / 64 * 8192 + (t0 + 31) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 31) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                        kpk[15] = kpk[15] | w31[0] << 16;
+                    }
                     asm volatile("barrier.sync 1, 256;" ::: "memory");
                     mbarrier_wait(a_ready_addr, _phase_a_ready_0);
                     _phase_a_ready_0 ^= 1;
@@ -809,6 +865,8 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                         : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[1])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[2])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[3])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[4])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[5])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[6])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[7])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[8])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[9])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[10])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[11])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[12])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[13])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[14])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_0[15]))
                         : "r"(taddr + 384 + (unsigned int)row_base + (unsigned int)(ch * 32)));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
+                    asm volatile("tcgen05.fence::before_thread_sync;");
+                    mbarrier_arrive(daq_drained_addr);
                     float gt = gc_s[trow16];
                     float aqg[16];
                     float _exp_8 = expf(gt - gc_s[colh]);
@@ -849,8 +907,8 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(aqg[_lp*2 + 0], aqg[_lp*2+1 + 0]));
                         aqg_bf16[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v30_addr + (unsigned int)(colh / 64 * 8192 + trow16 * 128 + colh % 64 * 2 ^ (colh / 64 * 8192 + trow16 * 128 + colh % 64 * 2 >> 7 & 7) << 4))), "r"(aqg_bf16[0]), "r"(aqg_bf16[1]), "r"(aqg_bf16[2]), "r"(aqg_bf16[3]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v30_addr + (unsigned int)((colh + 8) / 64 * 8192 + trow16 * 128 + (colh + 8) % 64 * 2 ^ ((colh + 8) / 64 * 8192 + trow16 * 128 + (colh + 8) % 64 * 2 >> 7 & 7) << 4))), "r"(aqg_bf16[4]), "r"(aqg_bf16[5]), "r"(aqg_bf16[6]), "r"(aqg_bf16[7]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v20_addr_2 + (unsigned int)(colh / 64 * 8192 + trow16 * 128 + colh % 64 * 2 ^ (colh / 64 * 8192 + trow16 * 128 + colh % 64 * 2 >> 7 & 7) << 4))), "r"(aqg_bf16[0]), "r"(aqg_bf16[1]), "r"(aqg_bf16[2]), "r"(aqg_bf16[3]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v20_addr_2 + (unsigned int)((colh + 8) / 64 * 8192 + trow16 * 128 + (colh + 8) % 64 * 2 ^ ((colh + 8) / 64 * 8192 + trow16 * 128 + (colh + 8) % 64 * 2 >> 7 & 7) << 4))), "r"(aqg_bf16[4]), "r"(aqg_bf16[5]), "r"(aqg_bf16[6]), "r"(aqg_bf16[7]) : "memory");
                     float _tmem_load_1[32];
                     asm volatile(
                         "tcgen05.ld.sync.aligned.32x32b.x32.b32"
@@ -1093,15 +1151,15 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((dwbt_k_addr + (unsigned int)((t0 + 24) / 64 * 16384 + d_row * 128 + (t0 + 24) % 64 * 2 ^ ((t0 + 24) / 64 * 16384 + d_row * 128 + (t0 + 24) % 64 * 2 >> 7 & 7) << 4))), "r"(_tmem_load_3_bf16[12]), "r"(_tmem_load_3_bf16[13]), "r"(_tmem_load_3_bf16[14]), "r"(_tmem_load_3_bf16[15]) : "memory");
                     float egt = eg_s[te];
                     float bte = beta_s[te];
-                    unsigned int kraw0[4];
+                    unsigned int kraw0_1_0[4];
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&kraw0[0])), "=r"(*reinterpret_cast<uint32_t*>(&kraw0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&kraw0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&kraw0[(0) + 3]))
-                        : "r"((smem_v7_addr + (unsigned int)(de0 / 64 * 8192 + te * 128 + de0 % 64 * 2 ^ (de0 / 64 * 8192 + te * 128 + de0 % 64 * 2 >> 7 & 7) << 4))));
+                        : "=r"(*reinterpret_cast<uint32_t*>(&kraw0_1_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&kraw0_1_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&kraw0_1_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&kraw0_1_0[(0) + 3]))
+                        : "r"((smem_v6_addr_0 + (unsigned int)(de0 / 64 * 8192 + te * 128 + de0 % 64 * 2 ^ (de0 / 64 * 8192 + te * 128 + de0 % 64 * 2 >> 7 & 7) << 4))));
                     float _unpack_bf16_2[8];
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        (&_unpack_bf16_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(kraw0[_pair]) << 16);
-                        (&_unpack_bf16_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(kraw0[_pair]) & 0xffff0000u);
+                        (&_unpack_bf16_2[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(kraw0_1_0[_pair]) << 16);
+                        (&_unpack_bf16_2[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(kraw0_1_0[_pair]) & 0xffff0000u);
                     }
                     float kg8_0[8];
                     float kb8_0[8];
@@ -1121,29 +1179,29 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                     kb8_0[6] = bte * _unpack_bf16_2[6];
                     kg8_0[7] = egt * _unpack_bf16_2[7];
                     kb8_0[7] = bte * _unpack_bf16_2[7];
-                    unsigned int kg8_0_bf16[4];
+                    unsigned int kg8_0_bf16_1_0[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(kg8_0[_lp*2 + 0], kg8_0[_lp*2+1 + 0]));
-                        kg8_0_bf16[_lp] = *(uint32_t*)&_bf2;
+                        kg8_0_bf16_1_0[_lp] = *(uint32_t*)&_bf2;
                     }
-                    unsigned int kb8_0_bf16[4];
+                    unsigned int kb8_0_bf16_1_0[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(kb8_0[_lp*2 + 0], kb8_0[_lp*2+1 + 0]));
-                        kb8_0_bf16[_lp] = *(uint32_t*)&_bf2;
+                        kb8_0_bf16_1_0[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v24_addr + (unsigned int)(de0 / 64 * 8192 + te * 128 + de0 % 64 * 2 ^ (de0 / 64 * 8192 + te * 128 + de0 % 64 * 2 >> 7 & 7) << 4))), "r"(kg8_0_bf16[0]), "r"(kg8_0_bf16[1]), "r"(kg8_0_bf16[2]), "r"(kg8_0_bf16[3]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v25_addr + (unsigned int)(de0 / 64 * 8192 + te * 128 + de0 % 64 * 2 ^ (de0 / 64 * 8192 + te * 128 + de0 % 64 * 2 >> 7 & 7) << 4))), "r"(kb8_0_bf16[0]), "r"(kb8_0_bf16[1]), "r"(kb8_0_bf16[2]), "r"(kb8_0_bf16[3]) : "memory");
-                    unsigned int kraw1[4];
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v6_addr_5 + (unsigned int)(de0 / 64 * 8192 + te * 128 + de0 % 64 * 2 ^ (de0 / 64 * 8192 + te * 128 + de0 % 64 * 2 >> 7 & 7) << 4))), "r"(kg8_0_bf16_1_0[0]), "r"(kg8_0_bf16_1_0[1]), "r"(kg8_0_bf16_1_0[2]), "r"(kg8_0_bf16_1_0[3]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v6_addr_6 + (unsigned int)(de0 / 64 * 8192 + te * 128 + de0 % 64 * 2 ^ (de0 / 64 * 8192 + te * 128 + de0 % 64 * 2 >> 7 & 7) << 4))), "r"(kb8_0_bf16_1_0[0]), "r"(kb8_0_bf16_1_0[1]), "r"(kb8_0_bf16_1_0[2]), "r"(kb8_0_bf16_1_0[3]) : "memory");
+                    unsigned int kraw0_1_1[4];
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&kraw1[0])), "=r"(*reinterpret_cast<uint32_t*>(&kraw1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&kraw1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&kraw1[(0) + 3]))
-                        : "r"((smem_v7_addr + (unsigned int)((de0 + 8) / 64 * 8192 + te * 128 + (de0 + 8) % 64 * 2 ^ ((de0 + 8) / 64 * 8192 + te * 128 + (de0 + 8) % 64 * 2 >> 7 & 7) << 4))));
+                        : "=r"(*reinterpret_cast<uint32_t*>(&kraw0_1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&kraw0_1_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&kraw0_1_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&kraw0_1_1[(0) + 3]))
+                        : "r"((smem_v6_addr_0 + (unsigned int)((de0 + 8) / 64 * 8192 + te * 128 + (de0 + 8) % 64 * 2 ^ ((de0 + 8) / 64 * 8192 + te * 128 + (de0 + 8) % 64 * 2 >> 7 & 7) << 4))));
                     float _unpack_bf16_3[8];
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        (&_unpack_bf16_3[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(kraw1[_pair]) << 16);
-                        (&_unpack_bf16_3[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(kraw1[_pair]) & 0xffff0000u);
+                        (&_unpack_bf16_3[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(kraw0_1_1[_pair]) << 16);
+                        (&_unpack_bf16_3[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(kraw0_1_1[_pair]) & 0xffff0000u);
                     }
                     float kg8_1[8];
                     float kb8_1[8];
@@ -1163,29 +1221,29 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                     kb8_1[6] = bte * _unpack_bf16_3[6];
                     kg8_1[7] = egt * _unpack_bf16_3[7];
                     kb8_1[7] = bte * _unpack_bf16_3[7];
-                    unsigned int kg8_1_bf16[4];
+                    unsigned int kg8_0_bf16_1_1[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(kg8_1[_lp*2 + 0], kg8_1[_lp*2+1 + 0]));
-                        kg8_1_bf16[_lp] = *(uint32_t*)&_bf2;
+                        kg8_0_bf16_1_1[_lp] = *(uint32_t*)&_bf2;
                     }
-                    unsigned int kb8_1_bf16[4];
+                    unsigned int kb8_0_bf16_1_1[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(kb8_1[_lp*2 + 0], kb8_1[_lp*2+1 + 0]));
-                        kb8_1_bf16[_lp] = *(uint32_t*)&_bf2;
+                        kb8_0_bf16_1_1[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v24_addr + (unsigned int)((de0 + 8) / 64 * 8192 + te * 128 + (de0 + 8) % 64 * 2 ^ ((de0 + 8) / 64 * 8192 + te * 128 + (de0 + 8) % 64 * 2 >> 7 & 7) << 4))), "r"(kg8_1_bf16[0]), "r"(kg8_1_bf16[1]), "r"(kg8_1_bf16[2]), "r"(kg8_1_bf16[3]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v25_addr + (unsigned int)((de0 + 8) / 64 * 8192 + te * 128 + (de0 + 8) % 64 * 2 ^ ((de0 + 8) / 64 * 8192 + te * 128 + (de0 + 8) % 64 * 2 >> 7 & 7) << 4))), "r"(kb8_1_bf16[0]), "r"(kb8_1_bf16[1]), "r"(kb8_1_bf16[2]), "r"(kb8_1_bf16[3]) : "memory");
-                    unsigned int kraw2[4];
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v6_addr_5 + (unsigned int)((de0 + 8) / 64 * 8192 + te * 128 + (de0 + 8) % 64 * 2 ^ ((de0 + 8) / 64 * 8192 + te * 128 + (de0 + 8) % 64 * 2 >> 7 & 7) << 4))), "r"(kg8_0_bf16_1_1[0]), "r"(kg8_0_bf16_1_1[1]), "r"(kg8_0_bf16_1_1[2]), "r"(kg8_0_bf16_1_1[3]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v6_addr_6 + (unsigned int)((de0 + 8) / 64 * 8192 + te * 128 + (de0 + 8) % 64 * 2 ^ ((de0 + 8) / 64 * 8192 + te * 128 + (de0 + 8) % 64 * 2 >> 7 & 7) << 4))), "r"(kb8_0_bf16_1_1[0]), "r"(kb8_0_bf16_1_1[1]), "r"(kb8_0_bf16_1_1[2]), "r"(kb8_0_bf16_1_1[3]) : "memory");
+                    unsigned int kraw0_1_2[4];
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&kraw2[0])), "=r"(*reinterpret_cast<uint32_t*>(&kraw2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&kraw2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&kraw2[(0) + 3]))
-                        : "r"((smem_v7_addr + (unsigned int)((de0 + 16) / 64 * 8192 + te * 128 + (de0 + 16) % 64 * 2 ^ ((de0 + 16) / 64 * 8192 + te * 128 + (de0 + 16) % 64 * 2 >> 7 & 7) << 4))));
+                        : "=r"(*reinterpret_cast<uint32_t*>(&kraw0_1_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&kraw0_1_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&kraw0_1_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&kraw0_1_2[(0) + 3]))
+                        : "r"((smem_v6_addr_0 + (unsigned int)((de0 + 16) / 64 * 8192 + te * 128 + (de0 + 16) % 64 * 2 ^ ((de0 + 16) / 64 * 8192 + te * 128 + (de0 + 16) % 64 * 2 >> 7 & 7) << 4))));
                     float _unpack_bf16_4[8];
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        (&_unpack_bf16_4[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(kraw2[_pair]) << 16);
-                        (&_unpack_bf16_4[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(kraw2[_pair]) & 0xffff0000u);
+                        (&_unpack_bf16_4[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(kraw0_1_2[_pair]) << 16);
+                        (&_unpack_bf16_4[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(kraw0_1_2[_pair]) & 0xffff0000u);
                     }
                     float kg8_2[8];
                     float kb8_2[8];
@@ -1205,29 +1263,29 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                     kb8_2[6] = bte * _unpack_bf16_4[6];
                     kg8_2[7] = egt * _unpack_bf16_4[7];
                     kb8_2[7] = bte * _unpack_bf16_4[7];
-                    unsigned int kg8_2_bf16[4];
+                    unsigned int kg8_0_bf16_1_2[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(kg8_2[_lp*2 + 0], kg8_2[_lp*2+1 + 0]));
-                        kg8_2_bf16[_lp] = *(uint32_t*)&_bf2;
+                        kg8_0_bf16_1_2[_lp] = *(uint32_t*)&_bf2;
                     }
-                    unsigned int kb8_2_bf16[4];
+                    unsigned int kb8_0_bf16_1_2[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(kb8_2[_lp*2 + 0], kb8_2[_lp*2+1 + 0]));
-                        kb8_2_bf16[_lp] = *(uint32_t*)&_bf2;
+                        kb8_0_bf16_1_2[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v24_addr + (unsigned int)((de0 + 16) / 64 * 8192 + te * 128 + (de0 + 16) % 64 * 2 ^ ((de0 + 16) / 64 * 8192 + te * 128 + (de0 + 16) % 64 * 2 >> 7 & 7) << 4))), "r"(kg8_2_bf16[0]), "r"(kg8_2_bf16[1]), "r"(kg8_2_bf16[2]), "r"(kg8_2_bf16[3]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v25_addr + (unsigned int)((de0 + 16) / 64 * 8192 + te * 128 + (de0 + 16) % 64 * 2 ^ ((de0 + 16) / 64 * 8192 + te * 128 + (de0 + 16) % 64 * 2 >> 7 & 7) << 4))), "r"(kb8_2_bf16[0]), "r"(kb8_2_bf16[1]), "r"(kb8_2_bf16[2]), "r"(kb8_2_bf16[3]) : "memory");
-                    unsigned int kraw3[4];
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v6_addr_5 + (unsigned int)((de0 + 16) / 64 * 8192 + te * 128 + (de0 + 16) % 64 * 2 ^ ((de0 + 16) / 64 * 8192 + te * 128 + (de0 + 16) % 64 * 2 >> 7 & 7) << 4))), "r"(kg8_0_bf16_1_2[0]), "r"(kg8_0_bf16_1_2[1]), "r"(kg8_0_bf16_1_2[2]), "r"(kg8_0_bf16_1_2[3]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v6_addr_6 + (unsigned int)((de0 + 16) / 64 * 8192 + te * 128 + (de0 + 16) % 64 * 2 ^ ((de0 + 16) / 64 * 8192 + te * 128 + (de0 + 16) % 64 * 2 >> 7 & 7) << 4))), "r"(kb8_0_bf16_1_2[0]), "r"(kb8_0_bf16_1_2[1]), "r"(kb8_0_bf16_1_2[2]), "r"(kb8_0_bf16_1_2[3]) : "memory");
+                    unsigned int kraw0_1_3[4];
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&kraw3[0])), "=r"(*reinterpret_cast<uint32_t*>(&kraw3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&kraw3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&kraw3[(0) + 3]))
-                        : "r"((smem_v7_addr + (unsigned int)((de0 + 24) / 64 * 8192 + te * 128 + (de0 + 24) % 64 * 2 ^ ((de0 + 24) / 64 * 8192 + te * 128 + (de0 + 24) % 64 * 2 >> 7 & 7) << 4))));
+                        : "=r"(*reinterpret_cast<uint32_t*>(&kraw0_1_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&kraw0_1_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&kraw0_1_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&kraw0_1_3[(0) + 3]))
+                        : "r"((smem_v6_addr_0 + (unsigned int)((de0 + 24) / 64 * 8192 + te * 128 + (de0 + 24) % 64 * 2 ^ ((de0 + 24) / 64 * 8192 + te * 128 + (de0 + 24) % 64 * 2 >> 7 & 7) << 4))));
                     float _unpack_bf16_5[8];
                     #pragma unroll
                     for (int _pair = 0; _pair < 4; _pair++) {
-                        (&_unpack_bf16_5[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(kraw3[_pair]) << 16);
-                        (&_unpack_bf16_5[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(kraw3[_pair]) & 0xffff0000u);
+                        (&_unpack_bf16_5[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(kraw0_1_3[_pair]) << 16);
+                        (&_unpack_bf16_5[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(kraw0_1_3[_pair]) & 0xffff0000u);
                     }
                     float kg8_3[8];
                     float kb8_3[8];
@@ -1247,26 +1305,26 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                     kb8_3[6] = bte * _unpack_bf16_5[6];
                     kg8_3[7] = egt * _unpack_bf16_5[7];
                     kb8_3[7] = bte * _unpack_bf16_5[7];
-                    unsigned int kg8_3_bf16[4];
+                    unsigned int kg8_0_bf16_1_3[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(kg8_3[_lp*2 + 0], kg8_3[_lp*2+1 + 0]));
-                        kg8_3_bf16[_lp] = *(uint32_t*)&_bf2;
+                        kg8_0_bf16_1_3[_lp] = *(uint32_t*)&_bf2;
                     }
-                    unsigned int kb8_3_bf16[4];
+                    unsigned int kb8_0_bf16_1_3[4];
                     #pragma unroll
                     for (int _lp = 0; _lp < 4; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(kb8_3[_lp*2 + 0], kb8_3[_lp*2+1 + 0]));
-                        kb8_3_bf16[_lp] = *(uint32_t*)&_bf2;
+                        kb8_0_bf16_1_3[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v24_addr + (unsigned int)((de0 + 24) / 64 * 8192 + te * 128 + (de0 + 24) % 64 * 2 ^ ((de0 + 24) / 64 * 8192 + te * 128 + (de0 + 24) % 64 * 2 >> 7 & 7) << 4))), "r"(kg8_3_bf16[0]), "r"(kg8_3_bf16[1]), "r"(kg8_3_bf16[2]), "r"(kg8_3_bf16[3]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v25_addr + (unsigned int)((de0 + 24) / 64 * 8192 + te * 128 + (de0 + 24) % 64 * 2 ^ ((de0 + 24) / 64 * 8192 + te * 128 + (de0 + 24) % 64 * 2 >> 7 & 7) << 4))), "r"(kb8_3_bf16[0]), "r"(kb8_3_bf16[1]), "r"(kb8_3_bf16[2]), "r"(kb8_3_bf16[3]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v6_addr_5 + (unsigned int)((de0 + 24) / 64 * 8192 + te * 128 + (de0 + 24) % 64 * 2 ^ ((de0 + 24) / 64 * 8192 + te * 128 + (de0 + 24) % 64 * 2 >> 7 & 7) << 4))), "r"(kg8_0_bf16_1_3[0]), "r"(kg8_0_bf16_1_3[1]), "r"(kg8_0_bf16_1_3[2]), "r"(kg8_0_bf16_1_3[3]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v6_addr_6 + (unsigned int)((de0 + 24) / 64 * 8192 + te * 128 + (de0 + 24) % 64 * 2 ^ ((de0 + 24) / 64 * 8192 + te * 128 + (de0 + 24) % 64 * 2 >> 7 & 7) << 4))), "r"(kb8_0_bf16_1_3[0]), "r"(kb8_0_bf16_1_3[1]), "r"(kb8_0_bf16_1_3[2]), "r"(kb8_0_bf16_1_3[3]) : "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(a_drained_addr);
-                    mbarrier_wait(b_ready_addr, _phase_b_ready_0);
-                    _phase_b_ready_0 ^= 1;
+                    mbarrier_wait(b1_ready_addr, _phase_b1_ready_0);
+                    _phase_b1_ready_0 ^= 1;
                     mbarrier_wait(v_full_addr, _phase_v_full_0);
                     _phase_v_full_0 ^= 1;
                     mbarrier_wait(dvn_full_addr, _phase_dvn_full_0);
@@ -1277,170 +1335,170 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                         "tcgen05.ld.sync.aligned.32x32b.x32.b32"
                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
                         : "=f"(_tmem_load_4[0]), "=f"(_tmem_load_4[1]), "=f"(_tmem_load_4[2]), "=f"(_tmem_load_4[3]), "=f"(_tmem_load_4[4]), "=f"(_tmem_load_4[5]), "=f"(_tmem_load_4[6]), "=f"(_tmem_load_4[7]), "=f"(_tmem_load_4[8]), "=f"(_tmem_load_4[9]), "=f"(_tmem_load_4[10]), "=f"(_tmem_load_4[11]), "=f"(_tmem_load_4[12]), "=f"(_tmem_load_4[13]), "=f"(_tmem_load_4[14]), "=f"(_tmem_load_4[15]), "=f"(_tmem_load_4[16]), "=f"(_tmem_load_4[17]), "=f"(_tmem_load_4[18]), "=f"(_tmem_load_4[19]), "=f"(_tmem_load_4[20]), "=f"(_tmem_load_4[21]), "=f"(_tmem_load_4[22]), "=f"(_tmem_load_4[23]), "=f"(_tmem_load_4[24]), "=f"(_tmem_load_4[25]), "=f"(_tmem_load_4[26]), "=f"(_tmem_load_4[27]), "=f"(_tmem_load_4[28]), "=f"(_tmem_load_4[29]), "=f"(_tmem_load_4[30]), "=f"(_tmem_load_4[31])
-                        : "r"(taddr + 256 + (unsigned int)row_base + (unsigned int)(ch * 32)));
+                        : "r"(taddr + 384 + (unsigned int)row_base + (unsigned int)(ch * 32)));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
                     float dvo[32];
                     float pv[32];
                     float vval = 0.0f;
                     dvo[0] = beta_s[t0] * _tmem_load_4[0];
                     unsigned int w[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + t0 * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + t0 * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + t0 * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + t0 * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
                     vval = __uint_as_float(w[0] << 16);
                     pv[0] = _tmem_load_4[0] * vval;
                     dvo[1] = beta_s[t0 + 1] * _tmem_load_4[1];
-                    unsigned int w_1[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_1[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 1) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 1) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_1[0] << 16);
+                    unsigned int w_0[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_0[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 1) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 1) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_0[0] << 16);
                     pv[1] = _tmem_load_4[1] * vval;
                     dvo[2] = beta_s[t0 + 2] * _tmem_load_4[2];
-                    unsigned int w_2[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_2[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 2) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 2) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_2[0] << 16);
+                    unsigned int w_1[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_1[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 2) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 2) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_1[0] << 16);
                     pv[2] = _tmem_load_4[2] * vval;
                     dvo[3] = beta_s[t0 + 3] * _tmem_load_4[3];
-                    unsigned int w_3[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_3[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 3) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 3) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_3[0] << 16);
+                    unsigned int w_2[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_2[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 3) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 3) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_2[0] << 16);
                     pv[3] = _tmem_load_4[3] * vval;
                     dvo[4] = beta_s[t0 + 4] * _tmem_load_4[4];
-                    unsigned int w_4[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_4[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 4) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 4) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_4[0] << 16);
+                    unsigned int w_3[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_3[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 4) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 4) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_3[0] << 16);
                     pv[4] = _tmem_load_4[4] * vval;
                     dvo[5] = beta_s[t0 + 5] * _tmem_load_4[5];
-                    unsigned int w_5[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_5[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 5) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 5) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_5[0] << 16);
+                    unsigned int w_4[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_4[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 5) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 5) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_4[0] << 16);
                     pv[5] = _tmem_load_4[5] * vval;
                     dvo[6] = beta_s[t0 + 6] * _tmem_load_4[6];
-                    unsigned int w_6[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_6[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 6) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 6) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_6[0] << 16);
+                    unsigned int w_5[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_5[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 6) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 6) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_5[0] << 16);
                     pv[6] = _tmem_load_4[6] * vval;
                     dvo[7] = beta_s[t0 + 7] * _tmem_load_4[7];
-                    unsigned int w_7[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_7[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 7) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 7) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_7[0] << 16);
+                    unsigned int w_6[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_6[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 7) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 7) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_6[0] << 16);
                     pv[7] = _tmem_load_4[7] * vval;
                     dvo[8] = beta_s[t0 + 8] * _tmem_load_4[8];
-                    unsigned int w_8[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_8[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 8) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 8) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_8[0] << 16);
+                    unsigned int w_7[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_7[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 8) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 8) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_7[0] << 16);
                     pv[8] = _tmem_load_4[8] * vval;
                     dvo[9] = beta_s[t0 + 9] * _tmem_load_4[9];
-                    unsigned int w_9[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_9[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 9) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 9) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_9[0] << 16);
+                    unsigned int w_8[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_8[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 9) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 9) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_8[0] << 16);
                     pv[9] = _tmem_load_4[9] * vval;
                     dvo[10] = beta_s[t0 + 10] * _tmem_load_4[10];
-                    unsigned int w_10[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_10[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 10) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 10) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_10[0] << 16);
+                    unsigned int w_9[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_9[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 10) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 10) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_9[0] << 16);
                     pv[10] = _tmem_load_4[10] * vval;
                     dvo[11] = beta_s[t0 + 11] * _tmem_load_4[11];
-                    unsigned int w_11[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_11[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 11) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 11) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_11[0] << 16);
+                    unsigned int w_10[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_10[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 11) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 11) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_10[0] << 16);
                     pv[11] = _tmem_load_4[11] * vval;
                     dvo[12] = beta_s[t0 + 12] * _tmem_load_4[12];
-                    unsigned int w_12[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_12[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 12) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 12) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_12[0] << 16);
+                    unsigned int w_11[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_11[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 12) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 12) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_11[0] << 16);
                     pv[12] = _tmem_load_4[12] * vval;
                     dvo[13] = beta_s[t0 + 13] * _tmem_load_4[13];
-                    unsigned int w_13[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_13[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 13) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 13) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_13[0] << 16);
+                    unsigned int w_12[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_12[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 13) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 13) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_12[0] << 16);
                     pv[13] = _tmem_load_4[13] * vval;
                     dvo[14] = beta_s[t0 + 14] * _tmem_load_4[14];
-                    unsigned int w_14[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_14[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 14) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 14) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_14[0] << 16);
+                    unsigned int w_13[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_13[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 14) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 14) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_13[0] << 16);
                     pv[14] = _tmem_load_4[14] * vval;
                     dvo[15] = beta_s[t0 + 15] * _tmem_load_4[15];
-                    unsigned int w_15[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_15[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 15) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 15) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_15[0] << 16);
+                    unsigned int w_14[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_14[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 15) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 15) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_14[0] << 16);
                     pv[15] = _tmem_load_4[15] * vval;
                     dvo[16] = beta_s[t0 + 16] * _tmem_load_4[16];
-                    unsigned int w_16[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_16[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 16) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 16) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_16[0] << 16);
+                    unsigned int w_15[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_15[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 16) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 16) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_15[0] << 16);
                     pv[16] = _tmem_load_4[16] * vval;
                     dvo[17] = beta_s[t0 + 17] * _tmem_load_4[17];
-                    unsigned int w_17[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_17[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 17) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 17) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_17[0] << 16);
+                    unsigned int w_16[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_16[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 17) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 17) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_16[0] << 16);
                     pv[17] = _tmem_load_4[17] * vval;
                     dvo[18] = beta_s[t0 + 18] * _tmem_load_4[18];
-                    unsigned int w_18[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_18[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 18) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 18) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_18[0] << 16);
+                    unsigned int w_17[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_17[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 18) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 18) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_17[0] << 16);
                     pv[18] = _tmem_load_4[18] * vval;
                     dvo[19] = beta_s[t0 + 19] * _tmem_load_4[19];
-                    unsigned int w_19[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_19[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 19) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 19) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_19[0] << 16);
+                    unsigned int w_18[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_18[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 19) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 19) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_18[0] << 16);
                     pv[19] = _tmem_load_4[19] * vval;
                     dvo[20] = beta_s[t0 + 20] * _tmem_load_4[20];
-                    unsigned int w_20[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_20[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 20) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 20) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_20[0] << 16);
+                    unsigned int w_19[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_19[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 20) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 20) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_19[0] << 16);
                     pv[20] = _tmem_load_4[20] * vval;
                     dvo[21] = beta_s[t0 + 21] * _tmem_load_4[21];
-                    unsigned int w_21[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_21[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 21) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 21) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_21[0] << 16);
+                    unsigned int w_20[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_20[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 21) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 21) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_20[0] << 16);
                     pv[21] = _tmem_load_4[21] * vval;
                     dvo[22] = beta_s[t0 + 22] * _tmem_load_4[22];
-                    unsigned int w_22[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_22[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 22) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 22) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_22[0] << 16);
+                    unsigned int w_21[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_21[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 22) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 22) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_21[0] << 16);
                     pv[22] = _tmem_load_4[22] * vval;
                     dvo[23] = beta_s[t0 + 23] * _tmem_load_4[23];
-                    unsigned int w_23[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_23[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 23) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 23) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_23[0] << 16);
+                    unsigned int w_22[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_22[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 23) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 23) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_22[0] << 16);
                     pv[23] = _tmem_load_4[23] * vval;
                     dvo[24] = beta_s[t0 + 24] * _tmem_load_4[24];
-                    unsigned int w_24[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_24[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 24) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 24) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_24[0] << 16);
+                    unsigned int w_23[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_23[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 24) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 24) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_23[0] << 16);
                     pv[24] = _tmem_load_4[24] * vval;
                     dvo[25] = beta_s[t0 + 25] * _tmem_load_4[25];
-                    unsigned int w_25[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_25[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 25) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 25) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_25[0] << 16);
+                    unsigned int w_24[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_24[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 25) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 25) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_24[0] << 16);
                     pv[25] = _tmem_load_4[25] * vval;
                     dvo[26] = beta_s[t0 + 26] * _tmem_load_4[26];
-                    unsigned int w_26[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_26[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 26) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 26) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_26[0] << 16);
+                    unsigned int w_25[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_25[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 26) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 26) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_25[0] << 16);
                     pv[26] = _tmem_load_4[26] * vval;
                     dvo[27] = beta_s[t0 + 27] * _tmem_load_4[27];
-                    unsigned int w_27[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_27[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 27) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 27) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_27[0] << 16);
+                    unsigned int w_26[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_26[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 27) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 27) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_26[0] << 16);
                     pv[27] = _tmem_load_4[27] * vval;
                     dvo[28] = beta_s[t0 + 28] * _tmem_load_4[28];
-                    unsigned int w_28[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_28[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 28) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 28) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_28[0] << 16);
+                    unsigned int w_27[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_27[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 28) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 28) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_27[0] << 16);
                     pv[28] = _tmem_load_4[28] * vval;
                     dvo[29] = beta_s[t0 + 29] * _tmem_load_4[29];
-                    unsigned int w_29[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_29[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 29) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 29) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_29[0] << 16);
+                    unsigned int w_28[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_28[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 29) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 29) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_28[0] << 16);
                     pv[29] = _tmem_load_4[29] * vval;
                     dvo[30] = beta_s[t0 + 30] * _tmem_load_4[30];
-                    unsigned int w_30[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_30[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 30) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 30) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_30[0] << 16);
+                    unsigned int w_29[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_29[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 30) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 30) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_29[0] << 16);
                     pv[30] = _tmem_load_4[30] * vval;
                     dvo[31] = beta_s[t0 + 31] * _tmem_load_4[31];
-                    unsigned int w_31[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_31[0])) : "r"((smem_v8_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 31) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 31) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    vval = __uint_as_float(w_31[0] << 16);
+                    unsigned int w_30[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_30[0])) : "r"((smem_v6_addr_1 + (unsigned int)(d_row / 64 * 8192 + (t0 + 31) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 31) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    vval = __uint_as_float(w_30[0] << 16);
                     pv[31] = _tmem_load_4[31] * vval;
                     {
                         __nv_bfloat16 _bval_29 = __float2bfloat16_rn(dvo[0]);
@@ -1634,12 +1692,15 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                         uint32_t _addr_60 = static_cast<uint32_t>(stage_dv_addr + (unsigned int)((t0 + 31) * 256 + ((d_row >> 3 ^ t0 + 31 & 7) << 4) + (d_row & 7) * 2));
                         asm volatile("st.shared.b16 [%0], %1;" :: "r"(_addr_60), "h"(_bits_60) : "memory");
                     }
+                    mbarrier_wait(b_ready_addr, _phase_b_ready_0);
+                    _phase_b_ready_0 ^= 1;
+                    asm volatile("tcgen05.fence::after_thread_sync;");
                     float _tmem_load_5[32];
                     asm volatile(
                         "tcgen05.ld.sync.aligned.32x32b.x32.b32"
                         " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
                         : "=f"(_tmem_load_5[0]), "=f"(_tmem_load_5[1]), "=f"(_tmem_load_5[2]), "=f"(_tmem_load_5[3]), "=f"(_tmem_load_5[4]), "=f"(_tmem_load_5[5]), "=f"(_tmem_load_5[6]), "=f"(_tmem_load_5[7]), "=f"(_tmem_load_5[8]), "=f"(_tmem_load_5[9]), "=f"(_tmem_load_5[10]), "=f"(_tmem_load_5[11]), "=f"(_tmem_load_5[12]), "=f"(_tmem_load_5[13]), "=f"(_tmem_load_5[14]), "=f"(_tmem_load_5[15]), "=f"(_tmem_load_5[16]), "=f"(_tmem_load_5[17]), "=f"(_tmem_load_5[18]), "=f"(_tmem_load_5[19]), "=f"(_tmem_load_5[20]), "=f"(_tmem_load_5[21]), "=f"(_tmem_load_5[22]), "=f"(_tmem_load_5[23]), "=f"(_tmem_load_5[24]), "=f"(_tmem_load_5[25]), "=f"(_tmem_load_5[26]), "=f"(_tmem_load_5[27]), "=f"(_tmem_load_5[28]), "=f"(_tmem_load_5[29]), "=f"(_tmem_load_5[30]), "=f"(_tmem_load_5[31])
-                        : "r"(taddr + 384 + (unsigned int)row_base + (unsigned int)(ch * 32)));
+                        : "r"(taddr + 256 + (unsigned int)row_base + (unsigned int)(ch * 32)));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
                     float pdg[32];
                     pv[0] = __fmaf_rn(_tmem_load_5[0] * __uint_as_float(kpk[0] << 16), eg_s[t0], pv[0]);
@@ -1845,72 +1906,72 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                     float _shfl_xor_sync_91 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 1) == 0) ? w2_1[1] : w2_1[0]), 1);
                     tmp = (((lane_0 & 1) == 0) ? w2_1[0] : w2_1[1]) + _shfl_xor_sync_91;
                     db_acc = db_acc + tmp;
-                    float w16_32[16];
+                    float w16_0[16];
                     float _shfl_xor_sync_92 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? pdg[16] : pdg[0]), 16);
-                    w16_32[0] = (((lane_0 & 16) == 0) ? pdg[0] : pdg[16]) + _shfl_xor_sync_92;
+                    w16_0[0] = (((lane_0 & 16) == 0) ? pdg[0] : pdg[16]) + _shfl_xor_sync_92;
                     float _shfl_xor_sync_93 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? pdg[17] : pdg[1]), 16);
-                    w16_32[1] = (((lane_0 & 16) == 0) ? pdg[1] : pdg[17]) + _shfl_xor_sync_93;
+                    w16_0[1] = (((lane_0 & 16) == 0) ? pdg[1] : pdg[17]) + _shfl_xor_sync_93;
                     float _shfl_xor_sync_94 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? pdg[18] : pdg[2]), 16);
-                    w16_32[2] = (((lane_0 & 16) == 0) ? pdg[2] : pdg[18]) + _shfl_xor_sync_94;
+                    w16_0[2] = (((lane_0 & 16) == 0) ? pdg[2] : pdg[18]) + _shfl_xor_sync_94;
                     float _shfl_xor_sync_95 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? pdg[19] : pdg[3]), 16);
-                    w16_32[3] = (((lane_0 & 16) == 0) ? pdg[3] : pdg[19]) + _shfl_xor_sync_95;
+                    w16_0[3] = (((lane_0 & 16) == 0) ? pdg[3] : pdg[19]) + _shfl_xor_sync_95;
                     float _shfl_xor_sync_96 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? pdg[20] : pdg[4]), 16);
-                    w16_32[4] = (((lane_0 & 16) == 0) ? pdg[4] : pdg[20]) + _shfl_xor_sync_96;
+                    w16_0[4] = (((lane_0 & 16) == 0) ? pdg[4] : pdg[20]) + _shfl_xor_sync_96;
                     float _shfl_xor_sync_97 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? pdg[21] : pdg[5]), 16);
-                    w16_32[5] = (((lane_0 & 16) == 0) ? pdg[5] : pdg[21]) + _shfl_xor_sync_97;
+                    w16_0[5] = (((lane_0 & 16) == 0) ? pdg[5] : pdg[21]) + _shfl_xor_sync_97;
                     float _shfl_xor_sync_98 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? pdg[22] : pdg[6]), 16);
-                    w16_32[6] = (((lane_0 & 16) == 0) ? pdg[6] : pdg[22]) + _shfl_xor_sync_98;
+                    w16_0[6] = (((lane_0 & 16) == 0) ? pdg[6] : pdg[22]) + _shfl_xor_sync_98;
                     float _shfl_xor_sync_99 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? pdg[23] : pdg[7]), 16);
-                    w16_32[7] = (((lane_0 & 16) == 0) ? pdg[7] : pdg[23]) + _shfl_xor_sync_99;
+                    w16_0[7] = (((lane_0 & 16) == 0) ? pdg[7] : pdg[23]) + _shfl_xor_sync_99;
                     float _shfl_xor_sync_100 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? pdg[24] : pdg[8]), 16);
-                    w16_32[8] = (((lane_0 & 16) == 0) ? pdg[8] : pdg[24]) + _shfl_xor_sync_100;
+                    w16_0[8] = (((lane_0 & 16) == 0) ? pdg[8] : pdg[24]) + _shfl_xor_sync_100;
                     float _shfl_xor_sync_101 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? pdg[25] : pdg[9]), 16);
-                    w16_32[9] = (((lane_0 & 16) == 0) ? pdg[9] : pdg[25]) + _shfl_xor_sync_101;
+                    w16_0[9] = (((lane_0 & 16) == 0) ? pdg[9] : pdg[25]) + _shfl_xor_sync_101;
                     float _shfl_xor_sync_102 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? pdg[26] : pdg[10]), 16);
-                    w16_32[10] = (((lane_0 & 16) == 0) ? pdg[10] : pdg[26]) + _shfl_xor_sync_102;
+                    w16_0[10] = (((lane_0 & 16) == 0) ? pdg[10] : pdg[26]) + _shfl_xor_sync_102;
                     float _shfl_xor_sync_103 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? pdg[27] : pdg[11]), 16);
-                    w16_32[11] = (((lane_0 & 16) == 0) ? pdg[11] : pdg[27]) + _shfl_xor_sync_103;
+                    w16_0[11] = (((lane_0 & 16) == 0) ? pdg[11] : pdg[27]) + _shfl_xor_sync_103;
                     float _shfl_xor_sync_104 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? pdg[28] : pdg[12]), 16);
-                    w16_32[12] = (((lane_0 & 16) == 0) ? pdg[12] : pdg[28]) + _shfl_xor_sync_104;
+                    w16_0[12] = (((lane_0 & 16) == 0) ? pdg[12] : pdg[28]) + _shfl_xor_sync_104;
                     float _shfl_xor_sync_105 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? pdg[29] : pdg[13]), 16);
-                    w16_32[13] = (((lane_0 & 16) == 0) ? pdg[13] : pdg[29]) + _shfl_xor_sync_105;
+                    w16_0[13] = (((lane_0 & 16) == 0) ? pdg[13] : pdg[29]) + _shfl_xor_sync_105;
                     float _shfl_xor_sync_106 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? pdg[30] : pdg[14]), 16);
-                    w16_32[14] = (((lane_0 & 16) == 0) ? pdg[14] : pdg[30]) + _shfl_xor_sync_106;
+                    w16_0[14] = (((lane_0 & 16) == 0) ? pdg[14] : pdg[30]) + _shfl_xor_sync_106;
                     float _shfl_xor_sync_107 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? pdg[31] : pdg[15]), 16);
-                    w16_32[15] = (((lane_0 & 16) == 0) ? pdg[15] : pdg[31]) + _shfl_xor_sync_107;
-                    float w8_33[8];
-                    float _shfl_xor_sync_108 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_32[8] : w16_32[0]), 8);
-                    w8_33[0] = (((lane_0 & 8) == 0) ? w16_32[0] : w16_32[8]) + _shfl_xor_sync_108;
-                    float _shfl_xor_sync_109 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_32[9] : w16_32[1]), 8);
-                    w8_33[1] = (((lane_0 & 8) == 0) ? w16_32[1] : w16_32[9]) + _shfl_xor_sync_109;
-                    float _shfl_xor_sync_110 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_32[10] : w16_32[2]), 8);
-                    w8_33[2] = (((lane_0 & 8) == 0) ? w16_32[2] : w16_32[10]) + _shfl_xor_sync_110;
-                    float _shfl_xor_sync_111 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_32[11] : w16_32[3]), 8);
-                    w8_33[3] = (((lane_0 & 8) == 0) ? w16_32[3] : w16_32[11]) + _shfl_xor_sync_111;
-                    float _shfl_xor_sync_112 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_32[12] : w16_32[4]), 8);
-                    w8_33[4] = (((lane_0 & 8) == 0) ? w16_32[4] : w16_32[12]) + _shfl_xor_sync_112;
-                    float _shfl_xor_sync_113 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_32[13] : w16_32[5]), 8);
-                    w8_33[5] = (((lane_0 & 8) == 0) ? w16_32[5] : w16_32[13]) + _shfl_xor_sync_113;
-                    float _shfl_xor_sync_114 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_32[14] : w16_32[6]), 8);
-                    w8_33[6] = (((lane_0 & 8) == 0) ? w16_32[6] : w16_32[14]) + _shfl_xor_sync_114;
-                    float _shfl_xor_sync_115 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_32[15] : w16_32[7]), 8);
-                    w8_33[7] = (((lane_0 & 8) == 0) ? w16_32[7] : w16_32[15]) + _shfl_xor_sync_115;
-                    float w4_34[4];
-                    float _shfl_xor_sync_116 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 4) == 0) ? w8_33[4] : w8_33[0]), 4);
-                    w4_34[0] = (((lane_0 & 4) == 0) ? w8_33[0] : w8_33[4]) + _shfl_xor_sync_116;
-                    float _shfl_xor_sync_117 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 4) == 0) ? w8_33[5] : w8_33[1]), 4);
-                    w4_34[1] = (((lane_0 & 4) == 0) ? w8_33[1] : w8_33[5]) + _shfl_xor_sync_117;
-                    float _shfl_xor_sync_118 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 4) == 0) ? w8_33[6] : w8_33[2]), 4);
-                    w4_34[2] = (((lane_0 & 4) == 0) ? w8_33[2] : w8_33[6]) + _shfl_xor_sync_118;
-                    float _shfl_xor_sync_119 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 4) == 0) ? w8_33[7] : w8_33[3]), 4);
-                    w4_34[3] = (((lane_0 & 4) == 0) ? w8_33[3] : w8_33[7]) + _shfl_xor_sync_119;
-                    float w2_35[2];
-                    float _shfl_xor_sync_120 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 2) == 0) ? w4_34[2] : w4_34[0]), 2);
-                    w2_35[0] = (((lane_0 & 2) == 0) ? w4_34[0] : w4_34[2]) + _shfl_xor_sync_120;
-                    float _shfl_xor_sync_121 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 2) == 0) ? w4_34[3] : w4_34[1]), 2);
-                    w2_35[1] = (((lane_0 & 2) == 0) ? w4_34[1] : w4_34[3]) + _shfl_xor_sync_121;
-                    float _shfl_xor_sync_122 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 1) == 0) ? w2_35[1] : w2_35[0]), 1);
-                    tmp = (((lane_0 & 1) == 0) ? w2_35[0] : w2_35[1]) + _shfl_xor_sync_122;
+                    w16_0[15] = (((lane_0 & 16) == 0) ? pdg[15] : pdg[31]) + _shfl_xor_sync_107;
+                    float w8_0[8];
+                    float _shfl_xor_sync_108 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_0[8] : w16_0[0]), 8);
+                    w8_0[0] = (((lane_0 & 8) == 0) ? w16_0[0] : w16_0[8]) + _shfl_xor_sync_108;
+                    float _shfl_xor_sync_109 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_0[9] : w16_0[1]), 8);
+                    w8_0[1] = (((lane_0 & 8) == 0) ? w16_0[1] : w16_0[9]) + _shfl_xor_sync_109;
+                    float _shfl_xor_sync_110 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_0[10] : w16_0[2]), 8);
+                    w8_0[2] = (((lane_0 & 8) == 0) ? w16_0[2] : w16_0[10]) + _shfl_xor_sync_110;
+                    float _shfl_xor_sync_111 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_0[11] : w16_0[3]), 8);
+                    w8_0[3] = (((lane_0 & 8) == 0) ? w16_0[3] : w16_0[11]) + _shfl_xor_sync_111;
+                    float _shfl_xor_sync_112 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_0[12] : w16_0[4]), 8);
+                    w8_0[4] = (((lane_0 & 8) == 0) ? w16_0[4] : w16_0[12]) + _shfl_xor_sync_112;
+                    float _shfl_xor_sync_113 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_0[13] : w16_0[5]), 8);
+                    w8_0[5] = (((lane_0 & 8) == 0) ? w16_0[5] : w16_0[13]) + _shfl_xor_sync_113;
+                    float _shfl_xor_sync_114 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_0[14] : w16_0[6]), 8);
+                    w8_0[6] = (((lane_0 & 8) == 0) ? w16_0[6] : w16_0[14]) + _shfl_xor_sync_114;
+                    float _shfl_xor_sync_115 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_0[15] : w16_0[7]), 8);
+                    w8_0[7] = (((lane_0 & 8) == 0) ? w16_0[7] : w16_0[15]) + _shfl_xor_sync_115;
+                    float w4_0[4];
+                    float _shfl_xor_sync_116 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 4) == 0) ? w8_0[4] : w8_0[0]), 4);
+                    w4_0[0] = (((lane_0 & 4) == 0) ? w8_0[0] : w8_0[4]) + _shfl_xor_sync_116;
+                    float _shfl_xor_sync_117 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 4) == 0) ? w8_0[5] : w8_0[1]), 4);
+                    w4_0[1] = (((lane_0 & 4) == 0) ? w8_0[1] : w8_0[5]) + _shfl_xor_sync_117;
+                    float _shfl_xor_sync_118 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 4) == 0) ? w8_0[6] : w8_0[2]), 4);
+                    w4_0[2] = (((lane_0 & 4) == 0) ? w8_0[2] : w8_0[6]) + _shfl_xor_sync_118;
+                    float _shfl_xor_sync_119 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 4) == 0) ? w8_0[7] : w8_0[3]), 4);
+                    w4_0[3] = (((lane_0 & 4) == 0) ? w8_0[3] : w8_0[7]) + _shfl_xor_sync_119;
+                    float w2_0[2];
+                    float _shfl_xor_sync_120 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 2) == 0) ? w4_0[2] : w4_0[0]), 2);
+                    w2_0[0] = (((lane_0 & 2) == 0) ? w4_0[0] : w4_0[2]) + _shfl_xor_sync_120;
+                    float _shfl_xor_sync_121 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 2) == 0) ? w4_0[3] : w4_0[1]), 2);
+                    w2_0[1] = (((lane_0 & 2) == 0) ? w4_0[1] : w4_0[3]) + _shfl_xor_sync_121;
+                    float _shfl_xor_sync_122 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 1) == 0) ? w2_0[1] : w2_0[0]), 1);
+                    tmp = (((lane_0 & 1) == 0) ? w2_0[0] : w2_0[1]) + _shfl_xor_sync_122;
                     dg_acc = dg_acc + tmp;
                     float _tmem_load_7[16];
                     asm volatile(
@@ -1942,42 +2003,48 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(dab[_lp*2 + 0], dab[_lp*2+1 + 0]));
                         dab_bf16[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v27_addr + (unsigned int)(colh / 64 * 8192 + trow16 * 128 + colh % 64 * 2 ^ (colh / 64 * 8192 + trow16 * 128 + colh % 64 * 2 >> 7 & 7) << 4))), "r"(dab_bf16[0]), "r"(dab_bf16[1]), "r"(dab_bf16[2]), "r"(dab_bf16[3]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v27_addr + (unsigned int)((colh + 8) / 64 * 8192 + trow16 * 128 + (colh + 8) % 64 * 2 ^ ((colh + 8) / 64 * 8192 + trow16 * 128 + (colh + 8) % 64 * 2 >> 7 & 7) << 4))), "r"(dab_bf16[4]), "r"(dab_bf16[5]), "r"(dab_bf16[6]), "r"(dab_bf16[7]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v20_addr_0 + (unsigned int)(colh / 64 * 8192 + trow16 * 128 + colh % 64 * 2 ^ (colh / 64 * 8192 + trow16 * 128 + colh % 64 * 2 >> 7 & 7) << 4))), "r"(dab_bf16[0]), "r"(dab_bf16[1]), "r"(dab_bf16[2]), "r"(dab_bf16[3]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v20_addr_0 + (unsigned int)((colh + 8) / 64 * 8192 + trow16 * 128 + (colh + 8) % 64 * 2 ^ ((colh + 8) / 64 * 8192 + trow16 * 128 + (colh + 8) % 64 * 2 >> 7 & 7) << 4))), "r"(dab_bf16[4]), "r"(dab_bf16[5]), "r"(dab_bf16[6]), "r"(dab_bf16[7]) : "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(b_drained_addr);
                     asm volatile("barrier.sync 1, 256;" ::: "memory");
-                    int t = tid_1 >> 2;
-                    int d0 = (tid_1 & 3) * 32;
+                    int t = tid_1 >> 3;
+                    int t1 = t + 32;
+                    int c0 = tid_1 & 7;
                     if (t < clen) {
-                        long long base = (long long)(trow + t) * (long long)dv_tstride + (long long)(hv * 128 + d0);
-                        int chunk_0 = d0 >> 3 ^ t & 7;
-                        unsigned int q0[4];
+                        long long base = (long long)(trow + t) * (long long)dv_tstride + (long long)(hv * 128 + c0 * 8);
+                        int chunk_0 = c0 ^ t & 7;
+                        unsigned int q0_1_0[4];
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&q0[0])), "=r"(*reinterpret_cast<uint32_t*>(&q0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q0[(0) + 3]))
+                            : "=r"(*reinterpret_cast<uint32_t*>(&q0_1_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1_0[(0) + 3]))
                             : "r"(stage_dv_addr + (unsigned int)(t * 256 + (chunk_0 << 4))));
-                        reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dv + base))[0] = reinterpret_cast<int4*>(q0)[0];
-                        int chunk_1 = (d0 >> 3) + 1 ^ t & 7;
-                        unsigned int q1[4];
+                        reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dv + base))[0] = reinterpret_cast<int4*>(q0_1_0)[0];
+                        int chunk_1 = c0 + 8 ^ t & 7;
+                        unsigned int q0_1_1[4];
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&q1[0])), "=r"(*reinterpret_cast<uint32_t*>(&q1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q1[(0) + 3]))
+                            : "=r"(*reinterpret_cast<uint32_t*>(&q0_1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1_1[(0) + 3]))
                             : "r"(stage_dv_addr + (unsigned int)(t * 256 + (chunk_1 << 4))));
-                        reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dv + (base + 8)))[0] = reinterpret_cast<int4*>(q1)[0];
-                        int chunk_2 = (d0 >> 3) + 2 ^ t & 7;
-                        unsigned int q2[4];
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&q2[0])), "=r"(*reinterpret_cast<uint32_t*>(&q2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q2[(0) + 3]))
-                            : "r"(stage_dv_addr + (unsigned int)(t * 256 + (chunk_2 << 4))));
-                        reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dv + (base + 16)))[0] = reinterpret_cast<int4*>(q2)[0];
-                        int chunk_3 = (d0 >> 3) + 3 ^ t & 7;
-                        unsigned int q3[4];
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&q3[0])), "=r"(*reinterpret_cast<uint32_t*>(&q3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q3[(0) + 3]))
-                            : "r"(stage_dv_addr + (unsigned int)(t * 256 + (chunk_3 << 4))));
-                        reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dv + (base + 24)))[0] = reinterpret_cast<int4*>(q3)[0];
+                        reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dv + (base + 64)))[0] = reinterpret_cast<int4*>(q0_1_1)[0];
                     }
+                    if (t1 < clen) {
+                        long long base1 = (long long)(trow + t1) * (long long)dv_tstride + (long long)(hv * 128 + c0 * 8);
+                        int chunk1_0 = c0 ^ t1 & 7;
+                        unsigned int q2_3_0[4];
+                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                            : "=r"(*reinterpret_cast<uint32_t*>(&q2_3_0[0])), "=r"(*reinterpret_cast<uint32_t*>(&q2_3_0[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q2_3_0[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q2_3_0[(0) + 3]))
+                            : "r"(stage_dv_addr + (unsigned int)(t1 * 256 + (chunk1_0 << 4))));
+                        reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dv + base1))[0] = reinterpret_cast<int4*>(q2_3_0)[0];
+                        int chunk1_1 = c0 + 8 ^ t1 & 7;
+                        unsigned int q2_3_1[4];
+                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                            : "=r"(*reinterpret_cast<uint32_t*>(&q2_3_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&q2_3_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q2_3_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q2_3_1[(0) + 3]))
+                            : "r"(stage_dv_addr + (unsigned int)(t1 * 256 + (chunk1_1 << 4))));
+                        reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dv + (base1 + 64)))[0] = reinterpret_cast<int4*>(q2_3_1)[0];
+                    }
+                    asm volatile("tcgen05.fence::before_thread_sync;");
+                    mbarrier_arrive(dv_stored_addr);
                     mbarrier_wait(c_ready_addr, _phase_c_ready_0);
                     _phase_c_ready_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
@@ -1994,8 +2061,8 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_8[_lp*2 + 0], _tmem_load_8[_lp*2+1 + 0]));
                         _tmem_load_8_bf16[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v28_addr + (unsigned int)(colh / 64 * 8192 + trow16 * 128 + colh % 64 * 2 ^ (colh / 64 * 8192 + trow16 * 128 + colh % 64 * 2 >> 7 & 7) << 4))), "r"(_tmem_load_8_bf16[0]), "r"(_tmem_load_8_bf16[1]), "r"(_tmem_load_8_bf16[2]), "r"(_tmem_load_8_bf16[3]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v28_addr + (unsigned int)((colh + 8) / 64 * 8192 + trow16 * 128 + (colh + 8) % 64 * 2 ^ ((colh + 8) / 64 * 8192 + trow16 * 128 + (colh + 8) % 64 * 2 >> 7 & 7) << 4))), "r"(_tmem_load_8_bf16[4]), "r"(_tmem_load_8_bf16[5]), "r"(_tmem_load_8_bf16[6]), "r"(_tmem_load_8_bf16[7]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v20_addr_1 + (unsigned int)(colh / 64 * 8192 + trow16 * 128 + colh % 64 * 2 ^ (colh / 64 * 8192 + trow16 * 128 + colh % 64 * 2 >> 7 & 7) << 4))), "r"(_tmem_load_8_bf16[0]), "r"(_tmem_load_8_bf16[1]), "r"(_tmem_load_8_bf16[2]), "r"(_tmem_load_8_bf16[3]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v20_addr_1 + (unsigned int)((colh + 8) / 64 * 8192 + trow16 * 128 + (colh + 8) % 64 * 2 ^ ((colh + 8) / 64 * 8192 + trow16 * 128 + (colh + 8) % 64 * 2 >> 7 & 7) << 4))), "r"(_tmem_load_8_bf16[4]), "r"(_tmem_load_8_bf16[5]), "r"(_tmem_load_8_bf16[6]), "r"(_tmem_load_8_bf16[7]) : "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(c_drained_addr);
@@ -2049,13 +2116,13 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(akg[_lp*2 + 0], akg[_lp*2+1 + 0]));
                         akg_bf16[_lp] = *(uint32_t*)&_bf2;
                     }
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v32_addr + (unsigned int)(colh / 64 * 8192 + trow16 * 128 + colh % 64 * 2 ^ (colh / 64 * 8192 + trow16 * 128 + colh % 64 * 2 >> 7 & 7) << 4))), "r"(akg_bf16[0]), "r"(akg_bf16[1]), "r"(akg_bf16[2]), "r"(akg_bf16[3]) : "memory");
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v32_addr + (unsigned int)((colh + 8) / 64 * 8192 + trow16 * 128 + (colh + 8) % 64 * 2 ^ ((colh + 8) / 64 * 8192 + trow16 * 128 + (colh + 8) % 64 * 2 >> 7 & 7) << 4))), "r"(akg_bf16[4]), "r"(akg_bf16[5]), "r"(akg_bf16[6]), "r"(akg_bf16[7]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v20_addr_3 + (unsigned int)(colh / 64 * 8192 + trow16 * 128 + colh % 64 * 2 ^ (colh / 64 * 8192 + trow16 * 128 + colh % 64 * 2 >> 7 & 7) << 4))), "r"(akg_bf16[0]), "r"(akg_bf16[1]), "r"(akg_bf16[2]), "r"(akg_bf16[3]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_v20_addr_3 + (unsigned int)((colh + 8) / 64 * 8192 + trow16 * 128 + (colh + 8) % 64 * 2 ^ ((colh + 8) / 64 * 8192 + trow16 * 128 + (colh + 8) % 64 * 2 >> 7 & 7) << 4))), "r"(akg_bf16[4]), "r"(akg_bf16[5]), "r"(akg_bf16[6]), "r"(akg_bf16[7]) : "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     mbarrier_arrive(d_drained_addr);
-                    mbarrier_wait(e_ready_addr, _phase_e_ready_0);
-                    _phase_e_ready_0 ^= 1;
+                    mbarrier_wait(e1_ready_addr, _phase_e1_ready_0);
+                    _phase_e1_ready_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     float _tmem_load_10[32];
                     asm volatile(
@@ -2072,133 +2139,133 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                         : "r"(taddr + 128 + (unsigned int)row_base + (unsigned int)(ch * 32)));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
                     float qval = 0.0f;
-                    unsigned int w_36[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_36[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + t0 * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + t0 * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_36[0] << 16);
+                    unsigned int w_31[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_31[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + t0 * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + t0 * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_31[0] << 16);
                     _tmem_load_10[0] = __fmaf_rn(qval, _tmem_load_11[0], _tmem_load_10[0]);
-                    unsigned int w_37[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_37[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 1) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 1) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_37[0] << 16);
+                    unsigned int w_32[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_32[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 1) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 1) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_32[0] << 16);
                     _tmem_load_10[1] = __fmaf_rn(qval, _tmem_load_11[1], _tmem_load_10[1]);
-                    unsigned int w_38[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_38[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 2) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 2) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_38[0] << 16);
+                    unsigned int w_33[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_33[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 2) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 2) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_33[0] << 16);
                     _tmem_load_10[2] = __fmaf_rn(qval, _tmem_load_11[2], _tmem_load_10[2]);
-                    unsigned int w_39[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_39[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 3) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 3) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_39[0] << 16);
+                    unsigned int w_34[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_34[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 3) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 3) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_34[0] << 16);
                     _tmem_load_10[3] = __fmaf_rn(qval, _tmem_load_11[3], _tmem_load_10[3]);
-                    unsigned int w_40[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_40[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 4) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 4) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_40[0] << 16);
+                    unsigned int w_35[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_35[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 4) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 4) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_35[0] << 16);
                     _tmem_load_10[4] = __fmaf_rn(qval, _tmem_load_11[4], _tmem_load_10[4]);
-                    unsigned int w_41[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_41[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 5) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 5) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_41[0] << 16);
+                    unsigned int w_36[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_36[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 5) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 5) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_36[0] << 16);
                     _tmem_load_10[5] = __fmaf_rn(qval, _tmem_load_11[5], _tmem_load_10[5]);
-                    unsigned int w_42[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_42[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 6) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 6) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_42[0] << 16);
+                    unsigned int w_37[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_37[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 6) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 6) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_37[0] << 16);
                     _tmem_load_10[6] = __fmaf_rn(qval, _tmem_load_11[6], _tmem_load_10[6]);
-                    unsigned int w_43[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_43[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 7) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 7) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_43[0] << 16);
+                    unsigned int w_38[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_38[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 7) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 7) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_38[0] << 16);
                     _tmem_load_10[7] = __fmaf_rn(qval, _tmem_load_11[7], _tmem_load_10[7]);
-                    unsigned int w_44[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_44[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 8) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 8) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_44[0] << 16);
+                    unsigned int w_39[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_39[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 8) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 8) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_39[0] << 16);
                     _tmem_load_10[8] = __fmaf_rn(qval, _tmem_load_11[8], _tmem_load_10[8]);
-                    unsigned int w_45[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_45[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 9) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 9) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_45[0] << 16);
+                    unsigned int w_40[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_40[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 9) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 9) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_40[0] << 16);
                     _tmem_load_10[9] = __fmaf_rn(qval, _tmem_load_11[9], _tmem_load_10[9]);
-                    unsigned int w_46[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_46[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 10) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 10) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_46[0] << 16);
+                    unsigned int w_41[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_41[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 10) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 10) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_41[0] << 16);
                     _tmem_load_10[10] = __fmaf_rn(qval, _tmem_load_11[10], _tmem_load_10[10]);
-                    unsigned int w_47[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_47[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 11) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 11) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_47[0] << 16);
+                    unsigned int w_42[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_42[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 11) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 11) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_42[0] << 16);
                     _tmem_load_10[11] = __fmaf_rn(qval, _tmem_load_11[11], _tmem_load_10[11]);
-                    unsigned int w_48[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_48[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 12) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 12) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_48[0] << 16);
+                    unsigned int w_43[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_43[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 12) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 12) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_43[0] << 16);
                     _tmem_load_10[12] = __fmaf_rn(qval, _tmem_load_11[12], _tmem_load_10[12]);
-                    unsigned int w_49[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_49[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 13) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 13) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_49[0] << 16);
+                    unsigned int w_44[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_44[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 13) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 13) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_44[0] << 16);
                     _tmem_load_10[13] = __fmaf_rn(qval, _tmem_load_11[13], _tmem_load_10[13]);
-                    unsigned int w_50[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_50[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 14) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 14) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_50[0] << 16);
+                    unsigned int w_45[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_45[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 14) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 14) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_45[0] << 16);
                     _tmem_load_10[14] = __fmaf_rn(qval, _tmem_load_11[14], _tmem_load_10[14]);
-                    unsigned int w_51[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_51[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 15) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 15) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_51[0] << 16);
+                    unsigned int w_46[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_46[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 15) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 15) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_46[0] << 16);
                     _tmem_load_10[15] = __fmaf_rn(qval, _tmem_load_11[15], _tmem_load_10[15]);
-                    unsigned int w_52[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_52[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 16) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 16) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_52[0] << 16);
+                    unsigned int w_47[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_47[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 16) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 16) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_47[0] << 16);
                     _tmem_load_10[16] = __fmaf_rn(qval, _tmem_load_11[16], _tmem_load_10[16]);
-                    unsigned int w_53[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_53[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 17) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 17) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_53[0] << 16);
+                    unsigned int w_48[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_48[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 17) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 17) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_48[0] << 16);
                     _tmem_load_10[17] = __fmaf_rn(qval, _tmem_load_11[17], _tmem_load_10[17]);
-                    unsigned int w_54[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_54[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 18) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 18) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_54[0] << 16);
+                    unsigned int w_49[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_49[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 18) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 18) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_49[0] << 16);
                     _tmem_load_10[18] = __fmaf_rn(qval, _tmem_load_11[18], _tmem_load_10[18]);
-                    unsigned int w_55[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_55[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 19) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 19) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_55[0] << 16);
+                    unsigned int w_50[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_50[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 19) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 19) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_50[0] << 16);
                     _tmem_load_10[19] = __fmaf_rn(qval, _tmem_load_11[19], _tmem_load_10[19]);
-                    unsigned int w_56[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_56[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 20) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 20) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_56[0] << 16);
+                    unsigned int w_51[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_51[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 20) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 20) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_51[0] << 16);
                     _tmem_load_10[20] = __fmaf_rn(qval, _tmem_load_11[20], _tmem_load_10[20]);
-                    unsigned int w_57[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_57[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 21) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 21) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_57[0] << 16);
+                    unsigned int w_52[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_52[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 21) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 21) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_52[0] << 16);
                     _tmem_load_10[21] = __fmaf_rn(qval, _tmem_load_11[21], _tmem_load_10[21]);
-                    unsigned int w_58[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_58[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 22) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 22) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_58[0] << 16);
+                    unsigned int w_53[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_53[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 22) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 22) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_53[0] << 16);
                     _tmem_load_10[22] = __fmaf_rn(qval, _tmem_load_11[22], _tmem_load_10[22]);
-                    unsigned int w_59[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_59[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 23) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 23) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_59[0] << 16);
+                    unsigned int w_54[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_54[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 23) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 23) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_54[0] << 16);
                     _tmem_load_10[23] = __fmaf_rn(qval, _tmem_load_11[23], _tmem_load_10[23]);
-                    unsigned int w_60[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_60[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 24) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 24) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_60[0] << 16);
+                    unsigned int w_55[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_55[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 24) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 24) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_55[0] << 16);
                     _tmem_load_10[24] = __fmaf_rn(qval, _tmem_load_11[24], _tmem_load_10[24]);
-                    unsigned int w_61[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_61[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 25) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 25) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_61[0] << 16);
+                    unsigned int w_56[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_56[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 25) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 25) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_56[0] << 16);
                     _tmem_load_10[25] = __fmaf_rn(qval, _tmem_load_11[25], _tmem_load_10[25]);
-                    unsigned int w_62[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_62[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 26) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 26) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_62[0] << 16);
+                    unsigned int w_57[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_57[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 26) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 26) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_57[0] << 16);
                     _tmem_load_10[26] = __fmaf_rn(qval, _tmem_load_11[26], _tmem_load_10[26]);
-                    unsigned int w_63[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_63[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 27) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 27) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_63[0] << 16);
+                    unsigned int w_58[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_58[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 27) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 27) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_58[0] << 16);
                     _tmem_load_10[27] = __fmaf_rn(qval, _tmem_load_11[27], _tmem_load_10[27]);
-                    unsigned int w_64[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_64[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 28) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 28) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_64[0] << 16);
+                    unsigned int w_59[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_59[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 28) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 28) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_59[0] << 16);
                     _tmem_load_10[28] = __fmaf_rn(qval, _tmem_load_11[28], _tmem_load_10[28]);
-                    unsigned int w_65[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_65[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 29) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 29) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_65[0] << 16);
+                    unsigned int w_60[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_60[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 29) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 29) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_60[0] << 16);
                     _tmem_load_10[29] = __fmaf_rn(qval, _tmem_load_11[29], _tmem_load_10[29]);
-                    unsigned int w_66[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_66[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 30) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 30) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_66[0] << 16);
+                    unsigned int w_61[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_61[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 30) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 30) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_61[0] << 16);
                     _tmem_load_10[30] = __fmaf_rn(qval, _tmem_load_11[30], _tmem_load_10[30]);
-                    unsigned int w_67[1];
-                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_67[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 31) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 31) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
-                    qval = __uint_as_float(w_67[0] << 16);
+                    unsigned int w_62[1];
+                    asm volatile("ld.shared.u16 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&w_62[0])) : "r"((smem_v6_addr + (unsigned int)(d_row / 64 * 8192 + (t0 + 31) * 128 + d_row % 64 * 2 ^ (d_row / 64 * 8192 + (t0 + 31) * 128 + d_row % 64 * 2 >> 7 & 7) << 4))));
+                    qval = __uint_as_float(w_62[0] << 16);
                     _tmem_load_10[31] = __fmaf_rn(qval, _tmem_load_11[31], _tmem_load_10[31]);
                     if (group_reduce != 0) {
                         if (hl == 0) {
@@ -2344,6 +2411,9 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                             *(reinterpret_cast<float*>(dq_part + (pbase + (long long)((t0 + 31) * num_heads * 128))) + (0)) = _tmem_load_11[31];
                         }
                     }
+                    mbarrier_wait(e_ready_addr, _phase_e_ready_0);
+                    _phase_e_ready_0 ^= 1;
+                    asm volatile("tcgen05.fence::after_thread_sync;");
                     float _tmem_load_13[32];
                     asm volatile(
                         "tcgen05.ld.sync.aligned.32x32b.x32.b32"
@@ -2383,72 +2453,72 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                     _tmem_load_10[29] = __fmaf_rn(-__uint_as_float(kpk[14] & 4294901760u), _tmem_load_13[29], _tmem_load_10[29]);
                     _tmem_load_10[30] = __fmaf_rn(-__uint_as_float(kpk[15] << 16), _tmem_load_13[30], _tmem_load_10[30]);
                     _tmem_load_10[31] = __fmaf_rn(-__uint_as_float(kpk[15] & 4294901760u), _tmem_load_13[31], _tmem_load_10[31]);
-                    float w16_68[16];
+                    float w16_1_1[16];
                     float _shfl_xor_sync_139 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? _tmem_load_10[16] : _tmem_load_10[0]), 16);
-                    w16_68[0] = (((lane_0 & 16) == 0) ? _tmem_load_10[0] : _tmem_load_10[16]) + _shfl_xor_sync_139;
+                    w16_1_1[0] = (((lane_0 & 16) == 0) ? _tmem_load_10[0] : _tmem_load_10[16]) + _shfl_xor_sync_139;
                     float _shfl_xor_sync_140 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? _tmem_load_10[17] : _tmem_load_10[1]), 16);
-                    w16_68[1] = (((lane_0 & 16) == 0) ? _tmem_load_10[1] : _tmem_load_10[17]) + _shfl_xor_sync_140;
+                    w16_1_1[1] = (((lane_0 & 16) == 0) ? _tmem_load_10[1] : _tmem_load_10[17]) + _shfl_xor_sync_140;
                     float _shfl_xor_sync_141 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? _tmem_load_10[18] : _tmem_load_10[2]), 16);
-                    w16_68[2] = (((lane_0 & 16) == 0) ? _tmem_load_10[2] : _tmem_load_10[18]) + _shfl_xor_sync_141;
+                    w16_1_1[2] = (((lane_0 & 16) == 0) ? _tmem_load_10[2] : _tmem_load_10[18]) + _shfl_xor_sync_141;
                     float _shfl_xor_sync_142 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? _tmem_load_10[19] : _tmem_load_10[3]), 16);
-                    w16_68[3] = (((lane_0 & 16) == 0) ? _tmem_load_10[3] : _tmem_load_10[19]) + _shfl_xor_sync_142;
+                    w16_1_1[3] = (((lane_0 & 16) == 0) ? _tmem_load_10[3] : _tmem_load_10[19]) + _shfl_xor_sync_142;
                     float _shfl_xor_sync_143 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? _tmem_load_10[20] : _tmem_load_10[4]), 16);
-                    w16_68[4] = (((lane_0 & 16) == 0) ? _tmem_load_10[4] : _tmem_load_10[20]) + _shfl_xor_sync_143;
+                    w16_1_1[4] = (((lane_0 & 16) == 0) ? _tmem_load_10[4] : _tmem_load_10[20]) + _shfl_xor_sync_143;
                     float _shfl_xor_sync_144 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? _tmem_load_10[21] : _tmem_load_10[5]), 16);
-                    w16_68[5] = (((lane_0 & 16) == 0) ? _tmem_load_10[5] : _tmem_load_10[21]) + _shfl_xor_sync_144;
+                    w16_1_1[5] = (((lane_0 & 16) == 0) ? _tmem_load_10[5] : _tmem_load_10[21]) + _shfl_xor_sync_144;
                     float _shfl_xor_sync_145 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? _tmem_load_10[22] : _tmem_load_10[6]), 16);
-                    w16_68[6] = (((lane_0 & 16) == 0) ? _tmem_load_10[6] : _tmem_load_10[22]) + _shfl_xor_sync_145;
+                    w16_1_1[6] = (((lane_0 & 16) == 0) ? _tmem_load_10[6] : _tmem_load_10[22]) + _shfl_xor_sync_145;
                     float _shfl_xor_sync_146 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? _tmem_load_10[23] : _tmem_load_10[7]), 16);
-                    w16_68[7] = (((lane_0 & 16) == 0) ? _tmem_load_10[7] : _tmem_load_10[23]) + _shfl_xor_sync_146;
+                    w16_1_1[7] = (((lane_0 & 16) == 0) ? _tmem_load_10[7] : _tmem_load_10[23]) + _shfl_xor_sync_146;
                     float _shfl_xor_sync_147 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? _tmem_load_10[24] : _tmem_load_10[8]), 16);
-                    w16_68[8] = (((lane_0 & 16) == 0) ? _tmem_load_10[8] : _tmem_load_10[24]) + _shfl_xor_sync_147;
+                    w16_1_1[8] = (((lane_0 & 16) == 0) ? _tmem_load_10[8] : _tmem_load_10[24]) + _shfl_xor_sync_147;
                     float _shfl_xor_sync_148 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? _tmem_load_10[25] : _tmem_load_10[9]), 16);
-                    w16_68[9] = (((lane_0 & 16) == 0) ? _tmem_load_10[9] : _tmem_load_10[25]) + _shfl_xor_sync_148;
+                    w16_1_1[9] = (((lane_0 & 16) == 0) ? _tmem_load_10[9] : _tmem_load_10[25]) + _shfl_xor_sync_148;
                     float _shfl_xor_sync_149 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? _tmem_load_10[26] : _tmem_load_10[10]), 16);
-                    w16_68[10] = (((lane_0 & 16) == 0) ? _tmem_load_10[10] : _tmem_load_10[26]) + _shfl_xor_sync_149;
+                    w16_1_1[10] = (((lane_0 & 16) == 0) ? _tmem_load_10[10] : _tmem_load_10[26]) + _shfl_xor_sync_149;
                     float _shfl_xor_sync_150 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? _tmem_load_10[27] : _tmem_load_10[11]), 16);
-                    w16_68[11] = (((lane_0 & 16) == 0) ? _tmem_load_10[11] : _tmem_load_10[27]) + _shfl_xor_sync_150;
+                    w16_1_1[11] = (((lane_0 & 16) == 0) ? _tmem_load_10[11] : _tmem_load_10[27]) + _shfl_xor_sync_150;
                     float _shfl_xor_sync_151 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? _tmem_load_10[28] : _tmem_load_10[12]), 16);
-                    w16_68[12] = (((lane_0 & 16) == 0) ? _tmem_load_10[12] : _tmem_load_10[28]) + _shfl_xor_sync_151;
+                    w16_1_1[12] = (((lane_0 & 16) == 0) ? _tmem_load_10[12] : _tmem_load_10[28]) + _shfl_xor_sync_151;
                     float _shfl_xor_sync_152 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? _tmem_load_10[29] : _tmem_load_10[13]), 16);
-                    w16_68[13] = (((lane_0 & 16) == 0) ? _tmem_load_10[13] : _tmem_load_10[29]) + _shfl_xor_sync_152;
+                    w16_1_1[13] = (((lane_0 & 16) == 0) ? _tmem_load_10[13] : _tmem_load_10[29]) + _shfl_xor_sync_152;
                     float _shfl_xor_sync_153 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? _tmem_load_10[30] : _tmem_load_10[14]), 16);
-                    w16_68[14] = (((lane_0 & 16) == 0) ? _tmem_load_10[14] : _tmem_load_10[30]) + _shfl_xor_sync_153;
+                    w16_1_1[14] = (((lane_0 & 16) == 0) ? _tmem_load_10[14] : _tmem_load_10[30]) + _shfl_xor_sync_153;
                     float _shfl_xor_sync_154 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? _tmem_load_10[31] : _tmem_load_10[15]), 16);
-                    w16_68[15] = (((lane_0 & 16) == 0) ? _tmem_load_10[15] : _tmem_load_10[31]) + _shfl_xor_sync_154;
-                    float w8_69[8];
-                    float _shfl_xor_sync_155 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_68[8] : w16_68[0]), 8);
-                    w8_69[0] = (((lane_0 & 8) == 0) ? w16_68[0] : w16_68[8]) + _shfl_xor_sync_155;
-                    float _shfl_xor_sync_156 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_68[9] : w16_68[1]), 8);
-                    w8_69[1] = (((lane_0 & 8) == 0) ? w16_68[1] : w16_68[9]) + _shfl_xor_sync_156;
-                    float _shfl_xor_sync_157 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_68[10] : w16_68[2]), 8);
-                    w8_69[2] = (((lane_0 & 8) == 0) ? w16_68[2] : w16_68[10]) + _shfl_xor_sync_157;
-                    float _shfl_xor_sync_158 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_68[11] : w16_68[3]), 8);
-                    w8_69[3] = (((lane_0 & 8) == 0) ? w16_68[3] : w16_68[11]) + _shfl_xor_sync_158;
-                    float _shfl_xor_sync_159 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_68[12] : w16_68[4]), 8);
-                    w8_69[4] = (((lane_0 & 8) == 0) ? w16_68[4] : w16_68[12]) + _shfl_xor_sync_159;
-                    float _shfl_xor_sync_160 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_68[13] : w16_68[5]), 8);
-                    w8_69[5] = (((lane_0 & 8) == 0) ? w16_68[5] : w16_68[13]) + _shfl_xor_sync_160;
-                    float _shfl_xor_sync_161 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_68[14] : w16_68[6]), 8);
-                    w8_69[6] = (((lane_0 & 8) == 0) ? w16_68[6] : w16_68[14]) + _shfl_xor_sync_161;
-                    float _shfl_xor_sync_162 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_68[15] : w16_68[7]), 8);
-                    w8_69[7] = (((lane_0 & 8) == 0) ? w16_68[7] : w16_68[15]) + _shfl_xor_sync_162;
-                    float w4_70[4];
-                    float _shfl_xor_sync_163 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 4) == 0) ? w8_69[4] : w8_69[0]), 4);
-                    w4_70[0] = (((lane_0 & 4) == 0) ? w8_69[0] : w8_69[4]) + _shfl_xor_sync_163;
-                    float _shfl_xor_sync_164 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 4) == 0) ? w8_69[5] : w8_69[1]), 4);
-                    w4_70[1] = (((lane_0 & 4) == 0) ? w8_69[1] : w8_69[5]) + _shfl_xor_sync_164;
-                    float _shfl_xor_sync_165 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 4) == 0) ? w8_69[6] : w8_69[2]), 4);
-                    w4_70[2] = (((lane_0 & 4) == 0) ? w8_69[2] : w8_69[6]) + _shfl_xor_sync_165;
-                    float _shfl_xor_sync_166 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 4) == 0) ? w8_69[7] : w8_69[3]), 4);
-                    w4_70[3] = (((lane_0 & 4) == 0) ? w8_69[3] : w8_69[7]) + _shfl_xor_sync_166;
-                    float w2_71[2];
-                    float _shfl_xor_sync_167 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 2) == 0) ? w4_70[2] : w4_70[0]), 2);
-                    w2_71[0] = (((lane_0 & 2) == 0) ? w4_70[0] : w4_70[2]) + _shfl_xor_sync_167;
-                    float _shfl_xor_sync_168 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 2) == 0) ? w4_70[3] : w4_70[1]), 2);
-                    w2_71[1] = (((lane_0 & 2) == 0) ? w4_70[1] : w4_70[3]) + _shfl_xor_sync_168;
-                    float _shfl_xor_sync_169 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 1) == 0) ? w2_71[1] : w2_71[0]), 1);
-                    tmp = (((lane_0 & 1) == 0) ? w2_71[0] : w2_71[1]) + _shfl_xor_sync_169;
+                    w16_1_1[15] = (((lane_0 & 16) == 0) ? _tmem_load_10[15] : _tmem_load_10[31]) + _shfl_xor_sync_154;
+                    float w8_1_1[8];
+                    float _shfl_xor_sync_155 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_1_1[8] : w16_1_1[0]), 8);
+                    w8_1_1[0] = (((lane_0 & 8) == 0) ? w16_1_1[0] : w16_1_1[8]) + _shfl_xor_sync_155;
+                    float _shfl_xor_sync_156 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_1_1[9] : w16_1_1[1]), 8);
+                    w8_1_1[1] = (((lane_0 & 8) == 0) ? w16_1_1[1] : w16_1_1[9]) + _shfl_xor_sync_156;
+                    float _shfl_xor_sync_157 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_1_1[10] : w16_1_1[2]), 8);
+                    w8_1_1[2] = (((lane_0 & 8) == 0) ? w16_1_1[2] : w16_1_1[10]) + _shfl_xor_sync_157;
+                    float _shfl_xor_sync_158 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_1_1[11] : w16_1_1[3]), 8);
+                    w8_1_1[3] = (((lane_0 & 8) == 0) ? w16_1_1[3] : w16_1_1[11]) + _shfl_xor_sync_158;
+                    float _shfl_xor_sync_159 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_1_1[12] : w16_1_1[4]), 8);
+                    w8_1_1[4] = (((lane_0 & 8) == 0) ? w16_1_1[4] : w16_1_1[12]) + _shfl_xor_sync_159;
+                    float _shfl_xor_sync_160 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_1_1[13] : w16_1_1[5]), 8);
+                    w8_1_1[5] = (((lane_0 & 8) == 0) ? w16_1_1[5] : w16_1_1[13]) + _shfl_xor_sync_160;
+                    float _shfl_xor_sync_161 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_1_1[14] : w16_1_1[6]), 8);
+                    w8_1_1[6] = (((lane_0 & 8) == 0) ? w16_1_1[6] : w16_1_1[14]) + _shfl_xor_sync_161;
+                    float _shfl_xor_sync_162 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_1_1[15] : w16_1_1[7]), 8);
+                    w8_1_1[7] = (((lane_0 & 8) == 0) ? w16_1_1[7] : w16_1_1[15]) + _shfl_xor_sync_162;
+                    float w4_1_1[4];
+                    float _shfl_xor_sync_163 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 4) == 0) ? w8_1_1[4] : w8_1_1[0]), 4);
+                    w4_1_1[0] = (((lane_0 & 4) == 0) ? w8_1_1[0] : w8_1_1[4]) + _shfl_xor_sync_163;
+                    float _shfl_xor_sync_164 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 4) == 0) ? w8_1_1[5] : w8_1_1[1]), 4);
+                    w4_1_1[1] = (((lane_0 & 4) == 0) ? w8_1_1[1] : w8_1_1[5]) + _shfl_xor_sync_164;
+                    float _shfl_xor_sync_165 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 4) == 0) ? w8_1_1[6] : w8_1_1[2]), 4);
+                    w4_1_1[2] = (((lane_0 & 4) == 0) ? w8_1_1[2] : w8_1_1[6]) + _shfl_xor_sync_165;
+                    float _shfl_xor_sync_166 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 4) == 0) ? w8_1_1[7] : w8_1_1[3]), 4);
+                    w4_1_1[3] = (((lane_0 & 4) == 0) ? w8_1_1[3] : w8_1_1[7]) + _shfl_xor_sync_166;
+                    float w2_1_1[2];
+                    float _shfl_xor_sync_167 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 2) == 0) ? w4_1_1[2] : w4_1_1[0]), 2);
+                    w2_1_1[0] = (((lane_0 & 2) == 0) ? w4_1_1[0] : w4_1_1[2]) + _shfl_xor_sync_167;
+                    float _shfl_xor_sync_168 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 2) == 0) ? w4_1_1[3] : w4_1_1[1]), 2);
+                    w2_1_1[1] = (((lane_0 & 2) == 0) ? w4_1_1[1] : w4_1_1[3]) + _shfl_xor_sync_168;
+                    float _shfl_xor_sync_169 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 1) == 0) ? w2_1_1[1] : w2_1_1[0]), 1);
+                    tmp = (((lane_0 & 1) == 0) ? w2_1_1[0] : w2_1_1[1]) + _shfl_xor_sync_169;
                     dg_acc = dg_acc + tmp;
                     float _tmem_load_14[32];
                     asm volatile(
@@ -2522,72 +2592,72 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                     _tmem_load_14[30] = beta_s[t0 + 30] * _tmem_load_14[30];
                     px[31] = _tmem_load_14[31] * __uint_as_float(kpk[15] & 4294901760u);
                     _tmem_load_14[31] = beta_s[t0 + 31] * _tmem_load_14[31];
-                    float w16_72[16];
+                    float w16_2[16];
                     float _shfl_xor_sync_170 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? px[16] : px[0]), 16);
-                    w16_72[0] = (((lane_0 & 16) == 0) ? px[0] : px[16]) + _shfl_xor_sync_170;
+                    w16_2[0] = (((lane_0 & 16) == 0) ? px[0] : px[16]) + _shfl_xor_sync_170;
                     float _shfl_xor_sync_171 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? px[17] : px[1]), 16);
-                    w16_72[1] = (((lane_0 & 16) == 0) ? px[1] : px[17]) + _shfl_xor_sync_171;
+                    w16_2[1] = (((lane_0 & 16) == 0) ? px[1] : px[17]) + _shfl_xor_sync_171;
                     float _shfl_xor_sync_172 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? px[18] : px[2]), 16);
-                    w16_72[2] = (((lane_0 & 16) == 0) ? px[2] : px[18]) + _shfl_xor_sync_172;
+                    w16_2[2] = (((lane_0 & 16) == 0) ? px[2] : px[18]) + _shfl_xor_sync_172;
                     float _shfl_xor_sync_173 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? px[19] : px[3]), 16);
-                    w16_72[3] = (((lane_0 & 16) == 0) ? px[3] : px[19]) + _shfl_xor_sync_173;
+                    w16_2[3] = (((lane_0 & 16) == 0) ? px[3] : px[19]) + _shfl_xor_sync_173;
                     float _shfl_xor_sync_174 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? px[20] : px[4]), 16);
-                    w16_72[4] = (((lane_0 & 16) == 0) ? px[4] : px[20]) + _shfl_xor_sync_174;
+                    w16_2[4] = (((lane_0 & 16) == 0) ? px[4] : px[20]) + _shfl_xor_sync_174;
                     float _shfl_xor_sync_175 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? px[21] : px[5]), 16);
-                    w16_72[5] = (((lane_0 & 16) == 0) ? px[5] : px[21]) + _shfl_xor_sync_175;
+                    w16_2[5] = (((lane_0 & 16) == 0) ? px[5] : px[21]) + _shfl_xor_sync_175;
                     float _shfl_xor_sync_176 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? px[22] : px[6]), 16);
-                    w16_72[6] = (((lane_0 & 16) == 0) ? px[6] : px[22]) + _shfl_xor_sync_176;
+                    w16_2[6] = (((lane_0 & 16) == 0) ? px[6] : px[22]) + _shfl_xor_sync_176;
                     float _shfl_xor_sync_177 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? px[23] : px[7]), 16);
-                    w16_72[7] = (((lane_0 & 16) == 0) ? px[7] : px[23]) + _shfl_xor_sync_177;
+                    w16_2[7] = (((lane_0 & 16) == 0) ? px[7] : px[23]) + _shfl_xor_sync_177;
                     float _shfl_xor_sync_178 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? px[24] : px[8]), 16);
-                    w16_72[8] = (((lane_0 & 16) == 0) ? px[8] : px[24]) + _shfl_xor_sync_178;
+                    w16_2[8] = (((lane_0 & 16) == 0) ? px[8] : px[24]) + _shfl_xor_sync_178;
                     float _shfl_xor_sync_179 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? px[25] : px[9]), 16);
-                    w16_72[9] = (((lane_0 & 16) == 0) ? px[9] : px[25]) + _shfl_xor_sync_179;
+                    w16_2[9] = (((lane_0 & 16) == 0) ? px[9] : px[25]) + _shfl_xor_sync_179;
                     float _shfl_xor_sync_180 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? px[26] : px[10]), 16);
-                    w16_72[10] = (((lane_0 & 16) == 0) ? px[10] : px[26]) + _shfl_xor_sync_180;
+                    w16_2[10] = (((lane_0 & 16) == 0) ? px[10] : px[26]) + _shfl_xor_sync_180;
                     float _shfl_xor_sync_181 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? px[27] : px[11]), 16);
-                    w16_72[11] = (((lane_0 & 16) == 0) ? px[11] : px[27]) + _shfl_xor_sync_181;
+                    w16_2[11] = (((lane_0 & 16) == 0) ? px[11] : px[27]) + _shfl_xor_sync_181;
                     float _shfl_xor_sync_182 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? px[28] : px[12]), 16);
-                    w16_72[12] = (((lane_0 & 16) == 0) ? px[12] : px[28]) + _shfl_xor_sync_182;
+                    w16_2[12] = (((lane_0 & 16) == 0) ? px[12] : px[28]) + _shfl_xor_sync_182;
                     float _shfl_xor_sync_183 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? px[29] : px[13]), 16);
-                    w16_72[13] = (((lane_0 & 16) == 0) ? px[13] : px[29]) + _shfl_xor_sync_183;
+                    w16_2[13] = (((lane_0 & 16) == 0) ? px[13] : px[29]) + _shfl_xor_sync_183;
                     float _shfl_xor_sync_184 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? px[30] : px[14]), 16);
-                    w16_72[14] = (((lane_0 & 16) == 0) ? px[14] : px[30]) + _shfl_xor_sync_184;
+                    w16_2[14] = (((lane_0 & 16) == 0) ? px[14] : px[30]) + _shfl_xor_sync_184;
                     float _shfl_xor_sync_185 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 16) == 0) ? px[31] : px[15]), 16);
-                    w16_72[15] = (((lane_0 & 16) == 0) ? px[15] : px[31]) + _shfl_xor_sync_185;
-                    float w8_73[8];
-                    float _shfl_xor_sync_186 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_72[8] : w16_72[0]), 8);
-                    w8_73[0] = (((lane_0 & 8) == 0) ? w16_72[0] : w16_72[8]) + _shfl_xor_sync_186;
-                    float _shfl_xor_sync_187 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_72[9] : w16_72[1]), 8);
-                    w8_73[1] = (((lane_0 & 8) == 0) ? w16_72[1] : w16_72[9]) + _shfl_xor_sync_187;
-                    float _shfl_xor_sync_188 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_72[10] : w16_72[2]), 8);
-                    w8_73[2] = (((lane_0 & 8) == 0) ? w16_72[2] : w16_72[10]) + _shfl_xor_sync_188;
-                    float _shfl_xor_sync_189 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_72[11] : w16_72[3]), 8);
-                    w8_73[3] = (((lane_0 & 8) == 0) ? w16_72[3] : w16_72[11]) + _shfl_xor_sync_189;
-                    float _shfl_xor_sync_190 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_72[12] : w16_72[4]), 8);
-                    w8_73[4] = (((lane_0 & 8) == 0) ? w16_72[4] : w16_72[12]) + _shfl_xor_sync_190;
-                    float _shfl_xor_sync_191 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_72[13] : w16_72[5]), 8);
-                    w8_73[5] = (((lane_0 & 8) == 0) ? w16_72[5] : w16_72[13]) + _shfl_xor_sync_191;
-                    float _shfl_xor_sync_192 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_72[14] : w16_72[6]), 8);
-                    w8_73[6] = (((lane_0 & 8) == 0) ? w16_72[6] : w16_72[14]) + _shfl_xor_sync_192;
-                    float _shfl_xor_sync_193 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_72[15] : w16_72[7]), 8);
-                    w8_73[7] = (((lane_0 & 8) == 0) ? w16_72[7] : w16_72[15]) + _shfl_xor_sync_193;
-                    float w4_74[4];
-                    float _shfl_xor_sync_194 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 4) == 0) ? w8_73[4] : w8_73[0]), 4);
-                    w4_74[0] = (((lane_0 & 4) == 0) ? w8_73[0] : w8_73[4]) + _shfl_xor_sync_194;
-                    float _shfl_xor_sync_195 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 4) == 0) ? w8_73[5] : w8_73[1]), 4);
-                    w4_74[1] = (((lane_0 & 4) == 0) ? w8_73[1] : w8_73[5]) + _shfl_xor_sync_195;
-                    float _shfl_xor_sync_196 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 4) == 0) ? w8_73[6] : w8_73[2]), 4);
-                    w4_74[2] = (((lane_0 & 4) == 0) ? w8_73[2] : w8_73[6]) + _shfl_xor_sync_196;
-                    float _shfl_xor_sync_197 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 4) == 0) ? w8_73[7] : w8_73[3]), 4);
-                    w4_74[3] = (((lane_0 & 4) == 0) ? w8_73[3] : w8_73[7]) + _shfl_xor_sync_197;
-                    float w2_75[2];
-                    float _shfl_xor_sync_198 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 2) == 0) ? w4_74[2] : w4_74[0]), 2);
-                    w2_75[0] = (((lane_0 & 2) == 0) ? w4_74[0] : w4_74[2]) + _shfl_xor_sync_198;
-                    float _shfl_xor_sync_199 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 2) == 0) ? w4_74[3] : w4_74[1]), 2);
-                    w2_75[1] = (((lane_0 & 2) == 0) ? w4_74[1] : w4_74[3]) + _shfl_xor_sync_199;
-                    float _shfl_xor_sync_200 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 1) == 0) ? w2_75[1] : w2_75[0]), 1);
-                    tmp = (((lane_0 & 1) == 0) ? w2_75[0] : w2_75[1]) + _shfl_xor_sync_200;
+                    w16_2[15] = (((lane_0 & 16) == 0) ? px[15] : px[31]) + _shfl_xor_sync_185;
+                    float w8_2[8];
+                    float _shfl_xor_sync_186 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_2[8] : w16_2[0]), 8);
+                    w8_2[0] = (((lane_0 & 8) == 0) ? w16_2[0] : w16_2[8]) + _shfl_xor_sync_186;
+                    float _shfl_xor_sync_187 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_2[9] : w16_2[1]), 8);
+                    w8_2[1] = (((lane_0 & 8) == 0) ? w16_2[1] : w16_2[9]) + _shfl_xor_sync_187;
+                    float _shfl_xor_sync_188 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_2[10] : w16_2[2]), 8);
+                    w8_2[2] = (((lane_0 & 8) == 0) ? w16_2[2] : w16_2[10]) + _shfl_xor_sync_188;
+                    float _shfl_xor_sync_189 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_2[11] : w16_2[3]), 8);
+                    w8_2[3] = (((lane_0 & 8) == 0) ? w16_2[3] : w16_2[11]) + _shfl_xor_sync_189;
+                    float _shfl_xor_sync_190 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_2[12] : w16_2[4]), 8);
+                    w8_2[4] = (((lane_0 & 8) == 0) ? w16_2[4] : w16_2[12]) + _shfl_xor_sync_190;
+                    float _shfl_xor_sync_191 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_2[13] : w16_2[5]), 8);
+                    w8_2[5] = (((lane_0 & 8) == 0) ? w16_2[5] : w16_2[13]) + _shfl_xor_sync_191;
+                    float _shfl_xor_sync_192 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_2[14] : w16_2[6]), 8);
+                    w8_2[6] = (((lane_0 & 8) == 0) ? w16_2[6] : w16_2[14]) + _shfl_xor_sync_192;
+                    float _shfl_xor_sync_193 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 8) == 0) ? w16_2[15] : w16_2[7]), 8);
+                    w8_2[7] = (((lane_0 & 8) == 0) ? w16_2[7] : w16_2[15]) + _shfl_xor_sync_193;
+                    float w4_2[4];
+                    float _shfl_xor_sync_194 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 4) == 0) ? w8_2[4] : w8_2[0]), 4);
+                    w4_2[0] = (((lane_0 & 4) == 0) ? w8_2[0] : w8_2[4]) + _shfl_xor_sync_194;
+                    float _shfl_xor_sync_195 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 4) == 0) ? w8_2[5] : w8_2[1]), 4);
+                    w4_2[1] = (((lane_0 & 4) == 0) ? w8_2[1] : w8_2[5]) + _shfl_xor_sync_195;
+                    float _shfl_xor_sync_196 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 4) == 0) ? w8_2[6] : w8_2[2]), 4);
+                    w4_2[2] = (((lane_0 & 4) == 0) ? w8_2[2] : w8_2[6]) + _shfl_xor_sync_196;
+                    float _shfl_xor_sync_197 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 4) == 0) ? w8_2[7] : w8_2[3]), 4);
+                    w4_2[3] = (((lane_0 & 4) == 0) ? w8_2[3] : w8_2[7]) + _shfl_xor_sync_197;
+                    float w2_2[2];
+                    float _shfl_xor_sync_198 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 2) == 0) ? w4_2[2] : w4_2[0]), 2);
+                    w2_2[0] = (((lane_0 & 2) == 0) ? w4_2[0] : w4_2[2]) + _shfl_xor_sync_198;
+                    float _shfl_xor_sync_199 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 2) == 0) ? w4_2[3] : w4_2[1]), 2);
+                    w2_2[1] = (((lane_0 & 2) == 0) ? w4_2[1] : w4_2[3]) + _shfl_xor_sync_199;
+                    float _shfl_xor_sync_200 = __shfl_xor_sync(0xFFFFFFFF, (((lane_0 & 1) == 0) ? w2_2[1] : w2_2[0]), 1);
+                    tmp = (((lane_0 & 1) == 0) ? w2_2[0] : w2_2[1]) + _shfl_xor_sync_200;
                     db_acc = db_acc + tmp;
                     dg_acc = __fmaf_rn(beta_s[t0 + lane_0], tmp, dg_acc);
                     float _tmem_load_15[32];
@@ -3223,63 +3293,71 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                             }
                             asm volatile("tcgen05.fence::before_thread_sync;");
                             asm volatile("barrier.sync 1, 256;" ::: "memory");
-                            int t_0 = tid_1 >> 2;
-                            int d0_1 = (tid_1 & 3) * 32;
+                            int t_0 = tid_1 >> 3;
+                            int t1_0 = t_0 + 32;
+                            int c0_0 = tid_1 & 7;
                             if (t_0 < clen) {
-                                long long base_1 = (long long)(trow + t_0) * (long long)dqk_tstride + (long long)(hq * 128 + d0_1);
-                                int chunk_0_1 = d0_1 >> 3 ^ t_0 & 7;
-                                unsigned int q0_1[4];
+                                long long base_1 = (long long)(trow + t_0) * (long long)dqk_tstride + (long long)(hq * 128 + c0_0 * 8);
+                                int chunk_2 = c0_0 ^ t_0 & 7;
+                                unsigned int q0_1_2[4];
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                    : "=r"(*reinterpret_cast<uint32_t*>(&q0_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1[(0) + 3]))
-                                    : "r"(stage_dq_addr + (unsigned int)(t_0 * 256 + (chunk_0_1 << 4))));
-                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dq + base_1))[0] = reinterpret_cast<int4*>(q0_1)[0];
-                                int chunk_1_1 = (d0_1 >> 3) + 1 ^ t_0 & 7;
-                                unsigned int q1_1[4];
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&q0_1_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1_2[(0) + 3]))
+                                    : "r"(stage_dq_addr + (unsigned int)(t_0 * 256 + (chunk_2 << 4))));
+                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dq + base_1))[0] = reinterpret_cast<int4*>(q0_1_2)[0];
+                                int chunk_3 = c0_0 + 8 ^ t_0 & 7;
+                                unsigned int q0_1_3[4];
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                    : "=r"(*reinterpret_cast<uint32_t*>(&q1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&q1_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q1_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q1_1[(0) + 3]))
-                                    : "r"(stage_dq_addr + (unsigned int)(t_0 * 256 + (chunk_1_1 << 4))));
-                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dq + (base_1 + 8)))[0] = reinterpret_cast<int4*>(q1_1)[0];
-                                int chunk_2_1 = (d0_1 >> 3) + 2 ^ t_0 & 7;
-                                unsigned int q2_1[4];
-                                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                    : "=r"(*reinterpret_cast<uint32_t*>(&q2_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&q2_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q2_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q2_1[(0) + 3]))
-                                    : "r"(stage_dq_addr + (unsigned int)(t_0 * 256 + (chunk_2_1 << 4))));
-                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dq + (base_1 + 16)))[0] = reinterpret_cast<int4*>(q2_1)[0];
-                                int chunk_3_1 = (d0_1 >> 3) + 3 ^ t_0 & 7;
-                                unsigned int q3_1[4];
-                                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                    : "=r"(*reinterpret_cast<uint32_t*>(&q3_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&q3_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q3_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q3_1[(0) + 3]))
-                                    : "r"(stage_dq_addr + (unsigned int)(t_0 * 256 + (chunk_3_1 << 4))));
-                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dq + (base_1 + 24)))[0] = reinterpret_cast<int4*>(q3_1)[0];
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&q0_1_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1_3[(0) + 3]))
+                                    : "r"(stage_dq_addr + (unsigned int)(t_0 * 256 + (chunk_3 << 4))));
+                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dq + (base_1 + 64)))[0] = reinterpret_cast<int4*>(q0_1_3)[0];
                             }
-                            int t_2 = tid_1 >> 2;
-                            int d0_3 = (tid_1 & 3) * 32;
-                            if (t_2 < clen) {
-                                long long base_2 = (long long)(trow + t_2) * (long long)dqk_tstride + (long long)(hq * 128 + d0_3);
-                                int chunk_0_2 = d0_3 >> 3 ^ t_2 & 7;
-                                unsigned int q0_2[4];
+                            if (t1_0 < clen) {
+                                long long base1_1 = (long long)(trow + t1_0) * (long long)dqk_tstride + (long long)(hq * 128 + c0_0 * 8);
+                                int chunk1_2 = c0_0 ^ t1_0 & 7;
+                                unsigned int q2_3_2[4];
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                    : "=r"(*reinterpret_cast<uint32_t*>(&q0_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&q0_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q0_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q0_2[(0) + 3]))
-                                    : "r"(stage_dk_addr + (unsigned int)(t_2 * 256 + (chunk_0_2 << 4))));
-                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dk + base_2))[0] = reinterpret_cast<int4*>(q0_2)[0];
-                                int chunk_1_2 = (d0_3 >> 3) + 1 ^ t_2 & 7;
-                                unsigned int q1_2[4];
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&q2_3_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&q2_3_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q2_3_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q2_3_2[(0) + 3]))
+                                    : "r"(stage_dq_addr + (unsigned int)(t1_0 * 256 + (chunk1_2 << 4))));
+                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dq + base1_1))[0] = reinterpret_cast<int4*>(q2_3_2)[0];
+                                int chunk1_3 = c0_0 + 8 ^ t1_0 & 7;
+                                unsigned int q2_3_3[4];
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                    : "=r"(*reinterpret_cast<uint32_t*>(&q1_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&q1_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q1_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q1_2[(0) + 3]))
-                                    : "r"(stage_dk_addr + (unsigned int)(t_2 * 256 + (chunk_1_2 << 4))));
-                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dk + (base_2 + 8)))[0] = reinterpret_cast<int4*>(q1_2)[0];
-                                int chunk_2_2 = (d0_3 >> 3) + 2 ^ t_2 & 7;
-                                unsigned int q2_2[4];
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&q2_3_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&q2_3_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q2_3_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q2_3_3[(0) + 3]))
+                                    : "r"(stage_dq_addr + (unsigned int)(t1_0 * 256 + (chunk1_3 << 4))));
+                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dq + (base1_1 + 64)))[0] = reinterpret_cast<int4*>(q2_3_3)[0];
+                            }
+                            int t_1 = tid_1 >> 3;
+                            int t1_1 = t_1 + 32;
+                            int c0_1 = tid_1 & 7;
+                            if (t_1 < clen) {
+                                long long base_2 = (long long)(trow + t_1) * (long long)dqk_tstride + (long long)(hq * 128 + c0_1 * 8);
+                                int chunk_4 = c0_1 ^ t_1 & 7;
+                                unsigned int q0_1_4[4];
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                    : "=r"(*reinterpret_cast<uint32_t*>(&q2_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&q2_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q2_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q2_2[(0) + 3]))
-                                    : "r"(stage_dk_addr + (unsigned int)(t_2 * 256 + (chunk_2_2 << 4))));
-                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dk + (base_2 + 16)))[0] = reinterpret_cast<int4*>(q2_2)[0];
-                                int chunk_3_2 = (d0_3 >> 3) + 3 ^ t_2 & 7;
-                                unsigned int q3_2[4];
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&q0_1_4[0])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1_4[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1_4[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1_4[(0) + 3]))
+                                    : "r"(stage_dk_addr + (unsigned int)(t_1 * 256 + (chunk_4 << 4))));
+                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dk + base_2))[0] = reinterpret_cast<int4*>(q0_1_4)[0];
+                                int chunk_5 = c0_1 + 8 ^ t_1 & 7;
+                                unsigned int q0_1_5[4];
                                 asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                    : "=r"(*reinterpret_cast<uint32_t*>(&q3_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&q3_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q3_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q3_2[(0) + 3]))
-                                    : "r"(stage_dk_addr + (unsigned int)(t_2 * 256 + (chunk_3_2 << 4))));
-                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dk + (base_2 + 24)))[0] = reinterpret_cast<int4*>(q3_2)[0];
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&q0_1_5[0])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1_5[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1_5[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q0_1_5[(0) + 3]))
+                                    : "r"(stage_dk_addr + (unsigned int)(t_1 * 256 + (chunk_5 << 4))));
+                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dk + (base_2 + 64)))[0] = reinterpret_cast<int4*>(q0_1_5)[0];
+                            }
+                            if (t1_1 < clen) {
+                                long long base1_2 = (long long)(trow + t1_1) * (long long)dqk_tstride + (long long)(hq * 128 + c0_1 * 8);
+                                int chunk1_4 = c0_1 ^ t1_1 & 7;
+                                unsigned int q2_3_4[4];
+                                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&q2_3_4[0])), "=r"(*reinterpret_cast<uint32_t*>(&q2_3_4[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q2_3_4[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q2_3_4[(0) + 3]))
+                                    : "r"(stage_dk_addr + (unsigned int)(t1_1 * 256 + (chunk1_4 << 4))));
+                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dk + base1_2))[0] = reinterpret_cast<int4*>(q2_3_4)[0];
+                                int chunk1_5 = c0_1 + 8 ^ t1_1 & 7;
+                                unsigned int q2_3_5[4];
+                                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&q2_3_5[0])), "=r"(*reinterpret_cast<uint32_t*>(&q2_3_5[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q2_3_5[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q2_3_5[(0) + 3]))
+                                    : "r"(stage_dk_addr + (unsigned int)(t1_1 * 256 + (chunk1_5 << 4))));
+                                reinterpret_cast<int4*>(reinterpret_cast<unsigned int*>(dk + (base1_2 + 64)))[0] = reinterpret_cast<int4*>(q2_3_5)[0];
                             }
                         }
                     }
@@ -3305,6 +3383,7 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
             unsigned int _phase_tk_empty = 1;
             unsigned int _phase_a_committed_0 = 1;
             unsigned int _phase_b_committed_0 = 1;
+            unsigned int _phase_dv_stored_0 = 1;
             unsigned int _phase_d_committed_0 = 1;
             unsigned int _phase_e_committed_0 = 1;
             unsigned int _phase_e_drained_0 = 1;
@@ -3339,23 +3418,23 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                         drawn = (unsigned int)(u_1 + grid_l);
                     }
                     unsigned int g_1 = (unsigned int)u_1;
-                    int chunk_4 = g_1 / (unsigned int)num_qk_heads;
+                    int chunk_6 = g_1 / (unsigned int)num_qk_heads;
                     int hq_1 = g_1 % (unsigned int)num_qk_heads;
-                    int row0_1 = chunk_4 * 64;
-                    int trow_1 = chunk_bos[chunk_4];
-                    int clen_1 = chunk_len[chunk_4];
+                    int row0_1 = chunk_6 * 64;
+                    int trow_1 = chunk_bos[chunk_6];
+                    int clen_1 = chunk_len[chunk_6];
                     #pragma unroll 1
                     for (int hl_1 = 0; hl_1 < r_l; hl_1++) {
                         int hv_1 = hq_1 * r_l + hl_1;
-                        int hrow0 = (chunk_4 * num_heads + hv_1) * 128;
+                        int hrow0 = (chunk_6 * num_heads + hv_1) * 128;
                         mbarrier_wait(a_committed_addr, _phase_a_committed_0);
                         _phase_a_committed_0 ^= 1;
                         mbarrier_arrive_expect_tx(dovn_full_addr, 32768);
                         #pragma unroll
                         for (int seg_1 = 0; seg_1 < 2; seg_1++) {
-                            int c0 = seg_1 * 64;
-                            tma_3d_gmem2smem(smem_v3_addr + (unsigned int)(seg_1 * 8192), (&do_tma), c0, hv_1, trow_1, dovn_full_addr);
-                            tma_3d_gmem2smem(smem_v4_addr + (unsigned int)(seg_1 * 8192), (&vn_tma), c0, hv_1, row0_1, dovn_full_addr);
+                            int c0_2 = seg_1 * 64;
+                            tma_3d_gmem2smem(smem_v0_addr_2 + (unsigned int)(seg_1 * 8192), (&do_tma), c0_2, hv_1, trow_1, dovn_full_addr);
+                            tma_3d_gmem2smem(smem_v0_addr_3 + (unsigned int)(seg_1 * 8192), (&vn_tma), c0_2, hv_1, row0_1, dovn_full_addr);
                         }
                         mbarrier_wait(b_committed_addr, _phase_b_committed_0);
                         _phase_b_committed_0 ^= 1;
@@ -3365,38 +3444,54 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                             int c1 = seg_2 * 64;
                             tma_2d_gmem2smem(h_p_addr + (unsigned int)(seg_2 * 16384), (&h_tma), c1, hrow0, h_full_addr);
                         }
+                        mbarrier_arrive_expect_tx(dh_full_addr, 32768);
+                        #pragma unroll
+                        for (int seg_3 = 0; seg_3 < 2; seg_3++) {
+                            int c4 = seg_3 * 64;
+                            tma_2d_gmem2smem(dh_p_addr + (unsigned int)(seg_3 * 16384), (&dh_tma), c4, hrow0, dh_full_addr);
+                        }
+                        mbarrier_wait(dv_stored_addr, _phase_dv_stored_0);
+                        _phase_dv_stored_0 ^= 1;
+                        mbarrier_arrive_expect_tx(v_full_addr, 16384);
+                        mbarrier_arrive_expect_tx(dvn_full_addr, 16384);
+                        #pragma unroll
+                        for (int seg_4 = 0; seg_4 < 2; seg_4++) {
+                            int c4_1 = seg_4 * 64;
+                            tma_3d_gmem2smem(smem_v0_addr_1 + (unsigned int)(seg_4 * 8192), (&v_tma), c4_1, hv_1, trow_1, v_full_addr);
+                            tma_3d_gmem2smem(smem_v0_addr_4 + (unsigned int)(seg_4 * 8192), (&dvn_tma), c4_1, hv_1, row0_1, dvn_full_addr);
+                        }
                         mbarrier_wait(d_committed_addr, _phase_d_committed_0);
                         _phase_d_committed_0 ^= 1;
                         mbarrier_arrive_expect_tx(akk_full_addr, 8192);
                         tma_3d_gmem2smem(akk_s_addr, (&akk_tma), 0, hv_1, row0_1, akk_full_addr);
                         mbarrier_wait(e_committed_addr, _phase_e_committed_0);
                         _phase_e_committed_0 ^= 1;
-                        mbarrier_arrive_expect_tx(dh_full_addr, 32768);
-                        #pragma unroll
-                        for (int seg_3 = 0; seg_3 < 2; seg_3++) {
-                            int c2 = seg_3 * 64;
-                            tma_2d_gmem2smem(dh_p_addr + (unsigned int)(seg_3 * 16384), (&dh_tma), c2, hrow0, dh_full_addr);
+                        if (hl_1 == r_l - 1) {
+                            int un = (int)drawn;
+                            if (un < ngroups_l) {
+                                int chunk_n = drawn / (unsigned int)num_qk_heads;
+                                int hq_n = drawn % (unsigned int)num_qk_heads;
+                                int trow_n = chunk_bos[chunk_n];
+                                #pragma unroll
+                                for (int seg_5 = 0; seg_5 < 2; seg_5++) {
+                                    int c5 = seg_5 * 64;
+                                    asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&q_tma))), "r"((int)(c5)), "r"((int)(hq_n)), "r"((int)(trow_n)) : "memory");
+                                    asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile [%0, {%1, %2, %3}];" :: "l"((uint64_t)((&k_tma))), "r"((int)(c5)), "r"((int)(hq_n)), "r"((int)(trow_n)) : "memory");
+                                }
+                            }
                         }
                         mbarrier_wait(e_drained_addr, _phase_e_drained_0);
                         _phase_e_drained_0 ^= 1;
                         if (hl_1 == 0) {
                             mbarrier_arrive_expect_tx(qk_full_addr, 32768);
                             #pragma unroll
-                            for (int seg_4 = 0; seg_4 < 2; seg_4++) {
-                                int c3 = seg_4 * 64;
-                                tma_3d_gmem2smem(smem_v0_addr + (unsigned int)(seg_4 * 8192), (&q_tma), c3, hq_1, trow_1, qk_full_addr);
-                                tma_3d_gmem2smem(smem_v1_addr + (unsigned int)(seg_4 * 8192), (&k_tma), c3, hq_1, trow_1, qk_full_addr);
+                            for (int seg_6 = 0; seg_6 < 2; seg_6++) {
+                                int c3 = seg_6 * 64;
+                                tma_3d_gmem2smem(smem_v0_addr + (unsigned int)(seg_6 * 8192), (&q_tma), c3, hq_1, trow_1, qk_full_addr);
+                                tma_3d_gmem2smem(smem_v0_addr_0 + (unsigned int)(seg_6 * 8192), (&k_tma), c3, hq_1, trow_1, qk_full_addr);
                             }
                         } else {
                             mbarrier_arrive(qk_full_addr);
-                        }
-                        mbarrier_arrive_expect_tx(v_full_addr, 16384);
-                        mbarrier_arrive_expect_tx(dvn_full_addr, 16384);
-                        #pragma unroll
-                        for (int seg_5 = 0; seg_5 < 2; seg_5++) {
-                            int c4 = seg_5 * 64;
-                            tma_3d_gmem2smem(smem_v2_addr + (unsigned int)(seg_5 * 8192), (&v_tma), c4, hv_1, trow_1, v_full_addr);
-                            tma_3d_gmem2smem(smem_v5_addr + (unsigned int)(seg_5 * 8192), (&dvn_tma), c4, hv_1, row0_1, dvn_full_addr);
                         }
                     }
                 }
@@ -3414,10 +3509,11 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
             unsigned int _phase_dovn_full_0 = 0;
             unsigned int _phase_dvn_full_0_1 = 0;
             unsigned int _phase_v_full_0_1 = 0;
-            unsigned int _phase_qk_full_0_1 = 0;
             unsigned int _phase_e_drained_0_1 = 1;
-            unsigned int _phase_a_drained_0 = 0;
+            unsigned int _phase_daq_drained_0 = 0;
             unsigned int _phase_akk_full_0 = 0;
+            unsigned int _phase_a_drained_0 = 0;
+            unsigned int _phase_qk_full_0_1 = 0;
             unsigned int _phase_b_drained_0 = 0;
             unsigned int _phase_c_drained_0 = 0;
             unsigned int _phase_d_drained_0 = 0;
@@ -3437,11 +3533,11 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                         break;
                     }
                     unsigned int g_2 = (unsigned int)u_2;
-                    int chunk_5 = g_2 / (unsigned int)num_qk_heads;
+                    int chunk_7 = g_2 / (unsigned int)num_qk_heads;
                     int hq_2 = g_2 % (unsigned int)num_qk_heads;
-                    int row0_2 = chunk_5 * 64;
-                    int trow_2 = chunk_bos[chunk_5];
-                    int clen_2 = chunk_len[chunk_5];
+                    int row0_2 = chunk_7 * 64;
+                    int trow_2 = chunk_bos[chunk_7];
+                    int clen_2 = chunk_len[chunk_7];
                     #pragma unroll 1
                     for (int hl_2 = 0; hl_2 < r_m; hl_2++) {
                         mbarrier_wait(h_full_addr, _phase_h_full_0_1);
@@ -3454,8 +3550,6 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                         _phase_dvn_full_0_1 ^= 1;
                         mbarrier_wait(v_full_addr, _phase_v_full_0_1);
                         _phase_v_full_0_1 ^= 1;
-                        mbarrier_wait(qk_full_addr, _phase_qk_full_0_1);
-                        _phase_qk_full_0_1 ^= 1;
                         if (clen_2 < 64) {
                             float zq[4];
                             zq[0] = 0.0f;
@@ -3468,7 +3562,7 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                                 int start = p * 8192 + clen_2 * 128;
                                 #pragma unroll 8
                                 for (int idx = 0; idx < n16; idx++) {
-                                    asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(smem_v8_addr + (unsigned int)(start + idx * 16)), "f"(zq[0]), "f"(zq[1]), "f"(zq[2]), "f"(zq[3]) : "memory");
+                                    asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"(smem_v6_addr_1 + (unsigned int)(start + idx * 16)), "f"(zq[0]), "f"(zq[1]), "f"(zq[2]), "f"(zq[3]) : "memory");
                                 }
                             }
                             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -3478,10 +3572,10 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                         int _mma_a_lo_0 = ((h_k_addr) >> 4) & 0x7FFF;
-                        int _mma_b_lo_0 = ((smem_v11_addr) >> 4) & 0x7FFF;
+                        int _mma_b_lo_0 = ((smem_v6_addr_2) >> 4) & 0x7FFF;
 #else
                         int _mma_a_lo_0 = ((h_k_addr) >> 4) & 0x3FFF;
-                        int _mma_b_lo_0 = ((smem_v11_addr) >> 4) & 0x3FFF;
+                        int _mma_b_lo_0 = ((smem_v6_addr_2) >> 4) & 0x3FFF;
 #endif
                         asm volatile(
                     "{\n\t"
@@ -3539,10 +3633,10 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                     :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"(tmem_acc_dq), "r"(0) : "memory");
 #if __CUDA_ARCH__ == 1070
                         int _mma_a_lo_1 = ((dh_k_addr) >> 4) & 0x7FFF;
-                        int _mma_b_lo_1 = ((smem_v12_addr) >> 4) & 0x7FFF;
+                        int _mma_b_lo_1 = ((smem_v6_addr_3) >> 4) & 0x7FFF;
 #else
                         int _mma_a_lo_1 = ((dh_k_addr) >> 4) & 0x3FFF;
-                        int _mma_b_lo_1 = ((smem_v12_addr) >> 4) & 0x3FFF;
+                        int _mma_b_lo_1 = ((smem_v6_addr_3) >> 4) & 0x3FFF;
 #endif
                         asm volatile(
                     "{\n\t"
@@ -3599,9 +3693,9 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                     "}\n"
                     :: "r"(_mma_a_lo_1), "r"(_mma_b_lo_1), "r"(tmem_acc_dk), "r"(0) : "memory");
 #if __CUDA_ARCH__ == 1070
-                        int _mma_b_lo_2 = ((smem_v13_addr) >> 4) & 0x7FFF;
+                        int _mma_b_lo_2 = ((smem_v6_addr_4) >> 4) & 0x7FFF;
 #else
-                        int _mma_b_lo_2 = ((smem_v13_addr) >> 4) & 0x3FFF;
+                        int _mma_b_lo_2 = ((smem_v6_addr_4) >> 4) & 0x3FFF;
 #endif
                         asm volatile(
                     "{\n\t"
@@ -3658,9 +3752,9 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                     "}\n"
                     :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_2), "r"(tmem_acc_dw), "r"(0) : "memory");
 #if __CUDA_ARCH__ == 1070
-                        int _smem_desc_lo_0 = ((smem_v8_addr) >> 4) & 0x7FFF;
+                        int _smem_desc_lo_0 = ((smem_v6_addr_1) >> 4) & 0x7FFF;
 #else
-                        int _smem_desc_lo_0 = ((smem_v8_addr) >> 4) & 0x3FFF;
+                        int _smem_desc_lo_0 = ((smem_v6_addr_1) >> 4) & 0x3FFF;
 #endif
                         asm volatile(
                     "{\n\t"
@@ -3772,16 +3866,16 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                     :: "r"(_mma_b_lo_0), "r"(_mma_b_lo_1), "r"(tmem_acc_daq), "r"(0) : "memory");
                         tcgen05_commit(a_ready_addr);
                         tcgen05_commit(a_committed_addr);
-                        mbarrier_wait(a_drained_addr, _phase_a_drained_0);
-                        _phase_a_drained_0 ^= 1;
+                        mbarrier_wait(daq_drained_addr, _phase_daq_drained_0);
+                        _phase_daq_drained_0 ^= 1;
                         mbarrier_wait(akk_full_addr, _phase_akk_full_0);
                         _phase_akk_full_0 ^= 1;
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
-                        int _mma_a_lo_2 = (((smem_v14_addr) >> 4) & 0x7FFF) | 0x2000000;
+                        int _mma_a_lo_2 = (((smem_v9_addr_1) >> 4) & 0x7FFF) | 0x2000000;
                         int _mma_b_lo_3 = (((smem_v21_addr) >> 4) & 0x7FFF) | 0x2000000;
 #else
-                        int _mma_a_lo_2 = (((smem_v14_addr) >> 4) & 0x3FFF) | 0x2000000;
+                        int _mma_a_lo_2 = (((smem_v9_addr_1) >> 4) & 0x3FFF) | 0x2000000;
                         int _mma_b_lo_3 = (((smem_v21_addr) >> 4) & 0x3FFF) | 0x2000000;
 #endif
                         asm volatile(
@@ -3818,6 +3912,10 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_mma_a_lo_2), "r"(_mma_b_lo_3), "r"(tmem_acc_dvb), "r"(0) : "memory");
+                        tcgen05_commit(b1_ready_addr);
+                        mbarrier_wait(a_drained_addr, _phase_a_drained_0);
+                        _phase_a_drained_0 ^= 1;
+                        asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_1 = ((dwbt_k_addr) >> 4) & 0x7FFF;
 #else
@@ -3859,10 +3957,10 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                     :: "r"(_smem_desc_lo_1), "r"(_mma_b_lo_3), "r"(tmem_acc_dkgb), "r"(0) : "memory");
 #if __CUDA_ARCH__ == 1070
                         int _smem_desc_lo_2 = (((dwbt_mn_addr) >> 4) & 0x7FFF) | 0x4000000;
-                        int _smem_desc_lo_3 = (((smem_v24_addr) >> 4) & 0x7FFF) | 0x2000000;
+                        int _smem_desc_lo_3 = (((smem_v6_addr_5) >> 4) & 0x7FFF) | 0x2000000;
 #else
                         int _smem_desc_lo_2 = (((dwbt_mn_addr) >> 4) & 0x3FFF) | 0x4000000;
-                        int _smem_desc_lo_3 = (((smem_v24_addr) >> 4) & 0x3FFF) | 0x2000000;
+                        int _smem_desc_lo_3 = (((smem_v6_addr_5) >> 4) & 0x3FFF) | 0x2000000;
 #endif
                         asm volatile(
                     "{\n\t"
@@ -3920,104 +4018,15 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                     :: "r"(_smem_desc_lo_2), "r"(_smem_desc_lo_3), "r"(tmem_acc_da), "r"(1) : "memory");
                         tcgen05_commit(b_ready_addr);
                         tcgen05_commit(b_committed_addr);
-                        mbarrier_wait(b_drained_addr, _phase_b_drained_0);
-                        _phase_b_drained_0 ^= 1;
+                        mbarrier_wait(qk_full_addr, _phase_qk_full_0_1);
+                        _phase_qk_full_0_1 ^= 1;
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
-                        int _smem_desc_lo_4 = ((smem_v27_addr) >> 4) & 0x7FFF;
-                        int _smem_desc_lo_5 = ((smem_v20_addr) >> 4) & 0x7FFF;
+                        int _mma_a_lo_3e = (((smem_v9_addr_0) >> 4) & 0x7FFF) | 0x2000000;
+                        int _smem_desc_lo_4 = (((smem_v20_addr_2) >> 4) & 0x7FFF) | 0x2000000;
 #else
-                        int _smem_desc_lo_4 = ((smem_v27_addr) >> 4) & 0x3FFF;
-                        int _smem_desc_lo_5 = ((smem_v20_addr) >> 4) & 0x3FFF;
-#endif
-                        asm volatile(
-                    "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    ""
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 68158608;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_smem_desc_lo_4), "r"(_smem_desc_lo_5), "r"(tmem_acc_da1), "r"(0) : "memory");
-                        tcgen05_commit(c_ready_addr);
-                        mbarrier_wait(c_drained_addr, _phase_c_drained_0);
-                        _phase_c_drained_0 ^= 1;
-                        asm volatile("tcgen05.fence::after_thread_sync;");
-#if __CUDA_ARCH__ == 1070
-                        int _smem_desc_lo_6 = (((smem_v29_addr) >> 4) & 0x7FFF) | 0x2000000;
-#else
-                        int _smem_desc_lo_6 = (((smem_v29_addr) >> 4) & 0x3FFF) | 0x2000000;
-#endif
-                        asm volatile(
-                    "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
-                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
-                    ".reg .b64 da, db;\n\t"
-                    ""
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 adhi, 0x40004040;\n\t"
-                    "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 68256912;\n\t"
-                    "mov.b32 alo, %0;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
-                    "mov.b64 da, {alo, adhi};\n\t"
-                    "mov.b64 db, {blo, bdhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(_mma_b_lo_3), "r"(_smem_desc_lo_6), "r"(tmem_acc_da2), "r"(0) : "memory");
-                        tcgen05_commit(d_ready_addr);
-                        tcgen05_commit(d_committed_addr);
-                        mbarrier_wait(d_drained_addr, _phase_d_drained_0);
-                        _phase_d_drained_0 ^= 1;
-                        asm volatile("tcgen05.fence::after_thread_sync;");
-#if __CUDA_ARCH__ == 1070
-                        int _mma_a_lo_3 = (((smem_v10_addr) >> 4) & 0x7FFF) | 0x2000000;
-                        int _smem_desc_lo_7 = (((smem_v30_addr) >> 4) & 0x7FFF) | 0x2000000;
-#else
-                        int _mma_a_lo_3 = (((smem_v10_addr) >> 4) & 0x3FFF) | 0x2000000;
-                        int _smem_desc_lo_7 = (((smem_v30_addr) >> 4) & 0x3FFF) | 0x2000000;
+                        int _mma_a_lo_3e = (((smem_v9_addr_0) >> 4) & 0x3FFF) | 0x2000000;
+                        int _smem_desc_lo_4 = (((smem_v20_addr_2) >> 4) & 0x3FFF) | 0x2000000;
 #endif
                         asm volatile(
                     "{\n\t"
@@ -4052,13 +4061,108 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_mma_a_lo_3), "r"(_smem_desc_lo_7), "r"(tmem_acc_dq), "r"(1) : "memory");
+                    :: "r"(_mma_a_lo_3e), "r"(_smem_desc_lo_4), "r"(tmem_acc_dq), "r"(1) : "memory");
+                        tcgen05_commit(e1_ready_addr);
+                        mbarrier_wait(b_drained_addr, _phase_b_drained_0);
+                        _phase_b_drained_0 ^= 1;
+                        asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
-                        int _smem_desc_lo_8 = (((smem_v9_addr) >> 4) & 0x7FFF) | 0x2000000;
-                        int _smem_desc_lo_9 = (((smem_v31_addr) >> 4) & 0x7FFF) | 0x2000000;
+                        int _smem_desc_lo_5 = ((smem_v20_addr_0) >> 4) & 0x7FFF;
+                        int _smem_desc_lo_6 = ((smem_v20_addr) >> 4) & 0x7FFF;
 #else
+                        int _smem_desc_lo_5 = ((smem_v20_addr_0) >> 4) & 0x3FFF;
+                        int _smem_desc_lo_6 = ((smem_v20_addr) >> 4) & 0x3FFF;
+#endif
+                        asm volatile(
+                    "{\n\t"
+                    ".reg .pred p0, p1;\n\t"
+                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
+                    ".reg .b64 da, db;\n\t"
+                    ""
+                    "setp.ne.b32 p0, %3, 0;\n\t"
+                    "setp.ne.b32 p1, 1, 0;\n\t"
+                    ""
+                    "mov.b32 adhi, 0x40004040;\n\t"
+                    "mov.b32 bdhi, 0x40004040;\n\t"
+                    "mov.b32 id, 68158608;\n\t"
+                    "mov.b32 alo, %0;\n\t"
+                    "mov.b32 blo, %1;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "}\n"
+                    :: "r"(_smem_desc_lo_5), "r"(_smem_desc_lo_6), "r"(tmem_acc_da1), "r"(0) : "memory");
+                        tcgen05_commit(c_ready_addr);
+                        mbarrier_wait(c_drained_addr, _phase_c_drained_0);
+                        _phase_c_drained_0 ^= 1;
+                        asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
+                        int _smem_desc_lo_7 = (((smem_v21_addr_0) >> 4) & 0x7FFF) | 0x2000000;
+#else
+                        int _smem_desc_lo_7 = (((smem_v21_addr_0) >> 4) & 0x3FFF) | 0x2000000;
+#endif
+                        asm volatile(
+                    "{\n\t"
+                    ".reg .pred p0, p1;\n\t"
+                    ".reg .b32 adhi, bdhi, alo, blo, id;\n\t"
+                    ".reg .b64 da, db;\n\t"
+                    ""
+                    "setp.ne.b32 p0, %3, 0;\n\t"
+                    "setp.ne.b32 p1, 1, 0;\n\t"
+                    ""
+                    "mov.b32 adhi, 0x40004040;\n\t"
+                    "mov.b32 bdhi, 0x40004040;\n\t"
+                    "mov.b32 id, 68256912;\n\t"
+                    "mov.b32 alo, %0;\n\t"
+                    "mov.b32 blo, %1;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p0;\n\t"
+                    "add.u32 alo, alo, 128;\n\t"
+                    "add.u32 blo, blo, 128;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "add.u32 alo, alo, 128;\n\t"
+                    "add.u32 blo, blo, 128;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "add.u32 alo, alo, 128;\n\t"
+                    "add.u32 blo, blo, 128;\n\t"
+                    "mov.b64 da, {alo, adhi};\n\t"
+                    "mov.b64 db, {blo, bdhi};\n\t"
+                    "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
+                    "}\n"
+                    :: "r"(_mma_b_lo_3), "r"(_smem_desc_lo_7), "r"(tmem_acc_da2), "r"(0) : "memory");
+                        tcgen05_commit(d_ready_addr);
+                        tcgen05_commit(d_committed_addr);
+                        mbarrier_wait(d_drained_addr, _phase_d_drained_0);
+                        _phase_d_drained_0 ^= 1;
+                        asm volatile("tcgen05.fence::after_thread_sync;");
+#if __CUDA_ARCH__ == 1070
+                        int _mma_a_lo_3 = (((smem_v9_addr_0) >> 4) & 0x7FFF) | 0x2000000;
+                        int _smem_desc_lo_8 = (((smem_v9_addr) >> 4) & 0x7FFF) | 0x2000000;
+                        int _smem_desc_lo_9 = (((smem_v21_addr_1) >> 4) & 0x7FFF) | 0x2000000;
+#else
+                        int _mma_a_lo_3 = (((smem_v9_addr_0) >> 4) & 0x3FFF) | 0x2000000;
                         int _smem_desc_lo_8 = (((smem_v9_addr) >> 4) & 0x3FFF) | 0x2000000;
-                        int _smem_desc_lo_9 = (((smem_v31_addr) >> 4) & 0x3FFF) | 0x2000000;
+                        int _smem_desc_lo_9 = (((smem_v21_addr_1) >> 4) & 0x3FFF) | 0x2000000;
 #endif
                         asm volatile(
                     "{\n\t"
@@ -4095,11 +4199,11 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                     "}\n"
                     :: "r"(_smem_desc_lo_8), "r"(_smem_desc_lo_9), "r"(tmem_acc_dksrc), "r"(0) : "memory");
 #if __CUDA_ARCH__ == 1070
-                        int _smem_desc_lo_10 = (((smem_v26_addr) >> 4) & 0x7FFF) | 0x2000000;
-                        int _smem_desc_lo_11 = (((smem_v33_addr) >> 4) & 0x7FFF) | 0x2000000;
+                        int _smem_desc_lo_10 = (((smem_v9_addr_2) >> 4) & 0x7FFF) | 0x2000000;
+                        int _smem_desc_lo_11 = (((smem_v21_addr_2) >> 4) & 0x7FFF) | 0x2000000;
 #else
-                        int _smem_desc_lo_10 = (((smem_v26_addr) >> 4) & 0x3FFF) | 0x2000000;
-                        int _smem_desc_lo_11 = (((smem_v33_addr) >> 4) & 0x3FFF) | 0x2000000;
+                        int _smem_desc_lo_10 = (((smem_v9_addr_2) >> 4) & 0x3FFF) | 0x2000000;
+                        int _smem_desc_lo_11 = (((smem_v21_addr_2) >> 4) & 0x3FFF) | 0x2000000;
 #endif
                         asm volatile(
                     "{\n\t"
@@ -4136,9 +4240,9 @@ kernel_cake_gdn_train_83eb8234f378bfe68bb1(const __grid_constant__ CUtensorMap q
                     "}\n"
                     :: "r"(_smem_desc_lo_10), "r"(_smem_desc_lo_11), "r"(tmem_acc_dksrc), "r"(1) : "memory");
 #if __CUDA_ARCH__ == 1070
-                        int _smem_desc_lo_12 = (((smem_v32_addr) >> 4) & 0x7FFF) | 0x2000000;
+                        int _smem_desc_lo_12 = (((smem_v20_addr_3) >> 4) & 0x7FFF) | 0x2000000;
 #else
-                        int _smem_desc_lo_12 = (((smem_v32_addr) >> 4) & 0x3FFF) | 0x2000000;
+                        int _smem_desc_lo_12 = (((smem_v20_addr_3) >> 4) & 0x3FFF) | 0x2000000;
 #endif
                         asm volatile(
                     "{\n\t"

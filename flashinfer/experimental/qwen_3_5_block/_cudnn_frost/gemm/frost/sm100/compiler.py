@@ -1763,7 +1763,7 @@ def _render_block_scale_tile_constants(
 
     # TMA-store stages output through a fixed SMEM-D buffer; reserve it before
     # sizing the AB pipeline (else SMEM overflows the cap).
-    epi_reserved = _smem_d_bytes(cfg, chain) if use_tma_store_epi else 0
+    epi_reserved = _smem_d_bytes(cfg, chain) if use_tma_store_epi else _combine_smem_bytes(chain, cfg)
     ab_reserved = epi_reserved
     if chain.has_moe and chain.moe.mode == "gather":
         token_rows, token_sfs = (cta_n, real_nb) if isinstance(chain.moe, MoeSwapAbSpec) else (cta_m, real_na)
@@ -1824,8 +1824,10 @@ def _render_block_scale_tile_constants(
         # nvfp4 (3 -> 2: a 192 KiB A ring behind its 32 KiB staging buffer) and 256x128
         # 2-CTA mxfp8 (7 -> 6) -- then refuse anything a single stage still cannot fit.
         def _desc_roots(stages: int) -> dict[str, int]:
+            """Mirror shared-memory allocation order for descriptor validation."""
             return _block_scale_smem_desc_roots(
-                header_bytes=tmpl.smem_fixed_reserve + (epi_reserved if tmpl.file in _SMEM_D_BEFORE_RINGS_TEMPLATES else 0),
+                header_bytes=tmpl.smem_fixed_reserve
+                + (epi_reserved if tmpl.file in _SMEM_D_BEFORE_RINGS_TEMPLATES or _use_swap_bulk_combine(chain, cfg) else 0),
                 rings=[
                     *((f"SFA[{i}]", sfa_smem_bytes * stages) for i in range(real_na)),
                     *((f"SFB[{j}]", sfb_smem_bytes * stages) for j in range(real_nb)),
@@ -2435,6 +2437,9 @@ def _render_block_scale_template(
     tile_constants = _render_block_scale_tile_constants(config, chain, tmpl)
     tile_constants += f"\nmoe_gather = {chain.has_moe and chain.moe.mode == 'gather'}\nmoe_scatter = {chain.has_moe and chain.moe.mode == 'scatter'}\nmoe_top_k = {chain.moe.top_k if chain.has_moe else 1}"
     tile_constants += f"\nmoe_combine = {chain.has_moe and chain.moe.mode == 'combine'}"
+    tile_constants += f"\nmoe_combine_bulk_enabled = {_use_bulk_combine(chain, config)}"
+    tile_constants += f"\nmoe_combine_fixed_descriptors = {_use_fixed_combine_descriptors(chain, config)}"
+    tile_constants += f"\nmoe_combine_swap_bulk_enabled = {_use_swap_bulk_combine(chain, config)}"
     if plumb.tap_constants:
         tile_constants += "\n" + "\n".join(plumb.tap_constants)
 
@@ -2638,6 +2643,12 @@ def _render_block_scale_template(
             }
         )
 
+    if _use_bulk_combine(chain, config):
+        # The template stages COMBINE fragments and reduces each complete row.
+        replacements["INJECT_EPILOGUE"] = "pass"
+
+    if "@@INJECT_SWAP_COMBINE_LAUNCH@@" in src:
+        replacements["INJECT_SWAP_COMBINE_LAUNCH"] = "min_blocks_per_mp=1," if _use_swap_bulk_combine(chain, config) else ""
     src = _replace_marker_lines(src, replacements, template_kind="block-scale template")
 
     tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{_template_stem(tmpl.file)}_{config.geometry_name}{_store_mode_tag(store_modes)}")
@@ -3668,6 +3679,14 @@ def _epi_n_for_chain(cfg, chain: FusionChain) -> int:
     while halving subtile-loop and output-store overhead.  Other epilogues keep
     the measured 32-column default and its lower register footprint.
     """
+    if _use_swap_bulk_combine(chain, cfg):
+        # Logical token batch, staged across two 64-column TMEM loads.
+        return 128
+    if _use_bulk_combine(chain, cfg):
+        cols = _epi_tile_cols(cfg)
+        # A full row is staged across drains before one bulk reduction. Keep
+        # register pressure bounded and uniform spans for accumulator overlap.
+        return min(256 // DTYPE_BYTES[chain.output_dtype], cols & -cols)
     if not any(q.axis == 1 for q in chain.quants):
         return _epi_n(cfg, _epi_store_dtype(chain, cfg))
     cols = _epi_tile_cols(cfg)
@@ -3704,6 +3723,96 @@ def _epi_slot_widen(
 
 _EPI_WARPS = 4  # every template's `num_epilogue_warps`
 _EPI_STAGE_ROWS = _EPI_WARPS * 32
+
+
+def _use_bulk_combine(chain: FusionChain, cfg: TileConfig) -> bool:
+    """Use the qualified single-CTA block-scaled COMBINE epilogue.
+
+    The normal 2-CTA BF16 route fails memcheck on SM100 (#1942). Keep
+    normal 2-CTA configurations on atomics until independently qualified.
+    The separately qualified SM107 swapped route has its own predicate.
+    """
+    return (
+        not _FORCE_STG_EPI
+        and chain.has_moe
+        and chain.moe.mode == "combine"
+        and chain.has_block_scale
+        and not isinstance(chain.moe, MoeSwapAbSpec)
+        and not cfg.swap_ab
+        and cfg.pipeline == "sm100"
+        and cfg.cta_group == 1
+        and cfg.mma_tile_m == 128
+        and chain.output_specs[0].major == "n"
+        and chain.output_dtype in ("fp32", "fp16", "bf16")
+    )
+
+
+def _combine_smem_bytes(chain: FusionChain, cfg: TileConfig) -> int:
+    """Reserve the weighted staging tile and its alignment padding."""
+    if _use_swap_bulk_combine(chain, cfg):
+        return 128 * cfg.cta_tile_m * DTYPE_BYTES[chain.output_dtype] + 16
+    if not _use_bulk_combine(chain, cfg):
+        return 0
+    return _EPI_STAGE_ROWS * _epi_tile_cols(cfg) * DTYPE_BYTES[chain.output_dtype] + 16
+
+
+def _use_swap_bulk_combine(chain: FusionChain, cfg: TileConfig) -> bool:
+    """Qualified weight-by-token COMBINE: transpose fragments, then bulk-reduce.
+
+    The tile owns 256 features and a pair of 128-token CTA partitions. Stage
+    one 128-token batch per CTA; 64-column TMEM loads bound live registers.
+    Immutable B/SFB maps address compact tokens and segmented scales separately,
+    just as the normal COMBINE path does for A/SFA. No workload shape is baked in.
+    """
+    return (
+        not _FORCE_STG_EPI
+        and chain.has_moe
+        and isinstance(chain.moe, MoeSwapAbSpec)
+        and chain.moe.mode == "combine"
+        and chain.has_block_scale
+        and _current_arch() == 107
+        and cfg.pipeline == "sm100"
+        and cfg.swap_ab
+        and cfg.cta_group == 2
+        and (cfg.cga_size_m, cfg.cga_size_n, cfg.cga_size_k) == (2, 1, 1)
+        and (cfg.cta_tile_m, cfg.cta_tile_n, cfg.cta_tile_k_bytes) == (256, 256, 128)
+        and (cfg.mma_tile_m, cfg.mma_tile_n, cfg.mma_tile_k_bytes) == (128, 256, 64)
+        and cfg.mma_size_m == 2
+        and cfg.split_k_slices == 1
+        and chain.num_gemms == 1
+        and chain.output_specs[0].major == "m"
+        and chain.output_dtype == "bf16"
+        and chain.matmul.b_major == "k"
+        and chain.matmul.a_dtype == chain.matmul.b_dtype == "fp4_e2m1"
+        and chain.block_scale.block_size == 16
+        and not chain.block_scale.fake_dequant_a
+        and not chain.block_scale.fake_dequant_b
+        and not _moe_aligned_offsets(chain, cfg)
+    )
+
+
+def _use_fixed_combine_descriptors(chain: FusionChain, cfg: TileConfig) -> bool:
+    """Read compact tokens and segmented scales through immutable tensor maps.
+
+    COMBINE masks group-tail rows before reading routing metadata or reducing
+    outputs. Those rows need not be zero-filled at each expert boundary. The
+    token and SF coordinates differ because only SF segments are 128-row padded.
+    Keep the first implementation on the qualified Rubin NVFP4 singleton path.
+    """
+    bs = chain.block_scale
+    return (
+        _use_bulk_combine(chain, cfg)
+        and _current_arch() == 107
+        and cfg.cta_group == 1
+        and (cfg.cga_size_m, cfg.cga_size_n, cfg.cga_size_k) == (1, 1, 1)
+        and cfg.cta_tile_m % 128 == 0
+        and chain.matmul.a_major == "k"
+        and chain.matmul.a_dtype == chain.matmul.b_dtype == "fp4_e2m1"
+        and bs.block_size == 16
+        and not bs.fake_dequant_a
+        and not bs.fake_dequant_b
+        and not _moe_aligned_offsets(chain, cfg)
+    )
 
 
 def _epi_packed_lanes(

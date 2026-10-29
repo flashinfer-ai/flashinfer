@@ -765,6 +765,44 @@ TAIL_PROGRAMS = {
     "tailpipe": TAILPIPE_PROGRAM,
     "tailpipe_wsmem": WSMEM_PROGRAM,
 }
+# The quantized variants' programs (hidden 4096) by the regime the host rule
+# mhc_infer_variant_program names: the plain variant ("bf16", every listed
+# architecture) and its tail forms ("tailpipe" / "tailpipe_wsmem", the production
+# programs' tail forms with the variant's quantization, VARIANT_TAIL_ARCHES alone).
+# A tail form writes bitwise the plain variant's outputs at the same split count.
+VARIANT_PROGRAMS = {
+    "fp8_group128": {
+        "bf16": "cake_mega_mhc_a940c94296afad2b2497",
+        "tailpipe": "cake_mega_mhc_ed3f407e5a68eb65478e",
+        "tailpipe_wsmem": "cake_mega_mhc_892d774130f06423fd7c",
+    },
+    "nvfp4": {
+        "bf16": "cake_mega_mhc_1c61fed11caf93d1b762",
+        "tailpipe": "cake_mega_mhc_5018692c75652529e6fd",
+        "tailpipe_wsmem": "cake_mega_mhc_12e5bcc41e7940e7d511",
+    },
+}
+VARIANT_TAIL_ARCHES = ["sm_107a"]
+# The FP8 group-128 programs of the UE8M0 scale mode (fp8_sf_ue8m0=True) on
+# sm_107a, one per regime: the plain variant's programs with the scale's
+# reciprocal an exact power of two compiled in. The raw mode, a selection
+# without the mode and the other architectures take VARIANT_PROGRAMS.
+UE8M0_PROGRAMS = {
+    "bf16": "cake_mega_mhc_91c9979888321fdbf94f",
+    "tailpipe": "cake_mega_mhc_9823742e18a9ffa6515b",
+    "tailpipe_wsmem": "cake_mega_mhc_5c5eaa3072b0d4f69ccd",
+}
+UE8M0_ARCHES = ["sm_107a"]
+
+
+def _variant_program(layout, regime, arch, ue8m0=True):
+    """The program a plan of the quantized ``layout`` launches in ``regime`` on
+    ``arch`` (``ue8m0``: the FP8 scale mode, True by default)."""
+    if layout == "fp8_group128" and ue8m0 and arch in UE8M0_ARCHES:
+        return UE8M0_PROGRAMS[regime]
+    return VARIANT_PROGRAMS[layout][regime]
+
+
 # The first token count at which the rule leaves the BF16 program for the
 # tailpipe program (the split count's 32 -> 22 point) and the first at which it
 # leaves the tailpipe program for its weight-staging twin (16 splits over five
@@ -922,8 +960,23 @@ def test_h4096_tail_program_follows_the_split_count(num_sms):
         assert len(routes) == 1 and routes[0]["num_splits"] == "runtime", regime
         assert _runtime.route_regime(routes[0]) == routes[0]["regime"] == regime
     keyed = [r for r in _runtime.ROUTES if _runtime.route_regime(r) is not None]
-    assert keyed == [routes[0] for routes in by_regime.values()], (
-        "only the BF16-output route is keyed on a regime"
+    assert [r for r in keyed if r["sf_layout"] == "bf16"] == [
+        routes[0] for routes in by_regime.values()
+    ]
+    ue8m0 = [r for r in keyed if "fp8_sf_ue8m0" in r]
+    assert [r["sf_layout"] for r in ue8m0] == ["fp8_group128"] * len(UE8M0_PROGRAMS)
+    assert all(r["fp8_sf_ue8m0"] is True for r in ue8m0)
+    assert all(r["num_splits"] == "runtime" for r in ue8m0)
+    assert {_runtime.route_regime(r): r["program"] for r in ue8m0} == UE8M0_PROGRAMS
+    assert all("fp8_sf_ue8m0" not in r for r in _runtime.ROUTES if r not in ue8m0)
+    for layout, programs in VARIANT_PROGRAMS.items():
+        routes = [r for r in keyed if r["sf_layout"] == layout and r not in ue8m0]
+        assert len(routes) == len(programs), layout
+        assert {_runtime.route_regime(r): r["program"] for r in routes} == programs
+        assert all(r["num_splits"] == "runtime" for r in routes), layout
+    assert {r["sf_layout"] for r in keyed} == {"bf16", *VARIANT_PROGRAMS}, (
+        "only the hidden-4096 BF16-output and quantized-variant routes are keyed "
+        "on a regime"
     )
     assert all(
         _runtime.route_regime(r) is None for r in _runtime.ROUTES if r not in keyed
@@ -1013,6 +1066,109 @@ def test_h4096_tail_program_follows_the_split_count(num_sms):
         ]
 
 
+def _expected_variant_program(t, num_sms, layout, deterministic=False):
+    """The quantized variants' program on an architecture that ships their tail
+    forms, restated as the producer's rules test spells it: the production
+    program's regime, except the plain variant ("bf16") where that regime is
+    "tailpipe" and the tasks fit one wave of the grid ("fp8_group128" below 16
+    splits, "nvfp4" at 16 or more), and in deterministic mode below the
+    weight-staging regime."""
+    regime = _expected_h4096_program(t, num_sms, deterministic)
+    if regime != "tailpipe":
+        return regime
+    if deterministic:
+        return "bf16"
+    splits = _runtime.mhc_infer_num_splits(t, num_sms)
+    grid = _runtime.mhc_infer_num_ctas(t, num_sms, splits)
+    one_wave = (t + 63) // 64 * splits <= grid
+    if one_wave and (splits < 16 if layout == "fp8_group128" else splits >= 16):
+        return "bf16"
+    return "tailpipe"
+
+
+@pytest.mark.parametrize("num_sms", H4096_SM_COUNTS)
+def test_h4096_variant_program_follows_the_rule(num_sms):
+    """The quantized variants' program: the plain variant where the architecture
+    ships no tail forms (``tail_variants`` False: sm_100a / sm_103a), else the
+    regime ``mhc_infer_variant_program`` names, which selects that layout's route
+    on sm_107a at the variant's own split count; every regime is reached on every
+    SM count, and on 208 SMs the plain variant stays where the tail form measured
+    slower (one-wave FP8 below 16 splits, one-wave NVFP4 at 16 or more)."""
+    tokens = sorted(
+        {
+            *H4096_TOKENS,
+            *H4096_RULE_TOKENS,
+            *(H4096_PROGRAM_SWITCH[num_sms] + d for d in (-1, 0)),
+            *(H4096_WSMEM_SWITCH[num_sms] + d for d in (-1, 0)),
+            *(H4096_VARIANT_SWITCH[num_sms] + d for d in (-1, 0)),
+        }
+    )
+    for layout, programs in VARIANT_PROGRAMS.items():
+        seen = set()
+        for t in tokens:
+            for deterministic in (False, True):
+                rule = _runtime.mhc_infer_variant_program
+                assert rule(t, num_sms, layout, deterministic) == "bf16"
+                regime = rule(t, num_sms, layout, deterministic, True)
+                expected = _expected_variant_program(t, num_sms, layout, deterministic)
+                assert regime == expected, (layout, t, deterministic)
+                seen.add(regime)
+                splits = _runtime.mhc_infer_variant_num_splits(
+                    t, num_sms, deterministic
+                )
+                assert _runtime.select_program(
+                    4096, splits, False, False, layout, "sm_107a", regime=regime
+                ) == (programs[regime], {})
+                if layout == "fp8_group128":
+                    for ue8m0 in (True, False):
+                        assert _runtime.select_program(
+                            4096,
+                            splits,
+                            False,
+                            False,
+                            layout,
+                            "sm_107a",
+                            regime=regime,
+                            fp8_sf_ue8m0=ue8m0,
+                        ) == (_variant_program(layout, regime, "sm_107a", ue8m0), {})
+        assert seen == set(programs), (layout, seen)
+    if num_sms == 208:
+        spots = (1, 384, 385, 832, 833, 1280, 1281, 3328, 3329, 8192)
+        table = {
+            layout: [
+                _runtime.mhc_infer_variant_program(t, 208, layout, False, True)
+                for t in spots
+            ]
+            for layout in VARIANT_PROGRAMS
+        }
+        assert table == {
+            "fp8_group128": [
+                "bf16",
+                "bf16",
+                "tailpipe",
+                "tailpipe",
+                "bf16",
+                "bf16",
+                "tailpipe",
+                "tailpipe",
+                "tailpipe_wsmem",
+                "tailpipe_wsmem",
+            ],
+            "nvfp4": [
+                "bf16",
+                "bf16",
+                "bf16",
+                "bf16",
+                "tailpipe",
+                "tailpipe",
+                "tailpipe",
+                "tailpipe",
+                "tailpipe_wsmem",
+                "tailpipe_wsmem",
+            ],
+        }
+
+
 def test_split_fn_is_the_exact_three_way_split():
     fn = torch.randn(24, 4 * 4096, generator=torch.Generator().manual_seed(7)) * 0.01
     fnp = _runtime.split_fn(fn)
@@ -1065,6 +1221,12 @@ def test_h4096_values_and_replay(tokens, layout):
         assert plan.program == plan.config["program"] == TAIL_PROGRAMS[regime]
     else:
         assert plan.program not in TAIL_PROGRAMS.values()
+        regime = _runtime.mhc_infer_variant_program(
+            tokens, sms, layout, False, _arch in VARIANT_TAIL_ARCHES
+        )
+        assert plan.config["regime"] == regime
+        assert plan.program == plan.config["program"]
+        assert plan.program == _variant_program(layout, regime, _arch)
     assert set(plan.outputs) == {*BF16_OUTPUTS, *QUANT_OUTPUTS[layout]}
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -1176,10 +1338,26 @@ def test_h4096_tailpipe_programs_are_bitwise_the_bf16_program(monkeypatch):
     assert {regimes[t] for t in tokens} == {"tailpipe", "tailpipe_wsmem"}, regimes
     select = _runtime.select_program
 
-    def forced(hidden, splits, shifted, shared_sf, sf_layout, arch, regime=None):
+    def forced(
+        hidden,
+        splits,
+        shifted,
+        shared_sf,
+        sf_layout,
+        arch,
+        regime=None,
+        fp8_sf_ue8m0=None,
+    ):
         assert (hidden, sf_layout) == (4096, "bf16") and regime != "bf16"
         return select(
-            hidden, splits, shifted, shared_sf, sf_layout, arch, regime="bf16"
+            hidden,
+            splits,
+            shifted,
+            shared_sf,
+            sf_layout,
+            arch,
+            regime="bf16",
+            fp8_sf_ue8m0=fp8_sf_ue8m0,
         )
 
     for t in tokens:
@@ -1205,13 +1383,79 @@ def test_h4096_tailpipe_programs_are_bitwise_the_bf16_program(monkeypatch):
             )
 
 
+@pytest.mark.parametrize("layout", ("fp8_group128", "nvfp4"))
+def test_h4096_variant_tail_forms_are_bitwise_the_plain_variant(monkeypatch, layout):
+    """At every token count the variants' rule dispatches a quantized layout to a
+    tail form, a plan forced onto the plain variant program (the route read as
+    the plain variant's) writes bitwise the same outputs over the same inputs; the
+    forced plan launches the same grid and split count, so the two differ in the
+    program alone. The candidates reach both tail forms on the device."""
+    _skip_unless_exported(4096, layout)
+    arch, sms = _runtime.device_facts(torch.cuda.current_device())
+    if arch not in VARIANT_TAIL_ARCHES:
+        pytest.skip(f"the variants' tail forms ship for {VARIANT_TAIL_ARCHES} alone")
+    candidates = (385, 577, 833, 1025, 1281, 2048, 3329, 4096, 8192)
+    rule = _runtime.mhc_infer_variant_program
+    regimes = {t: rule(t, sms, layout, False, True) for t in candidates}
+    tokens = [t for t in candidates if regimes[t] != "bf16"]
+    assert {regimes[t] for t in tokens} == {"tailpipe", "tailpipe_wsmem"}, regimes
+    select = _runtime.select_program
+
+    def forced(
+        hidden,
+        splits,
+        shifted,
+        shared_sf,
+        sf_layout,
+        arch,
+        regime=None,
+        fp8_sf_ue8m0=None,
+    ):
+        assert (hidden, sf_layout) == (4096, layout) and regime != "bf16"
+        return select(
+            hidden,
+            splits,
+            shifted,
+            shared_sf,
+            sf_layout,
+            arch,
+            regime="bf16",
+            fp8_sf_ue8m0=fp8_sf_ue8m0,
+        )
+
+    for t in tokens:
+        values = inputs_h4096(t)
+        kw = layout_kwargs(layout, values)
+        dispatched = prepare_mega_mhc(**values, sf_layout=layout, **kw)
+        assert dispatched.program == _variant_program(layout, regimes[t], arch)
+        assert dispatched.config["regime"] == regimes[t]
+        with monkeypatch.context() as patch:
+            patch.setattr(_runtime, "select_program", forced)
+            base = prepare_mega_mhc(**values, sf_layout=layout, **kw)
+        assert base.program == _variant_program(layout, "bf16", arch)
+        assert base.config["num_splits"] == dispatched.config["num_splits"]
+        assert base.config["num_launch_sms"] == dispatched.config["num_launch_sms"]
+        for plan in (dispatched, base):
+            poison(plan.outputs)
+            plan.run()
+        torch.cuda.synchronize()
+        check_h4096_layout(dispatched.outputs, values, layout, **kw)
+        for name in (*BF16_OUTPUTS, *QUANT_OUTPUTS[layout]):
+            assert bitwise_equal(dispatched.outputs[name], base.outputs[name]), (
+                t,
+                name,
+            )
+
+
 # ------------------------------------------------- the FP8 group-128 output variant (hidden 4096)
 
 
 def test_h4096_quant_routes_select_their_programs():
-    """The hidden-4096 layouts dispatch on (hidden, output layout, architecture):
-    each exported layout names its own program, an unexported pair is refused
-    with the support matrix, and the support matrix names every exported pair."""
+    """The hidden-4096 layouts dispatch on (hidden, output layout, architecture,
+    regime): each exported layout names its own programs (a quantized layout its
+    plain variant on every listed architecture and, on sm_107a alone, its two
+    tail forms, one per regime), an unexported pair is refused with the support
+    matrix, and the support matrix names every exported pair."""
     bf16 = _runtime.select_program(
         4096, 32, False, False, "bf16", "sm_107a", regime="bf16"
     )
@@ -1251,25 +1495,57 @@ def test_h4096_quant_routes_select_their_programs():
             with pytest.raises(NotImplementedError, match="(?i)exported:"):
                 _runtime.select_program(4096, 16, False, False, layout, "sm_107a")
             continue
+        programs = VARIANT_PROGRAMS[layout]
         program, defines = _runtime.select_program(
-            4096, 16, False, False, layout, "sm_107a"
+            4096, 16, False, False, layout, "sm_107a", regime="bf16"
         )
+        assert program == programs["bf16"]
         assert program not in (bf16, tailpipe, wsmem) and defines == {}
+        assert len(set(programs.values())) == 3
+        assert not set(programs.values()) & {bf16, tailpipe, wsmem}
         for splits, regime in (
             (64, "bf16"),
             (16, "tailpipe"),
             (16, "tailpipe_wsmem"),
-            (32, None),
         ):
             same = _runtime.select_program(
                 4096, splits, False, False, layout, "sm_107a", regime=regime
             )
-            assert same[0] == program, "a single-program layout ignores the regime"
+            assert same == (programs[regime], {}), "the regime selects the program"
+        with pytest.raises(NotImplementedError, match="regime=None"):
+            _runtime.select_program(4096, 32, False, False, layout, "sm_107a")
+        for arch in ("sm_100a", "sm_103a"):
+            assert _runtime.select_program(
+                4096, 16, False, False, layout, arch, regime="bf16"
+            ) == (program, {})
+            for regime in ("tailpipe", "tailpipe_wsmem"):
+                with pytest.raises(NotImplementedError, match="(?i)exported:"):
+                    _runtime.select_program(
+                        4096, 16, False, False, layout, arch, regime=regime
+                    )
         record = _runtime.PROGRAMS[program]
         assert record["hidden"] == 4096 and record["arches"] == H4096_ARCHES
         routes = [r for r in _runtime.ROUTES if r["program"] == program]
         assert [r["sf_layout"] for r in routes] == [layout]
         assert f"hidden=4096 output={layout} on {H4096_ARCHES}" in matrix
+        for regime in ("tailpipe", "tailpipe_wsmem"):
+            tail = _runtime.PROGRAMS[programs[regime]]
+            assert tail["hidden"] == 4096 and tail["arches"] == VARIANT_TAIL_ARCHES
+            assert tail["arg_plan"] == record["arg_plan"]
+            assert dict(tail["launch"], dynamic_smem_bytes=0) == dict(
+                record["launch"], dynamic_smem_bytes=0
+            )
+            # A tail form takes the production program's dynamic SMEM of its form.
+            production = _runtime.PROGRAMS[TAIL_PROGRAMS[regime]]["launch"]
+            assert (
+                tail["launch"]["dynamic_smem_bytes"] == production["dynamic_smem_bytes"]
+            )
+            routes = [r for r in _runtime.ROUTES if r["program"] == programs[regime]]
+            assert [(r["sf_layout"], r["regime"]) for r in routes] == [(layout, regime)]
+            assert (
+                f"hidden=4096 output={layout} on {VARIANT_TAIL_ARCHES} "
+                f"({regime}: {programs[regime]})" in matrix
+            )
         names = [name for _kind, name in _runtime.record_arg_plan(record)]
         assert names[-3:] == ["grid_x", "grid_y", "grid_z"]
         assert set(QUANT_OUTPUTS[layout]) < set(names)
@@ -1277,14 +1553,30 @@ def test_h4096_quant_routes_select_their_programs():
 
 def test_h4096_every_program_ships_for_every_listed_architecture():
     """Each hidden-4096 record lists the same three architectures, sm_107a first,
-    and the routes select the same program on each of them; hidden 5120 stays
-    unexported on sm_107a."""
+    except the quantized variants' four tail forms, which list VARIANT_TAIL_ARCHES
+    alone; the routes select the same BF16-output program and the same plain
+    variant on each architecture, and a tail form on sm_107a alone; hidden 5120
+    stays unexported on sm_107a."""
     h4096 = [
         name for name, record in _runtime.PROGRAMS.items() if record["hidden"] == 4096
     ]
-    assert len(h4096) == 5
+    tails = {
+        programs[regime]
+        for programs in VARIANT_PROGRAMS.values()
+        for regime in ("tailpipe", "tailpipe_wsmem")
+    }
+    pow2 = set(UE8M0_PROGRAMS.values())
+    assert len(h4096) == 12 and len(tails) == 4 and tails < set(h4096)
+    assert len(pow2) == 3 and pow2 < set(h4096) and not pow2 & tails
     for name in h4096:
-        assert _runtime.record_arches(_runtime.PROGRAMS[name]) == H4096_ARCHES, name
+        arches = (
+            UE8M0_ARCHES
+            if name in pow2
+            else VARIANT_TAIL_ARCHES
+            if name in tails
+            else H4096_ARCHES
+        )
+        assert _runtime.record_arches(_runtime.PROGRAMS[name]) == arches, name
     for arch in H4096_ARCHES:
         for splits, regime, program in (
             (64, "bf16", BF16_PROGRAM),
@@ -1297,12 +1589,66 @@ def test_h4096_every_program_ships_for_every_listed_architecture():
         for layout in ("fp8_group128", "nvfp4"):
             if _runtime.supported(arch, 4096, layout):
                 program, defines = _runtime.select_program(
-                    4096, 16, False, False, layout, arch
+                    4096, 16, False, False, layout, arch, regime="bf16"
                 )
                 assert program not in (BF16_PROGRAM, TAILPIPE_PROGRAM, WSMEM_PROGRAM)
+                assert program == VARIANT_PROGRAMS[layout]["bf16"]
                 assert defines == {}
+                for regime in ("tailpipe", "tailpipe_wsmem"):
+                    key = (4096, 16, False, False, layout, arch)
+                    if arch in VARIANT_TAIL_ARCHES:
+                        assert _runtime.select_program(*key, regime=regime) == (
+                            VARIANT_PROGRAMS[layout][regime],
+                            {},
+                        )
+                    else:
+                        with pytest.raises(NotImplementedError, match="(?i)exported:"):
+                            _runtime.select_program(*key, regime=regime)
         assert _runtime.supported(arch, 5120, "col") == (arch != "sm_107a")
     assert _runtime.shipped_arches() == sorted(H4096_ARCHES)
+
+
+def test_h4096_fp8_ue8m0_routes_select_the_pow2_programs():
+    """The FP8 group-128 layout's UE8M0 scale mode on sm_107a takes programs of
+    its own, one per regime (UE8M0_PROGRAMS); the raw mode, a selection without
+    the mode and sm_100a / sm_103a take the plain variant's programs. Each UE8M0
+    program's record is the plain variant's record of its regime (arg_plan,
+    launch) with its own kernel on UE8M0_ARCHES alone, and its route is the
+    plain variant's route of its regime keyed on fp8_sf_ue8m0=True."""
+    programs = VARIANT_PROGRAMS["fp8_group128"]
+    assert len(set(UE8M0_PROGRAMS.values())) == 3
+    assert not set(UE8M0_PROGRAMS.values()) & set(programs.values())
+    for regime, splits in (("bf16", 64), ("tailpipe", 16), ("tailpipe_wsmem", 16)):
+        key = (4096, splits, False, False, "fp8_group128")
+        for ue8m0 in (True, False, None):
+            kw = {} if ue8m0 is None else {"fp8_sf_ue8m0": ue8m0}
+            expected = UE8M0_PROGRAMS[regime] if ue8m0 else programs[regime]
+            selected = _runtime.select_program(*key, "sm_107a", regime=regime, **kw)
+            assert selected == (expected, {}), (regime, ue8m0)
+        for arch in ("sm_100a", "sm_103a"):
+            for ue8m0 in (True, False):
+                if regime == "bf16":
+                    assert _runtime.select_program(
+                        *key, arch, regime=regime, fp8_sf_ue8m0=ue8m0
+                    ) == (programs["bf16"], {})
+                    continue
+                with pytest.raises(NotImplementedError, match="(?i)exported:"):
+                    _runtime.select_program(
+                        *key, arch, regime=regime, fp8_sf_ue8m0=ue8m0
+                    )
+        pow2 = _runtime.PROGRAMS[UE8M0_PROGRAMS[regime]]
+        plain = _runtime.PROGRAMS[programs[regime]]
+        assert _runtime.record_arches(pow2) == UE8M0_ARCHES
+        assert pow2["hidden"] == plain["hidden"] == 4096
+        assert pow2["arg_plan"] == plain["arg_plan"]
+        assert pow2["launch"] == plain["launch"]
+        assert pow2["kernel_symbol"] != plain["kernel_symbol"]
+        route = [r for r in _runtime.ROUTES if r["program"] == UE8M0_PROGRAMS[regime]]
+        twin = [r for r in _runtime.ROUTES if r["program"] == programs[regime]]
+        assert len(route) == len(twin) == 1, regime
+        assert route[0]["fp8_sf_ue8m0"] is True
+        rest = {k: v for k, v in route[0].items() if k != "fp8_sf_ue8m0"}
+        assert dict(rest, program=None) == dict(twin[0], program=None)
 
 
 def test_h4096_quant_keyword_rules():

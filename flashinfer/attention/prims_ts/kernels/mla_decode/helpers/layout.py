@@ -291,6 +291,9 @@ def o_stage_tmem_col_offset(
     v_stage_idx: int,
 ):
     """Return the TMEM column offset for one O pipeline and V head-dim stage."""
+    if getattr(cfg, "ws_pv", False):
+        return o_stage_idx * Int32(256) + Int32((v_stage_idx // 2) * 128)
+
     if cfg.kernel_variant == "keeps_mma_ab" and cfg.head_dim_per_cta_v > 256:
         return (
             o_stage_idx * Int32(2 * cfg.tmem_o_buffer_cols)

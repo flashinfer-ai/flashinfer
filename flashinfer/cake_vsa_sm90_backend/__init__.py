@@ -129,6 +129,7 @@ from .cake_planner import (  # noqa: F401
     cluster_capacity,
     cluster_cost,
     cluster_variant_for,
+    fp8_gqa_pin,
     fp8_gqa_xshare,
     gqa_group,
     plan_small,
@@ -511,6 +512,9 @@ class CakeVsaSm90Plan:
                 # the Sage-FP8 route runs head-pair queue plans on the shared-transposer
                 # queue program; split-mode queue plans keep the queue program
                 xshare=self.fp8 and fp8_gqa_xshare(plan),
+                # ... and static plans whose lightest CTA runs at least PIN_MIN_CTA_LOOP_ITERS
+                # main-loop iterations on the position-selected static program (a plan key)
+                pin=self.fp8 and fp8_gqa_pin(plan),
             )
             rule = _loader.workspace_rule(self.stage)
             assert rule is not None and rule["kind"] == "persistent"
@@ -835,6 +839,7 @@ __all__ = [
     "cluster_capacity",
     "cluster_variant_for",
     "create_plan",
+    "fp8_gqa_pin",
     "fp8_gqa_xshare",
     "is_cake_vsa_sm90_supported",
     "persistent_stage",

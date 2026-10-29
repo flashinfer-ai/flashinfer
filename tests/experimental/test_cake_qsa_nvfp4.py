@@ -34,11 +34,14 @@ cache the kernel reads is filled by ``tests.test_helpers.cake_qsa_nvfp4_referenc
 port of FlashInfer's NVFP4 paged writer (the API file compares the two).
 """
 
+import gc
 import hashlib
 import json
 import math
 import re
+import sys
 import threading
+import weakref
 from pathlib import Path
 
 import pytest
@@ -472,7 +475,8 @@ def test_thirty_three_splits(layout):
 
 
 def test_two_wave_walk_matches_the_plain_cut_and_replays(monkeypatch):
-    """On a GB300 (sm_103a, 152 SMs) rows 128 at two KV heads take the persistent walk:
+    """On a GB300 (sm_103a, 152 SMs) or an R200 (sm_107a, 212 SMs) rows 128 at two KV heads
+    take the persistent walk:
     one CTA per SM walking a contiguous share of the (row, KV head) x tile slots, 2 partial
     slots per pair, then the merge.  The walked call meets the contract of its own cut;
     forced onto the plain cut (one split, 256 CTAs in two waves: the host's walk rule off)
@@ -552,7 +556,10 @@ def test_stream_counters_are_cached_per_stream():
     splits = _splits(rows, num_kv_heads, device)
     if (
         splits == 1
-        or cake_backend.select_form(rows, num_kv_heads, splits, index) != "fused"
+        or cake_backend.select_form(
+            rows, num_kv_heads, splits, cake_backend.num_tiles(WIDTH), index
+        )
+        != "fused"
     ):
         pytest.skip("the fused form is not selected on this device")
     q, cache, selection, gate = _inputs(rows, num_qo_heads, num_kv_heads, "NHD", 61)
@@ -609,6 +616,201 @@ def test_caller_workspace_allocates_nothing():
     assert torch.equal(out, expected)
     with pytest.raises(ValueError):
         _run(q, cache, selection, gate, out, workspace_buffer=workspace[:-1])
+
+
+def test_caller_workspace_is_carved_once(monkeypatch):
+    """A caller workspace is checked and carved as a first use on its first call and
+    once more on its second, which builds its plan; every later call that passes the
+    same tensor reuses the plan; a call it is too small for is checked afresh and
+    refused; a plan whose dtype no longer matches, or a tensor rebound to other bytes,
+    is checked again; ``reset_workspace`` drops the plans and the noted sightings; and
+    the plan dies with the tensor (its views hold the storage, not it)."""
+    device = _device_or_skip()
+    rows, num_qo_heads, num_kv_heads = 8, 24, 2
+    q, cache, selection, gate = _inputs(rows, num_qo_heads, num_kv_heads, "HND", 23)
+    splits = _splits(rows, num_kv_heads, device)
+    nbytes = cake_backend.qsa_workspace_bytes(rows, num_qo_heads, num_kv_heads, splits)
+    checks = [0]
+    real_check = cake_backend._check_workspace
+
+    def counted_check(*args):
+        checks[0] += 1
+        return real_check(*args)
+
+    monkeypatch.setattr(cake_backend, "_check_workspace", counted_check)
+    expected = _run(q, cache, selection, gate)
+    workspace = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+    cake_backend.reset_workspace(workspace)  # no plan or sighting from another test
+    out = torch.full_like(q, math.nan)
+    for call in range(5):
+        out.fill_(math.nan)
+        _run(q, cache, selection, gate, out, workspace_buffer=workspace)
+        assert torch.equal(out, expected)
+        assert checks[0] == min(call + 1, 2)
+        if call == 0:
+            assert id(workspace) not in cake_backend._workspace_plans
+            assert len(cake_backend._seen_once) == 1
+    assert not cake_backend._seen_once
+    plan = cake_backend._workspace_plans[id(workspace)]
+    assert plan.ref() is workspace and len(plan.views) == 1
+    partial_out, partial_lse, counters = next(iter(plan.views.values()))
+    assert partial_out.data_ptr() >= workspace.data_ptr()
+    assert partial_lse.data_ptr() > partial_out.data_ptr()
+    assert partial_out._base is not workspace
+    assert partial_lse._base is not workspace
+    # A call the buffer is too small for (more query heads) is checked and refused.
+    wide_q, _, _, wide_gate = _inputs(rows, 32, num_kv_heads, "HND", 24)
+    with pytest.raises(ValueError):
+        _run(wide_q, cache, selection, wide_gate, workspace_buffer=workspace)
+    assert checks[0] == 3 and len(plan.views) == 1
+    # A plan that reads another dtype for the same tensor is dropped; the tensor is
+    # then a first use again (checked, carved, noted) and gets a new plan on the call
+    # after.
+    plan.dtype = torch.int8
+    out.fill_(math.nan)
+    _run(q, cache, selection, gate, out, workspace_buffer=workspace)
+    assert torch.equal(out, expected) and checks[0] == 4
+    assert id(workspace) not in cake_backend._workspace_plans
+    _run(q, cache, selection, gate, out, workspace_buffer=workspace)
+    assert checks[0] == 5
+    assert cake_backend._workspace_plans[id(workspace)] is not plan
+    # A tensor rebound to bytes of another dtype is refused like any other first use.
+    rebound = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+    _run(q, cache, selection, gate, out, workspace_buffer=rebound)
+    rebound.data = torch.zeros(nbytes, dtype=torch.int8, device=device)
+    with pytest.raises(ValueError):
+        _run(q, cache, selection, gate, out, workspace_buffer=rebound)
+    # reset_workspace drops every plan, every noted sighting and the zero-once record
+    # of the storage.
+    cake_backend.reset_workspace(workspace)
+    assert not cake_backend._workspace_plans and not cake_backend._seen_once
+    assert workspace.untyped_storage() not in cake_backend._zeroed_counters
+    before = checks[0]
+    for _ in range(3):
+        out.fill_(math.nan)
+        _run(q, cache, selection, gate, out, workspace_buffer=workspace)
+        assert torch.equal(out, expected)
+    assert checks[0] == before + 2
+    plan = cake_backend._workspace_plans[id(workspace)]
+    # The plan dies with the tensor and releases the buffer.
+    ident = id(workspace)
+    ref = weakref.ref(workspace)
+    torch.cuda.synchronize()
+    held = torch.cuda.memory_allocated()
+    del plan, partial_out, partial_lse, counters, workspace
+    gc.collect()
+    assert ref() is None and ident not in cake_backend._workspace_plans
+    assert torch.cuda.memory_allocated() <= held - nbytes
+
+
+def test_alternating_caller_workspaces_reach_their_plans(monkeypatch):
+    """Two workspaces passed turn about are each checked twice (first use, then the
+    plan's build on the second sighting) and reuse their plans from their third call
+    on."""
+    device = _device_or_skip()
+    rows, num_qo_heads, num_kv_heads = 4, 24, 2
+    q, cache, selection, gate = _inputs(rows, num_qo_heads, num_kv_heads, "NHD", 31)
+    splits = _splits(rows, num_kv_heads, device)
+    nbytes = cake_backend.qsa_workspace_bytes(rows, num_qo_heads, num_kv_heads, splits)
+    checks = [0]
+    real_check = cake_backend._check_workspace
+
+    def counted_check(*args):
+        checks[0] += 1
+        return real_check(*args)
+
+    monkeypatch.setattr(cake_backend, "_check_workspace", counted_check)
+    expected = _run(q, cache, selection, gate)
+    buffers = [torch.zeros(nbytes, dtype=torch.uint8, device=device) for _ in range(2)]
+    cake_backend.reset_workspace(buffers[0])  # no plan or sighting from another test
+    out = torch.full_like(q, math.nan)
+    for call in range(8):
+        out.fill_(math.nan)
+        _run(q, cache, selection, gate, out, workspace_buffer=buffers[call % 2])
+        assert torch.equal(out, expected)
+        assert checks[0] == min(call + 1, 4)
+    assert all(id(b) in cake_backend._workspace_plans for b in buffers)
+    assert not cake_backend._seen_once
+    cake_backend.reset_workspace(buffers[0])
+    assert not cake_backend._workspace_plans
+
+
+def test_fresh_caller_workspace_views_build_no_plan(monkeypatch):
+    """A caller that passes a new view object of its buffer on every call is checked and
+    carved on every call, as before the plans, and never builds one: the view dies
+    between calls, so a later view with the same id and bytes is a first use again."""
+    device = _device_or_skip()
+    rows, num_qo_heads, num_kv_heads = 8, 24, 2
+    q, cache, selection, gate = _inputs(rows, num_qo_heads, num_kv_heads, "NHD", 37)
+    splits = _splits(rows, num_kv_heads, device)
+    nbytes = cake_backend.qsa_workspace_bytes(rows, num_qo_heads, num_kv_heads, splits)
+    checks = [0]
+    real_check = cake_backend._check_workspace
+
+    def counted_check(*args):
+        checks[0] += 1
+        return real_check(*args)
+
+    monkeypatch.setattr(cake_backend, "_check_workspace", counted_check)
+    expected = _run(q, cache, selection, gate)
+    buffer = torch.zeros(nbytes + 256, dtype=torch.uint8, device=device)
+    cake_backend.reset_workspace(buffer)  # no plan or sighting from another test
+    out = torch.full_like(q, math.nan)
+    for call in range(6):
+        out.fill_(math.nan)
+        _run(q, cache, selection, gate, out, workspace_buffer=buffer[:nbytes])
+        assert torch.equal(out, expected)
+        assert checks[0] == call + 1
+        assert not cake_backend._workspace_plans
+    assert all(ref() is None for ref in cake_backend._seen_once.values())
+    cake_backend.reset_workspace(buffer)
+    assert not cake_backend._seen_once
+
+
+def test_single_split_caller_workspace_is_checked_not_carved(monkeypatch):
+    """At one split the call launches without partials: a caller workspace is checked
+    (on a first use and on the plan's build) but never carved, a plan hit skips both,
+    and a buffer too small for the call is refused as at any other split."""
+    device = _device_or_skip()
+    rows, num_qo_heads, num_kv_heads = 128, 24, 2
+    splits = _splits(rows, num_kv_heads, device)
+    if splits != 1:
+        pytest.skip(f"{rows} rows take {splits} splits on this device")
+    q, cache, selection, gate = _inputs(rows, num_qo_heads, num_kv_heads, "NHD", 41)
+    nbytes = cake_backend.qsa_workspace_bytes(rows, num_qo_heads, num_kv_heads, 1)
+    counts = {"check": 0, "carve": 0}
+    real_check, real_carve = cake_backend._check_workspace, cake_backend._carve
+
+    def counted_check(*args):
+        counts["check"] += 1
+        return real_check(*args)
+
+    def counted_carve(*args, **kwargs):
+        counts["carve"] += 1
+        return real_carve(*args, **kwargs)
+
+    monkeypatch.setattr(cake_backend, "_check_workspace", counted_check)
+    monkeypatch.setattr(cake_backend, "_carve", counted_carve)
+    expected = _run(q, cache, selection, gate)
+    buffer = torch.zeros(nbytes + 256, dtype=torch.uint8, device=device)
+    cake_backend.reset_workspace(buffer)  # no plan or sighting from another test
+    out = torch.full_like(q, math.nan)
+    for _ in range(3):  # a fresh view every call: checked every call, never carved
+        out.fill_(math.nan)
+        _run(q, cache, selection, gate, out, workspace_buffer=buffer[:nbytes])
+        assert torch.equal(out, expected)
+    assert counts == {"check": 3, "carve": 0}
+    workspace = buffer[:nbytes]  # one tensor object: checked twice, then plan hits
+    for _ in range(4):
+        out.fill_(math.nan)
+        _run(q, cache, selection, gate, out, workspace_buffer=workspace)
+        assert torch.equal(out, expected)
+    assert counts == {"check": 5, "carve": 0}
+    plan = cake_backend._workspace_plans[id(workspace)]
+    assert list(plan.views.values()) == [None]
+    with pytest.raises(ValueError):
+        _run(q, cache, selection, gate, out, workspace_buffer=buffer[: nbytes - 256])
+    cake_backend.reset_workspace(buffer)
 
 
 def test_cuda_graph_replay():
@@ -914,7 +1116,9 @@ def test_split_formula_fills_the_device_capacity():
         1,
         2,
     ]
-    assert [num_splits(r, 2, WIDTH, 212, "sm_107a") for r in ROWS] == [
+    # sm_107a: the plain cut at rows 1-64; rows 128 (256 plain CTAs: two waves on 212 and 216
+    # SMs) take the persistent walk and its 2 partial slots replace the formula's 1.
+    assert [cake_backend.plain_splits(r, 2, WIDTH, 212, "sm_107a") for r in ROWS] == [
         33,
         33,
         26,
@@ -924,6 +1128,16 @@ def test_split_formula_fills_the_device_capacity():
         1,
         1,
     ]
+    assert [num_splits(r, 2, WIDTH, 212, "sm_107a") for r in ROWS] == [
+        33,
+        33,
+        26,
+        13,
+        6,
+        3,
+        1,
+        2,
+    ]
     assert [num_splits(r, 2, WIDTH, 216, "sm_107a") for r in ROWS] == [
         33,
         33,
@@ -932,10 +1146,10 @@ def test_split_formula_fills_the_device_capacity():
         6,
         3,
         1,
-        1,
+        2,
     ]
     # sm_120a (the RTX PRO 6000 Blackwell, 188 SMs): the mma.sync decode's two CTAs per SM; the table's rows 4, 8,
-    # 16 and 32 (16, 11, 5, 3) replace the formula's 33, 23, 11, 5.
+    # 16, 32 and 64 (16, 11, 5, 3, 1) replace the formula's 33, 23, 11, 5, 2.
     assert [num_splits(r, 2, WIDTH, 188, "sm_120a") for r in ROWS] == [
         33,
         33,
@@ -943,7 +1157,7 @@ def test_split_formula_fills_the_device_capacity():
         11,
         5,
         3,
-        2,
+        1,
         1,
     ]
     assert [_formula(r, 2, WIDTH, 188, "sm_120a") for r in ROWS] == [
@@ -980,7 +1194,7 @@ def test_split_formula_fills_the_device_capacity():
         assert [
             cake_backend.plain_splits(r, 2, WIDTH, sm_count, arch) for r in ROWS
         ] == [_formula(r, 2, WIDTH, sm_count, arch) for r in ROWS]
-        if arch != "sm_103a":
+        if arch not in cake_backend.WALK_ARCHES:
             assert [num_splits(r, 2, WIDTH, sm_count, arch) for r in ROWS] == [
                 _formula(r, 2, WIDTH, sm_count, arch) for r in ROWS
             ]
@@ -1008,6 +1222,7 @@ def test_host_rule_applies_the_measured_table_within_the_caps():
         (188, 8): 11,
         (188, 16): 5,
         (188, 32): 3,
+        (188, 64): 1,
     }
     assert all(
         isinstance(sm, int) and isinstance(rows, int) and 1 <= s <= MAX_SPLITS
@@ -1015,7 +1230,7 @@ def test_host_rule_applies_the_measured_table_within_the_caps():
     )
     table_132 = [33, 33, 16, 8, 8, 4, 2, 1]
     table_108 = [33, 33, 27, 13, 6, 3, 4, 2]
-    table_188 = [33, 33, 16, 11, 5, 3, 2, 1]
+    table_188 = [33, 33, 16, 11, 5, 3, 1, 1]
     assert [num_splits(r, 2, WIDTH, 132, "sm_90a") for r in ROWS] == table_132
     assert [num_splits(r, 2, WIDTH, 108, "sm_80") for r in ROWS] == table_108
     assert [num_splits(r, 2, WIDTH, 188, "sm_120a") for r in ROWS] == table_188
@@ -1038,10 +1253,13 @@ def test_form_rule_takes_the_fused_form_within_the_capacity_and_the_eager_rule(
     monkeypatch,
 ):
     """``select_form``: never above one split or the device's fused capacity. Within
-    it, compute capability 9.0 and 12.0 take the fused form on every host, eager or captured;
-    10.0 / 10.3 take it only on an ``aarch64`` host, at ``rows <= FUSED_MAX_ROWS`` and
-    outside capture (the captured call keeps the split form); 10.7 and 8.x are split alone.
-    GPU-free: the device facts are faked per device index."""
+    it, compute capability 9.0 takes the fused form on every host, eager or captured,
+    and so does 12.0 below the tile stream (a call whose CTAs would each walk
+    ``STREAM_TILES`` tiles takes the split form: the whole-tile program's);
+    10.0 / 10.3 take it only on a host of ``FUSED_HOSTS``, at ``rows <= FUSED_MAX_ROWS``
+    and outside capture -- and that list is empty, so they keep the split form on every
+    host, eager or captured, and never read the capture state; 10.7 and 8.x are split
+    alone.  GPU-free: the device facts are faked per device index."""
     facts = {
         800: ("sm_80", 108),
         900: ("sm_90a", 132),
@@ -1050,7 +1268,13 @@ def test_form_rule_takes_the_fused_form_within_the_capacity_and_the_eager_rule(
         1070: ("sm_107a", 212),
         1200: ("sm_120a", 188),
     }
-    form = cake_backend.select_form
+    tiles = cake_backend.num_tiles(WIDTH)  # 33: every call below is at the full width
+
+    def form(rows, num_kv_heads, splits, index, capturing=False):
+        return cake_backend.select_form(
+            rows, num_kv_heads, splits, tiles, index, capturing
+        )
+
     reads = cake_backend._reads_capture_state
     monkeypatch.setattr(cake_backend, "_device_facts", lambda index: facts[index])
     cake_backend.fused_capacity.cache_clear()
@@ -1058,7 +1282,7 @@ def test_form_rule_takes_the_fused_form_within_the_capacity_and_the_eager_rule(
     try:
         assert cake_backend.FUSED_HOST_RULE_ARCHES == ("sm_100a", "sm_103a")
         assert cake_backend.FUSED_SPLIT_ONLY_ARCHES == ("sm_107a",)
-        assert cake_backend.FUSED_HOSTS == ("aarch64",)
+        assert cake_backend.FUSED_HOSTS == ()
         assert cake_backend.FUSED_MAX_ROWS == 4
         capacity = [
             cake_backend.fused_capacity(i) for i in (800, 900, 1000, 1030, 1070, 1200)
@@ -1067,8 +1291,8 @@ def test_form_rule_takes_the_fused_form_within_the_capacity_and_the_eager_rule(
         for host in ("aarch64", "x86_64"):
             monkeypatch.setattr(cake_backend, "HOST_MACHINE", host)
             reads.cache_clear()
-            grace = host == "aarch64"
-            eager = "fused" if grace else "split"
+            # 10.0 / 10.3: the split form at every row on both hosts (no host is listed),
+            # eager or captured; no capture-state read.
             for index, splits_at in (
                 (1000, (33, 33, 18)),
                 (1030, (33, 33, 19)),
@@ -1076,9 +1300,9 @@ def test_form_rule_takes_the_fused_form_within_the_capacity_and_the_eager_rule(
                 sm_count = facts[index][1]
                 for rows, splits in zip((1, 2, 4), splits_at, strict=True):
                     assert rows * 2 * splits <= sm_count
-                    assert form(rows, 2, splits, index) == eager, (host, index, rows)
+                    assert form(rows, 2, splits, index) == "split", (host, index, rows)
                     assert form(rows, 2, splits, index, True) == "split"
-                    assert reads(rows, index) is grace
+                    assert reads(rows, index) is False
                 # Above FUSED_MAX_ROWS (rows 8 at 9 splits fit the capacity), with one
                 # split or above the capacity: split.
                 assert form(8, 2, 9, index) == "split"
@@ -1100,11 +1324,17 @@ def test_form_rule_takes_the_fused_form_within_the_capacity_and_the_eager_rule(
                 assert form(16, 2, 8, 900, capturing) == "fused"
                 assert form(16, 2, 9, 900, capturing) == "split"
             assert reads(8, 900) is False
-            # Compute capability 12.0: the fused form within 376 CTAs (two per SM on 188 SMs),
-            # whatever the host or the capture state; above it the split form.
+            # Compute capability 12.0: the fused form within 376 CTAs (two per SM on
+            # 188 SMs) below the tile stream (33 tiles at 4 splits: 9 per CTA), whatever
+            # the host or the capture state; above the capacity, or at the stream (33
+            # tiles at 3 or 2 splits: 11 / 17 per CTA, the whole-tile program's calls),
+            # the split form.
+            assert cake_backend.STREAM_TILES == 11
             for capturing in (False, True):
-                assert form(64, 2, 2, 1200, capturing) == "fused"
-                assert form(64, 2, 3, 1200, capturing) == "split"
+                assert form(32, 2, 4, 1200, capturing) == "fused"
+                assert form(48, 2, 4, 1200, capturing) == "split"
+                assert form(32, 2, 3, 1200, capturing) == "split"
+                assert form(64, 2, 2, 1200, capturing) == "split"
             assert reads(8, 1200) is False
             # Compute capability 8.x: the split form alone.
             assert form(1, 2, 33, 800) == "split"
@@ -1144,7 +1374,7 @@ def test_capabilities_route_to_the_six_libraries():
         assert cake_jit.arch_for_capability(capability) is None
     assert set(cake_jit.ARCH_BY_CAPABILITY.values()) == set(cake_jit.ARCHES)
     # The per-architecture launch-bound tables cover every architecture; the fused table every one but sm_80, with
-    # the co-resident build's one CTA per SM on the tcgen05 architectures (the eager host rule bounds the form there).
+    # the co-resident build's one CTA per SM on the tcgen05 architectures (the eager host rule keeps the split form there).
     assert cake_jit.DECODE_THREADS == {
         "sm_80": 128,
         "sm_90a": 128,
@@ -1168,7 +1398,7 @@ def test_registry_records_carry_the_launch_facts_and_the_argument_plans():
     """Seven programs: the mma.sync plain decode, its whole-tile build delivered for sm_80
     alone (the split form on a multi-wave, long-stream grid), the mma.sync cooperative
     decode that merges its splits in the launch, the tcgen05 plain and cooperative decodes
-    of sm_100a / sm_103a / sm_107a, the tcgen05 persistent walk delivered for sm_103a alone
+    of sm_100a / sm_103a / sm_107a, the tcgen05 persistent walk delivered for sm_103a and sm_107a
     (the split form on a two-wave grid, one CTA per SM), and the separate merge; 128
     threads for the mma.sync programs and the merge, 512 for the tcgen05 ones, no cluster;
     the decodes' shared-memory pools as dynamic shared memory, the merge's static; the
@@ -1185,25 +1415,25 @@ def test_registry_records_carry_the_launch_facts_and_the_argument_plans():
     }
     arches = {
         "decode": ("sm_80", "sm_90a", "sm_120a"),
-        "decode_whole_tile": ("sm_80",),
+        "decode_whole_tile": ("sm_80", "sm_120a"),
         "decode_coop": ("sm_80", "sm_90a", "sm_120a"),
         "decode_tcgen05": ("sm_100a", "sm_103a", "sm_107a"),
         "decode_tcgen05_coop": ("sm_100a", "sm_103a", "sm_107a"),
-        "decode_tcgen05_persistent": ("sm_103a",),
+        "decode_tcgen05_persistent": ("sm_103a", "sm_107a"),
         "merge": ("sm_80", "sm_90a", "sm_100a", "sm_103a", "sm_107a", "sm_120a"),
     }
     tcgen05 = ("decode_tcgen05", "decode_tcgen05_coop", "decode_tcgen05_persistent")
     assert cake_jit.SELECT_RULES == ("form", "form_grid")
-    assert cake_jit.GRID_BOUNDS == ("multi_wave_long", "two_wave_walk")
+    assert cake_jit.GRID_BOUNDS == ("multi_wave_long", "long_stream", "two_wave_walk")
     persistent = cake_jit.MODULES["decode_tcgen05_persistent"]
     assert persistent["stage"] == "decode"
     assert persistent["variant"] == "tcgen05_persistent"
     assert persistent["select_rule"] == {
         "kind": "form_grid",
         "value": "split",
-        "arch": "sm_103a",
-        "grid": "two_wave_walk",
+        "grid": {"sm_103a": "two_wave_walk", "sm_107a": "two_wave_walk"},
     }
+    assert list(persistent["select_rule"]["grid"]) == persistent["arches"]
     assert persistent["grid_rule"] == {"kind": "walk_ctas"}
     assert (
         persistent["workspace_rule"]
@@ -1214,9 +1444,9 @@ def test_registry_records_carry_the_launch_facts_and_the_argument_plans():
     assert whole_tile["select_rule"] == {
         "kind": "form_grid",
         "value": "split",
-        "arch": "sm_80",
-        "grid": "multi_wave_long",
+        "grid": {"sm_80": "multi_wave_long", "sm_120a": "long_stream"},
     }
+    assert list(whole_tile["select_rule"]["grid"]) == whole_tile["arches"]
     for key in ("grid_rule", "workspace_rule", "launch", "arg_plan", "logical"):
         assert whole_tile[key] == cake_jit.MODULES["decode"][key], key
     for name in tcgen05:
@@ -1375,7 +1605,12 @@ def test_workspace_at_a_recycled_address_is_zeroed_again():
     device = _device_or_skip()
     rows, num_qo_heads, num_kv_heads = 8, 24, 2
     splits = _splits(rows, num_kv_heads, device)
-    if cake_backend.select_form(rows, num_kv_heads, splits, device.index) != "fused":
+    if (
+        cake_backend.select_form(
+            rows, num_kv_heads, splits, cake_backend.num_tiles(WIDTH), device.index
+        )
+        != "fused"
+    ):
         pytest.skip("the split form keeps no counters in the workspace")
     q, cache, selection, gate = _inputs(rows, num_qo_heads, num_kv_heads, "NHD", 31)
     nbytes = cake_backend.qsa_workspace_bytes(rows, num_qo_heads, num_kv_heads, splits)
@@ -1401,3 +1636,87 @@ def test_workspace_at_a_recycled_address_is_zeroed_again():
     out.fill_(math.nan)
     _run(q, cache, selection, gate, out, workspace_buffer=second)
     assert torch.equal(out, expected)
+
+
+def test_threads_sharing_a_caller_workspace_raise_nothing():
+    """Threads that pass one workspace, while another thread calls ``reset_workspace``
+    on it, raise nothing and get bitwise-equal outputs: every change to the plan and
+    sighting tables is one dictionary operation that tolerates an entry another thread
+    removed.  Calls above one split are serialized by a lock, as a shared stream asks
+    of its callers (one call's decode and merge launches must not interleave with
+    another's partials); the table changes and the resets are not serialized.  Calls
+    at one split launch without partials and run unserialized.  A tiny switch interval
+    makes the interpreter change threads between the table operations."""
+    device = _device_or_skip()
+    num_qo_heads, num_kv_heads, threads, calls = 24, 2, 4, 12
+    shapes = [(8, _splits(8, num_kv_heads, device))]
+    if _splits(64, num_kv_heads, device) == 1:
+        shapes.append((64, 1))
+    nbytes = max(
+        cake_backend.qsa_workspace_bytes(rows, num_qo_heads, num_kv_heads, splits)
+        for rows, splits in shapes
+    )
+    workspace = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+    cake_backend.reset_workspace(workspace)  # no plan or sighting from another test
+    cases = []
+    for seed, (rows, splits) in enumerate(shapes, start=41):
+        q, cache, selection, gate = _inputs(
+            rows, num_qo_heads, num_kv_heads, "HND", seed
+        )
+        cases.append(
+            (splits, q, cache, selection, gate, _run(q, cache, selection, gate))
+        )
+    lock = threading.Lock()
+    done = threading.Event()
+    errors: list[BaseException] = []
+    mismatches = [0]
+
+    def caller():
+        try:
+            for splits, q, cache, selection, gate, expected in cases:
+                out = torch.full_like(q, math.nan)
+                for _ in range(calls):
+                    out.fill_(math.nan)
+                    if splits == 1:
+                        _run(q, cache, selection, gate, out, workspace_buffer=workspace)
+                    else:
+                        with lock:
+                            _run(
+                                q,
+                                cache,
+                                selection,
+                                gate,
+                                out,
+                                workspace_buffer=workspace,
+                            )
+                    if not torch.equal(out, expected):
+                        mismatches[0] += 1
+        except BaseException as exc:  # every failure is reported below
+            errors.append(exc)
+
+    def resetter():
+        try:
+            while not done.is_set():
+                cake_backend.reset_workspace(workspace)
+        except BaseException as exc:
+            errors.append(exc)
+
+    interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-5)
+    try:
+        workers = [threading.Thread(target=caller) for _ in range(threads)]
+        reset_thread = threading.Thread(target=resetter)
+        reset_thread.start()
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        done.set()
+        reset_thread.join()
+    finally:
+        sys.setswitchinterval(interval)
+    assert not errors, errors
+    assert mismatches[0] == 0
+    assert len(cake_backend._seen_once) <= cake_backend._SEEN_ONCE_MAX
+    assert len(cake_backend._workspace_plans) <= cake_backend._WORKSPACE_PLANS_MAX
+    cake_backend.reset_workspace(workspace)

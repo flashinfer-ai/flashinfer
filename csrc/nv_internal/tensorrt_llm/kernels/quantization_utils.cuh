@@ -262,9 +262,17 @@ inline __device__ float reciprocal_approximate_ftz(float a) {
   return b;
 }
 
-__device__ __forceinline__ float exp2f_rcp(uint8_t exp) {
-  constexpr uint32_t FP32_EXPONENT_BIAS = 127;
-  return (exp == 0) ? 1 : exp2f(FP32_EXPONENT_BIAS - static_cast<float>(exp));
+__device__ __forceinline__ float mx_quantize_mul(float a, float b) {
+  // MX quantization preserves FP32 subnormals, including when the caller is
+  // compiled with -use_fast_math. Match the CuTe DSL scale/payload arithmetic.
+  float result;
+  asm("mul.rn.f32 %0, %1, %2;" : "=f"(result) : "f"(a), "f"(b));
+  return result;
+}
+
+__device__ __forceinline__ float ue8m0_inverse_scale(uint8_t exp) {
+  // Same power-of-two construction and byte-zero sentinel as CuTe DSL.
+  return exp == 0 ? 0.0f : __uint_as_float(uint32_t(max(254 - int(exp), 0)) << 23);
 }
 
 __device__ __forceinline__ float e2m1_code_to_float(uint8_t code) {
@@ -471,11 +479,11 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
   if constexpr (UE8M0_SF) {
     __nv_fp8_e8m0 tmp;
     // Scale the max value to the range of E2m1.
-    vecMax *= reciprocal_approximate_ftz(6.0f);
+    vecMax = mx_quantize_mul(vecMax, reciprocal_approximate_ftz(6.0f));
     tmp.__x = __nv_cvt_float_to_e8m0(vecMax, __NV_SATFINITE, cudaRoundPosInf);
 
     fp8SFVal = tmp.__x;
-    outputScale = vecMax != 0 ? exp2f_rcp(fp8SFVal) : 0.0f;
+    outputScale = ue8m0_inverse_scale(fp8SFVal);
   } else if constexpr (!IsNVFP44Over6Config<NVFP4_4OVER6_CONFIG>::value &&
                        DISABLE_FP4_QUANT_FAST_MATH) {
     // Get the SF (max value of the vector / max value of e2m1).
@@ -502,7 +510,8 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
     SFValue = static_cast<float>(tmp);
     // Get the output scale.
     // Recipe: final_scale = reciprocal(fp32(fp8(SFValue * SFScaleVal)) * reciprocal(SFScaleVal))
-    outputScale = vecMax != 0
+    // A nonzero block can round to a zero E4M3 scale; match the CuTe zero-scale contract.
+    outputScale = fp8SFVal != 0
                       ? reciprocal_approximate_ftz(SFValue * reciprocal_approximate_ftz(SFScaleVal))
                       : 0.0f;
   }
@@ -672,8 +681,13 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint64_t, uint32_t> cvt
     } else {
       fp2Vals[i] = __bfloat1622float2(vec.elts[i]);
     }
-    fp2Vals[i].x *= outputScale;
-    fp2Vals[i].y *= outputScale;
+    if constexpr (UE8M0_SF) {
+      fp2Vals[i].x = mx_quantize_mul(fp2Vals[i].x, outputScale);
+      fp2Vals[i].y = mx_quantize_mul(fp2Vals[i].y, outputScale);
+    } else {
+      fp2Vals[i].x *= outputScale;
+      fp2Vals[i].y *= outputScale;
+    }
   }
 
   // Convert to e2m1 values.
@@ -704,11 +718,11 @@ cvt_warp_fp16_to_fp4_with_vec_max(PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, flo
   if constexpr (UE8M0_SF) {
     __nv_fp8_e8m0 tmp;
     // Scale the max value to the range of E2m1.
-    vecMax *= reciprocal_approximate_ftz(6.0f);
+    vecMax = mx_quantize_mul(vecMax, reciprocal_approximate_ftz(6.0f));
     tmp.__x = __nv_cvt_float_to_e8m0(vecMax, __NV_SATFINITE, cudaRoundPosInf);
 
     fp8SFVal = tmp.__x;
-    outputScale = vecMax != 0 ? exp2f_rcp(fp8SFVal) : 0.0f;
+    outputScale = ue8m0_inverse_scale(fp8SFVal);
   } else if constexpr (TE_EXACT_NVFP4) {
     // Get the SF (max value of the vector / max value of e2m1).
     // maximum value of e2m1 = 6.0.
@@ -731,7 +745,7 @@ cvt_warp_fp16_to_fp4_with_vec_max(PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, flo
     __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
     fp8SFVal = tmp.__x;
     SFValue = static_cast<float>(tmp);
-    outputScale = vecMax != 0 ? reciprocal_approximate_ftz(SFValue * reciprocalSFScaleVal) : 0.0f;
+    outputScale = fp8SFVal != 0 ? reciprocal_approximate_ftz(SFValue * reciprocalSFScaleVal) : 0.0f;
   }
 
   if (SFout) {
@@ -749,8 +763,13 @@ cvt_warp_fp16_to_fp4_with_vec_max(PackedVec<Type, CVT_ELTS_PER_THREAD>& vec, flo
     } else {
       fp2Vals[i] = __bfloat1622float2(vec.elts[i]);
     }
-    fp2Vals[i].x *= outputScale;
-    fp2Vals[i].y *= outputScale;
+    if constexpr (UE8M0_SF) {
+      fp2Vals[i].x = mx_quantize_mul(fp2Vals[i].x, outputScale);
+      fp2Vals[i].y = mx_quantize_mul(fp2Vals[i].y, outputScale);
+    } else {
+      fp2Vals[i].x *= outputScale;
+      fp2Vals[i].y *= outputScale;
+    }
   }
 
   // Convert to e2m1 values.
@@ -877,19 +896,14 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t> cvt_wa
   float vecMax = float(cuda_max(localMax.x, localMax.y));
 
   // Get the SF (max value of the vector / max value of mxfp8).
-  float SFValue = vecMax * reciprocal_approximate_ftz(448.0f);
+  float SFValue = mx_quantize_mul(vecMax, reciprocal_approximate_ftz(448.0f));
   // 8 bits representation of the SF.
   uint8_t fp8SFVal;
   // Write the SF to global memory (STG.8).
   __nv_fp8_e8m0 tmpSFVal;
   tmpSFVal.__x = __nv_cvt_float_to_e8m0(SFValue, __NV_SATFINITE, cudaRoundPosInf);
-  SFValue = static_cast<float>(tmpSFVal);
   fp8SFVal = tmpSFVal.__x;
-  // Get the output scale (reciprocal of the SFValue).
-  // Note: Check SFValue != 0 (not vecMax != 0) because E8M0 conversion can underflow
-  // very small vecMax values to zero. Using vecMax != 0 would cause division by zero
-  // (reciprocal of 0 = infinity), leading to NaN when multiplied with denormal inputs.
-  float outputScale = SFValue != 0.f ? reciprocal_approximate_ftz(SFValue) : 0.0f;
+  float outputScale = ue8m0_inverse_scale(fp8SFVal);
 
   if (SFout) {
     // Write the SF to global memory (STG.8).
@@ -906,8 +920,8 @@ __device__ std::conditional_t<CVT_ELTS_PER_THREAD == 16, uint4, uint64_t> cvt_wa
     } else {
       fp2Vals[i] = __bfloat1622float2(vec.elts[i]);
     }
-    fp2Vals[i].x *= outputScale;
-    fp2Vals[i].y *= outputScale;
+    fp2Vals[i].x = mx_quantize_mul(fp2Vals[i].x, outputScale);
+    fp2Vals[i].y = mx_quantize_mul(fp2Vals[i].y, outputScale);
     // Saturate to +/-E4M3 max (448) so inf / overflow map to the max finite
     // value instead of NaN. This matches torch's saturating float8_e4m3fn cast.
     fp2Vals[i].x = fmaxf(fminf(fp2Vals[i].x, 448.0f), -448.0f);

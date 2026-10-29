@@ -12,7 +12,6 @@ def route_members(ids, leader, group_size: cutlass.Constexpr):
     routes = cute.size(ids)
     expert = ids[leader].to(cutlass.Int64)
     rank = cutlass.Int32(0)
-    total = cutlass.Int32(0)
     masks = cute.make_rmem_tensor((routes + 31) // 32, cutlass.Uint32)
     for chunk in cutlass.range_constexpr((routes + 31) // 32):
         r = chunk * 32 + lane
@@ -21,7 +20,6 @@ def route_members(ids, leader, group_size: cutlass.Constexpr):
             hit = ids[r].to(cutlass.Int64) == expert
         mask = cute.arch.vote_ballot_sync(hit).to(cutlass.Uint32)
         masks[chunk] = mask
-        total = total + cute.arch.popc(mask)
         before = cutlass.Uint32(0)
         limit = leader - chunk * 32
         if limit >= 32:
@@ -33,25 +31,22 @@ def route_members(ids, leader, group_size: cutlass.Constexpr):
     members.fill(-1)
     if rank % group_size == 0:
         offset = cutlass.Int32(0)
-        lane_mask = (cutlass.Uint32(1) << lane) - cutlass.Uint32(1)
         for chunk in cutlass.range_constexpr((routes + 31) // 32):
-            r = chunk * 32 + lane
             mask = masks[chunk]
             limit = leader - chunk * 32
             if limit >= 32:
                 mask = cutlass.Uint32(0)
             elif limit > 0:
                 mask = mask & (~((cutlass.Uint32(1) << limit) - cutlass.Uint32(1)))
-            hit = ((mask >> lane) & cutlass.Uint32(1)) != 0
-            position = offset + cute.arch.popc(mask & lane_mask)
+            count = cute.arch.popc(mask)
+            # Ballot already made the membership mask uniform across the warp.
+            # Enumerate its set bits directly, preserving increasing route order.
             for p in cutlass.range_constexpr(group_size):
-                owner = cute.arch.vote_ballot_sync(hit & (position == p)).to(
-                    cutlass.Uint32
-                )
-                if owner != 0:
+                if (p >= offset) & (mask != 0):
                     src = cute.arch.popc(
-                        (owner & (cutlass.Uint32(0) - owner)) - cutlass.Uint32(1)
+                        (mask & (cutlass.Uint32(0) - mask)) - cutlass.Uint32(1)
                     )
-                    members[p] = cute.arch.shuffle_sync(r, src)
-            offset = offset + cute.arch.popc(mask)
+                    members[p] = chunk * 32 + src
+                    mask = mask & (mask - cutlass.Uint32(1))
+            offset = offset + count
     return members

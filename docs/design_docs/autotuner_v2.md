@@ -51,15 +51,22 @@ unusable entries as work to rebuild).
 v2 is a standalone context manager, deliberately disjoint from `autotune()`:
 
 ```python
-with flashinfer.autotune_v2(measurement_policy=MeasurementPolicy(execution_mode="cuda_graph")):
+graph_policy = MeasurementPolicy(execution_mode="cuda_graph")
+with flashinfer.autotune_v2(measurement_policy=graph_policy):
     model(dummy_inputs)      # warmup: tune misses, publish each winner atomically
 model(inputs)                # serving: reuses entries, no context needed
 
-# fresh process, same environment
-with flashinfer.autotune_v2(mode="replay"):
+# fresh process, same environment and measurement policy
+graph_policy = MeasurementPolicy(execution_mode="cuda_graph")
+with flashinfer.autotune_v2(mode="replay", measurement_policy=graph_policy):
     pass                     # hydrate only
 model(inputs)
 ```
+
+The measurement policy is part of the managed-cache identity. Reusing the same
+cache root without passing the original policy selects a different store; it
+does not hydrate the graph-tuned winners. Bare serving after the context exits
+uses the attached store under the default process scope.
 
 | `mode` | `persistent_cache` | meaning |
 |---|---|---|
@@ -396,6 +403,10 @@ Persistence and orchestration stay separate responsibilities.
   winner/shortlist and re-profile. Malformed persisted selections remain cache
   misses. Warm tuning still performs startup gates; serving with tuning disabled
   adds no collective. Distributed tuning must run outside CUDA Graph capture.
+- **Timer fallback**: CUPTI availability and initialization are checked across the tuning
+  group before candidate warmup or graph capture. If tracing fails on any rank, all ranks
+  fall back to CUDA events. Candidate exceptions still disqualify the tactic rather than
+  retrying it with another timer.
 - **In-session rank consistency**: coordinated tuning re-profiles divergent cached winners and
   tactic shortlists. Independent tuning without a process group can still diverge until
   `autotune_v2_reload()` runs — a finalize step (tune → barrier → reload) that drops in-process

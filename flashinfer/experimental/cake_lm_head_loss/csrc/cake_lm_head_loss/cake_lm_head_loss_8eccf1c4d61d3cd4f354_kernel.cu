@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2026 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -53,9 +53,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define LAUNCH_MIN_BLOCKS 8
 
 #include <math_constants.h>
+
 extern "C" {
 
-__global__ __launch_bounds__(THREADS, LAUNCH_MIN_BLOCKS) void
+__global__ __launch_bounds__(128, LAUNCH_MIN_BLOCKS) void
 kernel_cake_lm_head_loss_8eccf1c4d61d3cd4f354(__nv_bfloat16* __restrict__ z, long long* __restrict__ labels, float* __restrict__ lse, float* __restrict__ d, int row0, int d_off, int V)
 {
     const int tid = threadIdx.x;
@@ -68,7 +69,7 @@ kernel_cake_lm_head_loss_8eccf1c4d61d3cd4f354(__nv_bfloat16* __restrict__ z, lon
 
     const int cta_rank = 0;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int r = blockIdx.y;
     int t = row0 + r;
     long long lbl = labels[t];
@@ -87,20 +88,34 @@ kernel_cake_lm_head_loss_8eccf1c4d61d3cd4f354(__nv_bfloat16* __restrict__ z, lon
         for (int kz = 0; kz < 8; kz++) {
             int vi_z = vi0 + kz * 128;
             if (vi_z < num_vecs) {
-                {
-                    __nv_bfloat162 _pk[4];
-                    _pk[0] = __floats2bfloat162_rn(zero_out[0 + 0], zero_out[0 + 1]);
-                    _pk[1] = __floats2bfloat162_rn(zero_out[0 + 2], zero_out[0 + 3]);
-                    _pk[2] = __floats2bfloat162_rn(zero_out[0 + 4], zero_out[0 + 5]);
-                    _pk[3] = __floats2bfloat162_rn(zero_out[0 + 6], zero_out[0 + 7]);
-                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(z + (row_base + (unsigned long long)vi_z * 8)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                unsigned int _packed_0[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero_out[_lp*2 + 0], zero_out[_lp*2+1 + 0]));
+                    _packed_0[_lp] = *(uint32_t*)&_bf2;
                 }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero_out[_lp*2 + 2], zero_out[_lp*2+1 + 2]));
+                    _packed_0[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero_out[_lp*2 + 4], zero_out[_lp*2+1 + 4]));
+                    _packed_0[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(zero_out[_lp*2 + 6], zero_out[_lp*2+1 + 6]));
+                    _packed_0[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                reinterpret_cast<int4*>(z + (row_base + (unsigned long long)vi_z * 8))[0] = reinterpret_cast<int4*>(_packed_0)[0];
             }
         }
     } else {
         int lbl32 = (int)lbl;
         int lbl_vec = lbl32 / 8;
-        float nlse2 = (-lse_t) * 1.4426950408889634f;
+        float nlse2 = (-lse_t) * 1.442695f;
         unsigned int zero32 = 0;
         unsigned int zw[32];
         float zf[64];
@@ -124,41 +139,55 @@ kernel_cake_lm_head_loss_8eccf1c4d61d3cd4f354(__nv_bfloat16* __restrict__ z, lon
                 float out[8];
                 #pragma unroll
                 for (int w = 0; w < 4; w++) {
-                    uint32_t _prmt_b32_0;
-                    asm("prmt.b32 %0, %1, %2, 0x1044;" : "=r"(_prmt_b32_0) : "r"(zw[k * 4 + w]), "r"(zero32));
-                    float _exp_0 = expf(__uint_as_float(_prmt_b32_0) - lse_t);
-                    uint32_t _prmt_b32_1;
-                    asm("prmt.b32 %0, %1, %2, 0x3244;" : "=r"(_prmt_b32_1) : "r"(zw[k * 4 + w]), "r"(zero32));
-                    float _exp_1 = expf(__uint_as_float(_prmt_b32_1) - lse_t);
-                    out[2 * w] = d_raw * (-_exp_0);
-                    out[2 * w + 1] = d_raw * (-_exp_1);
+                    uint32_t _prmt_1;
+                    asm("prmt.b32 %0, %1, %2, 0x1044;" : "=r"(_prmt_1) : "r"(zw[k * 4 + w]), "r"(zero32));
+                    float exp = expf(__uint_as_float(_prmt_1) - lse_t);
+                    uint32_t _prmt_2;
+                    asm("prmt.b32 %0, %1, %2, 0x3244;" : "=r"(_prmt_2) : "r"(zw[k * 4 + w]), "r"(zero32));
+                    float exp_0 = expf(__uint_as_float(_prmt_2) - lse_t);
+                    out[2 * w] = d_raw * (-exp);
+                    out[2 * w + 1] = d_raw * (-exp_0);
                 }
                 if (vi == lbl_vec) {
                     int col0 = vi * 8;
                     #pragma unroll
                     for (int wl = 0; wl < 4; wl++) {
                         if (col0 + 2 * wl == lbl32) {
-                            uint32_t _prmt_b32_2;
-                            asm("prmt.b32 %0, %1, %2, 0x1044;" : "=r"(_prmt_b32_2) : "r"(zw[k * 4 + wl]), "r"(zero32));
-                            float _exp_2 = expf(__uint_as_float(_prmt_b32_2) - lse_t);
-                            out[2 * wl] = d_raw * (1.0f - _exp_2);
+                            uint32_t _prmt_4;
+                            asm("prmt.b32 %0, %1, %2, 0x1044;" : "=r"(_prmt_4) : "r"(zw[k * 4 + wl]), "r"(zero32));
+                            float _exp_3 = expf(__uint_as_float(_prmt_4) - lse_t);
+                            out[2 * wl] = d_raw * (1.0f - _exp_3);
                         }
                         if (col0 + 2 * wl + 1 == lbl32) {
-                            uint32_t _prmt_b32_3;
-                            asm("prmt.b32 %0, %1, %2, 0x3244;" : "=r"(_prmt_b32_3) : "r"(zw[k * 4 + wl]), "r"(zero32));
-                            float _exp_3 = expf(__uint_as_float(_prmt_b32_3) - lse_t);
-                            out[2 * wl + 1] = d_raw * (1.0f - _exp_3);
+                            uint32_t _prmt_6;
+                            asm("prmt.b32 %0, %1, %2, 0x3244;" : "=r"(_prmt_6) : "r"(zw[k * 4 + wl]), "r"(zero32));
+                            float _exp_5 = expf(__uint_as_float(_prmt_6) - lse_t);
+                            out[2 * wl + 1] = d_raw * (1.0f - _exp_5);
                         }
                     }
                 }
-                {
-                    __nv_bfloat162 _pk[4];
-                    _pk[0] = __floats2bfloat162_rn(out[0 + 0], out[0 + 1]);
-                    _pk[1] = __floats2bfloat162_rn(out[0 + 2], out[0 + 3]);
-                    _pk[2] = __floats2bfloat162_rn(out[0 + 4], out[0 + 5]);
-                    _pk[3] = __floats2bfloat162_rn(out[0 + 6], out[0 + 7]);
-                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(z + (row_base + (unsigned long long)vi * 8)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                unsigned int _packed_1[4];
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out[_lp*2 + 0], out[_lp*2+1 + 0]));
+                    _packed_1[_lp] = *(uint32_t*)&_bf2;
                 }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out[_lp*2 + 2], out[_lp*2+1 + 2]));
+                    _packed_1[_lp + 1] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out[_lp*2 + 4], out[_lp*2+1 + 4]));
+                    _packed_1[_lp + 2] = *(uint32_t*)&_bf2;
+                }
+                #pragma unroll
+                for (int _lp = 0; _lp < 1; _lp++) {
+                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out[_lp*2 + 6], out[_lp*2+1 + 6]));
+                    _packed_1[_lp + 3] = *(uint32_t*)&_bf2;
+                }
+                reinterpret_cast<int4*>(z + (row_base + (unsigned long long)vi * 8))[0] = reinterpret_cast<int4*>(_packed_1)[0];
             }
         }
     }

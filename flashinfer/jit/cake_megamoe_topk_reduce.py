@@ -32,13 +32,27 @@ from .utils import write_if_different
 
 _SOURCE_FILE = "cake_megamoe_topk_reduce_kernels.cu"
 _BINDING_HEADER = "cake_megamoe_topk_reduce_binding.cuh"
-_KERNEL_SYMBOL = "kernel_cake_megamoe_workspace_topk_reduce_bfloat16_h4096_k6"
+# The reducer in four CTA shapes (threads x BF16 values per thread, with or
+# without the L2::256B prefetch size); all four write bit-identical rows.
+_KERNEL_SYMBOLS = (
+    "kernel_flashinfer_sm100_megamoe_workspace_topk_reduce_tiered_t512x2",
+    "kernel_flashinfer_sm100_megamoe_workspace_topk_reduce_tiered_t512x4",
+    "kernel_flashinfer_sm100_megamoe_workspace_topk_reduce_tiered_t512x4_pf256",
+    "kernel_flashinfer_sm100_megamoe_workspace_topk_reduce_tiered_t1024x4_pf256",
+)
 # One arch-neutral generated source serves every datacenter-Blackwell target;
-# each module compiles it with its own ``-gencode`` and runs on the exact
-# compute capability it was built for.
+# each module compiles it with its own ``-gencode``, runs on the exact compute
+# capability it was built for and launches the shape its architecture's token
+# tiers pick for the live token count (``CAKE_MEGAMOE_TOPK_REDUCE_ARCH``).
 _ARCHS: dict[str, dict[str, Any]] = {
-    "sm_100a": {"capability": (10, 0), "nvcc_flags": sm100a_nvcc_flags},
-    "sm_103a": {"capability": (10, 3), "nvcc_flags": sm103a_nvcc_flags},
+    "sm_100a": {
+        "capability": (10, 0),
+        "nvcc_flags": sm100a_nvcc_flags + ["-DCAKE_MEGAMOE_TOPK_REDUCE_ARCH=100"],
+    },
+    "sm_103a": {
+        "capability": (10, 3),
+        "nvcc_flags": sm103a_nvcc_flags + ["-DCAKE_MEGAMOE_TOPK_REDUCE_ARCH=103"],
+    },
 }
 _CAPABILITY_TO_ARCH = {record["capability"]: arch for arch, record in _ARCHS.items()}
 _SUPPORTED_CAPABILITIES = tuple(sorted(_CAPABILITY_TO_ARCH))

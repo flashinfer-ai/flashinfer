@@ -60,9 +60,20 @@ ROUTES = {
     "bwd_col": (True, False, True),
     "bwd_both": (True, True, True),
 }
-# Entry-point shapes (M, K): M * K = 2^14, 2^23, 2^25, 2^26 and 2^28, at which
-# the selection rule picks every program of each route on each architecture.
-ENTRY_SHAPES = ((128, 128), (4096, 2048), (8192, 4096), (8192, 8192), (32768, 8192))
+# Entry-point shapes (M, K): M * K = 2^14, 2^16, 2^21, 2^22, 2^23, 2^24, 2^25,
+# 2^26 and 2^28, at which the selection rule picks every program of each route
+# on each architecture.
+ENTRY_SHAPES = (
+    (128, 128),
+    (256, 256),
+    (2048, 1024),
+    (2048, 2048),
+    (4096, 2048),
+    (4096, 4096),
+    (8192, 4096),
+    (8192, 8192),
+    (32768, 8192),
+)
 # (M, K): one tile row of scale tiles; odd counts of 128-column scale tiles.
 PROGRAM_SHAPES = ((128, 128), (256, 384), (384, 256))
 
@@ -233,19 +244,24 @@ def test_output_layouts_and_disabled_outputs() -> None:
 
 
 def test_selection_rule() -> None:
-    """Each route has one fallback; of the records whose threshold ``M * K``
-    reaches, the one of the highest threshold runs."""
+    """Each route has one fallback per architecture (the record without a
+    threshold there); of the records whose threshold ``M * K`` reaches, the one
+    of the highest threshold runs."""
 
     for arch in loader.ARCHES:
         for kind in loader.KINDS:
             names = loader.route_modules(arch, kind)
             rules = {name: loader.select_rule(loader.MODULES[name]) for name in names}
-            fallbacks = [name for name, rule in rules.items() if rule is None]
+            fallbacks = [
+                name
+                for name, rule in rules.items()
+                if rule is None or arch not in rule["elements"]
+            ]
             assert len(fallbacks) == 1, (arch, kind, fallbacks)
             positives = sorted(
                 (int(rule["elements"][arch]), name)
                 for name, rule in rules.items()
-                if rule is not None
+                if rule is not None and arch in rule["elements"]
             )
             thresholds = [threshold for threshold, _ in positives]
             assert thresholds == sorted(set(thresholds)), (arch, kind, positives)
@@ -413,15 +429,17 @@ def test_registry_records_reference_the_build_manifest() -> None:
         assert record["kernel_symbol"] == f"kernel_{name}"
         assert record["role"] in loader.ROLES, name
         assert record["grid_rule"]["kind"] in loader.GRID_KINDS, name
-        # 32 rows, or 64 for a program whose threads own two rows each
-        assert record["grid_rule"]["tile_rows"] in (32, 64), name
-        assert record["grid_rule"]["tile_cols"] == (
-            128 if record["role"] == "fwd" else 64
-        ), name
+        # 32 rows, or 64 or 128 for a program whose threads own two or four rows
+        assert record["grid_rule"]["tile_rows"] in (32, 64, 128), name
+        # 128 forward or 64 backward columns, or a narrower tile
+        tile_cols = record["grid_rule"]["tile_cols"]
+        widths = (128, 64, 32) if record["role"] == "fwd" else (64, 32)
+        assert tile_cols in widths, name
         assert record["launch"]["cooperative"] is False, name
         assert record["launch"]["use_pdl"] is False, name
+        # 256 threads for the forward's 128 columns, else 128
         assert record["launch"]["block"][0] == (
-            256 if record["role"] == "fwd" else 128
+            256 if record["role"] == "fwd" and tile_cols == 128 else 128
         ), name
         plan = {key for kind, key in record["arg_plan"] if kind != "grid"}
         assert plan == set(record["logical"]), name

@@ -438,7 +438,7 @@ def _run_cake_gdn_decode_pretranspose(
         allow_minus_one=True,
     )
     strided_inputs = not all(tensor.is_contiguous() for tensor in (q, k, v, a, b))
-    major, minor = torch.cuda.get_device_capability(q.device)
+    major, minor = get_compute_capability(q.device)
     arch = _cake_gdn.arch_for_compute_capability(major, minor)
     route = _cake_gdn.select_cake_gdn_decode_variant(
         arch=arch,
@@ -582,7 +582,7 @@ def _run_cake_gdn_decode_nontranspose(
         raise _cake_gdn.CakeGDNUnsupportedError(
             "GDN non-CP nontranspose decode requires exact contiguous T=1 tensors"
         )
-    major, minor = torch.cuda.get_device_capability(q.device)
+    major, minor = get_compute_capability(q.device)
     arch = _cake_gdn.arch_for_compute_capability(major, minor)
     route = _cake_gdn.select_cake_gdn_decode_variant(
         arch=arch,

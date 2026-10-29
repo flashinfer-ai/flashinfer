@@ -35,12 +35,18 @@ The programs are the eight launches of the KCP composition
 (:data:`PROGRAMS`, the names :mod:`.cake_kcp` passes to :func:`run_program`):
 
 * ``kcp_fwdh_offset`` / ``kcp_fwdh_tape`` -- the forward state recurrence
-  walked over the segments a host table lists (one CTA per segment and head,
-  ``grid_rule`` ``kcp_segments_heads``: ``n_walk * num_heads`` CTAs), from a
-  compact indexed initial state; the offset program writes each final state
-  to its indexed tile, the tape program writes the ``h`` / ``v_new`` tapes;
+  walked over the segments a host table lists, from a compact indexed initial
+  state; the offset program writes each final state to its indexed tile, the
+  tape program writes the ``h`` / ``v_new`` tapes.  Each program ships in two
+  records (``select_rule`` ``walk_form``): the full-width form (one CTA per
+  segment and head over the 128 value columns; ``grid_rule``
+  ``kcp_segments_heads``: ``n_walk * num_heads`` CTAs) and its ``_vh64`` form
+  (two CTAs per segment and head over 64 value columns each,
+  ``ctas_per_head`` 2), bitwise equal; :func:`walk_form` picks the form of a
+  launch from its walk list;
 * ``kcp_dhu_offset`` / ``kcp_dhu_tape`` -- the adjoint recurrence likewise
-  (reverse walk; the tape program writes the ``dh`` / ``dv2`` tapes);
+  (reverse walk; the tape program writes the ``dh`` / ``dv2`` tapes), in the
+  same two forms;
 * ``kcp_transfer_walk`` -- the FP32-class transfer ``M_f`` (``^T``) of a
   segment (BF16x3 on the tensor cores: two CTAs per segment and head, each
   over one 64-column half of the state) or, with ``init_mode = 1``, its
@@ -74,8 +80,8 @@ lists, slot tables and chain tables to cached device copies, the pools to
 base-pointer views, the operand and tape tensors from the call's local stage
 values -- onto :func:`run_module`.
 
-Test-only record set (``build.test.json``, loaded only under the environment
-variable ``CAKE_KCP_TEST_KNOBS=1``): the TF32 hi/lo transfer walk
+Test-only record set (``build.test.json``, loaded only after
+:func:`cake_kcp_plan.enable_test_knobs`): the TF32 hi/lo transfer walk
 (``transfer_walk`` knob ``tf32_hilo``: the previous shipped program, one CTA
 per segment and head) with its static ``precision_mode`` forms 1 (the
 explicit three-MMA TF32x3 form of the bitwise unit test) and 2 (plain TF32, a
@@ -85,7 +91,10 @@ value columns) for the A/B record of the shipped half-width program; their
 records are ``TEST_MODULES`` and their libraries never enter ``build.json``,
 so the shipped route carries the BF16x3 half-width program only.  The public
 API cannot select them: :mod:`.cake_kcp` takes ``precision_mode`` and
-``transfer_walk`` from the validated ``_kcp_test_knobs`` option alone.
+``transfer_walk`` from the validated ``_kcp_test_knobs`` option alone.  The
+``walk_form`` knob (:data:`WALK_FORMS`) forces the form of every K1 / K2 walk
+launch (``full`` / ``split``) for the A/B record; both forms are shipped
+records, so it names no test-only library.
 
 The derived leaves of a record (``kernel_symbol``, ``launch``, ``arg_plan``,
 ``logical``) are rewritten by the exporter from the rendered binding; the
@@ -97,14 +106,13 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
-import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import tvm_ffi
 
-from . import cake_build, cake_jit
+from . import cake_build, cake_jit, cake_kcp_plan
 
 # One verified build per architecture: B200 (``sm_100a``), B300 / GB300
 # (``sm_103a``) and R200 (``sm_107a``); the chunk stages' architectures.
@@ -135,7 +143,28 @@ PRECISION_MODES = (0, 1, 2)
 # CTAs per segment and head), ``tf32_hilo`` / ``bf16x3`` the test-only programs
 # of ``build.test.json`` (the TF32 hi/lo walk and the full-width BF16x3 form).
 TRANSFER_WALKS = ("bf16x3_hw64", "tf32_hilo", "bf16x3")
-TEST_KNOBS_ENV = "CAKE_KCP_TEST_KNOBS"
+# The ``walk_form`` test knob of the K1 / K2 state walks: ``auto`` the shipped
+# rule (:func:`walk_form`), ``full`` / ``split`` force the full-width or the
+# two-CTA record of every walk launch (the A/B record).
+WALK_FORMS = ("auto", "full", "split")
+# The shipped form rule per walk program: ``fit`` = the two-CTA record when the
+# launch list-schedules within its longest chain (:func:`walk_form`), else the
+# full-width one (the offset programs: two shipped records); ``split`` = the
+# two-CTA record on every launch (the tape programs, whose per-step tape stores
+# halve with the CTA's columns: their full-width records are test-only, under
+# ``walk_form="full"``).
+WALK_FORM_RULES = {
+    "kcp_fwdh_offset": "fit",
+    "kcp_fwdh_tape": "split",
+    "kcp_dhu_offset": "fit",
+    "kcp_dhu_tape": "split",
+}
+# The fit rule's step ratio: a two-CTA step beside a co-resident CTA, relative
+# to the full-width step of a CTA alone on its SM (measured 0.74-0.84 on the
+# one-wave lists; 0.9 is the conservative constant of the rule).
+WALK_FORM_FIT_STEP_RATIO = 0.9
+# Launches per form since import (evidence of the rule's choices).
+WALK_FORM_STATS = {"full": 0, "split": 0}
 TEST_MANIFEST = "build.test.json"
 
 # Logical argument names :func:`run_program` binds; every record maps its
@@ -281,8 +310,70 @@ MODULES: dict[str, dict[str, Any]] = {
             "walk_seg": "walk_seg",
         },
         "program": "kcp_fwdh_offset",
-        "select_rule": {"kind": "always"},
+        "select_rule": {"form": "full", "kind": "walk_form"},
         "variant": None,
+    },
+    "kcp_fwdh_offset_vh64": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "w_tma"],
+            ["buffer", "kg_tma"],
+            ["buffer", "u"],
+            ["buffer", "gk"],
+            ["parameter", "num_heads"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_seqs"],
+            ["buffer", "walk_seg"],
+            ["buffer", "h0"],
+            ["buffer", "h0_index"],
+            ["parameter", "h0_hg"],
+            ["parameter", "h0_n"],
+            ["buffer", "out"],
+            ["buffer", "out_index"],
+            ["parameter", "out_hg"],
+            ["parameter", "out_n"],
+            ["parameter", "tile_stride"],
+            ["buffer", "h_tape"],
+            ["buffer", "v_new"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"ctas_per_head": 2, "kind": "kcp_segments_heads"},
+        "kernel_symbol": "kernel_cake_kda_train_5a20cd12bb62bb6f3ac5",
+        "launch": {
+            "block": (192, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 91136,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_5a20cd12bb62bb6f3ac5",
+        "logical": {
+            "gk": "gk",
+            "h0": "h0",
+            "h0_hg": "h0_hg",
+            "h0_index": "h0_index",
+            "h0_n": "h0_n",
+            "h_tape": "h",
+            "kg_tma": "kg",
+            "num_heads": "num_heads",
+            "num_seqs": "num_seqs",
+            "out": "out",
+            "out_hg": "out_hg",
+            "out_index": "out_index",
+            "out_n": "out_n",
+            "seq_chunk_start": "seg_chunk_start",
+            "tile_stride": "tile_stride",
+            "u": "u",
+            "v_new": "v_new",
+            "w_tma": "w",
+            "walk_seg": "walk_seg",
+        },
+        "program": "kcp_fwdh_offset",
+        "select_rule": {"form": "split", "kind": "walk_form"},
+        "variant": "vh64",
     },
     "kcp_fwdh_tape": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
@@ -311,8 +402,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "grid_rule": {"kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_kda_train_9cfe05bce78410f1304b",
+        "grid_rule": {"ctas_per_head": 2, "kind": "kcp_segments_heads"},
+        "kernel_symbol": "kernel_cake_kda_train_6fac4410ba86c48541c4",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -320,7 +411,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 115712,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_9cfe05bce78410f1304b",
+        "library": "cake_kda_train_6fac4410ba86c48541c4",
         "logical": {
             "gk": "gk",
             "h0": "h0",
@@ -411,8 +502,76 @@ MODULES: dict[str, dict[str, Any]] = {
             "walk_seg": "walk_seg",
         },
         "program": "kcp_dhu_offset",
-        "select_rule": {"kind": "always"},
+        "select_rule": {"form": "full", "kind": "walk_form"},
         "variant": None,
+    },
+    "kcp_dhu_offset_vh64": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "kg_tma"],
+            ["buffer", "qg_tma"],
+            ["buffer", "w_tma"],
+            ["buffer", "do_tma"],
+            ["buffer", "dv1"],
+            ["buffer", "gk"],
+            ["parameter", "num_heads"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_seqs"],
+            ["parameter", "scale"],
+            ["buffer", "walk_seg"],
+            ["buffer", "dht"],
+            ["buffer", "dht_index"],
+            ["parameter", "dht_hg"],
+            ["parameter", "dht_n"],
+            ["buffer", "out"],
+            ["buffer", "out_index"],
+            ["parameter", "out_hg"],
+            ["parameter", "out_n"],
+            ["parameter", "tile_stride"],
+            ["buffer", "dh_tape"],
+            ["buffer", "dv2"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"ctas_per_head": 2, "kind": "kcp_segments_heads"},
+        "kernel_symbol": "kernel_cake_kda_train_afe02fb600500ba3556f",
+        "launch": {
+            "block": (192, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 82944,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_afe02fb600500ba3556f",
+        "logical": {
+            "dh_tape": "dh",
+            "dht": "dht",
+            "dht_hg": "dht_hg",
+            "dht_index": "dht_index",
+            "dht_n": "dht_n",
+            "do_tma": "do_int",
+            "dv1": "dv1",
+            "dv2": "dv2",
+            "gk": "gk",
+            "kg_tma": "kg",
+            "num_heads": "num_heads",
+            "num_seqs": "num_seqs",
+            "out": "out",
+            "out_hg": "out_hg",
+            "out_index": "out_index",
+            "out_n": "out_n",
+            "qg_tma": "qg",
+            "scale": "scale",
+            "seq_chunk_start": "seg_chunk_start",
+            "tile_stride": "tile_stride",
+            "w_tma": "w",
+            "walk_seg": "walk_seg",
+        },
+        "program": "kcp_dhu_offset",
+        "select_rule": {"form": "split", "kind": "walk_form"},
+        "variant": "vh64",
     },
     "kcp_dhu_tape": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
@@ -444,16 +603,16 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "grid_rule": {"kind": "kcp_segments_heads"},
-        "kernel_symbol": "kernel_cake_kda_train_3808ea4d567b82ea21a4",
+        "grid_rule": {"ctas_per_head": 2, "kind": "kcp_segments_heads"},
+        "kernel_symbol": "kernel_cake_kda_train_32b1aa657b082f2f4cb7",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 115712,
+            "dynamic_smem_bytes": 107520,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_3808ea4d567b82ea21a4",
+        "library": "cake_kda_train_32b1aa657b082f2f4cb7",
         "logical": {
             "dh_tape": "dh",
             "dht": "dht",
@@ -975,6 +1134,138 @@ TEST_MODULES: dict[str, dict[str, Any]] = {
         "test_knobs": {"transfer_walk": "tf32_hilo"},
         "variant": "tf32_hilo",
     },
+    "kcp_fwdh_tape_full": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "w_tma"],
+            ["buffer", "kg_tma"],
+            ["buffer", "u"],
+            ["buffer", "gk"],
+            ["parameter", "num_heads"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_seqs"],
+            ["buffer", "walk_seg"],
+            ["buffer", "h0"],
+            ["buffer", "h0_index"],
+            ["parameter", "h0_hg"],
+            ["parameter", "h0_n"],
+            ["buffer", "out"],
+            ["buffer", "out_index"],
+            ["parameter", "out_hg"],
+            ["parameter", "out_n"],
+            ["parameter", "tile_stride"],
+            ["buffer", "h_tape"],
+            ["buffer", "v_new"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "kcp_segments_heads"},
+        "kernel_symbol": "kernel_cake_kda_train_9cfe05bce78410f1304b",
+        "launch": {
+            "block": (192, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 115712,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_9cfe05bce78410f1304b",
+        "logical": {
+            "gk": "gk",
+            "h0": "h0",
+            "h0_hg": "h0_hg",
+            "h0_index": "h0_index",
+            "h0_n": "h0_n",
+            "h_tape": "h",
+            "kg_tma": "kg",
+            "num_heads": "num_heads",
+            "num_seqs": "num_seqs",
+            "out": "out",
+            "out_hg": "out_hg",
+            "out_index": "out_index",
+            "out_n": "out_n",
+            "seq_chunk_start": "seg_chunk_start",
+            "tile_stride": "tile_stride",
+            "u": "u",
+            "v_new": "v_new",
+            "w_tma": "w",
+            "walk_seg": "walk_seg",
+        },
+        "program": "kcp_fwdh_tape",
+        "select_rule": {"kind": "always"},
+        "test_knobs": {"walk_form": "full"},
+        "variant": "full",
+    },
+    "kcp_dhu_tape_full": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "kg_tma"],
+            ["buffer", "qg_tma"],
+            ["buffer", "w_tma"],
+            ["buffer", "do_tma"],
+            ["buffer", "dv1"],
+            ["buffer", "gk"],
+            ["parameter", "num_heads"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_seqs"],
+            ["parameter", "scale"],
+            ["buffer", "walk_seg"],
+            ["buffer", "dht"],
+            ["buffer", "dht_index"],
+            ["parameter", "dht_hg"],
+            ["parameter", "dht_n"],
+            ["buffer", "out"],
+            ["buffer", "out_index"],
+            ["parameter", "out_hg"],
+            ["parameter", "out_n"],
+            ["parameter", "tile_stride"],
+            ["buffer", "dh_tape"],
+            ["buffer", "dv2"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "kcp_segments_heads"},
+        "kernel_symbol": "kernel_cake_kda_train_3808ea4d567b82ea21a4",
+        "launch": {
+            "block": (192, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 115712,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_3808ea4d567b82ea21a4",
+        "logical": {
+            "dh_tape": "dh",
+            "dht": "dht",
+            "dht_hg": "dht_hg",
+            "dht_index": "dht_index",
+            "dht_n": "dht_n",
+            "do_tma": "do_int",
+            "dv1": "dv1",
+            "dv2": "dv2",
+            "gk": "gk",
+            "kg_tma": "kg",
+            "num_heads": "num_heads",
+            "num_seqs": "num_seqs",
+            "out": "out",
+            "out_hg": "out_hg",
+            "out_index": "out_index",
+            "out_n": "out_n",
+            "qg_tma": "qg",
+            "scale": "scale",
+            "seq_chunk_start": "seg_chunk_start",
+            "tile_stride": "tile_stride",
+            "w_tma": "w",
+            "walk_seg": "walk_seg",
+        },
+        "program": "kcp_dhu_tape",
+        "select_rule": {"kind": "always"},
+        "test_knobs": {"walk_form": "full"},
+        "variant": "full",
+    },
 }
 
 
@@ -991,33 +1282,87 @@ def records_of_program(program: str) -> tuple[str, ...]:
     return tuple(name for name, rec in MODULES.items() if rec["program"] == program)
 
 
-def _admits(rule: Mapping[str, Any], *, ncols: int | None) -> bool:
+def _admits(
+    rule: Mapping[str, Any], *, ncols: int | None, form: str | None = None
+) -> bool:
     kind = rule["kind"]
     if kind == "always":
         return True
     if kind == "columns":
         return ncols is not None and int(ncols) == int(rule["ncols"])
+    if kind == "walk_form":
+        return form is not None and str(form) == str(rule["form"])
     raise ValueError(f"unknown Cake KDA KCP selection rule: {kind!r}")
 
 
-def select_record(program: str, *, ncols: int | None = None) -> str:
+def select_record(
+    program: str, *, ncols: int | None = None, form: str | None = None
+) -> str:
     """The one record of ``program`` the launch's scalars select.
 
     ``always`` is the rule of a single-record program; ``columns`` (``{"kind":
     "columns", "ncols": N}``) picks the merge variant whose column count is
-    the chain's ``ncols`` (128 for state chains, 256 for map chains).  Exactly
-    one record admits every launch, or the registry is inconsistent.
+    the chain's ``ncols`` (128 for state chains, 256 for map chains);
+    ``walk_form`` (``{"kind": "walk_form", "form": F}``) picks the K1 / K2
+    walk record of form ``F`` -- ``"full"`` (one CTA per segment and head) or
+    ``"split"`` (the two-CTA record over 64 value columns each), the
+    launch's form from :func:`walk_form`; a program under a fixed rule ships
+    its one ``always`` record, the other form being test-only
+    (:func:`test_walk_record`).  Exactly one record admits every launch, or
+    the registry is inconsistent.
     """
     admitted = [
         name
         for name in records_of_program(program)
-        if _admits(MODULES[name]["select_rule"], ncols=ncols)
+        if _admits(MODULES[name]["select_rule"], ncols=ncols, form=form)
     ]
     if len(admitted) != 1:
         raise ValueError(
-            f"program {program!r}: {len(admitted)} records admit ncols={ncols} ({admitted}); expected one"
+            f"program {program!r}: {len(admitted)} records admit ncols={ncols} form={form} ({admitted}); expected one"
         )
     return admitted[0]
+
+
+def walk_form(
+    program: str,
+    chains: Sequence[int],
+    num_heads: int,
+    sm_count: int,
+    *,
+    knob: str = "auto",
+) -> str:
+    """The form of one launch of walk ``program``: ``"full"`` (one CTA per
+    segment and head over the 128 value columns) or ``"split"`` (the two-CTA
+    record: two CTAs per segment and head over 64 value columns each; bitwise
+    equal).  ``chains`` are the chunk counts of the listed segments, ``knob``
+    the ``walk_form`` test knob (``"full"`` / ``"split"`` force a form).
+
+    Under the rule ``fit`` (:data:`WALK_FORM_RULES`, the offset programs) a
+    launch takes the split form when its ``2 * num_heads`` CTAs per chain, two
+    resident per SM, list-schedule (LPT, :func:`cake_kcp_plan.lpt_makespan`)
+    within the longest chain, counting a two-CTA step at
+    :data:`WALK_FORM_FIT_STEP_RATIO` of a full-width step: there every CTA runs
+    beside another one that hides its per-step latency, and the launch lasts
+    one longest chain of shorter steps.  A launch of more work than that runs
+    several waves, where the full-width CTA does more per issued instruction
+    and keeps the SMs busier.  Under the rule ``split`` (the tape programs,
+    whose per-step tape stores halve with the CTA's columns) every launch takes
+    the split form.  An empty list is ``"full"``.
+    """
+    if knob not in WALK_FORMS:
+        raise ValueError(f"walk_form must be one of {WALK_FORMS}, got {knob!r}")
+    if knob != "auto":
+        return knob
+    rule = WALK_FORM_RULES[program]
+    if rule != "fit":
+        return rule
+    steps = [int(c) for c in chains if int(c) > 0]
+    if not steps:
+        return "full"
+    span = cake_kcp_plan.lpt_makespan(
+        [(c, 2 * int(num_heads)) for c in steps], 2 * int(sm_count)
+    )
+    return "split" if span * WALK_FORM_FIT_STEP_RATIO <= max(steps) else "full"
 
 
 def launch_grid(
@@ -1034,7 +1379,8 @@ def launch_grid(
 
     ``kcp_segments_heads`` launches ``(n_walk * num_heads * ctas_per_head, 1, 1)``
     (one CTA per listed segment and head -- ``ctas_per_head`` 2 for the
-    half-width test-only walk; the host lists the segments longest chain first);
+    half-width walks: the BF16x3 transfer walk and the two-CTA state walks;
+    the host lists the segments longest chain first);
     ``kcp_chains`` launches ``(n_chains * (ncols / cols_per_cta), 1, 1)`` (one
     CTA per chain and column block; ``ncols`` is a multiple of the record's
     ``cols_per_cta``); ``kcp_sm_bounded`` the persistent grid ``(max(1,
@@ -1209,8 +1555,8 @@ _MANIFEST_SCHEMA = "cake-build/1"
 
 
 def test_knobs_enabled() -> bool:
-    """Whether the process opted into the test-only programs (``CAKE_KCP_TEST_KNOBS=1``)."""
-    return os.environ.get(TEST_KNOBS_ENV) == "1"
+    """Whether the process opted into the test-only programs (:func:`cake_kcp_plan.enable_test_knobs`)."""
+    return cake_kcp_plan.test_knobs_enabled()
 
 
 def test_record(
@@ -1245,15 +1591,35 @@ def test_record(
     raise ValueError(f"no test-only record carries the knobs {wanted}")
 
 
-@functools.cache
-def test_manifest() -> dict[str, Any]:
-    """The parsed ``build.test.json`` (schema ``cake-build/1``, the test-only libraries), read on first use and
-    only under ``CAKE_KCP_TEST_KNOBS=1``: the shipped route never opens it."""
+def test_walk_record(program: str, form: str) -> tuple[str, dict[str, Any]]:
+    """``(record name, record)`` of the test-only form ``form`` of walk ``program`` under a fixed rule of
+    :data:`WALK_FORM_RULES` (the full-width tape walks beside their shipped two-CTA records; the ``walk_form``
+    knob alone selects them)."""
+    wanted = {"walk_form": str(form)}
+    for name, record in TEST_MODULES.items():
+        if record["program"] == program and record.get("test_knobs") == wanted:
+            return name, record
+    raise ValueError(f"no test-only record of {program!r} carries the knobs {wanted}")
+
+
+def _require_test_knobs() -> None:
     if not test_knobs_enabled():
         raise RuntimeError(
-            f"the test-only KCP programs are loaded only with {TEST_KNOBS_ENV}=1 in the environment; the shipped "
+            f"the test-only KCP programs are loaded only after {cake_kcp_plan.ENABLE_TEST_KNOBS}; the shipped "
             "route (precision_mode 0) uses build.json alone"
         )
+
+
+def test_manifest() -> dict[str, Any]:
+    """The parsed ``build.test.json`` (schema ``cake-build/1``, the test-only libraries), read on first use and
+    only after :func:`cake_kcp_plan.enable_test_knobs`: the shipped route never opens it.  The opt-in is checked on
+    every call, the parse is cached (an opt-out after a load closes it again)."""
+    _require_test_knobs()
+    return _test_manifest()
+
+
+@functools.cache
+def _test_manifest() -> dict[str, Any]:
     try:
         text = _TEST_MANIFEST_PATH.read_text(encoding="utf-8")
     except FileNotFoundError as exc:
@@ -1328,10 +1694,16 @@ def test_jit_spec(library: str) -> Any:
     )
 
 
-@functools.cache
 def load_test(name: str, arch: str) -> Any:
     """The loaded tvm-ffi module of test-only record ``name`` (a key of ``TEST_MODULES``) built for ``arch``,
-    JIT-built from ``build.test.json`` (never prebuilt, never from ``build.json``)."""
+    JIT-built from ``build.test.json`` (never prebuilt, never from ``build.json``); the opt-in is checked on every
+    call, the loaded module is cached."""
+    _require_test_knobs()
+    return _load_test(name, arch)
+
+
+@functools.cache
+def _load_test(name: str, arch: str) -> Any:
     return test_jit_spec(test_library_name(name, arch)).build_and_load()
 
 
@@ -1516,8 +1888,31 @@ def _walk(name: str, args: Mapping[str, Any], call: Any, device_index: int) -> N
             use_u=int(args["use_u"]),
             write_transposed=int(args["write_transposed"]),
         )
-    record = select_record(name)
     module = None
+    if name in WALK_FORM_RULES:  # the K1 / K2 walks: the form of this launch
+        form = str(args.get("walk_form") or "")
+        if form not in ("full", "split"):
+            seg = call.tb.hp.seg_chunk_start
+            form = walk_form(
+                name,
+                [int(seg[s + 1]) - int(seg[s]) for s in walk_list],
+                H,
+                sm_count(device_index),
+                knob=str(_call_knob(call, "walk_form", "auto")),
+            )
+        rule = WALK_FORM_RULES[name]
+        if rule in ("full", "split") and form != rule:
+            # the other form of a fixed-rule walk: its test-only record (the knob alone selects it)
+            record = test_walk_record(name, form)[0]
+            module = load_test(record, device_arch(device_index))
+        else:
+            record = select_record(name, form=form)
+        WALK_FORM_STATS[form] += 1
+        log = getattr(call, "walk_form_log", None)
+        if log is not None:
+            log.append((name, form, n_walk))
+    else:
+        record = select_record(name)
     if name == "kcp_transfer_walk":
         chosen = test_record(
             _call_knob(call, "precision_mode", 0),
@@ -1650,11 +2045,14 @@ __all__ = [
     "MODULES",
     "PRECISION_MODES",
     "PROGRAMS",
-    "TEST_KNOBS_ENV",
     "TEST_MANIFEST",
     "TEST_MODULES",
     "TILE",
     "TRANSFER_WALKS",
+    "WALK_FORMS",
+    "WALK_FORM_FIT_STEP_RATIO",
+    "WALK_FORM_RULES",
+    "WALK_FORM_STATS",
     "WALK_PROGRAMS",
     "arch_for_capability",
     "device_arch",
@@ -1674,4 +2072,6 @@ __all__ = [
     "test_manifest",
     "test_record",
     "test_specs_for_arch",
+    "test_walk_record",
+    "walk_form",
 ]

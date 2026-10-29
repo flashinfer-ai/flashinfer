@@ -4,7 +4,20 @@
 
 import cutlass
 from cutlass import cute
+from flashinfer.cute_dsl.fp4_common import fp4_decode_2, f16x2_to_f32x2
 from .nvfp4.fma_fc2 import _fp4_quad
+
+
+@cute.jit
+def _native_fp4_quad(word):
+    # Decode each byte explicitly to keep consecutive packed halfwords
+    # independent in unrolled wide-load bodies.
+    bits = word.to(cutlass.Uint32)
+    low = f16x2_to_f32x2(fp4_decode_2(bits & 255))
+    high = f16x2_to_f32x2(fp4_decode_2((bits >> 8) & 255))
+    return cutlass.Vector.from_elements(
+        (low[0], low[1], high[0], high[1]), cutlass.Float32
+    ).to(cutlass.Float16)
 
 
 @cute.jit
@@ -42,11 +55,15 @@ def scaled_quad(
     native: cutlass.Constexpr,
     scale_block_size: cutlass.Constexpr = 16,
     integer_weights: cutlass.Constexpr = False,
+    explicit_bytes: cutlass.Constexpr = False,
 ):
     if cutlass.const_expr(integer_weights):
         values = _int4_quad(word)
     elif cutlass.const_expr(native):
-        values = _fp4_quad(word)
+        if cutlass.const_expr(explicit_bytes):
+            values = _native_fp4_quad(word)
+        else:
+            values = _fp4_quad(word)
     else:
         values = _software_fp4_quad(word)
     # Every finite E2M1 * E4M3 product fits FP16 exactly. Dot accumulation
@@ -128,7 +145,7 @@ def scaled_values(
     # Native FP4 conversion consumes a 16-bit packed word even when the
     # coalesced load fetched eight nibbles in a uint32.
     low = scaled_quad(
-        word.to(cutlass.Uint16), scale, native, scale_block_size, integer_weights
+        word.to(cutlass.Uint16), scale, native, scale_block_size, integer_weights, True
     )
     high = scaled_quad(
         (word >> 16).to(cutlass.Uint16),
@@ -136,6 +153,7 @@ def scaled_values(
         native,
         scale_block_size,
         integer_weights,
+        True,
     )
     return cutlass.Vector.from_elements(
         (low[0], low[1], low[2], low[3], high[0], high[1], high[2], high[3]),

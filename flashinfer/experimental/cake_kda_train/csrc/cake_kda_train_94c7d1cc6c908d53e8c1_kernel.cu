@@ -354,25 +354,14 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
     int p6 = p5 + (cu7 - cu6 + 63) / 64;
     int p7 = p6 + (cu8 - cu7 + 63) / 64;
     int incl = p7;
-    int _shfl_up_0 = __shfl_up_sync(0xFFFFFFFF, incl, 1, 32);
-    if (lane_s >= 1) {
-        incl = incl + _shfl_up_0;
-    }
-    int _shfl_up_1 = __shfl_up_sync(0xFFFFFFFF, incl, 2, 32);
-    if (lane_s >= 2) {
-        incl = incl + _shfl_up_1;
-    }
-    int _shfl_up_2 = __shfl_up_sync(0xFFFFFFFF, incl, 4, 32);
-    if (lane_s >= 4) {
-        incl = incl + _shfl_up_2;
-    }
-    int _shfl_up_3 = __shfl_up_sync(0xFFFFFFFF, incl, 8, 32);
-    if (lane_s >= 8) {
-        incl = incl + _shfl_up_3;
-    }
-    int _shfl_up_4 = __shfl_up_sync(0xFFFFFFFF, incl, 16, 32);
-    if (lane_s >= 16) {
-        incl = incl + _shfl_up_4;
+    {
+        uint32_t incl_scan = (uint32_t)incl;
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, incl_scan, 1, 32); if (lane >= 1) { incl_scan += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, incl_scan, 2, 32); if (lane >= 2) { incl_scan += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, incl_scan, 4, 32); if (lane >= 4) { incl_scan += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, incl_scan, 8, 32); if (lane >= 8) { incl_scan += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, incl_scan, 16, 32); if (lane >= 16) { incl_scan += peer; } }
+        incl = (int)incl_scan;
     }
     int nc_s = __shfl_sync(0xFFFFFFFF, incl, 31);
     int first = incl - p7;
@@ -467,25 +456,25 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             }
             __syncthreads();
             int incl_t = n_i;
-            int _shfl_up_5 = __shfl_up_sync(0xFFFFFFFF, incl_t, 1, 32);
+            int _shfl_up_0 = __shfl_up_sync(0xFFFFFFFF, incl_t, 1, 32);
             if (lane_s >= 1) {
-                incl_t = incl_t + _shfl_up_5;
+                incl_t = incl_t + _shfl_up_0;
             }
-            int _shfl_up_6 = __shfl_up_sync(0xFFFFFFFF, incl_t, 2, 32);
+            int _shfl_up_1 = __shfl_up_sync(0xFFFFFFFF, incl_t, 2, 32);
             if (lane_s >= 2) {
-                incl_t = incl_t + _shfl_up_6;
+                incl_t = incl_t + _shfl_up_1;
             }
-            int _shfl_up_7 = __shfl_up_sync(0xFFFFFFFF, incl_t, 4, 32);
+            int _shfl_up_2 = __shfl_up_sync(0xFFFFFFFF, incl_t, 4, 32);
             if (lane_s >= 4) {
-                incl_t = incl_t + _shfl_up_7;
+                incl_t = incl_t + _shfl_up_2;
             }
-            int _shfl_up_8 = __shfl_up_sync(0xFFFFFFFF, incl_t, 8, 32);
+            int _shfl_up_3 = __shfl_up_sync(0xFFFFFFFF, incl_t, 8, 32);
             if (lane_s >= 8) {
-                incl_t = incl_t + _shfl_up_8;
+                incl_t = incl_t + _shfl_up_3;
             }
-            int _shfl_up_9 = __shfl_up_sync(0xFFFFFFFF, incl_t, 16, 32);
+            int _shfl_up_4 = __shfl_up_sync(0xFFFFFFFF, incl_t, 16, 32);
             if (lane_s >= 16) {
-                incl_t = incl_t + _shfl_up_9;
+                incl_t = incl_t + _shfl_up_4;
             }
             if (lane_s == 31) {
                 warp_tot[warp_t] = incl_t;
@@ -497,17 +486,17 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                     wt = warp_tot[lane_s];
                 }
                 int wincl = wt;
-                int _shfl_up_10 = __shfl_up_sync(0xFFFFFFFF, wincl, 1, 32);
+                int _shfl_up_5 = __shfl_up_sync(0xFFFFFFFF, wincl, 1, 32);
                 if (lane_s >= 1) {
-                    wincl = wincl + _shfl_up_10;
+                    wincl = wincl + _shfl_up_5;
                 }
-                int _shfl_up_11 = __shfl_up_sync(0xFFFFFFFF, wincl, 2, 32);
+                int _shfl_up_6 = __shfl_up_sync(0xFFFFFFFF, wincl, 2, 32);
                 if (lane_s >= 2) {
-                    wincl = wincl + _shfl_up_11;
+                    wincl = wincl + _shfl_up_6;
                 }
-                int _shfl_up_12 = __shfl_up_sync(0xFFFFFFFF, wincl, 4, 32);
+                int _shfl_up_7 = __shfl_up_sync(0xFFFFFFFF, wincl, 4, 32);
                 if (lane_s >= 4) {
-                    wincl = wincl + _shfl_up_12;
+                    wincl = wincl + _shfl_up_7;
                 }
                 if (lane_s < 8) {
                     warp_tot[lane_s] = wincl - wt;
@@ -578,25 +567,25 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                     rem_t[tid_t] = rem;
                     __syncthreads();
                     int incl_t_0 = base_r;
-                    int _shfl_up_13 = __shfl_up_sync(0xFFFFFFFF, incl_t_0, 1, 32);
+                    int _shfl_up_8 = __shfl_up_sync(0xFFFFFFFF, incl_t_0, 1, 32);
                     if (lane_s >= 1) {
-                        incl_t_0 = incl_t_0 + _shfl_up_13;
+                        incl_t_0 = incl_t_0 + _shfl_up_8;
                     }
-                    int _shfl_up_14 = __shfl_up_sync(0xFFFFFFFF, incl_t_0, 2, 32);
+                    int _shfl_up_9 = __shfl_up_sync(0xFFFFFFFF, incl_t_0, 2, 32);
                     if (lane_s >= 2) {
-                        incl_t_0 = incl_t_0 + _shfl_up_14;
+                        incl_t_0 = incl_t_0 + _shfl_up_9;
                     }
-                    int _shfl_up_15 = __shfl_up_sync(0xFFFFFFFF, incl_t_0, 4, 32);
+                    int _shfl_up_10 = __shfl_up_sync(0xFFFFFFFF, incl_t_0, 4, 32);
                     if (lane_s >= 4) {
-                        incl_t_0 = incl_t_0 + _shfl_up_15;
+                        incl_t_0 = incl_t_0 + _shfl_up_10;
                     }
-                    int _shfl_up_16 = __shfl_up_sync(0xFFFFFFFF, incl_t_0, 8, 32);
+                    int _shfl_up_11 = __shfl_up_sync(0xFFFFFFFF, incl_t_0, 8, 32);
                     if (lane_s >= 8) {
-                        incl_t_0 = incl_t_0 + _shfl_up_16;
+                        incl_t_0 = incl_t_0 + _shfl_up_11;
                     }
-                    int _shfl_up_17 = __shfl_up_sync(0xFFFFFFFF, incl_t_0, 16, 32);
+                    int _shfl_up_12 = __shfl_up_sync(0xFFFFFFFF, incl_t_0, 16, 32);
                     if (lane_s >= 16) {
-                        incl_t_0 = incl_t_0 + _shfl_up_17;
+                        incl_t_0 = incl_t_0 + _shfl_up_12;
                     }
                     if (lane_s == 31) {
                         warp_tot[warp_t] = incl_t_0;
@@ -608,17 +597,17 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                             wt_1 = warp_tot[lane_s];
                         }
                         int wincl_1 = wt_1;
-                        int _shfl_up_18 = __shfl_up_sync(0xFFFFFFFF, wincl_1, 1, 32);
+                        int _shfl_up_13 = __shfl_up_sync(0xFFFFFFFF, wincl_1, 1, 32);
                         if (lane_s >= 1) {
-                            wincl_1 = wincl_1 + _shfl_up_18;
+                            wincl_1 = wincl_1 + _shfl_up_13;
                         }
-                        int _shfl_up_19 = __shfl_up_sync(0xFFFFFFFF, wincl_1, 2, 32);
+                        int _shfl_up_14 = __shfl_up_sync(0xFFFFFFFF, wincl_1, 2, 32);
                         if (lane_s >= 2) {
-                            wincl_1 = wincl_1 + _shfl_up_19;
+                            wincl_1 = wincl_1 + _shfl_up_14;
                         }
-                        int _shfl_up_20 = __shfl_up_sync(0xFFFFFFFF, wincl_1, 4, 32);
+                        int _shfl_up_15 = __shfl_up_sync(0xFFFFFFFF, wincl_1, 4, 32);
                         if (lane_s >= 4) {
-                            wincl_1 = wincl_1 + _shfl_up_20;
+                            wincl_1 = wincl_1 + _shfl_up_15;
                         }
                         if (lane_s < 8) {
                             warp_tot[lane_s] = wincl_1 - wt_1;
@@ -671,25 +660,25 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                     int my = nseg_t[tid_t];
                     __syncthreads();
                     int incl_t_3 = my;
-                    int _shfl_up_21 = __shfl_up_sync(0xFFFFFFFF, incl_t_3, 1, 32);
+                    int _shfl_up_16 = __shfl_up_sync(0xFFFFFFFF, incl_t_3, 1, 32);
                     if (lane_s >= 1) {
-                        incl_t_3 = incl_t_3 + _shfl_up_21;
+                        incl_t_3 = incl_t_3 + _shfl_up_16;
                     }
-                    int _shfl_up_22 = __shfl_up_sync(0xFFFFFFFF, incl_t_3, 2, 32);
+                    int _shfl_up_17 = __shfl_up_sync(0xFFFFFFFF, incl_t_3, 2, 32);
                     if (lane_s >= 2) {
-                        incl_t_3 = incl_t_3 + _shfl_up_22;
+                        incl_t_3 = incl_t_3 + _shfl_up_17;
                     }
-                    int _shfl_up_23 = __shfl_up_sync(0xFFFFFFFF, incl_t_3, 4, 32);
+                    int _shfl_up_18 = __shfl_up_sync(0xFFFFFFFF, incl_t_3, 4, 32);
                     if (lane_s >= 4) {
-                        incl_t_3 = incl_t_3 + _shfl_up_23;
+                        incl_t_3 = incl_t_3 + _shfl_up_18;
                     }
-                    int _shfl_up_24 = __shfl_up_sync(0xFFFFFFFF, incl_t_3, 8, 32);
+                    int _shfl_up_19 = __shfl_up_sync(0xFFFFFFFF, incl_t_3, 8, 32);
                     if (lane_s >= 8) {
-                        incl_t_3 = incl_t_3 + _shfl_up_24;
+                        incl_t_3 = incl_t_3 + _shfl_up_19;
                     }
-                    int _shfl_up_25 = __shfl_up_sync(0xFFFFFFFF, incl_t_3, 16, 32);
+                    int _shfl_up_20 = __shfl_up_sync(0xFFFFFFFF, incl_t_3, 16, 32);
                     if (lane_s >= 16) {
-                        incl_t_3 = incl_t_3 + _shfl_up_25;
+                        incl_t_3 = incl_t_3 + _shfl_up_20;
                     }
                     if (lane_s == 31) {
                         warp_tot[warp_t] = incl_t_3;
@@ -701,17 +690,17 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
                             wt_2 = warp_tot[lane_s];
                         }
                         int wincl_2 = wt_2;
-                        int _shfl_up_26 = __shfl_up_sync(0xFFFFFFFF, wincl_2, 1, 32);
+                        int _shfl_up_21 = __shfl_up_sync(0xFFFFFFFF, wincl_2, 1, 32);
                         if (lane_s >= 1) {
-                            wincl_2 = wincl_2 + _shfl_up_26;
+                            wincl_2 = wincl_2 + _shfl_up_21;
                         }
-                        int _shfl_up_27 = __shfl_up_sync(0xFFFFFFFF, wincl_2, 2, 32);
+                        int _shfl_up_22 = __shfl_up_sync(0xFFFFFFFF, wincl_2, 2, 32);
                         if (lane_s >= 2) {
-                            wincl_2 = wincl_2 + _shfl_up_27;
+                            wincl_2 = wincl_2 + _shfl_up_22;
                         }
-                        int _shfl_up_28 = __shfl_up_sync(0xFFFFFFFF, wincl_2, 4, 32);
+                        int _shfl_up_23 = __shfl_up_sync(0xFFFFFFFF, wincl_2, 4, 32);
                         if (lane_s >= 4) {
-                            wincl_2 = wincl_2 + _shfl_up_28;
+                            wincl_2 = wincl_2 + _shfl_up_23;
                         }
                         if (lane_s < 8) {
                             warp_tot[lane_s] = wincl_2 - wt_2;
@@ -1207,10 +1196,10 @@ kernel_cake_kda_train_94c7d1cc6c908d53e8c1(const __grid_constant__ CUtensorMap q
             }
         }
     }
-    unsigned int _phase_ring_empty_0 = 1;
-    unsigned int _phase_ring_empty_1 = 1;
     unsigned int _phase_q_full = 0;
+    unsigned int _phase_ring_empty_0 = 1;
     unsigned int _phase_acc_done_0 = 0;
+    unsigned int _phase_ring_empty_1 = 1;
     #pragma unroll 1
     for (int i = 0; i < 4; i++) {
         int fill = fmask >> i * 4 + q4 & 1;

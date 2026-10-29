@@ -45,9 +45,11 @@ Contract
   gradient ``g`` and performs the single cast ``dX = bf16(g * dX_acc)``,
   ``dW = cast(g * dW_acc)`` -- never mutating the saved accumulators, so a
   retained graph may run the backward repeatedly.  Entry (b)
-  ``chunked_lm_head_logprob``: the forward saves only the FP32 row statistic
-  ``lse[T]``; the backward recomputes each chunk's logits (four GEMMs) with the
-  incoming ``dlogp`` as ``d_t`` (masked to valid rows).
+  ``chunked_lm_head_logprob``: the forward saves the FP32 row statistic
+  ``lse[T]`` and the valid-row index, so the backward plans its chunks without
+  counting the rows again (no host synchronization); the backward recomputes
+  each chunk's logits (four GEMMs) with the incoming ``dlogp`` as ``d_t``
+  (masked to valid rows).
 * Memory rule: no logits / dlogits / probability buffer spans more than ``C``
   tokens (a batch smaller than ``C`` is one chunk).  :func:`memory_report`
   states the peak temporary bytes separately from the model weights, the
@@ -55,8 +57,10 @@ Contract
 * Valid-row compaction (``compact_rows``, default on): when some labels are
   ``-100`` the chunk loop runs over the valid rows only -- the row index
   ``idx = (labels >= 0).nonzero()`` is formed once per call (one device
-  synchronization for the count, one for the index), each chunk's rows of
-  ``X`` are gathered into one reusable BF16 ``[C, H]`` buffer, the row operands
+  synchronization, ``nonzero``'s count, for the count and the index together:
+  :func:`valid_rows`, which forms them on the host from the mask's readback
+  for calls of at most :data:`HOST_COUNT_MAX_ROWS` rows; the log-probability
+  backward reuses the forward's index), each chunk's rows of ``X`` are gathered into one reusable BF16 ``[C, H]`` buffer, the row operands
   are compacted to ``[T_v]``, the FP32 ``dX`` accumulator is ``[T_v, H]`` and
   ``logp`` / ``dX`` are scattered back to ``[T]`` with exact zeros on the
   ignored rows.  Ignored rows contribute exactly zero to the loss and both
@@ -65,6 +69,13 @@ Contract
   whenever the chunk's K-slice count agrees; the ``loss`` and ``dW``
   reductions run over different chunk boundaries, hence differ by FP32
   rounding.  All rows valid: the uncompacted path (no gather, no scatter).
+  On this host-count path (calls the hidden valid-row count below does not
+  serve) a remembered forward launches chunk 0's row gather and logits GEMM
+  right behind the count and binds the rest of the call -- the compacted
+  labels, the policy operands, the row vectors, the accumulators -- behind
+  them (:func:`forward_early_keys`): the same kernels on the same operands in
+  the same stream order per kernel, so every output is bitwise the in-order
+  sequence's.
 * Fused dX finalize (``dx_finalize``, default on): the K-slice slabs of a sliced dX GEMM are added into ``dX_acc`` by one
   fixed-order kernel (``slab_sum``) instead of the host's chain of in-place
   ``add_`` launches, and a compacted call's dX output boundary writes the
@@ -104,6 +115,17 @@ Contract
   (``hidden_count=False`` restores it).  Calls the device-count GEMM cannot serve -- an ``X`` that needs a
   contiguous copy or whose base is not 16-byte aligned, a program without the
   kernels -- take the shipped path.
+* Log-probability logits GEMM arms (``logprob_dz`` / ``logprob_lbl``, default
+  on; ``cake`` backend, records that register them): the backward's
+  recompute of each chunk is one ``gemm_logits_dz`` launch whose epilogue
+  writes ``dz_c = bf16(d_t * (1[v = y_t] - exp(z - lse_t)))`` -- the
+  per-element sequence of ``row_grad`` on the same BF16-rounded logits, zeros
+  on ignored rows -- in place of the logits, so ``row_grad`` and the logits
+  store disappear; the forward's logits GEMM ``gemm_logits_lbl`` writes the
+  row statistics and the logit at the (clamped) label column alone, the one
+  element ``row_finalize`` reads.  The same arithmetic per element, so
+  ``lse`` / ``logp`` / ``dX`` / ``dW`` are bitwise the previous path's
+  (``logprob_dz=False`` / ``logprob_lbl=False`` restore it).
 * ``deterministic=True`` (the only mode this backend serves): fixed sequential
   chunk order, no atomics -- bitwise reproducible ``loss``, ``logp``, ``dX``
   and ``dW`` across runs.
@@ -129,12 +151,14 @@ returns loss 0, an empty ``logp`` and zero gradients without binding or
 launching anything.
 
 Every switch of this module (``compact_rows``, ``fuse_dw_cast``,
-``dx_finalize``, ``dw_stream``, ``hidden_count``, ``gemm_tuning``) is a keyword
-argument of the entry points that it affects, ``None`` selecting the documented
-default (the ``*_default()`` functions); the binding cache is configured through
+``dx_finalize``, ``dw_stream``, ``hidden_count``, ``gemm_tuning``,
+``logprob_dz``, ``logprob_lbl``) is a keyword argument of the entry points
+that it affects, ``None`` selecting the documented default (the
+``*_default()`` functions); the binding cache is configured through
 :meth:`BindingCache.configure`.  This module reads no environment variable.
 FlashInfer's public wrapper (``flashinfer.chunked_lm_head``) owns the A/B
-environment variables of these switches and passes the resolved values down.
+environment variables of the first six and passes the resolved values down;
+it leaves the log-probability arms at their defaults.
 """
 
 from __future__ import annotations
@@ -182,6 +206,13 @@ ABI_CONTRACT = "lm_head_loss_v1"
 # plan on the count after the readback, the launches it orders) is hidden behind chunk 0's logits GEMM only from there; one- and
 # two-chunk calls measured 5-16 % slower with it than on the host-count path (same kernels, bitwise the same outputs).
 HIDDEN_COUNT_MIN_CHUNKS = 3
+# Calls of at most this many rows form the valid-row count and index of the host-count path on the host
+# (:func:`valid_rows`): the bool mask ``labels >= 0`` comes back in one copy of ``T`` bytes -- the call's one
+# synchronization -- and the index goes back in one copy, instead of ``nonzero``'s count, scan and select kernels and
+# their API calls.  Above it the device forms the index.  The same index and mask either way.  With some rows ignored,
+# the index copy back makes :func:`valid_rows` alone a few microseconds slower than the device path from about 128 rows
+# up (2-6 us measured at 512-1024 rows).
+HOST_COUNT_MAX_ROWS = 1024
 SUPPORTED_ABIS = (ABI_CONTRACT,)
 
 # Geometry the kernels of a record were built for (record field ``geometry``;
@@ -235,6 +266,9 @@ _GEOMETRY_OPTIONAL = ("hidden", "vocab")
 # the casts, and ``T`` / ``H`` / ``C`` for grid rules.
 STAGE_TENSORS = {
     **{stage: ("A", "B", "C", "STATS_OUT", "WS") for stage in GEMM_STAGES},
+    # the log-probability arms of the logits GEMM also read the per-token rows (``d_in`` = the kernel's ``dlogp``)
+    "gemm_logits_dz": ("A", "B", "C", "STATS_OUT", "WS", "labels", "lse", "d_in"),
+    "gemm_logits_lbl": ("A", "B", "C", "STATS_OUT", "WS", "labels"),
     "row_finalize": (
         "stats",
         "z",
@@ -305,6 +339,23 @@ DX_SLICED_STAGE = "gemm_dx_s"
 # operations in the same order as ``gemm_dw_acc`` followed by ``scale_cast_*``, so the weight gradient is bitwise
 # identical; the flat ``scale_cast`` pass over ``dW`` disappears.  Selected by ``fuse_dw_cast`` (default on).
 DW_CAST_STAGES = ("gemm_dw_cast_bf16", "gemm_dw_cast_f32")
+# TMA-epilogue form of the deferred BF16 dW cast (``gemm_dw_cast_bf16_tma``): the old FP32 sum is read and the
+# BF16 tile is stored as TMA sub-tiles.  It runs the cast of the LAST chunk of a call of >= 2 chunks whose last
+# chunk has 1 .. DW_CAST_TMA_MAX_ROWS[arch] rows (:func:`dw_cast_tma_rule`); the per-element (old + acc) * g
+# and its round-to-nearest order are the shipped form's, so dW is bitwise the same.  A one-chunk call has no old
+# sum to read and keeps the shipped form.
+DW_CAST_TMA_MAX_ROWS: dict[str, int] = {"sm_100a": 1792, "sm_103a": 1792}
+
+
+def dw_cast_tma_rule(num_chunks: int, rows_last: int, arch: Optional[str]) -> bool:
+    """Does the deferred BF16 dW cast of a call of ``num_chunks`` chunks, whose last chunk has ``rows_last``
+    rows, run the TMA-epilogue form on ``arch``?"""
+    limit = DW_CAST_TMA_MAX_ROWS.get(arch) if arch is not None else None
+    return (
+        limit is not None and int(num_chunks) >= 2 and 0 < int(rows_last) <= int(limit)
+    )
+
+
 # Fused dX finalize (``dx_finalize``, default on): ``slab_sum`` adds the FP32 K-slice slabs of a sliced dX GEMM into
 # the chunk's rows of ``dX_acc`` in ascending slab order in one launch (one RN add per element per slab -- the
 # evaluation order of the host's ``add_`` chain, ``dX_acc`` read and written once instead of once per slab), and
@@ -320,6 +371,21 @@ DX_FINALIZE_STAGES = ("slab_sum", "scale_cast_scatter_bf16")
 # its device-count form (the ``_mcnt`` variants: ``WS`` is that cell and every store is bounded by ``min(WS[0], M)`` while
 # ``M`` / ``m_tiles`` / the raster rule are the buffer extent ``min(chunk, T)``), both before the count reaches the host.
 HIDDEN_COUNT_STAGE = "gather_rows_bf16"
+# The log-probability entry's logits GEMM arms (one launch per chunk each, no device-count form):
+# ``gemm_logits_dz`` -- the backward's recompute writes ``dz_c = bf16(dlogp_t * (1[v = y_t] - exp(z - lse_t)))`` from its
+# epilogue (``row_grad``'s per-element sequence on the same BF16-rounded logits, zeros on ignored rows), so the recompute
+# is one launch and never stores ``z``: bitwise ``gemm_logits_nostats`` + ``row_grad``; ``gemm_logits_lbl`` -- the
+# forward's logits GEMM writes the row statistics and ``z`` at the (clamped) label column alone, the one element
+# ``row_finalize`` reads: bitwise the same ``lse`` / ``logp``.  Selected by the ``logprob_dz`` / ``logprob_lbl`` switches
+# (default on: :func:`logprob_dz_default` / :func:`logprob_lbl_default`) when the record registers them.
+LOGPROB_DZ_STAGE = "gemm_logits_dz"
+LOGPROB_LBL_STAGE = "gemm_logits_lbl"
+LOGITS_BASES = (
+    "gemm_logits",
+    "gemm_logits_nostats",
+    LOGPROB_DZ_STAGE,
+    LOGPROB_LBL_STAGE,
+)
 K_SLICE_PENALTY = 0.01  # wave-efficiency score penalty per extra slab (the kernels' fitted per-slab cost share)
 
 # --------------------------------------------------------------------------- per-chunk instance rules
@@ -399,16 +465,54 @@ DX_WIDE_MIN_EFF = {
 }  # wave-efficiency floor of a one-slice 512-wide dX launch below RASTER_RULE_MIN_HIDDEN, per architecture; below it the
 #    256-wide cluster form runs the chunk (absent = the wide tile stays)
 DX_K_SLICES_MAX = 4
+# Mixed-width last wave of the wide dX tile (``_split``): on an architecture listed here, a chunk whose wide work items
+# leave a last wave of ``r`` items on ``P`` SM pairs with ``0 < r <= P / 2`` runs its last ``F = r`` wide items as ``2 F``
+# 256-wide half items in the same launch (the grid carries ``W + F`` clusters, :func:`dx_split_rule`).  A chunk of whole
+# 512-token tiles takes the rule only below RASTER_RULE_MIN_HIDDEN (:func:`dx_split_eligible`): in every call on an
+# architecture in DX_SPLIT_WHOLE_ARCHES, and in a call of fewer than DW_STREAM_MIN_CHUNKS chunks on one in
+# DX_SPLIT_WHOLE_FEW_CHUNKS_ARCHES -- there the weight-gradient accumulate shares the dX GEMM's stream
+# (:func:`dw_side_stream`), so nothing else fills the last wave; in a longer call the side stream's accumulate does.
+# Elsewhere a whole chunk keeps its full items.  Bitwise: the same K slices and per-element K order on both widths.
+DX_SPLIT_ARCHES = (
+    "sm_100a",
+    "sm_103a",
+)
+DX_SPLIT_LONG_RING_ARCHES = (
+    "sm_103a",
+)  # architectures whose long-chunk ring (``_st3``) also takes the split (on sm_100a it ran slower at the power limit)
+DX_SPLIT_WHOLE_ARCHES: tuple[str, ...] = (
+    "sm_103a",
+)  # whole-tile chunks below RASTER_RULE_MIN_HIDDEN split in every call
+DX_SPLIT_WHOLE_FEW_CHUNKS_ARCHES: tuple[str, ...] = (
+    "sm_100a",
+)  # ... only in a call of fewer than DW_STREAM_MIN_CHUNKS chunks
+DX_TOKEN_TILE = 512  # rows of a whole dX token tile (:func:`dx_whole_tiles`)
+# Swapped dX tile (``_swab``): dX^T = W^T dz^T, W's 128 hidden columns of a CTA on the MMA's M and the chunk's
+# 512-token tile on its N (two 256-token blocks), C stored per thread.  On an architecture listed here it runs a chunk
+# of whole 512-token tiles of a cross-entropy loss call of >= DW_STREAM_MIN_CHUNKS chunks (:func:`dx_swab_rule`), ahead
+# of the split-tail rule and of the H >= RASTER_RULE_MIN_HIDDEN base form.  Bitwise: the same bf16 products summed
+# over the same K slices in the same K order.
+DX_SWAB_ARCHES: tuple[str, ...] = ("sm_103a",)
 _TUNING_KNOBS = {
     "logits": ("group_m",),
-    "dx": ("k_slices", "tile_n", "stages"),
+    "dx": ("k_slices", "tile_n", "stages", "split", "swap_ab"),
     "dw": ("group_m", "epi_store", "group_n"),
 }
 _STAGE_RE = re.compile(
     r"(?P<base>" + "|".join(sorted(BASE_STAGES, key=len, reverse=True)) + r")"
-    r"(?P<mcnt>_mcnt)?(?P<s>_s)?(?:_tn(?P<tile>\d+))?(?:_st(?P<stages>\d+))?(?P<gn>_gn)?(?P<tma>_tma)?"
+    r"(?P<mcnt>_mcnt)?(?P<s>_s)?(?:_tn(?P<tile>\d+))?(?:_st(?P<stages>\d+))?(?P<split>_split)?(?P<swab>_swab)?"
+    r"(?P<gn>_gn)?(?P<tma>_tma)?"
 )
-STAGE_KNOBS = ("count", "sliced", "tile_n", "stages", "blocked", "epi_store")
+STAGE_KNOBS = (
+    "count",
+    "sliced",
+    "tile_n",
+    "stages",
+    "split",
+    "swab",
+    "blocked",
+    "epi_store",
+)
 
 
 def stage_variant(
@@ -418,17 +522,22 @@ def stage_variant(
     sliced: bool = False,
     tile_n: Optional[int] = None,
     stages: Optional[int] = None,
+    split: bool = False,
+    swab: bool = False,
     blocked: bool = False,
     epi_store: Optional[str] = None,
 ) -> str:
     """Stage name of one structural form of ``base``: the rule outputs that select a kernel body, in the fixed suffix
-    order ``_mcnt``, ``_s``, ``_tn256``, ``_st<stages>``, ``_gn``, ``_tma``; a default output (the host-bound row count,
-    one slice, the wide tile, the table ring depth, the 1-D raster, the default epilogue) adds nothing, so
+    order ``_mcnt``, ``_s``, ``_tn256``, ``_st<stages>``, ``_split``, ``_swab``, ``_gn``, ``_tma``; ``split``: the wide
+    dX tile with its last wave's trailing items run as half items (:func:`dx_split_rule`); ``swab``: the wide dX tile
+    with swapped operands at the table ring depth (:func:`dx_swab_rule`); a default output (the host-bound row
+    count, one slice, the wide tile, the table ring depth, the 1-D raster, the default epilogue) adds nothing, so
     ``stage_variant(base)`` is ``base`` itself.  ``count``: the logits GEMM whose valid-row bound is read from device
     memory (chunk 0 of the hidden valid-row count path); ``sliced``: the dX GEMM run as ``k_slices > 1`` K-slice work
     items per tile; ``blocked``: the weight-gradient accumulate / fp32 fused cast on the 2-D blocked raster
-    (``group_n`` set).  The slice count, the raster height and the block width themselves are launch scalars
-    (:func:`gemm_scalars`), not part of the name."""
+    (``group_n`` set); ``epi_store="tma"``: the weight-gradient accumulate's TMA reduce-add or the bf16 fused cast's
+    TMA store (:func:`dw_cast_tma_rule`).  The slice count, the raster height and the block width themselves are
+    launch scalars (:func:`gemm_scalars`), not part of the name."""
     if base not in BASE_STAGES:
         raise ValueError(f"unknown base stage {base!r}")
     name = base
@@ -460,6 +569,20 @@ def stage_variant(
                 f"{base}: the only ring-depth form is the 512-wide dX tile's {sorted(set(DX_LONG_CHUNK_STAGES.values()))}-deep ring, got {stages} (tile {tile_n})"
             )
         name += f"_st{int(stages)}"
+    if split or swab:
+        if base != "gemm_dx" or (tile_n is not None and int(tile_n) != DX_TILE_WIDE):
+            raise ValueError(
+                f"{base}: the split-tail and swapped forms exist for the wide dX tile only"
+            )
+        if split and swab:
+            raise ValueError(
+                f"{base}: the split-tail and swapped dX forms exclude each other"
+            )
+        if swab and stages is not None and int(stages) != DX_WIDE_TILE_STAGES:
+            raise ValueError(
+                f"{base}: the swapped dX tile runs the table ring depth only"
+            )
+        name += "_split" if split else "_swab"
     if blocked:
         if base not in DW_BLOCK_BASES:
             raise ValueError(
@@ -467,17 +590,19 @@ def stage_variant(
             )
         name += "_gn"
     if epi_store is not None and epi_store != "redsm":
-        if base != "gemm_dw_acc" or epi_store != "tma":
+        if base not in ("gemm_dw_acc", "gemm_dw_cast_bf16") or epi_store != "tma":
             raise ValueError(
-                f"{base}: the only epilogue variant is the weight-gradient accumulate's TMA reduce-add, got {epi_store!r}"
+                f"{base}: the only epilogue variants are the weight-gradient accumulate's TMA reduce-add and the bf16 fused cast's TMA store, got {epi_store!r}"
             )
         name += "_tma"
     return name
 
 
-def parse_stage(stage: str) -> tuple[str, dict[str, Any]]:
-    """``(base, {count, sliced, tile_n, stages, blocked, epi_store})`` of a stage name (the inverse of
-    :func:`stage_variant`; the knob keys are ``STAGE_KNOBS``)."""
+@functools.lru_cache(maxsize=1024)
+def _parse_stage(stage: str) -> tuple[str, tuple[tuple[str, Any], ...]]:
+    """:func:`parse_stage` with the knobs as an immutable tuple: the stage names of the records are a fixed set, so the
+    regular expression and the :func:`stage_variant` round trip run once per name (bounded; a failed parse is not
+    remembered)."""
     m = _STAGE_RE.fullmatch(stage)
     if m is None:
         raise ValueError(f"not a stage name of this backend: {stage!r}")
@@ -486,24 +611,33 @@ def parse_stage(stage: str) -> tuple[str, dict[str, Any]]:
         sliced=bool(m["s"]),
         tile_n=int(m["tile"]) if m["tile"] else None,
         stages=int(m["stages"]) if m["stages"] else None,
+        split=bool(m["split"]),
+        swab=bool(m["swab"]),
         blocked=bool(m["gn"]),
         epi_store="tma" if m["tma"] else None,
     )
     if stage_variant(m["base"], **knobs) != stage:
         raise ValueError(f"not a stage name of this backend: {stage!r}")
-    return m["base"], knobs
+    return m["base"], tuple(knobs.items())
+
+
+def parse_stage(stage: str) -> tuple[str, dict[str, Any]]:
+    """``(base, {count, sliced, tile_n, stages, split, blocked, epi_store})`` of a stage name (the inverse of
+    :func:`stage_variant`; the knob keys are ``STAGE_KNOBS``)."""
+    base, knobs = _parse_stage(stage)
+    return base, dict(knobs)
 
 
 def base_stage(stage: str) -> str:
     """The base stage a (variant) stage name instantiates."""
-    return parse_stage(stage)[0]
+    return _parse_stage(stage)[0]
 
 
 def gemm_op(stage: str) -> str:
     """``"logits"`` / ``"dx"`` / ``"dw"``: the GEMM a (variant) stage name instantiates (``ValueError`` for a row
     kernel)."""
     base = base_stage(stage)
-    if base in ("gemm_logits", "gemm_logits_nostats"):
+    if base in LOGITS_BASES:
         return "logits"
     if base == "gemm_dx":
         return "dx"
@@ -611,6 +745,102 @@ def dx_tile_rule(
     return DX_TILE_WIDE
 
 
+def dx_split_rule(
+    rows_c: int,
+    hidden: int,
+    num_sms: int,
+    k_slices: int,
+    geometry: "Geometry",
+    arch: Optional[str],
+    tile_n: Optional[int],
+    stages: Optional[int] = None,
+) -> int:
+    """Wide dX items of a chunk run as half items (``F``, 0 = none): on an architecture in ``DX_SPLIT_ARCHES``, the
+    wide tile's ``W = (row pairs) x (H / 512) x k_slices`` items leave ``r = W mod P`` items in the last wave of the
+    ``P`` SM pairs; ``0 < r <= P / 2`` splits those ``r`` (the half items fill the wave's idle pairs).  A chunk on the
+    long-chunk ring (``stages``) splits only on an architecture in ``DX_SPLIT_LONG_RING_ARCHES``.  Deterministic in the
+    shapes, the slice count, the SM count and the architecture."""
+    if arch not in DX_SPLIT_ARCHES or (
+        tile_n is not None and int(tile_n) != DX_TILE_WIDE
+    ):
+        return 0
+    if (
+        stages is not None
+        and int(stages) != DX_WIDE_TILE_STAGES
+        and arch not in DX_SPLIT_LONG_RING_ARCHES
+    ):
+        return 0
+    wide, pairs = dx_wide_items(rows_c, hidden, num_sms, k_slices, geometry)
+    r = wide % pairs
+    return r if 0 < r <= pairs // 2 else 0
+
+
+def dx_wide_items(
+    rows_c: int, hidden: int, num_sms: int, k_slices: int, geometry: "Geometry"
+) -> tuple[int, int]:
+    """The wide dX tile's work items ``W = (row pairs) x (H / 512) x k_slices`` of a chunk and the SM pairs ``P``."""
+    ctas = int(geometry.cta_group)
+    wide = (
+        (geometry.row_tiles(rows_c, ctas) // ctas)
+        * (int(hidden) // DX_TILE_WIDE)
+        * max(1, int(k_slices))
+    )
+    return wide, max(1, int(num_sms) // ctas)
+
+
+def dx_whole_tiles(rows_c: int, hidden: int, tile_n: Optional[int]) -> bool:
+    """The chunk runs the wide tile and its rows are a whole number of ``DX_TOKEN_TILE`` token tiles."""
+    if (tile_n is not None and int(tile_n) != DX_TILE_WIDE) or int(
+        hidden
+    ) % DX_TILE_WIDE:
+        return False
+    return int(rows_c) > 0 and int(rows_c) % DX_TOKEN_TILE == 0
+
+
+def dx_split_eligible(
+    rows_c: int,
+    hidden: int,
+    arch: Optional[str],
+    tile_n: Optional[int],
+    num_chunks: Optional[int] = None,
+) -> bool:
+    """The chunk may take the split-tail rule (:func:`dx_split_rule`): a chunk that is not a whole number of
+    ``DX_TOKEN_TILE`` token tiles always; a chunk of whole token tiles only below ``RASTER_RULE_MIN_HIDDEN``, in every call
+    on an architecture in ``DX_SPLIT_WHOLE_ARCHES`` and in a call of ``num_chunks < DW_STREAM_MIN_CHUNKS`` chunks on one
+    in ``DX_SPLIT_WHOLE_FEW_CHUNKS_ARCHES`` (``None``: the call's chunk count is unknown -- no)."""
+    if not dx_whole_tiles(rows_c, hidden, tile_n):
+        return True
+    if int(hidden) >= RASTER_RULE_MIN_HIDDEN:
+        return False
+    if arch in DX_SPLIT_WHOLE_ARCHES:
+        return True
+    return (
+        arch in DX_SPLIT_WHOLE_FEW_CHUNKS_ARCHES
+        and num_chunks is not None
+        and int(num_chunks) < DW_STREAM_MIN_CHUNKS
+    )
+
+
+def dx_swab_rule(
+    rows_c: int,
+    hidden: int,
+    arch: Optional[str],
+    tile_n: Optional[int],
+    ce_loss: bool = False,
+    num_chunks: Optional[int] = None,
+) -> bool:
+    """The swapped dX tile runs a chunk of whole ``DX_TOKEN_TILE`` token tiles (wide tile) of a cross-entropy loss call
+    (``ce_loss``: the loss entry point with objective ``"ce"``; the policy objective and the log-probability entry point
+    keep the other forms) of ``num_chunks >= DW_STREAM_MIN_CHUNKS`` chunks on an architecture in ``DX_SWAB_ARCHES``."""
+    return (
+        arch in DX_SWAB_ARCHES
+        and bool(ce_loss)
+        and num_chunks is not None
+        and int(num_chunks) >= DW_STREAM_MIN_CHUNKS
+        and dx_whole_tiles(rows_c, hidden, tile_n)
+    )
+
+
 def gemm_tuning_default() -> dict[str, dict[str, Any]]:
     """Default of ``gemm_tuning`` (``{}``): no explicit GEMM knob, the per-chunk instance rules choose every form."""
     return {}
@@ -653,9 +883,16 @@ class ChunkVariants:
     logits_group_m: Optional[int] = None
     dx_tile_n: Optional[int] = None  # None = DX_TILE_WIDE
     dx_stages: Optional[int] = None  # None = the table ring depth
+    dx_split: Optional[int] = (
+        None  # None = no split-tail; F = the wide items run as half items (dx_split_rule)
+    )
+    dx_swab: bool = False  # the swapped dX tile (dx_swab_rule)
     dw_group_m: Optional[int] = None
     dw_epi_store: Optional[str] = None
     dw_group_n: Optional[int] = None  # None = the 1-D raster
+    dw_cast_tma: bool = (
+        False  # the deferred bf16 cast's TMA epilogue (dw_cast_tma_rule; last chunk)
+    )
 
 
 def chunk_variants(
@@ -666,9 +903,13 @@ def chunk_variants(
     geometry: "Geometry",
     arch: Optional[str],
     tuning: Optional[dict[str, dict[str, Any]]] = None,
+    num_chunks: Optional[int] = None,
+    ce_loss: bool = False,
 ) -> ChunkVariants:
     """Per-chunk instance knobs: the explicit ``tuning`` knob when present (``None`` pins the default), else the rule
-    of a registered program's architecture (``arch``; ``None`` -- the reference path -- plans the base stages)."""
+    of a registered program's architecture (``arch``; ``None`` -- the reference path -- plans the base stages).
+    ``num_chunks`` is the call's chunk count (the whole-chunk split rule of :func:`dx_split_eligible`); ``ce_loss``: the
+    call is a cross-entropy loss call (the swap rule :func:`dx_swab_rule`)."""
     tuning = tuning or {}
     logits_t, dx_t, dw_t = (tuning.get(op, {}) for op in ("logits", "dx", "dw"))
     raster = raster_variant(hidden, rows_c, arch)
@@ -692,6 +933,65 @@ def chunk_variants(
         stages = (
             dx_stages_variant(rows_c, hidden, tile, arch) if arch is not None else None
         )
+    # the swapped tile runs the table ring depth: an explicit ``stages`` other than it, like an explicit ``split``
+    # (``None`` included), keeps the pinned form and turns the swap rule off; with ``swap_ab=True`` it is an error
+    stages_off_table = (
+        "stages" in dx_t
+        and dx_t["stages"] is not None
+        and int(dx_t["stages"]) != DX_WIDE_TILE_STAGES
+    )
+    if "swap_ab" in dx_t:
+        # an explicit ``swap_ab=True`` applies to every chunk (as an explicit ``split`` does): a chunk whose resolved
+        # form cannot run the swapped tile is an error here, not a missing stage at bind time
+        swab = bool(dx_t["swap_ab"])
+        if swab and arch is not None and arch not in DX_SWAB_ARCHES:
+            raise ValueError(
+                f"gemm_tuning dx swap_ab=True: {arch} has no swapped dX program (architectures "
+                f"{', '.join(DX_SWAB_ARCHES)})"
+            )
+        if swab and stages_off_table:
+            raise ValueError(
+                f"gemm_tuning dx swap_ab=True: the swapped dX tile runs the {DX_WIDE_TILE_STAGES}-deep table ring "
+                f"only, got stages={dx_t['stages']}"
+            )
+        if swab and tile is not None and int(tile) != DX_TILE_WIDE:
+            how = (
+                "pinned"
+                if "tile_n" in dx_t
+                else "selected by the tile rule (the wide items do not fill the SM pairs)"
+            )
+            hint = (
+                f"H={int(hidden)} has no wide tile (H % {DX_TILE_WIDE} != 0)"
+                if int(hidden) % DX_TILE_WIDE
+                else f"pin tile_n={DX_TILE_WIDE} as well"
+            )
+            raise ValueError(
+                f"gemm_tuning dx swap_ab=True: the swapped dX form exists for the {DX_TILE_WIDE}-column tile only, "
+                f"but the chunk of {int(rows_c)} rows resolves tile_n={int(tile)} ({how}); {hint}"
+            )
+    else:
+        swab = (
+            arch is not None
+            and "split" not in dx_t
+            and not stages_off_table
+            and dx_swab_rule(rows_c, hidden, arch, tile, ce_loss, num_chunks)
+        )
+    if "split" in dx_t:
+        split = 0 if dx_t["split"] is None else int(dx_t["split"])
+    elif swab:
+        split = 0  # the swapped tile takes precedence over the split-tail rule
+    elif arch is None or not dx_split_eligible(rows_c, hidden, arch, tile, num_chunks):
+        split = 0  # a chunk of whole token tiles keeps its full items where its half items cost more at the power limit
+    else:
+        split = dx_split_rule(
+            rows_c, hidden, num_sms, k_slices, geometry, arch, tile, stages
+        )
+    if swab:
+        stages = None  # the swapped tile runs the table ring depth
+    if split and swab:
+        raise ValueError(
+            "gemm_tuning: the dX split-tail and swapped forms exclude each other"
+        )
     epi = dw_t.get(
         "epi_store"
     )  # no rule selects an epilogue form (the SM103 TMA reduce-add rule was retired): explicit pins only
@@ -705,6 +1005,8 @@ def chunk_variants(
         dx_stages=None
         if stages is None or int(stages) == DX_WIDE_TILE_STAGES
         else int(stages),
+        dx_split=int(split) if split else None,
+        dx_swab=bool(swab),
         dw_group_m=None if dw_g is None else int(dw_g),
         dw_epi_store=None if epi in (None, "redsm") else str(epi),
         dw_group_n=None if gn in (None, 0) else int(gn),
@@ -733,8 +1035,17 @@ def reachable_variants(bases, arch: str, dx_max: int) -> set[str]:
                             base, sliced=sliced, tile_n=DX_TILE_WIDE, stages=st_long
                         )
                     )
+                if arch in DX_SPLIT_ARCHES:
+                    for st in (None, st_long):
+                        out.add(
+                            stage_variant(base, sliced=sliced, stages=st, split=True)
+                        )
+                if arch in DX_SWAB_ARCHES:
+                    out.add(stage_variant(base, sliced=sliced, swab=True))
         elif base in DW_BLOCK_BASES and blocked:
             out.add(stage_variant(base, blocked=True))
+        elif base == "gemm_dw_cast_bf16" and arch in DW_CAST_TMA_MAX_ROWS:
+            out.add(stage_variant(base, epi_store="tma"))
     return out
 
 
@@ -827,7 +1138,7 @@ class Geometry:
     def cluster_ctas_of(self, stage: str) -> Optional[int]:
         """CTAs per cluster of a GEMM stage (``None`` for the row kernels and the casts)."""
         base = base_stage(stage) if stage in GEMM_STAGES else stage
-        if base in ("gemm_logits", "gemm_logits_nostats"):
+        if base in LOGITS_BASES:
             return self.logits_cluster_ctas
         if base == "gemm_dx":
             return self.dx_cluster_ctas
@@ -878,7 +1189,11 @@ def record_abi(record: dict[str, Any]) -> str:
 
 
 def dx_stage(
-    k_slices: int, tile_n: Optional[int] = None, stages: Optional[int] = None
+    k_slices: int,
+    tile_n: Optional[int] = None,
+    stages: Optional[int] = None,
+    split: bool = False,
+    swab: bool = False,
 ) -> str:
     """Stage name of the dX GEMM run as ``k_slices`` K-slice work items per output tile (the ``_s`` form above one;
     ``tile_n`` = the pair tile's column width, ``None`` / ``DX_TILE_WIDE`` = the wide default; ``stages`` = the
@@ -888,7 +1203,12 @@ def dx_stage(
             f"the dX GEMM runs 1 .. {DX_K_SLICES_MAX} K slices per tile, got {k_slices}"
         )
     return stage_variant(
-        "gemm_dx", sliced=int(k_slices) > 1, tile_n=tile_n, stages=stages
+        "gemm_dx",
+        sliced=int(k_slices) > 1,
+        tile_n=tile_n,
+        stages=stages,
+        split=split,
+        swab=swab,
     )
 
 
@@ -917,7 +1237,37 @@ def gemm_scalars(
     the dX GEMM.  The logits GEMM always stores (``first_chunk`` 0 = no accumulate), the dX GEMM always stores its chunk's
     rows (1); ``first_chunk`` / ``ws_slab`` are taken from the arguments for the weight-gradient / dX GEMM only.  The
     form of ``stage`` must agree with the scalars (the ``_s`` form with ``k_slices > 1``, the ``_gn`` form with a
-    ``group_n``)."""
+    ``group_n``).  A pure function of its arguments, remembered per argument tuple (bounded; a rejected tuple is not
+    remembered); every call returns a fresh dict."""
+    return dict(
+        _gemm_scalars(
+            stage,
+            geometry,
+            hidden,
+            vocab,
+            rows_c,
+            k_slices,
+            group_m,
+            group_n,
+            first_chunk,
+            ws_slab,
+        )
+    )
+
+
+@functools.lru_cache(maxsize=4096)
+def _gemm_scalars(
+    stage: str,
+    geometry: "Geometry",
+    hidden: int,
+    vocab: int,
+    rows_c: int,
+    k_slices: int,
+    group_m: Optional[int],
+    group_n: Optional[int],
+    first_chunk: int,
+    ws_slab: int,
+) -> dict[str, int]:
     _base, knobs = parse_stage(stage)
     op = gemm_op(stage)
     hidden, vocab, rows_c = int(hidden), int(vocab), int(rows_c)
@@ -1074,6 +1424,39 @@ def _dx_reduce(values: dict[str, Any]) -> None:
 # ``*_default()`` returns); this module reads no environment variable.  FlashInfer's public wrapper
 # (``flashinfer.chunked_lm_head``) owns the A/B environment variables of these switches and passes the resolved values
 # down.
+
+
+def logprob_dz_default() -> bool:
+    """Default of ``logprob_dz`` (``True``; the log-probability backward): each chunk's recompute is one
+    ``gemm_logits_dz`` launch whose epilogue writes the row gradient ``dz`` in place of the logits where the record
+    registers that arm; ``False`` (or a record without it) recomputes the logits with ``gemm_logits_nostats`` and forms
+    ``dz`` with ``row_grad`` (bitwise the same ``dz``, hence the same ``dX`` / ``dW``)."""
+    return True
+
+
+def logprob_lbl_default() -> bool:
+    """Default of ``logprob_lbl`` (``True``; the log-probability forward): each chunk's logits GEMM is
+    ``gemm_logits_lbl``, which writes the row statistics and the logit at the label column alone (the one element
+    ``row_finalize`` reads) where the record registers that arm; ``False`` (or a record without it) writes the chunk's
+    whole logits with ``gemm_logits`` (bitwise the same ``lse`` / ``logp``)."""
+    return True
+
+
+def _resolve_logprob_dz(logprob_dz) -> bool:
+    return logprob_dz_default() if logprob_dz is None else bool(logprob_dz)
+
+
+def _resolve_logprob_lbl(logprob_lbl) -> bool:
+    return logprob_lbl_default() if logprob_lbl is None else bool(logprob_lbl)
+
+
+def _logprob_arm(
+    record: Optional[dict[str, Any]], stages: tuple, stage: str, switch: bool
+) -> bool:
+    """Whether a log-probability plan runs the logits GEMM arm ``stage`` (:data:`LOGPROB_DZ_STAGE` /
+    :data:`LOGPROB_LBL_STAGE`): its resolved switch is on and a registered program registers the arm (otherwise the
+    plan keeps the stages the arm replaces, bitwise the same outputs).  Resolved once per prepared binding."""
+    return bool(switch) and record is not None and stage in stages
 
 
 def compact_rows_default() -> bool:
@@ -1460,18 +1843,27 @@ def valid_rows(
     """``(row_index, row_valid)``.  ``row_index`` is ``None`` when every row is valid (or ``T == 0``: the uncompacted
     path, no gather cost), else the ascending int64 index of the valid rows (``labels >= 0``; ``-100`` is the ignore
     index).  Rows with a negative label contribute exactly zero to the loss, ``dX`` and ``dW``, so skipping them is
-    exact.  One device synchronization (the count) plus the ``nonzero`` synchronization when rows are ignored.
-    ``mask=True`` (the fused dX finalize of a call that produces ``dX``) also returns the already materialized bool
-    valid-row mask ``labels >= 0`` (``[T]``; :func:`finalize_dx` turns it into the inclusive int32 scan behind the
-    backward's queued GEMMs, not here in the synchronization shadow of ``nonzero``); ``None`` whenever ``row_index``
-    is."""
+    exact.  One device synchronization: ``nonzero`` reads its count back once and returns the index with it, so the
+    count is the index's length (every row valid: the index is dropped).  ``mask=True`` (the fused dX finalize of a
+    call that produces ``dX``) also returns the already materialized bool valid-row mask ``labels >= 0`` (``[T]``;
+    :func:`finalize_dx` turns it into the inclusive int32 scan behind the backward's queued GEMMs, not here in the
+    synchronization shadow of ``nonzero``); ``None`` whenever ``row_index`` is.  A CUDA call of at most
+    :data:`HOST_COUNT_MAX_ROWS` rows reads the mask back instead (the one synchronization) and forms the same index on
+    the host, copied back to the labels' device: no count or select kernels."""
     T = int(labels.numel())
     if T == 0:
         return None, None
     valid = labels >= 0
-    if int(valid.sum().item()) == T:
+    if T <= HOST_COUNT_MAX_ROWS and labels.is_cuda:
+        index = valid.cpu().nonzero().squeeze(1)
+        if int(index.numel()) == T:
+            return None, None
+        # pageable host memory: the copy is staged before it returns, so the host index may go right away
+        return index.to(labels.device, non_blocking=True), (valid if mask else None)
+    index = valid.nonzero().squeeze(1)
+    if int(index.numel()) == T:
         return None, None
-    return valid.nonzero().squeeze(1), (valid if mask else None)
+    return index, (valid if mask else None)
 
 
 def valid_row_index(labels: torch.Tensor) -> Optional[torch.Tensor]:
@@ -1800,6 +2192,10 @@ class Plan:
     hidden_count: bool = False
     hidden_logits_group_m: Optional[int] = None
     hidden_stats: bool = True
+    # the log-probability entry's logits GEMM arms (:data:`LOGPROB_DZ_STAGE`, :data:`LOGPROB_LBL_STAGE`): the backward's
+    # recompute writes ``dz`` itself (no ``row_grad``), the forward writes the statistics and the label column only
+    logprob_dz: bool = False
+    logprob_lbl: bool = False
 
     def variants_of(self, index: int) -> ChunkVariants:
         return self.variants[index] if self.variants else ChunkVariants()
@@ -1817,11 +2213,29 @@ class Plan:
         self.variants_of(index)  # the chunk exists
         return stage_variant("gemm_logits" if stats else "gemm_logits_nostats")
 
+    def forward_logits_stage(self, index: int) -> str:
+        """The forward's logits GEMM of chunk ``index``: the label-column arm of the log-probability entry
+        (:attr:`logprob_lbl`), else :meth:`logits_stage`."""
+        stage = self.logits_stage(index)
+        return LOGPROB_LBL_STAGE if self.logprob_lbl else stage
+
+    def recompute_stage(self, index: int) -> str:
+        """The log-probability backward's recompute GEMM of chunk ``index``: the ``dz`` arm (:attr:`logprob_dz`), else
+        the stats-free logits GEMM that ``row_grad`` follows."""
+        stage = self.logits_stage(index, stats=False)
+        return LOGPROB_DZ_STAGE if self.logprob_dz else stage
+
     def dx_stage_of(self, index: int) -> str:
         """The dX GEMM form of chunk ``index`` (K-sliced or not, its tile and ring depth; the slice count is a launch
         scalar, :meth:`dx_slices_of`)."""
         v = self.variants_of(index)
-        return dx_stage(self.dx_slices_of(index), v.dx_tile_n, v.dx_stages)
+        return dx_stage(
+            self.dx_slices_of(index),
+            v.dx_tile_n,
+            v.dx_stages,
+            split=v.dx_split is not None,
+            swab=v.dx_swab,
+        )
 
     def dw_acc_stage(self, index: int) -> str:
         """The weight-gradient accumulate form of chunk ``index`` (blocked when the block rule set a ``group_n``; the
@@ -1893,9 +2307,9 @@ class Plan:
             )  # some chunk slices its dX GEMM: its slabs are added by the kernel
         for index in range(self.num_chunks):
             if "gemm_logits" in base:
-                used.add(self.logits_stage(index))
+                used.add(self.forward_logits_stage(index))
             if "gemm_logits_nostats" in base:
-                used.add(self.logits_stage(index, stats=False))
+                used.add(self.recompute_stage(index))
             if "gemm_dx" in base:
                 used.add(self.dx_stage_of(index))
             if "gemm_dw_acc" in base and not (
@@ -1907,6 +2321,8 @@ class Plan:
         if self.hidden_count:
             used.add(HIDDEN_COUNT_STAGE)
             used.add(self.hidden_logits_stage())
+        elif self.logprob_dz:
+            used.discard("row_grad")  # every chunk's recompute writes ``dz`` itself
         return tuple(s for s in STAGES if s in used)
 
     @property
@@ -1922,6 +2338,9 @@ class Plan:
                 "gemm_dw_cast_f32" if fp32 else "gemm_dw_cast_bf16",
                 blocked=fp32
                 and v.dw_group_n is not None,  # the bf16 cast keeps the 1-D raster
+                epi_store="tma"
+                if v.dw_cast_tma
+                else None,  # the TMA form of the bf16 cast (dw_cast_tma_rule)
             )
         return "scale_cast_f32" if fp32 else "scale_cast_bf16"
 
@@ -1943,6 +2362,8 @@ def make_plan(
     dx_cast: bool = True,
     hidden_count: bool = False,
     hidden_stats: bool = True,
+    logprob_dz: bool = False,
+    logprob_lbl: bool = False,
 ) -> Plan:
     """The chunk schedule; ``dx_max_slices`` > 1 (K-sliced dX stages registered) picks each chunk's slice count
     (``dx_resident`` = the device's co-resident dX clusters, :func:`cluster_resident`); ``valid_rows`` (compaction)
@@ -1953,7 +2374,11 @@ def make_plan(
     ``dx_finalize`` adds a sliced dX GEMM's slabs with the ``slab_sum`` kernel and ``dx_cast=False`` leaves ``dx_acc``
     uncast for the caller (:func:`finalize_dx`).  ``hidden_count`` (the eager entry points' hidden valid-row count,
     ``arch`` required): chunk 0's gather and logits GEMM already ran in device-count form (``hidden_stats``: with the
-    statistics) at the buffer extent ``min(chunk, T)``, whose raster-rule height the plan records."""
+    statistics) at the buffer extent ``min(chunk, T)``, whose raster-rule height the plan records.  ``logprob_dz`` /
+    ``logprob_lbl`` (a log-probability plan of a record that registers them) run the entry's logits GEMM arms
+    (:attr:`Plan.logprob_dz`, :attr:`Plan.logprob_lbl`)."""
+    if (logprob_dz or logprob_lbl) and problem.entry != "logprob":
+        raise ValueError("the logits GEMM arms belong to the log-probability entry")
     rows = problem.num_rows if valid_rows is None else int(valid_rows)
     chunks = plan_chunks(rows, problem.chunk)
     tuning = gemm_tuning or {}
@@ -1975,6 +2400,19 @@ def make_plan(
             )
             for _, rows_c in chunks
         )
+    if need_dx and dx_tuning.get("split"):
+        # the ``_split`` grid carries ``W + F`` clusters and runs those from ``W - F`` on as the half items of the last
+        # ``F`` wide items: ``F < 0`` leaves wide items unrun, ``F > W`` maps half items to negative items
+        explicit_f = int(dx_tuning["split"])
+        for i, (_, rows_c) in enumerate(chunks):
+            wide, _ = dx_wide_items(
+                rows_c, problem.hidden, num_sms, slices[i] if slices else 1, geometry
+            )
+            if not 1 <= explicit_f <= wide:
+                raise ValueError(
+                    f"gemm_tuning dx split={explicit_f}: the split-tail form runs 1 .. W of a chunk's W wide dX items "
+                    f"as half items; the chunk of {rows_c} rows has W = {wide}"
+                )
     variants: tuple[ChunkVariants, ...] = ()
     if arch is not None or tuning:
         variants = tuple(
@@ -1986,9 +2424,21 @@ def make_plan(
                 geometry,
                 arch,
                 tuning,
+                num_chunks=len(chunks),
+                ce_loss=problem.entry == "loss" and problem.objective == "ce",
             )
             for i, (_, rows_c) in enumerate(chunks)
         )
+    if (
+        variants
+        and need_dw
+        and fuse_dw_cast
+        and not (problem.entry == "loss" and problem.grad_weight_dtype == torch.float32)
+        and "epi_store" not in tuning.get("dw", {})
+        and dw_cast_tma_rule(len(chunks), chunks[-1][1], arch)
+    ):
+        # the deferred last chunk's bf16 cast takes the TMA epilogue; an explicit ``epi_store`` keeps the shipped cast
+        variants = variants[:-1] + (replace(variants[-1], dw_cast_tma=True),)
     hidden_group: Optional[int] = None
     if hidden_count:
         if arch is None:
@@ -2014,6 +2464,8 @@ def make_plan(
         bool(hidden_count),
         hidden_group,
         bool(hidden_stats),
+        logprob_dz=bool(logprob_dz),
+        logprob_lbl=bool(logprob_lbl),
     )
 
 
@@ -2423,10 +2875,17 @@ def _grid_term(value, names: dict[str, int]) -> int:
     if isinstance(value, int):
         return int(value)
     try:
-        tree = ast.parse(str(value).strip(), mode="eval")
+        tree = _grid_tree(str(value).strip())
     except SyntaxError as exc:
         raise ValueError(f"grid rule entry {value!r} is not an expression") from exc
     return _grid_eval(tree, names)
+
+
+@functools.lru_cache(maxsize=512)
+def _grid_tree(text: str) -> ast.Expression:
+    """The parsed grid rule entry (the records carry a fixed set of rule texts; bounded, never mutated:
+    :func:`_grid_eval` only reads it)."""
+    return ast.parse(text, mode="eval")
 
 
 def _grid_eval(node, names: dict[str, int]) -> int:
@@ -2601,7 +3060,7 @@ def side_stream_schedule(
     sequence has no per-chunk accumulate (the loss entry's cast keys); else the
     positions ``(joins, forks, sides)`` -- the first key of every chunk after the first and the first key after the last
     chunk's keys (the caller's stream waits for the side stream: the chunk buffer is about to be reused / read), each
-    chunk's ``row_grad`` key (the fork event is recorded after it) and the per-chunk ``dW`` accumulate keys (launched
+    chunk's ``row_grad`` key or ``dz`` recompute (:data:`LOGPROB_DZ_STAGE`; the fork event is recorded after it) and the per-chunk ``dW`` accumulate keys (launched
     on the side stream after it waited for the fork).  A deferred last chunk's cast GEMM and the flat casts stay on
     the caller's stream; the sequence always ends with a join."""
     if not (plan.need_dw and dw_side_stream(plan.num_chunks, dw_stream)):
@@ -2622,7 +3081,7 @@ def side_stream_schedule(
             seen.add(index)
             if index > 0:
                 joins.add(pos)
-        if stage == "row_grad":
+        if stage in ("row_grad", LOGPROB_DZ_STAGE):
             forks.add(pos)
     after = chunk_keys[-1][0] + 1
     if after < len(keys):
@@ -2779,8 +3238,13 @@ def stage_values(
     logits = t["logits"]
     dz_chunk = logits[:rows_c]
     base = base_stage(stage) if stage in GEMM_STAGES else stage
-    if base in ("gemm_logits", "gemm_logits_nostats"):
-        want = plan.logits_stage(index, stats=base == "gemm_logits")
+    if base in LOGITS_BASES:
+        if base == LOGPROB_DZ_STAGE:
+            want = plan.recompute_stage(index)
+        elif base == LOGPROB_LBL_STAGE:
+            want = plan.forward_logits_stage(index)
+        else:
+            want = plan.logits_stage(index, stats=base == "gemm_logits")
         if stage != want:
             raise ValueError(
                 f"chunk {index} plans the logits GEMM {want!r}; stage {stage!r} was requested"
@@ -2802,6 +3266,12 @@ def stage_values(
                 group_m=plan.variants_of(index).logits_group_m,
             ),
         )
+        if base in (LOGPROB_DZ_STAGE, LOGPROB_LBL_STAGE):
+            # the epilogue reads the chunk's labels at ``labels[row0 + r]``; the ``dz`` arm also ``lse[row0 + r]`` and
+            # the caller's ``[T]`` ``dlogp`` at ``d_in[d_off + r]`` (the operands ``row_grad`` reads)
+            values.update(labels=t["labels"])
+        if base == LOGPROB_DZ_STAGE:
+            values.update(lse=t["lse"], d_in=t["d_in"], d_off=int(row0))
     elif base == "gemm_dx":
         # every token chunk writes its own rows of dX_acc: the first K chunk of the GEMM always stores (first_chunk=1);
         # the K-sliced forms write slices >= 1 into the ``dx_ws`` slabs (added by ``dx_reduce`` afterwards)
@@ -2818,6 +3288,9 @@ def stage_values(
             C=t["dx_acc"][row0:stop],
             STATS_OUT=t["stats"],
             WS=ws,
+            dx_split=int(
+                plan.variants_of(index).dx_split or 0
+            ),  # the split-tail form's grid term
             **gemm_scalars(
                 stage,
                 g,
@@ -2941,6 +3414,121 @@ def stage_values(
     return values
 
 
+def _slot_values(stage: str, t: dict[str, Any], plan: Plan, index) -> dict[str, Any]:
+    """The tensor host values of :func:`stage_values` for chunk ``index`` -- the views a remembered launch slots in per
+    call (:meth:`_Launch.arguments_for`) and the operands of the ``gather_rows`` host step -- without the scalars and
+    the plan checks, which the binding fixed when it was prepared.  Any other host stage gets :func:`stage_values`.
+    :meth:`_Binding.from_runner` checks every remembered launch against :func:`stage_values` once."""
+    p = plan.problem
+    values: dict[str, Any] = {name: t.get(name) for name in COMMON_TENSORS}
+    if stage == "gather_rows":
+        if isinstance(index, str):
+            values.update(src=t[index + "_full"], idx=t["row_index"], out=t[index])
+            return values
+        row0, rows_c = plan.chunks[index]
+        values.update(
+            src=t["X"], idx=t["row_index"][row0 : row0 + rows_c], out=t["x_c"][:rows_c]
+        )
+        return values
+    if stage in ("scale_cast_bf16", "scale_cast_f32"):
+        acc = t["dx_acc"] if index == "dx" else t["dw_acc"]
+        out = t["dx_out"] if index == "dx" else t["dw_out"]
+        values.update(
+            acc=acc.reshape(-1),
+            g=t["grad_scale"] if p.entry == "loss" else t["unit_scale"],
+            out=out.reshape(-1),
+        )
+        return values
+    row0, rows_c = plan.chunks[index]
+    stop = row0 + rows_c
+    base = base_stage(stage) if stage in GEMM_STAGES else stage
+    logits = t["logits"]
+    if base in LOGITS_BASES or base == "gemm_dw_acc" or base in DW_CAST_STAGES:
+        x_chunk = t["x_c"][:rows_c] if plan.compact else t["X"][row0:stop]
+        if t.get("x_last") is not None and index == plan.num_chunks - 1:
+            x_chunk = t["x_last"]
+    if base in LOGITS_BASES:
+        values.update(
+            A=x_chunk,
+            B=t["W"],
+            C=logits[:rows_c],
+            STATS_OUT=t["stats"],
+            WS=t["f32_dummy"],
+        )
+        if base in (LOGPROB_DZ_STAGE, LOGPROB_LBL_STAGE):
+            values.update(labels=t["labels"])
+        if base == LOGPROB_DZ_STAGE:
+            values.update(lse=t["lse"], d_in=t["d_in"])
+    elif base == "gemm_dx":
+        values.update(
+            A=logits[:rows_c],
+            B=t["W"],
+            C=t["dx_acc"][row0:stop],
+            STATS_OUT=t["stats"],
+            WS=t["dx_ws"] if plan.dx_slices_of(index) > 1 else t["f32_dummy"],
+        )
+    elif stage == "slab_sum":
+        values.update(dx=t["dx_acc"][row0:stop], ws=t["dx_ws"])
+    elif base == "gemm_dw_acc":
+        values.update(
+            A=logits[:rows_c],
+            B=x_chunk,
+            C=t["dw_acc"],
+            STATS_OUT=t["stats"],
+            WS=t["f32_dummy"],
+        )
+    elif base in DW_CAST_STAGES:
+        values.update(
+            A=logits[:rows_c],
+            B=x_chunk,
+            C=t["dw_out"],
+            STATS_OUT=t["grad_scale"] if p.entry == "loss" else t["unit_scale"],
+            WS=t["dw_acc"] if plan.num_chunks > 1 else t["f32_dummy"],
+        )
+    elif stage == "row_finalize":
+        d = t["d"]
+        values.update(
+            stats=t["stats"],
+            z=logits,
+            labels=t["labels"],
+            infer_logp=d if t.get("infer_logp") is None else t["infer_logp"],
+            loss_weights=d if t.get("loss_weights") is None else t["loss_weights"],
+            d_in=d if t.get("d_in") is None else t["d_in"],
+            lse=t["lse"],
+            logp=t["logp"],
+            d=d,
+            term=t["term"],
+        )
+    elif stage == "loss_reduce":
+        values.update(term=t["term"], loss_acc=t["loss_acc"], loss_out=t["loss"])
+    elif stage == "row_grad":
+        values.update(
+            z=logits,
+            labels=t["labels"],
+            lse=t["lse"],
+            d=t["d_in"] if p.entry == "logprob" else t["d"],
+        )
+    else:
+        return stage_values(stage, t, plan, index)
+    return values
+
+
+def _same_view(a, b) -> bool:
+    """Whether two host values bind the same argument: the same object, or tensors with the same address, shape,
+    strides, dtype and device."""
+    if a is b:
+        return True
+    if not (isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor)):
+        return False
+    return (
+        a.data_ptr() == b.data_ptr()
+        and a.shape == b.shape
+        and a.stride() == b.stride()
+        and a.dtype == b.dtype
+        and a.device == b.device
+    )
+
+
 def forward_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
     """Launch keys ``(stage, chunk index)`` of the forward chunk loop (compacted plan: the host gathers first)."""
     keys: list[tuple[str, Any]] = []
@@ -2956,7 +3544,7 @@ def forward_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
         if plan.compact and not queued:
             keys.append(("gather_rows", index))
         if not queued:
-            keys.append((plan.logits_stage(index), index))
+            keys.append((plan.forward_logits_stage(index), index))
         keys.append(("row_finalize", index))
         if plan.problem.entry == "loss":
             keys.append(("loss_reduce", index))
@@ -2969,6 +3557,28 @@ def forward_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
                     (plan.dw_acc_stage(index), index)
                 )  # a deferred last chunk runs in the backward (cast_keys)
     return tuple(keys)
+
+
+def forward_early_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
+    """The keys of :func:`forward_keys` a remembered forward on the host-count path launches first, right behind the
+    valid-row count (:meth:`_Binding.forward`): chunk 0's row gather (compacted plan) and its forward logits GEMM
+    (:meth:`Plan.forward_logits_stage`).  They read ``X`` (the rows of the index), ``W`` and -- the log-probability
+    entry's label-column arm only -- the call's labels, and write the chunk buffers only, so the launches ahead of
+    them in :func:`forward_keys` (the policy operands' gathers) and the rest of the call's binding can follow them
+    unchanged.  Empty on the hidden valid-row count path, whose chunk 0 is already queued."""
+    if plan.hidden_count or not plan.chunks:
+        return ()
+    keys: list[tuple[str, Any]] = []
+    if plan.compact:
+        keys.append(("gather_rows", 0))
+    keys.append((plan.forward_logits_stage(0), 0))
+    return tuple(keys)
+
+
+def _reads_labels(stage: str) -> bool:
+    """Whether the host values of ``stage`` (:func:`stage_values`) include the call's labels."""
+    base = base_stage(stage) if stage in GEMM_STAGES else stage
+    return "labels" in STAGE_TENSORS.get(base, ())
 
 
 def _dx_keys(plan: Plan, index: int) -> list:
@@ -2992,9 +3602,14 @@ def recompute_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
         )  # the hidden valid-row count: chunk 0's recompute is already queued
         if plan.compact and not queued:
             keys.append(("gather_rows", index))
-        if not queued:
+        if queued:
+            # the queued device-count recompute stored ``z``
+            keys.append(("row_grad", index))
+        elif plan.logprob_dz:
+            keys.append((LOGPROB_DZ_STAGE, index))  # the recompute stores ``dz`` itself
+        else:
             keys.append((plan.logits_stage(index, stats=False), index))
-        keys.append(("row_grad", index))
+            keys.append(("row_grad", index))
         if plan.need_dx:
             keys += _dx_keys(plan, index)
         if plan.need_dw:
@@ -3451,6 +4066,43 @@ def _bind_all(
     return launches
 
 
+def _eager_launch(
+    record, module_name: str, stage: str, values: dict[str, Any], device, geometry
+) -> tuple[_Launch, list]:
+    """``(launch, arguments)`` of one eager stage of the output boundary (:func:`scale_cast`, :func:`scale_cast_scatter`,
+    :func:`dw_cast`).  Bound by :func:`_bind_all`; while :data:`BINDING_CACHE` is enabled the templated launch is
+    remembered there per form -- the record, the stage, the device and every non-tensor host value, which fix the grid
+    and the scalar arguments -- and a later call of the same form slots its tensors into it: the same entry, grid and
+    arguments as a fresh binding."""
+    key = (stage, "eager")
+    cache = BINDING_CACHE
+    if not cache.enabled:
+        launch = _bind_all(
+            record, module_name, (key,), {key: values}, device, geometry
+        )[key]
+        return launch, list(launch.arguments)
+    form = (
+        module_name,
+        stage,
+        str(device),
+        tuple(
+            sorted(
+                (name, isinstance(value, torch.Tensor))
+                + ((None,) if isinstance(value, torch.Tensor) else (value,))
+                for name, value in values.items()
+            )
+        ),
+    )
+    launch = cache.eager_lookup(form, record)
+    if launch is None:
+        launch = _bind_all(
+            record, module_name, (key,), {key: values}, device, geometry
+        )[key]
+        cache.eager_remember(form, record, launch.templated())
+        return launch, list(launch.arguments)
+    return launch, launch.arguments_for(values)
+
+
 def prepare_lm_head_loss(
     X: torch.Tensor,
     W: torch.Tensor,
@@ -3481,6 +4133,8 @@ def prepare_lm_head_loss(
     dx_finalize: Optional[bool] = None,
     dx_cast: bool = True,
     dw_stream: Optional[Union[bool, str]] = None,
+    logprob_dz: Optional[bool] = None,
+    logprob_lbl: Optional[bool] = None,
 ) -> LmHeadLossRunner:
     """Validate one binding and prepare its launches.
 
@@ -3525,9 +4179,20 @@ def prepare_lm_head_loss(
     of :data:`DW_STREAM_MIN_CHUNKS` chunks or more, ``True`` for every
     multi-chunk plan, ``False`` never (bitwise the same outputs; the runner's
     ``dw_stream`` attribute holds the mode).
+
+    ``logprob_dz`` / ``logprob_lbl`` (log-probability entry only; defaults
+    :func:`logprob_dz_default` / :func:`logprob_lbl_default`): the backward's
+    recompute writes ``dz`` from the ``gemm_logits_dz`` epilogue and the
+    forward's logits GEMM is ``gemm_logits_lbl``, where the record registers
+    them (bitwise the same outputs); ``False`` keeps ``gemm_logits_nostats`` +
+    ``row_grad`` / ``gemm_logits``.  A loss-entry runner rejects ``True``.
     """
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
+    if entry != "logprob" and (logprob_dz or logprob_lbl):
+        raise ValueError(
+            "logprob_dz / logprob_lbl select logits GEMM arms of the log-probability entry"
+        )
     device = X.device
     record = None
     module_name = None
@@ -3619,6 +4284,14 @@ def prepare_lm_head_loss(
         gemm_tuning=tuning,
         dx_finalize=bool(need_dx and _resolve_dx_finalize(dx_finalize)),
         dx_cast=bool(dx_cast),
+        logprob_dz=entry == "logprob"
+        and _logprob_arm(
+            record, stages, LOGPROB_DZ_STAGE, _resolve_logprob_dz(logprob_dz)
+        ),
+        logprob_lbl=entry == "logprob"
+        and _logprob_arm(
+            record, stages, LOGPROB_LBL_STAGE, _resolve_logprob_lbl(logprob_lbl)
+        ),
     )
     missing = [s for s in plan.stages if s not in stages]
     if missing:
@@ -3744,11 +4417,16 @@ def prepare_lm_head_loss(
 
     fwd = forward_keys(plan)
     bwd = (recompute_keys(plan) if entry == "logprob" else ()) + cast_keys(plan)
-    values = {key: stage_values(key[0], t, plan, key[1]) for key in fwd + bwd}
+    # a ``dz``-arm plan also binds chunk 0's ``row_grad``: the hidden valid-row count's backward recomputes chunk 0 in
+    # the device-count form, which stores ``z`` (:meth:`_Binding.from_runner`); the runner itself never launches it
+    spare = (("row_grad", 0),) if plan.logprob_dz else ()
+    values = {key: stage_values(key[0], t, plan, key[1]) for key in fwd + bwd + spare}
     launches: dict[Any, _Launch] = {}
     engine = None
     if backend == "cake":
-        launches = _bind_all(record, module_name, fwd + bwd, values, device, geometry)
+        launches = _bind_all(
+            record, module_name, fwd + bwd + spare, values, device, geometry
+        )
     else:
         engine = ReferenceEngine()
     memory = memory_report(
@@ -3828,6 +4506,7 @@ def forward_binding_key(
     gemm_tuning=None,
     dx_finalize=False,
     hidden_count=False,
+    logprob_lbl=False,
 ) -> tuple:
     """Cache key of a forward binding: ``(data_ptr, shape, stride, dtype)`` of every
     input plus every option that shapes the argument plans; ``valid_rows`` is the
@@ -3836,7 +4515,8 @@ def forward_binding_key(
     GEMM knobs (``None`` = none, :func:`gemm_tuning_default`);
     ``dx_finalize`` the resolved dX finalize form (the slab reduction's launches differ);
     ``hidden_count`` whether chunk 0's gather and logits GEMM ran before the plan
-    (the remembered sequence starts at chunk 0's row kernels)."""
+    (the remembered sequence starts at chunk 0's row kernels); ``logprob_lbl``
+    the resolved log-probability forward's logits form (:func:`logprob_lbl_default`)."""
     return (
         "fwd",
         entry,
@@ -3856,6 +4536,7 @@ def forward_binding_key(
         _tuning_key(_resolve_gemm_tuning(gemm_tuning)),
         bool(dx_finalize),
         bool(hidden_count),
+        bool(logprob_lbl),
     )
 
 
@@ -3874,7 +4555,10 @@ def logprob_backward_binding_key(
     gemm_tuning=None,
     dx_finalize=False,
     hidden_count=False,
+    logprob_dz=False,
 ) -> tuple:
+    """Cache key of a log-probability backward binding (as :func:`forward_binding_key`); ``logprob_dz`` the resolved
+    recompute form (:func:`logprob_dz_default`)."""
     return (
         "bwd",
         "logprob",
@@ -3891,6 +4575,7 @@ def logprob_backward_binding_key(
         _tuning_key(_resolve_gemm_tuning(gemm_tuning)),
         bool(dx_finalize),
         bool(hidden_count),
+        bool(logprob_dz),
     )
 
 
@@ -3910,6 +4595,13 @@ class _Binding:
     launches: dict[Any, _Launch] = field(repr=False)
     forward_order: tuple = ()
     backward_order: tuple = ()
+    # the host-count path's split of ``forward_order`` (:func:`forward_early_keys`): chunk 0's gather and logits GEMM,
+    # launched right behind the count -- ``forward_early`` before the call's labels are bound, ``forward_early_labels``
+    # (the early launches that read them: the label-column arm) right after -- then ``forward_late`` in order (all
+    # empty on the hidden valid-row count path)
+    forward_early: tuple = ()
+    forward_early_labels: tuple = ()
+    forward_late: tuple = ()
     owned: dict[str, torch.Tensor] = field(default_factory=dict, repr=False)
     owned_bytes: int = 0
     layout: dict = field(default_factory=dict, repr=False)
@@ -3950,6 +4642,18 @@ class _Binding:
             )
         # the hidden-count path drops the runner's chunk-0 gather / GEMM launches (not in either sequence)
         keep = None if hidden is None else set(forward_order) | set(backward_order)
+        # the per-call slots come from :func:`_slot_values`: check it against :func:`stage_values` on the runner's
+        # own tensors for every launch and host gather of this binding (fail closed)
+        for key, launch in runner.launches.items():
+            if keep is None or key in keep:
+                _check_slot_values(key, t, plan, [name for _, name in launch.slots])
+        for key in forward_order + backward_order:
+            if key[0] == "gather_rows":
+                _check_slot_values(key, t, plan, ["src", "idx", "out"])
+        early = forward_early_keys(plan)
+        split = next(
+            (i for i, key in enumerate(early) if _reads_labels(key[0])), len(early)
+        )
         return cls(
             plan=plan,
             device=t["X"].device,
@@ -3961,6 +4665,9 @@ class _Binding:
             },
             forward_order=forward_order,
             backward_order=backward_order,
+            forward_early=early[:split],
+            forward_early_labels=early[split:],
+            forward_late=tuple(key for key in forward_order if key not in early),
             owned=owned,
             owned_bytes=sum(v.numel() * v.element_size() for v in owned.values()),
             layout=runner.layout,
@@ -3975,16 +4682,22 @@ class _Binding:
         )
 
     def _scratch(
-        self, t: dict[str, Any], hidden: Optional[_HiddenCount] = None
+        self,
+        t: dict[str, Any],
+        hidden: Optional[_HiddenCount] = None,
+        *,
+        chunk_buffers: bool = True,
     ) -> None:
         """Per-call temporaries from the caching allocator into ``t`` (the runner's regions, minus the owned ones);
         with ``hidden`` the chunk buffers are the prologue's (chunk 0's logits / statistics / gathered rows already in
-        them, ``min(chunk, T)`` rows) -- the entry points check that a hidden-count plan gets its prologue."""
+        them, ``min(chunk, T)`` rows) -- the entry points check that a hidden-count plan gets its prologue.
+        ``chunk_buffers=False``: the chunk buffers are already bound (:meth:`_chunk_buffers`, the early launch of
+        :meth:`forward`) and the rest is allocated."""
         p = self.plan.problem
         rows = self.layout["logits"][1] // (p.vocab * 2)
-        if hidden is not None:
+        if chunk_buffers and hidden is not None:
             t["logits"], t["stats"] = hidden.logits, hidden.stats_buf
-        else:
+        elif chunk_buffers:
             t["logits"] = torch.empty(
                 (rows, p.vocab), dtype=torch.bfloat16, device=self.device
             )
@@ -4006,7 +4719,7 @@ class _Binding:
                 dtype=torch.float32,
                 device=self.device,
             )
-        if self.plan.compact:
+        if self.plan.compact and chunk_buffers:
             t["x_c"] = (
                 hidden.x_c
                 if hidden is not None
@@ -4014,6 +4727,26 @@ class _Binding:
                     (rows, p.hidden), dtype=torch.bfloat16, device=self.device
                 )
             )
+        for name, tensor in self.owned.items():
+            t[name] = tensor
+
+    def _chunk_buffers(self, t: dict[str, Any]) -> None:
+        """What chunk 0's row gather and logits GEMM bind (the early launch of :meth:`forward`): the chunk's logits,
+        statistics and gather buffers of :meth:`_scratch` (the same allocations, ahead of the others), the constant
+        cells and the owned regions."""
+        p = self.plan.problem
+        rows = self.layout["logits"][1] // (p.vocab * 2)
+        t["logits"] = torch.empty(
+            (rows, p.vocab), dtype=torch.bfloat16, device=self.device
+        )
+        t["stats"] = torch.empty(
+            (rows, self.plan.num_tiles, 2), dtype=torch.float32, device=self.device
+        )
+        if self.plan.compact:
+            t["x_c"] = torch.empty(
+                (rows, p.hidden), dtype=torch.bfloat16, device=self.device
+            )
+        t.update(_device_constants(self.device_index))
         for name, tensor in self.owned.items():
             t[name] = tensor
 
@@ -4037,13 +4770,20 @@ class _Binding:
             t["row_index"] = row_index
 
     def _launch(self, keys: tuple, t: dict[str, Any], dw_stream: str = "auto") -> None:
+        plan, launches = self.plan, self.launches
+
         def run_key(key) -> None:
-            host = HOST_STAGES.get(key[0])
+            stage = key[0]
+            host = HOST_STAGES.get(stage)
             if host is not None:
-                host(stage_values(key[0], t, self.plan, key[1]))
+                host(
+                    _slot_values(stage, t, plan, key[1])
+                    if stage == "gather_rows"
+                    else stage_values(stage, t, plan, key[1])
+                )
                 return
-            launch = self.launches[key]
-            arguments = launch.arguments_for(stage_values(key[0], t, self.plan, key[1]))
+            launch = launches[key]
+            arguments = launch.arguments_for(_slot_values(stage, t, plan, key[1]))
             if (
                 launch.prepare is not None
             ):  # descriptors of a pointer-ABI stage see the fresh tensors
@@ -4064,7 +4804,15 @@ class _Binding:
         dw_stream: str = "auto",
     ):
         """One forward through the remembered launches; ``dw_stream`` is the call's dW side-stream mode
-        (:func:`dw_stream_mode`), a launch placement outside the binding."""
+        (:func:`dw_stream_mode`), a launch placement outside the binding.
+
+        Host-count path (``hidden`` None, :func:`forward_early_keys`): chunk 0's row gather and logits GEMM are bound
+        and launched first, right behind the valid-row count, and the rest of the call -- the policy operands'
+        gathers, the row vectors, the accumulators and the remaining launches -- is bound behind the queued GEMM
+        instead of in front of it; the compacted labels are bound in front of the first early launch that reads them
+        (:attr:`forward_early_labels`, the label-column arm) and behind the early launches otherwise.  The same
+        kernels with the same operands on the same stream; the early launches neither read nor write what moved
+        behind them, so every output is bitwise the in-order sequence's."""
         p, plan = self.plan.problem, self.plan
         T, H, V = (
             plan.rows,
@@ -4072,13 +4820,21 @@ class _Binding:
             p.vocab,
         )  # rows of the chunk loop (the valid rows when compacted)
         self._check_hidden(hidden)
-        t: dict[str, Any] = dict(
-            X=_prepare_x(X, p, plan.compact),
-            W=W,
-            labels=_prepare_labels(labels, plan.geometry, row_index),
-        )
-        self._compact(t, row_index)
-        self._scratch(t, hidden)
+        early = hidden is None and bool(self.forward_early or self.forward_early_labels)
+        t: dict[str, Any] = dict(X=_prepare_x(X, p, plan.compact), W=W)
+        if early:
+            self._compact(t, row_index)
+            self._chunk_buffers(t)
+            if self.forward_early:
+                self._launch(self.forward_early, t, dw_stream)
+            t["labels"] = _prepare_labels(labels, plan.geometry, row_index)
+            if self.forward_early_labels:
+                self._launch(self.forward_early_labels, t, dw_stream)
+            self._scratch(t, chunk_buffers=False)
+        else:
+            t["labels"] = _prepare_labels(labels, plan.geometry, row_index)
+            self._compact(t, row_index)
+            self._scratch(t, hidden)
         t["lse"] = torch.empty((T,), dtype=torch.float32, device=self.device)
         t["logp"] = torch.empty((T,), dtype=torch.float32, device=self.device)
         if p.entry == "loss":
@@ -4104,7 +4860,7 @@ class _Binding:
                 t["dw_acc"] = torch.empty(
                     (V, H), dtype=torch.float32, device=self.device
                 )
-        self._launch(self.forward_order, t, dw_stream)
+        self._launch(self.forward_late if early else self.forward_order, t, dw_stream)
         if p.entry == "loss":
             return (
                 t["loss"],
@@ -4161,6 +4917,17 @@ class _Binding:
         return dx, t.get("dw_out")
 
 
+def _check_slot_values(key, t: dict[str, Any], plan: Plan, names) -> None:
+    """:func:`_slot_values` binds what :func:`stage_values` binds for the host values ``names`` of launch ``key``."""
+    fast = _slot_values(key[0], t, plan, key[1])
+    full = stage_values(key[0], t, plan, key[1])
+    for name in names:
+        if not _same_view(fast.get(name), full.get(name)):
+            raise RuntimeError(
+                f"launch {key!r}: the per-call host value {name!r} differs from the stage's host values"
+            )
+
+
 def _deferred_operands(plan: Plan, t: dict[str, Any]) -> tuple:
     """``(dz_last, x_last, x_src, x_idx)`` of a deferred plan after its forward: the last chunk's BF16 ``dz`` rows of the
     chunk buffer and its ``X`` rows -- a view of the launched ``X`` (uncompacted) or the ``X`` plus the chunk's int64
@@ -4183,7 +4950,12 @@ class BindingCache:
     """Remembered input bindings of the eager entry points (least recently used, bounded).
 
     ``capacity`` (default :data:`BINDING_CACHE_DEFAULT_CAPACITY`, 64 bindings) bounds what is kept; ``enabled=False``
-    bypasses the cache (every call validates and binds).  :meth:`configure` changes both at runtime."""
+    bypasses the cache (every call validates and binds).  :meth:`configure` changes both at runtime.  The templated
+    launches of the eager output-boundary casts (:func:`_eager_launch`) are kept alongside, at most
+    :attr:`EAGER_CAPACITY` forms, and follow the same switch and :meth:`clear`."""
+
+    # templated launches of the eager output-boundary stages (:func:`_eager_launch`) kept alongside the bindings
+    EAGER_CAPACITY = 64
 
     def __init__(self, capacity: Optional[int] = None, enabled: bool = True):
         self.capacity = BINDING_CACHE_DEFAULT_CAPACITY
@@ -4191,6 +4963,7 @@ class BindingCache:
         self.hits = 0
         self.misses = 0
         self._bindings: OrderedDict[tuple, _Binding] = OrderedDict()
+        self._eager: OrderedDict[tuple, tuple] = OrderedDict()
         self.configure(enabled=enabled, capacity=capacity)
 
     def configure(
@@ -4215,7 +4988,7 @@ class BindingCache:
         if enabled is not None:
             self.enabled = bool(enabled)
             if not self.enabled:
-                self._bindings.clear()
+                self.clear()
         return self
 
     def __len__(self) -> int:
@@ -4227,6 +5000,21 @@ class BindingCache:
 
     def clear(self) -> None:
         self._bindings.clear()
+        self._eager.clear()
+
+    def eager_lookup(self, form: tuple, record) -> Optional[_Launch]:
+        """The templated eager launch remembered for ``form`` and this very ``record`` (:func:`_eager_launch`)."""
+        entry = self._eager.get(form)
+        if entry is None or entry[0] is not record:
+            return None
+        self._eager.move_to_end(form)
+        return entry[1]
+
+    def eager_remember(self, form: tuple, record, launch: _Launch) -> None:
+        self._eager.pop(form, None)
+        self._eager[form] = (record, launch)
+        while len(self._eager) > self.EAGER_CAPACITY:
+            self._eager.popitem(last=False)
 
     def lookup(self, key: tuple) -> Optional[_Binding]:
         binding = self._bindings.get(key)
@@ -4397,6 +5185,9 @@ def _hidden_count(
     :func:`valid_rows` path."""
     if not (compact and backend == "cake" and hidden_count):
         return None
+    rows, chunk = int(problem.num_rows), int(problem.chunk)
+    if rows <= 0 or (rows + chunk - 1) // chunk < HIDDEN_COUNT_MIN_CHUNKS:
+        return None  # the chunk rule of :func:`hidden_count_eligible`, ahead of the record lookup
     module_name, record = record_for(X.device)
     if not hidden_count_eligible(problem, X, record, module_name, stats=stats):
         return None
@@ -4657,15 +5448,9 @@ def scale_cast(
         num_vecs=int(acc.numel() // geometry.cast_vec),
         loss_div=1.0,
     )
-    launches = _bind_all(
-        record,
-        module_name,
-        ((stage, "eager"),),
-        {(stage, "eager"): values},
-        acc.device,
-        geometry,
+    launch, arguments = _eager_launch(
+        record, module_name, stage, values, acc.device, geometry
     )
-    launch = launches[(stage, "eager")]
     index = (
         acc.device.index
         if acc.device.index is not None
@@ -4673,8 +5458,8 @@ def scale_cast(
     )
     with _ffi_stream_context(int(index)):
         if launch.prepare is not None:
-            launch.prepare(*launch.arguments)
-        launch()
+            launch.prepare(*arguments)
+        launch.entry(*arguments)
     return out
 
 
@@ -4762,15 +5547,9 @@ def scale_cast_scatter(
         num_rows=num_rows,
         loss_div=1.0,
     )
-    launches = _bind_all(
-        record,
-        module_name,
-        ((stage, "eager"),),
-        {(stage, "eager"): values},
-        acc.device,
-        geometry,
+    launch, arguments = _eager_launch(
+        record, module_name, stage, values, acc.device, geometry
     )
-    launch = launches[(stage, "eager")]
     index = (
         acc.device.index
         if acc.device.index is not None
@@ -4778,8 +5557,8 @@ def scale_cast_scatter(
     )
     with _ffi_stream_context(int(index)):
         if launch.prepare is not None:
-            launch.prepare(*launch.arguments)
-        launch()
+            launch.prepare(*arguments)
+        launch.entry(*arguments)
     return out
 
 
@@ -4896,6 +5675,14 @@ def dw_cast(
     stage = stage_variant(
         "gemm_dw_cast_f32" if fp32 else "gemm_dw_cast_bf16",
         blocked=group_n is not None,
+        epi_store="tma"
+        if (
+            not fp32
+            and dw_acc is not None
+            and "epi_store" not in dw_tuning
+            and dw_cast_tma_rule(2, int(rows), record["arch"])
+        )
+        else None,
     )
     if stage not in registered_stages(module_name):
         raise NotImplementedError(
@@ -4927,19 +5714,13 @@ def dw_cast(
             first_chunk=int(dw_acc is None),
         ),
     )
-    launches = _bind_all(
-        record,
-        module_name,
-        ((stage, "eager"),),
-        {(stage, "eager"): values},
-        device,
-        geometry,
+    launch, arguments = _eager_launch(
+        record, module_name, stage, values, device, geometry
     )
-    launch = launches[(stage, "eager")]
     with _ffi_stream_context(int(index)):
         if launch.prepare is not None:
-            launch.prepare(*launch.arguments)
-        launch()
+            launch.prepare(*arguments)
+        launch.entry(*arguments)
     return out
 
 
@@ -5005,6 +5786,10 @@ def backward_loss(
     return dx, dw
 
 
+# :func:`backward_logprob`'s ``row_index`` default: count the valid rows again
+_RECOUNT = object()
+
+
 def forward_logprob(
     X: torch.Tensor,
     W: torch.Tensor,
@@ -5016,12 +5801,15 @@ def forward_logprob(
     compact_rows: Optional[bool] = None,
     hidden_count: Optional[bool] = None,
     gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
+    logprob_lbl: Optional[bool] = None,
 ) -> ForwardResult:
     """Forward of the log-probability entry: ``logp`` (FP32 ``[T]``, 0 on ignored rows) plus the saved statistic
-    ``lse`` (compacted: the ``[T_v]`` rows of ``row_index``, exactly what :func:`backward_logprob` expects back).
-    ``compact_rows`` (default :func:`compact_rows_default`), ``hidden_count`` (default :func:`hidden_count_default`)
-    and ``gemm_tuning`` (default :func:`gemm_tuning_default`) as in :func:`forward_loss`; this forward has no weight
-    gradient, so it takes no ``fuse_dw_cast`` / ``dx_finalize`` / ``dw_stream``."""
+    ``lse`` (compacted: the ``[T_v]`` rows of ``row_index``, exactly what :func:`backward_logprob` expects back,
+    together with ``row_index``).  ``compact_rows`` (default :func:`compact_rows_default`), ``hidden_count`` (default
+    :func:`hidden_count_default`) and ``gemm_tuning`` (default :func:`gemm_tuning_default`) as in
+    :func:`forward_loss`; ``logprob_lbl`` (default :func:`logprob_lbl_default`) writes only the row statistics and
+    the label column's logit from the logits GEMM (bitwise the same ``lse`` / ``logp``).  This forward has no
+    weight gradient, so it takes no ``fuse_dw_cast`` / ``dx_finalize`` / ``dw_stream``."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
     problem = validate_lm_head_inputs(
@@ -5033,6 +5821,7 @@ def forward_logprob(
         entry="logprob",
     )
     tuning = _resolve_gemm_tuning(gemm_tuning)
+    lbl = _resolve_logprob_lbl(logprob_lbl)
     T = problem.num_rows
     if T == 0:
         return _empty_forward(problem, X, need_dx=False, need_dw=False)
@@ -5075,6 +5864,7 @@ def forward_logprob(
             valid_rows=valid_rows,
             gemm_tuning=tuning,
             hidden_count=hc is not None,
+            logprob_lbl=lbl,
         )
         binding = cache.lookup(key)
         if binding is not None:
@@ -5100,6 +5890,7 @@ def forward_logprob(
         backend=backend,
         compact_rows=False if row_index is None else row_index,
         gemm_tuning=tuning,
+        logprob_lbl=lbl,
     )
     if hc is not None:
         # the hidden valid-row count: chunk 0's logits already sit in the prologue's buffers, so the first call launches
@@ -5144,19 +5935,25 @@ def backward_logprob(
     dw_stream: Optional[Union[bool, str]] = None,
     hidden_count: Optional[bool] = None,
     gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
+    logprob_dz: Optional[bool] = None,
+    row_index: Any = _RECOUNT,
 ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Backward of the log-probability entry: recompute each chunk's logits, ``dz = dlogp_t *
     (1[v = y_t] - softmax)`` (ignored rows zero), then ``dX`` (BF16) and ``dW`` (BF16) through
     the FP32 accumulators.  ``(None, None)`` when neither input is trainable.  ``compact_rows``
-    must match the forward's: the valid-row index is recomputed from ``labels`` (identical to the
-    forward's), ``lse`` is then the forward's compact ``[T_v]`` statistic and ``dX`` comes back
-    scattered to ``[T, H]``; every row ignored returns zeros without launching.  ``fuse_dw_cast``
+    must match the forward's: the valid-row index is the forward's ``row_index``
+    (:attr:`ForwardResult.row_index`; ``None`` = uncompacted) when given -- no count, no host
+    synchronization -- else recomputed from ``labels`` (identical to the forward's); ``lse`` is then
+    the forward's compact ``[T_v]`` statistic and ``dX`` comes back scattered to ``[T, H]``; every
+    row ignored returns zeros without launching.  ``fuse_dw_cast``
     (default :func:`fuse_dw_cast_default`): the last chunk's weight-gradient GEMM writes the final BF16
     ``dW`` from its epilogue (the scale is 1 here).  ``dx_finalize`` (default :func:`dx_finalize_default`,
     resolved once here): a compacted backward writes ``dX`` in one pass from the accumulator.  ``dw_stream``
     (default ``None`` = ``"auto"``, :func:`dw_stream_mode`), ``hidden_count`` (default
-    :func:`hidden_count_default`) and ``gemm_tuning`` (default :func:`gemm_tuning_default`) as in
-    :func:`forward_loss`."""
+    :func:`hidden_count_default`; the recount path only) and ``gemm_tuning`` (default
+    :func:`gemm_tuning_default`) as in :func:`forward_loss`.  ``logprob_dz`` (default
+    :func:`logprob_dz_default`): each chunk's recompute writes ``dz`` from the logits GEMM's
+    epilogue instead of storing the logits for ``row_grad`` (bitwise the same ``dX`` / ``dW``)."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
     problem = validate_lm_head_inputs(
@@ -5169,6 +5966,7 @@ def backward_logprob(
     )
     stream_mode = dw_stream_mode(dw_stream)
     tuning = _resolve_gemm_tuning(gemm_tuning)
+    dz_arm = _resolve_logprob_dz(logprob_dz)
     if not (need_dx or need_dw):
         return None, None
     T, H, V = problem.num_rows, problem.hidden, problem.vocab
@@ -5176,24 +5974,32 @@ def backward_logprob(
         need_dx and _resolve_dx_finalize(dx_finalize)
     )  # resolved once per call
     compact = bool(T and _resolve_compact(compact_rows))
-    hc = _hidden_count(
-        problem,
-        X,
-        W,
-        labels,
-        backend=backend,
-        compact=compact,
-        stats=False,
-        hidden_count=_resolve_hidden_count(hidden_count),
-    )
-    if hc is not None:
-        # the hidden valid-row count: chunk 0's gather and its recompute GEMM (no statistics) are queued
-        row_index = hc.row_index()
-        row_valid = hc.valid if (row_index is not None and fused_dx) else None
+    hc = None
+    if row_index is not _RECOUNT:
+        # the forward's valid-row index: the plan is known without a count (the valid-row mask of the fused dX finalize
+        # is one device comparison, no synchronization)
+        if row_index is not None and not compact:
+            raise ValueError("a valid-row index belongs to a compacted backward")
+        row_valid = (labels >= 0) if (row_index is not None and fused_dx) else None
     else:
-        row_index, row_valid = (
-            valid_rows(labels, mask=fused_dx) if compact else (None, None)
+        hc = _hidden_count(
+            problem,
+            X,
+            W,
+            labels,
+            backend=backend,
+            compact=compact,
+            stats=False,
+            hidden_count=_resolve_hidden_count(hidden_count),
         )
+        if hc is not None:
+            # the hidden valid-row count: chunk 0's gather and its recompute GEMM (no statistics) are queued
+            row_index = hc.row_index()
+            row_valid = hc.valid if (row_index is not None and fused_dx) else None
+        else:
+            row_index, row_valid = (
+                valid_rows(labels, mask=fused_dx) if compact else (None, None)
+            )
     rows = T if row_index is None else int(row_index.numel())
     if rows == 0:  # no rows, or every row ignored
         return (
@@ -5236,6 +6042,7 @@ def backward_logprob(
             gemm_tuning=tuning,
             dx_finalize=fused_dx,
             hidden_count=hc is not None,
+            logprob_dz=dz_arm,
         )
         binding = cache.lookup(key)
         if binding is not None:
@@ -5261,6 +6068,7 @@ def backward_logprob(
         dx_finalize=fused_dx,
         dx_cast=dx_cast,
         dw_stream=stream_mode,
+        logprob_dz=dz_arm,
     )
     if hc is not None:
         binding = _Binding.from_runner(runner, hc)
@@ -5418,15 +6226,18 @@ class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
         dw_stream,
         hidden_count,
         gemm_tuning,
+        logprob_dz,
+        logprob_lbl,
     ):
-        # every switch is resolved (and validated) once here, before any launch: the backward recomputes the same
-        # valid-row index under the same switches, the forward and the backward bind with the same GEMM knobs
+        # every switch is resolved (and validated) once here, before any launch: the backward plans its chunks on the
+        # forward's valid-row index under the same switches, the forward and the backward bind with the same GEMM knobs
         compact = _resolve_compact(compact_rows)
         fuse = _resolve_fuse(fuse_dw_cast)
         fused_dx = _resolve_dx_finalize(dx_finalize)
         stream_mode = dw_stream_mode(dw_stream)
         hidden = _resolve_hidden_count(hidden_count)
         tuning = _resolve_gemm_tuning(gemm_tuning)
+        dz_arm = _resolve_logprob_dz(logprob_dz)
         result = forward_logprob(
             X,
             W,
@@ -5437,9 +6248,11 @@ class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
             compact_rows=compact,
             hidden_count=hidden,
             gemm_tuning=tuning,
+            logprob_lbl=_resolve_logprob_lbl(logprob_lbl),
         )
         ctx.set_materialize_grads(False)
-        ctx.save_for_backward(X, W, labels, result.lse)
+        # the valid-row index rides along: the backward plans its chunks without counting the rows again
+        ctx.save_for_backward(X, W, labels, result.lse, result.row_index)
         ctx.chunk_size, ctx.deterministic, ctx.backend, ctx.compact = (
             chunk_size,
             deterministic,
@@ -5451,13 +6264,14 @@ class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
         ctx.dw_stream = stream_mode
         ctx.hidden_count = hidden
         ctx.gemm_tuning = tuning
+        ctx.logprob_dz = dz_arm
         return result.logp
 
     @staticmethod
     def backward(ctx, dlogp):
         if dlogp is None:
-            return (None,) * 12
-        X, W, labels, lse = ctx.saved_tensors
+            return (None,) * 14
+        X, W, labels, lse, row_index = ctx.saved_tensors
         need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
         dx, dw = backward_logprob(
             X,
@@ -5476,8 +6290,10 @@ class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
             dw_stream=ctx.dw_stream,
             hidden_count=ctx.hidden_count,
             gemm_tuning=ctx.gemm_tuning,
+            logprob_dz=ctx.logprob_dz,
+            row_index=row_index,
         )
-        return (dx, dw) + (None,) * 10
+        return (dx, dw) + (None,) * 12
 
 
 def chunked_lm_head_loss(
@@ -5584,11 +6400,17 @@ def chunked_lm_head_logprob(
     dw_stream: Optional[Union[bool, str]] = None,
     hidden_count: Optional[bool] = None,
     gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
+    logprob_dz: Optional[bool] = None,
+    logprob_lbl: Optional[bool] = None,
 ) -> torch.Tensor:
     """Differentiable FP32 ``logp [T]`` (0 on ignored rows) for arbitrary downstream losses.  The switches
     ``compact_rows`` / ``fuse_dw_cast`` / ``dx_finalize`` / ``dw_stream`` / ``hidden_count`` / ``gemm_tuning`` and
-    their defaults (``None`` = the documented default) as in :func:`chunked_lm_head_loss`; every switch is resolved
-    once in the forward and the backward recomputes under the same values."""
+    their defaults (``None`` = the documented default) as in :func:`chunked_lm_head_loss`, plus the logits GEMM arms
+    of this entry: ``logprob_lbl`` (default ``True``, :func:`logprob_lbl_default`) -- the forward's logits GEMM
+    writes the row statistics and the label column's logit only -- and ``logprob_dz`` (default ``True``,
+    :func:`logprob_dz_default`) -- the backward's recompute writes ``dz`` from its epilogue, no ``row_grad`` launch
+    (both bitwise the same outputs).  Every switch is resolved once in the forward; the backward reuses the
+    forward's valid-row index (no count, no host synchronization) and recomputes under the same values."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
     return ChunkedLmHeadLogprobFunction.apply(
@@ -5604,4 +6426,6 @@ def chunked_lm_head_logprob(
         dw_stream,
         hidden_count,
         gemm_tuning,
+        logprob_dz,
+        logprob_lbl,
     )
