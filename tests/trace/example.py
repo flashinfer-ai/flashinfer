@@ -39,11 +39,13 @@ fmha_v2_prefill_sm120_h4_d128.json
 fmha_v2_prefill_sm120_h96_d128.json
 fmha_v2_prefill_sm120_h20_d256.json
 gdn_decode_qk4_v8_d128.json
+gdn_decode_paged_qk4_v8_d128.json
 gdn_fused_decode_h5120_v48_d128.json
 gdn_mtp_qk4_v8_d128.json
 gdn_replayssm_commit_k2_v8_d128.json
 gdn_prefill_qk4_v8_d128.json
 gdn_prefill_gates_q4_k4_v8_d128.json
+gdn_prefill_paged_q4_k4_v8_d128_ps64.json
 gdn2_prefill_qk4_v8_d128.json
 gdp_prefill_n2_qk4_v8_d128.json
 recurrent_kda_q8_v16_d128.json
@@ -1189,6 +1191,22 @@ from flashinfer.trace.templates.gdn import gdn_prefill_trace
 flashinfer.gdn_prefill.chunk_gated_delta_rule.fi_trace(
     **gdn_prefill_trace(use_gate_in_kernel=True).init(total_seq_len=256, device=device),
     backend="cudnn",
+    save_dir=SAVE_DIR,
+)
+
+# ── GDN on a paged recurrent-state pool (trace-only) ─────────────────────────
+import flashinfer.gdn_paged
+from flashinfer.trace.templates.gdn import (
+    gdn_decode_paged_trace,
+    gdn_prefill_paged_trace,
+)
+
+flashinfer.gdn_paged.chunk_gated_delta_rule_paged.fi_trace(
+    **gdn_prefill_paged_trace.init(total_seq_len=256, page_size=64, device=device),
+    save_dir=SAVE_DIR,
+)
+flashinfer.gdn_paged.gated_delta_rule_decode_paged.fi_trace(
+    **gdn_decode_paged_trace.init(batch_size=4, page_size=64, device=device),
     save_dir=SAVE_DIR,
 )
 

@@ -196,6 +196,12 @@ with contextlib.suppress(ImportError):
         CuteDslBf16MoEWrapper as CuteDslBf16MoEWrapper,
     )
     from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
+    from .gdn_paged import (
+        chunk_gated_delta_rule_paged as chunk_gated_delta_rule_paged,
+        gated_delta_rule_decode_paged as gated_delta_rule_decode_paged,
+        gdn_paged_decode_slots as gdn_paged_decode_slots,
+        gdn_paged_prefill_slots as gdn_paged_prefill_slots,
+    )
 from .gdn2_prefill import chunk_gated_delta_rule2 as chunk_gated_delta_rule2
 from .gdp_prefill import chunk_gated_delta_product as chunk_gated_delta_product
 
