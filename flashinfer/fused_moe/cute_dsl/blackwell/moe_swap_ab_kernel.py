@@ -1219,8 +1219,9 @@ class Sm100BlockScaledMoeEpilogue:
                 # A skipped overlap group has no live TMEM values.
                 cute.arch.fence_view_async_tmem_load()
                 acc_pipeline.consumer_release(acc_state)
-        cute.arch.cp_async_bulk_wait_group(0, read=True)
-        self.transpose_barrier.arrive_and_wait()
+        if valid_tokens >= tokens:
+            cute.arch.cp_async_bulk_wait_group(0, read=True)
+            self.transpose_barrier.arrive_and_wait()
 
     @cute.jit
     def _run_bulk(
@@ -2416,6 +2417,21 @@ class Sm100BlockScaledGroupedGemmKernel:
         return copy, source, thr.partition_D(target)
 
     @cute.jit
+    def _copy_sf(self, copy, source, target, stage_k: cutlass.Constexpr):
+        # Copy complete four-scale words, keeping the stage and row-bank strides.
+        words = cute.ceil_div(stage_k, self.sf_block_k)
+        if cutlass.const_expr(words < target.shape[3]):
+            source = cute.make_tensor(
+                source.iterator,
+                cute.make_layout((*source.shape[:3], words), stride=source.stride),
+            )
+            target = cute.make_tensor(
+                target.iterator,
+                cute.make_layout((*target.shape[:3], words), stride=target.stride),
+            )
+        cute.copy(copy, source, target)
+
+    @cute.jit
     def next_work(self, info_pipe, state, info, static_tile, total_tiles):
         tile = cutlass.Int32(static_tile)
         expert = cutlass.Int32(0)
@@ -3071,8 +3087,10 @@ class Sm100BlockScaledGroupedGemmKernel:
                             None,
                             consumer.index * self.channel_tiles,
                         )
-                        cute.copy(copy_a, source_a[sf_stage_a], target_a)
-                        cute.copy(copy_b, source_b[sf_stage], tile_target_b)
+                        self._copy_sf(copy_a, source_a[sf_stage_a], target_a, stage_k)
+                        self._copy_sf(
+                            copy_b, source_b[sf_stage], tile_target_b, stage_k
+                        )
                         if cutlass.const_expr(self.channel_tiles == 2):
                             sf_stage_a1 = (
                                 None,
@@ -3081,7 +3099,9 @@ class Sm100BlockScaledGroupedGemmKernel:
                                 None,
                                 consumer.index * self.channel_tiles + 1,
                             )
-                            cute.copy(copy_a1, source_a1[sf_stage_a1], target_a1)
+                            self._copy_sf(
+                                copy_a1, source_a1[sf_stage_a1], target_a1, stage_k
+                            )
                         if cutlass.const_expr(self.enable_iket):
                             _iket.range_pop()
                             _iket.range_push("mma_umma0_issue")
@@ -3166,34 +3186,29 @@ class Sm100BlockScaledGroupedGemmKernel:
                 clc_consumer = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Consumer, 1
                 )
-                active = cutlass.Boolean(True)
-                while active:
+                while work.is_valid_tile:
                     if cutlass.const_expr(self.enable_iket):
                         _iket.range_push("scheduler_item")
                     route = work.tile_idx[1]
-                    is_routed = work.is_valid_tile and (route < num_routed_tiles)
-                    if is_routed or not work.is_valid_tile:
+                    is_routed = route < num_routed_tiles
+                    if is_routed:
                         info_pipe.producer_acquire(info_producer)
-                    if work.is_valid_tile and cta_rank == 0:
+                    if cta_rank == 0:
                         clc_pipe.producer_acquire(clc_producer)
                         sched.advance_to_next_work(
                             clc_pipe.producer_get_barrier(clc_producer)
                         )
                         clc_producer.advance()
-                    if is_routed or not work.is_valid_tile:
-                        next_tile = cutlass.Int32(-1)
-                        next_expert = cutlass.Int32(0)
-                        next_valid = cutlass.Int32(0)
-                        if is_routed:
-                            next_tile = (
-                                route * total_m_tiles
-                                + work.tile_idx[0] // self.cta_group_size
-                            )
-                            next_expert = expert_idx[route]
-                            next_valid = cutlass.min(
-                                self.route_tile,
-                                mn_limit[route] - route * self.route_tile,
-                            )
+                    if is_routed:
+                        next_tile = (
+                            route * total_m_tiles
+                            + work.tile_idx[0] // self.cta_group_size
+                        )
+                        next_expert = expert_idx[route]
+                        next_valid = cutlass.min(
+                            self.route_tile,
+                            mn_limit[route] - route * self.route_tile,
+                        )
                         with cute.arch.elect_one():
                             sInfo[0, info_producer.index] = next_tile
                             sInfo[1, info_producer.index] = next_expert
@@ -3202,15 +3217,23 @@ class Sm100BlockScaledGroupedGemmKernel:
                             # release arrival to the consumers' acquire waits.
                             info_pipe.producer_commit(info_producer)
                         info_producer.advance()
-                    if work.is_valid_tile:
-                        clc_pipe.consumer_wait(clc_consumer)
-                        work = sched.get_current_work()
-                        clc_pipe.consumer_release(clc_consumer)
-                        clc_consumer.advance()
-                    else:
-                        active = cutlass.Boolean(False)
+                    clc_pipe.consumer_wait(clc_consumer)
+                    work = sched.get_current_work()
+                    clc_pipe.consumer_release(clc_consumer)
+                    clc_consumer.advance()
                     if cutlass.const_expr(self.enable_iket):
                         _iket.range_pop()
+                if cutlass.const_expr(self.enable_iket):
+                    _iket.range_push("scheduler_item")
+                info_pipe.producer_acquire(info_producer)
+                with cute.arch.elect_one():
+                    sInfo[0, info_producer.index] = cutlass.Int32(-1)
+                    sInfo[1, info_producer.index] = cutlass.Int32(0)
+                    sInfo[2, info_producer.index] = cutlass.Int32(0)
+                    info_pipe.producer_commit(info_producer)
+                info_producer.advance()
+                if cutlass.const_expr(self.enable_iket):
+                    _iket.range_pop()
                 # The final CTA join drains all terminal metadata consumers.
                 if cta_rank == 0:
                     clc_pipe.producer_tail(clc_producer)
