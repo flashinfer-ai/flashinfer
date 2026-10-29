@@ -1,11 +1,15 @@
-# Auto-trigger CI for approved PRs authored by NVIDIA employees.
+# Auto-trigger CI for approved PRs when an authorized org member has
+# specified a test scope via `@flashinfer-bot run <paths>`.
 #
-# When a PR from a flashinfer-ci org member receives an approval (or a new
-# commit is pushed to an already-approved PR), this workflow applies the
-# run-ci label to start CI — the same mechanism used by @flashinfer-bot run.
+# When a PR receives an approval (or a new commit is pushed to an
+# already-approved PR), this workflow checks the comment history for a
+# previous `@flashinfer-bot run <paths>` command from an authorized user.
+# If one is found, it applies the run-ci label to start CI — the same
+# mechanism used by @flashinfer-bot run.
 #
-# This eliminates the common case where approved PRs sit idle because nobody
-# issued @flashinfer-bot run for the current commit.
+# The PR author does NOT need to be an org member — any community PR
+# that has been approved and has a scoped run from an authorized user
+# will auto-trigger.
 #
 # Scope preservation:
 #   The auto-trigger ONLY runs if a previous `@flashinfer-bot run <paths>`
@@ -19,8 +23,8 @@
 #   exactly as ci-bot-commands.yml does, so pr-test.yml reads it the same way.
 #
 # Guards:
-#   - PR author must be a member of the flashinfer-ci GitHub org.
 #   - At least one approving review must exist for the PR.
+#   - An authorized user must have posted `@flashinfer-bot run <paths>`.
 #   - A CI run must not already be in-flight or passed for the HEAD SHA.
 #   - On new pushes (synchronize), any queued or in-progress runs for the
 #     previous HEAD SHA are cancelled before the new run starts — no wasted
@@ -85,37 +89,8 @@ jobs:
           echo "author=$AUTHOR" >> "$GITHUB_OUTPUT"
           echo "has_run_ci=$HAS_RUN_CI" >> "$GITHUB_OUTPUT"
 
-      - name: Check author is flashinfer-ci org member
-        id: org-check
-        env:
-          GH_TOKEN: ${{ github.token }}
-          AUTHOR: ${{ steps.pr.outputs.author }}
-          REPO: ${{ github.repository }}
-        run: |
-          # First try the repo collaborator role — works with GITHUB_TOKEN on
-          # public repos and doesn't need the org-scoped PAT.  This lets the
-          # workflow function on fork synchronize events where secrets aren't
-          # available.
-          ROLE=$(gh api \
-            -H "Accept: application/vnd.github+json" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "/repos/${REPO}/collaborators/${AUTHOR}/permission" \
-            --jq '.role_name' 2>/dev/null) || ROLE="none"
-
-          case "$ROLE" in
-            admin|maintain|write|triage)
-              echo "$AUTHOR is authorized by repository role ($ROLE)"
-              echo "is_member=true" >> "$GITHUB_OUTPUT"
-              exit 0
-              ;;
-          esac
-
-          echo "$AUTHOR does not have a sufficient repo role ($ROLE)"
-          echo "is_member=false" >> "$GITHUB_OUTPUT"
-
       - name: Check PR has an approval
         id: approval-check
-        if: steps.org-check.outputs.is_member == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
@@ -137,7 +112,7 @@ jobs:
 
       - name: Check for existing CI run on this SHA
         id: ci-check
-        if: steps.org-check.outputs.is_member == 'true' && steps.approval-check.outputs.approved == 'true'
+        if: steps.approval-check.outputs.approved == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
@@ -231,8 +206,7 @@ jobs:
       - name: Detect previous scoped run from comments
         id: scope
         if: >-
-          steps.org-check.outputs.is_member == 'true'
-          && steps.approval-check.outputs.approved == 'true'
+          steps.approval-check.outputs.approved == 'true'
           && steps.ci-check.outputs.needs_ci == 'true'
         env:
           GH_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN || github.token }}
@@ -362,8 +336,7 @@ jobs:
       - name: Publish test scope
         id: publish-scope
         if: >-
-          steps.org-check.outputs.is_member == 'true'
-          && steps.approval-check.outputs.approved == 'true'
+          steps.approval-check.outputs.approved == 'true'
           && steps.ci-check.outputs.needs_ci == 'true'
           && steps.scope.outputs.has_scope == 'true'
         env:
@@ -448,8 +421,7 @@ jobs:
 
       - name: Apply run-ci label
         if: >-
-          steps.org-check.outputs.is_member == 'true'
-          && steps.approval-check.outputs.approved == 'true'
+          steps.approval-check.outputs.approved == 'true'
           && steps.ci-check.outputs.needs_ci == 'true'
           && steps.scope.outputs.has_scope == 'true'
           && steps.publish-scope.outcome != 'failure'
