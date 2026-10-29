@@ -517,7 +517,10 @@ def test_blackwell_cached_cluster_one_row_over_takes_wide_kernel(
     assert len(wide) <= 1
     sixteen_chunk = -(-vocab_size // 16)
     sixteen_tiles = -(-sixteen_chunk // 2048)
-    if torch.cuda.get_device_properties(0).multi_processor_count in (148, 152):
+    if (
+        torch.cuda.get_device_capability(),
+        torch.cuda.get_device_properties(0).multi_processor_count,
+    ) in (((10, 0), 148), ((10, 3), 152)):
         # B200 and GB300 fit seven 16-CTA clusters one CTA per SM; GB300 fits
         # eight 12-CTA clusters, B200 eight 10-CTA clusters.
         if torch.cuda.get_device_capability() == (10, 3) or sixteen_tiles > 6:
