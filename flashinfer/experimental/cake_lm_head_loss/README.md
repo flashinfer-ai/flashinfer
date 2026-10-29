@@ -365,7 +365,8 @@ kl, logp = chunked_lm_head_support_kl(X, W, ids, offsets, teacher_logprobs, k_ca
   synchronization; a violation ends the CUDA context, like an out-of-range
   PyTorch index); `check_inputs=True` reads the word back once and raises
   `ValueError` naming the rule and the row.  Every later kernel clamps the
-  indices it reads, so it stays in bounds for any input.
+  indices it reads, and the sparse `dW` pass drops a pair whose id is outside
+  `[0, V)`, so it stays in bounds for any input.
 * Passes: the logits at the support, the forward row stage, the backward row
   stage (`dz [M]`), `dX` and `dW`.  Each of the logits, `dX` and `dW` passes has
   a sparse form (work proportional to `M`: a gather GEMM over tiles of 128

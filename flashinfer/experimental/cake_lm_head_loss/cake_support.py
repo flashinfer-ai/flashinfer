@@ -855,9 +855,9 @@ DW_MODES = ("auto", "global", "chunked")
 # Dispatch: pass ``P`` takes the dense form iff ``M >= K_P* x T`` (the mean support size reaches ``K_P*``), a host
 # rule on host-known sizes (no synchronization, deterministic).  Per-architecture constants calibrated on B200
 # (sm_100a) and GB300 (sm_103a): the thresholds that minimize the summed step time (forward + backward, relative to
-# the best pass forms of each problem) over a calibration set of uniform and Zipf-distributed supports at H = 6144,
-# V = 154880, T = 8192 / 16384 and mean support sizes 32 to 2048.  The rule cannot see how much the rows share
-# their candidates.
+# the best pass forms of each problem) over a calibration set of uniform, Zipf-distributed and group-shared supports
+# at H = 6144, V = 154880, T = 8192 / 16384 and mean support sizes 32 to 2048, and a recorded top-p sampling mask.
+# The rule cannot see how much the rows share their candidates.
 SUPPORT_DENSE_MIN_MEAN_K: dict[str, dict[str, int]] = {
     "sm_100a": {"F": 512, "X": 1029, "W": 508},
     "sm_103a": {"F": 508, "X": 1029, "W": 508},
@@ -1125,7 +1125,7 @@ def _cake_check(
 ):
     """The validation stage: ``(word [1], lpos [T] | None, offsets32 [T + 1], the int32 ids the later stages read)``.
     The int32 copies are clamped (offsets to ``[0, M]``, int64 ids to ``[0, V - 1]``), an int32 caller array is read
-    as it is (every later stage clamps it again)."""
+    as it is (every later stage clamps it again; the sparse dW keys drop an id outside ``[0, V)``)."""
     T, M, V = problem.num_rows, problem.num_pairs, problem.vocab
     device = cx.device
     word = torch.full((1,), NO_ERROR, dtype=torch.int64, device=device)
@@ -1383,8 +1383,9 @@ def _sga_dw_range(
     p1: int,
 ) -> None:
     """One sparse dW pass over the pairs ``[p0, p1)``: the unique CSC keys ``(v << 32) | p`` (a pair of an inactive
-    row takes :data:`SENTINEL_ROW`), sorted (unique keys: one order for any correct sort), then the segment
-    gather-accumulate and, when a segment can be longer than the split, the ordered sum of its parts."""
+    row or with an id outside ``[0, V)`` takes :data:`SENTINEL_ROW`), sorted (unique keys: one order for any correct
+    sort), then the segment gather-accumulate and, when a segment can be longer than the split, the ordered sum of
+    its parts."""
     T, H, V, M = problem.num_rows, problem.hidden, problem.vocab, problem.num_pairs
     n = p1 - p0
     p = torch.arange(p0, p1, dtype=torch.int32, device=cx.device)
@@ -1392,7 +1393,7 @@ def _sga_dw_range(
     keep = active[row]
     del row
     keys = ids_rows[p0:p1].to(torch.int64)
-    keys.masked_fill_(~keep, SENTINEL_ROW)
+    keys.masked_fill_(~keep | (keys < 0) | (keys >= V), SENTINEL_ROW)
     del keep
     keys.bitwise_left_shift_(32).bitwise_or_(p)
     del p

@@ -555,10 +555,12 @@ def chunked_lm_head_preload(device: Optional[Union[torch.device, int, str]] = No
     r"""Do part of the one-time work of a process's first chunked LM-head call
     ahead of it, then wait for the device once (SM100 / SM103 only).
 
-    Loads every generated library of ``device``'s architecture (a JIT build
-    when the package ships no prebuilt library), creates the per-device side
-    stream (PyTorch's stream pool), the count cells and constants, launches the
-    PyTorch operators of the valid-row count paths once and synchronizes.  It
+    Loads every generated library of the loss and log-probability entries for
+    ``device``'s architecture (a JIT build when the package ships no prebuilt
+    library; the candidate-support entries' libraries still load at their first
+    call), creates the per-device side stream (PyTorch's stream pool), the
+    count cells and constants, launches the PyTorch operators of the valid-row
+    count paths once and synchronizes.  It
     does not launch the package's kernels: under the driver's lazy module
     loading (``CUDA_MODULE_LOADING=LAZY``, the default) each kernel form still
     loads at its first launch.  ``device``: a CUDA device, its index or
