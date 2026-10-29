@@ -1026,7 +1026,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4_sm103a(int* __restrict__ t
         asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
         { // schedule_main
             asm volatile("griddepcontrol.wait;" ::: "memory");
-            asm volatile("barrier.arrive 11, 256;" ::: "memory");
+            asm volatile("barrier.sync 11, 256;" ::: "memory");
             unsigned int counts[12];
             unsigned int state[2];
             unsigned int task_3[8];
@@ -1035,304 +1035,104 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4_sm103a(int* __restrict__ t
             unsigned int sched_ticket = 0;
             unsigned int _phase_task_empty = 1;
             if (cta_rank == 0) {
-                int l1_route = -1;
-                if (lane < 24) {
-                    l1_route = topk_idx_i32[lane * 2] - local_expert_offset;
+                unsigned int expert_11_0 = lane;
+                counts[0] = 0;
+                if (expert_11_0 < 384) {
+                    int fold_c_1_0 = smem_hist[expert_11_0];
+                    counts[0] = (unsigned int)fold_c_1_0;
                 }
-                unsigned int l1_lead = 0;
-                unsigned int l1_count = 0;
-                unsigned int l1_below = 0;
-                int l1_q_0 = __shfl_sync(0xFFFFFFFF, l1_route, 0);
-                unsigned int l1_match_0 = __ballot_sync(0xFFFFFFFF, l1_route == l1_q_0);
-                int _find_first_set_0 = __ffs(l1_match_0);
-                if ((unsigned int)l1_q_0 < 384 && _find_first_set_0 - 1 == 0) {
-                    if (l1_q_0 < l1_route) {
-                        l1_below += 1;
-                    }
-                    if (lane == 0) {
-                        l1_lead = 1;
-                        l1_count = (unsigned int)(unsigned int)__popc(l1_match_0);
-                    }
+                unsigned int expert_11_1 = 32 + lane;
+                counts[1] = 0;
+                if (expert_11_1 < 384) {
+                    int fold_c_1_1 = smem_hist[expert_11_1];
+                    counts[1] = (unsigned int)fold_c_1_1;
                 }
-                int l1_q_1 = __shfl_sync(0xFFFFFFFF, l1_route, 1);
-                unsigned int l1_match_1 = __ballot_sync(0xFFFFFFFF, l1_route == l1_q_1);
-                int _find_first_set_1 = __ffs(l1_match_1);
-                if ((unsigned int)l1_q_1 < 384 && _find_first_set_1 - 1 == 1) {
-                    if (l1_q_1 < l1_route) {
-                        l1_below += 1;
-                    }
-                    if (lane == 1) {
-                        l1_lead = 1;
-                        l1_count = (unsigned int)(unsigned int)__popc(l1_match_1);
-                    }
+                unsigned int expert_11_2 = 64 + lane;
+                counts[2] = 0;
+                if (expert_11_2 < 384) {
+                    int fold_c_1_2 = smem_hist[expert_11_2];
+                    counts[2] = (unsigned int)fold_c_1_2;
                 }
-                int l1_q_2 = __shfl_sync(0xFFFFFFFF, l1_route, 2);
-                unsigned int l1_match_2 = __ballot_sync(0xFFFFFFFF, l1_route == l1_q_2);
-                int _find_first_set_2 = __ffs(l1_match_2);
-                if ((unsigned int)l1_q_2 < 384 && _find_first_set_2 - 1 == 2) {
-                    if (l1_q_2 < l1_route) {
-                        l1_below += 1;
-                    }
-                    if (lane == 2) {
-                        l1_lead = 1;
-                        l1_count = (unsigned int)(unsigned int)__popc(l1_match_2);
-                    }
+                unsigned int expert_11_3 = 96 + lane;
+                counts[3] = 0;
+                if (expert_11_3 < 384) {
+                    int fold_c_1_3 = smem_hist[expert_11_3];
+                    counts[3] = (unsigned int)fold_c_1_3;
                 }
-                int l1_q_3 = __shfl_sync(0xFFFFFFFF, l1_route, 3);
-                unsigned int l1_match_3 = __ballot_sync(0xFFFFFFFF, l1_route == l1_q_3);
-                int _find_first_set_3 = __ffs(l1_match_3);
-                if ((unsigned int)l1_q_3 < 384 && _find_first_set_3 - 1 == 3) {
-                    if (l1_q_3 < l1_route) {
-                        l1_below += 1;
-                    }
-                    if (lane == 3) {
-                        l1_lead = 1;
-                        l1_count = (unsigned int)(unsigned int)__popc(l1_match_3);
-                    }
+                unsigned int expert_11_4 = 128 + lane;
+                counts[4] = 0;
+                if (expert_11_4 < 384) {
+                    int fold_c_1_4 = smem_hist[expert_11_4];
+                    counts[4] = (unsigned int)fold_c_1_4;
                 }
-                int l1_q_4 = __shfl_sync(0xFFFFFFFF, l1_route, 4);
-                unsigned int l1_match_4 = __ballot_sync(0xFFFFFFFF, l1_route == l1_q_4);
-                int _find_first_set_4 = __ffs(l1_match_4);
-                if ((unsigned int)l1_q_4 < 384 && _find_first_set_4 - 1 == 4) {
-                    if (l1_q_4 < l1_route) {
-                        l1_below += 1;
-                    }
-                    if (lane == 4) {
-                        l1_lead = 1;
-                        l1_count = (unsigned int)(unsigned int)__popc(l1_match_4);
-                    }
+                unsigned int expert_11_5 = 160 + lane;
+                counts[5] = 0;
+                if (expert_11_5 < 384) {
+                    int fold_c_1_5 = smem_hist[expert_11_5];
+                    counts[5] = (unsigned int)fold_c_1_5;
                 }
-                int l1_q_5 = __shfl_sync(0xFFFFFFFF, l1_route, 5);
-                unsigned int l1_match_5 = __ballot_sync(0xFFFFFFFF, l1_route == l1_q_5);
-                int _find_first_set_5 = __ffs(l1_match_5);
-                if ((unsigned int)l1_q_5 < 384 && _find_first_set_5 - 1 == 5) {
-                    if (l1_q_5 < l1_route) {
-                        l1_below += 1;
-                    }
-                    if (lane == 5) {
-                        l1_lead = 1;
-                        l1_count = (unsigned int)(unsigned int)__popc(l1_match_5);
-                    }
+                unsigned int expert_11_6 = 192 + lane;
+                counts[6] = 0;
+                if (expert_11_6 < 384) {
+                    int fold_c_1_6 = smem_hist[expert_11_6];
+                    counts[6] = (unsigned int)fold_c_1_6;
                 }
-                int l1_q_6 = __shfl_sync(0xFFFFFFFF, l1_route, 6);
-                unsigned int l1_match_6 = __ballot_sync(0xFFFFFFFF, l1_route == l1_q_6);
-                int _find_first_set_6 = __ffs(l1_match_6);
-                if ((unsigned int)l1_q_6 < 384 && _find_first_set_6 - 1 == 6) {
-                    if (l1_q_6 < l1_route) {
-                        l1_below += 1;
-                    }
-                    if (lane == 6) {
-                        l1_lead = 1;
-                        l1_count = (unsigned int)(unsigned int)__popc(l1_match_6);
-                    }
+                unsigned int expert_11_7 = 224 + lane;
+                counts[7] = 0;
+                if (expert_11_7 < 384) {
+                    int fold_c_1_7 = smem_hist[expert_11_7];
+                    counts[7] = (unsigned int)fold_c_1_7;
                 }
-                int l1_q_7 = __shfl_sync(0xFFFFFFFF, l1_route, 7);
-                unsigned int l1_match_7 = __ballot_sync(0xFFFFFFFF, l1_route == l1_q_7);
-                int _find_first_set_7 = __ffs(l1_match_7);
-                if ((unsigned int)l1_q_7 < 384 && _find_first_set_7 - 1 == 7) {
-                    if (l1_q_7 < l1_route) {
-                        l1_below += 1;
-                    }
-                    if (lane == 7) {
-                        l1_lead = 1;
-                        l1_count = (unsigned int)(unsigned int)__popc(l1_match_7);
-                    }
+                unsigned int expert_11_8 = 256 + lane;
+                counts[8] = 0;
+                if (expert_11_8 < 384) {
+                    int fold_c_1_8 = smem_hist[expert_11_8];
+                    counts[8] = (unsigned int)fold_c_1_8;
                 }
-                int l1_q_8 = __shfl_sync(0xFFFFFFFF, l1_route, 8);
-                unsigned int l1_match_8 = __ballot_sync(0xFFFFFFFF, l1_route == l1_q_8);
-                int _find_first_set_8 = __ffs(l1_match_8);
-                if ((unsigned int)l1_q_8 < 384 && _find_first_set_8 - 1 == 8) {
-                    if (l1_q_8 < l1_route) {
-                        l1_below += 1;
-                    }
-                    if (lane == 8) {
-                        l1_lead = 1;
-                        l1_count = (unsigned int)(unsigned int)__popc(l1_match_8);
-                    }
+                unsigned int expert_11_9 = 288 + lane;
+                counts[9] = 0;
+                if (expert_11_9 < 384) {
+                    int fold_c_1_9 = smem_hist[expert_11_9];
+                    counts[9] = (unsigned int)fold_c_1_9;
                 }
-                int l1_q_9 = __shfl_sync(0xFFFFFFFF, l1_route, 9);
-                unsigned int l1_match_9 = __ballot_sync(0xFFFFFFFF, l1_route == l1_q_9);
-                int _find_first_set_9 = __ffs(l1_match_9);
-                if ((unsigned int)l1_q_9 < 384 && _find_first_set_9 - 1 == 9) {
-                    if (l1_q_9 < l1_route) {
-                        l1_below += 1;
-                    }
-                    if (lane == 9) {
-                        l1_lead = 1;
-                        l1_count = (unsigned int)(unsigned int)__popc(l1_match_9);
-                    }
+                unsigned int expert_11_10 = 320 + lane;
+                counts[10] = 0;
+                if (expert_11_10 < 384) {
+                    int fold_c_1_10 = smem_hist[expert_11_10];
+                    counts[10] = (unsigned int)fold_c_1_10;
                 }
-                int l1_q_10 = __shfl_sync(0xFFFFFFFF, l1_route, 10);
-                unsigned int l1_match_10 = __ballot_sync(0xFFFFFFFF, l1_route == l1_q_10);
-                int _find_first_set_10 = __ffs(l1_match_10);
-                if ((unsigned int)l1_q_10 < 384 && _find_first_set_10 - 1 == 10) {
-                    if (l1_q_10 < l1_route) {
-                        l1_below += 1;
-                    }
-                    if (lane == 10) {
-                        l1_lead = 1;
-                        l1_count = (unsigned int)(unsigned int)__popc(l1_match_10);
-                    }
+                unsigned int expert_11_11 = 352 + lane;
+                counts[11] = 0;
+                if (expert_11_11 < 384) {
+                    int fold_c_1_11 = smem_hist[expert_11_11];
+                    counts[11] = (unsigned int)fold_c_1_11;
                 }
-                int l1_q_11 = __shfl_sync(0xFFFFFFFF, l1_route, 11);
-                unsigned int l1_match_11 = __ballot_sync(0xFFFFFFFF, l1_route == l1_q_11);
-                int _find_first_set_11 = __ffs(l1_match_11);
-                if ((unsigned int)l1_q_11 < 384 && _find_first_set_11 - 1 == 11) {
-                    if (l1_q_11 < l1_route) {
-                        l1_below += 1;
-                    }
-                    if (lane == 11) {
-                        l1_lead = 1;
-                        l1_count = (unsigned int)(unsigned int)__popc(l1_match_11);
-                    }
-                }
-                int l1_q_12 = __shfl_sync(0xFFFFFFFF, l1_route, 12);
-                unsigned int l1_match_12 = __ballot_sync(0xFFFFFFFF, l1_route == l1_q_12);
-                int _find_first_set_12 = __ffs(l1_match_12);
-                if ((unsigned int)l1_q_12 < 384 && _find_first_set_12 - 1 == 12) {
-                    if (l1_q_12 < l1_route) {
-                        l1_below += 1;
-                    }
-                    if (lane == 12) {
-                        l1_lead = 1;
-                        l1_count = (unsigned int)(unsigned int)__popc(l1_match_12);
-                    }
-                }
-                int l1_q_13 = __shfl_sync(0xFFFFFFFF, l1_route, 13);
-                unsigned int l1_match_13 = __ballot_sync(0xFFFFFFFF, l1_route == l1_q_13);
-                int _find_first_set_13 = __ffs(l1_match_13);
-                if ((unsigned int)l1_q_13 < 384 && _find_first_set_13 - 1 == 13) {
-                    if (l1_q_13 < l1_route) {
-                        l1_below += 1;
-                    }
-                    if (lane == 13) {
-                        l1_lead = 1;
-                        l1_count = (unsigned int)(unsigned int)__popc(l1_match_13);
-                    }
-                }
-                int l1_q_14 = __shfl_sync(0xFFFFFFFF, l1_route, 14);
-                unsigned int l1_match_14 = __ballot_sync(0xFFFFFFFF, l1_route == l1_q_14);
-                int _find_first_set_14 = __ffs(l1_match_14);
-                if ((unsigned int)l1_q_14 < 384 && _find_first_set_14 - 1 == 14) {
-                    if (l1_q_14 < l1_route) {
-                        l1_below += 1;
-                    }
-                    if (lane == 14) {
-                        l1_lead = 1;
-                        l1_count = (unsigned int)(unsigned int)__popc(l1_match_14);
-                    }
-                }
-                int l1_q_15 = __shfl_sync(0xFFFFFFFF, l1_route, 15);
-                unsigned int l1_match_15 = __ballot_sync(0xFFFFFFFF, l1_route == l1_q_15);
-                int _find_first_set_15 = __ffs(l1_match_15);
-                if ((unsigned int)l1_q_15 < 384 && _find_first_set_15 - 1 == 15) {
-                    if (l1_q_15 < l1_route) {
-                        l1_below += 1;
-                    }
-                    if (lane == 15) {
-                        l1_lead = 1;
-                        l1_count = (unsigned int)(unsigned int)__popc(l1_match_15);
-                    }
-                }
-                int l1_q_16 = __shfl_sync(0xFFFFFFFF, l1_route, 16);
-                unsigned int l1_match_16 = __ballot_sync(0xFFFFFFFF, l1_route == l1_q_16);
-                int _find_first_set_16 = __ffs(l1_match_16);
-                if ((unsigned int)l1_q_16 < 384 && _find_first_set_16 - 1 == 16) {
-                    if (l1_q_16 < l1_route) {
-                        l1_below += 1;
-                    }
-                    if (lane == 16) {
-                        l1_lead = 1;
-                        l1_count = (unsigned int)(unsigned int)__popc(l1_match_16);
-                    }
-                }
-                int l1_q_17 = __shfl_sync(0xFFFFFFFF, l1_route, 17);
-                unsigned int l1_match_17 = __ballot_sync(0xFFFFFFFF, l1_route == l1_q_17);
-                int _find_first_set_17 = __ffs(l1_match_17);
-                if ((unsigned int)l1_q_17 < 384 && _find_first_set_17 - 1 == 17) {
-                    if (l1_q_17 < l1_route) {
-                        l1_below += 1;
-                    }
-                    if (lane == 17) {
-                        l1_lead = 1;
-                        l1_count = (unsigned int)(unsigned int)__popc(l1_match_17);
-                    }
-                }
-                int l1_q_18 = __shfl_sync(0xFFFFFFFF, l1_route, 18);
-                unsigned int l1_match_18 = __ballot_sync(0xFFFFFFFF, l1_route == l1_q_18);
-                int _find_first_set_18 = __ffs(l1_match_18);
-                if ((unsigned int)l1_q_18 < 384 && _find_first_set_18 - 1 == 18) {
-                    if (l1_q_18 < l1_route) {
-                        l1_below += 1;
-                    }
-                    if (lane == 18) {
-                        l1_lead = 1;
-                        l1_count = (unsigned int)(unsigned int)__popc(l1_match_18);
-                    }
-                }
-                int l1_q_19 = __shfl_sync(0xFFFFFFFF, l1_route, 19);
-                unsigned int l1_match_19 = __ballot_sync(0xFFFFFFFF, l1_route == l1_q_19);
-                int _find_first_set_19 = __ffs(l1_match_19);
-                if ((unsigned int)l1_q_19 < 384 && _find_first_set_19 - 1 == 19) {
-                    if (l1_q_19 < l1_route) {
-                        l1_below += 1;
-                    }
-                    if (lane == 19) {
-                        l1_lead = 1;
-                        l1_count = (unsigned int)(unsigned int)__popc(l1_match_19);
-                    }
-                }
-                int l1_q_20 = __shfl_sync(0xFFFFFFFF, l1_route, 20);
-                unsigned int l1_match_20 = __ballot_sync(0xFFFFFFFF, l1_route == l1_q_20);
-                int _find_first_set_20 = __ffs(l1_match_20);
-                if ((unsigned int)l1_q_20 < 384 && _find_first_set_20 - 1 == 20) {
-                    if (l1_q_20 < l1_route) {
-                        l1_below += 1;
-                    }
-                    if (lane == 20) {
-                        l1_lead = 1;
-                        l1_count = (unsigned int)(unsigned int)__popc(l1_match_20);
-                    }
-                }
-                int l1_q_21 = __shfl_sync(0xFFFFFFFF, l1_route, 21);
-                unsigned int l1_match_21 = __ballot_sync(0xFFFFFFFF, l1_route == l1_q_21);
-                int _find_first_set_21 = __ffs(l1_match_21);
-                if ((unsigned int)l1_q_21 < 384 && _find_first_set_21 - 1 == 21) {
-                    if (l1_q_21 < l1_route) {
-                        l1_below += 1;
-                    }
-                    if (lane == 21) {
-                        l1_lead = 1;
-                        l1_count = (unsigned int)(unsigned int)__popc(l1_match_21);
-                    }
-                }
-                int l1_q_22 = __shfl_sync(0xFFFFFFFF, l1_route, 22);
-                unsigned int l1_match_22 = __ballot_sync(0xFFFFFFFF, l1_route == l1_q_22);
-                int _find_first_set_22 = __ffs(l1_match_22);
-                if ((unsigned int)l1_q_22 < 384 && _find_first_set_22 - 1 == 22) {
-                    if (l1_q_22 < l1_route) {
-                        l1_below += 1;
-                    }
-                    if (lane == 22) {
-                        l1_lead = 1;
-                        l1_count = (unsigned int)(unsigned int)__popc(l1_match_22);
-                    }
-                }
-                int l1_q_23 = __shfl_sync(0xFFFFFFFF, l1_route, 23);
-                unsigned int l1_match_23 = __ballot_sync(0xFFFFFFFF, l1_route == l1_q_23);
-                int _find_first_set_23 = __ffs(l1_match_23);
-                if ((unsigned int)l1_q_23 < 384 && _find_first_set_23 - 1 == 23) {
-                    if (l1_q_23 < l1_route) {
-                        l1_below += 1;
-                    }
-                    if (lane == 23) {
-                        l1_lead = 1;
-                        l1_count = (unsigned int)(unsigned int)__popc(l1_match_23);
-                    }
-                }
-                unsigned int l1_leaders = __ballot_sync(0xFFFFFFFF, l1_lead != 0);
                 __syncwarp();
-                unsigned int direct_active = (unsigned int)(unsigned int)__popc(l1_leaders);
+                unsigned int direct_active = 0;
+                unsigned int _warp_vote_0_1 = __ballot_sync(0xFFFFFFFF, counts[0] > 0);
+                direct_active += (unsigned int)(unsigned int)__popc(_warp_vote_0_1);
+                unsigned int _warp_vote_1_1 = __ballot_sync(0xFFFFFFFF, counts[1] > 0);
+                direct_active += (unsigned int)(unsigned int)__popc(_warp_vote_1_1);
+                unsigned int _warp_vote_2_1 = __ballot_sync(0xFFFFFFFF, counts[2] > 0);
+                direct_active += (unsigned int)(unsigned int)__popc(_warp_vote_2_1);
+                unsigned int _warp_vote_3_1 = __ballot_sync(0xFFFFFFFF, counts[3] > 0);
+                direct_active += (unsigned int)(unsigned int)__popc(_warp_vote_3_1);
+                unsigned int _warp_vote_4_1 = __ballot_sync(0xFFFFFFFF, counts[4] > 0);
+                direct_active += (unsigned int)(unsigned int)__popc(_warp_vote_4_1);
+                unsigned int _warp_vote_5_1 = __ballot_sync(0xFFFFFFFF, counts[5] > 0);
+                direct_active += (unsigned int)(unsigned int)__popc(_warp_vote_5_1);
+                unsigned int _warp_vote_6_1 = __ballot_sync(0xFFFFFFFF, counts[6] > 0);
+                direct_active += (unsigned int)(unsigned int)__popc(_warp_vote_6_1);
+                unsigned int _warp_vote_7_1 = __ballot_sync(0xFFFFFFFF, counts[7] > 0);
+                direct_active += (unsigned int)(unsigned int)__popc(_warp_vote_7_1);
+                unsigned int _warp_vote_8_1 = __ballot_sync(0xFFFFFFFF, counts[8] > 0);
+                direct_active += (unsigned int)(unsigned int)__popc(_warp_vote_8_1);
+                unsigned int _warp_vote_9_1 = __ballot_sync(0xFFFFFFFF, counts[9] > 0);
+                direct_active += (unsigned int)(unsigned int)__popc(_warp_vote_9_1);
+                unsigned int _warp_vote_10_1 = __ballot_sync(0xFFFFFFFF, counts[10] > 0);
+                direct_active += (unsigned int)(unsigned int)__popc(_warp_vote_10_1);
+                unsigned int _warp_vote_11_1 = __ballot_sync(0xFFFFFFFF, counts[11] > 0);
+                direct_active += (unsigned int)(unsigned int)__popc(_warp_vote_11_1);
                 unsigned int direct_fc1 = direct_active * 5;
                 unsigned int direct_total = direct_fc1 + direct_active * 20;
                 #pragma unroll 1
@@ -1354,17 +1154,163 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4_sm103a(int* __restrict__ t
                     unsigned int direct_n = direct_j % direct_per;
                     unsigned int direct_expert = 0;
                     unsigned int direct_valid = 4;
-                    unsigned int direct_hit = __ballot_sync(0xFFFFFFFF, l1_lead != 0 && l1_below == direct_a);
-                    if (direct_hit != 0) {
-                        int _find_first_set_24 = __ffs(direct_hit);
-                        unsigned int direct_lane = _find_first_set_24 - 1;
-                        int _shfl_sync_25 = __shfl_sync(0xFFFFFFFF, l1_route, direct_lane);
-                        direct_expert = (unsigned int)_shfl_sync_25;
+                    unsigned int direct_base = 0;
+                    unsigned int direct_mask_0 = __ballot_sync(0xFFFFFFFF, counts[0] > 0);
+                    uint32_t _rank_in_mask_12 = (uint32_t)__popc(direct_mask_0 & ((1u << (unsigned int)lane) - 1u));
+                    unsigned int direct_hit_0 = __ballot_sync(0xFFFFFFFF, counts[0] > 0 && direct_base + _rank_in_mask_12 == direct_a);
+                    if (direct_hit_0 != 0) {
+                        int _find_first_set_13 = __ffs(direct_hit_0);
+                        unsigned int direct_lane_0 = _find_first_set_13 - 1;
+                        direct_expert = 0 + direct_lane_0;
                         if (direct_phase == 2) {
-                            unsigned int _shfl_sync_26 = __shfl_sync(0xFFFFFFFF, l1_count, direct_lane);
+                            unsigned int _shfl_sync_14 = __shfl_sync(0xFFFFFFFF, counts[0], direct_lane_0);
+                            direct_valid = _shfl_sync_14;
+                        }
+                    }
+                    direct_base += (unsigned int)(unsigned int)__popc(direct_mask_0);
+                    unsigned int direct_mask_1 = __ballot_sync(0xFFFFFFFF, counts[1] > 0);
+                    uint32_t _rank_in_mask_15 = (uint32_t)__popc(direct_mask_1 & ((1u << (unsigned int)lane) - 1u));
+                    unsigned int direct_hit_1 = __ballot_sync(0xFFFFFFFF, counts[1] > 0 && direct_base + _rank_in_mask_15 == direct_a);
+                    if (direct_hit_1 != 0) {
+                        int _find_first_set_16 = __ffs(direct_hit_1);
+                        unsigned int direct_lane_1 = _find_first_set_16 - 1;
+                        direct_expert = 32 + direct_lane_1;
+                        if (direct_phase == 2) {
+                            unsigned int _shfl_sync_17 = __shfl_sync(0xFFFFFFFF, counts[1], direct_lane_1);
+                            direct_valid = _shfl_sync_17;
+                        }
+                    }
+                    direct_base += (unsigned int)(unsigned int)__popc(direct_mask_1);
+                    unsigned int direct_mask_2 = __ballot_sync(0xFFFFFFFF, counts[2] > 0);
+                    uint32_t _rank_in_mask_18 = (uint32_t)__popc(direct_mask_2 & ((1u << (unsigned int)lane) - 1u));
+                    unsigned int direct_hit_2 = __ballot_sync(0xFFFFFFFF, counts[2] > 0 && direct_base + _rank_in_mask_18 == direct_a);
+                    if (direct_hit_2 != 0) {
+                        int _find_first_set_19 = __ffs(direct_hit_2);
+                        unsigned int direct_lane_2 = _find_first_set_19 - 1;
+                        direct_expert = 64 + direct_lane_2;
+                        if (direct_phase == 2) {
+                            unsigned int _shfl_sync_20 = __shfl_sync(0xFFFFFFFF, counts[2], direct_lane_2);
+                            direct_valid = _shfl_sync_20;
+                        }
+                    }
+                    direct_base += (unsigned int)(unsigned int)__popc(direct_mask_2);
+                    unsigned int direct_mask_3 = __ballot_sync(0xFFFFFFFF, counts[3] > 0);
+                    uint32_t _rank_in_mask_21 = (uint32_t)__popc(direct_mask_3 & ((1u << (unsigned int)lane) - 1u));
+                    unsigned int direct_hit_3 = __ballot_sync(0xFFFFFFFF, counts[3] > 0 && direct_base + _rank_in_mask_21 == direct_a);
+                    if (direct_hit_3 != 0) {
+                        int _find_first_set_22 = __ffs(direct_hit_3);
+                        unsigned int direct_lane_3 = _find_first_set_22 - 1;
+                        direct_expert = 96 + direct_lane_3;
+                        if (direct_phase == 2) {
+                            unsigned int _shfl_sync_23 = __shfl_sync(0xFFFFFFFF, counts[3], direct_lane_3);
+                            direct_valid = _shfl_sync_23;
+                        }
+                    }
+                    direct_base += (unsigned int)(unsigned int)__popc(direct_mask_3);
+                    unsigned int direct_mask_4 = __ballot_sync(0xFFFFFFFF, counts[4] > 0);
+                    uint32_t _rank_in_mask_24 = (uint32_t)__popc(direct_mask_4 & ((1u << (unsigned int)lane) - 1u));
+                    unsigned int direct_hit_4 = __ballot_sync(0xFFFFFFFF, counts[4] > 0 && direct_base + _rank_in_mask_24 == direct_a);
+                    if (direct_hit_4 != 0) {
+                        int _find_first_set_25 = __ffs(direct_hit_4);
+                        unsigned int direct_lane_4 = _find_first_set_25 - 1;
+                        direct_expert = 128 + direct_lane_4;
+                        if (direct_phase == 2) {
+                            unsigned int _shfl_sync_26 = __shfl_sync(0xFFFFFFFF, counts[4], direct_lane_4);
                             direct_valid = _shfl_sync_26;
                         }
                     }
+                    direct_base += (unsigned int)(unsigned int)__popc(direct_mask_4);
+                    unsigned int direct_mask_5 = __ballot_sync(0xFFFFFFFF, counts[5] > 0);
+                    uint32_t _rank_in_mask_27 = (uint32_t)__popc(direct_mask_5 & ((1u << (unsigned int)lane) - 1u));
+                    unsigned int direct_hit_5 = __ballot_sync(0xFFFFFFFF, counts[5] > 0 && direct_base + _rank_in_mask_27 == direct_a);
+                    if (direct_hit_5 != 0) {
+                        int _find_first_set_28 = __ffs(direct_hit_5);
+                        unsigned int direct_lane_5 = _find_first_set_28 - 1;
+                        direct_expert = 160 + direct_lane_5;
+                        if (direct_phase == 2) {
+                            unsigned int _shfl_sync_29 = __shfl_sync(0xFFFFFFFF, counts[5], direct_lane_5);
+                            direct_valid = _shfl_sync_29;
+                        }
+                    }
+                    direct_base += (unsigned int)(unsigned int)__popc(direct_mask_5);
+                    unsigned int direct_mask_6 = __ballot_sync(0xFFFFFFFF, counts[6] > 0);
+                    uint32_t _rank_in_mask_30 = (uint32_t)__popc(direct_mask_6 & ((1u << (unsigned int)lane) - 1u));
+                    unsigned int direct_hit_6 = __ballot_sync(0xFFFFFFFF, counts[6] > 0 && direct_base + _rank_in_mask_30 == direct_a);
+                    if (direct_hit_6 != 0) {
+                        int _find_first_set_31 = __ffs(direct_hit_6);
+                        unsigned int direct_lane_6 = _find_first_set_31 - 1;
+                        direct_expert = 192 + direct_lane_6;
+                        if (direct_phase == 2) {
+                            unsigned int _shfl_sync_32 = __shfl_sync(0xFFFFFFFF, counts[6], direct_lane_6);
+                            direct_valid = _shfl_sync_32;
+                        }
+                    }
+                    direct_base += (unsigned int)(unsigned int)__popc(direct_mask_6);
+                    unsigned int direct_mask_7 = __ballot_sync(0xFFFFFFFF, counts[7] > 0);
+                    uint32_t _rank_in_mask_33 = (uint32_t)__popc(direct_mask_7 & ((1u << (unsigned int)lane) - 1u));
+                    unsigned int direct_hit_7 = __ballot_sync(0xFFFFFFFF, counts[7] > 0 && direct_base + _rank_in_mask_33 == direct_a);
+                    if (direct_hit_7 != 0) {
+                        int _find_first_set_34 = __ffs(direct_hit_7);
+                        unsigned int direct_lane_7 = _find_first_set_34 - 1;
+                        direct_expert = 224 + direct_lane_7;
+                        if (direct_phase == 2) {
+                            unsigned int _shfl_sync_35 = __shfl_sync(0xFFFFFFFF, counts[7], direct_lane_7);
+                            direct_valid = _shfl_sync_35;
+                        }
+                    }
+                    direct_base += (unsigned int)(unsigned int)__popc(direct_mask_7);
+                    unsigned int direct_mask_8 = __ballot_sync(0xFFFFFFFF, counts[8] > 0);
+                    uint32_t _rank_in_mask_36 = (uint32_t)__popc(direct_mask_8 & ((1u << (unsigned int)lane) - 1u));
+                    unsigned int direct_hit_8 = __ballot_sync(0xFFFFFFFF, counts[8] > 0 && direct_base + _rank_in_mask_36 == direct_a);
+                    if (direct_hit_8 != 0) {
+                        int _find_first_set_37 = __ffs(direct_hit_8);
+                        unsigned int direct_lane_8 = _find_first_set_37 - 1;
+                        direct_expert = 256 + direct_lane_8;
+                        if (direct_phase == 2) {
+                            unsigned int _shfl_sync_38 = __shfl_sync(0xFFFFFFFF, counts[8], direct_lane_8);
+                            direct_valid = _shfl_sync_38;
+                        }
+                    }
+                    direct_base += (unsigned int)(unsigned int)__popc(direct_mask_8);
+                    unsigned int direct_mask_9 = __ballot_sync(0xFFFFFFFF, counts[9] > 0);
+                    uint32_t _rank_in_mask_39 = (uint32_t)__popc(direct_mask_9 & ((1u << (unsigned int)lane) - 1u));
+                    unsigned int direct_hit_9 = __ballot_sync(0xFFFFFFFF, counts[9] > 0 && direct_base + _rank_in_mask_39 == direct_a);
+                    if (direct_hit_9 != 0) {
+                        int _find_first_set_40 = __ffs(direct_hit_9);
+                        unsigned int direct_lane_9 = _find_first_set_40 - 1;
+                        direct_expert = 288 + direct_lane_9;
+                        if (direct_phase == 2) {
+                            unsigned int _shfl_sync_41 = __shfl_sync(0xFFFFFFFF, counts[9], direct_lane_9);
+                            direct_valid = _shfl_sync_41;
+                        }
+                    }
+                    direct_base += (unsigned int)(unsigned int)__popc(direct_mask_9);
+                    unsigned int direct_mask_10 = __ballot_sync(0xFFFFFFFF, counts[10] > 0);
+                    uint32_t _rank_in_mask_42 = (uint32_t)__popc(direct_mask_10 & ((1u << (unsigned int)lane) - 1u));
+                    unsigned int direct_hit_10 = __ballot_sync(0xFFFFFFFF, counts[10] > 0 && direct_base + _rank_in_mask_42 == direct_a);
+                    if (direct_hit_10 != 0) {
+                        int _find_first_set_43 = __ffs(direct_hit_10);
+                        unsigned int direct_lane_10 = _find_first_set_43 - 1;
+                        direct_expert = 320 + direct_lane_10;
+                        if (direct_phase == 2) {
+                            unsigned int _shfl_sync_44 = __shfl_sync(0xFFFFFFFF, counts[10], direct_lane_10);
+                            direct_valid = _shfl_sync_44;
+                        }
+                    }
+                    direct_base += (unsigned int)(unsigned int)__popc(direct_mask_10);
+                    unsigned int direct_mask_11 = __ballot_sync(0xFFFFFFFF, counts[11] > 0);
+                    uint32_t _rank_in_mask_45 = (uint32_t)__popc(direct_mask_11 & ((1u << (unsigned int)lane) - 1u));
+                    unsigned int direct_hit_11 = __ballot_sync(0xFFFFFFFF, counts[11] > 0 && direct_base + _rank_in_mask_45 == direct_a);
+                    if (direct_hit_11 != 0) {
+                        int _find_first_set_46 = __ffs(direct_hit_11);
+                        unsigned int direct_lane_11 = _find_first_set_46 - 1;
+                        direct_expert = 352 + direct_lane_11;
+                        if (direct_phase == 2) {
+                            unsigned int _shfl_sync_47 = __shfl_sync(0xFFFFFFFF, counts[11], direct_lane_11);
+                            direct_valid = _shfl_sync_47;
+                        }
+                    }
+                    direct_base += (unsigned int)(unsigned int)__popc(direct_mask_11);
                     task_3[0] = direct_phase;
                     task_3[1] = direct_expert;
                     task_3[2] = 0;
@@ -1385,20 +1331,20 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4_sm103a(int* __restrict__ t
                             "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [remAddr32], %2;\n\t"
                             "}"
                             :: "r"(task_full_addr + (schedule_stage) * 8), "r"(lane), "r"((uint32_t)(32)) : "memory");
-                        uint32_t _mbar_peer_27;
+                        uint32_t _mbar_peer_48;
                         asm(
                             "mapa.shared::cluster.u32 %0, %1, %2;"
-                            : "=r"(_mbar_peer_27) : "r"(task_full_addr + (schedule_stage) * 8), "r"(lane));
+                            : "=r"(_mbar_peer_48) : "r"(task_full_addr + (schedule_stage) * 8), "r"(lane));
                         asm volatile(
                             "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                            :: "r"(destination), "r"(task_3[0]), "r"(task_3[1]), "r"(task_3[2]), "r"(task_3[3]), "r"(_mbar_peer_27) : "memory");
-                        uint32_t _mbar_peer_28;
+                            :: "r"(destination), "r"(task_3[0]), "r"(task_3[1]), "r"(task_3[2]), "r"(task_3[3]), "r"(_mbar_peer_48) : "memory");
+                        uint32_t _mbar_peer_49;
                         asm(
                             "mapa.shared::cluster.u32 %0, %1, %2;"
-                            : "=r"(_mbar_peer_28) : "r"(task_full_addr + (schedule_stage) * 8), "r"(lane));
+                            : "=r"(_mbar_peer_49) : "r"(task_full_addr + (schedule_stage) * 8), "r"(lane));
                         asm volatile(
                             "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                            :: "r"(destination + 16), "r"(task_3[4]), "r"(task_3[5]), "r"(task_3[6]), "r"(task_3[7]), "r"(_mbar_peer_28) : "memory");
+                            :: "r"(destination + 16), "r"(task_3[4]), "r"(task_3[5]), "r"(task_3[6]), "r"(task_3[7]), "r"(_mbar_peer_49) : "memory");
                     }
                     __syncwarp();
                     schedule_stage += 1;
@@ -1425,20 +1371,20 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4_sm103a(int* __restrict__ t
                         "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [remAddr32], %2;\n\t"
                         "}"
                         :: "r"(task_full_addr + (schedule_stage) * 8), "r"(lane), "r"((uint32_t)(32)) : "memory");
-                    uint32_t _mbar_peer_29;
+                    uint32_t _mbar_peer_50;
                     asm(
                         "mapa.shared::cluster.u32 %0, %1, %2;"
-                        : "=r"(_mbar_peer_29) : "r"(task_full_addr + (schedule_stage) * 8), "r"(lane));
+                        : "=r"(_mbar_peer_50) : "r"(task_full_addr + (schedule_stage) * 8), "r"(lane));
                     asm volatile(
                         "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                        :: "r"(destination_1), "r"(task_3[0]), "r"(task_3[1]), "r"(task_3[2]), "r"(task_3[3]), "r"(_mbar_peer_29) : "memory");
-                    uint32_t _mbar_peer_30;
+                        :: "r"(destination_1), "r"(task_3[0]), "r"(task_3[1]), "r"(task_3[2]), "r"(task_3[3]), "r"(_mbar_peer_50) : "memory");
+                    uint32_t _mbar_peer_51;
                     asm(
                         "mapa.shared::cluster.u32 %0, %1, %2;"
-                        : "=r"(_mbar_peer_30) : "r"(task_full_addr + (schedule_stage) * 8), "r"(lane));
+                        : "=r"(_mbar_peer_51) : "r"(task_full_addr + (schedule_stage) * 8), "r"(lane));
                     asm volatile(
                         "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                        :: "r"(destination_1 + 16), "r"(task_3[4]), "r"(task_3[5]), "r"(task_3[6]), "r"(task_3[7]), "r"(_mbar_peer_30) : "memory");
+                        :: "r"(destination_1 + 16), "r"(task_3[4]), "r"(task_3[5]), "r"(task_3[6]), "r"(task_3[7]), "r"(_mbar_peer_51) : "memory");
                 }
                 __syncwarp();
             }
