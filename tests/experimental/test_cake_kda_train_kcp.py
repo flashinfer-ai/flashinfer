@@ -2153,6 +2153,111 @@ def test_partition_validation_and_defaults() -> None:
     )
 
 
+def _halo_sources_scan(part, halo: int):
+    """Reference of :func:`cake_kcp_plan._halo_sources`: the previous owner lookup, a linear scan of the document
+    chain for every halo row (O(chain) per row)."""
+    chains: dict = {}
+    for frs in part.fragments:
+        for f in frs:
+            if f.length > 0:
+                chains.setdefault(f.doc, []).append(f)
+    for lst in chains.values():
+        lst.sort(key=lambda f: f.off)
+
+    def owner(doc, t):
+        for g in chains[doc]:
+            if g.off <= t < g.end:
+                return g
+        raise ValueError(f"document {doc} token {t} has no owning fragment")
+
+    hist, tail = {}, {}
+    for frs in part.fragments:
+        for f in frs:
+            if f.length > 0 and f.off > 0:
+                rows = []
+                for k in range(halo):
+                    t = f.off - halo + k
+                    if t < 0:
+                        rows.append(None)
+                    else:
+                        g = owner(f.doc, t)
+                        rows.append((g.rank, g.slot, t - g.off))
+                hist[(f.rank, f.slot)] = tuple(rows)
+            if f.crossing_out:
+                length = part.doc_length(f.doc)
+                rows = []
+                for m in range(halo):
+                    p = f.end + m
+                    if p >= length:
+                        rows.append(None)
+                    else:
+                        s = owner(f.doc, p)
+                        rows.append((s.rank, s.slot, p - s.off))
+                tail[(f.rank, f.slot)] = tuple(rows)
+    return hist, tail
+
+
+def _random_ragged_partition(rng, W: int):
+    """An explicit ragged table: 1-6 documents (1 to 5000 tokens), each cut at random points into pieces on random
+    ranks (one-token pieces included), plus zero-length pieces."""
+    lengths = [
+        rng.choice((rng.randint(1, 8), rng.randint(1, 300), rng.randint(1, 5000)))
+        for _ in range(rng.randint(1, 6))
+    ]
+    cu = [0]
+    for n in lengths:
+        cu.append(cu[-1] + n)
+    per_rank: list[list[tuple[int, int, int]]] = [[] for _ in range(W)]
+    for d, n in enumerate(lengths):
+        k = rng.randint(1, min(n, 2 * W + 3))
+        bounds = [0, *sorted(rng.sample(range(1, n), k - 1)), n]
+        for a, b in zip(bounds, bounds[1:], strict=False):
+            per_rank[rng.randrange(W)].append((d, a, b - a))
+        for _ in range(rng.randint(0, 2)):
+            per_rank[rng.randrange(W)].append((d, rng.randint(0, n), 0))
+    for frs in per_rank:
+        frs.sort(key=lambda x: (x[0], x[1]))
+    return kp.kcp_partition(cu, W, fragments=per_rank)
+
+
+def test_halo_sources_bisect_matches_the_scan_on_random_partitions() -> None:
+    """The per-document bisect of ``_halo_sources`` gives the integers of the linear owner scan on random ragged tables
+    (one-token and zero-length fragments included) and on the C / Z / D layouts of the same documents, W = 2..64, for
+    halo widths 1..4 (3 is the shipped width of the width-4 conv)."""
+    import random
+
+    rng = random.Random(7815)
+    n_parts = 0
+    n_hist = 0
+    for W in range(2, 65):
+        parts = [_random_ragged_partition(rng, W) for _ in range(3)]
+        cu = parts[0].cu_seqlens
+        parts += [kp.kcp_partition(cu, W, layout=lay) for lay in kp.LAYOUTS]
+        for part in parts:
+            for halo in (1, 2, 3, 4):
+                got = kp._halo_sources(part, halo)
+                want = _halo_sources_scan(part, halo)
+                assert got == want, (W, part.layout, halo)
+                n_hist += len(got[0]) + len(got[1])
+            n_parts += 1
+    assert n_parts == 63 * (3 + len(kp.LAYOUTS)) and n_hist > 0
+
+
+@HARNESS
+def test_halo_sources_bisect_matches_the_scan_on_the_rows_of_record() -> None:
+    """The bisect owner lookup of ``_halo_sources`` equals the linear scan on every row, CP and layout of record."""
+    assert CASES
+    for name, W, lay in CASES:
+        _frags, part = harness_partition(kcp_shapes.ROWS[name], W, lay)
+        for halo in (1, 3, 4):
+            assert kp._halo_sources(part, halo) == _halo_sources_scan(part, halo), (
+                name,
+                W,
+                lay,
+                halo,
+            )
+
+
 def test_tables_follow_the_kernel_contract() -> None:
     """chunk_bos / chunk_len / seq_chunk_start / seq_order / seg_chunk_start of the spec formulas; the four chunk tables
     are laid out as the existing backend lays them out, and the boundary kernels' ``[NSEG + 1]`` segment table follows
