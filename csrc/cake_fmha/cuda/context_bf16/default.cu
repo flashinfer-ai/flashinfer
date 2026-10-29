@@ -2544,6 +2544,7 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
                     }
                 }
                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
                 mbarrier_arrive(corr_done_addr);
                 mbarrier_arrive(corr_done_addr + 8);
             }
