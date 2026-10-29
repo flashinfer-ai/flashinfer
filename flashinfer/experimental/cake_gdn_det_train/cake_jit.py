@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Registry of the Cake deterministic GDN chunked-training kernels (SM100 /
-SM103).  The loader glue is :mod:`.cake_backend`; the host plan and the
+SM103 / SM107).  The loader glue is :mod:`.cake_backend`; the host plan and the
 autograd chain are :mod:`.cake_chain`.
 
 Every record of ``MODULES`` is one mechanically exported program: a CUDA
@@ -59,8 +59,8 @@ from __future__ import annotations
 
 from typing import Any
 
-ARCHES = ("sm_100a", "sm_103a")
-ARCH_BY_CAPABILITY = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+ARCHES = ("sm_100a", "sm_103a", "sm_107a")
+ARCH_BY_CAPABILITY = {(10, 0): "sm_100a", (10, 3): "sm_103a", (10, 7): "sm_107a"}
 CHUNK = 64
 HEAD_DIM = 128
 PACKAGE = "flashinfer.experimental.cake_gdn_det_train"
@@ -103,7 +103,7 @@ STAGES = (
 
 MODULES: dict[str, dict[str, Any]] = {
     "meta": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "cu_seqlens"],
             ["buffer", "chunk_start"],
@@ -139,7 +139,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "meta",
     },
     "prep": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "q"],
             ["buffer", "k"],
@@ -173,7 +173,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "prep",
     },
     "prep_bf16beta": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "q"],
             ["buffer", "k"],
@@ -207,7 +207,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "prep_bf16beta",
     },
     "prep_tma": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "q_tma"],
             ["buffer", "k_tma"],
@@ -241,11 +241,14 @@ MODULES: dict[str, dict[str, Any]] = {
         "select": {
             "sm_100a": {"ctas_per_sm": 6, "window": 2.5},
             "sm_103a": {"ctas_per_sm": 6, "window": 2.5},
+            # PROVISIONAL: R200 runs 1024 threads per SM, so 3 CTAs of 288 threads; the window is a placeholder
+            # (>= 2048 / (3 x 216) keeps 4 x 4096 tokens at H = 8 on the plain prep) until the R200 calibration.
+            "sm_107a": {"ctas_per_sm": 3, "window": 3.2},
         },
         "stage": "prep_tma",
     },
     "prep_tma_bf16beta": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "q_tma"],
             ["buffer", "k_tma"],
@@ -279,7 +282,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "prep_tma_bf16beta",
     },
     "wy_tc": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "kn"],
             ["buffer", "v"],
@@ -310,7 +313,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "wy_tc",
     },
     "fwd_h_r32k2": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "kn"],
             ["buffer", "w"],
@@ -348,7 +351,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "fwd_h_r32k2",
     },
     "fwd_h_r32k1": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "kn"],
             ["buffer", "w"],
@@ -386,7 +389,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "fwd_h_r32k1",
     },
     "fwd_h_r64k1": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "kn"],
             ["buffer", "w"],
@@ -424,7 +427,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "fwd_h_r64k1",
     },
     "fwd_h_pre_r32k2": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "kn"],
             ["buffer", "w"],
@@ -464,7 +467,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "fwd_h_pre_r32k2",
     },
     "fwd_h_pre_r64k1": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "kn"],
             ["buffer", "w"],
@@ -504,7 +507,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "fwd_h_pre_r64k1",
     },
     "fwd_h_r32k2_split": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "kn"],
             ["buffer", "w"],
@@ -543,7 +546,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "fwd_h_r32k2_split",
     },
     "fwd_h_r64k1_split": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "kn"],
             ["buffer", "w"],
@@ -582,7 +585,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "fwd_h_r64k1_split",
     },
     "stitch": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "seg_state"],
             ["buffer", "init_state"],
@@ -609,7 +612,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "stitch",
     },
     "fwd_ho": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "qn_tma"],
             ["buffer", "kn_tma"],
@@ -653,7 +656,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "fwd_ho",
     },
     "dv_local": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "qn"],
             ["buffer", "kn"],
@@ -682,7 +685,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "dv_local",
     },
     "dhu_r32k2": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "qn"],
             ["buffer", "kn"],
@@ -723,7 +726,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "dhu_r32k2",
     },
     "dhu_r32k1": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "qn"],
             ["buffer", "kn"],
@@ -764,7 +767,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "dhu_r32k1",
     },
     "dhu_r64k1": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "qn"],
             ["buffer", "kn"],
@@ -805,7 +808,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "dhu_r64k1",
     },
     "dhu_pre_r32k2": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "qn"],
             ["buffer", "kn"],
@@ -848,7 +851,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "dhu_pre_r32k2",
     },
     "dhu_pre_r64k1": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "qn"],
             ["buffer", "kn"],
@@ -891,7 +894,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "dhu_pre_r64k1",
     },
     "dhu_tc2": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "qn_tma"],
             ["buffer", "kn_tma"],
@@ -940,11 +943,18 @@ MODULES: dict[str, dict[str, Any]] = {
                 "t_lat": 2.204,
                 "t_unit": 1.599,
             },
+            # PROVISIONAL: the sm_103a constants until the R200 calibration.
+            "sm_107a": {
+                "c_dvl": 1.85,
+                "t_full": 2.293,
+                "t_lat": 2.204,
+                "t_unit": 1.599,
+            },
         },
         "stage": "dhu_tc2",
     },
     "dqkwg": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "qn"],
             ["buffer", "kn"],
@@ -980,7 +990,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "dqkwg",
     },
     "wy_bwd": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "kn"],
             ["buffer", "v"],
@@ -1014,7 +1024,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "wy_bwd",
     },
     "wy_bwd_bf16": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "kn"],
             ["buffer", "v"],
@@ -1048,7 +1058,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "wy_bwd_bf16",
     },
     "finalize": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "qn"],
             ["buffer", "kn"],
@@ -1084,7 +1094,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "finalize",
     },
     "finalize_mlp": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "qn"],
             ["buffer", "kn"],
@@ -1120,7 +1130,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "finalize_mlp",
     },
     "tail_g2": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "qn"],
             ["buffer", "kn"],
@@ -1163,7 +1173,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "tail_g2",
     },
     "tail_g2_bf16": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "qn"],
             ["buffer", "kn"],

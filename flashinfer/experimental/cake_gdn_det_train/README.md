@@ -1,4 +1,4 @@
-# Cake deterministic GDN chunked training backend (SM100 / SM103)
+# Cake deterministic GDN chunked training backend (SM100 / SM103 / SM107)
 
 Experimental backend for the forward and backward of packed GDN (scalar-gated
 DeltaNet) layers in training: head dimension 128, chunk 64, grouped Q/K heads
@@ -10,8 +10,9 @@ side stream; the groups write disjoint outputs, so this holds with one or two
 streams.
 
 Both the API and the backend are experimental: no compatibility guarantee.
-SM100 (B200 / GB200) and SM103 (B300 / GB300) are the supported
-architectures; another device raises `RuntimeError`.  The feature does not
+SM100 (B200 / GB200), SM103 (B300 / GB300) and SM107 (R200) are the supported
+architectures; another device raises `RuntimeError`.  The SM107 libraries need
+CUDA 13.4 or newer.  The feature does not
 participate in automatic backend selection, autotuning or trace-apply.  Its
 libraries are loaded prebuilt from `aot/` when a builder compiled them and
 JIT-built by FlashInfer from the sources and flags `build.json` records
@@ -115,4 +116,4 @@ captured in a CUDA graph (warm it up first, like any captured call).
 
 - Head dimension 128 and chunk 64 only; `q`, `k`, `v` BF16.
 - No context parallelism and no cross-rank state passing.
-- `sm_100a` and `sm_103a` only.
+- `sm_100a`, `sm_103a` and `sm_107a` only (`sm_107a` with CUDA 13.4 or newer).

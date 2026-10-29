@@ -20,7 +20,7 @@ Without a device: the registry (one record per stage and architecture, the argum
 scan constants, the ``dhu_tc2`` selection constants and the ``prep_tma`` window), the build manifest (every record's
 library, the recorded source digests), the launch entries (one resolution per stage and device, then the cached FFI
 entry; the first launch's errors), the plan pins, the finalize rule, the ``dhu_tc2`` selection rule and the
-two-stream groups on the campaign rows, the ``prep_tma`` dispatch window and the host chunk / segment tables.  On SM100 / SM103: the six outputs ``o, dq, dk, dv, dg, dbeta`` against an FP64 token recurrence on
+two-stream groups on the campaign rows, the ``prep_tma`` dispatch window and the host chunk / segment tables.  On SM100 / SM103 / SM107: the six outputs ``o, dq, dk, dv, dg, dbeta`` against an FP64 token recurrence on
 packed layouts (host and device table routes, FP32 and BF16 ``beta``, every register-scan configuration, the serial
 and segment-parallel scans, both adjoint scans, both preps, the fused tail of a value-head group of two and the
 unfused tail with both finalize stages, the recompute and uncached forms, the un-normalized ``q`` / ``k`` form), the
@@ -520,9 +520,10 @@ def test_finalize_rule() -> None:
         rule(10, 4, 10, 148)
 
 
-# The campaign rows the selection rule decides on (serial adjoint plans on both architectures), and the decision
-# recorded with the rule's constants: dhu_tc2 on r01, r03, r05, r06, r08, r09 (r01: T_tc = 64 steps x t(64 CTAs),
-# B200 154.9 us, GB300 141.9 us).
+# The campaign rows the selection rule decides on (serial adjoint plans on SM100 / SM103; on the 216 SMs of R200 the
+# planner splits the adjoint scans of r01, r03 and r08 into segments), and the decision recorded with the rule's
+# constants: dhu_tc2 on r01, r03, r05, r06, r08, r09 (r01: T_tc = 64 steps x t(64 CTAs), B200 154.9 us, GB300
+# 141.9 us, R200 141.6 us).
 _REAL_15 = (
     2756,
     4479,
@@ -551,7 +552,11 @@ RULE_ROWS = (
 RULE_DEVICES = {
     "sm_100a": ((148, 232448, 10), 154.9),
     "sm_103a": ((152, 232448, 10), 141.9),
+    # PROVISIONAL: computed from the provisional sm_107a dhu_tc2 constants (cake_jit.py) until the R200 calibration.
+    "sm_107a": ((216, 232448, 10), 141.6),
 }
+# The rows whose adjoint plan the planner splits into segments on a device (the others run serial plans).
+SPLIT_ADJOINT_ROWS = {"sm_107a": ("r01", "r03", "r08")}
 
 
 @pytest.mark.parametrize("arch", sorted(RULE_DEVICES))
@@ -564,7 +569,8 @@ def test_dhu_tc_rule_on_the_campaign_rows(arch, monkeypatch) -> None:
             sum(seq_lens), len(seq_lens), num_v_heads, 0, seq_lens
         )
         chunks = tuple(-(-n // 64) for n in seq_lens)
-        assert bwd.segment_len == 0 or max(chunks) <= bwd.segment_len, (row, bwd)
+        serial = bwd.segment_len == 0 or max(chunks) <= bwd.segment_len
+        assert serial is (row not in SPLIT_ADJOINT_ROWS.get(arch, ())), (row, bwd)
         rec = cake_chain.dhu_tc_pricing(chunks, num_v_heads, 0)
         assert rec["select"] is selected, (row, rec)
         if row == "r01":
@@ -588,6 +594,8 @@ def test_two_stream_split_rule() -> None:
 STREAM_ROWS = {
     "sm_100a": {"r05": (7, 9), "r06": (6, 9), "r09": (7, 9)},
     "sm_103a": {"r05": (7, 9), "r06": (6, 9), "r09": (2, 14)},
+    # PROVISIONAL: at the provisional sm_107a constants until the R200 calibration.
+    "sm_107a": {"r05": (3, 13), "r06": (2, 13), "r09": (3, 13)},
 }
 
 
@@ -655,17 +663,19 @@ def test_sequence_groups_partition_a_serial_table() -> None:
     assert cake_chain.sequence_groups(device_meta, num_v_heads, 5) == (None, None)
 
 
-# The prep dispatch window on the two architectures' SM counts (slots = 6 x SMs): the plain prep inside
-# (slots, 2.5 x slots], prep_tma outside; 4 x 4096 tokens at H = 8 (2048 CTAs) lie inside on both.
+# The prep dispatch window on each architecture's SM count (slots = ctas_per_sm x SMs, the record's select
+# constants): the plain prep inside (slots, window x slots], prep_tma outside; 4 x 4096 tokens at H = 8 (2048 CTAs)
+# lie inside on every architecture.
 @pytest.mark.parametrize("arch", sorted(RULE_DEVICES))
 def test_prep_rule(arch, monkeypatch) -> None:
     props, _r01 = RULE_DEVICES[arch]
     monkeypatch.setattr(cake_chain, "_device_props", lambda _index: props)
     monkeypatch.setattr(cake_backend, "device_arch", lambda _index: arch)
     rule = cake_chain.use_prep_tma
-    slots = 6 * props[0]
+    ctas_per_sm, window = cake_chain._prep_tma_constants(arch)
+    slots = ctas_per_sm * props[0]
     assert rule(slots, 1, 0) and not rule(slots + 1, 1, 0)
-    assert not rule(int(2.5 * slots), 1, 0) and rule(int(2.5 * slots) + 1, 1, 0)
+    assert not rule(int(window * slots), 1, 0) and rule(int(window * slots) + 1, 1, 0)
     assert not rule(4 * 4096 // 64, 8, 0)
     assert rule(16 * 4096 // 64, 8, 0) and rule(2, 2, 0)
 
