@@ -33,7 +33,7 @@ PROGRAMS = tuple(
 # Every program runs every shape: batches across the tiles' 2, 4, 8, 16 and 64 rows,
 # output features across their 8, 16 and 32, and input features off the 64- and
 # 256-wide K steps of the four chains (zero-filled tails), with chains that
-# get no K chunk at all (K <= 768).  A program runs only on the targets it ships.
+# get no K chunk at all (K <= 768).
 PARITY_SHAPES = [
     (1, 16, 64),
     (1, 128, 720),
@@ -108,12 +108,8 @@ def test_tinygemm2_tcgen05_bitwise_parity(
     batch_size, output_features, input_features, program, wide
 ):
     """Every program is bit-identical to csrc/tinygemm2.cu on every shape."""
-    target = _target()
+    _target()
     from flashinfer.gemm.routergemm import get_tinygemm2_tcgen05_op
-    from flashinfer.jit import cake_tinygemm2_tcgen05 as programs
-
-    if target not in getattr(programs, program).targets:
-        pytest.skip(f"{program} does not ship for {target}")
 
     input, weight, bias = _make_case(
         batch_size, output_features, input_features, wide=wide
@@ -271,6 +267,173 @@ SM100_NARROW_ROUTES = [
     (8, 320, 9216, False, None),
     (8, 384, 14336, False, None),
 ]
+# sm_100a, rows without a bias from 3584 output features: PACKED_BOX8 on 1 to 7 rows
+# at 4480 to 4608 output features and inputs of 2048 to 8192, and at 3584 to 4608
+# from an input of 6152; at 8192 output features PACKED_M64_N8 on inputs that are a
+# multiple of 64 and PACKED_BOX8 on the others; PACKED_M64_N8 in its three other
+# windows (corners and inside points).  The shapes just past each edge, off a
+# multiple of 64 where a window needs one, on 9 rows or with a bias go to the next
+# window or keep their kernels; 8 rows at 3584 to 4608 output features from an input
+# of 6152 keep the reference, and 8 rows at 4480 to 16384 output features outside
+# the 8192 and 12288 windows keep their kernels.
+SM100_BOX8_M64_N8_ROUTES = [
+    (1, 4480, 2048, False, "PACKED_BOX8"),
+    (7, 4608, 8192, False, "PACKED_BOX8"),
+    (3, 4544, 5000, False, "PACKED_BOX8"),
+    (4, 4480, 2040, False, None),
+    (4, 4608, 8256, False, None),
+    (1, 4464, 4096, False, None),
+    (7, 4624, 4096, False, "PACKED_M64_N8"),
+    (1, 3584, 6152, False, "PACKED_BOX8"),
+    (5, 3584, 8192, False, "PACKED_BOX8"),
+    (6, 4096, 7432, False, "PACKED_BOX8"),
+    (3, 4096, 6144, False, "PACKED"),
+    (3, 3568, 7168, False, None),
+    (3, 3584, 8256, False, None),
+    (8, 4096, 7168, False, None),
+    (8, 4608, 8192, False, None),
+    (8, 8192, 2048, False, "PACKED_M64_N8"),
+    (8, 8192, 8192, False, "PACKED_M64_N8"),
+    (1, 8192, 2112, False, "PACKED_M64_N8"),
+    (5, 8192, 5632, False, "PACKED_M64_N8"),
+    (8, 8192, 2056, False, "PACKED_BOX8"),
+    (1, 8192, 8136, False, "PACKED_BOX8"),
+    (4, 8192, 5000, False, "PACKED_BOX8"),
+    (8, 8192, 2040, False, None),
+    (8, 8192, 8200, False, None),
+    (8, 8192, 8256, False, None),
+    (7, 8208, 4104, False, None),
+    (8, 8192, 4096, True, None),
+    (1, 4624, 2048, False, "PACKED_M64_N8"),
+    (7, 8176, 6152, False, "PACKED_M64_N8"),
+    (3, 6656, 4104, False, "PACKED_M64_N8"),
+    (5, 6992, 6160, False, None),
+    (9, 6656, 4096, False, None),
+    (3, 6656, 4096, True, None),
+    (1, 7008, 8192, False, "PACKED_M64_N8"),
+    (6, 7680, 7168, False, "PACKED_M64_N8"),
+    (3, 7680, 7176, False, None),
+    (2, 7680, 8256, False, None),
+    (5, 6992, 7168, False, None),
+    (8, 4480, 2048, False, None),
+    (8, 4608, 6152, False, None),
+    (8, 10000, 3000, False, None),
+    (8, 8208, 4104, False, None),
+    (8, 16384, 6152, False, None),
+    (8, 7008, 8192, False, None),
+    (8, 16384, 8184, False, None),
+    (8, 12288, 7000, False, None),
+    (8, 12288, 2048, False, "PACKED_M64_N8"),
+    (8, 12288, 6144, False, "PACKED_M64_N8"),
+    (8, 12288, 10240, False, "PACKED_M64_N8"),
+    (8, 12288, 16384, False, "PACKED_M64_N8"),
+    (8, 12288, 2040, False, None),
+    (8, 12288, 16376, False, None),
+    (8, 12288, 16448, False, None),
+    (8, 12272, 12288, False, None),
+    (8, 12304, 12288, False, None),
+    (7, 12288, 12288, False, None),
+    (8, 12288, 12288, True, None),
+]
+# sm_103a, rows without a bias from 3584 output features: PACKED_BOX8 on 8 rows at
+# 4480 to 4608 output features and inputs of 2048 to 12288; at 8192 output features
+# PACKED_M64_N8 on inputs that are a multiple of 64 and PACKED_BOX8 on the others;
+# PACKED_M64_N8 in its five other windows (corners and inside points).  The shapes
+# just past each edge, off a multiple of 64 where a window needs one, on 9 rows or
+# with a bias go to the next window or keep their kernels.  1 to 7 rows at 4480 to
+# 4608 output features, and at 3584 to 4608 from an input of 6152, keep the
+# reference, as do 8 rows at 3584 to 4464 output features and inputs of 6152 to
+# 12288.
+SM103_BOX8_M64_N8_ROUTES = [
+    (8, 4480, 2048, False, "PACKED_BOX8"),
+    (8, 4608, 12288, False, "PACKED_BOX8"),
+    (8, 4544, 7000, False, "PACKED_BOX8"),
+    (8, 4464, 4096, False, None),
+    (8, 4624, 4096, False, "PACKED_M64_N8"),
+    (8, 4480, 2040, False, None),
+    (8, 4608, 12296, False, None),
+    (9, 4480, 4096, False, None),
+    (8, 4480, 4096, True, None),
+    (1, 4480, 2048, False, None),
+    (7, 4608, 8192, False, None),
+    (3, 4544, 5000, False, None),
+    (4, 4480, 2040, False, None),
+    (4, 4608, 8256, False, None),
+    (1, 4464, 4096, False, None),
+    (7, 4624, 4096, False, "PACKED_M64_N8"),
+    (1, 4608, 2048, False, None),
+    (7, 4608, 6152, False, None),
+    (4, 4624, 6152, False, "PACKED_M64_N8"),
+    (8, 3584, 6152, False, None),
+    (8, 3584, 12288, False, None),
+    (8, 4096, 12288, False, None),
+    (8, 4096, 9000, False, None),
+    (8, 4096, 6144, False, "PACKED"),
+    (8, 3568, 8192, False, None),
+    (8, 4096, 12296, False, None),
+    (1, 3584, 6152, False, None),
+    (7, 4096, 8192, False, None),
+    (5, 4000, 7432, False, None),
+    (3, 4096, 6144, False, "PACKED"),
+    (3, 3568, 7168, False, None),
+    (3, 3584, 8256, False, None),
+    (8, 8192, 2048, False, "PACKED_M64_N8"),
+    (8, 8192, 8192, False, "PACKED_M64_N8"),
+    (1, 8192, 2112, False, "PACKED_M64_N8"),
+    (5, 8192, 5632, False, "PACKED_M64_N8"),
+    (8, 8192, 2056, False, "PACKED_BOX8"),
+    (8, 8192, 8136, False, "PACKED_BOX8"),
+    (1, 8192, 8136, False, "PACKED_BOX8"),
+    (4, 8192, 5000, False, "PACKED_BOX8"),
+    (8, 8192, 2040, False, None),
+    (3, 8192, 2040, False, None),
+    (8, 8192, 8200, False, None),
+    (7, 8192, 8256, False, None),
+    (7, 8208, 4104, False, None),
+    (8, 8192, 4096, True, None),
+    (8, 4624, 2048, False, "PACKED_M64_N8"),
+    (8, 16384, 6144, False, "PACKED_M64_N8"),
+    (8, 10000, 4096, False, "PACKED_M64_N8"),
+    (8, 16384, 6152, False, None),
+    (8, 10000, 3000, False, None),
+    (8, 16400, 4096, False, None),
+    (8, 10000, 6208, False, None),
+    (8, 4624, 2040, False, None),
+    (9, 6656, 4096, False, None),
+    (8, 6656, 4096, True, None),
+    (1, 4624, 2048, False, "PACKED_M64_N8"),
+    (7, 8176, 6152, False, "PACKED_M64_N8"),
+    (3, 6656, 4104, False, "PACKED_M64_N8"),
+    (5, 6992, 6160, False, None),
+    (2, 8208, 4096, False, None),
+    (3, 6656, 2040, False, None),
+    (8, 8192, 8256, False, "PACKED_M64_N8"),
+    (8, 8192, 10240, False, "PACKED_M64_N8"),
+    (8, 8192, 12288, False, "PACKED_M64_N8"),
+    (8, 8192, 12280, False, None),
+    (8, 8192, 12352, False, None),
+    (8, 8208, 10240, False, None),
+    (7, 8192, 10240, False, None),
+    (8, 12288, 2048, False, "PACKED_M64_N8"),
+    (8, 12288, 6208, False, "PACKED_M64_N8"),
+    (8, 12288, 12288, False, "PACKED_M64_N8"),
+    (8, 12288, 12280, False, None),
+    (8, 12288, 12352, False, None),
+    (8, 12272, 8192, False, None),
+    (8, 12304, 8192, False, None),
+    (7, 12288, 8192, False, None),
+    (8, 12288, 8192, True, None),
+    (8, 3584, 8192, False, None),
+    (8, 3584, 12352, False, "PACKED_M64_N8"),
+    (8, 3584, 14336, False, "PACKED_M64_N8"),
+    (8, 3584, 16384, False, "PACKED_M64_N8"),
+    (8, 3584, 16376, False, None),
+    (8, 3584, 16448, False, None),
+    (8, 3600, 14336, False, None),
+    (8, 3568, 14336, False, None),
+    (7, 3584, 14336, False, None),
+    (8, 3584, 14336, True, None),
+]
 # The full-stage narrow tile on sm_103a: two corners of each window, the measured
 # shapes just past a window's bound that keep the other kernels, and a shape inside
 # a window whose input is not a multiple of 64 (no narrow tile).
@@ -359,10 +522,11 @@ SM103_NARROW_ROUTES = [
 # 9 to 16 rows from 1728; PACKED_BOX8 on 8 rows without a bias from 3584 output
 # features and an input of 3072 to 6144 (the corners; below 3072 PACKED keeps the
 # rows; fewer output features, 7 or 9 rows, a longer input and a bias keep their
-# kernels); PACKED_M64_N8 on 8 rows without a bias ahead of it, at an input of 2048
-# from 3584 output features and at inputs that are a multiple of 64 in its three
-# other windows (corners, odd multiples of 64; the same shapes off a multiple of 64,
-# past each edge, 7 or 9 rows and a bias keep their kernels), and PACKED_BOX8 at
+# kernels or go to the later windows below); PACKED_M64_N8 on 8 rows without a bias
+# ahead of it, at an input of 2048 from 3584 output features and at inputs that are
+# a multiple of 64 in its three other windows (corners, odd multiples of 64; the
+# same shapes off a multiple of 64, past each edge, 7 or 9 rows and a bias keep
+# their kernels or go to the later windows below), and PACKED_BOX8 at
 # 4096 to 5120 output features and inputs of 2112 to 2560 (corners, an input that
 # is not a multiple of 64, past each edge); the M=64 tiles at 2048 to 3072 output
 # features (corners,
@@ -434,7 +598,7 @@ SM107_ROUTES = [
     (8, 3568, 2048, False, None),
     (8, 8208, 2048, False, None),
     (8, 3584, 2040, False, None),
-    (8, 4096, 2056, False, None),
+    (8, 4096, 2056, False, "PACKED_BOX8"),
     (7, 8192, 2048, False, None),
     (9, 8192, 2048, False, None),
     (8, 4096, 2048, True, None),
@@ -449,8 +613,8 @@ SM107_ROUTES = [
     (8, 6144, 8192, False, "PACKED_M64_N8"),
     (8, 6144, 3136, False, "PACKED_M64_N8"),
     (8, 6144, 3080, False, None),
-    (8, 6144, 3008, False, None),
-    (8, 6128, 4096, False, None),
+    (8, 6144, 3008, False, "PACKED_M64_N8"),
+    (8, 6128, 4096, False, "PACKED_M64_N8"),
     (8, 6144, 4096, True, None),
     (8, 3584, 4096, False, "PACKED_M64_N8"),
     (8, 4608, 8192, False, "PACKED_M64_N8"),
@@ -458,8 +622,8 @@ SM107_ROUTES = [
     (8, 4608, 6208, False, "PACKED_M64_N8"),
     (8, 4096, 4104, False, "PACKED_BOX8"),
     (8, 3584, 4032, False, "PACKED_BOX8"),
-    (8, 4608, 4104, False, None),
-    (8, 4624, 4096, False, None),
+    (8, 4608, 4104, False, "PACKED_BOX8"),
+    (8, 4624, 4096, False, "PACKED_M64_N8"),
     (8, 4096, 8256, False, None),
     (7, 4096, 4160, False, None),
     (9, 4608, 4160, False, None),
@@ -472,7 +636,7 @@ SM107_ROUTES = [
     (8, 5120, 2568, False, None),
     (8, 4096, 2112, True, None),
     (8, 3568, 4096, False, None),
-    (8, 4096, 6152, False, None),
+    (8, 4096, 6152, False, "PACKED_BOX8"),
     (7, 4096, 4096, False, None),
     (9, 4096, 4096, False, "PACKED"),
     (8, 4096, 4096, True, None),
@@ -509,6 +673,66 @@ SM107_ROUTES = [
     (24, 4096, 2048, False, "ACCUMULATORS"),
     (20, 4096, 3272, True, None),
 ]
+# sm_107a, rows without a bias after PACKED's 8-row window: PACKED_M64_N8 on 8 rows
+# at 4097 to 6784 output features and inputs from 2561 that are a multiple of 64 (up
+# to 8192 below 6144 output features, up to 3071 from there), PACKED_BOX8 on 8 rows
+# at 3584 to 6784 output features and the other inputs of 2056 to 8184,
+# PACKED_M64_N8 on 4 and 5 rows at 3584 to 4608 output features and an input of
+# 2048, PACKED_M64_N4 on 4 rows at 4097 to 6144 output features and inputs of 3072
+# to 6144 that are a multiple of 64 (corners and inside points).  The tests
+# count 148 SMs, where PACKED_BOX8's one-wave windows end at 4736 output features.
+# The shapes just past each edge, off a multiple of 64 where a window needs one, on
+# other rows or with a bias go to the earlier windows or keep their kernels.
+SM107_BOX8_M64_ROUTES = [
+    (8, 4112, 2624, False, "PACKED_M64_N8"),
+    (8, 6128, 8192, False, "PACKED_M64_N8"),
+    (8, 5120, 5120, False, "PACKED_M64_N8"),
+    (8, 4608, 4032, False, "PACKED_M64_N8"),
+    (8, 6128, 8256, False, None),
+    (8, 4096, 3008, False, "PACKED"),
+    (8, 6144, 4096, False, "PACKED_M64_N8"),
+    (9, 5120, 5120, False, None),
+    (8, 5120, 5120, True, None),
+    (8, 6144, 2624, False, "PACKED_M64_N8"),
+    (8, 6784, 3008, False, "PACKED_M64_N8"),
+    (8, 6400, 2816, False, "PACKED_M64_N8"),
+    (8, 6800, 2624, False, None),
+    (8, 6784, 3072, False, "PACKED_M64_N8"),
+    (8, 3584, 2056, False, "PACKED_BOX8"),
+    (8, 4736, 2104, False, "PACKED_BOX8"),
+    (8, 4000, 2056, False, "PACKED_BOX8"),
+    (8, 4752, 2104, False, None),
+    (8, 6784, 2560, False, None),
+    (8, 3584, 6152, False, "PACKED_BOX8"),
+    (8, 4096, 8184, False, "PACKED_BOX8"),
+    (8, 4736, 2568, False, "PACKED_BOX8"),
+    (8, 4608, 5000, False, "PACKED_BOX8"),
+    (8, 4752, 2568, False, None),
+    (8, 6784, 8184, False, None),
+    (8, 4096, 8200, False, None),
+    (8, 3568, 7000, False, None),
+    (9, 4608, 5000, False, None),
+    (8, 4608, 5000, True, None),
+    (4, 4112, 3072, False, "PACKED_M64_N4"),
+    (4, 6144, 6144, False, "PACKED_M64_N4"),
+    (4, 5120, 4096, False, "PACKED_M64_N4"),
+    (4, 4096, 4096, False, None),
+    (4, 6160, 4096, False, None),
+    (4, 5120, 3008, False, None),
+    (4, 5120, 6208, False, None),
+    (4, 5120, 4104, False, None),
+    (3, 5120, 4096, False, None),
+    (5, 5120, 4096, False, None),
+    (4, 5120, 4096, True, None),
+    (4, 3584, 2048, False, "PACKED_M64_N8"),
+    (5, 4608, 2048, False, "PACKED_M64_N8"),
+    (4, 4096, 2048, False, "PACKED_M64_N8"),
+    (4, 4624, 2048, False, None),
+    (5, 3568, 2048, False, None),
+    (4, 4096, 2056, False, None),
+    (3, 4096, 2048, False, None),
+    (4, 4096, 2048, True, None),
+]
 ROUTES = (
     [
         (capability, *route)
@@ -516,8 +740,11 @@ ROUTES = (
         for route in SM100_FAMILY_ROUTES
     ]
     + [((10, 0), *route) for route in SM100_NARROW_ROUTES]
+    + [((10, 0), *route) for route in SM100_BOX8_M64_N8_ROUTES]
     + [((10, 3), *route) for route in SM103_NARROW_ROUTES]
+    + [((10, 3), *route) for route in SM103_BOX8_M64_N8_ROUTES]
     + [((10, 7), *route) for route in SM107_ROUTES]
+    + [((10, 7), *route) for route in SM107_BOX8_M64_ROUTES]
     + [((9, 0), 64, 4096, 3072, True, None)]
 )
 
