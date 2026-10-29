@@ -5223,43 +5223,66 @@ class TmemSPResource(MemoryResource):
     ) -> SoftmaxChunks:
         """Mask scores of keys ``base_k + [0, N)`` outside ``[window_start, window_end)``.
 
-        ``None`` leaves that side unbounded. Each 32-column chunk builds one
-        valid-bit word, so a score costs a bit test and a predicated -inf.
+        ``None`` leaves that side unbounded. With both bounds, each 32-column
+        chunk builds one valid-bit word, so a score costs a bit test and a
+        predicated -inf. A single bound keeps one create_mask and a select,
+        which is as cheap and measured faster on fixed-length BF16 plans.
         """
         tmem_x = self.cfg.tmem_x_load_s
         num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
+        if cutlass.const_expr(window_start is None or window_end is None):
+            neg_inf = cutlass.vector.full(
+                [tmem_x],
+                self.cfg.qk_acc_dtype(-Float32.inf),
+                dtype=self.cfg.qk_acc_dtype,
+            )
+            all_true_mask = cutlass.vector.create_mask([tmem_x], [tmem_x])
         for chunk_idx in cutlass.range_constexpr(num_chunks):
             chunk_base = base_k + Int32(chunk_idx * tmem_x)
-            chunk_left = Int32(0)
-            if cutlass.const_expr(window_start is not None):
+            if cutlass.const_expr(window_end is None):
+                left_mask_inverted = cutlass.vector.create_mask(
+                    [tmem_x], [window_start - chunk_base]
+                )
+                mask = left_mask_inverted ^ all_true_mask
+                s_data[chunk_idx] = cutlass.vector.where(
+                    mask, s_data[chunk_idx], neg_inf
+                )
+            elif cutlass.const_expr(window_start is None):
+                right_oob_start_idx = cute.math.min(
+                    cute.math.max(window_end - chunk_base, Int32(0)),
+                    Int32(tmem_x),
+                )
+                mask = cutlass.vector.create_mask([tmem_x], [right_oob_start_idx])
+                s_data[chunk_idx] = cutlass.vector.where(
+                    mask, s_data[chunk_idx], neg_inf
+                )
+            else:
                 chunk_left = cute.math.min(
                     cute.math.max(window_start - chunk_base, Int32(0)),
                     Int32(tmem_x),
                 )
-            chunk_right = Int32(tmem_x)
-            if cutlass.const_expr(window_end is not None):
                 chunk_right = cute.math.min(
                     cute.math.max(window_end - chunk_base, Int32(0)),
                     Int32(tmem_x),
                 )
-            valid_bits = _bmsk_clamp(chunk_left, chunk_right - chunk_left)
-            chunk = s_data[chunk_idx]
-            masked_scores = []
-            for quad_idx in cutlass.range_constexpr(tmem_x // 4):
-                quad_base = quad_idx * 4
-                masked_scores.extend(
-                    _mask_score_quad(
-                        valid_bits,
-                        chunk[quad_base],
-                        chunk[quad_base + 1],
-                        chunk[quad_base + 2],
-                        chunk[quad_base + 3],
-                        quad_base,
+                valid_bits = _bmsk_clamp(chunk_left, chunk_right - chunk_left)
+                chunk = s_data[chunk_idx]
+                masked_scores = []
+                for quad_idx in cutlass.range_constexpr(tmem_x // 4):
+                    quad_base = quad_idx * 4
+                    masked_scores.extend(
+                        _mask_score_quad(
+                            valid_bits,
+                            chunk[quad_base],
+                            chunk[quad_base + 1],
+                            chunk[quad_base + 2],
+                            chunk[quad_base + 3],
+                            quad_base,
+                        )
                     )
+                s_data[chunk_idx] = cutlass.Vector.from_elements(
+                    tuple(masked_scores), self.cfg.qk_acc_dtype
                 )
-            s_data[chunk_idx] = cutlass.Vector.from_elements(
-                tuple(masked_scores), self.cfg.qk_acc_dtype
-            )
         return s_data
 
     @consumer_work(returns=(old_row_max, row_max))
