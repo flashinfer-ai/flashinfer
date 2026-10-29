@@ -323,12 +323,12 @@ kernel_cake_moe_grouped_gemm_1edcad995dcc790600cb(const __grid_constant__ CUtens
             unsigned int num_clusters_m = (unsigned int)num_clusters;
             unsigned int cluster_m = (unsigned int)cluster_id;
             unsigned int total_tiles_m = 0;
-            int p_start_m = 0;
+            int p_start_1 = 0;
             #pragma unroll 1
-            for (int gp_m = 0; gp_m < num_groups_m; gp_m++) {
-                int p_end_m = offs[gp_m];
-                total_tiles_m = total_tiles_m + (unsigned int)((p_end_m - p_start_m + CLUSTER_M - 1) / CLUSTER_M) * grid_c_m;
-                p_start_m = p_end_m;
+            for (int gp_1 = 0; gp_1 < num_groups_m; gp_1++) {
+                int p_end_1 = offs[gp_1];
+                total_tiles_m = total_tiles_m + (unsigned int)((p_end_1 - p_start_1 + CLUSTER_M - 1) / CLUSTER_M) * grid_c_m;
+                p_start_1 = p_end_1;
             }
             unsigned int cur_g_m = 0;
             unsigned int cum_tiles_m = 0;
@@ -413,12 +413,12 @@ kernel_cake_moe_grouped_gemm_1edcad995dcc790600cb(const __grid_constant__ CUtens
             unsigned int num_clusters_e = (unsigned int)num_clusters;
             unsigned int cluster_e = (unsigned int)cluster_id;
             unsigned int total_tiles_e = 0;
-            int p_start_e = 0;
+            int p_start_2 = 0;
             #pragma unroll 1
-            for (int gp_e = 0; gp_e < num_groups_e; gp_e++) {
-                int p_end_e = offs[gp_e];
-                total_tiles_e = total_tiles_e + (unsigned int)((p_end_e - p_start_e + CLUSTER_M - 1) / CLUSTER_M) * grid_c_e;
-                p_start_e = p_end_e;
+            for (int gp_2 = 0; gp_2 < num_groups_e; gp_2++) {
+                int p_end_2 = offs[gp_2];
+                total_tiles_e = total_tiles_e + (unsigned int)((p_end_2 - p_start_2 + CLUSTER_M - 1) / CLUSTER_M) * grid_c_e;
+                p_start_2 = p_end_2;
             }
             unsigned int cur_g_e = 0;
             unsigned int cum_tiles_e = 0;
@@ -449,9 +449,9 @@ kernel_cake_moe_grouped_gemm_1edcad995dcc790600cb(const __grid_constant__ CUtens
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 #pragma unroll
                 for (int n_chunk = 0; n_chunk < BLOCK_N / EPI_CHUNK; n_chunk++) {
-                    int row = cta_rank * 128 + epi_warp * 32;
-                    int col = epi_stage * (unsigned int)BLOCK_N + (unsigned int)(n_chunk * EPI_CHUNK);
-                    int tmem_addr = taddr + (unsigned int)(row << 16) + (unsigned int)col;
+                    int row_0 = cta_rank * 128 + epi_warp * 32;
+                    int col_1 = epi_stage * (unsigned int)BLOCK_N + (unsigned int)(n_chunk * EPI_CHUNK);
+                    int tmem_addr = taddr + (unsigned int)(row_0 << 16) + (unsigned int)col_1;
                     float _tmem_load_0[16];
                     tmem_ld_x16(&_tmem_load_0[0], tmem_addr);
                     asm volatile("tcgen05.wait::ld.sync.aligned;");

@@ -40,6 +40,16 @@ twin of its wide tile that loads G and stores dX with the L2 evict-first policy
 (``main_wide_ef``) when the groups average at least
 ``dgrad_evict_first_min_rows`` rows (``sum_m // E``) and dX has at least
 ``dgrad_evict_first_min_k`` columns (``K``).  On the architectures of
+``dgrad_wide_ts33_archs`` the data gradient launches the twin of its wide tile
+that splits three head and three tail k steps of an item around the release
+of the accumulator's halves instead of four and three (``main_wide_ts33``)
+when the groups average at least the architecture's
+``dgrad_wide_ts33_min_rows`` rows and dX has at least
+``dgrad_wide_ts33_min_k`` columns; on those of ``fwd_wide_ts33_archs`` the
+forward pass launches its twin when its reduction ``K`` is at most
+``fwd_wide_ts33_max_k`` and the groups average at most
+``fwd_wide_ts33_max_rows`` rows.  On the
+architectures of
 ``fwd_lwh_ef_archs`` the forward pass launches the twin of its wide tile that
 releases the last wave of tiles in halves and stores Y with the L2 evict-first
 policy (``main_wide_ef``) when its reduction ``K`` (the columns of x) is at most
@@ -440,6 +450,54 @@ def dgrad_evict_first(
     )
 
 
+def dgrad_wide_ts33(
+    k: int,
+    arch: str,
+    sum_m: int,
+    num_groups: int,
+    constants: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Whether the data gradient's wide tile takes its twin with three head and three
+    tail k steps around the release of the accumulator's halves (``main_wide_ts33``).
+
+    ``k`` is the dgrad ``K``, the columns of ``dX`` (``w.shape[2]``).  The twin serves
+    the gate/up projection's data gradient over few groups: the groups average at least
+    the architecture's ``dgrad_wide_ts33_min_rows`` rows (``sum_m // num_groups``) and
+    ``K >= dgrad_wide_ts33_min_k``, on the architectures of ``dgrad_wide_ts33_archs``.
+    Every element accumulates its k steps in the same order, so the twin gives the bits
+    of ``main_wide``."""
+    c = constants or host_plan_constants()
+    return (
+        arch in c["dgrad_wide_ts33_archs"]
+        and k >= int(c["dgrad_wide_ts33_min_k"])
+        and sum_m // max(num_groups, 1) >= int(c["dgrad_wide_ts33_min_rows"][arch])
+    )
+
+
+def fwd_wide_ts33(
+    k: int,
+    arch: str,
+    sum_m: int,
+    num_groups: int,
+    constants: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Whether the forward pass's wide tile takes its twin with three head and three
+    tail k steps around the release of the accumulator's halves (``main_wide_ts33``).
+
+    ``k`` is the forward ``K``, the reduction dimension (``w.shape[2]``).  On the
+    architectures of ``fwd_wide_ts33_archs`` the twin serves the short reductions of
+    the down projection over many groups (``K <= fwd_wide_ts33_max_k`` and at most
+    ``fwd_wide_ts33_max_rows`` rows per group, ``sum_m // num_groups``).  It gives
+    the bits of ``main_wide``."""
+    c = constants or host_plan_constants()
+    rows = sum_m // max(num_groups, 1)
+    return (
+        arch in c["fwd_wide_ts33_archs"]
+        and k <= int(c["fwd_wide_ts33_max_k"])
+        and rows <= int(c["fwd_wide_ts33_max_rows"])
+    )
+
+
 def fwd_lwh_ef(
     k: int,
     arch: str,
@@ -499,7 +557,9 @@ def select_row_stage(
     tile (``fwd_dgrad_tile_n``) where the route serves it on ``arch``, else ``main`` with
     ``block_n``; a data gradient takes ``main_wide_ef`` in place of ``main_wide`` where
     ``dgrad_evict_first`` holds, and a forward pass where ``fwd_lwh_ef`` holds, when the
-    route serves that stage on ``arch``."""
+    route serves that stage on ``arch``; else ``main_wide_ts33`` where
+    ``dgrad_wide_ts33`` (a data gradient) or ``fwd_wide_ts33`` (a forward pass) holds
+    and the route serves it on ``arch``."""
     c = constants or host_plan_constants()
     tile_n = fwd_dgrad_tile_n(op, n, k, arch, c)
     if tile_n != int(c["block_n"]) and stage_served(name, "main_wide", arch):
@@ -508,6 +568,11 @@ def select_row_stage(
             or (op == "fwd" and fwd_lwh_ef(k, arch, c))
         ) and stage_served(name, "main_wide_ef", arch):
             return "main_wide_ef", tile_n
+        if (
+            (op == "dgrad" and dgrad_wide_ts33(k, arch, sum_m, num_groups, c))
+            or (op == "fwd" and fwd_wide_ts33(k, arch, sum_m, num_groups, c))
+        ) and stage_served(name, "main_wide_ts33", arch):
+            return "main_wide_ts33", tile_n
         return "main_wide", tile_n
     return "main", int(c["block_n"])
 
@@ -915,7 +980,8 @@ def prepare_grouped_gemm_fwd(
     ``x``: ``[sum_m, K]`` bf16; ``w``: ``[E, N, K]`` bf16; ``offs``: int32
     ``[E]`` device end offsets; ``N % 256 == 0``, ``K % 64 == 0`` (the
     512-column tile when ``N % 512 == 0`` on the architectures of
-    ``wide_fwd_archs``).  ``out`` may be row-padded (any row stride, unit column
+    ``wide_fwd_archs``, its 3 / 3 head / tail twin where ``fwd_wide_ts33`` holds).
+    ``out`` may be row-padded (any row stride, unit column
     stride).
     """
     return _prepare_row_op("fwd", x, w, offs, out)
@@ -933,7 +999,8 @@ def prepare_grouped_gemm_dgrad(
     ``[E]`` device end offsets; ``K % 256 == 0``, ``N % 64 == 0`` (the
     512-column tile when ``K % 512 == 0`` on the architectures of
     ``wide_dgrad_archs``, its L2 evict-first twin where ``dgrad_evict_first``
-    holds for ``K``, ``sum_m`` and ``E``).
+    holds for ``K``, ``sum_m`` and ``E``, its 3 / 3 head / tail twin where
+    ``dgrad_wide_ts33`` holds).
     """
     return _prepare_row_op("dgrad", g, w, offs, out)
 

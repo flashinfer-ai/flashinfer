@@ -401,8 +401,8 @@ kernel_cake_moe_grouped_gemm_ab84c164aef14d967ac3(const __grid_constant__ CUtens
                     if (cta_rank == 0) {
                         if (claim_ends < 2) {
                             mbarrier_wait_cluster_hint(work_empty_addr + (work_stage) * 8, _phase_work_empty, 10000000);
-                            unsigned int _atomic_old_1 = atomicAdd(&sched[queue], 1);
-                            work_ring[work_stage * 4] = _atomic_old_1;
+                            unsigned int _atomic_old_0_1 = atomicAdd(&sched[queue], 1);
+                            work_ring[work_stage * 4] = _atomic_old_0_1;
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b32 remAddr32;\n\t"
@@ -420,9 +420,9 @@ kernel_cake_moe_grouped_gemm_ab84c164aef14d967ac3(const __grid_constant__ CUtens
                                 : "=r"(_mbar_peer_3) : "r"(work_full_addr + (work_stage) * 8), "r"(1));
                             asm volatile(
                                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-                                :: "r"(_cluster_mapa_2), "r"(_atomic_old_1), "r"(_mbar_peer_3) : "memory");
+                                :: "r"(_cluster_mapa_2), "r"(_atomic_old_0_1), "r"(_mbar_peer_3) : "memory");
                             mbarrier_arrive(work_full_addr + (work_stage) * 8);
-                            unsigned int nxt = _atomic_old_1;
+                            unsigned int nxt = _atomic_old_0_1;
                             if ((nxt & 2147483647) >= ((queue == 1) ? t1 : t0)) {
                                 claim_ends = claim_ends + 1;
                                 queue = queue ^ 1;

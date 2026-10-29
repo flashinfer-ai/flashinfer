@@ -379,8 +379,8 @@ kernel_cake_moe_grouped_gemm_aafe5d56af3c36f3b143(const __grid_constant__ CUtens
                 if (cta_rank == 0) {
                     queue = near;
                     mbarrier_wait_cluster_hint(work_empty_addr + (work_stage) * 8, _phase_work_empty, 10000000);
-                    unsigned int _atomic_old_0 = atomicAdd(&sched[queue], 1);
-                    work_ring[work_stage * 4] = _atomic_old_0;
+                    unsigned int _atomic_old_1 = atomicAdd(&sched[queue], 1);
+                    work_ring[work_stage * 4] = _atomic_old_1;
                     asm volatile(
                         "{\n\t"
                         ".reg .b32 remAddr32;\n\t"
@@ -398,10 +398,10 @@ kernel_cake_moe_grouped_gemm_aafe5d56af3c36f3b143(const __grid_constant__ CUtens
                         : "=r"(_mbar_peer_1) : "r"(work_full_addr + (work_stage) * 8), "r"(1));
                     asm volatile(
                         "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-                        :: "r"(_cluster_mapa_0), "r"(_atomic_old_0), "r"(_mbar_peer_1) : "memory");
+                        :: "r"(_cluster_mapa_0), "r"(_atomic_old_1), "r"(_mbar_peer_1) : "memory");
                     mbarrier_arrive(work_full_addr + (work_stage) * 8);
-                    unsigned int ticket = _atomic_old_0;
-                    unsigned int first = ticket;
+                    unsigned int ticket_0 = _atomic_old_1;
+                    unsigned int first = ticket_0;
                     if ((first & 2147483647) >= ((queue == 1) ? t1 : t0)) {
                         claim_ends = claim_ends + 1;
                         queue = queue ^ 1;
@@ -412,7 +412,7 @@ kernel_cake_moe_grouped_gemm_aafe5d56af3c36f3b143(const __grid_constant__ CUtens
                 #pragma unroll 1
                 for (unsigned int _item = 0; _item < t0 + t1 + 2; _item++) {
                     mbarrier_wait(work_full_addr + (work_stage) * 8, _phase_work_full);
-                    unsigned int ticket_1 = work_ring[work_stage * 4];
+                    unsigned int ticket = work_ring[work_stage * 4];
                     asm volatile(
                         "{\n\t"
                         ".reg .b32 remAddr32;\n\t"
@@ -425,8 +425,8 @@ kernel_cake_moe_grouped_gemm_aafe5d56af3c36f3b143(const __grid_constant__ CUtens
                     if (cta_rank == 0) {
                         if (claim_ends < 2) {
                             mbarrier_wait_cluster_hint(work_empty_addr + (work_stage) * 8, _phase_work_empty, 10000000);
-                            unsigned int _atomic_old_1 = atomicAdd(&sched[queue], 1);
-                            work_ring[work_stage * 4] = _atomic_old_1;
+                            unsigned int _atomic_old_1_1 = atomicAdd(&sched[queue], 1);
+                            work_ring[work_stage * 4] = _atomic_old_1_1;
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b32 remAddr32;\n\t"
@@ -444,18 +444,18 @@ kernel_cake_moe_grouped_gemm_aafe5d56af3c36f3b143(const __grid_constant__ CUtens
                                 : "=r"(_mbar_peer_3) : "r"(work_full_addr + (work_stage) * 8), "r"(1));
                             asm volatile(
                                 "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];"
-                                :: "r"(_cluster_mapa_2), "r"(_atomic_old_1), "r"(_mbar_peer_3) : "memory");
+                                :: "r"(_cluster_mapa_2), "r"(_atomic_old_1_1), "r"(_mbar_peer_3) : "memory");
                             mbarrier_arrive(work_full_addr + (work_stage) * 8);
-                            unsigned int ticket_0 = _atomic_old_1;
-                            unsigned int nxt = ticket_0;
+                            unsigned int ticket_0_1 = _atomic_old_1_1;
+                            unsigned int nxt = ticket_0_1;
                             if ((nxt & 2147483647) >= ((queue == 1) ? t1 : t0)) {
                                 claim_ends = claim_ends + 1;
                                 queue = queue ^ 1;
                             }
                         }
                     }
-                    unsigned int q = ticket_1 >> 31;
-                    unsigned int k = ticket_1 & 2147483647;
+                    unsigned int q = ticket >> 31;
+                    unsigned int k = ticket & 2147483647;
                     unsigned int valid = ((q == 1) ? ((k < t1) ? 1 : 0) : ((k < t0) ? 1 : 0));
                     unsigned int w0s = ((w0 > 0) ? w0 : 1);
                     unsigned int w1s = ((w1 > 0) ? w1 : 1);
@@ -551,7 +551,7 @@ kernel_cake_moe_grouped_gemm_aafe5d56af3c36f3b143(const __grid_constant__ CUtens
                 #pragma unroll 1
                 for (unsigned int _item_m = 0; _item_m < t0_1 + t1_2 + 2; _item_m++) {
                     mbarrier_wait(work_full_addr + (work_stage_m) * 8, _phase_work_full_1);
-                    unsigned int ticket_2 = work_ring[work_stage_m * 4];
+                    unsigned int ticket_1 = work_ring[work_stage_m * 4];
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile(
                         "{\n\t"
@@ -562,8 +562,8 @@ kernel_cake_moe_grouped_gemm_aafe5d56af3c36f3b143(const __grid_constant__ CUtens
                         :: "r"(work_empty_addr + (work_stage_m) * 8), "r"(0) : "memory");
                     work_stage_m += 1;
                     if (work_stage_m == 4) { work_stage_m = 0; _phase_work_full_1 ^= 1; }
-                    unsigned int q_1 = ticket_2 >> 31;
-                    unsigned int k_1 = ticket_2 & 2147483647;
+                    unsigned int q_1 = ticket_1 >> 31;
+                    unsigned int k_1 = ticket_1 & 2147483647;
                     unsigned int valid_1 = ((q_1 == 1) ? ((k_1 < t1_2) ? 1 : 0) : ((k_1 < t0_1) ? 1 : 0));
                     unsigned int w0s_1 = ((w0_1 > 0) ? w0_1 : 1);
                     unsigned int w1s_1 = ((w1_1 > 0) ? w1_1 : 1);
@@ -668,7 +668,7 @@ kernel_cake_moe_grouped_gemm_aafe5d56af3c36f3b143(const __grid_constant__ CUtens
             #pragma unroll 1
             for (unsigned int _item_e = 0; _item_e < t0_2 + t1_3 + 2; _item_e++) {
                 mbarrier_wait(work_full_addr + (work_stage_e) * 8, _phase_work_full_2);
-                unsigned int ticket_3 = work_ring[work_stage_e * 4];
+                unsigned int ticket_2 = work_ring[work_stage_e * 4];
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 asm volatile(
                     "{\n\t"
@@ -679,8 +679,8 @@ kernel_cake_moe_grouped_gemm_aafe5d56af3c36f3b143(const __grid_constant__ CUtens
                     :: "r"(work_empty_addr + (work_stage_e) * 8), "r"(0) : "memory");
                 work_stage_e += 1;
                 if (work_stage_e == 4) { work_stage_e = 0; _phase_work_full_2 ^= 1; }
-                unsigned int q_2 = ticket_3 >> 31;
-                unsigned int k_2 = ticket_3 & 2147483647;
+                unsigned int q_2 = ticket_2 >> 31;
+                unsigned int k_2 = ticket_2 & 2147483647;
                 unsigned int valid_2 = ((q_2 == 1) ? ((k_2 < t1_3) ? 1 : 0) : ((k_2 < t0_2) ? 1 : 0));
                 unsigned int w0s_2 = ((w0_2 > 0) ? w0_2 : 1);
                 unsigned int w1s_2 = ((w1_2 > 0) ? w1_2 : 1);
