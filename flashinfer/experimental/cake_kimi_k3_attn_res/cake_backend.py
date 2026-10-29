@@ -387,7 +387,7 @@ def _schedule(arch: str, M: int, K: int, write: bool = False) -> tuple[int, int]
             return PERSISTENT_SOURCES_PER_CHUNK, 3
         if K == 4:
             return (
-                5 if M in {1, 32, 1024, 2048, 4096, 8192, 16384} else 3
+                5 if M in {1024, 2048, 4096, 8192, 16384} else 3
             ), PERSISTENT_CHUNK_DEPTH
     else:
         if K == 1 and M in _SM103_K1_NC2_M:
@@ -1026,12 +1026,7 @@ def _persistent_plan_exact(
             )
             and not ecr
         )
-        or (
-            arch == "sm_103a"
-            and (K in {1, 2, 3} or (M == 1 and K == 5))
-            and nc == 4
-            and not ecr
-        )
+        or (arch == "sm_103a" and K in {1, 2, 3} and nc == 4 and not ecr)
         or (K == 4 and nc == 3 and not ecr)
         or (arch == "sm_103a" and K == 8 and nc == 3 and not ecr)
     )
@@ -1040,12 +1035,7 @@ def _persistent_plan_exact(
     # one token per CTA (K 1-3, nc 4, held release, grid_x == M), was never reached: every such
     # cell is small-M at 148 / 152 SMs.
     register_carry_only = False
-    prefetch_fifth_stats = (
-        (arch == "sm_103a" or (arch == "sm_100a" and M == 32))
-        and K == 4
-        and nc == 5
-        and not ecr
-    )
+    prefetch_fifth_stats = arch == "sm_103a" and K == 4 and nc == 5 and not ecr
     k4_early_nc5_input_first = (
         arch == "sm_100a" and M == 1024 and K == 4 and nc == 5 and ecr
     )
@@ -1272,7 +1262,7 @@ def _bind(
             )
         arguments.append(kwargs[key])
     module = load(name, arch)
-    return getattr(module, record["ffi_entry"]), tuple(arguments)
+    return module.run, tuple(arguments)
 
 
 @dataclass(frozen=True)
