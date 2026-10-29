@@ -1432,7 +1432,7 @@ def gated_delta_rule_mtp(
         slot).  Negative entries skip the writeback for that batch
         (the read still runs).
     cache_replayssm : bool
-        SM100/SM103 only, FP32 checkpoint, K=V=128, T>=3.
+        SM100/SM103 and SM120 only, FP32 checkpoint, K=V=128, T>=3.
         Persist only the fold-every-commit ReplaySSM raw input window instead
         of full intermediate hidden-state snapshots. Requires frozen-state
         verify mode (``disable_state_update=True``), no
@@ -1445,11 +1445,13 @@ def gated_delta_rule_mtp(
         the existing MTP kernel. All tensor base addresses must be 16-byte
         aligned for vectorized loads and TMA. Default: ``False``.
 
-        The tcgen05 TF32 specialization requires T=4..8, B=1..256, a
+        The SM100 tcgen05 TF32 specialization requires T=4..8, B=1..256, a
         contiguous checkpoint, BF16 output, int32 indices, Q/K normalization,
-        and even HV/H. Other supported SM100 cases use the FP32 MTP fallback.
-        TF32 changes reduction precision; outputs need not be bitwise equal
-        to the fallback.
+        and even HV/H. The SM120 warp-MMA TF32 specialization has the same
+        requirements except the HV/H parity, and is selected when
+        ``B * HV <= 128`` or T>=7. Other supported cases use the FP32 MTP
+        fallback. TF32 changes reduction precision; outputs need not be
+        bitwise equal to the fallback.
     replayssm_rawv : torch.Tensor, optional
         BF16 raw V window of shape ``[pool_size, HV, T, V]``.
     replayssm_rawk : torch.Tensor, optional
@@ -1468,7 +1470,8 @@ def gated_delta_rule_mtp(
 
     Notes
     -----
-    - Standard MTP requires SM90 or later; ReplaySSM requires SM100/SM103.
+    - Standard MTP requires SM90 or later; ReplaySSM requires SM100/SM103
+      or SM120.
     - Supports ``T > 1`` (multiple token processing).
     - State layout is K-last: ``[pool_size, HV, V, K]``.
     - Optimized for speculative decoding verification scenarios.
@@ -1655,28 +1658,33 @@ def gated_delta_rule_mtp(
     if cache_replayssm:
         from .gdn_kernels.device_target import gdn_device_target
 
-        if gdn_device_target(q.device).major != 10:
-            raise ValueError("ReplaySSM caching currently requires SM100/SM103")
-        assert disable_state_update, (
-            "ReplaySSM verify must leave the checkpoint frozen "
-            "(disable_state_update=True)"
-        )
-        assert intermediate_states_buffer is None, (
-            "ReplaySSM replaces full intermediate-state snapshots"
-        )
-        assert ssm_state_indices is None, (
-            "ReplaySSM and per-token state scatter are mutually exclusive"
-        )
-        assert pool_size > 0, "ReplaySSM requires at least one checkpoint slot"
-        assert k.shape == q.shape and v.shape[:2] == (B, T), (
-            "ReplaySSM Q/K/V shapes must agree"
-        )
-        assert a.shape == b.shape == (B, T, HV), "ReplaySSM a/b must be [B,T,HV]"
-        assert A_log.shape == dt_bias.shape == (HV,), (
-            "ReplaySSM gate parameters must be [HV]"
-        )
-        assert all(
-            t.device == q.device
+        target = gdn_device_target(q.device)
+        if target.major != 10 and (target.major, target.minor) != (12, 0):
+            raise ValueError("ReplaySSM caching requires SM100/SM103 or SM120")
+        # These checks raise instead of asserting so they survive ``python -O``:
+        # a verify that updates state would overwrite the checkpoint the
+        # following ReplaySSM commit replays from, corrupting it silently.
+        if not disable_state_update:
+            raise ValueError(
+                "ReplaySSM verify must leave the checkpoint frozen "
+                "(disable_state_update=True)"
+            )
+        if intermediate_states_buffer is not None:
+            raise ValueError("ReplaySSM replaces full intermediate-state snapshots")
+        if ssm_state_indices is not None:
+            raise ValueError(
+                "ReplaySSM and per-token state scatter are mutually exclusive"
+            )
+        if pool_size <= 0:
+            raise ValueError("ReplaySSM requires at least one checkpoint slot")
+        if k.shape != q.shape or v.shape[:2] != (B, T):
+            raise ValueError("ReplaySSM Q/K/V shapes must agree")
+        if a.shape != (B, T, HV) or b.shape != (B, T, HV):
+            raise ValueError("ReplaySSM a/b must be [B,T,HV]")
+        if A_log.shape != (HV,) or dt_bias.shape != (HV,):
+            raise ValueError("ReplaySSM gate parameters must be [HV]")
+        if any(
+            t.device != q.device
             for t in (
                 k,
                 v,
@@ -1688,14 +1696,18 @@ def gated_delta_rule_mtp(
                 initial_state_indices,
                 output,
             )
-        ), "ReplaySSM tensors must be on the query device"
-        assert K == V == 128, "ReplaySSM requires K=V=128"
-        assert H > 0 and HV > 0 and HV % H == 0, "ReplaySSM requires HV divisible by H"
-        assert initial_state_indices.shape == (B,), "initial_state_indices must be [B]"
-        assert T >= 3, f"ReplaySSM caching requires T >= 3, got T={T}"
-        assert all(t is not None for t in replayssm_buffers), (
-            "cache_replayssm=True requires replayssm_rawv/rawk/g/beta"
-        )
+        ):
+            raise ValueError("ReplaySSM tensors must be on the query device")
+        if K != 128 or V != 128:
+            raise ValueError("ReplaySSM requires K=V=128")
+        if H <= 0 or HV <= 0 or HV % H != 0:
+            raise ValueError("ReplaySSM requires HV divisible by H")
+        if initial_state_indices.shape != (B,):
+            raise ValueError("initial_state_indices must be [B]")
+        if T < 3:
+            raise ValueError(f"ReplaySSM caching requires T >= 3, got T={T}")
+        if any(t is None for t in replayssm_buffers):
+            raise ValueError("cache_replayssm=True requires replayssm_rawv/rawk/g/beta")
         expected_replayssm = (
             ((pool_size, HV, T, V), torch.bfloat16, "replayssm_rawv"),
             ((pool_size, H, T, K), torch.bfloat16, "replayssm_rawk"),
@@ -1706,18 +1718,20 @@ def gated_delta_rule_mtp(
             replayssm_buffers, expected_replayssm, strict=True
         ):
             assert tensor is not None
-            assert tensor.shape == shape, (
-                f"{name} must have shape {list(shape)}, got {tuple(tensor.shape)}"
-            )
-            assert tensor.dtype == dtype, (
-                f"{name} must have dtype {dtype}, got {tensor.dtype}"
-            )
-            assert tensor.device == q.device, (
-                f"{name} device {tensor.device} != q device {q.device}"
-            )
-            assert tensor.is_contiguous(), (
-                f"{name} must be a contiguous per-layer ReplaySSM view"
-            )
+            if tensor.shape != shape:
+                raise ValueError(
+                    f"{name} must have shape {list(shape)}, got {tuple(tensor.shape)}"
+                )
+            if tensor.dtype != dtype:
+                raise ValueError(f"{name} must have dtype {dtype}, got {tensor.dtype}")
+            if tensor.device != q.device:
+                raise ValueError(
+                    f"{name} device {tensor.device} != q device {q.device}"
+                )
+            if not tensor.is_contiguous():
+                raise ValueError(
+                    f"{name} must be a contiguous per-layer ReplaySSM view"
+                )
         # Contiguous views may still start at an unaligned storage offset.
         for name, tensor in (
             ("q", q),
@@ -1738,10 +1752,8 @@ def gated_delta_rule_mtp(
         ):
             if tensor is not None and tensor.data_ptr() % 16:
                 raise ValueError(f"{name} must have a 16-byte aligned base address")
-    else:
-        assert all(t is None for t in replayssm_buffers), (
-            "replayssm_* buffers require cache_replayssm=True"
-        )
+    elif any(t is not None for t in replayssm_buffers):
+        raise ValueError("replayssm_* buffers require cache_replayssm=True")
 
     # Execute kernel
     run_mtp_decode(
@@ -1818,7 +1830,8 @@ def gated_delta_rule_replayssm_commit(
     ----------
     checkpoint_state : torch.Tensor
         Contiguous FP32 ``[layers, slots, HV, 128, 128]`` state, K-last.
-        Updated in place. All tensors must be on the same SM100/SM103 device.
+        Updated in place. All tensors must be on the same SM100/SM103 or
+        SM120 device.
     rawv_cache : torch.Tensor
         Contiguous BF16 ``[layers, slots, HV, T, 128]`` raw V windows.
     rawk_cache : torch.Tensor
@@ -1850,7 +1863,8 @@ def gated_delta_rule_replayssm_commit(
         for T=8, or T=6/7 when B>1 and ``layers * B * HV >= 256``. Otherwise it uses
         FP32 SIMT. Shorter accepted prefixes may favor explicit ``simt``;
         auto does not read accepted lengths back to the host.
-        Explicit ``tcgen05`` supports normalized T=4..8 without tracking.
+        Explicit ``tcgen05`` supports normalized T=4..8 without tracking on
+        SM100/SM103; SM120 always uses ``simt``.
         Use ``simt`` to retain FP32 contractions.
 
     Notes

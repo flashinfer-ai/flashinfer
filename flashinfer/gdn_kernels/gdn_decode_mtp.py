@@ -603,19 +603,14 @@ def gdn_verify_kernel_mtp(
                 x = r_a + r_dt_bias
                 beta_x = softplus_beta * x
 
-                exp_beta_x = cute.exp(beta_x, fastmath=True)
-                softplus_val = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                    cutlass.Float32(1.0) + exp_beta_x, fastmath=True
-                )
-                use_softplus = (
-                    cutlass.Float32(1.0)
-                    if beta_x <= softplus_threshold
-                    else cutlass.Float32(0.0)
-                )
-                softplus_x = (
-                    use_softplus * softplus_val
-                    + (cutlass.Float32(1.0) - use_softplus) * x
-                )
+                # Evaluate exp only on the log branch: blending exp(large_x) = inf
+                # with a zero mask would produce 0 * inf = NaN.
+                softplus_x = x
+                if beta_x <= softplus_threshold:
+                    softplus_x = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
+                        cutlass.Float32(1.0) + cute.exp(beta_x, fastmath=True),
+                        fastmath=True,
+                    )
 
                 r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
                 r_beta = cutlass.Float32(1.0) / (
@@ -2966,6 +2961,63 @@ def run_mtp_decode(
     use_packed_fma = target.use_packed_fma
 
     per_token_pool_scatter = ssm_state_indices is not None
+
+    # SM120 frozen-state ReplaySSM fast path.  SM120 has no tcgen05, so the
+    # state/K, state/Q and Gram products use TF32 warp MMA (mma.sync).  It is
+    # selected where it beats the FMA path: always when B * HV <= 128 (few
+    # CTAs, where splitting V rows across CTAs helps most), and for larger
+    # batches only when T >= 7.  At T <= 6 the FMA path is as fast or faster
+    # (up to ~15% at T=4) once B * HV > 128.
+    use_replayssm_hmma = (
+        (target.major, target.minor) == (12, 0)
+        and cache_replayssm
+        and disable_state_update
+        and not cache_intermediate_states
+        and not per_token_pool_scatter
+        and not use_pool_indexing
+        and output_writeback is None
+        and h0_source.dtype == torch.float32
+        and initial_state_indices.dtype == torch.int32
+        and 4 <= T <= 8
+        and K == 128
+        and V == 128
+        and 1 <= B <= 256
+        and use_qk_l2norm
+        and (use_inline_kernel or T >= 7)
+    )
+    if use_replayssm_hmma:
+        assert replayssm_rawv is not None
+        assert replayssm_rawk is not None
+        assert replayssm_g is not None
+        assert replayssm_beta is not None
+        from .gdn_decode_mtp_replayssm_hmma import (
+            run_gdn_verify_kernel_mtp_replayssm_hmma,
+        )
+
+        run_gdn_verify_kernel_mtp_replayssm_hmma(
+            h0_source,
+            A_log,
+            a,
+            dt_bias,
+            q,
+            k,
+            v,
+            b,
+            output,
+            initial_state_indices,
+            replayssm_rawv,
+            replayssm_rawk,
+            replayssm_g,
+            replayssm_beta,
+            T,
+            H,
+            HV,
+            scale,
+            # Split each head's V rows across CTAs so enough state loads are
+            # in flight: four ways when there are few heads, two otherwise.
+            v_split=4 if use_inline_kernel else 2,
+        )
+        return
 
     # SM100 frozen-state ReplaySSM fast path.  One CTA owns two adjacent
     # (V=128, K=128) heads, shares their Q/K and Gram work, streams both FP32
