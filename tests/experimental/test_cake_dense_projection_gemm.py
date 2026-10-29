@@ -8649,7 +8649,10 @@ def test_sm107a_n128_wgrad_rules_plan():
     T = 16231
     for K, rule in want_rule.items():
         for f32 in (False, True):
-            assert ROW_RULES[("sm_107a", True, True, f32, True, False, 128, None, K)] == rule
+            assert (
+                ROW_RULES[("sm_107a", True, True, f32, True, False, 128, None, K)]
+                == rule
+            )
             G = torch.empty(T, 128, dtype=torch.bfloat16)
             X = torch.empty(T, K, dtype=torch.bfloat16)
             out = torch.empty(128, K, dtype=torch.float32 if f32 else torch.bfloat16)
