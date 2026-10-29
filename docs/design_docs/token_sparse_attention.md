@@ -1,24 +1,15 @@
 # Token-sparse attention for MQA
 
-## Scope
-
 In token-sparse attention, each query token attends only to its own list of
-keys. For example, the DSA indexer selects 2048 keys for each token.
+keys, such as the 2048 keys that the DSA indexer selects for it. FlashInfer runs
+it in two ways:
 
-This design covers:
-
-- token-sparse MQA decode on the token-sparse kernels of trtllm-gen, through
-  `trtllm_batch_decode_with_kv_cache(..., sparse_top_k=K)`;
-- `token_sparse_kv_indices`, which makes the index lists of that call from the
-  key positions of each token;
-- `group_union_masks`, which lets dense attention kernels that take a mask for
-  each query run token-sparse attention: a group of tokens attends to the union
-  of their keys, and a mask limits each token to its own keys;
-- the trace templates of these calls.
-
-It does not select the keys: an indexer does that. It does not add attention
-kernels, and it does not change MLA or dense attention. For token-sparse MLA,
-use `trtllm_batch_decode_with_kv_cache_mla`.
+- `trtllm_batch_decode_with_kv_cache(..., sparse_top_k=K)` runs MQA decode on
+  the token-sparse kernels of trtllm-gen. `token_sparse_kv_indices` makes its
+  index lists from the key positions of each token.
+- `group_union_masks` lets a dense attention kernel that takes a mask for each
+  query run it: a group of tokens attends to the union of their keys, and a mask
+  limits each token to its own keys.
 
 ## Public API
 
@@ -43,8 +34,8 @@ seq_lens:      [batch] int32         the entries of each list that the token use
 output:        [batch, num_qo_heads, head_dim]
 ```
 
-`seq_lens[b]` is at most `K`. The kernels do not read the other entries. For
-example, with 2 query tokens and `sparse_top_k=4`:
+`seq_lens[b]` is at most `K`, and the kernels read only the first `seq_lens[b]`
+entries. For example, with 2 query tokens and `sparse_top_k=4`:
 
 ```python
 block_tables = [[[7, 2, 9, -1], [7, 2, 9, -1]],  # token 0: K rows, V rows
@@ -84,10 +75,10 @@ union_sizes:   [unions] int32, output            the number of keys in each unio
 mask:          [masks, words] int32, output      bit j of word w: the token uses union column 32 * w + j
 ```
 
-The tokens make `len(requests)` groups of equal size. For example, take one
-group of 2 tokens, where token 0 uses keys 3 and 9, and token 1 uses keys 9 and
-12. These keys are on the first page of the request, which is cache page 5
-(rows 320 to 383):
+The tokens make `len(requests)` groups of equal size, which the caller chooses.
+For example, take one group of 2 tokens, where token 0 uses keys 3 and 9, and
+token 1 uses keys 9 and 12. These keys are on the first page of the request,
+which is cache page 5 (rows 320 to 383):
 
 ```python
 union = [[323, 329, 332]]  # the cache rows of keys 3, 9 and 12
@@ -107,11 +98,12 @@ The decode call rejects calls outside these limits:
 - `K` is a multiple of 4, because the kernels copy indices 16 bytes at a time.
 - `batch` is at most 65535, because of the launch grid. There are at most 128
   query heads.
-- The KV cache has one KV head, because the kernels cannot select a KV head.
+- The KV cache has one KV head, because the kernels have no KV-head stride.
 - Each request has one query token: `q_len_per_req` is 1, without
   `cum_seq_lens_q`.
 - There is no sliding window and there are no attention sinks.
-- The head dim is not 512. Head dim 512 selects the MLA kernels.
+- The head dim is not 512. Head dim 512 is MLA, which
+  `trtllm_batch_decode_with_kv_cache_mla` runs.
 - `uses_shared_paged_kv_idx` is `False`, and K and V have the same page stride.
   They can be two halves of one `[K | V]` cache row.
 - The backend is `trtllm-gen` (SM100 and SM103). K and V are BF16 or FP8.
@@ -128,10 +120,8 @@ The decode call rejects calls outside these limits:
 
 ## How the trtllm-gen dispatch runs it
 
-- The call uses the static token-sparse mode of trtllm-gen: one list length
-  `K` for all tokens, and `seq_lens` for the entries that each token uses. The
-  dynamic mode, with a length for each query token of a request, is for MLA.
-  MQA does not need it, because each request has one query token.
+- The call uses the static token-sparse mode of trtllm-gen: one list length `K`
+  for all tokens, and `seq_lens` for the entries that each token uses.
 - `TllmGenFmhaRunnerParams::isMla()` names the MLA shapes. A token-sparse call
   with other shapes is MQA (`isSparseMqa()`).
 - The call runs the generation kernels with a dense mask. One CTA holds all
@@ -142,7 +132,7 @@ The decode call rejects calls outside these limits:
 
 ## From key positions to kernel inputs
 
-An indexer gives the key positions of each token, but the kernels read cache
+An indexer gives the key positions of each token, and the kernels read cache
 rows. Both helpers change the positions to cache rows through the block table of
 the request, in one launch, without host synchronization.
 
@@ -192,13 +182,3 @@ and every replay.
     The replay uses new keys.
 - `tests/trace/test_trtllm_batch_decode_reference_correctness.py` compares the
   token-sparse trace reference with the kernel, for two shapes.
-- The trtllm-gen decode, MLA, sparse MLA and block-sparse tests cover the paths
-  that this design does not change.
-
-## Non-goals and follow-up work
-
-- Several KV heads (GQA). The kernels would need a KV-head stride.
-- One index list for both K and V. The two lists are the same in practice, so
-  one list would read half as many indices.
-- A sliding window and attention sinks.
-- Group sizes for `group_union_masks`: the caller chooses them.
