@@ -410,7 +410,7 @@ def test_peer_tables_and_signal_constants():
         backend.peer_table([11, 0])
     with pytest.raises(ValueError):
         backend.peer_table(list(range(1, 10)))
-    assert loader.SIGNAL_WORDS == 864 and loader.SIGNAL_BYTES == 3456
+    assert loader.SIGNAL_WORDS == 1138688 and loader.SIGNAL_BYTES == 4554752
     assert pkg.SIGNAL_BYTES == loader.SIGNAL_BYTES
     assert backend.dtype_name(torch.bfloat16) == "bf16"
     assert backend.dtype_name(torch.float16) == "f16"

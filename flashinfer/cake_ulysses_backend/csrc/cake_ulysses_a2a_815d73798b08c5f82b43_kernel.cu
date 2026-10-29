@@ -84,7 +84,7 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
     unsigned int epoch = _relaxed_ld_0 + 1;
     unsigned long long* signals_wide = reinterpret_cast<unsigned long long*>(signals_self);
     unsigned long long last_token = (unsigned long long)0;
-    if (tid_0 == 0) {
+    if (tid_0 == 480) {
         uint64_t _relaxed_ld_1;
         asm volatile("ld.relaxed.gpu.u64 %0, [%1];" : "=l"(_relaxed_ld_1) : "l"(signals_wide + (244 + bid_1)) : "memory");
         last_token = _relaxed_ld_1;
@@ -200,19 +200,1035 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
     }
     unsigned int* peer_words = reinterpret_cast<unsigned int*>(peer_elements);
     unsigned int* landed = peer_signals + (176 + bid_1);
-    if (tid_0 == 0) {
-        unsigned long long seen;
-        {
-            do {
-                asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(seen) : "l"((reinterpret_cast<unsigned long long*>(signals_wide) + (236 + destination))) : "memory");
-            } while (seen == static_cast<unsigned long long>(last_token));
+    unsigned int first_0[4];
+    unsigned int first_1[4];
+    unsigned int first_2[4];
+    unsigned int first_3[4];
+    if (out_chunks > 0) {
+        if (warp_1 < 15) {
+            if (vector != 0) {
+                if (B == 1) {
+                    unsigned int last_unit = units - 1;
+                    unsigned int unit_0 = sub * 7680 + tid_0;
+                    unsigned int clamped_0 = ((unit_0 < units) ? unit_0 : last_unit);
+                    unsigned int quotient_1 = (unsigned int)((unsigned long long)clamped_0 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_0 = clamped_0 - quotient_1 * block_units;
+                    unsigned int correction = (unsigned int)(remainder_0 >= block_units);
+                    quotient_1 = quotient_1 + correction;
+                    remainder_0 = remainder_0 - correction * block_units;
+                    unsigned int batch = 0;
+                    unsigned int src = (quotient_1 + (batch * 7 + destination) * sequences) * block_units + remainder_0;
+                    {
+                        uint4 _uv4_1 = *reinterpret_cast<const uint4*>(inp_words + (src * 4) + 0);
+                        first_0[0 + 0] = _uv4_1.x;
+                        first_0[0 + 1] = _uv4_1.y;
+                        first_0[0 + 2] = _uv4_1.z;
+                        first_0[0 + 3] = _uv4_1.w;
+                    }
+                    unsigned int unit_1 = sub * 7680 + (480 + tid_0);
+                    unsigned int clamped_1 = ((unit_1 < units) ? unit_1 : last_unit);
+                    unsigned int quotient_4 = (unsigned int)((unsigned long long)clamped_1 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_2 = clamped_1 - quotient_4 * block_units;
+                    unsigned int correction_0 = (unsigned int)(remainder_2 >= block_units);
+                    quotient_4 = quotient_4 + correction_0;
+                    remainder_2 = remainder_2 - correction_0 * block_units;
+                    unsigned int batch_0 = 0;
+                    unsigned int src_0 = (quotient_4 + (batch_0 * 7 + destination) * sequences) * block_units + remainder_2;
+                    {
+                        uint4 _uv4_2 = *reinterpret_cast<const uint4*>(inp_words + (src_0 * 4) + 0);
+                        first_1[0 + 0] = _uv4_2.x;
+                        first_1[0 + 1] = _uv4_2.y;
+                        first_1[0 + 2] = _uv4_2.z;
+                        first_1[0 + 3] = _uv4_2.w;
+                    }
+                    unsigned int unit_2 = sub * 7680 + (960 + tid_0);
+                    unsigned int clamped_2 = ((unit_2 < units) ? unit_2 : last_unit);
+                    unsigned int quotient_5 = (unsigned int)((unsigned long long)clamped_2 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_5 = clamped_2 - quotient_5 * block_units;
+                    unsigned int correction_1 = (unsigned int)(remainder_5 >= block_units);
+                    quotient_5 = quotient_5 + correction_1;
+                    remainder_5 = remainder_5 - correction_1 * block_units;
+                    unsigned int batch_1 = 0;
+                    unsigned int src_1 = (quotient_5 + (batch_1 * 7 + destination) * sequences) * block_units + remainder_5;
+                    {
+                        uint4 _uv4_3 = *reinterpret_cast<const uint4*>(inp_words + (src_1 * 4) + 0);
+                        first_2[0 + 0] = _uv4_3.x;
+                        first_2[0 + 1] = _uv4_3.y;
+                        first_2[0 + 2] = _uv4_3.z;
+                        first_2[0 + 3] = _uv4_3.w;
+                    }
+                    unsigned int unit_3 = sub * 7680 + (1440 + tid_0);
+                    unsigned int clamped_3 = ((unit_3 < units) ? unit_3 : last_unit);
+                    unsigned int quotient_6 = (unsigned int)((unsigned long long)clamped_3 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_6 = clamped_3 - quotient_6 * block_units;
+                    unsigned int correction_2 = (unsigned int)(remainder_6 >= block_units);
+                    quotient_6 = quotient_6 + correction_2;
+                    remainder_6 = remainder_6 - correction_2 * block_units;
+                    unsigned int batch_2 = 0;
+                    unsigned int src_2 = (quotient_6 + (batch_2 * 7 + destination) * sequences) * block_units + remainder_6;
+                    {
+                        uint4 _uv4_4 = *reinterpret_cast<const uint4*>(inp_words + (src_2 * 4) + 0);
+                        first_3[0 + 0] = _uv4_4.x;
+                        first_3[0 + 1] = _uv4_4.y;
+                        first_3[0 + 2] = _uv4_4.z;
+                        first_3[0 + 3] = _uv4_4.w;
+                    }
+                } else {
+                    unsigned int last_unit_1 = units - 1;
+                    unsigned int unit_4 = sub * 7680 + tid_0;
+                    unsigned int clamped_4 = ((unit_4 < units) ? unit_4 : last_unit_1);
+                    unsigned int quotient_7 = (unsigned int)((unsigned long long)clamped_4 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_7 = clamped_4 - quotient_7 * block_units;
+                    unsigned int correction_3 = (unsigned int)(remainder_7 >= block_units);
+                    quotient_7 = quotient_7 + correction_3;
+                    remainder_7 = remainder_7 - correction_3 * block_units;
+                    unsigned int batch_3 = (unsigned int)((unsigned long long)quotient_7 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int row = quotient_7 - batch_3 * sequences;
+                    unsigned int carry = (unsigned int)(row >= sequences);
+                    batch_3 = batch_3 + carry;
+                    row = row - carry * sequences;
+                    unsigned int src_3 = (quotient_7 + (batch_3 * 7 + destination) * sequences) * block_units + remainder_7;
+                    {
+                        uint4 _uv4_5 = *reinterpret_cast<const uint4*>(inp_words + (src_3 * 4) + 0);
+                        first_0[0 + 0] = _uv4_5.x;
+                        first_0[0 + 1] = _uv4_5.y;
+                        first_0[0 + 2] = _uv4_5.z;
+                        first_0[0 + 3] = _uv4_5.w;
+                    }
+                    unsigned int unit_5 = sub * 7680 + (480 + tid_0);
+                    unsigned int clamped_5 = ((unit_5 < units) ? unit_5 : last_unit_1);
+                    unsigned int quotient_9 = (unsigned int)((unsigned long long)clamped_5 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_8 = clamped_5 - quotient_9 * block_units;
+                    unsigned int correction_3_1 = (unsigned int)(remainder_8 >= block_units);
+                    quotient_9 = quotient_9 + correction_3_1;
+                    remainder_8 = remainder_8 - correction_3_1 * block_units;
+                    unsigned int batch_3_1 = (unsigned int)((unsigned long long)quotient_9 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int row_0 = quotient_9 - batch_3_1 * sequences;
+                    unsigned int carry_0 = (unsigned int)(row_0 >= sequences);
+                    batch_3_1 = batch_3_1 + carry_0;
+                    row_0 = row_0 - carry_0 * sequences;
+                    unsigned int src_3_1 = (quotient_9 + (batch_3_1 * 7 + destination) * sequences) * block_units + remainder_8;
+                    {
+                        uint4 _uv4_6 = *reinterpret_cast<const uint4*>(inp_words + (src_3_1 * 4) + 0);
+                        first_1[0 + 0] = _uv4_6.x;
+                        first_1[0 + 1] = _uv4_6.y;
+                        first_1[0 + 2] = _uv4_6.z;
+                        first_1[0 + 3] = _uv4_6.w;
+                    }
+                    unsigned int unit_7 = sub * 7680 + (960 + tid_0);
+                    unsigned int clamped_6 = ((unit_7 < units) ? unit_7 : last_unit_1);
+                    unsigned int quotient_10 = (unsigned int)((unsigned long long)clamped_6 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_10 = clamped_6 - quotient_10 * block_units;
+                    unsigned int correction_4 = (unsigned int)(remainder_10 >= block_units);
+                    quotient_10 = quotient_10 + correction_4;
+                    remainder_10 = remainder_10 - correction_4 * block_units;
+                    unsigned int batch_4 = (unsigned int)((unsigned long long)quotient_10 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int row_1 = quotient_10 - batch_4 * sequences;
+                    unsigned int carry_1 = (unsigned int)(row_1 >= sequences);
+                    batch_4 = batch_4 + carry_1;
+                    row_1 = row_1 - carry_1 * sequences;
+                    unsigned int src_4 = (quotient_10 + (batch_4 * 7 + destination) * sequences) * block_units + remainder_10;
+                    {
+                        uint4 _uv4_7 = *reinterpret_cast<const uint4*>(inp_words + (src_4 * 4) + 0);
+                        first_2[0 + 0] = _uv4_7.x;
+                        first_2[0 + 1] = _uv4_7.y;
+                        first_2[0 + 2] = _uv4_7.z;
+                        first_2[0 + 3] = _uv4_7.w;
+                    }
+                    unsigned int unit_8 = sub * 7680 + (1440 + tid_0);
+                    unsigned int clamped_8 = ((unit_8 < units) ? unit_8 : last_unit_1);
+                    unsigned int quotient_12 = (unsigned int)((unsigned long long)clamped_8 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_11 = clamped_8 - quotient_12 * block_units;
+                    unsigned int correction_6 = (unsigned int)(remainder_11 >= block_units);
+                    quotient_12 = quotient_12 + correction_6;
+                    remainder_11 = remainder_11 - correction_6 * block_units;
+                    unsigned int batch_5 = (unsigned int)((unsigned long long)quotient_12 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int row_2 = quotient_12 - batch_5 * sequences;
+                    unsigned int carry_2 = (unsigned int)(row_2 >= sequences);
+                    batch_5 = batch_5 + carry_2;
+                    row_2 = row_2 - carry_2 * sequences;
+                    unsigned int src_5 = (quotient_12 + (batch_5 * 7 + destination) * sequences) * block_units + remainder_11;
+                    {
+                        uint4 _uv4_8 = *reinterpret_cast<const uint4*>(inp_words + (src_5 * 4) + 0);
+                        first_3[0 + 0] = _uv4_8.x;
+                        first_3[0 + 1] = _uv4_8.y;
+                        first_3[0 + 2] = _uv4_8.z;
+                        first_3[0 + 3] = _uv4_8.w;
+                    }
+                }
+            }
         }
-        asm volatile("st.relaxed.gpu.u64 [%0], %1;" :: "l"((reinterpret_cast<unsigned long long*>(signals_wide) + (244 + bid_1))), "l"(static_cast<unsigned long long>(seen)) : "memory");
     }
-    __syncthreads();
+    unsigned int entry_seen = 0;
+    if (tid_0 == 480) {
+        unsigned long long _acquire_ld;
+        asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(_acquire_ld) : "l"(reinterpret_cast<unsigned long long*>(signals_wide + (236 + destination))) : "memory");
+        if (_acquire_ld != last_token) {
+            entry_seen = 1;
+            asm volatile("st.relaxed.gpu.u64 [%0], %1;" :: "l"((reinterpret_cast<unsigned long long*>(signals_wide) + (244 + bid_1))), "l"(static_cast<unsigned long long>(_acquire_ld)) : "memory");
+        }
+    }
+    uint32_t entered;
+    asm volatile("{\n\t.reg .pred p, q;\n\tsetp.ne.u32 p, %1, 0;\n\tbarrier.red.or.pred q, 6, 512, p;\n\tselp.u32 %0, 1, 0, q;\n\t}" : "=r"(entered) : "r"((uint32_t)(entry_seen != 0)) : "memory");
+    bool zoned = entered == 0 && out_chunks > 0 && vector != 0;
+    unsigned int zone_slot = (bid_1 * 2 + (epoch & 1)) * 960;
+    if (zoned) {
+        if (warp_1 < 15) {
+            if (sub * 7680 + tid_0 < units) {
+                {
+                    auto _gst_9 = peer_signals + (2048 + (zone_slot + tid_0) * 4);
+                    __builtin_assume(__isGlobal(_gst_9));
+                    reinterpret_cast<int4*>(_gst_9)[0] = reinterpret_cast<int4*>(first_0)[0];
+                }
+            }
+        }
+    }
+    if (tid_0 == 480) {
+        if (entry_seen == 0) {
+            unsigned long long token_seen;
+            {
+                do {
+                    asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(token_seen) : "l"((reinterpret_cast<unsigned long long*>(signals_wide) + (236 + destination))) : "memory");
+                } while (token_seen == static_cast<unsigned long long>(last_token));
+            }
+            asm volatile("st.relaxed.gpu.u64 [%0], %1;" :: "l"((reinterpret_cast<unsigned long long*>(signals_wide) + (244 + bid_1))), "l"(static_cast<unsigned long long>(token_seen)) : "memory");
+        }
+    }
+    if (entered == 0) {
+        __syncthreads();
+    }
     if (B == 1) {
+        if (out_chunks > 0) {
+            if (warp_1 < 15) {
+                if (vector != 0) {
+                    unsigned int last_unit_2 = units - 1;
+                    unsigned int unit_9 = sub * 7680 + tid_0;
+                    unsigned int clamped_9 = ((unit_9 < units) ? unit_9 : last_unit_2);
+                    unsigned int quotient_13 = (unsigned int)((unsigned long long)clamped_9 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_13 = clamped_9 - quotient_13 * block_units;
+                    unsigned int correction_5 = (unsigned int)(remainder_13 >= block_units);
+                    quotient_13 = quotient_13 + correction_5;
+                    remainder_13 = remainder_13 - correction_5 * block_units;
+                    unsigned int dst = quotient_13 * pitch_units + rank * block_units + remainder_13;
+                    unsigned int unit_10 = sub * 7680 + (480 + tid_0);
+                    unsigned int clamped_10 = ((unit_10 < units) ? unit_10 : last_unit_2);
+                    unsigned int quotient_14 = (unsigned int)((unsigned long long)clamped_10 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_14 = clamped_10 - quotient_14 * block_units;
+                    unsigned int correction_7 = (unsigned int)(remainder_14 >= block_units);
+                    quotient_14 = quotient_14 + correction_7;
+                    remainder_14 = remainder_14 - correction_7 * block_units;
+                    unsigned int dst_0 = quotient_14 * pitch_units + rank * block_units + remainder_14;
+                    unsigned int unit_11 = sub * 7680 + (960 + tid_0);
+                    unsigned int clamped_11 = ((unit_11 < units) ? unit_11 : last_unit_2);
+                    unsigned int quotient_15 = (unsigned int)((unsigned long long)clamped_11 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_15 = clamped_11 - quotient_15 * block_units;
+                    unsigned int correction_8 = (unsigned int)(remainder_15 >= block_units);
+                    quotient_15 = quotient_15 + correction_8;
+                    remainder_15 = remainder_15 - correction_8 * block_units;
+                    unsigned int dst_1 = quotient_15 * pitch_units + rank * block_units + remainder_15;
+                    unsigned int unit_12 = sub * 7680 + (1440 + tid_0);
+                    unsigned int clamped_12 = ((unit_12 < units) ? unit_12 : last_unit_2);
+                    unsigned int quotient_16 = (unsigned int)((unsigned long long)clamped_12 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_16 = clamped_12 - quotient_16 * block_units;
+                    unsigned int correction_9 = (unsigned int)(remainder_16 >= block_units);
+                    quotient_16 = quotient_16 + correction_9;
+                    remainder_16 = remainder_16 - correction_9 * block_units;
+                    unsigned int dst_2 = quotient_16 * pitch_units + rank * block_units + remainder_16;
+                    unsigned int unit_13 = sub * 7680 + (1920 + tid_0);
+                    unsigned int clamped_13 = ((unit_13 < units) ? unit_13 : last_unit_2);
+                    unsigned int quotient_17 = (unsigned int)((unsigned long long)clamped_13 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_17 = clamped_13 - quotient_17 * block_units;
+                    unsigned int correction_11 = (unsigned int)(remainder_17 >= block_units);
+                    quotient_17 = quotient_17 + correction_11;
+                    remainder_17 = remainder_17 - correction_11 * block_units;
+                    unsigned int batch_6 = 0;
+                    unsigned int src_6 = (quotient_17 + (batch_6 * 7 + destination) * sequences) * block_units + remainder_17;
+                    unsigned int dst_3 = quotient_17 * pitch_units + rank * block_units + remainder_17;
+                    unsigned int vec_0[4];
+                    {
+                        uint4 _uv4_11 = *reinterpret_cast<const uint4*>(inp_words + (src_6 * 4) + 0);
+                        vec_0[0 + 0] = _uv4_11.x;
+                        vec_0[0 + 1] = _uv4_11.y;
+                        vec_0[0 + 2] = _uv4_11.z;
+                        vec_0[0 + 3] = _uv4_11.w;
+                    }
+                    unsigned int unit_14 = sub * 7680 + (2400 + tid_0);
+                    unsigned int clamped_14 = ((unit_14 < units) ? unit_14 : last_unit_2);
+                    unsigned int quotient_19 = (unsigned int)((unsigned long long)clamped_14 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_18 = clamped_14 - quotient_19 * block_units;
+                    unsigned int correction_12 = (unsigned int)(remainder_18 >= block_units);
+                    quotient_19 = quotient_19 + correction_12;
+                    remainder_18 = remainder_18 - correction_12 * block_units;
+                    unsigned int batch_6_1 = 0;
+                    unsigned int src_6_1 = (quotient_19 + (batch_6_1 * 7 + destination) * sequences) * block_units + remainder_18;
+                    unsigned int dst_4 = quotient_19 * pitch_units + rank * block_units + remainder_18;
+                    unsigned int vec_1[4];
+                    {
+                        uint4 _uv4_12 = *reinterpret_cast<const uint4*>(inp_words + (src_6_1 * 4) + 0);
+                        vec_1[0 + 0] = _uv4_12.x;
+                        vec_1[0 + 1] = _uv4_12.y;
+                        vec_1[0 + 2] = _uv4_12.z;
+                        vec_1[0 + 3] = _uv4_12.w;
+                    }
+                    unsigned int unit_15 = sub * 7680 + (2880 + tid_0);
+                    unsigned int clamped_15 = ((unit_15 < units) ? unit_15 : last_unit_2);
+                    unsigned int quotient_20 = (unsigned int)((unsigned long long)clamped_15 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_20 = clamped_15 - quotient_20 * block_units;
+                    unsigned int correction_14 = (unsigned int)(remainder_20 >= block_units);
+                    quotient_20 = quotient_20 + correction_14;
+                    remainder_20 = remainder_20 - correction_14 * block_units;
+                    unsigned int batch_7 = 0;
+                    unsigned int src_7 = (quotient_20 + (batch_7 * 7 + destination) * sequences) * block_units + remainder_20;
+                    unsigned int dst_5 = quotient_20 * pitch_units + rank * block_units + remainder_20;
+                    unsigned int vec_2[4];
+                    {
+                        uint4 _uv4_13 = *reinterpret_cast<const uint4*>(inp_words + (src_7 * 4) + 0);
+                        vec_2[0 + 0] = _uv4_13.x;
+                        vec_2[0 + 1] = _uv4_13.y;
+                        vec_2[0 + 2] = _uv4_13.z;
+                        vec_2[0 + 3] = _uv4_13.w;
+                    }
+                    unsigned int unit_17 = sub * 7680 + (3360 + tid_0);
+                    unsigned int clamped_16 = ((unit_17 < units) ? unit_17 : last_unit_2);
+                    unsigned int quotient_22 = (unsigned int)((unsigned long long)clamped_16 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_21 = clamped_16 - quotient_22 * block_units;
+                    unsigned int correction_15 = (unsigned int)(remainder_21 >= block_units);
+                    quotient_22 = quotient_22 + correction_15;
+                    remainder_21 = remainder_21 - correction_15 * block_units;
+                    unsigned int batch_8 = 0;
+                    unsigned int src_8 = (quotient_22 + (batch_8 * 7 + destination) * sequences) * block_units + remainder_21;
+                    unsigned int dst_6 = quotient_22 * pitch_units + rank * block_units + remainder_21;
+                    unsigned int vec_3[4];
+                    {
+                        uint4 _uv4_14 = *reinterpret_cast<const uint4*>(inp_words + (src_8 * 4) + 0);
+                        vec_3[0 + 0] = _uv4_14.x;
+                        vec_3[0 + 1] = _uv4_14.y;
+                        vec_3[0 + 2] = _uv4_14.z;
+                        vec_3[0 + 3] = _uv4_14.w;
+                    }
+                    if (!zoned) {
+                        if (unit_9 < units) {
+                            {
+                                auto _gst_15 = peer_words + (dst * 4);
+                                __builtin_assume(__isGlobal(_gst_15));
+                                reinterpret_cast<int4*>(_gst_15)[0] = reinterpret_cast<int4*>(first_0)[0];
+                            }
+                        }
+                    }
+                    if (unit_10 < units) {
+                        {
+                            auto _gst_16 = peer_words + (dst_0 * 4);
+                            __builtin_assume(__isGlobal(_gst_16));
+                            reinterpret_cast<int4*>(_gst_16)[0] = reinterpret_cast<int4*>(first_1)[0];
+                        }
+                    }
+                    if (unit_11 < units) {
+                        {
+                            auto _gst_17 = peer_words + (dst_1 * 4);
+                            __builtin_assume(__isGlobal(_gst_17));
+                            reinterpret_cast<int4*>(_gst_17)[0] = reinterpret_cast<int4*>(first_2)[0];
+                        }
+                    }
+                    if (unit_12 < units) {
+                        {
+                            auto _gst_18 = peer_words + (dst_2 * 4);
+                            __builtin_assume(__isGlobal(_gst_18));
+                            reinterpret_cast<int4*>(_gst_18)[0] = reinterpret_cast<int4*>(first_3)[0];
+                        }
+                    }
+                    unsigned int unit_18 = sub * 7680 + (3840 + tid_0);
+                    unsigned int clamped_18 = ((unit_18 < units) ? unit_18 : last_unit_2);
+                    unsigned int quotient_23 = (unsigned int)((unsigned long long)clamped_18 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_23 = clamped_18 - quotient_23 * block_units;
+                    unsigned int correction_16 = (unsigned int)(remainder_23 >= block_units);
+                    quotient_23 = quotient_23 + correction_16;
+                    remainder_23 = remainder_23 - correction_16 * block_units;
+                    unsigned int batch_9 = 0;
+                    unsigned int src_9 = (quotient_23 + (batch_9 * 7 + destination) * sequences) * block_units + remainder_23;
+                    unsigned int dst_7 = quotient_23 * pitch_units + rank * block_units + remainder_23;
+                    unsigned int vec_4[4];
+                    {
+                        uint4 _uv4_19 = *reinterpret_cast<const uint4*>(inp_words + (src_9 * 4) + 0);
+                        vec_4[0 + 0] = _uv4_19.x;
+                        vec_4[0 + 1] = _uv4_19.y;
+                        vec_4[0 + 2] = _uv4_19.z;
+                        vec_4[0 + 3] = _uv4_19.w;
+                    }
+                    unsigned int unit_19 = sub * 7680 + (4320 + tid_0);
+                    unsigned int clamped_19 = ((unit_19 < units) ? unit_19 : last_unit_2);
+                    unsigned int quotient_24 = (unsigned int)((unsigned long long)clamped_19 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_24 = clamped_19 - quotient_24 * block_units;
+                    unsigned int correction_17 = (unsigned int)(remainder_24 >= block_units);
+                    quotient_24 = quotient_24 + correction_17;
+                    remainder_24 = remainder_24 - correction_17 * block_units;
+                    unsigned int batch_10 = 0;
+                    unsigned int src_10 = (quotient_24 + (batch_10 * 7 + destination) * sequences) * block_units + remainder_24;
+                    unsigned int dst_8 = quotient_24 * pitch_units + rank * block_units + remainder_24;
+                    unsigned int vec_5[4];
+                    {
+                        uint4 _uv4_20 = *reinterpret_cast<const uint4*>(inp_words + (src_10 * 4) + 0);
+                        vec_5[0 + 0] = _uv4_20.x;
+                        vec_5[0 + 1] = _uv4_20.y;
+                        vec_5[0 + 2] = _uv4_20.z;
+                        vec_5[0 + 3] = _uv4_20.w;
+                    }
+                    unsigned int unit_20 = sub * 7680 + (4800 + tid_0);
+                    unsigned int clamped_20 = ((unit_20 < units) ? unit_20 : last_unit_2);
+                    unsigned int quotient_25 = (unsigned int)((unsigned long long)clamped_20 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_25 = clamped_20 - quotient_25 * block_units;
+                    unsigned int correction_18 = (unsigned int)(remainder_25 >= block_units);
+                    quotient_25 = quotient_25 + correction_18;
+                    remainder_25 = remainder_25 - correction_18 * block_units;
+                    unsigned int batch_11 = 0;
+                    unsigned int src_11 = (quotient_25 + (batch_11 * 7 + destination) * sequences) * block_units + remainder_25;
+                    unsigned int dst_9 = quotient_25 * pitch_units + rank * block_units + remainder_25;
+                    unsigned int vec_6[4];
+                    {
+                        uint4 _uv4_21 = *reinterpret_cast<const uint4*>(inp_words + (src_11 * 4) + 0);
+                        vec_6[0 + 0] = _uv4_21.x;
+                        vec_6[0 + 1] = _uv4_21.y;
+                        vec_6[0 + 2] = _uv4_21.z;
+                        vec_6[0 + 3] = _uv4_21.w;
+                    }
+                    unsigned int unit_21 = sub * 7680 + (5280 + tid_0);
+                    unsigned int clamped_21 = ((unit_21 < units) ? unit_21 : last_unit_2);
+                    unsigned int quotient_26 = (unsigned int)((unsigned long long)clamped_21 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_26 = clamped_21 - quotient_26 * block_units;
+                    unsigned int correction_19 = (unsigned int)(remainder_26 >= block_units);
+                    quotient_26 = quotient_26 + correction_19;
+                    remainder_26 = remainder_26 - correction_19 * block_units;
+                    unsigned int batch_12 = 0;
+                    unsigned int src_12 = (quotient_26 + (batch_12 * 7 + destination) * sequences) * block_units + remainder_26;
+                    unsigned int dst_10 = quotient_26 * pitch_units + rank * block_units + remainder_26;
+                    unsigned int vec_7[4];
+                    {
+                        uint4 _uv4_22 = *reinterpret_cast<const uint4*>(inp_words + (src_12 * 4) + 0);
+                        vec_7[0 + 0] = _uv4_22.x;
+                        vec_7[0 + 1] = _uv4_22.y;
+                        vec_7[0 + 2] = _uv4_22.z;
+                        vec_7[0 + 3] = _uv4_22.w;
+                    }
+                    if (unit_13 < units) {
+                        {
+                            auto _gst_23 = peer_words + (dst_3 * 4);
+                            __builtin_assume(__isGlobal(_gst_23));
+                            reinterpret_cast<int4*>(_gst_23)[0] = reinterpret_cast<int4*>(vec_0)[0];
+                        }
+                    }
+                    if (unit_14 < units) {
+                        {
+                            auto _gst_24 = peer_words + (dst_4 * 4);
+                            __builtin_assume(__isGlobal(_gst_24));
+                            reinterpret_cast<int4*>(_gst_24)[0] = reinterpret_cast<int4*>(vec_1)[0];
+                        }
+                    }
+                    if (unit_15 < units) {
+                        {
+                            auto _gst_25 = peer_words + (dst_5 * 4);
+                            __builtin_assume(__isGlobal(_gst_25));
+                            reinterpret_cast<int4*>(_gst_25)[0] = reinterpret_cast<int4*>(vec_2)[0];
+                        }
+                    }
+                    if (unit_17 < units) {
+                        {
+                            auto _gst_26 = peer_words + (dst_6 * 4);
+                            __builtin_assume(__isGlobal(_gst_26));
+                            reinterpret_cast<int4*>(_gst_26)[0] = reinterpret_cast<int4*>(vec_3)[0];
+                        }
+                    }
+                    unsigned int unit_22 = sub * 7680 + (5760 + tid_0);
+                    unsigned int clamped_22 = ((unit_22 < units) ? unit_22 : last_unit_2);
+                    unsigned int quotient_27 = (unsigned int)((unsigned long long)clamped_22 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_27 = clamped_22 - quotient_27 * block_units;
+                    unsigned int correction_21 = (unsigned int)(remainder_27 >= block_units);
+                    quotient_27 = quotient_27 + correction_21;
+                    remainder_27 = remainder_27 - correction_21 * block_units;
+                    unsigned int batch_13 = 0;
+                    unsigned int src_13 = (quotient_27 + (batch_13 * 7 + destination) * sequences) * block_units + remainder_27;
+                    unsigned int dst_11 = quotient_27 * pitch_units + rank * block_units + remainder_27;
+                    unsigned int vec_8[4];
+                    {
+                        uint4 _uv4_27 = *reinterpret_cast<const uint4*>(inp_words + (src_13 * 4) + 0);
+                        vec_8[0 + 0] = _uv4_27.x;
+                        vec_8[0 + 1] = _uv4_27.y;
+                        vec_8[0 + 2] = _uv4_27.z;
+                        vec_8[0 + 3] = _uv4_27.w;
+                    }
+                    unsigned int unit_23 = sub * 7680 + (6240 + tid_0);
+                    unsigned int clamped_23 = ((unit_23 < units) ? unit_23 : last_unit_2);
+                    unsigned int quotient_29 = (unsigned int)((unsigned long long)clamped_23 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_28 = clamped_23 - quotient_29 * block_units;
+                    unsigned int correction_22 = (unsigned int)(remainder_28 >= block_units);
+                    quotient_29 = quotient_29 + correction_22;
+                    remainder_28 = remainder_28 - correction_22 * block_units;
+                    unsigned int batch_14 = 0;
+                    unsigned int src_15 = (quotient_29 + (batch_14 * 7 + destination) * sequences) * block_units + remainder_28;
+                    unsigned int dst_12 = quotient_29 * pitch_units + rank * block_units + remainder_28;
+                    unsigned int vec_9[4];
+                    {
+                        uint4 _uv4_28 = *reinterpret_cast<const uint4*>(inp_words + (src_15 * 4) + 0);
+                        vec_9[0 + 0] = _uv4_28.x;
+                        vec_9[0 + 1] = _uv4_28.y;
+                        vec_9[0 + 2] = _uv4_28.z;
+                        vec_9[0 + 3] = _uv4_28.w;
+                    }
+                    unsigned int unit_24 = sub * 7680 + (6720 + tid_0);
+                    unsigned int clamped_24 = ((unit_24 < units) ? unit_24 : last_unit_2);
+                    unsigned int quotient_30 = (unsigned int)((unsigned long long)clamped_24 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_30 = clamped_24 - quotient_30 * block_units;
+                    unsigned int correction_24 = (unsigned int)(remainder_30 >= block_units);
+                    quotient_30 = quotient_30 + correction_24;
+                    remainder_30 = remainder_30 - correction_24 * block_units;
+                    unsigned int batch_15 = 0;
+                    unsigned int src_16 = (quotient_30 + (batch_15 * 7 + destination) * sequences) * block_units + remainder_30;
+                    unsigned int dst_13 = quotient_30 * pitch_units + rank * block_units + remainder_30;
+                    unsigned int vec_10[4];
+                    {
+                        uint4 _uv4_29 = *reinterpret_cast<const uint4*>(inp_words + (src_16 * 4) + 0);
+                        vec_10[0 + 0] = _uv4_29.x;
+                        vec_10[0 + 1] = _uv4_29.y;
+                        vec_10[0 + 2] = _uv4_29.z;
+                        vec_10[0 + 3] = _uv4_29.w;
+                    }
+                    unsigned int unit_25 = sub * 7680 + (7200 + tid_0);
+                    unsigned int clamped_25 = ((unit_25 < units) ? unit_25 : last_unit_2);
+                    unsigned int quotient_32 = (unsigned int)((unsigned long long)clamped_25 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_31 = clamped_25 - quotient_32 * block_units;
+                    unsigned int correction_25 = (unsigned int)(remainder_31 >= block_units);
+                    quotient_32 = quotient_32 + correction_25;
+                    remainder_31 = remainder_31 - correction_25 * block_units;
+                    unsigned int batch_16 = 0;
+                    unsigned int src_17 = (quotient_32 + (batch_16 * 7 + destination) * sequences) * block_units + remainder_31;
+                    unsigned int dst_14 = quotient_32 * pitch_units + rank * block_units + remainder_31;
+                    unsigned int vec_11[4];
+                    {
+                        uint4 _uv4_30 = *reinterpret_cast<const uint4*>(inp_words + (src_17 * 4) + 0);
+                        vec_11[0 + 0] = _uv4_30.x;
+                        vec_11[0 + 1] = _uv4_30.y;
+                        vec_11[0 + 2] = _uv4_30.z;
+                        vec_11[0 + 3] = _uv4_30.w;
+                    }
+                    if (unit_18 < units) {
+                        {
+                            auto _gst_31 = peer_words + (dst_7 * 4);
+                            __builtin_assume(__isGlobal(_gst_31));
+                            reinterpret_cast<int4*>(_gst_31)[0] = reinterpret_cast<int4*>(vec_4)[0];
+                        }
+                    }
+                    if (unit_19 < units) {
+                        {
+                            auto _gst_32 = peer_words + (dst_8 * 4);
+                            __builtin_assume(__isGlobal(_gst_32));
+                            reinterpret_cast<int4*>(_gst_32)[0] = reinterpret_cast<int4*>(vec_5)[0];
+                        }
+                    }
+                    if (unit_20 < units) {
+                        {
+                            auto _gst_33 = peer_words + (dst_9 * 4);
+                            __builtin_assume(__isGlobal(_gst_33));
+                            reinterpret_cast<int4*>(_gst_33)[0] = reinterpret_cast<int4*>(vec_6)[0];
+                        }
+                    }
+                    if (unit_21 < units) {
+                        {
+                            auto _gst_34 = peer_words + (dst_10 * 4);
+                            __builtin_assume(__isGlobal(_gst_34));
+                            reinterpret_cast<int4*>(_gst_34)[0] = reinterpret_cast<int4*>(vec_7)[0];
+                        }
+                    }
+                    if (unit_22 < units) {
+                        {
+                            auto _gst_35 = peer_words + (dst_11 * 4);
+                            __builtin_assume(__isGlobal(_gst_35));
+                            reinterpret_cast<int4*>(_gst_35)[0] = reinterpret_cast<int4*>(vec_8)[0];
+                        }
+                    }
+                    if (unit_23 < units) {
+                        {
+                            auto _gst_36 = peer_words + (dst_12 * 4);
+                            __builtin_assume(__isGlobal(_gst_36));
+                            reinterpret_cast<int4*>(_gst_36)[0] = reinterpret_cast<int4*>(vec_9)[0];
+                        }
+                    }
+                    if (unit_24 < units) {
+                        {
+                            auto _gst_37 = peer_words + (dst_13 * 4);
+                            __builtin_assume(__isGlobal(_gst_37));
+                            reinterpret_cast<int4*>(_gst_37)[0] = reinterpret_cast<int4*>(vec_10)[0];
+                        }
+                    }
+                    if (unit_25 < units) {
+                        {
+                            auto _gst_38 = peer_words + (dst_14 * 4);
+                            __builtin_assume(__isGlobal(_gst_38));
+                            reinterpret_cast<int4*>(_gst_38)[0] = reinterpret_cast<int4*>(vec_11)[0];
+                        }
+                    }
+                } else {
+                    unsigned int tail_lo = lo + (out_chunks - 2) * 7680;
+                    unsigned int split = hi - (hi - tail_lo >> 2);
+                    unsigned int clo = lo;
+                    unsigned int chi = lo + 7680;
+                    if (out_chunks == 2) {
+                        clo = tail_lo;
+                        chi = split;
+                    }
+                    if (out_chunks == 1) {
+                        clo = split;
+                        chi = hi;
+                    }
+                    #pragma unroll 1
+                    for (unsigned int u = clo + tid_0; u < chi; u += 480) {
+                        unsigned int quotient_33 = (unsigned int)((unsigned long long)u * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_33 = u - quotient_33 * block_units;
+                        unsigned int correction_10 = (unsigned int)(remainder_33 >= block_units);
+                        quotient_33 = quotient_33 + correction_10;
+                        remainder_33 = remainder_33 - correction_10 * block_units;
+                        unsigned int batch_17 = 0;
+                        unsigned int src_14 = (quotient_33 + (batch_17 * 7 + destination) * sequences) * block_units + remainder_33;
+                        unsigned int dst_15 = quotient_33 * pitch_units + rank * block_units + remainder_33;
+                        peer_elements[dst_15] = inp[src_14];
+                    }
+                }
+            }
+        }
+        if (count_6 > 0) {
+            if (warp_1 < 15) {
+                unsigned int tail_lo_1 = lo_4 + (count_6 - 2) * 7680;
+                unsigned int split_1 = hi_5 - (hi_5 - tail_lo_1 >> 2);
+                unsigned int clo_1 = lo_4;
+                unsigned int chi_1 = lo_4 + 7680;
+                if (count_6 == 2) {
+                    clo_1 = tail_lo_1;
+                    chi_1 = split_1;
+                }
+                if (count_6 == 1) {
+                    clo_1 = split_1;
+                    chi_1 = hi_5;
+                }
+                if (vector != 0) {
+                    unsigned int last_unit_3 = chi_1 - 1;
+                    #pragma unroll 1
+                    for (unsigned int base = clo_1 + tid_0; base < chi_1; base += 7680) {
+                        unsigned int unit_27 = base;
+                        unsigned int clamped_26 = ((unit_27 < chi_1) ? unit_27 : last_unit_3);
+                        unsigned int quotient_34 = (unsigned int)((unsigned long long)clamped_26 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_34 = clamped_26 - quotient_34 * block_units;
+                        unsigned int correction_13 = (unsigned int)(remainder_34 >= block_units);
+                        quotient_34 = quotient_34 + correction_13;
+                        remainder_34 = remainder_34 - correction_13 * block_units;
+                        unsigned int batch_18 = 0;
+                        unsigned int src_18 = (quotient_34 + (batch_18 * 7 + rank) * sequences) * block_units + remainder_34;
+                        unsigned int dst_16 = quotient_34 * pitch_units + rank * block_units + remainder_34;
+                        unsigned int vec_12[4];
+                        {
+                            uint4 _uv4_39 = *reinterpret_cast<const uint4*>(inp_words + (src_18 * 4) + 0);
+                            vec_12[0 + 0] = _uv4_39.x;
+                            vec_12[0 + 1] = _uv4_39.y;
+                            vec_12[0 + 2] = _uv4_39.z;
+                            vec_12[0 + 3] = _uv4_39.w;
+                        }
+                        unsigned int unit_28 = base + 480;
+                        unsigned int clamped_28 = ((unit_28 < chi_1) ? unit_28 : last_unit_3);
+                        unsigned int quotient_35 = (unsigned int)((unsigned long long)clamped_28 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_35 = clamped_28 - quotient_35 * block_units;
+                        unsigned int correction_26 = (unsigned int)(remainder_35 >= block_units);
+                        quotient_35 = quotient_35 + correction_26;
+                        remainder_35 = remainder_35 - correction_26 * block_units;
+                        unsigned int batch_17_1 = 0;
+                        unsigned int src_18_1 = (quotient_35 + (batch_17_1 * 7 + rank) * sequences) * block_units + remainder_35;
+                        unsigned int dst_16_1 = quotient_35 * pitch_units + rank * block_units + remainder_35;
+                        unsigned int vec_13[4];
+                        {
+                            uint4 _uv4_40 = *reinterpret_cast<const uint4*>(inp_words + (src_18_1 * 4) + 0);
+                            vec_13[0 + 0] = _uv4_40.x;
+                            vec_13[0 + 1] = _uv4_40.y;
+                            vec_13[0 + 2] = _uv4_40.z;
+                            vec_13[0 + 3] = _uv4_40.w;
+                        }
+                        unsigned int unit_29 = base + 960;
+                        unsigned int clamped_29 = ((unit_29 < chi_1) ? unit_29 : last_unit_3);
+                        unsigned int quotient_36 = (unsigned int)((unsigned long long)clamped_29 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_36 = clamped_29 - quotient_36 * block_units;
+                        unsigned int correction_27 = (unsigned int)(remainder_36 >= block_units);
+                        quotient_36 = quotient_36 + correction_27;
+                        remainder_36 = remainder_36 - correction_27 * block_units;
+                        unsigned int batch_18_1 = 0;
+                        unsigned int src_19 = (quotient_36 + (batch_18_1 * 7 + rank) * sequences) * block_units + remainder_36;
+                        unsigned int dst_17 = quotient_36 * pitch_units + rank * block_units + remainder_36;
+                        unsigned int vec_14[4];
+                        {
+                            uint4 _uv4_41 = *reinterpret_cast<const uint4*>(inp_words + (src_19 * 4) + 0);
+                            vec_14[0 + 0] = _uv4_41.x;
+                            vec_14[0 + 1] = _uv4_41.y;
+                            vec_14[0 + 2] = _uv4_41.z;
+                            vec_14[0 + 3] = _uv4_41.w;
+                        }
+                        unsigned int unit_30 = base + 1440;
+                        unsigned int clamped_30 = ((unit_30 < chi_1) ? unit_30 : last_unit_3);
+                        unsigned int quotient_37 = (unsigned int)((unsigned long long)clamped_30 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_37 = clamped_30 - quotient_37 * block_units;
+                        unsigned int correction_28 = (unsigned int)(remainder_37 >= block_units);
+                        quotient_37 = quotient_37 + correction_28;
+                        remainder_37 = remainder_37 - correction_28 * block_units;
+                        unsigned int batch_19 = 0;
+                        unsigned int src_20 = (quotient_37 + (batch_19 * 7 + rank) * sequences) * block_units + remainder_37;
+                        unsigned int dst_18 = quotient_37 * pitch_units + rank * block_units + remainder_37;
+                        unsigned int vec_15[4];
+                        {
+                            uint4 _uv4_42 = *reinterpret_cast<const uint4*>(inp_words + (src_20 * 4) + 0);
+                            vec_15[0 + 0] = _uv4_42.x;
+                            vec_15[0 + 1] = _uv4_42.y;
+                            vec_15[0 + 2] = _uv4_42.z;
+                            vec_15[0 + 3] = _uv4_42.w;
+                        }
+                        unsigned int unit_31 = base + 1920;
+                        unsigned int clamped_31 = ((unit_31 < chi_1) ? unit_31 : last_unit_3);
+                        unsigned int quotient_39 = (unsigned int)((unsigned long long)clamped_31 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_38 = clamped_31 - quotient_39 * block_units;
+                        unsigned int correction_29 = (unsigned int)(remainder_38 >= block_units);
+                        quotient_39 = quotient_39 + correction_29;
+                        remainder_38 = remainder_38 - correction_29 * block_units;
+                        unsigned int batch_20 = 0;
+                        unsigned int src_21 = (quotient_39 + (batch_20 * 7 + rank) * sequences) * block_units + remainder_38;
+                        unsigned int dst_19 = quotient_39 * pitch_units + rank * block_units + remainder_38;
+                        unsigned int vec_16[4];
+                        {
+                            uint4 _uv4_43 = *reinterpret_cast<const uint4*>(inp_words + (src_21 * 4) + 0);
+                            vec_16[0 + 0] = _uv4_43.x;
+                            vec_16[0 + 1] = _uv4_43.y;
+                            vec_16[0 + 2] = _uv4_43.z;
+                            vec_16[0 + 3] = _uv4_43.w;
+                        }
+                        unsigned int unit_32 = base + 2400;
+                        unsigned int clamped_32 = ((unit_32 < chi_1) ? unit_32 : last_unit_3);
+                        unsigned int quotient_40 = (unsigned int)((unsigned long long)clamped_32 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_40 = clamped_32 - quotient_40 * block_units;
+                        unsigned int correction_31 = (unsigned int)(remainder_40 >= block_units);
+                        quotient_40 = quotient_40 + correction_31;
+                        remainder_40 = remainder_40 - correction_31 * block_units;
+                        unsigned int batch_21 = 0;
+                        unsigned int src_22 = (quotient_40 + (batch_21 * 7 + rank) * sequences) * block_units + remainder_40;
+                        unsigned int dst_20 = quotient_40 * pitch_units + rank * block_units + remainder_40;
+                        unsigned int vec_17[4];
+                        {
+                            uint4 _uv4_44 = *reinterpret_cast<const uint4*>(inp_words + (src_22 * 4) + 0);
+                            vec_17[0 + 0] = _uv4_44.x;
+                            vec_17[0 + 1] = _uv4_44.y;
+                            vec_17[0 + 2] = _uv4_44.z;
+                            vec_17[0 + 3] = _uv4_44.w;
+                        }
+                        unsigned int unit_33 = base + 2880;
+                        unsigned int clamped_33 = ((unit_33 < chi_1) ? unit_33 : last_unit_3);
+                        unsigned int quotient_42 = (unsigned int)((unsigned long long)clamped_33 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_41 = clamped_33 - quotient_42 * block_units;
+                        unsigned int correction_32 = (unsigned int)(remainder_41 >= block_units);
+                        quotient_42 = quotient_42 + correction_32;
+                        remainder_41 = remainder_41 - correction_32 * block_units;
+                        unsigned int batch_22 = 0;
+                        unsigned int src_23 = (quotient_42 + (batch_22 * 7 + rank) * sequences) * block_units + remainder_41;
+                        unsigned int dst_21 = quotient_42 * pitch_units + rank * block_units + remainder_41;
+                        unsigned int vec_18[4];
+                        {
+                            uint4 _uv4_45 = *reinterpret_cast<const uint4*>(inp_words + (src_23 * 4) + 0);
+                            vec_18[0 + 0] = _uv4_45.x;
+                            vec_18[0 + 1] = _uv4_45.y;
+                            vec_18[0 + 2] = _uv4_45.z;
+                            vec_18[0 + 3] = _uv4_45.w;
+                        }
+                        unsigned int unit_34 = base + 3360;
+                        unsigned int clamped_34 = ((unit_34 < chi_1) ? unit_34 : last_unit_3);
+                        unsigned int quotient_43 = (unsigned int)((unsigned long long)clamped_34 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_43 = clamped_34 - quotient_43 * block_units;
+                        unsigned int correction_34 = (unsigned int)(remainder_43 >= block_units);
+                        quotient_43 = quotient_43 + correction_34;
+                        remainder_43 = remainder_43 - correction_34 * block_units;
+                        unsigned int batch_23 = 0;
+                        unsigned int src_25 = (quotient_43 + (batch_23 * 7 + rank) * sequences) * block_units + remainder_43;
+                        unsigned int dst_22 = quotient_43 * pitch_units + rank * block_units + remainder_43;
+                        unsigned int vec_19[4];
+                        {
+                            uint4 _uv4_46 = *reinterpret_cast<const uint4*>(inp_words + (src_25 * 4) + 0);
+                            vec_19[0 + 0] = _uv4_46.x;
+                            vec_19[0 + 1] = _uv4_46.y;
+                            vec_19[0 + 2] = _uv4_46.z;
+                            vec_19[0 + 3] = _uv4_46.w;
+                        }
+                        if (unit_27 < chi_1) {
+                            {
+                                auto _gst_47 = out_words + (dst_16 * 4);
+                                __builtin_assume(__isGlobal(_gst_47));
+                                reinterpret_cast<int4*>(_gst_47)[0] = reinterpret_cast<int4*>(vec_12)[0];
+                            }
+                        }
+                        if (unit_28 < chi_1) {
+                            {
+                                auto _gst_48 = out_words + (dst_16_1 * 4);
+                                __builtin_assume(__isGlobal(_gst_48));
+                                reinterpret_cast<int4*>(_gst_48)[0] = reinterpret_cast<int4*>(vec_13)[0];
+                            }
+                        }
+                        if (unit_29 < chi_1) {
+                            {
+                                auto _gst_49 = out_words + (dst_17 * 4);
+                                __builtin_assume(__isGlobal(_gst_49));
+                                reinterpret_cast<int4*>(_gst_49)[0] = reinterpret_cast<int4*>(vec_14)[0];
+                            }
+                        }
+                        if (unit_30 < chi_1) {
+                            {
+                                auto _gst_50 = out_words + (dst_18 * 4);
+                                __builtin_assume(__isGlobal(_gst_50));
+                                reinterpret_cast<int4*>(_gst_50)[0] = reinterpret_cast<int4*>(vec_15)[0];
+                            }
+                        }
+                        unsigned int unit_35 = base + 3840;
+                        unsigned int clamped_35 = ((unit_35 < chi_1) ? unit_35 : last_unit_3);
+                        unsigned int quotient_44 = (unsigned int)((unsigned long long)clamped_35 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_44 = clamped_35 - quotient_44 * block_units;
+                        unsigned int correction_35 = (unsigned int)(remainder_44 >= block_units);
+                        quotient_44 = quotient_44 + correction_35;
+                        remainder_44 = remainder_44 - correction_35 * block_units;
+                        unsigned int batch_24 = 0;
+                        unsigned int src_26 = (quotient_44 + (batch_24 * 7 + rank) * sequences) * block_units + remainder_44;
+                        unsigned int dst_23 = quotient_44 * pitch_units + rank * block_units + remainder_44;
+                        unsigned int vec_20[4];
+                        {
+                            uint4 _uv4_51 = *reinterpret_cast<const uint4*>(inp_words + (src_26 * 4) + 0);
+                            vec_20[0 + 0] = _uv4_51.x;
+                            vec_20[0 + 1] = _uv4_51.y;
+                            vec_20[0 + 2] = _uv4_51.z;
+                            vec_20[0 + 3] = _uv4_51.w;
+                        }
+                        unsigned int unit_37 = base + 4320;
+                        unsigned int clamped_36 = ((unit_37 < chi_1) ? unit_37 : last_unit_3);
+                        unsigned int quotient_45 = (unsigned int)((unsigned long long)clamped_36 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_45 = clamped_36 - quotient_45 * block_units;
+                        unsigned int correction_36 = (unsigned int)(remainder_45 >= block_units);
+                        quotient_45 = quotient_45 + correction_36;
+                        remainder_45 = remainder_45 - correction_36 * block_units;
+                        unsigned int batch_25 = 0;
+                        unsigned int src_27 = (quotient_45 + (batch_25 * 7 + rank) * sequences) * block_units + remainder_45;
+                        unsigned int dst_24 = quotient_45 * pitch_units + rank * block_units + remainder_45;
+                        unsigned int vec_21[4];
+                        {
+                            uint4 _uv4_52 = *reinterpret_cast<const uint4*>(inp_words + (src_27 * 4) + 0);
+                            vec_21[0 + 0] = _uv4_52.x;
+                            vec_21[0 + 1] = _uv4_52.y;
+                            vec_21[0 + 2] = _uv4_52.z;
+                            vec_21[0 + 3] = _uv4_52.w;
+                        }
+                        unsigned int unit_38 = base + 4800;
+                        unsigned int clamped_38 = ((unit_38 < chi_1) ? unit_38 : last_unit_3);
+                        unsigned int quotient_46 = (unsigned int)((unsigned long long)clamped_38 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_46 = clamped_38 - quotient_46 * block_units;
+                        unsigned int correction_37 = (unsigned int)(remainder_46 >= block_units);
+                        quotient_46 = quotient_46 + correction_37;
+                        remainder_46 = remainder_46 - correction_37 * block_units;
+                        unsigned int batch_26 = 0;
+                        unsigned int src_28 = (quotient_46 + (batch_26 * 7 + rank) * sequences) * block_units + remainder_46;
+                        unsigned int dst_26 = quotient_46 * pitch_units + rank * block_units + remainder_46;
+                        unsigned int vec_22[4];
+                        {
+                            uint4 _uv4_53 = *reinterpret_cast<const uint4*>(inp_words + (src_28 * 4) + 0);
+                            vec_22[0 + 0] = _uv4_53.x;
+                            vec_22[0 + 1] = _uv4_53.y;
+                            vec_22[0 + 2] = _uv4_53.z;
+                            vec_22[0 + 3] = _uv4_53.w;
+                        }
+                        unsigned int unit_39 = base + 5280;
+                        unsigned int clamped_39 = ((unit_39 < chi_1) ? unit_39 : last_unit_3);
+                        unsigned int quotient_47 = (unsigned int)((unsigned long long)clamped_39 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_47 = clamped_39 - quotient_47 * block_units;
+                        unsigned int correction_38 = (unsigned int)(remainder_47 >= block_units);
+                        quotient_47 = quotient_47 + correction_38;
+                        remainder_47 = remainder_47 - correction_38 * block_units;
+                        unsigned int batch_27 = 0;
+                        unsigned int src_29 = (quotient_47 + (batch_27 * 7 + rank) * sequences) * block_units + remainder_47;
+                        unsigned int dst_27 = quotient_47 * pitch_units + rank * block_units + remainder_47;
+                        unsigned int vec_23[4];
+                        {
+                            uint4 _uv4_54 = *reinterpret_cast<const uint4*>(inp_words + (src_29 * 4) + 0);
+                            vec_23[0 + 0] = _uv4_54.x;
+                            vec_23[0 + 1] = _uv4_54.y;
+                            vec_23[0 + 2] = _uv4_54.z;
+                            vec_23[0 + 3] = _uv4_54.w;
+                        }
+                        if (unit_31 < chi_1) {
+                            {
+                                auto _gst_55 = out_words + (dst_19 * 4);
+                                __builtin_assume(__isGlobal(_gst_55));
+                                reinterpret_cast<int4*>(_gst_55)[0] = reinterpret_cast<int4*>(vec_16)[0];
+                            }
+                        }
+                        if (unit_32 < chi_1) {
+                            {
+                                auto _gst_56 = out_words + (dst_20 * 4);
+                                __builtin_assume(__isGlobal(_gst_56));
+                                reinterpret_cast<int4*>(_gst_56)[0] = reinterpret_cast<int4*>(vec_17)[0];
+                            }
+                        }
+                        if (unit_33 < chi_1) {
+                            {
+                                auto _gst_57 = out_words + (dst_21 * 4);
+                                __builtin_assume(__isGlobal(_gst_57));
+                                reinterpret_cast<int4*>(_gst_57)[0] = reinterpret_cast<int4*>(vec_18)[0];
+                            }
+                        }
+                        if (unit_34 < chi_1) {
+                            {
+                                auto _gst_58 = out_words + (dst_22 * 4);
+                                __builtin_assume(__isGlobal(_gst_58));
+                                reinterpret_cast<int4*>(_gst_58)[0] = reinterpret_cast<int4*>(vec_19)[0];
+                            }
+                        }
+                        unsigned int unit_40 = base + 5760;
+                        unsigned int clamped_40 = ((unit_40 < chi_1) ? unit_40 : last_unit_3);
+                        unsigned int quotient_49 = (unsigned int)((unsigned long long)clamped_40 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_48 = clamped_40 - quotient_49 * block_units;
+                        unsigned int correction_39 = (unsigned int)(remainder_48 >= block_units);
+                        quotient_49 = quotient_49 + correction_39;
+                        remainder_48 = remainder_48 - correction_39 * block_units;
+                        unsigned int batch_28 = 0;
+                        unsigned int src_30 = (quotient_49 + (batch_28 * 7 + rank) * sequences) * block_units + remainder_48;
+                        unsigned int dst_28 = quotient_49 * pitch_units + rank * block_units + remainder_48;
+                        unsigned int vec_24[4];
+                        {
+                            uint4 _uv4_59 = *reinterpret_cast<const uint4*>(inp_words + (src_30 * 4) + 0);
+                            vec_24[0 + 0] = _uv4_59.x;
+                            vec_24[0 + 1] = _uv4_59.y;
+                            vec_24[0 + 2] = _uv4_59.z;
+                            vec_24[0 + 3] = _uv4_59.w;
+                        }
+                        unsigned int unit_41 = base + 6240;
+                        unsigned int clamped_41 = ((unit_41 < chi_1) ? unit_41 : last_unit_3);
+                        unsigned int quotient_50 = (unsigned int)((unsigned long long)clamped_41 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_50 = clamped_41 - quotient_50 * block_units;
+                        unsigned int correction_41 = (unsigned int)(remainder_50 >= block_units);
+                        quotient_50 = quotient_50 + correction_41;
+                        remainder_50 = remainder_50 - correction_41 * block_units;
+                        unsigned int batch_29 = 0;
+                        unsigned int src_31 = (quotient_50 + (batch_29 * 7 + rank) * sequences) * block_units + remainder_50;
+                        unsigned int dst_29 = quotient_50 * pitch_units + rank * block_units + remainder_50;
+                        unsigned int vec_25[4];
+                        {
+                            uint4 _uv4_60 = *reinterpret_cast<const uint4*>(inp_words + (src_31 * 4) + 0);
+                            vec_25[0 + 0] = _uv4_60.x;
+                            vec_25[0 + 1] = _uv4_60.y;
+                            vec_25[0 + 2] = _uv4_60.z;
+                            vec_25[0 + 3] = _uv4_60.w;
+                        }
+                        unsigned int unit_42 = base + 6720;
+                        unsigned int clamped_42 = ((unit_42 < chi_1) ? unit_42 : last_unit_3);
+                        unsigned int quotient_52 = (unsigned int)((unsigned long long)clamped_42 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_51 = clamped_42 - quotient_52 * block_units;
+                        unsigned int correction_42 = (unsigned int)(remainder_51 >= block_units);
+                        quotient_52 = quotient_52 + correction_42;
+                        remainder_51 = remainder_51 - correction_42 * block_units;
+                        unsigned int batch_30 = 0;
+                        unsigned int src_32 = (quotient_52 + (batch_30 * 7 + rank) * sequences) * block_units + remainder_51;
+                        unsigned int dst_30 = quotient_52 * pitch_units + rank * block_units + remainder_51;
+                        unsigned int vec_26[4];
+                        {
+                            uint4 _uv4_61 = *reinterpret_cast<const uint4*>(inp_words + (src_32 * 4) + 0);
+                            vec_26[0 + 0] = _uv4_61.x;
+                            vec_26[0 + 1] = _uv4_61.y;
+                            vec_26[0 + 2] = _uv4_61.z;
+                            vec_26[0 + 3] = _uv4_61.w;
+                        }
+                        unsigned int unit_43 = base + 7200;
+                        unsigned int clamped_43 = ((unit_43 < chi_1) ? unit_43 : last_unit_3);
+                        unsigned int quotient_53 = (unsigned int)((unsigned long long)clamped_43 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_53 = clamped_43 - quotient_53 * block_units;
+                        unsigned int correction_44 = (unsigned int)(remainder_53 >= block_units);
+                        quotient_53 = quotient_53 + correction_44;
+                        remainder_53 = remainder_53 - correction_44 * block_units;
+                        unsigned int batch_31 = 0;
+                        unsigned int src_33 = (quotient_53 + (batch_31 * 7 + rank) * sequences) * block_units + remainder_53;
+                        unsigned int dst_31 = quotient_53 * pitch_units + rank * block_units + remainder_53;
+                        unsigned int vec_27[4];
+                        {
+                            uint4 _uv4_62 = *reinterpret_cast<const uint4*>(inp_words + (src_33 * 4) + 0);
+                            vec_27[0 + 0] = _uv4_62.x;
+                            vec_27[0 + 1] = _uv4_62.y;
+                            vec_27[0 + 2] = _uv4_62.z;
+                            vec_27[0 + 3] = _uv4_62.w;
+                        }
+                        if (unit_35 < chi_1) {
+                            {
+                                auto _gst_63 = out_words + (dst_23 * 4);
+                                __builtin_assume(__isGlobal(_gst_63));
+                                reinterpret_cast<int4*>(_gst_63)[0] = reinterpret_cast<int4*>(vec_20)[0];
+                            }
+                        }
+                        if (unit_37 < chi_1) {
+                            {
+                                auto _gst_64 = out_words + (dst_24 * 4);
+                                __builtin_assume(__isGlobal(_gst_64));
+                                reinterpret_cast<int4*>(_gst_64)[0] = reinterpret_cast<int4*>(vec_21)[0];
+                            }
+                        }
+                        if (unit_38 < chi_1) {
+                            {
+                                auto _gst_65 = out_words + (dst_26 * 4);
+                                __builtin_assume(__isGlobal(_gst_65));
+                                reinterpret_cast<int4*>(_gst_65)[0] = reinterpret_cast<int4*>(vec_22)[0];
+                            }
+                        }
+                        if (unit_39 < chi_1) {
+                            {
+                                auto _gst_66 = out_words + (dst_27 * 4);
+                                __builtin_assume(__isGlobal(_gst_66));
+                                reinterpret_cast<int4*>(_gst_66)[0] = reinterpret_cast<int4*>(vec_23)[0];
+                            }
+                        }
+                        if (unit_40 < chi_1) {
+                            {
+                                auto _gst_67 = out_words + (dst_28 * 4);
+                                __builtin_assume(__isGlobal(_gst_67));
+                                reinterpret_cast<int4*>(_gst_67)[0] = reinterpret_cast<int4*>(vec_24)[0];
+                            }
+                        }
+                        if (unit_41 < chi_1) {
+                            {
+                                auto _gst_68 = out_words + (dst_29 * 4);
+                                __builtin_assume(__isGlobal(_gst_68));
+                                reinterpret_cast<int4*>(_gst_68)[0] = reinterpret_cast<int4*>(vec_25)[0];
+                            }
+                        }
+                        if (unit_42 < chi_1) {
+                            {
+                                auto _gst_69 = out_words + (dst_30 * 4);
+                                __builtin_assume(__isGlobal(_gst_69));
+                                reinterpret_cast<int4*>(_gst_69)[0] = reinterpret_cast<int4*>(vec_26)[0];
+                            }
+                        }
+                        if (unit_43 < chi_1) {
+                            {
+                                auto _gst_70 = out_words + (dst_31 * 4);
+                                __builtin_assume(__isGlobal(_gst_70));
+                                reinterpret_cast<int4*>(_gst_70)[0] = reinterpret_cast<int4*>(vec_27)[0];
+                            }
+                        }
+                    }
+                } else {
+                    #pragma unroll 1
+                    for (unsigned int u_1 = clo_1 + tid_0; u_1 < chi_1; u_1 += 480) {
+                        unsigned int quotient_54 = (unsigned int)((unsigned long long)u_1 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_54 = u_1 - quotient_54 * block_units;
+                        unsigned int correction_20 = (unsigned int)(remainder_54 >= block_units);
+                        quotient_54 = quotient_54 + correction_20;
+                        remainder_54 = remainder_54 - correction_20 * block_units;
+                        unsigned int batch_32 = 0;
+                        unsigned int src_24 = (quotient_54 + (batch_32 * 7 + rank) * sequences) * block_units + remainder_54;
+                        unsigned int dst_25 = quotient_54 * pitch_units + rank * block_units + remainder_54;
+                        out[dst_25] = inp[src_24];
+                    }
+                }
+            }
+        }
         #pragma unroll 1
-        for (unsigned int k = 0; k < total; k++) {
+        for (unsigned int k = 1; k < total; k++) {
             if (out_chunks > k) {
                 if (warp_1 < 15) {
                     if (vector != 0) {
@@ -222,55 +1238,55 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                         unsigned int clamped = ((unit < units) ? unit : last);
                         unsigned int quotient_0 = (unsigned int)((unsigned long long)clamped * (unsigned long long)units_magic >> 32);
                         unsigned int remainder_1 = clamped - quotient_0 * block_units;
-                        unsigned int correction = (unsigned int)(remainder_1 >= block_units);
-                        quotient_0 = quotient_0 + correction;
-                        remainder_1 = remainder_1 - correction * block_units;
+                        unsigned int correction_23 = (unsigned int)(remainder_1 >= block_units);
+                        quotient_0 = quotient_0 + correction_23;
+                        remainder_1 = remainder_1 - correction_23 * block_units;
                         unsigned int quotient_3 = 0;
-                        unsigned int src = (quotient_0 + (quotient_3 * 7 + destination) * sequences) * block_units + remainder_1;
-                        unsigned int dst = quotient_0 * pitch_units + rank * block_units + remainder_1;
+                        unsigned int src_34 = (quotient_0 + (quotient_3 * 7 + destination) * sequences) * block_units + remainder_1;
+                        unsigned int dst_32 = quotient_0 * pitch_units + rank * block_units + remainder_1;
                         unsigned int _vec_load_0[4];
                         {
-                            uint4 _uv4_2 = *reinterpret_cast<const uint4*>(inp_words + (src * 4) + 0);
-                            _vec_load_0[0 + 0] = _uv4_2.x;
-                            _vec_load_0[0 + 1] = _uv4_2.y;
-                            _vec_load_0[0 + 2] = _uv4_2.z;
-                            _vec_load_0[0 + 3] = _uv4_2.w;
+                            uint4 _uv4_71 = *reinterpret_cast<const uint4*>(inp_words + (src_34 * 4) + 0);
+                            _vec_load_0[0 + 0] = _uv4_71.x;
+                            _vec_load_0[0 + 1] = _uv4_71.y;
+                            _vec_load_0[0 + 2] = _uv4_71.z;
+                            _vec_load_0[0 + 3] = _uv4_71.w;
                         }
                         unsigned int unit_6 = stripe + (480 + tid_0);
                         unsigned int clamped_7 = ((unit_6 < units) ? unit_6 : last);
                         unsigned int quotient_8 = (unsigned int)((unsigned long long)clamped_7 * (unsigned long long)units_magic >> 32);
                         unsigned int remainder_9 = clamped_7 - quotient_8 * block_units;
-                        unsigned int correction_10 = (unsigned int)(remainder_9 >= block_units);
-                        quotient_8 = quotient_8 + correction_10;
-                        remainder_9 = remainder_9 - correction_10 * block_units;
+                        unsigned int correction_10_1 = (unsigned int)(remainder_9 >= block_units);
+                        quotient_8 = quotient_8 + correction_10_1;
+                        remainder_9 = remainder_9 - correction_10_1 * block_units;
                         unsigned int quotient_11 = 0;
-                        unsigned int src_14 = (quotient_8 + (quotient_11 * 7 + destination) * sequences) * block_units + remainder_9;
-                        unsigned int dst_15 = quotient_8 * pitch_units + rank * block_units + remainder_9;
+                        unsigned int src_14_1 = (quotient_8 + (quotient_11 * 7 + destination) * sequences) * block_units + remainder_9;
+                        unsigned int dst_15_1 = quotient_8 * pitch_units + rank * block_units + remainder_9;
                         unsigned int _vec_load_1[4];
                         {
-                            uint4 _uv4_3 = *reinterpret_cast<const uint4*>(inp_words + (src_14 * 4) + 0);
-                            _vec_load_1[0 + 0] = _uv4_3.x;
-                            _vec_load_1[0 + 1] = _uv4_3.y;
-                            _vec_load_1[0 + 2] = _uv4_3.z;
-                            _vec_load_1[0 + 3] = _uv4_3.w;
+                            uint4 _uv4_72 = *reinterpret_cast<const uint4*>(inp_words + (src_14_1 * 4) + 0);
+                            _vec_load_1[0 + 0] = _uv4_72.x;
+                            _vec_load_1[0 + 1] = _uv4_72.y;
+                            _vec_load_1[0 + 2] = _uv4_72.z;
+                            _vec_load_1[0 + 3] = _uv4_72.w;
                         }
                         unsigned int unit_16 = stripe + (960 + tid_0);
                         unsigned int clamped_17 = ((unit_16 < units) ? unit_16 : last);
                         unsigned int quotient_18 = (unsigned int)((unsigned long long)clamped_17 * (unsigned long long)units_magic >> 32);
                         unsigned int remainder_19 = clamped_17 - quotient_18 * block_units;
-                        unsigned int correction_20 = (unsigned int)(remainder_19 >= block_units);
-                        quotient_18 = quotient_18 + correction_20;
-                        remainder_19 = remainder_19 - correction_20 * block_units;
+                        unsigned int correction_20_1 = (unsigned int)(remainder_19 >= block_units);
+                        quotient_18 = quotient_18 + correction_20_1;
+                        remainder_19 = remainder_19 - correction_20_1 * block_units;
                         unsigned int quotient_21 = 0;
-                        unsigned int src_24 = (quotient_18 + (quotient_21 * 7 + destination) * sequences) * block_units + remainder_19;
-                        unsigned int dst_25 = quotient_18 * pitch_units + rank * block_units + remainder_19;
+                        unsigned int src_24_1 = (quotient_18 + (quotient_21 * 7 + destination) * sequences) * block_units + remainder_19;
+                        unsigned int dst_25_1 = quotient_18 * pitch_units + rank * block_units + remainder_19;
                         unsigned int _vec_load_2[4];
                         {
-                            uint4 _uv4_4 = *reinterpret_cast<const uint4*>(inp_words + (src_24 * 4) + 0);
-                            _vec_load_2[0 + 0] = _uv4_4.x;
-                            _vec_load_2[0 + 1] = _uv4_4.y;
-                            _vec_load_2[0 + 2] = _uv4_4.z;
-                            _vec_load_2[0 + 3] = _uv4_4.w;
+                            uint4 _uv4_73 = *reinterpret_cast<const uint4*>(inp_words + (src_24_1 * 4) + 0);
+                            _vec_load_2[0 + 0] = _uv4_73.x;
+                            _vec_load_2[0 + 1] = _uv4_73.y;
+                            _vec_load_2[0 + 2] = _uv4_73.z;
+                            _vec_load_2[0 + 3] = _uv4_73.w;
                         }
                         unsigned int unit_26 = stripe + (1440 + tid_0);
                         unsigned int clamped_27 = ((unit_26 < units) ? unit_26 : last);
@@ -280,15 +1296,15 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                         quotient_28 = quotient_28 + correction_30;
                         remainder_29 = remainder_29 - correction_30 * block_units;
                         unsigned int quotient_31 = 0;
-                        unsigned int src_34 = (quotient_28 + (quotient_31 * 7 + destination) * sequences) * block_units + remainder_29;
+                        unsigned int src_34_1 = (quotient_28 + (quotient_31 * 7 + destination) * sequences) * block_units + remainder_29;
                         unsigned int dst_35 = quotient_28 * pitch_units + rank * block_units + remainder_29;
                         unsigned int _vec_load_3[4];
                         {
-                            uint4 _uv4_5 = *reinterpret_cast<const uint4*>(inp_words + (src_34 * 4) + 0);
-                            _vec_load_3[0 + 0] = _uv4_5.x;
-                            _vec_load_3[0 + 1] = _uv4_5.y;
-                            _vec_load_3[0 + 2] = _uv4_5.z;
-                            _vec_load_3[0 + 3] = _uv4_5.w;
+                            uint4 _uv4_74 = *reinterpret_cast<const uint4*>(inp_words + (src_34_1 * 4) + 0);
+                            _vec_load_3[0 + 0] = _uv4_74.x;
+                            _vec_load_3[0 + 1] = _uv4_74.y;
+                            _vec_load_3[0 + 2] = _uv4_74.z;
+                            _vec_load_3[0 + 3] = _uv4_74.w;
                         }
                         unsigned int unit_36 = stripe + (1920 + tid_0);
                         unsigned int clamped_37 = ((unit_36 < units) ? unit_36 : last);
@@ -302,11 +1318,11 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_45 = quotient_38 * pitch_units + rank * block_units + remainder_39;
                         unsigned int _vec_load_4[4];
                         {
-                            uint4 _uv4_6 = *reinterpret_cast<const uint4*>(inp_words + (src_44 * 4) + 0);
-                            _vec_load_4[0 + 0] = _uv4_6.x;
-                            _vec_load_4[0 + 1] = _uv4_6.y;
-                            _vec_load_4[0 + 2] = _uv4_6.z;
-                            _vec_load_4[0 + 3] = _uv4_6.w;
+                            uint4 _uv4_75 = *reinterpret_cast<const uint4*>(inp_words + (src_44 * 4) + 0);
+                            _vec_load_4[0 + 0] = _uv4_75.x;
+                            _vec_load_4[0 + 1] = _uv4_75.y;
+                            _vec_load_4[0 + 2] = _uv4_75.z;
+                            _vec_load_4[0 + 3] = _uv4_75.w;
                         }
                         unsigned int unit_46 = stripe + (2400 + tid_0);
                         unsigned int clamped_47 = ((unit_46 < units) ? unit_46 : last);
@@ -320,11 +1336,11 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_55 = quotient_48 * pitch_units + rank * block_units + remainder_49;
                         unsigned int _vec_load_5[4];
                         {
-                            uint4 _uv4_7 = *reinterpret_cast<const uint4*>(inp_words + (src_54 * 4) + 0);
-                            _vec_load_5[0 + 0] = _uv4_7.x;
-                            _vec_load_5[0 + 1] = _uv4_7.y;
-                            _vec_load_5[0 + 2] = _uv4_7.z;
-                            _vec_load_5[0 + 3] = _uv4_7.w;
+                            uint4 _uv4_76 = *reinterpret_cast<const uint4*>(inp_words + (src_54 * 4) + 0);
+                            _vec_load_5[0 + 0] = _uv4_76.x;
+                            _vec_load_5[0 + 1] = _uv4_76.y;
+                            _vec_load_5[0 + 2] = _uv4_76.z;
+                            _vec_load_5[0 + 3] = _uv4_76.w;
                         }
                         unsigned int unit_56 = stripe + (2880 + tid_0);
                         unsigned int clamped_57 = ((unit_56 < units) ? unit_56 : last);
@@ -338,11 +1354,11 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_65 = quotient_58 * pitch_units + rank * block_units + remainder_59;
                         unsigned int _vec_load_6[4];
                         {
-                            uint4 _uv4_8 = *reinterpret_cast<const uint4*>(inp_words + (src_64 * 4) + 0);
-                            _vec_load_6[0 + 0] = _uv4_8.x;
-                            _vec_load_6[0 + 1] = _uv4_8.y;
-                            _vec_load_6[0 + 2] = _uv4_8.z;
-                            _vec_load_6[0 + 3] = _uv4_8.w;
+                            uint4 _uv4_77 = *reinterpret_cast<const uint4*>(inp_words + (src_64 * 4) + 0);
+                            _vec_load_6[0 + 0] = _uv4_77.x;
+                            _vec_load_6[0 + 1] = _uv4_77.y;
+                            _vec_load_6[0 + 2] = _uv4_77.z;
+                            _vec_load_6[0 + 3] = _uv4_77.w;
                         }
                         unsigned int unit_66 = stripe + (3360 + tid_0);
                         unsigned int clamped_67 = ((unit_66 < units) ? unit_66 : last);
@@ -356,38 +1372,38 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_75 = quotient_68 * pitch_units + rank * block_units + remainder_69;
                         unsigned int _vec_load_7[4];
                         {
-                            uint4 _uv4_9 = *reinterpret_cast<const uint4*>(inp_words + (src_74 * 4) + 0);
-                            _vec_load_7[0 + 0] = _uv4_9.x;
-                            _vec_load_7[0 + 1] = _uv4_9.y;
-                            _vec_load_7[0 + 2] = _uv4_9.z;
-                            _vec_load_7[0 + 3] = _uv4_9.w;
+                            uint4 _uv4_78 = *reinterpret_cast<const uint4*>(inp_words + (src_74 * 4) + 0);
+                            _vec_load_7[0 + 0] = _uv4_78.x;
+                            _vec_load_7[0 + 1] = _uv4_78.y;
+                            _vec_load_7[0 + 2] = _uv4_78.z;
+                            _vec_load_7[0 + 3] = _uv4_78.w;
                         }
                         if (unit < units) {
                             {
-                                auto _gst_10 = peer_words + (dst * 4);
-                                __builtin_assume(__isGlobal(_gst_10));
-                                reinterpret_cast<int4*>(_gst_10)[0] = reinterpret_cast<int4*>(_vec_load_0)[0];
+                                auto _gst_79 = peer_words + (dst_32 * 4);
+                                __builtin_assume(__isGlobal(_gst_79));
+                                reinterpret_cast<int4*>(_gst_79)[0] = reinterpret_cast<int4*>(_vec_load_0)[0];
                             }
                         }
                         if (unit_6 < units) {
                             {
-                                auto _gst_11 = peer_words + (dst_15 * 4);
-                                __builtin_assume(__isGlobal(_gst_11));
-                                reinterpret_cast<int4*>(_gst_11)[0] = reinterpret_cast<int4*>(_vec_load_1)[0];
+                                auto _gst_80 = peer_words + (dst_15_1 * 4);
+                                __builtin_assume(__isGlobal(_gst_80));
+                                reinterpret_cast<int4*>(_gst_80)[0] = reinterpret_cast<int4*>(_vec_load_1)[0];
                             }
                         }
                         if (unit_16 < units) {
                             {
-                                auto _gst_12 = peer_words + (dst_25 * 4);
-                                __builtin_assume(__isGlobal(_gst_12));
-                                reinterpret_cast<int4*>(_gst_12)[0] = reinterpret_cast<int4*>(_vec_load_2)[0];
+                                auto _gst_81 = peer_words + (dst_25_1 * 4);
+                                __builtin_assume(__isGlobal(_gst_81));
+                                reinterpret_cast<int4*>(_gst_81)[0] = reinterpret_cast<int4*>(_vec_load_2)[0];
                             }
                         }
                         if (unit_26 < units) {
                             {
-                                auto _gst_13 = peer_words + (dst_35 * 4);
-                                __builtin_assume(__isGlobal(_gst_13));
-                                reinterpret_cast<int4*>(_gst_13)[0] = reinterpret_cast<int4*>(_vec_load_3)[0];
+                                auto _gst_82 = peer_words + (dst_35 * 4);
+                                __builtin_assume(__isGlobal(_gst_82));
+                                reinterpret_cast<int4*>(_gst_82)[0] = reinterpret_cast<int4*>(_vec_load_3)[0];
                             }
                         }
                         unsigned int unit_76 = stripe + (3840 + tid_0);
@@ -402,11 +1418,11 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_85 = quotient_78 * pitch_units + rank * block_units + remainder_79;
                         unsigned int _vec_load_8[4];
                         {
-                            uint4 _uv4_14 = *reinterpret_cast<const uint4*>(inp_words + (src_84 * 4) + 0);
-                            _vec_load_8[0 + 0] = _uv4_14.x;
-                            _vec_load_8[0 + 1] = _uv4_14.y;
-                            _vec_load_8[0 + 2] = _uv4_14.z;
-                            _vec_load_8[0 + 3] = _uv4_14.w;
+                            uint4 _uv4_83 = *reinterpret_cast<const uint4*>(inp_words + (src_84 * 4) + 0);
+                            _vec_load_8[0 + 0] = _uv4_83.x;
+                            _vec_load_8[0 + 1] = _uv4_83.y;
+                            _vec_load_8[0 + 2] = _uv4_83.z;
+                            _vec_load_8[0 + 3] = _uv4_83.w;
                         }
                         unsigned int unit_86 = stripe + (4320 + tid_0);
                         unsigned int clamped_87 = ((unit_86 < units) ? unit_86 : last);
@@ -420,11 +1436,11 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_95 = quotient_88 * pitch_units + rank * block_units + remainder_89;
                         unsigned int _vec_load_9[4];
                         {
-                            uint4 _uv4_15 = *reinterpret_cast<const uint4*>(inp_words + (src_94 * 4) + 0);
-                            _vec_load_9[0 + 0] = _uv4_15.x;
-                            _vec_load_9[0 + 1] = _uv4_15.y;
-                            _vec_load_9[0 + 2] = _uv4_15.z;
-                            _vec_load_9[0 + 3] = _uv4_15.w;
+                            uint4 _uv4_84 = *reinterpret_cast<const uint4*>(inp_words + (src_94 * 4) + 0);
+                            _vec_load_9[0 + 0] = _uv4_84.x;
+                            _vec_load_9[0 + 1] = _uv4_84.y;
+                            _vec_load_9[0 + 2] = _uv4_84.z;
+                            _vec_load_9[0 + 3] = _uv4_84.w;
                         }
                         unsigned int unit_96 = stripe + (4800 + tid_0);
                         unsigned int clamped_97 = ((unit_96 < units) ? unit_96 : last);
@@ -438,11 +1454,11 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_105 = quotient_98 * pitch_units + rank * block_units + remainder_99;
                         unsigned int _vec_load_10[4];
                         {
-                            uint4 _uv4_16 = *reinterpret_cast<const uint4*>(inp_words + (src_104 * 4) + 0);
-                            _vec_load_10[0 + 0] = _uv4_16.x;
-                            _vec_load_10[0 + 1] = _uv4_16.y;
-                            _vec_load_10[0 + 2] = _uv4_16.z;
-                            _vec_load_10[0 + 3] = _uv4_16.w;
+                            uint4 _uv4_85 = *reinterpret_cast<const uint4*>(inp_words + (src_104 * 4) + 0);
+                            _vec_load_10[0 + 0] = _uv4_85.x;
+                            _vec_load_10[0 + 1] = _uv4_85.y;
+                            _vec_load_10[0 + 2] = _uv4_85.z;
+                            _vec_load_10[0 + 3] = _uv4_85.w;
                         }
                         unsigned int unit_106 = stripe + (5280 + tid_0);
                         unsigned int clamped_107 = ((unit_106 < units) ? unit_106 : last);
@@ -456,38 +1472,38 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_115 = quotient_108 * pitch_units + rank * block_units + remainder_109;
                         unsigned int _vec_load_11[4];
                         {
-                            uint4 _uv4_17 = *reinterpret_cast<const uint4*>(inp_words + (src_114 * 4) + 0);
-                            _vec_load_11[0 + 0] = _uv4_17.x;
-                            _vec_load_11[0 + 1] = _uv4_17.y;
-                            _vec_load_11[0 + 2] = _uv4_17.z;
-                            _vec_load_11[0 + 3] = _uv4_17.w;
+                            uint4 _uv4_86 = *reinterpret_cast<const uint4*>(inp_words + (src_114 * 4) + 0);
+                            _vec_load_11[0 + 0] = _uv4_86.x;
+                            _vec_load_11[0 + 1] = _uv4_86.y;
+                            _vec_load_11[0 + 2] = _uv4_86.z;
+                            _vec_load_11[0 + 3] = _uv4_86.w;
                         }
                         if (unit_36 < units) {
                             {
-                                auto _gst_18 = peer_words + (dst_45 * 4);
-                                __builtin_assume(__isGlobal(_gst_18));
-                                reinterpret_cast<int4*>(_gst_18)[0] = reinterpret_cast<int4*>(_vec_load_4)[0];
+                                auto _gst_87 = peer_words + (dst_45 * 4);
+                                __builtin_assume(__isGlobal(_gst_87));
+                                reinterpret_cast<int4*>(_gst_87)[0] = reinterpret_cast<int4*>(_vec_load_4)[0];
                             }
                         }
                         if (unit_46 < units) {
                             {
-                                auto _gst_19 = peer_words + (dst_55 * 4);
-                                __builtin_assume(__isGlobal(_gst_19));
-                                reinterpret_cast<int4*>(_gst_19)[0] = reinterpret_cast<int4*>(_vec_load_5)[0];
+                                auto _gst_88 = peer_words + (dst_55 * 4);
+                                __builtin_assume(__isGlobal(_gst_88));
+                                reinterpret_cast<int4*>(_gst_88)[0] = reinterpret_cast<int4*>(_vec_load_5)[0];
                             }
                         }
                         if (unit_56 < units) {
                             {
-                                auto _gst_20 = peer_words + (dst_65 * 4);
-                                __builtin_assume(__isGlobal(_gst_20));
-                                reinterpret_cast<int4*>(_gst_20)[0] = reinterpret_cast<int4*>(_vec_load_6)[0];
+                                auto _gst_89 = peer_words + (dst_65 * 4);
+                                __builtin_assume(__isGlobal(_gst_89));
+                                reinterpret_cast<int4*>(_gst_89)[0] = reinterpret_cast<int4*>(_vec_load_6)[0];
                             }
                         }
                         if (unit_66 < units) {
                             {
-                                auto _gst_21 = peer_words + (dst_75 * 4);
-                                __builtin_assume(__isGlobal(_gst_21));
-                                reinterpret_cast<int4*>(_gst_21)[0] = reinterpret_cast<int4*>(_vec_load_7)[0];
+                                auto _gst_90 = peer_words + (dst_75 * 4);
+                                __builtin_assume(__isGlobal(_gst_90));
+                                reinterpret_cast<int4*>(_gst_90)[0] = reinterpret_cast<int4*>(_vec_load_7)[0];
                             }
                         }
                         unsigned int unit_116 = stripe + (5760 + tid_0);
@@ -502,11 +1518,11 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_125 = quotient_118 * pitch_units + rank * block_units + remainder_119;
                         unsigned int _vec_load_12[4];
                         {
-                            uint4 _uv4_22 = *reinterpret_cast<const uint4*>(inp_words + (src_124 * 4) + 0);
-                            _vec_load_12[0 + 0] = _uv4_22.x;
-                            _vec_load_12[0 + 1] = _uv4_22.y;
-                            _vec_load_12[0 + 2] = _uv4_22.z;
-                            _vec_load_12[0 + 3] = _uv4_22.w;
+                            uint4 _uv4_91 = *reinterpret_cast<const uint4*>(inp_words + (src_124 * 4) + 0);
+                            _vec_load_12[0 + 0] = _uv4_91.x;
+                            _vec_load_12[0 + 1] = _uv4_91.y;
+                            _vec_load_12[0 + 2] = _uv4_91.z;
+                            _vec_load_12[0 + 3] = _uv4_91.w;
                         }
                         unsigned int unit_126 = stripe + (6240 + tid_0);
                         unsigned int clamped_127 = ((unit_126 < units) ? unit_126 : last);
@@ -520,11 +1536,11 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_135 = quotient_128 * pitch_units + rank * block_units + remainder_129;
                         unsigned int _vec_load_13[4];
                         {
-                            uint4 _uv4_23 = *reinterpret_cast<const uint4*>(inp_words + (src_134 * 4) + 0);
-                            _vec_load_13[0 + 0] = _uv4_23.x;
-                            _vec_load_13[0 + 1] = _uv4_23.y;
-                            _vec_load_13[0 + 2] = _uv4_23.z;
-                            _vec_load_13[0 + 3] = _uv4_23.w;
+                            uint4 _uv4_92 = *reinterpret_cast<const uint4*>(inp_words + (src_134 * 4) + 0);
+                            _vec_load_13[0 + 0] = _uv4_92.x;
+                            _vec_load_13[0 + 1] = _uv4_92.y;
+                            _vec_load_13[0 + 2] = _uv4_92.z;
+                            _vec_load_13[0 + 3] = _uv4_92.w;
                         }
                         unsigned int unit_136 = stripe + (6720 + tid_0);
                         unsigned int clamped_137 = ((unit_136 < units) ? unit_136 : last);
@@ -538,11 +1554,11 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_145 = quotient_138 * pitch_units + rank * block_units + remainder_139;
                         unsigned int _vec_load_14[4];
                         {
-                            uint4 _uv4_24 = *reinterpret_cast<const uint4*>(inp_words + (src_144 * 4) + 0);
-                            _vec_load_14[0 + 0] = _uv4_24.x;
-                            _vec_load_14[0 + 1] = _uv4_24.y;
-                            _vec_load_14[0 + 2] = _uv4_24.z;
-                            _vec_load_14[0 + 3] = _uv4_24.w;
+                            uint4 _uv4_93 = *reinterpret_cast<const uint4*>(inp_words + (src_144 * 4) + 0);
+                            _vec_load_14[0 + 0] = _uv4_93.x;
+                            _vec_load_14[0 + 1] = _uv4_93.y;
+                            _vec_load_14[0 + 2] = _uv4_93.z;
+                            _vec_load_14[0 + 3] = _uv4_93.w;
                         }
                         unsigned int unit_146 = stripe + (7200 + tid_0);
                         unsigned int clamped_147 = ((unit_146 < units) ? unit_146 : last);
@@ -556,188 +1572,188 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_155 = quotient_148 * pitch_units + rank * block_units + remainder_149;
                         unsigned int _vec_load_15[4];
                         {
-                            uint4 _uv4_25 = *reinterpret_cast<const uint4*>(inp_words + (src_154 * 4) + 0);
-                            _vec_load_15[0 + 0] = _uv4_25.x;
-                            _vec_load_15[0 + 1] = _uv4_25.y;
-                            _vec_load_15[0 + 2] = _uv4_25.z;
-                            _vec_load_15[0 + 3] = _uv4_25.w;
+                            uint4 _uv4_94 = *reinterpret_cast<const uint4*>(inp_words + (src_154 * 4) + 0);
+                            _vec_load_15[0 + 0] = _uv4_94.x;
+                            _vec_load_15[0 + 1] = _uv4_94.y;
+                            _vec_load_15[0 + 2] = _uv4_94.z;
+                            _vec_load_15[0 + 3] = _uv4_94.w;
                         }
                         if (unit_76 < units) {
                             {
-                                auto _gst_26 = peer_words + (dst_85 * 4);
-                                __builtin_assume(__isGlobal(_gst_26));
-                                reinterpret_cast<int4*>(_gst_26)[0] = reinterpret_cast<int4*>(_vec_load_8)[0];
+                                auto _gst_95 = peer_words + (dst_85 * 4);
+                                __builtin_assume(__isGlobal(_gst_95));
+                                reinterpret_cast<int4*>(_gst_95)[0] = reinterpret_cast<int4*>(_vec_load_8)[0];
                             }
                         }
                         if (unit_86 < units) {
                             {
-                                auto _gst_27 = peer_words + (dst_95 * 4);
-                                __builtin_assume(__isGlobal(_gst_27));
-                                reinterpret_cast<int4*>(_gst_27)[0] = reinterpret_cast<int4*>(_vec_load_9)[0];
+                                auto _gst_96 = peer_words + (dst_95 * 4);
+                                __builtin_assume(__isGlobal(_gst_96));
+                                reinterpret_cast<int4*>(_gst_96)[0] = reinterpret_cast<int4*>(_vec_load_9)[0];
                             }
                         }
                         if (unit_96 < units) {
                             {
-                                auto _gst_28 = peer_words + (dst_105 * 4);
-                                __builtin_assume(__isGlobal(_gst_28));
-                                reinterpret_cast<int4*>(_gst_28)[0] = reinterpret_cast<int4*>(_vec_load_10)[0];
+                                auto _gst_97 = peer_words + (dst_105 * 4);
+                                __builtin_assume(__isGlobal(_gst_97));
+                                reinterpret_cast<int4*>(_gst_97)[0] = reinterpret_cast<int4*>(_vec_load_10)[0];
                             }
                         }
                         if (unit_106 < units) {
                             {
-                                auto _gst_29 = peer_words + (dst_115 * 4);
-                                __builtin_assume(__isGlobal(_gst_29));
-                                reinterpret_cast<int4*>(_gst_29)[0] = reinterpret_cast<int4*>(_vec_load_11)[0];
+                                auto _gst_98 = peer_words + (dst_115 * 4);
+                                __builtin_assume(__isGlobal(_gst_98));
+                                reinterpret_cast<int4*>(_gst_98)[0] = reinterpret_cast<int4*>(_vec_load_11)[0];
                             }
                         }
                         if (unit_116 < units) {
                             {
-                                auto _gst_30 = peer_words + (dst_125 * 4);
-                                __builtin_assume(__isGlobal(_gst_30));
-                                reinterpret_cast<int4*>(_gst_30)[0] = reinterpret_cast<int4*>(_vec_load_12)[0];
+                                auto _gst_99 = peer_words + (dst_125 * 4);
+                                __builtin_assume(__isGlobal(_gst_99));
+                                reinterpret_cast<int4*>(_gst_99)[0] = reinterpret_cast<int4*>(_vec_load_12)[0];
                             }
                         }
                         if (unit_126 < units) {
                             {
-                                auto _gst_31 = peer_words + (dst_135 * 4);
-                                __builtin_assume(__isGlobal(_gst_31));
-                                reinterpret_cast<int4*>(_gst_31)[0] = reinterpret_cast<int4*>(_vec_load_13)[0];
+                                auto _gst_100 = peer_words + (dst_135 * 4);
+                                __builtin_assume(__isGlobal(_gst_100));
+                                reinterpret_cast<int4*>(_gst_100)[0] = reinterpret_cast<int4*>(_vec_load_13)[0];
                             }
                         }
                         if (unit_136 < units) {
                             {
-                                auto _gst_32 = peer_words + (dst_145 * 4);
-                                __builtin_assume(__isGlobal(_gst_32));
-                                reinterpret_cast<int4*>(_gst_32)[0] = reinterpret_cast<int4*>(_vec_load_14)[0];
+                                auto _gst_101 = peer_words + (dst_145 * 4);
+                                __builtin_assume(__isGlobal(_gst_101));
+                                reinterpret_cast<int4*>(_gst_101)[0] = reinterpret_cast<int4*>(_vec_load_14)[0];
                             }
                         }
                         if (unit_146 < units) {
                             {
-                                auto _gst_33 = peer_words + (dst_155 * 4);
-                                __builtin_assume(__isGlobal(_gst_33));
-                                reinterpret_cast<int4*>(_gst_33)[0] = reinterpret_cast<int4*>(_vec_load_15)[0];
+                                auto _gst_102 = peer_words + (dst_155 * 4);
+                                __builtin_assume(__isGlobal(_gst_102));
+                                reinterpret_cast<int4*>(_gst_102)[0] = reinterpret_cast<int4*>(_vec_load_15)[0];
                             }
                         }
                     } else {
-                        unsigned int tail_lo = lo + (out_chunks - 2) * 7680;
-                        unsigned int split = hi - (hi - tail_lo >> 2);
-                        unsigned int clo = lo + k * 7680;
-                        unsigned int chi = clo + 7680;
+                        unsigned int tail_lo_2 = lo + (out_chunks - 2) * 7680;
+                        unsigned int split_2 = hi - (hi - tail_lo_2 >> 2);
+                        unsigned int clo_2 = lo + k * 7680;
+                        unsigned int chi_2 = clo_2 + 7680;
                         if (k == out_chunks - 2) {
-                            clo = tail_lo;
-                            chi = split;
+                            clo_2 = tail_lo_2;
+                            chi_2 = split_2;
                         }
                         if (k == out_chunks - 1) {
-                            clo = split;
-                            chi = hi;
+                            clo_2 = split_2;
+                            chi_2 = hi;
                         }
                         #pragma unroll 1
-                        for (unsigned int u = clo + tid_0; u < chi; u += 480) {
-                            unsigned int quotient_0_1 = (unsigned int)((unsigned long long)u * (unsigned long long)units_magic >> 32);
-                            unsigned int remainder_1_1 = u - quotient_0_1 * block_units;
-                            unsigned int correction_1 = (unsigned int)(remainder_1_1 >= block_units);
-                            quotient_0_1 = quotient_0_1 + correction_1;
-                            remainder_1_1 = remainder_1_1 - correction_1 * block_units;
+                        for (unsigned int u_2 = clo_2 + tid_0; u_2 < chi_2; u_2 += 480) {
+                            unsigned int quotient_0_1 = (unsigned int)((unsigned long long)u_2 * (unsigned long long)units_magic >> 32);
+                            unsigned int remainder_1_1 = u_2 - quotient_0_1 * block_units;
+                            unsigned int correction_33 = (unsigned int)(remainder_1_1 >= block_units);
+                            quotient_0_1 = quotient_0_1 + correction_33;
+                            remainder_1_1 = remainder_1_1 - correction_33 * block_units;
                             unsigned int quotient_3_1 = 0;
-                            unsigned int src_1 = (quotient_0_1 + (quotient_3_1 * 7 + destination) * sequences) * block_units + remainder_1_1;
-                            unsigned int dst_1 = quotient_0_1 * pitch_units + rank * block_units + remainder_1_1;
-                            peer_elements[dst_1] = inp[src_1];
+                            unsigned int src_35 = (quotient_0_1 + (quotient_3_1 * 7 + destination) * sequences) * block_units + remainder_1_1;
+                            unsigned int dst_33 = quotient_0_1 * pitch_units + rank * block_units + remainder_1_1;
+                            peer_elements[dst_33] = inp[src_35];
                         }
                     }
                 }
             }
             if (count_6 > k) {
                 if (warp_1 < 15) {
-                    unsigned int tail_lo_1 = lo_4 + (count_6 - 2) * 7680;
-                    unsigned int split_1 = hi_5 - (hi_5 - tail_lo_1 >> 2);
-                    unsigned int clo_1 = lo_4 + k * 7680;
-                    unsigned int chi_1 = clo_1 + 7680;
+                    unsigned int tail_lo_3 = lo_4 + (count_6 - 2) * 7680;
+                    unsigned int split_3 = hi_5 - (hi_5 - tail_lo_3 >> 2);
+                    unsigned int clo_3 = lo_4 + k * 7680;
+                    unsigned int chi_3 = clo_3 + 7680;
                     if (k == count_6 - 2) {
-                        clo_1 = tail_lo_1;
-                        chi_1 = split_1;
+                        clo_3 = tail_lo_3;
+                        chi_3 = split_3;
                     }
                     if (k == count_6 - 1) {
-                        clo_1 = split_1;
-                        chi_1 = hi_5;
+                        clo_3 = split_3;
+                        chi_3 = hi_5;
                     }
                     if (vector != 0) {
-                        unsigned int last_1 = chi_1 - 1;
+                        unsigned int last_1 = chi_3 - 1;
                         #pragma unroll 1
-                        for (unsigned int base = clo_1 + tid_0; base < chi_1; base += 7680) {
-                            unsigned int unit_1 = base;
-                            unsigned int clamped_1 = ((unit_1 < chi_1) ? unit_1 : last_1);
-                            unsigned int quotient_0_2 = (unsigned int)((unsigned long long)clamped_1 * (unsigned long long)units_magic >> 32);
-                            unsigned int remainder_1_2 = clamped_1 - quotient_0_2 * block_units;
-                            unsigned int correction_2 = (unsigned int)(remainder_1_2 >= block_units);
-                            quotient_0_2 = quotient_0_2 + correction_2;
-                            remainder_1_2 = remainder_1_2 - correction_2 * block_units;
+                        for (unsigned int base_1 = clo_3 + tid_0; base_1 < chi_3; base_1 += 7680) {
+                            unsigned int unit_44 = base_1;
+                            unsigned int clamped_44 = ((unit_44 < chi_3) ? unit_44 : last_1);
+                            unsigned int quotient_0_2 = (unsigned int)((unsigned long long)clamped_44 * (unsigned long long)units_magic >> 32);
+                            unsigned int remainder_1_2 = clamped_44 - quotient_0_2 * block_units;
+                            unsigned int correction_43 = (unsigned int)(remainder_1_2 >= block_units);
+                            quotient_0_2 = quotient_0_2 + correction_43;
+                            remainder_1_2 = remainder_1_2 - correction_43 * block_units;
                             unsigned int quotient_3_2 = 0;
-                            unsigned int src_2 = (quotient_0_2 + (quotient_3_2 * 7 + rank) * sequences) * block_units + remainder_1_2;
-                            unsigned int dst_2 = quotient_0_2 * pitch_units + rank * block_units + remainder_1_2;
+                            unsigned int src_36 = (quotient_0_2 + (quotient_3_2 * 7 + rank) * sequences) * block_units + remainder_1_2;
+                            unsigned int dst_34 = quotient_0_2 * pitch_units + rank * block_units + remainder_1_2;
                             unsigned int _vec_load_16[4];
                             {
-                                uint4 _uv4_34 = *reinterpret_cast<const uint4*>(inp_words + (src_2 * 4) + 0);
-                                _vec_load_16[0 + 0] = _uv4_34.x;
-                                _vec_load_16[0 + 1] = _uv4_34.y;
-                                _vec_load_16[0 + 2] = _uv4_34.z;
-                                _vec_load_16[0 + 3] = _uv4_34.w;
+                                uint4 _uv4_103 = *reinterpret_cast<const uint4*>(inp_words + (src_36 * 4) + 0);
+                                _vec_load_16[0 + 0] = _uv4_103.x;
+                                _vec_load_16[0 + 1] = _uv4_103.y;
+                                _vec_load_16[0 + 2] = _uv4_103.z;
+                                _vec_load_16[0 + 3] = _uv4_103.w;
                             }
-                            unsigned int unit_6_1 = base + 480;
-                            unsigned int clamped_7_1 = ((unit_6_1 < chi_1) ? unit_6_1 : last_1);
+                            unsigned int unit_6_1 = base_1 + 480;
+                            unsigned int clamped_7_1 = ((unit_6_1 < chi_3) ? unit_6_1 : last_1);
                             unsigned int quotient_8_1 = (unsigned int)((unsigned long long)clamped_7_1 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_9_1 = clamped_7_1 - quotient_8_1 * block_units;
-                            unsigned int correction_10_1 = (unsigned int)(remainder_9_1 >= block_units);
-                            quotient_8_1 = quotient_8_1 + correction_10_1;
-                            remainder_9_1 = remainder_9_1 - correction_10_1 * block_units;
+                            unsigned int correction_10_2 = (unsigned int)(remainder_9_1 >= block_units);
+                            quotient_8_1 = quotient_8_1 + correction_10_2;
+                            remainder_9_1 = remainder_9_1 - correction_10_2 * block_units;
                             unsigned int quotient_11_1 = 0;
-                            unsigned int src_14_1 = (quotient_8_1 + (quotient_11_1 * 7 + rank) * sequences) * block_units + remainder_9_1;
-                            unsigned int dst_15_1 = quotient_8_1 * pitch_units + rank * block_units + remainder_9_1;
+                            unsigned int src_14_2 = (quotient_8_1 + (quotient_11_1 * 7 + rank) * sequences) * block_units + remainder_9_1;
+                            unsigned int dst_15_2 = quotient_8_1 * pitch_units + rank * block_units + remainder_9_1;
                             unsigned int _vec_load_17[4];
                             {
-                                uint4 _uv4_35 = *reinterpret_cast<const uint4*>(inp_words + (src_14_1 * 4) + 0);
-                                _vec_load_17[0 + 0] = _uv4_35.x;
-                                _vec_load_17[0 + 1] = _uv4_35.y;
-                                _vec_load_17[0 + 2] = _uv4_35.z;
-                                _vec_load_17[0 + 3] = _uv4_35.w;
+                                uint4 _uv4_104 = *reinterpret_cast<const uint4*>(inp_words + (src_14_2 * 4) + 0);
+                                _vec_load_17[0 + 0] = _uv4_104.x;
+                                _vec_load_17[0 + 1] = _uv4_104.y;
+                                _vec_load_17[0 + 2] = _uv4_104.z;
+                                _vec_load_17[0 + 3] = _uv4_104.w;
                             }
-                            unsigned int unit_16_1 = base + 960;
-                            unsigned int clamped_17_1 = ((unit_16_1 < chi_1) ? unit_16_1 : last_1);
+                            unsigned int unit_16_1 = base_1 + 960;
+                            unsigned int clamped_17_1 = ((unit_16_1 < chi_3) ? unit_16_1 : last_1);
                             unsigned int quotient_18_1 = (unsigned int)((unsigned long long)clamped_17_1 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_19_1 = clamped_17_1 - quotient_18_1 * block_units;
-                            unsigned int correction_20_1 = (unsigned int)(remainder_19_1 >= block_units);
-                            quotient_18_1 = quotient_18_1 + correction_20_1;
-                            remainder_19_1 = remainder_19_1 - correction_20_1 * block_units;
+                            unsigned int correction_20_2 = (unsigned int)(remainder_19_1 >= block_units);
+                            quotient_18_1 = quotient_18_1 + correction_20_2;
+                            remainder_19_1 = remainder_19_1 - correction_20_2 * block_units;
                             unsigned int quotient_21_1 = 0;
-                            unsigned int src_24_1 = (quotient_18_1 + (quotient_21_1 * 7 + rank) * sequences) * block_units + remainder_19_1;
-                            unsigned int dst_25_1 = quotient_18_1 * pitch_units + rank * block_units + remainder_19_1;
+                            unsigned int src_24_2 = (quotient_18_1 + (quotient_21_1 * 7 + rank) * sequences) * block_units + remainder_19_1;
+                            unsigned int dst_25_2 = quotient_18_1 * pitch_units + rank * block_units + remainder_19_1;
                             unsigned int _vec_load_18[4];
                             {
-                                uint4 _uv4_36 = *reinterpret_cast<const uint4*>(inp_words + (src_24_1 * 4) + 0);
-                                _vec_load_18[0 + 0] = _uv4_36.x;
-                                _vec_load_18[0 + 1] = _uv4_36.y;
-                                _vec_load_18[0 + 2] = _uv4_36.z;
-                                _vec_load_18[0 + 3] = _uv4_36.w;
+                                uint4 _uv4_105 = *reinterpret_cast<const uint4*>(inp_words + (src_24_2 * 4) + 0);
+                                _vec_load_18[0 + 0] = _uv4_105.x;
+                                _vec_load_18[0 + 1] = _uv4_105.y;
+                                _vec_load_18[0 + 2] = _uv4_105.z;
+                                _vec_load_18[0 + 3] = _uv4_105.w;
                             }
-                            unsigned int unit_26_1 = base + 1440;
-                            unsigned int clamped_27_1 = ((unit_26_1 < chi_1) ? unit_26_1 : last_1);
+                            unsigned int unit_26_1 = base_1 + 1440;
+                            unsigned int clamped_27_1 = ((unit_26_1 < chi_3) ? unit_26_1 : last_1);
                             unsigned int quotient_28_1 = (unsigned int)((unsigned long long)clamped_27_1 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_29_1 = clamped_27_1 - quotient_28_1 * block_units;
                             unsigned int correction_30_1 = (unsigned int)(remainder_29_1 >= block_units);
                             quotient_28_1 = quotient_28_1 + correction_30_1;
                             remainder_29_1 = remainder_29_1 - correction_30_1 * block_units;
                             unsigned int quotient_31_1 = 0;
-                            unsigned int src_34_1 = (quotient_28_1 + (quotient_31_1 * 7 + rank) * sequences) * block_units + remainder_29_1;
+                            unsigned int src_34_2 = (quotient_28_1 + (quotient_31_1 * 7 + rank) * sequences) * block_units + remainder_29_1;
                             unsigned int dst_35_1 = quotient_28_1 * pitch_units + rank * block_units + remainder_29_1;
                             unsigned int _vec_load_19[4];
                             {
-                                uint4 _uv4_37 = *reinterpret_cast<const uint4*>(inp_words + (src_34_1 * 4) + 0);
-                                _vec_load_19[0 + 0] = _uv4_37.x;
-                                _vec_load_19[0 + 1] = _uv4_37.y;
-                                _vec_load_19[0 + 2] = _uv4_37.z;
-                                _vec_load_19[0 + 3] = _uv4_37.w;
+                                uint4 _uv4_106 = *reinterpret_cast<const uint4*>(inp_words + (src_34_2 * 4) + 0);
+                                _vec_load_19[0 + 0] = _uv4_106.x;
+                                _vec_load_19[0 + 1] = _uv4_106.y;
+                                _vec_load_19[0 + 2] = _uv4_106.z;
+                                _vec_load_19[0 + 3] = _uv4_106.w;
                             }
-                            unsigned int unit_36_1 = base + 1920;
-                            unsigned int clamped_37_1 = ((unit_36_1 < chi_1) ? unit_36_1 : last_1);
+                            unsigned int unit_36_1 = base_1 + 1920;
+                            unsigned int clamped_37_1 = ((unit_36_1 < chi_3) ? unit_36_1 : last_1);
                             unsigned int quotient_38_1 = (unsigned int)((unsigned long long)clamped_37_1 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_39_1 = clamped_37_1 - quotient_38_1 * block_units;
                             unsigned int correction_40_1 = (unsigned int)(remainder_39_1 >= block_units);
@@ -748,14 +1764,14 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_45_1 = quotient_38_1 * pitch_units + rank * block_units + remainder_39_1;
                             unsigned int _vec_load_20[4];
                             {
-                                uint4 _uv4_38 = *reinterpret_cast<const uint4*>(inp_words + (src_44_1 * 4) + 0);
-                                _vec_load_20[0 + 0] = _uv4_38.x;
-                                _vec_load_20[0 + 1] = _uv4_38.y;
-                                _vec_load_20[0 + 2] = _uv4_38.z;
-                                _vec_load_20[0 + 3] = _uv4_38.w;
+                                uint4 _uv4_107 = *reinterpret_cast<const uint4*>(inp_words + (src_44_1 * 4) + 0);
+                                _vec_load_20[0 + 0] = _uv4_107.x;
+                                _vec_load_20[0 + 1] = _uv4_107.y;
+                                _vec_load_20[0 + 2] = _uv4_107.z;
+                                _vec_load_20[0 + 3] = _uv4_107.w;
                             }
-                            unsigned int unit_46_1 = base + 1920 + 480;
-                            unsigned int clamped_47_1 = ((unit_46_1 < chi_1) ? unit_46_1 : last_1);
+                            unsigned int unit_46_1 = base_1 + 1920 + 480;
+                            unsigned int clamped_47_1 = ((unit_46_1 < chi_3) ? unit_46_1 : last_1);
                             unsigned int quotient_48_1 = (unsigned int)((unsigned long long)clamped_47_1 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_49_1 = clamped_47_1 - quotient_48_1 * block_units;
                             unsigned int correction_50_1 = (unsigned int)(remainder_49_1 >= block_units);
@@ -766,14 +1782,14 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_55_1 = quotient_48_1 * pitch_units + rank * block_units + remainder_49_1;
                             unsigned int _vec_load_21[4];
                             {
-                                uint4 _uv4_39 = *reinterpret_cast<const uint4*>(inp_words + (src_54_1 * 4) + 0);
-                                _vec_load_21[0 + 0] = _uv4_39.x;
-                                _vec_load_21[0 + 1] = _uv4_39.y;
-                                _vec_load_21[0 + 2] = _uv4_39.z;
-                                _vec_load_21[0 + 3] = _uv4_39.w;
+                                uint4 _uv4_108 = *reinterpret_cast<const uint4*>(inp_words + (src_54_1 * 4) + 0);
+                                _vec_load_21[0 + 0] = _uv4_108.x;
+                                _vec_load_21[0 + 1] = _uv4_108.y;
+                                _vec_load_21[0 + 2] = _uv4_108.z;
+                                _vec_load_21[0 + 3] = _uv4_108.w;
                             }
-                            unsigned int unit_56_1 = base + 1920 + 960;
-                            unsigned int clamped_57_1 = ((unit_56_1 < chi_1) ? unit_56_1 : last_1);
+                            unsigned int unit_56_1 = base_1 + 1920 + 960;
+                            unsigned int clamped_57_1 = ((unit_56_1 < chi_3) ? unit_56_1 : last_1);
                             unsigned int quotient_58_1 = (unsigned int)((unsigned long long)clamped_57_1 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_59_1 = clamped_57_1 - quotient_58_1 * block_units;
                             unsigned int correction_60_1 = (unsigned int)(remainder_59_1 >= block_units);
@@ -784,14 +1800,14 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_65_1 = quotient_58_1 * pitch_units + rank * block_units + remainder_59_1;
                             unsigned int _vec_load_22[4];
                             {
-                                uint4 _uv4_40 = *reinterpret_cast<const uint4*>(inp_words + (src_64_1 * 4) + 0);
-                                _vec_load_22[0 + 0] = _uv4_40.x;
-                                _vec_load_22[0 + 1] = _uv4_40.y;
-                                _vec_load_22[0 + 2] = _uv4_40.z;
-                                _vec_load_22[0 + 3] = _uv4_40.w;
+                                uint4 _uv4_109 = *reinterpret_cast<const uint4*>(inp_words + (src_64_1 * 4) + 0);
+                                _vec_load_22[0 + 0] = _uv4_109.x;
+                                _vec_load_22[0 + 1] = _uv4_109.y;
+                                _vec_load_22[0 + 2] = _uv4_109.z;
+                                _vec_load_22[0 + 3] = _uv4_109.w;
                             }
-                            unsigned int unit_66_1 = base + 1920 + 1440;
-                            unsigned int clamped_67_1 = ((unit_66_1 < chi_1) ? unit_66_1 : last_1);
+                            unsigned int unit_66_1 = base_1 + 1920 + 1440;
+                            unsigned int clamped_67_1 = ((unit_66_1 < chi_3) ? unit_66_1 : last_1);
                             unsigned int quotient_68_1 = (unsigned int)((unsigned long long)clamped_67_1 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_69_1 = clamped_67_1 - quotient_68_1 * block_units;
                             unsigned int correction_70_1 = (unsigned int)(remainder_69_1 >= block_units);
@@ -802,42 +1818,42 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_75_1 = quotient_68_1 * pitch_units + rank * block_units + remainder_69_1;
                             unsigned int _vec_load_23[4];
                             {
-                                uint4 _uv4_41 = *reinterpret_cast<const uint4*>(inp_words + (src_74_1 * 4) + 0);
-                                _vec_load_23[0 + 0] = _uv4_41.x;
-                                _vec_load_23[0 + 1] = _uv4_41.y;
-                                _vec_load_23[0 + 2] = _uv4_41.z;
-                                _vec_load_23[0 + 3] = _uv4_41.w;
+                                uint4 _uv4_110 = *reinterpret_cast<const uint4*>(inp_words + (src_74_1 * 4) + 0);
+                                _vec_load_23[0 + 0] = _uv4_110.x;
+                                _vec_load_23[0 + 1] = _uv4_110.y;
+                                _vec_load_23[0 + 2] = _uv4_110.z;
+                                _vec_load_23[0 + 3] = _uv4_110.w;
                             }
-                            if (unit_1 < chi_1) {
+                            if (unit_44 < chi_3) {
                                 {
-                                    auto _gst_42 = out_words + (dst_2 * 4);
-                                    __builtin_assume(__isGlobal(_gst_42));
-                                    reinterpret_cast<int4*>(_gst_42)[0] = reinterpret_cast<int4*>(_vec_load_16)[0];
+                                    auto _gst_111 = out_words + (dst_34 * 4);
+                                    __builtin_assume(__isGlobal(_gst_111));
+                                    reinterpret_cast<int4*>(_gst_111)[0] = reinterpret_cast<int4*>(_vec_load_16)[0];
                                 }
                             }
-                            if (unit_6_1 < chi_1) {
+                            if (unit_6_1 < chi_3) {
                                 {
-                                    auto _gst_43 = out_words + (dst_15_1 * 4);
-                                    __builtin_assume(__isGlobal(_gst_43));
-                                    reinterpret_cast<int4*>(_gst_43)[0] = reinterpret_cast<int4*>(_vec_load_17)[0];
+                                    auto _gst_112 = out_words + (dst_15_2 * 4);
+                                    __builtin_assume(__isGlobal(_gst_112));
+                                    reinterpret_cast<int4*>(_gst_112)[0] = reinterpret_cast<int4*>(_vec_load_17)[0];
                                 }
                             }
-                            if (unit_16_1 < chi_1) {
+                            if (unit_16_1 < chi_3) {
                                 {
-                                    auto _gst_44 = out_words + (dst_25_1 * 4);
-                                    __builtin_assume(__isGlobal(_gst_44));
-                                    reinterpret_cast<int4*>(_gst_44)[0] = reinterpret_cast<int4*>(_vec_load_18)[0];
+                                    auto _gst_113 = out_words + (dst_25_2 * 4);
+                                    __builtin_assume(__isGlobal(_gst_113));
+                                    reinterpret_cast<int4*>(_gst_113)[0] = reinterpret_cast<int4*>(_vec_load_18)[0];
                                 }
                             }
-                            if (unit_26_1 < chi_1) {
+                            if (unit_26_1 < chi_3) {
                                 {
-                                    auto _gst_45 = out_words + (dst_35_1 * 4);
-                                    __builtin_assume(__isGlobal(_gst_45));
-                                    reinterpret_cast<int4*>(_gst_45)[0] = reinterpret_cast<int4*>(_vec_load_19)[0];
+                                    auto _gst_114 = out_words + (dst_35_1 * 4);
+                                    __builtin_assume(__isGlobal(_gst_114));
+                                    reinterpret_cast<int4*>(_gst_114)[0] = reinterpret_cast<int4*>(_vec_load_19)[0];
                                 }
                             }
-                            unsigned int unit_76_1 = base + 3840;
-                            unsigned int clamped_77_1 = ((unit_76_1 < chi_1) ? unit_76_1 : last_1);
+                            unsigned int unit_76_1 = base_1 + 3840;
+                            unsigned int clamped_77_1 = ((unit_76_1 < chi_3) ? unit_76_1 : last_1);
                             unsigned int quotient_78_1 = (unsigned int)((unsigned long long)clamped_77_1 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_79_1 = clamped_77_1 - quotient_78_1 * block_units;
                             unsigned int correction_80_1 = (unsigned int)(remainder_79_1 >= block_units);
@@ -848,14 +1864,14 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_85_1 = quotient_78_1 * pitch_units + rank * block_units + remainder_79_1;
                             unsigned int _vec_load_24[4];
                             {
-                                uint4 _uv4_46 = *reinterpret_cast<const uint4*>(inp_words + (src_84_1 * 4) + 0);
-                                _vec_load_24[0 + 0] = _uv4_46.x;
-                                _vec_load_24[0 + 1] = _uv4_46.y;
-                                _vec_load_24[0 + 2] = _uv4_46.z;
-                                _vec_load_24[0 + 3] = _uv4_46.w;
+                                uint4 _uv4_115 = *reinterpret_cast<const uint4*>(inp_words + (src_84_1 * 4) + 0);
+                                _vec_load_24[0 + 0] = _uv4_115.x;
+                                _vec_load_24[0 + 1] = _uv4_115.y;
+                                _vec_load_24[0 + 2] = _uv4_115.z;
+                                _vec_load_24[0 + 3] = _uv4_115.w;
                             }
-                            unsigned int unit_86_1 = base + 3840 + 480;
-                            unsigned int clamped_87_1 = ((unit_86_1 < chi_1) ? unit_86_1 : last_1);
+                            unsigned int unit_86_1 = base_1 + 3840 + 480;
+                            unsigned int clamped_87_1 = ((unit_86_1 < chi_3) ? unit_86_1 : last_1);
                             unsigned int quotient_88_1 = (unsigned int)((unsigned long long)clamped_87_1 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_89_1 = clamped_87_1 - quotient_88_1 * block_units;
                             unsigned int correction_90_1 = (unsigned int)(remainder_89_1 >= block_units);
@@ -866,14 +1882,14 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_95_1 = quotient_88_1 * pitch_units + rank * block_units + remainder_89_1;
                             unsigned int _vec_load_25[4];
                             {
-                                uint4 _uv4_47 = *reinterpret_cast<const uint4*>(inp_words + (src_94_1 * 4) + 0);
-                                _vec_load_25[0 + 0] = _uv4_47.x;
-                                _vec_load_25[0 + 1] = _uv4_47.y;
-                                _vec_load_25[0 + 2] = _uv4_47.z;
-                                _vec_load_25[0 + 3] = _uv4_47.w;
+                                uint4 _uv4_116 = *reinterpret_cast<const uint4*>(inp_words + (src_94_1 * 4) + 0);
+                                _vec_load_25[0 + 0] = _uv4_116.x;
+                                _vec_load_25[0 + 1] = _uv4_116.y;
+                                _vec_load_25[0 + 2] = _uv4_116.z;
+                                _vec_load_25[0 + 3] = _uv4_116.w;
                             }
-                            unsigned int unit_96_1 = base + 3840 + 960;
-                            unsigned int clamped_97_1 = ((unit_96_1 < chi_1) ? unit_96_1 : last_1);
+                            unsigned int unit_96_1 = base_1 + 3840 + 960;
+                            unsigned int clamped_97_1 = ((unit_96_1 < chi_3) ? unit_96_1 : last_1);
                             unsigned int quotient_98_1 = (unsigned int)((unsigned long long)clamped_97_1 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_99_1 = clamped_97_1 - quotient_98_1 * block_units;
                             unsigned int correction_100_1 = (unsigned int)(remainder_99_1 >= block_units);
@@ -884,14 +1900,14 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_105_1 = quotient_98_1 * pitch_units + rank * block_units + remainder_99_1;
                             unsigned int _vec_load_26[4];
                             {
-                                uint4 _uv4_48 = *reinterpret_cast<const uint4*>(inp_words + (src_104_1 * 4) + 0);
-                                _vec_load_26[0 + 0] = _uv4_48.x;
-                                _vec_load_26[0 + 1] = _uv4_48.y;
-                                _vec_load_26[0 + 2] = _uv4_48.z;
-                                _vec_load_26[0 + 3] = _uv4_48.w;
+                                uint4 _uv4_117 = *reinterpret_cast<const uint4*>(inp_words + (src_104_1 * 4) + 0);
+                                _vec_load_26[0 + 0] = _uv4_117.x;
+                                _vec_load_26[0 + 1] = _uv4_117.y;
+                                _vec_load_26[0 + 2] = _uv4_117.z;
+                                _vec_load_26[0 + 3] = _uv4_117.w;
                             }
-                            unsigned int unit_106_1 = base + 3840 + 1440;
-                            unsigned int clamped_107_1 = ((unit_106_1 < chi_1) ? unit_106_1 : last_1);
+                            unsigned int unit_106_1 = base_1 + 3840 + 1440;
+                            unsigned int clamped_107_1 = ((unit_106_1 < chi_3) ? unit_106_1 : last_1);
                             unsigned int quotient_108_1 = (unsigned int)((unsigned long long)clamped_107_1 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_109_1 = clamped_107_1 - quotient_108_1 * block_units;
                             unsigned int correction_110_1 = (unsigned int)(remainder_109_1 >= block_units);
@@ -902,42 +1918,42 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_115_1 = quotient_108_1 * pitch_units + rank * block_units + remainder_109_1;
                             unsigned int _vec_load_27[4];
                             {
-                                uint4 _uv4_49 = *reinterpret_cast<const uint4*>(inp_words + (src_114_1 * 4) + 0);
-                                _vec_load_27[0 + 0] = _uv4_49.x;
-                                _vec_load_27[0 + 1] = _uv4_49.y;
-                                _vec_load_27[0 + 2] = _uv4_49.z;
-                                _vec_load_27[0 + 3] = _uv4_49.w;
+                                uint4 _uv4_118 = *reinterpret_cast<const uint4*>(inp_words + (src_114_1 * 4) + 0);
+                                _vec_load_27[0 + 0] = _uv4_118.x;
+                                _vec_load_27[0 + 1] = _uv4_118.y;
+                                _vec_load_27[0 + 2] = _uv4_118.z;
+                                _vec_load_27[0 + 3] = _uv4_118.w;
                             }
-                            if (unit_36_1 < chi_1) {
+                            if (unit_36_1 < chi_3) {
                                 {
-                                    auto _gst_50 = out_words + (dst_45_1 * 4);
-                                    __builtin_assume(__isGlobal(_gst_50));
-                                    reinterpret_cast<int4*>(_gst_50)[0] = reinterpret_cast<int4*>(_vec_load_20)[0];
+                                    auto _gst_119 = out_words + (dst_45_1 * 4);
+                                    __builtin_assume(__isGlobal(_gst_119));
+                                    reinterpret_cast<int4*>(_gst_119)[0] = reinterpret_cast<int4*>(_vec_load_20)[0];
                                 }
                             }
-                            if (unit_46_1 < chi_1) {
+                            if (unit_46_1 < chi_3) {
                                 {
-                                    auto _gst_51 = out_words + (dst_55_1 * 4);
-                                    __builtin_assume(__isGlobal(_gst_51));
-                                    reinterpret_cast<int4*>(_gst_51)[0] = reinterpret_cast<int4*>(_vec_load_21)[0];
+                                    auto _gst_120 = out_words + (dst_55_1 * 4);
+                                    __builtin_assume(__isGlobal(_gst_120));
+                                    reinterpret_cast<int4*>(_gst_120)[0] = reinterpret_cast<int4*>(_vec_load_21)[0];
                                 }
                             }
-                            if (unit_56_1 < chi_1) {
+                            if (unit_56_1 < chi_3) {
                                 {
-                                    auto _gst_52 = out_words + (dst_65_1 * 4);
-                                    __builtin_assume(__isGlobal(_gst_52));
-                                    reinterpret_cast<int4*>(_gst_52)[0] = reinterpret_cast<int4*>(_vec_load_22)[0];
+                                    auto _gst_121 = out_words + (dst_65_1 * 4);
+                                    __builtin_assume(__isGlobal(_gst_121));
+                                    reinterpret_cast<int4*>(_gst_121)[0] = reinterpret_cast<int4*>(_vec_load_22)[0];
                                 }
                             }
-                            if (unit_66_1 < chi_1) {
+                            if (unit_66_1 < chi_3) {
                                 {
-                                    auto _gst_53 = out_words + (dst_75_1 * 4);
-                                    __builtin_assume(__isGlobal(_gst_53));
-                                    reinterpret_cast<int4*>(_gst_53)[0] = reinterpret_cast<int4*>(_vec_load_23)[0];
+                                    auto _gst_122 = out_words + (dst_75_1 * 4);
+                                    __builtin_assume(__isGlobal(_gst_122));
+                                    reinterpret_cast<int4*>(_gst_122)[0] = reinterpret_cast<int4*>(_vec_load_23)[0];
                                 }
                             }
-                            unsigned int unit_116_1 = base + 5760;
-                            unsigned int clamped_117_1 = ((unit_116_1 < chi_1) ? unit_116_1 : last_1);
+                            unsigned int unit_116_1 = base_1 + 5760;
+                            unsigned int clamped_117_1 = ((unit_116_1 < chi_3) ? unit_116_1 : last_1);
                             unsigned int quotient_118_1 = (unsigned int)((unsigned long long)clamped_117_1 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_119_1 = clamped_117_1 - quotient_118_1 * block_units;
                             unsigned int correction_120_1 = (unsigned int)(remainder_119_1 >= block_units);
@@ -948,14 +1964,14 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_125_1 = quotient_118_1 * pitch_units + rank * block_units + remainder_119_1;
                             unsigned int _vec_load_28[4];
                             {
-                                uint4 _uv4_54 = *reinterpret_cast<const uint4*>(inp_words + (src_124_1 * 4) + 0);
-                                _vec_load_28[0 + 0] = _uv4_54.x;
-                                _vec_load_28[0 + 1] = _uv4_54.y;
-                                _vec_load_28[0 + 2] = _uv4_54.z;
-                                _vec_load_28[0 + 3] = _uv4_54.w;
+                                uint4 _uv4_123 = *reinterpret_cast<const uint4*>(inp_words + (src_124_1 * 4) + 0);
+                                _vec_load_28[0 + 0] = _uv4_123.x;
+                                _vec_load_28[0 + 1] = _uv4_123.y;
+                                _vec_load_28[0 + 2] = _uv4_123.z;
+                                _vec_load_28[0 + 3] = _uv4_123.w;
                             }
-                            unsigned int unit_126_1 = base + 5760 + 480;
-                            unsigned int clamped_127_1 = ((unit_126_1 < chi_1) ? unit_126_1 : last_1);
+                            unsigned int unit_126_1 = base_1 + 5760 + 480;
+                            unsigned int clamped_127_1 = ((unit_126_1 < chi_3) ? unit_126_1 : last_1);
                             unsigned int quotient_128_1 = (unsigned int)((unsigned long long)clamped_127_1 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_129_1 = clamped_127_1 - quotient_128_1 * block_units;
                             unsigned int correction_130_1 = (unsigned int)(remainder_129_1 >= block_units);
@@ -966,14 +1982,14 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_135_1 = quotient_128_1 * pitch_units + rank * block_units + remainder_129_1;
                             unsigned int _vec_load_29[4];
                             {
-                                uint4 _uv4_55 = *reinterpret_cast<const uint4*>(inp_words + (src_134_1 * 4) + 0);
-                                _vec_load_29[0 + 0] = _uv4_55.x;
-                                _vec_load_29[0 + 1] = _uv4_55.y;
-                                _vec_load_29[0 + 2] = _uv4_55.z;
-                                _vec_load_29[0 + 3] = _uv4_55.w;
+                                uint4 _uv4_124 = *reinterpret_cast<const uint4*>(inp_words + (src_134_1 * 4) + 0);
+                                _vec_load_29[0 + 0] = _uv4_124.x;
+                                _vec_load_29[0 + 1] = _uv4_124.y;
+                                _vec_load_29[0 + 2] = _uv4_124.z;
+                                _vec_load_29[0 + 3] = _uv4_124.w;
                             }
-                            unsigned int unit_136_1 = base + 5760 + 960;
-                            unsigned int clamped_137_1 = ((unit_136_1 < chi_1) ? unit_136_1 : last_1);
+                            unsigned int unit_136_1 = base_1 + 5760 + 960;
+                            unsigned int clamped_137_1 = ((unit_136_1 < chi_3) ? unit_136_1 : last_1);
                             unsigned int quotient_138_1 = (unsigned int)((unsigned long long)clamped_137_1 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_139_1 = clamped_137_1 - quotient_138_1 * block_units;
                             unsigned int correction_140_1 = (unsigned int)(remainder_139_1 >= block_units);
@@ -984,14 +2000,14 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_145_1 = quotient_138_1 * pitch_units + rank * block_units + remainder_139_1;
                             unsigned int _vec_load_30[4];
                             {
-                                uint4 _uv4_56 = *reinterpret_cast<const uint4*>(inp_words + (src_144_1 * 4) + 0);
-                                _vec_load_30[0 + 0] = _uv4_56.x;
-                                _vec_load_30[0 + 1] = _uv4_56.y;
-                                _vec_load_30[0 + 2] = _uv4_56.z;
-                                _vec_load_30[0 + 3] = _uv4_56.w;
+                                uint4 _uv4_125 = *reinterpret_cast<const uint4*>(inp_words + (src_144_1 * 4) + 0);
+                                _vec_load_30[0 + 0] = _uv4_125.x;
+                                _vec_load_30[0 + 1] = _uv4_125.y;
+                                _vec_load_30[0 + 2] = _uv4_125.z;
+                                _vec_load_30[0 + 3] = _uv4_125.w;
                             }
-                            unsigned int unit_146_1 = base + 5760 + 1440;
-                            unsigned int clamped_147_1 = ((unit_146_1 < chi_1) ? unit_146_1 : last_1);
+                            unsigned int unit_146_1 = base_1 + 5760 + 1440;
+                            unsigned int clamped_147_1 = ((unit_146_1 < chi_3) ? unit_146_1 : last_1);
                             unsigned int quotient_148_1 = (unsigned int)((unsigned long long)clamped_147_1 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_149_1 = clamped_147_1 - quotient_148_1 * block_units;
                             unsigned int correction_150_1 = (unsigned int)(remainder_149_1 >= block_units);
@@ -1002,159 +2018,1108 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_155_1 = quotient_148_1 * pitch_units + rank * block_units + remainder_149_1;
                             unsigned int _vec_load_31[4];
                             {
-                                uint4 _uv4_57 = *reinterpret_cast<const uint4*>(inp_words + (src_154_1 * 4) + 0);
-                                _vec_load_31[0 + 0] = _uv4_57.x;
-                                _vec_load_31[0 + 1] = _uv4_57.y;
-                                _vec_load_31[0 + 2] = _uv4_57.z;
-                                _vec_load_31[0 + 3] = _uv4_57.w;
+                                uint4 _uv4_126 = *reinterpret_cast<const uint4*>(inp_words + (src_154_1 * 4) + 0);
+                                _vec_load_31[0 + 0] = _uv4_126.x;
+                                _vec_load_31[0 + 1] = _uv4_126.y;
+                                _vec_load_31[0 + 2] = _uv4_126.z;
+                                _vec_load_31[0 + 3] = _uv4_126.w;
                             }
-                            if (unit_76_1 < chi_1) {
+                            if (unit_76_1 < chi_3) {
                                 {
-                                    auto _gst_58 = out_words + (dst_85_1 * 4);
-                                    __builtin_assume(__isGlobal(_gst_58));
-                                    reinterpret_cast<int4*>(_gst_58)[0] = reinterpret_cast<int4*>(_vec_load_24)[0];
+                                    auto _gst_127 = out_words + (dst_85_1 * 4);
+                                    __builtin_assume(__isGlobal(_gst_127));
+                                    reinterpret_cast<int4*>(_gst_127)[0] = reinterpret_cast<int4*>(_vec_load_24)[0];
                                 }
                             }
-                            if (unit_86_1 < chi_1) {
+                            if (unit_86_1 < chi_3) {
                                 {
-                                    auto _gst_59 = out_words + (dst_95_1 * 4);
-                                    __builtin_assume(__isGlobal(_gst_59));
-                                    reinterpret_cast<int4*>(_gst_59)[0] = reinterpret_cast<int4*>(_vec_load_25)[0];
+                                    auto _gst_128 = out_words + (dst_95_1 * 4);
+                                    __builtin_assume(__isGlobal(_gst_128));
+                                    reinterpret_cast<int4*>(_gst_128)[0] = reinterpret_cast<int4*>(_vec_load_25)[0];
                                 }
                             }
-                            if (unit_96_1 < chi_1) {
+                            if (unit_96_1 < chi_3) {
                                 {
-                                    auto _gst_60 = out_words + (dst_105_1 * 4);
-                                    __builtin_assume(__isGlobal(_gst_60));
-                                    reinterpret_cast<int4*>(_gst_60)[0] = reinterpret_cast<int4*>(_vec_load_26)[0];
+                                    auto _gst_129 = out_words + (dst_105_1 * 4);
+                                    __builtin_assume(__isGlobal(_gst_129));
+                                    reinterpret_cast<int4*>(_gst_129)[0] = reinterpret_cast<int4*>(_vec_load_26)[0];
                                 }
                             }
-                            if (unit_106_1 < chi_1) {
+                            if (unit_106_1 < chi_3) {
                                 {
-                                    auto _gst_61 = out_words + (dst_115_1 * 4);
-                                    __builtin_assume(__isGlobal(_gst_61));
-                                    reinterpret_cast<int4*>(_gst_61)[0] = reinterpret_cast<int4*>(_vec_load_27)[0];
+                                    auto _gst_130 = out_words + (dst_115_1 * 4);
+                                    __builtin_assume(__isGlobal(_gst_130));
+                                    reinterpret_cast<int4*>(_gst_130)[0] = reinterpret_cast<int4*>(_vec_load_27)[0];
                                 }
                             }
-                            if (unit_116_1 < chi_1) {
+                            if (unit_116_1 < chi_3) {
                                 {
-                                    auto _gst_62 = out_words + (dst_125_1 * 4);
-                                    __builtin_assume(__isGlobal(_gst_62));
-                                    reinterpret_cast<int4*>(_gst_62)[0] = reinterpret_cast<int4*>(_vec_load_28)[0];
+                                    auto _gst_131 = out_words + (dst_125_1 * 4);
+                                    __builtin_assume(__isGlobal(_gst_131));
+                                    reinterpret_cast<int4*>(_gst_131)[0] = reinterpret_cast<int4*>(_vec_load_28)[0];
                                 }
                             }
-                            if (unit_126_1 < chi_1) {
+                            if (unit_126_1 < chi_3) {
                                 {
-                                    auto _gst_63 = out_words + (dst_135_1 * 4);
-                                    __builtin_assume(__isGlobal(_gst_63));
-                                    reinterpret_cast<int4*>(_gst_63)[0] = reinterpret_cast<int4*>(_vec_load_29)[0];
+                                    auto _gst_132 = out_words + (dst_135_1 * 4);
+                                    __builtin_assume(__isGlobal(_gst_132));
+                                    reinterpret_cast<int4*>(_gst_132)[0] = reinterpret_cast<int4*>(_vec_load_29)[0];
                                 }
                             }
-                            if (unit_136_1 < chi_1) {
+                            if (unit_136_1 < chi_3) {
                                 {
-                                    auto _gst_64 = out_words + (dst_145_1 * 4);
-                                    __builtin_assume(__isGlobal(_gst_64));
-                                    reinterpret_cast<int4*>(_gst_64)[0] = reinterpret_cast<int4*>(_vec_load_30)[0];
+                                    auto _gst_133 = out_words + (dst_145_1 * 4);
+                                    __builtin_assume(__isGlobal(_gst_133));
+                                    reinterpret_cast<int4*>(_gst_133)[0] = reinterpret_cast<int4*>(_vec_load_30)[0];
                                 }
                             }
-                            if (unit_146_1 < chi_1) {
+                            if (unit_146_1 < chi_3) {
                                 {
-                                    auto _gst_65 = out_words + (dst_155_1 * 4);
-                                    __builtin_assume(__isGlobal(_gst_65));
-                                    reinterpret_cast<int4*>(_gst_65)[0] = reinterpret_cast<int4*>(_vec_load_31)[0];
+                                    auto _gst_134 = out_words + (dst_155_1 * 4);
+                                    __builtin_assume(__isGlobal(_gst_134));
+                                    reinterpret_cast<int4*>(_gst_134)[0] = reinterpret_cast<int4*>(_vec_load_31)[0];
                                 }
                             }
                         }
                     } else {
                         #pragma unroll 1
-                        for (unsigned int u_1 = clo_1 + tid_0; u_1 < chi_1; u_1 += 480) {
-                            unsigned int quotient_0_3 = (unsigned int)((unsigned long long)u_1 * (unsigned long long)units_magic >> 32);
-                            unsigned int remainder_1_3 = u_1 - quotient_0_3 * block_units;
-                            unsigned int correction_3 = (unsigned int)(remainder_1_3 >= block_units);
-                            quotient_0_3 = quotient_0_3 + correction_3;
-                            remainder_1_3 = remainder_1_3 - correction_3 * block_units;
+                        for (unsigned int u_3 = clo_3 + tid_0; u_3 < chi_3; u_3 += 480) {
+                            unsigned int quotient_0_3 = (unsigned int)((unsigned long long)u_3 * (unsigned long long)units_magic >> 32);
+                            unsigned int remainder_1_3 = u_3 - quotient_0_3 * block_units;
+                            unsigned int correction_45 = (unsigned int)(remainder_1_3 >= block_units);
+                            quotient_0_3 = quotient_0_3 + correction_45;
+                            remainder_1_3 = remainder_1_3 - correction_45 * block_units;
                             unsigned int quotient_3_3 = 0;
-                            unsigned int src_3 = (quotient_0_3 + (quotient_3_3 * 7 + rank) * sequences) * block_units + remainder_1_3;
-                            unsigned int dst_3 = quotient_0_3 * pitch_units + rank * block_units + remainder_1_3;
-                            out[dst_3] = inp[src_3];
+                            unsigned int src_37 = (quotient_0_3 + (quotient_3_3 * 7 + rank) * sequences) * block_units + remainder_1_3;
+                            unsigned int dst_36 = quotient_0_3 * pitch_units + rank * block_units + remainder_1_3;
+                            out[dst_36] = inp[src_37];
                         }
                     }
                 }
             }
         }
     } else {
+        if (out_chunks > 0) {
+            if (warp_1 < 15) {
+                if (vector != 0) {
+                    unsigned int last_unit_4 = units - 1;
+                    unsigned int unit_44_1 = sub * 7680 + tid_0;
+                    unsigned int clamped_44_1 = ((unit_44_1 < units) ? unit_44_1 : last_unit_4);
+                    unsigned int quotient_55 = (unsigned int)((unsigned long long)clamped_44_1 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_55 = clamped_44_1 - quotient_55 * block_units;
+                    unsigned int correction_46 = (unsigned int)(remainder_55 >= block_units);
+                    quotient_55 = quotient_55 + correction_46;
+                    remainder_55 = remainder_55 - correction_46 * block_units;
+                    unsigned int dst_37 = quotient_55 * pitch_units + rank * block_units + remainder_55;
+                    unsigned int unit_45 = sub * 7680 + (480 + tid_0);
+                    unsigned int clamped_45 = ((unit_45 < units) ? unit_45 : last_unit_4);
+                    unsigned int quotient_56 = (unsigned int)((unsigned long long)clamped_45 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_56 = clamped_45 - quotient_56 * block_units;
+                    unsigned int correction_45_1 = (unsigned int)(remainder_56 >= block_units);
+                    quotient_56 = quotient_56 + correction_45_1;
+                    remainder_56 = remainder_56 - correction_45_1 * block_units;
+                    unsigned int dst_32_1 = quotient_56 * pitch_units + rank * block_units + remainder_56;
+                    unsigned int unit_47 = sub * 7680 + (960 + tid_0);
+                    unsigned int clamped_46 = ((unit_47 < units) ? unit_47 : last_unit_4);
+                    unsigned int quotient_57 = (unsigned int)((unsigned long long)clamped_46 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_57 = clamped_46 - quotient_57 * block_units;
+                    unsigned int correction_46_1 = (unsigned int)(remainder_57 >= block_units);
+                    quotient_57 = quotient_57 + correction_46_1;
+                    remainder_57 = remainder_57 - correction_46_1 * block_units;
+                    unsigned int dst_33_1 = quotient_57 * pitch_units + rank * block_units + remainder_57;
+                    unsigned int unit_48 = sub * 7680 + (1440 + tid_0);
+                    unsigned int clamped_48 = ((unit_48 < units) ? unit_48 : last_unit_4);
+                    unsigned int quotient_59 = (unsigned int)((unsigned long long)clamped_48 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_58 = clamped_48 - quotient_59 * block_units;
+                    unsigned int correction_47 = (unsigned int)(remainder_58 >= block_units);
+                    quotient_59 = quotient_59 + correction_47;
+                    remainder_58 = remainder_58 - correction_47 * block_units;
+                    unsigned int dst_34_1 = quotient_59 * pitch_units + rank * block_units + remainder_58;
+                    unsigned int unit_49 = sub * 7680 + (1920 + tid_0);
+                    unsigned int clamped_49 = ((unit_49 < units) ? unit_49 : last_unit_4);
+                    unsigned int quotient_60 = (unsigned int)((unsigned long long)clamped_49 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_60 = clamped_49 - quotient_60 * block_units;
+                    unsigned int correction_48 = (unsigned int)(remainder_60 >= block_units);
+                    quotient_60 = quotient_60 + correction_48;
+                    remainder_60 = remainder_60 - correction_48 * block_units;
+                    unsigned int batch_33 = (unsigned int)((unsigned long long)quotient_60 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int row_3 = quotient_60 - batch_33 * sequences;
+                    unsigned int carry_3 = (unsigned int)(row_3 >= sequences);
+                    batch_33 = batch_33 + carry_3;
+                    row_3 = row_3 - carry_3 * sequences;
+                    unsigned int src_38 = (quotient_60 + (batch_33 * 7 + destination) * sequences) * block_units + remainder_60;
+                    unsigned int dst_36_1 = quotient_60 * pitch_units + rank * block_units + remainder_60;
+                    unsigned int vec_28[4];
+                    {
+                        uint4 _uv4_135 = *reinterpret_cast<const uint4*>(inp_words + (src_38 * 4) + 0);
+                        vec_28[0 + 0] = _uv4_135.x;
+                        vec_28[0 + 1] = _uv4_135.y;
+                        vec_28[0 + 2] = _uv4_135.z;
+                        vec_28[0 + 3] = _uv4_135.w;
+                    }
+                    unsigned int unit_50 = sub * 7680 + (2400 + tid_0);
+                    unsigned int clamped_50 = ((unit_50 < units) ? unit_50 : last_unit_4);
+                    unsigned int quotient_62 = (unsigned int)((unsigned long long)clamped_50 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_61 = clamped_50 - quotient_62 * block_units;
+                    unsigned int correction_49 = (unsigned int)(remainder_61 >= block_units);
+                    quotient_62 = quotient_62 + correction_49;
+                    remainder_61 = remainder_61 - correction_49 * block_units;
+                    unsigned int batch_32_1 = (unsigned int)((unsigned long long)quotient_62 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int row_3_1 = quotient_62 - batch_32_1 * sequences;
+                    unsigned int carry_3_1 = (unsigned int)(row_3_1 >= sequences);
+                    batch_32_1 = batch_32_1 + carry_3_1;
+                    row_3_1 = row_3_1 - carry_3_1 * sequences;
+                    unsigned int src_35_1 = (quotient_62 + (batch_32_1 * 7 + destination) * sequences) * block_units + remainder_61;
+                    unsigned int dst_37_1 = quotient_62 * pitch_units + rank * block_units + remainder_61;
+                    unsigned int vec_29[4];
+                    {
+                        uint4 _uv4_136 = *reinterpret_cast<const uint4*>(inp_words + (src_35_1 * 4) + 0);
+                        vec_29[0 + 0] = _uv4_136.x;
+                        vec_29[0 + 1] = _uv4_136.y;
+                        vec_29[0 + 2] = _uv4_136.z;
+                        vec_29[0 + 3] = _uv4_136.w;
+                    }
+                    unsigned int unit_51 = sub * 7680 + (2880 + tid_0);
+                    unsigned int clamped_51 = ((unit_51 < units) ? unit_51 : last_unit_4);
+                    unsigned int quotient_63 = (unsigned int)((unsigned long long)clamped_51 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_63 = clamped_51 - quotient_63 * block_units;
+                    unsigned int correction_51 = (unsigned int)(remainder_63 >= block_units);
+                    quotient_63 = quotient_63 + correction_51;
+                    remainder_63 = remainder_63 - correction_51 * block_units;
+                    unsigned int batch_33_1 = (unsigned int)((unsigned long long)quotient_63 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int row_4 = quotient_63 - batch_33_1 * sequences;
+                    unsigned int carry_4 = (unsigned int)(row_4 >= sequences);
+                    batch_33_1 = batch_33_1 + carry_4;
+                    row_4 = row_4 - carry_4 * sequences;
+                    unsigned int src_36_1 = (quotient_63 + (batch_33_1 * 7 + destination) * sequences) * block_units + remainder_63;
+                    unsigned int dst_38 = quotient_63 * pitch_units + rank * block_units + remainder_63;
+                    unsigned int vec_30[4];
+                    {
+                        uint4 _uv4_137 = *reinterpret_cast<const uint4*>(inp_words + (src_36_1 * 4) + 0);
+                        vec_30[0 + 0] = _uv4_137.x;
+                        vec_30[0 + 1] = _uv4_137.y;
+                        vec_30[0 + 2] = _uv4_137.z;
+                        vec_30[0 + 3] = _uv4_137.w;
+                    }
+                    unsigned int unit_52 = sub * 7680 + (3360 + tid_0);
+                    unsigned int clamped_52 = ((unit_52 < units) ? unit_52 : last_unit_4);
+                    unsigned int quotient_64 = (unsigned int)((unsigned long long)clamped_52 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_64 = clamped_52 - quotient_64 * block_units;
+                    unsigned int correction_52 = (unsigned int)(remainder_64 >= block_units);
+                    quotient_64 = quotient_64 + correction_52;
+                    remainder_64 = remainder_64 - correction_52 * block_units;
+                    unsigned int batch_34 = (unsigned int)((unsigned long long)quotient_64 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int row_5 = quotient_64 - batch_34 * sequences;
+                    unsigned int carry_5 = (unsigned int)(row_5 >= sequences);
+                    batch_34 = batch_34 + carry_5;
+                    row_5 = row_5 - carry_5 * sequences;
+                    unsigned int src_37_1 = (quotient_64 + (batch_34 * 7 + destination) * sequences) * block_units + remainder_64;
+                    unsigned int dst_39 = quotient_64 * pitch_units + rank * block_units + remainder_64;
+                    unsigned int vec_31[4];
+                    {
+                        uint4 _uv4_138 = *reinterpret_cast<const uint4*>(inp_words + (src_37_1 * 4) + 0);
+                        vec_31[0 + 0] = _uv4_138.x;
+                        vec_31[0 + 1] = _uv4_138.y;
+                        vec_31[0 + 2] = _uv4_138.z;
+                        vec_31[0 + 3] = _uv4_138.w;
+                    }
+                    if (!zoned) {
+                        if (unit_44_1 < units) {
+                            {
+                                auto _gst_139 = peer_words + (dst_37 * 4);
+                                __builtin_assume(__isGlobal(_gst_139));
+                                reinterpret_cast<int4*>(_gst_139)[0] = reinterpret_cast<int4*>(first_0)[0];
+                            }
+                        }
+                    }
+                    if (unit_45 < units) {
+                        {
+                            auto _gst_140 = peer_words + (dst_32_1 * 4);
+                            __builtin_assume(__isGlobal(_gst_140));
+                            reinterpret_cast<int4*>(_gst_140)[0] = reinterpret_cast<int4*>(first_1)[0];
+                        }
+                    }
+                    if (unit_47 < units) {
+                        {
+                            auto _gst_141 = peer_words + (dst_33_1 * 4);
+                            __builtin_assume(__isGlobal(_gst_141));
+                            reinterpret_cast<int4*>(_gst_141)[0] = reinterpret_cast<int4*>(first_2)[0];
+                        }
+                    }
+                    if (unit_48 < units) {
+                        {
+                            auto _gst_142 = peer_words + (dst_34_1 * 4);
+                            __builtin_assume(__isGlobal(_gst_142));
+                            reinterpret_cast<int4*>(_gst_142)[0] = reinterpret_cast<int4*>(first_3)[0];
+                        }
+                    }
+                    unsigned int unit_53 = sub * 7680 + (3840 + tid_0);
+                    unsigned int clamped_53 = ((unit_53 < units) ? unit_53 : last_unit_4);
+                    unsigned int quotient_65 = (unsigned int)((unsigned long long)clamped_53 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_65 = clamped_53 - quotient_65 * block_units;
+                    unsigned int correction_54 = (unsigned int)(remainder_65 >= block_units);
+                    quotient_65 = quotient_65 + correction_54;
+                    remainder_65 = remainder_65 - correction_54 * block_units;
+                    unsigned int batch_35 = (unsigned int)((unsigned long long)quotient_65 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int row_6 = quotient_65 - batch_35 * sequences;
+                    unsigned int carry_6 = (unsigned int)(row_6 >= sequences);
+                    batch_35 = batch_35 + carry_6;
+                    row_6 = row_6 - carry_6 * sequences;
+                    unsigned int src_38_1 = (quotient_65 + (batch_35 * 7 + destination) * sequences) * block_units + remainder_65;
+                    unsigned int dst_40 = quotient_65 * pitch_units + rank * block_units + remainder_65;
+                    unsigned int vec_32[4];
+                    {
+                        uint4 _uv4_143 = *reinterpret_cast<const uint4*>(inp_words + (src_38_1 * 4) + 0);
+                        vec_32[0 + 0] = _uv4_143.x;
+                        vec_32[0 + 1] = _uv4_143.y;
+                        vec_32[0 + 2] = _uv4_143.z;
+                        vec_32[0 + 3] = _uv4_143.w;
+                    }
+                    unsigned int unit_54 = sub * 7680 + (4320 + tid_0);
+                    unsigned int clamped_54 = ((unit_54 < units) ? unit_54 : last_unit_4);
+                    unsigned int quotient_66 = (unsigned int)((unsigned long long)clamped_54 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_66 = clamped_54 - quotient_66 * block_units;
+                    unsigned int correction_55 = (unsigned int)(remainder_66 >= block_units);
+                    quotient_66 = quotient_66 + correction_55;
+                    remainder_66 = remainder_66 - correction_55 * block_units;
+                    unsigned int batch_36 = (unsigned int)((unsigned long long)quotient_66 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int row_7 = quotient_66 - batch_36 * sequences;
+                    unsigned int carry_7 = (unsigned int)(row_7 >= sequences);
+                    batch_36 = batch_36 + carry_7;
+                    row_7 = row_7 - carry_7 * sequences;
+                    unsigned int src_39 = (quotient_66 + (batch_36 * 7 + destination) * sequences) * block_units + remainder_66;
+                    unsigned int dst_41 = quotient_66 * pitch_units + rank * block_units + remainder_66;
+                    unsigned int vec_33[4];
+                    {
+                        uint4 _uv4_144 = *reinterpret_cast<const uint4*>(inp_words + (src_39 * 4) + 0);
+                        vec_33[0 + 0] = _uv4_144.x;
+                        vec_33[0 + 1] = _uv4_144.y;
+                        vec_33[0 + 2] = _uv4_144.z;
+                        vec_33[0 + 3] = _uv4_144.w;
+                    }
+                    unsigned int unit_55 = sub * 7680 + (4800 + tid_0);
+                    unsigned int clamped_55 = ((unit_55 < units) ? unit_55 : last_unit_4);
+                    unsigned int quotient_67 = (unsigned int)((unsigned long long)clamped_55 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_67 = clamped_55 - quotient_67 * block_units;
+                    unsigned int correction_56 = (unsigned int)(remainder_67 >= block_units);
+                    quotient_67 = quotient_67 + correction_56;
+                    remainder_67 = remainder_67 - correction_56 * block_units;
+                    unsigned int batch_37 = (unsigned int)((unsigned long long)quotient_67 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int row_8 = quotient_67 - batch_37 * sequences;
+                    unsigned int carry_8 = (unsigned int)(row_8 >= sequences);
+                    batch_37 = batch_37 + carry_8;
+                    row_8 = row_8 - carry_8 * sequences;
+                    unsigned int src_40 = (quotient_67 + (batch_37 * 7 + destination) * sequences) * block_units + remainder_67;
+                    unsigned int dst_42 = quotient_67 * pitch_units + rank * block_units + remainder_67;
+                    unsigned int vec_34[4];
+                    {
+                        uint4 _uv4_145 = *reinterpret_cast<const uint4*>(inp_words + (src_40 * 4) + 0);
+                        vec_34[0 + 0] = _uv4_145.x;
+                        vec_34[0 + 1] = _uv4_145.y;
+                        vec_34[0 + 2] = _uv4_145.z;
+                        vec_34[0 + 3] = _uv4_145.w;
+                    }
+                    unsigned int unit_57 = sub * 7680 + (5280 + tid_0);
+                    unsigned int clamped_56 = ((unit_57 < units) ? unit_57 : last_unit_4);
+                    unsigned int quotient_69 = (unsigned int)((unsigned long long)clamped_56 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_68 = clamped_56 - quotient_69 * block_units;
+                    unsigned int correction_57 = (unsigned int)(remainder_68 >= block_units);
+                    quotient_69 = quotient_69 + correction_57;
+                    remainder_68 = remainder_68 - correction_57 * block_units;
+                    unsigned int batch_38 = (unsigned int)((unsigned long long)quotient_69 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int row_9 = quotient_69 - batch_38 * sequences;
+                    unsigned int carry_9 = (unsigned int)(row_9 >= sequences);
+                    batch_38 = batch_38 + carry_9;
+                    row_9 = row_9 - carry_9 * sequences;
+                    unsigned int src_41 = (quotient_69 + (batch_38 * 7 + destination) * sequences) * block_units + remainder_68;
+                    unsigned int dst_43 = quotient_69 * pitch_units + rank * block_units + remainder_68;
+                    unsigned int vec_35[4];
+                    {
+                        uint4 _uv4_146 = *reinterpret_cast<const uint4*>(inp_words + (src_41 * 4) + 0);
+                        vec_35[0 + 0] = _uv4_146.x;
+                        vec_35[0 + 1] = _uv4_146.y;
+                        vec_35[0 + 2] = _uv4_146.z;
+                        vec_35[0 + 3] = _uv4_146.w;
+                    }
+                    if (unit_49 < units) {
+                        {
+                            auto _gst_147 = peer_words + (dst_36_1 * 4);
+                            __builtin_assume(__isGlobal(_gst_147));
+                            reinterpret_cast<int4*>(_gst_147)[0] = reinterpret_cast<int4*>(vec_28)[0];
+                        }
+                    }
+                    if (unit_50 < units) {
+                        {
+                            auto _gst_148 = peer_words + (dst_37_1 * 4);
+                            __builtin_assume(__isGlobal(_gst_148));
+                            reinterpret_cast<int4*>(_gst_148)[0] = reinterpret_cast<int4*>(vec_29)[0];
+                        }
+                    }
+                    if (unit_51 < units) {
+                        {
+                            auto _gst_149 = peer_words + (dst_38 * 4);
+                            __builtin_assume(__isGlobal(_gst_149));
+                            reinterpret_cast<int4*>(_gst_149)[0] = reinterpret_cast<int4*>(vec_30)[0];
+                        }
+                    }
+                    if (unit_52 < units) {
+                        {
+                            auto _gst_150 = peer_words + (dst_39 * 4);
+                            __builtin_assume(__isGlobal(_gst_150));
+                            reinterpret_cast<int4*>(_gst_150)[0] = reinterpret_cast<int4*>(vec_31)[0];
+                        }
+                    }
+                    unsigned int unit_58 = sub * 7680 + (5760 + tid_0);
+                    unsigned int clamped_58 = ((unit_58 < units) ? unit_58 : last_unit_4);
+                    unsigned int quotient_70 = (unsigned int)((unsigned long long)clamped_58 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_70 = clamped_58 - quotient_70 * block_units;
+                    unsigned int correction_58 = (unsigned int)(remainder_70 >= block_units);
+                    quotient_70 = quotient_70 + correction_58;
+                    remainder_70 = remainder_70 - correction_58 * block_units;
+                    unsigned int batch_39 = (unsigned int)((unsigned long long)quotient_70 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int row_10 = quotient_70 - batch_39 * sequences;
+                    unsigned int carry_10 = (unsigned int)(row_10 >= sequences);
+                    batch_39 = batch_39 + carry_10;
+                    row_10 = row_10 - carry_10 * sequences;
+                    unsigned int src_42 = (quotient_70 + (batch_39 * 7 + destination) * sequences) * block_units + remainder_70;
+                    unsigned int dst_44 = quotient_70 * pitch_units + rank * block_units + remainder_70;
+                    unsigned int vec_36[4];
+                    {
+                        uint4 _uv4_151 = *reinterpret_cast<const uint4*>(inp_words + (src_42 * 4) + 0);
+                        vec_36[0 + 0] = _uv4_151.x;
+                        vec_36[0 + 1] = _uv4_151.y;
+                        vec_36[0 + 2] = _uv4_151.z;
+                        vec_36[0 + 3] = _uv4_151.w;
+                    }
+                    unsigned int unit_59 = sub * 7680 + (6240 + tid_0);
+                    unsigned int clamped_59 = ((unit_59 < units) ? unit_59 : last_unit_4);
+                    unsigned int quotient_72 = (unsigned int)((unsigned long long)clamped_59 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_71 = clamped_59 - quotient_72 * block_units;
+                    unsigned int correction_59 = (unsigned int)(remainder_71 >= block_units);
+                    quotient_72 = quotient_72 + correction_59;
+                    remainder_71 = remainder_71 - correction_59 * block_units;
+                    unsigned int batch_40 = (unsigned int)((unsigned long long)quotient_72 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int row_11 = quotient_72 - batch_40 * sequences;
+                    unsigned int carry_11 = (unsigned int)(row_11 >= sequences);
+                    batch_40 = batch_40 + carry_11;
+                    row_11 = row_11 - carry_11 * sequences;
+                    unsigned int src_43 = (quotient_72 + (batch_40 * 7 + destination) * sequences) * block_units + remainder_71;
+                    unsigned int dst_46 = quotient_72 * pitch_units + rank * block_units + remainder_71;
+                    unsigned int vec_37[4];
+                    {
+                        uint4 _uv4_152 = *reinterpret_cast<const uint4*>(inp_words + (src_43 * 4) + 0);
+                        vec_37[0 + 0] = _uv4_152.x;
+                        vec_37[0 + 1] = _uv4_152.y;
+                        vec_37[0 + 2] = _uv4_152.z;
+                        vec_37[0 + 3] = _uv4_152.w;
+                    }
+                    unsigned int unit_60 = sub * 7680 + (6720 + tid_0);
+                    unsigned int clamped_60 = ((unit_60 < units) ? unit_60 : last_unit_4);
+                    unsigned int quotient_73 = (unsigned int)((unsigned long long)clamped_60 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_73 = clamped_60 - quotient_73 * block_units;
+                    unsigned int correction_61 = (unsigned int)(remainder_73 >= block_units);
+                    quotient_73 = quotient_73 + correction_61;
+                    remainder_73 = remainder_73 - correction_61 * block_units;
+                    unsigned int batch_41 = (unsigned int)((unsigned long long)quotient_73 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int row_12 = quotient_73 - batch_41 * sequences;
+                    unsigned int carry_12 = (unsigned int)(row_12 >= sequences);
+                    batch_41 = batch_41 + carry_12;
+                    row_12 = row_12 - carry_12 * sequences;
+                    unsigned int src_45 = (quotient_73 + (batch_41 * 7 + destination) * sequences) * block_units + remainder_73;
+                    unsigned int dst_47 = quotient_73 * pitch_units + rank * block_units + remainder_73;
+                    unsigned int vec_38[4];
+                    {
+                        uint4 _uv4_153 = *reinterpret_cast<const uint4*>(inp_words + (src_45 * 4) + 0);
+                        vec_38[0 + 0] = _uv4_153.x;
+                        vec_38[0 + 1] = _uv4_153.y;
+                        vec_38[0 + 2] = _uv4_153.z;
+                        vec_38[0 + 3] = _uv4_153.w;
+                    }
+                    unsigned int unit_61 = sub * 7680 + (7200 + tid_0);
+                    unsigned int clamped_61 = ((unit_61 < units) ? unit_61 : last_unit_4);
+                    unsigned int quotient_74 = (unsigned int)((unsigned long long)clamped_61 * (unsigned long long)units_magic >> 32);
+                    unsigned int remainder_74 = clamped_61 - quotient_74 * block_units;
+                    unsigned int correction_62 = (unsigned int)(remainder_74 >= block_units);
+                    quotient_74 = quotient_74 + correction_62;
+                    remainder_74 = remainder_74 - correction_62 * block_units;
+                    unsigned int batch_42 = (unsigned int)((unsigned long long)quotient_74 * (unsigned long long)sequences_magic >> 32);
+                    unsigned int row_13 = quotient_74 - batch_42 * sequences;
+                    unsigned int carry_13 = (unsigned int)(row_13 >= sequences);
+                    batch_42 = batch_42 + carry_13;
+                    row_13 = row_13 - carry_13 * sequences;
+                    unsigned int src_46 = (quotient_74 + (batch_42 * 7 + destination) * sequences) * block_units + remainder_74;
+                    unsigned int dst_48 = quotient_74 * pitch_units + rank * block_units + remainder_74;
+                    unsigned int vec_39[4];
+                    {
+                        uint4 _uv4_154 = *reinterpret_cast<const uint4*>(inp_words + (src_46 * 4) + 0);
+                        vec_39[0 + 0] = _uv4_154.x;
+                        vec_39[0 + 1] = _uv4_154.y;
+                        vec_39[0 + 2] = _uv4_154.z;
+                        vec_39[0 + 3] = _uv4_154.w;
+                    }
+                    if (unit_53 < units) {
+                        {
+                            auto _gst_155 = peer_words + (dst_40 * 4);
+                            __builtin_assume(__isGlobal(_gst_155));
+                            reinterpret_cast<int4*>(_gst_155)[0] = reinterpret_cast<int4*>(vec_32)[0];
+                        }
+                    }
+                    if (unit_54 < units) {
+                        {
+                            auto _gst_156 = peer_words + (dst_41 * 4);
+                            __builtin_assume(__isGlobal(_gst_156));
+                            reinterpret_cast<int4*>(_gst_156)[0] = reinterpret_cast<int4*>(vec_33)[0];
+                        }
+                    }
+                    if (unit_55 < units) {
+                        {
+                            auto _gst_157 = peer_words + (dst_42 * 4);
+                            __builtin_assume(__isGlobal(_gst_157));
+                            reinterpret_cast<int4*>(_gst_157)[0] = reinterpret_cast<int4*>(vec_34)[0];
+                        }
+                    }
+                    if (unit_57 < units) {
+                        {
+                            auto _gst_158 = peer_words + (dst_43 * 4);
+                            __builtin_assume(__isGlobal(_gst_158));
+                            reinterpret_cast<int4*>(_gst_158)[0] = reinterpret_cast<int4*>(vec_35)[0];
+                        }
+                    }
+                    if (unit_58 < units) {
+                        {
+                            auto _gst_159 = peer_words + (dst_44 * 4);
+                            __builtin_assume(__isGlobal(_gst_159));
+                            reinterpret_cast<int4*>(_gst_159)[0] = reinterpret_cast<int4*>(vec_36)[0];
+                        }
+                    }
+                    if (unit_59 < units) {
+                        {
+                            auto _gst_160 = peer_words + (dst_46 * 4);
+                            __builtin_assume(__isGlobal(_gst_160));
+                            reinterpret_cast<int4*>(_gst_160)[0] = reinterpret_cast<int4*>(vec_37)[0];
+                        }
+                    }
+                    if (unit_60 < units) {
+                        {
+                            auto _gst_161 = peer_words + (dst_47 * 4);
+                            __builtin_assume(__isGlobal(_gst_161));
+                            reinterpret_cast<int4*>(_gst_161)[0] = reinterpret_cast<int4*>(vec_38)[0];
+                        }
+                    }
+                    if (unit_61 < units) {
+                        {
+                            auto _gst_162 = peer_words + (dst_48 * 4);
+                            __builtin_assume(__isGlobal(_gst_162));
+                            reinterpret_cast<int4*>(_gst_162)[0] = reinterpret_cast<int4*>(vec_39)[0];
+                        }
+                    }
+                } else {
+                    unsigned int tail_lo_4 = lo + (out_chunks - 2) * 7680;
+                    unsigned int split_4 = hi - (hi - tail_lo_4 >> 2);
+                    unsigned int clo_4 = lo;
+                    unsigned int chi_4 = lo + 7680;
+                    if (out_chunks == 2) {
+                        clo_4 = tail_lo_4;
+                        chi_4 = split_4;
+                    }
+                    if (out_chunks == 1) {
+                        clo_4 = split_4;
+                        chi_4 = hi;
+                    }
+                    #pragma unroll 1
+                    for (unsigned int u_4 = clo_4 + tid_0; u_4 < chi_4; u_4 += 480) {
+                        unsigned int quotient_75 = (unsigned int)((unsigned long long)u_4 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_75 = u_4 - quotient_75 * block_units;
+                        unsigned int correction_53 = (unsigned int)(remainder_75 >= block_units);
+                        quotient_75 = quotient_75 + correction_53;
+                        remainder_75 = remainder_75 - correction_53 * block_units;
+                        unsigned int batch_43 = (unsigned int)((unsigned long long)quotient_75 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int row_14 = quotient_75 - batch_43 * sequences;
+                        unsigned int carry_14 = (unsigned int)(row_14 >= sequences);
+                        batch_43 = batch_43 + carry_14;
+                        row_14 = row_14 - carry_14 * sequences;
+                        unsigned int src_47 = (quotient_75 + (batch_43 * 7 + destination) * sequences) * block_units + remainder_75;
+                        unsigned int dst_49 = quotient_75 * pitch_units + rank * block_units + remainder_75;
+                        peer_elements[dst_49] = inp[src_47];
+                    }
+                }
+            }
+        }
+        if (count_6 > 0) {
+            if (warp_1 < 15) {
+                unsigned int tail_lo_5 = lo_4 + (count_6 - 2) * 7680;
+                unsigned int split_5 = hi_5 - (hi_5 - tail_lo_5 >> 2);
+                unsigned int clo_5 = lo_4;
+                unsigned int chi_5 = lo_4 + 7680;
+                if (count_6 == 2) {
+                    clo_5 = tail_lo_5;
+                    chi_5 = split_5;
+                }
+                if (count_6 == 1) {
+                    clo_5 = split_5;
+                    chi_5 = hi_5;
+                }
+                if (vector != 0) {
+                    unsigned int last_unit_5 = chi_5 - 1;
+                    #pragma unroll 1
+                    for (unsigned int base_2 = clo_5 + tid_0; base_2 < chi_5; base_2 += 7680) {
+                        unsigned int unit_62 = base_2;
+                        unsigned int clamped_62 = ((unit_62 < chi_5) ? unit_62 : last_unit_5);
+                        unsigned int quotient_76 = (unsigned int)((unsigned long long)clamped_62 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_76 = clamped_62 - quotient_76 * block_units;
+                        unsigned int correction_63 = (unsigned int)(remainder_76 >= block_units);
+                        quotient_76 = quotient_76 + correction_63;
+                        remainder_76 = remainder_76 - correction_63 * block_units;
+                        unsigned int batch_44 = (unsigned int)((unsigned long long)quotient_76 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int row_15 = quotient_76 - batch_44 * sequences;
+                        unsigned int carry_15 = (unsigned int)(row_15 >= sequences);
+                        batch_44 = batch_44 + carry_15;
+                        row_15 = row_15 - carry_15 * sequences;
+                        unsigned int src_48 = (quotient_76 + (batch_44 * 7 + rank) * sequences) * block_units + remainder_76;
+                        unsigned int dst_50 = quotient_76 * pitch_units + rank * block_units + remainder_76;
+                        unsigned int vec_40[4];
+                        {
+                            uint4 _uv4_163 = *reinterpret_cast<const uint4*>(inp_words + (src_48 * 4) + 0);
+                            vec_40[0 + 0] = _uv4_163.x;
+                            vec_40[0 + 1] = _uv4_163.y;
+                            vec_40[0 + 2] = _uv4_163.z;
+                            vec_40[0 + 3] = _uv4_163.w;
+                        }
+                        unsigned int unit_63 = base_2 + 480;
+                        unsigned int clamped_63 = ((unit_63 < chi_5) ? unit_63 : last_unit_5);
+                        unsigned int quotient_77 = (unsigned int)((unsigned long long)clamped_63 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_77 = clamped_63 - quotient_77 * block_units;
+                        unsigned int correction_64 = (unsigned int)(remainder_77 >= block_units);
+                        quotient_77 = quotient_77 + correction_64;
+                        remainder_77 = remainder_77 - correction_64 * block_units;
+                        unsigned int batch_43_1 = (unsigned int)((unsigned long long)quotient_77 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int row_14_1 = quotient_77 - batch_43_1 * sequences;
+                        unsigned int carry_14_1 = (unsigned int)(row_14_1 >= sequences);
+                        batch_43_1 = batch_43_1 + carry_14_1;
+                        row_14_1 = row_14_1 - carry_14_1 * sequences;
+                        unsigned int src_47_1 = (quotient_77 + (batch_43_1 * 7 + rank) * sequences) * block_units + remainder_77;
+                        unsigned int dst_49_1 = quotient_77 * pitch_units + rank * block_units + remainder_77;
+                        unsigned int vec_41[4];
+                        {
+                            uint4 _uv4_164 = *reinterpret_cast<const uint4*>(inp_words + (src_47_1 * 4) + 0);
+                            vec_41[0 + 0] = _uv4_164.x;
+                            vec_41[0 + 1] = _uv4_164.y;
+                            vec_41[0 + 2] = _uv4_164.z;
+                            vec_41[0 + 3] = _uv4_164.w;
+                        }
+                        unsigned int unit_64 = base_2 + 960;
+                        unsigned int clamped_64 = ((unit_64 < chi_5) ? unit_64 : last_unit_5);
+                        unsigned int quotient_79 = (unsigned int)((unsigned long long)clamped_64 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_78 = clamped_64 - quotient_79 * block_units;
+                        unsigned int correction_65 = (unsigned int)(remainder_78 >= block_units);
+                        quotient_79 = quotient_79 + correction_65;
+                        remainder_78 = remainder_78 - correction_65 * block_units;
+                        unsigned int batch_44_1 = (unsigned int)((unsigned long long)quotient_79 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int row_15_1 = quotient_79 - batch_44_1 * sequences;
+                        unsigned int carry_15_1 = (unsigned int)(row_15_1 >= sequences);
+                        batch_44_1 = batch_44_1 + carry_15_1;
+                        row_15_1 = row_15_1 - carry_15_1 * sequences;
+                        unsigned int src_48_1 = (quotient_79 + (batch_44_1 * 7 + rank) * sequences) * block_units + remainder_78;
+                        unsigned int dst_50_1 = quotient_79 * pitch_units + rank * block_units + remainder_78;
+                        unsigned int vec_42[4];
+                        {
+                            uint4 _uv4_165 = *reinterpret_cast<const uint4*>(inp_words + (src_48_1 * 4) + 0);
+                            vec_42[0 + 0] = _uv4_165.x;
+                            vec_42[0 + 1] = _uv4_165.y;
+                            vec_42[0 + 2] = _uv4_165.z;
+                            vec_42[0 + 3] = _uv4_165.w;
+                        }
+                        unsigned int unit_65 = base_2 + 1440;
+                        unsigned int clamped_65 = ((unit_65 < chi_5) ? unit_65 : last_unit_5);
+                        unsigned int quotient_80 = (unsigned int)((unsigned long long)clamped_65 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_80 = clamped_65 - quotient_80 * block_units;
+                        unsigned int correction_66 = (unsigned int)(remainder_80 >= block_units);
+                        quotient_80 = quotient_80 + correction_66;
+                        remainder_80 = remainder_80 - correction_66 * block_units;
+                        unsigned int batch_45 = (unsigned int)((unsigned long long)quotient_80 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int row_16 = quotient_80 - batch_45 * sequences;
+                        unsigned int carry_16 = (unsigned int)(row_16 >= sequences);
+                        batch_45 = batch_45 + carry_16;
+                        row_16 = row_16 - carry_16 * sequences;
+                        unsigned int src_49 = (quotient_80 + (batch_45 * 7 + rank) * sequences) * block_units + remainder_80;
+                        unsigned int dst_51 = quotient_80 * pitch_units + rank * block_units + remainder_80;
+                        unsigned int vec_43[4];
+                        {
+                            uint4 _uv4_166 = *reinterpret_cast<const uint4*>(inp_words + (src_49 * 4) + 0);
+                            vec_43[0 + 0] = _uv4_166.x;
+                            vec_43[0 + 1] = _uv4_166.y;
+                            vec_43[0 + 2] = _uv4_166.z;
+                            vec_43[0 + 3] = _uv4_166.w;
+                        }
+                        unsigned int unit_67 = base_2 + 1920;
+                        unsigned int clamped_66 = ((unit_67 < chi_5) ? unit_67 : last_unit_5);
+                        unsigned int quotient_82 = (unsigned int)((unsigned long long)clamped_66 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_81 = clamped_66 - quotient_82 * block_units;
+                        unsigned int correction_67 = (unsigned int)(remainder_81 >= block_units);
+                        quotient_82 = quotient_82 + correction_67;
+                        remainder_81 = remainder_81 - correction_67 * block_units;
+                        unsigned int batch_46 = (unsigned int)((unsigned long long)quotient_82 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int row_17 = quotient_82 - batch_46 * sequences;
+                        unsigned int carry_17 = (unsigned int)(row_17 >= sequences);
+                        batch_46 = batch_46 + carry_17;
+                        row_17 = row_17 - carry_17 * sequences;
+                        unsigned int src_50 = (quotient_82 + (batch_46 * 7 + rank) * sequences) * block_units + remainder_81;
+                        unsigned int dst_52 = quotient_82 * pitch_units + rank * block_units + remainder_81;
+                        unsigned int vec_44[4];
+                        {
+                            uint4 _uv4_167 = *reinterpret_cast<const uint4*>(inp_words + (src_50 * 4) + 0);
+                            vec_44[0 + 0] = _uv4_167.x;
+                            vec_44[0 + 1] = _uv4_167.y;
+                            vec_44[0 + 2] = _uv4_167.z;
+                            vec_44[0 + 3] = _uv4_167.w;
+                        }
+                        unsigned int unit_68 = base_2 + 2400;
+                        unsigned int clamped_68 = ((unit_68 < chi_5) ? unit_68 : last_unit_5);
+                        unsigned int quotient_83 = (unsigned int)((unsigned long long)clamped_68 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_83 = clamped_68 - quotient_83 * block_units;
+                        unsigned int correction_68 = (unsigned int)(remainder_83 >= block_units);
+                        quotient_83 = quotient_83 + correction_68;
+                        remainder_83 = remainder_83 - correction_68 * block_units;
+                        unsigned int batch_47 = (unsigned int)((unsigned long long)quotient_83 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int row_18 = quotient_83 - batch_47 * sequences;
+                        unsigned int carry_18 = (unsigned int)(row_18 >= sequences);
+                        batch_47 = batch_47 + carry_18;
+                        row_18 = row_18 - carry_18 * sequences;
+                        unsigned int src_51 = (quotient_83 + (batch_47 * 7 + rank) * sequences) * block_units + remainder_83;
+                        unsigned int dst_53 = quotient_83 * pitch_units + rank * block_units + remainder_83;
+                        unsigned int vec_45[4];
+                        {
+                            uint4 _uv4_168 = *reinterpret_cast<const uint4*>(inp_words + (src_51 * 4) + 0);
+                            vec_45[0 + 0] = _uv4_168.x;
+                            vec_45[0 + 1] = _uv4_168.y;
+                            vec_45[0 + 2] = _uv4_168.z;
+                            vec_45[0 + 3] = _uv4_168.w;
+                        }
+                        unsigned int unit_69 = base_2 + 2880;
+                        unsigned int clamped_69 = ((unit_69 < chi_5) ? unit_69 : last_unit_5);
+                        unsigned int quotient_84 = (unsigned int)((unsigned long long)clamped_69 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_84 = clamped_69 - quotient_84 * block_units;
+                        unsigned int correction_69 = (unsigned int)(remainder_84 >= block_units);
+                        quotient_84 = quotient_84 + correction_69;
+                        remainder_84 = remainder_84 - correction_69 * block_units;
+                        unsigned int batch_48 = (unsigned int)((unsigned long long)quotient_84 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int row_19 = quotient_84 - batch_48 * sequences;
+                        unsigned int carry_19 = (unsigned int)(row_19 >= sequences);
+                        batch_48 = batch_48 + carry_19;
+                        row_19 = row_19 - carry_19 * sequences;
+                        unsigned int src_52 = (quotient_84 + (batch_48 * 7 + rank) * sequences) * block_units + remainder_84;
+                        unsigned int dst_54 = quotient_84 * pitch_units + rank * block_units + remainder_84;
+                        unsigned int vec_46[4];
+                        {
+                            uint4 _uv4_169 = *reinterpret_cast<const uint4*>(inp_words + (src_52 * 4) + 0);
+                            vec_46[0 + 0] = _uv4_169.x;
+                            vec_46[0 + 1] = _uv4_169.y;
+                            vec_46[0 + 2] = _uv4_169.z;
+                            vec_46[0 + 3] = _uv4_169.w;
+                        }
+                        unsigned int unit_70 = base_2 + 3360;
+                        unsigned int clamped_70 = ((unit_70 < chi_5) ? unit_70 : last_unit_5);
+                        unsigned int quotient_85 = (unsigned int)((unsigned long long)clamped_70 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_85 = clamped_70 - quotient_85 * block_units;
+                        unsigned int correction_71 = (unsigned int)(remainder_85 >= block_units);
+                        quotient_85 = quotient_85 + correction_71;
+                        remainder_85 = remainder_85 - correction_71 * block_units;
+                        unsigned int batch_49 = (unsigned int)((unsigned long long)quotient_85 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int row_20 = quotient_85 - batch_49 * sequences;
+                        unsigned int carry_20 = (unsigned int)(row_20 >= sequences);
+                        batch_49 = batch_49 + carry_20;
+                        row_20 = row_20 - carry_20 * sequences;
+                        unsigned int src_53 = (quotient_85 + (batch_49 * 7 + rank) * sequences) * block_units + remainder_85;
+                        unsigned int dst_56 = quotient_85 * pitch_units + rank * block_units + remainder_85;
+                        unsigned int vec_47[4];
+                        {
+                            uint4 _uv4_170 = *reinterpret_cast<const uint4*>(inp_words + (src_53 * 4) + 0);
+                            vec_47[0 + 0] = _uv4_170.x;
+                            vec_47[0 + 1] = _uv4_170.y;
+                            vec_47[0 + 2] = _uv4_170.z;
+                            vec_47[0 + 3] = _uv4_170.w;
+                        }
+                        if (unit_62 < chi_5) {
+                            {
+                                auto _gst_171 = out_words + (dst_50 * 4);
+                                __builtin_assume(__isGlobal(_gst_171));
+                                reinterpret_cast<int4*>(_gst_171)[0] = reinterpret_cast<int4*>(vec_40)[0];
+                            }
+                        }
+                        if (unit_63 < chi_5) {
+                            {
+                                auto _gst_172 = out_words + (dst_49_1 * 4);
+                                __builtin_assume(__isGlobal(_gst_172));
+                                reinterpret_cast<int4*>(_gst_172)[0] = reinterpret_cast<int4*>(vec_41)[0];
+                            }
+                        }
+                        if (unit_64 < chi_5) {
+                            {
+                                auto _gst_173 = out_words + (dst_50_1 * 4);
+                                __builtin_assume(__isGlobal(_gst_173));
+                                reinterpret_cast<int4*>(_gst_173)[0] = reinterpret_cast<int4*>(vec_42)[0];
+                            }
+                        }
+                        if (unit_65 < chi_5) {
+                            {
+                                auto _gst_174 = out_words + (dst_51 * 4);
+                                __builtin_assume(__isGlobal(_gst_174));
+                                reinterpret_cast<int4*>(_gst_174)[0] = reinterpret_cast<int4*>(vec_43)[0];
+                            }
+                        }
+                        unsigned int unit_71 = base_2 + 3840;
+                        unsigned int clamped_71 = ((unit_71 < chi_5) ? unit_71 : last_unit_5);
+                        unsigned int quotient_86 = (unsigned int)((unsigned long long)clamped_71 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_86 = clamped_71 - quotient_86 * block_units;
+                        unsigned int correction_72 = (unsigned int)(remainder_86 >= block_units);
+                        quotient_86 = quotient_86 + correction_72;
+                        remainder_86 = remainder_86 - correction_72 * block_units;
+                        unsigned int batch_50 = (unsigned int)((unsigned long long)quotient_86 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int row_21 = quotient_86 - batch_50 * sequences;
+                        unsigned int carry_21 = (unsigned int)(row_21 >= sequences);
+                        batch_50 = batch_50 + carry_21;
+                        row_21 = row_21 - carry_21 * sequences;
+                        unsigned int src_55 = (quotient_86 + (batch_50 * 7 + rank) * sequences) * block_units + remainder_86;
+                        unsigned int dst_57 = quotient_86 * pitch_units + rank * block_units + remainder_86;
+                        unsigned int vec_48[4];
+                        {
+                            uint4 _uv4_175 = *reinterpret_cast<const uint4*>(inp_words + (src_55 * 4) + 0);
+                            vec_48[0 + 0] = _uv4_175.x;
+                            vec_48[0 + 1] = _uv4_175.y;
+                            vec_48[0 + 2] = _uv4_175.z;
+                            vec_48[0 + 3] = _uv4_175.w;
+                        }
+                        unsigned int unit_72 = base_2 + 4320;
+                        unsigned int clamped_72 = ((unit_72 < chi_5) ? unit_72 : last_unit_5);
+                        unsigned int quotient_87 = (unsigned int)((unsigned long long)clamped_72 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_87 = clamped_72 - quotient_87 * block_units;
+                        unsigned int correction_74 = (unsigned int)(remainder_87 >= block_units);
+                        quotient_87 = quotient_87 + correction_74;
+                        remainder_87 = remainder_87 - correction_74 * block_units;
+                        unsigned int batch_51 = (unsigned int)((unsigned long long)quotient_87 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int row_22 = quotient_87 - batch_51 * sequences;
+                        unsigned int carry_22 = (unsigned int)(row_22 >= sequences);
+                        batch_51 = batch_51 + carry_22;
+                        row_22 = row_22 - carry_22 * sequences;
+                        unsigned int src_56 = (quotient_87 + (batch_51 * 7 + rank) * sequences) * block_units + remainder_87;
+                        unsigned int dst_58 = quotient_87 * pitch_units + rank * block_units + remainder_87;
+                        unsigned int vec_49[4];
+                        {
+                            uint4 _uv4_176 = *reinterpret_cast<const uint4*>(inp_words + (src_56 * 4) + 0);
+                            vec_49[0 + 0] = _uv4_176.x;
+                            vec_49[0 + 1] = _uv4_176.y;
+                            vec_49[0 + 2] = _uv4_176.z;
+                            vec_49[0 + 3] = _uv4_176.w;
+                        }
+                        unsigned int unit_73 = base_2 + 4800;
+                        unsigned int clamped_73 = ((unit_73 < chi_5) ? unit_73 : last_unit_5);
+                        unsigned int quotient_89 = (unsigned int)((unsigned long long)clamped_73 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_88 = clamped_73 - quotient_89 * block_units;
+                        unsigned int correction_75 = (unsigned int)(remainder_88 >= block_units);
+                        quotient_89 = quotient_89 + correction_75;
+                        remainder_88 = remainder_88 - correction_75 * block_units;
+                        unsigned int batch_52 = (unsigned int)((unsigned long long)quotient_89 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int row_23 = quotient_89 - batch_52 * sequences;
+                        unsigned int carry_23 = (unsigned int)(row_23 >= sequences);
+                        batch_52 = batch_52 + carry_23;
+                        row_23 = row_23 - carry_23 * sequences;
+                        unsigned int src_57 = (quotient_89 + (batch_52 * 7 + rank) * sequences) * block_units + remainder_88;
+                        unsigned int dst_59 = quotient_89 * pitch_units + rank * block_units + remainder_88;
+                        unsigned int vec_50[4];
+                        {
+                            uint4 _uv4_177 = *reinterpret_cast<const uint4*>(inp_words + (src_57 * 4) + 0);
+                            vec_50[0 + 0] = _uv4_177.x;
+                            vec_50[0 + 1] = _uv4_177.y;
+                            vec_50[0 + 2] = _uv4_177.z;
+                            vec_50[0 + 3] = _uv4_177.w;
+                        }
+                        unsigned int unit_74 = base_2 + 5280;
+                        unsigned int clamped_74 = ((unit_74 < chi_5) ? unit_74 : last_unit_5);
+                        unsigned int quotient_90 = (unsigned int)((unsigned long long)clamped_74 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_90 = clamped_74 - quotient_90 * block_units;
+                        unsigned int correction_76 = (unsigned int)(remainder_90 >= block_units);
+                        quotient_90 = quotient_90 + correction_76;
+                        remainder_90 = remainder_90 - correction_76 * block_units;
+                        unsigned int batch_53 = (unsigned int)((unsigned long long)quotient_90 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int row_24 = quotient_90 - batch_53 * sequences;
+                        unsigned int carry_24 = (unsigned int)(row_24 >= sequences);
+                        batch_53 = batch_53 + carry_24;
+                        row_24 = row_24 - carry_24 * sequences;
+                        unsigned int src_58 = (quotient_90 + (batch_53 * 7 + rank) * sequences) * block_units + remainder_90;
+                        unsigned int dst_60 = quotient_90 * pitch_units + rank * block_units + remainder_90;
+                        unsigned int vec_51[4];
+                        {
+                            uint4 _uv4_178 = *reinterpret_cast<const uint4*>(inp_words + (src_58 * 4) + 0);
+                            vec_51[0 + 0] = _uv4_178.x;
+                            vec_51[0 + 1] = _uv4_178.y;
+                            vec_51[0 + 2] = _uv4_178.z;
+                            vec_51[0 + 3] = _uv4_178.w;
+                        }
+                        if (unit_67 < chi_5) {
+                            {
+                                auto _gst_179 = out_words + (dst_52 * 4);
+                                __builtin_assume(__isGlobal(_gst_179));
+                                reinterpret_cast<int4*>(_gst_179)[0] = reinterpret_cast<int4*>(vec_44)[0];
+                            }
+                        }
+                        if (unit_68 < chi_5) {
+                            {
+                                auto _gst_180 = out_words + (dst_53 * 4);
+                                __builtin_assume(__isGlobal(_gst_180));
+                                reinterpret_cast<int4*>(_gst_180)[0] = reinterpret_cast<int4*>(vec_45)[0];
+                            }
+                        }
+                        if (unit_69 < chi_5) {
+                            {
+                                auto _gst_181 = out_words + (dst_54 * 4);
+                                __builtin_assume(__isGlobal(_gst_181));
+                                reinterpret_cast<int4*>(_gst_181)[0] = reinterpret_cast<int4*>(vec_46)[0];
+                            }
+                        }
+                        if (unit_70 < chi_5) {
+                            {
+                                auto _gst_182 = out_words + (dst_56 * 4);
+                                __builtin_assume(__isGlobal(_gst_182));
+                                reinterpret_cast<int4*>(_gst_182)[0] = reinterpret_cast<int4*>(vec_47)[0];
+                            }
+                        }
+                        unsigned int unit_75 = base_2 + 5760;
+                        unsigned int clamped_75 = ((unit_75 < chi_5) ? unit_75 : last_unit_5);
+                        unsigned int quotient_92 = (unsigned int)((unsigned long long)clamped_75 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_91 = clamped_75 - quotient_92 * block_units;
+                        unsigned int correction_77 = (unsigned int)(remainder_91 >= block_units);
+                        quotient_92 = quotient_92 + correction_77;
+                        remainder_91 = remainder_91 - correction_77 * block_units;
+                        unsigned int batch_54 = (unsigned int)((unsigned long long)quotient_92 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int row_25 = quotient_92 - batch_54 * sequences;
+                        unsigned int carry_25 = (unsigned int)(row_25 >= sequences);
+                        batch_54 = batch_54 + carry_25;
+                        row_25 = row_25 - carry_25 * sequences;
+                        unsigned int src_59 = (quotient_92 + (batch_54 * 7 + rank) * sequences) * block_units + remainder_91;
+                        unsigned int dst_61 = quotient_92 * pitch_units + rank * block_units + remainder_91;
+                        unsigned int vec_52[4];
+                        {
+                            uint4 _uv4_183 = *reinterpret_cast<const uint4*>(inp_words + (src_59 * 4) + 0);
+                            vec_52[0 + 0] = _uv4_183.x;
+                            vec_52[0 + 1] = _uv4_183.y;
+                            vec_52[0 + 2] = _uv4_183.z;
+                            vec_52[0 + 3] = _uv4_183.w;
+                        }
+                        unsigned int unit_77 = base_2 + 6240;
+                        unsigned int clamped_76 = ((unit_77 < chi_5) ? unit_77 : last_unit_5);
+                        unsigned int quotient_93 = (unsigned int)((unsigned long long)clamped_76 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_93 = clamped_76 - quotient_93 * block_units;
+                        unsigned int correction_78 = (unsigned int)(remainder_93 >= block_units);
+                        quotient_93 = quotient_93 + correction_78;
+                        remainder_93 = remainder_93 - correction_78 * block_units;
+                        unsigned int batch_55 = (unsigned int)((unsigned long long)quotient_93 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int row_26 = quotient_93 - batch_55 * sequences;
+                        unsigned int carry_26 = (unsigned int)(row_26 >= sequences);
+                        batch_55 = batch_55 + carry_26;
+                        row_26 = row_26 - carry_26 * sequences;
+                        unsigned int src_60 = (quotient_93 + (batch_55 * 7 + rank) * sequences) * block_units + remainder_93;
+                        unsigned int dst_62 = quotient_93 * pitch_units + rank * block_units + remainder_93;
+                        unsigned int vec_53[4];
+                        {
+                            uint4 _uv4_184 = *reinterpret_cast<const uint4*>(inp_words + (src_60 * 4) + 0);
+                            vec_53[0 + 0] = _uv4_184.x;
+                            vec_53[0 + 1] = _uv4_184.y;
+                            vec_53[0 + 2] = _uv4_184.z;
+                            vec_53[0 + 3] = _uv4_184.w;
+                        }
+                        unsigned int unit_78 = base_2 + 6720;
+                        unsigned int clamped_78 = ((unit_78 < chi_5) ? unit_78 : last_unit_5);
+                        unsigned int quotient_94 = (unsigned int)((unsigned long long)clamped_78 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_94 = clamped_78 - quotient_94 * block_units;
+                        unsigned int correction_79 = (unsigned int)(remainder_94 >= block_units);
+                        quotient_94 = quotient_94 + correction_79;
+                        remainder_94 = remainder_94 - correction_79 * block_units;
+                        unsigned int batch_56 = (unsigned int)((unsigned long long)quotient_94 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int row_27 = quotient_94 - batch_56 * sequences;
+                        unsigned int carry_27 = (unsigned int)(row_27 >= sequences);
+                        batch_56 = batch_56 + carry_27;
+                        row_27 = row_27 - carry_27 * sequences;
+                        unsigned int src_61 = (quotient_94 + (batch_56 * 7 + rank) * sequences) * block_units + remainder_94;
+                        unsigned int dst_63 = quotient_94 * pitch_units + rank * block_units + remainder_94;
+                        unsigned int vec_54[4];
+                        {
+                            uint4 _uv4_185 = *reinterpret_cast<const uint4*>(inp_words + (src_61 * 4) + 0);
+                            vec_54[0 + 0] = _uv4_185.x;
+                            vec_54[0 + 1] = _uv4_185.y;
+                            vec_54[0 + 2] = _uv4_185.z;
+                            vec_54[0 + 3] = _uv4_185.w;
+                        }
+                        unsigned int unit_79 = base_2 + 7200;
+                        unsigned int clamped_79 = ((unit_79 < chi_5) ? unit_79 : last_unit_5);
+                        unsigned int quotient_95 = (unsigned int)((unsigned long long)clamped_79 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_95 = clamped_79 - quotient_95 * block_units;
+                        unsigned int correction_81 = (unsigned int)(remainder_95 >= block_units);
+                        quotient_95 = quotient_95 + correction_81;
+                        remainder_95 = remainder_95 - correction_81 * block_units;
+                        unsigned int batch_57 = (unsigned int)((unsigned long long)quotient_95 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int row_28 = quotient_95 - batch_57 * sequences;
+                        unsigned int carry_28 = (unsigned int)(row_28 >= sequences);
+                        batch_57 = batch_57 + carry_28;
+                        row_28 = row_28 - carry_28 * sequences;
+                        unsigned int src_62 = (quotient_95 + (batch_57 * 7 + rank) * sequences) * block_units + remainder_95;
+                        unsigned int dst_64 = quotient_95 * pitch_units + rank * block_units + remainder_95;
+                        unsigned int vec_55[4];
+                        {
+                            uint4 _uv4_186 = *reinterpret_cast<const uint4*>(inp_words + (src_62 * 4) + 0);
+                            vec_55[0 + 0] = _uv4_186.x;
+                            vec_55[0 + 1] = _uv4_186.y;
+                            vec_55[0 + 2] = _uv4_186.z;
+                            vec_55[0 + 3] = _uv4_186.w;
+                        }
+                        if (unit_71 < chi_5) {
+                            {
+                                auto _gst_187 = out_words + (dst_57 * 4);
+                                __builtin_assume(__isGlobal(_gst_187));
+                                reinterpret_cast<int4*>(_gst_187)[0] = reinterpret_cast<int4*>(vec_48)[0];
+                            }
+                        }
+                        if (unit_72 < chi_5) {
+                            {
+                                auto _gst_188 = out_words + (dst_58 * 4);
+                                __builtin_assume(__isGlobal(_gst_188));
+                                reinterpret_cast<int4*>(_gst_188)[0] = reinterpret_cast<int4*>(vec_49)[0];
+                            }
+                        }
+                        if (unit_73 < chi_5) {
+                            {
+                                auto _gst_189 = out_words + (dst_59 * 4);
+                                __builtin_assume(__isGlobal(_gst_189));
+                                reinterpret_cast<int4*>(_gst_189)[0] = reinterpret_cast<int4*>(vec_50)[0];
+                            }
+                        }
+                        if (unit_74 < chi_5) {
+                            {
+                                auto _gst_190 = out_words + (dst_60 * 4);
+                                __builtin_assume(__isGlobal(_gst_190));
+                                reinterpret_cast<int4*>(_gst_190)[0] = reinterpret_cast<int4*>(vec_51)[0];
+                            }
+                        }
+                        if (unit_75 < chi_5) {
+                            {
+                                auto _gst_191 = out_words + (dst_61 * 4);
+                                __builtin_assume(__isGlobal(_gst_191));
+                                reinterpret_cast<int4*>(_gst_191)[0] = reinterpret_cast<int4*>(vec_52)[0];
+                            }
+                        }
+                        if (unit_77 < chi_5) {
+                            {
+                                auto _gst_192 = out_words + (dst_62 * 4);
+                                __builtin_assume(__isGlobal(_gst_192));
+                                reinterpret_cast<int4*>(_gst_192)[0] = reinterpret_cast<int4*>(vec_53)[0];
+                            }
+                        }
+                        if (unit_78 < chi_5) {
+                            {
+                                auto _gst_193 = out_words + (dst_63 * 4);
+                                __builtin_assume(__isGlobal(_gst_193));
+                                reinterpret_cast<int4*>(_gst_193)[0] = reinterpret_cast<int4*>(vec_54)[0];
+                            }
+                        }
+                        if (unit_79 < chi_5) {
+                            {
+                                auto _gst_194 = out_words + (dst_64 * 4);
+                                __builtin_assume(__isGlobal(_gst_194));
+                                reinterpret_cast<int4*>(_gst_194)[0] = reinterpret_cast<int4*>(vec_55)[0];
+                            }
+                        }
+                    }
+                } else {
+                    #pragma unroll 1
+                    for (unsigned int u_5 = clo_5 + tid_0; u_5 < chi_5; u_5 += 480) {
+                        unsigned int quotient_96 = (unsigned int)((unsigned long long)u_5 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_96 = u_5 - quotient_96 * block_units;
+                        unsigned int correction_73 = (unsigned int)(remainder_96 >= block_units);
+                        quotient_96 = quotient_96 + correction_73;
+                        remainder_96 = remainder_96 - correction_73 * block_units;
+                        unsigned int batch_58 = (unsigned int)((unsigned long long)quotient_96 * (unsigned long long)sequences_magic >> 32);
+                        unsigned int row_29 = quotient_96 - batch_58 * sequences;
+                        unsigned int carry_29 = (unsigned int)(row_29 >= sequences);
+                        batch_58 = batch_58 + carry_29;
+                        row_29 = row_29 - carry_29 * sequences;
+                        unsigned int src_63 = (quotient_96 + (batch_58 * 7 + rank) * sequences) * block_units + remainder_96;
+                        unsigned int dst_66 = quotient_96 * pitch_units + rank * block_units + remainder_96;
+                        out[dst_66] = inp[src_63];
+                    }
+                }
+            }
+        }
         #pragma unroll 1
-        for (unsigned int k_1 = 0; k_1 < total; k_1++) {
+        for (unsigned int k_1 = 1; k_1 < total; k_1++) {
             if (out_chunks > k_1) {
                 if (warp_1 < 15) {
                     if (vector != 0) {
                         unsigned int last_2 = units - 1;
                         unsigned int stripe_1 = (sub + k_1 * parts) * 7680;
-                        unsigned int unit_2 = stripe_1 + tid_0;
-                        unsigned int clamped_2 = ((unit_2 < units) ? unit_2 : last_2);
-                        unsigned int quotient_0_4 = (unsigned int)((unsigned long long)clamped_2 * (unsigned long long)units_magic >> 32);
-                        unsigned int remainder_1_4 = clamped_2 - quotient_0_4 * block_units;
-                        unsigned int correction_4 = (unsigned int)(remainder_1_4 >= block_units);
-                        quotient_0_4 = quotient_0_4 + correction_4;
-                        remainder_1_4 = remainder_1_4 - correction_4 * block_units;
+                        unsigned int unit_80 = stripe_1 + tid_0;
+                        unsigned int clamped_80 = ((unit_80 < units) ? unit_80 : last_2);
+                        unsigned int quotient_0_4 = (unsigned int)((unsigned long long)clamped_80 * (unsigned long long)units_magic >> 32);
+                        unsigned int remainder_1_4 = clamped_80 - quotient_0_4 * block_units;
+                        unsigned int correction_82 = (unsigned int)(remainder_1_4 >= block_units);
+                        quotient_0_4 = quotient_0_4 + correction_82;
+                        remainder_1_4 = remainder_1_4 - correction_82 * block_units;
                         unsigned int quotient_3_4 = (unsigned int)((unsigned long long)quotient_0_4 * (unsigned long long)sequences_magic >> 32);
                         unsigned int remainder_4 = quotient_0_4 - quotient_3_4 * sequences;
-                        unsigned int correction_5 = (unsigned int)(remainder_4 >= sequences);
-                        quotient_3_4 = quotient_3_4 + correction_5;
-                        remainder_4 = remainder_4 - correction_5 * sequences;
-                        unsigned int src_4 = (quotient_0_4 + (quotient_3_4 * 7 + destination) * sequences) * block_units + remainder_1_4;
-                        unsigned int dst_4 = quotient_0_4 * pitch_units + rank * block_units + remainder_1_4;
+                        unsigned int correction_5_1 = (unsigned int)(remainder_4 >= sequences);
+                        quotient_3_4 = quotient_3_4 + correction_5_1;
+                        remainder_4 = remainder_4 - correction_5_1 * sequences;
+                        unsigned int src_65 = (quotient_0_4 + (quotient_3_4 * 7 + destination) * sequences) * block_units + remainder_1_4;
+                        unsigned int dst_67 = quotient_0_4 * pitch_units + rank * block_units + remainder_1_4;
                         unsigned int _vec_load_0_1[4];
                         {
-                            uint4 _uv4_66 = *reinterpret_cast<const uint4*>(inp_words + (src_4 * 4) + 0);
-                            _vec_load_0_1[0 + 0] = _uv4_66.x;
-                            _vec_load_0_1[0 + 1] = _uv4_66.y;
-                            _vec_load_0_1[0 + 2] = _uv4_66.z;
-                            _vec_load_0_1[0 + 3] = _uv4_66.w;
+                            uint4 _uv4_195 = *reinterpret_cast<const uint4*>(inp_words + (src_65 * 4) + 0);
+                            _vec_load_0_1[0 + 0] = _uv4_195.x;
+                            _vec_load_0_1[0 + 1] = _uv4_195.y;
+                            _vec_load_0_1[0 + 2] = _uv4_195.z;
+                            _vec_load_0_1[0 + 3] = _uv4_195.w;
                         }
                         unsigned int unit_6_2 = stripe_1 + (480 + tid_0);
                         unsigned int clamped_7_2 = ((unit_6_2 < units) ? unit_6_2 : last_2);
                         unsigned int quotient_8_2 = (unsigned int)((unsigned long long)clamped_7_2 * (unsigned long long)units_magic >> 32);
                         unsigned int remainder_9_2 = clamped_7_2 - quotient_8_2 * block_units;
-                        unsigned int correction_10_2 = (unsigned int)(remainder_9_2 >= block_units);
-                        quotient_8_2 = quotient_8_2 + correction_10_2;
-                        remainder_9_2 = remainder_9_2 - correction_10_2 * block_units;
+                        unsigned int correction_10_3 = (unsigned int)(remainder_9_2 >= block_units);
+                        quotient_8_2 = quotient_8_2 + correction_10_3;
+                        remainder_9_2 = remainder_9_2 - correction_10_3 * block_units;
                         unsigned int quotient_11_2 = (unsigned int)((unsigned long long)quotient_8_2 * (unsigned long long)sequences_magic >> 32);
                         unsigned int remainder_12 = quotient_8_2 - quotient_11_2 * sequences;
-                        unsigned int correction_13 = (unsigned int)(remainder_12 >= sequences);
-                        quotient_11_2 = quotient_11_2 + correction_13;
-                        remainder_12 = remainder_12 - correction_13 * sequences;
-                        unsigned int src_14_2 = (quotient_8_2 + (quotient_11_2 * 7 + destination) * sequences) * block_units + remainder_9_2;
-                        unsigned int dst_15_2 = quotient_8_2 * pitch_units + rank * block_units + remainder_9_2;
+                        unsigned int correction_13_1 = (unsigned int)(remainder_12 >= sequences);
+                        quotient_11_2 = quotient_11_2 + correction_13_1;
+                        remainder_12 = remainder_12 - correction_13_1 * sequences;
+                        unsigned int src_14_3 = (quotient_8_2 + (quotient_11_2 * 7 + destination) * sequences) * block_units + remainder_9_2;
+                        unsigned int dst_15_3 = quotient_8_2 * pitch_units + rank * block_units + remainder_9_2;
                         unsigned int _vec_load_1_1[4];
                         {
-                            uint4 _uv4_67 = *reinterpret_cast<const uint4*>(inp_words + (src_14_2 * 4) + 0);
-                            _vec_load_1_1[0 + 0] = _uv4_67.x;
-                            _vec_load_1_1[0 + 1] = _uv4_67.y;
-                            _vec_load_1_1[0 + 2] = _uv4_67.z;
-                            _vec_load_1_1[0 + 3] = _uv4_67.w;
+                            uint4 _uv4_196 = *reinterpret_cast<const uint4*>(inp_words + (src_14_3 * 4) + 0);
+                            _vec_load_1_1[0 + 0] = _uv4_196.x;
+                            _vec_load_1_1[0 + 1] = _uv4_196.y;
+                            _vec_load_1_1[0 + 2] = _uv4_196.z;
+                            _vec_load_1_1[0 + 3] = _uv4_196.w;
                         }
                         unsigned int unit_16_2 = stripe_1 + (960 + tid_0);
                         unsigned int clamped_17_2 = ((unit_16_2 < units) ? unit_16_2 : last_2);
                         unsigned int quotient_18_2 = (unsigned int)((unsigned long long)clamped_17_2 * (unsigned long long)units_magic >> 32);
                         unsigned int remainder_19_2 = clamped_17_2 - quotient_18_2 * block_units;
-                        unsigned int correction_20_2 = (unsigned int)(remainder_19_2 >= block_units);
-                        quotient_18_2 = quotient_18_2 + correction_20_2;
-                        remainder_19_2 = remainder_19_2 - correction_20_2 * block_units;
+                        unsigned int correction_20_3 = (unsigned int)(remainder_19_2 >= block_units);
+                        quotient_18_2 = quotient_18_2 + correction_20_3;
+                        remainder_19_2 = remainder_19_2 - correction_20_3 * block_units;
                         unsigned int quotient_21_2 = (unsigned int)((unsigned long long)quotient_18_2 * (unsigned long long)sequences_magic >> 32);
                         unsigned int remainder_22 = quotient_18_2 - quotient_21_2 * sequences;
-                        unsigned int correction_23 = (unsigned int)(remainder_22 >= sequences);
-                        quotient_21_2 = quotient_21_2 + correction_23;
-                        remainder_22 = remainder_22 - correction_23 * sequences;
-                        unsigned int src_24_2 = (quotient_18_2 + (quotient_21_2 * 7 + destination) * sequences) * block_units + remainder_19_2;
-                        unsigned int dst_25_2 = quotient_18_2 * pitch_units + rank * block_units + remainder_19_2;
+                        unsigned int correction_23_1 = (unsigned int)(remainder_22 >= sequences);
+                        quotient_21_2 = quotient_21_2 + correction_23_1;
+                        remainder_22 = remainder_22 - correction_23_1 * sequences;
+                        unsigned int src_24_3 = (quotient_18_2 + (quotient_21_2 * 7 + destination) * sequences) * block_units + remainder_19_2;
+                        unsigned int dst_25_3 = quotient_18_2 * pitch_units + rank * block_units + remainder_19_2;
                         unsigned int _vec_load_2_1[4];
                         {
-                            uint4 _uv4_68 = *reinterpret_cast<const uint4*>(inp_words + (src_24_2 * 4) + 0);
-                            _vec_load_2_1[0 + 0] = _uv4_68.x;
-                            _vec_load_2_1[0 + 1] = _uv4_68.y;
-                            _vec_load_2_1[0 + 2] = _uv4_68.z;
-                            _vec_load_2_1[0 + 3] = _uv4_68.w;
+                            uint4 _uv4_197 = *reinterpret_cast<const uint4*>(inp_words + (src_24_3 * 4) + 0);
+                            _vec_load_2_1[0 + 0] = _uv4_197.x;
+                            _vec_load_2_1[0 + 1] = _uv4_197.y;
+                            _vec_load_2_1[0 + 2] = _uv4_197.z;
+                            _vec_load_2_1[0 + 3] = _uv4_197.w;
                         }
                         unsigned int unit_26_2 = stripe_1 + (1440 + tid_0);
                         unsigned int clamped_27_2 = ((unit_26_2 < units) ? unit_26_2 : last_2);
@@ -1165,18 +3130,18 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                         remainder_29_2 = remainder_29_2 - correction_30_2 * block_units;
                         unsigned int quotient_31_2 = (unsigned int)((unsigned long long)quotient_28_2 * (unsigned long long)sequences_magic >> 32);
                         unsigned int remainder_32 = quotient_28_2 - quotient_31_2 * sequences;
-                        unsigned int correction_33 = (unsigned int)(remainder_32 >= sequences);
-                        quotient_31_2 = quotient_31_2 + correction_33;
-                        remainder_32 = remainder_32 - correction_33 * sequences;
-                        unsigned int src_34_2 = (quotient_28_2 + (quotient_31_2 * 7 + destination) * sequences) * block_units + remainder_29_2;
+                        unsigned int correction_33_1 = (unsigned int)(remainder_32 >= sequences);
+                        quotient_31_2 = quotient_31_2 + correction_33_1;
+                        remainder_32 = remainder_32 - correction_33_1 * sequences;
+                        unsigned int src_34_3 = (quotient_28_2 + (quotient_31_2 * 7 + destination) * sequences) * block_units + remainder_29_2;
                         unsigned int dst_35_2 = quotient_28_2 * pitch_units + rank * block_units + remainder_29_2;
                         unsigned int _vec_load_3_1[4];
                         {
-                            uint4 _uv4_69 = *reinterpret_cast<const uint4*>(inp_words + (src_34_2 * 4) + 0);
-                            _vec_load_3_1[0 + 0] = _uv4_69.x;
-                            _vec_load_3_1[0 + 1] = _uv4_69.y;
-                            _vec_load_3_1[0 + 2] = _uv4_69.z;
-                            _vec_load_3_1[0 + 3] = _uv4_69.w;
+                            uint4 _uv4_198 = *reinterpret_cast<const uint4*>(inp_words + (src_34_3 * 4) + 0);
+                            _vec_load_3_1[0 + 0] = _uv4_198.x;
+                            _vec_load_3_1[0 + 1] = _uv4_198.y;
+                            _vec_load_3_1[0 + 2] = _uv4_198.z;
+                            _vec_load_3_1[0 + 3] = _uv4_198.w;
                         }
                         unsigned int unit_36_2 = stripe_1 + (1920 + tid_0);
                         unsigned int clamped_37_2 = ((unit_36_2 < units) ? unit_36_2 : last_2);
@@ -1187,18 +3152,18 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                         remainder_39_2 = remainder_39_2 - correction_40_2 * block_units;
                         unsigned int quotient_41_2 = (unsigned int)((unsigned long long)quotient_38_2 * (unsigned long long)sequences_magic >> 32);
                         unsigned int remainder_42 = quotient_38_2 - quotient_41_2 * sequences;
-                        unsigned int correction_43 = (unsigned int)(remainder_42 >= sequences);
-                        quotient_41_2 = quotient_41_2 + correction_43;
-                        remainder_42 = remainder_42 - correction_43 * sequences;
+                        unsigned int correction_43_1 = (unsigned int)(remainder_42 >= sequences);
+                        quotient_41_2 = quotient_41_2 + correction_43_1;
+                        remainder_42 = remainder_42 - correction_43_1 * sequences;
                         unsigned int src_44_2 = (quotient_38_2 + (quotient_41_2 * 7 + destination) * sequences) * block_units + remainder_39_2;
                         unsigned int dst_45_2 = quotient_38_2 * pitch_units + rank * block_units + remainder_39_2;
                         unsigned int _vec_load_4_1[4];
                         {
-                            uint4 _uv4_70 = *reinterpret_cast<const uint4*>(inp_words + (src_44_2 * 4) + 0);
-                            _vec_load_4_1[0 + 0] = _uv4_70.x;
-                            _vec_load_4_1[0 + 1] = _uv4_70.y;
-                            _vec_load_4_1[0 + 2] = _uv4_70.z;
-                            _vec_load_4_1[0 + 3] = _uv4_70.w;
+                            uint4 _uv4_199 = *reinterpret_cast<const uint4*>(inp_words + (src_44_2 * 4) + 0);
+                            _vec_load_4_1[0 + 0] = _uv4_199.x;
+                            _vec_load_4_1[0 + 1] = _uv4_199.y;
+                            _vec_load_4_1[0 + 2] = _uv4_199.z;
+                            _vec_load_4_1[0 + 3] = _uv4_199.w;
                         }
                         unsigned int unit_46_2 = stripe_1 + (2400 + tid_0);
                         unsigned int clamped_47_2 = ((unit_46_2 < units) ? unit_46_2 : last_2);
@@ -1209,18 +3174,18 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                         remainder_49_2 = remainder_49_2 - correction_50_2 * block_units;
                         unsigned int quotient_51_2 = (unsigned int)((unsigned long long)quotient_48_2 * (unsigned long long)sequences_magic >> 32);
                         unsigned int remainder_52 = quotient_48_2 - quotient_51_2 * sequences;
-                        unsigned int correction_53 = (unsigned int)(remainder_52 >= sequences);
-                        quotient_51_2 = quotient_51_2 + correction_53;
-                        remainder_52 = remainder_52 - correction_53 * sequences;
+                        unsigned int correction_53_1 = (unsigned int)(remainder_52 >= sequences);
+                        quotient_51_2 = quotient_51_2 + correction_53_1;
+                        remainder_52 = remainder_52 - correction_53_1 * sequences;
                         unsigned int src_54_2 = (quotient_48_2 + (quotient_51_2 * 7 + destination) * sequences) * block_units + remainder_49_2;
                         unsigned int dst_55_2 = quotient_48_2 * pitch_units + rank * block_units + remainder_49_2;
                         unsigned int _vec_load_5_1[4];
                         {
-                            uint4 _uv4_71 = *reinterpret_cast<const uint4*>(inp_words + (src_54_2 * 4) + 0);
-                            _vec_load_5_1[0 + 0] = _uv4_71.x;
-                            _vec_load_5_1[0 + 1] = _uv4_71.y;
-                            _vec_load_5_1[0 + 2] = _uv4_71.z;
-                            _vec_load_5_1[0 + 3] = _uv4_71.w;
+                            uint4 _uv4_200 = *reinterpret_cast<const uint4*>(inp_words + (src_54_2 * 4) + 0);
+                            _vec_load_5_1[0 + 0] = _uv4_200.x;
+                            _vec_load_5_1[0 + 1] = _uv4_200.y;
+                            _vec_load_5_1[0 + 2] = _uv4_200.z;
+                            _vec_load_5_1[0 + 3] = _uv4_200.w;
                         }
                         unsigned int unit_56_2 = stripe_1 + (2880 + tid_0);
                         unsigned int clamped_57_2 = ((unit_56_2 < units) ? unit_56_2 : last_2);
@@ -1231,18 +3196,18 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                         remainder_59_2 = remainder_59_2 - correction_60_2 * block_units;
                         unsigned int quotient_61_2 = (unsigned int)((unsigned long long)quotient_58_2 * (unsigned long long)sequences_magic >> 32);
                         unsigned int remainder_62 = quotient_58_2 - quotient_61_2 * sequences;
-                        unsigned int correction_63 = (unsigned int)(remainder_62 >= sequences);
-                        quotient_61_2 = quotient_61_2 + correction_63;
-                        remainder_62 = remainder_62 - correction_63 * sequences;
+                        unsigned int correction_63_1 = (unsigned int)(remainder_62 >= sequences);
+                        quotient_61_2 = quotient_61_2 + correction_63_1;
+                        remainder_62 = remainder_62 - correction_63_1 * sequences;
                         unsigned int src_64_2 = (quotient_58_2 + (quotient_61_2 * 7 + destination) * sequences) * block_units + remainder_59_2;
                         unsigned int dst_65_2 = quotient_58_2 * pitch_units + rank * block_units + remainder_59_2;
                         unsigned int _vec_load_6_1[4];
                         {
-                            uint4 _uv4_72 = *reinterpret_cast<const uint4*>(inp_words + (src_64_2 * 4) + 0);
-                            _vec_load_6_1[0 + 0] = _uv4_72.x;
-                            _vec_load_6_1[0 + 1] = _uv4_72.y;
-                            _vec_load_6_1[0 + 2] = _uv4_72.z;
-                            _vec_load_6_1[0 + 3] = _uv4_72.w;
+                            uint4 _uv4_201 = *reinterpret_cast<const uint4*>(inp_words + (src_64_2 * 4) + 0);
+                            _vec_load_6_1[0 + 0] = _uv4_201.x;
+                            _vec_load_6_1[0 + 1] = _uv4_201.y;
+                            _vec_load_6_1[0 + 2] = _uv4_201.z;
+                            _vec_load_6_1[0 + 3] = _uv4_201.w;
                         }
                         unsigned int unit_66_2 = stripe_1 + (3360 + tid_0);
                         unsigned int clamped_67_2 = ((unit_66_2 < units) ? unit_66_2 : last_2);
@@ -1253,45 +3218,45 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                         remainder_69_2 = remainder_69_2 - correction_70_2 * block_units;
                         unsigned int quotient_71_2 = (unsigned int)((unsigned long long)quotient_68_2 * (unsigned long long)sequences_magic >> 32);
                         unsigned int remainder_72 = quotient_68_2 - quotient_71_2 * sequences;
-                        unsigned int correction_73 = (unsigned int)(remainder_72 >= sequences);
-                        quotient_71_2 = quotient_71_2 + correction_73;
-                        remainder_72 = remainder_72 - correction_73 * sequences;
+                        unsigned int correction_73_1 = (unsigned int)(remainder_72 >= sequences);
+                        quotient_71_2 = quotient_71_2 + correction_73_1;
+                        remainder_72 = remainder_72 - correction_73_1 * sequences;
                         unsigned int src_74_2 = (quotient_68_2 + (quotient_71_2 * 7 + destination) * sequences) * block_units + remainder_69_2;
                         unsigned int dst_75_2 = quotient_68_2 * pitch_units + rank * block_units + remainder_69_2;
                         unsigned int _vec_load_7_1[4];
                         {
-                            uint4 _uv4_73 = *reinterpret_cast<const uint4*>(inp_words + (src_74_2 * 4) + 0);
-                            _vec_load_7_1[0 + 0] = _uv4_73.x;
-                            _vec_load_7_1[0 + 1] = _uv4_73.y;
-                            _vec_load_7_1[0 + 2] = _uv4_73.z;
-                            _vec_load_7_1[0 + 3] = _uv4_73.w;
+                            uint4 _uv4_202 = *reinterpret_cast<const uint4*>(inp_words + (src_74_2 * 4) + 0);
+                            _vec_load_7_1[0 + 0] = _uv4_202.x;
+                            _vec_load_7_1[0 + 1] = _uv4_202.y;
+                            _vec_load_7_1[0 + 2] = _uv4_202.z;
+                            _vec_load_7_1[0 + 3] = _uv4_202.w;
                         }
-                        if (unit_2 < units) {
+                        if (unit_80 < units) {
                             {
-                                auto _gst_74 = peer_words + (dst_4 * 4);
-                                __builtin_assume(__isGlobal(_gst_74));
-                                reinterpret_cast<int4*>(_gst_74)[0] = reinterpret_cast<int4*>(_vec_load_0_1)[0];
+                                auto _gst_203 = peer_words + (dst_67 * 4);
+                                __builtin_assume(__isGlobal(_gst_203));
+                                reinterpret_cast<int4*>(_gst_203)[0] = reinterpret_cast<int4*>(_vec_load_0_1)[0];
                             }
                         }
                         if (unit_6_2 < units) {
                             {
-                                auto _gst_75 = peer_words + (dst_15_2 * 4);
-                                __builtin_assume(__isGlobal(_gst_75));
-                                reinterpret_cast<int4*>(_gst_75)[0] = reinterpret_cast<int4*>(_vec_load_1_1)[0];
+                                auto _gst_204 = peer_words + (dst_15_3 * 4);
+                                __builtin_assume(__isGlobal(_gst_204));
+                                reinterpret_cast<int4*>(_gst_204)[0] = reinterpret_cast<int4*>(_vec_load_1_1)[0];
                             }
                         }
                         if (unit_16_2 < units) {
                             {
-                                auto _gst_76 = peer_words + (dst_25_2 * 4);
-                                __builtin_assume(__isGlobal(_gst_76));
-                                reinterpret_cast<int4*>(_gst_76)[0] = reinterpret_cast<int4*>(_vec_load_2_1)[0];
+                                auto _gst_205 = peer_words + (dst_25_3 * 4);
+                                __builtin_assume(__isGlobal(_gst_205));
+                                reinterpret_cast<int4*>(_gst_205)[0] = reinterpret_cast<int4*>(_vec_load_2_1)[0];
                             }
                         }
                         if (unit_26_2 < units) {
                             {
-                                auto _gst_77 = peer_words + (dst_35_2 * 4);
-                                __builtin_assume(__isGlobal(_gst_77));
-                                reinterpret_cast<int4*>(_gst_77)[0] = reinterpret_cast<int4*>(_vec_load_3_1)[0];
+                                auto _gst_206 = peer_words + (dst_35_2 * 4);
+                                __builtin_assume(__isGlobal(_gst_206));
+                                reinterpret_cast<int4*>(_gst_206)[0] = reinterpret_cast<int4*>(_vec_load_3_1)[0];
                             }
                         }
                         unsigned int unit_76_2 = stripe_1 + (3840 + tid_0);
@@ -1310,11 +3275,11 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_85_2 = quotient_78_2 * pitch_units + rank * block_units + remainder_79_2;
                         unsigned int _vec_load_8_1[4];
                         {
-                            uint4 _uv4_78 = *reinterpret_cast<const uint4*>(inp_words + (src_84_2 * 4) + 0);
-                            _vec_load_8_1[0 + 0] = _uv4_78.x;
-                            _vec_load_8_1[0 + 1] = _uv4_78.y;
-                            _vec_load_8_1[0 + 2] = _uv4_78.z;
-                            _vec_load_8_1[0 + 3] = _uv4_78.w;
+                            uint4 _uv4_207 = *reinterpret_cast<const uint4*>(inp_words + (src_84_2 * 4) + 0);
+                            _vec_load_8_1[0 + 0] = _uv4_207.x;
+                            _vec_load_8_1[0 + 1] = _uv4_207.y;
+                            _vec_load_8_1[0 + 2] = _uv4_207.z;
+                            _vec_load_8_1[0 + 3] = _uv4_207.w;
                         }
                         unsigned int unit_86_2 = stripe_1 + (4320 + tid_0);
                         unsigned int clamped_87_2 = ((unit_86_2 < units) ? unit_86_2 : last_2);
@@ -1332,11 +3297,11 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_95_2 = quotient_88_2 * pitch_units + rank * block_units + remainder_89_2;
                         unsigned int _vec_load_9_1[4];
                         {
-                            uint4 _uv4_79 = *reinterpret_cast<const uint4*>(inp_words + (src_94_2 * 4) + 0);
-                            _vec_load_9_1[0 + 0] = _uv4_79.x;
-                            _vec_load_9_1[0 + 1] = _uv4_79.y;
-                            _vec_load_9_1[0 + 2] = _uv4_79.z;
-                            _vec_load_9_1[0 + 3] = _uv4_79.w;
+                            uint4 _uv4_208 = *reinterpret_cast<const uint4*>(inp_words + (src_94_2 * 4) + 0);
+                            _vec_load_9_1[0 + 0] = _uv4_208.x;
+                            _vec_load_9_1[0 + 1] = _uv4_208.y;
+                            _vec_load_9_1[0 + 2] = _uv4_208.z;
+                            _vec_load_9_1[0 + 3] = _uv4_208.w;
                         }
                         unsigned int unit_96_2 = stripe_1 + (4800 + tid_0);
                         unsigned int clamped_97_2 = ((unit_96_2 < units) ? unit_96_2 : last_2);
@@ -1354,11 +3319,11 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_105_2 = quotient_98_2 * pitch_units + rank * block_units + remainder_99_2;
                         unsigned int _vec_load_10_1[4];
                         {
-                            uint4 _uv4_80 = *reinterpret_cast<const uint4*>(inp_words + (src_104_2 * 4) + 0);
-                            _vec_load_10_1[0 + 0] = _uv4_80.x;
-                            _vec_load_10_1[0 + 1] = _uv4_80.y;
-                            _vec_load_10_1[0 + 2] = _uv4_80.z;
-                            _vec_load_10_1[0 + 3] = _uv4_80.w;
+                            uint4 _uv4_209 = *reinterpret_cast<const uint4*>(inp_words + (src_104_2 * 4) + 0);
+                            _vec_load_10_1[0 + 0] = _uv4_209.x;
+                            _vec_load_10_1[0 + 1] = _uv4_209.y;
+                            _vec_load_10_1[0 + 2] = _uv4_209.z;
+                            _vec_load_10_1[0 + 3] = _uv4_209.w;
                         }
                         unsigned int unit_106_2 = stripe_1 + (5280 + tid_0);
                         unsigned int clamped_107_2 = ((unit_106_2 < units) ? unit_106_2 : last_2);
@@ -1376,38 +3341,38 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_115_2 = quotient_108_2 * pitch_units + rank * block_units + remainder_109_2;
                         unsigned int _vec_load_11_1[4];
                         {
-                            uint4 _uv4_81 = *reinterpret_cast<const uint4*>(inp_words + (src_114_2 * 4) + 0);
-                            _vec_load_11_1[0 + 0] = _uv4_81.x;
-                            _vec_load_11_1[0 + 1] = _uv4_81.y;
-                            _vec_load_11_1[0 + 2] = _uv4_81.z;
-                            _vec_load_11_1[0 + 3] = _uv4_81.w;
+                            uint4 _uv4_210 = *reinterpret_cast<const uint4*>(inp_words + (src_114_2 * 4) + 0);
+                            _vec_load_11_1[0 + 0] = _uv4_210.x;
+                            _vec_load_11_1[0 + 1] = _uv4_210.y;
+                            _vec_load_11_1[0 + 2] = _uv4_210.z;
+                            _vec_load_11_1[0 + 3] = _uv4_210.w;
                         }
                         if (unit_36_2 < units) {
                             {
-                                auto _gst_82 = peer_words + (dst_45_2 * 4);
-                                __builtin_assume(__isGlobal(_gst_82));
-                                reinterpret_cast<int4*>(_gst_82)[0] = reinterpret_cast<int4*>(_vec_load_4_1)[0];
+                                auto _gst_211 = peer_words + (dst_45_2 * 4);
+                                __builtin_assume(__isGlobal(_gst_211));
+                                reinterpret_cast<int4*>(_gst_211)[0] = reinterpret_cast<int4*>(_vec_load_4_1)[0];
                             }
                         }
                         if (unit_46_2 < units) {
                             {
-                                auto _gst_83 = peer_words + (dst_55_2 * 4);
-                                __builtin_assume(__isGlobal(_gst_83));
-                                reinterpret_cast<int4*>(_gst_83)[0] = reinterpret_cast<int4*>(_vec_load_5_1)[0];
+                                auto _gst_212 = peer_words + (dst_55_2 * 4);
+                                __builtin_assume(__isGlobal(_gst_212));
+                                reinterpret_cast<int4*>(_gst_212)[0] = reinterpret_cast<int4*>(_vec_load_5_1)[0];
                             }
                         }
                         if (unit_56_2 < units) {
                             {
-                                auto _gst_84 = peer_words + (dst_65_2 * 4);
-                                __builtin_assume(__isGlobal(_gst_84));
-                                reinterpret_cast<int4*>(_gst_84)[0] = reinterpret_cast<int4*>(_vec_load_6_1)[0];
+                                auto _gst_213 = peer_words + (dst_65_2 * 4);
+                                __builtin_assume(__isGlobal(_gst_213));
+                                reinterpret_cast<int4*>(_gst_213)[0] = reinterpret_cast<int4*>(_vec_load_6_1)[0];
                             }
                         }
                         if (unit_66_2 < units) {
                             {
-                                auto _gst_85 = peer_words + (dst_75_2 * 4);
-                                __builtin_assume(__isGlobal(_gst_85));
-                                reinterpret_cast<int4*>(_gst_85)[0] = reinterpret_cast<int4*>(_vec_load_7_1)[0];
+                                auto _gst_214 = peer_words + (dst_75_2 * 4);
+                                __builtin_assume(__isGlobal(_gst_214));
+                                reinterpret_cast<int4*>(_gst_214)[0] = reinterpret_cast<int4*>(_vec_load_7_1)[0];
                             }
                         }
                         unsigned int unit_116_2 = stripe_1 + (5760 + tid_0);
@@ -1426,11 +3391,11 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_125_2 = quotient_118_2 * pitch_units + rank * block_units + remainder_119_2;
                         unsigned int _vec_load_12_1[4];
                         {
-                            uint4 _uv4_86 = *reinterpret_cast<const uint4*>(inp_words + (src_124_2 * 4) + 0);
-                            _vec_load_12_1[0 + 0] = _uv4_86.x;
-                            _vec_load_12_1[0 + 1] = _uv4_86.y;
-                            _vec_load_12_1[0 + 2] = _uv4_86.z;
-                            _vec_load_12_1[0 + 3] = _uv4_86.w;
+                            uint4 _uv4_215 = *reinterpret_cast<const uint4*>(inp_words + (src_124_2 * 4) + 0);
+                            _vec_load_12_1[0 + 0] = _uv4_215.x;
+                            _vec_load_12_1[0 + 1] = _uv4_215.y;
+                            _vec_load_12_1[0 + 2] = _uv4_215.z;
+                            _vec_load_12_1[0 + 3] = _uv4_215.w;
                         }
                         unsigned int unit_126_2 = stripe_1 + (6240 + tid_0);
                         unsigned int clamped_127_2 = ((unit_126_2 < units) ? unit_126_2 : last_2);
@@ -1448,11 +3413,11 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_135_2 = quotient_128_2 * pitch_units + rank * block_units + remainder_129_2;
                         unsigned int _vec_load_13_1[4];
                         {
-                            uint4 _uv4_87 = *reinterpret_cast<const uint4*>(inp_words + (src_134_2 * 4) + 0);
-                            _vec_load_13_1[0 + 0] = _uv4_87.x;
-                            _vec_load_13_1[0 + 1] = _uv4_87.y;
-                            _vec_load_13_1[0 + 2] = _uv4_87.z;
-                            _vec_load_13_1[0 + 3] = _uv4_87.w;
+                            uint4 _uv4_216 = *reinterpret_cast<const uint4*>(inp_words + (src_134_2 * 4) + 0);
+                            _vec_load_13_1[0 + 0] = _uv4_216.x;
+                            _vec_load_13_1[0 + 1] = _uv4_216.y;
+                            _vec_load_13_1[0 + 2] = _uv4_216.z;
+                            _vec_load_13_1[0 + 3] = _uv4_216.w;
                         }
                         unsigned int unit_136_2 = stripe_1 + (6720 + tid_0);
                         unsigned int clamped_137_2 = ((unit_136_2 < units) ? unit_136_2 : last_2);
@@ -1470,11 +3435,11 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_145_2 = quotient_138_2 * pitch_units + rank * block_units + remainder_139_2;
                         unsigned int _vec_load_14_1[4];
                         {
-                            uint4 _uv4_88 = *reinterpret_cast<const uint4*>(inp_words + (src_144_2 * 4) + 0);
-                            _vec_load_14_1[0 + 0] = _uv4_88.x;
-                            _vec_load_14_1[0 + 1] = _uv4_88.y;
-                            _vec_load_14_1[0 + 2] = _uv4_88.z;
-                            _vec_load_14_1[0 + 3] = _uv4_88.w;
+                            uint4 _uv4_217 = *reinterpret_cast<const uint4*>(inp_words + (src_144_2 * 4) + 0);
+                            _vec_load_14_1[0 + 0] = _uv4_217.x;
+                            _vec_load_14_1[0 + 1] = _uv4_217.y;
+                            _vec_load_14_1[0 + 2] = _uv4_217.z;
+                            _vec_load_14_1[0 + 3] = _uv4_217.w;
                         }
                         unsigned int unit_146_2 = stripe_1 + (7200 + tid_0);
                         unsigned int clamped_147_2 = ((unit_146_2 < units) ? unit_146_2 : last_2);
@@ -1492,186 +3457,186 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                         unsigned int dst_155_2 = quotient_148_2 * pitch_units + rank * block_units + remainder_149_2;
                         unsigned int _vec_load_15_1[4];
                         {
-                            uint4 _uv4_89 = *reinterpret_cast<const uint4*>(inp_words + (src_154_2 * 4) + 0);
-                            _vec_load_15_1[0 + 0] = _uv4_89.x;
-                            _vec_load_15_1[0 + 1] = _uv4_89.y;
-                            _vec_load_15_1[0 + 2] = _uv4_89.z;
-                            _vec_load_15_1[0 + 3] = _uv4_89.w;
+                            uint4 _uv4_218 = *reinterpret_cast<const uint4*>(inp_words + (src_154_2 * 4) + 0);
+                            _vec_load_15_1[0 + 0] = _uv4_218.x;
+                            _vec_load_15_1[0 + 1] = _uv4_218.y;
+                            _vec_load_15_1[0 + 2] = _uv4_218.z;
+                            _vec_load_15_1[0 + 3] = _uv4_218.w;
                         }
                         if (unit_76_2 < units) {
                             {
-                                auto _gst_90 = peer_words + (dst_85_2 * 4);
-                                __builtin_assume(__isGlobal(_gst_90));
-                                reinterpret_cast<int4*>(_gst_90)[0] = reinterpret_cast<int4*>(_vec_load_8_1)[0];
+                                auto _gst_219 = peer_words + (dst_85_2 * 4);
+                                __builtin_assume(__isGlobal(_gst_219));
+                                reinterpret_cast<int4*>(_gst_219)[0] = reinterpret_cast<int4*>(_vec_load_8_1)[0];
                             }
                         }
                         if (unit_86_2 < units) {
                             {
-                                auto _gst_91 = peer_words + (dst_95_2 * 4);
-                                __builtin_assume(__isGlobal(_gst_91));
-                                reinterpret_cast<int4*>(_gst_91)[0] = reinterpret_cast<int4*>(_vec_load_9_1)[0];
+                                auto _gst_220 = peer_words + (dst_95_2 * 4);
+                                __builtin_assume(__isGlobal(_gst_220));
+                                reinterpret_cast<int4*>(_gst_220)[0] = reinterpret_cast<int4*>(_vec_load_9_1)[0];
                             }
                         }
                         if (unit_96_2 < units) {
                             {
-                                auto _gst_92 = peer_words + (dst_105_2 * 4);
-                                __builtin_assume(__isGlobal(_gst_92));
-                                reinterpret_cast<int4*>(_gst_92)[0] = reinterpret_cast<int4*>(_vec_load_10_1)[0];
+                                auto _gst_221 = peer_words + (dst_105_2 * 4);
+                                __builtin_assume(__isGlobal(_gst_221));
+                                reinterpret_cast<int4*>(_gst_221)[0] = reinterpret_cast<int4*>(_vec_load_10_1)[0];
                             }
                         }
                         if (unit_106_2 < units) {
                             {
-                                auto _gst_93 = peer_words + (dst_115_2 * 4);
-                                __builtin_assume(__isGlobal(_gst_93));
-                                reinterpret_cast<int4*>(_gst_93)[0] = reinterpret_cast<int4*>(_vec_load_11_1)[0];
+                                auto _gst_222 = peer_words + (dst_115_2 * 4);
+                                __builtin_assume(__isGlobal(_gst_222));
+                                reinterpret_cast<int4*>(_gst_222)[0] = reinterpret_cast<int4*>(_vec_load_11_1)[0];
                             }
                         }
                         if (unit_116_2 < units) {
                             {
-                                auto _gst_94 = peer_words + (dst_125_2 * 4);
-                                __builtin_assume(__isGlobal(_gst_94));
-                                reinterpret_cast<int4*>(_gst_94)[0] = reinterpret_cast<int4*>(_vec_load_12_1)[0];
+                                auto _gst_223 = peer_words + (dst_125_2 * 4);
+                                __builtin_assume(__isGlobal(_gst_223));
+                                reinterpret_cast<int4*>(_gst_223)[0] = reinterpret_cast<int4*>(_vec_load_12_1)[0];
                             }
                         }
                         if (unit_126_2 < units) {
                             {
-                                auto _gst_95 = peer_words + (dst_135_2 * 4);
-                                __builtin_assume(__isGlobal(_gst_95));
-                                reinterpret_cast<int4*>(_gst_95)[0] = reinterpret_cast<int4*>(_vec_load_13_1)[0];
+                                auto _gst_224 = peer_words + (dst_135_2 * 4);
+                                __builtin_assume(__isGlobal(_gst_224));
+                                reinterpret_cast<int4*>(_gst_224)[0] = reinterpret_cast<int4*>(_vec_load_13_1)[0];
                             }
                         }
                         if (unit_136_2 < units) {
                             {
-                                auto _gst_96 = peer_words + (dst_145_2 * 4);
-                                __builtin_assume(__isGlobal(_gst_96));
-                                reinterpret_cast<int4*>(_gst_96)[0] = reinterpret_cast<int4*>(_vec_load_14_1)[0];
+                                auto _gst_225 = peer_words + (dst_145_2 * 4);
+                                __builtin_assume(__isGlobal(_gst_225));
+                                reinterpret_cast<int4*>(_gst_225)[0] = reinterpret_cast<int4*>(_vec_load_14_1)[0];
                             }
                         }
                         if (unit_146_2 < units) {
                             {
-                                auto _gst_97 = peer_words + (dst_155_2 * 4);
-                                __builtin_assume(__isGlobal(_gst_97));
-                                reinterpret_cast<int4*>(_gst_97)[0] = reinterpret_cast<int4*>(_vec_load_15_1)[0];
+                                auto _gst_226 = peer_words + (dst_155_2 * 4);
+                                __builtin_assume(__isGlobal(_gst_226));
+                                reinterpret_cast<int4*>(_gst_226)[0] = reinterpret_cast<int4*>(_vec_load_15_1)[0];
                             }
                         }
                     } else {
-                        unsigned int tail_lo_2 = lo + (out_chunks - 2) * 7680;
-                        unsigned int split_2 = hi - (hi - tail_lo_2 >> 2);
-                        unsigned int clo_2 = lo + k_1 * 7680;
-                        unsigned int chi_2 = clo_2 + 7680;
+                        unsigned int tail_lo_6 = lo + (out_chunks - 2) * 7680;
+                        unsigned int split_6 = hi - (hi - tail_lo_6 >> 2);
+                        unsigned int clo_6 = lo + k_1 * 7680;
+                        unsigned int chi_6 = clo_6 + 7680;
                         if (k_1 == out_chunks - 2) {
-                            clo_2 = tail_lo_2;
-                            chi_2 = split_2;
+                            clo_6 = tail_lo_6;
+                            chi_6 = split_6;
                         }
                         if (k_1 == out_chunks - 1) {
-                            clo_2 = split_2;
-                            chi_2 = hi;
+                            clo_6 = split_6;
+                            chi_6 = hi;
                         }
                         #pragma unroll 1
-                        for (unsigned int u_2 = clo_2 + tid_0; u_2 < chi_2; u_2 += 480) {
-                            unsigned int quotient_0_5 = (unsigned int)((unsigned long long)u_2 * (unsigned long long)units_magic >> 32);
-                            unsigned int remainder_1_5 = u_2 - quotient_0_5 * block_units;
-                            unsigned int correction_6 = (unsigned int)(remainder_1_5 >= block_units);
-                            quotient_0_5 = quotient_0_5 + correction_6;
-                            remainder_1_5 = remainder_1_5 - correction_6 * block_units;
+                        for (unsigned int u_6 = clo_6 + tid_0; u_6 < chi_6; u_6 += 480) {
+                            unsigned int quotient_0_5 = (unsigned int)((unsigned long long)u_6 * (unsigned long long)units_magic >> 32);
+                            unsigned int remainder_1_5 = u_6 - quotient_0_5 * block_units;
+                            unsigned int correction_84 = (unsigned int)(remainder_1_5 >= block_units);
+                            quotient_0_5 = quotient_0_5 + correction_84;
+                            remainder_1_5 = remainder_1_5 - correction_84 * block_units;
                             unsigned int quotient_3_5 = (unsigned int)((unsigned long long)quotient_0_5 * (unsigned long long)sequences_magic >> 32);
                             unsigned int remainder_4_1 = quotient_0_5 - quotient_3_5 * sequences;
-                            unsigned int correction_5_1 = (unsigned int)(remainder_4_1 >= sequences);
-                            quotient_3_5 = quotient_3_5 + correction_5_1;
-                            remainder_4_1 = remainder_4_1 - correction_5_1 * sequences;
-                            unsigned int src_5 = (quotient_0_5 + (quotient_3_5 * 7 + destination) * sequences) * block_units + remainder_1_5;
-                            unsigned int dst_5 = quotient_0_5 * pitch_units + rank * block_units + remainder_1_5;
-                            peer_elements[dst_5] = inp[src_5];
+                            unsigned int correction_5_2 = (unsigned int)(remainder_4_1 >= sequences);
+                            quotient_3_5 = quotient_3_5 + correction_5_2;
+                            remainder_4_1 = remainder_4_1 - correction_5_2 * sequences;
+                            unsigned int src_66 = (quotient_0_5 + (quotient_3_5 * 7 + destination) * sequences) * block_units + remainder_1_5;
+                            unsigned int dst_68 = quotient_0_5 * pitch_units + rank * block_units + remainder_1_5;
+                            peer_elements[dst_68] = inp[src_66];
                         }
                     }
                 }
             }
             if (count_6 > k_1) {
                 if (warp_1 < 15) {
-                    unsigned int tail_lo_3 = lo_4 + (count_6 - 2) * 7680;
-                    unsigned int split_3 = hi_5 - (hi_5 - tail_lo_3 >> 2);
-                    unsigned int clo_3 = lo_4 + k_1 * 7680;
-                    unsigned int chi_3 = clo_3 + 7680;
+                    unsigned int tail_lo_7 = lo_4 + (count_6 - 2) * 7680;
+                    unsigned int split_7 = hi_5 - (hi_5 - tail_lo_7 >> 2);
+                    unsigned int clo_7 = lo_4 + k_1 * 7680;
+                    unsigned int chi_7 = clo_7 + 7680;
                     if (k_1 == count_6 - 2) {
-                        clo_3 = tail_lo_3;
-                        chi_3 = split_3;
+                        clo_7 = tail_lo_7;
+                        chi_7 = split_7;
                     }
                     if (k_1 == count_6 - 1) {
-                        clo_3 = split_3;
-                        chi_3 = hi_5;
+                        clo_7 = split_7;
+                        chi_7 = hi_5;
                     }
                     if (vector != 0) {
-                        unsigned int last_3 = chi_3 - 1;
+                        unsigned int last_3 = chi_7 - 1;
                         #pragma unroll 1
-                        for (unsigned int base_1 = clo_3 + tid_0; base_1 < chi_3; base_1 += 7680) {
-                            unsigned int unit_3 = base_1;
-                            unsigned int clamped_3 = ((unit_3 < chi_3) ? unit_3 : last_3);
-                            unsigned int quotient_0_6 = (unsigned int)((unsigned long long)clamped_3 * (unsigned long long)units_magic >> 32);
-                            unsigned int remainder_1_6 = clamped_3 - quotient_0_6 * block_units;
-                            unsigned int correction_7 = (unsigned int)(remainder_1_6 >= block_units);
-                            quotient_0_6 = quotient_0_6 + correction_7;
-                            remainder_1_6 = remainder_1_6 - correction_7 * block_units;
+                        for (unsigned int base_3 = clo_7 + tid_0; base_3 < chi_7; base_3 += 7680) {
+                            unsigned int unit_81 = base_3;
+                            unsigned int clamped_81 = ((unit_81 < chi_7) ? unit_81 : last_3);
+                            unsigned int quotient_0_6 = (unsigned int)((unsigned long long)clamped_81 * (unsigned long long)units_magic >> 32);
+                            unsigned int remainder_1_6 = clamped_81 - quotient_0_6 * block_units;
+                            unsigned int correction_85 = (unsigned int)(remainder_1_6 >= block_units);
+                            quotient_0_6 = quotient_0_6 + correction_85;
+                            remainder_1_6 = remainder_1_6 - correction_85 * block_units;
                             unsigned int quotient_3_6 = (unsigned int)((unsigned long long)quotient_0_6 * (unsigned long long)sequences_magic >> 32);
                             unsigned int remainder_4_2 = quotient_0_6 - quotient_3_6 * sequences;
-                            unsigned int correction_5_2 = (unsigned int)(remainder_4_2 >= sequences);
-                            quotient_3_6 = quotient_3_6 + correction_5_2;
-                            remainder_4_2 = remainder_4_2 - correction_5_2 * sequences;
-                            unsigned int src_6 = (quotient_0_6 + (quotient_3_6 * 7 + rank) * sequences) * block_units + remainder_1_6;
-                            unsigned int dst_6 = quotient_0_6 * pitch_units + rank * block_units + remainder_1_6;
+                            unsigned int correction_5_3 = (unsigned int)(remainder_4_2 >= sequences);
+                            quotient_3_6 = quotient_3_6 + correction_5_3;
+                            remainder_4_2 = remainder_4_2 - correction_5_3 * sequences;
+                            unsigned int src_67 = (quotient_0_6 + (quotient_3_6 * 7 + rank) * sequences) * block_units + remainder_1_6;
+                            unsigned int dst_69 = quotient_0_6 * pitch_units + rank * block_units + remainder_1_6;
                             unsigned int _vec_load_16_1[4];
                             {
-                                uint4 _uv4_98 = *reinterpret_cast<const uint4*>(inp_words + (src_6 * 4) + 0);
-                                _vec_load_16_1[0 + 0] = _uv4_98.x;
-                                _vec_load_16_1[0 + 1] = _uv4_98.y;
-                                _vec_load_16_1[0 + 2] = _uv4_98.z;
-                                _vec_load_16_1[0 + 3] = _uv4_98.w;
+                                uint4 _uv4_227 = *reinterpret_cast<const uint4*>(inp_words + (src_67 * 4) + 0);
+                                _vec_load_16_1[0 + 0] = _uv4_227.x;
+                                _vec_load_16_1[0 + 1] = _uv4_227.y;
+                                _vec_load_16_1[0 + 2] = _uv4_227.z;
+                                _vec_load_16_1[0 + 3] = _uv4_227.w;
                             }
-                            unsigned int unit_6_3 = base_1 + 480;
-                            unsigned int clamped_7_3 = ((unit_6_3 < chi_3) ? unit_6_3 : last_3);
+                            unsigned int unit_6_3 = base_3 + 480;
+                            unsigned int clamped_7_3 = ((unit_6_3 < chi_7) ? unit_6_3 : last_3);
                             unsigned int quotient_8_3 = (unsigned int)((unsigned long long)clamped_7_3 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_9_3 = clamped_7_3 - quotient_8_3 * block_units;
-                            unsigned int correction_10_3 = (unsigned int)(remainder_9_3 >= block_units);
-                            quotient_8_3 = quotient_8_3 + correction_10_3;
-                            remainder_9_3 = remainder_9_3 - correction_10_3 * block_units;
+                            unsigned int correction_10_4 = (unsigned int)(remainder_9_3 >= block_units);
+                            quotient_8_3 = quotient_8_3 + correction_10_4;
+                            remainder_9_3 = remainder_9_3 - correction_10_4 * block_units;
                             unsigned int quotient_11_3 = (unsigned int)((unsigned long long)quotient_8_3 * (unsigned long long)sequences_magic >> 32);
                             unsigned int remainder_12_1 = quotient_8_3 - quotient_11_3 * sequences;
-                            unsigned int correction_13_1 = (unsigned int)(remainder_12_1 >= sequences);
-                            quotient_11_3 = quotient_11_3 + correction_13_1;
-                            remainder_12_1 = remainder_12_1 - correction_13_1 * sequences;
-                            unsigned int src_14_3 = (quotient_8_3 + (quotient_11_3 * 7 + rank) * sequences) * block_units + remainder_9_3;
-                            unsigned int dst_15_3 = quotient_8_3 * pitch_units + rank * block_units + remainder_9_3;
+                            unsigned int correction_13_2 = (unsigned int)(remainder_12_1 >= sequences);
+                            quotient_11_3 = quotient_11_3 + correction_13_2;
+                            remainder_12_1 = remainder_12_1 - correction_13_2 * sequences;
+                            unsigned int src_14_4 = (quotient_8_3 + (quotient_11_3 * 7 + rank) * sequences) * block_units + remainder_9_3;
+                            unsigned int dst_15_4 = quotient_8_3 * pitch_units + rank * block_units + remainder_9_3;
                             unsigned int _vec_load_17_1[4];
                             {
-                                uint4 _uv4_99 = *reinterpret_cast<const uint4*>(inp_words + (src_14_3 * 4) + 0);
-                                _vec_load_17_1[0 + 0] = _uv4_99.x;
-                                _vec_load_17_1[0 + 1] = _uv4_99.y;
-                                _vec_load_17_1[0 + 2] = _uv4_99.z;
-                                _vec_load_17_1[0 + 3] = _uv4_99.w;
+                                uint4 _uv4_228 = *reinterpret_cast<const uint4*>(inp_words + (src_14_4 * 4) + 0);
+                                _vec_load_17_1[0 + 0] = _uv4_228.x;
+                                _vec_load_17_1[0 + 1] = _uv4_228.y;
+                                _vec_load_17_1[0 + 2] = _uv4_228.z;
+                                _vec_load_17_1[0 + 3] = _uv4_228.w;
                             }
-                            unsigned int unit_16_3 = base_1 + 960;
-                            unsigned int clamped_17_3 = ((unit_16_3 < chi_3) ? unit_16_3 : last_3);
+                            unsigned int unit_16_3 = base_3 + 960;
+                            unsigned int clamped_17_3 = ((unit_16_3 < chi_7) ? unit_16_3 : last_3);
                             unsigned int quotient_18_3 = (unsigned int)((unsigned long long)clamped_17_3 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_19_3 = clamped_17_3 - quotient_18_3 * block_units;
-                            unsigned int correction_20_3 = (unsigned int)(remainder_19_3 >= block_units);
-                            quotient_18_3 = quotient_18_3 + correction_20_3;
-                            remainder_19_3 = remainder_19_3 - correction_20_3 * block_units;
+                            unsigned int correction_20_4 = (unsigned int)(remainder_19_3 >= block_units);
+                            quotient_18_3 = quotient_18_3 + correction_20_4;
+                            remainder_19_3 = remainder_19_3 - correction_20_4 * block_units;
                             unsigned int quotient_21_3 = (unsigned int)((unsigned long long)quotient_18_3 * (unsigned long long)sequences_magic >> 32);
                             unsigned int remainder_22_1 = quotient_18_3 - quotient_21_3 * sequences;
-                            unsigned int correction_23_1 = (unsigned int)(remainder_22_1 >= sequences);
-                            quotient_21_3 = quotient_21_3 + correction_23_1;
-                            remainder_22_1 = remainder_22_1 - correction_23_1 * sequences;
-                            unsigned int src_24_3 = (quotient_18_3 + (quotient_21_3 * 7 + rank) * sequences) * block_units + remainder_19_3;
-                            unsigned int dst_25_3 = quotient_18_3 * pitch_units + rank * block_units + remainder_19_3;
+                            unsigned int correction_23_2 = (unsigned int)(remainder_22_1 >= sequences);
+                            quotient_21_3 = quotient_21_3 + correction_23_2;
+                            remainder_22_1 = remainder_22_1 - correction_23_2 * sequences;
+                            unsigned int src_24_4 = (quotient_18_3 + (quotient_21_3 * 7 + rank) * sequences) * block_units + remainder_19_3;
+                            unsigned int dst_25_4 = quotient_18_3 * pitch_units + rank * block_units + remainder_19_3;
                             unsigned int _vec_load_18_1[4];
                             {
-                                uint4 _uv4_100 = *reinterpret_cast<const uint4*>(inp_words + (src_24_3 * 4) + 0);
-                                _vec_load_18_1[0 + 0] = _uv4_100.x;
-                                _vec_load_18_1[0 + 1] = _uv4_100.y;
-                                _vec_load_18_1[0 + 2] = _uv4_100.z;
-                                _vec_load_18_1[0 + 3] = _uv4_100.w;
+                                uint4 _uv4_229 = *reinterpret_cast<const uint4*>(inp_words + (src_24_4 * 4) + 0);
+                                _vec_load_18_1[0 + 0] = _uv4_229.x;
+                                _vec_load_18_1[0 + 1] = _uv4_229.y;
+                                _vec_load_18_1[0 + 2] = _uv4_229.z;
+                                _vec_load_18_1[0 + 3] = _uv4_229.w;
                             }
-                            unsigned int unit_26_3 = base_1 + 1440;
-                            unsigned int clamped_27_3 = ((unit_26_3 < chi_3) ? unit_26_3 : last_3);
+                            unsigned int unit_26_3 = base_3 + 1440;
+                            unsigned int clamped_27_3 = ((unit_26_3 < chi_7) ? unit_26_3 : last_3);
                             unsigned int quotient_28_3 = (unsigned int)((unsigned long long)clamped_27_3 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_29_3 = clamped_27_3 - quotient_28_3 * block_units;
                             unsigned int correction_30_3 = (unsigned int)(remainder_29_3 >= block_units);
@@ -1679,21 +3644,21 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                             remainder_29_3 = remainder_29_3 - correction_30_3 * block_units;
                             unsigned int quotient_31_3 = (unsigned int)((unsigned long long)quotient_28_3 * (unsigned long long)sequences_magic >> 32);
                             unsigned int remainder_32_1 = quotient_28_3 - quotient_31_3 * sequences;
-                            unsigned int correction_33_1 = (unsigned int)(remainder_32_1 >= sequences);
-                            quotient_31_3 = quotient_31_3 + correction_33_1;
-                            remainder_32_1 = remainder_32_1 - correction_33_1 * sequences;
-                            unsigned int src_34_3 = (quotient_28_3 + (quotient_31_3 * 7 + rank) * sequences) * block_units + remainder_29_3;
+                            unsigned int correction_33_2 = (unsigned int)(remainder_32_1 >= sequences);
+                            quotient_31_3 = quotient_31_3 + correction_33_2;
+                            remainder_32_1 = remainder_32_1 - correction_33_2 * sequences;
+                            unsigned int src_34_4 = (quotient_28_3 + (quotient_31_3 * 7 + rank) * sequences) * block_units + remainder_29_3;
                             unsigned int dst_35_3 = quotient_28_3 * pitch_units + rank * block_units + remainder_29_3;
                             unsigned int _vec_load_19_1[4];
                             {
-                                uint4 _uv4_101 = *reinterpret_cast<const uint4*>(inp_words + (src_34_3 * 4) + 0);
-                                _vec_load_19_1[0 + 0] = _uv4_101.x;
-                                _vec_load_19_1[0 + 1] = _uv4_101.y;
-                                _vec_load_19_1[0 + 2] = _uv4_101.z;
-                                _vec_load_19_1[0 + 3] = _uv4_101.w;
+                                uint4 _uv4_230 = *reinterpret_cast<const uint4*>(inp_words + (src_34_4 * 4) + 0);
+                                _vec_load_19_1[0 + 0] = _uv4_230.x;
+                                _vec_load_19_1[0 + 1] = _uv4_230.y;
+                                _vec_load_19_1[0 + 2] = _uv4_230.z;
+                                _vec_load_19_1[0 + 3] = _uv4_230.w;
                             }
-                            unsigned int unit_36_3 = base_1 + 1920;
-                            unsigned int clamped_37_3 = ((unit_36_3 < chi_3) ? unit_36_3 : last_3);
+                            unsigned int unit_36_3 = base_3 + 1920;
+                            unsigned int clamped_37_3 = ((unit_36_3 < chi_7) ? unit_36_3 : last_3);
                             unsigned int quotient_38_3 = (unsigned int)((unsigned long long)clamped_37_3 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_39_3 = clamped_37_3 - quotient_38_3 * block_units;
                             unsigned int correction_40_3 = (unsigned int)(remainder_39_3 >= block_units);
@@ -1701,21 +3666,21 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                             remainder_39_3 = remainder_39_3 - correction_40_3 * block_units;
                             unsigned int quotient_41_3 = (unsigned int)((unsigned long long)quotient_38_3 * (unsigned long long)sequences_magic >> 32);
                             unsigned int remainder_42_1 = quotient_38_3 - quotient_41_3 * sequences;
-                            unsigned int correction_43_1 = (unsigned int)(remainder_42_1 >= sequences);
-                            quotient_41_3 = quotient_41_3 + correction_43_1;
-                            remainder_42_1 = remainder_42_1 - correction_43_1 * sequences;
+                            unsigned int correction_43_2 = (unsigned int)(remainder_42_1 >= sequences);
+                            quotient_41_3 = quotient_41_3 + correction_43_2;
+                            remainder_42_1 = remainder_42_1 - correction_43_2 * sequences;
                             unsigned int src_44_3 = (quotient_38_3 + (quotient_41_3 * 7 + rank) * sequences) * block_units + remainder_39_3;
                             unsigned int dst_45_3 = quotient_38_3 * pitch_units + rank * block_units + remainder_39_3;
                             unsigned int _vec_load_20_1[4];
                             {
-                                uint4 _uv4_102 = *reinterpret_cast<const uint4*>(inp_words + (src_44_3 * 4) + 0);
-                                _vec_load_20_1[0 + 0] = _uv4_102.x;
-                                _vec_load_20_1[0 + 1] = _uv4_102.y;
-                                _vec_load_20_1[0 + 2] = _uv4_102.z;
-                                _vec_load_20_1[0 + 3] = _uv4_102.w;
+                                uint4 _uv4_231 = *reinterpret_cast<const uint4*>(inp_words + (src_44_3 * 4) + 0);
+                                _vec_load_20_1[0 + 0] = _uv4_231.x;
+                                _vec_load_20_1[0 + 1] = _uv4_231.y;
+                                _vec_load_20_1[0 + 2] = _uv4_231.z;
+                                _vec_load_20_1[0 + 3] = _uv4_231.w;
                             }
-                            unsigned int unit_46_3 = base_1 + 1920 + 480;
-                            unsigned int clamped_47_3 = ((unit_46_3 < chi_3) ? unit_46_3 : last_3);
+                            unsigned int unit_46_3 = base_3 + 1920 + 480;
+                            unsigned int clamped_47_3 = ((unit_46_3 < chi_7) ? unit_46_3 : last_3);
                             unsigned int quotient_48_3 = (unsigned int)((unsigned long long)clamped_47_3 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_49_3 = clamped_47_3 - quotient_48_3 * block_units;
                             unsigned int correction_50_3 = (unsigned int)(remainder_49_3 >= block_units);
@@ -1723,21 +3688,21 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                             remainder_49_3 = remainder_49_3 - correction_50_3 * block_units;
                             unsigned int quotient_51_3 = (unsigned int)((unsigned long long)quotient_48_3 * (unsigned long long)sequences_magic >> 32);
                             unsigned int remainder_52_1 = quotient_48_3 - quotient_51_3 * sequences;
-                            unsigned int correction_53_1 = (unsigned int)(remainder_52_1 >= sequences);
-                            quotient_51_3 = quotient_51_3 + correction_53_1;
-                            remainder_52_1 = remainder_52_1 - correction_53_1 * sequences;
+                            unsigned int correction_53_2 = (unsigned int)(remainder_52_1 >= sequences);
+                            quotient_51_3 = quotient_51_3 + correction_53_2;
+                            remainder_52_1 = remainder_52_1 - correction_53_2 * sequences;
                             unsigned int src_54_3 = (quotient_48_3 + (quotient_51_3 * 7 + rank) * sequences) * block_units + remainder_49_3;
                             unsigned int dst_55_3 = quotient_48_3 * pitch_units + rank * block_units + remainder_49_3;
                             unsigned int _vec_load_21_1[4];
                             {
-                                uint4 _uv4_103 = *reinterpret_cast<const uint4*>(inp_words + (src_54_3 * 4) + 0);
-                                _vec_load_21_1[0 + 0] = _uv4_103.x;
-                                _vec_load_21_1[0 + 1] = _uv4_103.y;
-                                _vec_load_21_1[0 + 2] = _uv4_103.z;
-                                _vec_load_21_1[0 + 3] = _uv4_103.w;
+                                uint4 _uv4_232 = *reinterpret_cast<const uint4*>(inp_words + (src_54_3 * 4) + 0);
+                                _vec_load_21_1[0 + 0] = _uv4_232.x;
+                                _vec_load_21_1[0 + 1] = _uv4_232.y;
+                                _vec_load_21_1[0 + 2] = _uv4_232.z;
+                                _vec_load_21_1[0 + 3] = _uv4_232.w;
                             }
-                            unsigned int unit_56_3 = base_1 + 1920 + 960;
-                            unsigned int clamped_57_3 = ((unit_56_3 < chi_3) ? unit_56_3 : last_3);
+                            unsigned int unit_56_3 = base_3 + 1920 + 960;
+                            unsigned int clamped_57_3 = ((unit_56_3 < chi_7) ? unit_56_3 : last_3);
                             unsigned int quotient_58_3 = (unsigned int)((unsigned long long)clamped_57_3 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_59_3 = clamped_57_3 - quotient_58_3 * block_units;
                             unsigned int correction_60_3 = (unsigned int)(remainder_59_3 >= block_units);
@@ -1745,21 +3710,21 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                             remainder_59_3 = remainder_59_3 - correction_60_3 * block_units;
                             unsigned int quotient_61_3 = (unsigned int)((unsigned long long)quotient_58_3 * (unsigned long long)sequences_magic >> 32);
                             unsigned int remainder_62_1 = quotient_58_3 - quotient_61_3 * sequences;
-                            unsigned int correction_63_1 = (unsigned int)(remainder_62_1 >= sequences);
-                            quotient_61_3 = quotient_61_3 + correction_63_1;
-                            remainder_62_1 = remainder_62_1 - correction_63_1 * sequences;
+                            unsigned int correction_63_2 = (unsigned int)(remainder_62_1 >= sequences);
+                            quotient_61_3 = quotient_61_3 + correction_63_2;
+                            remainder_62_1 = remainder_62_1 - correction_63_2 * sequences;
                             unsigned int src_64_3 = (quotient_58_3 + (quotient_61_3 * 7 + rank) * sequences) * block_units + remainder_59_3;
                             unsigned int dst_65_3 = quotient_58_3 * pitch_units + rank * block_units + remainder_59_3;
                             unsigned int _vec_load_22_1[4];
                             {
-                                uint4 _uv4_104 = *reinterpret_cast<const uint4*>(inp_words + (src_64_3 * 4) + 0);
-                                _vec_load_22_1[0 + 0] = _uv4_104.x;
-                                _vec_load_22_1[0 + 1] = _uv4_104.y;
-                                _vec_load_22_1[0 + 2] = _uv4_104.z;
-                                _vec_load_22_1[0 + 3] = _uv4_104.w;
+                                uint4 _uv4_233 = *reinterpret_cast<const uint4*>(inp_words + (src_64_3 * 4) + 0);
+                                _vec_load_22_1[0 + 0] = _uv4_233.x;
+                                _vec_load_22_1[0 + 1] = _uv4_233.y;
+                                _vec_load_22_1[0 + 2] = _uv4_233.z;
+                                _vec_load_22_1[0 + 3] = _uv4_233.w;
                             }
-                            unsigned int unit_66_3 = base_1 + 1920 + 1440;
-                            unsigned int clamped_67_3 = ((unit_66_3 < chi_3) ? unit_66_3 : last_3);
+                            unsigned int unit_66_3 = base_3 + 1920 + 1440;
+                            unsigned int clamped_67_3 = ((unit_66_3 < chi_7) ? unit_66_3 : last_3);
                             unsigned int quotient_68_3 = (unsigned int)((unsigned long long)clamped_67_3 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_69_3 = clamped_67_3 - quotient_68_3 * block_units;
                             unsigned int correction_70_3 = (unsigned int)(remainder_69_3 >= block_units);
@@ -1767,49 +3732,49 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                             remainder_69_3 = remainder_69_3 - correction_70_3 * block_units;
                             unsigned int quotient_71_3 = (unsigned int)((unsigned long long)quotient_68_3 * (unsigned long long)sequences_magic >> 32);
                             unsigned int remainder_72_1 = quotient_68_3 - quotient_71_3 * sequences;
-                            unsigned int correction_73_1 = (unsigned int)(remainder_72_1 >= sequences);
-                            quotient_71_3 = quotient_71_3 + correction_73_1;
-                            remainder_72_1 = remainder_72_1 - correction_73_1 * sequences;
+                            unsigned int correction_73_2 = (unsigned int)(remainder_72_1 >= sequences);
+                            quotient_71_3 = quotient_71_3 + correction_73_2;
+                            remainder_72_1 = remainder_72_1 - correction_73_2 * sequences;
                             unsigned int src_74_3 = (quotient_68_3 + (quotient_71_3 * 7 + rank) * sequences) * block_units + remainder_69_3;
                             unsigned int dst_75_3 = quotient_68_3 * pitch_units + rank * block_units + remainder_69_3;
                             unsigned int _vec_load_23_1[4];
                             {
-                                uint4 _uv4_105 = *reinterpret_cast<const uint4*>(inp_words + (src_74_3 * 4) + 0);
-                                _vec_load_23_1[0 + 0] = _uv4_105.x;
-                                _vec_load_23_1[0 + 1] = _uv4_105.y;
-                                _vec_load_23_1[0 + 2] = _uv4_105.z;
-                                _vec_load_23_1[0 + 3] = _uv4_105.w;
+                                uint4 _uv4_234 = *reinterpret_cast<const uint4*>(inp_words + (src_74_3 * 4) + 0);
+                                _vec_load_23_1[0 + 0] = _uv4_234.x;
+                                _vec_load_23_1[0 + 1] = _uv4_234.y;
+                                _vec_load_23_1[0 + 2] = _uv4_234.z;
+                                _vec_load_23_1[0 + 3] = _uv4_234.w;
                             }
-                            if (unit_3 < chi_3) {
+                            if (unit_81 < chi_7) {
                                 {
-                                    auto _gst_106 = out_words + (dst_6 * 4);
-                                    __builtin_assume(__isGlobal(_gst_106));
-                                    reinterpret_cast<int4*>(_gst_106)[0] = reinterpret_cast<int4*>(_vec_load_16_1)[0];
+                                    auto _gst_235 = out_words + (dst_69 * 4);
+                                    __builtin_assume(__isGlobal(_gst_235));
+                                    reinterpret_cast<int4*>(_gst_235)[0] = reinterpret_cast<int4*>(_vec_load_16_1)[0];
                                 }
                             }
-                            if (unit_6_3 < chi_3) {
+                            if (unit_6_3 < chi_7) {
                                 {
-                                    auto _gst_107 = out_words + (dst_15_3 * 4);
-                                    __builtin_assume(__isGlobal(_gst_107));
-                                    reinterpret_cast<int4*>(_gst_107)[0] = reinterpret_cast<int4*>(_vec_load_17_1)[0];
+                                    auto _gst_236 = out_words + (dst_15_4 * 4);
+                                    __builtin_assume(__isGlobal(_gst_236));
+                                    reinterpret_cast<int4*>(_gst_236)[0] = reinterpret_cast<int4*>(_vec_load_17_1)[0];
                                 }
                             }
-                            if (unit_16_3 < chi_3) {
+                            if (unit_16_3 < chi_7) {
                                 {
-                                    auto _gst_108 = out_words + (dst_25_3 * 4);
-                                    __builtin_assume(__isGlobal(_gst_108));
-                                    reinterpret_cast<int4*>(_gst_108)[0] = reinterpret_cast<int4*>(_vec_load_18_1)[0];
+                                    auto _gst_237 = out_words + (dst_25_4 * 4);
+                                    __builtin_assume(__isGlobal(_gst_237));
+                                    reinterpret_cast<int4*>(_gst_237)[0] = reinterpret_cast<int4*>(_vec_load_18_1)[0];
                                 }
                             }
-                            if (unit_26_3 < chi_3) {
+                            if (unit_26_3 < chi_7) {
                                 {
-                                    auto _gst_109 = out_words + (dst_35_3 * 4);
-                                    __builtin_assume(__isGlobal(_gst_109));
-                                    reinterpret_cast<int4*>(_gst_109)[0] = reinterpret_cast<int4*>(_vec_load_19_1)[0];
+                                    auto _gst_238 = out_words + (dst_35_3 * 4);
+                                    __builtin_assume(__isGlobal(_gst_238));
+                                    reinterpret_cast<int4*>(_gst_238)[0] = reinterpret_cast<int4*>(_vec_load_19_1)[0];
                                 }
                             }
-                            unsigned int unit_76_3 = base_1 + 3840;
-                            unsigned int clamped_77_3 = ((unit_76_3 < chi_3) ? unit_76_3 : last_3);
+                            unsigned int unit_76_3 = base_3 + 3840;
+                            unsigned int clamped_77_3 = ((unit_76_3 < chi_7) ? unit_76_3 : last_3);
                             unsigned int quotient_78_3 = (unsigned int)((unsigned long long)clamped_77_3 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_79_3 = clamped_77_3 - quotient_78_3 * block_units;
                             unsigned int correction_80_3 = (unsigned int)(remainder_79_3 >= block_units);
@@ -1824,14 +3789,14 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_85_3 = quotient_78_3 * pitch_units + rank * block_units + remainder_79_3;
                             unsigned int _vec_load_24_1[4];
                             {
-                                uint4 _uv4_110 = *reinterpret_cast<const uint4*>(inp_words + (src_84_3 * 4) + 0);
-                                _vec_load_24_1[0 + 0] = _uv4_110.x;
-                                _vec_load_24_1[0 + 1] = _uv4_110.y;
-                                _vec_load_24_1[0 + 2] = _uv4_110.z;
-                                _vec_load_24_1[0 + 3] = _uv4_110.w;
+                                uint4 _uv4_239 = *reinterpret_cast<const uint4*>(inp_words + (src_84_3 * 4) + 0);
+                                _vec_load_24_1[0 + 0] = _uv4_239.x;
+                                _vec_load_24_1[0 + 1] = _uv4_239.y;
+                                _vec_load_24_1[0 + 2] = _uv4_239.z;
+                                _vec_load_24_1[0 + 3] = _uv4_239.w;
                             }
-                            unsigned int unit_86_3 = base_1 + 3840 + 480;
-                            unsigned int clamped_87_3 = ((unit_86_3 < chi_3) ? unit_86_3 : last_3);
+                            unsigned int unit_86_3 = base_3 + 3840 + 480;
+                            unsigned int clamped_87_3 = ((unit_86_3 < chi_7) ? unit_86_3 : last_3);
                             unsigned int quotient_88_3 = (unsigned int)((unsigned long long)clamped_87_3 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_89_3 = clamped_87_3 - quotient_88_3 * block_units;
                             unsigned int correction_90_3 = (unsigned int)(remainder_89_3 >= block_units);
@@ -1846,14 +3811,14 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_95_3 = quotient_88_3 * pitch_units + rank * block_units + remainder_89_3;
                             unsigned int _vec_load_25_1[4];
                             {
-                                uint4 _uv4_111 = *reinterpret_cast<const uint4*>(inp_words + (src_94_3 * 4) + 0);
-                                _vec_load_25_1[0 + 0] = _uv4_111.x;
-                                _vec_load_25_1[0 + 1] = _uv4_111.y;
-                                _vec_load_25_1[0 + 2] = _uv4_111.z;
-                                _vec_load_25_1[0 + 3] = _uv4_111.w;
+                                uint4 _uv4_240 = *reinterpret_cast<const uint4*>(inp_words + (src_94_3 * 4) + 0);
+                                _vec_load_25_1[0 + 0] = _uv4_240.x;
+                                _vec_load_25_1[0 + 1] = _uv4_240.y;
+                                _vec_load_25_1[0 + 2] = _uv4_240.z;
+                                _vec_load_25_1[0 + 3] = _uv4_240.w;
                             }
-                            unsigned int unit_96_3 = base_1 + 3840 + 960;
-                            unsigned int clamped_97_3 = ((unit_96_3 < chi_3) ? unit_96_3 : last_3);
+                            unsigned int unit_96_3 = base_3 + 3840 + 960;
+                            unsigned int clamped_97_3 = ((unit_96_3 < chi_7) ? unit_96_3 : last_3);
                             unsigned int quotient_98_3 = (unsigned int)((unsigned long long)clamped_97_3 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_99_3 = clamped_97_3 - quotient_98_3 * block_units;
                             unsigned int correction_100_3 = (unsigned int)(remainder_99_3 >= block_units);
@@ -1868,14 +3833,14 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_105_3 = quotient_98_3 * pitch_units + rank * block_units + remainder_99_3;
                             unsigned int _vec_load_26_1[4];
                             {
-                                uint4 _uv4_112 = *reinterpret_cast<const uint4*>(inp_words + (src_104_3 * 4) + 0);
-                                _vec_load_26_1[0 + 0] = _uv4_112.x;
-                                _vec_load_26_1[0 + 1] = _uv4_112.y;
-                                _vec_load_26_1[0 + 2] = _uv4_112.z;
-                                _vec_load_26_1[0 + 3] = _uv4_112.w;
+                                uint4 _uv4_241 = *reinterpret_cast<const uint4*>(inp_words + (src_104_3 * 4) + 0);
+                                _vec_load_26_1[0 + 0] = _uv4_241.x;
+                                _vec_load_26_1[0 + 1] = _uv4_241.y;
+                                _vec_load_26_1[0 + 2] = _uv4_241.z;
+                                _vec_load_26_1[0 + 3] = _uv4_241.w;
                             }
-                            unsigned int unit_106_3 = base_1 + 3840 + 1440;
-                            unsigned int clamped_107_3 = ((unit_106_3 < chi_3) ? unit_106_3 : last_3);
+                            unsigned int unit_106_3 = base_3 + 3840 + 1440;
+                            unsigned int clamped_107_3 = ((unit_106_3 < chi_7) ? unit_106_3 : last_3);
                             unsigned int quotient_108_3 = (unsigned int)((unsigned long long)clamped_107_3 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_109_3 = clamped_107_3 - quotient_108_3 * block_units;
                             unsigned int correction_110_3 = (unsigned int)(remainder_109_3 >= block_units);
@@ -1890,42 +3855,42 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_115_3 = quotient_108_3 * pitch_units + rank * block_units + remainder_109_3;
                             unsigned int _vec_load_27_1[4];
                             {
-                                uint4 _uv4_113 = *reinterpret_cast<const uint4*>(inp_words + (src_114_3 * 4) + 0);
-                                _vec_load_27_1[0 + 0] = _uv4_113.x;
-                                _vec_load_27_1[0 + 1] = _uv4_113.y;
-                                _vec_load_27_1[0 + 2] = _uv4_113.z;
-                                _vec_load_27_1[0 + 3] = _uv4_113.w;
+                                uint4 _uv4_242 = *reinterpret_cast<const uint4*>(inp_words + (src_114_3 * 4) + 0);
+                                _vec_load_27_1[0 + 0] = _uv4_242.x;
+                                _vec_load_27_1[0 + 1] = _uv4_242.y;
+                                _vec_load_27_1[0 + 2] = _uv4_242.z;
+                                _vec_load_27_1[0 + 3] = _uv4_242.w;
                             }
-                            if (unit_36_3 < chi_3) {
+                            if (unit_36_3 < chi_7) {
                                 {
-                                    auto _gst_114 = out_words + (dst_45_3 * 4);
-                                    __builtin_assume(__isGlobal(_gst_114));
-                                    reinterpret_cast<int4*>(_gst_114)[0] = reinterpret_cast<int4*>(_vec_load_20_1)[0];
+                                    auto _gst_243 = out_words + (dst_45_3 * 4);
+                                    __builtin_assume(__isGlobal(_gst_243));
+                                    reinterpret_cast<int4*>(_gst_243)[0] = reinterpret_cast<int4*>(_vec_load_20_1)[0];
                                 }
                             }
-                            if (unit_46_3 < chi_3) {
+                            if (unit_46_3 < chi_7) {
                                 {
-                                    auto _gst_115 = out_words + (dst_55_3 * 4);
-                                    __builtin_assume(__isGlobal(_gst_115));
-                                    reinterpret_cast<int4*>(_gst_115)[0] = reinterpret_cast<int4*>(_vec_load_21_1)[0];
+                                    auto _gst_244 = out_words + (dst_55_3 * 4);
+                                    __builtin_assume(__isGlobal(_gst_244));
+                                    reinterpret_cast<int4*>(_gst_244)[0] = reinterpret_cast<int4*>(_vec_load_21_1)[0];
                                 }
                             }
-                            if (unit_56_3 < chi_3) {
+                            if (unit_56_3 < chi_7) {
                                 {
-                                    auto _gst_116 = out_words + (dst_65_3 * 4);
-                                    __builtin_assume(__isGlobal(_gst_116));
-                                    reinterpret_cast<int4*>(_gst_116)[0] = reinterpret_cast<int4*>(_vec_load_22_1)[0];
+                                    auto _gst_245 = out_words + (dst_65_3 * 4);
+                                    __builtin_assume(__isGlobal(_gst_245));
+                                    reinterpret_cast<int4*>(_gst_245)[0] = reinterpret_cast<int4*>(_vec_load_22_1)[0];
                                 }
                             }
-                            if (unit_66_3 < chi_3) {
+                            if (unit_66_3 < chi_7) {
                                 {
-                                    auto _gst_117 = out_words + (dst_75_3 * 4);
-                                    __builtin_assume(__isGlobal(_gst_117));
-                                    reinterpret_cast<int4*>(_gst_117)[0] = reinterpret_cast<int4*>(_vec_load_23_1)[0];
+                                    auto _gst_246 = out_words + (dst_75_3 * 4);
+                                    __builtin_assume(__isGlobal(_gst_246));
+                                    reinterpret_cast<int4*>(_gst_246)[0] = reinterpret_cast<int4*>(_vec_load_23_1)[0];
                                 }
                             }
-                            unsigned int unit_116_3 = base_1 + 5760;
-                            unsigned int clamped_117_3 = ((unit_116_3 < chi_3) ? unit_116_3 : last_3);
+                            unsigned int unit_116_3 = base_3 + 5760;
+                            unsigned int clamped_117_3 = ((unit_116_3 < chi_7) ? unit_116_3 : last_3);
                             unsigned int quotient_118_3 = (unsigned int)((unsigned long long)clamped_117_3 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_119_3 = clamped_117_3 - quotient_118_3 * block_units;
                             unsigned int correction_120_3 = (unsigned int)(remainder_119_3 >= block_units);
@@ -1940,14 +3905,14 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_125_3 = quotient_118_3 * pitch_units + rank * block_units + remainder_119_3;
                             unsigned int _vec_load_28_1[4];
                             {
-                                uint4 _uv4_118 = *reinterpret_cast<const uint4*>(inp_words + (src_124_3 * 4) + 0);
-                                _vec_load_28_1[0 + 0] = _uv4_118.x;
-                                _vec_load_28_1[0 + 1] = _uv4_118.y;
-                                _vec_load_28_1[0 + 2] = _uv4_118.z;
-                                _vec_load_28_1[0 + 3] = _uv4_118.w;
+                                uint4 _uv4_247 = *reinterpret_cast<const uint4*>(inp_words + (src_124_3 * 4) + 0);
+                                _vec_load_28_1[0 + 0] = _uv4_247.x;
+                                _vec_load_28_1[0 + 1] = _uv4_247.y;
+                                _vec_load_28_1[0 + 2] = _uv4_247.z;
+                                _vec_load_28_1[0 + 3] = _uv4_247.w;
                             }
-                            unsigned int unit_126_3 = base_1 + 5760 + 480;
-                            unsigned int clamped_127_3 = ((unit_126_3 < chi_3) ? unit_126_3 : last_3);
+                            unsigned int unit_126_3 = base_3 + 5760 + 480;
+                            unsigned int clamped_127_3 = ((unit_126_3 < chi_7) ? unit_126_3 : last_3);
                             unsigned int quotient_128_3 = (unsigned int)((unsigned long long)clamped_127_3 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_129_3 = clamped_127_3 - quotient_128_3 * block_units;
                             unsigned int correction_130_3 = (unsigned int)(remainder_129_3 >= block_units);
@@ -1962,14 +3927,14 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_135_3 = quotient_128_3 * pitch_units + rank * block_units + remainder_129_3;
                             unsigned int _vec_load_29_1[4];
                             {
-                                uint4 _uv4_119 = *reinterpret_cast<const uint4*>(inp_words + (src_134_3 * 4) + 0);
-                                _vec_load_29_1[0 + 0] = _uv4_119.x;
-                                _vec_load_29_1[0 + 1] = _uv4_119.y;
-                                _vec_load_29_1[0 + 2] = _uv4_119.z;
-                                _vec_load_29_1[0 + 3] = _uv4_119.w;
+                                uint4 _uv4_248 = *reinterpret_cast<const uint4*>(inp_words + (src_134_3 * 4) + 0);
+                                _vec_load_29_1[0 + 0] = _uv4_248.x;
+                                _vec_load_29_1[0 + 1] = _uv4_248.y;
+                                _vec_load_29_1[0 + 2] = _uv4_248.z;
+                                _vec_load_29_1[0 + 3] = _uv4_248.w;
                             }
-                            unsigned int unit_136_3 = base_1 + 5760 + 960;
-                            unsigned int clamped_137_3 = ((unit_136_3 < chi_3) ? unit_136_3 : last_3);
+                            unsigned int unit_136_3 = base_3 + 5760 + 960;
+                            unsigned int clamped_137_3 = ((unit_136_3 < chi_7) ? unit_136_3 : last_3);
                             unsigned int quotient_138_3 = (unsigned int)((unsigned long long)clamped_137_3 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_139_3 = clamped_137_3 - quotient_138_3 * block_units;
                             unsigned int correction_140_3 = (unsigned int)(remainder_139_3 >= block_units);
@@ -1984,14 +3949,14 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_145_3 = quotient_138_3 * pitch_units + rank * block_units + remainder_139_3;
                             unsigned int _vec_load_30_1[4];
                             {
-                                uint4 _uv4_120 = *reinterpret_cast<const uint4*>(inp_words + (src_144_3 * 4) + 0);
-                                _vec_load_30_1[0 + 0] = _uv4_120.x;
-                                _vec_load_30_1[0 + 1] = _uv4_120.y;
-                                _vec_load_30_1[0 + 2] = _uv4_120.z;
-                                _vec_load_30_1[0 + 3] = _uv4_120.w;
+                                uint4 _uv4_249 = *reinterpret_cast<const uint4*>(inp_words + (src_144_3 * 4) + 0);
+                                _vec_load_30_1[0 + 0] = _uv4_249.x;
+                                _vec_load_30_1[0 + 1] = _uv4_249.y;
+                                _vec_load_30_1[0 + 2] = _uv4_249.z;
+                                _vec_load_30_1[0 + 3] = _uv4_249.w;
                             }
-                            unsigned int unit_146_3 = base_1 + 5760 + 1440;
-                            unsigned int clamped_147_3 = ((unit_146_3 < chi_3) ? unit_146_3 : last_3);
+                            unsigned int unit_146_3 = base_3 + 5760 + 1440;
+                            unsigned int clamped_147_3 = ((unit_146_3 < chi_7) ? unit_146_3 : last_3);
                             unsigned int quotient_148_3 = (unsigned int)((unsigned long long)clamped_147_3 * (unsigned long long)units_magic >> 32);
                             unsigned int remainder_149_3 = clamped_147_3 - quotient_148_3 * block_units;
                             unsigned int correction_150_3 = (unsigned int)(remainder_149_3 >= block_units);
@@ -2006,100 +3971,529 @@ kernel_cake_ulysses_a2a_815d73798b08c5f82b43(__nv_bfloat16* __restrict__ inp, __
                             unsigned int dst_155_3 = quotient_148_3 * pitch_units + rank * block_units + remainder_149_3;
                             unsigned int _vec_load_31_1[4];
                             {
-                                uint4 _uv4_121 = *reinterpret_cast<const uint4*>(inp_words + (src_154_3 * 4) + 0);
-                                _vec_load_31_1[0 + 0] = _uv4_121.x;
-                                _vec_load_31_1[0 + 1] = _uv4_121.y;
-                                _vec_load_31_1[0 + 2] = _uv4_121.z;
-                                _vec_load_31_1[0 + 3] = _uv4_121.w;
+                                uint4 _uv4_250 = *reinterpret_cast<const uint4*>(inp_words + (src_154_3 * 4) + 0);
+                                _vec_load_31_1[0 + 0] = _uv4_250.x;
+                                _vec_load_31_1[0 + 1] = _uv4_250.y;
+                                _vec_load_31_1[0 + 2] = _uv4_250.z;
+                                _vec_load_31_1[0 + 3] = _uv4_250.w;
                             }
-                            if (unit_76_3 < chi_3) {
+                            if (unit_76_3 < chi_7) {
                                 {
-                                    auto _gst_122 = out_words + (dst_85_3 * 4);
-                                    __builtin_assume(__isGlobal(_gst_122));
-                                    reinterpret_cast<int4*>(_gst_122)[0] = reinterpret_cast<int4*>(_vec_load_24_1)[0];
+                                    auto _gst_251 = out_words + (dst_85_3 * 4);
+                                    __builtin_assume(__isGlobal(_gst_251));
+                                    reinterpret_cast<int4*>(_gst_251)[0] = reinterpret_cast<int4*>(_vec_load_24_1)[0];
                                 }
                             }
-                            if (unit_86_3 < chi_3) {
+                            if (unit_86_3 < chi_7) {
                                 {
-                                    auto _gst_123 = out_words + (dst_95_3 * 4);
-                                    __builtin_assume(__isGlobal(_gst_123));
-                                    reinterpret_cast<int4*>(_gst_123)[0] = reinterpret_cast<int4*>(_vec_load_25_1)[0];
+                                    auto _gst_252 = out_words + (dst_95_3 * 4);
+                                    __builtin_assume(__isGlobal(_gst_252));
+                                    reinterpret_cast<int4*>(_gst_252)[0] = reinterpret_cast<int4*>(_vec_load_25_1)[0];
                                 }
                             }
-                            if (unit_96_3 < chi_3) {
+                            if (unit_96_3 < chi_7) {
                                 {
-                                    auto _gst_124 = out_words + (dst_105_3 * 4);
-                                    __builtin_assume(__isGlobal(_gst_124));
-                                    reinterpret_cast<int4*>(_gst_124)[0] = reinterpret_cast<int4*>(_vec_load_26_1)[0];
+                                    auto _gst_253 = out_words + (dst_105_3 * 4);
+                                    __builtin_assume(__isGlobal(_gst_253));
+                                    reinterpret_cast<int4*>(_gst_253)[0] = reinterpret_cast<int4*>(_vec_load_26_1)[0];
                                 }
                             }
-                            if (unit_106_3 < chi_3) {
+                            if (unit_106_3 < chi_7) {
                                 {
-                                    auto _gst_125 = out_words + (dst_115_3 * 4);
-                                    __builtin_assume(__isGlobal(_gst_125));
-                                    reinterpret_cast<int4*>(_gst_125)[0] = reinterpret_cast<int4*>(_vec_load_27_1)[0];
+                                    auto _gst_254 = out_words + (dst_115_3 * 4);
+                                    __builtin_assume(__isGlobal(_gst_254));
+                                    reinterpret_cast<int4*>(_gst_254)[0] = reinterpret_cast<int4*>(_vec_load_27_1)[0];
                                 }
                             }
-                            if (unit_116_3 < chi_3) {
+                            if (unit_116_3 < chi_7) {
                                 {
-                                    auto _gst_126 = out_words + (dst_125_3 * 4);
-                                    __builtin_assume(__isGlobal(_gst_126));
-                                    reinterpret_cast<int4*>(_gst_126)[0] = reinterpret_cast<int4*>(_vec_load_28_1)[0];
+                                    auto _gst_255 = out_words + (dst_125_3 * 4);
+                                    __builtin_assume(__isGlobal(_gst_255));
+                                    reinterpret_cast<int4*>(_gst_255)[0] = reinterpret_cast<int4*>(_vec_load_28_1)[0];
                                 }
                             }
-                            if (unit_126_3 < chi_3) {
+                            if (unit_126_3 < chi_7) {
                                 {
-                                    auto _gst_127 = out_words + (dst_135_3 * 4);
-                                    __builtin_assume(__isGlobal(_gst_127));
-                                    reinterpret_cast<int4*>(_gst_127)[0] = reinterpret_cast<int4*>(_vec_load_29_1)[0];
+                                    auto _gst_256 = out_words + (dst_135_3 * 4);
+                                    __builtin_assume(__isGlobal(_gst_256));
+                                    reinterpret_cast<int4*>(_gst_256)[0] = reinterpret_cast<int4*>(_vec_load_29_1)[0];
                                 }
                             }
-                            if (unit_136_3 < chi_3) {
+                            if (unit_136_3 < chi_7) {
                                 {
-                                    auto _gst_128 = out_words + (dst_145_3 * 4);
-                                    __builtin_assume(__isGlobal(_gst_128));
-                                    reinterpret_cast<int4*>(_gst_128)[0] = reinterpret_cast<int4*>(_vec_load_30_1)[0];
+                                    auto _gst_257 = out_words + (dst_145_3 * 4);
+                                    __builtin_assume(__isGlobal(_gst_257));
+                                    reinterpret_cast<int4*>(_gst_257)[0] = reinterpret_cast<int4*>(_vec_load_30_1)[0];
                                 }
                             }
-                            if (unit_146_3 < chi_3) {
+                            if (unit_146_3 < chi_7) {
                                 {
-                                    auto _gst_129 = out_words + (dst_155_3 * 4);
-                                    __builtin_assume(__isGlobal(_gst_129));
-                                    reinterpret_cast<int4*>(_gst_129)[0] = reinterpret_cast<int4*>(_vec_load_31_1)[0];
+                                    auto _gst_258 = out_words + (dst_155_3 * 4);
+                                    __builtin_assume(__isGlobal(_gst_258));
+                                    reinterpret_cast<int4*>(_gst_258)[0] = reinterpret_cast<int4*>(_vec_load_31_1)[0];
                                 }
                             }
                         }
                     } else {
                         #pragma unroll 1
-                        for (unsigned int u_3 = clo_3 + tid_0; u_3 < chi_3; u_3 += 480) {
-                            unsigned int quotient_0_7 = (unsigned int)((unsigned long long)u_3 * (unsigned long long)units_magic >> 32);
-                            unsigned int remainder_1_7 = u_3 - quotient_0_7 * block_units;
-                            unsigned int correction_8 = (unsigned int)(remainder_1_7 >= block_units);
-                            quotient_0_7 = quotient_0_7 + correction_8;
-                            remainder_1_7 = remainder_1_7 - correction_8 * block_units;
+                        for (unsigned int u_7 = clo_7 + tid_0; u_7 < chi_7; u_7 += 480) {
+                            unsigned int quotient_0_7 = (unsigned int)((unsigned long long)u_7 * (unsigned long long)units_magic >> 32);
+                            unsigned int remainder_1_7 = u_7 - quotient_0_7 * block_units;
+                            unsigned int correction_86 = (unsigned int)(remainder_1_7 >= block_units);
+                            quotient_0_7 = quotient_0_7 + correction_86;
+                            remainder_1_7 = remainder_1_7 - correction_86 * block_units;
                             unsigned int quotient_3_7 = (unsigned int)((unsigned long long)quotient_0_7 * (unsigned long long)sequences_magic >> 32);
                             unsigned int remainder_4_3 = quotient_0_7 - quotient_3_7 * sequences;
-                            unsigned int correction_5_3 = (unsigned int)(remainder_4_3 >= sequences);
-                            quotient_3_7 = quotient_3_7 + correction_5_3;
-                            remainder_4_3 = remainder_4_3 - correction_5_3 * sequences;
-                            unsigned int src_7 = (quotient_0_7 + (quotient_3_7 * 7 + rank) * sequences) * block_units + remainder_1_7;
-                            unsigned int dst_7 = quotient_0_7 * pitch_units + rank * block_units + remainder_1_7;
-                            out[dst_7] = inp[src_7];
+                            unsigned int correction_5_4 = (unsigned int)(remainder_4_3 >= sequences);
+                            quotient_3_7 = quotient_3_7 + correction_5_4;
+                            remainder_4_3 = remainder_4_3 - correction_5_4 * sequences;
+                            unsigned int src_68 = (quotient_0_7 + (quotient_3_7 * 7 + rank) * sequences) * block_units + remainder_1_7;
+                            unsigned int dst_70 = quotient_0_7 * pitch_units + rank * block_units + remainder_1_7;
+                            out[dst_70] = inp[src_68];
                         }
                     }
                 }
             }
         }
     }
-    __syncthreads();
-    if (tid_0 == 0) {
-        asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(landed), "r"(epoch) : "memory");
-        asm volatile("fence.acq_rel.sys;" ::: "memory");
-        {
-        unsigned int _acquire_observed;
-        do {
-        asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_acquire_observed) : "l"((reinterpret_cast<unsigned int*>(signals_self) + (176 + bid_1))) : "memory");
-        } while (static_cast<unsigned int>(_acquire_observed - static_cast<unsigned int>(epoch)) >= static_cast<unsigned int>(1));
+    if (warp_1 < 15) {
+        asm volatile("barrier.sync 5, 480;" ::: "memory");
+        if (tid_0 == 0) {
+            if (zoned) {
+                asm volatile("st.relaxed.sys.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(peer_signals) + (1024 + bid_1))), "r"(static_cast<unsigned int>(epoch)) : "memory");
+            }
+            asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(landed), "r"(epoch) : "memory");
+            asm volatile("fence.acq_rel.sys;" ::: "memory");
+        }
+    } else {
+        unsigned int zone_epoch = 0;
+        if (tid_0 == 480) {
+            {
+            unsigned int _acquire_observed;
+            do {
+            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(_acquire_observed) : "l"((reinterpret_cast<unsigned int*>(signals_self) + (176 + bid_1))) : "memory");
+            } while (static_cast<unsigned int>(_acquire_observed - static_cast<unsigned int>(epoch)) >= static_cast<unsigned int>(1));
+            }
+            uint32_t _relaxed_ld_2;
+            asm volatile("ld.relaxed.sys.u32 %0, [%1];" : "=r"(_relaxed_ld_2) : "l"(signals_self + (1024 + bid_1)) : "memory");
+            zone_epoch = _relaxed_ld_2;
+        }
+        __syncwarp();
+        unsigned int _shfl_sync_259 = __shfl_sync(0xFFFFFFFF, zone_epoch, 0);
+        zone_epoch = _shfl_sync_259;
+        if (zone_epoch == epoch) {
+            unsigned int zone_lane = tid_0 - 480;
+            unsigned int zone_sender = (rank + 7 - other) % 8;
+            unsigned int zone_block = block_len / 8;
+            unsigned int zone_units = rows * zone_block;
+            unsigned int zone_magic = (unsigned int)4294967295 / zone_block;
+            unsigned int zone_unit = sub * 7680 + zone_lane;
+            unsigned int* zone_at = signals_self + (2048 + (zone_slot + zone_lane) * 4);
+            unsigned int got_0[4];
+            {
+                uint32_t _uv4_260_0;
+                uint32_t _uv4_260_1;
+                uint32_t _uv4_260_2;
+                uint32_t _uv4_260_3;
+                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
+                    : "=r"(_uv4_260_0), "=r"(_uv4_260_1), "=r"(_uv4_260_2), "=r"(_uv4_260_3) : "l"((const void*)(zone_at + 0 + (0))) : "memory");
+                got_0[0 + 0] = _uv4_260_0;
+                got_0[0 + 1] = _uv4_260_1;
+                got_0[0 + 2] = _uv4_260_2;
+                got_0[0 + 3] = _uv4_260_3;
+            }
+            unsigned int got_1[4];
+            {
+                uint32_t _uv4_261_0;
+                uint32_t _uv4_261_1;
+                uint32_t _uv4_261_2;
+                uint32_t _uv4_261_3;
+                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
+                    : "=r"(_uv4_261_0), "=r"(_uv4_261_1), "=r"(_uv4_261_2), "=r"(_uv4_261_3) : "l"((const void*)(zone_at + 128 + (0))) : "memory");
+                got_1[0 + 0] = _uv4_261_0;
+                got_1[0 + 1] = _uv4_261_1;
+                got_1[0 + 2] = _uv4_261_2;
+                got_1[0 + 3] = _uv4_261_3;
+            }
+            unsigned int got_2[4];
+            {
+                uint32_t _uv4_262_0;
+                uint32_t _uv4_262_1;
+                uint32_t _uv4_262_2;
+                uint32_t _uv4_262_3;
+                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
+                    : "=r"(_uv4_262_0), "=r"(_uv4_262_1), "=r"(_uv4_262_2), "=r"(_uv4_262_3) : "l"((const void*)(zone_at + 256 + (0))) : "memory");
+                got_2[0 + 0] = _uv4_262_0;
+                got_2[0 + 1] = _uv4_262_1;
+                got_2[0 + 2] = _uv4_262_2;
+                got_2[0 + 3] = _uv4_262_3;
+            }
+            unsigned int got_3[4];
+            {
+                uint32_t _uv4_263_0;
+                uint32_t _uv4_263_1;
+                uint32_t _uv4_263_2;
+                uint32_t _uv4_263_3;
+                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
+                    : "=r"(_uv4_263_0), "=r"(_uv4_263_1), "=r"(_uv4_263_2), "=r"(_uv4_263_3) : "l"((const void*)(zone_at + 384 + (0))) : "memory");
+                got_3[0 + 0] = _uv4_263_0;
+                got_3[0 + 1] = _uv4_263_1;
+                got_3[0 + 2] = _uv4_263_2;
+                got_3[0 + 3] = _uv4_263_3;
+            }
+            unsigned int landing_unit_0 = zone_unit + 0;
+            if (landing_unit_0 < zone_units) {
+                unsigned int landing_row_0 = (unsigned int)((unsigned long long)landing_unit_0 * (unsigned long long)zone_magic >> 32);
+                unsigned int landing_col_0 = landing_unit_0 - landing_row_0 * zone_block;
+                unsigned int landing_fix_0 = (unsigned int)(landing_col_0 >= zone_block);
+                landing_row_0 = landing_row_0 + landing_fix_0;
+                landing_col_0 = landing_col_0 - landing_fix_0 * zone_block;
+                unsigned int landing_dst_0 = (landing_row_0 * 8 + zone_sender) * zone_block + landing_col_0;
+                {
+                    auto _gst_264 = out_words + (landing_dst_0 * 4);
+                    __builtin_assume(__isGlobal(_gst_264));
+                    reinterpret_cast<int4*>(_gst_264)[0] = reinterpret_cast<int4*>(got_0)[0];
+                }
+            }
+            unsigned int landing_unit_1 = zone_unit + 32;
+            if (landing_unit_1 < zone_units) {
+                unsigned int landing_row_1 = (unsigned int)((unsigned long long)landing_unit_1 * (unsigned long long)zone_magic >> 32);
+                unsigned int landing_col_1 = landing_unit_1 - landing_row_1 * zone_block;
+                unsigned int landing_fix_1 = (unsigned int)(landing_col_1 >= zone_block);
+                landing_row_1 = landing_row_1 + landing_fix_1;
+                landing_col_1 = landing_col_1 - landing_fix_1 * zone_block;
+                unsigned int landing_dst_1 = (landing_row_1 * 8 + zone_sender) * zone_block + landing_col_1;
+                {
+                    auto _gst_265 = out_words + (landing_dst_1 * 4);
+                    __builtin_assume(__isGlobal(_gst_265));
+                    reinterpret_cast<int4*>(_gst_265)[0] = reinterpret_cast<int4*>(got_1)[0];
+                }
+            }
+            unsigned int landing_unit_2 = zone_unit + 64;
+            if (landing_unit_2 < zone_units) {
+                unsigned int landing_row_2 = (unsigned int)((unsigned long long)landing_unit_2 * (unsigned long long)zone_magic >> 32);
+                unsigned int landing_col_2 = landing_unit_2 - landing_row_2 * zone_block;
+                unsigned int landing_fix_2 = (unsigned int)(landing_col_2 >= zone_block);
+                landing_row_2 = landing_row_2 + landing_fix_2;
+                landing_col_2 = landing_col_2 - landing_fix_2 * zone_block;
+                unsigned int landing_dst_2 = (landing_row_2 * 8 + zone_sender) * zone_block + landing_col_2;
+                {
+                    auto _gst_266 = out_words + (landing_dst_2 * 4);
+                    __builtin_assume(__isGlobal(_gst_266));
+                    reinterpret_cast<int4*>(_gst_266)[0] = reinterpret_cast<int4*>(got_2)[0];
+                }
+            }
+            unsigned int landing_unit_3 = zone_unit + 96;
+            if (landing_unit_3 < zone_units) {
+                unsigned int landing_row_3 = (unsigned int)((unsigned long long)landing_unit_3 * (unsigned long long)zone_magic >> 32);
+                unsigned int landing_col_3 = landing_unit_3 - landing_row_3 * zone_block;
+                unsigned int landing_fix_3 = (unsigned int)(landing_col_3 >= zone_block);
+                landing_row_3 = landing_row_3 + landing_fix_3;
+                landing_col_3 = landing_col_3 - landing_fix_3 * zone_block;
+                unsigned int landing_dst_3 = (landing_row_3 * 8 + zone_sender) * zone_block + landing_col_3;
+                {
+                    auto _gst_267 = out_words + (landing_dst_3 * 4);
+                    __builtin_assume(__isGlobal(_gst_267));
+                    reinterpret_cast<int4*>(_gst_267)[0] = reinterpret_cast<int4*>(got_3)[0];
+                }
+            }
+            unsigned int got_4[4];
+            {
+                uint32_t _uv4_268_0;
+                uint32_t _uv4_268_1;
+                uint32_t _uv4_268_2;
+                uint32_t _uv4_268_3;
+                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
+                    : "=r"(_uv4_268_0), "=r"(_uv4_268_1), "=r"(_uv4_268_2), "=r"(_uv4_268_3) : "l"((const void*)(zone_at + 512 + (0))) : "memory");
+                got_4[0 + 0] = _uv4_268_0;
+                got_4[0 + 1] = _uv4_268_1;
+                got_4[0 + 2] = _uv4_268_2;
+                got_4[0 + 3] = _uv4_268_3;
+            }
+            unsigned int got_5[4];
+            {
+                uint32_t _uv4_269_0;
+                uint32_t _uv4_269_1;
+                uint32_t _uv4_269_2;
+                uint32_t _uv4_269_3;
+                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
+                    : "=r"(_uv4_269_0), "=r"(_uv4_269_1), "=r"(_uv4_269_2), "=r"(_uv4_269_3) : "l"((const void*)(zone_at + 640 + (0))) : "memory");
+                got_5[0 + 0] = _uv4_269_0;
+                got_5[0 + 1] = _uv4_269_1;
+                got_5[0 + 2] = _uv4_269_2;
+                got_5[0 + 3] = _uv4_269_3;
+            }
+            unsigned int got_6[4];
+            {
+                uint32_t _uv4_270_0;
+                uint32_t _uv4_270_1;
+                uint32_t _uv4_270_2;
+                uint32_t _uv4_270_3;
+                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
+                    : "=r"(_uv4_270_0), "=r"(_uv4_270_1), "=r"(_uv4_270_2), "=r"(_uv4_270_3) : "l"((const void*)(zone_at + 768 + (0))) : "memory");
+                got_6[0 + 0] = _uv4_270_0;
+                got_6[0 + 1] = _uv4_270_1;
+                got_6[0 + 2] = _uv4_270_2;
+                got_6[0 + 3] = _uv4_270_3;
+            }
+            unsigned int got_7[4];
+            {
+                uint32_t _uv4_271_0;
+                uint32_t _uv4_271_1;
+                uint32_t _uv4_271_2;
+                uint32_t _uv4_271_3;
+                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
+                    : "=r"(_uv4_271_0), "=r"(_uv4_271_1), "=r"(_uv4_271_2), "=r"(_uv4_271_3) : "l"((const void*)(zone_at + 896 + (0))) : "memory");
+                got_7[0 + 0] = _uv4_271_0;
+                got_7[0 + 1] = _uv4_271_1;
+                got_7[0 + 2] = _uv4_271_2;
+                got_7[0 + 3] = _uv4_271_3;
+            }
+            unsigned int landing_unit_4 = zone_unit + 128;
+            if (landing_unit_4 < zone_units) {
+                unsigned int landing_row_4 = (unsigned int)((unsigned long long)landing_unit_4 * (unsigned long long)zone_magic >> 32);
+                unsigned int landing_col_4 = landing_unit_4 - landing_row_4 * zone_block;
+                unsigned int landing_fix_4 = (unsigned int)(landing_col_4 >= zone_block);
+                landing_row_4 = landing_row_4 + landing_fix_4;
+                landing_col_4 = landing_col_4 - landing_fix_4 * zone_block;
+                unsigned int landing_dst_4 = (landing_row_4 * 8 + zone_sender) * zone_block + landing_col_4;
+                {
+                    auto _gst_272 = out_words + (landing_dst_4 * 4);
+                    __builtin_assume(__isGlobal(_gst_272));
+                    reinterpret_cast<int4*>(_gst_272)[0] = reinterpret_cast<int4*>(got_4)[0];
+                }
+            }
+            unsigned int landing_unit_5 = zone_unit + 160;
+            if (landing_unit_5 < zone_units) {
+                unsigned int landing_row_5 = (unsigned int)((unsigned long long)landing_unit_5 * (unsigned long long)zone_magic >> 32);
+                unsigned int landing_col_5 = landing_unit_5 - landing_row_5 * zone_block;
+                unsigned int landing_fix_5 = (unsigned int)(landing_col_5 >= zone_block);
+                landing_row_5 = landing_row_5 + landing_fix_5;
+                landing_col_5 = landing_col_5 - landing_fix_5 * zone_block;
+                unsigned int landing_dst_5 = (landing_row_5 * 8 + zone_sender) * zone_block + landing_col_5;
+                {
+                    auto _gst_273 = out_words + (landing_dst_5 * 4);
+                    __builtin_assume(__isGlobal(_gst_273));
+                    reinterpret_cast<int4*>(_gst_273)[0] = reinterpret_cast<int4*>(got_5)[0];
+                }
+            }
+            unsigned int landing_unit_6 = zone_unit + 192;
+            if (landing_unit_6 < zone_units) {
+                unsigned int landing_row_6 = (unsigned int)((unsigned long long)landing_unit_6 * (unsigned long long)zone_magic >> 32);
+                unsigned int landing_col_6 = landing_unit_6 - landing_row_6 * zone_block;
+                unsigned int landing_fix_6 = (unsigned int)(landing_col_6 >= zone_block);
+                landing_row_6 = landing_row_6 + landing_fix_6;
+                landing_col_6 = landing_col_6 - landing_fix_6 * zone_block;
+                unsigned int landing_dst_6 = (landing_row_6 * 8 + zone_sender) * zone_block + landing_col_6;
+                {
+                    auto _gst_274 = out_words + (landing_dst_6 * 4);
+                    __builtin_assume(__isGlobal(_gst_274));
+                    reinterpret_cast<int4*>(_gst_274)[0] = reinterpret_cast<int4*>(got_6)[0];
+                }
+            }
+            unsigned int landing_unit_7 = zone_unit + 224;
+            if (landing_unit_7 < zone_units) {
+                unsigned int landing_row_7 = (unsigned int)((unsigned long long)landing_unit_7 * (unsigned long long)zone_magic >> 32);
+                unsigned int landing_col_7 = landing_unit_7 - landing_row_7 * zone_block;
+                unsigned int landing_fix_7 = (unsigned int)(landing_col_7 >= zone_block);
+                landing_row_7 = landing_row_7 + landing_fix_7;
+                landing_col_7 = landing_col_7 - landing_fix_7 * zone_block;
+                unsigned int landing_dst_7 = (landing_row_7 * 8 + zone_sender) * zone_block + landing_col_7;
+                {
+                    auto _gst_275 = out_words + (landing_dst_7 * 4);
+                    __builtin_assume(__isGlobal(_gst_275));
+                    reinterpret_cast<int4*>(_gst_275)[0] = reinterpret_cast<int4*>(got_7)[0];
+                }
+            }
+            unsigned int got_8[4];
+            {
+                uint32_t _uv4_276_0;
+                uint32_t _uv4_276_1;
+                uint32_t _uv4_276_2;
+                uint32_t _uv4_276_3;
+                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
+                    : "=r"(_uv4_276_0), "=r"(_uv4_276_1), "=r"(_uv4_276_2), "=r"(_uv4_276_3) : "l"((const void*)(zone_at + 1024 + (0))) : "memory");
+                got_8[0 + 0] = _uv4_276_0;
+                got_8[0 + 1] = _uv4_276_1;
+                got_8[0 + 2] = _uv4_276_2;
+                got_8[0 + 3] = _uv4_276_3;
+            }
+            unsigned int got_9[4];
+            {
+                uint32_t _uv4_277_0;
+                uint32_t _uv4_277_1;
+                uint32_t _uv4_277_2;
+                uint32_t _uv4_277_3;
+                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
+                    : "=r"(_uv4_277_0), "=r"(_uv4_277_1), "=r"(_uv4_277_2), "=r"(_uv4_277_3) : "l"((const void*)(zone_at + 1152 + (0))) : "memory");
+                got_9[0 + 0] = _uv4_277_0;
+                got_9[0 + 1] = _uv4_277_1;
+                got_9[0 + 2] = _uv4_277_2;
+                got_9[0 + 3] = _uv4_277_3;
+            }
+            unsigned int got_10[4];
+            {
+                uint32_t _uv4_278_0;
+                uint32_t _uv4_278_1;
+                uint32_t _uv4_278_2;
+                uint32_t _uv4_278_3;
+                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
+                    : "=r"(_uv4_278_0), "=r"(_uv4_278_1), "=r"(_uv4_278_2), "=r"(_uv4_278_3) : "l"((const void*)(zone_at + 1280 + (0))) : "memory");
+                got_10[0 + 0] = _uv4_278_0;
+                got_10[0 + 1] = _uv4_278_1;
+                got_10[0 + 2] = _uv4_278_2;
+                got_10[0 + 3] = _uv4_278_3;
+            }
+            unsigned int got_11[4];
+            {
+                uint32_t _uv4_279_0;
+                uint32_t _uv4_279_1;
+                uint32_t _uv4_279_2;
+                uint32_t _uv4_279_3;
+                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
+                    : "=r"(_uv4_279_0), "=r"(_uv4_279_1), "=r"(_uv4_279_2), "=r"(_uv4_279_3) : "l"((const void*)(zone_at + 1408 + (0))) : "memory");
+                got_11[0 + 0] = _uv4_279_0;
+                got_11[0 + 1] = _uv4_279_1;
+                got_11[0 + 2] = _uv4_279_2;
+                got_11[0 + 3] = _uv4_279_3;
+            }
+            unsigned int landing_unit_8 = zone_unit + 256;
+            if (landing_unit_8 < zone_units) {
+                unsigned int landing_row_8 = (unsigned int)((unsigned long long)landing_unit_8 * (unsigned long long)zone_magic >> 32);
+                unsigned int landing_col_8 = landing_unit_8 - landing_row_8 * zone_block;
+                unsigned int landing_fix_8 = (unsigned int)(landing_col_8 >= zone_block);
+                landing_row_8 = landing_row_8 + landing_fix_8;
+                landing_col_8 = landing_col_8 - landing_fix_8 * zone_block;
+                unsigned int landing_dst_8 = (landing_row_8 * 8 + zone_sender) * zone_block + landing_col_8;
+                {
+                    auto _gst_280 = out_words + (landing_dst_8 * 4);
+                    __builtin_assume(__isGlobal(_gst_280));
+                    reinterpret_cast<int4*>(_gst_280)[0] = reinterpret_cast<int4*>(got_8)[0];
+                }
+            }
+            unsigned int landing_unit_9 = zone_unit + 288;
+            if (landing_unit_9 < zone_units) {
+                unsigned int landing_row_9 = (unsigned int)((unsigned long long)landing_unit_9 * (unsigned long long)zone_magic >> 32);
+                unsigned int landing_col_9 = landing_unit_9 - landing_row_9 * zone_block;
+                unsigned int landing_fix_9 = (unsigned int)(landing_col_9 >= zone_block);
+                landing_row_9 = landing_row_9 + landing_fix_9;
+                landing_col_9 = landing_col_9 - landing_fix_9 * zone_block;
+                unsigned int landing_dst_9 = (landing_row_9 * 8 + zone_sender) * zone_block + landing_col_9;
+                {
+                    auto _gst_281 = out_words + (landing_dst_9 * 4);
+                    __builtin_assume(__isGlobal(_gst_281));
+                    reinterpret_cast<int4*>(_gst_281)[0] = reinterpret_cast<int4*>(got_9)[0];
+                }
+            }
+            unsigned int landing_unit_10 = zone_unit + 320;
+            if (landing_unit_10 < zone_units) {
+                unsigned int landing_row_10 = (unsigned int)((unsigned long long)landing_unit_10 * (unsigned long long)zone_magic >> 32);
+                unsigned int landing_col_10 = landing_unit_10 - landing_row_10 * zone_block;
+                unsigned int landing_fix_10 = (unsigned int)(landing_col_10 >= zone_block);
+                landing_row_10 = landing_row_10 + landing_fix_10;
+                landing_col_10 = landing_col_10 - landing_fix_10 * zone_block;
+                unsigned int landing_dst_10 = (landing_row_10 * 8 + zone_sender) * zone_block + landing_col_10;
+                {
+                    auto _gst_282 = out_words + (landing_dst_10 * 4);
+                    __builtin_assume(__isGlobal(_gst_282));
+                    reinterpret_cast<int4*>(_gst_282)[0] = reinterpret_cast<int4*>(got_10)[0];
+                }
+            }
+            unsigned int landing_unit_11 = zone_unit + 352;
+            if (landing_unit_11 < zone_units) {
+                unsigned int landing_row_11 = (unsigned int)((unsigned long long)landing_unit_11 * (unsigned long long)zone_magic >> 32);
+                unsigned int landing_col_11 = landing_unit_11 - landing_row_11 * zone_block;
+                unsigned int landing_fix_11 = (unsigned int)(landing_col_11 >= zone_block);
+                landing_row_11 = landing_row_11 + landing_fix_11;
+                landing_col_11 = landing_col_11 - landing_fix_11 * zone_block;
+                unsigned int landing_dst_11 = (landing_row_11 * 8 + zone_sender) * zone_block + landing_col_11;
+                {
+                    auto _gst_283 = out_words + (landing_dst_11 * 4);
+                    __builtin_assume(__isGlobal(_gst_283));
+                    reinterpret_cast<int4*>(_gst_283)[0] = reinterpret_cast<int4*>(got_11)[0];
+                }
+            }
+            unsigned int got_12[4];
+            {
+                uint32_t _uv4_284_0;
+                uint32_t _uv4_284_1;
+                uint32_t _uv4_284_2;
+                uint32_t _uv4_284_3;
+                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
+                    : "=r"(_uv4_284_0), "=r"(_uv4_284_1), "=r"(_uv4_284_2), "=r"(_uv4_284_3) : "l"((const void*)(zone_at + 1536 + (0))) : "memory");
+                got_12[0 + 0] = _uv4_284_0;
+                got_12[0 + 1] = _uv4_284_1;
+                got_12[0 + 2] = _uv4_284_2;
+                got_12[0 + 3] = _uv4_284_3;
+            }
+            unsigned int got_13[4];
+            {
+                uint32_t _uv4_285_0;
+                uint32_t _uv4_285_1;
+                uint32_t _uv4_285_2;
+                uint32_t _uv4_285_3;
+                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
+                    : "=r"(_uv4_285_0), "=r"(_uv4_285_1), "=r"(_uv4_285_2), "=r"(_uv4_285_3) : "l"((const void*)(zone_at + 1664 + (0))) : "memory");
+                got_13[0 + 0] = _uv4_285_0;
+                got_13[0 + 1] = _uv4_285_1;
+                got_13[0 + 2] = _uv4_285_2;
+                got_13[0 + 3] = _uv4_285_3;
+            }
+            unsigned int got_14[4];
+            {
+                uint32_t _uv4_286_0;
+                uint32_t _uv4_286_1;
+                uint32_t _uv4_286_2;
+                uint32_t _uv4_286_3;
+                asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
+                    : "=r"(_uv4_286_0), "=r"(_uv4_286_1), "=r"(_uv4_286_2), "=r"(_uv4_286_3) : "l"((const void*)(zone_at + 1792 + (0))) : "memory");
+                got_14[0 + 0] = _uv4_286_0;
+                got_14[0 + 1] = _uv4_286_1;
+                got_14[0 + 2] = _uv4_286_2;
+                got_14[0 + 3] = _uv4_286_3;
+            }
+            unsigned int landing_unit_12 = zone_unit + 384;
+            if (landing_unit_12 < zone_units) {
+                unsigned int landing_row_12 = (unsigned int)((unsigned long long)landing_unit_12 * (unsigned long long)zone_magic >> 32);
+                unsigned int landing_col_12 = landing_unit_12 - landing_row_12 * zone_block;
+                unsigned int landing_fix_12 = (unsigned int)(landing_col_12 >= zone_block);
+                landing_row_12 = landing_row_12 + landing_fix_12;
+                landing_col_12 = landing_col_12 - landing_fix_12 * zone_block;
+                unsigned int landing_dst_12 = (landing_row_12 * 8 + zone_sender) * zone_block + landing_col_12;
+                {
+                    auto _gst_287 = out_words + (landing_dst_12 * 4);
+                    __builtin_assume(__isGlobal(_gst_287));
+                    reinterpret_cast<int4*>(_gst_287)[0] = reinterpret_cast<int4*>(got_12)[0];
+                }
+            }
+            unsigned int landing_unit_13 = zone_unit + 416;
+            if (landing_unit_13 < zone_units) {
+                unsigned int landing_row_13 = (unsigned int)((unsigned long long)landing_unit_13 * (unsigned long long)zone_magic >> 32);
+                unsigned int landing_col_13 = landing_unit_13 - landing_row_13 * zone_block;
+                unsigned int landing_fix_13 = (unsigned int)(landing_col_13 >= zone_block);
+                landing_row_13 = landing_row_13 + landing_fix_13;
+                landing_col_13 = landing_col_13 - landing_fix_13 * zone_block;
+                unsigned int landing_dst_13 = (landing_row_13 * 8 + zone_sender) * zone_block + landing_col_13;
+                {
+                    auto _gst_288 = out_words + (landing_dst_13 * 4);
+                    __builtin_assume(__isGlobal(_gst_288));
+                    reinterpret_cast<int4*>(_gst_288)[0] = reinterpret_cast<int4*>(got_13)[0];
+                }
+            }
+            unsigned int landing_unit_14 = zone_unit + 448;
+            if (landing_unit_14 < zone_units) {
+                unsigned int landing_row_14 = (unsigned int)((unsigned long long)landing_unit_14 * (unsigned long long)zone_magic >> 32);
+                unsigned int landing_col_14 = landing_unit_14 - landing_row_14 * zone_block;
+                unsigned int landing_fix_14 = (unsigned int)(landing_col_14 >= zone_block);
+                landing_row_14 = landing_row_14 + landing_fix_14;
+                landing_col_14 = landing_col_14 - landing_fix_14 * zone_block;
+                unsigned int landing_dst_14 = (landing_row_14 * 8 + zone_sender) * zone_block + landing_col_14;
+                {
+                    auto _gst_289 = out_words + (landing_dst_14 * 4);
+                    __builtin_assume(__isGlobal(_gst_289));
+                    reinterpret_cast<int4*>(_gst_289)[0] = reinterpret_cast<int4*>(got_14)[0];
+                }
+            }
         }
     }
     __syncthreads();
