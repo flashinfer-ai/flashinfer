@@ -399,8 +399,8 @@ class _Launch:
             assert grids is not None, "an overlap plan has an overlap width"
             overlap_grids = grids
         elif plan.head_major:
-            # the head-major producers over every SM, no lead or tail launch
-            overlap_grids = (0, _sm_count(index), 0)
+            # the head-major producers over every SM, then the attention (its grid in the tail position)
+            overlap_grids = (0, _sm_count(index), attention_grid)
         tensors = (
             plan.cu_seqlens,
             plan.seg_begin,
@@ -828,6 +828,62 @@ def _minimax_h3_sm120_varlen_attention_fp8_impl(
     tokens, heads = int(q.shape[0]), int(q.shape[1])
     with tvm_ffi.use_raw_stream(_ffi_device(q.device.index), stream):
         if tail_grid > 0:
+            if lead_grid == 0:
+                # the head-major sequential form
+                producers, attention = _head_major_entries(target)
+                producers(
+                    q,
+                    k,
+                    v,
+                    tile_table,
+                    seg_begin,
+                    seg_len,
+                    seg_tile_begin,
+                    cu_seqlens,
+                    partials,
+                    counters,
+                    mean_k,
+                    v_scale,
+                    q8_words,
+                    k8_words,
+                    vt8_words,
+                    q_scale,
+                    k_scale,
+                    hctr,
+                    num_tiles,
+                    tokens,
+                    padded_tokens,
+                    num_segments,
+                    heads,
+                    num_kblocks,
+                    producer_grid,
+                    1,
+                    1,
+                )
+                # the producers leave their ready and done words set; the call restarts them (stream order)
+                (
+                    hctr if isinstance(hctr, torch.Tensor) else torch.from_dlpack(hctr)
+                ).zero_()
+                attention(
+                    q8_rows,
+                    k8_rows,
+                    vt8_rows,
+                    out,
+                    q_scale,
+                    k_scale,
+                    v_scale,
+                    seg_begin,
+                    seg_len,
+                    unit_table,
+                    num_units,
+                    heads,
+                    num_kblocks,
+                    softmax_scale_log2,
+                    tail_grid,
+                    1,
+                    1,
+                )
+                return
             _launch_overlapped(
                 target,
                 q.device.index,
@@ -870,79 +926,44 @@ def _minimax_h3_sm120_varlen_attention_fp8_impl(
             )
             return
         stats, quantize, attention = _entries(target)
-        if producer_grid > 0:
-            _head_major_entry(target)(
-                q,
-                k,
-                v,
-                tile_table,
-                seg_begin,
-                seg_len,
-                seg_tile_begin,
-                cu_seqlens,
-                partials,
-                counters,
-                mean_k,
-                v_scale,
-                q8_words,
-                k8_words,
-                vt8_words,
-                q_scale,
-                k_scale,
-                hctr,
-                num_tiles,
-                tokens,
-                padded_tokens,
-                num_segments,
-                heads,
-                num_kblocks,
-                producer_grid,
-                1,
-                1,
-            )
-            # the producers leave their ready and done words set; the call restarts them (stream order)
-            (
-                hctr if isinstance(hctr, torch.Tensor) else torch.from_dlpack(hctr)
-            ).zero_()
-        else:
-            stats(
-                k,
-                v,
-                tile_table,
-                seg_begin,
-                seg_len,
-                seg_tile_begin,
-                partials,
-                counters,
-                mean_k,
-                v_scale,
-                num_tiles,
-                heads,
-                stats_grid,
-                1,
-                1,
-            )
-            quantize(
-                q,
-                k,
-                v,
-                cu_seqlens,
-                mean_k,
-                v_scale,
-                q8_words,
-                k8_words,
-                vt8_words,
-                q_scale,
-                k_scale,
-                tokens,
-                padded_tokens,
-                num_segments,
-                heads,
-                num_kblocks,
-                quantize_grid,
-                1,
-                1,
-            )
+        stats(
+            k,
+            v,
+            tile_table,
+            seg_begin,
+            seg_len,
+            seg_tile_begin,
+            partials,
+            counters,
+            mean_k,
+            v_scale,
+            num_tiles,
+            heads,
+            stats_grid,
+            1,
+            1,
+        )
+        quantize(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            mean_k,
+            v_scale,
+            q8_words,
+            k8_words,
+            vt8_words,
+            q_scale,
+            k_scale,
+            tokens,
+            padded_tokens,
+            num_segments,
+            heads,
+            num_kblocks,
+            quantize_grid,
+            1,
+            1,
+        )
         attention(
             q8_rows,
             k8_rows,
@@ -1015,10 +1036,10 @@ def _entries(target: str) -> Tuple[Any, Any, Any]:
 
 
 @functools.cache
-def _head_major_entry(target: str) -> Any:
-    """The ``run`` entry of the head-major producers (``PREPROCESS_HEAD_MAJOR``) on ``target``, the
-    pre-processing of a head-major sequential plan."""
-    return PREPROCESS_HEAD_MAJOR.entry(target)
+def _head_major_entries(target: str) -> Tuple[Any, Any]:
+    """The ``run`` entries of the head-major sequential form on ``target``: the head-major producers
+    (``PREPROCESS_HEAD_MAJOR``), its pre-processing, and the attention."""
+    return PREPROCESS_HEAD_MAJOR.entry(target), ATTENTION.entry(target)
 
 
 @functools.cache
