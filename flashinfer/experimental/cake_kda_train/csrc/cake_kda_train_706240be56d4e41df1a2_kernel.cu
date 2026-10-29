@@ -53,6 +53,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define NUM_ONE_STAGES 1
 #define NUM_RING_STAGES 2
 #define NUM_ACCS_STAGES 2
+#define NUM_WORK_STAGES 4
 #define SMEM_DO_S_OFF 1024
 #define SMEM_DO_S_STAGE_BYTES 32768
 #define SMEM_DO_S_STRIDE 65536
@@ -65,7 +66,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_VNEW_K_OFF 33792
 #define SMEM_VNEW_K_STAGE_BYTES 32768
 #define SMEM_VNEW_K_STRIDE 65536
-#define SMEM_TOTAL 132096
+#define SMEM_WORK_RESP_OFF 132096
+#define SMEM_WORK_RESP_STAGE_BYTES 16
+#define SMEM_WORK_RESP_STRIDE 16
+#define SMEM_TOTAL 132224
 #define THREADS 192
 #define LAUNCH_MIN_BLOCKS 1
 
@@ -157,7 +161,7 @@ __device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
 extern "C" {
 
 __global__ __launch_bounds__(192, LAUNCH_MIN_BLOCKS) void
-kernel_cake_kda_train_021592c077b54de470a5(const __grid_constant__ CUtensorMap do_tma, const __grid_constant__ CUtensorMap vnew_tma, float* __restrict__ dAqk, int num_heads, float scale, int* __restrict__ chunk_bos, int* __restrict__ chunk_len, int num_pairs)
+kernel_cake_kda_train_706240be56d4e41df1a2(const __grid_constant__ CUtensorMap do_tma, const __grid_constant__ CUtensorMap vnew_tma, float* __restrict__ dAqk, int num_heads, float scale, int* __restrict__ chunk_bos, int* __restrict__ chunk_len, int num_pairs)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -177,6 +181,8 @@ kernel_cake_kda_train_021592c077b54de470a5(const __grid_constant__ CUtensorMap d
     #define tiles_empty_addr (mbar_base + 16)
     #define acc_full_addr (mbar_base + 32)
     #define acc_empty_addr (mbar_base + 48)
+    #define work_full_addr (mbar_base + 64)
+    #define work_empty_addr (mbar_base + 96)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -192,9 +198,11 @@ kernel_cake_kda_train_021592c077b54de470a5(const __grid_constant__ CUtensorMap d
     const int do_k_addr = smem + 1024;
     __nv_bfloat16* vnew_k = reinterpret_cast<__nv_bfloat16*>(smem_raw + 33792);
     const int vnew_k_addr = smem + 33792;
+    unsigned int* work_resp = reinterpret_cast<unsigned int*>(smem_raw + 132096);
+    const int work_resp_addr = smem + 132096;
 
-    // Mbarrier init (4 pipeline groups, 0 ordered-sequence groups, 8 barriers)
-    // Mbarriers at smem_raw[0..64)
+    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 16 barriers)
+    // Mbarriers at smem_raw[0..128)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -213,6 +221,17 @@ kernel_cake_kda_train_021592c077b54de470a5(const __grid_constant__ CUtensorMap d
             // acc_empty: 2 barriers, init_count=128
             mbarrier_init(smem + 48, 128);
             mbarrier_init(smem + 56, 128);
+            // --- pipeline 'work' ---
+            // work_full: 4 barriers, init_count=1
+            mbarrier_init(smem + 64, 1);
+            mbarrier_init(smem + 72, 1);
+            mbarrier_init(smem + 80, 1);
+            mbarrier_init(smem + 88, 1);
+            // work_empty: 4 barriers, init_count=161
+            mbarrier_init(smem + 96, 161);
+            mbarrier_init(smem + 104, 161);
+            mbarrier_init(smem + 112, 161);
+            mbarrier_init(smem + 120, 161);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -220,9 +239,9 @@ kernel_cake_kda_train_021592c077b54de470a5(const __grid_constant__ CUtensorMap d
     __syncwarp();
 
     // TMEM alloc (256 columns, 256 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 64);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 128);
     if (warp == 0) {
-        int _tmem_hold = smem + 64;
+        int _tmem_hold = smem + 128;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(256) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
@@ -242,16 +261,47 @@ kernel_cake_kda_train_021592c077b54de470a5(const __grid_constant__ CUtensorMap d
             const int epi_warp = warp;
             const int epi_tid = epi_warp * 32 + lane;
             unsigned int epi_buf = 0;
+            unsigned int work_stage_e = 0;
             int num_items_e = num_pairs * num_heads;
             const int quad = (epi_warp & 3) * 32;
             const int row_base = quad << 16;
             const int row = quad + lane;
             const int chunk = row / 64;
             const int t_local = row - chunk * 64;
+            int it_e = (int)bid;
+            unsigned int _phase_work_full = 0;
             unsigned int _phase_acc_full = 0;
             #pragma unroll 1
-            for (unsigned int item = bid; item < num_items_e; item += num_bids) {
-                int it_e = (int)item;
+            for (int _item_e = 0; _item_e < num_items_e; _item_e++) {
+                mbarrier_wait(work_full_addr + (work_stage_e) * 8, _phase_work_full);
+                uint32_t valid = 0;
+                asm volatile(
+                    "{\n\t"
+                    ".reg .pred p1;\n\t"
+                    ".reg .b128 clc_r;\n\t"
+                    "ld.shared.b128 clc_r, [%1];\n\t"
+                    "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                    "selp.u32 %0, 1, 0, p1;\n\t"
+                    "}\n"
+                    : "=r"(valid)
+                    : "r"(work_resp_addr + work_stage_e * 16 + 0 * 16)
+                    : "memory");
+                uint32_t cta = 0;
+                asm volatile(
+                    "{\n\t"
+                    ".reg .pred p1;\n\t"
+                    ".reg .b128 clc_r;\n\t"
+                    "ld.shared.b128 clc_r, [%1];\n\t"
+                    "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                    "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
+                    "}\n"
+                    : "+r"(cta)
+                    : "r"(work_resp_addr + work_stage_e * 16 + 0 * 16)
+                    : "memory");
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                mbarrier_arrive(work_empty_addr + (work_stage_e) * 8);
+                work_stage_e += 1;
+                if (work_stage_e == 4) { work_stage_e = 0; _phase_work_full ^= 1; }
                 int pair_e = it_e / num_heads;
                 int head_e = it_e - pair_e * num_heads;
                 int grow = pair_e * 128 + row;
@@ -304,6 +354,10 @@ kernel_cake_kda_train_021592c077b54de470a5(const __grid_constant__ CUtensorMap d
                 mbarrier_arrive(acc_empty_addr + (epi_buf) * 8);
                 epi_buf += 1;
                 if (epi_buf == 2) { epi_buf = 0; _phase_acc_full ^= 1; }
+                if (valid == 0) {
+                    break;
+                }
+                it_e = (int)cta;
             }
             asm volatile("barrier.sync 1, 128;" ::: "memory");
             if (warp == 0) {
@@ -315,34 +369,36 @@ kernel_cake_kda_train_021592c077b54de470a5(const __grid_constant__ CUtensorMap d
     if (warp == 4) {
         { // load_main
             unsigned int ld_stage = 0;
+            unsigned int work_stage_l = 0;
             int num_items_l = num_pairs * num_heads;
+            unsigned int _phase_work_empty = 1;
             unsigned int _phase_tiles_empty = 1;
+            unsigned int _phase_work_full_1 = 0;
             if (elect_sync()) {
+                int it_l = (int)bid;
                 int nbos0 = 0;
                 int nbos1 = 0;
-                int first_l = (int)bid;
-                int pair_f = first_l / num_heads;
+                int pair_f = it_l / num_heads;
                 int chunk_f0 = pair_f * 2;
                 int chunk_f1 = pair_f * 2 + 1;
                 nbos0 = chunk_bos[chunk_f0];
                 nbos1 = chunk_bos[chunk_f1];
                 #pragma unroll 1
-                for (unsigned int item_1 = bid; item_1 < num_items_l; item_1 += num_bids) {
-                    int it_l = (int)item_1;
+                for (int _item_l = 0; _item_l < num_items_l; _item_l++) {
+                    mbarrier_wait(work_empty_addr + (work_stage_l) * 8, _phase_work_empty);
+                    mbarrier_arrive_expect_tx(work_full_addr + (work_stage_l) * 8, 16);
+                    asm volatile(
+                        "fence.proxy.async.shared::cta;\n\t"
+                        "clusterlaunchcontrol.try_cancel.async.shared::cta"
+                            ".mbarrier::complete_tx::bytes.b128"
+                            " [%0], [%1];"
+                        :: "r"(work_resp_addr + work_stage_l * 16 + 0 * 16), "r"(work_full_addr + work_stage_l * 8)
+                        : "memory");
                     int pair_l = it_l / num_heads;
                     int head_l = it_l - pair_l * num_heads;
                     int row0_l = pair_l * 128;
                     int bos0_l = nbos0;
                     int bos1_l = nbos1;
-                    int it_n = it_l + (int)num_bids;
-                    if (it_n >= num_items_l) {
-                        it_n = it_l;
-                    }
-                    int pair_n = it_n / num_heads;
-                    int chunk_n0 = pair_n * 2;
-                    int chunk_n1 = pair_n * 2 + 1;
-                    nbos0 = chunk_bos[chunk_n0];
-                    nbos1 = chunk_bos[chunk_n1];
                     mbarrier_wait(tiles_empty_addr + (ld_stage) * 8, _phase_tiles_empty);
                     mbarrier_arrive_expect_tx(tiles_full_addr + (ld_stage) * 8, 65536);
                     #pragma unroll
@@ -353,6 +409,42 @@ kernel_cake_kda_train_021592c077b54de470a5(const __grid_constant__ CUtensorMap d
                     }
                     ld_stage += 1;
                     if (ld_stage == 2) { ld_stage = 0; _phase_tiles_empty ^= 1; }
+                    mbarrier_wait(work_full_addr + (work_stage_l) * 8, _phase_work_full_1);
+                    uint32_t valid_1 = 0;
+                    asm volatile(
+                        "{\n\t"
+                        ".reg .pred p1;\n\t"
+                        ".reg .b128 clc_r;\n\t"
+                        "ld.shared.b128 clc_r, [%1];\n\t"
+                        "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                        "selp.u32 %0, 1, 0, p1;\n\t"
+                        "}\n"
+                        : "=r"(valid_1)
+                        : "r"(work_resp_addr + work_stage_l * 16 + 0 * 16)
+                        : "memory");
+                    uint32_t cta_1 = 0;
+                    asm volatile(
+                        "{\n\t"
+                        ".reg .pred p1;\n\t"
+                        ".reg .b128 clc_r;\n\t"
+                        "ld.shared.b128 clc_r, [%1];\n\t"
+                        "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                        "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
+                        "}\n"
+                        : "+r"(cta_1)
+                        : "r"(work_resp_addr + work_stage_l * 16 + 0 * 16)
+                        : "memory");
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    mbarrier_arrive(work_empty_addr + (work_stage_l) * 8);
+                    work_stage_l += 1;
+                    if (work_stage_l == 4) { work_stage_l = 0; _phase_work_empty ^= 1; _phase_work_full_1 ^= 1; }
+                    if (valid_1 == 0) {
+                        break;
+                    }
+                    it_l = (int)cta_1;
+                    int pair_n = it_l / num_heads;
+                    nbos0 = chunk_bos[pair_n * 2];
+                    nbos1 = chunk_bos[pair_n * 2 + 1];
                 }
             }
         }
@@ -362,13 +454,44 @@ kernel_cake_kda_train_021592c077b54de470a5(const __grid_constant__ CUtensorMap d
         { // mma_main
             unsigned int mma_stage = 0;
             unsigned int mma_buf = 0;
+            unsigned int work_stage_m = 0;
             int num_items_m = num_pairs * num_heads;
             const int lane_m = lane;
+            int it_m = (int)bid;
+            unsigned int _phase_work_full_2 = 0;
             unsigned int _phase_tiles_full = 0;
             unsigned int _phase_acc_empty = 1;
             #pragma unroll 1
-            for (unsigned int item_2 = bid; item_2 < num_items_m; item_2 += num_bids) {
-                int it_m = (int)item_2;
+            for (int _item_m = 0; _item_m < num_items_m; _item_m++) {
+                mbarrier_wait(work_full_addr + (work_stage_m) * 8, _phase_work_full_2);
+                uint32_t valid_2 = 0;
+                asm volatile(
+                    "{\n\t"
+                    ".reg .pred p1;\n\t"
+                    ".reg .b128 clc_r;\n\t"
+                    "ld.shared.b128 clc_r, [%1];\n\t"
+                    "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                    "selp.u32 %0, 1, 0, p1;\n\t"
+                    "}\n"
+                    : "=r"(valid_2)
+                    : "r"(work_resp_addr + work_stage_m * 16 + 0 * 16)
+                    : "memory");
+                uint32_t cta_2 = 0;
+                asm volatile(
+                    "{\n\t"
+                    ".reg .pred p1;\n\t"
+                    ".reg .b128 clc_r;\n\t"
+                    "ld.shared.b128 clc_r, [%1];\n\t"
+                    "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                    "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
+                    "}\n"
+                    : "+r"(cta_2)
+                    : "r"(work_resp_addr + work_stage_m * 16 + 0 * 16)
+                    : "memory");
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                mbarrier_arrive(work_empty_addr + (work_stage_m) * 8);
+                work_stage_m += 1;
+                if (work_stage_m == 4) { work_stage_m = 0; _phase_work_full_2 ^= 1; }
                 int pair_m = it_m / num_heads;
                 int chunk_m0 = pair_m * 2;
                 int chunk_m1 = pair_m * 2 + 1;
@@ -394,9 +517,9 @@ kernel_cake_kda_train_021592c077b54de470a5(const __grid_constant__ CUtensorMap d
                     zeros_0[1] = 0;
                     zeros_0[2] = 0;
                     zeros_0[3] = 0;
-                    int npad_1 = (64 - clen1) * 16;
+                    int npad_0 = (64 - clen1) * 16;
                     #pragma unroll 1
-                    for (int idx_1 = lane_m; idx_1 < npad_1; idx_1 += 32) {
+                    for (int idx_1 = lane_m; idx_1 < npad_0; idx_1 += 32) {
                         int row_2 = clen1 + (idx_1 >> 4);
                         int rem_1 = idx_1 & 15;
                         int off_1 = row_2 * 128 + (rem_1 >> 3) * 16384 + (rem_1 & 7) * 16;
@@ -477,6 +600,10 @@ kernel_cake_kda_train_021592c077b54de470a5(const __grid_constant__ CUtensorMap d
                 if (mma_stage == 2) { mma_stage = 0; _phase_tiles_full ^= 1; }
                 mma_buf += 1;
                 if (mma_buf == 2) { mma_buf = 0; _phase_acc_empty ^= 1; }
+                if (valid_2 == 0) {
+                    break;
+                }
+                it_m = (int)cta_2;
             }
         }
     }
