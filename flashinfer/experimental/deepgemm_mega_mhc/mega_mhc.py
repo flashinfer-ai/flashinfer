@@ -291,7 +291,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "block": [768, 1, 1],
             "dynamic_smem_bytes": 208896,
             "cooperative": True,
-            "use_pdl": False,
+            "use_pdl": True,
         },
     },
     "cake_mega_mhc_c549b064530c3765f9ba": {
@@ -345,7 +345,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "block": [768, 1, 1],
             "dynamic_smem_bytes": 208896,
             "cooperative": True,
-            "use_pdl": False,
+            "use_pdl": True,
         },
     },
     "cake_mega_mhc_41024b807c02040677b3": {
@@ -399,7 +399,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "block": [768, 1, 1],
             "dynamic_smem_bytes": 217088,
             "cooperative": True,
-            "use_pdl": False,
+            "use_pdl": True,
         },
     },
     "cake_mega_mhc_a940c94296afad2b2497": {
@@ -456,7 +456,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "block": [768, 1, 1],
             "dynamic_smem_bytes": 208896,
             "cooperative": True,
-            "use_pdl": False,
+            "use_pdl": True,
         },
     },
     "cake_mega_mhc_1c61fed11caf93d1b762": {
@@ -513,7 +513,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "block": [768, 1, 1],
             "dynamic_smem_bytes": 208896,
             "cooperative": True,
-            "use_pdl": False,
+            "use_pdl": True,
         },
     },
     "cake_mega_mhc_ed3f407e5a68eb65478e": {
@@ -570,7 +570,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "block": [768, 1, 1],
             "dynamic_smem_bytes": 208896,
             "cooperative": True,
-            "use_pdl": False,
+            "use_pdl": True,
         },
     },
     "cake_mega_mhc_892d774130f06423fd7c": {
@@ -627,7 +627,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "block": [768, 1, 1],
             "dynamic_smem_bytes": 217088,
             "cooperative": True,
-            "use_pdl": False,
+            "use_pdl": True,
         },
     },
     "cake_mega_mhc_91c9979888321fdbf94f": {
@@ -684,7 +684,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "block": [768, 1, 1],
             "dynamic_smem_bytes": 208896,
             "cooperative": True,
-            "use_pdl": False,
+            "use_pdl": True,
         },
     },
     "cake_mega_mhc_9823742e18a9ffa6515b": {
@@ -741,7 +741,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "block": [768, 1, 1],
             "dynamic_smem_bytes": 208896,
             "cooperative": True,
-            "use_pdl": False,
+            "use_pdl": True,
         },
     },
     "cake_mega_mhc_5c5eaa3072b0d4f69ccd": {
@@ -798,7 +798,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "block": [768, 1, 1],
             "dynamic_smem_bytes": 217088,
             "cooperative": True,
-            "use_pdl": False,
+            "use_pdl": True,
         },
     },
     "cake_mega_mhc_5018692c75652529e6fd": {
@@ -855,7 +855,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "block": [768, 1, 1],
             "dynamic_smem_bytes": 208896,
             "cooperative": True,
-            "use_pdl": False,
+            "use_pdl": True,
         },
     },
     "cake_mega_mhc_12e5bcc41e7940e7d511": {
@@ -912,7 +912,7 @@ PROGRAMS: dict[str, dict[str, Any]] = {
             "block": [768, 1, 1],
             "dynamic_smem_bytes": 217088,
             "cooperative": True,
-            "use_pdl": False,
+            "use_pdl": True,
         },
     },
 }
