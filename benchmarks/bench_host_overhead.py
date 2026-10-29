@@ -103,8 +103,11 @@ def main():
     results = {}
     kernels = {}
 
+    def wanted(*names):
+        return not args.only or any(x in n for n in names for x in args.only)
+
     def add(name, fn):
-        if args.only and name != "torch.mm" and not any(x in name for x in args.only):
+        if name != "torch.mm" and not wanted(name):
             return
         # A backend can pass its first call and still fail later (warmup, re-plan);
         # skip it rather than abort the whole table.
@@ -127,7 +130,15 @@ def main():
             )
 
     blackwell = props.major in (10, 12)
-    if blackwell and ("fp4" in args.api or "quant" in args.api):
+    lowp = ("auto", "cudnn", "cutlass", "cute-dsl", "cutedsl_low_latency")
+    # Prepare inputs only for rows --only keeps, so a failing unselected
+    # preparation cannot abort the selected ones.
+    fp4_rows = [f"mm_fp4({x})" for x in lowp + ("trtllm",)]
+    want_fp4 = "fp4" in args.api and wanted(*fp4_rows)
+    want_nvfp4_quant = "quant" in args.api and wanted(
+        "nvfp4_quantize(a)", "fp4_quantize(a)"
+    )
+    if blackwell and (want_fp4 or want_nvfp4_quant):
         layout = flashinfer.SfLayout.layout_128x4
         ga = (448 * 6) / a.float().abs().max()
         gw = (448 * 6) / w.float().abs().max()
@@ -135,8 +146,8 @@ def main():
         w4, w_sf = flashinfer.nvfp4_quantize(w, gw, sfLayout=layout, do_shuffle=False)
         alpha = (1.0 / (ga * gw)).reshape(1).float()
 
-    if blackwell and "fp4" in args.api:
-        for backend in ("auto", "cudnn", "cutlass", "cute-dsl", "cutedsl_low_latency"):
+    if blackwell and want_fp4:
+        for backend in lowp:
             add(
                 f"mm_fp4({backend})",
                 lambda x=backend: flashinfer.mm_fp4(
@@ -152,7 +163,7 @@ def main():
                     backend=x,
                 ),
             )
-    if blackwell and "fp4" in args.api and n % 128 == 0:
+    if blackwell and want_fp4 and wanted("mm_fp4(trtllm)") and n % 128 == 0:
         # trtllm swaps A and B, so its weight is shuffled (N % 128) at load time.
         w4s, w_sfs = flashinfer.nvfp4_quantize(w, gw, sfLayout=layout, do_shuffle=True)
         add(
@@ -171,17 +182,23 @@ def main():
             ),
         )
 
-    if blackwell and "mxfp8" in args.api:
+    if blackwell and "mxfp8" in args.api and wanted(*(f"mm_mxfp8({x})" for x in lowp)):
         a8, a8_sf = flashinfer.mxfp8_quantize(a, is_sf_swizzled_layout=True)
         w8, w8_sf = flashinfer.mxfp8_quantize(w, is_sf_swizzled_layout=True)
-        for backend in ("auto", "cudnn", "cutlass", "cute-dsl", "cutedsl_low_latency"):
+        for backend in lowp:
             add(
                 f"mm_mxfp8({backend})",
                 lambda x=backend: flashinfer.mm_mxfp8(
                     a8, w8.t(), a8_sf, w8_sf, out=out, backend=x
                 ),
             )
-    if blackwell and "mxfp8" in args.api and n % 128 == 0 and k % 256 == 0:
+    if (
+        blackwell
+        and "mxfp8" in args.api
+        and wanted("mm_mxfp8(trtllm)")
+        and n % 128 == 0
+        and k % 256 == 0
+    ):
         w8l, w8l_sf = flashinfer.mxfp8_quantize(w, is_sf_swizzled_layout=False)
         w8t = flashinfer.shuffle_matrix_a(w8l, 128).reshape(n, k)
         w8t_sf = flashinfer.shuffle_matrix_sf_a(

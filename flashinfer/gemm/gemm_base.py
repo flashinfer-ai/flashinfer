@@ -245,8 +245,9 @@ def get_gemm_module():
                 return (a.dtype, b.dtype, out.dtype)
 
             def _algo_cache_key(self, inputs: List[torch.Tensor]) -> tuple:
-                # The algo list is enumerated per exact problem descriptor.
-                a, b, _, _, out, _ = inputs
+                # The algo list is enumerated per exact problem descriptor and
+                # filtered by the workspace size, so a smaller buffer re-queries.
+                a, b, _, _, out, workspace = inputs
                 dev = a.device
                 major, minor = get_compute_capability(dev)
                 return (
@@ -261,6 +262,7 @@ def get_gemm_module():
                     a.dtype,
                     b.dtype,
                     out.dtype,
+                    workspace.numel() * workspace.element_size(),
                 )
 
             def _get_algos(self, inputs):
@@ -2254,8 +2256,10 @@ def get_mm_bf16_cublaslt_module():
                 Device identity is in the key because the runner is memoized and
                 therefore process-lived: without it, an algo enumerated on one
                 GPU would be replayed on another with a different architecture.
+                The workspace size is in it because the heuristic filters algos by
+                it: an algo listed for a larger buffer must not run on a smaller one.
                 """
-                a, b, bias, _, out, _ = inputs
+                a, b, bias, _, out, workspace = inputs
                 dev = a.device
                 major, minor = get_compute_capability(dev)
                 return (
@@ -2272,6 +2276,7 @@ def get_mm_bf16_cublaslt_module():
                     out.dtype,
                     self._compute_dtype(out.dtype),
                     self._pointer_alignment(bias),
+                    workspace.numel() * workspace.element_size(),
                 )
 
             @staticmethod
