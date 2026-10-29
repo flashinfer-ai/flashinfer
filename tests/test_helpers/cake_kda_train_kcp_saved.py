@@ -24,9 +24,11 @@ uninitialized tensor of ``n_frag (P - 1)`` slots (``+ max(n_in, n_out)`` extra s
 
 The other slots keep the caching allocator's bytes, which depend on the allocation history: the extra slots
 ``n_in <= j < n_out`` (the backward publishes its ``dS_out`` copies there in the workspace pool, never in the saved
-plane) and the slots of zero-length fragments.  The tape replay of the saved-mode backward reads exactly the written
-slots; :func:`carry_slots` checks that against the plan's segment tables, and :func:`poison_unwritten_carry` lets a
-test require bitwise gradients with NaN in the other slots.
+plane) and the slots of zero-length fragments.  :func:`carry_slots` checks the written slots against the plan's
+tape-replay index over the segments of the non-empty fragments.  The fused walks' tape replay (``walk_live``, the
+shipped form) reads exactly those slots.  The ``fused_walks=0`` replay walks every segment, so it also loads the
+slots of zero-length fragments; their segments hold no chunk, so the loaded state is never used.
+:func:`poison_unwritten_carry` lets a test require bitwise gradients with NaN in the other slots.
 """
 
 from __future__ import annotations
@@ -53,7 +55,8 @@ def carry_slots(saved) -> tuple[tuple[int, ...], tuple[int, ...]]:
     written = {f.slot * (P - 1) + i for f in live for i in range(P - 1)}
     if extra:
         written |= {base + int(ctx.in_slot[f.slot]) for f in live if f.crossing_in}
-    # the tape replay's initial states: the carry plane slot of every segment of a non-empty fragment (-1 = zero state)
+    # the tape replay's initial states over the segments of the non-empty fragments (-1 = zero state): the fused
+    # replay's walk_live; the fused_walks=0 replay also loads zero-length fragments' slots, for segments without a chunk
     index = hp.h0_index_fused if extra else hp.carry_index
     read = {int(index[f.slot * P + p]) for f in live for p in range(P)} - {-1}
     assert written == read, (sorted(written), sorted(read))

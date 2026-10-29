@@ -37,6 +37,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from tests.test_helpers.cake_kda_train_kcp_saved import (
+    carry_slots,
     poison_unwritten_carry,
     written_tensors,
 )
@@ -269,8 +270,14 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
     )
     # the carry plane slots the forward never writes (the extra slots beyond n_in when n_out > n_in, the slots of a
     # zero-length fragment) hold allocator bytes: the saved sets compare on the written bytes, and NaN in the others
-    # must not reach a gradient
-    poison_unwritten_carry(saved_f)
+    # must not reach a gradient.  Each rank's NaN bytes go to the report (0 where the plan leaves no slot unwritten).
+    # The slot invariants differ per rank: a rank that breaks one fails this flag with the reason, instead of raising
+    # before the backward's collectives and leaving its peers waiting
+    try:
+        carry_slots(saved_b)
+        carry_poisoned = poison_unwritten_carry(saved_f)
+    except AssertionError as exc:
+        carry_poisoned = f"carry_slots: {exc!r}"
     dq, dk, dv, dbeta, dg = cake_kcp.chunk_kda_kcp_bwd(
         q, k, v, g, beta, ctx, dout, saved=saved_f, workspace=ws_f
     )
@@ -283,7 +290,8 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
         "dbeta": dbeta,
     }
     fwd_only_eq = (
-        torch.equal(out_b, res["out"])
+        isinstance(carry_poisoned, int)
+        and torch.equal(out_b, res["out"])
         and torch.equal(out_n, res["out"])
         and torch.equal(out_t, res["out"])
         and saved_f.flags() == saved_b.flags()
@@ -375,14 +383,17 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
     flag_list = [None] * W
     spec3_list = [None] * W
     events_list = [None] * W
+    carry_list = [None] * W
     if W > 1:
         dist.all_gather_object(flag_list, flags)
         dist.all_gather_object(spec3_list, spec3)
         dist.all_gather_object(events_list, events)
+        dist.all_gather_object(carry_list, carry_poisoned)
     else:
         flag_list = [flags]
         spec3_list = [spec3]
         events_list = [events]
+        carry_list = [carry_poisoned]
     report = {
         "rank": rank,
         "world": W,
@@ -393,6 +404,7 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
         "backend_path": getattr(backend, "path", None),
         "spec3_by_rank": spec3_list,
         "graph_events_by_rank": events_list,
+        "carry_poisoned_bytes_by_rank": carry_list,
     }
     for key in flags:
         report["flags"][key] = all(f[key] for f in flag_list)
