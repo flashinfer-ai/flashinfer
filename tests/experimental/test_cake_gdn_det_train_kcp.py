@@ -1314,12 +1314,19 @@ def test_registry_seed() -> None:
     every record's logical names in the vocabulary, the grid / selection rules, literal
     tables (``ast.literal_eval`` of the module source equals the runtime dicts; frozen 20-hex library names; no
     build-system token) and the manifest skeleton."""
-    assert set(gj.PROGRAMS) == {rec["program"] for rec in gj.MODULES.values()}
+    # every program has a shipped record, except the in-kernel L2 norm programs until the exporter renders them
+    # (all three or none: their host plan is L2N_RECORD_PLANS)
+    shipped = {rec["program"] for rec in gj.MODULES.values()}
+    assert shipped <= set(gj.PROGRAMS)
+    assert set(gj.PROGRAMS) - shipped in (set(), set(gj.L2N_PROGRAMS))
+    assert set(gj.L2N_RECORD_PLANS) == set(gj.L2N_PROGRAMS)
+    assert gj.l2n_records_shipped() == (set(gj.L2N_PROGRAMS) <= shipped)
     assert sum(len(gj.records_of_program(p)) for p in gj.PROGRAMS) == len(gj.MODULES)
     assert all(
         len(gj.records_of_program(p)) == 1
         for p in gj.PROGRAMS
-        if p
+        if (p in shipped)
+        and p
         not in (
             "kcp_fwdh_offset",
             "kcp_fwdh_tape",

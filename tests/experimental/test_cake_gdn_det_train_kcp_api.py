@@ -618,7 +618,18 @@ def test_program_vocabulary_is_the_design_list() -> None:
         "kcp_dhu_tape",
         "bwd_dqkg",
         "gate_epilogue",
+        "fwd_prep_l2n",
+        "bwd_dqkg_l2n",
+        "qk_apply",
     )
+    # the in-kernel Q / K L2 norm (use_qk_l2norm_in_kernel): #1 / #8 siblings and the backward's qk_apply
+    assert kcp.L2N_PROGRAMS == ("fwd_prep_l2n", "bwd_dqkg_l2n", "qk_apply")
+    assert set(kcp.L2N_PROGRAMS) <= set(kcp.LOCAL_PROGRAMS)
+    assert kcp.L2N_SIBLING_OF == {
+        "fwd_prep": "fwd_prep_l2n",
+        "bwd_dqkg": "bwd_dqkg_l2n",
+    }
+    assert kcp.QK_TAPES == ("qn", "kn") and kcp.QK_RSTD == "qk_rstd"
     assert set(kcp.PROGRAM_ARGS) == set(kcp.PROGRAMS)
     assert (
         kcp.TART_MODULE_OF["kcp_affine_merge"] == "kda_chunk_kcp_affine_merge_fp32_v1"
@@ -713,9 +724,14 @@ def test_program_args_are_the_registry_logical_names() -> None:
         needed = set(rec["logical"].values())
         missing = needed - set(kcp.PROGRAM_ARGS[rec["program"]])
         assert not missing, (rec_name, sorted(missing))
-    # record resolution through the registry: shipped records, the merge variants by ncols, the test twins
+    # record resolution through the registry: shipped records, the merge variants by ncols, the test twins (the
+    # in-kernel L2 norm programs once their records ship; refused with a clear message before)
     for prog in kcp.PROGRAMS:
         if prog == "kcp_affine_merge":
+            continue
+        if prog in kcp.L2N_PROGRAMS and not jit.records_of_program(prog):
+            with pytest.raises(ValueError, match="no shipped record"):
+                jit.select_record(prog)
             continue
         assert jit.select_record(prog) == prog
     assert jit.select_record("kcp_affine_merge", ncols=128) == "kcp_affine_merge_c8"
