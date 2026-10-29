@@ -179,6 +179,16 @@ class TrtllmGenBatchedGemmRunner {
                                         int32_t numTokens, int32_t numBatches,
                                         int32_t maxNumCtasInBatchDim) const;
 
+  // True if the config splits K although the un-split grid already has a CTA for every SM, so it
+  // is not expected to beat the same tile without split-K. This prunes the tuning space only: such
+  // a config is still valid and runs correctly. With routed MoE, the batch dimension is sized for
+  // the routing upper bound (maxNumCtasInBatchDim), so a config can count as redundant even if a
+  // particular routing would have left SMs idle.
+  [[nodiscard]] bool isRedundantSplitKConfig(int32_t configIndex, int32_t m, int32_t n, int32_t k,
+                                             std::vector<int32_t> const& batchedTokens,
+                                             int32_t numTokens, int32_t numBatches,
+                                             int32_t maxNumCtasInBatchDim) const;
+
  private:
   void selectGemmConfig(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
                         int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim);
