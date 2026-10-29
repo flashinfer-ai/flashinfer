@@ -907,21 +907,24 @@ def run_gdn_decode_kernel_big_batch_pretranspose(
 _CUTE_DSL_MODULE = "gdn_decode_pretranspose"
 
 
-def _decode_launch_config(major: int, minor: int, B: int, HV: int) -> tuple:
+def _decode_launch_config(
+    major: int, minor: int, B: int, HV: int, V: int = 128
+) -> tuple:
     """(num_stages, blocks_per_state) for the pipelined pretranspose kernel.
 
     SM107 needs more bytes in flight per CTA once there are enough states to
     fill the GPU; elsewhere few states want more CTAs per state and many want
-    fewer, so each CTA amortizes its prologue over more V rows.
+    fewer. Each CTA owns V // TILE_V // blocks_per_state tiles with no tail.
     """
     num_states = B * HV
+    num_v_tiles = V // TILE_V
     if (major, minor) == (10, 7):
         if num_states >= 3072:
             return 5, 4
         if num_states >= 256:
             return 3, 4
         return NUM_STAGES, NUM_BLOCKS_PER_STATE
-    if num_states <= 64:
+    if num_states <= 64 and num_v_tiles % 16 == 0:
         return NUM_STAGES, 16
     if num_states < 384:
         return NUM_STAGES, NUM_BLOCKS_PER_STATE
@@ -1044,7 +1047,11 @@ def run_pretranspose_decode(
         stride1 = stride2 = stride3 = 0
     target = gdn_device_target(q.device)
     num_stages, blocks_per_state = _decode_launch_config(
-        target.major, target.minor, B, HV
+        target.major, target.minor, B, HV, V
+    )
+    assert num_stages >= 2, "pretranspose decode pipeline needs at least 2 stages"
+    assert (V // TILE_V) % blocks_per_state == 0, (
+        f"V={V} is not covered by blocks_per_state={blocks_per_state}"
     )
     cache_key = (
         target.compile_key,
