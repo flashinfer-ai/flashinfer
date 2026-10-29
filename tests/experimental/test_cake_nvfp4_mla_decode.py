@@ -54,11 +54,13 @@ FLAG_DIRECT_OUT = cake_backend.FLAG_DIRECT_OUT
 FLAG_SEED_SINK = cake_backend.FLAG_SEED_SINK
 HEAD_DIM = cake_backend.HEAD_DIM
 ITEM_FIELDS = cake_backend.ITEM_FIELDS
+LONG_DECODE_RECORDS = cake_backend.LONG_DECODE_RECORDS
 MAX_SPLITS = cake_backend.MAX_SPLITS
 PAGE_SIZE = cake_backend.PAGE_SIZE
 QK_AHEAD_RECORD = cake_backend.QK_AHEAD_RECORD
 REDUCE_GENERAL_RECORD = cake_backend.REDUCE_GENERAL_RECORD
 REDUCE_HEADS_PER_CTA = cake_backend.REDUCE_HEADS_PER_CTA
+REVERSED_PIECE_TARGETS = cake_backend.REVERSED_PIECE_TARGETS
 ROW_BYTES = cake_backend.ROW_BYTES
 ROWS_PER_CTA = cake_backend.ROWS_PER_CTA
 ROWS_PER_TILE = cake_backend.ROWS_PER_TILE
@@ -504,6 +506,61 @@ def test_balanced_units_are_contiguous_in_request_major_order():
         (b - a) % V_HALVES == 0
         for a, b in zip(plan.unit_first, plan.unit_first[1:], strict=False)
     )
+
+
+@pytest.mark.parametrize("kv_len", [8192, 131072])
+@pytest.mark.parametrize("num_sms", [148, 152])
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+def test_long_row_balanced_plans_reverse_their_pieces_on_152_sm_sm100(
+    arch, num_sms, kv_len
+):
+    forward = _bs32_plan(kv_len, num_sms)
+    plan = _bs32_plan(kv_len, num_sms, arch=arch)
+    record = select_decode_record(forward, arch)
+    assert plan.schedule == "balanced" and record in LONG_DECODE_RECORDS
+    assert select_decode_record(plan, arch) == record
+    reverse = (arch, num_sms // CLUSTER_PAIR) in REVERSED_PIECE_TARGETS
+    assert reverse == (arch == "sm_100a" and num_sms == 152)
+    # The same units hold the same pieces; on a 152-SM SM100 device every unit
+    # runs them in reverse request-major order, each piece's row pair kept in
+    # order. 148-SM SM100 and every SM103 plan keep the request-major order.
+    assert plan.unit_first == forward.unit_first
+    assert (plan.max_splits, plan.tiles_per_split) == (
+        forward.max_splits,
+        forward.tiles_per_split,
+    )
+    for a, b in zip(plan.unit_first, plan.unit_first[1:], strict=False):
+        pieces = [forward.items[i : i + V_HALVES] for i in range(a, b, V_HALVES)]
+        want = pieces[::-1] if reverse else pieces
+        assert plan.items[a:b] == tuple(item for piece in want for item in piece)
+    assert any(
+        b - a > V_HALVES
+        for a, b in zip(plan.unit_first, plan.unit_first[1:], strict=False)
+    )
+    check_pairs(plan)
+    uniform = _bs32_plan(kv_len, num_sms, schedule="uniform")
+    assert _bs32_plan(kv_len, num_sms, schedule="uniform", arch=arch) == uniform
+
+
+@pytest.mark.parametrize("num_sms", [148, 152])
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+def test_short_row_balanced_plans_keep_the_request_major_order(arch, num_sms):
+    # Balanced from the 9000-key request; every unit holds a short range, some
+    # of them several pieces.
+    kv_lens = [300, 600, 900, 1200, 9000]
+    forward = build_work_plan(
+        kv_lens, num_heads=64, num_sms=num_sms, q_len=6, enable_sink=True
+    )
+    plan = build_work_plan(
+        kv_lens, num_heads=64, num_sms=num_sms, q_len=6, enable_sink=True, arch=arch
+    )
+    assert plan.schedule == "balanced"
+    assert select_decode_record(plan, arch) not in LONG_DECODE_RECORDS
+    assert any(
+        b - a > V_HALVES
+        for a, b in zip(plan.unit_first, plan.unit_first[1:], strict=False)
+    )
+    assert plan == forward
 
 
 def test_pair_invariant_holds_and_is_enforced():

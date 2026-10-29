@@ -17,7 +17,7 @@ limitations under the License.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional, Sequence
 
 import torch
@@ -101,6 +101,17 @@ SHORT_EPI_SPEC_RECORD = "decode_short_epi_warp_spec_uh"
 XV_RECORD = "decode_xv"
 XV_WARMUP_TILES = 48  # pipeline tiles of every piece
 XV_MIN_STEADY_TILES = 307  # pipeline tiles of every unit past the warm-ups
+# The long-row decode programs. On an (architecture, cluster count) of
+# ``REVERSED_PIECE_TARGETS`` a balanced plan that one of them runs holds the
+# pieces of every unit in reverse order (``build_work_plan``): the head piece
+# of the unit's last sequence starts first, so the row tiles of one request
+# read most of their pages at the same time and the re-reads of a page stay in
+# L2. The cluster count is the one the plan requests, ``num_sms //
+# CLUSTER_PAIR``: 76 on a 152-SM SM100 device such as GB200. The short-row
+# programs stream too few tiles per unit for such re-reads, and every other
+# target keeps the request-major order.
+LONG_DECODE_RECORDS = frozenset({"decode", QK_AHEAD_RECORD, XV_RECORD})
+REVERSED_PIECE_TARGETS = frozenset({("sm_100a", 76)})
 # Further combine program (``select_reduce_record``), giving the combine
 # program's outputs bit for bit: it reads the first pair of splits of a row
 # from its top loads, which pays off for rows of more than two splits.
@@ -487,6 +498,21 @@ def _balanced_plan(kv_lens, *, q_len, num_heads, num_units, enable_sink):
     )
 
 
+def _reverse_unit_pieces(plan: WorkPlan) -> WorkPlan:
+    """``plan`` with the pieces of every unit in reverse order.
+
+    Each piece keeps its row pair in order (``check_pairs``); the units, their
+    item multisets and every item's fields stay the same, so the programs
+    ``select_decode_record`` and ``select_reduce_record`` pick do too. Each
+    item is computed on its own, so the order changes no output bit.
+    """
+    items: list = []
+    for first, last in zip(plan.unit_first, plan.unit_first[1:], strict=False):
+        for start in range(last - V_HALVES, first - 1, -V_HALVES):
+            items.extend(plan.items[start : start + V_HALVES])
+    return replace(plan, items=tuple(items))
+
+
 def check_pairs(plan: WorkPlan) -> None:
     """Every unit holds consecutive row pairs (rows 0 and 1) of one piece.
 
@@ -518,6 +544,7 @@ def build_work_plan(
     enable_sink: bool = False,
     schedule: str = "auto",
     tiles_per_split: Optional[int] = None,
+    arch: Optional[str] = None,
 ) -> WorkPlan:
     """Build the host work plan for one batch.
 
@@ -525,7 +552,11 @@ def build_work_plan(
     CLUSTER_PAIR`` clusters when the longest request reaches
     ``BALANCED_MIN_KV`` tokens and the uniform split policy otherwise;
     ``"balanced"`` / ``"uniform"`` force one of them. ``tiles_per_split``
-    fixes the uniform split granularity (pipeline tiles per split).
+    fixes the uniform split granularity (pipeline tiles per split). With
+    ``(arch, num_sms // CLUSTER_PAIR)`` in ``REVERSED_PIECE_TARGETS``, a
+    balanced plan that a program of ``LONG_DECODE_RECORDS`` runs
+    (``select_decode_record``) holds the pieces of every unit in reverse order;
+    otherwise, and without ``arch``, the order is request-major.
     """
     kv_lens = [int(v) for v in kv_lens]
     if q_len < 1 or not kv_lens or min(kv_lens) < q_len:
@@ -556,6 +587,12 @@ def build_work_plan(
             f"work plan needs {plan.max_splits} KV splits; the combine kernel supports {MAX_SPLITS}"
         )
     check_pairs(plan)
+    if (
+        plan.schedule == "balanced"
+        and (arch, num_sms // CLUSTER_PAIR) in REVERSED_PIECE_TARGETS
+        and select_decode_record(plan, arch) in LONG_DECODE_RECORDS
+    ):
+        plan = _reverse_unit_pieces(plan)
     return plan
 
 
@@ -1164,6 +1201,7 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
         enable_sink=sinks is not None,
         schedule=schedule,
         tiles_per_split=tiles_per_split,
+        arch=arch,
     )
     decode_record = select_decode_record(plan, arch)
     reduce_record = select_reduce_record(plan, arch)
