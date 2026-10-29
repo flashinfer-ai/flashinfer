@@ -2724,7 +2724,8 @@ class Sm100BlockScaledGroupedGemmKernel:
                         self.cta_group_size,
                     )
                     cute.arch.mbarrier_init(
-                        storage.gather_local_barriers.data_ptr() + stage, 129
+                        storage.gather_local_barriers.data_ptr() + stage,
+                        1 + min(self.route_tile, 128),
                     )
         # Publish all pipeline barriers once before any role can use them.
         cute.arch.mbarrier_init_fence()
@@ -3502,7 +3503,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                             _iket.range_pop()
                             _iket.range_push("producer_gather_issue")
                         # One local arrival accounts for all Gather4 bytes;
-                        # the 128 issuing threads complete their SF copies here too.
+                        # the participating threads complete their SF copies here too.
                         if gather_thread == 0:
                             cute.arch.mbarrier_arrive_and_expect_tx(
                                 storage.gather_local_barriers.data_ptr()
@@ -3537,9 +3538,11 @@ class Sm100BlockScaledGroupedGemmKernel:
                                     row < mma_n,
                                     (row < valid) & (channel < weights.shape[1]),
                                 )
-                        cute.arch.cp_async_mbarrier_arrive_noinc(
-                            storage.gather_local_barriers.data_ptr() + producer.index
-                        )
+                        if sf_row < self.route_tile:
+                            cute.arch.cp_async_mbarrier_arrive_noinc(
+                                storage.gather_local_barriers.data_ptr()
+                                + producer.index
+                            )
                         # Distribute row/K chunks together so all four warps can
                         # issue even when the route tile has fewer than four groups.
                         row_groups = self.b_copy_rows // 4
