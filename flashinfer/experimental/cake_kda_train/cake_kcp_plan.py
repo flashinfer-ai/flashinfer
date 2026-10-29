@@ -1836,7 +1836,10 @@ class KcpSequence:
         self.log.clear()
 
 
-@dataclasses.dataclass(frozen=True, eq=False)
+# KcpContext: argument omitted (the former default_factory fields)
+_DEFAULT: Any = object()
+
+
 class KcpContext:
     """One rank's view of the partition: CPU ints / tuples plus small int32 device tables; built once, reused across
     layers; never reads a tensor's contents.
@@ -1852,7 +1855,66 @@ class KcpContext:
     ``tables``; ``NC`` real chunks, ``NC_max`` / ``NC_pad`` / ``R`` the existing plan's geometry.  ``halo`` is the
     convolution halo plan (its device tables in ``halo_tables``: ``hist_row_off``, ``tail_row_off``, ``head_row_off``
     int32, ``hist_index`` int64).  ``heads(H)`` derives and caches the head-dependent plan (:class:`KcpHeadPlan`).
-    ``sequence`` is the debug collective counter."""
+    ``sequence`` is the debug collective counter.
+
+    A plain frozen class, not a dataclass: the input walks of FSDP2's ``fully_shard`` hooks descend into every
+    dataclass, dict, list and tuple of a module's arguments, so a dataclass context carried in per-layer metadata
+    was walked fragment by fragment on every call (flashinfer-ai/flashinfer#7914); this class is one leaf there.
+    It keeps the former dataclass's keyword constructor (:attr:`_FIELDS` in order), repr, identity equality and
+    ``dataclasses.FrozenInstanceError`` on attribute assignment."""
+
+    # the constructor's fields in the former dataclass order; the repr shows every field but ``sequence`` and the
+    # private "_" caches (_REPR_FIELDS), which the constructor creates empty when omitted
+    _FIELDS: tuple[str, ...] = (
+        "partition",
+        "rank",
+        "world_size",
+        "group",
+        "device",
+        "conv_kernel_size",
+        "sm_count",
+        "T_r",
+        "n_frag",
+        "cu_seqlens_local_cpu",
+        "cu_seqlens_local",
+        "frag_rows",
+        "in_slot",
+        "out_slot",
+        "n_in",
+        "n_out",
+        "N_in",
+        "N_out",
+        "n_in_by_rank",
+        "n_out_by_rank",
+        "in_slot_all",
+        "out_slot_all",
+        "chains",
+        "n_d_max",
+        "exchange_scheme",
+        "NC",
+        "NC_max",
+        "NC_pad",
+        "R",
+        "chunk_bos",
+        "chunk_len",
+        "seq_chunk_start",
+        "seq_order",
+        "tables",
+        "halo",
+        "halo_tables",
+        "p_rule",
+        "sequence",
+        "upload",
+        "table_cache",
+        "_head_plans",
+        "_table_sets",
+        "_uploads",
+        "_waited",
+        "_lazy",
+    )
+    _REPR_FIELDS: tuple[str, ...] = tuple(
+        f for f in _FIELDS if f != "sequence" and not f.startswith("_")
+    )
 
     partition: KcpPartition
     rank: int
@@ -1890,25 +1952,87 @@ class KcpContext:
     tables: dict[str, torch.Tensor]
     halo: KcpHaloPlan
     halo_tables: dict[str, torch.Tensor]
-    p_rule: str = P_RULE_DEFAULT  # plan rule: "wave_fill1_p1tie" shipped; "wave_fill1" (previous) / "wave" / "occ" / "wave_fill" via the test knob
-    sequence: KcpSequence = dataclasses.field(default_factory=KcpSequence, repr=False)
-    upload: str = UPLOAD_DEFAULT  # test knob: "async" (shipped) | "blocking" (the previous pageable copies)
-    table_cache: str = TABLE_CACHE_DEFAULT  # test knob: "context" (shipped) | "workspace" (the previous cache)
-    _head_plans: dict[int, KcpHeadPlan] = dataclasses.field(
-        default_factory=dict, repr=False
-    )
+    p_rule: str  # plan rule: "wave_fill1_p1tie" shipped; "wave_fill1" (previous) / "wave" / "occ" / "wave_fill" via the test knob
+    sequence: KcpSequence
+    # test knob: "async" (shipped) | "blocking" (the previous pageable copies)
+    upload: str
+    # test knob: "context" (shipped) | "workspace" (the previous cache)
+    table_cache: str
+    _head_plans: dict[int, KcpHeadPlan]
     # the launch table sets of cake_kcp (``_Tables`` per (H, fused_walks, walk_geometry)): shared by every workspace
     # (and by workspace=None calls); they hold this context only weakly
-    _table_sets: dict = dataclasses.field(default_factory=dict, repr=False)
-    _uploads: list = dataclasses.field(
-        default_factory=list, repr=False
-    )  # KcpUpload records, in issue order
-    _waited: dict = dataclasses.field(
-        default_factory=dict, repr=False
-    )  # stream handle -> number of records ordered on it
-    _lazy: dict = dataclasses.field(
-        default_factory=dict, repr=False
-    )  # tables uploaded on first read (frag_table)
+    _table_sets: dict
+    _uploads: list  # KcpUpload records, in issue order
+    _waited: dict  # stream handle -> number of records ordered on it
+    _lazy: dict  # tables uploaded on first read (frag_table)
+
+    def __init__(
+        self,
+        partition: KcpPartition,
+        rank: int,
+        world_size: int,
+        group: object,
+        device: torch.device,
+        conv_kernel_size: int,
+        sm_count: int,
+        T_r: int,
+        n_frag: int,
+        cu_seqlens_local_cpu: tuple[int, ...],
+        cu_seqlens_local: torch.Tensor,
+        frag_rows: tuple[tuple[int, int, int, int], ...],
+        in_slot: tuple[int, ...],
+        out_slot: tuple[int, ...],
+        n_in: int,
+        n_out: int,
+        N_in: int,
+        N_out: int,
+        n_in_by_rank: tuple[int, ...],
+        n_out_by_rank: tuple[int, ...],
+        in_slot_all: tuple[tuple[int, ...], ...],
+        out_slot_all: tuple[tuple[int, ...], ...],
+        chains: tuple[tuple[tuple[int, int], ...], ...],
+        n_d_max: int,
+        exchange_scheme: str,
+        NC: int,
+        NC_max: int,
+        NC_pad: int,
+        R: int,
+        chunk_bos: tuple[int, ...],
+        chunk_len: tuple[int, ...],
+        seq_chunk_start: tuple[int, ...],
+        seq_order: tuple[int, ...],
+        tables: dict[str, torch.Tensor],
+        halo: KcpHaloPlan,
+        halo_tables: dict[str, torch.Tensor],
+        p_rule: str = P_RULE_DEFAULT,
+        sequence: KcpSequence = _DEFAULT,
+        upload: str = UPLOAD_DEFAULT,
+        table_cache: str = TABLE_CACHE_DEFAULT,
+        _head_plans: dict[int, KcpHeadPlan] = _DEFAULT,
+        _table_sets: dict = _DEFAULT,
+        _uploads: list = _DEFAULT,
+        _waited: dict = _DEFAULT,
+        _lazy: dict = _DEFAULT,
+    ) -> None:
+        sequence = KcpSequence() if sequence is _DEFAULT else sequence
+        _head_plans = {} if _head_plans is _DEFAULT else _head_plans
+        _table_sets = {} if _table_sets is _DEFAULT else _table_sets
+        _uploads = [] if _uploads is _DEFAULT else _uploads
+        _waited = {} if _waited is _DEFAULT else _waited
+        _lazy = {} if _lazy is _DEFAULT else _lazy
+        values = dict(locals())
+        for name in self._FIELDS:
+            object.__setattr__(self, name, values[name])
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise dataclasses.FrozenInstanceError(f"cannot assign to field {name!r}")
+
+    def __delattr__(self, name: str) -> None:
+        raise dataclasses.FrozenInstanceError(f"cannot delete field {name!r}")
+
+    def __repr__(self) -> str:
+        fields = ", ".join(f"{f}={getattr(self, f)!r}" for f in self._REPR_FIELDS)
+        return f"{type(self).__qualname__}({fields})"
 
     @property
     def fragments(self) -> tuple[KcpFragment, ...]:
