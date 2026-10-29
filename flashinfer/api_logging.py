@@ -683,7 +683,8 @@ def _call_context() -> str:
     Lets a reader of the log tell calls made while autotuning or capturing CUDA graphs
     (typically during engine startup) from calls made while serving. The autotuner is
     read only if it is already imported: tuning cannot be active otherwise, and
-    importing it here would pull in the JIT stack.
+    importing it here would pull in the JIT stack. ``autotuning`` is process-wide
+    (``AutoTuner.is_tuning_mode``); ``autotune_profiling`` is per thread.
     """
     tuning = profiling = False
     autotuner = sys.modules.get("flashinfer.autotuner.autotuner")

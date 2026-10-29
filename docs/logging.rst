@@ -70,7 +70,9 @@ At level 3 and above, every logged call carries a context line right after its h
     --------------------------------------------------------------------------------
     Call context: autotuning=True autotune_profiling=False cuda_graph_capture=False
 
-- ``autotuning``: the call runs inside an ``autotune(True)`` context (``AutoTuner.is_tuning_mode``).
+- ``autotuning``: an ``autotune(True)`` context is active in this process (``AutoTuner.is_tuning_mode``).
+  The flag is process-wide: in a process that issues FlashInfer calls from several threads, a call on
+  one thread is also reported as ``True`` while another thread is inside ``autotune(True)``.
 - ``autotune_profiling``: the call is one of the autotuner's own tactic measurements
   (``is_in_profile_measurement()``), a narrower subset of ``autotuning``.
 - ``cuda_graph_capture``: the current CUDA stream is capturing a CUDA graph. Calls replayed from a
