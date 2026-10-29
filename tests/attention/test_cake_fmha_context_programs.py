@@ -62,6 +62,11 @@ SHAPE_ROWS = {
     ),
     "fp8_b256_q32_k1024": (
         "context_fp8", 256, 32, 1024, 32, 4, 64, True,
+        {"sm100a": "B256", "sm103a": "B256_PX"},
+    ),
+    # At most 128 keys: sm103a takes the short-KV program of the route.
+    "fp8_b16_q32_k128": (
+        "context_fp8", 16, 32, 128, 32, 4, 64, True,
         {"sm100a": "B256", "sm103a": "B256_KV4"},
     ),
     "nvfp4_b4_q511_k2047": (
@@ -72,32 +77,40 @@ SHAPE_ROWS = {
     # (the largest shipped pack dividing the JIT pack) and the page size.
     "fp8_b64_q32_k1024_g4": (
         "context_fp8", 64, 32, 1024, 32, 8, 64, True,
+        {"sm100a": "RUNTIME_PACK4_PAGE64", "sm103a": "RUNTIME_PACK4_PAGE64_PX"},
+    ),
+    "fp8_b16_q32_k128_g4": (
+        "context_fp8", 16, 32, 128, 32, 8, 64, True,
         {"sm100a": "RUNTIME_PACK4_PAGE64", "sm103a": "RUNTIME_PACK4_PAGE64"},
     ),
     "fp8_b16_q32_k1024_g16_page16": (
         "context_fp8", 16, 32, 1024, 32, 2, 16, False,
-        {"sm100a": "RUNTIME_PACK8", "sm103a": "RUNTIME_PACK8"},
+        {"sm100a": "RUNTIME_PACK8", "sm103a": "RUNTIME_PACK8_PX"},
     ),
     "fp8_b2_q256_k2048_g3_page32": (
         "context_fp8", 2, 256, 2048, 30, 10, 32, True,
-        {"sm100a": "RUNTIME_PACK1", "sm103a": "RUNTIME_PACK1"},
+        {"sm100a": "RUNTIME_PACK1", "sm103a": "RUNTIME_PACK1_PX"},
     ),
     "fp8_b4_q128_k1024_g6_page16": (
         "context_fp8", 4, 128, 1024, 30, 5, 16, True,
-        {"sm100a": "RUNTIME_PACK2", "sm103a": "RUNTIME_PACK2"},
+        {"sm100a": "RUNTIME_PACK2", "sm103a": "RUNTIME_PACK2_PX"},
     ),
 }  # fmt: skip
 # The device-scale program of a host-scale one; a runtime-size program serves
 # both scale forms itself.
 _DEVICE_SCALE_PROGRAM = {
     "B256": "B256_SCALE_PTR",
+    "B256_PX": "B256_SCALE_PTR_PX",
     "B256_KV4": "B256_SCALE_PTR_KV4",
     "Q511_SM100A": "Q511_SCALE_PTR_SM100A",
     "Q511_SM103A": "Q511_SCALE_PTR_SM103A",
 }
 # The exact FP8 program of a target (host scales): sm103a ships the 4-stage
-# K/V ring build.
-_FP8_EXACT = {"sm100a": "B256", "sm103a": "B256_KV4"}
+# K/V ring build with each stage's P tile in the other stage's S columns.
+_FP8_EXACT = {"sm100a": "B256", "sm103a": "B256_PX"}
+# The suffix of a target's runtime-size programs: sm103a ships the 4-stage
+# K/V ring builds with each stage's P tile in the other stage's S columns.
+_RUNTIME_SUFFIX = {"sm100a": "", "sm103a": "_PX"}
 # runtime-size program identifier -> its pack
 _RUNTIME_PACK = {
     identifier: pack
@@ -146,6 +159,11 @@ def test_cake_fmha_context_program_table_matches_the_generated_loaders() -> None
                 served.setdefault(("context_fp8", identifier), set()).add(
                     _TARGET_ARCH[target]
                 )
+    for target, short in cake_api._CONTEXT_FP8_SHORT_KV_ROUTES.items():
+        for identifier, _ in short.values():
+            served.setdefault(("context_fp8", identifier), set()).add(
+                _TARGET_ARCH[target]
+            )
     assert set(served) == set(cake_api._CONTEXT_PROGRAMS)
     for (component, identifier), (
         name,
@@ -658,7 +676,8 @@ def test_cake_fmha_context_fp8_runtime_route(
     if serves:
         pack = cake_api._context_fp8_runtime_pack(pack_g)
         assert pack_g % pack == 0 and pack in (1, 2, 4, 8)
-        assert route.program == f"RUNTIME_PACK{pack}" and route.pack_g == pack
+        assert route.program == f"RUNTIME_PACK{pack}{_RUNTIME_SUFFIX[target]}"
+        assert route.pack_g == pack
     else:
         assert route.program is None and route.pack_g == pack_g
 
@@ -684,8 +703,56 @@ def test_cake_fmha_context_fp8_exact_routes_come_first(monkeypatch, target) -> N
         )
         route = cake_api.select_cake_fmha_context_route(torch.device("meta"), **kwargs)
         assert route is not None and route.device_scales is device_scales
-        assert route.program == f"RUNTIME_PACK{pack}_PAGE64", route
+        assert route.program == f"RUNTIME_PACK{pack}_PAGE64{_RUNTIME_SUFFIX[target]}", (
+            route
+        )
         assert route.num_m_blocks == -(-33 // (2 * (128 // pack)))
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+def test_cake_fmha_context_fp8_short_kv_routes(monkeypatch, target) -> None:
+    """A launch of at most the keys of its exact or runtime-size route's
+    short-KV entry, where the target names one, takes the entry's program
+    (sm103a: the same schedule with each stage's P tile in its own S
+    columns; 256 keys for the exact programs, 128 for the runtime-size
+    ones), for host and device scales alike; one key more keeps the
+    route's program."""
+
+    short = cake_api._CONTEXT_FP8_SHORT_KV_ROUTES.get(target, {})
+    routed = {
+        *cake_api._CONTEXT_PROGRAM_ROUTES[target].values(),
+        *cake_api._CONTEXT_FP8_RUNTIME_ROUTES[target].values(),
+    }
+    assert set(short) <= routed and (target == "sm103a") == bool(short)
+    for swapped, (identifier, keys) in short.items():
+        assert keys == (256 if identifier.startswith("B256") else 128)
+        assert (
+            cake_api._CONTEXT_PROGRAMS[("context_fp8", swapped)][1:]
+            == cake_api._CONTEXT_PROGRAMS[("context_fp8", identifier)][1:]
+        )
+        assert swapped == f"{identifier.removesuffix('_KV4')}_PX"
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    for row in ("fp8_b16_q32_k128", "fp8_b16_q32_k128_g4"):
+        component, batch, q_len, _, hq, hkv, page, shared, _ = SHAPE_ROWS[row]
+        short_program = SHAPE_ROWS[row][-1][target]
+        swapped = {v[0]: k for k, v in short.items()}.get(short_program)
+        keys = short[swapped][1] if swapped else 128
+        for kv_len in (keys, keys + 1):
+            shape = (component, batch, q_len, kv_len, hq, hkv, page, shared, None)
+            for device_scales in (False, True):
+                kwargs = _context_kwargs(
+                    shape, device_scales=device_scales, device="meta"
+                )
+                route = cake_api.select_cake_fmha_context_route(
+                    torch.device("meta"), **kwargs
+                )
+                assert route is not None and route.program is not None
+                program = short_program
+                if kv_len > keys and swapped:
+                    program = swapped
+                if device_scales:
+                    program = _device_scale_program(program)
+                assert route.program == program, (row, kv_len, route)
 
 
 # --- The FP8 split-KV route (host-only) --------------------------------------
@@ -701,7 +768,7 @@ def test_cake_fmha_context_fp8_split_routes_mirror_the_runtime_routes() -> None:
     assert set(cake_api._CONTEXT_FP8_SPLIT_ROUTES) == set(runtime)
     for target, routes in runtime.items():
         assert cake_api._CONTEXT_FP8_SPLIT_ROUTES[target] == {
-            key: "RUNTIME_SK" + identifier.removeprefix("RUNTIME")
+            key: "RUNTIME_SK" + identifier.removeprefix("RUNTIME").removesuffix("_PX")
             for key, identifier in routes.items()
         }
     assert frozenset(_SPLIT_PACK) == cake_api._CONTEXT_FP8_SPLIT_PROGRAMS
@@ -769,7 +836,14 @@ def test_cake_fmha_context_fp8_split_plan(
     assert 2 <= num_splits <= cake_api._CONTEXT_FP8_SPLIT_MAX
     assert split_blocks >= 1 and -(-max(blocks) // split_blocks) >= num_splits
     costs = cake_api._CONTEXT_FP8_SPLIT_COSTS[target]
-    whole = cake_api._context_fp8_split_makespan(blocks, sm_count, 0, 1, 1, costs)
+    whole = cake_api._context_fp8_split_makespan(
+        blocks,
+        sm_count,
+        0,
+        1,
+        1,
+        cake_api._context_fp8_whole_costs(target, max_q, max_kv, pack, costs),
+    )
     split = cake_api._context_fp8_split_makespan(blocks, sm_count, *plan, costs)
     assert split <= whole * (1 - cake_api._CONTEXT_FP8_SPLIT_REL_MARGIN)
     assert whole - split >= cake_api._CONTEXT_FP8_SPLIT_ABS_MARGIN
@@ -781,9 +855,11 @@ _SPLIT_MARGIN_ROWS = [
     # B200: 0.58 us (2.1 %) predicted; GB300: no split predicted faster
     ("sm100a", 2, 300, 1500, 32, 8, True),
     ("sm103a", 2, 300, 1500, 32, 8, False),
-    # GB300: 0.84 us (3.0 % and 2.2 %) predicted
-    ("sm103a", 2, 300, 2000, 32, 8, True),
-    ("sm103a", 2, 300, 3000, 32, 8, True),
+    # GB300: the split's 0.84 us (3.0 % and 2.2 %) over whole tiles priced
+    # like split units is gone: the whole tiles run the swapped P placement
+    # (_CONTEXT_FP8_SPLIT_WHOLE_BLOCK)
+    ("sm103a", 2, 300, 2000, 32, 8, False),
+    ("sm103a", 2, 300, 3000, 32, 8, False),
     # 16 requests of 256 query tokens over 2048 keys, one head per tile: B200
     # 2.7 % predicted; GB300 1.5 %, below the margin
     ("sm100a", 16, 256, 2048, 32, 1, True),
@@ -840,7 +916,9 @@ def test_cake_fmha_context_fp8_split_costs_scale_with_the_tile_rows(target) -> N
 
 
 # (batch, max_q_len, max_kv_len, num_q_heads, pack): launches the split choice
-# sees; a smaller pack runs a plan only for a launch of one m-block.
+# sees; a smaller pack runs a plan only where it holds the launch in one
+# m-block (a launch of several m-blocks only on the targets of
+# _CONTEXT_FP8_SPLIT_M_BLOCK_TARGETS).
 _SPLIT_CHOICE_ROWS = [
     (1, 32, 16384, 32, 8),
     (1, 32, 1024, 32, 8),
@@ -857,6 +935,12 @@ _SPLIT_CHOICE_ROWS = [
     (1, 32, 16384, 64, 8),
     (1, 128, 16384, 32, 8),
     (2, 300, 6000, 32, 8),
+    (2, 128, 1500, 32, 8),
+    (1, 128, 1500, 32, 8),
+    (1, 64, 1500, 32, 8),
+    (2, 256, 2048, 32, 8),
+    (12, 96, 1536, 32, 4),
+    (12, 48, 2048, 64, 8),
     (1, 64, 4096, 64, 4),
     (1, 32, 16384, 32, 4),
     (1, 256, 8192, 32, 1),
@@ -871,12 +955,13 @@ _SPLIT_CHOICE_ROWS = [
 def test_cake_fmha_context_fp8_split_choice(
     target, batch, max_q, max_kv, num_q_heads, pack
 ) -> None:
-    """The split choice keeps the pack's plan, or, for a launch of one
-    m-block, runs a smaller shipped pack whose tiles hold every query token in
-    one stage: the pack's split (``split_blocks``, ``num_splits``) over its
-    tiles, or its own best split; only where the cost model of each pack's
-    tile rows predicts it faster than the pack's plan (or whole tiles) by both
-    margins."""
+    """The split choice keeps the pack's plan, or runs a smaller shipped pack
+    whose tiles hold every query token in one m-block: for a launch of one
+    m-block, the pack's split (``split_blocks``, ``num_splits``) over its
+    tiles, or its own best split; for a launch of several m-blocks (on the
+    targets of ``_CONTEXT_FP8_SPLIT_M_BLOCK_TARGETS`` only) its own best
+    split; only where the cost model of each pack's tile rows predicts it
+    faster than the pack's plan (or whole tiles) by both margins."""
 
     sm_count = _SM_COUNT[target]
     choice = cake_api._context_fp8_split_choice(
@@ -894,7 +979,14 @@ def test_cake_fmha_context_fp8_split_choice(
         return
     assert chosen < pack and pack % chosen == 0
     assert chosen in (*cake_api._CONTEXT_FP8_RUNTIME_PACKS, 1)
-    assert max_q <= 2 * (128 // pack) and max_q <= 128 // chosen
+    one_m_block = max_q <= 2 * (128 // pack)
+    assert max_q <= 2 * (128 // chosen)
+    if one_m_block:
+        assert max_q <= 128 // chosen
+    assert one_m_block or (
+        target in cake_api._CONTEXT_FP8_SPLIT_M_BLOCK_TARGETS
+        and batch * (num_q_heads // chosen) <= sm_count
+    )
     blocks = cake_api._context_fp8_tile_blocks(batch, max_q, max_kv, num_q_heads, pack)
     smaller = cake_api._context_fp8_tile_blocks(
         batch, max_q, max_kv, num_q_heads, chosen
@@ -903,7 +995,8 @@ def test_cake_fmha_context_fp8_split_choice(
     assert 1 <= split_tiles <= min(len(smaller), sm_count - 1)
     assert 2 <= num_splits <= cake_api._CONTEXT_FP8_SPLIT_MAX
     repack = (
-        own is not None
+        one_m_block
+        and own is not None
         and own[0] == len(blocks)
         and plan == (len(smaller), own[1], own[2])
     )
@@ -914,7 +1007,14 @@ def test_cake_fmha_context_fp8_split_choice(
         assert plan == found[0]
     costs = cake_api._context_fp8_split_costs
     time = cake_api._context_fp8_split_makespan(
-        blocks, sm_count, *(own or (0, 1, 1)), costs(target, max_q, pack)
+        blocks,
+        sm_count,
+        *(own or (0, 1, 1)),
+        costs(target, max_q, pack)
+        if own
+        else cake_api._context_fp8_whole_costs(
+            target, max_q, max_kv, pack, costs(target, max_q, pack)
+        ),
     )
     faster = cake_api._context_fp8_split_makespan(
         smaller, sm_count, *plan, costs(target, max_q, chosen)
@@ -964,6 +1064,56 @@ def test_cake_fmha_context_fp8_split_choice_bounds(monkeypatch, target) -> None:
             assert result is None or result[0] == 8, row
     finally:
         # the cached choices of the patched costs must not outlive the test
+        _clear_split_caches()
+
+
+def test_cake_fmha_context_fp8_split_choice_of_several_m_blocks(monkeypatch) -> None:
+    """On B200 (sm100a) a launch of several m-blocks also takes the own split
+    of a smaller pack that holds every query token in one m-block: 2 requests
+    of 128 query tokens over 1500 keys, heads 32/4 (4 m-blocks of pack 8)
+    run pack 1's split (64, 6, 2) instead of pack 8's (32, 4, 3), and route
+    to pack 1's split-KV program.  12 requests of 96 query tokens over 1536
+    keys, heads 32/8 (2 m-blocks of pack 4) keep pack 4's plan: pack 2's 192
+    tiles fill more than one wave.  A launch of one m-block still runs pack
+    8's split over pack 4's tiles.  On GB300 (sm103a), and on B200 without
+    the target in ``_CONTEXT_FP8_SPLIT_M_BLOCK_TARGETS``, the launch of
+    several m-blocks keeps its pack's plan."""
+
+    choice = cake_api._context_fp8_split_choice
+    plan = cake_api._context_fp8_split_plan
+    row = (2, 128, 1500, 32)
+    assert plan("sm100a", *row, 8, 148) == (32, 4, 3)
+    assert choice("sm100a", *row, 8, 148) == (1, (64, 6, 2))
+    own = plan("sm103a", *row, 8, 152)
+    assert choice("sm103a", *row, 8, 152) == (None if own is None else (8, own))
+    wide = (12, 96, 1536, 32, 4, 148)
+    own = plan("sm100a", *wide)
+    assert choice("sm100a", *wide) == (None if own is None else (4, own))
+    for target, sm_count in _SM_COUNT.items():
+        own = plan(target, 1, 32, 16384, 32, 8, sm_count)
+        assert choice(target, 1, 32, 16384, 32, 8, sm_count) == (4, (8, own[1], own[2]))
+
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm100a")
+    monkeypatch.setattr(cake_api, "_context_split_sm_count", lambda device: 148)
+    meta = torch.device("meta")
+    shape = ("context_fp8", 2, 128, 1500, 32, 4, 16, True, None)
+    need = cake_api._context_fp8_split_workspace_bytes(64, 2)
+    kwargs = dict(
+        _context_kwargs(shape, device="meta"),
+        workspace_buffer=torch.empty(need, dtype=torch.uint8, device="meta"),
+    )
+    route = cake_api.select_cake_fmha_context_route(meta, **kwargs)
+    assert route.program == "RUNTIME_SK_PACK1", route
+    assert (route.pack_g, route.num_m_blocks) == (1, 1)
+    try:
+        monkeypatch.setattr(cake_api, "_CONTEXT_FP8_SPLIT_M_BLOCK_TARGETS", frozenset())
+        _clear_split_caches()
+        assert choice("sm100a", *row, 8, 148) == (8, (32, 4, 3))
+        route = cake_api.select_cake_fmha_context_route(meta, **kwargs)
+        assert route.program == "RUNTIME_SK_PACK8", route
+        assert (route.pack_g, route.num_m_blocks) == (8, 4)
+    finally:
+        # the cached choices of the patched gate must not outlive the test
         _clear_split_caches()
 
 
@@ -1070,7 +1220,9 @@ def test_cake_fmha_context_fp8_split_route_without_a_runtime_pack_plan(
             {key: name for key, name in routes.items() if key[0] != pack},
         )
     route = cake_api.select_cake_fmha_context_route(meta, **kwargs)
-    assert route.program == (_FP8_EXACT[target] if page == 64 else "RUNTIME_PACK8")
+    assert route.program == (
+        _FP8_EXACT[target] if page == 64 else f"RUNTIME_PACK8{_RUNTIME_SUFFIX[target]}"
+    )
     assert (route.pack_g, route.num_m_blocks) == (8, 1)
 
 
@@ -1857,6 +2009,11 @@ def test_cake_context_quantized_programs_match_reference(
         program = {"B256": _FP8_EXACT[target]}.get(
             program, _DEVICE_SCALE_PROGRAM[_FP8_EXACT[target]]
         )
+        # a launch of at most the keys of the route's short-KV entry takes
+        # the entry's program
+        short = cake_api._CONTEXT_FP8_SHORT_KV_ROUTES.get(target, {}).get(program)
+        if short and case["max_kv_len"] <= short[1]:
+            program = short[0]
     original = prefill.trtllm_batch_context_with_kv_cache
 
     def cake_context(*args, **kwargs):
@@ -1878,7 +2035,7 @@ def test_cake_context_quantized_programs_match_reference(
     if program == "RUNTIME_PACK":
         # 16-token pages: no exact route; a runtime-size program of any page
         assert served_programs and all(
-            served in _RUNTIME_PACK and not served.endswith("_PAGE64")
+            served in _RUNTIME_PACK and "_PAGE64" not in served
             for served in served_programs
         ), served_programs
         return
@@ -1898,6 +2055,8 @@ BITWISE_ROWS = {
     "fp8_b16_q32_k1024_g16_page16": ("fp8_b16_q32_k1024_g16_page16", 16, 32),
     "fp8_b2_q256_k2048_g3_page32": ("fp8_b2_q256_k2048_g3_page32", 2, 256),
     "fp8_b4_q128_k1024_g6_page16": ("fp8_b4_q128_k1024_g6_page16", 4, 128),
+    "fp8_b16_q32_k128": ("fp8_b16_q32_k128", 16, 32),
+    "fp8_b16_q32_k128_g4": ("fp8_b16_q32_k128_g4", 16, 32),
     **WIDENED_ROWS,
 }
 _SCALES = {"context_bf16": (128**-0.5, 1.0)}
