@@ -3927,3 +3927,132 @@ def test_recompute_handle_entry_rules() -> None:
         kcp.chunk_gdn_det_kcp(
             q, k, v, g, beta, ctx, backend="fake", recompute_handle=object()
         )
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# Packed Q/K/V (issue #7817): q / k / v as head views of the convolution's packed row; the backward writes dq / dk / dv
+# into one packed row and the split hands it on without a concatenation.
+
+
+def _packed_autograd(
+    kcp, ctx, ops, *, batched: bool = False, ckpt: bool = False, **opts
+) -> tuple[dict[str, torch.Tensor], list[torch.Tensor]]:
+    """``out`` and the gradients of one layer whose q / k / v come from :func:`packed_qkv_views_det_kcp` of a packed leaf;
+    ``dq`` / ``dk`` / ``dv`` are read back from the leaf's gradient, which a hook also captures as it arrives."""
+    H_qk, HV = ops["q"].shape[-2], ops["v"].shape[-2]
+    T = ops["q"].shape[0]
+    qkv = torch.cat(
+        [ops[n].reshape(T, -1) for n in ("q", "k", "v")], dim=-1
+    ).contiguous()
+    if batched:
+        qkv = qkv.unsqueeze(0)
+    qkv.requires_grad_(True)
+    g, beta = (ops[n].detach().clone().requires_grad_(True) for n in ("g", "beta"))
+    seen: list[torch.Tensor] = []
+    qkv.register_hook(lambda grad: seen.append(grad))
+    o = {"backend": "fake", **opts}
+
+    def fn(qkv, g, beta):
+        q, k, v = kcp.packed_qkv_views_det_kcp(qkv, H_qk=H_qk, HV=HV)
+        gg, bb = (g.unsqueeze(0), beta.unsqueeze(0)) if batched else (g, beta)
+        return kcp.chunk_gdn_det_kcp(q, k, v, gg, bb, ctx, **o)
+
+    if ckpt:
+        from torch.utils.checkpoint import checkpoint
+
+        out = checkpoint(fn, qkv, g, beta, use_reentrant=False)
+    else:
+        out = fn(qkv, g, beta)
+    dout = ops["dout"].unsqueeze(0) if batched else ops["dout"]
+    out.backward(dout)
+    grad = qkv.grad.reshape(T, -1)
+    a, b = H_qk * 128, 2 * H_qk * 128
+    res = {
+        "out": out.detach().reshape(ops["dout"].shape),
+        "dq": grad[:, :a].reshape(T, H_qk, 128),
+        "dk": grad[:, a:b].reshape(T, H_qk, 128),
+        "dv": grad[:, b:].reshape(T, HV, 128),
+        "dg": g.grad,
+        "dbeta": beta.grad,
+    }
+    return res, seen
+
+
+@pytest.mark.parametrize(
+    "batched,ckpt,group_reduce,layout",
+    [
+        (False, False, "fused", "tma"),
+        (True, False, "fused", "tma"),
+        (False, True, "fused", "tma"),
+        (False, False, "host", "tma"),
+        (False, False, "fused", "copy"),
+    ],
+)
+def test_packed_qkv_gradients_are_bitwise_and_need_no_concatenation(
+    batched, ckpt, group_reduce, layout
+) -> None:
+    """q / k / v as views of one packed leaf: out and the five gradients are bitwise those of separate contiguous
+    leaves; with the views passed through (``layout="tma"``) the backward writes one packed dQKV row
+    (``grad_layout="packed"``) and the split returns it as the leaf's gradient (a view, no concatenation); with
+    ``layout="copy"`` the operands are copied, the gradients are separate and the split concatenates them."""
+    kcp, ctx, ops = _ckpt_setup()
+    base = dict(group_reduce=group_reduce, layout=layout)
+    direct = _ckpt_autograd(kcp, ctx, ops, ckpt=False, **base)
+    before = dict(kcp.PACKED_SPLIT_STATS)
+    got, seen = _packed_autograd(kcp, ctx, ops, batched=batched, ckpt=ckpt, **base)
+    what = f"batched={batched} ckpt={ckpt} {base}"
+    _assert_same(got, direct, what)
+    assert direct["dq"].is_contiguous(), what
+    packed = layout == "tma"
+    assert kcp.LAST_CALL["bwd"]["grad_layout"] == (
+        "packed" if packed else "separate"
+    ), what
+    delta = {k: kcp.PACKED_SPLIT_STATS[k] - before[k] for k in before}
+    assert delta == (
+        {"aliased": 1, "concatenated": 0}
+        if packed
+        else {"aliased": 0, "concatenated": 1}
+    ), (
+        what,
+        delta,
+    )
+    assert len(seen) == 1, what
+    assert (seen[0]._base is not None) == packed, what
+
+
+def test_packed_qkv_split_concatenates_any_other_gradient() -> None:
+    """Gradients that are not one packed row (an unused ``k``: zeros; separate tensors) are concatenated: the leaf's
+    gradient is the plain split's."""
+    kcp = _package("cake_kcp")
+    H_qk, HV, T = 2, 6, 37
+    gen = torch.Generator(device="cpu").manual_seed(7817)
+    x = torch.randn(T, (2 * H_qk + HV) * 128, generator=gen).to(torch.bfloat16)
+    a = x.clone().requires_grad_(True)
+    b = x.clone().requires_grad_(True)
+    before = dict(kcp.PACKED_SPLIT_STATS)
+    q, k, v = kcp.packed_qkv_views_det_kcp(a, H_qk=H_qk, HV=HV)
+    assert (
+        q.shape == (T, H_qk, 128)
+        and k.shape == (T, H_qk, 128)
+        and v.shape == (T, HV, 128)
+    )
+    assert q.data_ptr() == a.data_ptr() and q.stride() == (a.shape[-1], 128, 1)
+    ((q.float() * 3).sum() + (v.float() ** 2).sum()).backward()
+    q2, _, v2 = b.split((H_qk * 128, H_qk * 128, HV * 128), dim=-1)
+    ((q2.float() * 3).sum() + (v2.float() ** 2).sum()).backward()
+    assert torch.equal(a.grad, b.grad)
+    assert kcp.PACKED_SPLIT_STATS["concatenated"] - before["concatenated"] == 1
+    assert kcp.PACKED_SPLIT_STATS["aliased"] == before["aliased"]
+
+
+def test_packed_qkv_views_det_kcp_rejects_a_bad_row() -> None:
+    kcp = _package("cake_kcp")
+    x = torch.zeros(5, 10 * 128, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="expected"):
+        kcp.packed_qkv_views_det_kcp(x, H_qk=2, HV=4)  # 8 * 128 channels expected
+    with pytest.raises(ValueError, match="dense"):
+        kcp.packed_qkv_views_det_kcp(x.t().contiguous().t(), H_qk=2, HV=6)
+    with pytest.raises(ValueError):
+        kcp.packed_qkv_views_det_kcp(
+            torch.zeros(5, 9 * 128, dtype=torch.bfloat16), H_qk=2, HV=5
+        )

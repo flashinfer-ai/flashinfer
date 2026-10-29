@@ -1022,6 +1022,67 @@ def _ranked(x: torch.Tensor, batched: bool) -> torch.Tensor:
     return x.unsqueeze(0) if batched else x
 
 
+def _dense_strides(shape: Sequence[int]) -> tuple[int, ...]:
+    out, acc = [], 1
+    for n in reversed(tuple(shape)):
+        out.append(acc)
+        acc *= max(int(n), 1)
+    return tuple(reversed(out))
+
+
+def _packed_rows(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, H_qk: int, HV: int
+) -> torch.Tensor | None:
+    """The packed ``[..., T, (2 H_qk + HV) * 128]`` row ``q`` / ``k`` / ``v`` are the head views of, or ``None``.
+
+    Packed: one dtype, device and storage; ``k`` starts ``H_qk * 128`` elements after ``q`` and ``v`` ``H_qk * 128``
+    after ``k``; each is ``[..., T, heads, 128]`` with dense ``[heads, 128]`` rows and token stride
+    ``(2 H_qk + HV) * 128``.  Pointers and strides only: no tensor content is read.  The returned tensor is a dense
+    view of the whole row over ``q``'s storage."""
+    C = (2 * H_qk + HV) * D
+    if not (q.dtype == k.dtype == v.dtype and q.device == k.device == v.device):
+        return None
+    if not (q.shape[:-2] == k.shape[:-2] == v.shape[:-2]) or q.dim() < 3:
+        return None
+    if (q.shape[-2], k.shape[-2], v.shape[-2]) != (H_qk, H_qk, HV) or q.shape[-1] != D:
+        return None
+    if q.numel() == 0:
+        return None
+    lead = tuple(q.shape[:-2])
+    shape = (*lead, C)
+    want = _dense_strides(shape)
+    for x in (q, k, v):
+        if x.dim() != len(lead) + 2 or x.shape[-1] != D:
+            return None
+        for axis, n in enumerate(lead):
+            if n != 1 and x.stride(axis) != want[axis]:
+                return None
+        if x.stride(-1) != 1 or (x.shape[-2] != 1 and x.stride(-2) != D):
+            return None
+    st = q.untyped_storage().data_ptr()
+    if not (
+        k.untyped_storage().data_ptr() == st and v.untyped_storage().data_ptr() == st
+    ):
+        return None
+    if (k.storage_offset(), v.storage_offset()) != (
+        q.storage_offset() + H_qk * D,
+        q.storage_offset() + 2 * H_qk * D,
+    ):
+        return None
+    return q.as_strided(shape, want, q.storage_offset())
+
+
+def _row_span(x: torch.Tensor) -> torch.Tensor:
+    """A ``[T, heads, 128]`` gradient output as #8 receives it: itself when contiguous, else (a head view of the
+    packed ``dQKV`` row) the contiguous 1-D span from its first to its last element.  The #8 binding requires a
+    contiguous ``dq`` / ``dk`` / ``dv``; the kernel addresses them through the ``dqk_tstride`` / ``dv_tstride``
+    scalars, so it writes exactly the view's elements."""
+    if x.is_contiguous() or x.numel() == 0:
+        return x
+    n = (x.shape[0] - 1) * x.stride(0) + x.shape[1] * x.shape[2]
+    return x.as_strided((n,), (1,), x.storage_offset())
+
+
 # ----------------------------------------------------------------------------------------------------------------
 # Backends: the dispatch table of the eleven program launches
 
@@ -2560,6 +2621,9 @@ class CallDetKcp:
         ] = {}  # tape name -> tensor (fresh or arena), bound as the call proceeds
         self.out: torch.Tensor | None = None
         self.grads: dict[str, torch.Tensor] | None = None
+        self.grad_layout: str | None = (
+            None  # "packed" | "separate" (the backward's dq / dk / dv)
+        )
         self.exchange = _exchange_scheme(tb, opts)
         self.precision_mode = int(opts.precision_mode)
         self.transfer_walk = str(opts.transfer_walk)
@@ -2947,9 +3011,9 @@ class CallDetKcp:
                 qscale=self.tape("qscale"),
                 gamma=self.tape("gamma"),
                 scale=self.scale,
-                dq=self.grads["dq"],
-                dk=self.grads["dk"],
-                dv=self.grads["dv"],
+                dq=_row_span(self.grads["dq"]),
+                dk=_row_span(self.grads["dk"]),
+                dv=_row_span(self.grads["dv"]),
                 dbeta=self.grads["dbeta"],
                 dg_part=self.tape("dg_part"),
                 gamma_dot=self.tape("gamma_dot"),
@@ -3123,6 +3187,7 @@ def _record(kind: str, call: CallDetKcp) -> None:
         "cols_rule": call.cols_rule,
         "merges": list(call.merge_log),
         "graph": call.opts.graph,
+        "grad_layout": call.grad_layout,
         "graph_event": "eager",
         "graph_key": None,
         "graph_fallback": None,
@@ -4692,10 +4757,29 @@ def _alloc_grads(call: CallDetKcp) -> None:
     for nothing (R2-L1 1b)."""
     dt = call.backend.dtypes
     T, H_qk, HV = call.T_r, call.H_qk, call.HV
+    o = call.ops
+    packed = (
+        dt["dq"] == dt["dk"] == dt["dv"] == o["q"].dtype
+        and _packed_rows(o["q"], o["k"], o["v"], H_qk, HV) is not None
+    )
+    if packed:
+        # q / k / v are head views of one packed row: dq / dk / dv are the same views of one fresh dQKV row, so the
+        # layer below (the convolution's backward) reads one contiguous [T, (2 H_qk + HV) * 128] gradient with no
+        # concatenation (:func:`packed_qkv_views_det_kcp`)
+        qkv = _alloc((T, (2 * H_qk + HV) * D), dt["dq"], call.device)
+        a, b = H_qk * D, 2 * H_qk * D
+        dq = qkv[:, :a].view(T, H_qk, D)
+        dk = qkv[:, a:b].view(T, H_qk, D)
+        dv = qkv[:, b:].view(T, HV, D)
+    else:
+        dq = _alloc((T, H_qk, D), dt["dq"], call.device)
+        dk = _alloc((T, H_qk, D), dt["dk"], call.device)
+        dv = _alloc((T, HV, D), dt["dv"], call.device)
+    call.grad_layout = "packed" if packed else "separate"
     call.grads = {
-        "dq": _alloc((T, H_qk, D), dt["dq"], call.device),
-        "dk": _alloc((T, H_qk, D), dt["dk"], call.device),
-        "dv": _alloc((T, HV, D), dt["dv"], call.device),
+        "dq": dq,
+        "dk": dk,
+        "dv": dv,
         "dbeta": _alloc((T, HV), dt["dbeta"], call.device),
         "dg": _alloc((T, HV), dt["dg"], call.device),
     }
@@ -4837,6 +4921,74 @@ class ChunkGDNDetFunctionKcp(torch.autograd.Function):
         return dq, dk, dv, dg, dbeta, None, None, None, None, None, None
 
 
+PACKED_SPLIT_STATS: dict[str, int] = {
+    "aliased": 0,  # split backwards that returned the incoming packed dQKV row itself
+    "concatenated": 0,  # split backwards that concatenated (the gradients were not one packed row)
+}
+
+
+def _qkv_views(
+    qkv: torch.Tensor, H_qk: int, HV: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    lead = tuple(qkv.shape[:-1])
+    a, b = H_qk * D, 2 * H_qk * D
+    return (
+        qkv[..., :a].view(*lead, H_qk, D),
+        qkv[..., a:b].view(*lead, H_qk, D),
+        qkv[..., b:].view(*lead, HV, D),
+    )
+
+
+class PackedQKVSplitDetKcp(torch.autograd.Function):
+    """:func:`packed_qkv_views_det_kcp` as an autograd node.  The backward returns the packed gradient row itself when the
+    three incoming gradients are the head views of one packed row (what :func:`chunk_gdn_det_kcp`'s backward writes for
+    packed operands) and concatenates them otherwise (a missing gradient counts as zeros)."""
+
+    @staticmethod
+    def forward(fctx, qkv, H_qk, HV):
+        fctx.meta = (tuple(qkv.shape), qkv.dtype, qkv.device, int(H_qk), int(HV))
+        return _qkv_views(qkv, int(H_qk), int(HV))
+
+    @staticmethod
+    def backward(fctx, dq, dk, dv):
+        shape, dtype, device, H_qk, HV = fctx.meta
+        lead = shape[:-1]
+        grads = []
+        for g, heads in ((dq, H_qk), (dk, H_qk), (dv, HV)):
+            if g is None:
+                g = torch.zeros((*lead, heads, D), dtype=dtype, device=device)
+            grads.append(g)
+        row = _packed_rows(*grads, H_qk, HV)
+        if row is not None and row.dtype == dtype and tuple(row.shape) == shape:
+            PACKED_SPLIT_STATS["aliased"] += 1
+            return row, None, None
+        PACKED_SPLIT_STATS["concatenated"] += 1
+        return torch.cat([g.flatten(-2) for g in grads], dim=-1).to(dtype), None, None
+
+
+def packed_qkv_views_det_kcp(
+    qkv: torch.Tensor, *, H_qk: int, HV: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``q`` / ``k`` / ``v`` as head views ``[..., T, H_qk | H_qk | HV, 128]`` of a packed
+    ``[..., T, (2 H_qk + HV) * 128]`` row (the convolution's output), with no copy.
+
+    :func:`chunk_gdn_det_kcp` takes the views as they are (token stride ``(2 H_qk + HV) * 128``) and its backward writes
+    ``dq`` / ``dk`` / ``dv`` as the same views of one fresh packed row; this split's backward hands that row on as
+    the gradient of ``qkv`` without a concatenation.  Any other incoming gradient is concatenated."""
+    H_qk, HV = int(H_qk), int(HV)
+    validate_heads(H_qk, HV)
+    C = (2 * H_qk + HV) * D
+    if qkv.dim() < 2 or qkv.shape[-1] != C:
+        raise ValueError(
+            f"qkv: expected [..., T, {C}] for H_qk={H_qk}, HV={HV}, got shape {tuple(qkv.shape)}"
+        )
+    if qkv.stride(-1) != 1:
+        raise ValueError(
+            f"qkv: the channel axis must be dense (strides {qkv.stride()})"
+        )
+    return PackedQKVSplitDetKcp.apply(qkv, H_qk, HV)
+
+
 def chunk_gdn_det_kcp(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -4956,6 +5108,7 @@ __all__ = [
     "TAPE_ALIASES",
     "LOCAL_PROGRAMS",
     "OFFSET_CLASSES",
+    "PACKED_SPLIT_STATS",
     "PROGRAMS",
     "PROGRAM_ARGS",
     "PROVISIONAL_ARGS",
@@ -4985,6 +5138,7 @@ __all__ = [
     "SavedDetKcp",
     "WorkspaceDetKcp",
     "KernelBackend",
+    "PackedQKVSplitDetKcp",
     "chunk_gdn_det_kcp",
     "chunk_gdn_det_bwd_kcp",
     "chunk_gdn_det_fwd_kcp",
@@ -4999,6 +5153,7 @@ __all__ = [
     "kept_registry_size",
     "make_options",
     "merge_cols_per_cta",
+    "packed_qkv_views_det_kcp",
     "resolve_launch",
     "saved_states",
     "saved_tapes",

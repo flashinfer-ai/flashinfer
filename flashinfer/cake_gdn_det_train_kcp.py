@@ -340,6 +340,23 @@ def chunk_gdn_det_kcp(
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
+def packed_qkv_views_det_kcp(
+    qkv: torch.Tensor, *, H_qk: int, HV: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""``q`` / ``k`` / ``v`` as head views ``[..., T, H_qk | H_qk | HV, 128]`` of a packed
+    ``[..., T, (2 H_qk + HV) * 128]`` row, with no copy.  :func:`chunk_gdn_det_kcp` takes the views as they are and its
+    backward writes ``dq`` / ``dk`` / ``dv`` into one packed row, which this split's backward returns as the gradient
+    of ``qkv`` without a concatenation.
+
+    Example::
+
+        q, k, v = packed_qkv_views_det_kcp(conv_out, H_qk=16, HV=48)        # conv_out: [T, 10240]
+        out = chunk_gdn_det_kcp(q, k, v, g, beta, ctx)
+    """
+    return _pkg().packed_qkv_views_det_kcp(qkv, H_qk=H_qk, HV=HV)
+
+
+@flashinfer_experimental_api(feature=_FEATURE)
 def gdn_det_workspace_bytes_kcp(ctx: Any, *, H_qk: int, HV: int, **kw: Any) -> int:
     r"""Caller-held workspace bytes of one rank for ``(ctx, H_qk, HV)`` (exchange pools, staging, tapes): the most
     the workspace binds in the forward or the backward of the given options (``reuse_recompute_tapes`` as a keyword;
@@ -435,4 +452,5 @@ __all__ = [
     "gdn_det_workspace_bytes_kcp",
     "is_gdn_det_train_kcp_supported",
     "partition_det_kcp",
+    "packed_qkv_views_det_kcp",
 ]

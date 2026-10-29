@@ -28,7 +28,7 @@ from flashinfer.cake_gdn_det_train_kcp import (
     partition_det_kcp, build_context_det_kcp, PartitionDetKcp, ContextDetKcp, OptionsDetKcp,
     RecomputeHandleDetKcp, chunk_gdn_det_kcp, chunk_gdn_det_fwd_kcp, chunk_gdn_det_bwd_kcp,
     gdn_det_workspace_bytes_kcp, gdn_det_saved_bytes_kcp, gdn_det_comm_bytes_kcp,
-    is_gdn_det_train_kcp_supported,
+    is_gdn_det_train_kcp_supported, packed_qkv_views_det_kcp,
 )
 
 part = partition_det_kcp(cu_seqlens_global_cpu, world_size, layout="zigzag_per_document")   # once per batch layout
@@ -42,7 +42,7 @@ dq, dk, dv, dbeta, dg = chunk_gdn_det_bwd_kcp(q, k, v, g, beta, ctx, dout)      
 ws = gdn_det_workspace_bytes_kcp(ctx, H_qk=16, HV=48)                                      # per rank, pure CPU
 ```
 
-These thirteen names are the whole public surface (the `__all__` of
+These fourteen names are the whole public surface (the `__all__` of
 `flashinfer/cake_gdn_det_train_kcp.py`; this package's `__init__.py` exports
 them beside its backend controls).  The pre-rename names (see "Names") are
 compatibility aliases of the same objects, not additional surface.  Every
@@ -233,6 +233,16 @@ handle under their own key (the convolution's halo rows under `"conv"`).  A
 handle holds one entry per key: it serves one GDN call and at most one
 convolution call; a layer with separate Q / K / V convolutions uses one handle
 per convolution call, and the GDN call shares one of them.
+
+**Packed Q/K/V.**  `packed_qkv_views_det_kcp(qkv, H_qk=..., HV=...)` splits a packed
+`[T, (2 H_qk + HV) * 128]` row (the convolution's output) into `q` / `k` /
+`v` head views without a copy; `chunk_gdn_det_kcp` takes them as they are (token
+stride `(2 H_qk + HV) * 128`).  When `q` / `k` / `v` are such views, the
+backward writes `dq` / `dk` / `dv` as the same views of one fresh packed
+row, and the split's backward returns that row as the gradient of `qkv`: no
+concatenation and no copy between the GDN backward and the convolution's
+backward.  The gradient values are bitwise those of separate operands
+(`LAST_CALL["bwd"]["grad_layout"]` is `"packed"` or `"separate"`).
 
 ```
 gdn_det_comm_bytes_kcp(ctx, *, H_qk, HV, C) -> {rank: {c1_send, c1_recv, c2_recv, b1_send, b2_recv, halo_fwd, halo_bwd}}

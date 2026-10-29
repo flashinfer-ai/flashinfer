@@ -342,11 +342,12 @@ def test_facade_exposes_the_contract_names_keyword_only() -> None:
         "gdn_det_saved_bytes_kcp",
         "gdn_det_comm_bytes_kcp",
         "is_gdn_det_train_kcp_supported",
+        "packed_qkv_views_det_kcp",
     )
     for n in names:
         assert callable(getattr(facade, n)), n
         assert n in facade.__all__
-    # exactly the contract names plus the three public types; nothing else is public
+    # exactly the contract names plus the public types; nothing else is public
     types = (
         "OptionsDetKcp",
         "ContextDetKcp",
@@ -396,6 +397,7 @@ def test_package_init_re_exports_the_route() -> None:
         "gdn_det_comm_bytes_kcp",
         "gdn_det_saved_bytes_kcp",
         "gdn_det_workspace_bytes_kcp",
+        "packed_qkv_views_det_kcp",
         "OptionsDetKcp",
         "ContextDetKcp",
         "SavedDetKcp",

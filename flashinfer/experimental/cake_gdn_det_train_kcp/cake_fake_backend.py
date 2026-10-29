@@ -420,6 +420,15 @@ def bwd_prep(values: Mapping[str, Any]) -> None:
             )  # ROUND #6: dv_intra
 
 
+def _token_rows(x: torch.Tensor, T: int, heads: int, tstride: int) -> torch.Tensor:
+    """``[T, heads, 128]`` over token stride ``tstride`` from the tensor #8 receives (3-D, or a 1-D span)."""
+    if x.dim() == 3:
+        return x
+    return x.as_strided(
+        (T, heads, HEAD_DIM), (tstride, HEAD_DIM, 1), x.storage_offset()
+    )
+
+
 def bwd_dqkg(values: Mapping[str, Any]) -> None:
     q, k, v, do = (values[n] for n in ("q", "k", "v", "do"))
     h_tape, dh_tape, v_new, dv_new, w, u, aqk, akk, do_g = (
@@ -442,6 +451,11 @@ def bwd_dqkg(values: Mapping[str, Any]) -> None:
     dq, dk, dv, dbeta, dg_part, gamma_dot = (
         values[n] for n in ("dq", "dk", "dv", "dbeta", "dg_part", "gamma_dot")
     )
+    # the kernel addresses dq / dk / dv through their token strides: the host passes a head view of a packed dQKV
+    # row as its contiguous 1-D span
+    dq = _token_rows(dq, q.shape[0], q.shape[1], int(values["dqk_tstride"]))
+    dk = _token_rows(dk, q.shape[0], q.shape[1], int(values["dqk_tstride"]))
+    dv = _token_rows(dv, v.shape[0], v.shape[1], int(values["dv_tstride"]))
     scale = float(values["scale"])
     HV, H_qk, r = _group(values)
     for c, bos, L in _chunks(values):

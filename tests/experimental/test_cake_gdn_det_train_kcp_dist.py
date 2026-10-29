@@ -22,7 +22,8 @@ recurrence of the same operands and with one another.  Per row and rank the test
   for every tensor;
 * bitwise (G3): repeat; saved == replay (``boundary_mode``); ``save_mode`` light == full; autograd == explicit;
   ``torch.utils.checkpoint(use_reentrant=False)`` == direct; ``save_transfer`` True == False; ring == a2a where the
-  partition allows the ring; strided packed-QKV views == contiguous operands (``layout`` tma and copy);
+  partition allows the ring; strided packed-QKV views == contiguous operands (``layout`` tma and copy; under tma the
+  backward writes one packed dQKV row, and ``packed_qkv_views_det_kcp`` hands it to a packed leaf without a concatenation);
   ``.backward()`` twice accumulates exactly twice the gradient;
 * semantics (G4): zero-gradient leak (``dout`` zero outside one document -> exactly zero gradients on the others) and
   independence (the other documents' operands replaced -> one document's outputs bitwise unchanged);
@@ -1132,7 +1133,39 @@ def _run_rank(
     # strided packed-QKV views: zero-copy (layout="tma") and the copy adapter, both bitwise the contiguous call
     _buf, qs, ks, vs = _packed_views(q, k, v)
     flags["strided_eq_contiguous"] = _eq(res, saved_pass(qs, ks, vs))
+    # issue #7817: packed operands -> #8 writes dq / dk / dv as the same views of one packed dQKV row
+    flags["packed_grad_layout"] = (
+        int(q.shape[0]) == 0 or kcp.LAST_CALL["bwd"]["grad_layout"] == "packed"
+    )  # T_r = 0: nothing to pack
     flags["copy_layout_eq_contiguous"] = _eq(res, saved_pass(qs, ks, vs, layout="copy"))
+    # the copy adapter copies strided views; a one-token view is already contiguous, stays a packed view and keeps
+    # the packed gradient row
+    copy_noop = int(q.shape[0]) > 0 and all(x.is_contiguous() for x in (qs, ks, vs))
+    flags["copy_grad_layout_separate"] = kcp.LAST_CALL["bwd"]["grad_layout"] == (
+        "packed" if copy_noop else "separate"
+    )
+    # ... and the split hands that row to the packed leaf without a concatenation (autograd, bitwise)
+    split_before = dict(kcp.PACKED_SPLIT_STATS)
+    qkv_leaf = _buf.detach().clone().requires_grad_(True)
+    g_leaf, b_leaf = (x.detach().clone().requires_grad_(True) for x in (g, beta))
+    pq, pk, pv = kcp.packed_qkv_views_det_kcp(qkv_leaf, H_qk=H_qk, HV=HV)
+    out_split = kcp.chunk_gdn_det_kcp(pq, pk, pv, g_leaf, b_leaf, ctx, workspace=ws, **base)
+    out_split.backward(dout)
+    ga = qkv_leaf.grad
+    res_split = {
+        "out": out_split.detach(),
+        "dq": ga[:, : H_qk * 128].reshape(-1, H_qk, 128),
+        "dk": ga[:, H_qk * 128 : 2 * H_qk * 128].reshape(-1, H_qk, 128),
+        "dv": ga[:, 2 * H_qk * 128 :].reshape(-1, HV, 128),
+        "dg": g_leaf.grad,
+        "dbeta": b_leaf.grad,
+    }
+    flags["packed_split_eq_contiguous"] = _eq(res_auto, res_split)
+    flags["packed_split_aliased"] = (
+        int(ga.shape[0]) == 0
+        or kcp.PACKED_SPLIT_STATS["aliased"] - split_before["aliased"] == 1
+    )
+    del qkv_leaf, g_leaf, b_leaf, out_split, ga, res_split
     # gradient accumulation: .backward() twice == exactly twice the gradient (x + x is exact in every float format)
     res_twice = autograd_pass(False, twice=True)
     flags["backward_twice_accumulates"] = all(
