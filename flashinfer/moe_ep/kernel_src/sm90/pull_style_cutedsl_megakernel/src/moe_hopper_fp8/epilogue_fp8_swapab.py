@@ -45,8 +45,18 @@ from moe_hopper_fp8.epilogue_fp8_common import (
 Fc1EpilogueStoreTileN = 64
 SwapABTileMChoices = (128, 256)
 # 8 is experimental (wgmma m64n8k32; every n-derived count divides): see TUNING.md.
-# 72/80 are admitted by the packed-FP4 configs only (one task for 65-80 rows).
-SwapABTokenTileNChoices = (8, 16, 32, 64, 72, 80, 128)
+SwapABTokenTileNChoices = (8, 16, 32, 64, 128)
+# Packed FP4 (fp8_scale_mode "mxfp4_hybrid") also takes N72/N80: one task holds
+# an expert's 65-80 rows where N64 needs a second, nearly empty tile. Its shim
+# pads the activation-SF pool to a multiple of N, which the SF TMA coordinate
+# (expert SF base + tile * N) // N needs; FP8 keeps 128-row SF padding.
+SwapABPackedFp4TokenTileNChoices = (8, 16, 32, 64, 72, 80, 128)
+
+
+def swapab_token_tile_n_choices(fp8_scale_mode: str) -> tuple:
+    if fp8_scale_mode == "mxfp4_hybrid":
+        return SwapABPackedFp4TokenTileNChoices
+    return SwapABTokenTileNChoices
 SwapABBlockwiseFc1GroupChunkChoices = (1, 2, 4, 8)
 SwapABBlockwiseFc1GroupChunks = int(
     os.environ.get("MEGA_SWAPAB_FC1_GROUP_CHUNKS", "1")
@@ -314,10 +324,11 @@ class SwapABFp8GluEpilogue:
                 f"got CTA M={self._raw_cta_tile_m} split across "
                 f"{self._epilogue_warpgroup_count} warpgroup(s)."
             )
-        if self._token_tile_n not in SwapABTokenTileNChoices:
+        token_tile_n_choices = swapab_token_tile_n_choices(self.fp8_scale_mode)
+        if self._token_tile_n not in token_tile_n_choices:
             raise ValueError(
                 "Swap-AB Hopper FP8 epilogue requires token N in "
-                f"{SwapABTokenTileNChoices}, got {self._token_tile_n}."
+                f"{token_tile_n_choices}, got {self._token_tile_n}."
             )
         self._epi_tile = (self._token_tile_n, self._wg_output_tile_m)
         self._subtile_cnt = self._epilogue_warpgroup_count

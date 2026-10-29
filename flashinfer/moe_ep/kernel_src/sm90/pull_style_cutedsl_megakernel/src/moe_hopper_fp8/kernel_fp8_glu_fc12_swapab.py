@@ -25,8 +25,8 @@ from moe_hopper_fp8.fused_comm_policy import resolve_fused_comm_optimizations
 from moe_hopper_fp8.epilogue_fp8_swapab import (
     SwapABFp8GluEpilogue,
     SwapABTileMChoices,
-    SwapABTokenTileNChoices,
     WarpThreadCount,
+    swapab_token_tile_n_choices,
 )
 from moe_hopper_fp8.kernel_fp8_glu_fc12 import (
     Sm90SwigluFp8Fc12Kernel as _Sm90Fp8Fc12KernelBase,
@@ -169,11 +169,12 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 "limited to independent 1CTA WGMMA; "
                 "use_2cta_instrs must be False."
             )
-        if m not in SwapABTileMChoices or n not in SwapABTokenTileNChoices:
+        token_tile_n_choices = swapab_token_tile_n_choices(fp8_scale_mode)
+        if m not in SwapABTileMChoices or n not in token_tile_n_choices:
             raise ValueError(
                 "Sm90SwapABSwigluFp8Fc12Kernel only supports "
                 f"mma_tiler M in {SwapABTileMChoices} and N in "
-                f"{SwapABTokenTileNChoices} with "
+                f"{token_tile_n_choices} with "
                 "use_2cta_instrs=False; "
                 f"got mma_tiler_mnk={mma_tiler_mnk}, use_2cta_instrs={use_2cta_instrs}."
             )
@@ -481,10 +482,11 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         m, n, k = self.mma_tiler_mnk
         cm, cn = self.cluster_shape_mn
 
-        if m not in SwapABTileMChoices or n not in SwapABTokenTileNChoices:
+        token_tile_n_choices = swapab_token_tile_n_choices(self.fp8_scale_mode)
+        if m not in SwapABTileMChoices or n not in token_tile_n_choices:
             raise ValueError(
                 "Swap-AB Hopper FP8 requires M in "
-                f"{SwapABTileMChoices} and N in {SwapABTokenTileNChoices}, "
+                f"{SwapABTileMChoices} and N in {token_tile_n_choices}, "
                 f"got ({m}, {n})."
             )
 

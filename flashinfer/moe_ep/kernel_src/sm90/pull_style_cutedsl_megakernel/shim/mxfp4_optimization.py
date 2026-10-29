@@ -559,11 +559,12 @@ def hopper_mxfp4_candidates(
 ) -> list[dict[str, Any]]:
     """The single ordered strategy domain for fused offline and online tuning.
 
-    Token capacity only orders the existing geometry candidates. It never
-    changes strategy eligibility or selects an alternate source tree. The
-    eligible per-bucket defaults of the shape's table follow, then the N72 and
-    N80 tilings of this capacity's bucket default, so tuning always measures
-    the untuned default (the row-tiled one included). NV seeds its own domain
+    Token capacity orders the geometry candidates and never changes strategy
+    eligibility or selects an alternate source tree. The eligible per-bucket
+    defaults of the shape's table follow, then the N72 and N80 tilings of this
+    capacity's bucket default, so tuning always measures the untuned default
+    (the row-tiled one included); these extensions depend on the table and
+    the capacity bucket. NV seeds its own domain
     with ``include_fused_defaults=False``: those defaults were measured on
     MXFP4 only.
     """

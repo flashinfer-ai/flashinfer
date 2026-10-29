@@ -532,7 +532,8 @@ class TokenInPullTokenBackPush:
         # (a deep queue lengthens per-request RTT and fights the GEMM for
         # L2/issue slots).  Deeper per-warp pipelining (donating idle
         # warps' smem slots as extra in-flight stages) was measured at
-        # -0.8%..+0.1% net -- in-flight depth is not the bottleneck.
+        # -0.8%..+0.1% net in those sweeps; it pays only for some packed-FP4
+        # shapes (``pull_batch``; H2560/I640/E512/EP2 defaults keep 2-3 rows).
         if active_dispatch_warps not in (1, 2, self.num_dispatch_warps):
             raise ValueError(
                 "active_dispatch_warps must be 1, 2, or "
@@ -1802,7 +1803,9 @@ class TokenInPullTokenBackPush:
         index loads together, keeps ``R`` row loads in flight in its pull slots
         (the idle warps' slots of the non-compact buffer), drains the ``R``
         pool stores once and publishes them behind one release fence.  Token
-        order, pool placement and readiness counts match the serial loop.
+        order, pool placement and readiness counts match the serial loop; each
+        row's readiness is published after that fence, so the serial loop's
+        ``flag_batch`` coalescing does not apply here.
         """
         R: cutlass.Constexpr[int] = self._pull_batch
         pull_mbar_ptr = token_comm_storage.pull_mbar.data_ptr()

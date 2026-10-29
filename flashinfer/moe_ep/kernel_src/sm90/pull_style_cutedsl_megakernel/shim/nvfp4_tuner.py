@@ -37,6 +37,12 @@ def normalize_hopper_nvfp4_tactic(tactic: Mapping[str, Any]) -> dict[str, Any]:
     return dict(normalize_mxfp4_optimization_tactic(core), **conversion)
 
 
+def _default_bucket(max_tokens: int) -> int:
+    """Smallest adequate capacity bucket; larger capacities use the largest."""
+    buckets = tuple(NVFP4_DEFAULT_TACTICS_BY_TOKENS)
+    return next((value for value in buckets if value >= max_tokens), buckets[-1])
+
+
 def nvfp4_candidate_sha256(candidates: Iterable[Mapping[str, Any]]) -> str:
     values = [normalize_hopper_nvfp4_tactic(x) for x in candidates]
     return hashlib.sha256(
@@ -139,9 +145,8 @@ def hopper_nvfp4_candidates(
     # One N72/N80 task holds an expert's 65-72/65-80 rows where N64 needs a
     # second, nearly empty tile; offer both tilings of this capacity's default
     # (of its sf0 core, as the scale ring fits only N64 tiles).
-    buckets = tuple(NVFP4_DEFAULT_TACTICS_BY_TOKENS)
-    bucket = next((value for value in buckets if value >= max_tokens), buckets[-1])
-    seeds.extend(_row_tile_variants(NVFP4_SF0_DEFAULT_CORES_BY_TOKENS[bucket]).values())
+    core = NVFP4_SF0_DEFAULT_CORES_BY_TOKENS[_default_bucket(max_tokens)]
+    seeds.extend(_row_tile_variants(core).values())
     result = []
     for seed in seeds:
         try:
@@ -194,9 +199,7 @@ def hopper_nvfp4_default_profile(
         for name, value in _H200_REFERENCE.items()
     ):
         return None
-    buckets = tuple(NVFP4_DEFAULT_TACTICS_BY_TOKENS)
-    bucket = next((value for value in buckets if value >= max_tokens), buckets[-1])
-    profile = NVFP4_DEFAULT_TACTICS_BY_TOKENS[bucket]
+    profile = NVFP4_DEFAULT_TACTICS_BY_TOKENS[_default_bucket(max_tokens)]
     return dict(
         requested_tactic=normalize_hopper_nvfp4_tactic(profile["requested_tactic"]),
         requested_config=dict(profile["requested_config"]),

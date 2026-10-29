@@ -144,13 +144,15 @@ not picked them up):
   delayed scale-producer loop and early-release policy. Preserve these hooks
   when reapplying the scale-ring extension.
 - Dispatch pull batch + rotation and swap-AB FC1/FC2 dedup (2026-10-26,
-  measured on PR #6465 in October): `src/src/token_comm.py` ctor knobs
+  measured on H200 MegaMoE shapes in October): `src/src/token_comm.py` ctor knobs
   `pull_batch` (default 1) / `pull_rotate` (default False) and properties
   `pull_batch` / `pull_rotate`. `_dispatch_pull_batched` keeps R rows in
   flight in the idle slots of the 4-slot pull buffer (R x
   active_dispatch_warps <= 4; full buffer; no dispatch-side token-back,
-  dedup or grouped token-back). Rotation makes pass k take row
-  `k*G + (g + k) % G`; the serial loop keeps that index incremental.
+  dedup or grouped token-back); it publishes each row after one release
+  fence per pass, so `flag_batch` applies to the serial loop only. Rotation
+  makes pass k take row `k*G + (g + k) % G`; the serial loop keeps that
+  index incremental.
   `src/src/ptx_helpers.py` adds `red_add_relaxed_gpu_s32_raw`.
   `megamoe_kernel_fp8.py` takes ctor kwargs `dispatch_pull_batch` /
   `dispatch_pull_rotate`. `epilogue_fp8_swapab.py` and the MX
@@ -161,12 +163,16 @@ not picked them up):
   `compact_pull_buffer` becomes an MX tactic field (NV already had it). See
   `shim/mxfp4_optimization.py::MXFP4_PULL_DEFAULTS`. A normalized tactic
   omits these fields at their defaults, so existing candidate sets and cache
-  provenance keep their identity. Explicit frontend/backend values override
-  the tactic, as `token_back_mode` does. The drop tree has none of this.
+  provenance keep their identity. Explicit frontend values (and the MX
+  backend's `compact_pull_buffer`) override a cached or default tactic, as
+  `token_back_mode` does; a tactic's pull batch then drops to 1 when an
+  explicit token-back mode or compact buffer rules it out. Autotune measures
+  each candidate's own values. The drop tree has none of this.
 - Paired BF16 FC2 stores for K128 MXFP4 tiles (2026-10-27, measured on
-  H2560/I640/E512/top10/EP2 in October): `src/moe_hopper_fp8/mxfp4_policy.py` resolves
-  `paired_stores` for tile K 128 as well as 256. Output-invariant; K256
-  tiles are unchanged. Not in the drop tree.
+  H2560/I640/E512/top10/EP2 in October):
+  `src/moe_hopper_fp8/mxfp4_policy.py` resolves `paired_stores` for tile K
+  128 as well as 256. Output-invariant; K256 tiles are unchanged. Not in the
+  drop tree.
 - FC1/FC2 next-stage wait + LDSM under the WGMMAs for K128 MXFP4 tiles
   (2026-10-27, measured on H2560/I640/E512/top10/EP2 in October):
   `_mma_mxfp4_hybrid_fc1` and `_mma_mxfp4_hybrid_fc2` in
@@ -185,15 +191,16 @@ not picked them up):
   and NVFP4 tuning caches re-tune; the kernels do not read it. Not in the
   drop tree.
 - Swap-AB token tiles N72/N80 for packed FP4 (2026-10-28, measured on
-  H2560/I640/E512/top10/EP2): `src/moe_hopper_fp8/epilogue_fp8_swapab.py` admits 72 and 80
-  in `SwapABTokenTileNChoices`, and `fused_comm_policy.py` enables paired BF16
-  stores for M256 x N64/N72/N80. Only the MXFP4/NVFP4 shim configs admit the
-  new widths (FP8 keeps its list). The MX frontend pads the activation-SF pool
-  to a multiple of the token tile, because the SF TMA addresses a tile as
-  `(expert SF base + tile * N) // N`; every existing N keeps 128. One N80 task
-  holds an expert's 65-80 rows, where N64 needs a second, nearly empty tile;
-  the 224-register consumers do not spill in the main loops. Not in the drop
-  tree.
+  H2560/I640/E512/top10/EP2): `src/moe_hopper_fp8/epilogue_fp8_swapab.py`
+  adds `SwapABPackedFp4TokenTileNChoices` (with 72 and 80), which the swap-AB
+  kernel and epilogue take for `fp8_scale_mode="mxfp4_hybrid"`; FP8 keeps
+  `SwapABTokenTileNChoices` and its shim list. `fused_comm_policy.py` enables
+  paired BF16 stores for M256 x N64/N72/N80. The MX frontend pads the
+  activation-SF pool to a multiple of the token tile, because the SF TMA
+  addresses a tile as `(expert SF base + tile * N) // N`; every existing N
+  keeps 128. One N80 task holds an expert's 65-80 rows, where N64 needs a
+  second, nearly empty tile; the 224-register consumers do not spill in the
+  main loops. Not in the drop tree.
 
 ## Layout
 

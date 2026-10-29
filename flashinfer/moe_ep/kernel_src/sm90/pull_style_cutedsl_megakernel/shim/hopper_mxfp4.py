@@ -1081,6 +1081,14 @@ def _resolve_hopper_mxfp4_mega_moe_config(
         ):
             if value is not None:
                 resolved.pop(name)
+        # A tactic's pull batch keeps rows in the idle slots of the full
+        # 4-slot buffer of the serial epi_warps dispatch. When an explicit
+        # token-back mode or compact buffer rules that out, keep the rest of
+        # the tactic with one row in flight; the batch never changes outputs.
+        if resolved.get("dispatch_pull_batch", 1) > 1 and (
+            compact_pull_buffer or token_back_mode not in (None, "epi_warps")
+        ):
+            resolved["dispatch_pull_batch"] = 1
 
     config = MegaMoEHopperMxfp4Config(
         rank=rank,

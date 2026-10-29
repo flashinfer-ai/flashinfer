@@ -71,7 +71,8 @@ class Sm90_Fp8_Mxfp4_Bf16_PullCutedsl_MegaMoeConfig:
     fold_producer_warps: bool | None = None
     # One dispatch pull slot per active warp instead of four (frees shared
     # memory for AB stages when active_dispatch_warps < 4). A tactic field:
-    # None follows the selected tactic, an explicit bool overrides it.
+    # None follows the selected tactic, an explicit bool overrides a cached or
+    # default tactic (knobs="auto" measures each candidate's own buffer).
     compact_pull_buffer: bool | None = None
     routing_profile: str = field(
         default=SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
