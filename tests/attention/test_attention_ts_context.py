@@ -5391,7 +5391,7 @@ def test_variable_window_prefill_statistics(
 def test_context_dense_two_cta_lse_and_sinks(dtype, pv_dtype, monkeypatch):
     """Paired query tiles publish dense output/LSE with sinks and partial rows."""
     monkeypatch.setattr(
-        context_module, "_default_two_cta_umma", lambda device_index: True
+        context_module, "_default_two_cta_umma", lambda device_index, qk_bits: True
     )
     torch.manual_seed(117)
     q = (torch.randn(2, 521, 3, 128, device="cuda") * 0.2).to(dtype)
