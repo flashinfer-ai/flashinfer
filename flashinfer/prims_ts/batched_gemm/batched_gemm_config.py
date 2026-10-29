@@ -680,6 +680,18 @@ class BatchedGemmConfig:
     :attr:`use_tile256_tmem_overlap`.
     """
 
+    weight_l2_evict_first: int = 0
+    """Load the swap-AB weight operand and its scale factors with the
+    evict-first L2 policy. ``0``/``1``.
+
+    The runtime routing map selects evict-first only for experts with one
+    token CTA. Experts with multiple token CTAs use evict-normal to preserve
+    weight reuse. CTAs along M read different weight slices. Requires
+    :attr:`is_swap_ab` and token-cluster width one (:func:`validate_config`).
+    Weight and weight-scale loaders construct the policy once per work tile
+    with PTX ``createpolicy``.
+    """
+
     use_pdl: int = 0
     """Enable programmatic dependent launch (PDL). ``0``/``1``.
 
@@ -3542,6 +3554,13 @@ def validate_config(
 
     # batch_mode selects swap_ab and the expert-coordinate axis. The generated
     # transpose flag is retained but validated above against that kernel path.
+
+    _validate_binary_config_option("weight_l2_evict_first", cfg.weight_l2_evict_first)
+    if cfg.weight_l2_evict_first:
+        if not cfg.is_swap_ab:
+            raise ValueError("weight_l2_evict_first requires swap-AB (BatchN)")
+        if cfg.token_cluster_dim != 1:
+            raise ValueError("weight_l2_evict_first requires token-cluster width one")
 
     if cfg.use_max_tmem_overlap not in (0, 1):
         raise ValueError(

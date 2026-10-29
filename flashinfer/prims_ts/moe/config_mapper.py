@@ -1213,6 +1213,37 @@ def _pdl_overrides(
     }
 
 
+def apply_weight_l2_policy(pair: PrimsTsGemmPair) -> PrimsTsGemmPair:
+    """Enable per-expert weight policy selection for BatchN GEMMs.
+
+    The kernel uses the actual routing span of each expert: one token CTA
+    uses evict-first; multiple token CTAs use the default eviction priority.
+    Different M tiles access different weight slices and do not count as
+    reuse of the same weights.
+    """
+
+    def with_policy(gemm: PrimsTsMoeGemmConfig) -> PrimsTsMoeGemmConfig:
+        kwargs = dict(gemm.cfg.kwargs)
+        if kwargs.get("batch_mode", int(_BatchMode.BATCH_N)) != int(_BatchMode.BATCH_N):
+            return gemm
+        # Wider token CGAs share weights and routing records across CTAs.
+        # Keep their normal policy; the neighbor lookup requires one CTA/record.
+        if int(kwargs.get("cluster_dim_y", 1)) != 1:
+            return gemm
+        kwargs["weight_l2_evict_first"] = 1
+        return PrimsTsMoeGemmConfig(
+            cfg=PrimsTsConfigSpec(kwargs=kwargs),
+            prims_ts_gemm_config_index=gemm.prims_ts_gemm_config_index,
+        )
+
+    return PrimsTsGemmPair(
+        tile_n=pair.tile_n,
+        moe_config_index=pair.moe_config_index,
+        fc1=with_policy(pair.fc1),
+        fc2=with_policy(pair.fc2),
+    )
+
+
 def _with_pdl_spec(
     spec: PrimsTsConfigSpec,
     *,
