@@ -694,6 +694,25 @@ class _DispatchSpy:
         return self._module.sm90_cake_dispatch_fused_bf16(*args)
 
 
+class _GridDispatchSpy:
+    """Forwards to the runner's grid-strided dispatch module and counts its launches."""
+
+    def __init__(self, module) -> None:
+        self._module = module
+        self.calls = 0
+
+    def __getattr__(self, name):
+        return getattr(self._module, name)
+
+    def sm90_cake_dispatch_grid_bf16(self, *args):
+        self.calls += 1
+        return self._module.sm90_cake_dispatch_grid_bf16(*args)
+
+    def sm90_cake_dispatch_grid_direct_bf16(self, *args):
+        self.calls += 1
+        return self._module.sm90_cake_dispatch_grid_direct_bf16(*args)
+
+
 # Round sizes around the fused / grid-strided dispatch bound (fused up to 512 tokens,
 # grid-strided from 513) and the small-route instance bound (T * top_k <= 1024).
 DISPATCH_SWITCH_TOKENS = (1, 8, 64, 128, 129, 512, 513, 700)
@@ -973,6 +992,26 @@ def test_ep1_direct_place_defaults(monkeypatch) -> None:
     monkeypatch.setenv(cake_runner.DIRECT_PLACE_MIN_TOKENS_ENV, "700")
     for ep in (2, 8):
         assert cake_runner._direct_place_min_tokens_default(ep, 8, 7168) == 700
+
+
+def test_ep1_grid_dispatch_defaults(monkeypatch) -> None:
+    """The shipped per-EP bound of the grid-strided dispatch: 512 at EP 8, the
+    rounds above the fused bound (513) at the other EP sizes, and the environment
+    fallback overrides it (host-only check)."""
+    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import (
+        cake_runner,
+    )
+
+    assert cake_runner.GRID_DISPATCH_MIN_TOKENS_DEFAULTS == {8: 512}
+    assert cake_runner.GRID_DISPATCH_MIN_TOKENS == 513
+    monkeypatch.delenv(cake_runner.GRID_DISPATCH_MIN_TOKENS_ENV, raising=False)
+    for ep, bound in ((1, 513), (2, 513), (4, 513), (8, 512), (16, 513)):
+        assert cake_runner._grid_dispatch_min_tokens_default(ep) == bound, ep
+    monkeypatch.setenv(cake_runner.GRID_DISPATCH_MIN_TOKENS_ENV, "600")
+    for ep in (2, 8):
+        assert cake_runner._grid_dispatch_min_tokens_default(ep) == 600
+    monkeypatch.setenv(cake_runner.GRID_DISPATCH_MIN_TOKENS_ENV, "0")
+    assert cake_runner._grid_dispatch_min_tokens_default(8) == 0
 
 
 @requires_sm90
@@ -1476,6 +1515,89 @@ def test_ep_grid_dispatch_matches_vendored(mode: str) -> None:
 
 
 @requires_dist
+@pytest.mark.parametrize("mode", ["random", "dup_remote"])
+def test_ep_grid_dispatch_default_bound(mode: str, monkeypatch) -> None:
+    """Rounds of 511, 512 and 513 local tokens around the default grid-dispatch bound
+    of the EP size (512 at EP 8, 513 at the others): the default runner takes the
+    grid-strided dispatch from that bound on and the fused dispatch below it, and
+    every round writes the bytes of the vendored dispatch."""
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep.kernel_src.sm90.cake_bf16_megamoe.shim import (
+        cake_runner,
+    )
+
+    monkeypatch.delenv(cake_runner.GRID_DISPATCH_MIN_TOKENS_ENV, raising=False)
+    rank, world_size = _dist_setup()
+    device = torch.device("cuda", rank)
+    total_experts = LOCAL_EXPERTS * world_size
+    bound = cake_runner.GRID_DISPATCH_MIN_TOKENS_DEFAULTS.get(
+        world_size, cake_runner.GRID_DISPATCH_MIN_TOKENS
+    )
+    # a token capacity no other test uses (the workspace pool is keyed on it); the
+    # fused dispatch and the round opening pinned to their shipped values
+    capacity = 519
+    vendored, w13, w2 = _build_layer(
+        world_size,
+        rank,
+        device,
+        token_capacity=capacity,
+        fused_dispatch_max_tokens=1,
+        grid_dispatch_min_tokens=0,
+    )
+    layer, _w13, _w2 = _build_layer(
+        world_size,
+        rank,
+        device,
+        token_capacity=capacity,
+        fused_begin=2,
+        fused_dispatch_max_tokens=512,
+    )
+    runner = _warm_runner(layer, device)
+    assert runner.grid_dispatch_min_tokens == bound, (world_size, bound)
+    fused = _DispatchSpy(runner.dispatch_module)
+    grid = _GridDispatchSpy(runner.dispatch_grid_module)
+    runner.dispatch_module = fused
+    runner.dispatch_grid_module = grid
+    try:
+        for num_tokens in (511, 512, 513):
+            x, ids, weights = _make_inputs(
+                num_tokens,
+                total_experts,
+                307 + num_tokens + rank,
+                device,
+                mode=mode,
+                rank=rank,
+                world_size=world_size,
+            )
+            fused.calls.clear()
+            grid.calls = 0
+            reference = _forward(vendored, x, ids, weights).clone()
+            output = _forward(layer, x, ids, weights).clone()
+            torch.cuda.synchronize()
+            # one launch per round: grid-strided from the bound on, fused below it
+            want = (1, 0) if num_tokens >= bound else (0, 1)
+            got = (grid.calls, len(fused.calls))
+            assert got == want, (world_size, num_tokens, got)
+            assert torch.equal(output, reference), (
+                f"ep{world_size} rank{rank} {mode} T={num_tokens}"
+            )
+            _check(
+                output,
+                x,
+                ids,
+                weights,
+                w13,
+                w2,
+                label=f" ep{world_size} rank{rank} {mode} T={num_tokens} bound {bound}",
+            )
+    finally:
+        runner.dispatch_module = fused._module
+        runner.dispatch_grid_module = grid._module
+    dist.barrier()
+
+
+@requires_dist
 @pytest.mark.parametrize("wire", WIRES)
 @pytest.mark.parametrize("mode", ["random", "hot", "dup_remote", "empty_rank"])
 def test_ep_copy_forms_bitwise(mode: str, wire: str) -> None:
@@ -1593,9 +1715,10 @@ def test_ep_per_route_publish_pdl_bitwise(mode: str) -> None:
 @pytest.mark.parametrize("mode", ["random", "hot", "masked", "empty_rank"])
 def test_ep_shared_workspace_round_paths(mode: str) -> None:
     """Layers of one config share one pooled workspace; each round takes the dispatch
-    path of each rank's own token count (fused up to 512 tokens, grid-strided from 513),
-    which differs between ranks and rounds (across that bound, an idle rank), and every
-    layer stays bitwise equal to a layer with every round switch off."""
+    path of each rank's own token count (fused below the grid-dispatch bound of the EP
+    size, 513 tokens or 512 at EP 8, grid-strided from it), which differs between ranks
+    and rounds (across that bound, an idle rank), and every layer stays bitwise equal to
+    a layer with every round switch off."""
     import torch.distributed as dist
 
     rank, world_size = _dist_setup()
@@ -1632,6 +1755,7 @@ def test_ep_shared_workspace_round_paths(mode: str) -> None:
         lambda r: 0 if r == 0 else 128,
         lambda r: 512 + r % 2,
         lambda r: 640 - r,
+        lambda r: 511 + r % 2,
     )
     for index, plan in enumerate(plans):
         num_tokens = plan(rank)
