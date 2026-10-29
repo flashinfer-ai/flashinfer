@@ -25,6 +25,8 @@ def stage_mega_moe_inputs(
     topk_weights_out: torch.Tensor,
     *,
     kind: str = "mxfp8_e4m3",
+    num_experts: int | None = None,
+    workspace=None,
 ) -> int:
     """bf16 ``hidden_states`` -> MXFP8 activation + E8M0 block scales.
 
@@ -45,7 +47,7 @@ def stage_mega_moe_inputs(
     if topk_weights.shape != topk_ids.shape:
         raise ValueError("topk_weights and topk_ids must have the same shape.")
 
-    if (
+    fused_stage = (
         os.environ.get("FLASHINFER_MEGA_FUSED_STAGE", "1") != "0"
         and hidden_states.is_cuda
         and hidden_states.is_contiguous()
@@ -58,7 +60,25 @@ def stage_mega_moe_inputs(
         and topk_ids.data_ptr() % 16 == 0
         and topk_weights.data_ptr() % 16 == 0
         and topk_weights.dtype in (torch.float16, torch.bfloat16, torch.float32)
-    ):
+    )
+    check_routes = (
+        num_experts is not None
+        and os.environ.get("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "1") != "0"
+    )
+    fused_check = (
+        check_routes
+        and fused_stage
+        and topk_ids.shape[1] <= 32
+        and os.environ.get("FLASHINFER_SM107_FUSED_ROUTE_CHECK", "1") != "0"
+    )
+    if check_routes and not fused_check:
+        from ..validation import validate_routing_values
+
+        validate_routing_values(
+            topk_ids, topk_weights, num_experts, workspace=workspace
+        )
+
+    if fused_stage:
         from ......kernel_src.sm100.cutedsl_megamoe import (
             fused_quant_stage,
             note_staged_tokens,
@@ -76,6 +96,9 @@ def stage_mega_moe_inputs(
             topk_weights_out,
             quant_type="mxfp8_e4m3" if kind == "mxfp4_mxfp8" else kind,
             mxfp8_normal_scales=True,
+            num_experts=num_experts if fused_check else None,
+            fuse_tail_mask=os.environ.get("FLASHINFER_SM107_FUSED_TAIL_MASK", "1")
+            != "0",
         )
         return num_tokens
 

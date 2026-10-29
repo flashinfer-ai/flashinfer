@@ -10,6 +10,7 @@ from flashinfer.fused_moe import (
     MoEActivationPack,
     MoEFinalizeConfig,
     MoEWeightPack,
+    QuantFormat,
     SwiGLU,
 )
 from flashinfer.fused_moe.backends.frost_low_latency.runner import FrostLowLatencyRunner
@@ -23,6 +24,8 @@ from tests.moe.test_frost_low_latency_mxfp4_w4a16 import (
     _reference as mx_ref,
 )
 from tests.moe.test_frost_low_latency_fp8_per_tensor import _check
+from tests.moe.test_frost_low_latency_fp16 import _check as fp16_check
+from tests.moe.test_frost_low_latency_weight_only_fp16 import _reference as typed_ref
 
 
 def _check_case(factory, reference, index, activation, widths, finalize, top_k=3):
@@ -83,10 +86,20 @@ def test_fp4_wide_max_routes(factory, reference, widths, finalize):
     [(nv_inputs, nv_ref), (mx_inputs, mx_ref)],
     ids=["nvfp4", "mxfp4"],
 )
-def test_fp4_wide_cache_binds_fresh_storage(factory, reference, monkeypatch):
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fp4_wide_cache_binds_fresh_storage(factory, reference, dtype, monkeypatch):
     from flashinfer.fused_moe.backends.frost_low_latency.fma import fp4_weight_only
 
     cfg, x, ids, scores, pack, view = factory(SwiGLU(), 1)
+    if dtype is torch.float16:
+        # SM100 advertises FP16 wide loads even when BF16 uses narrow loads.
+        cfg = replace(
+            cfg,
+            quant=replace(
+                cfg.quant, activation=QuantFormat.FP16, output=QuantFormat.FP16
+            ),
+        )
+        x = x.to(dtype)
     runner = FrostLowLatencyRunner(cfg, x.device)
     runner.check_support()
     runner.build()
@@ -102,9 +115,12 @@ def test_fp4_wide_cache_binds_fresh_storage(factory, reference, monkeypatch):
     inputs = runner.pack_inputs(
         MoEActivationPack(fresh_x, None, fresh_ids, fresh_scores), fresh_pack
     )
-    _, expected, _ = reference(
-        fresh_x, fresh_ids, fresh_scores, fresh, cfg.activation, True
-    )
+    if dtype is torch.float16:
+        _, expected, _ = typed_ref(fresh_x, fresh_ids, fresh_scores, fresh, cfg, True)
+    else:
+        _, expected, _ = reference(
+            fresh_x, fresh_ids, fresh_scores, fresh, cfg.activation, True
+        )
 
     def forbidden(*args, **kwargs):
         raise AssertionError("warm FP4 load-width metadata must bind fresh storage")
@@ -112,7 +128,8 @@ def test_fp4_wide_cache_binds_fresh_storage(factory, reference, monkeypatch):
     monkeypatch.setattr(fp4_weight_only.cute, "compile", forbidden)
     monkeypatch.setattr(fp4_weight_only, "from_dlpack", forbidden)
     for tactic in reversed(tactics):
-        _check(runner.forward(inputs, tactic), expected)
+        check = fp16_check if dtype is torch.float16 else _check
+        check(runner.forward(inputs, tactic), expected)
 
 
 @pytest.mark.parametrize(

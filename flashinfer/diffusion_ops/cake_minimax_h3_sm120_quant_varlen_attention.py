@@ -30,6 +30,7 @@ from ..jit.cake_minimax_h3_sm120_quant_varlen_attention import (
     ATTENTION_TAIL,
     KV_STATS,
     PREPROCESS_HEAD_MAJOR,
+    PREPROCESS_HEAD_MAJOR_BURST,
     QUANTIZE,
 )
 from ..jit.cake_program import CakeProgram
@@ -79,6 +80,15 @@ _OVERLAP_WIDTH_LONG = {170: 64, 188: 48}
 _OVERLAP_LONG_MIN_PADDED = 16384
 _OVERLAP_LONG_MIN_SEGMENT = 4096
 _OVERLAP_PRODUCER_WORKERS = 2
+# On a part of 188 SMs a plan that keeps the default width (neither light nor long) launches the
+# producers' burst build (``PREPROCESS_HEAD_MAJOR_BURST``, built for P = ``_OVERLAP_BURST_P``) on
+# every SM instead: the lead attention takes the same SMs, the producer CTAs beyond the first P stop
+# taking work items once they hold one past the first heads' items and leave their SMs to the lead,
+# and the first P CTAs take the rest of the work order.  Only which producer CTA runs an item
+# changes, so the output is bitwise the default producers'.  The parts of 170 SMs keep the default
+# producers at every width.
+_OVERLAP_BURST_WIDTH = {188: 32}
+_OVERLAP_BURST_P = 32
 _HCTR_WORDS_PER_HEAD = 4
 _HCTR_TAIL_WORDS = 8
 # The overlap band: 56 heads and an attention work W = sum(len^2) over the segments of 2^23 to
@@ -91,6 +101,7 @@ _PROGRAMS = (
     QUANTIZE,
     ATTENTION,
     PREPROCESS_HEAD_MAJOR,
+    PREPROCESS_HEAD_MAJOR_BURST,
     ATTENTION_LEAD,
     ATTENTION_TAIL,
 )
@@ -637,12 +648,14 @@ def minimax_h3_sm120_quant_varlen_attention_overlap_grids(
     """The overlapped form's ``(lead, producers, tail)`` grids on a device of ``num_sms`` SMs, or
     ``None`` when that SM count has no overlap width ``P``: the lead attention over
     ``max(1, min(num_sms - P, num_units))`` CTAs (one per SM), the producers over
-    ``min(2 * P, num_sms - lead)`` CTAs (one CTA of two workers on each SM the lead leaves) and the
-    tail attention over ``P`` CTAs.  The tuple is in grid order; the launch order is the producers,
-    the lead, the tail.  ``P`` is 32 on 170 and 188 SMs; with the plan's ``total_tokens`` and
-    ``work`` (the sum of the squared segment lengths) it is 64 when ``work`` is at most 1792 (170
-    SMs) or 2304 (188 SMs) times ``total_tokens``, else, with ``padded_tokens`` above 16384 and
-    ``work`` at least 4096 times ``total_tokens``, 64 on 170 SMs and 48 on 188 SMs."""
+    ``min(2 * P, num_sms - lead)`` CTAs (one CTA of two workers on each SM the lead leaves), or over
+    ``num_sms`` CTAs on 188 SMs when ``P`` is 32 (the burst producers,
+    ``PREPROCESS_HEAD_MAJOR_BURST``), and the tail attention over ``P`` CTAs.  The tuple is in grid
+    order; the launch order is the producers, the lead, the tail.  ``P`` is 32 on 170 and 188 SMs;
+    with the plan's ``total_tokens`` and ``work`` (the sum of the squared segment lengths) it is 64
+    when ``work`` is at most 1792 (170 SMs) or 2304 (188 SMs) times ``total_tokens``, else, with
+    ``padded_tokens`` above 16384 and ``work`` at least 4096 times ``total_tokens``, 64 on 170 SMs
+    and 48 on 188 SMs."""
     sms = int(num_sms)
     if sms <= 0:
         raise ValueError(f"num_sms must be positive, got {num_sms}")
@@ -665,6 +678,8 @@ def minimax_h3_sm120_quant_varlen_attention_overlap_grids(
     ):
         width = _OVERLAP_WIDTH_LONG.get(sms, width)
     lead = max(1, min(sms - width, int(num_units)))
+    if width == _OVERLAP_BURST_WIDTH.get(sms):
+        return lead, sms, width
     return lead, min(_OVERLAP_PRODUCER_WORKERS * width, sms - lead), width
 
 
@@ -673,11 +688,40 @@ def minimax_h3_sm120_quant_varlen_attention_programs(
 ) -> Tuple[CakeProgram, ...]:
     """The programs a call of ``plan`` launches, in launch order: ``(PREPROCESS_HEAD_MAJOR,
     ATTENTION_LEAD, ATTENTION_TAIL)`` for a plan of the overlap band (56 heads, an attention work
-    ``sum(len^2)`` of 2^23 to 24576^2, a part of 170 or 188 SMs), else ``(KV_STATS, QUANTIZE,
-    ATTENTION)``."""
+    ``sum(len^2)`` of 2^23 to 24576^2, a part of 170 or 188 SMs), with ``PREPROCESS_HEAD_MAJOR_BURST``
+    in place of ``PREPROCESS_HEAD_MAJOR`` when the overlap grids launch the burst producers (188 SMs,
+    width 32), else ``(KV_STATS, QUANTIZE, ATTENTION)``."""
     if plan.overlap:
-        return PREPROCESS_HEAD_MAJOR, ATTENTION_LEAD, ATTENTION_TAIL
+        grids = minimax_h3_sm120_quant_varlen_attention_overlap_grids(
+            plan.key[3],
+            num_units=plan.num_units,
+            total_tokens=plan.total_tokens,
+            work=plan.work,
+            padded_tokens=plan.padded_tokens,
+        )
+        assert grids is not None, "an overlap plan has an overlap width"
+        return _overlap_programs(_overlap_burst(grids))
     return KV_STATS, QUANTIZE, ATTENTION
+
+
+def _overlap_burst(grids: Tuple[int, int, int]) -> bool:
+    """Whether the overlap grids ``(lead, producers, tail)`` launch the burst producers: a producer
+    grid above two workers' CTAs per tail CTA, which ``overlap_grids`` gives only for a tail of the
+    burst build's P (checked here)."""
+    _lead, producers, tail = grids
+    burst = producers > _OVERLAP_PRODUCER_WORKERS * tail
+    if burst and tail != _OVERLAP_BURST_P:
+        raise AssertionError(
+            f"the burst producers are built for a tail of {_OVERLAP_BURST_P} CTAs, got {tail}"
+        )
+    return burst
+
+
+def _overlap_programs(burst: bool) -> Tuple[CakeProgram, CakeProgram, CakeProgram]:
+    """The overlapped form's producers (the burst build when ``burst``), lead and tail attention
+    programs."""
+    producers = PREPROCESS_HEAD_MAJOR_BURST if burst else PREPROCESS_HEAD_MAJOR
+    return producers, ATTENTION_LEAD, ATTENTION_TAIL
 
 
 @register_custom_op(
@@ -898,16 +942,13 @@ def _entries(target: str) -> Tuple[Any, Any, Any]:
 
 
 @functools.cache
-def _overlap_entries(target: str) -> Tuple[Any, Any, Any]:
-    """The ``run`` entries of the overlapped form's producers, lead and tail attention on ``target``."""
-    return (
-        PREPROCESS_HEAD_MAJOR.entry(target),
-        ATTENTION_LEAD.entry(target),
-        ATTENTION_TAIL.entry(target),
-    )
+def _overlap_entries(target: str, burst: bool) -> Tuple[Any, Any, Any]:
+    """The ``run`` entries of the overlapped form's producers (the burst build when ``burst``), lead
+    and tail attention on ``target``."""
+    return tuple(program.entry(target) for program in _overlap_programs(burst))
 
 
-# (device, target) pairs whose overlapped programs ran once (``_launch_overlapped``).
+# (device, target, burst) triples whose overlapped programs ran once (``_launch_overlapped``).
 _OVERLAP_LOADED: set = set()
 
 
@@ -926,7 +967,9 @@ def _launch_overlapped(
     programmatic dependent of the producers) and the tail attention (a programmatic dependent of the
     lead).  ``producer_tensors`` / ``producer_facts`` are the producers' arguments through ``hctr`` /
     after it, ``attention_tensors`` / ``attention_facts`` the attention's through ``unit_table`` / from
-    ``total_units`` through ``hctr``; ``grids`` is ``(lead, producers, tail)``.  The caller holds the
+    ``total_units`` through ``hctr``; ``grids`` is ``(lead, producers, tail)``.  Grids that launch
+    the burst producers (``_overlap_burst``: every SM of the device beside a tail of their P) select
+    ``PREPROCESS_HEAD_MAJOR_BURST``, any other grids ``PREPROCESS_HEAD_MAJOR``.  The caller holds the
     stream's host lock (``_stream_lock``), so the three launches are contiguous on the stream.
 
     The first overlapped call on a device whose raw stream ``stream`` takes part in no graph capture
@@ -936,8 +979,10 @@ def _launch_overlapped(
     waits only on CTAs of the earlier launches of its call, so a lazy module load delays a call and
     never blocks it.
     """
-    producers, lead, tail = _overlap_entries(target)
-    if (index, target) not in _OVERLAP_LOADED and not _capturing(index, stream):
+    lead_grid, producer_grid, tail_grid = grids
+    burst = _overlap_burst(grids)
+    producers, lead, tail = _overlap_entries(target, burst)
+    if (index, target, burst) not in _OVERLAP_LOADED and not _capturing(index, stream):
         # one head, no statistics tile, no 128-key block, one segment, no unit
         tokens, padded_tokens = producer_facts[1], producer_facts[2]
         producers(*producer_tensors, 0, tokens, padded_tokens, 1, 1, 0, 1, 1, 1)
@@ -946,8 +991,7 @@ def _launch_overlapped(
             attention(
                 *attention_tensors, 0, 1, 1, softmax_scale_log2, hctr, 1, 1, 1, 1, 1
             )
-        _OVERLAP_LOADED.add((index, target))
-    lead_grid, producer_grid, tail_grid = grids
+        _OVERLAP_LOADED.add((index, target, burst))
     producers(*producer_tensors, *producer_facts, producer_grid, 1, 1)
     lead(*attention_tensors, *attention_facts, lead_grid, tail_grid, lead_grid, 1, 1)
     tail(*attention_tensors, *attention_facts, lead_grid, tail_grid, tail_grid, 1, 1)

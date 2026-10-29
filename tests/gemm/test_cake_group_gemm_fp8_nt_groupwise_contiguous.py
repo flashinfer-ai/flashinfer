@@ -781,7 +781,9 @@ def test_validated_layout_keeps_the_shape_route_outside_the_program_contract():
     padded = prepare_group_gemm_fp8_nt_groupwise_contiguous(
         a, b, a_scale, b_scale, m_indices, validate_indices=True, fill_padding=True
     )
-    assert padded.route == route_for_shape(65, 128, 512)
+    assert (padded.route, padded.grid) == launch_plan(
+        65, 128, 512, sm_count=sm_count, scalar_output=False
+    )
     storage = torch.empty(65 * 128 + 8, dtype=torch.bfloat16, device=device)
     scalar = prepare_group_gemm_fp8_nt_groupwise_contiguous(
         a,
@@ -2264,6 +2266,54 @@ def test_kg1_n64_route_when_its_tiles_fit_in_one_wave():
         ((127, 128, 256, 148), (DEEPK_C2_KG1_N64_ROUTE, (2, 1, 1))),
     ):
         assert launch_plan(m, n, k, sm_count=sm_count, scalar_output=False) == plan
+
+
+def test_ab6_one_tile_k512_launch_takes_the_n64_program():
+    """An AB6 launch of more than 32 rows that is a single 128 x 128 tile at K = 512
+    runs the KG1 program with 128 x 64 tiles, one CTA per tile; at most 32 rows,
+    another K, or more than one 128 x 128 tile keep their programs."""
+    for sm_count in (148, 152):
+        for (m, n, k), plan in (
+            ((33, 128, 512), (DEEPK_C2_KG1_N64_ROUTE, (2, 1, 1))),
+            ((64, 128, 512), (DEEPK_C2_KG1_N64_ROUTE, (2, 1, 1))),
+            ((127, 128, 512), (DEEPK_C2_KG1_N64_ROUTE, (2, 1, 1))),
+            ((128, 128, 512), (DEEPK_C2_KG1_N64_ROUTE, (2, 1, 1))),
+            ((32, 128, 512), (DEEPK_C2_AB6_SCALE1_DIRECT_STORE_ROUTE, (1, 1, 1))),
+            ((128, 128, 1024), (DEEPK_C2_AB6_SCALE1_ROUTE, (1, 1, 1))),
+            ((128, 256, 512), (DEEPK_C2_AB6_SCALE1_ROUTE, (2, 1, 1))),
+            ((129, 128, 512), (DEEPK_C2_ROUTE, (2, 1, 1))),
+        ):
+            assert route_for_shape(m, n, k) != DEEPK_C2_KG1_N64_ROUTE
+            assert launch_plan(m, n, k, sm_count=sm_count, scalar_output=False) == plan
+    assert launch_plan(128, 128, 512, sm_count=148, scalar_output=True) == (
+        DEEPK_C2_SCALAR_OUTPUT_ROUTE,
+        (1, 1, 1),
+    )
+
+
+@pytest.mark.parametrize("m", [33, 128])
+def test_ab6_one_tile_n64_program_writes_the_ab6_bytes(m):
+    """The 128 x 64-tile program of a one-tile K=512 launch writes the bytes of the
+    AB6 program: an N=128 launch equals the first 128 columns of the N=256 launch
+    of the same rows, which keeps the AB6 program."""
+    device = torch.device("cuda")
+    a, b, a_scale, b_scale, m_indices = _make_inputs(
+        [m], 256, 512, seed=4900 + m, device=device, arbitrary_scales=True
+    )
+    narrow_b, narrow_b_scale = b[:, :128].contiguous(), b_scale[:, :1].contiguous()
+    wide = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+        a, b, a_scale, b_scale, m_indices
+    )
+    narrow = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+        a, narrow_b, a_scale, narrow_b_scale, m_indices
+    )
+    assert wide.route == DEEPK_C2_AB6_SCALE1_ROUTE
+    assert (narrow.route, narrow.grid) == (DEEPK_C2_KG1_N64_ROUTE, (2, 1, 1))
+    expect = wide.launch()
+    out = narrow.launch()
+    torch.cuda.synchronize()
+    assert torch.equal(out, expect[:, :128])
+    _assert_close(out, _reference(a, narrow_b, a_scale, narrow_b_scale, m_indices))
 
 
 def test_rejects_invalid_inputs():
