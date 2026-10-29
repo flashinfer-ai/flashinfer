@@ -1231,6 +1231,7 @@ MODULES: dict[str, dict[str, Any]] = {
     },
     "fp8_e4m3_min_blocks10_persistent1": {
         "arches": [
+            "sm_100a",
             "sm_103a",
         ],
         "arg_plan": [
@@ -1287,8 +1288,8 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "kernel": "cake_fused_qk_rope_fp8_append_bc6c52ab41114c98fa85",
         "kernel_symbol": "kernel_cake_fused_qk_rope_fp8_append_bc6c52ab41114c98fa85",
-        # B300 prefill of one to sixteen requests beyond four waves: ten
-        # resident CTAs per SM stride over the request and row items.
+        # B300 and B200 prefill of one to sixteen requests beyond four waves:
+        # ten resident CTAs per SM stride over the request and row items.
         "launch": {
             "block": (96, 1, 1),
             "cluster": (1, 1, 1),
@@ -1421,13 +1422,15 @@ STAGE_POLICY: dict[str, Any] = {
         "shared table. b200 first: is_prefill and Hkv >= fold_min_kv_heads and "
         "num_requests >= swap_min_requests and waves <= 1 and order_ok -> "
         "grid_order=2; u2z_class and not prefetch_ok -> grid_order=3, "
-        "zero_store_width=256; then the shared table. shared (b200 / b300): "
+        "zero_store_width=256; is_prefill and 1 <= num_requests <= "
+        "persistent_max_requests and waves > persistent_min_waves -> "
+        "min_blocks=10, persistent; then the shared table. shared (b200 / b300): "
         "decode and waves > fold_waves[1] -> s3 from scan_rounds3_min_requests "
         "requests else the default build; prefill and waves > 1 -> min_blocks=10; "
         "prefetch_ok and (decode or Hkv == 1) -> early_rt2, page_prefetch, "
         "clear_tie; else the default build"
     ),
-    "version": "round3-v12-2026-10-28",
+    "version": "round3-v13-2026-10-29",
 }
 # Logical argument names the public API binds; every module record maps its
 # kernel parameter names onto this vocabulary (``record["logical"]``).
@@ -1652,6 +1655,14 @@ def policy_knobs(
             return {"grid_order": 2}
         if u2z_class and not prefetch_ok:
             return {"grid_order": 3, "zero_store_width": 256}
+        if (
+            prefill
+            and requests <= int(constants["persistent_max_requests"])
+            and waves > constants["persistent_min_waves"]
+        ):
+            # Prefill of a few requests beyond four waves: the persistent
+            # build (round three).
+            return {"min_blocks": 10, "persistent": True}
     if decode and waves > high:
         if requests >= int(constants["scan_rounds3_min_requests"]):
             return {"scan_rounds": 3, "clear_tie": True}
