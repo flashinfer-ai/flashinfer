@@ -52,9 +52,9 @@
     }
   },
   "generator": {
-    "cake_revision": "79f43d5a4157f29f36987c483fad25886407b594",
+    "cake_revision": "bc064b9b72ee7e5947d473c02552e55e6a28ee00",
     "cuda": "13.4.92",
-    "rendered_at": "2026-10-28T03:52:51Z"
+    "rendered_at": "2026-10-29T02:50:51Z"
   },
   "libraries": [
     {
@@ -1071,7 +1071,7 @@
     },
     {
       "arch": "sm_100a",
-      "closure_sha256": "c66320ce4c0f3aa0bfae65a0a53de1f223953fb93701818081db78d290edac15",
+      "closure_sha256": "004c21c191fd514ba6435fcde6b29b3cd152593c8ab7c7b4f63fbdd7ce93617c",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
       "min_cuda": "12.8",
@@ -1085,7 +1085,7 @@
       "path": "aot/cake_ulysses_a2a_815d73798b08c5f82b43_sm_100a.so",
       "sha256": {
         "csrc/cake_ulysses_a2a_815d73798b08c5f82b43_binding.cu": "4f5a11b435d595f377d2c9865376c38bd75bd822a9bc0a068e2785b7a9735082",
-        "csrc/cake_ulysses_a2a_815d73798b08c5f82b43_kernel.cu": "63b454cbd9b23bf45d498a9c9e5088781f86b72eaa703758c662698317fd32bd"
+        "csrc/cake_ulysses_a2a_815d73798b08c5f82b43_kernel.cu": "cb5b525ccdace5e901c603c64d9cea0a3b00b7463edd4a9411760033e70e1d93"
       },
       "sources": [
         "csrc/cake_ulysses_a2a_815d73798b08c5f82b43_kernel.cu",
@@ -1094,7 +1094,7 @@
     },
     {
       "arch": "sm_103a",
-      "closure_sha256": "180fbd3e5c83d8e0723d5eee209babcb2b96e940287b8f96453bb6f77a927cc2",
+      "closure_sha256": "9bf4ac642b71b8c654a646fc72581d2ef0450e3cb9f7627cca77f27bc88b7c7c",
       "entry": "run",
       "gencode": "-gencode=arch=compute_103a,code=sm_103a",
       "min_cuda": "12.9",
@@ -1108,7 +1108,7 @@
       "path": "aot/cake_ulysses_a2a_815d73798b08c5f82b43_sm_103a.so",
       "sha256": {
         "csrc/cake_ulysses_a2a_815d73798b08c5f82b43_binding.cu": "4f5a11b435d595f377d2c9865376c38bd75bd822a9bc0a068e2785b7a9735082",
-        "csrc/cake_ulysses_a2a_815d73798b08c5f82b43_kernel.cu": "63b454cbd9b23bf45d498a9c9e5088781f86b72eaa703758c662698317fd32bd"
+        "csrc/cake_ulysses_a2a_815d73798b08c5f82b43_kernel.cu": "cb5b525ccdace5e901c603c64d9cea0a3b00b7463edd4a9411760033e70e1d93"
       },
       "sources": [
         "csrc/cake_ulysses_a2a_815d73798b08c5f82b43_kernel.cu",
