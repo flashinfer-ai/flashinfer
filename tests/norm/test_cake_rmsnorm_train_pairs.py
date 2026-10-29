@@ -40,7 +40,7 @@ SHIPPED_SLABS = (16, 32, 64)
 # Row counts of the contract: the small counts, the window edges of every route and the training shapes.
 ROWS = (
     1, 2, 7, 63, 64, 65, 127, 128, 129, 255, 257, 1023, 1024, 1025, 3072, 3073, 4096, 4097,
-    12288, 12289, 14928, 16231, 16263, 16384, 16385, 32768, 32769, 65536,
+    12288, 12289, 14928, 15566, 15567, 16231, 16263, 16384, 16385, 32768, 32769, 65536,
 )  # fmt: skip
 
 
