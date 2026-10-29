@@ -171,6 +171,33 @@ M64_PAIR_SHARE_MIN_SEQ_LEN_GB300 = ((32, 1024), (64, 2048), (72, 4096))
 # keeps it at one CTA per SM (the cluster capacity probe launches this shape).
 M64_CTA_THREADS = 1024
 M64_CTA_SMEM_BYTES = 227328
+# The owner/helper build of an M64 value-split module (see
+# _m64_owner_helper_factory): H helper CTAs per task prepare each 32-token
+# chunk once and hand it to the task's two value-half owner CTAs through a
+# global ring, on a grid (tasks, 2 + H) whose CTAs are all resident at once
+# (one per SM, launched cooperatively).  Each helper has M64_OWNER_HELPER_SLOTS
+# ring slots of M64_OWNER_HELPER_SLOT_ELEMENTS BF16 elements per task; the
+# ready and consumed words hold M64_OWNER_HELPER_WORD_STRIDE helpers per task
+# whatever H is.
+M64_OWNER_HELPER_MAX_HELPERS = 3
+M64_OWNER_HELPER_DEFAULT_HELPERS = 2
+M64_OWNER_HELPER_SLOTS = 5
+M64_OWNER_HELPER_SLOT_ELEMENTS = 16384
+M64_OWNER_HELPER_WORD_STRIDE = 3
+# Shortest sequence of an M64 FP32-state value-split launch that takes the
+# owner/helper build, by task count: the first (most tasks, shortest sequence)
+# row whose task count holds the launch's tasks decides, and every sequence of
+# the launch must be at least the row's length.  A row may carry a third
+# column, its helpers per task (else M64_OWNER_HELPER_DEFAULT_HELPERS); the
+# launch takes at most as many as the device holds and needs two.  A launch
+# beyond the last row keeps its pair-share or routed program, and so does
+# every launch while a part's table is empty.  Per part:
+# M64_OWNER_HELPER_MIN_SEQ_LEN_GB300 on a 152-SM sm_103a.  Both rows come from
+# paired timings of 8 to 36 tasks at 1024 to 16384 tokens per sequence on
+# B200 and GB300 with two helpers per task (three helpers never beat two in
+# the measured sweep); 36 tasks is the largest count measured.
+M64_OWNER_HELPER_MIN_SEQ_LEN: tuple[tuple[int, ...], ...] = ((36, 1024),)
+M64_OWNER_HELPER_MIN_SEQ_LEN_GB300: tuple[tuple[int, ...], ...] = ((36, 1024),)
 # Architectures whose one-wave BF16 grid sweep selected the M64 value split over
 # every direct M128 tile (see _should_use_bf16_one_wave_dvsplit).
 BF16_ONE_WAVE_DVSPLIT_ARCHES = ("sm_100a", "sm_103a")
@@ -1110,6 +1137,195 @@ def _m64_pair_share_factory(name, *args, **kwargs):
     if program is None:
         return _factory(name, *args, **kwargs)
     return _kda_registry.PreparedKernel(program, arch)
+
+
+_M64_COOPERATIVE_CAPACITY: dict = {}
+_M64_COOPERATIVE_PROBE_WARNED = False
+
+
+def _m64_cooperative_capacity(device: torch.device) -> int:
+    """How many CTAs of the M64 value split's shape the device holds at once.
+
+    ``cuOccupancyMaxActiveBlocksPerMultiprocessor`` for a probe kernel with
+    the M64 CTA's threads and dynamic shared memory (one CTA per SM) times the
+    SM count: the device's, or the current context's where the driver reports
+    fewer.  Only an answer is cached (per device): when the driver cannot
+    answer, the call returns 0 (the runtime keeps the pair-share or routed
+    program), logs one warning per process and probes again on the next call.
+    """
+    capacity = _M64_COOPERATIVE_CAPACITY.get(device)
+    if capacity is None:
+        capacity = _probe_m64_cooperative_capacity(device)
+        if capacity is None:
+            return 0
+        _M64_COOPERATIVE_CAPACITY[device] = capacity
+    return capacity
+
+
+def _probe_m64_cooperative_capacity(device: torch.device) -> Optional[int]:
+    """The driver's answer for ``_m64_cooperative_capacity``; ``None`` on failure."""
+    global _M64_COOPERATIVE_PROBE_WARNED
+    import torch
+
+    try:
+        from cuda.bindings import driver
+
+        def check(result):
+            err, *values = result if isinstance(result, tuple) else (result,)
+            if err != driver.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f"CUDA driver error {err}")
+            return values[0] if values else None
+
+        with torch.cuda.device(device):
+            torch.empty(0, device=device)  # the primary context is current
+            sm_count = int(
+                check(
+                    driver.cuDeviceGetAttribute(
+                        driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                        check(driver.cuDeviceGet(torch.cuda.current_device())),
+                    )
+                )
+            )
+            try:
+                context = check(driver.cuCtxGetCurrent())
+                resource = check(
+                    driver.cuCtxGetDevResource(
+                        context, driver.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM
+                    )
+                )
+                sm_count = min(sm_count, int(resource.sm.smCount))
+            except Exception:
+                pass  # a driver without context resources: the device's count
+            module = check(driver.cuModuleLoadData(_PAIR_PROBE_PTX))
+            try:
+                function = check(
+                    driver.cuModuleGetFunction(module, b"cake_kda_pair_probe")
+                )
+                check(
+                    driver.cuFuncSetAttribute(
+                        function,
+                        driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        M64_CTA_SMEM_BYTES,
+                    )
+                )
+                per_sm = check(
+                    driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                        function, M64_CTA_THREADS, M64_CTA_SMEM_BYTES
+                    )
+                )
+                return int(per_sm) * sm_count
+            finally:
+                driver.cuModuleUnload(module)
+    except Exception as error:
+        if not _M64_COOPERATIVE_PROBE_WARNED:
+            _M64_COOPERATIVE_PROBE_WARNED = True
+            from flashinfer.jit.core import logger
+
+            logger.warning(
+                "KDA prefill: the M64 cooperative capacity probe failed (%s: %s); "
+                "M64 launches keep the pair-share or routed program until a probe "
+                "succeeds",
+                type(error).__name__,
+                error,
+            )
+        return None
+
+
+def _m64_owner_helper_count(
+    *,
+    gpu_arch: str,
+    sm_count: int,
+    total_tasks: int,
+    min_seq_len: int,
+    device: torch.device,
+) -> int:
+    """Helper CTAs per task of the M64 owner/helper build, or 0 to keep the
+    pair-share or routed program.
+
+    The part's ``M64_OWNER_HELPER_MIN_SEQ_LEN`` row (the first whose task
+    count holds ``total_tasks``) must hold ``min_seq_len``; its helper count
+    (else ``M64_OWNER_HELPER_DEFAULT_HELPERS``) is cut to what the device holds
+    at once beside two owners per task (``_m64_cooperative_capacity``, probed
+    only for a launch a row takes) and must stay at least two.
+    """
+    if gpu_arch not in ("sm_100a", "sm_103a") or total_tasks < 1:
+        return 0
+    rows = (
+        M64_OWNER_HELPER_MIN_SEQ_LEN_GB300
+        if gpu_arch == "sm_103a" and sm_count == 152
+        else M64_OWNER_HELPER_MIN_SEQ_LEN
+    )
+    row = next((row for row in rows if total_tasks <= row[0]), None)
+    if row is None or min_seq_len < row[1]:
+        return 0
+    wanted = row[2] if len(row) > 2 else M64_OWNER_HELPER_DEFAULT_HELPERS
+    helpers = min(
+        wanted,
+        M64_OWNER_HELPER_MAX_HELPERS,
+        _m64_cooperative_capacity(device) // total_tasks - 2,
+    )
+    return helpers if helpers >= 2 else 0
+
+
+def _m64_owner_helper_program(name, *args, **kwargs):
+    """The ``_RENDERED_M64_OWNER_HELPER_ROUTES`` build of the factory row's
+    module, or ``None``: the module needs a pair-share build too (the
+    owner/helper build replaces the pair-share or routed program of long
+    launches only)."""
+    arch = detect_gpu_arch()
+    rows = _kda_registry.FACTORIES.get(arch, {}).get(name, {})
+    module = rows.get(_kda_registry._key(args, kwargs))
+    if module not in _kda_registry._RENDERED_PAIR_SHARE_ROUTES.get(arch, {}):
+        return None
+    return _kda_registry._RENDERED_M64_OWNER_HELPER_ROUTES.get(arch, {}).get(module)
+
+
+# Long M64 FP32-state value-split launches the owner/helper rule takes run the
+# loader's ``_RENDERED_M64_OWNER_HELPER_ROUTES`` build of the module (the same
+# bits as the pair-share and routed programs); the returned kernel's
+# ``m64_owner_helper`` says whether the call got it.
+def _m64_owner_helper_factory(name, *args, **kwargs):
+    """The owner/helper build of the factory row's M64 module, else ``_factory``."""
+    program = _m64_owner_helper_program(name, *args, **kwargs)
+    if program is None:
+        return _factory(name, *args, **kwargs)
+    kernel = _kda_registry.PreparedKernel(program, detect_gpu_arch())
+    kernel.m64_owner_helper = True
+    return kernel
+
+
+# What the rendered bindings report when the driver refuses a cooperative grid
+# it cannot hold at once (the runtime's error string, or the driver's name).
+_COOPERATIVE_REFUSALS = (
+    "too many blocks in cooperative launch",
+    "cudaErrorCooperativeLaunchTooLarge",
+    "CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE",
+)
+_M64_OWNER_HELPER_REFUSAL_WARNED = False
+
+
+def _cooperative_launch_refused(error: BaseException) -> bool:
+    """``error`` is a binding's report of a refused cooperative launch."""
+    message = str(error)
+    return any(text in message for text in _COOPERATIVE_REFUSALS)
+
+
+def _clear_cuda_launch_error() -> None:
+    """Reset the CUDA runtime's last error after a refused launch.
+
+    The runtime records the refusal for the next ``cudaGetLastError`` of this
+    thread, which torch's launch checks read; every CUDA runtime library the
+    process loaded is reset.
+    """
+    import ctypes
+
+    try:
+        with open("/proc/self/maps") as maps:
+            paths = {line.split()[-1] for line in maps if "/libcudart.so" in line}
+        for path in sorted(paths):
+            ctypes.CDLL(path).cudaGetLastError()
+    except OSError:
+        pass
 
 
 def _work_bin_turnover_program(
@@ -2164,6 +2380,9 @@ class FlashKDABlackwellBF16FusedLaunch:
     _checkpoint_accumulate = False
     _affine_main_indexed_initial = False
     _active_beta_f32 = False
+    #: Helper CTAs per task of the M64 owner/helper build the plan launches
+    #: (0: another program).
+    m64_owner_helpers = 0
 
     def _build_body(
         self,
@@ -3316,6 +3535,7 @@ class FlashKDABlackwellBF16FusedLaunch:
             )
         owner_helpers = 0
         owner_helper_pool = 0
+        m64_owner_helpers = 0
         if use_bt16_prepare_chain:
             self.prepare_module = self._build_body(
                 partial(_factory, "compiled_tf32_bt16_prepare"),
@@ -3557,13 +3777,37 @@ class FlashKDABlackwellBF16FusedLaunch:
                 and max_seq_len >= pair_share_min_seq_len
                 and total_tasks <= _m64_pair_cluster_capacity(q.device)
             )
-            self.module = self._build_body(
-                partial(
-                    _m64_pair_share_factory if pair_share else _factory,
-                    "compiled_bf16_fused_m64",
-                ),
+            m64_body = dict(
                 state_dtype_is_fp32=self._state_dtype_is_fp32,
                 active_beta_f32=self._active_beta_f32,
+            )
+            # The owner/helper build takes the FP32-state launches its rule
+            # takes; its ring and words ride in the BF16 final_state and
+            # seq_order slots the FP32-state body never reads.
+            if (
+                self._state_dtype_is_fp32
+                and _m64_owner_helper_program("compiled_bf16_fused_m64", **m64_body)
+                is not None
+            ):
+                m64_owner_helpers = _m64_owner_helper_count(
+                    gpu_arch=gpu_arch,
+                    sm_count=sm_count,
+                    total_tasks=total_tasks,
+                    min_seq_len=min(
+                        end - start
+                        for start, end in zip(offsets, offsets[1:], strict=False)
+                    ),
+                    device=q.device,
+                )
+            m64_factory = partial(
+                _m64_pair_share_factory if pair_share else _factory,
+                "compiled_bf16_fused_m64",
+            )
+            self.module = self._build_body(
+                partial(_m64_owner_helper_factory, "compiled_bf16_fused_m64")
+                if m64_owner_helpers
+                else m64_factory,
+                **m64_body,
             )
             self.schedule = (
                 "fused_active_beta_checkpoint_dvsplit_m64"
@@ -3572,6 +3816,18 @@ class FlashKDABlackwellBF16FusedLaunch:
                 if self._state_dtype_is_fp32
                 else "fused_m64_independent_dvsplit"
             )
+            if m64_owner_helpers:
+                # The program a refused cooperative launch takes instead
+                # (_fall_back_from_m64_owner_helper), prepared with the plan.
+                m64_fallback_module = self._build_body(m64_factory, **m64_body)
+                m64_fallback_schedule = self.schedule + (
+                    "_pair_share"
+                    if m64_fallback_module.name
+                    in _kda_registry._RENDERED_PAIR_SHARE_ROUTES.get(
+                        gpu_arch, {}
+                    ).values()
+                    else ""
+                )
             if getattr(self.module, "name", None) in (
                 _kda_registry._RENDERED_PAIR_SHARE_ROUTES.get(gpu_arch, {}).values()
             ):
@@ -3729,6 +3985,13 @@ class FlashKDABlackwellBF16FusedLaunch:
         elif self.owner_helpers:
             self.grid = (total_tasks * (1 + self.owner_helpers), 1, 1)
             self.schedule += f"_owner{self.owner_helpers}helper"
+        self.m64_owner_helpers = (
+            m64_owner_helpers if getattr(self.module, "m64_owner_helper", False) else 0
+        )
+        if self.m64_owner_helpers:
+            m64_fallback_grid = self.grid
+            self.grid = (total_tasks, 2 + self.m64_owner_helpers, 1)
+            self.schedule += f"_owner{self.m64_owner_helpers}helper"
         self.prepare_grid = (bt16_prepare_total_ctas, 1, 1)
         qkv_carriers = self._qkv_carrier_names.get(id(self.module), ())
         self.args = {
@@ -3865,6 +4128,33 @@ class FlashKDABlackwellBF16FusedLaunch:
                 ),
                 zero_workspace=owner_helper_words[:slots],
                 state_checkpoint_needed=owner_helper_words[slots:],
+            )
+        if self.m64_owner_helpers:
+            # The packet ring (final_state) and its ready and consumed words
+            # (seq_order, ready words first). The program leaves every word
+            # zero when it exits, so one zeroed allocation serves every launch
+            # of the plan.
+            m64_owner_helper_words = torch.zeros(
+                2 * M64_OWNER_HELPER_WORD_STRIDE * M64_OWNER_HELPER_SLOTS * total_tasks,
+                dtype=torch.int32,
+                device=q.device,
+            )
+            m64_owner_helper_ring = torch.empty(
+                total_tasks
+                * self.m64_owner_helpers
+                * M64_OWNER_HELPER_SLOTS
+                * M64_OWNER_HELPER_SLOT_ELEMENTS,
+                dtype=torch.bfloat16,
+                device=q.device,
+            )
+            self._m64_owner_helper_fallback = (
+                m64_fallback_module,
+                m64_fallback_grid,
+                m64_fallback_schedule,
+                {name: self.args[name] for name in ("final_state", "seq_order")},
+            )
+            self.args.update(
+                final_state=m64_owner_helper_ring, seq_order=m64_owner_helper_words
             )
         self.prepare_args: dict[str, Any] = {}
         if use_bt16_prepare_chain:
@@ -4048,8 +4338,59 @@ class FlashKDABlackwellBF16FusedLaunch:
                     self.prepare_module, self.prepare_grid, self.prepare_args
                 )
             )
-        records.append(_prepared_kernel_record(self.module, self.grid, self.args))
+        records.append(
+            self._m64_owner_helper_record()
+            if self.m64_owner_helpers
+            else _prepared_kernel_record(self.module, self.grid, self.args)
+        )
         return records
+
+    def _m64_owner_helper_record(self) -> tuple:
+        """The launch record of the M64 owner/helper build.
+
+        The driver can refuse the cooperative grid although the capacity probe
+        passed (an MPS client's SM limit, a green context).  The first refused
+        launch switches the plan for good to the program it would otherwise
+        have taken (_fall_back_from_m64_owner_helper) and launches that instead;
+        a refused launch leaves the words untouched.
+        """
+        call, arguments = _prepared_kernel_record(self.module, self.grid, self.args)
+
+        def launch(*packed):
+            if self.m64_owner_helpers:
+                try:
+                    call(*packed)
+                    return
+                except RuntimeError as error:
+                    if not _cooperative_launch_refused(error):
+                        raise
+                self._fall_back_from_m64_owner_helper()
+            _run_launch_records(
+                (_prepared_kernel_record(self.module, self.grid, self.args),)
+            )
+
+        return launch, arguments
+
+    def _fall_back_from_m64_owner_helper(self) -> None:
+        """Switch the plan to the pair-share or routed program it would otherwise take."""
+        global _M64_OWNER_HELPER_REFUSAL_WARNED
+        module, grid, schedule, bindings = self._m64_owner_helper_fallback
+        _clear_cuda_launch_error()
+        self.args.update(bindings)
+        self.module, self.grid, self.schedule = module, grid, schedule
+        self.ir = module.schedule
+        self.m64_owner_helpers = 0
+        module.prepare(grid=grid, **self.args)
+        self.__dict__.pop("_launch_records", None)
+        if not _M64_OWNER_HELPER_REFUSAL_WARNED:
+            _M64_OWNER_HELPER_REFUSAL_WARNED = True
+            from flashinfer.jit.core import logger
+
+            logger.warning(
+                "KDA prefill: the device refused a cooperative M64 owner/helper "
+                "launch; the plan runs %s instead",
+                schedule,
+            )
 
     def _launch_in_stream(self) -> None:
         """Launch inside an already entered FFI/Torch stream context."""
