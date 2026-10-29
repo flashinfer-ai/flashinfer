@@ -87,10 +87,17 @@ def stage_bytes(block_tokens: int) -> int:
     return (EXPERTS_PER_CTA + block_tokens) * BLOCK_K * 2
 
 
-def max_stages(block_tokens: int) -> int:
+def exchange_bytes(num_experts: int) -> int:
+    """Shared memory of a cooperative gate's exchange: a sorted key, an expert id, a value
+    and a physical expert (4 B each) per aligned expert."""
+    return 4 * 4 * align(num_experts, EXPERTS_PER_CTA)
+
+
+def max_stages(block_tokens: int, reserved: int = 0) -> int:
     return min(
         MAX_STAGES,
-        (SMEM_CAPACITY_BYTES - SMEM_RESERVED_BYTES) // stage_bytes(block_tokens),
+        (SMEM_CAPACITY_BYTES - SMEM_RESERVED_BYTES - reserved)
+        // stage_bytes(block_tokens),
     )
 
 
@@ -103,6 +110,10 @@ class MegaGateConfig:
     num_expert_groups: int
     num_stages: int
     num_gate_warps: int = 4
+    cooperative_gate: bool = False
+    """At most one token per CTA and block (block tokens <= L): every gate warp ranks it
+    (the split-K loads and transcendentals of a wave per warp), instead of one warp per
+    token."""
 
     @property
     def num_logical_ctas(self) -> int:
@@ -193,12 +204,24 @@ def select_config(
         if best is None or (cost, split) < best[0]:
             best = ((cost, split), split)
     _, split = best
+    return make_config(block_tokens, split, num_experts)
+
+
+def make_config(
+    block_tokens: int, num_split_k: int, num_experts: int
+) -> MegaGateConfig:
+    """The schedule of a block size and split-K: gate warps, gate mode and stage count."""
+    num_groups = align(num_experts, EXPERTS_PER_CTA) // EXPERTS_PER_CTA
+    cooperative = block_tokens <= num_groups * num_split_k
     # The pipeline runs across the token blocks of a worker group, so the stage
     # count is bounded by shared memory only.
     return MegaGateConfig(
         block_tokens=block_tokens,
-        num_split_k=split,
+        num_split_k=num_split_k,
         num_expert_groups=num_groups,
-        num_stages=max_stages(block_tokens),
-        num_gate_warps=select_gate_warps(block_tokens, num_groups * split),
+        num_stages=max_stages(
+            block_tokens, exchange_bytes(num_experts) if cooperative else 0
+        ),
+        num_gate_warps=select_gate_warps(block_tokens, num_groups * num_split_k),
+        cooperative_gate=cooperative,
     )

@@ -89,7 +89,8 @@ class KernelSpec:
             )
         )
         return (
-            f"bt{c.block_tokens}_s{c.num_split_k}_st{c.num_stages}_g{c.num_gate_warps}_k{self.hidden}"
+            f"bt{c.block_tokens}_s{c.num_split_k}_st{c.num_stages}_g{c.num_gate_warps}"
+            f"{'c' if c.cooperative_gate else ''}_k{self.hidden}"
             f"_e{self.num_experts}_top{self.num_topk}_sh{self.num_shared}_f{flags}"
         )
 

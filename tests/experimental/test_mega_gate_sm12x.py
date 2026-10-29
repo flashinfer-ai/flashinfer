@@ -88,6 +88,9 @@ def test_schedule_invariants(num_sms, deterministic):
                     config.num_stages * heuristics.stage_bytes(config.block_tokens)
                     + heuristics.SMEM_RESERVED_BYTES
                 )
+                if config.cooperative_gate:
+                    assert config.block_tokens <= config.num_logical_ctas
+                    smem += heuristics.exchange_bytes(num_experts)
                 assert smem <= heuristics.SMEM_CAPACITY_BYTES
                 assert (
                     config.num_expert_groups * heuristics.EXPERTS_PER_CTA >= num_experts
@@ -104,17 +107,24 @@ def test_schedule_invariants(num_sms, deterministic):
 # --------------------------------------------------------------- reference
 
 
-def _physical_map(num_logical, shared_offset):
-    """Two replicas per logical expert; replica ids are distinct from the originals."""
+def _physical_map(num_logical, shared_offset, replicas=2):
+    """``replicas`` distinct replica ids per logical expert. Two replicas: every third
+    expert uses one; more: the counts cycle through 1..replicas."""
     mapping = torch.stack(
-        (
-            torch.arange(num_logical, dtype=torch.int32, device="cuda"),
-            torch.arange(num_logical, dtype=torch.int32, device="cuda") + shared_offset,
-        ),
+        [
+            torch.arange(num_logical, dtype=torch.int32, device="cuda")
+            + replica * shared_offset
+            for replica in range(replicas)
+        ],
         1,
     ).contiguous()
-    counts = torch.full((num_logical,), 2, dtype=torch.int32, device="cuda")
-    counts[::3] = 1  # some experts have a single replica
+    if replicas == 2:
+        counts = torch.full((num_logical,), 2, dtype=torch.int32, device="cuda")
+        counts[::3] = 1  # some experts have a single replica
+    else:
+        counts = (
+            torch.arange(num_logical, dtype=torch.int32, device="cuda") % replicas + 1
+        )
     return mapping, counts
 
 
@@ -238,6 +248,7 @@ def _run_case(
     with_mask=False,
     with_image_bias=False,
     ep_rank=3,
+    replicas=2,
     seed=0,
 ):
     x, weight, bias = _make_inputs(num_tokens, hidden, num_experts, seed=seed)
@@ -245,7 +256,7 @@ def _run_case(
         bias = None
     num_logical = num_experts + num_shared
     mapping, counts = (
-        _physical_map(num_logical, num_logical) if physical else (None, None)
+        _physical_map(num_logical, num_logical, replicas) if physical else (None, None)
     )
     mask = None
     if with_mask:
@@ -293,6 +304,17 @@ def _run_case(
 
 
 # -------------------------------------------------------------------- GPU
+
+
+@pytest.mark.parametrize("num_tokens", [1, 37, 1000])
+@pytest.mark.parametrize("ep_rank", [11, 2**31 - 7])
+def test_replica_counts(num_tokens, ep_rank):
+    """Replica counts 1..7, not only powers of two, and token hashes near 2^32: the
+    reciprocal multiply of the replica selection and its correction step."""
+    _skip_unless_sm120()
+    _run_case(
+        num_tokens, 5120, 384, 6, num_shared=1, ep_rank=ep_rank, replicas=7, seed=2
+    )
 
 
 @pytest.mark.parametrize("num_tokens", TOKEN_COUNTS)

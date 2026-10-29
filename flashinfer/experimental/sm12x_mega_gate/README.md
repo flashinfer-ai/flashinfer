@@ -33,7 +33,10 @@ producer warp through a multi-stage mbarrier pipeline and `ldmatrix`
   score barrier, then straight on to the next block), 1 TMA warp and 4 gate
   warps (8 when a CTA ranks more than 4 tokens of a block). Once all L CTAs of a
   block have arrived, every CTA ranks a share of the block's tokens (DeepGEMM's
-  order), one warp per token, overlapping the next block's GEMM.
+  order), one warp per token, overlapping the next block's GEMM. When a CTA ranks
+  at most one token of a block (the decode schedules), every gate warp ranks one
+  128-expert wave of it and gate warp 0 merges the waves (cooperative gate): a
+  lane's split-K loads and transcendentals are spread over the CTA's gate warps.
 - **Score barrier.** One 128 B line per token block in `score_barriers`: an
   arrival counter (`red.release.gpu` by the MMA warps, `ld.acquire.gpu` polls by
   one gate lane) and a waiter counter. Every CTA that waited counts itself after
@@ -46,7 +49,11 @@ producer warp through a multi-stage mbarrier pipeline and `ldmatrix`
   wave and every round offers the best unconsumed candidate of each wave; the
   warp keeps the largest rank (ties: the smaller expert). SM120 has no float
   `redux.sync`, so a round is two integer reduxes on order-preserving keys. The
-  biases and replica counts of a lane's experts are loaded once per CTA.
+  biases and replica counts of a lane's experts are loaded once per CTA, and a
+  token's replica of every lane expert is looked up before its top-k (a modulo by
+  a precomputed reciprocal), so no dependent lookup follows the selection. The
+  square roots use `sqrt.rn`'s fast path without its slow-path branch (bitwise
+  equal for every input), so a lane's square roots interleave.
 - **Proxy fence.** The MMA warps read the pipeline stages with `ldmatrix`
   (generic proxy) and the TMA refills them (async proxy): the producer issues
   `fence.proxy.async.shared::cta` after each empty-barrier wait. Without it the

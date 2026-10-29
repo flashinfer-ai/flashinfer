@@ -25,7 +25,10 @@ Warp roles (DeepGEMM's TMA / MMA / gate split):
 - warps 5.., gate (4 or 8, per schedule): once all L logical CTAs of a block have arrived, every logical
   CTA ranks a share of its tokens (DeepGEMM's order: token ``gate_warp * L +
   rank``, stride ``gate_warps * L``), one warp per token, overlapping the MMA of
-  the next block.
+  the next block. With at most one token per CTA and block (the decode schedules)
+  the gate is cooperative instead: every gate warp ranks one 128-expert wave of the
+  CTA's token (its split-K loads and transcendentals) and posts the sorted wave to
+  shared memory, and gate warp 0 runs the top-k rounds over all waves.
 
 Score barrier: per token block, an int32 arrival counter released with
 ``red.release.gpu`` by the MMA warps and acquired with ``ld.acquire.gpu`` by the
@@ -95,6 +98,8 @@ TOPK_SUM_EPSILON = 1e-20
 DUPLICATE_HASH = 23333
 NO_EXPERT = 0x7FFFFFFF
 """Sentinel larger than every expert index; loses every tie of the warp argmax."""
+KEY_NONE = 0x807FFFFF - (1 << 32)
+"""``ordered_key(-inf)``: the key of an unrankable or exhausted candidate, never selected."""
 
 
 @dsl_user_op
@@ -169,6 +174,65 @@ def ordered_key(value: Float32, *, loc=None, ip=None) -> Int32:
     )
 
 
+@dsl_user_op
+def sqrt_rn(value: Float32, *, loc=None, ip=None) -> Float32:
+    """``sqrt.rn.f32`` without its slow-path branch, bitwise equal to it for every input
+    but NaN payloads (checked exhaustively on SM120). ptxas expands ``sqrt.rn`` into
+    rsqrt + one correction behind a range check that calls a slow path, so every square
+    root is its own branch region and a lane's 12 of them run one after the other. Here
+    the same fast path runs on inputs below 2^-101 scaled by 2^64 (exact, and back by
+    2^-32), and zeros and +inf pass through: branch-free, so they interleave."""
+    return Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [Float32(value).ir_value(loc=loc, ip=ip)],
+            "{ .reg .f32 x, y, s, h, e, r; .reg .pred tiny, zero, inf; "
+            "setp.lt.f32 tiny, $1, 0f0D000000; "
+            "mul.f32 x, $1, 0f5F800000; "
+            "selp.f32 x, x, $1, tiny; "
+            "rsqrt.approx.ftz.f32 y, x; "
+            "mul.ftz.f32 s, x, y; "
+            "mul.ftz.f32 h, y, 0f3F000000; "
+            "neg.f32 e, s; "
+            "fma.rn.f32 e, e, s, x; "
+            "fma.rn.f32 r, e, h, s; "
+            "mul.f32 s, r, 0f2F800000; "
+            "selp.f32 r, s, r, tiny; "
+            "setp.eq.f32 zero, $1, 0f00000000; "
+            "setp.eq.f32 inf, $1, 0f7F800000; "
+            "or.pred zero, zero, inf; "
+            "selp.f32 $0, $1, r, zero; }",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def mul_hi_u32(lhs: Uint32, rhs: Uint32, *, loc=None, ip=None) -> Uint32:
+    """The high 32 bits of the 64-bit product of two uint32."""
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                Uint32(lhs).ir_value(loc=loc, ip=ip),
+                Uint32(rhs).ir_value(loc=loc, ip=ip),
+            ],
+            "mul.hi.u32 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 def load_vec4(tensor, offset):
     """One 16 B vector load of ``tensor[offset : offset + 4]`` (FP32 or int32); ``offset`` is a multiple of 4."""
     view = cute.make_tensor(
@@ -177,11 +241,19 @@ def load_vec4(tensor, offset):
     return view.load()
 
 
+def store_vec4(tensor, offset, vector):
+    """One 16 B vector store to ``tensor[offset : offset + 4]``; ``offset`` is a multiple of 4."""
+    view = cute.make_tensor(
+        tensor.iterator + cute.assume(offset, divby=4), cute.make_layout(4)
+    )
+    view.store(vector)
+
+
 def sqrt_softplus(value):
     """``sqrt(softplus(value))`` with the identity above the softplus threshold."""
     softplus = cute.math.log1p(cute.math.exp(value))
     softplus = cutlass.select_(value > Float32(SOFTPLUS_THRESHOLD), value, softplus)
-    return cute.math.sqrt(softplus)
+    return sqrt_rn(softplus)
 
 
 def compare_swap_best_first(lhs, lhs_idx, rhs, rhs_idx):
@@ -222,6 +294,7 @@ class Sm12xMegaGateKernel:
         self.num_split_k = config.num_split_k
         self.num_stages = config.num_stages
         self.num_gate_warps = config.num_gate_warps
+        self.cooperative = config.cooperative_gate
         self.num_threads = (FIRST_GATE_WARP + self.num_gate_warps) * 32
         self.hidden = hidden
         self.num_experts = num_experts
@@ -234,6 +307,10 @@ class Sm12xMegaGateKernel:
                 f"the expert count must be a multiple of {EXPERTS_PER_LANE}"
             )
         self.num_logical_ctas = self.num_expert_groups * self.num_split_k
+        if self.cooperative and self.block_tokens > self.num_logical_ctas:
+            raise ValueError(
+                "a cooperative gate needs at most one token per CTA and block"
+            )
         self.k_blocks_per_split = hidden // BLOCK_K // self.num_split_k
         self.num_waves = self.num_aligned_experts // EXPERTS_PER_WAVE
         self.num_lane_values = self.num_waves * EXPERTS_PER_LANE
@@ -287,6 +364,18 @@ class Sm12xMegaGateKernel:
                 cute.struct.MemRange[cutlass.BFloat16, cute.cosize(sX_layout)], 1024
             ],
         }
+        # The cooperative gate's exchange (sorted keys and expert ids per lane quad, values
+        # and physical experts by expert); a placeholder otherwise.
+        exchange = self.num_aligned_experts if self.cooperative else EXPERTS_PER_LANE
+        for name, dtype in (
+            ("exchange_keys", Int32),
+            ("exchange_experts", Int32),
+            ("exchange_values", Float32),
+            ("exchange_physical", Int32),
+        ):
+            SharedStorage.__annotations__[name] = cute.struct.Align[
+                cute.struct.MemRange[dtype, exchange], 16
+            ]
         return cute.struct(SharedStorage)
 
     # --------------------------------------------------------------------- host
@@ -519,8 +608,12 @@ class Sm12xMegaGateKernel:
                     load_pipeline.consumer_release(consumer_state)
                     consumer_state.advance()
 
-                # Full token blocks are always stored: scratch is sized for them and the
-                # rows past the last token are never read.
+                # Only the block's tokens are stored (the rows past the last token are never
+                # read): fewer stores for the arrival's release to wait for.
+                tokens_in_block = cutlass.min(
+                    Int32(self.block_tokens),
+                    num_tokens - token_block * Int32(self.block_tokens),
+                )
                 scratch_base = (
                     Int64(token_block) * Int64(self.num_split_k) + Int64(split_idx)
                 ) * Int64(self.block_tokens) * row_stride + Int64(expert_group) * Int64(
@@ -528,16 +621,20 @@ class Sm12xMegaGateKernel:
                 )
                 for i in cutlass.range_constexpr(cute.size(acc)):
                     coord = coords[i]
-                    scratch[
-                        scratch_base + Int64(coord[1]) * row_stride + Int64(coord[0])
-                    ] = acc[i]
+                    if coord[1] < tokens_in_block:
+                        scratch[
+                            scratch_base
+                            + Int64(coord[1]) * row_stride
+                            + Int64(coord[0])
+                        ] = acc[i]
 
-                # Arrive at the block's score barrier once all four warps have stored.
+                # Arrive at the block's score barrier once all four warps have stored. The
+                # barrier orders their stores before thread 0's release, which publishes them
+                # cumulatively (as CUTLASS's GenericBarrier::arrive_inc): no separate fence.
                 cute.arch.barrier(
                     barrier_id=MMA_BARRIER_ID, number_of_threads=NUM_MMA_WARPS * 32
                 )
                 if tidx == 0:
-                    cute.arch.fence_acq_rel_gpu()
                     red_release_gpu_add(
                         counters_address
                         + Int64(token_block) * Int64(COUNTER_STRIDE * 4),
@@ -580,6 +677,9 @@ class Sm12xMegaGateKernel:
 
         else:
             # -------------------------------------------------------- gate warps
+            exchange_layout = cute.make_layout(
+                self.num_aligned_experts if self.cooperative else EXPERTS_PER_LANE
+            )
             self.gate_warps(
                 warp_idx - Int32(FIRST_GATE_WARP),
                 worker_group,
@@ -602,6 +702,10 @@ class Sm12xMegaGateKernel:
                 ep_rank,
                 routed_scale,
                 map_width,
+                storage.exchange_keys.get_tensor(exchange_layout),
+                storage.exchange_experts.get_tensor(exchange_layout),
+                storage.exchange_values.get_tensor(exchange_layout),
+                storage.exchange_physical.get_tensor(exchange_layout),
             )
 
     # --------------------------------------------------------------- gate warps
@@ -630,15 +734,21 @@ class Sm12xMegaGateKernel:
         ep_rank: Int32,
         routed_scale: Float32,
         map_width: Int32,
+        exchange_keys: cute.Tensor,
+        exchange_experts: cute.Tensor,
+        exchange_values: cute.Tensor,
+        exchange_physical: cute.Tensor,
     ):
-        """Every logical CTA of a block ranks a share of its tokens, one warp per token."""
+        """Every logical CTA of a block ranks a share of its tokens: one warp per token, or,
+        with a cooperative gate (at most one token per CTA), every gate warp on its token."""
         lane = cute.arch.lane_idx()
-        # The per-expert constants of this lane's experts are loaded once, off the
-        # critical path: biases for the ranking and the replica counts of the mapping
-        # (exchanged with the selected value by shuffles instead of a dependent load).
+        # The per-expert constants of this lane's experts are prepared once, off the
+        # critical path: biases for the ranking, and the replica counts of the mapping with
+        # their reciprocals (a token's replica of every lane expert is looked up early).
         lane_bias = cute.make_rmem_tensor((self.num_lane_values,), Float32)
         lane_image_bias = cute.make_rmem_tensor((self.num_lane_values,), Float32)
         lane_counts = cute.make_rmem_tensor((self.num_lane_values,), Int32)
+        lane_magic = cute.make_rmem_tensor((self.num_lane_values,), Uint32)
         for wave in cutlass.range_constexpr(self.num_waves):
             expert = lane * Int32(EXPERTS_PER_LANE) + Int32(wave * EXPERTS_PER_WAVE)
             if const_expr(self.has_padded_experts):
@@ -654,15 +764,21 @@ class Sm12xMegaGateKernel:
             if const_expr(self.has_physical_map):
                 counts = load_vec4(logical_count, Int64(expert))
                 for j in cutlass.range_constexpr(EXPERTS_PER_LANE):
-                    lane_counts[wave * EXPERTS_PER_LANE + j] = counts[j]
+                    v = wave * EXPERTS_PER_LANE + j
+                    lane_counts[v] = self.clamp_count(counts[j], map_width)
+                    lane_magic[v] = self.count_magic(lane_counts[v])
         # Shared slot lanes map a fixed logical expert: E + (lane - top-k).
         shared_count = Int32(1)
+        shared_magic = Uint32(0)
         if const_expr(self.has_physical_map and self.num_shared > 0):
             shared_slot = cutlass.min(
                 cutlass.max(lane - Int32(self.num_topk), Int32(0)),
                 Int32(self.num_shared - 1),
             )
-            shared_count = logical_count[Int32(self.num_experts) + shared_slot]
+            shared_count = self.clamp_count(
+                logical_count[Int32(self.num_experts) + shared_slot], map_width
+            )
+            shared_magic = self.count_magic(shared_count)
         for token_block in cutlass.range(
             worker_group, num_token_blocks, num_worker_groups, unroll=1
         ):
@@ -672,6 +788,41 @@ class Sm12xMegaGateKernel:
             )
             # Only CTAs with a share of the block wait for it.
             if logical_rank < tokens_in_block:
+                if const_expr(self.cooperative):
+                    # The CTA's token is known before its logits are: look up its replica
+                    # of every lane expert (of the waves this warp ranks, and of the
+                    # shared slots) while waiting.
+                    cta_token = block_token_base + logical_rank
+                    wave_physical = cute.make_rmem_tensor(
+                        (self.num_lane_values,), Int32
+                    )
+                    shared_physical = Int32(0)
+                    if const_expr(self.has_physical_map):
+                        token_hash = Uint32(ep_rank) + Uint32(cta_token) * Uint32(
+                            DUPLICATE_HASH
+                        )
+                        for wave in cutlass.range_constexpr(self.num_waves):
+                            if gate_warp == Int32(self.wave_owner(wave)):
+                                self.lookup_physical(
+                                    physical_map,
+                                    token_hash,
+                                    lane,
+                                    wave,
+                                    lane_counts,
+                                    lane_magic,
+                                    map_width,
+                                    wave_physical,
+                                )
+                        if const_expr(self.num_shared > 0):
+                            if gate_warp == Int32(0):
+                                shared_physical = self.lookup_shared_physical(
+                                    physical_map,
+                                    token_hash,
+                                    lane,
+                                    shared_count,
+                                    shared_magic,
+                                    map_width,
+                                )
                 if gate_warp == Int32(0):
                     if lane == Int32(0):
                         address = counters_address + Int64(token_block) * Int64(
@@ -686,27 +837,110 @@ class Sm12xMegaGateKernel:
                     barrier_id=GATE_BARRIER_ID,
                     number_of_threads=self.num_gate_warps * 32,
                 )
-                # Count this CTA's pass through the wait. The result is only consumed after
-                # the CTA's share of the block is ranked, so the round trip overlaps it.
-                passed = Int32(0)
-                line = token_block * Int32(COUNTER_STRIDE)
-                if gate_warp == Int32(0):
-                    if lane == Int32(0):
-                        passed = cute.arch.atomic_add(
-                            counters.iterator + line + Int32(WAITERS_WORD),
-                            Int32(1),
-                            sem="relaxed",
-                            scope="gpu",
-                        )
-                for t_local in cutlass.range(
-                    gate_warp * Int32(self.num_logical_ctas) + logical_rank,
-                    tokens_in_block,
-                    self.num_gate_warps * self.num_logical_ctas,
-                    unroll=1,
+                # Count this CTA's pass through the wait (and rearm the line once every
+                # waiter has), from a warp that ranks nothing first: gate warp 0 of a
+                # cooperative gate, which waits for the waves anyway, else the last gate
+                # warp, which ranks tokens of a block only past (gate warps - 1) * L.
+                if gate_warp == Int32(
+                    0 if self.cooperative else self.num_gate_warps - 1
                 ):
-                    token = block_token_base + t_local
+                    if lane == Int32(0):
+                        self.count_waiter(counters, token_block, tokens_in_block)
+                if const_expr(self.cooperative):
                     if const_expr(self.has_mask):
-                        if mask[token] != Uint8(0):
+                        if mask[cta_token] != Uint8(0):
+                            self.cooperative_route(
+                                gate_warp,
+                                cta_token,
+                                logical_rank,
+                                token_block,
+                                lane,
+                                lane_bias,
+                                lane_image_bias,
+                                wave_physical,
+                                shared_physical,
+                                image_mask,
+                                physical_map,
+                                topk_idx,
+                                topk_weights,
+                                unmapped_idx,
+                                scratch,
+                                routed_scale,
+                                map_width,
+                                exchange_keys,
+                                exchange_experts,
+                                exchange_values,
+                                exchange_physical,
+                            )
+                        else:
+                            if gate_warp == Int32(0):
+                                self.store_masked_token(
+                                    cta_token,
+                                    lane,
+                                    topk_idx,
+                                    topk_weights,
+                                    unmapped_idx,
+                                )
+                    else:
+                        self.cooperative_route(
+                            gate_warp,
+                            cta_token,
+                            logical_rank,
+                            token_block,
+                            lane,
+                            lane_bias,
+                            lane_image_bias,
+                            wave_physical,
+                            shared_physical,
+                            image_mask,
+                            physical_map,
+                            topk_idx,
+                            topk_weights,
+                            unmapped_idx,
+                            scratch,
+                            routed_scale,
+                            map_width,
+                            exchange_keys,
+                            exchange_experts,
+                            exchange_values,
+                            exchange_physical,
+                        )
+                else:
+                    for t_local in cutlass.range(
+                        gate_warp * Int32(self.num_logical_ctas) + logical_rank,
+                        tokens_in_block,
+                        self.num_gate_warps * self.num_logical_ctas,
+                        unroll=1,
+                    ):
+                        token = block_token_base + t_local
+                        if const_expr(self.has_mask):
+                            if mask[token] != Uint8(0):
+                                self.route_token(
+                                    token,
+                                    t_local,
+                                    token_block,
+                                    lane,
+                                    lane_bias,
+                                    lane_image_bias,
+                                    lane_counts,
+                                    lane_magic,
+                                    shared_count,
+                                    shared_magic,
+                                    image_mask,
+                                    physical_map,
+                                    topk_idx,
+                                    topk_weights,
+                                    unmapped_idx,
+                                    scratch,
+                                    ep_rank,
+                                    routed_scale,
+                                    map_width,
+                                )
+                            else:
+                                self.store_masked_token(
+                                    token, lane, topk_idx, topk_weights, unmapped_idx
+                                )
+                        else:
                             self.route_token(
                                 token,
                                 t_local,
@@ -715,7 +949,9 @@ class Sm12xMegaGateKernel:
                                 lane_bias,
                                 lane_image_bias,
                                 lane_counts,
+                                lane_magic,
                                 shared_count,
+                                shared_magic,
                                 image_mask,
                                 physical_map,
                                 topk_idx,
@@ -726,41 +962,55 @@ class Sm12xMegaGateKernel:
                                 routed_scale,
                                 map_width,
                             )
-                        else:
-                            self.store_masked_token(
-                                token, lane, topk_idx, topk_weights, unmapped_idx
-                            )
-                    else:
-                        self.route_token(
-                            token,
-                            t_local,
-                            token_block,
-                            lane,
-                            lane_bias,
-                            lane_image_bias,
-                            lane_counts,
-                            shared_count,
-                            image_mask,
-                            physical_map,
-                            topk_idx,
-                            topk_weights,
-                            unmapped_idx,
-                            scratch,
-                            ep_rank,
-                            routed_scale,
-                            map_width,
-                        )
-                # Every waiter read the full count before it counted itself, so once the
-                # last one has counted nobody reads this line again in this launch: rearm
-                # it for the next launch (or CUDA graph replay).
-                if gate_warp == Int32(0):
-                    if lane == Int32(0):
-                        num_waiters = cutlass.min(
-                            Int32(self.num_logical_ctas), tokens_in_block
-                        )
-                        if passed == num_waiters - Int32(1):
-                            counters[line] = Int32(0)
-                            counters[line + Int32(WAITERS_WORD)] = Int32(0)
+
+    def wave_owner(self, wave: int) -> int:
+        """The gate warp that ranks a wave in a cooperative gate: waves go to gate warps
+        1, 2, ..., then 0 (which polls and counts the CTA's wait) past gate warps - 1."""
+        return (wave + 1) % self.num_gate_warps
+
+    @cute.jit
+    def count_waiter(
+        self, counters: cute.Tensor, token_block: Int32, tokens_in_block: Int32
+    ):
+        """Count this CTA's pass through a block's wait. Every waiter read the full count
+        before it counted itself, so once the last one has counted nobody reads the line
+        again in this launch: rearm it for the next launch (or CUDA graph replay)."""
+        line = token_block * Int32(COUNTER_STRIDE)
+        passed = cute.arch.atomic_add(
+            counters.iterator + line + Int32(WAITERS_WORD),
+            Int32(1),
+            sem="relaxed",
+            scope="gpu",
+        )
+        num_waiters = cutlass.min(Int32(self.num_logical_ctas), tokens_in_block)
+        if passed == num_waiters - Int32(1):
+            counters[line] = Int32(0)
+            counters[line + Int32(WAITERS_WORD)] = Int32(0)
+
+    @cute.jit
+    def clamp_count(self, count: Int32, map_width: Int32) -> Int32:
+        """A replica count must be positive and at most the map width: clamp so that a bad
+        table cannot index out of bounds (every lane looks up all of its experts)."""
+        return cutlass.min(cutlass.max(count, Int32(1)), map_width)
+
+    @cute.jit
+    def count_magic(self, count: Int32) -> Uint32:
+        """Reciprocal of a replica count for ``replica``: ``0xFFFFFFFF // count + 1``
+        (0 for a count of 1)."""
+        return Uint32(0xFFFFFFFF) // Uint32(count) + Uint32(1)
+
+    @cute.jit
+    def replica(self, token_hash: Uint32, count: Int32, magic: Uint32) -> Int32:
+        """DeepGEMM's replica of a logical expert for a token, ``token_hash % count``, as a
+        multiply by the count's reciprocal (a dozen integer ops, against a division's
+        float conversions and reciprocal per lookup): the quotient estimate is exact or
+        one too large, so the remainder is exact or wrapped below zero by the count."""
+        divisor = Uint32(count)
+        remainder = token_hash - mul_hi_u32(token_hash, magic) * divisor
+        remainder = cutlass.select_(
+            remainder >= divisor, remainder + divisor, remainder
+        )
+        return Int32(cutlass.select_(divisor == Uint32(1), Uint32(0), remainder))
 
     @cute.jit
     def store_masked_token(
@@ -779,6 +1029,175 @@ class Sm12xMegaGateKernel:
             if lane < Int32(self.num_topk):
                 unmapped_idx[Int64(token), Int64(lane)] = Int64(-1)
 
+    def load_partials(self, scratch, token_block, t_local, lane, wave):
+        """One token's split-K partials of the lane's 4 experts of a wave: a float4 per split."""
+        row_stride = Int64(self.num_aligned_experts)
+        split_stride = Int64(self.block_tokens) * row_stride
+        base = (
+            Int64(token_block) * Int64(self.num_split_k) * split_stride
+            + Int64(t_local) * row_stride
+            + Int64(lane * Int32(EXPERTS_PER_LANE) + Int32(wave * EXPERTS_PER_WAVE))
+        )
+        return [
+            load_vec4(scratch, base + Int64(split) * split_stride)
+            for split in range(self.num_split_k)
+        ]
+
+    def lookup_physical(
+        self,
+        physical_map,
+        token_hash,
+        lane,
+        wave,
+        lane_counts,
+        lane_magic,
+        map_width,
+        out,
+    ):
+        """A token's replica of the lane's 4 experts of a wave, into ``out[4 * wave:]``."""
+        expert = lane * Int32(EXPERTS_PER_LANE) + Int32(wave * EXPERTS_PER_WAVE)
+        if const_expr(self.has_padded_experts):
+            expert = cutlass.min(expert, Int32(self.num_experts - EXPERTS_PER_LANE))
+        for j in range(EXPERTS_PER_LANE):
+            v = wave * EXPERTS_PER_LANE + j
+            out[v] = physical_map[
+                Int64(expert + Int32(j)) * Int64(map_width)
+                + Int64(self.replica(token_hash, lane_counts[v], lane_magic[v]))
+            ]
+
+    def lookup_shared_physical(
+        self, physical_map, token_hash, lane, shared_count, shared_magic, map_width
+    ):
+        """A token's replica of the shared expert of the lane's slot (shared slot lanes)."""
+        shared_slot = cutlass.min(
+            cutlass.max(lane - Int32(self.num_topk), Int32(0)),
+            Int32(self.num_shared - 1),
+        )
+        return physical_map[
+            Int64(Int32(self.num_experts) + shared_slot) * Int64(map_width)
+            + Int64(self.replica(token_hash, shared_count, shared_magic))
+        ]
+
+    def rank_wave(
+        self,
+        partials,
+        lane,
+        wave,
+        lane_bias,
+        lane_image_bias,
+        is_image_token,
+        keys,
+        experts,
+        values,
+        slot,
+    ):
+        """Sum a wave's partials in a fixed order, rank the lane's 4 experts on score + bias
+        (or on the raw logits without a bias) and sort them best first (DeepGEMM's sort4).
+        From ``slot``: ``keys`` and ``experts`` get the sorted order keys and expert ids,
+        ``values`` the unbiased values by expert."""
+        neg_inf = Float32(-float("inf"))
+        total = partials[0]
+        for split in range(1, self.num_split_k):
+            total = total + partials[split]
+        expert_base = lane * Int32(EXPERTS_PER_LANE) + Int32(wave * EXPERTS_PER_WAVE)
+        ranks = []
+        for j in range(EXPERTS_PER_LANE):
+            v = wave * EXPERTS_PER_LANE + j
+            rank = total[j]
+            if const_expr(self.has_scoring_bias):
+                score = sqrt_softplus(total[j])
+                values[slot + j] = score
+                expert_bias = Float32(0.0)
+                if const_expr(self.has_bias):
+                    expert_bias = lane_bias[v]
+                if const_expr(self.has_image_bias):
+                    expert_bias = cutlass.select_(
+                        is_image_token, lane_image_bias[v], expert_bias
+                    )
+                rank = score + expert_bias
+            else:
+                values[slot + j] = total[j]
+            # NaN ranks last; padded experts (a whole lane vector, E being a multiple
+            # of 4) are ranked out.
+            rank = cutlass.select_(rank == rank, rank, neg_inf)
+            if const_expr(self.has_padded_experts):
+                rank = cutlass.select_(
+                    expert_base < Int32(self.num_experts), rank, neg_inf
+                )
+            ranks.append(rank)
+        r0, i0, r1, i1 = compare_swap_best_first(ranks[0], Int32(0), ranks[1], Int32(1))
+        r2, i2, r3, i3 = compare_swap_best_first(ranks[2], Int32(2), ranks[3], Int32(3))
+        r0, i0, r2, i2 = compare_swap_best_first(r0, i0, r2, i2)
+        r1, i1, r3, i3 = compare_swap_best_first(r1, i1, r3, i3)
+        r1, i1, r2, i2 = compare_swap_best_first(r1, i1, r2, i2)
+        for position, (rank, offset) in enumerate(
+            ((r0, i0), (r1, i1), (r2, i2), (r3, i3))
+        ):
+            keys[slot + position] = ordered_key(rank)
+            experts[slot + position] = expert_base + offset
+
+    def topk_rounds(self, lane, keys, experts):
+        """Warp top-k over the lanes' sorted wave lists (``keys``/``experts`` at 4 * wave):
+        every round each lane offers the best unconsumed candidate of each wave, the warp
+        keeps the largest key (ties: the smaller expert), the winning lane advances that
+        wave's cursor and lane r keeps round r's expert (NO_EXPERT if none was left)."""
+        cursors = [Int32(0)] * self.num_waves
+        selected_expert = Int32(NO_EXPERT)
+        for r in range(self.num_topk):
+            best_key = Int32(KEY_NONE)
+            best_expert = Int32(NO_EXPERT)
+            best_wave = Int32(0)
+            for wave in range(self.num_waves):
+                b = wave * EXPERTS_PER_LANE
+                cursor = cursors[wave]
+                candidate = cutlass.select_(
+                    cursor == Int32(0),
+                    keys[b],
+                    cutlass.select_(
+                        cursor == Int32(1),
+                        keys[b + 1],
+                        cutlass.select_(
+                            cursor == Int32(2),
+                            keys[b + 2],
+                            cutlass.select_(
+                                cursor == Int32(3), keys[b + 3], Int32(KEY_NONE)
+                            ),
+                        ),
+                    ),
+                )
+                expert = cutlass.select_(
+                    cursor == Int32(0),
+                    experts[b],
+                    cutlass.select_(
+                        cursor == Int32(1),
+                        experts[b + 1],
+                        cutlass.select_(
+                            cursor == Int32(2), experts[b + 2], experts[b + 3]
+                        ),
+                    ),
+                )
+                # Strict: a tie keeps the earlier wave, whose experts are smaller.
+                take = candidate > best_key
+                best_key = cutlass.select_(take, candidate, best_key)
+                best_expert = cutlass.select_(take, expert, best_expert)
+                best_wave = cutlass.select_(take, Int32(wave), best_wave)
+            # One integer redux on order-preserving keys (SM120 has no float redux) instead
+            # of a 5-step shuffle butterfly; ties resolve to the smaller expert.
+            top_key = cute.arch.warp_redux_sync(best_key, kind="max")
+            winner = cute.arch.warp_redux_sync(
+                cutlass.select_(best_key == top_key, best_expert, Int32(NO_EXPERT)),
+                kind="min",
+            )
+            is_winner = best_expert == winner
+            for wave in range(self.num_waves):
+                cursors[wave] = cutlass.select_(
+                    cutlass.and_(is_winner, best_wave == Int32(wave)),
+                    cursors[wave] + Int32(1),
+                    cursors[wave],
+                )
+            selected_expert = cutlass.select_(lane == Int32(r), winner, selected_expert)
+        return selected_expert
+
     @cute.jit
     def route_token(
         self,
@@ -789,7 +1208,9 @@ class Sm12xMegaGateKernel:
         lane_bias: cute.Tensor,
         lane_image_bias: cute.Tensor,
         lane_counts: cute.Tensor,
+        lane_magic: cute.Tensor,
         shared_count: Int32,
+        shared_magic: Uint32,
         image_mask: cute.Tensor,
         physical_map: cute.Tensor,
         topk_idx: cute.Tensor,
@@ -801,173 +1222,223 @@ class Sm12xMegaGateKernel:
         map_width: Int32,
     ):
         """Rank one token with one warp and store its routing slots."""
-        neg_inf = Float32(-float("inf"))
-        lane_expert_base = lane * Int32(EXPERTS_PER_LANE)
+        # 1. Load every split-K partial of the lane's experts before anything consumes them.
+        partials = [
+            self.load_partials(scratch, token_block, t_local, lane, wave)
+            for wave in range(self.num_waves)
+        ]
+        # While they are in flight, look up this token's replica of every lane expert (and
+        # of the shared slot): no dependent lookup is left after the top-k.
+        lane_physical = cute.make_rmem_tensor((self.num_lane_values,), Int32)
+        shared_physical = Int32(0)
+        if const_expr(self.has_physical_map):
+            token_hash = Uint32(ep_rank) + Uint32(token) * Uint32(DUPLICATE_HASH)
+            for wave in cutlass.range_constexpr(self.num_waves):
+                self.lookup_physical(
+                    physical_map,
+                    token_hash,
+                    lane,
+                    wave,
+                    lane_counts,
+                    lane_magic,
+                    map_width,
+                    lane_physical,
+                )
+            if const_expr(self.num_shared > 0):
+                shared_physical = self.lookup_shared_physical(
+                    physical_map,
+                    token_hash,
+                    lane,
+                    shared_count,
+                    shared_magic,
+                    map_width,
+                )
 
-        # 1. Reduce the split-K partials in a fixed order: one float4 per wave and
-        #    split, every load of a wave issued before the sum consumes them.
-        row_stride = Int64(self.num_aligned_experts)
-        split_stride = Int64(self.block_tokens) * row_stride
-        row_base = (
-            Int64(token_block) * Int64(self.num_split_k) * split_stride
-            + Int64(t_local) * row_stride
-        )
-        logits = cute.make_rmem_tensor((self.num_lane_values,), Float32)
-        for wave in cutlass.range_constexpr(self.num_waves):
-            offset = row_base + Int64(lane_expert_base + Int32(wave * EXPERTS_PER_WAVE))
-            partials = [
-                load_vec4(scratch, offset + Int64(split) * split_stride)
-                for split in range(self.num_split_k)
-            ]
-            total = partials[0]
-            for split in cutlass.range_constexpr(1, self.num_split_k):
-                total = total + partials[split]
-            for j in cutlass.range_constexpr(EXPERTS_PER_LANE):
-                logits[wave * EXPERTS_PER_LANE + j] = total[j]
-
-        # 2. Rank on score + bias, or on the raw logits without a bias; NaN ranks last.
-        ranks = cute.make_rmem_tensor((self.num_lane_values,), Float32)
-        values = cute.make_rmem_tensor((self.num_lane_values,), Float32)
+        # 2. Sum, rank and sort the lane's experts of every wave.
         is_image_token = False
         if const_expr(self.has_image_bias):
             is_image_token = image_mask[token] != Uint8(0)
+        keys = cute.make_rmem_tensor((self.num_lane_values,), Int32)
+        experts = cute.make_rmem_tensor((self.num_lane_values,), Int32)
+        values = cute.make_rmem_tensor((self.num_lane_values,), Float32)
         for wave in cutlass.range_constexpr(self.num_waves):
-            # Padded experts (a whole lane vector, E being a multiple of 4) are ranked out.
-            expert = lane_expert_base + Int32(wave * EXPERTS_PER_WAVE)
-            for j in cutlass.range_constexpr(EXPERTS_PER_LANE):
-                v = wave * EXPERTS_PER_LANE + j
-                rank = logits[v]
-                if const_expr(self.has_scoring_bias):
-                    score = sqrt_softplus(logits[v])
-                    values[v] = score
-                    expert_bias = Float32(0.0)
-                    if const_expr(self.has_bias):
-                        expert_bias = lane_bias[v]
-                    if const_expr(self.has_image_bias):
-                        expert_bias = cutlass.select_(
-                            is_image_token, lane_image_bias[v], expert_bias
-                        )
-                    rank = score + expert_bias
-                else:
-                    values[v] = logits[v]
-                rank = cutlass.select_(rank == rank, rank, neg_inf)
-                if const_expr(self.has_padded_experts):
-                    rank = cutlass.select_(
-                        expert < Int32(self.num_experts), rank, neg_inf
-                    )
-                ranks[v] = rank
-
-        # 3. Sort the 4 candidates of every wave, best first (DeepGEMM's sort4 network).
-        sorted_ranks = cute.make_rmem_tensor((self.num_lane_values,), Float32)
-        sorted_offsets = cute.make_rmem_tensor((self.num_lane_values,), Int32)
-        for wave in cutlass.range_constexpr(self.num_waves):
-            b = wave * EXPERTS_PER_LANE
-            r0, i0, r1, i1 = compare_swap_best_first(
-                ranks[b], Int32(0), ranks[b + 1], Int32(1)
+            self.rank_wave(
+                partials[wave],
+                lane,
+                wave,
+                lane_bias,
+                lane_image_bias,
+                is_image_token,
+                keys,
+                experts,
+                values,
+                wave * EXPERTS_PER_LANE,
             )
-            r2, i2, r3, i3 = compare_swap_best_first(
-                ranks[b + 2], Int32(2), ranks[b + 3], Int32(3)
-            )
-            r0, i0, r2, i2 = compare_swap_best_first(r0, i0, r2, i2)
-            r1, i1, r3, i3 = compare_swap_best_first(r1, i1, r3, i3)
-            r1, i1, r2, i2 = compare_swap_best_first(r1, i1, r2, i2)
-            sorted_ranks[b], sorted_offsets[b] = r0, i0
-            sorted_ranks[b + 1], sorted_offsets[b + 1] = r1, i1
-            sorted_ranks[b + 2], sorted_offsets[b + 2] = r2, i2
-            sorted_ranks[b + 3], sorted_offsets[b + 3] = r3, i3
 
-        # 4. Warp top-k: every round each lane offers the best unconsumed candidate of
-        #    each wave, the warp keeps the largest rank (ties: the smaller expert),
-        #    the winning lane advances that wave's cursor and lane r keeps round r.
-        cursors = cute.make_rmem_tensor((self.num_waves,), Int32)
-        for wave in cutlass.range_constexpr(self.num_waves):
-            cursors[wave] = Int32(0)
-        selected_expert = Int32(NO_EXPERT)
-        for r in cutlass.range_constexpr(self.num_topk):
-            best_rank = neg_inf
-            best_expert = Int32(NO_EXPERT)
-            best_wave = Int32(0)
-            for wave in cutlass.range_constexpr(self.num_waves):
-                b = wave * EXPERTS_PER_LANE
-                cursor = cursors[wave]
-                candidate = cutlass.select_(
-                    cursor == Int32(0),
-                    sorted_ranks[b],
-                    cutlass.select_(
-                        cursor == Int32(1),
-                        sorted_ranks[b + 1],
-                        cutlass.select_(
-                            cursor == Int32(2),
-                            sorted_ranks[b + 2],
-                            cutlass.select_(
-                                cursor == Int32(3), sorted_ranks[b + 3], neg_inf
-                            ),
-                        ),
-                    ),
-                )
-                offset = cutlass.select_(
-                    cursor == Int32(0),
-                    sorted_offsets[b],
-                    cutlass.select_(
-                        cursor == Int32(1),
-                        sorted_offsets[b + 1],
-                        cutlass.select_(
-                            cursor == Int32(2),
-                            sorted_offsets[b + 2],
-                            sorted_offsets[b + 3],
-                        ),
-                    ),
-                )
-                # Strict: a tie keeps the earlier wave, whose experts are smaller.
-                take = candidate > best_rank
-                best_rank = cutlass.select_(take, candidate, best_rank)
-                best_expert = cutlass.select_(
-                    take,
-                    lane_expert_base + Int32(wave * EXPERTS_PER_WAVE) + offset,
-                    best_expert,
-                )
-                best_wave = cutlass.select_(take, Int32(wave), best_wave)
-            # One integer redux on order-preserving keys instead of a 5-step float
-            # shuffle butterfly; ties resolve to the smaller expert.
-            best_key = ordered_key(best_rank)
-            top_key = cute.arch.warp_redux_sync(best_key, kind="max")
-            winner = cute.arch.warp_redux_sync(
-                cutlass.select_(best_key == top_key, best_expert, Int32(NO_EXPERT)),
-                kind="min",
-            )
-            is_winner = best_expert == winner
-            for wave in cutlass.range_constexpr(self.num_waves):
-                cursors[wave] = cutlass.select_(
-                    cutlass.and_(is_winner, best_wave == Int32(wave)),
-                    cursors[wave] + Int32(1),
-                    cursors[wave],
-                )
-            selected_expert = cutlass.select_(lane == Int32(r), winner, selected_expert)
+        # 3. Warp top-k.
+        selected_expert = self.topk_rounds(lane, keys, experts)
 
-        # 5. The selected expert's unbiased value, fetched from the lane that holds it.
+        # 4. The selected expert's unbiased value and physical expert, fetched from the
+        #    lane that holds them.
         owner_lane = (selected_expert >> 2) & Int32(31)
         owner_value = ((selected_expert >> 7) << 2) | (selected_expert & Int32(3))
         selected_value = Float32(0.0)
-        selected_count = Int32(1)
+        selected_physical = Int32(0)
         for v in cutlass.range_constexpr(self.num_lane_values):
             exchanged = cute.arch.shuffle_sync(values[v], offset=owner_lane)
             selected_value = cutlass.select_(
                 owner_value == Int32(v), exchanged, selected_value
             )
             if const_expr(self.has_physical_map):
-                exchanged_count = cute.arch.shuffle_sync(
-                    lane_counts[v], offset=owner_lane
+                exchanged_physical = cute.arch.shuffle_sync(
+                    lane_physical[v], offset=owner_lane
                 )
-                selected_count = cutlass.select_(
-                    owner_value == Int32(v), exchanged_count, selected_count
+                selected_physical = cutlass.select_(
+                    owner_value == Int32(v), exchanged_physical, selected_physical
                 )
+        self.finish_token(
+            token,
+            lane,
+            selected_expert,
+            selected_value,
+            selected_physical,
+            shared_physical,
+            physical_map,
+            topk_idx,
+            topk_weights,
+            unmapped_idx,
+            routed_scale,
+            map_width,
+        )
+
+    @cute.jit
+    def cooperative_route(
+        self,
+        gate_warp: Int32,
+        token: Int32,
+        t_local: Int32,
+        token_block: Int32,
+        lane: Int32,
+        lane_bias: cute.Tensor,
+        lane_image_bias: cute.Tensor,
+        wave_physical: cute.Tensor,
+        shared_physical: Int32,
+        image_mask: cute.Tensor,
+        physical_map: cute.Tensor,
+        topk_idx: cute.Tensor,
+        topk_weights: cute.Tensor,
+        unmapped_idx: cute.Tensor,
+        scratch: cute.Tensor,
+        routed_scale: Float32,
+        map_width: Int32,
+        exchange_keys: cute.Tensor,
+        exchange_experts: cute.Tensor,
+        exchange_values: cute.Tensor,
+        exchange_physical: cute.Tensor,
+    ):
+        """Rank the CTA's token of a block with every gate warp. Each wave's owner loads,
+        sums, ranks and sorts its 4 experts per lane (a third of a lane's split-K loads
+        and transcendentals for 384 experts, all in flight at once) and posts the sorted
+        keys and expert ids, the values and the physical experts to shared memory; gate
+        warp 0 then runs the top-k rounds over every wave and stores the slots."""
+        is_image_token = False
+        if const_expr(self.has_image_bias):
+            is_image_token = image_mask[token] != Uint8(0)
+        for wave in cutlass.range_constexpr(self.num_waves):
+            if gate_warp == Int32(self.wave_owner(wave)):
+                partials = self.load_partials(scratch, token_block, t_local, lane, wave)
+                keys = cute.make_rmem_tensor((EXPERTS_PER_LANE,), Int32)
+                experts = cute.make_rmem_tensor((EXPERTS_PER_LANE,), Int32)
+                values = cute.make_rmem_tensor((EXPERTS_PER_LANE,), Float32)
+                self.rank_wave(
+                    partials,
+                    lane,
+                    wave,
+                    lane_bias,
+                    lane_image_bias,
+                    is_image_token,
+                    keys,
+                    experts,
+                    values,
+                    0,
+                )
+                # The lane's quad of the wave sits at its first expert's index.
+                quad = lane * Int32(EXPERTS_PER_LANE) + Int32(wave * EXPERTS_PER_WAVE)
+                store_vec4(exchange_keys, quad, keys.load())
+                store_vec4(exchange_experts, quad, experts.load())
+                store_vec4(exchange_values, quad, values.load())
+                if const_expr(self.has_physical_map):
+                    physical = cute.make_rmem_tensor((EXPERTS_PER_LANE,), Int32)
+                    for j in cutlass.range_constexpr(EXPERTS_PER_LANE):
+                        physical[j] = wave_physical[wave * EXPERTS_PER_LANE + j]
+                    store_vec4(exchange_physical, quad, physical.load())
+        cute.arch.barrier(
+            barrier_id=GATE_BARRIER_ID, number_of_threads=self.num_gate_warps * 32
+        )
+        if gate_warp == Int32(0):
+            keys = cute.make_rmem_tensor((self.num_lane_values,), Int32)
+            experts = cute.make_rmem_tensor((self.num_lane_values,), Int32)
+            for wave in cutlass.range_constexpr(self.num_waves):
+                quad = lane * Int32(EXPERTS_PER_LANE) + Int32(wave * EXPERTS_PER_WAVE)
+                wave_keys = load_vec4(exchange_keys, quad)
+                wave_experts = load_vec4(exchange_experts, quad)
+                for position in cutlass.range_constexpr(EXPERTS_PER_LANE):
+                    keys[wave * EXPERTS_PER_LANE + position] = wave_keys[position]
+                    experts[wave * EXPERTS_PER_LANE + position] = wave_experts[position]
+            selected_expert = self.topk_rounds(lane, keys, experts)
+            # Values and physical experts are posted by expert: one read each.
+            expert = cutlass.min(
+                cutlass.max(selected_expert, Int32(0)), Int32(self.num_experts - 1)
+            )
+            selected_value = cutlass.select_(
+                selected_expert == Int32(NO_EXPERT),
+                Float32(0.0),
+                exchange_values[expert],
+            )
+            selected_physical = Int32(0)
+            if const_expr(self.has_physical_map):
+                selected_physical = exchange_physical[expert]
+            self.finish_token(
+                token,
+                lane,
+                selected_expert,
+                selected_value,
+                selected_physical,
+                shared_physical,
+                physical_map,
+                topk_idx,
+                topk_weights,
+                unmapped_idx,
+                routed_scale,
+                map_width,
+            )
+
+    @cute.jit
+    def finish_token(
+        self,
+        token: Int32,
+        lane: Int32,
+        selected_expert: Int32,
+        selected_value: Float32,
+        selected_physical: Int32,
+        shared_physical: Int32,
+        physical_map: cute.Tensor,
+        topk_idx: cute.Tensor,
+        topk_weights: cute.Tensor,
+        unmapped_idx: cute.Tensor,
+        routed_scale: Float32,
+        map_width: Int32,
+    ):
+        """Normalize the routed weights and store the token's slots (lane r: round r's
+        expert, then the shared experts) and its unmapped experts."""
         # Keep the slot in bounds should no finite candidate remain.
         is_routed = lane < Int32(self.num_topk)
+        no_candidate = selected_expert == Int32(NO_EXPERT)
         selected_expert = cutlass.min(
             cutlass.max(selected_expert, Int32(0)), Int32(self.num_experts - 1)
         )
 
-        # 6. Normalized unbiased weights of the routed slots.
+        # Normalized unbiased weights of the routed slots.
         if const_expr(not self.has_scoring_bias):
             selected_value = sqrt_softplus(selected_value)
         topk_sum = cutlass.select_(is_routed, selected_value, Float32(0.0))
@@ -980,7 +1451,7 @@ class Sm12xMegaGateKernel:
             is_routed, selected_value / topk_sum * routed_scale, Float32(1.0)
         )
 
-        # 7. Shared experts follow the routed slots; map logical to physical experts.
+        # Shared experts follow the routed slots; map logical to physical experts.
         logical_expert = selected_expert
         if const_expr(self.num_shared > 0):
             logical_expert = cutlass.select_(
@@ -991,17 +1462,16 @@ class Sm12xMegaGateKernel:
         physical_expert = logical_expert
         is_slot = lane < Int32(self.num_slots)
         if const_expr(self.has_physical_map):
-            if is_slot:
-                count = selected_count
-                if const_expr(self.num_shared > 0):
-                    count = cutlass.select_(is_routed, selected_count, shared_count)
-                # A count must be positive; clamp so a bad table cannot index out of bounds.
-                num_duplicates = Uint32(cutlass.max(count, Int32(1)))
-                duplicate = (
-                    Uint32(ep_rank) + Uint32(token) * Uint32(DUPLICATE_HASH)
-                ) % num_duplicates
+            physical_expert = selected_physical
+            if const_expr(self.num_shared > 0):
+                physical_expert = cutlass.select_(
+                    is_routed, selected_physical, shared_physical
+                )
+            if cutlass.and_(is_routed, no_candidate):
+                # No finite candidate was left for the slot: the clamped expert's
+                # first replica (a count of 1, as for an unowned expert).
                 physical_expert = physical_map[
-                    Int64(logical_expert) * Int64(map_width) + Int64(duplicate)
+                    Int64(selected_expert) * Int64(map_width)
                 ]
         if is_slot:
             topk_idx[Int64(token), Int64(lane)] = Int64(physical_expert)
