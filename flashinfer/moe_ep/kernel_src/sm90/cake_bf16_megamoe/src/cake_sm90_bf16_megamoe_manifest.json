@@ -45,45 +45,84 @@
     "stages": [
       "fc1_gated",
       "fc1_gated_clamp",
-      "fc2"
+      "fc2",
+      "fc1_gated_signal",
+      "fc1_gated_clamp_signal",
+      "fc2_early"
     ]
   },
   "files": [
     {
-      "bytes": 11048,
+      "bytes": 12115,
       "kind": "tvm_ffi_binding",
       "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_binding.cu",
-      "sha256": "65a255bcbdfe1763b74c005c9e827d910bc7732046dd343179df3bdff526e332"
+      "sha256": "710bf8b7df40825aee86723fff71ea779a158cf142c0c7c74965c7cb6cf8406d"
     },
     {
-      "bytes": 11078,
+      "bytes": 12145,
       "kind": "tvm_ffi_binding",
       "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_clamp_binding.cu",
-      "sha256": "8442138d8b43d0a3624f815ad777549f0350a6eee5b37fbd7f9056e471367c18"
+      "sha256": "6aed40c456a1b0887e11945f0228d8d5f8cdd961385078f87c4d9d323083add0"
     },
     {
-      "bytes": 102727,
+      "bytes": 102953,
       "kind": "device_source",
       "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_clamp_kernel.cu",
-      "sha256": "49fd3e5488d235388a6f0e7f5a52499e0b3c57b0cba4e35ede7d0ffeb1071d4c"
+      "sha256": "cf9a70f8b479b1a571fe02c351496f6f862cc3c73d86318c95d0fe56447e4ab9"
     },
     {
-      "bytes": 86831,
+      "bytes": 13008,
+      "kind": "tvm_ffi_binding",
+      "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_clamp_signal_binding.cu",
+      "sha256": "3d486b7dd6cf08c70fcf89c00b48ccc5e54c7a34effa99358d5da03ec01c92df"
+    },
+    {
+      "bytes": 110894,
+      "kind": "device_source",
+      "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_clamp_signal_kernel.cu",
+      "sha256": "5b8ea202ed131530e1b7c4b97e7051518dda6d90847e249abb948e45023cb005"
+    },
+    {
+      "bytes": 87057,
       "kind": "device_source",
       "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_kernel.cu",
-      "sha256": "547edf708cf529e8d6a9846ecfb353353c1d000babbef48e4d30362490bb298b"
+      "sha256": "de8fa0a37957e9e6a2d3e01ed3488bd50762b09b82f1d06db52d82545ed73746"
     },
     {
-      "bytes": 11018,
+      "bytes": 12978,
+      "kind": "tvm_ffi_binding",
+      "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_signal_binding.cu",
+      "sha256": "e2e524cdeaad307de0e6ea903e23dcdf73eb372f1cbf444fb6d5e575f3d2d6fa"
+    },
+    {
+      "bytes": 94998,
+      "kind": "device_source",
+      "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_signal_kernel.cu",
+      "sha256": "502191b3ec2cbd18b1de6a27cdd047d17e5d6b0ca402c92f5c4d6cdf4c495bc5"
+    },
+    {
+      "bytes": 12085,
       "kind": "tvm_ffi_binding",
       "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc2_binding.cu",
-      "sha256": "a946b3067413ce41fb131e4eb150bcabbd10a71fbf0963c6325012a397b35bac"
+      "sha256": "c012efcaed791ef0288eb5e453ffe1b98ca9633f6fe03ed0a3b6d2fdd193bd35"
     },
     {
-      "bytes": 93383,
+      "bytes": 13703,
+      "kind": "tvm_ffi_binding",
+      "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc2_early_binding.cu",
+      "sha256": "f593bb2e692f974212848be80e9590514b583f1ae55cd74e47c24ef53c8f0900"
+    },
+    {
+      "bytes": 103784,
+      "kind": "device_source",
+      "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc2_early_kernel.cu",
+      "sha256": "8d1aed5a3116cd66b13f38f2cdc00d8190b56c77451c9a4076cd3e3e13baf124"
+    },
+    {
+      "bytes": 93609,
       "kind": "device_source",
       "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc2_kernel.cu",
-      "sha256": "e7f751dabaccaee0c67270b5f8e0c1905a2cd4cf8f43cfaf6feddb287c83b4c7"
+      "sha256": "58e3d8f727d5f4945cc67f09c3ddd2ab37ff98fba829eeaf9f556eb335e6b5da"
     }
   ],
   "generation_inputs": {
@@ -148,17 +187,17 @@
       },
       "closure": [
         {
-          "bytes": 86831,
+          "bytes": 87057,
           "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_kernel.cu",
-          "sha256": "547edf708cf529e8d6a9846ecfb353353c1d000babbef48e4d30362490bb298b"
+          "sha256": "de8fa0a37957e9e6a2d3e01ed3488bd50762b09b82f1d06db52d82545ed73746"
         },
         {
-          "bytes": 11048,
+          "bytes": 12115,
           "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_binding.cu",
-          "sha256": "65a255bcbdfe1763b74c005c9e827d910bc7732046dd343179df3bdff526e332"
+          "sha256": "710bf8b7df40825aee86723fff71ea779a158cf142c0c7c74965c7cb6cf8406d"
         }
       ],
-      "closure_sha256": "deb4331635bc8e601d016cf69486b7d170dca8c504e07e391e251a4232c14e11",
+      "closure_sha256": "1929236253070e0aad02cd009d8cc13249f486723fb4d4c331d84a07e01afab0",
       "compile_flags": [],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_sm90_bf16_megamoe_fc1_gated",
@@ -178,7 +217,7 @@
         "dynamic_smem_bytes": 196704,
         "max_persistent_clusters": null,
         "persistent_ctas_per_sm": 1,
-        "use_pdl": false
+        "use_pdl": true
       },
       "module_ident": "cake_sm90_bf16_megamoe_fc1_gated_sm_90a",
       "name": "cake_sm90_bf16_megamoe_fc1_gated",
@@ -273,17 +312,17 @@
       },
       "closure": [
         {
-          "bytes": 102727,
+          "bytes": 102953,
           "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_clamp_kernel.cu",
-          "sha256": "49fd3e5488d235388a6f0e7f5a52499e0b3c57b0cba4e35ede7d0ffeb1071d4c"
+          "sha256": "cf9a70f8b479b1a571fe02c351496f6f862cc3c73d86318c95d0fe56447e4ab9"
         },
         {
-          "bytes": 11078,
+          "bytes": 12145,
           "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_clamp_binding.cu",
-          "sha256": "8442138d8b43d0a3624f815ad777549f0350a6eee5b37fbd7f9056e471367c18"
+          "sha256": "6aed40c456a1b0887e11945f0228d8d5f8cdd961385078f87c4d9d323083add0"
         }
       ],
-      "closure_sha256": "7647557602daee41e9f639e7bfd23f762c84bd9cd9e12ea7c3d1ae32ae6050f5",
+      "closure_sha256": "44811d2ab4b1f257aee35b3a67ea5c8718af41a531b09f8f0ba56dde6e4d3f27",
       "compile_flags": [],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_sm90_bf16_megamoe_fc1_gated_clamp",
@@ -303,7 +342,7 @@
         "dynamic_smem_bytes": 196704,
         "max_persistent_clusters": null,
         "persistent_ctas_per_sm": 1,
-        "use_pdl": false
+        "use_pdl": true
       },
       "module_ident": "cake_sm90_bf16_megamoe_fc1_gated_clamp_sm_90a",
       "name": "cake_sm90_bf16_megamoe_fc1_gated_clamp",
@@ -398,17 +437,17 @@
       },
       "closure": [
         {
-          "bytes": 93383,
+          "bytes": 93609,
           "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc2_kernel.cu",
-          "sha256": "e7f751dabaccaee0c67270b5f8e0c1905a2cd4cf8f43cfaf6feddb287c83b4c7"
+          "sha256": "58e3d8f727d5f4945cc67f09c3ddd2ab37ff98fba829eeaf9f556eb335e6b5da"
         },
         {
-          "bytes": 11018,
+          "bytes": 12085,
           "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc2_binding.cu",
-          "sha256": "a946b3067413ce41fb131e4eb150bcabbd10a71fbf0963c6325012a397b35bac"
+          "sha256": "c012efcaed791ef0288eb5e453ffe1b98ca9633f6fe03ed0a3b6d2fdd193bd35"
         }
       ],
-      "closure_sha256": "220c891f5f2a67e29e2ed46e71777eb1f68bcac279c9e69279558e2f15ef1ffc",
+      "closure_sha256": "17746dbcfca36bc7262d46bcc517457a9cabc82fd266543dbb18319dfbaee876",
       "compile_flags": [],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_sm90_bf16_megamoe_fc2",
@@ -428,7 +467,7 @@
         "dynamic_smem_bytes": 196704,
         "max_persistent_clusters": null,
         "persistent_ctas_per_sm": 1,
-        "use_pdl": false
+        "use_pdl": true
       },
       "module_ident": "cake_sm90_bf16_megamoe_fc2_sm_90a",
       "name": "cake_sm90_bf16_megamoe_fc2",
@@ -464,6 +503,404 @@
         "binding": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc2_binding.cu",
         "compile_separately": true,
         "device": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc2_kernel.cu"
+      }
+    },
+    {
+      "arch": "sm_90a",
+      "arg_plan": [
+        [
+          "parameter",
+          "num_experts"
+        ],
+        [
+          "parameter",
+          "shape_n"
+        ],
+        [
+          "parameter",
+          "shape_k"
+        ],
+        [
+          "parameter",
+          "clamp_limit"
+        ],
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "tma_buffer",
+          "W"
+        ],
+        [
+          "buffer",
+          "offsets"
+        ],
+        [
+          "buffer",
+          "D"
+        ],
+        [
+          "buffer",
+          "sched"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "aa409fcf6c577c17f6b3c62543445294718cee7b3dfe8325885fc9062c069280",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 94998,
+          "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_signal_kernel.cu",
+          "sha256": "502191b3ec2cbd18b1de6a27cdd047d17e5d6b0ca402c92f5c4d6cdf4c495bc5"
+        },
+        {
+          "bytes": 12978,
+          "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_signal_binding.cu",
+          "sha256": "e2e524cdeaad307de0e6ea903e23dcdf73eb372f1cbf444fb6d5e575f3d2d6fa"
+        }
+      ],
+      "closure_sha256": "514b47d9e1969a6e9dc06303b3a89f7f22106e8b46d62c566f1d5b7029b3f269",
+      "compile_flags": [],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_sm90_bf16_megamoe_fc1_gated_signal",
+      "launch": {
+        "block": [
+          384,
+          1,
+          1
+        ],
+        "cluster": [
+          2,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "spread",
+        "cooperative": false,
+        "dynamic_smem_bytes": 196768,
+        "max_persistent_clusters": null,
+        "persistent_ctas_per_sm": 1,
+        "use_pdl": true
+      },
+      "module_ident": "cake_sm90_bf16_megamoe_fc1_gated_signal_sm_90a",
+      "name": "cake_sm90_bf16_megamoe_fc1_gated_signal",
+      "noncontiguous_tensors": [],
+      "role": "kernel",
+      "route": {
+        "early_start": "fc1",
+        "gated": true,
+        "source_fingerprint": "f099f6db99511b32c06d95f703c2cd5873b5667044096206ba6b82c99182851b",
+        "source_identity": "f099f6db99511b32c06d95f703c2cd5873b5667044096206ba6b82c99182851b",
+        "stage": "fc1_gated_signal",
+        "template": "sm90_bf16_moe_grouped_gemm",
+        "use_clamp": false
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "persistent_ctas_per_sm": 1,
+        "physical_schedule": "resolved_final_ir",
+        "schedule_identity": "66e9a0ce109f81dc6bab3f496a20c97839e1131b1556515b8cf7a5d1493a6740",
+        "source_arch": "sm_90a",
+        "source_cluster_scheduling_policy": "spread",
+        "source_tma_abi": "grid_constant",
+        "specializations": {},
+        "use_pdl": false,
+        "validate": false
+      },
+      "specializations": {},
+      "tma_abi": "grid_constant",
+      "translation_units": {
+        "binding": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_signal_binding.cu",
+        "compile_separately": true,
+        "device": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_signal_kernel.cu"
+      }
+    },
+    {
+      "arch": "sm_90a",
+      "arg_plan": [
+        [
+          "parameter",
+          "num_experts"
+        ],
+        [
+          "parameter",
+          "shape_n"
+        ],
+        [
+          "parameter",
+          "shape_k"
+        ],
+        [
+          "parameter",
+          "clamp_limit"
+        ],
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "tma_buffer",
+          "W"
+        ],
+        [
+          "buffer",
+          "offsets"
+        ],
+        [
+          "buffer",
+          "D"
+        ],
+        [
+          "buffer",
+          "sched"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "aa409fcf6c577c17f6b3c62543445294718cee7b3dfe8325885fc9062c069280",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 110894,
+          "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_clamp_signal_kernel.cu",
+          "sha256": "5b8ea202ed131530e1b7c4b97e7051518dda6d90847e249abb948e45023cb005"
+        },
+        {
+          "bytes": 13008,
+          "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_clamp_signal_binding.cu",
+          "sha256": "3d486b7dd6cf08c70fcf89c00b48ccc5e54c7a34effa99358d5da03ec01c92df"
+        }
+      ],
+      "closure_sha256": "5ed60ad85af42f34a5eeb586095294164f254e444bf9f900358ab6b07bd79a8d",
+      "compile_flags": [],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_sm90_bf16_megamoe_fc1_gated_clamp_signal",
+      "launch": {
+        "block": [
+          384,
+          1,
+          1
+        ],
+        "cluster": [
+          2,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "spread",
+        "cooperative": false,
+        "dynamic_smem_bytes": 196768,
+        "max_persistent_clusters": null,
+        "persistent_ctas_per_sm": 1,
+        "use_pdl": true
+      },
+      "module_ident": "cake_sm90_bf16_megamoe_fc1_gated_clamp_signal_sm_90a",
+      "name": "cake_sm90_bf16_megamoe_fc1_gated_clamp_signal",
+      "noncontiguous_tensors": [],
+      "role": "kernel",
+      "route": {
+        "early_start": "fc1",
+        "gated": true,
+        "source_fingerprint": "0ac71e1bb7ff73125a5c7dec561db233de91fd2fb4f08c713a708530857131b0",
+        "source_identity": "0ac71e1bb7ff73125a5c7dec561db233de91fd2fb4f08c713a708530857131b0",
+        "stage": "fc1_gated_clamp_signal",
+        "template": "sm90_bf16_moe_grouped_gemm",
+        "use_clamp": true
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "persistent_ctas_per_sm": 1,
+        "physical_schedule": "resolved_final_ir",
+        "schedule_identity": "d5b102147a158510c39d5f0feb478a83ca1df34e224788d459437ab767c3ff3a",
+        "source_arch": "sm_90a",
+        "source_cluster_scheduling_policy": "spread",
+        "source_tma_abi": "grid_constant",
+        "specializations": {},
+        "use_pdl": false,
+        "validate": false
+      },
+      "specializations": {},
+      "tma_abi": "grid_constant",
+      "translation_units": {
+        "binding": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_clamp_signal_binding.cu",
+        "compile_separately": true,
+        "device": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc1_gated_clamp_signal_kernel.cu"
+      }
+    },
+    {
+      "arch": "sm_90a",
+      "arg_plan": [
+        [
+          "parameter",
+          "num_experts"
+        ],
+        [
+          "parameter",
+          "shape_n"
+        ],
+        [
+          "parameter",
+          "shape_k"
+        ],
+        [
+          "parameter",
+          "clamp_limit"
+        ],
+        [
+          "tma_buffer",
+          "A"
+        ],
+        [
+          "tma_buffer",
+          "W"
+        ],
+        [
+          "buffer",
+          "offsets"
+        ],
+        [
+          "buffer",
+          "D"
+        ],
+        [
+          "buffer",
+          "sched"
+        ],
+        [
+          "buffer",
+          "fc2_done"
+        ],
+        [
+          "parameter",
+          "use_fc2_done"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "2d87aa66da602dbf1903d3786a2eec21bae629fe432e052c95b1ac835fbe161f",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 103784,
+          "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc2_early_kernel.cu",
+          "sha256": "8d1aed5a3116cd66b13f38f2cdc00d8190b56c77451c9a4076cd3e3e13baf124"
+        },
+        {
+          "bytes": 13703,
+          "path": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc2_early_binding.cu",
+          "sha256": "f593bb2e692f974212848be80e9590514b583f1ae55cd74e47c24ef53c8f0900"
+        }
+      ],
+      "closure_sha256": "48da12c18b8aea05e3e890aa249a90bb28489b2e904df8074ad373d7a12fe0fc",
+      "compile_flags": [],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_sm90_bf16_megamoe_fc2_early",
+      "launch": {
+        "block": [
+          384,
+          1,
+          1
+        ],
+        "cluster": [
+          2,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "spread",
+        "cooperative": false,
+        "dynamic_smem_bytes": 196768,
+        "max_persistent_clusters": null,
+        "persistent_ctas_per_sm": 1,
+        "use_pdl": true
+      },
+      "module_ident": "cake_sm90_bf16_megamoe_fc2_early_sm_90a",
+      "name": "cake_sm90_bf16_megamoe_fc2_early",
+      "noncontiguous_tensors": [],
+      "role": "kernel",
+      "route": {
+        "early_start": "fc2",
+        "gated": false,
+        "source_fingerprint": "9ec499546547d3111f542a4311fb801864577914408b1ef402642a03e79fed5a",
+        "source_identity": "9ec499546547d3111f542a4311fb801864577914408b1ef402642a03e79fed5a",
+        "stage": "fc2_early",
+        "template": "sm90_bf16_moe_grouped_gemm",
+        "use_clamp": false
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "persistent_ctas_per_sm": 1,
+        "physical_schedule": "resolved_final_ir",
+        "schedule_identity": "4b3f103584a2001ee57d602682b03bfaa21376957f1976b6280835fbac384822",
+        "source_arch": "sm_90a",
+        "source_cluster_scheduling_policy": "spread",
+        "source_tma_abi": "grid_constant",
+        "specializations": {},
+        "use_pdl": false,
+        "validate": false
+      },
+      "specializations": {},
+      "tma_abi": "grid_constant",
+      "translation_units": {
+        "binding": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc2_early_binding.cu",
+        "compile_separately": true,
+        "device": "flashinfer/moe_ep/kernel_src/sm90/cake_bf16_megamoe/src/cake_sm90_bf16_megamoe_fc2_early_kernel.cu"
       }
     }
   ],

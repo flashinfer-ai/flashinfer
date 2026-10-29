@@ -119,7 +119,8 @@ ffi::Module resolve_dsv4_nvfp4_query(int64_t tokens, int64_t heads, int64_t topk
   return resolve_dsv4_nvfp4_descriptor(
       {int(ModelType::DSV4), tokens, heads, topk, extra_topk, page_size, extra_page_size,
        page_stride, extra_page_stride, Dsv4Nvfp4Layout::BYTES_PER_TOKEN, topk, extra_topk, heads,
-       lengths, extra_lengths, sink, false, prefill},
+       lengths, extra_lengths, sink, false, prefill,
+       extra_topk > 0 ? int64_t{Dsv4Nvfp4Layout::BYTES_PER_TOKEN} : 0},
       int(NumericRoute::NVFP4), cpb, sm_count, shared, stage1);
 }
 

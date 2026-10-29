@@ -27,6 +27,7 @@ from ..jit import gen_cudnn_fmha_module
 
 
 _attention_handles = threading.local()
+_get_current_raw_stream = getattr(torch._C, "_cuda_getCurrentRawStream", None)
 
 
 def supports_ordered_cudnn_execution(graph_type):
@@ -124,16 +125,39 @@ class _AttentionHandle:
         weakref.finalize(self, backend.destroy_handle, self.value)
 
 
-def get_cudnn_attention_handle(backend, stream):
+def get_cudnn_attention_handle(backend, stream=None, *, device=None):
     """A handle belongs to its CUDA device and must not race across threads."""
+    if stream is not None:
+        if device is not None:
+            raise ValueError("pass either stream or device, not both")
+        device, stream_ptr = stream.device, stream.cuda_stream
+    elif (
+        _get_current_raw_stream is not None
+        and isinstance(device, torch.device)
+        and device.type == "cuda"
+        and device.index is not None
+        and torch.cuda.is_initialized()
+    ):
+        # The caller already has a CUDA tensor on this explicit device. Read
+        # its current stream each time without constructing a Python Stream.
+        # Keep lazy initialization/bad-fork checks and older Torch support on
+        # the ordinary path below; a raw query does not perform lazy init.
+        stream_ptr = _get_current_raw_stream(device.index)
+    else:
+        # Warm callers already know the index; preserve the ordinary path's
+        # integer lookup when the raw getter is unavailable.
+        if isinstance(device, torch.device) and device.type == "cuda":
+            device = device.index
+        stream = torch.cuda.current_stream(device)
+        device, stream_ptr = stream.device, stream.cuda_stream
     handles = getattr(_attention_handles, "handles", None)
     if handles is None:
         handles = _attention_handles.handles = {}
-    owner = handles.get(stream.device)
+    owner = handles.get(device)
     if owner is None:
-        with torch.cuda.device(stream.device):
-            owner = handles[stream.device] = _AttentionHandle(backend)
-    backend.set_stream(owner.value, stream.cuda_stream)
+        with torch.cuda.device(device):
+            owner = handles[device] = _AttentionHandle(backend)
+    backend.set_stream(owner.value, stream_ptr)
     return owner.value
 
 

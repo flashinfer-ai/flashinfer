@@ -296,9 +296,10 @@ def validate_mega_arch() -> None:
 def validate_mega_arch_sm90() -> None:
     """Arch gate for the SM90 (Hopper) mega kernels.
 
-    The Hopper FP8 CuTeDSL mega kernel is compiled for sm_90 exactly (WGMMA
-    warp specialization; the fork is 1-CTA-only and does not target Blackwell
-    — Blackwell hosts use the sm_100 tree's kernels instead).
+    The Hopper pull-style CuTeDSL mega kernels (FP8 and BF16) are compiled
+    for sm_90 exactly (WGMMA warp specialization; the fork is 1-CTA-only and
+    does not target Blackwell — Blackwell hosts use the sm_100 tree's kernels
+    instead).
     """
     import torch
 
@@ -307,7 +308,7 @@ def validate_mega_arch_sm90() -> None:
     cc = _device_capability()
     if cc != (9, 0):
         raise MoEEpArchError(
-            f"sm90_fp8_fp8_bf16_pull_cutedsl mega kernel requires sm_90 (Hopper); host has "
+            "the sm90_*_pull_cutedsl mega kernels require sm_90 (Hopper); host has "
             f"sm_{cc[0]}{cc[1]}"
         )
 
@@ -401,6 +402,7 @@ def validate_mega_fleet_params(
     intermediate_size: int,
     top_k: int,
     alignment: int = 128,
+    hidden_alignment: int | None = None,
 ) -> None:
     # ``alignment`` is backend-specific: deep_gemm's wire format stores scale
     # factors 4-per-int32 word (hidden/128 columns, static-asserted host and
@@ -408,6 +410,11 @@ def validate_mega_fleet_params(
     # TMA zero-fill and predicated epilogue tails; their true bound is the
     # 16B TMA row alignment and SF-word packing, i.e. 64 (verified 2026-07-21
     # against gpt-oss-120b geometry, hidden=inter=2880).
+    # ``hidden_alignment`` overrides ``alignment`` for token_hidden_size only,
+    # for backends whose hidden bound (e.g. the fc2 N tile) is stricter than
+    # their intermediate bound.
+    if hidden_alignment is None:
+        hidden_alignment = alignment
     if world_size <= 0:
         raise MoEEpConfigError(f"world_size must be positive, got {world_size}")
     if params.num_experts % world_size != 0:
@@ -415,10 +422,10 @@ def validate_mega_fleet_params(
             f"num_experts ({params.num_experts}) must be divisible by "
             f"world_size ({world_size})"
         )
-    if params.token_hidden_size % alignment != 0:
+    if params.token_hidden_size % hidden_alignment != 0:
         raise MoEEpConfigError(
             f"token_hidden_size ({params.token_hidden_size}) must be a "
-            f"multiple of {alignment}"
+            f"multiple of {hidden_alignment}"
         )
     if intermediate_size % alignment != 0:
         raise MoEEpConfigError(

@@ -89,7 +89,7 @@ def main():
     )
     print(f"{torch.cuda.get_device_name(device)} ({arch}, {sms} SMs)")
     print(
-        f"{'precision':9s} {'Q':>5s} {'K':>8s} {'route':19s} {'launches':>8s} {'us':>9s} {'KV GB/s':>8s} {'TFLOP/s':>8s}"
+        f"{'precision':9s} {'Q':>5s} {'K':>8s} {'route':24s} {'launches':>8s} {'us':>9s} {'KV GB/s':>8s} {'TFLOP/s':>8s}"
     )
     for precision in args.precision:
         for queries in args.queries:
@@ -119,7 +119,7 @@ def main():
                 kv_bytes = keys * (64 + 4 if precision == "fp4" else 128 + 4)
                 flops = 2.0 * queries * 32 * 128 * keys
                 print(
-                    f"{precision:9s} {queries:5d} {keys:8d} {plan.route_name:19s} {plan.launch_count:8d} "
+                    f"{precision:9s} {queries:5d} {keys:8d} {plan.route_name:24s} {plan.launch_count:8d} "
                     f"{ms * 1e3:9.1f} {kv_bytes / ms / 1e6:8.1f} {flops / ms / 1e9:8.1f}"
                 )
                 del plan, q, kv, q_scales, kv_scales, weights, starts, ends

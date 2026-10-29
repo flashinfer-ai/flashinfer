@@ -335,10 +335,7 @@ def test_invalid_routing_indices_rejected(tensor_index, value, message):
         prepare_bgmv_moe(*inputs, backend="cake")
 
 
-def test_plan_alias_kept_and_blackwell_backend_rejected():
-    from flashinfer.fused_moe import BGMVMoEBlackwellPlan, BGMVMoECakePlan
-
-    assert BGMVMoEBlackwellPlan is BGMVMoECakePlan
+def test_blackwell_backend_rejected():
     x = torch.empty((1, 2688), dtype=torch.bfloat16)
     empty_i64 = torch.empty((1,), dtype=torch.int64)
     empty_f32 = torch.empty((1,), dtype=torch.float32)
@@ -363,7 +360,7 @@ def test_y_accum_may_be_a_column_slice_of_a_wider_buffer(hidden_size, rank):
     expected = _reference(inputs)
     num_tokens = int(inputs[0].shape[0])
     # The bundle follows the per-arch selector (specialized 2688/3072 x 32 only
-    # inside the Blackwell token window; generic everywhere else).
+    # inside the SM100/SM103/SM107 token window; generic everywhere else).
     variant = _expected_variant(hidden_size, num_tokens, rank)
     wide = torch.full(
         (num_tokens, hidden_size + 64), float("nan"), dtype=torch.float32, device="cuda"
@@ -418,6 +415,78 @@ def test_unknown_backend_rejected():
         )
 
 
+def test_cake_plan_rejects_the_retired_schedule_and_shrink_form():
+    # The specialized 64-lane expand (schedule 0) and the generic four-pair
+    # decode shrink (form 1) were removed: the plan constructor rejects them
+    # before it allocates any workspace (the bindings reject them again).
+    # CPU tensors: nothing here touches a device.
+    kwargs = dict(
+        y_accum=torch.empty((4, 2688), dtype=torch.float32),
+        shrink_out=torch.empty((1, 8, 32), dtype=torch.bfloat16),
+        x=torch.empty((4, 2688), dtype=torch.bfloat16),
+        lora_a=torch.empty((1, 2, 32, 2688), dtype=torch.bfloat16),
+        lora_b=torch.empty((1, 2, 2688, 32), dtype=torch.bfloat16),
+        sorted_token_ids=torch.empty((8,), dtype=torch.int64),
+        expert_ids=torch.empty((8,), dtype=torch.int64),
+        lora_indices=torch.empty((4,), dtype=torch.int64),
+        topk_weights=torch.empty((8,), dtype=torch.float32),
+    )
+    with pytest.raises(ValueError, match="schedule_id 0"):
+        BGMVMoECakePlan(None, schedule_id=0, variant="specialized", **kwargs)
+    with pytest.raises(ValueError, match="schedule_id 2"):
+        BGMVMoECakePlan(
+            None, schedule_id=2, variant="generic", shrink_launch=(0, 1), **kwargs
+        )
+    with pytest.raises(ValueError, match="shrink_launch"):
+        BGMVMoECakePlan(
+            None, schedule_id=1, variant="generic", shrink_launch=(1, 1), **kwargs
+        )
+    with pytest.raises(ValueError, match="shrink_launch"):
+        BGMVMoECakePlan(None, schedule_id=1, variant="generic", **kwargs)
+
+
+def test_generic_plan_rejects_the_plain_launch_off_sm90():
+    # The plain launch (pdl_mode 0) is an sm_90a form: the SM100/SM103/SM107
+    # generic bundles render the PDL kernel forms only, prepare_bgmv_moe never
+    # selects mode 0 there, and both the plan constructor and the binding reject
+    # a direct request for it. On SM90 the plain forms run and match the reference.
+    _require_cake_arch()
+    from flashinfer.jit.cake_bgmv_moe import CAKE_BGMV_MOE_PDL_MODES
+
+    inputs = _make_inputs(3072, 8, torch.bfloat16, rank=16)
+    expected = _reference(inputs)
+    plan = prepare_bgmv_moe(*inputs, backend="cake", fallback=False)
+    assert plan.variant == "generic"
+    modes = CAKE_BGMV_MOE_PDL_MODES[_device_arch()]
+    assert plan.pdl_mode in modes
+    kwargs = dict(
+        y_accum=plan.y_accum,
+        shrink_out=plan.shrink_out,
+        x=plan.x,
+        lora_a=plan.lora_a,
+        lora_b=plan.lora_b,
+        sorted_token_ids=plan.sorted_token_ids,
+        expert_ids=plan.expert_ids,
+        lora_indices=plan.lora_indices,
+        topk_weights=plan.topk_weights,
+        schedule_id=plan.schedule_id,
+        variant="generic",
+        shrink_launch=plan.shrink_launch,
+    )
+    if 0 in modes:
+        plain = BGMVMoECakePlan(plan._module, pdl_mode=0, **kwargs)
+        torch.testing.assert_close(plain.run(), expected, atol=1e-2, rtol=1e-2)
+        plain.close()
+    else:
+        with pytest.raises(ValueError, match="pdl_mode 0"):
+            BGMVMoECakePlan(plan._module, pdl_mode=0, **kwargs)
+        # The binding rejects the mode as well (the plan is not replayed after).
+        plan.pdl_mode = 0
+        with pytest.raises(RuntimeError, match="pdl_mode"):
+            plan.run()
+    plan.close()
+
+
 def test_cake_plan_reports_backend_used():
     _require_cake_arch()
     plan = prepare_bgmv_moe(*_make_inputs(2688, 4, torch.bfloat16), backend="cake")
@@ -428,7 +497,8 @@ def test_cake_plan_reports_backend_used():
 
 # (hidden, rank, tokens, dtype, arbitrary routes, top_k): runtime-hidden
 # generic bundles. Tokens <= 8 take the 64-lane expand, more the 128-lane one;
-# <= 32 pairs take the decode shrink (PPB=4), more the prefill shrink (PPB=1).
+# small pair x rank-tile grids take the three-stage prefill shrink, wide grids
+# the two-stage one (one pair per CTA either way).
 _GENERIC_CASES = [
     (3072, 16, 8, torch.bfloat16, False, 2),
     (3072, 8, 40, torch.float16, False, 2),
@@ -481,6 +551,13 @@ def test_expert_sorted_routes_match_reference_and_replay_bitwise(
     plan = prepare_bgmv_moe(*inputs, backend="cake", fallback=False)
     assert isinstance(plan, BGMVMoECakePlan)
     assert plan.variant == _expected_variant(hidden_size, num_tokens)
+    # The plan sizes the route index from the variant: only the per-route generic
+    # shrink appends the hidden-split region.
+    from flashinfer.jit.cake_bgmv_moe import cake_bgmv_moe_route_index_numel
+
+    assert plan.route_index.numel() == cake_bgmv_moe_route_index_numel(
+        num_tokens, plan.variant, grouped=plan.grouped
+    )
     first = plan.run().clone()
     torch.cuda.synchronize()
     torch.testing.assert_close(first, expected, atol=1e-2, rtol=1e-2)
@@ -789,7 +866,8 @@ def test_specialized_variant_window_at_rank_32(hidden_size):
     _require_cake_arch()
     # Decode-sized launches take the generic bundle on every architecture
     # (hidden-split shrink + programmatic dependent launch); the specialized
-    # bodies are used only inside the per-arch token window (Blackwell 128..512).
+    # bodies are used only inside the per-arch token window (32..1024 tokens on
+    # SM100/SM103/SM107; SM90 has no window and always takes the generic bundle).
     plan = prepare_bgmv_moe(
         *_make_inputs(hidden_size, 4, torch.bfloat16), backend="cake"
     )

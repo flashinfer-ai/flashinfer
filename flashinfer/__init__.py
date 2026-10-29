@@ -37,9 +37,11 @@ from .gated_act_mxfp8 import (
 from .attention import BatchAttention as BatchAttention
 from .attention import (
     BatchAttentionWithAttentionSinkWrapper as BatchAttentionWithAttentionSinkWrapper,
+    BatchDecodeWithAttentionSinkWrapper as BatchDecodeWithAttentionSinkWrapper,
     BatchPrefillWithCausalBidirectionalRangesWrapper as BatchPrefillWithCausalBidirectionalRangesWrapper,
 )
 from .autotune_cache import MeasurementPolicy as MeasurementPolicy
+from .autotune_cache import ReplayCoverage as ReplayCoverage
 from .autotune_cache import autotune_v2 as autotune_v2
 from .autotune_cache import autotune_v2_reload as autotune_v2_reload
 from .autotuner import autotune as autotune
@@ -124,6 +126,7 @@ from .quantization.fp8_quantization import (
     mxfp8_dequantize_host,
     mxfp8_grouped_quantize,
     mxfp8_quantize,
+    silu_and_mul_mxfp8_experts_quantize,
 )
 from .attn_scores import min_block_table_width as min_block_table_width
 from .attn_scores import padded_seq_len as padded_seq_len
@@ -151,12 +154,16 @@ from .fused_moe import (
 _PRIMS_TS_LAZY_EXPORTS = frozenset(
     {
         "prims_ts_bf16_moe",
+        "prims_ts_bf16_moe_partitioned",
         "prims_ts_bf16_routed_moe",
         "prims_ts_fp4_block_scale_moe",
+        "prims_ts_fp4_block_scale_moe_partitioned",
         "prims_ts_fp4_block_scale_routed_moe",
         "prims_ts_fp8_block_scale_moe",
+        "prims_ts_fp8_block_scale_moe_partitioned",
         "prims_ts_fp8_block_scale_routed_moe",
         "prims_ts_fp8_per_tensor_scale_moe",
+        "prims_ts_fp8_per_tensor_scale_moe_partitioned",
     }
 )
 
@@ -189,6 +196,12 @@ with contextlib.suppress(ImportError):
         CuteDslBf16MoEWrapper as CuteDslBf16MoEWrapper,
     )
     from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
+    from .gdn_paged import (
+        chunk_gated_delta_rule_paged as chunk_gated_delta_rule_paged,
+        gated_delta_rule_decode_paged as gated_delta_rule_decode_paged,
+        gdn_paged_decode_slots as gdn_paged_decode_slots,
+        gdn_paged_prefill_slots as gdn_paged_prefill_slots,
+    )
 from .gdn2_prefill import chunk_gated_delta_rule2 as chunk_gated_delta_rule2
 from .gdp_prefill import chunk_gated_delta_product as chunk_gated_delta_product
 
@@ -206,19 +219,24 @@ from .gdn_kernels.experimental import (
     gdn_fused_decode_step as gdn_fused_decode_step,
     gdn_fused_decode_step_supported as gdn_fused_decode_step_supported,
 )
-from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_bf16 as bmm_bf16
 from .gemm import bmm_fp8 as bmm_fp8
 from .gemm import bmm_mxfp8 as bmm_mxfp8
 from .gemm import mm_bf16 as mm_bf16
+from .gemm import mm_bf16_fp4 as mm_bf16_fp4
 from .gemm import mm_fp4 as mm_fp4
+from .gemm import mm_fp8 as mm_fp8
+from .gemm import mm_fp8_lora as mm_fp8_lora
+from .gemm import mm_mxfp8 as mm_mxfp8
+from .gemm import mm_nvfp4_lora as mm_nvfp4_lora
 from .gemm import mm_nvfp4_svdquant as mm_nvfp4_svdquant
 from .gemm import nvfp4_quantize_smooth as nvfp4_quantize_smooth
-from .gemm import svdquant_linear as svdquant_linear
-from .gemm import mm_bf16_fp4 as mm_bf16_fp4
 from .gemm import prepare_bf16_fp4_weights as prepare_bf16_fp4_weights
-from .gemm import mm_fp8 as mm_fp8
-from .gemm import mm_mxfp8 as mm_mxfp8
+from .gemm import prepare_nvfp4_lora_adapter as prepare_nvfp4_lora_adapter
+from .gemm import PreparedNvFp4LoraAdapter as PreparedNvFp4LoraAdapter
+from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
+from .gemm import StaleAdapterError as StaleAdapterError
+from .gemm import svdquant_linear as svdquant_linear
 from .gemm import tgv_gemm_sm100 as tgv_gemm_sm100
 from .grouped_mm import grouped_mm_bf16 as grouped_mm_bf16
 from .grouped_mm import grouped_mm_fp8 as grouped_mm_fp8
@@ -261,6 +279,62 @@ from .cake_rmsnorm_train import (
 )
 from .cake_rmsnorm_train import (
     cake_rmsnorm_train_forward as cake_rmsnorm_train_forward,
+)
+from .cake_causal_conv1d_train import (
+    CakeCausalConv1dFunction as CakeCausalConv1dFunction,
+)
+from .cake_causal_conv1d_train import cake_causal_conv1d as cake_causal_conv1d
+from .cake_causal_conv1d_train import (
+    cake_causal_conv1d_train_backward as cake_causal_conv1d_train_backward,
+)
+from .cake_causal_conv1d_train import (
+    cake_causal_conv1d_train_backward_workspace_bytes as cake_causal_conv1d_train_backward_workspace_bytes,
+)
+from .cake_causal_conv1d_train import (
+    cake_causal_conv1d_train_forward as cake_causal_conv1d_train_forward,
+)
+from .cake_causal_conv1d_train import (
+    cake_causal_conv1d_train_forward_workspace_bytes as cake_causal_conv1d_train_forward_workspace_bytes,
+)
+from .cake_mhc_train import CakeMHCTrainFinishFunction as CakeMHCTrainFinishFunction
+from .cake_mhc_train import CakeMHCTrainPrepareFunction as CakeMHCTrainPrepareFunction
+from .cake_mhc_train import (
+    cake_mhc_train_backward_finish as cake_mhc_train_backward_finish,
+)
+from .cake_mhc_train import (
+    cake_mhc_train_backward_prepare as cake_mhc_train_backward_prepare,
+)
+from .cake_mhc_train import (
+    cake_mhc_train_backward_workspace_bytes as cake_mhc_train_backward_workspace_bytes,
+)
+from .cake_mhc_train import cake_mhc_train_finish as cake_mhc_train_finish
+from .cake_mhc_train import (
+    cake_mhc_train_forward_finish as cake_mhc_train_forward_finish,
+)
+from .cake_mhc_train import (
+    cake_mhc_train_forward_prepare as cake_mhc_train_forward_prepare,
+)
+from .cake_mhc_train import (
+    cake_mhc_train_forward_stats as cake_mhc_train_forward_stats,
+)
+from .cake_mhc_train import (
+    cake_mhc_train_forward_workspace_bytes as cake_mhc_train_forward_workspace_bytes,
+)
+from .cake_mhc_train import cake_mhc_train_prepare as cake_mhc_train_prepare
+from .cake_gdp import (
+    cake_gated_delta_product_mtp as cake_gated_delta_product_mtp,
+)
+from .norm import gated_residual_rmsnorm as gated_residual_rmsnorm
+from .norm import gated_residual_next_rmsnorm as gated_residual_next_rmsnorm
+from .norm import rmsnorm_sigmoid_gate as rmsnorm_sigmoid_gate
+from .norm import (
+    supports_gated_residual_next_rmsnorm as supports_gated_residual_next_rmsnorm,
+)
+from .norm import (
+    supports_gated_residual_rmsnorm as supports_gated_residual_rmsnorm,
+)
+from .norm import (
+    supports_rmsnorm_sigmoid_gate as supports_rmsnorm_sigmoid_gate,
 )
 from . import nvfp4_attention_sm120 as nvfp4_attention_sm120
 from .nvfp4_attention_sm120 import (
@@ -315,6 +389,8 @@ from .prefill import (
 )
 from .quantization import packbits as packbits
 from .quantization import segment_packbits as segment_packbits
+from .qsa import qsa_forward as qsa_forward
+from .qsa import qsa_indexed_forward as qsa_indexed_forward
 from .rope import apply_llama31_rope as apply_llama31_rope
 from .rope import apply_llama31_rope_inplace as apply_llama31_rope_inplace
 from .rope import apply_llama31_rope_pos_ids as apply_llama31_rope_pos_ids
@@ -442,3 +518,4 @@ from .kda_prefill import KDAPrefillPlanCache as KDAPrefillPlanCache
 from .kda_prefill import (
     kda_prefill_supports_fp32_checkpoints as kda_prefill_supports_fp32_checkpoints,
 )
+from . import megamoe as megamoe

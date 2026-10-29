@@ -5,7 +5,7 @@
 
 #include "../include/cake_fmha.h"
 
-extern "C" __global__ void kernel_cake_fmha_decode_native_bf16_hd256_smallm_n32_p64(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const* K, CakeFmhaTensorMap const* V, __nv_bfloat16* partial_O_ptr, float* partial_LSE_ptr, __nv_bfloat16* O_ptr, float* LSE_ptr, uint32_t* counters, int* page_table, int* seq_lens, int max_pages_per_seq, float softmax_scale_log2, int num_q_heads, int num_kv_heads);
+extern "C" __global__ void kernel_cake_fmha_decode_native_bf16_hd256_smallm_n32_p64(const __grid_constant__ CakeFmhaTensorMap Q_tmap, const __grid_constant__ CakeFmhaTensorMap K_tmap, const __grid_constant__ CakeFmhaTensorMap V_tmap, __nv_bfloat16* partial_O_ptr, float* partial_LSE_ptr, __nv_bfloat16* O_ptr, float* LSE_ptr, uint32_t* counters, int* page_table, int* seq_lens, int max_pages_per_seq, float softmax_scale_log2, int num_q_heads, int num_kv_heads);
 
 extern "C" cudaError_t cake_fmha_launch_decode_native_bf16_hd256_smallm_n32_p64(
     CakeFmhaTensorMap const* Q,
@@ -34,9 +34,9 @@ extern "C" cudaError_t cake_fmha_launch_decode_native_bf16_hd256_smallm_n32_p64(
         return status;
     }
     void* kernel_args[] = {
-        const_cast<void*>(reinterpret_cast<const void*>(&Q)),
-        const_cast<void*>(reinterpret_cast<const void*>(&K)),
-        const_cast<void*>(reinterpret_cast<const void*>(&V)),
+        const_cast<void*>(reinterpret_cast<const void*>(Q)),
+        const_cast<void*>(reinterpret_cast<const void*>(K)),
+        const_cast<void*>(reinterpret_cast<const void*>(V)),
         const_cast<void*>(reinterpret_cast<const void*>(&partial_O_ptr)),
         const_cast<void*>(reinterpret_cast<const void*>(&partial_LSE_ptr)),
         const_cast<void*>(reinterpret_cast<const void*>(&O_ptr)),

@@ -24,7 +24,8 @@ import random
 import torch
 import pytest
 
-pytestmark = pytest.mark.long_running
+# H100 CI peak GPU memory: 43.0 GiB.
+pytestmark = [pytest.mark.long_running, pytest.mark.gpu_exclusive]
 
 
 try:
@@ -54,11 +55,20 @@ try:
     from flashinfer.gdn_kernels.gdn_decode_bf16_state import (
         gated_delta_rule as gdn_decode_bf16_state,
         gated_delta_rule_mtp as gdn_decode_bf16_state_mtp,
+        gated_delta_rule_t1_wide_vec as gdn_decode_bf16_state_t1_wide_vec,
     )
 
     GDN_DECODE_BF16_STATE_AVAILABLE = True
 except ImportError:
     GDN_DECODE_BF16_STATE_AVAILABLE = False
+
+# Rubin-tuned (SM107) T=1 BF16 state kernel
+try:
+    from flashinfer.gdn_kernels.gdn_decode_bf16_state_rubin import (
+        gated_delta_rule_t1_rubin as gdn_decode_bf16_state_t1_rubin,
+    )
+except (ImportError, RuntimeError):
+    gdn_decode_bf16_state_t1_rubin = None
 
 
 def _skip_if_not_sm90_or_later():
@@ -2018,15 +2028,22 @@ def _test_gdn_decode_bf16_state_t1_kernel(
     alpha: bool,
     beta: bool,
     seed: int | None = None,
+    kernel: str = "generic",
 ):
     """Test BF16 state kernel for T=1.
 
     Both kernel and reference use bf16 h state so the comparison is apples-to-apples.
+    ``kernel="rubin"`` runs the Rubin-tuned T=1 kernel (SM107) instead of the generic one.
     """
     _skip_if_not_sm90_or_later()
 
     if not GDN_DECODE_BF16_STATE_AVAILABLE:
         pytest.skip("BF16 state kernel not available")
+    if kernel == "rubin" and gdn_decode_bf16_state_t1_rubin is None:
+        pytest.skip("Rubin BF16 state kernel not available")
+    kernel_fn = (
+        gdn_decode_bf16_state_t1_rubin if kernel == "rubin" else gdn_decode_bf16_state
+    )
 
     random.seed(seed)
     torch.random.manual_seed(seed)
@@ -2070,7 +2087,7 @@ def _test_gdn_decode_bf16_state_t1_kernel(
     # non-pool semantics.
     our_state = input_state_kernel.clone()
     indices = torch.arange(batch_size, dtype=torch.int32, device=device)
-    our_o = gdn_decode_bf16_state(
+    our_o = kernel_fn(
         A_log=A_log,
         a=a,
         dt_bias=dt_bias,
@@ -2144,7 +2161,11 @@ def _test_gdn_decode_bf16_state_t1_kernel(
 # One B per _get_bf16_mtp_config bucket, at both HV=32 and HV=64.
 @pytest.mark.parametrize("batch_size", [1, 4, 8, 16, 32])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
+@pytest.mark.parametrize(
+    "kernel", ["generic", pytest.param("rubin", marks=pytest.mark.arch_rubin)]
+)
 def test_gdn_decode_bf16_state_t1_kernel(
+    kernel: str,
     dtype: str,
     num_q_heads: int,
     num_k_heads: int,
@@ -2168,7 +2189,43 @@ def test_gdn_decode_bf16_state_t1_kernel(
         alpha,
         beta,
         seed,
+        kernel,
     )
+
+
+def test_pretranspose_backend_rubin_rejected_off_sm107():
+    """backend="rubin" and the Rubin kernel itself are gated to compute capability 10.7."""
+    _skip_if_not_sm90_or_later()
+    if gdn_decode_bf16_state_t1_rubin is None:
+        pytest.skip("Rubin BF16 state kernel not available")
+    if get_compute_capability(torch.device("cuda")) == (10, 7):
+        pytest.skip("runs on GPUs other than SM107")
+    B, H, HV, K = 8, 16, 64, 128
+    device = torch.device("cuda")
+    q = torch.randn(B, 1, H, K, dtype=torch.bfloat16, device=device)
+    k = torch.randn(B, 1, H, K, dtype=torch.bfloat16, device=device)
+    v = torch.randn(B, 1, HV, K, dtype=torch.bfloat16, device=device)
+    a = torch.randn(B, 1, HV, dtype=torch.bfloat16, device=device)
+    b = torch.randn(B, 1, HV, dtype=torch.bfloat16, device=device)
+    A_log = torch.randn(HV, dtype=torch.float32, device=device)
+    dt_bias = torch.randn(HV, dtype=torch.float32, device=device)
+    state = torch.randn(B, HV, K, K, dtype=torch.bfloat16, device=device)
+    with pytest.raises(ValueError, match="10.7"):
+        gated_delta_rule_decode_pretranspose(
+            q, k, v, state, A_log, a, dt_bias, b, backend="rubin"
+        )
+    with pytest.raises(ValueError, match="10.7"):
+        gdn_decode_bf16_state_t1_rubin(
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=state,
+            initial_state_indices=torch.arange(B, dtype=torch.int32, device=device),
+        )
 
 
 # ============================================================================
@@ -3527,6 +3584,225 @@ def test_gdn_decode_bf16_state_mtp_pool_larger_than_batch(
 
 
 # ==============================================================================
+# Cache-step stride regression: a logical T view may have a larger batch stride.
+# ==============================================================================
+
+
+@pytest.mark.parametrize("cache_form", ["view", "padded", "offset"])
+@pytest.mark.parametrize(
+    "state_dtype,batch_size,num_v_heads,num_tokens",
+    [
+        pytest.param(torch.float32, 2, 64, 2, id="fp32-inline"),
+        pytest.param(torch.float32, 3, 64, 2, id="fp32-warp"),
+        pytest.param(torch.bfloat16, 2, 32, 2, id="bf16-ilp4"),
+        pytest.param(torch.bfloat16, 2, 64, 2, id="bf16-wide-vec"),
+        pytest.param(torch.bfloat16, 2, 64, 1, id="bf16-t1-wide-vec"),
+    ],
+)
+def test_gdn_decode_mtp_cache_steps_stride(
+    state_dtype: torch.dtype,
+    batch_size: int,
+    num_v_heads: int,
+    num_tokens: int,
+    cache_form: str,
+):
+    """Honor the physical cache stride of a padded cache.
+
+    ``cache_form="view"`` passes the leading view ``cache[:, :T]``;
+    ``cache_form="padded"`` passes the ``[B, cache_steps, HV, V, K]``
+    allocation directly with ``cache_steps > T``; ``cache_form="offset"``
+    passes ``cache[1:1 + B, :T]`` of a ``B + 1``-row allocation, so the view
+    also carries a non-zero storage offset. The old flat index used
+    ``i_n * T * HV`` and ignored the larger batch stride in both forms (and
+    the BF16 wrappers wrote a non-contiguous view into a throwaway copy). For
+    B > 1 that packed batch 1 into batch 0's trailing slots and left batch 1's
+    requested slots unwritten. Compare against an exact-T cache and require
+    the hidden trailing slots to remain bit-exact sentinels across every
+    FP32/BF16 MTP kernel route.
+    """
+    _skip_if_not_sm90_or_later()
+    if state_dtype == torch.bfloat16 and not GDN_DECODE_BF16_STATE_AVAILABLE:
+        pytest.skip("BF16 state kernel not available")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    B, T, cache_steps = batch_size, num_tokens, 4
+    H, HV, K, V = 16, num_v_heads, 128, 128
+
+    q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    k = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    v = torch.randn(B, T, HV, V, dtype=torch.bfloat16, device=device)
+    a = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
+    b = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
+    A_log = torch.randn(HV, dtype=torch.float32, device=device)
+    dt_bias = torch.randn(HV, dtype=torch.float32, device=device)
+    initial_state = torch.randn(B, HV, V, K, dtype=state_dtype, device=device)
+    initial_state_indices = torch.arange(B, dtype=torch.int32, device=device)
+
+    cache_exact = torch.zeros(B, T, HV, V, K, dtype=state_dtype, device=device)
+    sentinel = 7.0
+    extra_rows = 1 if cache_form == "offset" else 0
+    cache_backing = torch.full(
+        (B + extra_rows, cache_steps, HV, V, K),
+        sentinel,
+        dtype=state_dtype,
+        device=device,
+    )
+    # [B, cache_steps, HV, V, K]; a non-zero storage offset when extra_rows.
+    cache_rows = cache_backing[extra_rows:]
+    cache_view = cache_rows[:, :T]
+    assert cache_view.shape == cache_exact.shape
+    assert cache_view.stride(0) == cache_steps * HV * V * K
+    assert not cache_view.is_contiguous()
+    if cache_form == "padded":
+        # Padded allocation passed directly: logical dim 1 exceeds T and only
+        # steps [0, T) of each batch row may be written.
+        cache_under_test = cache_rows
+        assert cache_under_test.shape[1] == cache_steps > T
+        assert cache_under_test.is_contiguous()
+    else:
+        cache_under_test = cache_view
+        assert (
+            cache_under_test.storage_offset() == extra_rows * cache_steps * HV * V * K
+        )
+
+    common = dict(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_indices=initial_state_indices,
+        scale=K**-0.5,
+        disable_state_update=False,
+    )
+
+    if state_dtype == torch.float32:
+        out_exact, _ = gated_delta_rule_mtp(
+            **common,
+            initial_state=initial_state.clone(),
+            intermediate_states_buffer=cache_exact,
+            use_qk_l2norm=True,
+        )
+        out_padded, _ = gated_delta_rule_mtp(
+            **common,
+            initial_state=initial_state.clone(),
+            intermediate_states_buffer=cache_under_test,
+            use_qk_l2norm=True,
+        )
+    elif T == 1:
+        out_exact = gdn_decode_bf16_state_t1_wide_vec(
+            **common,
+            initial_state_source=initial_state.clone(),
+            intermediate_states_buffer=cache_exact,
+            use_qk_l2norm_in_kernel=True,
+        )
+        out_padded = gdn_decode_bf16_state_t1_wide_vec(
+            **common,
+            initial_state_source=initial_state.clone(),
+            intermediate_states_buffer=cache_under_test,
+            use_qk_l2norm_in_kernel=True,
+        )
+    else:
+        out_exact = gdn_decode_bf16_state_mtp(
+            **common,
+            initial_state_source=initial_state.clone(),
+            intermediate_states_buffer=cache_exact,
+            use_qk_l2norm_in_kernel=True,
+        )
+        out_padded = gdn_decode_bf16_state_mtp(
+            **common,
+            initial_state_source=initial_state.clone(),
+            intermediate_states_buffer=cache_under_test,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out_padded, out_exact, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(cache_view, cache_exact, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        cache_rows[:, T:],
+        torch.full_like(cache_rows[:, T:], sentinel),
+        atol=0,
+        rtol=0,
+    )
+    if extra_rows:
+        # Rows before the batch slice must stay untouched.
+        assert torch.equal(
+            cache_backing[:extra_rows],
+            torch.full_like(cache_backing[:extra_rows], sentinel),
+        )
+
+
+def test_gdn_decode_bf16_dense_cache_int64_boundary():
+    """Dense BF16 cache addressing must remain 64-bit beyond 2**31 elements."""
+    _skip_if_not_sm90_or_later()
+    if not GDN_DECODE_BF16_STATE_AVAILABLE:
+        pytest.skip("BF16 state kernel not available")
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    B, T, cache_steps = 257, 1, 8
+    H, HV, K, V = 1, 64, 128, 128
+
+    q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    k = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=device)
+    v = torch.randn(B, T, HV, V, dtype=torch.bfloat16, device=device)
+    a = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
+    b = torch.randn(B, T, HV, dtype=torch.bfloat16, device=device)
+    A_log = torch.randn(HV, dtype=torch.float32, device=device)
+    dt_bias = torch.randn(HV, dtype=torch.float32, device=device)
+    state = torch.randn(1, HV, V, K, dtype=torch.bfloat16, device=device)
+    state_indices = torch.zeros(B, dtype=torch.int32, device=device)
+
+    # At batch index 256, flat_idx * V * K reaches 2**31 elements. Keep the
+    # state pool compact and leave the 4.02 GiB cache uninitialized so the test
+    # exercises the boundary without unnecessary initialization traffic.
+    cache_backing = torch.empty(
+        B, cache_steps, HV, V, K, dtype=torch.bfloat16, device=device
+    )
+    cache = cache_backing[:, :T]
+    output = gdn_decode_bf16_state_t1_wide_vec(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        q=q,
+        k=k,
+        v=v,
+        b=b,
+        initial_state_source=state,
+        initial_state_indices=state_indices,
+        intermediate_states_buffer=cache,
+        disable_state_update=False,
+        use_qk_l2norm_in_kernel=True,
+        scale=K**-0.5,
+    )
+
+    ref_cache = torch.empty(1, T, HV, V, K, dtype=torch.bfloat16, device=device)
+    ref_output = gdn_decode_bf16_state_t1_wide_vec(
+        A_log=A_log,
+        a=a[-1:],
+        dt_bias=dt_bias,
+        q=q[-1:],
+        k=k[-1:],
+        v=v[-1:],
+        b=b[-1:],
+        initial_state_source=state,
+        initial_state_indices=state_indices[:1],
+        intermediate_states_buffer=ref_cache,
+        disable_state_update=False,
+        use_qk_l2norm_in_kernel=True,
+        scale=K**-0.5,
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(output[-1:], ref_output, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(cache[-1:, :T], ref_cache, atol=1e-2, rtol=1e-2)
+
+
+# ==============================================================================
 # BF16 state FLA-style per-token pool scatter (ssm_state_indices)
 # ==============================================================================
 # vLLM-compatible API: when `ssm_state_indices` (shape [B, T] int32) is passed,
@@ -3981,8 +4257,12 @@ def test_gdn_decode_bf16_state_fla_scatter_padded_pool(
     gated_delta_rule_mtp(**common, initial_state_source=pool_ref)
     torch.cuda.synchronize()
 
-    # Under test: padded pool → slot-slice fallback
-    pool_under_test = pool_padded.clone()
+    # Under test: padded pool → slot-slice fallback. Clone the backing
+    # allocation, not the view: clone() of a non-dense view comes back
+    # contiguous and would take the flat path again.
+    big_under_test = big.clone()
+    pool_under_test = big_under_test[:, :HV, :, :]
+    assert not pool_under_test.is_contiguous()
     gated_delta_rule_mtp(**common, initial_state_source=pool_under_test)
     torch.cuda.synchronize()
 
@@ -3998,6 +4278,16 @@ def test_gdn_decode_bf16_state_fla_scatter_padded_pool(
                 rtol=0,
                 msg=f"padded-pool fallback diverged at (i={i}, t={t}, slot={slot})",
             )
+
+    # The per-slot padding belongs to the caller (vLLM keeps conv state there).
+    torch.testing.assert_close(
+        big_under_test[:, HV:],
+        big[:, HV:],
+        atol=0,
+        rtol=0,
+        equal_nan=True,
+        msg="padded-pool fallback wrote into the per-slot padding",
+    )
 
 
 @pytest.mark.parametrize("max_T", [8])
@@ -4202,6 +4492,71 @@ def _packed_qkv_params(batch_size, seq_len, num_v_heads, device):
     return a, b, A_log, dt_bias
 
 
+def test_decode_pretranspose_accepts_scalar_aligned_views():
+    """Gate/parameter views with only element-size alignment must be accepted.
+
+    Regression test: the scalar-loaded operands (a, b, A_log, dt_bias) were
+    wrapped with from_dlpack(assumed_align=16), rejecting contiguous views
+    whose base pointer is not 16-byte aligned, e.g. the second half of a
+    packed [B, 2*HV] gate buffer when HV % 8 != 0.
+    """
+    _skip_if_not_sm90_or_later()
+    torch.manual_seed(0)
+    B, H, HV, D = 2, 2, 4, 128
+    dev = torch.device("cuda")
+    scale = 1.0 / math.sqrt(D)
+
+    q = torch.randn(B, 1, H, D, dtype=torch.bfloat16, device=dev)
+    k = torch.randn_like(q)
+    v = torch.randn(B, 1, HV, D, dtype=torch.bfloat16, device=dev)
+    pool = torch.randn(B + 1, HV, D, D, dtype=torch.float32, device=dev)
+    indices = torch.arange(1, B + 1, dtype=torch.int32, device=dev)
+    # Offset by one element: contiguous but only element-size aligned.
+    A_log = torch.randn(HV + 1, dtype=torch.float32, device=dev)[1:]
+    dt_bias = torch.randn(HV + 1, dtype=torch.float32, device=dev)[1:]
+    # Packed [B, 2*HV] gate buffer: the second half starts at HV * 2 = 8
+    # bytes into the allocation when HV % 8 != 0.
+    gates = torch.randn(B, 2 * HV, dtype=torch.bfloat16, device=dev)
+    b, a = gates.chunk(2, dim=-1)
+    assert A_log.data_ptr() % 16 == 4 and a.data_ptr() % 16 == 8
+
+    kw = dict(
+        q=q,
+        k=k,
+        v=v,
+        state=None,
+        scale=scale,
+        use_qk_l2norm=True,
+        initial_state_indices=indices,
+        backend="flashinfer",
+    )
+    out_view = torch.empty(B, 1, HV, D, dtype=torch.bfloat16, device=dev)
+    pool_view = pool.clone()
+    gated_delta_rule_decode_pretranspose(
+        A_log=A_log,
+        a=a.unsqueeze(1),
+        dt_bias=dt_bias,
+        b=b.unsqueeze(1),
+        output=out_view,
+        initial_state=pool_view,
+        **kw,
+    )
+    out_clone = torch.empty_like(out_view)
+    pool_clone = pool.clone()
+    gated_delta_rule_decode_pretranspose(
+        A_log=A_log.clone(),
+        a=a.contiguous().unsqueeze(1),
+        dt_bias=dt_bias.clone(),
+        b=b.contiguous().unsqueeze(1),
+        output=out_clone,
+        initial_state=pool_clone,
+        **kw,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out_view, out_clone, atol=0, rtol=0)
+    torch.testing.assert_close(pool_view, pool_clone, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize("state_dtype", ["bfloat16", "float32"])
 @pytest.mark.parametrize("batch_size", [2, 8, 64])
 def test_decode_pretranspose_packed_qkv(batch_size: int, state_dtype: str):
@@ -4295,9 +4650,11 @@ def test_mtp_packed_qkv(batch_size: int, seq_len: int):
 # ==============================================================================
 # Operand dtype handling and compile-cache ownership
 # ==============================================================================
-# These decode kernels are bf16-only internally: q/k/v/a/b move through fragments
-# declared `cutlass.BFloat16` and results are stored with `cutlass.BFloat16(...)`,
-# while the public API documents fp16 q/k/v. Their compile caches are also
+# Most of these decode kernels are bf16-only internally: q/k/v/a/b move through
+# fragments declared `cutlass.BFloat16` and results are stored with
+# `cutlass.BFloat16(...)`, while the public API documents fp16 q/k/v. The
+# nontranspose kernel is the exception -- it converts every operand on load, so
+# only its output store is bf16-bound. Their compile caches are also
 # process-global and keyed by hand. The tests below pin three contracts that no
 # other test in this file covers, because every other dtype parametrization here is
 # bf16-only:
@@ -4305,18 +4662,20 @@ def test_mtp_packed_qkv(batch_size: int, seq_len: int):
 #   2. one operand dtype must not poison another's cache entry at equal geometry;
 #   3. a default-allocated `output` is owned by the caller, not by the cache.
 
-# case -> (seq_len, state dtype). Batch size is fixed at 4 in the trimmed
-# regressions below (one representative per bug). B*HV still selects ILP4 vs
-# wide-vector at other call sites in this file.
+# case -> (seq_len, state dtype, state layout). Batch size is fixed at 4 in the
+# trimmed regressions below (one representative per bug). B*HV still selects ILP4
+# vs wide-vector at other call sites in this file.
 _DTYPE_CASES = {
-    "fp32_state_mtp": (2, torch.float32),
-    "bf16_state_t1": (1, torch.bfloat16),
-    "bf16_state_mtp": (2, torch.bfloat16),
+    "fp32_state_mtp": (2, torch.float32, "v_major"),
+    "bf16_state_t1": (1, torch.bfloat16, "v_major"),
+    "bf16_state_mtp": (2, torch.bfloat16, "v_major"),
+    "legacy_pretranspose": (1, torch.float32, "v_major"),
+    "nontranspose": (1, torch.float32, "k_major"),
 }
 
 
 def _dtype_case_inputs(case, dtype, batch_size, seed=0, dt_bias_dtype=torch.float32):
-    seq_len, state_dtype = _DTYPE_CASES[case]
+    seq_len, state_dtype, state_layout = _DTYPE_CASES[case]
     device = torch.device("cuda")
     H, HV, D = 16, 32, 128
     torch.manual_seed(seed)
@@ -4333,6 +4692,7 @@ def _dtype_case_inputs(case, dtype, batch_size, seed=0, dt_bias_dtype=torch.floa
         state=(
             torch.randn(batch_size, HV, D, D, dtype=state_dtype, device=device) * 0.01
         ).contiguous(),
+        state_layout=state_layout,
         scale=1.0 / math.sqrt(D),
     )
 
@@ -4372,6 +4732,8 @@ def _dtype_case_run(case, x, output=None):
             disable_state_update=True,
             **common,
         )
+    elif case == "nontranspose":
+        out, _ = gated_delta_rule_decode(state=x["state"].clone(), **common)
     else:
         out, _ = gated_delta_rule_decode_pretranspose(
             state=x["state"].clone(), **common
@@ -4380,12 +4742,16 @@ def _dtype_case_run(case, x, output=None):
 
 
 def _dtype_case_reference(x):
+    # Reference takes a K-major [B, HV, K, V] state; most of these kernels take
+    # V-major, the nontranspose one is already K-major.
+    state = x["state"].float()
+    if x["state_layout"] == "v_major":
+        state = state.transpose(-2, -1)
     out, _, _ = verify_delta_rule(
         q=x["q"],
         k=x["k"],
         v=x["v"],
-        # Reference takes a K-major [B, HV, K, V] state; the kernels take V-major.
-        state=x["state"].float().transpose(-2, -1).contiguous(),
+        state=state.contiguous(),
         A_log=x["A_log"].float(),
         a=x["a"],
         dt_bias=x["dt_bias"].float(),
@@ -4399,13 +4765,16 @@ def _dtype_case_reference(x):
     return out
 
 
-@pytest.mark.parametrize("case", ["fp32_state_mtp", "bf16_state_t1"])
+@pytest.mark.parametrize(
+    "case",
+    ["fp32_state_mtp", "bf16_state_t1", "legacy_pretranspose", "nontranspose"],
+)
 def test_gdn_decode_fp16_inputs_are_converted_not_reinterpreted(case, batch_size=4):
     """fp16 q/k/v/a/b must be converted to bf16, not bit-reinterpreted.
 
     The kernels declare their staging fragments bf16, so handing them an fp16
     descriptor silently produces garbage (output collapsed to ~0 on the FP32-state
-    MTP path, ~100x too large on the BF16-state path).
+    MTP and legacy pretranspose paths, ~100x too large on the BF16-state path).
     """
     _skip_if_not_sm90_or_later()
     x_bf16 = _dtype_case_inputs(case, torch.bfloat16, batch_size)
@@ -4441,7 +4810,10 @@ def test_gdn_decode_compile_cache_survives_dtype_interleaving(batch_size=4):
     torch.testing.assert_close(again.float(), first.float(), atol=0, rtol=0)
 
 
-def test_gdn_decode_dt_bias_dtype_interleaving(batch_size=4):
+@pytest.mark.parametrize(
+    "case", ["bf16_state_mtp", "legacy_pretranspose", "nontranspose"]
+)
+def test_gdn_decode_dt_bias_dtype_interleaving(case, batch_size=4):
     """fp32 and bf16 dt_bias are separate specializations of the same geometry.
 
     The public docstring documents dt_bias as bf16 or float32, and the kernels read
@@ -4449,7 +4821,6 @@ def test_gdn_decode_dt_bias_dtype_interleaving(batch_size=4):
     regardless of which compiles first.
     """
     _skip_if_not_sm90_or_later()
-    case = "bf16_state_mtp"
     for dt_bias_dtype in (torch.float32, torch.bfloat16, torch.float32):
         x = _dtype_case_inputs(
             case, torch.bfloat16, batch_size, dt_bias_dtype=dt_bias_dtype
@@ -4458,6 +4829,47 @@ def test_gdn_decode_dt_bias_dtype_interleaving(batch_size=4):
         torch.testing.assert_close(
             out.float(), _dtype_case_reference(x).float(), atol=3e-4, rtol=3e-2
         )
+
+
+@pytest.mark.parametrize("case", ["legacy_pretranspose", "nontranspose"])
+def test_gdn_decode_legacy_compile_key_covers_operand_dtypes(case, batch_size=4):
+    """Every polymorphic operand dtype the legacy keys omitted is its own specialization.
+
+    Both kernels convert a/b on load and convert on the output store, so a
+    caller-supplied fp16 `output=` and activations that do not all share q.dtype are
+    legitimate variants -- but the keys carried only q.dtype, so the first-compiled
+    variant claimed the entry and the next one hit a TVM-FFI signature mismatch.
+    """
+    _skip_if_not_sm90_or_later()
+    x = _dtype_case_inputs(case, torch.bfloat16, batch_size)
+    ref = _dtype_case_reference(x).float()
+    baseline = _dtype_case_run(case, x)
+
+    B, T, _, D = x["q"].shape
+    HV = x["v"].shape[2]
+    fp16_output = torch.zeros(B, T, HV, D, dtype=torch.float16, device=x["q"].device)
+    variants = {
+        "fp16 output buffer": _dtype_case_run(case, x, output=fp16_output),
+        "fp16 a/b with bf16 q": _dtype_case_run(
+            case, dict(x, a=x["a"].half(), b=x["b"].half())
+        ),
+    }
+    for name, out in variants.items():
+        torch.testing.assert_close(
+            out.float(), ref, atol=3e-4, rtol=3e-2, msg=lambda m, n=name: f"{n}: {m}"
+        )
+    assert variants["fp16 output buffer"] is fp16_output, (
+        "a caller-supplied output buffer must be written in place"
+    )
+    # The fp16 store must carry the bf16 result exactly, not a degraded rounding.
+    torch.testing.assert_close(
+        fp16_output, baseline.to(torch.float16), atol=0, rtol=0, check_dtype=False
+    )
+
+    # The extra specializations must not have displaced the original entry.
+    torch.testing.assert_close(
+        _dtype_case_run(case, x).float(), baseline.float(), atol=0, rtol=0
+    )
 
 
 def test_gdn_decode_default_output_is_not_shared(batch_size=4):

@@ -45,8 +45,8 @@ nccl-extensions>=0.1.0
 nccl4py>=0.4.1
 ninja
 numpy
-nvidia-cudnn-frontend>=1.31.0
-nvidia-cutlass-dsl>=4.6.2a0
+nvidia-cudnn-frontend>=1.32.0
+nvidia-cutlass-dsl>=4.8.0
 nvidia-ml-py
 packaging>=24.2
 requests

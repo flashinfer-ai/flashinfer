@@ -1484,6 +1484,11 @@ __device__ __forceinline__ void tmem_st16(int addr, const float (&v)[16]) {
 
 __device__ __forceinline__ void tmem_wait_st() { asm volatile("tcgen05.wait::st.sync.aligned;"); }
 
+// Orders generic st.shared before tcgen05.mma reads it via the async proxy.
+__device__ __forceinline__ void fence_proxy_async_smem() {
+  asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+}
+
 __device__ __forceinline__ float ex2(float x) { return exp2f(x); }
 
 __device__ __forceinline__ float warp_max(float x) {
@@ -1869,6 +1874,7 @@ __global__ __launch_bounds__(kThreads, 2) void kernel_msa_decode_nvfp4_kv_paged_
     for (int i = 0; i < kHalf; ++i)
       if (!kTailAware || i < nsecond)
         load_raw<false>(k_data, k_scale, sPageOff[p0 + kHalf + i], addr, rk[i]);
+    fence_proxy_async_smem();
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;");
     if (warp == 0 && elect_sync()) {
@@ -1890,6 +1896,7 @@ __global__ __launch_bounds__(kThreads, 2) void kernel_msa_decode_nvfp4_kv_paged_
 #pragma unroll
     for (int i = 0; i < kHalf; ++i)
       if (!kTailAware || i < nfirst) load_raw<true>(v_data, v_scale, sPageOff[p0 + i], addr, rv[i]);
+    fence_proxy_async_smem();
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;");
     if ((!kTailAware || nsecond > 0) && warp == 0 && elect_sync()) {
@@ -2002,6 +2009,7 @@ __global__ __launch_bounds__(kThreads, 2) void kernel_msa_decode_nvfp4_kv_paged_
       }
       if (lane == 0 && c != 0) sAlpha[shead] = alpha;
     }
+    fence_proxy_async_smem();
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;");
 
@@ -2055,6 +2063,7 @@ __global__ __launch_bounds__(kThreads, 2) void kernel_msa_decode_nvfp4_kv_paged_
       mbarrier_wait(mbarA, phaseA);
       phaseA ^= 1;
     }
+    fence_proxy_async_smem();
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;");
 

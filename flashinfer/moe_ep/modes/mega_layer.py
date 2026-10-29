@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import warnings
 import weakref
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -27,6 +28,7 @@ from ..weights import MoEWeightPack
 from .config import MegaConfig
 
 if TYPE_CHECKING:
+    from ..core.kernel.base import MegaKernelBackend
     from ..tensors import MoEEpTensors
 
 
@@ -34,10 +36,12 @@ class MoEEpMegaWorkspace:
     """Capacity-profile handle owned by one MegaMoE layer.
 
     Create handles with :meth:`MoEEpMegaLayer.create_workspace`; do not
-    construct them directly. The selected workspace keeps stable addresses
-    until :meth:`destroy` or layer destruction. A stable returned-output
-    address additionally requires ``return_workspace_view=True`` on a backend
-    that supports output views.
+    construct them directly. Fixed workspaces keep stable addresses until
+    destruction. Automatic selection can replace output and scratch storage
+    before capture; reacquire output views after selection. Once captured, an
+    explicit handle keeps its configuration and addresses until destruction.
+    A stable returned-output address additionally requires
+    ``return_workspace_view=True`` on a backend that supports output views.
 
     Creation and destruction are EP collectives. Before destroying a handle,
     callers must synchronize all work and retire every CUDA graph that uses it.
@@ -48,10 +52,13 @@ class MoEEpMegaWorkspace:
         layer: "MoEEpMegaLayer",
         fleet_params: FleetParams,
         backend_workspace: Any,
+        *,
+        kernel: MegaKernelBackend | None = None,
     ) -> None:
         self._layer_ref = weakref.ref(layer)
         self._fleet_params = fleet_params
         self._backend_workspace = backend_workspace
+        self._kernel = kernel if kernel is not None else layer._kernel
         self._destroyed = False
 
     @property
@@ -59,6 +66,11 @@ class MoEEpMegaWorkspace:
         """Maximum live-token count accepted by this handle."""
 
         return self._fleet_params.max_tokens_per_rank
+
+    @property
+    def live_tokens(self) -> int | None:
+        """Offline workload bucket; does not limit accepted input shapes."""
+        return self._fleet_params.tuning_live_tokens
 
     @property
     def is_destroyed(self) -> bool:
@@ -138,13 +150,14 @@ class MoEEpMegaLayer(nn.Module):
         # Strong tracking is intentional: workspace create/destroy is an EP
         # collective and therefore must never be triggered by rank-local GC.
         # Dict insertion order gives every EP rank the same reverse-allocation
-        # collective teardown order. One live profile per capacity also avoids
-        # presenting pooled aliases as independent concurrency lanes.
+        # collective teardown order. Automatic handles own independent storage.
         self._workspaces: dict[int, MoEEpMegaWorkspace] = {}
+        self._retired_tuning_workspaces: list[Any] = []
         self._preprocessing_count = 0
         self._destroyed = False
         self._bootstrap_validated = False
         self._forward_signatures: dict[int, tuple[Any, ...]] = {}
+        self._staged_kernel: MegaKernelBackend | None = None
         self._staged_workspace: Any = None
         self._staged_transformed: Any = None
 
@@ -185,12 +198,44 @@ class MoEEpMegaLayer(nn.Module):
             )
         return self._workspace
 
-    def create_workspace(self, max_tokens_per_rank: int) -> MoEEpMegaWorkspace:
+    def live_token_buckets(self, max_tokens_per_rank: int) -> list[int]:
+        """Read offline live-token profiles before capture (same cache on all ranks)."""
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            raise MoEEpConfigError("Read live-token profiles before CUDA graph capture")
+        return self._kernel.live_token_buckets(
+            dataclasses.replace(
+                self._fleet_params,
+                max_tokens_per_rank=max_tokens_per_rank,
+                tuning_live_tokens=None,
+            )
+        )
+
+    def create_workspace(
+        self,
+        max_tokens_per_rank: int,
+        *,
+        live_tokens: int | None = None,
+        knobs: dict[str, Any] | None = None,
+    ) -> MoEEpMegaWorkspace:
         """Allocate one reusable capacity profile for this layer.
 
-        The handle reuses this layer's transformed weights and backend.  Call
-        it collectively and in the same order on all EP ranks, before CUDA
-        graph capture. Only one live handle per capacity is allowed.
+        The handle reuses this layer's transformed weights. ``knobs=None``
+        inherits the layer's configuration. A dictionary selects fixed knobs
+        for this handle and is copied before allocation. The default workspace
+        must not already be allocated when overriding its profile.
+
+        Fixed configurations allow one handle per capacity/profile. Backends
+        supporting automatic handles allocate independent storage on every
+        call, with separate tuning state and shared transformed weights.
+        ``live_tokens`` selects an offline workload profile without shrinking
+        capacity. Explicit knobs take precedence over that profile's cache.
+        ``live_tokens=None`` selects full capacity, even when the layer has a
+        different default tuning profile. Fixed handles retain compiled tactics
+        and stable addresses.
+        Automatic handles warn when ``live_tokens`` is supplied because
+        selection uses the actual warmup or forward batch size.
+        Call collectively with matching arguments on all EP ranks before
+        capture.
         """
 
         if isinstance(max_tokens_per_rank, bool) or not isinstance(
@@ -201,7 +246,8 @@ class MoEEpMegaLayer(nn.Module):
             raise ValueError("max_tokens_per_rank must be positive")
         if self._destroyed:
             raise MoEEpConfigError("MegaMoE layer has been destroyed")
-        if getattr(self._megakernel_config, "knobs", None) == "auto":
+        automatic = getattr(self._megakernel_config, "knobs", None) == "auto"
+        if automatic and not self._kernel.supports_auto_workspaces:
             raise MoEEpConfigError(
                 "create_workspace() requires fixed/offline-tuned knobs; "
                 "knobs='auto' has mutable per-capacity tuning state"
@@ -210,43 +256,89 @@ class MoEEpMegaLayer(nn.Module):
             raise MoEEpConfigError(
                 "MegaMoE workspace allocation cannot run during CUDA graph capture"
             )
-        if max_tokens_per_rank in self._workspaces:
+        automatic = automatic and knobs is None
+        if (
+            live_tokens is not None
+            and not automatic
+            and not self._kernel.supports_live_token_tuning
+        ):
+            raise MoEEpConfigError("This backend does not support live-token tuning")
+        if automatic and live_tokens is not None:
+            warnings.warn(
+                "live_tokens is ignored for automatic tuning; selection uses "
+                "the actual warmup or forward batch size",
+                UserWarning,
+                stacklevel=2,
+            )
+        profile_key = (max_tokens_per_rank, live_tokens)
+        if not automatic and any(
+            (handle.max_tokens_per_rank, handle.live_tokens) == profile_key
+            for handle in self._workspaces.values()
+        ):
             raise MoEEpConfigError(
                 "a MegaMoE workspace profile for max_tokens_per_rank="
-                f"{max_tokens_per_rank} already exists on this layer"
+                f"{max_tokens_per_rank}, live_tokens={live_tokens} already exists on this layer"
             )
+        is_default_profile = (
+            max_tokens_per_rank == self._fleet_params.max_tokens_per_rank
+            and live_tokens == self._fleet_params.tuning_live_tokens
+        )
+        kernel = self._kernel
+        if knobs is not None:
+            if not isinstance(knobs, dict):
+                raise TypeError("workspace knobs must be a dictionary or None")
+            if (
+                not dataclasses.is_dataclass(self._megakernel_config)
+                or isinstance(self._megakernel_config, type)
+                or not hasattr(self._megakernel_config, "knobs")
+            ):
+                raise MoEEpConfigError("this MegaMoE backend does not support knobs")
+            if is_default_profile and self._workspace is not None:
+                raise MoEEpConfigError(
+                    "cannot override knobs for an already allocated default workspace"
+                )
+            kernel = create_mega_kernel(
+                dataclasses.replace(self._megakernel_config, knobs=deepcopy(knobs))
+            )
+            kernel.bind_ep_bootstrap(self._bootstrap)
         fleet_params = dataclasses.replace(
             self._fleet_params,
             max_tokens_per_rank=max_tokens_per_rank,
+            tuning_live_tokens=live_tokens,
         )
-        self._kernel.validate_init(self._bootstrap, fleet_params)
-        is_default_capacity = (
-            max_tokens_per_rank == self._fleet_params.max_tokens_per_rank
-        )
-        if is_default_capacity and self._workspace is not None:
+        kernel.validate_init(self._bootstrap, fleet_params)
+        if is_default_profile and self._workspace is not None and not automatic:
             # Transfer the already-lazy-allocated default profile into the
             # explicit handle without acquiring a second pooled reference.
             backend_workspace = self._workspace
             self._workspace = None
         else:
-            backend_workspace = self._kernel.prepare_workspace(
+            backend_workspace = kernel.prepare_workspace(
                 self._bootstrap,
                 fleet_params,
             )
-        handle = MoEEpMegaWorkspace(self, fleet_params, backend_workspace)
-        self._workspaces[max_tokens_per_rank] = handle
-        if is_default_capacity:
+        handle = MoEEpMegaWorkspace(
+            self, fleet_params, backend_workspace, kernel=kernel
+        )
+        self._workspaces[id(handle)] = handle
+        if (
+            is_default_profile
+            and self._workspace is None
+            and self._default_workspace_handle is None
+        ):
             self._default_workspace_handle = handle
         return handle
 
     def _resolve_workspace(
         self,
         workspace: MoEEpMegaWorkspace | None,
-    ) -> tuple[FleetParams, Any]:
+    ) -> tuple[FleetParams, Any, MegaKernelBackend]:
         if workspace is None:
             if self._destroyed:
                 raise MoEEpConfigError("MegaMoE layer has been destroyed")
-            return self._fleet_params, self._ensure_workspace()
+            if self._default_workspace_handle is None:
+                return self._fleet_params, self._ensure_workspace(), self._kernel
+            workspace = self._default_workspace_handle
         if not isinstance(workspace, MoEEpMegaWorkspace):
             raise TypeError(
                 "workspace must be created by MoEEpMegaLayer.create_workspace()"
@@ -255,16 +347,16 @@ class MoEEpMegaLayer(nn.Module):
             raise MoEEpConfigError("MegaMoE workspace belongs to a different layer")
         if workspace._destroyed or workspace._backend_workspace is None:
             raise MoEEpConfigError("MegaMoE workspace has been destroyed")
-        if self._workspaces.get(workspace.max_tokens_per_rank) is not workspace:
+        if self._workspaces.get(id(workspace)) is not workspace:
             raise MoEEpConfigError(
                 "MegaMoE workspace was not created by this layer or is no longer active"
             )
-        return workspace._fleet_params, workspace._backend_workspace
+        return workspace._fleet_params, workspace._backend_workspace, workspace._kernel
 
     def _destroy_workspace_handle(self, workspace: MoEEpMegaWorkspace) -> None:
         if workspace._destroyed:
             return
-        if self._workspaces.get(workspace.max_tokens_per_rank) is not workspace:
+        if self._workspaces.get(id(workspace)) is not workspace:
             raise MoEEpConfigError(
                 "MegaMoE workspace was not created by this layer or is no longer active"
             )
@@ -274,15 +366,20 @@ class MoEEpMegaLayer(nn.Module):
             )
         backend_workspace = workspace._backend_workspace
         if backend_workspace is not None:
-            self._kernel.destroy(backend_workspace)
+            workspace._kernel.destroy(backend_workspace)
+            self._forward_signatures.pop(id(backend_workspace), None)
+            if self._staged_workspace is backend_workspace:
+                self._staged_kernel = None
+                self._staged_workspace = None
+                self._staged_transformed = None
         # Commit the closed state only after the collective backend release
         # succeeds.  A failed release remains retryable on every rank.
         workspace._destroyed = True
         workspace._backend_workspace = None
         if self._default_workspace_handle is workspace:
             self._default_workspace_handle = None
-        if self._workspaces.get(workspace.max_tokens_per_rank) is workspace:
-            del self._workspaces[workspace.max_tokens_per_rank]
+        if self._workspaces.get(id(workspace)) is workspace:
+            del self._workspaces[id(workspace)]
 
     @property
     def supports_output_view(self) -> bool:
@@ -291,8 +388,13 @@ class MoEEpMegaLayer(nn.Module):
 
     @property
     def output_buffer(self) -> torch.Tensor:
-        """Stable zero-copy output owned by the default workspace."""
-        return self._kernel.workspace_output(self._ensure_workspace())
+        """Zero-copy output owned by the current default workspace.
+
+        Reacquire after automatic selection or default-workspace replacement.
+        Captured graphs keep writing to their original workspace's output.
+        """
+        _, backend_workspace, kernel = self._resolve_workspace(None)
+        return kernel.workspace_output(backend_workspace)
 
     def _get_transformed_weights(self) -> Any:
         """Return this layer's one-time backend weight transformation."""
@@ -317,6 +419,10 @@ class MoEEpMegaLayer(nn.Module):
         Forces every lazy host-side step — workspace allocation (symmetric
         heap), ``cute.compile``, the ``knobs="auto"`` autotune sweep, and one
         real kernel launch (module load) — then synchronizes the device.
+        Rubin automatic tuning requires an enabled tuning context and can replace
+        a captured default workspace for later selection while retaining its
+        old storage until layer destruction. Explicit handles remain fixed
+        after capture; create another handle when they need further tuning.
 
         COLLECTIVE: call on ALL EP ranks together before any rank starts
         capturing (the kernel has cross-rank device-side barriers, and the
@@ -330,13 +436,14 @@ class MoEEpMegaLayer(nn.Module):
             raise MoEEpConfigError(
                 "MegaMoE warmup cannot run during CUDA graph capture"
             )
+        uses_dummy_input = t is None
         if t is None:
             if not self._mega_config.quantize_input:
                 raise MoEEpConfigError(
                     "warmup() cannot build a dummy pre-quantized batch; pass "
                     "MoEEpTensors explicitly when quantize_input=False"
                 )
-        fleet_params, _backend_workspace = self._resolve_workspace(workspace)
+        fleet_params, _backend_workspace, _kernel = self._resolve_workspace(workspace)
         if t is None:
             from ..tensors import MoEEpTensors
 
@@ -365,15 +472,50 @@ class MoEEpMegaLayer(nn.Module):
                     device=device,
                 ),
             )
-        # Output-view-capable backends capture their internal graph against a
-        # stable workspace address. Warming that path is what makes a later
-        # outer CUDA Graph capture safe.
-        self.forward(
-            t,
-            workspace=workspace,
-            return_workspace_view=self.supports_output_view and t.output is None,
-        )
+        if self._kernel.supports_unfinalized_output:
+            self.forward_unfinalized(t, workspace=workspace)
+        else:
+            # Output-view-capable backends capture their internal graph against a
+            # stable workspace address. Warming that path is what makes a later
+            # outer CUDA Graph capture safe.
+            self.forward(
+                t,
+                workspace=workspace,
+                return_workspace_view=(
+                    self.supports_output_view
+                    and t.output is None
+                    and getattr(self._megakernel_config, "knobs", None) != "auto"
+                ),
+            )
         torch.cuda.synchronize()
+        if uses_dummy_input:
+            # The synthetic routing ids are int64, but some backends accept
+            # multiple input dtypes. Let the first real batch establish the
+            # steady-state signature instead of pinning it to the dummy batch.
+            _, warmed_workspace, _ = self._resolve_workspace(workspace)
+            self._forward_signatures.pop(id(warmed_workspace), None)
+
+    def get_tuned_knobs(
+        self, *, workspace: MoEEpMegaWorkspace | None = None
+    ) -> dict[str, Any]:
+        """Return the selected knobs after a successful ``knobs="auto"`` warmup.
+
+        ``workspace=None`` selects the default workspace. Pass an explicit
+        handle to inspect that handle's result independently of other workspaces.
+        The returned dictionary is a copy and can be passed as ``knobs`` when
+        constructing a fixed layer with the same kernel configuration and
+        capacity. This call does not allocate, tune or read a cache file.
+        It raises if the layer is destroyed or has no automatic tuning result.
+        """
+        if self._destroyed:
+            raise MoEEpConfigError("MegaMoE layer has been destroyed")
+        handle = workspace if workspace is not None else self._default_workspace_handle
+        if handle is not None:
+            _, backend_workspace, kernel = self._resolve_workspace(handle)
+        else:
+            # Introspection must not trigger lazy workspace allocation.
+            backend_workspace, kernel = self._workspace, self._kernel
+        return kernel.get_tuned_knobs(backend_workspace)
 
     def _resolve_quantize_input(self, t: "MoEEpTensors") -> bool:
         if not self._mega_config.quantize_input:
@@ -409,7 +551,7 @@ class MoEEpMegaLayer(nn.Module):
         *,
         workspace: MoEEpMegaWorkspace | None = None,
         compile_tokens_per_rank: int | None = None,
-    ) -> tuple[FleetParams, Any, bool, Any]:
+    ) -> tuple[FleetParams, Any, MegaKernelBackend, bool, Any]:
         if (
             compile_tokens_per_rank is not None
             and compile_tokens_per_rank < t.num_tokens
@@ -425,13 +567,14 @@ class MoEEpMegaLayer(nn.Module):
             if self._destroyed:
                 raise MoEEpConfigError("MegaMoE layer has been destroyed")
             fleet_params = self._fleet_params
-            backend_workspace = (
-                self._default_workspace_handle._backend_workspace
-                if self._default_workspace_handle is not None
-                else self._workspace
-            )
+            if self._default_workspace_handle is None:
+                backend_workspace = self._workspace
+                kernel = self._kernel
+            else:
+                backend_workspace = self._default_workspace_handle._backend_workspace
+                kernel = self._default_workspace_handle._kernel
         else:
-            fleet_params, backend_workspace = self._resolve_workspace(workspace)
+            fleet_params, backend_workspace, kernel = self._resolve_workspace(workspace)
         quantize_input = self._resolve_quantize_input(t)
         signature = self._input_signature(t)
         validation_key = None if backend_workspace is None else id(backend_workspace)
@@ -441,7 +584,7 @@ class MoEEpMegaLayer(nn.Module):
             else self._forward_signatures.get(validation_key)
         )
         if previous_signature is None:
-            self._kernel.validate_forward(
+            kernel.validate_forward(
                 t,
                 fleet_params,
                 quantize_input=quantize_input,
@@ -460,13 +603,24 @@ class MoEEpMegaLayer(nn.Module):
         if backend_workspace is None:
             backend_workspace = self._ensure_workspace()
             validation_key = id(backend_workspace)
+        if workspace is None and kernel.coordinate_workspace_replacement(
+            backend_workspace
+        ):
+            replacement = kernel.prepare_workspace(self._bootstrap, fleet_params)
+            if self._default_workspace_handle is None:
+                self._retired_tuning_workspaces.append(backend_workspace)
+            # Explicit handles keep their original storage and destruction API.
+            self._default_workspace_handle = None
+            self._workspace = backend_workspace = replacement
+            validation_key = id(backend_workspace)
+            previous_signature = None
         if previous_signature is None:
             assert validation_key is not None
             self._forward_signatures[validation_key] = signature
 
         transformed_weights = self._get_transformed_weights()
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-            self._kernel.validate_capture_ready(
+            kernel.validate_capture_ready(
                 backend_workspace,
                 transformed_weights,
             )
@@ -486,13 +640,14 @@ class MoEEpMegaLayer(nn.Module):
                 f"dtype={caller_output.dtype}, device={caller_output.device}"
             )
 
-        self._kernel.set_compile_tokens_per_rank(
+        kernel.set_compile_tokens_per_rank(
             backend_workspace,
             compile_tokens_per_rank,
         )
         return (
             fleet_params,
             backend_workspace,
+            kernel,
             quantize_input,
             transformed_weights,
         )
@@ -514,6 +669,7 @@ class MoEEpMegaLayer(nn.Module):
         (
             _,
             backend_workspace,
+            kernel,
             quantize_input,
             transformed_weights,
         ) = self._prepare_inputs(
@@ -521,22 +677,27 @@ class MoEEpMegaLayer(nn.Module):
             workspace=workspace,
             compile_tokens_per_rank=compile_tokens_per_rank,
         )
-        self._kernel.stage_inputs(
+        kernel.stage_inputs(
             t,
             backend_workspace,
             quantize_input=quantize_input,
         )
+        self._staged_kernel = kernel
         self._staged_workspace = backend_workspace
         self._staged_transformed = transformed_weights
 
     def compute_staged(self, *, output: torch.Tensor | None) -> torch.Tensor:
         """Launch the kernel using inputs staged by :meth:`stage_inputs`."""
 
-        if self._staged_workspace is None or self._staged_transformed is None:
+        if (
+            self._staged_kernel is None
+            or self._staged_workspace is None
+            or self._staged_transformed is None
+        ):
             raise MoEEpConfigError(
                 "compute_staged() requires a prior warmup/stage_inputs() call"
             )
-        return self._kernel.compute(
+        return self._staged_kernel.compute(
             self._staged_workspace,
             self._staged_transformed,
             output=output,
@@ -551,12 +712,14 @@ class MoEEpMegaLayer(nn.Module):
     ) -> torch.Tensor:
         """Run MegaMoE and return either an owned tensor or a workspace view.
 
-        Passing ``workspace`` selects only the capacity profile; it does not
+        Passing ``workspace`` selects its capacity and fixed knobs; it does not
         change output ownership. The default always returns an owned output.
         ``return_workspace_view=True`` explicitly opts into a borrowed view on
         backends that support one. A view remains valid under stream ordering
         until the next launch reuses the pooled physical workspace.
         """
+        if self._kernel.supports_unfinalized_output:
+            raise MoEEpConfigError("finalize_mode=NONE requires forward_unfinalized()")
         if return_workspace_view and t.output is not None:
             raise MoEEpConfigError(
                 "return_workspace_view=True cannot be combined with t.output"
@@ -571,7 +734,7 @@ class MoEEpMegaLayer(nn.Module):
                 raise MoEEpConfigError("MegaMoE layer has been destroyed")
             fleet_params = self._fleet_params
         else:
-            fleet_params, _ = self._resolve_workspace(workspace)
+            fleet_params, _, _ = self._resolve_workspace(workspace)
         if t.num_tokens > fleet_params.max_tokens_per_rank:
             raise MoEEpConfigError(
                 f"{t.num_tokens} tokens exceed max_tokens_per_rank="
@@ -580,6 +743,7 @@ class MoEEpMegaLayer(nn.Module):
         (
             fleet_params,
             backend_workspace,
+            kernel,
             quantize_input,
             transformed_weights,
         ) = self._prepare_inputs(t, workspace=workspace)
@@ -594,14 +758,45 @@ class MoEEpMegaLayer(nn.Module):
                 dtype=torch.bfloat16,
                 device=t.hidden_states.device,
             )
-        self._kernel.stage_inputs(
+        kernel.stage_inputs(
             t,
             backend_workspace,
             quantize_input=quantize_input,
         )
+        self._staged_kernel = kernel
         self._staged_workspace = backend_workspace
         self._staged_transformed = transformed_weights
         return self.compute_staged(output=output)
+
+    def forward_unfinalized(
+        self,
+        t: "MoEEpTensors",
+        *,
+        workspace: MoEEpMegaWorkspace | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return GEMM2 rows, remaining routing weights, and a route-to-row map.
+
+        Requires ``finalize_mode=FinalizeMode.NONE``. Results are contiguous BF16
+        ``[T * top_k, hidden]`` rows, FP32 ``[T, top_k]`` weights, and an int32
+        ``[T, top_k]`` identity map whose entries index the first result.
+        Weights are one when ``apply_routing_weights_before_fc2=True`` already
+        applied routing.
+        These tensors match the unfinalized TRTLLM MoE output layout.
+
+        All results borrow pooled workspace storage: consume them on the current
+        stream before any layer reuses that workspace. EP communication completes
+        before caller finalization; zero-token ranks still participate in the
+        full collective launch. Warm up on all ranks before capture.
+        """
+        if not self._kernel.supports_unfinalized_output:
+            raise MoEEpConfigError(
+                "forward_unfinalized() requires finalize_mode=FinalizeMode.NONE"
+            )
+        _, backend_workspace, kernel, quantize_input, transformed_weights = (
+            self._prepare_inputs(t, workspace=workspace)
+        )
+        kernel.stage_inputs(t, backend_workspace, quantize_input=quantize_input)
+        return kernel.compute_unfinalized(backend_workspace, transformed_weights)
 
     def destroy(self) -> None:
         """Collectively release all profiles and runtime resources.
@@ -621,6 +816,10 @@ class MoEEpMegaLayer(nn.Module):
         if self._workspace is not None:
             self._kernel.destroy(self._workspace)
             self._workspace = None
+        for workspace in reversed(self._retired_tuning_workspaces):
+            self._kernel.destroy(workspace)
+        self._retired_tuning_workspaces.clear()
+        self._staged_kernel = None
         self._staged_workspace = None
         self._staged_transformed = None
         if self._runtime is not None:
