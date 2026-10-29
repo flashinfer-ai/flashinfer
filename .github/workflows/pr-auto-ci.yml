@@ -461,16 +461,21 @@ jobs:
           && steps.ci-check.outputs.needs_ci == 'true'
           && steps.scope.outputs.has_scope == 'true'
           && steps.publish-scope.outcome != 'failure'
-          && secrets.FLASHINFER_BOT_TOKEN != ''
         env:
           # Use the bot PAT so the labeled event triggers pr-test.yml.
           # (Events from GITHUB_TOKEN do not trigger other workflows.)
-          # On fork synchronize events this secret is unavailable — the step
-          # is skipped and CI relies on the approval-event trigger instead.
+          # Unavailable when secrets are not passed to the run (e.g. fork PRs);
+          # the step then exits early with a notice.
+          # (The `secrets` context cannot be used in a step-level `if:`.)
           GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           HAS_RUN_CI: ${{ steps.pr.outputs.has_run_ci }}
         run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::notice::FLASHINFER_BOT_TOKEN is unavailable to this run; skipping the run-ci label"
+            exit 0
+          fi
+
           echo "Auto-triggering CI for PR #$PR_NUMBER"
 
           # Remove first if present (re-applying emits no event).
