@@ -13,6 +13,11 @@ from ......config import BootstrapConfig, FleetParams
 from ......core.kernel.base import MegaKernelBackend
 from ......core.runtime import mxfp8_cutedsl_runtime_requirements
 from ......core.validation.common import validate_mega_arch, validate_mega_fleet_params
+from ......cute_dsl.megamoe.mxfp8_mxfp4.workspace import (
+    MXFP8_SF_VEC_SIZE,
+    SF_BYTES_PER_UINT32,
+    round_up,
+)
 from ......weights import MoEWeightPack
 from ..mxfp8_mxfp8_bf16_cutedsl.staging import (
     stage_mega_moe_inputs,
@@ -87,8 +92,11 @@ class Mxfp8Mxfp4CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
     def _resolved_tactic(self, fleet_params: FleetParams) -> dict | None:
-        """Pinned tactic, or None when the workspace resolves it (knob cache
-        then default for ``knobs=None``; the autotune winner for ``"auto"``)."""
+        """Return the pinned tactic, or None to let the workspace resolve it.
+
+        ``knobs=None`` uses the knob cache or default. ``"auto"`` uses the
+        autotune winner.
+        """
         knobs = self._kernel_config.knobs
         if knobs is None or knobs == "auto":
             return None
@@ -102,8 +110,6 @@ class Mxfp8Mxfp4CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        # Component 11 owns this integration facade; importing lazily keeps the
-        # backend/config/weight package testable while that facade is assembled.
         from ......cute_dsl.megamoe.mxfp8_mxfp4.integration import (
             get_symm_buffer_for_mxfp8_mxfp4_mega_moe,
         )
@@ -122,6 +128,7 @@ class Mxfp8Mxfp4CutedslMegaKernelBackend(MegaKernelBackend):
             capacity = candidate_tactics(
                 hidden=fleet_params.token_hidden_size,
                 intermediate=cfg.intermediate_size,
+                max_tokens_per_rank=fleet_params.max_tokens_per_rank,
             )
         return get_symm_buffer_for_mxfp8_mxfp4_mega_moe(
             fleet_params.num_experts,
@@ -134,6 +141,7 @@ class Mxfp8Mxfp4CutedslMegaKernelBackend(MegaKernelBackend):
             gate_up_clamp=cfg.gate_up_clamp,
             knobs=knobs,
             capacity_tactics=capacity,
+            process_group=self.ep_comm_group if self.ep_world_size > 1 else None,
         )
 
     def validate_forward(
@@ -158,6 +166,10 @@ class Mxfp8Mxfp4CutedslMegaKernelBackend(MegaKernelBackend):
         self, t: "MoEEpTensors", workspace: Any, *, quantize_input: bool
     ) -> None:
         num_tokens = t.hidden_states.shape[0]
+        hidden_sf_cols = workspace.hidden // MXFP8_SF_VEC_SIZE
+        padded_sf_cols = round_up(hidden_sf_cols, SF_BYTES_PER_UINT32)
+        if workspace.x_sf.shape[1] < padded_sf_cols:
+            raise ValueError("workspace MXFP8 scale row is smaller than its padded ABI")
         if quantize_input:
             stage_mega_moe_inputs(
                 t.hidden_states,
@@ -173,8 +185,6 @@ class Mxfp8Mxfp4CutedslMegaKernelBackend(MegaKernelBackend):
 
         from ......kernel_src.sm100.cutedsl_megamoe import note_staged_tokens
 
-        hidden_sf_cols = workspace.hidden // 32
-        padded_sf_cols = ((hidden_sf_cols + 3) // 4) * 4
         workspace.x[:num_tokens].view(torch.uint8).copy_(
             t.hidden_states[:num_tokens].view(torch.uint8)
         )
@@ -183,8 +193,6 @@ class Mxfp8Mxfp4CutedslMegaKernelBackend(MegaKernelBackend):
         workspace.x_sf[:num_tokens, :hidden_sf_cols].view(torch.uint8).copy_(
             t.scales[:num_tokens, :hidden_sf_cols].view(torch.uint8)
         )
-        if workspace.x_sf.shape[1] < padded_sf_cols:
-            raise ValueError("workspace MXFP8 scale row is smaller than its padded ABI")
         workspace.topk_idx[:num_tokens].copy_(t.topk_ids)
         workspace.topk_weights[:num_tokens].copy_(t.topk_weights)
         if num_tokens < workspace.x.shape[0]:
@@ -206,7 +214,7 @@ class Mxfp8Mxfp4CutedslMegaKernelBackend(MegaKernelBackend):
 
         cfg = self._kernel_config
         unpinned = cfg.knobs is None or cfg.knobs == "auto"
-        pending = unpinned and not workspace._autotune_selected
+        pending = unpinned and not workspace.is_autotuned
 
         if output is not None:
             num_tokens = output.shape[0]
@@ -245,7 +253,7 @@ class Mxfp8Mxfp4CutedslMegaKernelBackend(MegaKernelBackend):
         view = mxfp8_mxfp4_mega_moe(
             # Bind the reducer to stable workspace storage. The public layer's
             # owned-output path allocates a new tensor on every invocation,
-            # including graph capture; rebinding DLPack views there is unsafe.
+            # including graph capture. Rebinding DLPack views there is unsafe.
             None,
             transformed_weights[0],
             transformed_weights[1],
@@ -282,30 +290,29 @@ class Mxfp8Mxfp4CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
     def _forget_workspace_state(self, workspace: Any) -> None:
-        import sys
-
-        quant_stage = sys.modules.get(
-            "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.quant_stage"
+        from ......kernel_src.sm100.cutedsl_megamoe.shim.quant_stage import (
+            forget_staged_tokens,
         )
+
         topk_idx = getattr(workspace, "topk_idx", None)
-        if quant_stage is not None and topk_idx is not None:
-            quant_stage.forget_staged_tokens(topk_idx)
+        if topk_idx is not None:
+            forget_staged_tokens(topk_idx)
 
 
 __all__ = ["Mxfp8Mxfp4CutedslMegaKernelBackend"]
 
 
-# Do not advertise a backend whose persistent device assembler has not landed.
-# The device-kernel component provides this module and class; registration then
-# becomes automatic without making CPU-only config imports depend on CuTe DSL.
+# Auto-selection skips unavailable device kernels. Explicit selection reports
+# the original import failure through the registry.
 try:
     from ......cute_dsl.megamoe.mxfp8_mxfp4.persistent_kernel import (
-        ASSEMBLY_READY as _ASSEMBLY_READY,
+        PersistentMxfp8Mxfp4KernelAdapter as _KernelAdapter,  # noqa: F401
     )
-except ImportError:
-    _ASSEMBLY_READY = False
+except ImportError as exc:
+    from ......core.kernel.registry import register_unavailable_mega_kernel
 
-if _ASSEMBLY_READY:
+    register_unavailable_mega_kernel(KERNEL_NAME, exc)
+else:
     from ......core.kernel.registry import register_mega_kernel
 
     register_mega_kernel(KERNEL_NAME)(Mxfp8Mxfp4CutedslMegaKernelBackend)

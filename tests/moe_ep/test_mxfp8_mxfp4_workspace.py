@@ -87,8 +87,8 @@ def test_fc1_handoff_is_mxfp8_plus_e8m0_k32() -> None:
 def test_transport_score_is_abi_only_not_fc1_policy() -> None:
     config = _config()
     plan = make_workspace_plan(config)
-    # The current shared helper requires this compatibility region.  It must
-    # never be consumed by FC1; post-FC2 reduction uses home-rank FP32 scores.
+    # The current shared helper requires this compatibility region. It must
+    # never be consumed by FC1. Post-FC2 reduction uses home-rank FP32 scores.
     assert plan.local.region("l1_topk_weights_buffer").spec.dtype == "float32"
     binding = make_token_comm_binding(
         config,

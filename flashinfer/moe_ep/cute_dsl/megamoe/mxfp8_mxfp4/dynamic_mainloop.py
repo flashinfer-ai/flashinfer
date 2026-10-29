@@ -1,26 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Dynamic-N native MXFP4-weight x MXFP8-activation tcgen05 mainloop.
+"""Dynamic-N MXFP4-weight x MXFP8-activation tcgen05 instruction issue.
 
-This module owns only instruction issue.  TMA, SMEM/TMEM layouts, pipelines,
-barriers, and accumulator lifetime belong to the integrating MegaMoE kernel.
+Swap-AB operands are K-major E2M1 weights ``A(M,K,L)`` and E4M3 activations
+``B(N,K,L)``, with E8M0 scales per K32 and an FP32 TMEM accumulator.
+Thus ``idesc.atype`` is E2M1 and ``idesc.btype`` is E4M3.
 
-The kernel uses swap-AB orientation:
-
-* instruction A: MXFP4 E2M1 weights, ``(M, K, L)``;
-* instruction B: MXFP8 E4M3 activations, ``(N, K, L)``;
-* SFA/SFB: E8M0, one scale per 32 K elements; and
-* D: FP32 accumulator in TMEM.
-
-Thus the instruction computes the transpose-oriented equivalent of the logical
-activation x weight GEMM.  Keeping this distinction explicit is important:
-``idesc.atype`` is E2M1 and ``idesc.btype`` is E4M3.
-
-The regular CuTe tcgen05 wrapper builds a static instruction descriptor.  A
-MegaMoE tile can contain fewer tokens than its configured N extent, so this
-component emits literal PTX and fills ``idesc.n_dim`` from the runtime valid
-token count.  All other descriptor fields are fixed by the contract above.
+Unlike CuTe's static wrapper, this emits PTX with ``idesc.n_dim`` set from
+the valid token count. Other descriptor fields are fixed. The caller owns
+TMA, layouts, pipelines, barriers, and accumulator lifetime.
 """
 
 from typing import Optional, Type
@@ -96,7 +85,7 @@ def align_valid_tokens(valid_tokens: int) -> int:
 
 
 def _align16(x):
-    """Round an Int32 SSA value up to a multiple of 16."""
+    """Round an Int32 value up to a multiple of 16."""
     return (Int32(x) + Int32(15)) & Int32(-16)
 
 
@@ -111,7 +100,7 @@ def compute_non_leader_cta_load_shift(
     """Return the non-leader CTA B-load shift for a dynamic-N 2-CTA MMA.
 
     TMA partitions B at ``mma_tiler_n / 2``, while hardware partitions the
-    issued tile at ``align16(valid_tokens) / 2``.  The caller applies this
+    issued tile at ``align16(valid_tokens) / 2``. The caller applies this
     offset with ``cute.domain_offset`` to the non-leader CTA's activation
     tensor before constructing its TMA slice.
     """
@@ -123,8 +112,8 @@ def compute_non_leader_cta_load_shift(
 def build_static_idesc_base(*, umma_m: int) -> int:
     """Build the static mxf8f6f4 descriptor for swap-AB MXFP4 x MXFP8.
 
-    PTX reserves bits 24-25 for this MMA kind; unlike the mxf4nvf4 descriptor,
-    M is a two-bit ``M >> 7`` field at bits 27-28.  This distinction is why the
+    PTX reserves bits 24-25 for this MMA kind. Unlike the mxf4nvf4 descriptor,
+    M is a two-bit ``M >> 7`` field at bits 27-28. This distinction is why the
     W4A4 descriptor builder cannot be reused.
     """
     if umma_m not in (128, 256):
@@ -260,12 +249,12 @@ def issue_dynamic_block_scaled_mma_tile(
     """Issue one K tile of native dynamic-N MXFP4 x MXFP8 MMAs.
 
     Fragment tensors use ``(V, MN-count, K-count)`` and must be built from a
-    tiled MMA matching the explicit dtype/SF contract.  Each K-count slice is
+    tiled MMA matching the explicit dtype/SF contract. Each K-count slice is
     one dense K=32 instruction and therefore consumes exactly one E8M0 scale
     from each scale-factor fragment.
 
-    ``valid_tokens_in_tile`` must be in ``[1, mma_tiler_n]``.  It is rounded to
-    16 before being encoded as ``idesc.n_dim = aligned_n >> 3``.  The caller
+    ``valid_tokens_in_tile`` must be in ``[1, mma_tiler_n]``. It is rounded to
+    16 before being encoded as ``idesc.n_dim = aligned_n >> 3``. The caller
     owns the corresponding non-leader B-load shift for 2-CTA operation.
     """
     validate_mma_contract(

@@ -3,7 +3,6 @@
 
 """Focused contracts and B200 trace test for the persistent device driver."""
 
-import inspect
 from types import SimpleNamespace
 
 import pytest
@@ -74,36 +73,13 @@ def test_driver_accepts_m128_one_cta_and_m256_two_cta() -> None:
     assert driver.dispatch_phase is distributed
 
 
-def test_driver_owns_every_persistent_role_and_tail() -> None:
-    source = inspect.getsource(PersistentM128DeviceDriver.__call__)
-    for role in ("scheduler", "tma_a", "tma_b", "mma", "epilogue"):
-        assert role in source
-    assert "dispatch_phase(" in source
-    assert "kernel_tail(" in source
-    assert "pipeline_init_arrive(" in source
-    assert "pipeline_init_wait(" in source
-
-
-@pytest.mark.parametrize("mega", [False, True])
-def test_eight_warp_register_budget(mega) -> None:
-    pipes = _fake_pipelines(warp_ids=KernelWarpIds.for_epilogue(8, mega=mega))
+def test_eight_warp_register_budget() -> None:
+    pipes = _fake_pipelines(warp_ids=KernelWarpIds.for_epilogue(8))
     driver = PersistentM128DeviceDriver(kernel_pipelines=pipes)
     assert driver.epilogue_registers == 184
     assert driver.task_registers == 72
     with pytest.raises(ValueError, match="register file"):
         PersistentM128DeviceDriver(kernel_pipelines=pipes, epilogue_registers=256)
-
-
-def test_driver_wires_native_mma_and_readiness_protocols() -> None:
-    source = inspect.getsource(PersistentM128DeviceDriver)
-    # Dynamic-N issue is the only MMA path.
-    assert "issue_dynamic_block_scaled_mma_tile(" in source
-    assert "cute.gemm(" not in source
-    assert "work.peek_ready" in source
-    assert "fc1_ready_counter_ptr" in source
-    assert "fc1_done_counter_ptr" in source
-    assert "producer_tail(" in source
-    assert "run_epilogue(" in source
 
 
 class _DriverCounterTraceHarness:

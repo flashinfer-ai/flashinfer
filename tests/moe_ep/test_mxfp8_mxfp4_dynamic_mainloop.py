@@ -104,7 +104,7 @@ class _DeviceIdescHarness:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_device_descriptor_matches_host_for_every_scale_data_id():
-    # Scale-factor data IDs 2 and 3 set bit 31 of the TMEM address; an
+    # Scale-factor data IDs 2 and 3 set bit 31 of the TMEM address. An
     # arithmetic shift of the masked value used to sign-extend ones over the
     # descriptor (illegal instruction parameter on K steps 2 and 3).
     pytest.importorskip("cutlass")

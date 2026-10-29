@@ -1,16 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Host-side workspace contract for MXFP8 x MXFP4 MegaMoE.
+"""Host-only workspace region table shared by the kernel, frontend, and tests.
 
-This module intentionally has no Torch, CUDA, CuTe, or NVSHMEM dependency.
-The persistent kernel and its frontend use the same region table, while unit
-tests can check every size and offset on a CPU-only host.
-
-The dispatch payload is E4M3 (one byte per element).  Its E8M0 sideband has
-one byte per consecutive K32 block and is moved by ``TokenInPullTokenBackPush``
-in uint32 atoms, hence ``ceil(hidden / 128)`` uint32 values per token.  Source
-rows must be zero-padded through the final partial uint32 atom.
+This module has no Torch, CUDA, CuTe, or NVSHMEM dependency. Dispatch
+transports E4M3 bytes and one E8M0 scale byte per K32 block.
+``TokenInPullTokenBackPush`` packs scales into uint32 atoms:
+``ceil(hidden / 128)`` atoms per token. Zero-pad each source scale row
+through its final partial atom.
 """
 
 from __future__ import annotations
@@ -275,13 +272,7 @@ def local_region_specs(config: WorkspaceConfig) -> tuple[RegionSpec, ...]:
             ),
         ]
     )
-    from .wait_stats_config import MEGA_STATS_WORDS, wait_stats_enabled
 
-    if wait_stats_enabled():
-        # Debug-only; after the data regions so the tail's zero-prefix reset
-        # keeps it. Accumulates across launches; the reader zeroes it. The
-        # per-CTA block is followed by the start-up ring.
-        specs.append(_region("wait_stats", "int32", 4, (MEGA_STATS_WORDS,)))
     return tuple(specs)
 
 

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from flashinfer.autotuner.protocol import TuningContext, TuningProtocol, TuningResult
 from flashinfer.autotuner.initializers import (
     autotuner_initializer_empty,
@@ -19,6 +22,7 @@ from flashinfer.autotuner.autotuner import (
     StaticDim,
     TunableRunner,
     TuningConfig,
+    TuningPreflight,
     ValueProfileArena,
     _METADATA_KEY,
     _collect_metadata,
@@ -45,6 +49,7 @@ __all__ = [
     "StaticDim",
     "TunableRunner",
     "TuningConfig",
+    "TuningPreflight",
     "TuningContext",
     "TuningProtocol",
     "TuningResult",

@@ -12,8 +12,8 @@ from typing import TYPE_CHECKING
 import pytest
 
 
-# Load the sibling by path under a collision-resistant module name.  A bare
-# ``import scheduler`` can resolve TeKit's top-level scheduler.py when these
+# Load the sibling by path under a collision-resistant module name. A bare
+# ``import scheduler`` can resolve an unrelated top-level scheduler.py when these
 # tests run inside the development container.
 _MODULE_NAME = "flashinfer_mxfp8_mxfp4_scheduler"
 _SPEC = spec_from_file_location(
@@ -70,7 +70,7 @@ def test_group_phase_order_and_independent_physical_rows() -> None:
     records = [scheduler.record_for(i) for i in range(scheduler.cluster_tile_count)]
 
     # group_hint=3: expert 0 contributes 4 FC1 cluster tiles, so it forms the
-    # first group.  Its FC2 work must precede the next group's FC1 work.
+    # first group. Its FC2 work must precede the next group's FC1 work.
     phases_experts = [(r.phase, r.expert_idx) for r in records]
     first_expert_2 = next(i for i, item in enumerate(phases_experts) if item[1] == 2)
     assert all(expert == 0 for _, expert in phases_experts[:first_expert_2])
@@ -79,7 +79,7 @@ def test_group_phase_order_and_independent_physical_rows() -> None:
 
     expert_2 = records[first_expert_2]
     # Expert 1 has zero tokens but still consumes its configured padded rows
-    # as zero; expert 0's 17 rows round differently in the two planes.
+    # as zero. Expert 0's 17 rows round differently in the two planes.
     assert expert_2.cumulative_data_physical_row == 64
     assert expert_2.cumulative_sf_physical_row == 128
     assert expert_2.cumulative_token_block_count == 2
@@ -156,84 +156,6 @@ def test_zero_token_suffix_terminates_without_work() -> None:
     )
     assert scheduler.cluster_tile_count == 0
     assert not scheduler.record_for(0).is_valid
-
-
-@pytest.mark.parametrize("hidden,intermediate", [(128, 128), (512, 256), (1024, 768)])
-def test_lean_explicit_rows_with_empty_and_skewed_experts(hidden, intermediate):
-    config = _config(
-        expert_token_counts=(0, 257, 0, 3, 0),
-        hidden_size=hidden,
-        gate_up_size=2 * intermediate,
-        expert_data_row_offsets=(0, 64, 384, 448, 512, 512),
-        expert_scale_row_offsets=(0, 128, 512, 768, 896, 896),
-        wait_for_dispatch=False,
-    )
-    scheduler = PersistentFc1Fc2Scheduler(config)
-    records = list(scheduler.records_for_claimer(AtomicTileClaimer()))
-    assert {r.expert_idx for r in records} == {1, 3}
-    for record in records:
-        assert (
-            record.cumulative_data_physical_row
-            == config.expert_data_row_offsets[record.expert_idx]
-        )
-        assert (
-            record.cumulative_sf_physical_row
-            == config.expert_scale_row_offsets[record.expert_idx]
-        )
-        assert record.cumulative_token_block_count == (
-            0 if record.expert_idx == 1 else 17
-        )
-        if record.phase is Phase.FC1:
-            assert scheduler.enrich_readiness_peek(record).peek_ready
-        else:
-            assert not scheduler.enrich_readiness_peek(record).peek_ready
-            assert scheduler.enrich_readiness_peek(
-                record,
-                fc1_done_counters={record.counter_slot: config.fc2_ready_threshold},
-            ).peek_ready
-    # The K extents change phase feature counts, not physical token offsets.
-    for expert_idx, token_count in ((1, 257), (3, 3)):
-        token_blocks = (
-            token_count + config.cluster_tile_m - 1
-        ) // config.cluster_tile_m
-        for phase, features in (
-            (Phase.FC1, config.fc1_feature_blocks),
-            (Phase.FC2, config.fc2_feature_blocks),
-        ):
-            assert (
-                sum(r.expert_idx == expert_idx and r.phase == phase for r in records)
-                == token_blocks * features
-            )
-
-
-def test_explicit_rows_match_mega_when_padding_matches():
-    mega = PersistentFc1Fc2Scheduler(_config())
-    lean = PersistentFc1Fc2Scheduler(
-        _config(
-            expert_data_row_offsets=(0, 64, 64, 128),
-            expert_scale_row_offsets=(0, 128, 128, 256),
-            wait_for_dispatch=False,
-        )
-    )
-    assert list(mega.records_for_claimer(AtomicTileClaimer())) == list(
-        lean.records_for_claimer(AtomicTileClaimer())
-    )
-
-
-@pytest.mark.parametrize(
-    "data,scales",
-    [
-        ((0, 64, 64, 128), None),
-        ((0, 64), (0, 128)),
-        ((64, 128, 128, 192), (0, 128, 128, 256)),
-        ((0, 32, 32, 128), (0, 128, 128, 256)),
-        ((0, 64, 0, 128), (0, 128, 128, 256)),
-        ((0, 0, 0, 64), (0, 128, 128, 256)),
-    ],
-)
-def test_explicit_row_validation(data, scales):
-    with pytest.raises(ValueError):
-        _config(expert_data_row_offsets=data, expert_scale_row_offsets=scales)
 
 
 @pytest.mark.parametrize("seed", range(20))
@@ -329,21 +251,12 @@ def test_alternating_fixed_claim_decode_ignores_groups():
 
 @pytest.mark.parametrize("experts", [1, 7, 32, 33, 64, 65])
 @pytest.mark.parametrize("group_hint", [1, 5, 4096])
-@pytest.mark.parametrize("explicit_offsets", [False, True])
-def test_longest_first_preserves_tiles_and_pool_addresses(
-    experts, group_hint, explicit_offsets
-):
+def test_longest_first_preserves_tiles_and_pool_addresses(experts, group_hint):
     import random
 
     rng = random.Random(20261018 + experts)
     counts = tuple(rng.choice([0, 0, 17, 33, 65, 257]) for _ in range(experts))
-    offsets = {}
-    if explicit_offsets:
-        offsets = dict(
-            expert_data_row_offsets=tuple(320 * e for e in range(experts + 1)),
-            expert_scale_row_offsets=tuple(384 * e for e in range(experts + 1)),
-        )
-    config = _config(expert_token_counts=counts, group_hint=group_hint, **offsets)
+    config = _config(expert_token_counts=counts, group_hint=group_hint)
     original = PersistentFc1Fc2Scheduler(config)
     reordered = PersistentFc1Fc2Scheduler(replace(config, claim_order="longest_first"))
     assert reordered.order == tuple(

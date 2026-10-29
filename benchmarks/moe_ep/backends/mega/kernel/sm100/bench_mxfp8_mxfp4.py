@@ -36,12 +36,17 @@ def main():
     parser.add_argument("--repeat", type=int, default=100)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--save-outputs", type=Path)
+    parser.add_argument(
+        "--owned-output",
+        action="store_true",
+        help="Include the graph-safe copy into caller-owned BF16 output.",
+    )
     args = parser.parse_args()
     # Refuse an event fallback: stable workspace closures cannot rotate inputs.
     from cupti import cupti  # noqa: F401
 
     assert int(importlib.metadata.version("cupti-python").split(".")[0]) >= 13
-    assert torch.cuda.get_device_capability() == (10, 0)
+    assert torch.cuda.get_device_capability()[0] == 10
     device = torch.cuda.get_device_properties(0)
     metadata = dict(
         gpu=device.name,
@@ -62,6 +67,7 @@ def main():
         topk=args.top_k,
         seed=args.seed,
         world_size=1,
+        owned_output=args.owned_output,
         timing="CUPTI, CUDA graph, cold L2, pre-staged inputs",
     )
     results, saved = [], {}
@@ -79,11 +85,17 @@ def main():
             capacity_tactics=[{}],
         )
         try:
+            owned = (
+                torch.empty((tokens, args.hidden), dtype=torch.bfloat16, device="cuda")
+                if args.owned_output
+                else None
+            )
 
             def run():
-                return mxfp8_mxfp4_mega_moe(
+                view = mxfp8_mxfp4_mega_moe(
                     None, fc1, fc2, workspace, num_tokens=tokens
                 )
+                return owned.copy_(view) if owned is not None else view
 
             actual = run()
             torch.cuda.synchronize()

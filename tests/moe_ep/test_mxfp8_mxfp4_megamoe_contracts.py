@@ -61,7 +61,7 @@ def test_mxfp8_mxfp4_megamoe_oracle_boundary_token_counts(tokens: int) -> None:
 
 def test_mxfp8_mxfp4_megamoe_zero_token_experts_and_extreme_skew() -> None:
     problem = _oracle_problem(tokens=33)
-    # Every live edge targets expert 3.  Experts 0..2 are deliberately empty.
+    # Every live edge targets expert 3. Experts 0..2 are deliberately empty.
     problem["topk_ids"].fill_(3)
     first = compute_reference(**problem)
     second = compute_reference(**problem)

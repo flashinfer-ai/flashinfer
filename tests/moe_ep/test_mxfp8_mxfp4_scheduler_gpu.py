@@ -30,7 +30,7 @@ class _SchedulerProbe:
         self.group_hint = group_hint
 
     @cute.jit
-    def __call__(self, counts, counters, tables, records, stream):
+    def __call__(self, counts, arrivals, counters, tables, records, stream):
         params = DeviceSchedulerParams(
             expert_token_sizes=counts,
             expert_count=self.experts,
@@ -42,7 +42,7 @@ class _SchedulerProbe:
             group_hint=self.group_hint,
             token_padding_block=64,
             sf_padding_block=128,
-            fc1_ready_counter_ptr=None,
+            fc1_ready_counter_ptr=arrivals.iterator,
             fc1_done_counter_ptr=counters.iterator,
             fc2_ready_threshold=4,
             claim_order=self.order,
@@ -101,7 +101,6 @@ def test_device_scheduler_tables_and_records(experts, empty, order, group_hint):
             sf_padding_block=128,
             num_persistent_clusters=1,
             fc2_ready_threshold=4,
-            wait_for_dispatch=False,
             claim_order=order,
         )
     )
@@ -109,11 +108,14 @@ def test_device_scheduler_tables_and_records(experts, empty, order, group_hint):
     counters = torch.full(
         (sum((n + 63) // 64 for n in counts) + 1,), 4, device="cuda", dtype=torch.int32
     )
+    arrivals = torch.full_like(counters, 64)
     tables = torch.empty((4, experts), device="cuda", dtype=torch.int32)
     records = torch.empty(
         (host.cluster_tile_count + 1, 8), device="cuda", dtype=torch.int32
     )
-    views = [from_dlpack(t) for t in (device_counts, counters, tables, records)]
+    views = [
+        from_dlpack(t) for t in (device_counts, arrivals, counters, tables, records)
+    ]
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     run = cute.compile(_SchedulerProbe(experts, order, group_hint), *views, stream)
     run(*views, stream)
@@ -125,7 +127,9 @@ def test_device_scheduler_tables_and_records(experts, empty, order, group_hint):
     expected = [
         list(
             host.enrich_readiness_peek(
-                host.record_for(i), fc1_done_counters=[4] * counters.numel()
+                host.record_for(i),
+                fc1_ready_counters=[64] * arrivals.numel(),
+                fc1_done_counters=[4] * counters.numel(),
             ).to_words()
         )
         for i in range(host.cluster_tile_count + 1)

@@ -1,17 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Logical CuTe views over transformed MXFP4 weight scale buffers.
+"""CuTe views of atom-swizzled MXFP4 weight scales.
 
-Weight preprocessing stores each expert's E8M0 scale plane in the standard
-Blackwell 32x4x4 scale-factor atom order.  The public Torch shape is therefore
-``(experts, bytes_per_expert)`` and deliberately does *not* describe the
-logical matrix.  TMA, on the other hand, needs the atom-tiled CuTe layout for
-the swap-AB GEMM domain ``(M, K, L=experts)``.
-
-This module is the single adapter between those representations.  CUTLASS and
-CuTe imports remain inside :meth:`SwizzledWeightScaleViews.to_cute`, keeping
-the backend importable on hosts that do not have CuTe DSL installed.
+Preprocessing stores E8M0 planes in Blackwell 32x4x4 atom order as Torch
+``(experts, bytes_per_expert)`` buffers. This adapter reconstructs the
+atom-tiled ``(M, K, L=experts)`` layout needed by swap-AB TMA.
+CUTLASS/CuTe imports stay inside :meth:`SwizzledWeightScaleViews.to_cute`
+for CPU-only import safety.
 """
 
 from __future__ import annotations
@@ -25,6 +21,8 @@ import torch
 SF_VECTOR_SIZE = 32
 SF_ATOM_ROWS = 128
 SF_ATOM_K_BLOCKS = 4
+SF_ATOM_ROW_GROUPS = 4
+SF_ATOM_ROWS_PER_GROUP = SF_ATOM_ROWS // SF_ATOM_ROW_GROUPS
 SF_ATOM_BYTES = SF_ATOM_ROWS * SF_ATOM_K_BLOCKS
 _TMA_MIN_ALIGNMENT = 16
 
@@ -61,7 +59,7 @@ def atom_swizzled_offset(
 ) -> int:
     """Map logical ``(row, K/32 block)`` to a byte in one expert plane.
 
-    This is the scalar form of CUTLASS' 32x4x4 SF atom layout.  Keeping the
+    This is the scalar form of CUTLASS' 32x4x4 SF atom layout. Keeping the
     mapping explicit gives preprocessing and the CuTe view a round-trip
     contract independent of tensor reshapes.
     """
@@ -78,8 +76,9 @@ def atom_swizzled_offset(
     row_in_atom = row % SF_ATOM_ROWS
     return (
         atom * SF_ATOM_BYTES
-        + (row_in_atom % 32) * 16
-        + (row_in_atom // 32) * 4
+        + (row_in_atom % SF_ATOM_ROWS_PER_GROUP)
+        * (SF_ATOM_ROW_GROUPS * SF_ATOM_K_BLOCKS)
+        + (row_in_atom // SF_ATOM_ROWS_PER_GROUP) * SF_ATOM_K_BLOCKS
         + k_block % SF_ATOM_K_BLOCKS
     )
 
@@ -87,7 +86,7 @@ def atom_swizzled_offset(
 def to_atom_swizzled(logical: torch.Tensor) -> torch.Tensor:
     """Apply the preprocessing 32x4x4 atom layout to one logical scale plane.
 
-    ``logical`` has shape ``(M, K/32)``.  Padding bytes are zero, matching the
+    ``logical`` has shape ``(M, K/32)``. Padding bytes are zero, matching the
     existing W4A8 preprocessing contract.
     """
 
@@ -106,7 +105,7 @@ def to_atom_swizzled(logical: torch.Tensor) -> torch.Tensor:
         0, 2, 1, 3
     )
     return (
-        atoms.reshape(-1, 4, 32, SF_ATOM_K_BLOCKS)
+        atoms.reshape(-1, SF_ATOM_ROW_GROUPS, SF_ATOM_ROWS_PER_GROUP, SF_ATOM_K_BLOCKS)
         .transpose(1, 2)
         .reshape(-1)
         .contiguous()
@@ -132,7 +131,9 @@ def from_atom_swizzled(
     padded_k_blocks = _ceil_div(k_blocks, SF_ATOM_K_BLOCKS) * SF_ATOM_K_BLOCKS
     row_atoms = padded_rows // SF_ATOM_ROWS
     k_atoms = padded_k_blocks // SF_ATOM_K_BLOCKS
-    atoms = flat.reshape(-1, 32, 16).reshape(-1, 32, 4, 4)
+    atoms = flat.reshape(
+        -1, SF_ATOM_ROWS_PER_GROUP, SF_ATOM_ROW_GROUPS * SF_ATOM_K_BLOCKS
+    ).reshape(-1, SF_ATOM_ROWS_PER_GROUP, SF_ATOM_ROW_GROUPS, SF_ATOM_K_BLOCKS)
     blocks = atoms.transpose(1, 2).reshape(
         row_atoms, k_atoms, SF_ATOM_ROWS, SF_ATOM_K_BLOCKS
     )
@@ -142,7 +143,7 @@ def from_atom_swizzled(
 
 @dataclass(frozen=True)
 class CuteWeightScaleViews:
-    """Named products consumed by ``DeviceAssemblyProtocol``."""
+    """Logical scale views consumed by the persistent kernel."""
 
     fc1_weight_sfa_logical: Any
     fc2_weight_sfa_logical: Any
@@ -159,9 +160,9 @@ class CuteWeightScaleArguments:
 class SwizzledWeightScaleViews:
     """Validate transformed scale planes and expose zero-copy CuTe SF views.
 
-    FC1 rows already have the preprocessing gate8/up8 interleave.  The
+    FC1 rows already have the preprocessing gate8/up8 interleave. The
     adapter preserves that M ordering and only supplies the correct atom
-    layout; it never transposes or reorders weight scale bytes.
+    layout. It never transposes or reorders weight scale bytes.
     """
 
     def __init__(
@@ -252,7 +253,7 @@ class SwizzledWeightScaleViews:
         """Create zero-copy flat CuTe runtime arguments.
 
         CuTe layouts can only be constructed while tracing a ``cute.jit``
-        entry point.  The integrating kernel passes these arguments to
+        entry point. The integrating kernel passes these arguments to
         :meth:`make_logical_views` inside that entry point.
         """
 
@@ -279,7 +280,7 @@ class SwizzledWeightScaleViews:
         """Apply atom layouts while tracing the integrating ``cute.jit``.
 
         The inputs are the traced forms of the flat arguments returned by
-        :meth:`to_cute`.  Returned tensors are directly compatible with
+        :meth:`to_cute`. Returned tensors are directly compatible with
         :meth:`Mxfp8Mxfp4TmaStaging.make_tma_atoms`.
         """
 
@@ -291,7 +292,7 @@ class SwizzledWeightScaleViews:
 
         def make_view(tensor: Any, shape: tuple[int, int, int]):
             layout = blockscaled_utils.tile_atom_to_shape_SF(shape, SF_VECTOR_SIZE)
-            # The iterator points at already-swizzled storage.  The atom
+            # The iterator points at already-swizzled storage. The atom
             # layout is essential: reshaping ``tensor`` would assign row-major
             # strides and make TMA read the wrong scale for almost every row.
             return cute.make_tensor(tensor.iterator, layout)

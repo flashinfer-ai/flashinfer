@@ -1291,13 +1291,26 @@ It accepts MXFP8 activations and MXFP4 weights with UE8M0 block-32 scales.
 Routing scores are applied after FC2 in deterministic FP32 slot order.
 The result is weighted BF16 `[tokens, hidden]`.
 
-Default tactic bands were measured on GB200 EP16. The knob cache can
-override them. Use explicit `knobs` for reproducible A/B runs, including
+Hidden and post-SwiGLU intermediate dimensions must be positive multiples
+of 128. Top-k is at most 32 and cannot exceed the expert count. Experts
+must divide evenly among the EP ranks. Use the backend's
+`preprocess_mega_weights` to pack weights and swizzle scales. It accepts
+canonical BF16 weights or `PrequantizedMoEWeights` with unswizzled UE8M0
+scales. Staging accepts BF16 activations or prequantized E4M3 with UE8M0
+block-32 scales.
+
+Default tactics depend on token capacity and matrix dimensions. The knob
+cache can override them. Use explicit `knobs` for reproducible A/B runs, including
 `epilogue_warps`, `in_kernel_reduce`, and `load_balance_mode`. Complete
 collective tuning and eager warmup before CUDA graph capture. The selected
 tactic is bound to workspace capacity, so serving with fewer active tokens
-retains the prepared layout. `FLASHINFER_MXFP8_MXFP4_WAIT_STATS` is a
-compile-time diagnostic; leave it unset for performance measurements.
+retains the prepared layout.
+
+Keep workspace and tensor addresses alive through graph replay. After a
+tactic change, warm up and capture a new graph. The low-level launcher
+returns workspace storage when `output=None`, so copy results that must
+survive the next launch. Complete GPU work before destroying the workspace,
+and keep tuning and teardown collective across the EP process group.
 
 Validate single-GPU behavior with `pytest tests/moe_ep/test_mxfp8_mxfp4*.py`.
 For NVLink reference checks, repeated launches, and graph replay, run

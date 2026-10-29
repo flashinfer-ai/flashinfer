@@ -1,20 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Offline tactic sweep for native MXFP8 x MXFP4 MegaMoE.
+"""Offline MXFP8 x MXFP4 tuning via :mod:`flashinfer.moe_ep.tune`.
 
-Selection and GPU timing use FlashInfer's general autotuner, with maximum
-rank latency as the score. Winners are also exported to the legacy knob
-cache for existing serving configurations (without a wall-clock p50).
+Use ``--dtype mxfp8_mxfp4``. The general autotuner scores the slowest rank.
+``--mxfp8-mxfp4-exhaustive`` expands the default candidate set.
+``--sweep schedule`` varies ``load_balance_mode`` and ``group_hint``,
+keeping other defaults or ``--base-knobs`` fixed.
 
-Invoked through the :mod:`flashinfer.moe_ep.tune` CLI shim (``--dtype
-mxfp8_mxfp4``). The default sweep times :func:`.config.candidate_tactics` for
-the shape (128 pair-tile tactics at 256-aligned shapes, both weight L2
-policies); ``--sweep schedule``
-pins the rest of the default (or ``--base-knobs``) and sweeps
-``load_balance_mode`` x ``group_hint``. Winners land in the knob cache under
-dtype ``mxfp8_mxfp4``, keyed on ``--max-tokens``; ``knobs=None`` workspaces
-resolve through it.
+Winners are cached under dtype ``mxfp8_mxfp4`` and ``--max-tokens`` for
+workspaces using ``knobs=None``.
 """
 
 from __future__ import annotations
@@ -32,7 +27,10 @@ def _candidates(args, max_tokens: int, rank: int) -> list[dict]:
         return [
             dict(tactic)
             for tactic in candidate_tactics(
-                hidden=args.hidden, intermediate=args.intermediate
+                hidden=args.hidden,
+                intermediate=args.intermediate,
+                max_tokens_per_rank=max_tokens,
+                exhaustive=args.mxfp8_mxfp4_exhaustive,
             )
         ]
     base: dict[str, Any] = dict(
@@ -58,7 +56,7 @@ def _candidates(args, max_tokens: int, rank: int) -> list[dict]:
 
 
 def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
-    """Run one max-token bucket; invoked by the shared sweep loop."""
+    """Run one max-token bucket. Invoked by the shared sweep loop."""
 
     from ......cute_dsl.megamoe.mxfp8_mxfp4.integration import (
         autotune_mxfp8_mxfp4_mega_moe,

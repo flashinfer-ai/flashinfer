@@ -23,6 +23,12 @@ LoadBalanceMode = Literal["static", "atomic_counter", "alternating"]
 ALTERNATING_CLAIM_MIN_TOKENS = 512
 # The pair tile claims tiles atomically below this many tokens per rank.
 ATOMIC_CLAIM_MAX_TOKENS = 256
+# Search bounds for fit_operand_stages, not hardware limits. Shared memory
+# limits the supported tiles. Stage counts size shared-storage mbarrier arrays,
+# so the search is finite. Splitting operands across a CTA pair makes each
+# stage smaller, allowing a higher cap. Revisit these if stage layouts shrink.
+MAX_OPERAND_STAGES_PAIR = 12
+MAX_OPERAND_STAGES_SINGLE = 8
 
 
 class Mxfp8Mxfp4Tactic(TypedDict, total=False):
@@ -81,8 +87,11 @@ def validate_tactic(tactic: Mapping[str, Any], *, partial: bool = True) -> None:
             raise ValueError("cluster_shape_mnk must be (1|2|4, 1|2|4, 1)")
         if cluster[0] * cluster[1] > 16:
             raise ValueError("cluster_shape_mnk may contain at most 16 CTAs")
+        # Dispatch readiness counters track one token tile per cluster.
+        if cluster[1] != 1:
+            raise ValueError("cluster_shape_mnk requires one CTA along the token axis")
 
-    # A partial override may pin M256 alone; resolve_tactic supplies the
+    # A partial override may pin M256 alone. resolve_tactic supplies the
     # matching cluster before validating the complete tactic.
     if (
         tile is not None
@@ -96,18 +105,18 @@ def validate_tactic(tactic: Mapping[str, Any], *, partial: bool = True) -> None:
     if (
         stages is not None
         and stages != "auto"
-        and (not isinstance(stages, int) or not 2 <= stages <= 8)
+        and (type(stages) is not int or not 2 <= stages <= 8)
     ):
         raise ValueError("num_stages must be 'auto' or an integer in [2, 8]")
     group_hint = tactic.get("group_hint")
-    if group_hint is not None and (not isinstance(group_hint, int) or group_hint <= 0):
+    if group_hint is not None and (type(group_hint) is not int or group_hint <= 0):
         raise ValueError("group_hint must be None or a positive integer")
     clusters = tactic.get("persistent_clusters")
     if clusters is not None and (type(clusters) is not int or clusters <= 0):
         raise ValueError("persistent_clusters must be None or a positive integer")
     flag_batch = tactic.get("flag_batch")
     if flag_batch is not None and (
-        not isinstance(flag_batch, int) or not 1 <= flag_batch <= 32
+        type(flag_batch) is not int or not 1 <= flag_batch <= 32
     ):
         raise ValueError("flag_batch must be an integer in [1, 32]")
     if tactic.get("load_balance_mode", "static") not in (
@@ -208,26 +217,18 @@ def default_tactic(
 
 
 def candidate_tactics(
-    *, hidden: int | None = None, intermediate: int | None = None
+    *,
+    hidden: int | None = None,
+    intermediate: int | None = None,
+    max_tokens_per_rank: int = 1,
+    exhaustive: bool = False,
 ) -> list[Mxfp8Mxfp4Tactic]:
-    """Bounded search over supported geometry and measured scheduling settings.
+    """Search 32 tactics, including the workload's default.
 
-    With a shape the pair tile supports (see :func:`default_tactic`), the
-    grid spans the axes the defaults choose between: N64/N128/N192 token
-    tiles, ``group_hint`` 512/4096, four or eight epilogue warps, and both
-    top-k reduction placements with static claims (24), plus alternating
-    claims at N192 and atomic claims at N64 (``group_hint`` 4096) for both
-    widths and placements (8; ``group_hint`` has no effect with alternating
-    claims), all ``num_stages="auto"`` and ``epi_warps`` token back.
-    Each paired-tile tactic also tries a 64-cluster cap and both weight L2
-    policies, for 128 candidates total. Every default tactic is in this
-    grid, so tuning cannot do worse
-    than the shipped band on the timed run.
-
-    Without such a shape, the 1-CTA grid: N64/N128 at auto and pinned 3-5
-    operand stages (auto fits more than four stages for the MAI geometry),
-    ``group_hint`` 512/4096 and both reduction placements. N256 is rejected
-    by the assembly.
+    Retain the capacity's default L2 policy and uncapped cluster count.
+    ``exhaustive=True`` adds a 64-cluster cap and both L2 policies, yielding
+    128 paired-tile tactics. The 1-CTA grid remains at 32. The tuning API
+    also accepts explicit candidate lists.
     """
 
     candidates: list[Mxfp8Mxfp4Tactic] = []
@@ -237,7 +238,9 @@ def candidate_tactics(
                 for epilogue_warps in (4, 8):
                     for in_kernel_reduce in (False, True):
                         tactic = default_tactic(
-                            1, hidden=hidden, intermediate=intermediate
+                            max_tokens_per_rank,
+                            hidden=hidden,
+                            intermediate=intermediate,
                         )
                         tactic["mma_tiler_mnk"] = (256, n, 128)
                         tactic["group_hint"] = group_hint
@@ -248,7 +251,9 @@ def candidate_tactics(
                         candidates.append(tactic)
         for epilogue_warps in (4, 8):
             for in_kernel_reduce in (False, True):
-                tactic = default_tactic(1, hidden=hidden, intermediate=intermediate)
+                tactic = default_tactic(
+                    max_tokens_per_rank, hidden=hidden, intermediate=intermediate
+                )
                 tactic["mma_tiler_mnk"] = (256, 192, 128)
                 tactic["group_hint"] = 512
                 tactic["epilogue_warps"] = cast(Literal[4, 8], epilogue_warps)
@@ -263,6 +268,8 @@ def candidate_tactics(
                 tactic["load_balance_mode"] = "atomic_counter"
                 validate_tactic(tactic, partial=False)
                 candidates.append(tactic)
+        if not exhaustive:
+            return candidates
         for tactic in candidates.copy():
             capped = tactic.copy()
             capped["persistent_clusters"] = 64
@@ -297,11 +304,10 @@ def resolve_tactic(
     hidden: int | None = None,
     intermediate: int | None = None,
 ) -> Mxfp8Mxfp4Tactic:
-    """Merge a partial pinned tactic over the deterministic host default.
+    """Merge pinned fields over the deterministic default.
 
-    An override that pins the MMA M without a cluster shape gets the cluster
-    that M implies ((1, 1, 1) for M128, (2, 1, 1) for M256), so pinning a
-    1-CTA tile never inherits the default's 2-CTA cluster.
+    When MMA M is pinned without a cluster shape, use ``(1, 1, 1)`` for M128
+    or ``(2, 1, 1)`` for M256 so a 1-CTA tile cannot inherit a 2-CTA cluster.
     """
 
     tactic = default_tactic(

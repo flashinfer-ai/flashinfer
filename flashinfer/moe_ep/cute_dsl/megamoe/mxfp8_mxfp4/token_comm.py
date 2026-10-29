@@ -3,7 +3,7 @@
 
 """Binding policy for the shared MegaMoE token communication helper.
 
-Only construction-time constants live here.  Device tensor arguments are
+Only construction-time constants live here. Device tensor arguments are
 assembled by the integrated kernel from :mod:`workspace` regions.
 """
 
@@ -20,8 +20,8 @@ class TokenCommBinding:
     """Format-specific constants passed to ``TokenInPullTokenBackPush``.
 
     ``transports_compat_topk_weights`` records a temporary ABI constraint of
-    the shared helper.  It does *not* authorize FC1 to apply routing weights;
-    the home-rank FP32 scores are authoritative and are applied after FC2.
+    the shared helper. It does *not* authorize FC1 to apply routing weights.
+    The home-rank FP32 scores are authoritative and are applied after FC2.
     """
 
     world_size: int
@@ -55,7 +55,7 @@ class TokenCommBinding:
             "hidden": self.hidden,
             "fc1_token_dtype": fc1_token_dtype,
             "combine_format": combine_format,
-            # The FC2 epilogue writes route terms home; dispatch warps never
+            # The FC2 epilogue writes route terms home. Dispatch warps never
             # push tokens back. Scores are not folded into FC1 or dispatch.
             "token_back_by_dispatch": False,
             "fc2_publishes_per_token_cluster_tile": 0,

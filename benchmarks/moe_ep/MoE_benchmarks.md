@@ -196,7 +196,7 @@ B200, both `nccl_ep` and `nixl_ep`. Correctness is covered in `docs/design_docs/
 
 ## MXFP8 x MXFP4 MegaMoE
 
-`benchmarks/bench_mxfp8_mxfp4.py` measures the native SM100
+`benchmarks/moe_ep/backends/mega/kernel/sm100/bench_mxfp8_mxfp4.py` measures the native SM100
 MegaMoE block with pre-staged inputs, default tactics, and cold-L2 CUPTI
 timing over CUDA graph replay. It records absolute latency, GPU identity,
 geometry, software versions, and tactics. Use `--save-outputs` for exact
@@ -204,11 +204,45 @@ before/after checks. Run each revision in a fresh process on the same B200,
 then repeat the baseline to detect drift:
 
 ```bash
-python benchmarks/bench_mxfp8_mxfp4.py \
+python benchmarks/moe_ep/backends/mega/kernel/sm100/bench_mxfp8_mxfp4.py \
   --tokens 32 128 512 --hidden 4096 --intermediate 6400 \
   --experts 32 --top-k 8 \
   --output /tmp/mxfp8-mxfp4.json --save-outputs /tmp/mxfp8-mxfp4.pt
 ```
 
-`benchmarks/profile_mxfp8_mxfp4_lean.py` provides focused FC1/FC2 profiling.
 Routing and attention are excluded from these measurements.
+
+### Autotuning
+
+To measure autotuning, time `autotune_mxfp8_mxfp4_mega_moe` after input
+creation and one default launch. Use `warmup_iters=0`, `timed_iters=3`, and
+`candidate_tactics` for the workload. Report cold and warm compilation/cache
+states separately. The default sweep has 32 candidates. The 128-candidate
+grid is available through `exhaustive=True` or the offline CLI's
+`--mxfp8-mxfp4-exhaustive` option.
+
+### Caller-owned output copy
+
+The backend keeps a stable workspace output binding during CUDA graph capture
+and copies into the layer's caller-owned BF16 output. This preserves output
+ownership across forwards. Cache residency determines the copy cost in a real
+forward. The benchmark uses the workspace view by default.
+Add `--owned-output` to `benchmarks/moe_ep/backends/mega/kernel/sm100/bench_mxfp8_mxfp4.py` to include the copy
+in an end-to-end single-GPU measurement. Reproduce the isolated copy with:
+
+```python
+import statistics
+import torch
+from cupti import cupti  # Require CUPTI rather than an event fallback.
+from flashinfer.testing import bench_gpu_time
+
+for tokens in (32, 256, 512, 1024):
+    source = torch.ones((tokens, 4096), device="cuda", dtype=torch.bfloat16)
+    destination = torch.empty_like(source)
+    for cold in (False, True):
+        times = bench_gpu_time(
+            lambda: destination.copy_(source), dry_run_iters=50, repeat_iters=100,
+            enable_cupti=True, use_cuda_graph=True, cold_l2_cache=cold,
+        )
+        print(tokens, cold, statistics.median(times) * 1000)
+```

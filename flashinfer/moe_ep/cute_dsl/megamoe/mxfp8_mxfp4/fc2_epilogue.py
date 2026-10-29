@@ -3,25 +3,16 @@
 
 """FC2 route stores and deterministic combine for MXFP8 x MXFP4 MegaMoE.
 
-The two operations in this module deliberately have separate interfaces:
+:class:`Fc2RouteStore` resolves local/peer source-token/slot rows. The
+persistent epilogue rounds each unweighted FP32 accumulator to BF16 once.
+:class:`DeterministicTopKReducer` converts terms to FP32, applies FP32
+scores, accumulates slots in ascending order, and rounds once to BF16.
+Routing therefore cannot alter the FC1-to-FC2 quantization boundary.
 
-* :class:`Fc2RouteStore` resolves the row of each ``(src_token_idx,
-  src_topk_idx)``; the persistent epilogue rounds each unweighted FP32 FC2
-  accumulator to BF16 exactly once and stores it there.
-* :class:`DeterministicTopKReducer` reads those BF16 route terms, converts
-  them back to FP32, applies the FP32 routing score, accumulates top-k slots in
-  increasing slot order, and rounds the final output to BF16 exactly once.
-
-In particular, the route-store path has no routing-score operand.  This keeps
-routing after FC2 and prevents it from changing the FC1-to-FC2 MXFP8
-quantization point. Local and peer stores share the same route-slot layout.
-Reduction placement is selected by the integrating kernel's tactic; the
-persistent tail runs :class:`InKernelTopKReduction`.
-
-The integrating kernel owns TMEM lifetime, accumulator-pipeline barriers,
-source metadata, and inter-rank completion signalling.  This component only
-owns the final TMEM/RMEM conversion, route destination resolution, and combine
-arithmetic.
+Local and peer stores use the same layout. The tactic chooses reduction
+placement, with :class:`InKernelTopKReduction` running in the tail. The
+integrating kernel owns TMEM lifetime, barriers, metadata, and inter-rank
+completion signaling.
 """
 
 from __future__ import annotations
@@ -56,20 +47,14 @@ def validate_fc2_contract(*, hidden: int, num_topk: int) -> None:
 
 @dataclasses.dataclass(frozen=True)
 class Fc2RouteStore:
-    """Resolve a route slot in local or peer symmetric memory.
+    """Resolve a BF16 route row in local or peer symmetric memory.
 
-    ``tensor`` is the local-rank view of a BF16
-    ``(max_tokens_per_rank, num_topk, hidden)`` route-term allocation.  With no
-    mapper, ``resolve_route_row`` returns its local
-    ``[src_token_idx, src_topk_idx, :]`` row.  With a mapper, the same local
-    row pointer is rebased to ``src_rank``; consequently the data layout is
-    identical for local and peer stores.
+    ``tensor`` has shape ``(max_tokens_per_rank, num_topk, hidden)``. Without a
+    mapper, return ``[src_token_idx, src_topk_idx, :]`` locally. Otherwise
+    rebase that pointer to ``src_rank``, preserving the layout.
 
-    The scheduler/token-communication component supplies the three source
-    coordinates.  It must use this component only after route ids have been
-    validated against the numerical contract.  Expert id ``-1`` never creates
-    an FC2 task, so its route slot remains the zero initialized term consumed
-    by the reducer.
+    The scheduler supplies validated source coordinates. Masked expert id
+    ``-1`` creates no FC2 task and is ignored by the reducer.
     """
 
     tensor: cute.Tensor
@@ -132,7 +117,7 @@ def _add_rn_f32(
     loc: Optional[ir.Location] = None,
     ip: Optional[ir.InsertionPoint] = None,
 ) -> Float32:
-    """Separate FP32 add; intentionally not contracted into an FMA."""
+    """Separate FP32 add. Intentionally not contracted into an FMA."""
 
     return Float32(
         llvm.inline_asm(
@@ -148,12 +133,10 @@ def _add_rn_f32(
 
 
 class DeterministicTopKReducer:
-    """BF16-route-term reducer with a fixed ascending slot order.
+    """Reduce BF16 route terms in ascending slot order.
 
-    ``route_ids`` is required so the ``-1`` sentinel ignores its score even if
-    the caller filled that score with a nonzero value.  All other ids are
-    treated as active here: invalid ids must be rejected by frontend route
-    validation and are never silently dropped by this kernel.
+    ``route_ids`` masks ``-1`` regardless of its score. Every other id is
+    active, so frontend validation must reject invalid ids.
     """
 
     def __init__(self, *, hidden: int, num_topk: int) -> None:
@@ -266,7 +249,7 @@ class DeterministicTopKReducer:
             cutlass.BFloat16,
             num_bits_per_copy=128,
         )
-        # This constexpr loop is the deterministic reduction order.  Do
+        # This constexpr loop is the deterministic reduction order. Do
         # not tree-reduce, atomically reduce, or reorder the slot axis.
         for slot in cutlass.range_constexpr(0, self.num_topk, 1):
             if route_ids[token_idx, Int32(slot)] != -1:
@@ -275,8 +258,8 @@ class DeterministicTopKReducer:
                     cutlass.BFloat16,
                 )
                 term_slice = terms[slot, None]
-                # Route rows are hidden-major and hidden is K32 aligned;
-                # each worker advances by eight BF16 values.  Rebuild the
+                # Route rows are hidden-major and hidden is K32 aligned.
+                # Each worker advances by eight BF16 values. Rebuild the
                 # dynamically sliced iterator with its guaranteed 16-byte
                 # alignment so the 128-bit load survives verification.
                 aligned_term = cute.make_tensor(

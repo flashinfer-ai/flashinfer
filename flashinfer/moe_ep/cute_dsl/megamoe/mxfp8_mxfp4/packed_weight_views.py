@@ -1,22 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Pointer-backed CuTe views over packed MXFP4 MegaMoE weights.
+"""CuTe nibble views over packed MXFP4 weights.
 
-Weight preprocessing returns Torch tensors with physical shape
-``(experts, K / 2, M)``.  Each Torch element is one byte containing two E2M1
-values, and the K dimension is physically contiguous.  The swap-AB MMA sees
-the same storage as a logical nibble tensor ``(M, K, experts)`` with stride
-``(K, 1, M * K)``.
+Preprocessing returns physical ``(experts, K/2, M)`` Torch byte tensors
+with contiguous packed K. MMA sees logical ``(M, K, experts)`` nibbles
+with stride ``(K, 1, M*K)``.
 
-``cutlass.torch.from_dlpack`` cannot express that distinction reliably for
-``torch.float4_e2m1fn_x2``: it expands Torch's trailing dimension, although
-the packed dimension here is the middle (K) dimension.  This adapter therefore
-passes typed raw pointers to CuTe and constructs the logical layout explicitly
-while tracing the JIT entry point.
-
-CUTLASS/CuTe imports are intentionally lazy so importing the backend remains
-safe on CPU-only hosts.
+For ``torch.float4_e2m1fn_x2``, ``from_dlpack`` expands the trailing dimension
+rather than packed K. Pass typed raw pointers and build the logical layout
+while tracing. Lazy CUTLASS/CuTe imports preserve CPU-only import safety.
 """
 
 from __future__ import annotations
@@ -72,7 +65,7 @@ class PackedWeightViews:
     """Validate transformed weights and expose zero-copy logical CuTe views.
 
     FC1's M coordinate is already gate8/up8 interleaved by preprocessing.
-    This adapter deliberately preserves that row order.  FC2 uses the same
+    This adapter deliberately preserves that row order. FC2 uses the same
     K-major physical contract without the gate/up row transform.
     """
 
@@ -145,7 +138,7 @@ class PackedWeightViews:
             raise ValueError(f"{label} must contain at least one expert")
 
         # This is the exact transpose view returned by preprocess_mega_weights:
-        # contiguous (E,M,K/2) storage viewed as (E,K/2,M).  Requiring all
+        # contiguous (E,M,K/2) storage viewed as (E,K/2,M). Requiring all
         # three strides prevents silently accepting expert padding or a copied
         # row-major tensor under the same public shape.
         expected_stride = (rows * (k_elements // 2), 1, k_elements // 2)

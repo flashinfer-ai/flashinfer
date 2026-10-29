@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -270,14 +271,11 @@ def test_capture_stream_rebind_requires_adapter_opt_in(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_prequantized_staging_is_bit_exact_and_masks_tail(monkeypatch):
-    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4 import staging
-
-    monkeypatch.setattr(
-        staging,
-        "_shim_helpers",
-        lambda: (None, None, None, lambda output, count: None),
+def test_prequantized_staging_is_bit_exact_and_masks_tail():
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp4_bf16_cutedsl.backend import (
+        Mxfp8Mxfp4CutedslMegaKernelBackend,
     )
+
     data = (
         torch.arange(256, device="cuda", dtype=torch.int32)
         .to(torch.uint8)
@@ -296,19 +294,21 @@ def test_prequantized_staging_is_bit_exact_and_masks_tail(monkeypatch):
     ids_out = torch.zeros((4, 2), device="cuda", dtype=torch.int64)
     scores_out = torch.empty((4, 2), device="cuda", dtype=torch.float32)
 
-    staged = staging.stage_inputs(
-        data,
-        scales,
-        ids,
-        scores,
-        data_out,
-        scales_out,
-        ids_out,
-        scores_out,
+    backend = object.__new__(Mxfp8Mxfp4CutedslMegaKernelBackend)
+    backend.stage_inputs(
+        SimpleNamespace(
+            hidden_states=data, scales=scales, topk_ids=ids, topk_weights=scores
+        ),
+        SimpleNamespace(
+            hidden=128,
+            x=data_out,
+            x_sf=scales_out,
+            topk_idx=ids_out,
+            topk_weights=scores_out,
+        ),
         quantize_input=False,
     )
 
-    assert staged.num_tokens == 2
     assert torch.equal(data_out[:2].view(torch.uint8), data.view(torch.uint8))
     assert torch.equal(scales_out[:2].view(torch.uint8), scales.view(torch.uint8))
     assert torch.equal(ids_out[:2], ids.to(torch.int64))
@@ -337,3 +337,20 @@ def test_output_shape_validation():
             config,
             replace(spec, output=_FakeTensor(2000, (16, 2, 128), torch.bfloat16)),
         )
+
+
+@pytest.mark.parametrize("rows", [0, 6, 17, 32])
+def test_output_rows_must_fit_live_tokens_and_workspace(rows):
+    config, spec = _config(), _spec()
+    with pytest.raises(ValueError, match="num_tokens <= rows <= max_tokens"):
+        frontend.validate_launch_spec(
+            config, replace(spec, output=_FakeTensor(2000, (rows, 128), torch.bfloat16))
+        )
+
+
+@pytest.mark.parametrize("rows", [7, 8, 16])
+def test_output_rows_within_workspace_are_accepted(rows):
+    config, spec = _config(), _spec()
+    frontend.validate_launch_spec(
+        config, replace(spec, output=_FakeTensor(2000, (rows, 128), torch.bfloat16))
+    )

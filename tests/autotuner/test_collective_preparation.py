@@ -46,7 +46,7 @@ def test_collective_config_survives_context_overrides(monkeypatch):
         rank_reduction="max",
     )
     with autotune(cuda_graph_profile_replays=5):
-        overridden = tuner._apply_tuning_overrides(config)
+        overridden = tuner.effective_config(config)
     assert overridden.preserve_input_storage
     assert overridden.profiling_warmup == 0
     assert overridden.profiling_repeat == 2
@@ -86,13 +86,13 @@ def _preparation_rank(rank, path):
         tuner = AutoTuner()
         runner = PreparedRunner(fail=rank == 1)
         try:
-            tuner._prepare_tactic(runner, [torch.zeros(1)], 0)
+            tuner.prepare_selected_tactic(runner, [torch.zeros(1)], 0)
         except (ValueError, RuntimeError):
             pass
         else:
             raise AssertionError("both ranks must reject before forward")
         runner.fail = False
-        tuner._prepare_tactic(runner, [torch.zeros(1)], 1)
+        tuner.prepare_selected_tactic(runner, [torch.zeros(1)], 1)
         assert runner.prepared[-1] == 1
     finally:
         set_autotune_process_group(None)
@@ -166,3 +166,50 @@ def test_profile_uses_requested_rank_reduction(monkeypatch, reduction, expected)
         assert ops == [dist.ReduceOp.MAX if reduction == "max" else dist.ReduceOp.SUM]
     finally:
         set_autotune_process_group(None)
+
+
+@pytest.mark.parametrize(
+    "indices",
+    [
+        {"profile_arena_input_indices": (0,)},
+        {"value_aware_input_indices": (0,)},
+        {"profile_arena_input_indices": (0,), "value_aware_input_indices": (0,)},
+    ],
+)
+def test_preserve_storage_rejects_rotating_inputs(indices):
+    with pytest.raises(ValueError, match="cannot be combined"):
+        TuningConfig(preserve_input_storage=True, **indices)
+
+
+def test_public_preflight_tracks_context_and_named_cache_state(monkeypatch):
+    from dataclasses import replace
+    from flashinfer.autotuner import get_autotune_process_group
+
+    tuner = AutoTuner()
+    monkeypatch.setattr(AutoTuner, "_instance", tuner)
+    runner = PreparedRunner()
+    inputs = [torch.zeros(3, 4)]
+    config = TuningConfig(preserve_input_storage=True, profiling_warmup=0)
+    with tuner.collective_session(None):
+        initial = tuner.selection_preflight(
+            "prepared", runner, config, inputs, tactics=(0, 1)
+        )
+        assert not initial.cache_hit and not initial.is_tuning and not initial.skipped
+        assert initial.allowed_tactics == (0, 1)
+        assert initial.config == config
+        with autotune(skip_ops={"prepared"}, cuda_graph_profile_replays=3):
+            active = tuner.selection_preflight(
+                "prepared", runner, config, inputs, tactics=(0, 1)
+            )
+            assert active == replace(
+                initial,
+                is_tuning=True,
+                skipped=True,
+                config=replace(config, cuda_graph_profile_replays=3),
+            )
+    original = get_autotune_process_group()
+    group = object()
+    with pytest.raises(ValueError, match="unwind"), tuner.collective_session(group):
+        assert get_autotune_process_group() is group
+        raise ValueError("unwind")
+    assert get_autotune_process_group() is original

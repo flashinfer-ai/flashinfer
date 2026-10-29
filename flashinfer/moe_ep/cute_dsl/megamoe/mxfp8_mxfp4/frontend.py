@@ -3,10 +3,9 @@
 
 """Graph-safe lazy frontend boundary for MXFP8 x MXFP4 MegaMoE.
 
-The persistent kernel is assembled separately.  Integration supplies a small
-adapter that compiles a :class:`KernelLaunchSpec` and binds it to a zero-arg
-launcher.  Keeping that adapter injectable freezes the host contract without
-guessing the unfinished kernel's Python constructor or ``__call__`` signature.
+Integration compiles a :class:`KernelLaunchSpec` and binds a zero-argument
+launcher. Compilation and binding caches preserve workspace ownership and
+allow stream rebinding without rebuilding tensor adapters during capture.
 """
 
 from __future__ import annotations
@@ -16,7 +15,7 @@ from typing import Any, Callable, Hashable, Mapping, Protocol
 
 import torch
 
-from .staging import MXFP8_DATA_DTYPE, MXFP8_SCALE_DTYPE
+from .workspace import MXFP8_SF_VEC_SIZE
 
 
 @dataclass(frozen=True)
@@ -31,7 +30,7 @@ class FrontendConfig:
     def __post_init__(self) -> None:
         for name in ("hidden", "intermediate"):
             value = getattr(self, name)
-            if value <= 0 or value % 32:
+            if value <= 0 or value % MXFP8_SF_VEC_SIZE:
                 raise ValueError(f"{name} must be a positive multiple of 32")
         for name in ("topk", "num_experts", "max_tokens"):
             if getattr(self, name) <= 0:
@@ -58,7 +57,7 @@ class KernelLaunchSpec:
 
 
 class KernelAdapter(Protocol):
-    """Bridge implemented when the assembled megakernel becomes available."""
+    """Compile and bind the persistent kernel for a launch specification."""
 
     def compile(self, config: FrontendConfig, spec: KernelLaunchSpec) -> Any: ...
 
@@ -195,7 +194,7 @@ def validate_launch_spec(config: FrontendConfig, spec: KernelLaunchSpec) -> None
         ("fc1_weight_scales", spec.fc1_weight_scales),
         ("fc2_weight_scales", spec.fc2_weight_scales),
     ):
-        if tensor.dtype not in (MXFP8_SCALE_DTYPE, torch.uint8):
+        if tensor.dtype not in (torch.float8_e8m0fnu, torch.uint8):
             raise ValueError(f"{name} must contain raw E8M0 values")
     for name, tensor in (
         ("activation", spec.activation),
@@ -209,15 +208,15 @@ def validate_launch_spec(config: FrontendConfig, spec: KernelLaunchSpec) -> None
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
 
-    sf_cols = config.hidden // 32
-    if spec.activation.dtype != MXFP8_DATA_DTYPE or spec.activation.shape != (
+    sf_cols = config.hidden // MXFP8_SF_VEC_SIZE
+    if spec.activation.dtype != torch.float8_e4m3fn or spec.activation.shape != (
         config.max_tokens,
         config.hidden,
     ):
         raise ValueError("activation must be E4M3 [max_tokens, hidden]")
     if spec.activation_scales.ndim != 2:
         raise ValueError("activation_scales must be 2D")
-    if spec.activation_scales.dtype != MXFP8_SCALE_DTYPE:
+    if spec.activation_scales.dtype != torch.float8_e8m0fnu:
         raise ValueError("activation_scales must contain raw E8M0 values")
     if (
         spec.activation_scales.shape[0] != config.max_tokens
@@ -237,10 +236,12 @@ def validate_launch_spec(config: FrontendConfig, spec: KernelLaunchSpec) -> None
     if (
         spec.output.ndim != 2
         or spec.output.dtype != torch.bfloat16
-        or spec.output.shape[0] < spec.num_tokens
+        or not spec.num_tokens <= spec.output.shape[0] <= config.max_tokens
         or spec.output.shape[1] != config.hidden
     ):
-        raise ValueError("output must be BF16 [>= num_tokens, hidden]")
+        raise ValueError(
+            "output must be BF16 [rows, hidden] with num_tokens <= rows <= max_tokens"
+        )
 
 
 def _ensure_not_capturing(what: str) -> None:
@@ -263,7 +264,7 @@ class Mxfp8Mxfp4Frontend:
     _launch: Callable[[], None] | None = field(default=None, init=False, repr=False)
 
     def warmup(self, spec: KernelLaunchSpec) -> None:
-        """Compile and bind eagerly; required before CUDA graph capture."""
+        """Compile and bind eagerly. Required before CUDA graph capture."""
 
         self._prepare(spec)
 
@@ -276,7 +277,7 @@ class Mxfp8Mxfp4Frontend:
         return spec.output[: spec.num_tokens]
 
     def invalidate(self) -> None:
-        """Drop host cache entries; does not free adapter-owned resources."""
+        """Drop host cache entries. Does not free adapter-owned resources."""
 
         _ensure_not_capturing("frontend cache invalidation")
         self._compiled = None
@@ -295,7 +296,7 @@ class Mxfp8Mxfp4Frontend:
             return
         # Benchmark helpers may warm up on one side stream and capture on
         # another. Only an explicitly capture-safe adapter may reuse that
-        # binding; ordinary bind() can construct DLPack views or allocate.
+        # binding. Ordinary bind() can construct DLPack views or allocate.
         rebind_stream = getattr(self.adapter, "rebind_stream", None)
         if (
             self._compiled is not None

@@ -1,16 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Host integration boundary for the MXFP8 x MXFP4 persistent MegaMoE.
+"""Workspace lifetime and host launch bindings for native MXFP8 x MXFP4 MegaMoE.
 
-This module deliberately lives outside ``kernel_src/cutedsl_megamoe``: the
-mixed-format kernel is FlashInfer-owned and must not become part of the
-vendored source drop.  It owns workspace lifetime and translates the backend
-ABI into the component frontend's stable launch specification.
-
-The actual device assembler is imported lazily from ``persistent_kernel`` so
-that config discovery and CPU-only tests do not import CuTe DSL or initialize
-CUDA.  Compilation and launch binding remain owned by that adapter.
+Translate the backend ABI into frontend launch specifications. The lazily
+imported :mod:`persistent_kernel` adapter owns compilation and binding,
+keeping config discovery and CPU tests free of CuTe imports and CUDA init.
 """
 
 from __future__ import annotations
@@ -24,7 +19,15 @@ from typing import Any, Mapping, Sequence, cast
 import torch
 
 from .frontend import FrontendConfig, KernelLaunchSpec, Mxfp8Mxfp4Frontend
-from .workspace import WorkspaceConfig, WorkspacePlan, make_workspace_plan, round_up
+from .workspace import (
+    MXFP8_SF_VEC_SIZE,
+    SF_ATOM_TOKEN_ROWS,
+    SF_BYTES_PER_UINT32,
+    WorkspaceConfig,
+    WorkspacePlan,
+    make_workspace_plan,
+    round_up,
+)
 
 
 # Knob-cache dtype key for this kernel (``flashinfer.moe_ep.tune --dtype``).
@@ -59,7 +62,7 @@ def _workspace_plan(
             hidden=hidden,
             intermediate=intermediate,
             token_padding_block=64,
-            sf_padding_block=128,
+            sf_padding_block=SF_ATOM_TOKEN_ROWS,
             cluster_tile_tokens=cluster_tokens,
             load_balance_mode=tactic["load_balance_mode"],
         )
@@ -70,7 +73,7 @@ def _workspace_plan(
 class Mxfp8Mxfp4MegaMoeWorkspace:
     """NVLink workspace and lazy-compile state.
 
-    ``num_experts`` is global; weights and compute use ``num_local_experts``.
+    ``num_experts`` is global. Weights and compute use ``num_local_experts``.
     Distributed allocation and destruction are collective on the EP world.
     One symmetric root contains every remotely accessed tensor, so a single
     peer offset table maps inputs, control words, and output route slots.
@@ -93,6 +96,7 @@ class Mxfp8Mxfp4MegaMoeWorkspace:
     y: torch.Tensor
     workspace_bytes: torch.Tensor
     shared_workspace_bytes: torch.Tensor
+    process_group: Any = field(default=None, repr=False)
     symmetric_base: int = 0
     peer_offsets_list: tuple[int, ...] = (0,)
     _symmetric_root: torch.Tensor | None = field(default=None, repr=False)
@@ -103,13 +107,28 @@ class Mxfp8Mxfp4MegaMoeWorkspace:
     _autotune_selected: bool = field(default=False, init=False, repr=False)
 
     @property
+    def is_autotuned(self) -> bool:
+        return self._autotune_selected
+
+    def mark_autotuned(self) -> None:
+        self._autotune_selected = True
+
+    def clear_autotune_selection(self) -> None:
+        self._autotune_selected = False
+
+    def restore_tactic(self, tactic: Mapping[str, Any], *, autotuned: bool) -> None:
+        """Collectively restore after failure, even if peers stopped on different layouts."""
+        self.apply_knobs(tactic, force_reset=True)
+        self._autotune_selected = autotuned
+
+    @property
     def num_local_experts(self) -> int:
         return self.num_experts // self.world_size
 
     @property
     def workspace_regions(self) -> dict[str, torch.Tensor]:
-        # The buffers may be sized for several tactics (``capacity_tactics``);
-        # launches see exactly the current plan's prefix.
+        # The buffers may be sized for several tactics (``capacity_tactics``).
+        # Launches see exactly the current plan's prefix.
         return {
             "local": self.workspace_bytes[: self.plan.local.total_bytes],
             "shared": self.shared_workspace_bytes[: self.plan.shared.total_bytes],
@@ -152,22 +171,22 @@ class Mxfp8Mxfp4MegaMoeWorkspace:
             and plan.shared.total_bytes <= self.shared_workspace_bytes.numel()
         )
 
-    def apply_knobs(self, knobs: Mapping[str, Any] | None) -> None:
-        """Switch the workspace to another tactic (collective on the EP world).
+    def apply_knobs(
+        self, knobs: Mapping[str, Any] | None, *, force_reset: bool = False
+    ) -> None:
+        """Collectively switch tactics on the EP process group.
 
-        The workspace layout depends on the tactic (counter regions move), so
-        the buffers are re-planned in place and cleared to their creation
-        state. Every rank must call this in the same order with the same
-        knobs, outside graph capture and with no launch in flight; graphs
-        captured before a switch must not be replayed after it. Frontends of
-        earlier tactics stay cached and remain valid when that tactic is
-        applied again (its plan is deterministic).
+        Layout changes reset buffers. Unchanged layouts preserve counters and
+        phases unless ``force_reset`` requests rollback. All ranks must use the
+        same knobs and call order, outside capture with no launch in flight.
+        Do not replay graphs captured before a switch. Cached frontends remain
+        reusable when their tactic's deterministic layout is restored.
         """
 
         if self._destroyed:
             raise RuntimeError("MXFP8 x MXFP4 MegaMoE workspace is destroyed")
         tactic = self.resolve(knobs)
-        if _tactic_key(tactic) == _tactic_key(self.tactic):
+        if not force_reset and _tactic_key(tactic) == _tactic_key(self.tactic):
             return
         plan = self._plan_for(tactic)
         if (
@@ -186,6 +205,18 @@ class Mxfp8Mxfp4MegaMoeWorkspace:
         )
 
         ensure_not_capturing("MXFP8 x MXFP4 tactic switch")
+        same_layout = (
+            plan.local.regions == self.plan.local.regions
+            and plan.shared.regions == self.plan.shared.regions
+        )
+        if same_layout and not force_reset:
+            # Scheduling/epilogue-only changes reuse exactly the same counters.
+            # Their phases persist. Each launch resets its declared prefixes.
+            self.tactic, self.plan = tactic, plan
+            # Deliberately invalidate selection even when storage is unchanged:
+            # the new scheduling tactic has not been selected by the tuner.
+            self.clear_autotune_selection()
+            return
         # No rank may still run on the old layout while a peer clears the
         # shared words, and none may launch on the new one before all have.
         distributed = self._symmetric_root is not None
@@ -193,14 +224,15 @@ class Mxfp8Mxfp4MegaMoeWorkspace:
         if distributed:
             import torch.distributed as dist
 
-            dist.barrier()
+            dist.barrier(group=self.process_group)
         self.workspace_bytes.zero_()
         self.shared_workspace_bytes.zero_()
         torch.cuda.synchronize(self.x.device)
         if distributed:
-            dist.barrier()
+            dist.barrier(group=self.process_group)
         self.tactic = tactic
         self.plan = plan
+        self.clear_autotune_selection()
 
     def frontend(
         self, *, gate_up_clamp: float | None, fast_math: bool
@@ -259,7 +291,7 @@ class Mxfp8Mxfp4MegaMoeWorkspace:
             import torch.distributed as dist
 
             torch.cuda.synchronize(self.x.device)
-            dist.barrier()
+            dist.barrier(group=self.process_group)
         for frontend in self._frontends.values():
             frontend.invalidate()
         self._frontends.clear()
@@ -286,7 +318,12 @@ def _symmetric_regions(
     """Byte offsets for the one-allocation peer mapping ABI (128B aligned)."""
     specs = (
         ("x", (max_tokens, hidden), torch.float8_e4m3fn, 1),
-        ("x_sf", (max_tokens, round_up(hidden // 32, 4)), torch.float8_e8m0fnu, 1),
+        (
+            "x_sf",
+            (max_tokens, round_up(hidden // MXFP8_SF_VEC_SIZE, SF_BYTES_PER_UINT32)),
+            torch.float8_e8m0fnu,
+            1,
+        ),
         ("topk_idx", (max_tokens, topk), torch.int64, 8),
         ("topk_weights", (max_tokens, topk), torch.float32, 4),
         ("route_terms", (max_tokens, topk, hidden), torch.bfloat16, 2),
@@ -308,8 +345,9 @@ def _allocate_peer_regions(
     geometry: tuple[Any, ...],
     regions: dict[str, tuple[int, tuple[int, ...], torch.dtype]],
     total_bytes: int,
+    process_group: Any,
 ) -> tuple[dict[str, torch.Tensor], torch.Tensor, int, tuple[int, ...]]:
-    """Collective allocation; reject missing direct peer mappings before JIT."""
+    """Collective allocation. Reject missing direct peer mappings before JIT."""
     import torch.distributed as dist
     import nvshmem.core
 
@@ -325,12 +363,15 @@ def _allocate_peer_regions(
         raise RuntimeError(
             "initialize the EP distributed/NVSHMEM runtime before allocation"
         )
-    if dist.get_rank() != rank or dist.get_world_size() != world_size:
+    if (
+        dist.get_rank(process_group) != rank
+        or dist.get_world_size(process_group) != world_size
+    ):
         raise ValueError("workspace rank/world must match the bootstrapped EP world")
     if int(nvshmem.core.my_pe()) != rank or int(nvshmem.core.n_pes()) != world_size:
         raise ValueError("NVSHMEM rank/world must match the EP world")
     configs: list[Any] = [None] * world_size
-    dist.all_gather_object(configs, geometry)
+    dist.all_gather_object(configs, geometry, group=process_group)
     if any(config != geometry for config in configs):
         raise ValueError(
             "all EP ranks must allocate the same workspace geometry/tactic"
@@ -346,7 +387,7 @@ def _allocate_peer_regions(
     except (RuntimeError, ValueError, TypeError) as exc:
         error = str(exc)
     errors: list[Any] = [None] * world_size
-    dist.all_gather_object(errors, error)
+    dist.all_gather_object(errors, error, group=process_group)
     if any(item is not None for item in errors):
         free_sym_tensor(root)
         raise RuntimeError(
@@ -357,10 +398,11 @@ def _allocate_peer_regions(
     for name, (offset, shape, dtype) in regions.items():
         size = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
         views[name] = root.narrow(0, offset, size).view(dtype).reshape(shape)
+    views["topk_idx"].fill_(-1)
     # No rank may start publishing dispatch counters until every peer's initial
     # zero-fill has completed. This is allocation-time only, never graph capture.
     torch.cuda.synchronize(root.device)
-    dist.barrier()
+    dist.barrier(group=process_group)
     return views, root, base, offsets
 
 
@@ -376,18 +418,29 @@ def get_symm_buffer_for_mxfp8_mxfp4_mega_moe(
     gate_up_clamp: float | None = None,
     knobs: Mapping[str, Any] | None = None,
     capacity_tactics: Sequence[Mapping[str, Any]] | None = None,
+    process_group: Any = None,
 ) -> Mxfp8Mxfp4MegaMoeWorkspace:
-    """Allocate the mixed-format workspace without importing the device kernel.
+    """Allocate workspace without importing the device kernel.
 
-    ``knobs=None`` resolves through the knob cache (``FLASHINFER_MOE_EP_KNOB_CACHE``,
-    dtype ``mxfp8_mxfp4``, written by ``python -m flashinfer.moe_ep.tune`` or a
-    ``knobs="auto"`` run) and falls back to the default tactic; pass a dict
-    (``{}`` for the default) to bypass the cache. ``capacity_tactics`` sizes
-    the buffers for every listed tactic as well, so
-    :meth:`Mxfp8Mxfp4MegaMoeWorkspace.apply_knobs` can switch among them.
+    ``knobs=None`` uses the ``FLASHINFER_MOE_EP_KNOB_CACHE`` winner for dtype
+    ``mxfp8_mxfp4``, then defaults. A dictionary bypasses the cache (``{}``
+    selects defaults). ``capacity_tactics`` reserves room for every listed
+    tactic so :meth:`Mxfp8Mxfp4MegaMoeWorkspace.apply_knobs` can switch among them.
     """
 
     del gate_up_clamp
+    if world_size > 1:
+        import torch.distributed as dist
+
+        if not dist.is_initialized():
+            raise RuntimeError("initialize the EP process group before allocation")
+        if process_group is None:
+            process_group = dist.group.WORLD
+        if (
+            dist.get_rank(process_group) != rank
+            or dist.get_world_size(process_group) != world_size
+        ):
+            raise ValueError("workspace rank/world must match its EP process group")
     _validate_ep_geometry(num_experts, rank, world_size)
     from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.comm import (
         ensure_not_capturing,
@@ -447,7 +500,7 @@ def get_symm_buffer_for_mxfp8_mxfp4_mega_moe(
         local_bytes = max(local_bytes, candidate_plan.local.total_bytes)
         shared_bytes = max(shared_bytes, candidate_plan.shared.total_bytes)
     device = torch.device("cuda", torch.cuda.current_device())
-    sf_cols = round_up(hidden // 32, 4)
+    sf_cols = round_up(hidden // MXFP8_SF_VEC_SIZE, SF_BYTES_PER_UINT32)
     peer_views: dict[str, torch.Tensor] = {}
     symmetric_root = None
     symmetric_base = 0
@@ -472,9 +525,9 @@ def get_symm_buffer_for_mxfp8_mxfp4_mega_moe(
                 ),
                 regions=regions,
                 total_bytes=total_bytes,
+                process_group=process_group,
             )
         )
-        peer_views["topk_idx"].fill_(-1)
 
     def allocate(name, shape, dtype, *, fill=None):
         if name in peer_views:
@@ -512,13 +565,14 @@ def get_symm_buffer_for_mxfp8_mxfp4_mega_moe(
             (max_tokens_per_rank, hidden), dtype=torch.bfloat16, device=device
         ),
         # Token communication has persistent phase/signal words outside the
-        # per-launch zero prefixes.  They must start from zero once when the
-        # workspace is created; subsequent graph-safe launches reset only the
+        # per-launch zero prefixes. They must start from zero once when the
+        # workspace is created. Subsequent graph-safe launches reset only the
         # declared prefixes in the adapter.
         workspace_bytes=torch.zeros(local_bytes, dtype=torch.uint8, device=device),
         shared_workspace_bytes=allocate(
             "shared_workspace_bytes", (shared_bytes,), torch.uint8, fill=0
         ),
+        process_group=process_group,
         symmetric_base=symmetric_base,
         peer_offsets_list=peer_offsets,
         _symmetric_root=symmetric_root,
@@ -589,15 +643,13 @@ def autotune_mxfp8_mxfp4_mega_moe(
     warmup_iters: int = 3,
     timed_iters: int = 10,
 ) -> dict[str, Any]:
-    """Time candidate tactics on the staged inputs and apply the winner.
+    """Collectively time tactics on staged inputs and apply the winner.
 
-    COLLECTIVE on the EP world: every rank calls this with the same candidates.
-    FlashInfer's general autotuner measures GPU time and minimizes the maximum
-    rank latency. Candidates the
-    workspace cannot hold are dropped with a warning (allocate it with
-    ``capacity_tactics``). Rank 0 records the winner in the knob cache under
-    dtype ``mxfp8_mxfp4``, where ``knobs=None`` allocations find it.
-    ``output`` is unused: timing binds the workspace's stable output view.
+    The general autotuner scores each tactic by its slowest GPU rank.
+    Every EP rank must pass the same candidates. Warn and skip tactics that
+    exceed workspace capacity. Rank 0 caches the winner under ``mxfp8_mxfp4``
+    for ``knobs=None`` allocations. Allocate with ``capacity_tactics`` to fit
+    all candidates. ``output`` is unused because timing binds workspace output.
     """
 
     del output
@@ -662,7 +714,11 @@ def create_dummy_mxfp8_mxfp4_inputs(
     if not 0 < live_tokens <= max_tokens:
         raise ValueError("live_tokens must be in (0, max_tokens]")
     if capacity_tactics is None:
-        capacity_tactics = candidate_tactics(hidden=hidden, intermediate=intermediate)
+        capacity_tactics = candidate_tactics(
+            hidden=hidden,
+            intermediate=intermediate,
+            max_tokens_per_rank=max_tokens,
+        )
     device = torch.device("cuda", torch.cuda.current_device())
     generator = torch.Generator(device=device).manual_seed(seed + rank)
     local_experts = num_experts // world_size

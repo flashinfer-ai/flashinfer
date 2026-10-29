@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from dataclasses import replace
 
 from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.device_workspace import (
     DeviceWorkspacePartition,
@@ -39,6 +40,69 @@ def _metadata(token: int, topk: int) -> int:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_dispatch_source_offset_beyond_int32() -> None:
+    pytest.importorskip("cutlass")
+    from flashinfer.utils import is_sm100a_supported
+
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("requires SM100/SM103 and CUDA 12.8+")
+
+    hidden = 4096
+    # Only the final row is routed. Its byte offset crosses the signed-int32 limit.
+    source_token = (1 << 31) // hidden
+    config = replace(
+        _config(hidden),
+        max_tokens_per_rank=source_token + 1,
+        num_topk=1,
+        num_experts_per_rank=1,
+    )
+    plan = make_workspace_plan(config)
+    local = torch.empty(plan.local.total_bytes, dtype=torch.uint8, device="cuda")
+    shared = torch.empty(plan.shared.total_bytes, dtype=torch.uint8, device="cuda")
+    route_terms = torch.empty(
+        (config.max_tokens_per_rank, 1, hidden), dtype=torch.bfloat16, device="cuda"
+    )
+    partition = DeviceWorkspacePartition(
+        plan, local, route_terms, shared_workspace=shared
+    )
+    data = torch.empty(
+        (config.max_tokens_per_rank, hidden), dtype=torch.float8_e4m3fn, device="cuda"
+    )
+    data[source_token].view(torch.uint8).fill_(37)
+    scales = torch.empty(
+        (config.max_tokens_per_rank, hidden // 32),
+        dtype=torch.float8_e8m0fnu,
+        device="cuda",
+    )
+    scales[source_token].view(torch.uint8).fill_(127)
+    ids = torch.full(
+        (config.max_tokens_per_rank, 1), -1, dtype=torch.int64, device="cuda"
+    )
+    ids[source_token, 0] = 0
+    scores = torch.ones(
+        (config.max_tokens_per_rank, 1), dtype=torch.float32, device="cuda"
+    )
+    products = SingleRankMxfp8Dispatch(config, num_sms=4).compile(
+        partition,
+        data,
+        scales,
+        ids,
+        scores,
+        stream=torch.cuda.current_stream().cuda_stream,
+    )
+    products()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        products.token_pool[0], data[source_token].view(torch.uint8)
+    )
+    assert (
+        products.token_src_metadata.view(torch.int64).reshape(-1)[0].item()
+        == source_token
+    )
+    assert products.expert_pool_offsets.expert_counts[0].item() == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("num_sms", [1, 4])
 @pytest.mark.parametrize(
     "local_counts,hidden,scale_offset",
@@ -56,7 +120,6 @@ def test_single_rank_dispatch_compacts_mxfp8_routes_on_device(
     local_counts,
     hidden,
     scale_offset,
-    monkeypatch,
 ) -> None:
     pytest.importorskip("cutlass")
     from flashinfer.utils import is_sm100a_supported
@@ -64,7 +127,6 @@ def test_single_rank_dispatch_compacts_mxfp8_routes_on_device(
     if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("requires SM100/SM103 and CUDA 12.8+")
 
-    monkeypatch.setenv("FLASHINFER_MXFP8_MXFP4_WAIT_STATS", "1")
     config = _config(hidden)
     plan = make_workspace_plan(config)
     device = torch.device("cuda")
@@ -146,8 +208,8 @@ def test_single_rank_dispatch_compacts_mxfp8_routes_on_device(
     products()
     torch.cuda.synchronize()
 
-    # Pool rows are expert-major; within an expert the stable order is the
-    # original (token, top-k slot) scan order.  Expert 3 is empty.
+    # Pool rows are expert-major. Within an expert the stable order is the
+    # original (token, top-k slot) scan order. Expert 3 is empty.
     expected_routes = (((0, 1), (2, 1)), ((2, 0), (3, 1)), ((0, 0), (1, 1), (3, 0)))
     starts = (0, 64, 128)
     counts = products.expert_pool_offsets.expert_counts.cpu()
@@ -164,7 +226,7 @@ def test_single_rank_dispatch_compacts_mxfp8_routes_on_device(
             assert int(metadata[pool_row].item()) == _metadata(token, topk)
             actual_score = products.compatibility_route_scores[pool_row].item()
             assert actual_score == pytest.approx(route_scores[token, topk].item())
-            # Each K atom occupies 128 words; this token's scale words are
+            # Each K atom occupies 128 words. This token's scale words are
             # 512 bytes apart in the swizzled pool, including H=6400 tails.
             sf_row = (start // 64) * 128
             for k_atom in range(config.sf_uint32_per_token):
@@ -215,29 +277,6 @@ def test_single_rank_dispatch_compacts_mxfp8_routes_on_device(
             products.expert_pool_offsets.expert_counts.cpu(),
             torch.tensor([2, 2, 3, 0], dtype=torch.int32),
         )
-
-
-def test_startup_ring_layout_and_decode() -> None:
-    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.wait_stats_config import (
-        MEGA_STATS_WORDS,
-        STARTUP_RING_ENTRIES,
-        STARTUP_RING_WORDS,
-        STATS_WORDS,
-        decode_startup_ring,
-    )
-
-    assert MEGA_STATS_WORDS == STATS_WORDS + 1 + 3 * STARTUP_RING_ENTRIES
-    ring = torch.zeros(STARTUP_RING_WORDS, dtype=torch.int32)
-    # Device layout: word 0 counts launches; entry i holds (launch + 1,
-    # arrival ns, wait ns) of launch i modulo the ring size.
-    ring[0] = 3
-    for launch, arrival, wait in ((2, 9000, 1500), (0, 7000, 2500), (1, 8000, 500)):
-        ring[1 + 3 * launch : 4 + 3 * launch] = torch.tensor(
-            [launch + 1, arrival, wait]
-        )
-    rows = decode_startup_ring(ring)
-    assert [row["launch"] for row in rows] == [0, 1, 2]
-    assert rows[0] == {"launch": 0, "local_arrival_us": 7.0, "signal_wait_us": 2.5}
 
 
 def test_dispatch_rejects_distributed_configuration() -> None:

@@ -1,11 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Host-side shared-memory stage fitting for MXFP8 x MXFP4 MegaMoE.
+"""Host-only shared-memory stage fitting for MXFP8 x MXFP4 MegaMoE.
 
-The CuTe layouts are the authority for the byte counts.  This module only
-performs the integer budget calculation, which keeps it importable on hosts
-without a CuTe DSL installation and makes the policy straightforward to test.
+CuTe layouts supply authoritative byte counts. This module performs only
+integer budgeting, so policy tests require no CuTe installation.
 """
 
 from dataclasses import dataclass
@@ -65,7 +64,7 @@ def compute_stage_fit(
 
     ``fixed_bytes_per_cta`` includes barriers, scheduler state, epilogue
     buffers, and any other shared allocation not multiplied by the mainloop
-    stage count.  No alignment estimate is made here: callers must use
+    stage count. No alignment estimate is made here: callers must use
     ``cute.size_in_bytes`` on the actual one-stage layouts.
     """
 

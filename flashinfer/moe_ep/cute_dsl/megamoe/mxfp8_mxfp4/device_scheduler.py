@@ -1,17 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Device-resident persistent FC1/FC2 scheduler for MXFP8 x MXFP4 MegaMoE.
+"""Device implementation of the FC1/FC2 contract in :mod:`scheduler`.
 
-This is the CuTe-DSL implementation of the host contract in :mod:`scheduler`.
-It intentionally has no dependency on the vendored MegaMoE source tree.  The
-scheduler warp owns the register-resident group/phase/expert state machine and
-publishes the stable eight-int32 ``WorkRecord`` through an async SMEM pipeline.
+The scheduler warp keeps group/phase/expert state in registers and publishes
+an eight-int32 ``WorkRecord`` through an async SMEM pipeline. It has no
+vendored MegaMoE dependency.
 
-The coordinate convention matches the mixed-format swap-AB mainloop:
-``tile_m_idx`` is a feature tile and ``tile_n_idx`` is a token tile.  Scheduler
-parameters, on the other hand, are named by their logical axes (tokens and
-features) so no implicit M/N swap occurs at this boundary.
+In swap-AB coordinates, ``tile_m_idx`` selects features and ``tile_n_idx``
+selects tokens. Scheduler parameters use logical token/feature axis names.
 """
 
 from enum import IntEnum
@@ -175,8 +172,8 @@ class DeviceSchedulerParams:
 
     ``expert_count`` must be compile-time when allocating scheduler storage.
     ``expert_token_sizes`` contains one int32 count per expert. Data rows and
-    scale rows deliberately have separate padding, while both operands retain
-    the MX block-32 invariant.
+    scale rows have separate padding. Both operands use one scale factor
+    per 32 values along K.
     """
 
     # load_balance_counter_ptr addresses one int32 for atomic_counter, or
@@ -199,8 +196,6 @@ class DeviceSchedulerParams:
         fc1_ready_counter_ptr,
         fc1_done_counter_ptr,
         fc2_ready_threshold: int | Int32,
-        expert_data_row_offsets: Optional[cute.Tensor] = None,
-        expert_scale_row_offsets: Optional[cute.Tensor] = None,
         load_balance_mode: Literal[
             "static", "atomic_counter", "alternating"
         ] = "static",
@@ -224,16 +219,12 @@ class DeviceSchedulerParams:
             raise ValueError("group and padding values must be positive")
         if num_stages <= 0:
             raise ValueError("num_stages must be positive")
-        if (expert_data_row_offsets is None) != (expert_scale_row_offsets is None):
-            raise ValueError("data and scale row offsets must be provided together")
         if isinstance(gate_up_size, int) and gate_up_size % SCALE_VECTOR_SIZE:
             raise ValueError("gate_up_size must preserve K32 scale grouping")
         if isinstance(hidden_size, int) and hidden_size % SCALE_VECTOR_SIZE:
             raise ValueError("hidden_size must preserve K32 scale grouping")
 
         self.expert_token_sizes = expert_token_sizes
-        self.expert_data_row_offsets = expert_data_row_offsets
-        self.expert_scale_row_offsets = expert_scale_row_offsets
         self.expert_count = expert_count
         self.gate_up_size = gate_up_size
         self.hidden_size = hidden_size
@@ -249,8 +240,6 @@ class DeviceSchedulerParams:
         self.claim_order = claim_order
         self.load_balance_mode = load_balance_mode
         self.load_balance_counter_ptr = load_balance_counter_ptr
-        # wait accounting (debug knob): mega stats word offset or None.
-        self.wait_stats_offset = None
         self.num_stages = num_stages
 
     @property
@@ -275,8 +264,6 @@ class DeviceSchedulerParams:
             self.fc1_ready_counter_ptr,
             self.fc1_done_counter_ptr,
             self.fc2_ready_threshold,
-            self.expert_data_row_offsets,
-            self.expert_scale_row_offsets,
         ):
             if value is not None:
                 values.extend(extract_mlir_values(value))
@@ -307,8 +294,6 @@ class DeviceSchedulerParams:
         result.fc1_ready_counter_ptr = take(self.fc1_ready_counter_ptr)
         result.fc1_done_counter_ptr = take(self.fc1_done_counter_ptr)
         result.fc2_ready_threshold = take(self.fc2_ready_threshold)
-        result.expert_data_row_offsets = take(self.expert_data_row_offsets)
-        result.expert_scale_row_offsets = take(self.expert_scale_row_offsets)
         result.load_balance_counter_ptr = (
             take(self.load_balance_counter_ptr)
             if self.load_balance_mode != "static"
@@ -324,7 +309,6 @@ class DeviceSchedulerParams:
             "load_balance_mode",
             "claim_order",
             "num_stages",
-            "wait_stats_offset",
         ):
             setattr(result, name, getattr(self, name))
         assert idx == len(values)
@@ -356,6 +340,18 @@ class _SchedulerState:
         assert len(values) == len(self._FIELDS)
         for name, value in zip(self._FIELDS, values, strict=True):
             setattr(self, name, value)
+
+    @classmethod
+    def initial(cls, *, static_tile_idx: Int32) -> "_SchedulerState":
+        defaults = dict(
+            phase=Int32(DevicePhase.FC1),
+            expert_idx=Int32(-1),
+            expert_pos=Int32(-1),
+            static_tile_idx=static_tile_idx,
+        )
+        return cls(
+            *(defaults[name] if name in defaults else Int32(0) for name in cls._FIELDS)
+        )
 
     def __extract_mlir_values__(self) -> List[ir.Value]:
         values: List[ir.Value] = []
@@ -539,7 +535,9 @@ class PersistentDeviceScheduler:
                 *(getattr(state, name) for name in state._FIELDS)
             )
             self._fc2_state.phase = Int32(DevicePhase.FC2)
-            self._alternating = _AlternatingState(*(Int32(0) for _ in range(5)))
+            self._alternating = _AlternatingState(
+                *(Int32(0) for _ in _AlternatingState._FIELDS)
+            )
         self._fc1_feature_blocks = fc1_feature_blocks
         self._fc2_feature_blocks = fc2_feature_blocks
         self._pipeline = sched_pipeline
@@ -590,9 +588,9 @@ class PersistentDeviceScheduler:
             cluster_mbar: cute.struct.MemRange[cutlass.Int64, 2]
             cluster_claim: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 1], 16]
 
-        if params.load_balance_mode != "static":
-            return AtomicSchedulerStorage
-        return StaticSchedulerStorage
+        if params.load_balance_mode == "static":
+            return StaticSchedulerStorage
+        return AtomicSchedulerStorage
 
     @staticmethod
     @dsl_user_op
@@ -620,15 +618,7 @@ class PersistentDeviceScheduler:
         cluster_size = token_ctas * feature_ctas
         num_clusters = cute.size(grid_dim, loc=loc, ip=ip) // cluster_size
 
-        state = _SchedulerState(
-            Int32(0),  # group_first_expert (position in order)
-            Int32(0),  # group_last_expert (exclusive position)
-            Int32(DevicePhase.FC1),
-            Int32(-1),  # expert_idx (pool index)
-            Int32(-1),  # expert_pos (walk position)
-            *(Int32(0) for _ in range(11)),
-            Int32(bidz),
-        )
+        state = _SchedulerState.initial(static_tile_idx=Int32(bidz))
         current_work = DeviceWorkRecord(
             Int32(DONE_EXPERT),
             Int32(0),
@@ -669,7 +659,7 @@ class PersistentDeviceScheduler:
                 num_stages=1,
                 producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
                 consumer_group=pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread, 32 * cluster_size
+                    pipeline.Agent.Thread, cute.arch.WARP_SIZE * cluster_size
                 ),
                 barrier_storage=storage.cluster_mbar.data_ptr(),
                 defer_sync=True,
@@ -729,19 +719,22 @@ class PersistentDeviceScheduler:
     @dsl_user_op
     @cute.jit
     def _init_expert_tables(self, *, loc=None, ip=None):
-        """Warp-owned permutation and index-order prefixes; no pool data moves.
+        """Warp-owned permutation and index-order prefixes. No pool data moves.
 
-        Scan each 32-expert chunk for physical offsets. Stable ranking uses
-        warp shuffles, including masked lanes in the final partial chunk, so
-        zero counts and E > 32 have the same deterministic tie break.
+        Each lane handles one expert, so a chunk contains WARP_SIZE experts.
+        Warp scans compute offsets, carrying totals into the next chunk.
+        Masked lanes contribute zero in the final partial chunk. Stable
+        ranking uses warp shuffles and breaks ties by expert index.
         """
         params = self.params
         lane = cute.arch.lane_idx()
         data_base = Int32(0)
         sf_base = Int32(0)
         block_base = Int32(0)
-        for base in cutlass.range_constexpr((params.expert_count + 31) // 32):
-            expert = Int32(base * 32) + lane
+        for base in cutlass.range_constexpr(
+            (params.expert_count + (cute.arch.WARP_SIZE - 1)) // cute.arch.WARP_SIZE
+        ):
+            expert = Int32(base * cute.arch.WARP_SIZE) + lane
             count = Int32(0)
             if expert < params.expert_count:
                 count = params.expert_token_sizes[expert]
@@ -755,7 +748,7 @@ class PersistentDeviceScheduler:
                 count + params.cluster_tile_tokens - 1
             ) // params.cluster_tile_tokens
             data_scan, sf_scan, block_scan = data, sf, blocks
-            for step in cutlass.range_constexpr(5):
+            for step in cutlass.range_constexpr(cute.arch.WARP_SIZE.bit_length() - 1):
                 delta = 1 << step
                 d = cute.arch.shuffle_sync_up(data_scan, offset=delta, mask_and_clamp=0)
                 f = cute.arch.shuffle_sync_up(sf_scan, offset=delta, mask_and_clamp=0)
@@ -770,19 +763,20 @@ class PersistentDeviceScheduler:
             if const_expr(params.claim_order == "longest_first"):
                 rank = Int32(0)
                 for other_base in cutlass.range_constexpr(
-                    (params.expert_count + 31) // 32
+                    (params.expert_count + (cute.arch.WARP_SIZE - 1))
+                    // cute.arch.WARP_SIZE
                 ):
-                    other_expert = Int32(other_base * 32) + lane
+                    other_expert = Int32(other_base * cute.arch.WARP_SIZE) + lane
                     other_count = Int32(0)
                     if other_expert < params.expert_count:
                         other_count = params.expert_token_sizes[other_expert]
-                    for source in cutlass.range(32, unroll=1):
-                        peer = Int32(other_base * 32) + source
+                    for source in cutlass.range(cute.arch.WARP_SIZE, unroll=1):
+                        peer = Int32(other_base * cute.arch.WARP_SIZE) + source
                         peer_count = cute.arch.shuffle_sync(
                             other_count,
                             offset=source,
                             mask=0xFFFFFFFF,
-                            mask_and_clamp=31,
+                            mask_and_clamp=cute.arch.WARP_SIZE - 1,
                         )
                         if peer < params.expert_count:
                             if peer_count > count or (
@@ -793,16 +787,23 @@ class PersistentDeviceScheduler:
                 self._order[rank] = expert
                 data_row = data_base + data_scan - data
                 sf_row = sf_base + sf_scan - sf
-                if const_expr(params.expert_data_row_offsets is not None):
-                    data_row = params.expert_data_row_offsets[expert]
-                    sf_row = params.expert_scale_row_offsets[expert]
                 self._pool_data_row[expert] = data_row
                 self._pool_sf_row[expert] = sf_row
                 self._pool_token_block_row[expert] = block_base + block_scan - blocks
-            data_base += cute.arch.shuffle_sync(data_scan, offset=31, mask_and_clamp=31)
-            sf_base += cute.arch.shuffle_sync(sf_scan, offset=31, mask_and_clamp=31)
+            data_base += cute.arch.shuffle_sync(
+                data_scan,
+                offset=cute.arch.WARP_SIZE - 1,
+                mask_and_clamp=cute.arch.WARP_SIZE - 1,
+            )
+            sf_base += cute.arch.shuffle_sync(
+                sf_scan,
+                offset=cute.arch.WARP_SIZE - 1,
+                mask_and_clamp=cute.arch.WARP_SIZE - 1,
+            )
             block_base += cute.arch.shuffle_sync(
-                block_scan, offset=31, mask_and_clamp=31
+                block_scan,
+                offset=cute.arch.WARP_SIZE - 1,
+                mask_and_clamp=cute.arch.WARP_SIZE - 1,
             )
         cute.arch.sync_warp()
 
@@ -811,25 +812,7 @@ class PersistentDeviceScheduler:
     def internal_init(self, warp_idx, sched_warp_id: int, *, loc=None, ip=None):
         """Prime the scheduler after dispatch has reset counters and counts."""
         if warp_idx == sched_warp_id:
-            if const_expr(self.params.wait_stats_offset is not None):
-                from .wait_stats import Slot, globaltimer_lo, stat_add
-                from .wait_stats_config import SLOTS
-
-                bx, by, bz = cute.arch.block_idx()
-                gx, gy, _ = cute.arch.grid_dim()
-                table_stats = (
-                    self.params.fc1_done_counter_ptr
-                    + Int32(self.params.wait_stats_offset)
-                    + (bx + by * gx + bz * gx * gy) * Int32(SLOTS)
-                )
-                table_start = globaltimer_lo()
             self._init_expert_tables()
-            if const_expr(self.params.wait_stats_offset is not None):
-                if cute.arch.lane_idx() == Int32(0):
-                    stat_add(
-                        table_stats + Int32(Slot.SCHED_INIT_DECODE_NS),
-                        globaltimer_lo() - table_start,
-                    )
             # Carry the helper's rebound count view across the warp branch.
             self.params = self.params
         else:
@@ -838,12 +821,17 @@ class PersistentDeviceScheduler:
             if warp_idx == sched_warp_id:
                 tidx, _, _ = cute.arch.thread_idx(loc=loc, ip=ip)
                 claimed = Int32(0)
-                if self._atomic_state.is_leader and tidx % 32 == Int32(0):
+                if self._atomic_state.is_leader and tidx % cute.arch.WARP_SIZE == Int32(
+                    0
+                ):
                     claimed = cute.arch.atomic_add(
                         self._atomic_state.counter_ptr, Int32(1), loc=loc, ip=ip
                     )
                 self._atomic_state.cached = cute.arch.shuffle_sync(
-                    claimed, offset=0, mask=0xFFFFFFFF, mask_and_clamp=31
+                    claimed,
+                    offset=0,
+                    mask=0xFFFFFFFF,
+                    mask_and_clamp=cute.arch.WARP_SIZE - 1,
                 )
                 self._atomic_state = self._atomic_state
             else:
@@ -877,44 +865,10 @@ class PersistentDeviceScheduler:
                 self._alternating = self._alternating
         elif const_expr(self.params.load_balance_mode == "static"):
             if warp_idx == sched_warp_id:
-                # wait accounting (debug knob, mega only): the params
-                # carry the stats region's word offset from fc1_done_counter.
-                stats_offset = getattr(self.params, "wait_stats_offset", None)
-                if const_expr(stats_offset is not None):
-                    from .wait_stats import Slot, globaltimer_lo, stat_add
-                    from .wait_stats_config import SLOTS
-
-                    bx, by, bz = cute.arch.block_idx()
-                    gx, gy, _ = cute.arch.grid_dim()
-                    stats_base = (
-                        self.params.fc1_done_counter_ptr
-                        + Int32(stats_offset)
-                        + (bx + by * gx + bz * gx * gy) * Int32(SLOTS)
-                    )
-                    loads_start = globaltimer_lo()
-                    if cute.arch.lane_idx() == Int32(0):
-                        stat_add(
-                            stats_base + Int32(Slot.SCHED_LOADS_START_RAW), loads_start
-                        )
-                    touched = Int32(0)
-                    for expert in cutlass.range(0, self.expert_count, 1, unroll=1):
-                        touched = touched + self.params.expert_token_sizes[expert]
-                    decode_start = globaltimer_lo()
-                    if cute.arch.lane_idx() == Int32(0):
-                        stat_add(
-                            stats_base + Int32(Slot.SCHED_INIT_COUNT_LOADS_NS),
-                            decode_start - loads_start + (touched >> Int32(31)),
-                        )
                 claimed = self._claim_static()
                 self._decode_claim(claimed)
                 self._state = self._state
                 self.current_work = self.current_work
-                if const_expr(stats_offset is not None):
-                    if cute.arch.lane_idx() == Int32(0):
-                        stat_add(
-                            stats_base + Int32(Slot.SCHED_INIT_DECODE_NS),
-                            globaltimer_lo() - decode_start,
-                        )
             else:
                 self._state = self._state
                 self.current_work = self.current_work
@@ -942,7 +896,7 @@ class PersistentDeviceScheduler:
                 atomic.producer.index, loc=loc, ip=ip
             )
             tidx, _, _ = cute.arch.thread_idx(loc=loc, ip=ip)
-            lane = tidx % Int32(32)
+            lane = tidx % Int32(cute.arch.WARP_SIZE)
             if const_expr(self.params.load_balance_mode == "alternating"):
                 claimed = Int32(ALTERNATING_DONE)
                 if lane == Int32(0):
@@ -951,7 +905,10 @@ class PersistentDeviceScheduler:
                 else:
                     self._alternating = self._alternating
                 claimed = cute.arch.shuffle_sync(
-                    claimed, offset=0, mask=0xFFFFFFFF, mask_and_clamp=31
+                    claimed,
+                    offset=0,
+                    mask=0xFFFFFFFF,
+                    mask_and_clamp=cute.arch.WARP_SIZE - 1,
                 )
             elif const_expr(self._first_claim_pending):
                 claimed = atomic.cached
@@ -962,7 +919,10 @@ class PersistentDeviceScheduler:
                         atomic.counter_ptr, Int32(1), loc=loc, ip=ip
                     )
                 claimed = cute.arch.shuffle_sync(
-                    claimed, offset=0, mask=0xFFFFFFFF, mask_and_clamp=31
+                    claimed,
+                    offset=0,
+                    mask=0xFFFFFFFF,
+                    mask_and_clamp=cute.arch.WARP_SIZE - 1,
                 )
             if lane < Int32(cluster_size):
                 _store_peer_i32(
@@ -983,7 +943,7 @@ class PersistentDeviceScheduler:
     @dsl_user_op
     @cute.jit
     def _claim_alternating(self, *, loc=None, ip=None) -> Int32:
-        # Only the cluster leader lane enters this routine; other lanes park
+        # Only the cluster leader lane enters this routine. Other lanes park
         # at the shuffle. FC2 waits for *claims*, never for completion here.
         a = self._alternating
         claimed = Int32(ALTERNATING_DONE)
@@ -1011,12 +971,6 @@ class PersistentDeviceScheduler:
                     threshold = (
                         index // self._fc2_feature_blocks + Int32(1)
                     ) * self._fc1_feature_blocks
-                    stats_offset = self.params.wait_stats_offset
-                    if const_expr(stats_offset is not None):
-                        from .wait_stats import Slot, globaltimer_lo, stat_add
-                        from .wait_stats_config import SLOTS
-
-                        started = globaltimer_lo()
                     observed = Int32(0)
                     while observed < threshold:
                         observed = cute.arch.load(
@@ -1024,16 +978,6 @@ class PersistentDeviceScheduler:
                             Int32,
                             sem="acquire",
                             scope="gpu",
-                        )
-                    if const_expr(stats_offset is not None):
-                        bx, by, bz = cute.arch.block_idx()
-                        gx, gy, _ = cute.arch.grid_dim()
-                        stat_add(
-                            self.params.fc1_done_counter_ptr
-                            + Int32(stats_offset)
-                            + (bx + by * gx + bz * gx * gy) * Int32(SLOTS)
-                            + Int32(Slot.SCHED_LATE_CLAIM_NS),
-                            globaltimer_lo() - started,
                         )
                     claimed = -index - Int32(1)
                     searching = Int32(0)
@@ -1143,7 +1087,7 @@ class PersistentDeviceScheduler:
         state.token_count = Int32(0)
         state.token_blocks = Int32(0)
 
-        # A zero-token suffix yields an empty group.  Do not dereference its
+        # A zero-token suffix yields an empty group. Do not dereference its
         # first expert after the greedy loop has reached expert_count.
         if state.group_first_expert < self.expert_count:
             self._advance_expert(loc=loc, ip=ip)
@@ -1187,19 +1131,14 @@ class PersistentDeviceScheduler:
     @dsl_user_op
     @cute.jit
     def _peek_readiness(self, record, *, loc=None, ip=None):
-        """Peek once; lean FC1 is ready without a dispatch-counter load."""
+        """Peek once at dispatch readiness for FC1 or FC1 completion for FC2."""
         phase_and_peek = record.phase_and_peek
         if record.is_valid_tile:
             if record.phase == Int32(DevicePhase.FC1):
-                if const_expr(self.params.fc1_ready_counter_ptr is None):
+                ptr = self.params.fc1_ready_counter_ptr + record.counter_slot
+                observed = cute.arch.load(ptr, ptr.dtype, sem="acquire", scope="gpu")
+                if observed >= record.valid_tokens_in_cta_tile:
                     phase_and_peek = phase_and_peek | Int32(PEEK_READY_BIT)
-                else:
-                    ptr = self.params.fc1_ready_counter_ptr + record.counter_slot
-                    observed = cute.arch.load(
-                        ptr, ptr.dtype, sem="acquire", scope="gpu"
-                    )
-                    if observed >= record.valid_tokens_in_cta_tile:
-                        phase_and_peek = phase_and_peek | Int32(PEEK_READY_BIT)
             else:
                 ptr = self.params.fc1_done_counter_ptr + record.counter_slot
                 observed = cute.arch.load(ptr, ptr.dtype, sem="acquire", scope="gpu")

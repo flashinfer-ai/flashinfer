@@ -1,25 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""FC1 epilogue for the SM100 MXFP8 x MXFP4 MegaMoE kernel.
+"""FC1 FP32 arithmetic and MXFP8 quantization for persistent MegaMoE.
 
-The mainloop uses swap-AB orientation and leaves FP32 gate/up accumulators in
-TMEM.  This component provides FP32 arithmetic and quantization for the persistent
-epilogue. The native path distributes a K32 block across lanes and paired
-warps, using these numerical primitives:
+Swap-AB MMA supplies FP32 gate/up accumulators. Across each K32 block:
 
-1. optionally clamp ``gate`` above and ``up`` on both sides in FP32;
-2. evaluate ``up * (gate * sigmoid(gate))`` in FP32;
-3. form ``scale = ceil_pow2(amax / 448)`` as one raw E8M0 byte; and
-4. multiply by the exact reciprocal power of two and convert to E4M3 with
-   saturating round-to-nearest-even.
+1. Clamp ``gate`` above and ``up`` symmetrically in FP32 when configured.
+2. Evaluate ``up * (gate * sigmoid(gate))`` in FP32.
+3. Encode ``ceil_pow2(amax / 448)`` as a raw E8M0 scale.
+4. Multiply by its exact reciprocal and convert to E4M3 with saturating
+   round-to-nearest-even.
 
-There is deliberately no BF16 conversion and no routing-weight multiplication
-at this boundary.  This is the deterministic handoff specified by
-``README.md``; FC2 and the output reducer own routing weights.
-
-The persistent epilogue owns TMEM traversal, cross-lane amax reduction,
-stores, and readiness publication.
+No BF16 rounding or routing multiplication occurs here. The persistent
+epilogue owns TMEM traversal, cross-lane amax, stores, and readiness.
+Routing scores are applied after FC2.
 """
 
 from __future__ import annotations
@@ -47,9 +41,9 @@ class Fc1EpilogueConfig:
     """Compile-time FC1 epilogue policy.
 
     ``gate_up_clamp`` follows the MegaMoE public API: the gate is upper-clamped
-    while the up projection is clamped to the symmetric interval.  ``None``
-    disables clamping.  ``fast_math`` selects the exponential implementation;
-    it does not alter the E8M0 or E4M3 rounding modes.
+    while the up projection is clamped to the symmetric interval. ``None``
+    disables clamping. ``fast_math`` selects the exponential implementation.
+    It does not alter the E8M0 or E4M3 rounding modes.
     """
 
     gate_up_clamp: Optional[float] = None
@@ -98,12 +92,11 @@ def handoff_storage_bytes(
 
 @dsl_user_op
 def _ue8m0_to_inv_scale_contract(raw_scale, *, loc=None, ip=None):
-    """Decode the reciprocal of every finite E8M0 code, including code zero.
+    """Decode reciprocals of finite E8M0 codes, including zero.
 
-    The generic quantization helper treats raw zero as a zero-scale sentinel.
-    ``reference.py`` instead defines it as the finite scale ``2**-127``.  The
-    difference only affects extremely small nonzero blocks, but preserving it
-    here makes the kernel recipe complete rather than relying on underflow.
+    The generic helper treats raw zero as a zero-scale sentinel. This kernel
+    follows :mod:`reference`: code zero is ``2**-127``, preserving extremely
+    small nonzero blocks rather than relying on underflow.
     """
 
     return cutlass.Float32(
@@ -194,7 +187,7 @@ def _clamp_and_swiglu(
             ftz=fast_math,
         )
 
-        # Keep this association synchronized with README.md and reference.py.
+        # Keep this association synchronized with reference.py.
         silu0, silu1 = cute.arch.mul_packed_f32x2(
             (g0, g1), (sigmoid0, sigmoid1), rnd="rn", ftz=False
         )
@@ -210,7 +203,7 @@ def _quantize_with_amax(
     amax,
     count: cutlass.Constexpr[int] = SF_VEC_SIZE,
 ):
-    """Quantize ``count`` values against a K32 block's amax; return E8M0."""
+    """Quantize ``count`` values against a K32 block's amax. Return E8M0."""
 
     # float_to_ue8m0_fast is the exact round-toward-+inf exponent encoding:
     # ceil_pow2(amax / 448), saturated below the reserved 0xff E8M0 code.

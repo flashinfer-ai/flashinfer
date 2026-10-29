@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -37,7 +38,9 @@ def _buffers(capacity: int, hidden: int, topk: int):
 @pytest.mark.parametrize("tokens", [0, 1, 31, 32, 33])
 def test_mxfp8_mxfp4_megamoe_prequantized_staging_is_byte_exact(tokens: int) -> None:
     _require_b200()
-    from flashinfer.moe_ep.cute_dsl.megamoe.mxfp8_mxfp4.staging import stage_inputs
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp4_bf16_cutedsl.backend import (
+        Mxfp8Mxfp4CutedslMegaKernelBackend,
+    )
 
     capacity, hidden, topk = 64, 160, 4
     data = torch.randn((tokens, hidden), device="cuda").to(torch.float8_e4m3fn)
@@ -52,13 +55,23 @@ def test_mxfp8_mxfp4_megamoe_prequantized_staging_is_byte_exact(tokens: int) -> 
     )
     scores = torch.randn((tokens, topk), device="cuda", dtype=torch.float32)
     out = _buffers(capacity, hidden, topk)
-    staged = stage_inputs(data, scales, ids, scores, *out, quantize_input=False)
+    backend = object.__new__(Mxfp8Mxfp4CutedslMegaKernelBackend)
+    backend.stage_inputs(
+        SimpleNamespace(
+            hidden_states=data, scales=scales, topk_ids=ids, topk_weights=scores
+        ),
+        SimpleNamespace(
+            hidden=hidden, x=out[0], x_sf=out[1], topk_idx=out[2], topk_weights=out[3]
+        ),
+        quantize_input=False,
+    )
     torch.cuda.synchronize()
-    assert staged.num_tokens == tokens
-    assert torch.equal(staged.data.view(torch.uint8), data.view(torch.uint8))
-    assert torch.equal(staged.scales.view(torch.uint8), scales.view(torch.uint8))
-    assert torch.equal(staged.route_ids, ids.to(torch.int64))
-    assert torch.equal(staged.route_scores, scores)
+    assert torch.equal(out[0][:tokens].view(torch.uint8), data.view(torch.uint8))
+    assert torch.equal(
+        out[1][:tokens, : hidden // 32].view(torch.uint8), scales.view(torch.uint8)
+    )
+    assert torch.equal(out[2][:tokens], ids.to(torch.int64))
+    assert torch.equal(out[3][:tokens], scores)
     if tokens < capacity:
         assert bool((out[2][tokens:] == -1).all())
 
@@ -981,7 +994,7 @@ def test_public_layer_owned_view_and_partial_capacity():
         for _ in range(2):
             graph.replay()
             assert torch.count_nonzero(captured) == 0
-        # Borrowed storage was reused; the earlier owned result survives.
+        # Borrowed storage was reused. The earlier owned result survives.
         assert torch.count_nonzero(view) == 0
         torch.testing.assert_close(owned, expected, atol=0, rtol=0)
     finally:

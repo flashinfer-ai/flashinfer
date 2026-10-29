@@ -34,7 +34,7 @@ def store_native_bf16(
     Registers pack adjacent tokens. Matrices advance feature by 8, token
     by 8, then both. Lanes 0..7 supply the first matrix's token-row addresses,
     8..15 the second's, etc. Swizzle logical offsets so the exchange base
-    need only be 16-byte aligned; its address must not change the permutation.
+    need only be 16-byte aligned. Its address must not change the permutation.
     """
     offset = byte_offset ^ ((byte_offset >> 3) & swizzle_mask)
     address = smem_ptr.toint(loc=loc, ip=ip) + offset
@@ -63,8 +63,8 @@ def stage_native_bf16(
 ):
     """Round 16 token columns once and stage one native 16-feature half.
 
-    A 16-row tile is reused between chunks to retain the N128 operand depth;
-    the four warps of a warpgroup share its rows.
+    A 16-row tile is reused between chunks to retain the N128 operand depth.
+    The four warps of a warpgroup share its rows.
     """
     bf16 = cute.make_rmem_tensor((8,), cutlass.BFloat16)
     for i in cutlass.range_constexpr(8):

@@ -105,7 +105,7 @@ def test_b200_traces_and_reads_atom_tiled_logical_view() -> None:
     fc1_logical = torch.zeros(
         (2 * intermediate, hidden // 32), dtype=torch.uint8, device="cuda"
     )
-    # Raw E8M0 0x7f encodes 1.0.  Row 32 is deliberately non-contiguous in
+    # Raw E8M0 0x7f encodes 1.0. Row 32 is deliberately non-contiguous in
     # the atom byte order, so this coordinate exercises more than a reshape.
     fc1_logical[32, 0] = 0x7F
     fc2_logical = torch.zeros(

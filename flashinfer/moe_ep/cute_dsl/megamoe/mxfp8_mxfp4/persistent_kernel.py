@@ -18,60 +18,6 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 
-class KernelAssemblyPendingError(RuntimeError):
-    """Raised when a native assembly dependency is unavailable."""
-
-
-@dataclass(frozen=True)
-class DeviceAssemblyProtocol:
-    required_launch_regions: tuple[str, ...] = ("local", "shared", "route_terms")
-    required_local_views: tuple[str, ...] = (
-        "l1_arrival_count",
-        "expert_send_count",
-        "grid_sync_counter",
-        "fc1_done_counter",
-        "l1_token_buffer",
-        "nvlink_barrier_counter",
-        "l1_sf_buffer",
-        "l1_topk_weights_buffer",
-        "token_src_metadata",
-        "fc1_output",
-        "fc1_output_sf",
-    )
-    dispatch_products: tuple[str, ...] = (
-        "expert_recv_count_sum",
-        "expert_pool_offsets",
-        "token_src_metadata",
-        "fc1_ready_counters",
-    )
-    weight_scale_products: tuple[str, ...] = (
-        "fc1_weight_sfa_logical",
-        "fc2_weight_sfa_logical",
-    )
-
-
-DEVICE_ASSEMBLY_PROTOCOL = DeviceAssemblyProtocol()
-# The M128/N128 single-rank assembly passed the B200 compile and numerical gate.
-ASSEMBLY_READY = True
-
-
-def _missing_protocols() -> tuple[str, ...]:
-    probes = (
-        ("device_workspace", "DeviceWorkspacePartition"),
-        ("dispatch", "SingleRankMxfp8DispatchPhase"),
-        ("weight_scale_views", "SwizzledWeightScaleViews"),
-        ("packed_weight_views", "PackedWeightViews"),
-    )
-    missing = []
-    for module, symbol in probes:
-        try:
-            imported = __import__(f"{__package__}.{module}", fromlist=[symbol])
-            getattr(imported, symbol)
-        except (ImportError, AttributeError):
-            missing.append(f"{module}.{symbol}")
-    return tuple(missing)
-
-
 @dataclass(frozen=True)
 class _CompiledAssembly:
     persistent: Any
@@ -81,7 +27,7 @@ class _CompiledAssembly:
 
 @dataclass(frozen=True)
 class _BoundMegaLaunch:
-    """Warmed runtime views; stream rebinding never revisits DLPack adapters."""
+    """Warmed runtime views. Stream rebinding never revisits DLPack adapters."""
 
     compiled: Any
     runtime: dict[str, Any]
@@ -136,7 +82,7 @@ def _layout_adapter(cls, *, hidden: int, intermediate: int, experts: int):
     return obj
 
 
-class _MegaAdapterBindings:
+class PersistentMxfp8Mxfp4KernelAdapter:
     """Frontend adapter for one native persistent kernel plus reducer."""
 
     def __init__(self, *, workspace, tactic, gate_up_clamp, fast_math) -> None:
@@ -144,10 +90,6 @@ class _MegaAdapterBindings:
         self.tactic = dict(tactic)
         self.gate_up_clamp = gate_up_clamp
         self.fast_math = bool(fast_math)
-
-    @staticmethod
-    def assembly_protocol() -> DeviceAssemblyProtocol:
-        return DEVICE_ASSEMBLY_PROTOCOL
 
     def _validate_static_contract(self, config, spec) -> None:
         expected = {
@@ -166,7 +108,7 @@ class _MegaAdapterBindings:
             raise ValueError(f"frontend/workspace static contract mismatch: {mismatch}")
         missing = tuple(
             key
-            for key in DEVICE_ASSEMBLY_PROTOCOL.required_launch_regions
+            for key in ("local", "shared", "route_terms")
             if key not in spec.workspace_regions
         )
         if missing:
@@ -187,8 +129,6 @@ class _MegaAdapterBindings:
                     "M256 (2-CTA) requires hidden and 2*intermediate to be "
                     "multiples of 256"
                 )
-        # N32 is not supported yet: it faults on a misaligned shared-memory
-        # access and needs 32-token dispatch padding.
         if self.tactic["mma_tiler_mnk"][1] not in (64, 128, 192):
             raise ValueError("persistent assembly supports N64, N128, or N192")
 
@@ -225,10 +165,10 @@ class _MegaAdapterBindings:
         ].view(torch.int32)
         input_sf = spec.activation_scales.view(torch.uint8).view(torch.int32)
         return dict(
-            input_token_buffer=_to_cute(spec.activation, 16),
-            input_sf_buffer=_to_cute(input_sf, 4),
-            input_topk_idx=_to_cute(spec.route_ids, 8),
-            input_topk_weights=_to_cute(spec.route_scores, 4),
+            input_token_buffer=_to_cute(spec.activation, align=16),
+            input_sf_buffer=_to_cute(input_sf, align=4),
+            input_topk_idx=_to_cute(spec.route_ids, align=8),
+            input_topk_weights=_to_cute(spec.route_scores, align=4),
             fc1_weight=weights.fc1_weight,
             fc2_weight=weights.fc2_weight,
             fc1_weight_scales=scales.fc1_weight_scales,
@@ -249,9 +189,9 @@ class _MegaAdapterBindings:
             fc1_output=v["fc1_output"],
             fc1_output_sf=v["fc1_output_sf"],
             route_terms=v["route_terms"],
-            output=_to_cute(spec.output, 16),
-            local_zero_prefix=_to_cute(local_zero, 4),
-            shared_zero_prefix=_to_cute(shared_zero, 4),
+            output=_to_cute(spec.output, align=16),
+            local_zero_prefix=_to_cute(local_zero, align=4),
+            shared_zero_prefix=_to_cute(shared_zero, align=4),
             load_balance_counter=v.get("load_balance_counter"),
             peer_rank_ptr_mapper_host=SymBufferHost(
                 base_addr=self.workspace.symmetric_base or spec.activation.data_ptr(),
@@ -260,21 +200,8 @@ class _MegaAdapterBindings:
                 num_max_ranks=self.workspace.world_size,
             ),
             stream=cuda.CUstream(spec.stream),
-            expert_data_row_offsets=None,
-            expert_scale_row_offsets=None,
         )
 
-
-class PersistentFc12KernelBase:
-    """Shared compute assembly; communication is a compile-time specialization."""
-
-    # Concrete launchers supply these before assembling the shared kernel.
-    tactic: dict[str, Any]
-    workspace: Any
-    gate_up_clamp: float | None
-    fast_math: bool
-
-    mega = False
     resolved_num_stages = None
     resolved_persistent_clusters = None
 
@@ -300,19 +227,22 @@ class PersistentFc12KernelBase:
 
         from .device_scheduler import DeviceSchedulerParams
         from .dispatch import Mxfp8DispatchPhase
+        from ....backends.mega.kernel.sm100.mxfp8_mxfp4_bf16_cutedsl.config import (
+            MAX_OPERAND_STAGES_PAIR,
+            MAX_OPERAND_STAGES_SINGLE,
+        )
         from .kernel_pipelines import fit_operand_stages
 
-        dispatch = None
-        if self.mega:
-            dispatch = Mxfp8DispatchPhase(
-                wc,
-                rank=local_rank,
-                cluster_shape_mn=cluster_shape_mn,
-                dispatch_warp_start=warps.dispatch[0],
-                num_other_warps=len(warps.epilogue) + 4,
-                flag_batch=flag_batch,
-                cta_local_counts=self.tactic.get("cta_local_counts", False),
-            )
+        dispatch = Mxfp8DispatchPhase(
+            wc,
+            rank=local_rank,
+            cluster_shape_mn=cluster_shape_mn,
+            dispatch_warp_start=warps.dispatch[0],
+            num_other_warps=warps.num_non_dispatch_warps,
+            flag_batch=flag_batch,
+            cta_local_counts=self.tactic.get("cta_local_counts", False),
+        )
+        two_cta = self.tactic["mma_tiler_mnk"][0] == 256
         fit = fit_operand_stages(
             mma_tiler_mnk=tuple(self.tactic["mma_tiler_mnk"]),
             scheduler_params=SimpleNamespace(
@@ -323,9 +253,9 @@ class PersistentFc12KernelBase:
             dispatch_phase=dispatch,
             epilogue_warps=len(warps.epilogue),
             smem_capacity_bytes=cutlass.utils.get_smem_capacity_in_bytes(),
-            # 2-CTA stages are smaller per CTA; allow the deeper pipelines
-            # they fit (the 1-CTA cap stays at the measured default).
-            maximum_stages=12 if self.tactic["mma_tiler_mnk"][0] == 256 else 8,
+            maximum_stages=(
+                MAX_OPERAND_STAGES_PAIR if two_cta else MAX_OPERAND_STAGES_SINGLE
+            ),
         )
         _logger.info(
             "MXFP8 x MXFP4 mega: num_stages=auto -> %d (%d of %d bytes, H=%d I=%d)",
@@ -356,16 +286,15 @@ class PersistentFc12KernelBase:
             DriverViews,
             PersistentM128DeviceDriver,
             PhaseTmaViews,
+            TmaOperandView,
         )
         from .kernel_pipelines import KernelPipelines, KernelWarpIds, OperandSmem
         from .packed_weight_views import PackedWeightViews
-        from .scale_tma_staging import Mxfp8Mxfp4TmaStaging
+        from .scale_tma_staging import Mxfp8Mxfp4TmaStaging, TmaLoad, TmaOperands
         from .weight_scale_views import SwizzledWeightScaleViews
 
-        # CuTe's staged-function frontend resolves module symbols by global
-        # name rather than retaining ordinary Python closure cells.  Publish
-        # these lazy imports only once compilation has explicitly been asked
-        # for, preserving CPU-only import safety.
+        # CuTe resolves staged symbols through globals, not closure cells.
+        # Publish lazy imports only during compilation to keep CPU imports safe.
         globals().update(
             cutlass=cutlass,
             cute=cute,
@@ -383,22 +312,11 @@ class PersistentFc12KernelBase:
         self.resolved_persistent_clusters = clusters
         m, n, _ = self.tactic["mma_tiler_mnk"]
         cm, cn, _ = self.tactic["cluster_shape_mnk"]
-        mega = self.mega
         cta_local_counts = self.tactic.get("cta_local_counts", False)
-        in_kernel_reduce = mega and self.tactic.get("in_kernel_reduce", False)
-        # The tactic selects the epilogue width (Mega always resolves one);
-        # the lean proxy's fixed tactic has none and follows the environment.
+        in_kernel_reduce = self.tactic.get("in_kernel_reduce", False)
         epilogue_warps = self.tactic.get("epilogue_warps", EPILOGUE_WARPS)
-        warps = KernelWarpIds.for_epilogue(epilogue_warps, mega=mega)
-        # wait accounting (debug knob): the mega stats region offset.
-        from .wait_stats_config import mega_stats_word_offset
+        warps = KernelWarpIds.for_epilogue(epilogue_warps)
 
-        workspace = getattr(self, "workspace", None)
-        stats_word_offset = (
-            mega_stats_word_offset(workspace.plan)
-            if mega and workspace is not None
-            else None
-        )
         weight_layouts = _layout_adapter(
             PackedWeightViews,
             hidden=config.hidden,
@@ -417,8 +335,6 @@ class PersistentFc12KernelBase:
         input_sf_capacity = wc.pool_sf_capacity
         output_sf_capacity = (
             wc.pool_token_capacity + wc.num_experts_per_rank * wc.sf_padding_block
-            if mega
-            else wc.pool_sf_capacity
         )
         cluster_size = cm * cn
         active_sms = clusters * cluster_size
@@ -432,12 +348,8 @@ class PersistentFc12KernelBase:
         # Every CTA publishes FC1 completion once per 128-row tile, so FC2
         # waits for all ceil(2I / cta_m) tiles of the token block.
         fc2_threshold = (2 * config.intermediate + cta_m - 1) // cta_m
-        claim_order = (
-            self.tactic.get("claim_order", "expert") if self.mega else "expert"
-        )
+        claim_order = self.tactic.get("claim_order", "expert")
         load_balance_mode = self.tactic["load_balance_mode"]
-        if not self.mega and load_balance_mode != "static":
-            raise ValueError("lean FC12 requires static load balancing")
         flag_batch = self.tactic["flag_batch"]
         weight_l2_evict_first = self.tactic.get("weight_l2_evict_first", False)
         num_stages = self.tactic["num_stages"]
@@ -494,17 +406,15 @@ class PersistentFc12KernelBase:
                 cluster_shape_mn=(cm, cn),
                 num_stages=num_stages,
             )
-            dispatch = None
-            if cutlass.const_expr(mega):
-                dispatch = Mxfp8DispatchPhase(
-                    wc,
-                    rank=local_rank,
-                    cluster_shape_mn=(cm, cn),
-                    dispatch_warp_start=warps.dispatch[0],
-                    num_other_warps=len(warps.epilogue) + 4,
-                    flag_batch=flag_batch,
-                    cta_local_counts=cta_local_counts,
-                )
+            dispatch = Mxfp8DispatchPhase(
+                wc,
+                rank=local_rank,
+                cluster_shape_mn=(cm, cn),
+                dispatch_warp_start=warps.dispatch[0],
+                num_other_warps=warps.num_non_dispatch_warps,
+                flag_batch=flag_batch,
+                cta_local_counts=cta_local_counts,
+            )
             epilogue = PersistentMxfp8Mxfp4Epilogue(
                 DeviceEpilogueConfig(
                     cta_tile_features=cta_m,
@@ -515,8 +425,8 @@ class PersistentFc12KernelBase:
                 )
             )
             # FC1 publishes scale bytes in the same 32x4x4 atom layout that
-            # FC2's SFB TMA descriptor consumes.  The runtime tensor only
-            # describes the backing row-major allocation; reconstruct the
+            # FC2's SFB TMA descriptor consumes. The runtime tensor only
+            # describes the backing row-major allocation. Reconstruct the
             # logical scale-factor view in this device trace before stores.
             fc1_output_sf_logical = cute.make_tensor(
                 fc1_output_sf.iterator,
@@ -538,9 +448,20 @@ class PersistentFc12KernelBase:
                     (pool_tokens, config.intermediate), stride=(config.intermediate, 1)
                 ),
             )
-            phase1 = (p1a, p1at, p1b, p1bt, p1sa, p1sat, p1sb, p1sbt)
-            phase2 = (p2a, p2at, p2b, p2bt, p2sa, p2sat, p2sb, p2sbt)
-            bidx, _, _ = cute.arch.block_idx()
+            phase1 = TmaOperands(
+                a=TmaLoad(atom=p1a, tensor=p1at),
+                b=TmaLoad(atom=p1b, tensor=p1bt),
+                sfa=TmaLoad(atom=p1sa, tensor=p1sat),
+                sfb=TmaLoad(atom=p1sb, tensor=p1sbt),
+            )
+            phase2 = TmaOperands(
+                a=TmaLoad(atom=p2a, tensor=p2at),
+                b=TmaLoad(atom=p2b, tensor=p2bt),
+                sfa=TmaLoad(atom=p2sa, tensor=p2sat),
+                sfb=TmaLoad(atom=p2sb, tensor=p2sbt),
+            )
+            block_idx = cute.arch.block_idx()
+            bidx, _, _ = block_idx
             mma_v = bidx % cute.size(staging.tiled_mma.thr_id.shape)
             rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
             coord = staging.cluster_layout_vmnk.get_flat_coord(rank)
@@ -554,7 +475,7 @@ class PersistentFc12KernelBase:
                 warp_ids=warps,
             )
             storage = smem.allocate(pipes.shared_storage_type())
-            if cutlass.const_expr(mega and cta_local_counts):
+            if cutlass.const_expr(cta_local_counts):
                 scheduler_params.expert_token_sizes = dispatch.bind_local_counts(
                     dispatch_args, storage.dispatch
                 )
@@ -574,20 +495,20 @@ class PersistentFc12KernelBase:
                 dispatch.bind_in_kernel_reduce(route_terms, reduce_output)
             mainloop = pipes.create_mainloop_pipelines(storage)
             sched = pipes.create_scheduler(
-                storage, block_idx=cute.arch.block_idx(), grid_dim=cute.arch.grid_dim()
+                storage, block_idx=block_idx, grid_dim=cute.arch.grid_dim()
             )
             tmem = pipes.make_tmem_allocator(storage)
 
             def partition(parts):
                 return staging.partition_tma_loads(
-                    tma_atom_a=parts[0],
-                    tma_tensor_a=parts[1],
-                    tma_atom_b=parts[2],
-                    tma_tensor_b=parts[3],
-                    tma_atom_sfa=parts[4],
-                    tma_tensor_sfa=parts[5],
-                    tma_atom_sfb=parts[6],
-                    tma_tensor_sfb=parts[7],
+                    tma_atom_a=parts.a.atom,
+                    tma_tensor_a=parts.a.tensor,
+                    tma_atom_b=parts.b.atom,
+                    tma_tensor_b=parts.b.tensor,
+                    tma_atom_sfa=parts.sfa.atom,
+                    tma_tensor_sfa=parts.sfa.tensor,
+                    tma_atom_sfb=parts.sfb.atom,
+                    tma_tensor_sfb=parts.sfb.tensor,
                     smem_a=operands.weight,
                     smem_b=operands.activation,
                     smem_sfa=operands.weight_scale,
@@ -600,36 +521,87 @@ class PersistentFc12KernelBase:
             p1, p2 = partition(phase1), partition(phase2)
             masks = staging.make_multicast_masks(coord, sfb_coord)
             pv1 = PhaseTmaViews(
-                atoms=(phase1[0], phase1[2], phase1[4], phase1[6]),
-                global_partitions=(p1[1], p1[3], p1[5], p1[7]),
-                tensors=(phase1[1], phase1[3], phase1[5], phase1[7]),
-                multicast_masks=masks,
+                a=TmaOperandView(
+                    atom=phase1.a.atom,
+                    tensor=phase1.a.tensor,
+                    global_partition=p1.global_a,
+                    multicast_mask=masks.a,
+                ),
+                b=TmaOperandView(
+                    atom=phase1.b.atom,
+                    tensor=phase1.b.tensor,
+                    global_partition=p1.global_b,
+                    multicast_mask=masks.b,
+                ),
+                sfa=TmaOperandView(
+                    atom=phase1.sfa.atom,
+                    tensor=phase1.sfa.tensor,
+                    global_partition=p1.global_sfa,
+                    multicast_mask=masks.sfa,
+                ),
+                sfb=TmaOperandView(
+                    atom=phase1.sfb.atom,
+                    tensor=phase1.sfb.tensor,
+                    global_partition=p1.global_sfb,
+                    multicast_mask=masks.sfb,
+                ),
             )
             pv2 = PhaseTmaViews(
-                atoms=(phase2[0], phase2[2], phase2[4], phase2[6]),
-                global_partitions=(p2[1], p2[3], p2[5], p2[7]),
-                tensors=(phase2[1], phase2[3], phase2[5], phase2[7]),
-                multicast_masks=masks,
+                a=TmaOperandView(
+                    atom=phase2.a.atom,
+                    tensor=phase2.a.tensor,
+                    global_partition=p2.global_a,
+                    multicast_mask=masks.a,
+                ),
+                b=TmaOperandView(
+                    atom=phase2.b.atom,
+                    tensor=phase2.b.tensor,
+                    global_partition=p2.global_b,
+                    multicast_mask=masks.b,
+                ),
+                sfa=TmaOperandView(
+                    atom=phase2.sfa.atom,
+                    tensor=phase2.sfa.tensor,
+                    global_partition=p2.global_sfa,
+                    multicast_mask=masks.sfa,
+                ),
+                sfb=TmaOperandView(
+                    atom=phase2.sfb.atom,
+                    tensor=phase2.sfb.tensor,
+                    global_partition=p2.global_sfb,
+                    multicast_mask=masks.sfb,
+                ),
             )
             warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
             if warp == pipes.warp_ids.tma_a or warp == pipes.warp_ids.tma_b:
-                for atom in phase1[::2]:
+                for atom in (
+                    phase1.a.atom,
+                    phase1.b.atom,
+                    phase1.sfa.atom,
+                    phase1.sfb.atom,
+                ):
                     cpasync.prefetch_descriptor(atom)
-                for atom in phase2[::2]:
+                for atom in (
+                    phase2.a.atom,
+                    phase2.b.atom,
+                    phase2.sfa.atom,
+                    phase2.sfb.atom,
+                ):
                     cpasync.prefetch_descriptor(atom)
             fc2_store = Fc2RouteStore(
                 route_terms,
-                dispatch_args.peer_rank_ptr_mapper if mega else None,
+                dispatch_args.peer_rank_ptr_mapper,
             )
             PersistentM128DeviceDriver(
                 kernel_pipelines=pipes,
-                stats_word_offset=stats_word_offset,
                 weight_l2_evict_first=weight_l2_evict_first,
             )(
                 mainloop_pipelines=mainloop,
                 scheduler_bundle=sched,
                 operand_smem=operands,
-                tma_operand_smem=OperandSmem(p1[0], p1[2], p1[4], p1[6]),
+                tma_operand_smem=OperandSmem(
+                    p1.smem_a, p1.smem_b, p1.smem_sfa, p1.smem_sfb
+                ),
                 tmem_allocator=tmem,
                 views=DriverViews(
                     fc1=pv1,
@@ -638,10 +610,10 @@ class PersistentFc12KernelBase:
                     fc1_output_scales=fc1_output_sf_logical,
                     route_store=fc2_store,
                     fc1_done_counter=fc1_done_counter,
-                    token_metadata=dispatch_args.token_src_metadata if mega else None,
+                    token_metadata=dispatch_args.token_src_metadata,
                 ),
                 dispatch_args=dispatch_args,
-                dispatch_storage=storage.dispatch if mega else None,
+                dispatch_storage=storage.dispatch,
                 epilogue_exchange=epilogue_exchange,
                 fc1_k_tiles=(config.hidden + staging.mma_tiler[2] - 1)
                 // staging.mma_tiler[2],
@@ -683,8 +655,6 @@ class PersistentFc12KernelBase:
                 load_balance_counter,
                 peer_rank_ptr_mapper_host,
                 stream,
-                expert_data_row_offsets,
-                expert_scale_row_offsets,
             ):
                 # Descriptor construction belongs to this enclosing JIT trace.
                 staging = Mxfp8Mxfp4TmaStaging(
@@ -692,43 +662,36 @@ class PersistentFc12KernelBase:
                     cluster_shape_mn=(cm, cn),
                     num_stages=num_stages,
                 )
-                args = None
-                counts = expert_recv_count_sum
-                if cutlass.const_expr(mega):
-                    args = self.make_dispatch_args(
-                        input_token_buffer,
-                        input_sf_buffer,
-                        input_topk_idx,
-                        input_topk_weights,
-                        expert_send_count,
-                        expert_recv_count,
-                        expert_recv_count_sum,
-                        src_token_topk_idx,
-                        token_src_metadata,
-                        l1_arrival_count,
-                        l1_token_buffer,
-                        l1_sf_buffer,
-                        l1_topk_weights_buffer,
-                        nvlink_barrier_signal,
-                        nvlink_barrier_counter,
-                        grid_sync_counter,
-                        local_zero_prefix,
-                        shared_zero_prefix,
-                        peer_rank_ptr_mapper_host,
-                        route_terms,
-                    )
-                    counts_i32 = cute.recast_tensor(
-                        expert_recv_count_sum, cutlass.Int32
-                    )
-                    counts = cute.make_tensor(
-                        counts_i32.iterator,
-                        cute.make_layout((config.num_experts,), stride=(2,)),
-                    )
+                args = self.make_dispatch_args(
+                    input_token_buffer=input_token_buffer,
+                    input_sf_buffer=input_sf_buffer,
+                    input_topk_idx=input_topk_idx,
+                    input_topk_weights=input_topk_weights,
+                    expert_send_count=expert_send_count,
+                    expert_recv_count=expert_recv_count,
+                    expert_recv_count_sum=expert_recv_count_sum,
+                    src_token_topk_idx=src_token_topk_idx,
+                    token_src_metadata=token_src_metadata,
+                    l1_arrival_count=l1_arrival_count,
+                    l1_token_buffer=l1_token_buffer,
+                    l1_sf_buffer=l1_sf_buffer,
+                    l1_topk_weights_buffer=l1_topk_weights_buffer,
+                    nvlink_barrier_signal=nvlink_barrier_signal,
+                    nvlink_barrier_counter=nvlink_barrier_counter,
+                    grid_sync_counter=grid_sync_counter,
+                    local_zero_prefix=local_zero_prefix,
+                    shared_zero_prefix=shared_zero_prefix,
+                    peer_rank_ptr_mapper_host=peer_rank_ptr_mapper_host,
+                    route_terms=route_terms,
+                )
+                counts_i32 = cute.recast_tensor(expert_recv_count_sum, cutlass.Int32)
+                counts = cute.make_tensor(
+                    counts_i32.iterator,
+                    cute.make_layout((config.num_experts,), stride=(2,)),
+                )
                 params = DeviceSchedulerParams(
                     expert_token_sizes=counts,
                     expert_count=config.num_experts,
-                    expert_data_row_offsets=expert_data_row_offsets,
-                    expert_scale_row_offsets=expert_scale_row_offsets,
                     gate_up_size=2 * config.intermediate,
                     hidden_size=config.hidden,
                     cta_tile_tokens=n,
@@ -737,7 +700,7 @@ class PersistentFc12KernelBase:
                     group_hint=group_hint,
                     token_padding_block=wc.token_padding_block,
                     sf_padding_block=wc.sf_padding_block,
-                    fc1_ready_counter_ptr=l1_arrival_count.iterator if mega else None,
+                    fc1_ready_counter_ptr=l1_arrival_count.iterator,
                     fc1_done_counter_ptr=fc1_done_counter.iterator,
                     fc2_ready_threshold=fc2_threshold,
                     load_balance_mode=load_balance_mode,
@@ -748,8 +711,6 @@ class PersistentFc12KernelBase:
                         else None
                     ),
                 )
-                # wait accounting (debug knob, mega only).
-                params.wait_stats_offset = stats_word_offset
                 w = weight_layouts.make_logical_views(fc1_weight, fc2_weight)
                 ws = sf_layouts.make_logical_views(fc1_weight_scales, fc2_weight_scales)
                 x1 = cute.make_tensor(
@@ -793,29 +754,29 @@ class PersistentFc12KernelBase:
                     xs2,
                 )
                 kernel(
-                    phase1[0],
-                    phase1[1],
-                    phase1[2],
-                    phase1[3],
-                    phase1[4],
-                    phase1[5],
-                    phase1[6],
-                    phase1[7],
-                    phase2[0],
-                    phase2[1],
-                    phase2[2],
-                    phase2[3],
-                    phase2[4],
-                    phase2[5],
-                    phase2[6],
-                    phase2[7],
-                    args,
-                    params,
-                    fc1_output,
-                    fc1_output_sf,
-                    fc1_done_counter,
-                    route_terms,
-                    output if in_kernel_reduce else None,
+                    p1a=phase1.a.atom,
+                    p1at=phase1.a.tensor,
+                    p1b=phase1.b.atom,
+                    p1bt=phase1.b.tensor,
+                    p1sa=phase1.sfa.atom,
+                    p1sat=phase1.sfa.tensor,
+                    p1sb=phase1.sfb.atom,
+                    p1sbt=phase1.sfb.tensor,
+                    p2a=phase2.a.atom,
+                    p2at=phase2.a.tensor,
+                    p2b=phase2.b.atom,
+                    p2bt=phase2.b.tensor,
+                    p2sa=phase2.sfa.atom,
+                    p2sat=phase2.sfa.tensor,
+                    p2sb=phase2.sfb.atom,
+                    p2sbt=phase2.sfb.tensor,
+                    dispatch_args=args,
+                    scheduler_params=params,
+                    fc1_output=fc1_output,
+                    fc1_output_sf=fc1_output_sf,
+                    fc1_done_counter=fc1_done_counter,
+                    route_terms=route_terms,
+                    reduce_output=output if in_kernel_reduce else None,
                 ).launch(
                     grid=(cm, cn, clusters),
                     block=(warps.threads_per_cta, 1, 1),
@@ -853,7 +814,7 @@ class PersistentFc12KernelBase:
                     cluster_shape_mn=(cm, cn),
                     rank=local_rank,
                     dispatch_warp_start=warps.dispatch[0],
-                    num_other_warps=len(warps.epilogue) + 4,
+                    num_other_warps=warps.num_non_dispatch_warps,
                     flag_batch=flag_batch,
                 )
                 mapper = peer_rank_ptr_mapper_host.make_device_obj()
@@ -885,20 +846,8 @@ class PersistentFc12KernelBase:
 
         return Launcher()
 
-
-class PersistentMxfp8Mxfp4KernelAdapter(_MegaAdapterBindings, PersistentFc12KernelBase):
-    """Mega specialization of the shared FC12 kernel, with NVLink dispatch."""
-
-    mega = True
-
     def compile(self, config: "FrontendConfig", spec: "KernelLaunchSpec") -> Any:
         self._validate_static_contract(config, spec)
-        missing = _missing_protocols()
-        if missing:
-            raise KernelAssemblyPendingError(
-                "native persistent MXFP8 x MXFP4 assembly is waiting for: "
-                + ", ".join(missing)
-            )
         import cutlass.cute as cute
         import cutlass.utils as cutlass_utils
         from .fc2_epilogue import DeterministicTopKReducer
@@ -915,10 +864,10 @@ class PersistentMxfp8Mxfp4KernelAdapter(_MegaAdapterBindings, PersistentFc12Kern
             self._make_launcher(config, max_active_clusters), **runtime
         )
         reducer_runtime = dict(
-            route_terms=_to_cute(spec.workspace_regions["route_terms"], 16),
-            route_scores=_to_cute(spec.route_scores, 4),
-            route_ids=_to_cute(spec.route_ids, 8),
-            output=_to_cute(spec.output, 16),
+            route_terms=_to_cute(spec.workspace_regions["route_terms"], align=16),
+            route_scores=_to_cute(spec.route_scores, align=4),
+            route_ids=_to_cute(spec.route_ids, align=8),
+            output=_to_cute(spec.output, align=16),
             stream=runtime["stream"],
         )
         reducer = None
@@ -937,10 +886,10 @@ class PersistentMxfp8Mxfp4KernelAdapter(_MegaAdapterBindings, PersistentFc12Kern
 
         runtime = self._runtime(spec, compiled.num_sms)
         reducer_runtime = dict(
-            route_terms=_to_cute(spec.workspace_regions["route_terms"], 16),
-            route_scores=_to_cute(spec.route_scores, 4),
-            route_ids=_to_cute(spec.route_ids, 8),
-            output=_to_cute(spec.output, 16),
+            route_terms=_to_cute(spec.workspace_regions["route_terms"], align=16),
+            route_scores=_to_cute(spec.route_scores, align=4),
+            route_ids=_to_cute(spec.route_ids, align=8),
+            output=_to_cute(spec.output, align=16),
             stream=runtime["stream"],
         )
         partition = DeviceWorkspacePartition.from_launch_regions(
@@ -968,10 +917,5 @@ class PersistentMxfp8Mxfp4KernelAdapter(_MegaAdapterBindings, PersistentFc12Kern
 
 
 __all__ = [
-    "ASSEMBLY_READY",
-    "DEVICE_ASSEMBLY_PROTOCOL",
-    "DeviceAssemblyProtocol",
-    "KernelAssemblyPendingError",
-    "PersistentFc12KernelBase",
     "PersistentMxfp8Mxfp4KernelAdapter",
 ]

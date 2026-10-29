@@ -1,29 +1,23 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Persistent FC1/FC2 scheduler contract for MXFP8 x MXFP4 MegaMoE.
+"""Host reference model and shared work-record format for the FC1/FC2 scheduler.
 
-This module is deliberately host executable.  It defines the record ABI and
-the exact state-machine/claiming semantics that the CuTe-DSL scheduler warp
-must implement, without importing the vendored W4A4 kernel.  Keeping the model
-host-only makes scheduler changes cheap to validate and gives the integration
-kernel a stable eight-int32 boundary.
+The host scheduling model serves as a reference for tests.
+Kernel execution uses the scheduler in device_scheduler.py.
 
-The scheduler walks this hierarchy::
+The state machine walks::
 
     group -> FC1/FC2 phase -> expert -> token block -> feature block
 
-Static and atomic-counter modes order all FC1 claims before FC2 in each
-group. ``AlternatingTileClaimer`` instead claims from two whole-batch task
-spaces after an FC1 warm-up; ``record_for_alternating`` decodes its signed
-phase-local indices. FC2 cannot be returned until its FC1 tasks are claimed.
-Token blocks are the
-slow axis in both phases.  ``tile_m_idx`` is the feature tile and
-``tile_n_idx`` is the token tile, matching the swap-AB kernel orientation.
+Static and atomic-counter modes claim all FC1 work before FC2 in each group.
+``AlternatingTileClaimer`` uses two whole-batch task spaces after FC1 warmup.
+``record_for_alternating`` decodes signed phase-local indices. FC2 is not
+returned until its FC1 tasks are claimed.
 
-MXFP8 activations and MXFP4 weights both use E8M0 scales per K32.  K32 is a
-format invariant; token-row padding remains independently configurable because
-the data and scale workspaces can use different physical row padding.
+Token blocks are the slow axis. In swap-AB coordinates, ``tile_m_idx``
+selects features and ``tile_n_idx`` selects tokens. E8M0/K32 is a format
+invariant. Data and scale token-row padding remain independently configurable.
 """
 
 from __future__ import annotations
@@ -66,7 +60,7 @@ class Phase(IntEnum):
 class WorkRecord:
     """Stable scheduler-to-mainloop/epilogue ABI.
 
-    ``to_words`` is the canonical SMEM wire order.  Slot 3 intentionally
+    ``to_words`` is the canonical SMEM wire order. Slot 3 intentionally
     occupies the base scheduler's historic ``k_tile_cnt`` position, but its
     MegaMoE meaning is ``cumulative_data_physical_row``.
     """
@@ -135,7 +129,7 @@ class SchedulerConfig:
     """Compile/launch-time scheduler parameters.
 
     ``gate_up_size`` is the full interleaved FC1 output dimension (2 * I),
-    not the post-SwiGLU intermediate dimension.  ``cluster_shape_mn`` is in
+    not the post-SwiGLU intermediate dimension. ``cluster_shape_mn`` is in
     scheduler-internal token/feature order.
     """
 
@@ -150,9 +144,6 @@ class SchedulerConfig:
     sf_padding_block: int
     num_persistent_clusters: int
     fc2_ready_threshold: int
-    expert_data_row_offsets: tuple[int, ...] | None = None
-    expert_scale_row_offsets: tuple[int, ...] | None = None
-    wait_for_dispatch: bool = True
     claim_order: Literal["expert", "longest_first"] = "expert"
 
     def __post_init__(self) -> None:
@@ -184,24 +175,6 @@ class SchedulerConfig:
             raise ValueError("gate_up_size must be divisible by MX block size 32")
         if self.hidden_size % SCALE_VECTOR_SIZE:
             raise ValueError("hidden_size must be divisible by MX block size 32")
-        if (self.expert_data_row_offsets is None) != (
-            self.expert_scale_row_offsets is None
-        ):
-            raise ValueError("data and scale row offsets must be provided together")
-        for name, alignment in (
-            ("expert_data_row_offsets", self.token_padding_block),
-            ("expert_scale_row_offsets", self.sf_padding_block),
-        ):
-            offsets = getattr(self, name)
-            if offsets is None:
-                continue
-            if len(offsets) != len(self.expert_token_counts) + 1 or offsets[0] != 0:
-                raise ValueError(f"{name} must contain E+1 offsets starting at zero")
-            if any(value < 0 or value % alignment for value in offsets):
-                raise ValueError(f"{name} must contain aligned nonnegative offsets")
-            for index, count in enumerate(self.expert_token_counts):
-                if offsets[index + 1] - offsets[index] < count:
-                    raise ValueError(f"{name} spans must contain each expert's rows")
 
     @property
     def cluster_tile_m(self) -> int:
@@ -259,7 +232,7 @@ class AtomicTileClaimer:
 
     One instance models the global counter shared by all persistent clusters.
     The device scheduler broadcasts each returned value to the other CTAs in
-    its cluster; consequently callers claim once per cluster, not once per CTA.
+    its cluster. Consequently callers claim once per cluster, not once per CTA.
     """
 
     def __init__(self, initial: int = 0) -> None:
@@ -302,7 +275,7 @@ class AlternatingTileClaimer:
 
     ``claim`` returns None while a late FC2 claim waits for the FC1 frontier.
     The caller must let other clusters progress and retry. DONE is encoded as
-    INT32_MAX; FC1 uses nonnegative indices and FC2 uses -(index + 1).
+    INT32_MAX. FC1 uses nonnegative indices and FC2 uses -(index + 1).
     """
 
     DONE = (1 << 31) - 1
@@ -367,10 +340,7 @@ class PersistentFc1Fc2Scheduler:
         sf_row = 0
         token_block_row = 0
         layouts: list[_ExpertLayout] = []
-        for expert_idx, token_count in enumerate(self.config.expert_token_counts):
-            if self.config.expert_data_row_offsets is not None:
-                data_row = self.config.expert_data_row_offsets[expert_idx]
-                sf_row = self.config.expert_scale_row_offsets[expert_idx]
+        for token_count in self.config.expert_token_counts:
             token_blocks = _ceil_div(token_count, self.config.cluster_tile_m)
             layouts.append(
                 _ExpertLayout(
@@ -399,7 +369,7 @@ class PersistentFc1Fc2Scheduler:
                     * self.config.fc1_feature_blocks
                 )
                 last += 1
-            # A suffix of zero-token experts cannot reach group_hint.  The
+            # A suffix of zero-token experts cannot reach group_hint. The
             # loop still consumes the suffix, so progress is guaranteed.
             yield range(first, last)
             first = last
@@ -488,14 +458,12 @@ class PersistentFc1Fc2Scheduler:
 
         FC1 compares the dispatch counter against this CTA's valid token count.
         FC2 compares the FC1 publication counter against the configured fixed
-        threshold.  This function never spins and never performs arithmetic on
+        threshold. This function never spins and never performs arithmetic on
         routing weights.
         """
 
         if not record.is_valid:
             return record.with_peek_ready(False)
-        if record.phase is Phase.FC1 and not self.config.wait_for_dispatch:
-            return record.with_peek_ready(True)
         counters = (
             fc1_ready_counters if record.phase is Phase.FC1 else fc1_done_counters
         )

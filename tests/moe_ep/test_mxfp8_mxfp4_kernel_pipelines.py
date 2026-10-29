@@ -59,7 +59,7 @@ def _make_pipelines(*, mma_m: int = 128, mma_n: int = 128, dispatch_start: int =
     epilogue = PersistentMxfp8Mxfp4Epilogue(
         DeviceEpilogueConfig(cta_tile_features=128, cta_tile_tokens=mma_n)
     )
-    # Storage shape depends on these scheduler fields.  Device-valued
+    # Storage shape depends on these scheduler fields. Device-valued
     # scheduler parameters are supplied by the final driver before it calls
     # create_scheduler.
     scheduler_shape = SimpleNamespace(
@@ -107,17 +107,16 @@ def test_fc2_staging_stage_fit(warps, n):
     assert fit.fixed_bytes >= warps * 1024
 
 
-@pytest.mark.parametrize("mega", [False, True])
 @pytest.mark.parametrize("warps", [4, 8])
-def test_epilogue_warpgroup_roles(mega, warps) -> None:
-    ids = KernelWarpIds.for_epilogue(warps, mega=mega)
+def test_epilogue_warpgroup_roles(warps) -> None:
+    ids = KernelWarpIds.for_epilogue(warps)
     assert len(ids.epilogue) == warps
-    assert ids.threads_per_cta == (warps + 4 + 4 * mega) * 32
+    assert ids.threads_per_cta == (warps + 8) * 32
     assert ids.epilogue[:4] == (0, 1, 2, 3)
     if warps == 8:
-        start = 12 if mega else 8
+        start = 12
         assert ids.epilogue[4:] == tuple(range(start, start + 4))
-    assert ids.dispatch == ((8, 9, 10, 11) if mega else ())
+    assert ids.dispatch == (8, 9, 10, 11)
 
 
 def test_epilogue_rejects_mixed_role_warpgroups() -> None:
@@ -125,15 +124,14 @@ def test_epilogue_rejects_mixed_role_warpgroups() -> None:
         KernelWarpIds(epilogue=(0, 1, 2, 12, 3, 13, 14, 15))
 
 
-@pytest.mark.parametrize("mega", [False, True])
 @pytest.mark.parametrize("n", [64, 128, 192])
-def test_eight_warp_stage_fit_sizes_exchange_storage(mega, n) -> None:
+def test_eight_warp_stage_fit_sizes_exchange_storage(n) -> None:
     kwargs = dict(
         mma_tiler_mnk=(256, n, 128),
         scheduler_params=SimpleNamespace(
             num_stages=2, load_balance_mode="static", expert_count=32
         ),
-        dispatch_phase=_ep16_dispatch(6400) if mega else None,
+        dispatch_phase=_ep16_dispatch(6400),
         smem_capacity_bytes=SM100_SMEM_CAPACITY,
         maximum_stages=12,
     )
@@ -154,7 +152,7 @@ def test_pipeline_rejects_other_mma_m_and_shifted_dispatch_warps() -> None:
 
 def test_two_cta_stage_bytes_are_per_cta() -> None:
     # Each CTA of a 2-CTA pair stages its own 128 weight rows and half of the
-    # token tile; SFB stays whole (1-CTA SFB view).
+    # token tile. SFB stays whole (1-CTA SFB view).
     for n in (64, 128, 192):
         one = mma_operand_stage_bytes((128, n, 128))
         two = mma_operand_stage_bytes((256, n, 128))
@@ -178,12 +176,12 @@ class _PipelineTraceHarness:
     @cute.kernel
     def _kernel(self):
         # Layouts contain MLIR values and therefore must be created and
-        # consumed wholly within this kernel region.  Storing ``pipelines`` on
+        # consumed wholly within this kernel region. Storing ``pipelines`` on
         # the harness would leak composed layouts across CuTe region isolation.
         pipelines = _make_pipelines()
         stage_bytes = pipelines.staging.operand_stage_bytes()
         assert stage_bytes.weight_a == 128 * 128
-        # The host-side stage fit uses this formula; keep it tied to layouts.
+        # The host-side stage fit uses this formula. Keep it tied to layouts.
         assert stage_bytes == mma_operand_stage_bytes((128, 128, 128))
         assert pipelines.staging.tma_transaction_bytes_a() == 128 * 128 // 2 + 512
         smem = cutlass.utils.SmemAllocator()
@@ -239,12 +237,12 @@ def test_b200_traces_shared_storage_and_pipeline_layout() -> None:
         pytest.skip("requires SM100/SM103 and CUDA 12.8+")
 
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    # Compilation traces every allocation and both pipeline constructors.  No
+    # Compilation traces every allocation and both pipeline constructors. No
     # launch is required: execution behavior belongs to the final driver test.
     cute.compile(_PipelineTraceHarness(), stream)
 
 
-# Shared-memory stage fit.  GB200/B200 allow 232448 dynamic bytes per CTA.
+# Shared-memory stage fit. GB200/B200 allow 232448 dynamic bytes per CTA.
 SM100_SMEM_CAPACITY = 232448
 
 
@@ -269,7 +267,7 @@ def _ep16_dispatch(hidden: int) -> Mxfp8DispatchPhase:
         rank=0,
         cluster_shape_mn=(1, 1),
         dispatch_warp_start=warps.dispatch[0],
-        num_other_warps=len(warps.epilogue) + 4,
+        num_other_warps=warps.num_non_dispatch_warps,
         flag_batch=2,
     )
 
@@ -342,7 +340,7 @@ def test_b200_stage_fit_boundary_matches_launch_limit() -> None:
         pytest.skip("requires SM100/SM103 and CUDA 12.8+")
     fitted = _fit(6400, SM100_SMEM_CAPACITY)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    # The fitted depth launches; one more stage exceeds the per-CTA limit.
+    # The fitted depth launches. One more stage exceeds the per-CTA limit.
     cute.compile(_StageFitLaunchHarness(fitted, 6400), stream)(stream)
     torch.cuda.synchronize()
     # CuTe 4.6.2 prints the shared-memory diagnostic to stderr but raises

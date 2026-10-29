@@ -48,7 +48,7 @@ def test_fc1_epilogue_policy_keeps_routing_outside_fc1() -> None:
     epilogue = Fc1Epilogue(Fc1EpilogueConfig(gate_up_clamp=10.0, fast_math=False))
     assert epilogue.config.gate_up_clamp == 10.0
     assert epilogue.config.fast_math is False
-    # No score/top-k policy exists on the FC1 component.  Routing belongs to
+    # No score/top-k policy exists on the FC1 component. Routing belongs to
     # FC2/output reduction per README.md.
     assert not hasattr(epilogue.config, "routing_weight")
     assert not hasattr(epilogue.config, "apply_topk")

@@ -1,21 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Block-32 scale-factor and TMA staging for SM100 MXFP8 x MXFP4 MegaMoE.
+"""TMA and scale-factor staging for swap-AB MXFP8 x MXFP4 MegaMoE.
 
-This component uses the swap-AB orientation of the persistent MegaMoE kernel:
-
-* operand A is K-major MXFP4 (E2M1) expert weight;
-* operand B is K-major MXFP8 (E4M3) token activation;
-* SFA and SFB are E8M0 scale factors with one scale per 32 K elements.
-
-It owns the GMEM -> SMEM TMA descriptors and partitions, plus the scale-factor
-SMEM -> TMEM copies consumed by ``tcgen05.mma.kind::mxf8f6f4``.  Scheduling,
-pipeline barriers, routing weights, and MMA issue are intentionally outside
-this module.
+A is K-major E2M1 expert weights, B is K-major E4M3 activations, and
+SFA/SFB contain E8M0 scales per K32. This module builds GMEM-to-SMEM TMA
+partitions and SMEM-to-TMEM scale copies for ``tcgen05.mma.kind::mxf8f6f4``.
+The caller owns scheduling, barriers, routing scores, and MMA issue.
 """
 
-from typing import Type
+from dataclasses import dataclass
+from typing import Generic, Type, TypeVar
 
 import cutlass
 import cutlass.cute as cute
@@ -26,18 +21,59 @@ from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from .stage_fit import MX_BLOCK_SIZE, OperandStageBytes
 
 
+# Four K32 MMA steps form one K128 pipeline stage.
+MMA_K_STEPS_PER_STAGE = 4
+
+# Scale-factor TMEM columns group rows in sets of 32.
+SF_TMEM_ROW_GROUP = 32
+
+
+_Operand = TypeVar("_Operand")
+
+
+@dataclass(frozen=True)
+class TmaOperands(Generic[_Operand]):
+    """Named weights, activations, and their scale factors."""
+
+    a: _Operand
+    b: _Operand
+    sfa: _Operand
+    sfb: _Operand
+
+
+@dataclass(frozen=True)
+class TmaLoad:
+    """A TMA copy atom and its global tensor."""
+
+    atom: cute.CopyAtom
+    tensor: cute.Tensor
+
+
+@dataclass(frozen=True)
+class TmaLoadPartitions:
+    """Shared-memory destinations and global-memory sources for TMA loads."""
+
+    smem_a: cute.Tensor
+    global_a: cute.Tensor
+    smem_b: cute.Tensor
+    global_b: cute.Tensor
+    smem_sfa: cute.Tensor
+    global_sfa: cute.Tensor
+    smem_sfb: cute.Tensor
+    global_sfb: cute.Tensor
+
+
 class Mxfp8Mxfp4TmaStaging:
     """Layout and copy factory for one block-scaled MegaMoE mainloop.
 
-    The object contains compile-time configuration only.  Methods return CuTe
+    The object contains compile-time configuration only. Methods return CuTe
     tensors/copy atoms for the integrating kernel to place in its own shared
     storage and pipeline.
     """
 
     weight_dtype: Type[cutlass.Numeric] = cutlass.Float4E2M1FN
-    # tcgen05's mixed-width FP4(A) x FP8(B) path consumes A from byte-wide
-    # SMEM containers.  TMA still reads packed FP4 from GMEM, but unpacks each
-    # nibble into one Int8 slot on arrival.
+    # TMA reads packed FP4 from GMEM and unpacks each 4-bit value
+    # into one Int8 slot in shared memory.
     weight_smem_dtype: Type[cutlass.Numeric] = cutlass.Int8
     activation_dtype: Type[cutlass.Numeric] = cutlass.Float8E4M3FN
     scale_dtype: Type[cutlass.Numeric] = cutlass.Float8E8M0FNU
@@ -85,7 +121,7 @@ class Mxfp8Mxfp4TmaStaging:
             mma_tiler_mn,
         )
         mma_k = cute.size(self.tiled_mma.shape_mnk, mode=[2])
-        self.mma_tiler = (*mma_tiler_mn, mma_k * 4)
+        self.mma_tiler = (*mma_tiler_mn, mma_k * MMA_K_STEPS_PER_STAGE)
 
         # A separate 1-CTA view is required for SFB multicast and the rounded-N
         # scale layout, including the 2-CTA data path.
@@ -103,7 +139,7 @@ class Mxfp8Mxfp4TmaStaging:
             tcgen05.CtaGroup.ONE,
             sfb_mn,
         )
-        self.mma_tiler_sfb = (*sfb_mn, mma_k * 4)
+        self.mma_tiler_sfb = (*sfb_mn, mma_k * MMA_K_STEPS_PER_STAGE)
 
         self.cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout((*cluster_shape_mn, 1)),
@@ -187,7 +223,7 @@ class Mxfp8Mxfp4TmaStaging:
         activation_b: cute.Tensor,
         weight_sfa: cute.Tensor,
         activation_sfb: cute.Tensor,
-    ):
+    ) -> TmaOperands[TmaLoad]:
         """Build TMA load atoms/tensors for A, B, SFA, and SFB."""
         a_layout, b_layout, sfa_layout, sfb_layout = self.one_stage_layouts()
         a_op = sm100_utils.cluster_shape_to_tma_atom_A(
@@ -236,13 +272,18 @@ class Mxfp8Mxfp4TmaStaging:
             internal_type=cutlass.Uint16,
         )
         tma_tensor_sfb = self._normalize_sfb_tma_tensor(tma_tensor_sfb)
-        return (*tma_a, *tma_b, *tma_sfa, tma_atom_sfb, tma_tensor_sfb)
+        return TmaOperands(
+            a=TmaLoad(atom=tma_a[0], tensor=tma_a[1]),
+            b=TmaLoad(atom=tma_b[0], tensor=tma_b[1]),
+            sfa=TmaLoad(atom=tma_sfa[0], tensor=tma_sfa[1]),
+            sfb=TmaLoad(atom=tma_atom_sfb, tensor=tma_tensor_sfb),
+        )
 
     def _normalize_sfb_tma_tensor(self, tma_tensor_sfb: cute.Tensor):
         """Identity: N192 SFB tiles are addressed by atom offset instead.
 
         CUTLASS's dense block-scaled GEMM repairs overlapping 192-column SFB
-        blocks with an overlapping-stride layout.  This kernel offsets every
+        blocks with an overlapping-stride layout. This kernel offsets every
         work tile's scale rows with ``cute.domain_offset`` (per expert), which
         assumes a linear row mapping, so the driver instead offsets N192 tiles
         to the 128-row atom holding their first token and loads a 256-row
@@ -254,8 +295,8 @@ class Mxfp8Mxfp4TmaStaging:
         self,
         block_in_cluster_coord_vmnk,
         block_in_cluster_coord_sfb_vmnk,
-    ):
-        """Return multicast masks in A, B, SFA, SFB order."""
+    ) -> TmaOperands[cutlass.Int16 | None]:
+        """Return a multicast mask for each operand."""
         num_mcast_a = cute.size(self.cluster_layout_vmnk.shape[2])
         num_mcast_b = cute.size(self.cluster_layout_vmnk.shape[1])
         num_mcast_sfb = cute.size(self.cluster_layout_sfb_vmnk.shape[1])
@@ -285,18 +326,13 @@ class Mxfp8Mxfp4TmaStaging:
                 block_in_cluster_coord_sfb_vmnk,
                 mcast_mode=1,
             )
-        return (
-            mask_a,
-            mask_b,
-            mask_sfa,
-            mask_sfb,
-        )
+        return TmaOperands(a=mask_a, b=mask_b, sfa=mask_sfa, sfb=mask_sfb)
 
     def tmem_column_counts(self) -> tuple[int, int, int]:
         """Return (SFA, SFB, total) TMEM column counts."""
         mma_k_tiles = self.mma_tiler[2] // cute.size(self.tiled_mma.shape_mnk, mode=[2])
-        sfa_cols = self.cta_tile_shape_mnk[0] // 32 * mma_k_tiles
-        sfb_cols = self.cta_tile_shape_mnk_sfb[1] // 32 * mma_k_tiles
+        sfa_cols = (self.cta_tile_shape_mnk[0] // SF_TMEM_ROW_GROUP) * mma_k_tiles
+        sfb_cols = (self.cta_tile_shape_mnk_sfb[1] // SF_TMEM_ROW_GROUP) * mma_k_tiles
         return sfa_cols, sfb_cols, sfa_cols + sfb_cols
 
     def make_tmem_scale_tensors(self, base_ptr, column_offset: int):
@@ -340,13 +376,14 @@ class Mxfp8Mxfp4TmaStaging:
     def make_mma_tmem_sfb(self, base_ptr, column_offset: int, tile_n_idx, tmem_sfb):
         """SFB TMEM view for the MMA of token tile ``tile_n_idx``.
 
-        SFB always moves in 128-row atoms, so for N64 the S2T copy lands
-        the whole atom and the MMA must start at this tile's 32-row group:
-        one TMEM word per 32 rows, as in CUTLASS's dense block-scaled GEMM.
+        SFB always moves in 128-row atoms, so for N64 the copy from shared
+        memory to tensor memory lands the whole atom. The MMA must start at
+        this tile's 32-row group: one TMEM word per 32 rows, as in CUTLASS's
+        dense block-scaled GEMM.
         """
         if cutlass.const_expr(self.mma_tiler[1] == 192):
             # N192: the SFB tile starts at the atom holding the tile's first
-            # row (driver offset); odd tiles start 64 rows into it, i.e. two
+            # row (driver offset). Odd tiles start 64 rows into it, i.e. two
             # TMEM words (as in CUTLASS's dense block-scaled GEMM).
             sfa_cols, _, _ = self.tmem_column_counts()
             shift = (tile_n_idx % cutlass.Int32(2)) * cutlass.Int32(2)
@@ -358,7 +395,7 @@ class Mxfp8Mxfp4TmaStaging:
             return tmem_sfb
         sfa_cols, _, _ = self.tmem_column_counts()
         shift = (tile_n_idx % cutlass.Int32(self.sfb_tiles_per_atom)) * cutlass.Int32(
-            self.mma_tiler[1] // 32
+            self.mma_tiler[1] // SF_TMEM_ROW_GROUP
         )
         shifted = cute.recast_ptr(
             base_ptr + column_offset + sfa_cols + shift, dtype=self.scale_dtype
@@ -411,23 +448,27 @@ class Mxfp8Mxfp4TmaStaging:
         mma_tile_coord_v,
         block_in_cluster_coord_vmnk,
         block_in_cluster_coord_sfb_vmnk,
-    ):
+    ) -> TmaLoadPartitions:
         """Partition all four GMEM/SMEM pairs for the caller's TMA warp."""
         g_a = cute.local_tile(
-            tma_tensor_a, cute.slice_(self.mma_tiler, (None, 0, None)), (None,) * 3
+            tma_tensor_a,
+            cute.slice_(self.mma_tiler, (None, 0, None)),
+            (None, None, None),
         )
         g_b = cute.local_tile(
-            tma_tensor_b, cute.slice_(self.mma_tiler, (0, None, None)), (None,) * 3
+            tma_tensor_b,
+            cute.slice_(self.mma_tiler, (0, None, None)),
+            (None, None, None),
         )
         g_sfa = cute.local_tile(
             tma_tensor_sfa,
             cute.slice_(self.mma_tiler, (None, 0, None)),
-            (None,) * 3,
+            (None, None, None),
         )
         g_sfb = cute.local_tile(
             tma_tensor_sfb,
             cute.slice_(self.mma_tiler_sfb, (0, None, None)),
-            (None,) * 3,
+            (None, None, None),
         )
         thr_mma = self.tiled_mma.get_slice(mma_tile_coord_v)
         thr_mma_sfb = self.tiled_mma_sfb.get_slice(mma_tile_coord_v)
@@ -473,11 +514,15 @@ class Mxfp8Mxfp4TmaStaging:
             cute.group_modes(smem_sfb, 0, 3),
             cute.group_modes(p_sfb, 0, 3),
         )
-        return (
-            *a_pair,
-            *b_pair,
-            *(cute.filter_zeros(t) for t in sfa_pair),
-            *(cute.filter_zeros(t) for t in sfb_pair),
+        return TmaLoadPartitions(
+            smem_a=a_pair[0],
+            global_a=a_pair[1],
+            smem_b=b_pair[0],
+            global_b=b_pair[1],
+            smem_sfa=cute.filter_zeros(sfa_pair[0]),
+            global_sfa=cute.filter_zeros(sfa_pair[1]),
+            smem_sfb=cute.filter_zeros(sfb_pair[0]),
+            global_sfb=cute.filter_zeros(sfb_pair[1]),
         )
 
     def slice_tma_sources(
@@ -488,15 +533,15 @@ class Mxfp8Mxfp4TmaStaging:
         global_sfa: cute.Tensor,
         global_sfb: cute.Tensor,
         tile_mnl,
-    ):
+    ) -> TmaOperands[cute.Tensor]:
         """Select one persistent work tile from partitioned TMA sources.
 
-        The returned tensors retain the RestK pipeline-count mode.  The caller
+        The returned tensors retain the RestK pipeline-count mode. The caller
         indexes it with the producer state's monotonically increasing count.
         """
         tile_m, tile_n, tile_l = tile_mnl
         if cutlass.const_expr(self.cta_group == tcgen05.CtaGroup.TWO):
-            # A/SFA are tiled by the 256-row pair tile; the scheduler's
+            # A/SFA are tiled by the 256-row pair tile. The scheduler's
             # tile_m is the per-CTA 128-row index (2 * pair + v).
             tile_m = tile_m // 2
         sfb_n = tile_n
@@ -504,9 +549,9 @@ class Mxfp8Mxfp4TmaStaging:
             sfb_n = tile_n // 2
         if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 192):
             sfb_n = self.sfb_atom_tile(tile_n)
-        return (
-            global_a[(None, tile_m, None, tile_l)],
-            global_b[(None, tile_n, None, tile_l)],
-            global_sfa[(None, tile_m, None, tile_l)],
-            global_sfb[(None, sfb_n, None, tile_l)],
+        return TmaOperands(
+            a=global_a[(None, tile_m, None, tile_l)],
+            b=global_b[(None, tile_n, None, tile_l)],
+            sfa=global_sfa[(None, tile_m, None, tile_l)],
+            sfb=global_sfb[(None, sfb_n, None, tile_l)],
         )

@@ -36,9 +36,9 @@ def test_b200_reads_fc1_fc2_nibbles_through_explicit_logical_layout() -> None:
 
     experts, hidden, intermediate = 2, 128, 128
 
-    # Physical preprocessing ABI before the transpose is (E,M,K/2).  Use a
+    # Physical preprocessing ABI before the transpose is (E,M,K/2). Use a
     # constant E2M1 code per row/expert so each sampled logical coordinate has
-    # an unambiguous expected value.  FC1 rows 0..7 and 8..15 model the first
+    # an unambiguous expected value. FC1 rows 0..7 and 8..15 model the first
     # gate8/up8 pair produced by preprocessing.
     canonical_fc1_emk = torch.zeros(
         (experts, 2 * intermediate, hidden // 2),
@@ -82,9 +82,9 @@ def test_b200_reads_fc1_fc2_nibbles_through_explicit_logical_layout() -> None:
         @cute.kernel
         def _kernel(self, fc1_logical, fc2_logical, destination):
             if cute.arch.thread_idx()[0] == 0:
-                # CuTe forbids scalar dereference of a sub-byte tensor.  A
+                # CuTe forbids scalar dereference of a sub-byte tensor. A
                 # Uint8 recast pairs logical K=(2j,2j+1), so reading these
-                # bytes still executes and verifies the nibble layout.  The
+                # bytes still executes and verifies the nibble layout. The
                 # row and expert checks prove gate/up-M and L strides.
                 fc1_bytes = cute.recast_tensor(fc1_logical, cutlass.Uint8)
                 fc2_bytes = cute.recast_tensor(fc2_logical, cutlass.Uint8)

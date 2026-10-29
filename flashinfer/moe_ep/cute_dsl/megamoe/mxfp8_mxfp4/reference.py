@@ -3,8 +3,8 @@
 """Independent Torch oracle for MXFP8-activation x MXFP4-weight MegaMoE.
 
 This module intentionally has no dependency on ``kernel_src``, CUTLASS, CuTe
-DSL, or another MegaMoE backend.  It defines the numerical function that the
-SM100 CuTeDSL kernel implements.  Physical scale-factor swizzles and TMA tensor
+DSL, or another MegaMoE backend. It defines the numerical function that the
+SM100 CuTeDSL kernel implements. Physical scale-factor swizzles and TMA tensor
 layouts are outside this contract.
 
 Logical MMA operand convention
@@ -15,9 +15,9 @@ For each expert GEMM the kernel-facing convention is::
     B = MXFP8 activations  (N, K, L), K-major
     C = output             (M, N, L)
 
-where ``L`` selects an expert.  The Torch-facing tensors below put ``L``
+where ``L`` selects an expert. The Torch-facing tensors below put ``L``
 first, use row-major logical weight rows, and express the same operation as
-``B @ A.T``.  Both A and B have one raw E8M0 scale byte per consecutive 32 K
+``B @ A.T``. Both A and B have one raw E8M0 scale byte per consecutive 32 K
 elements.
 
 Numerical boundaries
@@ -26,18 +26,18 @@ Numerical boundaries
   dequantized to FP32 before FC1.
 * MXFP4 weights are E2M1 nibble pairs plus E8M0/K32 and are dequantized to
   FP32 before each GEMM.
-* FC1 GEMM accumulates in FP32.  Its output rows are gate/up interleaved in
-  blocks of 32.  Optional clamping is applied in FP32, followed by
+* FC1 GEMM accumulates in FP32. Its output rows are gate/up interleaved in
+  blocks of 8. Optional clamping is applied in FP32, followed by
   ``up * (gate * sigmoid(gate))`` in FP32.
 * The unweighted SwiGLU result is quantized directly from FP32 to E4M3 plus
   E8M0/K32 (no BF16 rounding first), then dequantized to FP32 for FC2.
 * FC2 accumulates in FP32 and each route term is rounded once to BF16.
-* Routing weights are applied after that BF16 route-term rounding.  Terms are
+* Routing weights are applied after that BF16 route-term rounding. Terms are
   multiplied by FP32 scores and accumulated in increasing top-k slot order in
-  FP32.  The final result is rounded once to BF16.
+  FP32. The final result is rounded once to BF16.
 
-Expert id ``-1`` is the sole masked-route sentinel.  Its per-route term is
-zero and its score is ignored.  Any id below ``-1`` or at least the number of
+Expert id ``-1`` is the sole masked-route sentinel. Its per-route term is
+zero and its score is ignored. Any id below ``-1`` or at least the number of
 experts is an input error.
 """
 
@@ -78,7 +78,7 @@ class MegaMoEReferenceResult:
     """Oracle outputs.
 
     ``route_terms`` has shape ``(rank, token, topk, hidden)`` and contains
-    unweighted BF16 FC2 terms.  Masked routes contain zero.  ``output`` has
+    unweighted BF16 FC2 terms. Masked routes contain zero. ``output`` has
     shape ``(rank, token, hidden)`` and contains the post-routing BF16 result.
     """
 
@@ -97,8 +97,8 @@ def _raw_bytes(tensor: torch.Tensor) -> torch.Tensor:
 def decode_e8m0(scales: torch.Tensor) -> torch.Tensor:
     """Decode raw UE8M0 bytes as ``2 ** (byte - 127)`` in FP32.
 
-    Byte ``0xff`` is the reserved NaN encoding and is rejected.  Byte zero is
-    a valid, extremely small power-of-two scale; all-zero quantization blocks
+    Byte ``0xff`` is the reserved NaN encoding and is rejected. Byte zero is
+    a valid, extremely small power-of-two scale. All-zero quantization blocks
     conventionally use it as well.
     """
 
@@ -149,8 +149,8 @@ def dequantize_mxfp8(data: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
 def quantize_mxfp8(values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize FP32-like values to E4M3 plus raw E8M0/K32.
 
-    The scale is ``ceil_pow2(block_amax / 448)``.  The scaled E4M3 conversion
-    uses Torch's round-to-nearest-even conversion.  No BF16 cast occurs.
+    The scale is ``ceil_pow2(block_amax / 448)``. The scaled E4M3 conversion
+    uses Torch's round-to-nearest-even conversion. No BF16 cast occurs.
     """
 
     if values.ndim < 1 or values.shape[-1] % BLOCK_SIZE:
@@ -193,7 +193,7 @@ def dequantize_mxfp4(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor
 def quantize_mxfp4(values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Reference-quantize rows to packed E2M1 plus raw E8M0/K32.
 
-    E2M1 conversion is saturating round-to-nearest-even.  Even logical K is
+    E2M1 conversion is saturating round-to-nearest-even. Even logical K is
     stored in the low nibble and odd logical K in the high nibble.
     """
 
@@ -209,14 +209,14 @@ def quantize_mxfp4(values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     distance = (normalized.unsqueeze(-1) - lut).abs()
     minimum = distance.amin(dim=-1, keepdim=True)
     ties = distance == minimum
-    # E2M1's mantissa bit is code bit zero.  RTNE chooses a code with that bit
-    # clear at an exact midpoint.  ``argmax`` then selects the unique eligible
+    # E2M1's mantissa bit is code bit zero. RTNE chooses a code with that bit
+    # clear at an exact midpoint. ``argmax`` then selects the unique eligible
     # code (positive zero for an exact zero).
     even_code = (torch.arange(16, device=fp32.device, dtype=torch.int64) & 1) == 0
     prefer_even = ties & even_code
     candidates = torch.where(prefer_even.any(dim=-1, keepdim=True), prefer_even, ties)
     codes = candidates.to(torch.int64).argmax(dim=-1).to(torch.uint8)
-    # Preserve the sign of a value that rounds to zero.  E2M1 has distinct
+    # Preserve the sign of a value that rounds to zero. E2M1 has distinct
     # positive/negative-zero encodings and hardware RTNE preserves that sign.
     codes = torch.where(
         (codes == 0) & torch.signbit(normalized),
@@ -332,15 +332,15 @@ def compute_reference(
 
     Shapes are:
 
-    * ``input_q``: ``(R, T, H)`` E4M3; ``input_scale``: ``(R,T,H/32)``.
+    * ``input_q``: ``(R, T, H)`` E4M3. ``input_scale``: ``(R,T,H/32)``.
     * ``topk_ids`` and ``topk_weights``: ``(R, T, Ktop)``.
-    * ``w13_packed``: ``(E, 2I, H/2)`` packed E2M1.  Its output rows use
-      alternating 8-row gate/up blocks.  ``w13_scale`` is ``(E,2I,H/32)``.
-    * ``w2_packed``: ``(E, H, I/2)`` packed E2M1; ``w2_scale`` is
+    * ``w13_packed``: ``(E, 2I, H/2)`` packed E2M1. Its output rows use
+      alternating 8-row gate/up blocks. ``w13_scale`` is ``(E,2I,H/32)``.
+    * ``w2_packed``: ``(E, H, I/2)`` packed E2M1. ``w2_scale`` is
       ``(E,H,I/32)``.
 
     In MMA notation, each weight tensor is logical A ``(M,K,L)`` and gathered
-    tokens are logical B ``(N,K,L)``.  Packing halves only the stored K extent.
+    tokens are logical B ``(N,K,L)``. Packing halves only the stored K extent.
     """
 
     ranks, tokens, topk, experts, hidden, _intermediate = _validate_problem(

@@ -11,8 +11,6 @@ from flashinfer.autotuner import (
     AutoTuner,
     TunableRunner,
     TuningConfig,
-    get_autotune_process_group,
-    set_autotune_process_group,
 )
 
 from .integration import _launch_spec, _tactic_key, mxfp8_mxfp4_mega_moe
@@ -46,7 +44,9 @@ class Mxfp8Mxfp4MegaMoeRunner(TunableRunner):
         self.fallback = _tactic_key(workspace.resolve({}))
         if candidates is None:
             candidates = candidate_tactics(
-                hidden=workspace.hidden, intermediate=workspace.intermediate
+                hidden=workspace.hidden,
+                intermediate=workspace.intermediate,
+                max_tokens_per_rank=workspace.max_tokens_per_rank,
             )
         kept, dropped = [], []
         for candidate in candidates:
@@ -154,6 +154,33 @@ def _agree(value, group, description):
         raise RuntimeError(f"MXFP8 x MXFP4 autotune ranks disagree on {description}")
 
 
+def _collective_call(function, group, description):
+    """Agree on host-side failure before any rank advances or rolls back.
+
+    As with tactic preparation, interrupts participate in the handshake before
+    propagating. The function must itself preserve collective cardinality.
+    """
+    result, error = None, None
+    try:
+        result = function()
+    except BaseException as exc:
+        error = exc
+    report = None
+    if error is not None:
+        # Bound peer diagnostics while preserving the original local exception.
+        report = f"{type(error).__name__}: {error}"
+        if len(report) > 512:
+            report = report[:509] + "..."
+    reports = _gather(report, group)
+    if any(report is not None for report in reports):
+        if error is not None:
+            raise error
+        raise RuntimeError(
+            f"MXFP8 x MXFP4 autotune {description} failed on a peer: {reports}"
+        )
+    return result
+
+
 def select_tactic(
     fc1,
     fc2,
@@ -169,7 +196,7 @@ def select_tactic(
     """Collectively choose/apply a tactic, or only look it up outside autotune.
 
     Called eagerly once per backend workspace. The compatibility API enters
-    ``autotune(True)`` around this call; a normal backend call inherits the
+    ``autotune(True)`` around this call. A normal backend call inherits the
     caller's tuning context. No allocation or collective enters the hot path.
     """
     from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.comm import (
@@ -181,13 +208,16 @@ def select_tactic(
     if workspace.world_size > 1:
         import torch.distributed as dist
 
-        # The native workspace currently uses the bootstrapped WORLD domain
-        # for allocation, peer offsets, and apply_knobs barriers as well.
-        if not dist.is_initialized() or dist.get_world_size() != workspace.world_size:
+        group = workspace.process_group
+        if (
+            not dist.is_initialized()
+            or group is None
+            or dist.get_world_size(group) != workspace.world_size
+            or dist.get_rank(group) != workspace.rank
+        ):
             raise RuntimeError(
                 "MXFP8 x MXFP4 workspace must match the EP process group"
             )
-        group = dist.group.WORLD
 
     # Agree on errors before entering any preparation that contains barriers.
     runner, error = None, None
@@ -226,67 +256,66 @@ def select_tactic(
         rank_reduction="max",
     )
     tuner = AutoTuner.get()
-    # Match choose_one's effective config for the preflight cache decision.
-    # Hold the tuner lock through selection and restoring the process group.
-    with tuner._lock:
-        config = tuner._apply_tuning_overrides(config)
-        if tuner._effective_measure_policy is not None:
-            config = tuner._apply_measure_policy(
-                config, tuner._effective_measure_policy
+    with tuner.collective_session(group):
+
+        def preflight():
+            return tuner.selection_preflight(
+                CUSTOM_OP, runner, config, inputs, tactics=runner.tactics
             )
-        previous_group = get_autotune_process_group()
-        set_autotune_process_group(group)
+
+        state = _collective_call(preflight, group, "preflight")
+        original = dict(workspace.tactic)
+        was_autotuned = workspace.is_autotuned
+        _agree(
+            (
+                runner.get_cache_key_extras(inputs),
+                tuple(tuple(t.shape) for t in inputs),
+                runner.fallback,
+                _tactic_key(original),
+                was_autotuned,
+                state,
+                workspace.workspace_bytes.numel(),
+                workspace.shared_workspace_bytes.numel(),
+            ),
+            group,
+            "candidates, cache, workspace, or profiling policy",
+        )
+        # From here all ranks enter the same transaction. Any failure after
+        # mutation is agreed before restoring, including cache/export failures.
+        workspace.clear_autotune_selection()
         try:
-            shapes = tuple(tuple(t.shape) for t in inputs)
-            cache_hit = tuner.search_cache(
-                CUSTOM_OP, [runner], shapes, config, inputs=inputs
-            )
-            allowed = tuner._blocklist.filter(CUSTOM_OP, runner, list(runner.tactics))
-            skipped = CUSTOM_OP in tuner._effective_skip_ops
-            _agree(
-                (
-                    runner.get_cache_key_extras(inputs),
-                    shapes,
-                    runner.fallback,
-                    _tactic_key(workspace.tactic),
-                    tuple(allowed),
-                    cache_hit[:3],
-                    tuner.is_tuning_mode,
-                    skipped,
-                    config,
-                    tuner._effective_measure_policy,
-                    tuner._in_v2_context,
-                    workspace.workspace_bytes.numel(),
-                    workspace.shared_workspace_bytes.numel(),
-                ),
+            _, tactic = _collective_call(
+                lambda: tuner.choose_one(CUSTOM_OP, [runner], state.config, inputs),
                 group,
-                "candidates, cache, workspace, or profiling policy",
+                "selection",
             )
-            workspace._autotune_selected = False
-            _, tactic = tuner.choose_one(CUSTOM_OP, [runner], config, inputs)
-            hit = tuner.search_cache(
-                CUSTOM_OP, [runner], shapes, config, inputs=inputs
-            )[0]
-            if tuner.is_tuning_mode and not skipped and not hit:
+            selected = _collective_call(preflight, group, "selected cache lookup")
+            _agree(selected, group, "selected cache state")
+            if state.is_tuning and not state.skipped and not selected.cache_hit:
                 raise RuntimeError(
                     "MXFP8 x MXFP4 autotune: every candidate failed or preparation ran out of memory"
                 )
-            if not hit or skipped:
-                # With no general result, retain the legacy cache/default
-                # resolved before allocation. A measured v2 -1 winner instead
-                # means the deterministic default recorded in cache extras.
-                tactic = _tactic_key(workspace.tactic)
+            if not selected.cache_hit or state.skipped:
+                # Retain the pre-sweep legacy/default tactic on a cache miss.
+                tactic = _tactic_key(original)
             _agree(tactic, group, "winning tactic")
-            # The last profiled tactic need not be the winner. Rebind even on
-            # cache hits, and use the same pre-launch failure handshake.
-            tuner._prepare_tactic(runner, inputs, tactic)
+            tuner.prepare_selected_tactic(runner, inputs, tactic)
             winner = dict(runner.fallback if tactic == -1 else tactic)
-            workspace._autotune_selected = True
-            if tuner.is_tuning_mode and not skipped and workspace.rank == 0:
-                _export_legacy_winner(workspace, winner)
+            if state.is_tuning and not state.skipped:
+                _collective_call(
+                    lambda: _export_legacy_winner(workspace, winner)
+                    if workspace.rank == 0
+                    else None,
+                    group,
+                    "compatibility cache export",
+                )
+            workspace.mark_autotuned()
             return winner
-        finally:
-            set_autotune_process_group(previous_group)
+        except BaseException:
+            # Force reset even on ranks already at the original tactic: peers
+            # may have stopped on another layout and must see equal barriers.
+            workspace.restore_tactic(original, autotuned=was_autotuned)
+            raise
 
 
 def _export_legacy_winner(workspace, winner):

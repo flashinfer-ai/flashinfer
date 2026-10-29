@@ -1,26 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared storage and pipeline assembly for the persistent SM100 kernel.
+"""Per-CTA control storage and pipelines for persistent MXFP8 x MXFP4 MegaMoE.
 
-This module is the single owner of per-CTA control storage and pipeline
-construction for the native MXFP8 x MXFP4 MegaMoE kernel.  It deliberately
-does not issue TMA or MMA instructions and it does not choose work records;
-those responsibilities remain in :mod:`scale_tma_staging`,
-:mod:`dynamic_mainloop`, and :mod:`device_scheduler` respectively.
+TMA, MMA issue, and scheduling belong to :mod:`scale_tma_staging`,
+:mod:`dynamic_mainloop`, and :mod:`device_scheduler`.
 
-The supported bring-up geometry is the native one-CTA M128 instruction.  A
-cluster may still contain multiple one-CTA instructions for multicast and
-persistent scheduling; ``one-CTA`` here means that no two CTAs jointly own a
-single tcgen05 instruction or TMEM allocation.
+``PersistentMxfp8Mxfp4Epilogue`` owns accumulator stage count, TMEM extent,
+consumer population, and retirement. The driver must call
+:meth:`run_epilogue` instead of adding another accumulator consumer.
 
-``PersistentMxfp8Mxfp4Epilogue`` is autonomous.  Consequently it is the
-authority for accumulator stage count, TMEM accumulator extent, pipeline
-consumer population, and accumulator retirement.  The driver must call
-:meth:`run_epilogue` rather than constructing another accumulator consumer.
-
-Do not add ``from __future__ import annotations`` to this file.  ``@cute.struct``
-reads live annotation objects when the storage type is created.
+Do not enable postponed annotations here. ``@cute.struct`` requires live
+annotation objects when constructing storage types.
 """
 
 from dataclasses import dataclass
@@ -36,11 +27,20 @@ from .device_epilogue import (
     EXCHANGE_BARRIER_IDS,
     PersistentMxfp8Mxfp4Epilogue,
 )
-from .device_scheduler import DeviceSchedulerParams, PersistentDeviceScheduler
+from .device_scheduler import (
+    DeviceSchedulerConsumer,
+    DeviceSchedulerParams,
+    PersistentDeviceScheduler,
+)
 from .dispatch import Mxfp8DispatchPhase
 from .fc2_store import fc2_exchange_words
 from .scale_tma_staging import Mxfp8Mxfp4TmaStaging
-from .stage_fit import MX_BLOCK_SIZE, OperandStageBytes, StageFit
+from .stage_fit import (
+    MX_BLOCK_SIZE,
+    SM100_TMEM_CAPACITY_COLUMNS,
+    OperandStageBytes,
+    StageFit,
+)
 
 
 WARP_SIZE = 32
@@ -50,7 +50,7 @@ WARP_SIZE = 32
 class KernelWarpIds:
     """Stable warp ownership used by the persistent driver.
 
-    The numbering matches the proven W4A4 persistent orchestration.  Keeping
+    The numbering matches the proven W4A4 persistent orchestration. Keeping
     it here prevents the scheduler, dispatch phase, and TMEM allocator from
     silently using different populations.
     """
@@ -73,8 +73,8 @@ class KernelWarpIds:
         )
         if len(self.epilogue) not in (4, 8):
             raise ValueError("the autonomous epilogue requires four or eight warps")
-        if len(self.dispatch) not in (0, 4):
-            raise ValueError("lean uses zero dispatch warps; mega uses four")
+        if len(self.dispatch) != 4:
+            raise ValueError("MegaMoE requires four dispatch warps")
         if min(all_ids) < 0 or len(set(all_ids)) != len(all_ids):
             raise ValueError("kernel warp IDs must be distinct non-negative values")
         if tuple(sorted(all_ids)) != tuple(range(max(all_ids) + 1)):
@@ -86,20 +86,24 @@ class KernelWarpIds:
         if (
             self.epilogue != expected_epilogue
             or (self.mma, self.tma_a, self.tma_b, self.scheduler) != (4, 5, 6, 7)
-            or self.dispatch not in ((), (8, 9, 10, 11))
+            or self.dispatch != (8, 9, 10, 11)
         ):
             raise ValueError("warp roles must preserve the role-pure warpgroup layout")
 
     @classmethod
-    def for_epilogue(cls, epilogue_warps: int, *, mega: bool = True) -> "KernelWarpIds":
+    def for_epilogue(cls, epilogue_warps: int) -> "KernelWarpIds":
         """Append a role-pure epilogue warpgroup after the existing roles."""
         if epilogue_warps not in (4, 8):
             raise ValueError("epilogue_warps must be 4 or 8")
-        start = 12 if mega else 8
+        start = 12
         epilogue: Tuple[int, ...] = (0, 1, 2, 3)
         if epilogue_warps == 8:
             epilogue += tuple(range(start, start + 4))
-        return cls(epilogue=epilogue, dispatch=(8, 9, 10, 11) if mega else ())
+        return cls(epilogue=epilogue)
+
+    @property
+    def num_non_dispatch_warps(self) -> int:
+        return len((*self.epilogue, self.mma, self.tma_a, self.tma_b, self.scheduler))
 
     @property
     def threads_per_cta(self) -> int:
@@ -122,34 +126,34 @@ class KernelWarpIds:
 class OperandSmem:
     """The four staged operands allocated after the control struct."""
 
-    weight: Any
-    activation: Any
-    weight_scale: Any
-    activation_scale: Any
+    weight: cute.Tensor
+    activation: cute.Tensor
+    weight_scale: cute.Tensor
+    activation_scale: cute.Tensor
 
 
 @dataclass(frozen=True)
 class MainloopPipelines:
     """Shared A/B TMA-UMMA stage ring plus the accumulator pipeline."""
 
-    ab_pipeline: Any
-    ab_producer: Any
-    ab_consumer: Any
-    accumulator: Any
+    ab_pipeline: pipeline.PipelineTmaUmma
+    ab_producer: pipeline.PipelineProducer
+    ab_consumer: pipeline.PipelineConsumer
+    accumulator: pipeline.PipelineUmmaAsync
 
 
 @dataclass(frozen=True)
 class SchedulerBundle:
     """The scheduler-warp producer and a fresh mainloop consumer."""
 
-    scheduler: Any
-    consumer: Any
+    scheduler: PersistentDeviceScheduler
+    consumer: DeviceSchedulerConsumer
 
 
 class KernelPipelines:
     """Assemble shared storage, mainloop pipelines, scheduler, and TMEM.
 
-    Parameters are compile-time objects.  ``scheduler_params`` may contain
+    Parameters are compile-time objects. ``scheduler_params`` may contain
     device values, but its storage shape (mode and number of stages) must be
     fixed before tracing the kernel.
     """
@@ -159,48 +163,34 @@ class KernelPipelines:
         *,
         staging: Mxfp8Mxfp4TmaStaging,
         scheduler_params: DeviceSchedulerParams,
-        dispatch_phase: Optional[Mxfp8DispatchPhase],
+        dispatch_phase: Mxfp8DispatchPhase,
         epilogue: PersistentMxfp8Mxfp4Epilogue,
         warp_ids: Optional[KernelWarpIds] = None,
         tmem_alloc_barrier_id: int = 2,
     ) -> None:
         if warp_ids is None:
-            warp_ids = KernelWarpIds.for_epilogue(
-                epilogue.config.epilogue_warps, mega=dispatch_phase is not None
-            )
+            warp_ids = KernelWarpIds.for_epilogue(epilogue.config.epilogue_warps)
         if len(warp_ids.epilogue) != epilogue.config.epilogue_warps:
             raise ValueError("epilogue and KernelWarpIds disagree on warp count")
-        if (dispatch_phase is None) != (not warp_ids.dispatch):
-            raise ValueError("dispatch warp population must match communication mode")
         self.validate_mma_tiler_mn(staging.mma_tiler_mn)
         self.two_cta = staging.cta_group == tcgen05.CtaGroup.TWO
         if self.two_cta and tuple(staging.cluster_shape_mn) != (2, 1):
             raise ValueError("2-CTA MMA requires a (2, 1) cluster")
-        if staging.sf_vec_size != 32:
+        if staging.sf_vec_size != MX_BLOCK_SIZE:
             raise ValueError("MXFP8 x MXFP4 pipelines require block-32 scaling")
         if epilogue.config.cta_tile_features != staging.cta_tile_shape_mnk[0]:
             raise ValueError("epilogue feature tile must match the staging CTA tile")
         if epilogue.config.cta_tile_tokens != staging.cta_tile_shape_mnk[1]:
             raise ValueError("epilogue token tile must match the staging CTA tile")
-        if dispatch_phase is not None and tuple(
-            dispatch_phase.cluster_shape_mn
-        ) != tuple(staging.cluster_shape_mn):
+        if tuple(dispatch_phase.cluster_shape_mn) != tuple(staging.cluster_shape_mn):
             raise ValueError("dispatch and TMA staging must use the same cluster shape")
-        if (
-            dispatch_phase is not None
-            and dispatch_phase.dispatch_warp_start != warp_ids.dispatch[0]
-        ):
+        if dispatch_phase.dispatch_warp_start != warp_ids.dispatch[0]:
             raise ValueError("dispatch_warp_start must match KernelWarpIds.dispatch")
-        if dispatch_phase is not None and dispatch_phase.num_dispatch_warps != len(
-            warp_ids.dispatch
-        ):
+        if dispatch_phase.num_dispatch_warps != len(warp_ids.dispatch):
             raise ValueError("dispatch phase and KernelWarpIds disagree on warp count")
         # MMA, TMA-A, TMA-B, and scheduler join the epilogue warps.
-        expected_other_warps = len(warp_ids.epilogue) + 4
-        if (
-            dispatch_phase is not None
-            and dispatch_phase.num_other_warps != expected_other_warps
-        ):
+        expected_other_warps = warp_ids.num_non_dispatch_warps
+        if dispatch_phase.num_other_warps != expected_other_warps:
             raise ValueError(
                 "dispatch num_other_warps must count epilogue, MMA, both TMA, "
                 "and scheduler warps"
@@ -230,10 +220,10 @@ class KernelPipelines:
         _, _, self.num_scale_tmem_cols = staging.tmem_column_counts()
         required_tmem_cols = self.num_accumulator_tmem_cols + self.num_scale_tmem_cols
         # tcgen05.alloc accepts only a power-of-two multiple of 32 columns.
-        # Scale tensors still start immediately after the accumulator; the
+        # Scale tensors still start immediately after the accumulator. The
         # remaining tail is intentional allocation padding.
         self.num_tmem_cols = max(32, 1 << (required_tmem_cols - 1).bit_length())
-        if self.num_tmem_cols > 512:
+        if self.num_tmem_cols > SM100_TMEM_CAPACITY_COLUMNS:
             raise ValueError(
                 f"persistent kernel requires {required_tmem_cols} TMEM columns; "
                 "the rounded allocation exceeds the 512-column limit"
@@ -243,12 +233,7 @@ class KernelPipelines:
 
     @staticmethod
     def validate_mma_tiler_mn(mma_tiler_mn: Tuple[int, int]) -> None:
-        """Reject unsupported geometry before constructing CuTe layouts.
-
-        ``Mxfp8Mxfp4TmaStaging`` requires an active MLIR context.  Launchers
-        use this host-only guard first so an M256 tactic fails clearly rather
-        than entering CuTe tracing and constructing a two-CTA MMA.
-        """
+        """Reject unsupported geometry before constructing CuTe layouts."""
 
         if len(mma_tiler_mn) != 2 or mma_tiler_mn[0] not in (128, 256):
             raise ValueError(
@@ -264,7 +249,7 @@ class KernelPipelines:
 
         Operand stage tensors are intentionally not fields of this struct:
         their swizzled layouts are allocated by :meth:`allocate_operand_smem`
-        immediately afterwards.  All barrier and publication storage is here.
+        immediately afterwards. All barrier and publication storage is here.
         """
 
         if self._shared_storage_type is None:
@@ -283,13 +268,13 @@ class KernelPipelines:
         num_ab_stages: int,
         num_acc_stages: int,
         scheduler_params: Any,
-        dispatch_phase: Optional[Mxfp8DispatchPhase],
+        dispatch_phase: Mxfp8DispatchPhase,
         epilogue_warps: int = EPILOGUE_WARPS,
     ) -> type:
         """Compose the control-storage struct for a given operand stage count.
 
         Shared by the kernel and :func:`fit_operand_stages`, so the stage fit
-        sizes exactly the struct the kernel allocates.  Only
+        sizes exactly the struct the kernel allocates. Only
         ``scheduler_params.num_stages`` and ``load_balance_mode`` shape the
         scheduler storage, and no MLIR context is required.
         """
@@ -299,26 +284,8 @@ class KernelPipelines:
         )
         num_operand_barriers = num_ab_stages * 2
         num_acc_barriers = num_acc_stages * 2
-        if epilogue_warps not in (4, 8):
-            raise ValueError("epilogue_warps must be 4 or 8")
         exchange_words = fc2_exchange_words(epilogue_warps)
         exchange_alignment = 16
-
-        if dispatch_phase is None:
-
-            @cute.struct
-            class LeanSharedStorage:
-                ab_full_mbar: cute.struct.MemRange[cutlass.Int64, num_operand_barriers]
-                acc_full_mbar: cute.struct.MemRange[cutlass.Int64, num_acc_barriers]
-                scheduler: SchedulerStorage  # type: ignore[valid-type]
-                epilogue_exchange: cute.struct.Align[
-                    cute.struct.MemRange[cutlass.Float32, exchange_words],
-                    exchange_alignment,
-                ]
-                tmem_dealloc_mbar: cutlass.Int64
-                tmem_holding_buf: cutlass.Int32
-
-            return LeanSharedStorage
 
         DispatchStorage = dispatch_phase.shared_storage_type()
 
@@ -343,24 +310,24 @@ class KernelPipelines:
         weight = smem.allocate_tensor(
             element_type=self.staging.weight_smem_dtype,
             layout=self.staging.weight_smem_layout.outer,
-            byte_alignment=128,
+            byte_alignment=_OPERAND_SMEM_ALIGNMENT,
             swizzle=self.staging.weight_smem_layout.inner,
         )
         activation = smem.allocate_tensor(
             element_type=self.staging.activation_dtype,
             layout=self.staging.activation_smem_layout.outer,
-            byte_alignment=128,
+            byte_alignment=_OPERAND_SMEM_ALIGNMENT,
             swizzle=self.staging.activation_smem_layout.inner,
         )
         weight_scale = smem.allocate_tensor(
             element_type=self.staging.scale_dtype,
             layout=self.staging.sfa_smem_layout,
-            byte_alignment=128,
+            byte_alignment=_OPERAND_SMEM_ALIGNMENT,
         )
         activation_scale = smem.allocate_tensor(
             element_type=self.staging.scale_dtype,
             layout=self.staging.sfb_smem_layout,
-            byte_alignment=128,
+            byte_alignment=_OPERAND_SMEM_ALIGNMENT,
         )
         return OperandSmem(weight, activation, weight_scale, activation_scale)
 
@@ -396,9 +363,8 @@ class KernelPipelines:
             cta_layout_vmnk=self.staging.cluster_layout_vmnk,
             defer_sync=True,
         )
-        # Participant state is staged SSA.  Construct both participants once,
-        # before warp-role divergence, and carry that state through the entire
-        # persistent loop exactly as the proven MegaMoE kernel does.
+        # Create both participants before warps split into their roles. Carry
+        # their pipeline state through the entire persistent loop.
         ab_producer, ab_consumer = ab_pipeline.make_participants()
         return MainloopPipelines(ab_pipeline, ab_producer, ab_consumer, acc_pipeline)
 
@@ -468,7 +434,7 @@ class KernelPipelines:
         """Delegate the complete accumulator consumer lifecycle.
 
         The explicit pipeline/consumer names keep the driver from passing an
-        AB participant or scheduler producer by accident.  Remaining keyword
+        AB participant or scheduler producer by accident. Remaining keyword
         arguments are the numerical/output tensors owned by the epilogue API.
         """
 
@@ -489,13 +455,13 @@ def mma_operand_stage_bytes(mma_tiler_mnk: Tuple[int, int, int]) -> OperandStage
 
     FP4 weights occupy 8-bit shared-memory containers for the mixed-kind MMA,
     activations are FP8, and each operand carries one E8M0 byte per 32 K
-    elements.  ``tests/moe_ep/test_mxfp8_mxfp4_kernel_pipelines.py`` checks these figures against
+    elements. ``tests/moe_ep/test_mxfp8_mxfp4_kernel_pipelines.py`` checks these figures against
     :meth:`Mxfp8Mxfp4TmaStaging.operand_stage_bytes` inside a trace.
     """
 
     m, n, k = mma_tiler_mnk
     # A 2-CTA (M256) MMA splits both operands across the pair: each CTA
-    # stages its own 128 weight rows and half of the token tile.  SFB is
+    # stages its own 128 weight rows and half of the token tile. SFB is
     # staged whole in each CTA (1-CTA SFB view).
     cta_m, cta_n = (m // 2, n // 2) if m == 256 else (m, n)
     return OperandStageBytes(
@@ -511,7 +477,7 @@ def fit_operand_stages(
     *,
     mma_tiler_mnk: Tuple[int, int, int],
     scheduler_params: Any,
-    dispatch_phase: Optional[Mxfp8DispatchPhase],
+    dispatch_phase: Mxfp8DispatchPhase,
     smem_capacity_bytes: int,
     num_acc_stages: int = 2,
     minimum_stages: int = 2,

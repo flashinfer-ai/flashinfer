@@ -1,17 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Typed device views over the opaque MegaMoE workspaces.
+"""Zero-copy Torch views over the workspace regions defined in :mod:`workspace`.
 
-``workspace.py`` is the sole owner of byte offsets and extents.  This module
-only validates an allocation against that plan and turns each declared region
-into a zero-copy Torch view.  CuTe conversion is deliberately lazy so importing
-the workspace/frontend path on a CPU-only host does not import CUTLASS or CuTe.
+Validate allocations against that plan. Lazy CuTe conversion keeps imports
+safe on CPU-only hosts.
 
-Single-rank dispatch uses ``expert_send_count`` as its expert-count vector.
-There is intentionally no fabricated expert-offset allocation: the persistent
-scheduler derives the padded data, scale, and token-block prefixes from those
-counts, just as the host scheduler model does.
+Single-rank dispatch uses ``expert_send_count`` as its count vector.
+The scheduler derives padded data, scale, and token-block prefixes directly,
+matching the host model without a separate offsets allocation.
 """
 
 from __future__ import annotations
@@ -21,13 +18,19 @@ from typing import Any, Mapping, Sequence
 
 import torch
 
-from .workspace import RegionLayout, RegionSpec, WorkspacePlan, round_up
+from .workspace import (
+    SF_BYTES_PER_UINT32,
+    RegionLayout,
+    RegionSpec,
+    WorkspacePlan,
+    round_up,
+)
 
 
 SCHEDULER_COUNTER_REGIONS = {
-    # Dispatch publishes token arrivals here; FC1 scheduler records wait on it.
+    # Dispatch publishes token arrivals here. FC1 scheduler records wait on it.
     "fc1_ready_counters": "l1_arrival_count",
-    # FC1 epilogues publish completed handoff tiles here; FC2 waits on it.
+    # FC1 epilogues publish completed handoff tiles here. FC2 waits on it.
     "fc2_ready_counters": "fc1_done_counter",
 }
 
@@ -104,9 +107,7 @@ class ExpertPoolOffsets:
 class DeviceWorkspacePartition:
     """Zero-copy Torch/CuTe views for one workspace plan.
 
-    ``shared_workspace`` remains optional during single-rank bring-up because
-    the current integration allocates only the local pool.  Passing it enables
-    the shared-region views without changing any local offsets.
+    Omit ``shared_workspace`` when only local-region views are needed.
     """
 
     def __init__(
@@ -152,8 +153,8 @@ class DeviceWorkspacePartition:
             else {}
         )
 
-        # Semantic views used by dispatch/scheduler code.  These aliases are
-        # still backed by declared workspace bytes; none creates storage.
+        # Semantic views used by dispatch/scheduler code. These aliases are
+        # still backed by declared workspace bytes. None creates storage.
         self.expert_counts = self.local["expert_send_count"]
         self.expert_recv_count = self.shared.get("expert_recv_count")
         self.expert_recv_count_sum = self.shared.get(
@@ -169,7 +170,7 @@ class DeviceWorkspacePartition:
         self.token_metadata_i64 = self.token_metadata.view(torch.int64).reshape(-1)
 
         sf_bytes = self.local["l1_sf_buffer"].view(torch.uint8)
-        sf_cols = config.sf_uint32_per_token * 4
+        sf_cols = config.sf_uint32_per_token * SF_BYTES_PER_UINT32
         sf_dtype = _torch_dtype(plan.local.region("fc1_output_sf").spec)
         self.activation_scales = sf_bytes.view(sf_dtype).reshape(
             config.pool_sf_capacity, sf_cols
@@ -290,7 +291,7 @@ class DeviceWorkspacePartition:
         return ExpertPoolOffsets(tuple(data), tuple(scales), tuple(blocks))
 
     def to_cute(self) -> dict[str, Any]:
-        """Convert every Torch view lazily; CuTe is never imported at module load."""
+        """Convert every Torch view lazily. CuTe is never imported at module load."""
 
         if self.local_workspace.device.type != "cuda":
             raise ValueError("CuTe views require CUDA workspace tensors")

@@ -14,6 +14,9 @@ if TYPE_CHECKING:
 
 
 MXFP4_BLOCK_SIZE = 32
+MXFP4_VALUES_PER_BYTE = 2
+GATE_UP_PROJECTIONS = 2
+GATE_UP_INTERLEAVE_ROWS = 8
 
 TransformedMegaWeights = Tuple[
     Tuple["torch.Tensor", "torch.Tensor"],
@@ -54,18 +57,22 @@ def _interleave_gate_up_8(
 
     if intermediate_size % MXFP4_BLOCK_SIZE:
         raise ValueError("MXFP4 MegaMoE requires intermediate_size divisible by 32")
-    if tensor.ndim != 3 or tensor.shape[1] != 2 * intermediate_size:
+    if tensor.ndim != 3 or tensor.shape[1] != GATE_UP_PROJECTIONS * intermediate_size:
         raise ValueError(
-            f"expected FC1 shape (experts, {2 * intermediate_size}, ...), "
+            f"expected FC1 shape (experts, {GATE_UP_PROJECTIONS * intermediate_size}, ...), "
             f"got {tuple(tensor.shape)}"
         )
     gate = tensor[:, :intermediate_size].contiguous()
     up = tensor[:, intermediate_size:].contiguous()
-    blocks = intermediate_size // 8
+    num_experts, _, columns = tensor.shape
+    blocks = intermediate_size // GATE_UP_INTERLEAVE_ROWS
+    block_shape = (num_experts, blocks, GATE_UP_INTERLEAVE_ROWS, columns)
     out = tensor.new_empty(tensor.shape)
-    out_view = out.view(tensor.shape[0], blocks, 2, 8, tensor.shape[2])
-    out_view[:, :, 0].copy_(gate.view(tensor.shape[0], blocks, 8, tensor.shape[2]))
-    out_view[:, :, 1].copy_(up.view(tensor.shape[0], blocks, 8, tensor.shape[2]))
+    out_view = out.view(
+        num_experts, blocks, GATE_UP_PROJECTIONS, GATE_UP_INTERLEAVE_ROWS, columns
+    )
+    out_view[:, :, 0].copy_(gate.view(block_shape))
+    out_view[:, :, 1].copy_(up.view(block_shape))
     return out.contiguous()
 
 
@@ -131,10 +138,10 @@ def preprocess_mega_weights(
 ) -> TransformedMegaWeights:
     """Build K-major packed weights and atom-swizzled UE8M0 scale planes.
 
-    Canonical input is BF16 ``w13[E,2I,H]`` / ``w2[E,H,I]``.  A
+    Canonical input is BF16 ``w13[E,2I,H]`` / ``w2[E,H,I]``. A
     :class:`PrequantizedMoEWeights` instead carries packed E2M1 data in those
     same logical layouts (with the K dimension halved) and unswizzled uint8
-    UE8M0 scales.  Quantized bytes are consumed verbatim.
+    UE8M0 scales. Quantized bytes are consumed verbatim.
     """
 
     import torch
@@ -145,11 +152,15 @@ def preprocess_mega_weights(
         )
 
     num_experts = weights.w13.shape[0]
-    fc1_out = 2 * intermediate_size
+    fc1_out = GATE_UP_PROJECTIONS * intermediate_size
     logical_w13_shape = (num_experts, fc1_out, hidden_size)
     logical_w2_shape = (num_experts, hidden_size, intermediate_size)
-    packed_w13_shape = (num_experts, fc1_out, hidden_size // 2)
-    packed_w2_shape = (num_experts, hidden_size, intermediate_size // 2)
+    packed_w13_shape = (num_experts, fc1_out, hidden_size // MXFP4_VALUES_PER_BYTE)
+    packed_w2_shape = (
+        num_experts,
+        hidden_size,
+        intermediate_size // MXFP4_VALUES_PER_BYTE,
+    )
     w13_sf_shape = (num_experts, fc1_out, hidden_size // MXFP4_BLOCK_SIZE)
     w2_sf_shape = (
         num_experts,
@@ -262,7 +273,7 @@ def validate_transformed_mega_weights(
     if world_size <= 0 or num_experts % world_size:
         raise MoEEpConfigError("num_experts must be divisible by positive world_size")
     local_experts = num_experts // world_size
-    fc1_out = 2 * intermediate_size
+    fc1_out = GATE_UP_PROJECTIONS * intermediate_size
     fc1_sf = _swizzled_flat_sf_size(fc1_out, hidden_size // MXFP4_BLOCK_SIZE)
     fc2_sf = _swizzled_flat_sf_size(hidden_size, intermediate_size // MXFP4_BLOCK_SIZE)
     weight_dtype = _kernel_fp4_dtype()
@@ -273,7 +284,11 @@ def validate_transformed_mega_weights(
         label="fc1",
         num_local_experts=local_experts,
         weight_dtype=weight_dtype,
-        expected_weight_shape=(local_experts, hidden_size // 2, fc1_out),
+        expected_weight_shape=(
+            local_experts,
+            hidden_size // MXFP4_VALUES_PER_BYTE,
+            fc1_out,
+        ),
         scale_dtype=torch.uint8,
         expected_scale_shape=(local_experts, fc1_sf),
     )
@@ -282,7 +297,11 @@ def validate_transformed_mega_weights(
         label="fc2",
         num_local_experts=local_experts,
         weight_dtype=weight_dtype,
-        expected_weight_shape=(local_experts, intermediate_size // 2, hidden_size),
+        expected_weight_shape=(
+            local_experts,
+            intermediate_size // MXFP4_VALUES_PER_BYTE,
+            hidden_size,
+        ),
         scale_dtype=torch.uint8,
         expected_scale_shape=(local_experts, fc2_sf),
     )

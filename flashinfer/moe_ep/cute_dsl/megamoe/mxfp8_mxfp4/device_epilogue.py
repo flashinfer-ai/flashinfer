@@ -1,26 +1,23 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Autonomous persistent epilogue for MXFP8 x MXFP4 MegaMoE.
+"""Persistent epilogue for MXFP8 x MXFP4 MegaMoE.
 
-The swap-AB MMA leaves feature rows and token columns in TMEM. FC1's
-16dp256b loads match the gate8/up8 weight interleave, so each lane computes
-SwiGLU directly without transposing or exchanging gate/up values. Only K32
-block maxima cross lanes and paired warps. FC2 uses the same native loads
-with a shared-memory BF16 transpose and coalesced route stores.
+Swap-AB MMA leaves feature rows and token columns in TMEM. FC1's 16dp256b
+loads match gate8/up8 interleaving, allowing lane-local SwiGLU. Only K32
+maxima cross lanes and paired warps. FC2 transposes BF16 through shared
+memory for coalesced route stores.
 
-This module owns accumulator wait/release, tile traversal, output stores,
-and FC1 readiness publication after the output data and scales are visible.
-
-Routing scores are absent by construction.  FC2 publishes an unweighted BF16
-term for every ``(source token, source top-k slot)``; the deterministic reducer
-in :mod:`fc2_epilogue` owns score multiplication and ordered accumulation.
+Owns accumulator wait/release, traversal, stores, and FC1 readiness
+publication after data and scales are visible. FC2 stores unweighted BF16
+terms per source token/slot. :mod:`fc2_epilogue` applies routing scores
+and accumulates them in slot order.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -38,19 +35,17 @@ from .fc1_epilogue import (
     _quantize_with_amax,
 )
 from .fc2_store import stage_native_bf16, store_staged_vector
-from .wait_stats import Slot, globaltimer_lo, stat_add, stats_slot_ptr
-from .iket_markers import iket_enabled, iket_fine_ctas, is_fine_cta, load_iket
 from .fc2_epilogue import Fc2RouteStore
 
 
 WARP_SIZE = 32
 EPILOGUE_WARPS = 4
-# IDs 0/1/2 are CTA/tile/TMEM barriers; dispatch owns 8/9/10.
+# IDs 0/1/2 are CTA/tile/TMEM barriers. Dispatch owns 8/9/10.
 EXCHANGE_BARRIER_IDS = (3, 4)
 TOKEN_METADATA_BYTES = 8
 TMEM_ROW_STRIDE = 1 << 16
 # Only the two warps' half-block maxima cross shared memory. Each row
-# contains one amax per token; the final barrier protects reuse by the next group.
+# contains one amax per token. The final barrier protects reuse by the next group.
 EXCHANGE_LANE_STRIDE = WARP_SIZE
 EXCHANGE_ROWS = 2
 EXCHANGE_WORDS = (EPILOGUE_WARPS // 2) * EXCHANGE_ROWS * EXCHANGE_LANE_STRIDE
@@ -61,9 +56,9 @@ class DeviceEpilogueConfig:
     """Compile-time geometry and policy for the persistent epilogue.
 
     ``cta_tile_features`` is the swap-AB MMA M extent (weight/output rows),
-    while ``cta_tile_tokens`` is its N extent.  FC1 rows are interleaved as
+    while ``cta_tile_tokens`` is its N extent. FC1 rows are interleaved as
     eight gate rows followed by eight up rows, so a 128-row feature tile produces 64
-    post-SwiGLU values. Each warpgroup covers all feature rows; with eight
+    post-SwiGLU values. Each warpgroup covers all feature rows. With eight
     epilogue warps, the two warpgroups process alternating token groups.
     """
 
@@ -82,7 +77,7 @@ class DeviceEpilogueConfig:
                 "swap-AB feature tile"
             )
         if self.cta_tile_tokens not in (2 * WARP_SIZE, 4 * WARP_SIZE, 6 * WARP_SIZE):
-            # Every warp covers each 32-token group of its feature rows; N64,
+            # Every warp covers each 32-token group of its feature rows. N64,
             # N128, and N192 are the token tiles validated end to end.
             raise ValueError("the epilogue requires N64, N128, or N192")
         if self.accumulator_stages != 2:
@@ -123,7 +118,7 @@ class DeviceEpilogueConfig:
 def route_metadata_host(packed: int) -> tuple[int, int, int]:
     """Decode the stable eight-byte token-source record on the host.
 
-    Low 32 bits are ``source token``.  The high word contains
+    Low 32 bits are ``source token``. The high word contains
     ``source rank`` in bits 16..31 and ``source top-k slot`` in bits 0..15.
     This helper is also the host-side test oracle for the device decoder.
     """
@@ -215,7 +210,7 @@ class PersistentMxfp8Mxfp4Epilogue:
 
     The integrating kernel supplies the accumulator TMEM allocation, pipeline,
     scheduler consumer, output tensors, and optional source metadata/peer
-    mapper.  It does not traverse accumulator tiles or publish readiness
+    mapper. It does not traverse accumulator tiles or publish readiness
     counters itself.
     """
 
@@ -223,11 +218,6 @@ class PersistentMxfp8Mxfp4Epilogue:
         if config is None:
             config = DeviceEpilogueConfig()
         self.config = config
-        # IKET ranges (CUTE_DSL_COMPILER_OPT=iket only; see iket_markers).
-        self.iket = iket_enabled()
-        self._iket: Any = load_iket() if self.iket else None
-        # Per-step FC1 tile ranges on the first CTAs only (see iket_markers).
-        self.iket_fine_ctas = iket_fine_ctas()
         self.fc1 = Fc1Epilogue(
             Fc1EpilogueConfig(
                 gate_up_clamp=config.gate_up_clamp,
@@ -306,7 +296,6 @@ class PersistentMxfp8Mxfp4Epilogue:
         warp_idx,
         lane_idx,
         warpgroup_idx,
-        fine_cta,
     ) -> None:
         """Traverse gate/up TMEM and publish E4M3+E8M0/K32 handoff rows."""
 
@@ -334,7 +323,6 @@ class PersistentMxfp8Mxfp4Epilogue:
                         warp_idx=warp_idx,
                         lane_idx=lane_idx,
                         pair_idx=pair_idx,
-                        fine_cta=fine_cta,
                     )
 
     @cute.jit
@@ -352,13 +340,9 @@ class PersistentMxfp8Mxfp4Epilogue:
         warp_idx,
         lane_idx,
         pair_idx,
-        fine_cta,
     ) -> None:
         """One 32-token FC1 group: native load, SwiGLU, amax exchange, store."""
 
-        if cutlass.const_expr(self.iket_fine_ctas > 0):
-            if fine_cta:
-                self._iket.range_push("fc1_ld_math")
         first = self._load_fc1_native_half(
             tmem_acc_tensor, warp_idx, Int32(token_group), acc_stage, 0
         )
@@ -395,15 +379,7 @@ class PersistentMxfp8Mxfp4Epilogue:
             )
             if lane_idx < Int32(4):
                 epilogue_exchange[pair_idx, warp_idx % Int32(2), token_in_group] = amax
-        if cutlass.const_expr(self.iket_fine_ctas > 0):
-            if fine_cta:
-                self._iket.range_pop()
-                self._iket.range_push("fc1_amax_bar")
         boundary.arrive_and_wait()
-        if cutlass.const_expr(self.iket_fine_ctas > 0):
-            if fine_cta:
-                self._iket.range_pop()
-                self._iket.range_push("fc1_quant_store")
         # One address per lane and group. The native fragment owns rows
         # {0, 1, 8, 9, 16, 17, 24, 25} and features {0, 8}. The launcher
         # supplies a static row stride, so all remaining offsets are
@@ -453,7 +429,7 @@ class PersistentMxfp8Mxfp4Epilogue:
         if lane_idx < Int32(4) and warp_idx % Int32(2) == Int32(0):
             # Expert SF rows are padded to 128, and tile/group starts are
             # multiples of 32. Within a group only the atom's row%32 mode
-            # varies (stride 16); derive the base from the canonical layout
+            # varies (stride 16). Derive the base from the canonical layout
             # once so K-block and outer-atom strides need no duplication.
             scale_row = work.cumulative_sf_physical_row + group_row + lane_row
             scale_ptr = cute.recast_ptr(
@@ -468,14 +444,7 @@ class PersistentMxfp8Mxfp4Epilogue:
                     < work.valid_tokens_in_cta_tile
                 )
                 _store_predicated_u8(scale_ptr, scales[token], valid, row_offset * 16)
-        if cutlass.const_expr(self.iket_fine_ctas > 0):
-            if fine_cta:
-                self._iket.range_pop()
-                self._iket.range_push("fc1_group_bar")
         boundary.arrive_and_wait()
-        if cutlass.const_expr(self.iket_fine_ctas > 0):
-            if fine_cta:
-                self._iket.range_pop()
 
     @cute.jit
     def _run_fc2_task_tile(
@@ -539,9 +508,8 @@ class PersistentMxfp8Mxfp4Epilogue:
         second = self._load_fc1_native_half(
             tmem_acc_tensor, warp_idx, Int32(token_group), acc_stage, 1
         )
-        # Resolve each token's destination once in its emitting warp. Broadcast
-        # the final address, avoiding repeated peer lookup and row arithmetic
-        # in every lane that stores a 16-byte piece of the same row.
+        # Resolve and broadcast each token's destination once per emitting warp,
+        # avoiding repeated peer lookup and row arithmetic in the storing lanes.
         token_base = Int32(token_group * WARP_SIZE)
         pool_base = work.cumulative_data_physical_row + work.tile_n_idx * Int32(
             self.config.cta_tile_tokens
@@ -607,13 +575,11 @@ class PersistentMxfp8Mxfp4Epilogue:
         warp_idx,
         tidx,
         token_metadata=None,
-        stats=None,
-        stats_word_offset=None,
     ) -> None:
         """Consume and retire all persistent FC1/FC2 work records.
 
         Publication happens after an all-epilogue barrier and a device-scope
-        fence.  The FC1 release-add unlocks FC2 mainloop work.  FC2 needs no
+        fence. The FC1 release-add unlocks FC2 mainloop work. FC2 needs no
         completion counter: the reducer runs after the collective kernel tail.
         """
 
@@ -635,33 +601,11 @@ class PersistentMxfp8Mxfp4Epilogue:
                 num_threads=4 * WARP_SIZE,
             )
         lane_idx = tidx % Int32(WARP_SIZE)
-        fine_cta = cutlass.Boolean(False)
-        if cutlass.const_expr(self.iket_fine_ctas > 0):
-            fine_cta = is_fine_cta(self.iket_fine_ctas)
-        if cutlass.const_expr(stats is not None):
-            loop_start = globaltimer_lo()
         work = scheduler_consumer.consume_work()
         while work.is_valid_tile:
             # The scheduler's peek concerns input/readiness and never permits
             # the epilogue to consume an accumulator before its pipeline stage.
-            if cutlass.const_expr(stats is not None):
-                waited = globaltimer_lo()
-            if cutlass.const_expr(self.iket):
-                self._iket.range_push("epi_wait_acc")
             acc_pipeline.consumer_wait(consumer_state)
-            if cutlass.const_expr(self.iket):
-                self._iket.range_pop()
-                if work.phase == Int32(DevicePhase.FC1):
-                    self._iket.range_push("epi_fc1")
-                else:
-                    self._iket.range_push("epi_fc2")
-            if cutlass.const_expr(stats is not None):
-                tile_start = globaltimer_lo()
-                if tidx == Int32(0):
-                    stat_add(
-                        stats_slot_ptr(stats, Slot.EPI_ACC_FULL_NS, stats_word_offset),
-                        tile_start - waited,
-                    )
             acc_stage = Int32(consumer_state.index)
 
             if work.phase == Int32(DevicePhase.FC1):
@@ -676,7 +620,6 @@ class PersistentMxfp8Mxfp4Epilogue:
                     warp_idx=warp_idx,
                     lane_idx=lane_idx,
                     warpgroup_idx=warpgroup_idx,
-                    fine_cta=fine_cta,
                 )
             else:
                 self._run_fc2_task_tile(
@@ -693,29 +636,14 @@ class PersistentMxfp8Mxfp4Epilogue:
                 )
 
             # Every LDTM has completed before the accumulator slot is handed
-            # back.  Register math and global stores no longer depend on TMEM.
+            # back. Register math and global stores no longer depend on TMEM.
             cute.arch.fence_view_async_tmem_load()
             acc_pipeline.consumer_release(consumer_state)
             consumer_state.advance()
 
             # Tile end, then the FC1-done publication (warp 0 only: tid 0
             # issues the GPU-scope fence and release-add).
-            if cutlass.const_expr(self.iket_fine_ctas > 0):
-                if fine_cta and work.phase == Int32(DevicePhase.FC1):
-                    self._iket.range_push("fc1_tile_bar")
             boundary.arrive_and_wait()
-            if cutlass.const_expr(self.iket_fine_ctas > 0):
-                if fine_cta and work.phase == Int32(DevicePhase.FC1):
-                    self._iket.range_pop()
-            if cutlass.const_expr(self.iket):
-                self._iket.range_pop()
-            if cutlass.const_expr(self.iket_fine_ctas > 0):
-                if (
-                    fine_cta
-                    and work.phase == Int32(DevicePhase.FC1)
-                    and warp_idx == Int32(0)
-                ):
-                    self._iket.range_push("fc1_publish")
             if tidx == Int32(0):
                 cute.arch.fence_acq_rel_gpu()
                 if work.phase == Int32(DevicePhase.FC1):
@@ -723,50 +651,8 @@ class PersistentMxfp8Mxfp4Epilogue:
                         fc1_done_counter.iterator + work.counter_slot,
                         Int32(1),
                     )
-                if cutlass.const_expr(stats is not None):
-                    # Accumulator ready -> publication: the FC2 readiness latency.
-                    elapsed = globaltimer_lo() - tile_start
-                    if work.phase == Int32(DevicePhase.FC1):
-                        stat_add(
-                            stats_slot_ptr(
-                                stats, Slot.EPI_FC1_TILE_NS, stats_word_offset
-                            ),
-                            elapsed,
-                        )
-                        stat_add(
-                            stats_slot_ptr(
-                                stats, Slot.EPI_FC1_TILE_COUNT, stats_word_offset
-                            ),
-                            Int32(1),
-                        )
-                    else:
-                        stat_add(
-                            stats_slot_ptr(
-                                stats, Slot.EPI_FC2_TILE_NS, stats_word_offset
-                            ),
-                            elapsed,
-                        )
-                        stat_add(
-                            stats_slot_ptr(
-                                stats, Slot.EPI_FC2_TILE_COUNT, stats_word_offset
-                            ),
-                            Int32(1),
-                        )
-            if cutlass.const_expr(self.iket_fine_ctas > 0):
-                if (
-                    fine_cta
-                    and work.phase == Int32(DevicePhase.FC1)
-                    and warp_idx == Int32(0)
-                ):
-                    self._iket.range_pop()
 
             work = scheduler_consumer.consume_work()
-        if cutlass.const_expr(stats is not None):
-            if tidx == Int32(0):
-                stat_add(
-                    stats_slot_ptr(stats, Slot.EPI_LOOP_NS, stats_word_offset),
-                    globaltimer_lo() - loop_start,
-                )
 
 
 __all__ = [
