@@ -163,6 +163,7 @@ MSA (msa_*) files require SM120/SM121 (consumer Blackwell) GPUs.
 dsv41_fp4_quantize_*_sparse_mla_cache_*.json and dsv41_fp8_quantize_*_sparse_mla_cache_*.json
 are only generated on SM120/SM121 GPUs.
 trtllm_batch_decode_block_sparse_h16_kv2_d128_ps16.json requires SM100/SM103 GPUs.
+trtllm_batch_decode_token_sparse_h16_kv1_d256_ps1_topk512.json requires SM100/SM103 GPUs.
 trtllm_gen_routing_e256_k8_t8.json requires SM100/SM103/SM120/SM121 GPUs.
 top_k_varlen_n4096_k512.json (windowed prefill mode, gvr_2) requires SM100/SM103/SM107 GPUs.
 """
@@ -2696,6 +2697,20 @@ with contextlib.suppress(Exception):
         device=device,
     )
     trtllm_batch_decode_with_kv_cache(**_tbs_inputs)
+
+# trtllm_batch_decode_with_kv_cache with token-sparse attention (each query
+# token attends to its own K and V slot lists; SM100/103 only).
+with contextlib.suppress(Exception):
+    from flashinfer.decode import trtllm_batch_decode_with_kv_cache
+    from flashinfer.trace.templates.attention import (
+        _trtllm_batch_decode_token_sparse_init,
+    )
+
+    trtllm_batch_decode_with_kv_cache(
+        **_trtllm_batch_decode_token_sparse_init(
+            num_tokens=4, num_heads=16, head_dim=256, sparse_top_k=512, device=device
+        )
+    )
 
 # concat_mla_k (DeepSeek MLA K concat, fixed shape per docstring).
 with contextlib.suppress(Exception):
