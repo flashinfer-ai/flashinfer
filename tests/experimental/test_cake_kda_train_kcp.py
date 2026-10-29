@@ -2227,7 +2227,6 @@ def test_halo_sources_bisect_matches_the_scan_on_random_partitions() -> None:
     assert n_parts == 63 * (3 + len(kp.LAYOUTS)) and n_hist > 0
 
 
-@HARNESS
 def test_halo_sources_bisect_matches_the_scan_on_the_rows_of_record() -> None:
     """The bisect owner lookup of ``_halo_sources`` equals the linear scan on every row, CP and layout of record."""
     assert CASES
