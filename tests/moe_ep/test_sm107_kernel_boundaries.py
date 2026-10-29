@@ -135,6 +135,7 @@ def test_supported_knob_variants(monkeypatch, kind, variant):
 @pytest.mark.parametrize("kind", KINDS)
 @pytest.mark.parametrize("raw_scale_bytes", [False, True])
 def test_layer_prequantized_input_and_output_view(monkeypatch, kind, raw_scale_bytes):
+    """Check prequantized parity, borrowed output views, and shared-buffer lifetime."""
     from flashinfer.moe_ep import (
         BootstrapConfig,
         FleetParams,

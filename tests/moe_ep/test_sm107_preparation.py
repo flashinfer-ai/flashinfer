@@ -376,6 +376,7 @@ def test_route_staging_rebinds_and_replays(
 @pytest.mark.parametrize("hidden,topk", [(512, 6), (2880, 6), (7168, 6), (512, 129)])
 @pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
 def test_mxfp8_fused_staging_matches_torch(monkeypatch, kind, hidden, topk, id_dtype):
+    """Compare fused and fallback staging bytes, masked scores, and inactive tails."""
     from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl.staging import (
         _data_dtype,
         stage_mega_moe_inputs,
@@ -501,6 +502,7 @@ def test_mxfp8_fused_staging_keeps_scale_policies_separate(kind):
 @pytest.mark.parametrize("tail_fused", ["0", "1"])
 @pytest.mark.parametrize("capacity", [129, 4096])
 def test_mxfp8_staging_graph_masks_dirty_tail(monkeypatch, kind, tail_fused, capacity):
+    """Replay varying live lengths and capacities without stale tails or recompiles."""
     import cutlass.cute as cute
 
     from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl.staging import (
@@ -523,6 +525,7 @@ def test_mxfp8_staging_graph_masks_dirty_tail(monkeypatch, kind, tail_fused, cap
     )
 
     def stage(live, limit=capacity):
+        """Stage a live prefix into the requested output capacity."""
         stage_mega_moe_inputs(
             x[:live],
             scores[:live],
@@ -569,6 +572,7 @@ def test_mxfp8_staging_graph_masks_dirty_tail(monkeypatch, kind, tail_fused, cap
 
 
 def _invalid_staged_route(case):
+    """Require eager or captured staging to trap a route corrupted after warmup."""
     # A device assertion invalidates the CUDA context, so each case needs its
     # own process. Values can also become invalid after CUDA graph capture.
     from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl.staging import (
@@ -626,6 +630,7 @@ def _invalid_staged_route(case):
     "case", ["bounds", "negative", "int64_wrap", "duplicate", "nan", "inf"]
 )
 def test_fused_staging_rejects_invalid_routes(monkeypatch, case):
+    """Isolate each expected device assertion in a fresh spawned CUDA process."""
     import multiprocessing
 
     monkeypatch.setenv("FLASHINFER_MEGA_FUSED_STAGE", "1")

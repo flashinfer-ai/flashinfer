@@ -524,6 +524,11 @@ class Sm107BlockScaledSymmBuffer:
         self._bound_scalars: dict = {}
 
     def _allocate_execution_state(self) -> None:
+        """Allocate reduction buffers and scratch, then reset cached bindings.
+
+        Peer-written buffers use symmetric allocations; separate-reduce output
+        stays local and may be replaced by a caller output at launch time.
+        """
         cfg, kernel = self.config, self.kernel
         tokens = cfg.padded_tokens_per_rank
         # In-kernel reduce: the combine peer-writes (red.add) each topk term
@@ -735,6 +740,11 @@ class Sm107BlockScaledSymmBuffer:
         transformed_l2: TransformedBlockScaledWeights,
         output: Optional[torch.Tensor] = None,
     ) -> dict:
+        """Bind weights, workspaces, scalars, and output on the current stream.
+
+        Output defaults to the workspace buffer. Its dynamic row extent lets
+        one compiled kernel serve caller outputs with different live lengths.
+        """
         stream = torch.cuda.current_stream()
         if output is None:
             output = self.output_activation
@@ -862,6 +872,7 @@ class Sm107BlockScaledSymmBuffer:
         self._compiled(**self._launch_kwargs)
 
     def _release_execution_state(self) -> None:
+        """Drop cached tensor references and free owned symmetric buffers."""
         self._compiled = None
         self._launch_kwargs = None
         self._launch_weights = None

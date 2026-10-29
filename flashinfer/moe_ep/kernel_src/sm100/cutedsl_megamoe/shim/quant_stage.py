@@ -89,6 +89,11 @@ def _int32_routing_stager_class(
             topk_idx_output,
             topk_weights_output,
         ):
+            """Store int32 routes and zero masked scores for one live token.
+
+            Optional checks reject invalid routes before narrowing IDs. When
+            enabled, live CTAs also mask tails within the per-thread work limit.
+            """
             if tid < cutlass.Int32(self.topk):
                 is_padding = False
                 if cutlass.const_expr(token_padding_info is not None):

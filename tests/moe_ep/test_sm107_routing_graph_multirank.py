@@ -61,6 +61,7 @@ def _barrier():
 def test_sparse_to_dense_graph_multirank(
     ep_runtime, family, kind, cluster, capacity, early, caller_output
 ):
+    """Exercise routing changes with workspace and caller outputs across ranks."""
     _check_sparse_to_dense_graph_multirank(
         ep_runtime, family, kind, cluster, capacity, early, caller_output
     )
@@ -69,6 +70,11 @@ def test_sparse_to_dense_graph_multirank(
 def _check_sparse_to_dense_graph_multirank(
     ep_runtime, family, kind, cluster, capacity, early, caller_output=False
 ):
+    """Check graph replay against the oracle after poisoning combine and output.
+
+    Empty, sparse, and rank-asymmetric routes must clear inactive rows and
+    preserve numerical accuracy through repeated replays with fixed bindings.
+    """
     rank, world = ep_runtime
     hidden, intermediate, experts = 512, 256, 16
     # DATA CTA count depends on capacity * topk, not token capacity alone.
@@ -118,6 +124,7 @@ def _check_sparse_to_dense_graph_multirank(
     )
 
     def launch():
+        """Launch with the output binding selected for this multirank case."""
         if caller_output:
             pkg.sm107_block_scaled_mega_moe(output, *weights, ws, num_tokens=capacity)
         else:

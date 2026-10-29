@@ -239,6 +239,11 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
     def stage_inputs(
         self, t: "MoEEpTensors", workspace: Any, *, quantize_input: bool
     ) -> None:
+        """Stage validated MXFP8 activations and routes, masking unused rows.
+
+        BF16 inputs may fuse validation with quantization; prequantized inputs
+        are validated before copying their payload and logical scale columns.
+        """
         if quantize_input:
             staged = stage_mega_moe_inputs(
                 t.hidden_states,
