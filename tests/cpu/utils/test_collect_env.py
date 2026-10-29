@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import importlib.util
 import json
 import sys
 
@@ -175,3 +176,39 @@ def test_kernel_packages_reported_when_import_fails(monkeypatch):
     assert info["flashinfer-cubin"] == (
         "0.7.0  ⚠ MISMATCH vs flashinfer-python==0.7.0.post1"
     )
+
+
+@pytest.mark.cpu_only
+def test_megamoe_surface_keys_present(report):
+    # Source checkouts of main expose these modules; the keys must always
+    # appear so bug reports can tell PyPI wheels apart from main.
+    fi = report["FlashInfer"]
+    assert fi["flashinfer.megamoe"] in ("present", "absent")
+    assert fi["moe_ep SM90 NVFP4 MegaMoE config"] in ("present", "absent")
+
+
+@pytest.mark.cpu_only
+def test_megamoe_surface_present_on_source_tree(report):
+    fi = report["FlashInfer"]
+    assert fi["flashinfer.megamoe"] == "present"
+    assert fi["moe_ep SM90 NVFP4 MegaMoE config"] == "present"
+
+
+@pytest.mark.cpu_only
+def test_megamoe_surface_absent_when_find_spec_misses(monkeypatch):
+    real_find_spec = importlib.util.find_spec
+
+    def fake_find_spec(name, package=None):
+        if name in (
+            "flashinfer.megamoe",
+            "flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_pull_cutedsl.config",
+        ):
+            return None
+        return real_find_spec(name, package)
+
+    monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
+    info = collect_env._get_megamoe_surface_info()
+    assert info == {
+        "flashinfer.megamoe": "absent",
+        "moe_ep SM90 NVFP4 MegaMoE config": "absent",
+    }

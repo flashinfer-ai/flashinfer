@@ -37,6 +37,7 @@ Design constraints (please preserve when editing):
 
 import argparse
 import glob
+import importlib.util
 import json
 import os
 import platform
@@ -300,6 +301,25 @@ def _get_kernel_package_info():
     return info
 
 
+
+def _module_present(name):
+    """Return 'present'/'absent' via find_spec; never imports the module."""
+    try:
+        return "present" if importlib.util.find_spec(name) is not None else "absent"
+    except Exception as e:
+        return f"<probe failed: {type(e).__name__}: {e}>"
+
+
+def _get_megamoe_surface_info():
+    """CPU-only presence of MegaMoE-related package surfaces (no CUDA import)."""
+    return {
+        "flashinfer.megamoe": _module_present("flashinfer.megamoe"),
+        "moe_ep SM90 NVFP4 MegaMoE config": _module_present(
+            "flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_pull_cutedsl.config"
+        ),
+    }
+
+
 def _get_flashinfer_info():
     info = {}
     try:
@@ -309,11 +329,13 @@ def _get_flashinfer_info():
         # Older releases fail to import when a kernel wheel does not match
         # flashinfer-python, so report the versions anyway.
         info.update(_get_kernel_package_info())
+        info.update(_get_megamoe_surface_info())
         return info
     info["flashinfer"] = _guard(lambda: flashinfer.__version__, "?")
     info["flashinfer commit"] = _guard(lambda: flashinfer.__git_commit__, "?")
     info["flashinfer file"] = _guard(lambda: flashinfer.__file__, "?")
     info.update(_get_kernel_package_info())
+    info.update(_get_megamoe_surface_info())
 
     def _cache_dir():
         from flashinfer.jit.env import FLASHINFER_CACHE_DIR
