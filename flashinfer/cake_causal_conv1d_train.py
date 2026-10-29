@@ -324,7 +324,11 @@ def cake_causal_conv1d(
 
 @flashinfer_api
 def cake_causal_conv1d_kcp(
-    x_local: torch.Tensor, weight: torch.Tensor, ctx: Any
+    x_local: torch.Tensor,
+    weight: torch.Tensor,
+    ctx: Any,
+    *,
+    recompute_handle: Optional[Any] = None,
 ) -> torch.Tensor:
     """Autograd-enabled context-parallel packed width-4 depthwise causal convolution + SiLU of this rank's fragments.
 
@@ -342,6 +346,20 @@ def cake_causal_conv1d_kcp(
         FP32 ``[C, 4]`` contiguous taps.
     ctx : KcpContext
         From ``flashinfer.kda_train.build_kcp_context`` (the same context the KDA step of the rank uses).
+    recompute_handle : KcpRecomputeHandle, optional
+        Keyword-only, default ``None`` (unchanged behavior).  A handle (any object with an ``entries`` dict, such as
+        ``flashinfer.cake_causal_conv1d_train.KcpRecomputeHandle``) makes the checkpoint recompute of
+        this call run without the forward halo exchange: the original forward exchanges as always and stores its
+        history rows (the saved set's own tensor, key ``"conv"``) in the handle; torch's recompute of the forward
+        inside the backward reads them back, so ``y`` and the gradients are bitwise those of the same checkpoint
+        without a handle.  The backward still exchanges.  Create one handle per convolution call and micro-step,
+        outside the outermost checkpoint region, and pass it as an argument of the checkpointed function.  A
+        forward outside the backward that finds an entry raises (a handle reused across micro-steps).  The forward
+        halo exchange is a collective: every rank of ``ctx.group`` passes a handle for the same call or none, created
+        at the same checkpoint nesting level.  A mismatch pairs one rank's recompute exchange with another rank's
+        backward exchange and hangs or corrupts data; no check is made.  Never share one handle between two
+        convolution calls (also not in nested regions), and never ``clear()`` or reuse a handle while a backward
+        that needs it is pending.
 
     Returns
     -------
@@ -352,13 +370,26 @@ def cake_causal_conv1d_kcp(
 
     from .cake_causal_conv1d_train_backend import kcp as _kcp
 
-    return _kcp.cake_causal_conv1d_kcp(x_local, weight, ctx)
+    return _kcp.cake_causal_conv1d_kcp(
+        x_local, weight, ctx, recompute_handle=recompute_handle
+    )
+
+
+def __getattr__(name: str) -> Any:
+    # ``KcpRecomputeHandle`` (the KCP route's checkpoint recompute handle) resolves on first access, so importing the
+    # facade does not import the KCP host module (torch.distributed, the KCP loader), like the entry point above.
+    if name == "KcpRecomputeHandle":
+        from .cake_causal_conv1d_train_backend.kcp import KcpRecomputeHandle
+
+        return KcpRecomputeHandle
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [
     "ARCHES",
     "SUPPORTED_COMPUTE_CAPABILITIES",
     "CakeCausalConv1dFunction",
+    "KcpRecomputeHandle",  # noqa: F822 - resolved by __getattr__
     "cake_causal_conv1d",
     "cake_causal_conv1d_kcp",
     "cake_causal_conv1d_train_backward",
