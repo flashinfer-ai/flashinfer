@@ -1217,8 +1217,11 @@ class BlockSparseAttentionWrapper:
         # NOTE(Zihao): we haven't supported mask in cuda-core implementations but it should
         # be easy to add support for it if needed, leave it as a future work.
         # at this moment, when mask is provided, we use the tensor-core implementation
+        # CUDA-core decode maps each query row to one paged-KV request, so it is only
+        # valid when each BSR block row contains exactly one query row.
         if (
-            R * (num_qo_heads // num_kv_heads) < 4
+            R == 1
+            and R * (num_qo_heads // num_kv_heads) < 4
             and mask_mode != MaskMode.CUSTOM.value
             and q_data_type not in [torch.float8_e4m3fn, torch.float8_e5m2]
         ):
