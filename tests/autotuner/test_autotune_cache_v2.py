@@ -58,13 +58,17 @@ def cache_root(tmp_path, monkeypatch):
 
 def _install_fake_profile(monkeypatch, times, record_configs=None):
     """Replace GPU profiling with a lookup table; returns the call log.
-    Pass a list as *record_configs* to also capture each TuningConfig."""
+    Pass a list as *record_configs* to also capture each TuningConfig.
+    *times* is a ``{tactic: time}`` table, or a ``(inputs, tactic) -> time``
+    callable when the winner must depend on the profiled shape."""
     calls = []
 
     def fake_profile(self, runner, inputs, tactic, tuning_config, **kwargs):
         calls.append(tactic)
         if record_configs is not None:
             record_configs.append(tuning_config)
+        if callable(times):
+            return float(times(inputs, tactic))
         return float(times[tactic])
 
     monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
@@ -365,13 +369,21 @@ def test_serving_above_top_tuned_bucket_uses_largest_entry(cache_root, monkeypat
             ),
         ),
     )
-    _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
+    # Bucket 4 is won by tactic 0 and bucket 8 by tactic 1, so the served
+    # tactic shows which entry the lookup used.
+    def times_by_bucket(inputs, tactic):
+        return {
+            4: {0: 1.0, 1: 3.0, 2: 2.0},
+            8: {0: 3.0, 1: 1.0, 2: 2.0},
+        }[inputs[0].shape[0]][tactic]
+
+    _install_fake_profile(monkeypatch, times=times_by_bucket)
     with autotune_v2():
         AutoTuner.get().choose_one(_OP, [DummyRunner()], config, [torch.zeros(8, 16)])
     assert len(_entry_files(cache_root)) == 2
 
     _fresh_process()
-    calls = _install_fake_profile(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
+    calls = _install_fake_profile(monkeypatch, times=times_by_bucket)
     with autotune_v2(mode="replay"):
         pass  # hydrate the entries for buckets 4 and 8
     # A malformed key must not break the scan for the top tuned bucket.
