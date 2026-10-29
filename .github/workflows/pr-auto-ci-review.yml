@@ -1,0 +1,30 @@
+# Unprivileged relay for pr-auto-ci.yml on PR approvals.
+#
+# `pull_request_review` events from fork PRs get a read-only GITHUB_TOKEN and
+# no secrets, and there is no `pull_request_review_target`. This workflow
+# therefore does no work itself: it exists only so its completion fires
+# pr-auto-ci.yml through `workflow_run`, which runs from the default branch
+# with a write token and secrets.
+#
+# The job is skipped (so the run concludes "skipped" and pr-auto-ci.yml
+# ignores it) unless the review is an approval on a PR targeting main.
+# pr-auto-ci.yml re-verifies everything through the API; it trusts nothing
+# from this run beyond "some review happened on this head SHA".
+
+name: Auto CI review relay
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions: {}
+
+jobs:
+  relay:
+    name: approval relay
+    if: >-
+      github.event.review.state == 'approved'
+      && github.event.pull_request.base.ref == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Approval on PR #${{ github.event.pull_request.number }}; pr-auto-ci.yml will pick this up via workflow_run"

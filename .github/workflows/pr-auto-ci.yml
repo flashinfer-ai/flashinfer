@@ -31,15 +31,32 @@
 #     GPU time on stale commits.
 #   - The run-ci label is applied via the bot PAT so the labeled event
 #     triggers pr-test.yml (GITHUB_TOKEN events don't trigger workflows).
+#
+# Triggers and tokens:
+#   Most PRs come from forks. On `pull_request` / `pull_request_review`
+#   events from a fork, GITHUB_TOKEN is read-only and secrets are withheld,
+#   so publishing scope statuses, cancelling stale runs and applying the
+#   label all fail. This workflow therefore runs only in the base repo's
+#   context:
+#     - New pushes: `pull_request_target` (synchronize).
+#     - Approvals:  pr-auto-ci-review.yml (unprivileged, does no work)
+#                   completes, which fires this workflow via `workflow_run`.
+#   Both run this file from the base branch with a write token and secrets.
+#   That is safe only because this workflow never checks out or executes PR
+#   code: the checkout below is the base branch, and the PR is read purely
+#   through the API. Do not add a checkout of the PR head.
+#   Every fact about the PR (number, head SHA, approval) is re-read from the
+#   API rather than taken from the triggering event.
 
 name: Auto CI on Approval
 
 on:
-  pull_request_review:
-    types: [submitted]
-  pull_request:
+  pull_request_target:
     branches: [main]
     types: [synchronize]
+  workflow_run:
+    workflows: ["Auto CI review relay"]
+    types: [completed]
 
 permissions:
   contents: read
@@ -57,40 +74,61 @@ jobs:
     # GitHub cannot hide a job's check run, so the name marks it as part of
     # auto-CI rather than a separate check.
     name: approval gate
-    # Only run on the canonical repo — forks making PRs against their own
-    # main branch should not trigger this workflow.
+    # Only run on the canonical repo. For approvals, only act when the relay
+    # actually ran (it is skipped for non-approving reviews and non-main PRs).
     if: >-
       github.repository == 'flashinfer-ai/flashinfer'
       && (
-        (github.event_name == 'pull_request_review'
-         && github.event.pull_request.base.ref == 'main'
-         && github.event.review.state == 'approved')
-        || github.event_name == 'pull_request'
+        github.event_name == 'pull_request_target'
+        || (github.event_name == 'workflow_run'
+            && github.event.workflow_run.event == 'pull_request_review'
+            && github.event.workflow_run.conclusion == 'success')
       )
     runs-on: ubuntu-latest
     outputs:
       approved: ${{ steps.approval-check.outputs.approved }}
+      pr_number: ${{ steps.approval-check.outputs.pr_number }}
     steps:
-      - name: Check PR has an approval
+      - name: Resolve PR and check it has an approval
         id: approval-check
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_PR: ${{ github.event.pull_request.number }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
-          APPROVED=$(gh pr view "$PR_NUMBER" \
-            --repo "${{ github.repository }}" \
-            --json reviews \
-            --jq '[.reviews[]
-                   | select(.state == "APPROVED"
-                            and (.authorAssociation | IN("OWNER","MEMBER","COLLABORATOR")))] | length')
+          set -o pipefail
 
-          if [[ "${APPROVED:-0}" -gt 0 ]]; then
-            echo "PR has $APPROVED approval(s)"
-            echo "approved=true" >> "$GITHUB_OUTPUT"
+          if [[ "$EVENT_NAME" == "pull_request_target" ]]; then
+            CANDIDATES="$EVENT_PR"
           else
-            echo "PR has no approvals"
-            echo "approved=false" >> "$GITHUB_OUTPUT"
+            # workflow_run leaves pull_requests[] empty for fork PRs, so find
+            # the open PR(s) into main whose head is the reviewed SHA.
+            CANDIDATES=$(gh api --paginate \
+              "/repos/${REPO}/pulls?state=open&base=main&per_page=100" \
+              --jq '.[] | {number, sha: .head.sha}' \
+              | jq -r --arg sha "$RUN_HEAD_SHA" 'select(.sha == $sha) | .number')
           fi
+
+          for PR in $CANDIDATES; do
+            APPROVED=$(gh pr view "$PR" --repo "$REPO" --json reviews \
+              --jq '[.reviews[]
+                     | select(.state == "APPROVED"
+                              and (.authorAssociation | IN("OWNER","MEMBER","COLLABORATOR")))] | length')
+            if [[ "${APPROVED:-0}" -gt 0 ]]; then
+              echo "PR #$PR has $APPROVED approval(s)"
+              echo "pr_number=$PR" >> "$GITHUB_OUTPUT"
+              echo "approved=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "PR #$PR has no approvals"
+          done
+
+          if [[ -z "$CANDIDATES" ]]; then
+            echo "No open PR into main has head $RUN_HEAD_SHA (pushed since the review?)"
+          fi
+          echo "approved=false" >> "$GITHUB_OUTPUT"
 
   auto-ci:
     name: Auto-trigger CI
@@ -100,9 +138,12 @@ jobs:
     if: needs.approval.outputs.approved == 'true'
     runs-on: ubuntu-latest
     concurrency:
-      group: pr-auto-ci-${{ github.event.pull_request.number }}
+      group: pr-auto-ci-${{ needs.approval.outputs.pr_number }}
       cancel-in-progress: false
     steps:
+      # Base branch only (the default for pull_request_target and
+      # workflow_run). This job holds a write token and secrets; never check
+      # out the PR head here.
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
@@ -111,19 +152,27 @@ jobs:
         id: pr
         env:
           GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ needs.approval.outputs.pr_number }}
         run: |
-          PR_NUMBER="${{ github.event.pull_request.number }}"
           echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
 
           PR_JSON=$(gh pr view "$PR_NUMBER" \
             --repo "${{ github.repository }}" \
-            --json headRefOid,author,labels)
+            --json headRefOid,headRefName,headRepository,headRepositoryOwner,author,labels)
 
           HEAD_SHA=$(echo "$PR_JSON" | jq -r '.headRefOid')
+          HEAD_REF=$(echo "$PR_JSON" | jq -r '.headRefName')
+          HEAD_REPO=$(echo "$PR_JSON" | jq -r '"\(.headRepositoryOwner.login // "")/\(.headRepository.name // "")"')
           AUTHOR=$(echo "$PR_JSON" | jq -r '.author.login')
           HAS_RUN_CI=$(echo "$PR_JSON" | jq '[.labels[].name] | index("run-ci") != null')
 
           echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          {
+            echo "head_ref<<EOF_HEAD_REF"
+            echo "$HEAD_REF"
+            echo "EOF_HEAD_REF"
+          } >> "$GITHUB_OUTPUT"
+          echo "head_repo=$HEAD_REPO" >> "$GITHUB_OUTPUT"
           echo "author=$AUTHOR" >> "$GITHUB_OUTPUT"
           echo "has_run_ci=$HAS_RUN_CI" >> "$GITHUB_OUTPUT"
 
@@ -132,8 +181,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
-          HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          HEAD_REF: ${{ steps.pr.outputs.head_ref }}
+          HEAD_REPO: ${{ steps.pr.outputs.head_repo }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           # Decide whether a REAL pr-test.yml run already exists for this SHA.
           #
@@ -214,7 +264,7 @@ jobs:
           #
           # Filter by head repository to avoid cancelling runs from a different
           # fork that happens to share the same branch name.
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          if [[ "$EVENT_NAME" == "pull_request_target" ]]; then
             # Use the workflow runs API directly — gh run list doesn't expose
             # head_repository, which we need to avoid cancelling runs from a
             # different fork that shares the same branch name.
