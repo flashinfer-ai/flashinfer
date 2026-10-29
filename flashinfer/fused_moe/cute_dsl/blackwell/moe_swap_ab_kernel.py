@@ -420,57 +420,86 @@ def _blockscaled_load16x32(ptr):
 
 
 @cute.jit
-def _blockscaled_transpose16x32(values, scratch_ptr, bottom: cutlass.Constexpr = False):
+def _blockscaled_transpose16x32(values, scratch_ptr):
     """Transpose loaded values into lane=token, register=channel order.
 
     The scratch rectangle is 32 TMEM rows by 32 columns.  All source values
     must have been loaded before the caller reuses their TMEM as scratch.
+    The caller must wait for final loads before releasing the scratch.
     """
     perm1 = (0, 8, 2, 10, 4, 12, 6, 14, 1, 9, 3, 11, 5, 13, 7, 15)
     perm3 = (0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15)
-    work = cute.make_rmem_tensor((16,), cutlass.Float32)
-    result = cute.make_rmem_tensor((16,), cutlass.Float32)
-    source_ptr = scratch_ptr + ((16 << 16) if bottom else 0)
-    dest_ptr = scratch_ptr + (16 if bottom else 0)
-    source = _blockscaled_tmem_view(source_ptr, 16, 32)
-    dest = _blockscaled_tmem_view(dest_ptr, 32, 16)
-    dest_top = _blockscaled_tmem_view(dest_ptr, 16, 16)
-    dest_bottom = _blockscaled_tmem_view(dest_ptr + (16 << 16), 16, 16)
-    for i in cutlass.range_constexpr(16):
-        result[i] = values[perm1[i]]
-    cute.copy(
-        cute.make_copy_atom(
-            tcgen05.St16x128bOp(tcgen05.Repetition.x8), cutlass.Float32
-        ),
-        _blockscaled_rmem_view(result, 16),
-        source,
-    )
-    cute.copy(
-        cute.make_copy_atom(
-            tcgen05.Ld16x64bOp(tcgen05.Repetition.x16), cutlass.Float32
-        ),
-        source,
-        _blockscaled_rmem_view(work, 16),
-    )
+    fragments = len(values)
+    work = cute.make_rmem_tensor((16, fragments), cutlass.Float32)
+    result = cute.make_rmem_tensor((16, fragments), cutlass.Float32)
+    cute.arch.fence_view_async_tmem_load()
+    for fragment in cutlass.range_constexpr(fragments):
+        for i in cutlass.range_constexpr(16):
+            result[i, fragment] = values[fragment][perm1[i]]
+        cute.copy(
+            cute.make_copy_atom(
+                tcgen05.St16x128bOp(tcgen05.Repetition.x8), cutlass.Float32
+            ),
+            _blockscaled_rmem_view(result[None, fragment], 16),
+            _blockscaled_tmem_view(scratch_ptr + fragment * (16 << 16), 16, 32),
+        )
+    cute.arch.fence_view_async_tmem_store()
+    # Load both source halves before either transposed destination overwrites them.
+    for fragment in cutlass.range_constexpr(fragments):
+        cute.copy(
+            cute.make_copy_atom(
+                tcgen05.Ld16x64bOp(tcgen05.Repetition.x16), cutlass.Float32
+            ),
+            _blockscaled_tmem_view(scratch_ptr + fragment * (16 << 16), 16, 32),
+            _blockscaled_rmem_view(work[None, fragment], 16),
+        )
+    cute.arch.fence_view_async_tmem_load()
     atom_store = cute.make_copy_atom(
         tcgen05.St32x32bOp(tcgen05.Repetition.x16), cutlass.Float32
     )
-    cute.copy(atom_store, _blockscaled_rmem_view(work, 16), dest)
+    for fragment in cutlass.range_constexpr(fragments):
+        cute.copy(
+            atom_store,
+            _blockscaled_rmem_view(work[None, fragment], 16),
+            _blockscaled_tmem_view(scratch_ptr + fragment * 16, 32, 16),
+        )
+    cute.arch.fence_view_async_tmem_store()
     atom_load3 = cute.make_copy_atom(
         tcgen05.Ld16x256bOp(tcgen05.Repetition.x2), cutlass.Float32
     )
-    cute.copy(atom_load3, dest_top, _blockscaled_rmem_view(work, 8))
-    cute.copy(atom_load3, dest_bottom, _blockscaled_rmem_view(work, 8, 8))
-    for i in cutlass.range_constexpr(16):
-        result[i] = work[perm3[i]]
-    cute.copy(atom_store, _blockscaled_rmem_view(result, 16), dest)
+    for fragment in cutlass.range_constexpr(fragments):
+        for half in cutlass.range_constexpr(2):
+            cute.copy(
+                atom_load3,
+                _blockscaled_tmem_view(
+                    scratch_ptr + fragment * 16 + half * (16 << 16), 16, 16
+                ),
+                _blockscaled_rmem_view(work[None, fragment], 8, half * 8),
+            )
+    cute.arch.fence_view_async_tmem_load()
+    for fragment in cutlass.range_constexpr(fragments):
+        for i in cutlass.range_constexpr(16):
+            result[i, fragment] = work[perm3[i], fragment]
+        cute.copy(
+            atom_store,
+            _blockscaled_rmem_view(result[None, fragment], 16),
+            _blockscaled_tmem_view(scratch_ptr + fragment * 16, 32, 16),
+        )
+    cute.arch.fence_view_async_tmem_store()
     atom_load4 = cute.make_copy_atom(
         tcgen05.Ld16x128bOp(tcgen05.Repetition.x4), cutlass.Float32
     )
-    cute.copy(atom_load4, dest_top, _blockscaled_rmem_view(work, 8))
-    cute.copy(atom_load4, dest_bottom, _blockscaled_rmem_view(work, 8, 8))
-    for i in cutlass.range_constexpr(16):
-        result[i] = work[perm1[i]]
+    for fragment in cutlass.range_constexpr(fragments):
+        for half in cutlass.range_constexpr(2):
+            cute.copy(
+                atom_load4,
+                _blockscaled_tmem_view(
+                    scratch_ptr + fragment * 16 + half * (16 << 16), 16, 16
+                ),
+                _blockscaled_rmem_view(work[None, fragment], 8, half * 8),
+            )
+        for i in cutlass.range_constexpr(16):
+            result[i, fragment] = work[perm1[i], fragment]
     return result
 
 
@@ -779,7 +808,7 @@ class Sm100BlockScaledMoeEpilogue:
         packed.store(
             scaled_values.load().to(self.output_dtype).bitcast(cutlass.Float32)
         )
-        words = _blockscaled_transpose16x32(packed, scratch)
+        words = _blockscaled_transpose16x32((packed,), scratch)[None, 0]
         halves = cute.make_rmem_tensor((32,), self.output_dtype)
         halves.store(words.load().bitcast(self.output_dtype))
         result = cute.make_rmem_tensor((32,), self.output_dtype)
@@ -822,8 +851,8 @@ class Sm100BlockScaledMoeEpilogue:
             up = _blockscaled_load16x32(scratch)
             gate = _blockscaled_load16x32(scratch + (16 << 16))
             if cutlass.const_expr(self.use_per_token_scale):
-                up = _blockscaled_transpose16x32(up, scratch)
-                gate = _blockscaled_transpose16x32(gate, scratch, True)
+                transposed = _blockscaled_transpose16x32((up, gate), scratch)
+                up, gate = transposed[None, 0], transposed[None, 1]
                 if cutlass.const_expr(release_acc):
                     cute.arch.fence_view_async_tmem_load()
                     acc_pipeline.consumer_release(acc_state)
@@ -841,7 +870,7 @@ class Sm100BlockScaledMoeEpilogue:
                 values = self._activate(up, gate, token_alpha)
             else:
                 values = self._activate(up, gate, alpha)
-                values = _blockscaled_transpose16x32(values, scratch)
+                values = _blockscaled_transpose16x32((values,), scratch)[None, 0]
             if cutlass.const_expr(release_acc and not self.use_per_token_scale):
                 # All overlapping accumulator and transpose-scratch reads have
                 # completed before either CTA allows the next MMA to overwrite.
@@ -898,8 +927,8 @@ class Sm100BlockScaledMoeEpilogue:
         ):
             top = _blockscaled_load16x32(scratch)
             bottom = _blockscaled_load16x32(scratch + (16 << 16))
-            top = _blockscaled_transpose16x32(top, scratch)
-            bottom = _blockscaled_transpose16x32(bottom, scratch, True)
+            transposed = _blockscaled_transpose16x32((top, bottom), scratch)
+            top, bottom = transposed[None, 0], transposed[None, 1]
             if cutlass.const_expr(release_acc):
                 # All overlapping accumulator and transpose-scratch reads have
                 # completed before either CTA allows the next MMA to overwrite.
