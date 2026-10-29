@@ -1033,6 +1033,17 @@ def _run_rank(
         for ph in ("orig", "bwd")
     )
     flags["handle_modes"] = rec_h["modes"] == ["capture", "replay"]
+    # the ring exchange (where the partition allows it): its recompute skips the hops as well
+    if W > 1 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS:
+        res_pr, rec_pr = handle_pass(False, exchange="ring")
+        res_hr, rec_hr = handle_pass(True, exchange="ring")
+        handle_info["ring"] = {"plain": rec_pr, "handle": rec_hr}
+        flags["handle_ring_eq_ckpt"] = _eq(res_pr, res_hr) and _eq(res_auto, res_hr)
+        flags["handle_ring_recompute_no_comm"] = (
+            rec_hr["calls"].get("recompute", 0) == 0
+            and rec_hr["waits"].get("recompute", 0) == 0
+            and rec_hr["modes"] == ["capture", "replay"]
+        )
     res_h2, rec_h2 = handle_pass(True, twice=True)
     handle_info["twice"] = rec_h2
     flags["handle_twice_accumulates"] = (
