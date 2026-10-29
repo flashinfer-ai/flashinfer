@@ -2638,7 +2638,7 @@ def _one_token_per_sequence_inputs(num_seqs, H, D, state_dtype):
     return q, k, v, g, beta, A_log, dt_bias, pool, cu_seqlens, state_indices
 
 
-def _run_one_token_per_sequence(inputs, dt_bias, pool):
+def _run_one_token_per_sequence(inputs, dt_bias, pool, output=None):
     q, k, v, g, beta, A_log, _, _, cu_seqlens, state_indices = inputs
     out, _ = recurrent_kda(
         q,
@@ -2654,6 +2654,7 @@ def _run_one_token_per_sequence(inputs, dt_bias, pool):
         use_gate_in_kernel=True,
         lower_bound=-5.0,
         beta_is_logit=True,
+        output=output,
     )
     return out
 
@@ -2670,8 +2671,12 @@ def test_one_token_per_sequence_accepts_2d_dt_bias(num_seqs):
     torch.testing.assert_close(pool_2d, pool, rtol=0, atol=0)
 
 
-def test_one_token_per_sequence_rejects_fp32_state():
-    H, D = 8, 128
-    inputs = _one_token_per_sequence_inputs(4, H, D, torch.float32)
+@pytest.mark.parametrize("num_seqs", [0, 4, 64])
+@pytest.mark.parametrize("D", [64, 128])
+def test_one_token_per_sequence_rejects_fp32_state(num_seqs, D):
+    H = 8
+    inputs = _one_token_per_sequence_inputs(num_seqs, H, D, torch.float32)
+    output = torch.full_like(inputs[2], 7.0)
     with pytest.raises(TypeError, match="bfloat16 state"):
-        _run_one_token_per_sequence(inputs, inputs[6], inputs[7])
+        _run_one_token_per_sequence(inputs, inputs[6], inputs[7], output=output)
+    assert torch.all(output == 7.0)

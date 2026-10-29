@@ -2043,6 +2043,12 @@ def run_recurrent_kda(
     for name, tensor in (("q", q), ("k", k), ("v", v), ("g", g), ("beta", beta)):
         if tensor.dtype != torch.bfloat16:
             raise TypeError(f"{name} must be bfloat16, got {tensor.dtype}")
+    if initial_state is not None and initial_state.dtype != torch.bfloat16:
+        raise TypeError(
+            "the CuTe DSL recurrent decode kernels require a bfloat16 state, got "
+            f"{initial_state.dtype}; float32 state pools are supported only by plain "
+            "multi-token prefill (more tokens than sequences)"
+        )
     if HV < H or HV % H != 0:
         raise ValueError(f"HV must be a positive multiple of H, got H={H}, HV={HV}")
 
@@ -2572,12 +2578,6 @@ def run_recurrent_kda(
             out_buf = out_buf.reshape(_batched_spec_B, 1 + num_spec_tokens, HV, V)
         return (out_buf, state if output_final_state else None)
 
-    if state.dtype != torch.bfloat16:
-        raise TypeError(
-            "the CuTe DSL recurrent decode kernels require a bfloat16 state, got "
-            f"{state.dtype}; float32 state pools are supported only by plain "
-            "multi-token prefill (more tokens than sequences)"
-        )
     if dt_bias is not None and dt_bias.ndim != 1:
         dt_bias = dt_bias.reshape(-1)
 
