@@ -1191,11 +1191,14 @@ def test_nvfp4_early_qk_quantizer_matches_the_head_quantizer():
 
 
 def test_nvfp4_tp_quantizer_matches_the_head_quantizer():
-    """Both fp4 quantizers, bound on a plan of exactly ``QUANTIZE_TP_MAX_PB``
-    (128) packed blocks with ragged blocks and an empty segment, write
-    bitwise-identical packed operands (padding included) and give a
-    bitwise-identical attention output; a 129-block plan binds ``quantize``
-    and stays exact."""
+    """Every fp4 quantizer build (``quantize``, ``quantize_tp`` and, where the
+    route carries it, ``quantize_tp_mb8``), bound on a plan of exactly
+    ``QUANTIZE_TP_MAX_PB`` (128) packed blocks with ragged blocks and an empty
+    segment, writes bitwise-identical packed operands (padding included) and
+    gives a bitwise-identical attention output; the plan binds the build of
+    the window rule (its 1024-CTA quantize grid lies in
+    ``QUANTIZE_TP_MB8_GRID``); a 129-block plan binds ``quantize`` and stays
+    exact."""
     import tvm_ffi
 
     arch = _require_program("nvfp4_fp4pv")
@@ -1203,20 +1206,28 @@ def test_nvfp4_tp_quantizer_matches_the_head_quantizer():
         pytest.skip(f"the fp4 route carries no quantize_tp program on {arch}")
     cu, heads = [0, 37, 37, 237, 16237], 2
     q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=23)
+    modules = cake_backend.select_route("nvfp4_fp4pv", arch)["modules"]
+    stages = ["quantize", "quantize_tp"]
+    bound = "quantize_tp"
+    if "quantize_tp_mb8" in modules:
+        stages.append("quantize_tp_mb8")
+        low, high = cake_backend.QUANTIZE_TP_MB8_GRID
+        assert low <= cake_backend.nvfp4_quantize_grid(heads, 128)[0] <= high
+        bound = "quantize_tp_mb8"
     runners = {}
-    for stage in ("quantize", "quantize_tp"):
+    for stage in stages:
         runner = prepare_minimax_h3_varlen_nvfp4_attention(
             q, k, v, cu_seqlens, pv_mode="fp4", cu_seqlens_host=cu
         )
-        assert runner.plan.PB == 128 and runner.quantize_stage == "quantize_tp"
+        assert runner.plan.PB == 128 and runner.quantize_stage == bound
         for tensor in runner.workspace.values():
             tensor.view(torch.uint8).fill_(0xA5)
-        route = cake_backend.select_route("nvfp4_fp4pv", runner.arch)
-        by_value = cake_backend.QUANTIZE_TP_BY_VALUE if stage == "quantize_tp" else ()
+        slot = "quantize" if stage == "quantize" else "quantize_tp"
+        by_value = cake_backend.QUANTIZE_TP_BY_VALUE if slot == "quantize_tp" else ()
         entry, arguments = cake_backend._bind_stage(
-            route["modules"][stage],
+            modules[stage],
             runner.arch,
-            runner.stage_kwargs[stage],
+            runner.stage_kwargs[slot],
             exact=True,
             by_value=by_value,
         )
@@ -1225,15 +1236,17 @@ def test_nvfp4_tp_quantizer_matches_the_head_quantizer():
         runner.attention()
         runners[stage] = runner
     torch.cuda.synchronize()
-    head, tp = runners["quantize"], runners["quantize_tp"]
-    assert head.workspace.keys() == tp.workspace.keys()
-    for name, tensor in head.workspace.items():
-        assert torch.equal(
-            tensor.view(torch.uint8), tp.workspace[name].view(torch.uint8)
-        ), name
-    torch.testing.assert_close(tp.out, head.out, atol=0, rtol=0)
+    head = runners["quantize"]
     scale = 1.0 / math.sqrt(HEAD_DIM)
-    _check(tp.out, _reference(q, k, v, cu, scale), NVFP4_ATOL, NVFP4_RTOL)
+    for stage in stages[1:]:
+        tp = runners[stage]
+        assert head.workspace.keys() == tp.workspace.keys()
+        for name, tensor in head.workspace.items():
+            assert torch.equal(
+                tensor.view(torch.uint8), tp.workspace[name].view(torch.uint8)
+            ), (stage, name)
+        torch.testing.assert_close(tp.out, head.out, atol=0, rtol=0)
+        _check(tp.out, _reference(q, k, v, cu, scale), NVFP4_ATOL, NVFP4_RTOL)
     cu = [0, 16384, 16385]
     q, k, v, cu_seqlens = _make_inputs(cu, 1, seed=24)
     runner = prepare_minimax_h3_varlen_nvfp4_attention(
