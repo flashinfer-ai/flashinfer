@@ -111,6 +111,9 @@ jobs:
       skip_build: ${{ steps.check.outputs.skip }}
       test_matrix: ${{ steps.matrix.outputs.matrix }}
       test_count: ${{ steps.matrix.outputs.count }}
+      aot_build_matrix: ${{ steps.matrix.outputs.aot_build_matrix }}
+      aot_assemble_matrix: ${{ steps.matrix.outputs.aot_assemble_matrix }}
+      aot_count: ${{ steps.matrix.outputs.aot_count }}
       # Surfaced so the required check can say a green result was scoped.
       test_scope: ${{ steps.scope.outputs.test_path }}
       h100_disabled: ${{ steps.matrix.outputs.h100_disabled }}
@@ -253,9 +256,16 @@ jobs:
               --targets "${REQUESTED_TEST_PATH}")
             echo "T4 targeted scope:   ${T4_SCOPE:-<none: lane not scheduled>}"
           fi
+          # AOT: each (arch, cuda) image builds its provider wheels in two parallel groups
+          # (aot-build) and a final job assembles the shim from them (aot-assemble),
+          # whose name is the long-standing "AOT Build Import" check. The groups come
+          # from ci/cuda-versions.json (scripts/pr_checks/aot_provider_groups.py).
+          # They are separate jobs from the GPU matrix: the assembly has to `needs:`
+          # the builds, which a matrix entry cannot.
           {
             if [ "$SKIP_AOT" != "true" ]; then
               for arch in x64 arm64; do
+                case "$arch" in x64) cpu_arch=x86_64 ;; arm64) cpu_arch=aarch64 ;; esac
                 for cuda in $(jq -r '.[].label' <<< "${RUNTIME_CUDA_MATRIX}"); do
                   # Runtime entries land before their multi-arch image is
                   # published. The release-ci-docker workflow adds the tag in
@@ -264,18 +274,33 @@ jobs:
                     echo "::notice title=AOT image not published::Skipping ${cuda}; ci/docker-tags.yml has no published image yet" >&2
                     continue
                   fi
-                  jq -nc --arg arch "$arch" --arg cuda "$cuda" '{
-                    name: "AOT Build Import (\($arch), \($cuda))",
-                    kind: "aot",
-                    runner: ["self-hosted", "linux", $arch, "cpu", "on-demand"],
-                    cuda: $cuda,
-                    script: "task_test_jit_cache_package_build_import.sh",
-                    timeout: 360
-                  }'
+                  python3 scripts/pr_checks/aot_provider_groups.py \
+                    --cuda "$cuda" --cpu-architecture "$cpu_arch" |
+                    jq -c --arg arch "$arch" --arg cuda "$cuda" '
+                      to_entries[] | {
+                        kind: "build",
+                        name: "AOT Provider Build (\($arch), \($cuda), \(.value))",
+                        runner: ["self-hosted", "linux", $arch, "cpu", "on-demand"],
+                        cuda: $cuda,
+                        group: (.key | tostring),
+                        providers: .value,
+                        timeout: 180
+                      }'
                 done
               done
             fi
+          } | jq -sc '{include: .}' > aot_build_matrix.json
+          jq -c '{include: (.include | map({
+                    kind: "assemble",
+                    name: "AOT Build Import (\(.runner[2]), \(.cuda))",
+                    runner, cuda, timeout: 60
+                  }) | unique_by(.name))}' aot_build_matrix.json > aot_assemble_matrix.json
+          echo "aot_build_matrix=$(cat aot_build_matrix.json)" >> $GITHUB_OUTPUT
+          echo "aot_assemble_matrix=$(cat aot_assemble_matrix.json)" >> $GITHUB_OUTPUT
+          echo "aot_count=$(jq '.include | length' aot_build_matrix.json)" >> $GITHUB_OUTPUT
+          jq -r '.include[].name' aot_build_matrix.json aot_assemble_matrix.json
 
+          {
             if [ "$SKIP_GPU" != "true" ] && [ -z "${REQUESTED_TEST_PATH}" ]; then
               for shard in 1 2 3 4 5; do
                 jq -nc --arg shard "$shard" '{
@@ -371,6 +396,177 @@ jobs:
           jq -r '.include[].name' matrix.json
 
   # ---------------------------------------------------------------------------
+  # AOT provider builds - one job per group of provider architectures
+  #
+  # Built serially on one runner the providers took ~47 min even with every
+  # compile a cache hit. The groups (scripts/pr_checks/aot_provider_groups.py)
+  # build on separate runners, two providers at a time on each, and hand their
+  # wheels to aot-assemble.
+  # ---------------------------------------------------------------------------
+  aot-build:
+    name: ${{ matrix.name }}
+    needs: [gate, setup]
+    if: |
+      needs.gate.outputs.authorized == 'true' &&
+      needs.setup.outputs.skip_build != 'true' &&
+      needs.setup.outputs.aot_count != '0'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: ${{ github.event_name != 'schedule' }}
+      matrix: ${{ fromJSON(needs.setup.outputs.aot_build_matrix) }}
+    env:
+      DOCKER_IMAGE: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ needs.setup.outputs.docker_tag }}
+      MATRIX_ARCH: ${{ matrix.runner[2] }}
+      MATRIX_CUDA: ${{ matrix.cuda }}
+      MATRIX_GROUP: ${{ matrix.group }}
+      PROVIDERS: ${{ matrix.providers }}
+    steps:
+      - name: Cleanup
+        run: |
+          docker stop $(docker ps -q) 2>/dev/null || true
+          docker rm $(docker ps -aq) 2>/dev/null || true
+          sudo rm -rf ${{ github.workspace }}/* || true
+          sudo rm -rf ${{ github.workspace }}/.[!.]* || true
+          rm -rf ~/.cache/flashinfer_jit || true
+          docker image prune -f || true
+          docker builder prune -f --filter "until=24h" || true
+
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Show Node Info
+        run: ./scripts/task_show_node_info.sh
+        env:
+          NODE_NAME: ${{ runner.name }}
+          WORKSPACE: ${{ github.workspace }}
+          BUILD_NUMBER: ${{ github.run_number }}
+
+      - name: Build provider wheels
+        env:
+          SCCACHE_BUCKET: ${{ vars.SCCACHE_BUCKET }}
+          SCCACHE_REGION: ${{ vars.SCCACHE_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
+          # Builds within a group overlap (see the script); the repository variable
+          # AOT_PROVIDER_CONCURRENCY overrides it, and 1 builds them one by one.
+          AOT_PROVIDER_CONCURRENCY: ${{ vars.AOT_PROVIDER_CONCURRENCY || '2' }}
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/sccache-stats" "${GITHUB_WORKSPACE}/aot-wheelhouse"
+          # Comma-separated: ci/bash.sh word-splits -e values. Each group has its
+          # own runner, so MAX_JOBS (compute_jit_cache_parallelism) is sized for the
+          # whole box, as before.
+          bash ci/bash.sh "${DOCKER_IMAGE}" \
+            -e SCCACHE_BUCKET "${SCCACHE_BUCKET}" \
+            -e SCCACHE_REGION "${SCCACHE_REGION}" \
+            -e AWS_ACCESS_KEY_ID \
+            -e AWS_SECRET_ACCESS_KEY \
+            -e SCCACHE_STATS_DIR /workspace/sccache-stats \
+            -e AOT_PHASE build \
+            -e AOT_PROVIDER_CONCURRENCY "${AOT_PROVIDER_CONCURRENCY}" \
+            -e AOT_PROVIDER_ARCHITECTURES "${PROVIDERS// /,}" \
+            -e AOT_WHEELHOUSE_DIR /workspace/aot-wheelhouse \
+            --no-gpu ./scripts/task_test_jit_cache_package_build_import.sh
+
+      - name: Display sccache stats
+        if: always()
+        run: |
+          STATS_FILE="${GITHUB_WORKSPACE}/sccache-stats/sccache-stats.txt"
+          if [ -s "${STATS_FILE}" ]; then
+            cat "${STATS_FILE}"
+          else
+            echo "::warning::sccache stats were not produced"
+          fi
+
+      - name: Record sccache job metadata
+        if: always()
+        run: |
+          mkdir -p "${GITHUB_WORKSPACE}/sccache-stats"
+          IMAGE_DIGESTS=$(docker image inspect --format '{{json .RepoDigests}}' "${DOCKER_IMAGE}" 2>/dev/null || printf 'unavailable')
+          {
+            printf 'git_commit=%s\n' "$(git rev-parse HEAD)"
+            printf 'docker_image=%s\n' "${DOCKER_IMAGE}"
+            printf 'docker_image_repo_digests=%s\n' "${IMAGE_DIGESTS}"
+            printf 'matrix_cuda=%s\n' "${MATRIX_CUDA}"
+            printf 'matrix_arch=%s\n' "${MATRIX_ARCH}"
+            printf 'matrix_kind=aot\n'
+            printf 'providers=%s\n' "${PROVIDERS}"
+          } > "${GITHUB_WORKSPACE}/sccache-stats/job-metadata.txt"
+
+      - name: Upload sccache stats
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sccache-stats-${{ matrix.cuda }}-${{ matrix.runner[2] }}-group${{ matrix.group }}
+          path: sccache-stats/
+          if-no-files-found: warn
+          retention-days: 14
+
+      # Handed to aot-assemble. Names carry the run attempt: a re-run of failed
+      # jobs must not find (or collide with) the wheels of an earlier attempt.
+      - name: Upload provider wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: aot-wheels-${{ matrix.cuda }}-${{ matrix.runner[2] }}-${{ github.run_id }}-${{ github.run_attempt }}-group${{ matrix.group }}
+          path: aot-wheelhouse/*.whl
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # AOT shim assembly - the "AOT Build Import (<arch>, <cuda>)" check
+  #
+  # Builds the shim over every provider wheel, installs it and verifies each
+  # provider's module inventory. Waits for all groups, as a matrix job cannot
+  # depend on a subset of another job's matrix.
+  # ---------------------------------------------------------------------------
+  aot-assemble:
+    name: ${{ matrix.name }}
+    needs: [gate, setup, aot-build]
+    if: |
+      needs.gate.outputs.authorized == 'true' &&
+      needs.setup.outputs.skip_build != 'true' &&
+      needs.setup.outputs.aot_count != '0' &&
+      needs.aot-build.result == 'success'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.aot_assemble_matrix) }}
+    env:
+      DOCKER_IMAGE: flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ needs.setup.outputs.docker_tag }}
+    steps:
+      - name: Cleanup
+        run: |
+          docker stop $(docker ps -q) 2>/dev/null || true
+          docker rm $(docker ps -aq) 2>/dev/null || true
+          sudo rm -rf ${{ github.workspace }}/* || true
+          sudo rm -rf ${{ github.workspace }}/.[!.]* || true
+          rm -rf ~/.cache/flashinfer_jit || true
+          docker image prune -f || true
+
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Download provider wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: aot-wheels-${{ matrix.cuda }}-${{ matrix.runner[2] }}-${{ github.run_id }}-${{ github.run_attempt }}-group*
+          path: aot-wheelhouse
+          merge-multiple: true
+
+      - name: Assemble shim, install and verify
+        run: |
+          ls -lh aot-wheelhouse
+          bash ci/bash.sh "${DOCKER_IMAGE}" \
+            -e AOT_PHASE assemble \
+            -e AOT_WHEELHOUSE_DIR /workspace/aot-wheelhouse \
+            --no-gpu ./scripts/task_test_jit_cache_package_build_import.sh
+
+  # ---------------------------------------------------------------------------
   # Tests - AOT build imports and GPU unit tests
   #
   # Every test is one entry of a single matrix so that fail-fast cancels all of
@@ -407,7 +603,7 @@ jobs:
       # which turns it off for A/B timing without a code change. The `|| '1'`
       # matters: an unset variable is null, and `null != '0'` is false because
       # mismatched types are compared as numbers (null and '0' both become 0).
-      GPU_TEST_SCCACHE: ${{ matrix.kind != 'aot' && (vars.FLASHINFER_GPU_TEST_SCCACHE || '1') != '0' && '1' || '0' }}
+      GPU_TEST_SCCACHE: ${{ (vars.FLASHINFER_GPU_TEST_SCCACHE || '1') != '0' && '1' || '0' }}
     steps:
       - name: Cleanup
         if: matrix.kind != 'h100'
@@ -457,33 +653,6 @@ jobs:
           BUILD_NUMBER: ${{ github.run_number }}
 
       - name: Run Test
-        if: matrix.kind == 'aot'
-        env:
-          SCCACHE_BUCKET: ${{ vars.SCCACHE_BUCKET }}
-          SCCACHE_REGION: ${{ vars.SCCACHE_REGION }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
-          # Provider builds overlapped per job (see the script). The repository
-          # variable AOT_PROVIDER_CONCURRENCY overrides it, and 1 restores the
-          # serial loop, for A/B timing without a code change.
-          AOT_PROVIDER_CONCURRENCY: ${{ vars.AOT_PROVIDER_CONCURRENCY || '2' }}
-        run: |
-          if [ "${TEST_SCRIPT}" != "task_test_jit_cache_package_build_import.sh" ]; then
-            echo "::error::Unexpected AOT test script: ${TEST_SCRIPT}"
-            exit 1
-          fi
-          mkdir -p "${GITHUB_WORKSPACE}/sccache-stats"
-          bash ci/bash.sh "${DOCKER_IMAGE}" \
-            -e SCCACHE_BUCKET "${SCCACHE_BUCKET}" \
-            -e SCCACHE_REGION "${SCCACHE_REGION}" \
-            -e AWS_ACCESS_KEY_ID \
-            -e AWS_SECRET_ACCESS_KEY \
-            -e SCCACHE_STATS_DIR /workspace/sccache-stats \
-            -e AOT_PROVIDER_CONCURRENCY "${AOT_PROVIDER_CONCURRENCY}" \
-            --no-gpu "./scripts/${TEST_SCRIPT}"
-
-      - name: Run Test
-        if: matrix.kind != 'aot'
         env:
           SCCACHE_BUCKET: ${{ vars.SCCACHE_BUCKET }}
           SCCACHE_REGION: ${{ vars.SCCACHE_REGION }}
@@ -564,7 +733,7 @@ jobs:
           fi
 
       - name: Display sccache stats
-        if: always() && (matrix.kind == 'aot' || env.GPU_TEST_SCCACHE == '1')
+        if: always() && env.GPU_TEST_SCCACHE == '1'
         run: |
           STATS_FILE="${GITHUB_WORKSPACE}/sccache-stats/sccache-stats.txt"
           if [ -s "${STATS_FILE}" ]; then
@@ -574,7 +743,7 @@ jobs:
           fi
 
       - name: Record sccache job metadata
-        if: always() && (matrix.kind == 'aot' || env.GPU_TEST_SCCACHE == '1')
+        if: always() && env.GPU_TEST_SCCACHE == '1'
         run: |
           mkdir -p "${GITHUB_WORKSPACE}/sccache-stats"
           IMAGE_DIGESTS=$(docker image inspect --format '{{json .RepoDigests}}' "${DOCKER_IMAGE}" 2>/dev/null || printf 'unavailable')
@@ -589,17 +758,17 @@ jobs:
           } > "${GITHUB_WORKSPACE}/sccache-stats/job-metadata.txt"
 
       - name: Upload sccache stats
-        if: always() && (matrix.kind == 'aot' || env.GPU_TEST_SCCACHE == '1')
+        if: always() && env.GPU_TEST_SCCACHE == '1'
         uses: actions/upload-artifact@v4
         with:
           # GPU lanes share a CUDA/runner pair, so they add the matrix index.
-          name: ${{ matrix.kind == 'aot' && format('sccache-stats-{0}-{1}', matrix.cuda, matrix.runner[2]) || format('sccache-stats-{0}-{1}-{2}', matrix.kind, matrix.cuda, strategy.job-index) }}
+          name: sccache-stats-${{ matrix.kind }}-${{ matrix.cuda }}-${{ strategy.job-index }}
           path: sccache-stats/
           if-no-files-found: warn
           retention-days: 14
 
       - name: Summarize JIT build times
-        if: always() && matrix.kind != 'aot'
+        if: always()
         run: |
           if command -v python3 >/dev/null; then
             python3 scripts/summarize_jit_builds.py junit/jit-builds.jsonl || true
@@ -610,14 +779,14 @@ jobs:
           fi
 
       - name: Make JUnit XML readable
-        if: ${{ always() && matrix.kind != 'aot' }}
+        if: ${{ always() }}
         run: |
           if [ -d junit ]; then
             sudo chmod -R a+rX junit
           fi
 
       - name: Upload JUnit XML and telemetry
-        if: ${{ always() && matrix.kind != 'aot' }}
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           # Non-H100 names add the runner SM: A10G and T4 rows can run the same script.
@@ -660,6 +829,8 @@ jobs:
     needs:
       - gate
       - setup
+      - aot-build
+      - aot-assemble
       - test
     runs-on: ubuntu-latest
     steps:
@@ -1012,7 +1183,21 @@ jobs:
             echo "" >> $GITHUB_STEP_SUMMARY
           fi
 
-          if [ "$RESULT" == "success" ] || [ "$RESULT" == "skipped" ]; then
+          # AOT runs as two job groups outside the matrix above. aot-assemble is
+          # skipped, not failed, when a build failed or was cancelled, so it cannot
+          # be the only one read: a skipped assemble after a failed build must fail.
+          AOT_BUILD="${{ needs.aot-build.result }}"
+          AOT_ASSEMBLE="${{ needs.aot-assemble.result }}"
+          echo "AOT provider builds: ${AOT_BUILD}, AOT assembly: ${AOT_ASSEMBLE}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          AOT_OK=true
+          if [ "$AOT_BUILD" == "skipped" ]; then
+            [ "$AOT_ASSEMBLE" == "skipped" ] || AOT_OK=false
+          else
+            [ "$AOT_BUILD" == "success" ] && [ "$AOT_ASSEMBLE" == "success" ] || AOT_OK=false
+          fi
+
+          if { [ "$RESULT" == "success" ] || [ "$RESULT" == "skipped" ]; } && [ "$AOT_OK" == "true" ]; then
             echo "Result: Tests Passed" >> $GITHUB_STEP_SUMMARY
             exit 0
           fi

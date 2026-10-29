@@ -1169,3 +1169,103 @@ def test_aot_script_overlaps_providers_in_private_package_copies():
     assert "run_bounded_parallel" in text
     # Concurrent builds must not share the package dir `python -m build` writes to.
     assert 'cp -a flashinfer-jit-cache-provider "${provider_dir}"' in text
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _aot_provider_groups_module():
+    from scripts.pr_checks import aot_provider_groups
+
+    return aot_provider_groups
+
+
+@pytest.mark.cpu_only
+def test_aot_provider_groups_balance_the_measured_costs():
+    groups = _aot_provider_groups_module().split_groups(
+        ["8.0", "8.9", "9.0a", "10.0a", "10.3a", "12.0f"], 2
+    )
+
+    assert groups == [["9.0a", "10.3a", "8.9"], ["10.0a", "12.0f", "8.0"]]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("cpu_arch", ["x86_64", "aarch64"])
+def test_aot_provider_groups_partition_every_configured_provider_set(cpu_arch):
+    import json
+
+    module = _aot_provider_groups_module()
+    config = json.loads((_REPO_ROOT / "ci" / "cuda-versions.json").read_text())
+
+    for entry in config["jit_cache"]:
+        archs = module.provider_architectures(config, entry["label"], cpu_arch)
+        groups = module.split_groups(archs, module.DEFAULT_GROUP_COUNT)
+
+        assert all(groups), entry["label"]
+        assert sorted(a for group in groups for a in group) == sorted(archs)
+
+
+@pytest.mark.cpu_only
+def test_aot_provider_groups_handle_unknown_and_few_architectures():
+    module = _aot_provider_groups_module()
+
+    # An architecture missing from the cost table is still assigned exactly once.
+    groups = module.split_groups(["9.0a", "11.0f", "12.0f"], 3)
+    assert sorted(a for group in groups for a in group) == ["11.0f", "12.0f", "9.0a"]
+    # Never more groups than architectures, so no runner starts with nothing to do.
+    assert len(module.split_groups(["9.0a"], 3)) == 1
+    assert module.split_groups([], 3) == []
+    with pytest.raises(ValueError):
+        module.split_groups(["9.0a"], 0)
+
+
+@pytest.mark.cpu_only
+def test_aot_provider_groups_cli_prints_one_string_per_group():
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_REPO_ROOT / "scripts" / "pr_checks" / "aot_provider_groups.py"),
+            "--cuda",
+            "cu130",
+            "--cpu-architecture",
+            "x86_64",
+            "--config",
+            str(_REPO_ROOT / "ci" / "cuda-versions.json"),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    import json
+
+    groups = json.loads(result.stdout)
+    assert all(isinstance(group, str) for group in groups)
+    assert len(groups) == 2
+
+
+@pytest.mark.cpu_only
+def test_aot_build_import_script_phases_parse_and_reject_bad_phase():
+    script = _REPO_ROOT / "scripts" / "task_test_jit_cache_package_build_import.sh"
+    subprocess.run(["bash", "-n", str(script)], check=True)
+
+    text = script.read_text()
+    for phase in ("all", "build", "assemble"):
+        assert phase in text
+    # Assembly must be able to find every provider's wheel by its exact tag.
+    assert "flashinfer_jit_cache_sm${provider_architecture//./}-*.whl" in text
+
+
+@pytest.mark.cpu_only
+def test_pr_workflow_assembles_after_all_provider_builds():
+    yaml = pytest.importorskip("yaml")
+    workflow = yaml.safe_load(
+        (_REPO_ROOT / ".github/workflows/pr-test.yml").read_text()
+    )
+    jobs = workflow["jobs"]
+
+    assert "aot-build" in jobs["aot-assemble"]["needs"]
+    # The aggregate required check has to see both halves of the AOT check.
+    assert {"aot-build", "aot-assemble"} <= set(jobs["test-results-summary"]["needs"])
+    # AOT no longer rides the GPU matrix, whose entries cannot depend on each other.
+    assert "task_test_jit_cache_package_build_import.sh" not in str(jobs["test"])

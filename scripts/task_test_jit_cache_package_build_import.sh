@@ -156,9 +156,44 @@ print(" ".join(entry[f"{cpu_architecture}_provider_architectures"]))
 PY
 )
 read -ra PROVIDER_ARCHITECTURE_LIST <<< "${PROVIDER_ARCHITECTURES}"
+
+# The PR workflow builds the providers on several runners and assembles the shim
+# on another, so the work is selectable. Unset, everything runs here in order.
+#   AOT_PHASE                 all (default) | build | assemble
+#                             build:    build the provider wheels of
+#                                       AOT_PROVIDER_ARCHITECTURES into the wheelhouse
+#                             assemble: build the shim from the wheelhouse, which must
+#                                       hold every provider wheel, then install + verify
+#   AOT_PROVIDER_ARCHITECTURES  subset to build, space- or comma-separated (default: all;
+#                             commas because ci/bash.sh word-splits -e values)
+#   AOT_WHEELHOUSE_DIR        wheelhouse directory (default: dist-jit-cache-provider-test)
+: "${AOT_PHASE:=all}"
+case "${AOT_PHASE}" in
+    all|build|assemble) ;;
+    *)
+        echo "ERROR: AOT_PHASE must be all, build or assemble, got '${AOT_PHASE}'"
+        exit 1
+        ;;
+esac
+BUILD_ARCHITECTURE_LIST=("${PROVIDER_ARCHITECTURE_LIST[@]}")
+if [ -n "${AOT_PROVIDER_ARCHITECTURES:-}" ]; then
+    read -ra BUILD_ARCHITECTURE_LIST <<< "${AOT_PROVIDER_ARCHITECTURES//,/ }"
+    for provider_architecture in "${BUILD_ARCHITECTURE_LIST[@]}"; do
+        if [[ " ${PROVIDER_ARCHITECTURES} " != *" ${provider_architecture} "* ]]; then
+            echo "ERROR: ${provider_architecture} is not a ${CUDA_LABEL}/${CPU_ARCHITECTURE} provider architecture (${PROVIDER_ARCHITECTURES})"
+            exit 1
+        fi
+    done
+fi
+mkdir -p "${AOT_WHEELHOUSE_DIR:=dist-jit-cache-provider-test}"
+WHEELHOUSE=$(cd "${AOT_WHEELHOUSE_DIR}" && pwd)
+
 echo "Detected CUDA version: ${CUDA_LABEL}"
 echo "CPU architecture: ${CPU_ARCHITECTURE}"
 echo "Provider architectures: ${PROVIDER_ARCHITECTURES}"
+echo "Phase: ${AOT_PHASE}"
+echo "Providers built here: ${BUILD_ARCHITECTURE_LIST[*]}"
+echo "Wheelhouse: ${WHEELHOUSE}"
 
 compute_jit_cache_parallelism
 
@@ -197,8 +232,11 @@ echo "Setting up sccache"
 echo "========================================"
 
 export SCCACHE_BUCKET="${SCCACHE_BUCKET:-flashinfer-build-cache}"
-setup_sccache "cuda${CUDA_VERSION}-$(uname -m)" "$(pwd -P)"
+if [ "${AOT_PHASE}" != "assemble" ]; then
+    setup_sccache "cuda${CUDA_VERSION}-$(uname -m)" "$(pwd -P)"
+fi
 
+if [ "${AOT_PHASE}" != "assemble" ]; then
 echo ""
 echo "========================================"
 echo "Building flashinfer-jit-cache provider wheels"
@@ -209,12 +247,13 @@ python -c "import wheel" 2>/dev/null || pip install --no-deps wheel
 # --no-isolation keeps build from re-downloading torch, but it then verifies the
 # build requires transitively, and the image's torch declares an nvidia-cudnn
 # wheel the image does not install. Testing what the image ships is the point.
-WHEELHOUSE=$(pwd)/dist-jit-cache-provider-test
-rm -rf "${WHEELHOUSE}"
-mkdir -p "${WHEELHOUSE}"
+if [ "${AOT_PHASE}" = "all" ]; then
+    # A full local run starts from an empty wheelhouse, as it always has.
+    find "${WHEELHOUSE}" -mindepth 1 -delete
+fi
 
-# Providers build as a pool of AOT_PROVIDER_CONCURRENCY at a time (default 1:
-# one after another). Each build is CPU-bound on cache hits, so overlapping them
+# The providers built here run as a pool of AOT_PROVIDER_CONCURRENCY at a time
+# (default 1: one after another). Each build is CPU-bound on cache hits, so overlapping them
 # adds no cores; it fills the gaps one build leaves: the 60-75 s of spec
 # generation before ninja starts, and the tail where fewer TUs than MAX_JOBS
 # remain. The total ninja parallelism stays MAX_JOBS, split between the builds.
@@ -223,8 +262,8 @@ if ! [[ "${AOT_PROVIDER_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: AOT_PROVIDER_CONCURRENCY must be a positive integer, got '${AOT_PROVIDER_CONCURRENCY}'"
     exit 1
 fi
-if (( AOT_PROVIDER_CONCURRENCY > ${#PROVIDER_ARCHITECTURE_LIST[@]} )); then
-    AOT_PROVIDER_CONCURRENCY=${#PROVIDER_ARCHITECTURE_LIST[@]}
+if (( AOT_PROVIDER_CONCURRENCY > ${#BUILD_ARCHITECTURE_LIST[@]} )); then
+    AOT_PROVIDER_CONCURRENCY=${#BUILD_ARCHITECTURE_LIST[@]}
 fi
 TOTAL_MAX_JOBS=${MAX_JOBS}
 PER_PROVIDER_MAX_JOBS=$(( TOTAL_MAX_JOBS / AOT_PROVIDER_CONCURRENCY ))
@@ -263,11 +302,36 @@ build_provider_wheel() {
 
 PROVIDER_BUILD_STARTED_AT=${SECONDS}
 run_bounded_parallel "${AOT_PROVIDER_CONCURRENCY}" build_provider_wheel \
-    "${PROVIDER_ARCHITECTURE_LIST[@]}" || {
+    "${BUILD_ARCHITECTURE_LIST[@]}" || {
     echo "ERROR: A provider wheel build failed"
     exit 1
 }
 echo "Provider wheels built in $(( SECONDS - PROVIDER_BUILD_STARTED_AT )) s"
+echo "Built provider wheels:"
+ls -lh "${WHEELHOUSE}"
+fi
+
+if [ "${AOT_PHASE}" = "build" ]; then
+    echo ""
+    echo "========================================"
+    echo "✓✓✓ PROVIDER BUILD DONE: ${BUILD_ARCHITECTURE_LIST[*]} ✓✓✓"
+    echo "========================================"
+    exit 0
+fi
+
+# Assembly needs one wheel per provider; installing the shim would only fail later
+# with a pip resolution error that does not say which group's wheel is missing.
+if [ "${AOT_PHASE}" = "assemble" ]; then
+    for provider_architecture in "${PROVIDER_ARCHITECTURE_LIST[@]}"; do
+        # "9.0a" -> flashinfer_jit_cache_sm90a-<version>-<tags>.whl; the dash keeps
+        # sm90 from matching sm90a.
+        if ! compgen -G "${WHEELHOUSE}/flashinfer_jit_cache_sm${provider_architecture//./}-*.whl" >/dev/null; then
+            echo "ERROR: no provider wheel for ${provider_architecture} in ${WHEELHOUSE}"
+            ls -l "${WHEELHOUSE}"
+            exit 1
+        fi
+    done
+fi
 
 rm -rf flashinfer-jit-cache/dist flashinfer-jit-cache/build \
     flashinfer-jit-cache/*.egg-info
