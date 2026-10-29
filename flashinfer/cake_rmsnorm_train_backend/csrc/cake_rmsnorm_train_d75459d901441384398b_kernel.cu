@@ -52,10 +52,13 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_RED_FOLD_OFF 0
 #define SMEM_RED_FOLD_STAGE_BYTES 4096
 #define SMEM_RED_FOLD_STRIDE 4096
-#define SMEM_STAGE_OFF 4096
+#define SMEM_GRP_FOLD_OFF 4096
+#define SMEM_GRP_FOLD_STAGE_BYTES 512
+#define SMEM_GRP_FOLD_STRIDE 512
+#define SMEM_STAGE_OFF 4608
 #define SMEM_STAGE_STAGE_BYTES 131072
 #define SMEM_STAGE_STRIDE 131072
-#define SMEM_TOTAL 135168
+#define SMEM_TOTAL 135680
 #define THREADS 256
 
 #include <math_constants.h>
@@ -63,7 +66,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_cake_rmsnorm_train_d28b28659bee9c861c6c(float* __restrict__ partial, float* __restrict__ dw, int n_chunks)
+kernel_cake_rmsnorm_train_d75459d901441384398b(float* __restrict__ partial, float* __restrict__ dw, int n_chunks)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -81,8 +84,10 @@ kernel_cake_rmsnorm_train_d28b28659bee9c861c6c(float* __restrict__ partial, floa
     // Kernel setup ops
     float* red_fold = reinterpret_cast<float*>(smem_raw + 0);
     const int red_fold_addr = smem + 0;
-    uint8_t* stage = reinterpret_cast<uint8_t*>(smem_raw + 4096);
-    const int stage_addr = smem + 4096;
+    float* grp_fold = reinterpret_cast<float*>(smem_raw + 4096);
+    const int grp_fold_addr = smem + 4096;
+    uint8_t* stage = reinterpret_cast<uint8_t*>(smem_raw + 4608);
+    const int stage_addr = smem + 4608;
 
     // === Task calls (declaration order) ===
     asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -201,33 +206,60 @@ kernel_cake_rmsnorm_train_d28b28659bee9c861c6c(float* __restrict__ partial, floa
         red_fold[rsub * 32 + cg * 4 + e_3] = a[e_3] - c[e_3];
     }
     __syncthreads();
-    if (tid < 8) {
-        float o4[4];
-        float oc4[4];
+    if (tid < 32) {
+        int gi = tid / 8;
+        int lane_1 = tid - gi * 8;
+        float o[4];
+        float oc[4];
         #pragma unroll
         for (int e_4 = 0; e_4 < 4; e_4++) {
-            o4[e_4] = 0.0f;
-            oc4[e_4] = 0.0f;
+            o[e_4] = 0.0f;
+            oc[e_4] = 0.0f;
         }
         #pragma unroll
-        for (int k = 0; k < 32; k++) {
+        for (int k = 0; k < 8; k++) {
             #pragma unroll
             for (int e_5 = 0; e_5 < 4; e_5++) {
-                float d_6 = red_fold[k * 32 + tid * 4 + e_5];
-                float y_2 = __fmaf_rn(d_6, 1.0f, -oc4[e_5]);
-                float t_2 = o4[e_5] + y_2;
-                oc4[e_5] = t_2 - o4[e_5] - y_2;
-                o4[e_5] = t_2;
+                float d_6 = red_fold[(gi * 8 + k) * 32 + lane_1 * 4 + e_5];
+                float y_2 = __fmaf_rn(d_6, 1.0f, -oc[e_5]);
+                float t_2 = o[e_5] + y_2;
+                oc[e_5] = t_2 - o[e_5] - y_2;
+                o[e_5] = t_2;
             }
         }
         #pragma unroll
         for (int e_6 = 0; e_6 < 4; e_6++) {
-            o4[e_6] = o4[e_6] - oc4[e_6];
+            grp_fold[gi * 32 + lane_1 * 4 + e_6] = o[e_6] - oc[e_6];
         }
-        int ocol = s * 32 + tid * 4;
+    }
+    __syncthreads();
+    if (tid < 8) {
+        float o2[4];
+        float oc2[4];
+        #pragma unroll
+        for (int e_7 = 0; e_7 < 4; e_7++) {
+            o2[e_7] = 0.0f;
+            oc2[e_7] = 0.0f;
+        }
+        #pragma unroll
+        for (int gk = 0; gk < 4; gk++) {
+            #pragma unroll
+            for (int e_8 = 0; e_8 < 4; e_8++) {
+                float d2 = grp_fold[gk * 32 + tid * 4 + e_8];
+                float y_3 = __fmaf_rn(d2, 1.0f, -oc2[e_8]);
+                float t_3 = o2[e_8] + y_3;
+                oc2[e_8] = t_3 - o2[e_8] - y_3;
+                o2[e_8] = t_3;
+            }
+        }
+        #pragma unroll
+        for (int e_9 = 0; e_9 < 4; e_9++) {
+            o2[e_9] = o2[e_9] - oc2[e_9];
+        }
+        int ocol2 = s * 32 + tid * 4;
         {
-            float4 _v4 = make_float4(o4[0 + 0], o4[0 + 1], o4[0 + 2], o4[0 + 3]);
-            *reinterpret_cast<float4*>(dw + (unsigned long long)ocol) = _v4;
+            float4 _v4 = make_float4(o2[0 + 0], o2[0 + 1], o2[0 + 2], o2[0 + 3]);
+            *reinterpret_cast<float4*>(dw + (unsigned long long)ocol2) = _v4;
         }
     }
     __syncthreads();
