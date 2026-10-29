@@ -4012,8 +4012,11 @@ def test_workspace_pools_shared_lazy_and_predicted() -> None:
     add ``kcp_arena_layout(...)["ring"]`` bytes; on a forward-only workspace the :data:`FWD_LAZY_POOLS` (c1 receive,
     transfer staging, carry) stay unallocated until a call reads them, then hold their size and add
     ``kcp_arena_layout(..., backward=False)["lazy"]`` bytes (the two states of the forward-only prediction), while a
-    backward ensure sizes them up front; the pool sizes are the plan module's (:func:`kcp_pool_numel`)."""
+    backward ensure sizes them up front; without ``save_transfer`` the first state holds the
+    :data:`FWD_TRANSFER_POOLS` a saving forward reads and ``lazy`` is the carry plane alone, the same second state;
+    the pool sizes are the plan module's (:func:`kcp_pool_numel`)."""
     assert kp.FWD_LAZY_POOLS == ("c1_recv", "stage_m", "carry")
+    assert kp.FWD_TRANSFER_POOLS == ("c1_recv", "stage_m")
     assert not set(kp.FWD_LAZY_POOLS) & set(kp.LAZY_POOLS)
     assert set(kp.FWD_LAZY_POOLS) <= set(kp.FWD_POOLS)
     seen_p = seen_ring = seen_lazy = 0
@@ -4059,6 +4062,27 @@ def test_workspace_pools_shared_lazy_and_predicted() -> None:
                     ws_n.ensure(ctx, H, device="cpu", backward=True)
                     assert ws_n.bytes == full["arena"], (W, layout, r, H)
                     seen_lazy += fwd["lazy"] > 0
+                    # without save_transfer a saving forward reads the transfer pools (the a2a c1 receive, M_seg^T
+                    # in the staging plane): the first state holds them, a forward without a saved set adds the carry
+                    nt = kp.kcp_arena_layout(
+                        ctx, H=H, backward=False, save_transfer=False
+                    )
+                    assert kp.kcp_arena_layout(ctx, H=H, save_transfer=False) == full
+                    assert nt["arena"] == fwd["arena"] + sum(
+                        fwd[f"pool.{name}"] for name in kp.FWD_TRANSFER_POOLS
+                    )
+                    assert nt["lazy"] == fwd["pool.carry"]
+                    assert nt["arena"] + nt["lazy"] == fwd["arena"] + fwd["lazy"]
+                    ws_t = cake_kcp.KcpWorkspace(local=False)
+                    ws_t.ensure(ctx, H, device="cpu", backward=False)
+                    for name in kp.FWD_TRANSFER_POOLS:
+                        ws_t.pool(name, tb.sizes[name])
+                    assert ws_t.bytes == nt["arena"] and not ws_t.has("carry"), (
+                        W,
+                        layout,
+                        r,
+                        H,
+                    )
                     ws.ensure(ctx, H, device="cpu", backward=True)
                     assert ws.bytes == full["arena"], (W, layout, r, H)
                     for name in kp.FWD_LAZY_POOLS:  # sized by the backward ensure
@@ -4096,8 +4120,8 @@ def test_forward_only_layout_bytes_and_prediction() -> None:
     beside ``kb`` (both dead before the tape walk writes ``h``), exactly 2432 B per internal token-head -- at least
     128 below the existing backend's forward layout on every plan; the byte queries take it only for a forward-only
     light arena of the whole problem.  The rank prediction of a forward-only workspace (state after forwards with a
-    saved set) is the ``fwd_kcp`` local arena, the scratch table set and the non-lazy pools; the backward
-    prediction is unchanged."""
+    saved set) is the ``fwd_kcp`` local arena, the scratch table set and the non-lazy pools (plus the transfer pools
+    without ``save_transfer``); the backward prediction is unchanged and independent of ``save_transfer``."""
     rows = ((3000, 1, 4), (2999, 4, 64), (64 * 257, 3, 16), (1, 1, 1), (5000, 7, 2))
     for (S, N, H), arch in ((row, arch) for row in rows for arch in cake_jit.ARCHES):
         p = cake_backend.plan(S, N, H, SM_COUNT, arch)
@@ -4175,6 +4199,18 @@ def test_forward_only_layout_bytes_and_prediction() -> None:
                     fwd = kp.kcp_arena_layout(ctx, H=H, backward=False)
                     pred_b = kp.kcp_workspace_bytes(ctx, H=H)
                     pred_f = kp.kcp_workspace_bytes(ctx, H=H, backward=False)
+                    # without save_transfer the forward-only prediction holds the transfer pools a saving forward
+                    # reads; the backward prediction does not depend on it
+                    transfer = sum(fwd[f"pool.{n}"] for n in kp.FWD_TRANSFER_POOLS)
+                    assert (
+                        kp.kcp_workspace_bytes(ctx, H=H, save_transfer=False) == pred_b
+                    )
+                    assert (
+                        kp.kcp_workspace_bytes(
+                            ctx, H=H, backward=False, save_transfer=False
+                        )
+                        == pred_f + transfer
+                    ), (W, layout, r, H)
                     if ctx.T_r == 0:
                         assert pred_f == fwd["arena"] and pred_b == full["arena"]
                         continue
@@ -5329,27 +5365,31 @@ def _unit_operands(device, T: int, H: int, seed: int = 0x3837) -> dict:
 
 
 # (document lengths, H) of one rank: one document of 23 chunks (P > 1 on every exported device, a segment cut after
-# every chunk), two documents of 16 and 10 chunks (P > 1) and five documents with boundaries inside chunks, of 2 /
-# 10 / 2 / 16 / 3 chunks, at 64 heads (P = 1); documents start on even and odd internal chunks
+# every chunk), two documents of 16 and 10 chunks (P > 1) and five documents with boundaries inside chunks, of 1 /
+# 10 / 2 / 16 / 3 chunks, at 64 heads (P = 1); the documents of the last row start on internal chunks 0, 1, 11, 13
+# and 29, so chunk pairs of the pair-shaped programs straddle documents there
 FWD_ONLY_ROWS = (
     ((1450,), 2),
     ((1000, 577), 4),
-    ((100, 640, 77, 1000, 129), 64),
+    ((50, 640, 77, 1000, 129), 64),
 )
 
 
 def test_gpu_forward_only_layout_is_bitwise_and_lean(device) -> None:
     """The forward-only workspace (KDA module, one rank, the rows of ``FWD_ONLY_ROWS``: P = 1 and P > 1).  A saving
     forward on an empty workspace runs on the KCP forward layout (2432 B per internal token-head), allocates none of
-    the lazy pools and holds exactly ``kcp_workspace_bytes(..., backward=False)``; its high-water is that plus the
-    call's output and saved set.  Its ``out`` and saved set are bitwise those of the forward on a backward workspace
-    (the existing backend's ``fwd`` views), also with the arena filled with NaN before the call (on either layout:
-    no launch reads an arena byte the call did not write).  The backward on it releases the forward-only arena,
-    allocates the backward one (the backward workspace's bytes) and gives bitwise the backward workspace's gradients;
-    the first training step on an empty workspace peaks no higher than a later step.  A forward without a saved set
-    allocates the lazy pools at their size (the second prediction state, ``kcp_arena_layout(...)["lazy"]`` more)
-    with the same ``out``.  ``workspace=None`` (every forward on a forward-only arena of its own) gives bitwise the
-    same results, explicitly and through autograd."""
+    the lazy pools and holds exactly ``kcp_workspace_bytes(..., backward=False)``; its high-water is its end state
+    (the workspace, the output and the saved set: no transient above it).  Its ``out`` and saved set are bitwise
+    those of the forward on a backward workspace (the existing backend's ``fwd`` views), also with the arena filled
+    with NaN before the call (on either layout: no result depends on an arena byte the call did not write, the
+    output program's reads of the pad chunks' ``h`` entries included).  The backward on it releases the forward-only
+    arena, allocates the backward one (the backward workspace's bytes) and gives bitwise the backward workspace's
+    gradients; the first training step on an empty workspace peaks no higher than a later step.  A forward without a
+    saved set allocates the lazy pools at their size (the second prediction state, ``kcp_arena_layout(...)["lazy"]``
+    more) with the same ``out``.  With ``save_transfer=False`` a saving forward also allocates the transfer pools
+    (``kcp_workspace_bytes(..., backward=False, save_transfer=False)``) with the same ``out`` and ``S_in``, and a
+    forward without a saved set then reaches the same second state.  ``workspace=None`` (every forward on a
+    forward-only arena of its own) gives bitwise the same results, explicitly and through autograd."""
     backend = cake_kcp.get_backend()
     assert backend.local_stages
     dt = backend.dtypes
@@ -5398,19 +5438,16 @@ def test_gpu_forward_only_layout_is_bitwise_and_lean(device) -> None:
         out_f, saved_f = fwd(ws_f)
         torch.cuda.synchronize(device)
         hw_fwd = torch.cuda.max_memory_allocated(device) - base
+        end_fwd = torch.cuda.memory_allocated(device) - base
         local = ws_f.local
         assert not local.backward and local.fwd_layout == "fwd_kcp", row
         assert local.bytes == 2432 * local.plan.R * H, row
         assert not any(ws_f.has(n) for n in kp.FWD_LAZY_POOLS), row
         pred_f = kp.kcp_workspace_bytes(ctx, H=H, backward=False)
         assert ws_f.bytes == pred_f, (row, ws_f.bytes, pred_f)
-        call_bytes = out_f.numel() * out_f.element_size() + saved_f.bytes
-        assert hw_fwd <= pred_f + call_bytes + (1 << 20), (
-            row,
-            hw_fwd,
-            pred_f,
-            call_bytes,
-        )
+        # no transient above the end state (the workspace, out and the saved set alive): both are allocator block
+        # sizes, so the caching allocator's rounding cancels
+        assert hw_fwd <= end_fwd + (1 << 20), (row, hw_fwd, end_fwd)
         assert torch.equal(out_f, out_b), row
         assert saved_f.flags() == saved_b.flags(), row
         assert same(saved_f.tensors(), saved_b.tensors()), row
@@ -5446,6 +5483,24 @@ def test_gpu_forward_only_layout_is_bitwise_and_lean(device) -> None:
             row
         )  # one rank: no c1 receive; the staging and carry planes at P > 1
         del ws_n, out_n
+        # a saving forward without save_transfer reads the transfer pools (that option's first state); a forward
+        # without a saved set then adds the carry plane, the same second state
+        ws_t = new_ws()
+        out_t, saved_t = fwd(ws_t, save_transfer=False)
+        assert torch.equal(out_t, out_b) and not ws_t.has("carry"), row
+        for n in ("S_in", "carry"):
+            a, b = getattr(saved_t, n), getattr(saved_b, n)
+            assert (a is None) == (b is None) and (a is None or torch.equal(a, b)), (
+                row,
+                n,
+            )
+        pred_t = kp.kcp_workspace_bytes(ctx, H=H, backward=False, save_transfer=False)
+        assert ws_t.bytes == pred_t, (row, ws_t.bytes, pred_t)
+        out_t, _ = fwd(ws_t, save_for_backward=False)
+        lay_t = kp.kcp_arena_layout(ctx, H=H, backward=False, save_transfer=False)
+        assert torch.equal(out_t, out_b), row
+        assert ws_t.bytes == pred_t + lay_t["lazy"] == pred_f + lazy, row
+        del ws_t, out_t, saved_t
         # workspace=None: every forward on a forward-only arena of its own, explicitly and through autograd
         out_0, saved_0 = fwd(None)
         assert torch.equal(out_0, out_b) and same(saved_0.tensors(), saved_b.tensors())
@@ -5554,5 +5609,70 @@ def test_gpu_graph_replay_on_the_forward_only_layout_then_backward(device) -> No
             events
         )
         assert events[-1][1] == "replay" and "capture" in [e[1] for e in events], events
+    finally:  # the cached entries pin ws / ctx: never leak them into later tests
+        cake_kcp.graph_cache_clear()
+
+
+def test_gpu_graph_replay_after_a_forward_without_a_saved_set(device) -> None:
+    """``graph="replay"`` on a forward-only workspace whose lazy pools a forward without a saved set allocates (KDA
+    module, one rank, P > 1): the saving forwards capture and replay first (no lazy pool); the first forward without
+    a saved set allocates the lazy pools and drops the captured saving forward's entry (its key holds the pools as
+    they were, so no later call matches it, and its graph would keep its memory); those forwards then run eagerly
+    twice (the key before and after the allocation), capture once and replay, bitwise the eager ``out``; the saving
+    forwards after them capture again and replay bitwise."""
+    backend = cake_kcp.get_backend()
+    assert backend.local_stages
+    dt = backend.dtypes
+    H = 2
+    part = _small_partition(1, lengths=(1450,), layout="contiguous")
+    ctx = kp.build_kcp_context(part, None, 0, device)
+    assert ctx.heads(H).P > 1
+    x = _unit_operands(device, int(ctx.T_r), H)
+    q, k, v, g, beta = (x[n] for n in ("q", "k", "v", "g", "beta"))
+
+    def new_ws():
+        return cake_kcp.KcpWorkspace(state_dtype=dt["state"], local=True)
+
+    def fwd(ws, **kw):
+        return cake_kcp.chunk_kda_kcp_fwd(q, k, v, g, beta, ctx, workspace=ws, **kw)
+
+    out_r, saved_r = fwd(new_ws())  # the eager reference
+    ws = new_ws()
+
+    def captured() -> int:  # the cached graphs that pin ws
+        return sum(
+            e.graph is not None and any(p is ws for p in e.pins)
+            for e in cake_kcp._GRAPHS.values()
+        )
+
+    def run(save: bool, n: int) -> list[str]:
+        events = []
+        for _ in range(n):
+            out, saved = fwd(ws, save_for_backward=save, graph="replay")
+            events.append(cake_kcp.LAST_CALL["fwd"]["graph_event"])
+            assert torch.equal(out, out_r), events
+            if save:
+                assert all(
+                    torch.equal(a, b)
+                    for a, b in zip(saved.tensors(), saved_r.tensors(), strict=True)
+                ), events
+            else:
+                assert saved is None, events
+        return events
+
+    cake_kcp.graph_cache_clear()
+    try:
+        events = run(True, 4)
+        assert events.count("capture") == 1 and events[-1] == "replay", events
+        assert captured() == 1 and not any(ws.has(n) for n in kp.FWD_LAZY_POOLS)
+        events = run(False, 4)
+        assert events == ["eager", "eager", "capture", "replay"], events
+        assert all(ws.has(n) for n in kp.FWD_LAZY_POOLS)
+        assert captured() == 1, (
+            "the captured saving forward's unreachable entry stays cached"
+        )
+        events = run(True, 3)
+        assert events == ["eager", "capture", "replay"], events
+        assert captured() == 2
     finally:  # the cached entries pin ws / ctx: never leak them into later tests
         cake_kcp.graph_cache_clear()

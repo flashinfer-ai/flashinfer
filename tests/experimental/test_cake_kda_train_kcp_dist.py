@@ -243,6 +243,26 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
         and ws_n.bytes == pred_f + lazy_f
         and (ws_f.local is None or ws_f.local.fwd_layout == "fwd_kcp")
     )
+    # without save_transfer a forward with a saved set reads the c1 receive and transfer staging pools (that option's
+    # first state) and a forward without a saved set then adds the carry plane; the ring exchange (checked below)
+    # never allocates the c1 receive pool
+    ws_t = cake_kcp.KcpWorkspace()
+    out_t, _ = cake_kcp.chunk_kda_kcp_fwd(
+        q, k, v, g, beta, ctx, workspace=ws_t, save_transfer=False
+    )
+    pred_t = cake_kcp_plan.kcp_workspace_bytes(
+        ctx, H=H, backward=False, save_transfer=False
+    )
+    lay_t = cake_kcp_plan.kcp_arena_layout(
+        ctx, H=H, backward=False, save_transfer=False
+    )
+    fwd_only_bytes = fwd_only_bytes and ws_t.bytes == pred_t and not ws_t.has("carry")
+    cake_kcp.chunk_kda_kcp_fwd(
+        q, k, v, g, beta, ctx, workspace=ws_t, save_for_backward=False
+    )
+    fwd_only_bytes = (
+        fwd_only_bytes and ws_t.bytes == pred_t + lay_t["lazy"] == pred_f + lazy_f
+    )
     dq, dk, dv, dbeta, dg = cake_kcp.chunk_kda_kcp_bwd(
         q, k, v, g, beta, ctx, dout, saved=saved_f, workspace=ws_f
     )
@@ -257,6 +277,7 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
     fwd_only_eq = (
         torch.equal(out_b, res["out"])
         and torch.equal(out_n, res["out"])
+        and torch.equal(out_t, res["out"])
         and saved_f.flags() == saved_b.flags()
         and all(
             torch.equal(a, b)
@@ -264,7 +285,7 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
         )
         and all(torch.equal(res[n], res_fwd_only[n]) for n in TENSORS)
     )
-    del ws_f, ws_n, out_b, saved_b, out_f, saved_f, out_n, res_fwd_only
+    del ws_f, ws_n, ws_t, out_b, saved_b, out_f, saved_f, out_n, out_t, res_fwd_only
     leaves = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
     out_0 = cake_kcp.chunk_kda_kcp(*leaves, ctx)
     out_0.backward(dout)
@@ -279,6 +300,18 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
     ):  # gate 5: the ring path is bitwise the a2a path; the ring receives no c1 tensor, so recompute form only
         res_ring = saved_pass(exchange="ring", save_transfer=False)
         ring_ok = all(torch.equal(res_recompute[n], res_ring[n]) for n in TENSORS)
+        # a forward-only ring workspace: no c1 receive pool, the hop pools on first use
+        ws_r = cake_kcp.KcpWorkspace()
+        out_r, _ = cake_kcp.chunk_kda_kcp_fwd(
+            q, k, v, g, beta, ctx, workspace=ws_r, exchange="ring"
+        )
+        ring_ok = ring_ok and torch.equal(out_r, res["out"])
+        fwd_only_bytes = (
+            fwd_only_bytes
+            and not ws_r.has("c1_recv")
+            and ws_r.bytes == pred_t - lay_t["pool.c1_recv"] + lay_t["ring"]
+        )
+        del ws_r, out_r
     # every rank (a rank without tokens included) captures and replays the same calls: a rank that stayed eager
     # while the others captured would run its collectives outside the graphs of its peers
     cake_kcp.graph_cache_clear()

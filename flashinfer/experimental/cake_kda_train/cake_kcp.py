@@ -3013,7 +3013,9 @@ class KcpWorkspace:
     need; a call waits its c1 / c2 sends before a backward writes either).  The ring exchange's hop pools
     ``ring_out`` / ``ring_in`` (``cake_kcp_plan.LAZY_POOLS``) are allocated by the first call that reads them, and so
     are, on a forward-only workspace, ``c1_recv`` / ``stage_m`` / ``carry`` (``cake_kcp_plan.FWD_LAZY_POOLS``: a
-    forward with a saved set writes fresh tensors in their place; a forward without one reads them).  A forward-only
+    forward with a saved set writes a fresh carry plane in place of ``carry`` and, under ``save_transfer``, fresh
+    tensors in place of the other two, which it reads without it; a forward without one reads all three; their first
+    allocation drops the graph-cache entries pinning the workspace, whose keys hold its pools).  A forward-only
     local arena takes the KCP forward layout (:data:`LOCAL_LAYOUT_FWD_ONLY`, 2432 B per internal token-head); a
     backward workspace sizes every pool and the existing backend's layouts.  The saved-set tensors (``S_in`` = the c2
     output, the c1 receive tensor under ``save_transfer``, ``M_seg`` under ``save_transfer`` at ``P > 1``) are never
@@ -3194,13 +3196,19 @@ class KcpWorkspace:
     def pool(
         self, name: str, n: int | None = None, *, cached: bool = False
     ) -> torch.Tensor:
+        # the graph-cache keys hold the forward-only lazy pools (not the ring's): once one is allocated or replaced, no
+        # later call matches an earlier key of this workspace, so its entries (and their captured memory) go
+        fwd_lazy = name in cake_kcp_plan.FWD_LAZY_POOLS
         if (
-            (name in cake_kcp_plan.LAZY_POOLS or name in cake_kcp_plan.FWD_LAZY_POOLS)
+            (name in cake_kcp_plan.LAZY_POOLS or fwd_lazy)
             and n
             and self.device is not None
         ):
-            if self._grow(name, n, self.device) and self._slices:
-                self._drop_stale_slices()
+            if self._grow(name, n, self.device):
+                if self._slices:
+                    self._drop_stale_slices()
+                if fwd_lazy:
+                    _graph_release(self)
         t = self._pools.get(name)
         if t is None:
             if n not in (None, 0) or self.device is None:
@@ -3208,6 +3216,8 @@ class KcpWorkspace:
                     f"KcpWorkspace: pool {name!r} was not sized for this call (ensure() first)"
                 )
             t = self._pools[name] = _alloc((0,), self.state_dtype, self.device)
+            if fwd_lazy:
+                _graph_release(self)
         if n is None:
             return t
         if (
@@ -4749,13 +4759,15 @@ def graph_cache_clear() -> int:
     return n
 
 
-def _graph_release(arena: Any) -> int:
-    """Drop the cached graphs whose key pins ``arena``, a local arena that :meth:`KcpWorkspace.ensure` supersedes: no
-    later call can match their keys, and their pins would keep its storage alive.  The dropped entries also let go of
-    their pins (the entry of the call doing the upgrade, created before its ``ensure``, is still referenced by that
-    call): once the arena is freed its id may be reused, and a later call that builds an equal key finds no entry and
-    starts a new one.  Returns the number dropped."""
-    stale = [key for key, e in _GRAPHS.items() if any(p is arena for p in e.pins)]
+def _graph_release(pinned: Any) -> int:
+    """Drop the cached graphs whose key pins ``pinned``: a local arena that :meth:`KcpWorkspace.ensure` supersedes, or
+    a workspace whose :meth:`KcpWorkspace.pool` has just allocated a forward-only lazy pool
+    (``cake_kcp_plan.FWD_LAZY_POOLS``, part of every key): no later call can match their keys, and their pins (and
+    graphs) would keep that storage alive.  The dropped entries also let go of their pins (the entry of the call doing
+    the upgrade, created before its ``ensure``, is still referenced by that call): once the arena is freed its id may
+    be reused, and a later call that builds an equal key finds no entry and starts a new one.  Returns the number
+    dropped."""
+    stale = [key for key, e in _GRAPHS.items() if any(p is pinned for p in e.pins)]
     for key in stale:
         _GRAPHS.pop(key).pins = ()
     return len(stale)

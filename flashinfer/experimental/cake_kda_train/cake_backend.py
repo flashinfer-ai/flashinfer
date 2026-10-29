@@ -1131,8 +1131,10 @@ BWD_TAPE_SLOTS: tuple[tuple[Occupant, ...], ...] = (
 # writes h and the real rows of v_new) and its own output program (4: qg / h / aqk_int / v_new), never this module's
 # segmented recurrence, so the layout keeps no state blocks, and akk_int (read by WY at 2) rides under the h tape
 # beside kb (sub-offset 256): 2432 B per internal token-head against the forward layout's 2560 (plus its blocks).  The
-# h entries of the pad chunks, which the output program reads but stores no row of, overlay dead kb / akk_int bytes
-# here (dead kb bytes in the forward layout); no result depends on them.
+# tape is chunk-major, so kb lies under its entries [0, NC_pad / 2) and akk_int under [NC_pad / 2, 3 NC_pad / 4).  The
+# h entries of the pad chunks (the trailing [nc, NC_pad)), which the output program reads but stores no row of, hold
+# bytes no launch of the call writes from 3 NC_pad / 4 on (from NC_pad / 2 on in the forward layout): an earlier
+# call's tape or the arena's initial content; below that, dead kb / akk_int rows.  No result depends on them.
 FWD_KCP_SLOTS: tuple[tuple[Occupant, ...], ...] = (
     (("gk", "F32", 0, (1, 3)),),
     (

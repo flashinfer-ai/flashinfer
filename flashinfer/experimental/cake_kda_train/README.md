@@ -646,13 +646,17 @@ has served forwards only (`kcp_workspace_bytes(..., backward=False)`) holds
 its local arena in the KCP forward layout (`fwd_kcp`: 2432 B per internal
 token-head against at least 2560 for the existing backend's forward layout;
 no segment state blocks, the internal `Akk` rows under the `h` tape) and leaves
-the c1 receive, transfer staging and carry pools to their first reader: a
-forward with a saved set writes fresh saved-set tensors in their place, so
-only a forward without one allocates them
-(`cake_kcp_plan.kcp_arena_layout(ctx, H=H, backward=False)["lazy"]` bytes
-more).  The first backward on such a workspace releases its forward arena
-before it allocates the backward one; outputs, saved sets and gradients are
-bitwise those of a backward workspace.
+the c1 receive, transfer staging and carry pools to their first reader.  A
+forward with a saved set writes a fresh carry plane in place of the carry
+pool and, with `save_transfer=True` (the a2a default), fresh saved-set
+tensors in place of the other two; with `save_transfer=False` it allocates
+those two, so pass the forward's `save_transfer` to the byte query.  A
+forward without a saved set allocates the rest
+(`cake_kcp_plan.kcp_arena_layout(ctx, H=H, backward=False,
+save_transfer=...)["lazy"]` bytes more).  Under `exchange="ring"` such a
+workspace never allocates the c1 receive pool.  The first backward on such a
+workspace releases its forward arena before it allocates the backward one;
+outputs, saved sets and gradients are bitwise those of a backward workspace.
 
 Saved set of a rank (`KcpSaved`, `boundary_mode="saved"`): the fresh `S_in`
 (the initial states of its fragments), with `save_transfer` the owner's c1

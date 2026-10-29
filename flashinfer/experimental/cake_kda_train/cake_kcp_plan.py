@@ -2159,11 +2159,15 @@ SHARED_POOLS = (("c1_send", "b1_send"), ("c2_send", "b2_send"))
 # a2a exchange never reads.
 LAZY_POOLS = ("ring_out", "ring_in")
 # Pools a forward-only workspace (``backward=False``) allocates on first use only: the c1 receive pool and, at
-# ``P > 1``, the staging plane of the transfers and the carry plane.  A forward with a saved set under the shipped
-# options writes fresh saved-set tensors in their place (``save_transfer``, the saved carry plane) and never reads
-# them; a forward without a saved set reads them (with ``save_transfer=False`` a saving forward reads the first two),
-# and a backward workspace sizes them up front.
+# ``P > 1``, the staging plane of the transfers and the carry plane.  A forward without a saved set reads all three;
+# a forward with one writes a fresh saved carry plane in place of ``carry`` and, under ``save_transfer``, fresh
+# saved-set tensors in place of the :data:`FWD_TRANSFER_POOLS` (without it, and under the ring exchange, it reads
+# them: the a2a exchange receives c1 into ``c1_recv``, the ring exchange receives no c1 tensor); a backward
+# workspace sizes them up front.
 FWD_LAZY_POOLS = ("c1_recv", "stage_m", "carry")
+# The :data:`FWD_LAZY_POOLS` that ``save_transfer`` replaces with fresh saved-set tensors (the c1 receive tensor,
+# ``M_seg``).
+FWD_TRANSFER_POOLS = ("c1_recv", "stage_m")
 # The pools a workspace sizes for a forward (``backward=False``) and the ones a backward workspace adds.
 FWD_POOLS = (
     "c1_send",
@@ -2223,20 +2227,34 @@ def kcp_arena_layout(
     ``pool.<name>``: the bytes each pool of a forward (``backward=False``) or a backward workspace needs
     (:func:`kcp_pool_numel`, 4 B per element); ``arena``: the bytes the workspace allocates -- every pool once, each
     :data:`SHARED_POOLS` pair as one storage of the larger need, the :data:`LAZY_POOLS` not at all (``ring``: the bytes
-    a call with ``exchange="ring"`` adds on first use) and, in a forward workspace, the :data:`FWD_LAZY_POOLS` not at
-    all either (``lazy``: the bytes the first forward that reads them adds -- a forward without a saved set; zero in a
-    backward workspace, which counts them in ``arena``).  The saved set (``S_in``, the c1 receive tensor kept with
-    ``save_transfer``, ``M_seg``, the forward's saved copy of the carry plane; :func:`kcp_saved_bytes`; the ``carry``
-    pool the backward's adjoint carries use is a workspace pool) and the convolution route's halo rows
-    (per-call tensors; their traffic: :func:`kcp_comm_bytes` ``halo_fwd`` / ``halo_bwd``) are never workspace pools,
-    so ``save_transfer`` and ``C`` leave the workspace unchanged."""
+    a call with ``exchange="ring"`` adds on first use) and, in a forward workspace, the :data:`FWD_LAZY_POOLS` a
+    forward with a saved set leaves unread not at all either: all three under ``save_transfer``, ``carry`` alone
+    without it (the a2a forward then reads the :data:`FWD_TRANSFER_POOLS`), so ``arena`` is the workspace after its
+    forwards with a saved set (``lazy``: the bytes the first forward without a saved set adds; zero in a backward
+    workspace, which counts every pool in ``arena``).  The ring exchange receives no c1 tensor: its forward workspace
+    holds ``pool.c1_recv`` bytes fewer than the ``save_transfer=False`` ``arena`` (the option resolves to ``False``
+    there) and ``ring`` more.  The saved set (``S_in``, the c1 receive tensor kept with ``save_transfer``, ``M_seg``, the forward's saved
+    copy of the carry plane; :func:`kcp_saved_bytes`; the ``carry`` pool the backward's adjoint carries use is a
+    workspace pool) and the convolution route's halo rows (per-call tensors; their traffic: :func:`kcp_comm_bytes`
+    ``halo_fwd`` / ``halo_bwd``) are never workspace pools, so ``C`` leaves the workspace unchanged, and so does
+    ``save_transfer`` a backward workspace."""
     _check_save_mode(save_mode)
     numel = kcp_pool_numel(ctx, H=H)
     need = {
         name: numel[name] * 4 for name in FWD_POOLS + (BWD_POOLS if backward else ())
     }
     shared = {name for pair in SHARED_POOLS for name in pair}
-    lazy = LAZY_POOLS + (() if backward else FWD_LAZY_POOLS)
+    # the forward-only pools no forward with a saved set reads: left to a forward without one
+    deferred = (
+        ()
+        if backward
+        else tuple(
+            name
+            for name in FWD_LAZY_POOLS
+            if save_transfer or name not in FWD_TRANSFER_POOLS
+        )
+    )
+    lazy = LAZY_POOLS + deferred
     arena = sum(
         v for name, v in need.items() if name not in shared and name not in lazy
     )
@@ -2246,7 +2264,7 @@ def kcp_arena_layout(
     )
     out = {f"pool.{name}": v for name, v in need.items()}
     out["ring"] = sum(need[name] for name in LAZY_POOLS)
-    out["lazy"] = 0 if backward else sum(need[name] for name in FWD_LAZY_POOLS)
+    out["lazy"] = sum(need[name] for name in deferred)
     out["arena"] = arena
     return out
 
@@ -2302,8 +2320,10 @@ def kcp_workspace_bytes(
     with the intra record's scratch table set where it writes one (:func:`local_scratch_table_bytes`), plus the KCP
     arena of transient buffers (:func:`kcp_arena_layout`; CONSISTENCY-6, SPEC-4: saved-set tensors are counted by
     :func:`kcp_saved_bytes`).  A forward-only workspace has two states: these bytes after its forwards with a saved
-    set (the training forward), and ``kcp_arena_layout(...)["lazy"]`` more once a forward without one has read the
-    :data:`FWD_LAZY_POOLS`; the ring exchange's hop pools (``["ring"]``) are not counted either."""
+    set (the training forward) under ``save_transfer`` -- pass the forward's value: without it such a forward also
+    allocates the :data:`FWD_TRANSFER_POOLS` -- and ``kcp_arena_layout(..., save_transfer=save_transfer)["lazy"]``
+    more once a forward without one has read the rest of the :data:`FWD_LAZY_POOLS`.  The ring exchange's hop pools
+    (``["ring"]``) are not counted; its forward-only workspace holds no c1 receive pool (``["pool.c1_recv"]``)."""
     _check_save_mode(save_mode)
     local = 0
     if ctx.T_r > 0:
@@ -2420,6 +2440,7 @@ __all__ = [
     "SHARED_POOLS",
     "LAZY_POOLS",
     "FWD_LAZY_POOLS",
+    "FWD_TRANSFER_POOLS",
     "FWD_POOLS",
     "BWD_POOLS",
     "STATE_TILE_BYTES",
