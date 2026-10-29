@@ -580,7 +580,6 @@ def _moe_core_impl(
         from .blackwell.moe_swap_ab import (
             launch_gather_gemm,
             launch_finalize_gemm,
-            _get_output_workspace,
         )
 
         gather_gemm = launch_gather_gemm
@@ -663,18 +662,6 @@ def _moe_core_impl(
         enable_pdl=enable_pdl,
         **moe_sort_kwargs,
     )
-
-    output_workspace = None
-    if swap_ab:
-        output_workspace = _get_output_workspace(
-            gemm2_mma_tiler_mn[1],
-            output_dtype,
-            use_fused_finalize,
-            tile_idx_to_mn_limit,
-            expanded_idx_to_permuted_idx,
-        )
-        gemm1_options["_output_workspace"] = output_workspace
-        gemm2_options["_output_workspace"] = output_workspace
 
     if use_localized_path:
         # Allocate once: both domains fill disjoint columns of this buffer.
@@ -892,7 +879,10 @@ def _moe_core_impl(
         gemm2_output = moe_output
     else:
         gemm2_output = torch.empty(
-            (num_tokens * top_k, hidden_size),
+            (
+                permuted_idx_to_expanded_idx.numel() if swap_ab else num_tokens * top_k,
+                hidden_size,
+            ),
             dtype=output_dtype,
             device=x.device,
         )
@@ -977,8 +967,7 @@ def _moe_core_impl(
             topk_scales=token_final_scales,
             num_tokens=num_tokens,
             top_k=top_k,
-            input_is_expanded=True,
-            _output_workspace=output_workspace,
+            input_is_expanded=not swap_ab,
             enable_pdl=enable_pdl,
         )
 

@@ -14,7 +14,6 @@
 
 """Host launchers for SM100 split MoE with activations on MMA operand B."""
 
-from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, Union
 
 import cuda.bindings.driver as cuda
@@ -47,30 +46,6 @@ from .moe_swap_ab_kernel import Sm100BlockScaledGroupedGemmKernel
 _CUDA_GRID_Y_MAX = 65_535
 
 _blockscaled_kernel_cache: Dict[Tuple, Any] = {}
-
-
-@dataclass
-class _CompactOutputWorkspace:
-    offsets: torch.Tensor
-    indices: torch.Tensor
-
-
-def _get_output_workspace(
-    route_tile, output_dtype, use_fused_finalize, tile_limits, route_mapping
-):
-    # Automatic operand staging reserves the eligible epilogue's bulk slab.
-    if not Sm100BlockScaledGroupedGemmKernel.bulk_output_element_bytes(
-        route_tile,
-        torch_to_cutlass_dtype(output_dtype),
-        True,
-        use_fused_finalize,
-        False,
-    ):
-        return None
-    return _CompactOutputWorkspace(
-        offsets=torch.empty_like(tile_limits),
-        indices=torch.empty_like(route_mapping),
-    )
 
 
 def _blockscaled_ptr(tensor, dtype, alignment=16):
@@ -122,13 +97,7 @@ def _run_blockscaled_gemm(
     sm_count=None,
     publish_routing_before_signal=False,
     activation_cache_policy: str = "normal",
-    _output_workspace=None,
 ):
-    output_is_routed = scatter_output and _output_workspace is not None
-    compact_offsets = (
-        _output_workspace.offsets if _output_workspace is not None else None
-    )
-    dense_indices = _output_workspace.indices if output_is_routed else None
     cache_policies = {
         "normal": 0,
         "evict_first": 0x12F0000000000000,
@@ -189,7 +158,6 @@ def _run_blockscaled_gemm(
             top_k,
             sf_vec_size,
             enable_pdl,
-            compact_offsets,
         )
         activation, activation_sf = routed, routed_sf
     pointers = (
@@ -214,8 +182,6 @@ def _run_blockscaled_gemm(
         _blockscaled_ptr(num_tiles, cutlass.Int32),
         _blockscaled_ptr(token_final_scales, scale_dtype),
         _blockscaled_ptr(per_token_scale, cutlass.Float32),
-        _blockscaled_ptr(compact_offsets if scatter_output else None, cutlass.Int32),
-        _blockscaled_ptr(dense_indices, cutlass.Int32),
     )
     device_sms = get_num_sm(activation.device)
     num_sms = device_sms if sm_count is None else sm_count
@@ -247,7 +213,6 @@ def _run_blockscaled_gemm(
         num_sms,
         top_k,
         scatter_output,
-        output_is_routed,
         per_token_scale_is_routed,
         k_steps,
         overlap_activation_accumulators,
@@ -289,7 +254,6 @@ def _run_blockscaled_gemm(
             sf_vec_size=sf_vec_size,
             native_mma_k=native_mma_k,
             scatter_output=scatter_output,
-            output_is_routed=output_is_routed,
             per_token_scale_is_routed=per_token_scale_is_routed,
             k_steps=k_steps,
             num_stages=None,
@@ -383,7 +347,6 @@ def launch_gather_gemm(
     gated: bool = True,
     k_steps: Optional[int] = None,
     use_clc_scheduler: bool = True,
-    _output_workspace=None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Prepare routed input and launch FC1 with the swap-AB weight layout."""
     _check_gemm_inputs(a, b, a_dtype, b_dtype, a_per_token_scale, k_steps)
@@ -508,7 +471,6 @@ def launch_gather_gemm(
         sf_dtype=sf_dtype_cutlass,
         sf_vec_size=sf_vec_size,
         prepare_input=True,
-        _output_workspace=_output_workspace,
         scatter_output=False,
         per_token_scale_is_routed=False,
         k_steps=k_steps,
@@ -547,11 +509,12 @@ def launch_finalize_gemm(
     use_fused_finalize: bool = True,
     k_steps: Optional[int] = None,
     use_clc_scheduler: bool = False,
-    _output_workspace=None,
 ) -> torch.Tensor:
-    """Launch FC2 with routed/expanded rows or fused atomic finalize."""
-    if _output_workspace is not None and use_fused_finalize:
-        raise ValueError("Routed FC2 output requires deterministic finalize")
+    """Launch FC2 with padded routed rows or fused atomic finalize.
+
+    Unfused output has one row per entry in ``permuted_idx_to_expanded_idx``;
+    fused output has one row per token.
+    """
     _check_gemm_inputs(a, b, a_dtype, b_dtype, a_per_token_scale, k_steps)
     a_dtype_cutlass = get_cutlass_dtype(a_dtype)
     b_dtype_cutlass = get_cutlass_dtype(b_dtype)
@@ -569,7 +532,9 @@ def launch_finalize_gemm(
 
     seq_len, topk = token_final_scales.shape
     n = b.shape[1]
-    output_rows = seq_len if use_fused_finalize else seq_len * topk
+    output_rows = (
+        seq_len if use_fused_finalize else permuted_idx_to_expanded_idx.numel()
+    )
     # Atomic fused finalize requires zero-initialized output.
     if out is None:
         allocator = torch.zeros if use_fused_finalize else torch.empty
@@ -626,7 +591,6 @@ def launch_finalize_gemm(
         sf_vec_size=sf_vec_size,
         prepare_input=False,
         scatter_output=True,
-        _output_workspace=_output_workspace,
         per_token_scale_is_routed=True,
         k_steps=k_steps,
         overlap_activation_accumulators=False,
