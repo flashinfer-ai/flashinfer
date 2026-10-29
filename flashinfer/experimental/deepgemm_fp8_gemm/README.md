@@ -7,9 +7,10 @@ DeepGEMM normal schedule (BM128 / BN224 / BK128, six TMA stages, `cta_group::2`,
 persistent grouped raster): `forward` writes BF16 output, `wgrad` accumulates
 into an FP32 output in place (`D = D + A @ B^T`). Problem sizes, tile counts
 and the persistent CTA count are launch scalars, so one compiled program per
-route serves every `M` and `N` and every `K` that is a multiple of 128.
-`cake_jit.py` registers the programs and compiles each source for the exact
-architecture of the device (`sm_100a`, `sm_103a`) through FlashInfer's JIT.
+route serves every `M` and `N` and every `K` that is a multiple of 128. The
+programs are compiled for the exact architecture of the device (`sm_100a`,
+`sm_103a`). Portions of the generated device code derive from DeepGEMM (MIT
+licensed); `DEEPGEMM_NOTICE.txt` in this directory carries the notice.
 
 `a` `[M, K]` and `b` `[N, K]` are `uint8` tensors holding E4M3 bytes; `sfa`
 `[ceil(K/512), M]` and `sfb` `[ceil(K/512), N]` are `uint32` words that pack
@@ -26,11 +27,26 @@ the current PyTorch stream without any allocation, so it can be captured into
 a CUDA graph. Restore the FP32 initializer before each independent accumulated
 evaluation.
 
-Generated sources live in `csrc/experimental/deepgemm_fp8_gemm/`; the runtime
-and loader are in this directory.
+## Package layout
+
+The package is self-contained. `cake_jit.py` is the registry of the generated
+programs: one `MODULES` record per route carrying the host plan (the
+architectures it is delivered for, its launch record, the argument plan of its
+`run` entry, the grid rule the runtime evaluates, the workspace rule and the
+kernel-parameter to logical-argument map), `KERNELS` mapping each route to its
+record, and the loader glue (`library_name`, `launch_args`, `load`,
+`run_module`). What to compile is recorded once in `build.json`: the generated
+CUDA sources under `csrc/`, their digests and nvcc flags, one entry per
+(program, architecture). `cake_build.py` loads a prebuilt library from `aot/`
+when a builder compiled one and otherwise JIT-builds the manifest entry through
+FlashInfer from the same sources and flags. `runtime.py` holds
+`launch_geometry` (the grid rule), `pack_ue8m0_words` and
+`prepare_fp8_gemm_1d1d`. `scripts/check_cake_build_manifests.py` checks the
+manifest against the registry and the sources without importing the package.
 
 ```bash
 pytest tests/experimental/test_fp8_gemm_1d1d_generated.py -q
 ```
 
-The test runs on any registered architecture and skips elsewhere.
+The test runs on any registered architecture and skips its GPU cases
+elsewhere; the host-plan and manifest cases need no GPU.

@@ -59,6 +59,7 @@
 #include <cuda_bf16.h>
 
 #include <algorithm>
+#include <climits>
 #include <cstdint>
 #include <cstring>
 
@@ -73,6 +74,37 @@ namespace {
 constexpr int kMaxEpSize = 32;
 constexpr int kMaxTopK = 8;  // matches the pipe's top_k validation; sizes the in-register row lists
 constexpr int kThreads = 256;
+
+// Programmatic dependent launch (PDL).  Every kernel of the round waits for the
+// preceding grid before it touches global memory and then, unless told
+// otherwise, lets the next PDL-launched grid be scheduled at once; without the
+// early trigger the next grid is scheduled when this grid's blocks exit.  Both
+// instructions are no-ops when the launch carries no PDL attribute.  use_pdl:
+// bit 0 = launch with the PDL attribute, bit 1 = no early trigger.
+__device__ __forceinline__ void pdl_wait_and_trigger(int trigger) {
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+  if (trigger) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+}
+
+// Launch on the caller's stream, optionally with the PDL attribute (the kernel
+// may then start while the preceding kernel finishes; see pdl_wait_and_trigger).
+template <typename... Params, typename... Args>
+void launch_kernel(void (*kernel)(Params...), dim3 grid, dim3 block, size_t smem,
+                   cudaStream_t stream, bool use_pdl, Args... args) {
+  cudaLaunchAttribute attr{};
+  attr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr.val.programmaticStreamSerializationAllowed = 1;
+  cudaLaunchConfig_t config{};
+  config.gridDim = grid;
+  config.blockDim = block;
+  config.dynamicSmemBytes = smem;
+  config.stream = stream;
+  config.attrs = &attr;
+  config.numAttrs = use_pdl ? 1 : 0;
+  cudaError_t const status = cudaLaunchKernelEx(&config, kernel, args...);
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "sm90_cake_bf16: kernel launch failed: " << cudaGetErrorString(status);
+}
 
 PushLayout build_layout(int64_t peer_bases, int64_t ep_size, int64_t rank,
                         int64_t num_local_experts, int64_t pool_rows, int64_t meta_rows,
@@ -146,7 +178,9 @@ __global__ void __launch_bounds__(kThreads) combine_publish_prereduced_bf16_kern
     int32_t* __restrict__ grp_cnt, const int32_t* __restrict__ grp_rows,
     const int32_t* __restrict__ grp_list, int32_t* __restrict__ n_groups,
     int32_t* __restrict__ groups_per_src, int32_t* __restrict__ cdone_local,
-    const int32_t* __restrict__ round_ctr, int32_t* __restrict__ blocks_done, int split_partials) {
+    const int32_t* __restrict__ round_ctr, int32_t* __restrict__ blocks_done, int split_partials,
+    int pdl_trigger) {
+  pdl_wait_and_trigger(pdl_trigger);
   int const H = L.hidden;
   int const nv = H >> 3;               // 16-byte vectors per row
   int const total_groups = *n_groups;  // read once: the last block zeroes it below
@@ -268,6 +302,218 @@ __global__ void __launch_bounds__(kThreads) combine_publish_prereduced_bf16_kern
   }
 }
 
+// Load-hoisted form (publish_form 1).  The kernel above loads route i's y vector and
+// feeds it to the fmaf chain before it loads route i + 1, and keeps the group's rows and
+// weights in local memory (dynamically indexed arrays): at EP2, with about four routes
+// per group, every 16-byte output vector waits for a chain of dependent global loads.
+// This form keeps the group record in registers (the rows are sorted by route index with
+// an 8-input sorting network; the route indices of one group are distinct, so the order
+// equals the insertion sort's) and issues the y loads of up to kHoistRoutes routes before
+// their fmaf chain.  The chain itself is unchanged: acc = fmaf(w_k, fp32(y_k), acc) in
+// ascending route index from acc = 0, one round to nearest per output element, so the
+// output bytes are identical.  __launch_bounds__(256, 4) keeps four blocks per SM, as the
+// shipped grid of 4 x SMs assumes.
+constexpr int kHoistRoutes = 4;
+
+struct PublishGroup {
+  int rows[kMaxTopK];  // sorted by route index; entries >= cnt are unused
+  float ws[kMaxTopK];
+  int k0, k1;  // smallest and second-smallest route index
+  int cnt, dst, tok, g;
+};
+
+__device__ __forceinline__ void load_publish_group(PushLayout const& L,
+                                                   const int32_t* __restrict__ meta,
+                                                   const int32_t* __restrict__ grp_cnt,
+                                                   const int32_t* __restrict__ grp_rows,
+                                                   const int32_t* __restrict__ grp_list, int idx,
+                                                   PublishGroup& G) {
+  int const g = grp_list[idx];  // uniform across the block
+  int const cnt = grp_cnt[g];   // >= 1 by worklist construction, <= top_k
+  const int32_t* glist = grp_rows + static_cast<int64_t>(g) * L.top_k;
+  int kk[kMaxTopK], rr[kMaxTopK];
+  float wv[kMaxTopK];
+#pragma unroll
+  for (int i = 0; i < kMaxTopK; ++i) rr[i] = (i < cnt) ? glist[i] : 0;
+#pragma unroll
+  for (int i = 0; i < kMaxTopK; ++i) {
+    if (i < cnt) {
+      int4 const mr = *reinterpret_cast<const int4*>(meta + static_cast<int64_t>(rr[i]) * 4);
+      kk[i] = mr.z;                  // meta_route_k
+      wv[i] = __int_as_float(mr.w);  // meta_weight
+    } else {
+      kk[i] = INT_MAX;  // padding sorts last
+      wv[i] = 0.0f;
+    }
+  }
+#define CAKE_PUBLISH_CSWAP(a, b) \
+  do {                           \
+    if (kk[b] < kk[a]) {         \
+      int const tk = kk[a];      \
+      kk[a] = kk[b];             \
+      kk[b] = tk;                \
+      int const tr = rr[a];      \
+      rr[a] = rr[b];             \
+      rr[b] = tr;                \
+      float const tw = wv[a];    \
+      wv[a] = wv[b];             \
+      wv[b] = tw;                \
+    }                            \
+  } while (0)
+  // Batcher's odd-even merge sort network for 8 inputs (19 compare-exchanges)
+  CAKE_PUBLISH_CSWAP(0, 1);
+  CAKE_PUBLISH_CSWAP(2, 3);
+  CAKE_PUBLISH_CSWAP(4, 5);
+  CAKE_PUBLISH_CSWAP(6, 7);
+  CAKE_PUBLISH_CSWAP(0, 2);
+  CAKE_PUBLISH_CSWAP(1, 3);
+  CAKE_PUBLISH_CSWAP(4, 6);
+  CAKE_PUBLISH_CSWAP(5, 7);
+  CAKE_PUBLISH_CSWAP(1, 2);
+  CAKE_PUBLISH_CSWAP(5, 6);
+  CAKE_PUBLISH_CSWAP(0, 4);
+  CAKE_PUBLISH_CSWAP(1, 5);
+  CAKE_PUBLISH_CSWAP(2, 6);
+  CAKE_PUBLISH_CSWAP(3, 7);
+  CAKE_PUBLISH_CSWAP(2, 4);
+  CAKE_PUBLISH_CSWAP(3, 5);
+  CAKE_PUBLISH_CSWAP(1, 2);
+  CAKE_PUBLISH_CSWAP(3, 4);
+  CAKE_PUBLISH_CSWAP(5, 6);
+#undef CAKE_PUBLISH_CSWAP
+#pragma unroll
+  for (int i = 0; i < kMaxTopK; ++i) {
+    G.rows[i] = rr[i];
+    G.ws[i] = wv[i];
+  }
+  G.k0 = kk[0];
+  G.k1 = kk[1];
+  G.cnt = cnt;
+  G.g = g;
+  G.dst = g / L.t_cap;
+  G.tok = g - G.dst * L.t_cap;
+}
+
+__global__ void __launch_bounds__(kThreads, 4) combine_publish_prereduced_bf16_hoisted_kernel(
+    PushLayout L, const __nv_bfloat16* __restrict__ y, const int32_t* __restrict__ meta,
+    int32_t* __restrict__ grp_cnt, const int32_t* __restrict__ grp_rows,
+    const int32_t* __restrict__ grp_list, int32_t* __restrict__ n_groups,
+    int32_t* __restrict__ groups_per_src, int32_t* __restrict__ cdone_local,
+    const int32_t* __restrict__ round_ctr, int32_t* __restrict__ blocks_done, int split_partials,
+    int pdl_trigger) {
+  pdl_wait_and_trigger(pdl_trigger);
+  int const H = L.hidden;
+  int const nv = H >> 3;               // 16-byte vectors per row
+  int const total_groups = *n_groups;  // read once: the last block zeroes it below
+  int const grid = static_cast<int>(gridDim.x);
+  int const S = (total_groups * 4 <= grid) ? 4 : ((total_groups * 2 <= grid) ? 2 : 1);
+  int const items = total_groups * S;
+  int const participants = min(grid, items);
+  if (static_cast<int>(blockIdx.x) >= participants) return;
+  __shared__ int s_last;
+  const uint4* y4 = reinterpret_cast<const uint4*>(y);
+  // The group record is carried across iterations: the next item's record is loaded after
+  // this item's publish tail.  Re-creating it at the top of every iteration spills more to
+  // local memory under the 64-register bound.
+  PublishGroup G;
+  int item = blockIdx.x;
+  if (item < items) load_publish_group(L, meta, grp_cnt, grp_rows, grp_list, item / S, G);
+  for (; item < items; item += grid) {
+    int const idx = item / S;
+    int const part = item - idx * S;
+    int const nitem = item + grid;
+    uint4* out4 = reinterpret_cast<uint4*>(L.combine_row(G.dst, G.tok, G.k0));
+    bool const split = split_partials != 0 && G.cnt >= 2;
+    uint4* lo4 = split ? reinterpret_cast<uint4*>(L.combine_row(G.dst, G.tok, G.k1)) : nullptr;
+    int const v_begin = (nv * part) / S;
+    int const v_end = (nv * (part + 1)) / S;
+    for (int v = v_begin + threadIdx.x; v < v_end; v += blockDim.x) {
+      float acc[8];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) acc[j] = 0.0f;
+#pragma unroll
+      for (int c0 = 0; c0 < kMaxTopK; c0 += kHoistRoutes) {
+        if (c0 < G.cnt) {
+          uint4 pk[kHoistRoutes];
+#pragma unroll
+          for (int i = 0; i < kHoistRoutes; ++i) {  // loads first ...
+            if (c0 + i < G.cnt) pk[i] = __ldg(y4 + static_cast<uint64_t>(G.rows[c0 + i]) * nv + v);
+          }
+#pragma unroll
+          for (int i = 0; i < kHoistRoutes; ++i) {  // ... then the ascending-k fp32 fma chain
+            if (c0 + i < G.cnt) {
+              __nv_bfloat162 h2[4];
+              memcpy(h2, &pk[i], sizeof(uint4));
+              float const w = G.ws[c0 + i];
+#pragma unroll
+              for (int j = 0; j < 4; ++j) {
+                float2 f = __bfloat1622float2(h2[j]);
+                acc[2 * j] = fmaf(w, f.x, acc[2 * j]);
+                acc[2 * j + 1] = fmaf(w, f.y, acc[2 * j + 1]);
+              }
+            }
+          }
+        }
+      }
+      __nv_bfloat162 o2[4];
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+        o2[j] = __floats2bfloat162_rn(acc[2 * j], acc[2 * j + 1]);  // one RN
+      uint4 pk;
+      memcpy(&pk, o2, sizeof(pk));
+      out4[v] = pk;  // 16-byte P2P store into the owner's inbox
+      if (split) {   // residual row: lo = bf16(p - hi), p - hi exact in fp32
+        __nv_bfloat162 r2[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          float2 hi = __bfloat1622float2(o2[j]);
+          r2[j] = __floats2bfloat162_rn(acc[2 * j] - hi.x, acc[2 * j + 1] - hi.y);
+        }
+        uint4 pl;
+        memcpy(&pl, r2, sizeof(pl));
+        lo4[v] = pl;
+      }
+    }
+    __syncthreads();  // this slice's remote stores all issued before the publish tail
+    if (threadIdx.x == 0) {
+      if (S == 1) grp_cnt[G.g] = 0;  // single owner block: the slot is clean for the next round
+      __threadfence_system();
+      int prev = atomicAdd(&cdone_local[G.dst], 1);
+      if (prev + 1 == groups_per_src[G.dst] * S) {  // every slice of every group for dst is out
+        __threadfence_system();
+        st_release_sys_u64(
+            L.cdone_cell(G.dst, L.rank),
+            pack_count_tag(groups_per_src[G.dst], static_cast<uint32_t>(*round_ctr)));
+      }
+    }
+    if (nitem < items) {  // grp_cnt[G.g] reset above is a different group: no race
+      PublishGroup Gn;
+      load_publish_group(L, meta, grp_cnt, grp_rows, grp_list, nitem / S, Gn);
+      G = Gn;
+    }
+  }
+  // grid completion, as the kernel above
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    __threadfence();
+    int const prev = atomicAdd(blocks_done, 1);
+    s_last = (prev + 1 == participants) ? 1 : 0;
+    if (s_last) {
+      __threadfence();
+      *blocks_done = 0;
+      *n_groups = 0;
+      for (int s = 0; s < L.ep_size; ++s) {
+        groups_per_src[s] = 0;
+        cdone_local[s] = 0;
+      }
+    }
+  }
+  __syncthreads();
+  if (s_last && S > 1) {
+    for (int i = threadIdx.x; i < total_groups; i += blockDim.x) grp_cnt[grp_list[i]] = 0;
+  }
+}
+
 // persistent-grid sizing, cached per device (as the vendored compact / publish kernels)
 int publish_grid_blocks(DLDevice device) {
   static int cache[64] = {0};
@@ -287,7 +533,7 @@ void sm90_cake_combine_prereduced_bf16(TensorView y, TensorView meta, LAYOUT_PAR
                                        TensorView grp_list, TensorView n_groups,
                                        TensorView groups_per_src, TensorView cdone_local,
                                        TensorView round_ctr, TensorView blocks_done,
-                                       int64_t split_partials) {
+                                       int64_t split_partials, int64_t use_pdl, int64_t form) {
   check_layout(LAYOUT_ARGS);
   auto L = build_layout(LAYOUT_ARGS);
   CHECK_INPUT_AND_TYPE(y, dl_bfloat16);
@@ -327,11 +573,22 @@ void sm90_cake_combine_prereduced_bf16(TensorView y, TensorView meta, LAYOUT_PAR
   // no memsets: the scratch was zeroed at construction and self-resets every round
   if (Mcap == 0) return;  // zero-row destinations were published by wait_prefix
   int const blocks = publish_grid_blocks(y.device());
-  combine_publish_prereduced_bf16_kernel<<<blocks, kThreads, 0, stream>>>(
-      L, static_cast<const __nv_bfloat16*>(y.data_ptr()),
-      static_cast<const int32_t*>(meta.data_ptr()), cnt,
-      static_cast<const int32_t*>(grp_rows.data_ptr()), glist, ng, gps, cdl,
-      static_cast<const int32_t*>(round_ctr.data_ptr()), bd, split_partials != 0 ? 1 : 0);
+  TVM_FFI_ICHECK(form == 0 || form == 1) << "combine_prereduced: form must be 0 or 1, got " << form;
+  if (form == 1) {  // load-hoisted form (same bytes)
+    launch_kernel(combine_publish_prereduced_bf16_hoisted_kernel, dim3(blocks), dim3(kThreads), 0,
+                  stream, (use_pdl & 1) != 0, L, static_cast<const __nv_bfloat16*>(y.data_ptr()),
+                  static_cast<const int32_t*>(meta.data_ptr()), cnt,
+                  static_cast<const int32_t*>(grp_rows.data_ptr()), glist, ng, gps, cdl,
+                  static_cast<const int32_t*>(round_ctr.data_ptr()), bd,
+                  split_partials != 0 ? 1 : 0, static_cast<int>((use_pdl & 2) == 0));
+    return;
+  }
+  launch_kernel(combine_publish_prereduced_bf16_kernel, dim3(blocks), dim3(kThreads), 0, stream,
+                (use_pdl & 1) != 0, L, static_cast<const __nv_bfloat16*>(y.data_ptr()),
+                static_cast<const int32_t*>(meta.data_ptr()), cnt,
+                static_cast<const int32_t*>(grp_rows.data_ptr()), glist, ng, gps, cdl,
+                static_cast<const int32_t*>(round_ctr.data_ptr()), bd, split_partials != 0 ? 1 : 0,
+                static_cast<int>((use_pdl & 2) == 0));
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm90_cake_combine_prereduced_bf16, sm90_cake_combine_prereduced_bf16);

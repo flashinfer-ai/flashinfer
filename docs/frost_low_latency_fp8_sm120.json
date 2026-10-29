@@ -1,0 +1,1394 @@
+{
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
+  "cc": [
+    12,
+    0
+  ],
+  "scope": "FP8 per-tensor full routed-expert GPU pipeline, CUPTI first-to-last activity span from a single-call graph replay; includes route packing, activation and combine; excludes host enqueue, weight preparation, routing selection, shared experts, communication and serving",
+  "timer": "CUPTI",
+  "versions": {
+    "torch": "2.14.1+cu130",
+    "nvidia-cutlass-dsl": "4.8.0",
+    "apache-tvm-ffi": "0.1.14.post1",
+    "cupti-python": "13.0.1"
+  },
+  "cuda_runtime": "13.0",
+  "source_sha256": {
+    "flashinfer/fused_moe/backends/frost_low_latency/__init__.py": "19cca05a476f8244eec58829041dec176a248e5f16d0aeb9e3ef969f94ad320d",
+    "flashinfer/fused_moe/backends/frost_low_latency/activation.py": "69b1247b0c56b785171703208a9292dcd31d3d1e340720eb072b61315c0de07a",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/__init__.py": "de6683449a20e3dad045d702e254ad5f62c17399513af286de9074a8c746ecc3",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/activation_config.py": "1b51203e8fbb681395798ba8711592e00c37f48c48667a2c76ef12d3c069193a",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/activations.py": "99f2ef68515e9d6c8bbf8626f4c1ad32acac9b7426b75292c6966769c61dcbfa",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/bf16/__init__.py": "b4d3306414a9948b6870f55f19903bf36e21053329f8ccb8052bd6d22b076d35",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/bf16/fma_fc1.py": "0ccf3f1c842e653902d08bd5840c30042eeb806746b2ac63927c451524272341",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/bf16/fma_fc2.py": "df203d561241444a2d1c2b13fb71b93902141583b4d71f88f1f28996d7ccf755",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/bf16/runtime.py": "55bf2d2e5066e45e9986d6e2167f7498383017b00a68b0f8e81845f89b95925d",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/fp8_per_tensor.py": "8bada9d318dcaee6690c45f1e2e7b8141e30122419b111b1b260639cb7643811",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/mxfp8/__init__.py": "b4d3306414a9948b6870f55f19903bf36e21053329f8ccb8052bd6d22b076d35",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/mxfp8/fma_common.py": "3c5cc0878a17b82f21e09500dc3ea2bc34428facc04955bfaf5e95211f517ade",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/mxfp8/fma_fc1.py": "a407fb74eba2cef85131f547d35f4e3206a1c729421addccd02d7541b20739b1",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/mxfp8/fma_fc2.py": "fb2bed49c325e4c0b9ed9b003932f0416cdffac9babd6fa4a6bff1ce45b83397",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/nvfp4/__init__.py": "b4d3306414a9948b6870f55f19903bf36e21053329f8ccb8052bd6d22b076d35",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/nvfp4/fma_fc1_o2.py": "6086984981a456144f89d0c93b3566875fef39f2a98540ede3814dade0df42ae",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/nvfp4/fma_fc1_o4.py": "cbb7ba0d68c7a0e5719f2fd82ccea55434cacfcaad6e2d35fdb8a8e5a55e22db",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/nvfp4/fma_fc2.py": "d53520da9bee139699d159d8070ca20dda12e1fba69a14e9f2b943fec888fe7f",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/nvfp4/runtime.py": "fd0f25d9c746dbe1da0a3829cec25d78d4a8d9394c801bc13839d7d1629cd651",
+    "flashinfer/fused_moe/backends/frost_low_latency/fma/runtime.py": "4d1ad53bb03efa42a2b8224e4ba8b0e0cf343e6743498ec3243f3713f842a132",
+    "flashinfer/fused_moe/backends/frost_low_latency/fp8_per_tensor.py": "16b4eb3f074290be694ef50e6bff6d096d8d9213592ac9134a4213b40e76c8e6",
+    "flashinfer/fused_moe/backends/frost_low_latency/gemm.py": "5d53868fb2190bc0499eb3b28fc46607c1d2c9b753c610780a8beb428c13cd83",
+    "flashinfer/fused_moe/backends/frost_low_latency/io.py": "bce77e22086f81bf78f65f62ab31d465d721094d4160e4ace568fea914e268db",
+    "flashinfer/fused_moe/backends/frost_low_latency/nvfp4.py": "04e7a0aa7dfbb04fa205380dfea4d27213ab2ceb7b55988267a0279899ce508c",
+    "flashinfer/fused_moe/backends/frost_low_latency/pipeline.py": "18e469ce116d4e8b01921c321e50125c76eb8c9a419a16392a5dba31ad8f1469",
+    "flashinfer/fused_moe/backends/frost_low_latency/prepare.py": "c5415d60e47d5b31f5700b55f5e2236b78de83b4cbdf9abfb3182d8380fb69e5",
+    "flashinfer/fused_moe/backends/frost_low_latency/quantization.py": "de0c5a7d2b63f0e5381560e75f6f97d9b7401d6134d8ac2dbfe30e0a6efec446",
+    "flashinfer/fused_moe/backends/frost_low_latency/runner.py": "0ed8df395e0a73b420a46d72ac1fba753190183e56dda4c6a06ad2bf8136dd3d",
+    "flashinfer/fused_moe/backends/frost_low_latency/runtime.py": "8a709463fa19a2909bc5bd6885ece4da6d17427faf424c4292bf7268de36553d"
+  },
+  "numerical_contract": "Static E4M3 calibration input=32, intermediate=128; BF16 FC1 preactivation, E4M3 intermediate, BF16 expert/final, packed BF16 route scores, ordered FP32 combine.",
+  "validation": "Four independently timed frozen ABBA blocks plus AA, correctness before/after timed replay; warm event-chain cross-check.",
+  "rows": [
+    {
+      "workload": {
+        "tokens": 1,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "cold",
+        "expert_reuse": "disjoint",
+        "validation_rounds": 4,
+        "selection_repeats": 20,
+        "validation_repeats": 50
+      },
+      "native_tactic_counts": [
+        21,
+        21
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "selected": {
+        "frost": [
+          "ffma",
+          1,
+          4
+        ],
+        "cutlass": [
+          2,
+          22
+        ]
+      },
+      "validation_median_us": {
+        "frost": 25.3035,
+        "cutlass": 46.47175
+      },
+      "speedup": 1.836573991740273,
+      "aa_ratio": {
+        "frost": 0.9993680759888622,
+        "cutlass": 0.9982850753169116
+      },
+      "rejected_count": 80,
+      "frost_tactics": 16,
+      "native_pairs_measured": 362,
+      "max_relative_l2": 0.0,
+      "max_normalized_error": 0.0
+    },
+    {
+      "workload": {
+        "tokens": 1,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "cold",
+        "expert_reuse": "shared",
+        "validation_rounds": 4,
+        "selection_repeats": 20,
+        "validation_repeats": 50
+      },
+      "native_tactic_counts": [
+        21,
+        21
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "selected": {
+        "frost": [
+          "ffma",
+          1,
+          4
+        ],
+        "cutlass": [
+          2,
+          22
+        ]
+      },
+      "validation_median_us": {
+        "frost": 25.26375,
+        "cutlass": 46.455
+      },
+      "speedup": 1.8388006531096925,
+      "aa_ratio": {
+        "frost": 1.00001979159451,
+        "cutlass": 0.9989671033165667
+      },
+      "rejected_count": 80,
+      "frost_tactics": 16,
+      "native_pairs_measured": 362,
+      "max_relative_l2": 0.0,
+      "max_normalized_error": 0.0
+    },
+    {
+      "workload": {
+        "tokens": 1,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "warm",
+        "expert_reuse": "disjoint",
+        "validation_rounds": 4,
+        "selection_repeats": 20,
+        "validation_repeats": 50
+      },
+      "native_tactic_counts": [
+        21,
+        21
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "selected": {
+        "frost": [
+          "ffma",
+          1,
+          4
+        ],
+        "cutlass": [
+          7,
+          23
+        ]
+      },
+      "validation_median_us": {
+        "frost": 8.072,
+        "cutlass": 27.68725
+      },
+      "speedup": 3.4300359266600595,
+      "aa_ratio": {
+        "frost": 1.0009910802775026,
+        "cutlass": 0.998005055064091
+      },
+      "warm_event_chain_us": {
+        "frost": {
+          "samples": [
+            7.837500423192978,
+            7.78375007212162,
+            7.774250116199255,
+            7.761749904602766,
+            7.775249890983105,
+            7.795500103384256,
+            7.777499966323376
+          ],
+          "median": 7.777499966323376
+        },
+        "cutlass": {
+          "samples": [
+            25.94125084578991,
+            25.891000404953957,
+            25.882499292492867,
+            25.867750868201256,
+            25.867750868201256,
+            25.882750749588013,
+            25.877000764012337
+          ],
+          "median": 25.882499292492867
+        }
+      },
+      "rejected_count": 80,
+      "frost_tactics": 16,
+      "native_pairs_measured": 362,
+      "max_relative_l2": 0.0,
+      "max_normalized_error": 0.0
+    },
+    {
+      "workload": {
+        "tokens": 1,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "warm",
+        "expert_reuse": "shared",
+        "validation_rounds": 4,
+        "selection_repeats": 20,
+        "validation_repeats": 50
+      },
+      "native_tactic_counts": [
+        21,
+        21
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "selected": {
+        "frost": [
+          "ffma",
+          1,
+          4
+        ],
+        "cutlass": [
+          7,
+          23
+        ]
+      },
+      "validation_median_us": {
+        "frost": 8.064,
+        "cutlass": 27.679499999999997
+      },
+      "speedup": 3.4324776785714284,
+      "aa_ratio": {
+        "frost": 1.0,
+        "cutlass": 0.999385838150289
+      },
+      "warm_event_chain_us": {
+        "frost": {
+          "samples": [
+            7.850750349462032,
+            7.788000162690878,
+            7.780999876558781,
+            7.778000086545944,
+            7.776500191539526,
+            7.779750041663647,
+            7.792499847710133
+          ],
+          "median": 7.780999876558781
+        },
+        "cutlass": {
+          "samples": [
+            26.052000001072884,
+            25.963999330997467,
+            25.968000292778015,
+            25.969749316573143,
+            25.988249108195305,
+            25.969749316573143,
+            25.988249108195305
+          ],
+          "median": 25.969749316573143
+        }
+      },
+      "rejected_count": 80,
+      "frost_tactics": 16,
+      "native_pairs_measured": 362,
+      "max_relative_l2": 0.0,
+      "max_normalized_error": 0.0
+    },
+    {
+      "workload": {
+        "tokens": 2,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "cold",
+        "expert_reuse": "disjoint",
+        "validation_rounds": 4,
+        "selection_repeats": 20,
+        "validation_repeats": 50
+      },
+      "native_tactic_counts": [
+        21,
+        21
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "selected": {
+        "frost": [
+          "ffma",
+          2,
+          4
+        ],
+        "cutlass": [
+          1,
+          22
+        ]
+      },
+      "validation_median_us": {
+        "frost": 44.967749999999995,
+        "cutlass": 67.119
+      },
+      "speedup": 1.4926030321730575,
+      "aa_ratio": {
+        "frost": 0.9994721225120299,
+        "cutlass": 1.0003687480445178
+      },
+      "rejected_count": 80,
+      "frost_tactics": 16,
+      "native_pairs_measured": 362,
+      "max_relative_l2": 0.0,
+      "max_normalized_error": 0.0
+    },
+    {
+      "workload": {
+        "tokens": 2,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "cold",
+        "expert_reuse": "shared",
+        "validation_rounds": 4,
+        "selection_repeats": 20,
+        "validation_repeats": 50
+      },
+      "native_tactic_counts": [
+        21,
+        21
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "selected": {
+        "frost": [
+          "ffma",
+          2,
+          8
+        ],
+        "cutlass": [
+          2,
+          22
+        ]
+      },
+      "validation_median_us": {
+        "frost": 25.744,
+        "cutlass": 46.28775
+      },
+      "speedup": 1.7980014760720946,
+      "aa_ratio": {
+        "frost": 0.9993982802461228,
+        "cutlass": 0.9996489977535856
+      },
+      "rejected_count": 80,
+      "frost_tactics": 16,
+      "native_pairs_measured": 362,
+      "max_relative_l2": 0.000134402583823308,
+      "max_normalized_error": 0.002145922746781116
+    },
+    {
+      "workload": {
+        "tokens": 2,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "warm",
+        "expert_reuse": "disjoint",
+        "validation_rounds": 4,
+        "selection_repeats": 20,
+        "validation_repeats": 50
+      },
+      "native_tactic_counts": [
+        21,
+        21
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "selected": {
+        "frost": [
+          "ffma",
+          2,
+          8
+        ],
+        "cutlass": [
+          2,
+          21
+        ]
+      },
+      "validation_median_us": {
+        "frost": 12.80775,
+        "cutlass": 33.079499999999996
+      },
+      "speedup": 2.582772149675001,
+      "aa_ratio": {
+        "frost": 0.9993562734082398,
+        "cutlass": 1.0012095006274286
+      },
+      "warm_event_chain_us": {
+        "frost": {
+          "samples": [
+            12.546749785542488,
+            12.453500181436539,
+            12.474999763071537,
+            12.460500001907349,
+            12.446500360965729,
+            12.459499761462212,
+            12.458249926567078
+          ],
+          "median": 12.459499761462212
+        },
+        "cutlass": {
+          "samples": [
+            31.361501663923264,
+            31.23375028371811,
+            31.242750585079193,
+            31.241249293088913,
+            31.232750043272972,
+            31.230749562382698,
+            31.234249472618103
+          ],
+          "median": 31.234249472618103
+        }
+      },
+      "rejected_count": 80,
+      "frost_tactics": 16,
+      "native_pairs_measured": 362,
+      "max_relative_l2": 0.0,
+      "max_normalized_error": 0.0
+    },
+    {
+      "workload": {
+        "tokens": 2,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "warm",
+        "expert_reuse": "shared",
+        "validation_rounds": 4,
+        "selection_repeats": 20,
+        "validation_repeats": 50
+      },
+      "native_tactic_counts": [
+        21,
+        21
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "selected": {
+        "frost": [
+          "ffma",
+          2,
+          8
+        ],
+        "cutlass": [
+          7,
+          23
+        ]
+      },
+      "validation_median_us": {
+        "frost": 12.831999999999999,
+        "cutlass": 27.92
+      },
+      "speedup": 2.1758104738154618,
+      "aa_ratio": {
+        "frost": 1.0,
+        "cutlass": 0.9988545246277206
+      },
+      "warm_event_chain_us": {
+        "frost": {
+          "samples": [
+            12.535749934613705,
+            12.451999820768833,
+            12.448499910533428,
+            12.443000450730324,
+            12.450500391423702,
+            12.446249835193157,
+            12.442749924957752
+          ],
+          "median": 12.448499910533428
+        },
+        "cutlass": {
+          "samples": [
+            26.24399960041046,
+            26.187749579548836,
+            26.18574909865856,
+            26.180749759078026,
+            26.184499263763428,
+            26.19674988090992,
+            26.18424966931343
+          ],
+          "median": 26.18574909865856
+        }
+      },
+      "rejected_count": 80,
+      "frost_tactics": 16,
+      "native_pairs_measured": 362,
+      "max_relative_l2": 0.000134402583823308,
+      "max_normalized_error": 0.002145922746781116
+    },
+    {
+      "workload": {
+        "tokens": 4,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "cold",
+        "expert_reuse": "disjoint",
+        "validation_rounds": 4,
+        "selection_repeats": 20,
+        "validation_repeats": 50
+      },
+      "native_tactic_counts": [
+        21,
+        21
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "selected": {
+        "frost": [
+          "ffma",
+          1,
+          4
+        ],
+        "cutlass": [
+          2,
+          23
+        ]
+      },
+      "validation_median_us": {
+        "frost": 89.33500000000001,
+        "cutlass": 109.75874999999999
+      },
+      "speedup": 1.228619801869368,
+      "aa_ratio": {
+        "frost": 0.998568088510029,
+        "cutlass": 1.0003667400906144
+      },
+      "rejected_count": 80,
+      "frost_tactics": 16,
+      "native_pairs_measured": 362,
+      "max_relative_l2": 0.0,
+      "max_normalized_error": 0.0
+    },
+    {
+      "workload": {
+        "tokens": 4,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "cold",
+        "expert_reuse": "shared",
+        "validation_rounds": 4,
+        "selection_repeats": 20,
+        "validation_repeats": 50
+      },
+      "native_tactic_counts": [
+        21,
+        21
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "selected": {
+        "frost": [
+          "ffma",
+          2,
+          8
+        ],
+        "cutlass": [
+          2,
+          22
+        ]
+      },
+      "validation_median_us": {
+        "frost": 35.96775,
+        "cutlass": 46.543499999999995
+      },
+      "speedup": 1.2940342390057757,
+      "aa_ratio": {
+        "frost": 0.9997845756139596,
+        "cutlass": 0.9986153970000269
+      },
+      "rejected_count": 80,
+      "frost_tactics": 16,
+      "native_pairs_measured": 362,
+      "max_relative_l2": 7.878422661565445e-05,
+      "max_normalized_error": 0.0013440860215053765
+    },
+    {
+      "workload": {
+        "tokens": 4,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "warm",
+        "expert_reuse": "disjoint",
+        "validation_rounds": 4,
+        "selection_repeats": 20,
+        "validation_repeats": 50
+      },
+      "native_tactic_counts": [
+        21,
+        21
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "selected": {
+        "frost": [
+          "ffma",
+          1,
+          4
+        ],
+        "cutlass": [
+          2,
+          23
+        ]
+      },
+      "validation_median_us": {
+        "frost": 22.0,
+        "cutlass": 45.37575
+      },
+      "speedup": 2.062534090909091,
+      "aa_ratio": {
+        "frost": 0.9989208347059558,
+        "cutlass": 1.0044382709558883
+      },
+      "warm_event_chain_us": {
+        "frost": {
+          "samples": [
+            21.834250539541245,
+            21.764500066637993,
+            21.711500361561775,
+            21.7677503824234,
+            21.737750619649887,
+            21.77649922668934,
+            21.814249455928802
+          ],
+          "median": 21.7677503824234
+        },
+        "cutlass": {
+          "samples": [
+            43.724749237298965,
+            43.602000921964645,
+            43.5824990272522,
+            43.57774928212166,
+            43.57599839568138,
+            43.59374940395355,
+            43.60450059175491
+          ],
+          "median": 43.59374940395355
+        }
+      },
+      "rejected_count": 80,
+      "frost_tactics": 16,
+      "native_pairs_measured": 362,
+      "max_relative_l2": 0.0,
+      "max_normalized_error": 0.0
+    },
+    {
+      "workload": {
+        "tokens": 4,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "warm",
+        "expert_reuse": "shared",
+        "validation_rounds": 4,
+        "selection_repeats": 20,
+        "validation_repeats": 50
+      },
+      "native_tactic_counts": [
+        21,
+        21
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "selected": {
+        "frost": [
+          "ffma",
+          1,
+          4
+        ],
+        "cutlass": [
+          7,
+          23
+        ]
+      },
+      "validation_median_us": {
+        "frost": 21.944,
+        "cutlass": 28.128
+      },
+      "speedup": 1.2818082391542107,
+      "aa_ratio": {
+        "frost": 0.998566585515688,
+        "cutlass": 0.9994311717861206
+      },
+      "warm_event_chain_us": {
+        "frost": {
+          "samples": [
+            21.771499887108803,
+            21.71025052666664,
+            21.680500358343124,
+            21.724499762058258,
+            21.660249680280685,
+            21.707499399781227,
+            21.70800045132637
+          ],
+          "median": 21.70800045132637
+        },
+        "cutlass": {
+          "samples": [
+            26.522750034928322,
+            26.466000825166702,
+            26.457250118255615,
+            26.459500193595886,
+            26.460500434041023,
+            26.386000216007233,
+            26.42050012946129
+          ],
+          "median": 26.459500193595886
+        }
+      },
+      "rejected_count": 80,
+      "frost_tactics": 16,
+      "native_pairs_measured": 362,
+      "max_relative_l2": 7.878422661565445e-05,
+      "max_normalized_error": 0.0013440860215053765
+    },
+    {
+      "workload": {
+        "tokens": 8,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "cold",
+        "expert_reuse": "disjoint",
+        "validation_rounds": 4,
+        "selection_repeats": 20,
+        "validation_repeats": 50
+      },
+      "native_tactic_counts": [
+        21,
+        21
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "selected": {
+        "frost": [
+          "ffma",
+          2,
+          8
+        ],
+        "cutlass": [
+          2,
+          23
+        ]
+      },
+      "validation_median_us": {
+        "frost": 172.51075,
+        "cutlass": 190.90999999999997
+      },
+      "speedup": 1.1066556721827479,
+      "aa_ratio": {
+        "frost": 1.00013622971228,
+        "cutlass": 1.0002095664463162
+      },
+      "rejected_count": 80,
+      "frost_tactics": 16,
+      "native_pairs_measured": 362,
+      "max_relative_l2": 0.0,
+      "max_normalized_error": 0.0
+    },
+    {
+      "workload": {
+        "tokens": 8,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "cold",
+        "expert_reuse": "shared",
+        "validation_rounds": 4,
+        "selection_repeats": 20,
+        "validation_repeats": 50
+      },
+      "native_tactic_counts": [
+        21,
+        21
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "selected": {
+        "frost": [
+          "ffma",
+          2,
+          4
+        ],
+        "cutlass": [
+          2,
+          23
+        ]
+      },
+      "validation_median_us": {
+        "frost": 51.92,
+        "cutlass": 47.455749999999995
+      },
+      "speedup": 0.9140167565485361,
+      "aa_ratio": {
+        "frost": 1.0006311762523548,
+        "cutlass": 0.9998366899690764
+      },
+      "rejected_count": 80,
+      "frost_tactics": 16,
+      "native_pairs_measured": 362,
+      "max_relative_l2": 6.117005858437228e-05,
+      "max_normalized_error": 0.0013440860215053765
+    },
+    {
+      "workload": {
+        "tokens": 8,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "warm",
+        "expert_reuse": "disjoint",
+        "validation_rounds": 4,
+        "selection_repeats": 20,
+        "validation_repeats": 50
+      },
+      "native_tactic_counts": [
+        21,
+        21
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "selected": {
+        "frost": [
+          "ffma",
+          1,
+          4
+        ],
+        "cutlass": [
+          2,
+          23
+        ]
+      },
+      "validation_median_us": {
+        "frost": 156.9105,
+        "cutlass": 181.41424999999998
+      },
+      "speedup": 1.1561638641136187,
+      "aa_ratio": {
+        "frost": 1.000709434684182,
+        "cutlass": 0.9997367902466316
+      },
+      "warm_event_chain_us": {
+        "frost": {
+          "samples": [
+            156.29824995994568,
+            156.22274577617645,
+            156.18625283241272,
+            156.2505066394806,
+            156.20124340057373,
+            156.2267541885376,
+            156.18374943733215
+          ],
+          "median": 156.22274577617645
+        },
+        "cutlass": {
+          "samples": [
+            180.24100363254547,
+            180.1455020904541,
+            180.18825352191925,
+            180.19075691699982,
+            180.16450107097626,
+            180.14724552631378,
+            180.16424775123596
+          ],
+          "median": 180.16450107097626
+        }
+      },
+      "rejected_count": 80,
+      "frost_tactics": 16,
+      "native_pairs_measured": 362,
+      "max_relative_l2": 0.0,
+      "max_normalized_error": 0.0
+    },
+    {
+      "workload": {
+        "tokens": 8,
+        "hidden": 2048,
+        "intermediate": 512,
+        "experts": 512,
+        "top_k": 10,
+        "cache_mode": "warm",
+        "expert_reuse": "shared",
+        "validation_rounds": 4,
+        "selection_repeats": 20,
+        "validation_repeats": 50
+      },
+      "native_tactic_counts": [
+        21,
+        21
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "selected": {
+        "frost": [
+          "ffma",
+          1,
+          4
+        ],
+        "cutlass": [
+          7,
+          23
+        ]
+      },
+      "validation_median_us": {
+        "frost": 38.06375,
+        "cutlass": 29.247500000000002
+      },
+      "speedup": 0.7683819907392204,
+      "aa_ratio": {
+        "frost": 0.9995601365546218,
+        "cutlass": 0.999453243802006
+      },
+      "warm_event_chain_us": {
+        "frost": {
+          "samples": [
+            38.76874968409538,
+            38.69875147938728,
+            38.66174817085266,
+            38.72475028038025,
+            38.763999938964844,
+            38.82500156760216,
+            38.84999826550484
+          ],
+          "median": 38.763999938964844
+        },
+        "cutlass": {
+          "samples": [
+            27.682749554514885,
+            27.612749487161636,
+            27.611499652266502,
+            27.604250237345695,
+            27.600500732660294,
+            27.609750628471375,
+            27.600249275565147
+          ],
+          "median": 27.609750628471375
+        }
+      },
+      "rejected_count": 80,
+      "frost_tactics": 16,
+      "native_pairs_measured": 362,
+      "max_relative_l2": 6.117005858437228e-05,
+      "max_normalized_error": 0.0013440860215053765
+    }
+  ],
+  "large_expert_controls": [
+    {
+      "workload": {
+        "tokens": 1,
+        "hidden": 7168,
+        "intermediate": 2048,
+        "experts": 256,
+        "top_k": 8,
+        "cache_mode": "cold",
+        "expert_reuse": "disjoint",
+        "validation_rounds": 4,
+        "selection_repeats": 20,
+        "validation_repeats": 50
+      },
+      "native_tactic_counts": [
+        21,
+        21
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "selected": {
+        "frost": [
+          "ffma",
+          1,
+          2
+        ],
+        "cutlass": [
+          7,
+          23
+        ]
+      },
+      "validation_median_us": {
+        "frost": 237.839,
+        "cutlass": 256.30274999999995
+      },
+      "speedup": 1.0776312968016177,
+      "aa_ratio": {
+        "frost": 1.0007391923351117,
+        "cutlass": 1.0001863378275544
+      }
+    },
+    {
+      "workload": {
+        "tokens": 1,
+        "hidden": 7168,
+        "intermediate": 2048,
+        "experts": 256,
+        "top_k": 8,
+        "cache_mode": "warm",
+        "expert_reuse": "disjoint",
+        "validation_rounds": 4,
+        "selection_repeats": 20,
+        "validation_repeats": 50
+      },
+      "native_tactic_counts": [
+        21,
+        21
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "selected": {
+        "frost": [
+          "ffma",
+          1,
+          1
+        ],
+        "cutlass": [
+          7,
+          23
+        ]
+      },
+      "validation_median_us": {
+        "frost": 217.27825,
+        "cutlass": 243.40675
+      },
+      "speedup": 1.1202536379043921,
+      "aa_ratio": {
+        "frost": 1.0001461364177706,
+        "cutlass": 1.000164339381365
+      },
+      "warm_event_chain_us": {
+        "frost": {
+          "samples": [
+            216.82900190353394,
+            216.8094962835312,
+            216.88775718212128,
+            216.77449345588684,
+            216.80624783039093,
+            216.80200099945068,
+            216.83000028133392
+          ],
+          "median": 216.8094962835312
+        },
+        "cutlass": {
+          "samples": [
+            241.99500679969788,
+            241.97499454021454,
+            242.04149842262268,
+            242.13574826717377,
+            241.95775389671326,
+            241.95075035095215,
+            242.04100668430328
+          ],
+          "median": 241.99500679969788
+        }
+      }
+    },
+    {
+      "workload": {
+        "tokens": 2,
+        "hidden": 7168,
+        "intermediate": 2048,
+        "experts": 256,
+        "top_k": 8,
+        "cache_mode": "cold",
+        "expert_reuse": "disjoint",
+        "validation_rounds": 4,
+        "selection_repeats": 20,
+        "validation_repeats": 50
+      },
+      "native_tactic_counts": [
+        21,
+        21
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "selected": {
+        "frost": [
+          "ffma",
+          1,
+          2
+        ],
+        "cutlass": [
+          7,
+          23
+        ]
+      },
+      "validation_median_us": {
+        "frost": 463.31025,
+        "cutlass": 477.671
+      },
+      "speedup": 1.0309959686840513,
+      "aa_ratio": {
+        "frost": 0.9997933458440932,
+        "cutlass": 0.9992131368477445
+      }
+    },
+    {
+      "workload": {
+        "tokens": 2,
+        "hidden": 7168,
+        "intermediate": 2048,
+        "experts": 256,
+        "top_k": 8,
+        "cache_mode": "warm",
+        "expert_reuse": "disjoint",
+        "validation_rounds": 4,
+        "selection_repeats": 20,
+        "validation_repeats": 50
+      },
+      "native_tactic_counts": [
+        21,
+        21
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "selected": {
+        "frost": [
+          "ffma",
+          1,
+          2
+        ],
+        "cutlass": [
+          7,
+          23
+        ]
+      },
+      "validation_median_us": {
+        "frost": 430.77475,
+        "cutlass": 458.91874999999993
+      },
+      "speedup": 1.065333448629475,
+      "aa_ratio": {
+        "frost": 1.000203129942224,
+        "cutlass": 0.9982598055876554
+      },
+      "warm_event_chain_us": {
+        "frost": {
+          "samples": [
+            430.4710030555725,
+            430.43625354766846,
+            430.4267466068268,
+            430.3927421569824,
+            430.4119944572449,
+            430.3712546825409,
+            430.3567409515381
+          ],
+          "median": 430.4119944572449
+        },
+        "cutlass": {
+          "samples": [
+            459.8875045776367,
+            459.5962464809418,
+            459.6160054206848,
+            459.65924859046936,
+            459.595263004303,
+            459.71474051475525,
+            459.60548520088196
+          ],
+          "median": 459.6160054206848
+        }
+      }
+    },
+    {
+      "workload": {
+        "tokens": 4,
+        "hidden": 7168,
+        "intermediate": 2048,
+        "experts": 256,
+        "top_k": 8,
+        "cache_mode": "cold",
+        "expert_reuse": "disjoint",
+        "validation_rounds": 4,
+        "selection_repeats": 20,
+        "validation_repeats": 50
+      },
+      "native_tactic_counts": [
+        21,
+        21
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "selected": {
+        "frost": [
+          "ffma",
+          1,
+          1
+        ],
+        "cutlass": [
+          7,
+          28
+        ]
+      },
+      "validation_median_us": {
+        "frost": 905.4772499999999,
+        "cutlass": 927.7257500000001
+      },
+      "speedup": 1.024571020420447,
+      "aa_ratio": {
+        "frost": 1.0001943880930666,
+        "cutlass": 0.9996898996740579
+      }
+    },
+    {
+      "workload": {
+        "tokens": 4,
+        "hidden": 7168,
+        "intermediate": 2048,
+        "experts": 256,
+        "top_k": 8,
+        "cache_mode": "warm",
+        "expert_reuse": "disjoint",
+        "validation_rounds": 4,
+        "selection_repeats": 20,
+        "validation_repeats": 50
+      },
+      "native_tactic_counts": [
+        21,
+        21
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "selected": {
+        "frost": [
+          "ffma",
+          1,
+          4
+        ],
+        "cutlass": [
+          7,
+          23
+        ]
+      },
+      "validation_median_us": {
+        "frost": 857.2855,
+        "cutlass": 893.87825
+      },
+      "speedup": 1.0426844382647322,
+      "aa_ratio": {
+        "frost": 1.0000099150166428,
+        "cutlass": 1.0000808326490063
+      },
+      "warm_event_chain_us": {
+        "frost": {
+          "samples": [
+            856.9465279579163,
+            856.8410277366638,
+            856.8465113639832,
+            856.9419980049133,
+            856.7942380905151,
+            856.8162322044373,
+            856.8634986877441
+          ],
+          "median": 856.8465113639832
+        },
+        "cutlass": {
+          "samples": [
+            892.6485180854797,
+            892.5172686576843,
+            892.5937414169312,
+            892.4474716186523,
+            892.5777673721313,
+            892.4787640571594,
+            892.4224972724915
+          ],
+          "median": 892.5172686576843
+        }
+      }
+    },
+    {
+      "workload": {
+        "tokens": 8,
+        "hidden": 7168,
+        "intermediate": 2048,
+        "experts": 256,
+        "top_k": 8,
+        "cache_mode": "cold",
+        "expert_reuse": "disjoint",
+        "validation_rounds": 4,
+        "selection_repeats": 20,
+        "validation_repeats": 50
+      },
+      "native_tactic_counts": [
+        21,
+        21
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "selected": {
+        "frost": [
+          "ffma",
+          1,
+          1
+        ],
+        "cutlass": [
+          7,
+          23
+        ]
+      },
+      "validation_median_us": {
+        "frost": 1774.59125,
+        "cutlass": 1816.96675
+      },
+      "speedup": 1.0238790200278516,
+      "aa_ratio": {
+        "frost": 1.0000543811864764,
+        "cutlass": 1.000083800162619
+      }
+    },
+    {
+      "workload": {
+        "tokens": 8,
+        "hidden": 7168,
+        "intermediate": 2048,
+        "experts": 256,
+        "top_k": 8,
+        "cache_mode": "warm",
+        "expert_reuse": "disjoint",
+        "validation_rounds": 4,
+        "selection_repeats": 20,
+        "validation_repeats": 50
+      },
+      "native_tactic_counts": [
+        21,
+        21
+      ],
+      "native_search": "exhaustive advertised GEMM1 x GEMM2 Cartesian product plus default",
+      "selected": {
+        "frost": [
+          "ffma",
+          1,
+          4
+        ],
+        "cutlass": [
+          7,
+          23
+        ]
+      },
+      "validation_median_us": {
+        "frost": 1709.9212499999999,
+        "cutlass": 1750.57625
+      },
+      "speedup": 1.0237759487461777,
+      "aa_ratio": {
+        "frost": 0.9999441507648641,
+        "cutlass": 0.9999501615394457
+      },
+      "warm_event_chain_us": {
+        "frost": {
+          "samples": [
+            1709.5227241516113,
+            1709.5797061920166,
+            1709.5730304718018,
+            1709.5012664794922,
+            1709.5459699630737,
+            1709.4672918319702,
+            1709.4712257385254
+          ],
+          "median": 1709.5227241516113
+        },
+        "cutlass": {
+          "samples": [
+            1749.7752904891968,
+            1749.7707605361938,
+            1749.848484992981,
+            1749.7901916503906,
+            1749.7472763061523,
+            1749.9467134475708,
+            1749.7769594192505
+          ],
+          "median": 1749.7769594192505
+        }
+      }
+    }
+  ],
+  "public_benchmark_reproduction": {
+    "harness_sha256": "2a98d700611478f911a8e7fa0281d6a42926187f9d60edab96bfc15b65db0a7e",
+    "validation_median_us": {
+      "frost": 8.16,
+      "cutlass": 27.808
+    },
+    "speedup": 3.407843137254902,
+    "aa_ratio": {
+      "frost": 1.0,
+      "cutlass": 0.9988499137435309
+    },
+    "completed": true
+  }
+}

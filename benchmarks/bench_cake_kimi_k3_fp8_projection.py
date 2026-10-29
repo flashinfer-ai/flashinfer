@@ -40,7 +40,6 @@ from flashinfer.experimental.kimi_k3_fp8_projection.cake_backend import (
     BLOCK,
     E4M3_MAX,
     PROJECTION_FAMILIES,
-    n_padded_128,
     requant_weight_ue8m0,
 )
 from flashinfer.gemm import (
@@ -60,6 +59,11 @@ ROWS = {
     for m in M_VALUES
 }
 CHAINS = ("cutlass_sm1", "cutlass_sm2", "trtllm", "cutile")
+
+
+def n_padded_128(n_valid: int) -> int:
+    """ModelOpt's serialized padding (128-row blocks)."""
+    return -(-int(n_valid) // BLOCK) * BLOCK
 
 
 def make_weight(n_valid, K, device, seed):

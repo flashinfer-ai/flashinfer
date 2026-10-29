@@ -4565,10 +4565,10 @@
                                     : "=r"(*reinterpret_cast<uint32_t*>(&w1_sfb_arr[w1_sfl_nt_s8])), "=r"(*reinterpret_cast<uint32_t*>(&w1_sfb_arr[(w1_sfl_nt_s8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w1_sfb_arr[(w1_sfl_nt_s8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w1_sfb_arr[(w1_sfl_nt_s8) + 3]))
                                     : "r"(w1_smem_sfb_addr + w1_math_stage * 512 + (unsigned int)((w1_group_id * 16 + (w1_warp_n * 8 + w1_sfl_nt_s8 ^ (w1_group_id >> 1) * 4)) * 4)));
                             }
-#if ((MOE_INSTANCE == 0 && ((MOE_SW_POLICY_EP == 4 || MOE_SW_POLICY_EP == 16) || (MOE_SW_POLICY_EP == 8 && (MOE_SW_TB_SCR_GLOBAL == 0 && (MOE_SW_ROLE_WARP_FOLD == 0 || (MOE_SW_ROLE_WARP_FOLD == 1 && MOE_SW_PAD_MULTI_PASS == 1)))))) || (MOE_INSTANCE == 2 && ((MOE_SW_POLICY_EP == 4 || MOE_SW_POLICY_EP == 16) || (MOE_SW_POLICY_EP == 8 && (MOE_SW_TB_SCR_GLOBAL == 0 && (MOE_SW_ROLE_WARP_FOLD == 0 || (MOE_SW_ROLE_WARP_FOLD == 1 && MOE_SW_PAD_MULTI_PASS == 1))))))) // moe-select
-                            #pragma unroll 1
-#else // moe-select
+#if (MOE_INSTANCE == 1 || MOE_INSTANCE == 3) // moe-select
                             #pragma unroll 4
+#else // moe-select
+                            #pragma unroll 1
 #endif // moe-select
                             for (int w1_k_step_s8 = 0; w1_k_step_s8 < 4; w1_k_step_s8++) {
                                 #pragma unroll
@@ -4702,10 +4702,10 @@
                                 : "=r"(*reinterpret_cast<uint32_t*>(&w1_sfb_arr[w1_sfl_nt])), "=r"(*reinterpret_cast<uint32_t*>(&w1_sfb_arr[(w1_sfl_nt) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w1_sfb_arr[(w1_sfl_nt) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w1_sfb_arr[(w1_sfl_nt) + 3]))
                                 : "r"(w1_smem_sfb_addr + w1_math_stage * 512 + (unsigned int)((w1_group_id * 16 + (w1_warp_n * 8 + w1_sfl_nt ^ (w1_group_id >> 1) * 4)) * 4)));
                         }
-#if ((MOE_INSTANCE == 0 && ((MOE_SW_POLICY_EP == 4 || MOE_SW_POLICY_EP == 16) || (MOE_SW_POLICY_EP == 8 && (MOE_SW_TB_SCR_GLOBAL == 0 && (MOE_SW_ROLE_WARP_FOLD == 0 || (MOE_SW_ROLE_WARP_FOLD == 1 && MOE_SW_PAD_MULTI_PASS == 1)))))) || (MOE_INSTANCE == 2 && ((MOE_SW_POLICY_EP == 4 || MOE_SW_POLICY_EP == 16) || (MOE_SW_POLICY_EP == 8 && (MOE_SW_TB_SCR_GLOBAL == 0 && (MOE_SW_ROLE_WARP_FOLD == 0 || (MOE_SW_ROLE_WARP_FOLD == 1 && MOE_SW_PAD_MULTI_PASS == 1))))))) // moe-select
-                        #pragma unroll 1
-#else // moe-select
+#if (MOE_INSTANCE == 1 || MOE_INSTANCE == 3) // moe-select
                         #pragma unroll 4
+#else // moe-select
+                        #pragma unroll 1
 #endif // moe-select
                         for (int w1_k_step = 0; w1_k_step < 4; w1_k_step++) {
                             #pragma unroll
@@ -5203,10 +5203,10 @@
                                     : "=r"(*reinterpret_cast<uint32_t*>(&w1_sfb_arr[w2_sfl_nt_s8])), "=r"(*reinterpret_cast<uint32_t*>(&w1_sfb_arr[(w2_sfl_nt_s8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w1_sfb_arr[(w2_sfl_nt_s8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w1_sfb_arr[(w2_sfl_nt_s8) + 3]))
                                     : "r"(w1_smem_sfb_addr + w1_math_stage * 512 + (unsigned int)((w1_group_id * 16 + (w1_warp_n * 8 + w2_sfl_nt_s8 ^ (w1_group_id >> 1) * 4)) * 4)));
                             }
-#if ((MOE_INSTANCE == 0 && ((MOE_SW_POLICY_EP == 4 || MOE_SW_POLICY_EP == 16) || (MOE_SW_POLICY_EP == 8 && (MOE_SW_TB_SCR_GLOBAL == 0 && (MOE_SW_ROLE_WARP_FOLD == 0 || (MOE_SW_ROLE_WARP_FOLD == 1 && MOE_SW_PAD_MULTI_PASS == 1)))))) || (MOE_INSTANCE == 2 && ((MOE_SW_POLICY_EP == 4 || MOE_SW_POLICY_EP == 16) || (MOE_SW_POLICY_EP == 8 && (MOE_SW_TB_SCR_GLOBAL == 0 && (MOE_SW_ROLE_WARP_FOLD == 0 || (MOE_SW_ROLE_WARP_FOLD == 1 && MOE_SW_PAD_MULTI_PASS == 1))))))) // moe-select
-                            #pragma unroll 1
-#else // moe-select
+#if (MOE_INSTANCE == 1 || MOE_INSTANCE == 3) // moe-select
                             #pragma unroll 4
+#else // moe-select
+                            #pragma unroll 1
 #endif // moe-select
                             for (int w2_k_step_s8 = 0; w2_k_step_s8 < 4; w2_k_step_s8++) {
                                 #pragma unroll
@@ -5340,10 +5340,10 @@
                                 : "=r"(*reinterpret_cast<uint32_t*>(&w1_sfb_arr[w2_sfl_nt])), "=r"(*reinterpret_cast<uint32_t*>(&w1_sfb_arr[(w2_sfl_nt) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&w1_sfb_arr[(w2_sfl_nt) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&w1_sfb_arr[(w2_sfl_nt) + 3]))
                                 : "r"(w1_smem_sfb_addr + w1_math_stage * 512 + (unsigned int)((w1_group_id * 16 + (w1_warp_n * 8 + w2_sfl_nt ^ (w1_group_id >> 1) * 4)) * 4)));
                         }
-#if ((MOE_INSTANCE == 0 && ((MOE_SW_POLICY_EP == 4 || MOE_SW_POLICY_EP == 16) || (MOE_SW_POLICY_EP == 8 && (MOE_SW_TB_SCR_GLOBAL == 0 && (MOE_SW_ROLE_WARP_FOLD == 0 || (MOE_SW_ROLE_WARP_FOLD == 1 && MOE_SW_PAD_MULTI_PASS == 1)))))) || (MOE_INSTANCE == 2 && ((MOE_SW_POLICY_EP == 4 || MOE_SW_POLICY_EP == 16) || (MOE_SW_POLICY_EP == 8 && (MOE_SW_TB_SCR_GLOBAL == 0 && (MOE_SW_ROLE_WARP_FOLD == 0 || (MOE_SW_ROLE_WARP_FOLD == 1 && MOE_SW_PAD_MULTI_PASS == 1))))))) // moe-select
-                        #pragma unroll 1
-#else // moe-select
+#if (MOE_INSTANCE == 1 || MOE_INSTANCE == 3) // moe-select
                         #pragma unroll 4
+#else // moe-select
+                        #pragma unroll 1
 #endif // moe-select
                         for (int w2_k_step = 0; w2_k_step < 4; w2_k_step++) {
                             #pragma unroll
@@ -6639,3 +6639,27 @@
                                 #pragma unroll
                                 for (int e2_nt = 0; e2_nt < 8; e2_nt++) {
                                     int e2_col = e2_nt * 8 + epi_tid * 2;
+#if (MOE_INSTANCE == 1 || MOE_INSTANCE == 3) // moe-select
+                                    int e2_addr_2912fc = e2_vn * 8192 + e2_srow_ae7d29 * 128 + (e2_col * 2 ^ (e2_srow_ae7d29 & 7) * 16);
+                                    int e2_addr_2912fc_1 = e2_vn * 8192 + e2_srow_e70369 * 128 + (e2_col * 2 ^ (e2_srow_e70369 & 7) * 16);
+                                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&epi_word[0])) : "r"(d_stage_addr + (unsigned int)e2_addr_2912fc));
+#else // moe-select
+                                    int e2_addr_fef2a0 = e2_vn * 16384 + e2_srow_93c3f8 * 128 + (e2_col * 2 ^ (e2_srow_93c3f8 & 7) * 16);
+                                    int e2_addr_fef2a0_1 = e2_vn * 16384 + e2_srow_e70369 * 128 + (e2_col * 2 ^ (e2_srow_e70369 & 7) * 16);
+                                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&epi_word[0])) : "r"(d_stage_addr + (unsigned int)e2_addr_fef2a0));
+#endif // moe-select
+                                    epi_lo_bits = epi_word[0] << 16;
+                                    epi_hi_bits = epi_word[0] & 4294901760;
+                                    float e2_v00 = 0.0f;
+                                    e2_v00 = reinterpret_cast<float*>(&epi_lo_bits)[0];
+                                    float e2_v01 = 0.0f;
+                                    e2_v01 = reinterpret_cast<float*>(&epi_hi_bits)[0];
+                                    epi_a[e2_nt * 2] = e2_v00;
+                                    epi_a[e2_nt * 2 + 1] = e2_v01;
+#if (MOE_INSTANCE == 1 || MOE_INSTANCE == 3) // moe-select
+                                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&epi_word[0])) : "r"(d_stage_addr + (unsigned int)e2_addr_2912fc_1));
+#else // moe-select
+                                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&epi_word[0])) : "r"(d_stage_addr + (unsigned int)e2_addr_fef2a0_1));
+#endif // moe-select
+                                    epi_lo_bits = epi_word[0] << 16;
+                                    epi_hi_bits = epi_word[0] & 4294901760;

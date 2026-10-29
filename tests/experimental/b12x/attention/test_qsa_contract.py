@@ -3460,22 +3460,6 @@ def test_qsa_run_stream_options_validate_before_mutation() -> None:
     assert not hasattr(qsa, "run_selected")
 
 
-@torch.library.custom_op(
-    "b12x_tests::qsa_delayed_producer",
-    mutates_args=("query", "value_cache"),
-)
-def _qsa_delayed_producer(query: torch.Tensor, value_cache: torch.Tensor) -> None:
-    # Model an opaque cache writer; Torch functionalization must not defer writes.
-    torch.cuda._sleep(100_000_000)
-    query.zero_()
-    value_cache.fill_(2)
-
-
-@_qsa_delayed_producer.register_fake
-def _qsa_delayed_producer_fake(query: torch.Tensor, value_cache: torch.Tensor) -> None:
-    return None
-
-
 @pytest.mark.parametrize("compiled", [False, True])
 def test_qsa_run_selection_forks_before_main_producer_and_joins_before_attention(
     monkeypatch,
@@ -3506,21 +3490,38 @@ def test_qsa_run_selection_forks_before_main_producer_and_joins_before_attention
     started = torch.cuda.Event(enable_timing=True, external=True)
     selected = torch.cuda.Event(enable_timing=True, external=True)
     produced = torch.cuda.Event(enable_timing=True, external=True)
+
+    @torch.library.custom_op(
+        "b12x_tests::qsa_delayed_producer",
+        mutates_args=("query", "value_cache"),
+    )
+    def delayed_producer(query: torch.Tensor, value_cache: torch.Tensor) -> None:
+        # Keep the timestamps with the opaque producer's actual CUDA work;
+        # compilation may move separate event-record calls around the custom op.
+        stream = torch.cuda.current_stream(device)
+        started.record(stream)
+        ready.record(stream)
+        torch.cuda._sleep(100_000_000)
+        query.zero_()
+        value_cache.fill_(2)
+        produced.record(stream)
+
+    @delayed_producer.register_fake
+    def delayed_producer_fake(query: torch.Tensor, value_cache: torch.Tensor) -> None:
+        return None
+
     original = qsa_contract._qsa_decode_impl
 
     def observe(*args, **kwargs):
         original(*args, **kwargs)
         if args[0] is None:
-            selected.record()
+            selected.record(binding.selection_stream)
 
     monkeypatch.setattr(qsa_contract, "_qsa_decode_impl", observe)
     ready.record()
 
     def invoke():
-        started.record()
-        ready.record()
-        _qsa_delayed_producer(dynamic["query"], binding.main_v_cache)
-        produced.record()
+        delayed_producer(dynamic["query"], binding.main_v_cache)
         return qsa.run(binding, **dynamic, index_ready=ready)
 
     launch = torch.compile(invoke, fullgraph=True) if compiled else invoke
@@ -3532,6 +3533,9 @@ def test_qsa_run_selection_forks_before_main_producer_and_joins_before_attention
             graph = _cuda_graph()
             with torch.cuda.graph(graph):
                 result = launch()
+                # Inductor can append mutation copy-backs on the selector stream
+                # after QSA's attention join. Include that tail in this capture.
+                torch.cuda.current_stream().wait_stream(binding.selection_stream)
         for _ in range(2):
             binding.raw_interval_start_positions.fill_(-1)
             dynamic["query"].fill_(float("nan"))

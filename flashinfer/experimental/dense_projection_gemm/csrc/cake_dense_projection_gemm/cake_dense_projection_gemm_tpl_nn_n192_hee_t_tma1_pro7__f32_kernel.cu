@@ -304,6 +304,12 @@ nn_n192_hee_t_tma1_pro7__f32(const __grid_constant__ CUtensorMap A, const __grid
                     }
                     this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
                 }
+                #pragma unroll
+                for (int _xs = 0; _xs < 6; _xs++) {
+                    mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
+                    load_stage += 1;
+                    if (load_stage == 6) { load_stage = 0; _phase_mma_done ^= 1; }
+                }
             }
         }
     }

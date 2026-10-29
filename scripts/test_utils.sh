@@ -4,6 +4,8 @@
 
 # shellcheck disable=SC1091
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test_path_scope.sh"
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test_run_status.sh"
 
 # Default environment variables
 : "${JUNIT_DIR:=$(realpath ./junit)}"
@@ -168,6 +170,10 @@ print_test_mode_banner() {
 }
 
 run_pytest_with_file_timeout() {
+    local receipt pytest_status=0
+    receipt=$(test_status_start) || return 3
+    local -a TEST_STATUS_PYTEST_COMMAND
+    test_status_pytest_command "${receipt}"
     local -a timeout_cmd=()
     if [ "$PYTEST_FILE_TIMEOUT_SECONDS" -gt 0 ] 2>/dev/null; then
         if command -v timeout >/dev/null 2>&1; then
@@ -182,7 +188,9 @@ run_pytest_with_file_timeout() {
     fi
 
     # shellcheck disable=SC2086  # PYTEST_COMMAND_PREFIX and PYTEST_FLAGS need word splitting
-    "${timeout_cmd[@]}" ${PYTEST_COMMAND_PREFIX} pytest $PYTEST_FLAGS "$@"
+    "${timeout_cmd[@]}" ${PYTEST_COMMAND_PREFIX} "${TEST_STATUS_PYTEST_COMMAND[@]}" $PYTEST_FLAGS "$@" || pytest_status=$?
+    test_status_finish "${receipt}" "${pytest_status}" || return 3
+    return "${pytest_status}"
 }
 
 is_pytest_file_timeout_exit() {
@@ -296,22 +304,9 @@ install_and_verify() {
 
         # Sync the branch's direct dependencies without re-resolving the CUDA
         # stack already selected and validated by the image build.
-        _dependency_args=(-r requirements.txt -r requirements-test.txt)
-
-        # Install nvidia-cutlass-dsl with the correct CUDA extra to avoid
-        # version skew between libs-base and libs-cu13.  requirements.txt
-        # cannot add the extra conditionally, hence the separate install.
-        #
-        # Keep this a floor, not an exact pin: an exact ==4.7.0 downgrades a
-        # newer CuTe DSL that the test image may ship (the Rubin image ships
-        # 4.8.0a0), which removes cutlass.utils.rubin_helpers and the sm_107a
-        # Arch member and so disables every SM107 path for the whole run.
-        # The a0 suffix is required for pip to consider pre-releases at all.
-        if [[ "${CUDA_VERSION}" == *"cu13"* || "${CUDA_VERSION}" == 13.* ]]; then
-            _dependency_args+=("nvidia-cutlass-dsl[cu13]>=4.7.0a0")
-        fi
-        pip install --no-deps "${_dependency_args[@]}"
-        unset _dependency_args
+        pip install --no-deps -r requirements.txt -r requirements-test.txt
+        # Repair the complete DSL stack before show-config imports FlashInfer.
+        bash "$(dirname "${BASH_SOURCE[0]}")/install_cutlass_dsl.sh" || return 1
         python -c "import pytest_timeout"
 
         # Install local python sources. The env var keeps --no-build-isolation

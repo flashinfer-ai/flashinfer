@@ -252,6 +252,13 @@ def pytest_collection_modifyitems(config, items):
             if mk not in item.keywords:
                 continue
             if "WORLD_SIZE" not in os.environ:
+                # Runners that exist only to run multi-rank tests set this so
+                # that a missing launcher fails instead of skipping silently.
+                if os.environ.get("FAIL_ON_DISTRIBUTED_SKIP") == "1":
+                    raise pytest.UsageError(
+                        f"{item.nodeid} needs a torchrun or MPI launch "
+                        "(WORLD_SIZE unset)"
+                    )
                 # Multi-rank tests must be launched via torchrun (see
                 # tests/moe_ep/run_tests.sh); under plain pytest auto-discovery
                 # (e.g. CI unit-test sweeps) they would hang on dist init.
@@ -273,6 +280,17 @@ def pytest_collection_modifyitems(config, items):
         # Exactly sm_107: the Rubin mega kernels compile for sm_107a only.
         if "arch_rubin" in item.keywords and cc != (10, 7):
             item.add_marker(pytest.mark.skip(reason="needs sm_107 (Rubin)"))
+        elif "arch_rubin" in item.keywords:
+            from flashinfer.cute_dsl.availability import (
+                is_cute_dsl_arch_supported,
+            )
+
+            if not is_cute_dsl_arch_supported(10, 7, native_only=True):
+                item.add_marker(
+                    pytest.mark.skip(
+                        reason="installed CuTe DSL cannot natively target sm_107"
+                    )
+                )
         # Exactly sm_90: the SM90 mega kernels are Hopper-only (Blackwell
         # hosts use the sm_100 tree's kernels instead).
         if "arch_hopper" in item.keywords and cc != (9, 0):

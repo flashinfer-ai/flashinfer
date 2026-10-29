@@ -14,19 +14,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""Benchmark the experimental NVFP4 attention backend on SM103.
+"""Benchmark the experimental NVFP4 attention backend (SM100, SM103, SM120).
 
-For every ``[B,H,S,128]`` row this reports the attention launch (CUPTI, cold
-L2, median over the measured iterations) and the preparation step
-(``prepare_nvfp4_attention``: quantization + scale packing + binding) as host
-wall time, the number of GPU kernels it launches, the bytes it copies host to
-device and its peak allocated memory. Run it before and after a host-path
-change to compare both halves of a call.
+For every ``[B, H, S, 128]`` row this reports the complete BF16 -> BF16 call
+(the whole chain -- statistics, quantization, on SM100 / SM103 the block-mean
+compensation table, attention -- replayed from a CUDA graph; CUPTI
+kernel time with a cold L2, median over the measured iterations), its
+TFLOP/s over the dense score and output products, the preparation host time
+(``prepare_nvfp4_attention``: validation, workspace carving, binding) and the
+workspace bytes.  ``--baseline sdpa`` adds PyTorch's BF16
+``scaled_dot_product_attention`` on the same tensors under the same protocol.
 
 Usage::
 
-    python benchmarks/bench_cake_nvfp4_attention.py [--rows b4_h8_s4096 ...]
-        [--prepare-repeats 5] [--json out.json]
+    python benchmarks/bench_cake_nvfp4_attention.py [--rows R1 R2 ...]
+        [--layout HND|NHD] [--baseline none|sdpa] [--json out.json]
 """
 
 import argparse
@@ -35,117 +37,132 @@ import statistics
 import time
 
 import torch
-from torch.profiler import ProfilerActivity, profile
 
-from flashinfer.prefill import prepare_nvfp4_attention
+from flashinfer.prefill import nvfp4_attention_workspace_bytes, prepare_nvfp4_attention
 from flashinfer.testing import bench_gpu_time_with_cupti
 from flashinfer.utils import get_compute_capability
 
+# (batch, seqlen, heads): the owner's rows of the dense video-diffusion workload.
 ROWS = {
-    "b4_h8_s4096": (4, 8, 4096),
-    "b1_h8_s32768": (1, 8, 32768),
-    "b8_h32_s8192": (8, 32, 8192),
+    "R1": (1, 4800, 40),
+    "R2": (1, 32760, 40),
+    "R3": (1, 75600, 40),
+    "R4": (1, 32760, 5),
+    "R5": (1, 75600, 5),
+    "R6": (2, 32760, 40),
+    "R7": (1, 32760, 12),
 }
+SUPPORTED = {(10, 0): "sm_100a", (10, 3): "sm_103a", (12, 0): "sm_120a"}
 
 
-def _prepare_profile(q, k, v, out):
+def _inputs(batch, heads, seqlen, layout, seed=42):
+    generator = torch.Generator().manual_seed(seed)
+    shape = (batch, heads, seqlen, 128)
+    tensors = []
+    for _ in range(3):
+        x = torch.randn(shape, generator=generator).to(
+            dtype=torch.bfloat16, device="cuda"
+        )
+        if layout == "NHD":
+            x = x.transpose(1, 2).contiguous().transpose(1, 2)
+        tensors.append(x)
+    out = (
+        torch.empty_like(tensors[0])
+        if layout == "HND"
+        else torch.empty_like(tensors[0].transpose(1, 2)).transpose(1, 2)
+    )
+    return (*tensors, out)
+
+
+def _timed(fn):
+    times = bench_gpu_time_with_cupti(fn, cold_l2_cache=True, use_cuda_graph=True)
+    return float(statistics.median(times))
+
+
+def bench_row(name, layout, baseline, prepare_repeats):
+    batch, seqlen, heads = ROWS[name]
+    q, k, v, out = _inputs(batch, heads, seqlen, layout)
+    runner = prepare_nvfp4_attention(q, k, v, out, backend="cake")
+    runner()  # warm the JIT libraries and the cached device facts
     torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
-    before = torch.cuda.memory_allocated()
-    with profile(activities=[ProfilerActivity.CUDA]) as trace:
+    host_ms = []
+    for _ in range(prepare_repeats):
         start = time.perf_counter()
-        runner = prepare_nvfp4_attention(q, k, v, out, backend="cake")
+        runner = prepare_nvfp4_attention(
+            q, k, v, out, backend="cake", workspace=runner.workspace
+        )
         torch.cuda.synchronize()
-        host_ms = (time.perf_counter() - start) * 1e3
-    events = trace.events()
-    kernels = sum(
-        1 for e in events if e.device_type.name == "CUDA" and "Memcpy" not in e.name
-    )
-    h2d_copies = sum(
-        1 for e in events if e.device_type.name == "CUDA" and "Memcpy HtoD" in e.name
-    )
-    peak_bytes = torch.cuda.max_memory_allocated() - before
-    return runner, dict(
-        prepare_host_ms=host_ms,
-        prepare_kernels=kernels,
-        prepare_h2d_copies=h2d_copies,
-        prepare_peak_bytes=peak_bytes,
-    )
-
-
-def _summarize_prepare(samples):
-    """Fold the per-repeat preparation samples into one record.
-
-    Launch and copy counts are one value when every repeat agrees and the
-    sorted distinct values otherwise. The peak allocation is the maximum over
-    the repeats, so it is always a number the table can print in MiB.
-    """
-    record = {
-        "prepare_host_ms_median": statistics.median(
-            s["prepare_host_ms"] for s in samples
-        ),
-        "prepare_peak_bytes": max(s["prepare_peak_bytes"] for s in samples),
-    }
-    for key in ("prepare_kernels", "prepare_h2d_copies"):
-        values = {s[key] for s in samples}
-        record[key] = values.pop() if len(values) == 1 else sorted(values)
-    return record
-
-
-def bench_row(name, repeats):
-    batch, heads, seqlen = ROWS[name]
-    torch.manual_seed(42)
-    q = torch.randn((batch, heads, seqlen, 128), dtype=torch.bfloat16, device="cuda")
-    k, v = torch.randn_like(q), torch.randn_like(q)
-    out = torch.empty_like(q)
-    # Warm the JIT library and the cached device facts before measuring.
-    prepare_nvfp4_attention(q, k, v, out, backend="cake")()
-    torch.cuda.synchronize()
-    samples = []
-    runner = None
-    for _ in range(repeats):
-        runner, sample = _prepare_profile(q, k, v, out)
-        samples.append(sample)
+        host_ms.append((time.perf_counter() - start) * 1e3)
     record = {
         "row": name,
         "batch": batch,
         "heads": heads,
         "seqlen": seqlen,
-        **_summarize_prepare(samples),
+        "layout": layout,
+        "arch": runner.route_metadata["arch"],
+        "recipe": runner.route_metadata["recipe"],
+        "qk_format": runner.route_metadata["qk_format"],
+        "workspace_bytes": nvfp4_attention_workspace_bytes(
+            batch, heads, seqlen, q.device
+        ),
+        "prepare_host_ms_median": statistics.median(host_ms),
+        "call_ms_median": _timed(runner.launch),
     }
-    times = bench_gpu_time_with_cupti(runner, cold_l2_cache=True)
-    record["attention_ms_median"] = float(statistics.median(times))
     flops = 4.0 * batch * heads * seqlen * seqlen * 128
-    record["attention_tflops"] = flops / (record["attention_ms_median"] * 1e-3) / 1e12
+    record["call_tflops"] = flops / (record["call_ms_median"] * 1e-3) / 1e12
+    if baseline == "sdpa":
+        sdpa = torch.nn.functional.scaled_dot_product_attention
+        record["sdpa_ms_median"] = _timed(lambda: sdpa(q, k, v))
+        record["speedup_vs_sdpa"] = record["sdpa_ms_median"] / record["call_ms_median"]
     return record
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--rows", nargs="+", default=list(ROWS), choices=list(ROWS))
+    parser.add_argument("--layout", default="HND", choices=("HND", "NHD"))
+    parser.add_argument("--baseline", default="none", choices=("none", "sdpa"))
     parser.add_argument("--prepare-repeats", type=int, default=5)
     parser.add_argument("--json", type=str, default=None)
     args = parser.parse_args()
-    if get_compute_capability(torch.device("cuda", torch.cuda.current_device())) != (
-        10,
-        3,
-    ):
-        raise SystemExit("NVFP4 attention requires an SM103 GPU")
-    records = [bench_row(name, args.prepare_repeats) for name in args.rows]
-    print(
-        f"{'row':<16}{'attention ms':>14}{'TFLOPS':>10}{'prepare ms':>12}"
-        f"{'kernels':>9}{'H2D':>6}{'peak MiB':>10}"
+    capability = get_compute_capability(
+        torch.device("cuda", torch.cuda.current_device())
     )
-    for r in records:
-        print(
-            f"{r['row']:<16}{r['attention_ms_median']:>14.4f}{r['attention_tflops']:>10.1f}"
-            f"{r['prepare_host_ms_median']:>12.2f}{str(r['prepare_kernels']):>9}"
-            f"{str(r['prepare_h2d_copies']):>6}{r['prepare_peak_bytes'] / 2**20:>10.1f}"
+    if tuple(capability) not in SUPPORTED:
+        raise SystemExit(
+            f"NVFP4 attention requires an SM100, SM103 or SM120 GPU, got {capability}"
         )
+    records = [
+        bench_row(name, args.layout, args.baseline, args.prepare_repeats)
+        for name in args.rows
+    ]
+    header = f"{'row':<5}{'B':>3}{'S':>7}{'H':>4}{'call ms':>10}{'TFLOP/s':>9}{'prep ms':>9}{'ws MiB':>8}"
+    if args.baseline == "sdpa":
+        header += f"{'sdpa ms':>10}{'speedup':>9}"
+    print(
+        f"{torch.cuda.get_device_name()}  {records[0]['arch']}  CUDA {torch.version.cuda}  layout {args.layout}"
+    )
+    print(header)
+    for r in records:
+        line = (
+            f"{r['row']:<5}{r['batch']:>3}{r['seqlen']:>7}{r['heads']:>4}{r['call_ms_median']:>10.3f}"
+            f"{r['call_tflops']:>9.1f}{r['prepare_host_ms_median']:>9.2f}{r['workspace_bytes'] / 2**20:>8.1f}"
+        )
+        if args.baseline == "sdpa":
+            line += f"{r['sdpa_ms_median']:>10.3f}{r['speedup_vs_sdpa']:>9.2f}"
+        print(line)
     if args.json:
-        with open(args.json, "w") as f:
+        with open(args.json, "w") as handle:
             json.dump(
-                {"device": torch.cuda.get_device_name(), "rows": records}, f, indent=2
+                {
+                    "device": torch.cuda.get_device_name(),
+                    "cuda": torch.version.cuda,
+                    "rows": records,
+                },
+                handle,
+                indent=1,
             )
 
 

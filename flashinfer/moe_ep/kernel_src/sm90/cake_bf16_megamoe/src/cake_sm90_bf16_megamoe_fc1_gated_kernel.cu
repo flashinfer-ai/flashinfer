@@ -224,6 +224,9 @@ kernel_cake_sm90_bf16_megamoe_fc1_gated(unsigned int num_experts, unsigned int s
     unsigned int num_k_stages = shape_k / 64;
     unsigned int n_out = shape_n / 2;
     asm volatile("griddepcontrol.wait;" ::: "memory");
+    // PDL: the next grid of the round may be scheduled now; it still waits
+    // (griddepcontrol.wait) for this grid to complete before reading its output.
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     if (static_cast<uint32_t>(warp) >= 8u) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
         if (warp == 8) {
