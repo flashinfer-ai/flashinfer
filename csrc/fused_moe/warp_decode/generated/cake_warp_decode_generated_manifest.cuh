@@ -358,6 +358,9 @@ inline int32_t Fc1LaunchGridN(const warp_decode::Shape& shape,
     if (shape.hidden_size == 4096 && shape.intermediate_size == 512 && shape.num_experts == 512 &&
         shape.local_num_experts == 512 && shape.top_k == 10 && shape.num_tokens == 2)
       pool = std::min<int32_t>(96, pool);  // h4096_e512_i512_k10 T2
+    if (shape.hidden_size == 3072 && shape.intermediate_size == 384 && shape.num_experts == 256 &&
+        shape.local_num_experts == 256 && shape.top_k == 8 && shape.num_tokens == 7)
+      pool = std::min<int32_t>(112, pool);  // h3072_e256_i384_k8 T7
   }
   return std::min(ws.route_tiles, std::max(1, pool / grid_m));
 }
@@ -384,10 +387,16 @@ inline int32_t Fc2LaunchGridN(const warp_decode::Shape& shape,
     return ws.route_extent;
   return std::min(ws.route_tiles, std::max(1, ws.workfeed_ctas / Fc2GridM(shape)));
 }
+// The fused route-pack K256 FC2 of h3072_e256_i384_k8 T7 runs the linear-grid program on all 152 SMs: its
+// 24 x 6 pool leaves the last FC2 items to too few CTAs.
+inline bool LinearK256Fc2AllSms(const warp_decode::Shape& shape) {
+  return shape.hidden_size == 3072 && shape.intermediate_size == 384 && shape.num_experts == 256 &&
+         shape.local_num_experts == 256 && shape.top_k == 8 && shape.num_tokens == 7;
+}
 // The linear-grid K256 FC2 launches one 1-D grid of CTAs, each starting at the work item of its block index:
 // every item of the route tiles up to the device workfeed's pool, which need not be a multiple of grid_m.
 inline int32_t Fc2LinearCtas(const warp_decode::Shape& shape, const WorkspaceView& ws) {
-  return std::max(1, std::min(Fc2GridM(shape) * ws.route_tiles, ws.workfeed_ctas));
+  return std::max(1, std::min(Fc2GridM(shape) * ws.route_tiles, LinearK256Fc2AllSms(shape) ? 152 : ws.workfeed_ctas));
 }
 // The fused route-pack K256 FC2 rows of the contract's LinearK256Fc2: the program choice and the workfeed
 // counter PrepareWorkspace arms both read it.
@@ -395,7 +404,7 @@ inline bool LinearK256Fc2(const warp_decode::Shape& shape, const warp_decode::Sc
   return schedule.route_layout == warp_decode::RouteLayout::kGpuPacked &&
          schedule.route_packer == warp_decode::RoutePacker::kFusedFc1 &&
          schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK256 &&
-         warp_decode::LinearK256Fc2(warp_decode::kTarget, shape);
+         (warp_decode::LinearK256Fc2(warp_decode::kTarget, shape) || LinearK256Fc2AllSms(shape));
 }
 inline int32_t* TileExpert(const warp_decode::Invocation& inv,
                            const warp_decode::Schedule& schedule,
