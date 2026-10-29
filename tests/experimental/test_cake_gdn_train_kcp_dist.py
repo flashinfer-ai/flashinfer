@@ -2042,3 +2042,199 @@ def test_conv_halo_row(slurm) -> None:
     if not conv.is_cake_causal_conv1d_train_supported(slurm.device):
         pytest.skip("the conv package does not support this device")
     _slurm_row(C7_ROW, slurm, "conv", _run_rank_conv)
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# Whole-layer checkpoint rows (issue #7818): KCP convolution -> packed q | k | v views -> caller L2 norm of q, k ->
+# chunk_gdn_kcp, one checkpointed region per layer with one KcpRecomputeHandle.  Gated: out / dx / dweight / dg /
+# dbeta bitwise across the direct pass, the plain checkpoint and the handle checkpoint; the GDN part of the
+# recompute exchanges nothing (with a convolution that takes the handle the whole recompute exchanges nothing;
+# before that, exactly the convolution's own forward collectives remain, the whole-layer zero is reported as
+# pending); the original forward and the backward exchange as in the plain checkpoint.  Runs under Slurm.
+
+LAYER_ROWS = [
+    Row("L4", (303, 200), (2, 6), 4, "explicit:c7", stage="layer"),
+    Row(
+        "L8", (10240, 8192, 2085, 333), (16, 48), 8, "zigzag_per_document", stage="layer"
+    ),
+    Row(
+        "L8r",
+        (10240, 8192, 2085, 333),
+        (16, 48),
+        8,
+        "ragged:5000,0,1,3000,2849,4000,3000,3000",
+        stage="layer",
+    ),
+]
+
+
+def _l2_normalize(x: torch.Tensor) -> torch.Tensor:
+    """The caller's per-head L2 norm of ``[T, H, 128]`` BF16 (FP32 math, one rounding): deterministic, so the
+    checkpoint recompute reproduces it bit for bit."""
+    xf = x.float()
+    return (xf / torch.sqrt((xf * xf).sum(-1, keepdim=True) + 1e-6)).to(torch.bfloat16)
+
+
+def _run_rank_layer(
+    rank: int,
+    W: int,
+    row: Row,
+    group,
+    device: torch.device,
+    result_dir: str | None,
+    backend: str,
+) -> dict:
+    import inspect
+
+    from flashinfer import cake_causal_conv1d_train as conv
+
+    H_qk, HV = row.heads
+    C = (2 * H_qk + HV) * 128
+    part, cu = _partition(row)
+    ctx = plan.build_kcp_context(part, group, rank, device)
+    total = cu[-1]
+    gen = torch.Generator(device="cpu").manual_seed(78180)
+    x_all = (torch.randn(total, C, generator=gen) * 0.5).to(torch.bfloat16)
+    w_all = (torch.randn(C, CONV_WIDTH, generator=gen) * 0.5).float()
+    pieces = [
+        torch.arange(cu[f.doc] + f.off, cu[f.doc] + f.off + f.length)
+        for f in part.fragments[rank]
+        if f.length
+    ]
+    l2g = torch.cat(pieces) if pieces else torch.zeros(0, dtype=torch.int64)
+    x_local = x_all[l2g].to(device)
+    ops = _local_inputs(row, part, cu, rank, device)
+    g, beta, dout = ops["g"], ops["beta"], ops["dout"]
+    conv_takes_handle = "recompute_handle" in inspect.signature(
+        conv.cake_causal_conv1d_kcp
+    ).parameters
+
+    def layer(x, w, g_, b_, h):
+        ckw = {"recompute_handle": h} if (h is not None and conv_takes_handle) else {}
+        y = conv.cake_causal_conv1d_kcp(x, w, ctx, **ckw)
+        qkv = y.view(y.shape[0], 2 * H_qk + HV, 128)
+        q = _l2_normalize(qkv[:, :H_qk])
+        k = _l2_normalize(qkv[:, H_qk : 2 * H_qk])
+        v = qkv[:, 2 * H_qk :]
+        return kcp.chunk_gdn_kcp(
+            q,
+            k,
+            v,
+            g_,
+            b_,
+            ctx,
+            recompute_handle=h,
+            save_transfer=False,
+            backend=backend,
+        )
+
+    def run(mode: str):
+        leaves = [
+            x_local.detach().clone().requires_grad_(True),
+            w_all.to(device).requires_grad_(True),
+            g.detach().clone().requires_grad_(True),
+            beta.detach().clone().requires_grad_(True),
+        ]
+        hd = kcp.KcpRecomputeHandle() if mode == "handle" else None
+        from torch.utils.checkpoint import checkpoint
+
+        with CollectiveCounter() as cc:
+            if mode == "direct":
+                out = layer(*leaves, None)
+            else:
+                rphase = RecomputePhase(cc)
+                out = checkpoint(
+                    layer,
+                    *leaves,
+                    hd,
+                    use_reentrant=False,
+                    context_fn=lambda: (contextlib.nullcontext(), rphase),
+                )
+            cc.phase = "bwd"
+            out.backward(dout)
+        names = ("out", "dx", "dw", "dg", "dbeta")
+        tensors = [out.detach()] + [lf.grad for lf in leaves]
+        return dict(zip(names, tensors, strict=True)), {
+            **cc.record(),
+            "handle_bytes": hd.nbytes() if hd is not None else 0,
+            "handle_keys": sorted(hd.entries) if hd is not None else [],
+        }
+
+    # the convolution's own forward collectives (its halo exchange), for the pending whole-layer count
+    with CollectiveCounter() as cc_conv:
+        conv.cake_causal_conv1d_kcp(x_local, w_all.to(device), ctx)
+    conv_fwd = cc_conv.record()
+    t0 = time.time()
+    res_d, rec_d = run("direct")
+    res_p, rec_p = run("plain")
+    res_h, rec_h = run("handle")
+    eq = lambda a, b: all(torch.equal(a[n], b[n]) for n in a)  # noqa: E731
+    flags: dict[str, bool] = {
+        "layer_handle_eq_ckpt": eq(res_p, res_h),
+        "layer_handle_eq_direct": eq(res_d, res_h),
+        "layer_orig_bwd_comm_unchanged": all(
+            rec_h[t].get(ph, 0) == rec_p[t].get(ph, 0)
+            for t in ("calls", "waits")
+            for ph in ("orig", "bwd")
+        ),
+    }
+    rc_calls = rec_h["calls"].get("recompute", 0)
+    rc_waits = rec_h["waits"].get("recompute", 0)
+    if conv_takes_handle:
+        flags["layer_recompute_no_comm"] = rc_calls == 0 and rc_waits == 0
+    else:
+        # only the convolution's own halo exchange is left in the recompute: the GDN part exchanges nothing
+        flags["layer_gdn_recompute_no_comm"] = rc_calls == conv_fwd["calls"].get(
+            "orig", 0
+        ) and rc_waits == conv_fwd["waits"].get("orig", 0)
+    report = {
+        "row": dataclasses.asdict(row),
+        "rank": rank,
+        "world": W,
+        "backend": backend,
+        "mode": "layer",
+        "host": socket.gethostname(),
+        "device": str(device),
+        "device_name": torch.cuda.get_device_name(device),
+        "torch": torch.__version__,
+        "utc": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "pass": all(flags.values()),
+        "flags": flags,
+        "gated": sorted(flags),
+        "reported": [] if conv_takes_handle else ["layer_recompute_no_comm (pending: conv recompute_handle)"],
+        "info_by_rank": [
+            {
+                "rank": rank,
+                "T_r": int(x_local.shape[0]),
+                "conv_takes_handle": conv_takes_handle,
+                "conv_fwd_collectives": conv_fwd,
+                "direct": rec_d,
+                "plain": rec_p,
+                "handle": rec_h,
+                "plain_recompute_calls": rec_p["calls"].get("recompute", 0),
+                "handle_recompute_calls": rc_calls,
+                "handle_recompute_waits": rc_waits,
+            }
+        ],
+        "seconds": round(time.time() - t0, 2),
+        "C": C,
+    }
+    if result_dir:
+        os.makedirs(result_dir, exist_ok=True)
+        with open(
+            os.path.join(result_dir, f"{row.name}-layer-rank{rank}.json"), "w"
+        ) as fh:
+            json.dump(report, fh, indent=1, default=str)
+    return report
+
+
+@pytest.mark.parametrize("row", LAYER_ROWS, ids=_row_id)
+def test_layer_checkpoint_rows(row: Row, slurm) -> None:
+    """#7818 whole-layer rows: KCP convolution + L2 norm + chunk_gdn_kcp in one checkpointed region with one
+    recompute handle (see the block comment above).  Runs under Slurm with >= the row's ranks."""
+    if slurm is None:
+        pytest.skip("the layer rows run under Slurm")
+    conv = pytest.importorskip("flashinfer.cake_causal_conv1d_train")
+    if not conv.is_cake_causal_conv1d_train_supported(slurm.device):
+        pytest.skip("the conv package does not support this device")
+    _slurm_row(row, slurm, _backend_name(), _run_rank_layer)
