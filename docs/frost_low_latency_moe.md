@@ -1400,6 +1400,14 @@ column pairs pending wider-load performance qualification. Default backend
 and default tactic selection are unchanged: use autotuning to select a
 measured candidate, and prepare other backend views for fallback.
 
+MXFP4 weight-only FFMA expands E8M0-scaled weights in FP32. For the two
+largest scale bytes (253 and 254), it first multiplies the BF16/FP16 activation
+by the unscaled E2M1 value, then applies the scale in the FP32 FMA. This avoids
+an infinite expanded weight when the dot product is finite, including zero
+activations and cancelling signed weights. Ordinary scales retain the existing
+operation order. FP32 accumulation and typed preactivation/intermediate/output
+rounding boundaries still apply; this does not provide FP64 accumulation.
+
 ### Hopper software conversion and route reuse
 
 A packed byte-permutation lookup decodes four E2M1 values at once. The
