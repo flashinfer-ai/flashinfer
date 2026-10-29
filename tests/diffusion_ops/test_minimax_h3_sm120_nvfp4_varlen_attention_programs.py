@@ -51,6 +51,8 @@ from flashinfer.jit.cake_minimax_h3_sm120_nvfp4_varlen_attention import (
     ATTENTION_WS_NODELTA,
     ATTENTION_WS_NODELTA_LEAD,
     ATTENTION_WS_NODELTA_TAIL,
+    ATTENTION_WS_NODELTA_WSIL_LEAD,
+    ATTENTION_WS_NODELTA_WSIL_TAIL,
     PREPROCESS,
     PREPROCESS_HEAD_MAJOR,
     PREPROCESS_HEAD_MAJOR_KA,
@@ -80,6 +82,8 @@ NAMED = {
     "PREPROCESS_HEAD_MAJOR_KA": PREPROCESS_HEAD_MAJOR_KA,
     "ATTENTION_SFSEL_LEAD": ATTENTION_SFSEL_LEAD,
     "ATTENTION_SFSEL_TAIL": ATTENTION_SFSEL_TAIL,
+    "ATTENTION_WS_NODELTA_WSIL_LEAD": ATTENTION_WS_NODELTA_WSIL_LEAD,
+    "ATTENTION_WS_NODELTA_WSIL_TAIL": ATTENTION_WS_NODELTA_WSIL_TAIL,
 }
 # The overlapped form's producers: its first launch, a plain launch (no programmatic dependent launch).
 PLAIN = ("PREPROCESS_HEAD_MAJOR", "PREPROCESS_HEAD_MAJOR_KA")
@@ -102,12 +106,16 @@ DYNAMIC_SMEM = {
     "PREPROCESS_HEAD_MAJOR_KA": 49536,
     "ATTENTION_SFSEL_LEAD": 66560,
     "ATTENTION_SFSEL_TAIL": 66560,
+    "ATTENTION_WS_NODELTA_WSIL_LEAD": 80896,
+    "ATTENTION_WS_NODELTA_WSIL_TAIL": 80896,
 }
 THREADS = {identifier: 256 for identifier in NAMED} | {
     "ATTENTION_WS": 384,
     "ATTENTION_WS_NODELTA": 384,
     "ATTENTION_WS_NODELTA_LEAD": 384,
     "ATTENTION_WS_NODELTA_TAIL": 384,
+    "ATTENTION_WS_NODELTA_WSIL_LEAD": 384,
+    "ATTENTION_WS_NODELTA_WSIL_TAIL": 384,
     # three 256-thread producer workers per CTA
     "PREPROCESS_HEAD_MAJOR": 768,
     "PREPROCESS_HEAD_MAJOR_KA": 768,
@@ -222,13 +230,15 @@ HOST_ARGS = {
     "PREPROCESS_HEAD_MAJOR_KA": PREPROCESS_HEAD_MAJOR_ARGS,
     "ATTENTION_SFSEL_LEAD": ATTENTION_OVERLAP_ARGS,
     "ATTENTION_SFSEL_TAIL": ATTENTION_OVERLAP_ARGS,
+    "ATTENTION_WS_NODELTA_WSIL_LEAD": ATTENTION_OVERLAP_ARGS,
+    "ATTENTION_WS_NODELTA_WSIL_TAIL": ATTENTION_OVERLAP_ARGS,
 }
 
 
-def test_the_loader_publishes_the_eighteen_programs() -> None:
+def test_the_loader_publishes_the_twenty_programs() -> None:
     assert tuple(NAMED.values()) == PROGRAMS
     assert ops._NVFP4_PROGRAMS == PROGRAMS
-    assert len({program.name for program in PROGRAMS}) == 18
+    assert len({program.name for program in PROGRAMS}) == 20
     for identifier, program in NAMED.items():
         assert program.name.startswith("cake_minimax_h3_sm120_nvfp4_varlen_attention_")
         assert program.operator_dir == "cake_minimax_h3_sm120_nvfp4_varlen_attention"
@@ -259,10 +269,13 @@ def test_the_loader_publishes_the_eighteen_programs() -> None:
         == PREPROCESS_HEAD_MAJOR_KA.launch_record()
     )
     assert PREPROCESS_HEAD_MAJOR.name != PREPROCESS_HEAD_MAJOR_KA.name
-    # the compensated overlap's two lead / tail builds share their launch, not their units
+    # the compensated overlap's two lead / tail builds, and the uncompensated warp-specialised ones, share their
+    # launch, not their units
     for ship, sfsel in (
         (ATTENTION_LEAD, ATTENTION_SFSEL_LEAD),
         (ATTENTION_TAIL, ATTENTION_SFSEL_TAIL),
+        (ATTENTION_WS_NODELTA_LEAD, ATTENTION_WS_NODELTA_WSIL_LEAD),
+        (ATTENTION_WS_NODELTA_TAIL, ATTENTION_WS_NODELTA_WSIL_TAIL),
     ):
         assert ship.launch_record() == sfsel.launch_record()
         assert ship.name != sfsel.name
@@ -280,6 +293,8 @@ def test_the_loader_publishes_the_eighteen_programs() -> None:
         ATTENTION_WS_NODELTA_TAIL,
         ATTENTION_SFSEL_LEAD,
         ATTENTION_SFSEL_TAIL,
+        ATTENTION_WS_NODELTA_WSIL_LEAD,
+        ATTENTION_WS_NODELTA_WSIL_TAIL,
     )
     assert len({program.args for program in overlap}) == 1
 
@@ -379,6 +394,14 @@ OVERLAP_WS_NODELTA = (
     ATTENTION_WS_NODELTA_LEAD,
     ATTENTION_WS_NODELTA_TAIL,
 )
+# The same form for a plan of long segments (attention-weighted mean segment of at least 2560 tokens): the
+# lead and tail with the WS-IL softmax order.
+OVERLAP_WS_NODELTA_WSIL = (
+    PREPROCESS_HEAD_MAJOR_KA,
+    ATTENTION_WS_NODELTA_WSIL_LEAD,
+    ATTENTION_WS_NODELTA_WSIL_TAIL,
+)
+WS_FORMS = (OVERLAP_WS_NODELTA, OVERLAP_WS_NODELTA_WSIL)
 PRODUCERS = (PREPROCESS_HEAD_MAJOR, PREPROCESS_HEAD_MAJOR_KA)
 
 
@@ -391,8 +414,17 @@ def _overlap(num_sms: int, fused: bool) -> tuple:
     return OVERLAP_SFSEL if num_sms == 170 and not fused else OVERLAP
 
 
-def _overlap_nodelta(num_sms: int) -> tuple:
-    return OVERLAP_WS_NODELTA if num_sms == 188 else OVERLAP_NODELTA
+def _long_segments(plan) -> bool:
+    """Whether ``plan``'s attention-weighted mean segment ``sum(len ** 2) / tokens`` is at least 2560 tokens."""
+    bounds = [int(b) for b in plan.bounds]
+    squares = sum((b - a) ** 2 for a, b in zip(bounds[:-1], bounds[1:]))
+    return squares >= 2560 * bounds[-1]
+
+
+def _overlap_nodelta(num_sms: int, plan) -> tuple:
+    if num_sms != 188:
+        return OVERLAP_NODELTA
+    return OVERLAP_WS_NODELTA_WSIL if _long_segments(plan) else OVERLAP_WS_NODELTA
 
 
 @pytest.mark.parametrize(
@@ -460,7 +492,7 @@ def test_fused_plans_take_the_overlapped_form_on_the_overlap_sm_counts(
     assert _fused(plan)
     programs = ops.minimax_h3_sm120_nvfp4_programs(plan, num_sms)
     assert programs == _overlap(num_sms, fused=True)
-    nodelta = _overlap_nodelta(num_sms)
+    nodelta = _overlap_nodelta(num_sms, plan)
     assert ops.minimax_h3_sm120_nvfp4_programs(plan, num_sms, delta=False) == nodelta
     # a plan below the fused pre-processing keeps the separate launches
     small = _plan((0, 1920))
@@ -511,7 +543,7 @@ def test_long_plans_take_the_overlapped_form_below_the_segment_bound(
         assert programs == (STATS, QUANTIZE_KV_HBLK64, ATTENTION)
     programs = ops.minimax_h3_sm120_nvfp4_programs(plan, num_sms, delta=False)
     if nodelta_overlaps:
-        assert programs == _overlap_nodelta(num_sms)
+        assert programs == _overlap_nodelta(num_sms, plan)
     else:
         assert programs == (STATS, QUANTIZE_KV_HBLK64, ATTENTION_WS_NODELTA)
     # an SM count without an overlap width keeps the separate launches
@@ -523,16 +555,22 @@ def test_long_plans_take_the_overlapped_form_below_the_segment_bound(
 @pytest.mark.parametrize(
     ("bounds", "nodelta_188"),
     [
-        # fused pre-processing plans
+        # fused pre-processing plans: short segments, then an attention-weighted mean segment of at least
+        # 2560 tokens (the WS-IL lead and tail)
         ((0, 2048), OVERLAP_WS_NODELTA),
-        ((0, 257, 4567, 4824), OVERLAP_WS_NODELTA),
-        ((0, 4096), OVERLAP_WS_NODELTA),
-        ((0, 16384), OVERLAP_WS_NODELTA),
+        ((0, 1100, 2100), OVERLAP_WS_NODELTA),
+        ((0, 2559), OVERLAP_WS_NODELTA),
+        ((0, 2560), OVERLAP_WS_NODELTA_WSIL),
+        ((0, 257, 4567, 4824), OVERLAP_WS_NODELTA_WSIL),
+        ((0, 4096), OVERLAP_WS_NODELTA_WSIL),
+        ((0, 16384), OVERLAP_WS_NODELTA_WSIL),
         # long plans up to an attention-weighted mean segment of 40960 tokens
-        ((0, 8368, 16736, 25104, 33472), OVERLAP_WS_NODELTA),
-        ((0, 33472), OVERLAP_WS_NODELTA),
-        ((0, 38592), OVERLAP_WS_NODELTA),
-        ((0, 40960), OVERLAP_WS_NODELTA),
+        ((0,) + tuple(2048 * i for i in range(1, 41)), OVERLAP_WS_NODELTA),
+        ((0,) + tuple(2560 * i for i in range(1, 8)), OVERLAP_WS_NODELTA_WSIL),
+        ((0, 8368, 16736, 25104, 33472), OVERLAP_WS_NODELTA_WSIL),
+        ((0, 33472), OVERLAP_WS_NODELTA_WSIL),
+        ((0, 38592), OVERLAP_WS_NODELTA_WSIL),
+        ((0, 40960), OVERLAP_WS_NODELTA_WSIL),
         # above it the separate launches with the warp-specialised attention
         ((0, 40961), (STATS, QUANTIZE_KV_HBLK64, ATTENTION_WS_NODELTA)),
         ((0, 58944), (STATS, QUANTIZE_KV_HBLK64, ATTENTION_WS_NODELTA)),
@@ -549,15 +587,20 @@ def test_uncompensated_overlap_is_warp_specialised_on_188_sms(
     plan = _plan(bounds)
     assert ops.minimax_h3_sm120_nvfp4_programs(plan, 188, delta=False) == nodelta_188
     on_170 = ops.minimax_h3_sm120_nvfp4_programs(plan, 170, delta=False)
-    if nodelta_188 == OVERLAP_WS_NODELTA:
+    if nodelta_188 in WS_FORMS:
         assert on_170 == OVERLAP_NODELTA
         assert ops.minimax_h3_sm120_nvfp4_programs(plan, 188) == OVERLAP
         on_170_delta = ops.minimax_h3_sm120_nvfp4_programs(plan, 170)
         assert on_170_delta == _overlap(170, _fused(plan))
-    assert ATTENTION_WS_NODELTA_LEAD not in on_170
-    assert ATTENTION_WS_NODELTA_TAIL not in on_170
+    ws = (
+        ATTENTION_WS_NODELTA_LEAD,
+        ATTENTION_WS_NODELTA_TAIL,
+        ATTENTION_WS_NODELTA_WSIL_LEAD,
+        ATTENTION_WS_NODELTA_WSIL_TAIL,
+    )
+    assert not any(program in on_170 for program in ws)
     for num_sms in (170, 188):
-        for program in (ATTENTION_WS_NODELTA_LEAD, ATTENTION_WS_NODELTA_TAIL):
+        for program in ws:
             assert program not in ops.minimax_h3_sm120_nvfp4_programs(plan, num_sms)
 
 
@@ -582,13 +625,13 @@ def test_k_sum_wait_producers_only_behind_the_warp_specialised_uncompensated_lea
     bounds, num_sms
 ) -> None:
     """``PREPROCESS_HEAD_MAJOR_KA`` is a property of the plan's form: the producers of exactly the
-    uncompensated overlapped form whose lead is ``ATTENTION_WS_NODELTA_LEAD`` (188 SMs); every other
+    uncompensated overlapped form whose lead is warp-specialised (188 SMs); every other
     overlapped form keeps ``PREPROCESS_HEAD_MAJOR`` and no separate-launch plan takes either."""
     plan = _plan(bounds)
     for delta in (True, False):
         programs = ops.minimax_h3_sm120_nvfp4_programs(plan, num_sms, delta=delta)
         ws_form = programs[0] in PRODUCERS and not delta and num_sms == 188
-        assert (programs == OVERLAP_WS_NODELTA) == ws_form
+        assert (programs in WS_FORMS) == ws_form
         assert (programs[0] is PREPROCESS_HEAD_MAJOR_KA) == ws_form
 
 
@@ -625,7 +668,8 @@ def test_sfsel_lead_and_tail_only_in_the_long_compensated_overlap_on_170_sms(
         assert (programs == OVERLAP) == (overlapped and delta and not sfsel_form)
         sfsel = (ATTENTION_SFSEL_LEAD, ATTENTION_SFSEL_TAIL)
         assert any(p in programs for p in sfsel) == (programs == OVERLAP_SFSEL)
-        assert (ATTENTION_WS_NODELTA_LEAD in programs) == ws_form
+        ws_leads = (ATTENTION_WS_NODELTA_LEAD, ATTENTION_WS_NODELTA_WSIL_LEAD)
+        assert any(p in programs for p in ws_leads) == ws_form
         assert PREPROCESS_HEAD_MAJOR_KA not in programs[1:]
 
 
@@ -867,7 +911,8 @@ IMPL_TENSORS = (
 
 
 @pytest.mark.parametrize(
-    "overlap", [OVERLAP, OVERLAP_SFSEL, OVERLAP_NODELTA, OVERLAP_WS_NODELTA]
+    "overlap",
+    [OVERLAP, OVERLAP_SFSEL, OVERLAP_NODELTA, OVERLAP_WS_NODELTA, OVERLAP_WS_NODELTA_WSIL],
 )
 def test_overlapped_form_launches_the_producers_first(overlap, monkeypatch) -> None:
     """The overlapped form launches the producers, then the lead attention, then the tail attention, with
