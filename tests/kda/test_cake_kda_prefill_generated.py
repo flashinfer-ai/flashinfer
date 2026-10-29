@@ -19,7 +19,10 @@ window maps, which the chain composite launches instead of the map pass, and
 two value halves as a 2-CTA cluster, which long launches take instead, and
 ``_RENDERED_WORK_BIN_TURN_ROUTES`` the work-binned programs that also turn a
 bin's state over in the background, which work-binned launches of short tasks
-take instead of the work-binned program.
+take instead of the work-binned program, and
+``_RENDERED_M64_OWNER_HELPER_ROUTES`` the M64 value-split programs whose helper
+CTAs prepare a task's chunks for its two value-half owners, which long
+cooperative launches take instead of the pair-share or routed program.
 
 The CPU checks hold both tables to the units, to the shipped argument plans and
 to the factory lookup. The GPU checks run the prepared BF16 prefill on the
@@ -189,6 +192,17 @@ def test_routes_point_shipped_modules_at_generated_programs():
             assert program in registry._RENDERED_MODULES, (arch, program)
             assert arch in registry._RENDERED_MODULES[program]["arches"]
             routed.add(program)
+    assert set(registry._RENDERED_M64_OWNER_HELPER_ROUTES) == set(registry.ARCHES)
+    for arch, modules in registry._RENDERED_M64_OWNER_HELPER_ROUTES.items():
+        for module, program in modules.items():
+            # Every other launch of the module keeps its pair-share or routed
+            # program.
+            assert module in registry._RENDERED_PAIR_SHARE_ROUTES[arch], (arch, module)
+            assert program != registry._RENDERED_PAIR_SHARE_ROUTES[arch][module]
+            assert program != registry._RENDERED_ROUTES[arch][module]
+            assert program in registry._RENDERED_MODULES, (arch, program)
+            assert arch in registry._RENDERED_MODULES[program]["arches"]
+            routed.add(program)
     assert routed == set(GENERATED)
 
 
@@ -234,6 +248,7 @@ def test_generated_plans_bind_from_the_shipped_plans():
             *registry._RENDERED_MAP_FOLD_ROUTES[arch].items(),
             *registry._RENDERED_PAIR_SHARE_ROUTES[arch].items(),
             *registry._RENDERED_WORK_BIN_TURN_ROUTES[arch].items(),
+            *registry._RENDERED_M64_OWNER_HELPER_ROUTES[arch].items(),
         ]
         for module, program in routes:
             shipped = {
@@ -1023,6 +1038,7 @@ def unrouted(monkeypatch):
             "_RENDERED_MAP_FOLD_ROUTES",
             "_RENDERED_PAIR_SHARE_ROUTES",
             "_RENDERED_WORK_BIN_TURN_ROUTES",
+            "_RENDERED_M64_OWNER_HELPER_ROUTES",
         ):
             monkeypatch.setattr(registry, table, {arch: {} for arch in registry.ARCHES})
 
