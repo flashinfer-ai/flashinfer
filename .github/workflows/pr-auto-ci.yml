@@ -119,19 +119,64 @@ jobs:
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
           HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
-          # Check if this SHA already has a passing or active run.
-          # Only count runs triggered by the "labeled" event — synchronize-
-          # triggered pr-test.yml runs skip the gate (authorized=false) and
-          # succeed as no-ops, which would falsely block re-triggering.
-          PASSED=$(gh run list \
-            --repo "${{ github.repository }}" \
-            --workflow "pr-test.yml" \
-            --commit "$HEAD_SHA" \
-            --json databaseId,conclusion,event \
-            --jq '[.[] | select(.conclusion == "success" and .event == "pull_request")] | length' \
-            2>/dev/null) || PASSED=0
+          # Decide whether a REAL pr-test.yml run already exists for this SHA.
+          #
+          # pr-test.yml fires on every pull_request action (opened,
+          # synchronize, labeled, ...). Only a `labeled` + run-ci event passes
+          # its gate; every other run skips all downstream jobs and still
+          # concludes "success". The run list cannot tell these apart — its
+          # `event` field is just "pull_request" for all of them — so we look
+          # at pr-test's Setup job instead: it runs only when the gate
+          # authorized the run, and is skipped (or absent) on a no-op.
+          #
+          # A real run is matched to its Setup check run through the run's
+          # check_suite_id, which keeps a same-named job from another
+          # workflow from counting.
+          #
+          # Remaining window: for ~10-20s after a run-ci label is applied,
+          # the gate is still running and Setup does not exist yet, so that
+          # run looks like a no-op. If we re-apply the label then, pr-test's
+          # cancel-in-progress group cancels the first run and starts one new
+          # run — a restart, never a duplicate or a missed run.
+          #
+          # API failures fail this step instead of guessing; every later step
+          # requires needs_ci == 'true', so nothing is triggered.
+          # Steps run under `bash -e` without pipefail by default; without it a
+          # failed `gh api` piped into `jq -s` would yield [] and look like
+          # "no runs", re-triggering CI on an API outage.
+          set -o pipefail
+          REPO="${{ github.repository }}"
 
-          if [[ "${PASSED:-0}" -gt 0 ]]; then
+          RUNS=$(gh api --paginate -X GET \
+            "/repos/${REPO}/actions/workflows/pr-test.yml/runs" \
+            -f head_sha="$HEAD_SHA" -F per_page=100 \
+            --jq '.workflow_runs[] | {id, check_suite_id, status, conclusion}' \
+            | jq -s '.') || {
+              echo "::error::Could not list pr-test.yml runs for $HEAD_SHA"
+              exit 1
+            }
+
+          SETUP=$(gh api --paginate -X GET \
+            "/repos/${REPO}/commits/${HEAD_SHA}/check-runs" \
+            -f check_name=Setup -f filter=all -F per_page=100 \
+            --jq '.check_runs[] | {suite: .check_suite.id, status, conclusion}' \
+            | jq -s '.') || {
+              echo "::error::Could not list Setup check runs for $HEAD_SHA"
+              exit 1
+            }
+
+          # pr-test runs whose Setup job was not skipped. A queued or running
+          # Setup has a null conclusion, so it counts as real too.
+          REAL=$(jq -n --argjson runs "$RUNS" --argjson setup "$SETUP" '
+            ($setup | map(select(.conclusion != "skipped") | .suite)) as $real
+            | $runs | map(select(.check_suite_id as $s | any($real[]; . == $s)))')
+
+          echo "pr-test.yml runs on $HEAD_SHA: $(jq length <<< "$RUNS") total, $(jq length <<< "$REAL") real"
+
+          PASSED=$(jq '[.[] | select(.status == "completed" and .conclusion == "success")] | length' <<< "$REAL")
+          ACTIVE=$(jq '[.[] | select(.status != "completed")] | length' <<< "$REAL")
+
+          if [[ "$PASSED" -gt 0 ]]; then
             echo "CI already passed for $HEAD_SHA"
             echo "needs_ci=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -170,22 +215,13 @@ jobs:
             done
           fi
 
-          # Also check if a run is already active for THIS SHA — no need to
-          # re-trigger if one is already queued or in-progress.
-          # Same event filter: only count labeled-event runs (real CI).
-          ACTIVE=$(gh run list \
-            --repo "${{ github.repository }}" \
-            --workflow "pr-test.yml" \
-            --commit "$HEAD_SHA" \
-            --json databaseId,status,event \
-            --jq '[.[] | select((.status == "in_progress" or .status == "queued") and .event == "pull_request")] | length' \
-            2>/dev/null) || ACTIVE=0
-
-          if [[ "${ACTIVE:-0}" -gt 0 ]]; then
-            echo "CI already active for $HEAD_SHA ($ACTIVE run(s))"
+          # A real run already queued or in progress for THIS SHA — no need to
+          # re-trigger. (Stale runs cancelled above are on other SHAs.)
+          if [[ "$ACTIVE" -gt 0 ]]; then
+            echo "CI already active for $HEAD_SHA ($ACTIVE real run(s))"
             echo "needs_ci=false" >> "$GITHUB_OUTPUT"
           else
-            echo "No CI run for $HEAD_SHA"
+            echo "No real CI run active or passed for $HEAD_SHA"
             echo "needs_ci=true" >> "$GITHUB_OUTPUT"
           fi
 
