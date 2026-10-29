@@ -75,6 +75,11 @@ BALANCED_MIN_KV = 8192  # auto schedule: balanced partition from this KV length 
 QK_AHEAD_RECORD = "decode_qk_ahead"
 QK_AHEAD_MIN_UNIT_TILES = 512  # pipeline tiles of every unit
 QK_AHEAD_MIN_PIECE_TILES = 257  # pipeline tiles of the longest piece of every unit
+# (unit tiles, piece tiles) in place of the two above, keyed by the clusters the
+# device requests (``num_sms // CLUSTER_PAIR``, not the plan's unit count, which
+# the partition may lower): on a 148-SM part the program pays off from shorter
+# ranges.
+QK_AHEAD_MIN_TILES_BY_CLUSTERS = {74: (330, 165)}
 # The short-row program reads its unit range in the kernel setup and frees its
 # tensor memory once the last epilogue has read it; it pays off when every
 # cluster streams a short range.
@@ -590,7 +595,7 @@ def build_work_plan(
     if (
         plan.schedule == "balanced"
         and (arch, num_sms // CLUSTER_PAIR) in REVERSED_PIECE_TARGETS
-        and select_decode_record(plan, arch) in LONG_DECODE_RECORDS
+        and select_decode_record(plan, arch, num_sms) in LONG_DECODE_RECORDS
     ):
         plan = _reverse_unit_pieces(plan)
     return plan
@@ -602,7 +607,9 @@ def _delivered(name: str, arch: str) -> bool:
     return record is not None and arch in record["arches"]
 
 
-def select_decode_record(plan: WorkPlan, arch: str) -> str:
+def select_decode_record(
+    plan: WorkPlan, arch: str, num_sms: Optional[int] = None
+) -> str:
     """Registry record of the decode program that runs ``plan`` on ``arch``.
 
     A pure host function of the plan, fixed at prepare time, so a captured
@@ -611,7 +618,9 @@ def select_decode_record(plan: WorkPlan, arch: str) -> str:
     ``QK_AHEAD_RECORD`` (the same kernel with the QK MMAs issued two tiles
     ahead of PV, delivered for SM100 only) runs a balanced plan when every
     unit holds at least ``QK_AHEAD_MIN_UNIT_TILES`` pipeline tiles with a
-    piece of at least ``QK_AHEAD_MIN_PIECE_TILES``; ``XV_RECORD`` (the
+    piece of at least ``QK_AHEAD_MIN_PIECE_TILES`` (on a device of ``num_sms``
+    SMs, the pair ``QK_AHEAD_MIN_TILES_BY_CLUSTERS`` names for its
+    ``num_sms // CLUSTER_PAIR`` clusters); ``XV_RECORD`` (the
     decode with its row-pair max exchange gated by a vote, delivered for
     SM103 only) runs a plan of either schedule when every unit holds at least
     ``XV_MIN_STEADY_TILES`` pipeline tiles past ``XV_WARMUP_TILES`` tiles of
@@ -631,14 +640,15 @@ def select_decode_record(plan: WorkPlan, arch: str) -> str:
         [it[4] - it[3] for it in plan.items[first:last:V_HALVES]]
         for first, last in zip(plan.unit_first, plan.unit_first[1:], strict=False)
     ]
+    min_unit, min_piece = QK_AHEAD_MIN_UNIT_TILES, QK_AHEAD_MIN_PIECE_TILES
+    if num_sms is not None:
+        min_unit, min_piece = QK_AHEAD_MIN_TILES_BY_CLUSTERS.get(
+            num_sms // CLUSTER_PAIR, (min_unit, min_piece)
+        )
     if (
         _delivered(QK_AHEAD_RECORD, arch)
         and plan.schedule == "balanced"
-        and all(
-            sum(lens) >= QK_AHEAD_MIN_UNIT_TILES
-            and max(lens) >= QK_AHEAD_MIN_PIECE_TILES
-            for lens in units
-        )
+        and all(sum(lens) >= min_unit and max(lens) >= min_piece for lens in units)
     ):
         return QK_AHEAD_RECORD
     if _delivered(XV_RECORD, arch) and all(
@@ -1193,17 +1203,18 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
             f"every request needs q_len ({q_len}) <= seq_len <= max_pages * {PAGE_SIZE}"
         )
     total_q = batch * q_len
+    num_sms = _device_sm_count(device_index)
     plan = build_work_plan(
         kv_lens,
         num_heads=num_heads,
-        num_sms=_device_sm_count(device_index),
+        num_sms=num_sms,
         q_len=q_len,
         enable_sink=sinks is not None,
         schedule=schedule,
         tiles_per_split=tiles_per_split,
         arch=arch,
     )
-    decode_record = select_decode_record(plan, arch)
+    decode_record = select_decode_record(plan, arch, num_sms)
     reduce_record = select_reduce_record(plan, arch)
     layout = workspace_layout(plan, batch=batch, num_heads=num_heads, q_len=q_len)
     flat = workspace_buffer.view(-1).view(torch.uint8)

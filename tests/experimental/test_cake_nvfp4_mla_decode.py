@@ -833,6 +833,42 @@ def test_select_decode_record_thresholds(qk_ahead_record, unit_tiles, piece_tile
     assert select_decode_record(plan, "sm_100a") == want
 
 
+@pytest.mark.parametrize("num_sms", [None, 148, 152])
+@pytest.mark.parametrize("piece_tiles", [164, 165, 166])
+@pytest.mark.parametrize("unit_tiles", [329, 330, 331])
+def test_select_decode_record_cluster_thresholds(
+    qk_ahead_record, num_sms, unit_tiles, piece_tiles
+):
+    assert cake_backend.QK_AHEAD_MIN_TILES_BY_CLUSTERS == {74: (330, 165)}
+    rest = unit_tiles - piece_tiles
+    plan = _hand_plan([piece_tiles, rest // 2, rest - rest // 2])
+    keyed = num_sms is not None and num_sms // 2 == 74
+    want = (
+        QK_AHEAD_RECORD
+        if keyed and unit_tiles >= 330 and piece_tiles >= 165
+        else "decode"
+    )
+    assert select_decode_record(plan, "sm_100a", num_sms) == want
+
+
+@pytest.mark.parametrize(
+    "kv_len,selected",
+    [(16384, False), (32768, True), (51200, True), (65536, True)],
+)
+def test_select_decode_record_qk_ahead_on_148_sms(qk_ahead_record, kv_len, selected):
+    plan = _bs32_plan(kv_len, 148)
+    want = QK_AHEAD_RECORD if selected else "decode"
+    assert select_decode_record(plan, "sm_100a", 148) == want
+
+
+@pytest.mark.parametrize("kv_len", [16384, 32768, 51200, 52224, 65536])
+def test_select_decode_record_keeps_the_rule_on_152_sms(qk_ahead_record, kv_len):
+    plan = _bs32_plan(kv_len, 152)
+    assert select_decode_record(plan, "sm_100a", 152) == select_decode_record(
+        plan, "sm_100a"
+    )
+
+
 def test_select_decode_record_needs_every_unit(qk_ahead_record):
     long = [258, 127, 128]
     assert select_decode_record(_hand_plan(long, long), "sm_100a") == QK_AHEAD_RECORD
@@ -1761,7 +1797,9 @@ def test_nvfp4_mla_decode(
         return_lse=True,
         tiles_per_split=tiles_per_split,
     )
-    main_record = cake_jit.MODULES[select_decode_record(decode.plan, decode.arch)]
+    main_record = cake_jit.MODULES[
+        select_decode_record(decode.plan, decode.arch, num_sms)
+    ]
     assert decode.main_program == main_record["library"]
     assert decode.main_kwargs["grid"] == decode_grid(decode.plan)
     assert decode.main_kwargs["grid"] == (CLUSTER_PAIR * decode.plan.num_units, 1, 1)
@@ -1781,7 +1819,7 @@ def test_nvfp4_mla_decode(
         enable_sink=enable_sink,
         tiles_per_split=tiles_per_split,
     )
-    record = select_decode_record(forward, decode.arch)
+    record = select_decode_record(forward, decode.arch, num_sms)
     if decode.plan.schedule == "balanced" and record in LONG_DECODE_RECORDS:
         reverse = (decode.arch, num_sms // CLUSTER_PAIR) in REVERSED_PIECE_TARGETS
         first = decode.plan.unit_first
@@ -1947,7 +1985,9 @@ def assert_programs_match_bitwise(
     )
     results = []
     for key in (stage, name):
-        monkeypatch.setattr(cake_backend, selector, lambda plan, arch, key=key: key)
+        monkeypatch.setattr(
+            cake_backend, selector, lambda plan, arch, num_sms=None, key=key: key
+        )
         decode = prepare()
         bound_record = cake_jit.MODULES[key]
         assert getattr(decode, program) == bound_record["library"]
