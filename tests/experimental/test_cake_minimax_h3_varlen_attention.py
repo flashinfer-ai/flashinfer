@@ -1461,7 +1461,9 @@ def test_bf16_prepared_runner_and_graph_replay():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         runner()
-    q.copy_(torch.randn_like(q))
+    # New Q values from a seeded generator, so every run checks the same inputs.
+    new_q, _, _, _ = _make_inputs(cu, heads, seed=2)
+    q.copy_(new_q)
     out.fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
@@ -2018,7 +2020,10 @@ def test_bf16_rejects_bad_inputs():
     with pytest.raises(ValueError, match="bfloat16"):
         minimax_h3_varlen_attention(q.float(), k, v, cu_seqlens)
     # A non-unit last stride (every other element of a [T, H, 256] buffer) is rejected.
-    wide = torch.randn((300, 7, 2 * HEAD_DIM), dtype=torch.bfloat16, device="cuda")
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    wide = torch.randn(
+        (300, 7, 2 * HEAD_DIM), dtype=torch.bfloat16, device="cuda", generator=gen
+    )
     k_strided = wide[:, :, ::2]
     assert tuple(k_strided.shape) == (300, 7, HEAD_DIM) and k_strided.stride(2) == 2
     with pytest.raises(ValueError, match=r"stride|contiguous"):
@@ -2172,11 +2177,13 @@ def test_nvfp4_prepared_runner_stages_and_graph_replay(pv_mode):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         runner()
-    # New Q, K and V values: every quantizer re-reads all three (the early-Q/K
-    # build reads Q and K before its grid-dependency wait).
-    q.copy_(torch.randn_like(q) * 2.0)
-    k.copy_(torch.randn_like(k) * 0.5)
-    v.copy_(torch.randn_like(v) * 3.0)
+    # New Q, K and V values from a seeded generator, so every run checks the
+    # same inputs: every quantizer re-reads all three (the early-Q/K build
+    # reads Q and K before its grid-dependency wait).
+    new_q, new_k, new_v, _ = _make_inputs(cu, heads, seed=5)
+    q.copy_(new_q * 2.0)
+    k.copy_(new_k * 0.5)
+    v.copy_(new_v * 3.0)
     out.fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
