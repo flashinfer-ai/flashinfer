@@ -100,7 +100,10 @@ def dsa_indexer_topk(
     workspace_buffer : Optional[torch.Tensor]
         Scratch of at least :func:`dsa_indexer_topk_workspace_size` bytes for
         the call's geometry (uint8, 8-byte aligned); allocated through the
-        caching allocator when omitted.
+        caching allocator when omitted.  A caller-owned buffer may be shared
+        with other calls and kernels between runs: on the ticket architectures
+        the backend then zeroes the buffer's ticket word before every run,
+        while its own workspace is zeroed once at prepare.
     indices, scores : Optional[torch.Tensor]
         Caller-owned ``[T, top_k]`` int32 / float32 outputs; allocated when
         omitted.
