@@ -76,7 +76,7 @@ struct TrtllmGenGemmRunnerOptions {
 };
 
 int64_t select_kernel_fp8(int32_t M, int32_t N, int32_t K,
-                          const gemm::gemm::GemmInterface& interface) {
+                          const gemm::gemm::GemmInterface& gemm_interface) {
   static constexpr const char* KERNEL_NAME_HIGH_N_K_RATIO_SM100F =
       "gemm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_s6_et64x8_m64x8x32_c1x1x1_rM_TN_"
       "transOut_noShfl_dsFp8_schPd2x2x1x3_sm100f";
@@ -124,8 +124,8 @@ int64_t select_kernel_fp8(int32_t M, int32_t N, int32_t K,
     kernel_name = kDefault;
   }
 
-  auto const& configs = interface.getGemmConfigs();
-  size_t const num_configs = interface.getNumGemmConfigs();
+  auto const& configs = gemm_interface.getGemmConfigs();
+  size_t const num_configs = gemm_interface.getNumGemmConfigs();
 
   for (size_t i = 0; i < num_configs; ++i) {
     if (std::string(configs[i].mFunctionName) == kernel_name) {
