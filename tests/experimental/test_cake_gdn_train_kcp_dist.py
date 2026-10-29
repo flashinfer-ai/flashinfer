@@ -60,6 +60,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from tests.test_helpers.kcp_collective_shims import CollectiveCounter, RecomputePhase
+
 PACKAGE = "flashinfer.experimental.cake_gdn_train"
 
 
@@ -800,86 +802,6 @@ def _kept_record(T_r: int) -> dict:
     }
 
 
-class _CollectiveCounter:
-    """Counts the ``torch.distributed`` collectives issued and the waits on their work handles, by phase: ``"orig"``
-    (the checkpointed forward), ``"recompute"`` (torch's recompute, marked by the checkpoint's ``context_fn``) and
-    ``"bwd"`` (the rest of the backward).  The shims replace the module attributes the package calls
-    (``dist.all_to_all_single`` ...) while the counter is entered; tensor contents are never read."""
-
-    NAMES = (
-        "all_to_all_single",
-        "batch_isend_irecv",
-        "all_gather_object",
-        "all_gather",
-        "all_gather_into_tensor",
-        "all_reduce",
-        "broadcast",
-        "reduce_scatter_tensor",
-        "isend",
-        "irecv",
-        "send",
-        "recv",
-    )
-
-    def __init__(self) -> None:
-        self.phase = "orig"
-        self.calls: dict[str, int] = {}
-        self.waits: dict[str, int] = {}
-        self._saved: dict[str, object] = {}
-
-    def _bump(self, table: dict[str, int]) -> None:
-        table[self.phase] = table.get(self.phase, 0) + 1
-
-    def _work(self, w):
-        counter = self
-
-        class _Work:
-            def __init__(self, inner) -> None:
-                self._inner = inner
-
-            def wait(self, *a, **kw):
-                counter._bump(counter.waits)
-                return self._inner.wait(*a, **kw)
-
-            def __getattr__(self, name):
-                return getattr(self._inner, name)
-
-        return _Work(w) if hasattr(w, "wait") else w
-
-    def __enter__(self) -> "_CollectiveCounter":
-        for name in self.NAMES:
-            fn = getattr(dist, name, None)
-            if fn is None:
-                continue
-            self._saved[name] = fn
-
-            def shim(*a, _fn=fn, **kw):
-                self._bump(self.calls)
-                r = _fn(*a, **kw)
-                if isinstance(r, list):
-                    return [self._work(x) for x in r]
-                return self._work(r)
-
-            setattr(dist, name, shim)
-        return self
-
-    def __exit__(self, *exc) -> None:
-        for name, fn in self._saved.items():
-            setattr(dist, name, fn)
-        self._saved.clear()
-
-    @contextlib.contextmanager
-    def recompute(self):
-        prev, self.phase = self.phase, "recompute"
-        try:
-            yield
-        finally:
-            self.phase = prev
-
-    def record(self) -> dict:
-        return {"calls": dict(self.calls), "waits": dict(self.waits)}
-
-
 def _run_rank(
     rank: int,
     W: int,
@@ -1054,20 +976,6 @@ def _run_rank(
     # exactly S_in (the light saved set without the transfer and the convolution rows).  The row's own plan P is
     # used (a forced segment count is not valid on every rank of every row); info records it.  The plain
     # checkpoint's per-phase counts are recorded as the reproduction of the issue.
-    class _RecomputePhase:
-        """The recompute context of the checkpoint's context_fn: re-entered by every recompute (retain_graph)."""
-
-        def __init__(self, counter: "_CollectiveCounter") -> None:
-            self.counter, self.prev = counter, []
-
-        def __enter__(self):
-            self.prev.append(self.counter.phase)
-            self.counter.phase = "recompute"
-            return self
-
-        def __exit__(self, *exc) -> None:
-            self.counter.phase = self.prev.pop()
-
     def handle_pass(handle: bool, *, twice: bool = False, workspace=ws, **opts):
         leaves = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
         o = {**base, "save_transfer": False, **opts}
@@ -1080,8 +988,8 @@ def _run_rank(
 
         from torch.utils.checkpoint import checkpoint
 
-        with _CollectiveCounter() as cc:
-            rphase = _RecomputePhase(cc)
+        with CollectiveCounter() as cc:
+            rphase = RecomputePhase(cc)
             out = checkpoint(
                 fn,
                 *leaves,
