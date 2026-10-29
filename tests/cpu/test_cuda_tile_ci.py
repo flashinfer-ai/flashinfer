@@ -82,10 +82,19 @@ def test_ci_installer_uses_shared_cuda_tile_compile_requirements_for_cuda13() ->
     # The stages must stay in separate Dockerfile layers, most stable first.
     dockerfile = (REPO_ROOT / "docker" / "Dockerfile.ci").read_text()
     stage_runs = [
-        dockerfile.index(f'"${{CUDNN_VERSION}}" {stage}\n')
-        for stage in ("torch", "deps", "cudnn")
+        dockerfile.index(f'" {stage}\n') for stage in ("torch", "deps", "cudnn")
     ]
     assert stage_runs == sorted(stage_runs)
+    # Inputs that change with the cuDNN pin or requirements must not precede
+    # the torch layer, or a bump would invalidate it.
+    torch_run = stage_runs[0]
+    for late_input in (
+        "ARG CUDNN_VERSION",
+        "COPY requirements.txt",
+        "COPY build_utils.py",
+        "COPY ci/cuda-versions.json",
+    ):
+        assert dockerfile.index(late_input) > torch_run
 
 
 @pytest.mark.cpu_only

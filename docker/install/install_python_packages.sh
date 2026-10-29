@@ -46,31 +46,37 @@ if [[ ! "${PYTORCH_INDEX}" =~ ^(nightly/)?cu[0-9]+$ ]]; then
   echo "ERROR: invalid PyTorch index path: ${PYTORCH_INDEX}" >&2
   exit 1
 fi
-CUDNN_VERSION=${2:?cuDNN package version is required}
-if [[ ! "${CUDNN_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  echo "ERROR: invalid cuDNN package version: ${CUDNN_VERSION}" >&2
-  exit 1
+# The torch stage must not depend on the cuDNN version (or on the files that
+# change with it), or a cuDNN bump would invalidate the torch layer.
+CUDNN_VERSION=${2:-}
+if [[ "${STAGE}" != "torch" ]]; then
+  if [[ ! "${CUDNN_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "ERROR: invalid cuDNN package version: ${CUDNN_VERSION:-<empty>}" >&2
+    exit 1
+  fi
 fi
 
 CUDA_TAG="${PYTORCH_INDEX##*/}"  # nightly/cu134 -> cu134
 CUDA_MAJOR="${CUDA_TAG:2:2}"     # cu129 -> 12, cu134 -> 13
 CUDA_MINOR="${CUDA_TAG:4}"       # cu129 -> 9, cu134 -> 4
 PYTORCH_INDEX_URL="https://download.pytorch.org/whl/${PYTORCH_INDEX}"
-CI_IMAGE_DEPENDENCY_OUTPUT="$(
-  PYTHONPATH=/install python3 -c \
-    'import sys; from build_utils import get_ci_image_dependency_requirements; print(*get_ci_image_dependency_requirements(sys.argv[1]), sep="\n")' \
-    "${CUDA_MAJOR}"
-)"
 CI_IMAGE_DEPENDENCIES=()
-if [[ -n "${CI_IMAGE_DEPENDENCY_OUTPUT}" ]]; then
-  mapfile -t CI_IMAGE_DEPENDENCIES <<< "${CI_IMAGE_DEPENDENCY_OUTPUT}"
-fi
 CUDA_TILE_COMPILE_DEPENDENCIES=()
-if [[ "${CUDA_MAJOR}" == "13" ]] && (( 10#${CUDA_MINOR} < 4 )); then
-  mapfile -t CUDA_TILE_COMPILE_DEPENDENCIES < <(
+if want_stage deps; then
+  CI_IMAGE_DEPENDENCY_OUTPUT="$(
     PYTHONPATH=/install python3 -c \
-      'from build_utils import get_cuda_tile_compile_dependency_requirements; print(*get_cuda_tile_compile_dependency_requirements(), sep="\n")'
-  )
+      'import sys; from build_utils import get_ci_image_dependency_requirements; print(*get_ci_image_dependency_requirements(sys.argv[1]), sep="\n")' \
+      "${CUDA_MAJOR}"
+  )"
+  if [[ -n "${CI_IMAGE_DEPENDENCY_OUTPUT}" ]]; then
+    mapfile -t CI_IMAGE_DEPENDENCIES <<< "${CI_IMAGE_DEPENDENCY_OUTPUT}"
+  fi
+  if [[ "${CUDA_MAJOR}" == "13" ]] && (( 10#${CUDA_MINOR} < 4 )); then
+    mapfile -t CUDA_TILE_COMPILE_DEPENDENCIES < <(
+      PYTHONPATH=/install python3 -c \
+        'from build_utils import get_cuda_tile_compile_dependency_requirements; print(*get_cuda_tile_compile_dependency_requirements(), sep="\n")'
+    )
+  fi
 fi
 
 # Install torch with specific CUDA version first, followed by others in requirements.txt, and then others.
@@ -97,10 +103,14 @@ fi
 # conflict lets pip swap it for the PyPI build of a different CUDA major.
 # Strip the local +cuXXX tag so the constraint remains resolvable from PyPI.
 # mktemp, not /install: the .dev images run this as a non-root USER.
-TORCH_CONSTRAINT="$(mktemp)"
-python3 -c 'import importlib.metadata as m; print("torch==" + m.version("torch").split("+", 1)[0])' \
-  > "$TORCH_CONSTRAINT"
-export PIP_CONSTRAINT="$TORCH_CONSTRAINT"
+# Not written in the torch stage: a random tempfile name would end up in that
+# layer and change its digest on every build.
+if [[ "${STAGE}" != "torch" ]]; then
+  TORCH_CONSTRAINT="$(mktemp)"
+  python3 -c 'import importlib.metadata as m; print("torch==" + m.version("torch").split("+", 1)[0])' \
+    > "$TORCH_CONSTRAINT"
+  export PIP_CONSTRAINT="$TORCH_CONSTRAINT"
+fi
 
 # Resolve the remaining direct dependencies once. Match cuda-python to the
 # image's CUDA major/minor; this also satisfies the matching nvshmem4py range.
