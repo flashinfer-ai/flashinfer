@@ -417,7 +417,7 @@ def _overlap(num_sms: int, fused: bool) -> tuple:
 def _long_segments(plan) -> bool:
     """Whether ``plan``'s attention-weighted mean segment ``sum(len ** 2) / tokens`` is at least 2560 tokens."""
     bounds = [int(b) for b in plan.bounds]
-    squares = sum((b - a) ** 2 for a, b in zip(bounds[:-1], bounds[1:]))
+    squares = sum((b - a) ** 2 for a, b in zip(bounds[:-1], bounds[1:], strict=False))
     return squares >= 2560 * bounds[-1]
 
 
@@ -917,7 +917,13 @@ IMPL_TENSORS = (
 
 @pytest.mark.parametrize(
     "overlap",
-    [OVERLAP, OVERLAP_SFSEL, OVERLAP_NODELTA, OVERLAP_WS_NODELTA, OVERLAP_WS_NODELTA_WSIL],
+    [
+        OVERLAP,
+        OVERLAP_SFSEL,
+        OVERLAP_NODELTA,
+        OVERLAP_WS_NODELTA,
+        OVERLAP_WS_NODELTA_WSIL,
+    ],
 )
 def test_overlapped_form_launches_the_producers_first(overlap, monkeypatch) -> None:
     """The overlapped form launches the producers, then the lead attention, then the tail attention, with
