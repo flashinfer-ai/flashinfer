@@ -3626,8 +3626,11 @@ class MoEActivationPack:
     # Pair-specific scales documented above; None for BF16 and per-tensor FP8.
     hidden_states_scale: Optional[Tensor]
     # Pre-routed top-k selection (Packed/Unpacked modes); None under FromLogits.
-    # A negative id marks an unrouted slot (e.g. CUDA-graph padding) only on
-    # b12x for now; other backends define no behavior for negative ids.
+    # Runners that route through the TRT-LLM-Gen routing kernels (TRTLLM,
+    # Prims-TS, and CuteDSL via moe_sort) skip every id outside this rank's
+    # [local_expert_offset, local_expert_offset + local_num_experts), negative
+    # ids included. b12x treats a negative id as an unrouted slot (e.g.
+    # CUDA-graph padding); other backends define no behavior for negative ids.
     topk_ids: Optional[Tensor] = None  # [M, top_k] int32 (expert indices)
     # [M, top_k] routing weights: float32 for PackedPrecomputed; bfloat16 or
     # float32 for TRTLLM UnpackedPrecomputed.
