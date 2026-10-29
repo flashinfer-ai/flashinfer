@@ -259,10 +259,13 @@ def proxy_score_sm90(
                     "SM90 fp8 proxy-score decode serves a one-head index cache; "
                     f"got {k.shape[1]} index heads"
                 )
-            from .cute_dsl.proxy_score_decode_sm90 import run as _decode
+            from .cute_dsl.proxy_score_decode_sm90 import run as _decode_fp8
+
+            _decode_fp8(q, k, cu, pt, sk, per_head)
         else:
-            from .cute_dsl.proxy_score_decode_bf16_sm90 import run as _decode
-        _decode(q, k, cu, pt, sk, per_head)
+            from .cute_dsl.proxy_score_decode_bf16_sm90 import run as _decode_bf16
+
+            _decode_bf16(q, k, cu, pt, sk, per_head)
         return per_head
 
     if not kv_fp8:
@@ -278,7 +281,14 @@ def proxy_score_sm90(
     # Cake programs serve fp8 prefill scoring of a one-head index cache in
     # both accumulation precisions; the CuTe DSL kernel serves the same
     # one-head class in both precisions, so several index heads raise in both.
-    if proxy_prefill_route_available(
+    # Both launch ceil(max_seqlen_q / rows) query tiles per sequence. The CuTe
+    # kernel skips the tiles past each sequence's end; the Cake programs rescore
+    # rows 0.. in each of them. A padded batch (decodes beside a prefill chunk,
+    # or ragged chunks) therefore goes to CuTe: on H100 it takes 0.17-0.84x
+    # Cake's time there (8-32 decodes beside a 2048-token chunk: 0.18-0.31x),
+    # and 1.14-1.2x on uniform batches, which stay on Cake.
+    padded = batch_size * max_seqlen_q > total_q
+    if not padded and proxy_prefill_route_available(
         q_dtype=q.dtype, num_kv_heads=k.shape[1], use_fp32_acc=use_fp32_acc
     ):
         return hopper_msa_proxy_score_prefill(
