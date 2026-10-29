@@ -24,8 +24,10 @@ token_sparse_kv_indices_trace = TraceTemplate(
         "requests_per_token": Scalar("int32"),
     },
     outputs={
-        "block_tables": Tensor(["rows", "lists", "top_k"], dtype="int32"),
-        "seq_lens": Tensor(["rows"], dtype="int32"),
+        "block_tables": Tensor(
+            ["rows", "lists", "top_k"], dtype="int32", param="block_tables"
+        ),
+        "seq_lens": Tensor(["rows"], dtype="int32", param="seq_lens"),
     },
     description="Token-sparse attention's K/V slot lists from key positions.",
 )
@@ -57,9 +59,9 @@ group_union_masks_trace = TraceTemplate(
         "num_keys": Scalar("int32"),
     },
     outputs={
-        "union": Tensor(["unions", "columns"], dtype="int32"),
-        "union_sizes": Tensor(["unions"], dtype="int32"),
-        "mask": Tensor(["masks", "words"], dtype="int32"),
+        "union": Tensor(["unions", "columns"], dtype="int32", param="union"),
+        "union_sizes": Tensor(["unions"], dtype="int32", param="union_sizes"),
+        "mask": Tensor(["masks", "words"], dtype="int32", param="mask"),
     },
     description="Each token group's union of keys as cache slots, and each token's bitmask over it.",
 )
