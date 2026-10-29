@@ -140,8 +140,6 @@ jobs:
       ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.tag }}
       repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
       wheel_version: ${{ needs.setup.outputs.version }}
-      sccache_default_bucket: flashinfer-build-cache
-      sccache_default_region: us-west-2
     secrets:
       SCCACHE_AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
       SCCACHE_AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}

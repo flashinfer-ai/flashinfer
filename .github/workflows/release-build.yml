@@ -34,14 +34,6 @@ on:
         description: 'FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS for the cubin download'
         type: string
         default: '0'
-      sccache_default_bucket:
-        description: 'sccache bucket used when the SCCACHE_BUCKET repository variable is unset'
-        type: string
-        default: ''
-      sccache_default_region:
-        description: 'sccache region used when the SCCACHE_REGION repository variable is unset'
-        type: string
-        default: ''
     secrets:
       SCCACHE_AWS_ACCESS_KEY_ID:
         required: false
@@ -235,8 +227,8 @@ jobs:
           FLASHINFER_JIT_CACHE_PROVIDER_ARCH: ${{ matrix.provider_architecture }}
           FLASHINFER_LOCAL_VERSION: ${{ matrix.cuda_label }}
           PYTORCH_INDEX: ${{ matrix.pytorch_index }}
-          SCCACHE_BUCKET: ${{ vars.SCCACHE_BUCKET || inputs.sccache_default_bucket }}
-          SCCACHE_REGION: ${{ vars.SCCACHE_REGION || inputs.sccache_default_region }}
+          SCCACHE_BUCKET: ${{ vars.SCCACHE_BUCKET || 'flashinfer-build-cache' }}
+          SCCACHE_REGION: ${{ vars.SCCACHE_REGION || 'us-west-2' }}
         run: bash scripts/build_flashinfer_jit_cache_artifact.sh
         timeout-minutes: 360
 
