@@ -577,9 +577,15 @@ _C12_BLOCK_TAIL_CELLS: dict[
 # 1.019-1.045 of the chain at batch 8 and 16 (0.937-0.949 at batch 32), so those rows keep the chain below 800.
 # Batch 1, 2 and 4 keep the chain in its ``_CHAIN_CELL_FORMS_BY_DEVICE`` form (the tail runs at 0.966-1.032 of the
 # chain at batch 2 and 4).
+# Round 20: on GB300 (152 SMs) the V = 151936 row at batch 128 (the cost model's (1, 32) stream, a two-launch chain on
+# its no-tail twin) runs `c1_e32s_bt_sp_tia` (the integer-tested tail of compute capability 10.3) from k = 769 at
+# 0.852-0.868 of the chain at k = 1000, 0.851-0.859 at k = 769, 0.855-0.862 at k = 800, 0.853-0.859 at k = 900 and
+# 0.775-0.782 at k = 1024 (two nodes, 12 rounds, both buffer placements, eager and graph, same sampled tokens).  The
+# 148-SM B300 keeps the chain.
 _C1_BLOCK_TAIL_PICKS_BY_DEVICE: dict[
     tuple[int, int, int], dict[tuple[int, int], int]
 ] = {
+    (10, 3, 152): {(151936, 128): 769},
     (10, 7, 212): {(32768, 8): 800, (32768, 16): 800, (32768, 32): 769},
 }
 _C1_BLOCK_TAIL_PICK_BUILD = (1, 32, True)
@@ -2054,6 +2060,7 @@ _STAGE1_PICKS_BY_DEVICE: dict[
         (32768, 8, False): (4, 16, True),
         (32768, 16, False): (4, 16, True),
         (32768, 32, False): (4, 16, True),
+        (32768, 64, False): (1, 16, True),
         (128256, 1, False): (8, 16, True),
         (128256, 2, False): (8, 16, True),
         (128256, 4, False): (8, 16, True),
@@ -2159,6 +2166,20 @@ _STAGE1_PICKS_BY_DEVICE: dict[
 }
 
 
+# Round 20 (B200): the V = 32768 bin with 33-64 rows runs the (1, 16) stream (its speculative-sample build with the slab
+# tail) instead of the cost model's (1, 32) stream for a top-k above the CTA-local-select cap (20) up to 50: it took
+# 0.954-0.994x the (1, 32) stream's time there (worst median per cell over two B200 nodes, eager / CUDA graph and two
+# pads).  At top-k 64 it was not faster there (1.004x eager on one node), and with 65-128 rows it took up to 1.013x from
+# top-k 21 to 50, so only this bin takes it and only for top-k 21-50.  Key (capability major, minor, SM count) ->
+# ``_STAGE1_PICKS_BY_DEVICE`` key -> (smallest, largest) top-k the entry serves; an entry absent here serves its whole
+# top-k class.
+_STAGE1_PICK_K_RANGE_BY_DEVICE: dict[
+    tuple[int, int, int], dict[_Stage1PickKey, tuple[int, int]]
+] = {
+    (10, 0, 148): {(32768, 64, False): (21, 50)},
+}
+
+
 def _measured_stage1_pick(
     capability: tuple[int, int],
     sm_count: int,
@@ -2171,10 +2192,9 @@ def _measured_stage1_pick(
     top-k class (the ``_STAGE1_PICK_L1`` class first for a top-k up to the capability's
     ``_LOCAL_SELECT_MAX_K_BY_CAPABILITY`` cap) and the variant ships, fits ``smem_limit``, covers ``vocab`` as the
     cost model's candidates do and, for a larger top-k, launches in the form measured at ``_STAGE1_PICK_LARGE_K``;
-    else None."""
-    picks = _STAGE1_PICKS_BY_DEVICE.get(
-        (int(capability[0]), int(capability[1]), int(sm_count))
-    )
+    else None.  An entry with a ``_STAGE1_PICK_K_RANGE_BY_DEVICE`` range serves a top-k in that range only."""
+    device = (int(capability[0]), int(capability[1]), int(sm_count))
+    picks = _STAGE1_PICKS_BY_DEVICE.get(device)
     if not picks or not 1 <= batch <= 128:
         return None
     lower = 0
@@ -2193,7 +2213,10 @@ def _measured_stage1_pick(
     )
     pick = picks.get((vbin, bbin, _STAGE1_PICK_L1)) if l1 else None
     if pick is None:
-        pick = picks.get((vbin, bbin, large))
+        key = (vbin, bbin, large)
+        k_range = _STAGE1_PICK_K_RANGE_BY_DEVICE.get(device, {}).get(key)
+        if k_range is None or k_range[0] <= int(top_k_max) <= k_range[1]:
+            pick = picks.get(key)
     if pick is None or pick not in _stage1_variants(smem_limit):
         return None
     cluster, ept, stream = pick
