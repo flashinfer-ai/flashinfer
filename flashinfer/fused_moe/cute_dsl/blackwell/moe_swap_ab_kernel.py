@@ -2859,7 +2859,7 @@ class Sm100BlockScaledGroupedGemmKernel:
         # Keep each warpgroup's register budget scoped to its role until the join.
         if warp < 4:
             if cutlass.const_expr(self.gather_input):
-                cute.arch.setmaxregister_decrease(80)
+                cute.arch.setmaxregister_decrease(112)
             if warp == self.schedule_warp:
                 if cutlass.const_expr(self.use_clc_scheduler):
                     sched = utils.ClcDynamicPersistentTileScheduler.create(
@@ -3271,11 +3271,6 @@ class Sm100BlockScaledGroupedGemmKernel:
                             if cutlass.const_expr(self.enable_iket):
                                 _iket.range_push("mma_tma_ready")
                             operand_pipe.consumer_wait(consumer)
-                            if cutlass.const_expr(self.gather_input):
-                                _gather_mbarrier_wait(
-                                    storage.gather_barriers.data_ptr() + consumer.index,
-                                    consumer.phase,
-                                )
                             if cutlass.const_expr(self.enable_iket):
                                 _iket.range_pop()
                                 _iket.range_push("mma_sf_copy_issue")
@@ -3290,9 +3285,6 @@ class Sm100BlockScaledGroupedGemmKernel:
                             self._copy_sf(
                                 copy_a, source_a[sf_stage_a], target_a, stage_k
                             )
-                            self._copy_sf(
-                                copy_b, source_b[sf_stage], tile_target_b, stage_k
-                            )
                             if cutlass.const_expr(self.channel_tiles == 2):
                                 sf_stage_a1 = (
                                     None,
@@ -3304,6 +3296,22 @@ class Sm100BlockScaledGroupedGemmKernel:
                                 self._copy_sf(
                                     copy_a1, source_a1[sf_stage_a1], target_a1, stage_k
                                 )
+                            if cutlass.const_expr(self.gather_input):
+                                # Weight scales are ready independently of gathered B.
+                                # Issue their S2T copies while the gather can finish.
+                                if cutlass.const_expr(self.enable_iket):
+                                    _iket.range_pop()
+                                    _iket.range_push("mma_gather_ready")
+                                _gather_mbarrier_wait(
+                                    storage.gather_barriers.data_ptr() + consumer.index,
+                                    consumer.phase,
+                                )
+                                if cutlass.const_expr(self.enable_iket):
+                                    _iket.range_pop()
+                                    _iket.range_push("mma_sfb_copy_issue")
+                            self._copy_sf(
+                                copy_b, source_b[sf_stage], tile_target_b, stage_k
+                            )
                             if cutlass.const_expr(self.enable_iket):
                                 _iket.range_pop()
                                 _iket.range_push("mma_umma0_issue")
