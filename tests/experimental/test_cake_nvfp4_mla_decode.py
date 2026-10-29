@@ -511,7 +511,7 @@ def test_balanced_units_are_contiguous_in_request_major_order():
 @pytest.mark.parametrize("kv_len", [8192, 131072])
 @pytest.mark.parametrize("num_sms", [148, 152])
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
-def test_long_row_balanced_plans_reverse_their_pieces_on_152_sm_sm100(
+def test_long_row_balanced_plans_reverse_their_pieces_on_152_sm_devices(
     arch, num_sms, kv_len
 ):
     forward = _bs32_plan(kv_len, num_sms)
@@ -520,10 +520,10 @@ def test_long_row_balanced_plans_reverse_their_pieces_on_152_sm_sm100(
     assert plan.schedule == "balanced" and record in LONG_DECODE_RECORDS
     assert select_decode_record(plan, arch) == record
     reverse = (arch, num_sms // CLUSTER_PAIR) in REVERSED_PIECE_TARGETS
-    assert reverse == (arch == "sm_100a" and num_sms == 152)
-    # The same units hold the same pieces; on a 152-SM SM100 device every unit
-    # runs them in reverse request-major order, each piece's row pair kept in
-    # order. 148-SM SM100 and every SM103 plan keep the request-major order.
+    assert reverse == (num_sms == 152)
+    # The same units hold the same pieces; on a 152-SM SM100 or SM103 device
+    # every unit runs them in reverse request-major order, each piece's row
+    # pair kept in order. 148-SM plans keep the request-major order.
     assert plan.unit_first == forward.unit_first
     assert (plan.max_splits, plan.tiles_per_split) == (
         forward.max_splits,
@@ -1770,6 +1770,27 @@ def test_nvfp4_mla_decode(
     assert_plan_well_formed(
         decode.plan, kv_lens, q_len=q_len, num_heads=num_heads, enable_sink=enable_sink
     )
+    # The prepared plan holds the pieces of every unit in the order of
+    # ``build_work_plan`` for the device architecture: reversed for a long-row
+    # balanced plan on a target of ``REVERSED_PIECE_TARGETS``.
+    forward = build_work_plan(
+        kv_lens,
+        num_heads=num_heads,
+        num_sms=num_sms,
+        q_len=q_len,
+        enable_sink=enable_sink,
+        tiles_per_split=tiles_per_split,
+    )
+    record = select_decode_record(forward, decode.arch)
+    if decode.plan.schedule == "balanced" and record in LONG_DECODE_RECORDS:
+        reverse = (decode.arch, num_sms // CLUSTER_PAIR) in REVERSED_PIECE_TARGETS
+        first = decode.plan.unit_first
+        for a, b in zip(first, first[1:], strict=False):
+            pieces = [forward.items[i : i + V_HALVES] for i in range(a, b, V_HALVES)]
+            want = pieces[::-1] if reverse else pieces
+            assert decode.plan.items[a:b] == tuple(
+                item for piece in want for item in piece
+            )
     total_q = len(kv_lens) * q_len
     q_indptr = _q_indptr(len(kv_lens), q_len)
     torch.cuda.synchronize()  # the single table upload is asynchronous
