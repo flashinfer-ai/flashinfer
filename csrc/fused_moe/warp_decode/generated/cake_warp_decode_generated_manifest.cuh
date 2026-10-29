@@ -6679,6 +6679,13 @@ inline int32_t Fc1LaunchGridN(const warp_decode::Shape& shape,
 inline int32_t Fc2LaunchGridN(const warp_decode::Shape& shape,
                               const warp_decode::Schedule& schedule,
                               const WorkspaceView& ws) {
+  // h3072_e256_i384_k8 T1 runs its 24 x 6 pool FC2 program on grid_m x 5 CTAs.
+  if (shape.hidden_size == 3072 && shape.intermediate_size == 384 && shape.num_experts == 256 &&
+      shape.local_num_experts == 256 && shape.top_k == 8 && shape.num_tokens == 1 &&
+      schedule.route_layout == warp_decode::RouteLayout::kGpuPacked &&
+      schedule.route_packer == warp_decode::RoutePacker::kFusedFc1 &&
+      schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK256)
+    return std::min(ws.route_tiles, 5);
   if (schedule.route_layout == warp_decode::RouteLayout::kDirect ||
       (warp_decode::kTarget == warp_decode::Target::kSm100a &&
        schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK256 &&
