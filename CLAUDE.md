@@ -659,6 +659,14 @@ Every public API decorated with `@flashinfer_api` should also carry a `trace=` a
 6. **Run tests**: `pytest tests/trace/ -v` — all template-consistency and end-to-end tests must pass.
 7. **Commit the new JSON files** under `tests/trace/fi_trace_out/` alongside the code changes.
 
+### PDL Contract Checklist (for APIs with a `pdl` / `enable_pdl` argument)
+
+Under PDL every kernel behind an API must read its tensor parameters after `griddepcontrol.wait` and write its buffers after it. The exceptions are parameters the preceding kernel never writes, such as weights:
+
+1. **List them in the decorator**: `@flashinfer_api(trace=..., pdl_static=("b", "b_descale"))`. Leave out anything a previous kernel may produce, such as activations and scales.
+2. **Register the call** in `tests/trace/test_pdl_contract.py` (`_PDL_APIS`): backends, shapes, and builders for tensor inputs the template's `init` does not create. The RAW/WAR tests for every tensor parameter follow from the signature.
+3. **Known races** go into `_KNOWN_RACES` as strict xfails with the fixing PR; remove the entry when it XPASSes.
+
 **Example implementations:**
 - **Simple**: `flashinfer/norm/__init__.py` (RMSNorm) - no Jinja, good starting point
 - **Moderate**: `flashinfer/sampling.py` - with Jinja templating

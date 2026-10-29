@@ -1193,7 +1193,7 @@ def _rmsnorm_impl_fake(
     pass
 
 
-@flashinfer_api(trace=rmsnorm_quant_trace)
+@flashinfer_api(trace=rmsnorm_quant_trace, pdl_static=("weight",))
 @register_custom_op("flashinfer::rmsnorm_quant", mutates_args=("out",))
 def rmsnorm_quant(
     out: torch.Tensor,
@@ -1300,7 +1300,7 @@ def _fused_add_rmsnorm_fake(
     pass
 
 
-@flashinfer_api(trace=fused_add_rmsnorm_quant_trace)
+@flashinfer_api(trace=fused_add_rmsnorm_quant_trace, pdl_static=("weight",))
 @register_custom_op(
     "flashinfer::fused_add_rmsnorm_quant", mutates_args=("out", "residual")
 )
