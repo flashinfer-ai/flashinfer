@@ -735,3 +735,43 @@ def test_mm_fp4_l2_policy_rule():
     # other kernels are untouched
     assert mm_fp4_l2_policy(8, (128, 8), True, "sm100sk") is None
     assert mm_fp4_l2_policy(8, (128, 8), True, "sm103") is None
+
+
+@pytest.mark.parametrize("m", [1, 16])
+def test_mm_fp4_cutlass_sm120_disable_stream_k(m, monkeypatch):
+    # With FLASHINFER_FP4_GEMM_DISABLE_STREAM_K=1 the SM120 CUTLASS runner offers the
+    # autotuner only data-parallel tactics, and those all return the same bits, so the
+    # output no longer depends on which tactic the autotuner picked.
+    from flashinfer.gemm import gemm_base
+
+    if not is_sm12x_supported(torch.device("cuda")):
+        pytest.skip("The SM120 CUTLASS FP4 GEMM needs SM12x.")
+    n, k = 4096, 4096
+    _, _, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, n, k)
+    alpha = torch.tensor([alpha], device="cuda", dtype=torch.float32)
+    workspace = torch.empty(
+        gemm_base.DEFAULT_WORKSPACE_SIZE, device="cuda", dtype=torch.uint8
+    )
+    runner = gemm_base.get_gemm_sm120_module_cutlass_fp4().cutlass_fp4_gemm_runner()
+
+    def run(tactic):
+        out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+        inputs = [a_fp4, b_fp4.T, a_s, b_s.T, alpha, None, out, None, None, workspace]
+        runner(inputs=inputs, tactic=tactic)
+        torch.cuda.synchronize()
+        return out
+
+    monkeypatch.delenv("FLASHINFER_FP4_GEMM_DISABLE_STREAM_K", raising=False)
+    all_tactics = runner.get_valid_tactics([], None)
+    monkeypatch.setenv("FLASHINFER_FP4_GEMM_DISABLE_STREAM_K", "1")
+    tactics = runner.get_valid_tactics([], None)
+    assert tactics and set(tactics) < set(all_tactics)
+    assert all(t % 4 < 2 for t in tactics)
+    # a stream-K tactic loaded from a saved autotune cache is rejected too
+    excluded = sorted(set(all_tactics) - set(tactics))
+    assert not any(runner.validate_tactic([], t) for t in excluded)
+    assert all(runner.validate_tactic([], t) for t in tactics + [-1])
+
+    ref = run(tactics[0])
+    for t in tactics[1:]:
+        assert torch.equal(run(t), ref), f"tactic {t} differs from tactic {tactics[0]}"
