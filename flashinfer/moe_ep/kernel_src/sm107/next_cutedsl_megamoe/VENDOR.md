@@ -185,9 +185,14 @@ upstream `main` up to `413da003` have the same code):
   cost of at most one extra terminal FC1 claim per cluster. Re-apply this fix
   when the drop is re-exported until upstream carries it.
 
+The NVFP4 and MXFP8 reducers also accept route IDs and skip masked slots before
+loading payloads, scales or scores. The standard kernel advertises masked-slot
+handling for all separate reducers. These quantized-reduction changes are not
+part of the pinned upstream snapshot.
+
 FlashInfer-owned `shim/block_scaled.py` admits the geometries listed above and
-omits BF16 masked-slot preclear only when the kernel advertises masked reduction.
-Quantized combine and in-kernel reduction retain their existing clearing rules.
+omits combine-slot preclear when the kernel advertises masked reduction.
+In-kernel reduction retains its accumulation reset.
 This shim change is outside the exported payload. The local patch inventory
 above is separate from the historical upstream qualification evidence; run the
 registered strict single/multirank suites when updating or rebasing these patches.

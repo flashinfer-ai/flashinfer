@@ -73,6 +73,7 @@ def stage_mega_moe_inputs(
             quant_type="nvfp4",
             norm_const=input_norm_const,
             scale_multiplier=input_norm_const / 6.0,
+            zero_masked_scores=False,
         )
         return num_tokens
 
@@ -91,10 +92,7 @@ def stage_mega_moe_inputs(
     x_sf[:num_tokens].view(torch.uint8).zero_()
     x_sf[:num_tokens, :hidden_sf_cols].view(torch.uint8).copy_(sf.view(torch.uint8))
     topk_idx_out[:num_tokens].copy_(topk_ids.to(torch.int32))
-    # Masked scores may be non-finite; zero them before late-weight combine.
-    topk_weights_out[:num_tokens].copy_(
-        topk_weights.to(torch.float32).masked_fill(topk_ids == -1, 0)
-    )
+    topk_weights_out[:num_tokens].copy_(topk_weights)
     if num_tokens < capacity:
         topk_idx_out[num_tokens:capacity].fill_(-1)
     return num_tokens
