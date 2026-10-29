@@ -25,6 +25,7 @@ import re
 import subprocess
 import sys
 import textwrap
+from dataclasses import replace
 from fractions import Fraction
 
 import pytest
@@ -1650,36 +1651,39 @@ def test_cake_does_not_synchronize(form):
     assert bool(torch.isfinite(X.grad.float()).all())
 
 
-@pytest.mark.parametrize("form", ["sparse", "dense", "sparse chunked"])
-def test_cake_step_peak_within_memory_report(form):
-    """The device bytes a training step allocates above the inputs stay within :func:`support_memory_report`."""
-    _require_cake()
-    T, H, V = 2048, 512, 8192
-    inp = cuda_inputs(T, V=V, k_cap=64, teacher=True)
-    kw = dict(backend="cake")
-    if form == "sparse chunked":
-        kw.update(path="sparse", dw_mode="chunked", chunk_size=512)
-    else:
-        kw.update(path=form)
-    arch = cake_backend.arch_for(CUDA)
-    report = cake_support.support_memory_report(
-        T,
-        H,
-        V,
+PEAK_FORMS = {
+    "sparse": dict(path="sparse"),
+    "dense": dict(path="dense"),
+    "sparse chunked": dict(path="sparse", dw_mode="chunked", chunk_size=512),
+}
+
+
+def _step_report(inp, kw):
+    """:func:`support_memory_report` of one ``support_kl`` step with ``return_logprobs`` on the current device."""
+    return cake_support.support_memory_report(
+        inp.T,
+        inp.H,
+        inp.V,
         inp.M,
         outputs=("packed", "kl"),
         ids_dtype=inp.support_ids.dtype,
-        arch=arch,
+        arch=cake_backend.arch_for(CUDA),
         chunk_size=kw.get("chunk_size"),
-        path=kw["path"],
+        path=kw.get("path", "auto"),
         dw_mode=kw.get("dw_mode", "auto"),
     )
+
+
+def _step_peak(inp, kw):
+    """The device bytes one ``support_kl`` step (forward + backward) allocates above its inputs (the allocator's
+    blocks, and the requested sizes without its rounding), and the step's results."""
     run_support(inp, ("packed", "kl"), **kw)  # load the programs and the constants
     X = inp.X.detach().requires_grad_(True)
     W = inp.W.detach().requires_grad_(True)
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     base = torch.cuda.memory_allocated()
+    base_requested = torch.cuda.memory_stats()["requested_bytes.all.current"]
     torch.cuda.reset_peak_memory_stats()
     kl, logp = support_kl(
         X,
@@ -1694,7 +1698,57 @@ def test_cake_step_peak_within_memory_report(form):
     torch.autograd.backward([kl, logp], [inp.e, inp.g])
     torch.cuda.synchronize()
     peak = torch.cuda.max_memory_allocated() - base
-    assert peak <= report["total"] + 8 * 2**20, (peak, report)
+    requested = torch.cuda.memory_stats()["requested_bytes.all.peak"] - base_requested
+    return (
+        peak,
+        requested,
+        dict(kl=kl.detach(), packed=logp.detach(), dX=X.grad, dW=W.grad),
+    )
+
+
+@pytest.mark.parametrize("form", sorted(PEAK_FORMS))
+def test_cake_step_peak_within_memory_report(form):
+    """The device bytes a training step allocates above the inputs stay within :func:`support_memory_report`, up
+    to 1 % (about two million pairs, so the workspace buckets are MBs to hundreds of MB)."""
+    _require_cake()
+    inp = cuda_inputs(4096, H=1024, V=32768, k_cap=1024, teacher=True)
+    kw = dict(backend="cake", **PEAK_FORMS[form])
+    report = _step_report(inp, kw)
+    assert inp.M >= 2**20, inp.M
+    peak, _, _ = _step_peak(inp, kw)
+    assert peak <= report["total"] * 1.01, (peak, report)
+
+
+@pytest.mark.parametrize("form", ["sparse", "sparse chunked"])
+def test_cake_step_memory_is_vocabulary_invariant(form):
+    """The same supports with ``V`` in {77568, 154880, 309760} (rows past the first ``V`` appended to ``W``): the
+    step's requested device bytes above the inputs, less the ``V``-sized weight gradient (BF16 ``dW`` and the FP32
+    sum of the chunked mode), are equal (requested sizes: the allocator's block rounding depends on its cache
+    state); the outputs, ``dX`` and the support rows of ``dW`` are bitwise equal and the other ``dW`` rows are +0."""
+    _require_cake()
+    vocabs = (77568, 154880, 309760)
+    inp0 = cuda_inputs(2048, V=vocabs[0], k_cap=64, kind="heavy", teacher=True)
+    kw = dict(backend="cake", **PEAK_FORMS[form])
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(SEED + 5)
+    temps, results = [], []
+    for V in vocabs:
+        extra = torch.randn(V - vocabs[0], inp0.H, generator=gen) / math.sqrt(inp0.H)
+        W = torch.cat([inp0.W, extra.to(torch.bfloat16).to(CUDA)])
+        inp = replace(inp0, W=W)
+        report = _step_report(inp, kw)
+        _, requested, res = _step_peak(inp, kw)
+        temps.append(
+            requested - report["gradients"] - report["weight_gradient_storage"]
+        )
+        results.append(res)
+        del inp, W, extra
+    assert len(set(temps)) == 1, temps
+    V0 = vocabs[0]
+    for res in results[1:]:
+        dW = res.pop("dW")
+        assert torch.count_nonzero(dW[V0:].view(torch.int16)) == 0
+        assert_same(results[0], dict(res, dW=dW[:V0]))
 
 
 def test_cake_replay_uses_the_recorded_support():

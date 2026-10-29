@@ -383,13 +383,31 @@ kl, logp = chunked_lm_head_support_kl(X, W, ids, offsets, teacher_logprobs, k_ca
   `O(T)`; `cake_support.support_memory_report(T, H, V, M, ...)` gives the device
   bytes of a step by bucket, with the measured `torch.sort` bytes per key
   (`SORT_BYTES_PER_KEY`) and the split of a long `dW` segment chosen to keep its
-  FP32 partial rows within 128 MiB.
+  FP32 partial rows within 128 MiB (table below).
 * Determinism: one owner and one order per sum, no atomics on values; reruns
   are bitwise equal.  The bits of `dX` / `dW` depend on the pass form,
   `chunk_size`, the dense vocabulary block and the sparse split (fixed
   functions of the sizes).  `backend="reference"` on the `cake_support`
   entry points runs every stage with PyTorch operators at the same rounding
   boundaries (a development aid that materializes `[chunk, V]` blocks).
+
+Device bytes of one step from `support_memory_report` at `T = 16384`,
+`H = 6144`, `V = 154880` (packed log-probabilities and KL, int64 indices;
+MB = 10^6 bytes).  Each workspace column counts every temporary of its phase
+at once, so it is an upper bound.
+
+| pass forms, pairs `M` | packed state + outputs | forward workspace | backward workspace | FP32 `dW` sum | BF16 `dX` + `dW` |
+|---|---|---|---|---|---|
+| sparse, `2^20` | 11 | 0 | 166 | 0 | 2104 |
+| sparse, `2^23` (the largest BF16-stored `dW`) | 84 | 0 | 623 | 0 | 2104 |
+| sparse, `2^24` (`dW` in ranges of `2^22` pairs) | 168 | 0 | 387 | 3806 | 2104 |
+| dense, `2^23`, `chunk_size` 4096 | 84 | 128 | 346 | 3806 | 2104 |
+| dense, `2^23`, `chunk_size` 16384 | 84 | 512 | 1334 | 0 | 2104 |
+
+The sparse backward workspace is `dz` (2 B per pair), 60.25 B per pair of
+the `dW` pair range (pair and row indices, keys, sort) and at most 128 MiB
+of FP32 partial rows; it does not depend on `V`.  The dense workspace is `dz`
+plus blocks of `chunk_size` rows and at most 16384 vocabulary columns.
 
 ## Switches and environment variables
 
