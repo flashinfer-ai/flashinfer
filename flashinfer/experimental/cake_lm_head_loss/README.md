@@ -251,12 +251,18 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   so they are slower.  The loss entry saves `X` and `W` for the recompute (an
   in-place write between the forward and the backward raises PyTorch's
   saved-tensor version error); the log-probability entry plans its backward
-  only.  The bound assumes a backward that frees the graph.  The margin is
-  measured on GB200 only (other architectures and allocator settings are
-  not measured): every measured `"budget"` step peak, single calls and
-  repeated calls that miss or hit the binding cache, stayed within `B`; the
-  highest reached 0.9801 `B`, just above the planner's 2 % target.  No
-  environment variable selects it.
+  only.  A `"budget"` call counts its valid rows on the host: the hidden
+  valid-row count would allocate a whole chunk's buffers before the count is
+  known, which can exceed `B` when fewer rows than a chunk are valid.  The bound
+  assumes a backward that frees the graph and PyTorch's caching allocator in
+  its default configuration (`PYTORCH_CUDA_ALLOC_CONF` unset).  A call for
+  which no form fits runs the form with the smallest predicted peak, which
+  can exceed `B`.  The margin is measured on GB200 only (other architectures
+  and allocator settings are not measured): every measured `"budget"` step
+  peak of a call whose plan fits, single calls and repeated calls that miss
+  or hit the binding cache, at the issue's shapes and at small heads, stayed
+  within `B`; the highest reached 0.9794 `B`.  No environment variable
+  selects it.
 * Caller's valid-row count (`num_valid_rows`, keyword of
   `chunked_lm_head_loss` / `chunked_lm_head_logprob` and of the
   `cake_backend_opt_in` eager entry points, default `None`): the number of labels

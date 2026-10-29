@@ -151,9 +151,27 @@ MEMORY_MODES = (
 
 
 # The budget form's margin below the logits-materializing head's bytes (a fraction of them): the peak model of
-# :func:`memory_plan` counts the vocabulary- and hidden-sized buffers and estimates the O(T) row vectors; the margin
-# absorbs that estimate and the caching allocator's rounding.
+# :func:`memory_plan` counts the vocabulary- and hidden-sized buffers, estimates the O(T) row vectors and adds the
+# caching allocator's per-tensor bound (:func:`_allocated_bytes`); the margin absorbs the row-vector estimate and the
+# small tensors the model does not list.
 MEMORY_BUDGET_MARGIN = 0.02
+
+# PyTorch's CUDA caching allocator under its default configuration (``PYTORCH_CUDA_ALLOC_CONF`` unset), which
+# ``torch.cuda.max_memory_allocated`` counts in blocks: a block is a multiple of 512 bytes, and a large-pool block (a
+# request of 1 MiB or more, counted conservatively) may keep an unsplit remainder of up to 1 MiB (``kSmallSize``).
+ALLOCATOR_ROUND_BYTES = 512
+ALLOCATOR_LARGE_BYTES = 1 << 20
+
+
+def _allocated_bytes(nbytes: int, count: int = 1) -> int:
+    """The bytes :func:`memory_plan` counts for ``count`` live tensors of ``nbytes`` each: their bytes plus, per tensor,
+    the default caching allocator's bound -- :data:`ALLOCATOR_ROUND_BYTES` of rounding and, for a tensor of
+    :data:`ALLOCATOR_LARGE_BYTES` or more, an unsplit remainder of up to :data:`ALLOCATOR_LARGE_BYTES`."""
+    nbytes, count = int(nbytes), int(count)
+    if nbytes <= 0 or count <= 0:
+        return 0
+    large = ALLOCATOR_LARGE_BYTES if nbytes >= ALLOCATOR_LARGE_BYTES else 0
+    return count * (nbytes + ALLOCATOR_ROUND_BYTES + large)
 
 
 def memory_mode_default() -> str:
@@ -604,8 +622,8 @@ class MemoryPlan:
     backward recomputes every row).  ``dw_rows``: the vocabulary rows the chunk loop -- the loss entry's forward, the
     log-probability entry's backward -- accumulates (``V`` for the first two forms).  ``block_rows``: the rows of one
     vocabulary block of the backward's recompute (``None`` = no recompute; :func:`_dw_vocab_blocks`).
-    ``predicted_bytes``: the predicted step peak above the caller's tensors (outputs included);
-    ``budget_bytes``: the bound it was picked against."""
+    ``predicted_bytes``: the predicted step peak above the caller's tensors (outputs included), in allocator blocks
+    (:func:`_allocated_bytes`); ``budget_bytes``: the bound it was picked against."""
 
     form: str
     dw_rows: int
@@ -640,6 +658,8 @@ def memory_plan(
     recompute: bool = True,
     dx_ws_slabs: int = 0,
     buffer_rows: Optional[int] = None,
+    x_copy: bool = False,
+    dx_finalize: bool = True,
     geometry: Geometry = DEFAULT_GEOMETRY,
 ) -> MemoryPlan:
     """The ``memory_mode="budget"`` rule: the fastest exact weight-gradient form whose predicted step peak stays within
@@ -650,17 +670,28 @@ def memory_plan(
     Candidates in latency order: ``"fused"`` (when ``fuse_dw_cast`` allows it), ``"unfused"``, then, when the record
     registers the recompute's logits arm (``recompute``), ``"partial"`` with the largest ``dw_rows`` and
     ``"recompute"`` -- each with the largest vocabulary block that fits; ``dw_rows`` and the block are multiples of
-    :func:`dw_block_step`.  When no candidate fits (a ``chunk_size`` whose chunk buffers alone exceed the budget), the
-    one with the smallest predicted peak.  Every form is exact: the same ``dW`` bits (:func:`_dw_vocab_blocks`).
+    :func:`dw_block_step`.  When no candidate fits (the chunk buffers of the ``chunk_size``, the dX cast, the copy of ``X``
+    or the allocator's per-tensor bound of a small head leave no room), the one with the smallest predicted peak: the
+    call runs it and its step peak can exceed the budget.  Every form is exact: the same ``dW`` bits
+    (:func:`_dw_vocab_blocks`).
 
     The model counts, per phase, the buffers the entry points allocate -- the FP32 accumulators (``dX`` of the
     ``rows``, ``dW`` of the accumulated vocabulary rows), the chunk buffers of ``buffer_rows`` rows (logits,
     statistics, the gather buffer when ``compact``, ``dx_ws_slabs`` K-slice slabs), the outputs and a recompute block
     -- plus an estimate of the ``O(T)`` row vectors, and assumes a backward that frees the graph (the early release of
-    the autograd entries; ``retain_graph=True`` keeps the forward's state).  Loss entry: forward, forward-to-backward
-    state plus the ``dX`` output, then the ``dW`` phase; log-probability entry: its backward (the forward holds the
-    chunk buffers only).  ``buffer_rows`` defaults to ``min(chunk, rows)`` (the hidden valid-row count allocates
-    ``min(chunk, T)`` rows)."""
+    the autograd entries; ``retain_graph=True`` keeps the forward's state).  Each counted tensor carries the default
+    caching allocator's bound (``PYTORCH_CUDA_ALLOC_CONF`` unset; :func:`_allocated_bytes`), so a phase's prediction
+    is its tensors' bytes plus 1 MiB per live tensor of 1 MiB or more and 512 bytes per live tensor.  Loss entry:
+    forward, forward-to-backward state plus the ``dX`` output, then the ``dW`` phase; log-probability entry: its
+    backward (the forward holds the chunk buffers only).  ``buffer_rows`` defaults to ``min(chunk, rows)``: a budget
+    call runs without the hidden valid-row count, whose chunk-0 buffers take ``min(chunk, T)`` rows before the count is
+    known.  ``x_copy`` (``Problem.x_copy``: ``X``'s leading stride or base is not a TMA pitch): an uncompacted call's
+    chunk loop reads a contiguous BF16 ``[T, H]`` copy of ``X``, counted while it lives -- the loss entry's forward
+    (and, in the fused form, until the backward's deferred chunk, whose ``X`` rows are a view of it) and the
+    log-probability backward's chunk loop and casts.  ``dx_finalize`` (the call's resolved switch): a compacted call
+    with the fused dX finalize writes ``dX`` from the FP32 accumulator; otherwise the dX is first cast to a BF16
+    ``[rows, H]`` tensor -- the log-probability backward allocates it before its chunk loop, a compacted loss backward
+    casts its rows before scattering them into the ``[T, H]`` output."""
     if entry not in ENTRIES:
         raise ValueError(f"entry must be one of {ENTRIES}")
     T, R, H, V, C = (int(num_rows), int(rows), int(hidden), int(vocab), int(chunk))
@@ -674,55 +705,77 @@ def memory_plan(
     r_last = R - (n - 1) * C
     Cr = min(C, R)  # rows of the largest chunk
     Cb = Cr if buffer_rows is None else int(buffer_rows)
-    dxacc = 4 * R * H if need_dx else 0
-    dx_out = 2 * T * H if need_dx else 0
-    dw_out = 2 * V * H
+    live = _allocated_bytes  # every term below: its tensors with the allocator's per-tensor bound
+    dxacc = live(4 * R * H) if need_dx else 0
+    dx_out = live(2 * T * H) if need_dx else 0
+    dw_out = live(2 * V * H)
     rowvec = (
-        16 * T + 32 * R
-    )  # the O(T) vectors: labels, mask, scan, index, lse, logp, d, ...
+        live(4 * T, 4) + live(4 * R, 8)
+    )  # the O(T) vectors (16 T + 32 R bytes): labels, mask, scan, index, lse, logp, d, ...
+    xc = (
+        live(2 * T * H) if x_copy and not compact else 0
+    )  # the contiguous copy of X the chunk loop reads
+    dx_rows = (
+        live(2 * R * H) if need_dx and not (compact and dx_finalize) else 0
+    )  # the BF16 [rows, H] dX cast
+    logits = live(2 * Cb * V)
     bufs = (
-        2 * Cb * V
-        + 8 * Cb * -(-V // tile)
-        + (2 * Cb * H if compact else 0)
-        + 4 * int(dx_ws_slabs) * Cb * H
+        logits
+        + live(8 * Cb * -(-V // tile))
+        + (live(2 * Cb * H) if compact else 0)
+        + live(4 * int(dx_ws_slabs) * Cb * H)
     )
-    head = 2 * R * V + dw_out + dx_out
+    head = 2 * R * V + 2 * V * H + (2 * T * H if need_dx else 0)
     budget = head - int(math.ceil(head * float(MEMORY_BUDGET_MARGIN)))
 
     def block(vb: int) -> int:
         """One recompute block: the gathered rows, the block's ``dz`` and statistics, its FP32 accumulator (a
-        multi-chunk call) and the block-shifted labels."""
+        multi-chunk call) and the block-shifted labels (with their temporary)."""
         return (
-            2 * Cr * H
-            + 2 * Cr * vb
-            + 8 * Cr * -(-vb // tile)
-            + (4 * vb * H if n > 1 else 0)
-            + 12 * R
+            live(2 * Cr * H)
+            + live(2 * Cr * vb)
+            + live(8 * Cr * -(-vb // tile))
+            + (live(4 * vb * H) if n > 1 else 0)
+            + live(8 * R)
+            + live(4 * R)
         )
 
     if entry == "loss":
 
         def peak(form: str, v0: int, vb: int) -> int:
             if form == "fused":
-                acc = 4 * V * H if n > 1 else 0
-                fwd = dxacc + acc + bufs + rowvec
+                acc = live(4 * V * H) if n > 1 else 0
+                fwd = dxacc + acc + bufs + rowvec + xc
                 held = (
-                    dxacc + acc + 2 * Cb * V + rowvec
-                )  # the deferred chunk's dz pins its buffer
+                    dxacc + acc + logits + rowvec + xc
+                )  # the deferred chunk's dz pins its buffer, its X rows (a view) the copy
                 last = (
                     dx_out
                     + acc
-                    + 2 * Cb * V
-                    + (2 * r_last * H if compact else 0)
+                    + logits
+                    + (live(2 * r_last * H) if compact else 0)
                     + dw_out
                     + rowvec
+                    + xc
                 )
-                return max(fwd, held + dx_out + 4 * T, last)
-            acc = 4 * v0 * H
-            keep = 4 * R if vb else 0  # the per-row gradient scale of the recompute
+                return max(
+                    fwd,
+                    held + dx_out + live(4 * T) + (dx_rows if compact else 0),
+                    last,
+                )
+            acc = live(4 * v0 * H)
+            keep = (
+                live(4 * R) if vb else 0
+            )  # the per-row gradient scale of the recompute
             out = max(
-                dxacc + acc + bufs + rowvec + keep,
-                dxacc + acc + rowvec + keep + dx_out + 4 * T,
+                dxacc + acc + bufs + rowvec + keep + xc,
+                dxacc
+                + acc
+                + rowvec
+                + keep
+                + dx_out
+                + live(4 * T)
+                + (dx_rows if compact else 0),
             )
             if v0:
                 out = max(out, dx_out + dw_out + acc + rowvec + keep)
@@ -731,21 +784,25 @@ def memory_plan(
             return out
 
     else:
-        loop = bufs + 4 * R + rowvec  # the backward's chunk buffers and compact dlogp
+        loop = (
+            bufs + live(4 * R) + rowvec + xc + dx_rows
+        )  # the backward's chunk buffers, compact dlogp and dX cast
 
         def peak(form: str, v0: int, vb: int) -> int:
             if form == "fused":
-                acc = 4 * V * H if n > 1 else 0
+                acc = live(4 * V * H) if n > 1 else 0
                 return max(
                     dxacc + acc + dw_out + loop,
-                    dxacc + dx_out + dw_out + rowvec + 4 * T,
+                    dxacc + dx_out + dw_out + rowvec + live(4 * T) + xc,
                 )
-            acc = 4 * v0 * H
-            out = max(dxacc + acc + loop, dxacc + dx_out + acc + rowvec + 4 * T)
+            acc = live(4 * v0 * H)
+            out = max(
+                dxacc + acc + loop, dxacc + dx_out + acc + rowvec + live(4 * T) + xc
+            )
             if v0:
                 out = max(out, dx_out + dw_out + acc + rowvec)
             if vb:
-                out = max(out, dx_out + dw_out + block(vb) + rowvec + 4 * R)
+                out = max(out, dx_out + dw_out + block(vb) + rowvec + live(4 * R))
             return out
 
     def largest(fits, hi: int) -> int:
@@ -2701,7 +2758,8 @@ def forward_loss(
     knobs explicitly; the result carries it for the deferred weight gradient.
 
     ``memory_mode`` (default :func:`memory_mode_default`, ``"fast"``): ``"budget"`` (``cake`` backend, BF16 ``dW``)
-    picks the weight-gradient form of :func:`memory_plan` once the call's row count is known -- ``fuse_dw_cast=False``
+    picks the weight-gradient form of :func:`memory_plan` once the call's row count is known (without the hidden
+    valid-row count: its chunk-0 buffers come before the count) -- ``fuse_dw_cast=False``
     removes the fused form from the candidates -- and the result carries it (``memory_plan``); its recompute forms
     accumulate the vocabulary rows ``[0, dw_rows)`` only (``dw_acc`` is ``[dw_rows, H]``, ``None`` for ``dw_rows = 0``)
     and keep the row statistics, the plan and the inputs for :meth:`ForwardResult.backward`, which recomputes the
@@ -2759,7 +2817,9 @@ def forward_loss(
             backend=backend,
             compact=compact,
             stats=True,
-            hidden_count=_resolve_hidden_count(hidden_count),
+            # ``"budget"``: no hidden valid-row count -- its chunk-0 buffers take ``min(chunk, T)`` rows before the
+            # count is known, which can exceed the budget of a call with fewer valid rows than a chunk
+            hidden_count=False if budget else _resolve_hidden_count(hidden_count),
         )
         if hc is not None:
             # the hidden valid-row count: chunk 0's gather and logits GEMM are queued; the count arrives through the
@@ -2819,7 +2879,9 @@ def forward_loss(
             compact=row_index is not None,
             need_dx=need_dx,
             fuse_dw_cast=fuse,
-            buffer_rows=hc.rows0 if hc is not None else min(int(problem.chunk), rows),
+            buffer_rows=min(int(problem.chunk), rows),
+            x_copy=problem.x_copy,
+            dx_finalize=fused_dx,
             tuning=tuning,
         )
         fuse = mplan.form == "fused"
@@ -2989,6 +3051,8 @@ def _budget_plan(
     need_dx: bool,
     fuse_dw_cast: bool,
     buffer_rows: int,
+    x_copy: bool,
+    dx_finalize: bool,
     tuning: dict[str, dict[str, Any]],
 ) -> MemoryPlan:
     """:func:`memory_plan` of one ``memory_mode="budget"`` call on ``device``'s registered program: its geometry, the
@@ -3028,6 +3092,8 @@ def _budget_plan(
         recompute=LOGPROB_DZ_STAGE in stages,
         dx_ws_slabs=slabs,
         buffer_rows=buffer_rows,
+        x_copy=x_copy,
+        dx_finalize=dx_finalize,
         geometry=geometry,
     )
 
@@ -4294,7 +4360,8 @@ class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
             deterministic=deterministic,
             backend=backend,
             compact_rows=compact,
-            hidden_count=hidden,
+            # ``"budget"``: no hidden valid-row count (as :func:`forward_loss`)
+            hidden_count=False if budget else hidden,
             gemm_tuning=tuning,
             logprob_lbl=_resolve_logprob_lbl(logprob_lbl),
             num_valid_rows=num_valid_rows,
@@ -4401,6 +4468,7 @@ def _backward_logprob_budget(
             row_index=row_index,
             **{k: v for k, v in common.items() if k != "row_index"},
         )
+    problem = validate_lm_head_inputs(X, W, labels, chunk_size=chunk, entry="logprob")
     mplan = _budget_plan(
         "logprob",
         X.device,
@@ -4413,6 +4481,8 @@ def _backward_logprob_budget(
         need_dx=need_dx,
         fuse_dw_cast=bool(fuse_dw_cast),
         buffer_rows=min(chunk, rows),
+        x_copy=problem.x_copy,
+        dx_finalize=_resolve_dx_finalize(common["dx_finalize"]),
         tuning=common["gemm_tuning"],
     )
     loop = dict(common, row_index=row_index)
@@ -4474,7 +4544,6 @@ def _backward_logprob_budget(
             fuse_dw_cast=False,
             **loop,
         )
-    problem = validate_lm_head_inputs(X, W, labels, chunk_size=chunk, entry="logprob")
     module_name, record = record_for(X.device)
     geometry = Geometry.from_record(record)
     plan = make_plan(
