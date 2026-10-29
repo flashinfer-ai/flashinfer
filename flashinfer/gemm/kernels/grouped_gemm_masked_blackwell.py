@@ -69,6 +69,7 @@ from flashinfer.cute_dsl.fp4_common import (
     nvfp4_compute_output_scale,
     rcp_approx_ftz,
 )
+from flashinfer.quantization.nvfp4_quantization_utils import env_flag_enabled
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 from flashinfer.cute_dsl.utils import (
     get_cutlass_dtype,
@@ -4009,6 +4010,14 @@ def _validate_gated_activation(
     return activation_type.value
 
 
+# TRTLLM_DISABLE_FP4_QUANT_FAST_MATH is the alias honored by the CUDA quantizer.
+_NVFP4_RECIPE_ENV_VARS = (
+    "FLASHINFER_NVFP4_4OVER6",
+    "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH",
+    "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
+)
+
+
 def _validate_nvfp4_output(
     *,
     out,
@@ -4020,6 +4029,15 @@ def _validate_nvfp4_output(
     l,
     mma_tiler_mn,
 ) -> None:
+    # The epilogue implements only the default recipe; these switches change
+    # the standalone quantizers, so the fused output would silently diverge.
+    enabled = [name for name in _NVFP4_RECIPE_ENV_VARS if env_flag_enabled(name)]
+    if enabled:
+        raise ValueError(
+            "c_dtype='float4_e2m1fn' only implements the default NVFP4 "
+            f"fast-math recipe, but {', '.join(enabled)} is set; unset it or "
+            "quantize the output with a separate kernel"
+        )
     if out_scale is None or global_scale is None:
         raise ValueError("c_dtype='float4_e2m1fn' requires out_scale and global_scale")
     if mma_tiler_mn[0] != 128:

@@ -355,3 +355,18 @@ def test_nvfp4_output_rejects_unsupported_arguments(overrides, error):
     }
     with pytest.raises(error):
         _run_invalid_nvfp4(**overrides)
+
+
+@pytest.mark.parametrize(
+    "env_var",
+    [
+        "FLASHINFER_NVFP4_4OVER6",
+        "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH",
+        "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH",
+    ],
+)
+def test_nvfp4_output_rejects_non_default_recipe(monkeypatch, env_var):
+    _skip_unless_sm100()
+    monkeypatch.setenv(env_var, "1")
+    with pytest.raises(ValueError, match=env_var):
+        _run_invalid_nvfp4()

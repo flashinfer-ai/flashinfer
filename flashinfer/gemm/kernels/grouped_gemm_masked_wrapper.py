@@ -196,7 +196,9 @@ def grouped_gemm_nt_masked(
         quantizing a BF16 output with that function.  Requires
         ``mma_tiler_mn[0] == 128``, ``n`` a multiple of ``mma_tiler_mn[1]``
         and ``n_out`` a multiple of 64.  Works with or without
-        ``activation_type``.
+        ``activation_type``.  Raises ``ValueError`` when
+        ``FLASHINFER_NVFP4_4OVER6`` or ``FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH``
+        is set, since the epilogue does not implement those recipes.
     global_scale : Optional[torch.Tensor]
         Required when ``c_dtype="float4_e2m1fn"``.  Contiguous ``float32``
         tensor of shape ``(l,)`` with the per-batch NVFP4 global scale, as the
