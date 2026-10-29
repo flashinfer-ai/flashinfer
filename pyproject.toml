@@ -147,6 +147,15 @@ exclude = [
 # Their in-package JIT kernel source, compiled on demand by
 # flashinfer/jit/gdn_fused_decode.py.
 "flashinfer.gdn_kernels.experimental.kernel" = ["*.cu"]
+# Experimental SM120 CuTe GDN prefill. include-package-data is false, so the
+# license, README, and autocp coefficients must be listed or a wheel omits them.
+"flashinfer.experimental.gdn_sm120_cute" = [
+  "README.md",
+  "LICENSE.FlashQLA",
+]
+"flashinfer.experimental.gdn_sm120_cute.autocp" = [
+  "coefs/*.csv",
+]
 # Generated sources for the experimental exact-SM103a MXFP8 MegaMoE backend.
 "flashinfer.experimental.cake_mxfp8_megamoe_ep16" = ["csrc/**"]
 # Generated programs, hand-written bindings and manifest of the experimental
