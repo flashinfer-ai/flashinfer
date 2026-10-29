@@ -1734,7 +1734,11 @@ def test_cake_ssd_combined_cu_seqlens_form_is_bitwise_the_triple(
             fused,
         )
         ring_triple = _without_table_form(
-            module, program_triple, state_dtype=state_dtype, num_sequences=len(lengths)
+            module,
+            program_triple,
+            state_dtype=state_dtype,
+            num_sequences=len(lengths),
+            total_tokens=sum(lengths),
         )
         assert program_cu.split("_", 1)[1] == ring_triple.split("_", 1)[1], (
             program_cu,
@@ -3906,13 +3910,17 @@ def _derived_family(module, lengths, *, nheads=8):
     )
 
 
-def _without_table_form(module, name, *, state_dtype, num_sequences, nheads=8):
+def _without_table_form(
+    module, name, *, state_dtype, num_sequences, total_tokens, nheads=8
+):
     """The ring one-launch program a derived-table call stands for on this
     device: ``name`` without the prologue form that ``exactone_table_variant``
     picks for the call's launch grid (SM107: ``tablefirst`` below its grid
-    threshold, ``tableroles`` from it on).  The forms move only where the CTA
-    prologue derives the table; the arithmetic is the ring program's.  Every
-    other program is returned as is."""
+    threshold, ``tableroles`` from it on), in its one-CTA-cluster twin
+    (``tablefirstunit`` / ``tablerolesunit``) where ``unit_cluster_variant``
+    takes it.  The forms move only where the CTA prologue derives the table
+    and the twin only adds the static one-CTA cluster shape; the arithmetic
+    is the ring program's.  Every other program is returned as is."""
 
     program = module._PROGRAMS[name]
     if program.family != "exactone" or program.variant == "noring":
@@ -3925,6 +3933,16 @@ def _without_table_form(module, name, *, state_dtype, num_sequences, nheads=8):
             total_work=num_sequences * nheads,
             sm_count=module._sm_count(torch.cuda.current_device()),
         ),
+    )
+    form = module.unit_cluster_variant(
+        capability=torch.cuda.get_device_capability(),
+        family="exactone",
+        variant=form,
+        state_dtype=state_dtype,
+        mode_varlen=True,
+        num_sequences=num_sequences,
+        nheads=nheads,
+        total_tokens=total_tokens,
     )
     assert program.variant == form, (name, form)
     return name[: -len(form) - 1] if form else name
@@ -6533,6 +6551,25 @@ def _state_key(state_dtype):
     return module._STATE_DTYPE_KEYS[state_dtype]
 
 
+def _fused_ring_program(module, state_dtype, mode, *, nchunks, has_z=True):
+    """The fused ring program (``exactfused``, variant ``""``) of a call on
+    this device: ``exactfused_<state>_<mode>``, or its z-prefetch program
+    (``_zpf``) where ``fused_z_prefetch_selected`` takes it (SM107 batched
+    calls with ``z`` of at least two chunks per item; bitwise the same
+    outputs)."""
+
+    name = f"exactfused_{_state_key(state_dtype)}_{mode}"
+    if module.fused_z_prefetch_selected(
+        capability=tuple(torch.cuda.get_device_capability()),
+        state_dtype=state_dtype,
+        mode_varlen=mode == "varlen",
+        has_z=has_z,
+        nchunks=nchunks,
+    ):
+        name += "_zpf"
+    return name
+
+
 def _forced_runs(monkeypatch, runner, tensors, arguments):
     """The same call on the forced exact scan (``never``), the forced
     look-back program (``always``) and the forced three-phase program
@@ -6811,7 +6848,17 @@ def test_cake_ssd_combined_chunk_parallel_is_bitwise_the_exact_scan(
         )
     else:
         family = "exactfused"
-    assert exact.program == f"{family}_{_state_key(state_dtype)}_{mode}"
+    expected_exact = (
+        _fused_ring_program(
+            module,
+            state_dtype,
+            mode,
+            nchunks=-(-max(lengths) // 128) if varlen else 1024 // 128,
+        )
+        if family == "exactfused"
+        else f"{family}_{_state_key(state_dtype)}_{mode}"
+    )
+    assert exact.program == expected_exact
     assert chunk_parallel.program == f"chunkpar_{_state_key(state_dtype)}_{mode}"
     assert three_phase.program == f"chunkpar3_{_state_key(state_dtype)}_{mode}"
     assert chunk_parallel.final.dtype == state_dtype
@@ -6940,9 +6987,23 @@ def test_cake_ssd_combined_chunk_parallel_checkpoints_are_bitwise_the_exact_scan
     exact_program = exact.program
     if form == "triple":
         exact_program = _without_table_form(
-            module, exact_program, state_dtype=state_dtype, num_sequences=len(lengths)
+            module,
+            exact_program,
+            state_dtype=state_dtype,
+            num_sequences=len(lengths),
+            total_tokens=sum(lengths),
         )
-    assert exact_program == f"{family}_{_state_key(state_dtype)}_{mode}"
+    expected_exact = (
+        _fused_ring_program(
+            module,
+            state_dtype,
+            mode,
+            nchunks=1024 // 128 if form == "batched" else -(-max(lengths) // 128),
+        )
+        if family == "exactfused"
+        else f"{family}_{_state_key(state_dtype)}_{mode}"
+    )
+    assert exact_program == expected_exact
     assert chunk_parallel.program == f"chunkpar_{_state_key(state_dtype)}_{mode}"
     assert three_phase.program == f"chunkpar3_{_state_key(state_dtype)}_{mode}"
     written = {slot for slot in slots if slot >= 0}
@@ -7046,7 +7107,9 @@ def test_cake_ssd_combined_auto_selects_three_phase_for_a_short_few_head_prefill
     assert cake.last_program_name == "chunkpar3_bf16_batched"
     monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "never")
     out_exact, final_exact = runner.run(*tensors, **arguments)
-    assert cake.last_program_name == "exactfused_bf16_batched"
+    assert cake.last_program_name == _fused_ring_program(
+        module, torch.bfloat16, "batched", nchunks=2048 // 128
+    )
     assert out_exact.shape == out.shape and final_exact.shape == final.shape
     monkeypatch.setenv(_CHUNK_PARALLEL_ENV, "always")
     runner.run(*tensors, **arguments)
@@ -7065,12 +7128,15 @@ def test_cake_ssd_combined_auto_keeps_the_exact_scan_for_many_heads(monkeypatch)
     per-tile cost exceeds the scan's per-chunk cost."""
 
     _skip_unless_cake_arch()
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     constructor, tensors, arguments = _case(batch=1, seqlen=1024, nheads=128, ngroups=8)
     runner = SSDCombined(**constructor, backend="cake")
 
     out, final = runner.run(*tensors, **arguments)
 
-    assert runner._cake_runner.last_program_name == "exactfused_bf16_batched"
+    assert runner._cake_runner.last_program_name == _fused_ring_program(
+        module, torch.bfloat16, "batched", nchunks=1024 // 128
+    )
     assert tuple(out.shape) == (1, 1024, 128, 64)
     assert tuple(final.shape) == (1, 128, 64, 128)
 
