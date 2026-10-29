@@ -33,6 +33,7 @@ import weakref
 import pytest
 import torch
 
+from tests.test_helpers.cake_kda_train_kcp_saved import written_carry, written_tensors
 from tests.test_helpers.cake_package import cake_package
 
 kp = cake_package("cake_kda_train", "cake_kcp_plan")
@@ -5446,17 +5447,19 @@ def test_gpu_forward_only_layout_is_bitwise_and_lean(device) -> None:
         pred_f = kp.kcp_workspace_bytes(ctx, H=H, backward=False)
         assert ws_f.bytes == pred_f, (row, ws_f.bytes, pred_f)
         # no transient above the end state (the workspace, out and the saved set alive): both are allocator block
-        # sizes, so the caching allocator's rounding cancels
+        # sizes, so the caching allocator's rounding cancels.  The window frees nothing allocated before it: each row
+        # deletes its tensors at its end (else rebinding out_f / saved_f here frees the previous row's out + saved
+        # set inside the window, and hw_fwd - end_fwd reads their bytes, e.g. 6640640 B after ((1450,), 2))
         assert hw_fwd <= end_fwd + (1 << 20), (row, hw_fwd, end_fwd)
         assert torch.equal(out_f, out_b), row
         assert saved_f.flags() == saved_b.flags(), row
-        assert same(saved_f.tensors(), saved_b.tensors()), row
+        assert same(written_tensors(saved_f), written_tensors(saved_b)), row
         # the arena's content never reaches a result: a NaN arena (0xFF bytes: NaN in BF16 and FP32) on either layout
         for ws in (ws_f, ws_b):
             ws.local.arena.fill_(0xFF)
             out_p, saved_p = fwd(ws)
             assert torch.equal(out_p, out_b), (row, ws.local.fwd_layout)
-            assert same(saved_p.tensors(), saved_b.tensors()), (
+            assert same(written_tensors(saved_p), written_tensors(saved_b)), (
                 row,
                 ws.local.fwd_layout,
             )
@@ -5488,8 +5491,10 @@ def test_gpu_forward_only_layout_is_bitwise_and_lean(device) -> None:
         ws_t = new_ws()
         out_t, saved_t = fwd(ws_t, save_transfer=False)
         assert torch.equal(out_t, out_b) and not ws_t.has("carry"), row
-        for n in ("S_in", "carry"):
-            a, b = getattr(saved_t, n), getattr(saved_b, n)
+        for n, a, b in (
+            ("S_in", saved_t.S_in, saved_b.S_in),
+            ("carry", written_carry(saved_t), written_carry(saved_b)),
+        ):
             assert (a is None) == (b is None) and (a is None or torch.equal(a, b)), (
                 row,
                 n,
@@ -5503,7 +5508,8 @@ def test_gpu_forward_only_layout_is_bitwise_and_lean(device) -> None:
         del ws_t, out_t, saved_t
         # workspace=None: every forward on a forward-only arena of its own, explicitly and through autograd
         out_0, saved_0 = fwd(None)
-        assert torch.equal(out_0, out_b) and same(saved_0.tensors(), saved_b.tensors())
+        assert torch.equal(out_0, out_b)
+        assert same(written_tensors(saved_0), written_tensors(saved_b)), row
         assert same(bwd(None, saved_0), grads_b), row
         leaves = [t.detach().clone().requires_grad_(True) for t in (q, k, v, g, beta)]
         out_a = cake_kcp.chunk_kda_kcp(*leaves, ctx)
@@ -5533,7 +5539,9 @@ def test_gpu_forward_only_layout_is_bitwise_and_lean(device) -> None:
         hw_second = torch.cuda.max_memory_allocated(device) - base0
         assert torch.equal(o2, out_b) and same(g2, grads_b), row
         assert hw_first <= hw_second + (1 << 20), (row, hw_first, hw_second)
-        del o2, s2, g2, ws_s, ws_f, ws_b
+        # every tensor of the row: the next row's forward window must free nothing (see hw_fwd above)
+        del o2, s2, g2, ws_s, ws_f, ws_b, ws, out_b, saved_b, grads_b, out_f, saved_f
+        del grads_f, out_p, saved_p, tb, a, b, dq, dk, dv, dbeta, dg
     assert seen_p1 > 0 and seen_pn > 0, (seen_p1, seen_pn)
 
 
@@ -5575,7 +5583,8 @@ def test_gpu_graph_replay_on_the_forward_only_layout_then_backward(device) -> No
                 q, k, v, g, beta, ctx, workspace=ws, graph="replay"
             )
             events.append(cake_kcp.LAST_CALL["fwd"]["graph_event"])
-            assert torch.equal(out, out_r) and same(saved.tensors(), saved_r.tensors())
+            assert torch.equal(out, out_r)
+            assert same(written_tensors(saved), written_tensors(saved_r))
             assert not ws.local.backward and ws.local.fwd_layout == "fwd_kcp"
             assert not any(ws.has(n) for n in kp.FWD_LAZY_POOLS)
         cap = events.index("capture") if "capture" in events else -1
@@ -5654,7 +5663,9 @@ def test_gpu_graph_replay_after_a_forward_without_a_saved_set(device) -> None:
             if save:
                 assert all(
                     torch.equal(a, b)
-                    for a, b in zip(saved.tensors(), saved_r.tensors(), strict=True)
+                    for a, b in zip(
+                        written_tensors(saved), written_tensors(saved_r), strict=True
+                    )
                 ), events
             else:
                 assert saved is None, events

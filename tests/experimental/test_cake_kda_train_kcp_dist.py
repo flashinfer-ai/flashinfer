@@ -36,6 +36,10 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from tests.test_helpers.cake_kda_train_kcp_saved import (
+    poison_unwritten_carry,
+    written_tensors,
+)
 from tests.test_helpers.cake_kda_train_reference import (
     GRAD_NAMES,
     kda_exact_with_grads,
@@ -226,9 +230,9 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
     res_recompute = saved_pass(save_transfer=False)
     # the forward-only workspace (the KCP forward layout, the lazy pools) against this backward workspace: a saving
     # forward on an empty workspace holds the predicted bytes and none of the lazy pools, a forward without a saved
-    # set adds their predicted bytes, both give this workspace's out (and saved set) bitwise, and the backward that
-    # upgrades the forward-only workspace gives the same gradients; workspace=None (a forward-only arena per call)
-    # through autograd too
+    # set adds their predicted bytes, both give this workspace's out (and the written bytes of its saved set)
+    # bitwise, and the backward that upgrades the forward-only workspace gives the same gradients; workspace=None (a
+    # forward-only arena per call) through autograd too
     out_b, saved_b = cake_kcp.chunk_kda_kcp_fwd(q, k, v, g, beta, ctx, workspace=ws)
     ws_f, ws_n = cake_kcp.KcpWorkspace(), cake_kcp.KcpWorkspace()
     out_f, saved_f = cake_kcp.chunk_kda_kcp_fwd(q, k, v, g, beta, ctx, workspace=ws_f)
@@ -263,6 +267,10 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
     fwd_only_bytes = (
         fwd_only_bytes and ws_t.bytes == pred_t + lay_t["lazy"] == pred_f + lazy_f
     )
+    # the carry plane slots the forward never writes (the extra slots beyond n_in when n_out > n_in, the slots of a
+    # zero-length fragment) hold allocator bytes: the saved sets compare on the written bytes, and NaN in the others
+    # must not reach a gradient
+    poison_unwritten_carry(saved_f)
     dq, dk, dv, dbeta, dg = cake_kcp.chunk_kda_kcp_bwd(
         q, k, v, g, beta, ctx, dout, saved=saved_f, workspace=ws_f
     )
@@ -281,7 +289,9 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
         and saved_f.flags() == saved_b.flags()
         and all(
             torch.equal(a, b)
-            for a, b in zip(saved_f.tensors(), saved_b.tensors(), strict=True)
+            for a, b in zip(
+                written_tensors(saved_f), written_tensors(saved_b), strict=True
+            )
         )
         and all(torch.equal(res[n], res_fwd_only[n]) for n in TENSORS)
     )
