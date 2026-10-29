@@ -14,8 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# QSA sparse paged attention over an NVFP4 KV cache, for SM80 through SM90.
+# QSA sparse paged attention over an NVFP4, FP8-e4m3 or BF16 KV cache, for SM80 through SM90.
 
+import functools
 import math
 from typing import Optional
 
@@ -25,20 +26,31 @@ from ...utils import get_compute_capability
 from .jit import get_qsa_nvfp4_module
 
 _HEAD_DIM = 256
-_TILE_TOKENS = 64
 _MAX_GROUP_SIZE = 16
-# Splits are sized so rows * kv_heads * splits reaches about this many CTAs. One value per
-# architecture family, never per device.
-_TARGET_CTAS = {8: 128, 9: 128}
+# kernel format code and tile tokens by cache dtype
+_FORMATS = {
+    torch.uint8: (0, 64),
+    torch.float8_e4m3fn: (1, 64),
+    torch.bfloat16: (2, 32),
+}
+
+
+@functools.cache
+def _resident_ctas(device_index: int, kv_format: int) -> int:
+    with torch.cuda.device(device_index):
+        ctas_per_sm = get_qsa_nvfp4_module().ctas_per_sm(kv_format)
+    return (
+        ctas_per_sm
+        * torch.cuda.get_device_properties(device_index).multi_processor_count
+    )
 
 
 def _num_splits(
-    num_rows: int, num_kv_heads: int, selection_width: int, major: int
+    num_rows: int, num_kv_heads: int, num_tiles: int, resident_ctas: int
 ) -> int:
-    num_tiles = math.ceil(selection_width / _TILE_TOKENS)
-    return min(
-        num_tiles, max(1, math.ceil(_TARGET_CTAS[major] / (num_rows * num_kv_heads)))
-    )
+    # Fill one wave of resident CTAs, then use the fewest splits with the same tiles per split.
+    splits = min(num_tiles, max(1, resident_ctas // (num_rows * num_kv_heads)))
+    return math.ceil(num_tiles / math.ceil(num_tiles / splits))
 
 
 def _check(condition: bool, message: str) -> None:
@@ -70,39 +82,55 @@ def qsa_sparse_paged_attention(
     v_scale: Optional[float] = None,
     *,
     output_gate: torch.Tensor,
-    k_sf: torch.Tensor,
-    v_sf: torch.Tensor,
+    k_sf: Optional[torch.Tensor] = None,
+    v_sf: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     del (
         use_prefill_config
     )  # kept for the signature; the split rule does not depend on it
     major = get_compute_capability(q.device)[0]
-    if major not in _TARGET_CTAS:
+    if major not in (8, 9):
         raise RuntimeError(
-            f"QSA NVFP4 attention supports SM80 through SM90, got SM{major}x"
+            f"QSA sparse paged attention supports SM80 through SM90, got SM{major}x"
         )
     _check(q.ndim == 3 and k_cache.ndim == 4, "q must be 3D and k_cache 4D")
     num_rows, num_qo_heads, head_dim = q.shape
-    num_blocks, page_size, num_kv_heads, packed_dim = k_cache.shape
+    num_blocks, page_size, num_kv_heads, cache_dim = k_cache.shape
     _check(q.dtype == torch.bfloat16, "q must be bfloat16")
     _check(head_dim == _HEAD_DIM, f"head_dim must be {_HEAD_DIM}")
-    _check(packed_dim * 2 == head_dim, "k_cache must hold head_dim / 2 packed bytes")
     _check(
-        k_cache.dtype == torch.uint8
-        and v_cache.shape == k_cache.shape
+        k_cache.dtype in _FORMATS,
+        "k_cache must be uint8 (NVFP4), float8_e4m3fn or bfloat16",
+    )
+    kv_format, tile_tokens = _FORMATS[k_cache.dtype]
+    nvfp4 = k_cache.dtype == torch.uint8
+    _check(
+        cache_dim == (head_dim // 2 if nvfp4 else head_dim),
+        "k_cache must hold head_dim / 2 packed bytes (uint8 is NVFP4; view an FP8 cache "
+        "as float8_e4m3fn) or head_dim values",
+    )
+    _check(
+        v_cache.shape == k_cache.shape
         and v_cache.dtype == k_cache.dtype
         and v_cache.stride() == k_cache.stride(),
-        "k_cache and v_cache must be uint8 views with the same shape and strides",
+        "k_cache and v_cache must have the same dtype, shape and strides",
     )
-    sf_shape = (num_blocks, page_size, num_kv_heads, head_dim // 16)
-    _check(
-        k_sf.dtype == torch.float8_e4m3fn
-        and tuple(k_sf.shape) == sf_shape
-        and v_sf.shape == k_sf.shape
-        and v_sf.dtype == k_sf.dtype
-        and v_sf.stride() == k_sf.stride(),
-        f"k_sf and v_sf must be float8_e4m3fn views of shape {sf_shape} with the same strides",
-    )
+    sf_tensors = ()
+    if nvfp4:
+        sf_shape = (num_blocks, page_size, num_kv_heads, head_dim // 16)
+        _check(
+            k_sf is not None
+            and v_sf is not None
+            and k_sf.dtype == torch.float8_e4m3fn
+            and tuple(k_sf.shape) == sf_shape
+            and v_sf.shape == k_sf.shape
+            and v_sf.dtype == k_sf.dtype
+            and v_sf.stride() == k_sf.stride(),
+            f"k_sf and v_sf must be float8_e4m3fn views of shape {sf_shape} with the same strides",
+        )
+        sf_tensors = (("k_sf", k_sf), ("v_sf", v_sf))
+    else:
+        _check(k_sf is None and v_sf is None, "k_sf and v_sf are only taken with NVFP4")
     _check(num_blocks > 0 and page_size > 0, "k_cache must not be empty")
     _check(
         num_qo_heads % num_kv_heads == 0
@@ -130,6 +158,8 @@ def qsa_sparse_paged_attention(
         and token_to_req.is_contiguous(),
         "token_to_req must be contiguous int32 [rows]",
     )
+    if k_cache.dtype == torch.bfloat16:
+        k_scale = v_scale = 1.0
     _check(
         k_scale is not None and v_scale is not None, "k_scale and v_scale are required"
     )
@@ -145,7 +175,14 @@ def qsa_sparse_paged_attention(
         out.shape == q.shape and out.dtype == q.dtype,
         "out must match q in shape and dtype",
     )
-    tensors = (q, k_cache, v_cache, k_sf, v_sf, logical_indices, block_table)
+    tensors = (
+        q,
+        k_cache,
+        v_cache,
+        *(x for _, x in sf_tensors),
+        logical_indices,
+        block_table,
+    )
     _check(
         all(x.device == q.device for x in (*tensors, token_to_req, output_gate, out)),
         "all tensors must be on the same device",
@@ -154,8 +191,7 @@ def qsa_sparse_paged_attention(
     for name, tensor in (
         ("k_cache", k_cache),
         ("v_cache", v_cache),
-        ("k_sf", k_sf),
-        ("v_sf", v_sf),
+        *sf_tensors,
         ("output_gate", output_gate),
         ("out", out),
     ):
@@ -163,8 +199,9 @@ def qsa_sparse_paged_attention(
     if num_rows == 0:
         return out
 
+    num_tiles = math.ceil((logical_indices.shape[1] - 1) / tile_tokens)
     num_splits = _num_splits(
-        num_rows, num_kv_heads, logical_indices.shape[1] - 1, major
+        num_rows, num_kv_heads, num_tiles, _resident_ctas(q.device.index, kv_format)
     )
     if num_splits > 1:
         partial_out = q.new_empty(
@@ -190,6 +227,7 @@ def qsa_sparse_paged_attention(
         partial_lse,
         float(k_scale) * math.log2(math.e) / math.sqrt(head_dim),
         float(v_scale),
+        kv_format,
         num_splits,
     )
     return out

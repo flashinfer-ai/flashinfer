@@ -20,15 +20,20 @@ import pytest
 import torch
 
 import flashinfer
-from flashinfer.experimental.qsa_nvfp4.backend import _num_splits
+from flashinfer.experimental.qsa_nvfp4.backend import (
+    _FORMATS,
+    _num_splits,
+    _resident_ctas,
+)
 from flashinfer.sparse import qsa_sparse_paged_attention
 from flashinfer.utils import get_compute_capability
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
     or get_compute_capability(torch.device("cuda"))[0] not in (8, 9),
-    reason="QSA NVFP4 attention runs on SM80 through SM90",
+    reason="QSA attention runs on SM80 through SM90",
 )
+FORMATS = (torch.uint8, torch.float8_e4m3fn, torch.bfloat16)  # NVFP4, FP8, BF16
 
 HEAD_DIM = 256
 PAGE_SIZE = 16
@@ -44,10 +49,11 @@ def _dequant(data, sf, scale):
     return values.flatten(-2) * sf.float().repeat_interleave(16, -1) * scale
 
 
-def _make_cache(num_kv_heads, layout, seed):
-    """Quantize random K/V into every slot with the NVFP4 writer, using one buffer of
-    [data | scales] rows per side like a packed vLLM page. Returns the kernel's
-    [blocks, tokens, heads, *] views, the global scales and the dequantized cache."""
+def _make_cache(num_kv_heads, layout, seed, kv_dtype):
+    """Quantize random K/V into every slot (NVFP4 with its writer, using one buffer of
+    [data | scales] rows per side like a packed vLLM page). Returns the kernel's
+    [blocks, tokens, heads, *] views, the block scales (None unless NVFP4), the global
+    scales and the dequantized cache."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
     slots = NUM_BLOCKS * PAGE_SIZE
     k, v = (
@@ -56,6 +62,23 @@ def _make_cache(num_kv_heads, layout, seed):
     )
     k, v = k.bfloat16(), v.bfloat16()
     dims = (num_kv_heads, PAGE_SIZE) if layout == "HND" else (PAGE_SIZE, num_kv_heads)
+    if kv_dtype != torch.uint8:
+        scales = (1.0, 1.0)
+        if kv_dtype == torch.float8_e4m3fn:
+            scales = tuple(x.abs().max().item() / 448 for x in (k, v))
+        kv = torch.empty(NUM_BLOCKS, 2, *dims, HEAD_DIM, dtype=kv_dtype, device="cuda")
+        for i, (x, scale) in enumerate(zip((k, v), scales, strict=True)):
+            x = (
+                (x.float() / scale)
+                .to(kv_dtype)
+                .view(NUM_BLOCKS, PAGE_SIZE, -1, HEAD_DIM)
+            )
+            kv[:, i].copy_(x.transpose(1, 2) if layout == "HND" else x)
+        data = tuple(kv[:, i] for i in range(2))
+        if layout == "HND":
+            data = tuple(x.transpose(1, 2) for x in data)
+        deq = tuple(x.float() * scale for x, scale in zip(data, scales, strict=True))
+        return data, (None, None), scales, deq
     row_bytes = HEAD_DIM // 2 + HEAD_DIM // 16
     kv = torch.empty(NUM_BLOCKS, 2, *dims, row_bytes, dtype=torch.uint8, device="cuda")
     data = tuple(kv[:, i, ..., : HEAD_DIM // 2] for i in range(2))
@@ -96,25 +119,30 @@ def _make_selection(rows, seed):
     return table.cuda(), token_to_req.cuda(), indices.int().cuda()
 
 
-def _ulp_bf16(x):
-    """BF16 spacing at |x|, and 0 at 0."""
-    return torch.ldexp(torch.ones_like(x), torch.frexp(x)[1] - 8) * (x != 0)
+def _ulp(x, dtype=torch.bfloat16):
+    """BF16 or FP16 spacing at |x|, and 0 at 0."""
+    bits = 8 if dtype == torch.bfloat16 else 11
+    ulp = torch.ldexp(torch.ones_like(x), torch.frexp(x)[1] - bits)
+    return (ulp if dtype == torch.bfloat16 else ulp.clamp(min=2**-24)) * (x != 0)
 
 
-def _reference(q, cache, selection, gate, num_splits, chunk=64):
+def _reference(q, cache, selection, gate, num_splits, kv_dtype, chunk=64):
     """Float64 references, row chunk by row chunk.
 
-    contract: the kernel's arithmetic -- 64-column tiles walked per split with an online
-    softmax, P rounded to BF16, LSE merge, BF16 rounding, FP32 gate, BF16 output -- and a
-    worst-case bound on how far one-ulp P rounding, FP32 scores (with exp2.approx), FP32
-    accumulation and the two output roundings can move the kernel from it.
+    contract: the kernel's arithmetic -- tiles walked per split with an online softmax, P
+    rounded to the PV operand type (FP16 for FP8, BF16 otherwise), LSE merge, BF16 rounding,
+    FP32 gate, BF16 output -- and a worst-case bound on how far one-ulp P rounding, FP32
+    scores (with exp2.approx), FP32 accumulation and the two output roundings can move the
+    kernel from it.
     exact: softmax attention times the gate, unrounded, and sum_n p_n |v_n| times the gate.
     """
     k_deq, v_deq = cache[3]
     table, token_to_req, indices = selection
     num_kv_heads = k_deq.shape[2]
     log2_scale = math.log2(math.e) / math.sqrt(HEAD_DIM)
-    num_tiles = math.ceil(WIDTH / 64)
+    tile_tokens = _FORMATS[kv_dtype][1]
+    p_dtype = torch.float16 if kv_dtype == torch.float8_e4m3fn else torch.bfloat16
+    num_tiles = math.ceil(WIDTH / tile_tokens)
     parts = []
     for r0 in range(0, q.shape[0], chunk):
         token = indices[r0 : r0 + chunk, :WIDTH].long()
@@ -143,14 +171,14 @@ def _reference(q, cache, selection, gate, num_splits, chunk=64):
             m = torch.full(s.shape[:-1], -1e20, dtype=s.dtype, device=s.device)
             l, acc, flip = torch.zeros_like(m), 0.0, 0.0
             for tile in range(split, num_tiles, num_splits):
-                cols = slice(64 * tile, 64 * tile + 64)
+                cols = slice(tile_tokens * tile, tile_tokens * (tile + 1))
                 m_new = torch.maximum(m, s[..., cols].amax(-1))
                 pt = torch.exp2(s[..., cols] - m_new[..., None]) * mask[..., cols]
-                pb = pt.bfloat16().double()
+                pb = pt.to(p_dtype).double()
                 alpha = torch.exp2(m - m_new)[..., None]
                 acc = acc * alpha + torch.einsum("rhgw,rwhd->rhgd", pb, v[:, cols])
                 flip = flip * alpha + torch.einsum(
-                    "rhgw,rwhd->rhgd", _ulp_bf16(pb), v[:, cols].abs()
+                    "rhgw,rwhd->rhgd", _ulp(pb, p_dtype), v[:, cols].abs()
                 )
                 l, m = l * alpha[..., 0] + pt.sum(-1), m_new
             lse = torch.where(l > 0, m + torch.log2(l), -math.inf)[..., None]
@@ -179,9 +207,9 @@ def _reference(q, cache, selection, gate, num_splits, chunk=64):
     contract = (rounded.float() * sigma).bfloat16().double()
     sigma = sigma.double()
     tolerance = (
-        sigma * (2 * _ulp_bf16(rounded.double()) + flip)
+        sigma * (2 * _ulp(rounded.double()) + flip)
         + sigma * (2 * eps_p + 2 * WIDTH * 2**-23) * bound
-        + _ulp_bf16(contract)
+        + _ulp(contract)
     )
     return contract, tolerance, exact * sigma, bound * sigma
 
@@ -207,7 +235,7 @@ def _run(q, cache, selection, gate, out=None):
     )
 
 
-def _inputs(rows, num_qo_heads, num_kv_heads, layout, seed):
+def _inputs(rows, num_qo_heads, num_kv_heads, layout, seed, kv_dtype=torch.uint8):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     q, gate = (
         torch.randn(
@@ -217,10 +245,12 @@ def _inputs(rows, num_qo_heads, num_kv_heads, layout, seed):
     )
     # q and the cache draw from the same seed on purpose: some q rows then equal a cached
     # K and their attention collapses onto that token, which stresses small probabilities.
-    return q, _make_cache(num_kv_heads, layout, seed), _make_selection(rows, seed), gate
+    cache = _make_cache(num_kv_heads, layout, seed, kv_dtype)
+    return q, cache, _make_selection(rows, seed), gate
 
 
-# rows x kv_heads of 2, 16, 32, 128 and 4096 give 33, 8, 4, 1 and 1 splits; groups 12, 16, 1.
+# rows x kv_heads of 2 to 4096 cover many to one splits; groups 12, 16, 1.
+@pytest.mark.parametrize("kv_dtype", FORMATS)
 @pytest.mark.parametrize("layout", ["NHD", "HND"])
 @pytest.mark.parametrize(
     "rows,num_qo_heads,num_kv_heads",
@@ -234,13 +264,20 @@ def _inputs(rows, num_qo_heads, num_kv_heads, layout, seed):
         (4, 2, 2),
     ],
 )
-def test_matches_reference(layout, rows, num_qo_heads, num_kv_heads):
-    q, cache, selection, gate = _inputs(rows, num_qo_heads, num_kv_heads, layout, rows)
+def test_matches_reference(kv_dtype, layout, rows, num_qo_heads, num_kv_heads):
+    q, cache, selection, gate = _inputs(
+        rows, num_qo_heads, num_kv_heads, layout, rows, kv_dtype
+    )
     out = _run(q, cache, selection, gate).double()
-    major = get_compute_capability(q.device)[0]
-    num_splits = _num_splits(rows, num_kv_heads, WIDTH, major)
+    kv_format, tile_tokens = _FORMATS[kv_dtype]
+    num_splits = _num_splits(
+        rows,
+        num_kv_heads,
+        math.ceil(WIDTH / tile_tokens),
+        _resident_ctas(q.device.index, kv_format),
+    )
     contract, tolerance, exact, bound = _reference(
-        q, cache, selection, gate, num_splits
+        q, cache, selection, gate, num_splits, kv_dtype
     )
     assert ((out - contract).abs() <= tolerance).all()
     # Accuracy limit against exact attention; validated empirically, not a proven bound.
@@ -249,8 +286,9 @@ def test_matches_reference(layout, rows, num_qo_heads, num_kv_heads):
         assert not out[1].any() and out[2].any()  # count 0; count 1 with a real token
 
 
-def test_cuda_graph_replay():
-    q, cache, selection, gate = _inputs(8, 24, 2, "HND", 7)
+@pytest.mark.parametrize("kv_dtype", FORMATS)
+def test_cuda_graph_replay(kv_dtype):
+    q, cache, selection, gate = _inputs(8, 24, 2, "HND", 7, kv_dtype)
     out = torch.empty_like(q)
     _run(q, cache, selection, gate, out)
     graph = torch.cuda.CUDAGraph()
@@ -285,6 +323,9 @@ def test_rejects_invalid_inputs():
         q.shape
     )
     wide_group = torch.zeros(4, 48, HEAD_DIM, dtype=q.dtype, device="cuda")
+    fp8 = torch.zeros(*k_data.shape[:3], HEAD_DIM, device="cuda").to(
+        torch.float8_e4m3fn
+    )
     for change in (
         {"q": q.half()},
         {"q": q[..., :128]},
@@ -297,6 +338,10 @@ def test_rejects_invalid_inputs():
         {"token_to_req": token_to_req[:-1]},
         {"k_scale": None},
         {"output_gate": gate.half()},
+        {"k_sf": None},
+        {"k_cache": k_data.view(fp8.dtype), "v_cache": v_data.view(fp8.dtype)},
+        {"k_cache": fp8, "v_cache": fp8},
+        {"k_cache": fp8, "v_cache": fp8, "k_sf": None, "v_sf": None, "k_scale": None},
     ):
         with pytest.raises(ValueError):
             qsa_sparse_paged_attention(**{**args, **change}, backend="default")
