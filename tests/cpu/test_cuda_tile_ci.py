@@ -70,9 +70,7 @@ def test_ci_installer_uses_shared_cuda_tile_compile_requirements_for_cuda13() ->
     assert 'CUDA_PYTHON="cuda-python==13.4.1"' in installer
     assert 'CUDA_PYTHON="cuda-python==${CUDA_MAJOR}.${CUDA_MINOR}"' in installer
 
-    resolver_install = installer.index(
-        "pip3 install \\\n  -r /install/requirements.txt"
-    )
+    resolver_install = installer.index("-r /install/requirements.txt")
     compiler_install = installer.index(
         'pip3 install --no-deps "${CUDA_TILE_COMPILE_DEPENDENCIES[@]}"'
     )
@@ -80,6 +78,14 @@ def test_ci_installer_uses_shared_cuda_tile_compile_requirements_for_cuda13() ->
         'pip3 install --upgrade --no-deps "${CUDNN_PACKAGE}==${CUDNN_VERSION}"'
     )
     assert resolver_install < compiler_install < cudnn_override
+
+    # The stages must stay in separate Dockerfile layers, most stable first.
+    dockerfile = (REPO_ROOT / "docker" / "Dockerfile.ci").read_text()
+    stage_runs = [
+        dockerfile.index(f'"${{CUDNN_VERSION}}" {stage}\n')
+        for stage in ("torch", "deps", "cudnn")
+    ]
+    assert stage_runs == sorted(stage_runs)
 
 
 @pytest.mark.cpu_only

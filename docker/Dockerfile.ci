@@ -35,7 +35,12 @@ COPY requirements.txt /install/requirements.txt
 COPY build_utils.py /install/build_utils.py
 COPY ci/cuda-versions.json /install/ci/cuda-versions.json
 COPY docker/install/install_python_packages.sh /install/install_python_packages.sh
-RUN bash /install/install_python_packages.sh "${PYTORCH_INDEX}" "${CUDNN_VERSION}"
+# One layer per stage, most stable first (see install_python_packages.sh), so a
+# cuDNN or requirements bump does not invalidate and re-pull the multi-GB torch
+# layer. Keep the arguments identical across the three RUNs.
+RUN bash /install/install_python_packages.sh "${PYTORCH_INDEX}" "${CUDNN_VERSION}" torch
+RUN bash /install/install_python_packages.sh "${PYTORCH_INDEX}" "${CUDNN_VERSION}" deps
+RUN bash /install/install_python_packages.sh "${PYTORCH_INDEX}" "${CUDNN_VERSION}" cudnn
 
 RUN conda install -n "$FLASHINFER_PYTHON_ENV" -y mpi4py mpich
 
