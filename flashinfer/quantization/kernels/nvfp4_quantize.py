@@ -1163,10 +1163,11 @@ class NVFP4QuantizePerTokenKernel:
                     local_amax = fmax_f32(local_amax, block_max)
                     sf_col_idx = sf_col_idx + threads
 
-                warp_amax = warp_reduce(local_amax, fmax_f32)
-                row_amax = block_reduce(
-                    warp_amax, fmax_f32, reduction_buffer, Float32(0.0)
-                )
+                row_amax = warp_reduce(local_amax, fmax_f32)
+                if cutlass.const_expr(self.warps > 1):
+                    row_amax = block_reduce(
+                        row_amax, fmax_f32, reduction_buffer, Float32(0.0)
+                    )
                 global_scale_inv = Float32(mGlobalScaleInv[Int32(0)])
                 global_encode_scale, per_token_scale = self._row_scales(
                     row_amax, global_scale_inv
@@ -1218,7 +1219,8 @@ class NVFP4QuantizePerTokenKernel:
                         mScales[sf_offset] = Uint8(0)
                         sf_col_idx = sf_col_idx + threads
             # A subsequent row reuses the CTA-wide reduction buffer.
-            cute.arch.barrier()
+            if cutlass.const_expr(self.warps > 1):
+                cute.arch.barrier()
 
     @cute.jit
     def _quantize_row_register_resident(
@@ -1287,8 +1289,9 @@ class NVFP4QuantizePerTokenKernel:
                 block_max = hmax_reduce_to_f32(block_max_h2)
             local_amax = fmax_f32(local_amax, block_max)
 
-        warp_amax = warp_reduce(local_amax, fmax_f32)
-        row_amax = block_reduce(warp_amax, fmax_f32, reduction_buffer, Float32(0.0))
+        row_amax = warp_reduce(local_amax, fmax_f32)
+        if cutlass.const_expr(self.warps > 1):
+            row_amax = block_reduce(row_amax, fmax_f32, reduction_buffer, Float32(0.0))
         global_scale_inv = Float32(mGlobalScaleInv[Int32(0)])
         global_encode_scale, per_token_scale = self._row_scales(
             row_amax, global_scale_inv
