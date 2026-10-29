@@ -186,26 +186,26 @@ kernel_cake_mhc_train_bwd_prepare(__nv_bfloat16* __restrict__ dy, __nv_bfloat16*
                 unsigned int dbw[8];
                 #pragma unroll
                 for (int k = 0; k < 8; k++) {
-                    float2 _cvt_f32_0 = cake_bf16x2_to_f32x2(__as_bf16x2(cache[v_1 * 8 + k]));
+                    float2 cvt_f32 = cake_bf16x2_to_f32x2(__as_bf16x2(cache[v_1 * 8 + k]));
                     float _mul_0;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_0) : "f"(post[0]), "f"(_cvt_f32_0.x));
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_0) : "f"(post[0]), "f"(cvt_f32.x));
                     float _mul_1;
-                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_1) : "f"(post[0]), "f"(_cvt_f32_0.y));
-                    float2 _cvt_f32_1 = cake_bf16x2_to_f32x2(__as_bf16x2(cache[(2 + v_1) * 8 + k]));
+                    asm("mul.rn.f32 %0, %1, %2;" : "=f"(_mul_1) : "f"(post[0]), "f"(cvt_f32.y));
+                    float2 cvt_f32_0 = cake_bf16x2_to_f32x2(__as_bf16x2(cache[(2 + v_1) * 8 + k]));
                     float _fma_0;
-                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_0) : "f"(post[1]), "f"(_cvt_f32_1.x), "f"(_mul_0));
+                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_0) : "f"(post[1]), "f"(cvt_f32_0.x), "f"(_mul_0));
                     float _fma_1;
-                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_1) : "f"(post[1]), "f"(_cvt_f32_1.y), "f"(_mul_1));
-                    float2 _cvt_f32_2 = cake_bf16x2_to_f32x2(__as_bf16x2(cache[(4 + v_1) * 8 + k]));
+                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_1) : "f"(post[1]), "f"(cvt_f32_0.y), "f"(_mul_1));
+                    float2 cvt_f32_1 = cake_bf16x2_to_f32x2(__as_bf16x2(cache[(4 + v_1) * 8 + k]));
                     float _fma_2;
-                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_2) : "f"(post[2]), "f"(_cvt_f32_2.x), "f"(_fma_0));
+                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_2) : "f"(post[2]), "f"(cvt_f32_1.x), "f"(_fma_0));
                     float _fma_3;
-                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_3) : "f"(post[2]), "f"(_cvt_f32_2.y), "f"(_fma_1));
-                    float2 _cvt_f32_3 = cake_bf16x2_to_f32x2(__as_bf16x2(cache[(6 + v_1) * 8 + k]));
+                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_3) : "f"(post[2]), "f"(cvt_f32_1.y), "f"(_fma_1));
+                    float2 cvt_f32_2 = cake_bf16x2_to_f32x2(__as_bf16x2(cache[(6 + v_1) * 8 + k]));
                     float _fma_5;
-                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_5) : "f"(post[3]), "f"(_cvt_f32_3.x), "f"(_fma_2));
+                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_5) : "f"(post[3]), "f"(cvt_f32_2.x), "f"(_fma_2));
                     float _fma_6;
-                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_6) : "f"(post[3]), "f"(_cvt_f32_3.y), "f"(_fma_3));
+                    asm("fma.rn.f32 %0, %1, %2, %3;" : "=f"(_fma_6) : "f"(post[3]), "f"(cvt_f32_2.y), "f"(_fma_3));
                     unsigned int hword = __as_u32(__float22bfloat162_rn(make_float2(_fma_5, _fma_6)));
                     dbw[k] = hword;
                 }
