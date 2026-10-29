@@ -1479,6 +1479,11 @@ class Sm100BlockScaledGroupedGemmKernel:
             use_fused_finalize,
             generate_sfc,
         )
+        max_release_cols = (
+            cute.arch.get_max_tmem_alloc_cols("sm_100") // 2
+            if overlap_activation_accumulators is not False
+            else 64
+        )
         if k_steps is None:
             k_steps = self._select_k_steps(
                 mma_tiler_mnk,
@@ -1487,6 +1492,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                 sf_vec_size,
                 num_stages,
                 overlap_activation_accumulators,
+                max_release_cols,
                 self.bulk_output_bytes,
                 use_clc_scheduler,
                 num_tile_info_stages,
@@ -1566,7 +1572,7 @@ class Sm100BlockScaledGroupedGemmKernel:
         self.sfb_cols = self.sf_cols * self.sfb_row_blocks
         scale_cols = self.sf_cols * self.channel_tiles + self.sfb_cols
         self.acc_stages, self.can_overlap_accumulators = self._accumulator_storage(
-            self.acc_cols, scale_cols
+            self.acc_cols, scale_cols, max_release_cols
         )
         self.overlap_activation_accumulators = (
             self.can_overlap_accumulators
@@ -1615,15 +1621,14 @@ class Sm100BlockScaledGroupedGemmKernel:
         )
 
     @staticmethod
-    def _accumulator_storage(acc_cols, scale_cols):
+    def _accumulator_storage(acc_cols, scale_cols, max_release_cols):
         capacity = cute.arch.get_max_tmem_alloc_cols("sm_100")
         stages = min(2, (capacity - scale_cols) // acc_cols)
         if stages < 1:
             raise ValueError("Not enough SM100 tensor memory for one accumulator tile")
-        # The current epilogues release at most 64 columns before the next MMA:
-        # one/two 32-column activation slabs, or the first 64-column bulk slab.
+        # Activation slabs can release the whole window; bulk releases 64 columns.
         # This ownership constraint is separate from the hardware capacity.
-        can_overlap = 2 * acc_cols == capacity and scale_cols <= 64
+        can_overlap = 2 * acc_cols == capacity and scale_cols <= max_release_cols
         return stages, can_overlap
 
     @staticmethod
@@ -1728,6 +1733,7 @@ class Sm100BlockScaledGroupedGemmKernel:
         activation_dtype,
         weight_dtype,
         sf_vec_size,
+        max_release_cols,
         bulk_output_bytes,
         use_clc_scheduler,
         num_tile_info_stages,
@@ -1745,7 +1751,9 @@ class Sm100BlockScaledGroupedGemmKernel:
         )
         if acc_cols + scale_cols > cute.arch.get_max_tmem_alloc_cols("sm_100"):
             return 0, False
-        acc_stages, can_overlap = cls._accumulator_storage(acc_cols, scale_cols)
+        acc_stages, can_overlap = cls._accumulator_storage(
+            acc_cols, scale_cols, max_release_cols
+        )
         stage_bytes = cls._stage_storage_bytes(
             tile_k,
             allocated_n,
@@ -1774,6 +1782,7 @@ class Sm100BlockScaledGroupedGemmKernel:
         sf_vec_size,
         num_stages,
         overlap_activation_accumulators,
+        max_release_cols,
         bulk_output_bytes,
         use_clc_scheduler,
         num_tile_info_stages,
@@ -1806,6 +1815,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                 activation_dtype,
                 weight_dtype,
                 sf_vec_size,
+                max_release_cols,
                 bulk_output_bytes,
                 use_clc_scheduler,
                 num_tile_info_stages,
@@ -1987,6 +1997,7 @@ class Sm100BlockScaledGroupedGemmKernel:
             activation_dtype,
             weight_dtype,
             sf_vec_size,
+            64,
             0,
             False,
             1,
@@ -2281,10 +2292,6 @@ class Sm100BlockScaledGroupedGemmKernel:
             and self.channel_tiles == 1
             and self.epilogue.bulk_tokens > 0
         ) or self.overlap_activation_accumulators
-        if cutlass.const_expr(
-            self.overlap_acc and self.sf_cols * self.channel_tiles + self.sfb_cols > 64
-        ):
-            raise ValueError("Overlapping accumulators require at most 64 SF columns")
         # TMEM scale copies occupy four columns per 128-bit scale atom. The
         # FC1 transpose works in 32-column slabs, so only ownership is rounded.
         sf_footprint = self.sf_cols * self.channel_tiles + self.sfb_cols
