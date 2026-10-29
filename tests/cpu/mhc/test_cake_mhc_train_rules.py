@@ -104,6 +104,12 @@ TOKEN_LIBRARY = {
     "ao22_rae7_pd1_tma_ntr": "cake_mhc_train_bwd_token__ao22_rae7_pd1_tma_ntr",
     "dot_ao8_l2l": "cake_mhc_train_bwd_token__dot_ao8_l2l",
 }
+# The run-time-count records (select rule ``run_time_iters``): record -> the kernel it stands in for at every
+# Sinkhorn count but the compiled one (the count is their ``sinkhorn_iters`` argument, at most SINKHORN_ITERS_MAX).
+RUN_TIME_ITERS = {
+    "cake_mhc_train_fwd_coef__rt64": "cake_mhc_train_fwd_coef",
+    "cake_mhc_train_bwd_token__rt64": "cake_mhc_train_bwd_token",
+}
 SLAB_LIBRARY = {
     "xrsg": "cake_mhc_train_bwd_slab__xrsg",
     "dynr": "cake_mhc_train_bwd_slab__dynr",
@@ -163,6 +169,7 @@ LIBRARY_ARCHES = {
     "cake_mhc_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr": ("sm_107a",),
     "cake_mhc_train_bwd_token__dot_ao8": ("sm_100a", "sm_103a"),
     "cake_mhc_train_bwd_token__dot_ao8_l2l": ("sm_107a",),
+    "cake_mhc_train_bwd_token__rt64": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_train_fn_split": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_train_fn_split__tv128": ("sm_100a", "sm_103a"),
     "cake_mhc_train_fn_split__tv128_t128": ("sm_107a",),
@@ -173,6 +180,7 @@ LIBRARY_ARCHES = {
     "cake_mhc_train_fwd_coef__qe_mb10": ("sm_103a",),
     "cake_mhc_train_fwd_coef__qe_mb10_pu4": ("sm_100a", "sm_103a"),
     "cake_mhc_train_fwd_coef__qe_mb10_tree": ("sm_100a", "sm_103a", "sm_107a"),
+    "cake_mhc_train_fwd_coef__rt64": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_train_fwd_coef__st16_w4_tree": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_train_fwd_coef__st8_lp2": ("sm_100a", "sm_103a"),
@@ -229,7 +237,7 @@ MULTI_RECORDS = {
         "cake_mhc_train_bwd_slab__xrsg__a7",
     ],
 }
-N_RECORDS, N_LIBRARIES = 52, 40
+N_RECORDS, N_LIBRARIES = 54, 42
 RECORD_SCALARS = {
     "cake_mhc_train_fn_split": {"want_t": 0},
     "cake_mhc_train_fn_split__tv128__t": {"want_t": 1},
@@ -1063,6 +1071,7 @@ LAUNCH_FACTS = {
     "cake_mhc_train_fwd_map__nsx_g2_ol2l__a7": ((192, 1, 1), 115712, 2),
     "cake_mhc_train_fwd_map__hi": ((192, 1, 1), 115712, 2),
     "cake_mhc_train_fwd_coef__qe_mb10_tree": ((128, 1, 1), 0, 1),
+    "cake_mhc_train_fwd_coef__rt64": ((128, 1, 1), 0, 1),
     "cake_mhc_train_fwd_coef__st16_w4_tree": ((128, 1, 1), 6400, 1),
     "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd": ((128, 1, 1), 12800, 1),
     "cake_mhc_train_fwd_coef__qe_mb10": ((128, 1, 1), 0, 1),
@@ -1085,6 +1094,7 @@ LAUNCH_FACTS = {
     "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr": ((256, 1, 1), 91136, 2),
     "cake_mhc_train_bwd_token__dot_ao8": ((256, 1, 1), 91136, 2),
     "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__a3": ((256, 1, 1), 91136, 2),
+    "cake_mhc_train_bwd_token__rt64": ((256, 1, 1), 71296, 2),
     "cake_mhc_train_bwd_token__ao22_rae7_pd1_tma_ntr": ((256, 1, 1), 91136, 2),
     "cake_mhc_train_bwd_token__dot_ao8__a3": ((256, 1, 1), 91136, 2),
     "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr__a3": ((256, 1, 1), 91136, 2),
@@ -1128,6 +1138,7 @@ RECORD_ARCHES = {
     "cake_mhc_train_fwd_coef__g2_el": ("sm_107a",),
     "cake_mhc_train_fwd_coef__st8_lp2_tree_asel_qd": ("sm_107a",),
     "cake_mhc_train_fwd_coef__lp2_w8_adj_qe": ("sm_107a",),
+    "cake_mhc_train_fwd_coef__rt64": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_train_fwd_collapse": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_train_fwd_finish": ("sm_100a", "sm_103a"),
     "cake_mhc_train_fwd_finish__r2": ("sm_107a",),
@@ -1146,6 +1157,7 @@ RECORD_ARCHES = {
     "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__a7": ("sm_107a",),
     "cake_mhc_train_bwd_token__dot_ao8_l2l": ("sm_107a",),
     "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr__a7": ("sm_107a",),
+    "cake_mhc_train_bwd_token__rt64": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_train_bwd_slab__dynr": ("sm_100a", "sm_103a"),
     "cake_mhc_train_bwd_slab__xrsg": ("sm_100a", "sm_103a"),
     "cake_mhc_train_bwd_slab__xrsg__a7": ("sm_107a",),
@@ -1639,7 +1651,7 @@ def test_records_are_consistent() -> None:
     assert set(libraries) == {
         *SPLIT_LIBRARY.values(), *MAP_LIBRARY.values(), *COEF_LIBRARY.values(), *TOKEN_LIBRARY.values(),
         *SLAB_LIBRARY.values(), *REDUCE_LIBRARY.values(), *FINISH_LIBRARY.values(), *EVERYWHERE,
-        *K5_FORM_LIBRARY.values(),
+        *K5_FORM_LIBRARY.values(), *RUN_TIME_ITERS,
     }  # fmt: skip
     for library, names in MULTI_RECORDS.items():
         # several records, or one record not named after its library (the `__hi` / `__t` records)
@@ -1714,6 +1726,15 @@ def test_records_are_consistent() -> None:
                 assert all(
                     len(span) == 2 and span[0] >= 0 for span in rule["ranges"]
                 ), name
+            elif rule["kind"] == "run_time_iters":
+                # the run-time-count records: named after their library, launched at every count but the compiled one
+                assert (
+                    set(rule) == {"kind"}
+                    and name in RUN_TIME_ITERS
+                    and name == record["library"]
+                ), name
+                assert _is(name, RUN_TIME_ITERS[name]), name
+                assert record["logical"].get("sinkhorn_iters") == "sinkhorn_iters", name
             elif rule["kind"] == "program":
                 assert (
                     set(rule) == {"kind", "rule", "program"}
@@ -1836,8 +1857,9 @@ def test_records_are_consistent() -> None:
         else:
             slabs = [SLAB_LIBRARY[loader.BWD_SLAB_PROGRAM[arch]]]
         reduces = _first_programs(loader.bwd_reduce_program, arch, sms)
+        # the token-owner run-time-count record closes the token-owner records
         assert libs(loader.ROUTES[arch]["bwd_finish_h4096"]) == [
-            split, *tokens, *slabs, *[REDUCE_LIBRARY[p] for p in reduces]
+            split, *tokens, "cake_mhc_train_bwd_token__rt64", *slabs, *[REDUCE_LIBRARY[p] for p in reduces]
         ], arch  # fmt: skip
         assert loader.ROUTES[arch]["bwd_finish_h4096"][0] == f"{split}__t"
         # the fn split records launch their program's fixed grid (the rules' fn_split_grid / fn_split_grid_t columns)
@@ -1864,7 +1886,9 @@ def test_records_are_consistent() -> None:
             for T in DISPATCH_T
             for sm in SM_COUNTS
         }, arch
-        assert set(coefs) == {
+        # the coefficient-pass records the rules dispatch, then the run-time-count record
+        assert coefs[-1] == "cake_mhc_train_fwd_coef__rt64", arch
+        assert set(coefs[:-1]) == {
             COEF_LIBRARY[loader.fwd_coef_program(T, sm, arch)]
             for T in DISPATCH_T
             for sm in SM_COUNTS
@@ -2245,8 +2269,9 @@ def test_launch_grids_follow_the_rules(
             assert grid(name) == (row["k1_grid"], 1, 1), name
         program_of = {library: program for program, library in COEF_LIBRARY.items()}
         for name in (n for n in modules if _is(n, "cake_mhc_train_fwd_coef")):
-            program = program_of[modules[name]["library"]]
-            assert grid(name) == (-(-T // COEF_TOKENS_PER_CTA[program]), 1, 1), name
+            program = program_of.get(modules[name]["library"])
+            tokens = 8 if name in RUN_TIME_ITERS else COEF_TOKENS_PER_CTA[program]
+            assert grid(name) == (-(-T // tokens), 1, 1), name
         assert grid(COEF_LIBRARY[row["fwd_coef_program"]]) == (
             -(-T // COEF_TOKENS_PER_CTA[row["fwd_coef_program"]]),
             1,
@@ -2317,7 +2342,7 @@ def test_launch_grids_follow_the_rules(
             assert selected == K5_FORM_LIBRARY[form] or selected.startswith(
                 K5_FORM_LIBRARY[form] + "__"
             ), (arch, T, selected)
-        for name in TOKEN_LIBRARY.values():
+        for name in (*TOKEN_LIBRARY.values(), "cake_mhc_train_bwd_token__rt64"):
             assert grid(name) == (row["G6"], 1, 1), name
         for name in SLAB_LIBRARY.values():
             assert grid(name) == (row["k7_grid"], 1, 1), name
@@ -2464,3 +2489,44 @@ def test_route_glue() -> None:
             else:
                 with pytest.raises(RuntimeError, match=f"not delivered for {arch}"):
                     loader.library_name(name, arch)
+
+
+@pytest.mark.cpu_only
+def test_run_time_count_rule_and_bound() -> None:
+    assert loader.SINKHORN_ITERS_MAX == 64
+    assert "run_time_iters" in loader.SELECT_RULE_KINDS
+
+
+@pytest.mark.cpu_only
+def test_selection_by_sinkhorn_count() -> None:
+    """At 20 no run-time-count record is selected. At another count the coefficient
+    and token-owner passes select exactly their run-time-count record, and every
+    other kernel the default's record, on every board and route."""
+    run_time = {
+        name
+        for name, record in loader.MODULES.items()
+        if (record["select_rule"] or {}).get("kind") == "run_time_iters"
+    }
+    assert run_time == set(RUN_TIME_ITERS)
+    roles = {loader.MODULES[name]["role"]: name for name in run_time}
+    assert set(roles) == {"fwd_coef", "bwd_token"}
+    for arch, sm in BOARDS:
+        for kind in loader.KINDS:
+            for T in (1, 7, 129, 1024, 2049, 4096, 8192, 14928, 16263, 32768, 65536):
+                default = loader.selected_modules(arch, 4096, kind, rows=T, sm_count=sm)
+                assert not set(default) & run_time, (arch, kind, T)
+                assert default == loader.selected_modules(
+                    arch, 4096, kind, rows=T, sm_count=sm, sinkhorn_iters=20
+                )
+                for iters in (1, 19, 21, 64):
+                    other = loader.selected_modules(
+                        arch, 4096, kind, rows=T, sm_count=sm, sinkhorn_iters=iters
+                    )
+                    expected = tuple(
+                        roles.get(loader.MODULES[name]["role"], name)
+                        for name in default
+                    )
+                    assert other == expected, (arch, kind, T, iters)
+                    assert other == tuple(
+                        n for n in loader.route_modules(arch, 4096, kind) if n in other
+                    )

@@ -603,16 +603,16 @@ kernel_cake_mhc_train_fwd_map__nsx(const __grid_constant__ CUtensorMap X, const 
                                 : "=f"(_dot_0) : "r"(words[h * 16 + i]), "r"(words[h * 16 + i]), "f"(part[h]));
                             part[h] = _dot_0;
                         }
-                        float _sub_0;
-                        asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_0) : "f"(part[h]), "f"(qcomp[0]));
-                        float _add_0;
-                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_0) : "f"(qsum[0]), "f"(_sub_0));
+                        float sub;
+                        asm("sub.rn.f32 %0, %1, %2;" : "=f"(sub) : "f"(part[h]), "f"(qcomp[0]));
+                        float add;
+                        asm("add.rn.f32 %0, %1, %2;" : "=f"(add) : "f"(qsum[0]), "f"(sub));
                         float _sub_2;
-                        asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_2) : "f"(_add_0), "f"(qsum[0]));
+                        asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_2) : "f"(add), "f"(qsum[0]));
                         float _sub_1;
-                        asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_1) : "f"(_sub_2), "f"(_sub_0));
+                        asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_1) : "f"(_sub_2), "f"(sub));
                         qcomp[0] = _sub_1;
-                        qsum[0] = _add_0;
+                        qsum[0] = add;
                     }
                     __syncwarp();
                     if (elect_sync()) {
@@ -639,16 +639,16 @@ kernel_cake_mhc_train_fwd_map__nsx(const __grid_constant__ CUtensorMap X, const 
                         if (rc_stage == 2) { rc_stage = 0; _phase_big_full ^= 1; }
                         #pragma unroll
                         for (int n_1 = 0; n_1 < 24; n_1++) {
-                            float _sub_1_1;
-                            asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_1_1) : "f"(_tmem_load_0[n_1]), "f"(comp[n_1]));
-                            float _add_1;
-                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_1) : "f"(acc[n_1]), "f"(_sub_1_1));
+                            float sub_1;
+                            asm("sub.rn.f32 %0, %1, %2;" : "=f"(sub_1) : "f"(_tmem_load_0[n_1]), "f"(comp[n_1]));
+                            float add_1;
+                            asm("add.rn.f32 %0, %1, %2;" : "=f"(add_1) : "f"(acc[n_1]), "f"(sub_1));
                             float _sub_4;
-                            asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_4) : "f"(_add_1), "f"(acc[n_1]));
+                            asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_4) : "f"(add_1), "f"(acc[n_1]));
                             float _sub_3;
-                            asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_3) : "f"(_sub_4), "f"(_sub_1_1));
+                            asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_3) : "f"(_sub_4), "f"(sub_1));
                             comp[n_1] = _sub_3;
-                            acc[n_1] = _add_1;
+                            acc[n_1] = add_1;
                         }
                     }
                 }
@@ -669,16 +669,16 @@ kernel_cake_mhc_train_fwd_map__nsx(const __grid_constant__ CUtensorMap X, const 
                 _phase_small_full ^= 1;
                 #pragma unroll
                 for (int n_2 = 0; n_2 < 24; n_2++) {
-                    float _sub_2_1;
-                    asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_2_1) : "f"(_tmem_load_1[n_2]), "f"(comp[n_2]));
-                    float _add_2;
-                    asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_2) : "f"(acc[n_2]), "f"(_sub_2_1));
+                    float sub_2;
+                    asm("sub.rn.f32 %0, %1, %2;" : "=f"(sub_2) : "f"(_tmem_load_1[n_2]), "f"(comp[n_2]));
+                    float add_2;
+                    asm("add.rn.f32 %0, %1, %2;" : "=f"(add_2) : "f"(acc[n_2]), "f"(sub_2));
                     float _sub_6;
-                    asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_6) : "f"(_add_2), "f"(acc[n_2]));
+                    asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_6) : "f"(add_2), "f"(acc[n_2]));
                     float _sub_5;
-                    asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_5) : "f"(_sub_6), "f"(_sub_2_1));
+                    asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_5) : "f"(_sub_6), "f"(sub_2));
                     comp[n_2] = _sub_5;
-                    acc[n_2] = _add_2;
+                    acc[n_2] = add_2;
                 }
                 float out[24];
                 #pragma unroll

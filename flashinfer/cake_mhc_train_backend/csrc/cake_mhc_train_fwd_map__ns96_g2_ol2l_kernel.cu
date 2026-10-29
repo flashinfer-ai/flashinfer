@@ -298,16 +298,16 @@ kernel_cake_mhc_train_fwd_map__ns96_g2_ol2l(const __grid_constant__ CUtensorMap 
                         tma_3d_gmem2smem(b1_s_addr + slot_j * 28672, (&FNP), k0, 0, 0, a_full_addr + (((l_stage + 2 >= 4) ? l_stage + 2 - 4 : l_stage + 2)) * 8);
                         tma_3d_gmem2smem(b2_s_addr + slot_j * 28672, (&FNP), k0, 0, 1, a_full_addr + (((l_stage + 2 >= 4) ? l_stage + 2 - 4 : l_stage + 2)) * 8);
                         tma_3d_gmem2smem(b3_s_addr + slot_j * 28672, (&FNP), k0, 0, 2, a_full_addr + (((l_stage + 2 >= 4) ? l_stage + 2 - 4 : l_stage + 2)) * 8);
-                        int k0_1 = k_base + (st + 1) * 64;
+                        int k0_0 = k_base + (st + 1) * 64;
                         mbarrier_arrive_expect_tx(a_full_addr + (((l_stage + 3 >= 4) ? l_stage + 3 - 4 : l_stage + 3)) * 8, 28672);
                         asm volatile(
                             "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                             " [%0], [%1, {%2, %3}], [%4], %5;"
-                            :: "r"(a_s_addr + slot_j_0 * 28672), "l"((&X)), "r"(k0_1), "r"(t0),
+                            :: "r"(a_s_addr + slot_j_0 * 28672), "l"((&X)), "r"(k0_0), "r"(t0),
                                "r"(a_full_addr + (((l_stage + 3 >= 4) ? l_stage + 3 - 4 : l_stage + 3)) * 8), "l"(0x12F0000000000000ULL) : "memory");
-                        tma_3d_gmem2smem(b1_s_addr + slot_j_0 * 28672, (&FNP), k0_1, 0, 0, a_full_addr + (((l_stage + 3 >= 4) ? l_stage + 3 - 4 : l_stage + 3)) * 8);
-                        tma_3d_gmem2smem(b2_s_addr + slot_j_0 * 28672, (&FNP), k0_1, 0, 1, a_full_addr + (((l_stage + 3 >= 4) ? l_stage + 3 - 4 : l_stage + 3)) * 8);
-                        tma_3d_gmem2smem(b3_s_addr + slot_j_0 * 28672, (&FNP), k0_1, 0, 2, a_full_addr + (((l_stage + 3 >= 4) ? l_stage + 3 - 4 : l_stage + 3)) * 8);
+                        tma_3d_gmem2smem(b1_s_addr + slot_j_0 * 28672, (&FNP), k0_0, 0, 0, a_full_addr + (((l_stage + 3 >= 4) ? l_stage + 3 - 4 : l_stage + 3)) * 8);
+                        tma_3d_gmem2smem(b2_s_addr + slot_j_0 * 28672, (&FNP), k0_0, 0, 1, a_full_addr + (((l_stage + 3 >= 4) ? l_stage + 3 - 4 : l_stage + 3)) * 8);
+                        tma_3d_gmem2smem(b3_s_addr + slot_j_0 * 28672, (&FNP), k0_0, 0, 2, a_full_addr + (((l_stage + 3 >= 4) ? l_stage + 3 - 4 : l_stage + 3)) * 8);
                     }
                 }
             }
@@ -454,16 +454,16 @@ kernel_cake_mhc_train_fwd_map__ns96_g2_ol2l(const __grid_constant__ CUtensorMap 
                                 : "=f"(_dot_0) : "r"(words[h * 16 + i]), "r"(words[h * 16 + i]), "f"(part[h]));
                             part[h] = _dot_0;
                         }
-                        float _sub_0;
-                        asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_0) : "f"(part[h]), "f"(qcomp[0]));
-                        float _add_0;
-                        asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_0) : "f"(qsum[0]), "f"(_sub_0));
+                        float sub;
+                        asm("sub.rn.f32 %0, %1, %2;" : "=f"(sub) : "f"(part[h]), "f"(qcomp[0]));
+                        float add;
+                        asm("add.rn.f32 %0, %1, %2;" : "=f"(add) : "f"(qsum[0]), "f"(sub));
                         float _sub_2;
-                        asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_2) : "f"(_add_0), "f"(qsum[0]));
+                        asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_2) : "f"(add), "f"(qsum[0]));
                         float _sub_1;
-                        asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_1) : "f"(_sub_2), "f"(_sub_0));
+                        asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_1) : "f"(_sub_2), "f"(sub));
                         qcomp[0] = _sub_1;
-                        qsum[0] = _add_0;
+                        qsum[0] = add;
                     }
                     __syncwarp();
                     if (elect_sync()) {
@@ -484,16 +484,16 @@ kernel_cake_mhc_train_fwd_map__ns96_g2_ol2l(const __grid_constant__ CUtensorMap 
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
                         #pragma unroll
                         for (int n_1 = 0; n_1 < 24; n_1++) {
-                            float _sub_1_1;
-                            asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_1_1) : "f"(_tmem_load_0[n_1]), "f"(comp[n_1]));
-                            float _add_1;
-                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_1) : "f"(acc[n_1]), "f"(_sub_1_1));
+                            float sub_1;
+                            asm("sub.rn.f32 %0, %1, %2;" : "=f"(sub_1) : "f"(_tmem_load_0[n_1]), "f"(comp[n_1]));
+                            float add_1;
+                            asm("add.rn.f32 %0, %1, %2;" : "=f"(add_1) : "f"(acc[n_1]), "f"(sub_1));
                             float _sub_4;
-                            asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_4) : "f"(_add_1), "f"(acc[n_1]));
+                            asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_4) : "f"(add_1), "f"(acc[n_1]));
                             float _sub_3;
-                            asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_3) : "f"(_sub_4), "f"(_sub_1_1));
+                            asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_3) : "f"(_sub_4), "f"(sub_1));
                             comp[n_1] = _sub_3;
-                            acc[n_1] = _add_1;
+                            acc[n_1] = add_1;
                         }
                         float _tmem_load_1[32];
                         asm volatile(
@@ -504,16 +504,16 @@ kernel_cake_mhc_train_fwd_map__ns96_g2_ol2l(const __grid_constant__ CUtensorMap 
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
                         #pragma unroll
                         for (int n_2 = 0; n_2 < 24; n_2++) {
-                            float _sub_2_1;
-                            asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_2_1) : "f"(_tmem_load_1[n_2]), "f"(comp[n_2]));
-                            float _add_2;
-                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_2) : "f"(acc[n_2]), "f"(_sub_2_1));
+                            float sub_2;
+                            asm("sub.rn.f32 %0, %1, %2;" : "=f"(sub_2) : "f"(_tmem_load_1[n_2]), "f"(comp[n_2]));
+                            float add_2;
+                            asm("add.rn.f32 %0, %1, %2;" : "=f"(add_2) : "f"(acc[n_2]), "f"(sub_2));
                             float _sub_6;
-                            asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_6) : "f"(_add_2), "f"(acc[n_2]));
+                            asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_6) : "f"(add_2), "f"(acc[n_2]));
                             float _sub_5;
-                            asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_5) : "f"(_sub_6), "f"(_sub_2_1));
+                            asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_5) : "f"(_sub_6), "f"(sub_2));
                             comp[n_2] = _sub_5;
-                            acc[n_2] = _add_2;
+                            acc[n_2] = add_2;
                         }
                         float _tmem_load_2[32];
                         asm volatile(
@@ -530,16 +530,16 @@ kernel_cake_mhc_train_fwd_map__ns96_g2_ol2l(const __grid_constant__ CUtensorMap 
                         if (rc_stage == 2) { rc_stage = 0; _phase_big_full ^= 1; }
                         #pragma unroll
                         for (int n_3 = 0; n_3 < 24; n_3++) {
-                            float _sub_3_1;
-                            asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_3_1) : "f"(_tmem_load_2[n_3]), "f"(comp[n_3]));
-                            float _add_3;
-                            asm("add.rn.f32 %0, %1, %2;" : "=f"(_add_3) : "f"(acc[n_3]), "f"(_sub_3_1));
+                            float sub_3;
+                            asm("sub.rn.f32 %0, %1, %2;" : "=f"(sub_3) : "f"(_tmem_load_2[n_3]), "f"(comp[n_3]));
+                            float add_3;
+                            asm("add.rn.f32 %0, %1, %2;" : "=f"(add_3) : "f"(acc[n_3]), "f"(sub_3));
                             float _sub_8;
-                            asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_8) : "f"(_add_3), "f"(acc[n_3]));
+                            asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_8) : "f"(add_3), "f"(acc[n_3]));
                             float _sub_7;
-                            asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_7) : "f"(_sub_8), "f"(_sub_3_1));
+                            asm("sub.rn.f32 %0, %1, %2;" : "=f"(_sub_7) : "f"(_sub_8), "f"(sub_3));
                             comp[n_3] = _sub_7;
-                            acc[n_3] = _add_3;
+                            acc[n_3] = add_3;
                         }
                     }
                 }

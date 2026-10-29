@@ -80,7 +80,9 @@ DEEPK_C2_KG1_ROUTE = "deepk_c2_kg1_non_kg4_k_blocks"
 DEEPK_C2_SCALAR_OUTPUT_ROUTE = "deepk_c2_scalar_output"
 DEEPK_C2_KG1_DIRECT_STORE_ROUTE = "deepk_c2_kg1_direct_store_m32"
 # The KG1 program with 128 x 64 tiles: a KG1 launch of more than
-# DIRECT_STORE_MAX_ROWS rows whose 128 x 64 tiles fit in one wave (see _launch_plan).
+# DIRECT_STORE_MAX_ROWS rows whose 128 x 64 tiles fit in one wave, and an AB6
+# launch of more than DIRECT_STORE_MAX_ROWS rows that is a single 128 x 128 tile
+# at K = 512 (see _launch_plan).
 DEEPK_C2_KG1_N64_ROUTE = "deepk_c2_kg1_n64_k_blocks"
 DEEPK_C2_AB6_SCALE1_DIRECT_STORE_ROUTE = "deepk_c2_ab6_scale1_direct_store_m32"
 DEEPK_N256_ROUTE = "deepk_n256_ab4_three_panel_kg4"
@@ -782,7 +784,8 @@ def launch_plan(
     with the SM count.  A KG1 / AB6 launch of at most ``DIRECT_STORE_MAX_ROWS``
     rows on at most ``DIRECT_STORE_MAX_CTAS`` CTAs runs that route's
     direct-store program; a KG1 launch of more rows whose 128 x 64 tiles fit
-    in one wave runs the KG1 program with 128 x 64 tiles.
+    in one wave runs the KG1 program with 128 x 64 tiles, and so does an AB6
+    launch of more rows that is a single 128 x 128 tile at K = 512.
     """
     return _launch_plan(
         m,
@@ -858,6 +861,18 @@ def _launch_plan(
         n64_tiles = math.ceil(m / 128) * math.ceil(n / 64)
         if n64_tiles <= sm_count:
             route, grid = DEEPK_C2_KG1_N64_ROUTE, (n64_tiles, 1, 1)
+    elif (
+        route == DEEPK_C2_AB6_SCALE1_ROUTE
+        and m > DIRECT_STORE_MAX_ROWS
+        and math.ceil(m / 128) * math.ceil(n / 128) == 1
+        and k == 512
+    ):
+        # Both programs compute each output element with the same MMA chain, so
+        # the bytes are the same; two 128 x 64 tiles finish sooner than one tile.
+        route, grid = (
+            DEEPK_C2_KG1_N64_ROUTE,
+            (math.ceil(m / 128) * math.ceil(n / 64), 1, 1),
+        )
     return route, grid
 
 
