@@ -24,6 +24,7 @@ visible or the KCP programs are not exported yet) and one process per Slurm task
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import socket
@@ -921,3 +922,152 @@ def test_module_imports_only_torch_and_its_package() -> None:
                 assert a.name in allowed, a.name
         elif isinstance(node, ast.ImportFrom) and node.level == 0:
             assert node.module in allowed, node.module
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Checkpoint recompute (issue #7815): ``chunk_kda_kcp`` under ``torch.utils.checkpoint``.  Rows: ``ROWS`` plus one
+# H = 64 row (``P = 1`` ranks); under a Slurm step of 8 or 16 tasks also the rows of that width (``CKPT_WIDE``; a
+# one-node run has no such rows, so they never show up as skips there).
+
+CKPT_WIDE = {
+    8: [
+        ((3000,), 4, 8, "zigzag"),
+        ((2048, 5, 3000, 1), 4, 8, "zigzag_per_document"),
+        ((6, 1, 2, 3, 4000), 4, 8, "ragged:1,1,1,3,0,2,4000,4"),
+    ],
+    16: [
+        ((3000,), 4, 16, "zigzag"),
+        ((2048, 5, 3000, 1), 4, 16, "zigzag_per_document"),
+    ],
+}
+CKPT_ROWS = (
+    ROWS
+    + [((2048, 5, 3000, 1), 64, 4, "zigzag_per_document")]
+    + CKPT_WIDE.get(int(os.environ.get("SLURM_NTASKS", "0") or 0), [])
+)
+
+
+def _requested(device) -> int:
+    return int(torch.cuda.memory_stats(device).get("requested_bytes.all.current", 0))
+
+
+def _run_rank_ckpt(
+    rank: int, W: int, row, port: int, result_dir: str | None, local_id: int
+) -> dict:
+    """One rank of a checkpoint row: #7039 retained bytes after a checkpointed forward without a handle (per-call
+    and caller-held workspace, after a warm-up step of the same form)."""
+    from torch.utils.checkpoint import checkpoint
+
+    lengths, H, _w, layout = row
+    device = torch.device("cuda", local_id % max(torch.cuda.device_count(), 1))
+    torch.cuda.set_device(device)
+    if not dist.is_initialized():
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", str(port))
+        dist.init_process_group("nccl", rank=rank, world_size=W, device_id=device)
+    group = dist.group.WORLD
+    part, cu = _partition(lengths, W, layout)
+    ctx = cake_kcp_plan.build_kcp_context(part, group, rank, device)
+    glob = make_inputs(lengths, H, device)
+    ops = _local_slices(part, rank, cu, glob)
+    q, k, v, g, beta, dout = (ops[n] for n in ("q", "k", "v", "g", "beta", "dout"))
+    ws = cake_kcp.KcpWorkspace()
+    flags: dict[str, bool] = {}
+    info: dict[str, object] = {"T_r": int(q.shape[0]), "n_in": int(ctx.n_in)}
+
+    def leaves():
+        return [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
+
+    # #7039: retained bytes after a checkpointed forward without a handle (the output alone)
+    retained = {}
+    for form, wsp in (("per_call", None), ("caller_ws", ws)):
+
+        def fn(*a, _w=wsp):
+            return cake_kcp.chunk_kda_kcp(*a, ctx, None, "light", "saved", _w)
+
+        for step in ("warm", "measure"):
+            lv = leaves()
+            torch.cuda.synchronize(device)
+            gc.collect()
+            before = _requested(device)
+            out = checkpoint(fn, *lv, use_reentrant=False)
+            torch.cuda.synchronize(device)
+            if step == "measure":
+                retained[form] = (
+                    _requested(device) - before - out.numel() * out.element_size()
+                )
+            out.backward(dout)
+            del out, lv
+    info["retained_bytes"] = retained
+    flags["retained_zero"] = all(v_ == 0 for v_ in retained.values())
+
+    flag_list = [None] * W
+    info_list = [None] * W
+    dist.all_gather_object(flag_list, flags)
+    dist.all_gather_object(info_list, info)
+    report = {
+        "world": W,
+        "row": _row_id(row),
+        "torch": torch.__version__,
+        "flags": {key: all(f[key] for f in flag_list) for key in flags},
+        "failing_ranks": {
+            key: [r for r, f in enumerate(flag_list) if not f[key]] for key in flags
+        },
+        "info_by_rank": info_list,
+    }
+    report["pass"] = all(report["flags"].values())
+    dist.barrier()
+    if rank == 0 and result_dir:
+        os.makedirs(result_dir, exist_ok=True)
+        with open(
+            os.path.join(result_dir, "ckpt-" + _row_id(row) + ".json"), "w"
+        ) as fh:
+            json.dump(report, fh, indent=1, default=str)
+    return report
+
+
+def _spawn_entry_ckpt(rank: int, W: int, row, port: int, result_dir: str) -> None:
+    try:
+        report = _run_rank_ckpt(rank, W, row, port, result_dir, rank)
+        if not report["pass"]:
+            raise AssertionError(f"rank {rank}: {report}")
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("row", CKPT_ROWS, ids=_row_id)
+def test_checkpoint_recompute_rows(row) -> None:
+    """The checkpoint rows of ``_run_rank_ckpt`` on every rank of the row."""
+    W = row[2]
+    ntasks = int(os.environ.get("SLURM_NTASKS", "1") or 1)
+    if os.environ.get("SLURM_PROCID") is not None and ntasks > 1:
+        if ntasks != W:
+            pytest.skip(f"a {ntasks}-task Slurm step runs the W={ntasks} rows only")
+        if not _programs_exported():
+            pytest.skip(
+                "the KCP programs are not exported in the package's build.json yet"
+            )
+        report = _run_rank_ckpt(
+            int(os.environ["SLURM_PROCID"]),
+            W,
+            row,
+            int(os.environ.get("MASTER_PORT", "29500")),
+            os.environ.get("KCP_TEST_RESULT_DIR"),
+            int(os.environ.get("SLURM_LOCALID", "0")),
+        )
+        assert report["pass"], report
+        return
+    _skip_unless_runnable(W)
+    with tempfile.TemporaryDirectory(prefix="cake_kcp_ckpt_") as tmp:
+        result_dir = os.environ.get("KCP_TEST_RESULT_DIR") or tmp
+        mp.start_processes(
+            _spawn_entry_ckpt,
+            args=(W, row, _free_port(), result_dir),
+            nprocs=W,
+            join=True,
+            start_method="spawn",
+        )
+        with open(os.path.join(result_dir, "ckpt-" + _row_id(row) + ".json")) as fh:
+            report = json.load(fh)
+    assert report["pass"], report

@@ -3455,6 +3455,66 @@ def test_gpu_table_parity(device, case) -> None:
     assert not failures, f"table parity failures (rank, table): {failures}"
 
 
+# --------------------------------------------------------------------------- checkpoint recompute (issue #7815)
+# One rank here (world == 1: the KCP collectives of one rank are local copies, counted by the call's own
+# ``n_collectives``); the NCCL rows with per-phase collective counts are in test_cake_kda_train_kcp_dist.py.
+
+CKPT_ROWS = [((3000,), 2), ((300, 724, 476), 2), ((300, 724, 476), 64)]
+CKPT_IDS = [f"s{'_'.join(map(str, lens))}-h{H}" for lens, H in CKPT_ROWS]
+
+
+def _ckpt_problem(device, lengths, H):
+    """A one-rank problem: the context, the operands (the delta rule's contract) and ``dout``."""
+    from tests.test_helpers.cake_kda_train_reference import make_inputs
+
+    cu = [0]
+    for n in lengths:
+        cu.append(cu[-1] + n)
+    part = kp.kcp_partition(cu, 1)
+    ctx = kp.build_kcp_context(part, None, 0, device)
+    ops = make_inputs(lengths, H, device)
+    names = ("q", "k", "v", "g", "beta", "dout")
+    return ctx, {n: ops[n].to(device).contiguous() for n in names}
+
+
+def _requested_bytes(device) -> int:
+    return int(torch.cuda.memory_stats(device).get("requested_bytes.all.current", 0))
+
+
+@pytest.mark.parametrize("lengths,H", CKPT_ROWS, ids=CKPT_IDS)
+def test_gpu_checkpoint_retains_nothing_without_a_handle(device, lengths, H) -> None:
+    """#7039 for KDA (``recompute_handle=None``): after a non-reentrant checkpointed forward of ``chunk_kda_kcp``
+    (after a warm-up step of the same form) the bytes still requested are the output's alone -- the saved set is
+    released by the checkpoint and nothing else keeps a tensor -- with a per-call and with a caller-held workspace."""
+    from torch.utils.checkpoint import checkpoint
+
+    ctx, ops = _ckpt_problem(device, lengths, H)
+    ws = cake_kcp.KcpWorkspace()
+    retained = {}
+    for form, wsp in (("per_call", None), ("caller_ws", ws)):
+
+        def fn(*a, _w=wsp):
+            return cake_kcp.chunk_kda_kcp(*a, ctx, None, "light", "saved", _w)
+
+        for step in ("warm", "measure"):
+            leaves = [
+                ops[n].detach().clone().requires_grad_(True)
+                for n in ("q", "k", "v", "g", "beta")
+            ]
+            torch.cuda.synchronize(device)
+            gc.collect()
+            before = _requested_bytes(device)
+            out = checkpoint(fn, *leaves, use_reentrant=False)
+            torch.cuda.synchronize(device)
+            if step == "measure":
+                retained[form] = (
+                    _requested_bytes(device) - before - out.numel() * out.element_size()
+                )
+            out.backward(ops["dout"])
+            del out, leaves
+    assert retained == {"per_call": 0, "caller_ws": 0}, retained
+
+
 # --------------------------------------------------------------------------- FP64 fake backend (`-k fake`)
 
 
