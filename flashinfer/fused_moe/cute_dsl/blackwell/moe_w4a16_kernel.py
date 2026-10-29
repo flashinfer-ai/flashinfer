@@ -1876,19 +1876,11 @@ class Sm100W4A16GroupedGemmKernel:
                     )
 
                     a_load2trans_producer_state.reset_count()
-                    peek_load2trans_empty_status = cutlass.Boolean(1)
-                    if a_load2trans_producer_state.count < k_tile_cnt:
-                        peek_load2trans_empty_status = (
-                            a_load2trans_pipeline.producer_try_acquire(
-                                a_load2trans_producer_state
-                            )
-                        )
                     for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                         if cutlass.const_expr(self.enable_iket):
                             _iket.range_push("weight_tma_empty")
                         a_load2trans_pipeline.producer_acquire(
                             a_load2trans_producer_state,
-                            peek_load2trans_empty_status,
                         )
                         if cutlass.const_expr(self.enable_iket):
                             _iket.range_pop()
@@ -1920,12 +1912,6 @@ class Sm100W4A16GroupedGemmKernel:
                         if cutlass.const_expr(self.enable_iket):
                             _iket.range_pop()
                         a_load2trans_producer_state.advance()
-                        if a_load2trans_producer_state.count < k_tile_cnt:
-                            peek_load2trans_empty_status = (
-                                a_load2trans_pipeline.producer_try_acquire(
-                                    a_load2trans_producer_state
-                                )
-                            )
 
                     tile_info_pipeline.consumer_wait(tile_info_consumer_state)
                     work_tile = mixed_input_utils.make_contiguous_group_work_tile_info(
