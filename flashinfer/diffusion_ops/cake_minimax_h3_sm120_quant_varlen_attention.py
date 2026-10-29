@@ -901,7 +901,9 @@ def _minimax_h3_sm120_varlen_attention_fp8_impl(
                 1,
             )
             # the producers leave their ready and done words set; the call restarts them (stream order)
-            (hctr if isinstance(hctr, torch.Tensor) else torch.from_dlpack(hctr)).zero_()
+            (
+                hctr if isinstance(hctr, torch.Tensor) else torch.from_dlpack(hctr)
+            ).zero_()
         else:
             stats(
                 k,
