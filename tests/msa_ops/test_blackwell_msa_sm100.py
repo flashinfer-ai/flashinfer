@@ -564,6 +564,80 @@ CASES = [
         ),
         id="decode-paged-bf16-m16-ragged",
     ),
+    # L2 evict-first paged BF16 decode: eight requests of eight queries over
+    # four KV heads (256 work items, under two waves) with a longest context
+    # above 40960 tokens; the hinted program on compute capability 10.0 and
+    # 10.3, the unhinted one elsewhere, both against the same reference.
+    pytest.param(
+        _attention_case(
+            "sparse_decode",
+            q_dtype="bfloat16",
+            kv_dtype="bfloat16",
+            kv_layout="paged",
+            batch_size=8,
+            seqlen_q=8,
+            kv_lens=[41088, 40960, 1024, 896, 768, 640, 512, 384],
+            num_q_heads=32,
+            num_kv_heads=4,
+            topk=16,
+            causal=True,
+            seed=77,
+            force_fused=True,
+        ),
+        id="decode-paged-bf16-q8-gqa8-l2ef-batch8",
+    ),
+    # Persistent K-major prefill route: paged GQA-16 above 64 pages, paged
+    # GQA-8 at 64 pages (captured) and flat GQA-16 above 64 KV blocks, every
+    # batch with a request below the long route's 8192-query threshold.
+    pytest.param(
+        _attention_case(
+            "sparse_prefill",
+            q_dtype="bfloat16",
+            kv_dtype="bfloat16",
+            kv_layout="paged",
+            q_lens=[700, 300],
+            kv_lens=[8320, 8300],
+            num_q_heads=16,
+            num_kv_heads=1,
+            topk=16,
+            causal=True,
+            seed=71,
+        ),
+        id="prefill-paged-bf16-gqa16-kmaj-persistent",
+    ),
+    pytest.param(
+        _attention_case(
+            "sparse_prefill",
+            q_dtype="bfloat16",
+            kv_dtype="bfloat16",
+            kv_layout="paged",
+            q_lens=[900, 300],
+            kv_lens=[8192, 7000],
+            num_q_heads=16,
+            num_kv_heads=2,
+            topk=16,
+            causal=True,
+            seed=73,
+            cuda_graph=True,
+        ),
+        id="prefill-paged-bf16-gqa8-kmaj-persistent-graph",
+    ),
+    pytest.param(
+        _attention_case(
+            "sparse_prefill",
+            q_dtype="bfloat16",
+            kv_dtype="bfloat16",
+            kv_layout="flat_varlen",
+            q_lens=[1024],
+            kv_lens=[8320],
+            num_q_heads=16,
+            num_kv_heads=1,
+            topk=16,
+            causal=True,
+            seed=75,
+        ),
+        id="prefill-flat-bf16-gqa16-kmaj-persistent",
+    ),
 ]
 
 

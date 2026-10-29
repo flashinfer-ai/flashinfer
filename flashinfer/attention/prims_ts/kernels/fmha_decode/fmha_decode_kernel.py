@@ -51,7 +51,6 @@ from cutlass.experimental.task_scheduling.resources import (
     MemoryResource,
     PipelineConfig,
     TileSchedulerConfig,
-    WorkQueue,
 )
 from cutlass.experimental.task_scheduling.task import Task
 from cutlass.experimental.task_scheduling.task_manager import TaskManager
@@ -64,7 +63,6 @@ from ..._block_sparse.common import (
 )
 from ..._block_sparse.prepared import _BlockSparseRouteLayout
 from ..tensor_map import (
-    create_tensor_map_ragged_from_tensor,
     create_tensor_map_tiled,
     create_tensor_map_tiled_from_view,
 )
@@ -745,10 +743,12 @@ def _build_decode_gen_schedule(
     # route when it starts that tile and the scales after the tile's last pass
     # that reads them. When the K/V ring frees a slot for an instance's next K
     # tile, the oldest buffered K tile's QK has run, after the previous tile's
-    # P left the TMEM columns it aliases, so the instance's Softmax has
-    # finished every tile older than the K tiles the ring buffers per
-    # instance; one stage more than those K tiles never stalls the load warp
-    # on either pipeline.
+    # P left the TMEM columns it aliases or, with SMEM P, after the previous
+    # tile's max pass released S. A route or ``sfK`` stage is read no later
+    # than that pass (an SMEM-P Sage row is dequantized there), so the
+    # instance's Softmax has released every stage older than the K tiles the
+    # ring buffers per instance; one stage more than those K tiles never
+    # stalls the load warp on either pipeline.
     if use_per_inst_kv_resources:
         inst_k_tiles = max(split_k0_stages, split_k1_stages)
     else:
@@ -905,14 +905,13 @@ def _build_decode_gen_schedule(
             "pipeline_config": wq_pipeline_config,
             "name": "work_queue",
         }
-        if cfg.use_variable_seqlens_q:
-            work_queue = PackedDecodeWorkQueue(
-                cfg=cfg,
-                cu_seqlens_q=cu_seqlens_q,
-                **work_queue_kwargs,
-            )
-        else:
-            work_queue = WorkQueue(**work_queue_kwargs)
+        work_queue = PackedDecodeWorkQueue(
+            cfg=cfg,
+            cu_seqlens_q=cu_seqlens_q,
+            seqlens_kv=seqlens_kv,
+            num_heads_kv=num_heads_kv,
+            **work_queue_kwargs,
+        )
 
         schedule_token_throttle = ScheduleTokenThrottleResource(
             pipeline_config=PipelineConfig.create_async_async_pipeline_cfg(
@@ -2265,7 +2264,7 @@ def _build_decode_gen_schedule(
         tmem_allocator.add_resource(transformed_kv)
     tmem_allocator.compute_layout()
     if cfg.use_keeps_mma_ab and not use_one_inst_qkv and not cfg.uses_tmem_p:
-        # Two-inst Keeps with SMEM P (currently Q64) must retain the historical
+        # Two-inst Keeps with SMEM P (Q64/KV128 and 8-bit Q128/KV128) keeps the
         # standalone-first S/O layout after unused stats aliases are removed.
         s0_alloc = tmem_s0.get_tmem_requirements()[0]
         s1_alloc = tmem_s1.get_tmem_requirements()[0]
@@ -3153,6 +3152,15 @@ def decode_gen_kernel(
             q_token_offset, seq_len_q = _q_seq_bounds(cfg, g_cu_seqlens_q, b_idx)
         q_token_base = _q_group_token_base(cfg, q_group_idx)
         q_tile_is_active = q_token_base < seq_len_q
+        if cutlass.const_expr(
+            use_variable_seqlens_kv
+            or (use_native_paged_kv and not use_static_native_seqlens_kv)
+        ):
+            if cutlass.const_expr(cfg.use_pdl):
+                prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+            q_tile_is_active = q_tile_is_active & (
+                Int32(g_seqlens_kv[b_idx]) > Int32(0)
+            )
 
     # Persistent block coordinates identify physical workers rather than
     # logical tiles; their WorkQueue owns the equivalent Q predicate. Split-KV
@@ -3309,8 +3317,8 @@ def decode_gen_kernel(
                 g_sage_scales=g_sage_scales,
             )
     else:
-        # Packed-Q grids use a batch-wide maximum envelope. These Q CTAs own no
-        # producer state, unlike a valid Q tile whose K domain is empty.
+        # Inactive requests publish no output or partials; dependent reducers
+        # use the same live-length predicate. Every physical CTA still signals PDL.
         _signal_padded_pdl_producer(cfg)
 
 
@@ -3534,9 +3542,8 @@ def fmha_decode_launch(
         )
     q_box_dims: tuple[object, ...]
     if cutlass.const_expr(cfg.use_variable_seqlens_q):
-        # Packed Q is physically [sum_q_tokens, num_heads_q, head_dim]. Flatten
-        # the head modes into Hq. Sparse Q uses this rank-3 map directly;
-        # other packed paths retain per-sequence ragged zero fill.
+        # Bound packed Q by its physical [D, Hq, total_q_tokens] allocation.
+        # Per-route Q masks handle tiles that cross into the next request.
         q_tma = cute.make_tensor(
             q_iter,
             cute.make_layout(
@@ -3559,24 +3566,12 @@ def fmha_decode_launch(
                 (cfg.heads_q_per_kv + cfg.tile_size_q - 1) // cfg.tile_size_q
             )
             q_groups = Int32(cfg.max_seq_len_q) * head_ctas_per_token
-        if cutlass.const_expr(cfg.uses_q_token_kv_block_sparse_page_route):
-            # A partial group may read the next sequence into inactive Q rows.
-            # QK/softmax/PV rows are independent; row masks and guarded stores
-            # discard them. Physical allocation bounds still get TMA zero fill.
-            tma_desc_q = create_tensor_map_tiled_from_view(
-                q_tma,
-                box_dims=q_box_dims,
-                stride_order=(0, 1, 2),
-                swizzle=tma_swizzle_q,
-            )
-        else:
-            tma_desc_q = create_tensor_map_ragged_from_tensor(
-                q_tma,
-                box_dims=q_box_dims,
-                ragged_dim=2,
-                stride_order=(0, 1, 2),
-                swizzle=tma_swizzle_q,
-            )
+        tma_desc_q = create_tensor_map_tiled_from_view(
+            q_tma,
+            box_dims=q_box_dims,
+            stride_order=(0, 1, 2),
+            swizzle=tma_swizzle_q,
+        )
     else:
         q_tma = cute.make_tensor(
             q_iter,

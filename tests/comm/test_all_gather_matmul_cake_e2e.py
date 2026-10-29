@@ -262,6 +262,10 @@ def _run_cake_subgroup(
             )
             _check(prepared_first, prepared_expected)
             _check(prepared_second, -prepared_expected)
+            # The 125-row call pads to one 128-row tile; at the four-rank
+            # N = 14336 width, on an architecture whose tile-order point table
+            # lists that call, it runs the one-CTA main's tile-order twin (the
+            # same launch and grid; only the tile walk differs).
             for served_rows in (125, 1025, 2048):
                 served = torch.randn(served_rows, K, dtype=dtype, device=device)
                 served_out = launcher(served)

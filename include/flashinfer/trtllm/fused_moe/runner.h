@@ -174,9 +174,10 @@ enum class ActivationType : int64_t {
   Identity = 9,
   Situ = 10,
   InvalidType = 11,  // Must be last among the normally-sequential members
-  // CUTLASS-backend only. Keep this after InvalidType so the existing values
+  // CUTLASS-backend only. Keep these after InvalidType so the existing values
   // consumed by the TRT-LLM backend remain stable.
   ClampedRelu2 = 12,
+  PowLU = 13,
 };
 
 inline std::string serializeActivationType(ActivationType activationType) {
@@ -205,6 +206,8 @@ inline std::string serializeActivationType(ActivationType activationType) {
       return "Situ";
     case ActivationType::ClampedRelu2:
       return "ClampedRelu2";
+    case ActivationType::PowLU:
+      return "PowLU";
     default:
       return "InvalidActivationType";  // TODO throw error
   };
@@ -214,7 +217,8 @@ inline bool isGatedActivation(ActivationType activationType) {
   return activationType == ActivationType::Swiglu || activationType == ActivationType::Geglu ||
          activationType == ActivationType::SwigluBias ||
          activationType == ActivationType::SwigluStep ||
-         activationType == ActivationType::GegluTanh || activationType == ActivationType::Situ;
+         activationType == ActivationType::GegluTanh || activationType == ActivationType::Situ ||
+         activationType == ActivationType::PowLU;
 }
 
 }  // namespace MoE
@@ -404,6 +408,11 @@ struct MoERunnerArgs {
 
   // finalize
   bool do_finalize{true};
+
+  // 4over6 recipe for the per-token GEMM2-input requantization, as the code
+  // decoded by resolveNVFP4Recipe() (nvfp4Recipe.h). The default
+  // (kNVFP44Over6FromEnv) reads FLASHINFER_NVFP4_4OVER6* on every launch.
+  int64_t nvfp4_4over6_code{-1};
 };
 
 struct MoEWorkspace {

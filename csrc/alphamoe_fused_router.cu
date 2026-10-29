@@ -57,6 +57,74 @@ TVM_FFI_EMBED_CUBIN(alphamoe_tiny_sm_103a);
 TVM_FFI_EMBED_CUBIN(alphamoe_tiny_routed_sm_103a);
 TVM_FFI_EMBED_CUBIN(alphamoe_large_tail_sm_103a);
 #endif
+// The cake_ routed entries load their cubins from the byte arrays that
+// flashinfer/jit/alphamoe_nvrtc.py writes into cake_alphamoe_router_images.h,
+// not from embedded objects as the entries above.
+#include "cake_alphamoe_router_images.h"
+#if defined(FLASHINFER_ALPHAMOE_SM_100A)
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_small_routed_e512_c4_sm_100a,
+                               alphamoe_cake_small_routed_e512_c4_sm_100a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_small_routed_e512_c16_sm_100a,
+                               alphamoe_cake_small_routed_e512_c16_sm_100a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_medium_routed_e512_sm_100a,
+                               alphamoe_cake_medium_routed_e512_sm_100a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_large_routed_e512_sm_100a,
+                               alphamoe_cake_large_routed_e512_sm_100a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_large_routed_e512_rb_sm_100a,
+                               alphamoe_cake_large_routed_e512_rb_sm_100a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_medium_routed_split_e256_sm_100a,
+                               alphamoe_cake_medium_routed_split_e256_sm_100a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_medium_routed_split_e288_sm_100a,
+                               alphamoe_cake_medium_routed_split_e288_sm_100a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_medium_routed_split_e384_sm_100a,
+                               alphamoe_cake_medium_routed_split_e384_sm_100a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_cluster_routed_c16_w16_sm_100a,
+                               alphamoe_cake_cluster_routed_c16_w16_sm_100a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_large_routed_e512_ot_sm_100a,
+                               alphamoe_cake_large_routed_e512_ot_sm_100a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_medium_routed_e512_bm4_sm_100a,
+                               alphamoe_cake_medium_routed_e512_bm4_sm_100a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_medium_routed_e512_bm5_sm_100a,
+                               alphamoe_cake_medium_routed_e512_bm5_sm_100a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_large_routed_e512_cps_sm_100a,
+                               alphamoe_cake_large_routed_e512_cps_sm_100a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_large_routed_e512_rb_cps_sm_100a,
+                               alphamoe_cake_large_routed_e512_rb_cps_sm_100a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_large_tail_e512_sm_100a,
+                               alphamoe_cake_large_tail_e512_sm_100a_image);
+#endif
+#if defined(FLASHINFER_ALPHAMOE_SM_103A)
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_small_routed_e512_c4_sm_103a,
+                               alphamoe_cake_small_routed_e512_c4_sm_103a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_small_routed_e512_c16_sm_103a,
+                               alphamoe_cake_small_routed_e512_c16_sm_103a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_medium_routed_e512_sm_103a,
+                               alphamoe_cake_medium_routed_e512_sm_103a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_large_routed_e512_sm_103a,
+                               alphamoe_cake_large_routed_e512_sm_103a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_large_routed_e512_rb_sm_103a,
+                               alphamoe_cake_large_routed_e512_rb_sm_103a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_medium_routed_split_e256_sm_103a,
+                               alphamoe_cake_medium_routed_split_e256_sm_103a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_medium_routed_split_e288_sm_103a,
+                               alphamoe_cake_medium_routed_split_e288_sm_103a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_medium_routed_split_e384_sm_103a,
+                               alphamoe_cake_medium_routed_split_e384_sm_103a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_cluster_routed_c16_w16_sm_103a,
+                               alphamoe_cake_cluster_routed_c16_w16_sm_103a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_large_routed_e512_ot_sm_103a,
+                               alphamoe_cake_large_routed_e512_ot_sm_103a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_medium_routed_e512_bm4_sm_103a,
+                               alphamoe_cake_medium_routed_e512_bm4_sm_103a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_medium_routed_e512_bm5_sm_103a,
+                               alphamoe_cake_medium_routed_e512_bm5_sm_103a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_large_routed_e512_cps_sm_103a,
+                               alphamoe_cake_large_routed_e512_cps_sm_103a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_large_routed_e512_rb_cps_sm_103a,
+                               alphamoe_cake_large_routed_e512_rb_cps_sm_103a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_large_tail_e512_sm_103a,
+                               alphamoe_cake_large_tail_e512_sm_103a_image);
+#endif
 namespace alphamoe_router_large_generated {
 constexpr int kThreads = 256;
 constexpr int kSmemTotal = 4224;
@@ -93,6 +161,69 @@ namespace alphamoe_router_large_tail_generated {
 constexpr int kThreads = 256;
 constexpr int kSmemTotal = 4224;
 }  // namespace alphamoe_router_large_tail_generated
+namespace alphamoe_router_cake_small_routed_e512_c4_generated {
+constexpr int kThreads = 256;
+constexpr int kSmemTotal = 16512;
+constexpr unsigned int kCluster = 4;
+}  // namespace alphamoe_router_cake_small_routed_e512_c4_generated
+namespace alphamoe_router_cake_small_routed_e512_c16_generated {
+constexpr int kThreads = 256;
+constexpr int kSmemTotal = 22912;
+constexpr unsigned int kCluster = 16;
+}  // namespace alphamoe_router_cake_small_routed_e512_c16_generated
+namespace alphamoe_router_cake_medium_routed_e512_generated {
+constexpr int kThreads = 128;
+constexpr int kSmemTotal = 6272;
+}  // namespace alphamoe_router_cake_medium_routed_e512_generated
+namespace alphamoe_router_cake_large_routed_e512_generated {
+constexpr int kThreads = 256;
+constexpr int kSmemTotal = 8320;
+}  // namespace alphamoe_router_cake_large_routed_e512_generated
+namespace alphamoe_router_cake_large_routed_e512_rb_generated {
+constexpr int kThreads = 256;
+constexpr int kSmemTotal = 8320;
+}  // namespace alphamoe_router_cake_large_routed_e512_rb_generated
+namespace alphamoe_router_cake_large_routed_e512_ot_generated {
+constexpr int kThreads = 256;
+constexpr int kSmemTotal = 8320;
+}  // namespace alphamoe_router_cake_large_routed_e512_ot_generated
+namespace alphamoe_router_cake_medium_routed_split_e256_generated {
+constexpr int kThreads = 128;
+constexpr int kSmemTotal = 6272;
+}  // namespace alphamoe_router_cake_medium_routed_split_e256_generated
+namespace alphamoe_router_cake_medium_routed_split_e288_generated {
+constexpr int kThreads = 128;
+constexpr int kSmemTotal = 6272;
+}  // namespace alphamoe_router_cake_medium_routed_split_e288_generated
+namespace alphamoe_router_cake_medium_routed_split_e384_generated {
+constexpr int kThreads = 128;
+constexpr int kSmemTotal = 6272;
+}  // namespace alphamoe_router_cake_medium_routed_split_e384_generated
+namespace alphamoe_router_cake_cluster_routed_c16_w16_generated {
+constexpr int kThreads = 512;
+constexpr int kSmemTotal = 28032;
+constexpr unsigned int kCluster = 16;
+}  // namespace alphamoe_router_cake_cluster_routed_c16_w16_generated
+namespace alphamoe_router_cake_medium_routed_e512_bm4_generated {
+constexpr int kThreads = 128;
+constexpr int kSmemTotal = 6272;
+}  // namespace alphamoe_router_cake_medium_routed_e512_bm4_generated
+namespace alphamoe_router_cake_medium_routed_e512_bm5_generated {
+constexpr int kThreads = 128;
+constexpr int kSmemTotal = 6272;
+}  // namespace alphamoe_router_cake_medium_routed_e512_bm5_generated
+namespace alphamoe_router_cake_large_routed_e512_cps_generated {
+constexpr int kThreads = 1024;
+constexpr int kSmemTotal = 20608;
+}  // namespace alphamoe_router_cake_large_routed_e512_cps_generated
+namespace alphamoe_router_cake_large_routed_e512_rb_cps_generated {
+constexpr int kThreads = 1024;
+constexpr int kSmemTotal = 20608;
+}  // namespace alphamoe_router_cake_large_routed_e512_rb_cps_generated
+namespace alphamoe_router_cake_large_tail_e512_generated {
+constexpr int kThreads = 256;
+constexpr int kSmemTotal = 4224;
+}  // namespace alphamoe_router_cake_large_tail_e512_generated
 
 namespace flashinfer {
 namespace alphamoe_fused_router {
@@ -340,6 +471,426 @@ inline int64_t MaxRouteBlocks(int64_t m, int64_t top_k, int64_t num_experts, int
   return nonempty + (pairs - nonempty) / block_m;
 }
 
+// The routed 512-expert-build entries: a one-pass threshold top-k (the k-th largest of the 32 lane
+// maxima bounds the top-k from below). At 512 experts, M <= 128 runs as one thread-block cluster of
+// 8-warp CTAs, one token per warp, without a grid barrier; larger M keeps FlashInfer's medium and
+// large grids; from 12000 tokens the large grid's warps rebase their routes' IDs in batches. The
+// split-start medium entries serve 256, 257 and 384 experts on the medium grid: they count their
+// routes in a CTA table behind a split grid barrier, over a row of 8, 9 or 12 slots of 32 experts.
+// From 129 to 256 tokens at top_k 8 to 10, one cluster of 16 CTAs of 16 warps serves 512, 384, 257
+// and 256 experts, one token per warp. Up to 12000 tokens, the large grid's one-token entry serves
+// the calls its grid has a warp for, one token per warp. From 129 to 512 tokens, block_m 4 (and
+// block_m 5 above 256 tokens) takes a medium entry built for that block_m. From 3000 tokens at
+// top_k 8 to 10, the large entries run one 1024-thread CTA per SM (cta_per_sm); on sm_103a the
+// batched-rebase one also stages each warp's routes in shared memory. Behind the large entries
+// runs the 512-expert tail, whose CTAs leave the padding rows of one expert to one warp.
+using RoutedE512Kernels = std::array<tvm::ffi::CubinKernel*, 15>;
+
+inline RoutedE512Kernels GetRoutedE512Kernels(int minor) {
+#if defined(FLASHINFER_ALPHAMOE_SM_100A)
+  if (minor == 0) {
+    static auto small_c4 =
+        TVM_FFI_EMBED_CUBIN_GET_KERNEL(alphamoe_cake_small_routed_e512_c4_sm_100a,
+                                       "kernel_alpha_moe_fused_router_cluster_c4_w8_threshold");
+    static auto small_c16 =
+        TVM_FFI_EMBED_CUBIN_GET_KERNEL(alphamoe_cake_small_routed_e512_c16_sm_100a,
+                                       "kernel_alpha_moe_fused_router_cluster_c16_w8_threshold");
+    static auto medium =
+        TVM_FFI_EMBED_CUBIN_GET_KERNEL(alphamoe_cake_medium_routed_e512_sm_100a,
+                                       "kernel_alpha_moe_fused_router_medium_e512_threshold");
+    static auto large = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
+        alphamoe_cake_large_routed_e512_sm_100a, "kernel_alpha_moe_fused_router_e512_threshold");
+    static auto large_rb =
+        TVM_FFI_EMBED_CUBIN_GET_KERNEL(alphamoe_cake_large_routed_e512_rb_sm_100a,
+                                       "kernel_alpha_moe_fused_router_e512_threshold_rebase_batch");
+    static auto split_e256 = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
+        alphamoe_cake_medium_routed_split_e256_sm_100a,
+        "kernel_alpha_moe_fused_router_medium_e512_threshold_split_start_rs8");
+    static auto split_e288 = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
+        alphamoe_cake_medium_routed_split_e288_sm_100a,
+        "kernel_alpha_moe_fused_router_medium_e512_threshold_split_start_rs9");
+    static auto split_e384 = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
+        alphamoe_cake_medium_routed_split_e384_sm_100a,
+        "kernel_alpha_moe_fused_router_medium_e512_threshold_split_start_rs12");
+    static auto cluster_c16_w16 = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
+        alphamoe_cake_cluster_routed_c16_w16_sm_100a,
+        "kernel_alpha_moe_fused_router_cluster_c16_w16_threshold_acq");
+    static auto large_ot =
+        TVM_FFI_EMBED_CUBIN_GET_KERNEL(alphamoe_cake_large_routed_e512_ot_sm_100a,
+                                       "kernel_alpha_moe_fused_router_e512_threshold_one_token");
+    static auto medium_bm4 =
+        TVM_FFI_EMBED_CUBIN_GET_KERNEL(alphamoe_cake_medium_routed_e512_bm4_sm_100a,
+                                       "kernel_alpha_moe_fused_router_medium_e512_threshold_bm4");
+    static auto medium_bm5 =
+        TVM_FFI_EMBED_CUBIN_GET_KERNEL(alphamoe_cake_medium_routed_e512_bm5_sm_100a,
+                                       "kernel_alpha_moe_fused_router_medium_e512_threshold_bm5");
+    static auto large_cps =
+        TVM_FFI_EMBED_CUBIN_GET_KERNEL(alphamoe_cake_large_routed_e512_cps_sm_100a,
+                                       "kernel_alpha_moe_fused_router_e512_threshold_cta_per_sm");
+    static auto large_rb_cps = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
+        alphamoe_cake_large_routed_e512_rb_cps_sm_100a,
+        "kernel_alpha_moe_fused_router_e512_threshold_rebase_batch_cta_per_sm");
+    static auto large_tail = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
+        alphamoe_cake_large_tail_e512_sm_100a,
+        "kernel_alpha_moe_fused_router_large_tail_e512_idle_padding");
+    return {&small_c4,   &small_c16,  &medium,     &large,           &large_rb,
+            &split_e256, &split_e288, &split_e384, &cluster_c16_w16, &large_ot,
+            &medium_bm4, &medium_bm5, &large_cps,  &large_rb_cps,    &large_tail};
+  }
+#endif
+#if defined(FLASHINFER_ALPHAMOE_SM_103A)
+  if (minor == 3) {
+    static auto small_c4 =
+        TVM_FFI_EMBED_CUBIN_GET_KERNEL(alphamoe_cake_small_routed_e512_c4_sm_103a,
+                                       "kernel_alpha_moe_fused_router_cluster_c4_w8_threshold");
+    static auto small_c16 =
+        TVM_FFI_EMBED_CUBIN_GET_KERNEL(alphamoe_cake_small_routed_e512_c16_sm_103a,
+                                       "kernel_alpha_moe_fused_router_cluster_c16_w8_threshold");
+    static auto medium =
+        TVM_FFI_EMBED_CUBIN_GET_KERNEL(alphamoe_cake_medium_routed_e512_sm_103a,
+                                       "kernel_alpha_moe_fused_router_medium_e512_threshold");
+    static auto large = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
+        alphamoe_cake_large_routed_e512_sm_103a, "kernel_alpha_moe_fused_router_e512_threshold");
+    static auto large_rb =
+        TVM_FFI_EMBED_CUBIN_GET_KERNEL(alphamoe_cake_large_routed_e512_rb_sm_103a,
+                                       "kernel_alpha_moe_fused_router_e512_threshold_rebase_batch");
+    static auto split_e256 = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
+        alphamoe_cake_medium_routed_split_e256_sm_103a,
+        "kernel_alpha_moe_fused_router_medium_e512_threshold_split_start_rs8");
+    static auto split_e288 = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
+        alphamoe_cake_medium_routed_split_e288_sm_103a,
+        "kernel_alpha_moe_fused_router_medium_e512_threshold_split_start_rs9");
+    static auto split_e384 = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
+        alphamoe_cake_medium_routed_split_e384_sm_103a,
+        "kernel_alpha_moe_fused_router_medium_e512_threshold_split_start_rs12");
+    static auto cluster_c16_w16 = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
+        alphamoe_cake_cluster_routed_c16_w16_sm_103a,
+        "kernel_alpha_moe_fused_router_cluster_c16_w16_threshold_acq");
+    static auto large_ot =
+        TVM_FFI_EMBED_CUBIN_GET_KERNEL(alphamoe_cake_large_routed_e512_ot_sm_103a,
+                                       "kernel_alpha_moe_fused_router_e512_threshold_one_token");
+    static auto medium_bm4 =
+        TVM_FFI_EMBED_CUBIN_GET_KERNEL(alphamoe_cake_medium_routed_e512_bm4_sm_103a,
+                                       "kernel_alpha_moe_fused_router_medium_e512_threshold_bm4");
+    static auto medium_bm5 =
+        TVM_FFI_EMBED_CUBIN_GET_KERNEL(alphamoe_cake_medium_routed_e512_bm5_sm_103a,
+                                       "kernel_alpha_moe_fused_router_medium_e512_threshold_bm5");
+    static auto large_cps =
+        TVM_FFI_EMBED_CUBIN_GET_KERNEL(alphamoe_cake_large_routed_e512_cps_sm_103a,
+                                       "kernel_alpha_moe_fused_router_e512_threshold_cta_per_sm");
+    static auto large_rb_cps = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
+        alphamoe_cake_large_routed_e512_rb_cps_sm_103a,
+        "kernel_alpha_moe_fused_router_e512_threshold_rebase_batch_cta_per_sm");
+    static auto large_tail = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
+        alphamoe_cake_large_tail_e512_sm_103a,
+        "kernel_alpha_moe_fused_router_large_tail_e512_idle_padding");
+    return {&small_c4,   &small_c16,  &medium,     &large,           &large_rb,
+            &split_e256, &split_e288, &split_e384, &cluster_c16_w16, &large_ot,
+            &medium_bm4, &medium_bm5, &large_cps,  &large_rb_cps,    &large_tail};
+  }
+#endif
+  TVM_FFI_THROW(RuntimeError) << "AlphaMoE router was not built for this CUDA device";
+  return {};
+}
+
+struct RoutedE512Config {
+  int medium_active_blocks_per_sm;
+  int large_active_blocks_per_sm;
+  int large_rb_active_blocks_per_sm;
+  int small_c16_active_clusters;
+  RoutedE512Kernels kernels;
+  // The split-start medium entries of 256, 288 and 384 experts (kernels 5 to 7).
+  std::array<int, 3> split_active_blocks_per_sm{};
+  // The 16-warp 16-CTA cluster (kernel 8).
+  int cluster_c16_w16_active_clusters = 0;
+  // The large grid's one-token entry (kernel 9).
+  int large_ot_active_blocks_per_sm = 0;
+  // The medium entries of block_m 4 and 5 (kernels 10 and 11).
+  std::array<int, 2> medium_bm_active_blocks_per_sm{};
+  // The large grid's cta_per_sm entries, without and with the batched rebase (kernels 12 and 13).
+  std::array<int, 2> large_cps_active_blocks_per_sm{};
+};
+
+inline int ActiveBlocksPerSm(tvm::ffi::CubinKernel* kernel, int threads, int smem) {
+  CUfunction function = nullptr;
+  CheckCudaDriver(cuKernelGetFunction(&function, reinterpret_cast<CUkernel>(kernel->GetHandle())));
+  int active = 0;
+  CheckCudaDriver(cuOccupancyMaxActiveBlocksPerMultiprocessor(&active, function, threads, smem));
+  return active;
+}
+
+inline int ActiveClusters(tvm::ffi::CubinKernel* kernel, unsigned int cluster, unsigned int threads,
+                          unsigned int smem) {
+  CUfunction function = nullptr;
+  CheckCudaDriver(cuKernelGetFunction(&function, reinterpret_cast<CUkernel>(kernel->GetHandle())));
+  CUlaunchAttribute attribute{};
+  attribute.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
+  attribute.value.clusterDim.x = cluster;
+  attribute.value.clusterDim.y = 1;
+  attribute.value.clusterDim.z = 1;
+  CUlaunchConfig launch{};
+  launch.gridDimX = cluster;
+  launch.gridDimY = 1;
+  launch.gridDimZ = 1;
+  launch.blockDimX = threads;
+  launch.blockDimY = 1;
+  launch.blockDimZ = 1;
+  launch.sharedMemBytes = smem;
+  launch.attrs = &attribute;
+  launch.numAttrs = 1;
+  int clusters = 0;
+  CheckCudaDriver(cuOccupancyMaxActiveClusters(&clusters, function, &launch));
+  return clusters;
+}
+
+inline RoutedE512Config GetRoutedE512Config(int32_t device_id) {
+  static std::mutex mutex;
+  static std::unordered_map<int32_t, RoutedE512Config> cache;
+  std::lock_guard<std::mutex> lock(mutex);
+  const auto cached = cache.find(device_id);
+  if (cached != cache.end()) return cached->second;
+  int minor = 0;
+  CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
+            "cudaDeviceGetAttribute(compute capability minor)");
+  const RoutedE512Kernels kernels = GetRoutedE512Kernels(minor);
+  // The 16-CTA clusters are above the portable cluster size of 8.
+  CUdevice device = 0;
+  CheckCudaDriver(cuDeviceGet(&device, device_id));
+  CheckCudaDriver(cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, 1,
+                                       reinterpret_cast<CUkernel>(kernels[1]->GetHandle()),
+                                       device));
+  CheckCudaDriver(cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, 1,
+                                       reinterpret_cast<CUkernel>(kernels[8]->GetHandle()),
+                                       device));
+  // A context that holds only part of the device (MPS, green contexts) may fit no 16-CTA
+  // cluster; LaunchRoutedE512 then leaves 32 < M <= 128 to FlashInfer's cooperative entry.
+  const int small_c16_clusters =
+      ActiveClusters(kernels[1], alphamoe_router_cake_small_routed_e512_c16_generated::kCluster,
+                     alphamoe_router_cake_small_routed_e512_c16_generated::kThreads,
+                     alphamoe_router_cake_small_routed_e512_c16_generated::kSmemTotal);
+  // Without a resident 16-warp 16-CTA cluster, 128 < M <= 256 keeps its medium entries.
+  const int cluster_c16_w16_clusters =
+      ActiveClusters(kernels[8], alphamoe_router_cake_cluster_routed_c16_w16_generated::kCluster,
+                     alphamoe_router_cake_cluster_routed_c16_w16_generated::kThreads,
+                     alphamoe_router_cake_cluster_routed_c16_w16_generated::kSmemTotal);
+  const int medium_active =
+      ActiveBlocksPerSm(kernels[2], alphamoe_router_cake_medium_routed_e512_generated::kThreads,
+                        alphamoe_router_cake_medium_routed_e512_generated::kSmemTotal);
+  const int large_active =
+      ActiveBlocksPerSm(kernels[3], alphamoe_router_cake_large_routed_e512_generated::kThreads,
+                        alphamoe_router_cake_large_routed_e512_generated::kSmemTotal);
+  const int large_rb_active =
+      ActiveBlocksPerSm(kernels[4], alphamoe_router_cake_large_routed_e512_rb_generated::kThreads,
+                        alphamoe_router_cake_large_routed_e512_rb_generated::kSmemTotal);
+  const int large_ot_active =
+      ActiveBlocksPerSm(kernels[9], alphamoe_router_cake_large_routed_e512_ot_generated::kThreads,
+                        alphamoe_router_cake_large_routed_e512_ot_generated::kSmemTotal);
+  const int medium_bm4_active = ActiveBlocksPerSm(
+      kernels[10], alphamoe_router_cake_medium_routed_e512_bm4_generated::kThreads,
+      alphamoe_router_cake_medium_routed_e512_bm4_generated::kSmemTotal);
+  const int medium_bm5_active = ActiveBlocksPerSm(
+      kernels[11], alphamoe_router_cake_medium_routed_e512_bm5_generated::kThreads,
+      alphamoe_router_cake_medium_routed_e512_bm5_generated::kSmemTotal);
+  const int large_cps_active =
+      ActiveBlocksPerSm(kernels[12], alphamoe_router_cake_large_routed_e512_cps_generated::kThreads,
+                        alphamoe_router_cake_large_routed_e512_cps_generated::kSmemTotal);
+  const int large_rb_cps_active = ActiveBlocksPerSm(
+      kernels[13], alphamoe_router_cake_large_routed_e512_rb_cps_generated::kThreads,
+      alphamoe_router_cake_large_routed_e512_rb_cps_generated::kSmemTotal);
+  const int large_tail_active =
+      ActiveBlocksPerSm(kernels[14], alphamoe_router_cake_large_tail_e512_generated::kThreads,
+                        alphamoe_router_cake_large_tail_e512_generated::kSmemTotal);
+  const int split_e256_active = ActiveBlocksPerSm(
+      kernels[5], alphamoe_router_cake_medium_routed_split_e256_generated::kThreads,
+      alphamoe_router_cake_medium_routed_split_e256_generated::kSmemTotal);
+  const int split_e288_active = ActiveBlocksPerSm(
+      kernels[6], alphamoe_router_cake_medium_routed_split_e288_generated::kThreads,
+      alphamoe_router_cake_medium_routed_split_e288_generated::kSmemTotal);
+  const int split_e384_active = ActiveBlocksPerSm(
+      kernels[7], alphamoe_router_cake_medium_routed_split_e384_generated::kThreads,
+      alphamoe_router_cake_medium_routed_split_e384_generated::kSmemTotal);
+  TVM_FFI_ICHECK(medium_active > 0 && large_active > 0 && large_rb_active > 0 &&
+                 large_ot_active > 0 && split_e256_active > 0 && split_e288_active > 0 &&
+                 split_e384_active > 0 && medium_bm4_active > 0 && medium_bm5_active > 0 &&
+                 large_cps_active > 0 && large_rb_cps_active > 0 && large_tail_active > 0)
+      << "AlphaMoE routed 512-expert-build entries have zero occupancy";
+  RoutedE512Config config{medium_active, large_active, large_rb_active, small_c16_clusters,
+                          kernels};
+  config.split_active_blocks_per_sm = {split_e256_active, split_e288_active, split_e384_active};
+  config.cluster_c16_w16_active_clusters = cluster_c16_w16_clusters;
+  config.large_ot_active_blocks_per_sm = large_ot_active;
+  config.medium_bm_active_blocks_per_sm = {medium_bm4_active, medium_bm5_active};
+  config.large_cps_active_blocks_per_sm = {large_cps_active, large_rb_cps_active};
+  cache.emplace(device_id, config);
+  return config;
+}
+
+inline void LaunchClusterRouterKernel(tvm::ffi::CubinKernel& kernel, unsigned int cluster,
+                                      unsigned int threads, unsigned int smem, cudaStream_t stream,
+                                      void** args) {
+  cudaLaunchAttribute attribute{};
+  attribute.id = cudaLaunchAttributeClusterDimension;
+  attribute.val.clusterDim.x = cluster;
+  attribute.val.clusterDim.y = 1;
+  attribute.val.clusterDim.z = 1;
+  cudaLaunchConfig_t launch{};
+  launch.gridDim = {cluster, 1, 1};
+  launch.blockDim = {threads, 1, 1};
+  launch.dynamicSmemBytes = smem;
+  launch.stream = stream;
+  launch.attrs = &attribute;
+  launch.numAttrs = 1;
+  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.LaunchEx(args, launch));
+}
+
+// Returns false, without a launch, when the call is left to FlashInfer's entries.
+inline bool LaunchRoutedE512(int32_t device_id, const RouterLaunchConfig& base, int64_t m,
+                             int64_t top_k, int64_t block_m, cudaStream_t stream, void** args) {
+  const RoutedE512Config config = GetRoutedE512Config(device_id);
+  if (m <= 32) {
+    LaunchClusterRouterKernel(
+        *config.kernels[0], alphamoe_router_cake_small_routed_e512_c4_generated::kCluster,
+        alphamoe_router_cake_small_routed_e512_c4_generated::kThreads,
+        alphamoe_router_cake_small_routed_e512_c4_generated::kSmemTotal, stream, args);
+  } else if (m <= 128) {
+    if (config.small_c16_active_clusters == 0) return false;
+    LaunchClusterRouterKernel(
+        *config.kernels[1], alphamoe_router_cake_small_routed_e512_c16_generated::kCluster,
+        alphamoe_router_cake_small_routed_e512_c16_generated::kThreads,
+        alphamoe_router_cake_small_routed_e512_c16_generated::kSmemTotal, stream, args);
+  } else if (m <= 512) {
+    // Run sends 128 < m <= 512 here at top_k 8 to 10. block_m 4, and block_m 5 above 256 tokens
+    // (128 < m <= 256 at block_m 5 is the 16-warp cluster's), take the entry built for it.
+    const bool fixed_bm4 = block_m == 4;
+    const bool fixed_bm5 = block_m == 5 && m > 256;
+    const auto medium_grid_x = [&](int active) {
+      return static_cast<unsigned int>(std::max<int64_t>(
+          1, std::min<int64_t>((m + 3) / 4, static_cast<int64_t>(base.sm_count) * active)));
+    };
+    if (fixed_bm4) {
+      LaunchRouterKernel(
+          *config.kernels[10], medium_grid_x(config.medium_bm_active_blocks_per_sm[0]),
+          alphamoe_router_cake_medium_routed_e512_bm4_generated::kThreads,
+          alphamoe_router_cake_medium_routed_e512_bm4_generated::kSmemTotal, true, stream, args);
+    } else if (fixed_bm5) {
+      LaunchRouterKernel(
+          *config.kernels[11], medium_grid_x(config.medium_bm_active_blocks_per_sm[1]),
+          alphamoe_router_cake_medium_routed_e512_bm5_generated::kThreads,
+          alphamoe_router_cake_medium_routed_e512_bm5_generated::kSmemTotal, true, stream, args);
+    } else {
+      LaunchRouterKernel(*config.kernels[2], medium_grid_x(config.medium_active_blocks_per_sm),
+                         alphamoe_router_cake_medium_routed_e512_generated::kThreads,
+                         alphamoe_router_cake_medium_routed_e512_generated::kSmemTotal, true,
+                         stream, args);
+    }
+  } else {
+    // From 12000 tokens the rb entries: each warp rebases its routes' IDs in batches.
+    const bool rebase_batch = m >= 12000;
+    // From 3000 tokens at top_k 8 to 10, the cta_per_sm entries: one 1024-thread CTA per SM.
+    const bool cta_per_sm = m >= 3000 && top_k >= 8 && top_k <= 10;
+    const int64_t full_wave_grid =
+        (((m + 3) / 4 + base.sm_count - 1) / base.sm_count) * base.sm_count;
+    const auto large_grid_x = [&](int active) {
+      return std::max<int64_t>(
+          1, std::min<int64_t>(full_wave_grid,
+                               static_cast<int64_t>(base.sm_count) * std::min(5, active)));
+    };
+    // The grid of the threshold (rb from 12000 tokens) entry; the tail's grid starts from it.
+    const int64_t default_grid_x = large_grid_x(rebase_batch ? config.large_rb_active_blocks_per_sm
+                                                             : config.large_active_blocks_per_sm);
+    // Below 3000 tokens, the one-token entry runs when its grid has a warp (8 per CTA) for every
+    // token; its kernel assumes m <= its grid's warps.
+    const int64_t one_token_grid_x = large_grid_x(config.large_ot_active_blocks_per_sm);
+    const bool one_token = m < 3000 && m <= one_token_grid_x * 8;
+    const int64_t grid_x =
+        one_token    ? one_token_grid_x
+        : cta_per_sm ? large_grid_x(config.large_cps_active_blocks_per_sm[rebase_batch ? 1 : 0])
+                     : default_grid_x;
+    if (one_token) {
+      LaunchRouterKernel(*config.kernels[9], static_cast<unsigned int>(grid_x),
+                         alphamoe_router_cake_large_routed_e512_ot_generated::kThreads,
+                         alphamoe_router_cake_large_routed_e512_ot_generated::kSmemTotal, true,
+                         stream, args);
+    } else if (cta_per_sm) {
+      if (rebase_batch) {
+        LaunchRouterKernel(*config.kernels[13], static_cast<unsigned int>(grid_x),
+                           alphamoe_router_cake_large_routed_e512_rb_cps_generated::kThreads,
+                           alphamoe_router_cake_large_routed_e512_rb_cps_generated::kSmemTotal,
+                           true, stream, args);
+      } else {
+        LaunchRouterKernel(*config.kernels[12], static_cast<unsigned int>(grid_x),
+                           alphamoe_router_cake_large_routed_e512_cps_generated::kThreads,
+                           alphamoe_router_cake_large_routed_e512_cps_generated::kSmemTotal, true,
+                           stream, args);
+      }
+    } else if (rebase_batch) {
+      LaunchRouterKernel(*config.kernels[4], static_cast<unsigned int>(grid_x),
+                         alphamoe_router_cake_large_routed_e512_rb_generated::kThreads,
+                         alphamoe_router_cake_large_routed_e512_rb_generated::kSmemTotal, true,
+                         stream, args);
+    } else {
+      LaunchRouterKernel(*config.kernels[3], static_cast<unsigned int>(grid_x),
+                         alphamoe_router_cake_large_routed_e512_generated::kThreads,
+                         alphamoe_router_cake_large_routed_e512_generated::kSmemTotal, true, stream,
+                         args);
+    }
+    // The tail takes one CTA per 256 routes where that is more than the producer grid (the
+    // threshold or rb entry's grid behind a cta_per_sm entry), up to 1024.
+    const int64_t route_blocks = (m * top_k + 255) / 256;
+    const int64_t tail_base_x = cta_per_sm ? default_grid_x : grid_x;
+    const int64_t tail_grid_x =
+        tail_base_x < route_blocks && route_blocks <= 1024 ? route_blocks : tail_base_x;
+    LaunchRouterKernel(*config.kernels[14], static_cast<unsigned int>(tail_grid_x),
+                       alphamoe_router_cake_large_tail_e512_generated::kThreads,
+                       alphamoe_router_cake_large_tail_e512_generated::kSmemTotal, false, stream,
+                       args);
+  }
+  return true;
+}
+
+// Routed calls with 128 < M <= 256 and top_k 8 to 10 at 512, 384, 257 and 256 experts (see Run):
+// one cluster of 16 CTAs of 16 warps, one token per warp. Returns false, without a launch, when
+// no such cluster is resident; the call then keeps its medium entry.
+inline bool LaunchRoutedClusterC16W16(int32_t device_id, cudaStream_t stream, void** args) {
+  const RoutedE512Config config = GetRoutedE512Config(device_id);
+  if (config.cluster_c16_w16_active_clusters == 0) return false;
+  LaunchClusterRouterKernel(
+      *config.kernels[8], alphamoe_router_cake_cluster_routed_c16_w16_generated::kCluster,
+      alphamoe_router_cake_cluster_routed_c16_w16_generated::kThreads,
+      alphamoe_router_cake_cluster_routed_c16_w16_generated::kSmemTotal, stream, args);
+  return true;
+}
+
+// Routed 256, 257 and 384-expert calls with 128 < M <= 512 and top_k 8 to 10 (see Run): the
+// split-start medium entry on FlashInfer's medium grid, in the build whose row holds the fewest
+// slots of 32 experts that cover the call's: 8 for 256 experts, 9 for 257 and 12 for 384.
+inline void LaunchRoutedSplit(int32_t device_id, const RouterLaunchConfig& base, int64_t m,
+                              int64_t num_experts, cudaStream_t stream, void** args) {
+  const RoutedE512Config config = GetRoutedE512Config(device_id);
+  // One CTA per 4 tokens, at most the CTAs the cooperative grid keeps resident.
+  const auto grid_x = [&](int active_blocks_per_sm) {
+    return static_cast<unsigned int>(std::max<int64_t>(
+        1, std::min<int64_t>((m + 3) / 4,
+                             static_cast<int64_t>(base.sm_count) * active_blocks_per_sm)));
+  };
+  if (num_experts <= 256) {
+    LaunchRouterKernel(*config.kernels[5], grid_x(config.split_active_blocks_per_sm[0]),
+                       alphamoe_router_cake_medium_routed_split_e256_generated::kThreads,
+                       alphamoe_router_cake_medium_routed_split_e256_generated::kSmemTotal, true,
+                       stream, args);
+  } else if (num_experts <= 288) {
+    LaunchRouterKernel(*config.kernels[6], grid_x(config.split_active_blocks_per_sm[1]),
+                       alphamoe_router_cake_medium_routed_split_e288_generated::kThreads,
+                       alphamoe_router_cake_medium_routed_split_e288_generated::kSmemTotal, true,
+                       stream, args);
+  } else {  // 384 experts
+    LaunchRouterKernel(*config.kernels[7], grid_x(config.split_active_blocks_per_sm[2]),
+                       alphamoe_router_cake_medium_routed_split_e384_generated::kThreads,
+                       alphamoe_router_cake_medium_routed_split_e384_generated::kSmemTotal, true,
+                       stream, args);
+  }
+}
+
 void Run(TensorView logits, TensorView topk_weights, TensorView topk_ids,
          TensorView sorted_token_ids, TensorView expert_ids, TensorView num_tokens_post_padded,
          TensorView expert_counts, TensorView expert_offsets, TensorView expert_scatter_offsets,
@@ -466,6 +1017,33 @@ void Run(TensorView logits, TensorView topk_weights, TensorView topk_ids,
   };
 
   const cudaStream_t stream = get_stream(logits.device());
+  // Routed 512-expert calls: the cluster plan for 8 < M <= 128 at every top_k; the threshold
+  // searches from top_k 8, below which the route-by-route selection is faster, the medium one
+  // (128 < M <= 512) up to top_k 10; M <= 32 runs as one 4-CTA cluster; the large grid (M > 512)
+  // takes its batched-rebase build from 12000 tokens and, at top_k 8 to 10 from 3000 tokens, one
+  // 1024-thread CTA per SM. Routed 256, 257 and 384-expert calls with 128 < M <= 512 and top_k
+  // 8 to 10 take the split-start medium entry sized to the expert count.
+  // First, routed 512, 384, 257 and 256-expert calls with 128 < M <= 256, top_k 8 to 10 and
+  // block_m 5, 8 or 16 (8 or 16 at 256 experts) run as one cluster of 16 CTAs of 16 warps.
+  // These cake_ entries rank a NaN logit as +inf, the lower expert ID first among equal ones, so
+  // an all-NaN row routes to experts 0..top_k-1 with NaN weights.
+  if (!has_shared_expert && m > 128 && m <= 256 && top_k >= 8 && top_k <= 10 &&
+      (num_experts == kMaxExperts || num_experts == 384 || num_experts == 257 ||
+       num_experts == 256) &&
+      (block_m == 8 || block_m == 16 || (block_m == 5 && num_experts != 256)) &&
+      LaunchRoutedClusterC16W16(device_id, stream, arguments)) {
+    return;
+  }
+  if (!has_shared_expert && num_experts == kMaxExperts &&
+      ((m > 8 && m <= 128) || (top_k >= 8 && (m <= 8 || m > 512 || top_k <= 10))) &&
+      LaunchRoutedE512(device_id, config, m, top_k, block_m, stream, arguments)) {
+    return;
+  }
+  if (!has_shared_expert && (num_experts == 256 || num_experts == 257 || num_experts == 384) &&
+      m > 128 && m <= 512 && top_k >= 8 && top_k <= 10) {
+    LaunchRoutedSplit(device_id, config, m, num_experts, stream, arguments);
+    return;
+  }
   if (use_tiny) {
     LaunchRouterKernel(*config.kernels[has_shared_expert ? 6 : 7],
                        static_cast<unsigned int>(grid_x), alphamoe_router_tiny_generated::kThreads,

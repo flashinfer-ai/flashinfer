@@ -84,7 +84,7 @@ from .resources import (
     MlaWorkQueue,
     WorkThrottleBarrierResource,
 )
-from ..helpers.math import qkv_dtype
+from ..helpers.math import qkv_dtype, canonicalize_softmax_rescale_threshold_log2
 from ..parallel_reduction_topology import (
     ParallelReductionTopology,
     make_balanced_parallel_reduction_topology,
@@ -175,8 +175,10 @@ def build_mla_decode_task_manager(
 ) -> "tuple[TaskManager, list[MemoryResource], dict[str, MemoryResource]]":
     """Build the MLA decode TaskManager with all resources, tasks, and dependency graph.
 
-    The throughput 2CTA graph uses Q/K/V TMA loads, a register-held BF16 page-ID
-    window, QK/PV MMA, softmax, and correction/store tasks. Validation-only
+    The throughput 2CTA graph uses Q/K/V TMA loads, register-held page-ID
+    windows (BF16: refreshed at each window boundary; dense FP8 K/V loaders:
+    the next window is also prefetched), QK/PV MMA, softmax, and
+    correction/store tasks. Validation-only
     calls pass a concrete integer ``domain`` and no runtime tensors; JIT calls
     pass symbolic runtime state and skip schedule validation. The dependency
     graph relies on TaskManager DMA-order validation to keep SMEM producers
@@ -405,7 +407,6 @@ def build_mla_decode_task_manager(
         smem_k = SmemKResource(
             smem_sparse_offsets=sparse_offsets_smem,
             smem_k=smem_kc_arr,
-            page_offsets=page_offsets,
             tma_desc_c_latent=tma_desc_c_latent,
             tma_desc_c_rope=tma_desc_c_rope,
             logical_seq_len_q=logical_seq_len_q,
@@ -416,7 +417,6 @@ def build_mla_decode_task_manager(
         smem_v = SmemVResource(
             smem_sparse_offsets=sparse_offsets_smem,
             smem_v=smem_vc_arr,
-            page_offsets=page_offsets,
             tma_desc_c_transpose=tma_desc_c_transpose,
             tma_desc_extra_v=tma_desc_q_rope,
             logical_seq_len_q=logical_seq_len_q,
@@ -519,11 +519,20 @@ def build_mla_decode_task_manager(
     # register-budget check accounts for the real MLA warpgroup layout.
     wg2_reg_count = cfg.other_reg_num
 
+    # Dense FP8 K/V loaders take page IDs from a prefetched register window
+    # (one table entry per lane, 32 per warp) instead of reading GMEM after
+    # each slot wait; make_mla_decode_config checks the window geometry.
+    dense_page_window = (
+        page_offset_window
+        if cfg.use_fp8_split_mma_schedule and not sparse_offsets_enabled
+        else None
+    )
     if cfg.use_fp8_split_mma_schedule:
         load_k_task = create_load_k_task(
             smem_q,
             smem_k,
             page_offsets=page_offset_window if sparse_offsets_enabled else None,
+            page_window=dense_page_window,
             work_queue=work_queue,
             domain=domain,
             num_registers=wg2_reg_count,
@@ -531,6 +540,7 @@ def build_mla_decode_task_manager(
         load_v_task = create_load_v_task(
             smem_v,
             page_offsets=page_offset_window if sparse_offsets_enabled else None,
+            page_window=dense_page_window,
             work_queue=work_queue,
             domain=domain,
             num_registers=wg2_reg_count,
@@ -718,8 +728,8 @@ def build_mla_decode_task_manager(
     if cfg.use_fp8_split_mma_schedule:
         resource_dependency_graph = {
             smem_q: [],  # Q loads (independent)
-            smem_k: [],  # K loads read page offsets directly
-            smem_v: [],  # V loads read page offsets directly
+            smem_k: [],  # K loads take page IDs from the window or offset ring
+            smem_v: [],  # V loads take page IDs from the window or offset ring
             tmem_s: [smem_k, smem_q],  # QK MMA needs K and Q
             smem_p: [tmem_s],  # softmax reads S -> writes P
             tmem_corr: [tmem_s],  # softmax produces correction
@@ -772,6 +782,8 @@ def build_mla_decode_task_manager(
         resource_dependency_graph[page_offset_window] = (
             [work_queue] if work_queue is not None else []
         )
+    elif dense_page_window is not None:
+        resource_dependency_graph[page_offset_window] = []  # register-held window
 
     # ──────────────────────────────────────────────────────────────
     # Create TaskManager
@@ -831,6 +843,7 @@ class MlaDecodeTs:
         seq_len_q=1,
         batch_size=1,
         mask_type: MaskType | str = MaskType.CAUSAL,
+        softmax_rescale_threshold_log2: float = 0.0,
     ):
         """
         Parameters
@@ -878,6 +891,9 @@ class MlaDecodeTs:
         mask_type : MaskType or str, optional
             ``causal`` (default) for bottom-right speculative decoding or
             ``dense`` for full per-batch KV visibility.
+        softmax_rescale_threshold_log2 : float, optional
+            Compile-time skip-correction threshold in log2 units. ``0.0``
+            (default) keeps the exact online-softmax rescale.
         """
         import cutlass as _cutlass
 
@@ -913,6 +929,13 @@ class MlaDecodeTs:
             raise ValueError("batch_size must be positive")
         self.batch_size = batch_size
         self.mask_type = normalize_mask_type(mask_type)
+        # Validate eagerly: the config (and its own check) is only built when
+        # the kernel is traced, after plan() has bound a workspace.
+        self.softmax_rescale_threshold_log2 = (
+            canonicalize_softmax_rescale_threshold_log2(
+                softmax_rescale_threshold_log2, qkv_dtype=qkv_dtype
+            )
+        )
         self.fuse_sparse_reduction = False
         self.fuse_sparse_epilogue = False
         self.output_quant = None
@@ -977,6 +1000,7 @@ class MlaDecodeTs:
             self.num_heads,
             self.seq_len_q,
             self.mask_type,
+            self.softmax_rescale_threshold_log2,
             self.reduction_split_capacity,
             self.query_tile_layout,
             self.num_q_tiles,
@@ -1075,6 +1099,7 @@ class MlaDecodeTs:
             balance_sparse_registers=self.sparse_balanced_registers,
             fuse_output_quant=self.output_quant is not None
             and self.fuse_sparse_epilogue,
+            softmax_rescale_threshold_log2=self.softmax_rescale_threshold_log2,
         )
 
         # One flattened sparse query supplies a complete M128 tile. Its two

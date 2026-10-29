@@ -1,3 +1,16 @@
+"""Independent FP4 quantization references for bit-exact, zero-tolerance tests.
+
+``ref_fp4_quant`` covers CUDA and CuTe DSL ``fp4_quantize``/``nvfp4_quantize``
+standard-fast NVFP4 and ``fp4_quantize``/``mxfp4_quantize`` MXFP4 with UE8M0
+scales. ``ref_fp4_quant_te`` covers AMAX-based NVFP4, per tensor or per token,
+with explicit standard/4over6 and strict/fast arithmetic configuration.
+Compare packed payload and scale bytes; per-token decode scales compare FP32
+bits. These helpers do not call production quantizers. Fast arithmetic uses
+an independent PTX reciprocal primitive and requires CUDA.
+"""
+
+import functools
+
 import torch
 
 from flashinfer.quantization.nvfp4_quantization_utils import (
@@ -27,7 +40,7 @@ E2M1_TO_FLOAT32 = [
     3.0,
     4.0,
     6.0,
-    0.0,
+    -0.0,
     -0.5,
     -1.0,
     -1.5,
@@ -75,22 +88,61 @@ def get_reciprocal(x):
 
 
 def ref_fp4_quant(x, global_scale, block_size, sf_use_ue8m0=False):
+    """Quantize to unpacked E2M1 values and linear FP32 block scales.
+
+    The E4M3 branch is the bit-exact standard-fast NVFP4 reference for
+    ``nvfp4_quantize`` and ``fp4_quantize`` with 16-element blocks, for both
+    CUDA and CuTe DSL. CUDA is required for the independent PTX reciprocal. Inputs are widened to
+    FP32 without additional rounding; arbitrary leading dimensions are
+    preserved. The supplied encode scale does not provide the original
+    tensor AMAX needed for TE per-tensor parity. No environment is read and
+    no strict or 4over6 mode is inferred.
+
+    The UE8M0 branch is the bit-exact FP16/BF16 MXFP4 reference for
+    ``mxfp4_quantize`` and ``fp4_quantize`` with 32-element blocks, for both
+    CUDA and CuTe DSL. It ignores the global scale, rounds block scales
+    upward, and converts E2M1 values with nearest-even rounding.
+    Both backends preserve FP32 subnormals. Returned FP32 scales use FlashInfer's
+    host-decode convention: UE8M0 byte zero becomes zero. Compare packed
+    payloads and scale bytes with zero tolerance, including signed zeros.
+    """
     assert isinstance(global_scale, (float, int)) or global_scale.dtype == torch.float32
 
     sliced_shape = x.shape[:-1] + (x.shape[-1] // block_size, block_size)
-    sliced_x = torch.reshape(x, sliced_shape)
-    vec_max = torch.max(torch.abs(sliced_x), dim=-1, keepdim=True)[0].to(torch.float32)
-    scale = global_scale * (vec_max * get_reciprocal(FLOAT4_E2M1_MAX))
+    sliced_x = x.to(torch.float32).reshape(sliced_shape)
+    vec_max = sliced_x.abs().amax(dim=-1, keepdim=True)
     if sf_use_ue8m0:
-        scale = (scale.view(torch.int32) + 0x007FFFFF) & 0x7F800000
-        scale = scale.view(torch.float32)
-    else:
-        scale = scale.to(torch.float8_e4m3fn).to(torch.float32)
-    output_scale = get_reciprocal(scale * get_reciprocal(global_scale))
+        if block_size != 32 or x.dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError("MXFP4 reference requires FP16/BF16 and block size 32")
+        six = torch.full((), 6.0, dtype=torch.float32, device=x.device)
+        normalized_max = vec_max * _ref_rcp_approx_ftz(six)
 
-    scaled_x = sliced_x.to(torch.float32) * output_scale
-    clipped_x = torch.clamp(scaled_x, -6.0, 6.0).reshape(x.shape)
-    return cast_to_fp4(clipped_x), scale.squeeze(-1)
+        # Saturating UE8M0 conversion rounds toward +inf, including its
+        # minimum-scale boundary at 2**-127. This is not nearest rounding.
+        bits = normalized_max.contiguous().view(torch.int32)
+        exponent = (bits >> 23) & 0xFF
+        mantissa = bits & 0x7FFFFF
+        round_up = (mantissa != 0) & ((exponent != 0) | (mantissa > 0x400000))
+        exponent = (exponent + round_up.to(torch.int32)).clamp(max=254)
+        inverse = ((254 - exponent) << 23).view(torch.float32)
+        inverse = torch.where(exponent == 0, 0.0, inverse)
+        scaled = sliced_x * inverse
+        q = _ref_e2m1_values(scaled).reshape_as(x)
+        return q, (exponent << 23).view(torch.float32).squeeze(-1)
+    else:
+        global_scale = torch.as_tensor(
+            global_scale, dtype=torch.float32, device=x.device
+        )
+        q, sf, _ = _ref_nvfp4_quant_blocks(
+            sliced_x,
+            vec_max,
+            global_scale,
+            _ref_rcp_approx_ftz(global_scale),
+            None,
+            False,
+            None,
+        )
+        return q.reshape_as(x), sf.view(torch.float8_e4m3fn).float()
 
 
 def nvfp4_global_encode_scale_te(
@@ -144,83 +196,92 @@ def ref_fp4_quant_te(
     x: torch.Tensor,
     global_amax: torch.Tensor,
     block_size: int = 16,
-    *,
     per_token_rowwise: bool = False,
+    nvfp4_4over6_config: NVFP44Over6Config | None = None,
+    disable_fp4_quant_fast_math: bool = True,
+    global_scale_inv: torch.Tensor | None = None,
 ):
-    """NVFP4 reference mirroring TE's Python reference quantizer.
+    """AMAX-based NVFP4 reference for standard or configured 4over6 quantization.
 
-    Returns unpacked E2M1 values and E4M3 block scales in linear layout.
+    ``None`` selects standard NVFP4; a resolved config selects 4over6. Returns
+    unpacked E2M1 values, linear E4M3 scale bytes, the global/row decode scale,
+    and the chosen-four mask (all false for standard NVFP4).
+
+    Strict arithmetic retains the TE-style AMAX contract. Fast arithmetic
+    models FlashInfer's approximate reciprocals and requires CUDA. The
+    quantization arithmetic flag is independent of the recipe's candidate
+    error mode. Signed zeros follow the FP4 conversion; 4over6 zero-AMAX
+    blocks return zero bytes.
+
+    With ``per_token_rowwise=True``, pass the original row AMAX. The optional
+    scalar ``global_scale_inv`` preserves the per-token API's normalization;
+    otherwise it is 1 / (6 * recipe E4M3 maximum). Per-tensor calls derive
+    the encode scale from the supplied tensor AMAX. No environment is read.
     """
-    if x.ndim != 2:
-        raise ValueError(
-            f"ref_fp4_quant_te expects a 2D tensor, got {x.ndim}D with shape {x.shape}"
-        )
+    if x.ndim != 2 or x.shape[1] % block_size:
+        raise ValueError("AMAX NVFP4 reference requires a 2D block-aligned tensor")
     assert block_size == 16
-
+    if nvfp4_4over6_config is not None and not isinstance(
+        nvfp4_4over6_config, NVFP44Over6Config
+    ):
+        raise TypeError("Expected a resolved NVFP44Over6Config or None")
+    if not isinstance(disable_fp4_quant_fast_math, bool):
+        raise TypeError("disable_fp4_quant_fast_math must be bool")
     m, n = x.shape
-    x = x.view(m, n // block_size, block_size)
-    vec_max = torch.amax(torch.abs(x), dim=-1, keepdim=True).to(torch.float32)
-
-    FLOAT4_E2M1_MAX = torch.tensor(6.0, device=x.device, dtype=torch.float32)
-    FLOAT8_E4M3_MAX = torch.tensor(448.0, device=x.device, dtype=torch.float32)
-
+    blocks = x.float().reshape(m, n // block_size, block_size)
+    block_amax = blocks.abs().amax(dim=-1, keepdim=True)
+    global_amax = torch.as_tensor(global_amax, dtype=torch.float32, device=x.device)
     if per_token_rowwise:
-        global_amax = global_amax.to(torch.float32).view(m, 1, 1)
+        global_amax = global_amax.reshape(m, 1, 1)
+        if global_scale_inv is None:
+            global_scale_inv = 1.0 / (6.0 * nvfp4_e4m3_max(nvfp4_4over6_config))
+        global_scale_inv = torch.as_tensor(
+            global_scale_inv, dtype=torch.float32, device=x.device
+        )
+        if global_scale_inv.numel() != 1:
+            raise ValueError("Per-token normalization requires a scalar inverse scale")
+        maximum = torch.finfo(torch.float32).max
+        if disable_fp4_quant_fast_math:
+            global_scale = torch.div(
+                torch.ones_like(global_scale_inv), global_scale_inv
+            )
+            encode = torch.div(global_scale, global_amax).clamp(max=maximum)
+            encode = torch.where(encode == 0, 1.0, encode)
+            output_decode = torch.div(torch.ones_like(encode), encode)
+        else:
+            output_decode = global_amax * global_scale_inv
+            encode = _ref_rcp_approx_ftz(output_decode)
+        output_decode = torch.where(global_amax == 0, 0.0, output_decode).reshape(m)
+        encode = torch.where(
+            global_amax == 0,
+            maximum if nvfp4_4over6_config is None else 0.0,
+            encode,
+        )
+        error_row_amax = global_amax.reshape(m, 1)
     else:
-        global_amax = global_amax.to(torch.float32)
+        if global_scale_inv is not None:
+            raise ValueError("global_scale_inv applies only to per-token quantization")
+        if global_amax.numel() != 1:
+            raise ValueError("Per-tensor quantization requires a scalar AMAX")
+        encode = nvfp4_global_encode_scale_te(global_amax, nvfp4_4over6_config)
+        error_row_amax = None
 
-    global_encode_scale = nvfp4_global_encode_scale_te(global_amax)
-    global_decode_scale = torch.div(1.0, global_encode_scale)
-    global_encode_scale_multiplier = global_encode_scale * torch.reciprocal(
-        FLOAT4_E2M1_MAX
+    if disable_fp4_quant_fast_math:
+        decode = torch.div(torch.ones_like(encode), encode)
+    else:
+        decode = _ref_rcp_approx_ftz(encode)
+    if not per_token_rowwise:
+        output_decode = decode.reshape(())
+    q, sf, pick_four = _ref_nvfp4_quant_blocks(
+        blocks,
+        block_amax,
+        encode,
+        decode,
+        nvfp4_4over6_config,
+        disable_fp4_quant_fast_math,
+        error_row_amax,
     )
-
-    decode_scale = vec_max * global_encode_scale_multiplier
-    decode_scale = torch.min(
-        decode_scale,
-        torch.tensor(
-            torch.finfo(torch.float32).max,
-            device=decode_scale.device,
-            dtype=torch.float32,
-        ),
-    )
-    decode_scale = torch.clamp(decode_scale, min=-FLOAT8_E4M3_MAX, max=FLOAT8_E4M3_MAX)
-    decode_scale = decode_scale.to(torch.float8_e4m3fn)
-
-    encode_scale = torch.min(
-        torch.div(1.0, decode_scale.to(torch.float32) * global_decode_scale),
-        torch.tensor(
-            torch.finfo(torch.float32).max,
-            device=decode_scale.device,
-            dtype=torch.float32,
-        ),
-    )
-
-    scaled_x = x.to(torch.float32) * encode_scale
-    clipped_x = torch.clamp(scaled_x, -FLOAT4_E2M1_MAX, FLOAT4_E2M1_MAX).reshape(m, n)
-
-    return cast_to_fp4(clipped_x), decode_scale.squeeze(-1)
-
-
-def _ref_fp4_quant_te_with_decode_scale(
-    x_blocks: torch.Tensor,
-    decode_scale: torch.Tensor,
-    global_decode_scale: torch.Tensor,
-) -> torch.Tensor:
-    """TE-style FP4 quantization with a caller-provided E4M3 decode scale."""
-    max_float32 = torch.tensor(
-        torch.finfo(torch.float32).max,
-        device=x_blocks.device,
-        dtype=torch.float32,
-    )
-    decode_scale = decode_scale.to(torch.float32)
-    encode_scale = torch.minimum(
-        torch.div(1.0, decode_scale * global_decode_scale),
-        max_float32,
-    )
-    scaled_x = x_blocks.to(torch.float32) * encode_scale
-    clipped_x = torch.clamp(scaled_x, -FLOAT4_E2M1_MAX, FLOAT4_E2M1_MAX)
-    return cast_to_fp4(clipped_x)
+    return q.reshape_as(x), sf, output_decode, pick_four
 
 
 def _ref_nvfp4_4over6_fp16_candidate(
@@ -294,150 +355,181 @@ def _ref_nvfp4_4over6_fp16_candidate(
     return sign_f32 * torch.where(fp16_exp == 0, subnormal_f32, normal_f32)
 
 
-def ref_fp4_quant_4over6_te(
-    x: torch.Tensor,
-    global_amax: torch.Tensor,
-    block_size: int = 16,
-    per_token_rowwise: bool = False,
-    nvfp4_4over6_config: NVFP44Over6Config | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """NVFP4 4over6 reference for FlashInfer's candidate-error contract.
+@functools.lru_cache(maxsize=1)
+def _rcp_approx_ftz_kernel():
+    # Keep Triton optional for the pre-existing pure-PyTorch references.
+    import triton
+    import triton.language as tl
 
-    Returns unpacked E2M1 values, E4M3 block scales in linear layout, the
-    effective global/per-token decode scale, and the chosen candidate mask.
-    """
-    if x.ndim != 2:
-        raise ValueError(
-            f"ref_fp4_quant_4over6_te expects a 2D tensor, got {x.ndim}D with shape {x.shape}"
+    @triton.jit
+    def kernel(X, Y, size: tl.constexpr, BLOCK: tl.constexpr):
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        value = tl.load(X + offsets, offsets < size, other=1.0)
+        result = tl.inline_asm_elementwise(
+            "rcp.approx.ftz.f32 $0, $1;",
+            constraints="=f,f",
+            args=[value],
+            dtype=tl.float32,
+            is_pure=True,
+            pack=1,
         )
-    assert block_size == 16
+        tl.store(Y + offsets, result, offsets < size)
+
+    return kernel
+
+
+def _ref_rcp_approx_ftz(x):
+    """Evaluate the PTX reciprocal primitive independently of CuTe quantizers."""
+    if x.device.type != "cuda" or x.dtype != torch.float32:
+        raise ValueError("Approximate reciprocal reference requires CUDA FP32 input")
+    x = x.contiguous()
+    output = torch.empty_like(x)
+    if x.numel():
+        _rcp_approx_ftz_kernel()[((x.numel() + 255) // 256,)](x, output, x.numel(), 256)
+    return output
+
+
+def _ref_e2m1_values(x):
+    # PTX E2M1 saturates either sign of NaN to +6 and preserves signed zeros.
+    finite_or_inf = torch.copysign(cast_to_fp4(x.abs()), x)
+    return torch.where(torch.isnan(x), 6.0, finite_or_inf)
+
+
+def pack_fp4_values(q_ref):
+    """Pack unpacked E2M1 values into bytes, with the first value in low bits."""
+    if q_ref.ndim != 2 or q_ref.shape[1] % 2:
+        raise ValueError("FP4 packing requires a 2D tensor with even row width")
+    q_abs = torch.abs(q_ref)
+    q_code = torch.zeros_like(q_abs, dtype=torch.uint8)
+    for code, value in enumerate(E2M1_TO_FLOAT32[:8]):
+        q_code = torch.where(q_abs == value, code, q_code)
+    q_code = q_code | (torch.signbit(q_ref).to(torch.uint8) << 3)
+    return q_code[:, 0::2] | (q_code[:, 1::2] << 4)
+
+
+def _ref_nvfp4_quant_blocks(
+    blocks,
+    block_amax,
+    encode,
+    decode,
+    nvfp4_4over6_config,
+    disable_fp4_quant_fast_math,
+    error_row_amax,
+):
+    """Shared candidate construction and conversion for both scale contracts."""
+    if disable_fp4_quant_fast_math:
+        if nvfp4_4over6_config is None:
+            sf6_high = block_amax * (encode * (1.0 / 6.0))
+        else:
+            six = torch.full((), 6.0, dtype=torch.float32, device=blocks.device)
+            sf6_high = torch.div(block_amax, six) * encode
+    else:
+        six = torch.full((), 6.0, dtype=torch.float32, device=blocks.device)
+        sf6_high = encode * (block_amax * _ref_rcp_approx_ftz(six))
+    sf6 = sf6_high.clamp(0, 448).to(torch.float8_e4m3fn)
+
+    def quantize(sf):
+        if disable_fp4_quant_fast_math:
+            multiplier = torch.div(
+                torch.ones_like(sf, dtype=torch.float32), sf.float() * decode
+            ).clamp(max=torch.finfo(torch.float32).max)
+        else:
+            multiplier = _ref_rcp_approx_ftz(sf.float() * decode)
+        if nvfp4_4over6_config is None:
+            if disable_fp4_quant_fast_math:
+                # Nonzero blocks with underflowed SF retain the clamped
+                # multiplier; only zero-AMAX blocks are zeroed in strict mode.
+                multiplier = torch.where(block_amax == 0, 0.0, multiplier)
+            else:
+                multiplier = torch.where(sf.float() == 0, 0.0, multiplier)
+        return _ref_e2m1_values(blocks * multiplier)
+
+    q6 = quantize(sf6)
     if nvfp4_4over6_config is None:
-        nvfp4_4over6_config = NVFP44Over6Config()
-    nvfp4_4over6_err_mode = nvfp4_4over6_config.err_mode
-
-    m, n = x.shape
-    x_blocks = x.view(m, n // block_size, block_size).to(torch.float32)
-    vec_max = torch.amax(torch.abs(x_blocks), dim=-1, keepdim=True)
-
-    e2m1_max = torch.tensor(FLOAT4_E2M1_MAX, device=x.device, dtype=torch.float32)
-
-    float8_e4m3_max = torch.tensor(
-        nvfp4_e4m3_max(nvfp4_4over6_config),
-        device=x.device,
-        dtype=torch.float32,
-    )
-
-    if per_token_rowwise:
-        global_amax = global_amax.to(torch.float32).view(m)
-        global_encode_scale = nvfp4_global_encode_scale_te(
-            global_amax, nvfp4_4over6_config
+        return (
+            q6,
+            sf6.view(torch.uint8).squeeze(-1),
+            torch.zeros_like(block_amax.squeeze(-1), dtype=torch.bool),
         )
-        global_decode_scale = torch.where(
-            global_amax == 0.0,
-            torch.zeros_like(global_amax),
-            torch.div(1.0, global_encode_scale),
-        )
-        global_encode_scale = global_encode_scale.view(m, 1, 1)
-        global_decode_scale_blocks = global_decode_scale.view(m, 1, 1)
-        error_row_amax = global_amax.view(m, 1)
-        error_global_decode_scale = None
-        per_token_scale = global_decode_scale
     else:
-        global_amax = global_amax.to(torch.float32)
-        global_encode_scale = nvfp4_global_encode_scale_te(
-            global_amax, nvfp4_4over6_config
+        sf4_fp8 = (sf6_high * 1.5).clamp(0, 448).to(torch.float8_e4m3fn)
+        sf6_fp8 = sf6
+        q4 = quantize(sf4_fp8)
+        m, num_blocks, block_size = blocks.shape
+        nvfp4_4over6_err_mode = nvfp4_4over6_config.err_mode
+        per_token_rowwise = error_row_amax is not None
+        e2m1_max = torch.tensor(6.0, dtype=torch.float32, device=blocks.device)
+        float8_e4m3_max = torch.tensor(
+            nvfp4_e4m3_max(nvfp4_4over6_config),
+            dtype=torch.float32,
+            device=blocks.device,
         )
-        global_decode_scale = torch.div(1.0, global_encode_scale)
-        global_decode_scale_blocks = global_decode_scale
-        error_row_amax = None
-        error_global_decode_scale = global_decode_scale
-        per_token_scale = global_decode_scale.reshape(())
+        sf4 = sf4_fp8.to(torch.float32)
+        sf6 = sf6_fp8.to(torch.float32)
+        err4 = torch.zeros((m, num_blocks), dtype=torch.float32, device=blocks.device)
+        err6 = torch.zeros_like(err4)
+        if nvfp4_4over6_config.err_use_fast_math:
+            original_scaled = blocks * encode
+            candidate4_scaled = _ref_nvfp4_4over6_fp16_candidate(q4, sf4_fp8)
+            candidate6_scaled = _ref_nvfp4_4over6_fp16_candidate(q6, sf6_fp8)
+            for i in range(block_size):
+                diff4 = candidate4_scaled[:, :, i] - original_scaled[:, :, i]
+                diff6 = candidate6_scaled[:, :, i] - original_scaled[:, :, i]
+                if nvfp4_4over6_err_mode == NVFP44Over6ErrMode.MSE:
+                    err4 += diff4 * diff4
+                    err6 += diff6 * diff6
+                elif nvfp4_4over6_err_mode == NVFP44Over6ErrMode.MAE:
+                    err4 += torch.abs(diff4)
+                    err6 += torch.abs(diff6)
+                else:
+                    raise ValueError(
+                        f"Unsupported 4over6 error mode: {nvfp4_4over6_err_mode}"
+                    )
+        else:
+            # Per-token strict scoring uses the row amax that is already computed
+            # online. Per-tensor strict scoring intentionally uses the normal
+            # global-decode-scale expression to avoid an additional tensor amax.
+            denom = e2m1_max * float8_e4m3_max
+            sf4 = sf4.squeeze(-1)
+            sf6 = sf6.squeeze(-1)
+            for i in range(block_size):
+                val4 = q4[:, :, i] * sf4
+                if per_token_rowwise:
+                    val4 = val4 * error_row_amax
+                    val4 = val4 / denom
+                else:
+                    val4 = val4 * decode
+                diff4 = val4 - blocks[:, :, i]
+                val6 = q6[:, :, i] * sf6
+                if per_token_rowwise:
+                    val6 = val6 * error_row_amax
+                    val6 = val6 / denom
+                else:
+                    val6 = val6 * decode
+                diff6 = val6 - blocks[:, :, i]
+                if nvfp4_4over6_err_mode == NVFP44Over6ErrMode.MSE:
+                    err4 += diff4 * diff4
+                    err6 += diff6 * diff6
+                elif nvfp4_4over6_err_mode == NVFP44Over6ErrMode.MAE:
+                    err4 += torch.abs(diff4)
+                    err6 += torch.abs(diff6)
+                else:
+                    raise ValueError(
+                        f"Unsupported 4over6 error mode: {nvfp4_4over6_err_mode}"
+                    )
+        pick_four = err4 < err6
 
-    # Candidate scale construction follows the original 4over6 reference.
-    sf6_high_precision = torch.where(
-        vec_max == 0.0,
-        torch.zeros_like(vec_max),
-        torch.div(vec_max, e2m1_max) * global_encode_scale,
-    )
-    sf4_high_precision = sf6_high_precision * 1.5
-    float8_e4m3_clamp_max = torch.tensor(448.0, device=x.device, dtype=torch.float32)
-    sf4_high_precision = torch.clamp(
-        sf4_high_precision, min=-float8_e4m3_clamp_max, max=float8_e4m3_clamp_max
-    )
-    sf6_high_precision = torch.clamp(
-        sf6_high_precision, min=-float8_e4m3_clamp_max, max=float8_e4m3_clamp_max
-    )
-    sf4_fp8 = sf4_high_precision.to(torch.float8_e4m3fn)
-    sf6_fp8 = sf6_high_precision.to(torch.float8_e4m3fn)
-    sf4 = sf4_fp8.to(torch.float32)
-    sf6 = sf6_fp8.to(torch.float32)
-
-    # Candidate FP4 quantization follows the TE reference expression exactly:
-    # encode_scale = min(1 / (fp32(fp8_scale) * global_decode_scale), fp32_max),
-    # then clamp to E2M1 range and map with cast_to_fp4.
-    q4 = _ref_fp4_quant_te_with_decode_scale(
-        x_blocks,
-        sf4_fp8,
-        global_decode_scale_blocks,
-    )
-    q6 = _ref_fp4_quant_te_with_decode_scale(
-        x_blocks,
-        sf6_fp8,
-        global_decode_scale_blocks,
-    )
-
-    err4 = torch.zeros((m, n // block_size), dtype=torch.float32, device=x.device)
-    err6 = torch.zeros((m, n // block_size), dtype=torch.float32, device=x.device)
-    if nvfp4_4over6_config.err_use_fast_math:
-        original_scaled = x_blocks * global_encode_scale
-        candidate4_scaled = _ref_nvfp4_4over6_fp16_candidate(q4, sf4_fp8)
-        candidate6_scaled = _ref_nvfp4_4over6_fp16_candidate(q6, sf6_fp8)
-        for i in range(block_size):
-            diff4 = candidate4_scaled[:, :, i] - original_scaled[:, :, i]
-            diff6 = candidate6_scaled[:, :, i] - original_scaled[:, :, i]
-            if nvfp4_4over6_err_mode == NVFP44Over6ErrMode.MSE:
-                err4 += diff4 * diff4
-                err6 += diff6 * diff6
-            else:
-                err4 += torch.abs(diff4)
-                err6 += torch.abs(diff6)
-    else:
-        # Per-token strict scoring uses the row amax that is already computed
-        # online. Per-tensor strict scoring intentionally uses the normal
-        # global-decode-scale expression to avoid an additional tensor amax.
-        denom = e2m1_max * float8_e4m3_max
-        sf4 = sf4.squeeze(-1)
-        sf6 = sf6.squeeze(-1)
-        for i in range(block_size):
-            val4 = q4[:, :, i] * sf4
-            if per_token_rowwise:
-                val4 = val4 * error_row_amax
-                val4 = val4 / denom
-            else:
-                val4 = val4 * error_global_decode_scale
-            diff4 = val4 - x_blocks[:, :, i]
-            val6 = q6[:, :, i] * sf6
-            if per_token_rowwise:
-                val6 = val6 * error_row_amax
-                val6 = val6 / denom
-            else:
-                val6 = val6 * error_global_decode_scale
-            diff6 = val6 - x_blocks[:, :, i]
-            if nvfp4_4over6_err_mode == NVFP44Over6ErrMode.MSE:
-                err4 += diff4 * diff4
-                err6 += diff6 * diff6
-            else:
-                err4 += torch.abs(diff4)
-                err6 += torch.abs(diff6)
-    pick_four = err4 < err6
-
-    q_ref = torch.where(pick_four.unsqueeze(-1), q4, q6).reshape(m, n)
-    scale_ref = torch.where(
-        pick_four,
-        sf4_fp8.view(torch.uint8).squeeze(-1),
-        sf6_fp8.view(torch.uint8).squeeze(-1),
-    )
-    return q_ref, scale_ref, per_token_scale, pick_four
+        q_ref = torch.where(pick_four.unsqueeze(-1), q4, q6)
+        scale_ref = torch.where(
+            pick_four,
+            sf4_fp8.view(torch.uint8).squeeze(-1),
+            sf6_fp8.view(torch.uint8).squeeze(-1),
+        )
+        # The 4over6 kernel exits before candidate formation for zero blocks,
+        # including negative-zero inputs.
+        q_ref = torch.where(block_amax == 0, 0.0, q_ref)
+        scale_ref = torch.where(block_amax.squeeze(-1) == 0, 0, scale_ref)
+        return q_ref, scale_ref, pick_four
 
 
 def recover_swizzled_scales(scale, m, n, block_size, sf_start_index=0):

@@ -649,6 +649,28 @@ class SmemPageOffsetsResource(MlaResource):
         # The load task waits on the page-offset stage, snapshots the page ids
         # into registers, and keeps swaps K0/K1 live until their delayed V use.
         del stage_info
+        if cutlass.const_expr(self.cfg.sparse_d576):
+            assert self.cfg.cache_uniform_sparse_quads
+            # Snapshot this warp's eight quads once per K / V tile as
+            # warp-uniform coordinates; every head-dimension stage of the
+            # tile then issues them from one elected lane without the
+            # per-lane R2UR waterfall.
+            quads = self.cfg.tile_size_kv // (4 * self.cfg.load_num_warps)
+            warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - Int32(
+                self.cfg.load_warp_idx
+            )
+            row_base = self.consumer_work_stage * Int32(
+                self.cfg.page_offsets_entries_per_stage
+            ) + warp * Int32(4 * quads)
+            for quad in cutlass.range_constexpr(quads):
+                rows = self._smem_page_offsets.data_ptr(
+                    row_base + Int32(4 * quad)
+                ).load(count=4, alignment=16)
+                for j in cutlass.range_constexpr(4):
+                    cached_page_ids[6 + quad * 4 + j] = cute.arch.make_warp_uniform(
+                        Int32(rows[j])
+                    )
+            return cached_page_ids
         if cutlass.const_expr(self.cfg.num_tokens_per_page == 1):
             lane = lane_idx_from_thread(cute.arch.thread_idx()[0])
             warp = cute.arch.thread_idx()[0] // 32 - self.cfg.load_warp_idx
@@ -974,7 +996,7 @@ class SmemKvResource(MlaResource):
         stage_base = self._stage_base(stage_info)
         inner_width = min(tma_inner_dim_elems(cfg), active_width)
         uses_compact_fp8_rope_stage = (
-            cfg.load_num_warps == 1
+            (cfg.load_num_warps == 1 or cfg.sparse_d576)
             and cfg.is_fp8_qkv()
             and not is_v
             and cfg.rope_dim == 64
@@ -982,6 +1004,59 @@ class SmemKvResource(MlaResource):
             and cfg.head_dim_per_stage_kv == 128
         )
 
+        if cutlass.const_expr(cfg.sparse_d576):
+            # D576 sparse K/V stage: each loader warp issues its quads (one
+            # Gather4 of four token rows each) from the warp-uniform rows that
+            # read_offsets cached for this tile.  The four rows land at
+            # consecutive SMEM rows of the stage, so the TMA swizzle (SW128
+            # latent / SW64 RoPE) is the one the UMMA descriptors expect.  Rows
+            # addressed outside the pool are zero-filled by the TMA unit and
+            # still count toward the stage's transaction bytes; only -1 slots
+            # are also masked in softmax.
+            assert cfg.cache_uniform_sparse_quads, (
+                "D576 sparse loads issue from the cached uniform quads"
+            )
+            is_rope_stage = (not is_v) and (
+                qk_stage_idx >= cfg.latent_dim // cfg.head_dim_per_stage_kv
+            )
+            num_load_warps = cfg.load_num_warps
+            warp_in_task = Int32(0)
+            if cutlass.const_expr(num_load_warps > 1):
+                warp_in_task = cute.arch.make_warp_uniform(
+                    cute.arch.warp_idx()
+                ) - Int32(cfg.load_warp_idx)
+            # Row maps: latent D128 slices (SW128) or the RoPE columns (SW64).
+            descriptor = (
+                self.tma_desc_c_rope if is_rope_stage else self.tma_desc_c_latent
+            )
+            quads_per_warp = cfg.tile_size_kv // (4 * num_load_warps)
+            gather4_cached_warp(
+                stage_base.data_ptr(
+                    warp_in_task * Int32(quads_per_warp * 4 * active_width)
+                ),
+                descriptor,
+                Int32(0) if is_rope_stage else dim_offset,
+                cached_page_ids,
+                stage_info.barrier,
+                cache_start=6,
+                num_quads=quads_per_warp,
+                num_slices=1,
+                quad_stride=4 * active_width,
+                slice_stride=0,
+                col_stride=0,
+            )
+            if cutlass.const_expr(uses_compact_fp8_rope_stage):
+                if warp_in_task == Int32(0):
+                    if prims.elect_sync():
+                        missing_stage_bytes = (
+                            cfg.tile_size_kv
+                            * (cfg.head_dim_per_stage_kv - active_width)
+                            * cfg.qkv_dtype_bytes
+                        )
+                        prims.mbarrier_complete_tx(
+                            stage_info.barrier, Int32(missing_stage_bytes)
+                        )
+            return
         # Each lane owns four adjacent index-list entries. Bulk TMA requires
         # a verified 32-row physical run within one source; irregular rows
         # use gather4. The separate empty-window path only zero-fills padding.

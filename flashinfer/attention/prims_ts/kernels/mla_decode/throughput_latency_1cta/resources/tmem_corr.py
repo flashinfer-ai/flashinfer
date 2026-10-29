@@ -70,8 +70,8 @@ from ...helpers.math import (
     partial_output_dtype,
 )
 from ...helpers.ops import (
-    fp8_quant_scale,
-    fp8_quant_scale_rcp,
+    fp8_p_scale,
+    fp8_p_scale_rcp,
     pack_float4_to_fp8_e4m3,
     store_transposed_smem8b_x2,
     store_transposed_smem8b_x4,
@@ -143,7 +143,7 @@ class TmemCorrResource(MlaResource):
     def _keeps_direct_output(self):
         return (
             self.cfg.kernel_variant == "keeps_mma_ab"
-            and self.cfg.num_tokens_per_page == 1
+            and self.cfg.sparse_d512
             and self.cfg.use_cluster_reduction != 1
         )
 
@@ -521,7 +521,7 @@ class TmemCorrResource(MlaResource):
             )
             head_idx = head_base_idx + local_row_idx
         if cutlass.const_expr(
-            self.cfg.num_tokens_per_page == 1 and self.cfg.use_cluster_reduction != 1
+            self.cfg.sparse_d512 and self.cfg.use_cluster_reduction != 1
         ):
             should_store_lse = should_store_lse and cta_idx_head_dim_v == Int32(0)
         if should_store_lse:
@@ -555,7 +555,7 @@ class TmemCorrResource(MlaResource):
                 if cutlass.const_expr(self.cfg.is_fp8_qkv()):
                     # P and the online sum use the same FP8 quantization scale.
                     # Undo that scale for the externally visible log-sum-exp.
-                    lse_sum = lse_sum * fp8_quant_scale_rcp()
+                    lse_sum = lse_sum * fp8_p_scale_rcp(self.cfg)
                 lse_val = (
                     cute.math.log2(lse_sum, fastmath=True)
                     + self.scale_softmax_log2 * selected_max
@@ -593,6 +593,11 @@ class TmemCorrResource(MlaResource):
                             lse_val
                         )
                 else:
+                    if cutlass.const_expr(self.cfg.sparse_d576):
+                        # The sparse MLA wrapper publishes natural-log LSE (the
+                        # D512 path finalizes the same way); split partials
+                        # above stay base 2 for the reducer.
+                        lse_val = lse_val * Float32(LN_2)
                     if valid_output_row:
                         elem_offset = public_query_flat_row(
                             self.cfg,
@@ -1484,7 +1489,7 @@ class TmemCorrResource(MlaResource):
                                 cute.math.min(delta, Float32(0)), approx=True
                             )
                             if cutlass.const_expr(cfg.is_fp8_qkv()):
-                                sink_mass *= fp8_quant_scale()
+                                sink_mass *= fp8_p_scale(cfg)
                             norm_scale = (
                                 self.output_scale
                                 * attention_rescale

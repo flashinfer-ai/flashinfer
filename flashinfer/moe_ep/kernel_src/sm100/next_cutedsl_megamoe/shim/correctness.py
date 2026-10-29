@@ -22,30 +22,25 @@ def sampled_reference(
     cfg = symm_buffer.config
     count = min(sample_size, num_tokens)
     indices = torch.linspace(0, max(num_tokens - 1, 0), count, device="cuda").long()
+    sources = [
+        symm_buffer.x,
+        symm_buffer.x_sf,
+        symm_buffer.topk_idx,
+        symm_buffer.topk_weights,
+    ]
+    scale = getattr(symm_buffer, "fc1_activation_per_token_scale", None)
+    if scale is not None:
+        sources.append(scale)
     local = [
         torch.zeros(
             (sample_size, *t.shape[1:]), dtype=torch.uint8, device=t.device
         ).view(t.dtype)
         if t.element_size() == 1
         else torch.zeros((sample_size, *t.shape[1:]), dtype=t.dtype, device=t.device)
-        for t in (
-            symm_buffer.x,
-            symm_buffer.x_sf,
-            symm_buffer.topk_idx,
-            symm_buffer.topk_weights,
-        )
+        for t in sources
     ]
     local[2].fill_(-1)
-    for source, target in zip(
-        (
-            symm_buffer.x,
-            symm_buffer.x_sf,
-            symm_buffer.topk_idx,
-            symm_buffer.topk_weights,
-        ),
-        local,
-        strict=False,
-    ):
+    for source, target in zip(sources, local, strict=True):
         if source.element_size() == 1:
             target[:count].view(torch.uint8).copy_(source.view(torch.uint8)[indices])
         else:
@@ -76,11 +71,14 @@ def sampled_reference(
             combine_dtype=cfg.combine_dtype,
             local_expert_offset=cfg.rank * cfg.experts_per_rank,
             gate_up_clamp=cfg.gate_up_clamp,
-            apply_topk_at_fc1=cfg.apply_topk_at_fc1,
+            apply_routing_weights_before_fc2=cfg.apply_routing_weights_before_fc2,
             weight_scales_are_swizzled=True,
             return_fp32=True,
             situ_beta=cfg.situ_beta,
             situ_linear_beta=cfg.situ_linear_beta,
+            swiglu_alpha=getattr(cfg, "swiglu_alpha", None),
+            swiglu_beta=getattr(cfg, "swiglu_beta", None),
+            fc1_activation_per_token_scale=payload[4] if scale is not None else None,
             fc1_alpha=getattr(symm_buffer, "fc1_alpha", None),
             fc2_alpha=getattr(symm_buffer, "fc2_alpha", None),
             fc1_norm_const=getattr(symm_buffer, "fc1_norm_const", None),

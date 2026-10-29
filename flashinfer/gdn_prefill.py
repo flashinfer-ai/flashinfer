@@ -32,15 +32,20 @@ try:
     from .jit import cake_gdn as _cake_gdn
 
     _CAKE_GDN_AVAILABLE = True
+    _HostOffsetsError: type[NotImplementedError] = _cake_gdn.CakeGDNUnsupportedError
 except (ImportError, RuntimeError):
     _cake_gdn = None
     _CAKE_GDN_AVAILABLE = False
+    # CakeGDNUnsupportedError's base: SM8x checks host offsets without Cake.
+    _HostOffsetsError = NotImplementedError
 from .utils import get_compute_capability, get_device_name, get_device_sm_count
 from .gdn_kernels import (
     _chunk_gated_delta_rule_gdn_cp_sm100,
+    chunk_gated_delta_rule_sm80,
     chunk_gated_delta_rule_sm90,
     chunk_gated_delta_rule_sm100,
     chunk_gated_delta_rule_sm120,
+    cp_delta_rule_dsl_sm80,
     cp_delta_rule_dsl_sm90,
     cp_delta_rule_dsl_sm100,
     cp_delta_rule_dsl_sm120,
@@ -48,6 +53,8 @@ from .gdn_kernels import (
 from .gdn_kernels.delta_rule_dsl.varlen_helper import (
     is_integer_dtype,
     should_use_cp_host,
+    should_use_cp_sm80_host,
+    should_use_v32_sm80_host,
 )
 
 
@@ -189,7 +196,7 @@ def _cake_gdn_prefill_host_offsets(
             or cu_seqlens_cpu.ndim != 1
             or cu_seqlens_cpu.dtype not in (torch.int32, torch.int64)
         ):
-            raise _cake_gdn.CakeGDNUnsupportedError(
+            raise _HostOffsetsError(
                 "cu_seqlens_cpu must be a one-dimensional int32/int64 CPU tensor"
             )
         values = cu_seqlens_cpu.tolist()
@@ -197,18 +204,18 @@ def _cake_gdn_prefill_host_offsets(
         values = []
         for value in cu_seqlens_cpu:
             if isinstance(value, bool):
-                raise _cake_gdn.CakeGDNUnsupportedError(
+                raise _HostOffsetsError(
                     "cu_seqlens_cpu must hold integer offsets, not bools"
                 )
             try:
                 values.append(operator.index(value))
             except TypeError as exc:
-                raise _cake_gdn.CakeGDNUnsupportedError(
+                raise _HostOffsetsError(
                     "cu_seqlens_cpu must be a CPU integer tensor or a sequence of ints"
                 ) from exc
     offsets = tuple(int(value) for value in values)
     if len(offsets) != num_seqs + 1:
-        raise _cake_gdn.CakeGDNUnsupportedError(
+        raise _HostOffsetsError(
             f"cu_seqlens_cpu must have num_seqs + 1 = {num_seqs + 1} entries, "
             f"got {len(offsets)}"
         )
@@ -217,7 +224,7 @@ def _cake_gdn_prefill_host_offsets(
         or offsets[-1] != total_tokens
         or any(end < start for start, end in zip(offsets, offsets[1:], strict=False))
     ):
-        raise _cake_gdn.CakeGDNUnsupportedError(
+        raise _HostOffsetsError(
             "GDN non-CP prefill requires monotonic cu_seqlens spanning all input tokens"
         )
     return offsets
@@ -306,6 +313,87 @@ def _cake_gdn_assert_state_slots(
         + ("-1 or " if allow_minus_one else "")
         + f"slots in [0, {pool_size})",
     )
+
+
+def _validate_slot_args(
+    *,
+    q: torch.Tensor,
+    cu_seqlens: Optional[torch.Tensor],
+    state_indices: Optional[torch.Tensor],
+    output_state: Optional[torch.Tensor],
+    output_final_state: bool,
+    checkpoint_every_n_tokens: int,
+    output_state_indices: Optional[torch.Tensor],
+    checkpoint_state_indices: Optional[torch.Tensor],
+    prefix_lens: Optional[torch.Tensor],
+    backend: str,
+    use_cp: Literal["auto"] | bool,
+    cp_chunk_len: Optional[int],
+) -> bool:
+    """Check the slot-addressing arguments; return whether any is given.
+
+    ``output_state_indices``, ``checkpoint_state_indices`` and ``prefix_lens``
+    let a caller keep its states in one pool addressed per sequence (a paged
+    recurrent-state cache): read and write rows differ, checkpoints land in
+    pool rows, and checkpoint positions are absolute. Only the native non-CP
+    kernels implement them.
+    """
+
+    given = [
+        name
+        for name, tensor in (
+            ("output_state_indices", output_state_indices),
+            ("checkpoint_state_indices", checkpoint_state_indices),
+            ("prefix_lens", prefix_lens),
+        )
+        if tensor is not None
+    ]
+    if not given:
+        return False
+    names = ", ".join(given)
+    if backend not in ("auto", "flashinfer"):
+        raise ValueError(
+            f"{names} require the native non-CP kernels "
+            f'(backend="auto" or "flashinfer"), got backend={backend!r}'
+        )
+    if use_cp is True or cp_chunk_len is not None:
+        raise ValueError(f"{names} are not supported with context parallelism")
+    num_seqs = None if cu_seqlens is None else cu_seqlens.size(0) - 1
+
+    def check_index_tensor(name: str, tensor: torch.Tensor, length) -> None:
+        if not is_integer_dtype(tensor.dtype):
+            raise ValueError(f"{name} must be int32 or int64, got {tensor.dtype}")
+        if tensor.ndim != 1 or (length is not None and tensor.size(0) not in length):
+            expected = "" if length is None else f" of {length[0]} entries"
+            raise ValueError(
+                f"{name} must be 1D{expected}, got shape {tuple(tensor.shape)}"
+            )
+        if tensor.device != q.device:
+            raise ValueError(f"{name} must be on {q.device}, got {tensor.device}")
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+
+    seq_shape = None if num_seqs is None else (num_seqs,)
+    if output_state_indices is not None:
+        check_index_tensor("output_state_indices", output_state_indices, seq_shape)
+        if state_indices is None:
+            raise ValueError("output_state_indices requires state_indices")
+        if output_state is None or not output_final_state:
+            raise ValueError(
+                "output_state_indices requires an explicit output_state pool "
+                "and output_final_state=True"
+            )
+    if checkpoint_state_indices is not None:
+        check_index_tensor("checkpoint_state_indices", checkpoint_state_indices, None)
+        if checkpoint_every_n_tokens <= 0:
+            raise ValueError(
+                "checkpoint_state_indices requires checkpoint_every_n_tokens > 0"
+            )
+    if prefix_lens is not None:
+        check_index_tensor("prefix_lens", prefix_lens, seq_shape)
+        if checkpoint_every_n_tokens <= 0:
+            raise ValueError("prefix_lens requires checkpoint_every_n_tokens > 0")
+    return True
 
 
 def _cake_gdn_prefill_dtype_name(dtype: torch.dtype) -> str:
@@ -871,6 +959,33 @@ def _is_gdn_cp_sm100_supported_shape(
     )
 
 
+def _allocate_sm8x_output_state(
+    num_seqs: int,
+    num_sab_heads: int,
+    head_size: int,
+    device,
+    initial_state: Optional[torch.Tensor],
+    state_indices: Optional[torch.Tensor],
+    returned: bool = True,
+) -> torch.Tensor:
+    """The SM8x final-state buffer; a zero-length sequence never writes its row.
+
+    A returned buffer starts as the initial state, or zero without one, so that
+    row is h0 or zero. Scratch the caller never reads stays uninitialized.
+    """
+    shape = (
+        initial_state.shape
+        if state_indices is not None and initial_state is not None
+        else (num_seqs, num_sab_heads, head_size, head_size)
+    )
+    if returned and initial_state is None:
+        return torch.zeros(shape, dtype=torch.float32, device=device)
+    out = torch.empty(shape, dtype=torch.float32, device=device)
+    if returned:
+        out.copy_(initial_state)
+    return out
+
+
 def _cp_delta_rule_rejection_reason(
     *,
     arch_major: int,
@@ -890,7 +1005,11 @@ def _cp_delta_rule_rejection_reason(
     state_indices: Optional[torch.Tensor],
     cp_chunk_len: Optional[int],
 ) -> Optional[str]:
-    if arch_major == 9:
+    """Why CP cannot serve this call, or ``None`` if it can."""
+    if arch_major == 8:
+        if cp_delta_rule_dsl_sm80 is None:
+            return "CP delta rule SM8x DSL kernel is unavailable"
+    elif arch_major == 9:
         if cp_delta_rule_dsl_sm90 is None:
             return "CP delta rule SM90 DSL kernel is unavailable"
     elif arch_major == 10:
@@ -906,7 +1025,10 @@ def _cp_delta_rule_rejection_reason(
         if cp_delta_rule_dsl_sm120 is None:
             return "CP delta rule SM120 DSL kernel is unavailable"
     else:
-        return "CP delta rule is currently implemented only for SM90, SM100, and SM120"
+        return (
+            "CP delta rule is currently implemented only for SM8x, SM90, "
+            "SM100, and SM120"
+        )
     if q.shape[-1] != 128:
         return f"CP delta rule only supports head_size=128, got {q.shape[-1]}"
     if q.dtype not in (torch.float16, torch.bfloat16):
@@ -1041,6 +1163,9 @@ def chunk_gated_delta_rule(
     dt_bias: Optional[torch.Tensor] = None,
     beta_is_logit: bool = False,
     cu_seqlens_cpu: Optional[Union[Sequence[int], torch.Tensor]] = None,
+    output_state_indices: Optional[torch.Tensor] = None,
+    checkpoint_state_indices: Optional[torch.Tensor] = None,
+    prefix_lens: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Chunked Gated Delta Rule (GDN) attention for prefill.
 
@@ -1076,7 +1201,7 @@ def chunk_gated_delta_rule(
         Initial KV state. Packed, sequence-ordered shape
         ``[num_seqs, num_sab_heads, head_size, head_size]``.  Must be
         float32, bfloat16, float16, float8_e4m3fn, or float8_e5m2. Starts from zero state
-        when ``None``.  When ``state_indices`` is given (SM90/SM100/SM103/SM120),
+        when ``None``.  When ``state_indices`` is given (SM8x/SM90/SM100/SM103/SM120),
         this is instead the state **pool** ``[N_pool, num_sab_heads,
         head_size, head_size]`` and sequence ``i`` reads its initial state
         from row ``state_indices[i]``; on SM100/SM103 every rank-4 positive,
@@ -1103,8 +1228,9 @@ def chunk_gated_delta_rule(
         bfloat16, float16, float8_e4m3fn, or float8_e5m2. Required when
         ``output_final_state=True``.  When ``state_indices`` is given it is
         instead the output state **pool** ``[N_pool, ...]`` and sequence
-        ``i``'s final state is written to row ``state_indices[i]`` (in place
-        when ``output_state is initial_state``); it must be provided by the
+        ``i``'s final state is written to row ``state_indices[i]``, or to row
+        ``output_state_indices[i]`` when that is given (in place when
+        ``output_state is initial_state``); it must be provided by the
         caller (auto-allocation is rejected, since a compact ``[num_seqs, ...]``
         buffer would be indexed out of bounds by the pool slot ids).
         SM100/SM103 accepts the same positive, non-overlapping rank-4 stride
@@ -1114,45 +1240,56 @@ def chunk_gated_delta_rule(
         num_sab_heads, head_size, head_size]``. May be float32, bfloat16,
         float16, float8_e4m3fn, or float8_e5m2. Required when
         ``checkpoint_every_n_tokens > 0``. Context-parallel checkpointing is
-        currently supported on SM90, SM100, and SM120.
+        currently supported on SM8x, SM90, SM100, and SM120.
     checkpoint_cu_starts : torch.Tensor, optional
         Cumulative checkpoint counts of shape ``[num_seqs + 1]``, int32 or
         int64 on the same CUDA device as ``q``.
         ``checkpoint_cu_starts[i+1] - checkpoint_cu_starts[i]`` is the
-        number of checkpoints for sequence ``i`` (= ``seq_len_i //
-        checkpoint_every_n_tokens``).  Required when
-        ``checkpoint_every_n_tokens > 0``. The values must be monotonic and
-        consistent with ``cu_seqlens``; this caller precondition is not checked
-        at launch to avoid a device-to-host synchronization.
+        number of checkpoints for sequence ``i``: ``seq_len_i //
+        checkpoint_every_n_tokens``, or ``(prefix_lens[i] + seq_len_i) // N -
+        prefix_lens[i] // N`` with ``prefix_lens`` (``N =
+        checkpoint_every_n_tokens``). With ``checkpoint_state_indices`` only
+        ``checkpoint_cu_starts[i]`` is read and ``[num_seqs]`` entries are
+        also accepted.  Required when
+        ``checkpoint_every_n_tokens > 0``. Without ``checkpoint_state_indices``
+        the values must be monotonic and consistent with ``cu_seqlens``; this
+        caller precondition is not checked at launch to avoid a device-to-host
+        synchronization.
     checkpoint_every_n_tokens : int
         Store intermediate state every N tokens.  Must be a multiple of the
         chunk size (64).  ``0`` disables checkpointing (default).
     use_cp : Literal["auto"] | bool, optional:
-        Whether to use context parallelism when low-parallelism heuristics
-        match. SM100/SM103/SM107 uses the generated GDN CP-only four-stage
-        implementation for structurally supported shapes. Other legal
-        configurations retain the CuTe-DSL implementation.
-        ``"auto"`` enables conservative routing, ``True`` requires CP support,
-        and ``False`` disables CP. Default: ``"auto"``.
+        Whether to use the architecture-specific context-parallel DSL
+        implementation on SM8x, SM90, SM100/SM103/SM107 or SM120, where it is
+        supported and low-parallelism heuristics match. SM100/SM103/SM107 uses
+        the generated GDN CP-only four-stage implementation for structurally
+        supported shapes; other legal configurations retain the CuTe-DSL
+        implementation. ``"auto"`` enables conservative routing, ``True``
+        requires CP support, and ``False`` disables CP. Default: ``"auto"``.
     state_indices : torch.Tensor, optional
         Int32 or int64 tensor of shape ``[num_seqs]``
-        (SM90/SM100/SM103/SM120). When provided,
+        (SM8x/SM90/SM100/SM103/SM120). When provided,
         ``initial_state`` and ``output_state`` are treated as a state pool whose
         first dimension is indexed by these slot ids rather than laid out in
         sequence order: sequence ``i`` reads its initial state from row
         ``state_indices[i]`` and writes its final state back to the same row
-        (in place when ``output_state is initial_state``). This lets callers
+        (in place when ``output_state is initial_state``), or to row
+        ``output_state_indices[i]`` when that is given. This lets callers
         that keep a paged/indexed state pool avoid gathering the active rows
         into a packed buffer and scattering the result back. The pool may be
         any positive, non-overlapping rank-4 stride layout on SM100/SM103.
         ``None`` (default) keeps sequence-ordered row mapping without requiring
         the physical view itself to be contiguous.
 
-        The ids **must be unique**: as with any indexed scatter, two sequences
-        sharing a slot id would concurrently write the same pool row across
-        work tiles, leaving that row's final state nondeterministic. Uniqueness
-        is a caller precondition (not checked at launch, to avoid a per-call
-        host sync); the caller's slot allocator is expected to guarantee it.
+        Without ``output_state_indices`` the ids **must be unique**: as with
+        any indexed scatter, two sequences sharing a slot id would
+        concurrently write the same pool row across work tiles, leaving that
+        row's final state nondeterministic. Uniqueness is a caller
+        precondition (not checked at launch, to avoid a per-call host sync);
+        the caller's slot allocator is expected to guarantee it. With
+        ``output_state_indices`` read ids may repeat or be ``-1``; only the
+        rows a sequence writes must not be read or written by another
+        sequence.
         ``backend="cudnn"`` requires frontend 1.31+, int32 indices and
         float32/bfloat16 pools with dense ``[H, V, K]`` rows and a 16-byte
         aligned slot stride. It supports identical input/output pool views
@@ -1238,7 +1375,8 @@ def chunk_gated_delta_rule(
         or a sequence of Python ints of length ``num_seqs + 1`` holding the
         same values (vLLM's ``query_start_loc_cpu``, the prefix sums of
         SGLang's ``extend_seq_lens_cpu``). Used by ``backend="cake_gdn"``
-        without CP and ignored by every other route. When given, the Cake
+        without CP, and on SM8x by the ``use_cp="auto"`` and V32 rules, which
+        need the exact longest sequence and keep the fused path without it. When given, the Cake
         route validates it on the host (non-decreasing, first entry ``0``,
         last entry ``total_seq_len``; a mismatch raises before any launch),
         takes the exact longest sequence as the bound for variant selection,
@@ -1261,6 +1399,50 @@ def chunk_gated_delta_rule(
         reaches the kernel as is too. Nothing is cached by tensor identity, so
         a buffer rewritten in place is always read live, including on CUDA
         Graph replay.
+    output_state_indices : torch.Tensor, optional
+        Contiguous int32 or int64 tensor of shape ``[num_seqs]`` on the device
+        of ``q``. Requires
+        ``state_indices``, an explicit ``output_state`` pool and
+        ``output_final_state=True``. Sequence ``i`` then reads its initial
+        state from row ``state_indices[i]`` of ``initial_state`` and writes
+        its final state to row ``output_state_indices[i]`` of
+        ``output_state``, which may be the same pool. A read id of ``-1``
+        starts the sequence from the zero state; a write id of ``-1`` skips
+        its final-state write. A zero-length sequence writes nothing: its
+        write row keeps its contents. Rows written by one sequence must not be
+        read or written by another sequence of the same call.
+    checkpoint_state_indices : torch.Tensor, optional
+        Contiguous int32 or int64 destination rows for checkpoints, on the
+        device of ``q``. Requires ``checkpoint_every_n_tokens > 0``.
+        ``state_checkpoints`` is then a state pool ``[N_pool, num_sab_heads,
+        head_size, head_size]`` whose rows are dense ``[H, V, K]`` blocks (the
+        row stride may be padded), so a pool it shares with
+        ``initial_state``/``output_state`` needs that layout too. The ``j``-th
+        checkpoint of sequence ``i`` is written to row
+        ``checkpoint_state_indices[checkpoint_cu_starts[i] + j]``; a row of
+        ``-1`` skips that checkpoint. ``checkpoint_cu_starts`` (``[num_seqs]``
+        or ``[num_seqs + 1]`` entries) only gives each sequence's first entry,
+        so a paged caller can pass its page table directly (see
+        :func:`flashinfer.gdn_paged.chunk_gated_delta_rule_paged`).
+    prefix_lens : torch.Tensor, optional
+        Contiguous int32 or int64 tensor of shape ``[num_seqs]`` on the device
+        of ``q``: the number of tokens of each sequence processed before this
+        call. Requires ``checkpoint_every_n_tokens > 0``. Checkpoints are then
+        taken at absolute token positions: sequence ``i`` stores a checkpoint after
+        its ``n``-th new token whenever ``prefix_lens[i] + n`` is a multiple
+        of ``checkpoint_every_n_tokens`` (``1 <= n <= seq_len_i``). Prefix
+        lengths need not be multiples of the 64-token chunk; a sequence whose
+        prefix is not chunk-aligned is chunked from its aligned absolute
+        position, so every checkpoint falls on a chunk boundary. Sequence
+        ``i`` then has ``(prefix_lens[i] + seq_len_i) // N - prefix_lens[i] //
+        N`` checkpoints (``N = checkpoint_every_n_tokens``); size
+        ``checkpoint_cu_starts`` accordingly.
+
+        ``output_state_indices``, ``checkpoint_state_indices`` and
+        ``prefix_lens`` are served by the native non-CP kernels on SM8x, SM90,
+        SM100/SM103/SM107 and SM120 (``backend="auto"`` or
+        ``"flashinfer"``); ``use_cp=True``, ``backend="cake_gdn"`` and
+        ``backend="cudnn"`` reject them.
 
     Returns
     -------
@@ -1270,7 +1452,8 @@ def chunk_gated_delta_rule(
         ``(output, final_state)`` where ``final_state`` has shape
         ``[num_seqs, num_sab_heads, head_size, head_size]`` — or, when
         ``state_indices`` is given, the state pool ``[N_pool, ...]`` itself
-        (i.e. ``output_state``), whose rows named by ``state_indices`` now
+        (i.e. ``output_state``), whose rows named by ``state_indices`` (by
+        ``output_state_indices`` when given; ``-1`` rows are not written) now
         hold the updated final states.
 
     Notes
@@ -1278,14 +1461,18 @@ def chunk_gated_delta_rule(
     - Supports GQA (``num_q_heads > num_k_heads = num_v_heads``) and GVA
       (``num_v_heads > num_q_heads = num_k_heads``).
     - The final state layout is ``[N, H, V, K]``.
-    - Requires SM90 (Hopper) or SM100 (Blackwell) architecture. The SM100
-      path requires ``head_size == 128``. On SM100/SM103, ``gdn_cp`` supports
-      structurally legal equal-head, GQA, and GVA shapes on CUDA 12.8,
-      CUDA 12.9, and CUDA 13; SM107 supports the same shapes with an ``nvcc``
-      that can emit ``compute_107a``.
+    - Requires SM8x (Ampere), SM90 (Hopper), SM100 (Blackwell) or SM120. The
+      SM100 path requires ``head_size == 128``. On SM100/SM103, ``gdn_cp``
+      supports structurally legal equal-head, GQA, and GVA shapes on
+      CUDA 12.8, CUDA 12.9, and CUDA 13; SM107 supports the same shapes with
+      an ``nvcc`` that can emit ``compute_107a``.
       Other SM100 CP DSL routes require CUDA 13 and
       ``nvidia-cutlass-dsl[cu13]>=4.4.2`` (``pip install
       flashinfer-python[cu13]``).
+    - On SM8x the state may not be FP8.
+    - ``use_cp="auto"`` selects CP on compute capability 8.0 when
+      ``cu_seqlens_cpu`` gives a longest sequence of at least 8192 tokens and
+      ``num_seqs * max(num_q_heads, num_v_heads)`` is at most 16.
     """
     if backend not in ("auto", "flashinfer", "cake_gdn", "cudnn"):
         raise ValueError(f"unsupported GDN backend: {backend!r}")
@@ -1340,6 +1527,24 @@ def chunk_gated_delta_rule(
             "state_checkpoints and checkpoint_cu_starts must be None "
             "when checkpoint_every_n_tokens == 0"
         )
+    slot_args = _validate_slot_args(
+        q=q,
+        cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        output_state=output_state,
+        output_final_state=output_final_state,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        output_state_indices=output_state_indices,
+        checkpoint_state_indices=checkpoint_state_indices,
+        prefix_lens=prefix_lens,
+        backend=backend,
+        use_cp=use_cp,
+        cp_chunk_len=_cp_chunk_len,
+    )
+    if slot_args:
+        # The native non-CP kernels serve these arguments; never auto-route
+        # the call to CP or cuDNN, which would drop them.
+        use_cp = False
 
     assert cu_seqlens is not None, "cu_seqlens is required for varlen mode"
     if not is_integer_dtype(cu_seqlens.dtype):
@@ -1447,6 +1652,14 @@ def chunk_gated_delta_rule(
         g, beta = materialize_gates(
             g, beta, gate_domain, use_gate_in_kernel, A_log, dt_bias, beta_is_logit
         )
+    if prefix_lens is not None and beta is None:
+        # Chunk-aligning an unaligned prefix pads the first chunk with identity
+        # rows, which the kernels build from a zero beta.
+        beta = torch.ones(
+            (q.size(0), max(q.size(1), v.size(1))),
+            dtype=torch.float32,
+            device=q.device,
+        )
 
     if checkpoint_every_n_tokens > 0:
         assert state_checkpoints is not None and checkpoint_cu_starts is not None
@@ -1472,9 +1685,17 @@ def chunk_gated_delta_rule(
                 f"checkpoint_cu_starts must be 1D [num_seqs + 1], "
                 f"got {checkpoint_cu_starts.ndim}D"
             )
-        if checkpoint_cu_starts.size(0) != num_seqs + 1:
+        # With checkpoint_state_indices only each sequence's first entry is
+        # read, so a paged caller may pass one start per sequence.
+        cu_starts_lengths = (
+            (num_seqs + 1,)
+            if checkpoint_state_indices is None
+            else (num_seqs, num_seqs + 1)
+        )
+        if checkpoint_cu_starts.size(0) not in cu_starts_lengths:
+            expected = " or ".join(str(n) for n in cu_starts_lengths)
             raise ValueError(
-                f"checkpoint_cu_starts must have {num_seqs + 1} elements, "
+                f"checkpoint_cu_starts must have {expected} elements, "
                 f"got {checkpoint_cu_starts.size(0)}"
             )
         expected_shape = (
@@ -1489,6 +1710,26 @@ def chunk_gated_delta_rule(
                 f"[*, {num_sab_heads}, {head_size}, {head_size}], "
                 f"got {list(state_checkpoints.shape)}"
             )
+        # A strided state_checkpoints would be written through a copy and lost.
+        # A checkpoint pool (checkpoint_state_indices) may pad its rows like
+        # the state pools, but each row must be one dense [H, V, K] block.
+        if not checkpoint_cu_starts.is_contiguous():
+            raise RuntimeError("checkpoint_cu_starts must be contiguous")
+        if checkpoint_state_indices is None:
+            if not state_checkpoints.is_contiguous():
+                raise RuntimeError("state_checkpoints must be contiguous")
+        else:
+            row_size = num_sab_heads * head_size * head_size
+            dense_rows = state_checkpoints.stride()[1:] == (
+                head_size * head_size,
+                head_size,
+                1,
+            )
+            if not dense_rows or state_checkpoints.stride(0) < row_size:
+                raise RuntimeError(
+                    "state_checkpoints pool rows must be dense [H, V, K] blocks "
+                    "with a row stride of at least H * V * K elements"
+                )
 
     # Allocate output if not provided
     if output is None:
@@ -1512,11 +1753,30 @@ def chunk_gated_delta_rule(
     _device_capability = get_compute_capability(device)
     _arch_major = _device_capability[0]
     _device_name = get_device_name(device)
-    cp_heuristic_matches = _arch_major in (9, 10, 12) and should_use_cp_host(
-        num_seqs * num_sab_heads,
-        _sm_count,
-        _device_name,
-        device_capability=_device_capability,
+    _parallel_work = num_seqs * num_sab_heads
+    # SM8x routes on the exact longest sequence; max_seqlen may be an upper bound.
+    sm8x_max_seqlen = None
+    if _arch_major == 8 and cu_seqlens_cpu is not None:
+        offsets = _cake_gdn_prefill_host_offsets(
+            cu_seqlens_cpu, num_seqs=num_seqs, total_tokens=total_seq_len
+        )
+        sm8x_max_seqlen = max(b - a for a, b in zip(offsets, offsets[1:], strict=False))
+        if cp_max_seqlen < sm8x_max_seqlen:
+            raise ValueError(
+                "max_seqlen is smaller than the longest sequence in cu_seqlens_cpu"
+            )
+    cp_heuristic_matches = (
+        _arch_major in (9, 10, 12)
+        and should_use_cp_host(
+            _parallel_work,
+            _sm_count,
+            _device_name,
+            device_capability=_device_capability,
+        )
+    ) or should_use_cp_sm80_host(
+        sm8x_max_seqlen,
+        _parallel_work,
+        _device_capability,
     )
     cake_cp_domain_matches = bool(
         backend == "cake_gdn"
@@ -1586,6 +1846,19 @@ def chunk_gated_delta_rule(
             "Cake GDN CP requires SM100/SM103/SM107 and supported head, state and "
             "checkpoint configurations"
         )
+    # The SM80 entry checks the rest of the V32 contract (dtypes, state, no checkpoints).
+    offer_v32 = (
+        backend != "cake_gdn"
+        and not will_use_cp
+        and not slot_args
+        and should_use_v32_sm80_host(
+            sm8x_max_seqlen,
+            num_seqs,
+            num_q_heads,
+            num_v_heads,
+            _device_capability,
+        )
+    )
     if state_indices is not None:
         if not is_integer_dtype(state_indices.dtype):
             raise ValueError(
@@ -1598,10 +1871,10 @@ def chunk_gated_delta_rule(
             )
         # Reject unsupported dispatch paths rather than silently reading/writing
         # the state in packed, sequence-ordered layout.
-        if _arch_major not in (9, 10, 12):
+        if _arch_major not in (8, 9, 10, 12):
             raise NotImplementedError(
-                "state_indices is only supported on the SM90/SM100/SM103/SM120 GDN "
-                f"prefill kernels; got compute-capability major {_arch_major}, "
+                "state_indices is only supported on the SM80/SM90/SM100/SM103/SM120 "
+                f"GDN prefill kernels; got compute-capability major {_arch_major}, "
                 f"use_cp={use_cp!r}."
             )
         # The kernel writes each final state to output_state[state_indices[i]],
@@ -1613,9 +1886,47 @@ def chunk_gated_delta_rule(
                 "the state pool ([N_pool, H, V, K]); refusing to auto-allocate a "
                 "compact [num_seqs, ...] tensor that would be indexed out of bounds."
             )
+        # No pool to read from or write to: the slot ids would only index the
+        # compact scratch state the SM90/SM120 kernels still store into.
+        if initial_state is None and output_state is None:
+            state_indices = None
+        # Opt-in slot bounds check (FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1), as Cake does.
+        indexed_pools = tuple(
+            tensor for tensor in (initial_state, output_state) if tensor is not None
+        )
+        if output_state_indices is not None:
+            # Separate rows: -1 reads the zero state / skips the final write.
+            if initial_state is not None:
+                _cake_gdn_assert_state_slots(
+                    state_indices,
+                    int(initial_state.shape[0]),
+                    name="GDN prefill state_indices",
+                    allow_minus_one=True,
+                )
+            _cake_gdn_assert_state_slots(
+                output_state_indices,
+                int(output_state.shape[0]),
+                name="GDN prefill output_state_indices",
+                allow_minus_one=True,
+            )
+        elif indexed_pools and (backend != "cake_gdn" or will_use_cp):
+            _cake_gdn_assert_state_slots(
+                state_indices,
+                min(int(tensor.shape[0]) for tensor in indexed_pools),
+                name="GDN prefill state_indices",
+                allow_minus_one=False,
+            )
+    if checkpoint_state_indices is not None and state_checkpoints is not None:
+        _cake_gdn_assert_state_slots(
+            checkpoint_state_indices,
+            int(state_checkpoints.shape[0]),
+            name="GDN prefill checkpoint_state_indices",
+            allow_minus_one=True,
+        )
+
     if (
         use_qk_l2norm_in_kernel
-        and _arch_major in (9, 10, 12)
+        and _arch_major in (8, 9, 10, 12)
         and (_arch_major != 10 or _cuda_major >= 13)
         and is_cute_dsl_arch_supported(*_device_capability)
     ):
@@ -1657,6 +1968,15 @@ def chunk_gated_delta_rule(
                 stacklevel=2,
             )
         else:
+            if output_final_state and output_state is None and _arch_major == 8:
+                output_state = _allocate_sm8x_output_state(
+                    num_seqs,
+                    num_sab_heads,
+                    head_size,
+                    device,
+                    initial_state,
+                    state_indices,
+                )
             if output_final_state and output_state is None:
                 output_state = torch.empty(
                     (num_seqs, num_sab_heads, head_size, head_size),
@@ -1707,6 +2027,7 @@ def chunk_gated_delta_rule(
             cp_delta_rule_dsl = cast(
                 Callable[..., None],
                 {
+                    8: cp_delta_rule_dsl_sm80,
                     9: cp_delta_rule_dsl_sm90,
                     10: cp_delta_rule_dsl_sm100,
                     12: cp_delta_rule_dsl_sm120,
@@ -1721,7 +2042,7 @@ def chunk_gated_delta_rule(
                     "checkpoint_cu_starts": checkpoint_cu_starts,
                     "checkpoint_every_n_tokens": checkpoint_every_n_tokens,
                 }
-                if _arch_major in (9, 10, 12)
+                if _arch_major in (8, 9, 10, 12)
                 else {}
             )
             cp_delta_rule_dsl(
@@ -1768,6 +2089,15 @@ def chunk_gated_delta_rule(
             cu_seqlens_cpu=cu_seqlens_cpu,
         )
 
+    slot_kwargs = (
+        {
+            "output_state_indices": output_state_indices,
+            "checkpoint_state_indices": checkpoint_state_indices,
+            "prefix_lens": prefix_lens,
+        }
+        if slot_args
+        else {}
+    )
     if _arch_major == 10:
         if _cuda_major < 13:
             raise NotImplementedError(
@@ -1821,6 +2151,39 @@ def chunk_gated_delta_rule(
             cu_checkpoints=checkpoint_cu_starts,
             output_checkpoints=state_checkpoints,
             state_indices=state_indices,
+            **slot_kwargs,
+        )
+    elif _arch_major == 8:
+        # SM80 Ampere path (CuTe DSL kernel)
+        if chunk_gated_delta_rule_sm80 is None:
+            raise NotImplementedError("SM80 GDN prefill DSL kernel is unavailable")
+        if output_state is None:
+            output_state = _allocate_sm8x_output_state(
+                num_seqs,
+                num_sab_heads,
+                head_size,
+                device,
+                initial_state,
+                state_indices,
+                returned=output_final_state,
+            )
+        chunk_gated_delta_rule_sm80(
+            output,
+            output_state,
+            q,
+            k,
+            v,
+            initial_state,
+            g,
+            beta,
+            cu_seqlens,
+            _scale,
+            state_checkpoints,
+            checkpoint_cu_starts,
+            checkpoint_every_n_tokens,
+            state_indices=state_indices,
+            _v32=offer_v32,
+            **slot_kwargs,
         )
     elif _arch_major == 12:
         # SM120 Blackwell path (CuTe DSL kernel)
@@ -1850,15 +2213,23 @@ def chunk_gated_delta_rule(
             checkpoint_cu_starts,
             checkpoint_every_n_tokens,
             state_indices=state_indices,
+            **slot_kwargs,
         )
     elif _arch_major == 9:
         # SM90 Hopper path (CuTe DSL kernel)
         if chunk_gated_delta_rule_sm90 is None:
             raise NotImplementedError("SM90 GDN prefill DSL kernel is unavailable")
 
+        # The kernel always stores the final state, to
+        # output_state[state_indices[i]] when indexed, so scratch for a
+        # read-only pool must span the pool, as on SM120.
         if output_state is None:
             output_state = torch.empty(
-                (num_seqs, num_sab_heads, head_size, head_size),
+                (
+                    initial_state.shape
+                    if state_indices is not None and initial_state is not None
+                    else (num_seqs, num_sab_heads, head_size, head_size)
+                ),
                 dtype=torch.float32,
                 device=device,
             )
@@ -1878,6 +2249,7 @@ def chunk_gated_delta_rule(
             checkpoint_cu_starts,
             checkpoint_every_n_tokens,
             state_indices=state_indices,
+            **slot_kwargs,
         )
     else:
         raise NotImplementedError("GDN prefill DSL kernel is unavailable")
