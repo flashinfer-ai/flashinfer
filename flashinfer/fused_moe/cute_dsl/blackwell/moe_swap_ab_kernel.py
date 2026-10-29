@@ -3529,43 +3529,19 @@ class Sm100BlockScaledGroupedGemmKernel:
                         row_base = (
                             (gather_warp + group * 4) % (self.b_copy_rows // 4)
                         ) * 4
-                        source_row = row_base + cta_rank * (
-                            ((valid + 15) & -16) // self.cta_group_size
+                        source_row = (
+                            row_base
+                            + cta_rank * (((valid + 15) & -16) // self.cta_group_size)
+                            + (gather_thread & 3)
                         )
-                        if (row_base < self.b_copy_rows) & (source_row + 3 < valid):
-                            routes = cute.make_rmem_tensor((4,), cutlass.Int32)
-                            route_source = cute.make_tensor(
-                                token_mapping.iterator
-                                + cute.assume(route_start + source_row, divby=4),
-                                cute.make_layout((4,)),
+                        row_id = cutlass.Int32(tma_activations.shape[0])
+                        if source_row < valid:
+                            row_id = cutlass.Int32(
+                                cutlass.Uint32(token_mapping[route_start + source_row])
+                                // self.top_k
                             )
-                            cute.copy(
-                                cute.make_copy_atom(
-                                    cute.nvgpu.CopyUniversalOp(),
-                                    cutlass.Int32,
-                                    num_bits_per_copy=128,
-                                ),
-                                route_source,
-                                routes,
-                            )
-                            for j in cutlass.range_constexpr(4):
-                                row_ids[group * 4 + j] = cutlass.Int32(
-                                    cutlass.Uint32(routes[j]) // self.top_k
-                                )
-                        else:
-                            for j in cutlass.range_constexpr(4):
-                                row_ids[group * 4 + j] = cutlass.Int32(
-                                    tma_activations.shape[0]
-                                )
-                                if (row_base < self.b_copy_rows) & (
-                                    source_row + j < valid
-                                ):
-                                    row_ids[group * 4 + j] = cutlass.Int32(
-                                        cutlass.Uint32(
-                                            token_mapping[route_start + source_row + j]
-                                        )
-                                        // self.top_k
-                                    )
+                        for j in cutlass.range_constexpr(4):
+                            row_ids[group * 4 + j] = cute.arch.shuffle_sync(row_id, j)
                     # Each lane owns a complete four-byte SF word in a different
                     # shared bank. SFB remains full-N in each CTA for group-2 S2T.
                     sf_row = (
