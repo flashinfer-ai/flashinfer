@@ -115,7 +115,6 @@ def qsa_sparse_paged_attention(
         and v_cache.stride() == k_cache.stride(),
         "k_cache and v_cache must have the same dtype, shape and strides",
     )
-    sf_tensors = ()
     if nvfp4:
         sf_shape = (num_blocks, page_size, num_kv_heads, head_dim // 16)
         _check(
@@ -128,7 +127,6 @@ def qsa_sparse_paged_attention(
             and v_sf.stride() == k_sf.stride(),
             f"k_sf and v_sf must be float8_e4m3fn views of shape {sf_shape} with the same strides",
         )
-        sf_tensors = (("k_sf", k_sf), ("v_sf", v_sf))
     else:
         _check(k_sf is None and v_sf is None, "k_sf and v_sf are only taken with NVFP4")
     _check(num_blocks > 0 and page_size > 0, "k_cache must not be empty")
@@ -175,27 +173,25 @@ def qsa_sparse_paged_attention(
         out.shape == q.shape and out.dtype == q.dtype,
         "out must match q in shape and dtype",
     )
-    tensors = (
-        q,
-        k_cache,
-        v_cache,
-        *(x for _, x in sf_tensors),
-        logical_indices,
-        block_table,
-    )
+    tensors = (q, k_cache, v_cache, k_sf, v_sf, logical_indices, block_table)
     _check(
-        all(x.device == q.device for x in (*tensors, token_to_req, output_gate, out)),
+        all(
+            x is None or x.device == q.device
+            for x in (*tensors, token_to_req, output_gate, out)
+        ),
         "all tensors must be on the same device",
     )
     _check_aligned(q, "q", 8)
     for name, tensor in (
         ("k_cache", k_cache),
         ("v_cache", v_cache),
-        *sf_tensors,
+        ("k_sf", k_sf),
+        ("v_sf", v_sf),
         ("output_gate", output_gate),
         ("out", out),
     ):
-        _check_aligned(tensor, name, 16)
+        if tensor is not None:
+            _check_aligned(tensor, name, 16)
     if num_rows == 0:
         return out
 
