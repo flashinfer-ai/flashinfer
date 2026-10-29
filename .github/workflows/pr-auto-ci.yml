@@ -48,8 +48,12 @@ permissions:
   actions: write    # cancel stale runs on synchronize
 
 jobs:
-  auto-ci:
-    name: Auto-trigger CI
+  # A step cannot mark its job "skipped" — only a job-level `if:` can. The
+  # approval check therefore runs as its own job, and auto-ci is gated on its
+  # output so an unapproved PR reports the "Auto-trigger CI" check as skipped
+  # rather than as a green no-op.
+  approval:
+    name: Check approval
     # Only run on the canonical repo — forks making PRs against their own
     # main branch should not trigger this workflow.
     if: >-
@@ -60,6 +64,37 @@ jobs:
          && github.event.review.state == 'approved')
         || github.event_name == 'pull_request'
       )
+    runs-on: ubuntu-latest
+    outputs:
+      approved: ${{ steps.approval-check.outputs.approved }}
+    steps:
+      - name: Check PR has an approval
+        id: approval-check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          APPROVED=$(gh pr view "$PR_NUMBER" \
+            --repo "${{ github.repository }}" \
+            --json reviews \
+            --jq '[.reviews[]
+                   | select(.state == "APPROVED"
+                            and (.authorAssociation | IN("OWNER","MEMBER","COLLABORATOR")))] | length')
+
+          if [[ "${APPROVED:-0}" -gt 0 ]]; then
+            echo "PR has $APPROVED approval(s)"
+            echo "approved=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "PR has no approvals"
+            echo "approved=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  auto-ci:
+    name: Auto-trigger CI
+    needs: approval
+    # Skipped (not green) when the PR is unapproved, or when the approval job
+    # itself was skipped (non-canonical repo / non-approving review).
+    if: needs.approval.outputs.approved == 'true'
     runs-on: ubuntu-latest
     concurrency:
       group: pr-auto-ci-${{ github.event.pull_request.number }}
@@ -89,30 +124,8 @@ jobs:
           echo "author=$AUTHOR" >> "$GITHUB_OUTPUT"
           echo "has_run_ci=$HAS_RUN_CI" >> "$GITHUB_OUTPUT"
 
-      - name: Check PR has an approval
-        id: approval-check
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ steps.pr.outputs.number }}
-        run: |
-          APPROVED=$(gh pr view "$PR_NUMBER" \
-            --repo "${{ github.repository }}" \
-            --json reviews \
-            --jq '[.reviews[]
-                   | select(.state == "APPROVED"
-                            and (.authorAssociation | IN("OWNER","MEMBER","COLLABORATOR")))] | length')
-
-          if [[ "${APPROVED:-0}" -gt 0 ]]; then
-            echo "PR has $APPROVED approval(s)"
-            echo "approved=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "PR has no approvals"
-            echo "approved=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Check for existing CI run on this SHA
         id: ci-check
-        if: steps.approval-check.outputs.approved == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
@@ -242,8 +255,7 @@ jobs:
       - name: Detect previous scoped run from comments
         id: scope
         if: >-
-          steps.approval-check.outputs.approved == 'true'
-          && steps.ci-check.outputs.needs_ci == 'true'
+          steps.ci-check.outputs.needs_ci == 'true'
         env:
           GH_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN || github.token }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
@@ -372,8 +384,7 @@ jobs:
       - name: Publish test scope
         id: publish-scope
         if: >-
-          steps.approval-check.outputs.approved == 'true'
-          && steps.ci-check.outputs.needs_ci == 'true'
+          steps.ci-check.outputs.needs_ci == 'true'
           && steps.scope.outputs.has_scope == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -457,8 +468,7 @@ jobs:
 
       - name: Apply run-ci label
         if: >-
-          steps.approval-check.outputs.approved == 'true'
-          && steps.ci-check.outputs.needs_ci == 'true'
+          steps.ci-check.outputs.needs_ci == 'true'
           && steps.scope.outputs.has_scope == 'true'
           && steps.publish-scope.outcome != 'failure'
         env:
