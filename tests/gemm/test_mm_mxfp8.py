@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -672,6 +674,172 @@ def test_mm_mxfp8_cute_dsl_quantize_pdl_cuda_graph(m, n, k, dtype):
                     rtol=0,
                     atol=0,
                 )
+
+
+@pytest.mark.parametrize("tune_sm100", [False, True])
+def test_mm_mxfp8_cute_dsl_sm107_runner_set_tune_sm100(tune_sm100, monkeypatch):
+    """CPU-only: what FLASHINFER_MM_MXFP8_SM107_TUNE_SM100 changes in the SM107
+    cute-dsl runner set at M > 32. By default the SM100 runner offers nothing
+    there; with the flag set it offers its persistent-kernel tactics. The untuned
+    order is the same in both modes, and only the flag's set marks its cache keys."""
+    pytest.importorskip("cutlass")
+    if tune_sm100:
+        monkeypatch.setenv("FLASHINFER_MM_MXFP8_SM107_TUNE_SM100", "1")
+    else:
+        monkeypatch.delenv("FLASHINFER_MM_MXFP8_SM107_TUNE_SM100", raising=False)
+    # No GPU: fix the SM count read by the untuned order and the prefetch filter.
+    monkeypatch.setattr(gemm_base, "get_device_sm_count", lambda device: 148)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=148),
+    )
+    m, n, k = 256, 4096, 1024
+    inputs = [
+        torch.empty((m, k), dtype=torch.float8_e4m3fn),
+        torch.empty((n, k), dtype=torch.float8_e4m3fn).T,
+        torch.empty((m * k // 32,), dtype=torch.uint8),
+        torch.empty((n * k // 32,), dtype=torch.uint8),
+        torch.bfloat16,
+        torch.empty((m, n), dtype=torch.bfloat16),
+        None,
+    ]
+
+    runners = gemm_base._cute_dsl_mxfp8_runners_sm107(torch.bfloat16, inputs)  # pyright: ignore[reportPrivateUsage]
+
+    # Above M=16 the SM107 kernel is the untuned default in both modes.
+    sm107, sm100 = runners[:2]
+    assert type(sm107).__name__ == "CuteDSLMxfp8Sm107GemmRunner"
+    assert type(sm100).__name__ == "CuteDSLMxfp8GemmRunner"
+    sm100_tactics = sm100.get_valid_tactics(inputs, None)
+    keys = [runner.get_cache_key_extras(inputs) for runner in runners]
+    if not tune_sm100:
+        assert sm100_tactics == []
+        assert keys[:2] == [("torch.bfloat16",), ("torch.bfloat16", True)]
+        assert all(key[-1] != "sm107_tune_sm100" for key in keys)
+        return
+    assert sm100_tactics
+    # Split-K only exists for M <= 32: every tactic is a persistent-kernel one.
+    assert all(tactic[4] == 1 for tactic in sm100_tactics), sm100_tactics
+    assert keys[:2] == [
+        ("torch.bfloat16", "sm107_tune_sm100"),
+        ("torch.bfloat16", True, "sm107_tune_sm100"),
+    ]
+    assert all(key[-1] == "sm107_tune_sm100" for key in keys)
+
+
+@pytest.mark.arch_rubin
+@pytest.mark.parametrize("auto_tuning", [False, True])
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        (64, 4096, 1024),
+        (129, 4096, 2080),  # M % 8 != 0, K % 128 != 0
+        (256, 1536, 6144),
+    ],
+)
+def test_mm_mxfp8_cute_dsl_sm107_tune_sm100(m, n, k, auto_tuning, monkeypatch):
+    """With FLASHINFER_MM_MXFP8_SM107_TUNE_SM100=1, autotuning on SM107 profiles
+    both the SM100 and the SM107 kernel above M=32. The untuned default stays the
+    SM107 kernel, and every SM100 tactic offered above M=32 is correct."""
+    _skip_if_unsupported("cute-dsl")
+    from flashinfer.cute_dsl.utils import is_rubin_cute_dsl_available
+
+    if not is_rubin_cute_dsl_available():
+        pytest.skip(
+            "The SM107 cute-dsl mm_mxfp8 path requires CuTe DSL >= 4.8 "
+            "(cutlass.utils.rubin_helpers)."
+        )
+    monkeypatch.setenv("FLASHINFER_MM_MXFP8_SM107_TUNE_SM100", "1")
+
+    # Record (M, tactic) of every launch of each kernel family.
+    sm107_runs = []
+    sm100_runs = []
+    make_sm107_runner = gemm_base._cute_dsl_gemm_mxfp8_sm107_runner  # pyright: ignore[reportPrivateUsage]
+    make_sm100_runner = gemm_base._cute_dsl_gemm_mxfp8_runner  # pyright: ignore[reportPrivateUsage]
+
+    def record(runner, runs):
+        forward = runner.forward
+
+        def recording_forward(inputs, tactic=None, **forward_kwargs):
+            runs.append((inputs[0].shape[0], tactic))
+            return forward(inputs, tactic=tactic, **forward_kwargs)
+
+        # monkeypatch undoes this on the cached SM100 runner after the test.
+        monkeypatch.setattr(runner, "forward", recording_forward)
+        return runner
+
+    recorded_sm100 = set()
+
+    def recording_sm107_runner(*args, **kwargs):
+        return record(make_sm107_runner(*args, **kwargs), sm107_runs)
+
+    def recording_sm100_runner(*args, **kwargs):
+        runner = make_sm100_runner(*args, **kwargs)
+        # The factory is cached: wrap each runner once.
+        if kwargs.get("sm107_tune_sm100") and id(runner) not in recorded_sm100:
+            recorded_sm100.add(id(runner))
+            record(runner, sm100_runs)
+        return runner
+
+    monkeypatch.setattr(
+        gemm_base, "_cute_dsl_gemm_mxfp8_sm107_runner", recording_sm107_runner
+    )
+    monkeypatch.setattr(
+        gemm_base, "_cute_dsl_gemm_mxfp8_runner", recording_sm100_runner
+    )
+    # Untuned: a cached winner would replace the default. Tuned: profile afresh.
+    AutoTuner.get().clear_cache()
+    _run_mm_mxfp8(
+        m,
+        n,
+        k,
+        torch.bfloat16,
+        torch.bfloat16,
+        "cute-dsl",
+        auto_tuning=auto_tuning,
+        provide_out=True,
+    )
+
+    if auto_tuning:
+        assert any(mm > 32 and isinstance(t, tuple) for mm, t in sm107_runs), (
+            "mm_mxfp8 did not profile the SM107 kernel above M=32"
+        )
+        assert any(mm > 32 and isinstance(t, tuple) for mm, t in sm100_runs), (
+            "mm_mxfp8 did not profile the SM100 kernel above M=32"
+        )
+        return
+    assert sm107_runs == [(m, -1)], sm107_runs
+    assert sm100_runs == [], sm100_runs
+
+    # Autotuning launches every tactic but only checks the one it picks, so also
+    # run every SM100 tactic offered for this shape against the reference.
+    input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    input_mxfp8, weight_mxfp8, input_scale, weight_scale = _prepare_mxfp8_tensors(
+        input, weight, SfLayout.layout_128x4, SfLayout.layout_128x4, "cute-dsl"
+    )
+    reference = torch.mm(input, weight.T)
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(1, device="cuda", dtype=torch.uint8)
+    inputs = [
+        input_mxfp8,
+        weight_mxfp8.T,
+        input_scale,
+        weight_scale,
+        torch.bfloat16,
+        out,
+        workspace,
+    ]
+    runner = make_sm100_runner(
+        10, 7, True, torch.bfloat16, low_m_only=False, sm107_tune_sm100=True
+    )
+    tactics = runner.get_valid_tactics(inputs, None)
+    assert tactics
+    for tactic in tactics:
+        out.zero_()
+        runner(inputs, tactic=tactic)
+        _assert_cosine_similarity(reference, out, context=f"tactic {tactic}")
 
 
 def test_mm_mxfp8_cute_dsl_stale_split_k_tactic_falls_back():
