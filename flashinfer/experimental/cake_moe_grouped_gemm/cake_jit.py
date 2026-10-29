@@ -89,7 +89,12 @@ from . import cake_build
 # half tiles, whose split tail the tail-reduce stage of the 256-wide k tile's
 # route sums, launched in its place on the architectures of
 # ``k256_tail_archs`` when K is at most ``k256_tail_max_k`` and the groups
-# average at least ``k256_tail_min_rows`` rows.
+# average at least ``k256_tail_min_rows`` rows.  On the architectures of
+# ``domain_split_archs`` a launch of an op in ``domain_split_ops`` (the data
+# gradient) whose weight has at most ``domain_split_max_weight_elems`` elements
+# per group (``N * K``, the down projection) splits its tile queues by the
+# probed SM pairs of each locality domain instead of evenly (``cake_backend``,
+# stream workspaces).
 PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_moe_grouped_gemm_05258dbe307cb47d829e": {
         "library": "cake_moe_grouped_gemm_05258dbe307cb47d829e",
@@ -866,6 +871,9 @@ HOST_PLAN_CONSTANTS: dict[str, Any] = {
     "wave_sync_words": 2,
     "sched_words": 4224,
     "sched_rest": [0, 2147483648, 0],
+    "domain_split_archs": ["sm_103a"],
+    "domain_split_ops": ["dgrad"],
+    "domain_split_max_weight_elems": 12582912,
     "wgrad_tail_split": 1,
     "tail_plan": {
         "max_splits": 16,
