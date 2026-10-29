@@ -866,13 +866,15 @@ def _per_token_cta_threads(k: int, m: int) -> int:
 @functools.lru_cache(maxsize=None)
 def _per_token_cta_threads_default(k: int, m: int) -> int:
     num_blocks = k // NVFP4_SF_VEC_SIZE
+    threads = min(
+        _PER_TOKEN_THREADS,
+        max(1, (num_blocks + WARP_SIZE - 1) // WARP_SIZE) * WARP_SIZE,
+    )
     if m <= _PER_TOKEN_WIDE_MAX_M:
-        threads = _PER_TOKEN_THREADS
         while threads < _PER_TOKEN_MAX_THREADS and threads < num_blocks:
             threads *= 2
         return threads
     # narrow: the smallest width that still keeps the row in registers
-    threads = _PER_TOKEN_THREADS
     while (
         threads < _PER_TOKEN_MAX_THREADS
         and (num_blocks + threads - 1) // threads > _PER_TOKEN_MAX_REG_BLOCKS
@@ -888,7 +890,7 @@ class NVFP4QuantizePerTokenKernel:
     (``blocks_per_thread`` of them, chosen from K at trace time) and keeps
     their 8 packed 32-bit words in registers: the row is read from global
     memory once, the amax reduction and the quantisation pass both work on
-    the register copy. The CTA width grows with K (128..512 threads) so a
+    the register copy. The CTA width grows with K (32..512 threads) so a
     single row is streamed by as many loads in flight as the row allows.
     Rows whose K needs more than ``_PER_TOKEN_MAX_REG_BLOCKS`` blocks per
     thread fall back to the two-pass variant that re-reads the row.
@@ -929,11 +931,13 @@ class NVFP4QuantizePerTokenKernel:
             self.padded_sf_cols = self.num_sf_blocks_per_row
         else:
             self.padded_sf_cols = ((self.num_sf_blocks_per_row + 3) // 4) * 4
-        # CTA width (128..512): chosen by the host from K and M, see
+        # CTA width (32..512): chosen by the host from K and M, see
         # _per_token_cta_threads; the default is the latency-bound choice.
         if threads is None:
             threads = _per_token_cta_threads(K, 1)
-        assert threads in (128, 256, 512), threads
+        assert (
+            WARP_SIZE <= threads <= _PER_TOKEN_MAX_THREADS and threads % WARP_SIZE == 0
+        ), threads
         self.threads = threads
         self.warps = threads // WARP_SIZE
         self.blocks_per_thread = (self.num_sf_blocks_per_row + threads - 1) // threads
