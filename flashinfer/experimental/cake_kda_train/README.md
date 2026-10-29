@@ -658,6 +658,26 @@ workspace never allocates the c1 receive pool.  The first backward on such a
 workspace releases its forward arena before it allocates the backward one;
 outputs, saved sets and gradients are bitwise those of a backward workspace.
 
+One workspace serves every prepared pack of a rank whose calls run in stream
+order, so the workspace memory does not grow with the number of prepared
+packs: its pools hold the largest need of the packs and its local arena the
+largest layout, and a smaller pack runs on a view of that arena under its own
+plan.  `ws.reserve([ctx_a, ctx_b, ...], H)` sizes it for a list of contexts
+before the first call (host work and allocations only; `ring=True` also
+sizes the ring exchange's hop pools); the calls of those
+packs then allocate nothing, keep every pointer (so graph keys stay valid) and
+never re-size it -- a forward never turns a backward arena into a forward-only
+one.  `kcp_workspace_bytes([ctx_a, ctx_b, ...], H=H)` is its size: each pool at
+its largest need, the largest local arena and, where the intra record writes
+one, each pack's scratch table set (KiB scale; none at 64 heads).  No content
+crosses calls, so outputs, saved sets and gradients are bitwise those of one
+workspace per pack.  The workspace holds no context alive.  It records the
+stream of its last call; a call on another stream first waits for that
+stream's queued work on the device (one `wait_stream`, no host wait).
+`KcpWorkspace(ctx, H, allocate=False)` allocates nothing until its first call
+and sizes that call for the backward, so a first forward does not build a
+forward-only arena that the first backward replaces.
+
 Saved set of a rank (`KcpSaved`, `boundary_mode="saved"`): the fresh `S_in`
 (the initial states of its fragments), with `save_transfer` the owner's c1
 receive tensor and `M_seg`, on a rank whose fragments are split into `P > 1`

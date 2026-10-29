@@ -493,7 +493,8 @@ def chunk_kda_kcp_fwd(
         ``"saved"`` keeps the received boundary states in the saved set; ``"replay"`` saves nothing and lets the
         backward replay the forward's exchanges.
     workspace : KcpWorkspace, optional
-        A reused workspace of this rank; without one the call allocates its own.
+        A reused workspace of this rank; without one the call allocates its own.  One workspace may serve every
+        prepared pack of the rank (``KcpWorkspace.reserve(ctxs, H)`` sizes it for all of them up front).
     **options
         Further KCP options (``save_transfer``, ``exchange``, ``head_groups``, ``offset_class``, ``graph``),
         forwarded.
@@ -660,7 +661,9 @@ def kcp_workspace_bytes(
     ring or the recompute form); with ``True`` it holds no c1 receive, transfer staging or carry pool, with ``False``
     it holds the first two.  Once a forward without a saved set has allocated the rest, it holds
     ``cake_kcp_plan.kcp_arena_layout(ctx, H=H, backward=False, save_transfer=save_transfer)["lazy"]`` bytes more.
-    Under ``exchange="ring"`` it never holds the c1 receive pool."""
+    Under ``exchange="ring"`` it never holds the c1 receive pool.  ``ctx`` may be a list of contexts: the bytes of
+    one workspace that serves all of them (``KcpWorkspace.reserve(ctxs, H)``): each pool at its largest need and
+    the largest local arena, not their sum."""
     from .experimental.cake_kda_train import cake_kcp_plan
 
     if save_transfer is None:

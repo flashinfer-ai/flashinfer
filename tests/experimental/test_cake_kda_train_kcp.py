@@ -4777,7 +4777,7 @@ def test_host_trim_workspace_fast_paths() -> None:
     ws = cake_kcp.KcpWorkspace(local=False)
     tb = ws.ensure(ctx, 64, device="cpu", backward=False, host_trim=True)
     assert ws.ensure(ctx, 64, device="cpu", backward=False, host_trim=True) is tb
-    assert ws._last_ensure is not None and ws._last_ensure[0] is ctx
+    assert [rec[0]() for rec in ws._fast.values()] == [ctx]
     assert not ws.has("b1_send")
     assert (
         ws.ensure(ctx, 64, device="cpu", backward=True, host_trim=True) is tb
