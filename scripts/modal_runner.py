@@ -62,6 +62,7 @@ def _run_flashinfer_command(command: str) -> str:
     Run a command in the FlashInfer environment.
     """
     import os
+    import shutil
     import subprocess
 
     os.chdir("/workspace/flashinfer")
@@ -125,6 +126,36 @@ def _run_flashinfer_command(command: str) -> str:
             ],
             check=True,
         )
+        # Pin the clone to the 3rdparty/cccl revision. If that fails, remove the clone so
+        # that a reused container does not pick up the unpinned checkout on the next run.
+        # BaseException also covers Modal's InputCancellation.
+        try:
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    "3rdparty/cccl",
+                    "fetch",
+                    "--depth=1",
+                    "origin",
+                    "a9f01e74965a444caa2b92c94135c4232fe9d54d",
+                ],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    "3rdparty/cccl",
+                    "checkout",
+                    "--detach",
+                    "a9f01e74965a444caa2b92c94135c4232fe9d54d",
+                ],
+                check=True,
+            )
+        except BaseException:
+            shutil.rmtree("3rdparty/cccl", ignore_errors=True)
+            raise
 
     # Run the user command
     print(f"=== Running command: {command} ===")
