@@ -132,6 +132,101 @@ def test_append_paged_kv_cache(contiguous):
     )
 
 
+@pytest.mark.parametrize(
+    "key_dtype, value_dtype, k_cache_dtype, v_cache_dtype, message",
+    [
+        # bf16 K/V into an FP8 cache, written without quantizing first.
+        (
+            torch.bfloat16,
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fn,
+            "paged_k_cache dtype must match append_key dtype",
+        ),
+        (
+            torch.float16,
+            torch.bfloat16,
+            torch.float16,
+            torch.float16,
+            "append_key and append_value must have the same dtype",
+        ),
+        (
+            torch.float16,
+            torch.float16,
+            torch.bfloat16,
+            torch.float16,
+            "paged_k_cache dtype must match append_key dtype",
+        ),
+        (
+            torch.float16,
+            torch.float16,
+            torch.float16,
+            torch.bfloat16,
+            "paged_v_cache dtype must match append_value dtype",
+        ),
+        (
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+            torch.float8_e5m2,
+            "paged_k_cache dtype must match append_key dtype",
+        ),
+    ],
+    ids=[
+        "bf16_into_e4m3_cache",
+        "key_value_mismatch",
+        "k_cache_mismatch",
+        "v_cache_mismatch",
+        "e4m3_into_e5m2_cache",
+    ],
+)
+def test_append_paged_kv_cache_rejects_dtype_mismatch(
+    key_dtype, value_dtype, k_cache_dtype, v_cache_dtype, message
+):
+    if torch.float8_e4m3fn in (key_dtype, k_cache_dtype):
+        major, minor = get_compute_capability(torch.device("cuda:0"))
+        if major < 8:
+            pytest.skip(f"SM{major}{minor} does not support FP8 E4M3 tensors")
+
+    nnz_kv = 4
+    num_kv_heads = 2
+    head_dim = 128
+    page_size = 16
+    k_append = torch.ones(
+        nnz_kv, num_kv_heads, head_dim, dtype=key_dtype, device="cuda:0"
+    )
+    v_append = torch.ones(
+        nnz_kv, num_kv_heads, head_dim, dtype=value_dtype, device="cuda:0"
+    )
+    k_cache = torch.zeros(
+        1, page_size, num_kv_heads, head_dim, dtype=k_cache_dtype, device="cuda:0"
+    )
+    v_cache = torch.zeros(
+        1, page_size, num_kv_heads, head_dim, dtype=v_cache_dtype, device="cuda:0"
+    )
+    # One request of nnz_kv new tokens in page 0.
+    batch_indices = torch.zeros(nnz_kv, dtype=torch.int32, device="cuda:0")
+    positions = torch.arange(nnz_kv, dtype=torch.int32, device="cuda:0")
+    kv_page_indices = torch.zeros(1, dtype=torch.int32, device="cuda:0")
+    kv_page_indptr = torch.tensor([0, 1], dtype=torch.int32, device="cuda:0")
+    kv_last_page_len = torch.tensor([nnz_kv], dtype=torch.int32, device="cuda:0")
+
+    with pytest.raises(RuntimeError, match=message):
+        flashinfer.append_paged_kv_cache(
+            k_append,
+            v_append,
+            batch_indices,
+            positions,
+            (k_cache, v_cache),
+            kv_page_indices,
+            kv_page_indptr,
+            kv_last_page_len,
+        )
+
+    assert not k_cache.view(torch.uint8).any()
+    assert not v_cache.view(torch.uint8).any()
+
+
 @pytest.mark.parametrize("kv_layout", ["NHD", "HND"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("head_dim", [128, 512])
