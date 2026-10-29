@@ -43,6 +43,8 @@ from flashinfer.experimental.balanced_gqa_decode.cake_bounds import (
 )
 from tests.test_helpers.cake_balanced_gqa_plan import (
     chunk_pairs_for,
+    device_plan,
+    generated_program_available,
     length_bucket,
     mtp_chunk_pairs,
     mtp_device_plan,
@@ -314,7 +316,7 @@ def _require_program(q_len=1):
     arch = _gpu_arch()
     if arch is None:
         pytest.skip("balanced GQA decode requires an SM100/SM103 GPU")
-    if not cake_backend.generated_program_available(torch.device("cuda", 0), q_len):
+    if not generated_program_available(torch.device("cuda", 0), q_len):
         pytest.skip(
             f"no generated balanced GQA decode program ({cake_backend.program_kind(q_len)}) "
             f"registered for {arch}"
@@ -441,7 +443,7 @@ def _run_and_check(seq_lens, num_kv_heads, *, q_len=1, seed=0, pad_pages=True):
     torch.testing.assert_close(out, expected, atol=ATOL, rtol=RTOL)
     # The device planner published the same plan as the host mirror, and the
     # self-resetting counters are back at zero.
-    assert runner.device_plan() == _expected_device_plan(
+    assert device_plan(runner) == _expected_device_plan(
         seq_lens, q_len=q_len, num_kv_heads=num_kv_heads, num_ctas=runner.num_ctas
     )
     counters = runner.main_kwargs["queue_counters"].tolist()
@@ -519,7 +521,7 @@ def test_graph_replay_follows_device_lengths():
         )
         torch.testing.assert_close(out, expected, atol=ATOL, rtol=RTOL)
         mirror = plan_balanced_work(new_lens, num_kv_heads=1, num_ctas=runner.num_ctas)
-        assert runner.device_plan() == (mirror.chunk_pairs, mirror.num_items)
+        assert device_plan(runner) == (mirror.chunk_pairs, mirror.num_items)
 
 
 def test_graph_replay_follows_device_lengths_mtp():
@@ -560,7 +562,7 @@ def test_graph_replay_follows_device_lengths_mtp():
             sm_scale=sm_scale,
         )
         torch.testing.assert_close(out, expected, atol=ATOL, rtol=RTOL)
-        assert runner.device_plan() == mtp_device_plan(
+        assert device_plan(runner) == mtp_device_plan(
             new_lens, q_len=7, num_kv_heads=8, num_ctas=runner.num_ctas
         )
 

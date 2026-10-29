@@ -39,9 +39,11 @@ saturating ``cvt.rn.satfinite`` forms, and E2M1 ``-0`` is canonicalised to
   ``gs_r = amax(x_r) / 2688`` (``inv = 1 / gs_r``); the decode uses ``gs_r`` as
   the row scale.
 * **Fused residual + Gemma RMSNorm (world size 2).** ``z = acc + f32(residual)``,
-  ``residual_out = bf16(z)``, ``ss = sum z^2`` in the kernel's float32 order,
-  ``rinv = rsqrt(ss / 6144 + eps)``, ``y = f32(bf16(z)) * rinv * (weight_bias +
-  f32(weight))`` (the baseline multiplies the BF16-rounded ``z``), written as BF16
+  ``residual_out = bf16(z)``, ``ss = sum z^2`` in the kernel's float32 order (the
+  program's ``ss_order`` -- the registry record says which chunk order a target's
+  build sums in; :func:`sum_of_squares`), ``rinv = rsqrt(ss / 6144 + eps)``,
+  ``y = f32(bf16(z)) * rinv * (weight_bias + f32(weight))`` (the baseline
+  multiplies the BF16-rounded ``z``), written as BF16
   or quantised from ``bf16(y)`` with the arithmetic and layouts of FlashInfer's
   ``fp4_quantize`` (16-value E4M3 block scales) / ``mxfp8_quantize`` (32-value
   UE8M0 block scales), the scales in the swizzled 128 x 4 layout over
@@ -441,21 +443,38 @@ def records_of(
 # ---------------------------------------------------------------------------
 
 
-def sum_of_squares(z: torch.Tensor) -> torch.Tensor:
+# The fused-norm programs' ``ss_order`` (a registry key): the chunk order of each lane's pass-1 chains.
+SS_ORDERS = ("natural", "perm")
+
+
+def sum_of_squares(z: torch.Tensor, *, order: str = "natural") -> torch.Tensor:
     """``ss`` of each row as the kernel accumulates it.
 
     Lane ``l`` of the warp owns the pairs ``l + 32 j`` (elements ``1024 j + 32 l +
     8 k + 2 i + p``), accumulates the even and the odd elements in two
     ``fma.rn.f32`` chains in pair, chunk, word order, adds the two, and the 32
     lane sums meet in the ``add.rn.f32`` butterfly over lane masks 16, 8, 4, 2,
-    1 (every lane ends with the same bits).
+    1 (every lane ends with the same bits).  ``order`` is the program's
+    ``ss_order``: ``"natural"`` takes a pair's four chunks in the row's order
+    ``k = 0..3``; ``"perm"`` takes them in the lane's loaded order ``f ^ k`` with
+    ``f = (l >> 1) & 3`` (the same squares in another float32 order, so ``ss``
+    may differ in its last ulp).
     """
+    if order not in SS_ORDERS:
+        raise ValueError(f"order must be one of {SS_ORDERS}, got {order!r}")
     rows = z.shape[0]
-    chains = (
-        z.reshape(rows, 6, 32, 4, 4, 2)
-        .permute(0, 2, 1, 3, 4, 5)
-        .reshape(rows, 32, 96, 2)
-    )
+    # [rows, lane, pair, chunk, word, parity]
+    chains = z.reshape(rows, 6, 32, 4, 4, 2).permute(0, 2, 1, 3, 4, 5)
+    if order == "perm":
+        lanes = torch.arange(32, device=z.device)
+        # slot k of lane l holds chunk f ^ k
+        chunk = ((lanes >> 1) & 3).reshape(32, 1) ^ torch.arange(
+            4, device=z.device
+        ).reshape(1, 4)
+        chains = torch.gather(
+            chains, 3, chunk.reshape(1, 32, 1, 4, 1, 1).expand(rows, 32, 6, 4, 4, 2)
+        )
+    chains = chains.reshape(rows, 32, 96, 2)
     acc = torch.zeros((rows, 32, 2), dtype=torch.float32, device=z.device)
     for step in range(96):
         v = chains[:, :, step, :]
@@ -470,7 +489,7 @@ def sum_of_squares(z: torch.Tensor) -> torch.Tensor:
 @dataclass
 class FusedNormReference:
     """Reference outputs of one fused call: ``y`` (bfloat16 ``[rows, 6144]``), ``residual_out`` (bfloat16, bitwise),
-    ``ss`` and ``rinv`` (float32 ``[rows]``) and the scalars the reference was built with."""
+    ``ss`` and ``rinv`` (float32 ``[rows]``), the scalars and the sum-of-squares order the reference was built with."""
 
     y: torch.Tensor
     residual_out: torch.Tensor
@@ -478,6 +497,7 @@ class FusedNormReference:
     rinv: torch.Tensor
     eps: float
     weight_bias: float
+    ss_order: str
 
 
 def norm(
@@ -486,14 +506,17 @@ def norm(
     weight_bf16: torch.Tensor,
     eps: float = EPS,
     weight_bias: float = WEIGHT_BIAS,
+    *,
+    ss_order: str = "natural",
 ) -> FusedNormReference:
     """The fused epilogue of the float32 sum ``acc``: the kernel's arithmetic with the IEEE ``rsqrt`` (float64, rounded once)
-    in place of ``rsqrt.approx.ftz``."""
+    in place of ``rsqrt.approx.ftz``; ``ss_order`` is the program's chunk order of the sum of squares
+    (:func:`sum_of_squares`)."""
     rows = acc.shape[0]
     z = f32_add_rn(acc, residual_bf16.to(torch.float32))
     residual_out = z.to(torch.bfloat16)
     zb = residual_out.to(torch.float32)
-    ss = sum_of_squares(z)
+    ss = sum_of_squares(z, order=ss_order)
     arg = f32_add_rn(
         f32_div_rn(ss, torch.full_like(ss, float(HIDDEN))),
         torch.full_like(ss, float(eps)),
@@ -516,6 +539,7 @@ def norm(
         rinv=rinv,
         eps=float(eps),
         weight_bias=float(weight_bias),
+        ss_order=ss_order,
     )
 
 
@@ -528,12 +552,14 @@ def reference_fused_rmsnorm(
     global_scales: Optional[torch.Tensor] = None,
     eps: float = EPS,
     weight_bias: float = WEIGHT_BIAS,
+    ss_order: str = "natural",
 ) -> FusedNormReference:
     """Reference of the fused call on two ranks' bfloat16 partials, or (``records`` + ``global_scales``) NVFP4 records.
 
     A ``weight_bias`` other than 1 or another ``eps`` builds the reference of a
     call with those runtime scalars (or a deliberately wrong one for a negative
-    control).
+    control).  ``ss_order`` is the ``ss_order`` of the program the call runs
+    (its registry record): the chunk order of the float32 sum of squares.
     """
     if residual_bf16 is None or weight_bf16 is None:
         raise ValueError("residual_bf16 and weight_bf16 are required")
@@ -557,7 +583,14 @@ def reference_fused_rmsnorm(
         raise ValueError(
             f"residual must be {tuple(acc.shape)}, got {tuple(residual_bf16.shape)}"
         )
-    return norm(acc, residual_bf16, weight_bf16, eps=eps, weight_bias=weight_bias)
+    return norm(
+        acc,
+        residual_bf16,
+        weight_bf16,
+        eps=eps,
+        weight_bias=weight_bias,
+        ss_order=ss_order,
+    )
 
 
 # ---------------------------------------------------------------------------

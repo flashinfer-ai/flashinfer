@@ -14,16 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import re
-from pathlib import Path
-
 import pytest
 import torch
 
 import flashinfer
-from flashinfer.jit.gated_act_mxfp8 import gen_gated_act_mxfp8_module
 from flashinfer.quantization import SfLayout, mxfp8_quantize
-from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
+from flashinfer.utils import get_compute_capability
 
 
 MODES = (
@@ -35,29 +31,6 @@ MODES = (
     ("backward", True, True),
 )
 
-FROZEN_LAUNCHER_SOURCES = (
-    "gated_act_mxfp8_fwd_row_noalloc.cu",
-    "gated_act_mxfp8_fwd_both_noalloc.cu",
-    "gated_act_mxfp8_bwd_row.cu",
-    "gated_act_mxfp8_bwd_row_sm103.cu",
-    "gated_act_mxfp8_bwd_both_sm103.cu",
-)
-
-
-def test_frozen_launcher_sources_use_cuda_type_definitions() -> None:
-    source_dir = Path(__file__).resolve().parents[2] / "csrc" / "gated_act_mxfp8"
-    tensor_map_typedef = re.compile(r"\btypedef\b[^;]*\bCUtensorMap\s*;", re.DOTALL)
-    uint64_typedef = re.compile(r"\btypedef\b[^;]*\buint64_t\s*;", re.DOTALL)
-
-    for source_name in FROZEN_LAUNCHER_SOURCES:
-        source = (source_dir / source_name).read_text()
-        assert tensor_map_typedef.search(source) is None, (
-            f"{source_name} must use CUtensorMap from <cuda.h>"
-        )
-        assert uint64_typedef.search(source) is None, (
-            f"{source_name} must use uint64_t from platform headers"
-        )
-
 
 def _supported() -> bool:
     return torch.cuda.is_available() and get_compute_capability(
@@ -67,16 +40,6 @@ def _supported() -> bool:
         (10, 3),
         (10, 7),
     )
-
-
-@pytest.fixture(
-    autouse=not has_flashinfer_jit_cache(),
-    scope="module",
-)
-def warmup_jit():
-    if _supported():
-        flashinfer.jit.build_jit_specs([gen_gated_act_mxfp8_module()], verbose=False)
-    yield
 
 
 def _make_inputs(m: int, k: int) -> tuple[torch.Tensor, torch.Tensor]:

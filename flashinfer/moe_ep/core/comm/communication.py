@@ -194,10 +194,19 @@ class MoEEpCommunication(ABC):
         Callable before construction; performs no collective work.
         """
 
-    def is_workload_feasible(self, max_tokens_per_rank: int) -> bool:
-        """Whether a step whose busiest rank dispatches ``max_tokens_per_rank``
-        tokens fits this instance's buffers."""
-        return max_tokens_per_rank <= self.params.max_tokens_per_rank
+    def _resolve_runtime_max_tokens_per_rank(
+        self, runtime_max_tokens_per_rank: Optional[int]
+    ) -> int:
+        """The ``tokens_per_rank`` of one :meth:`dispatch`."""
+        capacity = self.params.max_tokens_per_rank
+        if runtime_max_tokens_per_rank is None:
+            return capacity
+        if not 0 < runtime_max_tokens_per_rank <= capacity:
+            raise ValueError(
+                f"runtime_max_tokens_per_rank={runtime_max_tokens_per_rank} "
+                f"must be in (0, {capacity}]"
+            )
+        return runtime_max_tokens_per_rank
 
     @abstractmethod
     def dispatch(
@@ -207,7 +216,7 @@ class MoEEpCommunication(ABC):
         topk_weights: "torch.Tensor | None" = None,
         *,
         hidden_states_scale: "torch.Tensor | None" = None,
-        max_tokens_per_rank: Optional[int] = None,
+        runtime_max_tokens_per_rank: Optional[int] = None,
         eplb_local_stats: "torch.Tensor | None" = None,
     ) -> MoEEpDispatchResult:
         """Send each token to the ranks that own its selected experts.
@@ -224,12 +233,12 @@ class MoEEpCommunication(ABC):
         hidden_states_scale : torch.Tensor, optional
             ``[local_num_tokens, *]`` per-token scale factors of quantized
             ``hidden_states``, forwarded row-aligned with them.
-        max_tokens_per_rank : int, optional
-            Largest ``local_num_tokens`` over all ranks for this step; it sets
+        runtime_max_tokens_per_rank : int, optional
+            Largest ``local_num_tokens`` over all ranks for this step, at most
+            ``MoEEpCommParams.max_tokens_per_rank``; it sets
             ``tokens_per_rank`` of the result. Every rank must pass the same
             value. ``None`` uses ``MoEEpCommParams.max_tokens_per_rank``, which
-            keeps shapes static (e.g. for CUDA graphs). Backends with fixed
-            receive buffers ignore it.
+            keeps shapes static (e.g. for CUDA graphs).
         eplb_local_stats : torch.Tensor, optional
             This rank's expert-load statistics, all-gathered alongside the
             dispatch by backends that support it.

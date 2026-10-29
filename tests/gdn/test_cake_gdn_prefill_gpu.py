@@ -5,6 +5,7 @@
 
 """Direct public-API tests for the frozen GDN non-CP non-CP GDN prefill routes."""
 
+import gc
 import itertools
 import math
 import os
@@ -18,6 +19,7 @@ import torch
 from flashinfer import gdn_prefill as prefill_mod
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 from flashinfer.jit import cake_gdn as cake_gdn
+from tests.test_helpers import cake_profiler
 
 
 @pytest.fixture(autouse=True)
@@ -812,44 +814,62 @@ def _forbidden_sync_names(names):
     ]
 
 
-def _profile_window(fn):
-    """Names of the CUDA runtime/device events of ``fn`` (CPU events inside its window)."""
+def _profile_window(fn, attempts=cake_profiler.ATTEMPTS):
+    """Names of the CUDA runtime/device events of ``fn`` (CPU events inside its window).
 
-    with (
-        torch.profiler.profile(
+    Sentinel kernels open and close the window (``tests.test_helpers.cake_profiler``): a
+    session whose device records miss a leading or the trailing one lost CUDA activity
+    (some torch / CUPTI builds of the nightly images do), so the window is profiled again;
+    after ``attempts`` such sessions the test is skipped.  The sentinels' own records are
+    not among the names (their ``cudaLaunchKernel`` runtime events are, harmlessly), and the
+    synchronization that drains the trailing one runs outside the window.
+    """
+
+    for attempt in range(1, attempts + 1):
+        with torch.profiler.profile(
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.CUDA,
             ]
-        ) as profile,
-        torch.profiler.record_function("cake_gdn_prefill_window"),
-    ):
-        fn()
-    events = profile.events()
-    # The annotation is reported once per activity source (the CPU record and,
-    # on newer profilers, a device-side user annotation of the same name); the
-    # window is the CPU record's span, and every copy of the marker is skipped.
-    windows = [
-        event
-        for event in events
-        if event.name == "cake_gdn_prefill_window"
-        and event.device_type == torch.autograd.DeviceType.CPU
-    ]
-    assert windows, [
-        event.name for event in events if event.name == "cake_gdn_prefill_window"
-    ]
-    start = min(event.time_range.start for event in windows)
-    end = max(event.time_range.end for event in windows)
-    names = []
-    for event in events:
-        if event.name == "cake_gdn_prefill_window":
-            continue
-        if event.device_type == torch.autograd.DeviceType.CPU:
-            if start <= event.time_range.start and event.time_range.end <= end:
-                names.append(event.name)
-        else:
-            names.append(event.name)
-    return names
+        ) as profile:
+            with torch.profiler.record_function("cake_gdn_prefill_window"):
+                cake_profiler.launch_sentinel()
+                cake_profiler.launch_sentinel()
+                fn()
+                cake_profiler.launch_sentinel()
+            torch.cuda.synchronize()
+        events = profile.events()
+        # The annotation is reported once per activity source (the CPU record and,
+        # on newer profilers, a device-side user annotation of the same name); the
+        # window is the CPU record's span, and every copy of the marker is skipped.
+        windows = [
+            event
+            for event in events
+            if event.name == "cake_gdn_prefill_window"
+            and event.device_type == torch.autograd.DeviceType.CPU
+        ]
+        assert windows, [
+            event.name for event in events if event.name == "cake_gdn_prefill_window"
+        ]
+        start = min(event.time_range.start for event in windows)
+        end = max(event.time_range.end for event in windows)
+        names = []
+        device = []
+        for event in events:
+            if event.name == "cake_gdn_prefill_window":
+                continue
+            if event.device_type == torch.autograd.DeviceType.CPU:
+                if start <= event.time_range.start and event.time_range.end <= end:
+                    names.append(event.name)
+            else:
+                device.append(event)
+        device.sort(key=lambda event: event.time_range.start)
+        device_names = [event.name for event in device]
+        inner = cake_profiler.between_sentinels(device_names)
+        if inner is not None:
+            return names + inner
+        cake_profiler.warn_lost_records(attempt, attempts, device_names)
+    cake_profiler.skip_lost_records(attempts)
 
 
 @pytest.mark.parametrize(
@@ -1371,22 +1391,13 @@ def _live_arch(case):
 
 
 def _device_kernel_names(fn):
-    """Names of the device kernels ``fn`` launches (profiler CUDA activities; copies excluded)."""
+    """Names of the device kernels ``fn`` launches (profiler CUDA activities; copies excluded).
 
-    with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ]
-    ) as profile:
-        fn()
-        torch.cuda.synchronize()
-    return [
-        event.name
-        for event in profile.events()
-        if event.device_type == torch.autograd.DeviceType.CUDA
-        and not event.name.startswith(("Memcpy", "Memset"))
-    ]
+    ``tests.test_helpers.cake_profiler`` brackets the call with sentinel kernels and retries a
+    session that lost its CUDA records; ``fn`` runs once more as the profiler's warm-up call.
+    """
+
+    return cake_profiler.cuda_kernel_names(fn)
 
 
 def _record_metadata_casts(monkeypatch):
@@ -1473,15 +1484,18 @@ def test_public_cake_gdn_prefill_metadata_i64_record_reads_mixed_widths_without_
     _launch(case)
     torch.cuda.synchronize()
     _assert_same_outputs(case, expected)
+    # Validate casts even when the profiler cannot capture CUDA activity.
+    if zero_copy:
+        assert casts == [], casts
+    else:
+        assert torch.int64 in casts, casts
 
     _reset_outputs(case, initial_state)
     kernels = _device_kernel_names(lambda: _launch(case))
     _assert_same_outputs(case, expected)
     if zero_copy:
-        assert casts == [], casts
         assert len(kernels) == 1, kernels
     else:
-        assert torch.int64 in casts, casts
         assert len(kernels) > 1, kernels
 
 
@@ -1947,10 +1961,20 @@ def test_public_cake_gdn_prefill_repeated_calls_allocate_no_device_memory(
     if case["state_checkpoints"].numel():
         case["state_checkpoints"].fill_(float("nan"))
     torch.cuda.synchronize()
-    before = torch.cuda.memory_stats()
-    _launch(case)
-    torch.cuda.synchronize()
-    after = torch.cuda.memory_stats()
+    # Garbage left by earlier tests of this process must not be collected inside the measured call: a cyclic
+    # GC pass there frees unrelated device blocks (84 frees with 0 allocations in one nightly shard).  Collect
+    # it first, and keep the automatic collector off while the call runs.
+    gc.collect()
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        before = torch.cuda.memory_stats()
+        _launch(case)
+        torch.cuda.synchronize()
+        after = torch.cuda.memory_stats()
+    finally:
+        if gc_was_enabled:
+            gc.enable()
     allocated = after["allocation.all.allocated"] - before["allocation.all.allocated"]
     freed = after["allocation.all.freed"] - before["allocation.all.freed"]
     assert (allocated, freed) == (0, 0)

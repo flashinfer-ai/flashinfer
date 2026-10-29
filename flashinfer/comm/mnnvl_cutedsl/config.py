@@ -138,16 +138,31 @@ class MRangeDispatch(Generic[TargetT]):
 
 @dataclass(frozen=True, slots=True)
 class StaticProfile:
+    """Routes for one static shape.
+
+    ``compute_capability`` restricts the profile to one GPU architecture, as a
+    ``(major, minor)`` tuple such as ``(10, 3)``; ``None`` serves any
+    architecture. Protocol crossovers move with the NVLink and HBM rates, so a
+    shape may carry one profile per measured architecture next to an
+    architecture-agnostic fallback.
+    """
+
     tp_size: int
     hidden_size: int
     top_k: int
     dtype: torch.dtype
     finalize_routes: MRangeDispatch[KernelTarget[object]]
     all_reduce_routes: MRangeDispatch[KernelTarget[object]]
+    compute_capability: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         if self.hidden_size <= 0 or self.hidden_size % 8:
             raise ValueError("hidden_size must be a positive multiple of 8")
+        if self.compute_capability is not None and (
+            len(self.compute_capability) != 2
+            or not all(isinstance(part, int) for part in self.compute_capability)
+        ):
+            raise ValueError("compute_capability must be a (major, minor) int tuple")
 
     def matches(
         self,
@@ -156,12 +171,22 @@ class StaticProfile:
         hidden_size: int,
         top_k: int,
         dtype: torch.dtype,
+        compute_capability: tuple[int, int] | None = None,
     ) -> bool:
+        """Whether this profile serves the shape on ``compute_capability``.
+
+        An architecture-specific profile never matches an unknown
+        (``None``) architecture.
+        """
         return (
             self.tp_size == tp_size
             and self.hidden_size == hidden_size
             and self.top_k == top_k
             and self.dtype == dtype
+            and (
+                self.compute_capability is None
+                or self.compute_capability == compute_capability
+            )
         )
 
     def validate_capacity(self, capacity_m: int) -> None:
@@ -208,13 +233,52 @@ class MNNVLCuteDSLConfig:
 
     def __post_init__(self) -> None:
         keys = [
-            (profile.tp_size, profile.hidden_size, profile.top_k, profile.dtype)
+            (
+                profile.tp_size,
+                profile.hidden_size,
+                profile.top_k,
+                profile.dtype,
+                profile.compute_capability,
+            )
             for profile in self.profiles
         ]
         if not keys:
             raise ValueError("A backend config must contain at least one profile")
         if len(keys) != len(set(keys)):
-            raise ValueError("Backend config profiles must have unique static shapes")
+            raise ValueError(
+                "Backend config profiles must have unique static shapes "
+                "per compute capability"
+            )
+
+    def find(
+        self,
+        *,
+        tp_size: int,
+        hidden_size: int,
+        top_k: int,
+        dtype: torch.dtype,
+        compute_capability: tuple[int, int] | None = None,
+    ) -> StaticProfile | None:
+        """The profile for this shape and architecture, or ``None``.
+
+        A profile keyed to ``compute_capability`` wins over an
+        architecture-agnostic one for the same shape.
+        """
+        fallback = None
+        for profile in self.profiles:
+            if not profile.matches(
+                tp_size=tp_size,
+                hidden_size=hidden_size,
+                top_k=top_k,
+                dtype=dtype,
+                compute_capability=compute_capability,
+            ):
+                continue
+            if profile.compute_capability is not None:
+                return profile
+            if fallback is None:
+                fallback = profile
+        return fallback
 
     def resolve(
         self,
@@ -224,14 +288,22 @@ class MNNVLCuteDSLConfig:
         top_k: int,
         dtype: torch.dtype,
         capacity_m: int,
+        compute_capability: tuple[int, int] | None = None,
     ) -> StaticProfile:
-        for profile in self.profiles:
-            if profile.matches(
-                tp_size=tp_size,
-                hidden_size=hidden_size,
-                top_k=top_k,
-                dtype=dtype,
-            ):
-                profile.validate_capacity(capacity_m)
-                return profile
-        raise ValueError("No MNNVL CuTe DSL profile supports this static shape")
+        """Select the profile with :meth:`find` and check it covers ``capacity_m``.
+
+        ``compute_capability`` is the ``(major, minor)`` of the device the
+        workspace runs on; ``None`` restricts the search to
+        architecture-agnostic profiles.
+        """
+        profile = self.find(
+            tp_size=tp_size,
+            hidden_size=hidden_size,
+            top_k=top_k,
+            dtype=dtype,
+            compute_capability=compute_capability,
+        )
+        if profile is None:
+            raise ValueError("No MNNVL CuTe DSL profile supports this static shape")
+        profile.validate_capacity(capacity_m)
+        return profile

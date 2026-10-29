@@ -227,6 +227,79 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
                 f"{_NAME} combine_wire must be one of {COMBINE_WIRES} or None, got "
                 f"{kcfg.combine_wire!r}"
             )
+        if kcfg.pdl is not None and not (
+            isinstance(kcfg.pdl, bool)
+            or (isinstance(kcfg.pdl, int) and 0 <= kcfg.pdl <= 31)
+        ):
+            raise MoEEpConfigError(
+                f"{_NAME} pdl must be a bool, an edge mask in [0, 31] or None, got {kcfg.pdl!r}"
+            )
+        if kcfg.pdl_late is not None and not isinstance(kcfg.pdl_late, bool):
+            raise MoEEpConfigError(
+                f"{_NAME} pdl_late must be a bool or None, got {kcfg.pdl_late!r}"
+            )
+        if kcfg.fused_begin is not None and kcfg.fused_begin not in (0, 1, 2):
+            raise MoEEpConfigError(
+                f"{_NAME} fused_begin must be 0, 1, 2 or None, got {kcfg.fused_begin!r}"
+            )
+        if kcfg.fused_dispatch_max_tokens is not None and not (
+            isinstance(kcfg.fused_dispatch_max_tokens, int)
+            and not isinstance(kcfg.fused_dispatch_max_tokens, bool)
+            and 1 <= kcfg.fused_dispatch_max_tokens <= 512
+        ):
+            raise MoEEpConfigError(
+                f"{_NAME} fused_dispatch_max_tokens must be an int in [1, 512] or None, got "
+                f"{kcfg.fused_dispatch_max_tokens!r}"
+            )
+        if kcfg.grid_dispatch_min_tokens is not None and not (
+            isinstance(kcfg.grid_dispatch_min_tokens, int)
+            and not isinstance(kcfg.grid_dispatch_min_tokens, bool)
+            and kcfg.grid_dispatch_min_tokens >= 0
+        ):
+            raise MoEEpConfigError(
+                f"{_NAME} grid_dispatch_min_tokens must be an int >= 0 or None, got "
+                f"{kcfg.grid_dispatch_min_tokens!r}"
+            )
+        for name in ("compact_form", "publish_form", "prefix_form"):
+            value = getattr(kcfg, name)
+            if value is not None and (isinstance(value, bool) or value not in (0, 1)):
+                raise MoEEpConfigError(
+                    f"{_NAME} {name} must be 0, 1 or None, got {value!r}"
+                )
+        if kcfg.per_route_publish_pdl is not None and not isinstance(
+            kcfg.per_route_publish_pdl, bool
+        ):
+            raise MoEEpConfigError(
+                f"{_NAME} per_route_publish_pdl must be a bool or None, got {kcfg.per_route_publish_pdl!r}"
+            )
+        if kcfg.fc2_early_windows is not None and not isinstance(
+            kcfg.fc2_early_windows, bool
+        ):
+            raise MoEEpConfigError(
+                f"{_NAME} fc2_early_windows must be a bool or None, got {kcfg.fc2_early_windows!r}"
+            )
+        if kcfg.fc2_early_max_tokens is not None and not (
+            isinstance(kcfg.fc2_early_max_tokens, int)
+            and not isinstance(kcfg.fc2_early_max_tokens, bool)
+            and kcfg.fc2_early_max_tokens >= 0
+        ):
+            raise MoEEpConfigError(
+                f"{_NAME} fc2_early_max_tokens must be an int >= 0 or None, got "
+                f"{kcfg.fc2_early_max_tokens!r}"
+            )
+        if kcfg.direct_place is not None and not isinstance(kcfg.direct_place, bool):
+            raise MoEEpConfigError(
+                f"{_NAME} direct_place must be a bool or None, got {kcfg.direct_place!r}"
+            )
+        if kcfg.direct_place_min_tokens is not None and not (
+            isinstance(kcfg.direct_place_min_tokens, int)
+            and not isinstance(kcfg.direct_place_min_tokens, bool)
+            and kcfg.direct_place_min_tokens >= 0
+        ):
+            raise MoEEpConfigError(
+                f"{_NAME} direct_place_min_tokens must be an int >= 0 or None, got "
+                f"{kcfg.direct_place_min_tokens!r}"
+            )
 
     def preprocess_weights(
         self, weights: MoEWeightPack, fleet_params: FleetParams
@@ -335,6 +408,19 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
                 transformed_weights,
                 clamp=None if kcfg.clamp_limit is None else float(kcfg.clamp_limit),
                 combine_wire=kcfg.combine_wire,
+                pdl=kcfg.pdl,
+                pdl_late=kcfg.pdl_late,
+                fused_begin=kcfg.fused_begin,
+                fused_dispatch_max_tokens=kcfg.fused_dispatch_max_tokens,
+                grid_dispatch_min_tokens=kcfg.grid_dispatch_min_tokens,
+                compact_form=kcfg.compact_form,
+                publish_form=kcfg.publish_form,
+                per_route_publish_pdl=kcfg.per_route_publish_pdl,
+                fc2_early_max_tokens=kcfg.fc2_early_max_tokens,
+                prefix_form=kcfg.prefix_form,
+                direct_place=kcfg.direct_place,
+                direct_place_min_tokens=kcfg.direct_place_min_tokens,
+                fc2_early_windows=kcfg.fc2_early_windows,
             )
         except Exception:
             pipe.destroy()
@@ -361,6 +447,19 @@ class Sm90CakeBf16MegaKernelBackend(MegaKernelBackend):
             None if kcfg.clamp_limit is None else float(kcfg.clamp_limit),
             kcfg.allow_unverified_p2p,
             kcfg.combine_wire,
+            kcfg.pdl,
+            kcfg.pdl_late,
+            kcfg.fused_begin,
+            kcfg.fused_dispatch_max_tokens,
+            kcfg.grid_dispatch_min_tokens,
+            kcfg.compact_form,
+            kcfg.publish_form,
+            kcfg.per_route_publish_pdl,
+            kcfg.fc2_early_max_tokens,
+            kcfg.prefix_form,
+            kcfg.direct_place,
+            kcfg.direct_place_min_tokens,
+            kcfg.fc2_early_windows,
             float(kcfg.init_timeout_s),
         )
 
