@@ -18,7 +18,9 @@ for a list of contexts (each pool at its largest need, the local arena at the la
 other pack), ``kcp_workspace_bytes([ctx, ...], H=)`` predicts its bytes, and the calls of the reserved packs, in any
 interleaving, allocate nothing, keep every pointer and give bitwise the results of one workspace per pack.  The
 workspace holds no context, its host caches are bounded, a call on another stream is ordered after the last one on
-the device, and ``allocate=False`` sizes the first forward for the backward.  The multi-GPU rows are in
+the device, and ``allocate=False`` sizes the first forward for the backward.  Checkpointed layers with one recompute
+handle per pack and layer on a shared workspace are bitwise and exchange-free in their recompute, and the tensors a
+handle stores are never in the workspace (the other packs' calls cannot overwrite them).  The multi-GPU rows are in
 ``test_cake_kda_train_kcp_dist.py``-style launch forms at the end of this file (``spawn`` or one process per Slurm
 task).
 """
@@ -787,6 +789,261 @@ def test_gpu_graph_replay_on_a_reserved_shared_workspace(device) -> None:
         cake_kcp.graph_cache_clear()
 
 
+# --------------------------------------------------------------------------- recompute handles on a shared workspace
+
+# checkpointed KDA layers per pack: y1 = KDA(q, k, v, g, beta), y2 = KDA(q, k, y1, g, beta) on the pack's context
+HANDLE_LAYERS = 2
+# "interleaved": every pack's forward, then the backwards in pack order (A fwd, B fwd, A bwd, B bwd);
+# "sequential": pack by pack, forward then backward (A fwd, A bwd, B fwd, B bwd)
+HANDLE_ORDERS = ("interleaved", "sequential")
+RECOMPUTE_EXCHANGES = (
+    "a2a:",
+    "ring:",
+)  # sequence entries of the state exchange (c1 / c2 or the ring hops)
+
+
+def _bits(t: torch.Tensor) -> torch.Tensor:
+    """Byte view: -0.0 vs 0.0 and NaN payloads count as differences."""
+    return t.detach().contiguous().view(torch.uint8)
+
+
+def _same_bits(a, b) -> bool:
+    if isinstance(a, torch.Tensor):
+        return (
+            isinstance(b, torch.Tensor)
+            and a.dtype == b.dtype
+            and a.shape == b.shape
+            and torch.equal(_bits(a), _bits(b))
+        )
+    return len(a) == len(b) and all(_same_bits(x, y) for x, y in zip(a, b, strict=True))
+
+
+def _poison_all(ws) -> None:
+    """The arena and every pool but ``eye`` filled with all-ones bytes (NaN in BF16 / FP32): a stored tensor that
+    lived in the workspace would read NaN afterwards.  ``eye`` is the identity the workspace writes once when it
+    sizes that pool, a constant every call reads; the other pools carry no contents across calls."""
+    _poison(ws)
+    eye = ws._pools.get("eye")
+    keep = None if eye is None else eye.untyped_storage().data_ptr()
+    for t in ws._pools.values():
+        if t.numel() and t.untyped_storage().data_ptr() != keep:
+            t.view(torch.uint8).fill_(0xFF)
+
+
+def _overlaps(t: torch.Tensor, storages) -> bool:
+    """Whether ``t``'s storage shares a byte with one of ``storages``."""
+    if t.numel() == 0:
+        return False
+    a0 = t.untyped_storage().data_ptr()
+    a1 = a0 + t.untyped_storage().nbytes()
+    for s in storages:
+        b0 = s.untyped_storage().data_ptr()
+        if b0 < a1 and a0 < b0 + s.untyped_storage().nbytes():
+            return True
+    return False
+
+
+class _Records:
+    """Every forward / backward record (``cake_kcp.LAST_CALL`` as ``_record`` writes it) while active."""
+
+    def __enter__(self):
+        self.recs: list[tuple[str, dict]] = []
+        self._orig = cake_kcp._record
+
+        def record(kind, call):
+            self._orig(kind, call)
+            self.recs.append((kind, dict(cake_kcp.LAST_CALL[kind])))
+
+        cake_kcp._record = record
+        return self
+
+    def __exit__(self, *exc):
+        cake_kcp._record = self._orig
+        return False
+
+    def phases(self, n_calls: int, exchange: str) -> list[str]:
+        """The violations of the handle phases over ``n_calls`` checkpointed calls: one "capture" (the original
+        forward, which exchanges) and one "replay" per call; a replay issues no collective and launches no exchange."""
+        bad = []
+        fwd = [r for kind, r in self.recs if kind == "fwd"]
+        capture = [r for r in fwd if r["recompute_handle"] == "capture"]
+        replay = [r for r in fwd if r["recompute_handle"] == "replay"]
+        if len(capture) != n_calls or len(replay) != n_calls or len(fwd) != 2 * n_calls:
+            bad.append(
+                f"phases fwd {len(fwd)} capture {len(capture)} replay {len(replay)} != {n_calls}"
+            )
+        for r in replay:
+            if r["n_collectives"] != 0:
+                bad.append(f"replay n_collectives {r['n_collectives']}")
+            if any(s.startswith(RECOMPUTE_EXCHANGES) for s in r["sequence"]):
+                bad.append("replay launches an exchange")
+        if exchange == "a2a" and any(r["n_collectives"] != 2 for r in capture):
+            bad.append("an original forward without its c1 + c2")
+        return bad
+
+
+def _handle_pass(ctxs, ops, wss, *, keep=None, order="interleaved", poison=None, **kw):
+    """Per pack :data:`HANDLE_LAYERS` KDA layers on its context (layer ``l + 1`` reads layer ``l``'s ``out`` as
+    ``v``; leaves ``q, k, v, g, beta``; ``backward(dout)`` from the last layer).  ``keep=None``: direct autograd, no
+    checkpoint, no handle (the reference).  Otherwise every layer runs under ``torch.utils.checkpoint`` (non-reentrant)
+    with its own :class:`KcpRecomputeHandle` and ``checkpoint_keep=keep``.  ``wss[i]``: pack ``i``'s workspace (one
+    object: shared).  ``poison(ws)`` before every forward and backward.  Right after each checkpointed forward the
+    handle's stored tensors are copied; before every backward and at the end every stored tensor is compared bitwise
+    with its copy (a stored tensor in the shared workspace would be overwritten by the other packs' calls and
+    poisoned), and each must lie outside the workspace's storages.  Returns per pack ``out`` and the five gradients,
+    and a log of the violations and of the stored element counts."""
+    n = len(ctxs)
+    if not isinstance(wss, list):
+        wss = [wss] * n
+    res: list[dict] = [{} for _ in range(n)]
+    handles: list[list] = [[] for _ in range(n)]
+    snaps: list[list] = [[] for _ in range(n)]
+    seen: list[list] = [[[] for _ in range(HANDLE_LAYERS)] for _ in range(n)]
+    log: dict = {
+        "changed": [],
+        "overlap": [],
+        "recompute_out": [],
+        "S_in": 0,
+        "c1_recv": 0,
+    }
+    live: dict = {}
+
+    def check(tag):
+        for i in range(n):
+            for layer, (h, snap) in enumerate(zip(handles[i], snaps[i], strict=True)):
+                entry = h.entries.get(cake_kcp.HANDLE_KEY) or {}
+                for name, copy in snap.items():
+                    t = entry.get(name)
+                    if not isinstance(t, torch.Tensor) or not _same_bits(t, copy):
+                        log["changed"].append(f"{tag}: pack {i} layer {layer} {name}")
+
+    def forward(i):
+        ctx, ws = ctxs[i], wss[i]
+        leaves = [
+            ops[i][name].detach().clone().requires_grad_(True)
+            for name in ("q", "k", "v", "g", "beta")
+        ]
+        q, k, y, g, b = leaves
+        for layer in range(HANDLE_LAYERS):
+            if poison is not None:
+                poison(ws)
+            if keep is None:
+                y = cake_kcp.chunk_kda_kcp(
+                    q, k, y, g, b, ctx, None, "light", "saved", ws, **kw
+                )
+                continue
+
+            def fn(q_, k_, v_, g_, b_, h_, w_, _i=i, _layer=layer):
+                out = cake_kcp.chunk_kda_kcp(
+                    q_,
+                    k_,
+                    v_,
+                    g_,
+                    b_,
+                    ctxs[_i],
+                    None,
+                    "light",
+                    "saved",
+                    wss[_i],
+                    recompute_handle=h_,
+                    checkpoint_keep=keep,
+                    **kw,
+                )
+                seen[_i][_layer].append(out.detach().clone())
+                return out * w_
+
+            h = cake_kcp.KcpRecomputeHandle()
+            # ``out * w`` with ``w`` a leaf of ones changes no bit of ``out`` or of its gradient, but the product's
+            # backward reads the recompute's ``out``: the recompute runs past the record above (torch stops a
+            # recompute once the tensors it needs are back)
+            w = torch.ones_like(y).requires_grad_(True)
+            y = torch.utils.checkpoint.checkpoint(
+                fn, q, k, y, g, b, h, w, use_reentrant=False
+            )
+            stored = {
+                name: t
+                for name, t in h.entries[cake_kcp.HANDLE_KEY].items()
+                if isinstance(t, torch.Tensor)
+            }
+            handles[i].append(h)
+            snaps[i].append({name: t.clone() for name, t in stored.items()})
+            for name, t in stored.items():
+                log[name] += t.numel()
+                if _overlaps(t, _storages(ws)):
+                    log["overlap"].append(f"pack {i} layer {layer} {name}")
+        live[i] = (leaves, y)
+
+    def backward(i):
+        check(f"before the backward of pack {i}")
+        if poison is not None:
+            poison(wss[i])
+        leaves, y = live.pop(i)
+        y.backward(ops[i]["dout"])
+        res[i]["out"] = y.detach()
+        res[i]["grads"] = tuple(t.grad for t in leaves)
+
+    if order == "interleaved":
+        for i in range(n):
+            forward(i)
+        for i in range(n):
+            backward(i)
+    else:
+        for i in range(n):
+            forward(i)
+            backward(i)
+    check("after the last backward")
+    if keep is not None:
+        for i in range(n):
+            for layer in range(HANDLE_LAYERS):
+                outs = seen[i][layer]
+                if len(outs) != 2 or not _same_bits(outs[0], outs[1]):
+                    log["recompute_out"].append(
+                        f"pack {i} layer {layer}: {len(outs)} outs"
+                    )
+    return res, log
+
+
+def _handle_violations(ref, got, log, recs, n_calls, exchange) -> list[str]:
+    bad = [
+        f"pack {i} {key}"
+        for i in range(len(ref))
+        for key in ("out", "grads")
+        if not _same_bits(got[i][key], ref[i][key])
+    ]
+    bad += [f"stored tensor changed: {c}" for c in log["changed"]]
+    bad += [f"stored tensor in the workspace: {c}" for c in log["overlap"]]
+    bad += [f"recompute out differs: {c}" for c in log["recompute_out"]]
+    return bad + recs.phases(n_calls, exchange)
+
+
+@pytest.mark.parametrize("order", HANDLE_ORDERS)
+@pytest.mark.parametrize("keep", ("states", "transfer"))
+@pytest.mark.parametrize("H", HEADS)
+def test_gpu_recompute_handles_on_a_reserved_shared_workspace(
+    device, H, keep, order
+) -> None:
+    """Four packs on ONE reserved workspace, two checkpointed KDA layers per pack, one recompute handle per pack and
+    layer (``checkpoint_keep`` ``"states"`` / ``"transfer"``), in the interleaved (A fwd, B fwd, A bwd, B bwd) and the
+    sequential order, the arena and the pools poisoned before every forward and backward: out and the five gradients
+    of every pack are bitwise those of one workspace per pack without handles; each recompute binds its entry
+    ("replay": no collective, no exchange launch) and gives bitwise its original ``out``; no stored tensor changes
+    before its backward and none lies in the workspace; no pointer moves.  One rank: no fragment crosses a rank, so
+    the stored tensors are empty here; the W = 4 rows at the end of this file store and check real ones."""
+    ctxs, ops = _packs(device, H)
+    ref, _ = _handle_pass(ctxs, ops, [_new_ws() for _ in ctxs])
+    ws = _new_ws()
+    ws.reserve(ctxs, H)
+    ptrs = _pointers(ws)
+    with _Records() as recs:
+        got, log = _handle_pass(
+            ctxs, ops, ws, keep=keep, order=order, poison=_poison_all
+        )
+    bad = _handle_violations(ref, got, log, recs, len(ctxs) * HANDLE_LAYERS, "a2a")
+    assert not bad, bad
+    assert _pointers(ws) == ptrs
+    assert all(c.n_in == 0 for c in ctxs) and log["S_in"] == log["c1_recv"] == 0
+
+
 # --------------------------------------------------------------------------- multi-GPU
 
 # (packs, H, W, layout, exchange): four prepared packs per rank on one reserved workspace per rank; a2a and ring
@@ -847,11 +1104,9 @@ def _dist_row_id(row) -> str:
     return f"p{len(packs)}-h{H}-w{W}-{layout}-{exchange}"
 
 
-def _run_dist_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict:
-    """One rank: the four packs on one workspace per pack (reference) and on one reserved shared workspace (the
-    interleaved schedule, the arena NaN-filled before every forward), bitwise compared on this rank; the shared
-    workspace's bytes against ``kcp_workspace_bytes(ctxs)`` and the per-pack sum, pointer stability over two rounds.
-    The verdicts are gathered to every rank."""
+def _rank_packs(rank: int, W: int, row, port: int):
+    """This rank's device (the process group initialized for ``W > 1``), the row's packs prepared on it and seeded
+    operands per pack."""
     packs, H, _w, layout, exchange = row
     device = torch.device("cuda", rank % max(torch.cuda.device_count(), 1))
     torch.cuda.set_device(device)
@@ -868,11 +1123,21 @@ def _run_dist_rank(rank: int, W: int, row, port: int, result_dir: str | None) ->
         _operands(device, int(c.T_r), H, 0x7815 + 97 * i + rank)
         for i, c in enumerate(ctxs)
     ]
-    kw = {"exchange": exchange}
     if exchange == "ring":
         assert all(c.ring_eligible for c in ctxs), (
             "a ring row holds a document over more than three ranks"
         )
+    return device, ctxs, ops
+
+
+def _run_dist_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict:
+    """One rank: the four packs on one workspace per pack (reference) and on one reserved shared workspace (the
+    interleaved schedule, the arena NaN-filled before every forward), bitwise compared on this rank; the shared
+    workspace's bytes against ``kcp_workspace_bytes(ctxs)`` and the per-pack sum, pointer stability over two rounds.
+    The verdicts are gathered to every rank."""
+    packs, H, _w, layout, exchange = row
+    device, ctxs, ops = _rank_packs(rank, W, row, port)
+    kw = {"exchange": exchange}
     ring = exchange == "ring"
     report: dict = {"rank": rank, "row": _dist_row_id(row), "pass": True, "fail": []}
     per = [_new_ws() for _ in ctxs]
@@ -940,9 +1205,11 @@ def _run_dist_rank(rank: int, W: int, row, port: int, result_dir: str | None) ->
     return report
 
 
-def _spawn_dist_entry(rank: int, W: int, row, port: int, result_dir: str) -> None:
+def _spawn_dist_entry(
+    rank: int, W: int, row, port: int, result_dir: str, kind: str = "shared"
+) -> None:
     try:
-        report = _run_dist_rank(rank, W, row, port, result_dir)
+        report = RANK_RUNNERS[kind](rank, W, row, port, result_dir)
         if not report["pass"]:
             raise AssertionError(f"rank {rank}: {report}")
     finally:
@@ -962,12 +1229,19 @@ def test_multi_gpu_shared_workspace_rows_are_bitwise_per_pack(row) -> None:
     """The rows of :func:`_run_dist_rank`: one process per GPU (``spawn``, rows up to the visible GPU count) or one
     process per Slurm task (a step with ``SLURM_NTASKS`` > 1 runs the rows of its own world size and skips the
     others)."""
+    _launch(row, "shared")
+
+
+def _launch(row, kind: str) -> None:
+    """Run ``RANK_RUNNERS[kind]`` for ``row``: in this process as one Slurm task (a step with ``SLURM_NTASKS`` > 1
+    runs the rows of its own world size and skips the others) or one spawned process per GPU (rows up to the
+    visible GPU count); assert the gathered verdict."""
     _packs_, _H, W, _layout, _exchange = row
     ntasks = int(os.environ.get("SLURM_NTASKS", "1"))
     if os.environ.get("SLURM_PROCID") is not None and ntasks > 1:
         if ntasks != W:
             pytest.skip(f"this Slurm step runs the W = {ntasks} rows")
-        report = _run_dist_rank(
+        report = RANK_RUNNERS[kind](
             int(os.environ["SLURM_PROCID"]),
             W,
             row,
@@ -983,13 +1257,89 @@ def test_multi_gpu_shared_workspace_rows_are_bitwise_per_pack(row) -> None:
         result_dir = os.environ.get("KCP_TEST_RESULT_DIR") or tmp
         mp.start_processes(
             _spawn_dist_entry,
-            args=(W, row, _free_port(), result_dir),
+            args=(W, row, _free_port(), result_dir, kind),
             nprocs=W,
             join=True,
             start_method="spawn",
         )
-        with open(
-            os.path.join(result_dir, "shared-" + _dist_row_id(row) + ".json")
-        ) as fh:
+        with open(os.path.join(result_dir, RESULT_NAMES[kind](row))) as fh:
             report = json.load(fh)
     assert report["pass"], report
+
+
+# (packs, H, W, layout, exchange): the W = 4 rows above with recompute handles -- a2a P > 1 (H = 4, both tiers),
+# a2a P = 1 (H = 64, both tiers), ring (H = 4, "states": the ring receives no c1 tensor)
+HANDLE_DIST_ROWS = [row for row in DIST_ROWS if row[2] == 4]
+
+
+def _handle_row_id(row) -> str:
+    return "handles-" + _dist_row_id(row)
+
+
+def _run_handle_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict:
+    """One rank: the row's packs on one workspace per pack without handles (the reference), then on ONE reserved
+    shared workspace with two checkpointed layers per pack and one recompute handle per pack and layer, for every
+    tier (``"transfer"`` with a2a only) and both orders (:func:`_handle_pass`; the arena and the pools poisoned
+    before every forward and backward): bitwise out and gradients, no stored ``S_in`` / c1 receive tensor changed
+    before its backward or placed in the workspace, every recompute exchange-free and bitwise its original ``out``,
+    no pointer moved.  The stored element counts are gathered: the row must store non-empty tensors on some rank (of
+    each tier's members).  The verdicts are gathered to every rank."""
+    _packs_, H, _w, _layout, exchange = row
+    _device, ctxs, ops = _rank_packs(rank, W, row, port)
+    kw = {"exchange": exchange}
+    report: dict = {"rank": rank, "row": _handle_row_id(row), "pass": True, "fail": []}
+    ref, _ = _handle_pass(ctxs, ops, [_new_ws() for _ in ctxs], **kw)
+    gc.collect()
+    ws = _new_ws()
+    ws.reserve(ctxs, H, ring=exchange == "ring")
+    ptrs = _pointers(ws)
+    keeps = ("states",) if exchange == "ring" else ("states", "transfer")
+    stored: dict = {}
+    for keep in keeps:
+        for order in HANDLE_ORDERS:
+            with _Records() as recs:
+                got, log = _handle_pass(
+                    ctxs, ops, ws, keep=keep, order=order, poison=_poison_all, **kw
+                )
+            bad = _handle_violations(
+                ref, got, log, recs, len(ctxs) * HANDLE_LAYERS, exchange
+            )
+            report["fail"] += [f"{keep} {order}: {b}" for b in bad]
+            if _pointers(ws) != ptrs:
+                report["fail"].append(f"{keep} {order}: pointers moved")
+            stored[f"{keep}/{order}"] = {"S_in": log["S_in"], "c1_recv": log["c1_recv"]}
+            del got, log
+    report["stored"] = stored
+    report["pass"] = not report["fail"]
+    if W > 1:
+        verdicts = [None] * W
+        dist.all_gather_object(verdicts, {k: report[k] for k in report if k != "row"})
+        report["ranks"] = verdicts
+        for key in stored:
+            members = ("S_in", "c1_recv") if key.startswith("transfer") else ("S_in",)
+            for m in members:
+                if not any(v["stored"][key][m] for v in verdicts):
+                    report["fail"].append(f"{key}: no rank stored a non-empty {m}")
+        report["pass"] = all(v["pass"] for v in verdicts) and not report["fail"]
+        dist.barrier()
+    if rank == 0 and result_dir:
+        os.makedirs(result_dir, exist_ok=True)
+        with open(
+            os.path.join(result_dir, "shared-" + _handle_row_id(row) + ".json"), "w"
+        ) as fh:
+            json.dump(report, fh, indent=1, default=str)
+    return report
+
+
+RANK_RUNNERS = {"shared": _run_dist_rank, "handles": _run_handle_rank}
+RESULT_NAMES = {
+    "shared": lambda row: "shared-" + _dist_row_id(row) + ".json",
+    "handles": lambda row: "shared-" + _handle_row_id(row) + ".json",
+}
+
+
+@pytest.mark.parametrize("row", HANDLE_DIST_ROWS, ids=_dist_row_id)
+def test_multi_gpu_recompute_handles_on_a_shared_workspace(row) -> None:
+    """The rows of :func:`_run_handle_rank`, launched like the shared-workspace rows (``spawn`` or one process per
+    Slurm task)."""
+    _launch(row, "handles")
