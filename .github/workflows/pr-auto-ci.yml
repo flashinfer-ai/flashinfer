@@ -195,11 +195,15 @@ jobs:
 
           echo "pr-test.yml runs on $HEAD_SHA: $(jq length <<< "$RUNS") total, $(jq length <<< "$REAL") real"
 
-          PASSED=$(jq '[.[] | select(.status == "completed" and .conclusion == "success")] | length' <<< "$REAL")
+          # Any finished real run blocks a re-trigger, failures included: a
+          # failure on this SHA is a real result (pr-test.yml does not retry),
+          # and re-running unchanged code would only burn GPU time. Cancelled
+          # runs never produced a result, so they do not block.
+          FINISHED=$(jq '[.[] | select(.status == "completed" and .conclusion != "cancelled")] | length' <<< "$REAL")
           ACTIVE=$(jq '[.[] | select(.status != "completed")] | length' <<< "$REAL")
 
-          if [[ "$PASSED" -gt 0 ]]; then
-            echo "CI already passed for $HEAD_SHA"
+          if [[ "$FINISHED" -gt 0 ]]; then
+            echo "CI already completed for $HEAD_SHA ($FINISHED finished real run(s)); not re-triggering"
             echo "needs_ci=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
