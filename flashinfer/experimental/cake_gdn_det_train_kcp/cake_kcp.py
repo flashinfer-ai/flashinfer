@@ -3602,8 +3602,10 @@ def _ring_chain(elems: list[tuple[int, int, int, int]]) -> Chains:
     return ch
 
 
-def _ring_forward(call: CallDetKcp) -> None:
-    """Hops of the forward ring; afterwards ``S_in`` holds the crossing-in fragments' initial states (as after c2)."""
+def _ring_forward(call: CallDetKcp, *, walk_starts: bool = False) -> None:
+    """Hops of the forward ring; afterwards ``S_in`` holds the crossing-in fragments' initial states (as after c2).
+    ``walk_starts``: the document-start tape walk runs under hop 1 (overlap schedule); the caller then walks only the
+    crossing-in segments."""
     tb, H = call.tb, call.H
     ring = _ring_tables(tb)
     out_pool, in_pool = call.buf("ring_out"), call.buf("ring_in")
@@ -3663,7 +3665,7 @@ def _ring_forward(call: CallDetKcp) -> None:
                 for f in receivers
             ],
         )
-        if h == 1 and call.schedule == "overlap":
+        if h == 1 and walk_starts:
             carry = (
                 call.indexed("carry", tb.carry_index, tb.carry_tiles)
                 if tb.P > 1
@@ -3685,9 +3687,12 @@ def _ring_forward(call: CallDetKcp) -> None:
             )
 
 
-def _ring_backward(call: CallDetKcp) -> None:
+def _ring_backward(call: CallDetKcp, *, walk_ends: bool = False) -> None:
     """Hops of the adjoint ring; afterwards ``b2_recv`` holds the crossing-out fragments' ``dS_out`` (as after b2).
-    Requires the b1 ``dm`` form (``d_f`` and ``M_f`` of the crossing-in fragments in ``b1_send``)."""
+    Requires the b1 ``dm`` form (``d_f`` and ``M_f`` of the crossing-in fragments in ``b1_send``).  ``walk_ends``:
+    the ``dcarry_end`` merge (``P > 1``) and the document-end adjoint walk run under hop 1 (overlap schedule); the
+    caller then neither merges ``dcarry_end`` again nor walks those segments again (the walk stores ``dv_new`` in
+    place of ``dv_intra``, so a second walk of a segment would apply its update twice)."""
     tb, H = call.tb, call.H
     ring = _ring_tables(tb)
     out_pool, in_pool = call.buf("ring_out"), call.buf("ring_in")
@@ -3742,7 +3747,7 @@ def _ring_backward(call: CallDetKcp) -> None:
                 for f in receivers
             ],
         )
-        if h == 1 and call.schedule == "overlap":
+        if h == 1 and walk_ends:
             dcarry = (
                 call.indexed("carry", tb.dcarry_index, tb.carry_tiles)
                 if tb.P > 1
@@ -3899,7 +3904,7 @@ def _forward(
     # before the first launch: the backend record reads it
     call.scratch["hand_off"] = bool(hand_off)
     wait_first = call.schedule == "wait_first"
-    started_early = False  # the document-start tape walk issued under c1 (overlap schedule, a2a exchange only)
+    started_early = False  # the document-start tape walk issued under c1 / hop 1 of the ring (overlap schedule)
     merged_start = (
         False  # the carry_start merge issued under c1 / the ring (overlap schedule)
     )
@@ -3962,7 +3967,9 @@ def _forward(
         if tb.P > 1 and not wait_first:
             call.merge("carry_start")
             merged_start = True
-        _ring_forward(call)
+        # a hand-off forward walks every tape in the replay's single form below
+        started_early = not wait_first and not hand_off
+        _ring_forward(call, walk_starts=started_early)
     else:
         w1 = call.a2a("c1", "c1_send", "c1_recv", *tb.split_elems("c1"))
         if not wait_first:
@@ -4011,7 +4018,7 @@ def _forward(
     else:
         _fwd_tapes(
             call, carry=carry, wait_first=not started_early
-        )  # no exchange (N_out = 0) or a ring: every walk runs here, whatever the schedule
+        )  # no exchange (N_out = 0) or the wait_first schedule: every walk runs here
     if call.opts.knob("record_states"):
         call.scratch["states"] = {
             "S_in": gather_states(call.buf("S_in"), tb.s_in_tiles)
@@ -4127,8 +4134,8 @@ def _backward(call: CallDetKcp, saved: SavedDetKcp | None) -> None:
     (:class:`SavedDetKcp` ``release_in_backward``); #8 reads the tapes only, so none of them reaches the backward's peak."""
     tb = call.tb
     wait_first = call.schedule == "wait_first"
-    ended_early = False  # the document-end adjoint walk issued under b2 (overlap schedule, a2a exchange only)
-    merged_end = False  # the dcarry_end merge issued under b2 (overlap schedule)
+    ended_early = False  # the document-end adjoint walk issued under b2 / hop 1 of the ring (overlap schedule)
+    merged_end = False  # the dcarry_end merge issued under b2 / hop 1 of the ring (overlap schedule)
     replay = saved is None
     if replay:
         _forward(call, save=False, replay=True)
@@ -4223,7 +4230,9 @@ def _backward(call: CallDetKcp, saved: SavedDetKcp | None) -> None:
     elif (
         ring
     ):  # adjoint hops from the document end; b2_recv filled as b2 would (bitwise)
-        _ring_backward(call)
+        ended_early = not wait_first
+        merged_end = ended_early and tb.P > 1
+        _ring_backward(call, walk_ends=ended_early)
     else:
         wb1 = call.a2a("b1", "b1_send", "b1_recv", *tb.split_elems(f"b1_{form}"))
         call.wait(wb1)
@@ -4264,7 +4273,7 @@ def _backward(call: CallDetKcp, saved: SavedDetKcp | None) -> None:
             call.release_pools(("b2_recv",))
     _adj_tapes(
         call, dcarry=dcarry, wait_first=not ended_early
-    )  # no exchange (N_out = 0) or a ring: every walk runs here, whatever the schedule
+    )  # no exchange (N_out = 0) or the wait_first schedule: every walk runs here
     if call.opts.knob("record_states"):
         states = call.scratch.setdefault("states", {})
         states["dS_out"] = gather_states(call.buf("b2_recv"), tb.ds_out_tiles)
