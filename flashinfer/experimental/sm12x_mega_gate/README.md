@@ -10,9 +10,9 @@ returns a plan; `plan.run()` launches on the current PyTorch stream and returns
 `(expert_indices, weights)`: int64 `[M,topk+shared]` physical expert ids and
 FP32 weights scaled by `routed_scaling_factor`.
 
-Status: validated target SM120 (`sm_120a`, RTX PRO 6000 Blackwell / RTX 5090).
-SM121 (GB10) runs the same instructions but is not enabled until it is
-validated: add `(12, 1): "sm_121a"` to `_ARCHES` in `mega_gate.py`.
+Status: SM120 (`sm_120a`), validated and tuned on an RTX PRO 5000 Blackwell
+(110 SMs). SM121 (GB10) runs the same instructions but is not enabled until it
+is validated: add `(12, 1): "sm_121a"` to `_ARCHES` in `mega_gate.py`.
 
 ## Design
 
@@ -31,26 +31,31 @@ producer warp through a multi-stage mbarrier pipeline and `ldmatrix`
   CTA per SM, so a group is co-resident) stride over the token blocks.
 - **Warp roles.** 4 MMA warps (mainloop, partial stores, arrival at the block's
   score barrier, then straight on to the next block), 1 TMA warp and 4 gate
-  warps. Once all L CTAs of a block have arrived, every CTA ranks a share of the
-  block's tokens (DeepGEMM's order), one warp per token, overlapping the next
-  block's GEMM.
-- **Score barrier.** One int32 counter per token block in `score_barriers`
-  (`red.release.gpu` arrivals, `ld.acquire.gpu` waits). Instead of DeepGEMM's
-  `%gridid` tags (a CUDA graph kernel node keeps one grid id across replays), the
-  last CTA to exit zeroes the launch's counters, so every launch and graph
-  replay starts from zero.
+  warps (8 when a CTA ranks more than 4 tokens of a block). Once all L CTAs of a
+  block have arrived, every CTA ranks a share of the block's tokens (DeepGEMM's
+  order), one warp per token, overlapping the next block's GEMM.
+- **Score barrier.** One 128 B line per token block in `score_barriers`: an
+  arrival counter (`red.release.gpu` by the MMA warps, `ld.acquire.gpu` polls by
+  one gate lane) and a waiter counter. Every CTA that waited counts itself after
+  reading the full count and the last one zeroes the line. This replaces
+  DeepGEMM's `%gridid` tags (a CUDA graph kernel node keeps one grid id across
+  replays) without a teardown pass, so every launch and graph replay starts
+  from zero.
 - **Top-k.** DeepGEMM's: the split partials are summed in a fixed order (one
   float4 per wave and split), each lane sorts its 4 experts of every 128-expert
   wave and every round offers the best unconsumed candidate of each wave; the
-  warp keeps the largest rank (ties: the smaller expert).
+  warp keeps the largest rank (ties: the smaller expert). SM120 has no float
+  `redux.sync`, so a round is two integer reduxes on order-preserving keys. The
+  biases and replica counts of a lane's experts are loaded once per CTA.
 - **Proxy fence.** The MMA warps read the pipeline stages with `ldmatrix`
   (generic proxy) and the TMA refills them (async proxy): the producer issues
   `fence.proxy.async.shared::cta` after each empty-barrier wait. Without it the
   refill can land under a pending read once the gate warps load the memory
   system (the same SM120 hazard fixed in `cake_minimax_h3`, #7455).
-- **Schedule.** `heuristics.py` picks (block tokens, split-K) as the argmin of a
-  cost model of one CTA's critical path, fitted on every candidate schedule
-  measured on a 110-SM board (1.4% slower than the measured best on average).
+- **Schedule.** `heuristics.py` takes a token block of `M / 4` tokens rounded
+  up to 16 and clamped to 16..64, and the split-K that minimizes a cost model of one CTA's
+  critical path, fitted on every candidate split measured on the 110-SM board
+  (0.7% slower than the measured best on average, 2.9% at worst).
 
 Compared to the SM100 programs this backend also accepts other hidden sizes
 (multiples of 64), 1..1024 experts, top-k up to 32 slots, no bias, token masks
