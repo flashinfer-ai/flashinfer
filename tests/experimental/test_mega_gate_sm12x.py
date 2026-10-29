@@ -84,6 +84,11 @@ def test_schedule_invariants(num_sms, deterministic):
                 assert config.num_split_k <= heuristics.MAX_SPLIT_K
                 assert config.num_stages >= 2
                 assert config.num_gate_warps in heuristics.GATE_WARP_CHOICES
+                assert config.mma_warps_n == heuristics.select_mma_warps_n(
+                    config.block_tokens
+                )
+                if config.mma_warps_n > 1:  # 17 warps would spill the mainloop
+                    assert config.num_gate_warps == 4
                 smem = (
                     config.num_stages * heuristics.stage_bytes(config.block_tokens)
                     + heuristics.SMEM_RESERVED_BYTES

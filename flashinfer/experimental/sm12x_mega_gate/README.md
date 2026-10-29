@@ -30,8 +30,9 @@ producer warp through a multi-stage mbarrier pipeline and `ldmatrix`
   The grid is persistent: `num_sms // L` worker groups of L CTAs (at most one
   CTA per SM, so a group is co-resident) stride over the token blocks.
 - **Warp roles.** 4 MMA warps (mainloop, partial stores, arrival at the block's
-  score barrier, then straight on to the next block), 1 TMA warp and 4 gate
-  warps (8 when a CTA ranks more than 4 tokens of a block). Once all L CTAs of a
+  score barrier, then straight on to the next block; 8 for 96- and 128-token
+  blocks, two per 32 experts), 1 TMA warp and 4 gate warps (8 when a CTA ranks
+  more than 4 tokens of a 64-token or smaller block). Once all L CTAs of a
   block have arrived, every CTA ranks a share of the block's tokens (DeepGEMM's
   order), one warp per token, overlapping the next block's GEMM. When a CTA ranks
   at most one token of a block (the decode schedules), every gate warp ranks one
@@ -59,10 +60,13 @@ producer warp through a multi-stage mbarrier pipeline and `ldmatrix`
   `fence.proxy.async.shared::cta` after each empty-barrier wait. Without it the
   refill can land under a pending read once the gate warps load the memory
   system (the same SM120 hazard fixed in `cake_minimax_h3`, #7455).
-- **Schedule.** `heuristics.py` takes a token block of `M / 4` tokens rounded
-  up to 16 and clamped to 16..64, and the split-K that minimizes a cost model of one CTA's
-  critical path, fitted on every candidate split measured on the 110-SM board
-  (0.7% slower than the measured best on average, 2.9% at worst).
+- **Schedule.** Up to 512 tokens `heuristics.py` takes a token block of `M / 4`
+  tokens rounded up to 16 and clamped to 16..64; above, a 96- or 128-token block
+  (each weight tile then serves more tokens: 5-11% faster from 768 tokens). The
+  split-K, and above 512 tokens the block, minimize a cost model of one CTA's
+  critical path fitted on the near-best measured schedules of the 110-SM board
+  (0.9% slower than the measured best on average over 21 token counts, 7.3% at
+  worst; the best schedule at 5 further token counts).
 
 Compared to the SM100 programs this backend also accepts other hidden sizes
 (multiples of 64), 1..1024 experts, top-k up to 32 slots, no bias, token masks

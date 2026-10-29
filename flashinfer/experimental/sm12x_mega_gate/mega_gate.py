@@ -91,7 +91,9 @@ class KernelSpec:
         )
         return (
             f"bt{c.block_tokens}_s{c.num_split_k}_st{c.num_stages}_g{c.num_gate_warps}"
-            f"{'c' if c.cooperative_gate else ''}{'_pdl' if self.enable_pdl else ''}_k{self.hidden}"
+            f"{'c' if c.cooperative_gate else ''}"
+            f"{f'_n{c.mma_warps_n}' if c.mma_warps_n != 1 else ''}"
+            f"{'_pdl' if self.enable_pdl else ''}_k{self.hidden}"
             f"_e{self.num_experts}_top{self.num_topk}_sh{self.num_shared}_f{flags}"
         )
 
@@ -432,6 +434,7 @@ class MegaGateSm12xPlan:
             num_expert_groups=config.num_expert_groups,
             num_stages=config.num_stages,
             num_gate_warps=config.num_gate_warps,
+            mma_warps_n=config.mma_warps_n,
             cooperative_gate=config.cooperative_gate,
             enable_pdl=spec.enable_pdl,
             num_worker_groups=num_worker_groups,

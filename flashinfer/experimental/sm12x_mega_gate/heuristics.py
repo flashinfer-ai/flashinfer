@@ -29,9 +29,10 @@ EXPERTS_PER_CTA = 128
 
 TOKEN_ALIGNMENT = 16
 MAX_BLOCK_TOKENS = 64
-BLOCK_TOKENS_CHOICES = tuple(
-    range(TOKEN_ALIGNMENT, MAX_BLOCK_TOKENS + 1, TOKEN_ALIGNMENT)
-)
+"""Largest block of the size rule: 16, 32, 48 or 64 tokens."""
+BLOCK_TOKENS_CHOICES = (16, 32, 48, 64, 96, 128)
+"""Blocks above 64 tokens split the tokens over two MMA warps per 32 experts (a 32x64
+accumulator tile per warp) and read each weight tile for twice the tokens."""
 MAX_SPLIT_K = 16
 """Bounds the split-K partials a gate lane loads per wave (one float4 each)."""
 MAX_STAGES = 8
@@ -51,27 +52,52 @@ MAX_TOKENS_PER_CTA_FOR_4_GATE_WARPS = 4
 (measured 1.03x-1.09x at 512-2048 tokens, 0.97x-0.99x below on a 110-SM board)."""
 
 
-def select_gate_warps(block_tokens: int, num_logical_ctas: int) -> int:
+def select_gate_warps(
+    block_tokens: int, num_logical_ctas: int, mma_warps_n: int = 1
+) -> int:
+    # With 8 MMA warps, 8 gate warps would cap a thread at 120 registers and spill the
+    # mainloop (measured 2.5x slower at 128-token blocks).
+    if mma_warps_n > 1:
+        return 4
     tokens_per_cta = ceil_div(block_tokens, num_logical_ctas)
     return 4 if tokens_per_cta <= MAX_TOKENS_PER_CTA_FOR_4_GATE_WARPS else 8
 
 
+def select_mma_warps_n(block_tokens: int) -> int:
+    """MMA warps along the tokens: 1 up to 64 block tokens, else 2 (each warp keeps a 32x64
+    accumulator tile; at 64 tokens, 2 measured 0.93x-1.02x of 1)."""
+    return 1 if block_tokens <= 64 else 2
+
+
 TARGET_TOKEN_BLOCKS = 4
 """Token blocks per call before the block grows (16, 32, 48 then 64 tokens)."""
+WIDE_BLOCK_MIN_TOKENS = 513
+"""From this many tokens the schedule is chosen among 96- and 128-token blocks (each weight
+tile serves more tokens; 5-11% faster than 64-token blocks from 768 tokens, slower at 512)."""
+WIDE_BLOCK_TOKENS = (96, 128)
 
-# Split-K cost model of one CTA's critical path, in microseconds, fitted
-# (non-negative least squares, relative error) on the measured schedules whose
-# block size ``select_block_tokens`` picks, on the 110-SM RTX PRO 5000.
-COST_PER_TILE_ROW = 0.00125
+# Cost model of one CTA's critical path, in microseconds, fitted (non-negative least
+# squares, relative error) on the schedules measured within 15% of the best of their token
+# count (16-128 token blocks, every split, 1-16384 tokens) on the 110-SM RTX PRO 5000:
+# 0.9% slower than the measured best on average, 7.3% at worst (320 tokens, the block rule).
+COST_PER_TILE_ROW = 0.0017247
 """Per K block and staged tile row (weight rows + token rows): the load side."""
-COST_PER_MMA_TOKEN = 0.00501
-"""Per K block and token of the block: the tensor-core side."""
-COST_PER_WAVE = 3.252
-"""Per token block a worker group runs: partial stores, arrival, pipeline turnaround."""
-COST_PER_TAIL_TOKEN = 1.574
+COST_PER_MMA_TOKEN = 0.0040045
+"""Per K block and token of the block: the tensor-core side (4x1 MMA warps)."""
+COST_PER_WIDE_MMA_TOKEN = 0.0040944
+"""The same with 4x2 MMA warps (blocks above 64 tokens)."""
+COST_PER_WAVE = 1.6644
+"""Per token block a worker group runs: arrival and pipeline turnaround."""
+COST_PER_WAVE_TOKEN = 0.016512
+"""Per token block and token: the partial-logit stores."""
+COST_PER_TAIL_TOKEN = 2.7365
 """Per token a gate warp ranks after the last block, when nothing overlaps it."""
-COST_PER_TAIL_TOKEN_SPLIT = 0.403
+COST_PER_TAIL_TOKEN_SPLIT = 0.19731
 """Per split-K partial such a tail token reduces."""
+COST_PER_COOPERATIVE_TAIL = 2.0183
+"""The last block's token when every gate warp of the CTA ranks it."""
+COST_PER_COOPERATIVE_TAIL_SPLIT = 0.15841
+"""Per split-K partial it reduces."""
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -110,6 +136,8 @@ class MegaGateConfig:
     num_expert_groups: int
     num_stages: int
     num_gate_warps: int = 4
+    mma_warps_n: int = 1
+    """MMA warps along the tokens (4 along the experts); see ``select_mma_warps_n``."""
     cooperative_gate: bool = False
     """At most one token per CTA and block (block tokens <= L): every gate warp ranks it
     (the split-K loads and transcendentals of a wave per warp), instead of one warp per
@@ -162,15 +190,25 @@ def estimated_us(
     num_worker_groups = num_sms // num_logical_ctas
     num_waves = ceil_div(ceil_div(num_tokens, block_tokens), num_worker_groups)
     k_blocks = num_waves * (num_k_blocks // split)
+    mma_warps_n = select_mma_warps_n(block_tokens)
+    cost = (
+        COST_PER_TILE_ROW * k_blocks * (EXPERTS_PER_CTA + block_tokens)
+        + (COST_PER_MMA_TOKEN if mma_warps_n == 1 else COST_PER_WIDE_MMA_TOKEN)
+        * k_blocks
+        * block_tokens
+        + (COST_PER_WAVE + COST_PER_WAVE_TOKEN * block_tokens) * num_waves
+    )
+    if block_tokens <= num_logical_ctas:  # cooperative gate
+        return (
+            cost + COST_PER_COOPERATIVE_TAIL + COST_PER_COOPERATIVE_TAIL_SPLIT * split
+        )
     tail_tokens = ceil_div(
         min(block_tokens, num_tokens),
-        num_logical_ctas * select_gate_warps(block_tokens, num_logical_ctas),
+        num_logical_ctas
+        * select_gate_warps(block_tokens, num_logical_ctas, mma_warps_n),
     )
-    return (
-        COST_PER_TILE_ROW * k_blocks * (EXPERTS_PER_CTA + block_tokens)
-        + COST_PER_MMA_TOKEN * k_blocks * block_tokens
-        + COST_PER_WAVE * num_waves
-        + tail_tokens * (COST_PER_TAIL_TOKEN + COST_PER_TAIL_TOKEN_SPLIT * split)
+    return cost + tail_tokens * (
+        COST_PER_TAIL_TOKEN + COST_PER_TAIL_TOKEN_SPLIT * split
     )
 
 
@@ -181,7 +219,9 @@ def select_config(
     num_sms: int,
     deterministic: bool = False,
 ) -> MegaGateConfig:
-    """Pick the schedule for ``num_tokens`` tokens on a ``num_sms``-SM device."""
+    """Pick the schedule for ``num_tokens`` tokens on a ``num_sms``-SM device: the block
+    size rule and the modelled best split up to 512 tokens, the modelled best wide block
+    and split above."""
     if hidden <= 0 or hidden % BLOCK_K:
         raise ValueError(f"hidden must be a positive multiple of {BLOCK_K}")
     if not 0 < num_experts <= MAX_EXPERTS:
@@ -192,18 +232,24 @@ def select_config(
     num_k_blocks = hidden // BLOCK_K
     num_tokens = max(num_tokens, 1)
 
-    block_tokens = select_block_tokens(num_tokens)
+    block_choices = (
+        WIDE_BLOCK_TOKENS
+        if num_tokens >= WIDE_BLOCK_MIN_TOKENS
+        else (select_block_tokens(num_tokens),)
+    )
     best = None
-    for split in (1,) if deterministic else range(1, MAX_SPLIT_K + 1):
-        if num_k_blocks % split or num_groups * split > num_sms:
-            continue
-        cost = estimated_us(
-            num_tokens, num_k_blocks, num_groups, num_sms, block_tokens, split
-        )
-        # Ties: fewer partials to reduce.
-        if best is None or (cost, split) < best[0]:
-            best = ((cost, split), split)
-    _, split = best
+    for block_tokens in block_choices:
+        for split in (1,) if deterministic else range(1, MAX_SPLIT_K + 1):
+            if num_k_blocks % split or num_groups * split > num_sms:
+                continue
+            cost = estimated_us(
+                num_tokens, num_k_blocks, num_groups, num_sms, block_tokens, split
+            )
+            # Ties: fewer partials to reduce, then the smaller block.
+            key = (cost, split, block_tokens)
+            if best is None or key < best:
+                best = key
+    _, split, block_tokens = best
     return make_config(block_tokens, split, num_experts)
 
 
@@ -213,6 +259,7 @@ def make_config(
     """The schedule of a block size and split-K: gate warps, gate mode and stage count."""
     num_groups = align(num_experts, EXPERTS_PER_CTA) // EXPERTS_PER_CTA
     cooperative = block_tokens <= num_groups * num_split_k
+    mma_warps_n = select_mma_warps_n(block_tokens)
     # The pipeline runs across the token blocks of a worker group, so the stage
     # count is bounded by shared memory only.
     return MegaGateConfig(
@@ -222,6 +269,9 @@ def make_config(
         num_stages=max_stages(
             block_tokens, exchange_bytes(num_experts) if cooperative else 0
         ),
-        num_gate_warps=select_gate_warps(block_tokens, num_groups * num_split_k),
+        num_gate_warps=select_gate_warps(
+            block_tokens, num_groups * num_split_k, mma_warps_n
+        ),
+        mma_warps_n=mma_warps_n,
         cooperative_gate=cooperative,
     )

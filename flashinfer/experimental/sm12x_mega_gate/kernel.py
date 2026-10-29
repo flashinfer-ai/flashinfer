@@ -19,10 +19,12 @@ groups of L CTAs, at most one CTA per SM so that every group is co-resident, and
 a group strides over the token blocks.
 
 Warp roles (DeepGEMM's TMA / MMA / gate split):
-- warps 0-3, MMA: per token block, the mainloop, the partial-logit stores and the
-  arrival at the block's score barrier; then straight on to the next block.
-- warp 4, TMA producer.
-- warps 5.., gate (4 or 8, per schedule): once all L logical CTAs of a block have arrived, every logical
+- 4 MMA warps along the experts, times 1 or 2 along the tokens (2 for 96- and
+  128-token blocks, a 32x64 accumulator tile per warp): per token block, the
+  mainloop, the partial-logit stores and the arrival at the block's score barrier;
+  then straight on to the next block.
+- 1 TMA producer warp.
+- gate warps (4 or 8, per schedule): once all L logical CTAs of a block have arrived, every logical
   CTA ranks a share of its tokens (DeepGEMM's order: token ``gate_warp * L +
   rank``, stride ``gate_warps * L``), one warp per token, overlapping the MMA of
   the next block. With at most one token per CTA and block (the decode schedules)
@@ -74,13 +76,8 @@ from .heuristics import (
 )
 
 MMA_WARPS_M = 4
-"""MMA warps along the experts: 32 of the CTA's 128 experts each."""
-MMA_WARPS_N = 1
-"""MMA warps along the tokens. 2 (two MMA warps per SM sub-partition) measured 0.93x-1.02x of
-1 on a 110-SM board: the mainloop already keeps the tensor pipe ~80% busy (ncu, M=16384)."""
-NUM_MMA_WARPS = MMA_WARPS_M * MMA_WARPS_N
-PRODUCER_WARP = NUM_MMA_WARPS
-FIRST_GATE_WARP = PRODUCER_WARP + 1
+"""MMA warps along the experts: 32 of the CTA's 128 experts each. The schedule sets the MMA
+warps along the tokens (``mma_warps_n``); the TMA producer and the gate warps follow them."""
 MMA_BARRIER_ID = 1
 GATE_BARRIER_ID = 2
 EXPERTS_PER_LANE = 4
@@ -297,7 +294,11 @@ class Sm12xMegaGateKernel:
         self.num_stages = config.num_stages
         self.num_gate_warps = config.num_gate_warps
         self.cooperative = config.cooperative_gate
-        self.num_threads = (FIRST_GATE_WARP + self.num_gate_warps) * 32
+        self.mma_warps_n = config.mma_warps_n
+        self.num_mma_warps = MMA_WARPS_M * self.mma_warps_n
+        self.producer_warp = self.num_mma_warps
+        self.first_gate_warp = self.producer_warp + 1
+        self.num_threads = (self.first_gate_warp + self.num_gate_warps) * 32
         self.hidden = hidden
         self.num_experts = num_experts
         self.num_aligned_experts = align(num_experts, EXPERTS_PER_CTA)
@@ -334,7 +335,7 @@ class Sm12xMegaGateKernel:
     def _tiled_mma(self) -> cute.TiledMma:
         return cute.make_tiled_mma(
             warp.MmaF16BF16Op(cutlass.BFloat16, Float32, (16, 8, 16)),
-            (MMA_WARPS_M, MMA_WARPS_N, 1),
+            (MMA_WARPS_M, self.mma_warps_n, 1),
             permutation_mnk=(MMA_WARPS_M * 16, self.block_tokens, 16),
         )
 
@@ -496,7 +497,7 @@ class Sm12xMegaGateKernel:
             self.block_tokens
         )
 
-        if warp_idx == Int32(PRODUCER_WARP):
+        if warp_idx == Int32(self.producer_warp):
             cpasync.prefetch_descriptor(tma_atom_w)
             cpasync.prefetch_descriptor(tma_atom_x)
 
@@ -510,7 +511,7 @@ class Sm12xMegaGateKernel:
             num_stages=self.num_stages,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, NUM_MMA_WARPS
+                pipeline.Agent.Thread, self.num_mma_warps
             ),
             tx_count=tx_bytes,
             barrier_storage=storage.mbar_ptr.data_ptr(),
@@ -542,7 +543,7 @@ class Sm12xMegaGateKernel:
         # Programmatic dependent launch: whatever a prerequisite grid may write (the
         # tokens, the maps, this plan's workspace) is touched only after griddepcontrol.wait
         # (a no-op without PDL), so only the launch and the prologue overlap that grid.
-        if warp_idx < Int32(NUM_MMA_WARPS):
+        if warp_idx < Int32(self.num_mma_warps):
             # ---------------------------------------------------- MMA warps
             cute.arch.griddepcontrol_wait()
             consumer_state = pipeline.make_pipeline_state(
@@ -557,9 +558,9 @@ class Sm12xMegaGateKernel:
                 thr_mma.partition_shape_C((EXPERTS_PER_CTA, self.block_tokens)),
                 Float32,
             )
-            # A warp's B slice per k16 is (block_tokens / MMA_WARPS_N) x 16: four 8x8
+            # A warp's B slice per k16 is (block_tokens / mma_warps_n) x 16: four 8x8
             # matrices per ldmatrix when that is a multiple of 16 tokens, two otherwise.
-            tokens_per_warp = self.block_tokens // MMA_WARPS_N
+            tokens_per_warp = self.block_tokens // self.mma_warps_n
             smem_copy_w = cute.make_tiled_copy_A(
                 cute.make_copy_atom(
                     warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
@@ -639,7 +640,8 @@ class Sm12xMegaGateKernel:
                 # barrier orders their stores before thread 0's release, which publishes them
                 # cumulatively (as CUTLASS's GenericBarrier::arrive_inc): no separate fence.
                 cute.arch.barrier(
-                    barrier_id=MMA_BARRIER_ID, number_of_threads=NUM_MMA_WARPS * 32
+                    barrier_id=MMA_BARRIER_ID,
+                    number_of_threads=self.num_mma_warps * 32,
                 )
                 if tidx == 0:
                     red_release_gpu_add(
@@ -650,7 +652,7 @@ class Sm12xMegaGateKernel:
                 # Reconverge warp 0 before the next block's .aligned ldmatrix / mma.sync.
                 cute.arch.sync_warp()
 
-        elif warp_idx == Int32(PRODUCER_WARP):
+        elif warp_idx == Int32(self.producer_warp):
             # --------------------------------------------------- TMA producer
             producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_stages
@@ -694,7 +696,7 @@ class Sm12xMegaGateKernel:
                 self.num_aligned_experts if self.cooperative else EXPERTS_PER_LANE
             )
             self.gate_warps(
-                warp_idx - Int32(FIRST_GATE_WARP),
+                warp_idx - Int32(self.first_gate_warp),
                 worker_group,
                 logical_rank,
                 num_worker_groups,
