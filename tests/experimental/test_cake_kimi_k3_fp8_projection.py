@@ -126,7 +126,7 @@ GPU_ROWS = [
     ("tp1", "in_proj_qkvgfab", 256, 0),
     ("tp8", "kv_a", 16384, 0),
     # Round 8: the register-epilogue fallback of TMA-store cells on an 8-byte-aligned output
-    # stride (sm_100a 12,1,512; 96,28,64 on both architectures; no padded-stride contract row
+    # stride (12,1,512 and 96,28,64 on both architectures; no padded-stride contract row
     # lies in these buckets, so the export covers the fallback programs with correctness-only
     # coverage shapes). Where the cell is not a TMA-store cell the row is a plain
     # unaligned-stride decode row.
@@ -1507,7 +1507,8 @@ def test_decode_config_round6_continuation_rules(arch):
     # which has no TMA-store epilogue, so its ``tstore`` flag is 0 (27 / 28).  Round 10 (S1): the sm_103a 5,28,2048 cell
     # moved to the cluster split-K GEMM route (``gemm_cs`` 2), leaving the decode table (27 / 27).  Round 12: the sm_100a
     # 18,6,2048 cell (tp8:q_b:2048) left the GEMM route for the persistent decode with the TMA-store epilogue (28 / 27).
-    assert n_tstore == {"sm_100a": 28, "sm_103a": 27}[arch]
+    # The sm_103a 12,1,512 cell then took the shared 12,1,256 entry, a TMA-store decode route (28 / 28).
+    assert n_tstore == {"sm_100a": 28, "sm_103a": 28}[arch]
     # Round-6 next loop (lever PX-S): eight small fused buckets per architecture prefetch their BF16 token tile one stage
     # ahead of its TMA load (``pfx: 1`` -> the ``_px1`` program); a prefetch changes no data path and no launch argument.
     n_pfx = 0
