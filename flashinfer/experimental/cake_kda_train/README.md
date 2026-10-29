@@ -315,7 +315,16 @@ patterns on rows built for this case.  The option refuses the rows whose block
 table gives the documents proportional segment counts (`num_docs * H <= 4` on
 the segmented route: a group of fewer documents would change every document's
 segments) and, on a lean workspace, the checkpoint replay (`saved=None`); a
-batched workspace that is not lean runs the replay group by group.  The costs
+batched workspace that is not lean runs the replay group by group.  With
+`tail_passes = B` the arena is sized for the largest group (over `doc_lengths`,
+or the bound of every group) at `B` passes, and each group runs its tail in the
+fewest passes `b <= B` whose lean layout at the group's geometry fits that arena
+(`b = 1`: the one-pass lean layout): each tail stage launches once per range of
+`ceil(NC_pad / b)` chunks instead of `ceil(NC_pad / B)`, with the same gradients
+bit for bit and the same arena bytes.  `b` is the `tail_passes` of the group
+view the backward runs: `KdaWorkspace.batch_view(group, tape=True)` (at the
+group's `NC_pad_tape`) where the call reads slices of a saved tape or of the
+saved `qg` / `w` / `u`, else `batch_view(group)`.  The costs
 per group are a table launch, the gathers of a group whose blocks are not one
 run (at most three state blocks per segment of the group, within
 `batch_scratch` of `memory_report`) and the smaller grids; the serial route's

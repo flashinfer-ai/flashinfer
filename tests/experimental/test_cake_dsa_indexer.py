@@ -2718,11 +2718,14 @@ def test_prepared_runner_graph_capture_and_replay():
         for _ in range(2):
             runner()
     torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    _assert_ticket_tail_zero(runner)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = runner()
     graph.replay()
     torch.cuda.synchronize()
+    _assert_ticket_tail_zero(runner)
     assert ref.same_bits(captured, eager)
     fresh = ref.make_random_inputs(
         [600, 400], [600, 12000], top_k=1024, seed=51, device="cuda"
@@ -2732,7 +2735,55 @@ def test_prepared_runner_graph_capture_and_replay():
     inputs.w.copy_(fresh.w)
     graph.replay()
     torch.cuda.synchronize()
+    _assert_ticket_tail_zero(runner)
     _judge_ok((captured[0].clone(), captured[1].clone()), ref.select_reference(inputs))
+
+
+def _assert_ticket_tail_zero(runner) -> None:
+    """The ticket word reads 0 whenever no scan is running (the runner zeroes the tail once, when it prepares;
+    every completed launch leaves it 0); None on the architectures without a tail."""
+    if runner.ticket_tail is not None:
+        assert not runner.ticket_tail.any(), runner.ticket_tail[:8].tolist()
+
+
+def test_prepared_runner_ticket_tail_is_zero_at_prepare_after_runs_and_after_a_failed_launch():
+    _require_program()
+    inputs = ref.make_random_inputs(
+        [600, 400], [600, 12000], top_k=1024, seed=52, device="cuda"
+    )
+    runner = prepare_dsa_indexer_topk(
+        inputs.q,
+        inputs.k,
+        inputs.w,
+        inputs.cu_seqlens_q,
+        inputs.cu_seqlens_k,
+        **inputs.kwargs(),
+    )
+    if runner.ticket_tail is None:
+        pytest.skip("no ticket tail on this architecture")
+    torch.cuda.synchronize()
+    _assert_ticket_tail_zero(runner)  # zeroed once, at prepare
+    expected = runner()
+    expected = (expected[0].clone(), expected[1].clone())
+    torch.cuda.synchronize()
+    _assert_ticket_tail_zero(runner)  # left at 0 by the scan, no memset in run()
+    # a launch sequence that raises marks the tail dirty; the next run restores the word before it launches
+    launches = runner.launches
+
+    def failing() -> None:
+        raise RuntimeError("boom")
+
+    runner.launches = (failing,)
+    runner.ticket_tail.fill_(7)  # what an aborted launch could leave behind
+    with pytest.raises(RuntimeError, match="boom"):
+        runner()
+    assert runner._tail_dirty
+    runner.launches = launches
+    out = runner()
+    torch.cuda.synchronize()
+    assert not runner._tail_dirty
+    _assert_ticket_tail_zero(runner)
+    assert ref.same_bits(out, expected)
 
 
 def test_workspace_bound_is_respected():

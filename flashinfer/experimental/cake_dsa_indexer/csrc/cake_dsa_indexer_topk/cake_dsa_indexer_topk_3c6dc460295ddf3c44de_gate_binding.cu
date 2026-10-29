@@ -168,7 +168,7 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_W, TensorView arg_cu
   void* kargs[] = {&p_Q, &p_K, &p_W, &p_cu_seqlens_q, &p_cu_seqlens_k, &p_q_offsets, &p_Indices, &p_Scores, &p_Cand, &v_num_segments, &v_top_k, &v_ratio, &v_has_offsets, &v_cand_cap, &v_first_cap, &v_sample_tiles_max, &v_sample_shift_permille, &v_far_sample, &v_check_period, &v_grid_ctas, &v_softmax_scale, &v_n_split};
 
   static const bool smem_ready = CakeSetMaxDynamicSmem(
-      reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL), 221184);
+      reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL), 221312);
   (void)smem_ready;
   dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   dim3 block(512u, 1u, 1u);
@@ -176,7 +176,7 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_W, TensorView arg_cu
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
   config.blockDim = block;
-  config.dynamicSmemBytes = 221184u;
+  config.dynamicSmemBytes = 221312u;
   config.stream = stream;
   cudaError_t launch_status = cudaLaunchKernelExC(
       &config, reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL), kargs);
