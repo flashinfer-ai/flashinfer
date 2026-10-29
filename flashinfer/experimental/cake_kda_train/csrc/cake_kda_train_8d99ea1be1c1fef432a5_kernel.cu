@@ -91,55 +91,38 @@ kernel_cake_kda_train_8d99ea1be1c1fef432a5(int* __restrict__ cu_seqlens, int num
 
     // === Task calls (declaration order) ===
     int tid_0 = tid;
-    int lane_1 = lane;
-    int warp_2 = warp;
     int cta = blockIdx.x;
     int n_i = 0;
     if (tid_0 < num_seqs) {
         n_i = (cu_seqlens[tid_0 + 1] - cu_seqlens[tid_0] + 63) / 64;
     }
-    int incl = n_i;
+    // CtaScanSum: threads=256, warps=8
+    int _cta_scan_sum_prefix_0;
+    int _cta_scan_sum_total_0;
     {
-        uint32_t incl_scan = (uint32_t)incl;
-        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, incl_scan, 1, 32); if (lane >= 1) { incl_scan += peer; } }
-        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, incl_scan, 2, 32); if (lane >= 2) { incl_scan += peer; } }
-        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, incl_scan, 4, 32); if (lane >= 4) { incl_scan += peer; } }
-        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, incl_scan, 8, 32); if (lane >= 8) { incl_scan += peer; } }
-        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, incl_scan, 16, 32); if (lane >= 16) { incl_scan += peer; } }
-        incl = (int)incl_scan;
+        const uint32_t _cta_scan_sum_prefix_0_own = (uint32_t)(n_i);
+        uint32_t _cta_scan_sum_prefix_0_ws = _cta_scan_sum_prefix_0_own;
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_ws, 1, 32); if (lane >= 1) { _cta_scan_sum_prefix_0_ws += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_ws, 2, 32); if (lane >= 2) { _cta_scan_sum_prefix_0_ws += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_ws, 4, 32); if (lane >= 4) { _cta_scan_sum_prefix_0_ws += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_ws, 8, 32); if (lane >= 8) { _cta_scan_sum_prefix_0_ws += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_ws, 16, 32); if (lane >= 16) { _cta_scan_sum_prefix_0_ws += peer; } }
+        if (lane == 31) { warp_tot[warp] = (int)_cta_scan_sum_prefix_0_ws; }
+        __syncthreads();
+        const uint32_t _cta_scan_sum_prefix_0_wt = (lane < 8) ? (uint32_t)warp_tot[lane] : 0;
+        uint32_t _cta_scan_sum_prefix_0_wsum = _cta_scan_sum_prefix_0_wt;
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_wsum, 1, 32); if (lane >= 1) { _cta_scan_sum_prefix_0_wsum += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_wsum, 2, 32); if (lane >= 2) { _cta_scan_sum_prefix_0_wsum += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_wsum, 4, 32); if (lane >= 4) { _cta_scan_sum_prefix_0_wsum += peer; } }
+        _cta_scan_sum_total_0 = (int)__shfl_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_wsum, 7);
+        const uint32_t _cta_scan_sum_prefix_0_before = __shfl_sync(0xFFFFFFFF, _cta_scan_sum_prefix_0_wsum - _cta_scan_sum_prefix_0_wt, warp);
+        _cta_scan_sum_prefix_0 = (int)(_cta_scan_sum_prefix_0_ws - _cta_scan_sum_prefix_0_own + _cta_scan_sum_prefix_0_before);
     }
-    if (lane_1 == 31) {
-        warp_tot[warp_2] = incl;
-    }
-    __syncthreads();
-    if (warp_2 == 0) {
-        int wt = 0;
-        if (lane_1 < 8) {
-            wt = warp_tot[lane_1];
-        }
-        int wincl = wt;
-        int _shfl_up_0 = __shfl_up_sync(0xFFFFFFFF, wincl, 1, 32);
-        if (lane_1 >= 1) {
-            wincl = wincl + _shfl_up_0;
-        }
-        int _shfl_up_1 = __shfl_up_sync(0xFFFFFFFF, wincl, 2, 32);
-        if (lane_1 >= 2) {
-            wincl = wincl + _shfl_up_1;
-        }
-        int _shfl_up_2 = __shfl_up_sync(0xFFFFFFFF, wincl, 4, 32);
-        if (lane_1 >= 4) {
-            wincl = wincl + _shfl_up_2;
-        }
-        if (lane_1 < 8) {
-            warp_tot[lane_1] = wincl - wt;
-        }
-        if (lane_1 == 7) {
-            starts[num_seqs] = wincl;
-        }
-    }
-    __syncthreads();
     if (tid_0 < num_seqs) {
-        starts[tid_0] = warp_tot[warp_2] + incl - n_i;
+        starts[tid_0] = _cta_scan_sum_prefix_0;
+    }
+    if (tid_0 == 0) {
+        starts[num_seqs] = _cta_scan_sum_total_0;
     }
     __syncthreads();
     if (cta == 0) {

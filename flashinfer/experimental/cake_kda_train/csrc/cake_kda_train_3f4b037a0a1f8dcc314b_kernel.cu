@@ -551,21 +551,21 @@ kernel_cake_kda_train_3f4b037a0a1f8dcc314b(const __grid_constant__ CUtensorMap w
                 float _tmem_load_0[16];
                 tmem_ld_x16(&_tmem_load_0[0], taddr + (unsigned int)h_row_base_1);
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
-                float hs2[16];
+                float hs2_1_0[16];
                 #pragma unroll
-                for (int j_1 = 0; j_1 < 16; j_1++) {
-                    hs2[j_1] = _tmem_load_0[j_1] * decay;
+                for (int j_1_0 = 0; j_1_0 < 16; j_1_0++) {
+                    hs2_1_0[j_1_0] = _tmem_load_0[j_1_0] * decay;
                 }
-                tmem_st_x16_f32(taddr + (unsigned int)h_row_base_1, hs2);
+                tmem_st_x16_f32(taddr + (unsigned int)h_row_base_1, hs2_1_0);
                 float _tmem_load_1[16];
                 tmem_ld_x16(&_tmem_load_1[0], taddr + (unsigned int)h_row_base_1 + 16);
                 asm volatile("tcgen05.wait::ld.sync.aligned;");
-                float hs2_0[16];
+                float hs2_1_1[16];
                 #pragma unroll
-                for (int j_2 = 0; j_2 < 16; j_2++) {
-                    hs2_0[j_2] = _tmem_load_1[j_2] * decay;
+                for (int j_1_1 = 0; j_1_1 < 16; j_1_1++) {
+                    hs2_1_1[j_1_1] = _tmem_load_1[j_1_1] * decay;
                 }
-                tmem_st_x16_f32(taddr + (unsigned int)h_row_base_1 + 16, hs2_0);
+                tmem_st_x16_f32(taddr + (unsigned int)h_row_base_1 + 16, hs2_1_1);
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 mbarrier_arrive(dec_done_addr);
@@ -599,8 +599,8 @@ kernel_cake_kda_train_3f4b037a0a1f8dcc314b(const __grid_constant__ CUtensorMap w
                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                 float ov[16];
                 #pragma unroll
-                for (int j_3 = 0; j_3 < 16; j_3++) {
-                    ov[j_3] = __fmaf_rn(_tmem_load_2[j_3], scale, _tmem_load_3[j_3]);
+                for (int j_1 = 0; j_1 < 16; j_1++) {
+                    ov[j_1] = __fmaf_rn(_tmem_load_2[j_1], scale, _tmem_load_3[j_1]);
                 }
                 if (t_row_1 < clen) {
                     unsigned int _packed_0[8];
