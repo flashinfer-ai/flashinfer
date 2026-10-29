@@ -2602,7 +2602,15 @@ def _run_rank_l2n(
         res, res_host
     )  # reported, as the norm-off host == fused
 
-    # the composed chain on the forward's own rows
+    # the composed chain on the forward's own rows.  The reference pass exchanges states, so every rank issues it (a
+    # rank without tokens passes its empty rows); skipping it there would put the ranks' collectives out of step.
+    ws0 = kcp.WorkspaceDetKcp()
+    ref = saved_pass(
+        qq=(rec_fwd_qk["qn"] if T_r > 0 else q).clone(),
+        kk=(rec_fwd_qk["kn"] if T_r > 0 else k).clone(),
+        workspace=ws0,
+        group_reduce="host",
+    )
     if T_r > 0:
         qn, kn, rstd = rec_fwd_qk["qn"], rec_fwd_qk["kn"], rec_fwd_qk["rstd"]
         flags["l2n_bwd_rows_eq_fwd"] = all(
@@ -2619,10 +2627,6 @@ def _run_rank_l2n(
             torch.equal(qn.cpu(), qh)
             and torch.equal(kn.cpu(), kh)
             and torch.equal(rstd.cpu(), torch.stack([rq, rk]))
-        )
-        ws0 = kcp.WorkspaceDetKcp()
-        ref = saved_pass(
-            qq=qn.clone(), kk=kn.clone(), workspace=ws0, group_reduce="host"
         )
         flags["l2n_eq_reference_out_dv_dbeta_dg"] = _eq(
             res, ref, ("out", "dv", "dbeta", "dg")
