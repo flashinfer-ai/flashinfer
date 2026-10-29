@@ -73,7 +73,7 @@ __device__ __forceinline__ void add_f32x2_inplace(float2* a, float2 b) {
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_cake_kimi_k3_latent_moe_e8d35f5bbf93c78ba382(__nv_bfloat16* __restrict__ routed, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ y_out, int M, int num_partials, float eps)
+kernel_cake_kimi_k3_latent_moe_0a2cd6c2104b4424604a(__nv_bfloat16* __restrict__ routed, __nv_bfloat16* __restrict__ norm_weight, __nv_bfloat16* __restrict__ y_out, int M, int num_partials, float eps)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -126,7 +126,7 @@ kernel_cake_kimi_k3_latent_moe_e8d35f5bbf93c78ba382(__nv_bfloat16* __restrict__ 
         ptotal += __shfl_xor_sync(0xFFFFFFFF, ptotal, offset);
     float prstd = rsqrtf(ptotal / (float)LATENT + eps);
     if (row < M) {
-        unsigned long long pout = (unsigned long long)row * (unsigned long long)LATENT;
+        unsigned long long out_base = (unsigned long long)row * (unsigned long long)LATENT;
         #pragma unroll
         for (int i_2 = 0; i_2 < VECS_PER_LANE; i_2++) {
             int kw = (lane + i_2 * 32) * 8;
@@ -214,7 +214,7 @@ kernel_cake_kimi_k3_latent_moe_e8d35f5bbf93c78ba382(__nv_bfloat16* __restrict__ 
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(yv[_lp*2 + 6], yv[_lp*2+1 + 6]));
                 _packed_0[_lp + 3] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<int4*>(y_out + (pout + (unsigned long long)kw))[0] = reinterpret_cast<int4*>(_packed_0)[0];
+            reinterpret_cast<int4*>(y_out + (out_base + (unsigned long long)kw))[0] = reinterpret_cast<int4*>(_packed_0)[0];
         }
     }
 }

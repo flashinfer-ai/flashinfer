@@ -923,14 +923,33 @@ FRONT_N224_I_LOCAL = SHARED_INTERMEDIATE
 FRONT_N224_MAX_T = 512
 FRONT_N224_SM_COUNT = 152
 FRONT_N224_BLOCK_N = 224
+# The TP8 rows of more than 256 and at most 512 tokens (two pair rows, evict_first weights) run the same 224-wide pair
+# tile on the parts where it measured faster: 4 router + 16 latent + 7 shared tiles (the last one 96 columns wide) give
+# 27 per pair row, 54 items at two pair rows, one wave of the resident clusters on 148 and 152 SMs, where the 256-wide
+# tile runs 48 larger items.  Whole tiles, the 256-wide tile's K order and accumulation: the outputs are bit-identical.
+# Parts are (SM count, architecture); a part not listed keeps the 256-wide tile.
+FRONT_N224_TP8_I_LOCAL = SHARED_INTERMEDIATE // 8
+FRONT_N224_TP8_MIN_T = 257
+FRONT_N224_TP8_PARTS = frozenset(
+    {(148, "sm_100a"), (148, "sm_103a"), (152, "sm_100a"), (152, "sm_103a")}
+)
 
 
-def front_block_n(M: int, i_local: int, sm_count: int = SM_COUNT) -> int:
-    """Pair-tile width of the prefill front GEMM instance for ``M`` tokens of one rank on a ``sm_count``-SM device."""
+def front_block_n(
+    M: int, i_local: int, sm_count: int = SM_COUNT, arch: str = "sm_100a"
+) -> int:
+    """Pair-tile width of the prefill front GEMM instance for ``M`` tokens of one rank on an ``arch`` device of
+    ``sm_count`` SMs."""
     if (
         int(i_local) == FRONT_N224_I_LOCAL
         and DECODE_MAX_T < int(M) <= FRONT_N224_MAX_T
         and int(sm_count) == FRONT_N224_SM_COUNT
+    ):
+        return FRONT_N224_BLOCK_N
+    if (
+        int(i_local) == FRONT_N224_TP8_I_LOCAL
+        and FRONT_N224_TP8_MIN_T <= int(M) <= FRONT_N224_MAX_T
+        and (int(sm_count), str(arch)) in FRONT_N224_TP8_PARTS
     ):
         return FRONT_N224_BLOCK_N
     return FRONT_BLOCK_N
@@ -1037,7 +1056,7 @@ def prefill_front_plan(
     every one of its clusters resident and keeps the trailing-wave plan below that (``None``: the qualified parts'
     count, which holds every fold plan)."""
     m_tiles = m_tiles_for(M)
-    block_n = front_block_n(M, i_local, sm_count)
+    block_n = front_block_n(M, i_local, sm_count, arch)
     n_tiles = front_n_tiles(i_local, block_n)
     cluster_tiles = (m_tiles // CTA_GROUP) * n_tiles
     fold = (
@@ -1288,6 +1307,35 @@ def use_resident_fused_norm(
     )
 
 
+# The TP8 rows of one routed partial of more than 256 tokens, up to a per-part bound, fuse the norm on the claimed
+# resident grid as the long TP1 rows do: the 256-wide tile at the default ring, 56 pair items at two pair rows (one wave
+# of the resident clusters on 148 and 152 SMs), whose epilogue warps normalise every latent row in place of the norm
+# launch.  The tile, K order and accumulation are those of the TP8 chain's 256-wide GEMM and the rows are normalised by
+# the norm launch's statements, so ``y`` and ``out`` are bit-identical.  Bounds by (SM count, architecture) where the
+# claimed launch measured faster, alone and behind the front GEMM; a part not listed keeps the norm launch.
+TAIL_TP8_CLAIMED_TP = 8
+TAIL_TP8_CLAIMED_MIN_T = 257
+TAIL_TP8_CLAIMED_MAX_T_BY_PART = {
+    (148, "sm_100a"): 300,
+    (148, "sm_103a"): 257,
+    (152, "sm_100a"): 384,
+    (152, "sm_103a"): 257,
+}
+
+
+def use_tp8_claimed_fused_norm(
+    M: int, tp: int, sm_count: int, arch: str, num_partials: int
+) -> bool:
+    """The TP8 rows of one routed partial that fuse the norm on the claimed resident grid."""
+    return (
+        int(tp) == TAIL_TP8_CLAIMED_TP
+        and int(num_partials) == 1
+        and TAIL_TP8_CLAIMED_MIN_T
+        <= int(M)
+        <= TAIL_TP8_CLAIMED_MAX_T_BY_PART.get((int(sm_count), str(arch)), 0)
+    )
+
+
 def resident_grid(num_items: int, sm_count: int) -> int:
     """CTAs of the claimed launch: one CTA pair per resident cluster, at most one per item.  Every CTA of the claimed
     instances allocates all 512 TMEM columns and more than half of the SM's shared memory, so one CTA runs per SM and
@@ -1322,15 +1370,23 @@ def use_packed_norm(M: int, tp: int, num_partials: int) -> bool:
 
 @_cached_plan
 def prefill_tail_plan(
-    M: int, tp: int, sm_count: int = SM_COUNT, num_partials: int = 1
+    M: int,
+    tp: int,
+    sm_count: int = SM_COUNT,
+    num_partials: int = 1,
+    arch: str = "sm_100a",
 ) -> dict[str, Any]:
     """Host plan of the prefill tail chain (norm launch + persistent GEMM) for ``M`` tokens and ``num_partials``
-    routed partials (the norm instance depends on it)."""
+    routed partials (the norm instance depends on it) on an ``arch`` device of ``sm_count`` SMs."""
     k_up = k_up_for_tp(tp)
     i_local = i_local_for_tp(tp)
     norm_grid = (M + NORM_ROWS_PER_CTA - 1) // NORM_ROWS_PER_CTA
     m_tiles = m_tiles_for(M)
-    num_stages, block_n, final_ts = tail_gemm_config(M, tp, sm_count)
+    tp8_claimed = use_tp8_claimed_fused_norm(M, tp, sm_count, arch, num_partials)
+    if tp8_claimed:
+        num_stages, block_n, final_ts = TAIL_NUM_STAGES, BLOCK_N, TAIL_FINAL_TS
+    else:
+        num_stages, block_n, final_ts = tail_gemm_config(M, tp, sm_count)
     n_tiles = (HIDDEN + block_n - 1) // block_n
     cluster_tiles = (m_tiles // CTA_GROUP) * n_tiles
     num_k = (k_up + i_local) // BLOCK_K
@@ -1338,7 +1394,9 @@ def prefill_tail_plan(
     gemm_grid = sk["num_items"] * CTA_GROUP
     early = norm_early_trigger(gemm_grid, norm_grid, sm_count)
     single_fused = use_fused_norm(M, gemm_grid, sm_count, i_local // BLOCK_K)
-    claim_items = use_resident_fused_norm(M, gemm_grid, sm_count, i_local // BLOCK_K)
+    claim_items = tp8_claimed or use_resident_fused_norm(
+        M, gemm_grid, sm_count, i_local // BLOCK_K
+    )
     launch_grid = resident_grid(sk["num_items"], sm_count) if claim_items else gemm_grid
     return dict(
         M=M,
@@ -1411,7 +1469,7 @@ def route_kernel_keys(
                     )
                 ),
             )
-        plan = prefill_tail_plan(num_tokens, tp, sm_count, int(num_partials))
+        plan = prefill_tail_plan(num_tokens, tp, sm_count, int(num_partials), arch)
         gemm = tail_gemm_kernel_key(
             tp,
             plan["weights_evict_first"],
@@ -2435,7 +2493,7 @@ def _prepare_tail(
             )
             route = "decode"
         else:
-            plan = prefill_tail_plan(T, tp, sm_count, P)
+            plan = prefill_tail_plan(T, tp, sm_count, P, arch)
             counters, norm_counter = _control_words(
                 index, _arrival_counter_words(plan), NORM_COUNTER_WORDS, lane=lane
             )
@@ -2601,6 +2659,7 @@ __all__ = [
     "use_fused_norm",
     "use_packed_norm",
     "use_resident_fused_norm",
+    "use_tp8_claimed_fused_norm",
     "resident_grid",
     "fused_norm_fits",
     "FUSED_MIN_K2_ITERS",
