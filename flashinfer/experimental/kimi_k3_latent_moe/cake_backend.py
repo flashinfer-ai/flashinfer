@@ -374,23 +374,58 @@ def decode_tail_plan(
     num_partials: int = 1,
     sm_count: int = SM_COUNT,
 ) -> dict[str, Any]:
-    """Instance configuration of ``tail_decode_fused`` (port of ``_tail_plan`` with the production defaults); the
-    few-token multi-partial rows of ``TAIL_SB_NORM_ROUTES`` take the global-y instance of their N_PAD with the
-    resident-B arithmetic (``sb_norm``), and the cells of ``TAIL_PARTIAL_PREFETCH_ROUTES`` the instance the table
-    names with the routed partials prefetched into L2 (``partial_prefetch``)."""
+    """Instance configuration of ``tail_decode_fused`` that the route of ``num_tokens`` tokens and ``num_partials``
+    routed partials at ``tp`` takes: the few-token multi-partial rows of ``TAIL_SB_NORM_ROUTES`` take the global-y
+    instance of their N_PAD with the resident-B arithmetic (``sb_norm``), the cells of ``TAIL_PARTIAL_PREFETCH_ROUTES``
+    the instance the table names with the routed partials prefetched into L2 (``partial_prefetch``), the cells of
+    ``TAIL_SPLIT_FIN_ROUTES`` the split-finalize instance of one routed partial at the table's N_PAD, and every other
+    row its own instance (``decode_tail_instance_plan``)."""
     sb_norm_n_pad = tail_sb_norm_n_pad(num_tokens, tp, num_partials)
     prefetch = tail_partial_prefetch(num_tokens, tp, num_partials)
     if prefetch is not None:
         sb_norm_n_pad = TAIL_SB_NORM_ROUTES[int(tp)][0] if prefetch else 0
     if sb_norm_n_pad:
-        plan = decode_tail_plan(sb_norm_n_pad, i_local, tp, num_partials, sm_count)
-        if plan["smem_b1"] or plan["split_fin"] or plan["partial_prefetch"]:
+        plan = decode_tail_instance_plan(
+            sb_norm_n_pad, i_local, tp, num_partials, sm_count
+        )
+        if plan["smem_b1"] or plan["split_fin"]:
             raise AssertionError(
                 f"tp{tp} N_PAD {sb_norm_n_pad} P={num_partials}: not a global-y instance"
             )
         plan["sb_norm"] = True
         plan["partial_prefetch"] = prefetch is not None
         return plan
+    if prefetch is not None:
+        plan = decode_tail_instance_plan(
+            num_tokens, i_local, tp, num_partials, sm_count
+        )
+        if not plan["smem_b1"] or plan["rows_smem"]:
+            raise AssertionError(
+                f"tp{tp} T={num_tokens} P={num_partials}: not a resident-B instance without staged rows"
+            )
+        plan["partial_prefetch"] = True
+        return plan
+    split_fin_n_pad = tail_split_fin_n_pad(num_tokens, tp, num_partials)
+    if split_fin_n_pad:
+        plan = decode_tail_instance_plan(split_fin_n_pad, i_local, tp, 1, sm_count)
+        if plan["smem_b1"] or not plan["split_fin"]:
+            raise AssertionError(
+                f"tp{tp} N_PAD {split_fin_n_pad}: not a split-finalize instance"
+            )
+        return plan
+    return decode_tail_instance_plan(num_tokens, i_local, tp, num_partials, sm_count)
+
+
+def decode_tail_instance_plan(
+    num_tokens: int,
+    i_local: int,
+    tp: int,
+    num_partials: int = 1,
+    sm_count: int = SM_COUNT,
+) -> dict[str, Any]:
+    """Instance configuration of ``tail_decode_fused`` for ``num_tokens`` tokens and ``num_partials`` routed partials
+    without the route tables (port of ``_tail_plan`` with the production defaults); a route table names an instance
+    by the N_PAD it plans for, i.e. this plan at ``num_tokens = N_PAD``."""
     n_pad = n_pad_for(num_tokens)
     tiles = HIDDEN // BLOCK_ROWS
     k_up = LATENT // tp
@@ -457,10 +492,6 @@ def decode_tail_plan(
             if use_rows
             else (SMEM_B1_MIN_STAGES if use_bn else 2),
         )
-    if prefetch is not None and not (use_bn and not use_rows):
-        raise AssertionError(
-            f"tp{tp} T={num_tokens} P={num_partials}: not a resident-B instance without staged rows"
-        )
     # The global-y protocol's levers (the resident-B instances normalise in smem and take neither).
     early_arrive = split_fin and not use_bn and tp == TAIL_EARLY_ARRIVE_TP
     up_prefetch = (
@@ -507,7 +538,7 @@ def decode_tail_plan(
         early_arrive=bool(early_arrive),
         up_prefetch=bool(up_prefetch),
         sb_norm=False,
-        partial_prefetch=prefetch is not None,
+        partial_prefetch=False,
         tiles=tiles,
         k1=k1,
         k2=k2,
@@ -532,8 +563,9 @@ FRONT_L2_PROMOTION_MAX_N_PAD = 64
 # combine, the epilogue math and the output stores are split over the pair and each landing zone holds half the partial
 # (one more ring stage for the TP8 tail at N_PAD 128).  Every value is still rank 0's partial plus rank 1's, so the
 # outputs are bitwise those of the single-finisher instance.  The cluster-pair instances take it: the TP8 front from
-# N_PAD 16 and the fused-norm tails of one routed partial from N_PAD 32 (P >= 2 keeps the single finisher; at N_PAD 16
-# the tails measured within run-to-run noise of the single finisher).
+# N_PAD 16 and the fused-norm tails of one routed partial from N_PAD 32 (the tail instances of P >= 2 keep the single
+# finisher, ``TAIL_SPLIT_FIN_ROUTES`` routes the multi-partial cells where the one-partial instance is faster to it; at
+# N_PAD 16 the tails measured within run-to-run noise of the single finisher).
 SPLIT_FIN_MIN_N_PAD = 16
 TAIL_SPLIT_FIN_MIN_N_PAD = 32
 # With it, the TP1 tail's epilogue warp 0 arrives on the fused norm's grid counter as soon as the CTA's normalised rows
@@ -563,7 +595,8 @@ TAIL_SB_NORM_ROUTES: dict[int, tuple[int, dict[int, int]]] = {
 
 def split_fin_route(stage: str, n_pad: int, num_partials: int = 1) -> bool:
     """Whether the decode instance of ``stage`` at ``n_pad`` (and, for the tail, ``num_partials`` routed partials)
-    takes the split finalize when it runs as cluster pairs."""
+    takes the split finalize when it runs as cluster pairs (the tail's own instance; ``TAIL_SPLIT_FIN_ROUTES`` sends
+    multi-partial cells to the instance of one partial)."""
     if stage != "tail":
         return int(n_pad) >= SPLIT_FIN_MIN_N_PAD
     return int(n_pad) >= TAIL_SPLIT_FIN_MIN_N_PAD and int(num_partials) == 1
@@ -619,6 +652,52 @@ def tail_partial_prefetch(
         if first <= int(num_partials) and (last is None or int(num_partials) <= last):
             return sb_norm
     return None
+
+
+# Split finalize for the multi-partial decode tails (``TAIL_SPLIT_FIN_ROUTES``).  The split-finalize instance of one
+# routed partial at N_PAD ``n`` (``decode_tail_instance_plan(n, ...)``: ``_sf``, with ``_ea`` on the TP1 tail and
+# ``_upf`` on the TP8 tail at N_PAD 32 / 64) serves every token count up to ``n`` and every partial count: both are
+# launch arguments, it sums the routed partials in the order of the row's own instance and its finalize only splits
+# the rank 0 + rank 1 sum over the pair, so its outputs are bitwise those of the row's own instance.
+# ``TAIL_SPLIT_FIN_ROUTES`` maps a TP to token ranges ``(first, last, cells)`` and each range to the partial ranges
+# ``(first, last, n_pad)`` that take the instance at ``n_pad`` (``last`` ``None``: from ``first`` up, as
+# ``TAIL_PARTIAL_PREFETCH_ROUTES``): the cells where it measured faster than the row's own instance on B200, B300,
+# GB200 and GB300 in both passes (paired CUDA-graph timing, cold L2, ABBA groups, by more than the largest of the A/A
+# band, 0.1 us and 0.192 us, the largest spread measured between two timings of one program; 9, 12, 16, 17, 24, 32,
+# 33, 48, 64, 65, 96 and 128 tokens, 1 to 8 and 16 partials, one partial up to 32 tokens), less 9 and 16 tokens of 2
+# partials (a validation run did not time them faster by more than that threshold).  A token count between two
+# measured ones takes an instance measured faster at both, more than 8 partials one measured faster at 8 and at 16.
+# From 17 tokens the row of one partial already takes the split-finalize instance of its own N_PAD; the TP1 tail of 9
+# to 16 tokens has none of its own (N_PAD 16).
+_SplitFinCells = tuple[tuple[int, int, tuple[tuple[int, Optional[int], int], ...]], ...]
+TAIL_SPLIT_FIN_ROUTES: dict[int, _SplitFinCells] = {
+    1: (
+        (9, 11, ((1, 1, 32), (6, None, 32))),
+        (12, 12, ((1, 2, 32), (6, None, 32))),
+        (13, 16, ((1, 1, 32), (6, None, 32))),
+        (17, 23, ((2, 2, 32),)),
+        (24, 32, ((1, 3, 64), (8, None, 64))),
+        (33, 64, ((2, None, 64),)),
+        (65, 128, ((2, None, 128),)),
+    ),
+    8: (
+        (33, 64, ((2, None, 64),)),
+        (65, 128, ((2, None, 128),)),
+    ),
+}
+
+
+def tail_split_fin_n_pad(num_tokens: int, tp: int, num_partials: int) -> int:
+    """N_PAD of the split-finalize instance of one routed partial that serves the decode tail of ``num_tokens`` tokens
+    and ``num_partials`` routed partials at ``tp`` (``TAIL_SPLIT_FIN_ROUTES``), or 0 for the row's own instance."""
+    for first_tokens, last_tokens, cells in TAIL_SPLIT_FIN_ROUTES.get(int(tp), ()):
+        if first_tokens <= int(num_tokens) <= last_tokens:
+            for first, last, n_pad in cells:
+                if first <= int(num_partials) and (
+                    last is None or int(num_partials) <= last
+                ):
+                    return n_pad
+    return 0
 
 
 def decode_symbol(plan: dict[str, Any]) -> str:
@@ -2496,6 +2575,7 @@ __all__ = [
     "decode_front_plan",
     "decode_kernel_key",
     "decode_symbol",
+    "decode_tail_instance_plan",
     "decode_tail_plan",
     "front_kernel_key",
     "generated_program_available",
@@ -2516,6 +2596,7 @@ __all__ = [
     "tail_gemm_kernel_key",
     "tail_partial_prefetch",
     "tail_sb_norm_n_pad",
+    "tail_split_fin_n_pad",
     "tail_wide_min_tokens",
     "use_fused_norm",
     "use_packed_norm",
