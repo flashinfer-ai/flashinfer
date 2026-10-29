@@ -112,17 +112,18 @@ def test_fp8_paged_mqa_full_positional_trace():
     wrapper._capacity_plan = None
     wrapper._math_mode = wrapper._math_mode_at_construction = "relu_strict"
     wrapper._compression_ratio = wrapper._compression_ratio_at_construction = 1
-    wrapper._full_top_k = 512
-    wrapper._full_batches = 1
-    wrapper._full_step_is_prepared = True
     q = torch.empty(2, 8, 128, dtype=torch.float8_e4m3fn)
     kv = torch.empty(1, 64, 1, 132, dtype=torch.uint8)
     weights = torch.empty(2, 8)
     table = torch.zeros(1, 1, dtype=torch.int32)
-    wrapper._full_state = SimpleNamespace(
+    state = SimpleNamespace(
         qo_indptr=torch.tensor([0, 2], dtype=torch.int32),
         kv_indptr=torch.tensor([0, 64], dtype=torch.int32),
         block_table=table,
+        _written_step_shape=(2, 1),
+    )
+    wrapper._full_capacity_plan = SimpleNamespace(
+        _state=state, _top_k=512, _planned=True
     )
     bound = inspect.signature(wrapper.run).bind(q, weights, kv)
     positional = fi_trace(wrapper.run, **bound.arguments)

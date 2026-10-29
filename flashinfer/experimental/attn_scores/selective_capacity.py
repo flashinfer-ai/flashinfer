@@ -195,6 +195,10 @@ class _CapacityStepInputs:
             check_ctas,
         )
         self._compiled = None
+        self._next_n = 0
+        from .host_length_hints import _HostHintValidation
+
+        self._host_hint_validation = _HostHintValidation(capacity, self.device)
 
     def input_buffers(self) -> dict[str, torch.Tensor]:
         return dict(
@@ -269,8 +273,12 @@ class _CapacityStepInputs:
         """Stage one layer without changing step metadata."""
         self._copy_inputs(self._payload_copies(q, weights))
 
-    def stage_step(self, qo_indptr, kv_indptr, block_table, *, num_query_rows):
+    def stage_step(
+        self, qo_indptr, kv_indptr, block_table, *, num_query_rows, next_n=None
+    ):
         """Stage shared prefixes/map and publish the supplied Q extent."""
+        if next_n is not None and (type(next_n) is not int or next_n not in (1, 2, 4)):
+            raise ValueError("next_n must be None, 1, 2 or 4")
         if type(num_query_rows) is not int or not (
             0 <= num_query_rows <= self.capacity.max_chunk_size
         ):
@@ -299,6 +307,7 @@ class _CapacityStepInputs:
             )
         )
         step_shape = (num_query_rows, qo_indptr.numel() - 1)
+        self._next_n = 0 if next_n is None else next_n
         # Replayed captures can write a shape without updating the host cache.
         # Once captured, always publish it, including on repeated eager steps.
         if torch.cuda.is_current_stream_capturing():
@@ -314,7 +323,8 @@ class _CapacityStepInputs:
         self.prepare()
         assert self._compiled is not None
         with torch.cuda.device(self.device):
-            self._compiled(*self._args, _current_stream(self.device))
+            self._compiled(*self._args, self._next_n, _current_stream(self.device))
+            self._host_hint_validation.check(self)
 
     def prepare_sampling(self, top_k: int) -> None:
         """Allocate the capacity-sized direct-page sample metadata."""
@@ -394,6 +404,7 @@ class _CapacityStepInputs:
                         self.device,
                         self._refresh_kernel,
                         *self._args,
+                        0,
                         _current_stream(self.device),
                     )
                 )
@@ -763,7 +774,16 @@ class _CapacitySelectiveTopKPlan:
                 row_ends=engine._sample_ends,
             )
 
-    def plan(self, qo_indptr, kv_indptr, block_table, *, num_query_rows=None):
+    def plan(
+        self,
+        qo_indptr,
+        kv_indptr,
+        block_table,
+        *,
+        num_query_rows=None,
+        next_n=None,
+        host_length_hints=None,
+    ):
         """Refresh prefixes, map and schedules once for all serialized layers.
 
         num_query_rows is the supplied Q storage extent, not a device value.
@@ -771,8 +791,14 @@ class _CapacitySelectiveTopKPlan:
         the final device query prefix may be smaller, leaving inactive -1 rows.
         Status is cleared here and survives every layer until the next step.
         """
+        self._step_prepared = False
         if num_query_rows is None:
             num_query_rows = self._capacity.max_chunk_size
+        from .host_length_hints import _validate_host_length_hints
+
+        _validate_host_length_hints(
+            host_length_hints, qo_indptr.numel() - 1, self._capacity, num_query_rows
+        )
         with torch.cuda.device(self._state.device):
             capturing = torch.cuda.is_current_stream_capturing()
             if capturing and (
@@ -781,9 +807,13 @@ class _CapacitySelectiveTopKPlan:
                 raise RuntimeError(
                     "prepare_pool or one eager run must precede capturing plan"
                 )
-            self._step_prepared = False
+            self._state._host_hint_validation.stage(host_length_hints)
             self._state.stage_step(
-                qo_indptr, kv_indptr, block_table, num_query_rows=num_query_rows
+                qo_indptr,
+                kv_indptr,
+                block_table,
+                num_query_rows=num_query_rows,
+                next_n=next_n,
             )
             self._check_caller_capture(capturing, "plan input copies")
             self._repair_error.zero_()

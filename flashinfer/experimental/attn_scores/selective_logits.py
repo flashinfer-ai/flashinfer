@@ -4206,10 +4206,13 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
     ``plan(qo_indptr, kv_indptr, block_table)`` binds step metadata;
     ``run(q, weights, kv_fused, *, out=None)`` shares the workspace across layers.
     Full uses the same constructor, step-plan and layer-run signatures;
-    its host-planned groups require plan outside capture. Both return stable
+    prepared unhinted plans refresh device metadata under caller capture.
+    Optional CPU length hints select eager request-local views and stripes.
+    Both return stable
     request-local int32 indices with shape ``[supplied_q_rows, top_k]``.
 
-    Full always uses GVR-v2 and owns independent per-plan scratch. Selective
+    Full uses GVR-v2 and a caller-budgeted score arena (default 512 MiB) shared across
+    serialized layer pools. Selective
     supports TopK1..2048 with fixed candidate and repair selectors.
     Neither strategy selects or falls back to another full-score backend.
 
@@ -4252,6 +4255,7 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
         max_context_length: int | None = None,
         max_chunk_size: int | None = None,
         max_batch_size: int | None = None,
+        max_workspace_size: int | None = None,
         kv_layout: torch.Tensor | None = None,
         num_pages: int | None = None,
         device: torch.device | str | int | None = None,
@@ -4267,12 +4271,13 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
         bounds total supplied Q rows, not rows per request. The owned table has
         ``max_batch_size`` rows and enough columns for the maximum per-request
         physical extent. Construction allocates the step workspace outside
-        CUDA graph capture without compiling kernels. The first ``prepare_pool``
-        or eager ``run`` compiles scoring kernels and reserves score scratch.
-        Full requires ``plan`` before preparation and reads prefixes on the host;
-        each new full plan invalidates the previous pool bindings. Selective can
-        prepare the layout before its first step and refresh metadata in capture.
-        Unsupported
+        CUDA graph capture. Full reserves a bounded score arena and compiles
+        device metadata at construction; call ``plan`` and ``prepare_pool``
+        outside capture to warm each full layout. In-capacity replans preserve
+        pool bindings and storage addresses. Selective can prepare the layout
+        before its first step or on its first eager ``run``. Both refresh
+        unhinted step metadata without host reads under caller capture.
+        Unsupported selective
         scoring specializations are rejected when that chain is first built;
         an empty physical capacity returns -1 results without building it.
         Construction validates capacities, layout and device, but does not
@@ -4300,6 +4305,9 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
             max_context_length: Maximum original-token context per request.
             max_chunk_size: Maximum total supplied query rows.
             max_batch_size: Maximum number of requests per step.
+            max_workspace_size: Positive byte budget for the full FP32 score
+                arena only; None means 512 MiB. Excludes GVRv2 workspace,
+                metadata, inputs and outputs. Validated but ignored by selective.
             kv_layout: Optional contiguous CUDA uint8 KV layout exemplar of
                 shape ``[num_pages, page_size, 1, head_dim + 4]``. Not retained.
             num_pages: Physical page capacity, instead of an exemplar.
@@ -4318,6 +4326,12 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
         math_mode = _validate_math_mode(math_mode)
         if strategy not in ("full", "selective"):
             raise ValueError("strategy must be 'full' or 'selective'")
+        if max_workspace_size is not None and (
+            type(max_workspace_size) is not int or max_workspace_size <= 0
+        ):
+            raise ValueError(
+                "max_workspace_size must be a positive integer byte budget or None"
+            )
         if type(compression_ratio) is not int or compression_ratio not in (1, 4):
             raise ValueError("compression_ratio must be 1 or 4")
         if strategy == "full" and compression_ratio != 1:
@@ -4335,6 +4349,9 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
         self._compression_ratio = compression_ratio
         self._compression_ratio_at_construction = compression_ratio
         self._capacity_plan = None
+        self._full_scores: torch.Tensor | None = None
+        self._full_gvr2_workspace: torch.Tensor | None = None
+        self._selected: torch.Tensor | None = None
         if strategy == "selective":
             from .selective_capacity import _CapacitySelectiveTopKPlan
 
@@ -4353,53 +4370,29 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
                 math_mode=math_mode,
             )
         else:
-            from .selective_capacity import (
-                _CapacitySelectiveTopKPlan,
-                _CapacityStepInputs,
-                _SelectiveCapacity,
-            )
+            from .full_capacity import _CapacityFullTopKPlan
 
-            capacity = _SelectiveCapacity(
-                num_heads,
-                head_dim,
-                page_size,
-                compression_ratio,
-                max_context_length,
-                max_chunk_size,
-                max_batch_size,
+            self._full_capacity_plan = _CapacityFullTopKPlan(
+                max_context_length=max_context_length,
+                max_chunk_size=max_chunk_size,
+                max_batch_size=max_batch_size,
+                kv_layout=kv_layout,
+                num_pages=num_pages,
+                device=device,
+                num_heads=num_heads,
+                head_dim=head_dim,
+                page_size=page_size,
+                top_k=top_k,
+                math_mode=math_mode,
+                max_workspace_size=max_workspace_size,
             )
-            layout, device, pages = _CapacitySelectiveTopKPlan._resolve_layout(
-                capacity, kv_layout, num_pages, device
-            )
-            self._full_state = _CapacityStepInputs(
-                capacity, device=device, num_pages=pages
-            )
-            self._full_state.q.zero_()
-            self._full_state.weights.zero_()
-            self._full_pool_layout = layout
-            self._full_pool_plans: dict[tuple[Any, ...], dict[str, Any]] = {}
-            self._full_step_is_prepared = False
-            self._full_num_heads, self._full_head_dim, self._full_top_k = (
-                num_heads,
-                head_dim,
-                top_k,
-            )
-            self._full_supplied_rows = max_chunk_size
-            self._full_batches = max_batch_size
-            self._full_q_payload = self._full_state.q
-            self._full_weight_payload = self._full_state.weights
-            self._full_block_table = self._full_state.block_table
-            self._full_repair_error = torch.zeros(1, dtype=torch.int32, device=device)
-        self._full_groups: list[
-            tuple[int, int, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-        ] = []
-        self._full_scores: torch.Tensor | None = None
-        self._full_row_ends: torch.Tensor | None = None
-        self._full_binding_identity: tuple[Any, ...] | None = None
-        self._full_max_context_len = 0
-        self._full_impl: Any = None
-        self._full_gvr2_workspace: torch.Tensor | None = None
-        self._selected: torch.Tensor | None = None
+            full = self._full_capacity_plan
+            self._full_state = full._state
+            self._full_scores = full._scores
+            self._full_gvr2_workspace = full._gvr_workspace
+            self._full_repair_error = full.repair_error
+            self._selected = full._output
+            return
 
     @property
     def math_mode(self) -> _MathMode:
@@ -4426,359 +4419,6 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
                 "compression_ratio is immutable; construct a new wrapper"
             )
 
-    def _allocate_full_plan(
-        self,
-        q: torch.Tensor,
-        kv_fused: torch.Tensor,
-        weights: torch.Tensor,
-        cu_q: torch.Tensor,
-        cu_kv: torch.Tensor,
-        block_table: torch.Tensor,
-        *,
-        top_k: int,
-        num_heads: int,
-        head_dim: int,
-    ) -> None:
-        """Prepare full paged logits and exact per-row TopK."""
-        from ...topk_varlen.topk_varlen import top_k_varlen
-        from ...attn_scores.attn_scores import (
-            compute_paged_mqa_logits_schedule,
-            fp8_paged_mqa_logits,
-            padded_seq_len,
-        )
-
-        _validate_selective_top_k(top_k)
-        if top_k not in (512, 1024, 2048):
-            raise ValueError(
-                "strategy='full' uses GVR-v2 and requires top_k in (512, 1024, 2048)"
-            )
-        if not isinstance(num_heads, int) or num_heads <= 0:
-            raise ValueError("num_heads must be a positive integer")
-        if not isinstance(head_dim, int) or head_dim <= 0 or head_dim % _FP8_MMA_INST_K:
-            raise ValueError(
-                f"head_dim must be a positive multiple of {_FP8_MMA_INST_K}"
-            )
-        if q.dim() != 3 or tuple(q.shape[1:]) != (num_heads, head_dim):
-            raise ValueError(
-                "q must have shape [total_q, num_heads, head_dim] matching "
-                "num_heads and head_dim"
-            )
-        if weights.shape != (q.shape[0], num_heads):
-            raise ValueError("weights must have shape [total_q, num_heads]")
-        if cu_q.numel() < 2 or cu_kv.numel() != cu_q.numel():
-            raise ValueError("cu_q and cu_kv must have matching [batch+1] extents")
-        if block_table.dim() != 2 or block_table.shape[0] != cu_q.numel() - 1:
-            raise ValueError("block_table must have one row per request")
-
-        q_prefix = cu_q.tolist()
-        kv_prefix = cu_kv.tolist()
-        if q_prefix[0] != 0 or kv_prefix[0] != 0:
-            raise ValueError("cu_q and cu_kv must start at zero")
-        if q_prefix[-1] > q.shape[0]:
-            raise ValueError("qo_indptr[-1] must not exceed supplied Q rows")
-        if any(a > b for a, b in zip(q_prefix, q_prefix[1:], strict=False)):
-            raise ValueError("cu_q must be monotonically nondecreasing")
-        if any(a > b for a, b in zip(kv_prefix, kv_prefix[1:], strict=False)):
-            raise ValueError("cu_kv must be monotonically nondecreasing")
-
-        row_ends: list[int] = []
-        chunks: list[tuple[int, int, int, int]] = []
-        max_next_n = _COMPUTE_BLOCK_KV // num_heads
-        if max_next_n < 1:
-            raise ValueError("num_heads exceeds the full paged-logits N envelope")
-        for request, (q_begin, q_end, kv_begin, kv_end) in enumerate(
-            zip(
-                q_prefix[:-1],
-                q_prefix[1:],
-                kv_prefix[:-1],
-                kv_prefix[1:],
-                strict=True,
-            )
-        ):
-            q_len = q_end - q_begin
-            kv_len = kv_end - kv_begin
-            if q_len == 0:
-                continue
-            if kv_len < q_len:
-                raise ValueError(
-                    "full causal TopK requires nonempty Q and every KV length >= Q"
-                )
-            first_end = kv_len - q_len + 1
-            row_ends.extend(range(first_end, kv_len + 1))
-            chunk_begin = q_begin
-            while chunk_begin < q_end:
-                next_n = min(max_next_n, q_end - chunk_begin)
-                chunk_end = chunk_begin + next_n
-                context_end = first_end + (chunk_end - q_begin) - 1
-                chunks.append((chunk_begin, chunk_end, request, context_end))
-                chunk_begin = chunk_end
-
-        # Invalidate before replacing storage; a failed rebuild must not
-        # execute bindings from the previous plan generation.
-        self._full_binding_identity = None
-        self._full_impl = None
-        self._full_gvr2_workspace = None
-        self._rows = q.shape[0]
-        self._batches = len(q_prefix) - 1
-        self._top_k = top_k
-        self._kv_rows = kv_prefix[-1]
-        self._cu_q = cu_q
-        self._cu_kv = cu_kv
-        row_ends.extend([0] * (q.shape[0] - len(row_ends)))
-        self._full_max_context_len = max(row_ends, default=0)
-        self._full_row_ends = torch.tensor(row_ends, dtype=torch.int32, device=q.device)
-        score_columns = max(padded_seq_len(self._full_max_context_len), self._top_k)
-        # Keep GVR2 on its streaming, spill-free path. Logical
-        # row lengths still exclude padding from score selection.
-        score_columns = max(score_columns, 8192)
-        self._full_scores = torch.empty(
-            (self._rows, score_columns),
-            dtype=torch.float32,
-            device=q.device,
-        )
-        self._selected = torch.empty(
-            (self._rows, top_k), dtype=torch.int32, device=q.device
-        )
-
-        self._full_groups = []
-        group_begin = 0
-        while group_begin < len(chunks):
-            q_begin, _, _, _ = chunks[group_begin]
-            next_n = chunks[group_begin][1] - q_begin
-            group_end = group_begin + 1
-            while group_end < len(chunks):
-                prev = chunks[group_end - 1]
-                current = chunks[group_end]
-                if current[0] != prev[1] or current[1] - current[0] != next_n:
-                    break
-                group_end += 1
-            selected_chunks = chunks[group_begin:group_end]
-            q_end = selected_chunks[-1][1]
-            context_lens = torch.tensor(
-                [chunk[3] for chunk in selected_chunks],
-                dtype=torch.int32,
-                device=q.device,
-            )
-            request_ids = torch.tensor(
-                [chunk[2] for chunk in selected_chunks],
-                dtype=torch.int64,
-                device=block_table.device,
-            )
-            group_block_table = block_table.index_select(0, request_ids).contiguous()
-            schedule = compute_paged_mqa_logits_schedule(
-                context_lens, device=q.device, next_n=next_n, variant="fp8"
-            )
-            self._full_groups.append(
-                (
-                    q_begin,
-                    q_end,
-                    next_n,
-                    group_block_table,
-                    context_lens,
-                    schedule,
-                    request_ids,
-                )
-            )
-            group_begin = group_end
-
-        full_scores = self._full_scores
-        full_row_ends = self._full_row_ends
-        selected = self._selected
-        full_groups = tuple(self._full_groups)
-        full_max_context_len = self._full_max_context_len
-        selected_top_k = self._top_k
-        full_math_mode = self.math_mode
-        from ...topk_varlen.kernels.gvr2_topk_host import workspace_bytes
-
-        # GVR2's default scratch is stream-local, but warmup and capture
-        # use different streams. Own one zeroed slab across both and any
-        # enclosing graph; concurrent wrappers must not share this scratch.
-        full_gvr2_workspace = torch.zeros(
-            workspace_bytes(), dtype=torch.uint8, device=q.device
-        ).view(torch.int32)
-        full_topk_workspace = {"gvr2_workspace": full_gvr2_workspace}
-        # In-range, evenly spaced hints enable the native self-sampling
-        # selector. They steer sampling, never determine the exact result.
-        # Use int64 during construction to avoid overflowing long row ends.
-        hint_columns = torch.arange(selected_top_k, dtype=torch.int64, device=q.device)
-        full_hints = (
-            full_row_ends[:, None] * hint_columns[None, :] // selected_top_k
-        ).to(torch.int32)
-
-        def full_impl() -> torch.Tensor:
-            if not full_groups:
-                selected.fill_(-1)
-                return selected
-            for (
-                q_begin,
-                q_end,
-                next_n,
-                group_block_table,
-                context_lens,
-                schedule,
-                request_ids,
-            ) in full_groups:
-                # Page mappings are per-run payload, including graph replay.
-                torch.index_select(block_table, 0, request_ids, out=group_block_table)
-                batch = (q_end - q_begin) // next_n
-                fp8_paged_mqa_logits(
-                    q[q_begin:q_end].view(batch, next_n, num_heads, head_dim),
-                    kv_fused,
-                    weights[q_begin:q_end],
-                    group_block_table,
-                    context_lens,
-                    full_max_context_len,
-                    math_mode=full_math_mode,
-                    schedule_meta=schedule,
-                    out=full_scores[q_begin:q_end],
-                )
-            # Consume causal lengths directly and write the stable int32 output;
-            # a dense torch.topk would scan padding and require an index copy.
-            top_k_varlen(
-                full_scores,
-                full_row_ends,
-                selected_top_k,
-                pre_idx=full_hints,
-                out_indices=selected,
-                workspace=full_topk_workspace,
-                backend="gvr_2",
-            )
-            # GVR-v2 keeps every key of a short row and pads its suffix with -1.
-            selected[q_prefix[-1] :].fill_(-1)
-            return selected
-
-        new_identity = _selective_logits_launch_identity(
-            (q, kv_fused, weights, block_table), 0
-        )
-        full_impl()
-        torch.cuda.synchronize(q.device)
-        self._full_gvr2_workspace = full_gvr2_workspace
-        self._full_impl = full_impl
-        self._full_binding_identity = new_identity
-
-    def _plan_full_payload(
-        self,
-        q: torch.Tensor,
-        kv_fused: torch.Tensor,
-        weights: torch.Tensor,
-        cu_q: torch.Tensor,
-        cu_kv: torch.Tensor,
-        block_table: torch.Tensor,
-        *,
-        top_k: int = _DEFAULT_TOP_K,
-        num_heads: int = 8,
-        head_dim: int = 128,
-    ) -> None:
-        """Prepare exact causal TopK on Blackwell SM100/SM103 outside graph capture.
-
-        Args:
-            q: Contiguous CUDA FP8 E4M3 queries ``[total_q, num_heads, head_dim]``.
-            kv_fused: Contiguous CUDA uint8 storage
-                ``[num_pages, page_size, 1, head_dim + 4]``. Each physical page
-                contains all FP8 keys followed by one FP32 scale per token;
-                the bytes are not interleaved per token. Page size is 32, 64,
-                or 128. Tables need one entry per logical page.
-            weights: Contiguous CUDA FP32 weights ``[total_q, num_heads]``.
-            cu_q: Contiguous CUDA int32 query prefix sums ``[batch + 1]``.
-                Requires at least one query in every request.
-            cu_kv: Contiguous CUDA int32 KV prefix sums ``[batch + 1]``.
-                Prefixes start at zero and are nondecreasing; each request
-                must have at least as many original KV tokens as query rows.
-            block_table: Contiguous CUDA int32 physical page indices
-                ``[batch, max_pages]``, with valid entries for logical pages.
-            top_k: Integer output width 512, 1024 or 2048, default 512.
-            num_heads: Scoring head count, default 8; must admit a legal
-                paged-logits compute tile for the selected strategy.
-            head_dim: Head dimension, a positive multiple of 32, default 128;
-                the selected tile must fit device shared memory.
-
-        All tensors must share one device. Planning reads prefixes on the host
-        and allocates/precompiles run resources. Replans replace storage.
-        Full owns 20,973,568 bytes of GVR-v2 scratch. Each successful
-        plan owns separate zero-initialized storage held across eager calls
-        and caller-owned graph captures. Successful selector launches reset their
-        consumed state; this is not a lock or CUDA-context-fault recovery.
-        Replan after changing prefixes, tensor objects, storage/layout, or
-        specialization, and recapture any enclosing graph after replanning.
-        A failed rebuild invalidates run until a successful plan; early
-        validation failures can leave the prior plan usable. Synchronize prior
-        work before replanning.
-        """
-        self._check_math_mode()
-        self._check_compression_ratio()
-        device = q.device if isinstance(q, torch.Tensor) and q.is_cuda else -1
-        # Retain retired bindings until replacement preparation finishes,
-        # including on a failed rebuild.
-        previous_plan = tuple(self.__dict__.values())
-        try:
-            with torch.cuda.device(device):
-                if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError(
-                        "full strategy plan must be called outside CUDA graph capture"
-                    )
-                self._allocate_full_plan(
-                    q,
-                    kv_fused,
-                    weights,
-                    cu_q,
-                    cu_kv,
-                    block_table,
-                    top_k=top_k,
-                    num_heads=num_heads,
-                    head_dim=head_dim,
-                )
-        finally:
-            del previous_plan
-
-    def _run_full_payload(
-        self,
-        q: torch.Tensor,
-        kv_fused: torch.Tensor,
-        weights: torch.Tensor,
-        block_table: torch.Tensor,
-    ) -> torch.Tensor:
-        """Return plan-owned int32 request-local indices ``[total_q, top_k]``.
-
-        Args:
-            q: The same query tensor object passed to plan, with unchanged
-                storage, shape and layout.
-            kv_fused: The same fused KV tensor object passed to plan, with
-                unchanged storage and layout.
-            weights: The same FP32 weights tensor object passed to plan, with
-                unchanged storage and layout.
-            block_table: The same page-map tensor object passed to plan, with
-                unchanged storage and layout.
-
-        Input contents, including page mappings, may change in place between
-        calls. Prefix changes require replanning. Output is overwritten on the
-        next run; clone it to retain a result. Ordering is unspecified, ties may
-        select equivalent keys, and underfilled rows retain all causal keys
-        with remaining slots filled with -1.
-
-        A successful plan is required. Eager and caller-captured calls enqueue
-        the prepared operations directly, except selective caller capture
-        records exact repair in a conditional body. Calls
-        on one wrapper must not overlap; synchronize before switching streams
-        or replanning. Replacing a tensor object, even with a view sharing the
-        same storage, or changing storage/layout raises ValueError. Recapture
-        enclosing graphs after replanning; they keep the previous bindings.
-        If outer capture fails, discard that graph before retrying. A failed
-        plan rebuild remains invalid until a successful plan.
-        Enclosing capture must use a stream on the input tensors' device.
-        """
-        self._check_math_mode()
-        self._check_compression_ratio()
-        device = q.device if isinstance(q, torch.Tensor) and q.is_cuda else -1
-        with torch.cuda.device(device):
-            if self._full_binding_identity is None or self._full_impl is None:
-                raise RuntimeError("plan must be called before run")
-            identity = _selective_logits_launch_identity(
-                (q, kv_fused, weights, block_table), 0
-            )
-            if identity != self._full_binding_identity:
-                raise ValueError("run tensors must match the address-stable plan")
-            return self._full_impl()
-
     @flashinfer_api
     @_public_wrapper_method
     def plan(
@@ -4788,6 +4428,8 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
         block_table: torch.Tensor,
         *,
         num_query_rows: int | None = None,
+        next_n: int | None = None,
+        host_length_hints: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> None:
         """Bind the current step's prefixes and page map for every layer.
 
@@ -4798,66 +4440,55 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
                 ``ceil((max_context_length // compression_ratio) / page_size)`` columns.
             num_query_rows: Supplied Q extent, default ``max_chunk_size``.
                 Active query prefixes may end below this extent.
+            next_n: Optional host int 1, 2 or 4 declaring exactly that many
+                query rows per request. Valid under caller capture. Device
+                prefix mismatches invalidate the step and produce -1 output.
+                Full uses direct uniform views; selective validates the
+                declaration without changing its scoring layout.
+            host_length_hints: Optional pair of contiguous CPU integer tensors:
+                exact query prefix ``[B+1]`` and KV length upper bounds ``[B]``.
+                Rejected during capture. Full selects prepared eager stripes
+                and direct query views; selective validates and ignores sizing.
+                Device prefixes/lengths remain authoritative: mismatched query
+                prefixes or under-bound lengths set invalid-step status and -1.
+                Every hinted plan also refreshes capacity metadata; existing
+                caller graphs retain their views and schedules. A different
+                replay step still needs its ordinary device metadata refresh.
 
         Returns:
             None. The wrapper owns staged metadata and reset status buffers.
 
         Raises:
             ValueError: A prefix, map layout or supplied extent is invalid.
-            RuntimeError: Full planning occurs during capture, or selective
-                capture requires a scoring layout that has not been prepared.
+            RuntimeError: Capture requires a layout not prepared outside capture.
 
-        Selective refreshes device metadata without host value reads and can
-        be captured after the layout is prepared. Full uses host prefix values
-        to build its scorer groups, so call its plan outside capture and warm
-        each pool before capturing run. Full planning synchronizes previous
-        work before replacing its per-pool score buffers and bindings. Discard
-        caller graphs from the previous full plan before replanning; they must
-        be recaptured. Both share step metadata across layers.
+        Both refresh device metadata without host value reads and support
+        caller capture after preparation. In-capacity replans preserve buffer
+        addresses and pool bindings. Prepare each host-static layout outside
+        capture; caller graphs keep that layout and supplied storage extent.
+        Both share step metadata across layers.
+        Host-side validation failures invalidate the step; call a valid plan
+        before running again.
         """
         self._check_math_mode()
         self._check_compression_ratio()
         if self._capacity_plan is not None:
             return self._capacity_plan.plan(
-                qo_indptr, kv_indptr, block_table, num_query_rows=num_query_rows
+                qo_indptr,
+                kv_indptr,
+                block_table,
+                num_query_rows=num_query_rows,
+                next_n=next_n,
+                host_length_hints=host_length_hints,
             )
-        state = self._full_state
-        with torch.cuda.device(state.device):
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError(
-                    "full strategy plan must be called outside CUDA graph capture"
-                )
-            if self._full_pool_plans:
-                torch.cuda.synchronize(state.device)
-            rows = (
-                state.capacity.max_chunk_size
-                if num_query_rows is None
-                else num_query_rows
-            )
-            state.stage_step(qo_indptr, kv_indptr, block_table, num_query_rows=rows)
-            if not state.is_prepared:
-                state.prepare()
-            state.refresh()
-            self._full_repair_error.zero_()
-            self._full_pool_plans.clear()
-            self._full_supplied_rows = rows
-            self._full_batches = qo_indptr.numel() - 1
-            self._full_block_table = state.block_table[: self._full_batches]
-            self._full_q_payload = state.q[:rows]
-            self._full_weight_payload = state.weights[:rows]
-            self._full_step_is_prepared = True
-
-    def _full_pool_key(self, kv_fused):
-        from .selective_capacity import _CapacitySelectiveTopKPlan
-
-        layout = _CapacitySelectiveTopKPlan._layout(kv_fused)
-        if layout != self._full_pool_layout or not kv_fused.is_contiguous():
-            raise ValueError("KV pool layout must match the constructed layout")
-        return kv_fused.data_ptr(), layout
-
-    def _restore_full_pool(self, binding):
-        for name, value in binding.items():
-            setattr(self, name, value)
+        return self._full_capacity_plan.plan(
+            qo_indptr,
+            kv_indptr,
+            block_table,
+            num_query_rows=num_query_rows,
+            next_n=next_n,
+            host_length_hints=host_length_hints,
+        )
 
     @flashinfer_api(trace=fp8_paged_mqa_topk_trace_dispatch)
     @_public_wrapper_method
@@ -4919,59 +4550,13 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
         Raises:
             ValueError: A tensor layout, supplied extent or output is invalid.
             RuntimeError: No step is planned, nothing was prepared before
-                capture, or a planned full-strategy binding has changed.
+                capture, or full uses an eager-only host-hinted plan in capture.
         """
         self._check_math_mode()
         self._check_compression_ratio()
         if self._capacity_plan is not None:
             return self._capacity_plan.run(q, weights, kv_fused, out=out)
-        if not self._full_step_is_prepared:
-            raise RuntimeError("plan must be called before run")
-        state = self._full_state
-        state._payload_copies(q, weights)
-        if q.shape[0] != self._full_supplied_rows:
-            raise ValueError("Q rows must match plan num_query_rows")
-        key = self._full_pool_key(kv_fused)
-        if out is not None:
-            if (
-                not isinstance(out, torch.Tensor)
-                or out.device != state.device
-                or out.dtype != torch.int32
-                or out.shape != (q.shape[0], self._full_top_k)
-                or not out.is_contiguous()
-            ):
-                raise ValueError("out must be contiguous CUDA int32 [Q, top_k]")
-            for tensor in (q, weights, kv_fused, *state.__dict__.values()):
-                if isinstance(tensor, torch.Tensor) and _overlap(
-                    _byte_range(out), _byte_range(tensor)
-                ):
-                    raise ValueError(
-                        "out must not overlap inputs or plan-owned storage"
-                    )
-        with torch.cuda.device(state.device):
-            if key not in self._full_pool_plans:
-                if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError(
-                        "prepare_pool or one eager run must precede caller capture for this full pool"
-                    )
-                self.prepare_pool(kv_fused)
-            self._restore_full_pool(self._full_pool_plans[key])
-            if (
-                out is not None
-                and self._full_scores is not None
-                and _overlap(_byte_range(out), _byte_range(self._full_scores))
-            ):
-                raise ValueError("out must not overlap plan-owned scores")
-            state.stage_payload(q, weights)
-            selected = self._run_full_payload(
-                self._full_q_payload,
-                kv_fused,
-                self._full_weight_payload,
-                self._full_block_table,
-            )
-            if out is not None and out.data_ptr() != selected.data_ptr():
-                out.copy_(selected)
-            return selected if out is None else out
+        return self._full_capacity_plan.run(q, weights, kv_fused, out=out)
 
     def prepare_pool(self, kv_fused):
         """Warm a layer pool outside capture for the selected strategy.
@@ -4985,49 +4570,16 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
         alive; the constructor's ``kv_layout``
         exemplar is not bound.
 
-        Full requires plan first and owns a separate score buffer, GVR-v2
-        workspace per prepared pool. Each full plan replaces these
-        bindings, so prepare every pool again before caller capture in that
-        step; eager run may prepare it on demand. Full pools share staged
-        inputs and step metadata, not scoring scratch.
+        Full requires plan first and preparation for each supplied-storage
+        extent, uniform layout and pool. It binds scorer/GVR-v2 launches and
+        warms eager hint buckets outside capture. Full pools share staged
+        inputs, step metadata, the bounded score arena and GVR-v2 workspace;
+        serialize their execution. In-capacity length/map changes preserve
+        bindings, so they need no repeated pool preparation.
         """
         if self._capacity_plan is not None:
             return self._capacity_plan.prepare_pool(kv_fused)
-        key = self._full_pool_key(kv_fused)
-        state = self._full_state
-        with torch.cuda.device(state.device):
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError("prepare_pool must run outside CUDA graph capture")
-            if not self._full_step_is_prepared:
-                raise RuntimeError("full plan must precede prepare_pool")
-            if key in self._full_pool_plans:
-                return
-            try:
-                self._plan_full_payload(
-                    self._full_q_payload,
-                    kv_fused,
-                    self._full_weight_payload,
-                    state.safe_qo_indptr[: self._full_batches + 1],
-                    state.physical_kv_indptr[: self._full_batches + 1],
-                    self._full_block_table,
-                    top_k=self._full_top_k,
-                    num_heads=self._full_num_heads,
-                    head_dim=self._full_head_dim,
-                )
-            except BaseException:
-                self._full_step_is_prepared = False
-                raise
-            fields = (
-                "_full_groups",
-                "_full_scores",
-                "_full_row_ends",
-                "_full_binding_identity",
-                "_full_max_context_len",
-                "_full_impl",
-                "_full_gvr2_workspace",
-                "_selected",
-            )
-            self._full_pool_plans[key] = {name: getattr(self, name) for name in fields}
+        return self._full_capacity_plan.prepare_pool(kv_fused)
 
     def clear_pools(self):
         """Synchronize and release cached pool bindings.
@@ -5041,12 +4593,7 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
         """
         if self._capacity_plan is not None:
             return self._capacity_plan.clear_pools()
-        with torch.cuda.device(self._full_state.device):
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError("clear_pools must run outside CUDA graph capture")
-            torch.cuda.synchronize(self._full_state.device)
-            self._full_pool_plans.clear()
-            self._full_impl = self._full_binding_identity = None
+        return self._full_capacity_plan.clear_pools()
 
     def input_buffers(self) -> dict[str, torch.Tensor]:
         """Return Q/weight/prefix staging tensors owned by either strategy.

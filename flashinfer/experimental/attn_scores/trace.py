@@ -249,12 +249,13 @@ class _SelectiveTopKTraceTemplate(TraceTemplate):
         def fi_trace(save_dir=None, name=None, **kwargs):
             wrapper = kwargs.get("self")
             if wrapper is not None:
-                state = wrapper._full_state
-                batches = wrapper._full_batches
+                plan = wrapper._full_capacity_plan
+                state = plan._state
+                batches = state._written_step_shape[1]
                 kwargs.setdefault("qo_indptr", state.qo_indptr[: batches + 1])
                 kwargs.setdefault("kv_indptr", state.kv_indptr[: batches + 1])
                 kwargs.setdefault("block_table", state.block_table[:batches])
-                kwargs.setdefault("top_k", wrapper._full_top_k)
+                kwargs.setdefault("top_k", plan._top_k)
                 kwargs["math_mode"] = wrapper.math_mode
                 if getattr(wrapper, "compression_ratio", 1) != 1:
                     kwargs["compression_ratio"] = wrapper.compression_ratio
@@ -952,7 +953,7 @@ def fp8_paged_mqa_topk_trace_dispatch(**kwargs):
             if wrapper.compression_ratio == 4
             else fp8_paged_mqa_selective_topk_trace
         )
-    if not getattr(wrapper, "_full_step_is_prepared", False):
+    if not wrapper._full_capacity_plan._planned:
         raise RuntimeError("plan() must be called before tracing run()")
     return fp8_paged_mqa_topk_trace
 

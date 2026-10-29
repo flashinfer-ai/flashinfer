@@ -90,14 +90,17 @@ def test_wrapper_construction_warns_once_without_wrapping_run():
         attn_scores._wrapper_type = lambda: Backend
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always", ExperimentalWarning)
-            first = Public(strategy="selective")
-            second = Public(strategy="full")
+            first = Public(strategy="selective", max_workspace_size=65536)
+            second = Public(strategy="full", max_workspace_size=131072)
         assert len([w for w in caught if issubclass(w.category, ExperimentalWarning)]) == 1
         assert isinstance(first, Public) and isinstance(second, Public)
+        assert first.options["max_workspace_size"] == 65536
+        assert second.options["max_workspace_size"] == 131072
         assert first.run.__func__ is Backend.run
         assert first.run(1, 2, 3) == 1
         assert tuple(inspect.signature(Public.plan).parameters) == (
-            "self", "qo_indptr", "kv_indptr", "block_table", "num_query_rows")
+            "self", "qo_indptr", "kv_indptr", "block_table", "num_query_rows",
+            "next_n", "host_length_hints")
         assert tuple(inspect.signature(Public.run).parameters) == (
             "self", "q", "weights", "kv_fused", "out")
         assert inspect.signature(Public.plan).parameters["qo_indptr"].annotation == "torch.Tensor"

@@ -33,6 +33,233 @@ _REFRESH_PAGE_CHUNK = 2048
 _REFRESH_ROWS_PER_CTA = 2048
 
 
+class FullCapacityPairsKernel:
+    """Front-pad requests into pairs without changing real causal bounds."""
+
+    def __init__(self, top_k: int):
+        self.top_k = top_k
+
+    @cute.jit
+    def __call__(
+        self,
+        qo,
+        row_ends,
+        table,
+        pair_ends,
+        row_tables,
+        lengths,
+        hints,
+        source_rows,
+        inverse_rows,
+        groups: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            qo,
+            row_ends,
+            table,
+            pair_ends,
+            row_tables,
+            lengths,
+            hints,
+            source_rows,
+            inverse_rows,
+        ).launch(grid=(groups, 1, 1), block=(256, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(
+        self,
+        qo,
+        row_ends,
+        table,
+        pair_ends,
+        row_tables,
+        lengths,
+        hints,
+        source_rows,
+        inverse_rows,
+    ):
+        pair, _, _ = cute.arch.block_idx()
+        thread, _, _ = cute.arch.thread_idx()
+        remaining = cutlass.Int32(pair)
+        request = cutlass.Int32(0)
+        owner = cutlass.Int32(-1)
+        begin = cutlass.Int32(0)
+        count = cutlass.Int32(0)
+        while (request < qo.shape[0] - 1) & (owner < 0):
+            first = qo[request]
+            size = qo[request + 1] - first
+            pairs = (size + 1) // 2
+            if remaining < pairs:
+                owner = request
+                begin = first
+                count = size
+            else:
+                remaining -= pairs
+            request += 1
+        final_end = cutlass.Int32(0)
+        if owner >= 0:
+            last = begin + remaining * 2 + 1 - (count % 2)
+            final_end = row_ends[last]
+        if thread == 0:
+            pair_ends[pair] = final_end
+        column = thread
+        while column < row_tables.shape[1]:
+            page = cutlass.Int32(0)
+            if owner >= 0:
+                page = table[(owner, column)]
+            row_tables[(pair, column)] = page
+            column += 256
+        for slot in cutlass.range_constexpr(2):
+            packed_row = pair * 2 + slot
+            source = cutlass.Int32(-1)
+            end = cutlass.Int32(0)
+            if owner >= 0:
+                candidate = begin + remaining * 2 + slot - (count % 2)
+                if candidate >= begin:
+                    source = candidate
+                    end = row_ends[source]
+            if thread == 0:
+                source_rows[packed_row] = source
+                lengths[packed_row] = end
+                if source >= 0:
+                    inverse_rows[source] = packed_row
+            rank = thread
+            while rank < self.top_k:
+                hints[(packed_row, rank)] = cutlass.Int32(
+                    cutlass.Int64(end) * cutlass.Int64(rank) // self.top_k
+                )
+                rank += 256
+
+
+class FullCapacityPackKernel:
+    """Copy real payload rows and zero the request-local padding slots."""
+
+    @cute.jit
+    def __call__(
+        self,
+        q,
+        weights,
+        source_rows,
+        packed_q,
+        packed_weights,
+        rows: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(q, weights, source_rows, packed_q, packed_weights).launch(
+            grid=(rows, 1, 1), block=(256, 1, 1), stream=stream
+        )
+
+    @cute.kernel
+    def kernel(self, q, weights, source_rows, packed_q, packed_weights):
+        row, _, _ = cute.arch.block_idx()
+        thread, _, _ = cute.arch.thread_idx()
+        source = source_rows[row]
+        column = thread
+        while column < q.shape[1]:
+            value = cutlass.Uint8(0)
+            if source >= 0:
+                value = q[(source, column)]
+            packed_q[(row, column)] = value
+            column += 256
+        if thread < weights.shape[1]:
+            value = cutlass.Float32(0)
+            if source >= 0:
+                value = weights[(source, thread)]
+            packed_weights[(row, thread)] = value
+
+
+class FullCapacityScatterKernel:
+    """Restore compact output order and clear inactive rows on every layer."""
+
+    @cute.jit
+    def __call__(
+        self,
+        row_requests,
+        inverse_rows,
+        indices,
+        output,
+        rows: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(row_requests, inverse_rows, indices, output).launch(
+            grid=(rows, 1, 1), block=(256, 1, 1), stream=stream
+        )
+
+    @cute.kernel
+    def kernel(self, row_requests, inverse_rows, indices, output):
+        row, _, _ = cute.arch.block_idx()
+        thread, _, _ = cute.arch.thread_idx()
+        rank = thread
+        while rank < output.shape[1]:
+            value = cutlass.Int32(-1)
+            if row_requests[row] >= 0:
+                source = inverse_rows[row]
+                value = indices[(source, rank)]
+            output[(row, rank)] = value
+            rank += 256
+
+
+class FullCapacityUniformKernel:
+    """Publish direct uniform groups with no payload packing or padding."""
+
+    def __init__(self, group_rows: int, top_k: int):
+        self.group_rows = group_rows
+        self.top_k = top_k
+
+    @cute.jit
+    def __call__(
+        self,
+        row_ends,
+        row_requests,
+        table,
+        group_ends,
+        row_tables,
+        lengths,
+        hints,
+        groups: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        self.kernel(
+            row_ends, row_requests, table, group_ends, row_tables, lengths, hints
+        ).launch(grid=(groups, 1, 1), block=(256, 1, 1), stream=stream)
+
+    @cute.kernel
+    def kernel(
+        self, row_ends, row_requests, table, group_ends, row_tables, lengths, hints
+    ):
+        group, _, _ = cute.arch.block_idx()
+        thread, _, _ = cute.arch.thread_idx()
+        last = group * self.group_rows + self.group_rows - 1
+        owner = cutlass.Int32(-1)
+        end = cutlass.Int32(0)
+        if last < row_ends.shape[0]:
+            owner = row_requests[last]
+            end = row_ends[last]
+        if thread == 0:
+            group_ends[group] = end
+        column = thread
+        while column < row_tables.shape[1]:
+            page = cutlass.Int32(0)
+            if owner >= 0:
+                page = table[(owner, column)]
+            row_tables[(group, column)] = page
+            column += 256
+        for slot in cutlass.range_constexpr(self.group_rows):
+            row = group * self.group_rows + slot
+            length = cutlass.Int32(0)
+            if row < row_ends.shape[0]:
+                length = row_ends[row]
+            if thread == 0:
+                lengths[row] = length
+            rank = thread
+            while rank < self.top_k:
+                hints[(row, rank)] = cutlass.Int32(
+                    cutlass.Int64(length) * rank // self.top_k
+                )
+                rank += 256
+
+
 class SelectiveCapacityRefreshKernel:
     """Validate a staged step before any dependent map or scorer access.
 
@@ -92,9 +319,10 @@ class SelectiveCapacityRefreshKernel:
         row_requests: cute.Tensor,
         error: cute.Tensor,
         page_flags: cute.Tensor,
+        next_n: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        self.check_kernel(qo, kv, step, table, page_flags).launch(
+        self.check_kernel(qo, kv, step, table, page_flags, next_n).launch(
             grid=(self.check_ctas, 1, 1),
             block=(_REFRESH_THREADS, 1, 1),
             stream=stream,
@@ -111,6 +339,7 @@ class SelectiveCapacityRefreshKernel:
             row_ends,
             row_requests,
             error,
+            next_n,
         ).launch(
             grid=(self.publish_ctas, 1, 1),
             block=(_REFRESH_THREADS, 1, 1),
@@ -130,7 +359,7 @@ class SelectiveCapacityRefreshKernel:
         return shared[0]
 
     @cute.jit
-    def _prefix_code(self, qo, kv, step, table, shared, tidx):
+    def _prefix_code(self, qo, kv, step, table, shared, tidx, next_n):
         """Extent bit 1, or the OR of prefix bit 2 and capacity bit 4."""
         supplied_rows = step[0]
         batches = step[1]
@@ -153,6 +382,8 @@ class SelectiveCapacityRefreshKernel:
                 kb, ke = cutlass.Int64(kv[request]), cutlass.Int64(kv[request + 1])
                 if (qb < 0) | (qe < qb) | (kb < 0) | (ke < kb) | (ke - kb < qe - qb):
                     local = local | 2
+                if (next_n != 0) & (qe - qb != next_n):
+                    local = local | 2
                 if (qe > supplied_rows) | (ke - kb > self.max_context):
                     local = local | 4
                 physical = (ke - kb) // self.ratio
@@ -170,6 +401,7 @@ class SelectiveCapacityRefreshKernel:
         step: cute.Tensor,
         table: cute.Tensor,
         page_flags: cute.Tensor,
+        next_n: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         cta, _, _ = cute.arch.block_idx()
@@ -179,7 +411,7 @@ class SelectiveCapacityRefreshKernel:
             layout=cute.make_ordered_layout((1,), order=(0,)),
             byte_alignment=16,
         )
-        code = self._prefix_code(qo, kv, step, table, shared, tidx)
+        code = self._prefix_code(qo, kv, step, table, shared, tidx, next_n)
         local = cutlass.Int32(0)
         if cutlass.const_expr(table.shape[1] > 0):
             # Invalid prefixes suppress every map read. Padding columns and
@@ -248,6 +480,7 @@ class SelectiveCapacityRefreshKernel:
         row_ends: cute.Tensor,
         row_requests: cute.Tensor,
         error: cute.Tensor,
+        next_n: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         cta, _, _ = cute.arch.block_idx()
@@ -262,7 +495,7 @@ class SelectiveCapacityRefreshKernel:
             layout=cute.make_ordered_layout((_REFRESH_THREADS // 32,), order=(0,)),
             byte_alignment=16,
         )
-        code = self._prefix_code(qo, kv, step, table, shared, tidx)
+        code = self._prefix_code(qo, kv, step, table, shared, tidx, next_n)
         # Page bit 8 counts only when the earlier checks pass.
         local = cutlass.Int32(0)
         if code == 0:

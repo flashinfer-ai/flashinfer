@@ -59,6 +59,7 @@ class FP8PagedMQATopKWrapper:
         max_context_length: int | None = None,
         max_chunk_size: int | None = None,
         max_batch_size: int | None = None,
+        max_workspace_size: int | None = None,
         kv_layout: torch.Tensor | None = None,
         num_pages: int | None = None,
         device: torch.device | str | int | None = None,
@@ -89,6 +90,7 @@ class FP8PagedMQATopKWrapper:
         max_context_length: int | None = None,
         max_chunk_size: int | None = None,
         max_batch_size: int | None = None,
+        max_workspace_size: int | None = None,
         kv_layout: torch.Tensor | None = None,
         num_pages: int | None = None,
         device: torch.device | str | int | None = None,
@@ -98,9 +100,15 @@ class FP8PagedMQATopKWrapper:
         Supply positive ``max_context_length`` (original tokens),
         ``max_chunk_size`` (total query rows) and ``max_batch_size``. Give
         either an unretained ``kv_layout`` exemplar or ``num_pages`` plus
-        ``device`` for a contiguous pool. Compilation remains lazy until
-        ``prepare_pool`` or eager ``run``. Unsupported specializations fail
-        at that first preparation. Both strategies are experimental.
+        ``device`` for a contiguous pool. Call ``plan`` and ``prepare_pool``
+        outside capture before using a full layout. Selective preparation
+        can also happen on the first eager ``run``. Unsupported selective
+        specializations fail at preparation. Both strategies are experimental.
+
+        ``max_workspace_size`` bounds only the full FP32 score arena, in
+        bytes (default 512 MiB), shared by eager and caller-captured execution.
+        It excludes GVRv2 workspace, metadata, inputs and outputs. Selective
+        validates this positive integer but ignores it for scratch sizing.
         """
         _backend_call(
             self,
@@ -115,6 +123,7 @@ class FP8PagedMQATopKWrapper:
             max_context_length=max_context_length,
             max_chunk_size=max_chunk_size,
             max_batch_size=max_batch_size,
+            max_workspace_size=max_workspace_size,
             kv_layout=kv_layout,
             num_pages=num_pages,
             device=device,
@@ -127,11 +136,28 @@ class FP8PagedMQATopKWrapper:
         block_table: torch.Tensor,
         *,
         num_query_rows: int | None = None,
+        next_n: int | None = None,
+        host_length_hints: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> None:
         """Publish prefixes and page maps once per step.
 
-        Selective planning supports caller capture; full planning reads
-        prefixes on the host and must run outside capture.
+        Unhinted plans refresh device metadata without host reads or CUDA
+        allocations and support caller capture after layout/pool preparation.
+        Full uses the constructor's bounded shared score arena; in-capacity length
+        and page-map changes preserve prepared bindings and buffer addresses.
+        ``next_n`` optionally declares exactly 1, 2 or 4
+        query rows per request. A device-side mismatch invalidates the step
+        and produces -1 output. Selective validates but does not use the hint
+        to change its scoring layout; full uses direct uniform views.
+        ``host_length_hints=(query_prefix_cpu, kv_bounds_cpu)`` optionally
+        selects eager full stripes without packing. These contiguous CPU
+        int32/int64 tensors give an exact query prefix and conservative KV
+        length bounds. Hints are checked against device inputs and rejected
+        during capture before CUDA work. Selective validates them
+        but ignores their sizing information. Hinted plans also refresh the
+        capacity metadata used by existing caller graphs.
+        A host-side planning error invalidates the step; publish a valid plan
+        before calling ``run`` again.
         """
         return _backend_call(
             self,
@@ -140,6 +166,8 @@ class FP8PagedMQATopKWrapper:
             kv_indptr,
             block_table,
             num_query_rows=num_query_rows,
+            next_n=next_n,
+            host_length_hints=host_length_hints,
         )
 
     def run(
@@ -154,6 +182,8 @@ class FP8PagedMQATopKWrapper:
 
         Normal instances dispatch directly to the backend method, without
         an additional experimental-warning or forwarding layer per run.
+        Full requires an unhinted active plan when recording ``run`` inside
+        caller capture; a ``host_length_hints`` plan is eager-only.
         """
         return _backend_call(self, "run", q, weights, kv_fused, out=out)
 

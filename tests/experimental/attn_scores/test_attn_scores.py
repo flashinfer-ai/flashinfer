@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import gc
 import importlib.util
+import itertools
 import math
 import weakref
 from contextlib import contextmanager
@@ -120,6 +121,463 @@ def _reject_library_graph_calls(monkeypatch, *, allow_repair_body=False):
             lambda: GuardedRepairModule(get_module()),
         )
         yield body_calls
+
+
+@_requires_selective_sm100
+@pytest.mark.parametrize("strategy", ["full", "selective"])
+@pytest.mark.parametrize("budget", [0, True, 1.5, "512"])
+def test_capacity_workspace_budget_validation(strategy, budget):
+    with pytest.raises(ValueError, match="max_workspace_size"):
+        FP8PagedMQATopKWrapper(
+            strategy=strategy,
+            max_context_length=4096,
+            max_chunk_size=8,
+            max_batch_size=1,
+            max_workspace_size=budget,
+            num_pages=32,
+            device="cuda",
+        )
+
+
+@_requires_selective_sm100
+def test_full_workspace_budget_exact_and_default():
+    torch.backends.cuda.matmul.allow_tf32 = False
+    inputs = _request_inputs([5], [1031], heads=64)
+    q, _, _, weights, qo, kv = inputs
+    pool, original = _paged_inputs(inputs)
+    table = torch.zeros((1, 32), dtype=torch.int32, device=q.device)
+    table[:, : original.shape[1]] = original
+    options = dict(
+        strategy="full",
+        num_heads=64,
+        top_k=512,
+        max_context_length=4096,
+        max_chunk_size=8,
+        max_batch_size=1,
+        kv_layout=pool,
+    )
+    with pytest.raises(ValueError, match="at least 65536 bytes"):
+        FP8PagedMQATopKWrapper(**options, max_workspace_size=65535)
+    expected = _oracle_rows(inputs)
+    arena_sizes = []
+    for budget in (None, 512 * 1024 * 1024, 64 * 1024, 128 * 1024):
+        wrapper = FP8PagedMQATopKWrapper(**options, max_workspace_size=budget)
+        wrapper.plan(qo, kv, table, num_query_rows=q.shape[0])
+        wrapper.prepare_pool(pool)
+        _check_selection(wrapper.run(q, weights, pool), expected, 512)
+        scores = wrapper._full_capacity_plan._scores
+        arena_bytes = scores.numel() * scores.element_size()
+        assert arena_bytes <= (512 * 1024 * 1024 if budget is None else budget)
+        arena_sizes.append(arena_bytes)
+        del scores
+        del wrapper
+    assert arena_sizes[0] == arena_sizes[1]
+
+
+@_requires_selective_sm100
+@pytest.mark.parametrize("strategy", ["full", "selective"])
+@pytest.mark.parametrize("q_lengths", [[4, 4], [3, 5], [0, 3, 2]])
+def test_capacity_host_length_hints_contract(strategy, q_lengths, monkeypatch):
+    torch.backends.cuda.matmul.allow_tf32 = False
+    lengths = [1025 + 128 * i for i in range(len(q_lengths))]
+    inputs = _request_inputs(q_lengths, lengths, heads=64)
+    q, _, _, weights, qo, kv = inputs
+    pool, original = _paged_inputs(inputs)
+    table = torch.zeros((len(q_lengths), 32), dtype=torch.int32, device=q.device)
+    table[:, : original.shape[1]] = original
+    wrapper = FP8PagedMQATopKWrapper(
+        strategy=strategy,
+        num_heads=64,
+        top_k=512,
+        max_context_length=4096,
+        max_chunk_size=16,
+        max_batch_size=len(q_lengths),
+        max_workspace_size=128 * 1024,
+        kv_layout=pool,
+    )
+    kwargs = dict(num_query_rows=q.shape[0])
+    wrapper.plan(qo, kv, table, **kwargs)
+    wrapper.prepare_pool(pool)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = wrapper.run(q, weights, pool)
+    # Publish different lengths and physical page maps after the graph was
+    # captured. Hinted eager planning must refresh its capacity metadata too.
+    lengths = [length - 257 for length in lengths]
+    kv.copy_(
+        torch.tensor(
+            [0, *itertools.accumulate(lengths)], device=q.device, dtype=kv.dtype
+        )
+    )
+    for request in range(len(lengths)):
+        pages = (lengths[request] + 127) // 128
+        table[request, :pages].copy_(original[request, :pages].flip(0))
+    hints = (qo.cpu(), torch.tensor(lengths, dtype=torch.int32))
+    expected = _paged_step_oracle(q, weights, pool, table, hints[0], lengths)
+    pointers = tuple(t.data_ptr() for t in wrapper.input_buffers().values())
+    for bounds in (hints[1], hints[1] + 100):
+        wrapper.plan(qo, kv, table, host_length_hints=(hints[0], bounds), **kwargs)
+        _check_selection(wrapper.run(q, weights, pool), expected, 512)
+        captured.fill_(-2)
+        graph.replay()
+        _check_selection(captured, expected, 512)
+        assert wrapper.error.item() == 0
+    assert pointers == tuple(t.data_ptr() for t in wrapper.input_buffers().values())
+    if strategy == "full":
+        wrapper.plan(qo, kv, table, host_length_hints=hints, **kwargs)
+        wrapper.run(q, weights, pool)
+        torch.cuda.synchronize()
+        allocated = torch.cuda.memory_allocated()
+        wrapper.plan(qo, kv, table, host_length_hints=hints, **kwargs)
+        wrapper.run(q, weights, pool)
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_allocated() == allocated
+    for bad in ((hints[0], hints[1] - 1), (hints[0] + 1, hints[1])):
+        # The second prefix must stay a valid host prefix, but differ on device.
+        if bad[0][0] != 0:
+            changed = hints[0].clone()
+            changed[-1] -= 1
+            bad = (changed, hints[1])
+        wrapper.plan(qo, kv, table, host_length_hints=bad, **kwargs)
+        assert (wrapper.run(q, weights, pool) == -1).all()
+        assert wrapper.error.item() & 2
+    wrapper.plan(qo, kv, table, **kwargs)
+    _check_selection(wrapper.run(q, weights, pool), expected, 512)
+    # Simulate capture for the rejection check, keeping the real stream valid.
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+        # Patch the class: restoring an instance's bound method would leave
+        # state.stage_step -> state, a test-owned cycle that delays private
+        # library retirement until an unrelated capture's cyclic collection.
+        patch.setattr(
+            type(
+                wrapper._full_state
+                if strategy == "full"
+                else wrapper._capacity_plan._state
+            ),
+            "stage_step",
+            lambda *a, **kw: pytest.fail("CUDA staging before rejection"),
+        )
+        with pytest.raises(RuntimeError, match="host_length_hints"):
+            wrapper.plan(qo, kv, table, host_length_hints=hints, **kwargs)
+    state = wrapper._full_state if strategy == "full" else wrapper._capacity_plan._state
+    owner, state_owner = weakref.ref(wrapper), weakref.ref(state)
+    del graph, state, wrapper
+    assert owner() is None
+    assert state_owner() is None
+
+
+def _paged_step_oracle(q, weights, pool, table, prefix, lengths):
+    """Independent FP32 scores using the supplied physical page map."""
+    expected = []
+    page_size, head_dim = pool.shape[1], q.shape[-1]
+    for request, length in enumerate(lengths):
+        pages = pool.index_select(
+            0, table[request, : (length + page_size - 1) // page_size].long()
+        ).flatten(1)
+        keys = (
+            pages[:, : page_size * head_dim]
+            .contiguous()
+            .view(q.dtype)
+            .reshape(-1, head_dim)
+        )
+        scales = (
+            pages[:, page_size * head_dim :].contiguous().view(torch.float32).flatten()
+        )
+        start, stop = int(prefix[request]), int(prefix[request + 1])
+        for row in range(start, stop):
+            end = length - (stop - start) + row - start + 1
+            dots = q[row].float() @ keys[:end].float().T
+            expected.append((dots.relu() * weights[row, :, None]).sum(0) * scales[:end])
+    return expected
+
+
+@_requires_selective_sm100
+def test_full_host_hint_pitch_bucket_edge():
+    torch.backends.cuda.matmul.allow_tf32 = False
+    inputs = _request_inputs([3], [9001], heads=64)
+    q, _, _, weights, qo, kv = inputs
+    pool, original = _paged_inputs(inputs)
+    table = torch.zeros((1, 256), dtype=torch.int32, device=q.device)
+    table[:, : original.shape[1]] = original
+    wrapper = FP8PagedMQATopKWrapper(
+        strategy="full",
+        num_heads=64,
+        top_k=512,
+        max_context_length=32768,
+        max_chunk_size=8,
+        max_batch_size=1,
+        max_workspace_size=512 * 1024,
+        kv_layout=pool,
+    )
+    wrapper.plan(qo, kv, table, num_query_rows=3)
+    wrapper.prepare_pool(pool)
+    for length, bound, pitch in ((8000, 8192, 8192), (8500, 9000, 16384)):
+        kv[1] = length
+        wrapper.plan(
+            qo,
+            kv,
+            table,
+            num_query_rows=3,
+            host_length_hints=(qo.cpu(), torch.tensor([bound], dtype=torch.int32)),
+        )
+        assert wrapper._full_capacity_plan._host_hints.pitch == pitch
+        selected = wrapper.run(q, weights, pool)
+        expected = _paged_step_oracle(q, weights, pool, table, qo.cpu(), [length])
+        _check_selection(selected, expected, 512)
+        assert wrapper.error.item() == 0
+
+
+@_requires_selective_sm100
+@pytest.mark.parametrize("strategy", ["full", "selective"])
+@pytest.mark.parametrize("next_n", [1, 2, 4])
+def test_capacity_uniform_plan_capture_and_invalid_step(strategy, next_n):
+    torch.backends.cuda.matmul.allow_tf32 = False
+    inputs = _request_inputs([next_n, next_n], [1025, 2049], heads=64)
+    q, keys, scales, weights, qo, kv = inputs
+    pool, original = _paged_inputs(inputs)
+    table = torch.zeros((2, 32), device=q.device, dtype=torch.int32)
+    table[:, : original.shape[1]] = original
+    wrapper = FP8PagedMQATopKWrapper(
+        strategy=strategy,
+        num_heads=64,
+        top_k=512,
+        max_context_length=4096,
+        max_chunk_size=32,
+        max_batch_size=4,
+        kv_layout=pool,
+    )
+    wrapper.plan(qo, kv, table, num_query_rows=q.shape[0], next_n=next_n)
+    wrapper.prepare_pool(pool)
+    expected = []
+    offset = 0
+    for request, length in enumerate((1025, 2049)):
+        for local in range(next_n):
+            row = request * next_n + local
+            end = length - next_n + local + 1
+            dots = q[row].float() @ keys[offset : offset + end].float().T
+            expected.append(
+                (dots.relu() * weights[row, :, None]).sum(0)
+                * scales[offset : offset + end]
+            )
+        offset += length
+    _check_selection(wrapper.run(q, weights, pool), expected, 512)
+    pointers = tuple(t.data_ptr() for t in wrapper.input_buffers().values())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.plan(qo, kv, table, num_query_rows=q.shape[0], next_n=next_n)
+        selected = wrapper.run(q, weights, pool)
+    graph.replay()
+    _check_selection(selected, expected, 512)
+    assert wrapper.error.item() == 0
+    # Lengths and physical page maps change while all captured addresses stay fixed.
+    kv.copy_(torch.tensor([0, 800, 2300], device=q.device, dtype=kv.dtype))
+    table.copy_(table.flip(0))
+    graph.replay()
+    changed = []
+    for request, length in enumerate((800, 1500)):
+        pages = pool.index_select(
+            0, table[request, : (length + 127) // 128].long()
+        ).flatten(1)
+        changed_keys = pages[:, : 128 * 128].contiguous().view(q.dtype).reshape(-1, 128)
+        changed_scales = (
+            pages[:, 128 * 128 :].contiguous().view(torch.float32).reshape(-1)
+        )
+        for local in range(next_n):
+            row = request * next_n + local
+            end = length - next_n + local + 1
+            dots = q[row].float() @ changed_keys[:end].float().T
+            changed.append(
+                (dots.relu() * weights[row, :, None]).sum(0) * changed_scales[:end]
+            )
+    _check_selection(selected, changed, 512)
+    assert wrapper.error.item() == 0
+    # Transfer one query between requests; storage extent stays unchanged.
+    qo[1] += 1
+    graph.replay()
+    assert wrapper.error.item() & 2
+    assert (selected == -1).all()
+    qo[1] -= 1
+    graph.replay()
+    assert wrapper.error.item() == 0
+    _check_selection(selected, changed, 512)
+    assert pointers == tuple(t.data_ptr() for t in wrapper.input_buffers().values())
+    for invalid in (0, 3, True, 1.0):
+        with pytest.raises(ValueError, match="next_n"):
+            wrapper.plan(qo, kv, table, next_n=invalid)
+    del graph
+    owner = weakref.ref(wrapper)
+    del wrapper
+    assert owner() is None
+
+
+@_requires_selective_sm100
+@pytest.mark.parametrize("next_n", [1, 2, 4])
+def test_capacity_uniform_full_odd_and_empty_storage(next_n):
+    inputs = _request_inputs([next_n, next_n], [1025, 2049], heads=64)
+    q, _, _, weights, qo, kv = inputs
+    pool, original = _paged_inputs(inputs)
+    table = torch.zeros((2, 32), dtype=torch.int32, device=q.device)
+    table[:, : original.shape[1]] = original
+    q = torch.cat((q, q[:1]))
+    weights = torch.cat((weights, weights[:1]))
+    wrapper = FP8PagedMQATopKWrapper(
+        strategy="full",
+        num_heads=64,
+        top_k=512,
+        max_context_length=4096,
+        max_chunk_size=32,
+        max_batch_size=4,
+        kv_layout=pool,
+    )
+    wrapper.plan(qo, kv, table, num_query_rows=q.shape[0], next_n=next_n)
+    wrapper.prepare_pool(pool)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.plan(qo, kv, table, num_query_rows=q.shape[0], next_n=next_n)
+        selected = wrapper.run(q, weights, pool)
+    graph.replay()
+    assert wrapper.error.item() == 0
+    _check_selection(selected[: 2 * next_n], _oracle_rows(inputs), 512)
+    assert (selected[-1] == -1).all()
+    qo[1] += 1
+    graph.replay()
+    assert wrapper.error.item() & 2
+    assert (selected == -1).all()
+    prefix = torch.zeros(1, device=q.device, dtype=torch.int32)
+    for mode in (None, next_n):
+        wrapper.plan(prefix, prefix, table[:0], num_query_rows=0, next_n=mode)
+        wrapper.prepare_pool(pool)
+        empty_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(empty_graph):
+            wrapper.plan(prefix, prefix, table[:0], num_query_rows=0, next_n=mode)
+            empty = wrapper.run(q[:0], weights[:0], pool)
+        empty_graph.replay()
+        assert wrapper.error.item() == 0
+        assert empty.shape == (0, 512)
+
+
+@_requires_selective_sm100
+def test_full_capacity_stripes_captured_plan_refresh(monkeypatch):
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    inputs = _request_inputs([3, 0, 2], [1031, 0, 2051], heads=64)
+    q, _, _, weights, qo, kv = inputs
+    pool, original_table = _paged_inputs(inputs)
+    table = torch.zeros((3, 32), dtype=torch.int32, device=q.device)
+    table[:, : original_table.shape[1]] = original_table
+    wrapper = FP8PagedMQATopKWrapper(
+        strategy="full",
+        num_heads=64,
+        top_k=512,
+        max_context_length=4096,
+        max_chunk_size=7,
+        max_batch_size=3,
+        max_workspace_size=64 * 1024,
+        kv_layout=pool,
+    )
+    wrapper.prepare_pool(pool)
+    wrapper.plan(qo, kv, table, num_query_rows=5)
+    wrapper.prepare_pool(pool)
+    plan = wrapper._full_capacity_plan
+    import importlib
+    from flashinfer.attn_scores import attn_scores as scorer
+
+    def reject_layer_dispatch(*args, **kwargs):
+        raise AssertionError("prepared full run must use bound launches")
+
+    monkeypatch.setattr(scorer, "fp8_paged_mqa_logits", reject_layer_dispatch)
+    monkeypatch.setattr(
+        importlib.import_module("flashinfer.topk_varlen.topk_varlen"),
+        "top_k_varlen",
+        reject_layer_dispatch,
+    )
+    pointers = [
+        t.data_ptr()
+        for t in (
+            plan._scores,
+            plan._q,
+            plan._weights,
+            plan._indices,
+            plan._tables,
+            plan._lengths,
+            plan._hints,
+            plan._gvr_workspace,
+        )
+    ]
+
+    def check(selected):
+        assert wrapper.error.item() == 0
+        qs, ks = qo.tolist(), kv.tolist()
+        expected = []
+        for request in range(3):
+            count, length = qs[request + 1] - qs[request], ks[request + 1] - ks[request]
+            pages = pool.index_select(
+                0, table[request, : (length + 127) // 128].long()
+            ).flatten(1)
+            keys = (
+                pages[:, : 128 * 128]
+                .contiguous()
+                .view(q.dtype)
+                .reshape(-1, 128)[:length]
+            )
+            scales = (
+                pages[:, 128 * 128 :]
+                .contiguous()
+                .view(torch.float32)
+                .reshape(-1)[:length]
+            )
+            for local in range(count):
+                row = qs[request] + local
+                end = max(0, length - count + local + 1)
+                dots = q[row].float() @ keys[:end].float().T
+                expected.append(
+                    (dots.relu() * weights[row, :, None]).sum(0) * scales[:end]
+                )
+        expected.extend([torch.empty(0, device=q.device)] * (5 - len(expected)))
+        _check_selection(selected, expected, 512)
+        assert wrapper.error.item() == 0
+        assert pointers == [
+            t.data_ptr()
+            for t in (
+                plan._scores,
+                plan._q,
+                plan._weights,
+                plan._indices,
+                plan._tables,
+                plan._lengths,
+                plan._hints,
+                plan._gvr_workspace,
+            )
+        ]
+
+    check(wrapper.run(q, weights, pool))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.plan(qo, kv, table, num_query_rows=5)
+        selected = wrapper.run(q, weights, pool)
+    for queries, lengths in (
+        ([1, 2, 2], [511, 2, 2]),
+        ([1, 0, 2], [17, 0, 2]),
+        ([0, 0, 0], [0, 0, 0]),
+    ):
+        qo.copy_(
+            torch.tensor(
+                [0, *torch.tensor(queries).cumsum(0).tolist()],
+                device=q.device,
+                dtype=qo.dtype,
+            )
+        )
+        kv.copy_(
+            torch.tensor(
+                [0, *torch.tensor(lengths).cumsum(0).tolist()],
+                device=q.device,
+                dtype=kv.dtype,
+            )
+        )
+        table.copy_(table.roll(1, dims=1))
+        graph.replay()
+        torch.cuda.synchronize()
+        check(selected)
 
 
 @_requires_selective_sm100
@@ -267,53 +725,6 @@ def test_selective_compile_device_ordinal(monkeypatch, device, expected):
 
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 2)
     assert _device_ordinal(torch.device(device)) == expected
-
-
-def test_topk_plan_explicit_signature_and_strategy_binding(monkeypatch):
-    """Strategy-specific logging uses true names for both planning contracts."""
-    import inspect
-
-    signature = inspect.signature(FP8PagedMQATopKWrapper.plan)
-    assert tuple(signature.parameters) == (
-        "self",
-        "qo_indptr",
-        "kv_indptr",
-        "block_table",
-        "num_query_rows",
-    )
-    assert tuple(inspect.signature(FP8PagedMQATopKWrapper.run).parameters) == (
-        "self",
-        "q",
-        "weights",
-        "kv_fused",
-        "out",
-    )
-    wrapper = object.__new__(sl.FP8PagedMQATopKWrapper)
-    wrapper._math_mode = wrapper._math_mode_at_construction = "relu_strict"
-    wrapper._compression_ratio = wrapper._compression_ratio_at_construction = 1
-    tensors = [object() for _ in range(3)]
-    step_calls = []
-    wrapper._capacity_plan = SimpleNamespace(
-        plan=lambda *args, **kwargs: step_calls.append((args, kwargs))
-    )
-    prefixes = tensors[:3]
-    wrapper.plan(*prefixes, num_query_rows=7)
-    wrapper.plan(
-        qo_indptr=prefixes[0],
-        kv_indptr=prefixes[1],
-        block_table=prefixes[2],
-        num_query_rows=7,
-    )
-    wrapper.plan(*prefixes[:2], block_table=prefixes[2], num_query_rows=7)
-    assert step_calls == [(tuple(prefixes), {"num_query_rows": 7})] * 3
-    with pytest.raises(TypeError, match="multiple values"):
-        wrapper.plan(*prefixes, qo_indptr=prefixes[0])
-    with pytest.raises(TypeError, match="multiple values"):
-        wrapper.plan(*prefixes, block_table=prefixes[2])
-    with pytest.raises(TypeError, match="required positional"):
-        wrapper.plan()
-    with pytest.raises(TypeError, match="unexpected keyword"):
-        wrapper.plan(*prefixes, top_k=1024)
 
 
 def _compressed_wrapper_fixture(q_lengths, token_lengths, heads, page_size):
@@ -1197,6 +1608,7 @@ def test_topk_common_serving_contract(strategy):
     wrapper.clear_pools()
     bad_table = torch.full_like(table, -1)
     wrapper.plan(qo, kv, bad_table)
+    wrapper.prepare_pool(pool)
     wrapper.run(q, weights, pool, out=out)
     torch.cuda.synchronize()
     assert wrapper.error.item() == 8
@@ -1340,7 +1752,7 @@ def test_unified_wrapper_full_strategy_ragged_causal_topk(monkeypatch, top_k):
     # Poison them to catch accidental dense selection after future refactors.
     invalid = (
         torch.arange(wrapper._full_scores.shape[1], device=q.device)[None, :]
-        >= wrapper._full_row_ends[:, None]
+        >= wrapper._full_capacity_plan._lengths[: wrapper._full_scores.shape[0], None]
     )
     wrapper._full_scores.masked_fill_(invalid, float("inf"))
     second = wrapper.run(q=q, kv_fused=kv_fused, weights=weights)
@@ -1357,8 +1769,8 @@ def test_unified_wrapper_full_strategy_ragged_causal_topk(monkeypatch, top_k):
     assert first.dtype == torch.int32
     _check_selection(first, oracle, top_k)
 
-    # Retiring a full plan must release its graph without cyclic collection,
-    # which may otherwise destroy graph-owned storage during another capture.
+    # Retire owners by refcount: delayed metadata unload during another
+    # capture is unsafe even though the wrapper owns no graph.
     owner = weakref.ref(wrapper)
     gc_enabled = gc.isenabled()
     gc.disable()
@@ -1371,8 +1783,8 @@ def test_unified_wrapper_full_strategy_ragged_causal_topk(monkeypatch, top_k):
 
 
 @_requires_selective_sm100
-def test_full_wrapper_plan_rejects_capture_without_invalidating_plan():
-    """Reject host-reading full planning before capture or plan state is changed."""
+def test_full_wrapper_plan_capture_preserves_prepared_pool():
+    """Prepared full planning records device refreshes in the caller graph."""
     inputs = _request_inputs((2,), (1024,))
     q, _, _, weights, qo_indptr, kv_indptr = inputs
     fused, table = _paged_inputs(inputs)
@@ -1392,16 +1804,12 @@ def test_full_wrapper_plan_rejects_capture_without_invalidating_plan():
     wrapper.run(q, weights, fused)
     oracle = _oracle_rows(inputs)
     graph = torch.cuda.CUDAGraph()
-    with (
-        torch.cuda.graph(graph),
-        pytest.raises(
-            RuntimeError,
-            match="full strategy plan must be called outside CUDA graph capture",
-        ),
-    ):
+    with torch.cuda.graph(graph):
         wrapper.plan(qo_indptr, kv_indptr, table, num_query_rows=q.shape[0])
-        wrapper.prepare_pool(fused)
-        wrapper.run(q, weights, fused)
+        captured = wrapper.run(q, weights, fused)
+    graph.replay()
+    torch.cuda.synchronize()
+    _check_selection(captured, oracle, 512)
     selected = wrapper.run(q, weights, fused)
     torch.cuda.synchronize()
     _check_selection(selected, oracle, 512)
@@ -1418,16 +1826,6 @@ def test_full_wrapper_gvr2_workspace_capture_and_replan(monkeypatch):
     cu_q = torch.tensor([0, q_rows], device="cuda", dtype=torch.int32)
     cu_kv = torch.tensor([0, kv_rows], device="cuda", dtype=torch.int32)
     fused, table = _paged_inputs((q, kv, scale, weights, cu_q, cu_kv))
-    calls = []
-    real_run = gvr2_topk_host.run_varlen
-
-    def observe_gvr2(*args, **kwargs):
-        capturing = torch.cuda.is_current_stream_capturing()
-        workspace = kwargs.get("workspace")
-        calls.append((capturing, workspace))
-        return real_run(*args, **kwargs)
-
-    monkeypatch.setattr(gvr2_topk_host, "run_varlen", observe_gvr2)
     wrapper = FP8PagedMQATopKWrapper(
         strategy="full",
         num_heads=q.shape[1],
@@ -1442,15 +1840,12 @@ def test_full_wrapper_gvr2_workspace_capture_and_replan(monkeypatch):
     wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
     wrapper.prepare_pool(fused)
     wrapper.run(q, weights, fused)
-    # Capture records operations without executing them. Preserve the eager
-    # plan result before any public run can overwrite it by graph replay.
+    # Keep a separate eager result because every layer shares output storage.
     planned_output = wrapper._selected.clone()
     slab = wrapper._full_gvr2_workspace
     assert slab is not None and slab.dtype == torch.int32
     assert slab.numel() * slab.element_size() == gvr2_topk_host.workspace_bytes()
     assert slab.device == q.device and slab.data_ptr() % 16 == 0
-    assert calls and all(not capturing for capturing, _ in calls)
-    assert all(workspace is slab for _, workspace in calls)
 
     def check_rows(output, logical_kv, logical_scale):
         ends = kv_rows - q_rows + torch.arange(q_rows, device=q.device) + 1
@@ -1494,24 +1889,14 @@ def test_full_wrapper_gvr2_workspace_capture_and_replan(monkeypatch):
     scale.copy_(scale.roll(1))
     fused.copy_(_fuse_paged_kv(kv, scale).flip(0))
     table.copy_(table.flip(1))
-    # Maps are step inputs for both strategies; full replanning retires its
-    # old pool bindings, so discard and rebuild the caller graph as well.
-    del outer
-    calls.clear()
+    # Refresh maps without replacing scratch or the prepared caller graph.
     wrapper.plan(cu_q, cu_kv, table)
-    wrapper.prepare_pool(fused)
-    slab = wrapper._full_gvr2_workspace
-    outer = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(outer, stream=stream):
-        captured = wrapper.run(q, weights, fused)
     outer.replay()
     torch.cuda.synchronize()
     reversed_kv = kv.float().view(-1, 128, kv.shape[1]).flip(0).reshape_as(kv)
     reversed_scale = scale.view(-1, 128).flip(0).reshape_as(scale)
     check_rows(captured, reversed_kv, reversed_scale)
     assert wrapper._full_gvr2_workspace is slab
-    assert sum(capturing for capturing, _ in calls) == 1
-    assert all(workspace is slab for _, workspace in calls)
 
     one_q = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
     one_query = q[:1]
@@ -1548,21 +1933,28 @@ def test_full_wrapper_gvr2_workspace_capture_and_replan(monkeypatch):
         raise RuntimeError("injected full GVR preparation failure")
 
     with monkeypatch.context() as patch:
-        patch.setattr(gvr2_topk_host, "run_varlen", fail_prepare)
+        patch.setattr(wrapper._full_capacity_plan, "_bind_launches", fail_prepare)
         with pytest.raises(RuntimeError, match="injected full GVR preparation failure"):
             wrapper.plan(one_q, cu_kv, table, num_query_rows=one_query.shape[0])
             wrapper.prepare_pool(fused)
             wrapper.run(one_query, one_weights, fused)
-    assert wrapper._full_gvr2_workspace is None
-    with pytest.raises(RuntimeError, match="plan must be called"):
+    assert wrapper._full_gvr2_workspace is slab
+    with pytest.raises(RuntimeError, match="prepare_pool must precede"):
         wrapper.run(q=one_query, kv_fused=fused, weights=one_weights)
     wrapper.plan(one_q, cu_kv, table, num_query_rows=one_query.shape[0])
     wrapper.prepare_pool(fused)
     wrapper.run(one_query, one_weights, fused)
-    assert wrapper._full_gvr2_workspace is not None
+    assert wrapper._full_gvr2_workspace is slab
     recovered = wrapper.run(q=one_query, kv_fused=fused, weights=one_weights)
     torch.cuda.synchronize()
     assert recovered.shape == (1, 512)
+    _check_selection(
+        recovered,
+        _oracle_rows(
+            (one_query, reversed_kv, reversed_scale, one_weights, one_q, cu_kv)
+        ),
+        512,
+    )
 
 
 @_requires_selective_sm100
@@ -1679,7 +2071,11 @@ def test_engine_compact_repair_queue_changes_cuda_graph():
     full.prepare_pool(fused)
     full.run(q, weights, fused)
     reference = full.run(payload[0], payload[2], payload[1]).long()
-    scores = full._full_scores[:, :kv_rows]
+    scores = torch.nn.utils.rnn.pad_sequence(
+        _oracle_rows((q, kv, scale, weights, cu_q, cu_kv)),
+        batch_first=True,
+        padding_value=float("-inf"),
+    )
     expected = scores.gather(1, reference).sort(1).values
     wrapper = SelectiveEngineCase()
     wrapper.plan(q, fused, weights, cu_q, cu_kv, table)
@@ -3573,8 +3969,7 @@ def test_wrapper_page_map_updates_in_eager_and_graph(strategy, q_rows):
         wrapper.prepare_pool(fused)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        if strategy == "selective":
-            wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
+        wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
         output = (
             wrapper.run(q=q, kv_fused=fused, weights=weights)
             if strategy == "full"
@@ -3592,18 +3987,12 @@ def test_wrapper_page_map_updates_in_eager_and_graph(strategy, q_rows):
         mapped_kv = kv.reshape(-1, 128, 128)[order].reshape_as(kv)
         mapped_scale = scale.reshape(-1, 128)[order].reshape_as(scale)
         oracle = _oracle_rows((q, mapped_kv, mapped_scale, weights, cu_q, cu_kv))
-        if strategy == "full":
-            del graph
         wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
         eager = (
             wrapper.run(q=q, kv_fused=fused, weights=weights)
             if strategy == "full"
             else wrapper.run(q, weights, fused)
         ).clone()
-        if strategy == "full":
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                output = wrapper.run(q, weights, fused)
         graph.replay()
         torch.cuda.synchronize()
         for actual in (eager, output):
@@ -3634,25 +4023,27 @@ def test_full_wrapper_failed_preparation_rejects_run_and_retries(monkeypatch, q_
     wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
     wrapper.prepare_pool(fused)
     wrapper.run(q, weights, fused)
+    unprepared_pool = fused.clone()
 
     def fail_prepare(*args, **kwargs):
         raise RuntimeError("injected preparation failure")
 
     with monkeypatch.context() as patch:
-        from flashinfer.attn_scores import attn_scores
-
-        patch.setattr(attn_scores, "fp8_paged_mqa_logits", fail_prepare)
+        patch.setattr(wrapper._full_capacity_plan, "_bind_launches", fail_prepare)
         with pytest.raises(RuntimeError, match="injected preparation failure"):
-            wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
-            wrapper.prepare_pool(fused)
-            wrapper.run(q, weights, fused)
-    with pytest.raises(RuntimeError, match="plan must be called"):
-        wrapper.run(q=q, kv_fused=fused, weights=weights)
+            wrapper.prepare_pool(unprepared_pool)
+    with pytest.raises(RuntimeError, match="prepare_pool must precede"):
+        wrapper.run(q=q, kv_fused=unprepared_pool, weights=weights)
+    _check_selection(
+        wrapper.run(q, weights, fused),
+        _oracle_rows((q, kv, scale, weights, cu_q, cu_kv)),
+        512,
+    )
 
     wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
-    wrapper.prepare_pool(fused)
-    wrapper.run(q, weights, fused)
-    output = wrapper.run(q=q, kv_fused=fused, weights=weights)
+    wrapper.prepare_pool(unprepared_pool)
+    wrapper.run(q, weights, unprepared_pool)
+    output = wrapper.run(q=q, kv_fused=unprepared_pool, weights=weights)
     torch.cuda.synchronize()
     assert output.shape == (q_rows, 512)
     for row, scores in enumerate(_oracle_rows((q, kv, scale, weights, cu_q, cu_kv))):
@@ -3940,22 +4331,12 @@ def test_natural_page_table_replay_and_replan(page_size, heads, route, monkeypat
         check(wrapper.run(q, weights, fused), (257, length))
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            if strategy == "selective":
-                wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
+            wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
             output = wrapper.run(q, weights, fused)
         for _ in range(2):
             for request, request_length in enumerate((257, length)):
                 pages = math.ceil(request_length / page_size)
                 table[request, :pages].copy_(table[request, :pages].flip(0))
-            if strategy == "full":
-                # Full plans bind the map once per step outside capture.
-                # Rebuild caller captures when publishing a different step.
-                del graph
-                wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
-                wrapper.prepare_pool(fused)
-                graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph):
-                    output = wrapper.run(q, weights, fused)
             graph.replay()
             check(output, (257, length))
         del graph
@@ -7200,6 +7581,7 @@ def test_capacity_caller_capture_names_plan_boundary(monkeypatch, fail_at):
         _state=SimpleNamespace(
             device="cuda:0",
             is_prepared=True,
+            _host_hint_validation=SimpleNamespace(stage=lambda hints: None),
             stage_step=lambda *args, **kwargs: None,
             refresh=lambda: None,
             refresh_sampling=lambda: None,
@@ -8016,3 +8398,119 @@ def test_wrapper_math_mode_rejects_before_cuda_work():
     wrapper._math_mode = "relu_fast"
     with pytest.raises(RuntimeError, match="math_mode"):
         wrapper.run(q=None, kv_fused=None, weights=None)
+
+
+def _full_plan_regression_inputs(strategy="full"):
+    torch.backends.cuda.matmul.allow_tf32 = False
+    inputs = _request_inputs([2], [1031], heads=64)
+    q, _, _, weights, qo, kv = inputs
+    pool, original = _paged_inputs(inputs)
+    table = torch.zeros((1, 32), device=q.device, dtype=torch.int32)
+    table[:, : original.shape[1]] = original
+    wrapper = FP8PagedMQATopKWrapper(
+        strategy=strategy,
+        num_heads=64,
+        top_k=512,
+        max_context_length=4096,
+        max_chunk_size=8,
+        max_batch_size=1,
+        kv_layout=pool,
+    )
+    return wrapper, inputs, pool, table
+
+
+@_requires_selective_sm100
+def test_full_hinted_run_rejects_capture_before_payload(monkeypatch):
+    wrapper, inputs, pool, table = _full_plan_regression_inputs()
+    q, _, _, weights, qo, kv = inputs
+    hints = (qo.cpu(), torch.tensor([1031], dtype=torch.int32))
+    wrapper.plan(qo, kv, table, num_query_rows=2, host_length_hints=hints)
+    wrapper.prepare_pool(pool)
+    _check_selection(wrapper.run(q, weights, pool), _oracle_rows(inputs), 512)
+    graph = torch.cuda.CUDAGraph()
+    sentinel = torch.zeros(1, device=q.device)
+
+    def reject_payload(*args, **kwargs):
+        pytest.fail("hinted capture reached payload staging")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(type(wrapper._full_state), "_payload_copies", reject_payload)
+        with torch.cuda.graph(graph):
+            with pytest.raises(RuntimeError, match="host_length_hints"):
+                wrapper.run(q, weights, pool)
+            sentinel.fill_(1)
+    graph.replay()
+    assert sentinel.item() == 1
+    wrapper.plan(qo, kv, table, num_query_rows=2, next_n=2)
+    wrapper.prepare_pool(pool)
+    _check_selection(wrapper.run(q, weights, pool), _oracle_rows(inputs), 512)
+
+
+@_requires_selective_sm100
+@pytest.mark.parametrize("strategy", ["full", "selective"])
+@pytest.mark.parametrize("invalid", ["next_n", "table", "hints"])
+def test_capacity_failed_plan_requires_replan(strategy, invalid):
+    wrapper, inputs, pool, table = _full_plan_regression_inputs(strategy)
+    q, _, _, weights, qo, kv = inputs
+    valid = dict(num_query_rows=2, next_n=2)
+    wrapper.plan(qo, kv, table, **valid)
+    wrapper.prepare_pool(pool)
+    expected = _oracle_rows(inputs)
+    _check_selection(wrapper.run(q, weights, pool), expected, 512)
+    bad = dict(valid)
+    bad_table = table
+    if invalid == "next_n":
+        bad["next_n"] = 3
+    elif invalid == "table":
+        bad.update(num_query_rows=3, next_n=1)
+        bad_table = table.to(torch.int64)
+    else:
+        bad["host_length_hints"] = (qo, kv)
+    with pytest.raises(ValueError):
+        wrapper.plan(qo, kv, bad_table, **bad)
+    with pytest.raises(RuntimeError, match="plan must be called"):
+        wrapper.run(q, weights, pool)
+    wrapper.plan(qo, kv, table, **valid)
+    wrapper.prepare_pool(pool)
+    _check_selection(wrapper.run(q, weights, pool), expected, 512)
+
+
+@_requires_selective_sm100
+@pytest.mark.parametrize("hinted", [False, True])
+def test_full_pool_warmup_preserves_inactive_output(hinted):
+    wrapper, inputs, pool, table = _full_plan_regression_inputs()
+    q, keys, scales, weights, qo, kv = inputs
+    # Prime the eager hint buffers with more live rows than the next uniform
+    # step. An unhinted plan intentionally does not refresh those buffers.
+    prior_q = torch.cat((q, q))
+    prior_weights = torch.cat((weights, weights))
+    prior_qo = torch.tensor([0, 4], device=q.device, dtype=torch.int32)
+    wrapper.plan(
+        prior_qo,
+        kv,
+        table,
+        num_query_rows=4,
+        host_length_hints=(prior_qo.cpu(), torch.tensor([1031], dtype=torch.int32)),
+    )
+    wrapper.prepare_pool(pool)
+    _check_selection(
+        wrapper.run(prior_q, prior_weights, pool),
+        _oracle_rows((prior_q, keys, scales, prior_weights, prior_qo, kv)),
+        512,
+    )
+    padded_q = torch.cat((q, q[:1]))
+    padded_weights = torch.cat((weights, weights[:1]))
+    kwargs = dict(num_query_rows=3, next_n=2)
+    if hinted:
+        kwargs["host_length_hints"] = (
+            qo.cpu(),
+            torch.tensor([1031], dtype=torch.int32),
+        )
+    wrapper.plan(qo, kv, table, **kwargs)
+    expected = [*_oracle_rows(inputs), torch.empty(0, device=q.device)]
+    for layer_pool in (pool, pool.clone()):
+        wrapper.prepare_pool(layer_pool)
+        result = wrapper.run(padded_q, padded_weights, layer_pool)
+        _check_selection(result, expected, 512)
+        assert (result[2] == -1).all()
+        assert wrapper.error.item() == 0
