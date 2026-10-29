@@ -660,12 +660,15 @@ def memory_plan(
     buffer_rows: Optional[int] = None,
     x_copy: bool = False,
     dx_finalize: bool = True,
+    budget_rows: Optional[int] = None,
     geometry: Geometry = DEFAULT_GEOMETRY,
 ) -> MemoryPlan:
     """The ``memory_mode="budget"`` rule: the fastest exact weight-gradient form whose predicted step peak stays within
     the budget -- ``(1 - MEMORY_BUDGET_MARGIN)`` times the bytes of a head that materializes its logits,
-    ``2 * rows * V + 2 * V * H + 2 * T * H`` (the BF16 logits of the ``rows`` the chunk loop runs over -- the valid rows
-    when compacted --, the BF16 ``dW`` and the BF16 ``dX``; the last term without ``dX``).
+    ``2 * T_v * V + 2 * V * H + 2 * T * H`` (the BF16 logits of the ``T_v = budget_rows`` valid rows, the BF16 ``dW``
+    and the BF16 ``dX``; the last term without ``dX``).  ``budget_rows`` (default ``rows``) is the number of valid rows
+    whatever rows the chunk loop runs over: ``rows`` when compacted, while an uncompacted call (``rows = T``) still
+    budgets the logits of its valid rows only; the model below counts the ``rows`` the chunk loop processes.
 
     Candidates in latency order: ``"fused"`` (when ``fuse_dw_cast`` allows it), ``"unfused"``, then, when the record
     registers the recompute's logits arm (``recompute``), ``"partial"`` with the largest ``dw_rows`` and
@@ -699,6 +702,11 @@ def memory_plan(
         raise ValueError(
             f"memory_plan needs 1 <= rows <= num_rows and a positive geometry, got T={T} rows={R} H={H} V={V} C={C}"
         )
+    Rb = R if budget_rows is None else int(budget_rows)
+    if not 0 <= Rb <= R:
+        raise ValueError(
+            f"memory_plan needs 0 <= budget_rows <= rows, got budget_rows={Rb} rows={R}"
+        )
     step = dw_block_step(geometry)
     tile = int(geometry.stats_tile)
     n = -(-R // C)
@@ -725,7 +733,7 @@ def memory_plan(
         + (live(2 * Cb * H) if compact else 0)
         + live(4 * int(dx_ws_slabs) * Cb * H)
     )
-    head = 2 * R * V + 2 * V * H + (2 * T * H if need_dx else 0)
+    head = 2 * Rb * V + 2 * V * H + (2 * T * H if need_dx else 0)
     budget = head - int(math.ceil(head * float(MEMORY_BUDGET_MARGIN)))
 
     def block(vb: int) -> int:
@@ -2759,11 +2767,12 @@ def forward_loss(
 
     ``memory_mode`` (default :func:`memory_mode_default`, ``"fast"``): ``"budget"`` (``cake`` backend, BF16 ``dW``)
     picks the weight-gradient form of :func:`memory_plan` once the call's row count is known (without the hidden
-    valid-row count: its chunk-0 buffers come before the count) -- ``fuse_dw_cast=False``
-    removes the fused form from the candidates -- and the result carries it (``memory_plan``); its recompute forms
-    accumulate the vocabulary rows ``[0, dw_rows)`` only (``dw_acc`` is ``[dw_rows, H]``, ``None`` for ``dw_rows = 0``)
-    and keep the row statistics, the plan and the inputs for :meth:`ForwardResult.backward`, which recomputes the
-    other rows (bitwise the same ``dW``).
+    valid-row count: its chunk-0 buffers come before the count; ``hidden_count`` is ignored) against the budget of the
+    valid rows, also when uncompacted (``compact_rows=False``: the caller's ``num_valid_rows``, else one host count;
+    :func:`_budget_valid_rows`) -- ``fuse_dw_cast=False`` removes the fused form from the candidates -- and the result
+    carries it (``memory_plan``); its recompute forms accumulate the vocabulary rows ``[0, dw_rows)`` only (``dw_acc``
+    is ``[dw_rows, H]``, ``None`` for ``dw_rows = 0``) and keep the row statistics, the plan and the inputs for
+    :meth:`ForwardResult.backward`, which recomputes the other rows (bitwise the same ``dW``).
 
     ``num_valid_rows`` (a host integer, default ``None``): the number of labels ``>= 0``, given by the caller.  A
     compacted call then plans on it without reading a count back -- the valid-row index is formed on the device and the
@@ -2882,6 +2891,7 @@ def forward_loss(
             buffer_rows=min(int(problem.chunk), rows),
             x_copy=problem.x_copy,
             dx_finalize=fused_dx,
+            budget_rows=_budget_valid_rows(labels, row_index, given, compact),
             tuning=tuning,
         )
         fuse = mplan.form == "fused"
@@ -3053,10 +3063,12 @@ def _budget_plan(
     buffer_rows: int,
     x_copy: bool,
     dx_finalize: bool,
+    budget_rows: int,
     tuning: dict[str, dict[str, Any]],
 ) -> MemoryPlan:
     """:func:`memory_plan` of one ``memory_mode="budget"`` call on ``device``'s registered program: its geometry, the
-    dX GEMM's K-slice slabs of this call and whether the program registers the recompute's ``dz`` arm."""
+    dX GEMM's K-slice slabs of this call and whether the program registers the recompute's ``dz`` arm.  ``rows``: the
+    rows the chunk loop runs over; ``budget_rows``: the valid rows ``T_v`` of the budget (:func:`_budget_valid_rows`)."""
     module_name, record = record_for(device)
     geometry = Geometry.from_record(record)
     stages = registered_stages(module_name)
@@ -3094,8 +3106,29 @@ def _budget_plan(
         buffer_rows=buffer_rows,
         x_copy=x_copy,
         dx_finalize=dx_finalize,
+        budget_rows=budget_rows,
         geometry=geometry,
     )
+
+
+def _budget_valid_rows(
+    labels: torch.Tensor,
+    row_index: Optional[torch.Tensor],
+    given: Optional[int],
+    compact: bool,
+) -> int:
+    """The valid rows ``T_v`` of a ``memory_mode="budget"`` call's budget (:func:`memory_plan`'s ``budget_rows``): the
+    compacted rows (``row_index``; every row when a compacted call's count found none ignored), else the caller's
+    ``num_valid_rows`` (``given``), else the labels ``>= 0`` counted on the host -- one synchronization, taken by an
+    uncompacted call (``compact_rows=False``) without the caller's count: its chunk loop runs over every row, its budget
+    counts the logits of the valid rows only."""
+    if row_index is not None:
+        return int(row_index.numel())
+    if given is not None:
+        return int(given)
+    if compact:
+        return int(labels.numel())
+    return int((labels >= 0).sum())
 
 
 def scale_cast(
@@ -4383,6 +4416,10 @@ class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
         ctx.gemm_tuning = tuning
         ctx.logprob_dz = dz_arm
         ctx.budget = budget
+        # ``"budget"``: the caller's count sizes the backward's budget of an uncompacted call
+        ctx.num_valid_rows = (
+            _given_count(num_valid_rows, int(labels.numel())) if budget else None
+        )
         return result.logp
 
     @staticmethod
@@ -4410,6 +4447,7 @@ class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
                 gemm_tuning=ctx.gemm_tuning,
                 logprob_dz=ctx.logprob_dz,
                 row_index=row_index,
+                num_valid_rows=ctx.num_valid_rows,
             )
         else:
             dx, dw = backward_logprob(
@@ -4445,9 +4483,12 @@ def _backward_logprob_budget(
     need_dx: bool,
     fuse_dw_cast: bool,
     row_index: Optional[torch.Tensor],
+    num_valid_rows: Optional[int] = None,
     **common,
 ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
-    """:func:`backward_logprob` (with ``dW``) in the form :func:`memory_plan` picks for ``memory_mode="budget"``:
+    """:func:`backward_logprob` (with ``dW``) in the form :func:`memory_plan` picks for ``memory_mode="budget"``
+    against the budget of the valid rows (``row_index``'s, else the caller's ``num_valid_rows``, else one host count of
+    an uncompacted call; :func:`_budget_valid_rows`):
     ``"fused"`` -- the fast form; ``"unfused"`` -- the chunk loop accumulates every row and the FP32 accumulator is
     cast after ``dX`` is written; ``"partial"`` / ``"recompute"`` -- the chunk loop accumulates the rows ``[0,
     dw_rows)`` (none for ``"recompute"``), their cast fills the top rows of ``dW`` and the other rows are recomputed in
@@ -4483,6 +4524,9 @@ def _backward_logprob_budget(
         buffer_rows=min(chunk, rows),
         x_copy=problem.x_copy,
         dx_finalize=_resolve_dx_finalize(common["dx_finalize"]),
+        budget_rows=_budget_valid_rows(
+            labels, row_index, num_valid_rows, bool(common["compact_rows"])
+        ),
         tuning=common["gemm_tuning"],
     )
     loop = dict(common, row_index=row_index)

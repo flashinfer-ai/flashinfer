@@ -251,16 +251,19 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   so they are slower.  The loss entry saves `X` and `W` for the recompute (an
   in-place write between the forward and the backward raises PyTorch's
   saved-tensor version error); the log-probability entry plans its backward
-  only.  A `"budget"` call counts its valid rows on the host: the hidden
-  valid-row count would allocate a whole chunk's buffers before the count is
-  known, which can exceed `B` when fewer rows than a chunk are valid.  The bound
+  only.  `T_v` counts the valid rows also when `compact_rows=False` (the
+  chunk loop then runs over all `T` rows, the budget still covers the logits
+  of the valid rows only).  Without a caller's count, a `"budget"` call counts
+  its valid rows on the host and ignores `hidden_count`: the hidden valid-row
+  count would allocate a whole chunk's buffers before the count is known,
+  which can exceed `B` when fewer rows than a chunk are valid.  The bound
   assumes a backward that frees the graph and PyTorch's caching allocator in
   its default configuration (`PYTORCH_CUDA_ALLOC_CONF` unset).  A call for
   which no form fits runs the form with the smallest predicted peak, which
-  can exceed `B`.  The margin is measured on GB200 only (other architectures
-  and allocator settings are not measured): every measured `"budget"` step
-  peak of a call whose plan fits, single calls and repeated calls that miss
-  or hit the binding cache, at the issue's shapes and at small heads, stayed
+  can exceed `B`.  The margin is measured on GB200, GB300 and B200 (other
+  allocator settings are not measured): every measured `"budget"` step peak
+  of a call whose plan fits, single calls and repeated calls that miss or
+  hit the binding cache, at the issue's shapes and at small heads, stayed
   within `B`; the highest reached 0.9794 `B`.  No environment variable
   selects it.
 * Caller's valid-row count (`num_valid_rows`, keyword of
