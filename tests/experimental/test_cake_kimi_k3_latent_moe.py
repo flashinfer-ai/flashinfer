@@ -221,30 +221,41 @@ def test_decode_split_finalize_rules():
                 else "_ww"
             )
             for tp in SUPPORTED_TP:
+                il = i_local_for_tp(tp)
                 for num_partials in (2, 4):
-                    many = decode_tail_plan(
-                        tokens, i_local_for_tp(tp), tp, num_partials, sm_count
+                    # The instance of P >= 2 keeps the single finisher; the cells of TAIL_SPLIT_FIN_ROUTES take
+                    # the instance of one partial (``test_tail_split_fin_rules``), every other row its own.
+                    many = cb.decode_tail_instance_plan(
+                        tokens, il, tp, num_partials, sm_count
                     )
                     assert not (
                         many["split_fin"] or many["early_arrive"] or many["up_prefetch"]
                     )
                     assert "_sf" not in decode_kernel_key(many)
-        # The tails at N_PAD 16 keep the single finisher, the staged-rows TP8 tail its 5 stages.
+                    plan = decode_tail_plan(tokens, il, tp, num_partials, sm_count)
+                    if not cb.tail_split_fin_n_pad(tokens, tp, num_partials):
+                        assert plan == many
+        # The tails at N_PAD 16 keep the single finisher, the staged-rows TP8 tail its 5 stages; the TP1 route of
+        # 16 tokens and one partial takes the split-finalize instance at N_PAD 32 (TAIL_SPLIT_FIN_ROUTES).
         t16 = decode_tail_plan(16, i_local_for_tp(8), 8, 1, sm_count)
         assert t16["rows_smem"] and t16["stages"] == 5 and not t16["split_fin"]
         assert decode_kernel_key(t16).endswith("_sb_rs_np_st2_ww")
-        t16_tp1 = decode_tail_plan(16, i_local_for_tp(1), 1, 1, sm_count)
+        t16_tp1 = cb.decode_tail_instance_plan(16, i_local_for_tp(1), 1, 1, sm_count)
         assert decode_kernel_key(t16_tp1).endswith("_ef_p256b")
+        assert not t16_tp1["split_fin"]
+        il1 = i_local_for_tp(1)
+        routed16 = decode_tail_plan(16, il1, 1, 1, sm_count)
+        assert routed16 == cb.decode_tail_instance_plan(32, il1, 1, 1, sm_count)
     # Half the landing zone buys the TP8 tail at N_PAD 128 a sixth ring stage; the other instances keep their depth.
     assert cb.plan_stages(n_pad=128, cluster=2) == 5
     assert cb.plan_stages(n_pad=128, cluster=2, split_fin=True) == 6
     assert decode_tail_plan(128, i_local_for_tp(8), 8)["stages"] == 6
-    assert decode_tail_plan(128, i_local_for_tp(8), 8, 2)["stages"] == 5
+    assert cb.decode_tail_instance_plan(128, i_local_for_tp(8), 8, 2)["stages"] == 5
     for tp, tokens in ((1, 16), (1, 32), (1, 64), (1, 128), (8, 32), (8, 64)):
-        assert (
-            decode_tail_plan(tokens, i_local_for_tp(tp), tp)["stages"]
-            == decode_tail_plan(tokens, i_local_for_tp(tp), tp, 2)["stages"]
-        )
+        il = i_local_for_tp(tp)
+        one = cb.decode_tail_instance_plan(tokens, il, tp)
+        two = cb.decode_tail_instance_plan(tokens, il, tp, 2)
+        assert one["stages"] == two["stages"]
 
 
 def test_split_plan_rules():
@@ -555,6 +566,23 @@ PARTIAL_PREFETCH_ROUTES = {
         3: ((4, None, True),),
         4: ((3, None, True),),
     },
+}
+# The decode tail cells served by the split-finalize instance of one routed partial at a larger or equal N_PAD:
+# (first tokens, last tokens, ((first partials, last partials, N_PAD), ...)), ``last`` None: from ``first`` up.
+SPLIT_FIN_ROUTES = {
+    1: (
+        (9, 11, ((1, 1, 32), (6, None, 32))),
+        (12, 12, ((1, 2, 32), (6, None, 32))),
+        (13, 16, ((1, 1, 32), (6, None, 32))),
+        (17, 23, ((2, 2, 32),)),
+        (24, 32, ((1, 3, 64), (8, None, 64))),
+        (33, 64, ((2, None, 64),)),
+        (65, 128, ((2, None, 128),)),
+    ),
+    8: (
+        (33, 64, ((2, None, 64),)),
+        (65, 128, ((2, None, 128),)),
+    ),
 }
 
 
@@ -1736,8 +1764,10 @@ _EPS_SCALE_ROWS = (
     (1, 0, 8, 2),
     (1, 0, 6, 3),
     (1, 0, 12, 2),
+    (1, 0, 12, 3),
     (1, 0, 20, 1),
     (1, 0, 24, 2),
+    (1, 0, 24, 4),
     (1, 0, 33, 1),
     (1, 0, 48, 3),
     (1, 0, 128, 1),
@@ -1765,13 +1795,18 @@ def test_eps_scale_rows_reach_every_decode_tail_program():
     """On every qualified SM count and architecture the eps-scale rows reach exactly the decode
     tail programs the package routes for T <= DECODE_MAX_T, TP1 and TP8 and P = 1 to 16 (the
     decode tail plan depends on P only through P = 1, the partial counts of
-    ``TAIL_SB_NORM_ROUTES`` and the partial ranges of ``TAIL_PARTIAL_PREFETCH_ROUTES``, all below
-    16 or open above), so the near-eps check runs on every decode tail program."""
+    ``TAIL_SB_NORM_ROUTES`` and the partial ranges of ``TAIL_PARTIAL_PREFETCH_ROUTES`` and
+    ``TAIL_SPLIT_FIN_ROUTES``, all below 16 or open above), so the near-eps check runs on every
+    decode tail program."""
     partials = range(1, 17)
     for _, cells in cb.TAIL_SB_NORM_ROUTES.values():
         assert max(cells.values(), default=1) < max(partials)
     for cells in cb.TAIL_PARTIAL_PREFETCH_ROUTES.values():
         for ranges in cells.values():
+            assert all(first < max(partials) for first, _, _ in ranges)
+            assert all(last is None or last < max(partials) for _, last, _ in ranges)
+    for token_ranges in cb.TAIL_SPLIT_FIN_ROUTES.values():
+        for _, _, ranges in token_ranges:
             assert all(first < max(partials) for first, _, _ in ranges)
             assert all(last is None or last < max(partials) for _, last, _ in ranges)
     for sm_count in QUALIFIED_SM_COUNTS:
@@ -1877,7 +1912,7 @@ def test_tail_sb_norm_rules(monkeypatch, no_partial_prefetch):
                     if not routed:
                         assert not key.endswith("_sbn")
                         continue
-                    base = decode_tail_plan(
+                    base = cb.decode_tail_instance_plan(
                         n_pad, i_local_for_tp(tp), tp, num_partials, sm_count
                     )
                     assert not (base["sb_norm"] or base["smem_b1"] or base["split_fin"])
@@ -1999,7 +2034,9 @@ def _without_partial_prefetch(tokens, tp, num_partials, sm_count, sb_norm):
     ``TAIL_SB_NORM_ROUTES`` with the resident-B arithmetic, or the resident-B instance."""
     if sb_norm:
         n_pad = SB_NORM_ROUTES[tp][0]
-        base = decode_tail_plan(n_pad, i_local_for_tp(tp), tp, num_partials, sm_count)
+        base = cb.decode_tail_instance_plan(
+            n_pad, i_local_for_tp(tp), tp, num_partials, sm_count
+        )
         assert not (base["sb_norm"] or base["smem_b1"] or base["split_fin"])
         return dict(base, sb_norm=True)
     base = decode_tail_plan(tokens, i_local_for_tp(tp), tp, num_partials, sm_count)
@@ -2121,6 +2158,173 @@ def test_tail_partial_prefetch_is_bitwise_the_resident_b_instance(
         base()
         torch.cuda.synchronize()
         _assert_bitwise((y_b, out_b), first, "resident-B instance")
+    finally:
+        monkeypatch.undo()
+        decode_tail_plan.cache_clear()
+
+
+def _split_fin_cell(tp, tokens, num_partials):
+    """N_PAD ``SPLIT_FIN_ROUTES`` names for the decode tail cell, or 0."""
+    for first_tokens, last_tokens, ranges in SPLIT_FIN_ROUTES.get(tp, ()):
+        if first_tokens <= tokens <= last_tokens:
+            for first, last, n_pad in ranges:
+                if first <= num_partials and (last is None or num_partials <= last):
+                    return n_pad
+    return 0
+
+
+def test_tail_split_fin_rules():
+    """The cells of ``TAIL_SPLIT_FIN_ROUTES`` take the split-finalize instance of one routed partial at the table's
+    N_PAD (its plan is ``decode_tail_instance_plan(N_PAD, ..., 1)``, a registered ``_sf`` program: ``_sf_ea`` on the
+    TP1 tail, ``_sf_upf`` / ``_sf`` on the TP8 tail) on both qualified SM counts and up to 17 partials (a range open
+    above included); every other decode row past the few-token tables keeps its own instance.  The token ranges and
+    the partial ranges are ordered and disjoint, start past the few-token rows of ``TAIL_SB_NORM_ROUTES`` and
+    ``TAIL_PARTIAL_PREFETCH_ROUTES``, and each N_PAD holds the tokens of its range."""
+    assert cb.TAIL_SPLIT_FIN_ROUTES == SPLIT_FIN_ROUTES
+    few = max(
+        [max(cells, default=0) for _, cells in cb.TAIL_SB_NORM_ROUTES.values()]
+        + [max(cells, default=0) for cells in cb.TAIL_PARTIAL_PREFETCH_ROUTES.values()]
+    )
+    for tp, token_ranges in SPLIT_FIN_ROUTES.items():
+        assert tp in SUPPORTED_TP
+        prev_tokens = few
+        for first_tokens, last_tokens, ranges in token_ranges:
+            assert prev_tokens < first_tokens <= last_tokens <= DECODE_MAX_T
+            prev_tokens = last_tokens
+            prev = 0
+            for first, last, n_pad in ranges:
+                assert prev is not None and prev < first
+                assert last is None or first <= last
+                prev = last
+                assert n_pad in cb.SUPPORTED_N_PAD
+                assert n_pad >= cb.n_pad_for(last_tokens)
+    taken = 0
+    for sm_count in QUALIFIED_SM_COUNTS:
+        for tp in SUPPORTED_TP:
+            i_local = i_local_for_tp(tp)
+            for tokens in range(1, DECODE_MAX_T + 1):
+                for num_partials in range(1, 18):
+                    n_pad = _split_fin_cell(tp, tokens, num_partials)
+                    assert cb.tail_split_fin_n_pad(tokens, tp, num_partials) == n_pad
+                    if tokens <= few:
+                        assert not n_pad
+                        continue
+                    plan = decode_tail_plan(tokens, i_local, tp, num_partials, sm_count)
+                    if not n_pad:
+                        own = cb.decode_tail_instance_plan(
+                            tokens, i_local, tp, num_partials, sm_count
+                        )
+                        assert plan == own, (tp, tokens, num_partials)
+                        continue
+                    base = cb.decode_tail_instance_plan(n_pad, i_local, tp, 1, sm_count)
+                    assert plan == base and plan["n_pad"] == n_pad
+                    assert plan["split_fin"] and not (
+                        plan["smem_b1"] or plan["sb_norm"] or plan["partial_prefetch"]
+                    )
+                    key = decode_kernel_key(plan)
+                    assert key in KERNELS, key
+                    if tp == 1:
+                        suffix = "_sf_ea"
+                    else:
+                        suffix = "_sf_upf" if n_pad in (32, 64) else "_sf"
+                    assert key.endswith(suffix), key
+                    taken += 1
+    assert taken
+
+
+def _split_fin_rows():
+    """(tp, tokens, num_partials) of ``TAIL_SPLIT_FIN_ROUTES``: the first and the last token count of every token
+    range, each with the first and the last partial count of every partial range, a range open above at 17 partials
+    (past the measured 1 to 16)."""
+    rows = []
+    for tp, token_ranges in sorted(cb.TAIL_SPLIT_FIN_ROUTES.items()):
+        for first_tokens, last_tokens, ranges in token_ranges:
+            for first, last, _ in ranges:
+                for tokens in (first_tokens, last_tokens):
+                    rows.append((tp, tokens, first))
+                    rows.append((tp, tokens, 17 if last is None else last))
+    return tuple(dict.fromkeys(rows))
+
+
+@pytest.mark.parametrize(("tp", "tokens", "num_partials"), _split_fin_rows())
+def test_tail_split_fin_route_is_bitwise_the_own_instance(
+    monkeypatch, tp, tokens, num_partials
+):
+    """The split-finalize instance of one routed partial that a cell of ``TAIL_SPLIT_FIN_ROUTES`` takes repeats its
+    first launch bit for bit in re-launches over NaN-filled outputs and graph replays, with the control words back at
+    zero, and reproduces the row's own instance (the route without the table) bit for bit -- partial pairs that cancel
+    to a negative FP32 subnormal and subnormal partials of both signs included -- where that program is registered:
+    from 33 tokens every multi-partial cell takes the table, so the single-finisher programs of N_PAD 64 and 128 left
+    the registry."""
+    rank = tp - 1
+    device = _require_program("tail", tp, tokens, num_partials)
+    seed = 6300 + 97 * tp + 13 * tokens + num_partials
+    w, routed, shared_act, out, y = _tail_case(
+        device, tp, rank, tokens, num_partials, seed
+    )
+    gen = torch.Generator(device="cpu").manual_seed(seed + 1)
+    parts = routed.double().cpu()
+    pick = torch.rand(tokens, LATENT, generator=gen)
+    if num_partials >= 2:
+        # A quarter of the elements: partials 0 and 1 cancel to -m * 2^-133, a negative FP32 subnormal, and the
+        # other partials are -0.0.  These global-y instances widen the bf16 latent by adding +0.0, so y has no -0.0.
+        a = 2.0**-126 * (
+            1.0
+            + torch.randint(16, 128, (tokens, LATENT), generator=gen).double() / 128.0
+        )
+        m = torch.randint(1, 16, (tokens, LATENT), generator=gen).double()
+        cancel = pick < 0.25
+        parts[0] = torch.where(cancel, -a, parts[0])
+        parts[1] = torch.where(cancel, a - m * 2.0**-133, parts[1])
+        parts[2:] = torch.where(cancel, torch.full_like(parts[2:], -0.0), parts[2:])
+    # Another quarter: bf16 subnormal partials of both signs.
+    parts = torch.where((pick >= 0.25) & (pick < 0.5), parts * 2.0**-130, parts)
+    routed.copy_(parts.to(torch.float32).to(torch.bfloat16).to(device))
+    args = (
+        routed,
+        w["norm_weight"],
+        w["up_weight"],
+        shared_act,
+        w["shared_down_weight"],
+    )
+    runner = prepare_kimi_k3_latent_moe_tail(
+        *args, out, tp=tp, rank=rank, y_workspace=y
+    )
+    n_pad = cb.tail_split_fin_n_pad(tokens, tp, num_partials)
+    assert n_pad and runner.plan["split_fin"] and runner.plan["n_pad"] == n_pad
+    runner()
+    torch.cuda.synchronize()
+    first = _snapshot((y, out))
+    _assert_words_zero(runner, "first launch")
+    for rnd in range(3):
+        _nan_fill((y, out))
+        runner()
+        torch.cuda.synchronize()
+        _assert_bitwise((y, out), first, f"re-launch {rnd}")
+    graph = _graph_replay(runner)
+    for rnd in range(3):
+        _nan_fill((y, out))
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_bitwise((y, out), first, f"replay {rnd}")
+        _assert_words_zero(runner, f"replay {rnd}")
+    monkeypatch.setattr(cb, "TAIL_SPLIT_FIN_ROUTES", {})
+    decode_tail_plan.cache_clear()
+    try:
+        if not cb.generated_program_available(device, "tail", tp, tokens, num_partials):
+            assert tokens > 32 and num_partials >= 2, (tp, tokens, num_partials)
+            return
+        out_own = torch.full_like(out, float("nan"))
+        y_own = torch.full_like(y, float("nan"))
+        own = prepare_kimi_k3_latent_moe_tail(
+            *args, out_own, tp=tp, rank=rank, y_workspace=y_own
+        )
+        assert not (own.plan["sb_norm"] or own.plan["partial_prefetch"])
+        assert own.plan["n_pad"] == cb.n_pad_for(tokens)
+        assert own.kernel_keys != runner.kernel_keys
+        own()
+        torch.cuda.synchronize()
+        _assert_bitwise((y_own, out_own), first, "own instance")
     finally:
         monkeypatch.undo()
         decode_tail_plan.cache_clear()
