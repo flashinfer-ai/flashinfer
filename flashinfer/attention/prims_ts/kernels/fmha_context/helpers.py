@@ -19,6 +19,21 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float16, Float32, Int32, Int64, Uint32
 from cutlass.cutlass_dsl import Constexpr
+from cutlass.experimental.task_scheduling.resources import StageInfo
+
+
+@cute.jit
+def _resolve_kv_tile_idx_context(
+    stage_info: StageInfo,
+    kv_tile_start: Int32,
+    tile_offset: cutlass.Constexpr[int] = 0,
+) -> Int32:
+    """Resolve the context KV tile, including a compile-time pipeline offset.
+
+    Sliding-window prefix skipping is already included in ``kv_tile_start``;
+    context does not apply a multi-CTA-KV split transform.
+    """
+    return kv_tile_start + Int32(stage_info.loop_offset) + Int32(tile_offset)
 
 
 @cute.jit

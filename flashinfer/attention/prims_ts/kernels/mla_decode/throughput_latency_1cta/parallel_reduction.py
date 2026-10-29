@@ -214,10 +214,12 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     lane_idx = thread_idx % Int32(GMEM_REDUCTION_WARP_LANES)
     if cutlass.const_expr(finalize_attention):
-        # The final sparse grid is one CTA per logical head. Decode its
-        # physical producer tile without launching padded head/V slices.
-        q_idx = slice_idx // Int32(cfg.tile_size_q)
-        slice_idx = slice_idx % Int32(cfg.tile_size_q)
+        # Sparse slices contain complete heads. Map the head group back
+        # to its physical producer tile; row validity masks a final odd head.
+        heads_per_slice = elements_per_slice // cfg.head_dim_v
+        slices_per_q_tile = cfg.tile_size_q // heads_per_slice
+        q_idx = slice_idx // Int32(slices_per_q_tile)
+        slice_idx = slice_idx % Int32(slices_per_q_tile)
         head_dim_cta_idx = Int32(0)
     else:
         head_dim_cta_idx = block_idx_y % Int32(cfg.num_ctas_per_head_dim)
@@ -312,7 +314,7 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
                 # natural-log LSE; global_lse stays base 2 for the weights below.
                 (lse.iterator.raw_ptr() + stats_output_query_row).store(
                     global_lse * Float32(LN_2)
-                    if cutlass.const_expr(finalize_attention or cfg.sparse_d576)
+                    if cutlass.const_expr(finalize_attention or cfg.sparse_d576_reload)
                     else global_lse
                 )
 
@@ -784,7 +786,7 @@ def _run_parallel_gmem_reduction_shared_stats(
             )
             if head_dim_cta_idx == Int32(0) and dim_in_cta == Int32(0):
                 public_lse = smem_global_lse[row_in_slice]
-                if cutlass.const_expr(cfg.sparse_d576):
+                if cutlass.const_expr(cfg.sparse_d576_reload):
                     # D576 sparse (DSA) plans publish natural-log LSE (this
                     # cluster path never finalizes attention).
                     public_lse = public_lse * Float32(LN_2)
@@ -836,7 +838,9 @@ def run_parallel_gmem_reduction_kernel(
     """Reduce split-KV partials with row-shared local and peer statistics."""
 
     if cutlass.const_expr(finalize_attention and cluster_size != 1):
-        raise ValueError("final attention output uses a single-CTA reducer per row")
+        raise ValueError(
+            "final attention output requires single-CTA reduction clusters"
+        )
     prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
 
     if cutlass.const_expr(cluster_size == 1):
