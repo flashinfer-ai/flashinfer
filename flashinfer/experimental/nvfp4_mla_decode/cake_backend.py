@@ -122,6 +122,19 @@ REVERSED_PIECE_TARGETS = frozenset({("sm_100a", 76), ("sm_103a", 76)})
 # from its top loads, which pays off for rows of more than two splits.
 REDUCE_GENERAL_RECORD = "reduce_general"
 REDUCE_GENERAL_MIN_SPLITS = 3  # KV splits of the plan's most split row
+# The combine program without the per-row split-count load: every row it runs
+# takes two splits, so it reads only the partials the decode just wrote. On an
+# (architecture, cluster count) of ``REDUCE_TWO_SPLITS_TARGETS`` it runs a plan
+# of two splits per row that a short-row decode program runs, when the rows
+# of two splits form one contiguous range of query rows; it is launched over
+# that range alone (``split_row_range``), with its row pointers offset to the
+# range's first row. The cluster count is the one the plan requests, ``num_sms
+# // CLUSTER_PAIR``: 74 on B200, 76 on GB200.
+REDUCE_TWO_SPLITS_RECORD = "reduce_two_splits"
+REDUCE_TWO_SPLITS_TARGETS = frozenset({("sm_100a", 74), ("sm_100a", 76)})
+SHORT_DECODE_RECORDS = frozenset(
+    {SHORT_RECORD, SHORT_EPI_RECORD, SHORT_SPEC_RECORD, SHORT_EPI_SPEC_RECORD}
+)
 WORKSPACE_ALIGNMENT = 256
 
 # Keyword names the two stages are bound with (arg plans refer to these names).
@@ -677,20 +690,51 @@ def select_decode_record(
     return "decode"
 
 
-def select_reduce_record(plan: WorkPlan, arch: str) -> str:
+def split_row_range(row_splits: Sequence[int]) -> Optional[tuple]:
+    """``(first, count)`` of the query rows of more than one split (``row_splits``,
+    ``token_splits``) when they form one contiguous range, else ``None``."""
+    rows = [row for row, splits in enumerate(row_splits) if splits > 1]
+    if not rows or rows[-1] - rows[0] + 1 != len(rows):
+        return None
+    return rows[0], len(rows)
+
+
+def select_reduce_record(
+    plan: WorkPlan,
+    arch: str,
+    *,
+    num_sms: Optional[int] = None,
+    row_splits: Optional[Sequence[int]] = None,
+) -> str:
     """Registry record of the combine program that runs ``plan`` on ``arch``.
 
     A pure host function of the plan, fixed at prepare time (the combine runs
     only when the plan splits a row). ``REDUCE_GENERAL_RECORD`` runs a plan
     whose most split row has at least ``REDUCE_GENERAL_MIN_SPLITS`` KV splits
-    when the registry delivers it for ``arch``; every other plan runs
-    ``"reduce"``. The combine programs' outputs are bitwise identical.
+    when the registry delivers it for ``arch``; ``REDUCE_TWO_SPLITS_RECORD``
+    runs a plan of two splits per row that a program of
+    ``SHORT_DECODE_RECORDS`` runs (``select_decode_record``) when the registry
+    delivers it for ``arch``, ``(arch, num_sms // CLUSTER_PAIR)`` is in
+    ``REDUCE_TWO_SPLITS_TARGETS`` and the rows of two splits (``row_splits``,
+    one count per query row) form one contiguous range (``split_row_range``);
+    every other plan runs ``"reduce"``. The combine programs' outputs are
+    bitwise identical.
     """
     if (
         _delivered(REDUCE_GENERAL_RECORD, arch)
         and plan.max_splits >= REDUCE_GENERAL_MIN_SPLITS
     ):
         return REDUCE_GENERAL_RECORD
+    if (
+        _delivered(REDUCE_TWO_SPLITS_RECORD, arch)
+        and plan.max_splits == 2
+        and num_sms is not None
+        and row_splits is not None
+        and (arch, num_sms // CLUSTER_PAIR) in REDUCE_TWO_SPLITS_TARGETS
+        and select_decode_record(plan, arch, num_sms) in SHORT_DECODE_RECORDS
+        and split_row_range(row_splits) is not None
+    ):
+        return REDUCE_TWO_SPLITS_RECORD
     return "reduce"
 
 
@@ -1215,7 +1259,6 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
         arch=arch,
     )
     decode_record = select_decode_record(plan, arch, num_sms)
-    reduce_record = select_reduce_record(plan, arch)
     layout = workspace_layout(plan, batch=batch, num_heads=num_heads, q_len=q_len)
     flat = workspace_buffer.view(-1).view(torch.uint8)
     if flat.numel() < layout["total"]:
@@ -1260,6 +1303,9 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
         )
     else:
         row_splits_host = [1] * total_q
+    reduce_record = select_reduce_record(
+        plan, arch, num_sms=num_sms, row_splits=row_splits_host
+    )
     tables = host_tables(
         plan, layout, q_indptr=q_indptr_host, row_splits=row_splits_host
     )
@@ -1302,7 +1348,26 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
         grid=launch_grid(MODULES[decode_record], units=plan.num_units),
     )
     reduce_kwargs = None
-    if max_splits > 1:
+    if max_splits > 1 and reduce_record == REDUCE_TWO_SPLITS_RECORD:
+        # The two-split combine runs the contiguous range of split rows alone:
+        # one CTA row per range row, every per-row pointer offset to the
+        # range's first row; total_q stays the full count (the split stride).
+        first, count = split_row_range(row_splits_host)
+        row_elems = num_heads * HEAD_DIM
+        reduce_kwargs = dict(
+            o=out.view(-1)[first * row_elems :],
+            lse=lse.view(-1)[first * num_heads :],
+            partial_o=partial_o.view(-1)[first * row_elems :],
+            partial_lse=partial_lse.view(-1)[first * num_heads * max_splits :],
+            row_splits=row_splits[first:],
+            total_q=total_q,
+            num_heads=num_heads,
+            max_splits=max_splits,
+            grid=launch_grid(
+                MODULES[reduce_record], total_q=count, num_heads=num_heads
+            ),
+        )
+    elif max_splits > 1:
         reduce_kwargs = dict(
             o=out,
             lse=lse,
