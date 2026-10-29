@@ -1191,11 +1191,14 @@ def test_nvfp4_early_qk_quantizer_matches_the_head_quantizer():
 
 
 def test_nvfp4_tp_quantizer_matches_the_head_quantizer():
-    """Both fp4 quantizers, bound on a plan of exactly ``QUANTIZE_TP_MAX_PB``
-    (128) packed blocks with ragged blocks and an empty segment, write
-    bitwise-identical packed operands (padding included) and give a
-    bitwise-identical attention output; a 129-block plan binds ``quantize``
-    and stays exact."""
+    """Every fp4 quantizer build (``quantize``, ``quantize_tp`` and, where the
+    route carries it, ``quantize_tp_mb8``), bound on a plan of exactly
+    ``QUANTIZE_TP_MAX_PB`` (128) packed blocks with ragged blocks and an empty
+    segment, writes bitwise-identical packed operands (padding included) and
+    gives a bitwise-identical attention output; the plan binds the build of
+    the window rule (its 1024-CTA quantize grid lies in
+    ``QUANTIZE_TP_MB8_GRID``); a 129-block plan binds ``quantize`` and stays
+    exact."""
     import tvm_ffi
 
     arch = _require_program("nvfp4_fp4pv")
@@ -1203,20 +1206,28 @@ def test_nvfp4_tp_quantizer_matches_the_head_quantizer():
         pytest.skip(f"the fp4 route carries no quantize_tp program on {arch}")
     cu, heads = [0, 37, 37, 237, 16237], 2
     q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=23)
+    modules = cake_backend.select_route("nvfp4_fp4pv", arch)["modules"]
+    stages = ["quantize", "quantize_tp"]
+    bound = "quantize_tp"
+    if "quantize_tp_mb8" in modules:
+        stages.append("quantize_tp_mb8")
+        low, high = cake_backend.QUANTIZE_TP_MB8_GRID
+        assert low <= cake_backend.nvfp4_quantize_grid(heads, 128)[0] <= high
+        bound = "quantize_tp_mb8"
     runners = {}
-    for stage in ("quantize", "quantize_tp"):
+    for stage in stages:
         runner = prepare_minimax_h3_varlen_nvfp4_attention(
             q, k, v, cu_seqlens, pv_mode="fp4", cu_seqlens_host=cu
         )
-        assert runner.plan.PB == 128 and runner.quantize_stage == "quantize_tp"
+        assert runner.plan.PB == 128 and runner.quantize_stage == bound
         for tensor in runner.workspace.values():
             tensor.view(torch.uint8).fill_(0xA5)
-        route = cake_backend.select_route("nvfp4_fp4pv", runner.arch)
-        by_value = cake_backend.QUANTIZE_TP_BY_VALUE if stage == "quantize_tp" else ()
+        slot = "quantize" if stage == "quantize" else "quantize_tp"
+        by_value = cake_backend.QUANTIZE_TP_BY_VALUE if slot == "quantize_tp" else ()
         entry, arguments = cake_backend._bind_stage(
-            route["modules"][stage],
+            modules[stage],
             runner.arch,
-            runner.stage_kwargs[stage],
+            runner.stage_kwargs[slot],
             exact=True,
             by_value=by_value,
         )
@@ -1225,15 +1236,17 @@ def test_nvfp4_tp_quantizer_matches_the_head_quantizer():
         runner.attention()
         runners[stage] = runner
     torch.cuda.synchronize()
-    head, tp = runners["quantize"], runners["quantize_tp"]
-    assert head.workspace.keys() == tp.workspace.keys()
-    for name, tensor in head.workspace.items():
-        assert torch.equal(
-            tensor.view(torch.uint8), tp.workspace[name].view(torch.uint8)
-        ), name
-    torch.testing.assert_close(tp.out, head.out, atol=0, rtol=0)
+    head = runners["quantize"]
     scale = 1.0 / math.sqrt(HEAD_DIM)
-    _check(tp.out, _reference(q, k, v, cu, scale), NVFP4_ATOL, NVFP4_RTOL)
+    for stage in stages[1:]:
+        tp = runners[stage]
+        assert head.workspace.keys() == tp.workspace.keys()
+        for name, tensor in head.workspace.items():
+            assert torch.equal(
+                tensor.view(torch.uint8), tp.workspace[name].view(torch.uint8)
+            ), (stage, name)
+        torch.testing.assert_close(tp.out, head.out, atol=0, rtol=0)
+        _check(tp.out, _reference(q, k, v, cu, scale), NVFP4_ATOL, NVFP4_RTOL)
     cu = [0, 16384, 16385]
     q, k, v, cu_seqlens = _make_inputs(cu, 1, seed=24)
     runner = prepare_minimax_h3_varlen_nvfp4_attention(
@@ -1448,7 +1461,9 @@ def test_bf16_prepared_runner_and_graph_replay():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         runner()
-    q.copy_(torch.randn_like(q))
+    # New Q values from a seeded generator, so every run checks the same inputs.
+    new_q, _, _, _ = _make_inputs(cu, heads, seed=2)
+    q.copy_(new_q)
     out.fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
@@ -2005,7 +2020,10 @@ def test_bf16_rejects_bad_inputs():
     with pytest.raises(ValueError, match="bfloat16"):
         minimax_h3_varlen_attention(q.float(), k, v, cu_seqlens)
     # A non-unit last stride (every other element of a [T, H, 256] buffer) is rejected.
-    wide = torch.randn((300, 7, 2 * HEAD_DIM), dtype=torch.bfloat16, device="cuda")
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    wide = torch.randn(
+        (300, 7, 2 * HEAD_DIM), dtype=torch.bfloat16, device="cuda", generator=gen
+    )
     k_strided = wide[:, :, ::2]
     assert tuple(k_strided.shape) == (300, 7, HEAD_DIM) and k_strided.stride(2) == 2
     with pytest.raises(ValueError, match=r"stride|contiguous"):
@@ -2159,11 +2177,13 @@ def test_nvfp4_prepared_runner_stages_and_graph_replay(pv_mode):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         runner()
-    # New Q, K and V values: every quantizer re-reads all three (the early-Q/K
-    # build reads Q and K before its grid-dependency wait).
-    q.copy_(torch.randn_like(q) * 2.0)
-    k.copy_(torch.randn_like(k) * 0.5)
-    v.copy_(torch.randn_like(v) * 3.0)
+    # New Q, K and V values from a seeded generator, so every run checks the
+    # same inputs: every quantizer re-reads all three (the early-Q/K build
+    # reads Q and K before its grid-dependency wait).
+    new_q, new_k, new_v, _ = _make_inputs(cu, heads, seed=5)
+    q.copy_(new_q * 2.0)
+    k.copy_(new_k * 0.5)
+    v.copy_(new_v * 3.0)
     out.fill_(float("nan"))
     graph.replay()
     torch.cuda.synchronize()
@@ -2238,8 +2258,11 @@ def test_nvfp4_q_split_plan_output_is_bitwise_the_plain_plans(monkeypatch, pv_mo
         )
         tiles = runner.tile_tables
         halves = tiles.num_q_split_units > 0
+        # A tail-first plan binds the unit-count dense program for both of its
+        # attention launches: attention_qs on a NVFP4_QS_DENSE pair.
+        tail_first = getattr(tiles, "schedule", "single") == "tfs"
         assert tiles.num_combine_units == 0 and runner.attention_stage == (
-            "attention_qs" if qs and halves else "attention"
+            "attention_qs" if qs and (halves or tail_first) else "attention"
         )
         assert tiles.total_tiles == 406 + tiles.num_q_split_units
         assert runner.route_metadata["q_split_units"] == tiles.num_q_split_units
@@ -2330,6 +2353,81 @@ def test_nvfp4_rejects_a_misaligned_workspace_tensor(pv_mode):
     torch.cuda.synchronize()
     _check(
         out, _reference(q, k, v, cu, 1.0 / math.sqrt(HEAD_DIM)), NVFP4_ATOL, NVFP4_RTOL
+    )
+
+
+@pytest.mark.parametrize(
+    "route,cu,heads",
+    [
+        ("bf16", [0, 19296], 28),  # center_5s_p2: a tail-grid plan on B200
+        ("fp8", [0, 27488], 14),  # center_15s_p4: a tail-first plan on B200
+        ("fp4", [0, 19296], 28),  # center_5s_p2: a tail-grid plan on B200
+    ],
+)
+def test_one_shot_side_streams_follow_the_caller_stream(route, cu, heads):
+    """The one-shot entries take the calling thread's side streams per caller
+    stream: calls on two caller streams of one thread get their own stream
+    sets (so their two-launch schedules stay concurrent), a repeated call
+    reuses its stream's set and every output is bitwise the default stream's.
+    A BF16 call warmed up on a stream captures there with that stream's set
+    and the graph replays the same output.  Off the two-launch architectures
+    every plan runs on the caller's stream and no set is created."""
+    arch = _require_program(
+        "bf16" if route == "bf16" else cake_backend.NVFP4_VARIANT[route]
+    )
+    scheduled = arch in (
+        cake_backend.BF16_TAIL_GRID_ARCHES
+        if route == "bf16"
+        else cake_backend.NVFP4_TFS_ARCHES
+    )
+    q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=16)
+
+    def call():
+        if route == "bf16":
+            return minimax_h3_varlen_attention(q, k, v, cu_seqlens, cu_seqlens_host=cu)
+        return minimax_h3_varlen_nvfp4_attention(
+            q, k, v, cu_seqlens, pv_mode=route, cu_seqlens_host=cu
+        )
+
+    torch.cuda.synchronize()
+    cake_backend._THREAD_SIDE_STREAMS.sets = {}
+    main, x, y = torch.cuda.current_stream(), torch.cuda.Stream(), torch.cuda.Stream()
+    expected = call()
+    x.wait_stream(main)
+    y.wait_stream(main)
+    with torch.cuda.stream(x):
+        out_x = call()
+    with torch.cuda.stream(y):
+        out_y = call()
+    with torch.cuda.stream(x):
+        again_x = call()
+    torch.cuda.synchronize()
+    sets = cake_backend._THREAD_SIDE_STREAMS.sets
+    index = torch.cuda.current_device()
+    if scheduled:
+        assert set(sets) == {(index, s.cuda_stream) for s in (main, x, y)}, (
+            f"expected a two-launch plan on {arch}"
+        )
+        pairs = [sets[(index, c.cuda_stream)][:2] for c in (main, x, y)]
+        assert len({s.cuda_stream for pair in pairs for s in pair}) == 6
+    else:
+        assert not sets
+    for out in (out_x, out_y, again_x):
+        assert torch.equal(out, expected)
+    if route == "bf16":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=x):
+            captured = call()
+        assert len(sets) == (3 if scheduled else 0)
+        captured.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(captured, expected)
+    _check(
+        expected,
+        _reference(q, k, v, cu, 1.0 / math.sqrt(HEAD_DIM)),
+        BF16_ATOL if route == "bf16" else NVFP4_ATOL,
+        BF16_RTOL if route == "bf16" else NVFP4_RTOL,
     )
 
 

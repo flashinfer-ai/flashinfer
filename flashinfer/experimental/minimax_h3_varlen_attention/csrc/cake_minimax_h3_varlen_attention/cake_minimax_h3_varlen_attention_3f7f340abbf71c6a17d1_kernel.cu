@@ -287,15 +287,6 @@ __device__ __forceinline__ float2 ex2_emulation_f32x2_value(float2 value) {
 
 
 
-__device__ __forceinline__ void fma_f32x2_inplace(float2* a, float2 b, float2 c) {
-    unsigned long long r;
-    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;"
-        : "=l"(r)
-        : "l"(*(unsigned long long*)a), "l"(*(unsigned long long*)&b),
-          "l"(*(unsigned long long*)&c));
-    *(unsigned long long*)a = r;
-}
-
 __device__ __forceinline__ void mul_f32x2_noftz_inplace(float2* a, float2 b) {
     asm("mul.rn.f32x2 %0, %0, %1;"
         : "+l"(*(unsigned long long*)a) : "l"(*(unsigned long long*)&b));
@@ -306,6 +297,15 @@ __device__ __forceinline__ float2 add_f32x2(float2 a, float2 b) {
     asm("add.rn.ftz.f32x2 %0, %1, %2;"
         : "=l"(*(unsigned long long*)&r)
         : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b));
+    return r;
+}
+
+__device__ __forceinline__ float2 fma_f32x2(float2 a, float2 b, float2 c) {
+    float2 r;
+    asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b),
+          "l"(*(unsigned long long*)&c));
     return r;
 }
 
@@ -529,8 +529,8 @@ kernel_cake_minimax_h3_varlen_attention_3f7f340abbf71c6a17d1(const __grid_consta
             unsigned int stage = make_warp_uniform(warp / 4);
             int scale_off = make_warp_uniform(stage * 128);
             int p_col = make_warp_uniform(416 + stage * 32);
-            int _phase_corr_done = 1;
             unsigned int _phase_s_full = 0;
+            unsigned int _phase_corr_done = 1;
             unsigned int _phase_p_empty = 1;
             unsigned int _phase_o_full = 0;
             #pragma unroll 1
@@ -796,6 +796,111 @@ kernel_cake_minimax_h3_varlen_attention_3f7f340abbf71c6a17d1(const __grid_consta
                         row_max = new_max;
                         row_max_scaled = new_max_scaled;
                     }
+                    float block_sum = 0.0f;
+                    const float2 _fma_b2_13 = {softmax_scale_log2, softmax_scale_log2};
+                    const float2 _fma_c2_14 = {-new_max_scaled, -new_max_scaled};
+                    float2 _fma_pair_15 = fma_f32x2(make_float2((sv + 96)[0], (sv + 96)[1]), _fma_b2_13, _fma_c2_14);
+                    (sv + 96)[0] = _fma_pair_15.x;
+                    (sv + 96)[1] = _fma_pair_15.y;
+                    float2 _fma_pair_16 = fma_f32x2(make_float2((sv + 96)[2], (sv + 96)[3]), _fma_b2_13, _fma_c2_14);
+                    (sv + 96)[2] = _fma_pair_16.x;
+                    (sv + 96)[3] = _fma_pair_16.y;
+                    float2 _fma_pair_17 = fma_f32x2(make_float2((sv + 96)[4], (sv + 96)[5]), _fma_b2_13, _fma_c2_14);
+                    (sv + 96)[4] = _fma_pair_17.x;
+                    (sv + 96)[5] = _fma_pair_17.y;
+                    float2 _fma_pair_18 = fma_f32x2(make_float2((sv + 96)[6], (sv + 96)[7]), _fma_b2_13, _fma_c2_14);
+                    (sv + 96)[6] = _fma_pair_18.x;
+                    (sv + 96)[7] = _fma_pair_18.y;
+                    float2 _fma_pair_19 = fma_f32x2(make_float2((sv + 96)[8], (sv + 96)[9]), _fma_b2_13, _fma_c2_14);
+                    (sv + 96)[8] = _fma_pair_19.x;
+                    (sv + 96)[9] = _fma_pair_19.y;
+                    float2 _fma_pair_20 = fma_f32x2(make_float2((sv + 96)[10], (sv + 96)[11]), _fma_b2_13, _fma_c2_14);
+                    (sv + 96)[10] = _fma_pair_20.x;
+                    (sv + 96)[11] = _fma_pair_20.y;
+                    float2 _fma_pair_21 = fma_f32x2(make_float2((sv + 96)[12], (sv + 96)[13]), _fma_b2_13, _fma_c2_14);
+                    (sv + 96)[12] = _fma_pair_21.x;
+                    (sv + 96)[13] = _fma_pair_21.y;
+                    float2 _fma_pair_22 = fma_f32x2(make_float2((sv + 96)[14], (sv + 96)[15]), _fma_b2_13, _fma_c2_14);
+                    (sv + 96)[14] = _fma_pair_22.x;
+                    (sv + 96)[15] = _fma_pair_22.y;
+                    float2 _fma_pair_23 = fma_f32x2(make_float2((sv + 96)[16], (sv + 96)[17]), _fma_b2_13, _fma_c2_14);
+                    (sv + 96)[16] = _fma_pair_23.x;
+                    (sv + 96)[17] = _fma_pair_23.y;
+                    float2 _fma_pair_24 = fma_f32x2(make_float2((sv + 96)[18], (sv + 96)[19]), _fma_b2_13, _fma_c2_14);
+                    (sv + 96)[18] = _fma_pair_24.x;
+                    (sv + 96)[19] = _fma_pair_24.y;
+                    float2 _fma_pair_25 = fma_f32x2(make_float2((sv + 96)[20], (sv + 96)[21]), _fma_b2_13, _fma_c2_14);
+                    (sv + 96)[20] = _fma_pair_25.x;
+                    (sv + 96)[21] = _fma_pair_25.y;
+                    float2 _fma_pair_26 = fma_f32x2(make_float2((sv + 96)[22], (sv + 96)[23]), _fma_b2_13, _fma_c2_14);
+                    (sv + 96)[22] = _fma_pair_26.x;
+                    (sv + 96)[23] = _fma_pair_26.y;
+                    float2 _fma_pair_27 = fma_f32x2(make_float2((sv + 96)[24], (sv + 96)[25]), _fma_b2_13, _fma_c2_14);
+                    (sv + 96)[24] = _fma_pair_27.x;
+                    (sv + 96)[25] = _fma_pair_27.y;
+                    float2 _fma_pair_28 = fma_f32x2(make_float2((sv + 96)[26], (sv + 96)[27]), _fma_b2_13, _fma_c2_14);
+                    (sv + 96)[26] = _fma_pair_28.x;
+                    (sv + 96)[27] = _fma_pair_28.y;
+                    float2 _fma_pair_29 = fma_f32x2(make_float2((sv + 96)[28], (sv + 96)[29]), _fma_b2_13, _fma_c2_14);
+                    (sv + 96)[28] = _fma_pair_29.x;
+                    (sv + 96)[29] = _fma_pair_29.y;
+                    float2 _fma_pair_30 = fma_f32x2(make_float2((sv + 96)[30], (sv + 96)[31]), _fma_b2_13, _fma_c2_14);
+                    (sv + 96)[30] = _fma_pair_30.x;
+                    (sv + 96)[31] = _fma_pair_30.y;
+                    float2 _exp2_pair_31 = ex2_emulation_f32x2_value(make_float2(sv[96], sv[97]));
+                    sv[96] = _exp2_pair_31.x;
+                    sv[97] = _exp2_pair_31.y;
+                    float2 _exp2_pair_32 = ex2_emulation_f32x2_value(make_float2(sv[98], sv[99]));
+                    sv[98] = _exp2_pair_32.x;
+                    sv[99] = _exp2_pair_32.y;
+                    float2 _exp2_pair_33 = ex2_emulation_f32x2_value(make_float2(sv[100], sv[101]));
+                    sv[100] = _exp2_pair_33.x;
+                    sv[101] = _exp2_pair_33.y;
+                    float2 _exp2_pair_34 = ex2_emulation_f32x2_value(make_float2(sv[102], sv[103]));
+                    sv[102] = _exp2_pair_34.x;
+                    sv[103] = _exp2_pair_34.y;
+                    float2 _exp2_pair_35 = ex2_emulation_f32x2_value(make_float2(sv[104], sv[105]));
+                    sv[104] = _exp2_pair_35.x;
+                    sv[105] = _exp2_pair_35.y;
+                    float2 _exp2_pair_36 = ex2_emulation_f32x2_value(make_float2(sv[106], sv[107]));
+                    sv[106] = _exp2_pair_36.x;
+                    sv[107] = _exp2_pair_36.y;
+                    float2 _exp2_pair_37 = ex2_emulation_f32x2_value(make_float2(sv[108], sv[109]));
+                    sv[108] = _exp2_pair_37.x;
+                    sv[109] = _exp2_pair_37.y;
+                    float2 _exp2_pair_38 = ex2_emulation_f32x2_value(make_float2(sv[110], sv[111]));
+                    sv[110] = _exp2_pair_38.x;
+                    sv[111] = _exp2_pair_38.y;
+                    float2 _exp2_pair_39 = ex2_emulation_f32x2_value(make_float2(sv[112], sv[113]));
+                    sv[112] = _exp2_pair_39.x;
+                    sv[113] = _exp2_pair_39.y;
+                    float2 _exp2_pair_40 = ex2_emulation_f32x2_value(make_float2(sv[114], sv[115]));
+                    sv[114] = _exp2_pair_40.x;
+                    sv[115] = _exp2_pair_40.y;
+                    float2 _exp2_pair_41 = ex2_emulation_f32x2_value(make_float2(sv[116], sv[117]));
+                    sv[116] = _exp2_pair_41.x;
+                    sv[117] = _exp2_pair_41.y;
+                    float2 _exp2_pair_42 = ex2_emulation_f32x2_value(make_float2(sv[118], sv[119]));
+                    sv[118] = _exp2_pair_42.x;
+                    sv[119] = _exp2_pair_42.y;
+                    float2 _exp2_pair_43 = ex2_emulation_f32x2_value(make_float2(sv[120], sv[121]));
+                    sv[120] = _exp2_pair_43.x;
+                    sv[121] = _exp2_pair_43.y;
+                    float2 _exp2_pair_44 = ex2_emulation_f32x2_value(make_float2(sv[122], sv[123]));
+                    sv[122] = _exp2_pair_44.x;
+                    sv[123] = _exp2_pair_44.y;
+                    float2 _exp2_pair_45 = ex2_emulation_f32x2_value(make_float2(sv[124], sv[125]));
+                    sv[124] = _exp2_pair_45.x;
+                    sv[125] = _exp2_pair_45.y;
+                    float2 _exp2_pair_46 = ex2_emulation_f32x2_value(make_float2(sv[126], sv[127]));
+                    sv[126] = _exp2_pair_46.x;
+                    sv[127] = _exp2_pair_46.y;
+                    float2 partial = make_float2(sv[96], sv[97]);
+                    #pragma unroll
+                    for (int pair = 98; pair < 128; pair += 2) {
+                        partial = add_f32x2(partial, make_float2(sv[pair], sv[pair + 1]));
+                    }
+                    float2 sum3 = partial;
                     if (n_iter > 0) {
                         mbarrier_wait(corr_done_addr + (stage) * 8, _phase_corr_done);
                     }
@@ -805,77 +910,179 @@ kernel_cake_minimax_h3_varlen_attention_3f7f340abbf71c6a17d1(const __grid_consta
                     } else {
                         mbarrier_arrive(corr_sig_hi_addr + (stage) * 8);
                     }
-                    float block_sum = 0.0f;
-                    const float2 _fma_b2_13 = {softmax_scale_log2, softmax_scale_log2};
-                    const float2 _fma_c2_14 = {-new_max_scaled, -new_max_scaled};
+                    const float2 _fma_b2_47 = {softmax_scale_log2, softmax_scale_log2};
+                    const float2 _fma_c2_48 = {-new_max_scaled, -new_max_scaled};
+                    float2 _fma_pair_49 = fma_f32x2(make_float2((sv + 0)[0], (sv + 0)[1]), _fma_b2_47, _fma_c2_48);
+                    (sv + 0)[0] = _fma_pair_49.x;
+                    (sv + 0)[1] = _fma_pair_49.y;
+                    float2 _fma_pair_50 = fma_f32x2(make_float2((sv + 0)[2], (sv + 0)[3]), _fma_b2_47, _fma_c2_48);
+                    (sv + 0)[2] = _fma_pair_50.x;
+                    (sv + 0)[3] = _fma_pair_50.y;
+                    float2 _fma_pair_51 = fma_f32x2(make_float2((sv + 0)[4], (sv + 0)[5]), _fma_b2_47, _fma_c2_48);
+                    (sv + 0)[4] = _fma_pair_51.x;
+                    (sv + 0)[5] = _fma_pair_51.y;
+                    float2 _fma_pair_52 = fma_f32x2(make_float2((sv + 0)[6], (sv + 0)[7]), _fma_b2_47, _fma_c2_48);
+                    (sv + 0)[6] = _fma_pair_52.x;
+                    (sv + 0)[7] = _fma_pair_52.y;
+                    float2 _fma_pair_53 = fma_f32x2(make_float2((sv + 0)[8], (sv + 0)[9]), _fma_b2_47, _fma_c2_48);
+                    (sv + 0)[8] = _fma_pair_53.x;
+                    (sv + 0)[9] = _fma_pair_53.y;
+                    float2 _fma_pair_54 = fma_f32x2(make_float2((sv + 0)[10], (sv + 0)[11]), _fma_b2_47, _fma_c2_48);
+                    (sv + 0)[10] = _fma_pair_54.x;
+                    (sv + 0)[11] = _fma_pair_54.y;
+                    float2 _fma_pair_55 = fma_f32x2(make_float2((sv + 0)[12], (sv + 0)[13]), _fma_b2_47, _fma_c2_48);
+                    (sv + 0)[12] = _fma_pair_55.x;
+                    (sv + 0)[13] = _fma_pair_55.y;
+                    float2 _fma_pair_56 = fma_f32x2(make_float2((sv + 0)[14], (sv + 0)[15]), _fma_b2_47, _fma_c2_48);
+                    (sv + 0)[14] = _fma_pair_56.x;
+                    (sv + 0)[15] = _fma_pair_56.y;
+                    float2 _fma_pair_57 = fma_f32x2(make_float2((sv + 0)[16], (sv + 0)[17]), _fma_b2_47, _fma_c2_48);
+                    (sv + 0)[16] = _fma_pair_57.x;
+                    (sv + 0)[17] = _fma_pair_57.y;
+                    float2 _fma_pair_58 = fma_f32x2(make_float2((sv + 0)[18], (sv + 0)[19]), _fma_b2_47, _fma_c2_48);
+                    (sv + 0)[18] = _fma_pair_58.x;
+                    (sv + 0)[19] = _fma_pair_58.y;
+                    float2 _fma_pair_59 = fma_f32x2(make_float2((sv + 0)[20], (sv + 0)[21]), _fma_b2_47, _fma_c2_48);
+                    (sv + 0)[20] = _fma_pair_59.x;
+                    (sv + 0)[21] = _fma_pair_59.y;
+                    float2 _fma_pair_60 = fma_f32x2(make_float2((sv + 0)[22], (sv + 0)[23]), _fma_b2_47, _fma_c2_48);
+                    (sv + 0)[22] = _fma_pair_60.x;
+                    (sv + 0)[23] = _fma_pair_60.y;
+                    float2 _fma_pair_61 = fma_f32x2(make_float2((sv + 0)[24], (sv + 0)[25]), _fma_b2_47, _fma_c2_48);
+                    (sv + 0)[24] = _fma_pair_61.x;
+                    (sv + 0)[25] = _fma_pair_61.y;
+                    float2 _fma_pair_62 = fma_f32x2(make_float2((sv + 0)[26], (sv + 0)[27]), _fma_b2_47, _fma_c2_48);
+                    (sv + 0)[26] = _fma_pair_62.x;
+                    (sv + 0)[27] = _fma_pair_62.y;
+                    float2 _fma_pair_63 = fma_f32x2(make_float2((sv + 0)[28], (sv + 0)[29]), _fma_b2_47, _fma_c2_48);
+                    (sv + 0)[28] = _fma_pair_63.x;
+                    (sv + 0)[29] = _fma_pair_63.y;
+                    float2 _fma_pair_64 = fma_f32x2(make_float2((sv + 0)[30], (sv + 0)[31]), _fma_b2_47, _fma_c2_48);
+                    (sv + 0)[30] = _fma_pair_64.x;
+                    (sv + 0)[31] = _fma_pair_64.y;
                     #pragma unroll
-                    for (int _lf = 0; _lf < 64; _lf++)
-                        fma_f32x2_inplace(&reinterpret_cast<float2*>(sv)[_lf], _fma_b2_13, _fma_c2_14);
-                    {
-                        #pragma unroll
-                        for (int _le = 0; _le < 96; _le++) {
-                            sv[_le] = approx_exp2(sv[_le]);
-                        }
-                        float2 _exp2_pair_15 = ex2_emulation_f32x2_value(make_float2(sv[96], sv[97]));
-                        sv[96] = _exp2_pair_15.x;
-                        sv[97] = _exp2_pair_15.y;
-                        float2 _exp2_pair_16 = ex2_emulation_f32x2_value(make_float2(sv[98], sv[99]));
-                        sv[98] = _exp2_pair_16.x;
-                        sv[99] = _exp2_pair_16.y;
-                        float2 _exp2_pair_17 = ex2_emulation_f32x2_value(make_float2(sv[100], sv[101]));
-                        sv[100] = _exp2_pair_17.x;
-                        sv[101] = _exp2_pair_17.y;
-                        float2 _exp2_pair_18 = ex2_emulation_f32x2_value(make_float2(sv[102], sv[103]));
-                        sv[102] = _exp2_pair_18.x;
-                        sv[103] = _exp2_pair_18.y;
-                        float2 _exp2_pair_19 = ex2_emulation_f32x2_value(make_float2(sv[104], sv[105]));
-                        sv[104] = _exp2_pair_19.x;
-                        sv[105] = _exp2_pair_19.y;
-                        float2 _exp2_pair_20 = ex2_emulation_f32x2_value(make_float2(sv[106], sv[107]));
-                        sv[106] = _exp2_pair_20.x;
-                        sv[107] = _exp2_pair_20.y;
-                        float2 _exp2_pair_21 = ex2_emulation_f32x2_value(make_float2(sv[108], sv[109]));
-                        sv[108] = _exp2_pair_21.x;
-                        sv[109] = _exp2_pair_21.y;
-                        float2 _exp2_pair_22 = ex2_emulation_f32x2_value(make_float2(sv[110], sv[111]));
-                        sv[110] = _exp2_pair_22.x;
-                        sv[111] = _exp2_pair_22.y;
-                        float2 _exp2_pair_23 = ex2_emulation_f32x2_value(make_float2(sv[112], sv[113]));
-                        sv[112] = _exp2_pair_23.x;
-                        sv[113] = _exp2_pair_23.y;
-                        float2 _exp2_pair_24 = ex2_emulation_f32x2_value(make_float2(sv[114], sv[115]));
-                        sv[114] = _exp2_pair_24.x;
-                        sv[115] = _exp2_pair_24.y;
-                        float2 _exp2_pair_25 = ex2_emulation_f32x2_value(make_float2(sv[116], sv[117]));
-                        sv[116] = _exp2_pair_25.x;
-                        sv[117] = _exp2_pair_25.y;
-                        float2 _exp2_pair_26 = ex2_emulation_f32x2_value(make_float2(sv[118], sv[119]));
-                        sv[118] = _exp2_pair_26.x;
-                        sv[119] = _exp2_pair_26.y;
-                        float2 _exp2_pair_27 = ex2_emulation_f32x2_value(make_float2(sv[120], sv[121]));
-                        sv[120] = _exp2_pair_27.x;
-                        sv[121] = _exp2_pair_27.y;
-                        float2 _exp2_pair_28 = ex2_emulation_f32x2_value(make_float2(sv[122], sv[123]));
-                        sv[122] = _exp2_pair_28.x;
-                        sv[123] = _exp2_pair_28.y;
-                        float2 _exp2_pair_29 = ex2_emulation_f32x2_value(make_float2(sv[124], sv[125]));
-                        sv[124] = _exp2_pair_29.x;
-                        sv[125] = _exp2_pair_29.y;
-                        float2 _exp2_pair_30 = ex2_emulation_f32x2_value(make_float2(sv[126], sv[127]));
-                        sv[126] = _exp2_pair_30.x;
-                        sv[127] = _exp2_pair_30.y;
+                    for (int _le = 0; _le < 32; _le++) {
+                        sv[_le] = approx_exp2(sv[_le]);
+                    }
+                    const float2 _fma_b2_65 = {softmax_scale_log2, softmax_scale_log2};
+                    const float2 _fma_c2_66 = {-new_max_scaled, -new_max_scaled};
+                    float2 _fma_pair_67 = fma_f32x2(make_float2((sv + 32)[0], (sv + 32)[1]), _fma_b2_65, _fma_c2_66);
+                    (sv + 32)[0] = _fma_pair_67.x;
+                    (sv + 32)[1] = _fma_pair_67.y;
+                    float2 _fma_pair_68 = fma_f32x2(make_float2((sv + 32)[2], (sv + 32)[3]), _fma_b2_65, _fma_c2_66);
+                    (sv + 32)[2] = _fma_pair_68.x;
+                    (sv + 32)[3] = _fma_pair_68.y;
+                    float2 _fma_pair_69 = fma_f32x2(make_float2((sv + 32)[4], (sv + 32)[5]), _fma_b2_65, _fma_c2_66);
+                    (sv + 32)[4] = _fma_pair_69.x;
+                    (sv + 32)[5] = _fma_pair_69.y;
+                    float2 _fma_pair_70 = fma_f32x2(make_float2((sv + 32)[6], (sv + 32)[7]), _fma_b2_65, _fma_c2_66);
+                    (sv + 32)[6] = _fma_pair_70.x;
+                    (sv + 32)[7] = _fma_pair_70.y;
+                    float2 _fma_pair_71 = fma_f32x2(make_float2((sv + 32)[8], (sv + 32)[9]), _fma_b2_65, _fma_c2_66);
+                    (sv + 32)[8] = _fma_pair_71.x;
+                    (sv + 32)[9] = _fma_pair_71.y;
+                    float2 _fma_pair_72 = fma_f32x2(make_float2((sv + 32)[10], (sv + 32)[11]), _fma_b2_65, _fma_c2_66);
+                    (sv + 32)[10] = _fma_pair_72.x;
+                    (sv + 32)[11] = _fma_pair_72.y;
+                    float2 _fma_pair_73 = fma_f32x2(make_float2((sv + 32)[12], (sv + 32)[13]), _fma_b2_65, _fma_c2_66);
+                    (sv + 32)[12] = _fma_pair_73.x;
+                    (sv + 32)[13] = _fma_pair_73.y;
+                    float2 _fma_pair_74 = fma_f32x2(make_float2((sv + 32)[14], (sv + 32)[15]), _fma_b2_65, _fma_c2_66);
+                    (sv + 32)[14] = _fma_pair_74.x;
+                    (sv + 32)[15] = _fma_pair_74.y;
+                    float2 _fma_pair_75 = fma_f32x2(make_float2((sv + 32)[16], (sv + 32)[17]), _fma_b2_65, _fma_c2_66);
+                    (sv + 32)[16] = _fma_pair_75.x;
+                    (sv + 32)[17] = _fma_pair_75.y;
+                    float2 _fma_pair_76 = fma_f32x2(make_float2((sv + 32)[18], (sv + 32)[19]), _fma_b2_65, _fma_c2_66);
+                    (sv + 32)[18] = _fma_pair_76.x;
+                    (sv + 32)[19] = _fma_pair_76.y;
+                    float2 _fma_pair_77 = fma_f32x2(make_float2((sv + 32)[20], (sv + 32)[21]), _fma_b2_65, _fma_c2_66);
+                    (sv + 32)[20] = _fma_pair_77.x;
+                    (sv + 32)[21] = _fma_pair_77.y;
+                    float2 _fma_pair_78 = fma_f32x2(make_float2((sv + 32)[22], (sv + 32)[23]), _fma_b2_65, _fma_c2_66);
+                    (sv + 32)[22] = _fma_pair_78.x;
+                    (sv + 32)[23] = _fma_pair_78.y;
+                    float2 _fma_pair_79 = fma_f32x2(make_float2((sv + 32)[24], (sv + 32)[25]), _fma_b2_65, _fma_c2_66);
+                    (sv + 32)[24] = _fma_pair_79.x;
+                    (sv + 32)[25] = _fma_pair_79.y;
+                    float2 _fma_pair_80 = fma_f32x2(make_float2((sv + 32)[26], (sv + 32)[27]), _fma_b2_65, _fma_c2_66);
+                    (sv + 32)[26] = _fma_pair_80.x;
+                    (sv + 32)[27] = _fma_pair_80.y;
+                    float2 _fma_pair_81 = fma_f32x2(make_float2((sv + 32)[28], (sv + 32)[29]), _fma_b2_65, _fma_c2_66);
+                    (sv + 32)[28] = _fma_pair_81.x;
+                    (sv + 32)[29] = _fma_pair_81.y;
+                    float2 _fma_pair_82 = fma_f32x2(make_float2((sv + 32)[30], (sv + 32)[31]), _fma_b2_65, _fma_c2_66);
+                    (sv + 32)[30] = _fma_pair_82.x;
+                    (sv + 32)[31] = _fma_pair_82.y;
+                    #pragma unroll
+                    for (int _le = 0; _le < 32; _le++) {
+                        sv[_le + 32] = approx_exp2(sv[_le + 32]);
+                    }
+                    const float2 _fma_b2_83 = {softmax_scale_log2, softmax_scale_log2};
+                    const float2 _fma_c2_84 = {-new_max_scaled, -new_max_scaled};
+                    float2 _fma_pair_85 = fma_f32x2(make_float2((sv + 64)[0], (sv + 64)[1]), _fma_b2_83, _fma_c2_84);
+                    (sv + 64)[0] = _fma_pair_85.x;
+                    (sv + 64)[1] = _fma_pair_85.y;
+                    float2 _fma_pair_86 = fma_f32x2(make_float2((sv + 64)[2], (sv + 64)[3]), _fma_b2_83, _fma_c2_84);
+                    (sv + 64)[2] = _fma_pair_86.x;
+                    (sv + 64)[3] = _fma_pair_86.y;
+                    float2 _fma_pair_87 = fma_f32x2(make_float2((sv + 64)[4], (sv + 64)[5]), _fma_b2_83, _fma_c2_84);
+                    (sv + 64)[4] = _fma_pair_87.x;
+                    (sv + 64)[5] = _fma_pair_87.y;
+                    float2 _fma_pair_88 = fma_f32x2(make_float2((sv + 64)[6], (sv + 64)[7]), _fma_b2_83, _fma_c2_84);
+                    (sv + 64)[6] = _fma_pair_88.x;
+                    (sv + 64)[7] = _fma_pair_88.y;
+                    float2 _fma_pair_89 = fma_f32x2(make_float2((sv + 64)[8], (sv + 64)[9]), _fma_b2_83, _fma_c2_84);
+                    (sv + 64)[8] = _fma_pair_89.x;
+                    (sv + 64)[9] = _fma_pair_89.y;
+                    float2 _fma_pair_90 = fma_f32x2(make_float2((sv + 64)[10], (sv + 64)[11]), _fma_b2_83, _fma_c2_84);
+                    (sv + 64)[10] = _fma_pair_90.x;
+                    (sv + 64)[11] = _fma_pair_90.y;
+                    float2 _fma_pair_91 = fma_f32x2(make_float2((sv + 64)[12], (sv + 64)[13]), _fma_b2_83, _fma_c2_84);
+                    (sv + 64)[12] = _fma_pair_91.x;
+                    (sv + 64)[13] = _fma_pair_91.y;
+                    float2 _fma_pair_92 = fma_f32x2(make_float2((sv + 64)[14], (sv + 64)[15]), _fma_b2_83, _fma_c2_84);
+                    (sv + 64)[14] = _fma_pair_92.x;
+                    (sv + 64)[15] = _fma_pair_92.y;
+                    float2 _fma_pair_93 = fma_f32x2(make_float2((sv + 64)[16], (sv + 64)[17]), _fma_b2_83, _fma_c2_84);
+                    (sv + 64)[16] = _fma_pair_93.x;
+                    (sv + 64)[17] = _fma_pair_93.y;
+                    float2 _fma_pair_94 = fma_f32x2(make_float2((sv + 64)[18], (sv + 64)[19]), _fma_b2_83, _fma_c2_84);
+                    (sv + 64)[18] = _fma_pair_94.x;
+                    (sv + 64)[19] = _fma_pair_94.y;
+                    float2 _fma_pair_95 = fma_f32x2(make_float2((sv + 64)[20], (sv + 64)[21]), _fma_b2_83, _fma_c2_84);
+                    (sv + 64)[20] = _fma_pair_95.x;
+                    (sv + 64)[21] = _fma_pair_95.y;
+                    float2 _fma_pair_96 = fma_f32x2(make_float2((sv + 64)[22], (sv + 64)[23]), _fma_b2_83, _fma_c2_84);
+                    (sv + 64)[22] = _fma_pair_96.x;
+                    (sv + 64)[23] = _fma_pair_96.y;
+                    float2 _fma_pair_97 = fma_f32x2(make_float2((sv + 64)[24], (sv + 64)[25]), _fma_b2_83, _fma_c2_84);
+                    (sv + 64)[24] = _fma_pair_97.x;
+                    (sv + 64)[25] = _fma_pair_97.y;
+                    float2 _fma_pair_98 = fma_f32x2(make_float2((sv + 64)[26], (sv + 64)[27]), _fma_b2_83, _fma_c2_84);
+                    (sv + 64)[26] = _fma_pair_98.x;
+                    (sv + 64)[27] = _fma_pair_98.y;
+                    float2 _fma_pair_99 = fma_f32x2(make_float2((sv + 64)[28], (sv + 64)[29]), _fma_b2_83, _fma_c2_84);
+                    (sv + 64)[28] = _fma_pair_99.x;
+                    (sv + 64)[29] = _fma_pair_99.y;
+                    float2 _fma_pair_100 = fma_f32x2(make_float2((sv + 64)[30], (sv + 64)[31]), _fma_b2_83, _fma_c2_84);
+                    (sv + 64)[30] = _fma_pair_100.x;
+                    (sv + 64)[31] = _fma_pair_100.y;
+                    #pragma unroll
+                    for (int _le = 0; _le < 32; _le++) {
+                        sv[_le + 64] = approx_exp2(sv[_le + 64]);
                     }
                     int p_addr = taddr + (unsigned int)p_col + (unsigned int)(warp % 4 * 32 << 16);
                     unsigned int p0[8];
                     unsigned int p1[8];
                     unsigned int p2[8];
                     unsigned int p3[8];
-                    float2 partial = make_float2(sv[0], sv[1]);
+                    float2 partial_3 = make_float2(sv[0], sv[1]);
                     #pragma unroll
-                    for (int pair = 2; pair < 32; pair += 2) {
-                        partial = add_f32x2(partial, make_float2(sv[pair], sv[pair + 1]));
+                    for (int pair_1 = 2; pair_1 < 32; pair_1 += 2) {
+                        partial_3 = add_f32x2(partial_3, make_float2(sv[pair_1], sv[pair_1 + 1]));
                     }
-                    float2 sum0 = partial;
+                    float2 sum0 = partial_3;
                     {
                         uint32_t _packed;
                         asm volatile("{\n\t"
@@ -984,12 +1191,12 @@ kernel_cake_minimax_h3_varlen_attention_3f7f340abbf71c6a17d1(const __grid_consta
                     _phase_p_empty ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     tmem_st_x8_u32(p_addr, (const uint32_t*)p0);
-                    float2 partial_0 = make_float2(sv[32], sv[33]);
+                    float2 partial_4 = make_float2(sv[32], sv[33]);
                     #pragma unroll
-                    for (int pair_1 = 34; pair_1 < 64; pair_1 += 2) {
-                        partial_0 = add_f32x2(partial_0, make_float2(sv[pair_1], sv[pair_1 + 1]));
+                    for (int pair_2 = 34; pair_2 < 64; pair_2 += 2) {
+                        partial_4 = add_f32x2(partial_4, make_float2(sv[pair_2], sv[pair_2 + 1]));
                     }
-                    float2 sum1 = partial_0;
+                    float2 sum1 = partial_4;
                     {
                         uint32_t _packed;
                         asm volatile("{\n\t"
@@ -1095,12 +1302,12 @@ kernel_cake_minimax_h3_varlen_attention_3f7f340abbf71c6a17d1(const __grid_consta
                         p1[7] = _packed;
                     }
                     tmem_st_x8_u32(p_addr + 8, (const uint32_t*)p1);
-                    float2 partial_1 = make_float2(sv[64], sv[65]);
+                    float2 partial_5 = make_float2(sv[64], sv[65]);
                     #pragma unroll
-                    for (int pair_2 = 66; pair_2 < 96; pair_2 += 2) {
-                        partial_1 = add_f32x2(partial_1, make_float2(sv[pair_2], sv[pair_2 + 1]));
+                    for (int pair_3 = 66; pair_3 < 96; pair_3 += 2) {
+                        partial_5 = add_f32x2(partial_5, make_float2(sv[pair_3], sv[pair_3 + 1]));
                     }
-                    float2 sum2 = partial_1;
+                    float2 sum2 = partial_5;
                     {
                         uint32_t _packed;
                         asm volatile("{\n\t"
@@ -1206,12 +1413,6 @@ kernel_cake_minimax_h3_varlen_attention_3f7f340abbf71c6a17d1(const __grid_consta
                         p2[7] = _packed;
                     }
                     tmem_st_x8_u32(p_addr + 16, (const uint32_t*)p2);
-                    float2 partial_2 = make_float2(sv[96], sv[97]);
-                    #pragma unroll
-                    for (int pair_3 = 98; pair_3 < 128; pair_3 += 2) {
-                        partial_2 = add_f32x2(partial_2, make_float2(sv[pair_3], sv[pair_3 + 1]));
-                    }
-                    float2 sum3 = partial_2;
                     {
                         uint32_t _packed;
                         asm volatile("{\n\t"
@@ -1340,18 +1541,18 @@ kernel_cake_minimax_h3_varlen_attention_3f7f340abbf71c6a17d1(const __grid_consta
                 }
                 float v_amax_reg[1];
                 {
-                    uint32_t _scalar_bits_31;
+                    uint32_t _scalar_bits_101;
                     asm volatile("ld.volatile.global.b32 %0, [%1];"
-                        : "=r"(_scalar_bits_31) : "l"((const void*)(v_amax + (0))) : "memory");
-                    v_amax_reg[0] = __uint_as_float(_scalar_bits_31);
+                        : "=r"(_scalar_bits_101) : "l"((const void*)(v_amax + (0))) : "memory");
+                    v_amax_reg[0] = __uint_as_float(_scalar_bits_101);
                 }
                 mbarrier_wait(o_full_addr + (stage) * 8, _phase_o_full);
                 _phase_o_full ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 float final_scale = 0.0f;
                 float v_dequant = v_amax_reg[0] * 0.002232143f;
-                float _rcp_32 = approx_rcp(row_sum);
-                final_scale = ((row_sum != 0.0f && row_sum == row_sum) ? _rcp_32 * v_dequant : 0.0f);
+                float _rcp_102 = approx_rcp(row_sum);
+                final_scale = ((row_sum != 0.0f && row_sum == row_sum) ? _rcp_102 * v_dequant : 0.0f);
                 int seg_len_out = seg_len;
                 int local_row = ((unsigned int)m_block + stage) * 128 + (unsigned int)(warp % 4 * 32 + lane);
                 int token = seg_begin + local_row;
@@ -1376,10 +1577,10 @@ kernel_cake_minimax_h3_varlen_attention_3f7f340abbf71c6a17d1(const __grid_consta
                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                     if (local_row < seg_len_out) {
                         float _scaled_0[16];
-                        const float2 _scale2_33 = {final_scale, final_scale};
+                        const float2 _scale2_103 = {final_scale, final_scale};
                         #pragma unroll
                         for (int _ls = 0; _ls < 8; _ls++)
-                            reinterpret_cast<float2*>(_scaled_0)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>(ov)[_ls], _scale2_33);
+                            reinterpret_cast<float2*>(_scaled_0)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>(ov)[_ls], _scale2_103);
                         unsigned int _packed_0[8];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
@@ -1424,10 +1625,10 @@ kernel_cake_minimax_h3_varlen_attention_3f7f340abbf71c6a17d1(const __grid_consta
                         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(row_addr + (unsigned int)(part * 4 * 32)), "r"(_packed_0[0]), "r"(_packed_0[1]), "r"(_packed_0[2]), "r"(_packed_0[3]) : "memory");
                         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(row_addr + (unsigned int)(part * 4 * 32 + 16)), "r"(_packed_0[4]), "r"(_packed_0[5]), "r"(_packed_0[6]), "r"(_packed_0[7]) : "memory");
                         float _scaled_1[16];
-                        const float2 _scale2_34 = {final_scale, final_scale};
+                        const float2 _scale2_104 = {final_scale, final_scale};
                         #pragma unroll
                         for (int _ls = 0; _ls < 8; _ls++)
-                            reinterpret_cast<float2*>(_scaled_1)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((ov + 16))[_ls], _scale2_34);
+                            reinterpret_cast<float2*>(_scaled_1)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((ov + 16))[_ls], _scale2_104);
                         unsigned int _packed_1[8];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
@@ -1472,10 +1673,10 @@ kernel_cake_minimax_h3_varlen_attention_3f7f340abbf71c6a17d1(const __grid_consta
                         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(row_addr + (unsigned int)((part * 4 + 1) * 32)), "r"(_packed_1[0]), "r"(_packed_1[1]), "r"(_packed_1[2]), "r"(_packed_1[3]) : "memory");
                         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(row_addr + (unsigned int)((part * 4 + 1) * 32 + 16)), "r"(_packed_1[4]), "r"(_packed_1[5]), "r"(_packed_1[6]), "r"(_packed_1[7]) : "memory");
                         float _scaled_2[16];
-                        const float2 _scale2_35 = {final_scale, final_scale};
+                        const float2 _scale2_105 = {final_scale, final_scale};
                         #pragma unroll
                         for (int _ls = 0; _ls < 8; _ls++)
-                            reinterpret_cast<float2*>(_scaled_2)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((ov + 32))[_ls], _scale2_35);
+                            reinterpret_cast<float2*>(_scaled_2)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((ov + 32))[_ls], _scale2_105);
                         unsigned int _packed_2[8];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
@@ -1520,10 +1721,10 @@ kernel_cake_minimax_h3_varlen_attention_3f7f340abbf71c6a17d1(const __grid_consta
                         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(row_addr + (unsigned int)((part * 4 + 2) * 32)), "r"(_packed_2[0]), "r"(_packed_2[1]), "r"(_packed_2[2]), "r"(_packed_2[3]) : "memory");
                         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(row_addr + (unsigned int)((part * 4 + 2) * 32 + 16)), "r"(_packed_2[4]), "r"(_packed_2[5]), "r"(_packed_2[6]), "r"(_packed_2[7]) : "memory");
                         float _scaled_3[16];
-                        const float2 _scale2_36 = {final_scale, final_scale};
+                        const float2 _scale2_106 = {final_scale, final_scale};
                         #pragma unroll
                         for (int _ls = 0; _ls < 8; _ls++)
-                            reinterpret_cast<float2*>(_scaled_3)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((ov + 48))[_ls], _scale2_36);
+                            reinterpret_cast<float2*>(_scaled_3)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((ov + 48))[_ls], _scale2_106);
                         unsigned int _packed_3[8];
                         #pragma unroll
                         for (int _lp = 0; _lp < 1; _lp++) {
@@ -1572,10 +1773,10 @@ kernel_cake_minimax_h3_varlen_attention_3f7f340abbf71c6a17d1(const __grid_consta
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 if (local_row < seg_len_out) {
                     {
-                        void* _cpbulk_dst_37 = reinterpret_cast<void*>(O + out_off);
+                        void* _cpbulk_dst_107 = reinterpret_cast<void*>(O + out_off);
                         asm volatile(
                             "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
-                            :: "l"(_cpbulk_dst_37), "r"(row_addr), "r"((uint32_t)(256))
+                            :: "l"(_cpbulk_dst_107), "r"(row_addr), "r"((uint32_t)(256))
                             : "memory");
                     }
                 }
@@ -1589,8 +1790,8 @@ kernel_cake_minimax_h3_varlen_attention_3f7f340abbf71c6a17d1(const __grid_consta
     // ---- Role: correction_lo ----
     if (warp >= 8 && warp <= 9) {
         { // correction_lo_main
-            unsigned int total_tiles_1 = heads * total_clusters;
-            int owned_row_base = make_warp_uniform(warp % 2 * 32);
+            unsigned int total_tiles_1_0 = heads * total_clusters;
+            int owned_row_base_1_0 = make_warp_uniform(warp % 2 * 32);
             unsigned int _phase_p_empty_0 = 1;
             unsigned int _phase_p_empty_1 = 1;
             unsigned int _phase_corr_sig_lo_0 = 0;
@@ -1598,12 +1799,12 @@ kernel_cake_minimax_h3_varlen_attention_3f7f340abbf71c6a17d1(const __grid_consta
             unsigned int _phase_o_full_0 = 0;
             unsigned int _phase_o_full_1 = 0;
             #pragma unroll 1
-            for (unsigned int tile_idx_1 = cluster_id; tile_idx_1 < total_tiles_1; tile_idx_1 += num_clusters) {
-                int head_1 = cl_head[tile_idx_1];
-                int seg_begin_1 = cl_seg_begin[tile_idx_1];
-                int seg_len_1 = cl_seg_len[tile_idx_1];
-                int kv_base_1 = cl_kv_base[tile_idx_1];
-                int m_block_1 = cl_q_block[tile_idx_1] + cta_rank * 2;
+            for (unsigned int tile_idx_1_0 = cluster_id; tile_idx_1_0 < total_tiles_1_0; tile_idx_1_0 += num_clusters) {
+                int head_1 = cl_head[tile_idx_1_0];
+                int seg_begin_1 = cl_seg_begin[tile_idx_1_0];
+                int seg_len_1 = cl_seg_len[tile_idx_1_0];
+                int kv_base_1 = cl_kv_base[tile_idx_1_0];
+                int m_block_1 = cl_q_block[tile_idx_1_0] + cta_rank * 2;
                 unsigned int num_n_blocks_1 = (seg_len_1 + 128 - 1) / 128;
                 int kv_begin_1 = 0;
                 int ws_slot_1 = -1;
@@ -1624,32 +1825,34 @@ kernel_cake_minimax_h3_varlen_attention_3f7f340abbf71c6a17d1(const __grid_consta
                 _phase_corr_sig_lo_1 ^= 1;
                 mbarrier_arrive(corr_done_addr + 8);
                 #pragma unroll 1
-                for (unsigned int n_iter_1 = 1; n_iter_1 < num_n_blocks_1; n_iter_1++) {
+                for (unsigned int n_iter_1_0 = 1; n_iter_1_0 < num_n_blocks_1; n_iter_1_0++) {
                     mbarrier_wait(corr_sig_lo_addr, _phase_corr_sig_lo_0);
                     _phase_corr_sig_lo_0 ^= 1;
                     mbarrier_wait(p_empty_addr, _phase_p_empty_0);
                     _phase_p_empty_0 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    int logical_row = owned_row_base + lane;
-                    int tmem_row_base = make_warp_uniform(owned_row_base << 16);
+                    int logical_row = owned_row_base_1_0 + lane;
+                    int uniform = make_warp_uniform(owned_row_base_1_0 << 16);
+                    int tmem_row_base = uniform;
                     float scale = row_state[logical_row];
                     int skip_rescale = __all_sync(0xFFFFFFFF, scale == 1.0f);
                     if (skip_rescale == 0) {
                         #pragma unroll
                         for (int col = 0; col < 8; col++) {
-                            int addr = make_warp_uniform(taddr + (unsigned int)128 + (unsigned int)tmem_row_base + (unsigned int)(col * 16));
-                            float _tmem_load_0[16];
-                            tmem_ld_x16(&_tmem_load_0[0], addr);
+                            int uniform_1 = make_warp_uniform(taddr + (unsigned int)128 + (unsigned int)tmem_row_base + (unsigned int)(col * 16));
+                            int addr = uniform_1;
+                            float tmem_load[16];
+                            tmem_ld_x16(&tmem_load[0], addr);
                             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                             const float2 _scale2_0 = {scale, scale};
                             #pragma unroll
                             for (int _ls = 0; _ls < 8; _ls++)
-                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_0)[_ls], _scale2_0);
-                            tmem_st_x16_f32(addr, _tmem_load_0);
+                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(tmem_load)[_ls], _scale2_0);
+                            tmem_st_x16_f32(addr, tmem_load);
                         }
                     }
-                    int skip_rescale_0 = skip_rescale;
-                    if (skip_rescale_0 == 0) {
+                    int skip_rescale_2_0 = skip_rescale;
+                    if (skip_rescale_2_0 == 0) {
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     }
                     asm volatile("tcgen05.fence::before_thread_sync;");
@@ -1662,26 +1865,28 @@ kernel_cake_minimax_h3_varlen_attention_3f7f340abbf71c6a17d1(const __grid_consta
                     mbarrier_wait(p_empty_addr + 8, _phase_p_empty_1);
                     _phase_p_empty_1 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    int logical_row_1 = owned_row_base + lane;
-                    int tmem_row_base_2 = make_warp_uniform(owned_row_base << 16);
+                    int logical_row_1 = owned_row_base_1_0 + lane;
+                    int uniform_0 = make_warp_uniform(owned_row_base_1_0 << 16);
+                    int tmem_row_base_2 = uniform_0;
                     float scale_3 = row_state[logical_row_1 + 128];
                     int skip_rescale_4 = __all_sync(0xFFFFFFFF, scale_3 == 1.0f);
                     if (skip_rescale_4 == 0) {
                         #pragma unroll
                         for (int col_1 = 0; col_1 < 8; col_1++) {
-                            int addr_1 = make_warp_uniform(taddr + (unsigned int)256 + (unsigned int)tmem_row_base_2 + (unsigned int)(col_1 * 16));
-                            float _tmem_load_1[16];
-                            tmem_ld_x16(&_tmem_load_1[0], addr_1);
+                            int uniform_1_1 = make_warp_uniform(taddr + (unsigned int)256 + (unsigned int)tmem_row_base_2 + (unsigned int)(col_1 * 16));
+                            int addr_1 = uniform_1_1;
+                            float tmem_load_1[16];
+                            tmem_ld_x16(&tmem_load_1[0], addr_1);
                             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                             const float2 _scale2_1 = {scale_3, scale_3};
                             #pragma unroll
                             for (int _ls = 0; _ls < 8; _ls++)
-                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_1)[_ls], _scale2_1);
-                            tmem_st_x16_f32(addr_1, _tmem_load_1);
+                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(tmem_load_1)[_ls], _scale2_1);
+                            tmem_st_x16_f32(addr_1, tmem_load_1);
                         }
                     }
-                    skip_rescale_0 = skip_rescale_4;
-                    if (skip_rescale_0 == 0) {
+                    skip_rescale_2_0 = skip_rescale_4;
+                    if (skip_rescale_2_0 == 0) {
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     }
                     asm volatile("tcgen05.fence::before_thread_sync;");
@@ -1710,8 +1915,8 @@ kernel_cake_minimax_h3_varlen_attention_3f7f340abbf71c6a17d1(const __grid_consta
     // ---- Role: correction_hi ----
     if (warp >= 10 && warp <= 11) {
         { // correction_hi_main
-            unsigned int total_tiles_2 = heads * total_clusters;
-            int owned_row_base_1 = make_warp_uniform(64 + warp % 2 * 32);
+            unsigned int total_tiles_1_1 = heads * total_clusters;
+            int owned_row_base_1_1 = make_warp_uniform(64 + warp % 2 * 32);
             unsigned int _phase_p_empty_0_1 = 1;
             unsigned int _phase_p_empty_1_1 = 1;
             unsigned int _phase_corr_sig_hi_0 = 0;
@@ -1719,12 +1924,12 @@ kernel_cake_minimax_h3_varlen_attention_3f7f340abbf71c6a17d1(const __grid_consta
             unsigned int _phase_o_full_0_1 = 0;
             unsigned int _phase_o_full_1_1 = 0;
             #pragma unroll 1
-            for (unsigned int tile_idx_2 = cluster_id; tile_idx_2 < total_tiles_2; tile_idx_2 += num_clusters) {
-                int head_2 = cl_head[tile_idx_2];
-                int seg_begin_2 = cl_seg_begin[tile_idx_2];
-                int seg_len_2 = cl_seg_len[tile_idx_2];
-                int kv_base_2 = cl_kv_base[tile_idx_2];
-                int m_block_2 = cl_q_block[tile_idx_2] + cta_rank * 2;
+            for (unsigned int tile_idx_1_1 = cluster_id; tile_idx_1_1 < total_tiles_1_1; tile_idx_1_1 += num_clusters) {
+                int head_2 = cl_head[tile_idx_1_1];
+                int seg_begin_2 = cl_seg_begin[tile_idx_1_1];
+                int seg_len_2 = cl_seg_len[tile_idx_1_1];
+                int kv_base_2 = cl_kv_base[tile_idx_1_1];
+                int m_block_2 = cl_q_block[tile_idx_1_1] + cta_rank * 2;
                 unsigned int num_n_blocks_2 = (seg_len_2 + 128 - 1) / 128;
                 int kv_begin_2 = 0;
                 int ws_slot_2 = -1;
@@ -1745,32 +1950,34 @@ kernel_cake_minimax_h3_varlen_attention_3f7f340abbf71c6a17d1(const __grid_consta
                 _phase_corr_sig_hi_1 ^= 1;
                 mbarrier_arrive(corr_done_addr + 8);
                 #pragma unroll 1
-                for (unsigned int n_iter_2 = 1; n_iter_2 < num_n_blocks_2; n_iter_2++) {
+                for (unsigned int n_iter_1_1 = 1; n_iter_1_1 < num_n_blocks_2; n_iter_1_1++) {
                     mbarrier_wait(corr_sig_hi_addr, _phase_corr_sig_hi_0);
                     _phase_corr_sig_hi_0 ^= 1;
                     mbarrier_wait(p_empty_addr, _phase_p_empty_0_1);
                     _phase_p_empty_0_1 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    int logical_row_2 = owned_row_base_1 + lane;
-                    int tmem_row_base_1 = make_warp_uniform(owned_row_base_1 << 16);
+                    int logical_row_2 = owned_row_base_1_1 + lane;
+                    int uniform_2 = make_warp_uniform(owned_row_base_1_1 << 16);
+                    int tmem_row_base_1 = uniform_2;
                     float scale_1 = row_state[logical_row_2];
                     int skip_rescale_1 = __all_sync(0xFFFFFFFF, scale_1 == 1.0f);
                     if (skip_rescale_1 == 0) {
                         #pragma unroll
                         for (int col_2 = 0; col_2 < 8; col_2++) {
-                            int addr_2 = make_warp_uniform(taddr + (unsigned int)128 + (unsigned int)tmem_row_base_1 + (unsigned int)(col_2 * 16));
-                            float _tmem_load_2[16];
-                            tmem_ld_x16(&_tmem_load_2[0], addr_2);
+                            int uniform_1_2 = make_warp_uniform(taddr + (unsigned int)128 + (unsigned int)tmem_row_base_1 + (unsigned int)(col_2 * 16));
+                            int addr_2 = uniform_1_2;
+                            float tmem_load_2[16];
+                            tmem_ld_x16(&tmem_load_2[0], addr_2);
                             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                             const float2 _scale2_0 = {scale_1, scale_1};
                             #pragma unroll
                             for (int _ls = 0; _ls < 8; _ls++)
-                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_2)[_ls], _scale2_0);
-                            tmem_st_x16_f32(addr_2, _tmem_load_2);
+                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(tmem_load_2)[_ls], _scale2_0);
+                            tmem_st_x16_f32(addr_2, tmem_load_2);
                         }
                     }
-                    int skip_rescale_0_1 = skip_rescale_1;
-                    if (skip_rescale_0_1 == 0) {
+                    int skip_rescale_2_1 = skip_rescale_1;
+                    if (skip_rescale_2_1 == 0) {
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     }
                     asm volatile("tcgen05.fence::before_thread_sync;");
@@ -1783,26 +1990,28 @@ kernel_cake_minimax_h3_varlen_attention_3f7f340abbf71c6a17d1(const __grid_consta
                     mbarrier_wait(p_empty_addr + 8, _phase_p_empty_1_1);
                     _phase_p_empty_1_1 ^= 1;
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    int logical_row_1_1 = owned_row_base_1 + lane;
-                    int tmem_row_base_2_1 = make_warp_uniform(owned_row_base_1 << 16);
+                    int logical_row_1_1 = owned_row_base_1_1 + lane;
+                    int uniform_1_3 = make_warp_uniform(owned_row_base_1_1 << 16);
+                    int tmem_row_base_2_1 = uniform_1_3;
                     float scale_3_1 = row_state[logical_row_1_1 + 128];
                     int skip_rescale_4_1 = __all_sync(0xFFFFFFFF, scale_3_1 == 1.0f);
                     if (skip_rescale_4_1 == 0) {
                         #pragma unroll
                         for (int col_3 = 0; col_3 < 8; col_3++) {
-                            int addr_3 = make_warp_uniform(taddr + (unsigned int)256 + (unsigned int)tmem_row_base_2_1 + (unsigned int)(col_3 * 16));
-                            float _tmem_load_3[16];
-                            tmem_ld_x16(&_tmem_load_3[0], addr_3);
+                            int uniform_1_0 = make_warp_uniform(taddr + (unsigned int)256 + (unsigned int)tmem_row_base_2_1 + (unsigned int)(col_3 * 16));
+                            int addr_3 = uniform_1_0;
+                            float tmem_load_3[16];
+                            tmem_ld_x16(&tmem_load_3[0], addr_3);
                             asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                             const float2 _scale2_1 = {scale_3_1, scale_3_1};
                             #pragma unroll
                             for (int _ls = 0; _ls < 8; _ls++)
-                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(_tmem_load_3)[_ls], _scale2_1);
-                            tmem_st_x16_f32(addr_3, _tmem_load_3);
+                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(tmem_load_3)[_ls], _scale2_1);
+                            tmem_st_x16_f32(addr_3, tmem_load_3);
                         }
                     }
-                    skip_rescale_0_1 = skip_rescale_4_1;
-                    if (skip_rescale_0_1 == 0) {
+                    skip_rescale_2_1 = skip_rescale_4_1;
+                    if (skip_rescale_2_1 == 0) {
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     }
                     asm volatile("tcgen05.fence::before_thread_sync;");
@@ -1840,16 +2049,16 @@ kernel_cake_minimax_h3_varlen_attention_3f7f340abbf71c6a17d1(const __grid_consta
             unsigned int _phase_p_full_0 = 0;
             unsigned int _phase_p_full_1 = 0;
             if (cta_rank == 0) {
-                unsigned int total_tiles_3 = heads * total_clusters;
+                unsigned int total_tiles_1 = heads * total_clusters;
                 unsigned int k_stage = 0;
                 unsigned int v_stage = 0;
                 #pragma unroll 1
-                for (unsigned int tile_idx_3 = cluster_id; tile_idx_3 < total_tiles_3; tile_idx_3 += num_clusters) {
-                    int head_3 = cl_head[tile_idx_3];
-                    int seg_begin_3 = cl_seg_begin[tile_idx_3];
-                    int seg_len_3 = cl_seg_len[tile_idx_3];
-                    int kv_base_3 = cl_kv_base[tile_idx_3];
-                    int m_block_3 = cl_q_block[tile_idx_3] + cta_rank * 2;
+                for (unsigned int tile_idx_1 = cluster_id; tile_idx_1 < total_tiles_1; tile_idx_1 += num_clusters) {
+                    int head_3 = cl_head[tile_idx_1];
+                    int seg_begin_3 = cl_seg_begin[tile_idx_1];
+                    int seg_len_3 = cl_seg_len[tile_idx_1];
+                    int kv_base_3 = cl_kv_base[tile_idx_1];
+                    int m_block_3 = cl_q_block[tile_idx_1] + cta_rank * 2;
                     unsigned int num_n_blocks_3 = (seg_len_3 + 128 - 1) / 128;
                     int kv_begin_3 = 0;
                     int ws_slot_3 = -1;
@@ -1907,7 +2116,7 @@ kernel_cake_minimax_h3_varlen_attention_3f7f340abbf71c6a17d1(const __grid_consta
                     if (k_stage == 4) { k_stage = 0; _phase_k_full ^= 1; }
                     unsigned int first_pv = 1;
                     #pragma unroll 1
-                    for (unsigned int n_iter_3 = 0; n_iter_3 < num_n_blocks_3 - 1; n_iter_3++) {
+                    for (unsigned int n_iter_1 = 0; n_iter_1 < num_n_blocks_3 - 1; n_iter_1++) {
                         int first_pv_flag = first_pv;
                         mbarrier_wait(v_full_addr + (v_stage) * 8, _phase_v_full);
                         mbarrier_wait(k_full_addr + (k_stage) * 8, _phase_k_full);
@@ -2111,17 +2320,17 @@ kernel_cake_minimax_h3_varlen_attention_3f7f340abbf71c6a17d1(const __grid_consta
     // ---- Role: load ----
     if (warp == 13) {
         { // load_main
-            unsigned int total_tiles_4 = heads * total_clusters;
+            unsigned int total_tiles_2 = heads * total_clusters;
             unsigned int k_load_stage = 0;
             unsigned int _phase_q_empty_0 = 1;
             unsigned int _phase_k_empty = 1;
             #pragma unroll 1
-            for (unsigned int tile_idx_4 = cluster_id; tile_idx_4 < total_tiles_4; tile_idx_4 += num_clusters) {
-                int head_4 = cl_head[tile_idx_4];
-                int seg_begin_4 = cl_seg_begin[tile_idx_4];
-                int seg_len_4 = cl_seg_len[tile_idx_4];
-                int kv_base_4 = cl_kv_base[tile_idx_4];
-                int m_block_4 = cl_q_block[tile_idx_4] + cta_rank * 2;
+            for (unsigned int tile_idx_2 = cluster_id; tile_idx_2 < total_tiles_2; tile_idx_2 += num_clusters) {
+                int head_4 = cl_head[tile_idx_2];
+                int seg_begin_4 = cl_seg_begin[tile_idx_2];
+                int seg_len_4 = cl_seg_len[tile_idx_2];
+                int kv_base_4 = cl_kv_base[tile_idx_2];
+                int m_block_4 = cl_q_block[tile_idx_2] + cta_rank * 2;
                 unsigned int num_n_blocks_4 = (seg_len_4 + 128 - 1) / 128;
                 int kv_begin_4 = 0;
                 int ws_slot_4 = -1;
@@ -2171,16 +2380,16 @@ kernel_cake_minimax_h3_varlen_attention_3f7f340abbf71c6a17d1(const __grid_consta
     // ---- Role: v_load ----
     if (warp == 14) {
         { // v_load_main
-            unsigned int total_tiles_5 = heads * total_clusters;
+            unsigned int total_tiles_3 = heads * total_clusters;
             unsigned int v_load_stage = 0;
             unsigned int _phase_v_empty = 1;
             #pragma unroll 1
-            for (unsigned int tile_idx_5 = cluster_id; tile_idx_5 < total_tiles_5; tile_idx_5 += num_clusters) {
-                int head_5 = cl_head[tile_idx_5];
-                int seg_begin_5 = cl_seg_begin[tile_idx_5];
-                int seg_len_5 = cl_seg_len[tile_idx_5];
-                int kv_base_5 = cl_kv_base[tile_idx_5];
-                int m_block_5 = cl_q_block[tile_idx_5] + cta_rank * 2;
+            for (unsigned int tile_idx_3 = cluster_id; tile_idx_3 < total_tiles_3; tile_idx_3 += num_clusters) {
+                int head_5 = cl_head[tile_idx_3];
+                int seg_begin_5 = cl_seg_begin[tile_idx_3];
+                int seg_len_5 = cl_seg_len[tile_idx_3];
+                int kv_base_5 = cl_kv_base[tile_idx_3];
+                int m_block_5 = cl_q_block[tile_idx_3] + cta_rank * 2;
                 unsigned int num_n_blocks_5 = (seg_len_5 + 128 - 1) / 128;
                 int kv_begin_5 = 0;
                 int ws_slot_5 = -1;
