@@ -569,9 +569,10 @@ def test_stage_table_builds_every_stage_from_the_shared_launcher():
     libraries = cake_build.libraries_by_name()
     package = Path(cake_build.__file__).parent
     # 4 + 15 BF16 stages, their 19 FP8 twins, 2 quantizers, then the 19 + 19 GQA stages, the
-    # two round-2 FP8 GQA programs (attention_fp8_gqa_xs_queue, small_fp8_gqa_k4p2) and the
-    # round-16 position-selected FP8 GQA static program (attention_fp8_gqa_pin)
-    assert len(loader.STAGES) == 81 and set(loader.STAGES) == set(loader.MODULES)
+    # two round-2 FP8 GQA programs (attention_fp8_gqa_xs_queue, small_fp8_gqa_k4p2), the
+    # round-16 position-selected FP8 GQA static program (attention_fp8_gqa_pin) and the
+    # round-17 planner-routed second BF16 GQA queue program (attention_gqa_queue_vf)
+    assert len(loader.STAGES) == 82 and set(loader.STAGES) == set(loader.MODULES)
     referenced = set()
     for stage in loader.STAGES:
         record = loader.stage_record(stage)
@@ -679,13 +680,15 @@ def test_stage_table_geometry_matches_the_stage_names():
                 base += "_gqa"
             assert stage.startswith(base)
             # the shared-transposer program is a queue program of the FP8 GQA family (round 2); it states xshare;
-            # the position-selected program is a static program of the same family (round 16); it states pin
+            # the position-selected program is a static program of the same family (round 16); it states pin;
+            # the second queue program is a queue program of the BF16 GQA family (round 17); it states vf
             xshare = stage == f"{base}_xs_queue"
             pin = stage == f"{base}_pin"
+            vf = stage == f"{base}_queue_vf"
             expected_route = {
                 "compact": stage == f"{base}_compact",
                 "kind": "persistent",
-                "queue": stage == f"{base}_queue" or xshare,
+                "queue": stage == f"{base}_queue" or xshare or vf,
                 "tagged": stage == f"{base}_tagged",
             }
             if fp8:
@@ -698,6 +701,9 @@ def test_stage_table_geometry_matches_the_stage_names():
             if pin:
                 assert fp8 and gqa
                 expected_route["pin"] = True
+            if vf:
+                assert gqa and not fp8
+                expected_route["vf"] = True
             assert route == expected_route
             assert stage == loader.persistent_stage(
                 route["queue"],
@@ -707,6 +713,7 @@ def test_stage_table_geometry_matches_the_stage_names():
                 gqa=gqa,
                 xshare=route.get("xshare", False),
                 pin=route.get("pin", False),
+                vf=route.get("vf", False),
             )
             assert ("parameter", "g_shift") not in plan and "g_shift" not in record[
                 "logical"
@@ -851,11 +858,14 @@ def test_stage_table_geometry_matches_the_stage_names():
     }
     assert loader.QUANTIZE_STAGES == ("quantize_qk_vamax", "quantize_v")
     # The GQA stages: one per MHA attention stage of each data type, named by the same rule with ``gqa``.
+    # ... plus the planner-routed second BF16 queue stage (round 17), the BF16 GQA stage
+    # without an MHA twin of its own keywords
     assert set(loader.GQA_PERSISTENT_STAGES) == {
         "attention_gqa",
         "attention_gqa_queue",
         "attention_gqa_compact",
         "attention_gqa_tagged",
+        "attention_gqa_queue_vf",
     }
     assert set(loader.GQA_SMALL_STAGES) == {
         stage.replace("small_", "small_gqa_") for stage in loader.SMALL_STAGES
@@ -876,7 +886,7 @@ def test_stage_table_geometry_matches_the_stage_names():
     } | {"small_fp8_gqa_k4p2"}
     assert len(loader.PERSISTENT_STAGES) + len(loader.SMALL_STAGES) == 19
     assert len(loader.FP8_PERSISTENT_STAGES) + len(loader.FP8_SMALL_STAGES) == 19
-    assert len(loader.GQA_PERSISTENT_STAGES) + len(loader.GQA_SMALL_STAGES) == 19
+    assert len(loader.GQA_PERSISTENT_STAGES) + len(loader.GQA_SMALL_STAGES) == 20
     assert (
         len(loader.FP8_GQA_PERSISTENT_STAGES) + len(loader.FP8_GQA_SMALL_STAGES) == 22
     )
@@ -899,12 +909,13 @@ def test_stage_table_geometry_matches_the_stage_names():
         + loader.FP8_SMALL_STAGES
         + loader.QUANTIZE_STAGES
     )
-    # (the two round-2 programs and the round-16 program appended after the 38 GQA records, in
-    # this order)
+    # (the two round-2 programs, the round-16 program and the round-17 program appended after
+    # the 38 GQA records, in this order)
     appended = (
         "attention_fp8_gqa_xs_queue",
         "small_fp8_gqa_k4p2",
         "attention_fp8_gqa_pin",
+        "attention_gqa_queue_vf",
     )
     assert loader.STAGES[40:78] == tuple(
         stage
@@ -982,7 +993,11 @@ def test_stage_table_geometry_matches_the_stage_names():
     assert b["arg_plan"] == a["arg_plan"] and b["logical"] == a["logical"]
     assert b["launch"] == a["launch"] and b["grid_rule"] == a["grid_rule"]
     assert b["workspace_rule"] is None and b["library"] != a["library"]
-    assert loader.STAGES[-2:] == ("small_fp8_gqa_k4p2", "attention_fp8_gqa_pin")
+    assert loader.STAGES[-3:] == (
+        "small_fp8_gqa_k4p2",
+        "attention_fp8_gqa_pin",
+        "attention_gqa_queue_vf",
+    )
     assert loader.small_stage(4, fp8=True, gqa=True, prefetch=2) == "small_fp8_gqa_k4p2"
     assert loader.small_stage(4, fp8=True, gqa=True) == "small_fp8_gqa_k4"
     with pytest.raises(ValueError, match="unknown Cake SM90 VSA stage"):
@@ -1045,7 +1060,7 @@ def test_build_manifest_pins_the_numerics_flags():
     assert not any(
         flag.startswith(numerics) for flag in manifest["common"]["nvcc_flags"]
     )
-    assert len(manifest["libraries"]) == 81
+    assert len(manifest["libraries"]) == 82
     for entry in manifest["libraries"]:
         assert entry["nvcc_flags"] == ["--use_fast_math"], entry["name"]
         assert entry["nvcc_flags_if"] == [], entry["name"]
@@ -1974,6 +1989,70 @@ def test_plan_pin_route_rule(monkeypatch):
     monkeypatch.setattr(module, "PIN_MIN_CTA_LOOP_ITERS", short["cta_loop_iters"])
     assert plan_vsa_sm90(short_mask, sms=132, gqa=g)["pin"] is True
     assert plan_vsa_sm90(_replicated(short_mask, g), sms=132)["pin"] is False
+
+
+def test_plan_queue_vf_route_rule(monkeypatch):
+    """Pair-mode BF16 grouped-query queue plans of long tiles (at least QUEUE_VF_MIN_TILE_POS ring
+    positions) whose lightest CTA runs at least QUEUE_VF_MIN_CTA_LOOP_ITERS main-loop iterations
+    carry ``queue_vf`` True and take the planner-routed second queue program
+    (``attention_gqa_queue_vf``: h12-m109632-n109632-k64 at g = 4); pooled plans of short tiles,
+    static plans and every MHA plan carry ``queue_vf`` False and keep their programs.  The planner
+    decides the key inside the plan and ``bf16_gqa_queue_vf`` reads it; the kernel-tests reference
+    planner states the same statistic."""
+    module = planner
+
+    assert planner.QUEUE_VF_MIN_TILE_POS == 24
+    assert planner.QUEUE_VF_MIN_CTA_LOOP_ITERS == 440
+    g = 4
+    long_mask = _topk_mask(
+        3, 1713, 1713, 64
+    )  # h12-m109632-n109632-k64 at g = 4: 64-position tiles
+    long = plan_vsa_sm90(long_mask, sms=132, gqa=g)
+    assert long["mode"] == "pair" and long["queue"] and not long["compact"]
+    assert not long["tagged"] and long["gqa"] == g and long["pin"] is False
+    assert long["cta_loop_iters"] >= planner.QUEUE_VF_MIN_CTA_LOOP_ITERS
+    assert long["queue_vf"] is True
+    assert planner.bf16_gqa_queue_vf(long) is True
+    # the Sage-FP8 route of the same head-pair queue plan takes the shared-transposer program;
+    # the second queue program is a BF16 program only
+    assert planner.fp8_gqa_xshare(long) is True and planner.fp8_gqa_pin(long) is False
+    # head-pair tiles: both warpgroups own every position.  The pool tiles of a queue plan are
+    # handed out at run time, so the plan statistic (taken over the planner's own lists) is not
+    # the round-robin preview's; the preview's lightest CTA also clears the threshold
+    lightest = min(sum(p - 1 for _, p in tiles) for tiles in _cta_tiles(long))
+    assert lightest >= planner.QUEUE_VF_MIN_CTA_LOOP_ITERS
+    # h8-m32768-n32768-k32 at g = 4: a queue plan of 16-position tiles stays on the queue program
+    short_mask = _topk_mask(2, 512, 512, 32)
+    short = plan_vsa_sm90(short_mask, sms=132, gqa=g)
+    assert short["queue"] and short["queue_vf"] is False
+    assert planner.bf16_gqa_queue_vf(short) is False
+    # 2112 head-pair tiles of <= 4 positions: the pooled queue plan of the bitwise test
+    pooled = plan_vsa_sm90(_topk_mask(2, 528, 64, 8), sms=132, gqa=g)
+    assert pooled["queue"] and pooled["queue_vf"] is False
+    # static plans never take it
+    static = plan_vsa_sm90(_topk_mask(2, 64, 64, 32), sms=132, gqa=g)
+    assert not static["queue"] and static["queue_vf"] is False
+    mha = plan_vsa_sm90(_replicated(long_mask, g), sms=132)
+    assert mha["gqa"] == 1 and mha["queue_vf"] is False
+    assert planner.bf16_gqa_queue_vf(mha) is False
+    # the key is read, never recomputed: no key or an MHA plan is an unrouted plan
+    assert planner.bf16_gqa_queue_vf({"gqa": 4}) is False
+    assert planner.bf16_gqa_queue_vf({"gqa": 1, "queue_vf": True}) is False
+    # the threshold is the route; the plan bytes do not depend on it
+    monkeypatch.setattr(module, "QUEUE_VF_MIN_CTA_LOOP_ITERS", 10**9)
+    off = plan_vsa_sm90(long_mask, sms=132, gqa=g)
+    assert off["queue_vf"] is False and off["cta_loop_iters"] == long["cta_loop_iters"]
+    assert torch.equal(off["meta"], long["meta"])
+    assert torch.equal(off["hdr"], long["hdr"])
+    monkeypatch.setattr(module, "QUEUE_VF_MIN_CTA_LOOP_ITERS", 1)
+    assert plan_vsa_sm90(long_mask, sms=132, gqa=g)["queue_vf"] is True
+    # the position threshold holds on its own: 16-position tiles stay unrouted at any loop count
+    assert plan_vsa_sm90(short_mask, sms=132, gqa=g)["queue_vf"] is False
+    assert plan_vsa_sm90(_replicated(long_mask, g), sms=132)["queue_vf"] is False
+    # without the queue there is no second queue program
+    monkeypatch.setattr(module, "POOL_MIN_TILES", 10**9)
+    unpooled = plan_vsa_sm90(long_mask, sms=132, gqa=g)
+    assert not unpooled["queue"] and unpooled["queue_vf"] is False
 
 
 def test_plan_ragged_queue_threshold_and_pool_order():
@@ -3783,6 +3862,104 @@ def test_gqa_routes_match_the_mha_route_on_replicated_inputs(
         gqa.run(q, k_rep, v)
     with pytest.raises(ValueError, match=rf"q must have shape \({h}, {mb * 64}, 128\)"):
         gqa.run(q[:h_kv], k, v)
+
+
+def test_bf16_gqa_queue_vf_route_takes_long_pair_queue_plans_only():
+    """``persistent_stage`` names the second queue program for the BF16 GQA queue route with ``vf``
+    only; the Sage-FP8 route, MHA, static, compact and tagged forms and the shared-transposer /
+    position-selected combinations refuse it."""
+    assert (
+        loader.persistent_stage(True, False, False, gqa=True, vf=True)
+        == "attention_gqa_queue_vf"
+    )
+    assert (
+        loader.persistent_stage(True, False, False, gqa=True) == "attention_gqa_queue"
+    )
+    assert (
+        loader.stage_gqa("attention_gqa_queue_vf")
+        and loader.stage_dtype("attention_gqa_queue_vf") == "bf16"
+    )
+    record = loader.stage_record("attention_gqa_queue_vf")
+    twin = loader.stage_record("attention_gqa_queue")
+    assert record["route"] == {**twin["route"], "vf": True}
+    assert record["launch"] == twin["launch"] and record["library"] != twin["library"]
+    with pytest.raises(ValueError, match="second queue program"):
+        loader.persistent_stage(True, False, False, fp8=True, gqa=True, vf=True)
+    with pytest.raises(ValueError, match="second queue program"):
+        loader.persistent_stage(True, False, False, gqa=False, vf=True)
+    for queue, compact, tagged in (
+        (False, False, False),
+        (False, True, False),
+        (False, False, True),
+    ):
+        with pytest.raises(ValueError, match="second queue program"):
+            loader.persistent_stage(queue, compact, tagged, gqa=True, vf=True)
+    with pytest.raises(ValueError):
+        loader.persistent_stage(
+            True, False, False, fp8=True, gqa=True, xshare=True, vf=True
+        )
+    with pytest.raises(ValueError):
+        loader.persistent_stage(
+            False, False, False, fp8=True, gqa=True, pin=True, vf=True
+        )
+
+
+@requires_hopper
+def test_gqa_queue_vf_kernel_matches_the_queue_kernel_bit_exact(
+    monkeypatch, record_property
+):
+    """The second queue program waits for the same V^T slot and generation later in the same iteration:
+    bit-identical to the queue program on the same plan (same CTAs, same meta / hdr bytes), the queue
+    words return to zero after every launch and a captured graph replays it."""
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    chosen = None
+    # long 64-position tiles at g = 4 / g = 8; the first plan the planner routes to the program on this GPU
+    for h_kv, mb, nb, k, g in (
+        (1, 512, 512, 64, 8),
+        (3, 512, 512, 64, 4),
+        (2, 1182, 1182, 64, 4),
+    ):
+        h = g * h_kv
+        mask = _topk_mask(h_kv, mb, nb, k).cuda()
+        routed = CakeVsaSm90Plan(
+            "cuda", mask, *_descriptors_of(mask), h, h_kv, 128, route="persistent"
+        )
+        if routed.stage == "attention_gqa_queue_vf":
+            chosen = (h, h_kv, mb, nb, mask, routed)
+            break
+    if chosen is None:
+        pytest.skip(f"{sms} SMs: no candidate plan reaches QUEUE_VF_MIN_CTA_LOOP_ITERS")
+    h, h_kv, mb, nb, mask, routed = chosen
+    record_property("vf_shape", f"h{h}-mb{mb}-nb{nb}-k{k}-g{h // h_kv}")
+    record_property("vf_num_ctas", int(routed.num_ctas))
+    q, k_, v = _gqa_inputs(h, h_kv, mb, nb)
+    out = torch.empty((h * mb * 64, 1, 128), device="cuda", dtype=q.dtype)
+    assert _cuda_kernel_names(lambda: routed.run(q, k_, v, out=out)) == [
+        loader.MODULES["attention_gqa_queue_vf"]["kernel_symbol"]
+    ]
+    first = routed.run(q, k_, v, out=out).clone()
+    torch.cuda.synchronize()
+    assert int(routed.dbg[62:64].abs().sum()) == 0
+    # the threshold is the route: above every loop count the planner keeps the queue program on the same plan
+    monkeypatch.setattr(planner, "QUEUE_VF_MIN_CTA_LOOP_ITERS", 10**9)
+    queued = CakeVsaSm90Plan(
+        "cuda", mask, *_descriptors_of(mask), h, h_kv, 128, route="persistent"
+    )
+    assert queued.queue and queued.stage == "attention_gqa_queue"
+    assert queued.num_ctas == routed.num_ctas
+    assert _cuda_kernel_names(lambda: queued.run(q, k_, v, out=out)) == [
+        loader.MODULES["attention_gqa_queue"]["kernel_symbol"]
+    ]
+    torch.testing.assert_close(queued.run(q, k_, v), first, atol=0, rtol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        routed.run(q, k_, v, out=out)
+    for _ in range(3):
+        out.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out.view_as(q), first, atol=0, rtol=0)
+        assert int(routed.dbg[62:64].abs().sum()) == 0
 
 
 @requires_hopper

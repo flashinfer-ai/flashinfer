@@ -126,6 +126,7 @@ from .cake_planner import (  # noqa: F401
     SPLIT_CLUSTER_VARIANTS,
     SPLIT_KMAX_VARIANTS,
     _FP32_MAX,
+    bf16_gqa_queue_vf,
     cluster_capacity,
     cluster_cost,
     cluster_variant_for,
@@ -515,6 +516,10 @@ class CakeVsaSm90Plan:
                 # ... and static plans whose lightest CTA runs at least PIN_MIN_CTA_LOOP_ITERS
                 # main-loop iterations on the position-selected static program (a plan key)
                 pin=self.fp8 and fp8_gqa_pin(plan),
+                # ... and the BF16 route runs pair-mode queue plans of long tiles whose
+                # lightest CTA runs at least QUEUE_VF_MIN_CTA_LOOP_ITERS main-loop
+                # iterations on the planner-routed second queue program (a plan key)
+                vf=(not self.fp8) and bf16_gqa_queue_vf(plan),
             )
             rule = _loader.workspace_rule(self.stage)
             assert rule is not None and rule["kind"] == "persistent"
@@ -836,6 +841,7 @@ __all__ = [
     "SUPPORTED_COMPUTE_CAPABILITIES",
     "CakeVsaSm90Plan",
     "arch_for_capability",
+    "bf16_gqa_queue_vf",
     "cluster_capacity",
     "cluster_variant_for",
     "create_plan",
