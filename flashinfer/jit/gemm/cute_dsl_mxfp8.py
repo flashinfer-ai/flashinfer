@@ -20,8 +20,6 @@ Warp split-K uses a separate experimental compiler and specializes on N/K;
 it remains JIT-compiled rather than adding an unbounded shape inventory.
 """
 
-from itertools import product
-
 import torch
 
 from ..cute_dsl_aot import CuteDslAOTOperation
@@ -30,7 +28,12 @@ MM_MXFP8_AOT_ARCHS = frozenset({"sm100a", "sm103a", "sm107a"})
 
 
 def mm_mxfp8_aot_configs(arch: str) -> dict[str, tuple]:
-    """Cover persistent tiles, both prefetch settings, and low-M cluster splits."""
+    """Cover vLLM's MXFP8 dtypes with persistent and cluster split-K tactics.
+
+    The public mm_mxfp8 API enables PDL for SM100-family runners; native
+    Rubin has a separate non-PDL interface. Both output dtypes are used by
+    vLLM v0.32.0.
+    """
     if arch not in MM_MXFP8_AOT_ARCHS:
         return {}
     import cutlass
@@ -79,8 +82,8 @@ def mm_mxfp8_aot_configs(arch: str) -> dict[str, tuple]:
                         (SplitK.mma_tiler_mn_for_m(m), (1, 1), True, False, slices)
                     )
         keys = [
-            _mm_mxfp8_cache_key(tactic, pdl, dtype)
-            for tactic, pdl in product(sorted(tactics, key=repr), (False, True))
+            _mm_mxfp8_cache_key(tactic, True, dtype)
+            for tactic in sorted(tactics, key=repr)
         ]
         if arch == "sm107a":
             keys.extend(

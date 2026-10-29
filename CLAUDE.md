@@ -1087,6 +1087,8 @@ python -m build --no-isolation --wheel flashinfer-jit-cache
 Provider builds explicitly enable `add_cute_dsl`; generic AOT builds default it
 to false. Matching CuTe objects also require the builder's Python ABI, Torch,
 TVM-FFI, and DSL fingerprint; otherwise runtime falls back to JIT.
+CuTe GEMM exports cover vLLM v0.32.0 API modes while retaining autotuning
+tactics. Other API modes remain available through runtime JIT.
 
 The provider build runs `flashinfer/aot.py`, which calls the registered
 `gen_*_module()` functions and pre-compiles them for exactly one architecture.

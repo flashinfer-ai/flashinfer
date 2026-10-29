@@ -24,7 +24,11 @@ MM_FP4_AOT_ARCHS = frozenset({"sm100a", "sm103a", "sm107a"})
 
 
 def mm_fp4_aot_configs(arch: str) -> dict[str, tuple]:
-    """Enumerate every runtime FP4 specialization, before autotune ranking.
+    """Enumerate vLLM's FP4 API modes across the full autotuning tactic space.
+
+    vLLM v0.32.0 uses scalar alpha and the default enabled PDL with both
+    FP4 formats and output dtypes. Other API modes remain available through
+    runtime JIT.
 
     Shapes and occupancy are runtime arguments. Three aligned representative
     shapes expose the full tactic space: narrow-N SM100 tactics require at
@@ -41,16 +45,13 @@ def mm_fp4_aot_configs(arch: str) -> dict[str, tuple]:
         _blockscaled_kernel_disk_name,
         _mm_fp4_cache_key,
         mm_fp4_l2_policy,
-        per_token_alpha_mode,
     )
 
     sm_version = int(arch[2:-1])
     _get_mm_fp4_kernel_classes(sm_version, require_native=True)
 
     configs: dict[str, tuple] = {}
-    for use_nvfp4, dtype, pdl in product(
-        (True, False), (torch.float16, torch.bfloat16), (False, True)
-    ):
+    for use_nvfp4, dtype in product((True, False), (torch.float16, torch.bfloat16)):
         sf_vec_size = 16 if use_nvfp4 else 32
         tactics = set()
         for m, n in ((32, 8192), (8192, 32), (8192, 8192)):
@@ -67,21 +68,15 @@ def mm_fp4_aot_configs(arch: str) -> dict[str, tuple]:
             )
         for tactic in sorted(tactics, key=repr):
             tile, _, swap, _, kernel_type, _ = tactic
-            # Both L2 regions for every persistent tactic, and both alpha
-            # modes where the public API serves per-token alpha.
+            # Both L2 regions for every persistent tactic.
             policies = {mm_fp4_l2_policy(m, tile, swap, kernel_type) for m in (1, 8192)}
-            alpha_modes = (
-                (False, True)
-                if kernel_type in ("sm100", "sm100sk") and sm_version != 107
-                else (False,)
-            )
-            for policy, per_token in product(sorted(policies, key=str), alpha_modes):
+            for policy in sorted(policies, key=str):
                 key = _mm_fp4_cache_key(
                     sf_vec_size,
                     tactic,
-                    pdl,
+                    True,
                     dtype,
-                    per_token_alpha_mode(per_token, swap),
+                    None,
                     policy,
                 )
                 name = _blockscaled_kernel_disk_name(key, 1, None)
