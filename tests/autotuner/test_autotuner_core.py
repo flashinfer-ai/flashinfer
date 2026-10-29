@@ -2013,6 +2013,68 @@ def test_search_cache_top_bucket_fallback_only_above_tuned_range():
         tuner.is_tuning_mode = False
 
 
+def test_search_cache_top_bucket_fallback_with_negative_dim_idx():
+    """A spec may address its dynamic dim from the end (dim_idx=(-2,) is M of
+    an (M, K) operand); that dim must still count as dynamic, not static."""
+    tuner = reset_autotuner()
+    runner = DummyRunner()
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(-2,),
+                gen_tuning_buckets=(128, 512),
+                map_to_tuning_buckets=next_positive_power_of_2,
+            ),
+        ),
+    )
+    for bucket, tactic in ((128, 0), (512, 1)):
+        key = AutoTuner._get_cache_key(
+            "top_bucket_neg", runner, ((bucket, 16),), config
+        )
+        tuner.profiling_cache[key] = (tactic, None)
+
+    def lookup(m, n=16):
+        return tuner.search_cache("top_bucket_neg", [runner], ((m, n),), config)
+
+    miss = (False, 0, -1, None)
+    assert lookup(1000) == (True, 0, 1, None)  # bucket 1024 > 512
+    assert lookup(200) == miss  # bucket 256 lies between tuned buckets
+    assert lookup(1000, n=32) == miss  # the other dim is still static
+
+
+def test_search_cache_top_bucket_fallback_with_linked_dims():
+    """One spec can tie the dynamic dim of several inputs (as the MoE runners
+    do); the clamped profile moves all of them together."""
+    tuner = reset_autotuner()
+    runner = DummyRunner()
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0, 1),
+                dim_idx=(0, 0),
+                gen_tuning_buckets=(128, 512),
+                map_to_tuning_buckets=next_positive_power_of_2,
+            ),
+        ),
+    )
+    for bucket, tactic in ((128, 0), (512, 1)):
+        key = AutoTuner._get_cache_key(
+            "top_bucket_linked", runner, ((bucket, 16), (bucket, 8)), config
+        )
+        tuner.profiling_cache[key] = (tactic, None)
+
+    def lookup(m, n=8):
+        return tuner.search_cache(
+            "top_bucket_linked", [runner], ((m, 16), (m, n)), config
+        )
+
+    miss = (False, 0, -1, None)
+    assert lookup(1000) == (True, 0, 1, None)  # both inputs clamp to 512
+    assert lookup(200) == miss  # bucket 256 lies between tuned buckets
+    assert lookup(1000, n=4) == miss  # static dim of the second input
+
+
 def test_search_cache_top_bucket_from_file_configs_matches_extras():
     """Loaded file configs count toward the top bucket only when their
     cache-key extras match the lookup's."""

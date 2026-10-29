@@ -2603,8 +2603,13 @@ class AutoTuner:
 
         requested = self._find_nearest_profile(input_shapes, tuning_config)
         # (input_idx, dim_idx) pairs of each spec; linked dims share a bucket.
+        # dim_idx may be negative (e.g. -2 for M of an (M, K) operand).
         spec_dims = [
-            tuple(zip(spec.input_idx, spec.dim_idx, strict=True)) for spec in specs
+            tuple(
+                (i, d % len(requested[i]))
+                for i, d in zip(spec.input_idx, spec.dim_idx, strict=True)
+            )
+            for spec in specs
         ]
         dynamic = {dim for dims in spec_dims for dim in dims}
 
