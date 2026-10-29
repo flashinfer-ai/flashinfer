@@ -4829,11 +4829,12 @@ def test_source_program_table_names_shipped_sources():
         "exactone_bf16_varlen_tablefirstunit",
         "exactone_f32_varlen_tablefirstunit",
         "exactone_f32_varlen_tablerolesunit",
-    }
+    } | {f"exactpre_{state}_varlen_wrap" for state in ("bf16", "f32")}
     # The sm_107a-only programs (the claim programs, the two-kernel and fused
-    # initial-state bulk programs, the two-kernel one-CTA pair programs, the
-    # one-launch programs in the tablefirst / tableroles prologue forms, the
-    # fused batched z-prefetch programs and the one-CTA-cluster twins): their
+    # initial-state bulk programs, the two-kernel one-CTA pair and wrap-plan
+    # programs, the one-launch programs in the tablefirst / tableroles prologue
+    # forms, the fused batched z-prefetch programs and the one-CTA-cluster
+    # twins): their
     # ``_SM107_MODULES`` entry is their sole source.
     assert {
         "exactpre_bf16_varlen_claim",
@@ -4858,6 +4859,8 @@ def test_source_program_table_names_shipped_sources():
         "exactone_bf16_varlen_tablefirstunit",
         "exactone_f32_varlen_tablefirstunit",
         "exactone_f32_varlen_tablerolesunit",
+        "exactpre_bf16_varlen_wrap",
+        "exactpre_f32_varlen_wrap",
     } == module._SM107_ONLY_PROGRAMS
     assert set(module._SCAN_MODULES) == {
         name for name in module._PROGRAMS if name.startswith("exact_")
@@ -4932,7 +4935,7 @@ def test_source_program_table_names_shipped_sources():
         }
         | module._SM107_ONLY_PROGRAMS
     )
-    assert len(module._SM107_MODULES) == 62
+    assert len(module._SM107_MODULES) == 64
     assert set(module._SM107_MODULES) <= set(module._PROGRAMS)
     assert set(module._PROGRAMS) - set(module._SM107_MODULES) == {
         name for name in module._PROGRAMS if name.startswith(("exact_", "exactmeta_"))
@@ -5014,6 +5017,7 @@ def test_source_program_table_names_shipped_sources():
                 "unit",
                 "tablefirstunit",
                 "tablerolesunit",
+                "wrap",
             )
             assert family in (
                 "exact",
@@ -5045,6 +5049,9 @@ def test_source_program_table_names_shipped_sources():
             if variant_name == "unit":
                 assert family == "exactpre" and mode == "varlen"
                 assert state_key in ("bf16", "f32")
+            if variant_name == "wrap":
+                assert family == "exactpre" and mode == "varlen"
+                assert state_key in ("bf16", "f32")
             sm107_only = (
                 "claim",
                 "ibulk",
@@ -5055,6 +5062,7 @@ def test_source_program_table_names_shipped_sources():
                 "unit",
                 "tablefirstunit",
                 "tablerolesunit",
+                "wrap",
             )
             assert (variant_name in sm107_only) == (name in module._SM107_ONLY_PROGRAMS)
             smem_bytes = module._VARIANT_SMEM_BYTES[(family, variant_name)]
@@ -5071,6 +5079,7 @@ def test_source_program_table_names_shipped_sources():
                     ("exactpre", "claim"): module._EXACTPRE_CLAIM_SMEM_BYTES,
                     ("exactpre", "ibulk"): module._EXACTPRE_IBULK_SMEM_BYTES,
                     ("exactpre", "tailone"): module._EXACTPRE_TAILONE_SMEM_BYTES,
+                    ("exactpre", "wrap"): module._EXACTPRE_TAILONE_SMEM_BYTES,
                     ("exactfused", "ibulk"): module._EXACTFUSED_IBULK_SMEM_BYTES,
                     ("exactfused", "zpf"): module._EXACTFUSED_SMEM_BYTES,
                     ("exactpre", "unit"): module._EXACTPRE_SMEM_BYTES,
@@ -7312,9 +7321,9 @@ def test_source_exact_scan_variant_programs():
     )
     # the two-kernel family: six ring and six ``_tail`` programs, no ``_noring``,
     # and the sm_107a-only programs: two ``_claim``, two ``_ibulk``, three
-    # ``_tailone`` and two ``_unit``
+    # ``_tailone``, two ``_unit`` and two ``_wrap``
     assert (
-        len([name for name in module._PROGRAMS if name.startswith("exactpre_")]) == 21
+        len([name for name in module._PROGRAMS if name.startswith("exactpre_")]) == 23
     )
     assert not any(name.endswith("_noring") for name in module._EXACTPRE_MODULES)
     assert len([name for name in module._PROGRAMS if name.startswith("chunkpar_")]) == 6
@@ -7333,7 +7342,7 @@ def test_source_exact_scan_variant_programs():
     assert (
         len([name for name in module._PROGRAMS if name.startswith("exactone_")]) == 14
     )
-    assert len(module._PROGRAMS) == 78
+    assert len(module._PROGRAMS) == 80
 
 
 @pytest.mark.parametrize(
@@ -7916,6 +7925,82 @@ def test_source_sm107_short_varlen_pair_calls_take_the_one_cta_pair_program(
     status = launch["main"]["preprocess_status"]
     assert tuple(status.shape) == (2 + 106 + 4,) and status.dtype == torch.int32
     assert launch["preprocess"]["preprocess_status"] is status
+
+
+@pytest.mark.parametrize("state", ("bf16", "f32"))
+@pytest.mark.parametrize("has_z", (False, True))
+@pytest.mark.parametrize(
+    ("num_seqs", "tokens", "nheads", "variant"),
+    (
+        # perf_varlen_32x32: 256 items of 32 chunks, a pair-rule call
+        (32, 4096, 8, "wrap"),
+        # 320 items of 32 chunks, a ring call
+        (20, 4096, 16, "wrap"),
+        # 448 items of 16 chunks
+        (56, 1950, 8, "wrap"),
+    ),
+)
+def test_source_sm107_long_varlen_calls_take_the_wrap_program(
+    monkeypatch, state, has_z, num_seqs, tokens, nheads, variant
+):
+    """On SM107 a packed-varlen call without z of 32 sequences x 4096 tokens
+    x 8 heads, 20 sequences x 4096 tokens x 16 heads or 56 sequences x 1950
+    tokens x 8 heads (256 / 320 items of 32 chunks, 448 items of 16 chunks on
+    212 SMs) runs the wrap program of its bf16 / f32 state on one CTA per
+    SM, ``run`` and ``prepare`` alike; its preprocess shares the runner's
+    status words (the slot ticket and the boundary bits).  The same calls
+    with z keep a program without the wrap plan."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    state_dtype = {"bf16": torch.bfloat16, "f32": torch.float32}[state]
+    calls = []
+    runner = _cpu_forwarding_runner(
+        module,
+        monkeypatch,
+        calls,
+        nheads=nheads,
+        ngroups=8,
+        has_varlen=True,
+        has_initial_states=True,
+        has_z=has_z,
+        state_dtype=state_dtype,
+        arch="sm_107a",
+    )
+    monkeypatch.setattr(module, "_sm_count", lambda _: 212)
+    seqlen = num_seqs * tokens
+    x = torch.empty((1, seqlen, nheads, 64), dtype=torch.bfloat16)
+    dt = torch.empty((1, seqlen, nheads), dtype=torch.float32)
+    A = torch.empty((nheads,), dtype=torch.float32)
+    B = torch.empty((1, seqlen, 8, 128), dtype=torch.bfloat16)
+    C = torch.empty_like(B)
+    kwargs = {
+        "cu_seqlens": torch.arange(0, seqlen + 1, tokens, dtype=torch.int32),
+        "initial_states": torch.empty((num_seqs, nheads, 64, 128), dtype=state_dtype),
+    }
+    if has_z:
+        kwargs["z"] = torch.empty_like(x)
+    runner.run(x, dt, A, B, C, **kwargs)
+    ((name, launch),) = calls
+    monkeypatch.setattr(module, "_load_generated_program", lambda *_: None)
+    prepared = runner.prepare(x=x, dt=dt, A=A, B=B, C=C, **kwargs)
+    assert prepared.program_name == name
+    if has_z:
+        assert name.startswith(f"exactpre_{state}_varlen")
+        assert not name.endswith("_wrap")
+        return
+    assert name == f"exactpre_{state}_varlen_{variant}"
+    if variant == "wrap":
+        assert launch["main_grid"] == (module._wrap_grid_size(sm_count=212), 1, 1)
+        assert launch["main_grid"] == (212, 1, 1)
+        pairs = module._tail_grid_size(sm_count=212) // 2
+        status = launch["main"]["preprocess_status"]
+        assert tuple(status.shape) == (2 + pairs + (pairs + 31) // 32,)
+        assert status.dtype == torch.int32
+        assert launch["preprocess"]["preprocess_status"] is status
+    else:
+        items = num_seqs * nheads
+        grid = module._persistent_grid_size(total_work=items, sm_count=212)
+        assert launch["main_grid"] == (grid, 1, 1)
 
 
 def test_source_sm107_ibulk_rule():

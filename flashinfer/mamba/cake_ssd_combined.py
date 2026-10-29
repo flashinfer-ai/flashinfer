@@ -128,7 +128,9 @@ class _Program:
     2-CTA pair program, ``cluster_dims`` ``(2, 1, 1)``, launched on the even
     grid :func:`_tail_grid_size`), ``"tailone"`` (the two-kernel family's
     sm_107a varlen pair program launched as one-CTA clusters on the same
-    grid, :func:`tail_one_cta_selected`), ``"claim"`` (the two-kernel family's
+    grid, :func:`tail_one_cta_selected`), ``"wrap"`` (the two-kernel family's
+    sm_107a varlen program of the grid-wide wrap-around plan, launched with
+    one CTA per SM, :func:`wrap_long_selected`), ``"claim"`` (the two-kernel family's
     sm_107a varlen ring program that draws its work items at run time,
     :func:`claim_selected`) or ``"ibulk"`` (the two-kernel family's sm_107a
     packed-varlen ring program loading a work item's initial state as one
@@ -304,8 +306,10 @@ _EXACTONE_MODULES = {
 # table in-kernel.  The two-kernel claim programs
 # (``exactpre_<state>_varlen_claim``, :func:`claim_selected`), initial-state
 # bulk programs (``exactpre_<state>_varlen_ibulk``, :func:`ibulk_selected`)
-# and one-CTA pair programs (``exactpre_<state>_varlen_tailone``,
-# :func:`tail_one_cta_selected`) exist on sm_107a only
+# one-CTA pair programs (``exactpre_<state>_varlen_tailone``,
+# :func:`tail_one_cta_selected`) and wrap-plan programs
+# (``exactpre_<state>_varlen_wrap``, :func:`wrap_long_selected`) exist on
+# sm_107a only
 # (``_SM107_ONLY_PROGRAMS``),
 # as do the fused initial-state bulk programs
 # (``exactfused_<state>_varlen_ibulk``, :func:`fused_ibulk_selected`), the
@@ -379,6 +383,8 @@ _SM107_MODULES = {
     "exactone_bf16_varlen_tablefirstunit": "mamba_ssd_q_tmem_alias_bf16_varlen_tablefirstunit_a61f3e7a56",
     "exactone_f32_varlen_tablefirstunit": "mamba_ssd_q_tmem_alias_f32_varlen_tablefirstunit_0815cf65cd",
     "exactone_f32_varlen_tablerolesunit": "mamba_ssd_q_tmem_alias_f32_varlen_tablerolesunit_f04c2e3916",
+    "exactpre_bf16_varlen_wrap": "mamba_ssd_q_tmem_alias_bf16_varlen_precomputed_wrap_b778c7bb4c",
+    "exactpre_f32_varlen_wrap": "mamba_ssd_q_tmem_alias_f32_varlen_precomputed_wrap_4898725595",
 }
 
 _SEGMENT_PREPROCESS = _Kernel(
@@ -755,6 +761,7 @@ _VARIANT_SMEM_BYTES = {
     ("exactpre", "claim"): _EXACTPRE_CLAIM_SMEM_BYTES,
     ("exactpre", "ibulk"): _EXACTPRE_IBULK_SMEM_BYTES,
     ("exactpre", "tailone"): _EXACTPRE_TAILONE_SMEM_BYTES,
+    ("exactpre", "wrap"): _EXACTPRE_TAILONE_SMEM_BYTES,
     ("exactfused", "ibulk"): _EXACTFUSED_IBULK_SMEM_BYTES,
     ("exactone", "tablefirst"): _EXACTONE_SMEM_BYTES,
     ("exactone", "tableroles"): _EXACTONE_SMEM_BYTES,
@@ -822,12 +829,13 @@ _PROGRAMS: dict[str, _Program] = {
         *_EXACTONE_MODULES.items(),
     )
 }
-# The sm_107a-only programs (the claim, initial-state bulk, one-CTA pair and
-# z-prefetch programs, the one-launch programs' table forms and the
-# one-CTA-cluster twins): their ``_SM107_MODULES`` entry is their main
+# The sm_107a-only programs (the claim, initial-state bulk, one-CTA pair,
+# wrap-plan and z-prefetch programs, the one-launch programs' table forms and
+# the one-CTA-cluster twins): their ``_SM107_MODULES`` entry is their main
 # module on every architecture; only capability (10, 7) routes to them
 # (:func:`claim_selected`, :func:`ibulk_selected`,
-# :func:`tail_one_cta_selected`, :func:`fused_ibulk_selected`,
+# :func:`tail_one_cta_selected`, :func:`wrap_long_selected`,
+# :func:`fused_ibulk_selected`,
 # :func:`fused_z_prefetch_selected`, :func:`exactone_table_variant`,
 # :func:`unit_cluster_variant`).
 _SM107_ONLY_PROGRAMS = frozenset(_SM107_MODULES) - frozenset(_PROGRAMS)
@@ -2452,6 +2460,106 @@ def tail_one_cta_selected(
     )
 
 
+# The grid-wide wrap-around plan of the varlen two-kernel program (``_wrap``,
+# sm_107a only), in the one-CTA pair program's launch.  Each CTA draws its slot
+# ``t`` from an ``atom.inc`` ticket in ``preprocess_status`` word 2 (limit
+# grid - 1, so the last draw leaves the word 0) and runs the slot's range of
+# the call's (sequence, head) items in order, each item weighing its chunks
+# plus one: the head chunks of the item its upper boundary cuts first, then
+# whole items, then the tail chunks of the item its lower boundary cuts.  An
+# item cut between slots ``t`` and ``t + 1`` hands its fp32 scan state over
+# through the output rows of two full chunks of its tail and bit
+# ``(t + 1) % 32`` of word ``3 + (t + 1) // 32``.  A CTA waits only, at its last
+# segment, on the CTA that drew the previous ticket, which publishes after its
+# first segment: no co-residency is assumed, and every complete launch leaves
+# the words 0.  Outputs are bitwise those of the static-order, pair and
+# one-CTA pair programs.  Measured on R200: faster than the pair or ring
+# program on varlen calls without ``z`` whose items span at least
+# ``_WRAP_LONG_CHUNKS`` chunks and whose chunk makespan the plan shortens to
+# ``_WRAP_MAX_MAKESPAN_RATIO`` or less (1.12x on perf_varlen_32x32 vs the
+# previous route); slower on calls with ``z`` and on items of 8 chunks, which
+# keep their programs.
+_WRAP_CAPABILITIES = frozenset({(10, 7)})
+_WRAP_STATE_DTYPES = frozenset({torch.bfloat16, torch.float32})
+_WRAP_FROM_VARIANTS = ("", "tail", "ibulk")
+_WRAP_MIN_CHUNKS = 8
+_WRAP_MAX_MAKESPAN_RATIO = 0.9
+_WRAP_LONG_CHUNKS = 16
+
+
+def wrap_selected(
+    *,
+    capability: Optional[Tuple[int, int]],
+    state_dtype: torch.dtype,
+    mode_varlen: bool,
+    total_work: int,
+    chunks_per_item: int,
+    sm_count: int,
+    tail: bool,
+) -> bool:
+    """The makespan rule of the wrap program (host-known inputs only): an
+    SM107 varlen call of a ``_WRAP_STATE_DTYPES`` state with more (sequence,
+    head) items than SMs, at least ``_WRAP_MIN_CHUNKS`` host-known chunks per
+    item (:func:`host_chunks_per_item`), whose balanced chunk makespan
+    ``ceil(items * chunks / sm_count)`` is at most ``_WRAP_MAX_MAKESPAN_RATIO``
+    of the current program's: the pair makespan
+    ``ceil(items / (sm_count // 2)) / 2 * chunks`` when the pair rule chose the
+    call (``tail``), else ``ceil(items / sm_count) * chunks``."""
+
+    if capability is None:
+        return False
+    if (int(capability[0]), int(capability[1])) not in _WRAP_CAPABILITIES:
+        return False
+    if not mode_varlen or state_dtype not in _WRAP_STATE_DTYPES:
+        return False
+    if sm_count < 2 or total_work <= sm_count or chunks_per_item < _WRAP_MIN_CHUNKS:
+        return False
+    wrap_makespan = -(-total_work * chunks_per_item // sm_count)
+    if tail:
+        current = -(-total_work // (sm_count // 2)) / 2 * chunks_per_item
+    else:
+        current = -(-total_work // sm_count) * chunks_per_item
+    return wrap_makespan <= _WRAP_MAX_MAKESPAN_RATIO * current
+
+
+def wrap_long_selected(
+    *,
+    capability: Optional[Tuple[int, int]],
+    state_dtype: torch.dtype,
+    mode_varlen: bool,
+    total_work: int,
+    chunks_per_item: int,
+    sm_count: int,
+    tail: bool,
+    has_z: bool,
+) -> bool:
+    """Whether a varlen two-kernel call runs the wrap program
+    ``exactpre_<state>_varlen_wrap``: :func:`wrap_selected` on a call without
+    ``z`` whose items span at least ``_WRAP_LONG_CHUNKS`` host-known chunks
+    (:func:`host_chunks_per_item`).  Outputs are bitwise those of the program
+    the call takes otherwise."""
+
+    if has_z or chunks_per_item < _WRAP_LONG_CHUNKS:
+        return False
+    return wrap_selected(
+        capability=capability,
+        state_dtype=state_dtype,
+        mode_varlen=mode_varlen,
+        total_work=total_work,
+        chunks_per_item=chunks_per_item,
+        sm_count=sm_count,
+        tail=tail,
+    )
+
+
+def _wrap_grid_size(*, sm_count: int) -> int:
+    """Grid of the wrap programs: one CTA per SM.  The kernel plans any grid;
+    the boundary bits of grid ``G`` reach word ``3 + (G - 1) // 32`` of the
+    runner's status words, within them for ``G = sm_count``."""
+
+    return sm_count
+
+
 def _sequence_arguments(
     main_args: tuple[str, ...],
     preprocess: Mapping[str, object],
@@ -3092,7 +3200,10 @@ class CakeSSDCombined:
         (:func:`_tail_grid_size`): pair ``p``'s rank ticket in word ``2 + p``,
         its hand-off flag in bit ``p % 32`` of word ``2 + pairs + p // 32``
         (on 212 SMs 112 words, within one 512-byte allocator block like the
-        two words alone).  Every complete launch leaves word 1 and the words
+        two words alone).  The sm_107a wrap programs (:func:`wrap_long_selected`)
+        draw their slot from word 2 and hand an item's state over through bit
+        ``b % 32`` of word ``3 + b // 32`` for slot boundary ``b`` (words 2-9
+        on 212 SMs).  Every complete launch leaves word 1 and the words
         after it 0, so a stream's launches see them 0.
         Like the runner's other per-device workspace (the delta and cumsum
         tiles, the grid barriers), the words serve one stream at a time: a
@@ -3494,6 +3605,30 @@ class CakeSSDCombined:
                 )
             ):
                 variant = "ibulk"
+            # sm_107a: the wrap program takes the long-item varlen calls
+            # ``wrap_long_selected`` admits among those the ring, pair or
+            # initial-state bulk program would run, before the pair
+            # program's one-CTA form.
+            if (
+                program_family == "exactpre"
+                and variant in _WRAP_FROM_VARIANTS
+                and wrap_long_selected(
+                    capability=capability,
+                    state_dtype=self.state_dtype,
+                    mode_varlen=self.has_varlen,
+                    total_work=num_sequences * self.nheads,
+                    chunks_per_item=host_chunks_per_item(
+                        mode_varlen=self.has_varlen,
+                        num_sequences=num_sequences,
+                        # packed varlen: x is [1, total tokens, nheads, 64]
+                        seqlen=batch * seqlen if self.has_varlen else seqlen,
+                    ),
+                    sm_count=sm_count,
+                    tail=variant == "tail",
+                    has_z=self.has_z,
+                )
+            ):
+                variant = "wrap"
             # sm_107a: the pair calls ``tail_one_cta_selected`` admits run the
             # pair program's one-CTA form.
             if variant == "tail" and tail_one_cta_selected(
@@ -4439,6 +4574,10 @@ class CakeSSDCombined:
             # cu_seqlens form may never address; the kernel reads the real
             # tile count from ``seq_chunk_cumsum[sequence_count]``.
             grid = max(1, min(num_segments * self.nheads, sm_count))
+        elif program.variant == "wrap":
+            # One CTA per SM; each CTA draws its slot from the grid ticket and
+            # computes the wrap plan in-kernel from this grid.
+            grid = _wrap_grid_size(sm_count=sm_count)
         elif program.variant in ("tail", "tailone"):
             # One 2-CTA cluster (``_tailone``: one CTA pair) per SM pair; the
             # pair plan is computed in-kernel from this grid (``tail_selected``
