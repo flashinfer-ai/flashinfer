@@ -347,8 +347,8 @@ def chunked_lm_head_loss(
         ``logp`` / ``dX`` / ``dW`` as ``"fast"``; the recompute forms run more
         GEMM work.  The bound assumes a backward that frees the graph
         (``retain_graph=True`` keeps the forward's state); its margin is
-        measured on GB200 only (see the package README).  No environment
-        variable.
+        measured on GB200, GB300 and B200 (see the package README).  No
+        environment variable.
     num_valid_rows : int, optional
         The number of labels ``>= 0`` (not ``-100``), as a host integer (a
         Python or NumPy integer or a CPU scalar tensor; a CUDA tensor is

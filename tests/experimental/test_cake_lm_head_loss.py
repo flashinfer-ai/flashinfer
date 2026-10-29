@@ -6270,6 +6270,30 @@ def test_memory_plan_budgets_the_valid_rows():
             )
 
 
+def test_budget_valid_rows_checks_an_uncompacted_count():
+    """The valid rows of a budget call's budget (:func:`_budget_valid_rows`): the compacted rows, else the caller's
+    count, else the labels counted on the host.  ``check=True`` (``check_num_valid_rows``) reads an uncompacted call's
+    labels back and raises the compacted path's ``ValueError`` on a wrong caller's count; without it, and on a
+    compacted call (whose count :func:`given_valid_rows` checks), the caller's count is taken as given."""
+    inp = _host_inputs(37)
+    labels, n = inp.labels.cpu(), int(inp.valid.sum())
+    assert 0 < n < inp.T
+    rows = opt_in._budget_valid_rows
+    assert rows(labels, None, None, False) == n
+    assert rows(labels, None, None, True) == inp.T
+    assert rows(labels, inp.valid.nonzero().reshape(-1), n, True, check=True) == n
+    for check in (False, True):
+        assert rows(labels, None, n, False, check=check) == n
+    for wrong in (n - 1, n + 1):
+        with pytest.raises(
+            ValueError,
+            match=f"num_valid_rows={wrong} but the labels hold {n} valid rows",
+        ):
+            rows(labels, None, wrong, False, check=True)
+        assert rows(labels, None, wrong, False) == wrong
+        assert rows(labels, None, wrong, True, check=True) == wrong
+
+
 def test_budget_plan_keys():
     """The budget forms' plans: ``keep_row_grad`` (loss entry) saves every chunk's per-row scale right after its
     ``row_finalize``; ``dw_rows`` (an unfused plan with dW, a granule multiple up to ``V``) leaves the accumulator
@@ -8195,15 +8219,17 @@ def test_device_budget_with_fewer_valid_rows_than_a_chunk(entry, objective):
     ],
 )
 def test_device_budget_uncompacted_with_ignored_rows(
-    glm_weight, entry, objective, given
+    glm_weight, monkeypatch, entry, objective, given
 ):
     """``compact_rows=False`` with a third of the labels ignored (flashinfer#7545's shape, T 16384, four chunks): the
     chunk loop runs over every row while the budget stays that of the valid rows (``2 * T_v * V + 2 * V * H + 2 * T *
-    H``; the caller's ``num_valid_rows`` or a count on the host) -- the loss entry's plan fits it, the budget step's
-    peak (forward through backward, outputs and gradients included, of the call that binds and of one from the
-    remembered binding) stays within it, and the outputs are bitwise the uncompacted fast step's."""
+    H``; the caller's ``num_valid_rows`` or a count on the host) -- the plan of each entry (the loss entry's forward,
+    the log-probability entry's backward) fits it, the budget step's peak (forward through backward, outputs and
+    gradients included, of the call that binds and of one from the remembered binding) stays within it, and the
+    outputs are bitwise the uncompacted fast step's."""
     _require_program(entry=entry)
     _require_recompute()
+    plans = _record_budget_plans(monkeypatch)
     T = 16384
     inp = make_inputs(
         T,
@@ -8236,7 +8262,57 @@ def test_device_budget_uncompacted_with_ignored_rows(
         del result
     if entry == "loss":
         assert mplan is not None and mplan.fits and mplan.budget_bytes < head, mplan
-    assert max(peaks) <= head, (peaks, head, mplan)
+    assert len(plans) == 2, plans
+    assert all(p.fits and p.budget_bytes < head for p in plans), plans
+    assert max(peaks) <= head, (peaks, head, plans)
+
+
+def _record_budget_plans(monkeypatch) -> list:
+    """Record every plan the budget entries make (:func:`_budget_plan`: the loss entry's forward, the
+    log-probability entry's backward)."""
+    plans: list = []
+    plan = opt_in._budget_plan
+
+    def recording(*args, **kwargs):
+        plans.append(plan(*args, **kwargs))
+        return plans[-1]
+
+    monkeypatch.setattr(opt_in, "_budget_plan", recording)
+    return plans
+
+
+@pytest.mark.parametrize("entry", ["loss", "logprob"])
+def test_device_budget_uncompacted_checks_the_callers_count(
+    glm_weight, monkeypatch, entry
+):
+    """An uncompacted budget call (``compact_rows=False``, a third of the labels ignored, T 16384) sizes its budget on
+    the caller's ``num_valid_rows``: ``check_num_valid_rows=True`` reads the labels' count back and raises the
+    compacted path's ``ValueError`` on a wrong count (the loss entry in its forward, the log-probability entry in its
+    backward) before planning; the right count plans once, fits and gives the uncompacted fast step's bits."""
+    _require_program(entry=entry)
+    _require_recompute()
+    plans = _record_budget_plans(monkeypatch)
+    T = 16384
+    inp = make_inputs(
+        T, seed=SEED + 7867 + T, device=CUDA, W=glm_weight, ignore_frac=0.33
+    )
+    R, H, V = int(inp.valid.sum()), DEFAULT_H, DEFAULT_V
+    assert 0 < R < T
+    head = 2 * R * V + 2 * V * H + 2 * T * H
+    budget = dict(memory_mode="budget", compact_rows=False, check_num_valid_rows=True)
+    for wrong in (R - 1, R + 1):
+        with pytest.raises(
+            ValueError,
+            match=f"num_valid_rows={wrong} but the labels hold {R} valid rows",
+        ):
+            _budget_step(inp, 4096, entry, num_valid_rows=wrong, **budget)
+    assert not plans, plans
+    keys = ("loss", "logp", "dX", "dW") if entry == "loss" else ("logp", "dX", "dW")
+    fast, _, _ = _budget_step(inp, 4096, entry, compact_rows=False)
+    result, peak, _ = _budget_step(inp, 4096, entry, num_valid_rows=R, **budget)
+    _assert_same_bits(fast, result, keys=keys)
+    assert len(plans) == 1 and plans[0].fits and plans[0].budget_bytes < head, plans
+    assert peak <= head, (peak, head, plans)
 
 
 @pytest.mark.parametrize("memory_mode", ["fast", "budget"])
