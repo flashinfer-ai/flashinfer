@@ -63,7 +63,9 @@ def _scale_tiles(byte):
     tiles = byte.reshape(
         experts, rows // 128, 4, 32, kb // 4, 4
     )  # [e, rb, row//32, row%32, kt, kb%4]
-    return tiles.permute(0, 1, 4, 3, 2, 5).reshape(experts * rows // 128, kb // 4, 32, 16)
+    return tiles.permute(0, 1, 4, 3, 2, 5).reshape(
+        experts * rows // 128, kb // 4, 32, 16
+    )
 
 
 def _quantize_layout_torch(matrices, transposed):
