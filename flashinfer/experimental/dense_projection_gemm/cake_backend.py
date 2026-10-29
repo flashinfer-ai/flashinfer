@@ -174,7 +174,9 @@ L2_PROMOS = (
 W8_FORMS = (
     "w8r",
     "w8rs",
-)  # the eight-warp CTA form of the input-gradient GEMM (instance_key field 37; ``_w8r`` / ``_w8rs`` symbols)
+    "w8",
+)  # the eight-warp CTA form of the input-gradient GEMM (instance_key field 37; ``_w8r`` / ``_w8rs`` / ``_w8`` symbols;
+# ``w8`` = the knob-free program)
 PD_CHOICES = (
     0,
     1,
@@ -652,13 +654,15 @@ def instance_key(
     odd chunks (warp - 2) steps), so each per-item eight-store burst becomes a seven-step ramp; the stores and
     bytes are unchanged.  A step count >= 0 that needs that drain (``slots`` > 0, ``pd`` 2, no fp32 output);
     every other field is unchanged and the OFF form renders byte-identical.  ``form`` (field 37 = LAST, symbol
-    ``_w8r`` / ``_w8rs`` directly after ``_pro<n>`` and before the diag tokens; "" = the ten-warp pipeline of every
-    other program) selects the eight-warp CTA form of the same GEMM: ``w8r`` = four epilogue warps, a loader, a
-    scheduler and the MMA warp on CTA-pair 256 x 256 tiles over six 32 KiB stages, whole tiles through
+    ``_w8r`` / ``_w8rs`` / ``_w8`` directly after ``_pro<n>`` and before the diag tokens; "" = the ten-warp pipeline
+    of every other program) selects the eight-warp CTA form of the same GEMM: ``w8r`` = four epilogue warps, a
+    loader, a scheduler and the MMA warp on CTA-pair 256 x 256 tiles over six 32 KiB stages, whole tiles through
     cluster-launch-control items, the BF16 output through the TMA store and the raster quotients resolved by four
     fast divisors the host passes (``fd_tiles_l`` / ``fd_tiles_g`` / ``fd_group`` / ``fd_last``), with the
     accumulator released by every epilogue warp after its last read; ``w8rs`` = the same with the loader's elected
-    lane issuing the cluster-launch-control queries (no scheduler warp).  It is refused with every field it cannot
+    lane issuing the cluster-launch-control queries (no scheduler warp); ``w8`` = the knob-free program of the form
+    (sm_100a): the scheduler warp issues the queries and the accumulator is released once per tile.  It is refused
+    with every field it cannot
     carry: a layout other than ``kn``, an fp32 or transposed output, the single-CTA form, a tile other than the
     128 x 256 pair tile, an epilogue other than the one-slot TMA store, a narrow B panel, a box cap, any tail or
     raster form (``sk_exact`` / ``sk_first`` / ``sk_sync`` / ``sk_slab`` / ``htail`` / ``cgrp`` / ``batch_group`` /
@@ -1089,8 +1093,8 @@ def instance_symbol(key: tuple) -> str:
     the pair prologue / cleanup sync form (round 33; absent when 0 - the single-CTA ``_c1`` programs never carry it);
     the round-2 shapes tranche adds ``_skf`` directly after ``_skx`` (``sk_first``) and ``_lw`` between ``_or`` and
     ``_pro`` (``lw``); ``_mg`` directly after ``_lw`` for the whole-tile tile resolve (``mg``); ``_sw<n>`` directly
-    after ``_mg`` for the paced output stores (``sw``, absent when 0); ``_w8r`` / ``_w8rs`` directly after ``_pro<n>``
-    and before the diag tokens for the eight-warp CTA form (``form``, absent when "")).
+    after ``_mg`` for the paced output stores (``sw``, absent when 0); ``_w8r`` / ``_w8rs`` / ``_w8`` directly after
+    ``_pro<n>`` and before the diag tokens for the eight-warp CTA form (``form``, absent when "")).
     [Cake ``instance_symbol``]"""
     (
         a_mn,
@@ -1215,7 +1219,10 @@ def swap_small_m(L: int, M: int, N: int, transposed_out: bool) -> bool:
 # measured faster than the row's program above the pair spread at both T on GB300; the knobs after it are the row's
 # program where the form yields (the planner drops a rule's form where the plan carries stream-K units, the single-CTA
 # form, another tile or output class, the register epilogue or a caller-forced pipeline knob, and refuses a caller-forced
-# form there).
+# form there).  Five sm_100a input-gradient rows (4096 -> 512, 4096 -> 1024, 5120 -> 512, 5120 -> 1024 and the kv_a
+# 6144 -> 576) carry ``form`` ``w8``: the knob-free eight-warp program (``_w8``) measured faster than the row's program
+# above the pair spread at both T on GB200; the knobs after it are the row's program where the form yields, and the
+# raster group is the row's measured launch parameter.
 ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, False, False, False, False, 32, 6144, None): {"cta1": True},
     ('sm_100a', False, False, False, False, False, 128, 6144, None): {"cta1": True},
@@ -1232,7 +1239,9 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, False, False, False, False, 4096, 2048, None): {"htail": True, "cgrp": True, "group_m": 16, "pro": 15},
     ('sm_100a', False, True, False, False, False, 2048, 4096, None): {"cgrp": True, "group_m": 16, "pro": 15},
     ('sm_100a', False, True, False, False, False, 6144, 128, None): {"slots": 2, "pd": 2, "pro": 15},
-    ('sm_100a', False, True, False, False, False, 6144, 576, None): {"group_m": 8, "slots": 1, "epi": 'tma', "pd": 2, "pro": 15},
+    # the kv_a input gradient (6144 -> 576): the knob-free eight-warp program, the row's ten-warp knobs kept as its
+    # program where the form yields; the raster group of 12 row tiles is the row's measured launch parameter
+    ('sm_100a', False, True, False, False, False, 6144, 576, None): {"form": 'w8', "group_m": 12, "slots": 1, "epi": 'tma', "pd": 2, "pro": 15, "sk": False},
     ('sm_100a', False, True, False, False, False, 6144, 2048, None): {"group_m": 8},
     ('sm_100a', False, True, False, False, False, 6144, 12288, None): {"cta_rows": 256, "group_m": 8, "ovl": True, "htail": True},
     ('sm_100a', False, True, False, False, True, 512, 256, None): {"cta_rows": 256, "group_m": 4, "batch_group": 4},
@@ -1350,16 +1359,16 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, True, False, False, False, 4096, 48, None): {"epi": 'tma', "slots": 2, "pro": 15, "htail": True, "lw": True},
     ('sm_100a', False, True, False, False, False, 4096, 64, None): {"epi": 'tma', "slots": 2, "cta1": True, "pd": 3},
     ('sm_100a', False, True, False, False, False, 4096, 128, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2, "lw": True, "group_m": 32},
-    ('sm_100a', False, True, False, False, False, 4096, 512, None): {"epi": 'tma', "slots": 1, "pro": 15, "pd": 2},
-    ('sm_100a', False, True, False, False, False, 4096, 1024, None): {"pd": 2, "pro": 15},
+    ('sm_100a', False, True, False, False, False, 4096, 512, None): {"form": 'w8', "epi": 'tma', "slots": 1, "pro": 15, "pd": 2, "group_m": 12, "sk": False},
+    ('sm_100a', False, True, False, False, False, 4096, 1024, None): {"form": 'w8', "pd": 2, "pro": 15, "group_m": 8, "sk": False},
     ('sm_100a', False, True, False, False, False, 4096, 4096, None): {"htail": True, "cgrp": True, "group_m": 16, "pro": 15},
     ('sm_100a', False, True, False, False, False, 4096, 12288, None): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 16},
     ('sm_100a', False, True, False, False, False, 5120, 32, None): {"epi": 'tma', "slots": 2, "pro": 15, "htail": True, "lw": True},
     ('sm_100a', False, True, False, False, False, 5120, 48, None): {"epi": 'tma', "slots": 2, "pro": 15, "htail": True, "lw": True},
     ('sm_100a', False, True, False, False, False, 5120, 64, None): {"epi": 'tma', "slots": 2, "cta1": True, "pd": 3},
     ('sm_100a', False, True, False, False, False, 5120, 128, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2, "lw": True},
-    ('sm_100a', False, True, False, False, False, 5120, 512, None): {"epi": 'tma', "slots": 1, "pro": 15, "pd": 2, "group_m": 8},
-    ('sm_100a', False, True, False, False, False, 5120, 1024, None): {"pd": 2, "pro": 15},
+    ('sm_100a', False, True, False, False, False, 5120, 512, None): {"form": 'w8', "epi": 'tma', "slots": 1, "pro": 15, "pd": 2, "group_m": 8, "sk": False},
+    ('sm_100a', False, True, False, False, False, 5120, 1024, None): {"form": 'w8', "pd": 2, "pro": 15, "group_m": 8, "sk": False},
     ('sm_100a', False, True, False, False, False, 5120, 5120, None): {"cgrp": True, "group_m": 12, "pro": 15},
     ('sm_100a', False, True, False, False, False, 5120, 17408, None): {"cta_rows": 256, "ovr": True, "htail": True},
     ('sm_100a', False, True, False, False, False, 8192, 128, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2},
@@ -2007,10 +2016,11 @@ class GemmPlan:
     # the bf16 TMA-store pd-2 drain delays its bulk tensor store issue - a program knob, no launch argument, no plan
     # arithmetic (0 = off)
     sw: int = 0
-    # the eight-warp CTA form (instance_key field 37, ``_w8r`` / ``_w8rs``; "" = the ten-warp pipeline): the same GEMM
-    # through four epilogue warps, a loader, a scheduler (``w8r``) or the loader's elected lane in its place (``w8rs``)
-    # and the MMA warp, whole kn bf16 TMA-store tiles only; a program knob that adds the raster's four fast divisors to
-    # the launch (``_k1_values``) and changes no plan arithmetic
+    # the eight-warp CTA form (instance_key field 37, ``_w8r`` / ``_w8rs`` / ``_w8``; "" = the ten-warp pipeline): the
+    # same GEMM through four epilogue warps, a loader, a scheduler (``w8r``; ``w8`` = the knob-free program without the
+    # early accumulator release) or the loader's elected lane in its place (``w8rs``) and the MMA warp, whole kn bf16
+    # TMA-store tiles only; a program knob that adds the raster's four fast divisors to the launch (``_k1_values``) and
+    # changes no plan arithmetic
     form: str = ""
     # FlashInfer-only: the rule's exact-wave BLOCK_N (224) yielded to the default tile because the device's CTA pairs do
     # not fit its tiles in whole waves and the default tile needs fewer waves (``exact_waves``)
@@ -2174,9 +2184,11 @@ def plan_dense_projection_gemm(
     pd-2 drain (a caller-forced register epilogue or ``slots`` 0, another ``pd``, the fp32 output) or is the
     single-CTA form; a caller-forced ``sw`` is admitted or refused by ``instance_key`` (the kernel's refusal: a step
     count >= 0 on that drain only).  It changes neither a launch argument nor the plan arithmetic.  ``form``
-    (``_w8r`` / ``_w8rs``) is the row's eight-warp CTA form - taken from the rule (the three sm_103a input-gradient
-    rules that carry it, 4096 -> 512, 5120 -> 512 and the kv_a 6144 -> 576, name whole-tile kn bf16 TMA-store rows)
-    and dropped where the plan is not whole-tile or a caller forces a pipeline, tile, output, epilogue, tail or raster
+    (``_w8r`` / ``_w8rs`` / ``_w8``) is the row's eight-warp CTA form - taken from the rule (the three sm_103a
+    input-gradient rules that carry it, 4096 -> 512, 5120 -> 512 and the kv_a 6144 -> 576, and the five sm_100a
+    input-gradient rules, 4096 -> 512, 4096 -> 1024, 5120 -> 512, 5120 -> 1024 and the kv_a 6144 -> 576, name
+    whole-tile kn bf16 TMA-store rows) and dropped where the plan is not whole-tile or a caller forces a pipeline,
+    tile, output, epilogue, tail or raster
     knob (the row's program above the form runs the plan asked for); where it survives, the rule's pair-program knobs
     (``pd`` / ``pro`` / ``lw`` / ``mg`` / ``sw`` / ``stages`` / ``hints`` / ``pf`` / ``sh`` / ``store_hint`` /
     ``store_ef`` / ``quad_store`` / ``f32_v8``) are cleared before the key: the eight-warp programs carry none of them.
@@ -2466,9 +2478,9 @@ def plan_dense_projection_gemm(
         sw = 0
     rule_form = form is None
     if form is None:
-        # the eight-warp CTA form of the row's rule (the ``_w8r`` / ``_w8rs`` programs): the whole-tile guard before
-        # ``instance_key`` drops it from a plan that is not whole-tile or that a caller shaped with a tile, output,
-        # epilogue, tail, raster or pipeline knob
+        # the eight-warp CTA form of the row's rule (the ``_w8r`` / ``_w8rs`` / ``_w8`` programs): the whole-tile
+        # guard before ``instance_key`` drops it from a plan that is not whole-tile or that a caller shaped with a
+        # tile, output, epilogue, tail, raster or pipeline knob
         form = rule.get("form", "")
     form = str(form or "")
     if form not in ("", *W8_FORMS):
@@ -3089,7 +3101,7 @@ def _template_class(tokens: tuple[str, ...]) -> tuple[str, bool, bool]:
 
 
 def _template_form(tokens: tuple[str, ...]) -> str:
-    """The eight-warp CTA form token of a symbol (``w8r`` / ``w8rs``), "" for the ten-warp programs: a class of its
+    """The eight-warp CTA form token of a symbol (``w8r`` / ``w8rs`` / ``w8``), "" for the ten-warp programs: a class of its
     own for the registry fallback (a ten-warp row never falls onto an eight-warp program, nor the reverse)."""
     return next((token for token in tokens if token in W8_FORMS), "")
 
@@ -3105,7 +3117,7 @@ def _template_knobs(
     not in the symbol and stay unset; ``_skx`` carries no part count, so ``sk_exact`` takes ``sk_exact_parts`` (the
     row's rule) or the kernel tests' 3 parts on 128-row / 2 on 64-row tiles (``_skf`` = its tail-first order,
     ``_lw`` = the load-warp prelude form, ``_mg`` = the whole-tile tile resolve, ``_sw<n>`` = the paced output stores,
-    ``_w8r`` / ``_w8rs`` = the eight-warp CTA form); a single-CTA program leaves ``pro`` to
+    ``_w8r`` / ``_w8rs`` / ``_w8`` = the eight-warp CTA form); a single-CTA program leaves ``pro`` to
     the planner (``instance_key`` refuses a forced one).  ``None`` for a symbol outside the family or carrying a token
     the planner never emits (``_box<rows>``, diagnostics)."""
     tokens = _template_tokens(template)
