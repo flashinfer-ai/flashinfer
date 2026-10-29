@@ -409,9 +409,11 @@ def test_multi_gpu_rows_match_the_exact_reference(row) -> None:
 
 
 # (lengths, H, W, layout) of the host-synchronization rows: CP2 / CP4 / CP8, every layout, H 4 / 64, one-token
-# documents and a document spanning >= 3 ranks
+# documents and a document spanning >= 3 ranks; (2000, 1000) at CP4 is a ring row with a three-fragment chain (a hop-2
+# chain launch)
 UPLOAD_ROWS = [
     ((100, 640, 77, 1000, 129), 4, 2, "contiguous"),
+    ((2000, 1000), 4, 4, "contiguous"),
     ((3000,), 64, 4, "zigzag"),
     ((2048, 5, 3000, 1), 4, 4, "zigzag_per_document"),
     ((700, 1, 1300, 999, 3000), 64, 8, "zigzag_per_document"),
@@ -422,29 +424,26 @@ UPLOAD_ROWS = [
 OLD_PATH = {"upload": "blocking", "table_cache": "workspace"}
 
 
-def _sync_warnings(fn) -> tuple:
-    """``(result, number of synchronizing operations torch.cuda.set_sync_debug_mode("warn") reported in fn)``."""
-    import warnings
-
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        torch.cuda.set_sync_debug_mode("warn")
-        try:
-            out = fn()
-        finally:
-            torch.cuda.set_sync_debug_mode(0)
-    return out, sum("synchronizing CUDA operation" in str(w.message) for w in caught)
+DIST_SLEEP_MS = 2000.0  # the queue probe of the dist census windows (the host must return within a quarter of it)
 
 
 def _run_upload_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict:
-    """Host synchronization on every rank of a CP row: the new path is bitwise the previous one (KDA saved / replay /
-    checkpointed passes with and without a workspace, conv halo forward / backward); steady-state calls report no
-    synchronizing operation (the previous path does); a pack prepared behind queued work (``heads=H``) does not wait
-    for it and runs bitwise; a pack prepared from another thread on a held-back side stream runs bitwise."""
-    import threading
-    import time
-
+    """Host synchronization on every rank of a CP row, each window a census of ``tests/test_helpers/cake_host_sync.py``
+    (upload counter, profiler copies where traced, sync-debug warnings, an event-based queue probe and a host-time
+    bound): the new path is bitwise the previous one (KDA saved / replay / checkpointed passes with and without a
+    workspace, conv halo forward / backward); the first call of a fresh context (with the reused workspace and with
+    ``workspace=None``) issues only pinned copies (at least one: its table sets) and does not wait; steady-state calls
+    issue no copy and do not wait; the previous path's calls and preparation copy from pageable memory and wait; a
+    pack prepared behind queued work (``heads=H``) issues one pinned copy, does not wait and runs bitwise; a pack
+    prepared from another thread on a held-back side stream does the same; repeated ``exchange="ring"`` calls record
+    no further upload on the context (ring rows); the plan's ``P`` of each rank is reported."""
     from flashinfer.cake_causal_conv1d_train_backend import kcp as conv
+    from tests.test_helpers.cake_host_sync import (
+        census,
+        counts_agree,
+        nonblocking,
+        sleep_cycles,
+    )
 
     lengths, H, _w, layout = row
     device = torch.device("cuda", rank % max(torch.cuda.device_count(), 1))
@@ -465,29 +464,15 @@ def _run_upload_rank(rank: int, W: int, row, port: int, result_dir: str | None) 
     w = (0.5 * torch.randn(C, 4, generator=gen)).to(device).contiguous()
     loc = _local_slices(part, rank, cu, {"x": xg, "dy": dyg})
     x, dy = loc["x"].contiguous(), loc["dy"].contiguous()
-    cycles_per_ms = None
-
-    def sleep_ms(ms: float, stream=None) -> None:
-        nonlocal cycles_per_ms
-        if cycles_per_ms is None:
-            a, b = (
-                torch.cuda.Event(enable_timing=True),
-                torch.cuda.Event(enable_timing=True),
-            )
-            a.record()
-            torch.cuda._sleep(50_000_000)
-            b.record()
-            b.synchronize()
-            cycles_per_ms = 50_000_000 / max(a.elapsed_time(b), 1e-3)
-        with torch.cuda.stream(stream or torch.cuda.current_stream(device)):
-            torch.cuda._sleep(int(cycles_per_ms * ms))
 
     def run(c, ws, **opts) -> list:
         out, saved = cake_kcp.chunk_kda_kcp_fwd(
             q, k, v, g, beta, c, workspace=ws, **opts
         )
+        # ``boundary_mode`` is a forward keyword
+        bwd_opts = {key: val for key, val in opts.items() if key != "boundary_mode"}
         grads = cake_kcp.chunk_kda_kcp_bwd(
-            q, k, v, g, beta, c, dout, saved=saved, workspace=ws
+            q, k, v, g, beta, c, dout, saved=saved, workspace=ws, **bwd_opts
         )
         return [out, *grads]
 
@@ -515,11 +500,27 @@ def _run_upload_rank(rank: int, W: int, row, port: int, result_dir: str | None) 
     def build(**kw):
         return cake_kcp_plan.build_kcp_context(part, group, rank, device, **kw)
 
+    def window(fn, **kw) -> dict:
+        return census(fn, device, sleep_ms=DIST_SLEEP_MS, **kw)
+
+    def brief(c: dict) -> dict:
+        keys = ("pageable", "pinned", "prof_pageable", "prof_pinned", "sync_warn")
+        return {
+            **{key: c[key] for key in keys},
+            "busy": c["busy"],
+            "host_s": round(c["host_s"], 4),
+        }
+
+    def fresh(c):
+        return c, not c.ready.query()
+
     prev = cake_kcp_plan.enable_test_knobs(True)
     try:
+        sleep_cycles(device, DIST_SLEEP_MS)  # calibrated before any window
         old = build(_kcp_test_knobs=dict(OLD_PATH))
         ctx = build(heads=H)
         ws, ws_old = cake_kcp.KcpWorkspace(), cake_kcp.KcpWorkspace()
+        P = cake_kcp.KcpWorkspace(local=False).tables(ctx, H).P
         ref = (
             run(old, None)
             + run(old, ws_old)
@@ -537,50 +538,94 @@ def _run_upload_rank(rank: int, W: int, row, port: int, result_dir: str | None) 
         for _ in range(2):
             run(ctx, ws)
             run(ctx, None)
-        torch.cuda.synchronize(device)
-        res_ws, n_ws = _sync_warnings(lambda: run(ctx, ws))
-        res_none, n_none = _sync_warnings(lambda: run(ctx, None) + halo(ctx))
-        _res_old, n_old = _sync_warnings(lambda: run(old, None))
-        # the next pack prepared while this one runs: queued pack + ~0.5 s of work, then the preparation
-        torch.cuda.synchronize(device)
-        run(ctx, ws)
-        sleep_ms(500.0)
-        t0 = time.perf_counter()
-        ctx_b, n_prep = _sync_warnings(lambda: build(heads=H))
-        prep_s = time.perf_counter() - t0
-        prep_busy = not torch.cuda.current_stream(device).query()
+        steady_ws = window(lambda: run(ctx, ws))
+        steady_none = window(lambda: run(ctx, None) + halo(ctx))
+        old_calls = window(lambda: run(old, None))
+        # the first call of a fresh context: its table sets are uploaded by the call
+        ctx_f = build(heads=H)
+        first_ws = window(lambda: run(ctx_f, ws) + halo(ctx_f))
+        ctx_g = build(heads=H)
+        first_none = window(lambda: run(ctx_g, None) + halo(ctx_g))
+        # the next pack prepared behind queued work, and the previous path's preparation
+        prep = window(lambda: fresh(build(heads=H)))
+        ctx_b, prep_pending = prep["out"]
+        prep_old = window(lambda: build(heads=H, _kcp_test_knobs=dict(OLD_PATH)))
         res_b = run(ctx_b, ws) + halo(ctx_b)
         # prepared from another thread on a side stream held back by ~0.5 s of its own work
         side = torch.cuda.Stream(device)
-        holder = {}
-        sleep_ms(500.0, side)
-        th = threading.Thread(
-            target=lambda: holder.update(ctx=build(heads=H, stream=side))
+
+        def hold() -> None:
+            with torch.cuda.stream(side):
+                torch.cuda._sleep(sleep_cycles(device, 500.0))
+
+        thread_prep = window(
+            lambda: fresh(build(heads=H, stream=side)), in_thread=True, setup=hold
         )
-        th.start()
-        th.join()
-        ctx_t = holder["ctx"]
-        held = not ctx_t.ready.query()
+        ctx_t, held = thread_prep["out"]
         res_t = run(ctx_t, None) + halo(ctx_t)
+        # the ring exchange: its hop chains are uploaded once per table set, not per call
+        ring_uploads, ring_chains = None, None
+        if W > 1 and int(ctx.n_d_max) - 1 <= cake_kcp.RING_MAX_HOPS:
+            ws_r = cake_kcp.KcpWorkspace()
+            run(ctx, ws_r, exchange="ring", save_transfer=False)
+            n1 = len(ctx._uploads)
+            for _ in range(3):
+                run(ctx, ws_r, exchange="ring", save_transfer=False)
+            ring_uploads = (n1, len(ctx._uploads))
+            ring_chains = sorted(
+                cake_kcp._ring_tables(
+                    cake_kcp.KcpWorkspace(local=False).tables(ctx, H)
+                ).chains
+            )
         torch.cuda.synchronize(device)
     finally:
         cake_kcp_plan.enable_test_knobs(prev)
+    halo_new = new[24:27]
     flags = {
         "new_eq_previous_path": eq(new, ref),
-        "steady_no_sync_reused_ws": n_ws == 0 and eq(res_ws, new[6:12]),
-        "steady_no_sync_no_ws": n_none == 0 and eq(res_none, new[0:6] + new[24:27]),
-        "previous_path_syncs": n_old > 0,
-        "prepare_no_sync": n_prep == 0 and prep_busy and prep_s < 0.25,
-        "prepared_pack_eq": eq(res_b, new[6:12] + new[24:27]),
-        "thread_side_stream_held": held,
-        "thread_prepared_pack_eq": eq(res_t, new[0:6] + new[24:27]),
+        "first_call_reused_ws_nonblocking": nonblocking(first_ws, DIST_SLEEP_MS)
+        and first_ws["pinned"] >= 1
+        and eq(first_ws["out"], new[6:12] + halo_new),
+        "first_call_no_ws_nonblocking": nonblocking(first_none, DIST_SLEEP_MS)
+        and first_none["pinned"] >= 1
+        and eq(first_none["out"], new[0:6] + halo_new),
+        "steady_reused_ws_nonblocking": nonblocking(steady_ws, DIST_SLEEP_MS)
+        and steady_ws["pinned"] == 0
+        and eq(steady_ws["out"], new[6:12]),
+        "steady_no_ws_nonblocking": nonblocking(steady_none, DIST_SLEEP_MS)
+        and steady_none["pinned"] == 0
+        and eq(steady_none["out"], new[0:6] + halo_new),
+        "previous_path_calls_block": old_calls["pageable"] > 0
+        and counts_agree(old_calls)
+        and old_calls["sync_warn"] > 0
+        and not old_calls["busy"],
+        "prepare_nonblocking": nonblocking(prep, DIST_SLEEP_MS)
+        and prep["pinned"] == 1
+        and prep_pending,
+        "previous_path_prepare_blocks": prep_old["pageable"] > 0
+        and counts_agree(prep_old)
+        and prep_old["sync_warn"] > 0
+        and not prep_old["busy"],
+        "prepared_pack_eq": eq(res_b, new[6:12] + halo_new),
+        "thread_prepare_nonblocking": nonblocking(thread_prep, DIST_SLEEP_MS)
+        and thread_prep["pinned"] == 1
+        and held,
+        "thread_prepared_pack_eq": eq(res_t, new[0:6] + halo_new),
+        "ring_uploads_bounded": ring_uploads is None
+        or ring_uploads[0] == ring_uploads[1],
     }
     counts = {
-        "n_ws": n_ws,
-        "n_none": n_none,
-        "n_old": n_old,
-        "n_prep": n_prep,
-        "prep_s": prep_s,
+        "P": P,
+        "ring_uploads": ring_uploads,
+        "ring_chains": ring_chains,
+        "first_ws": brief(first_ws),
+        "first_none": brief(first_none),
+        "steady_ws": brief(steady_ws),
+        "steady_none": brief(steady_none),
+        "old_calls": brief(old_calls),
+        "prep": brief(prep),
+        "prep_old": brief(prep_old),
+        "thread_prep": brief(thread_prep),
     }
     if W > 1:
         flag_list, count_list = [None] * W, [None] * W
