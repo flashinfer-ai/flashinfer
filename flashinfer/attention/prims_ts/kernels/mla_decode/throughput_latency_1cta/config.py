@@ -31,7 +31,7 @@ from math import ceil
 from typing import Any
 
 from ....split_kv_mode_policy import select_split_kv_modes
-from ..helpers.constants import MAX_MLA_SPLITS_KV, SUPPORTED_MLA_PAGE_SIZES
+from ..helpers.constants import SUPPORTED_MLA_PAGE_SIZES
 from ..helpers.nvfp4_kv import (
     Nvfp4KVConfig,
     nvfp4_row_bytes,

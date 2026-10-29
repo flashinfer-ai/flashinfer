@@ -22,7 +22,6 @@ from dataclasses import dataclass
 from typing import Tuple
 
 from ..helpers.constants import (
-    MAX_MLA_SPLITS_KV,
     SUPPORTED_MLA_PAGE_SIZES,
     WARP_LANES,
 )

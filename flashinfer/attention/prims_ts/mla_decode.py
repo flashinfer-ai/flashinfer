@@ -27,7 +27,6 @@ import torch
 from ._compile_cache import build_and_load_attention_kernel
 from ._hardware import get_max_active_clusters
 
-import torch
 
 from .kernels.mla_decode.helpers.nvfp4_kv import (
     cache_record_size,
@@ -1340,10 +1339,14 @@ def _get_compiled_mla_decode(
             cache_seqs_fake,
             sink,
             cutlass.Float32(1.0),
-            None if kernel.direct_static_scales else cute.runtime.make_fake_compact_tensor(
+            None
+            if kernel.direct_static_scales
+            else cute.runtime.make_fake_compact_tensor(
                 cutlass.Float32, (1,), stride_order=(0,), assumed_align=4
             ),
-            None if kernel.direct_static_scales else cute.runtime.make_fake_compact_tensor(
+            None
+            if kernel.direct_static_scales
+            else cute.runtime.make_fake_compact_tensor(
                 cutlass.Float32, (1,), stride_order=(0,), assumed_align=4
             ),
         )
@@ -2938,8 +2941,11 @@ class BatchSparseMLADecodePagedTSWrapper:
             static_kernel = copy.copy(kernel)
             static_kernel.direct_static_scales = True
             compiled_static = _get_compiled_mla_decode(
-                replace(spec, kernel=static_kernel,
-                        kernel_signature=_mla_kernel_compile_signature(static_kernel))
+                replace(
+                    spec,
+                    kernel=static_kernel,
+                    kernel_signature=_mla_kernel_compile_signature(static_kernel),
+                )
             )
         self._scalar_cache.clear()
         self._state = dict(
@@ -3025,7 +3031,6 @@ class BatchSparseMLADecodePagedTSWrapper:
                 (1,), key, device=state["device"], dtype=torch.float32
             )
         return self._scalar_cache[key]
-
 
     @staticmethod
     def host_scale(value, name):
@@ -3305,7 +3310,10 @@ class BatchSparseMLADecodePagedTSWrapper:
         else:
             scale_tensors = [
                 self._scalar(v, n, validate)
-                for v, n in ((softmax_scale, "softmax_scale"), (output_scale, "output_scale"))
+                for v, n in (
+                    (softmax_scale, "softmax_scale"),
+                    (output_scale, "output_scale"),
+                )
             ]
         kv_cache_scale = self.host_scale(kv_cache_scale, "kv_cache_scale")
         if state["kv_cache_format"] != "fp8" and kv_cache_scale != 1.0:
@@ -3437,7 +3445,9 @@ class BatchSparseMLADecodePagedTSWrapper:
                     buffers["core"] if buffers["core"].numel() else None,
                     lse.view(rows, 1, state["num_qo_heads"]),
                 ),
-                compiled=state["compiled_static"] if static_scales else state["compiled"],
+                compiled=state["compiled_static"]
+                if static_scales
+                else state["compiled"],
             )
         if quant is not None:
             return (out, out_scale, lse) if state["return_lse"] else (out, out_scale)

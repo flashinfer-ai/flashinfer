@@ -2005,7 +2005,11 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 )
                 // cfg.num_tokens_per_page,
             )
-        return dataclass_replace(cfg, lse_base_on_e=self.lse_base_on_e, sparse_static_scales=self.direct_static_scales)
+        return dataclass_replace(
+            cfg,
+            lse_base_on_e=self.lse_base_on_e,
+            sparse_static_scales=self.direct_static_scales,
+        )
 
     def validate_split_kv_launch(self, split_kv: int, workspace) -> None:
         """Validate host-side split-KV arguments before compiling the JIT body."""

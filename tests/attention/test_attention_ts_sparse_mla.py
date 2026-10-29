@@ -866,7 +866,6 @@ def test_native_graph(dtype, batch, queries, heads, topk, extra, packed, prefix)
         assert empty.numel() == empty_lse.numel() == 0
 
 
-
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_large_query_native_graph(dtype):
     # A long Q grid exercises persistent work-tile advancement, including
