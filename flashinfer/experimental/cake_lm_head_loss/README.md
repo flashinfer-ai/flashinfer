@@ -56,7 +56,8 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   Gradients are produced only for inputs that require them (a frozen `X` or
   `W` skips its GEMM); the upstream scalar gradient is applied once, in the
   cast.  The saved FP32 accumulators are re-scaled, never mutated, so a
-  retained graph may run the backward repeatedly.
+  retained graph may run the backward repeatedly (see "Saved-state release"
+  below for a `memory_mode="budget"` backward that frees the graph).
 * `chunked_lm_head_logprob` returns the differentiable `logp [T]` for
   arbitrary downstream losses; its forward saves the FP32 row statistic `lse`
   and the valid-row index, and the backward recomputes each chunk's logits
@@ -196,6 +197,93 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   an empty `logp` and zero gradients without binding or launching.
   `cake_backend.memory_report` reports the peak temporary bytes separately
   from the weights, the outputs and the FP32 accumulators.
+* Opt-in forms (`cake_backend_opt_in.py`): a call that passes `memory_mode`
+  or `num_valid_rows` (below) runs the planner, binding, forward, backward and
+  autograd functions of `cake_backend_opt_in.py`, which reuse the kernels,
+  launch helpers and per-device state of `cake_backend.py` and keep their
+  own binding cache (`cake_backend_opt_in.BINDING_CACHE`, same settings).  A
+  call with neither keyword runs `cake_backend.py`'s entry unchanged, with
+  its buffer lifetimes; the public entries of `flashinfer.chunked_lm_head`
+  run their argument checks first (`check_num_valid_rows`, which needs a
+  count: `ValueError` without one; then `memory_mode` and `num_valid_rows`
+  against `None`).  An explicit `memory_mode="fast"` without a count first
+  goes through the dispatch of `cake_backend_opt_in.py` (a few more Python
+  calls per call) and then runs the same `cake_backend.py` entry.
+  Every output is bitwise the same in both.  The opt-in forms also change
+  buffer lifetimes, below.
+* Saved-state release (`memory_mode="budget"` only): a backward of
+  `chunked_lm_head_loss` that
+  frees the graph (no `retain_graph` / `create_graph`) drops the forward's
+  FP32 `dX` accumulator as soon as `dX` is written -- before the weight
+  gradient's buffers exist -- and the rest of the saved state when it ends,
+  instead of when PyTorch frees the graph after the backward returns.  The
+  backward reads `retain_graph` from PyTorch's current graph task through a
+  private API (`torch._C._autograd._get_current_graph_task_keep_graph`); when
+  that API is missing or cannot answer, nothing is released early (the
+  previous lifetime).  A second backward through a freed graph raises
+  PyTorch's "backward through the graph a second time" error;
+  `retain_graph=True` keeps everything and the backward stays repeatable.
+  Without `"budget"` the saved state lives until the graph is freed.  In
+  every opt-in form `backward_logprob` drops its runner (the chunk workspace)
+  before the `dX` output is allocated.  Lifetimes only: every output is
+  bitwise the same.
+* Memory budget (`memory_mode`, keyword of `chunked_lm_head_loss` /
+  `chunked_lm_head_logprob`, default `None`, the `"fast"` form; `"budget"`
+  is opt-in, `cake` backend and BF16 `dW` only).  The fast form keeps the FP32 `[V, H]`
+  weight-gradient accumulator next to the chunk buffers, so its step peak
+  (forward through backward, outputs included) is above that of a head that
+  materializes the BF16 logits of the valid rows, `B = 2 * T_v * V + 2 * V *
+  H + 2 * T * H` bytes.  `"budget"` picks, per call, the fastest exact
+  weight-gradient form whose predicted peak stays within `B` less a 2 % margin
+  (`cake_backend_opt_in.memory_plan`, which returns the form and both byte counts;
+  `ForwardResult.memory_plan` carries it): `"fused"` (the fast form),
+  `"unfused"` (every chunk accumulated, one flat cast after `dX` is written),
+  `"partial"` (the chunk loop accumulates the vocabulary rows `[0, dw_rows)`
+  only) or `"recompute"` (none).  The last two recompute the other rows of
+  `dW` in the backward, one vocabulary block at a time: per block and chunk the
+  logits GEMM's `dz` arm (`gemm_logits_dz`) on `W[v0:v1]` recomputes the
+  block's `dz` from the saved row statistic `lse` and per-row gradient scale
+  `d` (labels shifted into the block), the weight-gradient accumulate GEMM adds
+  `dz_c^T @ X_c` and the last chunk runs the fused scale + cast GEMM into
+  `dW[v0:v1]`.  Every element of `dW` sees the same FP32 operations in the same
+  order as in the fast form, so `loss`, `logp`, `dX` and `dW` are bitwise the
+  fast form's; the recompute forms run up to one more logits GEMM per chunk,
+  so they are slower.  The loss entry saves `X` and `W` for the recompute (an
+  in-place write between the forward and the backward raises PyTorch's
+  saved-tensor version error); the log-probability entry plans its backward
+  only.  The bound assumes a backward that frees the graph.  The margin is
+  measured on GB200 only (other architectures and allocator settings are
+  not measured): every measured `"budget"` step peak, single calls and
+  repeated calls that miss or hit the binding cache, stayed within `B`; the
+  highest reached 0.9801 `B`, just above the planner's 2 % target.  No
+  environment variable selects it.
+* Caller's valid-row count (`num_valid_rows`, keyword of
+  `chunked_lm_head_loss` / `chunked_lm_head_logprob` and of the
+  `cake_backend_opt_in` eager entry points, default `None`): the number of labels
+  `>= 0` as a host integer (a Python or NumPy integer or a CPU scalar tensor;
+  a CUDA tensor is rejected because reading it would wait for the device).
+  A compacted forward then plans its chunks on that count without reading a
+  count back: it forms the valid-row index on the device
+  (`cake_backend_opt_in.given_valid_rows`: `labels >= 0` -> int32 `cumsum` ->
+  `searchsorted`, whose first `num_valid_rows` slots are the ascending valid
+  rows) and queues one `torch._assert_async(scan[T - 1] == num_valid_rows)`
+  ahead of every kernel that reads the index.  A wrong count therefore stops
+  the stream with a device-side assertion, which ends the CUDA context.
+  `check_num_valid_rows=True` reads the count back instead and raises
+  `ValueError` on a mismatch (one synchronization, for debugging); so do
+  CPU calls and every `sm_103a` call whose library CUDA 13.0 built (the calls
+  that keep the host-count schedule, see the toolchain note).  The given-count
+  call runs the host-count path's kernels on the same plan, so its outputs are
+  bitwise those of `num_valid_rows=None`.  The count is not derived from
+  `loss_div`.
+* First call of a process (`chunked_lm_head_preload(device=None)`,
+  `cake_backend_opt_in.preload`): loads every library of the device's architecture
+  (a JIT build when the package ships no `aot/` library), creates the
+  per-device side stream (the process's first `torch.cuda.Stream`), the count
+  cells and constants, launches the PyTorch operators of the valid-row count
+  paths once and synchronizes.  It does not launch the package's kernels:
+  under the driver's lazy module loading (`CUDA_MODULE_LOADING=LAZY`, the
+  default) each kernel form still loads at its first launch.
 * `deterministic=True` only: fixed sequential chunk order, bitwise
   reproducible `loss`, `logp`, `dX` and `dW` run to run.
 
@@ -210,6 +298,13 @@ the remembered argument plans with freshly allocated outputs and per-call
 scratch (`cake_backend.BINDING_CACHE`).  A remembered binding pins no caller
 tensor and holds no problem-sized scratch: the chunk workspace, the FP32
 accumulators and the outputs come from the caching allocator on every call.
+In the opt-in forms a call that misses the cache -- with compaction, every
+call whose valid-row count or `loss_div` is new, so usually every training
+batch -- binds on
+buffers that share one allocation of the largest of them (the binding is
+built from their addresses and never launches on them), so its peak stays
+close to that of a call that hits the cache instead of adding up every
+buffer the binding needs.
 The cache keeps up to 64 bindings (`cake_backend.BINDING_CACHE_DEFAULT_CAPACITY`)
 and evicts the least recently used one;
 `cake_backend.BINDING_CACHE.configure(enabled=..., capacity=...)` changes both
@@ -237,7 +332,9 @@ value is passed down; the two binding-cache variables are read when that
 module is imported and applied through `BINDING_CACHE.configure` when it first
 reaches the backend.  A build that vendors the package without the wrapper
 sees the backend defaults.  The wrapper leaves `logprob_dz` / `logprob_lbl`
-at their backend defaults (no variable).
+at their backend defaults (no variable) and passes `memory_mode` (no
+variable either) and the non-switch keywords `num_valid_rows` /
+`check_num_valid_rows` through unchanged.
 
 | Keyword (backend default) | Variable read by `flashinfer.chunked_lm_head` | Parsing |
 | --- | --- | --- |

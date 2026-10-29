@@ -38,6 +38,10 @@ from .api_logging import flashinfer_experimental_api
 
 _FEATURE = "chunked LM-head + loss training kernels (SM100/SM103)"
 
+_CHECK_WITHOUT_COUNT = (
+    "check_num_valid_rows=True needs num_valid_rows (the count it checks)"
+)
+
 # "0" turns valid-row compaction off (``compact_rows``); anything else: on.
 COMPACT_ROWS_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_COMPACT_ROWS"
 # "0" turns the fused weight-gradient cast off (``fuse_dw_cast``).
@@ -172,6 +176,18 @@ def _cake_backend() -> ModuleType:
     return cake_backend
 
 
+@functools.cache
+def _cake_backend_opt_in() -> ModuleType:
+    # The opt-in forms (``memory_mode`` / ``num_valid_rows``), imported on
+    # their first use; a call with neither never imports them.  Their own
+    # binding cache takes the same settings.
+    _cake_backend()
+    from .experimental.cake_lm_head_loss import cake_backend_opt_in
+
+    _configure_binding_cache(cake_backend_opt_in, _BINDING_CACHE_SETTINGS)
+    return cake_backend_opt_in
+
+
 @flashinfer_experimental_api(feature=_FEATURE)
 def chunked_lm_head_loss(
     X: torch.Tensor,
@@ -193,6 +209,9 @@ def chunked_lm_head_loss(
     dw_stream: Optional[Union[bool, str]] = None,
     hidden_count: Optional[bool] = None,
     gemm_tuning: Optional[Dict[str, Dict[str, Any]]] = None,
+    memory_mode: Optional[str] = None,
+    num_valid_rows: Optional[int] = None,
+    check_num_valid_rows: bool = False,
 ):
     r"""Differentiable chunked LM-head projection + loss with a memory-bounded
     backward, SM100 / SM103 only.
@@ -313,6 +332,39 @@ def chunked_lm_head_loss(
         ``FLASHINFER_CAKE_LM_HEAD_LOSS_GEMM_TUNING`` as a JSON object (unset or
         blank: no explicit knob, the backend's own default; invalid JSON is a
         ``ValueError``).
+    memory_mode : str, optional
+        ``None`` (the default) or ``"fast"``: the fastest form; an explicit
+        ``"fast"`` first goes through the opt-in dispatch
+        (``cake_backend_opt_in``) and then runs the same entry as ``None``.
+        ``"budget"``: bound the step peak (forward through backward, outputs
+        included) by the bytes ``B`` of a head that materializes the BF16
+        logits of the valid rows (``B = 2 * T_v * V + 2 * V * H + 2 * T * H``);
+        the planner targets ``B`` less a 2 % margin: per call, the fastest
+        exact weight-gradient form whose predicted peak fits -- the fused or
+        the unfused cast, or the forward accumulating the leading vocabulary
+        rows and the backward recomputing the others in vocabulary blocks
+        (``cake_backend_opt_in.memory_plan``).  Bitwise the same ``loss`` /
+        ``logp`` / ``dX`` / ``dW`` as ``"fast"``; the recompute forms run more
+        GEMM work.  The bound assumes a backward that frees the graph
+        (``retain_graph=True`` keeps the forward's state); its margin is
+        measured on GB200 only (see the package README).  No environment
+        variable.
+    num_valid_rows : int, optional
+        The number of labels ``>= 0`` (not ``-100``), as a host integer (a
+        Python or NumPy integer or a CPU scalar tensor; a CUDA tensor is
+        rejected).  With compaction the forward then plans on it without
+        waiting for queued device work: the valid-row index is formed on the
+        device and the count is checked there by one asynchronous assertion
+        -- a wrong count ends the CUDA context with a device-side assertion.
+        Exception: an ``sm_103a`` call whose library CUDA 13.0 built keeps the
+        host-count schedule and reads the count back once (see the package
+        README's toolchain note).  ``None`` (default): the forward counts the
+        valid rows itself, which waits for the device once per call.  Not
+        derived from ``loss_div``.
+    check_num_valid_rows : bool
+        Read the count back and raise ``ValueError`` when ``num_valid_rows``
+        is wrong (one synchronization; for debugging).  ``True`` without
+        ``num_valid_rows`` is a ``ValueError``.
 
     Notes
     -----
@@ -323,6 +375,20 @@ def chunked_lm_head_loss(
     or ``W`` skips its GEMM).  The saved accumulators are re-scaled, never
     mutated, so a retained graph may run the backward repeatedly.  ``T == 0``
     gives loss 0, an empty ``logp`` and zero gradients.
+
+    A call with neither ``memory_mode`` nor ``num_valid_rows`` runs the
+    backend's default entry (``cake_backend``) after this function's argument
+    checks (``check_num_valid_rows``, then ``memory_mode`` and
+    ``num_valid_rows`` against ``None``).  A call with either goes through
+    ``cake_backend_opt_in`` (bitwise the same outputs): an explicit
+    ``memory_mode="fast"`` without a count then runs the same default entry,
+    every other such call takes its opt-in forms; with
+    ``memory_mode="budget"`` a backward that frees the graph releases the
+    saved accumulators as soon as it has used them (a second backward then
+    raises).
+
+    ``chunked_lm_head_preload`` loads the libraries and creates the
+    per-device state ahead of a process's first call.
 
     Host side: inputs are validated and bound on the first call for an input
     binding (``data_ptr``, shape, stride and dtype of every input plus the
@@ -347,6 +413,34 @@ def chunked_lm_head_loss(
     if backend != "cake":
         raise ValueError(
             "the chunked LM-head + loss kernels currently support backend='cake'"
+        )
+    if check_num_valid_rows and num_valid_rows is None:
+        raise ValueError(_CHECK_WITHOUT_COUNT)
+    if memory_mode is not None or num_valid_rows is not None:
+        return _cake_backend_opt_in().chunked_lm_head_loss(
+            X,
+            W,
+            labels,
+            objective=objective,
+            loss_div=loss_div,
+            infer_logp=infer_logp,
+            loss_weights=loss_weights,
+            chunk_size=chunk_size,
+            return_logp=return_logp,
+            grad_weight_dtype=grad_weight_dtype,
+            deterministic=deterministic,
+            backend="cake",
+            **_resolve_knobs(
+                compact_rows=compact_rows,
+                fuse_dw_cast=fuse_dw_cast,
+                dx_finalize=dx_finalize,
+                dw_stream=dw_stream,
+                hidden_count=hidden_count,
+                gemm_tuning=gemm_tuning,
+            ),
+            memory_mode=memory_mode,
+            num_valid_rows=num_valid_rows,
+            check_num_valid_rows=check_num_valid_rows,
         )
     return _cake_backend().chunked_lm_head_loss(
         X,
@@ -387,6 +481,9 @@ def chunked_lm_head_logprob(
     dw_stream: Optional[Union[bool, str]] = None,
     hidden_count: Optional[bool] = None,
     gemm_tuning: Optional[Dict[str, Dict[str, Any]]] = None,
+    memory_mode: Optional[str] = None,
+    num_valid_rows: Optional[int] = None,
+    check_num_valid_rows: bool = False,
 ) -> torch.Tensor:
     r"""Differentiable chunked selected-token log-probability, SM100 / SM103 only.
 
@@ -404,11 +501,36 @@ def chunked_lm_head_logprob(
     ``dw_stream``, ``hidden_count`` and ``gemm_tuning`` with the same defaults
     (``None`` reads the same ``FLASHINFER_CAKE_LM_HEAD_LOSS_*`` variable; every
     switch is resolved once in the forward and the backward recomputes under
-    the same values); ``dW`` is returned in BF16.
+    the same values); ``dW`` is returned in BF16.  ``memory_mode``
+    (``"budget"``: the backward's weight-gradient form within the same bound),
+    ``num_valid_rows`` and ``check_num_valid_rows`` (the forward's count) as in
+    :func:`chunked_lm_head_loss`.
     """
     if backend != "cake":
         raise ValueError(
             "the chunked LM-head + loss kernels currently support backend='cake'"
+        )
+    if check_num_valid_rows and num_valid_rows is None:
+        raise ValueError(_CHECK_WITHOUT_COUNT)
+    if memory_mode is not None or num_valid_rows is not None:
+        return _cake_backend_opt_in().chunked_lm_head_logprob(
+            X,
+            W,
+            labels,
+            chunk_size=chunk_size,
+            deterministic=deterministic,
+            backend="cake",
+            **_resolve_knobs(
+                compact_rows=compact_rows,
+                fuse_dw_cast=fuse_dw_cast,
+                dx_finalize=dx_finalize,
+                dw_stream=dw_stream,
+                hidden_count=hidden_count,
+                gemm_tuning=gemm_tuning,
+            ),
+            memory_mode=memory_mode,
+            num_valid_rows=num_valid_rows,
+            check_num_valid_rows=check_num_valid_rows,
         )
     return _cake_backend().chunked_lm_head_logprob(
         X,
@@ -426,6 +548,23 @@ def chunked_lm_head_logprob(
             gemm_tuning=gemm_tuning,
         ),
     )
+
+
+@flashinfer_experimental_api(feature=_FEATURE)
+def chunked_lm_head_preload(device: Optional[Union[torch.device, int, str]] = None):
+    r"""Do part of the one-time work of a process's first chunked LM-head call
+    ahead of it, then wait for the device once (SM100 / SM103 only).
+
+    Loads every generated library of ``device``'s architecture (a JIT build
+    when the package ships no prebuilt library), creates the per-device side
+    stream (PyTorch's stream pool), the count cells and constants, launches the
+    PyTorch operators of the valid-row count paths once and synchronizes.  It
+    does not launch the package's kernels: under the driver's lazy module
+    loading (``CUDA_MODULE_LOADING=LAZY``, the default) each kernel form still
+    loads at its first launch.  ``device``: a CUDA device, its index or
+    ``None`` (the current device).
+    """
+    _cake_backend_opt_in().preload(device)
 
 
 # Read once at import: a malformed value fails here, naming the variable, not
