@@ -1,13 +1,13 @@
-# Token-sparse attention for MQA/GQA
+# Token-sparse attention for MQA
 
-**Scope**: Static token-sparse MQA/GQA decode on trtllm-gen (`sparse_top_k`), and the helpers that build its K/V slot lists.
+**Scope**: Static token-sparse MQA decode on trtllm-gen (`sparse_top_k`), and the helpers that build its K/V slot lists.
 
 In token-sparse attention, each query token attends to its own list of keys,
 such as the Top-K keys an indexer selects for it (DeepSeek Sparse Attention,
 DSA, selects 2048 per token). trtllm-gen ships static token-sparse kernels, but
 FlashInfer only dispatched them for MLA, DSA's core attention.
 `trtllm_batch_decode_with_kv_cache(..., sparse_top_k=K)` now dispatches them for
-MQA/GQA: each query token is its own request over one-token pages, attending to
+MQA: each query token is its own request over one-token pages, attending to
 its own list of at most `K` keys.
 
 - `block_tables` is `[batch, 2, K]`: each token's K and V slot indices, with

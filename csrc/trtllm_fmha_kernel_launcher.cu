@@ -337,14 +337,13 @@ void trtllm_paged_attention_launcher(
   bool const is_mla_decode = runner_params.isMla();
   runner_params.sparseMlaTopKLensPtr = sparse_mla_top_k_lens;
   runner_params.mHasSlidingWindowKvPool = has_sliding_window_kv_pool;
-  // Static token-sparse MQA/GQA: one-token pages and one CTA per query token holding all its heads.
+  // Static token-sparse MQA: one-token pages and one CTA per query token holding all its heads.
   // Only the decode entry point passes a top-k, so token-sparse always runs the generation kernels
   // (one query token per request); prefill tokens can use it as one-token requests.
   // The sparse kernels address K/V without a head stride, so they take one KV head.
-  bool const is_sparse_mqa_gqa = runner_params.isSparseMqaGqa() &&
-                                 sparse_mla_top_k_lens == nullptr && page_size == 1 &&
-                                 num_kv_heads == 1 && num_qo_heads <= 128;
-  TVM_FFI_ICHECK(is_mla_decode || is_sparse_mqa_gqa || sparse_mla_top_k <= 0)
+  bool const is_sparse_mqa = runner_params.isSparseMqa() && sparse_mla_top_k_lens == nullptr &&
+                             page_size == 1 && num_kv_heads == 1 && num_qo_heads <= 128;
+  TVM_FFI_ICHECK(is_mla_decode || is_sparse_mqa || sparse_mla_top_k <= 0)
       << "Token-sparse attention supports MLA decode, or MQA decode with one KV head, page "
          "size 1, no top-k lengths and at most 128 query heads";
 
@@ -370,7 +369,7 @@ void trtllm_paged_attention_launcher(
     // specified as causal, this is expected for better performance as each CTA will only process
     // one tokenQ in those cases, so dense mask works the same as causal mask.
     runner_params.mMaskType =
-        is_mla_decode || is_sparse_mqa_gqa
+        is_mla_decode || is_sparse_mqa
             ? TrtllmGenAttentionMaskType::Dense
             : (fixedWindowBinds(/*is_causal=*/true, max_kv_len, window_left, /*window_right=*/0)
                    ? TrtllmGenAttentionMaskType::SlidingOrChunkedCausal

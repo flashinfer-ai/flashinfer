@@ -393,8 +393,8 @@ struct TllmGenFmhaRunnerParams {
            (isSparseMla() && mHeadDimQk == 512 && mHeadDimV == 512);
   }
 
-  // Token-sparse MQA/GQA: the token-sparse kernels over separate K and V (not MLA's latent pool).
-  bool isSparseMqaGqa() const { return isSparseMla() && !isMla(); }
+  // Token-sparse MQA: the token-sparse kernels over separate K and V (not MLA's latent pool).
+  bool isSparseMqa() const { return isSparseMla() && !isMla(); }
 
   // set the attention mask type
   TllmGenFmhaRunnerParams& setAttentionMaskType(std::int8_t maskType) {

@@ -1,4 +1,4 @@
-"""Static token-sparse MQA/GQA decode through trtllm_batch_decode_with_kv_cache(sparse_top_k=...)."""
+"""Static token-sparse MQA decode through trtllm_batch_decode_with_kv_cache(sparse_top_k=...)."""
 
 from functools import partial
 
