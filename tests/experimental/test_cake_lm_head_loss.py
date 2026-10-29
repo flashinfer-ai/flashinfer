@@ -49,6 +49,8 @@ from tests.test_helpers.cake_package import cake_package
 # the FLASHINFER_CAKE_LM_HEAD_LOSS_* environment variables they read -- live in ``test_cake_lm_head_loss_api.py``.
 pkg = cake_package("cake_lm_head_loss")
 cake_backend = cake_package("cake_lm_head_loss", "cake_backend")
+# The opt-in forms (``memory_mode`` / ``num_valid_rows``); a call with neither keyword is ``cake_backend``'s.
+opt_in = cake_package("cake_lm_head_loss", "cake_backend_opt_in")
 cake_build = cake_package("cake_lm_head_loss", "cake_build")
 cake_jit = cake_package("cake_lm_head_loss", "cake_jit")
 ABI_CONTRACT = cake_backend.ABI_CONTRACT
@@ -159,6 +161,9 @@ def _host_inputs(T, objective="ce", *, seed=SEED, **kw):
     )
 
 
+_OPT_IN_KEYWORDS = {"memory_mode", "num_valid_rows", "check_num_valid_rows"}
+
+
 def _run(
     inp,
     C,
@@ -177,11 +182,13 @@ def _run(
     program; the public module ``flashinfer.chunked_lm_head`` is a pass-through to these two functions, tested in
     ``test_cake_lm_head_loss_api.py``).  ``switches``: the remaining switch keywords (``dx_finalize``, ``dw_stream``,
     ``hidden_count``, ``gemm_tuning``; ``logprob_dz`` / ``logprob_lbl`` of the log-probability entry), passed
-    through.  Returns ``loss`` / ``logp`` / ``dX`` / ``dW`` and the leaves."""
+    through; ``memory_mode`` / ``num_valid_rows`` / ``check_num_valid_rows`` call the opt-in module's entry points.
+    Returns ``loss`` / ``logp`` / ``dX`` / ``dW`` and the leaves."""
     X = inp.X.detach().requires_grad_(train_x)
     W = inp.W.detach().requires_grad_(train_w)
+    be = opt_in if _OPT_IN_KEYWORDS & switches.keys() else cake_backend
     if entry == "loss":
-        loss, logp = cake_backend.chunked_lm_head_loss(
+        loss, logp = be.chunked_lm_head_loss(
             X,
             W,
             inp.labels,
@@ -200,7 +207,7 @@ def _run(
         if train_x or train_w:
             (loss if scale is None else loss * scale).backward()
     else:
-        logp = cake_backend.chunked_lm_head_logprob(
+        logp = be.chunked_lm_head_logprob(
             X,
             W,
             inp.labels,
@@ -5732,6 +5739,458 @@ def test_all_ignored_rows_compacted_return_zeros_without_binding(entry, monkeypa
 
 
 # ---------------------------------------------------------------------------
+# Memory budget, caller's valid-row count, saved-state release (host layer)
+# ---------------------------------------------------------------------------
+
+
+def _loss_graph(inp, C=16, **kw):
+    """A loss graph of the opt-in autograd entry on the reference backend (``kw`` passed through; without
+    ``memory_mode`` / ``num_valid_rows`` the caller's count selects the opt-in form): ``(X, W, loss)``."""
+    X = inp.X.detach().requires_grad_()
+    W = inp.W.detach().requires_grad_()
+    if not _OPT_IN_KEYWORDS & kw.keys():
+        kw["num_valid_rows"] = int(inp.valid.sum())
+    loss = opt_in.chunked_lm_head_loss(
+        X,
+        W,
+        inp.labels,
+        objective=inp.objective,
+        loss_div=inp.loss_div if inp.objective == "ce" else None,
+        infer_logp=inp.infer_logp,
+        loss_weights=inp.loss_weights,
+        chunk_size=C,
+        backend=kw.pop("backend", "reference"),
+        **kw,
+    )
+    return X, W, loss
+
+
+def test_memory_mode_and_count_keywords_are_validated():
+    """``memory_mode`` is ``None`` / ``"fast"`` / ``"budget"`` (``"budget"`` on the cake backend only); ``num_valid_rows``
+    is a host integer in ``[0, T]`` -- a CUDA tensor (reading it would synchronize), a bool, a float, a string or a
+    multi-element tensor is a ``ValueError`` -- on both autograd entries."""
+    assert opt_in.memory_mode_default() == "fast"
+    assert opt_in._resolve_memory_mode(None) == "fast"
+    assert opt_in._resolve_memory_mode("budget") == "budget"
+    for bad in ("slow", "", 1, True):
+        with pytest.raises(ValueError, match="memory_mode"):
+            opt_in._resolve_memory_mode(bad)
+    inp = _host_inputs(37)
+    T, n = inp.T, int(inp.valid.sum())
+    assert 0 < n < T
+    for entry in ("loss", "logprob"):
+        with pytest.raises(ValueError, match="memory_mode"):
+            _run(inp, 16, entry=entry, memory_mode="slow")
+        with pytest.raises(ValueError, match="cake backend"):
+            _run(inp, 16, entry=entry, memory_mode="budget")
+        for bad in (True, 3.0, -1, T + 1, torch.tensor([1, 2]), torch.tensor(2.0), "5"):
+            with pytest.raises(ValueError, match="num_valid_rows"):
+                _run(inp, 16, entry=entry, num_valid_rows=bad)
+        if torch.cuda.is_available():
+            with pytest.raises(ValueError, match="host integer"):
+                _run(
+                    inp,
+                    16,
+                    entry=entry,
+                    num_valid_rows=torch.tensor(n, device="cuda"),
+                )
+    with pytest.raises(ValueError, match="BF16"):
+        opt_in._check_budget_call("cake", torch.float32)
+    given = opt_in._given_count
+    assert given(None, T) is None and given(0, T) == 0 and given(T, T) == T
+    assert (
+        given(torch.tensor(n), T) == n
+        and given(torch.tensor([n], dtype=torch.int32), T) == n
+    )
+    np = pytest.importorskip("numpy")
+    assert given(np.int64(n), T) == n and given(np.uint16(n), T) == n
+    with pytest.raises(ValueError, match="num_valid_rows"):
+        given(np.float32(n), T)
+
+
+@pytest.mark.parametrize("entry", ["loss", "logprob"])
+def test_given_valid_row_count_is_bitwise(entry):
+    """``num_valid_rows`` (the caller's count: the valid-row index formed on the device) gives the bits of the counted
+    call -- some rows ignored over one and several chunks, every row valid, every row ignored, a short call, the
+    checked and the unchecked form; the uncompacted path does not use the count."""
+    for T, kw in (
+        (37, {}),
+        (37, dict(ignore_frac=0.0)),
+        (37, dict(ignore_frac=1.0)),
+        (5, {}),
+    ):
+        inp = _host_inputs(T, **kw)
+        n = int(inp.valid.sum())
+        for C in (16, 64):
+            for compact in (None, False):
+                counted = _run(inp, C, entry=entry, compact_rows=compact)
+                for check in (False, True):
+                    given = _run(
+                        inp,
+                        C,
+                        entry=entry,
+                        compact_rows=compact,
+                        num_valid_rows=n,
+                        check_num_valid_rows=check,
+                    )
+                    _assert_same_bits(counted, given)
+
+
+def test_given_valid_row_count_mismatch_raises_when_checked():
+    """``check_num_valid_rows=True`` reads the count back and raises ``ValueError`` on a wrong count (both entries);
+    host labels always take the checked form; the right count gives ``nonzero``'s index and the valid-row mask, every
+    row valid gives no index."""
+    inp = _host_inputs(37)
+    n = int(inp.valid.sum())
+    for entry in ("loss", "logprob"):
+        for wrong in (n - 1, n + 1):
+            with pytest.raises(ValueError, match="num_valid_rows"):
+                _run(
+                    inp,
+                    16,
+                    entry=entry,
+                    num_valid_rows=wrong,
+                    check_num_valid_rows=True,
+                )
+    with pytest.raises(ValueError, match="num_valid_rows"):
+        opt_in.given_valid_rows(inp.labels.cpu(), n - 1)
+    idx, mask = opt_in.given_valid_rows(inp.labels, n, mask=True, check=True)
+    assert torch.equal(idx, inp.valid.nonzero().reshape(-1))
+    assert torch.equal(mask, inp.valid)
+    assert opt_in.given_valid_rows(inp.labels, n)[1] is None
+    full = inp.labels[inp.valid]
+    assert opt_in.given_valid_rows(full, n, mask=True, check=True) == (None, None)
+
+
+def test_backward_releases_the_saved_state():
+    """The early release is budget mode's (``ctx.early_release``; the budget forms run on the ``cake`` backend, so
+    here the flag is set on the node as budget mode sets it -- the device tests run budget mode itself): a backward
+    that frees the graph drops the forward's saved state (the node's ``released`` flag, its accumulators) and a second
+    backward raises PyTorch's error; ``retain_graph=True`` keeps it -- the repeated backward is bitwise the first --
+    and the graph's last backward still releases.  Every row ignored releases too.  A given count alone keeps the
+    saved state until the graph is freed.  Without PyTorch's graph-task API nothing is released early
+    (``test_backward_release_falls_back_without_the_private_api``)."""
+    have_api = hasattr(torch._C._autograd, "_get_current_graph_task_keep_graph")
+    inp = _host_inputs(37, "policy")
+    X, W, loss = _loss_graph(inp)
+    node = loss.grad_fn
+    assert node.early_release is False  # a given count alone: no early release
+    loss.backward()
+    assert node.released is False and node.dx_acc is not None
+    kept = (X.grad.clone(), W.grad.clone())
+    X, W, loss = _loss_graph(inp)
+    node = loss.grad_fn
+    node.early_release = True  # what memory_mode="budget" sets
+    assert (
+        node.dx_acc is not None and node.dw_acc is not None
+    )  # three compact chunks: an accumulator before the last
+    loss.backward(retain_graph=True)
+    assert torch.equal(_bits(X.grad), _bits(kept[0]))
+    assert torch.equal(_bits(W.grad), _bits(kept[1]))
+    assert (
+        node.released is False and node.dx_acc is not None and node.dw_acc is not None
+    )
+    first = (X.grad.clone(), W.grad.clone())
+    X.grad = W.grad = None
+    loss.backward()
+    assert torch.equal(_bits(X.grad), _bits(first[0]))
+    assert torch.equal(_bits(W.grad), _bits(first[1]))
+    assert node.released is have_api
+    if have_api:
+        assert node.dx_acc is None and node.dw_acc is None and node.row_index is None
+    with pytest.raises(RuntimeError, match="second time"):
+        loss.backward()
+    # every row ignored: zero gradients, the state released all the same
+    none = _host_inputs(37, ignore_frac=1.0)
+    X, W, loss = _loss_graph(none)
+    node = loss.grad_fn
+    node.early_release = True
+    loss.backward()
+    assert torch.all(X.grad == 0) and torch.all(W.grad == 0)
+    assert node.released is have_api
+    # a frozen W: the dX-only backward releases as well
+    inp = _host_inputs(37)
+    X = inp.X.detach().requires_grad_()
+    loss = opt_in.chunked_lm_head_loss(
+        X,
+        inp.W,
+        inp.labels,
+        loss_div=inp.loss_div,
+        chunk_size=16,
+        backend="reference",
+        num_valid_rows=int(inp.valid.sum()),
+    )
+    node = loss.grad_fn
+    node.early_release = True
+    loss.backward()
+    assert node.released is have_api and X.grad is not None
+
+
+def test_backward_release_falls_back_without_the_private_api(monkeypatch):
+    """``_keep_graph`` answers ``True`` (keep) when PyTorch lacks the graph-task API (resolved at import as
+    ``_GRAPH_TASK_KEEP_GRAPH``) or it raises: the backward then keeps the saved state until the graph is freed (the
+    previous lifetime) with bitwise the same gradients."""
+    inp = _host_inputs(37, "policy")
+    X, W, loss = _loss_graph(inp)
+    loss.backward()
+    released = (X.grad.clone(), W.grad.clone())
+
+    def broken():
+        raise RuntimeError("graph task API changed")
+
+    monkeypatch.setattr(opt_in, "_GRAPH_TASK_KEEP_GRAPH", broken)
+    assert opt_in._keep_graph() is True
+    monkeypatch.setattr(opt_in, "_GRAPH_TASK_KEEP_GRAPH", None)
+    assert opt_in._keep_graph() is True
+    X, W, loss = _loss_graph(inp)
+    node = loss.grad_fn
+    node.early_release = True  # what memory_mode="budget" sets
+    loss.backward()
+    assert node.released is False and node.dx_acc is not None
+    assert torch.equal(_bits(X.grad), _bits(released[0]))
+    assert torch.equal(_bits(W.grad), _bits(released[1]))
+
+
+def test_default_call_is_the_backend_entry():
+    """Without ``memory_mode`` / ``num_valid_rows`` (or with ``memory_mode="fast"`` alone) the opt-in entry points are
+    ``cake_backend``'s: the graph node is ``cake_backend``'s autograd function, which keeps its saved state until the
+    graph is freed; a given count or ``"budget"`` takes this module's."""
+    inp = _host_inputs(37)
+    n = int(inp.valid.sum())
+    for kw, cls in (
+        ({}, cake_backend.ChunkedLmHeadLossFunction),
+        (dict(memory_mode="fast"), cake_backend.ChunkedLmHeadLossFunction),
+        (dict(num_valid_rows=n), opt_in.ChunkedLmHeadLossFunction),
+    ):
+        X, W, loss = _loss_graph(inp, **(kw or dict(memory_mode=None)))
+        assert loss.grad_fn._forward_cls is cls, kw
+        loss.backward()
+        # outside budget mode the saved state lives until the graph is freed
+        assert loss.grad_fn.dx_acc is not None, kw
+    # check_num_valid_rows=True needs a count, on both entries and in every memory mode
+    for mode in (None, "fast", "budget"):
+        with pytest.raises(ValueError, match="needs num_valid_rows"):
+            _loss_graph(inp, memory_mode=mode, check_num_valid_rows=True)
+        with pytest.raises(ValueError, match="needs num_valid_rows"):
+            opt_in.chunked_lm_head_logprob(
+                inp.X,
+                inp.W,
+                inp.labels,
+                chunk_size=16,
+                backend="reference",
+                memory_mode=mode,
+                check_num_valid_rows=True,
+            )
+    for kw, cls in (
+        ({}, cake_backend.ChunkedLmHeadLogprobFunction),
+        (dict(memory_mode="fast"), cake_backend.ChunkedLmHeadLogprobFunction),
+        (dict(num_valid_rows=n), opt_in.ChunkedLmHeadLogprobFunction),
+    ):
+        logp = opt_in.chunked_lm_head_logprob(
+            inp.X.detach().requires_grad_(),
+            inp.W,
+            inp.labels,
+            chunk_size=16,
+            backend="reference",
+            **kw,
+        )
+        assert logp.grad_fn._forward_cls is cls, kw
+
+
+def test_template_only_runner_never_launches():
+    """The opt-in module's ``prepare_lm_head_loss(_template_only=True)`` (its eager entry points' binding build, whose
+    buffers alias one another) takes the ``cake`` backend only, and a template-only runner refuses to launch."""
+    inp = _host_inputs(37)
+    common = dict(objective="ce", loss_div=inp.loss_div, chunk_size=16)
+    with pytest.raises(ValueError, match="template-only"):
+        opt_in.prepare_lm_head_loss(
+            inp.X,
+            inp.W,
+            inp.labels,
+            backend="reference",
+            _template_only=True,
+            **common,
+        )
+    runner = opt_in.prepare_lm_head_loss(
+        inp.X, inp.W, inp.labels, backend="reference", **common
+    )
+    assert runner._template_only is False
+    runner._template_only = True
+    for launch in (runner.forward, runner.backward, runner.step):
+        with pytest.raises(RuntimeError, match="never launches"):
+            launch()
+
+
+_ISSUE_SHAPES = (  # (H, V, T) of flashinfer#7545; about a third of the labels ignored
+    (6144, 154880, 16384),
+    (4096, 154880, 16384),
+    (6144, 154880, 16231),
+    (4096, 154880, 16231),
+    (6144, 154880, 4096),
+    (5120, 248320, 4096),
+    (5120, 248320, 16231),
+    (5120, 248320, 16384),
+)
+
+
+def test_memory_plan_forms():
+    """The budget rule: at the issue's shapes (two thirds of the rows valid, and every row valid) both entries get a
+    form whose predicted peak fits the budget -- below the logits-materializing head's bytes -- with ``dw_rows`` and
+    the recompute block multiples of the granule; a shape whose fast form fits keeps it; ``fuse_dw_cast=False`` drops
+    the fused form; without the recompute arm the smallest predicted peak is returned unfitted; bad sizes raise."""
+    g = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
+    step = opt_in.dw_block_step(g)
+    assert step % 256 == 0 and step % int(g.row_tile) == 0
+    for H, V, T in _ISSUE_SHAPES:
+        for R in (round(0.67 * T), T):
+            head = 2 * R * V + 2 * V * H + 2 * T * H
+            for entry in ("loss", "logprob"):
+                for buffer_rows in (None, min(4096, T)):
+                    mp = opt_in.memory_plan(
+                        entry,
+                        num_rows=T,
+                        rows=R,
+                        hidden=H,
+                        vocab=V,
+                        chunk=4096,
+                        geometry=g,
+                        buffer_rows=buffer_rows,
+                    )
+                    key = (H, V, T, R, entry, buffer_rows, mp)
+                    assert mp.form in opt_in.MEMORY_FORMS, key
+                    assert mp.fits and mp.predicted_bytes <= mp.budget_bytes < head, key
+                    if mp.recompute:
+                        assert mp.form in ("partial", "recompute"), key
+                        assert mp.dw_rows % step == 0 and mp.block_rows % step == 0, key
+                        assert 0 < mp.block_rows <= V - mp.dw_rows, key
+                        assert (mp.dw_rows > 0) == (mp.form == "partial"), key
+                    else:
+                        assert mp.dw_rows == V, key
+    # the accumulated prefix is searched with the block it leaves (and the saved row scale): at a shape whose partial
+    # form fits with a few kilobytes to spare, the rule keeps it rather than recomputing every row
+    for entry in ("loss", "logprob"):
+        for slabs in (0, 1, 2, 3):
+            mp = opt_in.memory_plan(
+                entry,
+                num_rows=16384,
+                rows=10980,
+                hidden=6144,
+                vocab=154880,
+                chunk=4096,
+                geometry=g,
+                dx_ws_slabs=slabs,
+                buffer_rows=4096,
+            )
+            assert mp.form == "partial" and mp.fits and mp.dw_rows > 0, (
+                entry,
+                slabs,
+                mp,
+            )
+    # many rows per vocabulary row: the fast (fused) form fits; without it, the unfused one
+    small = dict(
+        num_rows=16384, rows=16384, hidden=512, vocab=2048, chunk=4096, geometry=g
+    )
+    assert opt_in.memory_plan("loss", **small).form == "fused"
+    assert opt_in.memory_plan("loss", fuse_dw_cast=False, **small).form == "unfused"
+    assert opt_in.memory_plan("logprob", **small).form == "fused"
+    # no recompute arm: the fused / unfused forms only, the smaller predicted peak, not fitting
+    mp = opt_in.memory_plan(
+        "loss",
+        num_rows=16384,
+        rows=10977,
+        hidden=6144,
+        vocab=154880,
+        chunk=4096,
+        geometry=g,
+        recompute=False,
+    )
+    assert mp.form in ("fused", "unfused") and not mp.fits and not mp.recompute
+    for bad in (
+        dict(rows=0),
+        dict(rows=17000),
+        dict(hidden=0),
+    ):
+        args = dict(
+            num_rows=16384,
+            rows=10977,
+            hidden=6144,
+            vocab=154880,
+            chunk=4096,
+            geometry=g,
+        )
+        args.update(bad)
+        with pytest.raises(ValueError, match="memory_plan"):
+            opt_in.memory_plan("loss", **args)
+    with pytest.raises(ValueError, match="entry"):
+        opt_in.memory_plan("other", **small)
+
+
+def test_budget_plan_keys():
+    """The budget forms' plans: ``keep_row_grad`` (loss entry) saves every chunk's per-row scale right after its
+    ``row_finalize``; ``dw_rows`` (an unfused plan with dW, a granule multiple up to ``V``) leaves the accumulator
+    uncast (no ``dW`` cast key) and binds the accumulate GEMM on the leading ``dw_rows`` columns of ``dz``."""
+    g = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
+    step = opt_in.dw_block_step(g)
+    common = dict(
+        need_dx=True,
+        need_dw=True,
+        geometry=g,
+        dx_max_slices=4,
+        num_sms=148,
+        dx_resident=74,
+        dx_finalize=True,
+    )
+    problem = _problem(8700, 6144, 154880, 4096)
+    plain = opt_in.make_plan(problem, valid_rows=8265, arch="sm_100a", **common)
+    kept = opt_in.make_plan(
+        problem,
+        valid_rows=8265,
+        arch="sm_100a",
+        dw_rows=40 * step,
+        keep_row_grad=True,
+        **common,
+    )
+    assert plain.dw_rows is None and not plain.keep_row_grad
+    assert kept.dw_rows == 40 * step and kept.keep_row_grad
+    keys = opt_in.forward_keys(kept)
+    for index in range(kept.num_chunks):
+        pos = keys.index(("row_finalize", index))
+        assert keys[pos + 1] == ("save_row_grad", index)
+    assert [k for k in keys if k[0] != "save_row_grad"] == list(
+        opt_in.forward_keys(plain)
+    )
+    assert "save_row_grad" in opt_in.HOST_STAGES
+    assert not any(k[1] == "dw" for k in opt_in.cast_keys(kept))
+    assert any(k[1] == "dw" for k in opt_in.cast_keys(plain))
+    with pytest.raises(ValueError, match="keep_row_grad"):
+        opt_in.make_plan(
+            _problem(8700, 6144, 154880, 4096, entry="logprob"),
+            arch="sm_100a",
+            keep_row_grad=True,
+            **common,
+        )
+    for bad, kw in (
+        (step + 1, {}),
+        (0, {}),
+        (154880 + step, {}),
+        (step, dict(fuse_dw_cast=True)),
+    ):
+        with pytest.raises(ValueError, match="dw_rows"):
+            opt_in.make_plan(problem, arch="sm_100a", dw_rows=bad, **common, **kw)
+    with pytest.raises(ValueError, match="dw_rows"):
+        opt_in.make_plan(
+            problem, arch="sm_100a", dw_rows=step, **dict(common, need_dw=False)
+        )
+    # V itself is accepted (the log-probability entry's unfused budget form)
+    assert (
+        opt_in.make_plan(problem, arch="sm_100a", dw_rows=154880, **common).dw_rows
+        == 154880
+    )
+    with pytest.raises(ValueError, match="CUDA device"):
+        opt_in.preload("cpu")
+
+
+# ---------------------------------------------------------------------------
 # Device tests (compute capability 10.0 / 10.3 with a registered program; the pinned
 # GLM-class geometry H = 6144, V = 154880 with small T)
 # ---------------------------------------------------------------------------
@@ -7262,3 +7721,400 @@ def test_device_logprob_backward_does_not_synchronize(glm_weight):
             assert torch.equal(mask, inp.valid)
         else:
             assert index is None and mask is None
+
+
+# ---------------------------------------------------------------------------
+# Device tests of memory_mode="budget", num_valid_rows and preload
+# ---------------------------------------------------------------------------
+
+
+def _poison_allocator(nbytes: int = 1 << 31) -> None:
+    """Fill free caching-allocator memory with 0xFF bytes (a NaN pattern in BF16 and FP32) between two arms, so a
+    buffer that one form forgets to write cannot inherit the previous arm's bits."""
+    torch.cuda.synchronize()
+    junk = torch.empty((int(nbytes),), dtype=torch.uint8, device=CUDA).fill_(0xFF)
+    del junk
+    torch.cuda.synchronize()
+
+
+def _require_recompute():
+    module_name, record = cake_backend.record_for(CUDA)
+    if cake_backend.LOGPROB_DZ_STAGE not in cake_jit.registered_stages(module_name):
+        pytest.skip(
+            "the registered program has no dz arm of the logits GEMM (no recompute forms)"
+        )
+    return opt_in.dw_block_step(Geometry.from_record(record))
+
+
+def _budget_forms(step: int, V: int = DEFAULT_V) -> tuple:
+    """``(form, dw_rows, block_rows)`` of every budget form at vocabulary ``V``: several blocks with a short last one,
+    one granule recomputed, a whole-vocabulary block."""
+    g = V // step
+    return (
+        ("fused", V, None),
+        ("unfused", V, None),
+        ("partial", (g // 2) * step, (g // 4 + 1) * step),
+        ("partial", (g - 1) * step, step),
+        ("recompute", 0, (g // 3 + 1) * step),
+        ("recompute", 0, g * step),
+    )
+
+
+def _force_budget_plan(monkeypatch, form, calls: list) -> None:
+    """Route ``memory_mode="budget"`` to the form ``(form, dw_rows, block_rows)`` instead of the rule's choice."""
+    plan = opt_in.MemoryPlan(*form, predicted_bytes=0, budget_bytes=0)
+
+    def forced(entry, device, **kw):
+        calls.append(entry)
+        return plan
+
+    monkeypatch.setattr(opt_in, "_budget_plan", forced)
+
+
+@pytest.mark.parametrize("objective", ["ce", "policy"])
+def test_device_budget_forms_are_bitwise(glm_weight, monkeypatch, objective):
+    """Every ``memory_mode="budget"`` form of the loss entry -- fused, unfused, an accumulate of the leading vocabulary
+    rows with the others recomputed in vocabulary blocks (several blocks with a short last one; one granule), a
+    recompute of every row (three blocks; one block) -- gives the bits (integer views) of the fast form: one chunk,
+    two chunks, three compacted chunks (the hidden count and the dW side stream), three uncompacted chunks and the
+    caller's count, with the caching allocator poisoned between the arms."""
+    _require_program(entry="loss")
+    step = _require_recompute()
+    for T, C, kw in (
+        (1500, 4096, {}),
+        (4097, 2048, {}),
+        (8700, 4096, {}),
+        (8700, 4096, dict(compact_rows=False)),
+        (8700, 4096, dict(num_valid_rows=True)),
+    ):
+        inp = _device_inputs(T, objective, W=glm_weight)
+        kw = dict(kw)
+        if kw.get("num_valid_rows"):
+            kw["num_valid_rows"] = int(inp.valid.sum())
+        _poison_allocator()
+        fast = _run(inp, C, backend="cake", **kw)
+        for form in _budget_forms(step):
+            calls: list = []
+            _force_budget_plan(monkeypatch, form, calls)
+            _poison_allocator()
+            budget = _run(inp, C, backend="cake", memory_mode="budget", **kw)
+            assert calls == ["loss"], (T, C, kw, form)
+            _assert_same_bits(fast, budget)
+        monkeypatch.undo()
+
+
+def test_device_logprob_budget_forms_are_bitwise(glm_weight, monkeypatch):
+    """Every budget form of the log-probability backward gives the fast form's bits (integer views), with and without
+    ``dX``; a frozen ``W`` takes the fast backward (no budget plan)."""
+    _require_program(entry="logprob")
+    step = _require_recompute()
+    for T, C, train_x in ((1500, 4096, True), (8700, 4096, True), (8700, 4096, False)):
+        inp = _device_inputs(T, W=glm_weight)
+        _poison_allocator()
+        fast = _run(inp, C, entry="logprob", backend="cake", train_x=train_x)
+        for form in _budget_forms(step):
+            calls: list = []
+            _force_budget_plan(monkeypatch, form, calls)
+            _poison_allocator()
+            budget = _run(
+                inp,
+                C,
+                entry="logprob",
+                backend="cake",
+                train_x=train_x,
+                memory_mode="budget",
+            )
+            assert calls == ["logprob"], (T, C, train_x, form)
+            _assert_same_bits(fast, budget, keys=("logp", "dX", "dW"))
+        calls = []
+        _force_budget_plan(monkeypatch, ("recompute", 0, step), calls)
+        frozen = _run(
+            inp, C, entry="logprob", backend="cake", train_w=False, memory_mode="budget"
+        )
+        assert calls == [] and frozen["dW"] is None
+        _assert_same_bits(
+            _run(inp, C, entry="logprob", backend="cake", train_w=False),
+            frozen,
+            keys=("logp", "dX"),
+        )
+        monkeypatch.undo()
+
+
+def _budget_step(inp, C, entry, **kw):
+    """One training step (forward + backward through the autograd entry, BF16 gradients) with its peak allocated
+    bytes above the bytes allocated before it (the outputs and gradients count): ``(result, peak, memory_plan)``."""
+    X = inp.X.detach().requires_grad_(True)
+    W = inp.W.detach().requires_grad_(True)
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    mplan = None
+    if entry == "loss":
+        loss, logp = opt_in.chunked_lm_head_loss(
+            X,
+            W,
+            inp.labels,
+            objective=inp.objective,
+            loss_div=inp.loss_div if inp.objective == "ce" else None,
+            infer_logp=inp.infer_logp,
+            loss_weights=inp.loss_weights,
+            chunk_size=C,
+            return_logp=True,
+            backend="cake",
+            **kw,
+        )
+        mplan = getattr(loss.grad_fn, "memory_plan", None)  # an opt-in form's plan
+        loss.backward()
+        loss = loss.detach()
+    else:
+        logp = opt_in.chunked_lm_head_logprob(
+            X, W, inp.labels, chunk_size=C, backend="cake", **kw
+        )
+        logp.backward(inp.dlogp)
+        loss = None
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() - base
+    return dict(loss=loss, logp=logp.detach(), dX=X.grad, dW=W.grad), peak, mplan
+
+
+@pytest.mark.parametrize("entry", ["loss", "logprob"])
+@pytest.mark.parametrize("T", [4096, 16384])
+def test_device_budget_step_peak_within_the_head_bytes(glm_weight, entry, T):
+    """Inputs like flashinfer#7545's (a third of the labels ignored; one chunk and four): the budget step's peak --
+    forward through backward, outputs and gradients included, of the call that binds and of one from the remembered
+    binding -- stays within the bytes of a head that materializes the BF16 logits of the valid rows
+    (``2 * T_v * V + 2 * V * H + 2 * T * H``) and its outputs are bitwise the fast step's; the loss entry records a
+    recompute form."""
+    _require_program(entry=entry)
+    _require_recompute()
+    inp = make_inputs(
+        T, seed=SEED + 7545 + T, device=CUDA, W=glm_weight, ignore_frac=0.33
+    )
+    R, H, V = int(inp.valid.sum()), DEFAULT_H, DEFAULT_V
+    head = 2 * R * V + 2 * V * H + 2 * T * H
+    keys = ("loss", "logp", "dX", "dW") if entry == "loss" else ("logp", "dX", "dW")
+    fast, _, _ = _budget_step(inp, 4096, entry)
+    peaks = []
+    for _ in range(
+        2
+    ):  # the first call also binds; the second launches from the remembered binding
+        result, peak, mplan = _budget_step(inp, 4096, entry, memory_mode="budget")
+        _assert_same_bits(fast, result, keys=keys)
+        peaks.append(peak)
+        del result
+    if entry == "loss":
+        assert mplan is not None and mplan.recompute and mplan.fits, mplan
+    assert max(peaks) <= head, (peaks, head)
+
+
+@pytest.mark.parametrize("memory_mode", ["fast", "budget"])
+@pytest.mark.parametrize("objective", ["ce", "policy"])
+def test_device_cache_miss_peaks_like_a_hit(glm_weight, memory_mode, objective):
+    """A training loop's step misses the binding cache whenever its valid-row count is new: in the opt-in forms such a
+    step (the binding built on buffers that alias one another) peaks no higher than the same step from the remembered
+    binding and gives its bits (integer views, the allocator poisoned between them), for each memory mode (``"fast"``
+    with the caller's count) and both loss objectives."""
+    _require_program(entry="loss")
+    if memory_mode == "budget":
+        _require_recompute()
+    inp = make_inputs(
+        16384,
+        objective=objective,
+        seed=SEED + 7546,
+        device=CUDA,
+        W=glm_weight,
+        ignore_frac=0.33,
+    )
+    keys = ("loss", "logp", "dX", "dW")
+    kw = dict(memory_mode=memory_mode)
+    if memory_mode == "fast":
+        kw["num_valid_rows"] = int(inp.valid.sum())  # the opt-in form of "fast"
+    cache = opt_in.BINDING_CACHE
+    cache.clear()
+    results, peaks, counts = [], [], []
+    for _ in range(2):  # a miss, then a hit of the same binding
+        _poison_allocator()
+        torch.cuda.empty_cache()
+        misses = cache.misses
+        result, peak, _ = _budget_step(inp, 4096, "loss", **kw)
+        counts.append(cache.misses - misses)
+        results.append(result)
+        peaks.append(peak)
+    assert counts == [1, 0], counts
+    _assert_same_bits(results[0], results[1], keys=keys)
+    # the binding's own scratch (allocated by the miss, before the hit's baseline) is the only allowance
+    assert peaks[0] <= peaks[1] + cache.owned_bytes, (peaks, cache.owned_bytes)
+
+
+def test_device_budget_frozen_inputs_and_retained_graph(glm_weight):
+    """``memory_mode="budget"`` with a frozen ``X`` (a recompute form without ``dX``) or a frozen ``W`` (no budget
+    plan) gives the fast form's bits; a retained graph repeats the recompute bitwise, the graph's last backward
+    releases the saved state and a further backward raises."""
+    _require_program(entry="loss")
+    _require_recompute()
+    inp = make_inputs(
+        8700, seed=SEED + 8700, device=CUDA, W=glm_weight, ignore_frac=0.33
+    )
+    for train_x, train_w in ((False, True), (True, False)):
+        fast = _run(inp, 4096, backend="cake", train_x=train_x, train_w=train_w)
+        budget = _run(
+            inp,
+            4096,
+            backend="cake",
+            train_x=train_x,
+            train_w=train_w,
+            memory_mode="budget",
+        )
+        _assert_same_bits(fast, budget)
+    fast = _run(inp, 4096, backend="cake")
+    X, W, loss = _loss_graph(inp, 4096, backend="cake", memory_mode="budget")
+    node = loss.grad_fn
+    assert node.memory_plan is not None and node.memory_plan.recompute
+    loss.backward(retain_graph=True)
+    assert torch.equal(_bits(X.grad), _bits(fast["dX"]))
+    assert torch.equal(_bits(W.grad), _bits(fast["dW"]))
+    X.grad = W.grad = None
+    loss.backward()
+    assert torch.equal(_bits(X.grad), _bits(fast["dX"]))
+    assert torch.equal(_bits(W.grad), _bits(fast["dW"]))
+    if hasattr(torch._C._autograd, "_get_current_graph_task_keep_graph"):
+        assert node.released and node.row_state is None and node.dx_acc is None
+    with pytest.raises(RuntimeError, match="second time"):
+        loss.backward()
+
+
+def test_device_given_count_is_bitwise_and_does_not_synchronize(glm_weight):
+    """``num_valid_rows`` on the device: bitwise (integer views) the counted call's outputs -- one and three chunks,
+    some rows ignored and none, both objectives and the log-probability entry, fast and budget -- and the forward of a
+    remembered binding runs without a host synchronization (PyTorch's sync debug mode ``"error"``)."""
+    _require_program(entry="loss")
+    if opt_in._given_count_readback(CUDA):
+        pytest.skip(
+            "this program's toolchain keeps the given count on its checked (readback) form"
+        )
+    budget = (
+        None,
+        "budget",
+    )  # without the dz arm the budget rule keeps to the fused / unfused forms
+    for T, ignore in ((1500, 0.05), (8700, 0.05), (8700, 0.0)):
+        for objective in ("ce", "policy"):
+            inp = make_inputs(
+                T,
+                objective=objective,
+                seed=SEED + 31 + T,
+                device=CUDA,
+                W=glm_weight,
+                ignore_frac=ignore,
+            )
+            n = int(inp.valid.sum())
+            counted = _run(inp, 4096, backend="cake")
+            for mode in budget:
+                given = _run(
+                    inp, 4096, backend="cake", num_valid_rows=n, memory_mode=mode
+                )
+                _assert_same_bits(counted, given)
+                X = inp.X.detach().requires_grad_(True)
+                W = inp.W.detach().requires_grad_(True)
+                torch.cuda.synchronize()
+                torch.cuda.set_sync_debug_mode("error")
+                try:
+                    loss = opt_in.chunked_lm_head_loss(
+                        X,
+                        W,
+                        inp.labels,
+                        objective=objective,
+                        loss_div=inp.loss_div if objective == "ce" else None,
+                        infer_logp=inp.infer_logp,
+                        loss_weights=inp.loss_weights,
+                        chunk_size=4096,
+                        backend="cake",
+                        num_valid_rows=n,
+                        memory_mode=mode,
+                    )
+                finally:
+                    torch.cuda.set_sync_debug_mode("default")
+                loss.backward()
+                torch.cuda.synchronize()
+                assert torch.equal(_bits(loss), _bits(counted["loss"]))
+                assert torch.equal(_bits(X.grad), _bits(counted["dX"]))
+                assert torch.equal(_bits(W.grad), _bits(counted["dW"]))
+        if not generated_program_available(CUDA, entry="logprob"):
+            continue
+        inp = _device_inputs(T, W=glm_weight)
+        n = int(inp.valid.sum())
+        counted = _run(inp, 4096, entry="logprob", backend="cake")
+        given = _run(inp, 4096, entry="logprob", backend="cake", num_valid_rows=n)
+        _assert_same_bits(counted, given, keys=("logp", "dX", "dW"))
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            opt_in.chunked_lm_head_logprob(
+                inp.X,
+                inp.W,
+                inp.labels,
+                chunk_size=4096,
+                backend="cake",
+                num_valid_rows=n,
+            )
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        torch.cuda.synchronize()
+
+
+_WRONG_COUNT_SCRIPT = """
+import sys, torch
+sys.path.insert(0, {root!r})
+from tests.test_helpers.cake_package import cake_package
+opt_in = cake_package("cake_lm_head_loss", "cake_backend_opt_in")
+labels = torch.tensor([0, -100, 3, 1, -100, 2], device="cuda")
+index, _ = opt_in.given_valid_rows(labels, 4)
+torch.cuda.synchronize()
+print("RIGHT", index.tolist(), flush=True)
+opt_in.given_valid_rows(labels, 3)
+torch.cuda.synchronize()
+print("WRONG_PASSED", flush=True)
+"""
+
+
+def test_device_given_count_mismatch_stops_the_stream():
+    """An unchecked wrong ``num_valid_rows`` stops the stream with a device-side assertion before any kernel reads the
+    index (run in a fresh process: the assertion ends the CUDA context); the right count passes."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires a CUDA device")
+    if opt_in._given_count_readback(CUDA):
+        pytest.skip(
+            "this program's toolchain keeps the given count on its checked (readback) form"
+        )
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    env = dict(
+        os.environ, PYTHONPATH=root + os.pathsep + os.environ.get("PYTHONPATH", "")
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", _WRONG_COUNT_SCRIPT.format(root=root)],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=root,
+        timeout=600,
+    )
+    report = f"{proc.returncode}\n{proc.stdout[-2000:]}\n{proc.stderr[-4000:]}"
+    assert "RIGHT [0, 2, 3, 5]" in proc.stdout, report
+    assert "WRONG_PASSED" not in proc.stdout and proc.returncode != 0, report
+    assert "assert" in proc.stderr.lower(), report
+
+
+def test_device_preload(glm_weight):
+    """``preload`` (by default, index and device) creates the per-device side stream and count cells, is repeatable,
+    and a call after it gives the same bits."""
+    _require_program(entry="loss")
+    inp = _device_inputs(4097, W=glm_weight)
+    before = _run(inp, 4096, backend="cake")
+    opt_in.preload()
+    index = torch.cuda.current_device()
+    opt_in.preload(index)
+    opt_in.preload(torch.device("cuda", index))
+    assert (
+        index in cake_backend._DW_STREAMS and index in cake_backend._HIDDEN_COUNT_CELLS
+    )
+    assert cake_backend._HIDDEN_COUNT_ARANGE[index].numel() >= opt_in.PRELOAD_ROWS
+    _assert_same_bits(before, _run(inp, 4096, backend="cake"))
