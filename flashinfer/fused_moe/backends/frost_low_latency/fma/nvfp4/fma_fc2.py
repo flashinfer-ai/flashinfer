@@ -170,6 +170,12 @@ def _kernel(
             shared[warp * 4 + 1] = cutlass.Float32(0.0)
             shared[warp * 4 + 2] = cutlass.Float32(0.0)
             shared[warp * 4 + 3] = cutlass.Float32(0.0)
+            if cutlass.const_expr(not finalize):
+                # Raw output keeps identity route mapping, including padding.
+                out[route, row + 0] = cutlass.BFloat16(0.0)
+                out[route, row + 1] = cutlass.BFloat16(0.0)
+                out[route, row + 2] = cutlass.BFloat16(0.0)
+                out[route, row + 3] = cutlass.BFloat16(0.0)
     cute.arch.sync_threads()
     if tid == 0 and cutlass.const_expr(finalize):
         total0 = cutlass.Float32(0.0)

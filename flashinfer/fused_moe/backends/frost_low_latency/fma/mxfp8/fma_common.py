@@ -5,9 +5,12 @@
 
 import cutlass
 from cutlass import cute
-from cutlass._mlir.dialects import llvm, vector
-from cutlass.cutlass_dsl import dsl_user_op
-from flashinfer.cute_dsl.fp4_common import cvt_e4m3_to_f32_via_f16
+from cutlass._mlir.dialects import llvm
+from flashinfer.cute_dsl.fp4_common import (
+    cvt_e4m3_to_f32_via_f16,
+    fp4_decode_2,
+    f16x2_to_f32x2,
+)
 
 
 @cute.jit
@@ -44,17 +47,15 @@ def _fp8x4(word):
     )
 
 
-@dsl_user_op
-def _fp4x4(word, *, loc=None, ip=None):
-    values = cute.arch.cvt_f4e2m1x4_to_f16x4(
-        word.ir_value(loc=loc, ip=ip), loc=loc, ip=ip
-    )
-    return tuple(
-        cutlass.Float16(vector.extract(values, [], [j], loc=loc, ip=ip)).to(
-            cutlass.Float32
-        )
-        for j in range(4)
-    )
+@cute.jit
+def _fp4x4(word):
+    # Keep each packed byte explicit through FP4 -> FP16 -> FP32 conversion.
+    # The vector conversion can alias the low pair across adjacent halfwords
+    # in the unrolled dot-product specialization on the cu12 compiler.
+    bits = word.to(cutlass.Uint32)
+    lo = f16x2_to_f32x2(fp4_decode_2(bits & 255))
+    hi = f16x2_to_f32x2(fp4_decode_2((bits >> 8) & 255))
+    return lo[0], lo[1], hi[0], hi[1]
 
 
 @cute.jit
