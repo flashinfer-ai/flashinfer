@@ -93,6 +93,16 @@ streams; do not run one plan concurrently. The caller may capture `plan.run()`
 in a CUDA graph after warmup. Preparing a plan or replacing its storage during
 capture is unsupported.
 
+The plan carves the control words its kernel writes and polls from one
+plan-owned arena: a zero-filled window that starts on a 2 MiB GPU page
+boundary, with 64 KiB guards and every buffer on its own 4 KiB page. No
+caller tensor can share a page with a control word, and each word's offset
+is the same for a route whatever the allocation history.
+`FLASHINFER_MEGA_MOE_CONTROL_ARENA`, read when a call is prepared, selects
+what is carved: `all` (the default) every kernel-written control buffer,
+`reset` only the words of `reset_storage`, `off` nothing (every buffer is a
+separate allocation). Any other value raises an error.
+
 From the repository root:
 
 ```bash
