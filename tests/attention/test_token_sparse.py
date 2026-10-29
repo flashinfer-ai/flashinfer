@@ -64,7 +64,8 @@ def test_group_union_masks_match_reference_and_replay(group: int, top_k: int) ->
     600000, past the 2**19 keys of a narrower block table. Short rows end in
     -1s; padding rows (mask row -1) end each request's tokens, and the last
     group is all padding (union row -1). Mask and union rows run in reverse
-    order. Nothing is written past a union or a mask row's words."""
+    order. Nothing is written past a union or a mask row's words. Row 0 has a key
+    at num_keys, which counts as -1."""
     torch.manual_seed(group)
     rows = 256
     contexts, width = [5000, 600000], 600000 // 64 + 1
@@ -77,6 +78,8 @@ def test_group_union_masks_match_reference_and_replay(group: int, top_k: int) ->
     counts[1::3] = torch.randint(1, top_k, (len(counts[1::3]),), device="cuda")
     counts[100:128] = counts[-max(group, 3) :] = 0  # padding rows
     keys = picked.masked_fill(torch.arange(top_k, device="cuda") >= counts[:, None], -1)
+    num_keys = contexts[1]
+    keys[0, 0] = num_keys  # past the keys: counts as -1
     positions = keys.int()
     live = counts > 0
     query_rows = torch.full((rows,), -1, dtype=torch.int32, device="cuda")
@@ -91,7 +94,7 @@ def test_group_union_masks_match_reference_and_replay(group: int, top_k: int) ->
     union = torch.full((unions, columns), -7, dtype=torch.int32, device="cuda")
     sizes = torch.full((unions,), -7, dtype=torch.int32, device="cuda")
     mask = torch.full((int(live.sum()), columns // 32), -7, dtype=torch.int32).cuda()
-    outputs = dict(union=union, union_sizes=sizes, mask=mask, num_keys=contexts[1])
+    outputs = dict(union=union, union_sizes=sizes, mask=mask, num_keys=num_keys)
     inputs = positions, query_rows, group_unions, requests, tables
 
     def run() -> None:
@@ -102,6 +105,7 @@ def test_group_union_masks_match_reference_and_replay(group: int, top_k: int) ->
     def check() -> None:
         for g in range(rows // group):
             mine = keys[g * group : (g + 1) * group]
+            mine = mine.masked_fill((mine < 0) | (mine >= num_keys), -1)
             members = mine[mine >= 0].unique()
             size, table = len(members), tables[requests[g]].long()
             if not size:  # an all-padding group
@@ -127,6 +131,7 @@ def test_group_union_masks_match_reference_and_replay(group: int, top_k: int) ->
         run()
     context = torch.tensor(contexts, device="cuda")[request, None]
     keys = torch.where(keys >= 0, context - 1 - keys, -1)  # new keys
+    keys[0, 0] = num_keys
     positions.copy_(keys)
     graph.replay()
     check()
