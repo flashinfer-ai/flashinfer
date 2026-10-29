@@ -35,6 +35,8 @@ the existing parallel GMEM reducer includes those partials in the final result.
 Sustained work retains K/V tiles with eight loaders and CLC scheduling instead.
 H128 uses the shared 2CTA schedule beyond the tiny split-grid region. Its packed
 NVFP4 path retains the existing conversion ownership and DSMEM exchange for V.
+Plans with `assume_valid_prefix=True` use the general path's prefix optimization;
+the native reload loader retains its arbitrary-hole masks.
 These are separate schedules within the shared kernel framework. D512, packed
 formats, narrower heads, extra pools and sinks retain their qualified paths.
 

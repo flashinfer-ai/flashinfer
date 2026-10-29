@@ -1268,7 +1268,7 @@ def test_softmax_rescale_threshold_log2_rejected(dtype, threshold):
     + [(16, "nvfp4", 4, 2049), (32, "nvfp4", 32, 513)]
     + [(h, p, 160, 513) for h in (64, 128) for p in ("fp8", "bf16")],
 )
-def test_d576_sparse_graph(heads, precision, rows, topk):
+def test_d576_sparse_graph(heads, precision, rows, topk, prefix=False):
     """Native352 cache mapping, tails, holes and live graph inputs on both families."""
     torch.manual_seed(123)
     q = (torch.randn(rows, 1, heads, 576, device="cuda") * 0.2).to(
@@ -1299,7 +1299,8 @@ def test_d576_sparse_graph(heads, precision, rows, topk):
     lengths = torch.full((rows,), topk, device="cuda", dtype=torch.int32)
     boundary_lengths = torch.tensor([0, 1, 127, 128, 129, 512], device="cuda")
     lengths[: min(rows, 6)] = boundary_lengths[:rows]
-    indices[min(6, rows - 1), 17::31] = -1
+    if not prefix:
+        indices[min(6, rows - 1), 17::31] = -1
     w = BatchSparseMLADecodePagedTSWrapper()
     w.plan(
         q.device,
@@ -1309,6 +1310,7 @@ def test_d576_sparse_graph(heads, precision, rows, topk):
         q_data_type=q.dtype,
         qk_rope_head_dim=64,
         kv_cache_format="nvfp4.fp8rope" if precision == "nvfp4" else "native",
+        assume_valid_prefix=prefix,
         return_lse=True,
     )
     out = torch.empty(rows, 1, heads, 512, device="cuda", dtype=torch.bfloat16)
@@ -1335,6 +1337,11 @@ def test_d576_sparse_graph(heads, precision, rows, topk):
         else:
             assert bool(((out.double() - ref).abs() <= bound).all())
         torch.testing.assert_close(lse.double(), ref_lse, atol=2e-4, rtol=1e-4)
+
+
+def test_d576_native_prefix_graph():
+    """Keep the optimized hole-free native path under the shared D576 interface."""
+    test_d576_sparse_graph(64, "fp8", 160, 513, prefix=True)
 
 
 def make_nvfp4_cache(pages, page_size, rope_dim=0):

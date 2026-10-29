@@ -2334,6 +2334,8 @@ def _resolve_sparse_mla_plan(
     # Reloading V from L2 shortens native FP8 decode's producer lifetime.
     # Sustained grids amortize the retained-KV/CLC pipeline instead; packed
     # caches and two-source/sink plans retain their format-specific schedules.
+    # The general path also exploits a hole-free prefix promise; the reload
+    # loader keeps arbitrary-hole masks and does not use that optimization.
     if (
         qk_rope_head_dim == 64
         and kv_cache_format == "native"
@@ -2341,6 +2343,7 @@ def _resolve_sparse_mla_plan(
         and num_heads in _D576_HEADS
         and not max_extra_topk
         and not has_sinks
+        and not assume_valid_prefix
         and prefer_sparse_d576_reload(
             rows=max_rows,
             heads=num_heads,
