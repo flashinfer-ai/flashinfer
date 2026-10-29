@@ -62,6 +62,13 @@ from flashinfer.tllm_enums import (
     DEFAULT_SWIGLU_LIMIT,
 )
 from flashinfer.fused_moe.cute_dsl.common.kernel_utils import fmin
+from flashinfer.cute_dsl.fp4_common import (
+    cvt_f32_to_e4m3,
+    fabs_f32,
+    fmax_f32,
+    nvfp4_compute_output_scale,
+    rcp_approx_ftz,
+)
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 from flashinfer.cute_dsl.utils import (
     get_cutlass_dtype,
@@ -835,9 +842,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.is_sfb_mcast = self.num_mcast_ctas_sfb > 1
 
         # Compute epilogue subtile
-        if self.gated:
+        if self.gated or self.quantize_output:
             # Each 64-column C subtile pairs one up and one gate accumulator
-            # subtile, matching the 64-row interleave of B.
+            # subtile, matching the 64-row interleave of B. NVFP4 output also
+            # relies on each thread owning 64 columns (four scale blocks) of
+            # one row.
             self.epi_tile = (self.cta_tile_shape_mnk[0], 64)
         else:
             self.epi_tile = sm100_utils.compute_epilogue_tile_shape(
@@ -926,6 +935,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         stream: cuda.CUstream,
         alpha_up_tensor: Optional[cute.Tensor] = None,
         a_per_token_scale_tensor: Optional[cute.Tensor] = None,
+        out_scale_tensor: Optional[cute.Tensor] = None,
+        global_scale_tensor: Optional[cute.Tensor] = None,
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -958,6 +969,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         :param a_per_token_scale_tensor: Optional (l, m) per-row scale of A,
             applied with alpha before a gated activation.
         :type a_per_token_scale_tensor: cute.Tensor
+        :param out_scale_tensor: NVFP4 output block scales, required when C is
+            Float4E2M1FN. Viewed as packed Uint32 words in the swizzled
+            ``(l, rm, rk, 32, 4, 4)`` layout consumed as SFA by a following GEMM.
+        :type out_scale_tensor: cute.Tensor
+        :param global_scale_tensor: (l,) NVFP4 global quantization scale of C,
+            required when C is Float4E2M1FN.
+        :type global_scale_tensor: cute.Tensor
         :raises TypeError: If input data types are incompatible with the MMA instruction.
         """
         # Setup static attributes before smem/grid/tma computation
@@ -968,6 +986,19 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.a_major_mode = utils.LayoutEnum.from_tensor(a_tensor).mma_major_mode()
         self.b_major_mode = utils.LayoutEnum.from_tensor(b_tensor).mma_major_mode()
         self.c_layout = utils.LayoutEnum.from_tensor(c_tensor)
+        # Float4E2M1FN C quantizes the epilogue output to NVFP4.
+        self.quantize_output = self.c_dtype == cutlass.Float4E2M1FN
+        if cutlass.const_expr(
+            self.quantize_output
+            and (out_scale_tensor is None or global_scale_tensor is None)
+        ):
+            raise ValueError(
+                "NVFP4 output requires out_scale_tensor and global_scale_tensor"
+            )
+        if cutlass.const_expr(
+            self.quantize_output and (self.is_combine_fusion or self.is_swap_ab)
+        ):
+            raise ValueError("NVFP4 output does not support combine fusion or swap_ab")
 
         # Check if input data types are compatible with MMA instruction
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
@@ -975,6 +1006,21 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes()
+        if cutlass.const_expr(
+            self.quantize_output
+            and (
+                self.cta_tile_shape_mnk[0] != 128
+                or self.cta_tile_shape_mnk_c[1] % 64 != 0
+            )
+        ):
+            raise ValueError(
+                "NVFP4 output requires a 128-row CTA tile and a multiple of 64 "
+                f"output columns, got {self.cta_tile_shape_mnk_c}"
+            )
+        if cutlass.const_expr(self.quantize_output):
+            # Row and 64-column block counts of the swizzled output scales.
+            self.sfc_rm = (cute.size(c_tensor, mode=[0]) + 127) // 128
+            self.sfc_rk = cute.size(c_tensor, mode=[1]) // 64
 
         # Setup sfa/sfb tensor by filling A/B tensor to scale factor atom layout
         # ((Atom_M, Rest_M),(Atom_K, Rest_K),RestL)
@@ -1201,6 +1247,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.tile_sched_params,
             alpha_up_tensor,
             a_per_token_scale_tensor,
+            out_scale_tensor,
+            global_scale_tensor,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1245,6 +1293,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         tile_sched_params: MaskedSchedulerParams,
         alpha_up: Optional[cute.Tensor],
         a_per_token_scale: Optional[cute.Tensor],
+        out_scale: Optional[cute.Tensor],
+        global_scale: Optional[cute.Tensor],
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -1882,6 +1932,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             if cutlass.const_expr(self.gated):
                 # tTR_rAcc holds the up subtile and tTR_rAcc_gate the gate subtile.
                 tTR_rAcc_gate = cute.make_rmem_tensor(tTR_rAcc.shape, self.acc_dtype)
+            if cutlass.const_expr(self.gated or self.quantize_output):
                 tCompute = cute.make_rmem_tensor(tTR_rAcc.shape, self.acc_dtype)
             tma_atom_c, bSG_sC, bSG_gC_partitioned = (
                 self.epilog_gmem_copy_and_partition(
@@ -2016,6 +2067,26 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         gate_scale = gate_scale * token_scale
                         up_scale = up_scale * token_scale
 
+                if cutlass.const_expr(self.quantize_output):
+                    out_scale_expert = cur_tile_coord[2]
+                    out_global_scale = global_scale[out_scale_expert]
+                    out_alpha = cutlass.Float32(1.0)
+                    if cutlass.const_expr(alpha is not None and not self.gated):
+                        out_alpha = alpha[out_scale_expert]
+                    # Word index of this thread's row in the first 64-column
+                    # block; the swizzled (l, rm, rk, 32, 4, 4) layout keeps the
+                    # four scales of a row and 64-column block in one word.
+                    sf_word_base = (
+                        (
+                            (out_scale_expert * self.sfc_rm + cur_tile_coord[0])
+                            * self.sfc_rk
+                            + cur_tile_coord[1] * (self.cta_tile_shape_mnk_c[1] // 64)
+                        )
+                        * 128
+                        + (epi_tidx % 32) * 4
+                        + epi_tidx // 32
+                    )
+
                 #
                 # Store accumulator to global memory in subtiles
                 #
@@ -2045,14 +2116,21 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     #
                     # Convert to C type
                     #
-                    if cutlass.const_expr(self.gated):
-                        self.swiglu(
-                            tTR_rAcc.load(),
-                            tTR_rAcc_gate.load(),
-                            up_scale,
-                            gate_scale,
-                            tCompute,
-                        )
+                    if cutlass.const_expr(self.gated or self.quantize_output):
+                        if cutlass.const_expr(self.gated):
+                            self.swiglu(
+                                tTR_rAcc.load(),
+                                tTR_rAcc_gate.load(),
+                                up_scale,
+                                gate_scale,
+                                tCompute,
+                            )
+                        else:
+                            tCompute.store(tTR_rAcc.load() * out_alpha)
+                        if cutlass.const_expr(self.quantize_output):
+                            out_scale[sf_word_base + subtile_idx * 128] = (
+                                self.quantize_nvfp4(tCompute, out_global_scale)
+                            )
                         acc_vec = tiled_copy_r2s.retile(tCompute).load()
                     elif cutlass.const_expr(self.is_combine_fusion):
                         # S2R copy: load topk from SMEM into register fragment
@@ -2080,7 +2158,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         acc_vec = tTR_rAcc.load()
                     else:
                         acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
-                    if cutlass.const_expr(alpha is not None and not self.gated):
+                    if cutlass.const_expr(
+                        alpha is not None
+                        and not self.gated
+                        and not self.quantize_output
+                    ):
                         acc_vec = acc_vec * alpha[work_tile.tile_idx[2]]
 
                     if cutlass.const_expr(self.is_combine_fusion):
@@ -2349,6 +2431,36 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             silu = cute.arch.mul_packed_f32x2(gate, sigmoid)
             up = cute.arch.add_packed_f32x2(up, (beta, beta))
             out[i], out[i + 1] = cute.arch.mul_packed_f32x2(silu, up)
+
+    @cute.jit
+    def quantize_nvfp4(
+        self,
+        values: cute.Tensor,
+        global_scale: cutlass.Float32,
+    ) -> cutlass.Uint32:
+        """Quantize one row of 64 values to NVFP4 in place.
+
+        Follows the default (fast-math) recipe of ``fp4_quantize`` on BF16
+        input, so the result matches quantizing a BF16 output bit for bit.
+        ``values`` is left holding ``value * output_scale`` for the E2M1
+        conversion. Returns the four E4M3 block scales packed little endian.
+        """
+        rcp_e2m1_max = rcp_approx_ftz(cutlass.Float32(6.0))
+        values.store(values.load().to(cutlass.BFloat16).to(cutlass.Float32))
+        packed_scales = cutlass.Uint32(0)
+        for block in cutlass.range_constexpr(cute.size(values) // 16):
+            amax = cutlass.Float32(0.0)
+            for i in cutlass.range_constexpr(16):
+                amax = fmax_f32(amax, fabs_f32(values[block * 16 + i]))
+            scale = cvt_f32_to_e4m3(global_scale * (amax * rcp_e2m1_max))
+            output_scale = nvfp4_compute_output_scale(scale, global_scale)
+            for i in cutlass.range_constexpr(0, 16, 2):
+                idx = block * 16 + i
+                values[idx], values[idx + 1] = cute.arch.mul_packed_f32x2(
+                    (values[idx], values[idx + 1]), (output_scale, output_scale)
+                )
+            packed_scales = packed_scales | (scale << cutlass.Uint32(8 * block))
+        return packed_scales
 
     def mainloop_s2t_copy_and_partition(
         self,
@@ -2765,6 +2877,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             cutlass.BFloat16,
             cutlass.Float8E5M2,
             cutlass.Float8E4M3FN,
+            cutlass.Float4E2M1FN,
         }:
             is_valid = False
 
@@ -2798,6 +2911,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         is_valid = True
 
         if ab_dtype is cutlass.Float4E2M1FN and not (a_major == "k" and b_major == "k"):
+            is_valid = False
+        if c_dtype is cutlass.Float4E2M1FN and c_major != "n":
             is_valid = False
         return is_valid
 
@@ -3175,6 +3290,8 @@ class MaskedBatchedMatmulCuteDSL:
         barrier_flag_multicast_ptr: Optional[cute.Pointer],
         alpha_up_ptr: Optional[cute.Pointer],
         a_per_token_scale_ptr: Optional[cute.Pointer],
+        out_scale_ptr: Optional[cute.Pointer],
+        global_scale_ptr: Optional[cute.Pointer],
         current_stream: cuda.CUstream,
     ):
         a_tensor = cute.make_tensor(
@@ -3319,6 +3436,23 @@ class MaskedBatchedMatmulCuteDSL:
             if cutlass.const_expr(a_per_token_scale_ptr is not None)
             else None
         )
+        out_scale_tensor = (
+            cute.make_tensor(
+                out_scale_ptr,
+                # One Uint32 word holds the four E4M3 scales of a row and a
+                # 64-column block.
+                layout=cute.make_layout(
+                    (self._l * ((self._m + 127) // 128) * (self._c_n // 64) * 128,)
+                ),
+            )
+            if cutlass.const_expr(out_scale_ptr is not None)
+            else None
+        )
+        global_scale_tensor = (
+            cute.make_tensor(global_scale_ptr, layout=cute.make_layout((self._l,)))
+            if cutlass.const_expr(global_scale_ptr is not None)
+            else None
+        )
 
         Sm100BlockScaledPersistentDenseGemmKernel(
             sf_vec_size=self._sf_vec_size,
@@ -3351,6 +3485,8 @@ class MaskedBatchedMatmulCuteDSL:
             current_stream,
             alpha_up_tensor,
             a_per_token_scale_tensor,
+            out_scale_tensor,
+            global_scale_tensor,
         )
 
 
@@ -3384,6 +3520,8 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
     enable_alpha_up: bool = False,
     enable_a_per_token_scale: bool = False,
 ) -> Callable:
+    quantize_output = c_dtype == cutlass.Float4E2M1FN
+
     def get_cute_pointers(
         input_tensors: Optional[List[torch.tensor]],
     ) -> List[cute.Pointer]:
@@ -3405,7 +3543,9 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 barrier_flag_multicast_data_ptr,
                 alpha_up_data_ptr,
                 a_per_token_scale_data_ptr,
-            ) = [16 for _ in range(16)]
+                out_scale_data_ptr,
+                global_scale_data_ptr,
+            ) = [16 for _ in range(18)]
 
             if not enable_dst_signals:
                 dst_signals_data_ptr = None
@@ -3425,6 +3565,9 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 alpha_up_data_ptr = None
             if not enable_a_per_token_scale:
                 a_per_token_scale_data_ptr = None
+            if not quantize_output:
+                out_scale_data_ptr = None
+                global_scale_data_ptr = None
 
         else:
             (
@@ -3444,6 +3587,8 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 barrier_flag_multicast_tensor_gpu,
                 alpha_up_tensor_gpu,
                 a_per_token_scale_tensor_gpu,
+                out_scale_tensor_gpu,
+                global_scale_tensor_gpu,
             ) = input_tensors
 
             assert enable_dst_signals == (dst_signals_tensor_gpu is not None)
@@ -3461,6 +3606,14 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                 a_per_token_scale_tensor_gpu.data_ptr()
                 if a_per_token_scale_tensor_gpu is not None
                 else None
+            )
+            assert quantize_output == (out_scale_tensor_gpu is not None)
+            assert quantize_output == (global_scale_tensor_gpu is not None)
+            out_scale_data_ptr = (
+                out_scale_tensor_gpu.data_ptr() if quantize_output else None
+            )
+            global_scale_data_ptr = (
+                global_scale_tensor_gpu.data_ptr() if quantize_output else None
             )
 
             (
@@ -3651,6 +3804,26 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             if a_per_token_scale_data_ptr is not None
             else None
         )
+        out_scale_ptr = (
+            make_ptr(
+                cutlass.Uint32,
+                out_scale_data_ptr,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            if out_scale_data_ptr is not None
+            else None
+        )
+        global_scale_ptr = (
+            make_ptr(
+                cutlass.Float32,
+                global_scale_data_ptr,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            if global_scale_data_ptr is not None
+            else None
+        )
 
         return [
             a_ptr,
@@ -3669,6 +3842,8 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             barrier_flag_multicast_ptr,
             alpha_up_ptr,
             a_per_token_scale_ptr,
+            out_scale_ptr,
+            global_scale_ptr,
         ]
 
     kernel = cute.compile(
@@ -3718,6 +3893,8 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
         barrier_flag_multicast_tensor_gpu: Optional[torch.Tensor] = None,
         alpha_up_tensor_gpu: Optional[torch.Tensor] = None,
         a_per_token_scale_tensor_gpu: Optional[torch.Tensor] = None,
+        out_scale_tensor_gpu: Optional[torch.Tensor] = None,
+        global_scale_tensor_gpu: Optional[torch.Tensor] = None,
     ):
         if c_tensor_gpu is None:
             # fp4 gemm output is not supported
@@ -3750,6 +3927,8 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
                     barrier_flag_multicast_tensor_gpu,
                     alpha_up_tensor_gpu,
                     a_per_token_scale_tensor_gpu,
+                    out_scale_tensor_gpu,
+                    global_scale_tensor_gpu,
                 ]
             ),
             current_stream,
@@ -3796,14 +3975,15 @@ def _validate_gated_activation(
         raise ValueError(
             "Fused gated activation requires mma_tiler_mn (128, 128) or (128, 256)"
         )
-    if c_dtype not in ("bfloat16", "float16", "float32"):
+    if c_dtype not in ("bfloat16", "float16", "float32", "float4_e2m1fn"):
         raise ValueError(f"Fused gated activation does not support c_dtype {c_dtype!r}")
     if n % mma_tiler_mn[1] != 0:
         raise ValueError(
             f"Fused gated activation requires n ({n}) to be a multiple of "
             f"mma_tiler_mn[1] ({mma_tiler_mn[1]})"
         )
-    if tuple(out.shape) != (m, n // 2, l):
+    # NVFP4 output packs two values per byte; its shape is checked separately.
+    if c_dtype != "float4_e2m1fn" and tuple(out.shape) != (m, n // 2, l):
         raise ValueError(
             f"Fused gated activation expects out of shape {(m, n // 2, l)}, "
             f"got {tuple(out.shape)}"
@@ -3827,6 +4007,63 @@ def _validate_gated_activation(
                 f"on {masked_m.device}"
             )
     return activation_type.value
+
+
+def _validate_nvfp4_output(
+    *,
+    out,
+    out_scale,
+    global_scale,
+    masked_m,
+    m,
+    n_out,
+    l,
+    mma_tiler_mn,
+) -> None:
+    if out_scale is None or global_scale is None:
+        raise ValueError("c_dtype='float4_e2m1fn' requires out_scale and global_scale")
+    if mma_tiler_mn[0] != 128:
+        raise ValueError("NVFP4 output requires mma_tiler_mn[0] == 128")
+    if n_out % 64 != 0:
+        raise ValueError(
+            f"NVFP4 output requires a multiple of 64 output columns, got {n_out}"
+        )
+    fp4_dtypes = (torch.uint8, getattr(torch, "float4_e2m1fn_x2", torch.uint8))
+    if out.dtype not in fp4_dtypes or tuple(out.shape) != (m, n_out // 2, l):
+        raise ValueError(
+            "NVFP4 output expects a uint8 or float4_e2m1fn_x2 out of shape "
+            f"{(m, n_out // 2, l)}, got {out.dtype} {tuple(out.shape)}"
+        )
+    rm = (m + 127) // 128
+    rk = n_out // 64
+    # Accept a contiguous buffer or the 6-D (32, 4, rm, 4, rk, l) view
+    # returned by the NVFP4 quantizers.
+    dense = out_scale.is_contiguous() or (
+        out_scale.dim() == 6
+        and tuple(out_scale.shape) == (32, 4, rm, 4, rk, l)
+        and out_scale.permute(5, 2, 4, 0, 1, 3).is_contiguous()
+    )
+    if (
+        out_scale.dtype not in (torch.float8_e4m3fn, torch.uint8)
+        or out_scale.numel() != l * rm * rk * 512
+        or not dense
+        or out_scale.data_ptr() % 16 != 0
+        or out_scale.device != masked_m.device
+    ):
+        raise ValueError(
+            "out_scale must be a dense, 16-byte aligned float8_e4m3fn tensor "
+            f"holding the swizzled scales of a ({m}, {n_out}, {l}) NVFP4 tensor "
+            f"({l * rm * rk * 512} elements)"
+        )
+    if (
+        tuple(global_scale.shape) != (l,)
+        or global_scale.dtype != torch.float32
+        or not global_scale.is_contiguous()
+        or global_scale.device != masked_m.device
+    ):
+        raise ValueError(
+            f"global_scale must be a contiguous float32 tensor of shape {(l,)}"
+        )
 
 
 def _grouped_gemm_nt_masked_sm100(
@@ -3856,6 +4093,8 @@ def _grouped_gemm_nt_masked_sm100(
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     alpha_up: Optional[torch.Tensor] = None,
     a_per_token_scale: Optional[torch.Tensor] = None,
+    out_scale: Optional[torch.Tensor] = None,
+    global_scale: Optional[torch.Tensor] = None,
     **kwargs,
 ):
     """
@@ -3936,6 +4175,8 @@ def _grouped_gemm_nt_masked_sm100(
         ``False``.
     activation_type, swiglu_alpha, swiglu_beta, swiglu_limit, alpha_up, a_per_token_scale
         Fused gated activation; see ``grouped_gemm_nt_masked``.
+    out_scale, global_scale
+        NVFP4 output (``c_dtype="float4_e2m1fn"``); see ``grouped_gemm_nt_masked``.
     **kwargs
         Additional keyword arguments.  Currently recognized:
 
@@ -3975,20 +4216,28 @@ def _grouped_gemm_nt_masked_sm100(
     corresponding alpha value: ``out = alpha * (A @ B)``.
     """
 
-    if activation_type is not None:
+    quantize_output = c_dtype == "float4_e2m1fn"
+    for feature, enabled in (
+        ("Fused gated activation", activation_type is not None),
+        ("NVFP4 output", quantize_output),
+    ):
+        if not enabled:
+            continue
         unsupported = [
             name
-            for name, enabled in (
+            for name, used in (
                 ("is_combine_fusion", is_combine_fusion),
                 ("is_swap_ab", is_swap_ab),
                 ("dst_signals", dst_signals is not None),
             )
-            if enabled
+            if used
         ]
         if unsupported:
             raise NotImplementedError(
-                "Fused gated activation does not support: " + ", ".join(unsupported)
+                f"{feature} does not support: " + ", ".join(unsupported)
             )
+    if not quantize_output and (out_scale is not None or global_scale is not None):
+        raise ValueError("out_scale and global_scale require c_dtype='float4_e2m1fn'")
 
     if is_swap_ab:
         a_torch, sfa_torch = rhs
@@ -4062,6 +4311,25 @@ def _grouped_gemm_nt_masked_sm100(
     elif alpha_up is not None or a_per_token_scale is not None:
         raise ValueError("alpha_up and a_per_token_scale require activation_type")
 
+    if quantize_output:
+        if n % mma_tiler_mn[1] != 0:
+            raise ValueError(
+                f"NVFP4 output requires n ({n}) to be a multiple of "
+                f"mma_tiler_mn[1] ({mma_tiler_mn[1]})"
+            )
+        if alpha is not None and alpha_dtype != "float32":
+            raise ValueError("NVFP4 output requires a float32 alpha")
+        _validate_nvfp4_output(
+            out=out,
+            out_scale=out_scale,
+            global_scale=global_scale,
+            masked_m=masked_m,
+            m=m,
+            n_out=n // 2 if activation_type is not None else n,
+            l=l,
+            mma_tiler_mn=mma_tiler_mn,
+        )
+
     if is_combine_fusion:
         required = {
             "topk_weights": topk_weights,
@@ -4130,6 +4398,8 @@ def _grouped_gemm_nt_masked_sm100(
         barrier_flag_multicast_tensor_gpu=barrier_flag_multicast,
         alpha_up_tensor_gpu=alpha_up,
         a_per_token_scale_tensor_gpu=a_per_token_scale,
+        out_scale_tensor_gpu=out_scale,
+        global_scale_tensor_gpu=global_scale,
     )
 
 

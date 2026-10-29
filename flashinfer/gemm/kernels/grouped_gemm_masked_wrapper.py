@@ -75,6 +75,8 @@ def grouped_gemm_nt_masked(
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     alpha_up: Optional[torch.Tensor] = None,
     a_per_token_scale: Optional[torch.Tensor] = None,
+    out_scale: Optional[torch.Tensor] = None,
+    global_scale: Optional[torch.Tensor] = None,
     **kwargs,
 ):
     r"""Masked, batched, block-scaled GEMM on Blackwell (SM100/SM103) and Rubin (SM107).
@@ -115,7 +117,9 @@ def grouped_gemm_nt_masked(
         ``"float8_e4m3fn"``.
     c_dtype : str
         Data type for output matrix ``C``.  One of ``"float16"``,
-        ``"bfloat16"``, ``"float32"``, ``"float8_e4m3fn"``, ``"float8_e5m2"``.
+        ``"bfloat16"``, ``"float32"``, ``"float8_e4m3fn"``, ``"float8_e5m2"``,
+        or ``"float4_e2m1fn"`` (SM100/SM103 only) to quantize the output to
+        NVFP4; see ``out_scale``.
     sf_vec_size : int
         Vector size for scale factors (typically 16 or 32).
     topk_weights : Optional[torch.Tensor]
@@ -158,8 +162,8 @@ def grouped_gemm_nt_masked(
         the plain GEMM epilogue.  When set, ``B`` and ``SFB`` rows must be
         interleaved in 64-row blocks with the up projection first,
         ``[up_0:64, gate_0:64, up_64:128, gate_64:128, ...]``, ``n`` must be a
-        multiple of ``mma_tiler_mn[1]``, and ``out`` has shape
-        ``(m, n / 2, l)``.  Each output element is
+        multiple of ``mma_tiler_mn[1]``, and ``out`` has ``n / 2`` columns,
+        shape ``(m, n / 2, l)`` (``(m, n / 4, l)`` bytes for NVFP4 output).  Each output element is
         ``gate * sigmoid(swiglu_alpha * gate) * (up + swiglu_beta)`` with
         ``gate = min(alpha * s * acc_gate, swiglu_limit)``,
         ``up = clamp(alpha_up * s * acc_up, -swiglu_limit, swiglu_limit)``
@@ -179,6 +183,24 @@ def grouped_gemm_nt_masked(
     a_per_token_scale : Optional[torch.Tensor]
         Optional contiguous ``float32`` tensor of shape ``(l, m)`` holding a
         per-row scale of ``A``, applied before the gated activation.
+    out_scale : Optional[torch.Tensor]
+        Required when ``c_dtype="float4_e2m1fn"``.  Receives the ``float8_e4m3fn``
+        block scales (``sf_vec_size`` 16) of the output in the same swizzled
+        layout as ``SFA``, so ``out`` and ``out_scale`` can feed the next masked
+        GEMM directly: logical shape ``(32, 4, rm, 4, rk, l)``, physically
+        ``(l, rm, rk, 32, 4, 4)``, with ``rk = n_out / 64``.  ``out`` is then a
+        ``uint8`` tensor of shape ``(m, n_out / 2, l)`` holding two E2M1 values
+        per byte, where ``n_out`` is the number of output columns.  The
+        epilogue rounds the output to BF16 and quantizes it with the default
+        recipe of ``scaled_fp4_grouped_quantize``, giving the same bits as
+        quantizing a BF16 output with that function.  Requires
+        ``mma_tiler_mn[0] == 128``, ``n`` a multiple of ``mma_tiler_mn[1]``
+        and ``n_out`` a multiple of 64.  Works with or without
+        ``activation_type``.
+    global_scale : Optional[torch.Tensor]
+        Required when ``c_dtype="float4_e2m1fn"``.  Contiguous ``float32``
+        tensor of shape ``(l,)`` with the per-batch NVFP4 global scale, as the
+        ``a_global_sf`` argument of ``scaled_fp4_grouped_quantize``.
     **kwargs
         Additional keyword arguments.  Currently recognized:
 
@@ -269,6 +291,8 @@ def grouped_gemm_nt_masked(
                 ("activation_type", activation_type, None),
                 ("alpha_up", alpha_up, None),
                 ("a_per_token_scale", a_per_token_scale, None),
+                ("out_scale", out_scale, None),
+                ("global_scale", global_scale, None),
             )
             if value is not default
         ]
@@ -330,6 +354,8 @@ def grouped_gemm_nt_masked(
             swiglu_limit=swiglu_limit,
             alpha_up=alpha_up,
             a_per_token_scale=a_per_token_scale,
+            out_scale=out_scale,
+            global_scale=global_scale,
             **kwargs,
         )
 
