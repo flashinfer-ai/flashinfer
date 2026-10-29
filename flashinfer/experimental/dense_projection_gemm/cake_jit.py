@@ -208,7 +208,7 @@ KERNELS: dict[str, dict[str, str]] = {
 
 # The architectures this checkout registers programs for (``KERNELS`` keys and
 # every record's ``arches`` are drawn from it).  SM103 (B300 / GB300) registers
-# its own builds of the shared programs and, for three input-gradient rows, the
+# its own builds of the shared programs and, for six input-gradient rows, the
 # eight-warp CTA programs (the ``_w8r`` / ``_w8rs`` templates); SM100 (B200 /
 # GB200) registers the knob-free eight-warp program (the ``_w8`` template) for
 # five input-gradient rows.

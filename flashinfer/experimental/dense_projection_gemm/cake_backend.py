@@ -1214,15 +1214,16 @@ def swap_small_m(L: int, M: int, N: int, transposed_out: bool) -> bool:
 # Two sm_103a input-gradient rows (5120 -> 512 and 5120 -> 1024) carry ``sw`` 25: the paced output stores (``_sw25``
 # programs) measured faster than the row's program above the pair spread at both T on GB300; the knob needs the bf16
 # TMA-store pd-2 drain (the planner drops a rule's ``sw`` where the planned program is not that drain or a caller forces
-# the single-CTA form, and refuses a caller-forced one there).  Three sm_103a input-gradient rows (4096 -> 512, 5120 -> 512
-# and the kv_a 6144 -> 576) carry ``form``: the eight-warp CTA form of the same GEMM (``_w8r`` / ``_w8rs`` programs)
-# measured faster than the row's program above the pair spread at both T on GB300; the knobs after it are the row's
-# program where the form yields (the planner drops a rule's form where the plan carries stream-K units, the single-CTA
-# form, another tile or output class, the register epilogue or a caller-forced pipeline knob, and refuses a caller-forced
-# form there).  Five sm_100a input-gradient rows (4096 -> 512, 4096 -> 1024, 5120 -> 512, 5120 -> 1024 and the kv_a
-# 6144 -> 576) carry ``form`` ``w8``: the knob-free eight-warp program (``_w8``) measured faster than the row's program
-# above the pair spread at both T on GB200; the knobs after it are the row's program where the form yields, and the
-# raster group is the row's measured launch parameter.
+# the single-CTA form, and refuses a caller-forced one there).  Six sm_103a input-gradient rows (4096 -> 48,
+# 4096 -> 512, 4096 -> 1024, 5120 -> 512, 5120 -> 1024 and the kv_a 6144 -> 576) carry ``form``: the eight-warp CTA form
+# of the same GEMM (``_w8r`` / ``_w8rs`` programs) measured faster than the row's program above the pair spread at both
+# T on GB300; the knobs after it are the row's program where the form yields (the 4096 -> 48 rule carries none: the
+# architecture default program runs there), and the planner drops a rule's form where the plan carries stream-K units,
+# the single-CTA form, another tile or output class, the register epilogue or a caller-forced pipeline knob, and refuses
+# a caller-forced form there.  Five sm_100a input-gradient rows (4096 -> 512, 4096 -> 1024, 5120 -> 512, 5120 -> 1024
+# and the kv_a 6144 -> 576) carry ``form`` ``w8``: the knob-free eight-warp program (``_w8``) measured faster than the
+# row's program above the pair spread at both T on GB200; the knobs after it are the row's program where the form
+# yields, and the raster group is the row's measured launch parameter.
 ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, False, False, False, False, 32, 6144, None): {"cta1": True},
     ('sm_100a', False, False, False, False, False, 128, 6144, None): {"cta1": True},
@@ -1444,11 +1445,16 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_103a', False, False, False, False, False, 17408, 5120, None): {"cgrp": True, "group_m": 12, "pro": 15},
     ('sm_103a', False, True, False, False, False, 2048, 4096, None): {"cgrp": True, "group_m": 16, "pro": 15},
     ('sm_103a', False, True, False, False, False, 4096, 32, None): {"epi": 'tma', "slots": 2, "pro": 15, "htail": True, "lw": True},
-    ('sm_103a', False, True, False, False, False, 4096, 48, None): {"epi": 'tma', "slots": 2, "pro": 15, "htail": True, "lw": True},
+    # the 4096 -> 48 input gradient (one K step): the eight-warp program runs whole tiles through the one-slot store;
+    # the row's load-warp half-tail program (two staging slots) cannot carry the form, so the rule names no ten-warp
+    # knobs and the architecture default program runs where the form yields; a caller that forces ``epi="tma",
+    # slots=2, htail=True, lw=True, pro=15`` plans the row's previous program
+    ('sm_103a', False, True, False, False, False, 4096, 48, None): {"form": 'w8r', "sk": False},
     ('sm_103a', False, True, False, False, False, 4096, 64, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2, "lw": True, "group_m": 32},
     ('sm_103a', False, True, False, False, False, 4096, 128, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2, "lw": True, "group_m": 32},
     ('sm_103a', False, True, False, False, False, 4096, 512, None): {"form": 'w8rs', "epi": 'tma', "slots": 1, "pro": 15, "pd": 2, "lw": True, "promo": 'l2_256b', "mg": True, "sk": False},
-    ('sm_103a', False, True, False, False, False, 4096, 1024, None): {"pd": 2, "pro": 15},
+    # the raster group of 8 row tiles is the row's measured launch parameter
+    ('sm_103a', False, True, False, False, False, 4096, 1024, None): {"form": 'w8rs', "pd": 2, "pro": 15, "group_m": 8, "sk": False},
     ('sm_103a', False, True, False, False, False, 4096, 4096, None): {"htail": True, "cgrp": True, "group_m": 16, "pro": 15},
     ('sm_103a', False, True, False, False, False, 4096, 12288, None): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 16},
     ('sm_103a', False, True, False, False, False, 5120, 32, None): {"epi": 'tma', "slots": 2, "pro": 15, "htail": True, "lw": True},
@@ -1456,7 +1462,8 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_103a', False, True, False, False, False, 5120, 64, None): {"epi": 'tma', "slots": 2, "cta1": True, "pd": 3},
     ('sm_103a', False, True, False, False, False, 5120, 128, None): {"epi": 'tma', "slots": 2, "pro": 15, "pd": 2, "lw": True, "group_m": 32},
     ('sm_103a', False, True, False, False, False, 5120, 512, None): {"form": 'w8r', "epi": 'tma', "slots": 1, "pro": 15, "pd": 2, "group_m": 12, "promo": 'l2_256b', "mg": True, "sk": False, "sw": 25},
-    ('sm_103a', False, True, False, False, False, 5120, 1024, None): {"pd": 2, "pro": 15, "sw": 25},
+    # the raster group of 12 row tiles is the row's measured launch parameter
+    ('sm_103a', False, True, False, False, False, 5120, 1024, None): {"form": 'w8r', "pd": 2, "pro": 15, "sw": 25, "group_m": 12, "sk": False},
     ('sm_103a', False, True, False, False, False, 5120, 5120, None): {"cgrp": True, "group_m": 12, "pro": 15},
     ('sm_103a', False, True, False, False, False, 5120, 17408, None): {"cta_rows": 256, "ovr": True, "htail": True},
     # the kv_a input gradient (6144 -> 576): the inherited sm_100a knobs restated so that this row keeps its program
@@ -2184,10 +2191,11 @@ def plan_dense_projection_gemm(
     pd-2 drain (a caller-forced register epilogue or ``slots`` 0, another ``pd``, the fp32 output) or is the
     single-CTA form; a caller-forced ``sw`` is admitted or refused by ``instance_key`` (the kernel's refusal: a step
     count >= 0 on that drain only).  It changes neither a launch argument nor the plan arithmetic.  ``form``
-    (``_w8r`` / ``_w8rs`` / ``_w8``) is the row's eight-warp CTA form - taken from the rule (the three sm_103a
-    input-gradient rules that carry it, 4096 -> 512, 5120 -> 512 and the kv_a 6144 -> 576, and the five sm_100a
-    input-gradient rules, 4096 -> 512, 4096 -> 1024, 5120 -> 512, 5120 -> 1024 and the kv_a 6144 -> 576, name
-    whole-tile kn bf16 TMA-store rows) and dropped where the plan is not whole-tile or a caller forces a pipeline,
+    (``_w8r`` / ``_w8rs`` / ``_w8``) is the row's eight-warp CTA form - taken from the rule (the six sm_103a
+    input-gradient rules that carry it, 4096 -> 48, 4096 -> 512, 4096 -> 1024, 5120 -> 512, 5120 -> 1024 and the
+    kv_a 6144 -> 576, and the five sm_100a input-gradient rules, 4096 -> 512, 4096 -> 1024, 5120 -> 512,
+    5120 -> 1024 and the kv_a 6144 -> 576, name whole-tile kn bf16 TMA-store rows) and dropped where the plan is not
+    whole-tile or a caller forces a pipeline,
     tile, output, epilogue, tail or raster
     knob (the row's program above the form runs the plan asked for); where it survives, the rule's pair-program knobs
     (``pd`` / ``pro`` / ``lw`` / ``mg`` / ``sw`` / ``stages`` / ``hints`` / ``pf`` / ``sh`` / ``store_hint`` /
