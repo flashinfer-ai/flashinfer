@@ -53,7 +53,10 @@ jobs:
   # output so an unapproved PR reports the "Auto-trigger CI" check as skipped
   # rather than as a green no-op.
   approval:
-    name: Check approval
+    # Shown in the PR checks list as "Auto CI on Approval / approval gate".
+    # GitHub cannot hide a job's check run, so the name marks it as part of
+    # auto-CI rather than a separate check.
+    name: approval gate
     # Only run on the canonical repo — forks making PRs against their own
     # main branch should not trigger this workflow.
     if: >-
