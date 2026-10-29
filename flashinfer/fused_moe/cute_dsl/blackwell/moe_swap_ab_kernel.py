@@ -92,8 +92,13 @@ _iket = None
 
 
 @dsl_user_op
-def _gather_mbarrier_arrive(mbarrier, loc=None, ip=None):
+def _gather_mbarrier_arrive(mbarrier, cta_group_size, loc=None, ip=None):
     """Publish this CTA's completed shared-memory inputs to the MMA leader."""
+    if cta_group_size == 1:
+        cute.arch.mbarrier_arrive(mbarrier, loc=loc, ip=ip)
+        return
+    elif cta_group_size != 2:
+        raise ValueError("Gather publication requires one or two CTAs")
     llvm.inline_asm(
         None,
         [cutlass.Int32(mbarrier.toint(loc=loc, ip=ip)).ir_value(loc=loc, ip=ip)],
@@ -111,8 +116,13 @@ def _gather_mbarrier_arrive(mbarrier, loc=None, ip=None):
 
 
 @dsl_user_op
-def _gather_mbarrier_wait(mbarrier, phase, loc=None, ip=None):
-    """Acquire both CTAs' shared-memory inputs after the gathered phase."""
+def _gather_mbarrier_wait(mbarrier, phase, cta_group_size, loc=None, ip=None):
+    """Acquire the shared-memory inputs after the gathered phase."""
+    if cta_group_size == 1:
+        cute.arch.mbarrier_wait(mbarrier, phase, loc=loc, ip=ip)
+        return
+    elif cta_group_size != 2:
+        raise ValueError("Gather publication requires one or two CTAs")
     llvm.inline_asm(
         None,
         [
@@ -3062,7 +3072,8 @@ class Sm100BlockScaledGroupedGemmKernel:
                             with cute.arch.elect_one():
                                 _gather_mbarrier_arrive(
                                     storage.gather_barriers.data_ptr()
-                                    + gather_consumer.index
+                                    + gather_consumer.index,
+                                    self.cta_group_size,
                                 )
                             gather_consumer.advance()
                         tile, _, _, info_state = self.next_work(
@@ -3252,6 +3263,7 @@ class Sm100BlockScaledGroupedGemmKernel:
                                 _gather_mbarrier_wait(
                                     storage.gather_barriers.data_ptr() + consumer.index,
                                     consumer.phase,
+                                    self.cta_group_size,
                                 )
                                 if cutlass.const_expr(self.enable_iket):
                                     _iket.range_pop()
