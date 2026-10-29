@@ -826,8 +826,9 @@ def test_blackwell_cached_cluster_ten_cta_rows_per_arch(
         (71, 28672, "none", 4096, 4096),
         (75, 24584, "none", 6176, 4096),
         # 8-CTA shared-tile and persistent kernels (on sm_103 the persistent
-        # kernel only with a cut of at least 1/10).
-        (45, 81928, "none", 10272, 10272),
+        # kernel only with a cut of at least 1/10; on sm_100 not for a 6-tile
+        # chunk with a cut of at least 1/10, which keeps whole tiles).
+        (45, 81928, "none", 12288, 10272),
         (320, 69632, "none", 8704, 8704),
         (82, 70000, "none", 8768, 8768),
         (52, 100000, "scalar_pdl", 12512, 12512),
@@ -858,8 +859,9 @@ def test_blackwell_cached_cluster_ten_cta_rows_per_arch(
         # under 1/10, a 4-tile row kernel with a cut of at most 1/16 in one
         # wave, the 4-tile row kernels of 4 and 8 CTAs with other chunk tile
         # counts, the 4-tile row kernels of 1 and 2 CTAs, the 8-tile 16-CTA row
-        # kernel, and rows past five waves (on sm_100 past seven for the 8-CTA
-        # kernels) or past one wave with a cut of at most 1/16.
+        # kernel, rows past five waves (on sm_100 past seven for the 8-CTA
+        # kernels) or past one wave with a cut of at most 1/16, and on sm_100
+        # the 8-CTA kernels of a 6-tile chunk with a cut of at least 1/10.
         (8, 256000, "none", 26624, 22528),
         (24, 151936, "none", 10240, 16384),
         (100, 30720, "none", 8192, 8192),
@@ -1015,11 +1017,13 @@ def test_blackwell_cached_cluster_four_tile_rows_balanced_chunk_per_arch(
     "rows,vocab_size,temperature_kind,sm100_chunk,sm103_chunk",
     [
         # 8-CTA shared-tile kernel with a cut of at least 1/10: 6-, 7- and
-        # 8-tile chunks.
-        (79, 81928, "none", 10272, 10272),
-        (296, 81928, "scalar", 10272, 12288),
-        (370, 88320, "scalar_pdl", 11040, 12288),
-        (371, 88320, "none", 11040, 12288),
+        # 8-tile chunks (whole tiles on sm_100 for 6 tiles, per-row
+        # temperatures included).
+        (79, 81928, "none", 12288, 10272),
+        (45, 81928, "per_row", 12288, 10272),
+        (296, 81928, "scalar", 12288, 12288),
+        (370, 88320, "scalar_pdl", 12288, 12288),
+        (371, 88320, "none", 12288, 12288),
         (53, 98312, "none", 12320, 12320),
         (73, 98312, "per_row", 12320, 12320),
         (370, 103168, "none", 12896, 12896),
@@ -1043,9 +1047,10 @@ def test_blackwell_cached_cluster_four_tile_rows_balanced_chunk_per_arch(
         (51, 117768, "per_row", 7392, 14752),
         (74, 126720, "scalar", 16384, 15840),
         # 8-CTA persistent kernel: 6-, 7- and 8-tile chunks.
-        (92, 81928, "scalar_pdl", 10272, 10272),
-        (93, 81928, "none", 10272, 12288),
-        (180, 88320, "scalar", 11040, 12288),
+        (92, 81928, "scalar_pdl", 12288, 10272),
+        (93, 81928, "per_row", 12288, 12288),
+        (93, 81928, "none", 12288, 12288),
+        (180, 88320, "scalar", 12288, 12288),
         (181, 88320, "per_row", 12288, 12288),
         (128, 98312, "none", 12320, 12320),
         (129, 98312, "scalar_pdl", 12320, 12320),
@@ -1063,7 +1068,8 @@ def test_blackwell_cached_cluster_eight_cta_balanced_chunk_rows_per_arch(
     # chunk up to the rows set per kernel, cut and chunk tile count: every
     # row up to five waves or trips, except for 6-tile chunks with a cut of
     # at least 1/10 (shared-tile kernel up to 79 rows, persistent kernel up
-    # to 92 rows).
+    # to 92 rows). On sm_100 the 8-CTA kernels keep whole tiles for 6-tile
+    # chunks with a cut of at least 1/10.
     _skip_unless_b200_or_gb300()
     torch.manual_seed(13)
     logits = torch.randn(rows, vocab_size, device="cuda")

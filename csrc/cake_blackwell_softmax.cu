@@ -164,6 +164,13 @@ constexpr uint32_t kBalancedChunkEightCtaSharedLowCutEightTileMaxRowsSm103 = kBa
 constexpr uint32_t kBalancedChunkEightCtaPersistentSixTileMaxRowsSm103 = 92;
 constexpr uint32_t kBalancedChunkEightCtaPersistentSevenTileMaxRowsSm103 = kBalancedChunkAnyRows;
 constexpr uint32_t kBalancedChunkEightCtaPersistentEightTileMaxRowsSm103 = kBalancedChunkAnyRows;
+// sm_100: the most rows at which the 8-CTA shared-tile and persistent kernels
+// take the balanced chunk for a whole-tile chunk of 6 tiles with a cut of at
+// least 1/HighCutDen (0: no row), on top of the rules above. The other 8-CTA
+// chunks have no such bound.
+constexpr uint64_t kBalancedChunkEightCtaHighCutDenSm100 = 10;
+constexpr uint32_t kBalancedChunkEightCtaSharedHighCutSixTileMaxRowsSm100 = 0;
+constexpr uint32_t kBalancedChunkEightCtaPersistentHighCutSixTileMaxRowsSm100 = 0;
 // The 4-tile row kernels of 4 and 8 CTAs take the balanced chunk, per
 // architecture, only for a whole-tile chunk of the tile count set here: one
 // count for rows in one wave of their resident clusters (OneWave) and one for
@@ -893,8 +900,9 @@ uint32_t eight_cta_balanced_max_rows_sm103(bool persistent, bool high_cut, uint3
 // persistent kernels with a cut of at least 1/10, or on sm_100 past one wave.
 // On sm_100 the 8-tile 8- and 16-CTA kernels keep it past five waves up to the
 // bounds above, unless the temperature is per row. On sm_103 the 8-CTA kernels
-// of a 5- to 8-tile chunk take it only up to the rows set above. The other
-// kernels keep whole tiles.
+// of a 5- to 8-tile chunk take it only up to the rows set above. On sm_100 the
+// 8-CTA kernels of a 6-tile chunk with a cut of at least 1/10 take it only up
+// to the rows set above. The other kernels keep whole tiles.
 cudaError_t select_cached_launch(uint32_t rows, uint32_t vocab_size, ParameterKind parameter_kind,
                                  bool pdl, int device, CachedLaunch* launch) {
   cudaError_t status = select_cached_route(rows, vocab_size, parameter_kind, pdl, device, launch);
@@ -964,6 +972,14 @@ cudaError_t select_cached_launch(uint32_t rows, uint32_t vocab_size, ParameterKi
     }
     const bool high_cut = cut * kBalancedChunkEightCtaSharedHighCutDenSm103 >= whole;
     if (rows > eight_cta_balanced_max_rows_sm103(persistent, high_cut, whole_tiles)) {
+      return cudaSuccess;
+    }
+  }
+  if (eight_cta_chunk && device_minor == 0 && whole_tiles == 6 &&
+      cut * kBalancedChunkEightCtaHighCutDenSm100 >= whole) {
+    const bool persistent = launch->route == SoftmaxRoute::kCachedClusterPersistent;
+    if (rows > (persistent ? kBalancedChunkEightCtaPersistentHighCutSixTileMaxRowsSm100
+                           : kBalancedChunkEightCtaSharedHighCutSixTileMaxRowsSm100)) {
       return cudaSuccess;
     }
   }
