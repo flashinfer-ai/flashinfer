@@ -223,6 +223,10 @@ class KdaArena:
     problem's, so the results are bitwise the whole problem's, except that an exactly-zero entry of ``u`` / ``w``
     in a chunk whose pair partner changed (the paired WY programs accumulate ``0 * partner``) may change sign.
     The calls then take ``doc_lengths``, the documents' token counts as host integers (the host reads no tensor).
+    With ``tail_passes = B`` the arena is sized for the largest group (or the bound of every group) at ``B``
+    passes, and each group runs its tail in the fewest passes ``b`` up to ``B`` whose lean layout at its own
+    geometry fits that arena (one pass: the one-pass lean layout): each tail stage launches once per range of
+    ``ceil(NC_pad / b)`` chunks instead of ``ceil(NC_pad / B)``, at the same bits.
     The option refuses the rows whose block table gives the documents proportional segment counts (at most four
     (document, head) chains on the segmented route).  The longest document bounds the arena from below
     (:func:`memory_report` with ``doc_lengths``); :func:`arena_for_budget` / :meth:`KdaWorkspace.for_budget` search
@@ -1920,16 +1924,45 @@ def _chain_ranks(lengths: Sequence[int]) -> tuple[int, ...]:
     return tuple(ranks)
 
 
+def _group_tail_passes(
+    p: Plan,
+    batch: Batch,
+    nc_pad: int,
+    arena: KdaArena,
+    *,
+    nbytes: int,
+    save_mode: str,
+) -> int:
+    """The tail passes of one document group's backward at chunk bound ``nc_pad`` under the batched ``arena`` in an
+    arena of ``nbytes``: the fewest, up to the option's ``tail_passes``, whose lean layouts at the group's geometry
+    fit those bytes (the layouts the workspace's backward takes: ``bwd_tape_lean`` on a tape-mode workspace, also
+    ``bwd_lean`` on a light one), else the option's (:meth:`KdaWorkspace.views` checks that one).  The arena is
+    sized for the largest group at the option's passes, so a smaller group runs its tail in fewer passes; the
+    split only partitions the tail's chunk ranges, so every pass count gives the same gradients bit for bit."""
+    if arena.tail_passes == 1:
+        return 1
+    modes = ("bwd_tape_lean",) if save_mode == "tape" else ("bwd_lean", "bwd_tape_lean")
+    nseg = p.batch_segments(batch)
+    for passes in range(1, arena.tail_passes):
+        if all(
+            _mode_bytes(BT * nc_pad, p.H, nc_pad, nseg, mode, passes, p.gate_fused)
+            <= nbytes
+            for mode in modes
+        ):
+            return passes
+    return arena.tail_passes
+
+
 @dataclasses.dataclass(frozen=True, eq=False)
 class _Packing:
     """One ``doc_lengths`` of a batched workspace (:meth:`KdaWorkspace.batches`), derived on the host from the
     lengths alone: the document groups (:meth:`Plan.batches`); on the segmented route, per group, where its state
     blocks are one run of the whole problem's the first of them (``blocks``; a group's tables rank its documents by
     the whole problem's rule, so its chains keep their relative order), else ``None`` and the group's block
-    indices (``index``; ``None`` on the serial route too, which has no blocks); under a lean workspace's
-    ``tail_passes > 1`` the real chunk count of every tail range of every group at both of its chunk bounds
-    (:func:`_tail_passes`); and the device copy of these integers (``None`` until a call makes it;
-    :func:`_entry_release` drops it)."""
+    indices (``index``; ``None`` on the serial route too, which has no blocks); the real chunk count of every
+    tail range of every group at each of its chunk bounds where the group runs more than one tail pass
+    (:func:`_group_tail_passes`, :func:`_tail_passes`); and the device copy of these integers (``None`` until a
+    call makes it; :func:`_entry_release` drops it)."""
 
     batches: tuple[Batch, ...]
     P: int
@@ -1964,8 +1997,8 @@ class _Packing:
         return self.words_dev[: self.batches[-1].d1]
 
     def tail_counts(self, group: int, nc_pad: int) -> torch.Tensor | None:
-        """The real chunk counts of the group's tail ranges at chunk bound ``nc_pad`` (``None`` without them: the
-        tail passes form them on the device)."""
+        """The real chunk counts of the group's tail ranges at chunk bound ``nc_pad`` (``None`` where the group runs
+        its tail in one pass)."""
         at = self.tail_at.get((group, nc_pad))
         return None if at is None else self.words_dev[at[0] : at[0] + at[1]]
 
@@ -1982,8 +2015,16 @@ class _Packing:
         return self.index_dev[at[0] : at[0] + at[1]]
 
 
-def _host_packing(p: Plan, arena: KdaArena, lengths: tuple[int, ...]) -> _Packing:
-    """The host part of :class:`_Packing` for ``lengths`` (checked) on plan ``p`` under the batched ``arena``."""
+def _host_packing(
+    p: Plan,
+    arena: KdaArena,
+    lengths: tuple[int, ...],
+    *,
+    nbytes: int,
+    save_mode: str,
+) -> _Packing:
+    """The host part of :class:`_Packing` for ``lengths`` (checked) on plan ``p`` under the batched ``arena``, for a
+    workspace of ``nbytes`` and ``save_mode`` (the groups' tail passes: :func:`_group_tail_passes`)."""
     batches = p.batches(arena, lengths)
     ranks = _chain_ranks(lengths) if p.recur == "seg" else None
     words = list(lengths)
@@ -1992,13 +2033,18 @@ def _host_packing(p: Plan, arena: KdaArena, lengths: tuple[int, ...]) -> _Packin
     index_at: dict[int, tuple[int, int]] = {}
     blocks: list[int | None] = []
     for i, b in enumerate(batches):
-        if arena.tail_passes > 1:
-            # the device rule of _tail_passes, clamp(NC_real - c0, 0, ceil(NC_pad / B)), at the group's real chunks
-            real = sum(-(-n // BT) for n in lengths[b.d0 : b.d1])
-            for nc_pad in sorted({b.NC_pad, b.NC_pad_tape}):
-                ranges = _tail_ranges(nc_pad, arena.tail_passes)
-                tail_at[(i, nc_pad)] = (len(words), len(ranges))
-                words += [min(max(real - c0, 0), ranges[0][1]) for c0, _n in ranges]
+        # the device rule of _tail_passes, clamp(NC_real - c0, 0, ceil(NC_pad / B)), at the group's real chunks and
+        # its own pass count B at each chunk bound (a group in one pass reads no counts)
+        real = sum(-(-n // BT) for n in lengths[b.d0 : b.d1])
+        for nc_pad in sorted({b.NC_pad, b.NC_pad_tape}):
+            passes = _group_tail_passes(
+                p, b, nc_pad, arena, nbytes=nbytes, save_mode=save_mode
+            )
+            if passes == 1:
+                continue
+            ranges = _tail_ranges(nc_pad, passes)
+            tail_at[(i, nc_pad)] = (len(words), len(ranges))
+            words += [min(max(real - c0, 0), ranges[0][1]) for c0, _n in ranges]
         if ranks is None:
             blocks.append(None)
             continue
@@ -2032,6 +2078,8 @@ class KdaWorkspace:
     replay on this workspace), the tail split into ``tail_passes`` passes and the document groups of
     ``batch_tokens``; under a batched option ``doc_lengths`` (the documents' token counts) sizes the arena for the
     exact groups instead of the bound of every group, and the calls on the workspace take the same ``doc_lengths``.
+    The attribute ``tail_passes`` is the passes of the workspace's backward tail: the option's, and in a group's
+    view (:meth:`batch_view`) the group's own, the fewest up to the option's that fit the arena.
     """
 
     def __init__(
@@ -2065,6 +2113,8 @@ class KdaWorkspace:
             )
         self.backward = backward
         self.save_mode = save_mode
+        # the passes of this workspace's backward tail (a group's view of a batched arena takes its own)
+        self.tail_passes = self.arena_option.tail_passes
         self.launcher: Launcher = cake_jit.run_module if launcher is None else launcher
         self.bytes = plan.arena_bytes(
             backward=backward,
@@ -2098,7 +2148,7 @@ class KdaWorkspace:
         ns = self._views_cache.get(mode)
         if ns is None:
             # the tail split shapes the lean backward layouts only; every other layout has one form
-            tail = self.arena_option.tail_passes if mode in LEAN_MODES else 1
+            tail = self.tail_passes if mode in LEAN_MODES else 1
             need = self.plan.workspace_bytes(mode, tail)
             if need > self.bytes:
                 raise ValueError(
@@ -2255,14 +2305,22 @@ class KdaWorkspace:
     def batch_view(self, batch: Batch, *, tape: bool = False) -> KdaWorkspace:
         """The view of this arena under the plan of one document group (:meth:`Plan.batch_plan`; ``tape`` selects
         the geometry of the group's views of a whole-problem tape), cached per group geometry: the group's layouts
-        on the same bytes (they must fit: :meth:`views` checks), the shared ``eye`` / ``flags`` and epoch counter."""
+        on the same bytes (they must fit: :meth:`views` checks), the shared ``eye`` / ``flags`` and epoch counter,
+        and the group's own ``tail_passes`` (:func:`_group_tail_passes`: the fewest that fit the arena)."""
         nc_pad = batch.NC_pad_tape if tape else batch.NC_pad
         key = (batch.S, batch.N, nc_pad)
         other = self._batch_views.get(key)
         if other is None:
-            other = self._batch_views[key] = self._view(
-                self.plan.batch_plan(batch, tape=tape)
+            other = self._view(self.plan.batch_plan(batch, tape=tape))
+            other.tail_passes = _group_tail_passes(
+                self.plan,
+                batch,
+                nc_pad,
+                self.arena_option,
+                nbytes=self.bytes,
+                save_mode=self.save_mode,
             )
+            self._batch_views[key] = other
         return other
 
     def batches(
@@ -2290,7 +2348,13 @@ class KdaWorkspace:
         capturing = torch.cuda.is_current_stream_capturing()
         entry = self._doc_cache.get(key)
         if entry is None:
-            entry = _host_packing(self.plan, self.arena_option, key)
+            entry = _host_packing(
+                self.plan,
+                self.arena_option,
+                key,
+                nbytes=self.bytes,
+                save_mode=self.save_mode,
+            )
         if entry.words_dev is None:
             if capturing:
                 raise RuntimeError(
@@ -2846,17 +2910,21 @@ def _tail_passes(
     nc_vec: torch.Tensor | None = None,
 ) -> None:
     """Steps 6-8 of the backward (the fused gradient, GLM intra and, where it launches, the gate epilogue) once per tail range
-    (:func:`_tail_ranges`) of a lean workspace with ``tail_passes > 1``.  Per range: the whole-sequence arena
-    buffers (``gk``, ``v_new``, ``dv2``, ``beta_int``, the ``h`` / ``dh`` tapes) as leading-axis views offset by the
-    range's first chunk, the chunk tables as the range's slices, ``seq_chunk_start`` as the one-entry count of the
-    range's real chunks (``num_seqs = 0`` makes the fused gradient read that entry as its item bound), the lean
-    layout's per-pass buffers as they are (sized for one range) and the token tensors whole (every kernel reaches
-    them through the absolute ``chunk_bos``); the grids are the plan's rules at the range's chunk count.  The same
-    kernels address the same bytes as in one pass, so the gradients are bitwise the same.  ``nc_vec`` is the real
-    chunk count of every range where the host has it (a batched call's groups: from ``doc_lengths``,
-    :class:`_Packing`), else formed on the device."""
+    (:func:`_tail_ranges`) of a lean workspace with ``tail_passes > 1`` (a group's view: its own).  Per range: the
+    whole-sequence arena buffers (``gk``, ``v_new``, ``dv2``, ``beta_int``, the ``h`` / ``dh`` tapes) as leading-axis
+    views offset by the range's first chunk, the chunk tables as the range's slices, ``seq_chunk_start`` as the
+    one-entry count of the range's real chunks (``num_seqs = 0`` makes the fused gradient read that entry as its item
+    bound), the lean layout's per-pass buffers as they are (sized for one range) and the token tensors whole (every
+    kernel reaches them through the absolute ``chunk_bos``); the grids are the plan's rules at the range's chunk
+    count.  The same kernels address the same bytes as in one pass, so the gradients are bitwise the same.
+    ``nc_vec`` is the real chunk count of every range where the host has it (a batched call's groups: from
+    ``doc_lengths``, :class:`_Packing`), else formed on the device."""
     p = ws.plan
-    ranges = _tail_ranges(p.NC_pad, ws.arena_option.tail_passes)
+    ranges = _tail_ranges(p.NC_pad, ws.tail_passes)
+    if nc_vec is not None and nc_vec.numel() != len(ranges):
+        raise RuntimeError(
+            f"_tail_passes: {nc_vec.numel()} host chunk counts for {len(ranges)} tail ranges"
+        )
     # without the host's counts (a lean call that is not batched has no doc_lengths), the real chunks of every range
     # on the device: clamp(NC_real - c0, 0, ceil(NC_pad / B)), NC_real = seq_chunk_start[N] <= NC_pad, so the
     # clipped last range needs no bound of its own; the first chunks come from an arange (the host does not wait
@@ -3313,9 +3381,9 @@ def _backward_launches(
     ``cu_seqlens`` slice, its tables, its tape slices, its slices of the saved ``qg`` / ``w`` / ``u``, its blocks of
     the saved states and its tail counts ``nc_vec``; the token tensors, the saved ``Aqk`` / ``Akk`` and the
     gradients always whole): the replay's intra recompute, the prep, WY, the recurrence recompute, dA / dv, the
-    adjoint recurrence and the tail (once, or per range of a lean workspace's ``tail_passes``), each where the path
-    and the plan dispatch it.  ``seg_m`` is the forward's transfers where they do not come from ``seg_state[1]``
-    (a tape set's ``seg_m``, a group's blocks of the saved ``seg_state[1]``)."""
+    adjoint recurrence and the tail (once, or per range of a lean workspace's ``tail_passes``, a group view's own),
+    each where the path and the plan dispatch it.  ``seg_m`` is the forward's transfers where they do not come from
+    ``seg_state[1]`` (a tape set's ``seg_m``, a group's blocks of the saved ``seg_state[1]``)."""
     p = ws.plan
     b = views
     # The operand sources of the backward programs: the saved Aqk / Akk token rows and the user's dout on the
@@ -3386,7 +3454,7 @@ def _backward_launches(
     if p.recur == "seg":
         transfers = (seg_m if seg_m is not None else seg_state[1]).view(-1, D, D)
     _adjoint_recurrence(ws, b, values, path=path, seg_m=transfers)
-    if ws.arena_option.tail_passes == 1:
+    if ws.tail_passes == 1:
         ws.run("dqkg", values, path=path)
         ws.run("glm_intra", values, path=path)
         if p.dispatched(
@@ -3442,7 +3510,8 @@ def chunk_kda_bwd(
     taken from the saved states by chain rank (``light_states``, ``tape``: ranked on the host from ``doc_lengths``
     by the tables' rule; views where the group's blocks are one run of the saved ones, else gathered by index) or
     recomputed in its view (``light``, ``replay``: the replay runs group by group on a workspace that is not lean),
-    and on a lean workspace its tail passes' chunk counts from the host.  The gradients are bitwise the whole
+    and on a lean workspace its tail in the fewest passes, up to the option's, whose layout fits the arena
+    (:func:`_group_tail_passes`) with their chunk counts from the host.  The gradients are bitwise the whole
     problem's (:class:`KdaArena` on the sign of exact zeros).
     """
     q, k, v, g, beta, S, N, H, batched = _operands(q, k, v, g, beta, cu_seqlens)
