@@ -70,7 +70,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(768, LAUNCH_MIN_BLOCKS) void
-kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_d4ed0d7920259003c789(__nv_bfloat16* __restrict__ Q, __nv_bfloat16* __restrict__ K, __nv_bfloat16* __restrict__ V, int* __restrict__ tile_table, int* __restrict__ seg_tile_begin, int* __restrict__ tok_seg, int* __restrict__ cu_seqlens, float* __restrict__ partials, unsigned int* __restrict__ counters, float* __restrict__ mean_k, float* __restrict__ q_mean, unsigned int* __restrict__ q4, unsigned int* __restrict__ k4, uint8_t* __restrict__ q_sf, uint8_t* __restrict__ k_sf, unsigned int* __restrict__ qm4, uint8_t* __restrict__ qm_sf, unsigned int* __restrict__ vt4, uint8_t* __restrict__ v_sf, unsigned int* __restrict__ hctr, int num_tiles, int total_tokens, int total_padded, int num_heads, int num_kblocks)
+kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_e70ba0377df8156f8ac9(__nv_bfloat16* __restrict__ Q, __nv_bfloat16* __restrict__ K, __nv_bfloat16* __restrict__ V, int* __restrict__ tile_table, int* __restrict__ seg_tile_begin, int* __restrict__ tok_seg, int* __restrict__ cu_seqlens, float* __restrict__ partials, unsigned int* __restrict__ counters, float* __restrict__ mean_k, float* __restrict__ q_mean, unsigned int* __restrict__ q4, unsigned int* __restrict__ k4, uint8_t* __restrict__ q_sf, uint8_t* __restrict__ k_sf, unsigned int* __restrict__ qm4, uint8_t* __restrict__ qm_sf, unsigned int* __restrict__ vt4, uint8_t* __restrict__ v_sf, unsigned int* __restrict__ hctr, int num_tiles, int total_tokens, int total_padded, int num_heads, int num_kblocks)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1052,7 +1052,7 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_d4ed0d7920259003c789(__nv_bf
                         }
                     }
                 } else {
-                    if (wtid == 0) {
+                    if (wtid == 32) {
                         {
                         unsigned int _acquire_observed;
                         do {
@@ -2135,7 +2135,7 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_d4ed0d7920259003c789(__nv_bf
                         }
                     }
                 } else {
-                    if (wtid_1 == 0) {
+                    if (wtid_1 == 32) {
                         {
                         unsigned int _acquire_observed;
                         do {
@@ -3208,7 +3208,7 @@ kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_d4ed0d7920259003c789(__nv_bf
                         }
                     }
                 } else {
-                    if (wtid_2 == 0) {
+                    if (wtid_2 == 32) {
                         {
                         unsigned int _acquire_observed;
                         do {
