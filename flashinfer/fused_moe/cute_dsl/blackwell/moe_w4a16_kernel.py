@@ -1981,14 +1981,7 @@ class Sm100W4A16GroupedGemmKernel:
                     tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
                     b_load2mma_consumer_state.reset_count()
                     trans2mma_consumer_state.reset_count()
-                    peek_trans2mma_full_status = cutlass.Boolean(1)
                     if is_leader_cta:
-                        if trans2mma_consumer_state.count < k_tile_cnt:
-                            peek_trans2mma_full_status = (
-                                trans2mma_pipeline.consumer_try_wait(
-                                    trans2mma_consumer_state
-                                )
-                            )
                         if cutlass.const_expr(self.enable_iket):
                             _iket.range_push("mma_acc_empty")
                         acc_pipeline.producer_acquire(acc_producer_state)
@@ -2017,7 +2010,7 @@ class Sm100W4A16GroupedGemmKernel:
                                 if cutlass.const_expr(self.enable_iket):
                                     _iket.range_push("mma_a_ready")
                                 trans2mma_pipeline.consumer_wait(
-                                    trans2mma_consumer_state, peek_trans2mma_full_status
+                                    trans2mma_consumer_state
                                 )
                                 if cutlass.const_expr(self.enable_iket):
                                     _iket.range_pop()
@@ -2064,13 +2057,6 @@ class Sm100W4A16GroupedGemmKernel:
                                     _iket.range_pop()
                                 trans2mma_consumer_state.advance()
                                 b_load2mma_consumer_state.advance()
-                                peek_trans2mma_full_status = cutlass.Boolean(1)
-                                if trans2mma_consumer_state.count < k_tile_cnt:
-                                    peek_trans2mma_full_status = (
-                                        trans2mma_pipeline.consumer_try_wait(
-                                            trans2mma_consumer_state
-                                        )
-                                    )
                         # Async arrive accumulator buffer full
                         acc_pipeline.producer_commit(acc_producer_state)
                     acc_producer_state.advance()
