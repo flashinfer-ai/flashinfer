@@ -333,14 +333,24 @@ def _enumerate_valid_tactics(
     num_tokens: int,
     use_per_token_scaling: bool = False,
     activation_type: ActivationType = ActivationType.Swiglu,
+    global_num_experts: int | None = None,
+    has_gemm1_lora_delta: bool = False,
+    factorized: bool = False,
 ) -> list[list[int]]:
     """Enumerate every (tile_N, config) tactic the autotuner may select for
-    the given problem shape."""
+    the given problem shape. ``num_experts`` is the local expert count and
+    ``global_num_experts`` (default: the same) the global one; ``factorized``
+    returns the factorization rows instead, which also start with tile_N."""
     from flashinfer.tllm_enums import Fp8QuantizationType
 
     cfg = _quant_mode_config(quant_mode)
+    query = (
+        moe_op.trtllm_get_valid_moe_factorizations
+        if factorized
+        else moe_op.trtllm_get_valid_moe_configs
+    )
     return list(
-        moe_op.trtllm_get_valid_moe_configs(
+        query(
             cfg["dtype_act"],
             cfg["dtype_weights"],
             Fp8QuantizationType.NoneFp8,
@@ -349,14 +359,38 @@ def _enumerate_valid_tactics(
             hidden_size,
             intermediate_size,
             num_experts,  # num_local_experts
+            num_experts if global_num_experts is None else global_num_experts,
             activation_type.value,
             True,  # use_shuffled_weight
             WeightLayout.MajorK.value,
             use_per_token_scaling,
             num_tokens,
-            False,  # has_gemm1_lora_delta
+            has_gemm1_lora_delta,
         )
     )
+
+
+def _offered_tiles(
+    quant_mode: Fp4QuantMode,
+    num_tokens: int,
+    local_num_experts: int,
+    num_experts: int,
+    **kwargs,
+) -> set[int]:
+    """tile_N values offered for a top-8, 4096 x 2048 FP4 MoE whose rows carry
+    ids of ``num_experts`` experts, ``local_num_experts`` of them local."""
+    tactics = _enumerate_valid_tactics(
+        get_trtllm_moe_sm100_module().moe_op,
+        quant_mode,
+        top_k=8,
+        hidden_size=4096,
+        intermediate_size=2048,
+        num_experts=local_num_experts,
+        num_tokens=num_tokens,
+        global_num_experts=num_experts,
+        **kwargs,
+    )
+    return {int(t[0]) for t in tactics}
 
 
 @pytest.mark.parametrize(
@@ -551,6 +585,8 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
     top_k: int,
     num_experts: int,
     quant_mode: Fp4QuantMode,
+    local_num_experts: int | None = None,
+    tile_ns: set[int] | None = None,
 ):
     """Per-tactic correctness sweep of `trtllm_fp4_block_scale_routed_moe`.
 
@@ -580,6 +616,19 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
         routing_method_type=routing_method_type,
         device=device,
     )
+    # Expert parallelism: rows keep global expert ids, the first
+    # ``local_num_experts`` experts are local.
+    local_num_experts = local_num_experts or num_experts
+    for key in (
+        "w13",
+        "w13_scale",
+        "w2",
+        "w2_scale",
+        "output1_scale_scalar",
+        "output1_scale_gate_scalar",
+        "output2_scale_scalar",
+    ):
+        inputs[key] = inputs[key][:local_num_experts]
     # Pin the autotuner bucket so cache-write and runtime cache-lookup match.
     tune_max_num_tokens = max(last_positive_power_of_2(num_tokens), 16)
     bucket_m = min(last_positive_power_of_2(num_tokens), tune_max_num_tokens)
@@ -589,7 +638,7 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
     forced_runner = moe_module.MoERunner(
         moe_module.moe_op,
         top_k=top_k,
-        num_local_experts=num_experts,
+        num_local_experts=local_num_experts,
         dtype_act=cfg["dtype_act"],
         dtype_weights=cfg["dtype_weights"],
         fp8_quantization_type=Fp8QuantizationType.NoneFp8,
@@ -628,7 +677,7 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
             topk_group=None,
             intermediate_size=intermediate_size,
             local_expert_offset=0,
-            local_num_experts=num_experts,
+            local_num_experts=local_num_experts,
             routed_scaling_factor=None,
             routing_method_type=routing_method_type.value,
             do_finalize=True,
@@ -653,9 +702,12 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
         top_k,
         hidden_size,
         intermediate_size,
-        num_experts,
+        local_num_experts,
         num_tokens,
+        global_num_experts=num_experts,
     )
+    if tile_ns is not None:
+        valid_tactics = [t for t in valid_tactics if t[0] in tile_ns]
     assert len(valid_tactics) > 0, f"[{quant_mode}] no valid tactics returned"
 
     _run_kernel_with_tactic(list(valid_tactics[0]))
@@ -667,7 +719,7 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
     print(
         f"\n[all_tactics_correctness] quant={quant_mode} "
         f"M={num_tokens} hidden={hidden_size} intermediate={intermediate_size} "
-        f"experts={num_experts} top_k={top_k}: "
+        f"experts={local_num_experts}/{num_experts} top_k={top_k}: "
         f"sweeping {len(valid_tactics)} valid tactics",
         flush=True,
     )
@@ -696,6 +748,30 @@ def test_trtllm_fp4_routed_moe_all_tactics_correctness(
             f"[{quant_mode}] {len(failures)} of {len(valid_tactics)} tactics "
             f"failed correctness. First few:\n  " + "\n  ".join(failures[:20])
         )
+
+
+def test_trtllm_fp4_routed_moe_all_tactics_correctness_expert_parallel():
+    """The sweep above on an expert-parallel shape, restricted to the tactics of
+    the tile the global expert count adds (the others are swept without EP)."""
+    if get_compute_capability(torch.device(device="cuda"))[0] not in [10]:
+        pytest.skip("Only work on SM100 / SM103.")
+    num_tokens, local_num_experts, num_experts = 256, 32, 256
+    local = _offered_tiles(
+        "NvFP4xNvFP4", num_tokens, local_num_experts, local_num_experts
+    )
+    offered = _offered_tiles("NvFP4xNvFP4", num_tokens, local_num_experts, num_experts)
+    added = offered - local
+    assert added, "the shape no longer exercises a tile added by EP"
+    test_trtllm_fp4_routed_moe_all_tactics_correctness(
+        num_tokens=num_tokens,
+        hidden_size=4096,
+        intermediate_size=2048,
+        top_k=8,
+        num_experts=num_experts,
+        quant_mode="NvFP4xNvFP4",
+        local_num_experts=local_num_experts,
+        tile_ns=added,
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -900,6 +976,7 @@ def _enumerate_fp8_valid_tactics(
             hidden_size,
             intermediate_size,
             num_experts,  # num_local_experts
+            num_experts,  # num_experts
             ActivationType.Swiglu.value,
             cfg["use_shuffled_weight"],
             cfg["weight_layout"],
@@ -1060,33 +1137,28 @@ def test_trtllm_fp8_routed_moe_all_tactics_correctness(
         )
 
 
-@pytest.mark.parametrize("num_fused_shared_experts", [1, 2])
-def test_fp4_block_scale_moe_fused_shared_experts_autotune(num_fused_shared_experts):
-    """FP4 fused shared experts must agree with the autotuner on the fused dimensions.
-
-    ``get_valid_tactics`` must query ``trtllm_get_valid_moe_configs`` with the
-    fused (routed + shared) ``top_k`` / ``local_num_experts`` so the chosen
-    tactic passes ``prepare_moe()``'s ``effectiveTopK`` / ``effectiveLocalExperts``
-    validation. Weight contents are uninitialized (numerics are irrelevant) —
-    smoke test: must not crash during autotuning.
-    """
-    if get_compute_capability(torch.device(device="cuda"))[0] not in [10]:
-        pytest.skip("Only work on SM100 / SM103.")
+def _tune_fp4_block_scale_moe(
+    num_tokens: int,
+    num_experts: int,
+    local_num_experts: int,
+    num_fused_shared_experts: int | None = None,
+) -> None:
+    """Autotune one FP4 block-scale MoE call (DeepSeekV3 routing, top-8 of
+    ``num_experts``, ``local_num_experts`` of them local). Weight contents are
+    uninitialized: only the tactic queries and the dispatch are under test."""
     tuner = AutoTuner.get()
     tuner.clear_cache()
     tuner.reset_statistics()
     tuner.is_tuning_mode = False
     device = torch.device("cuda:0")
 
-    num_experts = 256  # routed experts
     top_k = 8
     n_group = 8
     topk_group = 4
     hidden_size = 1024
     intermediate_size = 512
-    num_tokens = 8
-    # Weight tensors carry the routed + fused shared experts in the expert dim.
-    total_experts = num_experts + num_fused_shared_experts
+    # Weight tensors carry the local routed + fused shared experts in the expert dim.
+    total_experts = local_num_experts + (num_fused_shared_experts or 0)
 
     routing_logits = torch.rand(
         num_tokens, num_experts, dtype=torch.float32, device=device
@@ -1149,11 +1221,111 @@ def test_fp4_block_scale_moe_fused_shared_experts_autotune(num_fused_shared_expe
             topk_group=topk_group,
             intermediate_size=intermediate_size,
             local_expert_offset=0,
-            local_num_experts=num_experts,
+            local_num_experts=local_num_experts,
             routed_scaling_factor=2.5,
             routing_method_type=RoutingMethodType.DeepSeekV3.value,
             do_finalize=True,
             output=output,
-            tune_max_num_tokens=8,
+            tune_max_num_tokens=num_tokens,
             num_fused_shared_experts=num_fused_shared_experts,
         )
+
+
+@pytest.mark.parametrize("num_fused_shared_experts", [1, 2])
+def test_fp4_block_scale_moe_fused_shared_experts_autotune(num_fused_shared_experts):
+    """FP4 fused shared experts must agree with the autotuner on the fused dimensions.
+
+    ``get_valid_tactics`` must query ``trtllm_get_valid_moe_configs`` with the
+    fused (routed + shared) ``top_k`` / ``local_num_experts`` so the chosen
+    tactic passes ``prepare_moe()``'s ``effectiveTopK`` / ``effectiveLocalExperts``
+    validation. Weight contents are uninitialized (numerics are irrelevant) —
+    smoke test: must not crash during autotuning.
+    """
+    if get_compute_capability(torch.device(device="cuda"))[0] not in [10]:
+        pytest.skip("Only work on SM100 / SM103.")
+    _tune_fp4_block_scale_moe(
+        num_tokens=8,
+        num_experts=256,
+        local_num_experts=256,
+        num_fused_shared_experts=num_fused_shared_experts,
+    )
+
+
+# ----------------------------------------------------------------------------
+# Expert-parallel tile_N candidates.
+# ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("factorized", [False, True], ids=["configs", "factorizations"])
+@pytest.mark.parametrize(
+    "quant_mode,num_tokens,local_num_experts,num_experts",
+    [
+        pytest.param("NvFP4xNvFP4", 256, 32, 256, id="NvFP4-256rows-32of256"),
+        pytest.param("NvFP4xNvFP4", 2048, 32, 256, id="NvFP4-2048rows-32of256"),
+        pytest.param("MxFP4xBf16", 128, 32, 128, id="MxFP4xBf16-128rows-32of128"),
+    ],
+)
+def test_expert_parallel_adds_at_most_one_smaller_tile(
+    quant_mode: Fp4QuantMode,
+    num_tokens: int,
+    local_num_experts: int,
+    num_experts: int,
+    factorized: bool,
+):
+    """A global expert count above the local one keeps every tile offered for
+    the local count and adds at most one, smaller than all of them."""
+    if get_compute_capability(torch.device(device="cuda"))[0] not in [10]:
+        pytest.skip("Only work on SM100 / SM103.")
+    local = _offered_tiles(
+        quant_mode,
+        num_tokens,
+        local_num_experts,
+        local_num_experts,
+        factorized=factorized,
+    )
+    offered = _offered_tiles(
+        quant_mode, num_tokens, local_num_experts, num_experts, factorized=factorized
+    )
+    assert local and offered >= local
+    extra = offered - local
+    assert len(extra) <= 1 and all(tile < min(local) for tile in extra)
+
+
+@pytest.mark.parametrize("quant_mode", ["NvFP4xNvFP4", "MxFP4xMxFP8"])
+@pytest.mark.parametrize("num_tokens", [16, 128])
+def test_expert_parallel_with_lora_does_not_add_tile_192(
+    quant_mode: Fp4QuantMode, num_tokens: int
+):
+    """These dtypes have no tile-192 kernel with a gemm1 LoRA delta, and offering
+    192 fails the whole query, leaving the autotuner with no tactics (#5534).
+    Expert parallelism must not add 192 where the local expert count does not."""
+    if get_compute_capability(torch.device(device="cuda"))[0] not in [10]:
+        pytest.skip("Only work on SM100 / SM103.")
+    local = _offered_tiles(quant_mode, num_tokens, 32, 32, has_gemm1_lora_delta=True)
+    offered = _offered_tiles(quant_mode, num_tokens, 32, 256, has_gemm1_lora_delta=True)
+    assert offered
+    assert 192 not in offered or 192 in local
+
+
+def test_autotuner_queries_global_expert_count(monkeypatch: pytest.MonkeyPatch):
+    """The runner must pass the global expert count to the tactic query, or an
+    expert-parallel call is never offered the small tile when tuning."""
+    if get_compute_capability(torch.device(device="cuda"))[0] not in [10]:
+        pytest.skip("Only work on SM100 / SM103.")
+    num_tokens = 256
+    runner_cls = get_trtllm_moe_sm100_module().MoERunner
+    get_valid_tactics = runner_cls.get_valid_tactics
+    offered = []
+
+    def _spy(self, inputs, profile):
+        tactics = get_valid_tactics(self, inputs, profile)
+        if MoEInputs.from_list(inputs).hidden_states.shape[0] == num_tokens:
+            offered.append({int(t[0]) for t in tactics})
+        return tactics
+
+    monkeypatch.setattr(runner_cls, "get_valid_tactics", _spy)
+    _tune_fp4_block_scale_moe(num_tokens, num_experts=256, local_num_experts=32)
+    assert offered, "the autotuner did not query the runner at 256 rows"
+    # 256 rows of top-8 are 64 per local expert (candidates from tile 16 up), but
+    # about 8 per expert when they carry ids of all 256 experts.
+    assert all(8 in tiles for tiles in offered)

@@ -10,6 +10,7 @@
 #   bash tests/moe_ep/run_tests.sh bf16-rank-major # 8x B200 BF16 rank-major GPU regression
 #   bash tests/moe_ep/run_tests.sh mega_sm90     # 4-GPU Hopper sm90 pull FP8 + BF16 mega multirank
 #   bash tests/moe_ep/run_tests.sh mega_sm90_mxfp4 # 4-GPU Hopper MXFP4 accuracy
+#   bash tests/moe_ep/run_tests.sh mega_sm90_nvfp4 # 4-GPU Hopper NVFP4 accuracy + graph replay
 #   bash tests/moe_ep/run_tests.sh mega_sm120_cake # 4/8-GPU Blackwell-consumer sm120_mxfp4_mxfp8_bf16_cake (NCCL LSA + GIN)
 #   bash tests/moe_ep/run_tests.sh mega_sm107    # Rubin EP2/4/8 (NPROC_MULTIRANK, default 4), all three formats
 #   bash tests/moe_ep/run_tests.sh qualify_sm107 # strict Rubin host/single/multirank suite; rejects skips
@@ -122,6 +123,7 @@ run_unit() {
   pytest_no_finalize tests/moe_ep/ -v \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     --ignore=tests/moe_ep/test_moe_ep_layer_multirank.py \
+    --ignore=tests/moe_ep/test_nvlink_one_sided.py \
     --ignore=tests/moe_ep/test_moe_ep_deep_gemm_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py \
@@ -134,6 +136,7 @@ run_unit() {
     --ignore=tests/moe_ep/test_moe_ep_sm90_pull_fp8_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_sm90_pull_bf16_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_sm90_pull_mxfp4_mega_multirank.py \
+    --ignore=tests/moe_ep/test_moe_ep_sm90_pull_nvfp4_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_sm120_mxfp8_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_sm120_w4a8_cake_mega.py \
@@ -151,6 +154,7 @@ run_unit() {
     --ignore=tests/moe_ep/test_sm107_combine_kernel.py \
     --ignore=tests/moe_ep/test_sm90_pull_fp8_tuner.py \
     --ignore=tests/moe_ep/test_sm90_pull_bf16_tuner.py \
+    --ignore=tests/moe_ep/test_sm120_w4a8_cutedsl_host.py \
     --ignore=tests/moe_ep/test_split_fused_moe_kernel_vs_reference.py \
     --ignore=tests/moe_ep/test_moe_ep_compute_correctness.py \
     --ignore=tests/moe_ep/test_moe_ep_compute_correctness_nvfp4.py \
@@ -169,6 +173,11 @@ run_unit() {
   pytest_no_finalize -v "${MOE_EP_PYTEST_FLAGS[@]}" \
     "tests/moe_ep/test_workspace_pool.py::test_two_nvfp4_layers_share_one_symm_buffer" \
     || return 1
+  # The SM120 split shim prepends raw packages named src/common that overlap
+  # the SM100 drop. Keep its host contracts covered in a separate process.
+  pytest_no_finalize -v "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_sm120_w4a8_cutedsl_host.py \
+    || return 1
   # The SM90 pull tuner tests import the sm90 pull_style_cutedsl_megakernel
   # tree, which shares top-level module names (common, src, moe_nvfp4_swapab)
   # with the SM100 cutedsl_megamoe tree the tests above load; the shim's
@@ -185,7 +194,13 @@ run_unit() {
 run_comm() {
   "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
-    tests/moe_ep/test_moe_ep_communication_multirank.py -v
+    tests/moe_ep/test_moe_ep_communication_multirank.py -v || return 1
+  # NVLink one-sided's Lamport transport against its fence transport.
+  "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_nvlink_one_sided_lamport.py -v || return 1
+  # Spawns one process per EP rank itself; cases needing more GPUs skip.
+  "${PY}" -m pytest "${MOE_EP_PYTEST_FLAGS[@]}" tests/moe_ep/test_nvlink_one_sided.py -v
 }
 
 run_multirank() {
@@ -332,6 +347,12 @@ run_mega() {
     tests/moe_ep/test_mega_native_topk_reduce_multirank.py -v \
     -m "gpu_4 and arch_blackwell" || rc=1
 
+  "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_mega_cuda_graph_multirank.py -v \
+    -k "tail_reset_multirank_graph or sparse_dispatch_graph or sparse_to_dense_graph or blackwell_genphase_graph" \
+    -m "gpu_2 and arch_blackwell" || rc=1
+
   MEGA_NO_DIST=1 "${TORCHRUN}" --nproc_per_node=1 -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
@@ -374,6 +395,9 @@ run_oracle_sm107() {
     tests/moe_ep/test_sm107_block_scaled_kernel_vs_reference.py -v -s \
     tests/moe_ep/test_sm107_kernel_boundaries.py \
     tests/moe_ep/test_sm107_genphase_kernel.py \
+    tests/moe_ep/test_sm107_genphase_cga2_kernel.py \
+    tests/moe_ep/test_sm107_masked_combine.py \
+    tests/moe_ep/test_sm107_routing_graph.py \
     tests/moe_ep/test_sm107_combine_kernel.py \
     -m arch_rubin
 }
@@ -405,11 +429,19 @@ run_mega_sm90_mxfp4() {
     -m arch_hopper
 }
 
+run_mega_sm90_nvfp4() {
+  FAIL_ON_DISTRIBUTED_SKIP=1 "${TORCHRUN}" --standalone --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
+    "${MOE_EP_PYTEST_FLAGS[@]}" \
+    tests/moe_ep/test_moe_ep_sm90_pull_nvfp4_mega_multirank.py -v \
+    -m arch_hopper
+}
+
 # Distributed Rubin MoEEpLayer tests against the Torch oracle.
 run_mega_sm107() {
   CUTE_DSL_ARCH=sm_107a "${TORCHRUN}" --nproc_per_node="${NPROC_MULTIRANK}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py -v \
+    tests/moe_ep/test_sm107_routing_graph_multirank.py \
     -m "gpu_2 and arch_rubin"
 }
 
@@ -561,6 +593,7 @@ run_all() {
   run_section "split_path_correctness_nvfp4 (4 GPU)" run_split_path_correctness_nvfp4
   run_section "split_path_correctness_ht (4 GPU)" run_split_path_correctness_ht
   run_section "mega multirank (Blackwell)" run_mega
+  run_section "sm90 NVFP4 accuracy + graph replay (Hopper)" run_mega_sm90_nvfp4
   run_section "smoke scripts" run_smoke
   print_summary
 }
@@ -583,6 +616,7 @@ case "${1:-all}" in
   bf16-rank-major) run_section "BF16 rank-major GPU regression (8 B200 GPUs)" run_bf16_rank_major; print_summary ;;
   mega_sm120_cake) run_section "sm120_mxfp4_mxfp8_bf16_cake mega multirank (Blackwell-consumer, NCCL LSA + GIN)" run_mega_sm120_cake; print_summary ;;
   mega_sm90) run_section "sm90 pull FP8 + BF16 mega multirank (Hopper)" run_mega_sm90; print_summary ;;
+  mega_sm90_nvfp4) run_section "sm90_fp8_nvfp4_bf16_pull_cutedsl mega multirank (Hopper)" run_mega_sm90_nvfp4; print_summary ;;
   mega_sm90_mxfp4) run_section "sm90_fp8_mxfp4_bf16_pull_cutedsl mega multirank (Hopper)" run_mega_sm90_mxfp4; print_summary ;;
   mega_sm120) run_section "sm120_mxfp8_mxfp8_bf16_cutedsl mega multirank (Blackwell-consumer)" run_mega_sm120; print_summary ;;
   mega_sm107) run_section "sm107 block-scaled mega multirank (Rubin)" run_mega_sm107; print_summary ;;
@@ -592,7 +626,7 @@ case "${1:-all}" in
   ft) run_section "fault tolerance (4 GPU)" run_ft; print_summary ;;
   all) run_all ;;
   *)
-    echo "Usage: $0 [unit|oracle|oracle_sm90|oracle_sm90_mxfp4|oracle_sm107|qualify_sm107|multirank|comm|sm90_push|sm90_bf16_push_cake|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|bf16-rank-major|mega_sm90|mega_sm90_mxfp4|mega_sm120|mega_sm120_cake|mega_sm107|smoke|ft|all]" >&2
+    echo "Usage: $0 [unit|oracle|oracle_sm90|oracle_sm90_mxfp4|oracle_sm107|qualify_sm107|multirank|comm|sm90_push|sm90_bf16_push_cake|split_path_correctness_bf16|split_path_correctness_nvfp4|split_path_correctness_ht|mega|bf16-rank-major|mega_sm90|mega_sm90_mxfp4|mega_sm90_nvfp4|mega_sm120|mega_sm120_cake|mega_sm107|smoke|ft|all]" >&2
     exit 1
     ;;
 esac

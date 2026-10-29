@@ -83,9 +83,7 @@ def test_public_config_registration(config, key):
     assert config in api.ALL_BACKEND_CONFIGS
     assert eval(repr(config()), vars(api)) == config()
     assert BackendOptions((config(),)).valid_for(107) == [config()]
-    assert BackendOptions((config(),)).valid_for(120) == (
-        [config()] if config is CudnnFrostBf16Config else []
-    )
+    assert BackendOptions((config(),)).valid_for(120) == [config()]
     assert BackendOptions((config(),)).valid_for(121) == []
     assert BackendOptions((config(),)).valid_for(100) == []
     assert layer_module._BACKEND_RUNNERS[config].backend_key == key
@@ -152,9 +150,7 @@ def test_default_frost_shape_policy(dtype, tokens):
         torch.empty(tokens, 6, dtype=torch.float32, device="meta"),
     )
     weights = MoEWeightPack({f"cutlass_{dtype}": {}})
-    assert runner.accepts(act, weights) == (
-        tokens <= (12288 if dtype == "bf16" else 16384)
-    )
+    assert runner.accepts(act, weights) == (tokens <= 16384)
     act.hidden_states_q = torch.empty(tokens, 129, dtype=tensor_dtype, device="meta")
     assert not runner.accepts(act, weights)
 
@@ -442,7 +438,9 @@ def test_bundled_assembler_is_independent_of_cuda_home(version, accepted, monkey
         ("mxfp8_mxfp4", "CudnnFrostMxfp8Mxfp4MoeRunner"),
     ],
 )
-def test_runner_refresh_rechecks_selected_assembler(dtype, name, monkeypatch):
+def test_runner_refresh_rechecks_selected_assembler(
+    dtype, name, monkeypatch, frost_metadata_only
+):
     from flashinfer.fused_moe.backends.cudnn_frost import engine
 
     module = importlib.import_module(
@@ -505,7 +503,7 @@ def frost_case(request):
 
 
 def _make_frost_case(dtype, geometry=(64, 2048, 1408, 6)):
-    supported = ((10, 7), (12, 0)) if dtype == "bf16" else ((10, 7),)
+    supported = ((10, 7), (12, 0))
     if (
         not torch.cuda.is_available()
         or torch.cuda.get_device_capability() not in supported
@@ -620,15 +618,17 @@ def test_public_config_graph_and_configured_admission(frost_case, monkeypatch):
 
 
 @pytest.mark.parametrize("dtype", ("mxfp8", "nvfp4", "mxfp8_mxfp4"))
-def test_quantized_selection_cache(dtype, monkeypatch):
+def test_quantized_selection_cache(dtype, monkeypatch, frost_metadata_only):
     moe = importlib.import_module(
         f"flashinfer.fused_moe.backends.cudnn_frost.{dtype}.moe"
     )
     props = SimpleNamespace(multi_processor_count=128)
     monkeypatch.setattr(moe.common, "_arch_for", lambda _: "sm_107a")
     monkeypatch.setattr(torch.cuda, "get_device_properties", lambda _: props)
-    selection = Mock(wraps=moe.select_stages)
-    monkeypatch.setattr(moe, "select_stages", selection)
+    from flashinfer.fused_moe.backends.cudnn_frost import heuristics
+
+    selection = Mock(wraps=heuristics.select_stages)
+    monkeypatch.setattr(heuristics, "select_stages", selection)
     args = dict(
         tokens=17,
         hidden=2048,

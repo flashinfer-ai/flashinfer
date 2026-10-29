@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Auto substitutes a provider without changing native prefill semantics.
+"""Auto preserves KDA math and native fallback behavior.
 
-The performance policy is forced on here; tests cover capabilities and mutation
-boundaries rather than freeze the thresholds that future tuning may change.
+Contract tests force the policy on; policy tests cover the measured regions.
 """
 
 import importlib
@@ -138,7 +137,6 @@ def test_auto_preserves_math_dtype_and_fresh_bindings(
 @pytest.mark.parametrize(
     "excluded",
     [
-        "prefill_workspace",
         "ssm_state_indices",
         "initial_state_source",
         "initial_state_indices",
@@ -158,11 +156,7 @@ def test_auto_preserves_unadmitted_native_contracts(monkeypatch, excluded):
     seen = []
     _force_native_route(monkeypatch, "cute-dsl", seen)
     values = _inputs()
-    if excluded == "prefill_workspace":
-        # Only the dispatch type check runs here; the real constructor allocates
-        # CUDA storage, whereas this host test substitutes the native launcher.
-        values[excluded] = object.__new__(RecurrentKDAPrefillWorkspace)
-    elif excluded == "checkpoint_every_n_tokens":
+    if excluded == "checkpoint_every_n_tokens":
         values[excluded] = 32
     elif excluded == "strided_qk":
         for name in ("q", "k"):
@@ -183,6 +177,28 @@ def test_auto_preserves_unadmitted_native_contracts(monkeypatch, excluded):
         values[excluded] = torch.tensor([0], dtype=torch.int32)
     kda.recurrent_kda(**values, backend="auto")
     assert [provider for provider, _ in seen] == ["native"]
+
+
+@pytest.mark.parametrize("native", ["small-bh", "cute-dsl"])
+@pytest.mark.parametrize("declines", [False, True])
+def test_workspace_is_unused_by_cudnn_and_retained_for_fallback(
+    monkeypatch, native, declines
+):
+    seen = []
+    _force_native_route(monkeypatch, native, seen)
+    values = _inputs()
+    # Native launch is mocked, so no CUDA workspace allocation is needed.
+    workspace = object.__new__(RecurrentKDAPrefillWorkspace)
+    values["prefill_workspace"] = workspace
+    if declines:
+        monkeypatch.setattr(kda, "_try_cudnn_kda_prefill", lambda **kwargs: None)
+    kda.recurrent_kda(**values, backend="auto")
+    provider, bound = seen[-1]
+    assert provider == ("native" if declines else "cudnn")
+    if declines:
+        assert bound["prefill_workspace"] is workspace
+    else:
+        assert "prefill_workspace" not in bound
 
 
 @pytest.mark.parametrize("order", ["valid", "dtype", "shape", "device"])
@@ -446,6 +462,218 @@ def test_performance_policy_excludes_state_copy_compatibility_path(
     monkeypatch.setattr(kda, "get_compute_capability", lambda device: (10, 0))
     monkeypatch.setattr(torch, "is_inference_mode_enabled", lambda: False)
     assert not kda._prefer_cudnn_kda_prefill(q, state, offsets)
+
+
+@pytest.mark.parametrize("cc", [(10, 0), (10, 3)])
+@pytest.mark.parametrize(
+    "heads,tokens,state_dtype,sm100,sm103",
+    [
+        (8, 1024, torch.bfloat16, "small-bh", "small-bh"),
+        (8, 4096, torch.bfloat16, "cudnn", "cudnn"),
+        (12, 4096, torch.bfloat16, "small-bh", "small-bh"),
+        (12, 8192, torch.bfloat16, "cudnn", "cudnn"),
+        (12, 65536, torch.bfloat16, "cudnn", "cudnn"),
+        (12, 1024, torch.float32, "cute-dsl", "cute-dsl"),
+        (12, 4096, torch.float32, "cudnn", "cudnn"),
+        (64, 65536, torch.bfloat16, "small-bh", "small-bh"),
+        (64, 1024, torch.float32, "cute-dsl-persistent", "cute-dsl-persistent"),
+        (64, 4096, torch.float32, "cudnn", "cudnn"),
+        (64, 8192, torch.float32, "cudnn", "cute-dsl-persistent"),
+        (64, 16384, torch.float32, "cudnn", "cudnn"),
+        (64, 65536, torch.float32, "cudnn", "cudnn"),
+        (65, 1024, torch.bfloat16, "cudnn", "cudnn"),
+        (96, 1024, torch.bfloat16, "cudnn", "cudnn"),
+        (96, 4096, torch.bfloat16, "cudnn", "cudnn"),
+        (96, 8192, torch.bfloat16, "cudnn", "cudnn"),
+        (96, 65536, torch.bfloat16, "cudnn", "cudnn"),
+        (96, 65536, torch.float32, "cute-dsl-persistent", "cute-dsl-persistent"),
+        (97, 8192, torch.bfloat16, None, None),
+        (65, 8192, torch.float32, None, None),
+        (64, 1023, torch.float32, None, None),
+        (64, 65537, torch.float32, None, None),
+    ],
+)
+def test_measured_prefill_policy(
+    monkeypatch, cc, heads, tokens, state_dtype, sm100, sm103
+):
+    q = SimpleNamespace(
+        is_cuda=True,
+        dtype=torch.bfloat16,
+        shape=(1, tokens, heads, 128),
+        device="cuda:0",
+    )
+    state = SimpleNamespace(
+        dtype=state_dtype, requires_grad=False, is_inference=lambda: False
+    )
+    offsets = SimpleNamespace(numel=lambda: 2)
+    monkeypatch.setattr(kda, "get_compute_capability", lambda device: cc)
+    assert kda._select_kda_prefill_backend(q, state, offsets) == (
+        sm100 if cc == (10, 0) else sm103
+    )
+    assert (
+        kda._select_kda_prefill_backend(q, state, offsets, allow_cudnn=False) != "cudnn"
+    )
+
+
+@pytest.mark.parametrize("option", ["ragged", "unpacked", "sm90", "fp16", "no_state"])
+def test_policy_keeps_unmeasured_contracts(monkeypatch, option):
+    q = SimpleNamespace(
+        is_cuda=True, dtype=torch.bfloat16, shape=(1, 8192, 64, 128), device="cuda:0"
+    )
+    state = SimpleNamespace(
+        dtype=torch.float32, requires_grad=False, is_inference=lambda: False
+    )
+    offsets = SimpleNamespace(numel=lambda: 3 if option == "ragged" else 2)
+    if option == "unpacked":
+        offsets = None
+    if option == "no_state":
+        state = None
+    if option == "fp16":
+        q.dtype = torch.float16
+    monkeypatch.setattr(
+        kda,
+        "get_compute_capability",
+        lambda device: (9, 0) if option == "sm90" else (10, 0),
+    )
+    assert kda._select_kda_prefill_backend(q, state, offsets) is None
+
+
+@pytest.mark.parametrize("backend", ["auto", "cute-dsl"])
+@pytest.mark.parametrize(
+    "excluded", [None, "seq_order", "alignment", "sm_count", "gate"]
+)
+def test_persistent_auto_preserves_native_eligibility(monkeypatch, backend, excluded):
+    seen = []
+    _force_native_route(monkeypatch, "cute-dsl", seen)
+    monkeypatch.setattr(kda, "_prefer_cudnn_kda_prefill", lambda *args: False)
+    monkeypatch.setattr(
+        kda,
+        "_select_kda_prefill_backend",
+        lambda *args, **kwargs: "cute-dsl-persistent",
+    )
+    persistent = importlib.import_module("flashinfer.kda_prefill_persistent")
+    monkeypatch.setattr(
+        persistent, "_run_persistent_kda", lambda **kw: seen.append(("persistent", kw))
+    )
+    values = _inputs(state_dtype=torch.float32)
+    if excluded == "seq_order":
+        values["seq_order"] = torch.zeros(1, dtype=torch.int32)
+    elif excluded == "alignment":
+        values["initial_state"] = torch.zeros(values["initial_state"].numel() + 4)[
+            4:
+        ].view_as(values["initial_state"])
+    elif excluded == "sm_count":
+        monkeypatch.setattr(
+            torch.cuda,
+            "get_device_properties",
+            lambda device: SimpleNamespace(multi_processor_count=1),
+        )
+    elif excluded == "gate":
+        values["lower_bound"] = -6.0
+    kda.recurrent_kda(**values, backend=backend)
+    assert seen[-1][0] == (
+        "persistent" if backend == "auto" and excluded is None else "native"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "with_workspace,decline_cudnn", [(False, False), (True, False), (True, True)]
+)
+@pytest.mark.parametrize(
+    "heads,tokens,state_dtype",
+    [
+        (8, 4096, torch.bfloat16),
+        (12, 8192, torch.bfloat16),
+        (12, 4096, torch.float32),
+        (64, 4096, torch.float32),
+        (64, 8192, torch.float32),
+        (96, 1024, torch.bfloat16),
+        (96, 8192, torch.float32),
+        (8, 65536, torch.float32),
+    ],
+)
+def test_measured_routes_match_native_and_replay(
+    monkeypatch, heads, tokens, state_dtype, with_workspace, decline_cudnn
+):
+    device = torch.device("cuda")
+    if get_compute_capability(device) not in ((10, 0), (10, 3)):
+        pytest.skip("requires SM100/SM103")
+    if not kda._cudnn_kda_prefill_available():
+        pytest.skip("requires cuDNN frontend 1.31 and CuTe DSL 4.7")
+    if torch.cuda.get_device_properties(device).multi_processor_count < heads:
+        pytest.skip("requires at least one SM per head")
+    values = packed_prefill_inputs(device, seq_lens=[tokens], num_heads=heads, seed=73)
+    seed_state = torch.randn(1, heads, 128, 128, device=device, dtype=state_dtype) * 0.1
+    values.update(
+        initial_state=seed_state.clone(),
+        output=torch.empty_like(values["q"]),
+        output_final_state=True,
+    )
+    expected = kda.recurrent_kda(
+        **dict(
+            values,
+            initial_state=seed_state.clone(),
+            output=torch.empty_like(values["q"]),
+        ),
+        backend="cute-dsl",
+    )
+    if with_workspace:
+        values["prefill_workspace"] = RecurrentKDAPrefillWorkspace(device=device)
+    if decline_cudnn:
+        monkeypatch.setattr(kda, "_try_cudnn_kda_prefill", lambda **kwargs: None)
+    selected = kda._select_kda_prefill_backend(
+        values["q"],
+        values["initial_state"],
+        values["cu_seqlens"],
+        allow_cudnn=not decline_cudnn,
+    )
+    persistent = importlib.import_module("flashinfer.kda_prefill_persistent")
+    module, name = {
+        "cudnn": (cudnn_adapter, "cudnn_recurrent_kda"),
+        "cute-dsl-persistent": (persistent, "_run_persistent_kda"),
+        "cake": (kda._kda_prefill, "_run_flash_kda_prefill"),
+        "cute-dsl": (kda._kda_prefill_cute, "_run_cute_dsl_kda_prefill"),
+        "small-bh": (kda._kda_prefill_cute_small_bh, "_run_kda_prefill_cute_small_bh"),
+    }[selected]
+    run = getattr(module, name)
+    calls = []
+
+    def observe(*args, **kwargs):
+        calls.append(selected)
+        return run(*args, **kwargs)
+
+    monkeypatch.setattr(module, name, observe)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        actual = kda.recurrent_kda(**values, backend="auto")
+        if selected == "cute-dsl-persistent":
+            from flashinfer.kda_prefill import _get_stream_workspace
+
+            workspace = values.get("prefill_workspace") or _get_stream_workspace(device)
+            assert not workspace._persistent_kda["plan"][10], (
+                "auto must not use split schedules"
+            )
+    stream.synchronize()
+    assert calls == [selected]
+    assert actual[0].data_ptr() == values["output"].data_ptr()
+    assert actual[1].data_ptr() == values["initial_state"].data_ptr()
+    for name, result, target in zip(("output", "state"), actual, expected, strict=True):
+        assert_rel_close(name, result, target, 0.03)
+    if with_workspace or selected == "cudnn":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream):
+            with torch.cuda.graph(graph, stream=stream):
+                values["initial_state"].copy_(seed_state)
+                actual = kda.recurrent_kda(**values, backend="auto")
+            values["output"].fill_(float("nan"))
+            graph.replay()
+        stream.synchronize()
+        for name, result, target in zip(
+            ("output", "state"), actual, expected, strict=True
+        ):
+            assert_rel_close(name, result, target, 0.03)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

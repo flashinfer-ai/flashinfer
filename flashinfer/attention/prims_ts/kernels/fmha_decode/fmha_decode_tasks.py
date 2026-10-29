@@ -51,9 +51,11 @@ from cutlass.experimental.task_scheduling.schedule_builder import (
 )
 from cutlass.experimental.task_scheduling.task import Task
 
+from ...sage.modes import SageScoreScaling
 from ..stage import FmhaStage
 from ..task_compat import task_context_kwargs
 from .direct_sparse_metadata import DirectSparseMetadataView
+from .direct_sparse_metadata import HeadIndexedMetadataView
 from .fmha_decode_config import FmhaDecodeConfig
 from .fmha_decode_constants import (
     KV_INST0,
@@ -169,26 +171,44 @@ class ScheduleTokenThrottleResource(MemoryResource):
 
 @dataclass(kw_only=True)
 class PackedDecodeWorkQueue(WorkQueue):
-    """CLC work queue that drops packed-Q tiles beyond a batch's Q length."""
+    """CLC work queue that drops Q padding and inactive KV requests."""
 
     cfg: cutlass.Constexpr[FmhaDecodeConfig] = field(init=False, default=None)
     cu_seqlens_q: Any = field(init=False, default=None)
+    seqlens_kv: Any = field(init=False, default=None)
+    num_heads_kv: Any = field(init=False, default=None)
 
     def __init__(
         self,
         cfg: FmhaDecodeConfig,
         cu_seqlens_q: cute.Pointer,
+        seqlens_kv: cute.Pointer | None = None,
+        num_heads_kv: cutlass.Int32 | None = None,
         **kwargs: Any,
     ) -> None:
-        """Attach packed-Q metadata to the shared persistent work queue."""
+        """Attach request metadata to the shared persistent work queue."""
         super().__init__(**kwargs)
         self.cfg = cfg
         self.cu_seqlens_q = cu_seqlens_q
+        self.seqlens_kv = seqlens_kv
+        self.num_heads_kv = num_heads_kv
 
     @cute.jit
     def skip_work_tile_if(self, work_tile: Any) -> cutlass.Boolean:
-        """Skip a fetched Q group when its first token is outside this batch."""
-        q_group_cta_idx, _, b_idx = work_tile.tile_idx
+        """Skip empty KV requests and Q groups outside their live sequence."""
+        q_group_cta_idx, h_idx, b_idx = work_tile.tile_idx
+        empty_kv = cutlass.Boolean(False)
+        if cutlass.const_expr(self.seqlens_kv is not None):
+            lengths = self.seqlens_kv
+            if cutlass.const_expr(
+                self.cfg.use_q_token_kv_block_sparse_route
+                and not self.cfg.shares_sparse_pattern
+            ):
+                if cutlass.const_expr(isinstance(lengths, DirectSparseMetadataView)):
+                    lengths = lengths.with_head(h_idx)
+                else:
+                    lengths = HeadIndexedMetadataView(lengths, self.num_heads_kv, h_idx)
+            empty_kv = cutlass.Int32(lengths[b_idx]) <= cutlass.Int32(0)
         q_group_idx = cutlass.Int32(q_group_cta_idx)
         if cutlass.const_expr(self.cfg.use_split_kv):
             q_group_idx = q_group_idx // cutlass.Int32(self.cfg.splits_kv)
@@ -197,7 +217,7 @@ class PackedDecodeWorkQueue(WorkQueue):
             self.cu_seqlens_q,
             cutlass.Int32(b_idx),
         )
-        return _q_group_token_base(self.cfg, q_group_idx) >= seq_len_q
+        return empty_kv or _q_group_token_base(self.cfg, q_group_idx) >= seq_len_q
 
 
 def _page_offsets_consume(
@@ -514,16 +534,10 @@ def _decode_work_tile_schedule(
     body: Callable[[], None],
     non_skippable_head: Callable[[], None] | None = None,
 ) -> None:
-    """Trace one worker schedule, making only packed persistent data skippable."""
+    """Trace data work separately from persistent queue bookkeeping."""
     if cfg.use_persistent_scheduler:
         assert work_queue is not None
-        if not cfg.use_variable_seqlens_q:
-            with work_tile_loop(work_queue):
-                if non_skippable_head is not None:
-                    non_skippable_head()
-                body()
-                _work_queue_tail(work_queue)
-            return
+        # Schedule tracing passes resource proxies, so use the static config.
         with work_tile_loop(
             work_queue,
             skip_if=PackedDecodeWorkQueue.skip_work_tile_if,
@@ -562,13 +576,6 @@ def _decode_work_tile_schedule_with_invariant_bridge(
         # Descriptor backing storage depends only on the task's SMEM
         # allocation, so initialize it once before the persistent loop.
         invariant_setup()
-        if not cfg.use_variable_seqlens_q:
-            with work_tile_loop(work_queue):
-                active_prelude()
-                invariant = bridge()
-                body(invariant)
-                _work_queue_tail(work_queue)
-            return
         with work_tile_loop(
             work_queue,
             skip_if=PackedDecodeWorkQueue.skip_work_tile_if,
@@ -577,7 +584,11 @@ def _decode_work_tile_schedule_with_invariant_bridge(
                 active_prelude()
                 # Packed persistent QK reads Q's consumer-work stage directly,
                 # so it needs no descriptor task local crossing this guard.
-                body(None)
+                if cfg.use_variable_seqlens_q:
+                    body(None)
+                else:
+                    invariant = bridge()
+                    body(invariant)
             _work_queue_tail(work_queue)
         return
 
@@ -832,10 +843,9 @@ class DecodeGenTask(Task):
         self,
         context: ResourceContext | None = None,
     ) -> None:
-        """Drain inactive packed tiles before each unconditional active body."""
+        """Drain inactive tiles before each unconditional active body."""
         use_packed_early_stop = (
             self.cfg is not None
-            and self.cfg.use_variable_seqlens_q
             and self.cfg.use_persistent_scheduler
             and self._has_skip_if
         )
@@ -866,7 +876,8 @@ class DecodeGenTask(Task):
             self.dummy = cutlass.Boolean(True)
 
         while work_tile.is_valid_tile:
-            self._refresh_packed_q_bounds(work_tile)
+            if cutlass.const_expr(self.cfg.use_variable_seqlens_q):
+                self._refresh_packed_q_bounds(work_tile)
             # The tile is known active here. Running the complete schedule
             # without a dynamic skip guard keeps HEAD-produced pipeline state
             # in scope for LOOP and TAIL.
@@ -2370,25 +2381,28 @@ def create_mma_task_split_kv(
             FmhaStage.Head,
         )
 
+        # TMEM P aliases S, so an instance's next QK must follow the PV that
+        # reads P. A Q128 tile with SMEM P leaves S once Softmax has the scores
+        # in registers: the next QK goes first and overlaps the exponentials
+        # of this tile (``stages_q128_p_in_smem``).
+        qk_before_pv = cfg.stages_q128_p_in_smem
         with domain_loop(0, domain, 1, unroll=1):
-            pv_mma(smem_v0, smem_p0, "vp_mma_loop", KV_INST0, FmhaStage.Loop)
-            qk_mma(
-                smem_k0,
-                tmem_s0,
-                tmem_stats_done0,
-                q_desc,
-                "qk_mma_loop",
-                FmhaStage.Loop,
-            )
-            pv_mma(smem_v1, smem_p1, "vp_mma_loop", KV_INST1, FmhaStage.Loop)
-            qk_mma(
-                smem_k1,
-                tmem_s1,
-                tmem_stats_done1,
-                q_desc,
-                "qk_mma_loop",
-                FmhaStage.Loop,
-            )
+            for inst_idx, smem_k, smem_v, tmem_s, tmem_stats_done, smem_p in (
+                (KV_INST0, smem_k0, smem_v0, tmem_s0, tmem_stats_done0, smem_p0),
+                (KV_INST1, smem_k1, smem_v1, tmem_s1, tmem_stats_done1, smem_p1),
+            ):
+                if not qk_before_pv:
+                    pv_mma(smem_v, smem_p, "vp_mma_loop", inst_idx, FmhaStage.Loop)
+                qk_mma(
+                    smem_k,
+                    tmem_s,
+                    tmem_stats_done,
+                    q_desc,
+                    "qk_mma_loop",
+                    FmhaStage.Loop,
+                )
+                if qk_before_pv:
+                    pv_mma(smem_v, smem_p, "vp_mma_loop", inst_idx, FmhaStage.Loop)
 
         # The last BMM1 has been issued once the loop ends, and BMM2 never reads
         # Q. Releasing it here lets a persistent CTA load the next work tile's
@@ -2620,7 +2634,7 @@ def create_mma_task_one_inst_qkv(
     work_queue: WorkQueue | None,
     cfg: FmhaDecodeConfig,
     *,
-    tmem_stats_done: MemoryResource,
+    tmem_stats_done: MemoryResource | None,
     domain: int | cutlass.Int32,
     warp_idx: int | None = None,
     num_warps: int | None = None,
@@ -2636,14 +2650,15 @@ def create_mma_task_one_inst_qkv(
         tmem_s: MemoryResource,
         smem_p: MemoryResource,
         tmem_o: MemoryResource,
-        tmem_stats_done: MemoryResource,
+        tmem_stats_done: MemoryResource | None,
         q_desc: Any,
     ) -> None:
         """Schedule single-instance QK and PV waves across HEAD/LOOP/TAIL."""
 
         def qk_mma(q_desc, qk_mma_label: str, section: FmhaStage) -> None:
             """Issue one scheduled single-instance QK wave."""
-            tmem_stats_done.acquire()
+            if tmem_stats_done is not None:
+                tmem_stats_done.acquire()
             tmem_s.acquire()
             _issue_score_seed(tmem_s, section, cfg)
             for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
@@ -2662,7 +2677,8 @@ def create_mma_task_one_inst_qkv(
                     )
                 smem_k.release()
             tmem_s.commit()
-            tmem_stats_done.commit()
+            if tmem_stats_done is not None:
+                tmem_stats_done.commit()
 
         def pv_mma(vp_mma_label: str, section: FmhaStage) -> None:
             """Issue one scheduled single-instance PV wave."""
@@ -2710,7 +2726,7 @@ def create_mma_task_one_inst_qkv(
         smem_v.init_descriptor_state()
         smem_p.init_descriptor_state()
 
-    @schedule
+    @_schedule_with_optional_resources
     def mma_schedule(
         smem_q: MemoryResource,
         smem_k: MemoryResource,
@@ -2718,8 +2734,8 @@ def create_mma_task_one_inst_qkv(
         tmem_s: MemoryResource,
         smem_p: MemoryResource,
         tmem_o: MemoryResource,
-        tmem_stats_done: MemoryResource,
-        work_queue: WorkQueue | None = None,
+        tmem_stats_done: MemoryResource | None,
+        work_queue: WorkQueue | None,
     ) -> None:
         """Wrap one-inst MMA work in packed persistent skip handling."""
         _decode_work_tile_schedule_with_invariant_bridge(
@@ -2740,34 +2756,16 @@ def create_mma_task_one_inst_qkv(
             ),
         )
 
-    schedule_result = (
-        mma_schedule(
-            smem_q,
-            smem_k,
-            smem_v,
-            tmem_s,
-            smem_p,
-            tmem_o,
-            tmem_stats_done,
-        )
-        if work_queue is None
-        else mma_schedule(
-            smem_q,
-            smem_k,
-            smem_v,
-            tmem_s,
-            smem_p,
-            tmem_o,
-            tmem_stats_done,
-            work_queue,
-        )
+    schedule_result = mma_schedule(
+        smem_q, smem_k, smem_v, tmem_s, smem_p, tmem_o, tmem_stats_done, work_queue
     )
     src = [smem_q, smem_k, smem_v, smem_p]
     if work_queue is not None:
         src.append(work_queue)
     return task_class(
         src_resources=src,
-        dst_resources=[tmem_s, tmem_o, tmem_stats_done],
+        dst_resources=[tmem_s, tmem_o]
+        + ([tmem_stats_done] if tmem_stats_done is not None else []),
         cfg=cfg,
         warp_idx=cfg.mma_warp_idx if warp_idx is None else warp_idx,
         num_warps=cfg.mma_num_warps if num_warps is None else num_warps,
@@ -3200,7 +3198,9 @@ def _softmax_schedule_body(
     # with each tile. They are read in place, so the ring stage stays held
     # through the last pass that reads them: the max pass for dequantized
     # scores, else the P pass.
-    releases_sage_stage_after_max = cfg.sage_scores_dequantized()
+    releases_sage_stage_after_max = (
+        cfg.sage_score_scaling() is SageScoreScaling.DEQUANTIZED
+    )
     compute_softmax_loop = {
         (False, False): tmem_s.compute_softmax_loop,
         (False, True): tmem_s.compute_sage_softmax_loop,
@@ -3261,7 +3261,7 @@ def _softmax_schedule_body(
             **softmax_loop_kwargs
         )
         if cutlass.const_expr(releases_sage_stage_after_max):
-            # Dequantized scores went back to TMEM; the P pass reads no words.
+            # The scores came back dequantized; the P pass reads no words.
             sage_k_scales.release()
         if cutlass.const_expr(not cfg.use_keeps_mma_ab or not cfg.uses_tmem_p):
             # ConsRelease: free S once the scores are in registers unless
@@ -3306,6 +3306,12 @@ def _softmax_schedule_body(
                     s_arr=s_arr,
                     keeps_route_flags=sparse_route_flags,
                     swaps_route_flags=sparse_token_word2,
+                )
+            elif cutlass.const_expr(use_sage):
+                smem_p.compute_sage_p(
+                    new_max_arr=new_max_arr,
+                    s_arr=s_arr,
+                    sage_q_scale=sage_q_scale,
                 )
             else:
                 smem_p.compute_p(
@@ -4149,7 +4155,7 @@ def create_padding_task(
         warp_idx=warp_idx,
         num_warps=num_warps,
         schedule=captured_schedule,
-        num_registers=cfg.mma_load_task_num_registers,
+        num_registers=cfg.padding_task_num_registers(warp_idx, num_warps),
         name="PaddingTask",
         **kw,
     )

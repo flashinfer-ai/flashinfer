@@ -23,6 +23,7 @@ from types import SimpleNamespace
 from typing import Sequence
 
 import pytest
+from tests.test_helpers.parametrize import parametrize_product
 import torch
 
 pytest.importorskip(
@@ -43,6 +44,7 @@ from cutlass.experimental.task_scheduling.resources import (
 
 from flashinfer.attention.prims_ts import (
     BatchMLADecodePagedTSWrapper,
+    MLAAttentionTuning,
     batch_mla_decode_with_paged_kv_cache,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.config import (
@@ -362,8 +364,23 @@ def _fp8_request_reference(
     num_insts_kv: int,
     tile_size_kv: int,
     splits_kv: int,
+    softmax_rescale_threshold_log2: float = 0.0,
+    freeze: bool = True,
 ) -> torch.Tensor:
-    """Model P448 probabilities across split-local KV instruction streams."""
+    """Model E4M3 P across split-local KV instruction streams.
+
+    A positive ``softmax_rescale_threshold_log2`` T uses the P scale
+    ``448 * 2**-T`` and freezes each stream's running max while a tile raises
+    it by at most T. ``freeze=False`` keeps that scale but re-anchors on every
+    new maximum, which lets tests tell a working freeze from an ignored
+    threshold.
+    """
+    p_scale = _FP8_PROBABILITY_SCALE * 2.0**-softmax_rescale_threshold_log2
+    raw_freeze_threshold = (
+        softmax_rescale_threshold_log2 / (bmm1_scale * math.log2(math.e))
+        if softmax_rescale_threshold_log2 > 0.0
+        else 0.0
+    )
 
     if num_insts_kv <= 0 or tile_size_kv <= 0 or splits_kv <= 0:
         raise ValueError("KV instruction, tile, and split counts must be positive")
@@ -406,9 +423,15 @@ def _fp8_request_reference(
                 if stream_valid[stream_idx]
                 else local_max
             )
+            if (
+                stream_valid[stream_idx]
+                and softmax_rescale_threshold_log2 > 0.0
+                and freeze
+            ):
+                frozen = (new_max - stream_max[stream_idx]) <= raw_freeze_threshold
+                new_max = torch.where(frozen, stream_max[stream_idx], new_max)
             probabilities = (
-                torch.exp((tile_scores - new_max[:, None]) * bmm1_scale)
-                * _FP8_PROBABILITY_SCALE
+                torch.exp((tile_scores - new_max[:, None]) * bmm1_scale) * p_scale
             )
             quantized_probabilities = probabilities.to(_FP8).float()
             tile_sum = probabilities.sum(dim=-1)
@@ -457,6 +480,8 @@ def _mla_reference(
     splits_kv: int = 1,
     batch_indices: Sequence[int] | None = None,
     qo_indptr: torch.Tensor | None = None,
+    softmax_rescale_threshold_log2: float = 0.0,
+    fp8_freeze: bool = True,
 ) -> torch.Tensor:
     """Return the selected policy's independent FP32 MLA output oracle."""
 
@@ -490,6 +515,8 @@ def _mla_reference(
                     num_insts_kv=num_insts_kv,
                     tile_size_kv=tile_size_kv,
                     splits_kv=splits_kv,
+                    softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+                    freeze=fp8_freeze,
                 )
             else:
                 scores = (
@@ -587,6 +614,7 @@ _MLA_CASES = (
         },
         "mixed",
         True,
+        exercise_all_paths=True,
         id="fp8-1cta-parallel-reduction",
     ),
     _param(
@@ -594,6 +622,7 @@ _MLA_CASES = (
         {"kernel": "throughput_latency_1cta", "split_kv": 1},
         None,
         False,
+        exercise_all_paths=True,
         id="bf16-1cta-direct",
     ),
     _param(
@@ -601,6 +630,7 @@ _MLA_CASES = (
         {"kernel": "throughput_latency_1cta", "split_kv": 1},
         "identity",
         False,
+        exercise_all_paths=True,
         id="fp8-1cta-direct",
     ),
     _param(
@@ -679,6 +709,7 @@ _MLA_CASES = (
         },
         None,
         False,
+        exercise_all_paths=True,
         id="bf16-2cta-persistent-direct",
     ),
     _param(
@@ -718,6 +749,7 @@ def _plan_case(
     *,
     qo_indptr: torch.Tensor | None = None,
     max_seq_len_q: int | None = None,
+    softmax_rescale_threshold_log2: float = 0.0,
 ):
     wrapper = BatchMLADecodePagedTSWrapper()
     num_heads = int(
@@ -744,6 +776,9 @@ def _plan_case(
         kv_data_type=case.kv_cache.dtype,
         o_data_type=case.output_dtype,
         mask_type=case.mask_type,
+        tuning=MLAAttentionTuning(
+            softmax_rescale_threshold_log2=softmax_rescale_threshold_log2
+        ),
     )
     return wrapper
 
@@ -888,7 +923,9 @@ def _assert_auto_policy(
             assert policy[key] == expected, (key, policy, expected_b200)
 
 
-def _assert_case_correct(output, case, policy, *, qo_indptr=None):
+def _assert_case_correct(
+    output, case, policy, *, qo_indptr=None, softmax_rescale_threshold_log2=0.0
+):
     expected_shape = (
         (case.query.shape[0], case.query.shape[1], _LATENT_DIM)
         if qo_indptr is not None
@@ -915,6 +952,7 @@ def _assert_case_correct(output, case, policy, *, qo_indptr=None):
         splits_kv=int(policy["split_kv"]),
         batch_indices=batch_indices,
         qo_indptr=qo_indptr,
+        softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
     )
     actual = (
         output.float() if qo_indptr is not None else output[list(batch_indices)].float()
@@ -971,6 +1009,28 @@ def _exercise_public_paths(
     torch.cuda.synchronize()
     _assert_case_correct(graph_out, case, policy, qo_indptr=qo_indptr)
     torch.testing.assert_close(graph_out, eager, rtol=0, atol=0)
+    if qo_indptr is None:
+        saved_length = case.seq_lens[0].clone()
+        saved_pages = case.block_tables[0].clone()
+        case.seq_lens[0] = 0
+        case.block_tables[0].fill_(-1)
+        graph_out.fill_(8)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            graph_out[0].float(),
+            torch.full_like(graph_out[0].float(), 8),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            graph_out[1:].float(), eager[1:].float(), rtol=0, atol=0
+        )
+        case.seq_lens[0].copy_(saved_length)
+        case.block_tables[0].copy_(saved_pages)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(graph_out.float(), eager.float(), rtol=0, atol=0)
     _CUDA_GRAPH_ANCHOR_OWNERS.append((graph, graph_out, wrapper, case))
     return eager
 
@@ -1194,6 +1254,7 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         "mask_type",
         "workspace_buffer",
         "validate",
+        "tuning",
     )
     for name in (
         "device",
@@ -1354,6 +1415,42 @@ def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
     assert wrapper._plan_state is state
 
 
+def test_attention_ts_mla_decode_wrapper_trace_names_softmax_rescale_threshold_log2():
+    """A nonzero plan-time rescale threshold gets its own trace definition."""
+    from flashinfer.fi_trace import fi_trace
+
+    wrapper = BatchMLADecodePagedTSWrapper()
+    kwargs = {
+        "query": torch.empty((2, 1, 8, 576), dtype=torch.bfloat16),
+        "kv_cache": torch.empty((9, 32, 576), dtype=torch.bfloat16),
+        "block_tables": torch.empty((2, 1), dtype=torch.int32),
+        "seq_lens": torch.empty((2,), dtype=torch.int32),
+    }
+    state = dict(
+        packed_query=False,
+        mask_type="causal",
+        max_seq_len_q=1,
+        max_kv_len=64,
+        kv_lora_rank=_LATENT_DIM,
+        qk_rope_head_dim=_ROPE_DIM,
+    )
+    wrapper._plan_state = SimpleNamespace(**state, softmax_rescale_threshold_log2=0.0)
+    exact = fi_trace(wrapper.run, **kwargs)
+    wrapper._plan_state = SimpleNamespace(**state, softmax_rescale_threshold_log2=2.5)
+    skipped = fi_trace(wrapper.run, **kwargs)
+    assert "_rescale_thr" not in exact["name"]
+    assert "_rescale_thr2p5" in skipped["name"]
+    assert "softmax_rescale_threshold_log2:2.5" in skipped["tags"]
+    wrapper._plan_state = SimpleNamespace(
+        **state, softmax_rescale_threshold_log2=2.5001
+    )
+    nearby = fi_trace(wrapper.run, **kwargs)
+    assert nearby["name"] != skipped["name"]
+    assert not any(
+        tag.startswith("softmax_rescale_threshold_log2") for tag in exact["tags"]
+    )
+
+
 def test_attention_ts_mla_decode_bound_wrapper_trace_uses_plan_state():
     """Trace packed-Q shapes from the immutable MLA wrapper plan state."""
     from flashinfer.fi_trace import fi_trace
@@ -1414,6 +1511,29 @@ def test_attention_ts_mla_decode_bound_wrapper_trace_uses_plan_state():
     assert defn["axes"]["max_seq_len_q"]["value"] == 3
     assert defn["axes"]["max_kv_len"]["value"] == 64
     assert "mask:causal" in defn["tags"]
+
+
+@pytest.mark.parametrize(
+    "qk_tile,pv_tile",
+    [
+        ((128, 256), (128, 256)),
+        ((128, 64), (128, 256)),
+        ((128, 128), (128, 128)),
+        ((64, 128), (64, 256)),
+    ],
+)
+def test_attention_ts_mla_nvfp4_rejects_unsupported_tiles(qk_tile, pv_tile):
+    """Reject tile overrides incompatible with the fixed NVFP4 DSMEM layout."""
+    with pytest.raises(ValueError, match="NVFP4 2CTA requires QK"):
+        make_mla_decode_config(
+            mma_qk_tiler_mn=qk_tile,
+            mma_pv_tiler_mn=pv_tile,
+            rope_dim=0,
+            page_size=1,
+            qkv_dtype="e4m3",
+            kv_cache_format="nvfp4",
+            extra_kv_cache_format="nvfp4",
+        )
 
 
 @pytest.mark.filterwarnings("ignore::UserWarning")
@@ -1551,6 +1671,51 @@ def test_attention_ts_mla_explicit_split_preserves_explicit_profile():
             **select_kwargs,
             throughput_latency_profile="h8_static",
         )
+
+
+def test_attention_ts_mla_build_advisories_are_opt_in(monkeypatch, capsys):
+    """Quiet default builds retain errors and expose advisories in debug mode."""
+    import warnings
+
+    from flashinfer.attention.prims_ts.kernels.mla_decode.helpers.diagnostics import (
+        mla_build_diagnostics,
+    )
+    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.config import (
+        make_mla_decode_config,
+    )
+    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.kernel import (
+        build_mla_decode_task_manager,
+    )
+
+    monkeypatch.setenv("FLASHINFER_PRIMS_TS_DEBUG_CHECKS", "0")
+    with warnings.catch_warnings(record=True) as emitted:
+        warnings.simplefilter("always")
+        with mla_build_diagnostics():
+            manager, _, _ = build_mla_decode_task_manager(
+                make_mla_decode_config(),
+                domain=2,
+                exhaustive_deadlock_race_check=False,
+            )
+            warnings.warn("unrelated build warning", UserWarning, stacklevel=2)
+    assert "[head-loop-overlap]" not in capsys.readouterr().out
+    assert [str(item.message) for item in emitted] == ["unrelated build warning"]
+
+    monkeypatch.setenv("FLASHINFER_PRIMS_TS_DEBUG_CHECKS", "1")
+    with warnings.catch_warnings(record=True) as emitted:
+        warnings.simplefilter("always")
+        with mla_build_diagnostics():
+            build_mla_decode_task_manager(
+                make_mla_decode_config(),
+                domain=2,
+                exhaustive_deadlock_race_check=False,
+            )
+    assert "[head-loop-overlap]" in capsys.readouterr().out
+    assert any("never routed" in str(item.message) for item in emitted)
+
+    monkeypatch.setenv("FLASHINFER_PRIMS_TS_DEBUG_CHECKS", "0")
+    manager.tasks[0].num_registers = 512
+    with pytest.raises(ValueError), mla_build_diagnostics():
+        manager.print_and_verify()
 
 
 def test_attention_ts_mla_partial_tail_rejects_cluster_reduction():
@@ -1736,25 +1901,25 @@ def test_attention_ts_mla_block_table_stride_contract():
 @pytest.mark.parametrize(
     ("seq_lens", "max_kv_len", "message"),
     (
-        ((0, 1), 64, "at least one KV token"),
-        ((-1, 1), 64, "at least one KV token"),
+        ((0, 1), 64, None),
+        ((-1, 1), 64, None),
         ((65, 32), 64, r"longer than max_kv_len \(64\): got 65"),
     ),
     ids=("zero-length", "negative-length", "exceeds-explicit-bound"),
 )
 @_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_run_rejects_invalid_kv_lengths(
+def test_attention_ts_mla_run_validates_kv_lengths(
     seq_lens,
     max_kv_len,
     message,
 ):
-    """Validate every runtime MLA K/V length against the static plan bound."""
+    """Inactive rows preserve output; active lengths must fit the plan bound."""
 
     device = torch.device("cuda")
     block_tables = torch.zeros((2, 3), dtype=torch.int32, device=device)
     runtime_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
-    query = torch.empty((2, 1, 8, _QK_DIM), dtype=torch.bfloat16, device=device)
-    kv_cache = torch.empty(
+    query = torch.zeros((2, 1, 8, _QK_DIM), dtype=torch.bfloat16, device=device)
+    kv_cache = torch.zeros(
         (1, _DEFAULT_PAGE_SIZE, _QK_DIM), dtype=torch.bfloat16, device=device
     )
     wrapper = BatchMLADecodePagedTSWrapper()
@@ -1772,13 +1937,17 @@ def test_attention_ts_mla_run_rejects_invalid_kv_lengths(
         kv_data_type=torch.bfloat16,
         o_data_type=torch.bfloat16,
     )
-    with pytest.raises(ValueError, match=message):
-        wrapper.run(
-            query,
-            kv_cache,
-            block_tables,
-            runtime_seq_lens,
+    if message is not None:
+        with pytest.raises(ValueError, match=message):
+            wrapper.run(query, kv_cache, block_tables, runtime_seq_lens)
+    else:
+        block_tables[0].fill_(-1)
+        output = torch.full(
+            (2, 1, 8, _LATENT_DIM), 8, dtype=torch.bfloat16, device=device
         )
+        wrapper.run(query, kv_cache, block_tables, runtime_seq_lens, out=output)
+        torch.testing.assert_close(output[0], torch.full_like(output[0], 8))
+        torch.testing.assert_close(output[1], torch.zeros_like(output[1]))
 
 
 @_REQUIRES_PRIMTS_GPU
@@ -2162,15 +2331,19 @@ def test_attention_ts_mla_row_strided_page_table_metadata_mutation(
         assert bool((trt_block_offsets[:, 1] == poison_page).all().item())
 
 
-@pytest.mark.parametrize(
-    (
-        "case_kwargs",
-        "expected_policy",
-        "correction_pattern",
-        "overprovision",
-        "exercise_all_paths",
+# Regular runs retain public eager/standalone/graph anchors and FP8 2CTA.
+# The broader policy/shape sweep remains available through --full.
+@parametrize_product(
+    {
+        "case_kwargs,expected_policy,correction_pattern,overprovision,exercise_all_paths": tuple(
+            case.values for case in _MLA_CASES
+        )
+    },
+    regular=tuple(
+        (case.values,)
+        for case in _MLA_CASES
+        if case.values[-1] or case.id == "fp8-2cta-reference-reduction"
     ),
-    _MLA_CASES,
 )
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_compact_variable_k_acceptance(
@@ -2351,13 +2524,11 @@ def test_attention_ts_mla_decode_graph_reloads_all_live_metadata():
     assert not torch.allclose(graph_out.float(), eager.float(), rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.parametrize(
-    "page_size", (16, 32, 64, 128), ids=lambda value: f"page{value}"
-)
-@pytest.mark.parametrize(
-    "qkv_dtype",
-    (torch.bfloat16, torch.float8_e4m3fn),
-    ids=("bf16", "fp8"),
+# Page endpoints exercise the distinct TMA boundaries; page 32/64 also
+# appear in the head, packed-query and live-metadata tests.
+@parametrize_product(
+    {"page_size": (16, 32, 64, 128), "qkv_dtype": (torch.bfloat16, _FP8)},
+    regular=((16, torch.bfloat16), (128, torch.bfloat16), (16, _FP8), (128, _FP8)),
 )
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_page_size_dtype_product(
@@ -2393,12 +2564,48 @@ def test_attention_ts_mla_decode_page_size_dtype_product(
 
 
 @pytest.mark.parametrize(
-    "page_size", (16, 32, 64, 128), ids=lambda value: f"page{value}"
+    ("batch_size", "page_size", "max_seq_len"),
+    (
+        (2, 16, 32769),
+        (128, 16, 2049),
+        (128, 128, 4225),
+    ),
+    ids=("split-page16", "page16", "page128"),
 )
-@pytest.mark.parametrize(
-    "qkv_dtype",
-    (torch.bfloat16, torch.float8_e4m3fn),
-    ids=("bf16", "fp8"),
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_fp8_2cta_page_window(
+    batch_size: int, page_size: int, max_seq_len: int
+):
+    """FP8 2CTA K/V loaders read page IDs through a prefetched 32-entry window.
+
+    One window covers ``32 / pages_per_tile`` K tiles. Every case gives the
+    longest request's work tiles more K tiles than one window, so the loaders
+    swap in the prefetched window. The two-request case is long enough to
+    split KV, so windows start at each split's first K tile. Page 128 covers
+    the two CTAs sharing one page.
+    """
+
+    case = _make_mla_case(
+        batch_size=batch_size,
+        num_qo_heads=128,
+        max_seq_len=max_seq_len,
+        qkv_dtype=_FP8,
+        page_size=page_size,
+        device="cuda",
+        seed=37000 + page_size + batch_size,
+    )
+    wrapper = _plan_case(case)
+    policy = _policy_dict(wrapper)
+    assert policy["kernel"] == "throughput_2cta"
+    k_tiles = -(-max_seq_len // 128)
+    tiles_per_work_tile = -(-k_tiles // int(policy["split_kv"]))
+    assert tiles_per_work_tile > 32 // (128 // page_size), policy
+    _assert_case_correct(_run_case(wrapper, case), case, policy)
+
+
+@parametrize_product(
+    {"page_size": (16, 32, 64, 128), "qkv_dtype": (torch.bfloat16, _FP8)},
+    regular=((16, torch.bfloat16), (128, torch.bfloat16), (16, _FP8), (128, _FP8)),
 )
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_2cta_page_size_dtype_product(
@@ -2460,8 +2667,10 @@ def test_attention_ts_mla_decode_head_dtype_product(
     _exercise_auto_mla_case(case)
 
 
-@pytest.mark.parametrize("num_qo_heads", (12, 96), ids=("h12", "h96"))
-@pytest.mark.parametrize("packed_query", (False, True), ids=("fixed", "packed"))
+@parametrize_product(
+    {"num_qo_heads": (12, 96), "packed_query": (False, True)},
+    regular=((12, False), (96, True)),
+)
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_reuses_compiled_topology_across_batch_sizes(
     num_qo_heads: int,
@@ -2499,19 +2708,14 @@ def test_attention_ts_mla_decode_reuses_compiled_topology_across_batch_sizes(
     assert first_state.compiled is second_state.compiled
 
 
-@pytest.mark.parametrize(
-    "num_qo_heads,seq_len_q",
-    (
-        pytest.param(6, 8, id="h6-sq8"),
-        pytest.param(12, 4, id="h12-sq4"),
-        pytest.param(24, 2, id="h24-sq2"),
-        pytest.param(48, 1, id="h48-sq1"),
-    ),
-)
-@pytest.mark.parametrize(
-    "qkv_dtype",
-    (torch.bfloat16, torch.float8_e4m3fn),
-    ids=("bf16", "fp8"),
+# Keep the multi-query and single-query endpoints; all four equivalent
+# flat-row factorizations with both dtypes are exercised under --full.
+@parametrize_product(
+    {
+        "num_qo_heads,seq_len_q": ((6, 8), (12, 4), (24, 2), (48, 1)),
+        "qkv_dtype": (torch.bfloat16, _FP8),
+    },
+    regular=(((6, 8), torch.bfloat16), ((48, 1), _FP8)),
 )
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_non_power_of_two_heads_1cta_auto(
@@ -2594,19 +2798,12 @@ def test_attention_ts_mla_decode_one_cta_multiwave_progress(
     )
 
 
-@pytest.mark.parametrize(
-    "num_qo_heads,seq_len_q",
-    (
-        pytest.param(96, 4, id="h96-sq4"),
-        pytest.param(48, 8, id="h48-sq8"),
-        pytest.param(24, 16, id="h24-sq16"),
-        pytest.param(12, 32, id="h12-sq32"),
-    ),
-)
-@pytest.mark.parametrize(
-    "qkv_dtype",
-    (torch.bfloat16, torch.float8_e4m3fn),
-    ids=("bf16", "fp8"),
+@parametrize_product(
+    {
+        "num_qo_heads,seq_len_q": ((96, 4), (48, 8), (24, 16), (12, 32)),
+        "qkv_dtype": (torch.bfloat16, _FP8),
+    },
+    regular=(((96, 4), torch.bfloat16), ((12, 32), _FP8)),
 )
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_non_power_of_two_heads_2cta_matched_rows(
@@ -2662,13 +2859,21 @@ def test_attention_ts_mla_decode_non_power_heads_2cta_split_reduction(
     assert int(policy["split_kv"]) > 1
 
 
-@pytest.mark.parametrize("num_qo_heads", (8, 16, 32, 64), ids=lambda value: f"h{value}")
-@pytest.mark.parametrize(
-    "qkv_dtype",
-    (torch.bfloat16, torch.float8_e4m3fn),
-    ids=("bf16", "fp8"),
+# Cover every head count and each dtype/mask pair without compiling the
+# full three-axis product. SQ1 dtype coverage is kept separately above.
+@parametrize_product(
+    {
+        "num_qo_heads": (8, 16, 32, 64),
+        "qkv_dtype": (torch.bfloat16, _FP8),
+        "mask_type": ("dense", "causal"),
+    },
+    regular=(
+        (8, torch.bfloat16, "dense"),
+        (16, _FP8, "causal"),
+        (32, torch.bfloat16, "causal"),
+        (64, _FP8, "dense"),
+    ),
 )
-@pytest.mark.parametrize("mask_type", ("dense", "causal"))
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_sq2_head_dtype_mask_product(
     num_qo_heads: int,
@@ -2691,13 +2896,19 @@ def test_attention_ts_mla_decode_sq2_head_dtype_mask_product(
     _exercise_auto_mla_case(case)
 
 
-@pytest.mark.parametrize("page_size", (16, 64), ids=lambda value: f"page{value}")
-@pytest.mark.parametrize(
-    "qkv_dtype",
-    (torch.bfloat16, torch.float8_e4m3fn),
-    ids=("bf16", "fp8"),
+@parametrize_product(
+    {
+        "page_size": (16, 64),
+        "qkv_dtype": (torch.bfloat16, _FP8),
+        "mask_type": ("dense", "causal"),
+    },
+    regular=(
+        (16, torch.bfloat16, "dense"),
+        (16, _FP8, "causal"),
+        (64, torch.bfloat16, "causal"),
+        (64, _FP8, "dense"),
+    ),
 )
-@pytest.mark.parametrize("mask_type", ("dense", "causal"))
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_packed_dtype_mask_page_product(
     page_size: int,
@@ -2731,17 +2942,18 @@ def test_attention_ts_mla_decode_packed_dtype_mask_page_product(
     assert policy["source"] == "auto"
 
 
-@pytest.mark.parametrize(
-    "num_qo_heads,expected_kernel",
-    (
-        pytest.param(6, "throughput_latency_1cta", id="h6-1cta"),
-        pytest.param(96, "throughput_2cta", id="h96-2cta"),
+@parametrize_product(
+    {
+        "num_qo_heads,expected_kernel": (
+            (6, "throughput_latency_1cta"),
+            (96, "throughput_2cta"),
+        ),
+        "qkv_dtype": (torch.bfloat16, _FP8),
+    },
+    regular=(
+        ((6, "throughput_latency_1cta"), torch.bfloat16),
+        ((96, "throughput_2cta"), _FP8),
     ),
-)
-@pytest.mark.parametrize(
-    "qkv_dtype",
-    (torch.bfloat16, torch.float8_e4m3fn),
-    ids=("bf16", "fp8"),
 )
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_packed_non_power_of_two_heads(
@@ -2803,12 +3015,16 @@ def test_attention_ts_mla_decode_packed_non_power_of_two_heads(
     torch.testing.assert_close(one_shot, eager, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize(
-    "num_qo_heads,expected_kernel",
-    (
-        pytest.param(6, "throughput_latency_1cta", id="h6-1cta"),
-        pytest.param(96, "throughput_2cta", id="h96-2cta"),
-    ),
+# Empty queries bypass kernel execution, so one family covers the no-op
+# contract in regular runs; retain both planned families under --full.
+@parametrize_product(
+    {
+        "num_qo_heads,expected_kernel": (
+            (6, "throughput_latency_1cta"),
+            (96, "throughput_2cta"),
+        )
+    },
+    regular=(((6, "throughput_latency_1cta"),),),
 )
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_all_empty_packed_query_noop(
@@ -2891,17 +3107,18 @@ def test_attention_ts_mla_decode_all_empty_packed_query_noop(
     _assert_case_correct(one_shot, case, policy, qo_indptr=qo_indptr)
 
 
-@pytest.mark.parametrize(
-    ("num_qo_heads", "expected_kernel"),
-    (
-        pytest.param(16, "throughput_latency_1cta", id="1cta"),
-        pytest.param(128, "throughput_2cta", id="2cta"),
+@parametrize_product(
+    {
+        "num_qo_heads,expected_kernel": (
+            (16, "throughput_latency_1cta"),
+            (128, "throughput_2cta"),
+        ),
+        "qkv_dtype": (torch.bfloat16, _FP8),
+    },
+    regular=(
+        ((16, "throughput_latency_1cta"), torch.bfloat16),
+        ((128, "throughput_2cta"), _FP8),
     ),
-)
-@pytest.mark.parametrize(
-    "qkv_dtype",
-    (torch.bfloat16, torch.float8_e4m3fn),
-    ids=("bf16", "fp8"),
 )
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_runtime_k_pruning_product(
@@ -2926,3 +3143,257 @@ def test_attention_ts_mla_decode_runtime_k_pruning_product(
         case,
         expected_b200={"kernel": expected_kernel},
     )
+
+
+@pytest.mark.parametrize(
+    ("shape", "qkv_dtype", "softmax_rescale_threshold_log2", "expected_kernel"),
+    (
+        ((8, 128, 2049), torch.bfloat16, 8.0, "throughput_2cta"),
+        ((8, 128, 2049), torch.float8_e4m3fn, 8.0, "throughput_2cta"),
+        ((2, 8, 2048), torch.bfloat16, 8.0, "throughput_latency_1cta"),
+        ((4, 16, 4097), torch.float8_e4m3fn, 8.0, "throughput_latency_1cta"),
+        ((128, 16, 4096), torch.float8_e4m3fn, 8.0, "throughput_latency_1cta"),
+    ),
+    ids=(
+        "2cta-bf16-t8",
+        "2cta-fp8-t8",
+        "1cta-bf16-t8",
+        "1cta-fp8-t8",
+        "1cta-fp8-t8-unsplit",
+    ),
+)
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_softmax_rescale_threshold(
+    shape: tuple[int, int, int],
+    qkv_dtype: torch.dtype,
+    softmax_rescale_threshold_log2: float,
+    expected_kernel: str,
+) -> None:
+    """A rescale threshold matches the protocol oracle on the 1CTA and 2CTA kernels.
+
+    BF16 P is unscaled, so the exact softmax oracle applies; E4M3 P uses the
+    scale ``448 * 2**-T``, which the FP8 oracle models per KV stream.
+    """
+
+    batch_size, num_qo_heads, max_seq_len = shape
+    case = _make_mla_case(
+        batch_size=batch_size,
+        num_qo_heads=num_qo_heads,
+        max_seq_len=max_seq_len,
+        qkv_dtype=qkv_dtype,
+        device="cuda",
+        seed=36000
+        + int(softmax_rescale_threshold_log2)
+        + (1 if qkv_dtype == _FP8 else 0)
+        + 7 * batch_size,
+    )
+    wrapper = _plan_case(
+        case, softmax_rescale_threshold_log2=softmax_rescale_threshold_log2
+    )
+    policy = _policy_dict(wrapper)
+    expected_policy: dict[str, object] = {"kernel": expected_kernel}
+    if shape == (128, 16, 4096):
+        # The unsplit case is what makes the freeze check mandatory on 1CTA.
+        expected_policy["split_kv"] = 1
+    _assert_auto_policy(policy, expected_policy, device=case.query.device)
+    assert wrapper._plan_state is not None
+    assert (
+        wrapper._plan_state.softmax_rescale_threshold_log2
+        == softmax_rescale_threshold_log2
+    )
+
+    output = _run_case(wrapper, case)
+    _assert_case_correct(
+        output,
+        case,
+        policy,
+        softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+    )
+
+    # The exact-rescale plan on identical inputs agrees to output rounding.
+    baseline = _run_case(_plan_case(case), case)
+    rtol, atol = _mla_tolerances(qkv_dtype)
+    torch.testing.assert_close(output.float(), baseline.float(), rtol=rtol, atol=atol)
+    if qkv_dtype == _FP8:
+        # Positive control: the threshold kernel quantizes P at 448 * 2**-T, so
+        # reusing the T = 0 kernel by mistake would match the baseline bitwise.
+        assert not torch.equal(output, baseline)
+        # The freeze itself: with P quantized against the held anchor, the
+        # output sits closer to the freezing oracle than to one that keeps the
+        # same scale but re-anchors on every new maximum.
+        checked = tuple(range(batch_size)) if batch_size <= 8 else (0, batch_size - 1)
+        oracle_args = dict(
+            num_insts_kv=int(policy["num_insts_kv"]),
+            tile_size_kv=int(policy["tile_size_kv"]),
+            splits_kv=int(policy["split_kv"]),
+            batch_indices=checked,
+            softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+        )
+        frozen = _mla_reference(case, **oracle_args)
+        reanchored = _mla_reference(case, fp8_freeze=False, **oracle_args)
+        # Heavy split-KV can leave one tile per KV stream, where nothing can
+        # freeze. The 2CTA case and unsplit plans keep multi-tile streams and
+        # must discriminate.
+        if expected_kernel == "throughput_2cta" or int(policy["split_kv"]) == 1:
+            assert not torch.equal(frozen, reanchored)
+        if not torch.equal(frozen, reanchored):
+            actual = output[list(checked)].float()
+            assert torch.linalg.vector_norm(
+                actual - frozen
+            ) < 0.5 * torch.linalg.vector_norm(actual - reanchored)
+
+    one_shot = batch_mla_decode_with_paged_kv_cache(
+        case.query,
+        case.kv_cache,
+        case.block_tables,
+        case.seq_lens,
+        bmm1_scale=case.bmm1_scale,
+        bmm2_scale=case.bmm2_scale,
+        mask_type=case.mask_type,
+        tuning=MLAAttentionTuning(
+            softmax_rescale_threshold_log2=softmax_rescale_threshold_log2
+        ),
+    )
+    torch.testing.assert_close(one_shot, output, rtol=0, atol=0)
+
+
+def _spike_late_keys(case: _MLACase, factor: float) -> _MLACase:
+    """Scale the RoPE part of one key in each of two consecutive late K tiles.
+
+    Only the RoPE channels change, so the logits jump while V (the latent
+    channels) and the output magnitude stay as generated.
+    """
+
+    kv_cache = case.kv_cache.clone()
+    pages = kv_cache.view(kv_cache.shape[0], case.page_size, kv_cache.shape[-1])
+    for batch_idx, seq_len in enumerate(case.seq_lens.tolist()):
+        for token in (seq_len - 2, seq_len - 2 - 128):
+            page = int(case.block_tables[batch_idx, token // case.page_size])
+            rope = pages[page, token % case.page_size, _LATENT_DIM:]
+            pages[page, token % case.page_size, _LATENT_DIM:] = (
+                rope.float() * factor
+            ).to(rope.dtype)
+    return replace(case, kv_cache=kv_cache)
+
+
+def _max_tile_increase_log2(case: _MLACase) -> float:
+    """Return the largest per-tile row-max increase (log2 units) in the case."""
+
+    pages = case.kv_cache.view(
+        case.kv_cache.shape[0], case.page_size, case.kv_cache.shape[-1]
+    )
+    largest = 0.0
+    for batch_idx, seq_len in enumerate(case.seq_lens.tolist()):
+        page_ids = case.block_tables[batch_idx, : -(-seq_len // case.page_size)]
+        keys = pages[page_ids.long()].reshape(-1, pages.shape[-1])[:seq_len].float()
+        logits = case.query[batch_idx, 0].float() @ keys.T * case.bmm1_scale
+        tile_max = torch.stack(
+            [tile.amax(dim=-1) for tile in logits.split(128, dim=-1)], dim=-1
+        )
+        running = torch.cummax(tile_max, dim=-1).values
+        increase = (tile_max[:, 1:] - running[:, :-1]) * math.log2(math.e)
+        largest = max(largest, float(increase.max()))
+    return largest
+
+
+@pytest.mark.parametrize(
+    ("shape", "qkv_dtype", "softmax_rescale_threshold_log2", "expected_policy"),
+    (
+        (
+            (64, 128, 1025),
+            torch.bfloat16,
+            0.5,
+            {"kernel": "throughput_2cta", "split_kv": 1},
+        ),
+        (
+            (64, 128, 1025),
+            torch.float8_e4m3fn,
+            1.0,
+            {"kernel": "throughput_2cta", "split_kv": 1},
+        ),
+        (
+            (128, 16, 1025),
+            torch.bfloat16,
+            0.5,
+            {"kernel": "throughput_latency_1cta", "split_kv": 1},
+        ),
+        (
+            (128, 16, 1025),
+            torch.float8_e4m3fn,
+            1.0,
+            {"kernel": "throughput_latency_1cta"},
+        ),
+        # A 64-row Q tile is only legal for keeps-MMA-AB 1CTA profiles, which
+        # keep the anchor and row sum in a separate scratch path.
+        (
+            (16, 64, 1025),
+            torch.bfloat16,
+            0.5,
+            {"kernel": "throughput_latency_1cta", "tile_size_q": 64},
+        ),
+        (
+            (16, 64, 1025),
+            torch.float8_e4m3fn,
+            1.0,
+            {"kernel": "throughput_latency_1cta", "tile_size_q": 64},
+        ),
+    ),
+    ids=(
+        "2cta-bf16-t0.5",
+        "2cta-fp8-t1",
+        "1cta-bf16-t0.5",
+        "1cta-fp8-t1",
+        "1cta-keeps-ab-bf16-t0.5",
+        "1cta-keeps-ab-fp8-t1",
+    ),
+)
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_softmax_rescale_threshold_reanchors_when_max_jumps(
+    shape: tuple[int, int, int],
+    qkv_dtype: torch.dtype,
+    softmax_rescale_threshold_log2: float,
+    expected_policy: dict[str, object],
+) -> None:
+    """A late tile raising the max by more than T re-anchors and rescales O.
+
+    Random inputs almost never raise a row max by more than T after the first
+    tiles, so the other threshold test only takes the frozen-anchor path. This
+    test forces the correction path (new anchor, O and the row sum rescaled)
+    after earlier tiles froze, and compares against the exact T=0 kernel.
+
+    Spiked RoPE keys in two consecutive late K tiles (so both FP8 2CTA softmax
+    groups) raise row maxima by more than the small threshold after earlier
+    tiles froze the anchor. The 2CTA and swap cases run unsplit, so every spike
+    lands behind frozen tiles.
+    """
+
+    batch_size, num_qo_heads, max_seq_len = shape
+    case = _spike_late_keys(
+        _make_mla_case(
+            batch_size=batch_size,
+            num_qo_heads=num_qo_heads,
+            max_seq_len=max_seq_len,
+            qkv_dtype=qkv_dtype,
+            device="cuda",
+            seed=36500 + num_qo_heads + (1 if qkv_dtype == _FP8 else 0),
+        ),
+        factor=40.0,
+    )
+    assert _max_tile_increase_log2(case) > softmax_rescale_threshold_log2
+
+    wrapper = _plan_case(
+        case, softmax_rescale_threshold_log2=softmax_rescale_threshold_log2
+    )
+    policy = _policy_dict(wrapper)
+    _assert_auto_policy(policy, expected_policy, device=case.query.device)
+
+    output = _run_case(wrapper, case)
+    _assert_case_correct(
+        output,
+        case,
+        policy,
+        softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+    )
+    baseline = _run_case(_plan_case(case), case)
+    rtol, atol = _mla_tolerances(qkv_dtype)
+    torch.testing.assert_close(output.float(), baseline.float(), rtol=rtol, atol=atol)

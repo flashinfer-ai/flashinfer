@@ -22,7 +22,7 @@ runs on the per-call path.
 
 The file is the moe_ep knob cache shared with the other mega backends
 (``FLASHINFER_MOE_EP_KNOB_CACHE``, default ``~/.cache/flashinfer/moe_ep_knob_cache.json``,
-format version 1).  Entries of this backend carry ``dtype="sm120_mxfp4_mxfp8_cake"``
+format version ``KNOB_CACHE_VERSION``).  Entries of this backend carry ``dtype="sm120_mxfp4_mxfp8_cake"``
 plus a ``topology`` digest of the gathered LSA-reachability matrix and GIN
 availability, so they never match another backend's key and never leak to a host
 whose peer topology differs.  ``max_tokens`` is the workspace row capacity; lookup
@@ -41,7 +41,6 @@ import tempfile
 import warnings
 from typing import Any, Optional
 
-_CACHE_VERSION = 1
 DTYPE = "sm120_mxfp4_mxfp8_cake"
 _KEY_FIELDS = (
     "device",
@@ -84,6 +83,8 @@ def current_device_name() -> str:
 
 
 def _load_entries(path: str) -> list[dict[str, Any]]:
+    from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
+
     try:
         with open(path) as f:
             data = json.load(f)
@@ -96,7 +97,7 @@ def _load_entries(path: str) -> list[dict[str, Any]]:
             stacklevel=3,
         )
         return []
-    if not isinstance(data, dict) or data.get("version") != _CACHE_VERSION:
+    if not isinstance(data, dict) or data.get("version") != KNOB_CACHE_VERSION:
         return []
     entries = data.get("entries", [])
     return (
@@ -177,9 +178,13 @@ def record_knobs(
         directory = os.path.dirname(path) or "."
         os.makedirs(directory, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=directory, prefix=".moe_ep_knob_cache.")
+        from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
+
         try:
             with os.fdopen(fd, "w") as f:
-                json.dump({"version": _CACHE_VERSION, "entries": entries}, f, indent=1)
+                json.dump(
+                    {"version": KNOB_CACHE_VERSION, "entries": entries}, f, indent=1
+                )
             os.replace(tmp, path)
         except BaseException:
             with contextlib.suppress(OSError):

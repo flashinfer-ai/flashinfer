@@ -115,10 +115,20 @@ def prepare_generated_flash_kda_cubin(
     kernel_name: str,
     module_ident: str,
     target: str,
+    defines: tuple[tuple[str, int], ...] = (),
 ) -> Mapping[str, Path]:
-    """Compile and return one content-addressed cubin for Ninja embedding."""
+    """Compile and return one content-addressed cubin for Ninja embedding.
 
-    for label, value in (("module identifier", module_ident), ("kernel", kernel_name)):
+    ``defines`` are the row's ``FLASHKDA_GENERATED_*`` knobs; a folded body
+    selects one row's code from them. They enter the NVRTC options and hence
+    the cubin cache identity.
+    """
+
+    for label, value in (
+        ("module identifier", module_ident),
+        ("kernel", kernel_name),
+        *(("knob", name) for name, _ in defines),
+    ):
         if _C_IDENTIFIER.fullmatch(value) is None:
             raise ValueError(f"invalid generated FlashKDA {label}: {value!r}")
     try:
@@ -136,6 +146,7 @@ def prepare_generated_flash_kda_cubin(
         "-default-device",
         *(f"-I{path}" for path in include_dirs),
         "--use_fast_math",
+        *(f"-D{name}={value}" for name, value in defines),
     )
     if any("o1" in option.lower() for option in options):
         raise RuntimeError(

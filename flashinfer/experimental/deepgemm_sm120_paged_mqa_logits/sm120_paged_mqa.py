@@ -17,8 +17,17 @@ submission with the per-stage programmatic-dependent-launch attributes intact.
 standalone program, so it returns a real schedule (unlike the SM100 dense
 family's placeholder).
 
-Routes are selected from host-known scalars only: head count, page size and
-``next_n``.  Output: FP32 ``[B * next_n, paged_logits_stride(max_context_len)]``
+Routes are selected from host-known scalars only: head count, page size,
+``next_n``, the batch (``context_lens.shape[0]``) and the optional
+``max_context_hint``.  The batch, the head count and the hint pick the Q-atom
+schedule of a ``(H, page_kv, next_n)`` geometry through
+the catalog's ``atom_rule`` (:func:`atom_variant`); the route name carries the
+realised atom (``...:n5:a5``).  On a device whose physical SM count keys a
+table of the catalog's ``policy.device_rule``, a call with the full-device CTA
+budget and a ``max_context_hint`` inside one of the rule's context windows may
+take a tuned device route instead (:func:`resolve_route`); every other call
+runs the default route.  Output: FP32
+``[B * next_n, paged_logits_stride(max_context_len)]``
 with DeepGEMM's ``clean_logits=False`` semantics -- positions at or past a
 token's own context length carry unspecified values and the consumer masks by
 length.  Consume ``plan.logical_output`` (``[:, :max_context_len]``).
@@ -30,11 +39,10 @@ import functools
 import json
 from pathlib import Path
 
-CATALOG_SCHEMA = "sm120_paged_mqa.v1"
+CATALOG_SCHEMA = "sm120_paged_mqa.v2"
 CATALOG_FILE = "sm120_paged_mqa_catalog.json"
 HEAD_DIM = 128
 FUSED_ROW_BYTES = HEAD_DIM + 4  # one FP8 row plus its FP32 scale
-LOGITS_DTYPES = ("float32",)
 
 # Exported compute capabilities.  sm_121a (GB10) has the same instruction
 # surface but a separate cubin; it joins when a device is measured.
@@ -47,14 +55,18 @@ SUPPORTED_CAPABILITIES = tuple(sorted(_ARCHES))
 _TARGET_SUFFIXES = {(12, 0): ("0a", "0f")}
 
 
-@functools.cache
-def _catalog():
-    catalog = json.loads(Path(__file__).with_name(CATALOG_FILE).read_text())
+def _parse_catalog(text):
+    catalog = json.loads(text)
     if catalog.get("schema") != CATALOG_SCHEMA:
         raise RuntimeError(
             f"SM120 paged MQA catalog schema {catalog.get('schema')!r} is not {CATALOG_SCHEMA!r}; regenerate the export"
         )
     return catalog
+
+
+@functools.cache
+def _catalog():
+    return _parse_catalog(Path(__file__).with_name(CATALOG_FILE).read_text())
 
 
 def policy():
@@ -84,26 +96,265 @@ def max_batch():
     return int(policy()["max_batch"])
 
 
-def next_n_atoms(next_n):
-    """``num_next_n_atoms`` of the Q-atom rule for ``next_n`` (catalog rule).
+def atom_rule():
+    """The catalog's Q-atom selection rule (data, evaluated here without the producer).
 
-    Independent of the head count and the page size, so the metadata entry keeps
-    DeepGEMM's ``(context_lens, block_kv, num_sms)`` signature.
+    ``batch_class_min[i]`` is the first batch of batch class ``i`` (the last
+    class is open up to ``max_batch()``); ``selection["h<H>:n<N>"][i]`` the
+    atom variant (``"a<tokens per Q atom>"``) that class selects for a head
+    count and ``next_n``; ``num_atoms["n<N>:a<A>"]`` the ``num_next_n_atoms``
+    of that variant's schedule.  ``long_context_min_kv`` and ``selection_long``
+    (R3): when the caller passes ``max_context_hint`` -- an upper bound of the
+    batch's context lengths in KV tokens -- of at least ``long_context_min_kv``,
+    ``selection_long`` replaces ``selection`` (it differs only for batches 2..8,
+    where the native-atom programs are selected).  The exporter derives every
+    value from the kernel's own rule, so this is the single source of truth on
+    the host.
     """
-    rule = policy()["next_n_atoms"]
-    key = str(int(next_n))
-    if key not in rule:
+    return policy()["atom_rule"]
+
+
+def _selection_table(max_context_hint):
+    """The variant table ``max_context_hint`` selects (``None`` = batch-only)."""
+    rule = atom_rule()
+    if max_context_hint is None:
+        return rule["selection"]
+    hint = int(max_context_hint)
+    if hint < 1:
         raise ValueError(
-            f"next_n = {next_n} has no exported program; exported: {sorted(rule)}"
+            f"max_context_hint must be a positive KV length, got {max_context_hint}"
         )
-    return int(rule[key])
+    if hint >= int(rule["long_context_min_kv"]):
+        return rule["selection_long"]
+    return rule["selection"]
 
 
-def route_name(num_heads, page_kv, next_n, logits_dtype="float32"):
-    """Logical route of a problem (host-known scalars only)."""
-    if logits_dtype not in LOGITS_DTYPES:
-        raise ValueError(f"logits_dtype must be one of {LOGITS_DTYPES}")
-    return f"sm120:fp8:h{int(num_heads)}:p{int(page_kv)}:n{int(next_n)}"
+def batch_class(batch):
+    """Index of the batch class ``batch`` requests fall into."""
+    batch = int(batch)
+    if batch < 1:
+        raise ValueError("batch must be at least one request")
+    starts = [int(v) for v in atom_rule()["batch_class_min"]]
+    return sum(1 for start in starts if batch >= start) - 1
+
+
+def atom_variant(num_heads, next_n, batch, max_context_hint=None):
+    """Q-atom variant (``"a<N>"``) the catalog selects for (heads, next_n, batch).
+
+    ``max_context_hint`` (R3): the caller's upper bound of the batch's context
+    lengths; at or above ``atom_rule()["long_context_min_kv"]`` the long-context
+    table applies (batches 2..8 take the native-atom programs).  ``None`` keeps
+    the batch-only selection.
+    """
+    selection = _selection_table(max_context_hint)
+    key = f"h{int(num_heads)}:n{int(next_n)}"
+    if key not in selection:
+        raise ValueError(
+            f"no exported program for {num_heads} heads and next_n = {next_n}; "
+            f"exported: {sorted(selection)}"
+        )
+    return str(selection[key][batch_class(batch)])
+
+
+def next_n_atoms(
+    next_n,
+    batch,
+    num_heads=None,
+    max_context_hint=None,
+    *,
+    page_kv=None,
+    cta_budget=None,
+    device_sms=None,
+):
+    """``num_next_n_atoms`` of the schedule for ``(next_n, batch[, num_heads, hint])``.
+
+    The head count is optional exactly where every exported head count selects
+    the same Q-atom schedule for this ``(next_n, batch class)`` -- ``next_n``
+    1-4 at every batch and every ``next_n`` at small batch -- which keeps
+    DeepGEMM's ``(context_lens, block_kv, num_sms)`` metadata signature there.
+    Where the head counts differ (``next_n`` 5 and 6 above the small-batch
+    bound, and at batches 2..8 once ``max_context_hint`` reaches the
+    long-context bound) ``num_heads`` is required and a ``ValueError`` says so.
+    ``max_context_hint`` must be the value the logits call of the same decode
+    step receives: the schedule carries no atom count, so the two calls agree
+    only by construction.
+
+    With ``page_kv``, ``cta_budget`` and ``device_sms`` the count is the one of
+    the route :func:`resolve_route` selects for each head count (a device route
+    may run another atom than the default rule), and ``num_heads`` is required
+    wherever those routes disagree.  Without them the default rule applies.
+    """
+    selection = _selection_table(max_context_hint)
+    heads = exported_heads() if num_heads is None else (int(num_heads),)
+    counts = {}
+    for candidate in heads:
+        key = f"h{candidate}:n{int(next_n)}"
+        if key not in selection:
+            if num_heads is not None:
+                raise ValueError(
+                    f"no exported program for {num_heads} heads and next_n = {next_n}; "
+                    f"exported: {sorted(selection)}"
+                )
+            continue
+        device = None
+        if page_kv is not None:
+            device = device_route(
+                candidate,
+                page_kv,
+                next_n,
+                batch,
+                max_context_hint,
+                cta_budget=cta_budget,
+                device_sms=device_sms,
+            )
+        if device is None:
+            variant = str(selection[key][batch_class(batch)])
+            counts[candidate] = int(
+                atom_rule()["num_atoms"][f"n{int(next_n)}:{variant}"]
+            )
+        else:
+            counts[candidate] = route_next_n_atoms(route_record(device))
+    if not counts:
+        raise ValueError(
+            f"next_n = {next_n} has no exported program; exported: {sorted(selection)}"
+        )
+    if len(set(counts.values())) != 1:
+        raise ValueError(
+            f"num_heads is required for next_n = {next_n} at batch {batch} "
+            f"(max_context_hint={max_context_hint}): the exported head counts "
+            f"select different Q-atom schedules (atoms per request: {counts})"
+        )
+    return next(iter(counts.values()))
+
+
+def route_name(num_heads, page_kv, next_n, batch, max_context_hint=None):
+    """Logical route of a problem (host-known scalars only, incl. the batch)."""
+    variant = atom_variant(num_heads, next_n, batch, max_context_hint)
+    return f"sm120:fp8:h{int(num_heads)}:p{int(page_kv)}:n{int(next_n)}:{variant}"
+
+
+# ---------------------------------------------------------------------------
+# Device routes (catalog ``policy.device_rule`` and ``device_routes``)
+# ---------------------------------------------------------------------------
+
+
+def device_rule():
+    """Per-device route tables and the context windows they are keyed by.
+
+    ``ctx_windows[name] = [low, high]``: the half-open ``max_context_hint``
+    range of a context class.  ``tables[str(sm_count)][key]``, ``key =
+    "h<H>:p<P>:n<N>:a<atom>:<class>"`` with the default rule's atom variant
+    (:func:`atom_variant`): a list of ``[batch, device route or None]`` sorted
+    by batch.  A listed batch takes its entry; a batch strictly between two
+    listed batches takes their entry only when both name the same device
+    route; every other batch, and a ``None`` entry, keeps the default route.
+    """
+    return policy()["device_rule"]
+
+
+def route_record(name):
+    """Catalog record of a default route or a device route."""
+    catalog = _catalog()
+    if name in catalog["routes"]:
+        return catalog["routes"][name]
+    return catalog["device_routes"][name]
+
+
+def route_next_n_atoms(record):
+    """``num_next_n_atoms`` of a route: ``ceil(next_n / next_n_atom)``."""
+    next_n, atom = int(record["next_n"]), int(record["next_n_atom"])
+    return (next_n + atom - 1) // atom
+
+
+def route_schedule(record):
+    """Schedule kind of a route: ``{"kind": "static"}`` or the ``dyn`` parameters."""
+    return record.get("schedule") or {"kind": "static"}
+
+
+def dyn_schedule_shape(num_sms, dyn_slots):
+    """Shape of a dyn route's private schedule: ``((1 + dyn_slots) * num_sms + 2, 2)``.
+
+    Rows ``0 .. num_sms - 1`` start the CTAs' static items, the next
+    ``dyn_slots * num_sms`` rows the pool items, then the end sentinel and the
+    counter words ``[0, pool size]``.  The dyn scheduler writes every row on
+    every launch, so the buffer needs no fill.
+    """
+    return ((1 + int(dyn_slots)) * int(num_sms) + 2, 2)
+
+
+def ctx_window(max_context_hint):
+    """Name of the context window holding ``max_context_hint`` (``None`` outside)."""
+    if max_context_hint is None:
+        return None
+    hint = int(max_context_hint)
+    if hint < 1:
+        raise ValueError(
+            f"max_context_hint must be a positive KV length, got {max_context_hint}"
+        )
+    for name, (low, high) in device_rule()["ctx_windows"].items():
+        if int(low) <= hint < int(high):
+            return str(name)
+    return None
+
+
+def device_route(
+    num_heads,
+    page_kv,
+    next_n,
+    batch,
+    max_context_hint=None,
+    *,
+    cta_budget=None,
+    device_sms=None,
+):
+    """The device route the tables select, or ``None`` (the default route runs).
+
+    ``device_sms`` is the physical SM count of the device and ``cta_budget``
+    the CTA budget of the call; the tables apply only when the two are equal
+    and a table is keyed by that SM count, and only with a
+    ``max_context_hint`` inside a context window.
+    """
+    if device_sms is None or cta_budget is None or int(cta_budget) != int(device_sms):
+        return None
+    window = ctx_window(max_context_hint)
+    table = device_rule()["tables"].get(str(int(device_sms)))
+    if window is None or not table:
+        return None
+    variant = atom_variant(num_heads, next_n, batch, max_context_hint)
+    key = f"h{int(num_heads)}:p{int(page_kv)}:n{int(next_n)}:{variant}:{window}"
+    batch = int(batch)
+    below = None
+    for listed, route in table.get(key, ()):
+        if batch == int(listed):
+            return route
+        if batch < int(listed):
+            return route if below is not None and below == route else None
+        below = route
+    return None
+
+
+def resolve_route(
+    num_heads,
+    page_kv,
+    next_n,
+    batch,
+    max_context_hint=None,
+    *,
+    cta_budget=None,
+    device_sms=None,
+):
+    """Route a prepared call runs: the device route if one applies, else :func:`route_name`."""
+    default = route_name(num_heads, page_kv, next_n, batch, max_context_hint)
+    device = device_route(
+        num_heads,
+        page_kv,
+        next_n,
+        batch,
+        max_context_hint,
+        cta_budget=cta_budget,
+        device_sms=device_sms,
+    )
+    return default if device is None else device
 
 
 def metadata_route_name():
@@ -111,16 +362,41 @@ def metadata_route_name():
     return str(policy()["metadata_route"])
 
 
-def route_available(num_heads, page_kv, next_n, logits_dtype="float32"):
-    """True when the shipped catalog carries this paged route (host-only)."""
+def route_available(
+    num_heads,
+    page_kv,
+    next_n,
+    batch=None,
+    max_context_hint=None,
+):
+    """True when the shipped catalog carries this paged route (host-only).
+
+    With ``batch`` the exact variant route (of ``batch`` and the optional
+    ``max_context_hint``) is checked; without it, whether any variant of the
+    ``(heads, page_kv, next_n)`` geometry is shipped.
+    """
     try:
         if num_heads not in exported_heads() or page_kv not in exported_page_sizes():
             return False
-        next_n_atoms(next_n)
-        route = route_name(num_heads, page_kv, next_n, logits_dtype)
+        selection = atom_rule()["selection"]
+        key = f"h{int(num_heads)}:n{int(next_n)}"
+        if key not in selection:
+            return False
+        if batch is None:
+            variants = list(
+                dict.fromkeys(
+                    str(v)
+                    for v in list(selection[key])
+                    + list(atom_rule()["selection_long"][key])
+                )
+            )
+        else:
+            variants = [atom_variant(num_heads, next_n, batch, max_context_hint)]
     except ValueError:
         return False
-    return route in _catalog()["routes"]
+    routes = _catalog()["routes"]
+    prefix = f"sm120:fp8:h{int(num_heads)}:p{int(page_kv)}:n{int(next_n)}"
+    return any(f"{prefix}:{variant}" in routes for variant in variants)
 
 
 def paged_logits_stride(max_context_len):
@@ -217,7 +493,7 @@ def program_names(route=None):
     catalog = _catalog()
     if route is None:
         return sorted(catalog["programs"])
-    record = catalog["routes"][route]
+    record = route_record(route)
     if record.get("sequence"):
         return [record["sequence"]]
     return [program for _stage, program in record["stages"]]
@@ -226,9 +502,13 @@ def program_names(route=None):
 def program_spec(arch, name):
     """FlashInfer JIT build specification of one generated program.
 
-    The programs take no compile-line definitions: the CTA budget is the launch
-    grid.  The architecture is part of the spec name so two architectures never
-    share one cached library.
+    The CTA budget is the launch grid, never a definition.  The compile-line
+    definitions in the record's ``compile_flags`` only select within a shared
+    text: a default route's page size and ``next_n`` (``-DPAGE_KV`` /
+    ``-DNEXT_N``) and a device route's logits kernel symbol and host-shim
+    namespace in a shared binding (``-DCAKE_LOGITS_KERNEL`` /
+    ``-DCAKE_LOGITS_SHIM``).  The architecture is part of the spec name so two
+    architectures never share one cached library.
     """
     from flashinfer.jit import env
     from flashinfer.jit.core import gen_jit_spec
@@ -282,6 +562,7 @@ def _submission(arch, program, bindings, *, stage=None):
 
 
 def _resolve_device(tensor, sm_count):
+    """``(arch, CTA budget, physical SM count)`` of the device holding ``tensor``."""
     if tensor.device.type != "cuda":
         raise RuntimeError("SM120 paged MQA logits requires CUDA tensors")
     import torch
@@ -291,7 +572,8 @@ def _resolve_device(tensor, sm_count):
         if tensor.device.index is not None
         else torch.cuda.current_device()
     )
-    arch, num_sms = device_facts(index)
+    arch, device_sms = device_facts(index)
+    num_sms = device_sms
     if sm_count is not None:
         # CTA budget override (tests, a restricted serving partition).  The
         # schedule is sized for this many CTAs and the logits grid launches
@@ -299,7 +581,7 @@ def _resolve_device(tensor, sm_count):
         if int(sm_count) < 1:
             raise ValueError("sm_count must be a positive CTA budget")
         num_sms = int(sm_count)
-    return arch, num_sms
+    return arch, num_sms, device_sms
 
 
 # ---------------------------------------------------------------------------
@@ -408,17 +690,42 @@ def fused_cache_rows(kv_cache, page_kv=None):
     return fused, pages, page_kv, block_stride_bytes
 
 
-def metadata_bindings(context_lens, schedule_meta, *, num_sms):
-    """Argument plan of the scheduler stage (one warp, grid (1, 1, 1))."""
+def metadata_bindings(
+    context_lens,
+    schedule_meta,
+    *,
+    num_sms,
+    num_heads=None,
+    max_context_hint=None,
+    num_next_n_atoms=None,
+    schedule=None,
+):
+    """Argument plan of the scheduler stage (grid (1, 1, 1)).
+
+    The schedule is sized for ``num_next_n_atoms`` Q atoms per request, by
+    default those of the Q-atom variant of ``(num_heads, next_n,
+    batch[, max_context_hint])`` (``num_heads`` may be omitted where
+    :func:`next_n_atoms` resolves without it).  ``schedule`` is the route's
+    :func:`route_schedule`; a ``dyn`` route binds its pool parameters
+    ``dyn_slots`` / ``dyn_pct`` / ``dyn_seg``, a static route binds an empty
+    pool, which the static scheduler does not take.
+    """
     batch, next_n = (int(v) for v in context_lens.shape)
+    if num_next_n_atoms is None:
+        num_next_n_atoms = next_n_atoms(next_n, batch, num_heads, max_context_hint)
+    schedule = schedule or {"kind": "static"}
+    dyn = schedule["kind"] == "dyn"
     return dict(
         context_lens=context_lens.reshape(-1),
         schedule_meta=schedule_meta.reshape(-1),
         batch_size=batch,
         next_n=next_n,
-        num_next_n_atoms=next_n_atoms(next_n),
+        num_next_n_atoms=int(num_next_n_atoms),
         split_kv=split_kv(),
         num_sms=int(num_sms),
+        dyn_slots=int(schedule["dyn_slots"]) if dyn else 0,
+        dyn_pct=int(schedule["dyn_pct"]) if dyn else 0,
+        dyn_seg=int(schedule["dyn_seg"]) if dyn else 1,
         grid_x=1,
         grid_y=1,
         grid_z=1,
@@ -458,6 +765,55 @@ def logits_bindings(
     )
 
 
+def check_schedule_bindings(bindings, *, num_sms, schedule=None):
+    """Check the schedule a submission's stages share before it is launched.
+
+    ``bindings`` holds the ``"metadata"`` stage and, for a prepared sequence,
+    the ``"logits"`` stage.  The scheduler runs as one CTA (grid ``(1, 1,
+    1)``) and lays out its walk for ``metadata.num_sms`` CTAs, which must be
+    the CTA budget ``num_sms`` and the logits grid ``(num_sms, 1, 1)``.  Both
+    stages bind one schedule buffer of exactly the rows the route's schedule
+    kind writes: :func:`metadata_shape` for a static route, or
+    :func:`dyn_schedule_shape` for a ``dyn`` route.  Raises ``ValueError``.
+    """
+    schedule = schedule or {"kind": "static"}
+    metadata = bindings["metadata"]
+    grid = tuple(int(metadata[key]) for key in ("grid_x", "grid_y", "grid_z"))
+    if grid != (1, 1, 1):
+        raise ValueError(f"the scheduler stage must launch grid (1, 1, 1), got {grid}")
+    if int(metadata["num_sms"]) != int(num_sms):
+        raise ValueError(
+            f"the scheduler walks {metadata['num_sms']} CTAs, the CTA budget is {num_sms}"
+        )
+    if schedule["kind"] == "dyn":
+        rows = dyn_schedule_shape(num_sms, schedule["dyn_slots"])
+        if int(metadata["dyn_slots"]) != int(schedule["dyn_slots"]):
+            raise ValueError(
+                f"the scheduler binds dyn_slots = {metadata['dyn_slots']}, "
+                f"the route schedules {schedule['dyn_slots']}"
+            )
+    else:
+        rows = metadata_shape(num_sms)
+    walk = metadata["schedule_meta"]
+    if int(walk.numel()) != rows[0] * rows[1]:
+        raise ValueError(
+            f"the {schedule['kind']} schedule needs {rows[0] * rows[1]} int32 words "
+            f"({rows}), the bound buffer has {walk.numel()}"
+        )
+    logits = bindings.get("logits")
+    if logits is None:
+        return
+    grid = tuple(int(logits[key]) for key in ("grid_x", "grid_y", "grid_z"))
+    if grid != (int(num_sms), 1, 1):
+        raise ValueError(
+            f"the logits stage must launch grid ({num_sms}, 1, 1) for the "
+            f"scheduler's {num_sms} CTAs, got {grid}"
+        )
+    read = logits["schedule_meta"]
+    if read.data_ptr() != walk.data_ptr() or read.numel() != walk.numel():
+        raise ValueError("the logits stage must read the buffer the scheduler writes")
+
+
 # ---------------------------------------------------------------------------
 # Plans
 # ---------------------------------------------------------------------------
@@ -468,28 +824,63 @@ class Sm120MetadataPlan:
 
     ``context_lens`` int32 ``[B, next_n]``; ``page_kv`` an exported page size
     with an exported ``next_n``; ``num_sms`` the CTA budget of the logits call
-    the schedule is built for (``None`` = the device's SM count).  ``out`` is an
+    the schedule is built for (``None`` = the device's SM count).  ``num_heads``
+    selects the Q-atom schedule together with ``B`` and ``next_n``; it may be
+    omitted where every exported head count selects the same schedule
+    (:func:`next_n_atoms`), otherwise a ``ValueError`` names it.
+    ``max_context_hint`` (R3) is the caller's upper bound of the batch's context
+    lengths; it selects the long-context Q-atom schedule at batches 2..8 and
+    must equal the hint of the logits call this schedule serves.  The atom count
+    is the one of the route the logits call resolves (:func:`resolve_route`,
+    with ``num_sms`` as its CTA budget), so a device route's atom applies; on a
+    ``dyn`` route this is the static schedule of that atom, which the logits
+    call does not read (it builds its own).  ``out`` is an
     int32 ``[num_sms + 1, 2]`` buffer, allocated when not supplied.  ``run()``
     submits one launch on the current PyTorch stream and returns it.
     """
 
-    def __init__(self, context_lens, page_kv, num_sms=None, *, out=None):
+    def __init__(
+        self,
+        context_lens,
+        page_kv,
+        num_sms=None,
+        *,
+        num_heads=None,
+        max_context_hint=None,
+        out=None,
+    ):
         import torch
 
-        arch, num_sms = _resolve_device(context_lens, num_sms)
-        _batch, next_n = _check_context_lens(context_lens)
+        arch, num_sms, device_sms = _resolve_device(context_lens, num_sms)
+        batch, next_n = _check_context_lens(context_lens)
         if int(page_kv) not in exported_page_sizes():
             raise ValueError(
                 f"page_kv {page_kv} is not exported; exported page sizes: {exported_page_sizes()}"
             )
-        next_n_atoms(next_n)
+        if num_heads is not None and int(num_heads) not in exported_heads():
+            raise ValueError(
+                f"{num_heads} heads is not exported; exported head counts: {exported_heads()}"
+            )
+        self.num_next_n_atoms = next_n_atoms(
+            next_n,
+            batch,
+            num_heads,
+            max_context_hint,
+            page_kv=int(page_kv),
+            cta_budget=num_sms,
+            device_sms=device_sms,
+        )
+        self.max_context_hint = (
+            None if max_context_hint is None else int(max_context_hint)
+        )
         if out is None:
             out = torch.empty(
                 metadata_shape(num_sms), dtype=torch.int32, device=context_lens.device
             )
         _check_schedule_meta(out, num_sms, context_lens.device)
         self.arch, self.num_sms = arch, num_sms
-        self.page_kv, self.next_n = int(page_kv), next_n
+        self.page_kv, self.next_n, self.batch = int(page_kv), next_n, batch
+        self.num_heads = None if num_heads is None else int(num_heads)
         self.route_name = metadata_route_name()
         self.route = _catalog()["routes"][self.route_name]
         stages = list(self.route["stages"])
@@ -500,8 +891,14 @@ class Sm120MetadataPlan:
         if self.route.get("sequence"):
             raise ValueError("the metadata route must not be a prepared sequence")
         bindings = {
-            "metadata": metadata_bindings(context_lens, out, num_sms=num_sms),
+            "metadata": metadata_bindings(
+                context_lens,
+                out,
+                num_sms=num_sms,
+                num_next_n_atoms=self.num_next_n_atoms,
+            ),
         }
+        check_schedule_bindings(bindings, num_sms=num_sms)
         self._submissions, self._programs = [], []
         self.program_names = [program for _stage, program in stages]
         for stage_name, program in stages:
@@ -536,7 +933,15 @@ class Sm120PagedIndexerPlan:
     ``[B, next_n]`` contiguous; ``block_table`` int32 ``[B, S]`` with
     ``stride(1) == 1`` (any row stride, e.g. an engine's ``[::next_n]`` view);
     ``1 <= max_context_len <= S * page_kv``.  The route is
-    ``(H, page_kv, next_n)`` and must be shipped (:func:`route_available`).
+    ``(H, page_kv, next_n)`` plus the Q-atom variant the catalog rule selects
+    from ``(H, next_n, B)`` and the optional ``max_context_hint`` (R3: an upper
+    bound of the batch's context lengths; from ``long_context_min_kv`` up,
+    batches 2..8 take the large-batch atoms) and must be shipped
+    (:func:`route_available`).  With the full-device CTA budget and a hint
+    inside a context window, the catalog's device table may select a tuned
+    device route of the same geometry instead (:func:`resolve_route`);
+    ``route_name``, ``atom_variant`` and ``num_next_n_atoms`` are those of the
+    route that runs.
 
     ``output`` (FP32 ``[B * next_n, paged_logits_stride(max_context_len)]``) and
     ``schedule_meta`` (int32 ``[num_sms + 1, 2]``) are allocated when not
@@ -545,7 +950,10 @@ class Sm120PagedIndexerPlan:
     prepared sequence (one FFI call, two kernel launches: the scheduler then
     the logits program) on the current stream and returns ``logical_output``.
     The schedule is rebuilt on every call, so a caller-supplied
-    ``schedule_meta`` never goes stale.
+    ``schedule_meta`` never goes stale.  A ``dyn`` route schedules into its own
+    ``dyn_schedule`` buffer (int32 :func:`dyn_schedule_shape`, allocated here
+    and rewritten by every launch) and leaves ``schedule_meta`` unwritten;
+    ``dyn_schedule`` is ``None`` on static routes.
     """
 
     def __init__(
@@ -561,11 +969,11 @@ class Sm120PagedIndexerPlan:
         schedule_meta=None,
         output=None,
         sm_count=None,
-        logits_dtype="float32",
+        max_context_hint=None,
     ):
         import torch
 
-        arch, num_sms = _resolve_device(q, sm_count)
+        arch, num_sms, device_sms = _resolve_device(q, sm_count)
         batch, next_n = _check_context_lens(context_lens)
         if (
             q.ndim != 4
@@ -604,10 +1012,10 @@ class Sm120PagedIndexerPlan:
         max_context_len = int(max_context_len)
         if max_context_len < 1 or max_context_len > int(block_table.shape[1]) * page_kv:
             raise ValueError("max_context_len must be in 1..S * page_kv")
-        if not route_available(num_heads, page_kv, next_n, logits_dtype):
+        if not route_available(num_heads, page_kv, next_n, batch):
             raise ValueError(
                 f"no exported SM120 paged MQA route for {num_heads} heads, page "
-                f"{page_kv}, next_n {next_n}, {logits_dtype}"
+                f"{page_kv}, next_n {next_n}, batch {batch}"
             )
         tensors = [q, kv_cache, weights, context_lens, block_table]
         if any(tensor.device != q.device for tensor in tensors):
@@ -632,29 +1040,57 @@ class Sm120PagedIndexerPlan:
             )
         _check_schedule_meta(schedule_meta, num_sms, q.device)
         self.arch, self.num_sms, self.num_heads = arch, num_sms, num_heads
+        self.device_sms = device_sms
         self.page_kv, self.next_n, self.batch = page_kv, next_n, batch
         self.pages, self.block_stride_bytes = pages, block_stride_bytes
         self.max_context_len = max_context_len
-        self.route_name = route_name(num_heads, page_kv, next_n, logits_dtype)
-        self.route = _catalog()["routes"][self.route_name]
-        stages = list(self.route["stages"])
-        if [stage for stage, _program in stages] != ["metadata", "logits"]:
-            raise ValueError(
-                f"route {self.route_name} must be the ordered (metadata, logits) pair, catalog has {stages}"
+        self.max_context_hint = (
+            None if max_context_hint is None else int(max_context_hint)
+        )
+        self.route_name = resolve_route(
+            num_heads,
+            page_kv,
+            next_n,
+            batch,
+            max_context_hint,
+            cta_budget=num_sms,
+            device_sms=device_sms,
+        )
+        self.route = route_record(self.route_name)
+        self.atom_variant = str(self.route["atom_variant"])
+        self.num_next_n_atoms = route_next_n_atoms(self.route)
+        self.schedule = route_schedule(self.route)
+        self.dyn_schedule = None
+        walk = schedule_meta
+        if self.schedule["kind"] == "dyn":
+            # Plan-private: the dyn scheduler writes every row (counter words
+            # included) on every launch, so no fill and no per-run allocation.
+            self.dyn_schedule = torch.empty(
+                dyn_schedule_shape(num_sms, self.schedule["dyn_slots"]),
+                dtype=torch.int32,
+                device=q.device,
             )
+            walk = self.dyn_schedule
         bindings = {
-            "metadata": metadata_bindings(context_lens, schedule_meta, num_sms=num_sms),
+            "metadata": metadata_bindings(
+                context_lens,
+                walk,
+                num_sms=num_sms,
+                num_next_n_atoms=self.num_next_n_atoms,
+                schedule=self.schedule,
+            ),
             "logits": logits_bindings(
                 q,
                 fused,
                 weights,
                 context_lens,
                 block_table,
-                schedule_meta,
+                walk,
                 output,
                 num_sms=num_sms,
             ),
         }
+        check_schedule_bindings(bindings, num_sms=num_sms, schedule=self.schedule)
         sequence = self.route.get("sequence")
         if not sequence:
             raise ValueError(
@@ -667,7 +1103,7 @@ class Sm120PagedIndexerPlan:
         self._programs.append(loaded)
         self.output, self.schedule_meta = output, schedule_meta
         self.logical_output = output[:, :max_context_len]
-        self._retained = (*tensors, fused, output, schedule_meta)
+        self._retained = (*tensors, fused, output, schedule_meta, walk)
 
     @property
     def launch_count(self):
@@ -695,21 +1131,48 @@ class Sm120PagedIndexerPlan:
 
 
 def get_paged_mqa_logits_metadata(
-    context_lens, page_kv, num_sms, indices=None, *, out=None
+    context_lens,
+    page_kv,
+    num_sms,
+    indices=None,
+    *,
+    num_heads=None,
+    max_context_hint=None,
+    out=None,
 ):
     """DeepGEMM's ``get_paged_mqa_logits_metadata``: a REAL scheduler launch.
 
     ``context_lens`` int32 ``[B, next_n]``, ``page_kv`` an exported page size
     with an exported ``next_n``, ``num_sms`` the CTA budget of the logits call,
     ``indices`` must be ``None`` (variable-length request selection is not
-    ported).  Returns -- or fills ``out`` with -- the int32 ``[num_sms + 1, 2]``
-    schedule the exported logits programs read.  The buffer is not
-    interchangeable with DeepGEMM's: it carries this port's ``(q_atom_idx,
-    kv_split_idx)`` walk boundaries.
+    ported).  ``num_heads`` is the head count of the logits call the schedule
+    is built for: it is required only where the exported head counts select
+    different Q-atom schedules (``next_n`` 5 and 6 above the small-batch class;
+    the ``ValueError`` names it) and may be omitted everywhere else, exactly
+    like DeepGEMM's signature.  ``max_context_hint`` (R3, keyword-only) is an
+    upper bound of the batch's context lengths in KV tokens that the host knows;
+    from ``atom_rule()["long_context_min_kv"]`` (16384) up it selects the
+    native-atom schedules at batches 2..8 (``num_heads`` is then required for
+    ``next_n`` 5/6 there too); ``None`` keeps the batch-only selection.  The
+    logits call this schedule serves must receive the same hint.  The atom count
+    follows the route that logits call resolves (:func:`Sm120MetadataPlan`), so
+    on a device with a route table ``num_heads`` is also required wherever that
+    table makes the head counts select different schedules.  Returns -- or
+    fills ``out`` with -- the int32
+    ``[num_sms + 1, 2]`` schedule the exported logits programs read.  The buffer
+    is not interchangeable with DeepGEMM's: it carries this port's
+    ``(q_atom_idx, kv_split_idx)`` walk boundaries.
     """
     if indices is not None:
         raise ValueError("indices (variable-length request selection) is unsupported")
-    return Sm120MetadataPlan(context_lens, page_kv, num_sms, out=out).run()
+    return Sm120MetadataPlan(
+        context_lens,
+        page_kv,
+        num_sms,
+        num_heads=num_heads,
+        max_context_hint=max_context_hint,
+        out=out,
+    ).run()
 
 
 def fp8_paged_mqa_logits(
@@ -724,15 +1187,26 @@ def fp8_paged_mqa_logits(
     indices=None,
     *,
     page_kv=None,
+    max_context_hint=None,
 ):
     """One-shot paged logits with DeepGEMM's ``fp8_paged_mqa_logits`` signature.
+
+    ``max_context_hint`` (R3, keyword-only) selects the Q-atom program together
+    with ``(H, next_n, B)``: an upper bound of the batch's context lengths of at
+    least ``atom_rule()["long_context_min_kv"]`` takes the native-atom programs
+    at batches 2..8; ``None`` keeps the batch-only selection.  It must equal the
+    hint ``schedule_meta`` was built with; the positional ``max_context_len``
+    only sizes the logits row and never selects the program.
 
     ``schedule_meta`` is the int32 ``[num_sms + 1, 2]`` buffer from
     :func:`get_paged_mqa_logits_metadata`: its first dimension fixes the CTA
     budget, and the call REBUILDS it in the same sequence before the logits
     program reads it (the schedule is a pure function of ``context_lens``,
-    ``split_kv``, ``next_n`` and the budget, so a buffer produced by the
-    metadata entry on the same inputs is rewritten with identical bytes).
+    ``split_kv``, the Q-atom variant of ``(H, next_n, B)`` and the budget, so a
+    buffer produced by the metadata entry on the same inputs is rewritten with
+    identical bytes).  On a ``dyn`` device route the buffer is checked but not
+    written: the call schedules into a private buffer it allocates, as it
+    allocates its output.
     ``None`` selects the device's SM count and an internal buffer.
     ``clean_logits=True`` is rejected for two-dimensional context lengths
     exactly as DeepGEMM does; ``indices`` must be ``None``.  Returns the FP32
@@ -766,6 +1240,7 @@ def fp8_paged_mqa_logits(
         page_kv=page_kv,
         schedule_meta=schedule_meta,
         sm_count=num_sms,
+        max_context_hint=max_context_hint,
     )
     return plan.run()
 
@@ -782,8 +1257,12 @@ def prepare_sm120_paged_mqa_logits(
     schedule_meta=None,
     output=None,
     sm_count=None,
+    max_context_hint=None,
 ):
-    """Prepare repeated paged MQA logits on caller-provided operands."""
+    """Prepare repeated paged MQA logits on caller-provided operands.
+
+    ``max_context_hint`` (R3): see :func:`fp8_paged_mqa_logits`.
+    """
     return Sm120PagedIndexerPlan(
         q,
         kv_cache,
@@ -795,4 +1274,5 @@ def prepare_sm120_paged_mqa_logits(
         schedule_meta=schedule_meta,
         output=output,
         sm_count=sm_count,
+        max_context_hint=max_context_hint,
     )

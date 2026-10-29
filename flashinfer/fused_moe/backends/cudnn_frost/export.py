@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import json
 import ast
 import importlib.util
 import hashlib
 import inspect
-import json
 import os
 import re
 from pathlib import Path
 from typing import Any
 
 from .activations import ACTIVATIONS, is_gated
+from .manifest import MANIFEST_FILENAME, read_manifest, write_manifest
+from .catalog import generic_contract, kernel_id
 
 
 def _slug(value: str) -> str:
@@ -49,7 +51,7 @@ def _build_graph(
         raise ValueError(f"unsupported export dtype {dtype!r}")
     if quantize_output and (dtype == "bf16" or op == "grouped_gemm2"):
         raise ValueError("output quantization requires a block-scaled FC1")
-    if dtype != "bf16" and (n % 128 or k % 128):
+    if n < 128 or k < 128 or n % 128 or k % 128:
         raise ValueError(f"{dtype.upper()} export requires N and K divisible by 128")
     token_type, weight_type = {
         "bf16": (cudnn.data_type.BFLOAT16, cudnn.data_type.BFLOAT16),
@@ -599,7 +601,7 @@ def _export_compiled(args, compiled, config, arch):
         "nvfp4": ("float4_e2m1fn_x2", "float4_e2m1fn_x2"),
         "mxfp8_mxfp4": ("float8_e4m3fn", "float4_e2m1fn_x2"),
     }[dtype]
-    return {
+    record = {
         "id": artifact_id,
         "op": prefix,
         "arch": arch,
@@ -664,19 +666,27 @@ def _export_compiled(args, compiled, config, arch):
         },
         "producer_revision": args.cudnn_frost_revision,
     }
+    record["contract"] = generic_contract(record)
+    if not args.id:
+        record["id"] = kernel_id(record, dtype)
+    return record
 
 
 def _write_manifest(output_dir: Path, kernel: dict[str, Any], replace: bool) -> None:
-    path = output_dir / "cudnn_frost_selected_kernels.json"
+    path = output_dir / MANIFEST_FILENAME
     payload: dict[str, Any] = {
         "schema_version": 2,
         "producer": {"name": "cudnn_frost"},
         "kernels": [],
     }
     if path.exists():
-        payload = json.loads(path.read_text())
-        if payload.get("schema_version") != 2:
-            raise RuntimeError(f"refusing to update unsupported manifest {path}")
+        catalog = json.loads(path.read_text())
+        payload = read_manifest(path)
+        if catalog.get("schema_version") == 4:
+            from .catalog import generic_contract, kernel_id
+
+            kernel = {**kernel, "contract": generic_contract(kernel)}
+            kernel["id"] = kernel_id(kernel, catalog["dtype"])
     kernels = list(payload.get("kernels", []))
     old = next(
         (i for i, item in enumerate(kernels) if item.get("id") == kernel["id"]),
@@ -694,9 +704,7 @@ def _write_manifest(output_dir: Path, kernel: dict[str, Any], replace: bool) -> 
         kernels,
         key=lambda item: (item["contract"]["output_dtype"] != "bfloat16", item["id"]),
     )
-    temporary = path.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    temporary.replace(path)
+    write_manifest(path, payload)
 
 
 def main() -> None:
