@@ -87,7 +87,7 @@ def _run_blockscaled_gemm(
     weight_dtype,
     sf_dtype,
     sf_vec_size,
-    prepare_input,
+    gather_input,
     scatter_output,
     per_token_scale_is_routed,
     k_steps,
@@ -140,31 +140,11 @@ def _run_blockscaled_gemm(
         )
     mma_m, route_tile = mma_tiler_mn
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    if prepare_input:
-        from .moe_swap_ab_prepare import allocate, prepare
-
-        routed, routed_sf = allocate(
-            activation, activation_sf, token_mapping.numel(), sf_vec_size, route_tile
-        )
-        prepare(
-            activation,
-            activation_sf,
-            routed,
-            routed_sf,
-            token_mapping,
-            mn_limit,
-            num_tiles,
-            route_tile,
-            top_k,
-            sf_vec_size,
-            enable_pdl,
-        )
-        activation, activation_sf = routed, routed_sf
     pointers = (
         _blockscaled_ptr(weight, weight_dtype, 32),
         _blockscaled_ptr(weight_sf, sf_dtype),
         _blockscaled_ptr(activation, activation_dtype, 32),
-        _blockscaled_ptr(activation_sf, sf_dtype),
+        _blockscaled_ptr(activation_sf, sf_dtype, 4 if gather_input else 16),
         _blockscaled_ptr(output, output_dtype, 32),
         _blockscaled_ptr(
             output_sf,
@@ -212,6 +192,7 @@ def _run_blockscaled_gemm(
         experts,
         num_sms,
         top_k,
+        gather_input,
         scatter_output,
         per_token_scale_is_routed,
         k_steps,
@@ -253,6 +234,7 @@ def _run_blockscaled_gemm(
             sf_dtype=sf_dtype,
             sf_vec_size=sf_vec_size,
             native_mma_k=native_mma_k,
+            gather_input=gather_input,
             scatter_output=scatter_output,
             per_token_scale_is_routed=per_token_scale_is_routed,
             k_steps=k_steps,
@@ -261,7 +243,9 @@ def _run_blockscaled_gemm(
             pdl_signal_at=pdl_signal_at,
             use_clc_scheduler=use_clc_scheduler,
             num_tile_info_stages=1,
-            prefetch_weights_before_wait=enable_pdl,
+            # Gather consumes moe_sort directly: its early PDL signal does not
+            # publish routing yet. FC2 retains the completed-ancestor contract.
+            prefetch_weights_before_wait=enable_pdl and not gather_input,
             publish_routing_before_signal=publish_routing_before_signal,
             activation_cache_policy=activation_cache_hint,
             generate_sfc=output_sf is not None,
@@ -348,8 +332,54 @@ def launch_gather_gemm(
     k_steps: Optional[int] = None,
     use_clc_scheduler: bool = True,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Prepare routed input and launch FC1 with the swap-AB weight layout."""
+    """Gather input inside FC1 with the swap-AB weight layout."""
     _check_gemm_inputs(a, b, a_dtype, b_dtype, a_per_token_scale, k_steps)
+    if a.dtype == torch.uint8:
+        reduction = a.shape[1] * 2
+    elif a.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        reduction = a.shape[1]
+    else:
+        raise TypeError(f"unsupported blockscaled activation dtype {a.dtype}")
+    if sf_vec_size not in (16, 32) or reduction % (sf_vec_size * 4):
+        raise ValueError("unsupported SF geometry")
+    if a_scale is None:
+        raise ValueError("source SF must be byte-valued linear per-token scales")
+    if any(
+        not tensor.is_cuda or tensor.device != a.device or not tensor.is_contiguous()
+        for tensor in (
+            a,
+            a_scale,
+            token_id_mapping,
+            tile_idx_to_mn_limit,
+            num_non_exiting_tiles,
+        )
+    ):
+        raise ValueError("same-device contiguous CUDA tensors required")
+    if (
+        a_scale.numel() != a.shape[0] * (reduction // sf_vec_size)
+        or a_scale.element_size() != 1
+    ):
+        raise ValueError("source SF must be byte-valued linear per-token scales")
+    if any(
+        tensor.dtype != torch.int32
+        for tensor in (
+            token_id_mapping,
+            tile_idx_to_mn_limit,
+            num_non_exiting_tiles,
+        )
+    ):
+        raise TypeError("routing metadata must be int32")
+    route_tile = mma_tiler_mn[1]
+    if (
+        token_id_mapping.numel() % route_tile
+        or tile_idx_to_mn_limit.numel() < token_id_mapping.numel() // route_tile
+        or num_non_exiting_tiles.numel() != 1
+    ):
+        raise ValueError("metadata capacity mismatch")
+    if a.data_ptr() % 16 or a.shape[1] * a.element_size() % 16:
+        raise ValueError("payload rows and storage require 16-byte alignment")
+    if a.data_ptr() % 32 or a_scale.data_ptr() % 4:
+        raise ValueError("unaligned gather input storage")
     normalized_activation_type, expected_gated = normalize_cute_dsl_moe_activation_type(
         activation_type
     )
@@ -469,7 +499,7 @@ def launch_gather_gemm(
         weight_dtype=b_dtype_cutlass,
         sf_dtype=sf_dtype_cutlass,
         sf_vec_size=sf_vec_size,
-        prepare_input=True,
+        gather_input=True,
         scatter_output=False,
         per_token_scale_is_routed=False,
         k_steps=k_steps,
@@ -588,7 +618,7 @@ def launch_finalize_gemm(
         weight_dtype=b_dtype_cutlass,
         sf_dtype=sf_dtype_cutlass,
         sf_vec_size=sf_vec_size,
-        prepare_input=False,
+        gather_input=False,
         scatter_output=True,
         per_token_scale_is_routed=True,
         k_steps=k_steps,
