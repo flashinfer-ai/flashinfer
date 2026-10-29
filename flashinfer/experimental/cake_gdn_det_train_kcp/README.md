@@ -155,6 +155,7 @@ context serves every call of the same batch layout and head pair.
 | `recompute_output` | **`"auto"`**, `"always"` | under `torch.utils.checkpoint(use_reentrant=False)` torch re-runs the forward inside `.backward()` only to re-save its tensors and discards that run's output; when the GDN node is the last operation of the checkpointed region that saves a tensor, `"auto"` does not launch the output program (#5) of that re-run. The proof is read from torch's checkpoint frame (the node is executable, the remaining saved-tensor holders are exactly this node's, early stop is on, and the torch release -- `torch.__version__` without its local `+cuNNN` build tag (`cake_kcp.torch_release`) -- is one of the verified releases in `cake_kcp.RECOMPUTE_OUTPUT_TORCH_VERSIONS`); any other state -- a later saver in the region such as the next layer or a norm on the output, a non-executable node, a reentrant checkpoint, `graph="replay"`, another torch build -- launches it as before, and `cake_kcp.LAST_CALL["fwd"]["fwd_o_reason"]` records why. Gradients and retained bytes are the same either way; `"always"` is the unconditional launch |
 | `p_rule`, `walk_seg` | plan policy / explicit override | how many intra-rank segments a fragment is walked as (`P`); a function of metadata and the SM count only. The shipped policy costs the three per-rank programs over every rank's fragment table with a crossing-aware model and switches the whole row away from the per-rank default only when an alternative is cheaper by at least its margin (2 % for the `occ` program; 0 % for the `one` program, which has no segment composition and takes a model tie), so the same topology gives the same `P` on every rank |
 | `offset_class` | **`"fla"`**, `"fp32"` | the class of the forward offset `B_f`: the walk from zero with the reference rounding points, or an FP32 walk (`B_f` only) |
+| `use_qk_l2norm_in_kernel` | **`False`**, `True` | the per-token L2 norm of every 128-channel Q / K head inside the programs (FLA's `use_qk_l2norm_in_kernel`; see "In-kernel Q / K L2 norm" below); a literal keyword of the three entry points as well |
 | `test_knobs` | **`None`** | names the test-only values a test selects (`precision_mode` 1 or 2) and private levers such as `fwdh_vh` (forces the #2 value width); without it every test-only value is refused |
 
 The validator refuses every test-only value not named in `test_knobs`,
@@ -261,6 +262,48 @@ gdn_det_workspace_bytes_kcp(ctx, *, H_qk, HV, P=None, reuse_recompute_tapes=None
 `H_qk` enters the halo and strided-view terms; the exchange terms depend on
 `HV` alone.
 
+### In-kernel Q / K L2 norm (`use_qk_l2norm_in_kernel=True`)
+
+`q` / `k` are the raw rows (the convolution's output views pass through);
+per token `t` and Q / K head `h`, with `x = fp32(q[t, h, :])`:
+
+```
+ss    = 16 lanes x 8 channels: fma.rn chains (lane c holds channels 8c..8c+7), then the xor tree m = 8, 4, 2, 1
+r     = div.rn(1, sqrt.rn(ss + 1e-6))                                    FP32, saved as rstd
+q_hat = cvt.rn.bf16(mul.rn(x, r))
+y     = mul.rn(x, r)  (FP32, from the raw row and the saved r)
+dot   = 32-channel quadrant trees (pairs c <-> c^m, m = 16..1), then ((S0 + S1) + S2) + S3 of mul.rn(dq_hat, y)
+dq    = cvt.rn.bf16(mul.rn(r, sub.rn(dq_hat, mul.rn(y, dot))))           dq_hat = the FP32 group sum of #8
+```
+
+FTZ off everywhere; `cake_l2n.py` is the pure-torch reference of these
+orders (bitwise the device programs; the `fma.rn` of `ss` is emulated
+exactly in FP64).  Programs: `fwd_prep_l2n` (#1 that first writes `qn` /
+`kn` and `r`, then runs #1's body on them), `bwd_dqkg_l2n` (#8 on `qn` /
+`kn` with the pullback before the one BF16 rounding; `group_reduce="host"`
+runs the unchanged #8 and the reference pullback on the host, per block of
+2048 tokens) and `qk_apply` (`qn = bf16(q * r)` from the saved `r`).  Every
+other reader (#2, #3, #5, #7) is the unchanged program bound to `qn` / `kn`.
+
+| path | `qn` / `kn` from | `r` the pullback reads | dropped |
+|---|---|---|---|
+| forward | `fwd_prep_l2n` | -- | `kn` before `out`, `qn` after #5; the arena `r` after #1 (the saved `r` is a fresh tensor) |
+| light backward | the replay's `fwd_prep_l2n` | saved | after #8 |
+| `save_mode="full"`, kept recompute tapes | `qk_apply` after #6 | saved | after #8 |
+| `boundary_mode="replay"` | the replayed forward's `fwd_prep_l2n` | arena | after #8 |
+| recompute handle | `fwd_prep_l2n` (the recompute is a forward) | -- | as the forward |
+| `graph="replay"` | as eager | as eager | never (the graph bakes the arena) |
+
+The saved set gains `qk_rstd` (FP32 `[2, T_r, H_qk]`, `8 T_r H_qk` bytes;
+`KCP_SAVED_VERSION` 2); the normalized rows are workspace only
+(`2 x 256 T_r H_qk` bytes, in the forward's tape walk and every backward
+phase).  The byte queries take `use_qk_l2norm_in_kernel=`;
+`LAST_CALL[...]` records `qk_l2norm`, `qk_source`, `rstd_source` and
+`arena_tapes`.  The recompute handle's entry key includes the flag.  Until
+the registry renders the three programs the kernel backend refuses the
+option before any launch (`cake_kcp.l2n_records_shipped()`); the fake
+backend emulates them.
+
 ### Exchange
 
 Per forward: one `all_to_all_single` carrying the `[B_f | M_f^T]` summary
@@ -341,6 +384,7 @@ not the whole grid.
 | `cake_backend.py` | device -> architecture map, library loading, the generic launch of one record |
 | `cake_kcp_plan.py`, `cake_tables.py`, `cake_bytes.py` | partition, context, ownership and halo plans, the CPU tables, the byte queries |
 | `cake_kcp.py` | the launch sequences, the exchange schedule, the saved set and the autograd Function |
+| `cake_l2n.py` | the pure-torch FP32 reference of the in-kernel Q / K L2 norm and its pullback (the fake backend's, the host reduction's and the tests' oracle) |
 | `csrc/` | the generated device sources and tvm-ffi bindings (`<library>_kernel.cu`, `<library>_binding.cu`) and the binding checks header |
 | `aot/` | prebuilt libraries and their `build_info.json` sidecar, when a builder fills it (git-ignored) |
 

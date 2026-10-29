@@ -39,6 +39,18 @@ size 64, head dimension 128, value head ``hv`` reads Q/K head ``hv // (HV // H_q
                      dg partials and the chunk gate term gamma_dot (all FP32)
   #9 gate_epilogue   dg = reverse cumsum within the chunk of (dg partials + gamma_dot at the last token), FP32
 
+In-kernel Q / K L2 norm (``use_qk_l2norm_in_kernel``; dispatched by program name until the registry renders the
+records; the norm itself is :mod:`.cake_l2n`, the fixed-order FP32 reference of the device programs, so these three
+emulations are bitwise the device ones in the norm and the pullback, and inherit the FLA-class #1 / #8 bodies):
+
+  fwd_prep_l2n      qn, kn = qk_l2norm_ref(q, k) (and q_rstd / k_rstd) per real chunk; then #1 on (qn, kn)
+  bwd_dqkg_l2n      #8 on (q, k) = (qn, kn), the FP32 group sums through l2n_pullback(q_raw, q_rstd, .) before the
+                    one BF16 rounding of dq / dk
+  qk_apply          qn = bf16(q_raw * q_rstd), kn likewise, per real chunk
+
+``group_reduce = 0`` (the host form): #8 writes the FP32 per-value-head partials ``dq_part`` / ``dk_part`` ``[T, HV,
+128]`` instead of ``dq`` / ``dk`` (the host sums them in head order and rounds once).
+
 Every rounding point is a call of :func:`bf16` marked ``# ROUND``; everything
 else is FP32 (``torch.matmul`` of FP32-widened operands = the FP32-accumulate
 MMA).  The arithmetic is deterministic for one device and thread count, so a
@@ -68,7 +80,7 @@ from typing import Any
 
 import torch
 
-from . import cake_jit, cake_tables
+from . import cake_jit, cake_l2n, cake_tables
 from .cake_kcp_plan import (
     CHUNK,
     HEAD_DIM,
@@ -429,7 +441,10 @@ def _token_rows(x: torch.Tensor, T: int, heads: int, tstride: int) -> torch.Tens
     )
 
 
-def bwd_dqkg(values: Mapping[str, Any]) -> None:
+def bwd_dqkg(values: Mapping[str, Any], *, l2n: bool = False) -> None:
+    """#8 (``l2n``: #8_l2n, the norm's pullback of the FP32 group sums before the BF16 rounding; ``q`` / ``k`` are
+    then ``qn`` / ``kn`` and ``q_raw`` / ``k_raw`` / ``q_rstd`` / ``k_rstd`` the norm's inputs).  ``group_reduce = 0``
+    writes the FP32 per-value-head partials ``dq_part`` / ``dk_part`` instead of ``dq`` / ``dk``."""
     q, k, v, do = (values[n] for n in ("q", "k", "v", "do"))
     h_tape, dh_tape, v_new, dv_new, w, u, aqk, akk, do_g = (
         values[n]
@@ -458,6 +473,18 @@ def bwd_dqkg(values: Mapping[str, Any]) -> None:
     dv = _token_rows(dv, v.shape[0], v.shape[1], int(values["dv_tstride"]))
     scale = float(values["scale"])
     HV, H_qk, r = _group(values)
+    partials = int(values.get("group_reduce", 1)) == 0
+    if partials and l2n:
+        raise ValueError("bwd_dqkg_l2n runs with group_reduce = 1 only")
+    if partials:
+        dq_part, dk_part = values["dq_part"], values["dk_part"]  # FP32 [T, HV, 128]
+    if l2n:
+        T = q.shape[0]
+        ts = int(values["rstd_tstride"])
+        q_raw = _token_rows(values["q_raw"], T, H_qk, int(values["q_raw_tstride"]))
+        k_raw = _token_rows(values["k_raw"], T, H_qk, int(values["k_raw_tstride"]))
+        q_rstd = _rstd_rows(values["q_rstd"], T, H_qk, ts)
+        k_rstd = _rstd_rows(values["k_rstd"], T, H_qk, ts)
     for c, bos, L in _chunks(values):
         tok, rows = slice(bos, bos + L), slice(c * CHUNK, c * CHUNK + L)
         for hq in range(H_qk):
@@ -467,7 +494,11 @@ def bwd_dqkg(values: Mapping[str, Any]) -> None:
                 L, HEAD_DIM, dtype=F32, device=q.device
             )  # FP32 over the group's value heads
             dk_acc = torch.zeros_like(dq_acc)
+            group_q, group_k = dq_acc, dk_acc
             for hv in range(hq * r, (hq + 1) * r):
+                if partials:  # this value head's own FP32 contribution (the same operation sequence)
+                    dq_acc = torch.zeros_like(group_q)
+                    dk_acc = torch.zeros_like(group_k)
                 vv, dd = f32(v[tok, hv]), f32(do[tok, hv])
                 h, dh = f32(h_tape[c, hv]), f32(dh_tape[c, hv])
                 vn, dvn, ww, dog = (f32(t[rows, hv]) for t in (v_new, dv_new, w, do_g))
@@ -528,10 +559,58 @@ def bwd_dqkg(values: Mapping[str, Any]) -> None:
                 dG += PL.sum(1) - PL.sum(0)
                 dbeta[tok, hv] = dbeta_hv
                 dg_part[rows, hv] = dG
+                if partials:
+                    dq_part[tok, hv] = dq_acc
+                    dk_part[tok, hv] = dk_acc
+            if partials:
+                continue
+            if l2n:  # the norm's pullback of the FP32 group sums (raw rows, saved r), before the one rounding
+                dq_acc = cake_l2n.l2n_pullback(q_raw[tok, hq], q_rstd[tok, hq], dq_acc)
+                dk_acc = cake_l2n.l2n_pullback(k_raw[tok, hq], k_rstd[tok, hq], dk_acc)
             dq[tok, hq] = bf16(
                 dq_acc
             )  # ROUND #8: one BF16 rounding of the FP32 group sum
             dk[tok, hq] = bf16(dk_acc)  # ROUND #8
+
+
+def _rstd_rows(x: torch.Tensor, T: int, heads: int, tstride: int) -> torch.Tensor:
+    """``[T, heads]`` FP32 rstd rows over token stride ``tstride`` (2-D as given, or a 1-D span)."""
+    if x.dim() == 2:
+        return x
+    return x.as_strided((T, heads), (tstride, 1), x.storage_offset())
+
+
+def fwd_prep_l2n(values: Mapping[str, Any]) -> None:
+    """#1_l2n: ``qn`` / ``kn`` / ``q_rstd`` / ``k_rstd`` of the real chunks' tokens (:func:`.cake_l2n.qk_l2norm_ref`),
+    then #1 on ``(qn, kn)``."""
+    q, k, qn, kn = (values[n] for n in ("q", "k", "qn", "kn"))
+    _HV, H_qk, _r = _group(values)
+    T, ts = q.shape[0], int(values["rstd_tstride"])
+    q_rstd = _rstd_rows(values["q_rstd"], T, H_qk, ts)
+    k_rstd = _rstd_rows(values["k_rstd"], T, H_qk, ts)
+    for _c, bos, L in _chunks(values):
+        tok = slice(bos, bos + L)
+        for x, xn, xr in ((q, qn, q_rstd), (k, kn, k_rstd)):
+            hat, rr = cake_l2n.qk_l2norm_ref(x[tok])
+            xn[tok] = hat
+            xr[tok] = rr
+    fwd_prep({**values, "q": qn, "k": kn})
+
+
+def qk_apply(values: Mapping[str, Any]) -> None:
+    """``qn = bf16(q_raw * q_rstd)``, ``kn`` likewise, over the real chunks' tokens."""
+    qn, kn = values["qn"], values["kn"]
+    T, H_qk = qn.shape[0], int(values["num_qk_heads"])
+    ts = int(values["rstd_tstride"])
+    pairs = (
+        (values["q_raw"], int(values["q_raw_tstride"]), values["q_rstd"], qn),
+        (values["k_raw"], int(values["k_raw_tstride"]), values["k_rstd"], kn),
+    )
+    for _c, bos, L in _chunks(values):
+        tok = slice(bos, bos + L)
+        for raw, raw_ts, rstd, out in pairs:
+            x = _token_rows(raw, T, H_qk, raw_ts)
+            out[tok] = cake_l2n.qk_apply_ref(x[tok], _rstd_rows(rstd, T, H_qk, ts)[tok])
 
 
 def gate_epilogue(values: Mapping[str, Any]) -> None:
@@ -548,6 +627,49 @@ def gate_epilogue(values: Mapping[str, Any]) -> None:
 # ----------------------------------------------------------------------------------------------------------------
 # The backend entry: the kernels' call
 
+# The logical arguments the emulations of the in-kernel L2 norm programs read (beyond the v1 bodies' own reads,
+# which their bodies check as they index ``values``).
+L2N_LOGICAL: dict[str, tuple[str, ...]] = {
+    "fwd_prep_l2n": (
+        "q",
+        "k",
+        "qn",
+        "kn",
+        "q_rstd",
+        "k_rstd",
+        "rstd_tstride",
+        "chunk_bos",
+        "chunk_len",
+    ),
+    "bwd_dqkg_l2n": (
+        "q",
+        "k",
+        "q_raw",
+        "k_raw",
+        "q_raw_tstride",
+        "k_raw_tstride",
+        "q_rstd",
+        "k_rstd",
+        "rstd_tstride",
+        "group_reduce",
+    ),
+    "qk_apply": (
+        "q_raw",
+        "k_raw",
+        "q_raw_tstride",
+        "k_raw_tstride",
+        "q_rstd",
+        "k_rstd",
+        "rstd_tstride",
+        "num_qk_heads",
+        "chunk_bos",
+        "chunk_len",
+        "num_chunks",
+        "qn",
+        "kn",
+    ),
+}
+
 
 def run_module(
     name: str,
@@ -559,15 +681,25 @@ def run_module(
 ) -> None:
     """Run record ``name`` of :data:`cake_jit.MODULES` (or ``TEST_MODULES``) on logical ``values`` -- the same call
     as :func:`cake_jit.run_module`; ``grid`` / ``device_index`` / ``module`` are accepted and ignored (the fake
-    backend derives its work from the tables).  Every logical argument of the record's plan must be present."""
+    backend derives its work from the tables).  Every logical argument of the record's plan must be present.  An
+    in-kernel L2 norm program the registry does not render yet runs by its program name
+    (:data:`cake_jit.L2N_PROGRAMS`), with the logical names :data:`L2N_LOGICAL` it reads."""
     record = cake_jit.MODULES.get(name) or cake_jit.TEST_MODULES.get(name)
+    if record is None and name in getattr(cake_jit, "L2N_PROGRAMS", ()):
+        record = {"program": name, "logical": {n: n for n in L2N_LOGICAL[name]}}
     if record is None:
         raise KeyError(f"{name!r} is not a GDN KCP record")
     missing = sorted(set(record["logical"].values()) - set(values))
     if missing:
         raise ValueError(f"record {name} needs logical argument(s) {missing}")
     program = record["program"]
-    if program == "fwd_prep":
+    if program == "fwd_prep_l2n":
+        fwd_prep_l2n(values)
+    elif program == "bwd_dqkg_l2n":
+        bwd_dqkg(values, l2n=True)
+    elif program == "qk_apply":
+        qk_apply(values)
+    elif program == "fwd_prep":
         fwd_prep(values)
     elif program == "kcp_fwdh_offset":
         kcp_fwdh(values, tape=False)
@@ -689,6 +821,7 @@ class FakeRank:
     H_qk: int
     HV: int
     scale: float
+    qk_l2norm: bool = False  # use_qk_l2norm_in_kernel: #1 / #8 as their _l2n siblings, the readers on qn / kn
 
     def common(self) -> dict[str, Any]:
         """The logical arguments every program of this rank shares (operands, tables, head counts)."""
@@ -762,9 +895,11 @@ def build_ranks(
     conv_kernel_size: int = 4,
     p_rule: str = "wave_fill1",
     device="cpu",
+    qk_l2norm: bool = False,
 ) -> list[FakeRank]:
     """The emulated ranks of ``part``: one context per rank (``sm_count=1`` keeps ``P = 1``), the tables and the
-    rank's operands (``q, k, v, g, beta, dout`` in local order without the batch axis)."""
+    rank's operands (``q, k, v, g, beta, dout`` in local order without the batch axis); ``qk_l2norm``: the in-kernel
+    Q / K L2 norm form."""
     ranks = []
     for r in range(part.world_size):
         ctx = build_context_det_kcp(
@@ -792,6 +927,7 @@ def build_ranks(
                 int(H_qk),
                 int(HV),
                 float(scale),
+                bool(qk_l2norm),
             )
         )
     return ranks
@@ -865,7 +1001,29 @@ def _buffers(ranks: list[FakeRank], split: str) -> list[torch.Tensor]:
 
 
 def _prep(rk: FakeRank) -> dict[str, torch.Tensor]:
+    """#1 of one rank: the ten forward tapes; with the norm (#1_l2n) also ``qk_rstd`` and the readers' ``q`` / ``k``
+    = ``qn`` / ``kn`` (the later programs bind ``{**common, **tapes}``, so these override the raw operands)."""
     tapes = new_tapes(rk.ctx, rk.H_qk, rk.HV, FWD_TAPES)
+    if rk.qk_l2norm:
+        T, dev = rk.ctx.T_r, rk.ops["q"].device
+        qn = torch.zeros(T, rk.H_qk, HEAD_DIM, dtype=BF16, device=dev)
+        kn = torch.zeros_like(qn)
+        rstd = torch.zeros(2, T, rk.H_qk, dtype=F32, device=dev)
+        if rk.lt.NC:
+            run_module(
+                "fwd_prep_l2n",
+                {
+                    **rk.common(),
+                    **tapes,
+                    "qn": qn,
+                    "kn": kn,
+                    "q_rstd": rstd[0],
+                    "k_rstd": rstd[1],
+                    "rstd_tstride": rk.H_qk,
+                },
+            )
+        tapes.update(q=qn, k=kn, qk_rstd=rstd)
+        return tapes
     if rk.lt.NC:
         run_module("fwd_prep", {**rk.common(), **tapes})
     return tapes
@@ -973,6 +1131,10 @@ def emulate_forward(
             run_module("fwd_o", {**rk.common(), **tp, "o": o, "num_seqs": rk.wt.NSEG})
         outs.append(o)
     keep = FULL_SAVED if save_mode == "full" else LIGHT_SAVED
+    if ranks and ranks[0].qk_l2norm:
+        keep = keep + (
+            "qk_rstd",
+        )  # the norm's saved r (the replay's own r is checked against it)
     saved = FakeSaved(
         s_in=[t.clone() for t in s_in],
         c1_recv=[t.clone() for t in c1_recv] if save_transfer else None,
@@ -1140,13 +1302,31 @@ def emulate_backward(
         if rk.lt.NC:
             # the record's launch logicals the emulation does not read: in-kernel group reduce (the partials
             # dq_part / dk_part are written only for group_reduce == 0, K4 ABI) and the token strides
+            l2n_args = {}
+            if rk.qk_l2norm:
+                # the saved r in saved mode (the replay's own r otherwise; both are the forward's bits)
+                rstd = (
+                    saved.tapes[rk.rank]["qk_rstd"]
+                    if boundary_mode == "saved"
+                    else tp["qk_rstd"]
+                )
+                l2n_args = {
+                    "q_raw": rk.ops["q"],
+                    "k_raw": rk.ops["k"],
+                    "q_raw_tstride": int(rk.ops["q"].stride(0)),
+                    "k_raw_tstride": int(rk.ops["k"].stride(0)),
+                    "q_rstd": rstd[0],
+                    "k_rstd": rstd[1],
+                    "rstd_tstride": rk.H_qk,
+                }
             run_module(
-                "bwd_dqkg",
+                "bwd_dqkg_l2n" if rk.qk_l2norm else "bwd_dqkg",
                 {
                     **rk.common(),
                     **tp,
                     **bw,
                     **g_r,
+                    **l2n_args,
                     "num_seqs": rk.wt.NSEG,
                     "dqk_tstride": int(g_r["dq"].stride(0)),
                     "dv_tstride": int(g_r["dv"].stride(0)),
@@ -1171,10 +1351,12 @@ def emulate(
     save_transfer: bool = True,
     sm_count: int = 1,
     device="cpu",
+    qk_l2norm: bool = False,
 ) -> dict[str, Any]:
     """Forward + both backward modes of the pack ``global_ops`` (``q, k, v, g, beta, dout`` without the batch axis,
     global token order) under partition ``part``.  Returns the global-order ``out`` and gradients of the saved-mode
-    backward (``saved``), the replay-mode gradients (``replay``), the collective logs and the ranks."""
+    backward (``saved``), the replay-mode gradients (``replay``), the collective logs and the ranks.  ``qk_l2norm``:
+    the in-kernel Q / K L2 norm form (``q`` / ``k`` raw)."""
     ranks = build_ranks(
         part,
         [slice_local(global_ops, part, r) for r in range(part.world_size)],
@@ -1183,6 +1365,7 @@ def emulate(
         scale=scale,
         sm_count=sm_count,
         device=device,
+        qk_l2norm=qk_l2norm,
     )
     log_fwd: list[str] = []
     outs, saved = emulate_forward(
@@ -1209,6 +1392,7 @@ def emulate(
         },
         "save_mode": save_mode,
         "save_transfer": save_transfer,
+        "qk_l2norm": bool(qk_l2norm),
     }
 
 
@@ -1233,8 +1417,10 @@ __all__ = [
     "emulate",
     "emulate_backward",
     "emulate_forward",
+    "L2N_LOGICAL",
     "fwd_o",
     "fwd_prep",
+    "fwd_prep_l2n",
     "gate_epilogue",
     "gather_global",
     "kcp_affine_merge",
@@ -1242,6 +1428,7 @@ __all__ = [
     "kcp_fwdh",
     "kcp_transfer_walk",
     "new_tapes",
+    "qk_apply",
     "replay_equals_saved",
     "run_module",
     "slice_local",

@@ -26,7 +26,8 @@ nothing itself and forwards every keyword.  Every switch is a keyword
 argument; no environment variable is read.
 
 Operands of one rank (its ``T_r`` local tokens in fragment order): ``q, k``
-BF16 ``[1, T_r, H_qk, 128]`` (L2-normalized by the caller), ``v`` BF16
+BF16 ``[1, T_r, H_qk, 128]`` (L2-normalized by the caller, or raw with
+``use_qk_l2norm_in_kernel=True``), ``v`` BF16
 ``[1, T_r, HV, 128]`` with ``HV % H_qk == 0`` (production ``(16, 48)``),
 ``g`` FP32 ``[1, T_r, HV]`` (the natural-log decay, preactivated, no clamp),
 ``beta`` FP32 ``[1, T_r, HV]`` (through the sigmoid).  Strided packed-QKV
@@ -47,6 +48,21 @@ Usage::
     dq, dk, dv, dbeta, dg = chunk_gdn_det_bwd_kcp(q, k, v, g, beta, ctx, dout, saved=saved)
     dq, dk, dv, dbeta, dg = chunk_gdn_det_bwd_kcp(q, k, v, g, beta, ctx, dout)                 # checkpoint replay
     gdn_det_comm_bytes_kcp(ctx, H_qk=16, HV=48, C=10240)                                       # bytes per collective
+
+``use_qk_l2norm_in_kernel=True`` (keyword-only, default ``False``; the FLA
+``chunk_gated_delta_rule`` keyword) normalizes ``q`` and ``k`` inside the
+recurrence programs, per token and 128-channel head:
+``q_hat = bf16(x * r)``, ``r = 1 / sqrt(sum x^2 + 1e-6)`` with ``x = fp32(q)``,
+in a fixed FP32 operation order with FTZ off (one BF16 rounding); ``q`` / ``k``
+are the raw rows (for example the convolution's output views).  The gradient is
+the exact derivative of that FP32 form at the stored point: ``dq = r (dq_hat -
+y (dq_hat . y))`` with ``y = x * r`` recomputed in FP32 from the raw rows and the
+saved ``r``, rounded once to BF16.  The saved set grows by ``8 T_r H_qk`` bytes
+(the FP32 ``r`` of q and k; 4 MiB at ``T_r = 32768``, ``H_qk = 16``); the
+normalized rows (``2 x 256 T_r H_qk`` bytes) are transient workspace in the
+forward and the backward and never retained.  Pass the same value to
+``chunk_gdn_det_bwd_kcp`` as to ``chunk_gdn_det_fwd_kcp``; every mode (saved / replay,
+light / full, checkpoint, recompute handle, CUDA-graph replay, ring) supports it.
 
 The width-4 causal convolution with halo of the same partition is
 ``flashinfer.cake_causal_conv1d_train.cake_causal_conv1d_kcp(x_local, weight, ctx)``
@@ -145,6 +161,7 @@ def chunk_gdn_det_fwd_kcp(
     save_for_backward: bool = True,
     workspace: Optional[Any] = None,
     options: Optional[Any] = None,
+    use_qk_l2norm_in_kernel: bool = False,
     **knobs: Any,
 ) -> tuple[torch.Tensor, Optional[Any]]:
     r"""Context-parallel packed GDN training forward of this rank's fragments.
@@ -175,6 +192,9 @@ def chunk_gdn_det_fwd_kcp(
         :func:`chunk_gdn_det_kcp`),
         ``recompute_output`` ``"auto"`` | ``"always"`` (an autograd-node switch; this forward-only entry never skips a
         launch), ...).
+    use_qk_l2norm_in_kernel : bool
+        Normalize ``q`` / ``k`` per token and head inside the programs (module docstring); the saved set then
+        carries the FP32 ``r`` of q and k.  With an ``options`` instance it overrides only when ``True``.
 
     Returns
     -------
@@ -191,6 +211,7 @@ def chunk_gdn_det_fwd_kcp(
         save_for_backward=save_for_backward,
         workspace=workspace,
         options=options,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         **knobs,
     )
 
@@ -209,6 +230,7 @@ def chunk_gdn_det_bwd_kcp(
     scale: Optional[float] = None,
     workspace: Optional[Any] = None,
     options: Optional[Any] = None,
+    use_qk_l2norm_in_kernel: bool = False,
     **knobs: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""Context-parallel packed GDN training backward.
@@ -222,8 +244,9 @@ def chunk_gdn_det_bwd_kcp(
     saved : optional
         The forward's saved set; ``None`` recomputes it from the inputs (checkpoint replay: the summaries and the
         exchange are re-run).
-    scale, workspace, options, **knobs
-        As in :func:`chunk_gdn_det_fwd_kcp` (the same options as the forward's).
+    scale, workspace, options, use_qk_l2norm_in_kernel, **knobs
+        As in :func:`chunk_gdn_det_fwd_kcp` (the same options as the forward's; a saved set of the other
+        ``use_qk_l2norm_in_kernel`` value is refused).
 
     Returns
     -------
@@ -243,6 +266,7 @@ def chunk_gdn_det_bwd_kcp(
         scale=DEFAULT_SCALE if scale is None else scale,
         workspace=workspace,
         options=options,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         **knobs,
     )
 
@@ -263,6 +287,7 @@ def chunk_gdn_det_kcp(
     graph: str = "off",
     options: Optional[Any] = None,
     recompute_handle: Optional[Any] = None,
+    use_qk_l2norm_in_kernel: bool = False,
     **knobs: Any,
 ) -> torch.Tensor:
     r"""Context-parallel packed GDN training as an autograd node (``torch.utils.checkpoint`` compatible).
@@ -320,6 +345,10 @@ def chunk_gdn_det_kcp(
     halo rows go under the key ``"conv"``); a layer with separate Q / K / V convolutions uses one handle per
     convolution call, and this call shares one of them.  Needs ``boundary_mode="saved"`` and ``graph="off"``; implies ``save_transfer=False``.  A forward
     outside the backward that finds an entry raises (a handle reused across micro-steps).
+
+    ``use_qk_l2norm_in_kernel`` (keyword-only, default ``False``): the in-kernel per-head L2 norm of ``q`` / ``k``
+    (module docstring); it is part of the saved set and of the recompute handle's entry, so a checkpoint, a handle
+    and a CUDA-graph replay see it like any other option.
     """
     return _pkg().chunk_gdn_det_kcp(
         q,
@@ -335,6 +364,7 @@ def chunk_gdn_det_kcp(
         graph=graph,
         options=options,
         recompute_handle=recompute_handle,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         **knobs,
     )
 
@@ -360,14 +390,17 @@ def packed_qkv_views_det_kcp(
 def gdn_det_workspace_bytes_kcp(ctx: Any, *, H_qk: int, HV: int, **kw: Any) -> int:
     r"""Caller-held workspace bytes of one rank for ``(ctx, H_qk, HV)`` (exchange pools, staging, tapes): the most
     the workspace binds in the forward or the backward of the given options (``reuse_recompute_tapes`` as a keyword;
-    the per-phase terms are ``gdn_det_workspace_layout_kcp`` of the package)."""
+    the per-phase terms are ``gdn_det_workspace_layout_kcp`` of the package).  ``use_qk_l2norm_in_kernel=True`` adds the
+    transient normalized rows ``qn`` / ``kn`` (``2 x 256 T_r H_qk`` bytes) to the forward and every backward phase,
+    and the ``8 T_r H_qk``-byte FP32 ``r`` where the backward re-runs the prep program."""
     return _pkg().gdn_det_workspace_bytes_kcp(ctx, H_qk=H_qk, HV=HV, **kw)
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
 def gdn_det_saved_bytes_kcp(ctx: Any, *, H_qk: int, HV: int, **kw: Any) -> int:
     r"""Saved-set bytes of one layer on this rank (``save_mode``, ``save_transfer`` as keywords), counted per
-    crossing fragment."""
+    crossing fragment; ``use_qk_l2norm_in_kernel=True`` adds the FP32 ``r`` of q and k, ``8 T_r H_qk`` bytes
+    (``boundary_mode="saved"``)."""
     return _pkg().gdn_det_saved_bytes_kcp(ctx, H_qk=H_qk, HV=HV, **kw)
 
 

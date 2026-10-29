@@ -80,6 +80,18 @@ with a successor in its document chain), ``N_in`` / ``N_out`` the group totals,
   added when the programs exist (every term is listed by
   :func:`gdn_det_workspace_layout_kcp` so the host can account for it).
 
+* ``use_qk_l2norm_in_kernel=True`` (the in-kernel Q / K L2 norm): the saved
+  set gains ``qk_rstd`` (FP32 ``[2, T_r, H_qk]``: ``8 T_r H_qk`` bytes, 4 MiB
+  at ``T_r = 32768``, ``H_qk = 16``; ``boundary_mode="saved"`` only); the
+  workspace gains the transient normalized rows ``qn`` / ``kn`` (BF16
+  ``[T_r, H_qk, 128]`` each, ``2 * 256 T_r H_qk`` bytes together, 256 MiB at
+  the same shape) in the forward's tape walk and in every backward phase (and
+  in the kept form's recompute forward), plus the arena ``qk_rstd`` in the
+  backward forms that re-run #1 (the light replay and ``boundary_mode=
+  "replay"``; the ``save_mode="full"`` and kept-tape backwards read the saved
+  one).  The forward drops ``kn`` before its output and ``qn`` after #5, so
+  nothing of the norm is left in the arena after a forward.
+
 All sizes are exact integers of the shapes the host allocates (``R = 64
 NC_pad`` padded token rows, ``NC_pad`` the even chunk bound), not estimates.
 """
@@ -119,6 +131,16 @@ EYE_BYTES = STATE_TILE_BYTES
 FWD_TAPES_DEAD_AFTER_PREP = ("akk", "gcum")
 FWD_TAPES_ARENA_AFTER_FWD = ("aqk", "qscale", "h_tape", "v_new")
 TAPE_NAME_OF = {"gcum": "g_cum"}  # this module's spelling -> cake_kcp's
+# The in-kernel Q / K L2 norm (``use_qk_l2norm_in_kernel``): bytes per (token, Q/K head) of one normalized row tape
+# (``qn`` / ``kn``: BF16 [T_r, H_qk, 128]) and of the FP32 ``r`` of q and k together (``qk_rstd`` [2, T_r, H_qk]).
+QK_ROW_BF16 = HEAD_DIM * 2
+QK_RSTD_BYTES = 2 * 4
+
+
+def _flag(value: bool, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError(f"{name} must be a bool, got {type(value).__name__}")
+    return value
 
 
 def _kept_form(reuse_recompute_tapes: bool | str | None) -> bool:
@@ -292,10 +314,13 @@ def gdn_det_saved_layout_kcp(
     with_conv: bool = True,
     C: int | None = None,
     P: int | None = None,
+    use_qk_l2norm_in_kernel: bool = False,
 ) -> dict[str, int]:
     """The saved set of one layer on this rank, term by term in bytes (design table 4.1; module docstring).
-    ``P`` overrides the plan's segment count (the ``walk_seg`` override knob) for the ``M_seg`` term."""
+    ``P`` overrides the plan's segment count (the ``walk_seg`` override knob) for the ``M_seg`` term;
+    ``use_qk_l2norm_in_kernel``: the ``qk_rstd`` term (``8 T_r H_qk``)."""
     H_qk, HV = _check(H_qk, HV)
+    l2n = _flag(use_qk_l2norm_in_kernel, "use_qk_l2norm_in_kernel")
     C = _channels(H_qk, HV, C)
     _mode(save_mode, SAVE_MODES, "save_mode")
     _mode(boundary_mode, BOUNDARY_MODES, "boundary_mode")
@@ -337,6 +362,9 @@ def gdn_det_saved_layout_kcp(
             "qscale": ctx.R * HV * ROW_F32 if full else 0,
         }
     )
+    # the in-kernel L2 norm's r of q and k (the backward recomputes qn / kn from the raw rows and it)
+    if l2n:  # (no term without the norm: the norm-off layout is unchanged)
+        terms["qk_rstd"] = ctx.T_r * H_qk * QK_RSTD_BYTES if saved else 0
     return terms
 
 
@@ -351,6 +379,7 @@ def gdn_det_saved_bytes_kcp(
     with_conv: bool = True,
     C: int | None = None,
     P: int | None = None,
+    use_qk_l2norm_in_kernel: bool = False,
 ) -> int:
     """Saved-set bytes of one layer on this rank (the sum of :func:`gdn_det_saved_layout_kcp`)."""
     return sum(
@@ -364,6 +393,7 @@ def gdn_det_saved_bytes_kcp(
             with_conv=with_conv,
             C=C,
             P=P,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         ).values()
     )
 
@@ -382,6 +412,7 @@ def gdn_det_workspace_layout_kcp(
     P: int | None = None,
     group_reduce: str = "fused",
     reuse_recompute_tapes: bool | str | None = None,
+    use_qk_l2norm_in_kernel: bool = False,
 ) -> dict[str, int]:
     """The caller-held workspace of one rank, term by term (``fwd.*`` / ``bwd.*`` in bytes), with the lifetime
     maxima ``forward`` / ``backward`` and their maximum ``workspace`` (module docstring).  Saved-set tensors are
@@ -406,8 +437,12 @@ def gdn_det_workspace_layout_kcp(
       checkpointed region saves a tensor).  ``save_mode="full"`` saves the forward tapes as fresh tensors: none is
       workspace in either lifetime.  ``backward_transient`` = the backward's phase maximum with the hand-off tensors
       added (the memory a backward needs besides the saved set; the same figure in both forms).
+    * ``use_qk_l2norm_in_kernel``: ``qn`` / ``kn`` in the forward's tape walk, in every backward phase and in the
+      kept form's recompute forward; ``bwd.qk_rstd`` (the arena ``r``) where the backward re-runs #1 (the light
+      replay, ``boundary_mode="replay"``).
     """
     H_qk, HV = _check(H_qk, HV)
+    l2n = _flag(use_qk_l2norm_in_kernel, "use_qk_l2norm_in_kernel")
     C = _channels(H_qk, HV, C)
     _mode(save_mode, SAVE_MODES, "save_mode")
     _mode(boundary_mode, BOUNDARY_MODES, "boundary_mode")
@@ -462,7 +497,11 @@ def gdn_det_workspace_layout_kcp(
             k: v for k, v in light_tapes.items() if k not in FWD_TAPES_DEAD_AFTER_PREP
         }
     )
-    fwd = {**fwd_pools, **fwd_tapes}
+    # the in-kernel L2 norm's normalized rows: live through the tape walk (kn goes before the output, qn after #5)
+    qk_rows = (
+        {"qn": T_r * H_qk * QK_ROW_BF16, "kn": T_r * H_qk * QK_ROW_BF16} if l2n else {}
+    )
+    fwd = {**fwd_pools, **fwd_tapes, **qk_rows}
     # the b1 buffers are the plan's split tables (their map half pairs with the crossing-in slots; the design's
     # per-rank b1 QUERY is in gdn_det_comm_bytes_kcp -- the workspace counts what the host allocates)
     b1_send, b1_recv = hp.b1_splits(saved and not save_transfer)
@@ -509,7 +548,16 @@ def gdn_det_workspace_layout_kcp(
         if group_reduce == "host"
         else 0,  # #8, the host form of the grouped reduction
     }
-    bwd = {**bwd_pools, **bwd_fwd_tapes_end, **bwd_tapes}
+    # the norm in the backward: qn / kn from #1_l2n (light replay, replay mode) or qk_apply (full, kept) until #8, and
+    # the arena r where #1 is re-run (the full / kept forms read the saved r)
+    replays_prep = (not saved) or not (full or kept)
+    bwd_l2n = (
+        {**qk_rows, "qk_rstd": T_r * H_qk * QK_RSTD_BYTES if replays_prep else 0}
+        if l2n
+        else {}
+    )
+    l2n_sum = sum(bwd_l2n.values())
+    bwd = {**bwd_pools, **bwd_fwd_tapes_end, **bwd_tapes, **bwd_l2n}
     # the backward's phases (the host drops the exchange pools after the adjoint merge, the staging planes before the
     # adjoint tape walk and carry / b2_recv before #8; the kept entry is re-adopted after #8)
     pools_exchange = sum(bwd_pools.values())
@@ -525,14 +573,19 @@ def gdn_det_workspace_layout_kcp(
     )
     fwd_arena = sum(bwd_fwd_tapes.values())
     phase_exchange = (
-        pools_exchange + fwd_arena + bwd_tapes["do_g"] + bwd_tapes["dv_intra"]
+        pools_exchange + fwd_arena + bwd_tapes["do_g"] + bwd_tapes["dv_intra"] + l2n_sum
     )
     phase_walk = phase_exchange - pools_exchange + pools_walk + bwd_tapes["dh_tape"]
-    phase_end = pools_end + sum(bwd_fwd_tapes_end.values()) + sum(bwd_tapes.values())
+    phase_end = (
+        pools_end + sum(bwd_fwd_tapes_end.values()) + sum(bwd_tapes.values()) + l2n_sum
+    )
     phases = {"exchange": phase_exchange, "walk": phase_walk, "end": phase_end}
     if kept:
-        # the recompute forward of the kept form drops no tape before handing all ten over
-        phases["recompute_forward"] = sum(fwd_pools.values()) + light_sum
+        # the recompute forward of the kept form drops no tape before handing all ten over (its qn / kn are live
+        # through its tape walk like any forward's)
+        phases["recompute_forward"] = (
+            sum(fwd_pools.values()) + light_sum + sum(qk_rows.values())
+        )
     out = {f"fwd.{k}": v for k, v in fwd.items()}
     if backward:
         out.update({f"bwd.{k}": v for k, v in bwd.items()})
@@ -567,6 +620,7 @@ def gdn_det_workspace_bytes_kcp(
     P: int | None = None,
     group_reduce: str = "fused",
     reuse_recompute_tapes: bool | str | None = None,
+    use_qk_l2norm_in_kernel: bool = False,
 ) -> int:
     """Caller-held workspace bytes of one rank (the ``workspace`` entry of :func:`gdn_det_workspace_layout_kcp`): the
     most the workspace binds in the forward or the backward of these options."""
@@ -583,6 +637,7 @@ def gdn_det_workspace_bytes_kcp(
         P=P,
         group_reduce=group_reduce,
         reuse_recompute_tapes=reuse_recompute_tapes,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )["workspace"]
 
 
@@ -594,6 +649,8 @@ __all__ = [
     "TICKET_SITES",
     "TICKET_SLOT_BYTES",
     "EYE_BYTES",
+    "QK_ROW_BF16",
+    "QK_RSTD_BYTES",
     "FWD_TAPES_ARENA_AFTER_FWD",
     "FWD_TAPES_DEAD_AFTER_PREP",
     "TAPE_NAME_OF",

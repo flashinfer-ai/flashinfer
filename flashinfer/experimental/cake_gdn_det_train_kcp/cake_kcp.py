@@ -85,6 +85,18 @@ qscale, dg_part`` FP32 ``[R, HV]``; ``gamma, gamma_dot`` FP32 ``[NC_pad, HV]``;
 ``h_tape, dh_tape`` BF16 ``[NC_pad, HV, 128, 128]``.  Head mapping of a value
 head ``hv`` to its Q/K head: ``hv // r``.
 
+In-kernel Q / K L2 norm (``use_qk_l2norm_in_kernel=True``, default ``False``): ``q`` / ``k`` stay the raw operands
+(the convolution's output views); #1 runs as ``fwd_prep_l2n``, which writes the normalized rows ``qn`` / ``kn``
+(BF16 ``[T_r, H_qk, 128]``, transient arena tapes) and the FP32 ``r = 1 / sqrt(sum q^2 + 1e-6)`` of q and k
+(``qk_rstd`` ``[2, T_r, H_qk]``) before its own body; every other q / k reader (#2, #3, #5, #7, #8) is the unchanged
+program bound to ``qn`` / ``kn``; #8 runs as ``bwd_dqkg_l2n``, which applies the norm's pullback (from the raw rows
+and the saved ``r``) before the one BF16 rounding of ``dq`` / ``dk`` (``group_reduce="host"``: the unchanged #8 and the
+pullback of :mod:`.cake_l2n` on the host, chunked by token blocks).  The saved set gains ``qk_rstd`` only
+(``KCP_SAVED_VERSION`` 2); ``qn`` / ``kn`` never outlive a call: the forward drops ``kn`` before its output and
+``qn`` after #5; the backward gets them from #1_l2n again (light replay, replay mode) or from ``qk_apply``
+(``qn = bf16(q * r)`` from the saved ``r``: ``save_mode="full"`` and the kept recompute tapes) and drops them after #8.
+The numeric orders are :mod:`.cake_l2n`'s (FTZ off), bitwise the device programs'.
+
 This module reads tensor contents nowhere (no ``.item()``, no ``.tolist()``
 of a device tensor, no device synchronisation), dispatches from metadata and
 the SM count only, allocates the outputs and the saved set fresh per call and
@@ -102,7 +114,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from . import cake_kcp_plan
+from . import cake_kcp_plan, cake_l2n
 from . import cake_options as _opt
 from .cake_bytes import TICKET_SITES, TICKET_SLOT_BYTES
 from .cake_options import OptionsDetKcp, make_options, validate_heads, validate_ring
@@ -122,7 +134,9 @@ OFFSET_CLASSES = _opt.OFFSET_CLASSES
 RING_MAX_HOPS = _opt.RING_MAX_HOPS
 GRAPH_MODES = _opt.GRAPH_MODES
 GRAPH_DEFAULT = _opt.GRAPH_DEFAULT
-KCP_SAVED_VERSION = 1  # saved set {S_in [, c1 receive tensor, M_seg] [, forward tapes]}
+KCP_SAVED_VERSION = (
+    2  # saved set {S_in [, c1 receive tensor, M_seg] [, forward tapes] [, qk_rstd]}
+)
 COLLECTIVES = ("c1", "c2", "b1", "b2")
 COLS_RULE_CHAINS = 24  # by_chains: <= 24 concurrent 128-column state chains -> c8, otherwise c16; map launches stay c16
 
@@ -139,8 +153,21 @@ PROGRAMS = (
     "kcp_dhu_tape",  # #7 program=tape: reverse walk from an indexed final adjoint, dh / dv_new tapes
     "bwd_dqkg",  # #8: dq, dk (grouped FP32 reduction), dv, dbeta, dg partials
     "gate_epilogue",  # #9: dg from the partials (reverse cumsum + chunk term), dbeta pass-through
+    "fwd_prep_l2n",  # #1 with the in-kernel Q / K L2 norm: qn / kn / rstd first, then #1's body on qn / kn
+    "bwd_dqkg_l2n",  # #8 on qn / kn with the norm's pullback before the BF16 rounding of dq / dk (group_reduce = 1)
+    "qk_apply",  # qn = bf16(q * r), kn likewise, from the saved rstd (backward of save_mode="full" / kept tapes)
 )
-LOCAL_PROGRAMS = ("fwd_prep", "fwd_o", "bwd_prep", "bwd_dqkg", "gate_epilogue")
+# The in-kernel Q / K L2 norm programs (``use_qk_l2norm_in_kernel``): #1 and #8 run as their ``_l2n`` siblings, and
+# ``qk_apply`` rebuilds ``qn`` / ``kn`` where the backward has no #1 replay.
+L2N_PROGRAMS = ("fwd_prep_l2n", "bwd_dqkg_l2n", "qk_apply")
+LOCAL_PROGRAMS = (
+    "fwd_prep",
+    "fwd_o",
+    "bwd_prep",
+    "bwd_dqkg",
+    "gate_epilogue",
+    *L2N_PROGRAMS,
+)
 WALK_PROGRAMS = (
     "kcp_fwdh_offset",
     "kcp_fwdh_tape",
@@ -160,6 +187,9 @@ TART_MODULE_OF = {
     "kcp_dhu_tape": "gdn_chunk_det_dhu_v1_kcp",
     "bwd_dqkg": "gdn_chunk_det_train_bwd_dqkg_v1",
     "gate_epilogue": "gdn_chunk_det_train_gate_epilogue_v1",
+    "fwd_prep_l2n": "gdn_chunk_det_train_fwd_prep_l2n_v1",
+    "bwd_dqkg_l2n": "gdn_chunk_det_train_bwd_dqkg_l2n_v1",
+    "qk_apply": "gdn_chunk_det_train_qk_apply_v1",
 }
 # Registry record names (``cake_jit.MODULES`` / ``TEST_MODULES``): ``<program>[_<variant>]`` -- the merge records
 # ``kcp_affine_merge_c8`` / ``_c16`` by ``ncols`` / ``cols_per_cta``; the transfer walk's test-only programs
@@ -367,6 +397,49 @@ PROGRAM_ARGS: dict[str, tuple[str, ...]] = {
 }
 PROGRAM_ARGS["kcp_fwdh_tape"] = PROGRAM_ARGS["kcp_fwdh_offset"]
 PROGRAM_ARGS["kcp_dhu_tape"] = PROGRAM_ARGS["kcp_dhu_offset"]
+# The in-kernel Q / K L2 norm: the extra logical names of the two siblings over #1 / #8 and the arguments of
+# ``qk_apply``.  #1_l2n reads the RAW ``q`` / ``k`` (TMA, as #1) and writes ``qn`` / ``kn`` (contiguous
+# ``[T_r, H_qk, 128]``) and ``q_rstd`` / ``k_rstd`` (the two planes of ``qk_rstd``, token stride ``rstd_tstride =
+# H_qk``); #8_l2n reads ``q`` / ``k`` = ``qn`` / ``kn`` through #8's TMA and the raw rows ``q_raw`` / ``k_raw``
+# (token strides ``q_raw_tstride`` / ``k_raw_tstride`` in elements: packed-QKV views pass through) with the rstd
+# planes.  Norm-off launches pass exactly the v1 values.
+PROGRAM_ARGS_L2N: dict[str, tuple[str, ...]] = {
+    "fwd_prep_l2n": ("qn", "kn", "q_rstd", "k_rstd", "rstd_tstride"),
+    "bwd_dqkg_l2n": (
+        "q_raw",
+        "k_raw",
+        "q_raw_tstride",
+        "k_raw_tstride",
+        "rstd_tstride",
+        "q_rstd",
+        "k_rstd",
+    ),
+}
+PROGRAM_ARGS["fwd_prep_l2n"] = (
+    PROGRAM_ARGS["fwd_prep"] + PROGRAM_ARGS_L2N["fwd_prep_l2n"]
+)
+PROGRAM_ARGS["bwd_dqkg_l2n"] = (
+    PROGRAM_ARGS["bwd_dqkg"][:-1]
+    + PROGRAM_ARGS_L2N["bwd_dqkg_l2n"]
+    + (
+        "ticket",
+    )  # the persistent #8's ticket stays last (the bwd_dqkg launch site's slot)
+)
+PROGRAM_ARGS["qk_apply"] = (
+    "q_raw",
+    "k_raw",
+    "q_raw_tstride",
+    "k_raw_tstride",
+    "q_rstd",
+    "k_rstd",
+    "rstd_tstride",
+    "num_qk_heads",
+    *_LOCAL_TABLE_ARGS,
+    "qn",
+    "kn",
+)
+# the norm-off program each sibling replaces (the launch site: its ticket slot, its place in the sequence)
+L2N_SIBLING_OF = {"fwd_prep": "fwd_prep_l2n", "bwd_dqkg": "bwd_dqkg_l2n"}
 # Every host argument is a registry logical name since the registry follows the frozen kernel ABIs (K4 ABI: #8 takes
 # ``group_reduce`` / ``dq_part`` / ``dk_part`` / the token strides; #6 ``do_tstride``; the persistent programs
 # ``num_seqs``).  ``PROVISIONAL_ARGS`` names the values a registry may not bind yet: the persistent programs'
@@ -418,6 +491,16 @@ FWD_TAPES = (
     "v_new",
 )
 BWD_TAPES = ("do_g", "dv_intra", "dh_tape", "dv_new", "dg_part", "gamma_dot")
+# In-kernel Q / K L2 norm: the normalized rows (BF16 ``[T_r, H_qk, 128]``, contiguous) and the FP32 ``r`` of q and k
+# (``[2, T_r, H_qk]``: plane 0 = q, plane 1 = k).  Arena tapes of the call that writes them (never saved): the forward
+# drops ``kn`` before its output (the tape walks were its last readers) and ``qn`` after #5; the backward drops both
+# with the arena ``qk_rstd`` after #8 (or the host reduction).  A forward that keeps a saved set writes a fresh
+# ``qk_rstd`` (the saved set's tensor, bound in ``CallDetKcp.bufs``); the light replay's #1_l2n writes the arena one.
+QK_TAPES: tuple[str, ...] = ("qn", "kn")
+QK_RSTD = "qk_rstd"
+# group_reduce="host" with the norm: the FP32 group sum and the pullback run per block of this many tokens (the same
+# per-token order), so the host temporaries stay at a few block-sized FP32 planes instead of full [T_r, H_qk, 128] ones
+HOST_L2N_BLOCK_TOKENS = 2048
 # Tapes that share one buffer (host-side aliasing, no kernel change): #7 stores ``dv_new`` in place of ``dv_intra``.
 # The walk visits every token row once and reads the row's ``dv_intra`` before it stores the row's ``dv_new``; the
 # offset program only reads; #8 reads ``dv_new`` only.  The two names resolve to one ``[R, HV, 128]`` BF16 buffer
@@ -469,6 +552,7 @@ SAVED_TENSOR_OF_BUFFER: dict[str, str] = {
     "S_in": "S_in",
     "c1_recv": "c1_recv",
     "stage_m": "M_seg",
+    QK_RSTD: QK_RSTD,
 }
 # Pools dead once the adjoint exchange is merged (a2a form): the forward exchange pools (the backward never exchanges
 # through them) and b1 (sent and merged).  They go before the document-end adjoint walk that the overlap schedule
@@ -632,8 +716,11 @@ def _handle_key(
     precision_mode,
     offset_class,
     transfer_walk,
+    qk_l2norm,
 ) -> tuple:
-    """What a handle entry must match to stand in for the recompute's exchange: the problem and the programs."""
+    """What a handle entry must match to stand in for the recompute's exchange: the problem and the programs.
+    ``qk_l2norm`` (``use_qk_l2norm_in_kernel``): ``S_in`` is a function of the keys the walks read (``kn`` with the
+    norm), so an entry of the other form is refused."""
     return (
         T_r,
         H_qk,
@@ -645,6 +732,7 @@ def _handle_key(
         precision_mode,
         offset_class,
         transfer_walk,
+        bool(qk_l2norm),
     )
 
 
@@ -901,10 +989,15 @@ def _kept_take(key: tuple) -> _KeptTapes | None:
 
 
 def tape_spec(
-    name: str, *, R: int, NC_pad: int, HV: int, T: int
+    name: str, *, R: int, NC_pad: int, HV: int, T: int, H_qk: int | None = None
 ) -> tuple[tuple[int, ...], torch.dtype]:
-    """``(shape, dtype)`` of tape ``name`` for the padded geometry."""
+    """``(shape, dtype)`` of tape ``name`` for the padded geometry (``H_qk``: the Q / K head count of the in-kernel
+    L2 norm tapes :data:`QK_TAPES` / :data:`QK_RSTD`, token rows ``T``)."""
     bf, f32 = torch.bfloat16, torch.float32
+    if name in QK_TAPES or name == QK_RSTD:
+        if H_qk is None:
+            raise KeyError(f"tape {name!r} needs H_qk")
+        return ((T, int(H_qk), D), bf) if name in QK_TAPES else ((2, T, int(H_qk)), f32)
     if name in ("w", "u", "v_new", "do_g", "dv_intra", "dv_new"):
         return (R, HV, D), bf
     if name in ("aqk", "akk"):
@@ -1167,6 +1260,18 @@ def _registry() -> Any | None:
     return cake_jit
 
 
+def l2n_records_shipped() -> bool:
+    """Whether the registry ships a record of every in-kernel Q / K L2 norm program (:data:`L2N_PROGRAMS`): the
+    kernel backend runs ``use_qk_l2norm_in_kernel=True`` only then; the fake backend emulates them either way."""
+    jit = _registry()
+    if jit is None:
+        return False
+    try:
+        return all(jit.records_of_program(p) for p in L2N_PROGRAMS)
+    except ValueError:  # a registry that does not know the programs
+        return False
+
+
 def resolve_launch(
     name: str, args: dict[str, Any], *, cols_per_cta: int = 8
 ) -> tuple[str, dict[str, Any], tuple[int, int, int], bool]:
@@ -1199,6 +1304,20 @@ def resolve_launch(
         )
     call = args.get("_call")
     jit = _registry()
+    if name in L2N_PROGRAMS and not l2n_records_shipped():
+        # an in-kernel L2 norm program the registry does not render yet: the record is the program name (the fake
+        # backend's emulation; the kernel backend refuses it before any launch), the grid its host plan's rule
+        record = RECORD_OF[name]
+        grid = (int(args["_grid"]), 1, 1)
+        if (
+            jit is not None
+            and grid_args
+            and record in getattr(jit, "L2N_RECORD_PLANS", {})
+        ):
+            grid = tuple(int(x) for x in jit.launch_grid(record, **grid_args))
+        if call is not None:
+            call.records.append((record, grid))
+        return record, values, grid, False
     if jit is not None and not explicit:
         per_head = 2 if vh == 64 else 1
         select = dict(ncols=values.get("ncols"), precision_mode=pm, transfer_walk=tw)
@@ -1256,6 +1375,12 @@ def resolve_launch(
     return str(record), values, grid, is_test
 
 
+_L2N_NOT_SHIPPED = (
+    "use_qk_l2norm_in_kernel=True needs the in-kernel Q / K L2 norm programs (fwd_prep_l2n, bwd_dqkg_l2n, qk_apply), "
+    "which this package's registry does not ship yet; use backend='fake' (the torch emulation) or the norm-off route"
+)
+
+
 class KernelBackend(Backend):
     """The shipped backend: the exported programs through the package's launch glue (:mod:`.cake_backend`
     ``run_module(record, values, *, grid, device_index, module=None)``, imported at the first launch so this module
@@ -1297,6 +1422,8 @@ class KernelBackend(Backend):
 
     def run(self, name: str, args: dict[str, Any]) -> None:
         call: CallDetKcp = args["_call"]
+        if name in L2N_PROGRAMS and not l2n_records_shipped():
+            raise RuntimeError(_L2N_NOT_SHIPPED)
         be = self.launcher()
         device_index = (
             call.device.index
@@ -2273,6 +2400,8 @@ class WorkspaceDetKcp:
             None  # u32 [len(TICKET_SITES) * 32]: one 128-byte slot per site
         )
         self.geometry: tuple[int, int, int, int] | None = None  # (R, NC_pad, HV, T)
+        # the Q / K head count of the in-kernel L2 norm tapes (QK_TAPES / QK_RSTD: [T, H_qk, ...]); the last ensure()'s
+        self.qk_heads: int | None = None
         if ctx is not None:
             if H_qk is None or HV is None:
                 raise ValueError("WorkspaceDetKcp: H_qk and HV are required with ctx")
@@ -2341,6 +2470,10 @@ class WorkspaceDetKcp:
         if self.geometry != geometry:
             self._tapes.clear()  # another padded geometry: the tapes are reallocated on first use
             self.geometry = geometry
+        if self.qk_heads != int(H_qk):
+            for name in (*QK_TAPES, QK_RSTD):  # the L2 norm tapes are [T, H_qk, ...]
+                self._tapes.pop(name, None)
+            self.qk_heads = int(H_qk)
         return tb
 
     def ticket(self, site: str) -> torch.Tensor:
@@ -2383,7 +2516,9 @@ class WorkspaceDetKcp:
                     "WorkspaceDetKcp: no tape geometry bound (ensure() first)"
                 )
             R, NC_pad, HV, T = self.geometry
-            shape, dtype = tape_spec(name, R=R, NC_pad=NC_pad, HV=HV, T=T)
+            shape, dtype = tape_spec(
+                name, R=R, NC_pad=NC_pad, HV=HV, T=T, H_qk=self.qk_heads
+            )
             t = self._tapes[name] = _alloc(shape, dtype, self.device)
         return t
 
@@ -2403,7 +2538,9 @@ class WorkspaceDetKcp:
         ):
             return False
         R, NC_pad, HV, T = self.geometry
-        shape, dtype = tape_spec(name, R=R, NC_pad=NC_pad, HV=HV, T=T)
+        shape, dtype = tape_spec(
+            name, R=R, NC_pad=NC_pad, HV=HV, T=T, H_qk=self.qk_heads
+        )
         if tuple(t.shape) != tuple(shape) or t.dtype != dtype:
             return False
         self._tapes[name] = t
@@ -2440,7 +2577,9 @@ class SavedDetKcp:
     """The saved context of one forward (``boundary_mode="saved"``): ``S_in`` (the fresh c2 output), the owner's c1
     receive tensor (``save_transfer``), ``M_seg`` (``save_transfer`` at ``P > 1``), the saved tapes of the
     ``save_mode`` (:func:`saved_tapes`: none in ``"light"``, every forward tape in ``"full"``) and the scalars of the
-    call.  Every
+    call.  With ``use_qk_l2norm_in_kernel`` (``qk_l2norm``) it also carries ``qk_rstd``, the FP32 ``r`` of q and k
+    ``[2, T_r, H_qk]`` (after the tapes in :meth:`tensors`; its presence follows ``meta()["qk_l2norm"]``, so
+    :meth:`flags` keeps its three entries).  Every
     tensor is fresh per call and travels through ``save_for_backward`` only (#7039).  ``kept`` (never saved, never
     compared: not in ``tensors()`` / ``flags()`` / ``meta()``) is the recompute forward's tape hand-off of
     ``reuse_recompute_tapes`` on its way through the autograd Function's backward; ``None`` everywhere else."""
@@ -2464,6 +2603,8 @@ class SavedDetKcp:
     precision_mode: int
     transfer_walk: str
     ctx: Any
+    qk_rstd: torch.Tensor | None = None
+    qk_l2norm: bool = False
     kept: Any = dataclasses.field(default=None, compare=False, repr=False)
     # The backward may forget ``S_in`` / ``c1_recv`` / ``M_seg`` at their last reader (:meth:`forget`): set by the
     # autograd Function on the set it rebuilds from ``save_for_backward`` (nothing else references those tensors
@@ -2480,6 +2621,8 @@ class SavedDetKcp:
             out.append(self.M_seg)
         if self.tapes is not None:
             out.extend(self.tapes)
+        if self.qk_l2norm:
+            out.append(self.qk_rstd)
         return tuple(out)
 
     def flags(self) -> tuple[bool, ...]:
@@ -2505,6 +2648,7 @@ class SavedDetKcp:
             "exchange": self.exchange,
             "precision_mode": self.precision_mode,
             "transfer_walk": self.transfer_walk,
+            "qk_l2norm": self.qk_l2norm,
         }
 
     @classmethod
@@ -2525,8 +2669,15 @@ class SavedDetKcp:
             if has_tapes
             else None
         )
+        qk_rstd = next(it) if meta.get("qk_l2norm") else None
         return cls(
-            S_in=S_in, c1_recv=c1_recv, M_seg=M_seg, tapes=tapes, ctx=ctx, **meta
+            S_in=S_in,
+            c1_recv=c1_recv,
+            M_seg=M_seg,
+            tapes=tapes,
+            ctx=ctx,
+            qk_rstd=qk_rstd,
+            **meta,
         )
 
     def tape(self, name: str) -> torch.Tensor:
@@ -2538,16 +2689,18 @@ class SavedDetKcp:
         return self.tapes[names.index(name)]
 
     def forget(self, name: str) -> None:
-        """Drop this set's reference to ``name`` (``S_in`` / ``c1_recv`` / ``M_seg``) once the backward's last reader
+        """Drop this set's reference to ``name`` (``S_in`` / ``c1_recv`` / ``M_seg`` / ``qk_rstd``) once the backward's last reader
         of it has run (``release_in_backward``): the bytes return to the allocator before the backward's next
         allocation.  Frozen dataclass, hence ``object.__setattr__``."""
-        if name not in ("S_in", "c1_recv", "M_seg"):
+        if name not in ("S_in", "c1_recv", "M_seg", QK_RSTD):
             raise KeyError(f"saved: {name!r} is not a saved-set tensor")
         object.__setattr__(self, name, None)
 
     @property
     def bytes(self) -> int:
-        return sum(t.numel() * t.element_size() for t in self.tensors())
+        return sum(
+            t.numel() * t.element_size() for t in self.tensors() if t is not None
+        )
 
 
 def _exchange_scheme(tb: _Tables, opts: OptionsDetKcp) -> str:
@@ -2625,6 +2778,8 @@ class CallDetKcp:
             None  # "packed" | "separate" (the backward's dq / dk / dv)
         )
         self.exchange = _exchange_scheme(tb, opts)
+        # use_qk_l2norm_in_kernel: the q / k readers bind qn / kn (:meth:`qk`), #1 / #8 run as their _l2n siblings
+        self.l2n = bool(opts.use_qk_l2norm_in_kernel)
         self.precision_mode = int(opts.precision_mode)
         self.transfer_walk = str(opts.transfer_walk)
         self.schedule = str(opts.knob("schedule"))
@@ -2673,6 +2828,27 @@ class CallDetKcp:
             t = self.tapes[name] = self.ws.tape(name)
         return t
 
+    def qk(self, name: str) -> torch.Tensor:
+        """The ``q`` / ``k`` a reader program binds: the raw operand, or with ``use_qk_l2norm_in_kernel`` the
+        normalized rows ``qn`` / ``kn`` (arena tapes #1_l2n / ``qk_apply`` wrote).  ``ops["q"]`` / ``ops["k"]`` stay
+        the raw operands (packed-gradient detection, the kept-tape key, #1_l2n's and #8_l2n's raw inputs)."""
+        if not self.l2n:
+            return self.ops[name]
+        return self.tape("qn" if name == "q" else "kn")
+
+    def rstd_out(self) -> torch.Tensor:
+        """Where #1_l2n writes ``r``: a forward's fresh saved-set tensor (bound in ``bufs`` when it keeps a saved
+        set), else the arena tape (a forward without a saved set, the replay-mode forward, the light replay -- a
+        backward never writes the saved tensor)."""
+        t = None if self.backward else self.bufs.get(QK_RSTD)
+        return t if t is not None else self.tape(QK_RSTD)
+
+    def rstd_in(self) -> torch.Tensor:
+        """The ``r`` the pullback and ``qk_apply`` read: the saved set's (bound in ``bufs``), else the arena's (the
+        replay mode: its own #1_l2n wrote it)."""
+        t = self.bufs.get(QK_RSTD)
+        return t if t is not None else self.tape(QK_RSTD)
+
     def release_tapes(self, names: Sequence[str], *, keep: Sequence[str] = ()) -> None:
         """Unbind the arena tapes ``names`` (never one of ``keep``: the saved tapes stay bound) and drop them from
         the arena, returning their memory to the allocator before this call's next allocation."""
@@ -2706,7 +2882,9 @@ class CallDetKcp:
         """Bind fresh tensors for the tapes ``names`` (the saved tapes of ``save_mode="full"``)."""
         R, NC_pad, HV, T = int(self.ctx.R), int(self.ctx.NC_pad), self.HV, self.T_r
         for name in names:
-            shape, dtype = tape_spec(name, R=R, NC_pad=NC_pad, HV=HV, T=T)
+            shape, dtype = tape_spec(
+                name, R=R, NC_pad=NC_pad, HV=HV, T=T, H_qk=self.H_qk
+            )
             self.tapes[name] = _alloc(shape, dtype, self.device)
 
     def dev(
@@ -2776,7 +2954,7 @@ class CallDetKcp:
             h0 = self.block(kw.get("h0") if tape else None)
             out = self.block(None if tape else kw.get("out"))
             args.update(
-                k=self.ops["k"],
+                k=self.qk("k"),
                 w=self.tape("w"),
                 u=self.tape("u"),
                 rowscale=self.tape("rowscale"),
@@ -2790,7 +2968,7 @@ class CallDetKcp:
         elif name == "kcp_transfer_walk":
             out = self.block(kw["out"])
             args.update(
-                k=self.ops["k"],
+                k=self.qk("k"),
                 w=self.tape("w"),
                 u=self.tape("u"),
                 rowscale=self.tape("rowscale"),
@@ -2810,8 +2988,8 @@ class CallDetKcp:
             )  # the unused pool is the zero block (see above)
             out = self.block(None if tape else kw.get("out"))
             args.update(
-                q=self.ops["q"],
-                k=self.ops["k"],
+                q=self.qk("q"),
+                k=self.qk("k"),
                 w=self.tape("w"),
                 do_g=self.tape("do_g"),
                 dv_intra=self.tape("dv_intra"),
@@ -2934,17 +3112,26 @@ class CallDetKcp:
         }
 
     def local(self, name: str) -> None:
-        """A chunk-local program (#1, #5, #6, #8, #9) over this rank's tokens (skipped without tokens)."""
+        """A chunk-local program (#1, #5, #6, #8, #9, ``qk_apply``) over this rank's tokens (skipped without
+        tokens).  With ``use_qk_l2norm_in_kernel`` ``fwd_prep`` launches ``fwd_prep_l2n`` and the fused
+        ``bwd_dqkg`` launches ``bwd_dqkg_l2n`` (:data:`L2N_SIBLING_OF`); ``group_reduce="host"`` keeps #8 itself
+        (on ``qn`` / ``kn``) and applies the pullback in :meth:`host_group_reduce`."""
         if self.T_r == 0:
             return
-        if name not in LOCAL_PROGRAMS:
+        if name not in LOCAL_PROGRAMS or name in L2N_SIBLING_OF.values():
             raise ValueError(f"{name} is not a local program")
+        if name == "qk_apply" and not self.l2n:
+            raise ValueError("qk_apply runs with use_qk_l2norm_in_kernel only")
+        program = name
+        if self.l2n and name in L2N_SIBLING_OF:
+            if name == "fwd_prep" or self.opts.group_reduce != "host":
+                program = L2N_SIBLING_OF[name]
         self.counters["locals"] += 1
         o, NC = self.ops, int(self.ctx.NC)
         args = self._local_common()
         if name == "fwd_prep":
             args.update(
-                q=o["q"],
+                q=o["q"],  # #1 / #1_l2n read the raw rows
                 k=o["k"],
                 v=o["v"],
                 g=o["g"],
@@ -2959,10 +3146,35 @@ class CallDetKcp:
                 qscale=self.tape("qscale"),
                 gamma=self.tape("gamma"),
             )
+            if program == "fwd_prep_l2n":
+                rstd = self.rstd_out()
+                args.update(
+                    qn=self.tape("qn"),
+                    kn=self.tape("kn"),
+                    q_rstd=rstd[0],
+                    k_rstd=rstd[1],
+                    rstd_tstride=self.H_qk,
+                )
+            grid = NC * self.H_qk
+        elif name == "qk_apply":
+            args.pop("num_heads")
+            args.pop("num_seqs")
+            rstd = self.rstd_in()
+            args.update(
+                q_raw=o["q"],
+                k_raw=o["k"],
+                q_raw_tstride=int(o["q"].stride(0)),
+                k_raw_tstride=int(o["k"].stride(0)),
+                q_rstd=rstd[0],
+                k_rstd=rstd[1],
+                rstd_tstride=self.H_qk,
+                qn=self.tape("qn"),
+                kn=self.tape("kn"),
+            )
             grid = NC * self.H_qk
         elif name == "fwd_o":
             args.update(
-                q=o["q"],
+                q=self.qk("q"),
                 h_tape=self.tape("h_tape"),
                 v_new=self.tape("v_new"),
                 aqk=self.tape("aqk"),
@@ -2992,8 +3204,8 @@ class CallDetKcp:
         elif name == "bwd_dqkg":
             host = self.opts.group_reduce == "host"
             args.update(
-                q=o["q"],
-                k=o["k"],
+                q=self.qk("q"),
+                k=self.qk("k"),
                 v=o["v"],
                 do=o["dout"],
                 h_tape=self.tape("h_tape"),
@@ -3032,6 +3244,17 @@ class CallDetKcp:
                 dv_tstride=int(self.grads["dv"].stride(0)),
                 ticket=self.ws.ticket(name),
             )
+            if program == "bwd_dqkg_l2n":
+                rstd = self.rstd_in()
+                args.update(
+                    q_raw=o["q"],
+                    k_raw=o["k"],
+                    q_raw_tstride=int(o["q"].stride(0)),
+                    k_raw_tstride=int(o["k"].stride(0)),
+                    rstd_tstride=self.H_qk,
+                    q_rstd=rstd[0],
+                    k_rstd=rstd[1],
+                )
             grid = NC * self.H_qk
         else:  # gate_epilogue
             args.pop("num_qk_heads")
@@ -3043,7 +3266,7 @@ class CallDetKcp:
             )
             grid = NC * self.HV
         self.kernel(
-            name,
+            program,
             grid,
             _grid_args={
                 "num_chunks": NC,
@@ -3058,11 +3281,28 @@ class CallDetKcp:
 
     def host_group_reduce(self) -> None:
         """``group_reduce="host"``: the ``r`` value heads' FP32 ``dq`` / ``dk`` partials summed in a fixed order
-        (head ``0``, then ``+1``, ...) and rounded once to BF16 into the outputs."""
+        (head ``0``, then ``+1``, ...) and rounded once to BF16 into the outputs.  With ``use_qk_l2norm_in_kernel``
+        the FP32 sum goes through the norm's pullback (:func:`.cake_l2n.l2n_pullback`: the raw rows and ``r``) before
+        the rounding, per block of :data:`HOST_L2N_BLOCK_TOKENS` tokens (the same per-token order)."""
         if self.T_r == 0:
             return
         self.counters["launches"] += 1
         self.sequence.append("host_group_reduce")
+        if self.l2n:
+            rstd = self.rstd_in()
+            for plane, (part, name) in enumerate(
+                (("dq_part", "dq"), ("dk_part", "dk"))
+            ):
+                p = self.tape(part).view(self.T_r, self.H_qk, self.r, D)
+                x, r_t, out = self.ops[name[1]], rstd[plane], self.grads[name]
+                for t0 in range(0, self.T_r, HOST_L2N_BLOCK_TOKENS):
+                    t1 = min(self.T_r, t0 + HOST_L2N_BLOCK_TOKENS)
+                    acc = p[t0:t1, :, 0]
+                    for j in range(1, self.r):
+                        acc = acc + p[t0:t1, :, j]
+                    dx = cake_l2n.l2n_pullback(x[t0:t1], r_t[t0:t1], acc)
+                    out[t0:t1].copy_(dx.to(out.dtype))
+            return
         for part, name in (("dq_part", "dq"), ("dk_part", "dk")):
             p = self.tape(part).view(self.T_r, self.H_qk, self.r, D)
             acc = p[:, :, 0]
@@ -3215,6 +3455,19 @@ def _record(kind: str, call: CallDetKcp) -> None:
         "recompute_handle": call.scratch.get(
             "recompute_handle"
         ),  # forward: None | "capture" (stored S_in in the handle) | "replay" (S_in from the handle, no exchange)
+        "qk_l2norm": call.l2n,  # use_qk_l2norm_in_kernel
+        # where qn / kn came from: forward "fwd_prep" (#1_l2n); backward "recompute" (the replay mode's forward),
+        # "replay" (the light replay's #1_l2n) or "qk_apply" (save_mode="full" / kept tapes); None without the norm
+        "qk_source": call.scratch.get("qk_source"),
+        # the r #1_l2n wrote (forward: "fresh" = the saved set's tensor, "arena") / the pullback read (backward:
+        # "saved", "arena" in the replay mode); None without the norm
+        "rstd_source": call.scratch.get("rstd_source"),
+        "arena_tapes": sorted(
+            call.ws._tapes
+        ),  # the tapes bound in the workspace arena when the call ended
+        "qk": call.scratch.get(
+            "qk"
+        ),  # test knob record_qk: {"qn", "kn", "rstd"[, "rstd_regen", "rstd_regen_equal"]} copies
     }
 
 
@@ -3660,7 +3913,24 @@ def _forward(
         keep
     ):  # the saved tapes are fresh per call (light: none; full: every forward tape)
         call.fresh_tapes(saved_tapes(opts.save_mode))
+    if call.l2n:
+        # the saved set's r: fresh, written by #1_l2n directly (the arena r of a forward without a saved set and of
+        # the replay-mode forward is dropped after #1 / kept for the pullback)
+        if keep:
+            call.bufs[QK_RSTD] = _alloc(
+                (2, call.T_r, call.H_qk), torch.float32, call.device
+            )
+        call.scratch["qk_source"] = "recompute" if replay else "fwd_prep"
+        if call.backward:
+            call.scratch["rstd_source"] = "arena"
+        else:
+            call.scratch["rstd_source"] = "fresh" if keep else "arena"
     call.local("fwd_prep")
+    if call.l2n and call.opts.knob("record_qk") and not call.backward:
+        _record_qk(call)
+    if call.l2n and not replay and opts.graph == "off":
+        # no forward program reads r: the arena copy goes now (the saved set's fresh one is not in the arena)
+        call.release_tapes((QK_RSTD,))
     if not replay and opts.graph == "off" and not hand_off:
         # #1's backward-only outputs leave the arena now (FWD_DEAD_AFTER_PREP); a saved copy (save_mode="full") is a
         # fresh tensor bound in call.tapes and stays.  A replay keeps them for #6 / #8; so does a hand-off forward.
@@ -3748,6 +4018,23 @@ def _forward(
         }
     # #5 is launched by _fwd_body (never in a replay; not by a recompute whose output is provably dead) once this
     # frame and its views of the pools are gone
+
+
+def _record_qk(call: CallDetKcp, regen: bool = False) -> None:
+    """Test knob ``record_qk``: copies of ``qn`` / ``kn`` and of the ``r`` the call's programs read (forward: the one
+    #1_l2n wrote); ``regen`` (the light backward): also the arena ``r`` its #1_l2n replay wrote and whether it equals
+    the saved one bitwise (a content read: test knob only)."""
+    if call.T_r == 0:
+        return
+    rec = {
+        "qn": call.tape("qn").clone(),
+        "kn": call.tape("kn").clone(),
+        "rstd": (call.rstd_out() if not call.backward else call.rstd_in()).clone(),
+    }
+    if regen:
+        rec["rstd_regen"] = call.tape(QK_RSTD).clone()
+        rec["rstd_regen_equal"] = bool(torch.equal(rec["rstd_regen"], rec["rstd"]))
+    call.scratch["qk"] = rec
 
 
 def _replay_tapes(call: CallDetKcp, saved: SavedDetKcp) -> None:
@@ -3848,6 +4135,11 @@ def _backward(call: CallDetKcp, saved: SavedDetKcp | None) -> None:
         m_source = "c1"
         call.scratch["tapes_source"] = "recompute"
     else:
+        if call.l2n:
+            # the forward's r: read by the pullback (and qk_apply), never written here (the light replay's #1_l2n
+            # writes the arena r)
+            call.bufs[QK_RSTD] = saved.qk_rstd
+            call.scratch["rstd_source"] = "saved"
         call.bufs["S_in"] = saved.S_in
         m_source = "b1"
         if saved.c1_recv is not None:
@@ -3874,7 +4166,15 @@ def _backward(call: CallDetKcp, saved: SavedDetKcp | None) -> None:
         else:  # light replay: #1 again (gamma / g_cum / akk included) + the #2 tape walk from the saved S_in
             _replay_tapes(call, saved)
             call.scratch["tapes_source"] = "replay"
+            if call.l2n:
+                call.scratch["qk_source"] = "replay"
     call.local("bwd_prep")
+    if call.l2n and call.scratch.get("tapes_source") in ("saved", "kept"):
+        # no #1 replay: qn / kn from the raw rows and the saved r (bitwise #1_l2n's), before the first q / k reader
+        call.local("qk_apply")
+        call.scratch["qk_source"] = "qk_apply"
+    if call.l2n and call.opts.knob("record_qk"):
+        _record_qk(call, regen=call.scratch.get("tapes_source") == "replay")
     ring = call.exchange == "ring"
     form = (
         "dm" if (m_source == "b1" or ring) else "d"
@@ -3980,6 +4280,10 @@ def _backward(call: CallDetKcp, saved: SavedDetKcp | None) -> None:
     call.local("bwd_dqkg")
     if call.opts.group_reduce == "host":
         call.host_group_reduce()
+    if call.l2n and eager:
+        # #8 (or the host reduction) was the last reader of qn / kn and r: the arena copies go, the saved r with them
+        call.release_tapes((*QK_TAPES, QK_RSTD))
+        call.drop_bound(QK_RSTD, saved)
     if saved is not None and saved.kept is not None:
         _kept_release(call, saved.kept)  # #8 was the last reader of the forward tapes
     call.local("gate_epilogue")
@@ -4188,9 +4492,22 @@ def _prepare(
 ):
     """``fresh_pools``: the pools this call binds fresh / saved tensors for (never read from the workspace)."""
     backend = get_backend(opts.backend)
+    if (
+        opts.use_qk_l2norm_in_kernel
+        and isinstance(backend, KernelBackend)
+        and not l2n_records_shipped()
+    ):
+        raise RuntimeError(_L2N_NOT_SHIPPED)
     q, k, v, g, beta, T, H_qk, HV, batched = _operands(
         q, k, v, g, beta, ctx, dtypes=backend.dtypes, layout=opts.layout
     )
+    if opts.use_qk_l2norm_in_kernel:
+        # #1_l2n writes qn / kn / r for the tokens of the real chunks only: they must cover [0, T_r) (metadata)
+        chunk_len = getattr(ctx, "chunk_len", None)
+        if chunk_len is not None and sum(int(n) for n in chunk_len) != int(T):
+            raise ValueError(
+                f"use_qk_l2norm_in_kernel: the context's chunks cover {sum(int(n) for n in chunk_len)} of {T} tokens"
+            )
     if opts.exchange == "ring":
         validate_ring(ctx.n_d_max)
     device = torch.device(ctx.device)
@@ -4251,6 +4568,17 @@ def _prepare(
     return call, batched
 
 
+def _literal_overrides(options: Any, *pairs: tuple[str, Any, Any]) -> dict[str, Any]:
+    """The literal keywords of an entry point as option fields: each ``(name, value, default)`` overrides an
+    ``options`` instance / dict only when it differs from its documented default (without ``options`` every value
+    is passed, so the validator sees it)."""
+    return {
+        name: value
+        for name, value, default in pairs
+        if options is None or value != default
+    }
+
+
 def chunk_gdn_det_fwd_kcp(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -4263,12 +4591,23 @@ def chunk_gdn_det_fwd_kcp(
     save_for_backward: bool = True,
     workspace: WorkspaceDetKcp | None = None,
     options: OptionsDetKcp | dict[str, Any] | None = None,
+    use_qk_l2norm_in_kernel: bool = _opt.USE_QK_L2NORM_DEFAULT,
     **knobs: Any,
 ) -> tuple[torch.Tensor, SavedDetKcp | None]:
     """The KCP forward of this rank's fragments: ``out`` like ``v`` (fresh) and the saved set (``None``
     without ``save_for_backward`` or with ``boundary_mode="replay"``).  ``ctx`` is this rank's ``ContextDetKcp``; the
     token operands are its ``T_r`` local tokens in fragment order; ``options`` / ``**knobs`` are the keyword-only
-    fields of :class:`OptionsDetKcp` (``save_mode``, ``boundary_mode``, ``graph``, ...)."""
+    fields of :class:`OptionsDetKcp` (``save_mode``, ``boundary_mode``, ``graph``, ...); ``use_qk_l2norm_in_kernel``
+    (the one literal keyword; overrides ``options`` only when ``True``): the in-kernel per-head L2 norm of q / k
+    (module docstring)."""
+    over = _literal_overrides(
+        options,
+        (
+            "use_qk_l2norm_in_kernel",
+            use_qk_l2norm_in_kernel,
+            _opt.USE_QK_L2NORM_DEFAULT,
+        ),
+    )
     return _fwd_entry(
         q,
         k,
@@ -4279,7 +4618,7 @@ def chunk_gdn_det_fwd_kcp(
         scale=scale,
         save_for_backward=save_for_backward,
         workspace=workspace,
-        opts=make_options(options, **knobs),
+        opts=make_options(options, **over, **knobs),
         hand_off=False,
     )
 
@@ -4387,6 +4726,7 @@ def _fwd_entry(
             call.precision_mode,
             opts.offset_class,
             opts.transfer_walk,
+            call.l2n,
         ):
             raise ValueError(
                 "recompute_handle: the 'gdn' entry describes another problem or programs than this recompute"
@@ -4418,7 +4758,8 @@ def _fwd_entry(
 def _saved_count(call: CallDetKcp, save: bool) -> int:
     """What :class:`ChunkGDNDetFunctionKcp` saves for this forward: the five operands and the saved set's tensors
     (:meth:`SavedDetKcp.tensors`: ``S_in``; the c1 receive tensor under ``save_transfer``; ``M_seg`` under
-    ``save_transfer`` at ``P > 1``; the saved tapes of the ``save_mode`` when the rank holds tokens) -- known before
+    ``save_transfer`` at ``P > 1``; the saved tapes of the ``save_mode`` when the rank holds tokens; ``qk_rstd`` with
+    ``use_qk_l2norm_in_kernel``) -- known before
     the forward runs, so the frame proof can decide a hand-off (``reuse_recompute_tapes="auto"``)."""
     if not save:
         return _SAVED_OPERANDS
@@ -4430,6 +4771,8 @@ def _saved_count(call: CallDetKcp, save: bool) -> int:
     )
     if call.T_r > 0:
         n += len(saved_tapes(opts.save_mode))
+    if call.l2n:  # qk_rstd, at T_r = 0 too (an empty [2, 0, H_qk] tensor: the flags agree across ranks)
+        n += 1
     return _SAVED_OPERANDS + n
 
 
@@ -4487,6 +4830,9 @@ def _fwd_body(
             call.release_tapes(
                 FWD_DEAD_BEFORE_O, keep=saved_tapes(call.opts.save_mode) if save else ()
             )
+        if call.l2n:
+            # the tape walks were kn's last readers (a hand-off forward hands only the ten forward tapes over)
+            call.release_tapes(("kn",))
         call.release_pools(FWD_DEAD_POOLS)
     call.out = _alloc((call.T_r, call.HV, D), call.backend.dtypes["out"], call.device)
     saved = _saved_set(call) if save else None
@@ -4511,6 +4857,8 @@ def _fwd_body(
     call.scratch["fwd_o_reason"] = reason
     if launch:
         call.local("fwd_o")
+    if call.l2n and call.opts.graph == "off":
+        call.release_tapes(("qn",))  # #5 was qn's last reader (or #5 is left out)
     kept = None
     if hand_off:
         kept = _KeptTapes(
@@ -4553,6 +4901,8 @@ def _saved_set(call: CallDetKcp) -> SavedDetKcp:
         precision_mode=call.precision_mode,
         transfer_walk=call.transfer_walk,
         ctx=call.ctx,
+        qk_rstd=call.bufs.get(QK_RSTD) if call.l2n else None,
+        qk_l2norm=call.l2n,
         kept=None,
     )
 
@@ -4590,6 +4940,24 @@ def _check_saved(saved: SavedDetKcp, call: CallDetKcp) -> None:
             "the forward's"
         )
     _check(saved.S_in, "saved.S_in", (tb.sizes["S_in"],), call.state_dtype, call.device)
+    if bool(saved.qk_l2norm) != call.l2n:
+        raise ValueError(
+            f"saved: use_qk_l2norm_in_kernel={call.l2n} differs from the forward's ({bool(saved.qk_l2norm)})"
+        )
+    if call.l2n:
+        if saved.qk_rstd is None:
+            raise ValueError(
+                "saved: use_qk_l2norm_in_kernel needs the forward's qk_rstd"
+            )
+        _check(
+            saved.qk_rstd,
+            "saved.qk_rstd",
+            (2, call.T_r, call.H_qk),
+            torch.float32,
+            call.device,
+        )
+    elif saved.qk_rstd is not None:
+        raise ValueError("saved: a qk_rstd without use_qk_l2norm_in_kernel")
     if opts.save_transfer:
         if saved.c1_recv is None:
             raise ValueError(
@@ -4684,10 +5052,20 @@ def chunk_gdn_det_bwd_kcp(
     scale: float | None = None,
     workspace: WorkspaceDetKcp | None = None,
     options: OptionsDetKcp | dict[str, Any] | None = None,
+    use_qk_l2norm_in_kernel: bool = _opt.USE_QK_L2NORM_DEFAULT,
     **knobs: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The KCP backward: ``(dq, dk, dv, dbeta, dg)``, fresh.  ``saved=None`` replays the forward."""
-    opts = make_options(options, **knobs)
+    """The KCP backward: ``(dq, dk, dv, dbeta, dg)``, fresh.  ``saved=None`` replays the forward.
+    ``use_qk_l2norm_in_kernel`` must be the forward's (a saved set of the other form is refused)."""
+    over = _literal_overrides(
+        options,
+        (
+            "use_qk_l2norm_in_kernel",
+            use_qk_l2norm_in_kernel,
+            _opt.USE_QK_L2NORM_DEFAULT,
+        ),
+    )
+    opts = make_options(options, **over, **knobs)
     entry = None
     if opts.graph != "off":
         kept = () if saved is None else saved.tensors()
@@ -4849,6 +5227,7 @@ class ChunkGDNDetFunctionKcp(torch.autograd.Function):
                     saved.precision_mode,
                     saved.offset_class,
                     saved.transfer_walk,
+                    saved.qk_l2norm,
                 ),
             }
         if saved is not None and saved.kept is not None:
@@ -5004,23 +5383,29 @@ def chunk_gdn_det_kcp(
     graph: str = _opt.GRAPH_DEFAULT,
     options: OptionsDetKcp | dict[str, Any] | None = None,
     recompute_handle: Any = None,
+    use_qk_l2norm_in_kernel: bool = _opt.USE_QK_L2NORM_DEFAULT,
     **knobs: Any,
 ) -> torch.Tensor:
     """The differentiable KCP forward: ``out`` like ``v``; gradients for ``q, k, v, g, beta``
-    in the backward's order ``(dq, dk, dv, dbeta, dg)``.  With an ``options`` instance, the three literal keywords
-    override it only when they differ from their documented defaults.  ``recompute_handle``
+    in the backward's order ``(dq, dk, dv, dbeta, dg)``.  With an ``options`` instance, the four literal keywords
+    (``save_mode``, ``boundary_mode``, ``graph``, ``use_qk_l2norm_in_kernel``) override it only when they differ from
+    their documented defaults.  ``use_qk_l2norm_in_kernel=True``: the in-kernel per-head L2 norm of q / k (the
+    gradient is the exact derivative of ``bf16(q * r)``'s FP32 form at the stored point; module docstring).  ``recompute_handle``
     (:class:`RecomputeHandleDetKcp`): the checkpoint recompute of this forward exchanges nothing -- it reads the
     incoming states the original forward stored in the handle; needs ``boundary_mode="saved"`` and ``graph="off"``,
     implies ``save_transfer=False`` (a ``save_transfer=True`` keyword or ``options`` dict entry is refused; a
     :class:`OptionsDetKcp` instance's value is replaced by ``False``) and refuses ``debug_sequence``."""
-    over: dict[str, Any] = {}
-    for name, value, default in (
+    over = _literal_overrides(
+        options,
         ("save_mode", save_mode, _opt.SAVE_MODE_DEFAULT),
         ("boundary_mode", boundary_mode, _opt.BOUNDARY_MODE_DEFAULT),
         ("graph", graph, _opt.GRAPH_DEFAULT),
-    ):
-        if options is None or value != default:
-            over[name] = value
+        (
+            "use_qk_l2norm_in_kernel",
+            use_qk_l2norm_in_kernel,
+            _opt.USE_QK_L2NORM_DEFAULT,
+        ),
+    )
     if recompute_handle is not None and (
         knobs.get("save_transfer") is True
         or (isinstance(options, dict) and options.get("save_transfer") is True)
@@ -5087,6 +5472,7 @@ __all__ = [
     "GRAPH_DEFAULT",
     "GRAPH_MODES",
     "GRAPH_STATS",
+    "HOST_L2N_BLOCK_TOKENS",
     "HOST_ONLY_ARGS",
     "HOST_REDUCE_TAPES",
     "KCP_SAVED_VERSION",
@@ -5103,6 +5489,8 @@ __all__ = [
     "FWD_DEAD_POOLS",
     "FWD_TAPES_ARENA_AFTER_FWD",
     "KEPT_STATS",
+    "L2N_PROGRAMS",
+    "L2N_SIBLING_OF",
     "LIGHT_TAPES",
     "HANDLE_KEY",
     "TAPE_ALIASES",
@@ -5111,7 +5499,10 @@ __all__ = [
     "PACKED_SPLIT_STATS",
     "PROGRAMS",
     "PROGRAM_ARGS",
+    "PROGRAM_ARGS_L2N",
     "PROVISIONAL_ARGS",
+    "QK_RSTD",
+    "QK_TAPES",
     "RECOMPUTE_OUTPUT_STATS",
     "RECOMPUTE_OUTPUT_TORCH_VERSIONS",
     "RECORD_OF",
@@ -5151,6 +5542,7 @@ __all__ = [
     "get_backend",
     "graph_cache_clear",
     "kept_registry_size",
+    "l2n_records_shipped",
     "make_options",
     "merge_cols_per_cta",
     "packed_qkv_views_det_kcp",
