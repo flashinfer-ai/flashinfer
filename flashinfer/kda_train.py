@@ -62,6 +62,9 @@ through the plan's collectives (``build_kcp_context``)::
     out_local = chunk_kda_kcp(q_local, k_local, v_local, g_local, beta_local, ctx)   # autograd
     out_local, saved = chunk_kda_kcp_fwd(q_local, k_local, v_local, g_local, beta_local, ctx)
     grads = chunk_kda_kcp_bwd(q_local, k_local, v_local, g_local, beta_local, ctx, dout_local, saved=saved)
+
+    ctx_next = build_kcp_context(part_next, group, rank, device, heads=H)   # prepare the next pack while this one
+                                                                          # runs: one async copy, no host wait
 """
 
 from __future__ import annotations
@@ -408,6 +411,8 @@ def build_kcp_context(
     conv_kernel_size: int = 4,
     *,
     sm_count: Optional[int] = None,
+    heads: Optional[Any] = None,
+    stream: Optional[Any] = None,
 ) -> Any:
     r"""This rank's context of a partition: its device tables, the collectives of the state and halo exchanges and
     the segment plan of its fragments.
@@ -426,6 +431,13 @@ def build_kcp_context(
         The width of the causal convolution whose history rows the context exchanges (4).
     sm_count : int, optional
         The device's SM count when it should not be queried.
+    heads : int or sequence of int, optional
+        Head counts whose head plans are derived now (host work only) instead of at the first call.
+    stream : torch.cuda.Stream, optional
+        The stream of the context's one asynchronous table copy (default: the current stream of ``device``).  The
+        host never waits for device work: a pack can be prepared while the previous one runs.  A thread other than
+        the one that runs the pack must pass the stream that will run it, or call ``ctx.wait_ready(stream)`` before
+        that stream reads the tables (the KCP entry points call ``ctx.wait_ready()`` on their current stream).
 
     Returns
     -------
@@ -434,7 +446,14 @@ def build_kcp_context(
     from .experimental.cake_kda_train import cake_kcp_plan
 
     return cake_kcp_plan.build_kcp_context(
-        part, group, rank, device, conv_kernel_size, sm_count=sm_count
+        part,
+        group,
+        rank,
+        device,
+        conv_kernel_size,
+        sm_count=sm_count,
+        heads=heads,
+        stream=stream,
     )
 
 

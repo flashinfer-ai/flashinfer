@@ -696,6 +696,31 @@ through the private test knob `host_trim` (after
 `cake_kcp_plan.enable_test_knobs()`; the conv module's
 `_set_test_knobs({"host_trim": 0})`).
 
+Host synchronization: no KCP call and no pack preparation copies a table from
+pageable memory or waits for queued device work, with or without a
+caller-owned workspace. `build_kcp_context` copies the context's tables in one
+pinned non-blocking copy on `stream=` (default: the current stream), so pack
+N+1 can be prepared while pack N runs; `heads=H` derives the head plans there
+as well (host work; their device tables are copied only when read, and the
+byte queries are host-only). The launch tables of a `(ctx, H)` live on the
+context, shared by every workspace and by `workspace=None` calls: each is
+copied once, by the first call that reads it, in one asynchronous pinned copy
+on the call's stream. A context prepared on another stream is ordered on the
+stream of each call by `ctx.wait_ready()` (event wait, no host wait; the KDA
+and conv halo entry points call it on every call). A thread other than the
+compute thread must pass `stream=` (the current stream is per thread). Copies
+are refused under CUDA-graph capture (`graph="replay"` runs the first call of
+a key eagerly). Not covered: `workspace=None` calls allocate their pools per
+call (a caching-allocator miss can call `cudaMalloc`, an out-of-memory retry
+synchronizes; reuse a workspace under memory pressure), the debug paths
+(`spec3_probe`, `debug_sequence`) and `TORCH_NCCL_BLOCKING_WAIT=1`. The
+previous copies stay reachable for A/B records through the context test knobs
+`upload="blocking"` and `table_cache="workspace"` (the latter only with the
+former). Eager KCP calls are host-bound at high CP: bind each rank's threads
+to the cores of its GPU's socket (for example `srun --cpu-bind=cores` with as
+many threads as bound cores), since unbound torch threads of several ranks
+oversubscribe the CPUs.
+
 Options of the KDA entry points: `save_transfer` keeps the owner's c1 receive
 tensor (and `M_seg`) for the backward instead of re-sending it in the backward
 exchange -- the default with the all-to-all exchange (an earlier revision).

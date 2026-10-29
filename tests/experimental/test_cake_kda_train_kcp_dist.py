@@ -515,6 +515,301 @@ def test_multi_gpu_rows_match_the_exact_reference(row) -> None:
     assert report["pass"], report
 
 
+# (lengths, H, W, layout) of the host-synchronization rows: CP2 / CP4 / CP8, every layout, H 4 / 64, one-token
+# documents and a document spanning >= 3 ranks; (2000, 1000) at CP4 is a ring row with a three-fragment chain (a hop-2
+# chain launch)
+UPLOAD_ROWS = [
+    ((100, 640, 77, 1000, 129), 4, 2, "contiguous"),
+    ((2000, 1000), 4, 4, "contiguous"),
+    ((3000,), 64, 4, "zigzag"),
+    ((2048, 5, 3000, 1), 4, 4, "zigzag_per_document"),
+    ((700, 1, 1300, 999, 3000), 64, 8, "zigzag_per_document"),
+    ((5000, 1003), 4, 8, "zigzag"),
+    ((1200 + 900 + 900,), 4, 8, "contiguous"),
+]
+# the previous copies (A/B, negative control)
+OLD_PATH = {"upload": "blocking", "table_cache": "workspace"}
+
+
+DIST_SLEEP_MS = 2000.0  # the queue probe of the dist census windows (the host must return within a quarter of it)
+
+
+def _run_upload_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict:
+    """Host synchronization on every rank of a CP row, each window a census of ``tests/test_helpers/cake_host_sync.py``
+    (upload counter, profiler copies where traced, sync-debug warnings, an event-based queue probe and a host-time
+    bound): the new path is bitwise the previous one (KDA saved / replay / checkpointed passes with and without a
+    workspace, conv halo forward / backward); the first call of a fresh context (with the reused workspace and with
+    ``workspace=None``) issues only pinned copies (at least one: its table sets) and does not wait; steady-state calls
+    issue no copy and do not wait; the previous path's calls and preparation copy from pageable memory and wait; a
+    pack prepared behind queued work (``heads=H``) issues one pinned copy, does not wait and runs bitwise; a pack
+    prepared from another thread on a held-back side stream does the same; repeated ``exchange="ring"`` calls record
+    no further upload on the context (ring rows); the plan's ``P`` of each rank is reported."""
+    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv
+    from tests.test_helpers.cake_host_sync import (
+        census,
+        counts_agree,
+        nonblocking,
+        sleep_cycles,
+    )
+
+    lengths, H, _w, layout = row
+    device = torch.device("cuda", rank % max(torch.cuda.device_count(), 1))
+    torch.cuda.set_device(device)
+    if W > 1 and not dist.is_initialized():
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", str(port))
+        dist.init_process_group("nccl", rank=rank, world_size=W, device_id=device)
+    group = dist.group.WORLD if W > 1 else None
+    part, cu = _partition(lengths, W, layout)
+    glob = make_inputs(lengths, H, device)
+    ops = _local_slices(part, rank, cu, glob)
+    q, k, v, g, beta, dout = (ops[n] for n in ("q", "k", "v", "g", "beta", "dout"))
+    gen = torch.Generator(device="cpu").manual_seed(0x7815)
+    C = 256
+    xg = torch.randn(cu[-1], C, generator=gen).to(torch.bfloat16).to(device)
+    dyg = torch.randn(cu[-1], C, generator=gen).to(torch.bfloat16).to(device)
+    w = (0.5 * torch.randn(C, 4, generator=gen)).to(device).contiguous()
+    loc = _local_slices(part, rank, cu, {"x": xg, "dy": dyg})
+    x, dy = loc["x"].contiguous(), loc["dy"].contiguous()
+
+    def run(c, ws, **opts) -> list:
+        out, saved = cake_kcp.chunk_kda_kcp_fwd(
+            q, k, v, g, beta, c, workspace=ws, **opts
+        )
+        # ``boundary_mode`` is a forward keyword
+        bwd_opts = {key: val for key, val in opts.items() if key != "boundary_mode"}
+        grads = cake_kcp.chunk_kda_kcp_bwd(
+            q, k, v, g, beta, c, dout, saved=saved, workspace=ws, **bwd_opts
+        )
+        return [out, *grads]
+
+    def ckpt(c, ws) -> list:
+        from torch.utils.checkpoint import checkpoint
+
+        leaves = [t.detach().clone().requires_grad_(True) for t in (q, k, v, g, beta)]
+        out = checkpoint(
+            lambda *a: cake_kcp.chunk_kda_kcp(*a, c, None, "light", "saved", ws),
+            *leaves,
+            use_reentrant=False,
+        )
+        out.backward(dout)
+        return [out.detach()] + [lf.grad for lf in leaves]
+
+    def halo(c) -> list:
+        y, hist = conv.cake_causal_conv1d_kcp_forward(x, w, c)
+        return [y, *conv.cake_causal_conv1d_kcp_backward(x, w, c, dy, hist)]
+
+    def eq(a, b) -> bool:
+        return len(a) == len(b) and all(
+            torch.equal(s, t) for s, t in zip(a, b, strict=True)
+        )
+
+    def build(**kw):
+        return cake_kcp_plan.build_kcp_context(part, group, rank, device, **kw)
+
+    def window(fn, **kw) -> dict:
+        return census(fn, device, sleep_ms=DIST_SLEEP_MS, **kw)
+
+    def brief(c: dict) -> dict:
+        keys = ("pageable", "pinned", "prof_pageable", "prof_pinned", "sync_warn")
+        return {
+            **{key: c[key] for key in keys},
+            "busy": c["busy"],
+            "host_s": round(c["host_s"], 4),
+        }
+
+    def fresh(c):
+        return c, not c.ready.query()
+
+    prev = cake_kcp_plan.enable_test_knobs(True)
+    try:
+        sleep_cycles(device, DIST_SLEEP_MS)  # calibrated before any window
+        old = build(_kcp_test_knobs=dict(OLD_PATH))
+        ctx = build(heads=H)
+        ws, ws_old = cake_kcp.KcpWorkspace(), cake_kcp.KcpWorkspace()
+        P = cake_kcp.KcpWorkspace(local=False).tables(ctx, H).P
+        ref = (
+            run(old, None)
+            + run(old, ws_old)
+            + run(old, None, boundary_mode="replay")
+            + ckpt(old, None)
+            + halo(old)
+        )
+        new = (
+            run(ctx, None)
+            + run(ctx, ws)
+            + run(ctx, ws, boundary_mode="replay")
+            + ckpt(ctx, ws)
+            + halo(ctx)
+        )
+        for _ in range(2):
+            run(ctx, ws)
+            run(ctx, None)
+        steady_ws = window(lambda: run(ctx, ws))
+        steady_none = window(lambda: run(ctx, None) + halo(ctx))
+        old_calls = window(lambda: run(old, None))
+        # the first call of a fresh context: its table sets are uploaded by the call
+        ctx_f = build(heads=H)
+        first_ws = window(lambda: run(ctx_f, ws) + halo(ctx_f))
+        ctx_g = build(heads=H)
+        first_none = window(lambda: run(ctx_g, None) + halo(ctx_g))
+        # the next pack prepared behind queued work, and the previous path's preparation
+        prep = window(lambda: fresh(build(heads=H)))
+        ctx_b, prep_pending = prep["out"]
+        prep_old = window(lambda: build(heads=H, _kcp_test_knobs=dict(OLD_PATH)))
+        res_b = run(ctx_b, ws) + halo(ctx_b)
+        # prepared from another thread on a side stream held back by ~0.5 s of its own work
+        side = torch.cuda.Stream(device)
+
+        def hold() -> None:
+            with torch.cuda.stream(side):
+                torch.cuda._sleep(sleep_cycles(device, 500.0))
+
+        thread_prep = window(
+            lambda: fresh(build(heads=H, stream=side)), in_thread=True, setup=hold
+        )
+        ctx_t, held = thread_prep["out"]
+        res_t = run(ctx_t, None) + halo(ctx_t)
+        # the ring exchange: its hop chains are uploaded once per table set, not per call
+        ring_uploads, ring_chains = None, None
+        if W > 1 and int(ctx.n_d_max) - 1 <= cake_kcp.RING_MAX_HOPS:
+            ws_r = cake_kcp.KcpWorkspace()
+            run(ctx, ws_r, exchange="ring", save_transfer=False)
+            n1 = len(ctx._uploads)
+            for _ in range(3):
+                run(ctx, ws_r, exchange="ring", save_transfer=False)
+            ring_uploads = (n1, len(ctx._uploads))
+            ring_chains = sorted(
+                cake_kcp._ring_tables(
+                    cake_kcp.KcpWorkspace(local=False).tables(ctx, H)
+                ).chains
+            )
+        torch.cuda.synchronize(device)
+    finally:
+        cake_kcp_plan.enable_test_knobs(prev)
+    halo_new = new[24:27]
+    flags = {
+        "new_eq_previous_path": eq(new, ref),
+        "first_call_reused_ws_nonblocking": nonblocking(first_ws, DIST_SLEEP_MS)
+        and first_ws["pinned"] >= 1
+        and eq(first_ws["out"], new[6:12] + halo_new),
+        "first_call_no_ws_nonblocking": nonblocking(first_none, DIST_SLEEP_MS)
+        and first_none["pinned"] >= 1
+        and eq(first_none["out"], new[0:6] + halo_new),
+        "steady_reused_ws_nonblocking": nonblocking(steady_ws, DIST_SLEEP_MS)
+        and steady_ws["pinned"] == 0
+        and eq(steady_ws["out"], new[6:12]),
+        "steady_no_ws_nonblocking": nonblocking(steady_none, DIST_SLEEP_MS)
+        and steady_none["pinned"] == 0
+        and eq(steady_none["out"], new[0:6] + halo_new),
+        "previous_path_calls_block": old_calls["pageable"] > 0
+        and counts_agree(old_calls)
+        and old_calls["sync_warn"] > 0
+        and not old_calls["busy"],
+        "prepare_nonblocking": nonblocking(prep, DIST_SLEEP_MS)
+        and prep["pinned"] == 1
+        and prep_pending,
+        "previous_path_prepare_blocks": prep_old["pageable"] > 0
+        and counts_agree(prep_old)
+        and prep_old["sync_warn"] > 0
+        and not prep_old["busy"],
+        "prepared_pack_eq": eq(res_b, new[6:12] + halo_new),
+        "thread_prepare_nonblocking": nonblocking(thread_prep, DIST_SLEEP_MS)
+        and thread_prep["pinned"] == 1
+        and held,
+        "thread_prepared_pack_eq": eq(res_t, new[0:6] + halo_new),
+        "ring_uploads_bounded": ring_uploads is None
+        or ring_uploads[0] == ring_uploads[1],
+    }
+    counts = {
+        "P": P,
+        "ring_uploads": ring_uploads,
+        "ring_chains": ring_chains,
+        "first_ws": brief(first_ws),
+        "first_none": brief(first_none),
+        "steady_ws": brief(steady_ws),
+        "steady_none": brief(steady_none),
+        "old_calls": brief(old_calls),
+        "prep": brief(prep),
+        "prep_old": brief(prep_old),
+        "thread_prep": brief(thread_prep),
+    }
+    if W > 1:
+        flag_list, count_list = [None] * W, [None] * W
+        dist.all_gather_object(flag_list, flags)
+        dist.all_gather_object(count_list, counts)
+    else:
+        flag_list, count_list = [flags], [counts]
+    report = {
+        "rank": rank,
+        "world": W,
+        "row": _row_id(row),
+        "flags": {},
+        "counts_by_rank": count_list,
+    }
+    for key in flags:
+        report["flags"][key] = all(f[key] for f in flag_list)
+    report["pass"] = all(report["flags"].values())
+    if W > 1:
+        dist.barrier()
+    if rank == 0 and result_dir:
+        os.makedirs(result_dir, exist_ok=True)
+        with open(
+            os.path.join(result_dir, "upload-" + _row_id(row) + ".json"), "w"
+        ) as fh:
+            json.dump(report, fh, indent=1, default=str)
+    return report
+
+
+def _spawn_upload_entry(rank: int, W: int, row, port: int, result_dir: str) -> None:
+    try:
+        report = _run_upload_rank(rank, W, row, port, result_dir)
+        if not report["pass"]:
+            raise AssertionError(f"rank {rank}: {report}")
+    finally:
+        if dist.is_initialized():
+            cake_kcp.graph_cache_clear()
+            dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("row", UPLOAD_ROWS, ids=_row_id)
+def test_multi_gpu_upload_rows_are_bitwise_and_nonblocking(row) -> None:
+    """The rows of :func:`_run_upload_rank`: one process per GPU (``spawn``, rows up to the visible GPU count) or
+    one process per Slurm task (a step with ``SLURM_NTASKS`` > 1 runs the rows of its own world size and skips the
+    others)."""
+    lengths, H, W, layout = row
+    ntasks = int(os.environ.get("SLURM_NTASKS", "1"))
+    if os.environ.get("SLURM_PROCID") is not None and ntasks > 1:
+        if ntasks != W:
+            pytest.skip(f"this Slurm step runs the W = {ntasks} rows")
+        if not _programs_exported():
+            pytest.skip(
+                "the KCP programs are not exported in the package's build.json yet"
+            )
+        report = _run_upload_rank(
+            int(os.environ["SLURM_PROCID"]),
+            W,
+            row,
+            int(os.environ.get("MASTER_PORT", "29500")),
+            os.environ.get("KCP_TEST_RESULT_DIR"),
+        )
+        assert report["pass"], report
+        return
+    _skip_unless_runnable(W)
+    with tempfile.TemporaryDirectory(prefix="cake_kcp_upload_") as tmp:
+        result_dir = os.environ.get("KCP_TEST_RESULT_DIR") or tmp
+        mp.start_processes(
+            _spawn_upload_entry,
+            args=(W, row, _free_port(), result_dir),
+            nprocs=W,
+            join=True,
+            start_method="spawn",
+        )
+        with open(os.path.join(result_dir, "upload-" + _row_id(row) + ".json")) as fh:
+            report = json.load(fh)
+    assert report["pass"], report
+
+
 def test_public_api_cannot_select_a_precision_mode(monkeypatch) -> None:
     """The private test hook is refused without the environment variable; the public options never reach K3's
     non-shipped programs (SPEC-11)."""

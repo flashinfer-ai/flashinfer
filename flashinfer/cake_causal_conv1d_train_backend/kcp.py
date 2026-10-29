@@ -201,6 +201,14 @@ def _launch_with_grid(
         getattr(module, record["ffi_entry"])(*args)
 
 
+def _wait_ready(ctx: Any) -> None:
+    """``ctx.wait_ready()`` of a context that has one (a context prepared on another stream orders its table uploads
+    on the current stream; a duck-typed context without it needs nothing)."""
+    wait_ready = getattr(ctx, "wait_ready", None)
+    if wait_ready is not None:
+        wait_ready()
+
+
 def _context(ctx: Any, *, device: torch.device, T_r: int) -> tuple[torch.Tensor, int]:
     """The context's local ``cu_seqlens`` (int32 device ``[n_frag + 1]``) and fragment count, checked against the
     tokens the call received."""
@@ -553,6 +561,9 @@ def _kcp_forward(
 
     x = _require_tensor(x_local, "x_local")
     device = x.device
+    # tables of a context prepared on another stream: order them on this call's stream, on every call (the trimmed
+    # path's host cache is not per stream; after the first call on a stream this is one dict lookup)
+    _wait_ready(ctx)
     if _TEST_KNOBS["host_trim"] == 1:
         return _kcp_forward_trim(x, weight, ctx, out=out, device=device)
     arch = _device_arch(device)
@@ -748,6 +759,8 @@ def _kcp_backward(
 
     x = _require_tensor(x_local, "x_local")
     device = x.device
+    # as in the forward: every call, before the host-cache lookup of the trimmed path
+    _wait_ready(ctx)
     if _TEST_KNOBS["host_trim"] == 1:
         return _kcp_backward_trim(
             x, weight, ctx, dy, hist, dx=dx, dweight=dweight, device=device
