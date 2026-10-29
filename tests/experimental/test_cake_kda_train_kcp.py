@@ -3523,13 +3523,57 @@ def _bits(t: torch.Tensor) -> torch.Tensor:
     return t.contiguous().view(torch.int16 if t.element_size() == 2 else torch.int32)
 
 
-def _same(a: dict, b: dict) -> bool:
+def _same(a: dict, b: dict, names=TENSOR_NAMES + ("dw",)) -> bool:
+    """``dw``: the gradient of the ``out * w`` consumer (``dout * out`` of the forward the backward read: the
+    recompute's under a checkpoint)."""
     return all(
         a[n].dtype == b[n].dtype
         and a[n].shape == b[n].shape
         and torch.equal(_bits(a[n]), _bits(b[n]))
-        for n in TENSOR_NAMES
+        for n in names
     )
+
+
+def _poison(device) -> None:
+    """Fill the caching allocator's free blocks (large and small pool) with all-ones bits (NaN in BF16 / FP32): rows
+    of a fresh ``torch.empty`` tensor that no kernel writes then read as NaN, not as a stale earlier result."""
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+    big = torch.full((1 << 27,), -1, dtype=torch.int32, device=device)  # 512 MiB
+    small = [
+        torch.full((1 << 17,), -1, dtype=torch.int32, device=device) for _ in range(256)
+    ]  # 512 KiB each: the small pool's 2 MiB segments
+    torch.cuda.synchronize(device)
+    del big, small
+
+
+# the launches a bound recompute may drop: the exchange (c1 / c2 or the ring hops) and its feeders (the owner merge,
+# the P = 1 summaries, the P > 1 map merge and transpose)
+DROPPABLE = {
+    "a2a:c1",
+    "a2a:c2",
+    "kcp_affine_merge",
+    "kcp_fwdh_offset",
+    "kcp_transfer_walk",
+    "kcp_transpose_tiles",
+}
+
+
+def _removed_launches(orig: list, replay: list) -> list:
+    """The original forward's launches the replay drops.  The replay must be the original sequence with launches
+    deleted -- same order, nothing added; asserted -- and every dropped one an exchange launch or a feeder of it."""
+    removed, i = [], 0
+    for s in orig:
+        if i < len(replay) and replay[i] == s:
+            i += 1
+        else:
+            removed.append(s)
+    assert i == len(replay), (
+        f"the replay adds or reorders launches: {replay[i:]} (original {orig})"
+    )
+    bad = [s for s in removed if s not in DROPPABLE and not s.startswith("ring:")]
+    assert not bad, (bad, orig, replay)
+    return removed
 
 
 class _PhaseCounter:
@@ -3579,53 +3623,82 @@ def _ckpt_pass(
     twice=False,
     early_stop=True,
     ws=None,
+    poison=False,
     **opts,
 ):
-    """``out`` and the five gradients of ``chunk_kda_kcp`` (directly or under a checkpoint) and the LAST_CALL
-    records of the original forward, of the forward after the backward (the recompute's) and of the backward."""
+    """``out``, the five gradients and ``dw`` of ``chunk_kda_kcp(...) * w`` (``w`` a leaf of ones: no bit of ``out``
+    or of its gradient changes, but the backward of the product reads the ``out`` of the forward it belongs to -- the
+    recompute's under a checkpoint), directly or under a checkpoint, and the LAST_CALL records of the original
+    forward, of the recompute (popped before each backward and required afterwards) and of the backward.  Under a
+    checkpoint every recompute's ``out`` is asserted bitwise the original forward's.  ``poison``: :func:`_poison`
+    before the pass."""
     import contextlib
 
     from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
 
+    device = ops["q"].device
+    if poison:
+        _poison(device)
     leaves = [
         ops[n].detach().clone().requires_grad_(True)
         for n in ("q", "k", "v", "g", "beta")
     ]
+    w = torch.ones_like(ops["dout"]).requires_grad_(True)
     kw = {} if handle is None else {"recompute_handle": handle}
     if keep is not None:
         kw["checkpoint_keep"] = keep
+    outs = []
 
-    def fn(q_, k_, v_, g_, b_, h_):
+    def fn(q_, k_, v_, g_, b_, h_, w_):
         if h_ is not None:
             kw["recompute_handle"] = h_
-        return cake_kcp.chunk_kda_kcp(
+        y = cake_kcp.chunk_kda_kcp(
             q_, k_, v_, g_, b_, ctx, None, "light", "saved", ws, **kw, **opts
         )
+        outs.append(y.detach().clone())
+        return y * w_
 
     cake_kcp.LAST_CALL.pop("fwd", None)
     with set_checkpoint_early_stop(early_stop):
         if not ckpt:
-            out = fn(*leaves, handle)
+            out = fn(*leaves, handle, w)
         elif reentrant:
-            out = checkpoint(fn, *leaves, handle, use_reentrant=True)
+            out = checkpoint(fn, *leaves, handle, w, use_reentrant=True)
         else:
             cm = counter.recompute_cm if counter is not None else contextlib.nullcontext
             out = checkpoint(
                 fn,
                 *leaves,
                 handle,
+                w,
                 use_reentrant=False,
                 context_fn=lambda: (contextlib.nullcontext(), cm()),
             )
         rec_orig = dict(cake_kcp.LAST_CALL["fwd"])
         if counter is not None:
             counter.phase = "bwd"
+        if ckpt:
+            cake_kcp.LAST_CALL.pop("fwd")
         out.backward(ops["dout"], retain_graph=twice)
-        rec_fwd_after = dict(cake_kcp.LAST_CALL["fwd"])
+        rec_fwd_after = dict(cake_kcp.LAST_CALL["fwd"])  # KeyError: no recompute ran
         rec_bwd = dict(cake_kcp.LAST_CALL["bwd"])
         if twice:
+            if ckpt:
+                cake_kcp.LAST_CALL.pop("fwd")
             out.backward(ops["dout"])
-    res = {"out": out.detach()}
+            if ckpt:
+                assert (
+                    cake_kcp.LAST_CALL["fwd"]["recompute_handle"]
+                    == (rec_fwd_after["recompute_handle"])
+                    and cake_kcp.LAST_CALL["fwd"]["n_collectives"]
+                    == (rec_fwd_after["n_collectives"])
+                )
+    assert len(outs) == (1 + (2 if twice else 1) if ckpt else 1), len(outs)
+    for o in outs[
+        1:
+    ]:  # the recompute's out (read by the product's backward): bitwise the original's
+        assert torch.equal(_bits(o), _bits(outs[0])), "the recompute's out differs"
+    res = {"out": out.detach(), "dw": w.grad}
     res.update(
         {
             f"d{n}": lf.grad
@@ -3643,10 +3716,14 @@ def test_gpu_recompute_handle_is_bitwise_and_exchange_free(
 ) -> None:
     """With a recompute handle the original forward exchanges and stores its entry ("capture"), torch's recompute
     binds it ("replay") and issues no exchange (``n_collectives == 0``; the plain checkpoint's recompute, the
-    positive control, issues c1 + c2); ``out`` and the five gradients are bitwise the plain checkpoint's, the direct
-    pass's and the explicit forward / backward calls'; the handle holds exactly the tier's tensors
-    (``kcp_saved_bytes(checkpoint_keep=..., with_conv=False)``)."""
+    positive control, issues c1 + c2); the recompute's ``out`` (read by the ``out * w`` consumer), ``out``, the five
+    gradients and ``dw`` are bitwise the plain checkpoint's, the direct pass's and the explicit forward / backward
+    calls'; the recompute's launches are the original's in order minus the exchange and its feeders; the entry holds
+    the tier's tensors.  One rank: no fragment crosses a rank (``n_in == 0``), so the stored ``S_in`` / c1 receive
+    tensors are empty and the binding and its bytes are shown by the NCCL rows of test_cake_kda_train_kcp_dist.py
+    only; these rows cover the phases, the counts, the launches and ``out``."""
     ctx, ops = _ckpt_problem(device, lengths, H)
+    assert ctx.n_in == 0
     out_e, saved_e = cake_kcp.chunk_kda_kcp_fwd(
         *(ops[n] for n in ("q", "k", "v", "g", "beta")), ctx
     )
@@ -3669,9 +3746,10 @@ def test_gpu_recompute_handle_is_bitwise_and_exchange_free(
         ctx, ops, handle=handle, keep=keep, reentrant=reentrant, counter=cc
     )
     monkeypatch.undo()
-    assert _same(direct, explicit), (
+    assert _same(direct, explicit, TENSOR_NAMES), (
         "recompute_handle=None differs from the explicit calls"
     )
+    assert torch.equal(_bits(direct["dw"]), _bits(ops["dout"] * out_e))
     assert _same(plain, direct), "plain checkpoint differs from the direct pass"
     assert _same(got, plain), (
         "checkpoint with a handle differs from the plain checkpoint"
@@ -3687,16 +3765,10 @@ def test_gpu_recompute_handle_is_bitwise_and_exchange_free(
     assert not any(s.startswith("a2a:") for s in recs[1]["sequence"]), recs[1][
         "sequence"
     ]
-    # the recompute launches the original forward's programs minus the exchange and its feeders only
-    removed = [s for s in recs[0]["sequence"] if s not in recs[1]["sequence"]]
-    assert set(removed) <= {
-        "a2a:c1",
-        "a2a:c2",
-        "kcp_affine_merge",
-        "kcp_fwdh_offset",
-        "kcp_transfer_walk",
-        "kcp_transpose_tiles",
-    }, removed
+    # the recompute launches the original forward's programs in order minus the exchange and its feeders only
+    removed = _removed_launches(recs[0]["sequence"], recs[1]["sequence"])
+    assert removed.count("a2a:c1") == 1 and removed.count("a2a:c2") == 1, removed
+    assert _removed_launches(recs_plain[0]["sequence"], recs_plain[1]["sequence"]) == []
     if (
         reentrant
     ):  # the recompute runs inside the backward without a context_fn: counted as "bwd"
@@ -3710,9 +3782,11 @@ def test_gpu_recompute_handle_is_bitwise_and_exchange_free(
         {"S_in", "c1_recv"} if keep == "transfer" else {"S_in"}
     )
     assert entry["ctx"] is ctx
-    assert handle.nbytes() == kp.kcp_saved_bytes(
-        ctx, H=H, checkpoint_keep=keep, with_conv=False
-    )
+    assert (
+        handle.nbytes()
+        == kp.kcp_saved_bytes(ctx, H=H, checkpoint_keep=keep, with_conv=False)
+        == 0
+    )  # one rank: empty (see the docstring)
     assert recs[0]["P"] == recs[1]["P"]
     handle.clear()
     assert handle.nbytes() == 0 and not handle.entries
@@ -3737,7 +3811,7 @@ def test_gpu_recompute_handle_retain_graph_early_stop_and_nesting(
     )
     monkeypatch.undo()
     assert cc.table() == {"orig": 2, "recompute": 0, "bwd": 4}
-    for n in TENSOR_NAMES[1:]:
+    for n in (*TENSOR_NAMES[1:], "dw"):
         assert torch.equal(_bits(twice[n]), _bits(direct[n] + direct[n])), n
     for keep in ("states", "transfer"):
         cc = _PhaseCounter(monkeypatch)
@@ -3762,21 +3836,25 @@ def test_gpu_recompute_handle_retain_graph_early_stop_and_nesting(
             ops[n].detach().clone().requires_grad_(True)
             for n in ("q", "k", "v", "g", "beta")
         ]
+        w = torch.ones_like(ops["dout"]).requires_grad_(True)
+        outs = []
 
         def inner(q_, k_, v_, g_, b_, h_):
-            return cake_kcp.chunk_kda_kcp(q_, k_, v_, g_, b_, ctx, recompute_handle=h_)
+            y = cake_kcp.chunk_kda_kcp(q_, k_, v_, g_, b_, ctx, recompute_handle=h_)
+            outs.append(y.detach().clone())
+            return y
 
-        def outer(q_, k_, v_, g_, b_, h_):
+        def outer(q_, k_, v_, g_, b_, h_, w_):
             hh = cake_kcp.KcpRecomputeHandle() if inside else h_
             yi = checkpoint(inner, q_, k_, v_, g_, b_, hh, use_reentrant=False)
-            return yi * torch.ones_like(
-                yi
-            )  # saves a tensor of the outer region; no bit changes
+            # the product saves the outer recompute's yi (its backward reads it); no bit of out or dout changes
+            return yi * w_
 
         out = checkpoint(
             outer,
             *leaves,
             cake_kcp.KcpRecomputeHandle(),
+            w,
             use_reentrant=False,
             context_fn=lambda: (contextlib.nullcontext(), counter.recompute_cm()),
         )
@@ -3784,7 +3862,10 @@ def test_gpu_recompute_handle_retain_graph_early_stop_and_nesting(
         out.backward(ops["dout"])
         table = counter.table()
         monkeypatch.undo()
-        res = {"out": out.detach()}
+        assert len(outs) >= 2 and all(
+            torch.equal(_bits(o), _bits(outs[0])) for o in outs[1:]
+        ), len(outs)
+        res = {"out": out.detach(), "dw": w.grad}
         res.update(
             {
                 f"d{n}": lf.grad
@@ -3801,6 +3882,51 @@ def test_gpu_recompute_handle_retain_graph_early_stop_and_nesting(
     assert out_table == {"orig": 2, "recompute": 0, "bwd": 2}, out_table
     # inside the outer region: the outer recompute's inner forward is an original forward (exchanges, stores)
     assert in_table == {"orig": 2, "recompute": 2, "bwd": 2}, in_table
+
+
+@pytest.mark.parametrize("lengths,H", CKPT_ROWS, ids=CKPT_IDS)
+def test_gpu_recompute_handle_overlap_schedule_and_ring(
+    device, monkeypatch, lengths, H
+) -> None:
+    """The bound branch of the overlap schedule (``_kcp_test_knobs={"schedule": "overlap"}``, both tiers) and the
+    ring exchange (``"states"``, both schedules): the handle's recompute issues no exchange, its launches are the
+    original's in order minus the exchange and its feeders, and every result (the recompute's ``out`` included) is
+    bitwise the plain checkpoint's of the same options, the direct pass's of the same options and the shipped direct
+    pass's.  One rank: no document crosses a rank, so the ring has no hop; under the overlap schedule the
+    document-start (forward) and document-end (backward) tape walks then run alone -- they used to be skipped,
+    leaving those rows of ``out`` and of the gradients unwritten.  Every pass starts from a poisoned allocator
+    (:func:`_poison`), so an unwritten row reads as NaN."""
+    ctx, ops = _ckpt_problem(device, lengths, H)
+    shipped, _ = _ckpt_pass(ctx, ops, ckpt=False, poison=True)
+    monkeypatch.setattr(kp, "_TEST_KNOBS_ENABLED", True)
+    overlap = {"_kcp_test_knobs": {"schedule": "overlap"}}
+    arms = [
+        ("overlap", overlap, "states"),
+        ("overlap", overlap, "transfer"),
+        ("ring", {"exchange": "ring"}, "states"),
+        ("ring_overlap", {"exchange": "ring", **overlap}, "states"),
+    ]
+    for name, opts, keep in arms:
+        tag = (name, keep)
+        direct, _ = _ckpt_pass(ctx, ops, ckpt=False, poison=True, **opts)
+        plain, recs_plain = _ckpt_pass(ctx, ops, poison=True, **opts)
+        handle = cake_kcp.KcpRecomputeHandle()
+        got, recs = _ckpt_pass(ctx, ops, handle=handle, keep=keep, poison=True, **opts)
+        assert _same(direct, shipped), f"{tag}: direct differs from the shipped form"
+        assert _same(plain, direct), f"{tag}: plain checkpoint differs"
+        assert _same(got, plain), f"{tag}: checkpoint with a handle differs"
+        assert recs[0]["recompute_handle"] == "capture", tag
+        assert recs[1]["recompute_handle"] == "replay", tag
+        assert recs[1]["n_collectives"] == 0, tag
+        assert recs_plain[1]["n_collectives"] == recs_plain[0]["n_collectives"], tag
+        assert recs[0]["n_collectives"] == (0 if name.startswith("ring") else 2), tag
+        _removed_launches(recs[0]["sequence"], recs[1]["sequence"])
+        assert not any(s.startswith(("a2a:", "ring:")) for s in recs[1]["sequence"]), (
+            tag
+        )
+        assert sorted(handle.entries[cake_kcp.HANDLE_KEY]) == sorted(
+            ["S_in", "ctx", "fingerprint"] + (["c1_recv"] if keep == "transfer" else [])
+        ), tag
 
 
 def test_gpu_recompute_handle_misuse_raises(device, monkeypatch) -> None:
@@ -3932,7 +4058,7 @@ def test_gpu_recompute_handle_misuse_raises(device, monkeypatch) -> None:
             for n, lf in zip(("q", "k", "v", "g", "beta"), leaves, strict=True)
         }
     )
-    assert _same(res, direct)
+    assert _same(res, direct, TENSOR_NAMES)
     # a torch without the phase binding refuses the handle (and only the handle)
     monkeypatch.setattr(cake_kcp, "_GRAPH_TASK_ID_USABLE", False)
     with pytest.raises(RuntimeError, match="_current_graph_task_id"):
@@ -3996,7 +4122,8 @@ def test_recompute_handle_byte_queries(W) -> None:
     """CPU: ``kcp_saved_bytes(checkpoint_keep=...)`` is the handle's retained bytes -- ``S_in`` (+ the c1 receive
     tensor under ``"transfer"``) as the call's pools size them, + one convolution's hist pool with ``with_conv`` --
     and ``kcp_comm_bytes(checkpoint_keep=...)`` is the table of the tier's ``save_transfer`` plus the tier and an empty
-    recompute; ``None`` keeps both queries unchanged."""
+    recompute; ``None`` keeps both queries unchanged; an explicit ``save_transfer`` that contradicts the tier raises
+    in both, as in the entry point."""
     for lengths, layout in (
         ((700, 1, 1300, 999), "zigzag_per_document"),
         ((3000,), "contiguous"),
@@ -4022,9 +4149,9 @@ def test_recompute_handle_byte_queries(W) -> None:
                     q(ctx, H=H, checkpoint_keep="transfer", with_conv=False) == transfer
                 )
                 assert q(ctx, H=H, C=512, checkpoint_keep="states") == states + hist
-                assert q(ctx, H=H, checkpoint_keep="states", save_transfer=True) == q(
-                    ctx, H=H, checkpoint_keep="states", save_transfer=False
-                )
+                assert q(ctx, H=H, checkpoint_keep="states", save_transfer=False) == q(
+                    ctx, H=H, checkpoint_keep="states"
+                )  # an agreeing explicit value; a contradicting one raises (below)
                 assert q(ctx, H=H) == q(ctx, H=H, checkpoint_keep=None)
                 for keep, st in (("states", False), ("transfer", True)):
                     cb = kp.kcp_comm_bytes(ctx, H=H, checkpoint_keep=keep)
@@ -4040,6 +4167,17 @@ def test_recompute_handle_byte_queries(W) -> None:
         kp.kcp_comm_bytes(ctx, checkpoint_keep="all")
     with pytest.raises(ValueError, match="boundary_mode='saved'"):
         kp.kcp_comm_bytes(ctx, checkpoint_keep="states", boundary_mode="replay")
+    for keep, contradicting in (("states", True), ("transfer", False)):
+        with pytest.raises(ValueError, match="contradicts"):
+            kp.kcp_saved_bytes(ctx, checkpoint_keep=keep, save_transfer=contradicting)
+        with pytest.raises(ValueError, match="contradicts"):
+            kp.kcp_comm_bytes(ctx, checkpoint_keep=keep, save_transfer=contradicting)
+        assert kp.kcp_comm_bytes(
+            ctx, checkpoint_keep=keep, save_transfer=not contradicting
+        ) == kp.kcp_comm_bytes(ctx, checkpoint_keep=keep)
+    assert kp.kcp_saved_bytes(ctx, save_transfer=None) == kp.kcp_saved_bytes(
+        ctx, save_transfer=kp.SAVE_TRANSFER_DEFAULT
+    )
 
 
 # --------------------------------------------------------------------------- FP64 fake backend (`-k fake`)

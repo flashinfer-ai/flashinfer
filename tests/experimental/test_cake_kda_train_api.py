@@ -489,7 +489,8 @@ def test_kcp_recompute_handle_keywords_are_forwarded(
 ) -> None:
     """The KCP checkpoint recompute handle on the public module (issue #7815): ``chunk_kda_kcp`` takes
     ``recompute_handle`` / ``checkpoint_keep`` keyword-only and forwards both (``None`` by default);
-    ``kcp_saved_bytes`` / ``kcp_comm_bytes`` forward ``checkpoint_keep``; ``KcpRecomputeHandle`` resolves lazily to
+    ``kcp_saved_bytes`` / ``kcp_comm_bytes`` forward ``checkpoint_keep`` (and ``save_transfer=None`` under a tier,
+    ``False`` without one); ``KcpRecomputeHandle`` resolves lazily to
     the KCP module's class.  Device-free (recorders)."""
     from flashinfer.experimental.cake_kda_train import cake_kcp, cake_kcp_plan
 
@@ -518,52 +519,67 @@ def test_kcp_recompute_handle_keywords_are_forwarded(
         assert public_api.chunk_kda_kcp(*operands, exchange="ring") == "autograd"
         assert public_api.kcp_saved_bytes(ctx, checkpoint_keep="states") == "saved"
         assert public_api.kcp_comm_bytes(ctx, H=4, checkpoint_keep="states") == "comm"
+        assert public_api.kcp_comm_bytes(ctx, H=4) == "comm"
     base = {
         "scale": None,
         "save_mode": "light",
         "boundary_mode": "saved",
         "workspace": None,
     }
-    assert calls == [
-        (
-            "autograd",
-            operands,
-            {**base, "recompute_handle": handle, "checkpoint_keep": "transfer"},
-        ),
-        (
-            "autograd",
-            operands,
-            {
-                **base,
-                "recompute_handle": None,
-                "checkpoint_keep": None,
-                "exchange": "ring",
-            },
-        ),
-        (
-            "saved",
-            (ctx,),
-            {
-                "H": 64,
-                "save_mode": "light",
-                "save_transfer": False,
-                "with_conv": True,
-                "C": 8192,
-                "checkpoint_keep": "states",
-            },
-        ),
-        (
-            "comm",
-            (ctx,),
-            {
-                "H": 4,
-                "C": 8192,
-                "save_transfer": False,
-                "boundary_mode": "saved",
-                "checkpoint_keep": "states",
-            },
-        ),
-    ]
+    assert (
+        calls
+        == [
+            (
+                "autograd",
+                operands,
+                {**base, "recompute_handle": handle, "checkpoint_keep": "transfer"},
+            ),
+            (
+                "autograd",
+                operands,
+                {
+                    **base,
+                    "recompute_handle": None,
+                    "checkpoint_keep": None,
+                    "exchange": "ring",
+                },
+            ),
+            (
+                "saved",
+                (ctx,),
+                {
+                    "H": 64,
+                    "save_mode": "light",
+                    "save_transfer": None,
+                    "with_conv": True,
+                    "C": 8192,
+                    "checkpoint_keep": "states",
+                },
+            ),
+            (
+                "comm",
+                (ctx,),
+                {
+                    "H": 4,
+                    "C": 8192,
+                    "save_transfer": None,  # the tier fixes it (an explicit contradicting value raises in the query)
+                    "boundary_mode": "saved",
+                    "checkpoint_keep": "states",
+                },
+            ),
+            (
+                "comm",
+                (ctx,),
+                {
+                    "H": 4,
+                    "C": 8192,
+                    "save_transfer": False,  # no tier: the public default, unchanged
+                    "boundary_mode": "saved",
+                    "checkpoint_keep": None,
+                },
+            ),
+        ]
+    )
     params = inspect.signature(public_api.chunk_kda_kcp).parameters
     for name in ("recompute_handle", "checkpoint_keep"):
         assert params[name].kind is inspect.Parameter.KEYWORD_ONLY

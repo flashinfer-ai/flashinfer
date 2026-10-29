@@ -2306,11 +2306,25 @@ def _check_save_mode(save_mode: str) -> None:
 CHECKPOINT_KEEPS = ("states", "transfer")
 
 
-def _check_checkpoint_keep(checkpoint_keep: str | None) -> None:
-    if checkpoint_keep is not None and checkpoint_keep not in CHECKPOINT_KEEPS:
+def _check_checkpoint_keep(
+    checkpoint_keep: str | None, save_transfer: bool | None
+) -> bool:
+    """The ``save_transfer`` a byte query reads: ``None`` -> ``SAVE_TRANSFER_DEFAULT`` without a tier; a tier fixes it
+    (``"states"`` -> ``False``, ``"transfer"`` -> ``True``) and an explicit value that contradicts it raises, as the
+    entry point does."""
+    if checkpoint_keep is None:
+        return SAVE_TRANSFER_DEFAULT if save_transfer is None else bool(save_transfer)
+    if checkpoint_keep not in CHECKPOINT_KEEPS:
         raise ValueError(
             f"checkpoint_keep must be None or one of {CHECKPOINT_KEEPS}, got {checkpoint_keep!r}"
         )
+    transfer = checkpoint_keep == "transfer"
+    if save_transfer is not None and bool(save_transfer) != transfer:
+        raise ValueError(
+            f"checkpoint_keep={checkpoint_keep!r} runs the call with save_transfer={transfer}; "
+            f"save_transfer={save_transfer!r} contradicts it"
+        )
+    return transfer
 
 
 def kcp_saved_bytes(
@@ -2318,7 +2332,7 @@ def kcp_saved_bytes(
     *,
     H: int = 64,
     save_mode: str = "light",
-    save_transfer: bool = SAVE_TRANSFER_DEFAULT,
+    save_transfer: bool | None = None,
     with_conv: bool = True,
     C: int = 8192,
     saved_carry: bool = True,
@@ -2356,10 +2370,12 @@ def kcp_saved_bytes(
     + ["transfer"] * N_out * 2 * s * Hg_r / H                  # the owner's whole c1 receive tensor
     + [with_conv] * n_hist_rows * C * 2                        # one convolution's hist pool (BF16)
 
-    The tier fixes ``save_transfer`` (``False`` / ``True``); ``save_mode``, ``save_transfer`` and ``saved_carry``
-    are not read.  The saved set itself is released by the checkpoint as before (#7039)."""
+    The tier fixes ``save_transfer`` (``False`` / ``True``; ``None``, the default, is ``SAVE_TRANSFER_DEFAULT``
+    without a tier; an explicit value that contradicts the tier raises ``ValueError``, as the entry point does);
+    ``save_mode`` and ``saved_carry`` are not read.  The saved set itself is released by the checkpoint as before
+    (#7039)."""
     _check_save_mode(save_mode)
-    _check_checkpoint_keep(checkpoint_keep)
+    save_transfer = _check_checkpoint_keep(checkpoint_keep, save_transfer)
     H, C = int(H), int(C)
     hp = ctx.heads(H)
     if checkpoint_keep is not None:
@@ -2392,7 +2408,7 @@ def kcp_comm_bytes(
     *,
     H: int = 64,
     C: int = 8192,
-    save_transfer: bool = SAVE_TRANSFER_DEFAULT,
+    save_transfer: bool | None = None,
     boundary_mode: str = "saved",
     checkpoint_keep: str | None = None,
 ) -> dict:
@@ -2407,22 +2423,21 @@ def kcp_comm_bytes(
     ``pad_tiles_per_slot``; all zero for the production ``H = 64``.
 
     ``checkpoint_keep`` (``"states"`` | ``"transfer"``; ``None`` = the table above): the traffic of a checkpointed
-    step with a recompute handle of that tier.  The tier fixes ``save_transfer`` (``False`` / ``True``; the
-    argument is not read), so ``B2`` (``b1`` in the ``dm`` form under ``"states"``) is the backward's traffic; the
-    recompute moves nothing (``recompute``: no c1 / c2, and no ``halo_fwd`` when the convolution carries its own
-    handle), so the step moves ``B1 + B2`` instead of the ``B1 + B1 + B2`` of a checkpoint without a handle; the
-    table also reports ``checkpoint_keep``."""
+    step with a recompute handle of that tier.  The tier fixes ``save_transfer`` (``False`` / ``True``; an explicit
+    value that contradicts it raises ``ValueError``, as the entry point does; ``None``, the default, is
+    ``SAVE_TRANSFER_DEFAULT`` without a tier), so ``B2`` (``b1`` in the ``dm`` form under ``"states"``) is the
+    backward's traffic; the recompute moves nothing (``recompute``: no c1 / c2, and no ``halo_fwd`` when the
+    convolution carries its own handle), so the step moves ``B1 + B2`` instead of the ``B1 + B1 + B2`` of a
+    checkpoint without a handle; the table also reports ``checkpoint_keep``."""
     if boundary_mode not in ("saved", "replay"):
         raise ValueError(
             f"boundary_mode must be 'saved' or 'replay', got {boundary_mode!r}"
         )
-    _check_checkpoint_keep(checkpoint_keep)
-    if checkpoint_keep is not None:
-        if boundary_mode != "saved":
-            raise ValueError(
-                "checkpoint_keep describes a saved-mode call: it needs boundary_mode='saved'"
-            )
-        save_transfer = checkpoint_keep == "transfer"
+    save_transfer = _check_checkpoint_keep(checkpoint_keep, save_transfer)
+    if checkpoint_keep is not None and boundary_mode != "saved":
+        raise ValueError(
+            "checkpoint_keep describes a saved-mode call: it needs boundary_mode='saved'"
+        )
     H, C = int(H), int(C)
     hp = ctx.heads(H)
     sp, halo = hp.splits, ctx.halo

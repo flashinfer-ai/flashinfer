@@ -610,8 +610,10 @@ def chunk_kda_kcp(
     checkpoint_keep : str, optional
         With a handle only.  ``"states"`` (default): the handle keeps ``S_in`` and the call runs with
         ``save_transfer=False`` (bitwise the default form; the backward re-sends the maps).  ``"transfer"``: it also
-        keeps the owner's c1 receive tensor (``save_transfer=True``; not with ``exchange="ring"``).  The retained
-        bytes are ``kcp_saved_bytes(ctx, H=..., checkpoint_keep=..., with_conv=False)``.
+        keeps the owner's c1 receive tensor (``save_transfer=True``; not with ``exchange="ring"``).  An explicit
+        ``save_transfer`` must agree with the tier (``"states"`` -> ``False``, ``"transfer"`` -> ``True``); a
+        contradicting value raises ``ValueError``.  The retained bytes are ``kcp_saved_bytes(ctx, H=...,
+        checkpoint_keep=..., with_conv=False)``.
 
     Returns
     -------
@@ -679,7 +681,7 @@ def kcp_saved_bytes(
     *,
     H: int = 64,
     save_mode: str = "light",
-    save_transfer: bool = False,
+    save_transfer: Optional[bool] = None,
     with_conv: bool = True,
     C: int = 8192,
     checkpoint_keep: Optional[str] = None,
@@ -687,9 +689,12 @@ def kcp_saved_bytes(
     """Bytes of this rank's KCP saved set for ``H`` heads: the local saved set (:func:`kda_train_saved_bytes`), the
     boundary states, and (``with_conv``) the convolution's history rows of ``C`` channels.  ``checkpoint_keep``
     (``"states"`` | ``"transfer"``): instead the bytes a recompute handle of that tier retains for the layer
-    (:func:`chunk_kda_kcp`; plus one convolution's history rows with ``with_conv``)."""
+    (:func:`chunk_kda_kcp`; plus one convolution's history rows with ``with_conv``).  ``save_transfer``: ``None``
+    is ``False`` without a tier; with one, an explicit value that contradicts it raises ``ValueError``."""
     from .experimental.cake_kda_train import cake_kcp_plan
 
+    if save_transfer is None and checkpoint_keep is None:
+        save_transfer = False
     return cake_kcp_plan.kcp_saved_bytes(
         ctx,
         H=H,
@@ -707,16 +712,19 @@ def kcp_comm_bytes(
     *,
     H: int = 64,
     C: int = 8192,
-    save_transfer: bool = False,
+    save_transfer: Optional[bool] = None,
     boundary_mode: str = "saved",
     checkpoint_keep: Optional[str] = None,
 ) -> dict:
     """Bytes this rank sends and receives in one training step (forward and backward) for ``H`` heads and ``C``
     convolution channels: the state summaries, the boundary states and the halo rows of the context's collectives,
     as a table per collective and per boundary (``cake_kcp_plan.kcp_comm_bytes``).  ``checkpoint_keep``: the
-    traffic of a checkpointed step with a recompute handle of that tier (the tier fixes ``save_transfer``)."""
+    traffic of a checkpointed step with a recompute handle of that tier (the tier fixes ``save_transfer``; ``None``
+    is ``False`` without a tier; an explicit value that contradicts the tier raises ``ValueError``)."""
     from .experimental.cake_kda_train import cake_kcp_plan
 
+    if save_transfer is None and checkpoint_keep is None:
+        save_transfer = False
     return cake_kcp_plan.kcp_comm_bytes(
         ctx,
         H=H,

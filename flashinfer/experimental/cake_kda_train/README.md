@@ -773,11 +773,14 @@ nested regions).  `checkpoint_keep="states"` (the default) keeps `S_in` only
 and runs the call with `save_transfer=False` (the backward re-sends the maps
 in b1; bitwise the default form); `checkpoint_keep="transfer"` also keeps the
 owner's c1 receive tensor (`save_transfer=True`; not with the ring exchange).
-The handle retains `kcp_saved_bytes(ctx, H=..., checkpoint_keep=...,
-with_conv=False)` bytes for the KDA entry until it is dropped (`with_conv`
-adds one convolution's history rows); `kcp_comm_bytes(ctx, ...,
-checkpoint_keep=...)` reports the step's traffic (`B1 + B2`, the recompute
-moves nothing).  Rules: create the handles outside the outermost checkpoint
+An explicit `save_transfer` that contradicts the tier raises `ValueError`, in
+the entry point and in both byte queries.  The handle retains
+`kcp_saved_bytes(ctx, H=..., checkpoint_keep=..., with_conv=False)` bytes for
+the KDA entry until it is dropped (`with_conv` adds one convolution's history
+rows); `kcp_comm_bytes(ctx, ..., checkpoint_keep=...)` reports the step's
+traffic (`B1 + B2`; the recompute moves nothing when the layer's convolutions
+carry handles too -- a convolution without one still sends its `halo_fwd`
+rows in the recompute).  Rules: create the handles outside the outermost checkpoint
 region (a handle created inside a region is empty in that region's recompute,
 which then exchanges -- correct, not communication-free); a forward outside
 the backward that finds an entry raises (a handle reused across micro-steps);
