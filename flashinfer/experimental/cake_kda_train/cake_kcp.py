@@ -4172,14 +4172,7 @@ def _ring_forward(call: KcpCall) -> None:
             ],
         )
         if h == 1 and call.schedule == "overlap":
-            carry = (
-                call.indexed("carry", tb.carry_index, tb.carry_tiles)
-                if tb.P > 1
-                else None
-            )
-            call.walk(
-                "kcp_fwdh_tape", tb.walk_start, h0=carry, out=call.out
-            )  # document starts: under hop 1 (R7)
+            _ring_start_walk(call)  # document starts: under hop 1 (R7)
         _ring_wait(works)
         for f in receivers:
             _ring_scatter(
@@ -4191,6 +4184,29 @@ def _ring_forward(call: KcpCall) -> None:
                 tb.s_in_tiles,
                 ring.in_slot[f.slot],
             )
+    if (
+        ring.hops == 0 and call.schedule == "overlap"
+    ):  # no document crosses a rank: no hop 1 to hide it under, the walk still writes the document starts' rows
+        _ring_start_walk(call)
+
+
+def _ring_start_walk(call: KcpCall) -> None:
+    """The overlap schedule's document-start tape walk of the ring forward (under hop 1; alone when there is none)."""
+    tb = call.tb
+    carry = call.indexed("carry", tb.carry_index, tb.carry_tiles) if tb.P > 1 else None
+    call.walk("kcp_fwdh_tape", tb.walk_start, h0=carry, out=call.out)
+
+
+def _ring_end_walk(call: KcpCall) -> None:
+    """The overlap schedule's ``dcarry_end`` merge and document-end tape walk of the ring backward (under hop 1;
+    alone when there is none)."""
+    tb = call.tb
+    dcarry = (
+        call.indexed("carry", tb.dcarry_index, tb.carry_tiles) if tb.P > 1 else None
+    )
+    if tb.P > 1:
+        call.merge("dcarry_end")
+    call.walk("kcp_dhu_tape", tb.walk_end, dht=dcarry)
 
 
 def _ring_backward(call: KcpCall) -> None:
@@ -4251,16 +4267,7 @@ def _ring_backward(call: KcpCall) -> None:
             ],
         )
         if h == 1 and call.schedule == "overlap":
-            dcarry = (
-                call.indexed("carry", tb.dcarry_index, tb.carry_tiles)
-                if tb.P > 1
-                else None
-            )
-            if tb.P > 1:
-                call.merge("dcarry_end")
-            call.walk(
-                "kcp_dhu_tape", tb.walk_end, dht=dcarry
-            )  # document ends: under hop 1 (R7)
+            _ring_end_walk(call)  # document ends: under hop 1 (R7)
         _ring_wait(works)
         for f in receivers:
             _ring_scatter(
@@ -4272,6 +4279,8 @@ def _ring_backward(call: KcpCall) -> None:
                 tb.ds_out_tiles,
                 ring.out_slot[f.slot],
             )
+    if ring.hops == 0 and call.schedule == "overlap":  # the mirror of _ring_forward's
+        _ring_end_walk(call)
 
 
 def _summaries(call: KcpCall) -> None:
