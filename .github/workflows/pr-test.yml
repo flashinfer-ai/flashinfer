@@ -463,6 +463,10 @@ jobs:
           SCCACHE_REGION: ${{ vars.SCCACHE_REGION }}
           AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
+          # Provider builds overlapped per job (see the script). The repository
+          # variable AOT_PROVIDER_CONCURRENCY overrides it, and 1 restores the
+          # serial loop, for A/B timing without a code change.
+          AOT_PROVIDER_CONCURRENCY: ${{ vars.AOT_PROVIDER_CONCURRENCY || '2' }}
         run: |
           if [ "${TEST_SCRIPT}" != "task_test_jit_cache_package_build_import.sh" ]; then
             echo "::error::Unexpected AOT test script: ${TEST_SCRIPT}"
@@ -475,6 +479,7 @@ jobs:
             -e AWS_ACCESS_KEY_ID \
             -e AWS_SECRET_ACCESS_KEY \
             -e SCCACHE_STATS_DIR /workspace/sccache-stats \
+            -e AOT_PROVIDER_CONCURRENCY "${AOT_PROVIDER_CONCURRENCY}" \
             --no-gpu "./scripts/${TEST_SCRIPT}"
 
       - name: Run Test

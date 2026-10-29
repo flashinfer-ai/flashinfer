@@ -76,6 +76,36 @@ compute_jit_cache_parallelism() {
   export MEM_PER_JOB=$mem_per_job
 }
 
+# Run "FUNCTION ITEM" for every ITEM, at most CONCURRENCY at a time, as a pool: a
+# finished item frees its slot for the next one. Output of different items
+# interleaves, so FUNCTION should prefix its own lines. On the first failure the
+# running items are killed and no more start.
+#
+# Args: $1 - CONCURRENCY (>= 1), $2 - function name, $3... - items.
+# Returns 0 when every item succeeded, else 1. Needs bash >= 4.3 (wait -n).
+run_bounded_parallel() {
+  local limit=$1 fn=$2
+  shift 2
+  local item failed=0
+  for item in "$@"; do
+    while (( $(jobs -rp | wc -l) >= limit )); do
+      wait -n || failed=1
+      (( failed )) && break
+    done
+    (( failed )) && break
+    "$fn" "$item" &
+  done
+  if (( failed )); then
+    kill $(jobs -rp) 2>/dev/null || true
+  fi
+  # Reaps what is left; a job that fails after the loop ended counts too.
+  local pid
+  for pid in $(jobs -p); do
+    wait "$pid" || failed=1
+  done
+  return $failed
+}
+
 # Verify that the selected compiler matches the CUDA matrix entry.
 #
 # Args:

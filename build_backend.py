@@ -1092,7 +1092,11 @@ def _create_data_dir(use_symlinks=True):
     def ln(source: str, target: str) -> None:
         src = _root / source
         dst = _data_dir / target
-        if dst.exists():
+        if use_symlinks and dst.is_symlink() and dst.resolve() == src.resolve():
+            # Already correct. Concurrent provider builds call this at start-up,
+            # and unlinking a link another build is compiling through breaks it.
+            return
+        if dst.exists() or dst.is_symlink():
             if dst.is_symlink():
                 dst.unlink()
             elif dst.is_dir():
