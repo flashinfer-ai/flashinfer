@@ -6125,6 +6125,151 @@ def test_memory_plan_forms():
         opt_in.memory_plan("other", **small)
 
 
+def test_memory_plan_counts_the_x_copy():
+    """An uncompacted call whose ``X`` is copied contiguously (``x_copy``: a leading stride or base that is not a TMA
+    pitch) counts the BF16 ``[T, H]`` copy while it lives: at a shape where the form picked without it peaks in the
+    chunk loop, that form's predicted peak plus the copy exceeds the head's bytes, and the rule picks a recompute form
+    within the same budget instead; a compacted call (the per-chunk gather reads ``X`` in place) plans as without a
+    copy."""
+    g = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
+    T, H, V, C = 4096, 1024, 4096, 1024
+    head = 2 * T * V + 2 * V * H + 2 * T * H
+    args = dict(num_rows=T, rows=T, hidden=H, vocab=V, chunk=C, geometry=g)
+    for entry in ("loss", "logprob"):
+        plain = opt_in.memory_plan(entry, compact=False, **args)
+        copied = opt_in.memory_plan(entry, compact=False, x_copy=True, **args)
+        key = (entry, plain, copied)
+        assert copied.budget_bytes == plain.budget_bytes < head, key
+        assert plain.fits and plain.predicted_bytes + 2 * T * H > head, key
+        assert copied.fits and copied.recompute and copied != plain, key
+        assert opt_in.memory_plan(
+            entry, compact=True, x_copy=True, **args
+        ) == opt_in.memory_plan(entry, compact=True, **args), key
+
+
+def test_memory_plan_counts_the_dx_cast():
+    """The buffers a binding allocates together sit within the predicted peak: an uncompacted log-probability backward
+    (and a compacted one without the fused dX finalize) allocates the BF16 ``[rows, H]`` dX cast next to the FP32 dX
+    accumulator, the weight-gradient buffers and a chunk's logits before its chunk loop; a compacted loss backward
+    without the fused finalize casts the dX rows before it scatters them into the ``[T, H]`` output, with the
+    accumulators still alive."""
+    g = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
+    T, H, V, C = 16384, 512, 2048, 4096
+    for R, compact, extra in (
+        (T, False, {}),
+        (T, False, dict(dx_finalize=False)),
+        (12288, True, dict(dx_finalize=False)),
+    ):
+        mp = opt_in.memory_plan(
+            "logprob",
+            num_rows=T,
+            rows=R,
+            hidden=H,
+            vocab=V,
+            chunk=C,
+            compact=compact,
+            geometry=g,
+            **extra,
+        )
+        n = -(-R // C)
+        fused = mp.form == "fused"
+        dw = (4 * mp.dw_rows * H if (n > 1 or not fused) else 0) + (
+            2 * V * H if fused else 0
+        )
+        loop = 4 * R * H + 2 * R * H + dw + 2 * min(C, R) * V
+        assert mp.fits and mp.predicted_bytes >= loop, (R, compact, extra, mp, loop)
+    # a compacted loss backward without the fused finalize: accumulators, the compact BF16 rows and the [T, H] output
+    R = 12288
+    mp = opt_in.memory_plan(
+        "loss",
+        num_rows=T,
+        rows=R,
+        hidden=H,
+        vocab=V,
+        chunk=C,
+        dx_finalize=False,
+        geometry=g,
+    )
+    held = 4 * R * H + 4 * mp.dw_rows * H + 2 * R * H + 2 * T * H
+    assert mp.fits and mp.predicted_bytes >= held, (mp, held)
+
+
+def test_memory_plan_counts_the_allocator_blocks():
+    """Every tensor the model counts carries the default caching allocator's bound (``PYTORCH_CUDA_ALLOC_CONF``
+    unset): 512 bytes of rounding, and a 1 MiB unsplit remainder for a tensor of 1 MiB or more.  A one-chunk loss call
+    without dX in the fused form peaks in its last phase -- the chunk's logits, the BF16 ``dW`` and the row vectors --
+    and its prediction is exactly those tensors with their bounds."""
+    MiB = 1 << 20
+    blocks = opt_in._allocated_bytes
+    assert blocks(0) == 0 and blocks(64, 0) == 0
+    assert blocks(4) == 4 + 512 and blocks(MiB - 512) == MiB
+    assert blocks(MiB) == 2 * MiB + 512 and blocks(3 * MiB, 2) == 2 * (4 * MiB + 512)
+    g = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
+    T, H, V = 1024, 512, 4096
+    mp = opt_in.memory_plan(
+        "loss",
+        num_rows=T,
+        rows=T,
+        hidden=H,
+        vocab=V,
+        chunk=T,
+        need_dx=False,
+        compact=False,
+        recompute=False,
+        geometry=g,
+    )
+    last = blocks(2 * T * V) + blocks(2 * V * H) + blocks(4 * T, 4) + blocks(4 * T, 8)
+    assert mp.form == "fused" and mp.predicted_bytes == last, (mp, last)
+    assert mp.budget_bytes < 2 * T * V + 2 * V * H < mp.predicted_bytes and not mp.fits
+
+
+def test_memory_plan_without_the_hidden_count():
+    """Why a budget call runs without the hidden valid-row count: the count's chunk-0 buffers take ``min(chunk, T)``
+    rows before the count is known, and with fewer valid rows than a chunk among several chunks of rows (H 512,
+    V 65536, T 8192, chunk 2048, 1024 rows valid) the plan on buffers of the valid rows fits while the plan on a whole
+    chunk's buffers does not."""
+    g = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
+    T, H, V, C, R = 8192, 512, 65536, 2048, 1024
+    args = dict(num_rows=T, rows=R, hidden=H, vocab=V, chunk=C, geometry=g)
+    for entry in ("loss", "logprob"):
+        valid = opt_in.memory_plan(entry, **args)
+        chunk0 = opt_in.memory_plan(entry, buffer_rows=C, **args)
+        assert valid.fits and not chunk0.fits, (entry, valid, chunk0)
+
+
+def test_memory_plan_budgets_the_valid_rows():
+    """The budget covers the logits of the valid rows (``budget_rows``, default ``rows``) whatever rows the chunk loop
+    runs over: an uncompacted call (``rows = T``) with a third of the rows ignored (flashinfer#7545's H 6144, V 154880,
+    T 16384) budgets ``2 * T_v * V + 2 * V * H + 2 * T * H`` -- the budget of the compacted call with the same valid
+    rows -- while its model still counts the ``T`` rows of its chunk loop: the form that fits the budget of all ``T``
+    rows predicts a peak above it, and the plan picks a recompute form within it instead."""
+    g = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
+    T, H, V, C, Tv = 16384, 6144, 154880, 4096, 10977
+    head = 2 * Tv * V + 2 * V * H + 2 * T * H
+    budget = head - math.ceil(head * opt_in.MEMORY_BUDGET_MARGIN)
+    shape = dict(num_rows=T, hidden=H, vocab=V, chunk=C, geometry=g)
+    for entry in ("loss", "logprob"):
+        every = opt_in.memory_plan(entry, rows=T, compact=False, **shape)
+        assert (
+            opt_in.memory_plan(entry, rows=T, compact=False, budget_rows=T, **shape)
+            == every
+        ), entry
+        valid = opt_in.memory_plan(
+            entry, rows=T, compact=False, budget_rows=Tv, **shape
+        )
+        compacted = opt_in.memory_plan(entry, rows=Tv, **shape)
+        key = (entry, every, valid, compacted)
+        assert valid.budget_bytes == compacted.budget_bytes == budget, key
+        assert budget < every.budget_bytes and every.fits, key
+        assert every.predicted_bytes > budget, key
+        assert valid.fits and valid.recompute and valid != every, key
+    for rows, budget_rows in ((T, -1), (T, T + 1), (Tv, Tv + 1)):
+        with pytest.raises(ValueError, match="budget_rows"):
+            opt_in.memory_plan(
+                "loss", rows=rows, compact=rows < T, budget_rows=budget_rows, **shape
+            )
+
+
 def test_budget_plan_keys():
     """The budget forms' plans: ``keep_row_grad`` (loss entry) saves every chunk's per-row scale right after its
     ``row_finalize``; ``dw_rows`` (an unfused plan with dW, a granule multiple up to ``V``) leaves the accumulator
@@ -7776,7 +7921,7 @@ def test_device_budget_forms_are_bitwise(glm_weight, monkeypatch, objective):
     """Every ``memory_mode="budget"`` form of the loss entry -- fused, unfused, an accumulate of the leading vocabulary
     rows with the others recomputed in vocabulary blocks (several blocks with a short last one; one granule), a
     recompute of every row (three blocks; one block) -- gives the bits (integer views) of the fast form: one chunk,
-    two chunks, three compacted chunks (the hidden count and the dW side stream), three uncompacted chunks and the
+    two chunks, three compacted chunks (the dW side stream), three uncompacted chunks and the
     caller's count, with the caching allocator poisoned between the arms."""
     _require_program(entry="loss")
     step = _require_recompute()
@@ -7905,6 +8050,193 @@ def test_device_budget_step_peak_within_the_head_bytes(glm_weight, entry, T):
     if entry == "loss":
         assert mplan is not None and mplan.recompute and mplan.fits, mplan
     assert max(peaks) <= head, (peaks, head)
+
+
+@pytest.mark.parametrize(
+    "entry, objective", [("loss", "ce"), ("loss", "policy"), ("logprob", "ce")]
+)
+@pytest.mark.parametrize("T", [4096, 16384])
+def test_device_budget_step_peak_with_a_copied_x(glm_weight, entry, objective, T):
+    """An ``X`` whose leading stride is not a TMA pitch (the ``[:, :H]`` view of a ``[T, H + 1]`` buffer) with every
+    row valid: the uncompacted chunk loop reads a contiguous copy of ``X``, and the budget step's peak -- forward
+    through backward, outputs and gradients included, of the call that binds and of one from the remembered binding --
+    still stays within the head's bytes (``2 * T_v * V + 2 * V * H + 2 * T * H``); its outputs are bitwise the budget
+    step's on the contiguous ``X``."""
+    _require_program(entry=entry)
+    _require_recompute()
+    inp = make_inputs(
+        T,
+        objective=objective,
+        seed=SEED + 7865 + T,
+        device=CUDA,
+        W=glm_weight,
+        ignore_frac=0.0,
+        ld_pad=1,
+    )
+    H, V = DEFAULT_H, DEFAULT_V
+    assert inp.X.stride() == (H + 1, 1)
+    head = 2 * T * V + 2 * V * H + 2 * T * H
+    keys = ("loss", "logp", "dX", "dW") if entry == "loss" else ("logp", "dX", "dW")
+    contiguous, _, _ = _budget_step(
+        replace(inp, X=inp.X.contiguous()), 4096, entry, memory_mode="budget"
+    )
+    peaks = []
+    for _ in range(
+        2
+    ):  # the first call also binds; the second launches from the remembered binding
+        result, peak, mplan = _budget_step(inp, 4096, entry, memory_mode="budget")
+        _assert_same_bits(contiguous, result, keys=keys)
+        peaks.append(peak)
+        del result
+    assert max(peaks) <= head, (peaks, head, mplan)
+
+
+# every row valid at a head whose 2 % margin is several times the allocator's per-tensor bound (about 1 MiB per live
+# tensor) and smaller than the copy of X, the dX cast and the count's chunk-0 gather buffer: (H, V, T, chunk)
+_BUDGET_EVERY_ROW_VALID = (8192, 32768, 16384, 4096)
+
+
+@pytest.mark.parametrize(
+    "entry, objective, copied",
+    [
+        ("loss", "ce", False),
+        ("loss", "ce", True),
+        ("loss", "policy", False),
+        ("loss", "policy", True),
+        ("logprob", "ce", False),
+        ("logprob", "ce", True),
+    ],
+)
+def test_device_budget_step_peak_with_every_row_valid(entry, objective, copied):
+    """Every row valid at a head whose margin is narrower than the buffers the model must count (H 8192, V 32768,
+    T 16384, chunk 4096): the budget step's peak -- forward through backward, outputs and gradients included, of the
+    call that binds and of one from the remembered binding -- stays within the head's bytes (``2 * T_v * V + 2 * V * H
+    + 2 * T * H``) with a contiguous ``X`` (the log-probability backward casts dX into a BF16 ``[T, H]`` tensor in its
+    chunk loop) and with the ``[:, :H]``
+    view of a ``[T, H + 1]`` buffer (the chunk loop reads a contiguous copy of ``X``); the loss entry's plan fits, and
+    the outputs are bitwise the fast step's."""
+    _require_program(entry=entry)
+    _require_recompute()
+    H, V, T, C = _BUDGET_EVERY_ROW_VALID
+    inp = make_inputs(
+        T,
+        objective=objective,
+        seed=SEED + 7865 + T,
+        H=H,
+        V=V,
+        device=CUDA,
+        ignore_frac=0.0,
+        ld_pad=1 if copied else 0,
+    )
+    assert inp.X.stride() == ((H + 1, 1) if copied else (H, 1))
+    head = 2 * T * V + 2 * V * H + 2 * T * H
+    keys = ("loss", "logp", "dX", "dW") if entry == "loss" else ("logp", "dX", "dW")
+    fast, _, _ = _budget_step(replace(inp, X=inp.X.contiguous()), C, entry)
+    peaks = []
+    for _ in range(
+        2
+    ):  # the first call also binds; the second launches from the remembered binding
+        torch.cuda.empty_cache()
+        result, peak, mplan = _budget_step(inp, C, entry, memory_mode="budget")
+        _assert_same_bits(fast, result, keys=keys)
+        peaks.append(peak)
+        del result
+    if entry == "loss":
+        assert mplan is not None and mplan.fits, mplan
+    assert max(peaks) <= head, (peaks, head, mplan)
+
+
+@pytest.mark.parametrize(
+    "entry, objective", [("loss", "ce"), ("loss", "policy"), ("logprob", "ce")]
+)
+def test_device_budget_with_fewer_valid_rows_than_a_chunk(entry, objective):
+    """Fewer valid rows than a chunk among several chunks of rows (H 512, V 65536, T 8192, chunk 2048, 1024 rows
+    valid, no caller's count): the budget's logits are those of the valid rows, while the hidden valid-row count would
+    allocate a whole chunk's logits before the count is known -- the budget forward counts the rows on the host, the
+    loss entry's plan fits, and the step's peak (forward through backward, outputs and gradients included, the call
+    that binds and one from the remembered binding) stays within the head's bytes with the fast step's bits."""
+    _require_program(entry=entry)
+    _require_recompute()
+    H, V, T, C = 512, 65536, 8192, 2048
+    inp = make_inputs(
+        T,
+        objective=objective,
+        seed=SEED + 7866,
+        H=H,
+        V=V,
+        device=CUDA,
+        ignore_frac=0.875,
+    )
+    R = int(inp.valid.sum())
+    assert R == 1024 < C and 2 * C * V > 2 * R * V + 2 * V * H + 2 * T * H
+    head = 2 * R * V + 2 * V * H + 2 * T * H
+    keys = ("loss", "logp", "dX", "dW") if entry == "loss" else ("logp", "dX", "dW")
+    fast, _, _ = _budget_step(inp, C, entry)
+    peaks = []
+    for _ in range(2):
+        torch.cuda.empty_cache()
+        result, peak, mplan = _budget_step(inp, C, entry, memory_mode="budget")
+        _assert_same_bits(fast, result, keys=keys)
+        peaks.append(peak)
+        del result
+    if entry == "loss":
+        assert mplan is not None and mplan.fits, mplan
+    assert max(peaks) <= head, (peaks, head)
+
+
+@pytest.mark.parametrize(
+    "entry, objective, given",
+    [
+        ("loss", "ce", False),
+        ("loss", "policy", False),
+        ("loss", "ce", True),
+        ("logprob", "ce", False),
+        ("logprob", "ce", True),
+    ],
+)
+def test_device_budget_uncompacted_with_ignored_rows(
+    glm_weight, entry, objective, given
+):
+    """``compact_rows=False`` with a third of the labels ignored (flashinfer#7545's shape, T 16384, four chunks): the
+    chunk loop runs over every row while the budget stays that of the valid rows (``2 * T_v * V + 2 * V * H + 2 * T *
+    H``; the caller's ``num_valid_rows`` or a count on the host) -- the loss entry's plan fits it, the budget step's
+    peak (forward through backward, outputs and gradients included, of the call that binds and of one from the
+    remembered binding) stays within it, and the outputs are bitwise the uncompacted fast step's."""
+    _require_program(entry=entry)
+    _require_recompute()
+    T = 16384
+    inp = make_inputs(
+        T,
+        objective=objective,
+        seed=SEED + 7867 + T,
+        device=CUDA,
+        W=glm_weight,
+        ignore_frac=0.33,
+    )
+    R, H, V = int(inp.valid.sum()), DEFAULT_H, DEFAULT_V
+    assert R < T
+    head = 2 * R * V + 2 * V * H + 2 * T * H
+    keys = ("loss", "logp", "dX", "dW") if entry == "loss" else ("logp", "dX", "dW")
+    fast, _, _ = _budget_step(inp, 4096, entry, compact_rows=False)
+    peaks = []
+    for _ in range(
+        2
+    ):  # the first call also binds; the second launches from the remembered binding
+        torch.cuda.empty_cache()
+        result, peak, mplan = _budget_step(
+            inp,
+            4096,
+            entry,
+            memory_mode="budget",
+            compact_rows=False,
+            num_valid_rows=R if given else None,
+        )
+        _assert_same_bits(fast, result, keys=keys)
+        peaks.append(peak)
+        del result
+    if entry == "loss":
+        assert mplan is not None and mplan.fits and mplan.budget_bytes < head, mplan
+    assert max(peaks) <= head, (peaks, head, mplan)
 
 
 @pytest.mark.parametrize("memory_mode", ["fast", "budget"])
