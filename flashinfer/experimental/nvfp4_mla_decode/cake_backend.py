@@ -107,11 +107,11 @@ XV_MIN_STEADY_TILES = 307  # pipeline tiles of every unit past the warm-ups
 # of the unit's last sequence starts first, so the row tiles of one request
 # read most of their pages at the same time and the re-reads of a page stay in
 # L2. The cluster count is the one the plan requests, ``num_sms //
-# CLUSTER_PAIR``: 76 on a 152-SM SM100 device such as GB200. The short-row
-# programs stream too few tiles per unit for such re-reads, and every other
-# target keeps the request-major order.
+# CLUSTER_PAIR``: 76 on a 152-SM device such as GB200 (SM100) or GB300
+# (SM103). The short-row programs stream too few tiles per unit for such
+# re-reads, and every other target keeps the request-major order.
 LONG_DECODE_RECORDS = frozenset({"decode", QK_AHEAD_RECORD, XV_RECORD})
-REVERSED_PIECE_TARGETS = frozenset({("sm_100a", 76)})
+REVERSED_PIECE_TARGETS = frozenset({("sm_100a", 76), ("sm_103a", 76)})
 # Further combine program (``select_reduce_record``), giving the combine
 # program's outputs bit for bit: it reads the first pair of splits of a row
 # from its top loads, which pays off for rows of more than two splits.
