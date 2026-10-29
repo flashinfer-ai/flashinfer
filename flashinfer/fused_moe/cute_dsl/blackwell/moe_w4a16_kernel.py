@@ -2846,17 +2846,16 @@ class Sm100W4A16GroupedGemmKernel:
                         if cutlass.const_expr(self.enable_iket):
                             _iket.range_pop()
                             _iket.range_push("gather_issue")
-                        for i in cutlass.range_constexpr(groups_per_warp):
-                            row = (row_lane + i * row_issuers) * 4
-                            for j in cutlass.range_constexpr(
-                                cute.ceil_div(
-                                    k_chunks, k_issuers * self.num_mcast_ctas_b
-                                )
-                            ):
-                                column = (
-                                    (k_lane + j * k_issuers) * self.num_mcast_ctas_b
-                                    + block_in_cluster_coord_vmnk[1]
-                                ) * 64
+                        # Traverse row groups first within each K chunk.
+                        for j in cutlass.range_constexpr(
+                            cute.ceil_div(k_chunks, k_issuers * self.num_mcast_ctas_b)
+                        ):
+                            column = (
+                                (k_lane + j * k_issuers) * self.num_mcast_ctas_b
+                                + block_in_cluster_coord_vmnk[1]
+                            ) * 64
+                            for i in cutlass.range_constexpr(groups_per_warp):
+                                row = (row_lane + i * row_issuers) * 4
                                 if (row < rows) & (column < self.mma_tiler[2]):
                                     coordinate = (
                                         (row % row_atom, column % k_atom),
