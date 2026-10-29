@@ -334,7 +334,7 @@ def _mtp_precompute_replayssm_step(
 @cute.kernel
 def gdn_verify_kernel_mtp(
     h0_source: cute.Tensor,  # 3D [pool*HV, V, K] when use_pool_indexing=False; 4D [pool, HV, V, K] when True
-    intermediate_states: cute.Tensor,  # [pool_size * T * HV, V, K] - intermediate state cache
+    intermediate_states: cute.Tensor,  # [B * cache_steps * HV, V, K] - intermediate state cache
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],  # TILE_V - configurable for batch size
@@ -359,6 +359,7 @@ def gdn_verify_kernel_mtp(
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
+    cache_steps: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -860,7 +861,7 @@ def gdn_verify_kernel_mtp(
                         # Cache intermediate state if needed
                         if not cutlass.const_expr(cache_replayssm):
                             if cache_intermediate_states:
-                                flat_idx = i_n * T * HV + i_t * HV + i_hv
+                                flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
                                 it0 = cute.local_tile(
                                     intermediate_states,
                                     (1, 1, vec_size),
@@ -1454,7 +1455,7 @@ def gdn_verify_kernel_mtp(
                         # Cache intermediate state LAST in timestep (fire-and-forget stores
                         # overlap with next timestep's compute)
                         if cache_intermediate_states:
-                            flat_idx = i_n * T * HV + i_t * HV + i_hv
+                            flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
                             inter_tile_a = cute.local_tile(
                                 intermediate_states,
                                 (1, 1, vec_size),
@@ -1629,7 +1630,7 @@ def gdn_verify_kernel_mtp(
 
                         # Cache intermediate state if needed
                         if cache_intermediate_states:
-                            flat_idx = i_n * T * HV + i_t * HV + i_hv
+                            flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
                             inter_tile_a = cute.local_tile(
                                 intermediate_states,
                                 (1, 1, vec_size),
@@ -1752,6 +1753,7 @@ def run_gdn_verify_kernel_mtp(
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
+    cache_steps: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -1824,6 +1826,7 @@ def run_gdn_verify_kernel_mtp(
         scale,
         HV,
         T,
+        cache_steps,
         H,
         K,
         V,
@@ -1851,7 +1854,7 @@ def run_gdn_verify_kernel_mtp(
 @cute.kernel
 def gdn_verify_kernel_mtp_inline(
     h0_source: cute.Tensor,  # 3D [pool*HV, V, K] when use_pool_indexing=False; 4D [pool, HV, V, K] when True
-    intermediate_states: cute.Tensor,  # [pool_size * T * HV, V, K] - intermediate state cache
+    intermediate_states: cute.Tensor,  # [B * cache_steps * HV, V, K] - intermediate state cache
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
     tile_v: cutlass.Constexpr[int],  # TILE_V - configurable for batch size
@@ -1876,6 +1879,7 @@ def gdn_verify_kernel_mtp_inline(
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
+    cache_steps: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -2218,7 +2222,7 @@ def gdn_verify_kernel_mtp_inline(
 
                         # Cache intermediate state if needed
                         if cache_intermediate_states:
-                            flat_idx = i_n * T * HV + i_t * HV + i_hv
+                            flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
                             inter_tile_a = cute.local_tile(
                                 intermediate_states,
                                 (1, 1, vec_size),
@@ -2552,7 +2556,7 @@ def gdn_verify_kernel_mtp_inline(
 
                         # Cache intermediate state
                         if cache_intermediate_states:
-                            flat_idx = i_n * T * HV + i_t * HV + i_hv
+                            flat_idx = i_n * cache_steps * HV + i_t * HV + i_hv
                             inter_tile_a = cute.local_tile(
                                 intermediate_states,
                                 (1, 1, vec_size),
@@ -2672,6 +2676,7 @@ def run_gdn_verify_kernel_mtp_inline(
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
+    cache_steps: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -2737,6 +2742,7 @@ def run_gdn_verify_kernel_mtp_inline(
         scale,
         HV,
         T,
+        cache_steps,
         H,
         K,
         V,
@@ -3170,14 +3176,14 @@ def run_mtp_decode(
                 mode=0, stride_order=(0, 1, 2), divisibility=1
             )
         )
-        A_log_tensor = from_dlpack(A_log, assumed_align=16)
+        A_log_tensor = from_dlpack(A_log)
         # mark_layout_dynamic accepts non-compact packed q/k/v (SGLang fused QKV).
-        a_tensor = from_dlpack(a, assumed_align=16).mark_layout_dynamic()
-        dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
+        a_tensor = from_dlpack(a).mark_layout_dynamic()
+        dt_bias_tensor = from_dlpack(dt_bias)
         q_tensor = from_dlpack(q, assumed_align=16).mark_layout_dynamic()
         k_tensor = from_dlpack(k, assumed_align=16).mark_layout_dynamic()
         v_tensor = from_dlpack(v, assumed_align=16).mark_layout_dynamic()
-        b_tensor = from_dlpack(b, assumed_align=16).mark_layout_dynamic()
+        b_tensor = from_dlpack(b).mark_layout_dynamic()
         o_tensor = from_dlpack(output, assumed_align=16).mark_layout_dynamic()
         h0_indices_tensor = from_dlpack(
             initial_state_indices, assumed_align=16
@@ -3234,6 +3240,7 @@ def run_mtp_decode(
                     scale=scale,
                     HV=HV,
                     T=T,
+                    cache_steps=cache_steps,
                     H=H,
                     K=K,
                     V=V,
@@ -3285,6 +3292,7 @@ def run_mtp_decode(
                     scale=scale,
                     HV=HV,
                     T=T,
+                    cache_steps=cache_steps,
                     H=H,
                     K=K,
                     V=V,

@@ -49,11 +49,11 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 import cutlass.utils.rubin_helpers as sm107_utils
 import torch
-from cutlass._mlir.dialects import math, nvvm
+from cutlass._mlir.dialects import llvm, math, nvvm
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05.mma import CollectorOp
 from cutlass.cute.runtime import from_dlpack
-from cutlass.cutlass_dsl import dsl_user_op
+from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils.gemm.sm100 import (
     epilogue_smem_copy_and_partition,
@@ -95,6 +95,36 @@ def fmin(
             nan=nan,
             loc=loc,
             ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def fclip_xorsign(
+    a: Union[float, cutlass.Float32],
+    limit: Union[float, cutlass.Float32],
+    *,
+    loc=None,
+    ip=None,
+) -> cutlass.Float32:
+    """Clip to ``[-limit, limit]`` with PTX ``min.NaN.xorsign.abs.f32``.
+
+    The ``.NaN`` variant propagates a NaN operand instead of returning the
+    finite one, matching ``torch.clamp`` and the NaN-preserving ``fmin`` used
+    by the quantization path.
+    """
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                cutlass.Float32(a).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(limit).ir_value(loc=loc, ip=ip),
+            ],
+            "min.NaN.xorsign.abs.f32 $0, $1, $2;",
+            "=f,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
         )
     )
 
@@ -226,6 +256,7 @@ class Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel:
         activation_type: ActivationType = ActivationType.Swiglu,
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
+        swiglu_limit: float = float("inf"),
         enable_pdl: Optional[bool] = None,
         ugpu_half_gemm: Optional[bool] = None,
     ):
@@ -269,6 +300,18 @@ class Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel:
             )
         self.situ_beta = None if situ_beta is None else float(situ_beta)
         self.situ_linear_beta = None if situ_linear_beta is None else float(situ_linear_beta)
+        # DS-V4 / GPT-OSS style SwiGLU clamp: gate is capped at +limit, up is clipped
+        # to [-limit, limit] before the activation. ``+inf`` (or any negative value,
+        # the op-level "disabled" sentinel) means no clamp and generates no code.
+        if swiglu_limit < 0:
+            swiglu_limit = float("inf")
+        self.swiglu_limit = float(swiglu_limit)
+        self.has_swiglu_limit = self.swiglu_limit != float("inf")
+        if self.has_swiglu_limit and self.activation_type != ActivationType.Swiglu:
+            raise ValueError(
+                "swiglu_limit applies to ActivationType.Swiglu only; "
+                f"got {self.activation_type.name} with swiglu_limit={self.swiglu_limit}."
+            )
         self.is_gated = is_gated_activation(self.activation_type)
         if locality_domain_half_gemm and not self.is_gated:
             raise ValueError("Rubin locality domain half-GEMM currently supports SwiGLU only")
@@ -3302,7 +3345,11 @@ class Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel:
         alpha_val,
         tCompute: cute.Tensor,
     ):
-        """SwiGLU: ``tCompute[i] = (alpha * up[i]) * silu(alpha * gate[i])``."""
+        """SwiGLU: ``tCompute[i] = (alpha * up[i]) * silu(alpha * gate[i])``.
+
+        With ``has_swiglu_limit`` the scaled gate is capped at ``+swiglu_limit`` and
+        the scaled up is clipped to ``[-swiglu_limit, swiglu_limit]`` first.
+        """
         if cutlass.const_expr(self.vectorized_f32):
             LOG2_E = cutlass.Float32(1.4426950408889634)
             for i in cutlass.range_constexpr(0, cute.size(acc_vec_up.shape), 2):
@@ -3314,6 +3361,15 @@ class Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel:
                     (acc_vec_gate[i], acc_vec_gate[i + 1]),
                     (cutlass.Float32(alpha_val), cutlass.Float32(alpha_val)),
                 )
+                if cutlass.const_expr(self.has_swiglu_limit):
+                    acc_vec_gate_alpha = (
+                        fmin(acc_vec_gate_alpha[0], self.swiglu_limit, nan=True),
+                        fmin(acc_vec_gate_alpha[1], self.swiglu_limit, nan=True),
+                    )
+                    acc_vec_up_alpha = (
+                        fclip_xorsign(acc_vec_up_alpha[0], self.swiglu_limit),
+                        fclip_xorsign(acc_vec_up_alpha[1], self.swiglu_limit),
+                    )
                 tCompute_log2e = cute.arch.mul_packed_f32x2(
                     (acc_vec_gate_alpha[0], acc_vec_gate_alpha[1]),
                     (-LOG2_E, -LOG2_E),
@@ -3348,6 +3404,9 @@ class Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel:
             for i in cutlass.range_constexpr(cute.size(acc_vec_up.shape)):
                 acc_vec_up_alpha = acc_vec_up[i] * cutlass.Float32(alpha_val)
                 acc_vec_gate_alpha = acc_vec_gate[i] * cutlass.Float32(alpha_val)
+                if cutlass.const_expr(self.has_swiglu_limit):
+                    acc_vec_gate_alpha = fmin(acc_vec_gate_alpha, self.swiglu_limit, nan=True)
+                    acc_vec_up_alpha = fclip_xorsign(acc_vec_up_alpha, self.swiglu_limit)
                 tCompute[i] = acc_vec_up_alpha * silu_f32(acc_vec_gate_alpha, fastmath=True)
 
     @cute.jit

@@ -550,6 +550,15 @@ class GroupedQueryAttentionDecode:
         scale_s_log2_e: Float32,
         scale_o: Float32,
     ):
+        """Warp-specialized GQA decode over contiguous KV.
+
+        Each CTA handles one (KV split, grouped-head x prediction tile, KV head and
+        batch) block. TMA warps load Q, K and V; MMA warps compute ``S = K Q`` and
+        accumulate ``O += V P`` in tensor memory; softmax warpgroups produce the
+        online-softmax probabilities; the correction warpgroup rescales O as the
+        running max changes; and the reduction warp finalizes colmax and colsum for
+        the configured split-K reduction mode.
+        """
         ##############################
         # Static variables
         ##############################
@@ -1615,17 +1624,17 @@ class GroupedQueryAttentionDecode:
                     scale_o,
                 )
             elif cutlass.const_expr(do_none_red):
-                gL = None
-                if cutlass.const_expr(store_lse):
-                    gL = cute.local_tile(mL, (blk_tile_hp,), (coord_hp, coord_hb))
                 self.reduction_none(
+                    blk_tile_hp,
+                    coord_hp,
+                    coord_hb,
                     lane_store_max,
                     lane_idx,
                     sM_final_nbar,
                     sL_final_nbar,
                     sM,
                     sL,
-                    gL,
+                    mL,
                     sSink,
                     scale_o,
                 )
@@ -1636,21 +1645,45 @@ class GroupedQueryAttentionDecode:
     @staticmethod
     @cute.jit
     def reduction_none(
+        blk_tile_hp: Tuple[int, int],
+        coord_hp: Tuple[Int32, Int32],
+        coord_hb: Tuple[Int32, Int32],
         lane_store_max: bool,
         lane_idx: Int32,
         sM_final_nbar: nbar,
         sL_final_nbar: nbar,
         sM: cute.Tensor,
         sL: cute.Tensor,
-        gL: Optional[cute.Tensor],
+        mL: Optional[cute.Tensor],
         sSink: Optional[cute.Tensor],
         scale_o: Float32,
     ):
-        store_lse = gL is not None
+        """Finalize softmax normalization when there is no split-K reduction.
+
+        Waits for the final colmax and per-warp colsums, adds the attention sink
+        term (relative to the final colmax) when ``sSink`` is set, and writes
+        ``scale_o / colsum`` to ``sM`` for the correction warpgroup. When ``mL`` is
+        given, stores the log2-base LSE for lanes inside the grouped-head and
+        prediction bounds.
+        """
+        store_lse = mL is not None
+        if cutlass.const_expr(store_lse):
+            gL = cute.local_tile(mL, (blk_tile_hp,), (coord_hp, coord_hb))
+            # Padded tile lanes (grouped heads or predictions past the tensor) must not
+            # store: their LSE slots alias the next KV head's rows.
+            cL = cute.local_tile(
+                cute.make_identity_tensor(mL.shape[0]), blk_tile_hp, coord_hp
+            )
+            idx_hg, idx_p = cL[lane_idx]
+            grouped_heads, prediction = mL.shape[0]
+            lane_store_lse = lane_store_max
+            lane_store_lse &= idx_hg < grouped_heads
+            lane_store_lse &= idx_p < prediction
         colmax = Float32(0)
         colsum = Float32(0)
         sM_final_nbar.arrive_and_wait()
-        if cutlass.const_expr(store_lse):
+        # The sink term is relative to the final colmax, so sinks need it too.
+        if cutlass.const_expr(store_lse or sSink is not None):
             if lane_store_max:
                 colmax = sM[lane_idx]
         sL_final_nbar.arrive_and_wait()
@@ -1663,7 +1696,7 @@ class GroupedQueryAttentionDecode:
             sM[lane_idx] = normalization
         sM_final_nbar.arrive()
         if cutlass.const_expr(store_lse):
-            if lane_store_max:
+            if lane_store_lse:
                 gL[lane_idx] = colmax + cute.math.log2(colsum)
 
     @staticmethod

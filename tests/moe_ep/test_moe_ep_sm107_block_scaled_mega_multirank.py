@@ -148,6 +148,7 @@ def _megakernel_config(quant_kind: str, **overrides):
 
 @pytest.mark.gpu_2
 @pytest.mark.arch_rubin
+@pytest.mark.parametrize("family", ["inference", "genphase"])
 @pytest.mark.parametrize("ikr,early", [(False, True), (False, False), (True, True)])
 @pytest.mark.parametrize(
     "kind,situ,scaled",
@@ -157,7 +158,9 @@ def _megakernel_config(quant_kind: str, **overrides):
     ]
     + [("nvfp4", situ, True) for situ in (False, True)],
 )
-def test_prequantized_situ_and_scaling_multirank(kind, situ, scaled, ikr, early):
+def test_prequantized_situ_and_scaling_multirank(
+    family, kind, situ, scaled, ikr, early
+):
     from flashinfer.moe_ep import PrequantizedMoEWeights
     from tests.moe_ep.sm107_test_utils import (
         assert_reference,
@@ -178,7 +181,15 @@ def test_prequantized_situ_and_scaling_multirank(kind, situ, scaled, ikr, early)
     local_pack = PrequantizedMoEWeights(
         *(getattr(pack, name)[local] for name in ("w13", "w2", "w13_scale", "w2_scale"))
     )
-    kwargs = dict(in_kernel_fc2_reduce=ikr, apply_topk_in_fc1=early)
+    kwargs = dict(in_kernel_fc2_reduce=ikr, apply_routing_weights_before_fc2=early)
+    if family == "genphase":
+        # Exercise the multi-rank reset path with the standard N128 geometry,
+        # all four formats, and both separate and in-kernel reduction.
+        kwargs.update(
+            kernel_variant="genphase",
+            cluster_shape_mn=(4, 1),
+            fc2_use_bulk=True,
+        )
     if situ:
         kwargs.update(activation="situ", situ_beta=1.25, situ_linear_beta=0.75)
     if kind == "nvfp4":
@@ -208,11 +219,15 @@ def test_prequantized_situ_and_scaling_multirank(kind, situ, scaled, ikr, early)
             live = 0 if prequantized_input and rank == 0 else NUM_TOKENS
             current_ids = ids[rank, :live].clone()
             current_ids[::3, 0] = -1
+            current_ids[1::7] = -1
+            current_scores = scores[rank, :live].clone()
+            current_scores[::3, 0] = float("nan")
+            current_scores[1::7] = float("inf")
             xq, xsf = quantize(x[rank, :live], kind, norm)
             t = MoEEpTensors(
                 xq if prequantized_input else x[rank, :live],
                 current_ids,
-                scores[rank, :live],
+                current_scores,
                 scales=xsf if prequantized_input else None,
                 **{name: value[local] for name, value in scalars.items()},
             )
@@ -227,7 +242,10 @@ def test_prequantized_situ_and_scaling_multirank(kind, situ, scaled, ikr, early)
                 early=early,
                 scalars=scalars,
             )
-            assert_reference(layer.forward(t), reference, kind)
+            # An odd repeat count exercises the GenPhase grid phase across
+            # calls before the shared workspace changes input/routing state.
+            for _ in range(3 if family == "genphase" else 1):
+                assert_reference(layer.forward(t), reference, kind)
         assert layers[0]._workspace is layers[1]._workspace
     finally:
         for layer in layers:
@@ -344,7 +362,13 @@ def test_prequantized_situ_pooled_graph_with_scaling(kind):
 
 
 def _torch_oracle(
-    x_rank, topk_ids_rank, topk_weights_rank, w13, w2, quant_kind, apply_topk_at_fc1
+    x_rank,
+    topk_ids_rank,
+    topk_weights_rank,
+    w13,
+    w2,
+    quant_kind,
+    apply_routing_weights_before_fc2,
 ):
     """Full-bank oracle for one rank's tokens over the layer's exact quant path."""
     if x_rank.shape[0] == 0:
@@ -384,7 +408,7 @@ def _torch_oracle(
         quant_kind=quant_kind,
         local_expert_offset=0,
         gate_up_clamp=None,
-        apply_topk_at_fc1=apply_topk_at_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
     )
 
 
@@ -435,7 +459,7 @@ def test_sm107_preprocess_mega_weights_from_bf16(quant_kind):
 @pytest.mark.gpu_2
 @pytest.mark.arch_rubin
 @pytest.mark.parametrize(
-    "quant_kind, in_kernel_fc2_reduce, apply_topk_in_fc1",
+    "quant_kind, in_kernel_fc2_reduce, apply_routing_weights_before_fc2",
     [
         (kind, ikr, early)
         for kind in ("mxfp8_e4m3", "mxfp8_e5m2", "nvfp4")
@@ -443,7 +467,7 @@ def test_sm107_preprocess_mega_weights_from_bf16(quant_kind):
     ],
 )
 def test_moe_ep_sm107_block_scaled_mega_multirank_torch_oracle(
-    quant_kind, in_kernel_fc2_reduce, apply_topk_in_fc1
+    quant_kind, in_kernel_fc2_reduce, apply_routing_weights_before_fc2
 ):
     _require_cuda()
     rank, world_size = _launcher_ranks()
@@ -459,7 +483,7 @@ def test_moe_ep_sm107_block_scaled_mega_multirank_torch_oracle(
     cfg = _megakernel_config(
         quant_kind,
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
-        apply_topk_in_fc1=apply_topk_in_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
     )
     kernel = create_mega_kernel(cfg)
     runtime = bootstrap_moe_ep_runtime(
@@ -504,7 +528,7 @@ def test_moe_ep_sm107_block_scaled_mega_multirank_torch_oracle(
                 w13,
                 w2,
                 quant_kind,
-                apply_topk_at_fc1=cfg.apply_topk_in_fc1,
+                apply_routing_weights_before_fc2=(cfg.apply_routing_weights_before_fc2),
             )[:live]
             yk = y[:live].to(torch.float32)
             yr = y_ref.to(torch.float32)
@@ -527,7 +551,8 @@ def test_moe_ep_sm107_block_scaled_mega_multirank_torch_oracle(
 @pytest.mark.gpu_2
 @pytest.mark.arch_rubin
 @pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
-def test_sm107_pooled_layers_graph_rebinds_weights_and_stream(kind):
+@pytest.mark.parametrize("variant", ["standard", "genphase"])
+def test_sm107_pooled_layers_graph_rebinds_weights_and_stream(kind, variant):
     import torch.distributed as dist
 
     rank, world = _launcher_ranks()
@@ -538,7 +563,14 @@ def test_sm107_pooled_layers_graph_rebinds_weights_and_stream(kind):
     w13, w2, x, ids, scores = _global_problem(world)
     local_experts = NUM_EXPERTS // world
     local = slice(rank * local_experts, (rank + 1) * local_experts)
-    cfg = _megakernel_config(kind)
+    cfg = _megakernel_config(
+        kind,
+        **(
+            dict(kernel_variant="genphase", cluster_shape_mn=(4, 1), fc2_use_bulk=True)
+            if variant == "genphase"
+            else {}
+        ),
+    )
     kernel = create_mega_kernel(cfg)
     runtime = bootstrap_moe_ep_runtime(
         bootstrap, kernel.runtime_requirements(bootstrap)
@@ -573,6 +605,9 @@ def test_sm107_pooled_layers_graph_rebinds_weights_and_stream(kind):
             tensors.topk_ids.copy_((ids[rank] + iteration) % NUM_EXPERTS)
             tensors.topk_ids[::3, 0] = -1
             tensors.topk_weights.copy_(scores[rank] * (1 + iteration * 0.1))
+            tensors.topk_ids[1::7] = -1
+            tensors.topk_weights[::3, 0] = float("nan")
+            tensors.topk_weights[1::7] = float("inf")
             dist.barrier()
             graph.replay()
             torch.cuda.synchronize()
@@ -608,3 +643,111 @@ def test_mxfp4_k3_routed_expert_geometry_multirank():
     if world < 2:
         pytest.skip("requires torchrun with >= 2 ranks")
     run_mxfp4_k3_geometry(rank, world)
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_rubin
+@pytest.mark.parametrize(
+    "kind,variant,combine",
+    [
+        (kind, variant, "bf16")
+        for kind in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8")
+        for variant in ("inference", "genphase")
+    ]
+    + [("nvfp4", "inference", combine) for combine in ("nvfp4", "mxfp8")],
+)
+def test_masked_nonfinite_scores_pooled_graph(kind, variant, combine):
+    import torch.distributed as dist
+    from tests.moe_ep.sm107_test_utils import quantize, weight_pack
+
+    rank, world = _launcher_ranks()
+    if world < 2:
+        pytest.skip("requires torchrun with at least two ranks")
+    bootstrap = BootstrapConfig(rank=rank, world_size=world)
+    ensure_moe_ep_cuda_device(bootstrap)
+    w13, w2, x, ids, scores = _global_problem(world)
+    cfg = _megakernel_config(
+        kind,
+        kernel_variant=variant,
+        combine_dtype=combine,
+        apply_topk_in_fc1=False,
+        **(
+            dict(cluster_shape_mn=(4, 1), fc2_use_bulk=True)
+            if variant == "genphase"
+            else {}
+        ),
+    )
+    runtime = bootstrap_moe_ep_runtime(
+        bootstrap, create_mega_kernel(cfg).runtime_requirements(bootstrap)
+    )
+    count = NUM_EXPERTS // world
+    local = slice(rank * count, (rank + 1) * count)
+    layers, inputs = [], []
+    graph = None
+    try:
+        pack, _, _ = weight_pack(w13, w2, kind)
+        local_pack = type(pack)(
+            *(
+                getattr(pack, name)[local]
+                for name in ("w13", "w2", "w13_scale", "w2_scale")
+            )
+        )
+        for prequantized in (False, True):
+            layer = MoEEpLayer(
+                bootstrap=BootstrapConfig(
+                    rank=rank, world_size=world, auto_bootstrap=False
+                ),
+                fleet_params=FleetParams(
+                    num_experts=NUM_EXPERTS,
+                    max_tokens_per_rank=MAX_TOKENS,
+                    token_hidden_size=HIDDEN,
+                ),
+                weights=local_pack,
+                backend=MegaConfig(megakernel=cfg, quantize_input=not prequantized),
+            )
+            layers.append(layer)
+            xq, sf = quantize(x[rank], kind)
+            t = MoEEpTensors(
+                xq if prequantized else x[rank].clone(),
+                ids[rank].clone(),
+                scores[rank].clone(),
+                scales=sf if prequantized else None,
+            )
+            inputs.append(t)
+            layer.warmup(t)
+        assert layers[0]._workspace is layers[1]._workspace
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outputs = [
+                layer.forward(t) for layer, t in zip(layers, inputs, strict=True)
+            ]
+        for iteration, value in enumerate((float("nan"), float("inf"), -float("inf"))):
+            for t in inputs:
+                t.topk_ids.copy_((ids[rank] + iteration) % NUM_EXPERTS)
+                t.topk_ids[::3, 0] = -1
+                t.topk_ids[1::7] = -1
+                if iteration == 2 and rank == 0:
+                    t.topk_ids.fill_(-1)
+                t.topk_weights.copy_(scores[rank])
+                t.topk_weights.masked_fill_(t.topk_ids == -1, 0)
+            expected = [
+                layer.forward(t).clone()
+                for layer, t in zip(layers, inputs, strict=True)
+            ]
+            for t in inputs:
+                t.topk_weights.masked_fill_(t.topk_ids == -1, value)
+            for layer, t, reference in zip(layers, inputs, expected, strict=True):
+                torch.testing.assert_close(layer.forward(t), reference, rtol=0, atol=0)
+            for _ in range(3):
+                graph.replay()
+                torch.cuda.synchronize()
+                for output, reference in zip(outputs, expected, strict=True):
+                    assert torch.isfinite(output).all()
+                    torch.testing.assert_close(output, reference, rtol=0, atol=0)
+    finally:
+        if graph is not None:
+            graph.reset()
+        for layer in layers:
+            layer.destroy()
+        finalize_moe_ep_runtime(runtime)

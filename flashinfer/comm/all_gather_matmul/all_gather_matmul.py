@@ -111,8 +111,10 @@ def prepare_all_gather_matmul(
     transposed view of a contiguous ``[N, 8192]`` parameter, with ``N`` a
     positive multiple of 256. Both ``backend="auto"`` and ``backend="cake"``
     select the Cake route (SM100 or SM103, bfloat16 or float16, two-, four- or
-    eight-rank NCCL groups). Unsupported inputs raise during preparation
-    instead of falling back to another implementation.
+    eight-rank NCCL groups, torch's default CUDA or NVSHMEM symmetric-memory
+    backend). The launcher is CUDA-graph capturable once prepared. Unsupported
+    inputs raise during preparation instead of falling back to another
+    implementation.
     """
     if backend not in {"auto", "cake"}:
         raise ValueError("backend must be exactly 'auto' or 'cake'")

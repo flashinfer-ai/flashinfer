@@ -18,6 +18,26 @@
 // Common preamble (typedefs, tensor-map ABI, compiler helpers) shared by this export's kernels.
 #include "cake_nvfp4_per_token_device_common.cuh"
 
+// Shared by every record that names this translation unit in its sources: the record's
+// compile_flags select the knob values below (the guarded defaults are this file's own values) and
+// rename the kernel symbol (-DCAKE_PROGRAM_KERNEL=<its own symbol>; every JIT library of the family
+// exports a distinct kernel); the defaults name this file's own program.
+//   CAKE_OUT_F16   output dtype of the epilogue: 0 = bf16, 1 = f16
+//   CAKE_A_POLICY  L2 cache-hint policy of the A / SFA TMA loads: 0 = plain helper, else the operand
+//   CAKE_B_POLICY  L2 cache-hint policy operand of the B / SFB TMA loads
+#ifndef CAKE_OUT_F16
+#define CAKE_OUT_F16 0
+#endif
+#ifndef CAKE_A_POLICY
+#define CAKE_A_POLICY 0x14F0000000000000ULL
+#endif
+#ifndef CAKE_B_POLICY
+#define CAKE_B_POLICY 0x14F0000000000000ULL
+#endif
+#ifndef CAKE_PROGRAM_KERNEL
+#define CAKE_PROGRAM_KERNEL kernel_cake_nvfp4_per_token_288adcab31da85191a26
+#endif
+
 #define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 512
 #define TMEM_ACC_OFFSET 0
@@ -61,7 +81,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(256, 1) __cluster_dims__(2,1,1) void
-kernel_cake_nvfp4_per_token_288adcab31da85191a26(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, uint8_t* __restrict__ SFA_RAW, uint8_t* __restrict__ SFB_RAW, float* __restrict__ alpha, const __grid_constant__ CUtensorMap out, int M, int N, int K_tiles, int tok_tiles, int num_tiles, float* __restrict__ red_ws, unsigned int* __restrict__ red_flags, unsigned int* __restrict__ red_gen, int sk_tiles, int sk_pairs)
+CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, uint8_t* __restrict__ SFA_RAW, uint8_t* __restrict__ SFB_RAW, float* __restrict__ alpha, const __grid_constant__ CUtensorMap out, int M, int N, int K_tiles, int tok_tiles, int num_tiles, float* __restrict__ red_ws, unsigned int* __restrict__ red_flags, unsigned int* __restrict__ red_gen, int sk_tiles, int sk_pairs)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -69,12 +89,7 @@ kernel_cake_nvfp4_per_token_288adcab31da85191a26(const __grid_constant__ CUtenso
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-#if __CUDA_ARCH__ == 1000
-    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
-    smem = make_warp_uniform(smem);
-#else
-    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
-#endif
+    smem = shared_base_addr(smem_raw);
 
     const int mbar_base = smem;
     #define tma_full_addr (mbar_base + 0)
@@ -111,7 +126,11 @@ kernel_cake_nvfp4_per_token_288adcab31da85191a26(const __grid_constant__ CUtenso
     const int smem_v7_addr = smem + 31744;
     uint8_t* smem_v8 = reinterpret_cast<uint8_t*>(smem_raw + 33792);
     const int smem_v8_addr = smem + 33792;
+#if CAKE_OUT_F16
+    __half* smem_out = reinterpret_cast<__half*>(smem_raw + 209920);
+#else
     __nv_bfloat16* smem_out = reinterpret_cast<__nv_bfloat16*>(smem_raw + 209920);
+#endif
     const int smem_out_addr = smem + 209920;
     if (warp == 2) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&A))) : "memory"); }
     if (warp == 2) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&B))) : "memory"); }
@@ -202,21 +221,26 @@ kernel_cake_nvfp4_per_token_288adcab31da85191a26(const __grid_constant__ CUtenso
                         }
                     }
                     if (elect_sync()) {
+#if CAKE_A_POLICY
                         asm volatile(
                             "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
                             " [%0], [%1, {%2, %3, %4}], [%5], %6;"
                             :: "r"(smem_a_addr + load_stage * 34816), "l"((&A)), "r"(0), "r"(a_rows), "r"(k_tile),
-                               "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "l"(0x14F0000000000000ULL) : "memory");
+                               "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "l"(CAKE_A_POLICY) : "memory");
                         asm volatile(
                             "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
                             " [%0], [%1, {%2, %3, %4}], [%5], %6;"
                             :: "r"(smem_sfa_addr + load_stage * 34816), "l"((&SFA)), "r"(0), "r"(4 * k_tile), "r"(a_atom),
-                               "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "l"(0x14F0000000000000ULL) : "memory");
+                               "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "l"(CAKE_A_POLICY) : "memory");
+#else
+                        tma_3d_gmem2smem_cta2(smem_a_addr + load_stage * 34816, (&A), 0, a_rows, k_tile, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                        tma_3d_gmem2smem_cta2(smem_sfa_addr + load_stage * 34816, (&SFA), 0, 4 * k_tile, a_atom, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+#endif
                         asm volatile(
                             "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
                             " [%0], [%1, {%2, %3, %4}], [%5], %6;"
                             :: "r"(smem_b_addr + load_stage * 34816), "l"((&B)), "r"(0), "r"(b_rows), "r"(k_tile),
-                               "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "l"(0x14F0000000000000ULL) : "memory");
+                               "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "l"(CAKE_B_POLICY) : "memory");
                     }
                     if (cta_rank == 0) {
                         if (elect_sync()) {
@@ -224,22 +248,22 @@ kernel_cake_nvfp4_per_token_288adcab31da85191a26(const __grid_constant__ CUtenso
                                 "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2.L2::cache_hint"
                                 " [%0], [%1, {%2, %3, %4}], [%5], %6, %7;"
                                 :: "r"(smem_v3_addr + load_stage * 34816), "l"((&SFB)), "r"(0), "r"(4 * k_tile), "r"(b_atom),
-                                   "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)), "l"(0x14F0000000000000ULL) : "memory");
+                                   "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)), "l"(CAKE_B_POLICY) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2.L2::cache_hint"
                                 " [%0], [%1, {%2, %3, %4}], [%5], %6, %7;"
                                 :: "r"(smem_v4_addr + load_stage * 34816), "l"((&SFB)), "r"(0), "r"(4 * k_tile + 1), "r"(b_atom),
-                                   "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)), "l"(0x14F0000000000000ULL) : "memory");
+                                   "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)), "l"(CAKE_B_POLICY) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2.L2::cache_hint"
                                 " [%0], [%1, {%2, %3, %4}], [%5], %6, %7;"
                                 :: "r"(smem_v5_addr + load_stage * 34816), "l"((&SFB)), "r"(0), "r"(4 * k_tile + 2), "r"(b_atom),
-                                   "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)), "l"(0x14F0000000000000ULL) : "memory");
+                                   "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)), "l"(CAKE_B_POLICY) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2.L2::cache_hint"
                                 " [%0], [%1, {%2, %3, %4}], [%5], %6, %7;"
                                 :: "r"(smem_v6_addr + load_stage * 34816), "l"((&SFB)), "r"(0), "r"(4 * k_tile + 3), "r"(b_atom),
-                                   "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)), "l"(0x14F0000000000000ULL) : "memory");
+                                   "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)), "l"(CAKE_B_POLICY) : "memory");
                         }
                     }
                     load_stage += 1;
@@ -268,21 +292,26 @@ kernel_cake_nvfp4_per_token_288adcab31da85191a26(const __grid_constant__ CUtenso
                         }
                     }
                     if (elect_sync()) {
+#if CAKE_A_POLICY
                         asm volatile(
                             "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
                             " [%0], [%1, {%2, %3, %4}], [%5], %6;"
                             :: "r"(smem_a_addr + load_stage * 34816), "l"((&A)), "r"(0), "r"(a_rows_1), "r"(k_tile_1),
-                               "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "l"(0x14F0000000000000ULL) : "memory");
+                               "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "l"(CAKE_A_POLICY) : "memory");
                         asm volatile(
                             "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
                             " [%0], [%1, {%2, %3, %4}], [%5], %6;"
                             :: "r"(smem_sfa_addr + load_stage * 34816), "l"((&SFA)), "r"(0), "r"(4 * k_tile_1), "r"(a_atom_1),
-                               "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "l"(0x14F0000000000000ULL) : "memory");
+                               "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "l"(CAKE_A_POLICY) : "memory");
+#else
+                        tma_3d_gmem2smem_cta2(smem_a_addr + load_stage * 34816, (&A), 0, a_rows_1, k_tile_1, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                        tma_3d_gmem2smem_cta2(smem_sfa_addr + load_stage * 34816, (&SFA), 0, 4 * k_tile_1, a_atom_1, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+#endif
                         asm volatile(
                             "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
                             " [%0], [%1, {%2, %3, %4}], [%5], %6;"
                             :: "r"(smem_b_addr + load_stage * 34816), "l"((&B)), "r"(0), "r"(b_rows_1), "r"(k_tile_1),
-                               "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "l"(0x14F0000000000000ULL) : "memory");
+                               "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "l"(CAKE_B_POLICY) : "memory");
                     }
                     if (cta_rank == 0) {
                         if (elect_sync()) {
@@ -290,22 +319,22 @@ kernel_cake_nvfp4_per_token_288adcab31da85191a26(const __grid_constant__ CUtenso
                                 "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2.L2::cache_hint"
                                 " [%0], [%1, {%2, %3, %4}], [%5], %6, %7;"
                                 :: "r"(smem_v3_addr + load_stage * 34816), "l"((&SFB)), "r"(0), "r"(4 * k_tile_1), "r"(b_atom_1),
-                                   "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)), "l"(0x14F0000000000000ULL) : "memory");
+                                   "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)), "l"(CAKE_B_POLICY) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2.L2::cache_hint"
                                 " [%0], [%1, {%2, %3, %4}], [%5], %6, %7;"
                                 :: "r"(smem_v4_addr + load_stage * 34816), "l"((&SFB)), "r"(0), "r"(4 * k_tile_1 + 1), "r"(b_atom_1),
-                                   "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)), "l"(0x14F0000000000000ULL) : "memory");
+                                   "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)), "l"(CAKE_B_POLICY) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2.L2::cache_hint"
                                 " [%0], [%1, {%2, %3, %4}], [%5], %6, %7;"
                                 :: "r"(smem_v5_addr + load_stage * 34816), "l"((&SFB)), "r"(0), "r"(4 * k_tile_1 + 2), "r"(b_atom_1),
-                                   "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)), "l"(0x14F0000000000000ULL) : "memory");
+                                   "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)), "l"(CAKE_B_POLICY) : "memory");
                             asm volatile(
                                 "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.multicast::cluster.cta_group::2.L2::cache_hint"
                                 " [%0], [%1, {%2, %3, %4}], [%5], %6, %7;"
                                 :: "r"(smem_v6_addr + load_stage * 34816), "l"((&SFB)), "r"(0), "r"(4 * k_tile_1 + 3), "r"(b_atom_1),
-                                   "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)), "l"(0x14F0000000000000ULL) : "memory");
+                                   "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "h"((uint16_t)(3)), "l"(CAKE_B_POLICY) : "memory");
                         }
                     }
                     load_stage += 1;
@@ -628,11 +657,20 @@ kernel_cake_nvfp4_per_token_288adcab31da85191a26(const __grid_constant__ CUtenso
                         _tmem_load_0[31] *= alpha_row;
                         #endif
                     }
+#if CAKE_OUT_F16
+                    uint32_t _tmem_load_0_f16[16];
+#else
                     uint32_t _tmem_load_0_bf16[16];
+#endif
                     #pragma unroll
                     for (int _lp = 0; _lp < 16; _lp++) {
+#if CAKE_OUT_F16
+                        __half2 _h2 = __float22half2_rn(make_float2(_tmem_load_0[_lp*2 + 0], _tmem_load_0[_lp*2+1 + 0]));
+                        _tmem_load_0_f16[_lp] = *(uint32_t*)&_h2;
+#else
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_0[_lp*2 + 0], _tmem_load_0[_lp*2+1 + 0]));
                         _tmem_load_0_bf16[_lp] = *(uint32_t*)&_bf2;
+#endif
                     }
                     if (subtile > 0) {
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -655,10 +693,17 @@ kernel_cake_nvfp4_per_token_288adcab31da85191a26(const __grid_constant__ CUtenso
                     int out_stage_row = store_stage * 128 + (unsigned int)epi_srow;
                     unsigned int out_abs = smem_out_addr + (unsigned int)(out_stage_row * 64);
                     unsigned int out_swz = out_abs / 8 & 48;
+#if CAKE_OUT_F16
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_out_addr + ((unsigned int)(out_stage_row * 64) + (0 ^ out_swz)))), "r"(_tmem_load_0_f16[0]), "r"(_tmem_load_0_f16[1]), "r"(_tmem_load_0_f16[2]), "r"(_tmem_load_0_f16[3]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_out_addr + ((unsigned int)(out_stage_row * 64) + (16 ^ out_swz)))), "r"(_tmem_load_0_f16[4]), "r"(_tmem_load_0_f16[5]), "r"(_tmem_load_0_f16[6]), "r"(_tmem_load_0_f16[7]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_out_addr + ((unsigned int)(out_stage_row * 64) + (32 ^ out_swz)))), "r"(_tmem_load_0_f16[8]), "r"(_tmem_load_0_f16[9]), "r"(_tmem_load_0_f16[10]), "r"(_tmem_load_0_f16[11]) : "memory");
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_out_addr + ((unsigned int)(out_stage_row * 64) + (48 ^ out_swz)))), "r"(_tmem_load_0_f16[12]), "r"(_tmem_load_0_f16[13]), "r"(_tmem_load_0_f16[14]), "r"(_tmem_load_0_f16[15]) : "memory");
+#else
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_out_addr + ((unsigned int)(out_stage_row * 64) + (0 ^ out_swz)))), "r"(_tmem_load_0_bf16[0]), "r"(_tmem_load_0_bf16[1]), "r"(_tmem_load_0_bf16[2]), "r"(_tmem_load_0_bf16[3]) : "memory");
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_out_addr + ((unsigned int)(out_stage_row * 64) + (16 ^ out_swz)))), "r"(_tmem_load_0_bf16[4]), "r"(_tmem_load_0_bf16[5]), "r"(_tmem_load_0_bf16[6]), "r"(_tmem_load_0_bf16[7]) : "memory");
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_out_addr + ((unsigned int)(out_stage_row * 64) + (32 ^ out_swz)))), "r"(_tmem_load_0_bf16[8]), "r"(_tmem_load_0_bf16[9]), "r"(_tmem_load_0_bf16[10]), "r"(_tmem_load_0_bf16[11]) : "memory");
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_out_addr + ((unsigned int)(out_stage_row * 64) + (48 ^ out_swz)))), "r"(_tmem_load_0_bf16[12]), "r"(_tmem_load_0_bf16[13]), "r"(_tmem_load_0_bf16[14]), "r"(_tmem_load_0_bf16[15]) : "memory");
+#endif
                 }
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("barrier.sync 1, 128;" ::: "memory");
@@ -1533,11 +1578,20 @@ kernel_cake_nvfp4_per_token_288adcab31da85191a26(const __grid_constant__ CUtenso
                             red[31] *= alpha_row_s;
                             #endif
                         }
+#if CAKE_OUT_F16
+                        uint32_t red_f16[16];
+#else
                         uint32_t red_bf16[16];
+#endif
                         #pragma unroll
                         for (int _lp = 0; _lp < 16; _lp++) {
+#if CAKE_OUT_F16
+                            __half2 _h2 = __float22half2_rn(make_float2(red[_lp*2 + 0], red[_lp*2+1 + 0]));
+                            red_f16[_lp] = *(uint32_t*)&_h2;
+#else
                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(red[_lp*2 + 0], red[_lp*2+1 + 0]));
                             red_bf16[_lp] = *(uint32_t*)&_bf2;
+#endif
                         }
                         if (warp == 4) {
                             asm volatile("cp.async.bulk.wait_group.read 1;");
@@ -1546,10 +1600,17 @@ kernel_cake_nvfp4_per_token_288adcab31da85191a26(const __grid_constant__ CUtenso
                         int out_stage_row_s = store_stage * 128 + (unsigned int)epi_srow;
                         unsigned int out_abs_s = smem_out_addr + (unsigned int)(out_stage_row_s * 64);
                         unsigned int out_swz_s = out_abs_s / 8 & 48;
+#if CAKE_OUT_F16
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_out_addr + ((unsigned int)(out_stage_row_s * 64) + (0 ^ out_swz_s)))), "r"(red_f16[0]), "r"(red_f16[1]), "r"(red_f16[2]), "r"(red_f16[3]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_out_addr + ((unsigned int)(out_stage_row_s * 64) + (16 ^ out_swz_s)))), "r"(red_f16[4]), "r"(red_f16[5]), "r"(red_f16[6]), "r"(red_f16[7]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_out_addr + ((unsigned int)(out_stage_row_s * 64) + (32 ^ out_swz_s)))), "r"(red_f16[8]), "r"(red_f16[9]), "r"(red_f16[10]), "r"(red_f16[11]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_out_addr + ((unsigned int)(out_stage_row_s * 64) + (48 ^ out_swz_s)))), "r"(red_f16[12]), "r"(red_f16[13]), "r"(red_f16[14]), "r"(red_f16[15]) : "memory");
+#else
                         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_out_addr + ((unsigned int)(out_stage_row_s * 64) + (0 ^ out_swz_s)))), "r"(red_bf16[0]), "r"(red_bf16[1]), "r"(red_bf16[2]), "r"(red_bf16[3]) : "memory");
                         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_out_addr + ((unsigned int)(out_stage_row_s * 64) + (16 ^ out_swz_s)))), "r"(red_bf16[4]), "r"(red_bf16[5]), "r"(red_bf16[6]), "r"(red_bf16[7]) : "memory");
                         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_out_addr + ((unsigned int)(out_stage_row_s * 64) + (32 ^ out_swz_s)))), "r"(red_bf16[8]), "r"(red_bf16[9]), "r"(red_bf16[10]), "r"(red_bf16[11]) : "memory");
                         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_out_addr + ((unsigned int)(out_stage_row_s * 64) + (48 ^ out_swz_s)))), "r"(red_bf16[12]), "r"(red_bf16[13]), "r"(red_bf16[14]), "r"(red_bf16[15]) : "memory");
+#endif
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         asm volatile("barrier.sync 1, 128;" ::: "memory");
                         if (warp == 4) {

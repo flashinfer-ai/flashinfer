@@ -15,8 +15,10 @@ limitations under the License.
 
 Frozen-source guard for the generated ``sm90_bf16_bf16_bf16_push_cake`` GEMMs (CPU only).
 
-The FC1 / FC1+clamp / FC2 expert-grouped GEMM sources and their tvm-ffi
-bindings are generated and sealed by ``cake_sm90_bf16_megamoe_manifest.json``.
+The FC1 / FC1+clamp / FC2 expert-grouped GEMM sources, their early-start
+variants (FC1 releasing per-tile readiness counters, FC2 claiming ready tiles)
+and their tvm-ffi bindings are generated and sealed by
+``cake_sm90_bf16_megamoe_manifest.json``.
 These tests pin the seal: every file is present and matches its sha256, each
 stage resolves to exactly one module with the expected launch geometry and
 FFI entry, the host constants mirrored in the Python shim equal the
@@ -46,7 +48,7 @@ EXPECTED_LAUNCH = {
     "dynamic_smem_bytes": 196704,
     "cluster": [2, 1, 1],
     "cooperative": False,
-    "use_pdl": False,
+    "use_pdl": True,
 }
 EXPECTED_ARG_PLAN = [
     ["parameter", "num_experts"],
@@ -61,6 +63,30 @@ EXPECTED_ARG_PLAN = [
     ["grid", "grid_y"],
     ["grid", "grid_z"],
 ]
+# early-start stage -> the regular stage it replaces in a decode-window round
+EARLY_STAGES = {
+    "fc1_gated_signal": "fc1",
+    "fc1_gated_clamp_signal": "fc1",
+    "fc2_early": "fc2",
+}
+EARLY_DYNAMIC_SMEM_BYTES = 196768
+
+
+def _expected_launch(stage: str) -> dict:
+    launch = dict(EXPECTED_LAUNCH)
+    if stage in EARLY_STAGES:
+        launch["dynamic_smem_bytes"] = EARLY_DYNAMIC_SMEM_BYTES
+    return launch
+
+
+def _expected_arg_plan(stage: str) -> list:
+    if stage not in EARLY_STAGES:
+        return EXPECTED_ARG_PLAN
+    extra = [["buffer", "sched"]]
+    if stage == "fc2_early":
+        extra += [["buffer", "fc2_done"], ["parameter", "use_fc2_done"]]
+    grid = EXPECTED_ARG_PLAN.index(["grid", "grid_x"])
+    return EXPECTED_ARG_PLAN[:grid] + extra + EXPECTED_ARG_PLAN[grid:]
 
 
 @pytest.fixture(autouse=True)
@@ -112,14 +138,39 @@ def test_stage_record(stage: str) -> None:
     assert record["arch"] == "sm_90a"
     assert record["ffi_entry"] == "run"
     assert record["kernel_symbol"] == f"kernel_cake_sm90_bf16_megamoe_{stage}"
-    assert record["route"]["gated"] is (stage != "fc2")
-    assert record["route"]["use_clamp"] is (stage == "fc1_gated_clamp")
-    assert {k: record["launch"][k] for k in EXPECTED_LAUNCH} == EXPECTED_LAUNCH
-    assert record["arg_plan"] == EXPECTED_ARG_PLAN
+    assert record["route"]["gated"] is (not stage.startswith("fc2"))
+    assert record["route"]["use_clamp"] is ("clamp" in stage)
+    assert record["route"].get("early_start") == EARLY_STAGES.get(stage)
+    expected_launch = _expected_launch(stage)
+    assert {k: record["launch"][k] for k in expected_launch} == expected_launch
+    assert record["arg_plan"] == _expected_arg_plan(stage)
     assert record["compile_flags"] == []
     # Both translation units resolve and re-hash cleanly.
     assert _jit._sealed_source(units["device"]).is_file()
     assert _jit._sealed_source(units["binding"]).is_file()
+
+
+def test_closure_digests_match_records() -> None:
+    """Each module's ``closure_sha256`` (whose prefix names its JIT module) is the
+    digest of its own record, so a record edited without a reseal fails here."""
+    for record in _jit.grouped_gemm_manifest()["modules"]:
+        ident = {
+            key: value
+            for key, value in record.items()
+            if key not in ("arg_plan_sha256", "closure_sha256")
+        }
+        text = json.dumps(ident, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        assert hashlib.sha256(text.encode()).hexdigest() == record["closure_sha256"], (
+            record["name"]
+        )
+
+
+def test_arg_plan_digests_match_records() -> None:
+    for record in _jit.grouped_gemm_manifest()["modules"]:
+        text = json.dumps(record["arg_plan"], separators=(",", ":"))
+        assert hashlib.sha256(text.encode()).hexdigest() == record["arg_plan_sha256"], (
+            record["name"]
+        )
 
 
 def test_host_constants_match_generator() -> None:

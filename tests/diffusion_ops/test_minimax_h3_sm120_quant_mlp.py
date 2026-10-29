@@ -96,12 +96,12 @@ _E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 def _supported() -> bool:
     if not torch.cuda.is_available():
         return False
-    major, _minor = get_compute_capability(torch.device("cuda:0"))
-    return major == 12
+    # The JIT module contains an sm_120a cubin, which cannot run on SM121.
+    return get_compute_capability(torch.device("cuda:0")) == (12, 0)
 
 
 requires_sm120 = pytest.mark.skipif(
-    not _supported(), reason="requires a CUDA GPU with compute capability 12.x (GB202)"
+    not _supported(), reason="requires a CUDA GPU with compute capability 12.0 (GB202)"
 )
 
 

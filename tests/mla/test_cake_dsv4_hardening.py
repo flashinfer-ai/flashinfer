@@ -237,6 +237,27 @@ def _rows(out: torch.Tensor, inputs: _Inputs) -> torch.Tensor:
     return out.reshape(-1, inputs.p.h_q, inputs.p.d_v)
 
 
+def _allocation_requests() -> int:
+    """Cumulative number of caching-allocator requests on the current device.
+
+    The no-allocation checks compare this monotonic counter rather than
+    ``torch.cuda.memory_allocated()``: the live-bytes figure also moves when an
+    unrelated tensor is released inside the measured window (a cyclic-garbage
+    collection pass can free an earlier case's inputs during the call), which
+    is not an allocation by the call under test and made the equality fail with
+    *fewer* bytes live after the call (flashinfer-ai/flashinfer#6236).
+
+    Only the native caching allocator maintains the counter; under
+    ``PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync`` it stays at zero and the
+    checks would pass vacuously, so they skip there.
+    """
+    if torch.cuda.get_allocator_backend() != "native":
+        pytest.skip(
+            "the no-allocation checks read a native caching-allocator statistic"
+        )
+    return int(torch.cuda.memory_stats()["allocation.all.allocated"])
+
+
 _CASES = [
     pytest.param(
         h, dtype, s_q, id=f"h{h}-{'bf16' if dtype == torch.bfloat16 else 'fp8'}-q{s_q}"
@@ -330,9 +351,9 @@ def test_same_workspace_serves_different_kv_caches(h_q, dtype):
     """Two calls with one workspace but different KV caches (consecutive layers).
 
     The prefill routes of these shapes (``bf16_h64_prefill``,
-    ``fp8_lowhead_prefill``) are the ones whose SM103 bindings read their TMA
-    descriptors from the workspace slab; the slab must follow the call, not the
-    first descriptors uploaded for that workspace.
+    ``fp8_h64_prefill_source_persistent_m64_multi_tile``) must read the KV cache
+    of each call; nothing bound to the workspace may carry over from the
+    previous call.
     """
     _skip_unless_cake_gpu()
     first = _Inputs(*_make_case(h_q, dtype, 257, varlen=True))
@@ -343,124 +364,6 @@ def test_same_workspace_serves_different_kv_caches(h_q, dtype):
         inputs.run(out=out, workspace=workspace)
         torch.cuda.synchronize()
         _assert_close(_rows(out, inputs), inputs.reference_rows(), dtype)
-
-
-_SLAB_ROUTES = [
-    pytest.param(64, torch.bfloat16, "bf16_h64_prefill", id="bf16-h64-prefill"),
-    pytest.param(32, torch.float8_e4m3fn, "fp8_lowhead_prefill", id="fp8-h32-prefill"),
-]
-
-
-def _require_descriptor_pool(inputs: _Inputs, variant: str):
-    """Return the host module after checking that ``inputs`` take ``variant`` and
-    that this architecture's binding reads its descriptors from host storage.
-
-    The SM100 twins of these variants pass their descriptors by value and use
-    no descriptor pool, so the pool tests skip there.
-    """
-    import flashinfer.mla.cake_dsv4 as cake
-    from flashinfer.jit.cake_dsv4 import get_cake_dsv4_spec
-
-    arch = cake._target_arch(torch.device("cuda:0"))
-    route = cake._route(
-        dtype=inputs.p.dtype,
-        num_heads=inputs.p.h_q,
-        max_q_len=inputs.max_q_len,
-        ragged=True,
-        sparse_topk=inputs.sparse_topk,
-        batch_size=int(inputs.seq_lens.numel()),
-        compressed_page_size=inputs.compressed_kv_cache.shape[-2],
-        num_query_tokens=inputs.num_tokens,
-    )
-    assert route == variant, route
-    if not get_cake_dsv4_spec(variant, arch=arch).get("tma_workspace_bytes"):
-        pytest.skip(f"{variant} on {arch} passes its descriptors by value (no pool)")
-    return cake
-
-
-@pytest.mark.parametrize("h_q,dtype,variant", _SLAB_ROUTES)
-def test_descriptor_storage_reassignment_matches_reference(
-    h_q, dtype, variant, monkeypatch
-):
-    """A full descriptor pool reassigns storages: every call still reads its own descriptors.
-
-    With capacity 1 every call on a new descriptor set rewrites the single eager
-    storage in stream order; a cycle over three inputs must match the reference
-    on each call and must not allocate once the pool is full.
-    """
-    _skip_unless_cake_gpu()
-    inputs = [_Inputs(*_make_case(h_q, dtype, 257, varlen=True)) for _ in range(3)]
-    cake = _require_descriptor_pool(inputs[0], variant)
-    monkeypatch.setattr(cake, "_DESCRIPTOR_POOL_CAPACITY", 1)
-    workspace = _workspace(inputs[0])
-    for i in inputs:
-        i.run(out=_out_like(i), workspace=workspace)
-    torch.cuda.synchronize()
-    for i in inputs + inputs[::-1]:
-        out = _out_like(i)
-        allocated = torch.cuda.memory_allocated()
-        i.run(out=out, workspace=workspace)
-        torch.cuda.synchronize()
-        assert torch.cuda.memory_allocated() == allocated, "descriptor pool grew"
-        _assert_close(_rows(out, i), i.reference_rows(), dtype)
-
-
-@pytest.mark.parametrize("h_q,dtype,variant", _SLAB_ROUTES)
-def test_captured_descriptor_set_survives_eager_churn(h_q, dtype, variant, monkeypatch):
-    """Graph-captured descriptor storage is never reassigned; a new set during capture raises.
-
-    Rules under test (host module docstring, "Descriptor storage"): a set that
-    was launched eagerly is reusable during capture and becomes a captured
-    entry; captured entries are never evicted or reassigned (capacity 1 here,
-    so every other eager set reassigns the single live storage around it); a
-    set never launched eagerly raises when a capture reaches it.
-    """
-    _skip_unless_cake_gpu()
-    static = _Inputs(*_make_case(h_q, dtype, 257, varlen=True))
-    cake = _require_descriptor_pool(static, variant)
-    monkeypatch.setattr(cake, "_DESCRIPTOR_POOL_CAPACITY", 1)
-    others = [_Inputs(*_make_case(h_q, dtype, 257, varlen=True)) for _ in range(2)]
-    workspace = _workspace(static)
-    out = _out_like(static, fill=0.0)
-    static.run(out=out, workspace=workspace)
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        static.run(out=out, workspace=workspace)
-    torch.cuda.synchronize()
-    expected = static.reference_rows()
-    graph.replay()
-    torch.cuda.synchronize()
-    _assert_close(_rows(out, static), expected, dtype)
-    # Eager churn through the (capacity 1) pool with other descriptor sets.
-    for i in others + others:
-        other_out = _out_like(i)
-        i.run(out=other_out, workspace=workspace)
-        torch.cuda.synchronize()
-        _assert_close(_rows(other_out, i), i.reference_rows(), dtype)
-    out.fill_(0.0)
-    graph.replay()
-    torch.cuda.synchronize()
-    _assert_close(_rows(out, static), expected, dtype)
-    # A descriptor set that was never launched eagerly cannot be captured. The
-    # fresh case has its own KV caches, so its set is distinct from every set
-    # above regardless of which entry the churn left live.
-    fresh = _Inputs(*_make_case(h_q, dtype, 257, varlen=True))
-    assert fresh.swa_kv_cache.data_ptr() not in {
-        i.swa_kv_cache.data_ptr() for i in (static, *others)
-    }
-    fresh_out = _out_like(fresh)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with (
-        pytest.raises(RuntimeError, match="before capture"),
-        torch.cuda.graph(torch.cuda.CUDAGraph(), stream=stream),
-    ):
-        fresh.run(out=fresh_out, workspace=workspace)
-    torch.cuda.synchronize()
-    fresh.run(out=fresh_out, workspace=workspace)
-    torch.cuda.synchronize()
-    _assert_close(_rows(fresh_out, fresh), fresh.reference_rows(), dtype)
 
 
 @pytest.mark.parametrize("h_q,dtype,s_q", _CASES)
@@ -476,10 +379,10 @@ def test_cuda_graph_replay_matches_eager(h_q, dtype, s_q):
     static.run(out=out, workspace=workspace)
     static.run(out=out, workspace=workspace)
     torch.cuda.synchronize()
-    baseline_allocated = torch.cuda.memory_allocated()
+    baseline_requests = _allocation_requests()
     static.run(out=out, workspace=workspace)
     torch.cuda.synchronize()
-    assert torch.cuda.memory_allocated() == baseline_allocated, "eager call allocated"
+    assert _allocation_requests() == baseline_requests, "eager call allocated"
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -495,11 +398,11 @@ def test_cuda_graph_replay_matches_eager(h_q, dtype, s_q):
     assert mutated.query.shape == static.query.shape
     static.copy_from(mutated)
     torch.cuda.synchronize()
-    replay_allocated = torch.cuda.memory_allocated()
+    replay_requests = _allocation_requests()
     for _ in range(3):
         graph.replay()
     torch.cuda.synchronize()
-    assert torch.cuda.memory_allocated() == replay_allocated, "graph replay allocated"
+    assert _allocation_requests() == replay_requests, "graph replay allocated"
 
     eager_out = _out_like(static, fill=0.0)
     static.run(out=eager_out, workspace=_workspace(static))
@@ -1592,21 +1495,21 @@ def test_row_tiled_launches_match_the_single_launch(monkeypatch, layout):
     out = case.nan_out()
     case.run(workspace=small, out=out)
     torch.cuda.synchronize()
-    allocated = torch.cuda.memory_allocated()
+    requests = _allocation_requests()
     case.run(workspace=small, out=out)
     torch.cuda.synchronize()
-    assert torch.cuda.memory_allocated() == allocated, "tiled call allocated"
+    assert _allocation_requests() == requests, "tiled call allocated"
     # Capture + replay: the per-chunk offset writes and launches are recorded.
     graph = torch.cuda.CUDAGraph()
     out.fill_(0.0)
     with torch.cuda.graph(graph):
         case.run(workspace=small, out=out)
     torch.cuda.synchronize()
-    replay_allocated = torch.cuda.memory_allocated()
+    replay_requests = _allocation_requests()
     graph.replay()
     graph.replay()
     torch.cuda.synchronize()
-    assert torch.cuda.memory_allocated() == replay_allocated, "graph replay allocated"
+    assert _allocation_requests() == replay_requests, "graph replay allocated"
     _assert_valid(out.reshape(-1, 32, 512), case, expected)
 
 
@@ -1674,13 +1577,13 @@ def test_counters_are_zeroed_inside_capture_without_priming():
     torch.cuda.synchronize()
     assert not cake._counters_primed(workspace, raw)
     assert torch.all(raw[1024 : 1024 + 12 * 4 * 4] == 0xFF), "capture executed nothing"
-    allocated = torch.cuda.memory_allocated()
     for _ in range(3):
         out.fill_(float("nan"))
+        requests = _allocation_requests()
         graph.replay()
         torch.cuda.synchronize()
+        assert _allocation_requests() == requests, "graph replay allocated"
         _assert_valid(out.reshape(-1, 32, 512), case, expected)
-    assert torch.cuda.memory_allocated() == allocated, "graph replay allocated"
     assert torch.all(raw[1024 : 1024 + 12 * 4 * 4].view(torch.uint32) == 0)
     # Eager first use through the still-unregistered workspace primes it.
     workspace.fill_(0xFF)

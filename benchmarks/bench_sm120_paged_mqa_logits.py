@@ -15,12 +15,24 @@
 
 Sweeps decode points on the current SM120a device and reports the CUPTI kernel
 time of one ``plan.run()`` (cold L2; both kernels of the sequence) with the
-effective fused-KV stream rate and the MMA rate.
+effective fused-KV stream rate and the MMA rate.  The printed route is the one
+the call ran: a default route carries the Q-atom variant the batch selected
+(``...:n5:a5``), a device route its program knob as well; the schedule column
+says whether the scheduler wrote the static or the dynamic schedule.  The
+default batch sweep (8, 64, 128) reaches every shipped variant, including the
+64-head next_n 5/6 two-atom schedule that starts at batch 128.
+
+``--hint`` sets the ``max_context_hint`` the calls pass: ``context`` (the
+default) the point's context, which the inputs never exceed; ``none`` no hint,
+which keeps every call on its default route; an integer that value for every
+point.  The device routes apply only on a GPU whose SM count has a table and
+only with a hint inside one of the context windows.
 
 Examples:
     python benchmarks/bench_sm120_paged_mqa_logits.py
     python benchmarks/bench_sm120_paged_mqa_logits.py --heads 64 --page-kv 64 \
         --next-n 1 2 4 --batch 8 64 --context 4096 16384
+    python benchmarks/bench_sm120_paged_mqa_logits.py --hint none
 """
 
 import argparse
@@ -65,14 +77,30 @@ def make_inputs(heads, page_kv, next_n, batch, context, device):
     return q, kv_cache, weights, context_lens, block_table
 
 
+def context_hint(text):
+    """``--hint``: ``context``, ``none`` or a positive integer."""
+    if text in ("context", "none"):
+        return text
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"--hint must be positive, got {value}")
+    return value
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--heads", nargs="+", type=int, default=[32, 64])
     parser.add_argument("--page-kv", nargs="+", type=int, default=[128, 64])
-    parser.add_argument("--next-n", nargs="+", type=int, default=[1, 2, 4])
-    parser.add_argument("--batch", nargs="+", type=int, default=[8, 64])
+    parser.add_argument("--next-n", nargs="+", type=int, default=[1, 2, 3, 4, 5, 6])
+    parser.add_argument("--batch", nargs="+", type=int, default=[8, 64, 128])
     parser.add_argument("--context", nargs="+", type=int, default=[4096, 16384])
     parser.add_argument("--repeat-ms", type=int, default=200)
+    parser.add_argument(
+        "--hint",
+        type=context_hint,
+        default="context",
+        help="max_context_hint: 'context' (the point's context), 'none', or a value",
+    )
     args = parser.parse_args()
     device = torch.device("cuda")
     index = device.index if device.index is not None else torch.cuda.current_device()
@@ -80,7 +108,8 @@ def main():
     print(f"{torch.cuda.get_device_name(device)} ({arch}, {sms} SMs)")
     header = (
         f"{'H':>4s} {'page':>5s} {'n':>3s} {'batch':>6s} {'ctx':>7s} "
-        f"{'route':28s} {'us':>9s} {'KV GB/s':>9s} {'TFLOP/s':>8s}"
+        f"{'hint':>7s} {'route':44s} {'schedule':8s} {'us':>9s} {'KV GB/s':>9s} "
+        f"{'TFLOP/s':>8s}"
     )
     print(header)
     for heads in args.heads:
@@ -91,12 +120,19 @@ def main():
                 if not sm120_paged_mqa.route_available(heads, page_kv, next_n):
                     continue
                 for batch in args.batch:
+                    if not sm120_paged_mqa.route_available(
+                        heads, page_kv, next_n, batch
+                    ):
+                        continue
                     for context in args.context:
                         operands = make_inputs(
                             heads, page_kv, next_n, batch, context, device
                         )
+                        hint = {"context": context, "none": None}.get(
+                            args.hint, args.hint
+                        )
                         plan = prepare_sm120_paged_mqa_logits(
-                            *operands, max_context_len=context
+                            *operands, max_context_len=context, max_context_hint=hint
                         )
                         plan.run()
                         torch.cuda.synchronize()
@@ -111,7 +147,8 @@ def main():
                         flops = 2.0 * batch * next_n * heads * HEAD_DIM * context
                         print(
                             f"{heads:4d} {page_kv:5d} {next_n:3d} {batch:6d} "
-                            f"{context:7d} {plan.route_name:28s} {ms * 1e3:9.1f} "
+                            f"{context:7d} {str(hint):>7s} {plan.route_name:44s} "
+                            f"{plan.schedule['kind']:8s} {ms * 1e3:9.1f} "
                             f"{kv_bytes / ms / 1e6:9.1f} {flops / ms / 1e9:8.1f}"
                         )
                         del plan, operands

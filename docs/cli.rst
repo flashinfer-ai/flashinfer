@@ -127,6 +127,12 @@ and CUDA environment:
    # Override CUDA version detection
    flashinfer install-jit-cache-wheel --cuda-version 12.9
 
+   # Install only the providers for the visible GPUs
+   flashinfer install-jit-cache-wheel --mode minimal
+
+   # Install only the provider compatible with SM90a (implies --mode minimal)
+   flashinfer install-jit-cache-wheel --sm sm90a
+
    # Use the nightly wheel index
    flashinfer install-jit-cache-wheel --nightly
 
@@ -142,6 +148,13 @@ If the detected CUDA minor version is newer than the latest available
 ``flashinfer-jit-cache`` wheel in the same major version, the command uses the
 newest compatible wheel label. For example, CUDA 13.3 resolves to ``cu130``
 and CUDA 13.5 resolves to ``cu134``.
+
+By default, the command installs the shim together with every
+architecture-specific provider it declares. ``--mode minimal`` installs the shim
+and only the best compatible provider for each visible GPU. ``--sm`` selects the
+target architectures explicitly, implies ``--mode minimal``, and may be repeated
+for heterogeneous targets or for building an image on a machine without the
+target GPU.
 
 Download Kernels
 ----------------
@@ -175,6 +188,13 @@ The ``flashinfer-cubin`` wheel is a shared multi-architecture package and is
 still installed unchanged.
 If one wheel install fails, the command still attempts the other install and
 reports any failures at the end.
+
+The kernel wheels must match the installed ``flashinfer-python`` version, so
+run ``flashinfer download-kernels`` again after upgrading FlashInfer. Until
+then, FlashInfer logs a warning at import and ignores the mismatched wheels:
+cubins are downloaded on demand and kernels are JIT-compiled, as if the
+wheels were not installed. Set ``FLASHINFER_DISABLE_VERSION_CHECK=1`` to use
+mismatched wheels anyway.
 
 Cache Management
 ----------------

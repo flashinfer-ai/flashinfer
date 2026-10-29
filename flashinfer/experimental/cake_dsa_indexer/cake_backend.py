@@ -79,6 +79,7 @@ expect (:data:`ABI_CONTRACT`).
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional
@@ -95,11 +96,14 @@ from .cake_jit import (
     PROGRAM_KEYS,
     PROGRAMS,
     STAGES,
+    TICKET_TAIL_ARCHES,
     TRACKING_ISSUE,
     load_program,
 )
 from .cake_policy import (
     MERGE_KEY,
+    SAMPLE_SHIFT_PERMILLE_BOUNDS,
+    TICKET_TAIL_BYTES,
     DispatchPolicy,
     ProgramChoice,
     finalize_grid,
@@ -147,6 +151,7 @@ SCAN_SCALARS = (
     "first_cap",
     "sample_tiles_max",
     "sample_shift_permille",
+    "far_sample",
     "check_period",
     "grid_ctas",
     "softmax_scale",
@@ -199,9 +204,11 @@ def arch_for(device: Optional[torch.device] = None) -> Optional[str]:
     """Architecture tag of ``device`` (``None`` when unsupported or without CUDA)."""
     if not torch.cuda.is_available():
         return None
-    if device is None:
-        device = torch.device("cuda", torch.cuda.current_device())
-    return SUPPORTED_COMPUTE_CAPABILITIES.get(torch.cuda.get_device_capability(device))
+    if device is not None and torch.device(device).type != "cuda":
+        # the refusal torch.cuda.get_device_capability raised here before the facts were memoised
+        raise ValueError(f"Expected a cuda device, but got: {device}")
+    capability, _ = _device_facts(_device_index(device))
+    return SUPPORTED_COMPUTE_CAPABILITIES.get(capability)
 
 
 def default_softmax_scale() -> float:
@@ -216,8 +223,10 @@ def registry_abi() -> str:
     return ABI
 
 
+@functools.cache
 def policy_for(arch: str) -> DispatchPolicy:
-    """The dispatch policy registered for ``arch``; raises when the architecture has no program."""
+    """The dispatch policy registered for ``arch``: the registry record is immutable for the life of the process, so
+    it is validated once per architecture; an architecture without programs raises on every call."""
     record = POLICY.get(arch)
     if record is None:
         raise NotImplementedError(
@@ -466,7 +475,7 @@ def _check_output(
 # Program selection and workspace bound
 # ---------------------------------------------------------------------------
 
-_SM_COUNTS: dict[int, int] = {}
+_DEVICE_FACTS: dict[int, tuple[tuple[int, int], int]] = {}
 
 
 def _outputs_aligned(tensors: Iterable[Optional[torch.Tensor]], align: int) -> bool:
@@ -485,14 +494,22 @@ def _device_index(device: Optional[torch.device]) -> int:
     )
 
 
-def _num_sms(device: Optional[torch.device]) -> int:
-    index = _device_index(device)
-    count = _SM_COUNTS.get(index)
-    if count is None:
-        count = _SM_COUNTS[index] = int(
-            torch.cuda.get_device_properties(index).multi_processor_count
+def _device_facts(index: int) -> tuple[tuple[int, int], int]:
+    """``((major, minor), multi_processor_count)`` of ``cuda:index``: immutable for the life of the process, so queried
+    once per device index; the index itself (``None`` / an index-less device = torch's current device) is resolved on
+    every call by ``_device_index``."""
+    facts = _DEVICE_FACTS.get(index)
+    if facts is None:
+        properties = torch.cuda.get_device_properties(index)
+        facts = _DEVICE_FACTS[index] = (
+            (int(properties.major), int(properties.minor)),
+            int(properties.multi_processor_count),
         )
-    return count
+    return facts
+
+
+def _num_sms(device: Optional[torch.device]) -> int:
+    return _device_facts(_device_index(device))[1]
 
 
 def plan_dsa_indexer_topk(
@@ -510,6 +527,7 @@ def plan_dsa_indexer_topk(
     check_period: Optional[int] = None,
     sample_tiles_max: Optional[int] = None,
     sample_shift_permille: Optional[int] = None,
+    far_sample: Optional[int] = None,
     finalize_threads: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
     outputs_aligned: bool = True,
@@ -547,7 +565,13 @@ def plan_dsa_indexer_topk(
     if sample_tiles_max is not None:
         _check_int("sample_tiles_max", sample_tiles_max, 0, 256)
     if sample_shift_permille is not None:
-        _check_int("sample_shift_permille", sample_shift_permille, -1000, 10000)
+        _check_int(
+            "sample_shift_permille",
+            sample_shift_permille,
+            *SAMPLE_SHIFT_PERMILLE_BOUNDS,
+        )
+    if far_sample is not None:
+        _check_int("far_sample", far_sample, 0, 1)
     if check_period is not None:
         _check_int("check_period", check_period, 1)
     if finalize_threads is not None:
@@ -566,6 +590,7 @@ def plan_dsa_indexer_topk(
         check_period=check_period,
         sample_tiles_max=sample_tiles_max,
         sample_shift_permille=sample_shift_permille,
+        far_sample=far_sample,
         finalize_threads=finalize_threads,
         max_seqlen_k=max_seqlen_k,
         outputs_aligned=bool(outputs_aligned),
@@ -711,6 +736,22 @@ class DSAIndexerRunner:
     workspace: torch.Tensor = field(default=None, repr=False)
     workspace_bytes: int = 0
     grid: tuple[int, int, int] = (1, 1, 1)
+    # the workspace's 128-byte ticket tail on the ticket architectures (``TICKET_TAIL_ARCHES``;
+    # None on sm_107a).  Invariant: the ticket word reads 0 when a scan launches.  Every scan
+    # launch that completes leaves the word at 0 (the kernel's end-of-launch reset, which
+    # kernel-tests check as the output ``ticket_word`` on every ticket-drawing config).
+    # Backend-owned workspace (no ``workspace_buffer`` passed to prepare): nothing else writes
+    # the tail, so it is zeroed once, when the runner is prepared; ``run()`` issues no memset
+    # and a CUDA graph capturing it carries none.  Caller-owned workspace (``_tail_shared``):
+    # the buffer may be written between two runs by another runner of a different geometry
+    # (its candidate region covers this tail) or by any other kernel the caller lends it to,
+    # so ``run()`` zeroes the tail before every launch sequence, on the current stream; a
+    # graph capturing it carries that memset node.  A ``run()`` that raised while launching
+    # may have left the word non-zero: it marks the tail dirty and the next ``run()`` zeroes
+    # it first.
+    ticket_tail: Optional[torch.Tensor] = field(default=None, repr=False)
+    _tail_shared: bool = field(default=False, repr=False)
+    _tail_dirty: bool = field(default=False, repr=False)
 
     @property
     def indices(self) -> torch.Tensor:
@@ -734,8 +775,17 @@ class DSAIndexerRunner:
 
     def run(self) -> tuple[torch.Tensor, torch.Tensor]:
         with _ffi_stream_context(self.device_index):
-            for launch in self.launches:
-                launch()
+            if self.ticket_tail is not None and (self._tail_dirty or self._tail_shared):
+                # caller-owned workspace: others may have written the tail since the last run;
+                # or a previous run raised while launching.  Restore the ticket word before the scan.
+                self.ticket_tail.zero_()
+                self._tail_dirty = False
+            try:
+                for launch in self.launches:
+                    launch()
+            except BaseException:
+                self._tail_dirty = self.ticket_tail is not None
+                raise
         return self.tensors["Indices"], self.tensors["Scores"]
 
     __call__ = run
@@ -779,6 +829,7 @@ def prepare_dsa_indexer_topk(
     check_period: Optional[int] = None,
     sample_tiles_max: Optional[int] = None,
     sample_shift_permille: Optional[int] = None,
+    far_sample: Optional[int] = None,
     finalize_threads: Optional[int] = None,
     backend: str = "cake",
 ) -> DSAIndexerRunner:
@@ -787,20 +838,30 @@ def prepare_dsa_indexer_topk(
     Missing outputs and the workspace are allocated here (the only allocations
     of the backend).  Pass ``workspace_buffer`` of at least
     :func:`dsa_indexer_workspace_size` bytes for the call's geometry (same
-    ``grid_ctas`` / ``candidate_multiplier``) to reuse storage across calls;
-    ``indices`` / ``scores`` may be caller-owned ``[T, top_k]`` int32 / float32
-    tensors.
+    ``grid_ctas`` / ``candidate_multiplier``) to reuse storage across calls.
+    A caller-owned buffer may be written by other runners or kernels between
+    two runs of the returned runner, so on the ticket architectures the runner
+    zeroes the buffer's ticket word before every run (one small memset on the
+    current stream, captured into a CUDA graph with the launches); the
+    backend-owned workspace is zeroed once, here.  ``indices`` / ``scores`` may
+    be caller-owned ``[T, top_k]`` int32 / float32 tensors.
 
     The keyword-only knobs ``grid_ctas`` (persistent CTA count; default: the SM
     count), ``candidate_multiplier`` (candidate buffer per query in multiples
     of ``top_k``), ``check_period`` (key tiles between selection-trigger
     checks), ``sample_tiles_max`` / ``sample_shift_permille`` (sampled first
-    threshold; ``0`` disables sampling) and ``finalize_threads`` (an admissible
-    registered finalize program) change only the internal partition and
-    scheduling of the work: results are bitwise identical for every admissible
-    value.  ``T == 0`` returns a runner whose launches are empty; a call
-    without keys (``Tkv == 0``) fills the outputs with padding instead of
-    launching.
+    threshold; ``0`` disables sampling and sizes the candidate buffers by the
+    record's unsampled capacity values; the shift defaults to the record's
+    value for the call's ``top_k``, ``sample_shift_rule`` where the record sets
+    one), ``far_sample`` (``1``: the sampled first threshold of the
+    ascending-tile-order scan programs ranks the far sample tiles only,
+    leaving out the sample tile nearest the diagonal; ``0``: every sample
+    tile; the descending-order and wide programs ignore it) and
+    ``finalize_threads`` (an admissible registered finalize program) change
+    only the internal partition and scheduling of the work: results are
+    bitwise identical for every admissible value.  ``T == 0`` returns a runner
+    whose launches are empty; a call without keys (``Tkv == 0``) fills the
+    outputs with padding instead of launching.
     """
     if backend != "cake":
         raise ValueError("DSA indexer top-k supports backend='cake'")
@@ -854,6 +915,7 @@ def prepare_dsa_indexer_topk(
         check_period=check_period,
         sample_tiles_max=sample_tiles_max,
         sample_shift_permille=sample_shift_permille,
+        far_sample=far_sample,
         finalize_threads=finalize_threads,
         max_seqlen_k=max_seqlen_k,
         outputs_aligned=outputs_aligned,
@@ -867,6 +929,7 @@ def prepare_dsa_indexer_topk(
     if choice.merge_key is not None:
         programs["merge"] = program_for(arch, choice.merge_key)
     workspace_bytes = int(choice.workspace_bytes)
+    caller_owned_workspace = workspace_buffer is not None
     if workspace_buffer is None:
         workspace_buffer = torch.empty(
             workspace_bytes, dtype=torch.uint8, device=device
@@ -898,7 +961,11 @@ def prepare_dsa_indexer_topk(
         else torch.empty((num_queries, int(top_k)), dtype=torch.float32, device=device),
         "Cand": cand,
         # the split staging [T, n_split, top_k] lives behind the persistent candidate buffers (merge stage only)
-        "Staging": cand[choice.scan_entries :] if choice.split else None,
+        "Staging": cand[
+            choice.scan_entries : choice.scan_entries + choice.staging_entries
+        ]
+        if choice.split
+        else None,
     }
     scalars: dict[str, Any] = dict(
         num_segments=num_segments,
@@ -911,6 +978,7 @@ def prepare_dsa_indexer_topk(
         ),  # regular trigger only: the first selection fires at the capacity rule
         sample_tiles_max=int(choice.sample_tiles_max),
         sample_shift_permille=int(choice.sample_shift_permille),
+        far_sample=int(choice.far_sample),
         check_period=int(choice.check_period),
         grid_ctas=int(choice.grid_ctas),
         softmax_scale=float(softmax_scale),
@@ -941,6 +1009,17 @@ def prepare_dsa_indexer_topk(
         stages.append(fin_role)
     elif num_queries > 0:
         _padded_outputs(num_queries, int(top_k), device, t["Indices"], t["Scores"])
+    # on sm_100a / sm_103a the scan program draws every work unit from the workspace's
+    # 128-byte tail (behind the candidate buffers and the staging).  Zeroed here once; every
+    # completed scan launch resets the word to 0.  Backend-owned workspace: that is the only
+    # memset, a run adds none.  Caller-owned ``workspace_buffer``: the buffer may be written
+    # between runs by others (another runner's candidate region, any kernel it is lent to),
+    # so the runner zeroes the tail again before every run (see ``DSAIndexerRunner.ticket_tail``).
+    # sm_107a: no tail view, nothing zeroed.
+    ticket_tail = None
+    if launches and arch in TICKET_TAIL_ARCHES:
+        ticket_tail = flat[workspace_bytes - TICKET_TAIL_BYTES : workspace_bytes]
+        ticket_tail.zero_()
     return DSAIndexerRunner(
         arch=arch,
         abi=abi,
@@ -954,6 +1033,8 @@ def prepare_dsa_indexer_topk(
         workspace=flat,
         workspace_bytes=workspace_bytes,
         grid=grid,
+        ticket_tail=ticket_tail,
+        _tail_shared=caller_owned_workspace and ticket_tail is not None,
     )
 
 
@@ -978,6 +1059,7 @@ def dsa_indexer_topk(
     check_period: Optional[int] = None,
     sample_tiles_max: Optional[int] = None,
     sample_shift_permille: Optional[int] = None,
+    far_sample: Optional[int] = None,
     finalize_threads: Optional[int] = None,
     backend: str = "cake",
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1008,6 +1090,7 @@ def dsa_indexer_topk(
         check_period=check_period,
         sample_tiles_max=sample_tiles_max,
         sample_shift_permille=sample_shift_permille,
+        far_sample=far_sample,
         finalize_threads=finalize_threads,
         backend=backend,
     )

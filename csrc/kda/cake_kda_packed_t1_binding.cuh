@@ -34,6 +34,9 @@
 #ifndef CAKE_KDA_PACKED_T1_REQUIRES_AUX_VEC4
 #error "CAKE_KDA_PACKED_T1_REQUIRES_AUX_VEC4 must describe auxiliary alignment"
 #endif
+#ifndef CAKE_KDA_PACKED_T1_PAIR_PUBLISH
+#error "CAKE_KDA_PACKED_T1_PAIR_PUBLISH must describe the output store width"
+#endif
 #ifndef FLASHINFER_CAKE_KDA_PACKED_T1_TARGET_KIND
 #error "FLASHINFER_CAKE_KDA_PACKED_T1_TARGET_KIND must identify the target"
 #endif
@@ -89,15 +92,19 @@ constexpr int32_t kMixedWidth = 3 * kHeads * kHeadDim;
 constexpr int32_t kGateWidth = kHeads * kHeadDim;
 constexpr int32_t kTargetFamily = 100;
 constexpr int32_t kTargetSM100a = 1000;
+constexpr int32_t kTargetSM107a = 1070;
 constexpr int32_t kTargetKind = FLASHINFER_CAKE_KDA_PACKED_T1_TARGET_KIND;
 
-static_assert(kTargetKind == kTargetFamily || kTargetKind == kTargetSM100a,
-              "packed KDA T=1 must be compiled for SM100f or legacy exact SM100a");
+static_assert(kTargetKind == kTargetFamily || kTargetKind == kTargetSM100a ||
+                  kTargetKind == kTargetSM107a,
+              "packed KDA T=1 must be compiled for SM100f, legacy exact SM100a or exact SM107a");
 static_assert(CAKE_KDA_PACKED_T1_VALUE_TILES == 1 || CAKE_KDA_PACKED_T1_VALUE_TILES == 2 ||
                   CAKE_KDA_PACKED_T1_VALUE_TILES == 8 || CAKE_KDA_PACKED_T1_VALUE_TILES == 16,
               "packed KDA T=1 has an unsupported value tiling");
 static_assert(CAKE_KDA_PACKED_T1_THREADS == 32 || CAKE_KDA_PACKED_T1_THREADS == 128,
               "packed KDA T=1 has an unsupported thread count");
+static_assert(CAKE_KDA_PACKED_T1_PAIR_PUBLISH == 0 || CAKE_KDA_PACKED_T1_PAIR_PUBLISH == 1,
+              "CAKE_KDA_PACKED_T1_PAIR_PUBLISH must be 0 or 1");
 static_assert(CAKE_KDA_PACKED_T1_REQUIRES_AUX_VEC4 == 0 ||
                   CAKE_KDA_PACKED_T1_REQUIRES_AUX_VEC4 == 1,
               "packed KDA T=1 auxiliary alignment must be boolean");
@@ -123,6 +130,11 @@ inline void CheckTarget(int32_t device_id) {
     TVM_FFI_ICHECK(major == 10 && (minor == 0 || minor == 3 || minor == 7))
         << "this packed KDA T=1 module requires the SM100 family "
            "(compute capability 10.0, 10.3 or 10.7), got "
+        << major << "." << minor;
+  } else if (kTargetKind == kTargetSM107a) {
+    TVM_FFI_ICHECK(major == 10 && minor == 7)
+        << "this packed KDA T=1 module requires an exact SM107a device (compute capability 10.7), "
+           "got "
         << major << "." << minor;
   } else {
     TVM_FFI_ICHECK(major == 10 && minor == 0)
@@ -253,6 +265,13 @@ void Run(TensorView mixed_qkv, TensorView raw_gate, TensorView raw_beta, TensorV
                  out.size(2) == kHeadDim)
       << "output must have shape [B, " << kHeads << ", " << kHeadDim << "]";
   CHECK_CONTIGUOUS(out);
+  if constexpr (CAKE_KDA_PACKED_T1_PAIR_PUBLISH != 0) {
+    // The body publishes the two output rows a thread group owns as one 32-bit
+    // BF16x2 store; rows are 256 bytes apart, so the base must be 4-byte aligned.
+    TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(out.data_ptr()) % 4 == 0)
+        << "this packed KDA variant stores output rows as BF16x2 pairs and "
+           "requires a 4-byte-aligned output";
+  }
 
   if constexpr (CAKE_KDA_PACKED_T1_REQUIRES_AUX_VEC4 != 0) {
     const uintptr_t mixed_base = reinterpret_cast<uintptr_t>(mixed_qkv.data_ptr());

@@ -73,6 +73,33 @@ class TmemTranspose16x32:
         )
 
     @staticmethod
+    def load_half_raw_acc(
+        tmem_subtile_tensor: cute.Tensor,
+    ) -> Tuple[cute.Tensor, cute.Tensor]:
+        """Load both feature halves of one 32-token accumulator subtile."""
+        atom = cute.make_copy_atom(
+            tcgen05.Ld16x64bOp(tcgen05.Repetition.x16),
+            TmemTranspose16x32._io_dtype,
+        )
+        ptr = tmem_subtile_tensor.iterator
+        top = cute.make_rmem_tensor((16,), TmemTranspose16x32._io_dtype)
+        bottom = cute.make_rmem_tensor((16,), TmemTranspose16x32._io_dtype)
+        cute.copy(
+            atom,
+            cute.make_tensor(ptr, TmemTranspose16x32._tmem_layout(16, 32)),
+            TmemTranspose16x32._rmem_copy_view(top, 16),
+        )
+        cute.copy(
+            atom,
+            cute.make_tensor(
+                ptr + 16 * TmemTranspose16x32._TmemRowStride,
+                TmemTranspose16x32._tmem_layout(16, 32),
+            ),
+            TmemTranspose16x32._rmem_copy_view(bottom, 16),
+        )
+        return top, bottom
+
+    @staticmethod
     def load_subtile_raw_acc(
         tmem_subtile_tensor: cute.Tensor,
     ) -> Tuple[cute.Tensor, cute.Tensor, cute.Tensor, cute.Tensor]:
@@ -520,6 +547,46 @@ def fc2_f2fp(
 
 
 @cute.jit
+def fc2_stg_post_f2fp_reorder_n32(
+    *,
+    casted: cute.Tensor,
+    tmem_subtile_view: cute.Tensor,
+):
+    """The existing BF16 FC2 reorder restricted to one 32-token half."""
+    if cutlass.const_expr(cute.size(casted) != 32):
+        raise ValueError("N32 FC2 reorder expects 32 BF16 elements per thread.")
+    # Interleave feature-top/bottom values into opaque BF16x2 registers.
+    packed = cute.make_rmem_tensor((32,), cutlass.BFloat16)
+    cute.autovec_copy(
+        cute.composition(casted, cute.make_layout(((2, 16),), stride=((16, 1),))),
+        packed,
+    )
+    packed_i32 = cute.recast_tensor(packed, cutlass.Float32)
+    transpose = TmemTranspose16x32(
+        tmem_subtile_view.iterator,
+        reg_tensor=packed_i32,
+    )
+    transpose.r1_perm()
+    transpose.r1_store()
+    transpose.r2_load()
+    transpose.r2_store()
+    transpose.r3_load_top()
+    transpose.r3_load_bot()
+    transpose.r3_perm()
+    transpose.r3_store()
+    transpose.r4_load_top()
+    transpose.r4_load_bot()
+    transpose.r4_perm()
+    cute.autovec_copy(transpose.output, packed_i32)
+    out = cute.make_rmem_tensor((32,), cutlass.BFloat16)
+    cute.autovec_copy(
+        cute.composition(packed, cute.make_layout(((16, 2),), stride=((2, 1),))),
+        out,
+    )
+    return out
+
+
+@cute.jit
 def fc2_stg_post_f2fp_reorder(
     *,
     casted: cute.Tensor,  # (subtile_cnt,)
@@ -627,7 +694,7 @@ def fc2_stg_store_function(
 
 def make_bf16_fc2_store_mapping(*, cta_token_tile_size, cta_hidden_tile_size):
     assert cta_hidden_tile_size == 128
-    assert cta_token_tile_size % 64 == 0
+    assert cta_token_tile_size == 32 or cta_token_tile_size % 64 == 0
     elems_per_stg = 16
     stgs_per_hidden32 = 2
     return Contract(

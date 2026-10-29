@@ -34,9 +34,15 @@ SUITES = {
         "tests/moe_ep/test_sm107_block_scaled_kernel_vs_reference.py",
         "tests/moe_ep/test_sm107_kernel_boundaries.py",
         "tests/moe_ep/test_sm107_genphase_kernel.py",
+        "tests/moe_ep/test_sm107_genphase_cga2_kernel.py",
+        "tests/moe_ep/test_sm107_masked_combine.py",
+        "tests/moe_ep/test_sm107_routing_graph.py",
         "tests/moe_ep/test_sm107_combine_kernel.py",
     ],
-    "multi": ["tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py"],
+    "multi": [
+        "tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py",
+        "tests/moe_ep/test_sm107_routing_graph_multirank.py",
+    ],
 }
 
 

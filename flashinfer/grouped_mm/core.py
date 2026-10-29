@@ -18,11 +18,16 @@ from typing import Optional
 
 import torch
 
-from ..api_logging import flashinfer_api
-from ..utils import backend_requirement, supported_compute_capability
+from ..api_logging import flashinfer_api, warn_experimental_backend_once
+from ..utils import (
+    backend_requirement,
+    get_compute_capability,
+    supported_compute_capability,
+)
 from .cudnn import (
     _CUDNN_MOE_MIN_VERSION,
     _check_cudnn_version,
+    _cudnn_moe_block_scale_min_version,
     _run_cudnn_moe_block_scale_grouped_gemm_fp4,
     _run_cudnn_moe_block_scale_grouped_gemm_mxfp8,
     _run_cudnn_moe_grouped_gemm,
@@ -140,6 +145,7 @@ def grouped_mm_bf16(
     >>> out_cake = flashinfer.grouped_mm.grouped_mm_bf16(a, b, m_indptr, backend="cake")
     """
     if backend == "cake":
+        warn_experimental_backend_once("grouped_mm_bf16", "cake")
         from ..experimental.cake_moe_grouped_gemm.cake_backend import (
             grouped_mm_bf16_cake,
         )
@@ -420,7 +426,10 @@ def grouped_mm_mxfp8(
         out_dtype = out.dtype
 
     if backend == "cudnn":
-        _check_cudnn_version(_CUDNN_MOE_MIN_VERSION, "grouped_mm_mxfp8")
+        major, minor = get_compute_capability(a.device)
+        _check_cudnn_version(
+            _cudnn_moe_block_scale_min_version(major * 10 + minor), "grouped_mm_mxfp8"
+        )
         return _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
             a,
             b,
@@ -588,7 +597,10 @@ def grouped_mm_fp4(
         out_dtype = out.dtype
 
     if backend == "cudnn":
-        _check_cudnn_version(_CUDNN_MOE_MIN_VERSION, "grouped_mm_fp4")
+        major, minor = get_compute_capability(a.device)
+        _check_cudnn_version(
+            _cudnn_moe_block_scale_min_version(major * 10 + minor), "grouped_mm_fp4"
+        )
         return _run_cudnn_moe_block_scale_grouped_gemm_fp4(
             a,
             b,

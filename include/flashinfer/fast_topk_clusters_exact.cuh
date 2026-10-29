@@ -243,6 +243,9 @@ __device__ __forceinline__ TopkResults fast_topk_cuda_v4(
     const int phase = t % 2;
     // we are now using histogram buffers at phase, and cached_offsets at phase
     // ^ 1 clear the next stage to prepare
+    // the previous round read shared_num_cached_count[phase] after its last block
+    // barrier; the cluster barrier does not order that read against the reset below
+    __syncthreads();
 
     if (ENABLE_CLUSTER_SAFETY && NClusters > 1) {
       cluster.barrier_wait();  // wait because we need to clear shared_hist for this

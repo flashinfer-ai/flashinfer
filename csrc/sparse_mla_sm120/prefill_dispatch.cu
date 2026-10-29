@@ -11,11 +11,17 @@ PrefillLaunchResult dispatch_prefill(const execution::AttentionParams& p,
   const auto& m = plan.metadata;
   const auto mt = static_cast<ModelType>(m.model);
   if (plan.implementation == execution::Implementation::FullBF16) {
-    return execution::visit_decode_heads<ModelType::DSV4_1>(m.heads, [&](auto head) {
-      constexpr int H = decltype(head)::value;
-      return m.extra_fp4 ? launch_dsv41_bf16_prefill<H, true>(p, stream)
-                         : launch_dsv41_bf16_prefill<H, false>(p, stream);
-    });
+    auto launch = [&](auto model) {
+      constexpr ModelType M = decltype(model)::value;
+      return execution::visit_decode_heads<ModelType::DSV4_1>(m.heads, [&](auto head) {
+        constexpr int H = decltype(head)::value;
+        return m.extra_fp4 ? launch_dsv41_bf16_prefill<H, true, M>(p, stream)
+                           : launch_dsv41_bf16_prefill<H, false, M>(p, stream);
+      });
+    };
+    if (mt == ModelType::DSV4_1_INLINE)
+      return launch(std::integral_constant<ModelType, ModelType::DSV4_1_INLINE>{});
+    return launch(std::integral_constant<ModelType, ModelType::DSV4_1>{});
   }
   PrefillColdParams cold{p.sm_scale,          m.tokens,
                          m.page_stride_bytes, m.extra_page_stride_bytes,
@@ -25,7 +31,11 @@ PrefillLaunchResult dispatch_prefill(const execution::AttentionParams& p,
                          p.extra_kv,          p.extra_indices,
                          m.extra_page_size,   m.page_size};
   cold.lse_scale = p.lse_scale;
-  if (cache_format_info(mt).inline_scale) cold.kv_stride_bytes = m.row_stride_bytes;
+  if (cache_format_info(mt).inline_scale) {
+    cold.kv_stride_bytes = m.row_stride_bytes;
+    // Inline-scale extra sections address flat rows at their row pitch.
+    if (m.extra_topk > 0) cold.extra_page_stride_bytes = m.extra_row_stride_bytes;
+  }
   if (mt == ModelType::DSV4 || mt == ModelType::DOTS3_SWA) {
     cold.main_div = flashinfer::uint_fastdiv(uint32_t(m.page_size));
     if (m.extra_topk > 0) cold.extra_div = flashinfer::uint_fastdiv(uint32_t(m.extra_page_size));
@@ -48,10 +58,18 @@ PrefillLaunchResult dispatch_prefill(const execution::AttentionParams& p,
     }
     case execution::Implementation::SG:
     case execution::Implementation::MixedCache: {
-      if (mt == ModelType::DSV4_1) {
-        if (plan.implementation == execution::Implementation::MixedCache)
-          return dispatch_dsv41_sg<Dsv41MixedCachePrefillSchedule>(SINGLE_ARGS, cold);
-        return dispatch_dsv41_sg<Dsv41PrefillGatherSchedule>(SINGLE_ARGS, cold);
+      if (is_dsv41(mt)) {
+        const bool mixed = plan.implementation == execution::Implementation::MixedCache;
+        if (mt == ModelType::DSV4_1_INLINE)
+          return mixed
+                     ? dispatch_dsv41_sg<ModelType::DSV4_1_INLINE, Dsv41MixedCachePrefillSchedule>(
+                           SINGLE_ARGS, cold)
+                     : dispatch_dsv41_sg<ModelType::DSV4_1_INLINE, Dsv41PrefillGatherSchedule>(
+                           SINGLE_ARGS, cold);
+        return mixed ? dispatch_dsv41_sg<ModelType::DSV4_1, Dsv41MixedCachePrefillSchedule>(
+                           SINGLE_ARGS, cold)
+                     : dispatch_dsv41_sg<ModelType::DSV4_1, Dsv41PrefillGatherSchedule>(SINGLE_ARGS,
+                                                                                        cold);
       }
       if (mt == ModelType::DOTS3_SWA) return dispatch_dots3_swa_sg(SINGLE_ARGS, cold);
       V32(dispatch_v32_sg);
