@@ -38,6 +38,12 @@ class SplitKernelContext:
     # quantized before dispatch (see SplitKernelBackend.dispatch_format), one
     # row per received token; None when ``expert_tensors`` is unquantized.
     expert_tensors_scale: Optional["torch.Tensor"] = None
+    # [num_tokens, hidden] bfloat16 buffer the kernel may write its output
+    # into, such as the communication's combine input region
+    # (MoEEpCommunication.get_combine_input_buffer), which the combine then
+    # reads in place; None lets the kernel allocate. The kernel returns the
+    # tensor it wrote, which need not be this one.
+    output: Optional["torch.Tensor"] = None
 
 
 class SplitKernelBackend(ABC):

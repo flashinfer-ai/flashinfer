@@ -494,6 +494,28 @@ class TestPrimsTsUnifiedGpu:
         direct_out = runner.forward(packed, tactic=-1)
         _bf16_check(direct_out, reference, "prims_ts bf16 direct")
 
+    def test_layer_writes_the_packs_output_buffer(self):
+        """A pack's ``output`` buffer receives the finalized output in place."""
+        act, weights, config, _tensors = _make_bf16_packs_and_config(
+            16,
+            hidden_size=256,
+            intermediate_size=256,
+            num_experts=8,
+            top_k=2,
+            max_tokens=16,
+        )
+        act, weights, config = _with_prims_ts_backend(
+            act, weights, config, "trtllm_bf16_routed"
+        )
+        layer = MoELayer(config)
+        expected = layer(act, weights)
+        buffer = torch.full_like(expected, float("nan"))
+        out = layer(dataclasses.replace(act, output=buffer), weights)
+        assert out.data_ptr() == buffer.data_ptr()
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
+        with pytest.raises(ValueError, match="contiguous bfloat16"):
+            layer(dataclasses.replace(act, output=buffer[:, :128]), weights)
+
     def test_tuning_pre_hook_binds_each_packs_static_extras(self):
         """Two packs on one runner: each pack's tuning pre-hook installs its own
         inner static extras, so tactic enumeration never reads the other's."""
