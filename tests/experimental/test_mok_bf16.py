@@ -1326,6 +1326,9 @@ def test_select_comm_split_decision_table():
         ((10, 3), 152, "bf16", None),  # GB300
         ((10, 3), 152, "mxfp8", None),
         ((10, 7), 160, "bf16", None),
+        ((10, 7), 212, "mxfp8", (72, 60)),  # Rubin
+        ((10, 7), 212, "bf16", None),
+        ((10, 7), 216, "mxfp8", None),  # other Rubin SM count
         ((12, 0), 170, "bf16", None),
     ],
 )
@@ -1349,6 +1352,39 @@ def test_imbalance_comm_sms_auto_follows_the_device(
     assert api.resolve_imbalance_comm_sms(precision) == expected
 
 
+@pytest.mark.parametrize(
+    "capability,sm_count,precision,expected",
+    [
+        ((10, 7), 212, "mxfp8", 1.5),  # Rubin: measured device threshold
+        ((10, 7), 212, "bf16", 4.0),
+        ((10, 7), 216, "mxfp8", 2.7),  # other Rubin SM count: precision default
+        ((10, 0), 148, "mxfp8", 2.7),  # B200
+        ((10, 0), 148, "bf16", 4.0),
+    ],
+)
+def test_imbalance_threshold_follows_the_device(
+    monkeypatch, capability, sm_count, precision, expected
+):
+    """Host-only: with a device, the threshold is the device's measured row of
+    ``IMBALANCE_DEVICE_THRESHOLDS`` where one exists, else the precision's
+    ``IMBALANCE_THRESHOLDS`` value; without a device it is always the latter."""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda device=None: capability
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device=None: SimpleNamespace(multi_processor_count=sm_count),
+    )
+    assert api.resolve_imbalance_threshold(precision, 0) == expected
+    assert (
+        api.resolve_imbalance_threshold(precision)
+        == api.IMBALANCE_THRESHOLDS[precision]
+    )
+
+
 def test_imbalance_comm_sms_defaults_keep_the_fixed_split():
     """Host-only: the config default disables the imbalance split, the facade
     default ``"auto"`` resolves the measured row of the device generation, and
@@ -1364,9 +1400,11 @@ def test_imbalance_comm_sms_defaults_keep_the_fixed_split():
     # The measured rows and thresholds (backend README); a change here is a
     # shipping change. The backend default is the BF16 threshold.
     assert api.IMBALANCE_COMM_SMS == {
-        (10, 0): {148: {"bf16": (24, 28), "mxfp8": (44, 36)}}
+        (10, 0): {148: {"bf16": (24, 28), "mxfp8": (44, 36)}},
+        (10, 7): {212: {"mxfp8": (72, 60)}},
     }
     assert api.IMBALANCE_THRESHOLDS == {"bf16": 4.0, "mxfp8": 2.7}
+    assert api.IMBALANCE_DEVICE_THRESHOLDS == {(10, 7): {212: {"mxfp8": 1.5}}}
     assert api.IMBALANCE_THRESHOLDS["bf16"] == api.IMBALANCE_THRESHOLD
     assert api.resolve_imbalance_threshold("bf16") == config.imbalance_threshold
     assert api.resolve_imbalance_threshold("mxfp8") == 2.7

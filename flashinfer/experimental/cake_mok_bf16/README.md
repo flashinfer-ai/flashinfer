@@ -213,7 +213,8 @@ and does not change the launch sequence.
   steps a launch may use different splits on different ranks for a step - the
   split is a per-rank launch parameter and the protocol does not require
   agreement. While the hottest rank's load is at least `imbalance_threshold`
-  x the mean load (facade default `"auto"`: the precision's value in
+  x the mean load (facade default `"auto"`: the device's value in
+  `IMBALANCE_DEVICE_THRESHOLDS`, else the precision's value in
   `IMBALANCE_THRESHOLDS`, BF16 4, MXFP8 2.7), the later launches use the
   (forward, backward) imbalance split; balanced steps are unchanged. Measured
   rows (`IMBALANCE_COMM_SMS`, keyed by compute capability and SM count, so B200
@@ -233,7 +234,15 @@ and does not change the launch sequence.
   -2.6 / -2.9 %; balanced steps +0.6 / +0.3 % (full) and +0.9 / +0.8 %
   (checkpoint) under an unconditional 44 / 36, which is why only imbalanced
   steps switch; with 4 ranks at 2.4x +0.8 % (one screening round). The MXFP8
-  threshold sits between the measured 2.4x and 3.0x. No row elsewhere.
+  threshold sits between the measured 2.4x and 3.0x. Rubin (212 SMs) MXFP8
+  72 / 60 over its fixed 60 / 60 from a device threshold of 1.5
+  (`IMBALANCE_DEVICE_THRESHOLDS`, which replaces the precision's threshold for
+  that device), two-node EP8, 27116 tokens per rank, configurations rotated on
+  one workspace, four rounds, hottest-rank medians, MoE training-update proxy:
+  hottest rank at 1.51x the mean routed load forward -6.9 % / update -3.8 %,
+  2.05x -5.7 / -2.8 %, 3.05x -10.1 / -5.1 %, 4.66x -11.1 / -5.5 %, 6.47x
+  -10.6 / -5.5 %; balanced steps do not switch, where an unconditional 72 / 60
+  forward is 4.1 % slower. No row elsewhere.
   `MoKConfig.comm_split_log=True` (default `False`; `dataclasses.replace(config,
   comm_split_log=True)` on the returned config) prints each split change per
   rank to stderr; the `CAKE_MOK_COMM_SPLIT_LOG` environment variable that used
