@@ -21,6 +21,18 @@ Use `--dtype mxfp4_mxfp8 --arch sm107` for mixed-format offline tuning, or
 MXFP8 activation staging and uses packed E2M1 weights with block-32 E8M0
 scales. Its tuning cache entries are separate from the MXFP8-weight entries.
 
+For contiguous BF16 inputs and top-k up to 32, MXFP8 staging checks route
+bounds, duplicate experts and finite unmasked scores in the quantization kernel.
+These checks remain active during graph replay. Unsupported layouts and
+prequantized inputs retain separate routing validation. Set
+`FLASHINFER_SM107_FUSED_ROUTE_CHECK=0` to use separate validation for diagnostics.
+
+MXFP8 staging also masks trailing routing rows in the quantization launch,
+including when replaying graphs with different live row counts in a shared
+workspace. Empty inputs and tails exceeding 16 routing elements per live CTA
+thread retain a separate parallel fill. Set
+`FLASHINFER_SM107_FUSED_TAIL_MASK=0` to use the separate tail clear for diagnostics.
+
 ## What the benchmark measures
 
 `benchmarks/moe_ep/backends/mega/kernel/sm107/bench_moe_ep_sm107_block_scaled_mega.py` reports:
@@ -29,9 +41,11 @@ scales. Its tuning cache entries are separate from the MXFP8-weight entries.
   required output/reset operations and dispatch, both GEMMs, and combine.
 - `--mode compute`: inputs staged once, then backend `compute()` with a
   preallocated owned output reused across calls. Includes the backend wrapper,
-  required resets/reduction, kernel, and output copy, but no recurring input staging.
+  required resets/reduction and kernel, but no recurring input staging. Separate
+  reduction writes aligned contiguous outputs directly; other layouts and
+  in-kernel reduction use a workspace output followed by a copy.
 - `--mode forward`: public `MoEEpLayer.forward()` with BF16 inputs, including
-  validation, Torch quantization/staging, owned output handling, and the kernel.
+  validation, quantization/staging, owned output handling, and the kernel.
 - `--execution eager|graph`: eager launches or replay of a warmed CUDA
   graph. These are separate series, not interchangeable measurements.
 
