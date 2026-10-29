@@ -350,3 +350,188 @@ def test_pipeline_bindings_refuse_a_token_routed_twice_to_one_expert_on_an_activ
         prepare(twice, "x")
     prepare(twice, "pool")
     prepare([[0, -1], [-1, -1], [1, 0], [-1, 1]], "x")
+
+
+# The control buffers the arena carves after ``reset_storage``, in carve
+# order (``_carve_control_arena``); a slot-list route adds its
+# ``expert_scatter_offsets`` after ``PrivateSFBlockOffsets``. The tile lists
+# share one page, so only the first starts on a page boundary.
+ARENA_STORES = (
+    "expert_row_offsets",
+    "PrivateSFBlockOffsets",
+    "tile_expert",
+    "tile_m_local",
+    "total_m_tiles_out",
+    "token_to_permuted",
+    "meta_token",
+    "meta_slot",
+    "routing_weight_pool",
+)
+SHARED_PAGE_MEMBERS = ("tile_m_local", "total_m_tiles_out")
+# The bindings that are views of ``reset_storage`` on every route; a route
+# without the slot list adds ``expert_scatter_offsets``.
+RESET_VIEWS = (
+    "expert_counts",
+    "histogram_done",
+    "prefix_done",
+    "dispatch_done",
+    "l2_done",
+    "l1_arrival",
+    "PrivateCounters",
+    "PrivateMasks",
+)
+MINUS_ONE_FILLED = (
+    "tile_expert",
+    "tile_m_local",
+    "token_to_permuted",
+    "meta_token",
+    "meta_slot",
+)
+
+
+def byte_range(tensor):
+    """``(first, end)`` device byte addresses of a contiguous tensor."""
+    first = tensor.data_ptr()
+    return first, first + tensor.numel() * tensor.element_size()
+
+
+def owns_its_storage(tensor):
+    """Whether the tensor is a separate allocation (not a view of a slab)."""
+    return tensor.untyped_storage().nbytes() == tensor.numel() * tensor.element_size()
+
+
+def prepare_small_route(torch, monkeypatch, mode, slot_list=False):
+    """The small route prepared under ``FLASHINFER_MEGA_MOE_CONTROL_ARENA``
+    ``mode`` (``None``: the knob unset, the default)."""
+    if mode is None:
+        monkeypatch.delenv(preparation.CONTROL_ARENA_KNOB, raising=False)
+    else:
+        monkeypatch.setenv(preparation.CONTROL_ARENA_KNOB, mode)
+    metadata = dict(SHORT_ROW_METADATA, slot_list=slot_list)
+    inputs = small_pipeline_inputs(torch)
+    return preparation.prepare_pipeline_bindings(inputs, 4, route_metadata=metadata)
+
+
+@pytest.mark.parametrize("slot_list", [False, True])
+def test_pipeline_bindings_carve_the_control_words_into_a_page_aligned_arena(
+    slot_list, monkeypatch
+):
+    """By default every kernel-written control buffer is carved from the
+    plan's ``control_slab``: ``reset_storage`` starts 64 KiB (the leading
+    guard) into a 2 MiB page of the slab, a second guard follows it, every
+    other control buffer takes its own 4 KiB page after that guard in carve
+    order (the tile lists share one page at 128-byte steps), the trailing
+    guard fits in the slab and no other binding touches the slab. The
+    counters, gates and masks stay views of ``reset_storage``, and the fills
+    are those of the separate allocations: -1 for the tile lists and the
+    dispatch scratch, 0 elsewhere (``PrivateSFBlockOffsets`` and the slot
+    list were uninitialised; every reader writes them first)."""
+    torch = cuda_torch()
+    PAGE, GUARD, SLOT = (
+        preparation.ARENA_PAGE,
+        preparation.ARENA_GUARD,
+        preparation.ARENA_SLOT,
+    )
+    data = prepare_small_route(torch, monkeypatch, None, slot_list)
+    bindings, slab = data["bindings"], data["control_slab"]
+    reset_storage = data["reset_storage"]
+    assert slab.dtype == torch.uint8 and slab.numel() == 2 * PAGE
+    slab_first, slab_end = byte_range(slab)
+    reset_first, reset_end = byte_range(reset_storage)
+    assert reset_first % PAGE == GUARD and reset_first - GUARD >= slab_first
+    stores = list(ARENA_STORES)
+    if slot_list:
+        stores.insert(2, "expert_scatter_offsets")
+    # Class A alone between two guards, then the stores in carve order, each
+    # on its own page except the shared tile-list page.
+    reset_pages = -(-(reset_end - reset_first) // SLOT) * SLOT
+    stores_first = reset_first + reset_pages + GUARD
+    firsts = [bindings[name].data_ptr() for name in stores]
+    assert firsts == sorted(firsts) and firsts[0] >= stores_first
+    pages = [first // SLOT for first in firsts]
+    for name, first in zip(stores, firsts, strict=True):
+        step = preparation.ARENA_SUB if name in SHARED_PAGE_MEMBERS else SLOT
+        assert first % step == 0, name
+    heads = [
+        p
+        for name, p in zip(stores, pages, strict=True)
+        if name not in SHARED_PAGE_MEMBERS
+    ]
+    assert len(set(heads)) == len(heads)
+    arena_end = max(byte_range(bindings[name])[1] for name in stores)
+    assert arena_end + GUARD <= slab_end
+    # The reset views lie inside ``reset_storage``; nothing else is in the slab.
+    reset_views = list(RESET_VIEWS)
+    if not slot_list:
+        reset_views.append("expert_scatter_offsets")
+    for name in reset_views:
+        first, end = byte_range(bindings[name])
+        assert reset_first <= first and end <= reset_end, name
+        assert bindings[name].untyped_storage().data_ptr() == slab.data_ptr(), name
+    assert bindings["PrivateMasks"].data_ptr() % 8 == 0
+    for name, value in bindings.items():
+        if isinstance(value, torch.Tensor) and name not in stores + reset_views:
+            first, end = byte_range(value)
+            assert end <= slab_first or first >= slab_end, name
+    # Fills: every control buffer is four bytes wide, so compare the words.
+    for name in stores:
+        words = bindings[name].view(torch.int32)
+        fill = -1 if name in MINUS_ONE_FILLED else 0
+        assert bool((words == fill).all()), name
+    assert bool((reset_storage.view(torch.int32) == 0).all())
+
+
+@pytest.mark.parametrize("mode", ["off", "reset", "all"])
+def test_control_arena_knob_moves_pointers_only(mode, monkeypatch):
+    """``FLASHINFER_MEGA_MOE_CONTROL_ARENA`` changes where the control
+    buffers live and nothing else: the binding names, dtypes and shapes,
+    ``reset_storage``'s words and the ``reset_buffers`` tuple are the same
+    under every value. ``off`` allocates every buffer separately (no slab,
+    as before the arena); ``reset`` carves ``reset_storage`` alone and keeps
+    the other control buffers separate allocations."""
+    torch = cuda_torch()
+
+    def surface(data):
+        bindings = data["bindings"]
+        tensors = {
+            name: (value.dtype, tuple(value.shape))
+            for name, value in bindings.items()
+            if isinstance(value, torch.Tensor)
+        }
+        reset_storage = data["reset_storage"]
+        return (
+            set(bindings),
+            tensors,
+            (reset_storage.dtype, tuple(reset_storage.shape)),
+            len(data["reset_buffers"]),
+        )
+
+    data = prepare_small_route(torch, monkeypatch, mode)
+    assert surface(data) == surface(prepare_small_route(torch, monkeypatch, "off"))
+    assert len(data["reset_buffers"]) == 7
+    slab, reset_storage = data["control_slab"], data["reset_storage"]
+    stores = [data["bindings"][name] for name in ARENA_STORES]
+    if mode == "off":
+        assert slab is None and owns_its_storage(reset_storage)
+        assert all(owns_its_storage(tensor) for tensor in stores)
+        return
+    assert reset_storage.data_ptr() % preparation.ARENA_PAGE == preparation.ARENA_GUARD
+    assert reset_storage.untyped_storage().data_ptr() == slab.data_ptr()
+    in_slab = [
+        tensor.untyped_storage().data_ptr() == slab.data_ptr() for tensor in stores
+    ]
+    assert in_slab == [mode == "all"] * len(stores)
+    if mode == "reset":
+        assert all(owns_its_storage(tensor) for tensor in stores)
+
+
+def test_control_arena_knob_refuses_an_unknown_value(monkeypatch):
+    """The knob is checked before any input is touched, so the inputs may
+    live on the host here."""
+    torch = pytest.importorskip("torch")
+    inputs = small_pipeline_inputs(torch, device="cpu")
+    monkeypatch.setenv(preparation.CONTROL_ARENA_KNOB, "on")
+    with pytest.raises(ValueError, match=preparation.CONTROL_ARENA_KNOB):
+        preparation.prepare_pipeline_bindings(
+            inputs, 4, route_metadata=SHORT_ROW_METADATA
+        )

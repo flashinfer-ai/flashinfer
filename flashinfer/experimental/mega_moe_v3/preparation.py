@@ -19,6 +19,7 @@ partial sum over its local routes (zeros for a token without one).
 """
 
 import math
+import os
 
 BLOCK_M = 128
 BLOCK_N = 128
@@ -44,6 +45,14 @@ PIPELINE_KEY_FIELDS = (
     "routed_weight_dtype",
     "activation_clamp",
 )
+# The plan's control arena (``_carve_control_arena``): a 2 MiB GPU page
+# window, 64 KiB guards, one 4 KiB page per buffer, 128-byte steps within
+# a shared page, and the knob that selects what is carved into it.
+CONTROL_ARENA_KNOB = "FLASHINFER_MEGA_MOE_CONTROL_ARENA"
+ARENA_PAGE = 2 << 20
+ARENA_GUARD = 64 << 10
+ARENA_SLOT = 4 << 10
+ARENA_SUB = 128
 
 
 def physical_intermediate(intermediate) -> int:
@@ -382,6 +391,87 @@ def w1_launch_view(b1, logical_intermediate: int, expert_map: bool):
     return b1[:, : 2 * logical_intermediate]
 
 
+def _control_arena_mode():
+    """What ``FLASHINFER_MEGA_MOE_CONTROL_ARENA`` carves into the control
+    arena, read when a call is prepared: ``"all"`` (the default) every
+    kernel-written control buffer, ``"reset"`` only the strong-op words
+    (``reset_storage``), ``"off"`` nothing (every buffer is a separate
+    allocation, as before the arena)."""
+    mode = os.environ.get(CONTROL_ARENA_KNOB, "all")
+    if mode not in ("all", "reset", "off"):
+        raise ValueError(
+            f"{CONTROL_ARENA_KNOB} must be 'all', 'reset' or 'off'; got {mode!r}"
+        )
+    return mode
+
+
+def _carve_control_arena(mode, strong, stores):
+    """``(control_slab, buffers)``: the control buffers ``mode`` selects,
+    carved by name from one plan-owned, page-aligned arena.
+
+    The kernel publishes and polls the plan's control words with strong
+    generic operations (release atomics, acquire spins, stores by every CTA)
+    while TMA streams the activations. When the caller's ``x`` (the FC1
+    ``A`` map of a route that reads the activations in place) landed in the
+    same 4 KiB page as those words, the four-token tp4ep4 row measured 1.6x
+    slower (40.6 us against ~25 us); the same bytes a page apart were fast.
+    Separate small allocations leave the words' page-mates to the caching
+    allocator's hole state, so the arena makes their placement deterministic
+    and private: a window of a zero-filled slab that starts on a 2 MiB GPU
+    page boundary, a 64 KiB guard nothing is carved from before the strong-op
+    words, after them and after the last buffer, and every buffer on its own
+    4 KiB page (the members of one slot share a page at 128-byte steps),
+    carved in order of traffic intensity. No foreign tensor can share a page
+    with a control word, and every word's offset within its 2 MiB page is
+    fixed for a route key, whatever the allocation history.
+
+    ``strong`` and ``stores`` list the slots in carve order; a slot is a list
+    of ``(name, numel, dtype, fill)`` members whose bytes read ``fill``
+    (``None`` or ``0``: the slab's zeros). The slab is sized so that a 2 MiB-
+    aligned window of the arena's size always exists inside it (4 MiB for an
+    arena of up to 2 MiB) and the arena starts at the slab's first 2 MiB
+    boundary. Mode ``"off"`` carves nothing.
+    """
+    import torch
+
+    if mode == "off":
+        return None, {}
+    slots = [None, *strong, None]
+    if mode == "all":
+        slots += [*stores, None]
+
+    def round_up(n, step):
+        return -(-n // step) * step
+
+    def slot_bytes(slot):
+        if slot is None:
+            return ARENA_GUARD
+        members = (
+            round_up(numel * dtype.itemsize, ARENA_SUB) for _, numel, dtype, _ in slot
+        )
+        return round_up(sum(members), ARENA_SLOT)
+
+    arena_bytes = sum(slot_bytes(slot) for slot in slots)
+    slab_bytes = round_up(arena_bytes, ARENA_PAGE) + ARENA_PAGE
+    control_slab = torch.zeros(slab_bytes, dtype=torch.uint8, device="cuda")
+    cur = (-control_slab.data_ptr()) % ARENA_PAGE
+    assert cur + arena_bytes <= slab_bytes, (cur, arena_bytes, slab_bytes)
+    buffers = {}
+    for slot in slots:
+        if slot is None:
+            cur += ARENA_GUARD
+            continue
+        start = cur
+        for name, numel, dtype, fill in slot:
+            nbytes = numel * dtype.itemsize
+            buffers[name] = control_slab[cur : cur + nbytes].view(dtype)
+            if fill:
+                buffers[name].fill_(fill)
+            cur += round_up(nbytes, ARENA_SUB)
+        cur = start + round_up(cur - start, ARENA_SLOT)
+    return control_slab, buffers
+
+
 def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
     """Pack ``inputs`` for the persistent grid of a ``num_sms``-SM catalogued route.
 
@@ -416,6 +506,7 @@ def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
         raise ValueError(
             f"route metadata 'a_source' must be 'x' or 'pool'; got {a_source!r}"
         )
+    arena_mode = _control_arena_mode()
     args = pipeline_route_args(inputs)
     E, TK, T, H, I = (
         args[k]
@@ -558,31 +649,71 @@ def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
     else:
         A = pool_fp8.view(torch.uint8)
     pool_sf = torch.zeros(M_total, H // 128, dtype=torch.int32, device="cuda")
-    routing_weight_pool = torch.zeros(M_total, dtype=torch.float32, device="cuda")
-    token_to_permuted = torch.full((T * TK,), -1, dtype=torch.int32, device="cuda")
-    meta_token = torch.full((M_total,), -1, dtype=torch.int32, device="cuda")
-    meta_slot = torch.full((M_total,), -1, dtype=torch.int32, device="cuda")
+    # The kernel-written control buffers in arena carve order (see
+    # ``_carve_control_arena``): the strong-op words of ``reset_storage``
+    # (counters, claim scratch, gates, arrival words), then the stores by
+    # every CTA, the CTA-0 tile lists and the dispatch scratch. A ``None``
+    # fill names a buffer every reader writes first (``PrivateSFBlockOffsets``,
+    # the slot-list ``expert_scatter_offsets``): the arena's zeros, or
+    # ``torch.empty`` outside it.
+    strong = [[("reset_storage", 2 * E + 4 + arrival_words, torch.uint32, 0)]]
+    stores = [
+        [("expert_row_offsets", E, torch.int32, 0)],
+        [("PrivateSFBlockOffsets", E, torch.uint32, None)],
+        [
+            ("tile_expert", total_m_tiles, torch.int32, -1),
+            ("tile_m_local", total_m_tiles, torch.int32, -1),
+            ("total_m_tiles_out", 1, torch.int32, 0),
+        ],
+        [("token_to_permuted", T * TK, torch.int32, -1)],
+        [("meta_token", M_total, torch.int32, -1)],
+        [("meta_slot", M_total, torch.int32, -1)],
+        [("routing_weight_pool", M_total, torch.float32, 0)],
+    ]
+    if slot_list:
+        # Slot-list dispatch: per-expert slot list [E, T] (native
+        # src_token_topk_idx), fully rewritten by every launch, never reset.
+        stores.insert(2, [("expert_scatter_offsets", E * T, torch.int32, None)])
+    control_slab, arena = _carve_control_arena(arena_mode, strong, stores)
+    spec = {
+        name: (numel, dtype, fill)
+        for slot in strong + stores
+        for name, numel, dtype, fill in slot
+    }
+
+    def control(name):
+        """The named control buffer: its arena slot, else allocated here, in
+        the order and form the buffers had before the arena."""
+        if name in arena:
+            return arena[name]
+        numel, dtype, fill = spec[name]
+        if fill is None:
+            return torch.empty(numel, dtype=dtype, device="cuda")
+        if fill == 0:
+            return torch.zeros(numel, dtype=dtype, device="cuda")
+        return torch.full((numel,), fill, dtype=dtype, device="cuda")
+
+    routing_weight_pool = control("routing_weight_pool")
+    token_to_permuted = control("token_to_permuted")
+    meta_token = control("meta_token")
+    meta_slot = control("meta_slot")
     num_sms = int(num_sms)
     # The source schedule runs one CTA per SM (NUM_CTAS) however few tiles
     # the routes fill, e.g. when -1 slots leave fewer routed tokens.
     persistent_grid = num_sms
     grid = (persistent_grid, 1, 1)
-    reset_storage = torch.zeros(
-        2 * E + 4 + arrival_words, dtype=torch.uint32, device="cuda"
-    )
+    reset_storage = control("reset_storage")
     expert_counts = reset_storage[:E].view(torch.int32)
-    expert_row_offsets = torch.zeros(E, dtype=torch.int32, device="cuda")
+    expert_row_offsets = control("expert_row_offsets")
     if slot_list:
-        # Slot-list dispatch: per-expert slot list [E, T] (native
-        # src_token_topk_idx), fully rewritten by every launch, never reset.
-        expert_scatter_offsets = torch.empty(E * T, dtype=torch.int32, device="cuda")
+        expert_scatter_offsets = control("expert_scatter_offsets")
     else:
         # Per-expert claim scratch [E], read before it is written: zero at
         # prepare (and at bind), zeroed again by the kernel on exit.
         expert_scatter_offsets = reset_storage[E : 2 * E].view(torch.int32)
-    tile_expert = torch.full((total_m_tiles,), -1, dtype=torch.int32, device="cuda")
-    tile_m_local = torch.full((total_m_tiles,), -1, dtype=torch.int32, device="cuda")
-    total_m_tiles_out = torch.zeros(1, dtype=torch.int32, device="cuda")
+    tile_expert = control("tile_expert")
+    tile_m_local = control("tile_m_local")
+    total_m_tiles_out = control("total_m_tiles_out")
     I_fp8 = torch.zeros(M_total, I, dtype=torch.uint8, device="cuda")
     SF_I = torch.zeros(M_total, I // GRAN_OUT, dtype=torch.uint8, device="cuda")
     expert_output = torch.zeros(M_total, H, dtype=torch.bfloat16, device="cuda")
@@ -667,7 +798,7 @@ def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
         PrivateCounters=l1_arrival[:2],
         PrivateMasks=l1_arrival[2 : 2 + 2 * source_blocks].view(torch.uint64),
         PublicExpertOutput=expert_output.view(torch.uint32),
-        PrivateSFBlockOffsets=torch.empty((E,), dtype=torch.uint32, device="cuda"),
+        PrivateSFBlockOffsets=control("PrivateSFBlockOffsets"),
         PrivateSF1=source_sf1,
         PrivateSF2=source_sf2,
         PrivateSF1Words=source_sf1.reshape(-1),
@@ -686,6 +817,7 @@ def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
         bindings=launch_kwargs,
         reset_storage=reset_storage,
         reset_buffers=reset_buffers,
+        control_slab=control_slab,
         output=y,
         expert_output=expert_output,
         source_schedule=True,
