@@ -102,6 +102,7 @@ Exchange layouts (one ``all_to_all_single`` per direction; ``s`` = one FP32
 from __future__ import annotations
 
 import dataclasses
+import operator
 import weakref
 from collections.abc import Mapping
 from typing import Any
@@ -234,6 +235,12 @@ UPLOADS = ("async", "blocking")
 UPLOAD_DEFAULT = "async"
 TABLE_CACHES = ("context", "workspace")
 TABLE_CACHE_DEFAULT = "context"
+
+
+def _stream_capturing(s) -> bool:
+    """Whether the CUDA stream ``s`` captures a graph (the state of ``s`` itself, not of the current stream)."""
+    with torch.cuda.device(s.device), torch.cuda.stream(s):
+        return torch.cuda.is_current_stream_capturing()
 
 
 @dataclasses.dataclass(eq=False)
@@ -1944,16 +1951,17 @@ class KcpContext:
         """Order every upload of this context before the later work of ``stream`` (default: the current stream of
         the context's device), without blocking the host: once per (upload, stream), ``stream.wait_event`` on the
         upload's event plus ``record_stream`` of its blob for an upload made on another stream; nothing for an upload
-        made on ``stream`` itself (stream order covers it) and nothing under CUDA-graph capture.  The KDA entry points
-        call it; a caller that prepares a context on another stream calls it before handing the context's tables to
-        work of its own (the conv halo entry calls it as well)."""
+        made on ``stream`` itself (stream order covers it) and nothing while ``stream`` captures a CUDA graph (the capture
+        state of ``stream`` itself, not of the current stream).  The KDA and conv halo entry points call it on every
+        call; a caller that prepares a context on another stream calls it before handing the context's tables to work
+        of its own."""
         n = len(self._uploads)
-        if not n or torch.cuda.is_current_stream_capturing():
+        if not n:
             return
         s = torch.cuda.current_stream(self.device) if stream is None else stream
         key = s.cuda_stream
         i = self._waited.get(key, 0)
-        if i >= n:
+        if i >= n or _stream_capturing(s):
             return
         for rec in self._uploads[i:n]:
             if rec.stream.cuda_stream != key:
@@ -2136,14 +2144,21 @@ def build_kcp_context(
             raise ValueError(
                 f"_kcp_test_knobs: table_cache must be one of {TABLE_CACHES}, got {table_cache!r}"
             )
+        if table_cache == "workspace" and upload != "blocking":
+            # the previous per-workspace table sets are not recorded on the context: their asynchronous copies
+            # would be unordered for a later call on another stream
+            raise ValueError(
+                "_kcp_test_knobs: table_cache='workspace' (the previous path) needs upload='blocking'"
+            )
     p_rule = validate_test_knobs(knobs)["p_rule"]
-    head_counts: tuple[int, ...] = (
-        ()
-        if heads is None
-        else (int(heads),)
-        if isinstance(heads, int)
-        else tuple(int(h) for h in heads)
-    )
+    head_counts: tuple[int, ...]
+    if heads is None:
+        head_counts = ()
+    else:
+        try:  # an int-like scalar (int, numpy / 0-d torch integer)
+            head_counts = (operator.index(heads),)
+        except TypeError:
+            head_counts = tuple(int(h) for h in heads)
     mine = part.fragments[rank]
     n_frag = len(mine)
     if n_frag > MAX_FRAGS:

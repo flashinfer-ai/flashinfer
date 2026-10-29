@@ -2280,6 +2280,8 @@ class _Tables:
     _ring: _Ring | None = None  # the ring-exchange tables, derived on first use
     # held by the context's table-set cache (KcpWorkspace.tables)
     on_context: bool = False
+    # the trimmed path's absent-pool slot table is this set's own copy (absent_index; KcpWorkspace.tables)
+    own_absent: bool = False
 
     def __init__(
         self,
@@ -2883,7 +2885,8 @@ class _Tables:
 
     def absent_index(self, device: torch.device | str) -> torch.Tensor:
         """Trimmed host path: the slot table of an absent pool (``NSEG`` entries of ``-1``), one device copy per
-        table set and device (the untrimmed path keeps the process cache of ``cake_kcp_jit``)."""
+        table set and device, used when ``own_absent`` (the untrimmed path and the test knobs of the previous path
+        keep the process cache of ``cake_kcp_jit``)."""
         lst = self.__dict__.get("_absent")
         if lst is None:
             lst = self._absent = [-1] * self.NSEG
@@ -3105,6 +3108,13 @@ class KcpWorkspace:
         if tb is None:
             tb = _Tables(ctx, H, fused_walks=fused_walks, walk_geometry=walk_geometry)
             tb.on_context = sets is not self._tables
+            # the absent-pool slot table: the set's own copy on the shipped path; the upload="blocking" /
+            # table_cache="workspace" knobs keep the previous process cache of cake_kcp_jit
+            tb.own_absent = (
+                getattr(ctx, "upload", cake_kcp_plan.UPLOAD_DEFAULT) == "async"
+                and getattr(ctx, "table_cache", cake_kcp_plan.TABLE_CACHE_DEFAULT)
+                == "context"
+            )
             sets[key] = tb
         return tb
 
@@ -3914,6 +3924,9 @@ class _Ring:
         ctx = tb.ctx
         rank = int(ctx.rank)
         self.hops = tb.max_hops
+        # the K4 chains of the hops (one Chains per family, built at its first call): their device tables are copied
+        # once per table set, not per call
+        self.chains: dict[str, Chains] = {}
         pos: dict[
             int, tuple[int, int]
         ] = {}  # slot -> (position in its document chain, chain length)
@@ -4042,17 +4055,18 @@ def _ring_wait(works) -> None:
 def _ring_chain(
     tb: _Tables, family: str, elems: list[tuple[int, int, int, int]]
 ) -> Chains:
-    """One-element chains per (fragment, head) from tile numbers ``(x0, m, c, y)`` (K4 state step on one fragment)."""
-    ch = Chains(ncols=D)
-    for (
-        x0,
-        m,
-        c,
-        y,
-    ) in (
-        elems
-    ):  # tile numbers -> element offsets (the chain tables address pools in elements)
-        ch.add([(m * TILE, c * TILE, -1)], x0=x0 * TILE, y_final=y * TILE)
+    """One-element chains per (fragment, head) from tile numbers ``(x0, m, c, y)`` (K4 state step on one fragment),
+    cached per ``family`` on the table set's ring tables: ``elems`` derive from the table set alone, so every call
+    of the set reuses the chains and their device tables (a fresh set per call would upload them, and record the
+    upload on the context, on every call)."""
+    ring = _ring_tables(tb)
+    ch = ring.chains.get(family)
+    if ch is None:
+        ch = Chains(ncols=D)
+        # tile numbers -> element offsets (the chain tables address pools in elements)
+        for x0, m, c, y in elems:
+            ch.add([(m * TILE, c * TILE, -1)], x0=x0 * TILE, y_final=y * TILE)
+        ring.chains[family] = ch
     return ch
 
 

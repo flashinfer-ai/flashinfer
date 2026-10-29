@@ -1786,10 +1786,16 @@ def _pool_arguments(
     ``ix`` is a ``cake_kcp.Indexed`` (pool, ``index[nseg]``, ``tiles[slot][h]``): its tile table is recovered into
     the two-integer form through ``Indexed.addressing`` and the pool view starts at its base tile.  ``None`` (or a
     non-pool value, the tape program's unused ``out``) is the absent pool: every slot ``-1`` over a dummy tile, with
-    no stride of its own (on the trimmed path the slot table is the table set's own copy, ``tb.absent_index``).
+    no stride of its own (on the trimmed path with the shipped upload knobs the slot table is the table set's own
+    copy, ``tb.absent_index``).
     """
     if ix is None or not hasattr(ix, "addressing"):
-        absent = getattr(tb, "absent_index", None) if trim else None
+        # the table set's own copy on the shipped path; the previous path's knobs keep the process cache
+        absent = (
+            getattr(tb, "absent_index", None)
+            if trim and getattr(tb, "own_absent", False)
+            else None
+        )
         return (
             _dummy_tile(device),
             absent(device)
