@@ -80,8 +80,11 @@ def sum_of_squares(x: torch.Tensor) -> torch.Tensor:
 
 def rstd_of(ss: torch.Tensor) -> torch.Tensor:
     """``r = div.rn(1, sqrt.rn(ss + 1e-6))`` (FP32)."""
-    t = ss + torch.tensor(EPS, dtype=F32, device=ss.device)
-    return torch.ones_like(t) / torch.sqrt(t)
+    # each op in FP64, rounded once to FP32, is the correctly rounded FP32 op (FP64 carries > 2 x 24 + 2 bits);
+    # torch's FP32 sqrt on CPU is not sqrt.rn bit for bit
+    t = (ss.to(F64) + torch.tensor(EPS, dtype=F32).to(F64)).to(F32)
+    s = torch.sqrt(t.to(F64)).to(F32)
+    return (1.0 / s.to(F64)).to(F32)
 
 
 def qk_apply_ref(x: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
