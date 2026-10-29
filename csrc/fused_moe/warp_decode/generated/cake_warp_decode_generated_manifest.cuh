@@ -351,7 +351,15 @@ inline int32_t Fc1LaunchGridN(const warp_decode::Shape& shape,
                               const WorkspaceView& ws) {
   if (schedule.route_layout == warp_decode::RouteLayout::kDirect) return ws.route_extent;
   const int32_t grid_m = Fc1GridM(shape, schedule);
-  return std::min(ws.route_tiles, std::max(1, ws.workfeed_ctas / grid_m));
+  // Fused route-pack FC1 pool by row: a smaller pool balances the FC1 workfeed rounds and leaves SMs to the
+  // programmatically launched FC2.
+  int32_t pool = ws.workfeed_ctas;
+  if (schedule.route_packer == warp_decode::RoutePacker::kFusedFc1) {
+    if (shape.hidden_size == 4096 && shape.intermediate_size == 512 && shape.num_experts == 512 &&
+        shape.local_num_experts == 512 && shape.top_k == 10 && shape.num_tokens == 2)
+      pool = std::min<int32_t>(96, pool);  // h4096_e512_i512_k10 T2
+  }
+  return std::min(ws.route_tiles, std::max(1, pool / grid_m));
 }
 inline int32_t Fc2LaunchGridN(const warp_decode::Shape& shape,
                               const warp_decode::Schedule& schedule,
@@ -6126,7 +6134,7 @@ inline void ForEachLaunch(const warp_decode::Invocation& inv,
       && ((!silu && !situ && inv.shape.hidden_size == 4096 && inv.shape.intermediate_size == 1536
               && inv.shape.num_experts == 128 && inv.shape.top_k == 8
               && (inv.shape.num_tokens == 1 || inv.shape.num_tokens == 2 || inv.shape.num_tokens == 4
-                  || inv.shape.num_tokens == 5 || inv.shape.num_tokens == 7))
+                  || inv.shape.num_tokens == 5 || inv.shape.num_tokens == 7 || inv.shape.num_tokens == 9))
           || (!silu && !situ && inv.shape.hidden_size == 2048 && inv.shape.intermediate_size == 768
               && inv.shape.num_experts == 128 && inv.shape.top_k == 8
               && ((inv.shape.num_tokens >= 2 && inv.shape.num_tokens <= 6)
@@ -6610,7 +6618,30 @@ inline int32_t Fc1LaunchGridN(const warp_decode::Shape& shape,
                               const WorkspaceView& ws) {
   if (schedule.route_layout == warp_decode::RouteLayout::kDirect) return ws.route_extent;
   const int32_t grid_m = Fc1GridM(shape, schedule);
-  return std::min(ws.route_tiles, std::max(1, ws.workfeed_ctas / grid_m));
+  // Fused route-pack FC1 pool by row: a smaller pool balances the FC1 workfeed rounds and leaves SMs to the
+  // programmatically launched FC2.
+  int32_t pool = ws.workfeed_ctas;
+  if (schedule.route_packer == warp_decode::RoutePacker::kFusedFc1) {
+    if (shape.hidden_size == 3072 && shape.intermediate_size == 384 && shape.num_experts == 256 &&
+        shape.local_num_experts == 256 && shape.top_k == 8 && shape.num_tokens == 3)
+      pool = std::min<int32_t>(80, pool);  // h3072_e256_i384_k8 T3
+    if (shape.hidden_size == 3072 && shape.intermediate_size == 384 && shape.num_experts == 256 &&
+        shape.local_num_experts == 256 && shape.top_k == 8 && shape.num_tokens == 4)
+      pool = std::min<int32_t>(96, pool);  // h3072_e256_i384_k8 T4
+    if (shape.hidden_size == 3072 && shape.intermediate_size == 768 && shape.num_experts == 256 &&
+        shape.local_num_experts == 256 && shape.top_k == 8 && shape.num_tokens == 2)
+      pool = std::min<int32_t>(96, pool);  // h3072_e256_i768_k8 T2
+    if (shape.hidden_size == 4096 && shape.intermediate_size == 256 && shape.num_experts == 512 &&
+        shape.local_num_experts == 512 && shape.top_k == 10 && shape.num_tokens == 4)
+      pool = std::min<int32_t>(80, pool);  // h4096_e512_i256_k10 T4
+    if (shape.hidden_size == 4096 && shape.intermediate_size == 512 && shape.num_experts == 512 &&
+        shape.local_num_experts == 512 && shape.top_k == 10 && shape.num_tokens == 2)
+      pool = std::min<int32_t>(96, pool);  // h4096_e512_i512_k10 T2
+    if (shape.hidden_size == 4096 && shape.intermediate_size == 512 && shape.num_experts == 512 &&
+        shape.local_num_experts == 512 && shape.top_k == 10 && shape.num_tokens == 4)
+      pool = std::min<int32_t>(128, pool);  // h4096_e512_i512_k10 T4
+  }
+  return std::min(ws.route_tiles, std::max(1, pool / grid_m));
 }
 inline int32_t Fc2LaunchGridN(const warp_decode::Shape& shape,
                               const warp_decode::Schedule& schedule,
@@ -6628,10 +6659,16 @@ inline int32_t Fc2LaunchGridN(const warp_decode::Shape& shape,
     return ws.route_extent;
   return std::min(ws.route_tiles, std::max(1, ws.workfeed_ctas / Fc2GridM(shape)));
 }
+// The fused route-pack K256 FC2 of h3072_e256_i384_k8 T7 runs the linear-grid program on all 152 SMs: its
+// 24 x 6 pool leaves the last FC2 items to too few CTAs.
+inline bool LinearK256Fc2AllSms(const warp_decode::Shape& shape) {
+  return shape.hidden_size == 3072 && shape.intermediate_size == 384 && shape.num_experts == 256 &&
+         shape.local_num_experts == 256 && shape.top_k == 8 && shape.num_tokens == 7;
+}
 // The linear-grid K256 FC2 launches one 1-D grid of CTAs, each starting at the work item of its block index:
 // every item of the route tiles up to the device workfeed's pool, which need not be a multiple of grid_m.
 inline int32_t Fc2LinearCtas(const warp_decode::Shape& shape, const WorkspaceView& ws) {
-  return std::max(1, std::min(Fc2GridM(shape) * ws.route_tiles, ws.workfeed_ctas));
+  return std::max(1, std::min(Fc2GridM(shape) * ws.route_tiles, LinearK256Fc2AllSms(shape) ? 152 : ws.workfeed_ctas));
 }
 // The fused route-pack K256 FC2 rows of the contract's LinearK256Fc2: the program choice and the workfeed
 // counter PrepareWorkspace arms both read it.
@@ -6639,7 +6676,7 @@ inline bool LinearK256Fc2(const warp_decode::Shape& shape, const warp_decode::Sc
   return schedule.route_layout == warp_decode::RouteLayout::kGpuPacked &&
          schedule.route_packer == warp_decode::RoutePacker::kFusedFc1 &&
          schedule.fc2 == warp_decode::Fc2Schedule::kRouteParallelK256 &&
-         warp_decode::LinearK256Fc2(warp_decode::kTarget, shape);
+         (warp_decode::LinearK256Fc2(warp_decode::kTarget, shape) || LinearK256Fc2AllSms(shape));
 }
 inline int32_t* TileExpert(const warp_decode::Invocation& inv,
                            const warp_decode::Schedule& schedule,
