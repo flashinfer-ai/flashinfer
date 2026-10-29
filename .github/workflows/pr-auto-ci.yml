@@ -46,13 +46,16 @@ permissions:
 jobs:
   auto-ci:
     name: Auto-trigger CI
-    # For review events, only fire on approval. For synchronize, always fire
-    # (the job itself checks whether an approval exists).
+    # Only run on the canonical repo — forks making PRs against their own
+    # main branch should not trigger this workflow.
     if: >-
-      (github.event_name == 'pull_request_review'
-       && github.event.pull_request.base.ref == 'main'
-       && github.event.review.state == 'approved')
-      || github.event_name == 'pull_request'
+      github.repository == 'flashinfer-ai/flashinfer'
+      && (
+        (github.event_name == 'pull_request_review'
+         && github.event.pull_request.base.ref == 'main'
+         && github.event.review.state == 'approved')
+        || github.event_name == 'pull_request'
+      )
     runs-on: ubuntu-latest
     concurrency:
       group: pr-auto-ci-${{ github.event.pull_request.number }}
