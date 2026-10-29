@@ -29,10 +29,29 @@ MOK_PRECISIONS = ("bf16", "mxfp8")
 # 4 ranks at 2.4x +0.8 % (one screening round). The MXFP8 threshold sits
 # between the measured 2.4x (no gain) and 3.0x (gain). Balanced steps never
 # switch, so the fixed split stays in force for them.
+#
+# Rubin (compute capability (10, 7), 212 SMs) MXFP8 row 72 / 60 over its fixed
+# 60 / 60 (COMM_SMS), switching from 1.5x (IMBALANCE_DEVICE_THRESHOLDS): EP8 on
+# two nodes (4 GPUs each, one NVLink domain), H 4096 / I 2048 / 288 experts /
+# top 8, 27116 tokens per rank, configurations rotated on one workspace, four
+# rounds, hottest-rank medians, MoE training-update proxy (5 layers x 2
+# microbatches). Hottest rank at 1.51x the mean routed load: forward -6.9 %,
+# update -3.8 %; 2.05x -5.7 / -2.8 %; 3.05x -10.1 / -5.1 %; 4.66x
+# -11.1 / -5.5 %; 6.47x -10.6 / -5.5 %; backward within +-0.1 % (a 64-SM
+# backward measured 0.2 ... 1.2 % slower). Balanced steps do not switch (+0.2 /
+# 0.0 % at 27116 / 32768 tokens), where an unconditional 72 / 60 forward is
+# 4.1 % slower at 27116 tokens.
 IMBALANCE_COMM_SMS = {
     (10, 0): {148: {"bf16": (24, 28), "mxfp8": (44, 36)}},
+    (10, 7): {212: {"mxfp8": (72, 60)}},
 }
 IMBALANCE_THRESHOLDS = {"bf16": 4.0, "mxfp8": 2.7}
+# Measured device thresholds that replace IMBALANCE_THRESHOLDS for a device
+# (compute capability, SM count) and precision. Rubin MXFP8 1.5: its split gains
+# from the measured 1.51x up; balanced steps (1.0x) measured no gain.
+IMBALANCE_DEVICE_THRESHOLDS = {
+    (10, 7): {212: {"mxfp8": 1.5}},
+}
 # The BF16 threshold under the single-precision name of the first imbalance
 # split revision; kept so callers written against that name keep working.
 IMBALANCE_THRESHOLD = IMBALANCE_THRESHOLDS["bf16"]
@@ -51,9 +70,17 @@ IMBALANCE_THRESHOLD = IMBALANCE_THRESHOLDS["bf16"]
 # full step sits at the edge of the ~0.6 % spread of identical arms, which is
 # why the row is opt-in rather than the default. GB300 EP4 (one node) measured
 # no unconditional gain (balanced steps +0.7 ... +1.0 % slower) and has no row;
-# B200 keeps its imbalance switch above.
+# B200 keeps its imbalance switch above. Rubin (compute capability (10, 7), 212
+# SMs) MXFP8 EP8 row 60 / 60 against the factory 40 / 40: EP8 on two nodes (4
+# GPUs each, one NVLink domain), H 4096 / I 2048 / 288 experts / top 8,
+# configurations rotated on one workspace, four rounds, hottest-rank medians.
+# Balanced routing, forward / backward: 8192 tokens per rank -7.4 / -4.6 %,
+# 27116 -13.3 / -8.7 %, 32768 -18.1 / -2.4 %; round spread at most 1.2 %.
+# Rubin BF16 measured no consistent gain (36 / 36 and 28 / 32 within the
+# +-3 % round spread or slower) and has no row.
 COMM_SMS = {
     (10, 3): {152: {"mxfp8": {8: (44, 36)}}},
+    (10, 7): {212: {"mxfp8": {8: (60, 60)}}},
 }
 _FACTORY_COMM_SMS = (40, 40)
 
@@ -101,14 +128,29 @@ def resolve_comm_sms(precision, ep_size, device=None):
     )
 
 
-def resolve_imbalance_threshold(precision):
+def resolve_imbalance_threshold(precision, device=None):
     """Load ratio (hottest rank over the mean per-rank routed load) from which
-    the imbalance split of ``precision`` (``"bf16"`` or ``"mxfp8"``) applies.
+    the imbalance split of ``precision`` (``"bf16"`` or ``"mxfp8"``) applies:
+    the measured row of ``device`` in :data:`IMBALANCE_DEVICE_THRESHOLDS`
+    (compute capability and SM count) when given and present, else the
+    precision's :data:`IMBALANCE_THRESHOLDS` value.
     """
     if precision not in MOK_PRECISIONS:
         raise ValueError(
             f"precision must be one of {MOK_PRECISIONS}, got {precision!r}"
         )
+    if device is not None:
+        import torch
+
+        capability = tuple(torch.cuda.get_device_capability(device))
+        sm_count = int(torch.cuda.get_device_properties(device).multi_processor_count)
+        threshold = (
+            IMBALANCE_DEVICE_THRESHOLDS.get(capability, {})
+            .get(sm_count, {})
+            .get(precision)
+        )
+        if threshold is not None:
+            return threshold
     return IMBALANCE_THRESHOLDS[precision]
 
 
@@ -185,7 +227,8 @@ def create_mok_bf16_workspace(
     communication-SM counts of every launch (factory default 40 / 40). ``"auto"``
     for both takes the measured row of the device, ``precision`` and EP group
     size (:func:`resolve_comm_sms`, :data:`COMM_SMS`; GB300 MXFP8 at EP8: 44 / 36,
-    no row elsewhere, so the factory split stays in force there).
+    Rubin (212 SMs) MXFP8 at EP8: 60 / 60, no row elsewhere, so the factory
+    split stays in force there).
     ``imbalance_comm_sms`` is the (forward, backward) communication-SM split the
     launches switch to while the hottest rank's routed-row load is at least
     ``imbalance_threshold`` times the mean per-rank load (observed on the
@@ -193,14 +236,16 @@ def create_mok_bf16_workspace(
     are identical on every rank, each rank applies its own latest completed
     observation). ``"auto"`` (default) takes the measured row of the device
     for ``precision`` (:func:`resolve_imbalance_comm_sms`, keyed by compute
-    capability and SM count; B200 BF16: 24 / 28, B200 MXFP8: 44 / 36, no row
-    elsewhere - GB200 and GB300 included - so the fixed split stays in force
-    there), ``None`` keeps the fixed split and a pair sets it. ``precision``
-    only selects that row and the threshold. ``imbalance_threshold`` ``"auto"``
-    (default) takes the measured ratio of ``precision``
-    (:func:`resolve_imbalance_threshold`; :data:`IMBALANCE_THRESHOLDS`): BF16 4,
-    between the 3x load ratio, where its split shows no gain, and 5.6x, where it
-    gains 1-2 %; MXFP8 2.7, between 2.4x (no gain) and 3x (gains 1 %). A number
+    capability and SM count; B200 BF16: 24 / 28, B200 MXFP8: 44 / 36, Rubin
+    (212 SMs) MXFP8: 72 / 60, no row elsewhere - GB200 and GB300 included - so
+    the fixed split stays in force there), ``None`` keeps the fixed split and a
+    pair sets it. ``precision`` only selects that row and the threshold.
+    ``imbalance_threshold`` ``"auto"`` (default) takes the measured ratio of
+    the device and ``precision`` (:func:`resolve_imbalance_threshold`;
+    :data:`IMBALANCE_DEVICE_THRESHOLDS`, else :data:`IMBALANCE_THRESHOLDS`):
+    BF16 4, between the 3x load ratio, where its split shows no gain, and 5.6x,
+    where it gains 1-2 %; MXFP8 2.7, between 2.4x (no gain) and 3x (gains 1 %);
+    Rubin MXFP8 1.5, its split gaining from the measured 1.51x up. A number
     sets the ratio. Balanced steps never switch.
     ``MoKConfig.comm_split_log`` (default ``False``; ``dataclasses.replace(config,
     comm_split_log=True)`` on the returned config) prints each split change per
@@ -241,7 +286,11 @@ def create_mok_bf16_workspace(
     if isinstance(imbalance_threshold, str):
         if imbalance_threshold != "auto":
             raise ValueError('imbalance_threshold must be "auto" or a number')
-        imbalance_threshold = resolve_imbalance_threshold(precision)
+        import torch
+
+        imbalance_threshold = resolve_imbalance_threshold(
+            precision, torch.cuda.current_device() if device is None else device
+        )
     config = MoKConfig(
         fwd_num_comm_sms=fwd_num_comm_sms,
         bwd_num_comm_sms=bwd_num_comm_sms,
@@ -273,6 +322,8 @@ def quantize_mok_mxfp8_weights(gate, up, down):
     ``forward`` (and its first two entries to ``recompute_forward_context``)
     and ``backward_weights`` to ``backward``. Requantize after every weight
     update; weight gradients are returned in BF16 (or FP32 accumulators).
+    CUDA tensors are quantized by fused kernels without host synchronization
+    (CUDA Graph capturable).
     """
     from .mxfp8 import quantize_routed_weights
 
