@@ -30,7 +30,8 @@ on:
   schedule:
     - cron: '17 4,12,20 * * *'
   pull_request:
-    branches: [main]
+    # DNM TEST: base-branch filter removed so the run-ci label applied by
+    # pr-auto-ci.yml on a fork-internal PR actually fires this workflow.
     types: [opened, synchronize, reopened, labeled, ready_for_review]
   workflow_dispatch:
     inputs:
