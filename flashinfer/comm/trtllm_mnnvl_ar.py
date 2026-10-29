@@ -56,6 +56,9 @@ class MNNVLQuantType:
     FP8 = 1
     NVFP4 = 2
     DYNAMIC_FP8 = 3
+    # E4M3 data with one UE8M0 scale per 32 elements (SWIZZLED_128x4 or LINEAR scales),
+    # bit-exact with mxfp8_quantize(backend="cute-dsl") on the RMSNorm output.
+    MXFP8 = 4
 
 
 class MNNVLAllReduceFusionWorkspace(AllReduceFusionWorkspace):
@@ -645,7 +648,7 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
     strategy: MNNVLAllreduceFusionStrategy = MNNVLAllreduceFusionStrategy.AUTO,
     weight_bias: float = 0.0,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, Optional[torch.Tensor]]:
-    """Perform MNNVL AllReduce + Residual + RMSNorm + FP8/NVFP4 quantization.
+    """Perform MNNVL AllReduce + Residual + RMSNorm + FP8/NVFP4/MXFP8 quantization.
 
     Quantization is applied after RMSNorm. ``output`` is optional; pass it only
     when the normalized non-quantized tensor is also needed. The quantized result
@@ -661,20 +664,23 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
             ``[num_tokens, hidden_dim]``.
         residual_out: Optional residual output tensor with shape
             ``[num_tokens, hidden_dim]``.
-        quant_out: Optional quantized output. For FP8, shape must be
+        quant_out: Optional quantized output. For FP8 and MXFP8, shape must be
             ``[num_tokens, hidden_dim]`` and dtype ``torch.float8_e4m3fn``. For
             NVFP4, shape must be ``[num_tokens, hidden_dim // 2]`` and dtype
             ``torch.uint8`` or ``torch.float4_e2m1fn_x2``.
         scale_out: Optional scale output. Dynamic FP8 uses ``[num_tokens, 1]``
-            float32. NVFP4 uses ``[num_tokens, hidden_dim // 16]`` for
+            float32. MXFP8 uses a contiguous 1-D uint8 tensor of UE8M0 scales
+            (one per 32 elements) sized as ``mxfp8_quantize`` returns it for the
+            layout; the scales of the swizzled layout's padding rows are not
+            written. NVFP4 uses ``[num_tokens, hidden_dim // 16]`` for
             ``LINEAR`` layout, or a 1-D tensor large enough for the padded
             ``SWIZZLED_128x4`` layout. Static FP8 ignores this argument.
         output_scale: Scalar float or float32 tensor used as the quantization
-            output scale. Defaults to ``1.0``.
-        layout_code: NVFP4 scale layout. MNNVL supports ``SWIZZLED_128x4`` and
+            output scale. Defaults to ``1.0``. Not used by dynamic FP8 or MXFP8.
+        layout_code: NVFP4/MXFP8 scale layout. MNNVL supports ``SWIZZLED_128x4`` and
             ``LINEAR``; ``SWIZZLED_8x4`` is not supported.
-        quant_type: ``MNNVLQuantType.FP8``, ``MNNVLQuantType.NVFP4``, or
-            ``MNNVLQuantType.DYNAMIC_FP8``.
+        quant_type: ``MNNVLQuantType.FP8``, ``MNNVLQuantType.NVFP4``,
+            ``MNNVLQuantType.DYNAMIC_FP8`` or ``MNNVLQuantType.MXFP8``.
         launch_with_pdl: Whether to launch with PDL.
         strategy: MNNVL execution strategy. ``AUTO`` uses internal heuristics.
         weight_bias: Bias added to gamma before scaling. ``0.0`` for standard
@@ -687,7 +693,8 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
 
     if epsilon is None:
         epsilon = torch.finfo(input.dtype).eps
-    if output_scale is None and quant_type != MNNVLQuantType.DYNAMIC_FP8:
+    dynamic_scale = quant_type in (MNNVLQuantType.DYNAMIC_FP8, MNNVLQuantType.MXFP8)
+    if output_scale is None and not dynamic_scale:
         output_scale = 1.0
 
     if len(input.shape) != 2:
@@ -724,7 +731,7 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
             f"output shape must match input shape, got {output.shape} and {input.shape}."
         )
 
-    if quant_type == MNNVLQuantType.DYNAMIC_FP8:
+    if dynamic_scale:
         output_scale_tensor = None
     elif isinstance(output_scale, torch.Tensor):
         if output_scale.numel() < 1:
@@ -830,6 +837,42 @@ def trtllm_mnnvl_fused_allreduce_add_rmsnorm_quant(
             )
         if not scale_out.is_contiguous():
             raise ValueError("scale_out must be contiguous for dynamic FP8.")
+    elif quant_type == MNNVLQuantType.MXFP8:
+        if hidden_dim % 32 != 0:
+            raise ValueError(
+                f"MNNVL MXFP8 quantization requires hidden_dim divisible by 32, got {hidden_dim}."
+            )
+        if quant_out is None:
+            quant_out = torch.empty_like(input, dtype=torch.float8_e4m3fn)
+        elif quant_out.shape != input.shape:
+            raise ValueError(
+                f"quant_out shape must be {tuple(input.shape)} for MXFP8, got {tuple(quant_out.shape)}."
+            )
+        if quant_out.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                f"quant_out dtype for MXFP8 must be float8_e4m3fn, got {quant_out.dtype}."
+            )
+        if not quant_out.is_contiguous():
+            raise ValueError("quant_out must be contiguous for MXFP8.")
+        expected_scale_out_numel = (
+            token_num * (hidden_dim // 32)
+            if layout_code == QuantizationSFLayout.LINEAR
+            else _compute_swizzled_layout_sf_size(token_num, hidden_dim // 32)
+        )
+        if scale_out is None:
+            scale_out = torch.empty(
+                expected_scale_out_numel, dtype=torch.uint8, device=input.device
+            )
+        elif scale_out.numel() < expected_scale_out_numel:
+            raise ValueError(
+                f"scale_out is too small for MXFP8: got {scale_out.numel()} elements, need at least {expected_scale_out_numel}."
+            )
+        if scale_out.dtype != torch.uint8:
+            raise ValueError(
+                f"scale_out dtype for MXFP8 must be uint8, got {scale_out.dtype}."
+            )
+        if not scale_out.is_contiguous():
+            raise ValueError("scale_out must be contiguous for MXFP8.")
     else:
         raise ValueError(f"Unsupported MNNVL quant_type: {quant_type}")
 

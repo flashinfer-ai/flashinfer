@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2026 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -56,9 +56,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define THREADS 256
 
 #include <math_constants.h>
+
 extern "C" {
 
-__global__ __launch_bounds__(THREADS) void
+__global__ __launch_bounds__(256) void
 kernel_cake_lm_head_loss_e03bef31303e0675324f(float* __restrict__ term, double* __restrict__ loss_acc, float* __restrict__ loss_out, int rows_c, int first_chunk, int last_chunk, int mode, float loss_div)
 {
     const int tid = threadIdx.x;
@@ -80,42 +81,42 @@ kernel_cake_lm_head_loss_e03bef31303e0675324f(float* __restrict__ term, double* 
     const int cta_rank = 0;
 
     // Kernel setup ops
-    double* partials = reinterpret_cast<double*>(smem_raw + SMEM_PARTIALS_OFF);
-    const int partials_addr = smem + SMEM_PARTIALS_OFF;
+    double* partials = reinterpret_cast<double*>(smem_raw + 0);
+    const int partials_addr = smem + 0;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     double zero = (double)0.0f;
     double acc = (double)0.0f;
     #pragma unroll 4
     for (int i = tid; i < rows_c; i += 256) {
         acc += (double)term[i];
     }
-    double _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, acc, 16);
-    acc = acc + _shfl_xor_0;
-    double _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, acc, 8);
-    acc = acc + _shfl_xor_1;
-    double _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, acc, 4);
-    acc = acc + _shfl_xor_2;
-    double _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, acc, 2);
-    acc = acc + _shfl_xor_3;
-    double _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, acc, 1);
-    acc = acc + _shfl_xor_4;
+    double _shfl_xor_sync_0 = __shfl_xor_sync(0xFFFFFFFF, acc, 16);
+    acc = acc + _shfl_xor_sync_0;
+    double _shfl_xor_sync_1 = __shfl_xor_sync(0xFFFFFFFF, acc, 8);
+    acc = acc + _shfl_xor_sync_1;
+    double _shfl_xor_sync_2 = __shfl_xor_sync(0xFFFFFFFF, acc, 4);
+    acc = acc + _shfl_xor_sync_2;
+    double _shfl_xor_sync_3 = __shfl_xor_sync(0xFFFFFFFF, acc, 2);
+    acc = acc + _shfl_xor_sync_3;
+    double _shfl_xor_sync_4 = __shfl_xor_sync(0xFFFFFFFF, acc, 1);
+    acc = acc + _shfl_xor_sync_4;
     if (lane == 0) {
         partials[warp] = acc;
     }
     __syncthreads();
     if (warp == 0) {
         double p = ((lane < 8) ? partials[lane] : zero);
-        double _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, p, 16);
-        p = p + _shfl_xor_5;
-        double _shfl_xor_6 = __shfl_xor_sync(0xFFFFFFFF, p, 8);
-        p = p + _shfl_xor_6;
-        double _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, p, 4);
-        p = p + _shfl_xor_7;
-        double _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, p, 2);
-        p = p + _shfl_xor_8;
-        double _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, p, 1);
-        p = p + _shfl_xor_9;
+        double _shfl_xor_sync_5 = __shfl_xor_sync(0xFFFFFFFF, p, 16);
+        p = p + _shfl_xor_sync_5;
+        double _shfl_xor_sync_6 = __shfl_xor_sync(0xFFFFFFFF, p, 8);
+        p = p + _shfl_xor_sync_6;
+        double _shfl_xor_sync_7 = __shfl_xor_sync(0xFFFFFFFF, p, 4);
+        p = p + _shfl_xor_sync_7;
+        double _shfl_xor_sync_8 = __shfl_xor_sync(0xFFFFFFFF, p, 2);
+        p = p + _shfl_xor_sync_8;
+        double _shfl_xor_sync_9 = __shfl_xor_sync(0xFFFFFFFF, p, 1);
+        p = p + _shfl_xor_sync_9;
         if (lane == 0) {
             double prev = loss_acc[0];
             double total = ((first_chunk != 0) ? p : prev + p);

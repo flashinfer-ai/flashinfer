@@ -28,6 +28,7 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Mapping
 import math
+import os
 from dataclasses import KW_ONLY, dataclass, field
 from enum import Enum
 from typing import Any, ClassVar, Dict, Literal, Optional, Tuple, Union
@@ -36,6 +37,7 @@ import torch
 from torch import Tensor
 
 from ..tllm_enums import (
+    DEFAULT_POWLU_M,
     DEFAULT_SITU_BETA,
     DEFAULT_SITU_LINEAR_BETA,
     DEFAULT_SWIGLU_ALPHA,
@@ -189,8 +191,11 @@ class QuantConfig:
         Only NVFP4 activations accept an explicit value (``__post_init__``
         raises otherwise). A runner that has not threaded the setting into
         its quantizer rejects an explicit value instead of dropping it; see
-        ``MoERunner.supports_nvfp4_4over6``. A pinned recipe also pins the
-        GEMM2-input scale of the weight pack: build it with
+        ``MoERunner.supports_nvfp4_4over6``. CuteDSL and TRT-LLM FP4 honor a
+        pinned recipe only with ``per_token_scale=True``, where they
+        requantize the GEMM2 input themselves; CUTLASS NVFP4 honors it on its
+        standard path. For CuteDSL a pinned recipe also pins the GEMM2-input
+        scale of the weight pack: build it with
         ``CuteDslConfig.prepare_weights(..., nvfp4_4over6=<the same value>)``
         or the call raises ``ValueError``. An unset field is not emitted by
         ``__repr__``, so the ``eval(repr(cfg))`` round-trip still holds.
@@ -333,6 +338,33 @@ class SiTU(ActivationConfig):
             _validate_finite("linear_scale", self.linear_scale, positive=True)
         if self.clamp_limit is not None:
             _validate_finite("clamp_limit", self.clamp_limit, positive=True)
+
+
+@dataclass(frozen=True)
+class PowLU(ActivationConfig):
+    """PowLU-GLU, the power-adaptive activation.
+
+    The gate branch is ``gate ** (m / (sqrt(gate) + 1)) * sigmoid(gate)`` where
+    ``gate > 0`` and ``silu(gate)`` elsewhere; the two halves meet at ``0`` and
+    at ``1``. ``limit`` then clamps the gate branch to ``(-inf, limit]`` and the
+    linear branch to ``[-limit, limit]``; ``None`` leaves both unclamped.
+
+    PowLU saturates on its own -- with the default ``m`` it peaks at ``4.02``
+    and decays toward ``1`` -- so a ``limit`` above that peak clamps only the
+    linear branch. Per-expert limits (a model may use one for the routed experts and
+    another for the fused shared expert) go through the backend-native weight
+    view, like the other gated activations.
+    """
+
+    type: ClassVar[ActivationType] = ActivationType.PowLU
+    m: float = DEFAULT_POWLU_M
+    limit: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _validate_finite("m", self.m, positive=True)
+        if self.limit is not None:
+            _validate_finite("limit", self.limit, positive=True)
 
 
 @dataclass(frozen=True)
@@ -795,17 +827,26 @@ def _shuffle_deepseek_prims_ts_weights(view: dict) -> dict:
     return shuffled
 
 
+CAKE_STEPFUN_FULL_PATH_ENV = "FLASHINFER_CAKE_STEPFUN_FULL_PATH"
+CAKE_STEPFUN_RESERVED_SMS_ENV = "FLASHINFER_TRTLLM_MOE_OVERLAP_RESERVED_SMS"
+CAKE_STEPFUN_DEFAULT_RESERVED_SMS = 8
+# The exported NVFP4 requantization unit bakes e4m3_max = 448 (no 4over6 recipe).
+CAKE_STEPFUN_GLOBAL_SCALE_INV = 1.0 / (448.0 * 6.0)
+
+
 @dataclass(frozen=True)
 class CakeStepFunConfig:
-    """Cake StepFun FC1 kernels inside the trtllm-gen fused-MoE pipeline.
+    """The StepFun fused MoE on exported Cake kernels (experimental backend
+    :mod:`flashinfer.experimental.cake_stepfun_moe`).
 
-    The backend runs the trtllm-gen routing, GEMM2 and finalize stages unchanged
-    and serves the GEMM1 stage with exported Cake kernels that evaluate the
-    StepFun activation ``clamp(up, -L, L) * min(silu(gate), L)`` with a per-expert
-    limit ``L``. It accepts four weight families, each with :class:`SwiGLUStep`
-    on exact SM100 and SM103 only: NVFP4×NVFP4 (E2m1 or bf16 output),
-    BF16×BF16, per-tensor FP8×FP8 and MXFP8×MXFP8. It is never part of the
-    default backend list; users opt in with ``CakeStepFunConfig(backend="cake_stepfun")``.
+    Every stage of the forward -- Renormalize routing, FC1 with the StepFun
+    activation ``clamp(up, -L, L) * min(silu(gate), L)`` and a per-expert limit
+    ``L``, the NVFP4 per-token requantization, FC2 and finalize -- is an exported
+    Cake kernel. It accepts four weight families, each with :class:`SwiGLUStep`
+    on exact SM100 and SM103 only: NVFP4×NVFP4 (E2m1 output, or bf16 output with
+    ``per_token_scale``), BF16×BF16, per-tensor FP8×FP8 and MXFP8×MXFP8. It is
+    never part of the default backend list; users opt in with
+    ``CakeStepFunConfig(backend="cake_stepfun")``.
 
     The physical weight and activation layouts are exactly those produced by
     the matching trtllm-gen config for the family (:class:`TrtllmFp4Config` for
@@ -813,14 +854,37 @@ class CakeStepFunConfig:
     for per-tensor FP8 and :class:`TrtllmFp8BlockConfig` for MXFP8); the view
     additionally carries the per-expert ``gemm1_clamp_limit`` the Cake kernels
     read.
+
+    ``full_path`` and ``reserved_sms`` are the backend knobs; ``None`` reads
+    ``FLASHINFER_CAKE_STEPFUN_FULL_PATH`` (``auto`` / ``1``; the FC1-only hybrid of
+    flashinfer-ai/flashinfer#6046 was removed by the cake-build/1 migration, so
+    ``0`` raises ``NotImplementedError``) and
+    ``FLASHINFER_TRTLLM_MOE_OVERLAP_RESERVED_SMS`` (default 8, the SMs the
+    cooperative router leaves free) once in ``check_support``. An explicit value
+    wins over the environment. The package itself reads no environment variable.
     """
 
     backend: Literal["cake_stepfun"] = "cake_stepfun"
+    full_path: Optional[bool] = None
+    reserved_sms: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.backend != "cake_stepfun":
             raise ValueError(
                 f"CakeStepFunConfig backend must be 'cake_stepfun', got {self.backend!r}."
+            )
+        if self.full_path is not None and not isinstance(self.full_path, bool):
+            raise TypeError(
+                f"CakeStepFunConfig.full_path must be a bool or None, got {self.full_path!r}."
+            )
+        if self.reserved_sms is not None and (
+            isinstance(self.reserved_sms, bool)
+            or not isinstance(self.reserved_sms, int)
+            or self.reserved_sms < 0
+        ):
+            raise ValueError(
+                "CakeStepFunConfig.reserved_sms must be a non-negative int or None, "
+                f"got {self.reserved_sms!r}."
             )
 
     @classmethod
@@ -969,7 +1033,107 @@ class CakeStepFunConfig:
         )
 
     def __repr__(self) -> str:
-        return "CakeStepFunConfig(backend='cake_stepfun')"
+        parts = ["backend='cake_stepfun'"]
+        if self.full_path is not None:
+            parts.append(f"full_path={self.full_path!r}")
+        if self.reserved_sms is not None:
+            parts.append(f"reserved_sms={self.reserved_sms!r}")
+        return f"CakeStepFunConfig({', '.join(parts)})"
+
+
+def _resolve_cake_stepfun_full_path(explicit: Optional[bool]) -> bool:
+    """``full_path`` of the Cake StepFun backend: the explicit value, else
+    ``FLASHINFER_CAKE_STEPFUN_FULL_PATH`` (unset / ``""`` / ``auto`` / ``1`` / ``true`` /
+    ``on`` -> ``True``; ``0`` / ``false`` / ``off`` -> ``False``; anything else raises
+    ``ValueError`` naming the variable)."""
+    if explicit is not None:
+        return bool(explicit)
+    raw = os.environ.get(CAKE_STEPFUN_FULL_PATH_ENV, "")
+    token = raw.strip().lower()
+    if token in ("", "auto", "1", "true", "on"):
+        return True
+    if token in ("0", "false", "off"):
+        return False
+    raise ValueError(
+        f"{CAKE_STEPFUN_FULL_PATH_ENV}={raw!r} is not one of auto, 1, true, on, 0, "
+        "false, off."
+    )
+
+
+def _resolve_cake_stepfun_reserved_sms(explicit: Optional[int]) -> int:
+    if explicit is not None:
+        return int(explicit)
+    raw = os.environ.get(CAKE_STEPFUN_RESERVED_SMS_ENV)
+    if raw is None or raw.strip() == "":
+        return CAKE_STEPFUN_DEFAULT_RESERVED_SMS
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        raise ValueError(
+            f"{CAKE_STEPFUN_RESERVED_SMS_ENV}={raw!r} is not an integer."
+        ) from None
+    if value < 0:
+        raise ValueError(f"{CAKE_STEPFUN_RESERVED_SMS_ENV}={raw!r} must be >= 0.")
+    return value
+
+
+def _cake_stepfun_backend_config(backend: Any) -> "CakeStepFunConfig":
+    """The :class:`CakeStepFunConfig` of a ``MoEConfig.backend`` value.
+
+    Accepts the config itself or a :class:`BackendOptions` whose only candidate is
+    a :class:`CakeStepFunConfig`, the binding :class:`MoELayer` gives every runner
+    (``replace(config, backend=BackendOptions(candidates=(backend_cfg,)))``).
+    Raises ``TypeError`` naming the value otherwise (several candidates, or none of
+    that type): the knobs of a multi-candidate option list are not resolvable here.
+    """
+    if isinstance(backend, CakeStepFunConfig):
+        return backend
+    if isinstance(backend, BackendOptions) and len(backend) == 1:
+        (candidate,) = tuple(backend)
+        if isinstance(candidate, CakeStepFunConfig):
+            return candidate
+    raise TypeError(
+        "_resolve_cake_stepfun_knobs expects a CakeStepFunConfig backend or a "
+        f"BackendOptions whose only candidate is one, got {backend!r}."
+    )
+
+
+def _resolve_cake_stepfun_knobs(config: "MoEConfig") -> Dict[str, Any]:
+    """Resolve the Cake StepFun backend knobs of ``config`` once (``check_support``).
+
+    ``config.backend`` is the :class:`CakeStepFunConfig` or the single-candidate
+    :class:`BackendOptions` holding it (:func:`_cake_stepfun_backend_config`).
+    Returns ``{"full_path": True, "reserved_sms": int, "global_scale_inv": float}``.
+    ``full_path`` resolves through :func:`_resolve_cake_stepfun_full_path`; ``False``
+    raises ``NotImplementedError``: the FC1-only hybrid of flashinfer-ai/flashinfer#6046
+    was removed by the cake-build/1 migration, not migrated (the variable stays and
+    ``0`` raises). ``reserved_sms`` sizes the cooperative routing grid. The NVFP4 4over6
+    recipe of ``config.quant`` (explicit or from ``FLASHINFER_NVFP4_4OVER6*``)
+    must resolve to ``None``: only the ``e4m3_max = 448`` requantization unit is
+    exported, so ``global_scale_inv`` is always ``1 / (448 * 6)``.
+    """
+    backend = _cake_stepfun_backend_config(config.backend)
+    full_path = _resolve_cake_stepfun_full_path(backend.full_path)
+    if not full_path:  # the variable stays; 0 names the removed hybrid and raises
+        raise NotImplementedError(
+            "The Cake StepFun FC1-only hybrid (FLASHINFER_CAKE_STEPFUN_FULL_PATH=0 / "
+            "CakeStepFunConfig(full_path=False)) of flashinfer-ai/flashinfer#6046 was "
+            "removed by the cake-build/1 migration, not migrated; every stage runs on "
+            "the exported Cake kernels (full_path=True)."
+        )
+    reserved_sms = _resolve_cake_stepfun_reserved_sms(backend.reserved_sms)
+    if config.quant.activation is QuantFormat.NVFP4:
+        recipe = resolve_nvfp4_4over6(config.quant.nvfp4_4over6)
+        if recipe is not None:
+            raise NotImplementedError(
+                "The Cake StepFun backend exports only the e4m3_max = 448 NVFP4 "
+                f"requantization unit; the 4over6 recipe {recipe!r} is unavailable."
+            )
+    return {
+        "full_path": True,
+        "reserved_sms": reserved_sms,
+        "global_scale_inv": CAKE_STEPFUN_GLOBAL_SCALE_INV,
+    }
 
 
 @dataclass(frozen=True)
@@ -2406,7 +2570,7 @@ class CutlassHummingConfig:
 
 @dataclass(frozen=True)
 class CuteDslConfig:
-    """CuteDSL FP4 backend for W4A4, W4A8, and W4A16.
+    """CuteDSL block-scaled backend for W4A4, W4A8, MXFP8, and W4A16.
 
     The underlying CuteDSL kernel throws at launch on SM120/SM121/SM130.
     """
@@ -2432,8 +2596,8 @@ class CuteDslConfig:
         """Build the ``cute_dsl`` weight view from canonical BF16 weights.
 
         Register the result with ``MoEWeightPack.prepare_for("cute_dsl", ...)``.
-        ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, or NVFP4×BF16 (CuTe-DSL W4A16).
-        Defaults to NVFP4×NVFP4.
+        ``quant`` selects NVFP4×NVFP4, MXFP4×MXFP8, MXFP8×MXFP8, or NVFP4×BF16
+        (CuTe-DSL W4A16). Defaults to NVFP4×NVFP4.
 
         ``nvfp4_4over6`` must equal the layer's ``QuantConfig.nvfp4_4over6``
         (see that field): it selects the NVFP4×NVFP4 pack's
@@ -2453,6 +2617,24 @@ class CuteDslConfig:
             device=device,
             nvfp4_4over6=nvfp4_4over6,
         )
+
+    @staticmethod
+    def prepare_activations(hidden_states_bf16, *, quant: Optional[QuantConfig] = None):
+        """Quantize BF16 activations to MXFP8 for MXFP8×MXFP8.
+
+        Returns the canonical linear pack shared with
+        ``TrtllmFp8BlockConfig.prepare_activations``: E4M3 ``[M, H]`` and
+        row-major E8M0 scales ``[M, H // 32]``.
+        """
+        from .prepare import prepare_trtllm_fp8_block_activations
+
+        pair = (QuantFormat.MXFP8, QuantFormat.MXFP8)
+        quant = _mxfp8_activation_quant(quant, pair, "CuteDslConfig")
+        if quant.swizzled_scale_factors is True:
+            raise ValueError(
+                "CuteDslConfig consumes only the linear activation scale layout."
+            )
+        return prepare_trtllm_fp8_block_activations(hidden_states_bf16, quant=quant)
 
     def __repr__(self) -> str:
         return "CuteDslConfig()"
@@ -2780,8 +2962,304 @@ class CudnnFrostMxfp8Mxfp4Config:
     prepare_activations = staticmethod(CutlassMxfp8Mxfp4Config.prepare_activations)
 
 
+@dataclass(frozen=True)
+class FrostLowLatencyConfig:
+    """Low-token routed MoE on SM80/SM90/SM100/SM103/SM107/SM120.
+
+    SM80 supports BF16/FP16 inputs and weights.
+
+    SM90 supports BF16, FP16, ordinary per-tensor FP8, DeepSeek FP8 and
+    NVFP4/MXFP4/MXINT4-weight with BF16/FP16-activation FMA.
+    Explicit opt-in; omitted from the default backend list. Autotuning selects
+    Tensor Core tile sizes or a scalar FMA tactic (top-k <= 32) using the same
+    prepared weights and numerical contract. Both are multi-kernel pipelines,
+    with precomputed routing and no EP communication. The MX Tensor Core path
+    overlaps its fused GU/activation/quantizer and Down GEMM through PDL.
+    Set ``max_num_tokens`` up to 8 for tuning; the default admits at most 2.
+    Prepare other backend views as well to permit fallback for larger inputs.
+
+    MXFP4/MXFP8 weights with MXFP8 inputs support the same ten typed
+    activations as BF16, through TC or FMA. Non-gated weights omit gate rows.
+    BF16 or FP16 weights/inputs use FMA with gated or non-gated activations and
+    top-k at most 32. The activation is rounded to the input dtype and expert
+    outputs to the configured BF16/FP16 output dtype. Combine uses ordered,
+    separate FP32 multiplication and addition. Packed routing scores retain
+    BF16 rounding regardless of the input/output dtype. This is distinct from
+    the MX intermediate quantization/combine contract. SM80, SM90 and SM120 also
+    offer grouped BF16/FP16 Tensor Core candidates at H=2048/I=512/top-k=10,
+    T=4 or 8, with finalized matching output dtype. SM80 admits default SwiGLU
+    and ReLU2; SM90/SM120 add GeGLU, and ReLU2/SiLU use T8 on SM90 and T4/T8
+    on SM120. SM120 also admits GeGLUTanh and default SiTU/SwiGLUStep
+    at T4/T8 with matching BF16/FP16 types. SM80 additionally admits BF16 default SwiGLU at
+    H=7168/I=2048/top-k=8 and T=4 or 8. These projections share the typed
+    intermediate and ordered combine contract;
+    FMA remains the untuned default and a tuning candidate.
+
+    Ordinary per-tensor E4M3 FP8 uses static calibration multipliers, with
+    BF16 FC1 preactivation rounding as in the CUTLASS per-tensor backbone.
+    Activation and intermediate quantization remain fused into FC1; FC2
+    produces BF16 expert/final outputs with ordered FP32 multiply/add combine.
+    On SM90, finalized default SwiGLU/SiTU at H=2048/I=512/top-k=10, T=4 or 8,
+    and ReLU2 at T=8 also offer grouped E4M3 WGMMA with bounded-K64 FP32 partial
+    promotion. SM120 adds grouped E4M3 warp MMA for the same shape, with
+    default SwiGLU/SiTU/ReLU2 at T4/T8. Static scales stay live, and FMA
+    remains the untuned default and tuning candidate.
+    The TRT-LLM per-tensor path retains FP32 preactivations, so its rounding
+    contract differs even with identical quantized weights and scales.
+
+    E4M3 weight-only mode uses BF16/FP16 inputs and intermediates, with
+    per-expert FP32 weight scales. FC1 preactivation rounds to the input dtype;
+    expert outputs round to the independently configured BF16/FP16 dtype.
+    No activation quantization is required.
+
+    DeepSeek FP8 preserves FP32 preactivation and 128x128 weight block scales.
+    BF16 input is quantized per 128 values; prequantized E4M3 input retains
+    its supplied FP32 scales. The intermediate is dynamically quantized to
+    E4M3 before FC2; expert outputs and ordered combine follow BF16 rounding.
+
+    FP4 weight-only modes preserve canonical E2M1 payloads with BF16/FP16
+    input, preactivation and intermediate rounding. Expert outputs use the
+    configured BF16/FP16 output dtype. NVFP4 uses linear E4M3 K16 scales;
+    MXFP4 uses E8M0 K32 scales and FP32 dequantization to retain its wider
+    range. It uses software decoding on SM90 and native FP4 conversion on Blackwell/Rubin, sharing
+    the BF16 FMA schedule and typed activation/combine implementation.
+    H must be divisible by 128; logical I is padded to 128 from multiples of 32.
+
+    MXINT4 weight-only mode preserves signed INT4 payloads and BF16 K32
+    scales. It retains FP32 preactivation, then BF16/FP16 intermediate/expert
+    rounding and ordered FP32 combine through the same two FMA kernels.
+
+    NVFP4 weights/inputs use shared FMA with H divisible by 512, I by 128,
+    and top-k at most 32. It retains BF16 activation/expert rounding and
+    separate FP32 multiply/add combine; the 4over6 recipe is not supported.
+    """
+
+    max_num_tokens: int = 2
+
+    def __post_init__(self):
+        if not 1 <= self.max_num_tokens <= 8:
+            raise ValueError("max_num_tokens must be between 1 and 8")
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (80, 90, 100, 103, 107, 120)
+
+    @staticmethod
+    def prepare_weights(w1, w1_scale, w2, w2_scale, *, activation=None):
+        """Pack canonical MX weights; pass activation for non-gated weights."""
+        from .backends.frost_low_latency.prepare import prepare_weights
+
+        return prepare_weights(
+            w1,
+            w1_scale,
+            w2,
+            w2_scale,
+            activation=SwiGLU() if activation is None else activation,
+        )
+
+    @staticmethod
+    def prepare_bf16_weights(w1, w2, *, activation=None):
+        """Prepare BF16 [up, gate] or non-gated weights, padding I to 128."""
+        from .backends.frost_low_latency.prepare import prepare_bf16_weights
+
+        return prepare_bf16_weights(
+            w1, w2, SwiGLU() if activation is None else activation
+        )
+
+    @staticmethod
+    def prepare_fp16_weights(w1, w2, *, activation=None):
+        """Prepare FP16 [up, gate] or non-gated weights, padding I to 128."""
+        from .backends.frost_low_latency.prepare import prepare_fp16_weights
+
+        return prepare_fp16_weights(
+            w1, w2, SwiGLU() if activation is None else activation
+        )
+
+    @staticmethod
+    def prepare_fp8_per_tensor_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        hidden_states_scale_global,
+        intermediate_scale_global,
+        num_local_experts,
+        hidden_size,
+        intermediate_size,
+        activation=None,
+        device=None,
+    ):
+        """Prepare E4M3 weights with static input/intermediate calibration scales."""
+        from .backends.frost_low_latency.prepare import prepare_fp8_per_tensor_weights
+
+        return prepare_fp8_per_tensor_weights(
+            w1_bf16,
+            w2_bf16,
+            hidden_states_scale_global=hidden_states_scale_global,
+            intermediate_scale_global=intermediate_scale_global,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+        )
+
+    @staticmethod
+    def prepare_fp8_weight_only_weights(w1, w1_scale, w2, w2_scale, *, activation=None):
+        """Prepare E4M3 weights for BF16/FP16 inputs without requantizing the payload.
+
+        Canonical weights are [E, 2*I, H] in [up, gate] order, or [E, I, H]
+        for non-gated activation, and [E, H, I]. Each FP32 scale is [E] and
+        dequantizes that expert's weight matrix. Logical I is padded to 128.
+        Configure FP8PerTensor weights with BF16/FP16 activations and BF16/FP16 output.
+        Preactivation and intermediate round to the activation dtype; expert
+        values round to the output dtype before ordered FP32 combine.
+        """
+        from .backends.frost_low_latency.prepare import prepare_fp8_weight_only_weights
+
+        return prepare_fp8_weight_only_weights(
+            w1, w1_scale, w2, w2_scale, SwiGLU() if activation is None else activation
+        )
+
+    @staticmethod
+    def prepare_mxint4_weight_only_weights(
+        w1, w1_block_scale, w2, w2_block_scale, *, activation=None
+    ):
+        """Preserve signed INT4 payloads and linear BF16 scales per 32 K values.
+
+        Weights are uint8 [E,branches*I,H/2] in [up,gate] order and [E,H,I/2].
+        Each byte stores the even K value in its low nibble, signed [-8,7].
+        H is divisible by 128; logical I is divisible by 32 and padded to 128.
+        Configure MXINT4 weights with BF16/FP16 inputs/output. FC1 preactivation
+        remains FP32; intermediate/expert values use the input/output dtype. Preparation
+        never requantizes the weights or reads values back to the host.
+        """
+        import torch
+        from .backends.frost_low_latency.fp4_weight_only import prepare_weights
+
+        one = torch.ones(w1.shape[0], device=w1.device, dtype=torch.float32)
+        return prepare_weights(
+            w1,
+            w1_block_scale,
+            one,
+            w2,
+            w2_block_scale,
+            one.clone(),
+            SwiGLU() if activation is None else activation,
+            scale_block_size=32,
+            integer_weights=True,
+        )
+
+    @staticmethod
+    def prepare_mxfp4_weight_only_weights(
+        w1, w1_block_scale, w2, w2_block_scale, *, activation=None
+    ):
+        """Preserve CUDA E2M1 weights and linear E8M0 scales per 32 K values.
+
+        Canonical gated FC1 rows use [up,gate] order. H is divisible by128;
+        logical I is divisible by32 and padded to128. Configure MXFP4 weights
+        with BF16/FP16 activations and BF16/FP16 output. No activation
+        quantization is performed.
+        """
+        import torch
+        from .backends.frost_low_latency.fp4_weight_only import prepare_weights
+
+        one = torch.ones(w1.shape[0], device=w1.device, dtype=torch.float32)
+        return prepare_weights(
+            w1,
+            w1_block_scale,
+            one,
+            w2,
+            w2_block_scale,
+            one.clone(),
+            SwiGLU() if activation is None else activation,
+            scale_block_size=32,
+        )
+
+    @staticmethod
+    def prepare_nvfp4_weight_only_weights(
+        w1,
+        w1_block_scale,
+        w1_global_scale,
+        w2,
+        w2_block_scale,
+        w2_global_scale,
+        *,
+        activation=None,
+    ):
+        """Preserve canonical E2M1 weights and linear E4M3 K16 block scales.
+
+        Weights are uint8 [E,branches*I,H/2] in [up,gate] order and [E,H,I/2].
+        E4M3 block scales use the same row dimensions with K/16 columns.
+        FP32 global scales dequantize each expert; FC1 accepts [E] or
+        [E,branches] and FC2 accepts [E]. H is divisible by 128; logical I
+        is divisible by 32 and padded to 128. Configure NVFP4 weights with
+        BF16/FP16 inputs and BF16/FP16 output; no activation quantization
+        is performed.
+        All tensors must reside on the same CUDA device. Payloads and scales
+        from a 4over6 checkpoint are preserved without requantization.
+        """
+        from .backends.frost_low_latency.fp4_weight_only import prepare_weights
+
+        return prepare_weights(
+            w1,
+            w1_block_scale,
+            w1_global_scale,
+            w2,
+            w2_block_scale,
+            w2_global_scale,
+            SwiGLU() if activation is None else activation,
+        )
+
+    @staticmethod
+    def prepare_deepseek_fp8_weights(w1, w1_scale, w2, w2_scale, *, activation=None):
+        """Preserve E4M3 weights and FP32 128x128 block scales without requantizing.
+
+        Canonical FC1 uses [up, gate] order for gated activation. H and I must
+        be divisible by 128. BF16 entry quantization and the E4M3 intermediate
+        use max(amax, 1e-4)/448 per 128 values; FC1 preactivation stays FP32.
+        Prepared E4M3 inputs instead retain their supplied FP32 [H/128,T] scales.
+        """
+        from .backends.frost_low_latency.prepare import prepare_deepseek_fp8_weights
+
+        return prepare_deepseek_fp8_weights(
+            w1, w1_scale, w2, w2_scale, SwiGLU() if activation is None else activation
+        )
+
+    prepare_fp8_per_tensor_activations = staticmethod(
+        TrtllmFp8PerTensorConfig.prepare_activations
+    )
+
+    @staticmethod
+    def prepare_nvfp4_weights(w1, w2, *, activation=None):
+        """Quantize BF16 source weights to the canonical CUTLASS NVFP4 view.
+
+        Requires H divisible by 512 and I by 128. Global scales are one;
+        activation inputs use the same linear scale pack as TRT-LLM.
+        """
+        from .backends.frost_low_latency.fma.activation_config import lower_activation
+
+        activation = SwiGLU() if activation is None else activation
+        lower_activation(activation)
+        if w2.ndim != 3:
+            raise ValueError("NVFP4 weights must be 3-D")
+        e, h, i = w2.shape
+        if e < 1 or h < 512 or h % 512 or i < 128 or i % 128:
+            raise ValueError(
+                "Frost NVFP4 requires positive E, H divisible by 512 and I by 128"
+            )
+        return CutlassNvfp4Config.prepare_weights(
+            w1,
+            w2,
+            num_local_experts=e,
+            hidden_size=h,
+            intermediate_size=i,
+            activation=activation,
+        )
+
+
 # Union type for backend config
 BackendConfigType = Union[
+    FrostLowLatencyConfig,
     CudnnFrostBf16Config,
     CudnnFrostMxfp8Config,
     CudnnFrostNvfp4Config,
@@ -2826,6 +3304,7 @@ BackendConfigType = Union[
 ]
 
 ALL_BACKEND_CONFIGS = (
+    FrostLowLatencyConfig,
     CudnnFrostBf16Config,
     CudnnFrostMxfp8Config,
     CudnnFrostNvfp4Config,

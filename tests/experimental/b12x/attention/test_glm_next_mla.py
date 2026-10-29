@@ -19,7 +19,7 @@ from b12x.attention._shared.mla.kv_cache import (
     _glm_next_cache_byte_offset,
     _glm_next_cache_record_address,
     clear_glm_next_mla_kv_cache_kernel_cache,
-    concat_and_cache_glm_next_mla,
+    _concat_and_cache_glm_next_nvfp4_mla_op,
 )
 from b12x.attention._shared.mla.traits import (
     ComputeMode,
@@ -30,6 +30,9 @@ from b12x.attention._shared.mla.traits import (
     resolve_unplanned_traits,
 )
 from b12x.testing.reference.helpers import dequantize_nvfp4_mla_nope
+from b12x.preparation import PreparationSession, PreparedCall
+from b12x.attention.sparse_mla._scratch import plan_sparse_mla_scratch
+
 
 from ..conftest import require_b12x as require_sm120
 
@@ -52,6 +55,25 @@ _ALLOCATOR_COUNTERS = (
 def _allocator_counters(device: torch.device) -> dict[str, int]:
     stats = torch.cuda.memory_stats(device)
     return {name: int(stats.get(name, 0)) for name in _ALLOCATOR_COUNTERS}
+
+
+def _prepare_glm_next_writer(latent, cache, slots):
+    """Compile the exact writer ABI without executing a trial cache mutation."""
+    writer_plan = sparse_mla.plan_cache_writer(latent, cache, slots)
+    session = PreparationSession(
+        device=latent.device, autotune=False, compile_workers=2
+    )
+    result = session.prepare(
+        (
+            writer_plan.request(
+                name="glm-next-cache-writer",
+                prepare_call=lambda state: PreparedCall(
+                    run=lambda: None, owners=(latent, cache, slots)
+                ),
+            ),
+        )
+    )
+    return session, result, writer_plan
 
 
 def _glm_next_plan_and_binding(
@@ -93,16 +115,42 @@ def _glm_next_plan_and_binding(
             lse_scale=lse_scale,
         )
     )
-    spec = plan.scratch_specs()[0]
+    owners = {}
+
+    def prepare_call(state):
+        spec = state.scratch_specs()[0]
+        scratch = torch.empty(spec.shape, dtype=spec.dtype, device=q.device)
+        runtime = state.bind_for_preparation(
+            scratch=scratch,
+            q=q,
+            selected_indices=selected,
+            kv_cache=kv_cache,
+            cache_seqlens_int32=cache_seqlens,
+            nsa_cache_seqlens_int32=active,
+        )
+        owners["scratch"] = scratch
+        return PreparedCall(
+            run=lambda: state.run(runtime, kv_cache=kv_cache),
+            owners=(scratch, runtime, kv_cache),
+        )
+
+    session = PreparationSession(device=q.device, autotune=False, compile_workers=2)
+    result = session.prepare(
+        (plan.request(name="glm-next-attention", prepare_call=prepare_call),)
+    )
     binding = sparse_mla.bind(
         plan,
-        scratch=torch.empty(spec.shape, dtype=spec.dtype, device=device),
+        scratch=owners["scratch"],
         q=q,
         selected_indices=selected,
         kv_cache=kv_cache,
         cache_lengths=cache_seqlens,
         selected_lengths=active,
     )
+    binding.runtime.scratch.output_buffer.fill_(float("nan"))
+    if return_lse:
+        binding.runtime.scratch.final_lse.fill_(float("nan"))
+    binding.runtime.scratch._test_preparation_owners = (session, result)
     return plan, binding
 
 
@@ -588,23 +636,28 @@ def test_glm_next_nvfp4_cache_abi_is_fixed_by_plan_and_binding() -> None:
 def test_binding_owned_cache_omits_runtime_recipe_selection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    plan = sparse_mla.plan(
-        sparse_mla.Caps(
-            device="cpu",
-            num_q_heads=1,
-            max_q_rows=1,
-            max_width=1,
-            softmax_scale=_GLM_NEXT_SM_SCALE,
-            kv_dtype=torch.uint8,
-            head_dim=_GLM_NEXT_HEAD_DIM,
-            v_head_dim=_GLM_NEXT_HEAD_DIM,
-            page_size=1,
-            model_type=ModelType.GLM_NEXT,
-            scale_format=ScaleFormat.NVFP4_E4M3,
-            latent_scale_per_token=True,
-        )
+    caps = sparse_mla.Caps(
+        device="cpu",
+        num_q_heads=1,
+        max_q_rows=1,
+        max_width=1,
+        softmax_scale=_GLM_NEXT_SM_SCALE,
+        kv_dtype=torch.uint8,
+        head_dim=_GLM_NEXT_HEAD_DIM,
+        v_head_dim=_GLM_NEXT_HEAD_DIM,
+        page_size=1,
+        model_type=ModelType.GLM_NEXT,
+        scale_format=ScaleFormat.NVFP4_E4M3,
+        latent_scale_per_token=True,
     )
-    spec = plan.scratch_specs()[0]
+    plan = sparse_mla.plan(caps)
+    from b12x.attention.sparse_mla._preparation import _SparseMlaState
+    from b12x.attention._shared.mla import kernel
+
+    layout = plan_sparse_mla_scratch(caps)
+    state = _SparseMlaState(layout.caps, layout, plan.query, 0, prepared=object())
+    monkeypatch.setattr(sparse_mla_api, "_state", lambda *_args, **_kwargs: state)
+    spec = state.scratch_specs()[0]
     cache = torch.empty((1, 1, _GLM_NEXT_NVFP4_RECORD_BYTES), dtype=torch.uint8)
     binding = sparse_mla.bind(
         plan,
@@ -621,13 +674,16 @@ def test_binding_owned_cache_omits_runtime_recipe_selection(
         calls.update(kwargs)
         return torch.empty((1, 1, _GLM_NEXT_HEAD_DIM), dtype=torch.bfloat16)
 
-    monkeypatch.setattr(sparse_mla_api, "_run_decode", fake_run_decode)
+    monkeypatch.setattr(kernel, "run_prepared_unified_decode", fake_run_decode)
 
     sparse_mla.run(binding)
 
     assert binding.runtime.kv_cache is cache
-    assert binding.runtime.cache_traits == plan.caps.cache_traits
-    assert calls["binding"] is binding.runtime
+    assert binding.runtime.cache_traits == state.caps.cache_traits
+    assert calls["workspace"] is binding.runtime.scratch
+    assert calls["q_all"] is binding.runtime.q
+    assert calls["swa_k_cache"] is cache
+    assert calls["prepared"] is state.prepared
     assert "kv_cache" not in calls
     assert "model_type" not in calls
     assert "scale_format" not in calls
@@ -867,7 +923,9 @@ def test_glm_next_cache_writer_preserves_padded_tail_and_record_abi(
         device=device,
     )
 
-    sparse_mla.concat_and_cache_glm_next_mla(kv_c, cache, slots)
+    writer_owners = _prepare_glm_next_writer(kv_c, cache, slots)
+    writer_plan = writer_owners[2]
+    sparse_mla.concat_and_cache_glm_next_mla(kv_c, cache, slots, plan=writer_plan)
     torch.cuda.synchronize(device)
 
     assert torch.all(backing[:, semantic_page_bytes:] == sentinel)
@@ -972,14 +1030,17 @@ def test_glm_next_nvfp4_writer_rejects_capture_compile_miss(
     )
     latent = torch.zeros((1, 512), dtype=torch.bfloat16, device=device)
     slots = torch.zeros((1,), dtype=torch.int64, device=device)
+    writer_plan = sparse_mla.plan_cache_writer(latent, cache, slots)
     clear_glm_next_mla_kv_cache_kernel_cache()
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
 
     with pytest.raises(RuntimeError, match="compile miss during CUDA graph capture"):
-        sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+        _concat_and_cache_glm_next_nvfp4_mla_op(latent, cache, slots)
+    with pytest.raises(RuntimeError, match="not prepared.*CUDA graph capture"):
+        sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots, plan=writer_plan)
 
 
-def test_glm_next_public_cpu_reference_path_preserves_model_identity() -> None:
+def test_glm_next_cpu_reference_path_preserves_model_identity() -> None:
     torch.manual_seed(20260826)
     rows, heads, cache_tokens, width = 2, 8, 16, 8
     latent = torch.randn((cache_tokens, 512), dtype=torch.bfloat16) / 4
@@ -991,7 +1052,7 @@ def test_glm_next_public_cpu_reference_path_preserves_model_identity() -> None:
     cache_seqlens = torch.full((rows,), cache_tokens, dtype=torch.int32)
     active = torch.full((rows,), width, dtype=torch.int32)
 
-    plan = sparse_mla.plan(
+    plan = plan_sparse_mla_scratch(
         sparse_mla.Caps(
             device="cpu",
             num_q_heads=heads,
@@ -1008,21 +1069,22 @@ def test_glm_next_public_cpu_reference_path_preserves_model_identity() -> None:
     spec = plan.scratch_specs()[0]
     scratch = torch.full(spec.shape, 0xA5, dtype=spec.dtype)
     before = scratch.clone()
-    binding = sparse_mla.bind(
-        plan,
+    binding = plan.bind(
         scratch=scratch,
         q=q,
         kv_cache=cache,
         selected_indices=selected,
-        cache_lengths=cache_seqlens,
-        selected_lengths=active,
+        cache_seqlens_int32=cache_seqlens,
+        nsa_cache_seqlens_int32=active,
     )
     torch.testing.assert_close(scratch, before)
     assert tuple(inspect.signature(sparse_mla.run).parameters) == ("binding",)
     assert "run_decode" not in sparse_mla.__all__
     assert "run_extend" not in sparse_mla.__all__
 
-    actual = sparse_mla.run(binding)
+    actual = mla_api.sparse_mla_decode_forward(
+        binding=binding, sm_scale=_GLM_NEXT_SM_SCALE
+    )
     expected = sparse_mla_reference(
         q_all=q,
         kv_cache=cache,
@@ -1034,12 +1096,12 @@ def test_glm_next_public_cpu_reference_path_preserves_model_identity() -> None:
     torch.testing.assert_close(actual, expected)
 
     assert sparse_mla.ModelType.GLM_NEXT == ModelType.GLM_NEXT
-    assert callable(sparse_mla.compile_glm_next_mla_cache_writer)
+    assert callable(sparse_mla.plan_cache_writer)
     assert callable(sparse_mla.concat_and_cache_glm_next_mla)
     assert callable(sparse_mla.concat_and_cache_glm_next_mla_fp8)
     assert callable(sparse_mla.concat_and_cache_glm_next_mla_nvfp4)
     with pytest.raises(TypeError, match="binding must be sparse_mla.Binding"):
-        sparse_mla.run(binding.runtime)
+        sparse_mla.run(binding)
 
 
 @pytest.mark.parametrize("container_width", [2051, 2112])
@@ -1110,7 +1172,9 @@ def test_glm_next_production_decode_matches_packed_record_oracle() -> None:
         device=device,
     )
     slots = torch.arange(num_records, dtype=torch.int64, device=device)
-    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+    writer_owners = _prepare_glm_next_writer(latent, cache, slots)
+    writer_plan = writer_owners[2]
+    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots, plan=writer_plan)
 
     q = (
         torch.randn(
@@ -1178,7 +1242,9 @@ def test_glm_next_nvfp4_decode_matches_dequantized_record_oracle() -> None:
         device=device,
     )
     slots = torch.arange(num_records, dtype=torch.int64, device=device)
-    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+    writer_owners = _prepare_glm_next_writer(latent, cache, slots)
+    writer_plan = writer_owners[2]
+    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots, plan=writer_plan)
 
     q = (
         torch.randn(
@@ -1227,7 +1293,7 @@ def test_glm_next_nvfp4_decode_matches_dequantized_record_oracle() -> None:
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+        sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots, plan=writer_plan)
         captured_output, captured_lse = sparse_mla.run(binding)
     assert captured_output.data_ptr() == actual.data_ptr()
     assert captured_lse.data_ptr() == actual_lse.data_ptr()
@@ -1242,7 +1308,7 @@ def test_glm_next_nvfp4_decode_matches_dequantized_record_oracle() -> None:
             torch.bfloat16
         )
     )
-    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots, plan=writer_plan)
     dequantized, _ = dequantize_nvfp4_mla_nope(
         cache.view(num_records, _GLM_NEXT_NVFP4_RECORD_BYTES),
         latent_scale_offset=292,
@@ -1294,7 +1360,9 @@ def test_glm_next_hybrid_manager_page_replays_across_page_boundary() -> None:
         )
         / 4
     ).to(torch.bfloat16)
-    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+    writer_owners = _prepare_glm_next_writer(latent, cache, slots)
+    writer_plan = writer_owners[2]
+    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots, plan=writer_plan)
 
     q = (
         torch.randn(
@@ -1343,7 +1411,7 @@ def test_glm_next_hybrid_manager_page_replays_across_page_boundary() -> None:
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+        sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots, plan=writer_plan)
         captured_output, captured_lse = sparse_mla.run(binding)
     assert captured_output.data_ptr() == actual.data_ptr()
     assert captured_lse.data_ptr() == actual_lse.data_ptr()
@@ -1364,7 +1432,7 @@ def test_glm_next_hybrid_manager_page_replays_across_page_boundary() -> None:
                 / 4
             ).to(torch.bfloat16)
         )
-        sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+        sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots, plan=writer_plan)
         flat_cache.copy_(
             cache.contiguous().view(num_pages * page_size, 1, _GLM_NEXT_RECORD_BYTES)
         )
@@ -1415,7 +1483,9 @@ def test_glm_next_production_prefill_2051_replays_without_allocation() -> None:
         device=device,
     )
     slots = torch.arange(num_records, dtype=torch.int64, device=device)
-    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+    writer_owners = _prepare_glm_next_writer(latent, cache, slots)
+    writer_plan = writer_owners[2]
+    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots, plan=writer_plan)
 
     q = (
         torch.randn(
@@ -1462,7 +1532,7 @@ def test_glm_next_production_prefill_2051_replays_without_allocation() -> None:
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+        sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots, plan=writer_plan)
         captured_output, captured_lse = sparse_mla.run(binding)
     assert captured_output.data_ptr() == actual.data_ptr()
     assert captured_lse.data_ptr() == actual_lse.data_ptr()
@@ -1521,7 +1591,9 @@ def test_glm_next_nvfp4_prefill_2051_matches_dequantized_record_oracle() -> None
         device=device,
     )
     slots = torch.arange(num_records, dtype=torch.int64, device=device)
-    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+    writer_owners = _prepare_glm_next_writer(latent, cache, slots)
+    writer_plan = writer_owners[2]
+    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots, plan=writer_plan)
 
     q = (
         torch.randn(
@@ -1569,7 +1641,7 @@ def test_glm_next_nvfp4_prefill_2051_matches_dequantized_record_oracle() -> None
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+        sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots, plan=writer_plan)
         captured_output, captured_lse = sparse_mla.run(binding)
     assert captured_output.data_ptr() == actual.data_ptr()
     assert captured_lse.data_ptr() == actual_lse.data_ptr()
@@ -1584,7 +1656,7 @@ def test_glm_next_nvfp4_prefill_2051_matches_dequantized_record_oracle() -> None
             torch.bfloat16
         )
     )
-    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots, plan=writer_plan)
     replay_dequantized, _ = dequantize_nvfp4_mla_nope(
         cache.view(num_records, _GLM_NEXT_NVFP4_RECORD_BYTES),
         latent_scale_offset=292,
@@ -1636,7 +1708,9 @@ def test_glm_next_tp4_hybrid_page_prefill_matches_oracle_and_replays() -> None:
         / 4
     ).to(torch.bfloat16)
     slots = 2 * page_size + torch.arange(rows, dtype=torch.int64, device=device)
-    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+    writer_owners = _prepare_glm_next_writer(latent, cache, slots)
+    writer_plan = writer_owners[2]
+    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots, plan=writer_plan)
 
     q = (
         torch.randn(
@@ -1691,7 +1765,7 @@ def test_glm_next_tp4_hybrid_page_prefill_matches_oracle_and_replays() -> None:
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+        sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots, plan=writer_plan)
         captured_output, captured_lse = sparse_mla.run(binding)
     assert captured_output.data_ptr() == actual.data_ptr()
     assert captured_lse.data_ptr() == actual_lse.data_ptr()
@@ -1706,7 +1780,7 @@ def test_glm_next_tp4_hybrid_page_prefill_matches_oracle_and_replays() -> None:
             torch.bfloat16
         )
     )
-    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots)
+    sparse_mla.concat_and_cache_glm_next_mla(latent, cache, slots, plan=writer_plan)
     flat_cache.copy_(
         cache.contiguous().view(num_pages * page_size, 1, _GLM_NEXT_RECORD_BYTES)
     )
@@ -1779,7 +1853,9 @@ def test_glm_next_writer_and_reader_use_int64_for_live_high_page() -> None:
     )
     sources = torch.cat((torch.zeros_like(live_latent), live_latent))
     slots = torch.tensor([0, high_slot], dtype=torch.int64, device=device)
-    sparse_mla.concat_and_cache_glm_next_mla(sources, cache, slots)
+    writer_owners = _prepare_glm_next_writer(sources, cache, slots)
+    writer_plan = writer_owners[2]
+    sparse_mla.concat_and_cache_glm_next_mla(sources, cache, slots, plan=writer_plan)
 
     q = torch.randn((1, 8, _GLM_NEXT_HEAD_DIM), dtype=torch.bfloat16, device=device)
     selected = torch.tensor([[high_slot]], dtype=torch.int32, device=device)
@@ -1865,7 +1941,9 @@ def test_glm_next_nvfp4_writer_and_reader_use_int64_for_live_high_page() -> None
     )
     sources = torch.cat((torch.zeros_like(live_latent), live_latent))
     slots = torch.tensor([0, high_slot], dtype=torch.int64, device=device)
-    sparse_mla.concat_and_cache_glm_next_mla(sources, cache, slots)
+    writer_owners = _prepare_glm_next_writer(sources, cache, slots)
+    writer_plan = writer_owners[2]
+    sparse_mla.concat_and_cache_glm_next_mla(sources, cache, slots, plan=writer_plan)
 
     q = torch.randn((1, 8, _GLM_NEXT_HEAD_DIM), dtype=torch.bfloat16, device=device)
     selected = torch.tensor([[high_slot]], dtype=torch.int32, device=device)
