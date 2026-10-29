@@ -583,10 +583,12 @@ _CUTLASS_FP8_ARCHS = _CUTLASS_BF16_ARCHS
 # DeepSeek-style 128x128 FP8 block scaling is Hopper-only in the flat API.
 _CUTLASS_FP8_BLOCK_ARCHS = (90,)
 
-# MXFP8 activations x MXFP4 weights matches a *wider* flat-API skip than
-# MXFP8 x MXFP8: ``capability[0] not in [10, 11, 12]`` (SM100/103/107, SM110,
-# SM120/121). Do not collapse this to ``_CUTLASS_MXFP8_ARCHS``.
-_CUTLASS_MXFP8_MXFP4_ARCHS = (100, 103, 107, 110, 120, 121)
+# MXFP8 activations x MXFP4 weights: SM100/103/107 and SM110 only.
+# SM120/121 previously claimed support, but the flat CUTLASS ``fused_moe_120``
+# path silently corrupts DeepSeek MXFP4×MXFP8 serving (#7179). Use
+# ``SM12xMxfp8Mxfp4Config`` (CuteDSL) on SM12x instead. Do not collapse this
+# to ``_CUTLASS_MXFP8_ARCHS`` (which omits SM110).
+_CUTLASS_MXFP8_MXFP4_ARCHS = (100, 103, 107, 110)
 
 # MXFP8 x MXFP8 follows the narrower flat skip: ``capability[0] not in [10]``
 # (SM10x only, including B300 SM103). Not claimed on SM11x/SM12x.
@@ -2350,7 +2352,11 @@ def _mxfp8_activation_quant(
 
 @dataclass(frozen=True)
 class CutlassMxfp8Mxfp4Config:
-    """CUTLASS MXFP8-activation x MXFP4-weight backend for SM100 / SM110 / SM12x.
+    """CUTLASS MXFP8-activation x MXFP4-weight backend for SM100 / SM103 / SM107 / SM110.
+
+    SM12x is intentionally unsupported: the flat CUTLASS ``fused_moe_120`` path
+    can silently corrupt MXFP4×MXFP8 output (#7179). Prefer
+    ``SM12xMxfp8Mxfp4Config`` on SM120/SM121.
 
     Activations follow the TRTLLM canonical MXFP8 pack (E4M3 ``[M, H]`` plus a
     linear E8M0 block scale ``[M, H // 32]``), so one ``MoEActivationPack``
