@@ -43,4 +43,4 @@ for NVFP4 and BF16 and FP16 operands for FP8, like the Triton kernel; both accum
 FP32, with the global scales folded into the softmax scale and the output scale.
 
 The split count fills one wave of resident CTAs (occupancy times the SM count,
-`backend.py`).
+`backend.py`) for FP8 and BF16, and two CTAs per SM for NVFP4.

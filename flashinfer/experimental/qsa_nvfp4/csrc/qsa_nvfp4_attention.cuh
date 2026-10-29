@@ -205,6 +205,94 @@ __device__ __forceinline__ void copy_rows(uint8_t* rows, const uint8_t* data, co
   }
 }
 
+// NVFP4 copy sources of one tile: lane l copies 16-byte column l % 8 of warp tokens l / 8 + 4i,
+// and lanes below 16 the scales of token l. Gathered once per tile, shared by K and V.
+struct Nvfp4Sources {
+  int64_t data[4];
+  int64_t sf;
+  uint32_t valid;  // bit i: data[i], bit 4: sf
+};
+
+__device__ __forceinline__ Nvfp4Sources gather_nvfp4(int64_t data_offset, int64_t sf_offset,
+                                                     uint32_t valid, uint32_t lane) {
+  Nvfp4Sources s;
+  s.valid = 0;
+#pragma unroll
+  for (uint32_t i = 0; i < 4; ++i) {
+    const uint32_t token = lane / 8 + 4 * i;
+    s.data[i] = __shfl_sync(0xffffffffu, data_offset, token) + 16 * (lane % 8);
+    s.valid |= ((valid >> token) & 1u) << i;
+  }
+  s.sf = __shfl_sync(0xffffffffu, sf_offset, lane % 16);
+  s.valid |= (lane < 16 ? (valid >> lane) & 1u : 0u) << 4;
+  return s;
+}
+
+// cp.async of 16 bytes, zero-filled when !pred, with the L2 evict-first policy: KV rows are read
+// once.
+__device__ __forceinline__ void pred_load_128b_evict_first(void* smem, const void* gmem,
+                                                           bool pred) {
+  const uint32_t dst = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
+  asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2, %3;\n" ::"r"(dst),
+               "l"(gmem), "r"(pred ? 16 : 0), "l"(0x12F0000000000000ull));
+}
+
+__device__ __forceinline__ void copy_nvfp4(uint8_t* rows, const uint8_t* data, const uint8_t* sf,
+                                           const Nvfp4Sources& s, uint32_t lane) {
+  constexpr uint32_t kRowBytes = KvTraits<KvFormat::kNVFP4>::kRowBytes;
+#pragma unroll
+  for (uint32_t i = 0; i < 4; ++i) {
+    pred_load_128b_evict_first(rows + (lane / 8 + 4 * i) * kRowBytes + 16 * (lane % 8),
+                               data + s.data[i], (s.valid >> i) & 1u);
+  }
+  if (lane < 16) {
+    pred_load_128b_evict_first(rows + lane * kRowBytes + kHeadDim / 2, sf + s.sf,
+                               (s.valid >> 4) & 1u);
+  }
+}
+
+// E2M1 x8 to BF16 times 2^120, and E4M3 x4 block scales to BF16 times 2^-120: both exact, and so
+// is their product, which skips the bias multiply of the E4M3 conversion.
+__device__ __forceinline__ void e2m1x8_to_bf16x8_x2p120(uint32_t packed, uint32_t* d) {
+  constexpr uint32_t kHi0 = 0x7B7B7B00u, kHi1 = 0x7C7C7C7Cu;
+  constexpr uint32_t kLo0 = 0xC0800000u, kLo1 = 0xC0804000u;
+  const uint32_t mag = packed & 0x77777777u;
+  uint32_t hi_a = __byte_perm(kHi0, kHi1, mag);
+  uint32_t hi_b = __byte_perm(kHi0, kHi1, mag >> 16);
+  const uint32_t lo_a = __byte_perm(kLo0, kLo1, mag);
+  const uint32_t lo_b = __byte_perm(kLo0, kLo1, mag >> 16);
+  hi_a |= __byte_perm(packed << 4, packed, 0xD9C8u) & 0x80808080u;
+  hi_b |= __byte_perm(packed << 4, packed, 0xFBEAu) & 0x80808080u;
+  d[0] = __byte_perm(lo_a, hi_a, 0x5140u);
+  d[1] = __byte_perm(lo_a, hi_a, 0x7362u);
+  d[2] = __byte_perm(lo_b, hi_b, 0x5140u);
+  d[3] = __byte_perm(lo_b, hi_b, 0x7362u);
+}
+
+// The same decode with nibbles 0, 2 / 1, 3 / 4, 6 / 5, 7 paired: given two tokens' bytes
+// interleaved, each output holds one dim of both tokens, a PV B half.
+__device__ __forceinline__ void e2m1x8_pairs_to_bf16x8_x2p120(uint32_t packed, uint32_t* d) {
+  constexpr uint32_t kHi0 = 0x7B7B7B00u, kHi1 = 0x7C7C7C7Cu;
+  constexpr uint32_t kLo0 = 0xC0800000u, kLo1 = 0xC0804000u;
+  const uint32_t mag = packed & 0x77777777u;
+  uint32_t hi_a = __byte_perm(kHi0, kHi1, mag);
+  uint32_t hi_b = __byte_perm(kHi0, kHi1, mag >> 16);
+  const uint32_t lo_a = __byte_perm(kLo0, kLo1, mag);
+  const uint32_t lo_b = __byte_perm(kLo0, kLo1, mag >> 16);
+  hi_a |= __byte_perm(packed << 4, packed, 0xD9C8u) & 0x80808080u;
+  hi_b |= __byte_perm(packed << 4, packed, 0xFBEAu) & 0x80808080u;
+  d[0] = __byte_perm(lo_a, hi_a, 0x6240u);
+  d[1] = __byte_perm(lo_a, hi_a, 0x7351u);
+  d[2] = __byte_perm(lo_b, hi_b, 0x6240u);
+  d[3] = __byte_perm(lo_b, hi_b, 0x7351u);
+}
+
+__device__ __forceinline__ uint2 e4m3x4_to_bf16x4_x2m120(uint32_t q) {
+  q = __byte_perm(q, q, 0x1302u);
+  return make_uint2((q & 0x80008000u) | ((q & 0x7F007F00u) >> 4),
+                    ((q << 8) & 0x80008000u) | (((q << 8) & 0x7F007F00u) >> 4));
+}
+
 template <KvFormat F>
 __global__ void __launch_bounds__(kNumThreads) SparsePagedAttentionKernel(const Params p) {
   using Traits = KvTraits<F>;
@@ -251,9 +339,20 @@ __global__ void __launch_bounds__(kNumThreads) SparsePagedAttentionKernel(const 
   }
 
   // Selection index -> (physical page or -1, page offset), then -> byte offsets and valid bits.
+  // NVFP4: index / page_size as (umulhi(index, mul) + index) >> shift, exact for 0 <= index < 2^31.
+  uint32_t page_shift = 0, page_mul = 0;
+  if constexpr (F == KvFormat::kNVFP4) {
+    page_shift = 32 - __clz(uint32_t(p.page_size) - 1);
+    page_mul = uint32_t(((uint64_t(1) << page_shift) - uint32_t(p.page_size)) *
+                            (uint64_t(1) << 32) / uint32_t(p.page_size) +
+                        1);
+  }
   auto lookup = [&](int index, int& page, int& offset) {
     const int safe = max(index, 0);
-    const int logical_page = safe / p.page_size;
+    const int logical_page =
+        F == KvFormat::kNVFP4
+            ? int((__umulhi(uint32_t(safe), page_mul) + uint32_t(safe)) >> page_shift)
+            : safe / p.page_size;
     offset = safe - logical_page * p.page_size;
     page = request_ok && index >= 0 && logical_page < p.table_width
                ? p.block_table[table_row + logical_page]
@@ -277,18 +376,30 @@ __global__ void __launch_bounds__(kNumThreads) SparsePagedAttentionKernel(const 
   uint8_t* const k_rows = &smem.k[0][kWarpTokens * warp][0];
   uint8_t* const v_rows = &smem.v[0][kWarpTokens * warp][0];
   constexpr uint32_t kStageBytes = kTileTokens * kRowBytes;
+  Nvfp4Sources src, next_src;
+  auto copy_tile = [&](uint8_t* rows, const uint8_t* data, const uint8_t* sf, uint32_t tile_valid,
+                       const Nvfp4Sources& sources) {
+    if constexpr (F == KvFormat::kNVFP4) {
+      copy_nvfp4(rows, data, sf, sources, lane);
+    } else {
+      copy_rows<F>(rows, data, sf, data_offset, sf_offset, tile_valid, lane);
+    }
+  };
   lookup(index0, page, offset);
   lookup(index1, next_page, next_offset);
   uint32_t valid = locate(page, offset, data_offset, sf_offset);
+  if constexpr (F == KvFormat::kNVFP4) src = gather_nvfp4(data_offset, sf_offset, valid, lane);
   if (split < tile_end) {
-    copy_rows<F>(k_rows, p.k_data, p.k_sf, data_offset, sf_offset, valid, lane);
+    copy_tile(k_rows, p.k_data, p.k_sf, valid, src);
   }
   cp_async::commit_group();
   if (split < tile_end) {
-    copy_rows<F>(v_rows, p.v_data, p.v_sf, data_offset, sf_offset, valid, lane);
+    copy_tile(v_rows, p.v_data, p.v_sf, valid, src);
   }
   cp_async::commit_group();
   uint32_t next_valid = locate(next_page, next_offset, data_offset, sf_offset);
+  if constexpr (F == KvFormat::kNVFP4)
+    next_src = gather_nvfp4(data_offset, sf_offset, next_valid, lane);
   lookup(index2, next_page, next_offset);
   int ahead_index = index3;
 
@@ -303,8 +414,7 @@ __global__ void __launch_bounds__(kNumThreads) SparsePagedAttentionKernel(const 
     cp_async::wait_group<1>();
     __syncwarp();
     if (has_next) {
-      copy_rows<F>(k_rows + (stage ^ 1) * kStageBytes, p.k_data, p.k_sf, data_offset, sf_offset,
-                   next_valid, lane);
+      copy_tile(k_rows + (stage ^ 1) * kStageBytes, p.k_data, p.k_sf, next_valid, next_src);
     }
     cp_async::commit_group();
 
@@ -314,10 +424,8 @@ __global__ void __launch_bounds__(kNumThreads) SparsePagedAttentionKernel(const 
     if constexpr (F == KvFormat::kNVFP4) {
       const uint8_t* k1 = k0 + 8 * kRowBytes;
       uint2 sf0, sf1;  // block scales 4t .. 4t + 3 of each token
-      uint32_t sf_bytes = *reinterpret_cast<const uint32_t*>(k0 + kHeadDim / 2 + 4 * t);
-      fast_dequant_f8f16x4<__nv_fp8_e4m3, nv_bfloat16>(&sf_bytes, &sf0);
-      sf_bytes = *reinterpret_cast<const uint32_t*>(k1 + kHeadDim / 2 + 4 * t);
-      fast_dequant_f8f16x4<__nv_fp8_e4m3, nv_bfloat16>(&sf_bytes, &sf1);
+      sf0 = e4m3x4_to_bf16x4_x2m120(*reinterpret_cast<const uint32_t*>(k0 + kHeadDim / 2 + 4 * t));
+      sf1 = e4m3x4_to_bf16x4_x2m120(*reinterpret_cast<const uint32_t*>(k1 + kHeadDim / 2 + 4 * t));
 #pragma unroll
       for (uint32_t h = 0; h < 2; ++h) {
         const uint4 raw0 = *reinterpret_cast<const uint4*>(k0 + 32 * t + 16 * h);
@@ -328,8 +436,8 @@ __global__ void __launch_bounds__(kNumThreads) SparsePagedAttentionKernel(const 
         for (uint32_t i = 0; i < 4; ++i) {
           const uint32_t pair = 4 * h + i;  // k-steps 2 * pair and 2 * pair + 1
           uint32_t d0[4], d1[4];
-          e2m1x8_to_bf16x8(w0[i], d0);
-          e2m1x8_to_bf16x8(w1[i], d1);
+          e2m1x8_to_bf16x8_x2p120(w0[i], d0);
+          e2m1x8_to_bf16x8_x2p120(w1[i], d1);
           const uint32_t scale0 = broadcast16(sf0, pair / 2), scale1 = broadcast16(sf1, pair / 2);
 #pragma unroll
           for (uint32_t k = 0; k < 4; ++k) {
@@ -390,8 +498,7 @@ __global__ void __launch_bounds__(kNumThreads) SparsePagedAttentionKernel(const 
     // Also retires every warp's previous PV, which frees the other V stage.
     __syncthreads();
     if (has_next) {
-      copy_rows<F>(v_rows + (stage ^ 1) * kStageBytes, p.v_data, p.v_sf, data_offset, sf_offset,
-                   next_valid, lane);
+      copy_tile(v_rows + (stage ^ 1) * kStageBytes, p.v_data, p.v_sf, next_valid, next_src);
     }
     cp_async::commit_group();
 
@@ -450,20 +557,21 @@ __global__ void __launch_bounds__(kNumThreads) SparsePagedAttentionKernel(const 
       uint4 a = smem.p[kk][lane];
       uint32_t d[4][4];
       if constexpr (F == KvFormat::kNVFP4) {
-        uint32_t sf_packed = 0;
+        // d[2p + h][k]: dim 4h + k of tokens j = 2p and 2p + 1.
+        uint32_t w[4], sf_packed = 0;
 #pragma unroll
         for (uint32_t j = 0; j < 4; ++j) {
           const uint8_t* v_row = v_tile + (16 * kk + 2 * t + j % 2 + 8 * (j / 2)) * kRowBytes;
-          e2m1x8_to_bf16x8(*reinterpret_cast<const uint32_t*>(v_row + 32 * warp + 4 * g), d[j]);
+          w[j] = *reinterpret_cast<const uint32_t*>(v_row + 32 * warp + 4 * g);
           sf_packed |= uint32_t(v_row[kHeadDim / 2 + 4 * warp + g / 2]) << (8 * j);
         }
-        uint2 sf;
-        fast_dequant_f8f16x4<__nv_fp8_e4m3, nv_bfloat16>(&sf_packed, &sf);
+        const uint2 sf = e4m3x4_to_bf16x4_x2m120(sf_packed);
 #pragma unroll
-        for (uint32_t j = 0; j < 4; ++j) {
-          const uint32_t scale = broadcast16(sf, j);
+        for (uint32_t i = 0; i < 4; ++i) {
+          e2m1x8_pairs_to_bf16x8_x2p120(
+              __byte_perm(w[i / 2 * 2], w[i / 2 * 2 + 1], i % 2 ? 0x7362u : 0x5140u), d[i]);
 #pragma unroll
-          for (uint32_t k = 0; k < 4; ++k) d[j][k] = mul_bf16x2(d[j][k], scale);
+          for (uint32_t k = 0; k < 4; ++k) d[i][k] = mul_bf16x2(d[i][k], i < 2 ? sf.x : sf.y);
         }
       } else {
 #pragma unroll
@@ -484,9 +592,16 @@ __global__ void __launch_bounds__(kNumThreads) SparsePagedAttentionKernel(const 
 #pragma unroll
       for (uint32_t c = 0; c < 4; ++c) {
         // Pair one dim across two tokens: n8 tile 2c takes the low halves, 2c + 1 the high.
-        uint32_t b[4] = {
-            __byte_perm(d[0][c], d[1][c], 0x5410u), __byte_perm(d[2][c], d[3][c], 0x5410u),
-            __byte_perm(d[0][c], d[1][c], 0x7632u), __byte_perm(d[2][c], d[3][c], 0x7632u)};
+        uint32_t b[4];
+        if constexpr (F == KvFormat::kNVFP4) {
+          const uint32_t h = c / 2, k = 2 * (c % 2);
+          b[0] = d[h][k], b[1] = d[2 + h][k], b[2] = d[h][k + 1], b[3] = d[2 + h][k + 1];
+        } else {
+          b[0] = __byte_perm(d[0][c], d[1][c], 0x5410u),
+          b[1] = __byte_perm(d[2][c], d[3][c], 0x5410u);
+          b[2] = __byte_perm(d[0][c], d[1][c], 0x7632u),
+          b[3] = __byte_perm(d[2][c], d[3][c], 0x7632u);
+        }
         mma::mma_sync_m16n16k16_row_col_f16f16f32<PvType>(o[c], &a.x, b);
       }
     }
@@ -494,6 +609,8 @@ __global__ void __launch_bounds__(kNumThreads) SparsePagedAttentionKernel(const 
     // Advance the lookups: offsets for the tile after next, pages and indices further ahead.
     valid = next_valid;
     next_valid = locate(next_page, next_offset, data_offset, sf_offset);
+    if constexpr (F == KvFormat::kNVFP4)
+      next_src = gather_nvfp4(data_offset, sf_offset, next_valid, lane);
     lookup(ahead_index, next_page, next_offset);
     ahead_index = load_index(tile + 4 * stride);
   }

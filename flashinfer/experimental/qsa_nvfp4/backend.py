@@ -53,6 +53,8 @@ def _num_splits(
 ) -> int:
     num_sms, ctas_per_sm = resident
     work = num_rows * num_kv_heads
+    if kv_format == 0:  # NVFP4 runs faster at two CTAs per SM, every split kept
+        return min(num_tiles, max(1, 2 * num_sms // work))
     # Fill one wave of resident CTAs. BF16 runs faster at one CTA per SM until that
     # leaves eight or more tiles per split.
     splits = min(num_tiles, max(1, ctas_per_sm * num_sms // work))
