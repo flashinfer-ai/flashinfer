@@ -2066,7 +2066,12 @@ def test_conv_halo_row(slurm) -> None:
 LAYER_ROWS = [
     Row("L4", (303, 200), (2, 6), 4, "explicit:c7", stage="layer"),
     Row(
-        "L8", (10240, 8192, 2085, 333), (16, 48), 8, "zigzag_per_document", stage="layer"
+        "L8",
+        (10240, 8192, 2085, 333),
+        (16, 48),
+        8,
+        "zigzag_per_document",
+        stage="layer",
     ),
     Row(
         "L8r",
@@ -2116,9 +2121,9 @@ def _run_rank_layer(
     x_local = x_all[l2g].to(device)
     ops = _local_inputs(row, part, cu, rank, device)
     g, beta, dout = ops["g"], ops["beta"], ops["dout"]
-    conv_takes_handle = "recompute_handle" in inspect.signature(
-        conv.cake_causal_conv1d_kcp
-    ).parameters
+    conv_takes_handle = (
+        "recompute_handle" in inspect.signature(conv.cake_causal_conv1d_kcp).parameters
+    )
 
     def layer(x, w, g_, b_, h):
         ckw = {"recompute_handle": h} if (h is not None and conv_takes_handle) else {}
@@ -2212,7 +2217,9 @@ def _run_rank_layer(
         "pass": all(flags.values()),
         "flags": flags,
         "gated": sorted(flags),
-        "reported": [] if conv_takes_handle else ["layer_recompute_no_comm (pending: conv recompute_handle)"],
+        "reported": []
+        if conv_takes_handle
+        else ["layer_recompute_no_comm (pending: conv recompute_handle)"],
         "info_by_rank": [
             {
                 "rank": rank,

@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import torch.distributed as dist
 
+
 class CollectiveCounter:
     """Counts the ``torch.distributed`` collectives issued and the waits on their work handles, by phase: ``"orig"``
     (the checkpointed forward), ``"recompute"`` (torch's recompute, marked by the checkpoint's ``context_fn``) and

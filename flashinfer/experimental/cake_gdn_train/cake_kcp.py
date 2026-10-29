@@ -621,9 +621,31 @@ class KcpRecomputeHandle:
 HANDLE_KEY = "gdn"  # this package's entry in a recompute handle
 
 
-def _handle_key(T_r, H_qk, HV, n_frag, P, scale, exchange, precision_mode, offset_class, transfer_walk) -> tuple:
+def _handle_key(
+    T_r,
+    H_qk,
+    HV,
+    n_frag,
+    P,
+    scale,
+    exchange,
+    precision_mode,
+    offset_class,
+    transfer_walk,
+) -> tuple:
     """What a handle entry must match to stand in for the recompute's exchange: the problem and the programs."""
-    return (T_r, H_qk, HV, n_frag, P, scale, exchange, precision_mode, offset_class, transfer_walk)
+    return (
+        T_r,
+        H_qk,
+        HV,
+        n_frag,
+        P,
+        scale,
+        exchange,
+        precision_mode,
+        offset_class,
+        transfer_walk,
+    )
 
 
 def _handle_lookup(handle: Any) -> dict[str, Any] | None:
@@ -4284,7 +4306,9 @@ def _fwd_entry(
     if boundary is not None:
         tb = call.tb
         if boundary.get("ctx") is not call.ctx:
-            raise ValueError("recompute_handle: the 'gdn' entry belongs to another KcpContext")
+            raise ValueError(
+                "recompute_handle: the 'gdn' entry belongs to another KcpContext"
+            )
         if boundary.get("key") != _handle_key(
             call.T_r,
             call.H_qk,
@@ -4301,7 +4325,13 @@ def _fwd_entry(
                 "recompute_handle: the 'gdn' entry describes another problem or programs than this recompute"
             )
         s_in = boundary["S_in"]
-        _check(s_in, "recompute_handle S_in", (tb.sizes["S_in"],), call.state_dtype, call.device)
+        _check(
+            s_in,
+            "recompute_handle S_in",
+            (tb.sizes["S_in"],),
+            call.state_dtype,
+            call.device,
+        )
     call.scratch["recompute_handle"] = handle_mode
     out, saved = _fwd_body(
         call,
@@ -4693,7 +4723,9 @@ class ChunkGDNKcpFunction(torch.autograd.Function):
     this node and pack its saved tensors at all; a non-executable node never skips."""
 
     @staticmethod
-    def forward(fctx, q, k, v, g, beta, ctx, scale, workspace, opts, executable, handle):
+    def forward(
+        fctx, q, k, v, g, beta, ctx, scale, workspace, opts, executable, handle
+    ):
         boundary = None if handle is None else _handle_lookup(handle)
         gid = _graph_task_id() if opts.reuse_recompute_tapes else -1
         out, saved = _fwd_entry(

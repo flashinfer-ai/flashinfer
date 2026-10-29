@@ -3780,4 +3780,6 @@ def test_recompute_handle_entry_rules() -> None:
                 **bad,
             )
     with pytest.raises(TypeError, match="entries"):
-        kcp.chunk_gdn_kcp(q, k, v, g, beta, ctx, backend="fake", recompute_handle=object())
+        kcp.chunk_gdn_kcp(
+            q, k, v, g, beta, ctx, backend="fake", recompute_handle=object()
+        )
