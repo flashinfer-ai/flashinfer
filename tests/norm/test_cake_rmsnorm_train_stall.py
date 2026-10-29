@@ -32,10 +32,22 @@ bitwise equal across the alone and busy calls, a fresh-workspace call and
 launch grids other than the production one (a CTA count that is not the slot
 count claims the same chunk table), and the workspace counters are zero after
 every call.
+
+The backward beside a kernel resident on every SM (issue #7548, item 2): a
+backward main kernel needs a large shared-memory carveout, so a side kernel
+holding every SM with the default carveout delays its start until the side
+kernel exits (documented in :mod:`flashinfer.cake_rmsnorm_train`).  The
+documented remedy is checked here: with the side kernel's preferred carveout
+set to the maximum shared memory, the backward starts beside it and costs at
+most ``MAX_ALL_SM_EXTRA_MS`` more than alone, far below the side kernel's
+``ALL_SM_SPIN_MS`` lifetime; the forward starts beside the default-carveout
+side kernel.  Every side CTA records its SM, and a run counts only when the side
+kernel holds every SM.
 """
 
 from __future__ import annotations
 
+import ctypes
 import statistics
 
 import pytest
@@ -243,3 +255,216 @@ def test_dw_is_bitwise_independent_of_the_launch_grid(
         )
         assert torch.count_nonzero(workspace[: loader.COUNTERS_BYTES]) == 0
     monkeypatch.setattr(loader, "launch_grid", production)
+
+
+# Item 2 of issue #7548: a side kernel of one 128-thread CTA per SM, each CTA
+# spinning ``ALL_SM_SPIN_MS`` of wall time (``%globaltimer``) after recording its
+# SM.  A backward that waits for it takes the rest of that lifetime; one that
+# starts beside it costs at most ``MAX_ALL_SM_EXTRA_MS`` more than alone.
+ALL_SM_SPIN_MS = 50.0
+ALL_SM_THREADS = 128
+ALL_SM_PRE_SLEEP_CYCLES = 2_000_000
+ALL_SM_TOKENS = (4096, 16384)
+ALL_SM_RUNS = 5
+ALL_SM_TRIES = 4
+MAX_ALL_SM_EXTRA_MS = 1.0
+# cudaSharedmemCarveoutMaxShared / cudaSharedmemCarveoutDefault
+CARVEOUT_MAX_SHARED = 100
+CARVEOUT_DEFAULT = -1
+
+_SPIN_KERNEL = "cake_rmsnorm_train_stall_spin"
+_SPIN_SOURCE = r"""
+extern "C" __global__ void cake_rmsnorm_train_stall_spin(unsigned long long ns, int* smids) {
+    if (threadIdx.x == 0) {
+        unsigned int smid;
+        asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
+        smids[blockIdx.x] = (int)smid;
+    }
+    unsigned long long t0, t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    do {
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    } while (t - t0 < ns);
+}
+"""
+
+
+def _checked(result):
+    error, *values = result
+    if int(error):
+        raise RuntimeError(f"CUDA error {error}")
+    return values[0] if values else None
+
+
+class _AllSmSpin:
+    """A side kernel of one CTA per SM (NVRTC + driver API, so the preferred
+    shared-memory carveout can be set on it)."""
+
+    def __init__(self, carveout: int) -> None:
+        from cuda.bindings import driver, nvrtc
+
+        self._driver = driver
+        device = _device()
+        torch.empty(1, device=device)  # primary context
+        major, minor = _capability()
+        prog = _checked(
+            nvrtc.nvrtcCreateProgram(_SPIN_SOURCE.encode(), b"spin.cu", 0, [], [])
+        )
+        opts = [f"--gpu-architecture=sm_{major}{minor}".encode()]
+        _checked(nvrtc.nvrtcCompileProgram(prog, len(opts), opts))
+        size = _checked(nvrtc.nvrtcGetCUBINSize(prog))
+        cubin = b" " * size
+        _checked(nvrtc.nvrtcGetCUBIN(prog, cubin))
+        _checked(nvrtc.nvrtcDestroyProgram(prog))
+        ctx = _checked(driver.cuDevicePrimaryCtxRetain(device.index or 0))
+        _checked(driver.cuCtxSetCurrent(ctx))
+        self._module = _checked(driver.cuModuleLoadData(cubin))
+        self._func = _checked(
+            driver.cuModuleGetFunction(self._module, _SPIN_KERNEL.encode())
+        )
+        _checked(
+            driver.cuFuncSetAttribute(
+                self._func,
+                driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT,
+                carveout,
+            )
+        )
+        self.sms = torch.cuda.get_device_properties(device).multi_processor_count
+        self.smids = torch.full((self.sms,), -1, dtype=torch.int32, device=device)
+
+    def launch(self, stream: torch.cuda.Stream) -> None:
+        self.smids.fill_(-1)
+        params = (
+            (int(ALL_SM_SPIN_MS * 1e6), self.smids.data_ptr()),
+            (ctypes.c_ulonglong, ctypes.c_void_p),
+        )
+        _checked(
+            self._driver.cuLaunchKernel(
+                self._func,
+                self.sms,
+                1,
+                1,
+                ALL_SM_THREADS,
+                1,
+                1,
+                0,
+                self._driver.CUstream(stream.cuda_stream),
+                params,
+                0,
+            )
+        )
+
+    def coverage(self) -> int:
+        """Distinct SMs the last launch held (read after a synchronize)."""
+        return int(torch.unique(self.smids[self.smids >= 0]).numel())
+
+
+def _beside_all_sms(call, spin: _AllSmSpin, side: torch.cuda.Stream):
+    """``call`` launched while ``spin`` holds every SM; ``None`` when the side
+    kernel did not reach every SM in ``ALL_SM_TRIES`` launches."""
+    for _ in range(ALL_SM_TRIES):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        torch.cuda.synchronize()
+        with torch.cuda.stream(side):
+            spin.launch(side)
+        torch.cuda._sleep(ALL_SM_PRE_SLEEP_CYCLES)
+        start.record()
+        out = call()
+        end.record()
+        torch.cuda.synchronize()
+        if spin.coverage() == spin.sms:
+            return start.elapsed_time(end), out
+    return None
+
+
+def _alone(call):
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    torch.cuda.synchronize()
+    torch.cuda._sleep(ALL_SM_PRE_SLEEP_CYCLES)
+    start.record()
+    out = call()
+    end.record()
+    torch.cuda.synchronize()
+    return start.elapsed_time(end), out
+
+
+def _all_sm_medians(call, carveout: int):
+    spin = _AllSmSpin(carveout)
+    side = torch.cuda.Stream()
+    for _ in range(WARMUP):
+        _alone(call)
+    alone, busy = [], []
+    for _ in range(ALL_SM_RUNS):
+        alone.append(_alone(call))
+        timed = _beside_all_sms(call, spin, side)
+        if timed is None:
+            pytest.skip(
+                f"the side kernel did not hold all {spin.sms} SMs in {ALL_SM_TRIES} launches"
+            )
+        busy.append(timed)
+    return (
+        statistics.median(t for t, _ in alone),
+        statistics.median(t for t, _ in busy),
+        alone,
+        busy,
+    )
+
+
+@pytest.mark.parametrize("rows", ALL_SM_TOKENS)
+@pytest.mark.parametrize(
+    "hidden,residual", [r for r in ROUTES if not r[1]], ids=lambda v: str(v)
+)
+def test_backward_starts_beside_an_all_sm_kernel_with_the_max_shared_carveout(
+    hidden: int, residual: bool, rows: int
+) -> None:
+    _skip_unless_route(hidden, residual)
+    x, w, g, g_h, rstd = _inputs(rows, hidden, residual)
+    workspace = cake_rmsnorm_train_backward_workspace(
+        rows, hidden, _device(), residual=residual
+    )
+
+    def call():
+        return _backward(x, w, g, g_h, rstd, workspace)[1].clone()
+
+    alone_ms, busy_ms, alone, busy = _all_sm_medians(call, CARVEOUT_MAX_SHARED)
+    print(
+        f"ALL_SM hidden={hidden} rows={rows} carveout=max_shared "
+        f"alone_ms={alone_ms:.4f} busy_ms={busy_ms:.4f} extra_ms={busy_ms - alone_ms:.4f}"
+    )
+    reference = alone[0][1]
+    for _t, dw in alone[1:] + busy:
+        assert torch.equal(dw, reference), (
+            f"hidden={hidden} rows={rows}: dw differs beside the all-SM kernel"
+        )
+    assert busy_ms - alone_ms <= MAX_ALL_SM_EXTRA_MS, (
+        f"hidden={hidden} rows={rows}: backward alone {alone_ms:.4f} ms, beside an all-SM "
+        f"kernel with the max-shared carveout {busy_ms:.4f} ms (at most "
+        f"{MAX_ALL_SM_EXTRA_MS} ms more; the side kernel lives {ALL_SM_SPIN_MS} ms)"
+    )
+
+
+@pytest.mark.parametrize("rows", ALL_SM_TOKENS)
+@pytest.mark.parametrize("hidden", [h for h, _eps in WIDTHS], ids=lambda v: str(v))
+def test_forward_starts_beside_an_all_sm_kernel_with_the_default_carveout(
+    hidden: int, rows: int
+) -> None:
+    _skip_unless_route(hidden, False)
+    x, w, _g, _g_h, _rstd = _inputs(rows, hidden, False)
+
+    def call():
+        return cake_rmsnorm_train_forward(x, w, EPS[hidden])[0]
+
+    alone_ms, busy_ms, alone, busy = _all_sm_medians(call, CARVEOUT_DEFAULT)
+    print(
+        f"ALL_SM_FWD hidden={hidden} rows={rows} carveout=default "
+        f"alone_ms={alone_ms:.4f} busy_ms={busy_ms:.4f} extra_ms={busy_ms - alone_ms:.4f}"
+    )
+    reference = alone[0][1]
+    for _t, y in alone[1:] + busy:
+        assert torch.equal(y, reference)
+    assert busy_ms - alone_ms <= MAX_ALL_SM_EXTRA_MS, (
+        f"hidden={hidden} rows={rows}: forward alone {alone_ms:.4f} ms, beside an all-SM "
+        f"kernel with the default carveout {busy_ms:.4f} ms (at most {MAX_ALL_SM_EXTRA_MS} ms more)"
+    )
