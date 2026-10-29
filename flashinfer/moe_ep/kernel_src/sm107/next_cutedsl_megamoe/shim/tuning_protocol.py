@@ -43,7 +43,7 @@ def _json(value):
 
 
 class RubinTuningProtocol:
-    """Retain native candidates, inputs, numerical checks and event timing."""
+    """Collective candidate selection with managed cache compatibility."""
 
     def __init__(
         self,
@@ -59,7 +59,12 @@ class RubinTuningProtocol:
         process_group: ProcessGroup | None = None,
         install_winner: bool = False,
         allow_nondeterministic: bool | None = None,
+        make_trial=None,
+        execution_contract: dict | None = None,
     ) -> None:
+        if (make_trial is None) != (execution_contract is None):
+            raise ValueError("a custom trial requires its execution contract")
+        self.make_trial, self.execution_contract = make_trial, execution_contract
         self.y, self.l1, self.l2 = y, l1, l2
         self.workspace = workspace
         self.cfg = workspace.config
@@ -131,14 +136,20 @@ class RubinTuningProtocol:
             "environment": _collect_metadata(),
             "config": config,
             "device": device,
+            **(
+                {"execution": self._gather(self.execution_contract)}
+                if self.make_trial is not None
+                else {}
+            ),
         }
 
     def _compatible(self, record, contract, context, measurement):
         if not isinstance(record, dict):
             return False
-        # Complete-forward winners remain usable by fixed file consumers, but
-        # do not replace results for this kernel-only objective.
-        if record.get("timing_boundary", "kernel") != "kernel":
+        boundary = "complete_forward" if self.make_trial is not None else "kernel"
+        if record.get("timing_boundary", "kernel") != boundary:
+            return False
+        if self.make_trial is not None and record.get("protocol_contract") != contract:
             return False
         if record.get("protocol_contract") not in (None, contract):
             return False
@@ -259,6 +270,7 @@ class RubinTuningProtocol:
             self.timed_iters,
             self.allow_nondeterministic,
             self.install_winner,
+            self.make_trial is not None,
             context.tuning_enabled,
             context.force_tune,
             context.disk_cache_enabled,
@@ -331,6 +343,11 @@ class RubinTuningProtocol:
                 timed_iters=self.timed_iters,
                 process_group=self.group,
                 measurement=measurement,
+                **(
+                    {"make_trial": self.make_trial}
+                    if self.make_trial is not None
+                    else {}
+                ),
             )
             record = knob_cache.make_record(
                 knobs,
@@ -338,6 +355,8 @@ class RubinTuningProtocol:
                 p50_us=score,
                 source="autotune-sampled-oracle",
             )
+            if self.make_trial is not None:
+                record["timing_boundary"] = "complete_forward"
             record["measurement_policy"] = policy_fields
             record["profiling_policy"] = measurement
         else:

@@ -116,7 +116,12 @@ def protocol(monkeypatch):
     )
     raw = SimpleNamespace(config=backend._fallback._resolved_config(fleet))
     owner = selection.VariantWorkspace(
-        fleet, Mock(), raw, tensors=SimpleNamespace(num_tokens=4)
+        fleet,
+        Mock(),
+        raw,
+        tensors=moe_ep.MoEEpTensors(
+            torch.empty(4, 512), torch.empty(4, 3, dtype=torch.int32), torch.empty(4, 3)
+        ),
     )
     protocol = selection._VariantProtocol(backend, owner, (None, None), None)
     contract = {"variants": ["inference", "genphase"]}
@@ -333,8 +338,9 @@ def test_install_prepares_independent_storage_before_releasing_previous(
 
 
 @pytest.mark.parametrize("output_view", [False, True])
+@pytest.mark.parametrize("variant", [None, "inference", "genphase"])
 def test_full_forward_sweep_selects_across_all_knobs(
-    protocol, monkeypatch, output_view
+    protocol, monkeypatch, output_view, variant
 ):
     from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
         autotune as native,
@@ -369,10 +375,14 @@ def test_full_forward_sweep_selects_across_all_knobs(
             self.output_activation = torch.zeros(4, 512)
             self.prepared = False
             self.destroyed = False
+            self._tuning_state = AutoTuningState()
             buffers.append(self)
 
         def note_staged_tokens(self, count):
             self.count = count
+
+        def staged_tokens(self):
+            return self.count
 
         def prepare(self, *weights):
             self.prepared = True
@@ -382,9 +392,18 @@ def test_full_forward_sweep_selects_across_all_knobs(
 
     class Kernel:
         def __init__(self, variant, knobs="auto"):
+            if not isinstance(variant, str):
+                knobs, variant = variant.knobs, variant.kernel_variant
+            self._kernel_config = dataclasses.replace(
+                backend._config, kernel_variant=variant, knobs=knobs
+            )
+            self._ep_bootstrap = backend._ep_bootstrap
             self.cfg = dataclasses.replace(
                 configs[variant], **({} if knobs == "auto" else knobs)
             )
+
+        def bind_ep_bootstrap(self, bootstrap):
+            self._ep_bootstrap = bootstrap
 
         def _allocate_workspace(self, fleet):
             return Buffer(self.cfg)
@@ -443,10 +462,28 @@ def test_full_forward_sweep_selects_across_all_knobs(
         cached = {"knobs": grid[0], "p50_us": 1}
         native_context.publish("kernel-only", cached)
         previous = dict(native_context.records())
-        result = AutoTuner.get().choose_with_protocol(selection.NAMESPACE, protocol)
-        assert dict(native_context.records()) == previous
-    assert measured == [(v, flag) for v in ("inference", "genphase") for flag in (1, 2)]
-    assert result["variant"] == "genphase"
-    assert result["knobs"] == grid[1]
-    assert result["knob_record"]["timing_boundary"] == "complete_forward"
+        if variant is None:
+            result = AutoTuner.get().choose_with_protocol(selection.NAMESPACE, protocol)
+            assert dict(native_context.records()) == previous
+            assert result["variant"] == "genphase"
+            assert result["knobs"] == grid[1]
+            assert result["knob_record"]["timing_boundary"] == "complete_forward"
+        else:
+            from flashinfer.moe_ep.backends.mega.kernel.sm107.forward_tuning import (
+                ForwardExecution,
+            )
+
+            kernel = backend._backend(variant)
+            workspace = kernel._allocate_workspace(protocol.owner.fleet)
+            kernel.stage_inputs(protocol.tensors, workspace, quantize_input=True)
+            execution = ForwardExecution(
+                kernel, protocol.tensors, quantize_input=True, output=protocol.output
+            )
+            assert (
+                execution.tune(None, None, workspace, candidates=grid, force_tune=True)
+                == grid[1]
+            )
+            workspace.destroy()
+    variants = ("inference", "genphase") if variant is None else (variant,)
+    assert measured == [(v, flag) for v in variants for flag in (1, 2)]
     assert all(buffer.destroyed for buffer in buffers)

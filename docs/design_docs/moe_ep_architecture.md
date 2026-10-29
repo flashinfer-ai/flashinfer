@@ -322,15 +322,23 @@ destruction. `warmup()` continues to return `None`.
 
 On Rubin, `kernel_variant="auto"` together with `knobs="auto"` selects between
 inference and GenPhase. An enabled `autotune_v2()` warmup measures every knob
-candidate including input staging, compute and output copies, then selects the
+candidate including input staging, compute and output handling, then selects the
 best of each variant's winners. Both levels use the same timing boundary.
 The same numerical settings apply to both variants;
 GenPhase is excluded when its capacity or combine requirements are not met.
-The result uses a separate managed-cache entry from explicit-variant tuning,
-which keeps its existing kernel-only timing. Selecting a result also writes its
-knobs to the MegaMoE compatibility file when persistence is enabled. These file
-records can configure fixed workspaces, but do not replace kernel-only tuning
-results. A replay miss uses the inference heuristic and leaves selection pending.
+Explicit inference or GenPhase with `knobs="auto"` uses the same complete-forward
+boundary, restricted to that variant. The Rubin offline CLI also measures staging,
+compute and writing an owned output, matching the default layer forward with
+BF16 inputs. Output copies are measured when the selected path requires them. Input generation, weight preparation, compilation and correctness
+checks are outside measurement. Match the deployment's input and output layouts
+when reusing automatic results; kernel-only records do not satisfy this objective.
+
+Variant selection has its own managed-cache entry containing the variant and
+knobs. Selecting a result also writes its knobs and execution contract to the
+MegaMoE compatibility file when persistence is enabled. Fixed-variant tuning
+retains compatible-capacity lookup in both stores. A variant-selection replay
+miss uses the inference heuristic and leaves selection pending. Low-level tuning
+of already-staged workspaces remains available for kernel measurements.
 
 Use `layer.get_tuned_config()` to reconstruct a fixed layer after variant
 selection. It returns the concrete kernel config with the selected variant and

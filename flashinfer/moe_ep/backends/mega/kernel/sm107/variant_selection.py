@@ -5,7 +5,6 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-import os
 from copy import deepcopy
 from typing import TYPE_CHECKING
 
@@ -16,6 +15,7 @@ from flashinfer.autotuner import AutoTuner, TuningContext, TuningResult
 from .....core.kernel.base import MegaKernelBackend
 from .....core.tuning_state import AutoTuningState
 from .....core.validation.common import MoEEpConfigError
+from .forward_tuning import ForwardExecution
 
 if TYPE_CHECKING:
     from .....config import FleetParams
@@ -310,27 +310,6 @@ class RubinVariantBackend(MegaKernelBackend):
             workspace.kernel.destroy(workspace.workspace)
 
 
-class _ForwardTrial:
-    def __init__(
-        self,
-        owner: VariantWorkspace,
-        output: torch.Tensor | None,
-    ):
-        if owner.tensors is None:
-            raise RuntimeError("Stage inputs before measuring a variant")
-        self.tensors = owner.tensors
-        self.owner, self.output = owner, output
-        self.config = owner.workspace.config
-        self.device = owner.workspace.device
-
-    def launch(self, l1, l2):
-        owner = self.owner
-        owner.kernel.stage_inputs(
-            self.tensors, owner.workspace, quantize_input=owner.quantize_input
-        )
-        owner.kernel.compute(owner.workspace, (l1, l2), output=self.output)
-
-
 class _VariantProtocol:
     def __init__(
         self,
@@ -351,6 +330,12 @@ class _VariantProtocol:
         )
 
         owner = self.owner
+        execution = ForwardExecution(
+            owner.kernel,
+            self.tensors,
+            quantize_input=owner.quantize_input,
+            output=self.output,
+        )
         # Native compatibility covers numerical settings, SM budget and environment.
         native = RubinTuningProtocol(
             self.output,
@@ -358,29 +343,13 @@ class _VariantProtocol:
             self.weights[1],
             owner.workspace,
             num_tokens=self.tensors.num_tokens,
+            process_group=self.backend.ep_comm_group
+            if self.backend.ep_world_size > 1
+            else None,
+            make_trial=execution.make_trial,
+            execution_contract=execution.contract(),
         )._contract()
         native["config"].pop("kernel_variant")
-        inputs = {}
-        for name in (
-            "hidden_states",
-            "topk_ids",
-            "topk_weights",
-            "scales",
-            "fc1_alpha",
-            "fc2_alpha",
-            "fc1_norm_const",
-        ):
-            value = getattr(self.tensors, name)
-            inputs[name] = (
-                None
-                if value is None
-                else [str(value.dtype), list(value.shape[1:]), list(value.stride())]
-            )
-        output = (
-            None
-            if self.output is None
-            else [str(self.output.dtype), list(self.output.stride())]
-        )
         return {
             "native": native,
             "timing_boundary": "complete_forward_candidates",
@@ -388,19 +357,7 @@ class _VariantProtocol:
             "allow_nondeterministic": self.backend._config.in_kernel_fc2_reduce,
             "native_skipped": _cache_identity(context)[1],
             "capacity": owner.fleet.max_tokens_per_rank,
-            "input_norm_const": getattr(self.backend._config, "input_norm_const", 1.0),
-            "staging": {
-                name: os.environ.get(name, "1")
-                for name in (
-                    "FLASHINFER_MEGA_FUSED_STAGE",
-                    "FLASHINFER_SM107_MEGA_CHECK_ROUTES",
-                    "FLASHINFER_SM107_FUSED_ROUTE_CHECK",
-                    "FLASHINFER_SM107_PREP_TVM_FFI",
-                )
-            },
-            "inputs": self.backend._gather(
-                [self.tensors.num_tokens, inputs, output, owner.quantize_input]
-            ),
+            "inputs": self.backend._gather(self.tensors.num_tokens),
             "measurement_policy": context.measurement_policy.manifest_fields()
             if context.measurement_policy
             else {},
@@ -537,21 +494,15 @@ class _VariantProtocol:
             group = backend.ep_comm_group if backend.ep_world_size > 1 else None
             live_tokens = max(backend._gather(self.tensors.num_tokens))
 
-            def make_trial(workspace):
-                return _ForwardTrial(
-                    VariantWorkspace(
-                        owner.fleet,
-                        backend._fixed_backend(workspace),
-                        workspace,
-                        tensors=self.tensors,
-                        quantize_input=owner.quantize_input,
-                    ),
-                    self.output,
-                )
-
             for variant in variants:
                 kernel = backend._backend(variant)
                 workspace = kernel._allocate_workspace(owner.fleet)
+                execution = ForwardExecution(
+                    kernel,
+                    self.tensors,
+                    quantize_input=owner.quantize_input,
+                    output=self.output,
+                )
                 kernel.stage_inputs(
                     self.tensors, workspace, quantize_input=owner.quantize_input
                 )
@@ -576,9 +527,9 @@ class _VariantProtocol:
                     candidates=knobs_to_try,
                     process_group=group,
                     measurement=measurement,
-                    make_trial=make_trial,
+                    make_trial=execution.make_trial,
                 )
-                query = RubinTuningProtocol(
+                protocol = RubinTuningProtocol(
                     self.output,
                     self.weights[0],
                     self.weights[1],
@@ -586,11 +537,21 @@ class _VariantProtocol:
                     num_tokens=self.tensors.num_tokens,
                     allow_nondeterministic=backend._config.in_kernel_fc2_reduce,
                     process_group=group,
-                )._query(live_tokens)
+                    make_trial=execution.make_trial,
+                    execution_contract=execution.contract(),
+                )
+                query = protocol._query(live_tokens)
                 knob_record = knob_cache.make_record(
                     knobs, **query, p50_us=score, source="autotune-complete-forward"
                 )
                 knob_record["timing_boundary"] = "complete_forward"
+                knob_record["protocol_contract"] = protocol._contract()
+                knob_record["measurement_policy"] = (
+                    context.measurement_policy.manifest_fields()
+                    if context.measurement_policy
+                    else {}
+                )
+                knob_record["profiling_policy"] = measurement
                 candidates.append(
                     {
                         "variant": variant,

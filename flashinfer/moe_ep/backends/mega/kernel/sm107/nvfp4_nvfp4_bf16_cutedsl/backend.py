@@ -254,6 +254,8 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         self, t: "MoEEpTensors", workspace: Any, *, quantize_input: bool
     ) -> None:
         """Stage NVFP4 inputs, fusing eligible route checks with quantization."""
+        if self._kernel_config.knobs == "auto":
+            workspace._tuning_inputs = (t, quantize_input)
         self._stage_scalars(t, workspace)
         if quantize_input:
             staged = stage_mega_moe_inputs(

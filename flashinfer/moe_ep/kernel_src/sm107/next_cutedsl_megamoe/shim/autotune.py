@@ -408,16 +408,14 @@ def autotune_sm107_block_scaled_mega_moe(
     install_winner: bool = False,
     allow_nondeterministic: Optional[bool] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Run the native sweep through FlashInfer's autotuner.
+    """Measure already-staged kernels through FlashInfer's autotuner.
 
-    Explicit calls search afresh. Online callers pass ``force_tune=False``
-    and ``install_winner=True`` to honor the shared context and prepare the
-    winner in the caller's workspace. A disabled cache miss returns None.
+    Explicit calls search afresh. Set ``force_tune=False`` to honor the shared
+    context and ``install_winner=True`` to prepare the winner in this workspace.
+    A disabled cache miss returns None. Layer and CLI tuning measure complete
+    forwards through the same protocol with a staging-aware execution trial.
     """
-    from flashinfer import autotune_v2
-    from flashinfer.autotuner import AutoTuner
-
-    from .tuning_protocol import NAMESPACE, RubinTuningProtocol
+    from .tuning_protocol import RubinTuningProtocol
 
     protocol = RubinTuningProtocol(
         y,
@@ -432,6 +430,14 @@ def autotune_sm107_block_scaled_mega_moe(
         install_winner=install_winner,
         allow_nondeterministic=allow_nondeterministic,
     )
+    return _choose_protocol(protocol, force_tune=force_tune)
+
+
+def _choose_protocol(protocol, *, force_tune):
+    from flashinfer import autotune_v2
+    from flashinfer.autotuner import AutoTuner
+    from .tuning_protocol import NAMESPACE
+
     tuner = AutoTuner.get()
     if force_tune and not tuner._in_v2_context:
         store = tuner._active_managed_store

@@ -252,6 +252,8 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         BF16 inputs may fuse validation with quantization; prequantized inputs
         are validated before copying their payload and logical scale columns.
         """
+        if self._kernel_config.knobs == "auto":
+            workspace._tuning_inputs = (t, quantize_input)
         if quantize_input:
             staged = stage_mega_moe_inputs(
                 t.hidden_states,

@@ -80,6 +80,7 @@ def rubin_bootstrap(request):
         (kind, "genphase", False, (512, 256, 8, 96, 128), "native")
         for kind in ("mxfp8_e4m3", "mxfp4_mxfp8")
     ]
+    + [("mxfp4_mxfp8", "genphase", False, (512, 256, 8, 96, 128), "prequantized")]
     + [
         ("nvfp4", "inference", False, (512, 256, 8, 96, 128), policy)
         for policy in (
@@ -97,6 +98,7 @@ def test_rubin_auto_persistence_and_capture(
 ):
     policy = {
         "native": None,
+        "prequantized": None,
         "auto-cold": MeasurementPolicy(cold_l2=True),
         "eager-hot": MeasurementPolicy(execution_mode="eager", cold_l2=False),
         "eager-cold": MeasurementPolicy(execution_mode="eager", cold_l2=True),
@@ -104,6 +106,7 @@ def test_rubin_auto_persistence_and_capture(
         "graph-cold": MeasurementPolicy(execution_mode="cuda_graph", cold_l2=True),
         "graph-cupti": MeasurementPolicy(execution_mode="cuda_graph", _timer="cupti"),
     }[policy_name]
+    prequantized = policy_name == "prequantized"
     hidden, intermediate, experts, tokens, capacity = geometry
     for name, value in zip(
         ("HIDDEN", "INTERMEDIATE", "NUM_EXPERTS", "NUM_TOKENS", "MAX_TOKENS"),
@@ -134,12 +137,24 @@ def test_rubin_auto_persistence_and_capture(
             max_tokens_per_rank=capacity,
             token_hidden_size=hidden,
         )
-        layer = MoEEpMegaLayer(bootstrap, fleet, local_pack, MegaConfig(megakernel=cfg))
+        layer = MoEEpMegaLayer(
+            bootstrap,
+            fleet,
+            local_pack,
+            MegaConfig(megakernel=cfg, quantize_input=not prequantized),
+        )
         layers.append(layer)
         live = tokens - rank
         tensors = MoEEpTensors(
             x[rank, :live].clone(), ids[rank, :live], scores[rank, :live]
         )
+        if prequantized:
+            tensors.hidden_states, tensors.scales = quantize(
+                tensors.hidden_states, kind
+            )
+            tensors.output = torch.empty(
+                live, hidden * 2, device="cuda", dtype=torch.bfloat16
+            )[:, ::2]
         candidates = sm107_candidates(kind, kernel_variant=variant)
         if ikr:
             candidates = [{**c, "reduce_topk_in_kernel": True} for c in candidates]
@@ -155,6 +170,7 @@ def test_rubin_auto_persistence_and_capture(
         sweep = native._sweep_sm107_block_scaled_mega_moe
 
         def counted_sweep(*args, **kwargs):
+            assert kwargs["make_trial"] is not None
             calls.append(True)
             return sweep(*args, **kwargs)
 
@@ -201,7 +217,11 @@ def test_rubin_auto_persistence_and_capture(
         assert workspace.config.reduce_topk_in_kernel == ikr
 
         def reference():
-            xq, xsf = quantize(tensors.hidden_states, kind)
+            xq, xsf = (
+                (tensors.hidden_states, tensors.scales)
+                if prequantized
+                else quantize(tensors.hidden_states, kind)
+            )
             return canonical_reference(
                 xq, xsf, tensors.topk_ids, tensors.topk_weights, pack, kind
             )
@@ -226,6 +246,7 @@ def test_rubin_auto_persistence_and_capture(
             record = next(
                 iter(tuner.get_protocol_records(tuning_protocol.NAMESPACE).values())
             )
+            assert record["timing_boundary"] == "complete_forward"
             alternative = next(
                 c for c in candidates if c != layer._workspace._tuning_state.winner
             )
@@ -237,7 +258,11 @@ def test_rubin_auto_persistence_and_capture(
             bootstrap,
             fleet,
             local_pack,
-            MegaConfig(megakernel=cfg, transformed_weights=layer._transformed),
+            MegaConfig(
+                megakernel=cfg,
+                transformed_weights=layer._transformed,
+                quantize_input=not prequantized,
+            ),
         )
         layers.append(cached)
         with autotune(False):
@@ -257,7 +282,12 @@ def test_rubin_auto_persistence_and_capture(
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             output = cached.forward(tensors)
-        tensors.hidden_states.mul_(0.75)
+        if prequantized:
+            replacement, scales = quantize(x[rank, :live] * 0.75, kind)
+            tensors.hidden_states.copy_(replacement)
+            tensors.scales.copy_(scales)
+        else:
+            tensors.hidden_states.mul_(0.75)
         graph.replay()
         torch.cuda.synchronize()
         assert_reference(output, reference(), kind)
@@ -292,6 +322,7 @@ def test_rubin_auto_persistence_and_capture(
             MegaConfig(
                 megakernel=dataclasses.replace(cfg, knobs=cached.get_tuned_knobs()),
                 transformed_weights=layer._transformed,
+                quantize_input=not prequantized,
             ),
         )
         layers.append(fixed)

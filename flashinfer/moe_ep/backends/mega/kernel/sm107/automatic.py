@@ -115,6 +115,8 @@ def prepare_auto_configuration(
     """
     if backend._kernel_config.knobs != "auto":
         return
+    inputs = getattr(workspace, "_tuning_inputs", None)
+    workspace._tuning_inputs = None
     context = tuning_context()
     select = needs_selection(workspace, context)
     import torch
@@ -135,7 +137,6 @@ def prepare_auto_configuration(
         return
     from .....kernel_src.sm107.next_cutedsl_megamoe import (
         KNOB_KEYS,
-        autotune_sm107_block_scaled_mega_moe,
         sm107_candidates,
     )
 
@@ -149,8 +150,15 @@ def prepare_auto_configuration(
         allow_in_kernel_fc2_reduce=backend._kernel_config.in_kernel_fc2_reduce
         and cfg.combine_dtype == "bf16",
     )
-    winner = autotune_sm107_block_scaled_mega_moe(
-        output,
+    from .forward_tuning import ForwardExecution
+
+    if inputs is None:
+        raise RuntimeError("Stage inputs before automatic Rubin tuning")
+    tensors, quantize_input = inputs
+    execution = ForwardExecution(
+        backend, tensors, quantize_input=quantize_input, output=output
+    )
+    winner = execution.tune(
         weights[0],
         weights[1],
         workspace,
