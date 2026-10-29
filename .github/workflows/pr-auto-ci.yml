@@ -149,9 +149,10 @@ jobs:
           # check_suite_id, which keeps a same-named job from another
           # workflow from counting.
           #
-          # Gate delay: for ~10-20s after a run-ci label is applied, that
-          # run's gate is still running and Setup does not exist yet, so the
-          # run would look like a no-op. Waiting 30s before querying lets any
+          # Gate delay: for ~6-7s after a run-ci label is applied (measured on
+          # recent runs, almost all of it runner queue time), that run's gate
+          # is still running and Setup does not exist yet, so the run would
+          # look like a no-op. Waiting 15s before querying lets any
           # run labeled just before this one (e.g. a manual
           # `@flashinfer-bot run`) create its Setup check run first. A label
           # applied after the query can still restart a run through pr-test's
@@ -165,8 +166,8 @@ jobs:
           set -o pipefail
           REPO="${{ github.repository }}"
 
-          echo "Waiting 30s for any just-labeled pr-test run to pass its gate"
-          sleep 30
+          echo "Waiting 15s for any just-labeled pr-test run to pass its gate"
+          sleep 15
 
           RUNS=$(gh api --paginate -X GET \
             "/repos/${REPO}/actions/workflows/pr-test.yml/runs" \
