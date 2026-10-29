@@ -67,7 +67,9 @@ are read anonymously over HTTPS.
   Nothing is uploaded when the job built nothing new (a content hash of the
   artifacts taken after the restore), or when the restore failed: a writer that
   started cold by accident would otherwise replace the lane's tarball with only
-  its own builds.
+  its own builds. Only a 404 counts as a missing tarball, since S3 also answers
+  403 for a denied read, so the bucket policy must grant anonymous
+  `s3:ListBucket` on `compile-cache/` for the first upload of each lane.
 - A tarball over `CI_COMPILE_CACHE_S3_MAX_MB` (default 4096) is cut down to the
   files the job compiled. That bounds growth, since kernels of earlier FlashInfer
   versions otherwise stay until the image changes, but it also drops kernels the

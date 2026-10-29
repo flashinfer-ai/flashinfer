@@ -27,8 +27,12 @@ META = {"arch": "sm_90a", "cute_dsl_version": "4.7.0", "source_sha256": "a" * 64
 
 class _Bucket(http.server.SimpleHTTPRequestHandler):
     not_modified = 0
+    denied = False
 
     def do_GET(self):
+        if type(self).denied:
+            self.send_error(403)
+            return
         path = Path(self.directory) / self.path.lstrip("/")
         if not path.is_file():
             self.send_error(404)
@@ -77,6 +81,7 @@ class S3LayerTestBase(unittest.TestCase):
         self.bucket = self.root / "bucket"
         self.bucket.mkdir()
         _Bucket.not_modified = 0
+        _Bucket.denied = False
         bucket = str(self.bucket)
         server = http.server.ThreadingHTTPServer(
             ("127.0.0.1", 0),
@@ -192,6 +197,21 @@ class CompileCacheS3ScriptTest(S3LayerTestBase):
         published = self.tarball().read_bytes()
         writer = self.root / "writer"
         out = self.s3("restore", "http://127.0.0.1:9", IMAGE, LANE, writer)
+        self.assertIn("will not upload", out)
+        cute_module(writer, "norm", ["k1"])
+        self.assertIn("did not complete", self.upload(writer))
+        self.assertEqual(self.tarball().read_bytes(), published)
+
+    def test_denied_restore_blocks_upload(self):
+        # S3 answers 403 for a denied read of an existing tarball, so only a
+        # 404 lets a cold writer publish the lane's first tarball.
+        self.publish(lambda root: cute_module(root, "gemm", ["k1", "k2"]))
+        published = self.tarball().read_bytes()
+        writer = self.root / "writer"
+        _Bucket.denied = True
+        out = self.s3("restore", self.url, IMAGE, LANE, writer)
+        _Bucket.denied = False
+        self.assertIn("HTTP 403", out)
         self.assertIn("will not upload", out)
         cute_module(writer, "norm", ["k1"])
         self.assertIn("did not complete", self.upload(writer))

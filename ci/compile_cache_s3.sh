@@ -154,7 +154,10 @@ restore() {
                 find "${dest}" -mindepth 1 -delete
             fi
             ;;
-        403 | 404)
+        404)
+            # Only a 404 proves the tarball absent: S3 answers 403 both for a
+            # denied read of an existing object and, without s3:ListBucket, for
+            # a missing one, and uploading after either would replace the lane.
             echo "No shared compile cache at ${url}"
             manifest "${dest}" > "${dest}/${MANIFEST}"
             ;;
