@@ -195,16 +195,22 @@ def test_megamoe_surface_present_on_source_tree(report):
 
 
 @pytest.mark.cpu_only
-def test_megamoe_surface_absent_when_find_spec_misses(monkeypatch):
-    real_find_spec = importlib.util.find_spec
+def test_megamoe_surface_absent_when_nested_modules_missing(tmp_path, monkeypatch):
+    # Point the top-level flashinfer spec at an empty package so nested
+    # MegaMoE files are missing without importing the real parents.
+    pkg = tmp_path / "flashinfer"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    empty_spec = importlib.util.spec_from_file_location(
+        "flashinfer",
+        pkg / "__init__.py",
+        submodule_search_locations=[str(pkg)],
+    )
 
     def fake_find_spec(name, package=None):
-        if name in (
-            "flashinfer.megamoe",
-            "flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_pull_cutedsl.config",
-        ):
-            return None
-        return real_find_spec(name, package)
+        if name == "flashinfer":
+            return empty_spec
+        return None
 
     monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
     info = collect_env._get_megamoe_surface_info()
@@ -212,3 +218,36 @@ def test_megamoe_surface_absent_when_find_spec_misses(monkeypatch):
         "flashinfer.megamoe": "absent",
         "moe_ep SM90 NVFP4 MegaMoE config": "absent",
     }
+
+
+@pytest.mark.cpu_only
+def test_module_present_does_not_import_parents(tmp_path, monkeypatch):
+    # Nested find_spec would execute parent package code; the probe must not.
+    pkg = tmp_path / "fi_collect_env_probe"
+    child = pkg / "child"
+    child.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("raise RuntimeError('parent imported')\n")
+    (child / "__init__.py").write_text("raise RuntimeError('child imported')\n")
+    (child / "config.py").write_text("raise RuntimeError('config imported')\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    for name in (
+        "fi_collect_env_probe",
+        "fi_collect_env_probe.child",
+        "fi_collect_env_probe.child.config",
+    ):
+        sys.modules.pop(name, None)
+
+    seen = []
+    real_find_spec = importlib.util.find_spec
+
+    def wrapped_find_spec(name, package=None):
+        seen.append(name)
+        return real_find_spec(name, package)
+
+    monkeypatch.setattr(importlib.util, "find_spec", wrapped_find_spec)
+
+    assert collect_env._module_present("fi_collect_env_probe.child.config") == "present"
+    assert collect_env._module_present("fi_collect_env_probe.child.missing") == "absent"
+    assert collect_env._module_present("fi_collect_env_probe.nope.config") == "absent"
+    assert seen == ["fi_collect_env_probe"] * 3
+    assert "fi_collect_env_probe" not in sys.modules

@@ -37,6 +37,7 @@ Design constraints (please preserve when editing):
 
 import argparse
 import glob
+import importlib.machinery
 import importlib.util
 import json
 import os
@@ -301,11 +302,22 @@ def _get_kernel_package_info():
     return info
 
 
-
 def _module_present(name):
-    """Return 'present'/'absent' via find_spec; never imports the module."""
+    """Return 'present'/'absent' without importing the module or its parents.
+
+    ``importlib.util.find_spec`` on a dotted name imports every parent. Walk
+    ``PathFinder`` specs from the top-level package's search locations instead.
+    """
     try:
-        return "present" if importlib.util.find_spec(name) is not None else "absent"
+        parts = name.split(".")
+        spec = importlib.util.find_spec(parts[0])
+        for depth in range(1, len(parts)):
+            if spec is None or not spec.submodule_search_locations:
+                return "absent"
+            spec = importlib.machinery.PathFinder.find_spec(
+                ".".join(parts[: depth + 1]), spec.submodule_search_locations
+            )
+        return "present" if spec is not None else "absent"
     except Exception as e:
         return f"<probe failed: {type(e).__name__}: {e}>"
 
