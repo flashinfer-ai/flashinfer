@@ -254,16 +254,31 @@ def test_registered_outputs_with_one_unaligned_rank(world_size):
     multi_process_parallel(world_size, _unaligned_rank_worker, ())
 
 
-# ---- the zone of the world-8 bf16 direct gather (eight GPUs) ------------------------
+# ---- the zone of the world-8 bf16 direct scatter and gather (eight GPUs) ------------
 #
-# The world-8 bf16 gather program of the direct route lets a stream whose
-# destination has not entered the launch yet store its first 16-byte units into
-# a zone at the tail of the destination's signal allocation; the destination
-# copies them into ``out`` before its launch ends. No other program writes the
-# zone. The checks read this rank's u32 signal words: EPOCHS + c (the epoch of
-# CTA c's last launch), ZR + c (the epoch of the last launch whose incoming
-# stream c used the zone) and the zone's units, unit
-# ((c * 2 + epoch % 2) * ZONE_SLOTS + slot) * 480 + lane from word ZONE_DATA.
+# The world-8 bf16 scatter and gather programs of the direct route (the zone
+# programs) let a stream whose destination has not entered the launch yet
+# store its first 16-byte units into a zone at the tail of the destination's
+# signal allocation; the destination copies them into ``out`` before its
+# launch ends. No other program writes the zone. CTA c serves the same
+# destination in both programs and both advance the same per-CTA epoch, so
+# the two share one communicator's zone. The checks read this rank's u32
+# signal words: EPOCHS + c (the epoch of CTA c's last launch), ZR + c (the
+# epoch of the last launch whose incoming stream c used the zone) and the
+# zone's units, unit ((c * 2 + epoch % 2) * ZONE_SLOTS + slot) * 480 + lane
+# from word ZONE_DATA.
+
+# (dtype, world size, collective) of every direct program that uses the zone
+_ZONE_PROGRAMS = frozenset({("bf16", 8, "scatter"), ("bf16", 8, "gather")})
+_MODE = {"scatter": 0, "gather": 1}  # the record's mode of each collective
+_OPERAND = {"scatter": 0, "gather": 3}  # its source and output in a case
+_PARTNER = {"scatter": "gather", "gather": "scatter"}
+
+
+def _zone_program(dtype, world_size, op):
+    """Whether the direct ``op`` program of this dtype and world size has the zone."""
+    return (backend.dtype_name(dtype), world_size, op) in _ZONE_PROGRAMS
+
 
 _GRID = 148
 _EPOCHS = 324
@@ -280,11 +295,14 @@ _SKEW_CYCLES = 10_000_000
 # kernel on its stream reads (ld.acquire.sys) its own ENTRY64 word of the
 # destination of every CTA c until the word differs from LAST64[c], the token
 # CTA c recorded in its previous launch: u64 words 236 + t and 244 + c of the
-# world-8 direct programs, CTA c serving rank + offset + 1. The launch that
-# follows on the same stream reads those words after the poll, so each of its
-# streams finds its destination's token at its one read (route D with the
-# entry token already seen). The poll writes no signal word; a CTA that sees
-# no new token within _ENTRY_POLL_TIMEOUT_NS stops waiting and fails the trial.
+# world-8 direct programs, CTA c serving rank + offset + 1 (_zone_destination)
+# in the scatter and the gather program alike, which keep LAST64[c] for that
+# one destination, so the poll covers a following launch of either program.
+# The launch that follows on the same stream reads those words after the poll,
+# so each of its streams finds its destination's token at its one read (route
+# D with the entry token already seen). The poll writes no signal word; a CTA
+# that sees no new token within _ENTRY_POLL_TIMEOUT_NS stops waiting and fails
+# the trial.
 _ENTRY64 = 236
 _LAST64 = 244
 _ENTRY_POLL_TIMEOUT_NS = 120_000_000_000
@@ -343,12 +361,15 @@ void entry_poll(torch::Tensor words, torch::Tensor dest, torch::Tensor status,
 """
 # (B, S_local, H, D) at world 8: one 16-byte unit a row for H = 8, D = 8, so
 # the stream sizes sit on the zone slot (480 units) and chunk (7680 units)
-# boundaries, up to every CTA of a destination holding a stripe (21 / 22); the
-# last two rows are not whole 16-byte units and take the elements path
+# boundaries, up to every CTA of a destination holding a stripe (21 / 22);
+# rows with B > 1 put batch boundaries inside a zone slot (the scatter's
+# output places each batch apart); the last two rows are not whole 16-byte
+# units and take the elements path
 _ZONE_ROWS = [
     (1, 1, 8, 8),
     (1, 5, 8, 8),
     (3, 1, 8, 8),
+    (7, 3, 8, 8),
     (1, 479, 8, 8),
     (1, 480, 8, 8),
     (1, 481, 8, 8),
@@ -386,8 +407,9 @@ def _zone_shape(row, dtype="bfloat16"):
 
 
 def _stream_units(shape):
-    """16-byte units of one stream of the zone program (bf16) on the vector
-    path; 0 for another dtype or when rows are not whole units."""
+    """16-byte units of one stream of a zone program (bf16, scatter or gather
+    alike) on the vector path; 0 for another dtype or when rows are not whole
+    units."""
     row = shape["H"] // shape["world_size"] * shape["D"]
     if shape["dtype"] != "bfloat16" or row % 8:
         return 0
@@ -404,6 +426,11 @@ def _zone_stream(cta):
 def _zone_source(receiver, cta):
     """The rank whose CTA ``cta`` streams into ``receiver``."""
     return (receiver + 7 - _zone_stream(cta)[0]) % 8
+
+
+def _zone_destination(rank, cta):
+    """The rank CTA ``cta`` of ``rank`` streams into, in either collective."""
+    return (rank + _zone_stream(cta)[0] + 1) % 8
 
 
 _entry_poll_module = None
@@ -427,7 +454,8 @@ def _entry_poll_extension():
 
 
 class _EntryPoll:
-    """The late rank's entry poll on a world-8 Cake communicator."""
+    """The late rank's entry poll on a world-8 Cake communicator, before a
+    launch of its scatter or its gather."""
 
     def __init__(self, case):
         communicator = case.communicator
@@ -435,7 +463,7 @@ class _EntryPoll:
         rank = communicator.rank
         self.words = communicator._cake.signals_self.view(torch.int32)
         self.dest = torch.tensor(
-            [(rank + _zone_stream(c)[0] + 1) % 8 for c in range(_GRID)],
+            [_zone_destination(rank, c) for c in range(_GRID)],
             dtype=torch.int32,
             device="cuda",
         )
@@ -522,7 +550,7 @@ def _zone_audit(
     """Epoch and zone audit of this rank over ``launches`` direct launches.
 
     Every CTA advanced its epoch by ``launches``. A ZR word that changed holds
-    an epoch of these launches, under the zone program only, and never for a
+    an epoch of these launches, under a zone program only, and never for a
     stream from one of ``direct_sources`` (an unaligned rank, or a late rank
     whose destinations had all entered: it sends straight into ``out`` after
     the barrier that follows its read of the entry token). With ``poisoned``
@@ -567,15 +595,16 @@ def _zone_audit(
 
 
 def _check_zone_tail(case):
-    """No program but the world-8 bf16 gather writes the zone: on every other
-    Cake communicator its words stay zero, and on that one every ZR word holds
-    0 or an epoch its CTA has completed."""
+    """No program but the zone programs writes the zone: on a Cake
+    communicator that runs none of them its words stay zero, and on one that
+    does every ZR word holds 0 or an epoch its CTA has completed."""
     communicator = case.communicator
     if communicator._cake is None:
         return
     probe = _ZoneProbe(case)
     errors = []
-    if communicator.world_size == 8 and case.inputs[0].dtype == torch.bfloat16:
+    dtype, world_size = case.inputs[0].dtype, communicator.world_size
+    if any(_zone_program(dtype, world_size, op) for op in _MODE):
         epochs, tags, _ = probe.read()
         errors += [
             f"ZR + {c} = {tags[c]} beyond epoch {epochs[c]}"
@@ -605,6 +634,44 @@ def _expected(case, index, source=None):
     )
 
 
+def _launch(case, op):
+    """``op`` on the case's operand of that collective, into its output."""
+    index = _OPERAND[op]
+    source, out = case.inputs[index], case.outputs[index]
+    if op == "gather":
+        case.communicator.gather_heads(source, out=out)
+    else:
+        case.communicator.scatter_heads(source, out=out)
+
+
+def _launch_audit(rows, *, rank, direct_sources=()):
+    """Epoch and zone audit of each launch of a back-to-back sequence.
+
+    ``rows[k]`` and ``rows[k + 1]`` hold this rank's (EPOCHS, ZR) words before
+    and after launch k: every CTA advanced its epoch by one, and a ZR word
+    kept its value or took the launch's epoch, never for a stream from one of
+    ``direct_sources``. Returns the errors and, per launch, the number of
+    streams that used the zone.
+    """
+    errors, routed = [], []
+    for k in range(len(rows) - 1):
+        epochs0, tags0 = ([word & 0xFFFFFFFF for word in row] for row in rows[k])
+        epochs1, tags1 = ([word & 0xFFFFFFFF for word in row] for row in rows[k + 1])
+        stale = [c for c in range(_GRID) if epochs1[c] != epochs0[c] + 1]
+        if stale:
+            c = stale[0]
+            errors.append(f"launch {k}: CTA {c} epoch {epochs0[c]} -> {epochs1[c]}")
+        changed = [c for c in range(_GRID) if tags1[c] != tags0[c]]
+        for c in changed:
+            source = _zone_source(rank, c)
+            if tags1[c] != epochs1[c]:
+                errors.append(f"launch {k}: ZR + {c} = {tags1[c]}, epoch {epochs1[c]}")
+            if source in direct_sources:
+                errors.append(f"launch {k}: ZR + {c} changed for rank {source}")
+        routed.append(len(changed))
+    return errors, routed
+
+
 def _zone_trial(case, probe, op, late, step, units, unaligned=()):
     """One direct collective with rank ``late`` entering late (``None``: no delay).
 
@@ -614,12 +681,13 @@ def _zone_trial(case, probe, op, late, step, units, unaligned=()):
     destination entered (route D with the entry token already seen) and none
     of them uses the zone. The output is checked
     bit-exact by a copy stream-ordered after this rank's launch (kernel_end)
-    and after a barrier (post_barrier); the epoch and zone audits follow.
-    Returns every rank's count of streams that used the zone.
+    and after a barrier (post_barrier); the epoch and zone audits follow, the
+    zone allowed only to a zone program. Returns every rank's count of
+    streams that used the zone.
     """
     communicator = case.communicator
     rank = communicator.rank
-    index = 3 if op == "gather" else 0
+    index = _OPERAND[op]
     source, out = case.inputs[index], case.outputs[index]
     _refresh(case, step)
     probe.poison()
@@ -631,10 +699,7 @@ def _zone_trial(case, probe, op, late, step, units, unaligned=()):
             poll.enqueue()
         torch.cuda._sleep(_SKEW_CYCLES)
         out.fill_(float("nan"))
-    if op == "gather":
-        communicator.gather_heads(source, out=out)
-    else:
-        communicator.scatter_heads(source, out=out)
+    _launch(case, op)
     at_end = out.clone()
     torch.cuda.synchronize()
     dist.barrier()
@@ -651,7 +716,7 @@ def _zone_trial(case, probe, op, late, step, units, unaligned=()):
         rank=rank,
         launches=1,
         units=units,
-        adopted=op == "gather" and source.dtype == torch.bfloat16,
+        adopted=_zone_program(source.dtype, communicator.world_size, op),
         poisoned=True,
         direct_sources=tuple(unaligned)
         + ((late,) if late is not None and late != rank else ()),
@@ -669,7 +734,7 @@ def _require_zone_route(counts, late, what):
     )
 
 
-def _zone_worker(world_size, rank, port):
+def _zone_worker(world_size, rank, port, op, other_dtypes):
     torch.cuda.set_device(rank)
     dist.init_process_group(
         "nccl",
@@ -678,6 +743,7 @@ def _zone_worker(world_size, rank, port):
         world_size=world_size,
     )
     try:
+        partner = _PARTNER[op]
         step = 0
         for index, row in enumerate(_ZONE_ROWS):
             shape = _zone_shape(row)
@@ -695,30 +761,35 @@ def _zone_worker(world_size, rank, port):
                 )
                 late = index % world_size
                 plan = [
-                    ("gather", late),
-                    ("gather", None),
-                    ("scatter", late),
-                    ("gather", (late + 3) % world_size),
-                    ("gather", late),
-                    ("gather", late),
-                    ("gather", late),
-                    ("scatter", None),
+                    (op, late),
+                    (op, None),
+                    (partner, late),
+                    (op, (late + 3) % world_size),
+                    (op, late),
+                    (op, late),
+                    (op, late),
+                    (partner, None),
                 ]
                 if row == (1, 7681, 8, 8):
                     plan += [
-                        (op, other)
+                        (trial_op, other)
                         for other in range(world_size)
-                        for op in ("gather", "scatter")
+                        for trial_op in (op, partner)
                     ]
-                for op, late_rank in plan:
+                for trial_op, late_rank in plan:
                     step += 1
-                    counts = _zone_trial(case, probe, op, late_rank, step, units)
-                    if op == "gather" and late_rank is not None and units:
-                        _require_zone_route(counts, late_rank, f"{row} step {step}")
+                    counts = _zone_trial(case, probe, trial_op, late_rank, step, units)
+                    zoned = _zone_program(torch.bfloat16, world_size, trial_op)
+                    if zoned and late_rank is not None and units:
+                        _require_zone_route(
+                            counts, late_rank, f"{row} {trial_op} step {step}"
+                        )
                     if not units:
                         assert not any(counts), f"elements path used the zone {counts}"
             finally:
                 case.close()
+        if not other_dtypes:
+            return
         # the f16 and f32 programs, late rank or not, never use the zone
         for dtype in ("float16", "float32"):
             for index, row in enumerate(((1, 7681, 8, 8), (1, 4095, 40, 128))):
@@ -735,9 +806,9 @@ def _zone_worker(world_size, rank, port):
                         f"{dtype} {row} init",
                     )
                     for late in (None, index, index + 4):
-                        for op in ("gather", "scatter"):
+                        for trial_op in ("gather", "scatter"):
                             step += 1
-                            counts = _zone_trial(case, probe, op, late, step, 0)
+                            counts = _zone_trial(case, probe, trial_op, late, step, 0)
                             assert not any(counts), f"{dtype} used the zone {counts}"
                 finally:
                     case.close()
@@ -745,7 +816,7 @@ def _zone_worker(world_size, rank, port):
         dist.destroy_process_group()
 
 
-def _zone_graph_worker(world_size, rank, port):
+def _zone_graph_worker(world_size, rank, port, op):
     torch.cuda.set_device(rank)
     dist.init_process_group(
         "nccl",
@@ -754,6 +825,7 @@ def _zone_graph_worker(world_size, rank, port):
         world_size=world_size,
     )
     try:
+        partner = _PARTNER[op]
         step = 1000
         for row in ((1, 7681, 8, 8), (1, 4095, 40, 128)):
             shape = _zone_shape(row)
@@ -765,7 +837,9 @@ def _zone_graph_worker(world_size, rank, port):
             try:
                 probe = _ZoneProbe(case)
                 late, launches, replays = 5, 4, 3
-                query, attention = case.inputs[0], case.inputs[3]
+                source, out = case.inputs[_OPERAND[op]], case.outputs[_OPERAND[op]]
+                partner_source = case.inputs[_OPERAND[partner]]
+                partner_out = case.outputs[_OPERAND[partner]]
                 generator = torch.Generator(device="cuda").manual_seed(4099 + rank)
 
                 def stash(like):
@@ -779,25 +853,32 @@ def _zone_graph_worker(world_size, rank, port):
                         for _ in range(launches)
                     ]
 
-                gathers, scatters = stash(attention), stash(query)
+                sources, partner_sources = stash(source), stash(partner_source)
                 poll = probe.entry_poll() if rank == late else None
-                gathered = [torch.empty_like(case.outputs[3]) for _ in range(launches)]
-                scattered = [torch.empty_like(case.outputs[0]) for _ in range(launches)]
+                results = [torch.empty_like(out) for _ in range(launches)]
+                partner_results = [
+                    torch.empty_like(partner_out) for _ in range(launches)
+                ]
 
                 def body(mixed):
                     # distinct inputs a launch: a stale zone parity read differs
                     for i in range(launches):
                         if mixed:
-                            query.copy_(scatters[i])
-                            communicator.scatter_heads(query, out=case.outputs[0])
-                            scattered[i].copy_(case.outputs[0])
-                        attention.copy_(gathers[i])
+                            partner_source.copy_(partner_sources[i])
+                            if rank == late:
+                                # no delay: its peers' streams into it may
+                                # still use the zone, its own find every
+                                # destination entered
+                                poll.enqueue()
+                            _launch(case, partner)
+                            partner_results[i].copy_(partner_out)
+                        source.copy_(sources[i])
                         if rank == late:
                             poll.enqueue()
                             torch.cuda._sleep(_SKEW_CYCLES)
-                            case.outputs[3].fill_(float("nan"))
-                        communicator.gather_heads(attention, out=case.outputs[3])
-                        gathered[i].copy_(case.outputs[3])
+                            out.fill_(float("nan"))
+                        _launch(case, op)
+                        results[i].copy_(out)
 
                 for mixed in (False, True):
                     stream = torch.cuda.Stream()
@@ -819,12 +900,14 @@ def _zone_graph_worker(world_size, rank, port):
                     after = probe.read()
                     errors = [] if poll is None else poll.errors()
                     for i in range(launches):
-                        if not torch.equal(gathered[i], _expected(case, 3, gathers[i])):
-                            errors.append(f"replayed gather {i} mismatch")
+                        expected = _expected(case, _OPERAND[op], sources[i])
+                        if not torch.equal(results[i], expected):
+                            errors.append(f"replayed {op} {i} mismatch")
                         if mixed and not torch.equal(
-                            scattered[i], _expected(case, 0, scatters[i])
+                            partner_results[i],
+                            _expected(case, _OPERAND[partner], partner_sources[i]),
                         ):
-                            errors.append(f"replayed scatter {i} mismatch")
+                            errors.append(f"replayed {partner} {i} mismatch")
                     found, routed = _zone_audit(
                         before,
                         after,
@@ -844,8 +927,8 @@ def _zone_graph_worker(world_size, rank, port):
                     torch.cuda.synchronize()
                     dist.barrier()
                 # the staged route (caller-owned outputs) alternates with the
-                # direct gather on the same signal allocation and leaves the
-                # epochs, ZR words and zone alone
+                # direct collective on the same signal allocation and leaves
+                # the epochs, ZR words and zone alone
                 staged = PreparedCase(
                     communicator,
                     case.inputs,
@@ -872,8 +955,8 @@ def _zone_graph_worker(world_size, rank, port):
                     )
                     _raise_if_any(found, f"{row} staged step {step}")
                     step += 1
-                    counts = _zone_trial(case, probe, "gather", late, step, units)
-                    _require_zone_route(counts, late, f"{row} after staged")
+                    counts = _zone_trial(case, probe, op, late, step, units)
+                    _require_zone_route(counts, late, f"{row} {op} after staged")
                 _check_zone_tail(case)
             finally:
                 case.close()
@@ -881,7 +964,7 @@ def _zone_graph_worker(world_size, rank, port):
         dist.destroy_process_group()
 
 
-def _zone_unaligned_worker(world_size, rank, port):
+def _zone_unaligned_worker(world_size, rank, port, op):
     torch.cuda.set_device(rank)
     dist.init_process_group(
         "nccl",
@@ -916,28 +999,216 @@ def _zone_unaligned_worker(world_size, rank, port):
                 # late = its successor: the unaligned rank's stream into it
                 # takes the elements path and never the zone
                 for late in (unaligned, (unaligned + 1) % world_size):
-                    for _ in range(3):
+                    for trial_op in (op, op, op, _PARTNER[op]):
                         step += 1
                         counts = _zone_trial(
                             case,
                             probe,
-                            "gather",
+                            trial_op,
                             late,
                             step,
                             units,
                             unaligned=(unaligned,),
                         )
-                        _require_zone_route(counts, late, f"{row} unaligned")
+                        if _zone_program(torch.bfloat16, world_size, trial_op):
+                            _require_zone_route(
+                                counts, late, f"{row} unaligned {trial_op}"
+                            )
+            finally:
+                case.close()
+    finally:
+        dist.destroy_process_group()
+
+
+# Scatters and gathers back to back on one communicator, with every transition
+# between the two collectives: scatter -> gather, gather -> gather,
+# gather -> scatter and scatter -> scatter.
+_SHARED_OPS = (
+    "scatter",
+    "gather",
+    "gather",
+    "scatter",
+    "scatter",
+    "gather",
+    "scatter",
+    "gather",
+)
+_SHARED_ROWS = ((1, 7681, 8, 8), (2, 16, 24, 64), (1, 4095, 40, 128))
+
+
+def _zone_shared(case, probe, late, step, units, graph):
+    """``_SHARED_OPS`` back to back on one communicator: run once (eager), or
+    captured in a CUDA graph and replayed back to back (``graph``).
+
+    Each launch takes distinct inputs, so a stale zone parity read differs.
+    Before each of its launches the late rank polls, waits and refills that
+    output: in every launch its peers' streams into it may use the zone, and
+    its own streams find every destination entered. Each launch's output and
+    this rank's EPOCHS and ZR words are copied stream-ordered after it. The
+    outputs are checked bit-exact, each launch is audited
+    (:func:`_launch_audit`), and so is the whole run (:func:`_zone_audit`).
+    Each zone program must use the zone into the late rank (VOID otherwise).
+    """
+    communicator = case.communicator
+    rank, world_size = communicator.rank, communicator.world_size
+    launches, replays = len(_SHARED_OPS), 3
+    generator = torch.Generator(device="cuda").manual_seed(6151 * step + rank)
+    sources = [
+        torch.randn(
+            case.inputs[_OPERAND[op]].shape,
+            dtype=case.inputs[_OPERAND[op]].dtype,
+            device="cuda",
+            generator=generator,
+        )
+        for op in _SHARED_OPS
+    ]
+    results = [torch.empty_like(case.outputs[_OPERAND[op]]) for op in _SHARED_OPS]
+    # this rank's (EPOCHS, ZR) words before the first launch and after each
+    words = torch.zeros(launches + 1, 2, _GRID, dtype=torch.int32, device="cuda")
+    poll = probe.entry_poll() if rank == late else None
+
+    def record(k):
+        words[k, 0].copy_(probe.words[_EPOCHS : _EPOCHS + _GRID])
+        words[k, 1].copy_(probe.words[_ZONE_WORD : _ZONE_WORD + _GRID])
+
+    def body():
+        record(0)
+        for k, op in enumerate(_SHARED_OPS):
+            index = _OPERAND[op]
+            case.inputs[index].copy_(sources[k])
+            if poll is not None:
+                poll.enqueue()
+                torch.cuda._sleep(_SKEW_CYCLES)
+                case.outputs[index].fill_(float("nan"))
+            _launch(case, op)
+            results[k].copy_(case.outputs[index])
+            record(k + 1)
+
+    captured = None
+    if graph:
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            body()
+        torch.cuda.current_stream().wait_stream(stream)
+        torch.cuda.synchronize()
+        dist.barrier()
+        captured = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(captured):
+            body()
+    before = probe.read()
+    dist.barrier()
+    if captured is None:
+        body()
+    else:
+        for _ in range(replays):
+            captured.replay()  # back to back, nothing between replays
+    torch.cuda.synchronize()
+    dist.barrier()
+    after = probe.read()
+    direct_sources = (late,) if rank != late else ()
+    errors = [] if poll is None else poll.errors()
+    for k, op in enumerate(_SHARED_OPS):
+        if not torch.equal(results[k], _expected(case, _OPERAND[op], sources[k])):
+            errors.append(f"{op} {k} mismatch")
+    found, routed = _launch_audit(
+        words.tolist(), rank=rank, direct_sources=direct_sources
+    )
+    errors += found
+    found, _ = _zone_audit(
+        before,
+        after,
+        rank=rank,
+        launches=launches * (1 if captured is None else replays),
+        units=units,
+        adopted=True,
+        poisoned=False,
+        direct_sources=direct_sources,
+    )
+    errors += found
+    by_op = {
+        op: sum(n for n, o in zip(routed, _SHARED_OPS, strict=True) if o == op)
+        for op in _MODE
+    }
+    counts = [None] * world_size
+    dist.all_gather_object(counts, by_op)
+    what = f"{case.inputs[0].shape} {'graph' if graph else 'eager'} step {step}"
+    _raise_if_any(errors, what)
+    dtype = case.inputs[0].dtype
+    for op in _MODE:
+        if _zone_program(dtype, world_size, op):
+            _require_zone_route([count[op] for count in counts], late, f"{what} {op}")
+    if captured is not None:
+        del captured
+        torch.cuda.synchronize()
+        dist.barrier()
+
+
+def _zone_sharing_worker(world_size, rank, port):
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "nccl",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        step = 3000
+        # each sequence on its own communicator; the last one only opens one
+        sequences = [(row, graph) for row in _SHARED_ROWS for graph in (False, True)]
+        sequences.append((_SHARED_ROWS[0], None))
+        for index, (row, graph) in enumerate(sequences):
+            shape = _zone_shape(row)
+            units = _stream_units(shape)
+            late = (3 * index + 2) % world_size
+            case = prepare(
+                shape, backend="nvlink", nvlink_kernel="cake", registered=True
+            )
+            try:
+                probe = _ZoneProbe(case)
+                # the first launch on a fresh zone after each sequence: the
+                # new communicator's zone is zero, and its first launch (the
+                # scatter and the gather in turn) takes the zone
+                _raise_if_any(
+                    [] if probe.tail_is_zero() else ["zone words not zero"],
+                    f"{row} fresh zone",
+                )
+                first = ("scatter", "gather")[index % 2]
+                second = _PARTNER[first]
+                step += 1
+                counts = _zone_trial(case, probe, first, late, step, units)
+                _require_zone_route(counts, late, f"{row} first {first}, fresh zone")
+                if graph is None:
+                    _check_zone_tail(case)
+                    continue
+                if not graph:
+                    # the two alternate with a barrier between launches, the
+                    # zone poisoned before each and audited per program
+                    other = (late + 4) % world_size
+                    plan = [
+                        (second, late),
+                        (first, late),
+                        (first, other),
+                        (second, other),
+                        (second, late),
+                        (first, None),
+                        (second, None),
+                    ]
+                    for op, late_rank in plan:
+                        step += 1
+                        counts = _zone_trial(case, probe, op, late_rank, step, units)
+                        if late_rank is not None:
+                            _require_zone_route(
+                                counts, late_rank, f"{row} {op} step {step}"
+                            )
+                step += 1
+                _zone_shared(case, probe, late, step, units, graph)
+                # each program again on the zone the sequence left
+                for op in (first, second):
                     step += 1
-                    _zone_trial(
-                        case,
-                        probe,
-                        "scatter",
-                        late,
-                        step,
-                        units,
-                        unaligned=(unaligned,),
-                    )
+                    counts = _zone_trial(case, probe, op, late, step, units)
+                    _require_zone_route(counts, late, f"{row} {op} after the sequence")
+                _check_zone_tail(case)
             finally:
                 case.close()
     finally:
@@ -954,28 +1225,66 @@ def _skip_without_zone_route():
 
 
 def test_direct_gather_zone_world8():
-    """The world-8 bf16 direct gather and scatter, plain and with one rank
-    entering late (entry probe, kernel_end, post_barrier), on stream sizes at
-    the zone slot and chunk boundaries and on stripe-less CTAs: bit-exact, the
-    epoch and zone audits hold, a late rank's incoming streams use the zone
-    (none doing so is VOID), and each new communicator starts on a zeroed zone;
-    the f16 and f32 programs, checked alike, never write the zone."""
+    """The world-8 bf16 direct gather, with scatters between, plain and with
+    one rank entering late (entry probe, kernel_end, post_barrier), on stream
+    sizes at the zone slot and chunk boundaries and on stripe-less CTAs:
+    bit-exact, the epoch and zone audits hold, a late rank's incoming streams
+    use the zone in either collective (none doing so is VOID), and each new
+    communicator starts on a zeroed zone; the f16 and f32 programs, checked
+    alike in both collectives, never write the zone."""
     _skip_without_zone_route()
-    multi_process_parallel(8, _zone_worker, ())
+    multi_process_parallel(8, _zone_worker, ("gather", True))
 
 
 def test_direct_gather_zone_graph_replays_world8():
     """Back-to-back CUDA graph replays of gathers with a late rank, alone and
     mixed with scatters, then the staged route alternating with the gather."""
     _skip_without_zone_route()
-    multi_process_parallel(8, _zone_graph_worker, ())
+    multi_process_parallel(8, _zone_graph_worker, ("gather",))
 
 
 def test_direct_gather_zone_with_one_unaligned_rank_world8():
     """One rank's inputs unaligned, as the late receiver and as a source into
     the late rank: bit-exact, and its own streams never use the zone."""
     _skip_without_zone_route()
-    multi_process_parallel(8, _zone_unaligned_worker, ())
+    multi_process_parallel(8, _zone_unaligned_worker, ("gather",))
+
+
+def test_direct_scatter_zone_world8():
+    """The world-8 bf16 direct scatter, with gathers between, checked as the
+    gather is: plain and with one rank entering late, on the same stream
+    sizes, which include several batches in one zone slot (each batch lands
+    apart in the scatter's output). The f16 and f32 programs are checked in
+    the gather test."""
+    _skip_without_zone_route()
+    multi_process_parallel(8, _zone_worker, ("scatter", False))
+
+
+def test_direct_scatter_zone_graph_replays_world8():
+    """Back-to-back CUDA graph replays of scatters with a late rank, alone and
+    mixed with gathers, then the staged route alternating with the scatter."""
+    _skip_without_zone_route()
+    multi_process_parallel(8, _zone_graph_worker, ("scatter",))
+
+
+def test_direct_scatter_zone_with_one_unaligned_rank_world8():
+    """One rank's inputs unaligned, as the late receiver of scatters and as a
+    source into the late rank: bit-exact, and its own streams never use the
+    zone."""
+    _skip_without_zone_route()
+    multi_process_parallel(8, _zone_unaligned_worker, ("scatter",))
+
+
+def test_direct_zone_shared_by_scatter_and_gather_world8():
+    """The world-8 bf16 scatter and gather share one communicator's zone:
+    they alternate with a barrier between launches (the zone poisoned before
+    each), back to back eagerly, and in back-to-back replays of one CUDA graph
+    holding both, with a late rank throughout; then each runs again on the
+    zone the sequence left, and after each sequence a new communicator's first
+    launch takes its fresh zone. Every launch is bit-exact and passes the
+    epoch and zone audits, and both programs use the zone into the late rank."""
+    _skip_without_zone_route()
+    multi_process_parallel(8, _zone_sharing_worker, ())
 
 
 # ---- the package route (CPU) -------------------------------------------------------
@@ -1145,6 +1454,31 @@ def test_peer_tables_and_signal_constants():
     assert _ZONE_DATA + _GRID * 2 * _ZONE_SLOTS * _ZONE_LANES * 4 == loader.SIGNAL_WORDS
     assert [_zone_stream(c)[0] for c in range(_GRID)].count(0) == 22
     assert {_zone_source(0, c) for c in range(_GRID)} == set(range(1, 8))
+    # CTA c of a source streams into the receiver whose incoming stream c it
+    # is, in the scatter and the gather alike: the late rank's entry poll waits
+    # on the destinations of its streams of either program
+    assert all(
+        _zone_destination(_zone_source(receiver, c), c) == receiver
+        for receiver in range(8)
+        for c in range(_GRID)
+    )
+    # the zone programs are direct programs of the portfolio, bf16 at world 8
+    for dtype, world_size, op in _ZONE_PROGRAMS:
+        assert dtype in loader.DTYPES and world_size in loader.WORLD_SIZES
+        assert _MODE[op] in loader.MODES
+    assert {op for _, _, op in _ZONE_PROGRAMS} == set(_MODE)
+    assert all(_zone_program(torch.bfloat16, 8, op) for op in _MODE)
+    assert not any(
+        _zone_program(dtype, world_size, op)
+        for dtype in (torch.bfloat16, torch.float16, torch.float32)
+        for world_size in (2, 4, 6)
+        for op in _MODE
+    )
+    assert not any(
+        _zone_program(dtype, 8, op)
+        for dtype in (torch.float16, torch.float32)
+        for op in _MODE
+    )
     assert backend.dtype_name(torch.bfloat16) == "bf16"
     assert backend.dtype_name(torch.float16) == "f16"
     assert backend.dtype_name(torch.float32) == "f32"
@@ -1241,19 +1575,25 @@ def test_registry_records_reference_the_build_manifest():
 
 
 def test_the_zone_program_pairs_with_the_signal_allocation():
-    """The world-8 bf16 direct gather program is the one program that uses the
-    zone: its kernel source stores zone units from word ZONE_DATA and ZR words
-    from ZONE_WORD, and no other kernel source does. The manifest delivers the
-    sources it was built from (digests checked for every entry), and the
-    package's signal allocation (SIGNAL_WORDS) ends at the zone's end. No record
-    launches with programmatic dependent launch or cooperatively, no kernel waits
-    on a grid dependency and every binding launches without launch attributes,
-    so consecutive launches on a stream never overlap."""
+    """The zone programs, the world-8 bf16 direct scatter and gather, are the
+    programs that use the zone: each one's kernel source stores zone units
+    from word ZONE_DATA and ZR words from ZONE_WORD, and no other kernel
+    source does. The manifest delivers the sources it was built from (digests
+    checked for every entry), and the package's signal allocation
+    (SIGNAL_WORDS) ends at the zone's end. No record launches with
+    programmatic dependent launch or cooperatively, no kernel waits on a grid
+    dependency and every binding launches without launch attributes, so
+    consecutive launches on a stream never overlap."""
     package = Path(cake_build.__file__).parent
     libraries = cake_build.libraries_by_name()
     if not libraries:
         pytest.skip("build.json delivers no library yet (the export run fills it)")
-    zone = loader.record_for("bf16", 8, 1, direct=True)
+    zones = {
+        loader.record_name(dtype, world_size, _MODE[op], direct=True)
+        for dtype, world_size, op in _ZONE_PROGRAMS
+    }
+    assert zones == {"direct_scatter_bf16_w8", "direct_gather_bf16_w8"}
+    assert zones <= set(loader.MODULES)
     marks = (
         f"peer_signals + ({_ZONE_DATA} + ",
         f"signals_self + ({_ZONE_DATA} + ",
@@ -1264,7 +1604,7 @@ def test_the_zone_program_pairs_with_the_signal_allocation():
         kernel = (package / "csrc" / f"{record['kernel']}_kernel.cu").read_text()
         binding = (package / "csrc" / f"{record['kernel']}_binding.cu").read_text()
         found = [mark for mark in marks if mark in kernel]
-        assert found == (list(marks) if record is zone else []), (name, found)
+        assert found == (list(marks) if name in zones else []), (name, found)
         assert "griddepcontrol" not in kernel, name
         assert "cudaLaunchKernelExC" in binding, name
         assert "attrs" not in binding and "numAttrs" not in binding, name
