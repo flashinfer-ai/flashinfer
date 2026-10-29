@@ -1083,14 +1083,15 @@ def test_serving_rows_match_the_fp32_reference(
             assert not _modules(one_task_per_cta.prepared) & work_bin_programs
             _assert_bitwise(one_task_per_cta.run(), routed_result, "one task per CTA")
         # Nor does the selection without work bins (where it takes the H12
-        # early-pack body, the binned launch takes the binned N32 body).
+        # early-pack body, the binned launch takes the binned N32 body): every
+        # rule that asks for bins is off.
         with monkeypatch.context() as patch:
-            patch.setattr(
-                runtime, "_use_direct_work_bins", lambda *args, **kwargs: False
-            )
-            patch.setattr(
-                runtime, "_use_turnover_work_bins", lambda *args, **kwargs: False
-            )
+            for rule in (
+                "_use_direct_work_bins",
+                "_use_turnover_work_bins",
+                "_use_bounded_work_bins",
+            ):
+                patch.setattr(runtime, rule, lambda *args, **kwargs: False)
             unbinned = _Call(d, lower_bound)
             assert not _modules(unbinned.prepared) & work_bin_programs
             _assert_bitwise(unbinned.run(), routed_result, "selection without bins")
@@ -1730,9 +1731,10 @@ def test_turnover_bins_keep_one_task_per_cta_without_a_turnover_build(
     lengths, heads, monkeypatch
 ):
     """A bounded launch never asks for turnover bins (its module's turnover
-    build takes work-binned launches only), and a loader without the turn table
-    has no turnover build: the launch keeps the one-task-per-CTA program, the
-    same programs and schedule as without the rule, bit for bit."""
+    build takes strict work-binned launches only; the bounded rule may give it
+    plain bins instead), and a loader without the turn table has no turnover
+    build: the launch keeps the programs, bin tables and schedule it takes
+    without the turnover-bin rule, bit for bit."""
     for lower_bound, drop_turn in ((-5.0, False), (None, True)):
         d = _inputs(lengths, heads)
         with monkeypatch.context() as patch:
@@ -1753,7 +1755,8 @@ def test_turnover_bins_keep_one_task_per_cta_without_a_turnover_build(
 # Bounded launches the strict test keeps one task per CTA where, on both parts,
 # the turnover-bin rule holds (``_use_turnover_work_bins``), the bounded
 # predicate holds on the strict table (``_bounded_turnover_route``) and the
-# module has a turnover build: only the gate keeps them on one task per CTA.
+# module has a turnover build: the gate keeps them off the turnover bins, and
+# the bounded rule (``_use_bounded_work_bins``) gives them plain bins.
 BOUNDED_ONE_TASK_ROWS = [
     pytest.param([256] * 2 + [128] * 12, 16, id="2x256+12x128-h16"),
     pytest.param([256] * 3 + [128] * 14, 12, id="3x256+14x128-h12"),
@@ -1761,14 +1764,27 @@ BOUNDED_ONE_TASK_ROWS = [
 ]
 
 
+def _bounded_bin_table(lengths, heads, sm_count):
+    """The bin table of a launch the bounded rule bins (its task cost)."""
+    return runtime._make_direct_work_bins(
+        tuple(lengths),
+        num_heads=heads,
+        worker_count=sm_count,
+        chunk_tokens=runtime.BF16_M128_CHUNK,
+        task_cost=runtime.BF16_BOUNDED_WORK_BIN_TASK_COST,
+    )[0]
+
+
 @requires_blackwell
 @pytest.mark.parametrize("lengths,heads", BOUNDED_ONE_TASK_ROWS)
 def test_bounded_launches_never_take_turnover_bins(lengths, heads, monkeypatch):
-    """A bounded launch the strict test keeps one task per CTA takes no work
-    bins, although on this part the turnover-bin rule admits it, the bounded
-    predicate holds on its strict bin table and its module has a turnover
-    build: no turnover program and no bin table, the same programs and
-    schedule as with the turnover-bin rule off, bit for bit."""
+    """A bounded launch the strict test keeps one task per CTA never takes the
+    turnover bins or the turnover build, although on this part the
+    turnover-bin rule admits it, the bounded predicate holds on its strict bin
+    table and its module has a turnover build: it takes the plain work-binned
+    program with the bounded rule's table, the same programs, table and
+    schedule as with the turnover-bin rule off, and bit for bit the
+    one-task-per-CTA launch it takes with the bounded rule off."""
     sm = torch.cuda.get_device_properties(
         torch.cuda.current_device()
     ).multi_processor_count
@@ -1787,6 +1803,7 @@ def test_bounded_launches_never_take_turnover_bins(lengths, heads, monkeypatch):
         gpu_arch=arch,
         sm_count=sm,
     )
+    assert runtime._use_bounded_work_bins(seq_lens, num_heads=heads, sm_count=sm)
     builds = []
     original = runtime.FlashKDABlackwellBF16FusedLaunch._build_body
 
@@ -1819,15 +1836,80 @@ def test_bounded_launches_never_take_turnover_bins(lengths, heads, monkeypatch):
     with monkeypatch.context() as patch:
         patch.setattr(runtime, "_use_turnover_work_bins", lambda *args, **kwargs: False)
         plain = _Call(d, -5.0)
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime, "_use_bounded_work_bins", lambda *args, **kwargs: False)
+        one_task = _Call(d, -5.0)
+    work_bin_programs = set(registry._RENDERED_WORK_BIN_ROUTES[arch].values())
     assert str(ruled.prepared.schedule) == str(plain.prepared.schedule)
     assert _modules(ruled.prepared) == _modules(plain.prepared)
+    assert _modules(ruled.prepared) & work_bin_programs
     assert not _modules(ruled.prepared) & _turn_programs()
     assert "_turnover" not in str(ruled.prepared.schedule)
-    assert _work_bin_tables(ruled.prepared) == _work_bin_tables(plain.prepared) == []
+    assert (
+        _work_bin_tables(ruled.prepared)
+        == _work_bin_tables(plain.prepared)
+        == [_bounded_bin_table(lengths, heads, sm)]
+    )
+    assert not _modules(one_task.prepared) & (work_bin_programs | _turn_programs())
+    assert _work_bin_tables(one_task.prepared) == []
     got = ruled.run()
-    want = plain.run()
-    _assert_bitwise(got, want, "bounded one task per CTA vs the rule off")
-    _assert_bitwise(plain.run(), got, "rule off repeat")
+    want = one_task.run()
+    _assert_bitwise(got, want, "bounded plain bins vs one task per CTA")
+    _assert_bitwise(plain.run(), got, "turnover-bin rule off")
+    _assert_bitwise(one_task.run(), got, "one task per CTA repeat")
+
+
+# Short bounded N32 launches the strict bin test keeps one task per CTA that
+# take plain work bins (``_use_bounded_work_bins``) on both parts: the mixed
+# H16 row and a long-and-short H16 row.
+BOUNDED_BIN_ROWS = [
+    pytest.param([17, 64, 65, 127, 128, 200, 255, 96] * 2, 16, id="mixed-h16"),
+    pytest.param([256] * 8 + [128] * 2, 16, id="8x256+2x128-h16"),
+]
+
+
+@requires_blackwell
+@pytest.mark.parametrize("rows", [True, False], ids=["rows", "no-rows"])
+@pytest.mark.parametrize("lengths,heads", BOUNDED_BIN_ROWS)
+def test_bounded_bins_launch_is_bitwise_the_one_task_per_cta_launch(
+    lengths, heads, rows, monkeypatch
+):
+    """A short bounded launch the strict test keeps one task per CTA takes its
+    module's plain work-binned program with bins charged the bounded task cost,
+    never the turnover build; bit for bit the one-task-per-CTA launch it
+    replaces, with and without checkpoint rows, free memory and outputs
+    poisoned before every launch, in either order."""
+    sm_count = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+    seq_lens = tuple(lengths)
+    assert not runtime._use_direct_work_bins(
+        seq_lens,
+        num_heads=heads,
+        sm_count=sm_count,
+        chunk_tokens=runtime.BF16_M128_CHUNK,
+    )
+    assert runtime._use_bounded_work_bins(seq_lens, num_heads=heads, sm_count=sm_count)
+    d = _inputs(lengths, heads)
+    binned = _Call(d, -5.0, rows=rows)
+    with monkeypatch.context() as patch:
+        patch.setattr(runtime, "_use_bounded_work_bins", lambda *args, **kwargs: False)
+        direct = _Call(d, -5.0, rows=rows)
+    arch = registry.device_arch()
+    work_bin_programs = set(registry._RENDERED_WORK_BIN_ROUTES[arch].values())
+    assert _modules(binned.prepared) & work_bin_programs
+    assert not _modules(binned.prepared) & _turn_programs()
+    assert "_turnover" not in str(binned.prepared.schedule)
+    assert not _modules(direct.prepared) & (_turn_programs() | work_bin_programs)
+    assert _work_bin_tables(binned.prepared) == [
+        _bounded_bin_table(lengths, heads, sm_count)
+    ]
+    assert _work_bin_tables(direct.prepared) == []
+    got = binned.run()
+    want = direct.run()
+    _assert_bitwise(got, want, "bounded plain bins vs one task per CTA")
+    _assert_bitwise(binned.run(), want, "bounded plain bins after one task per CTA")
+    _assert_bitwise(direct.run(), got, "one task per CTA repeat")
 
 
 @requires_blackwell

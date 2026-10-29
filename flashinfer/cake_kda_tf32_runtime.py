@@ -147,6 +147,21 @@ BF16_BOUNDED_TURNOVER_CHUNKS_PER_TASK_GB300: int | None = 3
 # BF16_BOUNDED_TURNOVER_SHORT_TASK_RATIO_GB300 on a 152-SM sm_103a.
 BF16_BOUNDED_TURNOVER_SHORT_TASK_RATIO = 4
 BF16_BOUNDED_TURNOVER_SHORT_TASK_RATIO_GB300 = 4
+# A bounded (lower-bound gate) direct N32 launch that the strict bin test
+# keeps one task per CTA takes its module's plain work-binned build (never the
+# turnover build) where bins pay for the fixed cost of each task
+# (_bounded_bins_route, _use_bounded_work_bins): with more tasks than SMs and
+# a longest sequence of at most BF16_BOUNDED_WORK_BIN_MAX_TASK_CHUNKS 32-token
+# chunks, the bin assignment that charges every task
+# BF16_BOUNDED_WORK_BIN_PROBE_TASK_COST chunks has a largest bin at least
+# BF16_BOUNDED_WORK_BIN_MIN_MARGIN chunks above the longest task plus that
+# cost.  The launch's bin table then charges every task
+# BF16_BOUNDED_WORK_BIN_TASK_COST chunks.  Measured on both parts; launches
+# with a smaller margin keep one task per CTA.
+BF16_BOUNDED_WORK_BIN_MAX_TASK_CHUNKS = 8
+BF16_BOUNDED_WORK_BIN_PROBE_TASK_COST = 5
+BF16_BOUNDED_WORK_BIN_MIN_MARGIN = 3
+BF16_BOUNDED_WORK_BIN_TASK_COST = 3
 BF16_BETA_TMA_MIN_HEADS = 8
 BF16_DIRECT_ORDER_MAX_PASSES = 1
 BF16_DIRECT_INSERTION_MAX_SEQUENCES = 16
@@ -2215,9 +2230,10 @@ def _turnover_bins_route(
 
     Only an unbounded (softplus gate) direct M128 N32 launch outside the TF32
     direct body and the N32 FT slab does, where ``_use_turnover_work_bins``
-    holds.  A bounded (lower-bound gate) launch keeps one task per CTA: its
-    turnover builds take the bounded rule of work-binned launches only
-    (``_bounded_turnover_route``).
+    holds.  A bounded (lower-bound gate) launch never does: it may ask for the
+    plain work-binned build instead (``_bounded_bins_route``), and its
+    module's turnover build takes the bounded rule of strict work-binned
+    launches only (``_bounded_turnover_route``).
     """
     return (
         (not strict)
@@ -2231,6 +2247,197 @@ def _turnover_bins_route(
             sm_count=sm_count,
             gpu_arch=gpu_arch,
         )
+    )
+
+
+def _use_bounded_work_bins(
+    seq_lens: tuple[int, ...],
+    *,
+    num_heads: int,
+    sm_count: int,
+) -> bool:
+    """Whether a bounded direct M128 N32 launch that ``_use_direct_work_bins``
+    keeps one task per CTA asks for its module's plain work-binned build
+    (``_bounded_bins_route`` asks it for bounded launches only).
+
+    The strict test charges a task its chunks only; a one-task-per-CTA launch
+    also pays a fixed cost per task.  With more tasks than SMs and a longest
+    sequence of at most ``BF16_BOUNDED_WORK_BIN_MAX_TASK_CHUNKS`` chunks, bins
+    pay where the bin assignment that charges every task
+    ``BF16_BOUNDED_WORK_BIN_PROBE_TASK_COST`` chunks has a largest bin at
+    least ``BF16_BOUNDED_WORK_BIN_MIN_MARGIN`` chunks above the longest task
+    plus that cost.  The launch then builds the assignment that charges
+    ``BF16_BOUNDED_WORK_BIN_TASK_COST`` chunks per task.
+    """
+    if not seq_lens or min(seq_lens) <= 0:
+        return False
+    if len(seq_lens) * num_heads <= sm_count:
+        return False
+    chunks = [(length + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK for length in seq_lens]
+    longest = max(chunks)
+    if longest > BF16_BOUNDED_WORK_BIN_MAX_TASK_CHUNKS:
+        return False
+    cost = BF16_BOUNDED_WORK_BIN_PROBE_TASK_COST
+    table, num_bins = _make_direct_work_bins(
+        seq_lens,
+        num_heads=num_heads,
+        worker_count=sm_count,
+        chunk_tokens=BF16_M128_CHUNK,
+        task_cost=cost,
+    )
+    largest_bin = max(
+        sum(
+            chunks[task // num_heads] + cost
+            for task in table[table[index] : table[index + 1]]
+        )
+        for index in range(num_bins)
+    )
+    return largest_bin - (longest + cost) >= BF16_BOUNDED_WORK_BIN_MIN_MARGIN
+
+
+def _bounded_bins_route(
+    *,
+    strict: bool,
+    route: str,
+    tf32_direct: bool,
+    n32_ft_slab: bool,
+    bounded: bool,
+    seq_lens: tuple[int, ...],
+    num_heads: int,
+    sm_count: int,
+) -> bool:
+    """Whether a direct launch the strict bin test keeps one task per CTA
+    (``strict`` False) asks for its module's plain work-binned build.
+
+    Only a bounded (lower-bound gate) direct M128 N32 launch outside the TF32
+    direct body and the N32 FT slab does, where ``_use_bounded_work_bins``
+    holds.  Such a launch never takes the turnover build; a module without a
+    work-binned build keeps one task per CTA (``_factory``).
+    """
+    return (
+        (not strict)
+        and bounded
+        and route == BF16_ROUTE_DIRECT_M128
+        and (not tf32_direct)
+        and (not n32_ft_slab)
+        and _use_bounded_work_bins(
+            seq_lens,
+            num_heads=num_heads,
+            sm_count=sm_count,
+        )
+    )
+
+
+@dataclass(frozen=True)
+class _DirectWorkBinRoute:
+    """How a direct M128 launch uses work bins (``_direct_work_bin_route``).
+
+    ``work_bins``: the launch asks for its module's work-binned build;
+    ``turnover_bins_only``: it asks for them for the turnover build only
+    (``_build_body`` drops them where the module has none); ``turnover``: it
+    takes the module's turnover build where the loader names one;
+    ``task_cost``: the per-task chunk cost its bin table charges.
+    """
+
+    work_bins: bool = False
+    turnover_bins_only: bool = False
+    turnover: bool = False
+    task_cost: int = 0
+
+
+def _direct_work_bin_route(
+    *,
+    route: str,
+    tf32_direct: bool,
+    n32_ft_slab: bool,
+    gate_kind: KDAGateKind,
+    seq_lens: tuple[int, ...],
+    max_seq_len: int,
+    num_heads: int,
+    sm_count: int,
+    gpu_arch: str,
+) -> _DirectWorkBinRoute:
+    """The work bins of a direct M128 launch, in this order of the rules:
+
+    1. The strict test (``_use_direct_work_bins``, N32 and N16 bodies) bins a
+       launch with a table that charges chunks only.  A strict work-binned N32
+       launch within the part's turnover chunk count takes its module's
+       turnover build (``_work_bin_turnover_route``); a bounded one only where
+       ``_bounded_turnover_route`` holds on that table.
+    2. An unbounded N32 launch the strict test keeps one task per CTA asks for
+       bins for its module's turnover build only (``_turnover_bins_route``);
+       its table charges ``BF16_WORK_BIN_TURNOVER_TASK_COST`` per task.
+    3. A bounded N32 launch the strict test keeps one task per CTA asks for
+       its module's plain work-binned build (``_bounded_bins_route``) and never
+       the turnover build; its table charges
+       ``BF16_BOUNDED_WORK_BIN_TASK_COST`` per task.
+
+    Rules 2 and 3 need the strict test false and split on the gate, and the
+    bounded turnover of rule 1 needs it true, so each launch takes at most one
+    rule.
+    """
+    direct_n16 = route == BF16_ROUTE_DIRECT_M128_N16
+    strict = (
+        route in {BF16_ROUTE_DIRECT_M128, BF16_ROUTE_DIRECT_M128_N16}
+        and (not tf32_direct)
+        and _use_direct_work_bins(
+            seq_lens,
+            num_heads=num_heads,
+            sm_count=sm_count,
+            chunk_tokens=BF16_N16_M128_CHUNK if direct_n16 else BF16_M128_CHUNK,
+        )
+    )
+    turnover_bins = _turnover_bins_route(
+        strict=strict,
+        route=route,
+        tf32_direct=tf32_direct,
+        n32_ft_slab=n32_ft_slab,
+        unbounded=gate_kind == KDAGateKind.UNBOUNDED_SOFTPLUS,
+        seq_lens=seq_lens,
+        num_heads=num_heads,
+        sm_count=sm_count,
+        gpu_arch=gpu_arch,
+    )
+    bounded_bins = _bounded_bins_route(
+        strict=strict,
+        route=route,
+        tf32_direct=tf32_direct,
+        n32_ft_slab=n32_ft_slab,
+        bounded=gate_kind == KDAGateKind.LOWER_BOUND,
+        seq_lens=seq_lens,
+        num_heads=num_heads,
+        sm_count=sm_count,
+    )
+    work_bins = strict or turnover_bins or bounded_bins
+    turnover = (
+        (not bounded_bins)
+        and _work_bin_turnover_route(
+            route_work_bins=work_bins,
+            direct_n16=direct_n16,
+            n32_ft_slab=n32_ft_slab,
+            max_seq_len=max_seq_len,
+            gpu_arch=gpu_arch,
+            sm_count=sm_count,
+        )
+        and _bounded_turnover_route(
+            bounded_gate=gate_kind == KDAGateKind.LOWER_BOUND,
+            seq_lens=seq_lens,
+            num_heads=num_heads,
+            gpu_arch=gpu_arch,
+            sm_count=sm_count,
+        )
+    )
+    return _DirectWorkBinRoute(
+        work_bins=work_bins,
+        turnover_bins_only=turnover_bins,
+        turnover=turnover,
+        task_cost=(
+            BF16_WORK_BIN_TURNOVER_TASK_COST
+            if turnover_bins
+            else BF16_BOUNDED_WORK_BIN_TASK_COST
+            if bounded_bins
+            else 0
+        ),
     )
 
 
@@ -3147,57 +3354,27 @@ class FlashKDABlackwellBF16FusedLaunch:
             and (max_seq_len <= H12_DIRECT_N32_MAX_SEQ_LEN)
         )
         # Work bins where a bin runs tasks back to back (the direct N32 and N16
-        # bodies, in chunks of their own size).
+        # bodies, in chunks of their own size): the strict test, the turnover
+        # bins of unbounded N32 launches and the plain bins of bounded ones,
+        # and the turnover build of short work-binned N32 launches
+        # (``_direct_work_bin_route`` orders the rules).
         seq_lens = tuple(
             offsets[index + 1] - offsets[index] for index in range(num_seqs)
         )
-        route_work_bins = (
-            route in {BF16_ROUTE_DIRECT_M128, BF16_ROUTE_DIRECT_M128_N16}
-            and (not use_tf32_direct_m128)
-            and _use_direct_work_bins(
-                seq_lens,
-                num_heads=num_heads,
-                sm_count=sm_count,
-                chunk_tokens=(
-                    BF16_N16_M128_CHUNK if use_direct_m128_n16 else BF16_M128_CHUNK
-                ),
-            )
-        )
-        # An unbounded direct N32 serving launch the strict test keeps one task
-        # per CTA may still take work bins for its module's turnover build,
-        # where bins that charge each task its fixed cost pay; a module without
-        # a turnover build keeps one task per CTA (``_build_body``), and so does
-        # a bounded launch.
-        route_turnover_bins = _turnover_bins_route(
-            strict=route_work_bins,
+        work_bin_route = _direct_work_bin_route(
             route=route,
             tf32_direct=use_tf32_direct_m128,
             n32_ft_slab=self._n32_ft_slab,
-            unbounded=unbounded_softplus,
+            gate_kind=gate_kind,
             seq_lens=seq_lens,
-            num_heads=num_heads,
-            sm_count=sm_count,
-            gpu_arch=gpu_arch,
-        )
-        route_work_bins = route_work_bins or route_turnover_bins
-        # A work-binned N32 serving launch whose longest sequence has at most
-        # the part's turnover chunk count may take its module's turnover build;
-        # a bounded one only when few of its tasks are short and every work bin
-        # averages more than the part's bounded chunk count per task.
-        route_work_bin_turnover = _work_bin_turnover_route(
-            route_work_bins=route_work_bins,
-            direct_n16=use_direct_m128_n16,
-            n32_ft_slab=self._n32_ft_slab,
             max_seq_len=max_seq_len,
-            gpu_arch=gpu_arch,
-            sm_count=sm_count,
-        ) and _bounded_turnover_route(
-            bounded_gate=gate_kind == KDAGateKind.LOWER_BOUND,
-            seq_lens=seq_lens,
             num_heads=num_heads,
-            gpu_arch=gpu_arch,
             sm_count=sm_count,
+            gpu_arch=gpu_arch,
         )
+        route_work_bins = work_bin_route.work_bins
+        route_turnover_bins = work_bin_route.turnover_bins_only
+        route_work_bin_turnover = work_bin_route.turnover
         # The bounded N32 body without the early state pack is faster on the
         # short H12 grids and bitwise identical to the early-pack body, so the
         # prepared path keeps it for every length; it also has the work-binned
@@ -3876,8 +4053,8 @@ class FlashKDABlackwellBF16FusedLaunch:
                 ),
                 # A strict launch reads the table the strict test cached.
                 **(
-                    {"task_cost": BF16_WORK_BIN_TURNOVER_TASK_COST}
-                    if route_turnover_bins
+                    {"task_cost": work_bin_route.task_cost}
+                    if work_bin_route.task_cost
                     else {}
                 ),
             )
