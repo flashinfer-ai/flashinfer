@@ -276,6 +276,7 @@ def _check(T: int, iters: int, *, seed: int = SEED) -> dict:
 # Tests
 
 
+@needs_device
 @pytest.mark.parametrize("iters", COUNTS)
 @pytest.mark.parametrize("T", T_COUNTS)
 def test_counts_match_fp64(T: int, iters: int) -> None:
@@ -417,7 +418,7 @@ def test_count_validation() -> None:
     assert pkg.SINKHORN_ITERS_MAX == loader.SINKHORN_ITERS_MAX == SINKHORN_ITERS_MAX
     i = _make_inputs(8, seed=SEED + 9)
     X, fn, scale, base = i["X"], i["fn"], i["scale"], i["base"]
-    for iters in (0, -1, 2.5, 20.5):
+    for iters in (0, -1, 2.5, 20.5, True, float("inf"), float("nan"), "20"):
         with pytest.raises(ValueError):
             forward_prepare(X, fn, scale, base, sinkhorn_iters=iters)
         with pytest.raises(ValueError):

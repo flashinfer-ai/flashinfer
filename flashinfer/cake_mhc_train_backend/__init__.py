@@ -189,11 +189,21 @@ def _check_constants(rms_eps: float, hc_eps: float, sinkhorn_iters: int) -> None
         raise ValueError(f"rms_eps must be a finite positive float, got {rms_eps!r}")
     if not (math.isfinite(float(hc_eps)) and float(hc_eps) > 0.0):
         raise ValueError(f"hc_eps must be a finite positive float, got {hc_eps!r}")
-    if int(sinkhorn_iters) != sinkhorn_iters or int(sinkhorn_iters) < 1:
+    if isinstance(sinkhorn_iters, bool):
         raise ValueError(
             f"sinkhorn_iters must be a positive integer, got {sinkhorn_iters!r}"
         )
-    if int(sinkhorn_iters) > SINKHORN_ITERS_MAX:
+    try:
+        iters = int(sinkhorn_iters)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            f"sinkhorn_iters must be a positive integer, got {sinkhorn_iters!r}"
+        ) from None
+    if iters != sinkhorn_iters or iters < 1:
+        raise ValueError(
+            f"sinkhorn_iters must be a positive integer, got {sinkhorn_iters!r}"
+        )
+    if iters > SINKHORN_ITERS_MAX:
         raise NotImplementedError(
             f"the exported Cake mHC training programs run sinkhorn_iters from 1 to {SINKHORN_ITERS_MAX} "
             f"(the run-time-count programs are built for at most {SINKHORN_ITERS_MAX}); got sinkhorn_iters={sinkhorn_iters!r}"
