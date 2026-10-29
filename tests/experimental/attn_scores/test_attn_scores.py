@@ -34,13 +34,15 @@ import torch
 from flashinfer import FP8PagedMQATopKWrapper
 from flashinfer.experimental.attn_scores import selective_logits as sl
 from flashinfer.experimental.attn_scores.selective_logits import (
-    _capture_cuda_graph,
     _fp8_mqa_selective_logits,
     _SelectiveLogitsMode,
 )
 from flashinfer.utils import is_sm100a_supported
 
-from tests.experimental.attn_scores._selective_engine_case import SelectiveEngineCase
+from tests.experimental.attn_scores._selective_engine_case import (
+    SelectiveEngineCase,
+    _capture_cuda_graph,
+)
 
 
 pytestmark = pytest.mark.filterwarnings(
@@ -56,6 +58,126 @@ _requires_selective_sm100 = pytest.mark.skipif(
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
     reason="selective FP8 logits requires SM100 or SM103",
 )
+
+
+@contextmanager
+def _reject_library_graph_calls(monkeypatch, *, allow_repair_body=False):
+    """Only a repair conditional body may capture inside the caller's graph."""
+
+    def reject(*args, **kwargs):
+        raise AssertionError(
+            "the wrapper must not capture, instantiate or launch graphs"
+        )
+
+    with monkeypatch.context() as patch:
+        graph_type = torch.cuda.CUDAGraph
+        for name in (
+            "__init__",
+            "capture_begin",
+            "capture_end",
+            "instantiate",
+            "replay",
+        ):
+            if hasattr(graph_type, name):
+                patch.setattr(graph_type, name, reject)
+        patch.setattr(torch.cuda, "graph", reject)
+        runtime = sl._capture_runtime()
+        for name in (
+            "cudaStreamBeginCapture",
+            "cudaStreamBeginCaptureToGraph",
+            "cudaStreamEndCapture",
+            "cudaGraphInstantiate",
+            "cudaGraphInstantiateWithFlags",
+            "cudaGraphLaunch",
+        ):
+            if hasattr(runtime, name):
+                patch.setattr(runtime, name, reject)
+        from flashinfer.experimental.attn_scores.jit import selective_repair_if
+
+        get_module = selective_repair_if.get_selective_repair_if_module
+        body_calls = []
+
+        class GuardedRepairModule:
+            def __init__(self, module):
+                self.module = module
+
+            def __getattr__(self, name):
+                operation = getattr(self.module, name)
+                if name not in ("begin_if", "begin_body", "end_body", "finish_if"):
+                    return operation
+
+                def guarded(*args):
+                    assert allow_repair_body
+                    assert torch.cuda.is_current_stream_capturing()
+                    body_calls.append(name)
+                    return operation(*args)
+
+                return guarded
+
+        patch.setattr(
+            selective_repair_if,
+            "get_selective_repair_if_module",
+            lambda: GuardedRepairModule(get_module()),
+        )
+        yield body_calls
+
+
+@_requires_selective_sm100
+@pytest.mark.parametrize("strategy", ["full", "selective"])
+@pytest.mark.parametrize("tied", [False, True])
+def test_wrapper_leaves_all_graph_ownership_to_caller(monkeypatch, strategy, tied):
+    """Preparation/eager/captured execution uses no library-created graphs."""
+    inputs = _request_inputs([2, 1], [9001, 257])
+    q, _, _, weights, qo, kv = inputs
+    if tied:
+        weights.zero_()
+    pool, table = _paged_inputs(inputs)
+    expected = _oracle_rows(inputs)
+    with _reject_library_graph_calls(monkeypatch):
+        wrapper = FP8PagedMQATopKWrapper(
+            strategy=strategy,
+            max_context_length=9001,
+            max_chunk_size=3,
+            max_batch_size=2,
+            kv_layout=pool,
+        )
+        wrapper.plan(qo, kv, table)
+        wrapper.prepare_pool(pool)
+        eager = wrapper.run(q, weights, pool).clone()
+    torch.cuda.synchronize()
+    _check_selection(eager, expected, 512)
+    graph = torch.cuda.CUDAGraph()
+    # Rebind the prepared native module through the same guard for capture.
+    with (
+        torch.cuda.graph(graph),
+        _reject_library_graph_calls(
+            monkeypatch, allow_repair_body=strategy == "selective"
+        ) as body_calls,
+    ):
+        if strategy == "selective":
+            from flashinfer.experimental.attn_scores.jit.selective_repair_if import (
+                get_selective_repair_if_module,
+            )
+
+            wrapper._capacity_plan._engine._repair_if_module = (
+                get_selective_repair_if_module()
+            )
+            wrapper.plan(qo, kv, table)
+        captured = wrapper.run(q, weights, pool)
+        assert body_calls == (
+            ["begin_if", "begin_body", "end_body", "finish_if"]
+            if strategy == "selective"
+            else []
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+    _check_selection(captured, expected, 512)
+    assert wrapper.error.item() == wrapper.repair_error.item() == 0
+    # Caller-owned graphs must be retired outside subsequent captures.
+    del graph
+    owner = weakref.ref(wrapper)
+    del wrapper
+    assert owner() is None
 
 
 @pytest.mark.parametrize(
@@ -430,7 +552,7 @@ def test_compressed_wrapper_empty_live_empty_replan(strategy, monkeypatch, heads
     capacities = dict(max_context_length=9, max_chunk_size=1, max_batch_size=1)
     wrapper = FP8PagedMQATopKWrapper(**specialization, **capacities, kv_layout=fused)
     wrapper.prepare_pool(fused)
-    pool_graph = wrapper._capacity_plan._pool_graphs.copy()
+    pool_binding = wrapper._capacity_plan._pool_bindings.copy()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         wrapper.plan(cu_q, cu_tokens, table)
@@ -443,7 +565,7 @@ def test_compressed_wrapper_empty_live_empty_replan(strategy, monkeypatch, heads
             output, (q, fused, weights, cu_q, cu_tokens, table), 512
         )
         assert wrapper.error.item() == wrapper.repair_error.item() == 0
-        assert wrapper._capacity_plan._pool_graphs == pool_graph
+        assert wrapper._capacity_plan._pool_bindings == pool_binding
     del graph
     # Capacity changes construct a new wrapper rather than re-reserving one.
     empty_wrapper = FP8PagedMQATopKWrapper(
@@ -460,15 +582,17 @@ def test_compressed_wrapper_empty_live_empty_replan(strategy, monkeypatch, heads
     wrapper = FP8PagedMQATopKWrapper(**specialization, **capacities, kv_layout=fused)
     with monkeypatch.context() as patch:
         patch.setattr(
-            torch.cuda,
-            "CUDAGraph",
-            lambda: (_ for _ in ()).throw(
-                RuntimeError("injected compressed capture failure")
+            wrapper._capacity_plan,
+            "_build_engine",
+            lambda _: (_ for _ in ()).throw(
+                RuntimeError("injected compressed preparation failure")
             ),
         )
-        with pytest.raises(RuntimeError, match="injected compressed capture failure"):
+        with pytest.raises(
+            RuntimeError, match="injected compressed preparation failure"
+        ):
             wrapper.prepare_pool(fused)
-    assert not wrapper._capacity_plan._pool_graphs
+    assert not wrapper._capacity_plan._pool_bindings
     with pytest.raises(RuntimeError, match="plan must be called"):
         wrapper.run(q, weights, fused)
     wrapper.prepare_pool(fused)
@@ -1325,8 +1449,7 @@ def test_full_wrapper_gvr2_workspace_capture_and_replan(monkeypatch):
     assert slab is not None and slab.dtype == torch.int32
     assert slab.numel() * slab.element_size() == gvr2_topk_host.workspace_bytes()
     assert slab.device == q.device and slab.data_ptr() % 16 == 0
-    assert any(capturing for capturing, _ in calls)
-    assert any(not capturing for capturing, _ in calls)
+    assert calls and all(not capturing for capturing, _ in calls)
     assert all(workspace is slab for _, workspace in calls)
 
     def check_rows(output, logical_kv, logical_scale):
@@ -1372,7 +1495,7 @@ def test_full_wrapper_gvr2_workspace_capture_and_replan(monkeypatch):
     fused.copy_(_fuse_paged_kv(kv, scale).flip(0))
     table.copy_(table.flip(1))
     # Maps are step inputs for both strategies; full replanning retires its
-    # old pool graphs, so discard and rebuild the caller graph as well.
+    # old pool bindings, so discard and rebuild the caller graph as well.
     del outer
     calls.clear()
     wrapper.plan(cu_q, cu_kv, table)
@@ -1387,7 +1510,7 @@ def test_full_wrapper_gvr2_workspace_capture_and_replan(monkeypatch):
     reversed_scale = scale.view(-1, 128).flip(0).reshape_as(scale)
     check_rows(captured, reversed_kv, reversed_scale)
     assert wrapper._full_gvr2_workspace is slab
-    assert sum(capturing for capturing, _ in calls) >= 2
+    assert sum(capturing for capturing, _ in calls) == 1
     assert all(workspace is slab for _, workspace in calls)
 
     one_q = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
@@ -1421,12 +1544,12 @@ def test_full_wrapper_gvr2_workspace_capture_and_replan(monkeypatch):
     assert other._full_gvr2_workspace is other_slab
     assert other.run(q=one_query, kv_fused=fused, weights=one_weights).shape == (1, 512)
 
-    def fail_capture():
-        raise RuntimeError("injected full GVR capture failure")
+    def fail_prepare(*args, **kwargs):
+        raise RuntimeError("injected full GVR preparation failure")
 
     with monkeypatch.context() as patch:
-        patch.setattr(torch.cuda, "CUDAGraph", fail_capture)
-        with pytest.raises(RuntimeError, match="injected full GVR capture failure"):
+        patch.setattr(gvr2_topk_host, "run_varlen", fail_prepare)
+        with pytest.raises(RuntimeError, match="injected full GVR preparation failure"):
             wrapper.plan(one_q, cu_kv, table, num_query_rows=one_query.shape[0])
             wrapper.prepare_pool(fused)
             wrapper.run(one_query, one_weights, fused)
@@ -1627,13 +1750,12 @@ def test_engine_underfilled_causal_rows_skip_repair(top_k, heads):
     )
     _assert_repair_position_storage(wrapper)
     for _ in range(3):
-        # Every row is shorter than TopK and publishes all of its keys, so no
-        # row is flagged and the conditional repair body must not run: the
-        # stale ranks of a previous compact turn stay untouched.
+        # Every row publishes all its keys. Repair launches must predicate
+        # away score reads/writes even with stale state from another layer.
         wrapper._ranks.fill_(top_k)
         selected = wrapper.run(q, kv_fused, weights, block_table).long()
         torch.cuda.synchronize()
-        assert bool((wrapper._ranks == top_k).all())
+        assert not wrapper._repair_flags.any().item()
 
     assert wrapper._compact_repair == (heads == 8)
     assert int(wrapper._exact_error.item()) == 0
@@ -3490,7 +3612,7 @@ def test_wrapper_page_map_updates_in_eager_and_graph(strategy, q_rows):
 
 @_requires_selective_sm100
 @pytest.mark.parametrize("q_rows", [1, 33])
-def test_full_wrapper_failed_capture_rejects_run_and_retries(monkeypatch, q_rows):
+def test_full_wrapper_failed_preparation_rejects_run_and_retries(monkeypatch, q_rows):
     from flashinfer import FP8PagedMQATopKWrapper
 
     q, kv, scale, weights, _, _ = _inputs(q_rows=q_rows, kv_rows=2048)
@@ -3513,12 +3635,14 @@ def test_full_wrapper_failed_capture_rejects_run_and_retries(monkeypatch, q_rows
     wrapper.prepare_pool(fused)
     wrapper.run(q, weights, fused)
 
-    def fail_capture():
-        raise RuntimeError("injected capture failure")
+    def fail_prepare(*args, **kwargs):
+        raise RuntimeError("injected preparation failure")
 
     with monkeypatch.context() as patch:
-        patch.setattr(torch.cuda, "CUDAGraph", fail_capture)
-        with pytest.raises(RuntimeError, match="injected capture failure"):
+        from flashinfer.attn_scores import attn_scores
+
+        patch.setattr(attn_scores, "fp8_paged_mqa_logits", fail_prepare)
+        with pytest.raises(RuntimeError, match="injected preparation failure"):
             wrapper.plan(cu_q, cu_kv, table, num_query_rows=q.shape[0])
             wrapper.prepare_pool(fused)
             wrapper.run(q, weights, fused)
@@ -3680,7 +3804,6 @@ def test_public_wrapper_on_non_current_device_after_warm_cache(route):
     if torch.cuda.device_count() < 2:
         pytest.skip("Requires two CUDA devices")
     wrappers = []
-    handles = []
     with _preserve_cuda_device_streams((0, 1)) as stream_handles:
         torch.cuda.set_device(0)
         caller = torch.cuda.Stream(device=0)
@@ -3713,10 +3836,6 @@ def test_public_wrapper_on_non_current_device_after_warm_cache(route):
             assert torch.cuda.current_device() == 0
             assert stream_handles() == expected_streams
             wrappers.append(wrapper)
-            if route != "full":
-                engine = wrapper._capacity_plan._engine
-                assert engine._repair_body_stream.device == q.device
-                handles.append(engine._repair_body_stream.cuda_stream)
             for tied in (False, True):
                 if tied:
                     weights.zero_()
@@ -3758,8 +3877,6 @@ def test_public_wrapper_on_non_current_device_after_warm_cache(route):
                             )
                 assert torch.cuda.current_device() == 0
                 assert stream_handles() == expected_streams
-        if handles:
-            assert len(set(handles)) == 2
 
 
 @_requires_selective_sm100
@@ -5998,8 +6115,6 @@ def test_capacity_capture_binds_unprepared_pool(ratio):
         w.plan(cu_q, original_kv, table)
         w.run(q, weights, pool_a, out=out_a)
         w.run(q, weights, pool_b, out=out_b)
-    # A pool seen only under capture keeps no owned eager graph.
-    assert len(w._capacity_plan._pool_graphs) == 1
     # The oracle is tie-aware; index sets may differ only among equal scores.
     for factor in (1.0, 0.5):
         weights.mul_(factor)
@@ -6008,11 +6123,9 @@ def test_capacity_capture_binds_unprepared_pool(ratio):
         assert w.error.item() == w.repair_error.item() == 0
         _check_selection(out_a, _oracle_rows(inputs), 512)
         _check_selection(out_b, _oracle_rows(inputs_b), 512)
-    # Eager use still builds the second pool's owned graph on demand.
     w.plan(cu_q, original_kv, table)
     _check_selection(w.run(q, weights, pool_b), _oracle_rows(inputs_b), 512)
     torch.cuda.synchronize()
-    assert len(w._capacity_plan._pool_graphs) == 2
 
 
 def test_selective_compile_materializes_before_publication(monkeypatch):
@@ -6034,7 +6147,7 @@ def test_selective_compile_materializes_before_publication(monkeypatch):
 @_requires_selective_sm100
 @pytest.mark.parametrize("heads,ratio", [(64, 4), (64, 1), (8, 4)])
 def test_capacity_materializes_kernels_before_capture(monkeypatch, heads, ratio):
-    """First-use CuTe libraries must load before owned or caller capture."""
+    """First-use CuTe libraries must load before caller capture."""
     from cutlass.cutlass_dsl.cuda_jit_executor import CudaDialectJitCompiledFunction
 
     original = CudaDialectJitCompiledFunction._load_cuda_library
@@ -6140,7 +6253,7 @@ def test_capacity_shared_layer_workspace(heads, ratio):
         _check_selection(out_b, _oracle_rows(inputs_b), 512)
         assert wrapper.error.item() == wrapper.repair_error.item() == 0
 
-    # Retiring pool graphs must release tensor owners without rebuilding scratch.
+    # Retiring pool bindings releases tensor owners without rebuilding scratch.
     del graph
     retired_pool = pool_a.clone()
     retired_ref = weakref.ref(retired_pool)
@@ -6153,7 +6266,7 @@ def test_capacity_shared_layer_workspace(heads, ratio):
     assert retired_ref() is None
     assert wrapper._capacity_plan._engine is engine
     assert engine._candidate_values is workspace
-    assert not wrapper._capacity_plan._pool_graphs
+    assert not wrapper._capacity_plan._pool_bindings
     wrapper.run(q, weights, pool_b, out=out_b)
     torch.cuda.synchronize()
     _check_selection(out_b, _oracle_rows(inputs_b), 512)
@@ -6349,7 +6462,7 @@ def test_capacity_selective_chain_live_steps_and_repair(heads, ratio):
     device_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
     assert plan._engine._candidate_prepared.num_sms == device_sms
     assert plan._engine._sample_prepared.num_sms == device_sms
-    graph = plan._pool_graphs[plan._pool_key(fused)][1]
+    launches = plan._pool_bindings[plan._pool_key(fused)][1]
     wrapper.prepare_pool(fused.view_as(fused))
 
     def prefixes(lengths):
@@ -6386,7 +6499,7 @@ def test_capacity_selective_chain_live_steps_and_repair(heads, ratio):
                 )
             offset += q_length
         _check_selection(selected, expected, top_k)
-        assert plan._pool_graphs[plan._pool_key(fused)][1] is graph
+        assert plan._pool_bindings[plan._pool_key(fused)][1] is launches
         return selected
 
     check([1, 0, 3], [65535, 7, 8195])
@@ -6413,7 +6526,7 @@ def test_capacity_selective_chain_live_steps_and_repair(heads, ratio):
     )
     check([2], [2049])
 
-    # Equal-layout pools share the workspace but keep separate captured bindings.
+    # Equal-layout pools share the workspace but keep separate launch bindings.
     # Each physical row must exceed K, or every index remains a valid selection
     # after rebinding and cannot detect execution against the retired map.
     rebind_lengths = [8191 * ratio, 4095 * ratio + 1]
@@ -6421,7 +6534,7 @@ def test_capacity_selective_chain_live_steps_and_repair(heads, ratio):
     old_owners = fused, table
     fused, table = fused.clone(), table.roll(1, dims=1)
     wrapper.prepare_pool(fused)
-    graph = plan._pool_graphs[plan._pool_key(fused)][1]
+    launches = plan._pool_bindings[plan._pool_key(fused)][1]
     with pytest.raises(AssertionError):
         check([1, 2], rebind_lengths, observed=previous)
     check([1, 2], rebind_lengths)
@@ -6997,78 +7110,6 @@ def test_capacity_schedule_large_batch_owner_walk():
         _check_selection(selected, _oracle_rows(inputs), 512)
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-@pytest.mark.parametrize("fail", [False, True])
-def test_capture_restores_gc_state(monkeypatch, enabled, fail):
-    events = []
-
-    class Stream:
-        def __init__(self):
-            self.waits = []
-
-        def wait_stream(self, other):
-            self.waits.append(other)
-
-    capture_stream, caller_stream = Stream(), Stream()
-    active_stream = caller_stream
-
-    def make_stream(*, device):
-        assert device == 7
-        return capture_stream
-
-    def reject_collection_or_flush(*args, **kwargs):
-        raise AssertionError("capture must not collect or empty allocator caches")
-
-    @contextmanager
-    def stream_context(stream):
-        nonlocal active_stream
-        assert stream is capture_stream
-        active_stream = stream
-        try:
-            yield
-        finally:
-            active_stream = caller_stream
-
-    class Graph:
-        def capture_begin(self):
-            assert active_stream is capture_stream
-            assert not gc.isenabled()
-            events.append("begin")
-
-        def capture_end(self):
-            assert active_stream is capture_stream
-            assert not gc.isenabled()
-            events.append("end")
-
-    monkeypatch.setattr(gc, "collect", reject_collection_or_flush)
-    monkeypatch.setattr(torch.cuda, "graph", reject_collection_or_flush)
-    monkeypatch.setattr(torch.cuda, "empty_cache", reject_collection_or_flush)
-    monkeypatch.setattr(torch.cuda, "stream", stream_context)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: active_stream)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 7)
-    monkeypatch.setattr(torch.cuda, "Stream", make_stream)
-    monkeypatch.setattr(sl, "_check_capture_status", lambda stream, step: None)
-    original = gc.isenabled()
-    try:
-        (gc.enable if enabled else gc.disable)()
-        if fail:
-            with (
-                pytest.raises(RuntimeError, match="injected capture failure"),
-                _capture_cuda_graph(Graph()),
-            ):
-                raise RuntimeError("injected capture failure")
-        else:
-            with _capture_cuda_graph(Graph()):
-                assert not gc.isenabled()
-        assert gc.isenabled() == enabled
-        assert active_stream is caller_stream
-        assert events == ["begin", "end"]
-        assert capture_stream.waits == [caller_stream]
-        assert caller_stream.waits == ([] if fail else [capture_stream])
-    finally:
-        (gc.enable if original else gc.disable)()
-
-
 @pytest.mark.parametrize("error,status", [(0, 0), (0, 1), (0, 2), (901, 2)])
 def test_capture_status_names_invalid_boundary(monkeypatch, error, status):
     runtime = SimpleNamespace(
@@ -7085,68 +7126,44 @@ def test_capture_status_names_invalid_boundary(monkeypatch, error, status):
         sl._check_capture_status(stream, "predicate launch")
 
 
-@pytest.mark.parametrize("fail_at", ["capture_begin", "capture body", "capture_end"])
-def test_capture_status_failure_ends_capture_and_restores_gc(monkeypatch, fail_at):
-    events = []
-    stream = SimpleNamespace(cuda_stream=17, wait_stream=lambda other: None)
-
-    def check(stream, step):
-        events.append(step)
-        if step == fail_at:
-            raise sl._CaptureStatusError(f"invalid after {step}")
-
-    monkeypatch.setattr(sl, "_check_capture_status", check)
-    monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: stream)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
-    monkeypatch.setattr(torch.cuda, "stream", lambda stream: contextlib.nullcontext())
-    graph = SimpleNamespace(
-        capture_begin=lambda: events.append("begin"),
-        capture_end=lambda: events.append("end"),
+@_requires_selective_sm100
+def test_caller_capture_status_failure_keeps_wrapper_usable(monkeypatch):
+    """Discarding a failed caller graph does not retire the prepared bindings."""
+    inputs = _request_inputs([2], [9001])
+    q, _, _, weights, qo, kv = inputs
+    pool, table = _paged_inputs(inputs)
+    wrapper = FP8PagedMQATopKWrapper(
+        strategy="selective",
+        max_context_length=9001,
+        max_chunk_size=2,
+        max_batch_size=1,
+        kv_layout=pool,
     )
-    original = gc.isenabled()
-    with (
-        pytest.raises(sl._CaptureStatusError, match=f"after {fail_at}"),
-        sl._capture_cuda_graph(graph),
-    ):
-        events.append("body")
-    assert events.count("end") == 1
-    assert gc.isenabled() == original
-
-
-@pytest.mark.parametrize("cleanup_fails", [False, True])
-@pytest.mark.parametrize("query_error", [sl._CaptureStatusError, ValueError])
-def test_capture_status_query_failure_preserves_body_and_cleans_up(
-    monkeypatch, cleanup_fails, query_error
-):
-    events = []
-    stream = SimpleNamespace(cuda_stream=17, wait_stream=lambda other: None)
-
-    def check(stream, step):
-        if step.endswith("exception"):
-            raise query_error("query failure")
-
-    def end():
-        events.append("end")
-        if cleanup_fails:
-            raise RuntimeError("cleanup failure")
-
-    monkeypatch.setattr(sl, "_check_capture_status", check)
-    monkeypatch.setattr(torch.cuda, "Stream", lambda **kwargs: stream)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
-    monkeypatch.setattr(torch.cuda, "stream", lambda stream: contextlib.nullcontext())
-    graph = SimpleNamespace(capture_begin=lambda: None, capture_end=end)
-    original = gc.isenabled()
-    with (
-        pytest.raises(sl._CaptureStatusError, match="query failure") as caught,
-        sl._capture_cuda_graph(graph),
-    ):
-        raise RuntimeError("original body failure")
-    assert str(caught.value.__cause__) == "original body failure"
-    assert ("cleanup failure" in str(caught.value)) == cleanup_fails
-    assert events == ["end"]
-    assert gc.isenabled() == original
+    wrapper.prepare_pool(pool)
+    wrapper.plan(qo, kv, table)
+    invalid_runtime = SimpleNamespace(
+        cudaError_t=SimpleNamespace(cudaSuccess=0),
+        cudaStreamCaptureStatus=SimpleNamespace(cudaStreamCaptureStatusInvalidated=2),
+        cudaStreamGetCaptureInfo=lambda stream: (0, 2, 0),
+    )
+    rejected = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(rejected), monkeypatch.context() as patch:
+        patch.setattr(sl, "_capture_runtime", lambda: invalid_runtime)
+        with pytest.raises(sl._CaptureStatusError, match="layer payload copies"):
+            wrapper.run(q, weights, pool)
+    # Only the status query is injected; the real stream remains valid so the
+    # test can close/discard the caller's partial graph without a device reset.
+    del rejected
+    eager = wrapper.run(q, weights, pool).clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = wrapper.run(q, weights, pool)
+    graph.replay()
+    torch.cuda.synchronize()
+    expected = _oracle_rows(inputs)
+    for output in (eager, captured):
+        _check_selection(output, expected, 512)
+    assert wrapper.error.item() == wrapper.repair_error.item() == 0
 
 
 @pytest.mark.parametrize(

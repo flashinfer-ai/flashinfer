@@ -162,7 +162,7 @@ class FP8PagedMQATopKWrapper:
         return _backend_call(self, "prepare_pool", kv_fused)
 
     def clear_pools(self):
-        """Synchronize and release pool graphs outside caller capture."""
+        """Synchronize and release pool bindings outside caller capture."""
         return _backend_call(self, "clear_pools")
 
     def input_buffers(self) -> dict[str, torch.Tensor]:

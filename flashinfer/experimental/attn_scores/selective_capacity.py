@@ -422,7 +422,7 @@ class _CapacityStepInputs:
 
 
 class _CapacitySelectiveTopKPlan:
-    """Capacity-sized selective chain with stable per-step staging and graphs.
+    """Capacity-sized selective chain with stable staging and pool bindings.
 
     Use one plan per concurrent stream; calls on one plan must be serialized.
     ``max_context_length`` counts original tokens.
@@ -451,7 +451,7 @@ class _CapacitySelectiveTopKPlan:
         The layout comes from an unretained ``kv_layout`` exemplar, or from
         ``num_pages`` and ``device`` as a contiguous pool. Scorer
         allocation/compilation is completed by the first prepare_pool.
-        Subsequent equal-layout pools add only launch/graph bindings, not another
+        Subsequent equal-layout pools add only launch bindings, not another
         score, candidate or repair workspace. Construct outside capture.
         """
         from ...attn_scores._math_policy import _validate_math_mode
@@ -474,7 +474,7 @@ class _CapacitySelectiveTopKPlan:
         layout, device, num_pages = self._resolve_layout(
             capacity, kv_layout, num_pages, device
         )
-        self._pool_graphs: dict = {}
+        self._pool_bindings: dict = {}
         self._protected_ranges: tuple[tuple[int, int], ...] = ()
         self._engine: _FP8PagedMQASelectiveTopKEngine | None = None
         self._step_prepared = False
@@ -693,10 +693,10 @@ class _CapacitySelectiveTopKPlan:
         # Bind auxiliary kernels only after all stable metadata/output owners
         # have their final addresses. No predecessor graph is captured here.
         engine._compile_auxiliary_launches()
+        engine._prepare_repair_if(state.device)
         if engine._compact_repair:
             engine._compile_compact_repair_launches(self._q, self._weights)
         engine._precompile_score_launches(self._q, kv_fused, self._weights, block_table)
-        engine._prepare_repair_if(state.device)
         # Materialize the remaining FFI and PyTorch kernels before the first
         # capture. Empty radix rows read no score payloads; in particular this
         # must not score the uninitialized query/weight staging buffers.
@@ -884,7 +884,7 @@ class _CapacitySelectiveTopKPlan:
         owners = [self._selected, self._repair_error, *self._state.__dict__.values()]
         if self._engine is not None:
             owners.extend(self._engine.__dict__.values())
-        owners.extend(binding[0] for binding in self._pool_graphs.values())
+        owners.extend(binding[0] for binding in self._pool_bindings.values())
         ranges = sorted(
             _byte_range(tensor)
             for tensor in owners
@@ -899,7 +899,7 @@ class _CapacitySelectiveTopKPlan:
         self._protected_ranges = tuple(merged)
 
     def clear_pools(self) -> None:
-        """Synchronize and discard every pool graph without reallocating scratch.
+        """Synchronize and discard pool bindings without reallocating scratch.
 
         Discard caller-owned graphs using these pools before this call and
         recapture them before reuse. Pool bindings retain their tensors until
@@ -909,7 +909,7 @@ class _CapacitySelectiveTopKPlan:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("clear_pools must run outside CUDA graph capture")
             torch.cuda.synchronize(self._state.device)
-            self._pool_graphs.clear()
+            self._pool_bindings.clear()
             if self._engine is not None:
                 for prepared, _ in self._prepared_launches():
                     prepared._launches.clear()
@@ -917,16 +917,14 @@ class _CapacitySelectiveTopKPlan:
             self._cache_protected_ranges()
 
     def prepare_pool(self, kv_fused) -> None:
-        """Bind/capture an equal-layout layer pool outside caller capture.
+        """Compile and bind an equal-layout pool without capturing a graph.
 
         The first pool allocates and compiles the shared scoring workspace;
         that, or one eager run, must precede caller capture. Eager run calls
         this automatically, and caller capture binds later pools without it.
-        Pool-specific parent graphs own their nested repair bodies and retain
-        pool/launch owners until clear_pools or destruction.
+        Bindings retain pool/launch owners until clear_pools or destruction.
         """
         from .selective_logits import (
-            _capture_cuda_graph,
             _select_request_tiling,
             _select_sparse_sample_group_rows,
             _sparse_sample_gather4_serves,
@@ -968,7 +966,7 @@ class _CapacitySelectiveTopKPlan:
                 self._state.refresh()
                 if self._needs_sampling:
                     self._state.refresh_sampling()
-            if key in self._pool_graphs:
+            if key in self._pool_bindings:
                 return
             if self._engine is None:
                 try:
@@ -987,12 +985,8 @@ class _CapacitySelectiveTopKPlan:
                 engine._precompile_score_launches(
                     self._q, kv_fused, self._weights, self._state.block_table
                 )
-            # All CuTe and auxiliary launches were compiled above. Capture does
-            # not execute uninitialized payloads or overwrite earlier status.
-            graph = torch.cuda.CUDAGraph()
-            with _capture_cuda_graph(graph):
-                self._execute_layer(kv_fused)
-            self._pool_graphs[key] = (kv_fused, graph, self._prepared_launches())
+            # Keep pool and callable owners alive without owning a CUDA graph.
+            self._pool_bindings[key] = (kv_fused, self._prepared_launches())
             self._cache_protected_ranges()
 
     def input_buffers(self) -> dict[str, torch.Tensor]:
@@ -1054,16 +1048,14 @@ class _CapacitySelectiveTopKPlan:
                     )
         with torch.cuda.device(self._state.device):
             capturing = torch.cuda.is_current_stream_capturing()
-            graph = None
-            if key in self._pool_graphs:
-                _, graph, launches = self._pool_graphs[key]
+            if key in self._pool_bindings:
+                _, launches = self._pool_bindings[key]
                 if self._engine is not None:
                     for prepared, bindings in launches:
                         prepared._launches.clear()
                         prepared._launches.update(bindings)
             elif not capturing:
                 self.prepare_pool(kv_fused)
-                _, graph, _ = self._pool_graphs[key]
             elif not self._state.is_prepared or self._layout_needs_engine():
                 raise RuntimeError(
                     "prepare_pool or one eager run must precede caller capture"
@@ -1072,18 +1064,15 @@ class _CapacitySelectiveTopKPlan:
                 # The layout is compiled, so an unseen equal-layout pool only
                 # needs new launch arguments. They are rebuilt on the cache
                 # miss below without compiling, host reads or allocation; no
-                # owned eager graph is retained for a capture-only pool.
+                # graph is created for a capture-only pool.
                 for prepared, _ in self._prepared_launches():
                     prepared._launches.clear()
             if self._engine is not None:
                 self._engine._sample_fused = kv_fused
             self._state.stage_payload(q, weights)
             self._check_caller_capture(capturing, "layer payload copies")
-            if capturing:
-                self._execute_layer(kv_fused)
-                self._check_caller_capture(capturing, "layer execution")
-            else:
-                graph.replay()
+            self._execute_layer(kv_fused)
+            self._check_caller_capture(capturing, "layer execution")
             if out is not None and out.data_ptr() != selected.data_ptr():
                 out.copy_(selected)
                 self._check_caller_capture(capturing, "layer output copy")

@@ -22,12 +22,10 @@ from __future__ import annotations
 
 import bisect
 import functools
-import gc
 import hashlib
 import importlib.util
 import math
 import os
-from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, Tuple
@@ -152,59 +150,6 @@ def _check_capture_status(stream, step):
             f"CUDA graph capture invalid after {step}: "
             f"cudaStreamGetCaptureInfo returned {error}, capture status {status}"
         )
-
-
-@contextmanager
-def _capture_cuda_graph(graph):
-    """Capture on the input device without collecting or flushing allocators."""
-    # Torch's default capture stream is global, not keyed by tensor device.
-    capture_stream = torch.cuda.Stream(device=torch.cuda.current_device())
-    caller_stream = torch.cuda.current_stream()
-    capture_stream.wait_stream(caller_stream)
-    gc_enabled = gc.isenabled()
-    if gc_enabled:
-        gc.disable()
-    try:
-        with torch.cuda.stream(capture_stream):
-            _check_capture_status(capture_stream, "owned capture entry")
-            step = "capture_begin"
-            try:
-                graph.capture_begin()
-                _check_capture_status(capture_stream, "capture_begin")
-                step = "capture body"
-                yield
-                _check_capture_status(capture_stream, "capture body")
-            except BaseException as error:
-                diagnostic = None
-                if not isinstance(error, _CaptureStatusError):
-                    try:
-                        _check_capture_status(capture_stream, f"{step} exception")
-                    except BaseException as status_error:
-                        diagnostic = status_error
-                try:
-                    graph.capture_end()
-                except BaseException as cleanup_error:
-                    if diagnostic is not None:
-                        raise _CaptureStatusError(
-                            f"{step} exception capture-state check: {diagnostic}; "
-                            f"capture_end cleanup also failed: {cleanup_error}"
-                        ) from error
-                    raise error from cleanup_error
-                if diagnostic is not None:
-                    raise _CaptureStatusError(
-                        f"{step} exception capture-state check: {diagnostic}"
-                    ) from error
-                raise
-            else:
-                try:
-                    graph.capture_end()
-                except BaseException as error:
-                    raise RuntimeError("CUDA graph capture_end failed") from error
-                _check_capture_status(capture_stream, "capture_end")
-        caller_stream.wait_stream(capture_stream)
-    finally:
-        if gc_enabled:
-            gc.enable()
 
 
 @dataclass(frozen=True)
@@ -2483,6 +2428,9 @@ class _FP8PagedMQASelectiveTopKEngine:
         self._equal_counts: torch.Tensor | None = None
         self._selected: torch.Tensor | None = None
         self._exact_error: torch.Tensor | None = None
+        self._repair_if_module: Any = None
+        self._repair_body_stream: torch.cuda.Stream | None = None
+        self._repair_body_stream_owner: Any = None
         self._radix_select_launch: Any = None
         self._combine_exact_launch: Any = None
         self._repair_threshold_launch: Any = None
@@ -2494,9 +2442,6 @@ class _FP8PagedMQASelectiveTopKEngine:
         self._compact_repair_resolve_launch: Any = None
         self._compact_combine_exact_launch: Any = None
         self._sample_threshold_launch: Any = None
-        self._repair_if_module: Any = None
-        self._repair_body_stream: torch.cuda.Stream | None = None
-        self._repair_body_stream_owner: Any = None
 
     def _request_sample_indices(
         self, kv_length: int, page_size: int
@@ -3810,7 +3755,7 @@ class _FP8PagedMQASelectiveTopKEngine:
         reset.zero_()
 
     def _prepare_repair_if(self, device: torch.device) -> None:
-        """Load capture support before entering either owned or caller capture."""
+        """Load conditional repair support before caller capture."""
         from .jit.selective_repair_if import get_selective_repair_if_module
 
         self._repair_if_module = get_selective_repair_if_module()
@@ -3965,6 +3910,11 @@ class _FP8PagedMQASelectiveTopKEngine:
         assert self._equal_counts is not None
         assert self._selected is not None
         assert self._exact_error is not None
+
+        if not _candidate_counts_precleared:
+            # Direct engine users do not pass through the capacity layer's
+            # scratch reset. No conditional graph predicate resets these now.
+            torch._foreach_zero_([self._second_repair_flags, self._exact_error])
 
         _validate_prepared(self._candidate_prepared, q, kv_fused, block_table)
         if (
@@ -4263,6 +4213,11 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
     supports TopK1..2048 with fixed candidate and repair selectors.
     Neither strategy selects or falls back to another full-score backend.
 
+    Under caller capture, exact repair is recorded as a CUDA conditional node
+    in the caller's graph so repair-free replays skip it. The wrapper never
+    creates, instantiates or replays a graph of its own. Eager selective runs
+    enqueue the device-flagged repair sequence directly.
+
     ``compression_ratio=4`` consumes already-compressed KV for the selective
     strategy. Public KV prefixes remain in original-token units; each row's
     compressed end is floor((L-Q+i+1)/4). Returned IDs index compressed slots,
@@ -4315,7 +4270,7 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
         CUDA graph capture without compiling kernels. The first ``prepare_pool``
         or eager ``run`` compiles scoring kernels and reserves score scratch.
         Full requires ``plan`` before preparation and reads prefixes on the host;
-        each new full plan invalidates the previous pool graphs. Selective can
+        each new full plan invalidates the previous pool bindings. Selective can
         prepare the layout before its first step and refresh metadata in capture.
         Unsupported
         scoring specializations are rejected when that chain is first built;
@@ -4440,8 +4395,7 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
         ] = []
         self._full_scores: torch.Tensor | None = None
         self._full_row_ends: torch.Tensor | None = None
-        self._full_cuda_graph: torch.cuda.CUDAGraph | None = None
-        self._full_graph_identity: tuple[Any, ...] | None = None
+        self._full_binding_identity: tuple[Any, ...] | None = None
         self._full_max_context_len = 0
         self._full_impl: Any = None
         self._full_gvr2_workspace: torch.Tensor | None = None
@@ -4559,10 +4513,9 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
                 chunks.append((chunk_begin, chunk_end, request, context_end))
                 chunk_begin = chunk_end
 
-        # Invalidate before replacing any storage; a failed rebuild must not
-        # replay a graph bound to the previous generation's output buffers.
-        self._full_graph_identity = None
-        self._full_cuda_graph = None
+        # Invalidate before replacing storage; a failed rebuild must not
+        # execute bindings from the previous plan generation.
+        self._full_binding_identity = None
         self._full_impl = None
         self._full_gvr2_workspace = None
         self._rows = q.shape[0]
@@ -4699,13 +4652,9 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
         )
         full_impl()
         torch.cuda.synchronize(q.device)
-        graph = torch.cuda.CUDAGraph()
-        with _capture_cuda_graph(graph):
-            full_impl()
         self._full_gvr2_workspace = full_gvr2_workspace
         self._full_impl = full_impl
-        self._full_cuda_graph = graph
-        self._full_graph_identity = new_identity
+        self._full_binding_identity = new_identity
 
     def _plan_full_payload(
         self,
@@ -4746,8 +4695,8 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
         All tensors must share one device. Planning reads prefixes on the host
         and allocates/precompiles run resources. Replans replace storage.
         Full owns 20,973,568 bytes of GVR-v2 scratch. Each successful
-        plan owns separate zero-initialized storage held across eager/internal
-        and enclosing graph captures. Successful selector launches reset their
+        plan owns separate zero-initialized storage held across eager calls
+        and caller-owned graph captures. Successful selector launches reset their
         consumed state; this is not a lock or CUDA-context-fault recovery.
         Replan after changing prefixes, tensor objects, storage/layout, or
         specialization, and recapture any enclosing graph after replanning.
@@ -4758,8 +4707,8 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
         self._check_math_mode()
         self._check_compression_ratio()
         device = q.device if isinstance(q, torch.Tensor) and q.is_cuda else -1
-        # Retain the retired graph and all its tensor/stream owners until the
-        # replacement capture has ended, including on a failed rebuild.
+        # Retain retired bindings until replacement preparation finishes,
+        # including on a failed rebuild.
         previous_plan = tuple(self.__dict__.values())
         try:
             with torch.cuda.device(device):
@@ -4806,8 +4755,9 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
         select equivalent keys, and underfilled rows retain all causal keys
         with remaining slots filled with -1.
 
-        A successful plan is required. Eager calls replay the prepared graph;
-        outer CUDA graph capture emits the operations into that graph. Calls
+        A successful plan is required. Eager and caller-captured calls enqueue
+        the prepared operations directly, except selective caller capture
+        records exact repair in a conditional body. Calls
         on one wrapper must not overlap; synchronize before switching streams
         or replanning. Replacing a tensor object, even with a view sharing the
         same storage, or changing storage/layout raises ValueError. Recapture
@@ -4820,18 +4770,14 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
         self._check_compression_ratio()
         device = q.device if isinstance(q, torch.Tensor) and q.is_cuda else -1
         with torch.cuda.device(device):
-            if self._full_graph_identity is None or self._full_cuda_graph is None:
+            if self._full_binding_identity is None or self._full_impl is None:
                 raise RuntimeError("plan must be called before run")
             identity = _selective_logits_launch_identity(
                 (q, kv_fused, weights, block_table), 0
             )
-            if identity != self._full_graph_identity:
+            if identity != self._full_binding_identity:
                 raise ValueError("run tensors must match the address-stable plan")
-            if torch.cuda.is_current_stream_capturing():
-                return self._full_impl()
-            self._full_cuda_graph.replay()
-            assert self._selected is not None
-            return self._selected
+            return self._full_impl()
 
     @flashinfer_api
     @_public_wrapper_method
@@ -4865,7 +4811,7 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
         be captured after the layout is prepared. Full uses host prefix values
         to build its scorer groups, so call its plan outside capture and warm
         each pool before capturing run. Full planning synchronizes previous
-        work before replacing its per-pool score buffers and graphs. Discard
+        work before replacing its per-pool score buffers and bindings. Discard
         caller graphs from the previous full plan before replanning; they must
         be recaptured. Both share step metadata across layers.
         """
@@ -4943,12 +4889,14 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
         or synchronization; run does not synchronously raise device-value errors.
 
         Full uses the same layer-call signature and stages Q/weights into
-        owned buffers. Bind the page map through plan for both strategies. Both strategies replay
-        an owned graph outside capture and emit operations inside caller capture.
+        owned buffers. Bind the page map through plan for both strategies.
+        Both strategies enqueue operations on the caller's stream. Selective
+        caller capture records exact repair in a conditional node's body;
+        neither strategy owns, instantiates or replays a parent CUDA graph.
         Captured copy addresses and supplied extents are fixed in that graph;
         change device prefix contents in place or recapture for new bindings.
         The graph addresses this wrapper's workspace: keep the wrapper (and
-        its captured pools) alive while that graph may replay.
+        its bound pools) alive while that graph may replay.
         Release wrappers and their plans outside all CUDA graph capture,
         including captures owned by other wrappers: retirement unloads private
         CUDA libraries immediately.
@@ -5033,13 +4981,12 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
         scoring kernels for the layout and validates any step staged by an
         earlier plan call; one of them is required before the first caller
         capture. Later pools need no preparation: caller capture binds them in
-        place. This also builds the pool's owned eager graph, which eager run
-        otherwise builds on first use. That cache keys on address and full
-        layout and keeps pool owners alive; the constructor's ``kv_layout``
+        place. Bindings key on address and full layout and keep pool owners
+        alive; the constructor's ``kv_layout``
         exemplar is not bound.
 
         Full requires plan first and owns a separate score buffer, GVR-v2
-        workspace and graph per prepared pool. Each full plan replaces these
+        workspace per prepared pool. Each full plan replaces these
         bindings, so prepare every pool again before caller capture in that
         step; eager run may prepare it on demand. Full pools share staged
         inputs and step metadata, not scoring scratch.
@@ -5074,8 +5021,7 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
                 "_full_groups",
                 "_full_scores",
                 "_full_row_ends",
-                "_full_cuda_graph",
-                "_full_graph_identity",
+                "_full_binding_identity",
                 "_full_max_context_len",
                 "_full_impl",
                 "_full_gvr2_workspace",
@@ -5084,7 +5030,7 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
             self._full_pool_plans[key] = {name: getattr(self, name) for name in fields}
 
     def clear_pools(self):
-        """Synchronize and release cached pool graphs and bindings.
+        """Synchronize and release cached pool bindings.
 
         Call outside capture after discarding caller graphs using these pools.
         Their captures must be rebuilt before reuse. Pool tensors and launch
@@ -5100,7 +5046,7 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
                 raise RuntimeError("clear_pools must run outside CUDA graph capture")
             torch.cuda.synchronize(self._full_state.device)
             self._full_pool_plans.clear()
-            self._full_impl = self._full_cuda_graph = self._full_graph_identity = None
+            self._full_impl = self._full_binding_identity = None
 
     def input_buffers(self) -> dict[str, torch.Tensor]:
         """Return Q/weight/prefix staging tensors owned by either strategy.

@@ -14,13 +14,22 @@
 """Build fixed kernel cases through the production engine allocator and launches.
 
 Public capacity planning is tested separately. This helper only translates test
-prefixes into allocation geometry and captures the resulting production chain;
+prefixes into allocation geometry and warms the resulting production chain;
 it has no in-place replan, option switches or alternate selection algorithm.
 """
+
+from contextlib import contextmanager
 
 import torch
 
 from flashinfer.experimental.attn_scores import selective_logits as sl
+
+
+@contextmanager
+def _capture_cuda_graph(graph):
+    """Caller-owned graph used only by the kernel test driver."""
+    with torch.cuda.graph(graph):
+        yield
 
 
 class SelectiveEngineCase(sl._FP8PagedMQASelectiveTopKEngine):
@@ -79,17 +88,12 @@ class SelectiveEngineCase(sl._FP8PagedMQASelectiveTopKEngine):
             num_sms=num_sms,
             compression_ratio=compression_ratio,
         )
-        if not self._empty_physical:
-            self._prepare_repair_if(q.device)
-        self._cuda_graph = torch.cuda.CUDAGraph()
-        with sl._capture_cuda_graph(self._cuda_graph):
-            self._run_impl(q, kv_fused, weights, block_table)
+        self._prepare_repair_if(q.device)
+        self._run_impl(q, kv_fused, weights, block_table)
+        self._planned = True
 
     def run(self, q, kv_fused, weights, block_table):
         self._check_math_mode()
-        if not hasattr(self, "_cuda_graph"):
+        if not getattr(self, "_planned", False):
             raise RuntimeError("plan must be called before run")
-        if torch.cuda.is_current_stream_capturing():
-            return self._run_impl(q, kv_fused, weights, block_table)
-        self._cuda_graph.replay()
-        return self._selected
+        return self._run_impl(q, kv_fused, weights, block_table)
