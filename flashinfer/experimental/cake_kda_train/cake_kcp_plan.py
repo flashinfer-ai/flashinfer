@@ -101,6 +101,7 @@ Exchange layouts (one ``all_to_all_single`` per direction; ``s`` = one FP32
 
 from __future__ import annotations
 
+import bisect
 import dataclasses
 
 import torch
@@ -1044,11 +1045,16 @@ def _halo_sources(part: KcpPartition, halo: int):
                 chains.setdefault(f.doc, []).append(f)
     for lst in chains.values():
         lst.sort(key=lambda f: f.off)
+    # per document the sorted fragment offsets: the owner of token t is the last fragment starting at or before t
+    # (the non-empty fragments of a document tile it, so a bisect replaces the O(chain) scan)
+    starts = {doc: [g.off for g in lst] for doc, lst in chains.items()}
 
     def owner(doc: int, t: int) -> KcpFragment:
-        for g in chains[doc]:
-            if g.off <= t < g.end:
-                return g
+        lst = chains.get(doc)
+        if lst:
+            i = bisect.bisect_right(starts[doc], t) - 1
+            if i >= 0 and t < lst[i].end:
+                return lst[i]
         raise ValueError(f"halo plan: document {doc} token {t} has no owning fragment")
 
     hist: dict[tuple[int, int], tuple] = {}
