@@ -217,6 +217,7 @@ def _program_table(binding: str, name: str) -> list[str | None]:
         ("kKernels", "", (2, 4)),
         ("kLargeTokenKernels", "_lt", (2,)),
         ("kTwoShotKernels", "_ts", (4, 8)),
+        ("kTwoShotDeferKernels", "_tsd", (4, 8)),
     ],
 )
 def test_program_tables_list_one_program_kind(
@@ -252,6 +253,7 @@ def test_program_tables_cover_the_module_records() -> None:
             "kKernels",
             "kLargeTokenKernels",
             "kTwoShotKernels",
+            "kTwoShotDeferKernels",
         )
         for kernel in _program_table(binding, table)
         if kernel is not None
