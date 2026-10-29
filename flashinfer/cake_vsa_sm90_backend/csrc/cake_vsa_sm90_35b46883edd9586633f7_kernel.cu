@@ -2703,11 +2703,11 @@ kernel_cake_vsa_sm90_35b46883edd9586633f7(const __grid_constant__ CUtensorMap Q,
                     float pend1 = 1.0f;
                     int pend_need = 0;
                     int n_loop = n_own - 1;
+                    int w_e_c = w_e;
                     #pragma unroll 1
                     for (int n = 0; n < n_loop; n++) {
                         int cur_stage = cur_pos % 3;
-                        int w_e_2 = meta_smem[own_base_w + (n + 1 >> 1)];
-                        int en = w_e_2 >> (n + 1 & 1) * 16 & 65535;
+                        int en = w_e_c >> (n + 1 & 1) * 16 & 65535;
                         int nxt_pos = gbase + (en >> 3);
                         int nxt_has2 = en >> 2 & 1;
                         #pragma unroll 1
@@ -2971,7 +2971,6 @@ kernel_cake_vsa_sm90_35b46883edd9586633f7(const __grid_constant__ CUtensorMap Q,
                             : "r"(p_e4m3[12]), "r"(p_e4m3[(12) + 1]), "r"(p_e4m3[(12) + 2]), "r"(p_e4m3[(12) + 3]), "l"(wgmma_b_1 + 6)
                             : "memory");
                         asm volatile("wgmma.commit_group.sync.aligned;" ::: "memory");
-                        asm volatile("wgmma.wait_group.sync.aligned 1;" ::: "memory");
                         float ksg_0 = ks_smem[nxt_stage * 64];
                         qk_sc[0] = q_log2[0] * ksg_0;
                         qk_sc[8] = q_log2[1] * ksg_0;
@@ -2996,6 +2995,9 @@ kernel_cake_vsa_sm90_35b46883edd9586633f7(const __grid_constant__ CUtensorMap Q,
                         float ksg_7 = ks_smem[nxt_stage * 64 + 32 + 3];
                         qk_sc[7] = q_log2[0] * ksg_7;
                         qk_sc[15] = q_log2[1] * ksg_7;
+                        int w_e_2 = meta_smem[own_base_w + (n + 2 >> 1)];
+                        w_e_c = w_e_2;
+                        asm volatile("wgmma.wait_group.sync.aligned 1;" ::: "memory");
                         if (elect_sync()) {
                             mbarrier_arrive(k_empty_addr + (knext % 3) * 8);
                         }
