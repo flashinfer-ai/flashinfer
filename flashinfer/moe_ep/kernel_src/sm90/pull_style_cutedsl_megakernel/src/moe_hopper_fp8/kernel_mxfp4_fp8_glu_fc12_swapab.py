@@ -891,8 +891,10 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
 
         Only token tiles of N >= 64 have WGMMAs long enough to hide it; N16
         and N32 tiles keep the in-order loop (measured 2-3% slower with it).
+        Dispatch-side token-back (FC2 rows staged in the local pool) keeps the
+        in-order loop too: with the early wait its outputs varied run to run.
         """
-        return self.mma_tiler[1] >= 64
+        return self.mma_tiler[1] >= 64 and not self.token_back_by_dispatch
 
     @cute.jit
     def _mma_mxfp4_hybrid_fc1(

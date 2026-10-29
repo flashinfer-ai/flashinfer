@@ -2187,6 +2187,135 @@ class SwapABFp8GluEpilogue:
                         fc1_offload_full_mbar_ptr=fc1_offload_full_mbar_ptr,
                         fc1_offload_mbox=fc1_offload_mbox,
                     )
+                elif cutlass.const_expr(self._token_back_by_dispatch):
+                    # Dispatch-side token-back runs the epilogue on a smaller
+                    # register file (200/216); the runtime-half copy gave
+                    # outputs that varied run to run there. Keep one copy per
+                    # half in that layout.
+                    if n_half == cutlass.Int32(0):
+                        (
+                            ab_consumer_state,
+                            math_wg_order_state,
+                            epi_wg_order_state,
+                        ) = self._run_fc1_half_tile(
+                            work_tile_info=work_tile_info,
+                            local_warp_idx=local_warp_idx,
+                            tiled_mma=tiled_mma,
+                            tCrA=tCrA,
+                            tCrB=tCrB,
+                            accumulators=accumulators,
+                            accum_temp=accum_temp,
+                            n_half=0,
+                            store_stage_idx=cutlass.Int32(0),
+                            ab_pipeline=ab_pipeline,
+                            weight_sf_pipeline=weight_sf_pipeline,
+                            ab_consumer_state=ab_consumer_state,
+                            k_tile_cnt_fc1=k_tile_cnt_fc1,
+                            k_tile_cnt_fc2=k_tile_cnt_fc2,
+                            _iket_active=_iket_active,
+                            smem_fc1_output_buffer=smem_fc1_output_buffer,
+                            smem_fc1_amax=smem_fc1_amax,
+                            tma_atom_fc1_output=tma_atom_fc1_output,
+                            sched_ext=sched_ext,
+                            gmem_fc1_output=gmem_fc1_output,
+                            gmem_fc1_output_sf=gmem_fc1_output_sf,
+                            smem_activation_sf=smem_activation_sf,
+                            smem_weight_sf=smem_weight_sf,
+                            gmem_topk_scores=gmem_topk_scores,
+                            tidx=tidx,
+                            fc1_act_weight_dequant_scale=fc1_act_weight_dequant_scale,
+                            fc2_act_dequant_scale=fc2_act_dequant_scale,
+                            norm_const=norm_const,
+                            run_wgmma_task_tile=run_wgmma_task_tile,
+                            storage_group_idx=(
+                                warpgroup_idx if self._pingpong else 0
+                            ),
+                            math_wg_order_barrier=math_wg_order_barrier,
+                            math_wg_order_state=math_wg_order_state,
+                            epi_wg_order_barrier=epi_wg_order_barrier,
+                            epi_wg_order_state=epi_wg_order_state,
+                            gmem_fc1_c=gmem_fc1_c,
+                        )
+                        self._store_fc1_task_tile(
+                            work_tile_info=work_tile_info,
+                            smem_fc1_output_buffer=smem_fc1_output_buffer,
+                            tma_atom_fc1_output=tma_atom_fc1_output,
+                            sched_ext=sched_ext,
+                            gmem_fc1_output=gmem_fc1_output,
+                            local_warp_idx=local_warp_idx,
+                            n_half=0,
+                            store_stage_idx=cutlass.Int32(0),
+                            storage_group_idx=(
+                                warpgroup_idx if self._pingpong else 0
+                            ),
+                            _iket_active=_iket_active,
+
+                            gmem_fc1_done_counter=gmem_fc1_done_counter,
+                            fc1_offload_full_mbar_ptr=fc1_offload_full_mbar_ptr,
+                            fc1_offload_mbox=fc1_offload_mbox,
+                        )
+                    else:
+                        (
+                            ab_consumer_state,
+                            math_wg_order_state,
+                            epi_wg_order_state,
+                        ) = self._run_fc1_half_tile(
+                            work_tile_info=work_tile_info,
+                            local_warp_idx=local_warp_idx,
+                            tiled_mma=tiled_mma,
+                            tCrA=tCrA,
+                            tCrB=tCrB,
+                            accumulators=accumulators,
+                            accum_temp=accum_temp,
+                            n_half=1,
+                            store_stage_idx=cutlass.Int32(1),
+                            ab_pipeline=ab_pipeline,
+                            weight_sf_pipeline=weight_sf_pipeline,
+                            ab_consumer_state=ab_consumer_state,
+                            k_tile_cnt_fc1=k_tile_cnt_fc1,
+                            k_tile_cnt_fc2=k_tile_cnt_fc2,
+                            _iket_active=_iket_active,
+                            smem_fc1_output_buffer=smem_fc1_output_buffer,
+                            smem_fc1_amax=smem_fc1_amax,
+                            tma_atom_fc1_output=tma_atom_fc1_output,
+                            sched_ext=sched_ext,
+                            gmem_fc1_output=gmem_fc1_output,
+                            gmem_fc1_output_sf=gmem_fc1_output_sf,
+                            smem_activation_sf=smem_activation_sf,
+                            smem_weight_sf=smem_weight_sf,
+                            gmem_topk_scores=gmem_topk_scores,
+                            tidx=tidx,
+                            fc1_act_weight_dequant_scale=fc1_act_weight_dequant_scale,
+                            fc2_act_dequant_scale=fc2_act_dequant_scale,
+                            norm_const=norm_const,
+                            run_wgmma_task_tile=run_wgmma_task_tile,
+                            storage_group_idx=(
+                                warpgroup_idx if self._pingpong else 1
+                            ),
+                            math_wg_order_barrier=math_wg_order_barrier,
+                            math_wg_order_state=math_wg_order_state,
+                            epi_wg_order_barrier=epi_wg_order_barrier,
+                            epi_wg_order_state=epi_wg_order_state,
+                            gmem_fc1_c=gmem_fc1_c,
+                        )
+                        self._store_fc1_task_tile(
+                            work_tile_info=work_tile_info,
+                            smem_fc1_output_buffer=smem_fc1_output_buffer,
+                            tma_atom_fc1_output=tma_atom_fc1_output,
+                            sched_ext=sched_ext,
+                            gmem_fc1_output=gmem_fc1_output,
+                            local_warp_idx=local_warp_idx,
+                            n_half=1,
+                            store_stage_idx=cutlass.Int32(1),
+                            storage_group_idx=(
+                                warpgroup_idx if self._pingpong else 1
+                            ),
+                            _iket_active=_iket_active,
+
+                            gmem_fc1_done_counter=gmem_fc1_done_counter,
+                            fc1_offload_full_mbar_ptr=fc1_offload_full_mbar_ptr,
+                            fc1_offload_mbox=fc1_offload_mbox,
+                        )
                 else:
                     (
                         ab_consumer_state,
@@ -2286,6 +2415,79 @@ class SwapABFp8GluEpilogue:
                         epi_wg_order_barrier=epi_wg_order_barrier,
                         epi_wg_order_state=epi_wg_order_state,
                     )
+                elif cutlass.const_expr(self._token_back_by_dispatch):
+                    # Dispatch-side token-back runs the epilogue on a smaller
+                    # register file (200/216); the runtime-half copy gave
+                    # outputs that varied run to run there. Keep one copy per
+                    # half in that layout.
+                    if n_half == cutlass.Int32(0):
+                        (
+                            ab_consumer_state,
+                            math_wg_order_state,
+                            epi_wg_order_state,
+                        ) = self._run_fc2_half_tile(
+                            work_tile_info=work_tile_info,
+                            local_warp_idx=local_warp_idx,
+                            tiled_mma=tiled_mma,
+                            tCrA=tCrA,
+                            tCrB=tCrB,
+                            accumulators=accumulators,
+                            accum_temp=accum_temp,
+                            n_half=0,
+                            ab_pipeline=ab_pipeline,
+                            weight_sf_pipeline=weight_sf_pipeline,
+                            ab_consumer_state=ab_consumer_state,
+                            k_tile_cnt_fc1=k_tile_cnt_fc1,
+                            k_tile_cnt_fc2=k_tile_cnt_fc2,
+                            _iket_active=_iket_active,
+                            sched_ext=sched_ext,
+                            gmem_fc2_output=gmem_fc2_output,
+                            smem_activation_sf=smem_activation_sf,
+                            smem_weight_sf=smem_weight_sf,
+                            valid_hidden=valid_hidden,
+                            tidx=tidx,
+                            fc2_act_weight_dequant_scale=fc2_act_weight_dequant_scale,
+                            token_comm_args=token_comm_args,
+                            run_wgmma_task_tile=run_wgmma_task_tile,
+                            math_wg_order_barrier=math_wg_order_barrier,
+                            math_wg_order_state=math_wg_order_state,
+                            epi_wg_order_barrier=epi_wg_order_barrier,
+                            epi_wg_order_state=epi_wg_order_state,
+                        )
+                    else:
+                        (
+                            ab_consumer_state,
+                            math_wg_order_state,
+                            epi_wg_order_state,
+                        ) = self._run_fc2_half_tile(
+                            work_tile_info=work_tile_info,
+                            local_warp_idx=local_warp_idx,
+                            tiled_mma=tiled_mma,
+                            tCrA=tCrA,
+                            tCrB=tCrB,
+                            accumulators=accumulators,
+                            accum_temp=accum_temp,
+                            n_half=1,
+                            ab_pipeline=ab_pipeline,
+                            weight_sf_pipeline=weight_sf_pipeline,
+                            ab_consumer_state=ab_consumer_state,
+                            k_tile_cnt_fc1=k_tile_cnt_fc1,
+                            k_tile_cnt_fc2=k_tile_cnt_fc2,
+                            _iket_active=_iket_active,
+                            sched_ext=sched_ext,
+                            gmem_fc2_output=gmem_fc2_output,
+                            smem_activation_sf=smem_activation_sf,
+                            smem_weight_sf=smem_weight_sf,
+                            valid_hidden=valid_hidden,
+                            tidx=tidx,
+                            fc2_act_weight_dequant_scale=fc2_act_weight_dequant_scale,
+                            token_comm_args=token_comm_args,
+                            run_wgmma_task_tile=run_wgmma_task_tile,
+                            math_wg_order_barrier=math_wg_order_barrier,
+                            math_wg_order_state=math_wg_order_state,
+                            epi_wg_order_barrier=epi_wg_order_barrier,
+                            epi_wg_order_state=epi_wg_order_state,
+                        )
                 else:
                     (
                         ab_consumer_state,

@@ -156,8 +156,12 @@ not picked them up):
   `src/src/ptx_helpers.py` adds `red_add_relaxed_gpu_s32_raw`.
   `megamoe_kernel_fp8.py` takes ctor kwargs `dispatch_pull_batch` /
   `dispatch_pull_rotate`. `epilogue_fp8_swapab.py` and the MX
-  `run_wgmma_task_tile` take `n_half` as a runtime value, so FC1 and FC2
-  share one code copy. Host side, FP8: shim config fields + compile key,
+  `run_wgmma_task_tile` take `n_half` as a runtime value, so the two
+  epilogue warpgroups share one code copy with `token_back_mode='epi_warps'`.
+  Dispatch-side token-back (`reuse_dispatch_warps` / `standalone_warps`)
+  keeps one copy per half: that path has an intermittent upstream race
+  (outputs vary run to run on main too), which the shared copy made far more
+  frequent. Host side, FP8: shim config fields + compile key,
   backend config, and bench `--dispatch-pull-batch` /
   `--[no-]dispatch-pull-rotate`. MX/NV: both fields are tactic fields, and
   `compact_pull_buffer` becomes an MX tactic field (NV already had it). See
@@ -181,7 +185,8 @@ not picked them up):
   weights after the (last) WGMMA commit, while the WGMMAs read the
   converted registers. Only token tiles of N >= 64 use it
   (`_prefetch_next_stage`): N16/N32 tiles measured 2-3% slower with it and
-  keep the in-order loop, compiled exactly as before. The K256 paths
+  keep the in-order loop, compiled exactly as before, as does dispatch-side
+  token-back (it made that path's intermittent race frequent). The K256 paths
   (`*_k256*`, NV's FC1 K256 override) are unchanged. NV K128 tiles share
   these loops. Not in the drop tree.
 - MXFP4 optimization version `fused_local_v4` (2026-10-27):
