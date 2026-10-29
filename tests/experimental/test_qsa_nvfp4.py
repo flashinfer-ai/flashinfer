@@ -274,6 +274,7 @@ def test_matches_reference(kv_dtype, layout, rows, num_qo_heads, num_kv_heads):
         rows,
         num_kv_heads,
         math.ceil(WIDTH / tile_tokens),
+        kv_format,
         _resident_ctas(q.device.index, kv_format),
     )
     contract, tolerance, exact, bound = _reference(

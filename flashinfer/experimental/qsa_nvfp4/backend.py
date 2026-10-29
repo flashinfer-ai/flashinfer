@@ -36,20 +36,31 @@ _FORMATS = {
 
 
 @functools.cache
-def _resident_ctas(device_index: int, kv_format: int) -> int:
+def _resident_ctas(device_index: int, kv_format: int) -> tuple[int, int]:
+    """SM count and resident CTAs per SM."""
     with torch.cuda.device(device_index):
         ctas_per_sm = get_qsa_nvfp4_module().ctas_per_sm(kv_format)
-    return (
-        ctas_per_sm
-        * torch.cuda.get_device_properties(device_index).multi_processor_count
-    )
+    num_sms = torch.cuda.get_device_properties(device_index).multi_processor_count
+    return num_sms, ctas_per_sm
 
 
 def _num_splits(
-    num_rows: int, num_kv_heads: int, num_tiles: int, resident_ctas: int
+    num_rows: int,
+    num_kv_heads: int,
+    num_tiles: int,
+    kv_format: int,
+    resident: tuple[int, int],
 ) -> int:
-    # Fill one wave of resident CTAs, then use the fewest splits with the same tiles per split.
-    splits = min(num_tiles, max(1, resident_ctas // (num_rows * num_kv_heads)))
+    num_sms, ctas_per_sm = resident
+    work = num_rows * num_kv_heads
+    # Fill one wave of resident CTAs. BF16 runs faster at one CTA per SM until that
+    # leaves eight or more tiles per split.
+    splits = min(num_tiles, max(1, ctas_per_sm * num_sms // work))
+    if kv_format == 2:
+        one_per_sm = min(num_tiles, max(1, num_sms // work))
+        if math.ceil(num_tiles / one_per_sm) < 8:
+            splits = one_per_sm
+    # Then use the fewest splits with the same tiles per split.
     return math.ceil(num_tiles / math.ceil(num_tiles / splits))
 
 
@@ -197,7 +208,11 @@ def qsa_sparse_paged_attention(
 
     num_tiles = math.ceil((logical_indices.shape[1] - 1) / tile_tokens)
     num_splits = _num_splits(
-        num_rows, num_kv_heads, num_tiles, _resident_ctas(q.device.index, kv_format)
+        num_rows,
+        num_kv_heads,
+        num_tiles,
+        kv_format,
+        _resident_ctas(q.device.index, kv_format),
     )
     if num_splits > 1:
         partial_out = q.new_empty(
