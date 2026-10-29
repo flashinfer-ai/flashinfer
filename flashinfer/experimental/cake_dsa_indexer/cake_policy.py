@@ -134,8 +134,10 @@ SAMPLE_SHIFT_PERMILLE_BOUNDS = (-1000, 10000)
 # Global unit tickets (every sm_100a / sm_103a scan program): the CTAs draw every
 # work unit from the low u32 word of the first int64 behind the candidate buffers
 # (and behind the split staging), a 128-byte tail every plan's workspace carries.
-# The host zeroes it right before every scan launch on those architectures
-# (``cake_backend``); sm_107a leaves it unused.
+# Every completed scan launch leaves the word at 0; the host (``cake_backend``)
+# zeroes the tail once at prepare on a backend-owned workspace and before every
+# run on a caller-owned ``workspace_buffer``, which others may write between
+# runs.  sm_107a leaves the tail unused.
 TICKET_TAIL_BYTES = 128
 
 _INT = ("tile_keys", "block_q_narrow", "block_q_wide", "block_q_l6", "candidate_entry_bytes", "candidate_multiplier",

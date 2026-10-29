@@ -117,8 +117,11 @@ ARG_PLANS: dict[str, list[list[str]]] = {
 }
 # The architectures whose scan programs draw every work unit from the workspace's
 # ticket tail (``cake_policy.TICKET_TAIL_BYTES``): every sm_100a / sm_103a scan
-# program.  The host zeroes the tail right before every scan launch on them
-# (``cake_backend``); sm_107a keeps the static unit enumeration and leaves it unused.
+# program.  Every completed scan launch leaves the ticket word at 0; the host
+# (``cake_backend``) zeroes the tail once when it prepares a runner on its own
+# workspace, and before every run on a caller-owned ``workspace_buffer`` (others
+# may write that buffer between runs).  sm_107a keeps the static unit
+# enumeration and leaves the tail unused.
 TICKET_TAIL_ARCHES: tuple[str, ...] = ("sm_100a", "sm_103a")
 PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_dsa_indexer_topk_0d38735ee8e81ae6f5e8": {
