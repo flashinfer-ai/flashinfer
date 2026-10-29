@@ -21,17 +21,24 @@ Use `--dtype mxfp4_mxfp8 --arch sm107` for mixed-format offline tuning, or
 MXFP8 activation staging and uses packed E2M1 weights with block-32 E8M0
 scales. Its tuning cache entries are separate from the MXFP8-weight entries.
 
-For contiguous BF16 inputs and top-k up to 32, MXFP8 staging checks route
+For contiguous BF16 inputs and top-k up to 32, NVFP4 and MXFP8 staging check route
 bounds, duplicate experts and finite unmasked scores in the quantization kernel.
 These checks remain active during graph replay. Unsupported layouts and
 prequantized inputs retain separate routing validation. Set
 `FLASHINFER_SM107_FUSED_ROUTE_CHECK=0` to use separate validation for diagnostics.
 
-MXFP8 staging also masks trailing routing rows in the quantization launch,
+NVFP4 and MXFP8 staging also mask trailing routing rows in the quantization launch,
 including when replaying graphs with different live row counts in a shared
 workspace. Empty inputs and tails exceeding 16 routing elements per live CTA
 thread retain a separate parallel fill. Set
 `FLASHINFER_SM107_FUSED_TAIL_MASK=0` to use the separate tail clear for diagnostics.
+
+NVFP4 backend defaults for `fc1_alpha`, `fc2_alpha`, and `fc1_norm_const`
+bind a workspace-owned read-only ones tensor instead of filling three tensors
+on every call. Explicit contiguous FP32 tensors are also bound directly; other
+layouts retain the copy path. The default tensor is separate from mutable
+workspace scalar storage so pooled layers and captured graphs cannot overwrite
+each other's default values.
 
 ## What the benchmark measures
 

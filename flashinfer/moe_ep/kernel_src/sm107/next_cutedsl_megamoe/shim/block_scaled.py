@@ -500,8 +500,9 @@ class Sm107BlockScaledSymmBuffer:
             (tokens, cfg.num_topk), -1, dtype=torch.int32, device="cuda"
         )
         # Stable local-expert pointers allow per-call scaling updates in graphs.
-        # Per-call tensors are bound as launch arguments (bind_scalars); other
-        # values and defaults are copied in by the backend staging call.
+        # Mutable tensors serve explicit low-level calls and layout fallbacks.
+        # Backend defaults bind a separate read-only ones tensor, which cannot
+        # be overwritten by another layer or graph using these mutable tensors.
         for name in _SCALAR_NAMES:
             setattr(
                 self,
@@ -512,6 +513,11 @@ class Sm107BlockScaledSymmBuffer:
                 if cfg.quant_kind == "nvfp4"
                 else None,
             )
+        self._default_scalar = (
+            torch.ones(cfg.experts_per_rank, dtype=torch.float32, device=self.device)
+            if cfg.quant_kind == "nvfp4"
+            else None
+        )
         if self.topk_idx.data_ptr() % 16 != 0:
             raise RuntimeError("routing index tensor must be 16-byte aligned.")
 
@@ -933,6 +939,7 @@ class Sm107BlockScaledSymmBuffer:
             forget_staged_tokens(self.topk_idx)
         self.topk_idx = None
         self.fc1_alpha = self.fc2_alpha = self.fc1_norm_const = None
+        self._default_scalar = None
         self._destroyed = True
 
 
