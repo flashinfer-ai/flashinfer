@@ -677,6 +677,26 @@ def _is_current_stream_capturing() -> bool:
         return False
 
 
+def _call_context() -> str:
+    """Autotuner and CUDA-graph state of the current call, as one log line.
+
+    Lets a reader of the log tell calls made while autotuning or capturing CUDA graphs
+    (typically during engine startup) from calls made while serving. The autotuner is
+    read only if it is already imported: tuning cannot be active otherwise, and
+    importing it here would pull in the JIT stack.
+    """
+    tuning = profiling = False
+    autotuner = sys.modules.get("flashinfer.autotuner.autotuner")
+    if autotuner is not None:
+        tuner = autotuner.AutoTuner._instance
+        tuning = bool(tuner is not None and tuner.is_tuning_mode)
+        profiling = autotuner.is_in_profile_measurement()
+    return (
+        f"Call context: autotuning={tuning} autotune_profiling={profiling} "
+        f"cuda_graph_capture={_is_current_stream_capturing()}"
+    )
+
+
 def _extract_tensors_and_metadata_graph_refs(
     args: tuple, kwargs: dict
 ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
@@ -1730,6 +1750,9 @@ def _log_system_info():
     lines.append("=" * 80)
 
     try:
+        zone = datetime.now().astimezone().strftime("%Z, UTC%z")
+        lines.append(f"Timestamps: local time ({zone})")
+
         # FlashInfer version
         try:
             from .version import __version__ as flashinfer_version
@@ -2144,6 +2167,7 @@ def _log_function_inputs(
     lines.append("=" * 80)
     lines.append(f"{_get_timestamp()} FlashInfer API Call: {func_name}")
     lines.append("-" * 80)
+    lines.append(_call_context())
 
     # Log explicitly provided inputs
     if args or kwargs:

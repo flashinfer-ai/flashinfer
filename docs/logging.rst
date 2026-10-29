@@ -59,6 +59,27 @@ Logging Levels
      - Level 5 + dumps all input/output tensors to ``.pt`` (or ``.safetensors``) files
      - Full Reproducibility / Debugging
 
+Call Context
+------------
+
+At level 3 and above, every logged call carries a context line right after its header:
+
+.. code-block:: text
+
+    [2026-10-23 07:12:58] FlashInfer API Call: trtllm_fp4_block_scale_routed_moe
+    --------------------------------------------------------------------------------
+    Call context: autotuning=True autotune_profiling=False cuda_graph_capture=False
+
+- ``autotuning``: the call runs inside an ``autotune(True)`` context (``AutoTuner.is_tuning_mode``).
+- ``autotune_profiling``: the call is one of the autotuner's own tactic measurements
+  (``is_in_profile_measurement()``), a narrower subset of ``autotuning``.
+- ``cuda_graph_capture``: the current CUDA stream is capturing a CUDA graph. Calls replayed from a
+  captured graph are not logged again.
+
+Together with the timestamps, this separates calls made during engine startup (autotuning, warmup,
+CUDA-graph capture) from calls made while serving. Timestamps are in the process's local time, with
+one-second resolution; the system information block at the top of the log states the time zone.
+
 Environment Variables
 ---------------------
 

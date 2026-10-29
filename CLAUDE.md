@@ -764,6 +764,7 @@ FlashInfer provides the `@flashinfer_api` decorator for debugging API calls.
 - **Zero overhead when disabled**: `FLASHINFER_LOGLEVEL=0` (default)
 - **Multiple verbosity levels**: 0 (off), 1 (names), 3 (inputs/outputs), 5 (+ statistics)
 - **CUDA graph compatible**: Auto-skips stats during graph capture
+- **Call context** (level 3+): each call records whether it ran while autotuning or capturing a CUDA graph, so startup calls can be told from serving calls
 
 **Quick usage:**
 ```bash
