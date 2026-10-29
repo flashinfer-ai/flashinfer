@@ -48,6 +48,7 @@ class ApiFunction:
     keyword_only: tuple[ApiParameter, ...]
     kwarg: ApiParameter | None
     return_annotation: str | None
+    type_aliases: tuple[tuple[str, str], ...]
 
 
 @dataclass(frozen=True)
@@ -141,10 +142,6 @@ def parameters(
     )
 
 
-def is_none_annotation(node: ast.expr) -> bool:
-    return isinstance(node, ast.Constant) and node.value is None
-
-
 def typing_annotation_name(node: ast.expr) -> str | None:
     if isinstance(node, ast.Name):
         return node.id
@@ -154,26 +151,6 @@ def typing_annotation_name(node: ast.expr) -> str | None:
         and node.value.id == "typing"
     ):
         return node.attr
-    return None
-
-
-def optional_annotation_payload(node: ast.expr) -> ast.expr | None:
-    if isinstance(node, ast.Subscript):
-        annotation_name = typing_annotation_name(node.value)
-        if annotation_name == "Optional":
-            return node.slice
-        if annotation_name == "Union" and isinstance(node.slice, ast.Tuple):
-            elements = node.slice.elts
-            if len(elements) == 2:
-                if is_none_annotation(elements[0]):
-                    return elements[1]
-                if is_none_annotation(elements[1]):
-                    return elements[0]
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
-        if is_none_annotation(node.left):
-            return node.right
-        if is_none_annotation(node.right):
-            return node.left
     return None
 
 
@@ -187,7 +164,122 @@ def literal_annotation_values(node: ast.expr) -> frozenset[str] | None:
     return frozenset(ast.dump(member) for member in members)
 
 
-def is_compatible_annotation(before: str | None, after: str | None) -> bool:
+def annotation_aliases(api: ApiFunction) -> dict[str, str]:
+    return dict(api.type_aliases)
+
+
+def expand_annotation_alias(
+    node: ast.expr,
+    aliases: dict[str, str],
+    seen: frozenset[str] = frozenset(),
+) -> ast.expr:
+    """Expand a module-local type alias used as a complete annotation."""
+    if not isinstance(node, ast.Name) or node.id not in aliases or node.id in seen:
+        return node
+    try:
+        expanded = ast.parse(aliases[node.id], mode="eval").body
+    except SyntaxError:
+        return node
+    return expand_annotation_alias(expanded, aliases, seen | {node.id})
+
+
+def union_annotation_members(
+    node: ast.expr, aliases: dict[str, str]
+) -> tuple[ast.expr, ...] | None:
+    node = expand_annotation_alias(node, aliases)
+    if isinstance(node, ast.Subscript):
+        annotation_name = typing_annotation_name(node.value)
+        if annotation_name == "Optional":
+            return (node.slice, ast.Constant(value=None))
+        if annotation_name == "Union":
+            elements = (
+                node.slice.elts if isinstance(node.slice, ast.Tuple) else (node.slice,)
+            )
+            return tuple(elements)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        left = union_annotation_members(node.left, aliases) or (node.left,)
+        right = union_annotation_members(node.right, aliases) or (node.right,)
+        return (*left, *right)
+    return None
+
+
+def subscript_arguments(node: ast.Subscript) -> tuple[ast.expr, ...]:
+    return node.slice.elts if isinstance(node.slice, ast.Tuple) else (node.slice,)
+
+
+def is_tuple_annotation(node: ast.expr) -> bool:
+    return isinstance(node, ast.Subscript) and (
+        typing_annotation_name(node.value) == "Tuple"
+        or (isinstance(node.value, ast.Name) and node.value.id == "tuple")
+    )
+
+
+def annotation_accepts(
+    before: ast.expr,
+    after: ast.expr,
+    before_aliases: dict[str, str],
+    after_aliases: dict[str, str],
+) -> bool:
+    """Return whether every value described by *before* is accepted by *after*."""
+    before = expand_annotation_alias(before, before_aliases)
+    after = expand_annotation_alias(after, after_aliases)
+    if ast.dump(before) == ast.dump(after):
+        return True
+
+    before_members = union_annotation_members(before, before_aliases)
+    after_members = union_annotation_members(after, after_aliases)
+    if before_members is not None or after_members is not None:
+        old_members = before_members or (before,)
+        new_members = after_members or (after,)
+        return all(
+            any(
+                annotation_accepts(
+                    old_member,
+                    new_member,
+                    before_aliases,
+                    after_aliases,
+                )
+                for new_member in new_members
+            )
+            for old_member in old_members
+        )
+
+    before_literal = literal_annotation_values(before)
+    after_literal = literal_annotation_values(after)
+    if before_literal is not None or after_literal is not None:
+        return (
+            before_literal is not None
+            and after_literal is not None
+            and before_literal <= after_literal
+        )
+
+    if is_tuple_annotation(before) and is_tuple_annotation(after):
+        assert isinstance(before, ast.Subscript)
+        assert isinstance(after, ast.Subscript)
+        old_items = subscript_arguments(before)
+        new_items = subscript_arguments(after)
+        if (
+            len(new_items) == 2
+            and isinstance(new_items[1], ast.Constant)
+            and new_items[1].value is Ellipsis
+        ):
+            return all(
+                annotation_accepts(item, new_items[0], before_aliases, after_aliases)
+                for item in old_items
+            )
+        return len(old_items) == len(new_items) and all(
+            annotation_accepts(old, new, before_aliases, after_aliases)
+            for old, new in zip(old_items, new_items, strict=True)
+        )
+    return False
+
+
+def is_compatible_annotation(
+    before: str | None,
+    after: str | None,
+    before_aliases: dict[str, str] | None = None,
+    after_aliases: dict[str, str] | None = None,
+) -> bool:
     if before == after:
         return True
     if before is None or after is None:
@@ -197,45 +289,58 @@ def is_compatible_annotation(before: str | None, after: str | None) -> bool:
         after_node = ast.parse(after, mode="eval").body
     except SyntaxError:
         return False
-    payload = optional_annotation_payload(after_node)
-    if payload is not None and ast.dump(before_node) == ast.dump(payload):
-        return True
-    # A ``Literal`` that keeps every old member and adds new ones accepts every
-    # value the old signature accepted (for example a new ``backend`` choice).
-    before_literal = literal_annotation_values(before_node)
-    after_literal = literal_annotation_values(after_node)
-    return (
-        before_literal is not None
-        and after_literal is not None
-        and before_literal <= after_literal
+    return annotation_accepts(
+        before_node,
+        after_node,
+        before_aliases or {},
+        after_aliases or {},
     )
 
 
-def is_compatible_parameter(before: ApiParameter, after: ApiParameter) -> bool:
+def is_compatible_parameter(
+    before: ApiParameter,
+    after: ApiParameter,
+    before_aliases: dict[str, str],
+    after_aliases: dict[str, str],
+) -> bool:
     return (
         before.name == after.name
-        and is_compatible_annotation(before.annotation, after.annotation)
+        and is_compatible_annotation(
+            before.annotation,
+            after.annotation,
+            before_aliases,
+            after_aliases,
+        )
         and (before.default is None or before.default == after.default)
     )
 
 
 def is_compatible_signature_extension(before: ApiFunction, after: ApiFunction) -> bool:
-    """Return whether *after* is a narrowly compatible input widening.
+    """Return whether *after* is a narrowly compatible API widening.
 
-    Existing ``*args``/``**kwargs`` APIs are kept conservative: a new named
-    parameter can consume arguments that the old implementation forwarded.
+    Existing ``**kwargs`` APIs are kept conservative because a new named
+    parameter can consume a keyword the old implementation forwarded. A
+    ``*args`` parameter does not have that issue for new keyword-only options.
+    A wider return annotation is accepted only alongside a new optional input,
+    which represents an additive opt-in result while preserving the old member.
     """
+    before_aliases = annotation_aliases(before)
+    after_aliases = annotation_aliases(after)
+    return_changed = before.return_annotation != after.return_annotation
     if (
         before.is_async != after.is_async
-        or before.return_annotation != after.return_annotation
+        or not is_compatible_annotation(
+            before.return_annotation,
+            after.return_annotation,
+            before_aliases,
+            after_aliases,
+        )
         or before.vararg != after.vararg
         or before.kwarg != after.kwarg
-        or before.vararg is not None
-        or before.kwarg is not None
     ):
         return False
     if len(before.positional_only) != len(after.positional_only) or not all(
-        is_compatible_parameter(old, new)
+        is_compatible_parameter(old, new, before_aliases, after_aliases)
         for old, new in zip(
             before.positional_only,
             after.positional_only,
@@ -247,13 +352,17 @@ def is_compatible_signature_extension(before: ApiFunction, after: ApiFunction) -
     old_positional = before.positional_or_keyword
     new_positional = after.positional_or_keyword
     if len(new_positional) < len(old_positional) or not all(
-        is_compatible_parameter(old, new)
+        is_compatible_parameter(old, new, before_aliases, after_aliases)
         for old, new in zip(
             old_positional,
             new_positional[: len(old_positional)],
             strict=True,
         )
     ):
+        return False
+    if before.vararg is not None and len(new_positional) != len(old_positional):
+        return False
+    if before.kwarg is not None and len(new_positional) != len(old_positional):
         return False
     if any(item.default is None for item in new_positional[len(old_positional) :]):
         return False
@@ -263,21 +372,53 @@ def is_compatible_signature_extension(before: ApiFunction, after: ApiFunction) -
     if not old_keyword_only.keys() <= new_keyword_only.keys():
         return False
     if any(
-        not is_compatible_parameter(item, new_keyword_only[name])
+        not is_compatible_parameter(
+            item,
+            new_keyword_only[name],
+            before_aliases,
+            after_aliases,
+        )
         for name, item in old_keyword_only.items()
     ):
         return False
-    return all(
+    if before.kwarg is not None and old_keyword_only.keys() != new_keyword_only.keys():
+        return False
+    if not all(
         item.default is not None
         for name, item in new_keyword_only.items()
         if name not in old_keyword_only
-    )
+    ):
+        return False
+
+    added_parameter = len(new_positional) > len(old_positional) or len(
+        new_keyword_only
+    ) > len(old_keyword_only)
+    return not return_changed or added_parameter
 
 
 def is_compatible_api(before: ApiFunction, after: ApiFunction) -> bool:
     return before.signature == after.signature or is_compatible_signature_extension(
         before, after
     )
+
+
+def module_type_aliases(tree: ast.Module) -> tuple[tuple[str, str], ...]:
+    """Collect simple module-scope aliases that can appear in annotations."""
+    aliases: dict[str, str] = {}
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            aliases[node.targets[0].id] = ast.unparse(node.value)
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.value is not None
+        ):
+            aliases[node.target.id] = ast.unparse(node.value)
+    return tuple(sorted(aliases.items()))
 
 
 def extract_public_apis(path: str, source: str | None) -> dict[str, ApiFunction]:
@@ -293,6 +434,7 @@ def extract_public_apis(path: str, source: str | None) -> dict[str, ApiFunction]
         module_parts.pop()
     module = ".".join(module_parts)
     result: dict[str, ApiFunction] = {}
+    type_aliases = module_type_aliases(tree)
 
     def visit(parent: ast.AST, class_prefix: str = "") -> None:
         for child in ast.iter_child_nodes(parent):
@@ -324,6 +466,7 @@ def extract_public_apis(path: str, source: str | None) -> dict[str, ApiFunction]
                         return_annotation=(
                             ast.unparse(child.returns) if child.returns else None
                         ),
+                        type_aliases=type_aliases,
                     )
                 visit(child, class_prefix)
 
