@@ -8,13 +8,13 @@
 # issued @flashinfer-bot run for the current commit.
 #
 # Scope preservation:
-#   If the PR's comment history contains previous `@flashinfer-bot run <paths>`
-#   commands from authorized users, the auto-trigger reuses that scope. Multiple
-#   scoped commands for the same commit are aggregated (union of paths) — the
-#   assumption is that the user requested one scope, then extended it. A new
-#   commit with its own scoped commands replaces the previous scope; a new
-#   commit without any inherits the most recent scope.
-#   If no scoped run was ever requested, the full suite runs.
+#   The auto-trigger ONLY runs if a previous `@flashinfer-bot run <paths>`
+#   command from an authorized user exists in the PR's history. If no scope
+#   was ever specified, the workflow does NOT trigger — contributors must
+#   explicitly scope their CI runs.
+#   Multiple scoped commands for the same commit are aggregated (union of
+#   paths). A new commit with its own scoped commands replaces the previous
+#   scope; a new commit without any inherits the most recent scope.
 #   The scope is published as ci/test-scope-N commit statuses on the HEAD SHA,
 #   exactly as ci-bot-commands.yml does, so pr-test.yml reads it the same way.
 #
@@ -222,9 +222,9 @@ jobs:
       #   - A new commit with NO scoped commands inherits the most recent
       #     scope — the scope carries forward until explicitly overridden.
       #
-      # If no scoped run was ever requested, scope_args is empty and the
-      # publish-scope step will clear any stale scope statuses so the full
-      # suite runs cleanly.
+      # If no scoped run was ever requested, scope_args is empty,
+      # has_scope is false, and the workflow skips publish-scope and
+      # label application — CI is not auto-triggered without a scope.
       - name: Detect previous scoped run from comments
         id: scope
         if: >-
@@ -340,11 +340,13 @@ jobs:
           fi
 
           if [[ -z "$LAST_SCOPE" ]]; then
-            echo "No previous scoped run found; full suite will run"
+            echo "No previous scoped run found; skipping auto-trigger (scope required)"
             echo "scope_args=" >> "$GITHUB_OUTPUT"
+            echo "has_scope=false" >> "$GITHUB_OUTPUT"
           else
             echo "Found scope: $LAST_SCOPE"
             echo "scope_args=$LAST_SCOPE" >> "$GITHUB_OUTPUT"
+            echo "has_scope=true" >> "$GITHUB_OUTPUT"
           fi
 
       # Publish the scope as ci/test-scope-N commit statuses, mirroring
@@ -360,6 +362,7 @@ jobs:
           steps.org-check.outputs.is_member == 'true'
           && steps.approval-check.outputs.approved == 'true'
           && steps.ci-check.outputs.needs_ci == 'true'
+          && steps.scope.outputs.has_scope == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
@@ -384,11 +387,11 @@ jobs:
             done
           }
 
-          # If no scope was detected, just clear any stale statuses and exit.
+          # If no scope was detected, this step shouldn't run (gated by
+          # has_scope == 'true'), but guard defensively.
           if [[ -z "$SCOPE_ARGS" ]]; then
-            echo "No scope to publish; clearing any stale scope statuses"
-            clear_stale_scopes
-            exit 0
+            echo "::error::Publish-scope reached with empty scope"
+            exit 1
           fi
 
           # Validate and chunk the scope paths using the same script as
@@ -398,17 +401,17 @@ jobs:
           if ! SCOPE=$(python3 scripts/pr_checks/experimental_test_scope.py \
                 --targets "$SCOPE_ARGS" --root tests/ --no-check-exists --test-path \
                 2>/tmp/scope_err); then
-            echo "::warning::Previous scope failed validation ($(cat /tmp/scope_err)); clearing stale scopes and running full suite"
+            echo "::warning::Previous scope failed validation ($(cat /tmp/scope_err)); aborting auto-trigger"
             clear_stale_scopes
-            exit 0
+            exit 1
           fi
 
           if ! CHUNKED=$(python3 scripts/pr_checks/experimental_test_scope.py \
                 --targets "$SCOPE" --root tests/ --no-check-exists --chunk 140 \
                 2>/tmp/scope_err); then
-            echo "::warning::Scope chunking failed ($(cat /tmp/scope_err)); clearing stale scopes and running full suite"
+            echo "::warning::Scope chunking failed ($(cat /tmp/scope_err)); aborting auto-trigger"
             clear_stale_scopes
-            exit 0
+            exit 1
           fi
 
           mapfile -t CHUNKS <<< "$CHUNKED"
@@ -445,6 +448,7 @@ jobs:
           steps.org-check.outputs.is_member == 'true'
           && steps.approval-check.outputs.approved == 'true'
           && steps.ci-check.outputs.needs_ci == 'true'
+          && steps.scope.outputs.has_scope == 'true'
           && steps.publish-scope.outcome != 'failure'
           && secrets.FLASHINFER_BOT_TOKEN != ''
         env:
