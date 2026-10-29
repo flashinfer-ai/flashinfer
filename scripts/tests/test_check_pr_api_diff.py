@@ -166,19 +166,9 @@ class SignatureCompatibilityTest(unittest.TestCase):
                 "def api(value: int, *args: object, added: str = 'x', last: int = 2) -> None",
             ),
             (
-                "return union keeps the old result",
-                "def api(value: int) -> tuple[int, int]",
-                "def api(value: int, details: bool = False) -> tuple[int, int] | tuple[int, int, int]",
-            ),
-            (
-                "return tuple member widens",
-                "def api(value: int) -> tuple[int, str]",
-                "def api(value: int, alternate: bool = False) -> tuple[int, Optional[str]]",
-            ),
-            (
-                "fixed return tuple widens to variadic",
-                "def api(value: int) -> tuple[int, int]",
-                "def api(value: int, extra: bool = False) -> tuple[int, ...]",
+                "variadic tuple input widens",
+                "def api(value: tuple[int, ...]) -> None",
+                "def api(value: tuple[int | str, ...]) -> None",
             ),
         )
 
@@ -289,6 +279,21 @@ class SignatureCompatibilityTest(unittest.TestCase):
                 "def api(value: int) -> int | str",
             ),
             (
+                "return union widened with an opt-in input",
+                "def api(value: int) -> tuple[int, int]",
+                "def api(value: int, details: bool = False) -> tuple[int, int] | tuple[int, int, int]",
+            ),
+            (
+                "return tuple member widens",
+                "def api(value: int) -> tuple[int, str]",
+                "def api(value: int, alternate: bool = False) -> tuple[int, Optional[str]]",
+            ),
+            (
+                "fixed return tuple widens to variadic",
+                "def api(value: int) -> tuple[int, int]",
+                "def api(value: int, extra: bool = False) -> tuple[int, ...]",
+            ),
+            (
                 "function became async",
                 "def api(value: int) -> None",
                 "async def api(value: int) -> None",
@@ -322,10 +327,9 @@ class TypeAliasCompatibilityTest(unittest.TestCase):
             "flashinfer/example.py": textwrap.dedent(
                 """
                 Backend = Literal["first", "second", "third"]
-                Plan = Union[OldPlan, NewPlan]
 
                 @flashinfer_api
-                def api(backend: Backend = "first", fallback: bool = False) -> Plan:
+                def api(backend: Backend = "first") -> OldPlan:
                     pass
                 """
             )
@@ -350,6 +354,33 @@ class TypeAliasCompatibilityTest(unittest.TestCase):
 
                 @flashinfer_api
                 def api(backend: Backend = "first") -> None:
+                    pass
+                """
+            )
+        }
+
+        self.assertEqual(
+            tuple(finding.check for finding in compare_snapshots(base, head)),
+            ("public_api_signature_changed",),
+        )
+
+    def test_module_local_alias_cannot_hide_return_widening(self) -> None:
+        base = {
+            "flashinfer/example.py": textwrap.dedent(
+                """
+                @flashinfer_api
+                def api(value: int) -> OldPlan:
+                    pass
+                """
+            )
+        }
+        head = {
+            "flashinfer/example.py": textwrap.dedent(
+                """
+                Plan = Union[OldPlan, NewPlan]
+
+                @flashinfer_api
+                def api(value: int, fallback: bool = False) -> Plan:
                     pass
                 """
             )

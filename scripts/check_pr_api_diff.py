@@ -165,6 +165,7 @@ def literal_annotation_values(node: ast.expr) -> frozenset[str] | None:
 
 
 def annotation_aliases(api: ApiFunction) -> dict[str, str]:
+    """Return the module-local aliases visible to an extracted API."""
     return dict(api.type_aliases)
 
 
@@ -186,6 +187,7 @@ def expand_annotation_alias(
 def union_annotation_members(
     node: ast.expr, aliases: dict[str, str]
 ) -> tuple[ast.expr, ...] | None:
+    """Flatten one supported union annotation into its member expressions."""
     node = expand_annotation_alias(node, aliases)
     if isinstance(node, ast.Subscript):
         annotation_name = typing_annotation_name(node.value)
@@ -204,10 +206,12 @@ def union_annotation_members(
 
 
 def subscript_arguments(node: ast.Subscript) -> tuple[ast.expr, ...]:
+    """Return a subscript's arguments as a tuple for uniform comparison."""
     return node.slice.elts if isinstance(node.slice, ast.Tuple) else (node.slice,)
 
 
 def is_tuple_annotation(node: ast.expr) -> bool:
+    """Return whether *node* is a built-in or typing tuple annotation."""
     return isinstance(node, ast.Subscript) and (
         typing_annotation_name(node.value) == "Tuple"
         or (isinstance(node.value, ast.Name) and node.value.id == "tuple")
@@ -263,6 +267,12 @@ def annotation_accepts(
             and isinstance(new_items[1], ast.Constant)
             and new_items[1].value is Ellipsis
         ):
+            if (
+                len(old_items) == 2
+                and isinstance(old_items[1], ast.Constant)
+                and old_items[1].value is Ellipsis
+            ):
+                old_items = old_items[:1]
             return all(
                 annotation_accepts(item, new_items[0], before_aliases, after_aliases)
                 for item in old_items
@@ -280,6 +290,7 @@ def is_compatible_annotation(
     before_aliases: dict[str, str] | None = None,
     after_aliases: dict[str, str] | None = None,
 ) -> bool:
+    """Return whether *after* accepts every value admitted by *before*."""
     if before == after:
         return True
     if before is None or after is None:
@@ -303,6 +314,7 @@ def is_compatible_parameter(
     before_aliases: dict[str, str],
     after_aliases: dict[str, str],
 ) -> bool:
+    """Return whether one existing parameter remains call-compatible."""
     return (
         before.name == after.name
         and is_compatible_annotation(
@@ -321,20 +333,15 @@ def is_compatible_signature_extension(before: ApiFunction, after: ApiFunction) -
     Existing ``**kwargs`` APIs are kept conservative because a new named
     parameter can consume a keyword the old implementation forwarded. A
     ``*args`` parameter does not have that issue for new keyword-only options.
-    A wider return annotation is accepted only alongside a new optional input,
-    which represents an additive opt-in result while preserving the old member.
+    Return annotations must stay identical: input widening is mechanically
+    checkable, but a signature alone cannot prove that old calls keep the same
+    output type, arity, or default execution path.
     """
     before_aliases = annotation_aliases(before)
     after_aliases = annotation_aliases(after)
-    return_changed = before.return_annotation != after.return_annotation
     if (
         before.is_async != after.is_async
-        or not is_compatible_annotation(
-            before.return_annotation,
-            after.return_annotation,
-            before_aliases,
-            after_aliases,
-        )
+        or before.return_annotation != after.return_annotation
         or before.vararg != after.vararg
         or before.kwarg != after.kwarg
     ):
@@ -390,10 +397,7 @@ def is_compatible_signature_extension(before: ApiFunction, after: ApiFunction) -
     ):
         return False
 
-    added_parameter = len(new_positional) > len(old_positional) or len(
-        new_keyword_only
-    ) > len(old_keyword_only)
-    return not return_changed or added_parameter
+    return True
 
 
 def is_compatible_api(before: ApiFunction, after: ApiFunction) -> bool:
