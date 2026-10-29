@@ -250,6 +250,36 @@ def test_byte_queries_are_the_backends() -> None:
         )
 
 
+def test_kcp_workspace_query_resolves_save_transfer_like_the_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An unset save_transfer resolves to the plan default, as the a2a forward does; an explicit value passes through.
+    from flashinfer.experimental.cake_kda_train import cake_kcp_plan
+
+    calls = []
+    monkeypatch.setattr(
+        cake_kcp_plan, "kcp_workspace_bytes", lambda ctx, **kw: calls.append(kw) or 0
+    )
+    ctx = object()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        public_api.kcp_workspace_bytes(ctx, backward=False)
+        public_api.kcp_workspace_bytes(ctx, backward=False, save_transfer=False)
+        public_api.kcp_workspace_bytes(ctx)
+    assert [kw["save_transfer"] for kw in calls] == [
+        cake_kcp_plan.SAVE_TRANSFER_DEFAULT,
+        False,
+        cake_kcp_plan.SAVE_TRANSFER_DEFAULT,
+    ]
+    assert cake_kcp_plan.SAVE_TRANSFER_DEFAULT is True
+    assert (
+        inspect.signature(public_api.kcp_workspace_bytes)
+        .parameters["save_transfer"]
+        .default
+        is None
+    )
+
+
 def test_support_query_follows_the_capability_table() -> None:
     if not torch.cuda.is_available():
         assert public_api.is_kda_train_supported() is False

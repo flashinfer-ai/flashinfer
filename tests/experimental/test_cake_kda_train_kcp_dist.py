@@ -36,6 +36,11 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from tests.test_helpers.cake_kda_train_kcp_saved import (
+    carry_slots,
+    poison_unwritten_carry,
+    written_tensors,
+)
 from tests.test_helpers.cake_kda_train_reference import (
     GRAD_NAMES,
     kda_exact_with_grads,
@@ -224,12 +229,107 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
     # the shipped default keeps the owner's c1 receive tensor for the backward (save_transfer=True); the recompute
     # form (save_transfer=False) re-sends it and must be bitwise the same
     res_recompute = saved_pass(save_transfer=False)
+    # the forward-only workspace (the KCP forward layout, the lazy pools) against this backward workspace: a saving
+    # forward on an empty workspace holds the predicted bytes and none of the lazy pools, a forward without a saved
+    # set adds their predicted bytes, both give this workspace's out (and the written bytes of its saved set)
+    # bitwise, and the backward that upgrades the forward-only workspace gives the same gradients; workspace=None (a
+    # forward-only arena per call) through autograd too
+    out_b, saved_b = cake_kcp.chunk_kda_kcp_fwd(q, k, v, g, beta, ctx, workspace=ws)
+    ws_f, ws_n = cake_kcp.KcpWorkspace(), cake_kcp.KcpWorkspace()
+    out_f, saved_f = cake_kcp.chunk_kda_kcp_fwd(q, k, v, g, beta, ctx, workspace=ws_f)
+    out_n, _ = cake_kcp.chunk_kda_kcp_fwd(
+        q, k, v, g, beta, ctx, workspace=ws_n, save_for_backward=False
+    )
+    pred_f = cake_kcp_plan.kcp_workspace_bytes(ctx, H=H, backward=False)
+    lazy_f = cake_kcp_plan.kcp_arena_layout(ctx, H=H, backward=False)["lazy"]
+    fwd_only_bytes = (
+        ws_f.bytes == pred_f
+        and not any(ws_f.has(n) for n in cake_kcp_plan.FWD_LAZY_POOLS)
+        and ws_n.bytes == pred_f + lazy_f
+        and (ws_f.local is None or ws_f.local.fwd_layout == "fwd_kcp")
+    )
+    # without save_transfer a forward with a saved set reads the c1 receive and transfer staging pools (that option's
+    # first state) and a forward without a saved set then adds the carry plane; the ring exchange (checked below)
+    # never allocates the c1 receive pool
+    ws_t = cake_kcp.KcpWorkspace()
+    out_t, _ = cake_kcp.chunk_kda_kcp_fwd(
+        q, k, v, g, beta, ctx, workspace=ws_t, save_transfer=False
+    )
+    pred_t = cake_kcp_plan.kcp_workspace_bytes(
+        ctx, H=H, backward=False, save_transfer=False
+    )
+    lay_t = cake_kcp_plan.kcp_arena_layout(
+        ctx, H=H, backward=False, save_transfer=False
+    )
+    fwd_only_bytes = fwd_only_bytes and ws_t.bytes == pred_t and not ws_t.has("carry")
+    cake_kcp.chunk_kda_kcp_fwd(
+        q, k, v, g, beta, ctx, workspace=ws_t, save_for_backward=False
+    )
+    fwd_only_bytes = (
+        fwd_only_bytes and ws_t.bytes == pred_t + lay_t["lazy"] == pred_f + lazy_f
+    )
+    # the carry plane slots the forward never writes (the extra slots beyond n_in when n_out > n_in, the slots of a
+    # zero-length fragment) hold allocator bytes: the saved sets compare on the written bytes, and NaN in the others
+    # must not reach a gradient.  Each rank's NaN bytes go to the report (0 where the plan leaves no slot unwritten).
+    # The slot invariants differ per rank: a rank that breaks one fails this flag with the reason, instead of raising
+    # before the backward's collectives and leaving its peers waiting
+    try:
+        carry_slots(saved_b)
+        carry_poisoned = poison_unwritten_carry(saved_f)
+    except AssertionError as exc:
+        carry_poisoned = f"carry_slots: {exc!r}"
+    dq, dk, dv, dbeta, dg = cake_kcp.chunk_kda_kcp_bwd(
+        q, k, v, g, beta, ctx, dout, saved=saved_f, workspace=ws_f
+    )
+    res_fwd_only = {
+        "out": out_f,
+        "dq": dq,
+        "dk": dk,
+        "dv": dv,
+        "dg": dg,
+        "dbeta": dbeta,
+    }
+    fwd_only_eq = (
+        isinstance(carry_poisoned, int)
+        and torch.equal(out_b, res["out"])
+        and torch.equal(out_n, res["out"])
+        and torch.equal(out_t, res["out"])
+        and saved_f.flags() == saved_b.flags()
+        and all(
+            torch.equal(a, b)
+            for a, b in zip(
+                written_tensors(saved_f), written_tensors(saved_b), strict=True
+            )
+        )
+        and all(torch.equal(res[n], res_fwd_only[n]) for n in TENSORS)
+    )
+    del ws_f, ws_n, ws_t, out_b, saved_b, out_f, saved_f, out_n, out_t, res_fwd_only
+    leaves = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
+    out_0 = cake_kcp.chunk_kda_kcp(*leaves, ctx)
+    out_0.backward(dout)
+    ws_none_eq = torch.equal(out_0.detach(), res["out"]) and all(
+        torch.equal(lf.grad, res[f"d{n}"])
+        for n, lf in zip(("q", "k", "v", "g", "beta"), leaves, strict=True)
+    )
+    del leaves, out_0
     ring_ok = True
     if (
         W > 1 and int(ctx.n_d_max) - 1 <= cake_kcp.RING_MAX_HOPS
     ):  # gate 5: the ring path is bitwise the a2a path; the ring receives no c1 tensor, so recompute form only
         res_ring = saved_pass(exchange="ring", save_transfer=False)
         ring_ok = all(torch.equal(res_recompute[n], res_ring[n]) for n in TENSORS)
+        # a forward-only ring workspace: no c1 receive pool, the hop pools on first use
+        ws_r = cake_kcp.KcpWorkspace()
+        out_r, _ = cake_kcp.chunk_kda_kcp_fwd(
+            q, k, v, g, beta, ctx, workspace=ws_r, exchange="ring"
+        )
+        ring_ok = ring_ok and torch.equal(out_r, res["out"])
+        fwd_only_bytes = (
+            fwd_only_bytes
+            and not ws_r.has("c1_recv")
+            and ws_r.bytes == pred_t - lay_t["pool.c1_recv"] + lay_t["ring"]
+        )
+        del ws_r, out_r
     # every rank (a rank without tokens included) captures and replays the same calls: a rank that stayed eager
     # while the others captured would run its collectives outside the graphs of its peers
     cake_kcp.graph_cache_clear()
@@ -257,6 +357,9 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
         "autograd_eq_saved": all(torch.equal(res[n], res_auto[n]) for n in TENSORS),
         "ckpt_eq_direct": all(torch.equal(res_auto[n], res_ckpt[n]) for n in TENSORS),
         "save_transfer_eq": all(torch.equal(res[n], res_recompute[n]) for n in TENSORS),
+        "fwd_only_eq": fwd_only_eq,
+        "fwd_only_bytes": fwd_only_bytes,
+        "ws_none_eq": ws_none_eq,
         "ring_eq_a2a": ring_ok,
         "graph_replay": events == GRAPH_EVENTS
         and all(torch.equal(res[n], res_graph[n]) for n in TENSORS),
@@ -280,14 +383,17 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
     flag_list = [None] * W
     spec3_list = [None] * W
     events_list = [None] * W
+    carry_list = [None] * W
     if W > 1:
         dist.all_gather_object(flag_list, flags)
         dist.all_gather_object(spec3_list, spec3)
         dist.all_gather_object(events_list, events)
+        dist.all_gather_object(carry_list, carry_poisoned)
     else:
         flag_list = [flags]
         spec3_list = [spec3]
         events_list = [events]
+        carry_list = [carry_poisoned]
     report = {
         "rank": rank,
         "world": W,
@@ -298,6 +404,7 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
         "backend_path": getattr(backend, "path", None),
         "spec3_by_rank": spec3_list,
         "graph_events_by_rank": events_list,
+        "carry_poisoned_bytes_by_rank": carry_list,
     }
     for key in flags:
         report["flags"][key] = all(f[key] for f in flag_list)

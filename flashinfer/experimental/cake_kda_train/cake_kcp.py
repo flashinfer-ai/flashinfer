@@ -380,6 +380,9 @@ LOCAL_PATH_FWD = cake_kcp_plan.LOCAL_PATH_FWD
 LOCAL_PATH_BWD = cake_kcp_plan.LOCAL_PATH_BWD
 LOCAL_LAYOUT_FWD = "fwd"
 LOCAL_LAYOUT_BWD = "replay"
+# a forward-only local arena's layout (:func:`cake_kcp_plan.local_fwd_layout`): the forward runs on the layout its
+# arena was sized for (``KdaWorkspace.fwd_layout``), on a backward arena :data:`LOCAL_LAYOUT_FWD`
+LOCAL_LAYOUT_FWD_ONLY = cake_kcp_plan.LOCAL_LAYOUT_FWD_ONLY
 # The KCP-owned local records (:mod:`.cake_kcp_jit`), by the stage name the launch sequences use: the output program
 # over the K1 ``h`` / ``v_new`` tapes and the ``dA_qk`` / ``dv1`` program whose ``dv1`` K2 reads (the forms the
 # existing backend's output and dA / dv programs had before its fused recurrences took them over).
@@ -626,7 +629,8 @@ class KernelBackend(Backend):
     Local stages (:data:`LOCAL_STAGES_FWD` / :data:`LOCAL_STAGES_BWD`): a forward call runs the existing backend's
     intra program (``write_prep = 1``: the GLM prep's rows and the internal ``Aqk`` / ``Akk`` rows; the token-row
     copies are never written, ``write_ext = 0``), its forward WY program and the KCP's output program ``kcp_fwd_o``
-    (the output from the K1 ``h`` / ``v_new`` tapes) on the arena's ``fwd`` layout, with the records the plan selects
+    (the output from the K1 ``h`` / ``v_new`` tapes) on the arena's forward layout (``fwd``; a forward-only arena's
+    ``fwd_kcp``, :data:`LOCAL_LAYOUT_FWD_ONLY`), with the records the plan selects
     on the forward path without a saved set (:data:`LOCAL_PATH_FWD`).  A backward call runs on the ``replay`` layout
     with the records of the replay path (:data:`LOCAL_PATH_BWD`) in both modes: the replay prep (the GLM prep's rows
     and the internal ``dout`` copy ``do_int``), the intra program (``write_prep = 0``: the internal ``Aqk`` / ``Akk``
@@ -714,7 +718,7 @@ class KernelBackend(Backend):
             raise ValueError(
                 f"local plan geometry (NC_pad, R) = {(p.NC_pad, p.R)} differs from the KCP context's {(ctx.NC_pad, ctx.R)}"
             )
-        views = ws.views(LOCAL_LAYOUT_BWD if call.backward else LOCAL_LAYOUT_FWD)
+        views = ws.views(LOCAL_LAYOUT_BWD if call.backward else ws.fwd_layout)
         if call.host_trim:  # the call-independent part of the value dict is built once per (arena, tables, direction)
             # the template is cached on the ARENA whose views it holds (it dies with the arena), keyed by the
             # table set's identity with a WEAK reference to it (a hit needs that very table set alive); the backend
@@ -3007,9 +3011,15 @@ class KcpWorkspace:
     one identity tile ``eye``.  The backward send pools share the storage of the forward ones
     (``cake_kcp_plan.SHARED_POOLS``: ``b1_send`` = ``c1_send``, ``b2_send`` = ``c2_send``, one tensor of the larger
     need; a call waits its c1 / c2 sends before a backward writes either).  The ring exchange's hop pools
-    ``ring_out`` / ``ring_in`` (``cake_kcp_plan.LAZY_POOLS``) are allocated by the first call that reads them.  The
-    saved-set tensors (``S_in`` = the c2 output, the c1 receive tensor under ``save_transfer``, ``M_seg`` under
-    ``save_transfer`` at ``P > 1``) are never arena slices: the calls allocate them fresh (SPEC-4).  A workspace is
+    ``ring_out`` / ``ring_in`` (``cake_kcp_plan.LAZY_POOLS``) are allocated by the first call that reads them, and so
+    are, on a forward-only workspace, ``c1_recv`` / ``stage_m`` / ``carry`` (``cake_kcp_plan.FWD_LAZY_POOLS``: a
+    forward with a saved set writes a fresh carry plane in place of ``carry`` and, under ``save_transfer``, fresh
+    tensors in place of the other two, which it reads without it; a forward without one reads all three; their first
+    allocation drops the graph-cache entries pinning the workspace, whose keys hold its pools).  A forward-only
+    local arena takes the KCP forward layout (:data:`LOCAL_LAYOUT_FWD_ONLY`, 2432 B per internal token-head); a
+    backward workspace sizes every pool and the existing backend's layouts.  The saved-set tensors (``S_in`` = the c2
+    output, the c1 receive tensor under ``save_transfer``, ``M_seg`` under ``save_transfer`` at ``P > 1``) are never
+    arena slices: the calls allocate them fresh (SPEC-4).  A workspace is
     reusable across calls and layers of the same ``(ctx, H)``; a call with a larger need grows it, releasing each
     superseded pool and local arena (and the graph-cache entries pinning that arena) before allocating its successor
     (the old and the new storage never coexist, so a backward on a forward workspace peaks at the grown workspace plus
@@ -3096,11 +3106,13 @@ class KcpWorkspace:
                 f"KcpWorkspace: lives on {self.device}, the call is on {device}"
             )
         tb = self.tables(ctx, H, fused_walks=fused_walks, walk_geometry=walk_geometry)
+        # allocated by the first call that reads them (pool()): the ring pools; on a forward-only workspace the pools
+        # only a forward without a saved set reads
+        lazy = cake_kcp_plan.LAZY_POOLS + (
+            () if backward else cake_kcp_plan.FWD_LAZY_POOLS
+        )
         need = {
-            name: n
-            for name, n in tb.pool_sizes(backward).items()
-            if name
-            not in cake_kcp_plan.LAZY_POOLS  # allocated by the first call that reads them (pool())
+            name: n for name, n in tb.pool_sizes(backward).items() if name not in lazy
         }
         for pair in cake_kcp_plan.SHARED_POOLS:  # one storage of the larger need
             top = max((need[m] for m in pair if m in need), default=0)
@@ -3133,6 +3145,7 @@ class KcpWorkspace:
                     device,
                     backward=backward,
                     save_mode=self.save_mode,
+                    fwd_layout=cake_kcp_plan.local_fwd_layout(backward, self.save_mode),
                 )
         if host_trim:
             self._last_ensure = (ctx, sig, tb)
@@ -3183,9 +3196,19 @@ class KcpWorkspace:
     def pool(
         self, name: str, n: int | None = None, *, cached: bool = False
     ) -> torch.Tensor:
-        if name in cake_kcp_plan.LAZY_POOLS and n and self.device is not None:
-            if self._grow(name, n, self.device) and self._slices:
-                self._drop_stale_slices()
+        # the graph-cache keys hold the forward-only lazy pools (not the ring's): once one is allocated or replaced, no
+        # later call matches an earlier key of this workspace, so its entries (and their captured memory) go
+        fwd_lazy = name in cake_kcp_plan.FWD_LAZY_POOLS
+        if (
+            (name in cake_kcp_plan.LAZY_POOLS or fwd_lazy)
+            and n
+            and self.device is not None
+        ):
+            if self._grow(name, n, self.device):
+                if self._slices:
+                    self._drop_stale_slices()
+                if fwd_lazy:
+                    _graph_release(self)
         t = self._pools.get(name)
         if t is None:
             if n not in (None, 0) or self.device is None:
@@ -3193,6 +3216,8 @@ class KcpWorkspace:
                     f"KcpWorkspace: pool {name!r} was not sized for this call (ensure() first)"
                 )
             t = self._pools[name] = _alloc((0,), self.state_dtype, self.device)
+            if fwd_lazy:
+                _graph_release(self)
         if n is None:
             return t
         if (
@@ -4734,13 +4759,15 @@ def graph_cache_clear() -> int:
     return n
 
 
-def _graph_release(arena: Any) -> int:
-    """Drop the cached graphs whose key pins ``arena``, a local arena that :meth:`KcpWorkspace.ensure` supersedes: no
-    later call can match their keys, and their pins would keep its storage alive.  The dropped entries also let go of
-    their pins (the entry of the call doing the upgrade, created before its ``ensure``, is still referenced by that
-    call): once the arena is freed its id may be reused, and a later call that builds an equal key finds no entry and
-    starts a new one.  Returns the number dropped."""
-    stale = [key for key, e in _GRAPHS.items() if any(p is arena for p in e.pins)]
+def _graph_release(pinned: Any) -> int:
+    """Drop the cached graphs whose key pins ``pinned``: a local arena that :meth:`KcpWorkspace.ensure` supersedes, or
+    a workspace whose :meth:`KcpWorkspace.pool` has just allocated a forward-only lazy pool
+    (``cake_kcp_plan.FWD_LAZY_POOLS``, part of every key): no later call can match their keys, and their pins (and
+    graphs) would keep that storage alive.  The dropped entries also let go of their pins (the entry of the call doing
+    the upgrade, created before its ``ensure``, is still referenced by that call): once the arena is freed its id may
+    be reused, and a later call that builds an equal key finds no entry and starts a new one.  Returns the number
+    dropped."""
+    stale = [key for key, e in _GRAPHS.items() if any(p is pinned for p in e.pins)]
     for key in stale:
         _GRAPHS.pop(key).pins = ()
     return len(stale)
