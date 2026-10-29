@@ -740,8 +740,8 @@ def test_mm_fp4_l2_policy_rule():
 @pytest.mark.parametrize("m", [1, 16])
 def test_mm_fp4_cutlass_sm120_disable_stream_k(m, monkeypatch):
     # With FLASHINFER_FP4_GEMM_DISABLE_STREAM_K=1 the SM120 CUTLASS runner offers the
-    # autotuner only data-parallel tactics, and those all return the same bits, so the
-    # output no longer depends on which tactic the autotuner picked.
+    # autotuner only data-parallel tactics. At these shapes they all return the same
+    # bits, so here the output does not depend on which tactic the autotuner picked.
     from flashinfer.gemm import gemm_base
 
     if not is_sm12x_supported(torch.device("cuda")):
