@@ -853,13 +853,14 @@ PASSES = ("F", "X", "W")
 PATHS = ("auto", "sparse", "dense")
 DW_MODES = ("auto", "global", "chunked")
 # Dispatch: pass ``P`` takes the dense form iff ``M >= K_P* x T`` (the mean support size reaches ``K_P*``), a host
-# rule on host-known sizes (no synchronization, deterministic).  PROVISIONAL per-architecture constants from the
-# kernel times measured so far (the sparse passes scale with M, the dense ones with V); they are recalibrated on a
-# separate measurement set before any performance claim.  The rule cannot see how much the rows share their
-# candidates.
+# rule on host-known sizes (no synchronization, deterministic).  Per-architecture constants calibrated on B200
+# (sm_100a) and GB300 (sm_103a): the thresholds that minimize the summed step time (forward + backward, relative to
+# the best pass forms of each problem) over a calibration set of uniform and Zipf-distributed supports at H = 6144,
+# V = 154880, T = 8192 / 16384 and mean support sizes 32 to 2048.  The rule cannot see how much the rows share
+# their candidates.
 SUPPORT_DENSE_MIN_MEAN_K: dict[str, dict[str, int]] = {
-    "sm_100a": {"F": 512, "X": 1024, "W": 512},
-    "sm_103a": {"F": 512, "X": 1024, "W": 512},
+    "sm_100a": {"F": 512, "X": 1029, "W": 508},
+    "sm_103a": {"F": 508, "X": 1029, "W": 508},
 }
 # Global weight-gradient mode (one pair range, BF16 dW stored directly, no FP32 [V, H] accumulator) up to this many
 # pairs; above it the pairs are cut into ranges of ``chunk_size * ceil(M / T)`` pairs accumulated in FP32.

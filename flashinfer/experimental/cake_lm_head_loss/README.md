@@ -375,7 +375,8 @@ kl, logp = chunked_lm_head_support_kl(X, W, ids, offsets, teacher_logprobs, k_ca
   logits / dX / weight-gradient GEMMs per token chunk and vocabulary block on
   `W[v0:v1]` views, plus a gather / scatter at the support; `H` a multiple of
   512 for dX / dW).  A host rule on `M / T` picks the form per pass
-  (`cake_support.SUPPORT_DENSE_MIN_MEAN_K`, provisional constants); no
+  (`cake_support.SUPPORT_DENSE_MIN_MEAN_K`, constants calibrated per
+  architecture); no
   synchronization.  The sparse `dW` is stored directly in BF16 up to `2^23`
   pairs; above that pair ranges accumulate in an FP32 `[V, H]` sum.
 * Memory: no `[T, V]` or `[chunk, V]` tensor in the sparse form; the packed
