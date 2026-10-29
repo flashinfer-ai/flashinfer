@@ -812,13 +812,30 @@ def test_blackwell_cached_cluster_ten_cta_rows_per_arch(
         (8, 100000, "scalar", 6272, 6272),
         (28, 48000, "none", 3008, 3008),
         (55, 120000, "none", 7520, 7520),
+        # 4-tile 4- and 8-CTA row kernels with a cut of more than 1/16 (142
+        # and 71 resident clusters on B200, 148 and 74 on GB300): 4-tile chunks
+        # of 4 CTAs within five waves on sm_100 and in one wave on sm_103 (8
+        # CTAs keep whole tiles).
+        (96, 24584, "none", 6176, 6176),
+        (128, 28672, "scalar", 7168, 7168),
+        (512, 24584, "none", 6176, 8192),
+        (710, 24584, "none", 6176, 8192),
+        (711, 24584, "none", 8192, 8192),
+        (72, 24584, "none", 4096, 4096),
+        (74, 28672, "scalar_pdl", 4096, 4096),
+        (71, 28672, "none", 4096, 4096),
+        (75, 24584, "none", 6176, 4096),
         # 8-CTA shared-tile and persistent kernels (on sm_103 the persistent
         # kernel only with a cut of at least 1/10).
         (45, 81928, "none", 10272, 10272),
         (320, 69632, "none", 8704, 8704),
         (82, 70000, "none", 8768, 8768),
         (52, 100000, "scalar_pdl", 12512, 12512),
-        (370, 66000, "none", 10240, 8256),  # five waves of shared-tile clusters (GB300)
+        (370, 66000, "none", 8256, 8256),  # five waves of shared-tile clusters (GB300)
+        (180, 71680, "none", 8960, 8960),  # five persistent trips (GB300)
+        # On sm_100 also past five waves, up to seven 8-CTA waves or trips.
+        (371, 66000, "none", 8256, 10240),
+        (181, 71680, "none", 8960, 10240),
         (48, 76000, "none", 9504, 9504),
         (82, 76000, "none", 9504, 9504),
         (50, 110000, "none", 14336, 13760),
@@ -838,17 +855,27 @@ def test_blackwell_cached_cluster_ten_cta_rows_per_arch(
         (40, 151936, "none", 9504, 10240),
         (64, 180000, "none", 11264, 12288),
         # Whole tiles: the wide row kernel, a one-wave 16-CTA chunk with a cut
-        # under 1/10, a one-wave 4-tile 16-CTA row kernel with a cut of at most
-        # 1/16, the 8-tile 16-CTA row kernel, and rows past five waves (180
-        # rows are five persistent waves on GB300) or past one wave with a cut
-        # of at most 1/16.
+        # under 1/10, a 4-tile row kernel with a cut of at most 1/16 in one
+        # wave, the 4-tile row kernels of 4 and 8 CTAs with other chunk tile
+        # counts, the 4-tile row kernels of 1 and 2 CTAs, the 8-tile 16-CTA row
+        # kernel, and rows past five waves (on sm_100 past seven for the 8-CTA
+        # kernels) or past one wave with a cut of at most 1/16.
         (8, 256000, "none", 26624, 22528),
         (24, 151936, "none", 10240, 16384),
+        (100, 30720, "none", 8192, 8192),
+        (96, 32000, "none", 8192, 8192),
+        (1, 7168, "none", 2048, 2048),
+        (200, 20480, "scalar", 6144, 6144),
+        (64, 14848, "scalar_pdl", 2048, 2048),
+        (100, 50304, "none", 8192, 8192),
+        (200, 10240, "none", 6144, 6144),
+        (300, 7168, "none", 8192, 4096),
+        (741, 24584, "none", 8192, 8192),
+        (371, 50304, "none", 8192, 8192),
         (8, 126464, "none", 8192, 8192),
         (1, 151936, "none", 10240, 10240),
-        (180, 71680, "none", 10240, 8960),
-        (181, 71680, "none", 10240, 10240),
-        (371, 66000, "none", 10240, 10240),
+        (232, 71680, "none", 10240, 10240),
+        (498, 66000, "none", 10240, 10240),
         (76, 92000, "none", 12288, 12288),
     ],
 )
@@ -874,6 +901,221 @@ def test_blackwell_cached_cluster_balanced_chunk_per_arch(
         logits, temperature=temperature, enable_pdl=enable_pdl
     )
     torch.testing.assert_close(probs, probs_ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size,cluster_ctas,sm100_chunk,sm103_chunk",
+    [
+        # 16-CTA shared-tile kernel: up to 9 waves and from 9 up to 13 waves
+        # of 31 resident clusters on B200.
+        (156, 151936, 16, 9504, 10240),
+        (279, 151936, 16, 9504, 10240),
+        (280, 151936, 16, 9504, 10240),
+        (403, 151936, 16, 9504, 10240),
+        (404, 151936, 16, 10240, 10240),
+        (337, 201088, 16, 12576, 14336),
+        # 16-CTA persistent kernel: up to 18 trips of 14 resident clusters.
+        (71, 201088, 16, 12576, 14336),
+        (252, 201088, 16, 12576, 14336),
+        (253, 201088, 16, 14336, 14336),
+        # 8-CTA kernels: up to 7 waves of 71 resident shared-tile clusters or
+        # 7 trips of 33 resident persistent clusters.
+        (356, 66000, 8, 8256, 8256),
+        (497, 66000, 8, 8256, 10240),
+        (498, 66000, 8, 10240, 10240),
+        (166, 71680, 8, 8960, 8960),
+        (231, 71680, 8, 8960, 10240),
+        (232, 71680, 8, 10240, 10240),
+    ],
+)
+@pytest.mark.parametrize("temperature_kind", ["scalar", "scalar_pdl", "per_row"])
+def test_blackwell_cached_cluster_balanced_chunk_past_five_waves_per_arch(
+    rows, vocab_size, cluster_ctas, sm100_chunk, sm103_chunk, temperature_kind
+):
+    # On sm_100 the 8-tile 8- and 16-CTA shared-tile and persistent kernels
+    # keep the balanced chunk past five waves up to these bounds, unless the
+    # temperature is per row; sm_103 keeps its five-wave rule.
+    _skip_unless_b200_or_gb300()
+    torch.manual_seed(7)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    enable_pdl = temperature_kind == "scalar_pdl"
+    if temperature_kind == "per_row":
+        temperature = torch.rand(rows, device="cuda") * 0.9 + 0.1
+        probs_ref = torch.softmax(logits / temperature[:, None], dim=-1)
+    else:
+        temperature = 0.5
+        probs_ref = torch.softmax(logits / temperature, dim=-1)
+    kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    on_sm100 = torch.cuda.get_device_capability() == (10, 0)
+    per_cta = -(-vocab_size // cluster_ctas)
+    whole = -(-per_cta // 2048) * 2048
+    assert kernel[0] == cluster_ctas
+    assert kernel[5] == (
+        (whole if temperature_kind == "per_row" else sm100_chunk)
+        if on_sm100
+        else sm103_chunk
+    )
+    probs = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    torch.testing.assert_close(probs, probs_ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size,cluster_ctas,sm100_chunk,sm103_chunk",
+    [
+        (96, 24584, 4, 6176, 6176),
+        (512, 24584, 4, 6176, 8192),
+        (72, 24584, 8, 4096, 4096),
+        (71, 28672, 8, 4096, 4096),
+        (1, 7168, 4, 2048, 2048),
+        (100, 50304, 8, 8192, 8192),
+    ],
+)
+@pytest.mark.parametrize("temperature_kind", ["scalar", "scalar_pdl", "per_row"])
+def test_blackwell_cached_cluster_four_tile_rows_balanced_chunk_per_arch(
+    rows, vocab_size, cluster_ctas, sm100_chunk, sm103_chunk, temperature_kind
+):
+    # The 4-tile row kernels of 4 and 8 CTAs take the balanced chunk for the
+    # chunk tile counts set per architecture in one wave and past it, unless
+    # the temperature is per row; other tile counts keep whole tiles.
+    _skip_unless_b200_or_gb300()
+    torch.manual_seed(7)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    enable_pdl = temperature_kind == "scalar_pdl"
+    if temperature_kind == "per_row":
+        temperature = torch.rand(rows, device="cuda") * 0.9 + 0.1
+        probs_ref = torch.softmax(logits / temperature[:, None], dim=-1)
+    else:
+        temperature = 0.5
+        probs_ref = torch.softmax(logits / temperature, dim=-1)
+    kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    on_sm100 = torch.cuda.get_device_capability() == (10, 0)
+    per_cta = -(-vocab_size // cluster_ctas)
+    whole = -(-per_cta // 2048) * 2048
+    assert kernel[:2] == (cluster_ctas, 4)
+    assert kernel[5] == (
+        whole
+        if temperature_kind == "per_row"
+        else sm100_chunk
+        if on_sm100
+        else sm103_chunk
+    )
+    probs = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    torch.testing.assert_close(probs, probs_ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size,temperature_kind,sm100_chunk,sm103_chunk",
+    [
+        # 8-CTA shared-tile kernel with a cut of at least 1/10: 6-, 7- and
+        # 8-tile chunks.
+        (79, 81928, "none", 10272, 10272),
+        (296, 81928, "scalar", 10272, 12288),
+        (370, 88320, "scalar_pdl", 11040, 12288),
+        (371, 88320, "none", 11040, 12288),
+        (53, 98312, "none", 12320, 12320),
+        (73, 98312, "per_row", 12320, 12320),
+        (370, 103168, "none", 12896, 12896),
+        (371, 103168, "scalar", 12896, 14336),
+        (50, 114696, "scalar_pdl", 7200, 14368),
+        (74, 117760, "none", 14720, 14720),
+        # 8-CTA shared-tile kernel with a cut under 1/10: 5- to 8-tile chunks.
+        (82, 73736, "none", 9248, 9248),
+        (83, 73736, "scalar_pdl", 9248, 9248),
+        (115, 76544, "per_row", 9568, 9568),
+        (116, 76544, "none", 9568, 10240),
+        (79, 88328, "scalar", 11072, 11072),
+        (296, 88328, "none", 11072, 11072),
+        (370, 91904, "per_row", 12288, 11488),
+        (371, 91904, "scalar_pdl", 11488, 12288),
+        (53, 103176, "none", 12928, 12928),
+        (73, 103176, "scalar", 12928, 12928),
+        (370, 107264, "scalar_pdl", 13408, 13408),
+        (371, 107264, "per_row", 14336, 14336),
+        (50, 117768, "none", 7392, 14752),
+        (51, 117768, "per_row", 7392, 14752),
+        (74, 126720, "scalar", 16384, 15840),
+        # 8-CTA persistent kernel: 6-, 7- and 8-tile chunks.
+        (92, 81928, "scalar_pdl", 10272, 10272),
+        (93, 81928, "none", 10272, 12288),
+        (180, 88320, "scalar", 11040, 12288),
+        (181, 88320, "per_row", 12288, 12288),
+        (128, 98312, "none", 12320, 12320),
+        (129, 98312, "scalar_pdl", 12320, 12320),
+        (180, 103168, "per_row", 14336, 12896),
+        (181, 103168, "none", 12896, 14336),
+        (56, 114696, "per_row", 14368, 14368),
+        (180, 117760, "scalar_pdl", 14720, 14720),
+        (181, 117760, "scalar", 14720, 16384),
+    ],
+)
+def test_blackwell_cached_cluster_eight_cta_balanced_chunk_rows_per_arch(
+    rows, vocab_size, temperature_kind, sm100_chunk, sm103_chunk
+):
+    # On sm_103 the 8-CTA kernels of a 5- to 8-tile chunk take the balanced
+    # chunk up to the rows set per kernel, cut and chunk tile count: every
+    # row up to five waves or trips, except for 6-tile chunks with a cut of
+    # at least 1/10 (shared-tile kernel up to 79 rows, persistent kernel up
+    # to 92 rows).
+    _skip_unless_b200_or_gb300()
+    torch.manual_seed(13)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    enable_pdl = temperature_kind == "scalar_pdl"
+    if temperature_kind == "per_row":
+        temperature = torch.rand(rows, device="cuda") * 0.9 + 0.1
+        probs_ref = torch.softmax(logits / temperature[:, None], dim=-1)
+    else:
+        temperature = None if temperature_kind == "none" else 0.5
+        probs_ref = torch.softmax(
+            logits if temperature is None else logits / temperature, dim=-1
+        )
+    kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    on_sm100 = torch.cuda.get_device_capability() == (10, 0)
+    assert kernel[5] == (sm100_chunk if on_sm100 else sm103_chunk)
+    probs = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    torch.testing.assert_close(probs, probs_ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize("order", ["four_first", "eight_first"])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_blackwell_cached_cluster_row_residency_per_cluster_size(order, enable_pdl):
+    # The resident clusters of the 4-tile row kernels are kept per cluster
+    # size: querying the 4-CTA kernel (512 rows) before or after the spread of
+    # 72 to 75 rows to 8 CTAs (B200: 71 resident 8-CTA clusters, GB300: 74)
+    # changes neither launch.
+    _skip_unless_b200_or_gb300()
+    torch.manual_seed(7)
+    shapes = [(512, 24584), (72, 24576), (73, 24576), (74, 24576), (75, 24576)]
+    if order == "eight_first":
+        shapes = shapes[1:] + shapes[:1]
+    on_sm100 = torch.cuda.get_device_capability() == (10, 0)
+    four = (4, 4, 6176) if on_sm100 else (4, 4, 8192)
+    eight = (4, 4, 6144) if on_sm100 else (8, 4, 4096)
+    expected = {512: four, 72: eight, 73: eight, 74: eight, 75: (4, 4, 6144)}
+    for _ in range(2):
+        for rows, vocab_size in shapes:
+            logits = torch.randn(rows, vocab_size, device="cuda")
+            kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+                logits, temperature=0.5, enable_pdl=enable_pdl
+            )
+            assert (kernel[0], kernel[1], kernel[5]) == expected[rows]
+            probs = flashinfer.sampling.softmax(
+                logits, temperature=0.5, enable_pdl=enable_pdl
+            )
+            torch.testing.assert_close(
+                probs, torch.softmax(logits / 0.5, dim=-1), atol=1e-3, rtol=1e-3
+            )
 
 
 @pytest.mark.parametrize(

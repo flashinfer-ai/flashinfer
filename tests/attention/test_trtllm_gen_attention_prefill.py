@@ -1960,3 +1960,146 @@ def test_trtllm_gen_prefill_glm5(
     )
 
     torch.testing.assert_close(output_trtllm, output_naive, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "head_dim,materialize", [(128, False), (256, False), (256, True), (512, True)]
+)
+@pytest.mark.parametrize("window_left", [-1, 127])
+def test_trtllm_batch_prefill_nvfp4_kv_matches_reference(
+    head_dim, materialize, window_left
+):
+    """NVFP4-KV context attention must closely match a float reference on the
+    dequantized cache, in every head_dim channel. With ``materialize``, the
+    caller converts the pages to FP8 first and runs the FP8 kernel.
+    """
+    _skip_if_not_blackwell()
+    if head_dim == 512 and window_left >= 0:
+        pytest.skip("no head_dim 512 sliding-window context kernels")
+    from flashinfer.quantization.kernels import nvfp4_kv_materialize_fp8
+    from tests.quantization.test_nvfp4_kv_materialize import (
+        _dequantize_reference,
+        _random_cache,
+        _swizzle_v_scales,
+    )
+
+    major, minor = get_compute_capability(torch.device(GPU_DEVICE))
+    if materialize and not nvfp4_kv_materialize_fp8.is_compute_capability_supported(
+        major * 10 + minor
+    ):
+        pytest.skip("nvfp4_kv_materialize_fp8 does not support this GPU")
+
+    num_qo_heads, num_kv_heads, page_size = 8, 2, 64
+    seq_lens_host, q_lens_host = [300, 77], [300, 40]
+    num_pages_per_seq = [(s + page_size - 1) // page_size for s in seq_lens_host]
+    num_pages = sum(num_pages_per_seq) + 3
+    generator = torch.Generator(device=GPU_DEVICE).manual_seed(head_dim)
+    k_data, k_scales = _random_cache(
+        num_pages, num_kv_heads, page_size, head_dim, generator
+    )
+    v_data, v_scales = _random_cache(
+        num_pages, num_kv_heads, page_size, head_dim, generator
+    )
+    k_ref = _dequantize_reference(k_data, k_scales).float()
+    v_ref = _dequantize_reference(v_data, v_scales).float()
+    k_scales = k_scales.view(torch.uint8)
+    v_scales = _swizzle_v_scales(v_scales).view(torch.uint8)
+
+    page_ids = torch.randperm(num_pages, generator=generator, device=GPU_DEVICE)
+    block_tables = torch.zeros(
+        len(seq_lens_host), max(num_pages_per_seq), dtype=torch.int32
+    )
+    start = 0
+    for b, n in enumerate(num_pages_per_seq):
+        block_tables[b, :n] = page_ids[start : start + n].cpu()
+        start += n
+    block_tables = block_tables.to(GPU_DEVICE)
+
+    query = (
+        torch.randn(
+            sum(q_lens_host),
+            num_qo_heads,
+            head_dim,
+            device=GPU_DEVICE,
+            generator=generator,
+        )
+        * 0.25
+    ).to(torch.float8_e4m3fn)
+    seq_lens = torch.tensor(seq_lens_host, dtype=torch.int32, device=GPU_DEVICE)
+    cum_q = torch.tensor(
+        [0, *torch.tensor(q_lens_host).cumsum(0).tolist()],
+        dtype=torch.int32,
+        device=GPU_DEVICE,
+    )
+    cum_kv = torch.tensor(
+        [0, *seq_lens.cumsum(0).tolist()], dtype=torch.int32, device=GPU_DEVICE
+    )
+
+    kv_cache, kernel_block_tables = (k_data, v_data), block_tables
+    kv_cache_sf = (k_scales, v_scales)
+    if materialize:
+        # Size the FP8 copy by the pages each request reads.
+        page_indptr = [0, *torch.tensor(num_pages_per_seq).cumsum(0).tolist()]
+        kv_fp8, kernel_block_tables = nvfp4_kv_materialize_fp8(
+            k_data,
+            v_data,
+            k_scales,
+            v_scales,
+            block_tables,
+            seq_lens,
+            max(seq_lens_host),
+            kv_page_indptr=torch.tensor(
+                page_indptr, dtype=torch.int32, device=GPU_DEVICE
+            ),
+            num_pages=page_indptr[-1],
+        )
+        kv_cache, kv_cache_sf = kv_fp8.unbind(dim=1), None
+
+    sm_scale = head_dim**-0.5
+    out = torch.empty_like(query)
+    flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+        query=query,
+        kv_cache=kv_cache,
+        workspace_buffer=torch.zeros(
+            workspace_size, dtype=torch.uint8, device=GPU_DEVICE
+        ),
+        block_tables=kernel_block_tables,
+        seq_lens=seq_lens,
+        max_q_len=max(q_lens_host),
+        max_kv_len=max(seq_lens_host),
+        bmm1_scale=sm_scale,
+        bmm2_scale=1.0,
+        batch_size=len(seq_lens_host),
+        cum_seq_lens_q=cum_q,
+        cum_seq_lens_kv=cum_kv,
+        window_left=window_left,
+        out=out,
+        kv_cache_sf=kv_cache_sf,
+    )
+
+    group = num_qo_heads // num_kv_heads
+    ref = torch.empty(out.shape, dtype=torch.float32, device=GPU_DEVICE)
+    for b, (kv_len, q_len) in enumerate(zip(seq_lens_host, q_lens_host, strict=True)):
+        pages = block_tables[b, : num_pages_per_seq[b]].long()
+        k = k_ref[pages].transpose(0, 1).flatten(1, 2)[:, :kv_len]
+        v = v_ref[pages].transpose(0, 1).flatten(1, 2)[:, :kv_len]
+        q = query[cum_q[b] : cum_q[b + 1]].float().transpose(0, 1)
+        k, v = k.repeat_interleave(group, 0), v.repeat_interleave(group, 0)
+        scores = q @ k.transpose(1, 2) * sm_scale
+        q_pos = torch.arange(kv_len - q_len, kv_len, device=GPU_DEVICE)[:, None]
+        kv_pos = torch.arange(kv_len, device=GPU_DEVICE)[None]
+        masked = kv_pos > q_pos
+        if window_left >= 0:
+            masked |= kv_pos < q_pos - window_left
+        probs = scores.masked_fill(masked, float("-inf")).softmax(-1)
+        ref[cum_q[b] : cum_q[b + 1]] = (probs @ v).transpose(0, 1)
+
+    # Compare each half of the head_dim channels separately, so an error in
+    # one half is not averaged away by the other.
+    out_halves = out.float().chunk(2, dim=-1)
+    ref_halves = ref.chunk(2, dim=-1)
+    for out_half, ref_half in zip(out_halves, ref_halves, strict=True):
+        cos = torch.nn.functional.cosine_similarity(
+            out_half.flatten(1), ref_half.flatten(1), dim=-1
+        )
+        assert cos.min() > 0.995, f"min per-token cosine {cos.min():.4f}"

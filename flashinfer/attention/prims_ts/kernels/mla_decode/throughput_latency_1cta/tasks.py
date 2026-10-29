@@ -1096,6 +1096,7 @@ def create_load_page_offsets_task(
         smem_page_offsets.init_load_state()
 
         with work_tile_schedule_loop(work_queue, skip_if=work_tile_skip_if):
+            smem_page_offsets.bind_sparse_request()
             if cfg.single_kv_pipe:
                 page_offsets_produce(
                     smem_page_offsets, "load_k0", section=MlaStage.Head
@@ -1257,6 +1258,7 @@ def create_throughput_latency_load_task(
             else:
                 cached_page_ids = staged_kv_load(
                     smem_kv,
+                    whole_kv=cfg.whole_kv_tile,
                     head_dim_stages=head_dim_stages,
                     producer_label=producer_label,
                     section=section,
@@ -1492,7 +1494,7 @@ def create_throughput_latency_load_task(
         warp_idx=cfg.load_warp_idx if warp_idx is None else warp_idx,
         num_warps=cfg.load_num_warps if num_warps is None else num_warps,
         schedule=captured_schedule,
-        num_registers=cfg.mma_load_regs,
+        num_registers=cfg.kv_load_regs,
         name="LoadTmaTask",
         **kw,
     )
@@ -1661,6 +1663,7 @@ def create_throughput_latency_mma_task(
                         head_dim_stages=cfg.v_head_dim_stages,
                         consumer_label="v_desc_reused_0",
                         reuse_k=True,
+                        retained_k_stages=cfg.qk_head_dim_stages,
                         producer_label="pv_mma_loop_0",
                     )
                     staged_qk_mma(
@@ -1677,6 +1680,7 @@ def create_throughput_latency_mma_task(
                         head_dim_stages=cfg.v_head_dim_stages,
                         consumer_label="v_desc_reused_1",
                         reuse_k=True,
+                        retained_k_stages=cfg.qk_head_dim_stages,
                         producer_label="pv_mma_loop_1",
                     )
                     staged_qk_mma(
@@ -1693,6 +1697,7 @@ def create_throughput_latency_mma_task(
                     head_dim_stages=cfg.v_head_dim_stages,
                     consumer_label="v_desc_reused_0",
                     reuse_k=True,
+                    retained_k_stages=cfg.qk_head_dim_stages,
                     producer_label="pv_mma_tail_0",
                 )
                 staged_qk_mma(
@@ -1709,6 +1714,7 @@ def create_throughput_latency_mma_task(
                     head_dim_stages=cfg.v_head_dim_stages,
                     consumer_label="v_desc_reused_1",
                     reuse_k=True,
+                    retained_k_stages=cfg.qk_head_dim_stages,
                     producer_label="pv_mma_tail_1",
                 )
             else:
@@ -1737,6 +1743,7 @@ def create_throughput_latency_mma_task(
                             "v_desc_reused" if cfg.sparse_reuse_kv else "v_desc_0"
                         ),
                         reuse_k=cfg.sparse_reuse_kv,
+                        retained_k_stages=cfg.qk_head_dim_stages,
                         producer_label="pv_mma_loop_0",
                     )
                     staged_qk_mma(
@@ -1757,6 +1764,7 @@ def create_throughput_latency_mma_task(
                             "v_desc_reused" if cfg.sparse_reuse_kv else "v_desc_1"
                         ),
                         reuse_k=cfg.sparse_reuse_kv,
+                        retained_k_stages=cfg.qk_head_dim_stages,
                         producer_label="pv_mma_loop_1",
                     )
                     staged_qk_mma(
@@ -1776,6 +1784,7 @@ def create_throughput_latency_mma_task(
                         "v_desc_reused" if cfg.sparse_reuse_kv else "v_desc_0"
                     ),
                     reuse_k=cfg.sparse_reuse_kv,
+                    retained_k_stages=cfg.qk_head_dim_stages,
                     producer_label="pv_mma_tail_0",
                 )
                 staged_pv_mma(
@@ -1787,6 +1796,7 @@ def create_throughput_latency_mma_task(
                         "v_desc_reused" if cfg.sparse_reuse_kv else "v_desc_1"
                     ),
                     reuse_k=cfg.sparse_reuse_kv,
+                    retained_k_stages=cfg.qk_head_dim_stages,
                     producer_label="pv_mma_tail_1",
                 )
             smem_q.release()
@@ -1851,6 +1861,9 @@ def create_single_kv_pipe_mma_task(
     work_tile_skip_if = runtime_work_tile_skip_if(work_queue)
     swap = cfg.one_insts_kv_swap
     pv_mma = staged_pv_mma if swap else staged_pv_mma_tmem_p
+    pv_kwargs = {"whole_kv": cfg.whole_kv_tile}
+    if not swap:
+        pv_kwargs["ws_pair"] = cfg.ws_pv
     pv_loop = "pv_mma_loop_0" if swap else "pv_mma_loop_tmem_p"
     pv_tail = "pv_mma_tail_0" if swap else "pv_mma_tail_tmem_p"
     v_desc = "v_desc_reused_0" if swap else "v_desc_reused"
@@ -1858,8 +1871,8 @@ def create_single_kv_pipe_mma_task(
         v_desc = "v_desc_0"
     pv_before_qk = (
         cfg.sparse_reuse_kv
-        and not cfg.is_fp8_qkv()
-        and (swap or cfg.tile_size_kv == 128)
+        and not cfg.whole_kv_tile
+        and cfg.kv_stages < 2 * cfg.qk_head_dim_stages
     )
 
     @schedule
@@ -1893,6 +1906,7 @@ def create_single_kv_pipe_mma_task(
                 smem_kv,
                 tmem_s,
                 head_dim_stages=cfg.qk_head_dim_stages,
+                whole_kv=cfg.whole_kv_tile,
                 consumer_label="k_desc_0",
                 release_k=not cfg.sparse_reuse_kv,
             )
@@ -1905,12 +1919,15 @@ def create_single_kv_pipe_mma_task(
                         head_dim_stages=cfg.v_head_dim_stages,
                         consumer_label=v_desc,
                         reuse_k=True,
+                        retained_k_stages=cfg.qk_head_dim_stages,
                         producer_label=pv_loop,
+                        **pv_kwargs,
                     )
                 staged_qk_mma(
                     smem_kv,
                     tmem_s,
                     head_dim_stages=cfg.qk_head_dim_stages,
+                    whole_kv=cfg.whole_kv_tile,
                     consumer_label="k_desc_0",
                     release_k=not cfg.sparse_reuse_kv,
                 )
@@ -1922,7 +1939,9 @@ def create_single_kv_pipe_mma_task(
                         head_dim_stages=cfg.v_head_dim_stages,
                         consumer_label=v_desc,
                         reuse_k=cfg.sparse_reuse_kv,
+                        retained_k_stages=cfg.qk_head_dim_stages,
                         producer_label=pv_loop,
+                        **pv_kwargs,
                     )
             pv_mma(
                 smem_kv,
@@ -1931,7 +1950,9 @@ def create_single_kv_pipe_mma_task(
                 head_dim_stages=cfg.v_head_dim_stages,
                 consumer_label=v_desc,
                 reuse_k=cfg.sparse_reuse_kv,
+                retained_k_stages=cfg.qk_head_dim_stages,
                 producer_label=pv_tail,
+                **pv_kwargs,
             )
             smem_q.release()
 

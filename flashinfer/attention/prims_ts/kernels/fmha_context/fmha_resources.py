@@ -118,6 +118,7 @@ from ...sage.layout import _FLOAT4_WORDS, _SageScaleLayout
 from ...sage.modes import SageKTransport, SageScoreScaling
 from .helpers import (
     add_f16x2_to_f32x2,
+    _resolve_kv_tile_idx_context,
     bottom_right_window_left_bound,
     bottom_right_window_tile_start,
     exp2_f16x2_word,
@@ -1999,8 +2000,6 @@ class SmemPageOffsetsKvResource(MemoryResource):
         kv_request_begin: Int32,
         kv_page_idx_ub: Int32,
     ) -> None:
-        from .helpers_paged import _resolve_kv_tile_idx_context
-
         cfg = self.cfg
         # Context's K/V tile index is kv_tile_start + loop_offset; for V the
         # producer runs one tile ahead in TAIL, so reuse the same expression
@@ -2091,8 +2090,6 @@ class SmemPageOffsetsKvResource(MemoryResource):
         tile_offset: cutlass.Constexpr[int] = 0,
     ) -> cutlass.Array:
         """Retain one tile's page IDs after its SMEM window is released."""
-        from .helpers_paged import _resolve_kv_tile_idx_context
-
         tile_idx = _resolve_kv_tile_idx_context(
             stage_info, kv_tile_start, tile_offset=tile_offset
         )
@@ -2123,9 +2120,6 @@ class SmemPageOffsetsKvResource(MemoryResource):
 # ---------------------------------------------------------------------------
 # SmemSageKScalesResource -- SMEM ring of one K tile's Sage sfK words per stage
 # ---------------------------------------------------------------------------
-
-# Import after FmhaConfig is defined because helpers_paged imports it back.
-from .helpers_paged import _resolve_kv_tile_idx_context  # noqa: E402
 
 
 @dataclass(kw_only=True)
@@ -7055,9 +7049,7 @@ class TmemOResource(MemoryResource):
         # MMA (Thread 0) does tcgen05.mma → tcgen05.commit on O_full.
         # Correction (Thread 1) does mbarrier.try_wait on O_full → tcgen05.ld.
         # The fence orders the prior tcgen05.commit's completion with our tcgen05.ld.
-        from cutlass.experimental import primitives as _prims
-
-        _prims.tcgen05_fence("after")
+        prims.tcgen05_fence("after")
 
         # Only rescale if old_max != new_max AND not in invalid O0 iteration
         if should_rescale and not skip_o0_invalid:
