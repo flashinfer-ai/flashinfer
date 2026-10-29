@@ -743,6 +743,55 @@ serves single-process debugging.  Under `graph="replay"` the probing
 backward runs eagerly; a rank without tokens does not hold back its capture.
 No environment variable selects it.
 
+Checkpoint recompute without the state exchange (issue #7815): under
+`torch.utils.checkpoint` the backward re-runs the forward of the region, and
+with it the forward's c1 / c2 exchanges (and the convolution's halo exchange).
+A recompute handle keeps what the original forward received instead:
+
+```python
+from flashinfer.kda_train import KcpRecomputeHandle, chunk_kda_kcp
+from flashinfer.cake_causal_conv1d_train import cake_causal_conv1d_kcp
+
+def layer(xq, xk, xv, g, beta, hq, hk, hv):
+    q = cake_causal_conv1d_kcp(xq, wq, ctx, recompute_handle=hq)   # "conv" entry of hq
+    k = cake_causal_conv1d_kcp(xk, wk, ctx, recompute_handle=hk)
+    v = cake_causal_conv1d_kcp(xv, wv, ctx, recompute_handle=hv)
+    ...                                                          # split heads, normalize q / k
+    return chunk_kda_kcp(q, k, v, g, beta, ctx, recompute_handle=hq)   # "kda" entry of hq
+
+handles = [KcpRecomputeHandle() for _ in range(3)]               # per layer and micro-step
+out = torch.utils.checkpoint.checkpoint(layer, xq, xk, xv, g, beta, *handles, use_reentrant=False)
+```
+
+The original forward exchanges as always and stores its incoming states
+`S_in` (the saved set's own tensor, key `"kda"`; one entry per key, so one
+handle serves the KDA call and one convolution call); the recompute inside the
+backward binds them and launches only the rank-local programs -- no
+collective, no wait -- so the outputs and gradients are bitwise those of the
+checkpoint without a handle (`use_reentrant=True` and `False`, `retain_graph`,
+nested regions).  `checkpoint_keep="states"` (the default) keeps `S_in` only
+and runs the call with `save_transfer=False` (the backward re-sends the maps
+in b1; bitwise the default form); `checkpoint_keep="transfer"` also keeps the
+owner's c1 receive tensor (`save_transfer=True`; not with the ring exchange).
+An explicit `save_transfer` that contradicts the tier raises `ValueError`, in
+the entry point and in both byte queries.  The handle retains
+`kcp_saved_bytes(ctx, H=..., checkpoint_keep=..., with_conv=False)` bytes for
+the KDA entry until it is dropped (`with_conv` adds one convolution's history
+rows); `kcp_comm_bytes(ctx, ..., checkpoint_keep=...)` reports the step's
+traffic (`B1 + B2`; the recompute moves nothing when the layer's convolutions
+carry handles too -- a convolution without one still sends its `halo_fwd`
+rows in the recompute).  Rules: create the handles outside the outermost checkpoint
+region (a handle created inside a region is empty in that region's recompute,
+which then exchanges -- correct, not communication-free); a forward outside
+the backward that finds an entry raises (a handle reused across micro-steps);
+a recompute whose entry was stored by another context or call configuration
+raises; `graph="replay"`, CUDA-graph capture, `debug_sequence`, `spec3_probe`
+and `boundary_mode="replay"` are refused with a handle.  The exchange is a
+collective: every rank passes a handle for the same call or none, at the same
+nesting level -- a mismatch hangs or corrupts data, and no rank checks the
+others.  The phase comes from `torch._C._current_graph_task_id()`; a torch
+without it refuses the handle.
+
 The segment plan splits every fragment into `P` segments: above the 256-chunk
 chain cap the equal-segment wave rule on ranks with at most three fragments,
 below it on one-fragment ranks the

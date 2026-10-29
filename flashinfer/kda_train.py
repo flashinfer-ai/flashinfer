@@ -585,10 +585,35 @@ def chunk_kda_kcp(
     save_mode: str = "light",
     boundary_mode: str = "saved",
     workspace: Optional[Any] = None,
+    *,
+    recompute_handle: Optional[Any] = None,
+    checkpoint_keep: Optional[str] = None,
     **options: Any,
 ) -> torch.Tensor:
     r"""Autograd-enabled context-parallel packed KDA chunked training step of this rank's fragments (the forward of
     :func:`chunk_kda_kcp_fwd`; the backward of :func:`chunk_kda_kcp_bwd` from its saved set).
+
+    Parameters
+    ----------
+    recompute_handle : KcpRecomputeHandle, optional
+        Keyword-only, default ``None`` (unchanged behavior).  A handle (``flashinfer.kda_train.KcpRecomputeHandle``
+        or any object with an ``entries`` dict, such as the convolution's handle of the same layer) makes the
+        ``torch.utils.checkpoint`` recompute of this call run without the forward state exchange: the original
+        forward exchanges as always and stores its incoming states (the saved set's own tensors, key ``"kda"``) in
+        the handle; the recompute inside the backward reads them back, so ``out`` and the gradients are bitwise
+        those of the same checkpoint without a handle.  The backward still exchanges.  Create one handle per layer
+        and micro-step, outside the outermost checkpoint region, and pass it as an argument of the checkpointed
+        function; a forward outside the backward that finds an entry raises.  Refused with ``graph="replay"``,
+        inside a CUDA-graph capture, with ``debug_sequence``, ``spec3_probe`` and ``boundary_mode="replay"``.  The
+        exchange is a collective: every rank of ``ctx.group`` passes a handle for the same call or none, created at
+        the same checkpoint nesting level; a mismatch hangs or corrupts data (no check is made).
+    checkpoint_keep : str, optional
+        With a handle only.  ``"states"`` (default): the handle keeps ``S_in`` and the call runs with
+        ``save_transfer=False`` (bitwise the default form; the backward re-sends the maps).  ``"transfer"``: it also
+        keeps the owner's c1 receive tensor (``save_transfer=True``; not with ``exchange="ring"``).  An explicit
+        ``save_transfer`` must agree with the tier (``"states"`` -> ``False``, ``"transfer"`` -> ``True``); a
+        contradicting value raises ``ValueError``.  The retained bytes are ``kcp_saved_bytes(ctx, H=...,
+        checkpoint_keep=..., with_conv=False)``.
 
     Returns
     -------
@@ -608,6 +633,8 @@ def chunk_kda_kcp(
         save_mode=save_mode,
         boundary_mode=boundary_mode,
         workspace=workspace,
+        recompute_handle=recompute_handle,
+        checkpoint_keep=checkpoint_keep,
         **options,
     )
 
@@ -654,14 +681,20 @@ def kcp_saved_bytes(
     *,
     H: int = 64,
     save_mode: str = "light",
-    save_transfer: bool = False,
+    save_transfer: Optional[bool] = None,
     with_conv: bool = True,
     C: int = 8192,
+    checkpoint_keep: Optional[str] = None,
 ) -> int:
     """Bytes of this rank's KCP saved set for ``H`` heads: the local saved set (:func:`kda_train_saved_bytes`), the
-    boundary states, and (``with_conv``) the convolution's history rows of ``C`` channels."""
+    boundary states, and (``with_conv``) the convolution's history rows of ``C`` channels.  ``checkpoint_keep``
+    (``"states"`` | ``"transfer"``): instead the bytes a recompute handle of that tier retains for the layer
+    (:func:`chunk_kda_kcp`; plus one convolution's history rows with ``with_conv``).  ``save_transfer``: ``None``
+    is ``False`` without a tier; with one, an explicit value that contradicts it raises ``ValueError``."""
     from .experimental.cake_kda_train import cake_kcp_plan
 
+    if save_transfer is None and checkpoint_keep is None:
+        save_transfer = False
     return cake_kcp_plan.kcp_saved_bytes(
         ctx,
         H=H,
@@ -669,6 +702,7 @@ def kcp_saved_bytes(
         save_transfer=save_transfer,
         with_conv=with_conv,
         C=C,
+        checkpoint_keep=checkpoint_keep,
     )
 
 
@@ -678,16 +712,26 @@ def kcp_comm_bytes(
     *,
     H: int = 64,
     C: int = 8192,
-    save_transfer: bool = False,
+    save_transfer: Optional[bool] = None,
     boundary_mode: str = "saved",
+    checkpoint_keep: Optional[str] = None,
 ) -> dict:
     """Bytes this rank sends and receives in one training step (forward and backward) for ``H`` heads and ``C``
     convolution channels: the state summaries, the boundary states and the halo rows of the context's collectives,
-    as a table per collective and per boundary (``cake_kcp_plan.kcp_comm_bytes``)."""
+    as a table per collective and per boundary (``cake_kcp_plan.kcp_comm_bytes``).  ``checkpoint_keep``: the
+    traffic of a checkpointed step with a recompute handle of that tier (the tier fixes ``save_transfer``; ``None``
+    is ``False`` without a tier; an explicit value that contradicts the tier raises ``ValueError``)."""
     from .experimental.cake_kda_train import cake_kcp_plan
 
+    if save_transfer is None and checkpoint_keep is None:
+        save_transfer = False
     return cake_kcp_plan.kcp_comm_bytes(
-        ctx, H=H, C=C, save_transfer=save_transfer, boundary_mode=boundary_mode
+        ctx,
+        H=H,
+        C=C,
+        save_transfer=save_transfer,
+        boundary_mode=boundary_mode,
+        checkpoint_keep=checkpoint_keep,
     )
 
 
@@ -699,8 +743,19 @@ def is_kda_train_supported(device: torch.device | str | int | None = None) -> bo
     return cake_backend.is_supported(device)
 
 
+def __getattr__(name: str) -> Any:
+    # ``KcpRecomputeHandle`` (the KCP route's checkpoint recompute handle) resolves on first access, so importing this
+    # module does not import the KCP host module (torch.distributed, the KCP loader), like the entry points above.
+    if name == "KcpRecomputeHandle":
+        from .experimental.cake_kda_train.cake_kcp import KcpRecomputeHandle
+
+        return KcpRecomputeHandle
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 __all__ = [
     "DEFAULT_SCALE",
+    "KcpRecomputeHandle",  # noqa: F822 - resolved by __getattr__
     "build_kcp_context",
     "chunk_kda",
     "chunk_kda_bwd",

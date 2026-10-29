@@ -482,3 +482,112 @@ def test_public_arena_option_runs_the_backend() -> None:
             strict=True,
         ):
             assert torch.equal(leaf.grad, expected)
+
+
+def test_kcp_recompute_handle_keywords_are_forwarded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The KCP checkpoint recompute handle on the public module (issue #7815): ``chunk_kda_kcp`` takes
+    ``recompute_handle`` / ``checkpoint_keep`` keyword-only and forwards both (``None`` by default);
+    ``kcp_saved_bytes`` / ``kcp_comm_bytes`` forward ``checkpoint_keep`` (and ``save_transfer=None`` under a tier,
+    ``False`` without one); ``KcpRecomputeHandle`` resolves lazily to
+    the KCP module's class.  Device-free (recorders)."""
+    from flashinfer.experimental.cake_kda_train import cake_kcp, cake_kcp_plan
+
+    calls = []
+
+    def recorder(name):
+        def fake(*args, **kwargs):
+            calls.append((name, args, kwargs))
+            return name
+
+        return fake
+
+    monkeypatch.setattr(cake_kcp, "chunk_kda_kcp", recorder("autograd"))
+    monkeypatch.setattr(cake_kcp_plan, "kcp_saved_bytes", recorder("saved"))
+    monkeypatch.setattr(cake_kcp_plan, "kcp_comm_bytes", recorder("comm"))
+    operands = tuple(object() for _ in range(6))
+    handle, ctx = object(), object()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        assert (
+            public_api.chunk_kda_kcp(
+                *operands, recompute_handle=handle, checkpoint_keep="transfer"
+            )
+            == "autograd"
+        )
+        assert public_api.chunk_kda_kcp(*operands, exchange="ring") == "autograd"
+        assert public_api.kcp_saved_bytes(ctx, checkpoint_keep="states") == "saved"
+        assert public_api.kcp_comm_bytes(ctx, H=4, checkpoint_keep="states") == "comm"
+        assert public_api.kcp_comm_bytes(ctx, H=4) == "comm"
+    base = {
+        "scale": None,
+        "save_mode": "light",
+        "boundary_mode": "saved",
+        "workspace": None,
+    }
+    assert (
+        calls
+        == [
+            (
+                "autograd",
+                operands,
+                {**base, "recompute_handle": handle, "checkpoint_keep": "transfer"},
+            ),
+            (
+                "autograd",
+                operands,
+                {
+                    **base,
+                    "recompute_handle": None,
+                    "checkpoint_keep": None,
+                    "exchange": "ring",
+                },
+            ),
+            (
+                "saved",
+                (ctx,),
+                {
+                    "H": 64,
+                    "save_mode": "light",
+                    "save_transfer": None,
+                    "with_conv": True,
+                    "C": 8192,
+                    "checkpoint_keep": "states",
+                },
+            ),
+            (
+                "comm",
+                (ctx,),
+                {
+                    "H": 4,
+                    "C": 8192,
+                    "save_transfer": None,  # the tier fixes it (an explicit contradicting value raises in the query)
+                    "boundary_mode": "saved",
+                    "checkpoint_keep": "states",
+                },
+            ),
+            (
+                "comm",
+                (ctx,),
+                {
+                    "H": 4,
+                    "C": 8192,
+                    "save_transfer": False,  # no tier: the public default, unchanged
+                    "boundary_mode": "saved",
+                    "checkpoint_keep": None,
+                },
+            ),
+        ]
+    )
+    params = inspect.signature(public_api.chunk_kda_kcp).parameters
+    for name in ("recompute_handle", "checkpoint_keep"):
+        assert params[name].kind is inspect.Parameter.KEYWORD_ONLY
+        assert params[name].default is None
+    for fn in (public_api.kcp_saved_bytes, public_api.kcp_comm_bytes):
+        p = inspect.signature(fn).parameters["checkpoint_keep"]
+        assert p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is None
+    assert public_api.KcpRecomputeHandle is cake_kcp.KcpRecomputeHandle
+    assert "KcpRecomputeHandle" in public_api.__all__
+    with pytest.raises(AttributeError):
+        _ = public_api.NoSuchName  # type: ignore[attr-defined]
