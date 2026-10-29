@@ -1471,6 +1471,67 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "fwd",
         },
     },
+    "cake_mhc_train_fwd_coef__rt64": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "stats"],
+            ["parameter", "T"],
+            ["parameter", "p_k"],
+            ["parameter", "t_pad"],
+            ["parameter", "rms_eps"],
+            ["parameter", "hc_eps"],
+            ["parameter", "sinkhorn_iters"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "kind": "tiles",
+            "rows_per_tile": 8,
+        },
+        "hidden": 4096,
+        "kernel": "cake_mhc_train_fwd_coef__rt64",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_coef__rt64",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 0,
+            "persistent_ctas_per_sm": 1,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_fwd_coef__rt64",
+        "logical": {
+            "T": "rows",
+            "base": "base",
+            "hc_eps": "hc_eps",
+            "p_k": "p_k",
+            "qpart": "qpart",
+            "rms_eps": "rms_eps",
+            "scale": "scale",
+            "sinkhorn_iters": "sinkhorn_iters",
+            "spart": "spart",
+            "stats": "stats",
+            "t_pad": "t_pad",
+        },
+        "role": "fwd_coef",
+        "select_rule": {
+            "kind": "run_time_iters",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
     "cake_mhc_train_fwd_collapse": {
         "arches": [
             "sm_100a",
@@ -2569,6 +2630,75 @@ MODULES: dict[str, dict[str, Any]] = {
             "workspace": "bwd",
         },
     },
+    "cake_mhc_train_bwd_token__rt64": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "dU"],
+            ["buffer", "stats"],
+            ["buffer", "gstats"],
+            ["buffer", "scale"],
+            ["buffer", "base"],
+            ["buffer", "dzp"],
+            ["buffer", "tokp"],
+            ["buffer", "param_partial"],
+            ["parameter", "T"],
+            ["parameter", "t_pad"],
+            ["parameter", "rows_per_cta"],
+            ["parameter", "hc_eps"],
+            ["parameter", "sinkhorn_iters"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "chunks_rule": "k6_grid",
+            "ctas_per_sm": 2,
+            "group_rows": 8,
+            "kind": "chunks",
+        },
+        "hidden": 4096,
+        "kernel": "cake_mhc_train_bwd_token__rt64",
+        "kernel_symbol": "kernel_cake_mhc_train_bwd_token__rt64",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 71296,
+            "persistent_ctas_per_sm": 2,
+            "use_pdl": True,
+        },
+        "library": "cake_mhc_train_bwd_token__rt64",
+        "logical": {
+            "T": "rows",
+            "X": "x",
+            "base": "base",
+            "dU": "du",
+            "dzp": "dzp",
+            "gstats": "gstats",
+            "hc_eps": "hc_eps",
+            "param_partial": "param_partial",
+            "rows_per_cta": "rows_per_cta",
+            "scale": "scale",
+            "sinkhorn_iters": "sinkhorn_iters",
+            "stats": "stats",
+            "t_pad": "t_pad",
+            "tokp": "tokp",
+        },
+        "role": "bwd_token",
+        "select_rule": {
+            "kind": "run_time_iters",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "bwd",
+        },
+    },
     "cake_mhc_train_bwd_slab__dynr": {
         "arches": [
             "sm_100a",
@@ -3170,6 +3300,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_train_bwd_token__ao22_rae7_pd1_tma_ntr",
             "cake_mhc_train_bwd_token__dot_ao8__a3",
             "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr__a3",
+            "cake_mhc_train_bwd_token__rt64",
             "cake_mhc_train_bwd_slab__xrsg",
             "cake_mhc_train_bwd_slab__dynr",
             "cake_mhc_train_bwd_reduce__s27_wcvt_fadd_fshfl",
@@ -3196,6 +3327,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_train_fwd_coef__st8_lp2_as_el_qd",
             "cake_mhc_train_fwd_coef__st8_lp2",
             "cake_mhc_train_fwd_coef__lp2_w8_adj",
+            "cake_mhc_train_fwd_coef__rt64",
             "cake_mhc_train_fwd_collapse",
         ],
         "fwd_recompute_h4096": [
@@ -3210,6 +3342,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_train_fwd_coef__st8_lp2_as_el_qd",
             "cake_mhc_train_fwd_coef__st8_lp2",
             "cake_mhc_train_fwd_coef__lp2_w8_adj",
+            "cake_mhc_train_fwd_coef__rt64",
         ],
     },
     "sm_103a": {
@@ -3218,6 +3351,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr",
             "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr",
             "cake_mhc_train_bwd_token__dot_ao8",
+            "cake_mhc_train_bwd_token__rt64",
             "cake_mhc_train_bwd_slab__dynr",
             "cake_mhc_train_bwd_slab__xrsg",
             "cake_mhc_train_bwd_reduce__pt64",
@@ -3242,6 +3376,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_train_fwd_coef__st8_lp2",
             "cake_mhc_train_fwd_coef__qe_mb10_pu4",
             "cake_mhc_train_fwd_coef__lp2_w8_adj",
+            "cake_mhc_train_fwd_coef__rt64",
             "cake_mhc_train_fwd_collapse",
         ],
         "fwd_recompute_h4096": [
@@ -3256,6 +3391,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_train_fwd_coef__st8_lp2",
             "cake_mhc_train_fwd_coef__qe_mb10_pu4",
             "cake_mhc_train_fwd_coef__lp2_w8_adj",
+            "cake_mhc_train_fwd_coef__rt64",
         ],
     },
     "sm_107a": {
@@ -3266,6 +3402,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_train_bwd_token__ao22_rae7_pd1_ntr__a7",
             "cake_mhc_train_bwd_token__dot_ao8_l2l",
             "cake_mhc_train_bwd_token__ao15_rae8_tma_ntr__a7",
+            "cake_mhc_train_bwd_token__rt64",
             "cake_mhc_train_bwd_slab__xrsg__a7",
             "cake_mhc_train_bwd_reduce__s27_wcvt_spred",
             "cake_mhc_train_bwd_reduce__wpu4",
@@ -3290,6 +3427,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_train_fwd_coef__qe_mb10_tree",
             "cake_mhc_train_fwd_coef__st8_lp2_tree_asel_qd",
             "cake_mhc_train_fwd_coef__lp2_w8_adj_qe",
+            "cake_mhc_train_fwd_coef__rt64",
             "cake_mhc_train_fwd_collapse",
         ],
         "fwd_recompute_h4096": [
@@ -3304,6 +3442,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_train_fwd_coef__qe_mb10_tree",
             "cake_mhc_train_fwd_coef__st8_lp2_tree_asel_qd",
             "cake_mhc_train_fwd_coef__lp2_w8_adj_qe",
+            "cake_mhc_train_fwd_coef__rt64",
         ],
     },
 }
@@ -3341,6 +3480,12 @@ SLAB_TILE_T = 64  # token tile of the column-slab pass
 RMS_EPS = 1e-5
 HC_EPS = 1e-6
 SINKHORN_ITERS = 20
+# The Sinkhorn iteration counts a call may ask for: 1 .. SINKHORN_ITERS_MAX.  The count of record
+# (SINKHORN_ITERS) runs the compiled programs, whose chain is unrolled; every other count runs the
+# run-time-count records (``select_rule`` kind ``run_time_iters``), which take the count as their
+# ``sinkhorn_iters`` kernel argument and were built for at most SINKHORN_ITERS_MAX (the token-owner
+# pass keeps the 2 x count - 1 normalisation steps of its forward replay in shared memory).
+SINKHORN_ITERS_MAX = 64
 
 # Per-token records (FP32 columns).  ``stats`` is retained between the forward
 # and the backward (256 bytes per token); ``gstats`` is written by
@@ -3464,6 +3609,7 @@ LOGICAL_SCALARS = (
     "rows_per_cta",
     "rms_eps",
     "hc_eps",
+    "sinkhorn_iters",
     "want_t",
     "accumulate",
 )
@@ -4389,6 +4535,7 @@ SELECT_RULE_KINDS = (
     "units_fit",
     "chunk_rows_band",
     "program",
+    "run_time_iters",
 )
 # The host rules a ``program`` selection rule may name (the record's program key must equal the rule's value).
 PROGRAM_RULES = (
@@ -4400,13 +4547,19 @@ PROGRAM_RULES = (
 
 
 def _selects(
-    rule: Optional[dict[str, Any]], rows: int, sm_count: int, arch: str
+    rule: Optional[dict[str, Any]],
+    rows: int,
+    sm_count: int,
+    arch: str,
+    sinkhorn_iters: int = SINKHORN_ITERS,
 ) -> bool:
     if rule is None:
         return True
     kind = rule["kind"]
     if kind not in SELECT_RULE_KINDS:
         raise ValueError(f"unknown Cake mHC training selection rule: {kind!r}")
+    if kind == "run_time_iters":
+        return int(sinkhorn_iters) != SINKHORN_ITERS
     if kind == "program":
         if rule["rule"] not in PROGRAM_RULES:
             raise ValueError(
@@ -4440,7 +4593,13 @@ def _selects(
 
 
 def selected_modules(
-    arch: str, hidden: int, kind: str, *, rows: int, sm_count: int
+    arch: str,
+    hidden: int,
+    kind: str,
+    *,
+    rows: int,
+    sm_count: int,
+    sinkhorn_iters: int = SINKHORN_ITERS,
 ) -> tuple[str, ...]:
     """Ordered module names one public call launches on ``arch`` for ``rows`` tokens
     on a device of ``sm_count`` SMs.
@@ -4459,19 +4618,39 @@ def selected_modules(
     ``(rows, sm_count, arch)`` equals the record's program key -- the
     coefficient-pass forms of record, the token-owner forms on sm_107a, the
     column-slab forms on sm_100a and sm_103a and the reduction forms on sm_100a
-    and sm_107a; ``None`` =
-    every call); exactly the modules whose rule admits
+    and sm_107a; ``run_time_iters``: every call whose ``sinkhorn_iters`` is not
+    :data:`SINKHORN_ITERS` -- the run-time-count forms of the coefficient pass and
+    the token-owner pass, which then stand in for every other record of their
+    ``role``; ``None`` = every call); exactly the modules whose rule admits
     the call are launched, in route order.  The rules of record are
     :func:`fn_split_program`, :func:`fwd_map_program`, :func:`fwd_coef_program`,
     :func:`bwd_token_program`, :func:`bwd_slab_program` and
     :func:`bwd_reduce_program`.
     """
 
-    rows = int(rows)
+    rows, sinkhorn_iters = int(rows), int(sinkhorn_iters)
+    route = route_modules(arch, hidden, kind)
+    # At a count other than the count of record, the run-time-count record of a role replaces the role's
+    # compiled records (whose chain is unrolled for SINKHORN_ITERS).
+    run_time_roles = (
+        {
+            MODULES[name]["role"]
+            for name in route
+            if (MODULES[name]["select_rule"] or {}).get("kind") == "run_time_iters"
+        }
+        if sinkhorn_iters != SINKHORN_ITERS
+        else set()
+    )
     names = tuple(
         name
-        for name in route_modules(arch, hidden, kind)
-        if _selects(MODULES[name]["select_rule"], rows, int(sm_count), arch)
+        for name in route
+        if (
+            (MODULES[name]["select_rule"] or {}).get("kind") == "run_time_iters"
+            or MODULES[name]["role"] not in run_time_roles
+        )
+        and _selects(
+            MODULES[name]["select_rule"], rows, int(sm_count), arch, sinkhorn_iters
+        )
     )
     if not names:
         raise ValueError(

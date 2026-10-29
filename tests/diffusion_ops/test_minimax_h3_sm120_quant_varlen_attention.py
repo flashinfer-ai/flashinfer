@@ -431,8 +431,9 @@ def test_minimax_h3_sm120_varlen_attention_fp8_overlapped_form_is_bitwise_sequen
     fresh_caches, monkeypatch
 ) -> None:
     """A plan of the overlap band takes the overlapped form (the producers, the lead and the tail
-    attention), leaves the head-control words zero after every call and matches the sequential
-    launches bit for bit, its first call (with the programs' zero-work first run) included."""
+    attention; on 188 SMs at the overlap width 32 the producers' burst build on every SM), leaves the
+    head-control words zero after every call and matches the sequential launches bit for bit, its
+    first call (with the programs' zero-work first run) included."""
     device = torch.device("cuda:0")
     _skip_without_overlap(device)
     monkeypatch.setattr(fp8_ops, "_OVERLAP_LOADED", set())
@@ -442,8 +443,9 @@ def test_minimax_h3_sm120_varlen_attention_fp8_overlapped_form_is_bitwise_sequen
     )
     plan = fp8_ops._plan_at(OVERLAP_CU_SEQLENS, MINIMAX_H3_NUM_HEADS, device.index)
     assert plan.overlap
+    burst = fp8_ops._sm_count(device.index) == 188
     assert fp8_ops.minimax_h3_sm120_quant_varlen_attention_programs(plan) == (
-        fp8_ops.PREPROCESS_HEAD_MAJOR,
+        fp8_ops.PREPROCESS_HEAD_MAJOR_BURST if burst else fp8_ops.PREPROCESS_HEAD_MAJOR,
         fp8_ops.ATTENTION_LEAD,
         fp8_ops.ATTENTION_TAIL,
     )
