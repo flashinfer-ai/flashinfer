@@ -369,6 +369,7 @@ def test_serving_above_top_tuned_bucket_uses_largest_entry(cache_root, monkeypat
             ),
         ),
     )
+
     # Bucket 4 is won by tactic 0 and bucket 8 by tactic 1, so the served
     # tactic shows which entry the lookup used.
     def times_by_bucket(inputs, tactic):
