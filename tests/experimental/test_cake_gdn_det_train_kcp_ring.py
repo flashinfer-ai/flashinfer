@@ -110,7 +110,7 @@ def _rank(rank: int, init_file: str, cu: list[int], crossing: bool) -> None:
     )
     try:
         torch.set_flush_denormal(False)
-        kcp, plan = _mod("cake_kcp"), _mod("cake_kcp_plan")
+        kcp, plan, l2n_ref = _mod("cake_kcp"), _mod("cake_kcp_plan"), _mod("cake_l2n")
         part = plan.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), W, "contiguous")
         ctx = plan.build_context_det_kcp(part, dist.group.WORLD, rank, torch.device("cpu"))
         assert int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS, int(ctx.n_d_max)
@@ -121,8 +121,13 @@ def _rank(rank: int, init_file: str, cu: list[int], crossing: bool) -> None:
             )
         else:
             assert int(ctx.N_out) == 0, int(ctx.N_out)
-        ops = _local(part, cu, rank, _global_inputs(cu))
+        raw = _local(part, cu, rank, _global_inputs(cu))
+        # the norm-off route takes L2-normalized rows (raw rows would make the delta rule diverge), the norm-on
+        # route the raw rows
+        hat = dict(raw)
+        hat["q"], hat["k"] = (l2n_ref.qk_l2norm_ref(raw[n])[0] for n in ("q", "k"))
         for l2n in (False, True):
+            ops = raw if l2n else hat
             base = {
                 "exchange": "ring",
                 "save_transfer": False,
@@ -141,11 +146,11 @@ def _rank(rank: int, init_file: str, cu: list[int], crossing: bool) -> None:
             assert sorted(s for s in seq_w if s.startswith("ring:")) == hops, seq_w
             for name in TENSORS:
                 a, b = ref[name], got[name]
+                assert torch.isfinite(a.float()).all(), (rank, l2n, crossing, name)
                 assert a.shape == b.shape and torch.equal(a, b), (
                     f"rank {rank} l2n={l2n} crossing={crossing}: {name} differs between the overlap and "
                     f"wait_first schedules (max |diff| {(a.float() - b.float()).abs().max().item()})"
                 )
-                assert torch.isfinite(a.float()).all(), (rank, l2n, name)
         dist.barrier()
     finally:
         dist.destroy_process_group()
