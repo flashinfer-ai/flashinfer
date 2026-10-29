@@ -50,15 +50,18 @@ namespace qsa_nvfp4 {
 //    the four lanes of a token hit different banks.
 //  * PV: column n of warp w's n8 tile i is physical dim 64w + 8n + i, so a lane reads one dim
 //    group per token, and its output dims per row end up contiguous: [64w + 16t, +16).
-// Row strides of 144 (NVFP4), 272 (FP8) and 528 (BF16) bytes keep both read patterns free of
-// bank conflicts.
+// Row strides of 144 (NVFP4) and 272 (FP8) bytes keep both read patterns free of bank conflicts.
+// BF16 rows are unpadded 512 bytes and store 16-byte chunk c of stage token r at c ^ (r % 8)
+// instead, so three BF16 CTAs fit in the 228 KB of an SM90 SM.
 
 enum class KvFormat { kNVFP4, kFP8, kBF16 };
 
 constexpr uint32_t kHeadDim = 256;
 constexpr uint32_t kNumWarps = 4;
 constexpr uint32_t kNumThreads = kNumWarps * 32;
-constexpr uint32_t kMergeWarps = 4, kMergeThreads = 32 * kMergeWarps;
+// Merge warps at most. NVFP4 keeps its four; BF16 and FP8 merge up to 65 splits in one pass.
+template <KvFormat F>
+constexpr uint32_t kMergeWarps = F == KvFormat::kNVFP4 ? 4 : 16;
 constexpr int kMergeDepth = 8;            // splits in flight per merge warp
 constexpr float kMaskedScore = -1.0e20f;  // the Triton kernel's sentinel
 
@@ -81,7 +84,7 @@ struct KvTraits<KvFormat::kFP8> {
 template <>
 struct KvTraits<KvFormat::kBF16> {
   static constexpr uint32_t kChunks = kHeadDim / 8;
-  static constexpr uint32_t kRowBytes = 16 * kChunks + 16;
+  static constexpr uint32_t kRowBytes = 16 * kChunks;
   // Two 64-token stages would exceed the shared memory of SM86 and SM89.
   static constexpr uint32_t kTileTokens = 32;
   using PvType = nv_bfloat16;
@@ -132,6 +135,13 @@ __device__ __forceinline__ uint32_t qk_dim(uint32_t s, uint32_t t) {
   } else {
     return 64 * t + 8 * ((s / 2 + 2 * t) % 8) + 4 * (s % 2);
   }
+}
+
+// Byte offset of 16-byte chunk c in a K/V row of stage token r. Only r % 8 matters, so a
+// warp-local token index works too: each warp owns whole 8-token groups.
+template <KvFormat F>
+__device__ __forceinline__ uint32_t chunk_offset(uint32_t c, uint32_t r) {
+  return 16 * (F == KvFormat::kBF16 ? c ^ (r % 8) : c);
 }
 
 __device__ __forceinline__ uint32_t mul_bf16x2(uint32_t a, uint32_t b) {
@@ -189,7 +199,8 @@ __device__ __forceinline__ void copy_rows(uint8_t* rows, const uint8_t* data, co
     if (kCopies % 32 == 0 || e < kCopies) {
       cp_async::pred_load_128b<cp_async::PrefetchMode::kNoPrefetch,
                                cp_async::SharedMemFillMode::kFillZero>(
-          rows + token * Traits::kRowBytes + 16 * chunk, src, (valid >> token) & 1u);
+          rows + token * Traits::kRowBytes + chunk_offset<F>(chunk, token), src,
+          (valid >> token) & 1u);
     }
   }
 }
@@ -355,7 +366,8 @@ __global__ void __launch_bounds__(kNumThreads) SparsePagedAttentionKernel(const 
     } else {
 #pragma unroll
       for (uint32_t c = 0; c < 8; ++c) {  // k-steps 2c and 2c + 1
-        const uint4 raw = *reinterpret_cast<const uint4*>(k0 + 2 * qk_dim<F>(2 * c, t));
+        const uint4 raw =
+            *reinterpret_cast<const uint4*>(k0 + chunk_offset<F>(qk_dim<F>(2 * c, t) / 8, g));
         mma_m16n8k16_bf16(s, smem.q[2 * c][lane], raw.x, raw.y);
         mma_m16n8k16_bf16(s, smem.q[2 * c + 1][lane], raw.z, raw.w);
       }
@@ -456,13 +468,15 @@ __global__ void __launch_bounds__(kNumThreads) SparsePagedAttentionKernel(const 
       } else {
 #pragma unroll
         for (uint32_t j = 0; j < 4; ++j) {
-          const uint8_t* v_row = v_tile + (16 * kk + 2 * t + j % 2 + 8 * (j / 2)) * kRowBytes;
+          const uint32_t token = 16 * kk + 2 * t + j % 2 + 8 * (j / 2);
+          const uint8_t* v_row = v_tile + token * kRowBytes;
           if constexpr (F == KvFormat::kFP8) {
             uint2 raw = *reinterpret_cast<const uint2*>(v_row + 64 * warp + 8 * g);
             fast_dequant_f8f16x4<__nv_fp8_e4m3, half>(&raw.x, reinterpret_cast<uint2*>(d[j]));
             fast_dequant_f8f16x4<__nv_fp8_e4m3, half>(&raw.y, reinterpret_cast<uint2*>(d[j] + 2));
           } else {
-            const uint4 raw = *reinterpret_cast<const uint4*>(v_row + 128 * warp + 16 * g);
+            const uint4 raw =
+                *reinterpret_cast<const uint4*>(v_row + chunk_offset<F>(8 * warp + g, token));
             d[j][0] = raw.x, d[j][1] = raw.y, d[j][2] = raw.z, d[j][3] = raw.w;
           }
         }
@@ -538,7 +552,8 @@ __global__ void __launch_bounds__(kNumThreads) SparsePagedAttentionKernel(const 
 // Each warp merges a contiguous chunk of the splits, kMergeDepth at a time, issuing a group's
 // loads before using any of them, and lane l owns dims [8l, 8l + 8); the warps' sums are then
 // rescaled to a common max. The launch gives one warp per kMergeDepth splits, at most kMergeWarps.
-__global__ void __launch_bounds__(kMergeThreads) MergeKernel(const Params p) {
+template <KvFormat F>
+__global__ void __launch_bounds__(32 * kMergeWarps<F>) MergeKernel(const Params p) {
   const int row = blockIdx.x, head = blockIdx.y;
   const uint32_t num_warps = blockDim.x / 32, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
   const uint32_t dim = 8 * lane;
@@ -582,8 +597,16 @@ __global__ void __launch_bounds__(kMergeThreads) MergeKernel(const Params p) {
     }
   }
 
-  __shared__ float warp_m[kMergeWarps], warp_den[kMergeWarps];
-  __shared__ float4 warp_acc[kMergeWarps][kHeadDim / 4];
+  __shared__ float warp_m[kMergeWarps<F>], warp_den[kMergeWarps<F>];
+  float4(*warp_acc)[kHeadDim / 4];
+  if constexpr (F == KvFormat::kNVFP4) {
+    __shared__ float4 acc[kMergeWarps<F>][kHeadDim / 4];
+    warp_acc = acc;
+  } else {
+    // Sized by the launch to the warps it runs, so few-split merges keep their occupancy.
+    extern __shared__ __align__(16) uint8_t smem_buffer[];
+    warp_acc = reinterpret_cast<float4(*)[kHeadDim / 4]>(smem_buffer);
+  }
   if (lane == 0) {
     warp_m[warp] = m;
     warp_den[warp] = den;
@@ -641,8 +664,9 @@ inline cudaError_t SparsePagedAttention(const Params& p, cudaStream_t stream) {
   const dim3 grid(p.num_rows, p.num_qo_heads / p.group_size, p.num_splits);
   SparsePagedAttentionKernel<F><<<grid, kNumThreads, sizeof(SharedStorage<F>), stream>>>(p);
   if (p.num_splits > 1) {
-    const int warps = min(int(kMergeWarps), (p.num_splits + kMergeDepth - 1) / kMergeDepth);
-    MergeKernel<<<dim3(p.num_rows, p.num_qo_heads), 32 * warps, 0, stream>>>(p);
+    const int warps = min(int(kMergeWarps<F>), (p.num_splits + kMergeDepth - 1) / kMergeDepth);
+    const size_t acc_bytes = F == KvFormat::kNVFP4 ? 0 : warps * kHeadDim * sizeof(float);
+    MergeKernel<F><<<dim3(p.num_rows, p.num_qo_heads), 32 * warps, acc_bytes, stream>>>(p);
   }
   return cudaGetLastError();
 }
