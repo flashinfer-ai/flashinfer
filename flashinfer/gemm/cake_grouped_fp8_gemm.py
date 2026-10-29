@@ -1583,10 +1583,16 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous(
         and at most 255 experts, when at least 90% of the runs start inside a
         tile of the shape's route and one starts at least half a tile in, the
         launch uses the expert-aligned program, whose tiles never span two
-        experts.  These choices affect speed only.  Every program computes the
-        same bits for any valid ``m_indices``, so indices that change after
-        preparation (rebound at ``launch`` or rewritten before a graph replay)
-        stay correct; only the chosen program may be slower for them.
+        experts.  Such a launch uses the window-segment program instead when
+        its CTAs (the 128-row windows x the most expert runs in one window x
+        the 64-column tiles) fit in one wave and the shape keeps its launch
+        contract (``1 <= M <= 2**24``, ``64 <= N <= 2**19``): each CTA
+        computes one expert run of a 128-row window, so one window may hold
+        several experts.  These choices affect speed only.  Every program
+        computes the same bits for any valid ``m_indices``, so indices that
+        change after preparation (rebound at ``launch`` or rewritten before a
+        graph replay) stay correct; only the chosen program may be slower for
+        them.
     fill_padding : bool
         Accept ``-1`` padding rows in ``m_indices`` (promotion family).  The
         prepared object owns an ``(M,)`` int32 plus ``(M,)`` int64 scratch and
