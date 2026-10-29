@@ -79,6 +79,7 @@ from ..common.kernel_utils import (
     vectorized_atomic_add_fp32x2,
 )
 from .custom_pipeline import PipelineUmmaAsync
+from .inline_ptx import tma_gather4 as _blockscaled_tma_gather4
 from .utils import (
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
@@ -127,60 +128,6 @@ def _gather_mbarrier_wait(mbarrier, phase, loc=None, ip=None):
         "wait_done: "
         "fence.acquire.sync_restrict::shared::cluster.cluster; }",
         "r,r,~{memory}",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
-def _blockscaled_tma_gather4(
-    atom,
-    destination,
-    mbarrier,
-    k,
-    r0,
-    r1,
-    r2,
-    r3,
-    cta_group,
-    cache_policy,
-    loc=None,
-    ip=None,
-):
-    """Issue four 128-byte activation rows into the native K-major B layout."""
-    executable = _cute_nvgpu_ir.atom_make_exec_tma(atom._trait.value, loc=loc, ip=ip)
-    descriptor_type = _cute_ir.PtrType.get(
-        _cute_nvgpu_ir.TmaDescriptorTiledType.get(), AddressSpace.generic, 64
-    )
-    descriptor = _cute_nvgpu_ir.get_tma_desc_addr(
-        descriptor_type, executable, loc=loc, ip=ip
-    )
-    barrier = cutlass.Int32(mbarrier.toint())
-    if cta_group == 2:
-        # Clear the peer-CTA bit so both CTAs signal the leader's barrier.
-        barrier = barrier & cutlass.Int32(-16777217)
-    elif cta_group != 1:
-        raise ValueError("Unsupported TMA CTA group")
-    llvm.inline_asm(
-        None,
-        [
-            cutlass.Int32(destination.toint()).ir_value(loc=loc, ip=ip),
-            descriptor.toint().ir_value(loc=loc, ip=ip),
-            barrier.ir_value(loc=loc, ip=ip),
-            cutlass.Int32(k).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(r0).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(r1).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(r2).ir_value(loc=loc, ip=ip),
-            cutlass.Int32(r3).ir_value(loc=loc, ip=ip),
-            cutlass.Int64(cache_policy).ir_value(loc=loc, ip=ip),
-        ],
-        "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4."
-        f"mbarrier::complete_tx::bytes.cta_group::{cta_group}.L2::cache_hint "
-        "[$0], [$1, {$3, $4, $5, $6, $7}], [$2], $8;",
-        "r,l,r,r,r,r,r,r,l",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,

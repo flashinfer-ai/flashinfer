@@ -32,7 +32,6 @@ from flashinfer.tllm_enums import (
 
 from .moe_finalize import moe_unpermute
 from .moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
-from .moe_swap_ab_prepare import prepare
 
 
 W4A16GemmTactic = Tuple[Tuple[int, int, int], Tuple[int, int], bool]
@@ -123,6 +122,7 @@ def _get_compiled_kernel(
     cluster_shape_mn: Tuple[int, int],
     raster_along_m: bool,
     gated_weight_group_size: int,
+    gather_input: bool,
 ):
     mma_tiler_m, route_tile, mma_tiler_k = mma_tiler_mnk
     use_2cta_instrs = mma_tiler_m == 256
@@ -154,6 +154,7 @@ def _get_compiled_kernel(
         transform_fragment_size,
         m_cluster_aligned,
         gated_weight_group_size,
+        gather_input,
     )
     compiled = _kernel_cache.get(cache_key)
     if compiled is None:
@@ -178,6 +179,8 @@ def _get_compiled_kernel(
             transform_fragment_size=transform_fragment_size,
             m_cluster_aligned=m_cluster_aligned,
             gated_weight_group_size=gated_weight_group_size,
+            gather_input=gather_input,
+            gather_top_k=top_k if gather_input else 1,
         )
         compiled = cute.compile(
             kernel.wrapper,
@@ -198,6 +201,7 @@ def _get_compiled_kernel(
             top_k,
             max_active_clusters=max_active_clusters,
             stream=stream,
+            options="--ptxas-options='-maxrregcount=96'" if gather_input else "",
         )
         _kernel_cache[cache_key] = compiled
     return compiled
@@ -225,13 +229,15 @@ def _run_grouped_gemm(
     enable_pdl: bool,
     tactic: W4A16GemmTactic,
     swap_ab: bool,
+    gather_input: bool = False,
+    gather_top_k: int = 1,
 ) -> None:
     from flashinfer.fused_moe.prepare import _cute_dsl_gated_weight_group_size
 
     gated_weight_group_size = _cute_dsl_gated_weight_group_size(weight.device, swap_ab)
     m = int(weight.size(1))
     k = int(weight.size(2)) * 2
-    n = int(activations.size(0))
+    n = int(output.size(0)) if gather_input else int(activations.size(0))
     stream = current_cuda_stream()
     mma_tiler_mnk, cluster_shape_mn, raster_along_m = tactic
     mma_tiler_m, route_tile, _ = mma_tiler_mnk
@@ -264,7 +270,7 @@ def _run_grouped_gemm(
         cutlass.BFloat16,
         activations.data_ptr(),
         cute.AddressSpace.gmem,
-        assumed_align=32,
+        assumed_align=16,
     )
     tile_idx_to_expert_idx_ptr = make_ptr(
         cutlass.Int32,
@@ -316,8 +322,20 @@ def _run_grouped_gemm(
         if token_final_scales is not None
         else None
     )
-    num_tokens = int(output.size(0)) if use_fused_finalize else 0
-    top_k = int(token_final_scales.size(1)) if token_final_scales is not None else 0
+    num_tokens = (
+        int(activations.size(0))
+        if gather_input
+        else int(output.size(0))
+        if use_fused_finalize
+        else 0
+    )
+    top_k = (
+        gather_top_k
+        if gather_input
+        else int(token_final_scales.size(1))
+        if token_final_scales is not None
+        else 0
+    )
     compiled = _get_compiled_kernel(
         num_local_experts,
         weight_ptr,
@@ -350,6 +368,7 @@ def _run_grouped_gemm(
         cluster_shape_mn,
         raster_along_m,
         gated_weight_group_size,
+        gather_input,
     )
     compiled(
         weight_ptr,
@@ -448,23 +467,10 @@ def launch_w4a16_moe(
     permuted_idx_to_expanded_idx = permuted_idx_to_expanded_idx[:route_slots]
     hidden_workspace = workspace.hidden_workspace[:route_slots]
     intermediate = workspace.intermediate[:route_slots]
-    prepare(
-        activation=x,
-        activation_sf=None,
-        routed=hidden_workspace,
-        routed_sf=None,
-        mapping=permuted_idx_to_expanded_idx,
-        limits=tile_idx_to_mn_limit,
-        num_tiles=num_non_exiting_tiles,
-        route_tile=route_tile,
-        top_k=top_k,
-        sf_vec_size=None,
-        enable_pdl=enable_pdl,
-    )
     _run_grouped_gemm(
         weight=w1_weight,
         weight_sf=w1_weight_sf,
-        activations=hidden_workspace,
+        activations=x,
         tile_idx_to_expert_idx=tile_idx_to_expert_idx,
         tile_idx_to_mn_limit=tile_idx_to_mn_limit,
         num_non_exiting_tiles=num_non_exiting_tiles,
@@ -478,11 +484,13 @@ def launch_w4a16_moe(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         use_fused_finalize=False,
-        permuted_idx_to_expanded_idx=None,
+        permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
         token_final_scales=None,
         enable_pdl=enable_pdl,
         tactic=gemm1_tactic,
         swap_ab=swap_ab,
+        gather_input=True,
+        gather_top_k=top_k,
     )
     gemm2_output = moe_output if use_fused_finalize else hidden_workspace
     if use_fused_finalize:
@@ -511,6 +519,8 @@ def launch_w4a16_moe(
         enable_pdl=enable_pdl,
         tactic=gemm2_tactic,
         swap_ab=swap_ab,
+        gather_input=False,
+        gather_top_k=1,
     )
     if not use_fused_finalize:
         moe_unpermute(

@@ -59,6 +59,7 @@ from flashinfer.tllm_enums import (
 )
 
 from ..moe_utils import validate_cute_dsl_moe_situ_config
+from .inline_ptx import tma_gather4
 from .moe_w4a16_utils import decode_nvfp4_fragment_to_bf16
 from .utils import (
     blk_reduce_bf16,
@@ -66,6 +67,7 @@ from .utils import (
     gelu_tanh_f32,
     griddepcontrol_launch_dependents,
     griddepcontrol_wait,
+    release_gpu,
 )
 
 
@@ -276,9 +278,13 @@ class Sm100W4A16GroupedGemmKernel:
         transform_fragment_size: int,
         m_cluster_aligned: bool,
         gated_weight_group_size: int = 64,
+        gather_input: bool = False,
+        gather_top_k: int = 1,
     ):
         """Initialize the W4A16 grouped GEMM configuration."""
         self.group_count = group_count
+        self.gather_input = gather_input
+        self.gather_top_k = gather_top_k
         self.acc_dtype = acc_dtype
         self.use_2cta_instrs = use_2cta_instrs
         self.cluster_shape_mn = cluster_shape_mn
@@ -341,22 +347,14 @@ class Sm100W4A16GroupedGemmKernel:
         self.transform_warp_id = tuple(range(8, 8 + 4 * self.num_transform_warpgroups))
         self.num_transform_warps = len(self.transform_warp_id)
         # Keep the role-control warpgroup on one absolute register target.
-        # Transform warps retain the 128-register launch default.
-        self.num_regs_epilogue_warps = 176
+        # Transform warps retain the launch default: 96 for gather, otherwise 128.
+        self.num_regs_epilogue_warps = 144 if gather_input else 176
         self.num_regs_generic_warps = 80
-        self.threads_per_cta = 32 * (
-            max(
-                (
-                    self.mma_warp_id,
-                    self.schedule_warp_id,
-                    self.weight_tma_warp_id,
-                    self.activation_tma_warp_id,
-                    *self.epilog_warp_id,
-                    *self.transform_warp_id,
-                )
-            )
-            + 1
+        self.gather_warp_id = (16, 17, 18, 19)
+        last_warp = (
+            self.gather_warp_id[-1] if gather_input else self.transform_warp_id[-1]
         )
+        self.threads_per_cta = 32 * (last_warp + 1)
 
         self.epilog_sync_barrier = pipeline.NamedBarrier(
             1, 32 * len(self.epilog_warp_id)
@@ -850,7 +848,9 @@ class Sm100W4A16GroupedGemmKernel:
         )
         activations = cute.make_tensor(
             activation_ptr,
-            cute.make_ordered_layout((n, k, 1), order=(1, 0, 2)),
+            cute.make_ordered_layout(
+                (num_tokens if self.gather_input else n, k, 1), order=(1, 0, 2)
+            ),
         )
         output_m = m // self.output_m_factor
         output_layout = cute.make_ordered_layout((output_m, n, 1), order=(0, 1, 2))
@@ -876,7 +876,7 @@ class Sm100W4A16GroupedGemmKernel:
         alpha = cute.make_tensor(alpha_ptr, cute.make_layout((self.group_count,)))
         permuted_idx_to_expanded_idx = (
             cute.make_tensor(permuted_idx_to_expanded_idx_ptr, cute.make_layout((n,)))
-            if cutlass.const_expr(self.use_fused_finalize)
+            if cutlass.const_expr(self.use_fused_finalize or self.gather_input)
             else None
         )
         token_final_scales = (
@@ -981,17 +981,38 @@ class Sm100W4A16GroupedGemmKernel:
         )
 
         smem_layout_b_per_stage = cute.slice_(self.smem_layout_b, (None, None, None, 0))
-        tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
-            b_op,
-            b,
-            smem_layout_b_per_stage,
-            self.mma_tiler,
-            tiled_mma,
-            self.cluster_layout_vmnk.shape,
-            internal_type=(
-                cutlass.TFloat32 if b.element_type is cutlass.Float32 else None
-            ),
-        )
+        if cutlass.const_expr(self.gather_input):
+            gather_tensor = cute.make_tensor(
+                b.iterator,
+                cute.make_layout(
+                    (cutlass.Int32(b.shape[0]), cutlass.Int32(b.shape[1])),
+                    stride=(b.stride[0], b.stride[1]),
+                ),
+            )
+            gather_layout = cute.make_composed_layout(
+                cute.make_swizzle(3, 4, 3),
+                0,
+                cute.make_layout((1, 64), stride=(64, 1)),
+            )
+            tma_atom_b, _ = cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                gather_tensor,
+                gather_layout,
+                (1, 64),
+            )
+            tma_tensor_b = b
+        else:
+            tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
+                b_op,
+                b,
+                smem_layout_b_per_stage,
+                self.mma_tiler,
+                tiled_mma,
+                self.cluster_layout_vmnk.shape,
+                internal_type=(
+                    cutlass.TFloat32 if b.element_type is cutlass.Float32 else None
+                ),
+            )
 
         a_copy_size = cute.size_in_bytes(self.a_dtype, smem_layout_a_per_stage)
         b_copy_size = cute.size_in_bytes(self.b_dtype, smem_layout_b_per_stage)
@@ -1192,13 +1213,15 @@ class Sm100W4A16GroupedGemmKernel:
         b_load2mma_pipeline = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.b_load2mma_full_mbar_ptr.data_ptr(),
             num_stages=self.num_load2trans_stage,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+            producer_group=pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, 4 if self.gather_input else 1
+            ),
             consumer_group=pipeline.CooperativeGroup(
                 pipeline.Agent.Thread, self.num_mcast_ctas_b
             ),
             tx_count=self.num_tma_load_bytes_b,
             cta_layout_vmnk=cluster_layout_vmnk,
-            mcast_mode_mn=(0, 1),  # multicast for B will only happen on the N-mode
+            mcast_mode_mn=(0, 1),
             defer_sync=True,
         )
         # Initialize accumulator pipeline, which tracks the dependencies between
@@ -1216,7 +1239,9 @@ class Sm100W4A16GroupedGemmKernel:
         # Initialize tile info pipeline, which tracks the dependencies between
         # tile scheduling warp and other warps
         # Every warp except the scheduler consumes routed-tile metadata.
-        num_tile_info_pipeline_consumer_threads = self.threads_per_cta - 32
+        num_tile_info_pipeline_consumer_threads = (
+            self.threads_per_cta - 32 - (32 if self.gather_input else 0)
+        )
         tile_info_pipeline = pipeline.PipelineAsync.create(
             barrier_storage=storage.tile_info_full_mbar_ptr.data_ptr(),
             num_stages=self.num_tile_info_stage,
@@ -1432,13 +1457,14 @@ class Sm100W4A16GroupedGemmKernel:
         )
         # ((atom_v, rest_v), STAGE)
         # ((atom_v, rest_v), loopM, loopK, loopL)
-        tBsB, tBgB = cpasync.tma_partition(
-            tma_atom_b,
-            block_in_cluster_coord_vmnk[1],
-            b_cta_layout,
-            cute.group_modes(sB_input, 0, 3),
-            cute.group_modes(tCgB, 0, 3),
-        )
+        if cutlass.const_expr(not self.gather_input):
+            tBsB, tBgB = cpasync.tma_partition(
+                tma_atom_b,
+                block_in_cluster_coord_vmnk[1],
+                b_cta_layout,
+                cute.group_modes(sB_input, 0, 3),
+                cute.group_modes(tCgB, 0, 3),
+            )
 
         # (MMA, MMA_N, MMA_K, STAGE)
         tCrB = tiled_mma.make_fragment_B(sB_input)
@@ -1455,158 +1481,121 @@ class Sm100W4A16GroupedGemmKernel:
         tmem.allocate(self.num_tmem_alloc_cols)
         tmem.wait_for_alloc()
 
-        # Tile scheduling is independent of the preceding grid.
-        if warp_idx == self.schedule_warp_id:
+        if cutlass.const_expr(self.gather_input and self.enable_pdl):
+            # Without prepare, sort has not yet published routing to FC1.
+            griddepcontrol_wait()
+
+        if warp_idx >= self.mma_warp_id and warp_idx < self.transform_warp_id[0]:
             cute.arch.setmaxregister_decrease(self.num_regs_generic_warps)
-            tile_info_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.num_tile_info_stage
-            )
-            num_non_exiting_tiles_value = num_non_exiting_tiles[0]
-            if cutlass.const_expr(self.use_clc_scheduler):
-                tile_sched = utils.ClcDynamicPersistentTileScheduler.create(
-                    tile_sched_params,
-                    (bidx, bidy, bidz),
-                    cute.arch.grid_dim(),
-                    clc_response_ptr,
+            # Tile scheduling is independent of the preceding grid.
+            if warp_idx == self.schedule_warp_id:
+                tile_info_producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.num_tile_info_stage
                 )
-                work_tile = tile_sched.initial_work_tile_info()
-                clc_producer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.ProducerConsumer, 1
-                )
-                clc_consumer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer, 1
-                )
-                not_last_tile = cutlass.Boolean(1)
-                while not_last_tile:
-                    tile_coord_mnl = work_tile.tile_idx
-                    route_tile_idx = tile_coord_mnl[1]
-                    is_routed_tile = work_tile.is_valid_tile and (
-                        route_tile_idx < num_non_exiting_tiles_value
+                num_non_exiting_tiles_value = num_non_exiting_tiles[0]
+                if cutlass.const_expr(self.use_clc_scheduler):
+                    tile_sched = utils.ClcDynamicPersistentTileScheduler.create(
+                        tile_sched_params,
+                        (bidx, bidy, bidz),
+                        cute.arch.grid_dim(),
+                        clc_response_ptr,
                     )
-
-                    if is_routed_tile or not work_tile.is_valid_tile:
-                        tile_info_pipeline.producer_acquire(tile_info_producer_state)
-
-                    if work_tile.is_valid_tile and is_first_cta_in_cluster:
-                        clc_pipeline.producer_acquire(clc_producer_state)
-                        tile_sched.advance_to_next_work(
-                            clc_pipeline.producer_get_barrier(clc_producer_state)
-                        )
-                        clc_producer_state.advance()
-
-                    if is_routed_tile or not work_tile.is_valid_tile:
-                        cur_sTile_info = sTile_info[
-                            (None, tile_info_producer_state.index)
-                        ]
-                        route_start = cutlass.Int32(-1)
-                        group_idx = cutlass.Int32(group_count)
-                        distance_to_boundary = cutlass.Int32(-1)
-                        if is_routed_tile:
-                            route_start = route_tile_idx * self.cta_tile_shape_mnk[1]
-                            group_idx = tile_idx_to_expert_idx[route_tile_idx]
-                            distance_to_boundary = (
-                                tile_idx_to_mn_limit[route_tile_idx] - route_start
-                            )
-                        with cute.arch.elect_one():
-                            cur_sTile_info[0] = tile_coord_mnl[0]
-                            cur_sTile_info[1] = route_start
-                            cur_sTile_info[2] = group_idx
-                            cur_sTile_info[3] = distance_to_boundary
-                            tile_info_pipeline.producer_commit(tile_info_producer_state)
-                        tile_info_producer_state.advance()
-
-                    if work_tile.is_valid_tile:
-                        clc_pipeline.consumer_wait(clc_consumer_state)
-                        work_tile = tile_sched.get_current_work()
-                        clc_pipeline.consumer_release(clc_consumer_state)
-                        clc_consumer_state.advance()
-                    else:
-                        not_last_tile = cutlass.Boolean(0)
-
-                tile_info_pipeline.producer_tail(tile_info_producer_state)
-                if is_first_cta_in_cluster:
-                    clc_pipeline.producer_tail(clc_producer_state)
-            else:
-                tile_sched = utils.StaticPersistentRuntimeTileScheduler.create(
-                    tile_sched_params,
-                    (bidx, bidy, bidz),
-                    cute.arch.grid_dim(),
-                    inner_mode=0 if self.raster_along_m else 1,
-                )
-                work_tile = tile_sched.initial_work_tile_info()
-                not_last_tile = cutlass.Boolean(1)
-                if cutlass.const_expr(self.raster_along_m):
+                    work_tile = tile_sched.initial_work_tile_info()
+                    clc_producer_state = pipeline.make_pipeline_state(
+                        pipeline.PipelineUserType.ProducerConsumer, 1
+                    )
+                    clc_consumer_state = pipeline.make_pipeline_state(
+                        pipeline.PipelineUserType.Consumer, 1
+                    )
+                    not_last_tile = cutlass.Boolean(1)
                     while not_last_tile:
-                        tile_info_pipeline.producer_acquire(tile_info_producer_state)
-                        cluster_tile_coord_mnl = work_tile.tile_idx
-                        cta_tile_coord_m = (
-                            cluster_tile_coord_mnl[0] * self.cluster_shape_mn[0]
-                            + block_in_cluster_coord_vmnk[1]
-                            * cute.size(tiled_mma.thr_id.shape)
-                            + block_in_cluster_coord_vmnk[0]
-                        )
-                        cta_tile_offset_n = block_in_cluster_coord_vmnk[2]
-                        route_tile_idx = (
-                            cluster_tile_coord_mnl[1] * self.cluster_shape_mn[1]
-                            + cta_tile_offset_n
-                        )
-                        not_last_tile = work_tile.is_valid_tile and (
-                            route_tile_idx < num_non_exiting_tiles_value
-                        )
-                        route_start = cutlass.Int32(-1)
-                        group_idx = cutlass.Int32(group_count)
-                        distance_to_boundary = cutlass.Int32(-1)
-                        if not_last_tile:
-                            route_start = route_tile_idx * self.cta_tile_shape_mnk[1]
-                            group_idx = tile_idx_to_expert_idx[route_tile_idx]
-                            distance_to_boundary = (
-                                tile_idx_to_mn_limit[route_tile_idx] - route_start
-                            )
-                        cur_sTile_info = sTile_info[
-                            (None, tile_info_producer_state.index)
-                        ]
-                        with cute.arch.elect_one():
-                            cur_sTile_info[0] = cta_tile_coord_m
-                            cur_sTile_info[1] = route_start
-                            cur_sTile_info[2] = group_idx
-                            cur_sTile_info[3] = distance_to_boundary
-                            tile_info_pipeline.producer_commit(tile_info_producer_state)
-                        tile_info_producer_state.advance()
-                        tile_sched.advance_to_next_work()
-                        work_tile = tile_sched.get_current_work()
-                else:
-                    while not_last_tile:
-                        cluster_tile_coord_mnl = work_tile.tile_idx
-                        cta_tile_coord_m = (
-                            cluster_tile_coord_mnl[0] * self.cluster_shape_mn[0]
-                            + block_in_cluster_coord_vmnk[1]
-                            * cute.size(tiled_mma.thr_id.shape)
-                            + block_in_cluster_coord_vmnk[0]
-                        )
-                        cta_tile_offset_n = block_in_cluster_coord_vmnk[2]
-                        route_tile_idx = (
-                            cluster_tile_coord_mnl[1] * self.cluster_shape_mn[1]
-                            + cta_tile_offset_n
-                        )
-                        # The runtime scheduler leaves its outer mode unbounded.
-                        # With N as the inner mode, terminate on the finite M
-                        # extent and skip padded routed tiles within each M tile.
-                        has_work = work_tile.is_valid_tile and (
-                            cluster_tile_coord_mnl[0]
-                            < tile_sched_params.problem_layout_ncluster_mnl.shape[0]
-                        )
-                        is_routed_tile = has_work and (
+                        tile_coord_mnl = work_tile.tile_idx
+                        route_tile_idx = tile_coord_mnl[1]
+                        is_routed_tile = work_tile.is_valid_tile and (
                             route_tile_idx < num_non_exiting_tiles_value
                         )
 
-                        if is_routed_tile or not has_work:
+                        if is_routed_tile or not work_tile.is_valid_tile:
                             tile_info_pipeline.producer_acquire(
                                 tile_info_producer_state
                             )
+
+                        if work_tile.is_valid_tile and is_first_cta_in_cluster:
+                            clc_pipeline.producer_acquire(clc_producer_state)
+                            tile_sched.advance_to_next_work(
+                                clc_pipeline.producer_get_barrier(clc_producer_state)
+                            )
+                            clc_producer_state.advance()
+
+                        if is_routed_tile or not work_tile.is_valid_tile:
+                            cur_sTile_info = sTile_info[
+                                (None, tile_info_producer_state.index)
+                            ]
                             route_start = cutlass.Int32(-1)
                             group_idx = cutlass.Int32(group_count)
                             distance_to_boundary = cutlass.Int32(-1)
                             if is_routed_tile:
+                                route_start = (
+                                    route_tile_idx * self.cta_tile_shape_mnk[1]
+                                )
+                                group_idx = tile_idx_to_expert_idx[route_tile_idx]
+                                distance_to_boundary = (
+                                    tile_idx_to_mn_limit[route_tile_idx] - route_start
+                                )
+                            with cute.arch.elect_one():
+                                cur_sTile_info[0] = tile_coord_mnl[0]
+                                cur_sTile_info[1] = route_start
+                                cur_sTile_info[2] = group_idx
+                                cur_sTile_info[3] = distance_to_boundary
+                                tile_info_pipeline.producer_commit(
+                                    tile_info_producer_state
+                                )
+                            tile_info_producer_state.advance()
+
+                        if work_tile.is_valid_tile:
+                            clc_pipeline.consumer_wait(clc_consumer_state)
+                            work_tile = tile_sched.get_current_work()
+                            clc_pipeline.consumer_release(clc_consumer_state)
+                            clc_consumer_state.advance()
+                        else:
+                            not_last_tile = cutlass.Boolean(0)
+
+                    tile_info_pipeline.producer_tail(tile_info_producer_state)
+                    if is_first_cta_in_cluster:
+                        clc_pipeline.producer_tail(clc_producer_state)
+                else:
+                    tile_sched = utils.StaticPersistentRuntimeTileScheduler.create(
+                        tile_sched_params,
+                        (bidx, bidy, bidz),
+                        cute.arch.grid_dim(),
+                        inner_mode=0 if self.raster_along_m else 1,
+                    )
+                    work_tile = tile_sched.initial_work_tile_info()
+                    not_last_tile = cutlass.Boolean(1)
+                    if cutlass.const_expr(self.raster_along_m):
+                        while not_last_tile:
+                            tile_info_pipeline.producer_acquire(
+                                tile_info_producer_state
+                            )
+                            cluster_tile_coord_mnl = work_tile.tile_idx
+                            cta_tile_coord_m = (
+                                cluster_tile_coord_mnl[0] * self.cluster_shape_mn[0]
+                                + block_in_cluster_coord_vmnk[1]
+                                * cute.size(tiled_mma.thr_id.shape)
+                                + block_in_cluster_coord_vmnk[0]
+                            )
+                            cta_tile_offset_n = block_in_cluster_coord_vmnk[2]
+                            route_tile_idx = (
+                                cluster_tile_coord_mnl[1] * self.cluster_shape_mn[1]
+                                + cta_tile_offset_n
+                            )
+                            not_last_tile = work_tile.is_valid_tile and (
+                                route_tile_idx < num_non_exiting_tiles_value
+                            )
+                            route_start = cutlass.Int32(-1)
+                            group_idx = cutlass.Int32(group_count)
+                            distance_to_boundary = cutlass.Int32(-1)
+                            if not_last_tile:
                                 route_start = (
                                     route_tile_idx * self.cta_tile_shape_mnk[1]
                                 )
@@ -1626,191 +1615,400 @@ class Sm100W4A16GroupedGemmKernel:
                                     tile_info_producer_state
                                 )
                             tile_info_producer_state.advance()
-
-                        if has_work:
                             tile_sched.advance_to_next_work()
                             work_tile = tile_sched.get_current_work()
-                        else:
-                            not_last_tile = cutlass.Boolean(0)
+                    else:
+                        while not_last_tile:
+                            cluster_tile_coord_mnl = work_tile.tile_idx
+                            cta_tile_coord_m = (
+                                cluster_tile_coord_mnl[0] * self.cluster_shape_mn[0]
+                                + block_in_cluster_coord_vmnk[1]
+                                * cute.size(tiled_mma.thr_id.shape)
+                                + block_in_cluster_coord_vmnk[0]
+                            )
+                            cta_tile_offset_n = block_in_cluster_coord_vmnk[2]
+                            route_tile_idx = (
+                                cluster_tile_coord_mnl[1] * self.cluster_shape_mn[1]
+                                + cta_tile_offset_n
+                            )
+                            # The runtime scheduler leaves its outer mode unbounded.
+                            # With N as the inner mode, terminate on the finite M
+                            # extent and skip padded routed tiles within each M tile.
+                            has_work = work_tile.is_valid_tile and (
+                                cluster_tile_coord_mnl[0]
+                                < tile_sched_params.problem_layout_ncluster_mnl.shape[0]
+                            )
+                            is_routed_tile = has_work and (
+                                route_tile_idx < num_non_exiting_tiles_value
+                            )
 
-                tile_info_pipeline.producer_tail(tile_info_producer_state)
+                            if is_routed_tile or not has_work:
+                                tile_info_pipeline.producer_acquire(
+                                    tile_info_producer_state
+                                )
+                                route_start = cutlass.Int32(-1)
+                                group_idx = cutlass.Int32(group_count)
+                                distance_to_boundary = cutlass.Int32(-1)
+                                if is_routed_tile:
+                                    route_start = (
+                                        route_tile_idx * self.cta_tile_shape_mnk[1]
+                                    )
+                                    group_idx = tile_idx_to_expert_idx[route_tile_idx]
+                                    distance_to_boundary = (
+                                        tile_idx_to_mn_limit[route_tile_idx]
+                                        - route_start
+                                    )
+                                cur_sTile_info = sTile_info[
+                                    (None, tile_info_producer_state.index)
+                                ]
+                                with cute.arch.elect_one():
+                                    cur_sTile_info[0] = cta_tile_coord_m
+                                    cur_sTile_info[1] = route_start
+                                    cur_sTile_info[2] = group_idx
+                                    cur_sTile_info[3] = distance_to_boundary
+                                    tile_info_pipeline.producer_commit(
+                                        tile_info_producer_state
+                                    )
+                                tile_info_producer_state.advance()
 
-        # The activation TMA warp is the only role that waits on the preceding grid.
-        if warp_idx == self.activation_tma_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_generic_warps)
-            tile_info_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
-            )
-            tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-            work_tile = mixed_input_utils.make_contiguous_group_work_tile_info(
-                group_count, sTile_info[(None, tile_info_consumer_state.index)]
-            )
-            tile_info_pipeline.consumer_release(tile_info_consumer_state)
-            tile_info_consumer_state.advance()
-            b_load2mma_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.num_load2trans_stage
-            )
-            if cutlass.const_expr(self.enable_pdl):
-                griddepcontrol_wait()
-                # Let the standalone finalizer prepare routing metadata while
-                # FC2 runs; its own dependency wait protects every output load.
-                if cutlass.const_expr(
-                    not self.fuse_activation and not self.use_fused_finalize
-                ):
-                    with cute.arch.elect_one():
-                        griddepcontrol_launch_dependents()
+                            if has_work:
+                                tile_sched.advance_to_next_work()
+                                work_tile = tile_sched.get_current_work()
+                            else:
+                                not_last_tile = cutlass.Boolean(0)
 
-            while work_tile.is_valid_tile:
-                activation_coord_n = work_tile.coord_n
-                if cutlass.const_expr(self.use_dynamic_n and self.use_2cta_instrs):
-                    if not is_leader_cta:
-                        # Two-CTA MMA splits B at runtime_N / 2, whereas
-                        # the TMA partition starts at allocated_N / 2.
-                        activation_coord_n += compute_non_leader_cta_load_shift(
-                            valid_tokens_in_tile=cutlass.max(
-                                1,
-                                cutlass.min(
-                                    work_tile.distance_to_boundary, self.mma_tiler[1]
-                                ),
-                            ),
-                            mma_tiler_n=self.mma_tiler[1],
+                    tile_info_pipeline.producer_tail(tile_info_producer_state)
+
+            # The activation TMA warp is the only role that waits on the preceding grid.
+            if cutlass.const_expr(not self.gather_input):
+                if warp_idx == self.activation_tma_warp_id:
+                    tile_info_consumer_state = pipeline.make_pipeline_state(
+                        pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
+                    )
+                    tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+                    work_tile = mixed_input_utils.make_contiguous_group_work_tile_info(
+                        group_count, sTile_info[(None, tile_info_consumer_state.index)]
+                    )
+                    tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                    tile_info_consumer_state.advance()
+                    b_load2mma_producer_state = pipeline.make_pipeline_state(
+                        pipeline.PipelineUserType.Producer, self.num_load2trans_stage
+                    )
+                    if cutlass.const_expr(self.enable_pdl):
+                        griddepcontrol_wait()
+                        # Let the standalone finalizer prepare routing metadata while
+                        # FC2 runs; its own dependency wait protects every output load.
+                        if cutlass.const_expr(
+                            not self.fuse_activation and not self.use_fused_finalize
+                        ):
+                            with cute.arch.elect_one():
+                                griddepcontrol_launch_dependents()
+
+                    while work_tile.is_valid_tile:
+                        activation_coord_n = work_tile.coord_n
+                        if cutlass.const_expr(
+                            self.use_dynamic_n and self.use_2cta_instrs
+                        ):
+                            if not is_leader_cta:
+                                # Two-CTA MMA splits B at runtime_N / 2, whereas
+                                # the TMA partition starts at allocated_N / 2.
+                                activation_coord_n += compute_non_leader_cta_load_shift(
+                                    valid_tokens_in_tile=cutlass.max(
+                                        1,
+                                        cutlass.min(
+                                            work_tile.distance_to_boundary,
+                                            self.mma_tiler[1],
+                                        ),
+                                    ),
+                                    mma_tiler_n=self.mma_tiler[1],
+                                )
+                        coord_n_offset = (
+                            (activation_coord_n, 0)
+                            if cutlass.const_expr(
+                                self.b_major_mode == cute.nvgpu.OperandMajorMode.MN
+                            )
+                            else (0, activation_coord_n)
                         )
-                coord_n_offset = (
-                    (activation_coord_n, 0)
-                    if cutlass.const_expr(
-                        self.b_major_mode == cute.nvgpu.OperandMajorMode.MN
-                    )
-                    else (0, activation_coord_n)
-                )
-                tBgB_slice = cute.make_tensor(
-                    (
-                        tBgB.iterator[0] + coord_n_offset[0],
-                        coord_n_offset[1] + tBgB.iterator[1],
-                    ),
-                    cute.slice_(tBgB.layout, (None, 0, None, 0)),
-                )
+                        tBgB_slice = cute.make_tensor(
+                            (
+                                tBgB.iterator[0] + coord_n_offset[0],
+                                coord_n_offset[1] + tBgB.iterator[1],
+                            ),
+                            cute.slice_(tBgB.layout, (None, 0, None, 0)),
+                        )
 
-                b_load2mma_producer_state.reset_count()
-                for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                    b_load2mma_pipeline.producer_acquire(b_load2mma_producer_state)
-                    cute.copy(
-                        tma_atom_b,
-                        tBgB_slice[(None, b_load2mma_producer_state.count)],
-                        tBsB[(None, b_load2mma_producer_state.index)],
-                        tma_bar_ptr=b_load2mma_pipeline.producer_get_barrier(
-                            b_load2mma_producer_state
-                        ),
-                        mcast_mask=b_full_mcast_mask,
-                        cache_policy=cutlass.Int64(_TMA_CACHE_HINT_EVICT_LAST),
-                    )
-                    b_load2mma_pipeline.producer_commit(b_load2mma_producer_state)
-                    b_load2mma_producer_state.advance()
+                        b_load2mma_producer_state.reset_count()
+                        for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                            b_load2mma_pipeline.producer_acquire(
+                                b_load2mma_producer_state
+                            )
+                            cute.copy(
+                                tma_atom_b,
+                                tBgB_slice[(None, b_load2mma_producer_state.count)],
+                                tBsB[(None, b_load2mma_producer_state.index)],
+                                tma_bar_ptr=b_load2mma_pipeline.producer_get_barrier(
+                                    b_load2mma_producer_state
+                                ),
+                                mcast_mask=b_full_mcast_mask,
+                                cache_policy=cutlass.Int64(_TMA_CACHE_HINT_EVICT_LAST),
+                            )
+                            b_load2mma_pipeline.producer_commit(
+                                b_load2mma_producer_state
+                            )
+                            b_load2mma_producer_state.advance()
 
+                        tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+                        work_tile = (
+                            mixed_input_utils.make_contiguous_group_work_tile_info(
+                                group_count,
+                                sTile_info[(None, tile_info_consumer_state.index)],
+                            )
+                        )
+                        tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                        tile_info_consumer_state.advance()
+                    b_load2mma_pipeline.producer_tail(b_load2mma_producer_state)
+
+            # Static weight and scale loads can run before the activation is ready.
+            if warp_idx == self.weight_tma_warp_id:
+                tile_info_consumer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
+                )
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
                 work_tile = mixed_input_utils.make_contiguous_group_work_tile_info(
                     group_count, sTile_info[(None, tile_info_consumer_state.index)]
                 )
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
-            b_load2mma_pipeline.producer_tail(b_load2mma_producer_state)
-
-        # Static weight and scale loads can run before the activation is ready.
-        if warp_idx == self.weight_tma_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_generic_warps)
-            tile_info_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
-            )
-            tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-            work_tile = mixed_input_utils.make_contiguous_group_work_tile_info(
-                group_count, sTile_info[(None, tile_info_consumer_state.index)]
-            )
-            tile_info_pipeline.consumer_release(tile_info_consumer_state)
-            tile_info_consumer_state.advance()
-            a_load2trans_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.num_load2trans_stage
-            )
-            if cutlass.const_expr(self.enable_pdl and self.fuse_activation):
-                with cute.arch.elect_one():
-                    griddepcontrol_launch_dependents()
-            while work_tile.is_valid_tile:
-                tAgA_slice = tAgA[
-                    (
-                        None,
-                        work_tile.cta_coord_m // cute.size(tiled_mma.thr_id.shape),
-                        None,
-                        work_tile.group_idx,
-                    )
-                ]
-                tSgS_slice = tSgS[
-                    (
-                        None,
-                        work_tile.cta_coord_m // cute.size(tiled_mma.thr_id.shape),
-                        None,
-                        work_tile.group_idx,
-                    )
-                ]
-                # Filter zeros in rest mode
-                rest_filtered = cute.filter_zeros(tSgS_slice[(0, None)].layout)
-                tSgS_slice_filtered = cute.make_tensor(
-                    tSgS_slice.iterator,
-                    cute.make_layout(
-                        (tSgS_slice.layout[0].shape, rest_filtered.shape),
-                        stride=(tSgS_slice.layout[0].stride, rest_filtered.stride),
-                    ),
+                a_load2trans_producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.num_load2trans_stage
                 )
-
-                a_load2trans_producer_state.reset_count()
-                peek_load2trans_empty_status = cutlass.Boolean(1)
-                if a_load2trans_producer_state.count < k_tile_cnt:
-                    peek_load2trans_empty_status = (
-                        a_load2trans_pipeline.producer_try_acquire(
-                            a_load2trans_producer_state
+                if cutlass.const_expr(self.enable_pdl and self.fuse_activation):
+                    with cute.arch.elect_one():
+                        if cutlass.const_expr(self.gather_input):
+                            publishes_ancestors = (
+                                (bidx == 0) & (bidy == 0) & (bidz == 0)
+                            )
+                            if cutlass.const_expr(self.use_clc_scheduler):
+                                publishes_ancestors = is_leader_cta
+                            if publishes_ancestors:
+                                release_gpu()
+                        griddepcontrol_launch_dependents()
+                while work_tile.is_valid_tile:
+                    tAgA_slice = tAgA[
+                        (
+                            None,
+                            work_tile.cta_coord_m // cute.size(tiled_mma.thr_id.shape),
+                            None,
+                            work_tile.group_idx,
                         )
-                    )
-                for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                    a_load2trans_pipeline.producer_acquire(
-                        a_load2trans_producer_state,
-                        peek_load2trans_empty_status,
-                    )
-                    cute.copy(
-                        tma_atom_a,
-                        tAgA_slice[(None, a_load2trans_producer_state.count)],
-                        tAsA[(None, a_load2trans_producer_state.index)],
-                        tma_bar_ptr=a_load2trans_pipeline.producer_get_barrier(
-                            a_load2trans_producer_state
+                    ]
+                    tSgS_slice = tSgS[
+                        (
+                            None,
+                            work_tile.cta_coord_m // cute.size(tiled_mma.thr_id.shape),
+                            None,
+                            work_tile.group_idx,
+                        )
+                    ]
+                    # Filter zeros in rest mode
+                    rest_filtered = cute.filter_zeros(tSgS_slice[(0, None)].layout)
+                    tSgS_slice_filtered = cute.make_tensor(
+                        tSgS_slice.iterator,
+                        cute.make_layout(
+                            (tSgS_slice.layout[0].shape, rest_filtered.shape),
+                            stride=(tSgS_slice.layout[0].stride, rest_filtered.stride),
                         ),
-                        mcast_mask=a_full_mcast_mask,
-                        cache_policy=cutlass.Int64(_TMA_CACHE_HINT_EVICT_FIRST),
                     )
-                    cute.copy(
-                        tma_atom_s,
-                        tSgS_slice_filtered[(None, a_load2trans_producer_state.count)],
-                        tSsS[(None, a_load2trans_producer_state.index)],
-                        tma_bar_ptr=a_load2trans_pipeline.producer_get_barrier(
-                            a_load2trans_producer_state
-                        ),
-                        mcast_mask=s_full_mcast_mask,
-                    )
-                    a_load2trans_pipeline.producer_commit(a_load2trans_producer_state)
-                    a_load2trans_producer_state.advance()
+
+                    a_load2trans_producer_state.reset_count()
+                    peek_load2trans_empty_status = cutlass.Boolean(1)
                     if a_load2trans_producer_state.count < k_tile_cnt:
                         peek_load2trans_empty_status = (
                             a_load2trans_pipeline.producer_try_acquire(
                                 a_load2trans_producer_state
                             )
                         )
+                    for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                        a_load2trans_pipeline.producer_acquire(
+                            a_load2trans_producer_state,
+                            peek_load2trans_empty_status,
+                        )
+                        cute.copy(
+                            tma_atom_a,
+                            tAgA_slice[(None, a_load2trans_producer_state.count)],
+                            tAsA[(None, a_load2trans_producer_state.index)],
+                            tma_bar_ptr=a_load2trans_pipeline.producer_get_barrier(
+                                a_load2trans_producer_state
+                            ),
+                            mcast_mask=a_full_mcast_mask,
+                            cache_policy=cutlass.Int64(_TMA_CACHE_HINT_EVICT_FIRST),
+                        )
+                        cute.copy(
+                            tma_atom_s,
+                            tSgS_slice_filtered[
+                                (None, a_load2trans_producer_state.count)
+                            ],
+                            tSsS[(None, a_load2trans_producer_state.index)],
+                            tma_bar_ptr=a_load2trans_pipeline.producer_get_barrier(
+                                a_load2trans_producer_state
+                            ),
+                            mcast_mask=s_full_mcast_mask,
+                        )
+                        a_load2trans_pipeline.producer_commit(
+                            a_load2trans_producer_state
+                        )
+                        a_load2trans_producer_state.advance()
+                        if a_load2trans_producer_state.count < k_tile_cnt:
+                            peek_load2trans_empty_status = (
+                                a_load2trans_pipeline.producer_try_acquire(
+                                    a_load2trans_producer_state
+                                )
+                            )
 
+                    tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+                    work_tile = mixed_input_utils.make_contiguous_group_work_tile_info(
+                        group_count, sTile_info[(None, tile_info_consumer_state.index)]
+                    )
+                    tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                    tile_info_consumer_state.advance()
+
+                a_load2trans_pipeline.producer_tail(a_load2trans_producer_state)
+
+            # Specialized MMA warp
+            if warp_idx == self.mma_warp_id:
+                # Get the pointer to the TMEM buffer
+                tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+                accumulators = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
+                if cutlass.const_expr(
+                    self.transform_a_source == tcgen05.OperandSource.TMEM
+                ):
+                    tmem_ptr_transform = cute.recast_ptr(
+                        accumulators.iterator + self.num_acc_tmem_cols,
+                        dtype=self.mma_dtype,
+                    )
+                    tCrA = cute.make_tensor(
+                        tmem_ptr_transform,
+                        tiled_mma.make_fragment_A(a_smem_layout_transform.outer).layout,
+                    )
+                else:
+                    tCrA = tiled_mma.make_fragment_A(sA_transform)
+                tCtAcc_base = accumulators
+                # Persistent tile scheduling loop
+                tile_info_consumer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
+                )
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
                 work_tile = mixed_input_utils.make_contiguous_group_work_tile_info(
                     group_count, sTile_info[(None, tile_info_consumer_state.index)]
                 )
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
+                trans2mma_consumer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.num_trans2mma_stage
+                )
+                b_load2mma_consumer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.num_load2trans_stage
+                )
+                acc_producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.num_acc_stage
+                )
+                while work_tile.is_valid_tile:
+                    # (MMA, MMA_M, MMA_N)
+                    tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
+                    b_load2mma_consumer_state.reset_count()
+                    trans2mma_consumer_state.reset_count()
+                    peek_trans2mma_full_status = cutlass.Boolean(1)
+                    if is_leader_cta:
+                        if trans2mma_consumer_state.count < k_tile_cnt:
+                            peek_trans2mma_full_status = (
+                                trans2mma_pipeline.consumer_try_wait(
+                                    trans2mma_consumer_state
+                                )
+                            )
+                        acc_pipeline.producer_acquire(acc_producer_state)
 
-            a_load2trans_pipeline.producer_tail(a_load2trans_producer_state)
+                        # A privately supplied empty tile still participates in
+                        # every pipeline; issue the minimum legal MMA extent.
+                        valid_tokens = cutlass.max(
+                            1,
+                            cutlass.min(
+                                work_tile.distance_to_boundary, self.mma_tiler[1]
+                            ),
+                        )
+                        # Mma mainloop
+                        # Peel the static K tail; retain one wait/release per stage.
+                        full_k_tiles = mA_mkl.shape[1] // self.mma_tiler[2]
+                        tail_k = mA_mkl.shape[1] % self.mma_tiler[2]
+                        for section in cutlass.range_constexpr(1 + (tail_k != 0)):
+                            first_stage = 0 if section == 0 else full_k_tiles
+                            last_stage = full_k_tiles if section == 0 else k_tile_cnt
+                            stage_k = self.mma_tiler[2] if section == 0 else tail_k
+                            for _k_tile in cutlass.range(
+                                first_stage, last_stage, 1, unroll=1
+                            ):
+                                trans2mma_pipeline.consumer_wait(
+                                    trans2mma_consumer_state, peek_trans2mma_full_status
+                                )
+                                b_load2mma_pipeline.consumer_wait(
+                                    b_load2mma_consumer_state
+                                )
+                                self._issue_mma_tile(
+                                    tiled_mma,
+                                    tCtAcc,
+                                    tCrA[
+                                        (
+                                            None,
+                                            None,
+                                            None,
+                                            trans2mma_consumer_state.index,
+                                        )
+                                    ],
+                                    tCrB[
+                                        (
+                                            None,
+                                            None,
+                                            None,
+                                            b_load2mma_consumer_state.index,
+                                        )
+                                    ],
+                                    _k_tile,
+                                    valid_tokens,
+                                    stage_k,
+                                )
+                                trans2mma_pipeline.consumer_release(
+                                    trans2mma_consumer_state
+                                )
+                                b_load2mma_pipeline.consumer_release(
+                                    b_load2mma_consumer_state
+                                )
+                                trans2mma_consumer_state.advance()
+                                b_load2mma_consumer_state.advance()
+                                peek_trans2mma_full_status = cutlass.Boolean(1)
+                                if trans2mma_consumer_state.count < k_tile_cnt:
+                                    peek_trans2mma_full_status = (
+                                        trans2mma_pipeline.consumer_try_wait(
+                                            trans2mma_consumer_state
+                                        )
+                                    )
+                        # Async arrive accumulator buffer full
+                        acc_pipeline.producer_commit(acc_producer_state)
+                    acc_producer_state.advance()
+
+                    # Advance to next tile
+                    tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+                    work_tile = mixed_input_utils.make_contiguous_group_work_tile_info(
+                        group_count, sTile_info[(None, tile_info_consumer_state.index)]
+                    )
+                    tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                    tile_info_consumer_state.advance()
+                # Wait for accumulator buffer empty
+                acc_pipeline.producer_tail(acc_producer_state)
 
         # Specialized transform warps
-        if warp_idx >= self.transform_warp_id[0]:
+        elif (
+            warp_idx >= self.transform_warp_id[0]
+            and warp_idx <= self.transform_warp_id[-1]
+        ):
             transform_group_idx = (warp_idx - self.transform_warp_id[0]) // 4
             transform_local_tidx = tidx - 32 * (
                 self.transform_warp_id[0] + transform_group_idx * 4
@@ -1891,124 +2089,8 @@ class Sm100W4A16GroupedGemmKernel:
             # Wait a_transform buffer empty
             trans2mma_pipeline.producer_tail(trans2mma_producer_state)
 
-        # Specialized MMA warp
-        if warp_idx == self.mma_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_generic_warps)
-            # Get the pointer to the TMEM buffer
-            tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
-            accumulators = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
-            if cutlass.const_expr(
-                self.transform_a_source == tcgen05.OperandSource.TMEM
-            ):
-                tmem_ptr_transform = cute.recast_ptr(
-                    accumulators.iterator + self.num_acc_tmem_cols, dtype=self.mma_dtype
-                )
-                tCrA = cute.make_tensor(
-                    tmem_ptr_transform,
-                    tiled_mma.make_fragment_A(a_smem_layout_transform.outer).layout,
-                )
-            else:
-                tCrA = tiled_mma.make_fragment_A(sA_transform)
-            tCtAcc_base = accumulators
-            # Persistent tile scheduling loop
-            tile_info_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
-            )
-            tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-            work_tile = mixed_input_utils.make_contiguous_group_work_tile_info(
-                group_count, sTile_info[(None, tile_info_consumer_state.index)]
-            )
-            tile_info_pipeline.consumer_release(tile_info_consumer_state)
-            tile_info_consumer_state.advance()
-            trans2mma_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.num_trans2mma_stage
-            )
-            b_load2mma_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.num_load2trans_stage
-            )
-            acc_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.num_acc_stage
-            )
-            while work_tile.is_valid_tile:
-                # (MMA, MMA_M, MMA_N)
-                tCtAcc = tCtAcc_base[(None, None, None, acc_producer_state.index)]
-                b_load2mma_consumer_state.reset_count()
-                trans2mma_consumer_state.reset_count()
-                peek_trans2mma_full_status = cutlass.Boolean(1)
-                if is_leader_cta:
-                    if trans2mma_consumer_state.count < k_tile_cnt:
-                        peek_trans2mma_full_status = (
-                            trans2mma_pipeline.consumer_try_wait(
-                                trans2mma_consumer_state
-                            )
-                        )
-                    acc_pipeline.producer_acquire(acc_producer_state)
-
-                    # A privately supplied empty tile still participates in
-                    # every pipeline; issue the minimum legal MMA extent.
-                    valid_tokens = cutlass.max(
-                        1,
-                        cutlass.min(work_tile.distance_to_boundary, self.mma_tiler[1]),
-                    )
-                    # Mma mainloop
-                    # Peel the static K tail; retain one wait/release per stage.
-                    full_k_tiles = mA_mkl.shape[1] // self.mma_tiler[2]
-                    tail_k = mA_mkl.shape[1] % self.mma_tiler[2]
-                    for section in cutlass.range_constexpr(1 + (tail_k != 0)):
-                        first_stage = 0 if section == 0 else full_k_tiles
-                        last_stage = full_k_tiles if section == 0 else k_tile_cnt
-                        stage_k = self.mma_tiler[2] if section == 0 else tail_k
-                        for _k_tile in cutlass.range(
-                            first_stage, last_stage, 1, unroll=1
-                        ):
-                            trans2mma_pipeline.consumer_wait(
-                                trans2mma_consumer_state, peek_trans2mma_full_status
-                            )
-                            b_load2mma_pipeline.consumer_wait(b_load2mma_consumer_state)
-                            self._issue_mma_tile(
-                                tiled_mma,
-                                tCtAcc,
-                                tCrA[
-                                    (None, None, None, trans2mma_consumer_state.index)
-                                ],
-                                tCrB[
-                                    (None, None, None, b_load2mma_consumer_state.index)
-                                ],
-                                _k_tile,
-                                valid_tokens,
-                                stage_k,
-                            )
-                            trans2mma_pipeline.consumer_release(
-                                trans2mma_consumer_state
-                            )
-                            b_load2mma_pipeline.consumer_release(
-                                b_load2mma_consumer_state
-                            )
-                            trans2mma_consumer_state.advance()
-                            b_load2mma_consumer_state.advance()
-                            peek_trans2mma_full_status = cutlass.Boolean(1)
-                            if trans2mma_consumer_state.count < k_tile_cnt:
-                                peek_trans2mma_full_status = (
-                                    trans2mma_pipeline.consumer_try_wait(
-                                        trans2mma_consumer_state
-                                    )
-                                )
-                    # Async arrive accumulator buffer full
-                    acc_pipeline.producer_commit(acc_producer_state)
-                acc_producer_state.advance()
-
-                # Advance to next tile
-                tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                work_tile = mixed_input_utils.make_contiguous_group_work_tile_info(
-                    group_count, sTile_info[(None, tile_info_consumer_state.index)]
-                )
-                tile_info_pipeline.consumer_release(tile_info_consumer_state)
-                tile_info_consumer_state.advance()
-            # Wait for accumulator buffer empty
-            acc_pipeline.producer_tail(acc_producer_state)
-
         # Specialized epilogue warps
-        if warp_idx < self.mma_warp_id:
+        elif warp_idx < self.mma_warp_id:
             cute.arch.setmaxregister_increase(self.num_regs_epilogue_warps)
             epi_tidx = tidx
             # Get the pointer to the TMEM buffer
@@ -2607,6 +2689,120 @@ class Sm100W4A16GroupedGemmKernel:
             tmem.free(tmem_ptr)
             if cutlass.const_expr(not self.use_fused_finalize):
                 c_pipeline.producer_tail()
+
+        else:
+            if cutlass.const_expr(self.gather_input):
+                cute.arch.setmaxregister_decrease(64)
+                gather_warp = warp_idx - self.gather_warp_id[0]
+                info_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.num_tile_info_stage
+                )
+                producer = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.num_load2trans_stage
+                )
+                rows = self.mma_tiler[1] // cute.size(tiled_mma.thr_id.shape)
+                row_groups = rows // 4
+                row_issuers = min(4, row_groups)
+                k_issuers = 4 // row_issuers
+                row_lane = gather_warp % row_issuers
+                k_lane = gather_warp // row_issuers
+                groups_per_warp = cute.ceil_div(row_groups, row_issuers)
+                k_chunks = self.mma_tiler[2] // 64
+                row_atom = cute.size(sB_input.shape[0][0])
+                k_atom = cute.size(sB_input.shape[0][1])
+                # Four independent issuer arrivals keep B stages asynchronous.
+                tx_bytes = self.num_tma_load_bytes_b // len(self.gather_warp_id)
+                tile_info_pipeline.consumer_wait(info_state)
+                work_tile = mixed_input_utils.make_contiguous_group_work_tile_info(
+                    group_count, sTile_info[(None, info_state.index)]
+                )
+                tile_info_pipeline.consumer_release(info_state)
+                info_state.advance()
+                while work_tile.is_valid_tile:
+                    valid = cutlass.max(
+                        1,
+                        cutlass.min(work_tile.distance_to_boundary, self.mma_tiler[1]),
+                    )
+                    row_shift = cutlass.Int32(0)
+                    if cutlass.const_expr(self.use_2cta_instrs):
+                        if not is_leader_cta:
+                            row_shift = rows
+                            if cutlass.const_expr(self.use_dynamic_n):
+                                row_shift = ((valid + 15) // 16 * 16) // 2
+                    source_rows = cute.make_rmem_tensor(
+                        (groups_per_warp * 4,), cutlass.Int32
+                    )
+                    for i in cutlass.range_constexpr(groups_per_warp):
+                        row = (row_lane + i * row_issuers) * 4 + (tidx & 3)
+                        source_row = cutlass.Int32(-1)
+                        if (row < rows) & (row + row_shift < valid):
+                            source_row = cutlass.Int32(
+                                cutlass.Uint32(
+                                    permuted_idx_to_expanded_idx[
+                                        work_tile.coord_n + row + row_shift
+                                    ]
+                                )
+                                // self.gather_top_k
+                            )
+                        for j in cutlass.range_constexpr(4):
+                            source_rows[4 * i + j] = cute.arch.shuffle_sync(
+                                source_row, j
+                            )
+                    producer.reset_count()
+                    for k_tile in cutlass.range(k_tile_cnt, unroll=1):
+                        b_load2mma_pipeline.producer_acquire(
+                            producer, expected_tx=tx_bytes
+                        )
+                        for i in cutlass.range_constexpr(groups_per_warp):
+                            row = (row_lane + i * row_issuers) * 4
+                            for j in cutlass.range_constexpr(
+                                cute.ceil_div(
+                                    k_chunks, k_issuers * self.num_mcast_ctas_b
+                                )
+                            ):
+                                column = (
+                                    (k_lane + j * k_issuers) * self.num_mcast_ctas_b
+                                    + block_in_cluster_coord_vmnk[1]
+                                ) * 64
+                                if (row < rows) & (column < self.mma_tiler[2]):
+                                    coordinate = (
+                                        (row % row_atom, column % k_atom),
+                                        row // row_atom,
+                                        column // k_atom,
+                                        producer.index,
+                                    )
+                                    with cute.arch.elect_one():
+                                        tma_gather4(
+                                            tma_atom_b,
+                                            sB_input.iterator
+                                            + sB_input.layout(coordinate),
+                                            b_load2mma_pipeline.producer_get_barrier(
+                                                producer
+                                            ),
+                                            k_tile * self.mma_tiler[2] + column,
+                                            source_rows[4 * i],
+                                            source_rows[4 * i + 1],
+                                            source_rows[4 * i + 2],
+                                            source_rows[4 * i + 3],
+                                            cta_group=2 if self.use_2cta_instrs else 1,
+                                            cache_policy=_TMA_CACHE_HINT_EVICT_LAST,
+                                            mcast_mask=(
+                                                b_full_mcast_mask
+                                                if cutlass.const_expr(
+                                                    self.is_b_mcast
+                                                    or self.use_2cta_instrs
+                                                )
+                                                else None
+                                            ),
+                                        )
+                        producer.advance()
+                    tile_info_pipeline.consumer_wait(info_state)
+                    work_tile = mixed_input_utils.make_contiguous_group_work_tile_info(
+                        group_count, sTile_info[(None, info_state.index)]
+                    )
+                    tile_info_pipeline.consumer_release(info_state)
+                    info_state.advance()
+                b_load2mma_pipeline.producer_tail(producer)
 
         if cutlass.const_expr(
             self.enable_pdl and not self.fuse_activation and self.use_fused_finalize
