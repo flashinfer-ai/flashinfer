@@ -860,13 +860,21 @@ kernel_cake_dsv4_40932cb442b76026206f(const __grid_constant__ CUtensorMap tmap_q
                                         int row0_src = smem_row0_addr + (unsigned int)(warp_id_in_role * 1024);
                                         if (row0_staged == 0) {
                                             if (elect_sync()) {
-                                                mbarrier_arrive_expect_tx(row0_full_addr + (warp_id_in_role) * 8, 1024);
-                                                #pragma unroll
-                                                for (int row0_half = 0; row0_half < 2; row0_half++) {
-                                                    tma_gather4_gmem2smem(row0_src + row0_half * 512, (&tmap_swa_kv), bk_feature_chunk * 128, 0, 0, 0, 0, row0_full_addr + (warp_id_in_role) * 8);
-                                                }
+                                                mbarrier_arrive_expect_tx(row0_full_addr + (warp_id_in_role) * 8, 512);
+                                                tma_gather4_gmem2smem(row0_src, (&tmap_swa_kv), bk_feature_chunk * 128, 0, 0, 0, 0, row0_full_addr + (warp_id_in_role) * 8);
                                             }
                                             mbarrier_wait(row0_full_addr + (warp_id_in_role) * 8, 0);
+                                            int row0_phase = 4 + (lane >> 3);
+                                            int row0_chunk = lane & 7;
+                                            int row0_from = row0_src + (row0_phase - 4) * 128 + ((row0_chunk ^ row0_phase - 4) << 4);
+                                            int row0_to = row0_src + row0_phase * 128 + ((row0_chunk ^ row0_phase) << 4);
+                                            int row0_copy[4];
+                                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                                : "=r"(*reinterpret_cast<uint32_t*>(&row0_copy[0])), "=r"(*reinterpret_cast<uint32_t*>(&row0_copy[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&row0_copy[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&row0_copy[(0) + 3]))
+                                                : "r"(row0_from) : "memory");
+                                            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(row0_to), "r"(row0_copy[0]), "r"(row0_copy[1]), "r"(row0_copy[2]), "r"(row0_copy[3]) : "memory");
+                                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                                            __syncwarp();
                                             row0_staged = 1;
                                         }
                                         if (row0_group != 0) {
