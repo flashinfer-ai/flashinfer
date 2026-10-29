@@ -51,9 +51,17 @@ IMBALANCE_THRESHOLD = IMBALANCE_THRESHOLDS["bf16"]
 # full step sits at the edge of the ~0.6 % spread of identical arms, which is
 # why the row is opt-in rather than the default. GB300 EP4 (one node) measured
 # no unconditional gain (balanced steps +0.7 ... +1.0 % slower) and has no row;
-# B200 keeps its imbalance switch above.
+# B200 keeps its imbalance switch above. Rubin (compute capability (10, 7), 212
+# SMs) MXFP8 EP8 row 60 / 60 against the factory 40 / 40: EP8 on two nodes (4
+# GPUs each, one NVLink domain), H 4096 / I 2048 / 288 experts / top 8,
+# configurations rotated on one workspace, four rounds, hottest-rank medians.
+# Balanced routing, forward / backward: 8192 tokens per rank -7.4 / -4.6 %,
+# 27116 -13.3 / -8.7 %, 32768 -18.1 / -2.4 %; round spread at most 1.2 %.
+# Rubin BF16 measured no consistent gain (36 / 36 and 28 / 32 within the
+# +-3 % round spread or slower) and has no row.
 COMM_SMS = {
     (10, 3): {152: {"mxfp8": {8: (44, 36)}}},
+    (10, 7): {212: {"mxfp8": {8: (60, 60)}}},
 }
 _FACTORY_COMM_SMS = (40, 40)
 
@@ -185,7 +193,8 @@ def create_mok_bf16_workspace(
     communication-SM counts of every launch (factory default 40 / 40). ``"auto"``
     for both takes the measured row of the device, ``precision`` and EP group
     size (:func:`resolve_comm_sms`, :data:`COMM_SMS`; GB300 MXFP8 at EP8: 44 / 36,
-    no row elsewhere, so the factory split stays in force there).
+    Rubin (212 SMs) MXFP8 at EP8: 60 / 60, no row elsewhere, so the factory
+    split stays in force there).
     ``imbalance_comm_sms`` is the (forward, backward) communication-SM split the
     launches switch to while the hottest rank's routed-row load is at least
     ``imbalance_threshold`` times the mean per-rank load (observed on the

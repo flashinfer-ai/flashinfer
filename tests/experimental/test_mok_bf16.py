@@ -650,6 +650,38 @@ def test_observe_load_issues_one_copy_and_no_histogram_ops():
     assert host.tolist() == backend.count_routed_load(routes, ep_size, experts).tolist()
 
 
+def test_observe_load_keeps_a_completed_observation():
+    """A host running ahead of the device schedules the next step before any
+    launch of the previous one saw its observation complete; the next
+    observation adopts the completed one before replacing it, so the split
+    still follows the routed load."""
+    require_gpu()
+    from types import SimpleNamespace
+
+    ep_size, experts = 4, 4
+    functional = backend.MoKFunctional(ep_size, experts, 2)
+    config = MoKConfig(
+        fwd_num_comm_sms=4,
+        bwd_num_comm_sms=4,
+        imbalance_comm_sms=(6, 6),
+        imbalance_threshold=1.5,
+    )
+    skewed = (
+        torch.arange(ep_size * 256 * 2, device="cuda", dtype=torch.int32) % experts
+    ).view(ep_size, 256, 2)
+    capacity = ep_size * 256 * 2 + experts * 256
+    workspace = SimpleNamespace(ep_rank=0, ep_size=ep_size)
+    functional.scheduler(skewed, capacity, 0)
+    functional._observe_load(workspace, config)
+    torch.cuda.synchronize()
+    functional.scheduler(skewed, capacity, 0)
+    functional._observe_load(workspace, config)  # no launch in between
+    entry = functional._load_entry(workspace, create=False)
+    expected = backend.count_routed_load(skewed, ep_size, experts).tolist()
+    assert list(entry["loads"]) == expected
+    assert functional._comm_split(config, workspace) == (6, 6)
+
+
 def _layout_reference(counts, peers):
     """Torch reference of the expert layout's written prefix: padded counts,
     exclusive row offsets, real rows per expert and the expert of each
@@ -1365,6 +1397,10 @@ def test_imbalance_comm_sms_defaults_keep_the_fixed_split():
         ((10, 0), 148, "mxfp8", 8, None),  # B200: the imbalance switch instead
         ((10, 0), 152, "mxfp8", 8, None),  # GB200
         ((10, 7), 160, "mxfp8", 8, None),
+        ((10, 7), 212, "mxfp8", 8, (60, 60)),  # Rubin, EP8 across two nodes
+        ((10, 7), 212, "mxfp8", 16, None),
+        ((10, 7), 212, "bf16", 8, None),
+        ((10, 7), 216, "mxfp8", 8, None),  # other Rubin SM count: factory split
     ],
 )
 def test_comm_sms_auto_follows_the_device_and_group(
@@ -1396,7 +1432,10 @@ def test_comm_sms_factory_defaults_are_unchanged():
     facade = inspect.signature(api.create_mok_bf16_workspace).parameters
     assert facade["fwd_num_comm_sms"].default == 40
     assert facade["bwd_num_comm_sms"].default == 40
-    assert api.COMM_SMS == {(10, 3): {152: {"mxfp8": {8: (44, 36)}}}}
+    assert api.COMM_SMS == {
+        (10, 3): {152: {"mxfp8": {8: (44, 36)}}},
+        (10, 7): {212: {"mxfp8": {8: (60, 60)}}},
+    }
     with pytest.raises(ValueError, match="precision must be one of"):
         api.resolve_comm_sms("fp8", 8)
     with pytest.raises(ValueError, match="ep_size must be a positive"):

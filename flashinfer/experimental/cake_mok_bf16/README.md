@@ -250,6 +250,11 @@ and does not change the launch sequence.
   step sits at the edge of the ~0.6 % spread of identical arms, so the row is
   opt-in. GB300 EP4 on one node measured no unconditional gain (balanced steps
   +0.7 ... +1.0 % slower) and has no row; B200 uses the imbalance switch above.
+  Rubin (212 SMs) MXFP8 EP8 60 / 60 against the factory 40 / 40, two-node EP8
+  (one NVLink domain), configurations rotated on one workspace, four rounds,
+  hottest-rank medians, balanced routing forward / backward: 8192 tokens per
+  rank -7.4 / -4.6 %, 27116 -13.3 / -8.7 %, 32768 -18.1 / -2.4 % (round spread
+  at most 1.2 %). Rubin BF16 measured no consistent gain and has no row.
 - Mini-batches are multiples of 256; macro-batches are multiples of the
   mini-batch. Schedule capacity must hold every padded route; overflow traps.
 - Routed weight gradients are summed across macrobatches in BF16 (or in the
