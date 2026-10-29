@@ -3059,10 +3059,11 @@ def test_round33_rules_plan_like_the_cake_launcher(T):
     # gradient fp32-out moved to the cheaper slab path of its synchronised stream-K fixup (sk_slab 2); no key removed
     # round 33 left 109 keys (51 sm_100a, 58 sm_107a; six inserted, none removed); the shapes tranche adds 79 sm_100a and
     # 86 sm_103a keys and re-values seven round-33 sm_100a keys (MEASURED_SHAPE_ROWS); the whole-tile tile resolve
-    # adds one sm_103a key (the kv_a input gradient, test_mg_rules_plan_the_whole_tile_programs)
-    assert len(ROW_RULES) == 109 + 79 + 86 + 1
+    # adds one sm_103a key (the kv_a input gradient, test_mg_rules_plan_the_whole_tile_programs); the N = 128 weight
+    # gradients of the 4096 / 5120 / 8192 rows add six sm_107a keys (test_sm107a_n128_wgrad_rules_plan)
+    assert len(ROW_RULES) == 109 + 79 + 86 + 1 + 6
     assert sum(k[0] == "sm_100a" for k in ROW_RULES) == 51 + 79
-    assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 58
+    assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 58 + 6
     assert sum(k[0] == "sm_103a" for k in ROW_RULES) == 86 + 1
     assert ARCH_RULE_DEFAULTS == {
         "sm_107a": {"pro": 7},
@@ -8627,3 +8628,52 @@ def test_fused_split_matches_the_torch_chain_bit_exactly():
     torch.cuda.synchronize()
     assert torch.equal(first, eager)
     cake_backend.clear_convenience_caches()
+
+
+def test_sm107a_n128_wgrad_rules_plan():
+    # six sm_107a keys for the swapped N = 128 weight gradients of the 4096 / 5120 / 8192 rows (bf16 and fp32 out), measured on
+    # R200 against the ruleless plan: 128 x 128 pair tiles (cta_rows 64) with the exact three-way (4096) / two-way (5120) K
+    # split of the tail tiles, and 256 x 128 pair tiles with the synchronised stream-K tail (8192); the 6144 row (indexer_k)
+    # keeps its 64-row family rule
+    want_rule = {
+        4096: {"block_n": 128, "cta_rows": 64, "sk_exact": 3, "pro": 15},
+        5120: {"block_n": 128, "cta_rows": 64, "sk_exact": 2, "pro": 15},
+        8192: {"block_n": 128, "sk_sync": True},
+    }
+    # (template, tail_tiles, sk_units, iters_per_unit) of the bf16 row at T 16231 on 212 SMs; the fp32 row takes the _f32 program
+    want_plan = {
+        4096: ("dense_proj_gemm_nn_n128_m64_hen_t_skx_pro15", 32, 96, 85),
+        5120: ("dense_proj_gemm_nn_n128_m64_hen_t_skx_pro15", 40, 80, 127),
+        8192: ("dense_proj_gemm_nn_n128_hen_t_sks_pro7", 32, 64, 127),
+    }
+    T = 16231
+    for K, rule in want_rule.items():
+        for f32 in (False, True):
+            assert (
+                ROW_RULES[("sm_107a", True, True, f32, True, False, 128, None, K)]
+                == rule
+            )
+            G = torch.empty(T, 128, dtype=torch.bfloat16)
+            X = torch.empty(T, K, dtype=torch.bfloat16)
+            out = torch.empty(128, K, dtype=torch.float32 if f32 else torch.bfloat16)
+            A, B, transposed = wgrad_views(G, X, arch="sm_107a", out_f32=f32)
+            assert transposed
+            plan = plan_dense_projection_gemm(
+                A,
+                B,
+                out,
+                sm_count=212,
+                l2_bytes=L2_BYTES,
+                transposed_out=transposed,
+                arch="sm_107a",
+                _fallback=False,
+            )[0]
+            template, tail, units, ipu = want_plan[K]
+            if f32:
+                template = template.replace("_hen_t", "_hen_f32_t")
+            assert (
+                plan.template,
+                plan.tail_tiles,
+                plan.sk_units,
+                plan.iters_per_unit,
+            ) == (template, tail, units, ipu), (K, f32)

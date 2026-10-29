@@ -1335,6 +1335,12 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', False, True, False, False, False, 2048, 4096, None): {"pro": 15},
     ('sm_107a', True, True, False, False, False, 2048, None, 16384): {"pro": 15},
     ('sm_107a', True, True, True, True, False, 576, None, 6144): {"group_m": 8, "hints": ('evict_first', 'evict_first'), "b_swz": 64, "sk_sync": True, "sk_sync_m": 38, "sk_slab": 2},
+    ('sm_107a', True, True, False, True, False, 128, None, 4096): {"block_n": 128, "cta_rows": 64, "sk_exact": 3, "pro": 15},
+    ('sm_107a', True, True, True, True, False, 128, None, 4096): {"block_n": 128, "cta_rows": 64, "sk_exact": 3, "pro": 15},
+    ('sm_107a', True, True, False, True, False, 128, None, 5120): {"block_n": 128, "cta_rows": 64, "sk_exact": 2, "pro": 15},
+    ('sm_107a', True, True, True, True, False, 128, None, 5120): {"block_n": 128, "cta_rows": 64, "sk_exact": 2, "pro": 15},
+    ('sm_107a', True, True, False, True, False, 128, None, 8192): {"block_n": 128, "sk_sync": True},
+    ('sm_107a', True, True, True, True, False, 128, None, 8192): {"block_n": 128, "sk_sync": True},
     # ---- sm_100a: the shapes tranche - forward / input gradient / weight gradient rows at K 4096 - 17408 and N 32 - 17408,
     #      measured with this package's planner against cuBLAS on GB200 at T 16172 - 16384 (see the test table
     #      MEASURED_SHAPE_ROWS); a row whose measured choice equals the planner's default carries no rule ----
