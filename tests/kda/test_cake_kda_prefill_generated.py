@@ -1328,7 +1328,14 @@ def _assert_route(route, prepared):
     arch = registry.device_arch()
     schedule = str(prepared.schedule)
     loaded = _modules(prepared)
-    if route == "pair-share":
+    owner_helper = set(registry._RENDERED_M64_OWNER_HELPER_ROUTES[arch].values())
+    if route == "m64-owner-helper" and not owner_helper:
+        route = "pair-share"  # a loader without the build keeps the pair-share one
+    if route == "m64-owner-helper":
+        assert schedule.startswith("fused_m64_independent_dvsplit"), schedule
+        assert schedule.endswith("_owner2helper"), schedule
+        assert loaded & owner_helper
+    elif route == "pair-share":
         assert schedule.startswith("fused_m64_independent_dvsplit"), schedule
         assert schedule.endswith("_pair_share"), schedule
         assert loaded & set(registry._RENDERED_PAIR_SHARE_ROUTES[arch].values())
@@ -1858,11 +1865,12 @@ def test_bounded_and_long_launches_keep_their_build(lower_bound, monkeypatch):
         _assert_bitwise(turn.run(), plain.run(), f"{lengths[:2]} h{heads}")
 
 
-# The fourth field names the launch a row is there for: the last three rows hold
-# the launches that differ most from the others in a graph (the 2-CTA cluster
-# launch of the pair-share program, the cooperative launch of the pooled
-# owner/helper program, and the chain composite whose main body writes the
-# window maps, no map pass).  The last field: whether the launch takes a
+# The fourth field names the launch a row is there for: the last four rows hold
+# the launches that differ most from the others in a graph (the cooperative
+# launch of the M64 owner/helper program, the 2-CTA cluster launch of the
+# pair-share program, the cooperative launch of the pooled owner/helper
+# program, and the chain composite whose main body writes the window maps, no
+# map pass).  The last field: whether the launch takes a
 # turnover build (work-binned unbounded N32 launches of short tasks on both
 # parts; None: the part's bounded predicate decides; the mixed H12 row is not
 # work binned, its longest task alone sets the makespan).
@@ -1875,7 +1883,15 @@ GRAPH_ROWS = [
     pytest.param([8128, 64, 8128, 64], 16, None, None, False, id="long-short-h16"),
     pytest.param([64] * 16, 12, None, None, True, id="bs16x64-h12-turnover"),
     pytest.param(
-        [8192] * 2, 16, -5.0, "pair-share", False, id="2x8192-h16-lb5-pair-share"
+        [8192] * 2, 16, -5.0, "m64-owner-helper", False, id="2x8192-h16-lb5-m64oh"
+    ),
+    pytest.param(
+        [8128, 64] * 2,
+        16,
+        -5.0,
+        "pair-share",
+        False,
+        id="2x(8128+64)-h16-lb5-pair-share",
     ),
     pytest.param([4096] * 4, 16, None, "pool", False, id="4x4096-h16-pool"),
     pytest.param([8192], 12, -5.0, "map-fold", False, id="8192-h12-lb5-map-fold"),
@@ -2150,9 +2166,11 @@ def test_pair_share_is_bitwise_the_routed_m64_program(
     for bit, the routed M64 program (the loader without pair-share builds):
     output, final states and checkpoint rows, with and without state indices,
     initial states and checkpoint rows; each arm has its own copy of the
-    initial pool."""
+    initial pool.  The owner/helper rule is held off: it would take the rows
+    of up to 36 tasks whose sequences all reach its length."""
     arch = registry.device_arch()
     pair_share = set(registry._RENDERED_PAIR_SHARE_ROUTES[arch].values())
+    _m64_owner_helper_rule(monkeypatch, 0, 0)
     d = _inputs(lengths, heads)
 
     shared = _Call(_own_pool(d), -5.0, **state)
@@ -2235,7 +2253,9 @@ def test_pair_share_threshold_of_the_part(lengths, heads, expected, monkeypatch)
     (dense FP32 states, checkpoint rows) lands on: the exact schedule of the
     routed or of the pair-share program.  Where the build is taken it equals
     the routed program bit for bit, and a device that holds one 2-CTA cluster
-    fewer than the launch has tasks keeps the routed program."""
+    fewer than the launch has tasks keeps the routed program.  The owner/helper
+    rule is held off (it would take the launches of up to 36 tasks)."""
+    _m64_owner_helper_rule(monkeypatch, 0, 0)
     part = (registry.device_arch(), _sm_count())
     if part not in PAIR_SHARE_PARTS:
         pytest.skip(
@@ -2267,6 +2287,123 @@ def test_pair_share_threshold_of_the_part(lengths, heads, expected, monkeypatch)
     monkeypatch.setattr(runtime, "_m64_pair_cluster_capacity", lambda _: tasks)
     at_capacity = _Call(_own_pool(d), -5.0, indexed=False)
     assert str(at_capacity.prepared.schedule) == schedule
+
+
+# The M64 owner/helper build: long M64 value-split launches (dense FP32
+# states) whose owner and helper CTAs the device holds at once.  Rule rows
+# that take exactly the launch's task count (``_m64_owner_helper_rule``) stand
+# in for the measured rule.
+M64_OWNER_HELPER_ROWS = [
+    pytest.param([8192], 6, id="8192-h6"),
+    pytest.param([1024], 16, id="1024-h16"),
+    pytest.param([4096] * 2, 16, id="2x4096-h16"),
+    pytest.param([8192, 17], 12, id="8192+17-h12"),
+    pytest.param([3000, 13384], 16, id="3000+13384-h16"),
+]
+M64_OWNER_HELPER_STATES = [
+    pytest.param(dict(), id="dense-state"),
+    pytest.param(dict(initial=False), id="zero-initial-state"),
+    pytest.param(dict(rows=False), id="dense-state-no-rows"),
+]
+
+
+def _m64_owner_helper_rule(monkeypatch, tasks, helpers):
+    """Rule rows of both parts that take launches of ``tasks`` tasks with
+    ``helpers`` helpers per task (no rows for 0)."""
+    rows = ((tasks, 1, helpers),) if helpers else ()
+    monkeypatch.setattr(runtime, "M64_OWNER_HELPER_MIN_SEQ_LEN", rows)
+    monkeypatch.setattr(runtime, "M64_OWNER_HELPER_MIN_SEQ_LEN_GB300", rows)
+
+
+def _m64_owner_helper_programs():
+    arch = registry.device_arch()
+    programs = set(registry._RENDERED_M64_OWNER_HELPER_ROUTES[arch].values())
+    if not programs:
+        pytest.skip(f"the loader names no M64 owner/helper build on {arch}")
+    return programs
+
+
+@requires_blackwell
+@pytest.mark.parametrize("helpers", [2, 3])
+@pytest.mark.parametrize("state", M64_OWNER_HELPER_STATES)
+@pytest.mark.parametrize("lengths,heads", M64_OWNER_HELPER_ROWS)
+def test_m64_owner_helper_is_bitwise_the_pair_share_and_routed_programs(
+    lengths, heads, state, helpers, monkeypatch
+):
+    """A long M64 value-split launch that takes the owner/helper build equals,
+    bit for bit, the program it replaces (pair-share where that rule takes the
+    launch, else routed) and the routed program: output, final states and
+    checkpoint rows, launch after launch (the program leaves its words zero),
+    with and without initial states and checkpoint rows."""
+    owner_helper = _m64_owner_helper_programs()
+    tasks = len(lengths) * heads
+    device = torch.device("cuda", torch.cuda.current_device())
+    capacity = runtime._probe_m64_cooperative_capacity(device)
+    assert capacity, "the cooperative capacity probe failed"
+    if tasks * (2 + helpers) > capacity:
+        pytest.skip(f"{capacity} resident CTAs for {tasks} x (2 + {helpers})")
+    d = _inputs(lengths, heads)
+    _m64_owner_helper_rule(monkeypatch, tasks, helpers)
+    taken = _Call(_own_pool(d), -5.0, indexed=False, **state)
+    schedule = str(taken.prepared.schedule)
+    suffix = f"_owner{helpers}helper"
+    assert schedule.startswith("fused_m64_independent_dvsplit_fp32_state"), schedule
+    assert schedule.endswith(suffix), schedule
+    assert _modules(taken.prepared) & owner_helper
+    result = taken.run()
+    _assert_bitwise(taken.run(), result, "owner/helper repeat")
+
+    monkeypatch.undo()
+    _m64_owner_helper_rule(monkeypatch, tasks, 0)
+    base = schedule.removesuffix(suffix)
+    kept = _Call(_own_pool(d), -5.0, indexed=False, **state)
+    assert str(kept.prepared.schedule) in (base, base + "_pair_share")
+    assert not _modules(kept.prepared) & owner_helper
+    _assert_bitwise(result, kept.run(), "owner/helper vs the program it replaces")
+    monkeypatch.setattr(
+        registry,
+        "_RENDERED_PAIR_SHARE_ROUTES",
+        {name: {} for name in registry.ARCHES},
+    )
+    routed = _Call(_own_pool(d), -5.0, indexed=False, **state)
+    assert str(routed.prepared.schedule) == base
+    _assert_bitwise(result, routed.run(), "owner/helper vs routed M64")
+
+
+@requires_blackwell
+def test_refused_m64_owner_helper_launch_runs_its_fallback(monkeypatch):
+    """A cooperative grid the device cannot hold (the capacity probe
+    overridden): the driver refuses the owner/helper launch, the plan switches
+    for good to the pair-share or routed program it would otherwise take and
+    matches that program bit for bit, and later CUDA work is unaffected."""
+    owner_helper = _m64_owner_helper_programs()
+    lengths, heads = [4096] * 6, 12
+    tasks = len(lengths) * heads
+    assert tasks * 4 > _sm_count()
+    d = _inputs(lengths, heads)
+    monkeypatch.setattr(runtime, "_m64_cooperative_capacity", lambda device: 1 << 20)
+    _m64_owner_helper_rule(monkeypatch, tasks, 2)
+    refused = _Call(_own_pool(d), -5.0, indexed=False)
+    schedule = str(refused.prepared.schedule)
+    assert schedule.endswith("_owner2helper"), schedule
+    assert _modules(refused.prepared) & owner_helper
+    result = refused.run()
+    assert not _modules(refused.prepared) & owner_helper
+    probe = torch.zeros(1024, device="cuda")
+    probe.add_(1)
+    torch.cuda.synchronize()
+    assert float(probe.sum()) == 1024.0
+    _assert_bitwise(refused.run(), result, "fallback repeat")
+
+    monkeypatch.undo()
+    _m64_owner_helper_rule(monkeypatch, tasks, 0)
+    kept = _Call(_own_pool(d), -5.0, indexed=False)
+    assert not _modules(kept.prepared) & owner_helper
+    assert str(kept.prepared.schedule) in (
+        schedule.removesuffix("_owner2helper"),
+        schedule.removesuffix("_owner2helper") + "_pair_share",
+    )
+    _assert_bitwise(result, kept.run(), "refused owner/helper vs its fallback")
 
 
 CHAIN_ROWS = [
