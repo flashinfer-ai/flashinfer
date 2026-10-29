@@ -269,8 +269,8 @@ __device__ __forceinline__ float mul_f32_rn_noftz(float a, float b) {
 
 extern "C" {
 
-__global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) __cluster_dims__(1,1,1) void
-kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap b_map, const __grid_constant__ CUtensorMap c_map, const __grid_constant__ CUtensorMap out_map, __nv_bfloat16* __restrict__ x, float* __restrict__ dt, __half* __restrict__ delta_precomputed, float* __restrict__ cumsum_precomputed, float* __restrict__ A, __nv_bfloat16* __restrict__ B_tensor, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ D, __nv_bfloat16* __restrict__ z, float* __restrict__ dt_bias, __nv_bfloat16* __restrict__ initial_states, __nv_bfloat16* __restrict__ final_states, __nv_bfloat16* __restrict__ checkpoint_states, int* __restrict__ checkpoint_token_indices, int* __restrict__ checkpoint_state_slots, int* __restrict__ seq_idx_i32, long long* __restrict__ seq_idx_i64, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, int* __restrict__ seq_chunk_cumsum, __nv_bfloat16* __restrict__ out_native, int nheads, int ngroups, int batch, int seqlen, int nchunks, int sequence_count, int num_logical_chunks, int mode_varlen, int D_mode, int has_z, int has_initial, int dt_softplus, float dt_min, float dt_max, int write_final_states, int checkpoint_state_count, int* __restrict__ cu_seqlens, int metadata_from_cu_seqlens, int* __restrict__ preprocess_status)
+__global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
+kernel_mamba_ssd_q_tmem_alias_f16_varlen_noring(const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap b_map, const __grid_constant__ CUtensorMap c_map, const __grid_constant__ CUtensorMap out_map, __nv_bfloat16* __restrict__ x, float* __restrict__ dt, __half* __restrict__ delta_precomputed, float* __restrict__ cumsum_precomputed, float* __restrict__ A, __nv_bfloat16* __restrict__ B_tensor, __nv_bfloat16* __restrict__ C, __nv_bfloat16* __restrict__ D, __nv_bfloat16* __restrict__ z, float* __restrict__ dt_bias, __half* __restrict__ initial_states, __half* __restrict__ final_states, __half* __restrict__ checkpoint_states, int* __restrict__ checkpoint_token_indices, int* __restrict__ checkpoint_state_slots, int* __restrict__ seq_idx_i32, long long* __restrict__ seq_idx_i64, int* __restrict__ chunk_indices, int* __restrict__ chunk_offsets, int* __restrict__ seq_chunk_cumsum, __nv_bfloat16* __restrict__ out_native, int nheads, int ngroups, int batch, int seqlen, int nchunks, int sequence_count, int num_logical_chunks, int mode_varlen, int D_mode, int has_z, int has_initial, int dt_softplus, float dt_min, float dt_max, int write_final_states, int checkpoint_state_count, int* __restrict__ cu_seqlens, int metadata_from_cu_seqlens, int* __restrict__ preprocess_status)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -332,6 +332,52 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
     const int smem_geometry_addr = smem + 231936;
     __nv_bfloat16* smem_y = reinterpret_cast<__nv_bfloat16*>(smem_raw + 196608);
     const int smem_y_addr = smem + 196608;
+    if (metadata_from_cu_seqlens >= 2) {
+        int tpf_line = tid * 32;
+        if (tpf_line < num_logical_chunks) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(chunk_indices + tpf_line))); }
+        if (tpf_line < num_logical_chunks) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(chunk_offsets + tpf_line))); }
+        if (metadata_from_cu_seqlens == 3) {
+            if (tid * 16 < seqlen) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(seq_idx_i64 + (tid * 16)))); }
+        } else {
+            if (tpf_line < seqlen) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(seq_idx_i32 + tpf_line))); }
+        }
+    }
+    int tpf_work = bid;
+    if (tpf_work < sequence_count * nheads) {
+        int tpf_head = tpf_work % nheads;
+        if (tid == 64) {
+            if (has_initial != 0) {
+                asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(initial_states + (tpf_work * 64 * 128)), "r"((uint32_t)(16384)) : "memory");
+            }
+            if (tpf_work < nheads) {
+                int tpf_group = tpf_head * ngroups / nheads;
+                asm volatile("cp.async.bulk.prefetch.tensor.5d.L2.global.tile [%0, {%1, %2, %3, %4, %5}];" :: "l"((uint64_t)((&b_map))), "r"((int)(0)), "r"((int)(0)), "r"((int)(tpf_group)), "r"((int)(0)), "r"((int)(0)) : "memory");
+                asm volatile("cp.async.bulk.prefetch.tensor.5d.L2.global.tile [%0, {%1, %2, %3, %4, %5}];" :: "l"((uint64_t)((&b_map))), "r"((int)(0)), "r"((int)(1)), "r"((int)(tpf_group)), "r"((int)(0)), "r"((int)(0)) : "memory");
+                asm volatile("cp.async.bulk.prefetch.tensor.5d.L2.global.tile [%0, {%1, %2, %3, %4, %5}];" :: "l"((uint64_t)((&c_map))), "r"((int)(0)), "r"((int)(0)), "r"((int)(tpf_group)), "r"((int)(0)), "r"((int)(0)) : "memory");
+                asm volatile("cp.async.bulk.prefetch.tensor.5d.L2.global.tile [%0, {%1, %2, %3, %4, %5}];" :: "l"((uint64_t)((&c_map))), "r"((int)(0)), "r"((int)(1)), "r"((int)(tpf_group)), "r"((int)(0)), "r"((int)(0)) : "memory");
+                asm volatile("cp.async.bulk.prefetch.tensor.4d.L2.global.tile [%0, {%1, %2, %3, %4}];" :: "l"((uint64_t)((&x_map))), "r"((int)(0)), "r"((int)(tpf_head)), "r"((int)(0)), "r"((int)(0)) : "memory");
+            }
+        }
+        if (tpf_work < nheads) {
+            if (warp == 3) {
+                #pragma unroll
+                for (int tpf_local = 0; tpf_local < 4; tpf_local++) {
+                    int tpf_token = lane * 4 + tpf_local;
+                    if (tpf_token < seqlen) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(dt + (tpf_token * nheads + tpf_head)))); }
+                }
+            }
+            if (has_z != 0) {
+                if (warp >= 12) {
+                    int tpf_row = tid - 384;
+                    if (tpf_row < seqlen) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(z + ((tpf_row * nheads + tpf_head) * 64)))); }
+                }
+            }
+        }
+        if (tid == 96) {
+            asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(A + tpf_head)));
+            asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(dt_bias + tpf_head)));
+        }
+    }
 
     // Mbarrier init (17 pipeline groups, 0 ordered-sequence groups, 30 barriers)
     // Mbarriers at smem_raw[231944..232184)
@@ -415,6 +461,72 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
     const int tmem_intra_tmem = taddr + 256;
     const int tmem_state_delta_tmem = taddr + 384;
     const int tmem_inter_tmem = taddr + 448;
+    int table_base = 0;
+    if (metadata_from_cu_seqlens >= 2) {
+        table_base = bid * (sequence_count + 1);
+        #pragma unroll 1
+        for (int segment = tid; segment < num_logical_chunks; segment += 512) {
+            int start = chunk_indices[segment] * 128 + chunk_offsets[segment];
+            int sequence = 0;
+            if (metadata_from_cu_seqlens == 3) {
+                long long raw_sequence = seq_idx_i64[start];
+                sequence = (int)raw_sequence;
+                if (raw_sequence < 0) {
+                    sequence = -1;
+                }
+                if (raw_sequence >= (long long)sequence_count) {
+                    sequence = sequence_count;
+                }
+            } else {
+                sequence = seq_idx_i32[start];
+            }
+            int _max_1 = ((sequence) > (-1) ? (sequence) : (-1));
+            int _min_0 = ((_max_1) < (sequence_count) ? (_max_1) : (sequence_count));
+            sequence = _min_0;
+            int previous_sequence = -1;
+            if (segment != 0) {
+                int previous_start = chunk_indices[segment - 1] * 128 + chunk_offsets[segment - 1];
+                if (metadata_from_cu_seqlens == 3) {
+                    long long raw_previous = seq_idx_i64[previous_start];
+                    previous_sequence = (int)raw_previous;
+                    if (raw_previous < 0) {
+                        previous_sequence = -1;
+                    }
+                    if (raw_previous >= (long long)sequence_count) {
+                        previous_sequence = sequence_count;
+                    }
+                } else {
+                    previous_sequence = seq_idx_i32[previous_start];
+                }
+                int _max_3 = ((previous_sequence) > (-1) ? (previous_sequence) : (-1));
+                int _min_2 = ((_max_3) < (sequence_count) ? (_max_3) : (sequence_count));
+                previous_sequence = _min_2;
+            }
+            int flagged = 0;
+            if (sequence < 0) {
+                flagged = 1;
+            }
+            if (sequence >= sequence_count) {
+                flagged = 1;
+            }
+            if (sequence < previous_sequence) {
+                flagged = 1;
+            }
+            if (flagged != 0) {
+                preprocess_status[0] = 1;
+            }
+            #pragma unroll 1
+            for (int opened_id = previous_sequence + 1; opened_id < sequence + 1; opened_id++) {
+                seq_chunk_cumsum[table_base + opened_id] = segment;
+            }
+            if (segment == num_logical_chunks - 1) {
+                #pragma unroll 1
+                for (int closed_id = sequence + 1; closed_id < sequence_count + 1; closed_id++) {
+                    seq_chunk_cumsum[table_base + closed_id] = num_logical_chunks;
+                }
+            }
+        }
+    }
     if (warp >= 0 && warp <= 3) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 32;");
     }
@@ -424,31 +536,32 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
         { // mma_inter_main
             unsigned int input_stage = 0;
             unsigned int state_stage = 0;
+            asm volatile("barrier.sync 1, 512;" ::: "memory");
             unsigned int _phase_bc_full = 0;
             unsigned int _phase_state_operand_full = 0;
             unsigned int _phase_inter_empty_0 = 1;
             unsigned int _phase_scaled_b_full_0 = 0;
             #pragma unroll 1
             for (unsigned int work = bid; work < sequence_count * nheads; work += num_bids) {
-                int sequence = work / (unsigned int)nheads;
-                int first_logical = sequence * nchunks;
+                int sequence_1 = work / (unsigned int)nheads;
+                int first_logical = sequence_1 * nchunks;
                 int logical_end = first_logical + nchunks;
                 int item_lo = 0;
                 int item_hi = 0;
                 int item_checkpoint = -1;
                 int checkpoint_rank = 1073741824;
-                if (metadata_from_cu_seqlens != 0) {
-                    int _max_1 = ((cu_seqlens[sequence]) > (0) ? (cu_seqlens[sequence]) : (0));
-                    int _min_0 = ((_max_1) < (seqlen) ? (_max_1) : (seqlen));
-                    item_lo = _min_0;
-                    int _max_3 = ((cu_seqlens[sequence + 1]) > (0) ? (cu_seqlens[sequence + 1]) : (0));
-                    int _min_2 = ((_max_3) < (seqlen) ? (_max_3) : (seqlen));
-                    item_hi = _min_2;
+                if (metadata_from_cu_seqlens == 1) {
+                    int _max_1_1 = ((cu_seqlens[sequence_1]) > (0) ? (cu_seqlens[sequence_1]) : (0));
+                    int _min_0_1 = ((_max_1_1) < (seqlen) ? (_max_1_1) : (seqlen));
+                    item_lo = _min_0_1;
+                    int _max_3_1 = ((cu_seqlens[sequence_1 + 1]) > (0) ? (cu_seqlens[sequence_1 + 1]) : (0));
+                    int _min_2_1 = ((_max_3_1) < (seqlen) ? (_max_3_1) : (seqlen));
+                    item_hi = _min_2_1;
                     int item_count = 0;
                     if (item_hi > item_lo) {
                         item_count = (item_hi + 127) / 128 - item_lo / 128;
                         if (checkpoint_state_count > 0) {
-                            int candidate_checkpoint = checkpoint_token_indices[sequence];
+                            int candidate_checkpoint = checkpoint_token_indices[sequence_1];
                             if (candidate_checkpoint > item_lo && candidate_checkpoint < item_hi && candidate_checkpoint % 128 != 0) {
                                 item_checkpoint = candidate_checkpoint;
                                 checkpoint_rank = candidate_checkpoint / 128 - item_lo / 128 + 1;
@@ -459,8 +572,8 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
                     first_logical = 0;
                     logical_end = item_count;
                 } else {
-                    first_logical = seq_chunk_cumsum[sequence];
-                    logical_end = seq_chunk_cumsum[sequence + 1];
+                    first_logical = seq_chunk_cumsum[table_base + sequence_1];
+                    logical_end = seq_chunk_cumsum[table_base + sequence_1 + 1];
                 }
                 int uniform = make_warp_uniform(first_logical);
                 first_logical = uniform;
@@ -583,30 +696,31 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
         { // mma_intra_main
             unsigned int input_stage_1 = 0;
             unsigned int acc_stage = 0;
+            asm volatile("barrier.sync 1, 512;" ::: "memory");
             unsigned int _phase_q_full = 0;
             unsigned int _phase_intra_empty = 1;
             unsigned int _phase_x_full = 0;
             #pragma unroll 1
             for (unsigned int work_1 = bid; work_1 < sequence_count * nheads; work_1 += num_bids) {
-                int sequence_1 = work_1 / (unsigned int)nheads;
-                int first_logical_1 = sequence_1 * nchunks;
+                int sequence_2 = work_1 / (unsigned int)nheads;
+                int first_logical_1 = sequence_2 * nchunks;
                 int logical_end_1 = first_logical_1 + nchunks;
                 int item_lo_1 = 0;
                 int item_hi_1 = 0;
                 int item_checkpoint_1 = -1;
                 int checkpoint_rank_1 = 1073741824;
-                if (metadata_from_cu_seqlens != 0) {
-                    int _max_1_1 = ((cu_seqlens[sequence_1]) > (0) ? (cu_seqlens[sequence_1]) : (0));
-                    int _min_0_1 = ((_max_1_1) < (seqlen) ? (_max_1_1) : (seqlen));
-                    item_lo_1 = _min_0_1;
-                    int _max_3_1 = ((cu_seqlens[sequence_1 + 1]) > (0) ? (cu_seqlens[sequence_1 + 1]) : (0));
-                    int _min_2_1 = ((_max_3_1) < (seqlen) ? (_max_3_1) : (seqlen));
-                    item_hi_1 = _min_2_1;
+                if (metadata_from_cu_seqlens == 1) {
+                    int _max_1_2 = ((cu_seqlens[sequence_2]) > (0) ? (cu_seqlens[sequence_2]) : (0));
+                    int _min_0_2 = ((_max_1_2) < (seqlen) ? (_max_1_2) : (seqlen));
+                    item_lo_1 = _min_0_2;
+                    int _max_3_2 = ((cu_seqlens[sequence_2 + 1]) > (0) ? (cu_seqlens[sequence_2 + 1]) : (0));
+                    int _min_2_2 = ((_max_3_2) < (seqlen) ? (_max_3_2) : (seqlen));
+                    item_hi_1 = _min_2_2;
                     int item_count_1 = 0;
                     if (item_hi_1 > item_lo_1) {
                         item_count_1 = (item_hi_1 + 127) / 128 - item_lo_1 / 128;
                         if (checkpoint_state_count > 0) {
-                            int candidate_checkpoint_1 = checkpoint_token_indices[sequence_1];
+                            int candidate_checkpoint_1 = checkpoint_token_indices[sequence_2];
                             if (candidate_checkpoint_1 > item_lo_1 && candidate_checkpoint_1 < item_hi_1 && candidate_checkpoint_1 % 128 != 0) {
                                 item_checkpoint_1 = candidate_checkpoint_1;
                                 checkpoint_rank_1 = candidate_checkpoint_1 / 128 - item_lo_1 / 128 + 1;
@@ -617,8 +731,8 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
                     first_logical_1 = 0;
                     logical_end_1 = item_count_1;
                 } else {
-                    first_logical_1 = seq_chunk_cumsum[sequence_1];
-                    logical_end_1 = seq_chunk_cumsum[sequence_1 + 1];
+                    first_logical_1 = seq_chunk_cumsum[table_base + sequence_2];
+                    logical_end_1 = seq_chunk_cumsum[table_base + sequence_2 + 1];
                 }
                 int uniform_2 = make_warp_uniform(first_logical_1);
                 first_logical_1 = uniform_2;
@@ -697,32 +811,33 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
             unsigned int input_stage_2 = 0;
             unsigned int cb_input_stage = 0;
             unsigned int cb_acc_stage = 0;
+            asm volatile("barrier.sync 1, 512;" ::: "memory");
             unsigned int _phase_bc_empty = 1;
             unsigned int _phase_bc_full_1 = 0;
             unsigned int _phase_cb_empty = 1;
             #pragma unroll 1
             for (unsigned int work_2 = bid; work_2 < sequence_count * nheads; work_2 += num_bids) {
-                int sequence_2 = work_2 / (unsigned int)nheads;
+                int sequence_3 = work_2 / (unsigned int)nheads;
                 int head = work_2 % (unsigned int)nheads;
                 int group = head * ngroups / nheads;
-                int first_logical_2 = sequence_2 * nchunks;
+                int first_logical_2 = sequence_3 * nchunks;
                 int logical_end_2 = first_logical_2 + nchunks;
                 int item_lo_2 = 0;
                 int item_hi_2 = 0;
                 int item_checkpoint_2 = -1;
                 int checkpoint_rank_2 = 1073741824;
-                if (metadata_from_cu_seqlens != 0) {
-                    int _max_1_2 = ((cu_seqlens[sequence_2]) > (0) ? (cu_seqlens[sequence_2]) : (0));
-                    int _min_0_2 = ((_max_1_2) < (seqlen) ? (_max_1_2) : (seqlen));
-                    item_lo_2 = _min_0_2;
-                    int _max_3_2 = ((cu_seqlens[sequence_2 + 1]) > (0) ? (cu_seqlens[sequence_2 + 1]) : (0));
-                    int _min_2_2 = ((_max_3_2) < (seqlen) ? (_max_3_2) : (seqlen));
-                    item_hi_2 = _min_2_2;
+                if (metadata_from_cu_seqlens == 1) {
+                    int _max_1_3 = ((cu_seqlens[sequence_3]) > (0) ? (cu_seqlens[sequence_3]) : (0));
+                    int _min_0_3 = ((_max_1_3) < (seqlen) ? (_max_1_3) : (seqlen));
+                    item_lo_2 = _min_0_3;
+                    int _max_3_3 = ((cu_seqlens[sequence_3 + 1]) > (0) ? (cu_seqlens[sequence_3 + 1]) : (0));
+                    int _min_2_3 = ((_max_3_3) < (seqlen) ? (_max_3_3) : (seqlen));
+                    item_hi_2 = _min_2_3;
                     int item_count_2 = 0;
                     if (item_hi_2 > item_lo_2) {
                         item_count_2 = (item_hi_2 + 127) / 128 - item_lo_2 / 128;
                         if (checkpoint_state_count > 0) {
-                            int candidate_checkpoint_2 = checkpoint_token_indices[sequence_2];
+                            int candidate_checkpoint_2 = checkpoint_token_indices[sequence_3];
                             if (candidate_checkpoint_2 > item_lo_2 && candidate_checkpoint_2 < item_hi_2 && candidate_checkpoint_2 % 128 != 0) {
                                 item_checkpoint_2 = candidate_checkpoint_2;
                                 checkpoint_rank_2 = candidate_checkpoint_2 / 128 - item_lo_2 / 128 + 1;
@@ -733,8 +848,8 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
                     first_logical_2 = 0;
                     logical_end_2 = item_count_2;
                 } else {
-                    first_logical_2 = seq_chunk_cumsum[sequence_2];
-                    logical_end_2 = seq_chunk_cumsum[sequence_2 + 1];
+                    first_logical_2 = seq_chunk_cumsum[table_base + sequence_3];
+                    logical_end_2 = seq_chunk_cumsum[table_base + sequence_3 + 1];
                 }
                 int uniform_3 = make_warp_uniform(first_logical_2);
                 first_logical_2 = uniform_3;
@@ -755,8 +870,8 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
                 int next_physical = 0;
                 int next_token = 0;
                 if (first_logical_2 < logical_end_2) {
-                    int chunk = first_logical_2 - sequence_2 * nchunks;
-                    if (metadata_from_cu_seqlens != 0) {
+                    int chunk = first_logical_2 - sequence_3 * nchunks;
+                    if (metadata_from_cu_seqlens == 1) {
                         chunk = ((first_logical_2 > checkpoint_rank_2) ? (item_lo_2 / 128 + first_logical_2 - 1) * 128 : ((first_logical_2 == checkpoint_rank_2) ? item_checkpoint_2 : ((first_logical_2 == 0) ? item_lo_2 : (item_lo_2 / 128 + first_logical_2) * 128))) / 128;
                     } else {
                         chunk = chunk_indices[first_logical_2];
@@ -779,8 +894,8 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
                     int refill_before_cb = refill_first;
                     if (logical_end_2 > logical_2 + 1) {
                         if (refill_before_cb != 0) {
-                            int chunk_1 = logical_2 + 1 - sequence_2 * nchunks;
-                            if (metadata_from_cu_seqlens != 0) {
+                            int chunk_1 = logical_2 + 1 - sequence_3 * nchunks;
+                            if (metadata_from_cu_seqlens == 1) {
                                 chunk_1 = ((checkpoint_rank_2 < logical_2 + 1) ? (item_lo_2 / 128 + (logical_2 + 1) - 1) * 128 : ((logical_2 + 1 == checkpoint_rank_2) ? item_checkpoint_2 : ((logical_2 + 1 == 0) ? item_lo_2 : (item_lo_2 / 128 + (logical_2 + 1)) * 128))) / 128;
                             } else {
                                 chunk_1 = chunk_indices[logical_2 + 1];
@@ -855,8 +970,8 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
                     if (cb_acc_stage == 2) { cb_acc_stage = 0; _phase_cb_empty ^= 1; }
                     if (logical_end_2 > logical_2 + 1) {
                         if (refill_before_cb == 0) {
-                            int chunk_2 = logical_2 + 1 - sequence_2 * nchunks;
-                            if (metadata_from_cu_seqlens != 0) {
+                            int chunk_2 = logical_2 + 1 - sequence_3 * nchunks;
+                            if (metadata_from_cu_seqlens == 1) {
                                 chunk_2 = ((checkpoint_rank_2 < logical_2 + 1) ? (item_lo_2 / 128 + (logical_2 + 1) - 1) * 128 : ((logical_2 + 1 == checkpoint_rank_2) ? item_checkpoint_2 : ((logical_2 + 1 == 0) ? item_lo_2 : (item_lo_2 / 128 + (logical_2 + 1)) * 128))) / 128;
                             } else {
                                 chunk_2 = chunk_indices[logical_2 + 1];
@@ -884,29 +999,30 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
     if (warp == 3) {
         { // load_x_dt_main
             unsigned int input_stage_3 = 0;
+            asm volatile("barrier.sync 1, 512;" ::: "memory");
             unsigned int _phase_aux_empty = 1;
             #pragma unroll 1
             for (unsigned int work_3 = bid; work_3 < sequence_count * nheads; work_3 += num_bids) {
-                int sequence_3 = work_3 / (unsigned int)nheads;
+                int sequence_4 = work_3 / (unsigned int)nheads;
                 int head_1 = work_3 % (unsigned int)nheads;
-                int first_logical_3 = sequence_3 * nchunks;
+                int first_logical_3 = sequence_4 * nchunks;
                 int logical_end_3 = first_logical_3 + nchunks;
                 int item_lo_3 = 0;
                 int item_hi_3 = 0;
                 int item_checkpoint_3 = -1;
                 int checkpoint_rank_3 = 1073741824;
-                if (metadata_from_cu_seqlens != 0) {
-                    int _max_1_3 = ((cu_seqlens[sequence_3]) > (0) ? (cu_seqlens[sequence_3]) : (0));
-                    int _min_0_3 = ((_max_1_3) < (seqlen) ? (_max_1_3) : (seqlen));
-                    item_lo_3 = _min_0_3;
-                    int _max_3_3 = ((cu_seqlens[sequence_3 + 1]) > (0) ? (cu_seqlens[sequence_3 + 1]) : (0));
-                    int _min_2_3 = ((_max_3_3) < (seqlen) ? (_max_3_3) : (seqlen));
-                    item_hi_3 = _min_2_3;
+                if (metadata_from_cu_seqlens == 1) {
+                    int _max_1_4 = ((cu_seqlens[sequence_4]) > (0) ? (cu_seqlens[sequence_4]) : (0));
+                    int _min_0_4 = ((_max_1_4) < (seqlen) ? (_max_1_4) : (seqlen));
+                    item_lo_3 = _min_0_4;
+                    int _max_3_4 = ((cu_seqlens[sequence_4 + 1]) > (0) ? (cu_seqlens[sequence_4 + 1]) : (0));
+                    int _min_2_4 = ((_max_3_4) < (seqlen) ? (_max_3_4) : (seqlen));
+                    item_hi_3 = _min_2_4;
                     int item_count_3 = 0;
                     if (item_hi_3 > item_lo_3) {
                         item_count_3 = (item_hi_3 + 127) / 128 - item_lo_3 / 128;
                         if (checkpoint_state_count > 0) {
-                            int candidate_checkpoint_3 = checkpoint_token_indices[sequence_3];
+                            int candidate_checkpoint_3 = checkpoint_token_indices[sequence_4];
                             if (candidate_checkpoint_3 > item_lo_3 && candidate_checkpoint_3 < item_hi_3 && candidate_checkpoint_3 % 128 != 0) {
                                 item_checkpoint_3 = candidate_checkpoint_3;
                                 checkpoint_rank_3 = candidate_checkpoint_3 / 128 - item_lo_3 / 128 + 1;
@@ -917,8 +1033,8 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
                     first_logical_3 = 0;
                     logical_end_3 = item_count_3;
                 } else {
-                    first_logical_3 = seq_chunk_cumsum[sequence_3];
-                    logical_end_3 = seq_chunk_cumsum[sequence_3 + 1];
+                    first_logical_3 = seq_chunk_cumsum[table_base + sequence_4];
+                    logical_end_3 = seq_chunk_cumsum[table_base + sequence_4 + 1];
                 }
                 int uniform_4 = make_warp_uniform(first_logical_3);
                 first_logical_3 = uniform_4;
@@ -929,10 +1045,10 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
                 float next_delta[4];
                 #pragma unroll 1
                 for (int logical_3 = first_logical_3; logical_3 < logical_end_3; logical_3++) {
-                    int physical_chunk = logical_3 - sequence_3 * nchunks;
+                    int physical_chunk = logical_3 - sequence_4 * nchunks;
                     int segment_offset = 0;
                     int segment_limit = 128;
-                    if (metadata_from_cu_seqlens != 0) {
+                    if (metadata_from_cu_seqlens == 1) {
                         int first_chunk = item_lo_3 / 128;
                         int segment_start = ((checkpoint_rank_3 < logical_3) ? (first_chunk + logical_3 - 1) * 128 : ((logical_3 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 == 0) ? item_lo_3 : (first_chunk + logical_3) * 128)));
                         int segment_end = ((((checkpoint_rank_3 < logical_3 + 1) ? (first_chunk + (logical_3 + 1) - 1) * 128 : ((logical_3 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 == 0) ? item_lo_3 : (first_chunk + (logical_3 + 1)) * 128)))) < (item_hi_3) ? (((checkpoint_rank_3 < logical_3 + 1) ? (first_chunk + (logical_3 + 1) - 1) * 128 : ((logical_3 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 == 0) ? item_lo_3 : (first_chunk + (logical_3 + 1)) * 128)))) : (item_hi_3));
@@ -981,10 +1097,10 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
                     int next_chunk_tokens = 128;
                     float raw_next[4];
                     if (has_next_chunk != 0) {
-                        int physical_chunk_1 = logical_3 + 1 - sequence_3 * nchunks;
+                        int physical_chunk_1 = logical_3 + 1 - sequence_4 * nchunks;
                         int segment_offset_0 = 0;
                         int segment_limit_0 = 128;
-                        if (metadata_from_cu_seqlens != 0) {
+                        if (metadata_from_cu_seqlens == 1) {
                             int first_chunk_1 = item_lo_3 / 128;
                             int segment_start_1 = ((checkpoint_rank_3 < logical_3 + 1) ? (first_chunk_1 + (logical_3 + 1) - 1) * 128 : ((logical_3 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 == 0) ? item_lo_3 : (first_chunk_1 + (logical_3 + 1)) * 128)));
                             int segment_end_1 = ((((checkpoint_rank_3 < logical_3 + 1 + 1) ? (first_chunk_1 + (logical_3 + 1 + 1) - 1) * 128 : ((logical_3 + 1 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 + 1 == 0) ? item_lo_3 : (first_chunk_1 + (logical_3 + 1 + 1)) * 128)))) < (item_hi_3) ? (((checkpoint_rank_3 < logical_3 + 1 + 1) ? (first_chunk_1 + (logical_3 + 1 + 1) - 1) * 128 : ((logical_3 + 1 + 1 == checkpoint_rank_3) ? item_checkpoint_3 : ((logical_3 + 1 + 1 == 0) ? item_lo_3 : (first_chunk_1 + (logical_3 + 1 + 1)) * 128)))) : (item_hi_3));
@@ -1445,27 +1561,28 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
             unsigned int state_stage_1 = 0;
             int taddr_0 = taddr;
             float state_values[64];
+            asm volatile("barrier.sync 1, 512;" ::: "memory");
             unsigned int _phase_aux_full = 0;
             unsigned int _phase_state_read_released = 1;
             unsigned int _phase_cb_full = 0;
             unsigned int _phase_state_delta_full_0 = 0;
             #pragma unroll 1
             for (unsigned int work_4 = bid; work_4 < sequence_count * nheads; work_4 += num_bids) {
-                int sequence_4 = work_4 / (unsigned int)nheads;
+                int sequence_5 = work_4 / (unsigned int)nheads;
                 int head_2 = work_4 % (unsigned int)nheads;
-                int state_head_base = (sequence_4 * nheads + head_2) * 64 * 128;
-                if (metadata_from_cu_seqlens != 0) {
+                int state_head_base = (sequence_5 * nheads + head_2) * 64 * 128;
+                if (metadata_from_cu_seqlens == 1) {
                     if (warp == 4) {
                         if (elect_sync()) {
-                            int raw_lo = cu_seqlens[sequence_4];
-                            int raw_hi = cu_seqlens[sequence_4 + 1];
+                            int raw_lo = cu_seqlens[sequence_5];
+                            int raw_hi = cu_seqlens[sequence_5 + 1];
                             int flagged_cu = 0;
-                            if (sequence_4 == 0) {
+                            if (sequence_5 == 0) {
                                 if (raw_lo != 0) {
                                     flagged_cu = 1;
                                 }
                             }
-                            if (sequence_4 == sequence_count - 1) {
+                            if (sequence_5 == sequence_count - 1) {
                                 if (raw_hi != seqlen) {
                                     flagged_cu = 1;
                                 }
@@ -1505,24 +1622,24 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
                         }
                     }
                 }
-                int first_logical_4 = sequence_4 * nchunks;
+                int first_logical_4 = sequence_5 * nchunks;
                 int logical_end_4 = first_logical_4 + nchunks;
                 int item_lo_4 = 0;
                 int item_hi_4 = 0;
                 int item_checkpoint_4 = -1;
                 int checkpoint_rank_4 = 1073741824;
-                if (metadata_from_cu_seqlens != 0) {
-                    int _max_1_4 = ((cu_seqlens[sequence_4]) > (0) ? (cu_seqlens[sequence_4]) : (0));
-                    int _min_0_4 = ((_max_1_4) < (seqlen) ? (_max_1_4) : (seqlen));
-                    item_lo_4 = _min_0_4;
-                    int _max_3_4 = ((cu_seqlens[sequence_4 + 1]) > (0) ? (cu_seqlens[sequence_4 + 1]) : (0));
-                    int _min_2_4 = ((_max_3_4) < (seqlen) ? (_max_3_4) : (seqlen));
-                    item_hi_4 = _min_2_4;
+                if (metadata_from_cu_seqlens == 1) {
+                    int _max_1_5 = ((cu_seqlens[sequence_5]) > (0) ? (cu_seqlens[sequence_5]) : (0));
+                    int _min_0_5 = ((_max_1_5) < (seqlen) ? (_max_1_5) : (seqlen));
+                    item_lo_4 = _min_0_5;
+                    int _max_3_5 = ((cu_seqlens[sequence_5 + 1]) > (0) ? (cu_seqlens[sequence_5 + 1]) : (0));
+                    int _min_2_5 = ((_max_3_5) < (seqlen) ? (_max_3_5) : (seqlen));
+                    item_hi_4 = _min_2_5;
                     int item_count_4 = 0;
                     if (item_hi_4 > item_lo_4) {
                         item_count_4 = (item_hi_4 + 127) / 128 - item_lo_4 / 128;
                         if (checkpoint_state_count > 0) {
-                            int candidate_checkpoint_4 = checkpoint_token_indices[sequence_4];
+                            int candidate_checkpoint_4 = checkpoint_token_indices[sequence_5];
                             if (candidate_checkpoint_4 > item_lo_4 && candidate_checkpoint_4 < item_hi_4 && candidate_checkpoint_4 % 128 != 0) {
                                 item_checkpoint_4 = candidate_checkpoint_4;
                                 checkpoint_rank_4 = candidate_checkpoint_4 / 128 - item_lo_4 / 128 + 1;
@@ -1533,8 +1650,8 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
                     first_logical_4 = 0;
                     logical_end_4 = item_count_4;
                 } else {
-                    first_logical_4 = seq_chunk_cumsum[sequence_4];
-                    logical_end_4 = seq_chunk_cumsum[sequence_4 + 1];
+                    first_logical_4 = seq_chunk_cumsum[table_base + sequence_5];
+                    logical_end_4 = seq_chunk_cumsum[table_base + sequence_5 + 1];
                 }
                 int uniform_5 = make_warp_uniform(first_logical_4);
                 first_logical_4 = uniform_5;
@@ -1609,25 +1726,21 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
                         for (int b_local = 0; b_local < 8; b_local++) {
                             scaled_b_values[b_local] = 0.0f;
                         }
-                        unsigned int b_packed[4];
-                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                            : "=r"(*reinterpret_cast<uint32_t*>(&b_packed[0])), "=r"(*reinterpret_cast<uint32_t*>(&b_packed[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&b_packed[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&b_packed[(0) + 3]))
-                            : "r"((smem_b_addr + input_stage_4 * 32768 + (unsigned int)(b_state_base / 64 * 16384 + col * 128 + b_state_base % 64 * 2 ^ (b_state_base / 64 * 16384 + col * 128 + b_state_base % 64 * 2 >> 7 & 7) << 4))));
-                        #pragma unroll
-                        for (int _pair = 0; _pair < 4; _pair++) {
-                            (&scaled_b_values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(b_packed[_pair]) << 16);
-                            (&scaled_b_values[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(b_packed[_pair]) & 0xffff0000u);
-                        }
-                        float b_scale = smem_bscale[col];
-                        const float2 _scale2_6 = {b_scale, b_scale};
-                        #pragma unroll
-                        for (int _ls = 0; _ls < 4; _ls++)
-                            mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(scaled_b_values)[_ls], _scale2_6);
-                        if (col < segment_offset_1 || col >= segment_limit_1) {
+                        if (col >= segment_offset_1 && col < segment_limit_1) {
+                            unsigned int b_packed[4];
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&b_packed[0])), "=r"(*reinterpret_cast<uint32_t*>(&b_packed[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&b_packed[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&b_packed[(0) + 3]))
+                                : "r"((smem_b_addr + input_stage_4 * 32768 + (unsigned int)(b_state_base / 64 * 16384 + col * 128 + b_state_base % 64 * 2 ^ (b_state_base / 64 * 16384 + col * 128 + b_state_base % 64 * 2 >> 7 & 7) << 4))));
                             #pragma unroll
-                            for (int b_local_1 = 0; b_local_1 < 8; b_local_1++) {
-                                scaled_b_values[b_local_1] = 0.0f;
+                            for (int _pair = 0; _pair < 4; _pair++) {
+                                (&scaled_b_values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(b_packed[_pair]) << 16);
+                                (&scaled_b_values[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(b_packed[_pair]) & 0xffff0000u);
                             }
+                            float b_scale = smem_bscale[col];
+                            const float2 _scale2_6 = {b_scale, b_scale};
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 4; _ls++)
+                                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(scaled_b_values)[_ls], _scale2_6);
                         }
                         unsigned int scaled_b_values_bf16[4];
                         #pragma unroll
@@ -1684,9 +1797,9 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
                     state_stage_1 += 1;
                     if (state_stage_1 == 2) { state_stage_1 = 0; _phase_state_read_released ^= 1; }
                     if (checkpoint_state_count > 0) {
-                        int checkpoint_token = checkpoint_token_indices[sequence_4];
-                        int chunk_3 = logical_4 - sequence_4 * nchunks;
-                        if (metadata_from_cu_seqlens != 0) {
+                        int checkpoint_token = checkpoint_token_indices[sequence_5];
+                        int chunk_3 = logical_4 - sequence_5 * nchunks;
+                        if (metadata_from_cu_seqlens == 1) {
                             chunk_3 = ((checkpoint_rank_4 < logical_4) ? (item_lo_4 / 128 + logical_4 - 1) * 128 : ((logical_4 == checkpoint_rank_4) ? item_checkpoint_4 : ((logical_4 == 0) ? item_lo_4 : (item_lo_4 / 128 + logical_4) * 128))) / 128;
                         } else {
                             chunk_3 = chunk_indices[logical_4];
@@ -1696,7 +1809,7 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
                             segment_end_2 = seqlen;
                         }
                         if (checkpoint_token == segment_end_2) {
-                            int checkpoint_slot = checkpoint_state_slots[sequence_4];
+                            int checkpoint_slot = checkpoint_state_slots[sequence_5];
                             if (checkpoint_slot >= 0 && checkpoint_slot < checkpoint_state_count) {
                                 int checkpoint_head_base = (checkpoint_slot * nheads + head_2) * 64 * 128;
                                 #pragma unroll
@@ -1749,29 +1862,30 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
             int row = warp % 4 * 32 + lane;
             int row_tmem_base = warp % 4 * 32 << 16;
             int taddr_0_1 = taddr;
+            asm volatile("barrier.sync 1, 512;" ::: "memory");
             unsigned int _phase_cb_full_1 = 0;
             unsigned int _phase_aux_full_1 = 0;
             #pragma unroll 1
             for (unsigned int work_5 = bid; work_5 < sequence_count * nheads; work_5 += num_bids) {
-                int sequence_5 = work_5 / (unsigned int)nheads;
-                int first_logical_5 = sequence_5 * nchunks;
+                int sequence_6 = work_5 / (unsigned int)nheads;
+                int first_logical_5 = sequence_6 * nchunks;
                 int logical_end_5 = first_logical_5 + nchunks;
                 int item_lo_5 = 0;
                 int item_hi_5 = 0;
                 int item_checkpoint_5 = -1;
                 int checkpoint_rank_5 = 1073741824;
-                if (metadata_from_cu_seqlens != 0) {
-                    int _max_1_5 = ((cu_seqlens[sequence_5]) > (0) ? (cu_seqlens[sequence_5]) : (0));
-                    int _min_0_5 = ((_max_1_5) < (seqlen) ? (_max_1_5) : (seqlen));
-                    item_lo_5 = _min_0_5;
-                    int _max_3_5 = ((cu_seqlens[sequence_5 + 1]) > (0) ? (cu_seqlens[sequence_5 + 1]) : (0));
-                    int _min_2_5 = ((_max_3_5) < (seqlen) ? (_max_3_5) : (seqlen));
-                    item_hi_5 = _min_2_5;
+                if (metadata_from_cu_seqlens == 1) {
+                    int _max_1_6 = ((cu_seqlens[sequence_6]) > (0) ? (cu_seqlens[sequence_6]) : (0));
+                    int _min_0_6 = ((_max_1_6) < (seqlen) ? (_max_1_6) : (seqlen));
+                    item_lo_5 = _min_0_6;
+                    int _max_3_6 = ((cu_seqlens[sequence_6 + 1]) > (0) ? (cu_seqlens[sequence_6 + 1]) : (0));
+                    int _min_2_6 = ((_max_3_6) < (seqlen) ? (_max_3_6) : (seqlen));
+                    item_hi_5 = _min_2_6;
                     int item_count_5 = 0;
                     if (item_hi_5 > item_lo_5) {
                         item_count_5 = (item_hi_5 + 127) / 128 - item_lo_5 / 128;
                         if (checkpoint_state_count > 0) {
-                            int candidate_checkpoint_5 = checkpoint_token_indices[sequence_5];
+                            int candidate_checkpoint_5 = checkpoint_token_indices[sequence_6];
                             if (candidate_checkpoint_5 > item_lo_5 && candidate_checkpoint_5 < item_hi_5 && candidate_checkpoint_5 % 128 != 0) {
                                 item_checkpoint_5 = candidate_checkpoint_5;
                                 checkpoint_rank_5 = candidate_checkpoint_5 / 128 - item_lo_5 / 128 + 1;
@@ -1782,8 +1896,8 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
                     first_logical_5 = 0;
                     logical_end_5 = item_count_5;
                 } else {
-                    first_logical_5 = seq_chunk_cumsum[sequence_5];
-                    logical_end_5 = seq_chunk_cumsum[sequence_5 + 1];
+                    first_logical_5 = seq_chunk_cumsum[table_base + sequence_6];
+                    logical_end_5 = seq_chunk_cumsum[table_base + sequence_6 + 1];
                 }
                 int uniform_6 = make_warp_uniform(first_logical_5);
                 first_logical_5 = uniform_6;
@@ -1876,35 +1990,36 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
             int row_1 = warp % 4 * 32 + lane;
             int row_tmem_base_1 = warp % 4 * 32 << 16;
             int taddr_0_2 = taddr;
+            asm volatile("barrier.sync 1, 512;" ::: "memory");
             unsigned int _phase_intra_full = 0;
             unsigned int _phase_inter_full_0 = 0;
             unsigned int _phase_aux_full_2 = 0;
             #pragma unroll 1
             for (unsigned int work_6 = bid; work_6 < sequence_count * nheads; work_6 += num_bids) {
-                int sequence_6 = work_6 / (unsigned int)nheads;
+                int sequence_7 = work_6 / (unsigned int)nheads;
                 int head_3 = work_6 % (unsigned int)nheads;
                 float d_head_value = 0.0f;
                 if (D_mode == 1) {
                     d_head_value = (float)D[head_3];
                 }
-                int first_logical_6 = sequence_6 * nchunks;
+                int first_logical_6 = sequence_7 * nchunks;
                 int logical_end_6 = first_logical_6 + nchunks;
                 int item_lo_6 = 0;
                 int item_hi_6 = 0;
                 int item_checkpoint_6 = -1;
                 int checkpoint_rank_6 = 1073741824;
-                if (metadata_from_cu_seqlens != 0) {
-                    int _max_1_6 = ((cu_seqlens[sequence_6]) > (0) ? (cu_seqlens[sequence_6]) : (0));
-                    int _min_0_6 = ((_max_1_6) < (seqlen) ? (_max_1_6) : (seqlen));
-                    item_lo_6 = _min_0_6;
-                    int _max_3_6 = ((cu_seqlens[sequence_6 + 1]) > (0) ? (cu_seqlens[sequence_6 + 1]) : (0));
-                    int _min_2_6 = ((_max_3_6) < (seqlen) ? (_max_3_6) : (seqlen));
-                    item_hi_6 = _min_2_6;
+                if (metadata_from_cu_seqlens == 1) {
+                    int _max_1_7 = ((cu_seqlens[sequence_7]) > (0) ? (cu_seqlens[sequence_7]) : (0));
+                    int _min_0_7 = ((_max_1_7) < (seqlen) ? (_max_1_7) : (seqlen));
+                    item_lo_6 = _min_0_7;
+                    int _max_3_7 = ((cu_seqlens[sequence_7 + 1]) > (0) ? (cu_seqlens[sequence_7 + 1]) : (0));
+                    int _min_2_7 = ((_max_3_7) < (seqlen) ? (_max_3_7) : (seqlen));
+                    item_hi_6 = _min_2_7;
                     int item_count_6 = 0;
                     if (item_hi_6 > item_lo_6) {
                         item_count_6 = (item_hi_6 + 127) / 128 - item_lo_6 / 128;
                         if (checkpoint_state_count > 0) {
-                            int candidate_checkpoint_6 = checkpoint_token_indices[sequence_6];
+                            int candidate_checkpoint_6 = checkpoint_token_indices[sequence_7];
                             if (candidate_checkpoint_6 > item_lo_6 && candidate_checkpoint_6 < item_hi_6 && candidate_checkpoint_6 % 128 != 0) {
                                 item_checkpoint_6 = candidate_checkpoint_6;
                                 checkpoint_rank_6 = candidate_checkpoint_6 / 128 - item_lo_6 / 128 + 1;
@@ -1915,8 +2030,8 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
                     first_logical_6 = 0;
                     logical_end_6 = item_count_6;
                 } else {
-                    first_logical_6 = seq_chunk_cumsum[sequence_6];
-                    logical_end_6 = seq_chunk_cumsum[sequence_6 + 1];
+                    first_logical_6 = seq_chunk_cumsum[table_base + sequence_7];
+                    logical_end_6 = seq_chunk_cumsum[table_base + sequence_7 + 1];
                 }
                 int uniform_7 = make_warp_uniform(first_logical_6);
                 first_logical_6 = uniform_7;
@@ -1924,8 +2039,8 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
                 logical_end_6 = uniform_1_6;
                 #pragma unroll 1
                 for (int logical_6 = first_logical_6; logical_6 < logical_end_6; logical_6++) {
-                    int chunk_4 = logical_6 - sequence_6 * nchunks;
-                    if (metadata_from_cu_seqlens != 0) {
+                    int chunk_4 = logical_6 - sequence_7 * nchunks;
+                    if (metadata_from_cu_seqlens == 1) {
                         chunk_4 = ((checkpoint_rank_6 < logical_6) ? (item_lo_6 / 128 + logical_6 - 1) * 128 : ((logical_6 == checkpoint_rank_6) ? item_checkpoint_6 : ((logical_6 == 0) ? item_lo_6 : (item_lo_6 / 128 + logical_6) * 128))) / 128;
                     } else {
                         chunk_4 = chunk_indices[logical_6];
@@ -2086,13 +2201,13 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
                                         }
                                         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_y_addr + output_stage * 16384 + (unsigned int)(row_1 * 128 + dim_base * 2 ^ (row_1 * 128 + dim_base * 2 >> 7 & 7) << 4))), "r"(group_values_bf16[0]), "r"(group_values_bf16[1]), "r"(group_values_bf16[2]), "r"(group_values_bf16[3]) : "memory");
                                     } else {
-                                        unsigned int group_values_pva[4];
+                                        unsigned int group_values_pv[4];
                                         #pragma unroll
                                         for (int _lp = 0; _lp < 4; _lp++) {
                                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(group_values[_lp*2 + 0], group_values[_lp*2+1 + 0]));
-                                            group_values_pva[_lp] = *(uint32_t*)&_bf2;
+                                            group_values_pv[_lp] = *(uint32_t*)&_bf2;
                                         }
-                                        reinterpret_cast<int4*>(out_native + (out_row_base + dim_base))[0] = reinterpret_cast<int4*>(group_values_pva)[0];
+                                        reinterpret_cast<int4*>(out_native + (out_row_base + dim_base))[0] = reinterpret_cast<int4*>(group_values_pv)[0];
                                     }
                                 }
                             }
@@ -2222,13 +2337,13 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
                                         }
                                         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_y_addr + output_stage * 16384 + (unsigned int)(row_1 * 128 + dim_base_1 * 2 ^ (row_1 * 128 + dim_base_1 * 2 >> 7 & 7) << 4))), "r"(group_values_bf16_1[0]), "r"(group_values_bf16_1[1]), "r"(group_values_bf16_1[2]), "r"(group_values_bf16_1[3]) : "memory");
                                     } else {
-                                        unsigned int group_values_pvb[4];
+                                        unsigned int group_values_pv_1[4];
                                         #pragma unroll
                                         for (int _lp = 0; _lp < 4; _lp++) {
                                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(group_values_1[_lp*2 + 0], group_values_1[_lp*2+1 + 0]));
-                                            group_values_pvb[_lp] = *(uint32_t*)&_bf2;
+                                            group_values_pv_1[_lp] = *(uint32_t*)&_bf2;
                                         }
-                                        reinterpret_cast<int4*>(out_native + (out_row_base_1 + dim_base_1))[0] = reinterpret_cast<int4*>(group_values_pvb)[0];
+                                        reinterpret_cast<int4*>(out_native + (out_row_base_1 + dim_base_1))[0] = reinterpret_cast<int4*>(group_values_pv_1)[0];
                                     }
                                 }
                             }
@@ -2267,6 +2382,14 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
             }
             int warp_id_in_role_2 = warp - 12;
             if (warp_id_in_role_2 == 0) {
+                input_stage_6 += 1;
+                if (input_stage_6 == 2) { input_stage_6 = 0; _phase_aux_full_2 ^= 1; }
+                mbarrier_wait(aux_empty_addr + (input_stage_6) * 8, _phase_aux_full_2 ^ (unsigned int)(input_stage_6 + 2 >= 2));
+                __syncwarp();
+                asm volatile("tcgen05.fence::after_thread_sync;");
+                asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(512));
+            }
+            if (warp_id_in_role_2 == 0) {
                 asm volatile("cp.async.bulk.wait_group.read 0;");
             }
             asm volatile("barrier.sync 10, 128;" ::: "memory");
@@ -2274,12 +2397,6 @@ kernel_mamba_ssd_q_tmem_alias_bf16_varlen_noring(const __grid_constant__ CUtenso
     }
 
     // Cleanup
-    asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
-    __syncthreads(); // barrier before TMEM dealloc
-
-    if (warp == 12) {
-        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;" :: "r"(tmem_addr_storage[0]), "r"(512));
-    }
 }
 
 } // extern "C"
