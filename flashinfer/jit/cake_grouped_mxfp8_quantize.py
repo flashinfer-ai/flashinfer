@@ -18,12 +18,12 @@ kernel (BF16, F16), its bulk-copy form (BULK_BF16, BULK_F16), its row-tiled form
 TILED_K4096_F16: 256-thread CTAs) and K = 2048 (TILED_K2048_BF16, TILED_K2048_F16) to,
 each shipped for sm_100a and sm_103a. The per-K forms read the group's mask word first
 and exit a CTA whose first row is past the group's valid rows. In a partial group a CTA
-that stays warms L2 with its rows of the group three (K = 7168, K = 2048) or two (K =
-4096) groups ahead when that group is partial too; the K = 7168 and K = 2048 forms first
-warm L2 with the CTA's second row step. The K = 4096 form also pairs up to twelve early
-groups with late ones: when both groups of a pair hold at most 32 valid rows and the
-tile their CTAs share holds valid rows of each, the early group's CTA also runs the late
-group's tile and the late group's CTA exits. The host module
+that stays warms L2 with its rows of the group D = 3 (K = 7168, K = 2048) or D = 2 (K =
+4096) groups ahead when that group holds at most 3 M / (4 D) valid rows; the K = 7168
+and K = 2048 forms first warm L2 with the CTA's second row step. The K = 4096 form also
+pairs up to twelve early groups with late ones: when both groups of a pair hold at most
+32 valid rows and the tile their CTAs share holds valid rows of each, the early group's
+CTA also runs the late group's tile and the late group's CTA exits. The host module
 ``flashinfer.quantization.fp8_quantization`` selects the program from the problem's
 shape, computes the grid and launches it.
 
