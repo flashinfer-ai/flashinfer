@@ -16,6 +16,11 @@ import math
 import statistics
 from typing import Any, Dict, List, Optional
 
+
+class NoPassingCandidate(RuntimeError):
+    """All candidates were rejected after agreement across EP ranks."""
+
+
 # Knob keys = Sm107BlockScaledMoeConfig field names (the shim owns the dialect;
 # the backends map their config field names onto these).
 KNOB_KEYS = (
@@ -379,7 +384,7 @@ def _sweep_sm107_block_scaled_mega_moe(
 
     best = min(range(len(scores)), key=scores.__getitem__)
     if not math.isfinite(scores[best]):
-        raise RuntimeError(
+        raise NoPassingCandidate(
             "no SM107 candidate passed configuration and sampled correctness checks"
         )
     winner = candidates[best]

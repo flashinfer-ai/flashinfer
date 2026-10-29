@@ -318,6 +318,38 @@ def test_collective_cache_hits_reconcile_different_winners(protocol, monkeypatch
     assert gather.call_count == 5
 
 
+@pytest.mark.parametrize("phase", ["selection", "settled", "capture"])
+def test_compute_releases_staged_tensors(protocol, monkeypatch, phase):
+    protocol, _ = protocol
+    backend, owner = protocol.backend, protocol.owner
+    tensors = owner.tensors
+    monkeypatch.setattr(
+        torch.cuda, "is_current_stream_capturing", lambda: phase == "capture"
+    )
+
+    def choose(namespace, pending):
+        assert pending.tensors is tensors
+        assert owner.tensors is tensors
+
+    choose = Mock(side_effect=choose)
+    monkeypatch.setattr(AutoTuner.get(), "choose_with_protocol", choose)
+    with autotune_v2(mode="replay", persistent_cache=False):
+        if phase == "settled":
+            owner._tuning_state.record_selection(
+                {"variant": "inference", "knobs": {}},
+                selection._cache_identity(selection._context()),
+                None,
+            )
+        backend.compute(owner, (None, None), output=None)
+    assert owner.tensors is None
+    assert choose.call_count == (phase == "selection")
+    if phase == "selection":
+        owner.kernel.stage_inputs.assert_called_once_with(
+            tensors, owner.workspace, quantize_input=True
+        )
+    owner.kernel.compute.assert_called_once()
+
+
 def test_install_prepares_independent_storage_before_releasing_previous(
     protocol, monkeypatch
 ):
@@ -337,10 +369,23 @@ def test_install_prepares_independent_storage_before_releasing_previous(
     assert protocol.owner.workspace is raw
 
 
-@pytest.mark.parametrize("output_view", [False, True])
-@pytest.mark.parametrize("variant", [None, "inference", "genphase"])
+@pytest.mark.parametrize(
+    "variant,output_view,failure",
+    [
+        (variant, view, None)
+        for variant in (None, "inference", "genphase")
+        for view in (False, True)
+    ]
+    + [
+        (None, False, "inference"),
+        (None, False, "genphase"),
+        (None, False, "all"),
+        (None, False, "launch"),
+        ("inference", False, "inference"),
+    ],
+)
 def test_full_forward_sweep_selects_across_all_knobs(
-    protocol, monkeypatch, output_view, variant
+    protocol, monkeypatch, output_view, variant, failure
 ):
     from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
         autotune as native,
@@ -416,8 +461,11 @@ def test_full_forward_sweep_selects_across_all_knobs(
             assert self.cfg == workspace.config
             assert workspace.prepared
             assert events[-1] == "stage"
+            if failure == "launch":
+                raise RuntimeError("candidate launch failed")
             events.append("compute")
-            workspace.output_activation.fill_(1)
+            rejected = failure in (self.cfg.kernel_variant, "all")
+            workspace.output_activation.fill_(0 if rejected else 1)
             if output is not None:
                 output.copy_(workspace.output_activation)
                 events.append("copy")
@@ -463,11 +511,25 @@ def test_full_forward_sweep_selects_across_all_knobs(
         native_context.publish("kernel-only", cached)
         previous = dict(native_context.records())
         if variant is None:
-            result = AutoTuner.get().choose_with_protocol(selection.NAMESPACE, protocol)
+            if failure in ("all", "launch"):
+                error, message = (
+                    (selection.MoEEpConfigError, "no Rubin MegaMoE variant")
+                    if failure == "all"
+                    else (RuntimeError, "candidate launch failed")
+                )
+                with pytest.raises(error, match=message):
+                    AutoTuner.get().choose_with_protocol(selection.NAMESPACE, protocol)
+                protocol._install.assert_not_called()
+            else:
+                result = AutoTuner.get().choose_with_protocol(
+                    selection.NAMESPACE, protocol
+                )
+                assert result["variant"] == (
+                    "inference" if failure == "genphase" else "genphase"
+                )
+                assert result["knobs"] == grid[1]
+                assert result["knob_record"]["timing_boundary"] == "complete_forward"
             assert dict(native_context.records()) == previous
-            assert result["variant"] == "genphase"
-            assert result["knobs"] == grid[1]
-            assert result["knob_record"]["timing_boundary"] == "complete_forward"
         else:
             from flashinfer.moe_ep.backends.mega.kernel.sm107.forward_tuning import (
                 ForwardExecution,
@@ -479,11 +541,25 @@ def test_full_forward_sweep_selects_across_all_knobs(
             execution = ForwardExecution(
                 kernel, protocol.tensors, quantize_input=True, output=protocol.output
             )
-            assert (
-                execution.tune(None, None, workspace, candidates=grid, force_tune=True)
-                == grid[1]
-            )
+            if failure is not None:
+                with pytest.raises(
+                    native.NoPassingCandidate, match="no SM107 candidate"
+                ):
+                    execution.tune(
+                        None, None, workspace, candidates=grid, force_tune=True
+                    )
+            else:
+                assert (
+                    execution.tune(
+                        None, None, workspace, candidates=grid, force_tune=True
+                    )
+                    == grid[1]
+                )
             workspace.destroy()
     variants = ("inference", "genphase") if variant is None else (variant,)
+    variants = [v for v in variants if failure not in (v, "all", "launch")]
     assert measured == [(v, flag) for v in variants for flag in (1, 2)]
-    assert all(buffer.destroyed for buffer in buffers)
+    if failure != "launch":
+        assert all(buffer.destroyed for buffer in buffers)
+    else:
+        assert not any(buffer.destroyed for buffer in buffers)

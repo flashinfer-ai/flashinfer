@@ -301,6 +301,7 @@ class RubinVariantBackend(MegaKernelBackend):
                     workspace.workspace,
                     quantize_input=workspace.quantize_input,
                 )
+        workspace.tensors = None
         return workspace.kernel.compute(
             workspace.workspace, transformed_weights, output=output
         )
@@ -483,6 +484,7 @@ class _VariantProtocol:
             from .....kernel_src.sm107.next_cutedsl_megamoe import KNOB_KEYS
             from .....kernel_src.sm107.next_cutedsl_megamoe.shim import knob_cache
             from .....kernel_src.sm107.next_cutedsl_megamoe.shim.autotune import (
+                NoPassingCandidate,
                 _sweep_sm107_block_scaled_mega_moe,
                 sm107_candidates,
             )
@@ -518,17 +520,21 @@ class _VariantProtocol:
                         and workspace.config.combine_dtype == "bf16",
                     )
                 )
-                knobs, score, _ = _sweep_sm107_block_scaled_mega_moe(
-                    self.output,
-                    self.weights[0],
-                    self.weights[1],
-                    workspace,
-                    num_tokens=self.tensors.num_tokens,
-                    candidates=knobs_to_try,
-                    process_group=group,
-                    measurement=measurement,
-                    make_trial=execution.make_trial,
-                )
+                try:
+                    knobs, score, _ = _sweep_sm107_block_scaled_mega_moe(
+                        self.output,
+                        self.weights[0],
+                        self.weights[1],
+                        workspace,
+                        num_tokens=self.tensors.num_tokens,
+                        candidates=knobs_to_try,
+                        process_group=group,
+                        measurement=measurement,
+                        make_trial=execution.make_trial,
+                    )
+                except NoPassingCandidate:
+                    kernel.destroy(workspace)
+                    continue
                 protocol = RubinTuningProtocol(
                     self.output,
                     self.weights[0],
@@ -561,6 +567,10 @@ class _VariantProtocol:
                     }
                 )
                 kernel.destroy(workspace)
+            if not candidates:
+                raise MoEEpConfigError(
+                    "no Rubin MegaMoE variant has a passing tuning candidate"
+                )
             record = {
                 **min(candidates, key=lambda candidate: candidate["p50_us"]),
                 "contract": contract,
