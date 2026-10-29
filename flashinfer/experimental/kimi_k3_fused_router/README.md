@@ -40,11 +40,12 @@ the expert-aligned route plan consumed by grouped MoE GEMMs in **one launch**:
   only kernels bound to their exact token count), one cluster of 16 CTAs of
   two row groups each for every other
   count up to 32 (the 32-token cell, so 3 or 17 tokens take it; three kernels
-  serve it, one waiting for its cluster at entry, one after its row
-  selection and the second with its candidate floor taken from the owners of
-  the published bounds: SM100 takes the second at `block_m = 8` and, at
-  `block_m = 16`, the third from 29 tokens and the first below; SM103 takes
-  the first at `block_m = 8` and the second at `block_m = 16`), one-join plan
+  serve it: `LCG`, which waits for its cluster at entry, `LCG_LW`, which waits
+  after its row selection, and `LCG_LW_OWN`, the `LCG_LW` kernel whose
+  candidate floor comes from the owners of the published bounds: SM100 takes
+  `LCG_LW` at `block_m = 8` and, at `block_m = 16`, `LCG_LW_OWN` from 29
+  tokens and `LCG` below; SM103 takes `LCG` at `block_m = 8` and `LCG_LW` at
+  `block_m = 16`), one-join plan
   builders for 33 to 128 tokens (the 64- and 128-token cells use a second
   kernel of the builder's family which loads the bias and the first row's
   logits into registers before its prologue barrier; the plain builder keeps
