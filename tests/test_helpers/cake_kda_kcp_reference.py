@@ -43,8 +43,8 @@ transfer(S0, q, k, v, g, beta) -> (M, B)   [documentation helper for unit tests]
     from ``recur_interval`` by propagating the identity basis.  Cost O(K) recurrences: for unit tests on short
     intervals only.
 reference_pack(row, device, progress=None) -> (out, grads)
-    The whole GLOBAL pack of ``row`` (``cake_kcp_inputs.global_operands``), each document from the zero state, with
-    autograd per document; ``grads = {"dq", "dk", "dv", "dg", "dbeta"}``; all FP64 ``[T, H, 128]`` / ``[T, H]``.
+    The whole GLOBAL pack of ``row`` (``cake_kda_kcp_inputs.global_operands``), each document from the zero state,
+    with autograd per document; ``grads = {"dq", "dk", "dv", "dg", "dbeta"}``; all FP64 ``[T, H, 128]`` / ``[T, H]``.
 """
 
 from __future__ import annotations
@@ -52,8 +52,8 @@ from __future__ import annotations
 import torch
 from torch.utils.checkpoint import checkpoint
 
-from tests.test_helpers.cake_kcp_inputs import global_operands
-from tests.test_helpers.cake_kcp_shapes import D, Row
+from tests.test_helpers.cake_kda_kcp_inputs import global_operands
+from tests.test_helpers.cake_kda_kcp_shapes import D, Row
 
 SCALE = D**-0.5
 BLOCK = 64

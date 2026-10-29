@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Operand generation of the packed KDA context-parallel (KCP) tests, deterministic per (row, document, 64-token
-block) of the rows in ``cake_kcp_shapes``.
+block) of the rows in ``cake_kda_kcp_shapes``.
 
 Every rank generates only its own fragments; the FP64 reference generates the whole pack.  Both call `doc_block()`
 with the same arguments, so a token's operands do not depend on the partition, the device or the process.
@@ -41,7 +41,7 @@ import zlib
 
 import torch
 
-from tests.test_helpers.cake_kcp_shapes import SEED, D, Row
+from tests.test_helpers.cake_kda_kcp_shapes import SEED, D, Row
 
 BLOCK = 64
 EPS = 1e-6

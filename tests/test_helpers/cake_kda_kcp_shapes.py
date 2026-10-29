@@ -46,7 +46,7 @@ class Row:
     # layouts the row is run at ("R" = explicit ragged table, see RAGGED_TABLES)
     layouts: tuple[str, ...]
     note: str = ""
-    # input generator regime (cake_kcp_inputs): "default" or a regime string with parameters:
+    # input generator regime (cake_kda_kcp_inputs): "default" or a regime string with parameters:
     # "iso_weak:b0=B:gmax=G:gzero=Z" | "aniso_weak:noise=E:gmax=G:gzero=Z" | "mixed_v2:b0=B:gmax=G"
     data: str = "default"
 

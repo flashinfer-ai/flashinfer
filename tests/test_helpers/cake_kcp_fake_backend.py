@@ -18,7 +18,7 @@ FP64 fake backend of the context-parallel (KCP) route of the Cake packed KDA tra
 It emulates ``W`` ranks in ONE CPU process on the real :mod:`cake_kcp_plan` tables: every rank's exchange buffers
 are plain FP64 tensors laid out exactly as the device buffers (``KcpHeadPlan`` tile tables and chain offsets), the
 collectives are dictionary ``all_to_all_single`` over the published split sizes, and the per-fragment compute is the
-FP64 token recurrence of the reference (``cake_kcp_reference.recur_interval`` /
+FP64 token recurrence of the reference (``cake_kda_kcp_reference.recur_interval`` /
 ``recur_interval_adjoint``).  It follows the forward launch sequence (offset + transfer summaries -> c1 -> owner
 chain prefix -> c2 -> local forward from ``S_in``) and the backward one (adjoint offsets ``d_f`` [+ re-sent maps] ->
 b1 -> owner reverse chain -> b2 -> local adjoint from ``dS_out``) at fragment granularity (``P = 1`` semantics:
@@ -31,8 +31,8 @@ The transfer map of a fragment is the final state of the recurrence started from
 crossing-out fragment and no cancellation; ``_transfer_matches_basis_transfer`` checks it against the reference's
 basis-vector ``transfer`` helper on a short interval.
 
-Inputs come from the reference harness (``cake_kcp_shapes`` rows, ``cake_kcp_inputs`` operands) and the FP64
-reference ``cake_kcp_reference``, all in ``tests/test_helpers``.
+Inputs come from the reference harness (``cake_kda_kcp_shapes`` rows, ``cake_kda_kcp_inputs`` operands) and the
+FP64 reference ``cake_kda_kcp_reference``, all in ``tests/test_helpers``.
 """
 
 from __future__ import annotations
@@ -42,9 +42,9 @@ import time
 
 import torch
 
-from tests.test_helpers import cake_kcp_inputs as kcp_inputs
-from tests.test_helpers import cake_kcp_reference as rk
-from tests.test_helpers import cake_kcp_shapes as kcp_shapes
+from tests.test_helpers import cake_kda_kcp_inputs as kcp_inputs
+from tests.test_helpers import cake_kda_kcp_reference as rk
+from tests.test_helpers import cake_kda_kcp_shapes as kcp_shapes
 from tests.test_helpers.cake_package import cake_package
 
 kp = cake_package("cake_kda_train", "cake_kcp_plan")

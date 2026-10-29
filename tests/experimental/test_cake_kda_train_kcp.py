@@ -17,8 +17,8 @@ CPU tests of the KCP metadata layer (``cake_kcp_plan``): partitions against the 
 splits and chain tables, head ownership, the plan rule, the byte queries, the private test knobs; the GPU parity test
 of the CPU-built chunk tables against the ``table`` program (``-k gpu``); and the FP64
 fake backend against the unpartitioned FP64 reference (``-k fake``).  Rows, reference partitions and operands come
-from the reference harness ``tests/test_helpers/cake_kcp_shapes.py`` / ``cake_kcp_inputs.py``, the FP64 reference
-from ``tests/test_helpers/cake_kcp_reference.py``.
+from the reference harness ``tests/test_helpers/cake_kda_kcp_shapes.py`` / ``cake_kda_kcp_inputs.py``, the FP64
+reference from ``tests/test_helpers/cake_kda_kcp_reference.py``.
 """
 
 import ctypes
@@ -33,7 +33,7 @@ import weakref
 import pytest
 import torch
 
-from tests.test_helpers import cake_kcp_shapes as kcp_shapes
+from tests.test_helpers import cake_kda_kcp_shapes as kcp_shapes
 from tests.test_helpers.cake_kda_train_kcp_saved import written_carry, written_tensors
 from tests.test_helpers.cake_package import cake_package
 
@@ -3676,7 +3676,7 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap, walk_form) 
 
     def unit(
         x,
-    ):  # the delta rule's operand contract (cake_kcp_inputs): q / k L2-normalized per head; raw randn keys blow the state up
+    ):  # the delta rule's operand contract (cake_kda_kcp_inputs): q / k L2-normalized per head; raw randn keys blow the state up
         return x * torch.rsqrt((x * x).sum(-1, keepdim=True) + 1e-6)
 
     q = unit(randn(T, H, cake_kcp.D)).to(dt["q"])
@@ -5218,7 +5218,7 @@ def test_gpu_host_trim_fresh_context_per_call_releases_everything(device) -> Non
 
     def unit(
         x,
-    ):  # the delta rule's operand contract (cake_kcp_inputs): q / k L2-normalized per head
+    ):  # the delta rule's operand contract (cake_kda_kcp_inputs): q / k L2-normalized per head
         return x * torch.rsqrt((x * x).sum(-1, keepdim=True) + 1e-6)
 
     q = unit(randn(T, H, cake_kcp.D)).to(dt["q"])
