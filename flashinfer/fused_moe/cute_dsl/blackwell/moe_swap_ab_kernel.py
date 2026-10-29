@@ -3389,12 +3389,17 @@ class Sm100BlockScaledGroupedGemmKernel:
                     )
                     # Keep all four coordinates warp-uniform, including OOB rows.
                     # Dynamic MMA N splits payload ownership between the two CTAs.
+                    groups_per_warp = cute.ceil_div(self.b_copy_rows, 16)
+                    groups_per_load = min(8, 1 << (groups_per_warp - 1).bit_length())
                     row_ids = cute.make_rmem_tensor(
-                        (4 * cute.ceil_div(self.b_copy_rows, 16),), cutlass.Int32
+                        (4 * groups_per_warp,), cutlass.Int32
                     )
-                    for group in cutlass.range_constexpr(
-                        cute.ceil_div(self.b_copy_rows, 16)
+                    for batch in cutlass.range_constexpr(
+                        cute.ceil_div(groups_per_warp, groups_per_load)
                     ):
+                        group = batch * groups_per_load + (
+                            (gather_thread >> 2) & (groups_per_load - 1)
+                        )
                         row_base = (
                             (gather_warp + group * 4) % (self.b_copy_rows // 4)
                         ) * 4
@@ -3409,8 +3414,16 @@ class Sm100BlockScaledGroupedGemmKernel:
                                 cutlass.Uint32(token_mapping[route_start + source_row])
                                 // self.top_k
                             )
-                        for j in cutlass.range_constexpr(4):
-                            row_ids[group * 4 + j] = cute.arch.shuffle_sync(row_id, j)
+                        for i in cutlass.range_constexpr(
+                            min(
+                                groups_per_load,
+                                groups_per_warp - batch * groups_per_load,
+                            )
+                        ):
+                            for j in cutlass.range_constexpr(4):
+                                row_ids[4 * (batch * groups_per_load + i) + j] = (
+                                    cute.arch.shuffle_sync(row_id, 4 * i + j)
+                                )
                     # Each lane owns a complete four-byte SF word in a different
                     # shared bank. SFB remains full-N in each CTA for group-2 S2T.
                     sf_row = (
