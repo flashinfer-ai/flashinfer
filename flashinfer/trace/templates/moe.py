@@ -4181,7 +4181,7 @@ cute_dsl_fused_moe_trace = TraceTemplate(
         ),
         "w1_weight": Tensor(
             ["num_local_experts", "gemm1_out_size", "num_packed_hidden"],
-            description="Packed FP4 FC1 weights.",
+            description="Packed FP4 FC1 weights (float8_e4m3fn for mxfp8).",
         ),
         "w1_weight_sf": Tensor(
             [
@@ -4207,12 +4207,13 @@ cute_dsl_fused_moe_trace = TraceTemplate(
             dtype="float32",
             optional=True,
             description=(
-                "Global scale for W4A4 FC2 input quantization; omitted for W4A8/W4A16."
+                "Global scale for W4A4 FC2 input quantization; omitted for "
+                "W4A8/W4A16/MXFP8."
             ),
         ),
         "w2_weight": Tensor(
             ["num_local_experts", "hidden_size", "num_packed_intermediate"],
-            description="Packed FP4 FC2 weights.",
+            description="Packed FP4 FC2 weights (float8_e4m3fn for mxfp8).",
         ),
         "w2_weight_sf": Tensor(
             [
@@ -4242,7 +4243,7 @@ cute_dsl_fused_moe_trace = TraceTemplate(
         "quant_mode": Scalar(
             "string",
             optional=True,
-            description="Compute mode: 'w4a4', 'w4a8', or 'w4a16'.",
+            description="Compute mode: 'w4a4', 'w4a8', 'w4a16', or 'mxfp8'.",
         ),
         "num_experts": Scalar("int32", description="Total number of experts."),
         "top_k": Scalar("int32", description="Number of experts per token."),
@@ -5003,9 +5004,9 @@ def _cute_dsl_fused_moe_reference(
         if x_sf is None:
             raise ValueError("x_sf is required when quant_mode='w4a4'")
         hs_deq = _dequantize_fp4_tensor(x, x_sf, is_ue8m0_scales=False)
-    elif quant_mode == "w4a8":
+    elif quant_mode in ("w4a8", "mxfp8"):
         if x_sf is None:
-            raise ValueError("x_sf is required when quant_mode='w4a8'")
+            raise ValueError(f"x_sf is required when quant_mode={quant_mode!r}")
         hs_deq = _dequantize_fp4_hidden_states(x, x_sf, is_weights_mxfp4=True)
     elif quant_mode == "w4a16":
         if x_sf is not None:
@@ -5014,7 +5015,8 @@ def _cute_dsl_fused_moe_reference(
     else:
         raise ValueError(f"Unsupported quant_mode {quant_mode!r}")
     is_mxfp4 = quant_mode == "w4a8"
-    if is_mxfp4:
+    is_mxfp8 = quant_mode == "mxfp8"
+    if is_mxfp4 or is_mxfp8:
 
         def mma_scales_to_logical(scales, rows, columns):
             groups = scales.shape[5]
@@ -5024,14 +5026,24 @@ def _cute_dsl_fused_moe_reference(
                 .reshape(groups, -1, scales.shape[4] * 4)[:, :rows, : columns // 32]
             )
 
+        # FP4 weights pack two values per byte; FP8 weights are unpacked.
+        k_per_byte = 2 if is_mxfp4 else 1
         w1_weight_sf = mma_scales_to_logical(
-            w1_weight_sf, w1_weight.shape[1], w1_weight.shape[2] * 2
+            w1_weight_sf, w1_weight.shape[1], w1_weight.shape[2] * k_per_byte
         )
         w2_weight_sf = mma_scales_to_logical(
-            w2_weight_sf, w2_weight.shape[1], w2_weight.shape[2] * 2
+            w2_weight_sf, w2_weight.shape[1], w2_weight.shape[2] * k_per_byte
         )
-    W1 = _dequantize_fp4_tensor(w1_weight, w1_weight_sf, is_ue8m0_scales=is_mxfp4)
-    W2 = _dequantize_fp4_tensor(w2_weight, w2_weight_sf, is_ue8m0_scales=is_mxfp4)
+    if is_mxfp8:
+        W1 = _dequantize_fp4_hidden_states(
+            w1_weight, w1_weight_sf, is_weights_mxfp4=True
+        )
+        W2 = _dequantize_fp4_hidden_states(
+            w2_weight, w2_weight_sf, is_weights_mxfp4=True
+        )
+    else:
+        W1 = _dequantize_fp4_tensor(w1_weight, w1_weight_sf, is_ue8m0_scales=is_mxfp4)
+        W2 = _dequantize_fp4_tensor(w2_weight, w2_weight_sf, is_ue8m0_scales=is_mxfp4)
     if per_token_scale is not None:
         hs_deq = hs_deq * per_token_scale.to(torch.float32).view(-1, 1)
     W1 = W1 * w1_alpha.to(torch.float32).view(E_local, 1, 1)
@@ -5581,6 +5593,449 @@ cute_dsl_fused_moe_bf16_trace = TraceTemplate(
         ),
     },
     tags=["status:experimental", "backend:cute-dsl", "moe:sm90"],
+)
+
+
+# ---------------------------------------------------------------------------
+# Two-way partitioned Prims-TS MoE
+# ---------------------------------------------------------------------------
+# Partitioned APIs consume two caller-owned prepared-weight shards rather than
+# one logical weight tensor.  Template dispatch keeps the physical MajorK and
+# BlockMajorK ranks, FP4 activation format, and partition strategy explicit so
+# distinct executable variants cannot overwrite one another's trace files.
+# The resources handle is deliberately omitted: streams and synchronization
+# events are execution context rather than benchmark inputs.
+
+_PRIMS_TS_PARTITION_STRATEGIES = ("tp_n_tp_n", "tp_n_tp_k")
+_PRIMS_TS_WEIGHT_LAYOUTS = {0: "major_k", 2: "block_major_k"}
+
+
+class _Nvfp4PartitionTraceTemplate(TraceTemplate):
+    """TraceTemplate whose logical H is twice packed NVFP4 activation storage."""
+
+    derived_axes = frozenset({"hidden_size"})
+
+    def _build_axis_extractors(self):
+        extractors = super()._build_axis_extractors()
+
+        def logical_hidden_size(kwargs):
+            hidden_states = kwargs.get("hidden_states")
+            if hidden_states is None or hidden_states.ndim < 2:
+                return None
+            return int(hidden_states.shape[1]) * 2
+
+        extractors["hidden_size"] = logical_hidden_size
+        return extractors
+
+
+def _partitioned_weight_axes(layout: str) -> dict[str, Const]:
+    common = {
+        "fc1_shard_rows": Const(
+            abbrev="", description="Physical prepared FC1 rows per partition."
+        ),
+        "fc2_shard_rows": Const(
+            abbrev="", description="Physical prepared FC2 rows per partition."
+        ),
+    }
+    if layout == "major_k":
+        return {
+            **common,
+            "fc1_storage_k": Const(
+                abbrev="", description="Physical prepared FC1 K storage."
+            ),
+            "fc2_storage_k": Const(
+                abbrev="", description="Physical prepared FC2 K storage."
+            ),
+        }
+    return {
+        **common,
+        "fc1_k_blocks": Const(abbrev="", description="Prepared FC1 K-block count."),
+        "fc1_block_elements": Const(
+            abbrev="", description="Prepared FC1 elements per K block."
+        ),
+        "fc2_k_blocks": Const(abbrev="", description="Prepared FC2 K-block count."),
+        "fc2_block_elements": Const(
+            abbrev="", description="Prepared FC2 elements per K block."
+        ),
+    }
+
+
+def _partitioned_weight_inputs(layout: str) -> dict[str, Tensor]:
+    if layout == "major_k":
+        fc1_shape = ["num_local_experts", "fc1_shard_rows", "fc1_storage_k"]
+        fc2_shape = ["num_local_experts", "fc2_shard_rows", "fc2_storage_k"]
+    else:
+        fc1_shape = [
+            "num_local_experts",
+            "fc1_k_blocks",
+            "fc1_shard_rows",
+            "fc1_block_elements",
+        ]
+        fc2_shape = [
+            "num_local_experts",
+            "fc2_k_blocks",
+            "fc2_shard_rows",
+            "fc2_block_elements",
+        ]
+    return {
+        f"gemm{fc}_weights_{partition}": Tensor(
+            fc1_shape if fc == 1 else fc2_shape,
+            param=f"gemm{fc}_weights",
+            tuple_idx=partition,
+            description=f"Prepared FC{fc} payload owned by partition {partition}.",
+        )
+        for fc in (1, 2)
+        for partition in (0, 1)
+    }
+
+
+def _partitioned_scale_shard_inputs(dtype: str) -> dict[str, Tensor]:
+    return {
+        f"gemm{fc}_weights_scale_{partition}": Tensor(
+            [f"fc{fc}_scale_storage"],
+            dtype=dtype,
+            param=f"gemm{fc}_weights_scale",
+            tuple_idx=partition,
+            description=(
+                f"Flattened prepared FC{fc} scale payload for partition {partition}."
+            ),
+        )
+        for fc in (1, 2)
+        for partition in (0, 1)
+    }
+
+
+def _partitioned_prefix(
+    base: str, strategy: str, layout: str, *, variant: str = ""
+) -> str:
+    # Preserve the concise names used by the checked-in MajorK TP-N/TP-K
+    # examples. Every other dispatch target receives an explicit suffix.
+    if strategy == "tp_n_tp_k" and layout == "major_k" and not variant:
+        return base
+    suffix = "_".join(part for part in (variant, strategy, layout) if part)
+    return f"{base}_{suffix}"
+
+
+def _make_partitioned_trace(
+    *,
+    kind: str,
+    strategy: str,
+    layout: str,
+    fp4_mode: str | None = None,
+) -> TraceTemplate:
+    base = f"prims_ts_{kind}_moe_partitioned"
+    variant = "" if fp4_mode in (None, "nvfp4") else fp4_mode
+    hidden_dims = (
+        ["seq_len", "hidden_storage_k"]
+        if fp4_mode == "nvfp4"
+        else ["seq_len", "hidden_size"]
+    )
+    axes: dict[str, Var | Const] = {
+        "seq_len": Var(description="Number of input tokens."),
+        "num_experts": Const(abbrev="", description="Total number of experts."),
+        "top_k": Const(abbrev="topk", description="Experts selected per token."),
+        "num_local_experts": Const(
+            abbrev="e", description="Experts resident on this rank."
+        ),
+        "hidden_size": Const(abbrev="h", description="Logical activation width."),
+        "intermediate_size": Const(abbrev="i", description="Logical FFN width."),
+        "partition_count": Const(
+            value=2,
+            abbrev="p",
+            description="Number of concurrent weight partitions.",
+        ),
+        **_partitioned_weight_axes(layout),
+    }
+    constraints = ["do_finalize == True"]
+    if fp4_mode == "nvfp4":
+        axes["hidden_storage_k"] = Const(
+            abbrev="", description="Packed NVFP4 activation bytes per token."
+        )
+        constraints.append("hidden_size == 2 * hidden_storage_k")
+    inputs: dict[str, Tensor | Scalar] = {
+        "routing_logits": Tensor(
+            ["seq_len", "num_experts"],
+            optional=True,
+            description="Optional routing logits; omitted for precomputed routing.",
+        ),
+        "routing_bias": Tensor(
+            ["num_experts"], optional=True, description="Optional routing bias."
+        ),
+        "topk_ids": Tensor(
+            ["seq_len", "top_k"],
+            dtype="int32",
+            optional=True,
+            description="Optional precomputed expert ids.",
+        ),
+        "hidden_states": Tensor(hidden_dims, description="Input hidden states."),
+        "num_experts": Scalar("int32", description="Total number of experts."),
+        "top_k": Scalar("int32", description="Experts selected per token."),
+        "n_group": Scalar("int32", optional=True, description="Expert routing groups."),
+        "topk_group": Scalar(
+            "int32", optional=True, description="Expert groups retained by routing."
+        ),
+        "intermediate_size": Scalar("int32", description="Logical FFN width."),
+        "local_expert_offset": Scalar(
+            "int32", description="First local expert in global expert space."
+        ),
+        "local_num_experts": Scalar(
+            "int32", description="Experts resident on this rank."
+        ),
+        "routed_scaling_factor": Scalar(
+            "float32", optional=True, description="Optional routing-weight scale."
+        ),
+        "routing_method_type": Scalar(
+            "int32", optional=True, description="RoutingMethodType value."
+        ),
+        "partition_strategy": Scalar(
+            "string", description="Two-way FC partition strategy."
+        ),
+        "weight_layout": Scalar("int32", optional=True),
+        "do_finalize": Scalar("bool", optional=True),
+        "enable_pdl": Scalar(
+            "bool",
+            optional=True,
+            description="Enable Programmatic Dependent Launch.",
+        ),
+        **_partitioned_weight_inputs(layout),
+    }
+    if kind in ("bf16", "fp8_block_scale", "fp4_block_scale"):
+        inputs.update(
+            {
+                "gemm1_alpha": Tensor(
+                    ["num_local_experts"],
+                    dtype="float32",
+                    optional=True,
+                    description="Optional per-expert SiTU or SwiGLU alpha.",
+                ),
+                "gemm1_beta": Tensor(
+                    ["num_local_experts"],
+                    dtype="float32",
+                    optional=True,
+                    description="Optional per-expert SiTU or SwiGLU beta.",
+                ),
+                "gemm1_clamp_limit": Tensor(
+                    ["num_local_experts"],
+                    dtype="float32",
+                    optional=True,
+                    description="Optional per-expert gated-activation clamp limit.",
+                ),
+            }
+        )
+    tags = [
+        "status:experimental",
+        "backend:prims-ts",
+        "partitioning:two-way",
+        f"partition-strategy:{strategy}",
+        f"weight-layout:{layout}",
+    ]
+    if kind == "bf16":
+        inputs["expert_weights"] = Tensor(
+            ["seq_len", "top_k"],
+            optional=True,
+            description="Optional precomputed routing weights.",
+        )
+        description = "Two-way partitioned Prims-TS BF16 MoE."
+    elif kind == "fp8_per_tensor_scale":
+        inputs["expert_weights"] = Tensor(
+            ["seq_len", "top_k"],
+            optional=True,
+            description="Optional precomputed routing weights.",
+        )
+        for name in (
+            "output1_scales_scalar",
+            "output1_scales_gate_scalar",
+            "output2_scales_scalar",
+        ):
+            inputs[name] = Tensor(
+                ["num_local_experts"], description="Per-expert output scale."
+            )
+        tags.append("quantization:float8_e4m3fn")
+        description = "Two-way partitioned Prims-TS FP8 per-tensor-scale MoE."
+    elif kind == "fp8_block_scale":
+        axes.update(
+            {
+                "hidden_scale_storage": Const(abbrev=""),
+                "fc1_scale_storage": Const(abbrev=""),
+                "fc2_scale_storage": Const(abbrev=""),
+            }
+        )
+        inputs["expert_weights"] = Tensor(
+            ["seq_len", "top_k"],
+            optional=True,
+            description="Optional precomputed routing weights.",
+        )
+        inputs["hidden_states_scale"] = Tensor(
+            ["hidden_scale_storage"],
+            dtype="uint8",
+            description="Prepared MXFP8 activation-scale payload.",
+        )
+        inputs.update(_partitioned_scale_shard_inputs("uint8"))
+        tags.append("quantization:mxfp8")
+        description = "Two-way partitioned Prims-TS MXFP8 block-scale MoE."
+    else:
+        assert kind == "fp4_block_scale" and fp4_mode is not None
+        # The prepared FP4 weight-scale ABI uses byte-backed E4M3 tensors for
+        # both NVFP4 (K/16) and MXFP4 (K/32) scale factors.
+        scale_dtype = "float8_e4m3fn"
+        axes.update(
+            {
+                "hidden_scale_storage": Var(
+                    description="Optional activation-scale storage extent."
+                ),
+                "fc1_scale_storage": Const(abbrev=""),
+                "fc2_scale_storage": Const(abbrev=""),
+            }
+        )
+        inputs["topk_weights"] = Tensor(
+            ["seq_len", "top_k"],
+            optional=True,
+            description="Optional precomputed routing weights.",
+        )
+        inputs["hidden_states_scale"] = Tensor(
+            ["hidden_scale_storage"],
+            dtype=scale_dtype,
+            optional=fp4_mode == "mxfp4_bf16",
+            description="Prepared activation-scale payload.",
+        )
+        inputs.update(_partitioned_scale_shard_inputs(scale_dtype))
+        for name in (
+            "output1_scale_scalar",
+            "output1_scale_gate_scalar",
+            "output2_scale_scalar",
+        ):
+            inputs[name] = Tensor(
+                ["num_local_experts"], description="Per-expert output scale."
+            )
+        tags.extend(["quantization:fp4-block-scale", f"activation-format:{fp4_mode}"])
+        description = f"Two-way partitioned Prims-TS {fp4_mode} FP4 MoE."
+
+    template_type = (
+        _Nvfp4PartitionTraceTemplate if fp4_mode == "nvfp4" else TraceTemplate
+    )
+    return template_type(
+        op_type="moe",
+        name_prefix=_partitioned_prefix(base, strategy, layout, variant=variant),
+        description=description,
+        axes=axes,
+        inputs=inputs,
+        outputs={
+            "output": Tensor(
+                ["seq_len", "hidden_size"],
+                dtype="bfloat16",
+                description="Finalized MoE output.",
+            )
+        },
+        constraints=constraints,
+        tags=tags,
+    )
+
+
+def _make_partitioned_trace_table(
+    kind: str, *, fp4_modes: tuple[str, ...] = ()
+) -> dict[tuple[str, str, str | None], TraceTemplate]:
+    modes: tuple[str | None, ...] = fp4_modes or (None,)
+    return {
+        (strategy, layout, mode): _make_partitioned_trace(
+            kind=kind,
+            strategy=strategy,
+            layout=layout,
+            fp4_mode=mode,
+        )
+        for strategy in _PRIMS_TS_PARTITION_STRATEGIES
+        for layout in _PRIMS_TS_WEIGHT_LAYOUTS.values()
+        for mode in modes
+    }
+
+
+_PRIMS_TS_BF16_PARTITION_TRACES = _make_partitioned_trace_table("bf16")
+_PRIMS_TS_FP4_PARTITION_TRACES = _make_partitioned_trace_table(
+    "fp4_block_scale",
+    fp4_modes=("nvfp4", "mxfp4_mxfp8", "mxfp4_bf16"),
+)
+_PRIMS_TS_FP8_PER_TENSOR_PARTITION_TRACES = _make_partitioned_trace_table(
+    "fp8_per_tensor_scale"
+)
+_PRIMS_TS_FP8_BLOCK_PARTITION_TRACES = _make_partitioned_trace_table("fp8_block_scale")
+
+# Stable names retained for direct imports and the checked-in representative
+# MajorK TP-N/TP-K examples.
+prims_ts_bf16_moe_partitioned_trace = _PRIMS_TS_BF16_PARTITION_TRACES[
+    ("tp_n_tp_k", "major_k", None)
+]
+prims_ts_fp4_block_scale_moe_partitioned_trace = _PRIMS_TS_FP4_PARTITION_TRACES[
+    ("tp_n_tp_k", "major_k", "nvfp4")
+]
+prims_ts_fp8_per_tensor_scale_moe_partitioned_trace = (
+    _PRIMS_TS_FP8_PER_TENSOR_PARTITION_TRACES[("tp_n_tp_k", "major_k", None)]
+)
+prims_ts_fp8_block_scale_moe_partitioned_trace = _PRIMS_TS_FP8_BLOCK_PARTITION_TRACES[
+    ("tp_n_tp_k", "major_k", None)
+]
+
+
+def _partition_trace_layout_and_strategy(kwargs):
+    if not kwargs.get("do_finalize", True):
+        return None
+    strategy = kwargs.get("partition_strategy")
+    layout = _PRIMS_TS_WEIGHT_LAYOUTS.get(int(kwargs.get("weight_layout", 0)))
+    if strategy not in _PRIMS_TS_PARTITION_STRATEGIES or layout is None:
+        return None
+    return strategy, layout
+
+
+def prims_ts_bf16_moe_partitioned_trace_dispatch(**kwargs):
+    resolved = _partition_trace_layout_and_strategy(kwargs)
+    return (
+        None if resolved is None else _PRIMS_TS_BF16_PARTITION_TRACES[(*resolved, None)]
+    )
+
+
+def prims_ts_fp4_block_scale_moe_partitioned_trace_dispatch(**kwargs):
+    resolved = _partition_trace_layout_and_strategy(kwargs)
+    hidden_states = kwargs.get("hidden_states")
+    if resolved is None or hidden_states is None:
+        return None
+    if hidden_states.dtype == torch.uint8:
+        mode = "nvfp4"
+    elif hidden_states.dtype == torch.float8_e4m3fn:
+        mode = "mxfp4_mxfp8"
+    elif hidden_states.dtype == torch.bfloat16:
+        mode = "mxfp4_bf16"
+    else:
+        return None
+    return _PRIMS_TS_FP4_PARTITION_TRACES[(*resolved, mode)]
+
+
+def prims_ts_fp8_per_tensor_scale_moe_partitioned_trace_dispatch(**kwargs):
+    resolved = _partition_trace_layout_and_strategy(kwargs)
+    return (
+        None
+        if resolved is None
+        else _PRIMS_TS_FP8_PER_TENSOR_PARTITION_TRACES[(*resolved, None)]
+    )
+
+
+def prims_ts_fp8_block_scale_moe_partitioned_trace_dispatch(**kwargs):
+    resolved = _partition_trace_layout_and_strategy(kwargs)
+    return (
+        None
+        if resolved is None
+        else _PRIMS_TS_FP8_BLOCK_PARTITION_TRACES[(*resolved, None)]
+    )
+
+
+prims_ts_bf16_moe_partitioned_trace_dispatch.templates = list(  # type: ignore[attr-defined]
+    _PRIMS_TS_BF16_PARTITION_TRACES.values()
+)
+prims_ts_fp4_block_scale_moe_partitioned_trace_dispatch.templates = list(  # type: ignore[attr-defined]
+    _PRIMS_TS_FP4_PARTITION_TRACES.values()
+)
+prims_ts_fp8_per_tensor_scale_moe_partitioned_trace_dispatch.templates = list(  # type: ignore[attr-defined]
+    _PRIMS_TS_FP8_PER_TENSOR_PARTITION_TRACES.values()
+)
+prims_ts_fp8_block_scale_moe_partitioned_trace_dispatch.templates = list(  # type: ignore[attr-defined]
+    _PRIMS_TS_FP8_BLOCK_PARTITION_TRACES.values()
 )
 
 

@@ -23,7 +23,10 @@ entry points and the full user-facing documentation live in
 
 from __future__ import annotations
 
+import functools
 import math
+import operator
+import weakref
 from typing import Any, Optional
 
 import torch
@@ -39,6 +42,7 @@ from .cake_jit import (
     MAPPING_ROWS,
     RMS_EPS,
     SINKHORN_ITERS,
+    SINKHORN_ITERS_MAX,
     STATS_COLS,
     STREAMS,
     arch_for_capability,
@@ -52,10 +56,12 @@ from .cake_jit import (
 SUPPORTED_COMPUTE_CAPABILITIES: tuple[tuple[int, int], ...] = tuple(
     sorted(ARCH_BY_CAPABILITY)
 )
-# Sinkhorn iteration counts the export delivered programs for.  The count is a
-# compile-time constant of every delivered program (the chain is unrolled), so the
-# package keys its programs by it; the epsilons are launch arguments of the same
-# compiled programs and never key a build.
+# The Sinkhorn iteration counts the delivered programs compile in: their chain is
+# unrolled for the count of record, the default, which costs nothing at run time.
+# Every other count from 1 to SINKHORN_ITERS_MAX runs too: the coefficient pass and
+# the token-owner pass then launch their run-time-count programs, which take the
+# count as a kernel argument (the other kernels never read it).  The epsilons are
+# launch arguments of every program and never select one.
 SHIPPED_SINKHORN_ITERS: tuple[int, ...] = (SINKHORN_ITERS,)
 # Every kernel tensor is read with 256-bit vector loads or described to the
 # tensor memory accelerator: contiguous storage, 32-byte aligned base.
@@ -64,6 +70,11 @@ WORKSPACE_ALIGNMENT_BYTES = 256
 # Bound of the per-token-count caches below (layouts, default-workspace views,
 # launch plans); ``cake_jit.host_plan`` keeps the same bound.
 _CACHE_ENTRIES = 4096
+# The call paths of the per-call PDL argument (``cake_jit.PDL_PATHS``): the forward
+# prepare, the backward from saved statistics, the backward after a replayed forward
+# prefix (the autograd nodes know which; the public backward entry points are the
+# backward path).
+_PATH_FORWARD, _PATH_BACKWARD, _PATH_CHECKPOINT = _loader.PDL_PATHS
 _BF16 = torch.bfloat16
 _F32 = torch.float32
 _TORCH_DTYPES = {
@@ -153,6 +164,66 @@ def _validate_tensor(
     return tensor
 
 
+def _fast_tensor(
+    tensor: Any, shape: tuple[int, ...], dtype: torch.dtype, index: int
+) -> bool:
+    """Whether :func:`_validate_tensor` accepts ``tensor`` for ``shape`` / ``dtype`` on
+    CUDA device ``index`` (``shape`` non-empty).  ``False`` sends the call to the
+    full validation, which raises the error of record."""
+
+    return (
+        isinstance(tensor, torch.Tensor)
+        and tensor.dtype is dtype
+        and tensor.is_cuda
+        and tensor.get_device() == index
+        and tensor.shape == shape
+        and tensor.is_contiguous()
+        and tensor.data_ptr() % TENSOR_ALIGNMENT_BYTES == 0
+    )
+
+
+def _fast_rows(X: Any, kind: str) -> Optional[tuple[int, int, str]]:
+    """``(rows, device index, architecture)`` when ``X`` passes :func:`_rows_of`,
+    :func:`_device_arch` and :func:`_validate_tensor` with at least one token on
+    a device whose architecture and ``kind`` route were already checked; else
+    ``None`` (the full path validates and raises)."""
+
+    if not (
+        isinstance(X, torch.Tensor) and X.dtype is _BF16 and X.is_cuda and X.dim() == 3
+    ):
+        return None
+    rows, streams, hidden = X.shape
+    if not (
+        rows > 0
+        and streams == STREAMS
+        and hidden == HIDDEN
+        and X.is_contiguous()
+        and X.data_ptr() % TENSOR_ALIGNMENT_BYTES == 0
+    ):
+        return None
+    index = X.get_device()
+    arch = _DEVICE_ARCH.get(index)
+    if arch is None or (arch, kind) not in _ROUTES_CHECKED:
+        return None
+    return rows, index, arch
+
+
+def _fast_constants(rms_eps: Any, hc_eps: Any, sinkhorn_iters: Any) -> bool:
+    """Whether :func:`_check_constants` accepts the three constants and the compiled
+    programs run them: exact ``float`` epsilons and an ``int`` iteration count of
+    :data:`SHIPPED_SINKHORN_ITERS`.  Any other type or count (a run-time count, an
+    integral float, a ``bool``) takes the full check and the full path."""
+
+    return (
+        type(rms_eps) is float
+        and type(hc_eps) is float
+        and type(sinkhorn_iters) is int
+        and 0.0 < rms_eps < math.inf
+        and 0.0 < hc_eps < math.inf
+        and sinkhorn_iters in SHIPPED_SINKHORN_ITERS
+    )
+
+
 def _rows_of(X: Any) -> tuple[int, torch.device]:
     if not isinstance(X, torch.Tensor):
         raise TypeError("X must be a torch.Tensor")
@@ -169,24 +240,36 @@ def _check_constants(rms_eps: float, hc_eps: float, sinkhorn_iters: int) -> None
     ``rms_eps`` and ``hc_eps`` are launch arguments of the exported kernels (every
     mapping-pass and token-owner program takes them as kernel parameters), so any
     finite positive value runs on the compiled programs without a rebuild; the
-    defaults are the model's ``1e-5`` / ``1e-6``.  ``sinkhorn_iters`` is a
-    compile-time constant of the exported programs: the package keys its programs
-    by that count and ships exactly :data:`SHIPPED_SINKHORN_ITERS`, so a different
-    count is not a launch argument but a program the export has not delivered
-    (``NotImplementedError``).
+    defaults are the model's ``1e-5`` / ``1e-6``.  ``sinkhorn_iters`` is an integer
+    from 1 to :data:`SINKHORN_ITERS_MAX`: the counts of
+    :data:`SHIPPED_SINKHORN_ITERS` (the default ``20``) run the compiled programs,
+    every other count the run-time-count programs of the coefficient and
+    token-owner passes; a count above :data:`SINKHORN_ITERS_MAX` is beyond what
+    those programs were built for (``NotImplementedError``).
     """
 
     if not (math.isfinite(float(rms_eps)) and float(rms_eps) > 0.0):
         raise ValueError(f"rms_eps must be a finite positive float, got {rms_eps!r}")
     if not (math.isfinite(float(hc_eps)) and float(hc_eps) > 0.0):
         raise ValueError(f"hc_eps must be a finite positive float, got {hc_eps!r}")
-    if (
-        int(sinkhorn_iters) != sinkhorn_iters
-        or int(sinkhorn_iters) not in SHIPPED_SINKHORN_ITERS
-    ):
+    if isinstance(sinkhorn_iters, bool):
+        raise ValueError(
+            f"sinkhorn_iters must be a positive integer, got {sinkhorn_iters!r}"
+        )
+    try:
+        iters = int(sinkhorn_iters)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(
+            f"sinkhorn_iters must be a positive integer, got {sinkhorn_iters!r}"
+        ) from None
+    if iters != sinkhorn_iters or iters < 1:
+        raise ValueError(
+            f"sinkhorn_iters must be a positive integer, got {sinkhorn_iters!r}"
+        )
+    if iters > SINKHORN_ITERS_MAX:
         raise NotImplementedError(
-            f"the exported Cake mHC training programs are compiled for sinkhorn_iters in {SHIPPED_SINKHORN_ITERS} "
-            f"(a compile-time constant of the Sinkhorn chain, not a launch argument); got sinkhorn_iters={sinkhorn_iters!r}"
+            f"the exported Cake mHC training programs run sinkhorn_iters from 1 to {SINKHORN_ITERS_MAX} "
+            f"(the run-time-count programs are built for at most {SINKHORN_ITERS_MAX}); got sinkhorn_iters={sinkhorn_iters!r}"
         )
 
 
@@ -259,13 +342,14 @@ def cake_mhc_train_forward_workspace_bytes(T: int, device: torch.device) -> int:
     """Bytes of the caller-owned forward workspace for up to ``T`` tokens on ``device``.
 
     The forward routes (``forward_prepare`` and the ``forward_stats`` replay) hold
-    the BF16 pieces of ``fn`` in the mapping operand layout, the FP32 per-K-unit
-    partials of the mapping pass and one 256-byte ticket region.  The size is
-    the maximum over every token count up to ``T``, so a buffer sized for the
-    largest token count serves every smaller one (and CUDA Graph replays at a
-    smaller ``T``).  The ticket words must be zero on first use (allocate with
-    ``torch.zeros`` or :func:`cake_mhc_train_forward_workspace`); the kernels
-    leave them zero.  ``T == 0`` needs no workspace (nothing is launched).
+    one 256-byte ticket region (first, at the same offset for every token count),
+    the BF16 pieces of ``fn`` in the mapping operand layout and the FP32
+    per-K-unit partials of the mapping pass.  The size is the maximum over every
+    token count up to ``T``, so a buffer sized for the largest token count
+    serves every smaller one (and CUDA Graph replays at a smaller ``T``).  The
+    ticket words must be zero on first use (allocate with ``torch.zeros`` or
+    :func:`cake_mhc_train_forward_workspace`); the kernels leave them zero.
+    ``T == 0`` needs no workspace (nothing is launched).
     """
 
     return _workspace_bytes("fwd", T, device)
@@ -274,11 +358,12 @@ def cake_mhc_train_forward_workspace_bytes(T: int, device: torch.device) -> int:
 def cake_mhc_train_backward_workspace_bytes(T: int, device: torch.device) -> int:
     """Bytes of the caller-owned backward workspace for up to ``T`` tokens on ``device``.
 
-    The ``backward_finish`` route holds the transposed BF16 pieces of ``fn``, the
-    per-token records of the token-owner pass (``dz'`` pieces and the per-token
-    scalars, padded to a multiple of 128 rows), the per-CTA parameter partials,
-    the per-chunk FP32 partials of ``dfn`` and one 256-byte ticket region.  The
-    size is the maximum over every token count up to ``T`` (see
+    The ``backward_finish`` route holds one 256-byte ticket region (first, at
+    the same offset for every token count), the transposed BF16 pieces of
+    ``fn``, the per-token records of the token-owner pass (``dz'`` pieces and the
+    per-token scalars, padded to a multiple of 128 rows), the per-CTA parameter
+    partials and the per-chunk FP32 partials of ``dfn``.  The size is the
+    maximum over every token count up to ``T`` (see
     :func:`cake_mhc_train_forward_workspace_bytes`).
     """
 
@@ -435,7 +520,90 @@ def _workspace_for(
                 _DEFAULT_VIEWS.clear()
             _DEFAULT_VIEWS[key] = views
         return views
-    return _workspace_views(workspace, kind, rows=rows, device=device)
+    return _caller_views(workspace, kind, rows, device)
+
+
+# The region views of caller-owned workspaces, per workspace object and (kind,
+# token count, device): ``id(workspace) -> (weak reference, data pointer,
+# {(kind, rows, device index): views})``.  The views of an entry alias the
+# workspace's storage without referencing the workspace tensor, and the weak
+# reference drops the entry when that tensor dies, so the cache never keeps a
+# caller's buffer alive beyond the caller's own reference.  Every call still
+# validates the workspace; a moved data pointer rebuilds the views.
+_CALLER_VIEWS: dict[int, tuple[Any, int, dict[tuple[str, int, int], Any]]] = {}
+# Views kept per workspace object (a caller that cycles through more token
+# counts on one buffer rebuilds them).
+_CALLER_VIEW_ENTRIES = 64
+
+
+def _forget_workspace(key: int, ref: Any) -> None:
+    entry = _CALLER_VIEWS.get(key)
+    if entry is not None and entry[0] is ref:
+        del _CALLER_VIEWS[key]
+
+
+def _caller_views(
+    workspace: Any, kind: str, rows: int, device: torch.device
+) -> dict[str, torch.Tensor]:
+    """:func:`_workspace_views` of a caller workspace, cached per workspace object."""
+
+    if type(workspace) is not torch.Tensor:
+        return _workspace_views(workspace, kind, rows=rows, device=device)
+    index = _device_index(device)
+    entry = _CALLER_VIEWS.get(id(workspace))
+    if (
+        entry is not None
+        and entry[0]() is workspace
+        and entry[1] == workspace.data_ptr()
+    ):
+        found = entry[2].get((kind, rows, index))
+        if found is not None:
+            views, total = found
+            if (
+                workspace.device == device
+                and workspace.dtype == torch.uint8
+                and workspace.ndim == 1
+                and workspace.is_contiguous()
+                and workspace.numel() >= total
+            ):
+                # The data pointer is the cached one, so it is still aligned.
+                return views
+            return _workspace_views(workspace, kind, rows=rows, device=device)
+    views = _workspace_views(workspace, kind, rows=rows, device=device)
+    total = _layout(kind, rows, _loader.sm_count(index), _device_arch(device))[
+        "total_bytes"
+    ]
+    aliased = _aliased_views(workspace, views)
+    if entry is None or entry[0]() is not workspace:
+        key = id(workspace)
+        entry = (
+            weakref.ref(workspace, functools.partial(_forget_workspace, key)),
+            workspace.data_ptr(),
+            {},
+        )
+        _CALLER_VIEWS[key] = entry
+    elif entry[1] != workspace.data_ptr():
+        entry = (entry[0], workspace.data_ptr(), {})
+        _CALLER_VIEWS[id(workspace)] = entry
+    if len(entry[2]) >= _CALLER_VIEW_ENTRIES:
+        entry[2].clear()
+    entry[2][(kind, rows, index)] = (aliased, total)
+    return aliased
+
+
+def _aliased_views(
+    workspace: torch.Tensor, views: dict[str, torch.Tensor]
+) -> dict[str, torch.Tensor]:
+    """``views`` rebuilt on ``workspace``'s storage without a reference to
+    ``workspace`` itself: the same dtypes, shapes, strides and data pointers."""
+
+    storage = workspace.untyped_storage()
+    aliased: dict[str, torch.Tensor] = {}
+    for name, view in views.items():
+        alias = torch.empty((0,), dtype=view.dtype, device=view.device)
+        alias.set_(storage, view.storage_offset(), view.shape, view.stride())
+        aliased[name] = alias
+    return aliased
 
 
 # ----------------------------------------------------------------------------
@@ -481,20 +649,37 @@ class _Launch:
         self.run, self.template, self.slots = run, template, slots
 
 
-_PLANS: dict[tuple[str, str, int, int], tuple[_Launch, ...]] = {}
+_PLANS: dict[tuple[str, str, int, int, str, bool], tuple[_Launch, ...]] = {}
 
 
 def _route_plan(
-    arch: str, kind: str, rows: int, device_index: int
+    arch: str,
+    kind: str,
+    rows: int,
+    device_index: int,
+    path: str,
+    sinkhorn_iters: int = SINKHORN_ITERS,
 ) -> tuple[_Launch, ...]:
-    """The launches of one route for ``rows`` tokens on ``device_index``."""
+    """The launches of one route for ``rows`` tokens on ``device_index`` along ``path``
+    (one of ``cake_jit.PDL_PATHS``: it fixes the per-call PDL argument of the records
+    whose binding takes one, :func:`cake_jit.enable_pdl`).  A ``sinkhorn_iters``
+    other than the count of record selects the run-time-count records; the count
+    itself is a launch value, so one plan serves every such count."""
 
-    key = (arch, kind, rows, device_index)
+    run_time = int(sinkhorn_iters) != SINKHORN_ITERS
+    key = (arch, kind, rows, device_index, path, run_time)
     plan = _PLANS.get(key)
     if plan is None:
         launches = []
         sm_count = _loader.sm_count(device_index)
-        for name in selected_modules(arch, HIDDEN, kind, rows=rows, sm_count=sm_count):
+        for name in selected_modules(
+            arch,
+            HIDDEN,
+            kind,
+            rows=rows,
+            sm_count=sm_count,
+            sinkhorn_iters=sinkhorn_iters,
+        ):
             record = _loader.MODULES[name]
             logical = record["logical"]
             fixed = _loader.RECORD_SCALARS.get(name, {})
@@ -507,6 +692,9 @@ def _route_plan(
             for position, (arg_kind, arg_key) in enumerate(record["arg_plan"]):
                 if arg_kind == "grid":
                     template.append(grid_values[arg_key])
+                    continue
+                if arg_kind == "launch":
+                    template.append(_loader.enable_pdl(name, rows, arch, path))
                     continue
                 logical_name = logical[arg_key]
                 if logical_name in fixed:
@@ -524,12 +712,213 @@ def _route_plan(
     return plan
 
 
+# The raw handle of the current torch stream of a device (what
+# ``torch.cuda.current_stream(index).cuda_stream`` returns, without building a
+# ``torch.cuda.Stream``).
+_CURRENT_RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
+
+def _current_stream(device_index: int) -> int:
+    if _CURRENT_RAW_STREAM is not None:
+        return _CURRENT_RAW_STREAM(device_index)
+    return torch.cuda.current_stream(device_index).cuda_stream
+
+
+# The per-call logical values of each route, in the order a call passes them to
+# :func:`_launch_route`, then the workspace regions (fetched from the views with
+# ``_WORKSPACE_VALUES``); the token count and the host-plan scalars of a route
+# are fixed per token count (``_HOST_VALUES``) and bound into the plan.
+_CALL_VALUES: dict[str, tuple[str, ...]] = {
+    "fwd_prepare": (
+        "fn",
+        "x",
+        "x_flat",
+        "scale",
+        "base",
+        "stats",
+        "rms_eps",
+        "hc_eps",
+        "u",
+    ),
+    "fwd_recompute": (
+        "fn",
+        "x",
+        "x_flat",
+        "scale",
+        "base",
+        "stats",
+        "rms_eps",
+        "hc_eps",
+    ),
+    "fwd_finish": ("x", "b", "stats", "y"),
+    "bwd_prepare": ("dy", "b", "x", "stats", "db", "gstats"),
+    "bwd_finish": (
+        "fn",
+        "x",
+        "du",
+        "stats",
+        "gstats",
+        "scale",
+        "base",
+        "hc_eps",
+        "x_flat",
+        "dy_flat",
+        "dx_flat",
+        "dfn",
+        "dscale",
+        "dbase",
+        "accumulate",
+    ),
+}
+# Logical workspace values -> region names.  The forward fn split writes the
+# forward operand layout only and the backward one the transposed layout; the
+# other layout's pointer is bound to the same region, exactly like the source
+# launcher binds an unused parameter.
+_FWD_WORKSPACE_VALUES = (
+    ("fnp", "fnp"),
+    ("fnTp", "fnp"),
+    ("spart", "spart"),
+    ("qpart", "qpart"),
+    ("ticket", "ticket"),
+)
+_WORKSPACE_VALUES: dict[str, tuple[tuple[str, str], ...]] = {
+    "fwd_prepare": _FWD_WORKSPACE_VALUES,
+    "fwd_recompute": _FWD_WORKSPACE_VALUES,
+    "fwd_finish": (),
+    "bwd_prepare": (),
+    "bwd_finish": (
+        ("fnTp", "fnTp"),
+        ("fnp", "fnTp"),
+        ("dzp", "dzp"),
+        ("tokp", "tokp"),
+        ("param_partial", "param_partial"),
+        ("dzp_rows", "dzp_rows"),
+        ("dfn_part", "dfn_part"),
+        ("ticket", "ticket"),
+    ),
+}
+_HOST_VALUES: dict[str, tuple[str, ...]] = {
+    "fwd_prepare": ("m_tiles", "log2_pk", "p_k", "t_pad"),
+    "fwd_recompute": ("m_tiles", "log2_pk", "p_k", "t_pad"),
+    "fwd_finish": (),
+    "bwd_prepare": (),
+    "bwd_finish": ("t_pad", "rows_per_cta", "parts", "rows_per_chunk", "chunks"),
+}
+
+
+class _FastRoute:
+    """The launches of one route plan as ``(bound FFI entry, argument getter)``
+    pairs over ``call values + workspace values + statics``: every argument
+    position of every launch resolved once, so a call concatenates three tuples
+    and launches."""
+
+    __slots__ = ("launches", "statics", "workspace", "x_flat")
+
+    def __init__(
+        self,
+        launches: tuple[tuple[Any, Any], ...],
+        statics: tuple[Any, ...],
+        workspace: Any,
+        x_flat: tuple[int, int],
+    ) -> None:
+        self.launches, self.statics = launches, statics
+        self.workspace, self.x_flat = workspace, x_flat
+
+
+_FAST_ROUTES: dict[tuple[str, int, int, str], _FastRoute] = {}
+
+
+def _fast_route(
+    arch: str, kind: str, rows: int, device_index: int, path: str
+) -> _FastRoute:
+    key = (kind, rows, device_index, path)
+    found = _FAST_ROUTES.get(key)
+    if found is None:
+        found = _build_fast_route(arch, kind, rows, device_index, path)
+        if len(_FAST_ROUTES) >= _CACHE_ENTRIES:
+            _FAST_ROUTES.clear()
+        _FAST_ROUTES[key] = found
+    return found
+
+
+def _build_fast_route(
+    arch: str, kind: str, rows: int, device_index: int, path: str
+) -> _FastRoute:
+    plan = _route_plan(arch, kind, rows, device_index, path)
+    workspace_values = _WORKSPACE_VALUES[kind]
+    names = _CALL_VALUES[kind] + tuple(name for name, _ in workspace_values)
+    position_of = {name: position for position, name in enumerate(names)}
+    host: dict[str, Any] = {"rows": rows}
+    if _HOST_VALUES[kind]:
+        host_plan = _loader.host_plan(rows, _loader.sm_count(device_index), arch)
+        for name in _HOST_VALUES[kind]:
+            host[name] = host_plan[name]
+    statics: list[Any] = []
+    launches = []
+    for launch in plan:
+        logical_at = dict(launch.slots)
+        sources = []
+        for position, value in enumerate(launch.template):
+            logical_name = logical_at.get(position)
+            if logical_name is None:
+                sources.append(len(names) + len(statics))
+                statics.append(value)
+            elif logical_name in position_of:
+                sources.append(position_of[logical_name])
+            elif logical_name in host:
+                sources.append(len(names) + len(statics))
+                statics.append(host[logical_name])
+            else:
+                raise ValueError(
+                    f"the {route_key(HIDDEN, kind)!r} route needs the logical value {logical_name!r}"
+                )
+        launches.append((launch.run, _tuple_getter(sources)))
+    workspace_getter = (
+        _tuple_getter([region for _, region in workspace_values])
+        if workspace_values
+        else None
+    )
+    return _FastRoute(
+        tuple(launches), tuple(statics), workspace_getter, (rows, HIDDEN_TOTAL)
+    )
+
+
+def _tuple_getter(keys: list[Any]) -> Any:
+    """``values -> tuple(values[key] for key in keys)`` (``keys`` non-empty)."""
+
+    if len(keys) > 1:
+        return operator.itemgetter(*keys)
+    key = keys[0]
+    return lambda values: (values[key],)
+
+
+def _launch_route(
+    route: _FastRoute, values: tuple[Any, ...], device_index: int
+) -> None:
+    """Launch ``route`` with its call values (workspace values and statics appended)
+    on the current torch stream of ``device_index``."""
+
+    values += route.statics
+    with _tvm_ffi().use_raw_stream(
+        _tvm_device(device_index), _current_stream(device_index)
+    ):
+        for run, arguments in route.launches:
+            run(*arguments(values))
+
+
 def _run_route(
-    arch: str, kind: str, values: dict[str, Any], *, rows: int, device: torch.device
+    arch: str,
+    kind: str,
+    values: dict[str, Any],
+    *,
+    rows: int,
+    device: torch.device,
+    path: str,
+    sinkhorn_iters: int = SINKHORN_ITERS,
 ) -> None:
     device_index = _device_index(device)
-    plan = _route_plan(arch, kind, rows, device_index)
-    stream = torch.cuda.current_stream(device_index).cuda_stream
+    plan = _route_plan(arch, kind, rows, device_index, path, sinkhorn_iters)
+    stream = _current_stream(device_index)
     with _tvm_ffi().use_raw_stream(_tvm_device(device_index), stream):
         for launch in plan:
             args = launch.template.copy()
@@ -545,6 +934,66 @@ def _run_route(
 
 # ----------------------------------------------------------------------------
 # Entry points
+#
+# Each entry point first tries a fast path: when every input passes the checks
+# of the full path (inlined boolean forms of the same checks, on a device and
+# route the full path has already resolved), it allocates the outputs, fetches
+# the workspace views and launches the route's cached fast plan.  Any input the
+# fast checks do not accept takes the full path, which validates in its own
+# order and raises the error of record.  Both paths launch the same modules
+# with the same arguments.
+
+_FN_SHAPE = (MAPPING_ROWS, HIDDEN_TOTAL)
+_SCALE_SHAPE = (3,)
+_BASE_SHAPE = (MAPPING_ROWS,)
+
+
+def _empty(
+    shape: tuple[int, ...], dtype: torch.dtype, like: torch.Tensor
+) -> torch.Tensor:
+    """A fresh contiguous buffer on ``like``'s device (what :func:`_output` allocates)."""
+
+    return torch.empty(shape, dtype=dtype, device=like.device)
+
+
+def _fast_forward(
+    X: Any,
+    fn: Any,
+    scale: Any,
+    base: Any,
+    rms_eps: Any,
+    hc_eps: Any,
+    sinkhorn_iters: Any,
+    kind: str,
+) -> Optional[tuple[int, int, str]]:
+    """``(rows, device index, architecture)`` when the forward inputs pass every
+    check of the full path, else ``None``."""
+
+    if not _fast_constants(rms_eps, hc_eps, sinkhorn_iters):
+        return None
+    found = _fast_rows(X, kind)
+    if (
+        found is not None
+        and _fast_tensor(fn, _FN_SHAPE, _F32, found[1])
+        and _fast_tensor(scale, _SCALE_SHAPE, _F32, found[1])
+        and _fast_tensor(base, _BASE_SHAPE, _F32, found[1])
+    ):
+        return found
+    return None
+
+
+def _fast_workspace(
+    workspace: Optional[torch.Tensor],
+    kind: str,
+    rows: int,
+    index: int,
+    X: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    if workspace is None:
+        views = _DEFAULT_VIEWS.get((index, kind, rows))
+        if views is not None:
+            return views
+    return _workspace_for(workspace, kind, rows, X.device)
 
 
 def _forward_values(
@@ -559,6 +1008,7 @@ def _forward_values(
     device: torch.device,
     rms_eps: float = RMS_EPS,
     hc_eps: float = HC_EPS,
+    sinkhorn_iters: int = SINKHORN_ITERS,
 ) -> dict[str, Any]:
     plan = _loader.host_plan(
         rows, _loader.sm_count(_device_index(device)), _device_arch(device)
@@ -585,6 +1035,7 @@ def _forward_values(
         "t_pad": plan["t_pad"],
         "rms_eps": float(rms_eps),
         "hc_eps": float(hc_eps),
+        "sinkhorn_iters": int(sinkhorn_iters),
     }
 
 
@@ -620,9 +1071,10 @@ def cake_mhc_train_forward_prepare(
     hc_eps : float
         Coefficient epsilon (default ``1e-6``): a launch argument like ``rms_eps``.
     sinkhorn_iters : int
-        Finite Sinkhorn iteration count (default ``20``): a compile-time constant of
-        the exported programs; a count the export has not delivered raises
-        ``NotImplementedError``.
+        Sinkhorn iteration count, ``1 .. SINKHORN_ITERS_MAX`` (64; default ``20``).
+        The default runs the compiled programs, whose chain is unrolled for it;
+        every other count runs the run-time-count programs of the coefficient and
+        token-owner passes.  A larger count raises ``NotImplementedError``.
     out : torch.Tensor, optional
         Preallocated BF16 ``[T, 4096]`` contiguous ``U``.
     stats_out : torch.Tensor, optional
@@ -642,6 +1094,28 @@ def cake_mhc_train_forward_prepare(
     The launches run on the current torch stream of the tensors' device.
     """
 
+    fast = _fast_forward(
+        X, fn, scale, base, rms_eps, hc_eps, sinkhorn_iters, "fwd_prepare"
+    )
+    if fast is not None:
+        rows, index, arch = fast
+        if (out is None or _fast_tensor(out, (rows, HIDDEN), _BF16, index)) and (
+            stats_out is None
+            or _fast_tensor(stats_out, (rows, STATS_COLS), _F32, index)
+        ):
+            U = _empty((rows, HIDDEN), _BF16, X) if out is None else out
+            stats = (
+                _empty((rows, STATS_COLS), _F32, X) if stats_out is None else stats_out
+            )
+            route = _fast_route(arch, "fwd_prepare", rows, index, _PATH_FORWARD)
+            views = _fast_workspace(workspace, "fwd", rows, index, X)
+            _launch_route(
+                route,
+                (fn, X, X.view(route.x_flat), scale, base, stats, rms_eps, hc_eps, U)
+                + route.workspace(views),
+                index,
+            )
+            return U, stats
     _check_constants(rms_eps, hc_eps, sinkhorn_iters)
     rows, device = _rows_of(X)
     arch = _device_arch(device)
@@ -668,9 +1142,18 @@ def cake_mhc_train_forward_prepare(
         device=device,
         rms_eps=rms_eps,
         hc_eps=hc_eps,
+        sinkhorn_iters=sinkhorn_iters,
     )
     values["u"] = U
-    _run_route(arch, "fwd_prepare", values, rows=rows, device=device)
+    _run_route(
+        arch,
+        "fwd_prepare",
+        values,
+        rows=rows,
+        device=device,
+        path=_PATH_FORWARD,
+        sinkhorn_iters=sinkhorn_iters,
+    )
     return U, stats
 
 
@@ -694,7 +1177,7 @@ def cake_mhc_train_forward_stats(
         As in :func:`cake_mhc_train_forward_prepare`.
     rms_eps, hc_eps, sinkhorn_iters : float, float, int
         As in :func:`cake_mhc_train_forward_prepare` (the epsilons are launch
-        arguments; the iteration count must be a delivered one, default ``20``).
+        arguments; the iteration count is ``1 .. SINKHORN_ITERS_MAX``, default ``20``).
     stats_out : torch.Tensor, optional
         Preallocated FP32 ``[T, 64]`` contiguous statistics record.
     workspace : torch.Tensor, optional
@@ -710,6 +1193,26 @@ def cake_mhc_train_forward_stats(
     The launches run on the current torch stream of the tensors' device.
     """
 
+    fast = _fast_forward(
+        X, fn, scale, base, rms_eps, hc_eps, sinkhorn_iters, "fwd_recompute"
+    )
+    if fast is not None:
+        rows, index, arch = fast
+        if stats_out is None or _fast_tensor(
+            stats_out, (rows, STATS_COLS), _F32, index
+        ):
+            stats = (
+                _empty((rows, STATS_COLS), _F32, X) if stats_out is None else stats_out
+            )
+            route = _fast_route(arch, "fwd_recompute", rows, index, _PATH_CHECKPOINT)
+            views = _fast_workspace(workspace, "fwd", rows, index, X)
+            _launch_route(
+                route,
+                (fn, X, X.view(route.x_flat), scale, base, stats, rms_eps, hc_eps)
+                + route.workspace(views),
+                index,
+            )
+            return stats
     _check_constants(rms_eps, hc_eps, sinkhorn_iters)
     rows, device = _rows_of(X)
     arch = _device_arch(device)
@@ -735,8 +1238,17 @@ def cake_mhc_train_forward_stats(
         device=device,
         rms_eps=rms_eps,
         hc_eps=hc_eps,
+        sinkhorn_iters=sinkhorn_iters,
     )
-    _run_route(arch, "fwd_recompute", values, rows=rows, device=device)
+    _run_route(
+        arch,
+        "fwd_recompute",
+        values,
+        rows=rows,
+        device=device,
+        path=_PATH_CHECKPOINT,
+        sinkhorn_iters=sinkhorn_iters,
+    )
     return stats
 
 
@@ -768,6 +1280,23 @@ def cake_mhc_train_forward_finish(
     The launches run on the current torch stream of the tensors' device.
     """
 
+    fast = _fast_rows(X, "fwd_finish")
+    if fast is not None:
+        rows, index, arch = fast
+        if (
+            _fast_tensor(B, (rows, HIDDEN), _BF16, index)
+            and _fast_tensor(stats, (rows, STATS_COLS), _F32, index)
+            and (
+                out is None or _fast_tensor(out, (rows, STREAMS, HIDDEN), _BF16, index)
+            )
+        ):
+            Y = _empty((rows, STREAMS, HIDDEN), _BF16, X) if out is None else out
+            _launch_route(
+                _fast_route(arch, "fwd_finish", rows, index, _PATH_FORWARD),
+                (X, B, stats, Y),
+                index,
+            )
+            return Y
     rows, device = _rows_of(X)
     arch = _device_arch(device)
     X = _validate_tensor(
@@ -782,7 +1311,7 @@ def cake_mhc_train_forward_finish(
     if rows == 0:
         return Y
     values = {"x": X, "b": B, "stats": stats, "y": Y, "rows": rows}
-    _run_route(arch, "fwd_finish", values, rows=rows, device=device)
+    _run_route(arch, "fwd_finish", values, rows=rows, device=device, path=_PATH_FORWARD)
     return Y
 
 
@@ -822,6 +1351,52 @@ def cake_mhc_train_backward_prepare(
     The launches run on the current torch stream of the tensors' device.
     """
 
+    return _backward_prepare(
+        dY, B, X, stats, dB=dB, grad_stats_out=grad_stats_out, path=_PATH_BACKWARD
+    )
+
+
+def _backward_prepare(
+    dY: torch.Tensor,
+    B: torch.Tensor,
+    X: torch.Tensor,
+    stats: torch.Tensor,
+    *,
+    dB: Optional[torch.Tensor],
+    grad_stats_out: Optional[torch.Tensor],
+    path: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`cake_mhc_train_backward_prepare` along ``path`` (``_PATH_BACKWARD`` from
+    saved statistics, ``_PATH_CHECKPOINT`` after the forward prefix was replayed: the
+    autograd nodes know which): the path fixes the per-call PDL argument of the
+    backward prepare's records (:func:`cake_jit.enable_pdl`)."""
+
+    fast = _fast_rows(X, "bwd_prepare")
+    if fast is not None:
+        rows, index, arch = fast
+        if (
+            _fast_tensor(dY, (rows, STREAMS, HIDDEN), _BF16, index)
+            and _fast_tensor(B, (rows, HIDDEN), _BF16, index)
+            and _fast_tensor(stats, (rows, STATS_COLS), _F32, index)
+            and (dB is None or _fast_tensor(dB, (rows, HIDDEN), _BF16, index))
+            and (
+                grad_stats_out is None
+                or _fast_tensor(grad_stats_out, (rows, GSTATS_COLS), _F32, index)
+            )
+        ):
+            if dB is None:
+                dB = _empty((rows, HIDDEN), _BF16, X)
+            gstats = (
+                _empty((rows, GSTATS_COLS), _F32, X)
+                if grad_stats_out is None
+                else grad_stats_out
+            )
+            _launch_route(
+                _fast_route(arch, "bwd_prepare", rows, index, path),
+                (dY, B, X, stats, dB, gstats),
+                index,
+            )
+            return dB, gstats
     rows, device = _rows_of(X)
     arch = _device_arch(device)
     X = _validate_tensor(
@@ -854,7 +1429,7 @@ def cake_mhc_train_backward_prepare(
         "gstats": gstats,
         "rows": rows,
     }
-    _run_route(arch, "bwd_prepare", values, rows=rows, device=device)
+    _run_route(arch, "bwd_prepare", values, rows=rows, device=device, path=path)
     return dB, gstats
 
 
@@ -902,7 +1477,7 @@ def cake_mhc_train_backward_finish(
         FP32 ``[T, 32]`` record returned by :func:`cake_mhc_train_backward_prepare`.
     rms_eps, hc_eps, sinkhorn_iters : float, float, int
         As in :func:`cake_mhc_train_forward_prepare` (the epsilons are launch
-        arguments; the iteration count must be a delivered one, default ``20``).
+        arguments; the iteration count is ``1 .. SINKHORN_ITERS_MAX``, default ``20``).
     accumulate : bool
         ``False`` (default): ``dfn``, ``dscale`` and ``dbase`` are written.
         ``True``: the caller passes all three and the fixed-order sums are added
@@ -929,6 +1504,106 @@ def cake_mhc_train_backward_finish(
     The launches run on the current torch stream of the tensors' device.
     """
 
+    return _backward_finish(
+        X,
+        dY,
+        dU,
+        B,
+        fn,
+        scale,
+        base,
+        stats,
+        grad_stats,
+        rms_eps=rms_eps,
+        hc_eps=hc_eps,
+        sinkhorn_iters=sinkhorn_iters,
+        accumulate=accumulate,
+        workspace=workspace,
+        dX=dX,
+        dfn=dfn,
+        dscale=dscale,
+        dbase=dbase,
+        path=_PATH_BACKWARD,
+    )
+
+
+def _backward_finish(
+    X: torch.Tensor,
+    dY: torch.Tensor,
+    dU: torch.Tensor,
+    B: Optional[torch.Tensor],
+    fn: torch.Tensor,
+    scale: torch.Tensor,
+    base: torch.Tensor,
+    stats: torch.Tensor,
+    grad_stats: torch.Tensor,
+    *,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    accumulate: bool,
+    workspace: Optional[torch.Tensor],
+    dX: Optional[torch.Tensor],
+    dfn: Optional[torch.Tensor],
+    dscale: Optional[torch.Tensor],
+    dbase: Optional[torch.Tensor],
+    path: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """:func:`cake_mhc_train_backward_finish` along ``path`` (``_PATH_BACKWARD`` from
+    saved statistics, ``_PATH_CHECKPOINT`` after the forward prefix was replayed: the
+    autograd nodes know which): the path fixes the per-call PDL argument of the
+    column-slab and reduction records (:func:`cake_jit.enable_pdl`)."""
+
+    fast = _fast_forward(
+        X, fn, scale, base, rms_eps, hc_eps, sinkhorn_iters, "bwd_finish"
+    )
+    if fast is not None:
+        rows, index, arch = fast
+        if (
+            _fast_tensor(dY, (rows, STREAMS, HIDDEN), _BF16, index)
+            and _fast_tensor(dU, (rows, HIDDEN), _BF16, index)
+            and (B is None or _fast_tensor(B, (rows, HIDDEN), _BF16, index))
+            and _fast_tensor(stats, (rows, STATS_COLS), _F32, index)
+            and _fast_tensor(grad_stats, (rows, GSTATS_COLS), _F32, index)
+            and not (accumulate and (dfn is None or dscale is None or dbase is None))
+            and (dX is None or _fast_tensor(dX, (rows, STREAMS, HIDDEN), _BF16, index))
+            and (dfn is None or _fast_tensor(dfn, _FN_SHAPE, _F32, index))
+            and (dscale is None or _fast_tensor(dscale, _SCALE_SHAPE, _F32, index))
+            and (dbase is None or _fast_tensor(dbase, _BASE_SHAPE, _F32, index))
+        ):
+            if dX is None:
+                dX = _empty((rows, STREAMS, HIDDEN), _BF16, X)
+            if dfn is None:
+                dfn = _empty(_FN_SHAPE, _F32, X)
+            if dscale is None:
+                dscale = _empty(_SCALE_SHAPE, _F32, X)
+            if dbase is None:
+                dbase = _empty(_BASE_SHAPE, _F32, X)
+            route = _fast_route(arch, "bwd_finish", rows, index, path)
+            views = _fast_workspace(workspace, "bwd", rows, index, X)
+            _launch_route(
+                route,
+                (
+                    fn,
+                    X,
+                    dU,
+                    stats,
+                    grad_stats,
+                    scale,
+                    base,
+                    hc_eps,
+                    X.view(route.x_flat),
+                    dY.view(route.x_flat),
+                    dX.view(route.x_flat),
+                    dfn,
+                    dscale,
+                    dbase,
+                    1 if accumulate else 0,
+                )
+                + route.workspace(views),
+                index,
+            )
+            return dX, dfn, dscale, dbase
     _check_constants(rms_eps, hc_eps, sinkhorn_iters)
     rows, device = _rows_of(X)
     arch = _device_arch(device)
@@ -992,6 +1667,7 @@ def cake_mhc_train_backward_finish(
         "t_pad": plan["t_pad"],
         "rows_per_cta": plan["rows_per_cta"],
         "hc_eps": float(hc_eps),
+        "sinkhorn_iters": int(sinkhorn_iters),
         "x_flat": X.view(rows, HIDDEN_TOTAL),
         "dy_flat": dY.view(rows, HIDDEN_TOTAL),
         "dzp_rows": ws["dzp_rows"],
@@ -1006,7 +1682,15 @@ def cake_mhc_train_backward_finish(
         "chunks": plan["chunks"],
         "accumulate": 1 if accumulate else 0,
     }
-    _run_route(arch, "bwd_finish", values, rows=rows, device=device)
+    _run_route(
+        arch,
+        "bwd_finish",
+        values,
+        rows=rows,
+        device=device,
+        path=path,
+        sinkhorn_iters=sinkhorn_iters,
+    )
     return dX, dfn, dscale, dbase
 
 
@@ -1017,16 +1701,21 @@ def cake_mhc_train_backward_finish(
 class _MHCTrainState:
     """What the prepare and finish autograd nodes of one layer application share.
 
-    The parameters (detached), the constants, the workspaces, ``dY`` and
-    ``grad_stats`` (written by the finish node's backward, read by the prepare
-    node's backward) and, transiently, ``stats``: between the prepare and the
-    finish forward, and as the replay cache of the backward under
-    ``save_stats=False`` or of a finish forward rerun by a checkpoint region
-    that starts after the prepare.  Nothing the forward produced stays on the
-    handle once the finish forward has run: ``stats`` travels through
-    ``save_for_backward`` like the inputs, so an activation checkpoint
-    (non-reentrant ``torch.utils.checkpoint``) keeps no tensor of the layer
-    alive.
+    The parameters (detached), the constants, the workspaces and, transiently,
+    ``stats``: between the prepare and the finish forward.  Nothing the forward
+    produced stays on the state once the finish forward has run: ``stats``
+    travels through ``save_for_backward`` like the inputs, so an activation
+    checkpoint (non-reentrant ``torch.utils.checkpoint``) keeps no tensor of the
+    layer alive.
+
+    The finish node's backward hands ``dY``, the gradient statistics and, under
+    ``save_stats=False``, the statistics it replayed to the prepare node's
+    backward on autograd edges (:class:`_MHCTrainHandle`), so the autograd engine
+    releases them once the prepare node's backward has run, however long the
+    graph stays alive.  ``dY``, ``grad_stats`` and ``stats`` carry them on the
+    state only from a finish node without those edges whose prepare node is
+    ``recorded`` (a finish forward rerun by a reentrant checkpoint region that
+    starts after the prepare); the prepare node's backward empties them.
     """
 
     __slots__ = (
@@ -1036,6 +1725,7 @@ class _MHCTrainState:
         "stats",
         "grad_stats",
         "dY",
+        "recorded",
         "save_stats",
         "rms_eps",
         "hc_eps",
@@ -1056,25 +1746,83 @@ class _MHCTrainState:
     ) -> None:
         self.fn = self.scale = self.base = None
         self.stats = self.grad_stats = self.dY = None
+        self.recorded = False
         self.save_stats = bool(save_stats)
         self.rms_eps, self.hc_eps, self.sinkhorn_iters = rms_eps, hc_eps, sinkhorn_iters
         self.workspace, self.backward_workspace = workspace, backward_workspace
 
-    def statistics(self, X: torch.Tensor) -> torch.Tensor:
-        """The saved ``stats``, or the bitwise-identical replay of the forward prefix."""
+    def replay(self, X: torch.Tensor) -> torch.Tensor:
+        """The bitwise-identical replay of the forward prefix's ``stats``."""
 
-        if self.stats is None:
-            self.stats = cake_mhc_train_forward_stats(
-                X,
-                self.fn,
-                self.scale,
-                self.base,
-                rms_eps=self.rms_eps,
-                hc_eps=self.hc_eps,
-                sinkhorn_iters=self.sinkhorn_iters,
-                workspace=self.workspace,
-            )
-        return self.stats
+        return cake_mhc_train_forward_stats(
+            X,
+            self.fn,
+            self.scale,
+            self.base,
+            rms_eps=self.rms_eps,
+            hc_eps=self.hc_eps,
+            sinkhorn_iters=self.sinkhorn_iters,
+            workspace=self.workspace,
+        )
+
+    def take(
+        self,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """``(dY, grad_stats, stats)`` as a finish node without edges left them; the state lets go of them."""
+
+        held = self.dY, self.grad_stats, self.stats
+        self.dY = self.grad_stats = self.stats = None
+        return held
+
+
+class _MHCTrainHandle:
+    """What :func:`cake_mhc_train_prepare` returns beside ``U``: the shared state and the prepare node's edges.
+
+    The edges are extra outputs of the prepare node: one-element, zero-stride
+    tensors shaped like what the finish node's backward hands the prepare node's
+    backward (``dY``, the gradient statistics and, under ``save_stats=False``,
+    the replayed statistics).  The finish forward takes them off the handle as
+    inputs, so that hand-over runs on autograd edges.  The state never holds
+    them: the prepare node's context holds the state, and the edges hold the
+    prepare node.
+    """
+
+    __slots__ = ("state", "edges")
+
+    def __init__(self, state: _MHCTrainState, edges: tuple[torch.Tensor, ...]) -> None:
+        self.state, self.edges = state, edges
+
+
+# The edge stand-ins per (device, token count, save_stats).  No kernel reads or
+# writes an edge, so the edges of every prepare call alias these one-element
+# buffers; each call takes its own tensors (``detach``), so the edges of two
+# connections are distinct autograd outputs, and allocates no memory.
+_EDGES: dict[tuple[torch.device, int, bool], tuple[torch.Tensor, ...]] = {}
+
+
+def _edges(
+    rows: int, device: torch.device, save_stats: bool
+) -> tuple[torch.Tensor, ...]:
+    """One-element, zero-stride stand-ins of BF16 ``dY`` ``[T, 4, 4096]``, the FP32
+    gradient statistics ``[T, 32]`` and, under ``save_stats=False``, the FP32
+    statistics ``[T, 64]``: the prepare node's edge outputs."""
+
+    key = (device, rows, save_stats)
+    edges = _EDGES.get(key)
+    if edges is None:
+        shapes = [((rows, STREAMS, HIDDEN), _BF16), ((rows, GSTATS_COLS), _F32)]
+        if not save_stats:
+            shapes.append(((rows, STATS_COLS), _F32))
+        edges = tuple(
+            torch.empty_strided(shape, (0,) * len(shape), dtype=dtype, device=device)
+            for shape, dtype in shapes
+        )
+        if len(_EDGES) >= _CACHE_ENTRIES:
+            _EDGES.clear()
+        _EDGES[key] = edges
+    if save_stats:
+        return edges[0].detach(), edges[1].detach()
+    return edges[0].detach(), edges[1].detach(), edges[2].detach()
 
 
 def _as_bf16(
@@ -1082,16 +1830,20 @@ def _as_bf16(
 ) -> torch.Tensor:
     if grad is None:
         return torch.zeros(shape, dtype=_BF16, device=device)
+    if grad.dtype is _BF16 and grad.is_contiguous():
+        return grad  # what ``contiguous()`` and ``to()`` return for it
     return grad.contiguous().to(_BF16)
 
 
 class CakeMHCTrainPrepareFunction(torch.autograd.Function):
-    """Autograd node of ``forward_prepare``: ``forward(X, fn, scale, base, state) -> U``.
+    """Autograd node of ``forward_prepare``: ``forward(X, fn, scale, base, state) -> (U, *edges)``.
 
     Its backward is ``backward_finish``: it receives ``dU`` from the external
-    branch and returns the single-cast ``dX`` (mapping, collapse and
-    residual-mixing contributions summed in FP32) and the FP32 parameter
-    gradients; the finish node returns no gradient for ``X``.
+    branch and, as the gradients of the edges (outputs the finish node takes as
+    inputs), ``dY`` and the gradient statistics from the finish node's backward;
+    it returns the single-cast ``dX`` (mapping, collapse and residual-mixing
+    contributions summed in FP32) and the FP32 parameter gradients; the finish
+    node returns no gradient for ``X``.
     """
 
     @staticmethod
@@ -1113,23 +1865,31 @@ class CakeMHCTrainPrepareFunction(torch.autograd.Function):
         else:
             ctx.save_for_backward(X)
         ctx.state = state
-        return U
+        # An output the backward did not reach arrives as ``None``, not as zeros.
+        ctx.set_materialize_grads(False)
+        return (U,) + _edges(X.shape[0], X.device, state.save_stats)
 
     @staticmethod
-    def backward(ctx, dU):
+    def backward(ctx, dU, dY, grad_stats, stats=None):
         X, *saved = ctx.saved_tensors
         state = ctx.state
+        held = state.take()
+        if dY is None:
+            # No edge gradient: a finish node rerun by a reentrant checkpoint left
+            # them on the state, or the finish node's backward never ran (``Y``
+            # did not reach the loss: the residual-mixing path then carries no
+            # gradient).
+            dY, grad_stats, stats = held
         rows = int(X.shape[0])
-        stats = saved[0] if saved else state.statistics(X)
-        # ``Y`` did not reach the loss when the finish node's backward never ran:
-        # the residual-mixing path then carries no gradient.
-        dY = state.dY if state.dY is not None else torch.zeros_like(X)
-        grad_stats = (
-            state.grad_stats
-            if state.grad_stats is not None
-            else torch.zeros((rows, GSTATS_COLS), dtype=_F32, device=X.device)
-        )
-        dX, dfn, dscale, dbase = cake_mhc_train_backward_finish(
+        if saved:
+            stats = saved[0]
+        elif stats is None:
+            stats = state.replay(X)
+        if dY is None:
+            dY = torch.zeros_like(X)
+        if grad_stats is None:
+            grad_stats = torch.zeros((rows, GSTATS_COLS), dtype=_F32, device=X.device)
+        dX, dfn, dscale, dbase = _backward_finish(
             X,
             dY,
             _as_bf16(dU, shape=(rows, HIDDEN), device=X.device),
@@ -1142,23 +1902,33 @@ class CakeMHCTrainPrepareFunction(torch.autograd.Function):
             rms_eps=state.rms_eps,
             hc_eps=state.hc_eps,
             sinkhorn_iters=state.sinkhorn_iters,
+            accumulate=False,
             workspace=state.backward_workspace,
+            dX=None,
+            dfn=None,
+            dscale=None,
+            dbase=None,
+            path=_PATH_BACKWARD if saved else _PATH_CHECKPOINT,
         )
         return dX, dfn, dscale, dbase, None
 
 
 class CakeMHCTrainFinishFunction(torch.autograd.Function):
-    """Autograd node of ``forward_finish``: ``forward(X, B, state) -> Y``.
+    """Autograd node of ``forward_finish``: ``forward(X, B, state, *edges) -> Y``.
 
     Its backward is ``backward_prepare``: it returns ``dB`` for the external
-    branch and leaves ``dY`` and the gradient statistics in the shared state for
-    the prepare node, which runs after the branch backward.  When a checkpoint
-    region that starts after the prepare reruns this forward, the statistics
-    the handle already released are replayed bitwise from ``X``.
+    branch and hands ``dY`` and the gradient statistics (under
+    ``save_stats=False`` also the statistics it replayed) to the prepare node as
+    the gradients of ``edges``, the prepare node's edge outputs, so the autograd
+    engine releases them once the prepare node's backward has run.  When a
+    checkpoint region that starts after the prepare reruns this forward, the
+    statistics the state already released are replayed bitwise from ``X``; a
+    reentrant region reruns it without the edges, and its backward leaves them
+    on the state for the prepare node instead.
     """
 
     @staticmethod
-    def forward(ctx, X, B, state):
+    def forward(ctx, X, B, state, *edges):
         stats = state.stats
         if stats is None:
             if state.fn is None:
@@ -1166,15 +1936,15 @@ class CakeMHCTrainFinishFunction(torch.autograd.Function):
                     "cake_mhc_train_finish needs the state of a preceding cake_mhc_train_prepare"
                 )
             # Replay: a checkpoint region that starts after the prepare reruns the
-            # finish on a handle that already released its statistics; recompute
-            # them bitwise from ``X`` (released again below).
-            stats = state.statistics(X)
+            # finish on a state that already released its statistics; recompute
+            # them bitwise from ``X``.
+            stats = state.replay(X)
         Y = cake_mhc_train_forward_finish(X, B, stats)
         if state.save_stats:
             ctx.save_for_backward(X, B, stats)
         else:
             ctx.save_for_backward(X, B)
-        state.stats = None  # nothing of the forward stays on the handle
+        state.stats = None  # nothing of the forward stays on the state
         ctx.state = state
         return Y
 
@@ -1182,11 +1952,28 @@ class CakeMHCTrainFinishFunction(torch.autograd.Function):
     def backward(ctx, dY):
         X, B, *saved = ctx.saved_tensors
         state = ctx.state
-        stats = saved[0] if saved else state.statistics(X)
+        stats = saved[0] if saved else state.replay(X)
         dY = _as_bf16(dY, shape=(X.shape[0], STREAMS, HIDDEN), device=X.device)
-        dB, grad_stats = cake_mhc_train_backward_prepare(dY, B, X, stats)
-        state.dY, state.grad_stats = dY, grad_stats
-        return None, dB, None
+        dB, grad_stats = _backward_prepare(
+            dY,
+            B,
+            X,
+            stats,
+            dB=None,
+            grad_stats_out=None,
+            path=_PATH_BACKWARD if saved else _PATH_CHECKPOINT,
+        )
+        handed = (dY, grad_stats) if saved else (dY, grad_stats, stats)
+        edges = len(ctx.needs_input_grad) - 3
+        if edges and ctx.needs_input_grad[3]:
+            return (None, dB, None, *handed)
+        if state.recorded:
+            # No edge reaches the prepare node (a finish rerun by a reentrant
+            # checkpoint): its backward takes them off the state.
+            state.dY, state.grad_stats = dY, grad_stats
+            if not saved:
+                state.stats = stats
+        return (None, dB, None) + (None,) * edges
 
 
 def cake_mhc_train_prepare(
@@ -1201,7 +1988,7 @@ def cake_mhc_train_prepare(
     save_stats: bool = True,
     workspace: Optional[torch.Tensor] = None,
     backward_workspace: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, _MHCTrainState]:
+) -> tuple[torch.Tensor, _MHCTrainHandle]:
     """Autograd-enabled ``forward_prepare``: ``(U, handle)``; pass ``handle`` to :func:`cake_mhc_train_finish`.
 
     Parameters
@@ -1210,7 +1997,7 @@ def cake_mhc_train_prepare(
         As in :func:`cake_mhc_train_forward_prepare` (``X`` and the parameters may require gradients).
     rms_eps, hc_eps, sinkhorn_iters : float, float, int
         As in :func:`cake_mhc_train_forward_prepare` (the epsilons are launch
-        arguments; the iteration count must be a delivered one, default ``20``).
+        arguments; the iteration count is ``1 .. SINKHORN_ITERS_MAX``, default ``20``).
     save_stats : bool
         ``True`` (default): the per-token statistics are saved for the backward
         through the autograd saved tensors (an activation checkpoint frees and
@@ -1222,7 +2009,8 @@ def cake_mhc_train_prepare(
 
     Returns
     -------
-    ``(U, handle)``: BF16 ``U`` and the state object shared with the finish node.
+    ``(U, handle)``: BF16 ``U`` and the handle of this prepare node for one
+    :func:`cake_mhc_train_finish`.
     """
 
     state = _MHCTrainState(
@@ -1233,12 +2021,15 @@ def cake_mhc_train_prepare(
         workspace=workspace,
         backward_workspace=backward_workspace,
     )
-    U = CakeMHCTrainPrepareFunction.apply(X, fn, scale, base, state)
-    return U, state
+    out = CakeMHCTrainPrepareFunction.apply(X, fn, scale, base, state)
+    U = out[0]
+    # ``U`` requires grad exactly when the prepare node was recorded.
+    state.recorded = U.requires_grad
+    return U, _MHCTrainHandle(state, out[1:] if state.recorded else ())
 
 
 def cake_mhc_train_finish(
-    X: torch.Tensor, B: torch.Tensor, handle: _MHCTrainState
+    X: torch.Tensor, B: torch.Tensor, handle: _MHCTrainHandle
 ) -> torch.Tensor:
     """Autograd-enabled ``forward_finish``: ``Y`` from ``X``, the branch output ``B`` and the prepare ``handle``.
 
@@ -1249,16 +2040,21 @@ def cake_mhc_train_finish(
     B : torch.Tensor
         BF16 ``[T, 4096]`` output of the external branch applied to ``U`` (may require gradients).
     handle : object
-        The state returned by :func:`cake_mhc_train_prepare`.
+        The handle returned by :func:`cake_mhc_train_prepare`, for one finish.  A
+        reentrant checkpoint region (``use_reentrant=True``) holds both calls or
+        starts after the prepare; it does not end between them.
 
     Returns
     -------
     BF16 ``Y`` of shape ``[T, 4, 4096]``.
     """
 
-    if not isinstance(handle, _MHCTrainState):
-        raise TypeError("handle must be the state returned by cake_mhc_train_prepare")
-    return CakeMHCTrainFinishFunction.apply(X, B, handle)
+    if not isinstance(handle, _MHCTrainHandle):
+        raise TypeError("handle must be the handle returned by cake_mhc_train_prepare")
+    # The forward takes the edges off the handle: the handle then holds nothing of
+    # the prepare node, and a checkpoint rerun of this call runs without them.
+    edges, handle.edges = handle.edges, ()
+    return CakeMHCTrainFinishFunction.apply(X, B, handle.state, *edges)
 
 
 __all__ = [

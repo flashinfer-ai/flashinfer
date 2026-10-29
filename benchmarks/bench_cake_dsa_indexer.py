@@ -31,6 +31,12 @@ peaked variant):
   ``S4_peaked``; ``C1`` / ``C2`` context-parallel tails (4096 queries over 64k /
   128k keys); ``C3`` eight packed 2048 x 32768 segments; ``V1`` (``ratio = 2``),
   ``V2`` (top-k 256), ``V3`` (top-k 4096) at ``N = 65536``;
+* the top-512 rows of flashinfer-ai/flashinfer#7549 (its ratio-4 pooled
+  selection: top-512 pools over a 4-token pool layout, ``ratio = 4`` with the
+  keys pooled 4:1): ``V4`` the packed 4k .. 64k documents of ``Z3cp`` (zigzag
+  rank 0 of 16) pooled, ``V5`` the packed documents of ``Z3`` (full causal)
+  pooled, ``V6`` one 262144-token document pooled, and ``V7`` one 65536-token
+  document at top-k 512 without pooling; ``--rows pool`` names the group;
 * the attention-sink + local-band rows of flashinfer-ai/flashinfer#7042
   (``tests/test_helpers/cake_dsa_indexer_reference.make_sink_inputs``, the
   issue's generator): ``Z1`` one 262144-token document, context-parallel
@@ -46,7 +52,11 @@ outputs and workspace), ``cake_nosample`` (the same runner with
 ``sample_tiles_max=0``: the sampled first threshold off, same programs, same
 bits), ``cake_far`` (the same runner with ``far_sample=1``: the sampled first
 threshold ranks the far sample tiles only, same programs, same bits),
-``cake_wide`` / ``cake_l6`` / ``cake_pair_l6`` / ``cake_wide_c1`` /
+``cake_floor16k`` (forced dispatch: the record's 16384-slot
+capacity floor on every ``top_k``, ``cand_cap_floor_rule`` None -- the plan
+of the package before the top_k-keyed floor on ``sm_100a``, in this build --
+the record itself on ``sm_103a``; its ``_aa`` twin
+``cake_floor16k_aa``), ``cake_wide`` / ``cake_l6`` / ``cake_pair_l6`` / ``cake_wide_c1`` /
 ``cake_narrow`` and their ``_nosample`` twins (forced
 dispatch: the local package under the device's registry record with a rule
 replaced -- ``cake_wide`` drops ``l6_rule`` and ``pair_rule`` (the
@@ -294,6 +304,55 @@ ROWS["S6sink"] = _sink(
     [262144], [262144], note="one 262k causal document, sink statistics"
 )
 SINK_ROWS = [n for n in ROWS if n not in IID_ROWS]
+
+
+def pooled(seg_q, seg_k, offsets=None, ratio=4):
+    """The ``ratio``:1 pooled key layout of a geometry (flashinfer-ai/flashinfer#7549's ratio-4 pooled selection): every
+    key segment shrinks to its pool count (``ceil(Lk / ratio)``) and the segment offsets stay in query tokens (query ``u``
+    of a segment with offset ``o`` sees the pools ``j < floor((o + u + 1) / ratio)``); ``ratio > 1`` makes the default
+    offset 0, so a context-parallel chunk passes its token offset explicitly."""
+    return [-(-v // ratio) for v in seg_k], offsets
+
+
+def cp_zigzag_rank0_offsets(length, parts=16):
+    """The token offsets of ``cp_zigzag_rank0``'s two chunks: 0 for the head chunk, ``length - c`` for the tail chunk."""
+    return [0, length - length // (2 * parts)]
+
+
+_POOL_RATIO = 4
+_Z3CP_POOL_K, _Z3CP_POOL_OFF = pooled(
+    [v for n in _PACK for v in cp_zigzag_rank0(n)[0]],
+    [v for n in _PACK for v in cp_zigzag_rank0(n)[1]],
+    offsets=[o for n in _PACK for o in cp_zigzag_rank0_offsets(n)],
+)
+ROWS["V4"] = _row(
+    [v for n in _PACK for v in cp_zigzag_rank0(n)[0]],
+    _Z3CP_POOL_K,
+    top_k=512,
+    ratio=_POOL_RATIO,
+    offsets=_Z3CP_POOL_OFF,
+    seed=7604,
+    reps=40,
+    note="packed 4k-64k documents, CP16 zigzag rank 0, 4-token pools, top-k 512 (#7549 pooled selection)",
+)
+ROWS["V5"] = _row(
+    list(_PACK),
+    pooled(list(_PACK), list(_PACK))[0],
+    top_k=512,
+    ratio=_POOL_RATIO,
+    seed=7605,
+    note="packed 4k-64k documents, full causal, 4-token pools, top-k 512",
+)
+ROWS["V6"] = _row(
+    [262144],
+    pooled([262144], [262144])[0],
+    top_k=512,
+    ratio=_POOL_RATIO,
+    seed=7606,
+    note="one 262k document, 4-token pools, top-k 512",
+)
+ROWS["V7"] = _row([65536], [65536], top_k=512, seed=7607, note="N = 65536, top-k 512")
+POOL_ROWS = ["V4", "V5", "V6", "V7"]
 ROWS["smoke"] = _row(
     [200, 300, 500],
     [200, 3000, 1000],
@@ -311,11 +370,16 @@ ROWS["smoke_p1"] = _row(
     note="P1 pattern / 16",
 )
 DEFAULT_ROWS = [n for n in ROWS if not n.startswith("smoke")]
-ROW_GROUPS = {"iid": IID_ROWS, "sink": SINK_ROWS, "all": DEFAULT_ROWS}
+ROW_GROUPS = {
+    "iid": IID_ROWS,
+    "sink": SINK_ROWS,
+    "pool": POOL_ROWS,
+    "all": DEFAULT_ROWS,
+}
 
 
 def expand_rows(names):
-    """``--rows`` with the group names ``iid`` / ``sink`` / ``all`` expanded, in order, without repeats."""
+    """``--rows`` with the group names ``iid`` / ``sink`` / ``pool`` / ``all`` expanded, in order, without repeats."""
     out = []
     for name in names:
         for row in ROW_GROUPS.get(name, [name]):
@@ -783,6 +847,10 @@ PAIR_L6 = {
 WIDE_C1 = {"l6_rule": None, "pair_rule": None, "wide_rule": [1.0, 0.0]}
 # forced narrow: no l6, no pair, and a wide rule no call can meet (the single-warpgroup narrow program on every row)
 NARROW = {"l6_rule": None, "pair_rule": None, "wide_rule": [1e18, 1e18]}
+# the 16384-slot capacity floor on every top_k (no top_k-keyed floor rule): the plan of the package before the rule, so on
+# sm_100a a top_k <= 512 row runs the same programs with twice the candidate buffers (the same bits) in this build; the
+# sm_103a record carries this floor already (there the arm is a second A/A twin)
+FLOOR16K = {"cand_cap_floor": 16384, "cand_cap_floor_rule": None}
 
 
 def _cake(name, backend=None, knobs=None, policy=None):
@@ -806,7 +874,9 @@ def _cake(name, backend=None, knobs=None, policy=None):
 # and CTA-pair rules (the single-CTA wide program), ``cake_l6`` without the CTA-pair and wide-first rules,
 # ``cake_pair_l6`` with both unit rules widened to 1024 mean unit tiles and no wide-first rule, ``cake_wide_c1`` the wide
 # program from one round, ``cake_narrow`` the narrow program -- so the same bits are expected against ``cake`` /
-# ``cake_nosample`` while the programs (``plan``) differ.
+# ``cake_nosample`` while the programs (``plan``) differ.  ``cake_floor16k`` / ``cake_floor16k_aa`` run the local package
+# under the 16384-slot floor on every top_k (the record before ``cand_cap_floor_rule``): the same programs, twice the
+# candidate buffers on sm_100a's top_k <= 512 rows (the sm_103a record keeps that floor), the same bits.
 ARMS = {
     "cake": _cake("cake"),
     "cake_nosample": _cake("cake_nosample", knobs=NOSAMPLE),
@@ -832,6 +902,8 @@ ARMS = {
     "cake_narrow_nosample": _cake(
         "cake_narrow_nosample", knobs=NOSAMPLE, policy=NARROW
     ),
+    "cake_floor16k": _cake("cake_floor16k", policy=FLOOR16K),
+    "cake_floor16k_aa": _cake("cake_floor16k_aa", policy=FLOOR16K),
     ChunkedPipelineArm.name: ChunkedPipelineArm,
     MaterializedArm.name: MaterializedArm,
 }
@@ -1115,7 +1187,7 @@ def main():
         raise SystemExit(f"unknown arms {unknown}; known: {sorted(ARMS)}")
     if len(set(arms)) != len(arms):
         raise SystemExit(
-            f"an arm may be named once; use cake_aa / cake_far_aa / cake_main_aa for an A/A pair: {arms}"
+            f"an arm may be named once; use cake_aa / cake_far_aa / cake_main_aa / cake_floor16k_aa for an A/A pair: {arms}"
         )
     args.rows = expand_rows(args.rows)
     unknown_rows = [r for r in args.rows if r not in ROWS]

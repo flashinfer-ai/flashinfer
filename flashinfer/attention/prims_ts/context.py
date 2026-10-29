@@ -185,7 +185,6 @@ class _ContextPlanState:
     variable_window_cta_starts: torch.Tensor
     compiled: Callable[..., None]
     policy: tuple[tuple[str, object], ...]
-    # Expected shapes of the VC run operands, checked by a validating run.
     vc_scale_shapes: Optional[dict[str, tuple[int, ...]]] = None
     # Output scale of VC runs: the per-channel V scale times the planned or passed scale.
     vc_output_scale: Optional[torch.Tensor] = None
@@ -268,7 +267,6 @@ class _ContextCompileSpec:
     scheduler: _ContextScheduler
     head_dim_vo: int | None = None
     two_cta_umma: bool = False
-    # VC-Attention recipe of the plan. None compiles the plain kernel.
     vc: Optional[VCAttentionConfig] = None
     # A Sage plan's prepared scale layout; the kernel reads the scales.
     sage_scale_layout: _SageScaleLayout | None = None
@@ -316,6 +314,8 @@ def _make_context_kernel(
     scheduler: _ContextScheduler,
     uses_ldtm_stat: bool,
     fp8_psmem_early_token: bool = False,
+    kv_ring_stages: int = 0,
+    umma_fp8_k64: bool = False,
     two_cta_umma: bool = False,
     page_size: int | None = None,
     max_kv_len: int | None = None,
@@ -329,19 +329,15 @@ def _make_context_kernel(
     from .kernels.fmha_context.fmha_kernel import FmhaTs
 
     use_paged_kv = page_size is not None
-    if use_paged_kv != (max_kv_len is not None):
+    if use_paged_kv and max_kv_len is None:
         raise ValueError("paged context requires both page geometry values")
     is_persistent = scheduler != "nonpersistent"
     is_clc_dynamic = scheduler == "clc_dynamic_persistent"
     paged_kwargs = (
-        {
-            "use_paged_kv": True,
-            "num_tokens_per_page": page_size,
-            "max_kv_len": max_kv_len,
-        }
-        if use_paged_kv
-        else {}
+        {"use_paged_kv": True, "num_tokens_per_page": page_size} if use_paged_kv else {}
     )
+    if max_kv_len is not None:
+        paged_kwargs["max_kv_len"] = max_kv_len
     fmha = FmhaTs(
         qk_acc_dtype=cutlass.Float32,
         pv_acc_dtype=cutlass.Float32,
@@ -352,6 +348,8 @@ def _make_context_kernel(
         d_v=head_dim_vo,
         is_persistent=is_persistent,
         fp8_psmem_early_token=fp8_psmem_early_token,
+        kv_ring_stages=kv_ring_stages,
+        umma_fp8_k64=umma_fp8_k64,
         two_cta_umma=two_cta_umma,
         is_causal=mask_type == "causal",
         has_variable_window=mask_type == "variable_window",
@@ -573,22 +571,58 @@ def _default_exp2_fma_pairs(device_index: int, cfg) -> int:
     return 2 if cfg.single_qkv_instance else 0
 
 
+def _default_exp2_packed_f16x2(device_index: int, cfg) -> bool:
+    """Softmax exp2 as one packed f16x2 MUFU op per score pair, on for the SM107
+    paths with 8-bit V. SM100 and SM103 split the packed op into two MUFU ops and
+    keep the scalar form."""
+    return (
+        torch.cuda.get_device_capability(device_index) == (10, 7)
+        and cfg.v_dtype.width == 8
+    )
+
+
+def _default_kv_ring_stages(device_index: int, qk_bits: int, pv_bits: int) -> int:
+    """K/V ring depth of the SM107 dense paths with 8-bit V, 0 elsewhere for the
+    budget-derived depth. Deeper rings stall the softmax P stores behind the TMA
+    fills, so the fp8 K ring stops at 6 stages, and the bf16 K ring takes the 4
+    stages the larger SM107 shared memory fits."""
+    if torch.cuda.get_device_capability(device_index) == (10, 7) and pv_bits == 8:
+        return 6 if qk_bits == 8 else 4
+    return 0
+
+
+def _default_umma_fp8_k64(device_index: int, qk_bits: int) -> bool:
+    """K=64 fp8 UMMA instructions for the PV of the SM107 bf16-QK paths. The
+    fp8-QK paths are shared-memory-port bound on operand fetch and keep K=32."""
+    return torch.cuda.get_device_capability(device_index) == (10, 7) and qk_bits == 16
+
+
 def _default_fp8_psmem_early_token(device_index: int) -> bool:
     """Release the S0/S1 token early on the fp8 SMEM-P path, on for SM103."""
     return torch.cuda.get_device_capability(device_index) == (10, 3)
 
 
-def _default_two_cta_umma(device_index: int) -> bool:
-    """Two-CTA UMMA for the dense paired D128 context kernel: on for SM103, where the
-    kernel is tensor-pipe bound and halving UMMA issues and K/V traffic per SM pays."""
-    return torch.cuda.get_device_capability(device_index) == (10, 3)
+def _default_two_cta_umma(device_index: int, qk_bits: int) -> bool:
+    """Two-CTA UMMA for the dense paired D128 context kernel. On for SM103, where
+    the kernel is tensor-pipe bound and halving the UMMA issues and the K/V
+    traffic per SM pays. On SM107 only for bf16 QK, which is shared-memory-port
+    bound on operand fetch, since fp8 QK is slower with it."""
+    capability = torch.cuda.get_device_capability(device_index)
+    if capability == (10, 3):
+        return True
+    return capability == (10, 7) and qk_bits == 16
 
 
-def _default_uses_ldtm_stat(device_index: int) -> bool:
-    """Enable LDTM.STAT where the shared tcgen05 gate allows it."""
+def _default_uses_ldtm_stat(device_index: int, qk_bits: int, pv_bits: int) -> bool:
+    """Enable LDTM.STAT where the shared tcgen05 gate allows it. SM107 keeps it
+    off for the dense QK-BF16 PV-FP8 path, which is faster with the register
+    row max."""
     from .kernels.tcgen05_compat import ldtm_stat_supported
 
-    return ldtm_stat_supported(torch.cuda.get_device_capability(device_index))
+    capability = torch.cuda.get_device_capability(device_index)
+    if capability == (10, 7) and qk_bits == 16 and pv_bits == 8:
+        return False
+    return ldtm_stat_supported(capability)
 
 
 def _resolve_cuda_device(
@@ -1559,7 +1593,11 @@ def _make_context_scheduler_probe(
         has_q_offset=geometry.has_q_offset,
         causal_single_kv_tile=causal_single_kv_tile,
         scheduler="static_persistent",
-        uses_ldtm_stat=_default_uses_ldtm_stat(geometry.device_index),
+        uses_ldtm_stat=_default_uses_ldtm_stat(
+            geometry.device_index,
+            geometry.qk_dtype.itemsize * 8,
+            geometry.pv_dtype.itemsize * 8,
+        ),
         page_size=page_size,
         max_kv_len=max_kv_len,
     )
@@ -1669,11 +1707,29 @@ def _two_cta_umma_geometry_eligible(geometry: _ContextPlanGeometry) -> bool:
     The two-CTA launch is non-persistent with heads on grid Y and batch on
     grid Z. CUDA limits grid Y and Z to 65,535. Oversized geometries keep the
     persistent flattened grid so the valid int32 plans stay launchable."""
-    # VC-Attention always runs two-CTA. With P in SMEM, the bf16 K ring,
+    # VC-Attention-QK16 always runs two-CTA. With P in SMEM, the bf16 K ring,
     # tile-mean ring and row-sum operands leave room for one K/V stage per CTA
     # at one CTA and three in the halved form. The VC tail needs two.
+    # VC-Attention-QK8 keeps the E4M3 K ring and follows the device default.
+    vc_qk16 = geometry.vc is not None and geometry.qk_dtype != torch.float8_e4m3fn
+    two_cta = _default_two_cta_umma(
+        geometry.device_index, geometry.qk_dtype.itemsize * 8
+    )
+    if two_cta and torch.cuda.get_device_capability(geometry.device_index) == (10, 7):
+        # Pairs are coarser work units. Keep them only where they fill their
+        # waves at least as well as single CTAs fill theirs.
+        sms = torch.cuda.get_device_properties(
+            geometry.device_index
+        ).multi_processor_count
+        tiles = math.ceil(geometry.max_seq_len_q / (2 * _CONTEXT_TILE_SIZE_Q))
+        heads = geometry.batch_size * geometry.num_qo_heads
+        single_waves = heads * tiles / sms
+        pair_waves = heads * math.ceil(tiles / 2) / (sms // 2)
+        two_cta = pair_waves / math.ceil(pair_waves) >= single_waves / math.ceil(
+            single_waves
+        )
     return (
-        (_default_two_cta_umma(geometry.device_index) or geometry.vc is not None)
+        (two_cta or vc_qk16)
         and geometry.head_dim == 128
         and geometry.head_dim_vo in (None, 128)
         and geometry.mask_type == "dense"
@@ -1912,6 +1968,7 @@ def _get_compiled_context(
     two_cta_umma = compile_spec.two_cta_umma
     vc_attention = compile_spec.vc is not None
     sage_scale_layout = compile_spec.sage_scale_layout
+    vc_qk8 = vc_attention and qk_dtype_key == "float8_e4m3fn"
 
     import cutlass
     import cutlass.cute as cute
@@ -1945,20 +2002,39 @@ def _get_compiled_context(
         causal_single_kv_tile=causal_single_kv_tile,
         scheduler=scheduler,
         two_cta_umma=two_cta_umma,
-        uses_ldtm_stat=_default_uses_ldtm_stat(device_index),
+        uses_ldtm_stat=_default_uses_ldtm_stat(
+            device_index, input_qk_dtype.width, input_pv_dtype.width
+        ),
         fp8_psmem_early_token=_default_fp8_psmem_early_token(device_index),
+        kv_ring_stages=_default_kv_ring_stages(
+            device_index, input_qk_dtype.width, input_pv_dtype.width
+        ),
+        umma_fp8_k64=_default_umma_fp8_k64(device_index, input_qk_dtype.width),
         vc_attention=("means" if compile_spec.vc.demean else "outliers")
         if vc_attention
         else None,
         sage_scale_layout=sage_scale_layout,
+        # The QK8 K-scale table is sized from the K/V rows of the fixed plan.
+        max_kv_len=_fixed_kv_rows(max_seq_len_k, compile_spec.vc) if vc_qk8 else None,
     )
+    if vc_attention and torch.cuda.get_device_capability(device_index) == (10, 7):
+        raise ValueError(
+            "vc_config is not supported on SM107, where the dense fp8 kernel runs "
+            "the softmax exp2 natively"
+        )
     fmha.cfg.has_varlen = packed
     fmha.cfg.has_uniform_varlen = uniform_packed_lengths
+    if vc_qk8:
+        # The QK8 scale tables are addressed with the fixed plan lengths, the K/V
+        # rows including the repair tiles.
+        fmha.cfg.uniform_seq_len_q = max_seq_len_q
+        fmha.cfg.uniform_seq_len_k = _fixed_kv_rows(max_seq_len_k, compile_spec.vc)
     if uniform_packed_lengths:
         fmha.cfg.uniform_seq_len_q = max_seq_len_q
         fmha.cfg.uniform_seq_len_k = max_seq_len_k
     fmha.cfg.has_q_offset = has_q_offset
     fmha.cfg.exp2_fma_pairs = _default_exp2_fma_pairs(device_index, fmha.cfg)
+    fmha.cfg.exp2_packed_f16x2 = _default_exp2_packed_f16x2(device_index, fmha.cfg)
     if fmha.cfg.kv_tile_n != _CONTEXT_KV_TILE_N:
         raise RuntimeError(
             "context packed-K specialization assumes kv_tile_n="
@@ -1983,6 +2059,8 @@ def _get_compiled_context(
         variable_window_token_ends: cute.Tensor,
         variable_window_cta_starts: cute.Tensor,
         vc_mu: cute.Tensor | None,
+        vc_q_scale: cute.Tensor | None,
+        vc_k_scale: cute.Tensor | None,
         sage_scales: cute.Tensor | None,
         stream: cuda_drv.CUstream,
         static_max_active_clusters: cutlass.Constexpr[int],
@@ -2011,6 +2089,8 @@ def _get_compiled_context(
                 variable_window_token_ends=variable_window_token_ends,
                 variable_window_cta_starts=variable_window_cta_starts,
                 vc_mu=vc_mu,
+                vc_q_scale=vc_q_scale,
+                vc_k_scale=vc_k_scale,
                 vc_repair_tiles=static_vc_repair_tiles,
             )
         else:
@@ -2027,6 +2107,8 @@ def _get_compiled_context(
                 variable_window_token_ends=variable_window_token_ends,
                 variable_window_cta_starts=variable_window_cta_starts,
                 vc_mu=vc_mu,
+                vc_q_scale=vc_q_scale,
+                vc_k_scale=vc_k_scale,
                 vc_repair_tiles=static_vc_repair_tiles,
                 sage_scales=sage_scales,
             )
@@ -2095,19 +2177,35 @@ def _get_compiled_context(
         cutlass.Int32, variable_window_cta_shape, 4
     )
     vc_mu_fake = None
+    vc_q_scale_fake = None
+    vc_k_scale_fake = None
     if vc_attention:
         if packed:
             raise RuntimeError("VC-Attention context requires fixed tensors")
+        # The plan fixes every VC operand shape, so the kernel addresses the
+        # tile means and the Q and K scale tables with compile-time extents.
+        vc_shapes = vc_scale_shapes(
+            compile_spec.vc,
+            batch_size=batch_size,
+            seq_len_kv=max_seq_len_k,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim_vo or head_dim,
+            seq_len_q=max_seq_len_q,
+            num_qo_heads=num_qo_heads,
+            qk_fp8=vc_qk8,
+        )
         if compile_spec.vc.demean:
-            vc_mu_fake = fake_compact(
-                cutlass.BFloat16,
-                vc_scale_shapes(
-                    compile_spec.vc,
-                    batch_size=batch_size,
-                    seq_len_kv=max_seq_len_k,
-                    num_kv_heads=num_kv_heads,
-                    head_dim=head_dim_vo or head_dim,
-                )["tile_means"],
+            vc_mu_fake = fake_compact(cutlass.BFloat16, vc_shapes["tile_means"], 16)
+        if vc_qk8:
+            # The kernel reads the Q and K scale tables as one row of blocks per head.
+            vc_q_scale_fake = fake_compact(
+                cutlass.Float32,
+                (num_qo_heads, batch_size * vc_shapes["q_scale"][2]),
+                16,
+            )
+            vc_k_scale_fake = fake_compact(
+                cutlass.Float32,
+                (num_kv_heads, batch_size * vc_shapes["k_scale"][2]),
                 16,
             )
     # The prepared Sage scales span ``batch * Hkv`` sequences, so their length
@@ -2137,6 +2235,8 @@ def _get_compiled_context(
             variable_window_ends_fake,
             variable_window_cta_starts_fake,
             vc_mu_fake,
+            vc_q_scale_fake,
+            vc_k_scale_fake,
             sage_scales_fake,
             stream_fake,
             max_active_clusters,
@@ -2220,8 +2320,14 @@ def _get_compiled_paged_context(
         has_q_offset=has_q_offset,
         causal_single_kv_tile=False,
         scheduler=scheduler,
-        uses_ldtm_stat=_default_uses_ldtm_stat(device_index),
+        uses_ldtm_stat=_default_uses_ldtm_stat(
+            device_index, input_qk_dtype.width, input_pv_dtype.width
+        ),
         fp8_psmem_early_token=_default_fp8_psmem_early_token(device_index),
+        kv_ring_stages=_default_kv_ring_stages(
+            device_index, input_qk_dtype.width, input_pv_dtype.width
+        ),
+        umma_fp8_k64=_default_umma_fp8_k64(device_index, input_qk_dtype.width),
         page_size=page_size,
         max_kv_len=max_kv_len,
     )
@@ -2232,6 +2338,7 @@ def _get_compiled_paged_context(
         fmha.cfg.uniform_seq_len_k = max_kv_len
     fmha.cfg.has_q_offset = has_q_offset
     fmha.cfg.exp2_fma_pairs = _default_exp2_fma_pairs(device_index, fmha.cfg)
+    fmha.cfg.exp2_packed_f16x2 = _default_exp2_packed_f16x2(device_index, fmha.cfg)
     fmha.cfg.paged_v_tail_is_zero = paged_v_tail_is_zero
     if fmha.cfg.kv_tile_n != _CONTEXT_KV_TILE_N:
         raise RuntimeError(
@@ -2744,8 +2851,11 @@ class BatchPrefillTSWrapper:
     ) -> None:
         """Compile one reusable specialization from explicit static geometry.
 
-        ``vc_config`` selects the VC-Attention recipe. Q and K stay bf16
-        and V is E4M3, stored as per-128-token-tile residuals whose bf16 tile
+        ``vc_config`` selects a VC-Attention recipe and the planned Q/K dtype
+        picks its Q/K side. bf16 Q/K runs VC-Attention-QK16 and E4M3
+        Q/K runs VC-Attention-QK8, whose Hadamard-rotated, per-block scaled Q
+        and K need ``vc.q_scale`` and ``vc.k_scale`` on every :meth:`run`. V is
+        E4M3 in both, stored as per-128-token-tile residuals whose bf16 tile
         means the kernel restores. Every :meth:`run` then supplies the permuted
         K, the E4M3 V and ``vc=VCAttentionParams(...)``.
 
@@ -2800,8 +2910,9 @@ class BatchPrefillTSWrapper:
         output_scale : float
             Scale applied to the attention output.
         vc_config : VCAttentionConfig, optional
-            The VC-Attention recipe. Requires fixed dense tensors, head_dim
-            128, equal Q and K/V head counts, bf16 Q/K and E4M3 V.
+            A VC-Attention recipe. Requires fixed dense tensors, head_dim 128,
+            equal Q and K/V head counts and E4M3 V. bf16 Q/K selects
+            VC-Attention-QK16, E4M3 Q/K selects VC-Attention-QK8.
         sage : SageAttentionConfig, optional
             Sage attention recipe: 8-bit Q/K with per-block scales, E4M3 V with
             per-channel scales and FP8 P. Requires a dense, fixed-length,
@@ -2909,6 +3020,9 @@ class BatchPrefillTSWrapper:
                 seq_len_kv=geometry.max_seq_len_k,
                 num_kv_heads=geometry.num_kv_heads,
                 head_dim=geometry.head_dim_vo or geometry.head_dim,
+                seq_len_q=geometry.max_seq_len_q,
+                num_qo_heads=geometry.num_qo_heads,
+                qk_fp8=geometry.qk_dtype == torch.float8_e4m3fn,
             )
         sage_state = (
             _build_context_sage_state(geometry) if geometry.sage is not None else None
@@ -3015,13 +3129,27 @@ class BatchPrefillTSWrapper:
         if (vc is None) == (geometry.vc is not None):
             raise ValueError(
                 "vc=VCAttentionParams(...) is required by a VC plan and rejected "
-                "by a plan without VC-Attention"
+                "by a plan without vc_config"
             )
         vc_output_scale: Optional[torch.Tensor] = None
         vc_mu: Optional[torch.Tensor] = None
+        vc_q_scale: Optional[torch.Tensor] = None
+        vc_k_scale: Optional[torch.Tensor] = None
         if vc is not None:
             if validate:
                 validate_vc_params(vc, state.vc_scale_shapes, device=geometry.device)
+            if geometry.qk_dtype == torch.float8_e4m3fn:
+                if vc.q_scale is None or vc.k_scale is None:
+                    raise ValueError(
+                        "VC-Attention-QK8 plans require vc.q_scale and vc.k_scale"
+                    )
+                vc_q_scale = vc.q_scale.view(geometry.num_qo_heads, -1)
+                vc_k_scale = vc.k_scale.view(geometry.num_kv_heads, -1)
+            elif vc.q_scale is not None or vc.k_scale is not None:
+                raise ValueError(
+                    "vc.q_scale and vc.k_scale belong to VC-Attention-QK8 plans with "
+                    "E4M3 Q/K"
+                )
             vc_mu = vc.tile_means
             # VC plans have equal Q and K/V head counts, so the per-channel V
             # scale is already in output order.
@@ -3144,6 +3272,8 @@ class BatchPrefillTSWrapper:
             runtime_window_ends,
             runtime_window_cta_starts,
             vc_mu,
+            vc_q_scale,
+            vc_k_scale,
             runtime_sage_scales,
         )
         return out

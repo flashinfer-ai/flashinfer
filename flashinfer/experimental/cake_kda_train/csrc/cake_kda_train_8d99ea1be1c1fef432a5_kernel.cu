@@ -99,25 +99,14 @@ kernel_cake_kda_train_8d99ea1be1c1fef432a5(int* __restrict__ cu_seqlens, int num
         n_i = (cu_seqlens[tid_0 + 1] - cu_seqlens[tid_0] + 63) / 64;
     }
     int incl = n_i;
-    int _shfl_up_0 = __shfl_up_sync(0xFFFFFFFF, incl, 1, 32);
-    if (lane_1 >= 1) {
-        incl = incl + _shfl_up_0;
-    }
-    int _shfl_up_1 = __shfl_up_sync(0xFFFFFFFF, incl, 2, 32);
-    if (lane_1 >= 2) {
-        incl = incl + _shfl_up_1;
-    }
-    int _shfl_up_2 = __shfl_up_sync(0xFFFFFFFF, incl, 4, 32);
-    if (lane_1 >= 4) {
-        incl = incl + _shfl_up_2;
-    }
-    int _shfl_up_3 = __shfl_up_sync(0xFFFFFFFF, incl, 8, 32);
-    if (lane_1 >= 8) {
-        incl = incl + _shfl_up_3;
-    }
-    int _shfl_up_4 = __shfl_up_sync(0xFFFFFFFF, incl, 16, 32);
-    if (lane_1 >= 16) {
-        incl = incl + _shfl_up_4;
+    {
+        uint32_t incl_scan = (uint32_t)incl;
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, incl_scan, 1, 32); if (lane >= 1) { incl_scan += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, incl_scan, 2, 32); if (lane >= 2) { incl_scan += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, incl_scan, 4, 32); if (lane >= 4) { incl_scan += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, incl_scan, 8, 32); if (lane >= 8) { incl_scan += peer; } }
+        { uint32_t peer = __shfl_up_sync(0xFFFFFFFF, incl_scan, 16, 32); if (lane >= 16) { incl_scan += peer; } }
+        incl = (int)incl_scan;
     }
     if (lane_1 == 31) {
         warp_tot[warp_2] = incl;
@@ -129,17 +118,17 @@ kernel_cake_kda_train_8d99ea1be1c1fef432a5(int* __restrict__ cu_seqlens, int num
             wt = warp_tot[lane_1];
         }
         int wincl = wt;
-        int _shfl_up_5 = __shfl_up_sync(0xFFFFFFFF, wincl, 1, 32);
+        int _shfl_up_0 = __shfl_up_sync(0xFFFFFFFF, wincl, 1, 32);
         if (lane_1 >= 1) {
-            wincl = wincl + _shfl_up_5;
+            wincl = wincl + _shfl_up_0;
         }
-        int _shfl_up_6 = __shfl_up_sync(0xFFFFFFFF, wincl, 2, 32);
+        int _shfl_up_1 = __shfl_up_sync(0xFFFFFFFF, wincl, 2, 32);
         if (lane_1 >= 2) {
-            wincl = wincl + _shfl_up_6;
+            wincl = wincl + _shfl_up_1;
         }
-        int _shfl_up_7 = __shfl_up_sync(0xFFFFFFFF, wincl, 4, 32);
+        int _shfl_up_2 = __shfl_up_sync(0xFFFFFFFF, wincl, 4, 32);
         if (lane_1 >= 4) {
-            wincl = wincl + _shfl_up_7;
+            wincl = wincl + _shfl_up_2;
         }
         if (lane_1 < 8) {
             warp_tot[lane_1] = wincl - wt;

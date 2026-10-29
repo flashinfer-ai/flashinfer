@@ -23,7 +23,7 @@
 
 #include <cstdint>
 
-extern "C" __global__ void kernel_cake_gdn_train_2a0326b75a49ed13cfde(const __grid_constant__ CUtensorMap k_tma, const __grid_constant__ CUtensorMap w_tma, __nv_bfloat16* __restrict__ u, float* __restrict__ rowscale, float* __restrict__ gamma, int num_heads, int num_qk_heads, int* __restrict__ chunk_bos, int* __restrict__ seq_chunk_start, int num_seqs, int* __restrict__ walk_seg, float* __restrict__ h0, int* __restrict__ h0_index, int h0_hg, int h0_n, float* __restrict__ out, int* __restrict__ out_index, int out_hg, int out_n, int tile_stride, __nv_bfloat16* __restrict__ h_tape, __nv_bfloat16* __restrict__ v_new);
+extern "C" __global__ void kernel_cake_gdn_train_2a0326b75a49ed13cfde(const __grid_constant__ CUtensorMap k_tma, const __grid_constant__ CUtensorMap w_tma, __nv_bfloat16* __restrict__ u, float* __restrict__ rowscale, float* __restrict__ gamma, int num_heads, int num_qk_heads, int* __restrict__ chunk_bos, int* __restrict__ seq_chunk_start, int num_seqs, int* __restrict__ walk_seg, float* __restrict__ h0, int* __restrict__ h0_index, int h0_hg, int h0_n, float* __restrict__ out, int* __restrict__ out_index, int out_hg, int out_n, int tile_stride, const __grid_constant__ CUtensorMap h_tape, const __grid_constant__ CUtensorMap v_new);
 
 namespace cake_binding_kernel_cake_gdn_train_2a0326b75a49ed13cfde {
 
@@ -62,12 +62,21 @@ int64_t NumelAbove(const TensorView& t, int trailing) {
   return product;
 }
 
-int64_t NonZero(int64_t divisor) {
-  TVM_FFI_CHECK(divisor != 0, ValueError) << KERNEL_NAME << ": a descriptor formula divides by zero";
-  return divisor;
+[[noreturn]] void NoInt64(int64_t a, const char* op, int64_t b) {
+  TVM_FFI_THROW(ValueError) << KERNEL_NAME << ": " << a << " " << op << " " << b
+                            << " has no int64 value in a host check";
 }
 
-int64_t CMod(int64_t a, int64_t b) { return a % NonZero(b); }
+int64_t CheckedMul(int64_t a, int64_t b) {
+  int64_t product;
+  if (__builtin_mul_overflow(a, b, &product)) NoInt64(a, "*", b);
+  return product;
+}
+
+int64_t CMod(int64_t a, int64_t b) {
+  if (b == 0) NoInt64(a, "%", b);
+  return b == -1 ? 0 : a % b;
+}
 
 cuuint64_t Extent(int64_t value, const char* descriptor) {
   TVM_FFI_CHECK(value > 0, ValueError)
@@ -95,8 +104,13 @@ CUtensorMap EncodeTma_k_tma(const TensorView& t) {
   cuuint64_t global_strides[2] = {Stride(s2, "k_tma"), Stride(s3, "k_tma")};
   cuuint32_t box_dim[3] = {64u, 1u, 64u};
   cuuint32_t elem_strides[3] = {1u, 1u, 1u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1], ValueError)
-      << KERNEL_NAME << ": the box of descriptor 'k_tma' exceeds its source extents";
+  const bool allow_oob_box[3] = {false, false, true};
+  for (int axis = 0; axis < 3; ++axis) {
+    TVM_FFI_CHECK(allow_oob_box[axis] || box_dim[axis] <= global_dim[axis], ValueError)
+        << KERNEL_NAME << ": descriptor 'k_tma' axis " << axis << " (0 is the innermost) has a TMA box of "
+        << box_dim[axis] << " elements but the source extent along it is " << global_dim[axis]
+        << ". A box may not exceed its extent unless the axis is listed in the descriptor's allow_oob_box (CK.describe_tma(..., allow_oob_box=(axis,))). List it when the box is a tile that may run past the end of the axis, a tail tile: a load fills the part past the extent with zeros (its bytes still count toward the barrier's transaction) and a store or reduce skips it, so that is safe when the kernel ignores or masks those rows and columns. If the box was meant to fit, box_dim or the extent is wrong: check box_dim, global_dim and the tensor's shape";
+  }
   TVM_FFI_CHECK(global_strides[0] % 16 == 0 && global_strides[1] % 16 == 0, ValueError)
       << KERNEL_NAME << ": the strides of descriptor 'k_tma' must be multiples of 16 bytes";
   void* address = DataPtr(t);
@@ -118,11 +132,16 @@ CUtensorMap EncodeTma_w_tma(const TensorView& t) {
   int64_t d2 = t.size(-2);
   int64_t outer2 = NumelAbove(t, 2);
   cuuint64_t global_dim[3] = {Extent(d1, "w_tma"), Extent(d2, "w_tma"), Extent(outer2, "w_tma")};
-  cuuint64_t global_strides[2] = {Stride((d1 * 2), "w_tma"), Stride(((d1 * d2) * 2), "w_tma")};
+  cuuint64_t global_strides[2] = {Stride(CheckedMul(d1, 2LL), "w_tma"), Stride(CheckedMul(CheckedMul(d1, d2), 2LL), "w_tma")};
   cuuint32_t box_dim[3] = {64u, 1u, 64u};
   cuuint32_t elem_strides[3] = {1u, 1u, 1u};
-  TVM_FFI_CHECK(box_dim[0] <= global_dim[0] && box_dim[1] <= global_dim[1] && box_dim[2] <= global_dim[2], ValueError)
-      << KERNEL_NAME << ": the box of descriptor 'w_tma' exceeds its source extents";
+  const bool allow_oob_box[3] = {false, false, false};
+  for (int axis = 0; axis < 3; ++axis) {
+    TVM_FFI_CHECK(allow_oob_box[axis] || box_dim[axis] <= global_dim[axis], ValueError)
+        << KERNEL_NAME << ": descriptor 'w_tma' axis " << axis << " (0 is the innermost) has a TMA box of "
+        << box_dim[axis] << " elements but the source extent along it is " << global_dim[axis]
+        << ". A box may not exceed its extent unless the axis is listed in the descriptor's allow_oob_box (CK.describe_tma(..., allow_oob_box=(axis,))). List it when the box is a tile that may run past the end of the axis, a tail tile: a load fills the part past the extent with zeros (its bytes still count toward the barrier's transaction) and a store or reduce skips it, so that is safe when the kernel ignores or masks those rows and columns. If the box was meant to fit, box_dim or the extent is wrong: check box_dim, global_dim and the tensor's shape";
+  }
   TVM_FFI_CHECK(global_strides[0] % 16 == 0 && global_strides[1] % 16 == 0, ValueError)
       << KERNEL_NAME << ": the strides of descriptor 'w_tma' must be multiples of 16 bytes";
   void* address = DataPtr(t);
@@ -133,6 +152,68 @@ CUtensorMap EncodeTma_w_tma(const TensorView& t) {
                                  box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
                                  CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
           "cuTensorMapEncodeTiled of w_tma");
+  return map;
+}
+
+CUtensorMap EncodeTma_h_tape(const TensorView& t) {
+  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
+      << KERNEL_NAME << ": descriptor 'h_tape' takes a source of at least 2 dims, got " << t.ndim();
+  CheckUnitInnerStride(t, "h_tape");
+  int64_t d1 = t.size(-1);
+  int64_t d2 = t.size(-2);
+  int64_t outer2 = NumelAbove(t, 2);
+  cuuint64_t global_dim[3] = {Extent(d1, "h_tape"), Extent(d2, "h_tape"), Extent(outer2, "h_tape")};
+  cuuint64_t global_strides[2] = {Stride(CheckedMul(d1, 2LL), "h_tape"), Stride(CheckedMul(CheckedMul(d1, d2), 2LL), "h_tape")};
+  cuuint32_t box_dim[3] = {64u, 128u, 1u};
+  cuuint32_t elem_strides[3] = {1u, 1u, 1u};
+  const bool allow_oob_box[3] = {false, false, false};
+  for (int axis = 0; axis < 3; ++axis) {
+    TVM_FFI_CHECK(allow_oob_box[axis] || box_dim[axis] <= global_dim[axis], ValueError)
+        << KERNEL_NAME << ": descriptor 'h_tape' axis " << axis << " (0 is the innermost) has a TMA box of "
+        << box_dim[axis] << " elements but the source extent along it is " << global_dim[axis]
+        << ". A box may not exceed its extent unless the axis is listed in the descriptor's allow_oob_box (CK.describe_tma(..., allow_oob_box=(axis,))). List it when the box is a tile that may run past the end of the axis, a tail tile: a load fills the part past the extent with zeros (its bytes still count toward the barrier's transaction) and a store or reduce skips it, so that is safe when the kernel ignores or masks those rows and columns. If the box was meant to fit, box_dim or the extent is wrong: check box_dim, global_dim and the tensor's shape";
+  }
+  TVM_FFI_CHECK(global_strides[0] % 16 == 0 && global_strides[1] % 16 == 0, ValueError)
+      << KERNEL_NAME << ": the strides of descriptor 'h_tape' must be multiples of 16 bytes";
+  void* address = DataPtr(t);
+  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(address) % 16 == 0, ValueError)
+      << KERNEL_NAME << ": the address of descriptor 'h_tape' must be 16-byte aligned";
+  CUtensorMap map{};
+  CheckCu(cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, address, global_dim, global_strides,
+                                 box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+                                 CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
+          "cuTensorMapEncodeTiled of h_tape");
+  return map;
+}
+
+CUtensorMap EncodeTma_v_new(const TensorView& t) {
+  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
+      << KERNEL_NAME << ": descriptor 'v_new' takes a source of at least 2 dims, got " << t.ndim();
+  CheckUnitInnerStride(t, "v_new");
+  int64_t d1 = t.size(-1);
+  int64_t d2 = t.size(-2);
+  int64_t outer2 = NumelAbove(t, 2);
+  cuuint64_t global_dim[3] = {Extent(d1, "v_new"), Extent(d2, "v_new"), Extent(outer2, "v_new")};
+  cuuint64_t global_strides[2] = {Stride(CheckedMul(d1, 2LL), "v_new"), Stride(CheckedMul(CheckedMul(d1, d2), 2LL), "v_new")};
+  cuuint32_t box_dim[3] = {64u, 1u, 64u};
+  cuuint32_t elem_strides[3] = {1u, 1u, 1u};
+  const bool allow_oob_box[3] = {false, false, false};
+  for (int axis = 0; axis < 3; ++axis) {
+    TVM_FFI_CHECK(allow_oob_box[axis] || box_dim[axis] <= global_dim[axis], ValueError)
+        << KERNEL_NAME << ": descriptor 'v_new' axis " << axis << " (0 is the innermost) has a TMA box of "
+        << box_dim[axis] << " elements but the source extent along it is " << global_dim[axis]
+        << ". A box may not exceed its extent unless the axis is listed in the descriptor's allow_oob_box (CK.describe_tma(..., allow_oob_box=(axis,))). List it when the box is a tile that may run past the end of the axis, a tail tile: a load fills the part past the extent with zeros (its bytes still count toward the barrier's transaction) and a store or reduce skips it, so that is safe when the kernel ignores or masks those rows and columns. If the box was meant to fit, box_dim or the extent is wrong: check box_dim, global_dim and the tensor's shape";
+  }
+  TVM_FFI_CHECK(global_strides[0] % 16 == 0 && global_strides[1] % 16 == 0, ValueError)
+      << KERNEL_NAME << ": the strides of descriptor 'v_new' must be multiples of 16 bytes";
+  void* address = DataPtr(t);
+  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(address) % 16 == 0, ValueError)
+      << KERNEL_NAME << ": the address of descriptor 'v_new' must be 16-byte aligned";
+  CUtensorMap map{};
+  CheckCu(cuTensorMapEncodeTiled(&map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, address, global_dim, global_strides,
+                                 box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+                                 CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE),
+          "cuTensorMapEncodeTiled of v_new");
   return map;
 }
 
@@ -217,15 +298,15 @@ void Run(TensorView a_k_tma, TensorView a_w_tma, TensorView a_u, TensorView a_ro
   check_same_device(a_h_tape, a_k_tma, "h_tape", "k_tma");
   check_contiguous(a_v_new, "v_new");
   check_same_device(a_v_new, a_k_tma, "v_new", "k_tma");
-  TVM_FFI_CHECK((a_num_heads >= 1), ValueError)
+  TVM_FFI_CHECK((a_num_heads >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (num_heads >= 1)";
-  TVM_FFI_CHECK((a_num_qk_heads >= 1), ValueError)
+  TVM_FFI_CHECK((a_num_qk_heads >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (num_qk_heads >= 1)";
-  TVM_FFI_CHECK((CMod(a_num_heads, a_num_qk_heads) == 0), ValueError)
+  TVM_FFI_CHECK((CMod(a_num_heads, a_num_qk_heads) == 0LL), ValueError)
       << KERNEL_NAME << ": requires (CMod(num_heads, num_qk_heads) == 0)";
-  TVM_FFI_CHECK((a_num_seqs >= 0), ValueError)
+  TVM_FFI_CHECK((a_num_seqs >= 0LL), ValueError)
       << KERNEL_NAME << ": requires (num_seqs >= 0)";
-  TVM_FFI_CHECK((a_tile_stride >= 1), ValueError)
+  TVM_FFI_CHECK((a_tile_stride >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (tile_stride >= 1)";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
@@ -262,8 +343,8 @@ void Run(TensorView a_k_tma, TensorView a_w_tma, TensorView a_u, TensorView a_ro
   int32_t v_out_hg = static_cast<int32_t>(a_out_hg);
   int32_t v_out_n = static_cast<int32_t>(a_out_n);
   int32_t v_tile_stride = static_cast<int32_t>(a_tile_stride);
-  void* v_h_tape = DataPtr(a_h_tape);
-  void* v_v_new = DataPtr(a_v_new);
+  CUtensorMap v_h_tape = EncodeTma_h_tape(a_h_tape);
+  CUtensorMap v_v_new = EncodeTma_v_new(a_v_new);
   void* kernel_args[] = {&v_k_tma, &v_w_tma, &v_u, &v_rowscale, &v_gamma, &v_num_heads, &v_num_qk_heads, &v_chunk_bos, &v_seq_chunk_start, &v_num_seqs, &v_walk_seg, &v_h0, &v_h0_index, &v_h0_hg, &v_h0_n, &v_out, &v_out_index, &v_out_hg, &v_out_n, &v_tile_stride, &v_h_tape, &v_v_new};
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));

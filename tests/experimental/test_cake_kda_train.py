@@ -137,10 +137,12 @@ CARRY_V8_ARCHES = ARCHES
 CARRY_V8_MAX_H = 2
 CARRY_S_HOPS = 14
 CARRY_FLAG_WORDS_PER_CTA = 3
-# the architectures whose GLM intra program (glm_intra_v14) writes the gate gradients itself: no gate_epilogue
-# launch, no dg_int / db_int buffers in their layouts; sm_100a / sm_107a keep glm_intra + gate_epilogue.  A byte query
+# the architectures whose GLM intra program (glm_intra_v14 on sm_103a, glm_intra_v18 on sm_107a: the same program
+# with every named-barrier slot an immediate, two CTAs per SM there) writes the gate gradients itself: no gate_epilogue
+# launch, no dg_int / db_int buffers in their layouts; sm_100a keeps glm_intra + gate_epilogue.  A byte query
 # without an architecture takes the first exported one's answer.
-GATE_FUSED_ARCHES = ("sm_103a",)
+GATE_FUSED_ARCHES = ("sm_103a", "sm_107a")
+GATE_FUSED_RECORD = {"sm_103a": "glm_intra_v14", "sm_107a": "glm_intra_v18"}
 # The light saved set (version 4) carries the fold's qg on every row (the light backward's prep, bwd_prep_g8_noqg,
 # writes none) and the WY representation w / u on the paired serial WU_SAVED_H-head rows (the 32-column form) of
 # WU_SAVED_ARCHES and on the segmented WU_SAVED_H-head rows of WU_SEG_SAVED_ARCHES above WU_SEG_MIN_CHAINS (document,
@@ -239,6 +241,18 @@ def _device_or_skip() -> torch.device:
     return torch.device("cuda", index)
 
 
+def _current_arch() -> str:
+    """The architecture :func:`cake_backend.plan` takes without ``arch``: the current CUDA device's where it is an
+    exported target, else the first exported architecture."""
+    if torch.cuda.is_available():
+        arch = cake_jit.arch_for_capability(
+            torch.cuda.get_device_capability(torch.cuda.current_device())
+        )
+        if arch is not None:
+            return arch
+    return ARCHES[0]
+
+
 def _manifest_or_skip() -> dict:
     path = PACKAGE_DIR / "build.json"
     if not path.exists():
@@ -309,12 +323,13 @@ GRID_KINDS = (
     "segments_heads",
 )
 # the records delivered for a subset of the architectures (every other record ships on all three, the two-level
-# carry and the no-kb prep among them): the gate epilogue and its unfused GLM intra program on sm_100a / sm_107a, the
-# fused one on sm_103a
+# carry and the no-kb prep among them): the gate epilogue and its unfused GLM intra program on sm_100a, the fused
+# ones on sm_103a (glm_intra_v14) and sm_107a (glm_intra_v18)
 RECORD_ARCHES = {
-    "glm_intra": ("sm_100a", "sm_107a"),
+    "glm_intra": ("sm_100a",),
     "glm_intra_v14": ("sm_103a",),
-    "gate_epilogue": ("sm_100a", "sm_107a"),
+    "glm_intra_v18": ("sm_107a",),
+    "gate_epilogue": ("sm_100a",),
 }
 # The records of the segmented adjoint recurrence launch twice per stage (the carry between the passes); the
 # forward recurrence's passes are two stages (fwdh, fwdh_p3).
@@ -407,8 +422,8 @@ def _route_rule(route: str) -> dict:
 
 
 def test_registry_records_are_well_formed() -> None:
-    assert len(cake_jit.MODULES) == 66
-    assert len({r["library"] for r in cake_jit.MODULES.values()}) == 64
+    assert len(cake_jit.MODULES) == 67
+    assert len({r["library"] for r in cake_jit.MODULES.values()}) == 65
     assert tuple(cake_jit.PATHS) == PATHS
     assert tuple(cake_jit.OPTIONAL_STAGES) == OPTIONAL_STAGES
     assert {
@@ -751,12 +766,14 @@ def test_registry_records_are_well_formed() -> None:
             },
         ],
     }
-    # the GLM intra program and the gate epilogue: fused on sm_103a, two launches on sm_100a / sm_107a
+    # the GLM intra program and the gate epilogue: fused on sm_103a (glm_intra_v14) and sm_107a (glm_intra_v18), two
+    # launches on sm_100a
     unfused = [a for a in ARCHES if a not in GATE_FUSED_ARCHES]
-    assert cake_jit.MODULES["glm_intra_v14"]["select_rule"] == {
-        "kind": "arch_in",
-        "arches": list(GATE_FUSED_ARCHES),
-    }
+    for arch, fused_record in GATE_FUSED_RECORD.items():
+        assert cake_jit.MODULES[fused_record]["select_rule"] == {
+            "kind": "arch_in",
+            "arches": [arch],
+        }
     assert cake_jit.MODULES["glm_intra"]["select_rule"] == {
         "kind": "arch_in",
         "arches": unfused,
@@ -765,7 +782,7 @@ def test_registry_records_are_well_formed() -> None:
         "kind": "arch_in",
         "arches": unfused,
     }
-    for name in ("glm_intra", "glm_intra_v14", "gate_epilogue"):
+    for name in ("glm_intra", "glm_intra_v14", "glm_intra_v18", "gate_epilogue"):
         assert cake_jit.MODULES[name]["grid_rule"] == {"kind": "chunks", "x_factor": 1}
     # the fused gradient's dAqk-hosting form: the serial route from 16 heads and every segmented row, with the
     # hints on sm_100a / sm_103a or below 16 heads; the sm_107a rows from 16 heads take the _nohint build on
@@ -923,7 +940,7 @@ def _expected_records(
         if fused_fwd
         else ("wy_fwd_rows" if (ov1 and save) or paired or paired_v1 else "wy_fwd"),
         "seg_carry": carry,
-        "glm_intra": "glm_intra_v14" if gate_fused else "glm_intra",
+        "glm_intra": GATE_FUSED_RECORD[arch] if gate_fused else "glm_intra",
         "gate_epilogue": None if gate_fused else "gate_epilogue",
     }
     if path == "tape":
@@ -1032,6 +1049,7 @@ def _expected_grid(
         "bwd_prep_g8_noqg_nokb",
         "glm_intra",
         "glm_intra_v14",
+        "glm_intra_v18",
         "gate_epilogue",
     ):
         return (nc_pad, h, 1)
@@ -1195,9 +1213,9 @@ def test_segment_args_follow_the_proportional_rule() -> None:
         _route, segments, _nseg = cake_jit.segment_plan(3, 2, sm)
         assert cake_jit.segment_args(3, 2, sm) == (0, segments)
         assert cake_jit.segment_args(1, 16, sm) == (0, 1)  # the serial route
-    p = cake_backend.plan(1024, 4, 1, 148)
+    p = cake_backend.plan(1024, 4, 1, 148, ARCHES[0])  # the sm_100a rows of record
     assert (p.proportional, p.seg_arg) == (1, -4)
-    p = cake_backend.plan(1024, 7, 8, 148)
+    p = cake_backend.plan(1024, 7, 8, 148, ARCHES[0])
     assert (p.proportional, p.seg_arg) == (0, p.P)
 
 
@@ -1245,8 +1263,11 @@ def test_the_16_head_rows_of_two_architectures_take_the_segmented_route() -> Non
             ("serial", 1, 0) if arch == "sm_100a" else ("seg", 9, 9)
         )
         assert ("light_states" in p.records) is (arch != "sm_100a")
-    # arch=None is the first exported architecture's plan: the serial walk
-    assert cake_backend.plan(4096, 1, 16, 148).recur == "serial"
+    # arch=None is the current device's plan (the first exported architecture's without one)
+    assert (
+        cake_backend.plan(4096, 1, 16, 148).recur
+        == cake_backend.plan(4096, 1, 16, 148, _current_arch()).recur
+    )
 
 
 def test_carry_choice_picks_the_shortest_critical_path_that_fits() -> None:
@@ -1474,8 +1495,11 @@ def test_few_chains_cap_the_segment_count() -> None:
             p = cake_backend.plan(1024, 4, 1, sm, arch)
             assert (p.recur, p.P, p.NSEG) == ("seg", small, 4 * small)
             assert cake_backend.plan(1024, 8, 1, sm, arch).P == 64
-        # plan(arch=None) is the first exported architecture's plan, segment count included
-        assert cake_backend.plan(1024, 4, 1, sm).P == 37
+        # plan(arch=None) is the current device's plan, segment count included
+        assert (
+            cake_backend.plan(1024, 4, 1, sm).P
+            == cake_backend.plan(1024, 4, 1, sm, _current_arch()).P
+        )
     # below the clamp the cap is inert: four chains on a 32-SM device give 32
     assert cake_jit.segment_plan(4, 1, 32) == ("seg", 32, 128)
     assert cake_jit.segment_plan(4, 1, 32, "sm_100a") == ("seg", 32, 128)
@@ -1545,6 +1569,7 @@ def test_the_backward_reads_the_token_rows_without_chunk_layout_copies() -> None
     logical = cake_jit.MODULES["glm_intra"]["logical"]
     assert (logical["k_e"], logical["q_e"]) == ("k", "q")
     assert {"k", "q"} <= set(cake_jit.MODULES["glm_intra_v14"]["logical"].values())
+    assert {"k", "q"} <= set(cake_jit.MODULES["glm_intra_v18"]["logical"].values())
     preps = (
         "bwd_prep_g8",
         "bwd_prep_g8_replay",
@@ -1574,8 +1599,10 @@ def test_the_backward_reads_the_token_rows_without_chunk_layout_copies() -> None
     # the fused GLM intra program writes the token-row gate gradients itself and binds no epilogue buffer; the
     # unfused one hands them to the gate epilogue through dg_int / db_int
     v14 = set(cake_jit.MODULES["glm_intra_v14"]["logical"].values())
+    v18 = set(cake_jit.MODULES["glm_intra_v18"]["logical"].values())
     unfused = set(cake_jit.MODULES["glm_intra"]["logical"].values())
     epilogue = set(cake_jit.MODULES["gate_epilogue"]["logical"].values())
+    assert v18 == v14  # the same program: v18 differs in its named-barrier slots alone
     assert {"dg", "dbeta"} <= v14 and not {"dg_int", "db_int"} & v14
     assert {"dg_int", "db_int"} <= unfused and not {"dg", "dbeta"} & unfused
     assert {"dg_int", "db_int", "dg", "dbeta"} <= epilogue
@@ -1830,6 +1857,49 @@ def _expected_launch_count(
     return count
 
 
+def test_plan_is_cached_on_its_scalars(monkeypatch) -> None:
+    """A repeated problem returns the same plan without selecting a record again (the default entry plans a
+    repeated shape once); every scalar and the architecture are part of the key, and a refused problem raises
+    on every call."""
+    first = cake_backend.plan(261393, 4, 4, 152, "sm_100a")
+    calls: list = []
+    original = cake_jit.select_record
+
+    def counting(*args, **kwargs):
+        calls.append(args)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(cake_jit, "select_record", counting)
+    assert cake_backend.plan(261393, 4, 4, 152, "sm_100a") is first
+    assert cake_backend.plan(261393.0, 4, 4, 152, "sm_100a") is first
+    assert calls == []
+    for scalars in ((261392, 4, 4, 152), (261393, 3, 4, 152), (261393, 4, 2, 152)):
+        assert cake_backend.plan(*scalars, "sm_100a") is not first
+    assert cake_backend.plan(261393, 4, 4, 148, "sm_100a").sm_count == 148
+    for arch in ARCHES[1:]:
+        assert cake_backend.plan(261393, 4, 4, 152, arch).arch == arch
+    for _ in range(2):
+        with pytest.raises(ValueError, match="must all be >= 1"):
+            cake_backend.plan(0, 1, 1, 148, "sm_100a")
+
+
+def test_plan_without_arch_takes_the_current_device(monkeypatch) -> None:
+    """``plan(..., arch=None)`` selects the records of the current CUDA device's architecture, so its plan serves a
+    workspace there on every exported target; without a CUDA device, or on a device no record targets, it takes
+    the first exported architecture (whose records the byte queries also take without an ``arch``)."""
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    for arch in ARCHES:
+        monkeypatch.setattr(cake_backend, "_capability_arch", lambda index, a=arch: a)
+        p = cake_backend.plan(4096, 1, 16, 148)
+        assert p.arch == arch
+        assert p.records == cake_backend.plan(4096, 1, 16, 148, arch).records
+    monkeypatch.setattr(cake_backend, "_capability_arch", lambda index: None)
+    assert cake_backend.plan(4096, 1, 16, 148).arch == ARCHES[0]
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert cake_backend.plan(4096, 1, 16, 148).arch == ARCHES[0]
+
+
 def test_plan_follows_the_chunk_bound_formulas() -> None:
     for lengths, heads in SHAPES:
         S, N = sum(lengths), len(lengths)
@@ -1969,10 +2039,10 @@ def test_launch_counts_of_the_paths() -> None:
                 h,
                 arch,
             )
-    # plan(arch=None) is the first exported architecture's
+    # plan(arch=None) is the current device's (the first exported architecture's without one)
     for n, h in counts_by_arch:
         assert cake_backend.plan(4096, n, h, 148).records == (
-            cake_backend.plan(4096, n, h, 148, ARCHES[0]).records
+            cake_backend.plan(4096, n, h, 148, _current_arch()).records
         )
     # the 16-head row of sm_100a: the light set carries w / u, so the light path launches no wy program (six launches:
     # the prep, the recompute, the adjoint, the fused gradient, GLM intra, the gate epilogue)
@@ -2149,8 +2219,8 @@ def test_the_light_set_saves_qg_everywhere_and_w_u_where_the_prep_writes_no_kb()
 def test_gate_fused_architectures_lay_the_arena_out_without_the_epilogue_buffers() -> (
     None
 ):
-    # glm_intra_v14 (sm_103a) writes the gate gradients itself: no gate_epilogue record, no dg_int / db_int in the
-    # layouts.  The default layouts keep their bytes (the two shared slots with h / do_int); the lean single-pass
+    # glm_intra_v14 (sm_103a) / glm_intra_v18 (sm_107a) write the gate gradients themselves: no gate_epilogue record,
+    # no dg_int / db_int in the layouts.  The default layouts keep their bytes (the two shared slots with h / do_int); the lean single-pass
     # layout loses the 4-byte db_int slot; the multi-pass per-pass set loses both buffers.  A query without an
     # architecture takes sm_100a's answer: the epilogue's buffers stay.
     assert cake_backend._gate_fused(None) is _gate_fused(None) is False
@@ -2164,7 +2234,7 @@ def test_gate_fused_architectures_lay_the_arena_out_without_the_epilogue_buffers
             assert p.gate_fused is fused
             assert p.dispatched("gate_epilogue", "light") is not fused
             assert p.records["light"]["glm_intra"] == (
-                "glm_intra_v14" if fused else "glm_intra"
+                GATE_FUSED_RECORD[arch] if fused else "glm_intra"
             )
             R, H, NC, NSEG = p.R, p.H, p.NC_pad, p.NSEG
             for mode in cake_backend.MODES:
@@ -2201,16 +2271,19 @@ def test_seg_state_rule_is_a_pure_function_of_the_scalars() -> None:
     for nseg in (1, 64, 153, 256):
         assert rule(k * nseg, nseg) is True and rule(k * nseg - 1, nseg) is False
     assert rule(10**9, 0) is False  # the serial route has no segment states
+    # the sm_100a rule (a plan without an arch takes the current device's)
+    a0 = cake_jit.ARCHES[0]
     for n, h, sm in ((1, 1, 148), (4, 4, 152), (3, 8, 148), (4, 1, 152)):
-        nseg = cake_backend.plan(1, n, h, sm).NSEG  # independent of S
-        assert (  # a plan without an architecture is the sm_100a plan
+        nseg = cake_backend.plan(1, n, h, sm, a0).NSEG  # independent of S
+        assert (
             nseg
-            == cake_backend.plan(k * nseg, n, h, sm).NSEG
-            == _expected_segments(n, h, sm, cake_jit.ARCHES[0])[2]
+            == cake_backend.plan(k * nseg, n, h, sm, a0).NSEG
+            == _expected_segments(n, h, sm, a0)[2]
         )
-        assert cake_backend.plan(k * nseg, n, h, sm).seg_save is True
-        assert cake_backend.plan(k * nseg - 1, n, h, sm).seg_save is False
-    assert cake_backend.plan(10**6, 1, 16, 148).seg_save is False  # the serial route
+        assert cake_backend.plan(k * nseg, n, h, sm, a0).seg_save is True
+        assert cake_backend.plan(k * nseg - 1, n, h, sm, a0).seg_save is False
+    # the serial route
+    assert cake_backend.plan(10**6, 1, 16, 148, a0).seg_save is False
 
 
 def test_byte_queries_follow_the_arena_layout() -> None:
@@ -2985,9 +3058,12 @@ def test_tail_stages_bind_only_range_safe_operands() -> None:
                 )
                 assert logical <= allowed, (name, sorted(logical - allowed))
                 seen.add(name)
-    assert {"glm_intra", "glm_intra_v14", "gate_epilogue"} <= seen and any(
-        n.startswith("dqkg") for n in seen
-    )
+    assert {
+        "glm_intra",
+        "glm_intra_v14",
+        "glm_intra_v18",
+        "gate_epilogue",
+    } <= seen and any(n.startswith("dqkg") for n in seen)
 
 
 def test_manifest_is_well_formed(manifest: dict) -> None:
@@ -2997,8 +3073,8 @@ def test_manifest_is_well_formed(manifest: dict) -> None:
     assert set(ARCHES) <= set(arch_flags)
     libraries = manifest["libraries"]
     names = [entry["name"] for entry in libraries]
-    # The 64 programs of cake_jit.MODULES, each built for the architectures its record delivers (61 on all three,
-    # the three of RECORD_ARCHES on their subsets: 188 libraries), plus the KCP programs of cake_kcp_jit.MODULES
+    # The 65 programs of cake_jit.MODULES, each built for the architectures its record delivers (61 on all three,
+    # the four of RECORD_ARCHES on one each: 187 libraries), plus the KCP programs of cake_kcp_jit.MODULES
     # on every architecture (its test-only TEST_MODULES live in build.test.json, never here).
     kcp_libraries = {record["library"] for record in cake_kcp_jit.MODULES.values()}
     train_libraries = {
@@ -3006,8 +3082,8 @@ def test_manifest_is_well_formed(manifest: dict) -> None:
         for record in cake_jit.MODULES.values()
         for arch in record["arches"]
     }
-    assert len(train_libraries) == 188
-    assert len(names) == len(set(names)) == 188 + len(kcp_libraries) * len(ARCHES)
+    assert len(train_libraries) == 187
+    assert len(names) == len(set(names)) == 187 + len(kcp_libraries) * len(ARCHES)
     for entry in libraries:
         assert entry["arch"] in ARCHES
         assert entry["entry"] == "run"
@@ -3163,6 +3239,29 @@ def _run_fwd_bwd(inputs, *, scale=SCALE, workspace=None, save=True, save_mode=No
 
 def _clone_all(out, grads):
     return out.clone(), {name: t.clone() for name, t in grads.items()}
+
+
+def _spy_call_workspaces(monkeypatch) -> list:
+    """Record the workspace every call without one runs in (``_entry_acquire``): its option, direction, bytes, save
+    mode and ``doc_lengths``, not the workspace itself (a strong reference would be "retained")."""
+    created: list = []
+    original = cake_backend._entry_acquire
+
+    def spy(*args, **kwargs):
+        ws_, key = original(*args, **kwargs)
+        created.append(
+            types.SimpleNamespace(
+                arena_option=ws_.arena_option,
+                backward=ws_.backward,
+                bytes=ws_.bytes,
+                save_mode=ws_.save_mode,
+                doc_lengths=ws_.doc_lengths,
+            )
+        )
+        return ws_, key
+
+    monkeypatch.setattr(cake_backend, "_entry_acquire", spy)
+    return created
 
 
 @pytest.mark.parametrize("shape", SHAPES, ids=_shape_id)
@@ -3890,6 +3989,200 @@ def test_a_checkpointed_forward_retains_no_workspace(device, manifest) -> None:
             assert torch.equal(leaf.grad, reference_grads[name]), (fn.__name__, name)
 
 
+# The issue's pack: four documents of S = 261393 tokens, H = 4 (a segmented row whose light set saves the states).
+ISSUE_LENGTHS, ISSUE_HEADS = (120001, 70707, 65537, 5148), 4
+
+
+def _autograd_step(inputs, **kwargs):
+    """One forward and backward through the autograd entry on fresh leaves: ``out`` (detached) and the five
+    gradients in ``(dq, dk, dv, dbeta, dg)`` order.  The backward accumulates into the leaves: the graph task of
+    ``torch.autograd.grad`` holds the gradients it returns until the autograd engine's device thread drops it,
+    which can be after the call returned, so a memory check right after it would count them."""
+    leaves = [
+        inputs[n].detach().clone().requires_grad_(True)
+        for n in ("q", "k", "v", "g", "beta")
+    ]
+    out = cake_backend.chunk_kda(*leaves, inputs["cu_seqlens"], **kwargs)
+    out.backward(inputs["dout"])
+    dq, dk, dv, dg, dbeta = (leaf.grad for leaf in leaves)
+    return out.detach(), (dq, dk, dv, dbeta, dg)
+
+
+def test_the_default_entry_plans_a_repeated_problem_once_and_keeps_no_device_memory(
+    device, manifest, monkeypatch
+) -> None:
+    """The default entry (no workspace) plans a repeated problem once and reuses its workspaces: no record is
+    selected and no workspace is built again on a repeat, under every arena option.  Its arena, eye and
+    ``doc_lengths`` copy live for the call alone, so the kept workspaces hold no device memory; a call on another
+    stream runs in a workspace of its own; the results are bitwise those of a caller-owned workspace."""
+    lengths, heads = (100, 640, 77, 1000, 129), 2
+    S, N = sum(lengths), len(lengths)
+    inputs = make_inputs(lengths, heads, device)
+    plan = cake_backend.plan(S, N, heads, cake_jit.sm_count(device.index))
+    assert plan.arch == cake_jit.device_arch(device.index)
+    for arena, doc in (
+        (None, None),
+        (cake_backend.KdaArena(lean=True, tail_passes=4), None),
+        (cake_backend.KdaArena(lean=True, tail_passes=2, batch_tokens=1000), lengths),
+    ):
+        ws = KdaWorkspace(plan, device, backward=True, arena=arena, doc_lengths=doc)
+        ref_out, ref_grads = _autograd_step(inputs, workspace=ws, doc_lengths=doc)
+        del ws
+        _autograd_step(
+            inputs, arena=arena, doc_lengths=doc
+        )  # the first call builds the workspaces
+        selected: list = []
+        original = cake_jit.select_record
+
+        def counting(*args, _sel=selected, _orig=original, **kwargs):
+            _sel.append(args)
+            return _orig(*args, **kwargs)
+
+        monkeypatch.setattr(cake_jit, "select_record", counting)
+        built: list = []
+        original_init = KdaWorkspace.__init__
+
+        def counting_init(self, *args, _built=built, _orig=original_init, **kwargs):
+            _built.append(args)
+            _orig(self, *args, **kwargs)
+
+        monkeypatch.setattr(KdaWorkspace, "__init__", counting_init)
+        out, grads = _autograd_step(inputs, arena=arena, doc_lengths=doc)
+        assert selected == [] and built == [], arena
+        assert _bits_equal(out, ref_out), arena
+        _check_bits(
+            grads,
+            dict(zip(("dq", "dk", "dv", "dbeta", "dg"), ref_grads, strict=True)),
+            tag=arena,
+        )
+        monkeypatch.setattr(cake_jit, "select_record", original)
+        monkeypatch.setattr(KdaWorkspace, "__init__", original_init)
+        del out, grads, ref_out, ref_grads
+        # the baseline holds no kept workspace: building them again and reusing them leaves the device memory as
+        # it was, so a kept workspace that held its arena, eye or doc_lengths copy would show here
+        cake_backend._entry_pool.clear()
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_allocated()
+        for _ in range(2):
+            _autograd_step(inputs, arena=arena, doc_lengths=doc)
+        torch.cuda.synchronize()
+        assert cake_backend._entry_pool, arena
+        assert torch.cuda.memory_allocated() == before, arena
+    # a call on another stream takes a workspace of its own (no two queued calls share an eye)
+    created = _spy_call_workspaces(monkeypatch)
+    keys = []
+    original_acquire = cake_backend._entry_acquire
+
+    def keyed(*args, **kwargs):
+        ws_, key = original_acquire(*args, **kwargs)
+        keys.append(key)
+        return ws_, key
+
+    monkeypatch.setattr(cake_backend, "_entry_acquire", keyed)
+    side = torch.cuda.Stream(device)
+    side.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(side):
+        _autograd_step(inputs)
+    torch.cuda.current_stream(device).wait_stream(side)
+    _autograd_step(inputs)
+    assert len(created) == 4 and len(set(keys)) == 4
+    assert {key[1] for key in keys} == {
+        side.cuda_stream,
+        torch.cuda.current_stream(device).cuda_stream,
+    }
+
+
+def test_the_arena_options_never_synchronize_the_host(device, manifest) -> None:
+    """The issue's pack through the default entry and through a caller-owned workspace: the lean arena with four
+    tail passes and the batched option over two document groups (``doc_lengths``) run the forward and the backward
+    without one host synchronization (PyTorch's sync debug mode raises on any it routes), on the first call of a
+    problem as on a repeat, with the default arena's results bitwise.  Both groups of the issue's pack are one run
+    of the saved state blocks (views and contiguous copies); a second pack above the size rule has a group that is
+    not (its block indices ride with the ``doc_lengths`` copy), with the same guarantees."""
+    split = _saving_pack(SPLIT_LENGTHS, 4, device)
+    for lengths, heads, budget, runs in (
+        (ISSUE_LENGTHS, ISSUE_HEADS, 200000, (True, True)),
+        (split, 4, split[0] + split[1], (False, True)),
+    ):
+        S, N = sum(lengths), len(lengths)
+        inputs = make_inputs(lengths, heads, device)
+        ref_out, ref_grads = _autograd_step(inputs)
+        reference = dict(zip(("dq", "dk", "dv", "dbeta", "dg"), ref_grads, strict=True))
+        plan = cake_backend.plan(S, N, heads, cake_jit.sm_count(device.index))
+        assert plan.light_path == "light_states"
+        lean = cake_backend.KdaArena(lean=True, tail_passes=4)
+        batched = cake_backend.KdaArena(lean=True, tail_passes=4, batch_tokens=budget)
+        assert len(plan.batches(batched, lengths)) == 2
+        packing = cake_backend._host_packing(
+            plan,
+            batched,
+            tuple(lengths),
+            nbytes=plan.arena_bytes(arena=batched, doc_lengths=lengths),
+            save_mode="light",
+        )
+        assert tuple(b is not None for b in packing.blocks) == runs
+        options = (
+            ((lean, None), (batched, lengths)) if runs[0] else ((batched, lengths),)
+        )
+        for arena, doc in options:
+            ws = KdaWorkspace(plan, device, backward=True, arena=arena, doc_lengths=doc)
+            for kwargs in (
+                {"arena": arena},
+                {"arena": arena},
+                {"workspace": ws},
+                {"workspace": ws},
+            ):
+                torch.cuda.synchronize()
+                torch.cuda.set_sync_debug_mode("error")
+                try:
+                    out, grads = _autograd_step(inputs, doc_lengths=doc, **kwargs)
+                finally:
+                    torch.cuda.set_sync_debug_mode("default")
+                tag = (lengths, arena, tuple(kwargs))
+                assert _bits_equal(out, ref_out), tag
+                _check_bits(grads, reference, tag=tag)
+            del ws
+
+
+def test_plan_without_arch_serves_a_workspace_on_the_device(device, manifest) -> None:
+    """A plan made without ``arch`` selects the device's records, so a workspace accepts it on every exported
+    target (the plan of another architecture is refused, naming both)."""
+    lengths, heads = (100, 640, 77), 4
+    S, N = sum(lengths), len(lengths)
+    p = cake_backend.plan(S, N, heads, cake_jit.sm_count(device.index))
+    assert p.arch == cake_jit.device_arch(device.index)
+    ws = KdaWorkspace(p, device)
+    inputs = make_inputs(lengths, heads, device)
+    out, grads, _ = _run_fwd_bwd(inputs, workspace=ws)
+    ref_out, ref_grads, _ = _run_fwd_bwd(inputs)
+    assert _bits_equal(out, ref_out)
+    _check_bits(list(grads.values()), ref_grads)
+    for arch in ARCHES:
+        if arch != p.arch:
+            other = cake_backend.plan(S, N, heads, p.sm_count, arch)
+            with pytest.raises(ValueError, match=f"records of {arch}, the device is"):
+                KdaWorkspace(other, device)
+
+
+def test_a_batched_default_entry_under_capture_asks_for_a_warmed_workspace(
+    device, manifest
+) -> None:
+    """Under CUDA-graph capture the default entry's workspace is the captured call's alone, so a batched arena
+    would capture a copy of ``doc_lengths`` from a host buffer the graph does not own: it raises instead,
+    naming the caller-owned workspace that ran these ``doc_lengths`` before the capture."""
+    lengths, heads = (100, 640, 77, 1000, 129), 2
+    inputs = make_inputs(lengths, heads, device)
+    args = [inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens")]
+    batched = cake_backend.KdaArena(lean=True, tail_passes=2, batch_tokens=1000)
+    # eager first: the programs are loaded and the default entry's own copy is made outside the capture
+    cake_backend.chunk_kda_fwd(*args, arena=batched, doc_lengths=lengths)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    refused = pytest.raises(RuntimeError, match="under CUDA-graph capture needs")
+    with refused, torch.cuda.graph(graph):
+        cake_backend.chunk_kda_fwd(*args, arena=batched, doc_lengths=lengths)
+
+
 def test_the_node_holds_the_workspace_weakly(device, manifest) -> None:
     """A caller-owned workspace serves the backward (its launcher records the backward's launches); a per-call
     workspace dropped after the forward is freed at once (the node holds no strong reference), and the backward
@@ -4483,24 +4776,7 @@ def test_lean_arena_serves_the_saved_states_and_the_tape_paths(
     del out, grads
     assert saved.version == cake_backend.SAVED_VERSION and saved.hseg is not None
     assert saved.qg is not None
-    created: list = []
-    original = cake_backend.KdaWorkspace.for_problem
-
-    def spy(
-        *args, **kwargs
-    ):  # records the option, not the workspace: a strong reference would be "retained"
-        ws_ = original(*args, **kwargs)
-        created.append(
-            types.SimpleNamespace(
-                arena_option=ws_.arena_option,
-                backward=ws_.backward,
-                bytes=ws_.bytes,
-                save_mode=ws_.save_mode,
-            )
-        )
-        return ws_
-
-    monkeypatch.setattr(cake_backend.KdaWorkspace, "for_problem", spy)
+    created = _spy_call_workspaces(monkeypatch)
     launched: list = []
 
     def recording(name, values, *, grid, device_index):
@@ -4597,24 +4873,7 @@ def test_lean_arena_under_checkpointing_and_a_dropped_workspace(
     plan = cake_backend.plan(
         S, N, heads, cake_jit.sm_count(device.index), cake_jit.device_arch(device.index)
     )
-    created: list = []
-    original = cake_backend.KdaWorkspace.for_problem
-
-    def spy(
-        *args, **kwargs
-    ):  # records the option, not the workspace: a strong reference would be "retained"
-        ws_ = original(*args, **kwargs)
-        created.append(
-            types.SimpleNamespace(
-                arena_option=ws_.arena_option,
-                backward=ws_.backward,
-                bytes=ws_.bytes,
-                save_mode=ws_.save_mode,
-            )
-        )
-        return ws_
-
-    monkeypatch.setattr(cake_backend.KdaWorkspace, "for_problem", spy)
+    created = _spy_call_workspaces(monkeypatch)
 
     def leaves():
         return [
@@ -5072,23 +5331,21 @@ def test_memory_report_batched_fields() -> None:
             assert r2["arena_fwd_configured"] == p.arena_bytes(
                 backward=False, arena=arena, doc_lengths=lengths
             )
-            big = max(groups, key=lambda b: b.NC_pad)
-            blocks = 3 * p.batch_segments(big) * heads * D * D * 4
-            assert (
-                blocks
-                <= r2["batch_scratch"]
-                <= blocks
-                + 4
-                * (
-                    2 * big.NC_pad
-                    + 2 * big.N
-                    + 2
-                    + p.batch_segments(big)
-                    + 2 * big.N
-                    + 1
-                    + 5 * 64
+            # the largest table buffer of a group and three state blocks per segment of the group with the most
+            # segments (here the two-document group, not the one with the most chunks)
+            segments_b = max(p.batch_segments(b) for b in groups)
+            if p.recur == "seg":
+                assert (
+                    segments_b
+                    == p.batch_segments(groups[0])
+                    > max(p.batch_segments(b) for b in groups[1:])
                 )
+            blocks = 3 * segments_b * heads * D * D * 4
+            words = max(
+                2 * b.NC_pad + 2 * b.N + 2 + p.batch_segments(b) + 2 * b.N + 1 + 5 * 64
+                for b in groups
             )
+            assert blocks <= r2["batch_scratch"] <= blocks + 4 * words
             nc_min = -(-max(lengths) // BT) + 1
             rows_min = BT * (nc_min + nc_min % 2)
             block_min = p.P * heads * D * D * 4 if p.recur == "seg" else 0
@@ -5140,13 +5397,40 @@ def _group_rows_sliced(path: str) -> bool:
     return path not in ("fwd_nosave", "replay")
 
 
-def _expected_batched_launches(p, arena, lengths, path, *, tail_passes=1):
+def _fewest_tail_passes(pb, arena, nbytes, save_mode="light") -> int:
+    """The tail passes of a group's backward (group plan ``pb``) on an arena of ``nbytes``, the package's rule
+    restated: the fewest up to the option's ``tail_passes`` whose lean layouts fit (``bwd_tape_lean`` on a
+    tape-mode workspace, also ``bwd_lean`` on a light one), else the option's."""
+    modes = ("bwd_tape_lean",) if save_mode == "tape" else ("bwd_lean", "bwd_tape_lean")
+    return next(
+        (
+            t
+            for t in range(1, arena.tail_passes)
+            if all(pb.workspace_bytes(mode, t) <= nbytes for mode in modes)
+        ),
+        arena.tail_passes,
+    )
+
+
+def _group_passes(p, arena, lengths, path, *, nbytes, save_mode="light") -> list[int]:
+    """Per group of a batched call on ``path``, the tail passes of its backward (:func:`_fewest_tail_passes`)."""
+    return [
+        _fewest_tail_passes(
+            p.batch_plan(b, tape=_group_rows_sliced(path)), arena, nbytes, save_mode
+        )
+        for b in p.batches(arena, lengths)
+    ]
+
+
+def _expected_batched_launches(p, arena, lengths, path, *, passes=None):
     """The launch order of a batched call: on the saving forward the whole problem's tables by the saved-set
     paths' table program, then every group's forward list (its own tables where the row dispatches a table program
     on the forward); on the backward every group's list with the group's tables first (the saved set's describe the
-    whole problem) and the tail once per range of the group's chunk bound."""
+    whole problem) and the tail once per range of the group's chunk bound at the group's tail passes (``passes``,
+    one per group: :func:`_group_passes`; ``None``: one pass each)."""
     seq = []
     batches = p.batches(arena, lengths)
+    passes = [1] * len(batches) if passes is None else passes
     if path in ("fwd", "fwd_nosave"):
         if path == "fwd" and p.dispatched("table", "light"):
             seq.append(p.record("table", "light"))
@@ -5156,20 +5440,22 @@ def _expected_batched_launches(p, arena, lengths, path, *, tail_passes=1):
             pb = p.batch_plan(b, tape=_group_rows_sliced(path))
             seq += _expected_launches(pb, path)
         return seq
-    for b in batches:
+    for b, t in zip(batches, passes, strict=True):
         seq += _expected_launches(
             p.batch_plan(b, tape=_group_rows_sliced(path)),
             path,
             saved_tables=False,
-            tail_passes=tail_passes,
+            tail_passes=t,
         )
     return seq
 
 
-def _check_group_launches(launched, p, arena, lengths, path, *, tail_passes=1) -> None:
+def _check_group_launches(launched, p, arena, lengths, path, *, passes=None) -> None:
     """Every launch of a group carries the group's scalars (``num_seqs``, ``num_chunks_pad``) and one of the
-    group plan's grids; the tail passes carry ``num_seqs = 0`` and their range's chunk count."""
+    group plan's grids; the tail passes (``passes``, one per group, ``None``: one pass each) carry
+    ``num_seqs = 0`` and their range's chunk count."""
     batches = p.batches(arena, lengths)
+    passes = [1] * len(batches) if passes is None else passes
     forward = path in ("fwd", "fwd_nosave")
     pos = 0
     if forward and path == "fwd" and p.dispatched("table", "light"):
@@ -5177,24 +5463,22 @@ def _check_group_launches(launched, p, arena, lengths, path, *, tail_passes=1) -
         for name, grid, num_seqs, nc in launched[:head]:
             assert (num_seqs, nc) == (p.N, p.NC_pad) and grid in p.grids[name], name
         pos = head
-    for b in batches:
+    for b, t in zip(batches, passes, strict=True):
         pb = p.batch_plan(b, tape=_group_rows_sliced(path))
         expected = (
             _expected_launches(pb, path)
             if forward
-            else _expected_launches(
-                pb, path, saved_tables=False, tail_passes=tail_passes
-            )
+            else _expected_launches(pb, path, saved_tables=False, tail_passes=t)
         )
         group = launched[pos : pos + len(expected)]
         pos += len(expected)
         assert [n for n, *_ in group] == expected
         tail_names = set() if forward else set(_tail_records(pb, path))
         width = len(tail_names)
-        ranges = cake_backend._tail_ranges(pb.NC_pad, tail_passes)
+        ranges = cake_backend._tail_ranges(pb.NC_pad, t)
         tails = []
         for name, grid, num_seqs, nc in group:
-            if name in tail_names and tail_passes > 1:
+            if name in tail_names and t > 1:
                 tails.append((name, grid, num_seqs, nc))
                 continue
             assert (num_seqs, nc) == (pb.N, pb.NC_pad), (name, b)
@@ -5217,13 +5501,38 @@ def _check_group_launches(launched, p, arena, lengths, path, *, tail_passes=1) -
     assert pos == len(launched)
 
 
+def _check_tail_counts(counts, p, arena, lengths, path, *, passes=None) -> None:
+    """The one-entry chunk counts of a batched backward's tail launches (``seq_chunk_start`` at ``num_seqs = 0``, in
+    launch order): every launch of a group's range ``c0`` reads ``clamp(real_b - c0, 0, ceil(NC_pad_b / b))`` at
+    the group's tail passes ``b`` (``passes``, one per group, ``None``: one pass each), the device rule the host
+    reproduces from ``doc_lengths``; none for a group in one pass."""
+    batches = p.batches(arena, lengths)
+    passes = [1] * len(batches) if passes is None else passes
+    torch.cuda.synchronize()
+    pos = 0
+    for b, t in zip(batches, passes, strict=True):
+        if t == 1:
+            continue
+        pb = p.batch_plan(b, tape=_group_rows_sliced(path))
+        width = len(_tail_records(pb, path))
+        real = _real_chunks(lengths[b.d0 : b.d1])
+        ranges = cake_backend._tail_ranges(pb.NC_pad, t)
+        for c0, _length in ranges:
+            want = min(max(real - c0, 0), ranges[0][1])
+            for _ in range(width):
+                assert counts[pos].tolist() == [want], (b, c0)
+                pos += 1
+    assert pos == len(counts)
+    assert (pos > 0) == any(t > 1 for t in passes)
+
+
 def _real_chunks(lengths) -> int:
     return sum(-(-int(n) // BT) for n in lengths)
 
 
 @pytest.mark.parametrize("shape", D_ROWS, ids=_shape_id)
 def test_batched_arena_gives_the_default_results_bitwise(
-    device, manifest, shape
+    device, manifest, shape, monkeypatch
 ) -> None:
     """Two groups, three and one document per group, with and without the lean layouts: the batched forward gives
     the default's ``out``, token rows, tables and saved states bit for bit, the batched backward the default's
@@ -5246,7 +5555,7 @@ def test_batched_arena_gives_the_default_results_bitwise(
     _, saved_t = cake_backend.chunk_kda_fwd(
         q, k, v, g, beta, cu, workspace=tape_default
     )
-    ref_h, ref_v_new = saved_t.h[:real].clone(), saved_t.v_new[: BT * real].clone()
+    ref_h, ref_v_new = saved_t.h[:real].clone(), saved_t.v_new.clone()
     ref_seg_m = None if saved_t.seg_m is None else saved_t.seg_m.clone()
     del tape_default
     for label, kw in _partitions(lengths):
@@ -5359,15 +5668,36 @@ def test_batched_arena_gives_the_default_results_bitwise(
             assert tws.bytes == p.arena_bytes(
                 save_mode="tape", arena=arena, doc_lengths=lengths
             )
+            # the saved v_new comes from its allocation filled with NaN: a row no group writes would show
+            original_alloc, poisoned = cake_backend._alloc, []
+
+            def nan_v_new(
+                shape_,
+                dtype,
+                device_,
+                _orig=original_alloc,
+                _hit=poisoned,
+                _ref=ref_v_new,
+            ):
+                t = _orig(shape_, dtype, device_)
+                if dtype == _ref.dtype and tuple(shape_) == tuple(_ref.shape):
+                    t.view(torch.uint8).fill_(0xFF)
+                    _hit.append(t.data_ptr())
+                return t
+
+            monkeypatch.setattr(cake_backend, "_alloc", nan_v_new)
             o, saved_tb = cake_backend.chunk_kda_fwd(
                 q, k, v, g, beta, cu, workspace=tws, doc_lengths=lengths
             )
+            monkeypatch.setattr(cake_backend, "_alloc", original_alloc)
+            assert poisoned == [saved_tb.v_new.data_ptr()], tag
             assert (
                 _bits_equal(o, ref_out)
                 and saved_tb.version == cake_backend.SAVED_VERSION_TAPE
             ), tag
             assert _bits_equal(saved_tb.h[:real], ref_h), tag
-            assert _bits_equal(saved_tb.v_new[: BT * real], ref_v_new), tag
+            # v_new whole, its pad rows included: zero in both (the rows after the last group's slice too)
+            assert _bits_equal(saved_tb.v_new, ref_v_new), tag
             assert (saved_tb.seg_m is None) == (ref_seg_m is None), tag
             if ref_seg_m is not None:
                 assert _bits_equal(saved_tb.seg_m, ref_seg_m), tag
@@ -5455,8 +5785,10 @@ def test_batched_arena_launches_per_group(device, manifest) -> None:
     """The batched call's launch list is every group's list in turn (the whole problem's tables first on the saving
     forward; the group's tables first on the backward), each launch at the group's scalars and grids (the saving
     forward's groups in the tape geometry: they write slices of the saved qg / w / u); the overlap pair's and the
-    two-level carry's epoch advances once per group through the shared counter; the group tables are slices of
-    the whole problem's."""
+    two-level carry's epoch advances once per group through the shared counter; every group runs its tail in the
+    fewest passes that fit the arena (groups in several passes and in one, within a call too), whose launches read
+    the host's chunk counts of their ranges; the group tables are slices of the whole problem's."""
+    seen = {"multi": 0, "one_pass": 0, "mixed": 0}
     for lengths, heads in (
         ((63, 1, 65), 4),
         ((100, 0, 300), 2),
@@ -5475,6 +5807,7 @@ def test_batched_arena_launches_per_group(device, manifest) -> None:
         ref_out, ref_grads = _clone_all(out, grads)
         del out, grads
         launched: list = []
+        counts: list = []  # the tail passes' one-entry chunk counts (num_seqs = 0), in launch order
 
         def recording(name, values, *, grid, device_index):
             launched.append(
@@ -5485,6 +5818,8 @@ def test_batched_arena_launches_per_group(device, manifest) -> None:
                     int(values["num_chunks_pad"]),
                 )
             )
+            if int(values["num_seqs"]) == 0:
+                counts.append(values["seq_chunk_start"])
             cake_jit.run_module(name, values, grid=grid, device_index=device_index)
 
         for label, kw in _partitions(lengths):
@@ -5539,6 +5874,7 @@ def test_batched_arena_launches_per_group(device, manifest) -> None:
                     p, arena, lengths, "fwd_nosave"
                 ), case
                 launched.clear()
+                counts.clear()
                 got = cake_backend.chunk_kda_bwd(
                     q,
                     k,
@@ -5553,11 +5889,22 @@ def test_batched_arena_launches_per_group(device, manifest) -> None:
                 )
                 _check_bits(got, ref_grads, tag=case)
                 path = p.light_path
+                # every group's tail in the fewest passes up to t that fit the arena, as its view has it
+                passes = _group_passes(p, arena, lengths, path, nbytes=ws.bytes)
+                assert [
+                    ws.batch_view(b, tape=_group_rows_sliced(path)).tail_passes
+                    for b in batches
+                ] == passes, case
+                if t > 1:
+                    seen["multi"] += sum(x > 1 for x in passes)
+                    seen["one_pass"] += passes.count(1)
+                    seen["mixed"] += len(set(passes)) > 1
                 names = [n for n, *_ in launched]
                 assert names == _expected_batched_launches(
-                    p, arena, lengths, path, tail_passes=t
+                    p, arena, lengths, path, passes=passes
                 ), case
-                _check_group_launches(launched, p, arena, lengths, path, tail_passes=t)
+                _check_group_launches(launched, p, arena, lengths, path, passes=passes)
+                _check_tail_counts(counts, p, arena, lengths, path, passes=passes)
                 if t == 1:  # the replay group by group
                     launched.clear()
                     got = cake_backend.chunk_kda_bwd(
@@ -5600,12 +5947,15 @@ def test_batched_arena_launches_per_group(device, manifest) -> None:
                         and not tb[1][real_b : b.NC_pad].any()
                     )
                 del ws
+    assert min(seen.values()) > 0, seen
 
 
 def test_batched_arena_on_a_row_that_saves_the_states(device, manifest) -> None:
     """A pack above the size rule (its light set carries the states) whose last document alone would be below it:
-    the groups follow the whole problem's rule, the forward scatters their blocks into the saved states by chain
-    rank, the backward gathers them (``light_states`` as pass 2 alone), everything bit for bit."""
+    the groups follow the whole problem's rule, the forward writes their blocks into the saved states by chain
+    rank, the backward reads them there (``light_states`` as pass 2 alone; the documents rank in pack order, so
+    every group's blocks are one run of the saved ones: the carry writes the saved ``hseg``, the backward reads
+    views), everything bit for bit."""
     lengths, heads = (40000, 20000, 20000, 1000), 4
     sm, arch = cake_jit.sm_count(device.index), cake_jit.device_arch(device.index)
     # The size rule is S >= SEG_SAVE_MIN_TOKENS_PER_SEG * NSEG with NSEG = the SM count here, so on a device
@@ -5683,7 +6033,7 @@ def test_batched_arena_on_a_row_that_saves_the_states(device, manifest) -> None:
         del ws
 
 
-def test_batched_arena_with_exact_zero_values(device, manifest) -> None:
+def test_batched_arena_with_exact_zero_values(device, manifest, monkeypatch) -> None:
     """Rows with exact zeros in ``v`` and ``dout`` (a zero token row, a zero chunk at a group's first chunk, a whole
     zero document at an odd chunk): the paired WY programs accumulate ``0 * partner`` for the other chunk of a
     pair, so a changed partner could only change the sign of an exactly-zero entry; the bit-pattern comparison of
@@ -5717,7 +6067,7 @@ def test_batched_arena_with_exact_zero_values(device, manifest) -> None:
         _, saved_t = cake_backend.chunk_kda_fwd(
             q, k, v, g, beta, cu_t, workspace=tape_default
         )
-        ref_h, ref_v_new = saved_t.h[:real].clone(), saved_t.v_new[: BT * real].clone()
+        ref_h, ref_v_new = saved_t.h[:real].clone(), saved_t.v_new.clone()
         del tape_default
         for label, kw in _partitions(lengths):
             arena = cake_backend.KdaArena(lean=True, tail_passes=2, **kw)
@@ -5748,12 +6098,33 @@ def test_batched_arena_with_exact_zero_values(device, manifest) -> None:
             tws = KdaWorkspace.for_problem(
                 S, N, heads, device, save_mode="tape", arena=arena, doc_lengths=lengths
             )
+            # the saved v_new comes from its allocation filled with NaN: a row no group writes would show
+            original_alloc, poisoned = cake_backend._alloc, []
+
+            def nan_v_new(
+                shape_,
+                dtype,
+                device_,
+                _orig=original_alloc,
+                _hit=poisoned,
+                _ref=ref_v_new,
+            ):
+                t = _orig(shape_, dtype, device_)
+                if dtype == _ref.dtype and tuple(shape_) == tuple(_ref.shape):
+                    t.view(torch.uint8).fill_(0xFF)
+                    _hit.append(t.data_ptr())
+                return t
+
+            monkeypatch.setattr(cake_backend, "_alloc", nan_v_new)
             o, saved_tb = cake_backend.chunk_kda_fwd(
                 q, k, v, g, beta, cu_t, workspace=tws, doc_lengths=lengths
             )
+            monkeypatch.setattr(cake_backend, "_alloc", original_alloc)
+            assert poisoned == [saved_tb.v_new.data_ptr()], tag
             assert _bits_equal(o, ref_out), tag
             assert _bits_equal(saved_tb.h[:real], ref_h), tag
-            assert _bits_equal(saved_tb.v_new[: BT * real], ref_v_new), tag
+            # v_new whole, its pad rows included: zero in both (the rows after the last group's slice too)
+            assert _bits_equal(saved_tb.v_new, ref_v_new), tag
             got = cake_backend.chunk_kda_bwd(
                 q,
                 k,
@@ -5798,24 +6169,7 @@ def test_batched_arena_under_checkpointing_and_a_dropped_workspace(
     ]
     exact = plan.arena_bytes(arena=arena, doc_lengths=lengths)
     assert exact < plan.arena_bytes(arena=arena) < plan.arena_bytes()
-    created: list = []
-    original = cake_backend.KdaWorkspace.for_problem
-
-    def spy(
-        *args, **kwargs
-    ):  # records the option, not the workspace: a strong reference would be "retained"
-        ws_ = original(*args, **kwargs)
-        created.append(
-            types.SimpleNamespace(
-                arena_option=ws_.arena_option,
-                backward=ws_.backward,
-                bytes=ws_.bytes,
-                doc_lengths=ws_.doc_lengths,
-            )
-        )
-        return ws_
-
-    monkeypatch.setattr(cake_backend.KdaWorkspace, "for_problem", spy)
+    created = _spy_call_workspaces(monkeypatch)
 
     def leaves():
         return [
@@ -5929,7 +6283,8 @@ def test_batched_arena_content_never_reaches_a_result(device, manifest) -> None:
     """Write-before-read on the batched option too: a batched arena filled with NaN bytes before every call gives
     the zero-filled default arena's results bit for bit (the forward, the backward from the light and the tape
     sets, a light set on the tape workspace, the forward without a saved set), including a row whose light set
-    carries the states (the gathers read the saved tensors, not the arena)."""
+    carries the states (the groups read the saved tensors, not the arena; pass 2 never touches the arena's
+    ``seg_state`` it is bound to at ``write_ht = 0``)."""
     cases = (
         ((63, 1, 65, 30), 2, "light", 1, {"batch_tokens": 95}),
         ((100, 640, 77, 1000, 129), 2, "light", 3, {"batch_tokens": 1000}),
@@ -6062,3 +6417,624 @@ def test_batched_arena_content_never_reaches_a_result(device, manifest) -> None:
         )
         assert _bits_equal(nosave, reference_out), case
         zeroed = poisoned = None  # (no del: the poison closure refers to the name)
+
+
+# ------------------------------------------------------------------------------------------------------------------
+# The batched arena option: the groups' state blocks by the host's chain ranks
+
+# A pack above the size rule whose first group's state blocks are not one run of the whole problem's: document 1
+# ranks last (16 chunks) and documents 2 and 3 between, so under ``batch_tokens = L0 + 1000`` the group (0, 2) holds
+# ranks 0 and 3 (gathered and scattered by index) and the group (2, 4) ranks 1 and 2 (one run).  The first document
+# grows with the device's segment count (_saving_pack).
+SPLIT_LENGTHS = (40000, 1000, 20000, 20000)
+# Packs of the host chain ranks: the issue's pack, tied chunk counts, zero-length documents, interleaved ties (no
+# group of two or more documents is one run), one document, a small pack whose first group is not one run under
+# ``batch_tokens = 704`` and 300 documents (the one-CTA ``table`` program; ties and two zero-length documents).
+RANK_PACKS = (
+    (ISSUE_LENGTHS, ISSUE_HEADS),
+    ((128, 100, 128, 65, 1, 64), 2),
+    ((100, 0, 300, 0, 64), 2),
+    ((64, 640, 1, 600, 63, 577), 2),
+    ((1000,), 8),
+    ((640, 64, 320), 2),
+    (tuple((37 * i + 11) % 130 for i in range(300)), 1),
+)
+# the groupings beyond _partitions a pack runs under (the issue's two groups of the lean four-pass budget, the
+# groups that are not one run)
+RANK_GROUPINGS = {
+    ISSUE_LENGTHS: ({"batch_tokens": 200000},),
+    (640, 64, 320): ({"batch_tokens": 704},),
+    (1000,): ({"batch_tokens": 1000},),
+}
+
+
+def _saving_pack(lengths, heads, device) -> tuple[int, ...]:
+    """``lengths`` with the first document grown (4096 tokens a step) until the plan on this device saves the
+    segment states (``S >= 384 * NSEG``: on a device with more SMs the segment count grows)."""
+    sm, arch = cake_jit.sm_count(device.index), cake_jit.device_arch(device.index)
+    lengths = tuple(lengths)
+    for _ in range(64):
+        if cake_backend.plan(sum(lengths), len(lengths), heads, sm, arch).seg_save:
+            return lengths
+        lengths = (lengths[0] + 4096, *lengths[1:])
+    raise AssertionError(f"no pack from {lengths} saves the states on this device")
+
+
+def _kernel_ranks(lengths) -> list[int]:
+    """The chain rank every ``seq_order`` writer gives each document (``table``, ``table_v2``, ``table_v3`` and the
+    segmented intra program ``fwd_intra_v14``, their loop spelled out): one per document with more chunks, one per
+    earlier document with as many."""
+    nc = [(int(n) + BT - 1) // BT for n in lengths]
+    return [
+        sum(1 for j, m in enumerate(nc) if m > nc[d] or (m == nc[d] and j < d))
+        for d in range(len(nc))
+    ]
+
+
+def _expected_group_blocks(whole, lengths, batch, P) -> list[int]:
+    """The whole problem's state blocks of one group in the group's own block order, by the kernels' layout: the
+    group's tables rank its documents among themselves, the whole problem's among all (``whole``, the
+    :func:`_kernel_ranks` of ``lengths``), ``P`` blocks per chain."""
+    local = _kernel_ranks(lengths[batch.d0 : batch.d1])
+    order = sorted(range(batch.N), key=lambda d: local[d])
+    return [P * whole[batch.d0 + d] + s for d in order for s in range(P)]
+
+
+def _one_run(blocks) -> bool:
+    return blocks == list(range(blocks[0], blocks[0] + len(blocks)))
+
+
+def test_host_chain_ranks_and_block_runs_follow_the_tables_rule() -> None:
+    """The host's chain ranks (``_seq_order`` / ``_chain_ranks``) are the rank every ``seq_order`` writer computes,
+    and a batched packing (``_Packing``) holds the kernels' block layout: per group the whole problem's first block
+    where the group's blocks are one run of the whole problem's, else their indices, and the tail passes' chunk
+    counts of the device rule at both of the group's chunk bounds.  On every architecture, over the rank packs and
+    their groupings, with the counts at each group's own tail passes (:func:`_fewest_tail_passes`; none for a
+    group in one pass); the issue's two groups of the lean four-pass budget are the runs [0, 76) and [76, 152) on
+    a 152-SM ``sm_100a``, and the serial route has no blocks."""
+    seen = {"run": 0, "index": 0, "tail": 0, "one_pass": 0}
+    for lengths, heads in RANK_PACKS:
+        lengths = tuple(lengths)
+        S, N = sum(lengths), len(lengths)
+        ranks = _kernel_ranks(lengths)
+        order = cake_backend._seq_order(lengths)
+        assert cake_backend._chain_ranks(lengths) == tuple(ranks), lengths
+        assert sorted(order) == list(range(N)), lengths
+        assert all(ranks[d] == r for r, d in enumerate(order)), lengths
+        groupings = list(RANK_GROUPINGS.get(lengths, ()))
+        groupings += [kw for _label, kw in _partitions(lengths) if kw not in groupings]
+        for arch in ARCHES:
+            p = cake_backend.plan(S, N, heads, 148, arch)
+            assert p.recur == "seg" and not p.proportional, (lengths, arch)
+            for kw in groupings:
+                for t in (1, 4):
+                    arena = cake_backend.KdaArena(lean=t > 1, tail_passes=t, **kw)
+                    nbytes = p.arena_bytes(arena=arena, doc_lengths=lengths)
+                    packing = cake_backend._host_packing(
+                        p, arena, lengths, nbytes=nbytes, save_mode="light"
+                    )
+                    case = (lengths, arch, kw, t)
+                    assert packing.batches == p.batches(arena, lengths), case
+                    assert packing.words[:N] == lengths and packing.P == p.P, case
+                    assert packing.words_dev is None and packing.index_dev is None
+                    for i, b in enumerate(packing.batches):
+                        blocks = _expected_group_blocks(ranks, lengths, b, p.P)
+                        assert len(blocks) == b.N * p.P, (case, b)
+                        if _one_run(blocks):
+                            assert packing.blocks[i] == blocks[0], (case, b)
+                            assert i not in packing.index_at, (case, b)
+                            seen["run"] += 1
+                        else:
+                            assert packing.blocks[i] is None, (case, b)
+                            first, n = packing.index_at[i]
+                            assert list(packing.index[first : first + n]) == blocks
+                            seen["index"] += 1
+                        real = _real_chunks(lengths[b.d0 : b.d1])
+                        for nc_pad in (b.NC_pad, b.NC_pad_tape):
+                            pb = p.batch_plan(b, tape=nc_pad != b.NC_pad)
+                            passes = _fewest_tail_passes(pb, arena, nbytes)
+                            if passes == 1:
+                                assert (i, nc_pad) not in packing.tail_at, (case, b)
+                                seen["one_pass"] += t > 1
+                                continue
+                            ranges = cake_backend._tail_ranges(nc_pad, passes)
+                            want = [
+                                min(max(real - c0, 0), ranges[0][1])
+                                for c0, _n in ranges
+                            ]
+                            first, n = packing.tail_at[(i, nc_pad)]
+                            got = list(packing.words[first : first + n])
+                            assert got == want, (case, b, nc_pad)
+                            seen["tail"] += 1
+    assert min(seen.values()) > 0, seen
+    # the issue's pack under the lean four-pass budget of two groups: the second starts at an odd chunk, both are
+    # one run
+    S = sum(ISSUE_LENGTHS)
+    p = cake_backend.plan(S, len(ISSUE_LENGTHS), ISSUE_HEADS, 152, "sm_100a")
+    arena = cake_backend.KdaArena(lean=True, tail_passes=4, batch_tokens=200000)
+    packing = cake_backend._host_packing(
+        p,
+        arena,
+        ISSUE_LENGTHS,
+        nbytes=p.arena_bytes(arena=arena, doc_lengths=ISSUE_LENGTHS),
+        save_mode="light",
+    )
+    assert [(b.d0, b.d1, b.c0) for b in packing.batches] == [(0, 2, 0), (2, 4, 2981)]
+    assert (p.P, p.NSEG, packing.blocks, packing.index) == (38, 152, (0, 76), ())
+    # the split pack: its first group by index, its second one run from the second chain
+    for arch in ARCHES:
+        p = cake_backend.plan(sum(SPLIT_LENGTHS), 4, 4, 148, arch)
+        arena = cake_backend.KdaArena(batch_tokens=SPLIT_LENGTHS[0] + SPLIT_LENGTHS[1])
+        packing = cake_backend._host_packing(
+            p,
+            arena,
+            SPLIT_LENGTHS,
+            nbytes=p.arena_bytes(arena=arena, doc_lengths=SPLIT_LENGTHS),
+            save_mode="light",
+        )
+        assert [(b.d0, b.d1) for b in packing.batches] == [(0, 2), (2, 4)]
+        assert packing.blocks == (None, p.P), arch
+        assert packing.index == tuple(range(p.P)) + tuple(range(3 * p.P, 4 * p.P))
+    # the serial route: no state blocks, no indices
+    p = cake_backend.plan(129, 3, 64, 148, ARCHES[0])
+    assert p.recur == "serial"
+    arena = cake_backend.KdaArena(batch_tokens=65)
+    packing = cake_backend._host_packing(
+        p,
+        arena,
+        (63, 1, 65),
+        nbytes=p.arena_bytes(arena=arena, doc_lengths=(63, 1, 65)),
+        save_mode="light",
+    )
+    assert packing.blocks == (None, None)
+    assert packing.index == () and not packing.index_at
+
+
+def test_batched_groups_take_the_fewest_tail_passes_that_fit() -> None:
+    """Under a batched option with ``tail_passes = B`` every group runs its tail in the fewest passes up to ``B``
+    whose lean layouts at the group's geometry fit the arena (``_group_tail_passes``, which the group views and the
+    host's chunk counts take): the restated rule's count, between one and ``B``, fitting the arena, no fewer
+    fitting; the bound of every group (a larger arena) never takes more than the exact groups.  Over the rank packs
+    and their groupings on every architecture, light and tape, groups in one pass and in several, within one call
+    too.  The issue's pack on a 152-SM ``sm_100a`` under the lean four-pass budget of two groups: the first group,
+    which sizes the arena, keeps four passes and the second fits one (three and one on the bound's arena), so the
+    host's counts are the first group's alone and the tail launches five times per stage instead of eight."""
+    seen = {"multi": 0, "one_pass": 0, "mixed": 0}
+    for lengths, heads in RANK_PACKS:
+        lengths = tuple(lengths)
+        S, N = sum(lengths), len(lengths)
+        groupings = list(RANK_GROUPINGS.get(lengths, ()))
+        groupings += [kw for _label, kw in _partitions(lengths) if kw not in groupings]
+        for arch in ARCHES:
+            p = cake_backend.plan(S, N, heads, 148, arch)
+            for kw in groupings:
+                for t in (1, 2, 3, 4):
+                    arena = cake_backend.KdaArena(lean=t > 1, tail_passes=t, **kw)
+                    batches = p.batches(arena, lengths)
+                    for save_mode in ("light", "tape"):
+                        modes = ("bwd_tape_lean",)
+                        if save_mode == "light":
+                            modes += ("bwd_lean",)
+                        sized = {
+                            sizing: p.arena_bytes(
+                                save_mode=save_mode, arena=arena, doc_lengths=doc
+                            )
+                            for sizing, doc in (("exact", lengths), ("bound", None))
+                        }
+                        got = {}
+                        for (sizing, nbytes), b in itertools.product(
+                            sized.items(), batches
+                        ):
+                            for nc_pad in sorted({b.NC_pad, b.NC_pad_tape}):
+                                pb = p.batch_plan(b, tape=nc_pad != b.NC_pad)
+                                passes = cake_backend._group_tail_passes(
+                                    p,
+                                    b,
+                                    nc_pad,
+                                    arena,
+                                    nbytes=nbytes,
+                                    save_mode=save_mode,
+                                )
+                                case = (lengths, arch, kw, t, save_mode, sizing, b)
+                                fits = [
+                                    all(
+                                        pb.workspace_bytes(m, x) <= nbytes
+                                        for m in modes
+                                    )
+                                    for x in range(1, t + 1)
+                                ]
+                                assert passes == _fewest_tail_passes(
+                                    pb, arena, nbytes, save_mode
+                                ), case
+                                assert 1 <= passes <= t and fits[passes - 1], case
+                                assert not any(fits[: passes - 1]), case
+                                got[(sizing, b, nc_pad)] = passes
+                        for (sizing, b, nc_pad), passes in got.items():
+                            assert passes <= got[("exact", b, nc_pad)], (lengths, t)
+                            if t > 1 and sizing == "exact":
+                                seen["multi" if passes > 1 else "one_pass"] += 1
+                        if t > 1:
+                            seen["mixed"] += (
+                                len({got[("exact", b, b.NC_pad)] for b in batches}) > 1
+                            )
+    assert min(seen.values()) > 0, seen
+    # the issue's pack: four passes for the group that sizes the arena, one for the other
+    S = sum(ISSUE_LENGTHS)
+    p = cake_backend.plan(S, len(ISSUE_LENGTHS), ISSUE_HEADS, 152, "sm_100a")
+    arena = cake_backend.KdaArena(lean=True, tail_passes=4, batch_tokens=200000)
+    batches = p.batches(arena, ISSUE_LENGTHS)
+    assert [(b.NC_pad, b.NC_pad_tape) for b in batches] == [(2982, 2982), (1108, 1108)]
+    light = p.arena_bytes(arena=arena, doc_lengths=ISSUE_LENGTHS)
+    assert light == 2212534272
+    assert p.batch_plan(batches[0]).workspace_bytes("bwd_lean", 3) > light
+    for save_mode in ("light", "tape"):
+        for doc, want in ((ISSUE_LENGTHS, [4, 1]), (None, [3, 1])):
+            nbytes = p.arena_bytes(save_mode=save_mode, arena=arena, doc_lengths=doc)
+            got = [
+                cake_backend._group_tail_passes(
+                    p, b, b.NC_pad, arena, nbytes=nbytes, save_mode=save_mode
+                )
+                for b in batches
+            ]
+            assert got == want, (save_mode, doc, got)
+    packing = cake_backend._host_packing(
+        p, arena, ISSUE_LENGTHS, nbytes=light, save_mode="light"
+    )
+    assert packing.tail_at == {(0, 2982): (4, 4)}
+    assert packing.words[4:8] == (746, 746, 746, 743)
+
+
+# the device rows of the host ranks: every seq_order writer (table_v3 and fwd_intra_v14 on the segmented route up to
+# 256 documents, table_v2 on the serial route there, table above 256 documents)
+RANK_ROWS = (*RANK_PACKS, ((128, 100, 128, 65, 1, 64), 32))
+
+
+def test_host_chain_ranks_match_every_seq_order_writer(
+    device, manifest, monkeypatch
+) -> None:
+    """The host's ``seq_order`` is the table every writer leaves on the device, and its chain ranks the ``argsort``
+    of that table (the rule of the device glue it replaces): the saved-set paths' table program (``table_v3`` /
+    ``table_v2`` / ``table``) and the forward's own tables (the segmented intra program ``fwd_intra_v14`` up to
+    256 documents, ``table_v2`` on the serial route), over tied, zero-length, interleaved, one-document and
+    300-document packs."""
+    original = cake_backend._tables
+    writers: set = set()
+    compared = 0
+    for lengths, heads in RANK_ROWS:
+        lengths = tuple(lengths)
+        S, N = sum(lengths), len(lengths)
+        inputs = make_inputs(lengths, heads, device)
+        q, k, v, g, beta, cu = (
+            inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens")
+        )
+        ws = KdaWorkspace.for_problem(S, N, heads, device, backward=False)
+        p = ws.plan
+        written = [(p.record("table", "light"), original(ws, cu, "light"))]
+        # the forward's own tables (above 256 documents the same table program writes them)
+        if N <= 256:
+            seen: list = []
+
+            def spy(*args, _seen=seen, **kwargs):
+                tables = original(*args, **kwargs)
+                _seen.append(tables)
+                return tables
+
+            monkeypatch.setattr(cake_backend, "_tables", spy)
+            cake_backend.chunk_kda_fwd(
+                q, k, v, g, beta, cu, save_for_backward=False, workspace=ws
+            )
+            monkeypatch.setattr(cake_backend, "_tables", original)
+            assert len(seen) == 1, lengths
+            fwd = "fwd_nosave"
+            writer = (
+                p.record("table", fwd)
+                if p.dispatched("table", fwd)
+                else p.record("fwd_intra", fwd)
+            )
+            written.append((writer, seen[0]))
+        torch.cuda.synchronize()
+        want = list(cake_backend._seq_order(lengths))
+        ranks = list(cake_backend._chain_ranks(lengths))
+        assert ranks == _kernel_ranks(lengths), lengths
+        for writer, tables in written:
+            assert tables[3][:N].tolist() == want, (lengths, heads, writer)
+            assert torch.argsort(tables[3][:N]).tolist() == ranks, (lengths, writer)
+            writers.add(writer)
+            compared += 1
+        del ws
+    assert writers == {"table", "table_v2", "table_v3", "fwd_intra_v14"}, writers
+    assert compared == len(RANK_ROWS) + sum(
+        1 for lengths, _heads in RANK_ROWS if len(lengths) <= 256
+    )
+
+
+def test_batched_block_runs_give_the_default_results_bitwise(
+    device, manifest, monkeypatch
+) -> None:
+    """The groups' state blocks by the host's chain ranks give the default's results bit for bit on both sides of
+    the run test: the saving forward's carry writes a one-run group's carried states straight into the saved
+    ``hseg`` (its offsets / transfers two contiguous copies; the tape's transfers one) and scatters the other groups'
+    by index; the backward reads views of a one-run group's saved ``hseg`` and transfers (``light_states``: its pass
+    2 bound to the arena's ``seg_state``, poisoned here with the rest of the arena) or ``seg_m`` (``tape``) and
+    gathers the others'; the lean tail passes take the host's chunk counts, a group whose one-pass lean layout fits
+    the arena running its tail in one pass.  Over the issue's pack (two groups, the
+    second at an odd chunk; one document per group), a pack above the size rule with a group that is not one run,
+    tied chunk counts, zero-length documents, interleaved ties, one document and a small pack with a group that is
+    not one run, under their groupings.  The saved state blocks start as NaN (every block must be written) and
+    every comparison is counted."""
+    sm, arch = cake_jit.sm_count(device.index), cake_jit.device_arch(device.index)
+    split = _saving_pack(SPLIT_LENGTHS, 4, device)
+    cases = [(ISSUE_LENGTHS, ISSUE_HEADS, (1, 4)), (split, 4, (1, 4))] + [
+        (lengths, heads, (1, 3))
+        for lengths, heads in RANK_PACKS[1:6]  # the smaller packs (no 300-document one)
+    ]
+    groupings_of = {**RANK_GROUPINGS, split: ({"batch_tokens": split[0] + split[1]},)}
+    original_alloc = cake_backend._alloc
+
+    def poisoned_alloc(shape, dtype, device_):
+        t = original_alloc(shape, dtype, device_)
+        # the saved state blocks (hseg, seg_state, seg_m): NaN until a kernel or a copy writes them
+        if dtype == torch.float32 and tuple(shape[-2:]) == (D, D):
+            t.view(torch.uint8).fill_(0xFF)
+        return t
+
+    hits: dict = {}
+    total = 0
+    for lengths, heads, passes in cases:
+        lengths = tuple(lengths)
+        S, N = sum(lengths), len(lengths)
+        p = cake_backend.plan(S, N, heads, sm, arch)
+        assert p.recur == "seg" and not p.proportional, lengths
+        inputs = make_inputs(lengths, heads, device)
+        q, k, v, g, beta, cu, dout = (
+            inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
+        )
+        out, grads, saved = _run_fwd_bwd(inputs)
+        ref_out, ref_grads = _clone_all(out, grads)
+        del out, grads
+        tape_default = KdaWorkspace.for_problem(S, N, heads, device, save_mode="tape")
+        _, saved_t = cake_backend.chunk_kda_fwd(
+            q, k, v, g, beta, cu, workspace=tape_default
+        )
+        del tape_default
+        real = _real_chunks(lengths)
+        rows = slice(0, BT * real)
+        ranks = _kernel_ranks(lengths)
+        groupings = list(groupings_of.get(lengths, ()))
+        groupings += [kw for _label, kw in _partitions(lengths) if kw not in groupings]
+        monkeypatch.setattr(cake_backend, "_alloc", poisoned_alloc)
+        for kw in groupings:
+            for t in passes:
+                arena = cake_backend.KdaArena(lean=t > 1, tail_passes=t, **kw)
+                for save_mode, reference in (("light", saved), ("tape", saved_t)):
+                    path = "tape" if save_mode == "tape" else p.light_path
+                    case = (lengths, heads, kw, t, save_mode)
+                    ws = KdaWorkspace.for_problem(
+                        S,
+                        N,
+                        heads,
+                        device,
+                        save_mode=save_mode,
+                        arena=arena,
+                        doc_lengths=lengths,
+                    )
+                    packing = ws._packing(lengths)
+                    for i, b in enumerate(packing.batches):
+                        blocks = _expected_group_blocks(ranks, lengths, b, p.P)
+                        one_run = _one_run(blocks)
+                        assert (packing.blocks[i] is not None) == one_run, (case, b)
+                        key = (path, "run" if one_run else "index")
+                        hits[key] = hits.get(key, 0) + 1
+                        # the group's tail in its own passes, with the host's counts where it takes several
+                        group_passes = ws.batch_view(b, tape=True).tail_passes
+                        assert group_passes == _fewest_tail_passes(
+                            ws.batch_view(b, tape=True).plan, arena, ws.bytes, save_mode
+                        ), (case, b)
+                        counted = packing.tail_counts(i, b.NC_pad_tape) is not None
+                        assert counted == (group_passes > 1), (case, b)
+                        if counted:
+                            hits["tail"] = hits.get("tail", 0) + 1
+                        elif t > 1:
+                            hits["one_pass"] = hits.get("one_pass", 0) + 1
+                    count = [0]
+
+                    def same(a, b_, what, _case=case, _count=count):
+                        assert _bits_equal(a, b_), (_case, what)
+                        _count[0] += 1
+
+                    ws.arena.fill_(0xFF)  # NaN in every BF16 / FP32 view
+                    o, saved_b = cake_backend.chunk_kda_fwd(
+                        q, k, v, g, beta, cu, workspace=ws, doc_lengths=lengths
+                    )
+                    same(o, ref_out, "out")
+                    same(saved_b.Aqk, reference.Aqk, "Aqk")
+                    same(saved_b.Akk, reference.Akk, "Akk")
+                    for j, (a, b_) in enumerate(
+                        zip(saved_b.tables, reference.tables, strict=True)
+                    ):
+                        same(a, b_, f"tables[{j}]")
+                    want = 3 + len(reference.tables)
+                    if save_mode == "light":
+                        assert saved_b.version == cake_backend.SAVED_VERSION
+                        for name in ("hseg", "seg_state"):
+                            assert (getattr(saved_b, name) is None) == (not p.seg_save)
+                            if p.seg_save:
+                                a, b_ = getattr(saved_b, name), getattr(reference, name)
+                                same(a, b_, name)
+                                want += 1
+                        for name in ("qg", "w", "u"):  # the real token rows
+                            a, b_ = getattr(saved_b, name), getattr(reference, name)
+                            assert (a is None) == (b_ is None), (case, name)
+                            if b_ is not None:
+                                same(a[rows], b_[rows], name)
+                                want += 1
+                    else:
+                        assert saved_b.version == cake_backend.SAVED_VERSION_TAPE
+                        same(saved_b.h[:real], reference.h[:real], "h")
+                        same(saved_b.v_new[rows], reference.v_new[rows], "v_new")
+                        same(saved_b.seg_m, reference.seg_m, "seg_m")
+                        want += 3
+                    for source in (saved_b, reference):
+                        ws.arena.fill_(0xFF)
+                        got = cake_backend.chunk_kda_bwd(
+                            q,
+                            k,
+                            v,
+                            g,
+                            beta,
+                            cu,
+                            dout,
+                            saved=source,
+                            workspace=ws,
+                            doc_lengths=lengths,
+                        )
+                        for name, a in zip(
+                            ("dq", "dk", "dv", "dbeta", "dg"), got, strict=True
+                        ):
+                            same(a, ref_grads[name], name)
+                        want += 5
+                    assert count[0] == want, case
+                    total += count[0]
+                    del ws, o, saved_b, got
+        monkeypatch.setattr(cake_backend, "_alloc", original_alloc)
+    for key in (
+        ("light_states", "run"),
+        ("light_states", "index"),
+        ("tape", "run"),
+        ("tape", "index"),
+        "tail",
+        "one_pass",
+    ):
+        assert hits.get(key, 0) > 0, (key, hits)
+    assert total > 0
+
+
+def test_a_warmed_batched_workspace_captures_its_calls(device, manifest) -> None:
+    """A caller-owned batched workspace that ran its ``doc_lengths`` once holds their device copy (the lengths, the
+    tail counts of its group in several passes and the block indices of its group that is not one run), so a
+    forward and a backward captured in one CUDA graph make no copy, and the replay gives the eager results bit for
+    bit; a workspace without the copy still refuses the capture."""
+    lengths, heads = (640, 64, 320), 2
+    S, N = sum(lengths), len(lengths)
+    inputs = make_inputs(lengths, heads, device)
+    q, k, v, g, beta, cu, dout = (
+        inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
+    )
+    arena = cake_backend.KdaArena(lean=True, tail_passes=3, batch_tokens=704)
+    ws = KdaWorkspace.for_problem(
+        S, N, heads, device, save_mode="tape", arena=arena, doc_lengths=lengths
+    )
+    assert ws.plan.recur == "seg"
+    o, saved = cake_backend.chunk_kda_fwd(
+        q, k, v, g, beta, cu, workspace=ws, doc_lengths=lengths
+    )
+    got = cake_backend.chunk_kda_bwd(
+        q, k, v, g, beta, cu, dout, saved=saved, workspace=ws, doc_lengths=lengths
+    )
+    reference = [o.clone(), saved.seg_m.clone(), *(x.clone() for x in got)]
+    del o, saved, got
+    packing = ws._doc_cache[lengths]
+    assert packing.blocks[0] is None and packing.blocks[1] is not None
+    assert packing.words_dev is not None and packing.index_dev is not None
+    counted = [
+        packing.tail_counts(i, b.NC_pad_tape) is not None
+        for i, b in enumerate(packing.batches)
+    ]
+    assert counted == [
+        ws.batch_view(b, tape=True).tail_passes > 1 for b in packing.batches
+    ]
+    assert any(counted)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        o, saved = cake_backend.chunk_kda_fwd(
+            q, k, v, g, beta, cu, workspace=ws, doc_lengths=lengths
+        )
+        got = cake_backend.chunk_kda_bwd(
+            q, k, v, g, beta, cu, dout, saved=saved, workspace=ws, doc_lengths=lengths
+        )
+    after = ws._doc_cache[lengths]
+    assert after.words_dev is packing.words_dev and after.index_dev is packing.index_dev
+    graph.replay()
+    torch.cuda.synchronize()
+    results = [o, saved.seg_m, *got]
+    assert len(results) == len(reference) == 7
+    for i, (a, b) in enumerate(zip(results, reference, strict=True)):
+        assert _bits_equal(a, b), i
+    fresh = KdaWorkspace.for_problem(
+        S, N, heads, device, save_mode="tape", arena=arena, doc_lengths=lengths
+    )
+    refused = pytest.raises(RuntimeError, match="under CUDA-graph capture needs")
+    with refused, torch.cuda.graph(torch.cuda.CUDAGraph()):
+        cake_backend.chunk_kda_fwd(
+            q, k, v, g, beta, cu, workspace=fresh, doc_lengths=lengths
+        )
+
+
+def test_a_batched_workspace_keeps_the_device_copy_its_graph_reads(
+    device, manifest
+) -> None:
+    """A captured graph reads the device copy of its ``doc_lengths`` (the lengths, the tail counts of the groups in
+    several passes and the block indices of its group that is not one run) at each replay, so the workspace keeps
+    that packing for its lifetime: nine other packs run eagerly after the capture (the cache's eight and one more)
+    evict the oldest of them, never the captured one, and the replay still gives the eager results bit for bit."""
+    lengths, heads = (640, 64, 320), 2
+    others = [
+        (640, 320, 64),
+        (320, 640, 64),
+        (64, 640, 320),
+        (320, 64, 640),
+        (64, 320, 640),
+        (600, 360, 64),
+        (600, 64, 360),
+        (360, 600, 64),
+        (64, 600, 360),
+    ]
+    S, N = sum(lengths), len(lengths)
+    assert all(sum(o) == S and len(o) == N for o in others)
+    names = ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
+    arena = cake_backend.KdaArena(lean=True, tail_passes=3, batch_tokens=704)
+    # sized for the groups of the captured pack, whose first group then runs two tail passes; the other packs' groups
+    # (at most two documents of at most 704 tokens) fit that arena too
+    ws = KdaWorkspace.for_problem(
+        S, N, heads, device, save_mode="tape", arena=arena, doc_lengths=lengths
+    )
+    assert ws.plan.recur == "seg"
+
+    def fwd_bwd(pack, inputs):
+        q, k, v, g, beta, cu, dout = (inputs[n] for n in names)
+        o, saved = cake_backend.chunk_kda_fwd(
+            q, k, v, g, beta, cu, workspace=ws, doc_lengths=pack
+        )
+        got = cake_backend.chunk_kda_bwd(
+            q, k, v, g, beta, cu, dout, saved=saved, workspace=ws, doc_lengths=pack
+        )
+        return [o, saved.seg_m, *got]
+
+    inputs = make_inputs(lengths, heads, device)
+    reference = [x.clone() for x in fwd_bwd(lengths, inputs)]
+    packing = ws._doc_cache[lengths]
+    assert packing.blocks[0] is None and packing.index_dev is not None
+    counted = [
+        packing.tail_counts(i, b.NC_pad_tape) is not None
+        for i, b in enumerate(packing.batches)
+    ]
+    assert counted == [
+        ws.batch_view(b, tape=True).tail_passes > 1 for b in packing.batches
+    ]
+    assert any(counted)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        results = fwd_bwd(lengths, inputs)
+    assert ws._doc_graphs == {lengths}
+    for pack in others:
+        fwd_bwd(pack, make_inputs(pack, heads, device))
+    assert list(ws._doc_cache) == [lengths, *others[1:]]
+    kept = ws._doc_cache[lengths]
+    assert kept.words_dev is packing.words_dev and kept.index_dev is packing.index_dev
+    graph.replay()
+    torch.cuda.synchronize()
+    assert len(results) == len(reference) == 7
+    for i, (a, b) in enumerate(zip(results, reference, strict=True)):
+        assert _bits_equal(a, b), i

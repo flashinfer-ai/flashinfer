@@ -18,7 +18,7 @@ from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim.tuning import 
     sm100_genphase_candidates,
 )
 
-from .test_mega_workspace_api import _inputs
+from tests.cpu.moe_ep.test_mega_workspace_api import _inputs
 
 
 def _mxfp8_backend(*, capacity=129, hidden=384, **kwargs):
@@ -161,7 +161,6 @@ def test_blackwell_genphase_schedule_heuristic(tile, cluster, hint, monkeypatch)
     [
         {"kernel_variant": "unknown"},
         {"kernel_variant": "genphase", "capacity": 1025},
-        {"kernel_variant": "genphase", "kind": "mxfp8_e5m2"},
         {"kernel_variant": "genphase", "knobs": "bad"},
         {"kernel_variant": "genphase", "schedule_policy": ("grouped", 0)},
         {"kernel_variant": "genphase", "schedule_policy": ("grouped", -1)},
@@ -683,27 +682,6 @@ def test_blackwell_standard_and_genphase_share_epilogue(kind, monkeypatch):
     assert standard.masks_invalid_combine_slots
 
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [
-        {"knobs": "auto"},
-    ],
-)
-def test_blackwell_standard_rejects_missing_provider_features(kwargs):
-    from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
-    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.core.validation.common import MoEEpConfigError
-
-    config = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
-        intermediate_size=192,
-        top_k=3,
-        kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl_next",
-        **kwargs,
-    )
-    with pytest.raises(MoEEpConfigError):
-        create_mega_kernel(config)
-
-
 @pytest.mark.parametrize("kind", ["nvfp4", "mxfp8"])
 @pytest.mark.parametrize(
     "mode,live_count,supported",
@@ -837,8 +815,6 @@ def test_blackwell_genphase_import_is_lazy():
 @pytest.mark.parametrize(
     "override",
     [
-        {"quant_kind": "nvfp4"},
-        {"quant_kind": "mxfp4_mxfp8", "intermediate": 256},
         {"mma_tiler_mnk": (256, 64, 256)},
         {"mma_tiler_mnk": (256, 64, 128), "cluster_shape_mn": (1, 1)},
         {"cluster_shape_mn": (2, 1)},
@@ -1032,8 +1008,8 @@ def test_blackwell_genphase_autotune_rejects_incomplete_candidates_before_trials
     record = mock.Mock()
     monkeypatch.setattr(correctness, "sampled_reference", reference)
     monkeypatch.setattr(knob_cache, "record_knobs", record)
-    with pytest.raises(ValueError, match="candidates must set every GenPhase knob"):
-        autotune.autotune_sm100_genphase_mega_moe(
+    with pytest.raises(ValueError, match="candidates must set every Blackwell knob"):
+        autotune._sweep_sm100_mega_moe(
             None,
             None,
             None,
@@ -1152,9 +1128,9 @@ def test_blackwell_genphase_tuning_cache_exact_identity_constraints_and_invalid_
 def test_blackwell_genphase_tuning_public_auto_retunes_once_and_capture_guard(
     monkeypatch,
 ):
-    """Auto tuning retunes an unpooled workspace once and blocks early capture."""
-    from unittest import mock
-    import torch
+    """Auto workspaces defer search to v2 and prepare once before capture."""
+    from types import SimpleNamespace
+    from flashinfer import autotune_v2
     from flashinfer.moe_ep import (
         BootstrapConfig,
         FleetParams,
@@ -1162,15 +1138,16 @@ def test_blackwell_genphase_tuning_public_auto_retunes_once_and_capture_guard(
         Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
     )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.core.tuning_state import AutoTuningState
+    from flashinfer.moe_ep.kernel_src.sm100.next_cutedsl_megamoe.shim import autotune
     from flashinfer.moe_ep.kernel_src.sm100 import next_cutedsl_megamoe as pkg
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    with pytest.warns(UserWarning, match="COLLECTIVE"):
-        backend = create_mega_kernel(
-            Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
-                1024, 8, kernel_variant="genphase", knobs="auto"
-            )
+    backend = create_mega_kernel(
+        Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+            1024, 8, kernel_variant="genphase", knobs="auto"
         )
+    )
     backend.bind_ep_bootstrap(
         BootstrapConfig(rank=0, world_size=1, auto_bootstrap=False)
     )
@@ -1179,20 +1156,30 @@ def test_blackwell_genphase_tuning_public_auto_retunes_once_and_capture_guard(
     )
     assert backend._workspace_pool_request(fleet) is None
     assert backend._workspace_pool_key(fleet) is None
-    with pytest.raises(MoEEpConfigError, match="warmup"):
-        backend.validate_capture_ready(None, None)
-    winner = sm100_genphase_candidates(_genphase_tuning_config(), sm_count=148)[-1]
+    cfg = _genphase_tuning_config(world_size=1)
+    workspace = SimpleNamespace(
+        config=cfg,
+        _compiled=None,
+        _tuning_state=AutoTuningState(),
+        staged_tokens=lambda: 16,
+    )
+    with pytest.raises(MoEEpConfigError, match="Warm up"):
+        backend.validate_capture_ready(workspace, None)
+    winner = sm100_genphase_candidates(cfg, sm_count=148)[-1]
     tune = mock.Mock(return_value=winner)
     launch = mock.Mock(return_value=mock.sentinel.output)
-    monkeypatch.setattr(pkg, "autotune_sm100_genphase_mega_moe", tune)
+    monkeypatch.setattr(autotune, "autotune_sm100_block_scaled_mega_moe", tune)
     monkeypatch.setattr(pkg, "sm100_genphase_mega_moe", launch)
-    workspace = mock.Mock()
-    workspace.staged_tokens.return_value = 16
-    for _ in range(2):
-        assert backend.compute(workspace, (1, 2), output=None) is mock.sentinel.output
+    with autotune_v2(persistent_cache=False):
+        for _ in range(2):
+            assert (
+                backend.compute(workspace, (1, 2), output=None) is mock.sentinel.output
+            )
     tune.assert_called_once()
-    workspace.retune.assert_called_once_with(winner)
-    assert backend.get_tuned_knobs() == winner
+    assert tune.call_args.kwargs["force_tune"] is False
+    assert tune.call_args.kwargs["install_winner"] is True
+    assert backend.get_tuned_knobs(workspace) == winner
+    workspace._compiled = object()
     backend.validate_capture_ready(workspace, (1, 2))
 
 
@@ -1226,7 +1213,7 @@ def test_blackwell_genphase_tuning_offline_cli_dispatch_and_admission(monkeypatc
         "65",
     ]
     assert tune.main(args) == 0
-    assert "sm100.mxfp8_mxfp8_bf16_cutedsl.tuner" in loader.call_args.args[0]
+    assert loader.call_args.args[0] == ".backends.mega.kernel.sm100.next_tuning"
     assert module.run_tuning.call_args.args[0].kernel_variant == "genphase"
     loader.reset_mock()
     assert tune.main(args + ["--allow-nondeterministic"]) == 2

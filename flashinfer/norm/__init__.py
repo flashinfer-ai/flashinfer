@@ -197,6 +197,10 @@ _GATED_RESIDUAL_COMPUTE_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 _RMSNORM_SIGMOID_GATE_HEAD_DIM = 64
 _FUSED_NORM_ALIGNMENT = 16
 _DUAL_NORM_ALIGNMENT = 32
+#: The Cake package reaches rows and vectors in accesses of up to 256 bits: it serves storage aligned to 32 bytes
+#: alone (``gated_residual_rmsnorm``'s tensors; ``rmsnorm_sigmoid_gate``'s tensors and, in bytes, their token
+#: strides).  Under ``"auto"``, storage the 16-byte contract admits but the package does not runs the CuTe DSL kernel.
+_CAKE_NORM_ALIGNMENT = 32
 
 
 def _fused_norm_arch_supported(device: torch.device) -> bool:
@@ -206,6 +210,24 @@ def _fused_norm_arch_supported(device: torch.device) -> bool:
 
 def _is_aligned(tensor: torch.Tensor, alignment: int = _FUSED_NORM_ALIGNMENT) -> bool:
     return tensor.data_ptr() % alignment == 0
+
+
+def _cake_norm_layout(*tensors: Optional[torch.Tensor]) -> bool:
+    """Whether every tensor given (``None`` skipped) sits in storage the Cake package serves: 32-byte aligned."""
+    return all(
+        tensor is None or _is_aligned(tensor, _CAKE_NORM_ALIGNMENT)
+        for tensor in tensors
+    )
+
+
+def _cake_gate_layout(input: torch.Tensor, gate: torch.Tensor) -> bool:
+    """Whether a ``rmsnorm_sigmoid_gate`` call's tensors sit in storage the Cake package serves: 32-byte aligned
+    storage and token strides that are 32-byte multiples (16 elements)."""
+    return (
+        _cake_norm_layout(input, gate)
+        and (input.stride(0) * input.element_size()) % _CAKE_NORM_ALIGNMENT == 0
+        and (gate.stride(0) * gate.element_size()) % _CAKE_NORM_ALIGNMENT == 0
+    )
 
 
 _GATED_RESIDUAL_NEXT_BACKENDS = ("auto", "cake", "cute")
@@ -284,23 +306,30 @@ def _gated_residual_rmsnorm_backend(
     weight_before_norm: bool,
     enable_pdl: bool,
     rows: Optional[int] = None,
+    cake_layout: bool = True,
 ) -> Optional[str]:
     """The backend one call runs on: ``"cake"`` when the Cake package ships a
     program for the device, the call's variant (``weight`` applied before the
     norm or absent, programmatic dependent launch or not) and (with ``rows``)
     its row count (preferred under ``"auto"``; a row count in a gap of the
-    package's windows falls to the CuTe DSL kernel), else ``"cute"`` when the
-    CuTe DSL kernel targets the device; ``None`` when the requested backend is
-    not available."""
+    package's windows falls to the CuTe DSL kernel) and the call's tensors sit
+    in storage the package serves (``cake_layout``: 32-byte aligned; other
+    storage falls to the CuTe DSL kernel too), else ``"cute"`` when the CuTe DSL
+    kernel targets the device; ``None`` when the requested backend is not
+    available."""
     if backend not in _GATED_RESIDUAL_NEXT_BACKENDS:
         raise ValueError(
             f"backend must be one of {_GATED_RESIDUAL_NEXT_BACKENDS}, got {backend!r}"
         )
-    if backend != "cute" and _cake_gated_residual_rmsnorm_available(
-        device,
-        weight_before_norm=weight_before_norm,
-        enable_pdl=enable_pdl,
-        rows=None if backend == "cake" else rows,
+    if (
+        backend != "cute"
+        and cake_layout
+        and _cake_gated_residual_rmsnorm_available(
+            device,
+            weight_before_norm=weight_before_norm,
+            enable_pdl=enable_pdl,
+            rows=None if backend == "cake" else rows,
+        )
     ):
         return "cake"
     if backend != "cake" and _cute_gated_residual_rmsnorm_available(device):
@@ -327,24 +356,31 @@ def _rmsnorm_sigmoid_gate_backend(
     heads: Optional[int] = None,
     tokens: Optional[int] = None,
     enable_pdl: bool = False,
+    cake_layout: bool = True,
 ) -> Optional[str]:
     """The backend one call runs on: ``"cake"`` when the Cake package ships a
     program for the device, the call's launch form (its PDL route under
     ``enable_pdl``) and (with ``heads`` and ``tokens``) the call's head count
     and token count (preferred under ``"auto"``; a head count the package's
     windows do not name, or a token count in a gap of them, falls to the CuTe
-    DSL kernel),
+    DSL kernel) and the call's tensors sit in storage the package serves
+    (``cake_layout``: 32-byte aligned rows and token strides; other storage
+    falls to the CuTe DSL kernel too),
     else ``"cute"`` when the CuTe DSL kernel targets the device; ``None`` when
     the requested backend is not available."""
     if backend not in _GATED_RESIDUAL_NEXT_BACKENDS:
         raise ValueError(
             f"backend must be one of {_GATED_RESIDUAL_NEXT_BACKENDS}, got {backend!r}"
         )
-    if backend != "cute" and _cake_rmsnorm_sigmoid_gate_available(
-        device,
-        heads=None if backend == "cake" else heads,
-        tokens=None if backend == "cake" else tokens,
-        enable_pdl=enable_pdl,
+    if (
+        backend != "cute"
+        and cake_layout
+        and _cake_rmsnorm_sigmoid_gate_available(
+            device,
+            heads=None if backend == "cake" else heads,
+            tokens=None if backend == "cake" else tokens,
+            enable_pdl=enable_pdl,
+        )
     ):
         return "cake"
     if backend != "cake" and _cute_supports_rmsnorm_sigmoid_gate(
@@ -365,9 +401,9 @@ def supports_rmsnorm_sigmoid_gate(
     """Whether a BF16, head-dimension-64 call can run on ``device`` (the current
     one when ``None``) through ``backend`` (``"auto"``: the Cake package or the
     CuTe DSL kernel) in the launch form ``enable_pdl`` selects.  The package
-    routes on the head count and the token count of a call as well;
-    ``rmsnorm_sigmoid_gate`` falls to the CuTe DSL kernel where they lie outside
-    its windows."""
+    routes on the head count and the token count of a call as well and serves
+    32-byte aligned storage alone; ``rmsnorm_sigmoid_gate`` falls to the CuTe
+    DSL kernel where they lie outside its windows or its alignment."""
     if dtype != torch.bfloat16 or head_dim != _RMSNORM_SIGMOID_GATE_HEAD_DIM:
         return False
     if device is None:
@@ -398,7 +434,13 @@ def supports_gated_residual_rmsnorm(
 ) -> bool:
     """Return whether tensors satisfy the SM100/SM103/SM107 fused-kernel contract
     and ``backend`` (``"auto"``: the Cake package or the CuTe DSL kernel) can run
-    the call on their device."""
+    the call on their device.  ``"auto"`` answers for the call's row count as
+    well: a row count in a gap of the Cake package's windows runs on the CuTe DSL
+    kernel, so the answer is false there only where that kernel is unavailable.
+    ``"cake"`` answers whether the package ships a program for the device, the
+    variant and the tensors' storage; an explicit cake call still raises for a
+    row count in a gap (``is_cake_gated_residual_rmsnorm_supported`` of
+    :mod:`flashinfer.cake_muse_spark_norm_backend` answers for the row count)."""
     return (
         _gated_residual_rmsnorm_tensors_ok(branch, residual, weight, alpha, beta)
         and _gated_residual_rmsnorm_backend(
@@ -406,6 +448,8 @@ def supports_gated_residual_rmsnorm(
             branch.device,
             weight_before_norm=weight is not None,
             enable_pdl=_resolved_pdl(branch.device, enable_pdl),
+            rows=branch.shape[0] or None,
+            cake_layout=_cake_norm_layout(branch, residual, weight, alpha, beta),
         )
         is not None
     )
@@ -472,7 +516,13 @@ def supports_gated_residual_next_rmsnorm(
 ) -> bool:
     """Return whether inputs satisfy the SM100/SM103/SM107 two-norm kernel contract
     and ``backend`` (``"auto"``: the Cake package or the CuTe DSL kernel) can run
-    the call on their device."""
+    the call on their device.  ``"auto"`` answers for the call's row count as
+    well: a row count in a gap of the Cake package's windows runs on the CuTe DSL
+    kernel, so the answer is false there only where that kernel is unavailable.
+    ``"cake"`` answers whether the package ships a program for the device and the
+    variant; an explicit cake call still raises for a row count in a gap
+    (``is_cake_gated_residual_next_rmsnorm_supported`` of
+    :mod:`flashinfer.cake_muse_spark_norm_backend` answers for the row count)."""
     tensors: tuple[torch.Tensor, ...] = (branch, residual, next_weight, beta)
     if isinstance(alpha, torch.Tensor):
         if (
@@ -514,6 +564,7 @@ def supports_gated_residual_next_rmsnorm(
             branch.device,
             tensor_alpha=isinstance(alpha, torch.Tensor),
             has_post_weight=post_weight is not None,
+            rows=branch.shape[0] or None,
         )
         is not None
     )
@@ -799,9 +850,12 @@ def gated_residual_rmsnorm(
         (:mod:`flashinfer.cake_muse_spark_norm_backend`) where the package ships
         a program for the device, the call's inputs (``weight`` present or not,
         ``enable_pdl``) and its row count (the package's routes may leave
-        row-count gaps where the CuTe DSL kernel measured ahead), else the CuTe
-        DSL kernel; ``"cake"`` and ``"cute"`` select one and raise ``ValueError``
-        when it is not available (``"cake"`` at a row count in a gap raises too).
+        row-count gaps where the CuTe DSL kernel measured ahead) and the tensors
+        sit in 32-byte aligned storage (the package's programs read and write
+        256-bit vectors; storage aligned to 16 bytes only runs the CuTe DSL
+        kernel), else the CuTe DSL kernel; ``"cake"`` and ``"cute"`` select one
+        and raise ``ValueError`` when it is not available (``"cake"`` at a row
+        count in a gap, or on storage aligned to 16 bytes only, raises too).
 
     Returns
     -------
@@ -812,18 +866,6 @@ def gated_residual_rmsnorm(
         raise ValueError("tensors do not satisfy the gated_residual_rmsnorm contract")
     device = branch.device
     weight_before_norm = weight is not None
-    # One backend decision per call, handed to the implementation as the resolved backend.
-    chosen = _gated_residual_rmsnorm_backend(
-        backend,
-        device,
-        weight_before_norm=weight_before_norm,
-        enable_pdl=_resolved_pdl(device, enable_pdl),
-        rows=branch.shape[0],
-    )
-    if chosen is None:
-        raise ValueError(
-            f"gated_residual_rmsnorm: backend {backend!r} is not available on {device}"
-        )
     if out is not None and (
         out.shape != branch.shape
         or out.dtype != residual.dtype
@@ -832,6 +874,20 @@ def gated_residual_rmsnorm(
         or not _is_aligned(out)
     ):
         raise ValueError("out must match branch shape, dtype, device, and layout")
+    # One backend decision per call, handed to the implementation as the resolved backend; the Cake package
+    # serves 32-byte aligned storage alone (its programs read and write 256-bit vectors).
+    chosen = _gated_residual_rmsnorm_backend(
+        backend,
+        device,
+        weight_before_norm=weight_before_norm,
+        enable_pdl=_resolved_pdl(device, enable_pdl),
+        rows=branch.shape[0],
+        cake_layout=_cake_norm_layout(branch, residual, weight, alpha, beta, out),
+    )
+    if chosen is None:
+        raise ValueError(
+            f"gated_residual_rmsnorm: backend {backend!r} is not available on {device}"
+        )
     if out is None:
         out = torch.empty_like(residual)
     if weight is not None:
@@ -882,6 +938,7 @@ def _gated_residual_rmsnorm_impl(
             weight_before_norm=apply_weight_before_norm,
             enable_pdl=enable_pdl,
             rows=branch.shape[0],
+            cake_layout=_cake_norm_layout(branch, residual, weight, alpha, beta, out),
         )
     if chosen == "cake":
         # The package binds the unread weight slot of its mode-0 programs itself.
@@ -971,10 +1028,14 @@ def rmsnorm_sigmoid_gate(
         (:mod:`flashinfer.cake_muse_spark_norm_backend`) where the package ships
         a program for the device, the call's launch form, head count and token
         count (the package routes 128, 32 and 16 heads; its windows leave
-        token-count gaps where the CuTe DSL kernel measured ahead), else
-        the CuTe DSL kernel; ``"cake"`` and ``"cute"`` select one and raise
+        token-count gaps where the CuTe DSL kernel measured ahead) and the
+        tensors sit in 32-byte aligned storage with token strides that are
+        multiples of 16 elements (the package's 16-head programs on SM107 read
+        and write 256-bit vectors; other storage runs the CuTe DSL kernel),
+        else the CuTe DSL kernel; ``"cake"`` and ``"cute"`` select one and raise
         ``ValueError`` when it is not available (``"cake"`` at a head count or
-        token count outside the package's windows raises too).
+        token count outside the package's windows, or on storage the package
+        does not serve, raises too).
     """
     if input.ndim not in (2, 3) or gate.shape != input.shape:
         raise ValueError("input and gate must have matching 2-D or 3-D shapes")
@@ -995,6 +1056,7 @@ def rmsnorm_sigmoid_gate(
         heads=input.shape[1] if input.ndim == 3 else 1,
         tokens=input.shape[0],
         enable_pdl=enable_pdl,
+        cake_layout=_cake_gate_layout(input, gate),
     )
     if chosen is None:
         raise ValueError(
@@ -1036,6 +1098,7 @@ def _rmsnorm_sigmoid_gate_impl(
             heads=input.shape[1] if input.ndim == 3 else 1,
             tokens=input.shape[0],
             enable_pdl=enable_pdl,
+            cake_layout=_cake_gate_layout(input, gate),
         )
     if chosen == "cake":
         # The package's PDL route decides per window whether the program launches with the attribute.
@@ -1256,7 +1319,7 @@ def fused_add_rmsnorm_quant(
     ``residual[i] += input[i]``
 
     Step 2:
-    ``input[i] = ((residual[i] / RMS(residual)) * weight[i]).to(fp8)``
+    ``out[i] = (((residual[i] / RMS(residual)) * weight[i]) / scale).to(fp8)``
 
     Parameters
     ----------
@@ -1650,6 +1713,13 @@ def _get_rmsnorm_silu_sm_count(device_id: int):
 
 
 @functools.cache
+def _get_rmsnorm_silu_max_threads_per_sm(device_id: int):
+    """Cache the resident-thread limit per SM (2048 on SM100/SM103, 1024 on SM107)."""
+    props = torch.cuda.get_device_properties(device_id)
+    return props.max_threads_per_multi_processor
+
+
+@functools.cache
 def _get_rmsnorm_silu_module(
     C, output_dtype, warps_m, ctas_per_row, bytes_per_ldg, kernel_cfg, occupancy
 ):
@@ -1820,6 +1890,10 @@ def fused_rmsnorm_silu(
         )
 
     warps_m, split_cols, kernel_cfg, occupancy, bytes_per_ldg = knobs
+    # The LUT is tuned for 2048 threads/SM; cap occupancy on SM107 (1024).
+    max_threads_per_sm = _get_rmsnorm_silu_max_threads_per_sm(input.device.index)
+    if max_threads_per_sm <= 1024:
+        occupancy = max(1, min(occupancy, max_threads_per_sm // (warps_m * 32)))
     ctas_per_row = _estimate_ctas_per_row(C, split_cols, kernel_cfg, bytes_per_ldg)
     sm_count = _get_rmsnorm_silu_sm_count(input.device.index)
 

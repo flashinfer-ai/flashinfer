@@ -312,7 +312,7 @@ def xqa(
     - num_q_heads from q.shape[-2]
     - head_dim from q.shape[-1]
     - input_dtype from q.dtype
-    - kv_cache_dtype from k.dtype
+    - kv_cache_dtype from k_cache.dtype
     - head_group_ratio from num_q_heads // num_kv_heads
     - max_seq_len from page_table.shape[-1] * page_size
     """

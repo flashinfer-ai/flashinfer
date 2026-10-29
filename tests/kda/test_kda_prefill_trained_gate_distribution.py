@@ -359,21 +359,26 @@ def test_prepared_bf16_export_matches_fp64_recurrence(
 # round 7).  The round-9 body accumulates the BF16 decay correction onto the
 # FP32 state instead of re-deriving it (delta decay; FP32 chunk
 # carrier); these rows fail on the round-7 split body and pass on the fixed one.
+# Long rows whose 2-CTA clusters fit one wave take the pair-share build of the
+# same split (schedule suffix ``_pair_share``, the same bits) where the part's
+# pair-share row allows it: one sequence of 12 tasks is in the first row of
+# both parts (32 tasks, 1024 tokens); four 1024-token sequences (long-task load
+# 48) need 2048 tokens on both parts and keep the routed program.
 LONG_CASES = [
-    pytest.param((2048,), 12, 4411, id="bs1_t2048"),
-    pytest.param((2241,), 12, 4412, id="bs1_t2241"),
-    pytest.param((1024,) * 4, 12, 4413, id="bs4_t1024"),
+    pytest.param((2048,), 12, 4411, True, id="bs1_t2048"),
+    pytest.param((2241,), 12, 4412, True, id="bs1_t2241"),
+    pytest.param((1024,) * 4, 12, 4413, False, id="bs4_t1024"),
 ]
 
 
-@pytest.mark.parametrize(("lengths", "heads", "seed"), LONG_CASES)
+@pytest.mark.parametrize(("lengths", "heads", "seed", "pair_share"), LONG_CASES)
 def test_prepared_bf16_export_long_bounded_rows_keep_fp32_state_carrier(
-    lengths, heads, seed
+    lengths, heads, seed, pair_share
 ):
     call = _run_prepared_bf16_export(lengths, heads, seed, checkpoints=True)
-    assert str(call.schedule) == "fused_m64_independent_dvsplit_fp32_state", str(
-        call.schedule
-    )
+    schedule = str(call.schedule)
+    expected = "fused_m64_independent_dvsplit_fp32_state"
+    assert schedule == expected + ("_pair_share" if pair_share else ""), schedule
 
 
 # ---------------------------------------------------------------------------
@@ -413,9 +418,13 @@ CHECKPOINT_PREDICTION_FIRST = (
     "fused_checkpoint_direct_m128_n32",
     "cake_kda_bf16_c410d3932af8bc84666e",
 )
-UNBOUNDED_CARRIER = (
-    "fused_unbounded_softplus_direct_m128_fp32_carrier",
+# the unbounded softplus gate on one 1024-token sequence: its 16 tasks leave
+# two spare SMs each on 148, 152 and 160 SMs, so the call runs the owner/helper
+# program of the FP32-carrier body (two helper CTAs per task)
+UNBOUNDED_CARRIER_OWNER_HELPER = (
+    "fused_unbounded_softplus_direct_m128_fp32_carrier_owner2helper",
     "cake_kda_bf16_893740628d53688ac269",
+    "owner_helper",
 )
 # multi-wave grids at 256+ tokens: the register-inverse body on SM100a, the
 # prediction-first body on SM103a (its only architecture)
@@ -426,19 +435,25 @@ CHECKPOINT_BY_ARCH = {
 }
 
 
-def _routed(module):
+def _routed(module, owner_helper=False):
     """The program the loader runs for shipped ``module`` on this device: the
-    generated program its route names, else the module itself."""
+    generated program its route names (its owner/helper route's for a call that
+    selects the owner/helper build), else the module itself."""
     from flashinfer.jit import cake_kda_tf32 as registry
 
-    return registry._RENDERED_ROUTES.get(registry.device_arch(), {}).get(module, module)
+    routes = (
+        registry._RENDERED_OWNER_HELPER_ROUTES
+        if owner_helper
+        else registry._RENDERED_ROUTES
+    )
+    return routes.get(registry.device_arch(), {}).get(module, module)
 
 
 def _assert_selected(selected, expected):
     if isinstance(expected, dict):
         expected = expected[torch.cuda.get_device_capability()]
-    schedule, module = expected
-    expected = (schedule, _routed(module))
+    schedule, module, *build = expected
+    expected = (schedule, _routed(module, owner_helper="owner_helper" in build))
     assert selected == expected, f"selected {selected}, expected {expected}"
 
 
@@ -568,10 +583,17 @@ PLAIN_POOL_CASES = [
     ),
     # the one-wave split reads the pool rows directly
     pytest.param(2, 24, 512, LOWER_BOUND, False, 4443, M64_SPLIT, id="bs2_h24_t512"),
-    # unbounded softplus gate: the FP32-carrier body (no FP64 reference here;
-    # the indexed call is the oracle)
+    # unbounded softplus gate: the owner/helper program of the FP32-carrier body
+    # (no FP64 reference here; the indexed call is the oracle)
     pytest.param(
-        1, 16, 1024, None, False, 4444, UNBOUNDED_CARRIER, id="bs1_h16_t1024_unbounded"
+        1,
+        16,
+        1024,
+        None,
+        False,
+        4444,
+        UNBOUNDED_CARRIER_OWNER_HELPER,
+        id="bs1_h16_t1024_unbounded",
     ),
 ]
 

@@ -22,6 +22,7 @@ import re
 import subprocess
 import sys
 import threading
+import warnings
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -175,8 +176,8 @@ def _run(
     """One forward + backward through the backend's autograd entry points (``backend="cake"`` runs the generated
     program; the public module ``flashinfer.chunked_lm_head`` is a pass-through to these two functions, tested in
     ``test_cake_lm_head_loss_api.py``).  ``switches``: the remaining switch keywords (``dx_finalize``, ``dw_stream``,
-    ``hidden_count``, ``gemm_tuning``), passed through.  Returns ``loss`` / ``logp`` / ``dX`` / ``dW`` and the
-    leaves."""
+    ``hidden_count``, ``gemm_tuning``; ``logprob_dz`` / ``logprob_lbl`` of the log-probability entry), passed
+    through.  Returns ``loss`` / ``logp`` / ``dX`` / ``dW`` and the leaves."""
     X = inp.X.detach().requires_grad_(train_x)
     W = inp.W.detach().requires_grad_(train_w)
     if entry == "loss":
@@ -312,6 +313,8 @@ def test_registry_records_are_well_formed():
         "gemm_logits_mcnt",
         "gemm_logits_nostats",
         "gemm_logits_nostats_mcnt",
+        "gemm_logits_dz",
+        "gemm_logits_lbl",
         "row_finalize",
         "loss_reduce",
         "row_grad",
@@ -321,10 +324,17 @@ def test_registry_records_are_well_formed():
         "gemm_dx_s_tn256",
         "gemm_dx_st3",
         "gemm_dx_s_st3",
+        "gemm_dx_split",
+        "gemm_dx_s_split",
+        "gemm_dx_st3_split",
+        "gemm_dx_s_st3_split",
+        "gemm_dx_swab",
+        "gemm_dx_s_swab",
         "slab_sum",
         "gemm_dw_acc",
         "gemm_dw_acc_gn",
         "gemm_dw_cast_bf16",
+        "gemm_dw_cast_bf16_tma",
         "gemm_dw_cast_f32",
         "gemm_dw_cast_f32_gn",
         "scale_cast_bf16",
@@ -394,7 +404,7 @@ def test_registry_records_are_well_formed():
                     )
             assert int(physical.get("tma_workspace_bytes", 0)) >= 0
             assert int(physical.get("workspace_bytes", 0)) >= 0
-            kernel, launch = (s.removeprefix("csrc/") for s in entry["sources"])
+            kernel, binding = (s.removeprefix("csrc/") for s in entry["sources"])
             # one architecture-neutral translation unit per kernel (no architecture directory);
             # a sibling form's library compiles the shared unit's file and names its own
             # kernel through CAKE_PROGRAM_KERNEL in its compile definitions
@@ -403,22 +413,28 @@ def test_registry_records_are_well_formed():
                 kernel == f"cake_lm_head_loss/cake_lm_head_loss_{kernel_unit}_kernel.cu"
             )
             assert kernel_unit == unit or defined == f"kernel_cake_lm_head_loss_{unit}"
-            assert launch == f"cake_lm_head_loss/cake_lm_head_loss_{unit}_launch.cu"
+            assert re.fullmatch(
+                r"cake_lm_head_loss/cake_lm_head_loss_[0-9a-f]{20}_binding\.cu", binding
+            )
             csrc = package / "csrc"
-            assert (csrc / kernel).is_file() and (csrc / launch).is_file()
+            assert (csrc / kernel).is_file() and (csrc / binding).is_file()
             symbol = f"kernel_{physical['module']}"
             assert defined == symbol
-            stub = (csrc / launch).read_text()
-            assert f"#define CAKE_KERNEL_SYMBOL {symbol}\n" in stub
-            shim = re.search(
-                r'#include "(cake_lm_head_loss/shim/cake_lm_head_loss_shim_[0-9a-f]{12}\.cuh)"',
-                stub,
+            # the binding launches the stage's kernel: spelled literally, or (a binding several
+            # programs share) through CAKE_KERNEL_SYMBOL, which the library's compile definitions
+            # or the template's own default set
+            text = (csrc / binding).read_text()
+            assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run," in text
+            named = [
+                flag.removeprefix("-DCAKE_KERNEL_SYMBOL=")
+                for flag in entry["nvcc_flags"]
+                if flag.startswith("-DCAKE_KERNEL_SYMBOL=")
+            ]
+            default = re.findall(
+                r"^#define CAKE_KERNEL_SYMBOL (\S+)$", text, re.MULTILINE
             )
-            assert shim is not None and (csrc / shim.group(1)).is_file()
-            assert (
-                "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run,"
-                in (csrc / shim.group(1)).read_text()
-            )
+            bound = (named or default or [None])[0]
+            assert bound == symbol if bound is not None else symbol in text
             assert len(physical.get("grid", ["rows_c", 1, 1])) == 3
             launch = physical.get("launch")
             if launch is not None:
@@ -435,19 +451,17 @@ def test_registry_records_are_well_formed():
         )
         == cake_jit.MODULES
     )
-    shim_dir = package / "csrc" / "cake_lm_head_loss" / "shim"
-    used = set()
-    for name, record in cake_jit.MODULES.items():
-        for stage in record["stages"]:
-            launch = libraries[cake_jit.library_name(name, stage)]["sources"][1]
-            used.add(
-                re.search(
-                    r'#include "cake_lm_head_loss/shim/([^"]+)"',
-                    (package / launch).read_text(),
-                ).group(1)
-            )
+    # every binding file the manifest compiles exists, and no other binding ships
+    used = {
+        libraries[cake_jit.library_name(name, stage)]["sources"][1]
+        for name, record in cake_jit.MODULES.items()
+        for stage in record["stages"]
+    }
     if cake_jit.MODULES:
-        assert sorted(p.name for p in shim_dir.glob("*.cuh")) == sorted(used)
+        unit_dir = package / "csrc" / "cake_lm_head_loss"
+        assert sorted(
+            f"csrc/cake_lm_head_loss/{p.name}" for p in unit_dir.glob("*_binding.cu")
+        ) == sorted(used)
 
 
 @pytest.mark.parametrize("C", [4096, 2048, 8192])
@@ -1031,12 +1045,14 @@ def test_geometry_cluster_ctas():
 
 def test_stage_variant_grammar():
     bases = cake_jit.BASE_STAGES
-    assert len(bases) == 14 and set(bases) <= set(cake_jit.STAGES)
+    assert len(bases) == 16 and set(bases) <= set(cake_jit.STAGES)
     assert cake_backend.STAGE_KNOBS == (
         "count",
         "sliced",
         "tile_n",
         "stages",
+        "split",
+        "swab",
         "blocked",
         "epi_store",
     )
@@ -1057,6 +1073,8 @@ def test_stage_variant_grammar():
             "sliced": False,
             "tile_n": None,
             "stages": None,
+            "split": False,
+            "swab": False,
             "blocked": False,
             "epi_store": None,
         },
@@ -1083,11 +1101,29 @@ def test_stage_variant_grammar():
             "sliced": True,
             "tile_n": None,
             "stages": 3,
+            "split": False,
+            "swab": False,
             "blocked": False,
             "epi_store": None,
         },
     )
     assert cake_backend.parse_stage("gemm_dx_tn256")[1]["tile_n"] == 256
+    # the wide dX tile's split-tail form (its last wave's trailing items as half items)
+    assert cake_backend.stage_variant("gemm_dx", split=True) == "gemm_dx_split"
+    assert (
+        cake_backend.stage_variant("gemm_dx", sliced=True, stages=3, split=True)
+        == "gemm_dx_s_st3_split"
+    )
+    assert cake_backend.parse_stage("gemm_dx_st3_split")[1] == dict(
+        count=False,
+        sliced=False,
+        tile_n=None,
+        stages=3,
+        split=True,
+        swab=False,
+        blocked=False,
+        epi_store=None,
+    )
     # the 2-D blocked weight-gradient raster (the block width is a launch scalar)
     assert cake_backend.stage_variant("gemm_dw_acc", blocked=True) == "gemm_dw_acc_gn"
     assert (
@@ -1101,6 +1137,8 @@ def test_stage_variant_grammar():
             sliced=False,
             tile_n=None,
             stages=None,
+            split=False,
+            swab=False,
             blocked=True,
             epi_store=None,
         ),
@@ -1109,13 +1147,57 @@ def test_stage_variant_grammar():
     assert (
         cake_backend.stage_variant("gemm_dw_acc", blocked=True, epi_store="tma")
         == "gemm_dw_acc_gn_tma"
-    )  # grammar only: no rule selects an epilogue form and no record registers a _tma stage
+    )  # grammar only: no rule selects the accumulate's reduce-add and no record registers it
+    # the TMA-store form of the bf16 fused cast (dw_cast_tma_rule) and the swapped wide dX tile (dx_swab_rule)
+    assert (
+        cake_backend.stage_variant("gemm_dw_cast_bf16", epi_store="tma")
+        == "gemm_dw_cast_bf16_tma"
+    )
+    assert cake_backend.parse_stage("gemm_dw_cast_bf16_tma") == (
+        "gemm_dw_cast_bf16",
+        dict(
+            count=False,
+            sliced=False,
+            tile_n=None,
+            stages=None,
+            split=False,
+            swab=False,
+            blocked=False,
+            epi_store="tma",
+        ),
+    )
+    assert cake_backend.stage_variant("gemm_dx", swab=True) == "gemm_dx_swab"
+    assert (
+        cake_backend.stage_variant("gemm_dx", sliced=True, swab=True)
+        == "gemm_dx_s_swab"
+    )
+    assert (
+        cake_backend.stage_variant("gemm_dx", stages=4, tile_n=512, swab=True)
+        == "gemm_dx_swab"
+    )  # the table depth and the wide tile are the defaults
+    assert cake_backend.parse_stage("gemm_dx_s_swab") == (
+        "gemm_dx",
+        dict(
+            count=False,
+            sliced=True,
+            tile_n=None,
+            stages=None,
+            split=False,
+            swab=True,
+            blocked=False,
+            epi_store=None,
+        ),
+    )
     assert (
         cake_backend.dx_stage(2) == "gemm_dx_s"
         and cake_backend.dx_stage(4) == "gemm_dx_s"
         and cake_backend.dx_stage(1, 256) == "gemm_dx_tn256"
         and cake_backend.dx_stage(3, 512, 3) == "gemm_dx_s_st3"
         and cake_backend.dx_stage(1) == "gemm_dx"
+        and cake_backend.dx_stage(1, split=True) == "gemm_dx_split"
+        and cake_backend.dx_stage(2, None, 3, split=True) == "gemm_dx_s_st3_split"
+        and cake_backend.dx_stage(1, swab=True) == "gemm_dx_swab"
+        and cake_backend.dx_stage(3, swab=True) == "gemm_dx_s_swab"
     )
     for bad_k in (0, 5):
         with pytest.raises(ValueError):
@@ -1139,11 +1221,28 @@ def test_stage_variant_grammar():
         ),  # the K-sliced form exists for the dX GEMM only
         dict(base="gemm_dw_acc", sliced=True),
         dict(base="gemm_dx", tile_n=128),
-        dict(base="gemm_dw_cast_bf16", epi_store="tma"),
+        dict(
+            base="gemm_dw_cast_f32", epi_store="tma"
+        ),  # the TMA store is the bf16 cast's
+        dict(base="gemm_dw_cast_f32", blocked=True, epi_store="tma"),
         dict(base="gemm_logits", epi_store="tma"),
         dict(base="gemm_dw_acc", epi_store="cast_bf16"),
         dict(base="row_grad", tile_n=256),
         dict(base="other"),
+        dict(
+            base="gemm_dx", tile_n=256, split=True
+        ),  # the split-tail form exists for the wide tile only
+        dict(base="gemm_logits", split=True),
+        dict(
+            base="gemm_dx", split=True, swab=True
+        ),  # the two wide-tile forms exclude each other
+        dict(base="gemm_dx", sliced=True, split=True, swab=True),
+        dict(
+            base="gemm_dx", stages=3, swab=True
+        ),  # the swapped tile runs the table ring depth only
+        dict(base="gemm_dx", tile_n=256, swab=True),  # ... on the wide tile only
+        dict(base="gemm_dw_acc", swab=True),
+        dict(base="gemm_logits", swab=True),
     ):
         with pytest.raises(ValueError):
             cake_backend.stage_variant(bad.pop("base"), **bad)
@@ -1164,7 +1263,15 @@ def test_stage_variant_grammar():
         "gemm_dx_tn128",
         "row_grad_gn",
         "scale_cast",
-        "gemm_dw_cast_bf16_tma",
+        "gemm_dw_cast_f32_tma",  # the TMA store is the bf16 cast's
+        "gemm_dw_cast_bf16_tma_gn",  # the suffix order
+        "gemm_dx_split_st3",  # the suffix order
+        "gemm_dx_swab_split",
+        "gemm_dx_swab_s",
+        "gemm_dx_split_swab",  # the two wide-tile forms exclude each other
+        "gemm_dx_st3_swab",  # the table ring depth only
+        "gemm_dx_tn256_swab",  # the wide tile only
+        "gemm_dx_tn256_split",
     ):
         with pytest.raises(ValueError):
             cake_backend.parse_stage(bad_name)
@@ -1335,6 +1442,10 @@ def test_instance_rules_mirror_the_launchers():
     # the dX tile rule's wave-efficiency floor: SM100 only, one-slice launches below H 7168 (T 65031 / 32463 tails at
     # chunk 4096: 15 row pairs x 12 = 180 wide items on 74 SM pairs = 2.43 waves, 81 % < 83 % -> the 256-wide form)
     assert cake_backend.DX_WIDE_MIN_EFF == {"sm_100a": 0.83}
+    assert cake_backend.DX_SPLIT_ARCHES == ("sm_100a", "sm_103a")
+    assert cake_backend.DX_SPLIT_LONG_RING_ARCHES == ("sm_103a",)
+    assert cake_backend.DX_SPLIT_WHOLE_ARCHES == ("sm_103a",)
+    assert cake_backend.DX_SPLIT_WHOLE_FEW_CHUNKS_ARCHES == ("sm_100a",)
     g_glm = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
     g_wide = Geometry.from_record({"geometry": {"hidden": 7168, "vocab": 129280}})
     assert cake_backend.dx_tile_rule(3591, 6144, 148, 1, g_glm, "sm_100a") == 256
@@ -1468,18 +1579,23 @@ def test_make_plan_selects_the_rule_variants_per_chunk():
         arch="sm_100a",
     )
     assert plan.chunks == ((0, 4096), (4096, 4096), (8192, 4096), (12288, 3943))
-    for i, (_, rows_c) in enumerate(plan.chunks):
+    for i in range(len(plan.chunks)):
         v = plan.variants_of(i)
         assert (v.logits_group_m, v.dw_group_m, v.dw_epi_store) == (16, 32, None)
         # the raster heights are launch scalars: the base forms run every chunk
         assert plan.logits_stage(i) == "gemm_logits"
         assert plan.logits_stage(i, stats=False) == "gemm_logits_nostats"
-        k = recommended_k_slices(rows_c, 7168, 148, 4, g, 74)
-        tile = cake_backend.dx_tile_rule(rows_c, 7168, 148, k, g)
-        assert plan.dx_slices_of(i) == k
-        assert plan.dx_stage_of(i) == cake_backend.stage_variant(
-            "gemm_dx", sliced=k > 1, tile_n=tile
-        )
+    # H 7168 on SM100: four K slices everywhere; the whole 4096-token chunks keep their full wide items (whole chunks
+    # split only below H 7168), the 3943-row tail runs its last wave's 8 wide items as half items
+    assert [
+        (plan.dx_stage_of(i), plan.variants_of(i).dx_split, plan.dx_slices_of(i))
+        for i in range(4)
+    ] == [
+        ("gemm_dx_s", None, 4),
+        ("gemm_dx_s", None, 4),
+        ("gemm_dx_s", None, 4),
+        ("gemm_dx_s_split", 8, 4),
+    ]
     assert all(plan.dw_acc_stage(i) == "gemm_dw_acc" for i in range(3))
     assert plan.dw_cast_stage == "gemm_dw_cast_bf16"
     assert "gemm_dw_acc_gn" not in plan.stages and "gemm_logits_mcnt" not in plan.stages
@@ -1545,10 +1661,14 @@ def test_make_plan_selects_the_rule_variants_per_chunk():
         and tail.dw_acc_stage(0) == "gemm_dw_acc_gn"
         and tail.variants_of(0).dw_group_n == 12
     )
-    assert tail.dw_cast_stage == "gemm_dw_cast_bf16"
+    # the 1-row last chunk of a 2-chunk call: the bf16 cast's TMA store (dw_cast_tma_rule)
+    assert tail.dw_cast_stage == "gemm_dw_cast_bf16_tma"
+    assert [tail.variants_of(i).dw_cast_tma for i in range(2)] == [False, True]
     assert (
-        tail.dx_slices_of(0) == 4 and tail.dx_stage_of(0) == "gemm_dx_s"
-    )  # 16 x 12 x 4 = 768 wide items
+        tail.dx_slices_of(0) == 4
+        and tail.dx_stage_of(0) == "gemm_dx_s_split"
+        and tail.variants_of(0).dx_split == 28
+    )  # 16 x 12 x 4 = 768 wide items on 74 SM pairs: the last wave's 28 items run as half items
     assert (
         tail.dx_slices_of(1) == 3 and tail.dx_stage_of(1) == "gemm_dx_s_tn256"
     )  # 1 x 12 x 3 = 36 < 74 pairs
@@ -1557,10 +1677,10 @@ def test_make_plan_selects_the_rule_variants_per_chunk():
         "row_finalize",
         "loss_reduce",
         "row_grad",
-        "gemm_dx_s",
         "gemm_dx_s_tn256",
+        "gemm_dx_s_split",
         "gemm_dw_acc_gn",
-        "gemm_dw_cast_bf16",
+        "gemm_dw_cast_bf16_tma",
         "scale_cast_bf16",
     )
     # SM103 at a wide geometry: the wide weight-gradient raster of the accumulate (no epilogue rule)
@@ -1702,18 +1822,16 @@ def test_make_plan_selects_the_rule_variants_per_chunk():
             arch=arch,
         )
         assert ring.chunks == ((0, 8192), (8192, 8039))
-        for i, (_, rows_c) in enumerate(ring.chunks):
-            k = recommended_k_slices(rows_c, 6144, sms, 4, g0, resident)
-            tile = cake_backend.dx_tile_rule(rows_c, 6144, sms, k, g0, arch)
-            assert ring.dx_stage_of(i) == cake_backend.stage_variant(
-                "gemm_dx", sliced=k > 1, tile_n=tile, stages=3 if tile == 512 else None
-            )
-            if tile == 512:
-                assert ring.dx_stage_of(i).endswith("_st3")
-                assert ring.variants_of(i).dx_stages == 3
-            else:  # the tile rule's wave-efficiency floor (SM100): the 256-wide form keeps its ring depth
-                assert ring.dx_stage_of(i).endswith("_tn256")
-                assert ring.variants_of(i).dx_stages is None
+        # both chunks take the 3-deep ring of the wide tile; the long ring splits on sm_103a only, the whole 8192-token chunk too
+        assert [
+            (ring.dx_stage_of(i), ring.variants_of(i).dx_split, ring.dx_slices_of(i))
+            for i in range(2)
+        ] == {
+            "sm_103a": [("gemm_dx_s_st3_split", 32, 3), ("gemm_dx_s_st3_split", 32, 3)],
+            "sm_100a": [("gemm_dx_s_st3", None, 2), ("gemm_dx_s_st3", None, 2)],
+        }[arch]
+        for i in range(2):
+            assert ring.variants_of(i).dx_stages == 3
             assert (
                 ring.variants_of(i).dw_group_n is None
             )  # above 4096 rows: the raster rule, not the block
@@ -1781,7 +1899,13 @@ def test_make_plan_selects_the_rule_variants_per_chunk():
         assert tail_plan.chunks[-1] == (61440, 3591)
         last = tail_plan.num_chunks - 1
         if tail_plan.dx_slices_of(last) == 1:
-            assert tail_plan.dx_stage_of(last) == tail_stage
+            # the wide tile's last wave of a partial token tile: the split-tail form where the rule splits
+            split = tail_stage == "gemm_dx" and cake_backend.dx_split_rule(
+                3591, 6144, sms, 1, g0, arch, None
+            )
+            assert tail_plan.dx_stage_of(last) == (
+                "gemm_dx_split" if split else tail_stage
+            )
         else:  # the slice rule took more than one slice here: no floor, the wide tile
             assert not tail_plan.dx_stage_of(last).endswith("_tn256")
         pinned_tail = cake_backend.make_plan(
@@ -1819,6 +1943,250 @@ def test_make_plan_selects_the_rule_variants_per_chunk():
         num_sms=148,
     )
     assert ref.variants == () and set(ref.stages) <= set(cake_jit.BASE_STAGES)
+
+
+def test_dx_split_eligible_whole_chunks_by_architecture_and_call_length():
+    # a chunk that is not a whole number of 512-token tiles may always take the split rule
+    assert cake_backend.dx_split_eligible(3943, 6144, "sm_100a", 512, 4)
+    assert cake_backend.dx_split_eligible(3943, 6144, "sm_103a", 512, 4)
+    # a whole 4096-token chunk below H 7168: every call on sm_103a; on sm_100a only a call of fewer than
+    # DW_STREAM_MIN_CHUNKS chunks, whose dW accumulate shares the dX stream (an unknown chunk count: no)
+    assert cake_backend.DW_STREAM_MIN_CHUNKS == 3
+    for n in (1, 2, 3, 16, None):
+        assert cake_backend.dx_split_eligible(4096, 6144, "sm_103a", 512, n)
+    assert cake_backend.dx_split_eligible(4096, 6144, "sm_100a", 512, 1)
+    assert cake_backend.dx_split_eligible(4096, 6144, "sm_100a", 512, 2)
+    assert not cake_backend.dx_split_eligible(4096, 6144, "sm_100a", 512, 3)
+    assert not cake_backend.dx_split_eligible(4096, 6144, "sm_100a", 512, None)
+    # from H 7168 on a whole chunk keeps its full items on both architectures
+    for arch in ("sm_100a", "sm_103a"):
+        assert not cake_backend.dx_split_eligible(4096, 7168, arch, 512, 1)
+        assert not cake_backend.dx_split_eligible(8192, 8192, arch, 512, 2)
+    # the 256-wide tile is never a whole-tile chunk; the reference path (no architecture) never splits a whole chunk
+    assert cake_backend.dx_split_eligible(4096, 6144, "sm_100a", 256, 4)
+    assert not cake_backend.dx_split_eligible(4096, 6144, None, 512, 1)
+
+
+# The dX form of every chunk at the default geometries, written out rather than derived from the rule functions: the
+# chunk loops of the reference rows (their valid-row counts at 5 % ignored labels) and edge shapes, on SM100 (148 SMs)
+# and SM103 (152 SMs).  Key: (arch, H, V, rows of the chunk loop, chunk); value: runs of (chunks, rows of each chunk, dX
+# stage, split count F or None, K slices).  The forms do not depend on the entry or the objective, except on SM103
+# (DX_SWAB_ARCHES): a cross-entropy loss call of >= 3 chunks runs its whole 512-token-tile chunks as the swapped tile
+# (_DX_FORMS_SM103_CE below).
+_DX_FORMS = {
+    ("sm_100a", 6144, 154880, 1, 4096): ((1, 1, "gemm_dx_s_tn256", None, 3),),
+    ("sm_100a", 6144, 154880, 1946, 4096): ((1, 1946, "gemm_dx_s", None, 3),),
+    ("sm_100a", 6144, 154880, 3891, 4096): ((1, 3891, "gemm_dx_s_split", 28, 4),),
+    ("sm_100a", 6144, 154880, 4096, 4096): ((1, 4096, "gemm_dx_s_split", 28, 4),),
+    ("sm_100a", 6144, 154880, 4097, 4096): (
+        (1, 4096, "gemm_dx_s_split", 28, 4),
+        (1, 1, "gemm_dx_s_tn256", None, 3),
+    ),
+    ("sm_100a", 6144, 154880, 7711, 4096): (
+        (1, 4096, "gemm_dx_s_split", 28, 4),
+        (1, 3615, "gemm_dx_tn256", None, 1),
+    ),
+    ("sm_100a", 6144, 154880, 8192, 4096): ((2, 4096, "gemm_dx_s_split", 28, 4),),
+    ("sm_100a", 6144, 154880, 11362, 4096): (
+        (2, 4096, "gemm_dx_s", None, 4),
+        (1, 3170, "gemm_dx_s_split", 32, 4),
+    ),
+    ("sm_100a", 6144, 154880, 15363, 4096): (
+        (3, 4096, "gemm_dx_s", None, 4),
+        (1, 3075, "gemm_dx_s_split", 32, 4),
+    ),
+    ("sm_100a", 6144, 154880, 15419, 4096): (
+        (3, 4096, "gemm_dx_s", None, 4),
+        (1, 3131, "gemm_dx_s_split", 32, 4),
+    ),
+    ("sm_100a", 6144, 154880, 16231, 4096): (
+        (3, 4096, "gemm_dx_s", None, 4),
+        (1, 3943, "gemm_dx_s_split", 28, 4),
+    ),
+    ("sm_100a", 6144, 154880, 30840, 4096): (
+        (7, 4096, "gemm_dx_s", None, 4),
+        (1, 2168, "gemm_dx_tn256", None, 1),
+    ),
+    ("sm_100a", 6144, 154880, 61779, 4096): (
+        (15, 4096, "gemm_dx_s", None, 4),
+        (1, 339, "gemm_dx_s_tn256", None, 3),
+    ),
+    ("sm_100a", 6144, 154880, 15419, 1024): (
+        (15, 1024, "gemm_dx_s", None, 3),
+        (1, 59, "gemm_dx_s_tn256", None, 3),
+    ),
+    ("sm_100a", 6144, 154880, 15419, 2048): (
+        (7, 2048, "gemm_dx_s", None, 3),
+        (1, 1083, "gemm_dx_s_split", 32, 3),
+    ),
+    ("sm_100a", 6144, 154880, 15419, 8192): (
+        (1, 8192, "gemm_dx_s_st3", None, 2),
+        (1, 7227, "gemm_dx_s_st3", None, 2),
+    ),
+    ("sm_100a", 7168, 129280, 4097, 4096): (
+        (1, 4096, "gemm_dx_s", None, 4),
+        (1, 1, "gemm_dx_s_tn256", None, 2),
+    ),
+    ("sm_100a", 7168, 129280, 15419, 4096): (
+        (3, 4096, "gemm_dx_s", None, 4),
+        (1, 3131, "gemm_dx_split", 34, 1),
+    ),
+    ("sm_100a", 8192, 128256, 4097, 4096): (
+        (1, 4096, "gemm_dx", None, 1),
+        (1, 1, "gemm_dx_s_tn256", None, 2),
+    ),
+    ("sm_100a", 8192, 128256, 15419, 4096): (
+        (3, 4096, "gemm_dx", None, 1),
+        (1, 3131, "gemm_dx_s_split", 32, 3),
+    ),
+    ("sm_103a", 6144, 154880, 1, 4096): ((1, 1, "gemm_dx_s_tn256", None, 3),),
+    ("sm_103a", 6144, 154880, 1946, 4096): ((1, 1946, "gemm_dx_s", None, 3),),
+    ("sm_103a", 6144, 154880, 3891, 4096): ((1, 3891, "gemm_dx_s_split", 8, 4),),
+    ("sm_103a", 6144, 154880, 4096, 4096): ((1, 4096, "gemm_dx_s_split", 8, 4),),
+    ("sm_103a", 6144, 154880, 4097, 4096): (
+        (1, 4096, "gemm_dx_s_split", 8, 4),
+        (1, 1, "gemm_dx_s_tn256", None, 3),
+    ),
+    ("sm_103a", 6144, 154880, 7711, 4096): (
+        (1, 4096, "gemm_dx_s_split", 8, 4),
+        (1, 3615, "gemm_dx_s_split", 36, 4),
+    ),
+    ("sm_103a", 6144, 154880, 8192, 4096): ((2, 4096, "gemm_dx_s_split", 8, 4),),
+    ("sm_103a", 6144, 154880, 11362, 4096): (
+        (2, 4096, "gemm_dx_s_split", 8, 4),
+        (1, 3170, "gemm_dx_s_split", 16, 4),
+    ),
+    ("sm_103a", 6144, 154880, 15363, 4096): (
+        (3, 4096, "gemm_dx_s_split", 8, 4),
+        (1, 3075, "gemm_dx_s_split", 16, 4),
+    ),
+    ("sm_103a", 6144, 154880, 15419, 4096): (
+        (3, 4096, "gemm_dx_s_split", 8, 4),
+        (1, 3131, "gemm_dx_s_split", 16, 4),
+    ),
+    ("sm_103a", 6144, 154880, 16231, 4096): (
+        (3, 4096, "gemm_dx_s_split", 8, 4),
+        (1, 3943, "gemm_dx_s_split", 8, 4),
+    ),
+    ("sm_103a", 6144, 154880, 30840, 4096): (
+        (7, 4096, "gemm_dx_s_split", 8, 4),
+        (1, 2168, "gemm_dx_split", 32, 1),
+    ),
+    ("sm_103a", 6144, 154880, 61779, 4096): (
+        (15, 4096, "gemm_dx_s_split", 8, 4),
+        (1, 339, "gemm_dx_s_tn256", None, 3),
+    ),
+    ("sm_103a", 6144, 154880, 15419, 1024): (
+        (15, 1024, "gemm_dx_s", None, 3),
+        (1, 59, "gemm_dx_s_tn256", None, 3),
+    ),
+    ("sm_103a", 6144, 154880, 15419, 2048): (
+        (7, 2048, "gemm_dx_s", None, 3),
+        (1, 1083, "gemm_dx_s_split", 28, 3),
+    ),
+    ("sm_103a", 6144, 154880, 15419, 8192): (
+        (1, 8192, "gemm_dx_s_st3_split", 12, 3),
+        (1, 7227, "gemm_dx_s_st3", None, 3),
+    ),
+    ("sm_103a", 7168, 129280, 4097, 4096): (
+        (1, 4096, "gemm_dx", None, 1),
+        (1, 1, "gemm_dx_s_tn256", None, 2),
+    ),
+    ("sm_103a", 7168, 129280, 15419, 4096): (
+        (3, 4096, "gemm_dx", None, 1),
+        (1, 3131, "gemm_dx_split", 30, 1),
+    ),
+    ("sm_103a", 8192, 128256, 4097, 4096): (
+        (1, 4096, "gemm_dx_s", None, 4),
+        (1, 1, "gemm_dx_s_tn256", None, 2),
+    ),
+    ("sm_103a", 8192, 128256, 15419, 4096): (
+        (3, 4096, "gemm_dx_s", None, 4),
+        (1, 3131, "gemm_dx_s_split", 36, 2),
+    ),
+}
+
+
+# The SM103 cross-entropy loss plans that differ from _DX_FORMS: the chunk loops of >= 3 chunks; every chunk of whole
+# 512-token tiles on the wide tile runs the swapped tile (no split, the table ring depth, the same K slices), the
+# other chunks keep their forms.  Calls of 1 or 2 chunks, the policy objective and the log-probability entry point keep
+# _DX_FORMS.
+_DX_FORMS_SM103_CE = {
+    ("sm_103a", 6144, 154880, 11362, 4096): (
+        (2, 4096, "gemm_dx_s_swab", None, 4),
+        (1, 3170, "gemm_dx_s_split", 16, 4),
+    ),
+    ("sm_103a", 6144, 154880, 15363, 4096): (
+        (3, 4096, "gemm_dx_s_swab", None, 4),
+        (1, 3075, "gemm_dx_s_split", 16, 4),
+    ),
+    ("sm_103a", 6144, 154880, 15419, 4096): (
+        (3, 4096, "gemm_dx_s_swab", None, 4),
+        (1, 3131, "gemm_dx_s_split", 16, 4),
+    ),
+    ("sm_103a", 6144, 154880, 16231, 4096): (
+        (3, 4096, "gemm_dx_s_swab", None, 4),
+        (1, 3943, "gemm_dx_s_split", 8, 4),
+    ),
+    ("sm_103a", 6144, 154880, 30840, 4096): (
+        (7, 4096, "gemm_dx_s_swab", None, 4),
+        (1, 2168, "gemm_dx_split", 32, 1),
+    ),
+    ("sm_103a", 6144, 154880, 61779, 4096): (
+        (15, 4096, "gemm_dx_s_swab", None, 4),
+        (1, 339, "gemm_dx_s_tn256", None, 3),
+    ),
+    ("sm_103a", 6144, 154880, 15419, 1024): (
+        (15, 1024, "gemm_dx_s_swab", None, 3),
+        (1, 59, "gemm_dx_s_tn256", None, 3),
+    ),
+    ("sm_103a", 6144, 154880, 15419, 2048): (
+        (7, 2048, "gemm_dx_s_swab", None, 3),
+        (1, 1083, "gemm_dx_s_split", 28, 3),
+    ),
+    ("sm_103a", 7168, 129280, 15419, 4096): (
+        (3, 4096, "gemm_dx_swab", None, 1),
+        (1, 3131, "gemm_dx_split", 30, 1),
+    ),
+    ("sm_103a", 8192, 128256, 15419, 4096): (
+        (3, 4096, "gemm_dx_s_swab", None, 4),
+        (1, 3131, "gemm_dx_s_split", 36, 2),
+    ),
+}
+
+
+@pytest.mark.parametrize("key", list(_DX_FORMS), ids=lambda k: "-".join(map(str, k)))
+def test_make_plan_dx_forms_of_the_default_geometries(key):
+    arch, H, V, rows, C = key
+    sms = {"sm_100a": 148, "sm_103a": 152}[arch]
+    g = Geometry.from_record({"geometry": {"hidden": H, "vocab": V}})
+    assert set(_DX_FORMS_SM103_CE) <= set(_DX_FORMS)
+    for objective, entry in (("ce", "loss"), ("policy", "loss"), ("ce", "logprob")):
+        forms = _DX_FORMS[key]
+        if (objective, entry) == ("ce", "loss"):
+            forms = _DX_FORMS_SM103_CE.get(key, forms)
+        want = [(r, s, f, k) for n, r, s, f, k in forms for _ in range(n)]
+        plan = cake_backend.make_plan(
+            _problem(rows, H, V, C, objective=objective, entry=entry),
+            need_dx=True,
+            need_dw=True,
+            geometry=g,
+            dx_max_slices=4,
+            num_sms=sms,
+            dx_resident=sms // 2,
+            fuse_dw_cast=True,
+            arch=arch,
+        )
+        got = [
+            (
+                rows_c,
+                plan.dx_stage_of(i),
+                plan.variants_of(i).dx_split,
+                plan.dx_slices_of(i),
+            )
+            for i, (_, rows_c) in enumerate(plan.chunks)
+        ]
+        assert got == want, (objective, entry)
 
 
 def test_make_plan_explicit_gemm_tuning_wins_over_the_rules():
@@ -1868,14 +2236,34 @@ def test_make_plan_explicit_gemm_tuning_wins_over_the_rules():
     ruled = cake_backend.make_plan(problem, gemm_tuning={"dx": {}}, **kw)
     unpinned = cake_backend.make_plan(problem, **kw)
     assert len(one.chunks) == 4
-    for i, (_, rows_c) in enumerate(one.chunks):
-        assert one.dx_slices_of(i) == 1
-        assert one.dx_stage_of(i) == cake_backend.stage_variant(
-            "gemm_dx",
-            sliced=False,
-            tile_n=cake_backend.dx_tile_rule(rows_c, 7168, 148, 1, g, "sm_100a"),
-        )
+    # one pinned slice: 16 x 14 = 224 wide items per whole chunk on 74 SM pairs (r = 2) keep their full items; the
+    # 3943-row tail splits its last wave's 2 items
+    assert [
+        (one.dx_stage_of(i), one.variants_of(i).dx_split, one.dx_slices_of(i))
+        for i in range(4)
+    ] == [
+        ("gemm_dx", None, 1),
+        ("gemm_dx", None, 1),
+        ("gemm_dx", None, 1),
+        ("gemm_dx_split", 2, 1),
+    ]
+    for i in range(4):
         assert ruled.dx_slices_of(i) == unpinned.dx_slices_of(i)
+    # the dX split-tail form: a pin wins over the rule
+    plain = cake_backend.make_plan(problem, gemm_tuning={"dx": {"split": None}}, **kw)
+    assert all(plain.variants_of(i).dx_split is None for i in range(4))
+    assert all(not s.endswith("_split") for s in plain.stages)
+    halved = cake_backend.make_plan(
+        problem, gemm_tuning={"dx": {"tile_n": 512, "split": 2}}, **kw
+    )
+    assert all(halved.variants_of(i).dx_split == 2 for i in range(4))
+    assert all(halved.dx_stage_of(i).endswith("_split") for i in range(4))
+    # the swapped dX tile's knob is ``swap_ab`` (validated as the other integer knobs)
+    assert cake_backend._resolve_gemm_tuning(
+        {"dx": {"tile_n": 512, "swap_ab": False}}
+    ) == {"dx": {"tile_n": 512, "swap_ab": 0}}
+    with pytest.raises(ValueError, match="must be a dict over the knobs"):
+        cake_backend._resolve_gemm_tuning({"dx": {"swab": True}})
     # the default geometry's long chunks: a pinned knob keeps the other rule's output
     g0 = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
     long_kw = dict(
@@ -1903,12 +2291,24 @@ def test_make_plan_explicit_gemm_tuning_wins_over_the_rules():
         .dw_group_m
         == 16
     )
+    # the 1-row last chunk of this 2-chunk call takes the bf16 cast's TMA store (dw_cast_tma_rule) unless a call pins
+    # the weight-gradient epilogue: an explicit ``epi_store`` keeps the shipped cast (``tma`` = the accumulate's
+    # reduce-add only)
     assert (
         cake_backend.make_plan(
             long_problem, gemm_tuning={"dw": {"group_m": None}}, **long_kw
         ).dw_cast_stage
-        == "gemm_dw_cast_bf16"
+        == "gemm_dw_cast_bf16_tma"
     )
+    for epi in (None, "redsm", "tma"):
+        pinned_epi = cake_backend.make_plan(
+            long_problem, gemm_tuning={"dw": {"epi_store": epi}}, **long_kw
+        )
+        assert pinned_epi.dw_cast_stage == "gemm_dw_cast_bf16", epi
+        assert not pinned_epi.variants_of(1).dw_cast_tma
+        assert pinned_epi.dw_acc_stage(0) == (
+            "gemm_dw_acc_tma" if epi == "tma" else "gemm_dw_acc"
+        )
     assert (
         cake_backend.make_plan(
             long_problem, gemm_tuning={"dw": {"group_m": 32}}, **long_kw
@@ -1935,6 +2335,360 @@ def test_make_plan_explicit_gemm_tuning_wins_over_the_rules():
     assert cake_backend._resolve_gemm_tuning(
         {"dw": {"epi_store": "tma", "group_m": None}}
     ) == {"dw": {"epi_store": "tma", "group_m": None}}
+
+
+def test_make_plan_explicit_dx_split_runs_1_to_w_wide_items():
+    """An explicit dX ``split`` runs 1 .. W of the chunk's W wide items as half items (the ``_split`` grid carries
+    ``W + F`` clusters): ``F = 1`` and ``F = W`` plan the split-tail form, a value below 1 or above W raises, ``None``
+    and 0 plan the plain form."""
+    g = Geometry.from_record({"geometry": {"hidden": 7168, "vocab": 129280}})
+    kw = dict(
+        need_dx=True,
+        need_dw=True,
+        geometry=g,
+        dx_max_slices=4,
+        num_sms=148,
+        dx_resident=74,
+        fuse_dw_cast=True,
+        arch="sm_100a",
+    )
+    problem = _problem(3943, 7168, 129280, 4096)  # one chunk of 3943 rows
+    k = cake_backend.make_plan(problem, **kw).dx_slices_of(0)
+    wide, _ = cake_backend.dx_wide_items(3943, 7168, 148, k, g)
+    assert (
+        k > 1 and wide == 16 * 14 * k
+    )  # 16 row-tile pairs x 14 column tiles of 512 x k slices
+    for split in (1, wide):
+        plan = cake_backend.make_plan(
+            problem, gemm_tuning={"dx": {"split": split}}, **kw
+        )
+        assert plan.chunks == ((0, 3943),) and plan.variants_of(0).dx_split == split
+        assert plan.dx_stage_of(0).endswith("_split")
+    for split in (-1, wide + 1):
+        with pytest.raises(ValueError, match=rf"split={split}:.* W = {wide}$"):
+            cake_backend.make_plan(problem, gemm_tuning={"dx": {"split": split}}, **kw)
+    for split in (None, 0):
+        plain = cake_backend.make_plan(
+            problem, gemm_tuning={"dx": {"split": split}}, **kw
+        )
+        assert plain.variants_of(0).dx_split is None
+        assert not plain.dx_stage_of(0).endswith("_split")
+    # a plan without dX (the log-probability forward, a frozen X) runs no split form and does not check the knob
+    # against a one-slice chunk's items: W of k > 1 slices exceeds them
+    cake_backend.make_plan(
+        problem, gemm_tuning={"dx": {"split": wide}}, **{**kw, "need_dx": False}
+    )
+
+
+def _plan_kw(arch, H=6144, V=154880):
+    sms = {"sm_100a": 148, "sm_103a": 152}[arch]
+    return dict(
+        need_dx=True,
+        need_dw=True,
+        geometry=Geometry.from_record({"geometry": {"hidden": H, "vocab": V}}),
+        dx_max_slices=4,
+        num_sms=sms,
+        dx_resident=sms // 2,
+        fuse_dw_cast=True,
+        arch=arch,
+    )
+
+
+_ENTRIES = (("ce", "loss"), ("policy", "loss"), ("ce", "logprob"))
+
+
+def test_dw_cast_tma_rule():
+    assert cake_backend.DW_CAST_TMA_MAX_ROWS == {"sm_100a": 1792, "sm_103a": 1792}
+    for arch in ("sm_100a", "sm_103a"):
+        for rows in (1, 59, 63, 64, 65, 339, 1083, 1536, 1792):
+            assert cake_backend.dw_cast_tma_rule(2, rows, arch)
+            assert cake_backend.dw_cast_tma_rule(16, rows, arch)
+            assert not cake_backend.dw_cast_tma_rule(1, rows, arch)  # no old sum
+        assert not cake_backend.dw_cast_tma_rule(2, 1793, arch)
+        assert not cake_backend.dw_cast_tma_rule(2, 4096, arch)
+        assert not cake_backend.dw_cast_tma_rule(2, 0, arch)
+    assert not cake_backend.dw_cast_tma_rule(2, 1792, None)
+    assert not cake_backend.dw_cast_tma_rule(2, 1792, "sm_90a")
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+def test_make_plan_dw_cast_tma_runs_the_last_chunk_of_tails_up_to_1792(arch):
+    """The bf16 fused cast of the deferred last chunk takes the TMA store when the call has >= 2 chunks and the last
+    chunk has 1 .. 1792 rows, on both architectures and every entry / objective; a one-chunk call, a 1793-row tail,
+    the fp32 cast, the unfused cast and the reference path keep their shipped forms; only the last chunk's variant
+    changes."""
+    kw = _plan_kw(arch)
+    C = 2048
+    for objective, entry in _ENTRIES:
+        for tail, tma in (
+            (1, True),
+            (59, True),
+            (1083, True),
+            (1792, True),
+            (1793, False),
+            (C, False),
+        ):
+            for full in (1, 3):
+                rows = full * C + tail
+                plan = cake_backend.make_plan(
+                    _problem(rows, 6144, 154880, C, objective, entry), **kw
+                )
+                assert plan.num_chunks == full + 1 and plan.last_chunk[1] == tail
+                cast = "gemm_dw_cast_bf16_tma" if tma else "gemm_dw_cast_bf16"
+                assert plan.dw_cast_stage == cast, (objective, entry, rows)
+                assert cast in plan.stages
+                assert ("gemm_dw_cast_bf16" in plan.stages) is not tma
+                assert [plan.variants_of(i).dw_cast_tma for i in range(full + 1)] == [
+                    False
+                ] * full + [tma]
+                assert all(
+                    plan.variants_of(i).dw_epi_store is None for i in range(full + 1)
+                )
+        # a one-chunk call (no old FP32 sum) keeps the shipped cast at every row count
+        for rows in (1, 59, 1792, 1793, C):
+            one = cake_backend.make_plan(
+                _problem(rows, 6144, 154880, C, objective, entry), **kw
+            )
+            assert one.num_chunks == 1 and one.dw_cast_stage == "gemm_dw_cast_bf16"
+            assert not one.variants_of(0).dw_cast_tma
+    # the fp32 fused cast, the unfused cast and the reference path keep their forms
+    p32 = cake_backend.make_plan(
+        _problem(C + 59, 6144, 154880, C, dtype=torch.float32), **kw
+    )
+    assert p32.dw_cast_stage.startswith("gemm_dw_cast_f32")
+    assert not any(v.dw_cast_tma for v in p32.variants)
+    unfused = cake_backend.make_plan(
+        _problem(C + 59, 6144, 154880, C), **dict(kw, fuse_dw_cast=False)
+    )
+    assert unfused.dw_cast_stage == "scale_cast_bf16"
+    assert not any(v.dw_cast_tma for v in unfused.variants)
+    reference = cake_backend.make_plan(
+        _problem(C + 59, 6144, 154880, C), **dict(kw, arch=None)
+    )
+    assert reference.dw_cast_stage == "gemm_dw_cast_bf16"
+
+
+def test_make_plan_sm100_changes_only_the_last_cast():
+    """On SM100 the r6 rules add only the last chunk's TMA cast: no chunk runs the swapped dX tile (no SM100 swab
+    program), every variant other than the last chunk's ``dw_cast_tma`` is the one of a call that pins the shipped
+    weight-gradient epilogue (``"dw": {"epi_store": None}`` -- the rules of the shipped plan), and the stage sets differ
+    by the cast's name only."""
+    for key in [k for k in _DX_FORMS if k[0] == "sm_100a"]:
+        _, H, V, rows, C = key
+        kw_k = _plan_kw("sm_100a", H, V)
+        for objective, entry in _ENTRIES:
+            problem = _problem(rows, H, V, C, objective, entry)
+            plan = cake_backend.make_plan(problem, **kw_k)
+            shipped = cake_backend.make_plan(
+                problem, gemm_tuning={"dw": {"epi_store": None}}, **kw_k
+            )
+            assert not any(v.dx_swab for v in plan.variants)
+            assert all("_swab" not in s for s in plan.stages)
+            tma = cake_backend.dw_cast_tma_rule(
+                plan.num_chunks, plan.last_chunk[1], "sm_100a"
+            )
+            assert plan.variants[:-1] == shipped.variants[:-1]
+            assert plan.variants[-1] == replace(shipped.variants[-1], dw_cast_tma=tma)
+            rename = {"gemm_dw_cast_bf16_tma": "gemm_dw_cast_bf16"}
+            assert tuple(rename.get(s, s) for s in plan.stages) == shipped.stages
+            assert (plan.dw_cast_stage == "gemm_dw_cast_bf16_tma") is tma
+
+
+def test_dx_swab_rule():
+    assert cake_backend.DX_SWAB_ARCHES == ("sm_103a",)
+    rule = cake_backend.dx_swab_rule
+    for rows in (512, 1024, 2048, 4096, 8192):
+        for n in (3, 4, 16):
+            assert rule(rows, 6144, "sm_103a", None, True, n)
+            assert rule(rows, 6144, "sm_103a", 512, True, n)
+    assert rule(4096, 7168, "sm_103a", None, True, 3) and rule(
+        4096, 8192, "sm_103a", None, True, 3
+    )
+    for args in (
+        (
+            4096,
+            6144,
+            "sm_103a",
+            None,
+            True,
+            2,
+        ),  # fewer than DW_STREAM_MIN_CHUNKS chunks
+        (4096, 6144, "sm_103a", None, True, 1),
+        (4096, 6144, "sm_103a", None, True, None),  # an unknown chunk count
+        (4096, 6144, "sm_103a", None, False, 4),  # not a cross-entropy loss call
+        (4096, 6144, "sm_100a", None, True, 4),  # no SM100 swab program
+        (4096, 6144, None, None, True, 4),
+        (4096, 6144, "sm_103a", 256, True, 4),  # the narrow tile
+        (4095, 6144, "sm_103a", None, True, 4),  # not whole 512-token tiles
+        (3131, 6144, "sm_103a", None, True, 4),
+        (4096, 2880, "sm_103a", None, True, 4),  # H not a multiple of the wide tile
+    ):
+        assert not rule(*args), args
+
+
+def test_make_plan_swab_runs_whole_chunks_of_sm103_ce_calls_of_3_or_more_chunks():
+    """SM103 cross-entropy loss calls of >= 3 chunks run every chunk of whole 512-token tiles as the swapped dX tile,
+    ahead of the split-tail rule and the H >= 7168 forms (table ring depth, no split, the slice rule's K slices); the
+    policy objective, the log-probability entry point, calls of 1 or 2 chunks and SM100 never do."""
+    kw = _plan_kw("sm_103a")
+    exact = cake_backend.make_plan(_problem(3 * 4096, 6144, 154880, 4096), **kw)
+    assert exact.num_chunks == 3
+    assert all(exact.variants_of(i).dx_swab for i in range(3))
+    assert all(exact.dx_stage_of(i) == "gemm_dx_s_swab" for i in range(3))
+    assert all(exact.variants_of(i).dx_split is None for i in range(3))
+    assert {"gemm_dx_s_swab"} == {s for s in exact.stages if s.startswith("gemm_dx")}
+    for objective, entry in _ENTRIES[1:]:
+        other = cake_backend.make_plan(
+            _problem(3 * 4096, 6144, 154880, 4096, objective, entry), **kw
+        )
+        assert not any(v.dx_swab for v in other.variants)
+        assert all("_swab" not in s for s in other.stages)
+    for rows in (4096, 8192, 8191):  # 1 and 2 chunks
+        few = cake_backend.make_plan(_problem(rows, 6144, 154880, 4096), **kw)
+        assert not any(v.dx_swab for v in few.variants), rows
+    sm100 = cake_backend.make_plan(
+        _problem(3 * 4096, 6144, 154880, 4096), **_plan_kw("sm_100a")
+    )
+    assert not any(v.dx_swab for v in sm100.variants)
+
+
+# Amendment rows of the swab lever gate: their plans must not run the cast's TMA store (whole-call and 5 %-ignored
+# valid-row chunk loops).
+_SWAB_GATE_ROWS = {
+    "t16231_c4096_ce": (6144, 154880, (16231, 15419)),
+    "t16172_c4096_ce": (6144, 154880, (16172, 15363)),
+    "t16231_c4096_ce_h8192v128256": (8192, 128256, (16231, 15419)),
+}
+
+
+@pytest.mark.parametrize("row", list(_SWAB_GATE_ROWS))
+def test_make_plan_swab_gate_rows_have_no_tma_cast(row):
+    H, V, row_counts = _SWAB_GATE_ROWS[row]
+    for rows in row_counts:
+        plan = cake_backend.make_plan(
+            _problem(rows, H, V, 4096), **_plan_kw("sm_103a", H, V)
+        )
+        assert plan.num_chunks == 4 and plan.last_chunk[1] > 1792
+        assert "gemm_dw_cast_bf16_tma" not in plan.stages
+        assert plan.dw_cast_stage == "gemm_dw_cast_bf16"
+        assert [plan.variants_of(i).dx_swab for i in range(4)] == [True] * 3 + [False]
+
+
+def test_make_plan_explicit_dx_pins_and_the_swab_rule():
+    """An explicit ``split`` (any value) or a ``stages`` other than the table depth keeps the pinned form and turns the
+    swab rule off; ``stages`` 4 / ``None`` keep it on; ``swap_ab`` pins the swapped tile on or off on any chunk and
+    objective; ``swap_ab=True`` with another ring depth or with a split raises."""
+    kw = _plan_kw("sm_103a")
+    problem = _problem(15419, 6144, 154880, 4096)  # 3 whole chunks + a 3131-row tail
+    ruled = cake_backend.make_plan(problem, **kw)
+    assert [ruled.dx_stage_of(i) for i in range(4)] == ["gemm_dx_s_swab"] * 3 + [
+        "gemm_dx_s_split"
+    ]
+    split = cake_backend.make_plan(
+        problem, gemm_tuning={"dx": {"tile_n": 512, "split": 2}}, **kw
+    )
+    assert all(
+        split.dx_stage_of(i) == "gemm_dx_s_split" and split.variants_of(i).dx_split == 2
+        for i in range(4)
+    )
+    assert not any(v.dx_swab for v in split.variants)
+    plain = cake_backend.make_plan(problem, gemm_tuning={"dx": {"split": None}}, **kw)
+    assert [plain.dx_stage_of(i) for i in range(4)] == ["gemm_dx_s"] * 4
+    st3 = cake_backend.make_plan(problem, gemm_tuning={"dx": {"stages": 3}}, **kw)
+    assert all(st3.dx_stage_of(i).startswith("gemm_dx_s_st3") for i in range(4))
+    assert not any(v.dx_swab for v in st3.variants)
+    for table_depth in (4, None):
+        kept = cake_backend.make_plan(
+            problem, gemm_tuning={"dx": {"stages": table_depth}}, **kw
+        )
+        assert [kept.dx_stage_of(i) for i in range(4)] == [
+            ruled.dx_stage_of(i) for i in range(4)
+        ]
+    off = cake_backend.make_plan(problem, gemm_tuning={"dx": {"swap_ab": False}}, **kw)
+    none = cake_backend.make_plan(problem, gemm_tuning={"dx": {"swap_ab": None}}, **kw)
+    policy = _problem(15419, 6144, 154880, 4096, "policy")
+    assert (
+        off.variants == none.variants == cake_backend.make_plan(policy, **kw).variants
+    )
+    assert [off.dx_stage_of(i) for i in range(4)] == ["gemm_dx_s_split"] * 4
+    for p in (
+        problem,
+        policy,
+    ):  # a pin runs every chunk swapped, the 3131-row tail and the policy objective included
+        on = cake_backend.make_plan(p, gemm_tuning={"dx": {"swap_ab": True}}, **kw)
+        assert [on.dx_stage_of(i) for i in range(4)] == ["gemm_dx_s_swab"] * 4
+        on4 = cake_backend.make_plan(
+            p, gemm_tuning={"dx": {"swap_ab": True, "stages": 4, "split": None}}, **kw
+        )
+        assert on4.variants == on.variants
+    with pytest.raises(ValueError, match="swap_ab"):
+        cake_backend.make_plan(
+            problem, gemm_tuning={"dx": {"swap_ab": True, "stages": 3}}, **kw
+        )
+    with pytest.raises(ValueError, match="exclude each other"):
+        cake_backend.make_plan(
+            problem,
+            gemm_tuning={"dx": {"swap_ab": True, "tile_n": 512, "split": 2}},
+            **kw,
+        )
+    with pytest.raises(ValueError):  # the swapped form exists for the wide tile only
+        cake_backend.make_plan(
+            problem, gemm_tuning={"dx": {"swap_ab": True, "tile_n": 256}}, **kw
+        ).dx_stage_of(0)
+
+
+def test_make_plan_explicit_swap_ab_errors_early():
+    """An explicit ``swap_ab=True`` applies to every chunk: ``make_plan`` raises a ``ValueError`` (not a missing stage at
+    bind time) for a chunk whose dX tile the rule narrows (the message names the chunk's rows and tile and says to pin
+    ``tile_n=512`` as well), for an architecture without the swapped program and for a ring depth other than the
+    table's; with ``tile_n=512`` pinned too, every chunk -- the ragged tail included -- runs the swapped tile."""
+    kw = _plan_kw("sm_103a")
+    problem = _problem(3 * 2048 + 59, 6144, 154880, 2048)  # a ragged 59-row tail
+    ruled = cake_backend.make_plan(problem, **kw)
+    assert ruled.num_chunks == 4 and ruled.last_chunk[1] == 59
+    narrow = [i for i in range(4) if ruled.variants_of(i).dx_tile_n is not None]
+    assert narrow and all(ruled.variants_of(i).dx_tile_n == 256 for i in narrow)
+    rows = ruled.chunks[narrow[0]][1]
+    with pytest.raises(
+        ValueError,
+        match=rf"swap_ab=True: .* chunk of {rows} rows resolves tile_n=256 .*pin tile_n=512 as well",
+    ):
+        cake_backend.make_plan(problem, gemm_tuning={"dx": {"swap_ab": True}}, **kw)
+    for objective in ("ce", "policy"):
+        p = _problem(3 * 2048 + 59, 6144, 154880, 2048, objective)
+        pinned = cake_backend.make_plan(
+            p, gemm_tuning={"dx": {"swap_ab": True, "tile_n": 512}}, **kw
+        )
+        assert all(
+            pinned.variants_of(i).dx_swab and pinned.variants_of(i).dx_tile_n is None
+            for i in range(4)
+        )
+        assert all(pinned.dx_stage_of(i).endswith("_swab") for i in range(4))
+    with pytest.raises(ValueError, match=r"4-deep table ring only, got stages=3"):
+        cake_backend.make_plan(
+            problem,
+            gemm_tuning={"dx": {"swap_ab": True, "tile_n": 512, "stages": 3}},
+            **kw,
+        )
+    kw100 = _plan_kw("sm_100a")
+    for pin in ({"swap_ab": True}, {"swap_ab": True, "tile_n": 512}):
+        with pytest.raises(ValueError, match="sm_100a has no swapped dX program"):
+            cake_backend.make_plan(problem, gemm_tuning={"dx": pin}, **kw100)
+    assert (
+        cake_backend.make_plan(
+            problem, gemm_tuning={"dx": {"swap_ab": False}}, **kw100
+        ).variants
+        == cake_backend.make_plan(problem, **kw100).variants
+    )
+
+
+def test_reachable_variants_r6_forms():
+    bases = cake_jit.BASE_STAGES
+    r103 = cake_backend.reachable_variants(bases, "sm_103a", 4)
+    r100 = cake_backend.reachable_variants(bases, "sm_100a", 4)
+    assert {"gemm_dx_swab", "gemm_dx_s_swab", "gemm_dw_cast_bf16_tma"} <= r103
+    assert "gemm_dw_cast_bf16_tma" in r100
+    assert not {s for s in r100 if "_swab" in s}
 
 
 def test_gemm_tuning_default_is_no_knob():
@@ -2003,10 +2757,19 @@ def test_toolchain_workaround_flags():
                 assert workaround not in entry["nvcc_flags_if"], entry["name"]
 
 
-def test_toolchain_runs_hidden_count(monkeypatch):
+@pytest.fixture
+def toolchain_check_uncached():
+    """``cake_jit.toolchain_runs_hidden_count`` caches its answer per architecture for the process: a test that
+    patches the toolkit version starts and ends with an empty cache, so no patched answer outlives it."""
+    cake_jit.toolchain_runs_hidden_count.cache_clear()
+    yield
+    cake_jit.toolchain_runs_hidden_count.cache_clear()
+
+
+def test_toolchain_runs_hidden_count(monkeypatch, toolchain_check_uncached):
     """On CUDA 13.0 the sm_103a calls take the host-count path; every other architecture / toolchain pair runs
     the hidden valid-row count.  The toolkit version is ``cake_build.record_cuda_version`` (the toolkit that
-    built the prebuilt libraries, else the local one)."""
+    built the prebuilt libraries, else the local one), read once per architecture and process."""
     for version, sm_103a in (
         ((13, 0), False),
         ((12, 9), True),
@@ -2016,8 +2779,21 @@ def test_toolchain_runs_hidden_count(monkeypatch):
         monkeypatch.setattr(
             cake_build, "record_cuda_version", lambda arch, v=version: v
         )
+        cake_jit.toolchain_runs_hidden_count.cache_clear()
         assert cake_jit.toolchain_runs_hidden_count("sm_103a") is sm_103a, version
         assert cake_jit.toolchain_runs_hidden_count("sm_100a") is True, version
+    # the answer is cached: the manifest and the library files are read once per architecture and process
+    calls = []
+
+    def counted(arch):
+        calls.append(arch)
+        return (13, 4)
+
+    monkeypatch.setattr(cake_build, "record_cuda_version", counted)
+    cake_jit.toolchain_runs_hidden_count.cache_clear()
+    for _ in range(3):
+        assert cake_jit.toolchain_runs_hidden_count("sm_103a") is True
+    assert calls == ["sm_103a"]
 
 
 def test_select_module_one_record_per_arch(monkeypatch):
@@ -2055,30 +2831,46 @@ def test_reachable_variants_complete_the_rule_closure():
         "gemm_dx_s_tn256",
         "gemm_dx_st3",
         "gemm_dx_s_st3",
+        "gemm_dx_split",
+        "gemm_dx_s_split",
+        "gemm_dx_st3_split",
+        "gemm_dx_s_st3_split",
     }
-    dw_forms = {"gemm_dw_acc_gn", "gemm_dw_cast_f32_gn"}
+    dw_forms = {"gemm_dw_acc_gn", "gemm_dw_cast_f32_gn", "gemm_dw_cast_bf16_tma"}
     logits_forms = {"gemm_logits_mcnt", "gemm_logits_nostats_mcnt"}
-    # the forms are structural: the same set on both architectures at every geometry (H / V, the slice count, the
-    # raster height and the block width are launch scalars of these kernels)
+    # the forms are structural: the same set at every geometry (H / V, the slice count, the raster height and the
+    # block width are launch scalars of these kernels); SM103 adds the swapped dX tile (DX_SWAB_ARCHES)
     assert rv(bases, "sm_100a", 4) == dx_forms | dw_forms | logits_forms
-    assert rv(bases, "sm_103a", 4) == rv(bases, "sm_100a", 4)
+    assert rv(bases, "sm_103a", 4) == rv(bases, "sm_100a", 4) | {
+        "gemm_dx_swab",
+        "gemm_dx_s_swab",
+    }
     assert rv(bases, "sm_100a", 2) == rv(bases, "sm_100a", 4)
+    assert rv(bases, "sm_103a", 1) == rv(bases, "sm_100a", 1) | {"gemm_dx_swab"}
     # a record without the K-sliced form serves one slice: the plain dX forms only
     assert (
         rv(bases, "sm_100a", 1)
-        == {"gemm_dx", "gemm_dx_tn256", "gemm_dx_st3"} | dw_forms | logits_forms
+        == {
+            "gemm_dx",
+            "gemm_dx_tn256",
+            "gemm_dx_st3",
+            "gemm_dx_split",
+            "gemm_dx_st3_split",
+        }
+        | dw_forms
+        | logits_forms
     )
     assert rv({"row_grad", "scale_cast_bf16"}, "sm_103a", 4) == set()
-    # an architecture without the ring / block rules reaches neither form
+    # an architecture without the ring / block / split / swap rules reaches none of those forms
     assert (
         rv(bases, "sm_90a", 4)
         == {"gemm_dx", "gemm_dx_s", "gemm_dx_tn256", "gemm_dx_s_tn256"} | logits_forms
     )
     # every name of STAGES is a base stage or a form some record can reach
-    assert set(cake_jit.STAGES) == set(cake_jit.BASE_STAGES) | rv(
-        bases, "sm_103a", 4
-    ) | rv(bases, "sm_100a", 4)
-    assert len(cake_jit.STAGES) == 23
+    assert set(cake_jit.STAGES) == (
+        set(cake_jit.BASE_STAGES) | rv(bases, "sm_103a", 4) | rv(bases, "sm_100a", 4)
+    )
+    assert len(cake_jit.STAGES) == 32
     assert (
         cake_backend.dx_max_slices(cake_jit.STAGES) == cake_backend.DX_K_SLICES_MAX == 4
     )
@@ -2439,6 +3231,7 @@ def test_binding_keys_cover_pointer_shape_stride_dtype_and_options():
         dict(fuse_dw_cast=True),
         dict(gemm_tuning={"logits": {"group_m": 16}}),
         dict(hidden_count=True),
+        dict(logprob_lbl=True),
     ):
         assert base != forward_binding_key(X, W, labels, **dict(common, **option)), (
             option
@@ -2491,6 +3284,17 @@ def test_binding_keys_cover_pointer_shape_stride_dtype_and_options():
     )
     assert bwd != logprob_backward_binding_key(
         X, W, labels, lse, dlogp, chunk_size=2048, need_dx=True, need_dw=True
+    )
+    assert bwd != logprob_backward_binding_key(
+        X,
+        W,
+        labels,
+        lse,
+        dlogp,
+        chunk_size=4096,
+        need_dx=True,
+        need_dw=True,
+        logprob_dz=True,
     )
     assert bwd != logprob_backward_binding_key(
         X,
@@ -2610,6 +3414,32 @@ def test_binding_cache_configure():
     assert cache.capacity == 8
     with pytest.raises(ValueError, match="positive integer"):
         BindingCache(capacity=0)
+
+
+def test_stage_names_and_gemm_scalars_return_fresh_dicts():
+    """``parse_stage`` and ``gemm_scalars`` remember their results per argument tuple; every call still returns a dict
+    of its own, so a caller that edits one changes nothing for the next call."""
+    stage = "gemm_dx_s_tn256"
+    base, knobs = cake_backend.parse_stage(stage)
+    assert base == "gemm_dx" and knobs["sliced"] is True and knobs["tile_n"] == 256
+    knobs["sliced"] = None
+    assert cake_backend.parse_stage(stage)[1]["sliced"] is True
+    with pytest.raises(ValueError, match="not a stage name"):
+        cake_backend.parse_stage("gemm_dx_bogus")
+    g = Geometry.from_record(None)
+    scalars = cake_backend.gemm_scalars(
+        "gemm_logits", g, hidden=DEFAULT_H, vocab=DEFAULT_V, rows_c=7
+    )
+    expect = dict(scalars)
+    scalars["M"] = -1
+    again = cake_backend.gemm_scalars(
+        "gemm_logits", g, hidden=DEFAULT_H, vocab=DEFAULT_V, rows_c=7
+    )
+    assert again == expect and again["M"] == 7 and again is not scalars
+    with pytest.raises(ValueError, match="group_m must be positive"):
+        cake_backend.gemm_scalars(
+            "gemm_logits", g, hidden=DEFAULT_H, vocab=DEFAULT_V, rows_c=7, group_m=0
+        )
 
 
 HOST_SHAPES = [(1, 16), (5, 4), (37, 16), (64, 64), (65, 64), (200, 64)]
@@ -3438,7 +4268,153 @@ def test_hidden_count_plan_keys():
         )
 
 
-def test_hidden_count_eligibility_rules(monkeypatch):
+def test_logprob_arm_plan_keys():
+    """The log-probability logits GEMM arms: the forward's ``gemm_logits_lbl`` replaces ``gemm_logits`` and the
+    backward's ``gemm_logits_dz`` replaces ``gemm_logits_nostats`` + ``row_grad`` on every chunk (the dW side stream
+    forks behind it); a hidden valid-row count backward keeps chunk 0's queued device-count recompute and its
+    ``row_grad``; the arms belong to the log-probability entry."""
+    g = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
+    common = dict(
+        need_dx=True,
+        need_dw=True,
+        geometry=g,
+        dx_max_slices=4,
+        num_sms=148,
+        dx_resident=74,
+        fuse_dw_cast=True,
+        dx_finalize=True,
+        arch="sm_100a",
+    )
+    problem = _problem(8700, 6144, 154880, 4096, entry="logprob")
+    plain = cake_backend.make_plan(problem, valid_rows=8265, **common)
+    arms = cake_backend.make_plan(
+        problem, valid_rows=8265, logprob_dz=True, logprob_lbl=True, **common
+    )
+    assert arms.chunks == plain.chunks and arms.num_chunks == 3
+    fwd, plain_fwd = cake_backend.forward_keys(arms), cake_backend.forward_keys(plain)
+    assert fwd == tuple(
+        ("gemm_logits_lbl", k[1]) if k[0] == "gemm_logits" else k for k in plain_fwd
+    )
+    bwd = cake_backend.recompute_keys(arms)
+    assert not any(k[0] in ("row_grad", "gemm_logits_nostats") for k in bwd)
+    assert [k for k in bwd if k[0] == "gemm_logits_dz"] == [
+        ("gemm_logits_dz", i) for i in range(3)
+    ]
+    assert [k for k in bwd if k[0] != "gemm_logits_dz"] == [
+        k
+        for k in cake_backend.recompute_keys(plain)
+        if k[0] not in ("row_grad", "gemm_logits_nostats")
+    ]
+    assert {"gemm_logits_dz", "gemm_logits_lbl"} <= set(arms.stages)
+    assert not {"row_grad", "gemm_logits", "gemm_logits_nostats"} & set(arms.stages)
+    assert list(arms.stages) == [s for s in cake_jit.STAGES if s in arms.stages]
+    _, forks, sides = cake_backend.side_stream_schedule(arms, bwd, "1")
+    assert sorted(forks) == [i for i, k in enumerate(bwd) if k[0] == "gemm_logits_dz"]
+    assert len(sides) == 2 and all(p > min(forks) for p in sides)
+    hidden = replace(arms, hidden_count=True, hidden_stats=False)
+    rk = cake_backend.recompute_keys(hidden)
+    assert rk[:2] == (("gather_rows", "d_in"), ("row_grad", 0))
+    assert ("gemm_logits_dz", 0) not in rk and ("gemm_logits_dz", 1) in rk
+    assert "row_grad" in hidden.stages
+    with pytest.raises(ValueError, match="log-probability"):
+        cake_backend.make_plan(
+            _problem(8700, 6144, 154880, 4096), logprob_dz=True, **common
+        )
+
+
+def test_forward_early_keys():
+    """The host-count path's early launches (``forward_early_keys``): chunk 0's row gather (compacted plans) and
+    its forward logits GEMM -- the label-column arm on a log-probability plan that runs it, the only early launch
+    that reads the call's labels -- in their ``forward_keys`` order; none on the hidden valid-row count path."""
+    g = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
+    common = dict(geometry=g, num_sms=148, arch="sm_100a")
+    early, reads = cake_backend.forward_early_keys, cake_backend._reads_labels
+    loss = _problem(5000, 6144, 154880, 4096)
+    policy = _problem(5000, 6144, 154880, 4096, objective="policy")
+    logprob = _problem(5000, 6144, 154880, 4096, entry="logprob")
+    gather, logits, lbl = ("gather_rows", 0), ("gemm_logits", 0), ("gemm_logits_lbl", 0)
+    for problem, kw, want in (
+        (loss, dict(valid_rows=4750), (gather, logits)),
+        (loss, {}, (logits,)),
+        (policy, dict(valid_rows=4750), (gather, logits)),
+        (logprob, dict(valid_rows=4750), (gather, logits)),
+        (logprob, dict(valid_rows=4750, logprob_lbl=True), (gather, lbl)),
+        (logprob, dict(logprob_lbl=True), (lbl,)),
+    ):
+        train = problem.entry == "loss"
+        plan = cake_backend.make_plan(
+            problem, need_dx=train, need_dw=train, **common, **kw
+        )
+        keys = early(plan)
+        assert keys == want, (problem.objective, problem.entry, kw)
+        assert [k for k in cake_backend.forward_keys(plan) if k in keys] == list(keys)
+        assert [reads(k[0]) for k in keys] == [k == lbl for k in keys]
+    hidden = cake_backend.make_plan(
+        loss, need_dx=True, need_dw=True, valid_rows=4750, hidden_count=True, **common
+    )
+    assert early(hidden) == ()
+    assert reads("row_finalize") and reads("row_grad") and reads("gemm_logits_dz")
+    assert not reads("gemm_logits_nostats") and not reads("gather_rows_bf16")
+
+
+def test_logprob_arm_switches_belong_to_the_logprob_entry():
+    """``logprob_dz`` / ``logprob_lbl`` are keywords of the log-probability entry points defaulting to ``None`` (=
+    ``True``, the arms); a loss-entry runner rejects ``True`` and accepts ``False``; a plan without a registered
+    program (the reference backend) keeps the stages the arms replace under any value."""
+    inp = _host_inputs(37)
+    for kw in (dict(logprob_dz=True), dict(logprob_lbl=True)):
+        with pytest.raises(ValueError, match="log-probability"):
+            prepare_lm_head_loss(
+                inp.X,
+                inp.W,
+                inp.labels,
+                loss_div=inp.loss_div,
+                chunk_size=16,
+                backend="reference",
+                **kw,
+            )
+    runner = prepare_lm_head_loss(
+        inp.X,
+        inp.W,
+        inp.labels,
+        loss_div=inp.loss_div,
+        chunk_size=16,
+        backend="reference",
+        logprob_dz=False,
+        logprob_lbl=False,
+    )
+    assert not (runner.plan.logprob_dz or runner.plan.logprob_lbl)
+    runner = prepare_lm_head_loss(
+        inp.X,
+        inp.W,
+        inp.labels,
+        chunk_size=16,
+        entry="logprob",
+        backend="reference",
+        logprob_dz=True,
+        logprob_lbl=True,
+    )
+    assert not (runner.plan.logprob_dz or runner.plan.logprob_lbl)
+    assert "row_grad" in runner.stages and "gemm_logits" in runner.stages
+    for name, fns in (
+        (
+            "logprob_lbl",
+            (cake_backend.forward_logprob, cake_backend.chunked_lm_head_logprob),
+        ),
+        (
+            "logprob_dz",
+            (cake_backend.backward_logprob, cake_backend.chunked_lm_head_logprob),
+        ),
+    ):
+        for fn in (*fns, prepare_lm_head_loss):
+            param = inspect.signature(fn).parameters[name]
+            assert param.kind is inspect.Parameter.KEYWORD_ONLY
+            assert param.default is None, (fn.__name__, name)
+    assert cake_backend.logprob_dz_default() is True
+    assert cake_backend.logprob_lbl_default() is True
+
+
+def test_hidden_count_eligibility_rules(monkeypatch, toolchain_check_uncached):
     """A compacted call runs the hidden valid-row count only with a registered program that carries the gather kernel
     and the device-count form of chunk 0's logits GEMM (its raster height at the buffer extent is a launch scalar), a
     call of three or more chunks
@@ -3515,6 +4491,7 @@ def test_hidden_count_eligibility_rules(monkeypatch):
     monkeypatch.setitem(cake_jit.MODULES, name, sm_103a)
     assert elig(short, X, sm_103a, name, stats=True)  # the same rules on sm_103a
     monkeypatch.setattr(cake_build, "record_cuda_version", lambda arch: (13, 0))
+    cake_jit.toolchain_runs_hidden_count.cache_clear()
     assert not elig(
         short, X, sm_103a, name, stats=True
     )  # CUDA 13.0: the sm_103a calls take the host-count path
@@ -3581,6 +4558,39 @@ def test_valid_rows_mask():
     all_ignored = torch.full((4,), IGNORE_INDEX)
     idx0, mask0 = cake_backend.valid_rows(all_ignored, mask=True)
     assert idx0.numel() == 0 and mask0.shape == (4,) and not mask0.any()
+
+
+def test_valid_rows_host_count_matches_the_device_count(monkeypatch):
+    """A CUDA call of at most ``HOST_COUNT_MAX_ROWS`` rows forms the valid-row index on the host from the mask's
+    readback, a longer one on the device: the same int64 index and bool mask (contiguous, on the labels' device) for
+    every row valid, some ignored and every row ignored, either side of the limit."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    limit = cake_backend.HOST_COUNT_MAX_ROWS
+    assert 1 <= limit < 2048
+    gen = torch.Generator().manual_seed(SEED)
+    cases = []
+    for T in (1, 2, 16, 128, limit, limit + 1, 3000):
+        labels = torch.randint(0, 1000, (T,), generator=gen)
+        some = labels.clone()
+        some[torch.randperm(T, generator=gen)[: max(1, T // 20)]] = IGNORE_INDEX
+        cases += [labels, some, torch.full((T,), IGNORE_INDEX)]
+    for labels in cases:
+        on_device = labels.to(CUDA)
+        out = {}
+        # the device path everywhere, the host path everywhere
+        for rows in (0, 1 << 20):
+            monkeypatch.setattr(cake_backend, "HOST_COUNT_MAX_ROWS", rows)
+            out[rows] = cake_backend.valid_rows(on_device, mask=True)
+            assert cake_backend.valid_rows(on_device)[1] is None
+        (device_idx, device_mask), (host_idx, host_mask) = out[0], out[1 << 20]
+        assert (device_idx is None) == (host_idx is None) == bool((labels >= 0).all())
+        if device_idx is None:
+            assert device_mask is None and host_mask is None
+            continue
+        for d, h in ((device_idx, host_idx), (device_mask, host_mask)):
+            assert torch.equal(d, h) and d.dtype == h.dtype and d.shape == h.shape
+            assert h.device == on_device.device and h.is_contiguous()
 
 
 def test_scale_cast_scatter_reference_matches_scatter_rows():
@@ -5412,6 +6422,167 @@ def test_device_fused_dw_cast_is_bitwise(glm_weight):
     assert torch.equal(runner.dw_out, _run(inp, 2048, backend="cake", scale=3.0)["dW"])
 
 
+def test_device_eager_casts_remember_their_launch(glm_weight):
+    """The output-boundary casts bind once per form while the binding cache is enabled and slot each call's tensors into
+    the remembered launch: bitwise the outputs of a fresh binding per call (cache disabled), one remembered form per
+    cast, no tensor held, and ``clear`` / ``enabled=False`` drop them."""
+    _require_program(entry="loss")
+    cache = cake_backend.BINDING_CACHE
+    gen = torch.Generator(device=CUDA).manual_seed(SEED + 71)
+    accs = [torch.randn((5, DEFAULT_H), device=CUDA, generator=gen) for _ in range(2)]
+    dzs = [
+        torch.randn((3, DEFAULT_V), device=CUDA, generator=gen).to(torch.bfloat16)
+        for _ in range(2)
+    ]
+    xs = [
+        torch.randn((3, DEFAULT_H), device=CUDA, generator=gen).to(torch.bfloat16)
+        for _ in range(2)
+    ]
+    grads = [torch.tensor(v, device=CUDA) for v in (1.5, -0.25)]
+
+    def casts():
+        out = []
+        for acc, dz, x, g in zip(accs, dzs, xs, grads, strict=True):
+            out.append(cake_backend.scale_cast(acc, g, torch.bfloat16))
+            out.append(cake_backend.scale_cast(acc, g, torch.float32))
+            out.append(cake_backend.dw_cast(dz, x, None, g, torch.bfloat16))
+        torch.cuda.synchronize()
+        return out
+
+    with _cache(False):
+        fresh = casts()
+    with _cache(True):
+        cache.clear()
+        remembered = casts()
+        forms = len(cache._eager)
+        assert forms == 3, list(cache._eager)
+        again = casts()
+        assert len(cache._eager) == forms
+        assert not any(
+            isinstance(a, torch.Tensor)
+            for _, launch in cache._eager.values()
+            for a in launch.arguments
+        )
+        cache.clear()
+        assert len(cache._eager) == 0
+    for a, b, c in zip(fresh, remembered, again, strict=True):
+        assert torch.equal(a, b) and torch.equal(a, c) and a.dtype == b.dtype
+
+
+def _bits(t: torch.Tensor) -> torch.Tensor:
+    """The bit pattern of a float tensor as integers (bf16 -> int16, fp32 -> int32): equality of these views is
+    bit-level equality (``torch.equal`` on floats equates +0 and -0)."""
+    t = t.detach().reshape(-1).contiguous()
+    return t.view({torch.bfloat16: torch.int16, torch.float32: torch.int32}[t.dtype])
+
+
+def _assert_same_bits(a, b, keys=("loss", "logp", "dX", "dW")):
+    for key in keys:
+        x, y = a[key], b[key]
+        assert (x is None) == (y is None), key
+        if x is not None:
+            assert x.dtype == y.dtype and x.shape == y.shape, key
+            assert torch.equal(_bits(x), _bits(y)), key
+
+
+def test_device_swab_dx_is_bitwise_the_shipped_form(glm_weight):
+    """The swapped dX tile (SM103: the rule on whole chunks of a cross-entropy call of >= 3 chunks, or an explicit
+    ``swap_ab=True`` with ``tile_n=512`` on every chunk -- ragged last chunks included -- and objective) gives the bits
+    of the shipped forms (``swap_ab=False``, the rule's tiles): loss, logp, dX and dW as integer views."""
+    _require_program(entry="loss")
+    module_name, record = cake_backend.record_for(CUDA)
+    if record["arch"] not in cake_backend.DX_SWAB_ARCHES:
+        pytest.skip(f"no swapped dX tile on {record['arch']}")
+    assert {"gemm_dx_swab", "gemm_dx_s_swab"} <= set(
+        cake_jit.registered_stages(module_name)
+    )
+    off = {"gemm_tuning": {"dx": {"swap_ab": False}}}
+    # an explicit swap_ab applies to every chunk; a chunk the tile rule narrows needs the wide tile pinned as well
+    pinned = {"gemm_tuning": {"dx": {"swap_ab": True, "tile_n": 512}}}
+    for T, C, objective, pin in (
+        (
+            4096,
+            1024,
+            "ce",
+            {},
+        ),  # whole 1024-token chunks (3 whole + a tail when compacted)
+        (3 * 4096 + 59, 4096, "ce", {}),
+        (3 * 2048 + 1083, 2048, "ce", pinned),  # ragged last chunks
+        (2 * 2048 + 339, 2048, "policy", pinned),
+        (3 * 2048 + 59, 2048, "ce", pinned),
+    ):
+        inp = _device_inputs(T, objective, W=glm_weight)
+        for compact in (None, False):
+            swab = _run(inp, C, backend="cake", compact_rows=compact, **pin)
+            shipped = _run(inp, C, backend="cake", compact_rows=compact, **off)
+            _assert_same_bits(swab, shipped)
+    if generated_program_available(CUDA, entry="logprob"):
+        inp = _device_inputs(3 * 2048 + 1083, W=glm_weight)
+        _assert_same_bits(
+            _run(inp, 2048, entry="logprob", backend="cake", **pinned),
+            _run(inp, 2048, entry="logprob", backend="cake", **off),
+        )
+
+
+@pytest.mark.parametrize("tail", [1, 59, 63, 64, 65, 339, 1083, 1536, 1792, 1793])
+def test_device_dw_cast_tma_is_bitwise_the_shipped_cast(glm_weight, tail):
+    """The bf16 fused cast's TMA store on the last chunk of a 2- or 3-chunk call (tails 1 .. 1792; 1793 keeps the
+    shipped cast) gives the bits of the shipped cast (``"dw": {"epi_store": None}``) on every entry and objective."""
+    _require_program(entry="loss")
+    module_name, _ = cake_backend.record_for(CUDA)
+    assert "gemm_dw_cast_bf16_tma" in cake_jit.registered_stages(module_name)
+    C = 2048
+    shipped = {"gemm_tuning": {"dw": {"epi_store": None}}}
+    for full, objective, scale in ((1, "ce", None), (2, "policy", 2.5)):
+        inp = _device_inputs(full * C + tail, objective, W=glm_weight)
+        _assert_same_bits(
+            _run(inp, C, backend="cake", compact_rows=False, scale=scale),
+            _run(inp, C, backend="cake", compact_rows=False, scale=scale, **shipped),
+        )
+    if generated_program_available(CUDA, entry="logprob"):
+        inp = _device_inputs(C + tail, W=glm_weight)
+        _assert_same_bits(
+            _run(inp, C, entry="logprob", backend="cake", compact_rows=False),
+            _run(
+                inp, C, entry="logprob", backend="cake", compact_rows=False, **shipped
+            ),
+        )
+
+
+def test_device_dw_cast_tma_adversarial_old_sum_is_bitwise(glm_weight):
+    """The eager fused cast with an old FP32 sum of subnormals, +-0, +-inf, NaN and large magnitudes (sums that
+    overflow): the TMA store (rows 1 .. 1792, the default) and the shipped cast (an explicit ``epi_store``) give the
+    same bf16 bits for every tail and upstream scale, and the old sum is only read."""
+    _require_program(entry="loss")
+    module_name, _ = cake_backend.record_for(CUDA)
+    assert "gemm_dw_cast_bf16_tma" in cake_jit.registered_stages(module_name)
+    H, V = DEFAULT_H, DEFAULT_V
+    gen = torch.Generator(device=CUDA).manual_seed(SEED + 97)
+    acc = torch.randn((V, H), device=CUDA, generator=gen) * 64
+    special = torch.tensor(
+        [0.0, -0.0, float("inf"), float("-inf"), float("nan"), 1e-45, -1e-45]
+        + [1.1754942e-38, -1.1754942e-38, 3.0e38, -3.0e38, 6.0e4],
+        device=CUDA,
+    )
+    acc.view(-1, 64)[:, : special.numel()] = special
+    acc_sum = _bits(acc).to(torch.int64).sum()
+    for rows in (1, 59, 63, 64, 65, 339, 1083, 1536, 1792):
+        dz = (torch.randn((rows, V), device=CUDA, generator=gen) * 8).to(torch.bfloat16)
+        x = torch.randn((rows, H), device=CUDA, generator=gen).to(torch.bfloat16)
+        for g in (
+            None,
+            torch.tensor(2.5, device=CUDA),
+            torch.tensor(-3.0, device=CUDA),
+        ):
+            tma = cake_backend.dw_cast(dz, x, acc, g, torch.bfloat16)
+            shipped = cake_backend.dw_cast(
+                dz, x, acc, g, torch.bfloat16, gemm_tuning={"dw": {"epi_store": None}}
+            )
+            torch.cuda.synchronize()
+            assert torch.equal(_bits(tma), _bits(shipped)), (rows, g)
+    assert _bits(acc).to(torch.int64).sum() == acc_sum
+
+
 def test_device_dx_finalize_is_bitwise(glm_weight, monkeypatch):
     """The fused dX finalize on the generated program: ``dx_finalize=False`` (host ``add_`` chain, cast, zero fill,
     ``index_copy_``) and ``True`` (``slab_sum`` + ``scale_cast_scatter_bf16``) give bitwise the same ``loss`` / ``logp`` /
@@ -5624,8 +6795,9 @@ def test_device_hidden_count_kernels_match_torch(glm_weight):
         assert torch.all(hc.x_c[n0:] == 0)
         if n0 == 0:
             continue
-        # the shipped host-bound GEMM over chunk 0's rows (the log-probability forward keeps the logits intact); an
-        # explicit index also when every row is valid: the call has several chunks and only chunk 0 is compared
+        # the shipped host-bound GEMM over chunk 0's rows (the log-probability forward of the stored-logits form,
+        # ``logprob_lbl=False``, keeps the logits intact); an explicit index also when every row is valid: the call has
+        # several chunks and only chunk 0 is compared
         runner = prepare_lm_head_loss(
             inp.X,
             inp.W,
@@ -5636,6 +6808,7 @@ def test_device_hidden_count_kernels_match_torch(glm_weight):
             entry="logprob",
             backend="cake",
             compact_rows=idx[:n0],
+            logprob_lbl=False,
         )
         assert runner.plan.num_chunks == 1 and runner.plan.chunks[0][1] == n0
         runner.forward()
@@ -5769,9 +6942,10 @@ def test_device_hidden_count_switch_is_bitwise(glm_weight, monkeypatch):
                 assert not any(kind == "finish" for kind, _ in log)
                 assert fr.memory["hidden_count"] is False
             else:
-                # the loss forward, the log-probability forward and its backward (ce), the explicit forward: each
-                # queues the gather and chunk 0's device-count GEMM, then reads the count
-                expect = 4 if objective == "ce" else 2
+                # the loss forward, the log-probability forward (ce; its backward takes the forward's row index and
+                # counts nothing), the explicit forward: each queues the gather and chunk 0's device-count GEMM, then
+                # reads the count
+                expect = 3 if objective == "ce" else 2
                 assert binds.count(gather) == expect, binds
                 assert len(counted) == expect, binds
                 finishes = [i for i, (kind, _) in enumerate(log) if kind == "finish"]
@@ -5814,3 +6988,277 @@ def test_device_hidden_count_switch_is_bitwise(glm_weight, monkeypatch):
         lp2 = _run(inp, 4096, entry="logprob", **kw)
         for key in ("logp", "dX", "dW"):
             assert torch.equal(lp1[key], lp2[key]), key
+
+
+def _logprob_steps(inp, C, **kw):
+    """Two autograd log-probability steps through the binding cache (the first call binds, the second launches from
+    the remembered binding) and the explicit pair: ``forward_logprob``, then ``backward_logprob`` with the forward's
+    row index and with a recount."""
+    steps = [_run(inp, C, entry="logprob", backend="cake", **kw) for _ in range(2)]
+    fwd_kw = {k: v for k, v in kw.items() if k != "logprob_dz"}
+    bwd_kw = {k: v for k, v in kw.items() if k != "logprob_lbl"}
+    fr = cake_backend.forward_logprob(inp.X, inp.W, inp.labels, chunk_size=C, **fwd_kw)
+    dlogp = torch.where(inp.valid, inp.dlogp, torch.zeros_like(inp.dlogp))
+    out = dict(lse=fr.lse, logp_eager=fr.logp)
+    for i, step in enumerate(steps):
+        out.update({f"{k}{i}": step[k] for k in ("loss", "logp", "dX", "dW")})
+    for tag, extra in (("index", dict(row_index=fr.row_index)), ("recount", {})):
+        dx, dw = cake_backend.backward_logprob(
+            inp.X, inp.W, inp.labels, fr.lse, dlogp, chunk_size=C, **bwd_kw, **extra
+        )
+        out[f"dX_{tag}"], out[f"dW_{tag}"] = dx, dw
+    torch.cuda.synchronize()
+    return out, steps[0]
+
+
+def test_device_logprob_arms_are_bitwise(glm_weight):
+    """The log-probability logits GEMM arms against the stages they replace on the generated program: ``logprob_dz``
+    / ``logprob_lbl`` on (the default) and off give bitwise the same ``lse`` / ``logp`` / ``dX`` / ``dW`` through the
+    autograd entry (first call and remembered binding) and the explicit pair (the backward on the forward's row index
+    and on a recount), run to run, over one-, two- and many-chunk calls, compacted and uncompacted calls with ignored
+    rows (``-100`` and other negative labels), every row valid, labels at and beyond the last vocabulary column
+    (clamped), the hidden valid-row count on and off and an ``X`` with a padded leading stride (read in place and
+    copied); the arms keep the accuracy gates."""
+    _require_program(entry="logprob")
+    name, _ = cake_backend.record_for(CUDA)
+    if not {"gemm_logits_dz", "gemm_logits_lbl"} <= set(
+        cake_backend.registered_stages(name)
+    ):
+        pytest.skip("the registered program has no log-probability logits GEMM arms")
+    V = int(glm_weight.shape[0])
+    edge_labels = [-1, -7, V - 1, 0, V, V + 5, 2 * V, 2**40]
+    cases = [
+        # (T, chunk, ignored fraction, switches, X pitch padding, label edits, accuracy gate)
+        (1500, 4096, 0.05, {}, 0, False, True),
+        (1500, 4096, 0.0, {}, 0, False, True),
+        (1500, 4096, 0.05, dict(compact_rows=False), 0, False, True),
+        (6000, 4096, 0.05, {}, 0, False, False),
+        (6000, 4096, 0.05, dict(compact_rows=False), 0, False, False),
+        (8700, 4096, 0.05, {}, 0, False, False),
+        (8700, 4096, 0.05, dict(hidden_count=False), 0, False, False),
+        (3100, 1024, 0.5, {}, 0, False, True),
+        (1500, 4096, 0.05, {}, 8, False, False),
+        (1500, 4096, 0.05, dict(compact_rows=False), 4, False, False),
+        (2500, 2048, 0.05, {}, 0, True, False),
+        (2500, 2048, 0.05, dict(compact_rows=False), 0, True, False),
+        (5000, 2048, 0.05, {}, 0, True, False),
+    ]
+    for T, C, ignore, switches, ld_pad, edit, gate in cases:
+        inp = make_inputs(
+            T,
+            seed=SEED + 70 + T,
+            device=CUDA,
+            W=glm_weight,
+            ignore_frac=ignore,
+            ld_pad=ld_pad,
+        )
+        if edit:
+            labels = inp.labels.clone()
+            labels[: len(edge_labels)] = torch.tensor(edge_labels, device=CUDA)
+            inp = replace(inp, labels=labels)
+        case = (T, C, ignore, switches, ld_pad, edit)
+        with _cache(True) as cache:
+            cache.clear()
+            on, first = _logprob_steps(inp, C, **switches)
+            off, _ = _logprob_steps(
+                inp, C, logprob_dz=False, logprob_lbl=False, **switches
+            )
+            # the forward bindings run the label-column arm under its switch, the backward bindings the dz arm
+            arms = {
+                (key[0], b.plan.logprob_lbl if key[0] == "fwd" else b.plan.logprob_dz)
+                for key, b in cache._bindings.items()
+            }
+        assert arms == {
+            ("fwd", True),
+            ("fwd", False),
+            ("bwd", True),
+            ("bwd", False),
+        }, (case, arms)
+        for key in on:
+            assert _same(on[key], off[key]), (case, key)
+        for key in ("logp", "dX", "dW"):
+            assert torch.equal(on[f"{key}0"], on[f"{key}1"]), (case, key)
+        assert torch.equal(on["logp_eager"], on["logp0"]), case
+        for tag in ("index", "recount"):
+            assert torch.equal(on[f"dX_{tag}"], on["dX0"]), (case, tag)
+            assert torch.equal(on[f"dW_{tag}"], on["dW0"]), (case, tag)
+        assert torch.all(on["logp0"][~inp.valid] == 0)
+        assert torch.all(on["dX0"][~inp.valid] == 0)
+        if gate:
+            _check_against_references(first, inp, entry="logprob")
+        del on, off, first
+
+
+def test_device_host_count_early_launch_is_bitwise(glm_weight, monkeypatch):
+    """The host-count path's early launch (one- and two-chunk calls, and longer calls without the hidden valid-row
+    count): the remembered forward launches chunk 0's gather and logits GEMM right behind the count and binds the
+    rest behind them.  Against the in-order sequence (no early keys) every output of both entries is bitwise the
+    same -- compacted, every row valid, uncompacted with ignored rows, both objectives and the log-probability entry
+    (whose label-column GEMM binds the labels first), the dW side stream on two chunks, the unfused dW cast and dX
+    finalize, a padded ``X`` -- the remembered bindings record the split, and the early launch is queued before the
+    labels are bound (after them for the label-column GEMM)."""
+    _require_program(entry="loss")
+    _require_program(entry="logprob")
+    real_early = cake_backend.forward_early_keys
+    real_labels = cake_backend._prepare_labels
+    real_stream = cake_backend._ffi_stream_context
+    lbl = cake_backend.LOGPROB_LBL_STAGE
+    log: list = []
+
+    def spy_labels(*args, **kwargs):
+        log.append("labels")
+        return real_labels(*args, **kwargs)
+
+    def spy_stream(index):
+        log.append("launch")
+        return real_stream(index)
+
+    monkeypatch.setattr(cake_backend, "_prepare_labels", spy_labels)
+    monkeypatch.setattr(cake_backend, "_ffi_stream_context", spy_stream)
+    cases = [
+        (1500, "ce", 0.05, {}, 0),
+        (1500, "policy", 0.05, {}, 0),
+        (1500, "ce", 0.0, {}, 0),
+        (1500, "policy", 0.05, dict(compact_rows=False), 0),
+        (6000, "ce", 0.05, {}, 0),
+        (6000, "policy", 0.05, dict(dw_stream=True), 0),
+        (6000, "ce", 0.05, dict(fuse_dw_cast=False, dx_finalize=False), 0),
+        (1500, "policy", 0.05, {}, 8),
+        (8700, "ce", 0.05, dict(hidden_count=False), 0),
+    ]
+    for T, objective, ignore, switches, ld_pad in cases:
+        inp = make_inputs(
+            T,
+            objective=objective,
+            seed=SEED + 80 + T,
+            device=CUDA,
+            W=glm_weight,
+            ignore_frac=ignore,
+            ld_pad=ld_pad,
+        )
+        entries = ("loss", "logprob") if objective == "ce" else ("loss",)
+        case = (T, objective, ignore, switches, ld_pad)
+        out = {}
+        for early in (True, False):
+            monkeypatch.setattr(
+                cake_backend,
+                "forward_early_keys",
+                real_early if early else (lambda plan: ()),
+            )
+            with _cache(True) as cache:
+                cache.clear()
+                out[early] = {
+                    entry: [
+                        _run(inp, 4096, entry=entry, backend="cake", **switches)
+                        for _ in range(2)
+                    ]
+                    for entry in entries
+                }
+                bindings = [b for b in cache._bindings.values() if b.forward_order]
+                for b in bindings:
+                    split = (b.forward_early, b.forward_early_labels)
+                    if early:
+                        assert split[0] + split[1] == real_early(b.plan), case
+                        assert bool(split[0] or split[1]) == (
+                            not b.plan.hidden_count
+                        ), case
+                        assert split[1] == (
+                            ((lbl, 0),) if b.plan.logprob_lbl else ()
+                        ), case
+                    else:
+                        assert split == ((), ()), case
+                # the remembered forward's order of host work: the early launch ahead of the labels
+                for entry in entries:
+                    fwd = (
+                        cake_backend.forward_loss
+                        if entry == "loss"
+                        else cake_backend.forward_logprob
+                    )
+                    # the autograd calls' forward binding (the same keywords: a hit)
+                    kw = (
+                        dict(
+                            objective=objective,
+                            loss_div=inp.loss_div if objective == "ce" else None,
+                            infer_logp=inp.infer_logp,
+                            loss_weights=inp.loss_weights,
+                            **switches,
+                        )
+                        if entry == "loss"
+                        else {
+                            k: v
+                            for k, v in switches.items()
+                            if k in ("compact_rows", "hidden_count")
+                        }
+                    )
+                    log.clear()
+                    fwd(inp.X, inp.W, inp.labels, chunk_size=4096, **kw)
+                    torch.cuda.synchronize()
+                    first = log.index("labels")
+                    # the call's remembered forward binding: launches ahead of the labels exactly when its early
+                    # launches start with keys that do not read them (an uncompacted label-column GEMM reads them)
+                    bound = [
+                        b
+                        for key, b in cache._bindings.items()
+                        if key[:2] == ("fwd", entry)
+                    ]
+                    assert len(bound) == 1, (case, entry)
+                    expect = bool(bound[0].forward_early)
+                    assert ("launch" in log[:first]) == expect, (case, entry, log)
+        for entry in entries:
+            for run in range(2):
+                for key in ("loss", "logp", "dX", "dW"):
+                    a = out[True][entry][run][key]
+                    b = out[False][entry][run][key]
+                    assert _same(a, b), (case, entry, run, key)
+            for key in ("loss", "logp", "dX", "dW"):
+                assert torch.equal(
+                    out[True][entry][0][key], out[True][entry][1][key]
+                ), (case, entry, key)
+
+
+def test_device_logprob_backward_does_not_synchronize(glm_weight):
+    """The log-probability backward plans its chunks on the forward's valid-row index: with the binding remembered,
+    the autograd backward of one-, two- and three-chunk calls (compacted, every row valid, uncompacted) runs without
+    a host synchronization; the forward's host count is one synchronization (``valid_rows``: ``nonzero`` returns the
+    count together with the index), with ignored rows and without."""
+    _require_program(entry="logprob")
+    for T, C, ignore, compact in (
+        (1500, 4096, 0.05, True),
+        (1500, 4096, 0.0, True),
+        (6000, 4096, 0.05, True),
+        (6000, 4096, 0.05, False),
+        (8700, 4096, 0.05, True),
+    ):
+        inp = make_inputs(
+            T, seed=SEED + 90 + T, device=CUDA, W=glm_weight, ignore_frac=ignore
+        )
+        X = inp.X.detach().requires_grad_(True)
+        W = inp.W.detach().requires_grad_(True)
+        for i in range(2):
+            logp = cake_backend.chunked_lm_head_logprob(
+                X, W, inp.labels, chunk_size=C, backend="cake", compact_rows=compact
+            )
+            torch.cuda.synchronize()
+            if i:
+                torch.cuda.set_sync_debug_mode("error")
+            try:
+                logp.backward(inp.dlogp)
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+            torch.cuda.synchronize()
+            assert torch.all(X.grad[~inp.valid] == 0)
+            X.grad = W.grad = None
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            torch.cuda.set_sync_debug_mode("warn")
+            try:
+                index, mask = cake_backend.valid_rows(inp.labels, mask=True)
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+        syncs = [w for w in caught if "synchroniz" in str(w.message)]
+        assert len(syncs) == 1, [str(w.message) for w in caught]
+        if ignore:
+            assert torch.equal(index, inp.valid.nonzero().reshape(-1))
+            assert torch.equal(mask, inp.valid)
+        else:
+            assert index is None and mask is None

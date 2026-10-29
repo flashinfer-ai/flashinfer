@@ -208,6 +208,7 @@ kernel_cake_blackwell_bf16_fp4_8a6939530b5e50b17f3c(const __grid_constant__ CUte
     const int mbar_base = smem;
     #define full_addr (mbar_base + 0)
     #define mail_bar_addr (mbar_base + 16)
+    #define sf_full_addr (mbar_base + 24)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -232,8 +233,8 @@ kernel_cake_blackwell_bf16_fp4_8a6939530b5e50b17f3c(const __grid_constant__ CUte
     float* smk_mail = reinterpret_cast<float*>(smem_raw + 78848);
     const int smk_mail_addr = smem + 78848;
 
-    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 3 barriers)
-    // Mbarriers at smem_raw[0..24)
+    // Mbarrier init (3 pipeline groups, 0 ordered-sequence groups, 4 barriers)
+    // Mbarriers at smem_raw[0..32)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -243,19 +244,39 @@ kernel_cake_blackwell_bf16_fp4_8a6939530b5e50b17f3c(const __grid_constant__ CUte
             mbarrier_init(smem + 8, 1);
             // mail_bar: 1 barriers, init_count=1
             mbarrier_init(smem + 16, 1);
+            // sf_full: 1 barriers, init_count=1
+            mbarrier_init(smem + 24, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-            mbarrier_expect_tx(smem + 16, 7168);
+            mbarrier_expect_tx(smem + 16, 448);
         }
     }
-
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
     // === Task calls (declaration order) ===
     int off_n = blockIdx.x * 128;
     if (warp == 0) {
         if (elect_sync()) {
-            mbarrier_arrive_expect_tx(full_addr, 26624);
+            mbarrier_arrive_expect_tx(sf_full_addr, 4096);
+            asm volatile(
+                "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                " [%0], [%1, {%2, %3}], [%4], %5;"
+                :: "r"(smk_sf_addr), "l"((&B_descale)), "r"(off_n), "r"(blockIdx.z * 32),
+                   "r"(sf_full_addr), "l"(0x12F0000000000000ULL) : "memory");
+            asm volatile(
+                "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                " [%0], [%1, {%2, %3}], [%4], %5;"
+                :: "r"(smk_sf_addr + 1024), "l"((&B_descale)), "r"(off_n + 64), "r"(blockIdx.z * 32),
+                   "r"(sf_full_addr), "l"(0x12F0000000000000ULL) : "memory");
+            asm volatile(
+                "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                " [%0], [%1, {%2, %3}], [%4], %5;"
+                :: "r"(smk_sf_addr + 26624), "l"((&B_descale)), "r"(off_n), "r"(blockIdx.z * 32 + 16),
+                   "r"(sf_full_addr), "l"(0x12F0000000000000ULL) : "memory");
+            asm volatile(
+                "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
+                " [%0], [%1, {%2, %3}], [%4], %5;"
+                :: "r"(smk_sf_addr + 26624 + 1024), "l"((&B_descale)), "r"(off_n + 64), "r"(blockIdx.z * 32 + 16),
+                   "r"(sf_full_addr), "l"(0x12F0000000000000ULL) : "memory");
+            mbarrier_arrive_expect_tx(full_addr, 24576);
             asm volatile(
                 "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1, {%2, %3}], [%4], %5;"
@@ -266,17 +287,7 @@ kernel_cake_blackwell_bf16_fp4_8a6939530b5e50b17f3c(const __grid_constant__ CUte
                 " [%0], [%1, {%2, %3}], [%4], %5;"
                 :: "r"(smk_b_addr + 8192), "l"((&B)), "r"((off_n + 64) * 2), "r"(blockIdx.z * 32),
                    "r"(full_addr), "l"(0x12F0000000000000ULL) : "memory");
-            asm volatile(
-                "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-                " [%0], [%1, {%2, %3}], [%4], %5;"
-                :: "r"(smk_sf_addr), "l"((&B_descale)), "r"(off_n), "r"(blockIdx.z * 32),
-                   "r"(full_addr), "l"(0x12F0000000000000ULL) : "memory");
-            asm volatile(
-                "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-                " [%0], [%1, {%2, %3}], [%4], %5;"
-                :: "r"(smk_sf_addr + 1024), "l"((&B_descale)), "r"(off_n + 64), "r"(blockIdx.z * 32),
-                   "r"(full_addr), "l"(0x12F0000000000000ULL) : "memory");
-            mbarrier_arrive_expect_tx(full_addr + 8, 26624);
+            mbarrier_arrive_expect_tx(full_addr + 8, 24576);
             asm volatile(
                 "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1, {%2, %3}], [%4], %5;"
@@ -286,16 +297,6 @@ kernel_cake_blackwell_bf16_fp4_8a6939530b5e50b17f3c(const __grid_constant__ CUte
                 "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                 " [%0], [%1, {%2, %3}], [%4], %5;"
                 :: "r"(smk_b_addr + 26624 + 8192), "l"((&B)), "r"((off_n + 64) * 2), "r"(blockIdx.z * 32 + 16),
-                   "r"(full_addr + 8), "l"(0x12F0000000000000ULL) : "memory");
-            asm volatile(
-                "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-                " [%0], [%1, {%2, %3}], [%4], %5;"
-                :: "r"(smk_sf_addr + 26624), "l"((&B_descale)), "r"(off_n), "r"(blockIdx.z * 32 + 16),
-                   "r"(full_addr + 8), "l"(0x12F0000000000000ULL) : "memory");
-            asm volatile(
-                "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
-                " [%0], [%1, {%2, %3}], [%4], %5;"
-                :: "r"(smk_sf_addr + 26624 + 1024), "l"((&B_descale)), "r"(off_n + 64), "r"(blockIdx.z * 32 + 16),
                    "r"(full_addr + 8), "l"(0x12F0000000000000ULL) : "memory");
         }
     }
@@ -316,8 +317,13 @@ kernel_cake_blackwell_bf16_fp4_8a6939530b5e50b17f3c(const __grid_constant__ CUte
                    "r"(full_addr + 8), "l"(0x14F0000000000000ULL) : "memory");
         }
     }
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     if (warp == 0) {
         if (elect_sync()) {
+            if (M > 1) {
+                mbarrier_expect_tx(mail_bar_addr, 6720);
+            }
             mbarrier_arrive(mail_bar_addr);
         }
     }
@@ -361,7 +367,7 @@ kernel_cake_blackwell_bf16_fp4_8a6939530b5e50b17f3c(const __grid_constant__ CUte
     sf_lane_off = sf_lane_off + npair * 1024;
     int sfx_lane_off = (nw * 8 + lane_g) * 16;
     sfx_lane_off = sfx_lane_off + npair * 4096;
-    mbarrier_wait(full_addr, 0);
+    mbarrier_wait(sf_full_addr, 0);
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     int sfx_rec = tid;
     int sfx_kb = sfx_rec >> 4;
@@ -519,7 +525,165 @@ kernel_cake_blackwell_bf16_fp4_8a6939530b5e50b17f3c(const __grid_constant__ CUte
         asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(sfx_carrier_13) : "r"(_fp4_x16x2), "r"(_scale_x16x2));
     }
     smk_sfx[sfx_dst_9 + 3] = sfx_carrier_13;
+    int sfx_rec_14 = tid;
+    int sfx_kb_15 = sfx_rec_14 >> 4;
+    int sfx_nlo_16 = sfx_rec_14 & 15;
+    int sfx_src_17 = smk_sf_addr + 26624 + (unsigned int)(sfx_kb_15 * 64) + (unsigned int)(sfx_nlo_16 & 12);
+    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfx_word[0])) : "r"(sfx_src_17));
+    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfx_word[1])) : "r"(sfx_src_17 + 16));
+    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfx_word[2])) : "r"(sfx_src_17 + 32));
+    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfx_word[3])) : "r"(sfx_src_17 + 48));
+    int sfx_shift_18 = (sfx_nlo_16 & 3) * 8;
+    int sfx_dst_19 = (sfx_kb_15 * 16 + sfx_nlo_16) * 4 + 2048;
+    uint32_t sfx_carrier_20;
+    {
+        uint32_t _fp4_x16x2 = cvt_bf16x2_e2m1x2(34);
+        uint32_t _scale_byte = ((uint32_t)(sfx_word[0] >> (unsigned int)sfx_shift_18)) & 0xFFu;
+        uint32_t _scale_f16x2;
+        asm("mul.lo.u32 %0, %1, 0x00800080;" : "=r"(_scale_f16x2) : "r"(_scale_byte));
+        uint32_t _scale_x16x2;
+        uint16_t _scale_h0 = (uint16_t)(_scale_f16x2 & 0xFFFFu);
+        uint16_t _scale_h1 = (uint16_t)((_scale_f16x2 >> 16) & 0xFFFFu);
+        float _scale_f0;
+        float _scale_f1;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f0) : "h"(_scale_h0));
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f1) : "h"(_scale_h1));
+        asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_scale_x16x2) : "f"(_scale_f1), "f"(_scale_f0));
+        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(sfx_carrier_20) : "r"(_fp4_x16x2), "r"(_scale_x16x2));
+    }
+    smk_sfx[sfx_dst_19] = sfx_carrier_20;
+    uint32_t sfx_carrier_21;
+    {
+        uint32_t _fp4_x16x2 = cvt_bf16x2_e2m1x2(34);
+        uint32_t _scale_byte = ((uint32_t)(sfx_word[1] >> (unsigned int)sfx_shift_18)) & 0xFFu;
+        uint32_t _scale_f16x2;
+        asm("mul.lo.u32 %0, %1, 0x00800080;" : "=r"(_scale_f16x2) : "r"(_scale_byte));
+        uint32_t _scale_x16x2;
+        uint16_t _scale_h0 = (uint16_t)(_scale_f16x2 & 0xFFFFu);
+        uint16_t _scale_h1 = (uint16_t)((_scale_f16x2 >> 16) & 0xFFFFu);
+        float _scale_f0;
+        float _scale_f1;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f0) : "h"(_scale_h0));
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f1) : "h"(_scale_h1));
+        asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_scale_x16x2) : "f"(_scale_f1), "f"(_scale_f0));
+        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(sfx_carrier_21) : "r"(_fp4_x16x2), "r"(_scale_x16x2));
+    }
+    smk_sfx[sfx_dst_19 + 1] = sfx_carrier_21;
+    uint32_t sfx_carrier_22;
+    {
+        uint32_t _fp4_x16x2 = cvt_bf16x2_e2m1x2(34);
+        uint32_t _scale_byte = ((uint32_t)(sfx_word[2] >> (unsigned int)sfx_shift_18)) & 0xFFu;
+        uint32_t _scale_f16x2;
+        asm("mul.lo.u32 %0, %1, 0x00800080;" : "=r"(_scale_f16x2) : "r"(_scale_byte));
+        uint32_t _scale_x16x2;
+        uint16_t _scale_h0 = (uint16_t)(_scale_f16x2 & 0xFFFFu);
+        uint16_t _scale_h1 = (uint16_t)((_scale_f16x2 >> 16) & 0xFFFFu);
+        float _scale_f0;
+        float _scale_f1;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f0) : "h"(_scale_h0));
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f1) : "h"(_scale_h1));
+        asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_scale_x16x2) : "f"(_scale_f1), "f"(_scale_f0));
+        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(sfx_carrier_22) : "r"(_fp4_x16x2), "r"(_scale_x16x2));
+    }
+    smk_sfx[sfx_dst_19 + 2] = sfx_carrier_22;
+    uint32_t sfx_carrier_23;
+    {
+        uint32_t _fp4_x16x2 = cvt_bf16x2_e2m1x2(34);
+        uint32_t _scale_byte = ((uint32_t)(sfx_word[3] >> (unsigned int)sfx_shift_18)) & 0xFFu;
+        uint32_t _scale_f16x2;
+        asm("mul.lo.u32 %0, %1, 0x00800080;" : "=r"(_scale_f16x2) : "r"(_scale_byte));
+        uint32_t _scale_x16x2;
+        uint16_t _scale_h0 = (uint16_t)(_scale_f16x2 & 0xFFFFu);
+        uint16_t _scale_h1 = (uint16_t)((_scale_f16x2 >> 16) & 0xFFFFu);
+        float _scale_f0;
+        float _scale_f1;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f0) : "h"(_scale_h0));
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f1) : "h"(_scale_h1));
+        asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_scale_x16x2) : "f"(_scale_f1), "f"(_scale_f0));
+        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(sfx_carrier_23) : "r"(_fp4_x16x2), "r"(_scale_x16x2));
+    }
+    smk_sfx[sfx_dst_19 + 3] = sfx_carrier_23;
+    int sfx_rec_24 = tid + 256;
+    int sfx_kb_25 = sfx_rec_24 >> 4;
+    int sfx_nlo_26 = sfx_rec_24 & 15;
+    int sfx_src_27 = smk_sf_addr + 26624 + (unsigned int)(sfx_kb_25 * 64) + (unsigned int)(sfx_nlo_26 & 12);
+    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfx_word[0])) : "r"(sfx_src_27));
+    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfx_word[1])) : "r"(sfx_src_27 + 16));
+    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfx_word[2])) : "r"(sfx_src_27 + 32));
+    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfx_word[3])) : "r"(sfx_src_27 + 48));
+    int sfx_shift_28 = (sfx_nlo_26 & 3) * 8;
+    int sfx_dst_29 = (sfx_kb_25 * 16 + sfx_nlo_26) * 4 + 2048;
+    uint32_t sfx_carrier_30;
+    {
+        uint32_t _fp4_x16x2 = cvt_bf16x2_e2m1x2(34);
+        uint32_t _scale_byte = ((uint32_t)(sfx_word[0] >> (unsigned int)sfx_shift_28)) & 0xFFu;
+        uint32_t _scale_f16x2;
+        asm("mul.lo.u32 %0, %1, 0x00800080;" : "=r"(_scale_f16x2) : "r"(_scale_byte));
+        uint32_t _scale_x16x2;
+        uint16_t _scale_h0 = (uint16_t)(_scale_f16x2 & 0xFFFFu);
+        uint16_t _scale_h1 = (uint16_t)((_scale_f16x2 >> 16) & 0xFFFFu);
+        float _scale_f0;
+        float _scale_f1;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f0) : "h"(_scale_h0));
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f1) : "h"(_scale_h1));
+        asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_scale_x16x2) : "f"(_scale_f1), "f"(_scale_f0));
+        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(sfx_carrier_30) : "r"(_fp4_x16x2), "r"(_scale_x16x2));
+    }
+    smk_sfx[sfx_dst_29] = sfx_carrier_30;
+    uint32_t sfx_carrier_31;
+    {
+        uint32_t _fp4_x16x2 = cvt_bf16x2_e2m1x2(34);
+        uint32_t _scale_byte = ((uint32_t)(sfx_word[1] >> (unsigned int)sfx_shift_28)) & 0xFFu;
+        uint32_t _scale_f16x2;
+        asm("mul.lo.u32 %0, %1, 0x00800080;" : "=r"(_scale_f16x2) : "r"(_scale_byte));
+        uint32_t _scale_x16x2;
+        uint16_t _scale_h0 = (uint16_t)(_scale_f16x2 & 0xFFFFu);
+        uint16_t _scale_h1 = (uint16_t)((_scale_f16x2 >> 16) & 0xFFFFu);
+        float _scale_f0;
+        float _scale_f1;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f0) : "h"(_scale_h0));
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f1) : "h"(_scale_h1));
+        asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_scale_x16x2) : "f"(_scale_f1), "f"(_scale_f0));
+        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(sfx_carrier_31) : "r"(_fp4_x16x2), "r"(_scale_x16x2));
+    }
+    smk_sfx[sfx_dst_29 + 1] = sfx_carrier_31;
+    uint32_t sfx_carrier_32;
+    {
+        uint32_t _fp4_x16x2 = cvt_bf16x2_e2m1x2(34);
+        uint32_t _scale_byte = ((uint32_t)(sfx_word[2] >> (unsigned int)sfx_shift_28)) & 0xFFu;
+        uint32_t _scale_f16x2;
+        asm("mul.lo.u32 %0, %1, 0x00800080;" : "=r"(_scale_f16x2) : "r"(_scale_byte));
+        uint32_t _scale_x16x2;
+        uint16_t _scale_h0 = (uint16_t)(_scale_f16x2 & 0xFFFFu);
+        uint16_t _scale_h1 = (uint16_t)((_scale_f16x2 >> 16) & 0xFFFFu);
+        float _scale_f0;
+        float _scale_f1;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f0) : "h"(_scale_h0));
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f1) : "h"(_scale_h1));
+        asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_scale_x16x2) : "f"(_scale_f1), "f"(_scale_f0));
+        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(sfx_carrier_32) : "r"(_fp4_x16x2), "r"(_scale_x16x2));
+    }
+    smk_sfx[sfx_dst_29 + 2] = sfx_carrier_32;
+    uint32_t sfx_carrier_33;
+    {
+        uint32_t _fp4_x16x2 = cvt_bf16x2_e2m1x2(34);
+        uint32_t _scale_byte = ((uint32_t)(sfx_word[3] >> (unsigned int)sfx_shift_28)) & 0xFFu;
+        uint32_t _scale_f16x2;
+        asm("mul.lo.u32 %0, %1, 0x00800080;" : "=r"(_scale_f16x2) : "r"(_scale_byte));
+        uint32_t _scale_x16x2;
+        uint16_t _scale_h0 = (uint16_t)(_scale_f16x2 & 0xFFFFu);
+        uint16_t _scale_h1 = (uint16_t)((_scale_f16x2 >> 16) & 0xFFFFu);
+        float _scale_f0;
+        float _scale_f1;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f0) : "h"(_scale_h0));
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f1) : "h"(_scale_h1));
+        asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_scale_x16x2) : "f"(_scale_f1), "f"(_scale_f0));
+        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(sfx_carrier_33) : "r"(_fp4_x16x2), "r"(_scale_x16x2));
+    }
+    smk_sfx[sfx_dst_29 + 3] = sfx_carrier_33;
     __syncthreads();
+    mbarrier_wait(full_addr, 0);
+    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
         : "r"((smk_a_addr + (unsigned int)((pair * 16 + a_col) / 64 * 2048 + a_row * 128 + (pair * 16 + a_col) % 64 * 2 ^ ((pair * 16 + a_col) / 64 * 2048 + a_row * 128 + (pair * 16 + a_col) % 64 * 2 >> 7 & 7) << 4)))
@@ -1658,163 +1822,6 @@ kernel_cake_blackwell_bf16_fp4_8a6939530b5e50b17f3c(const __grid_constant__ CUte
         : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag[0]), "r"(b_frag[1]));
     mbarrier_wait(full_addr + 8, 0);
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-    int sfx_rec_14 = tid;
-    int sfx_kb_15 = sfx_rec_14 >> 4;
-    int sfx_nlo_16 = sfx_rec_14 & 15;
-    int sfx_src_17 = smk_sf_addr + 26624 + (unsigned int)(sfx_kb_15 * 64) + (unsigned int)(sfx_nlo_16 & 12);
-    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfx_word[0])) : "r"(sfx_src_17));
-    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfx_word[1])) : "r"(sfx_src_17 + 16));
-    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfx_word[2])) : "r"(sfx_src_17 + 32));
-    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfx_word[3])) : "r"(sfx_src_17 + 48));
-    int sfx_shift_18 = (sfx_nlo_16 & 3) * 8;
-    int sfx_dst_19 = (sfx_kb_15 * 16 + sfx_nlo_16) * 4 + 2048;
-    uint32_t sfx_carrier_20;
-    {
-        uint32_t _fp4_x16x2 = cvt_bf16x2_e2m1x2(34);
-        uint32_t _scale_byte = ((uint32_t)(sfx_word[0] >> (unsigned int)sfx_shift_18)) & 0xFFu;
-        uint32_t _scale_f16x2;
-        asm("mul.lo.u32 %0, %1, 0x00800080;" : "=r"(_scale_f16x2) : "r"(_scale_byte));
-        uint32_t _scale_x16x2;
-        uint16_t _scale_h0 = (uint16_t)(_scale_f16x2 & 0xFFFFu);
-        uint16_t _scale_h1 = (uint16_t)((_scale_f16x2 >> 16) & 0xFFFFu);
-        float _scale_f0;
-        float _scale_f1;
-        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f0) : "h"(_scale_h0));
-        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f1) : "h"(_scale_h1));
-        asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_scale_x16x2) : "f"(_scale_f1), "f"(_scale_f0));
-        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(sfx_carrier_20) : "r"(_fp4_x16x2), "r"(_scale_x16x2));
-    }
-    smk_sfx[sfx_dst_19] = sfx_carrier_20;
-    uint32_t sfx_carrier_21;
-    {
-        uint32_t _fp4_x16x2 = cvt_bf16x2_e2m1x2(34);
-        uint32_t _scale_byte = ((uint32_t)(sfx_word[1] >> (unsigned int)sfx_shift_18)) & 0xFFu;
-        uint32_t _scale_f16x2;
-        asm("mul.lo.u32 %0, %1, 0x00800080;" : "=r"(_scale_f16x2) : "r"(_scale_byte));
-        uint32_t _scale_x16x2;
-        uint16_t _scale_h0 = (uint16_t)(_scale_f16x2 & 0xFFFFu);
-        uint16_t _scale_h1 = (uint16_t)((_scale_f16x2 >> 16) & 0xFFFFu);
-        float _scale_f0;
-        float _scale_f1;
-        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f0) : "h"(_scale_h0));
-        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f1) : "h"(_scale_h1));
-        asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_scale_x16x2) : "f"(_scale_f1), "f"(_scale_f0));
-        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(sfx_carrier_21) : "r"(_fp4_x16x2), "r"(_scale_x16x2));
-    }
-    smk_sfx[sfx_dst_19 + 1] = sfx_carrier_21;
-    uint32_t sfx_carrier_22;
-    {
-        uint32_t _fp4_x16x2 = cvt_bf16x2_e2m1x2(34);
-        uint32_t _scale_byte = ((uint32_t)(sfx_word[2] >> (unsigned int)sfx_shift_18)) & 0xFFu;
-        uint32_t _scale_f16x2;
-        asm("mul.lo.u32 %0, %1, 0x00800080;" : "=r"(_scale_f16x2) : "r"(_scale_byte));
-        uint32_t _scale_x16x2;
-        uint16_t _scale_h0 = (uint16_t)(_scale_f16x2 & 0xFFFFu);
-        uint16_t _scale_h1 = (uint16_t)((_scale_f16x2 >> 16) & 0xFFFFu);
-        float _scale_f0;
-        float _scale_f1;
-        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f0) : "h"(_scale_h0));
-        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f1) : "h"(_scale_h1));
-        asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_scale_x16x2) : "f"(_scale_f1), "f"(_scale_f0));
-        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(sfx_carrier_22) : "r"(_fp4_x16x2), "r"(_scale_x16x2));
-    }
-    smk_sfx[sfx_dst_19 + 2] = sfx_carrier_22;
-    uint32_t sfx_carrier_23;
-    {
-        uint32_t _fp4_x16x2 = cvt_bf16x2_e2m1x2(34);
-        uint32_t _scale_byte = ((uint32_t)(sfx_word[3] >> (unsigned int)sfx_shift_18)) & 0xFFu;
-        uint32_t _scale_f16x2;
-        asm("mul.lo.u32 %0, %1, 0x00800080;" : "=r"(_scale_f16x2) : "r"(_scale_byte));
-        uint32_t _scale_x16x2;
-        uint16_t _scale_h0 = (uint16_t)(_scale_f16x2 & 0xFFFFu);
-        uint16_t _scale_h1 = (uint16_t)((_scale_f16x2 >> 16) & 0xFFFFu);
-        float _scale_f0;
-        float _scale_f1;
-        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f0) : "h"(_scale_h0));
-        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f1) : "h"(_scale_h1));
-        asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_scale_x16x2) : "f"(_scale_f1), "f"(_scale_f0));
-        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(sfx_carrier_23) : "r"(_fp4_x16x2), "r"(_scale_x16x2));
-    }
-    smk_sfx[sfx_dst_19 + 3] = sfx_carrier_23;
-    int sfx_rec_24 = tid + 256;
-    int sfx_kb_25 = sfx_rec_24 >> 4;
-    int sfx_nlo_26 = sfx_rec_24 & 15;
-    int sfx_src_27 = smk_sf_addr + 26624 + (unsigned int)(sfx_kb_25 * 64) + (unsigned int)(sfx_nlo_26 & 12);
-    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfx_word[0])) : "r"(sfx_src_27));
-    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfx_word[1])) : "r"(sfx_src_27 + 16));
-    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfx_word[2])) : "r"(sfx_src_27 + 32));
-    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&sfx_word[3])) : "r"(sfx_src_27 + 48));
-    int sfx_shift_28 = (sfx_nlo_26 & 3) * 8;
-    int sfx_dst_29 = (sfx_kb_25 * 16 + sfx_nlo_26) * 4 + 2048;
-    uint32_t sfx_carrier_30;
-    {
-        uint32_t _fp4_x16x2 = cvt_bf16x2_e2m1x2(34);
-        uint32_t _scale_byte = ((uint32_t)(sfx_word[0] >> (unsigned int)sfx_shift_28)) & 0xFFu;
-        uint32_t _scale_f16x2;
-        asm("mul.lo.u32 %0, %1, 0x00800080;" : "=r"(_scale_f16x2) : "r"(_scale_byte));
-        uint32_t _scale_x16x2;
-        uint16_t _scale_h0 = (uint16_t)(_scale_f16x2 & 0xFFFFu);
-        uint16_t _scale_h1 = (uint16_t)((_scale_f16x2 >> 16) & 0xFFFFu);
-        float _scale_f0;
-        float _scale_f1;
-        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f0) : "h"(_scale_h0));
-        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f1) : "h"(_scale_h1));
-        asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_scale_x16x2) : "f"(_scale_f1), "f"(_scale_f0));
-        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(sfx_carrier_30) : "r"(_fp4_x16x2), "r"(_scale_x16x2));
-    }
-    smk_sfx[sfx_dst_29] = sfx_carrier_30;
-    uint32_t sfx_carrier_31;
-    {
-        uint32_t _fp4_x16x2 = cvt_bf16x2_e2m1x2(34);
-        uint32_t _scale_byte = ((uint32_t)(sfx_word[1] >> (unsigned int)sfx_shift_28)) & 0xFFu;
-        uint32_t _scale_f16x2;
-        asm("mul.lo.u32 %0, %1, 0x00800080;" : "=r"(_scale_f16x2) : "r"(_scale_byte));
-        uint32_t _scale_x16x2;
-        uint16_t _scale_h0 = (uint16_t)(_scale_f16x2 & 0xFFFFu);
-        uint16_t _scale_h1 = (uint16_t)((_scale_f16x2 >> 16) & 0xFFFFu);
-        float _scale_f0;
-        float _scale_f1;
-        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f0) : "h"(_scale_h0));
-        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f1) : "h"(_scale_h1));
-        asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_scale_x16x2) : "f"(_scale_f1), "f"(_scale_f0));
-        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(sfx_carrier_31) : "r"(_fp4_x16x2), "r"(_scale_x16x2));
-    }
-    smk_sfx[sfx_dst_29 + 1] = sfx_carrier_31;
-    uint32_t sfx_carrier_32;
-    {
-        uint32_t _fp4_x16x2 = cvt_bf16x2_e2m1x2(34);
-        uint32_t _scale_byte = ((uint32_t)(sfx_word[2] >> (unsigned int)sfx_shift_28)) & 0xFFu;
-        uint32_t _scale_f16x2;
-        asm("mul.lo.u32 %0, %1, 0x00800080;" : "=r"(_scale_f16x2) : "r"(_scale_byte));
-        uint32_t _scale_x16x2;
-        uint16_t _scale_h0 = (uint16_t)(_scale_f16x2 & 0xFFFFu);
-        uint16_t _scale_h1 = (uint16_t)((_scale_f16x2 >> 16) & 0xFFFFu);
-        float _scale_f0;
-        float _scale_f1;
-        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f0) : "h"(_scale_h0));
-        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f1) : "h"(_scale_h1));
-        asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_scale_x16x2) : "f"(_scale_f1), "f"(_scale_f0));
-        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(sfx_carrier_32) : "r"(_fp4_x16x2), "r"(_scale_x16x2));
-    }
-    smk_sfx[sfx_dst_29 + 2] = sfx_carrier_32;
-    uint32_t sfx_carrier_33;
-    {
-        uint32_t _fp4_x16x2 = cvt_bf16x2_e2m1x2(34);
-        uint32_t _scale_byte = ((uint32_t)(sfx_word[3] >> (unsigned int)sfx_shift_28)) & 0xFFu;
-        uint32_t _scale_f16x2;
-        asm("mul.lo.u32 %0, %1, 0x00800080;" : "=r"(_scale_f16x2) : "r"(_scale_byte));
-        uint32_t _scale_x16x2;
-        uint16_t _scale_h0 = (uint16_t)(_scale_f16x2 & 0xFFFFu);
-        uint16_t _scale_h1 = (uint16_t)((_scale_f16x2 >> 16) & 0xFFFFu);
-        float _scale_f0;
-        float _scale_f1;
-        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f0) : "h"(_scale_h0));
-        asm("cvt.f32.f16 %0, %1;" : "=f"(_scale_f1) : "h"(_scale_h1));
-        asm("cvt.rn.bf16x2.f32 %0, %1, %2;" : "=r"(_scale_x16x2) : "f"(_scale_f1), "f"(_scale_f0));
-        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(sfx_carrier_33) : "r"(_fp4_x16x2), "r"(_scale_x16x2));
-    }
-    smk_sfx[sfx_dst_29 + 3] = sfx_carrier_33;
-    __syncthreads();
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
         : "=r"(a_frag[0]), "=r"(a_frag[1]), "=r"(a_frag[2]), "=r"(a_frag[3])
         : "r"((smk_a_addr + 26624 + (unsigned int)((pair * 16 + a_col) / 64 * 2048 + a_row * 128 + (pair * 16 + a_col) % 64 * 2 ^ ((pair * 16 + a_col) / 64 * 2048 + a_row * 128 + (pair * 16 + a_col) % 64 * 2 >> 7 & 7) << 4)))
@@ -3007,413 +3014,725 @@ kernel_cake_blackwell_bf16_fp4_8a6939530b5e50b17f3c(const __grid_constant__ CUte
         acc[14] = acc[14] + part[14];
         acc[15] = acc[15] + part[15];
         int slice_base = (npair * 2 + nw) * 2;
-        int rec_lane = cta_rank * 1024 + lane * 16;
-        if (slice_base == cta_rank) {
-            smk_mail[rec_lane / 4] = acc[0];
-            smk_mail[rec_lane / 4 + 1] = acc[1];
-            smk_mail[rec_lane / 4 + 2] = acc[2];
-            smk_mail[rec_lane / 4 + 3] = acc[3];
-            smk_mail[rec_lane / 4 + 128] = acc[4];
-            smk_mail[rec_lane / 4 + 129] = acc[5];
-            smk_mail[rec_lane / 4 + 130] = acc[6];
-            smk_mail[rec_lane / 4 + 131] = acc[7];
+        if (M > 1) {
+            int rec_lane = cta_rank * 1024 + lane * 16;
+            if (slice_base == cta_rank) {
+                smk_mail[rec_lane / 4] = acc[0];
+                smk_mail[rec_lane / 4 + 1] = acc[1];
+                smk_mail[rec_lane / 4 + 2] = acc[2];
+                smk_mail[rec_lane / 4 + 3] = acc[3];
+                smk_mail[rec_lane / 4 + 128] = acc[4];
+                smk_mail[rec_lane / 4 + 129] = acc[5];
+                smk_mail[rec_lane / 4 + 130] = acc[6];
+                smk_mail[rec_lane / 4 + 131] = acc[7];
+            } else {
+                int rs_dst = smk_mail_addr + (unsigned int)rec_lane;
+                uint32_t _mapa_0;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_mapa_0) : "r"(rs_dst), "r"(slice_base));
+                uint32_t _mbar_peer_0;
+                asm(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_mbar_peer_0) : "r"(mail_bar_addr), "r"(slice_base));
+                asm volatile(
+                    "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                    :: "r"(_mapa_0), "r"(__float_as_uint(acc[0])), "r"(__float_as_uint(acc[1])), "r"(__float_as_uint(acc[2])), "r"(__float_as_uint(acc[3])), "r"(_mbar_peer_0) : "memory");
+                uint32_t _mbar_peer_1;
+                asm(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_mbar_peer_1) : "r"(mail_bar_addr), "r"(slice_base));
+                asm volatile(
+                    "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                    :: "r"(_mapa_0 + 512), "r"(__float_as_uint(acc[4])), "r"(__float_as_uint(acc[5])), "r"(__float_as_uint(acc[6])), "r"(__float_as_uint(acc[7])), "r"(_mbar_peer_1) : "memory");
+            }
+            if (slice_base + 1 == cta_rank) {
+                smk_mail[rec_lane / 4] = acc[8];
+                smk_mail[rec_lane / 4 + 1] = acc[9];
+                smk_mail[rec_lane / 4 + 2] = acc[10];
+                smk_mail[rec_lane / 4 + 3] = acc[11];
+                smk_mail[rec_lane / 4 + 128] = acc[12];
+                smk_mail[rec_lane / 4 + 129] = acc[13];
+                smk_mail[rec_lane / 4 + 130] = acc[14];
+                smk_mail[rec_lane / 4 + 131] = acc[15];
+            } else {
+                int rs_dst_1 = smk_mail_addr + (unsigned int)rec_lane;
+                uint32_t _mapa_1;
+                asm volatile(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_mapa_1) : "r"(rs_dst_1), "r"(slice_base + 1));
+                uint32_t _mbar_peer_2;
+                asm(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_mbar_peer_2) : "r"(mail_bar_addr), "r"(slice_base + 1));
+                asm volatile(
+                    "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                    :: "r"(_mapa_1), "r"(__float_as_uint(acc[8])), "r"(__float_as_uint(acc[9])), "r"(__float_as_uint(acc[10])), "r"(__float_as_uint(acc[11])), "r"(_mbar_peer_2) : "memory");
+                uint32_t _mbar_peer_3;
+                asm(
+                    "mapa.shared::cluster.u32 %0, %1, %2;"
+                    : "=r"(_mbar_peer_3) : "r"(mail_bar_addr), "r"(slice_base + 1));
+                asm volatile(
+                    "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                    :: "r"(_mapa_1 + 512), "r"(__float_as_uint(acc[12])), "r"(__float_as_uint(acc[13])), "r"(__float_as_uint(acc[14])), "r"(__float_as_uint(acc[15])), "r"(_mbar_peer_3) : "memory");
+            }
         } else {
-            int rs_dst = smk_mail_addr + (unsigned int)rec_lane;
-            uint32_t _mapa_0;
-            asm volatile(
-                "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_0) : "r"(rs_dst), "r"(slice_base));
-            uint32_t _mapa_1;
-            asm volatile(
-                "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_1) : "r"(mail_bar_addr), "r"(slice_base));
-            asm volatile(
-                "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_0), "r"(__float_as_uint(acc[0])), "r"(__float_as_uint(acc[1])), "r"(__float_as_uint(acc[2])), "r"(__float_as_uint(acc[3])), "r"(_mapa_1) : "memory");
-            asm volatile(
-                "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_0 + 512), "r"(__float_as_uint(acc[4])), "r"(__float_as_uint(acc[5])), "r"(__float_as_uint(acc[6])), "r"(__float_as_uint(acc[7])), "r"(_mapa_1) : "memory");
-        }
-        if (slice_base + 1 == cta_rank) {
-            smk_mail[rec_lane / 4] = acc[8];
-            smk_mail[rec_lane / 4 + 1] = acc[9];
-            smk_mail[rec_lane / 4 + 2] = acc[10];
-            smk_mail[rec_lane / 4 + 3] = acc[11];
-            smk_mail[rec_lane / 4 + 128] = acc[12];
-            smk_mail[rec_lane / 4 + 129] = acc[13];
-            smk_mail[rec_lane / 4 + 130] = acc[14];
-            smk_mail[rec_lane / 4 + 131] = acc[15];
-        } else {
-            int rs_dst_1 = smk_mail_addr + (unsigned int)rec_lane;
-            uint32_t _mapa_2;
-            asm volatile(
-                "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_2) : "r"(rs_dst_1), "r"(slice_base + 1));
-            uint32_t _mapa_3;
-            asm volatile(
-                "mapa.shared::cluster.u32 %0, %1, %2;"
-                : "=r"(_mapa_3) : "r"(mail_bar_addr), "r"(slice_base + 1));
-            asm volatile(
-                "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_2), "r"(__float_as_uint(acc[8])), "r"(__float_as_uint(acc[9])), "r"(__float_as_uint(acc[10])), "r"(__float_as_uint(acc[11])), "r"(_mapa_3) : "memory");
-            asm volatile(
-                "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                :: "r"(_mapa_2 + 512), "r"(__float_as_uint(acc[12])), "r"(__float_as_uint(acc[13])), "r"(__float_as_uint(acc[14])), "r"(__float_as_uint(acc[15])), "r"(_mapa_3) : "memory");
+            int row0_lane = cta_rank * 64 + lane * 16;
+            if (lane < 4) {
+                if (slice_base == cta_rank) {
+                    smk_mail[row0_lane / 4] = acc[0];
+                    smk_mail[row0_lane / 4 + 1] = acc[1];
+                    smk_mail[row0_lane / 4 + 2] = acc[4];
+                    smk_mail[row0_lane / 4 + 3] = acc[5];
+                } else {
+                    int row0_dst = smk_mail_addr + (unsigned int)row0_lane;
+                    uint32_t _mapa_2;
+                    asm volatile(
+                        "mapa.shared::cluster.u32 %0, %1, %2;"
+                        : "=r"(_mapa_2) : "r"(row0_dst), "r"(slice_base));
+                    uint32_t _mbar_peer_4;
+                    asm(
+                        "mapa.shared::cluster.u32 %0, %1, %2;"
+                        : "=r"(_mbar_peer_4) : "r"(mail_bar_addr), "r"(slice_base));
+                    asm volatile(
+                        "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                        :: "r"(_mapa_2), "r"(__float_as_uint(acc[0])), "r"(__float_as_uint(acc[1])), "r"(__float_as_uint(acc[4])), "r"(__float_as_uint(acc[5])), "r"(_mbar_peer_4) : "memory");
+                }
+                if (slice_base + 1 == cta_rank) {
+                    smk_mail[row0_lane / 4] = acc[8];
+                    smk_mail[row0_lane / 4 + 1] = acc[9];
+                    smk_mail[row0_lane / 4 + 2] = acc[12];
+                    smk_mail[row0_lane / 4 + 3] = acc[13];
+                } else {
+                    int row0_dst_1 = smk_mail_addr + (unsigned int)row0_lane;
+                    uint32_t _mapa_3;
+                    asm volatile(
+                        "mapa.shared::cluster.u32 %0, %1, %2;"
+                        : "=r"(_mapa_3) : "r"(row0_dst_1), "r"(slice_base + 1));
+                    uint32_t _mbar_peer_5;
+                    asm(
+                        "mapa.shared::cluster.u32 %0, %1, %2;"
+                        : "=r"(_mbar_peer_5) : "r"(mail_bar_addr), "r"(slice_base + 1));
+                    asm volatile(
+                        "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
+                        :: "r"(_mapa_3), "r"(__float_as_uint(acc[8])), "r"(__float_as_uint(acc[9])), "r"(__float_as_uint(acc[12])), "r"(__float_as_uint(acc[13])), "r"(_mbar_peer_5) : "memory");
+                }
+            }
         }
         if (slice_base == cta_rank) {
             mbarrier_wait_cluster_hint(mail_bar_addr, 0, 10000000);
-            float rs_vals[64];
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[0])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(0) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[4])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(4) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(512 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[8])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(8) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(1024 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[12])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(12) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(1536 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[16])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(16) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(16) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(16) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(2048 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[20])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(20) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(20) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(20) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(2560 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[24])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(24) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(24) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(24) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(3072 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[28])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(28) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(28) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(28) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(3584 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[32])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(32) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(32) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(32) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(4096 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[36])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(36) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(36) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(36) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(4608 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[40])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(40) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(40) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(40) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(5120 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[44])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(44) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(44) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(44) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(5632 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[48])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(48) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(48) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(48) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(6144 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[52])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(52) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(52) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(52) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(6656 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[56])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(56) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(56) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(56) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(7168 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[60])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(60) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(60) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(60) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(7680 + lane * 16)));
-            float rs_sum[8];
-            rs_sum[0] = rs_vals[0];
-            rs_sum[1] = rs_vals[1];
-            rs_sum[2] = rs_vals[2];
-            rs_sum[3] = rs_vals[3];
-            rs_sum[4] = rs_vals[4];
-            rs_sum[5] = rs_vals[5];
-            rs_sum[6] = rs_vals[6];
-            rs_sum[7] = rs_vals[7];
-            rs_sum[0] = rs_sum[0] + rs_vals[8];
-            rs_sum[1] = rs_sum[1] + rs_vals[9];
-            rs_sum[2] = rs_sum[2] + rs_vals[10];
-            rs_sum[3] = rs_sum[3] + rs_vals[11];
-            rs_sum[4] = rs_sum[4] + rs_vals[12];
-            rs_sum[5] = rs_sum[5] + rs_vals[13];
-            rs_sum[6] = rs_sum[6] + rs_vals[14];
-            rs_sum[7] = rs_sum[7] + rs_vals[15];
-            rs_sum[0] = rs_sum[0] + rs_vals[16];
-            rs_sum[1] = rs_sum[1] + rs_vals[17];
-            rs_sum[2] = rs_sum[2] + rs_vals[18];
-            rs_sum[3] = rs_sum[3] + rs_vals[19];
-            rs_sum[4] = rs_sum[4] + rs_vals[20];
-            rs_sum[5] = rs_sum[5] + rs_vals[21];
-            rs_sum[6] = rs_sum[6] + rs_vals[22];
-            rs_sum[7] = rs_sum[7] + rs_vals[23];
-            rs_sum[0] = rs_sum[0] + rs_vals[24];
-            rs_sum[1] = rs_sum[1] + rs_vals[25];
-            rs_sum[2] = rs_sum[2] + rs_vals[26];
-            rs_sum[3] = rs_sum[3] + rs_vals[27];
-            rs_sum[4] = rs_sum[4] + rs_vals[28];
-            rs_sum[5] = rs_sum[5] + rs_vals[29];
-            rs_sum[6] = rs_sum[6] + rs_vals[30];
-            rs_sum[7] = rs_sum[7] + rs_vals[31];
-            rs_sum[0] = rs_sum[0] + rs_vals[32];
-            rs_sum[1] = rs_sum[1] + rs_vals[33];
-            rs_sum[2] = rs_sum[2] + rs_vals[34];
-            rs_sum[3] = rs_sum[3] + rs_vals[35];
-            rs_sum[4] = rs_sum[4] + rs_vals[36];
-            rs_sum[5] = rs_sum[5] + rs_vals[37];
-            rs_sum[6] = rs_sum[6] + rs_vals[38];
-            rs_sum[7] = rs_sum[7] + rs_vals[39];
-            rs_sum[0] = rs_sum[0] + rs_vals[40];
-            rs_sum[1] = rs_sum[1] + rs_vals[41];
-            rs_sum[2] = rs_sum[2] + rs_vals[42];
-            rs_sum[3] = rs_sum[3] + rs_vals[43];
-            rs_sum[4] = rs_sum[4] + rs_vals[44];
-            rs_sum[5] = rs_sum[5] + rs_vals[45];
-            rs_sum[6] = rs_sum[6] + rs_vals[46];
-            rs_sum[7] = rs_sum[7] + rs_vals[47];
-            rs_sum[0] = rs_sum[0] + rs_vals[48];
-            rs_sum[1] = rs_sum[1] + rs_vals[49];
-            rs_sum[2] = rs_sum[2] + rs_vals[50];
-            rs_sum[3] = rs_sum[3] + rs_vals[51];
-            rs_sum[4] = rs_sum[4] + rs_vals[52];
-            rs_sum[5] = rs_sum[5] + rs_vals[53];
-            rs_sum[6] = rs_sum[6] + rs_vals[54];
-            rs_sum[7] = rs_sum[7] + rs_vals[55];
-            rs_sum[0] = rs_sum[0] + rs_vals[56];
-            rs_sum[1] = rs_sum[1] + rs_vals[57];
-            rs_sum[2] = rs_sum[2] + rs_vals[58];
-            rs_sum[3] = rs_sum[3] + rs_vals[59];
-            rs_sum[4] = rs_sum[4] + rs_vals[60];
-            rs_sum[5] = rs_sum[5] + rs_vals[61];
-            rs_sum[6] = rs_sum[6] + rs_vals[62];
-            rs_sum[7] = rs_sum[7] + rs_vals[63];
-            float alpha_value = 1.0f;
-            {
-                alpha_value = alpha[0];
-            }
-            int row0 = lane_g;
-            int row1 = lane_g + 8;
-            int col = pair_off_n + nw * 8 + lane_r * 2;
-            if (row0 < M) {
-                long long base0 = (long long)row0 * (long long)N + (long long)col;
-                float _scaled_0[2];
-                const float2 _scale2_0 = {alpha_value, alpha_value};
-                #pragma unroll
-                for (int _ls = 0; _ls < 1; _ls++)
-                    reinterpret_cast<float2*>(_scaled_0)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>(rs_sum)[_ls], _scale2_0);
-                unsigned int _packed_0[1];
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_0[_lp*2 + 0], _scaled_0[_lp*2+1 + 0]));
-                    _packed_0[_lp] = *(uint32_t*)&_bf2;
+            if (M > 1) {
+                float rs_vals[64];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[0])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(0) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[4])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(4) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(512 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[8])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(8) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(1024 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[12])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(12) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(1536 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[16])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(16) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(16) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(16) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(2048 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[20])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(20) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(20) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(20) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(2560 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[24])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(24) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(24) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(24) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(3072 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[28])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(28) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(28) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(28) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(3584 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[32])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(32) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(32) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(32) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(4096 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[36])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(36) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(36) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(36) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(4608 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[40])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(40) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(40) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(40) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(5120 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[44])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(44) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(44) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(44) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(5632 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[48])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(48) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(48) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(48) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(6144 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[52])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(52) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(52) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(52) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(6656 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[56])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(56) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(56) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(56) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(7168 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[60])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(60) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(60) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals[(60) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(7680 + lane * 16)));
+                float rs_sum[8];
+                rs_sum[0] = rs_vals[0];
+                rs_sum[1] = rs_vals[1];
+                rs_sum[2] = rs_vals[2];
+                rs_sum[3] = rs_vals[3];
+                rs_sum[4] = rs_vals[4];
+                rs_sum[5] = rs_vals[5];
+                rs_sum[6] = rs_vals[6];
+                rs_sum[7] = rs_vals[7];
+                rs_sum[0] = rs_sum[0] + rs_vals[8];
+                rs_sum[1] = rs_sum[1] + rs_vals[9];
+                rs_sum[2] = rs_sum[2] + rs_vals[10];
+                rs_sum[3] = rs_sum[3] + rs_vals[11];
+                rs_sum[4] = rs_sum[4] + rs_vals[12];
+                rs_sum[5] = rs_sum[5] + rs_vals[13];
+                rs_sum[6] = rs_sum[6] + rs_vals[14];
+                rs_sum[7] = rs_sum[7] + rs_vals[15];
+                rs_sum[0] = rs_sum[0] + rs_vals[16];
+                rs_sum[1] = rs_sum[1] + rs_vals[17];
+                rs_sum[2] = rs_sum[2] + rs_vals[18];
+                rs_sum[3] = rs_sum[3] + rs_vals[19];
+                rs_sum[4] = rs_sum[4] + rs_vals[20];
+                rs_sum[5] = rs_sum[5] + rs_vals[21];
+                rs_sum[6] = rs_sum[6] + rs_vals[22];
+                rs_sum[7] = rs_sum[7] + rs_vals[23];
+                rs_sum[0] = rs_sum[0] + rs_vals[24];
+                rs_sum[1] = rs_sum[1] + rs_vals[25];
+                rs_sum[2] = rs_sum[2] + rs_vals[26];
+                rs_sum[3] = rs_sum[3] + rs_vals[27];
+                rs_sum[4] = rs_sum[4] + rs_vals[28];
+                rs_sum[5] = rs_sum[5] + rs_vals[29];
+                rs_sum[6] = rs_sum[6] + rs_vals[30];
+                rs_sum[7] = rs_sum[7] + rs_vals[31];
+                rs_sum[0] = rs_sum[0] + rs_vals[32];
+                rs_sum[1] = rs_sum[1] + rs_vals[33];
+                rs_sum[2] = rs_sum[2] + rs_vals[34];
+                rs_sum[3] = rs_sum[3] + rs_vals[35];
+                rs_sum[4] = rs_sum[4] + rs_vals[36];
+                rs_sum[5] = rs_sum[5] + rs_vals[37];
+                rs_sum[6] = rs_sum[6] + rs_vals[38];
+                rs_sum[7] = rs_sum[7] + rs_vals[39];
+                rs_sum[0] = rs_sum[0] + rs_vals[40];
+                rs_sum[1] = rs_sum[1] + rs_vals[41];
+                rs_sum[2] = rs_sum[2] + rs_vals[42];
+                rs_sum[3] = rs_sum[3] + rs_vals[43];
+                rs_sum[4] = rs_sum[4] + rs_vals[44];
+                rs_sum[5] = rs_sum[5] + rs_vals[45];
+                rs_sum[6] = rs_sum[6] + rs_vals[46];
+                rs_sum[7] = rs_sum[7] + rs_vals[47];
+                rs_sum[0] = rs_sum[0] + rs_vals[48];
+                rs_sum[1] = rs_sum[1] + rs_vals[49];
+                rs_sum[2] = rs_sum[2] + rs_vals[50];
+                rs_sum[3] = rs_sum[3] + rs_vals[51];
+                rs_sum[4] = rs_sum[4] + rs_vals[52];
+                rs_sum[5] = rs_sum[5] + rs_vals[53];
+                rs_sum[6] = rs_sum[6] + rs_vals[54];
+                rs_sum[7] = rs_sum[7] + rs_vals[55];
+                rs_sum[0] = rs_sum[0] + rs_vals[56];
+                rs_sum[1] = rs_sum[1] + rs_vals[57];
+                rs_sum[2] = rs_sum[2] + rs_vals[58];
+                rs_sum[3] = rs_sum[3] + rs_vals[59];
+                rs_sum[4] = rs_sum[4] + rs_vals[60];
+                rs_sum[5] = rs_sum[5] + rs_vals[61];
+                rs_sum[6] = rs_sum[6] + rs_vals[62];
+                rs_sum[7] = rs_sum[7] + rs_vals[63];
+                float alpha_value = 1.0f;
+                {
+                    alpha_value = alpha[0];
                 }
-                reinterpret_cast<unsigned*>(C + base0)[0] = reinterpret_cast<unsigned*>(_packed_0)[0];
-                float _scaled_1[2];
-                const float2 _scale2_1 = {alpha_value, alpha_value};
-                #pragma unroll
-                for (int _ls = 0; _ls < 1; _ls++)
-                    reinterpret_cast<float2*>(_scaled_1)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((rs_sum + 4))[_ls], _scale2_1);
-                unsigned int _packed_1[1];
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_1[_lp*2 + 0], _scaled_1[_lp*2+1 + 0]));
-                    _packed_1[_lp] = *(uint32_t*)&_bf2;
+                int row0 = lane_g;
+                int row1 = lane_g + 8;
+                int col = pair_off_n + nw * 8 + lane_r * 2;
+                if (row0 < M) {
+                    long long base0 = (long long)row0 * (long long)N + (long long)col;
+                    float _scaled_0[2];
+                    const float2 _scale2_6 = {alpha_value, alpha_value};
+                    #pragma unroll
+                    for (int _ls = 0; _ls < 1; _ls++)
+                        reinterpret_cast<float2*>(_scaled_0)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>(rs_sum)[_ls], _scale2_6);
+                    unsigned int _packed_0[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_0[_lp*2 + 0], _scaled_0[_lp*2+1 + 0]));
+                        _packed_0[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    reinterpret_cast<unsigned*>(C + base0)[0] = reinterpret_cast<unsigned*>(_packed_0)[0];
+                    float _scaled_1[2];
+                    const float2 _scale2_7 = {alpha_value, alpha_value};
+                    #pragma unroll
+                    for (int _ls = 0; _ls < 1; _ls++)
+                        reinterpret_cast<float2*>(_scaled_1)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((rs_sum + 4))[_ls], _scale2_7);
+                    unsigned int _packed_1[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_1[_lp*2 + 0], _scaled_1[_lp*2+1 + 0]));
+                        _packed_1[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    reinterpret_cast<unsigned*>(C + (base0 + 16))[0] = reinterpret_cast<unsigned*>(_packed_1)[0];
                 }
-                reinterpret_cast<unsigned*>(C + (base0 + 16))[0] = reinterpret_cast<unsigned*>(_packed_1)[0];
-            }
-            if (row1 < M) {
-                long long base1 = (long long)row1 * (long long)N + (long long)col;
-                float _scaled_2[2];
-                const float2 _scale2_2 = {alpha_value, alpha_value};
-                #pragma unroll
-                for (int _ls = 0; _ls < 1; _ls++)
-                    reinterpret_cast<float2*>(_scaled_2)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((rs_sum + 2))[_ls], _scale2_2);
-                unsigned int _packed_2[1];
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_2[_lp*2 + 0], _scaled_2[_lp*2+1 + 0]));
-                    _packed_2[_lp] = *(uint32_t*)&_bf2;
+                if (row1 < M) {
+                    long long base1 = (long long)row1 * (long long)N + (long long)col;
+                    float _scaled_2[2];
+                    const float2 _scale2_8 = {alpha_value, alpha_value};
+                    #pragma unroll
+                    for (int _ls = 0; _ls < 1; _ls++)
+                        reinterpret_cast<float2*>(_scaled_2)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((rs_sum + 2))[_ls], _scale2_8);
+                    unsigned int _packed_2[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_2[_lp*2 + 0], _scaled_2[_lp*2+1 + 0]));
+                        _packed_2[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    reinterpret_cast<unsigned*>(C + base1)[0] = reinterpret_cast<unsigned*>(_packed_2)[0];
+                    float _scaled_3[2];
+                    const float2 _scale2_9 = {alpha_value, alpha_value};
+                    #pragma unroll
+                    for (int _ls = 0; _ls < 1; _ls++)
+                        reinterpret_cast<float2*>(_scaled_3)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((rs_sum + 6))[_ls], _scale2_9);
+                    unsigned int _packed_3[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_3[_lp*2 + 0], _scaled_3[_lp*2+1 + 0]));
+                        _packed_3[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    reinterpret_cast<unsigned*>(C + (base1 + 16))[0] = reinterpret_cast<unsigned*>(_packed_3)[0];
                 }
-                reinterpret_cast<unsigned*>(C + base1)[0] = reinterpret_cast<unsigned*>(_packed_2)[0];
-                float _scaled_3[2];
-                const float2 _scale2_3 = {alpha_value, alpha_value};
-                #pragma unroll
-                for (int _ls = 0; _ls < 1; _ls++)
-                    reinterpret_cast<float2*>(_scaled_3)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((rs_sum + 6))[_ls], _scale2_3);
-                unsigned int _packed_3[1];
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_3[_lp*2 + 0], _scaled_3[_lp*2+1 + 0]));
-                    _packed_3[_lp] = *(uint32_t*)&_bf2;
+            } else if (lane < 4) {
+                float row0_vals[32];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[0])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[(0) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(0 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[4])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[(4) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(64 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[8])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[(8) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(128 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[12])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[(12) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(192 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[16])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[(16) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[(16) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[(16) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(256 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[20])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[(20) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[(20) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[(20) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(320 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[24])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[(24) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[(24) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[(24) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(384 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[28])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[(28) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[(28) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals[(28) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(448 + lane * 16)));
+                float row0_sum[8];
+                row0_sum[0] = 0.0f;
+                row0_sum[1] = 0.0f;
+                row0_sum[2] = 0.0f;
+                row0_sum[3] = 0.0f;
+                row0_sum[4] = 0.0f;
+                row0_sum[5] = 0.0f;
+                row0_sum[6] = 0.0f;
+                row0_sum[7] = 0.0f;
+                row0_sum[0] = row0_vals[0];
+                row0_sum[1] = row0_vals[1];
+                row0_sum[4] = row0_vals[2];
+                row0_sum[5] = row0_vals[3];
+                row0_sum[0] = row0_sum[0] + row0_vals[4];
+                row0_sum[1] = row0_sum[1] + row0_vals[5];
+                row0_sum[4] = row0_sum[4] + row0_vals[6];
+                row0_sum[5] = row0_sum[5] + row0_vals[7];
+                row0_sum[0] = row0_sum[0] + row0_vals[8];
+                row0_sum[1] = row0_sum[1] + row0_vals[9];
+                row0_sum[4] = row0_sum[4] + row0_vals[10];
+                row0_sum[5] = row0_sum[5] + row0_vals[11];
+                row0_sum[0] = row0_sum[0] + row0_vals[12];
+                row0_sum[1] = row0_sum[1] + row0_vals[13];
+                row0_sum[4] = row0_sum[4] + row0_vals[14];
+                row0_sum[5] = row0_sum[5] + row0_vals[15];
+                row0_sum[0] = row0_sum[0] + row0_vals[16];
+                row0_sum[1] = row0_sum[1] + row0_vals[17];
+                row0_sum[4] = row0_sum[4] + row0_vals[18];
+                row0_sum[5] = row0_sum[5] + row0_vals[19];
+                row0_sum[0] = row0_sum[0] + row0_vals[20];
+                row0_sum[1] = row0_sum[1] + row0_vals[21];
+                row0_sum[4] = row0_sum[4] + row0_vals[22];
+                row0_sum[5] = row0_sum[5] + row0_vals[23];
+                row0_sum[0] = row0_sum[0] + row0_vals[24];
+                row0_sum[1] = row0_sum[1] + row0_vals[25];
+                row0_sum[4] = row0_sum[4] + row0_vals[26];
+                row0_sum[5] = row0_sum[5] + row0_vals[27];
+                row0_sum[0] = row0_sum[0] + row0_vals[28];
+                row0_sum[1] = row0_sum[1] + row0_vals[29];
+                row0_sum[4] = row0_sum[4] + row0_vals[30];
+                row0_sum[5] = row0_sum[5] + row0_vals[31];
+                float alpha_value_1 = 1.0f;
+                {
+                    alpha_value_1 = alpha[0];
                 }
-                reinterpret_cast<unsigned*>(C + (base1 + 16))[0] = reinterpret_cast<unsigned*>(_packed_3)[0];
+                int row0_1 = lane_g;
+                int row1_1 = lane_g + 8;
+                int col_1 = pair_off_n + nw * 8 + lane_r * 2;
+                if (row0_1 < M) {
+                    long long base0_1 = (long long)row0_1 * (long long)N + (long long)col_1;
+                    float _scaled_0_1[2];
+                    const float2 _scale2_10 = {alpha_value_1, alpha_value_1};
+                    #pragma unroll
+                    for (int _ls = 0; _ls < 1; _ls++)
+                        reinterpret_cast<float2*>(_scaled_0_1)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>(row0_sum)[_ls], _scale2_10);
+                    unsigned int _packed_0_1[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_0_1[_lp*2 + 0], _scaled_0_1[_lp*2+1 + 0]));
+                        _packed_0_1[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    reinterpret_cast<unsigned*>(C + base0_1)[0] = reinterpret_cast<unsigned*>(_packed_0_1)[0];
+                    float _scaled_1_1[2];
+                    const float2 _scale2_11 = {alpha_value_1, alpha_value_1};
+                    #pragma unroll
+                    for (int _ls = 0; _ls < 1; _ls++)
+                        reinterpret_cast<float2*>(_scaled_1_1)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((row0_sum + 4))[_ls], _scale2_11);
+                    unsigned int _packed_1_1[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_1_1[_lp*2 + 0], _scaled_1_1[_lp*2+1 + 0]));
+                        _packed_1_1[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    reinterpret_cast<unsigned*>(C + (base0_1 + 16))[0] = reinterpret_cast<unsigned*>(_packed_1_1)[0];
+                }
+                if (row1_1 < M) {
+                    long long base1_1 = (long long)row1_1 * (long long)N + (long long)col_1;
+                    float _scaled_2_1[2];
+                    const float2 _scale2_12 = {alpha_value_1, alpha_value_1};
+                    #pragma unroll
+                    for (int _ls = 0; _ls < 1; _ls++)
+                        reinterpret_cast<float2*>(_scaled_2_1)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((row0_sum + 2))[_ls], _scale2_12);
+                    unsigned int _packed_2_1[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_2_1[_lp*2 + 0], _scaled_2_1[_lp*2+1 + 0]));
+                        _packed_2_1[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    reinterpret_cast<unsigned*>(C + base1_1)[0] = reinterpret_cast<unsigned*>(_packed_2_1)[0];
+                    float _scaled_3_1[2];
+                    const float2 _scale2_13 = {alpha_value_1, alpha_value_1};
+                    #pragma unroll
+                    for (int _ls = 0; _ls < 1; _ls++)
+                        reinterpret_cast<float2*>(_scaled_3_1)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((row0_sum + 6))[_ls], _scale2_13);
+                    unsigned int _packed_3_1[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_3_1[_lp*2 + 0], _scaled_3_1[_lp*2+1 + 0]));
+                        _packed_3_1[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    reinterpret_cast<unsigned*>(C + (base1_1 + 16))[0] = reinterpret_cast<unsigned*>(_packed_3_1)[0];
+                }
             }
         }
         if (slice_base + 1 == cta_rank) {
             mbarrier_wait_cluster_hint(mail_bar_addr, 0, 10000000);
-            float rs_vals_1[64];
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(0) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(4) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(512 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[8])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(8) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(1024 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[12])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(12) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(1536 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[16])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(16) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(16) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(16) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(2048 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[20])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(20) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(20) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(20) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(2560 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[24])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(24) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(24) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(24) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(3072 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[28])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(28) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(28) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(28) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(3584 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[32])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(32) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(32) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(32) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(4096 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[36])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(36) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(36) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(36) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(4608 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[40])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(40) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(40) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(40) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(5120 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[44])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(44) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(44) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(44) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(5632 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[48])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(48) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(48) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(48) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(6144 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[52])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(52) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(52) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(52) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(6656 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[56])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(56) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(56) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(56) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(7168 + lane * 16)));
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[60])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(60) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(60) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(60) + 3]))
-                : "r"(smk_mail_addr + (unsigned int)(7680 + lane * 16)));
-            float rs_sum_1[8];
-            rs_sum_1[0] = rs_vals_1[0];
-            rs_sum_1[1] = rs_vals_1[1];
-            rs_sum_1[2] = rs_vals_1[2];
-            rs_sum_1[3] = rs_vals_1[3];
-            rs_sum_1[4] = rs_vals_1[4];
-            rs_sum_1[5] = rs_vals_1[5];
-            rs_sum_1[6] = rs_vals_1[6];
-            rs_sum_1[7] = rs_vals_1[7];
-            rs_sum_1[0] = rs_sum_1[0] + rs_vals_1[8];
-            rs_sum_1[1] = rs_sum_1[1] + rs_vals_1[9];
-            rs_sum_1[2] = rs_sum_1[2] + rs_vals_1[10];
-            rs_sum_1[3] = rs_sum_1[3] + rs_vals_1[11];
-            rs_sum_1[4] = rs_sum_1[4] + rs_vals_1[12];
-            rs_sum_1[5] = rs_sum_1[5] + rs_vals_1[13];
-            rs_sum_1[6] = rs_sum_1[6] + rs_vals_1[14];
-            rs_sum_1[7] = rs_sum_1[7] + rs_vals_1[15];
-            rs_sum_1[0] = rs_sum_1[0] + rs_vals_1[16];
-            rs_sum_1[1] = rs_sum_1[1] + rs_vals_1[17];
-            rs_sum_1[2] = rs_sum_1[2] + rs_vals_1[18];
-            rs_sum_1[3] = rs_sum_1[3] + rs_vals_1[19];
-            rs_sum_1[4] = rs_sum_1[4] + rs_vals_1[20];
-            rs_sum_1[5] = rs_sum_1[5] + rs_vals_1[21];
-            rs_sum_1[6] = rs_sum_1[6] + rs_vals_1[22];
-            rs_sum_1[7] = rs_sum_1[7] + rs_vals_1[23];
-            rs_sum_1[0] = rs_sum_1[0] + rs_vals_1[24];
-            rs_sum_1[1] = rs_sum_1[1] + rs_vals_1[25];
-            rs_sum_1[2] = rs_sum_1[2] + rs_vals_1[26];
-            rs_sum_1[3] = rs_sum_1[3] + rs_vals_1[27];
-            rs_sum_1[4] = rs_sum_1[4] + rs_vals_1[28];
-            rs_sum_1[5] = rs_sum_1[5] + rs_vals_1[29];
-            rs_sum_1[6] = rs_sum_1[6] + rs_vals_1[30];
-            rs_sum_1[7] = rs_sum_1[7] + rs_vals_1[31];
-            rs_sum_1[0] = rs_sum_1[0] + rs_vals_1[32];
-            rs_sum_1[1] = rs_sum_1[1] + rs_vals_1[33];
-            rs_sum_1[2] = rs_sum_1[2] + rs_vals_1[34];
-            rs_sum_1[3] = rs_sum_1[3] + rs_vals_1[35];
-            rs_sum_1[4] = rs_sum_1[4] + rs_vals_1[36];
-            rs_sum_1[5] = rs_sum_1[5] + rs_vals_1[37];
-            rs_sum_1[6] = rs_sum_1[6] + rs_vals_1[38];
-            rs_sum_1[7] = rs_sum_1[7] + rs_vals_1[39];
-            rs_sum_1[0] = rs_sum_1[0] + rs_vals_1[40];
-            rs_sum_1[1] = rs_sum_1[1] + rs_vals_1[41];
-            rs_sum_1[2] = rs_sum_1[2] + rs_vals_1[42];
-            rs_sum_1[3] = rs_sum_1[3] + rs_vals_1[43];
-            rs_sum_1[4] = rs_sum_1[4] + rs_vals_1[44];
-            rs_sum_1[5] = rs_sum_1[5] + rs_vals_1[45];
-            rs_sum_1[6] = rs_sum_1[6] + rs_vals_1[46];
-            rs_sum_1[7] = rs_sum_1[7] + rs_vals_1[47];
-            rs_sum_1[0] = rs_sum_1[0] + rs_vals_1[48];
-            rs_sum_1[1] = rs_sum_1[1] + rs_vals_1[49];
-            rs_sum_1[2] = rs_sum_1[2] + rs_vals_1[50];
-            rs_sum_1[3] = rs_sum_1[3] + rs_vals_1[51];
-            rs_sum_1[4] = rs_sum_1[4] + rs_vals_1[52];
-            rs_sum_1[5] = rs_sum_1[5] + rs_vals_1[53];
-            rs_sum_1[6] = rs_sum_1[6] + rs_vals_1[54];
-            rs_sum_1[7] = rs_sum_1[7] + rs_vals_1[55];
-            rs_sum_1[0] = rs_sum_1[0] + rs_vals_1[56];
-            rs_sum_1[1] = rs_sum_1[1] + rs_vals_1[57];
-            rs_sum_1[2] = rs_sum_1[2] + rs_vals_1[58];
-            rs_sum_1[3] = rs_sum_1[3] + rs_vals_1[59];
-            rs_sum_1[4] = rs_sum_1[4] + rs_vals_1[60];
-            rs_sum_1[5] = rs_sum_1[5] + rs_vals_1[61];
-            rs_sum_1[6] = rs_sum_1[6] + rs_vals_1[62];
-            rs_sum_1[7] = rs_sum_1[7] + rs_vals_1[63];
-            float alpha_value_1 = 1.0f;
-            {
-                alpha_value_1 = alpha[0];
-            }
-            int row0_1 = lane_g;
-            int row1_1 = lane_g + 8;
-            int col_1 = pair_off_n + nw * 8 + lane_r * 2;
-            if (row0_1 < M) {
-                long long base0_1 = (long long)row0_1 * (long long)N + (long long)col_1;
-                float _scaled_4[2];
-                const float2 _scale2_4 = {alpha_value_1, alpha_value_1};
-                #pragma unroll
-                for (int _ls = 0; _ls < 1; _ls++)
-                    reinterpret_cast<float2*>(_scaled_4)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>(rs_sum_1)[_ls], _scale2_4);
-                unsigned int _packed_4[1];
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_4[_lp*2 + 0], _scaled_4[_lp*2+1 + 0]));
-                    _packed_4[_lp] = *(uint32_t*)&_bf2;
+            if (M > 1) {
+                float rs_vals_1[64];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(0) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(4) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(512 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[8])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(8) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(1024 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[12])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(12) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(1536 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[16])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(16) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(16) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(16) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(2048 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[20])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(20) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(20) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(20) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(2560 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[24])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(24) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(24) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(24) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(3072 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[28])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(28) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(28) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(28) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(3584 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[32])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(32) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(32) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(32) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(4096 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[36])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(36) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(36) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(36) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(4608 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[40])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(40) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(40) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(40) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(5120 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[44])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(44) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(44) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(44) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(5632 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[48])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(48) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(48) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(48) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(6144 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[52])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(52) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(52) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(52) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(6656 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[56])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(56) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(56) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(56) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(7168 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[60])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(60) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(60) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rs_vals_1[(60) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(7680 + lane * 16)));
+                float rs_sum_1[8];
+                rs_sum_1[0] = rs_vals_1[0];
+                rs_sum_1[1] = rs_vals_1[1];
+                rs_sum_1[2] = rs_vals_1[2];
+                rs_sum_1[3] = rs_vals_1[3];
+                rs_sum_1[4] = rs_vals_1[4];
+                rs_sum_1[5] = rs_vals_1[5];
+                rs_sum_1[6] = rs_vals_1[6];
+                rs_sum_1[7] = rs_vals_1[7];
+                rs_sum_1[0] = rs_sum_1[0] + rs_vals_1[8];
+                rs_sum_1[1] = rs_sum_1[1] + rs_vals_1[9];
+                rs_sum_1[2] = rs_sum_1[2] + rs_vals_1[10];
+                rs_sum_1[3] = rs_sum_1[3] + rs_vals_1[11];
+                rs_sum_1[4] = rs_sum_1[4] + rs_vals_1[12];
+                rs_sum_1[5] = rs_sum_1[5] + rs_vals_1[13];
+                rs_sum_1[6] = rs_sum_1[6] + rs_vals_1[14];
+                rs_sum_1[7] = rs_sum_1[7] + rs_vals_1[15];
+                rs_sum_1[0] = rs_sum_1[0] + rs_vals_1[16];
+                rs_sum_1[1] = rs_sum_1[1] + rs_vals_1[17];
+                rs_sum_1[2] = rs_sum_1[2] + rs_vals_1[18];
+                rs_sum_1[3] = rs_sum_1[3] + rs_vals_1[19];
+                rs_sum_1[4] = rs_sum_1[4] + rs_vals_1[20];
+                rs_sum_1[5] = rs_sum_1[5] + rs_vals_1[21];
+                rs_sum_1[6] = rs_sum_1[6] + rs_vals_1[22];
+                rs_sum_1[7] = rs_sum_1[7] + rs_vals_1[23];
+                rs_sum_1[0] = rs_sum_1[0] + rs_vals_1[24];
+                rs_sum_1[1] = rs_sum_1[1] + rs_vals_1[25];
+                rs_sum_1[2] = rs_sum_1[2] + rs_vals_1[26];
+                rs_sum_1[3] = rs_sum_1[3] + rs_vals_1[27];
+                rs_sum_1[4] = rs_sum_1[4] + rs_vals_1[28];
+                rs_sum_1[5] = rs_sum_1[5] + rs_vals_1[29];
+                rs_sum_1[6] = rs_sum_1[6] + rs_vals_1[30];
+                rs_sum_1[7] = rs_sum_1[7] + rs_vals_1[31];
+                rs_sum_1[0] = rs_sum_1[0] + rs_vals_1[32];
+                rs_sum_1[1] = rs_sum_1[1] + rs_vals_1[33];
+                rs_sum_1[2] = rs_sum_1[2] + rs_vals_1[34];
+                rs_sum_1[3] = rs_sum_1[3] + rs_vals_1[35];
+                rs_sum_1[4] = rs_sum_1[4] + rs_vals_1[36];
+                rs_sum_1[5] = rs_sum_1[5] + rs_vals_1[37];
+                rs_sum_1[6] = rs_sum_1[6] + rs_vals_1[38];
+                rs_sum_1[7] = rs_sum_1[7] + rs_vals_1[39];
+                rs_sum_1[0] = rs_sum_1[0] + rs_vals_1[40];
+                rs_sum_1[1] = rs_sum_1[1] + rs_vals_1[41];
+                rs_sum_1[2] = rs_sum_1[2] + rs_vals_1[42];
+                rs_sum_1[3] = rs_sum_1[3] + rs_vals_1[43];
+                rs_sum_1[4] = rs_sum_1[4] + rs_vals_1[44];
+                rs_sum_1[5] = rs_sum_1[5] + rs_vals_1[45];
+                rs_sum_1[6] = rs_sum_1[6] + rs_vals_1[46];
+                rs_sum_1[7] = rs_sum_1[7] + rs_vals_1[47];
+                rs_sum_1[0] = rs_sum_1[0] + rs_vals_1[48];
+                rs_sum_1[1] = rs_sum_1[1] + rs_vals_1[49];
+                rs_sum_1[2] = rs_sum_1[2] + rs_vals_1[50];
+                rs_sum_1[3] = rs_sum_1[3] + rs_vals_1[51];
+                rs_sum_1[4] = rs_sum_1[4] + rs_vals_1[52];
+                rs_sum_1[5] = rs_sum_1[5] + rs_vals_1[53];
+                rs_sum_1[6] = rs_sum_1[6] + rs_vals_1[54];
+                rs_sum_1[7] = rs_sum_1[7] + rs_vals_1[55];
+                rs_sum_1[0] = rs_sum_1[0] + rs_vals_1[56];
+                rs_sum_1[1] = rs_sum_1[1] + rs_vals_1[57];
+                rs_sum_1[2] = rs_sum_1[2] + rs_vals_1[58];
+                rs_sum_1[3] = rs_sum_1[3] + rs_vals_1[59];
+                rs_sum_1[4] = rs_sum_1[4] + rs_vals_1[60];
+                rs_sum_1[5] = rs_sum_1[5] + rs_vals_1[61];
+                rs_sum_1[6] = rs_sum_1[6] + rs_vals_1[62];
+                rs_sum_1[7] = rs_sum_1[7] + rs_vals_1[63];
+                float alpha_value_2 = 1.0f;
+                {
+                    alpha_value_2 = alpha[0];
                 }
-                reinterpret_cast<unsigned*>(C + (base0_1 + 32))[0] = reinterpret_cast<unsigned*>(_packed_4)[0];
-                float _scaled_5[2];
-                const float2 _scale2_5 = {alpha_value_1, alpha_value_1};
-                #pragma unroll
-                for (int _ls = 0; _ls < 1; _ls++)
-                    reinterpret_cast<float2*>(_scaled_5)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((rs_sum_1 + 4))[_ls], _scale2_5);
-                unsigned int _packed_5[1];
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_5[_lp*2 + 0], _scaled_5[_lp*2+1 + 0]));
-                    _packed_5[_lp] = *(uint32_t*)&_bf2;
+                int row0_2 = lane_g;
+                int row1_2 = lane_g + 8;
+                int col_2 = pair_off_n + nw * 8 + lane_r * 2;
+                if (row0_2 < M) {
+                    long long base0_2 = (long long)row0_2 * (long long)N + (long long)col_2;
+                    float _scaled_4[2];
+                    const float2 _scale2_14 = {alpha_value_2, alpha_value_2};
+                    #pragma unroll
+                    for (int _ls = 0; _ls < 1; _ls++)
+                        reinterpret_cast<float2*>(_scaled_4)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>(rs_sum_1)[_ls], _scale2_14);
+                    unsigned int _packed_4[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_4[_lp*2 + 0], _scaled_4[_lp*2+1 + 0]));
+                        _packed_4[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    reinterpret_cast<unsigned*>(C + (base0_2 + 32))[0] = reinterpret_cast<unsigned*>(_packed_4)[0];
+                    float _scaled_5[2];
+                    const float2 _scale2_15 = {alpha_value_2, alpha_value_2};
+                    #pragma unroll
+                    for (int _ls = 0; _ls < 1; _ls++)
+                        reinterpret_cast<float2*>(_scaled_5)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((rs_sum_1 + 4))[_ls], _scale2_15);
+                    unsigned int _packed_5[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_5[_lp*2 + 0], _scaled_5[_lp*2+1 + 0]));
+                        _packed_5[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    reinterpret_cast<unsigned*>(C + (base0_2 + 48))[0] = reinterpret_cast<unsigned*>(_packed_5)[0];
                 }
-                reinterpret_cast<unsigned*>(C + (base0_1 + 48))[0] = reinterpret_cast<unsigned*>(_packed_5)[0];
-            }
-            if (row1_1 < M) {
-                long long base1_1 = (long long)row1_1 * (long long)N + (long long)col_1;
-                float _scaled_6[2];
-                const float2 _scale2_6 = {alpha_value_1, alpha_value_1};
-                #pragma unroll
-                for (int _ls = 0; _ls < 1; _ls++)
-                    reinterpret_cast<float2*>(_scaled_6)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((rs_sum_1 + 2))[_ls], _scale2_6);
-                unsigned int _packed_6[1];
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_6[_lp*2 + 0], _scaled_6[_lp*2+1 + 0]));
-                    _packed_6[_lp] = *(uint32_t*)&_bf2;
+                if (row1_2 < M) {
+                    long long base1_2 = (long long)row1_2 * (long long)N + (long long)col_2;
+                    float _scaled_6[2];
+                    const float2 _scale2_16 = {alpha_value_2, alpha_value_2};
+                    #pragma unroll
+                    for (int _ls = 0; _ls < 1; _ls++)
+                        reinterpret_cast<float2*>(_scaled_6)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((rs_sum_1 + 2))[_ls], _scale2_16);
+                    unsigned int _packed_6[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_6[_lp*2 + 0], _scaled_6[_lp*2+1 + 0]));
+                        _packed_6[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    reinterpret_cast<unsigned*>(C + (base1_2 + 32))[0] = reinterpret_cast<unsigned*>(_packed_6)[0];
+                    float _scaled_7[2];
+                    const float2 _scale2_17 = {alpha_value_2, alpha_value_2};
+                    #pragma unroll
+                    for (int _ls = 0; _ls < 1; _ls++)
+                        reinterpret_cast<float2*>(_scaled_7)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((rs_sum_1 + 6))[_ls], _scale2_17);
+                    unsigned int _packed_7[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_7[_lp*2 + 0], _scaled_7[_lp*2+1 + 0]));
+                        _packed_7[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    reinterpret_cast<unsigned*>(C + (base1_2 + 48))[0] = reinterpret_cast<unsigned*>(_packed_7)[0];
                 }
-                reinterpret_cast<unsigned*>(C + (base1_1 + 32))[0] = reinterpret_cast<unsigned*>(_packed_6)[0];
-                float _scaled_7[2];
-                const float2 _scale2_7 = {alpha_value_1, alpha_value_1};
-                #pragma unroll
-                for (int _ls = 0; _ls < 1; _ls++)
-                    reinterpret_cast<float2*>(_scaled_7)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((rs_sum_1 + 6))[_ls], _scale2_7);
-                unsigned int _packed_7[1];
-                #pragma unroll
-                for (int _lp = 0; _lp < 1; _lp++) {
-                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_7[_lp*2 + 0], _scaled_7[_lp*2+1 + 0]));
-                    _packed_7[_lp] = *(uint32_t*)&_bf2;
+            } else if (lane < 4) {
+                float row0_vals_1[32];
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[(0) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(0 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[(4) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(64 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[8])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[(8) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[(8) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[(8) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(128 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[12])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[(12) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[(12) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[(12) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(192 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[16])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[(16) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[(16) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[(16) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(256 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[20])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[(20) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[(20) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[(20) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(320 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[24])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[(24) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[(24) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[(24) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(384 + lane * 16)));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[28])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[(28) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[(28) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&row0_vals_1[(28) + 3]))
+                    : "r"(smk_mail_addr + (unsigned int)(448 + lane * 16)));
+                float row0_sum_1[8];
+                row0_sum_1[0] = 0.0f;
+                row0_sum_1[1] = 0.0f;
+                row0_sum_1[2] = 0.0f;
+                row0_sum_1[3] = 0.0f;
+                row0_sum_1[4] = 0.0f;
+                row0_sum_1[5] = 0.0f;
+                row0_sum_1[6] = 0.0f;
+                row0_sum_1[7] = 0.0f;
+                row0_sum_1[0] = row0_vals_1[0];
+                row0_sum_1[1] = row0_vals_1[1];
+                row0_sum_1[4] = row0_vals_1[2];
+                row0_sum_1[5] = row0_vals_1[3];
+                row0_sum_1[0] = row0_sum_1[0] + row0_vals_1[4];
+                row0_sum_1[1] = row0_sum_1[1] + row0_vals_1[5];
+                row0_sum_1[4] = row0_sum_1[4] + row0_vals_1[6];
+                row0_sum_1[5] = row0_sum_1[5] + row0_vals_1[7];
+                row0_sum_1[0] = row0_sum_1[0] + row0_vals_1[8];
+                row0_sum_1[1] = row0_sum_1[1] + row0_vals_1[9];
+                row0_sum_1[4] = row0_sum_1[4] + row0_vals_1[10];
+                row0_sum_1[5] = row0_sum_1[5] + row0_vals_1[11];
+                row0_sum_1[0] = row0_sum_1[0] + row0_vals_1[12];
+                row0_sum_1[1] = row0_sum_1[1] + row0_vals_1[13];
+                row0_sum_1[4] = row0_sum_1[4] + row0_vals_1[14];
+                row0_sum_1[5] = row0_sum_1[5] + row0_vals_1[15];
+                row0_sum_1[0] = row0_sum_1[0] + row0_vals_1[16];
+                row0_sum_1[1] = row0_sum_1[1] + row0_vals_1[17];
+                row0_sum_1[4] = row0_sum_1[4] + row0_vals_1[18];
+                row0_sum_1[5] = row0_sum_1[5] + row0_vals_1[19];
+                row0_sum_1[0] = row0_sum_1[0] + row0_vals_1[20];
+                row0_sum_1[1] = row0_sum_1[1] + row0_vals_1[21];
+                row0_sum_1[4] = row0_sum_1[4] + row0_vals_1[22];
+                row0_sum_1[5] = row0_sum_1[5] + row0_vals_1[23];
+                row0_sum_1[0] = row0_sum_1[0] + row0_vals_1[24];
+                row0_sum_1[1] = row0_sum_1[1] + row0_vals_1[25];
+                row0_sum_1[4] = row0_sum_1[4] + row0_vals_1[26];
+                row0_sum_1[5] = row0_sum_1[5] + row0_vals_1[27];
+                row0_sum_1[0] = row0_sum_1[0] + row0_vals_1[28];
+                row0_sum_1[1] = row0_sum_1[1] + row0_vals_1[29];
+                row0_sum_1[4] = row0_sum_1[4] + row0_vals_1[30];
+                row0_sum_1[5] = row0_sum_1[5] + row0_vals_1[31];
+                float alpha_value_3 = 1.0f;
+                {
+                    alpha_value_3 = alpha[0];
                 }
-                reinterpret_cast<unsigned*>(C + (base1_1 + 48))[0] = reinterpret_cast<unsigned*>(_packed_7)[0];
+                int row0_3 = lane_g;
+                int row1_3 = lane_g + 8;
+                int col_3 = pair_off_n + nw * 8 + lane_r * 2;
+                if (row0_3 < M) {
+                    long long base0_3 = (long long)row0_3 * (long long)N + (long long)col_3;
+                    float _scaled_4_1[2];
+                    const float2 _scale2_18 = {alpha_value_3, alpha_value_3};
+                    #pragma unroll
+                    for (int _ls = 0; _ls < 1; _ls++)
+                        reinterpret_cast<float2*>(_scaled_4_1)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>(row0_sum_1)[_ls], _scale2_18);
+                    unsigned int _packed_4_1[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_4_1[_lp*2 + 0], _scaled_4_1[_lp*2+1 + 0]));
+                        _packed_4_1[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    reinterpret_cast<unsigned*>(C + (base0_3 + 32))[0] = reinterpret_cast<unsigned*>(_packed_4_1)[0];
+                    float _scaled_5_1[2];
+                    const float2 _scale2_19 = {alpha_value_3, alpha_value_3};
+                    #pragma unroll
+                    for (int _ls = 0; _ls < 1; _ls++)
+                        reinterpret_cast<float2*>(_scaled_5_1)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((row0_sum_1 + 4))[_ls], _scale2_19);
+                    unsigned int _packed_5_1[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_5_1[_lp*2 + 0], _scaled_5_1[_lp*2+1 + 0]));
+                        _packed_5_1[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    reinterpret_cast<unsigned*>(C + (base0_3 + 48))[0] = reinterpret_cast<unsigned*>(_packed_5_1)[0];
+                }
+                if (row1_3 < M) {
+                    long long base1_3 = (long long)row1_3 * (long long)N + (long long)col_3;
+                    float _scaled_6_1[2];
+                    const float2 _scale2_20 = {alpha_value_3, alpha_value_3};
+                    #pragma unroll
+                    for (int _ls = 0; _ls < 1; _ls++)
+                        reinterpret_cast<float2*>(_scaled_6_1)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((row0_sum_1 + 2))[_ls], _scale2_20);
+                    unsigned int _packed_6_1[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_6_1[_lp*2 + 0], _scaled_6_1[_lp*2+1 + 0]));
+                        _packed_6_1[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    reinterpret_cast<unsigned*>(C + (base1_3 + 32))[0] = reinterpret_cast<unsigned*>(_packed_6_1)[0];
+                    float _scaled_7_1[2];
+                    const float2 _scale2_21 = {alpha_value_3, alpha_value_3};
+                    #pragma unroll
+                    for (int _ls = 0; _ls < 1; _ls++)
+                        reinterpret_cast<float2*>(_scaled_7_1)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((row0_sum_1 + 6))[_ls], _scale2_21);
+                    unsigned int _packed_7_1[1];
+                    #pragma unroll
+                    for (int _lp = 0; _lp < 1; _lp++) {
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_7_1[_lp*2 + 0], _scaled_7_1[_lp*2+1 + 0]));
+                        _packed_7_1[_lp] = *(uint32_t*)&_bf2;
+                    }
+                    reinterpret_cast<unsigned*>(C + (base1_3 + 48))[0] = reinterpret_cast<unsigned*>(_packed_7_1)[0];
+                }
             }
         }
     }

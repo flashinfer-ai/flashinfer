@@ -157,7 +157,8 @@ def _binding_source(manifest: dict[str, Any]) -> str:
         f"{1 if v['spec_sample'] else 0}, {1 if v['slab_tail'] else 0}, "
         f"{1 if v['coarse_push'] else 0}, {1 if v.get('leader_push', False) else 0}, "
         f"{1 if v.get('local_select', False) else 0}, {1 if v.get('int_tail', False) else 0}, "
-        f"{1 if v.get('no_tail', False) else 0})"
+        f"{1 if v.get('no_tail', False) else 0}, "
+        f"{1 if v.get('compact_list', False) else 0})"
         for v in manifest["stage1"]
     )
     stage23 = " ".join(

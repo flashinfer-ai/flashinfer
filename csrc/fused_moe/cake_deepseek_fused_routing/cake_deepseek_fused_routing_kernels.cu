@@ -161,7 +161,7 @@ __global__ __launch_bounds__(256, 1) void kernel_cake_deepseek_routing_grouped(
                    : "=r"(_warp_redux_u32_3)
                    : "r"(group_encoded));
       unsigned int best_group_encoded = _warp_redux_u32_3;
-      unsigned int group_index_candidate = 4294967295;
+      unsigned int group_index_candidate = (unsigned int)(n_group - 1);
       if (group_encoded == best_group_encoded) {
         group_index_candidate = (unsigned int)lane_0;
       }

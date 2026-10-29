@@ -14,6 +14,8 @@ Requires a CUDA-capable GPU.
 
 Results:
 - We would get these example json files under fi_trace_out directory:
+qsa_forward_h12_kv1_d256.json
+qsa_indexed_forward_h12_kv1_d256.json
 alphamoe_fused_router_e512_k8_bm16_shared0.json
 alphamoe_nvfp4_aligned_moe_topk2_e4_h256_n256_bm8.json
 bmm_mxfp8_N128_K128.json
@@ -37,11 +39,13 @@ fmha_v2_prefill_sm120_h4_d128.json
 fmha_v2_prefill_sm120_h96_d128.json
 fmha_v2_prefill_sm120_h20_d256.json
 gdn_decode_qk4_v8_d128.json
+gdn_decode_paged_qk4_v8_d128.json
 gdn_fused_decode_h5120_v48_d128.json
 gdn_mtp_qk4_v8_d128.json
 gdn_replayssm_commit_k2_v8_d128.json
 gdn_prefill_qk4_v8_d128.json
 gdn_prefill_gates_q4_k4_v8_d128.json
+gdn_prefill_paged_q4_k4_v8_d128_ps64.json
 gdn2_prefill_qk4_v8_d128.json
 gdp_prefill_n2_qk4_v8_d128.json
 recurrent_kda_q8_v16_d128.json
@@ -124,6 +128,10 @@ prims_ts_paged_block_sparse_combined_h8_kv8_d128_qb64_kb64_ps64.json
 prims_ts_paged_block_sparse_tuple_h8_kv8_d128_qb64_kb64_ps64.json
 prims_ts_paged_block_sparse_wrapper_combined_h8_kv8_d128_ps64.json
 prims_ts_paged_block_sparse_wrapper_tuple_h8_kv8_d128_ps64.json
+prims_ts_bf16_moe_partitioned_topk2_e8_h1024_i512_p2.json
+prims_ts_fp4_block_scale_moe_partitioned_topk2_e8_h1024_i512_p2.json
+prims_ts_fp8_block_scale_moe_partitioned_topk2_e8_h1024_i512_p2.json
+prims_ts_fp8_per_tensor_scale_moe_partitioned_topk2_e8_h1024_i512_p2.json
 quantize_nvfp4_smooth_N3072.json
 rmsnorm_h4096.json
 rmsnorm_h7168.json
@@ -211,6 +219,7 @@ from flashinfer.comm import (
 )
 from flashinfer.decode import BatchDecodeWithPagedKVCacheWrapper
 from flashinfer.fi_trace import fi_trace
+from flashinfer.green_ctx import split_device_green_ctx_by_sm_count
 from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 from flashinfer.mla import BatchMLAPagedAttentionWrapper
 from flashinfer.prefill import (
@@ -219,6 +228,7 @@ from flashinfer.prefill import (
     fmha_v2_prefill_deepseek,
     fmha_v2_prefill_sm120,
 )
+from flashinfer.prims_ts.moe import MoePartitionResources
 from flashinfer.utils import is_sm100a_supported
 from tests.trace.example_moe_layer import generate as generate_moe_layer_traces
 from tests.utils_fp8 import to_float8
@@ -479,6 +489,37 @@ flashinfer.apply_rope_with_cos_sin_cache(
 flashinfer.apply_rope_with_cos_sin_cache_inplace(
     rope_positions, rope_query.clone(), rope_key.clone(), rope_D, rope_cos_sin
 )
+
+
+def example_qsa():
+    capability = torch.cuda.get_device_capability(device)
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        print("Skipping QSA examples: requires SM100/SM103/SM107")
+        return
+    q = torch.randn(8, 12, 256, dtype=torch.bfloat16, device=device)
+    k = torch.randn(8, 1, 256, dtype=torch.bfloat16, device=device)
+    v = torch.randn_like(k)
+    token = torch.arange(8, device=device, dtype=torch.int32)
+    zeros = torch.zeros_like(token)
+    first = torch.tensor([0, 4], device=device, dtype=torch.int32)
+    flashinfer.qsa_forward(
+        q,
+        k,
+        v,
+        torch.ones(8, 2, device=device, dtype=torch.uint8),
+        zeros,
+        token,
+        zeros,
+        zeros,
+        first,
+        first + 3,
+    )
+    if capability in ((10, 0), (10, 3)):
+        indices = torch.where(token[None, :] <= token[:, None], token[None, :], -1)
+        flashinfer.qsa_indexed_forward(q, k, v, indices)
+
+
+example_qsa()
 
 
 def example_dsv41_fp4_cache():
@@ -1150,6 +1191,22 @@ from flashinfer.trace.templates.gdn import gdn_prefill_trace
 flashinfer.gdn_prefill.chunk_gated_delta_rule.fi_trace(
     **gdn_prefill_trace(use_gate_in_kernel=True).init(total_seq_len=256, device=device),
     backend="cudnn",
+    save_dir=SAVE_DIR,
+)
+
+# ── GDN on a paged recurrent-state pool (trace-only) ─────────────────────────
+import flashinfer.gdn_paged
+from flashinfer.trace.templates.gdn import (
+    gdn_decode_paged_trace,
+    gdn_prefill_paged_trace,
+)
+
+flashinfer.gdn_paged.chunk_gated_delta_rule_paged.fi_trace(
+    **gdn_prefill_paged_trace.init(total_seq_len=256, page_size=64, device=device),
+    save_dir=SAVE_DIR,
+)
+flashinfer.gdn_paged.gated_delta_rule_decode_paged.fi_trace(
+    **gdn_decode_paged_trace.init(batch_size=4, page_size=64, device=device),
     save_dir=SAVE_DIR,
 )
 
@@ -2125,6 +2182,167 @@ flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe.fi_trace(
     per_token_scale=torch.ones(_pts_moe_T, dtype=torch.float32, device=device),
     nvfp4_4over6=NVFP44Over6Config(),
     **_pts_moe_fp4_common,
+)
+
+# Partitioned Prims-TS APIs consume two prepared MajorK shards and caller-owned
+# streams. Use TP-N/TP-K here so FC1 is split by output rows while FC2 is split
+# by reduction K, matching the public two-way partition contract.
+_pts_partition_device = torch.device("cuda", torch.cuda.current_device())
+_pts_properties = torch.cuda.get_device_properties(_pts_partition_device)
+_pts_green_streams, _pts_green_resources = split_device_green_ctx_by_sm_count(
+    _pts_partition_device, [_pts_properties.multi_processor_count // 2]
+)
+_pts_partition_resources = MoePartitionResources(
+    streams=(_pts_green_streams[0], _pts_green_streams[1])
+)
+_pts_partition_common = dict(
+    routing_logits=_pts_moe_logits,
+    routing_bias=_pts_moe_bias,
+    topk_ids=None,
+    hidden_states=_pts_moe_hidden_bf16,
+    num_experts=_pts_moe_E,
+    top_k=_pts_moe_K,
+    n_group=None,
+    topk_group=None,
+    intermediate_size=_pts_moe_I,
+    local_expert_offset=0,
+    local_num_experts=_pts_moe_E,
+    partition_resources=_pts_partition_resources,
+    partition_strategy="tp_n_tp_k",
+    routed_scaling_factor=None,
+    routing_method_type=1,
+)
+_pts_partition_w1_bf16 = tuple(
+    torch.empty(
+        _pts_moe_E,
+        _pts_moe_I,
+        _pts_moe_H,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    for _ in range(2)
+)
+_pts_partition_w2_bf16 = tuple(
+    torch.empty(
+        _pts_moe_E,
+        _pts_moe_H,
+        _pts_moe_I // 2,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    for _ in range(2)
+)
+flashinfer.prims_ts_bf16_moe_partitioned.fi_trace(
+    expert_weights=None,
+    gemm1_weights=_pts_partition_w1_bf16,
+    gemm2_weights=_pts_partition_w2_bf16,
+    **_pts_partition_common,
+)
+
+_pts_partition_w1_fp8 = tuple(
+    shard.to(torch.float8_e4m3fn) for shard in _pts_partition_w1_bf16
+)
+_pts_partition_w2_fp8 = tuple(
+    shard.to(torch.float8_e4m3fn) for shard in _pts_partition_w2_bf16
+)
+flashinfer.prims_ts_fp8_per_tensor_scale_moe_partitioned.fi_trace(
+    expert_weights=None,
+    gemm1_weights=_pts_partition_w1_fp8,
+    output1_scales_scalar=_pts_moe_tensor_scales,
+    output1_scales_gate_scalar=_pts_moe_tensor_scales,
+    gemm2_weights=_pts_partition_w2_fp8,
+    output2_scales_scalar=_pts_moe_tensor_scales,
+    use_routing_scales_on_input=False,
+    **{
+        **_pts_partition_common,
+        "hidden_states": _pts_moe_hidden_fp8,
+    },
+)
+
+_pts_partition_w1_fp4 = tuple(
+    torch.empty(
+        _pts_moe_E,
+        _pts_moe_I,
+        _pts_moe_H // 2,
+        dtype=torch.uint8,
+        device=device,
+    )
+    for _ in range(2)
+)
+_pts_partition_w2_fp4 = tuple(
+    torch.empty(
+        _pts_moe_E,
+        _pts_moe_H,
+        _pts_moe_I // 4,
+        dtype=torch.uint8,
+        device=device,
+    )
+    for _ in range(2)
+)
+_pts_partition_w1_fp4_scale = tuple(
+    torch.empty(
+        _pts_moe_E * _pts_moe_I * (_pts_moe_H // 16),
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    for _ in range(2)
+)
+_pts_partition_w2_fp4_scale = tuple(
+    torch.empty(
+        _pts_moe_E * _pts_moe_H * ((_pts_moe_I // 2) // 16),
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    for _ in range(2)
+)
+flashinfer.prims_ts_fp4_block_scale_moe_partitioned.fi_trace(
+    topk_weights=None,
+    hidden_states_scale=_pts_moe_hidden_fp4_scale.reshape(-1),
+    gemm1_weights=_pts_partition_w1_fp4,
+    gemm1_weights_scale=_pts_partition_w1_fp4_scale,
+    gemm2_weights=_pts_partition_w2_fp4,
+    gemm2_weights_scale=_pts_partition_w2_fp4_scale,
+    output1_scale_scalar=_pts_moe_tensor_scales,
+    output1_scale_gate_scalar=_pts_moe_tensor_scales,
+    output2_scale_scalar=_pts_moe_tensor_scales,
+    **{
+        **_pts_partition_common,
+        "hidden_states": _pts_moe_hidden_fp4,
+    },
+)
+
+_pts_partition_hidden_mxfp8_scale = torch.empty(
+    _pts_moe_T * (_pts_moe_H // 32),
+    dtype=torch.uint8,
+    device=device,
+)
+_pts_partition_w1_fp8_scale = tuple(
+    torch.empty(
+        _pts_moe_E * _pts_moe_I * (_pts_moe_H // 32),
+        dtype=torch.uint8,
+        device=device,
+    )
+    for _ in range(2)
+)
+_pts_partition_w2_fp8_scale = tuple(
+    torch.empty(
+        _pts_moe_E * _pts_moe_H * ((_pts_moe_I // 2) // 32),
+        dtype=torch.uint8,
+        device=device,
+    )
+    for _ in range(2)
+)
+flashinfer.prims_ts_fp8_block_scale_moe_partitioned.fi_trace(
+    expert_weights=None,
+    hidden_states_scale=_pts_partition_hidden_mxfp8_scale,
+    gemm1_weights=_pts_partition_w1_fp8,
+    gemm1_weights_scale=_pts_partition_w1_fp8_scale,
+    gemm2_weights=_pts_partition_w2_fp8,
+    gemm2_weights_scale=_pts_partition_w2_fp8_scale,
+    **{
+        **_pts_partition_common,
+        "hidden_states": _pts_moe_hidden_fp8,
+    },
 )
 
 # ── Summary ───────────────────────────────────────────────────────────────────

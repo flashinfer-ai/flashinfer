@@ -23,11 +23,21 @@ checked on packed boundaries, tails, empty segments and multi-segment streams.  
 ``pv_mode="fp8"`` route (NVFP4 scores, E4M3 probabilities and V; three generated programs) shares
 the API and the FP4 tolerance and is held to a smaller relative-L2 error than the default route on
 the same inputs, to bitwise idempotence, to stream-private workspaces and to its program routing.
-Every test needs an SM120 GPU (the JIT modules only build for compute capability 12.x) except the
-workspace estimators and the ``pv_mode`` validation.
+Concurrent use of the NVFP4 routes (several streams, CUDA graphs captured on one stream or with forked
+branches, two host threads on one stream, serialized launches) completes and reproduces every call's
+single-stream result bit for bit; each such test fails at a progress deadline instead of hanging.
+Numerical and concurrency tests require exact compute capability 12.0: the generated programs
+ship only sm_120a. Input validation and unsupported-device rejection remain covered on other GPUs.
 """
 
 import math
+import os
+import subprocess
+import sys
+import textwrap
+import threading
+import time
+from collections import OrderedDict
 
 import pytest
 import torch
@@ -35,8 +45,10 @@ import torch
 from flashinfer.diffusion_ops import (
     minimax_h3_sm120_varlen_attention_fp8,
     minimax_h3_sm120_varlen_attention_nvfp4,
+    minimax_h3_sm120_varlen_attention_nvfp4_nodelta,
 )
 import flashinfer.diffusion_ops.cake_minimax_h3_sm120_nvfp4_varlen_attention as nvfp4_ops
+import flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_varlen_attention as quant_ops
 from flashinfer.diffusion_ops.cake_minimax_h3_sm120_nvfp4_varlen_attention import (
     minimax_h3_sm120_nvfp4_fp8pv_programs,
     workspace_bytes_nvfp4,
@@ -79,13 +91,33 @@ PV_MODES = ("fp4", "fp8")
 def _supported() -> bool:
     if not torch.cuda.is_available():
         return False
-    major, _minor = get_compute_capability(torch.device("cuda:0"))
-    return major == 12
+    return get_compute_capability(torch.device("cuda:0")) == (12, 0)
 
 
 requires_sm120 = pytest.mark.skipif(
-    not _supported(), reason="requires an SM120 (RTX 5090 / RTX PRO 6000 Blackwell) GPU"
+    not _supported(),
+    reason="generated programs require exact compute capability 12.0 (sm_120a)",
 )
+
+
+@pytest.mark.parametrize(
+    "cuda_available, capability, expected",
+    [
+        (False, (12, 0), False),
+        (True, (12, 0), True),
+        (True, (12, 1), False),
+        (True, (10, 0), False),
+    ],
+)
+def test_supported_requires_exact_sm120(
+    monkeypatch, cuda_available, capability, expected
+):
+    # The generated programs ship sm_120a only; Spark must not enter the numerical suite.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda_available)
+    monkeypatch.setitem(
+        _supported.__globals__, "get_compute_capability", lambda device: capability
+    )
+    assert _supported() is expected
 
 
 def synthetic_inputs(tokens: int, heads: int, seed: int, device: torch.device):
@@ -224,7 +256,23 @@ def test_minimax_h3_sm120_varlen_attention_nvfp4_custom_scale_and_empty_stream()
     )
 
 
-@requires_sm120
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("pv_mode", PV_MODES)
+def test_minimax_h3_sm120_varlen_attention_nvfp4_rejects_unsupported_device(
+    pv_mode,
+) -> None:
+    device = torch.device("cuda:0")
+    if get_compute_capability(device) == (12, 0):
+        pytest.skip("SM120 is supported; numerical tests cover this device")
+    q, k, v = synthetic_inputs(1, 1, seed=0, device=device)
+    cu = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    with pytest.raises(RuntimeError, match=r"requires exact compute capability 12\.0"):
+        minimax_h3_sm120_varlen_attention_nvfp4(
+            q, k, v, cu, cu_seqlens_host=(0, 1), pv_mode=pv_mode
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_minimax_h3_sm120_varlen_attention_nvfp4_rejects_bad_inputs() -> None:
     device = torch.device("cuda:0")
     q, k, v = synthetic_inputs(300, 4, seed=3, device=device)
@@ -404,3 +452,502 @@ def test_minimax_h3_sm120_nvfp4_fp8pv_two_streams_keep_private_counters() -> Non
     torch.cuda.synchronize()
     for out, want in zip(outs, expected, strict=True):
         assert torch.equal(out, want)
+
+
+def _route(delta: bool):
+    return (
+        minimax_h3_sm120_varlen_attention_nvfp4
+        if delta
+        else minimax_h3_sm120_varlen_attention_nvfp4_nodelta
+    )
+
+
+def _await(streams, what: str, seconds: float = 60.0) -> None:
+    """Fail instead of hanging: the work queued so far on ``streams`` must complete within ``seconds``."""
+    ends = []
+    for stream in streams:
+        end = torch.cuda.Event()
+        end.record(stream)
+        ends.append(end)
+    deadline = time.monotonic() + seconds
+    while not all(end.query() for end in ends):
+        if time.monotonic() > deadline:
+            pytest.fail(f"{what} made no progress in {seconds:.0f} s")
+        time.sleep(0.001)
+
+
+def _control_words_are_zero(owners) -> bool:
+    """Whether the zero-start words (arrival counters, grid-barrier word, head-control words) of every
+    workspace owner in ``owners`` are zero again, as the kernels leave them after every complete call (the
+    grid barrier's top bit is its sense, which flips at every use)."""
+    for owner in owners:
+        for name, buffer in nvfp4_ops._ZERO_STREAM_WORKSPACES[owner].items():
+            words = buffer.view(torch.int32)
+            if name == "barrier":
+                words = words & 0x7FFFFFFF
+            if int(torch.count_nonzero(words)) != 0:
+                return False
+    return True
+
+
+def _new_capture_owners(before) -> list:
+    """The workspace owners created by graph captures since the owner set ``before`` was taken."""
+    return [
+        owner
+        for owner in nvfp4_ops._ZERO_STREAM_WORKSPACES
+        if len(owner) == 3 and owner not in before
+    ]
+
+
+# A plan of the fused pre-processing and a long plan (the statistics and long-plan quantizer launches), both of
+# which take the overlapped form on 170 and 188 SMs.
+CONCURRENT_CU_SEQLENS = [
+    (0, 1100, 2100),
+    (0, 5000, 5000, 21000, 21129),
+]
+
+
+@requires_sm120
+@pytest.mark.parametrize("cu_seqlens", CONCURRENT_CU_SEQLENS)
+@pytest.mark.parametrize("delta", [True, False])
+@pytest.mark.parametrize("overlap", [True, False])
+@pytest.mark.parametrize("num_streams", [2, 4])
+def test_minimax_h3_sm120_varlen_attention_nvfp4_concurrent_streams_are_bitwise(
+    cu_seqlens, delta, overlap, num_streams, monkeypatch
+) -> None:
+    """Streams running the route concurrently on different inputs each reproduce their single-stream result
+    bit for bit, and every round completes: the arrival counters, the grid-barrier word and the head-control
+    words are private to the (device, stream), and concurrent overlapped calls make progress.
+    ``overlap=False`` empties the overlap table, so the plans take the separate launches."""
+    device = torch.device("cuda:0")
+    # fresh launch caches for this test (restored afterwards), so no launch form leaks between cases
+    monkeypatch.setattr(nvfp4_ops, "_NVFP4_LAUNCHES", OrderedDict())
+    if not overlap:
+        monkeypatch.setattr(nvfp4_ops, "_OVERLAP_WIDTH", {})
+    fn = _route(delta)
+    cu = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
+    inputs = [
+        synthetic_inputs(cu_seqlens[-1], MINIMAX_H3_NUM_HEADS, seed=seed, device=device)
+        for seed in range(31, 31 + num_streams)
+    ]
+    expected = [fn(q, k, v, cu, cu_seqlens_host=cu_seqlens) for q, k, v in inputs]
+    torch.cuda.synchronize()
+    streams = [torch.cuda.Stream(device=device) for _ in inputs]
+    outs = [torch.zeros_like(q) for q, _k, _v in inputs]
+    for _round in range(8):
+        for stream, (q, k, v), out in zip(streams, inputs, outs, strict=True):
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                fn(q, k, v, cu, out, cu_seqlens_host=cu_seqlens)
+        _await(streams, f"concurrent calls on {num_streams} streams")
+        for out, want in zip(outs, expected, strict=True):
+            assert torch.equal(out, want)
+            out.zero_()
+    assert _control_words_are_zero([(device.index, s.cuda_stream) for s in streams])
+
+
+# The plan of the graph, host-thread and serialized-launch tests: the fused pre-processing (the overlapped form
+# on 170 and 188 SMs).
+FUSED_CU_SEQLENS = (0, 1100, 2100)
+
+
+def _fused_case(device: torch.device, seeds):
+    """``cu_seqlens``, one input triple per seed and each triple's single-stream result."""
+    cu = torch.tensor(FUSED_CU_SEQLENS, dtype=torch.int32, device=device)
+    inputs = [
+        synthetic_inputs(
+            FUSED_CU_SEQLENS[-1], MINIMAX_H3_NUM_HEADS, seed=seed, device=device
+        )
+        for seed in seeds
+    ]
+    expected = [
+        minimax_h3_sm120_varlen_attention_nvfp4(
+            q, k, v, cu, cu_seqlens_host=FUSED_CU_SEQLENS
+        )
+        for q, k, v in inputs
+    ]
+    torch.cuda.synchronize()
+    return cu, inputs, expected
+
+
+def _fused_call(q, k, v, cu, out) -> None:
+    minimax_h3_sm120_varlen_attention_nvfp4(
+        q, k, v, cu, out, cu_seqlens_host=FUSED_CU_SEQLENS
+    )
+
+
+@requires_sm120
+def test_minimax_h3_sm120_varlen_attention_nvfp4_graphs_one_capture_stream() -> None:
+    """Two graphs captured one after the other on torch's default capture stream get separate workspace
+    sets (their owners carry the capture id) and, replayed concurrently on two streams, each reproduce
+    their eager result bit for bit."""
+    device = torch.device("cuda:0")
+    cu, inputs, expected = _fused_case(device, (41, 42))
+    outs = [torch.zeros_like(q) for q, _k, _v in inputs]
+    before = set(nvfp4_ops._ZERO_STREAM_WORKSPACES)
+    graphs = []
+    for (q, k, v), out in zip(inputs, outs, strict=True):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            _fused_call(q, k, v, cu, out)
+        graphs.append(graph)
+    owners = _new_capture_owners(before)
+    # one capture stream, two captures
+    assert len(owners) == 2
+    assert owners[0][:2] == owners[1][:2] and owners[0][2] != owners[1][2]
+    streams = [torch.cuda.Stream(device=device) for _ in graphs]
+    for _round in range(16):
+        for stream, graph in zip(streams, graphs, strict=True):
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                graph.replay()
+        _await(streams, "two graphs replayed concurrently")
+        for out, want in zip(outs, expected, strict=True):
+            assert torch.equal(out, want)
+            out.zero_()
+    assert _control_words_are_zero(owners)
+
+
+@requires_sm120
+def test_minimax_h3_sm120_owner_asks_cuda_when_the_call_device_is_not_current(
+    monkeypatch,
+) -> None:
+    """While another device is current, torch's capture query reads that device's stream; the owner of a
+    call then asks CUDA about the call's own stream, which sees the capture (one GPU: the other current
+    device and its idle stream are reported by patched torch queries inside a real capture)."""
+    x = torch.zeros(16, device="cuda:0")
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        x.add_(1)
+        raw = torch.cuda.current_stream().cuda_stream
+        with monkeypatch.context() as patch:
+            patch.setattr(torch.cuda, "current_device", lambda: 1)
+            patch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+            owner = quant_ops._owner(0, raw)
+    assert len(owner) == 3 and owner[:2] == (0, raw) and owner[2] != 0
+    # the same stream after the capture is an eager owner
+    assert quant_ops._owner(0, raw) == (0, raw)
+
+
+@requires_sm120
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two CUDA devices")
+def test_minimax_h3_sm120_varlen_attention_nvfp4_capture_on_another_device(
+    monkeypatch,
+) -> None:
+    """A call on device 1 captured into a graph while device 0 is current gets a capture owner and no eager
+    warm-up launch inside the capture, and its replays reproduce the eager result bit for bit."""
+    device = torch.device("cuda:1")
+    with torch.cuda.device(device):
+        cu, ((q, k, v),), (want,) = _fused_case(device, (43,))
+    out = torch.zeros_like(q)
+    # the plan's first call on this device again: the warm-up gate must see the capture
+    monkeypatch.setattr(nvfp4_ops, "_NVFP4_OVERLAP_LOADED", set())
+    before = set(nvfp4_ops._ZERO_STREAM_WORKSPACES)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.device(device), torch.cuda.graph(graph), torch.cuda.device(0):
+        _fused_call(q, k, v, cu, out)
+    owners = _new_capture_owners(before)
+    assert len(owners) == 1 and owners[0][0] == device.index
+    assert not nvfp4_ops._NVFP4_OVERLAP_LOADED
+    with torch.cuda.device(device):
+        for _round in range(4):
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(out, want)
+            out.zero_()
+    assert _control_words_are_zero(owners)
+
+
+@requires_sm120
+def test_minimax_h3_sm120_varlen_attention_nvfp4_graph_beside_eager_calls() -> None:
+    """A graph captured on a stream, replayed on another stream concurrently with eager calls on its capture
+    stream: the eager calls use the stream's workspace set, the graph its capture's, and both outputs are
+    their single-stream results bit for bit."""
+    device = torch.device("cuda:0")
+    cu, inputs, expected = _fused_case(device, (43, 44))
+    (qg, kg, vg), (qe, ke, ve) = inputs
+    capture_stream = torch.cuda.Stream(device=device)
+    replay_stream = torch.cuda.Stream(device=device)
+    out_graph, out_eager = torch.zeros_like(qg), torch.zeros_like(qe)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        _fused_call(qg, kg, vg, cu, out_graph)
+    streams = (capture_stream, replay_stream)
+    for _round in range(16):
+        for stream in streams:
+            stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(replay_stream):
+            graph.replay()
+        with torch.cuda.stream(capture_stream):
+            _fused_call(qe, ke, ve, cu, out_eager)
+        _await(streams, "a graph replayed beside eager calls on its capture stream")
+        assert torch.equal(out_graph, expected[0])
+        assert torch.equal(out_eager, expected[1])
+        out_graph.zero_()
+        out_eager.zero_()
+    assert _control_words_are_zero([(device.index, capture_stream.cuda_stream)])
+
+
+@requires_sm120
+def test_minimax_h3_sm120_varlen_attention_nvfp4_two_threads_one_stream() -> None:
+    """Two host threads calling on one stream: the per-(device, stream) host lock keeps the launches of
+    every call contiguous on the stream, so the calls take the stream's workspace set in turn and each
+    thread's output is its single-stream result bit for bit."""
+    device = torch.device("cuda:0")
+    cu, inputs, expected = _fused_case(device, (45, 46))
+    stream = torch.cuda.Stream(device=device)
+    outs = [torch.zeros_like(q) for q, _k, _v in inputs]
+    stream.wait_stream(torch.cuda.current_stream())
+    start = threading.Barrier(len(inputs), timeout=60.0)
+    errors = []
+
+    def caller(q, k, v, out) -> None:
+        try:
+            torch.cuda.set_device(device)
+            with torch.cuda.stream(stream):
+                start.wait()
+                for _call in range(16):
+                    _fused_call(q, k, v, cu, out)
+        except Exception as error:
+            errors.append(error)
+
+    threads = [
+        threading.Thread(target=caller, args=(q, k, v, out))
+        for (q, k, v), out in zip(inputs, outs, strict=True)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60.0)
+    if any(thread.is_alive() for thread in threads):
+        pytest.fail("two host threads calling on one stream did not finish in 60 s")
+    if errors:
+        raise errors[0]
+    _await((stream,), "two host threads calling on one stream")
+    for out, want in zip(outs, expected, strict=True):
+        assert torch.equal(out, want)
+    assert _control_words_are_zero([(device.index, stream.cuda_stream)])
+
+
+@requires_sm120
+def test_minimax_h3_sm120_varlen_attention_nvfp4_forked_capture_branches() -> None:
+    """One capture with the operator on two forked branches joined back into the capture stream: each branch
+    gets its own workspace set (one capture id, two streams), the branches run concurrently at every replay
+    and both outputs are their eager results bit for bit."""
+    device = torch.device("cuda:0")
+    cu, inputs, expected = _fused_case(device, (47, 48))
+    outs = [torch.zeros_like(q) for q, _k, _v in inputs]
+    capture_stream = torch.cuda.Stream(device=device)
+    branch = torch.cuda.Stream(device=device)
+    before = set(nvfp4_ops._ZERO_STREAM_WORKSPACES)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        branch.wait_stream(capture_stream)
+        _fused_call(*inputs[0], cu, outs[0])
+        with torch.cuda.stream(branch):
+            _fused_call(*inputs[1], cu, outs[1])
+        capture_stream.wait_stream(branch)
+    owners = _new_capture_owners(before)
+    # two branch streams, one capture
+    assert len(owners) == 2
+    assert owners[0][1] != owners[1][1] and owners[0][2] == owners[1][2]
+    replay_stream = torch.cuda.Stream(device=device)
+    for _round in range(16):
+        replay_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(replay_stream):
+            graph.replay()
+        _await((replay_stream,), "a graph with the operator on two forked branches")
+        for out, want in zip(outs, expected, strict=True):
+            assert torch.equal(out, want)
+            out.zero_()
+    assert _control_words_are_zero(owners)
+
+
+# Run under ``CUDA_LAUNCH_BLOCKING=1``: every launch completes before the next one starts.
+_SERIALIZED_SCRIPT = textwrap.dedent(
+    """
+    import torch
+
+    import flashinfer.diffusion_ops.cake_minimax_h3_sm120_nvfp4_varlen_attention as ops
+
+    bounds = (0, 1100, 2100)
+    device = torch.device("cuda:0")
+    generator = torch.Generator(device="cpu").manual_seed(49)
+    q, k, v = (
+        torch.randn(bounds[-1], 56, 128, generator=generator)
+        .to(torch.bfloat16)
+        .to(device)
+        for _ in range(3)
+    )
+    cu = torch.tensor(bounds, dtype=torch.int32, device=device)
+    routes = (
+        ops.minimax_h3_sm120_varlen_attention_nvfp4,
+        ops.minimax_h3_sm120_varlen_attention_nvfp4_nodelta,
+    )
+    outs = [
+        (fn(q, k, v, cu, cu_seqlens_host=bounds), fn(q, k, v, cu, cu_seqlens_host=bounds))
+        for fn in routes
+    ]
+    torch.cuda.synchronize()
+    ops._OVERLAP_WIDTH = {}
+    ops._NVFP4_LAUNCHES.clear()
+    for fn, (first, again) in zip(routes, outs):
+        separate = fn(q, k, v, cu, cu_seqlens_host=bounds)
+        torch.cuda.synchronize()
+        assert torch.equal(first, separate) and torch.equal(again, separate)
+    print("SERIALIZED_OK")
+    """
+)
+
+
+@requires_sm120
+def test_minimax_h3_sm120_varlen_attention_nvfp4_serialized_launches(
+    monkeypatch,
+) -> None:
+    """With ``CUDA_LAUNCH_BLOCKING=1`` every launch completes before the next one starts, so no programmatic
+    dependent overlaps its primary: the overlapped form still completes (its producers run first and finish
+    on their own) and matches the separate launches bit for bit, both routes, the first call included.  Run
+    in a subprocess with a deadline."""
+    device = torch.device("cuda:0")
+    # build the programs of both forms here first, so the subprocess only loads them
+    cu, ((q, k, v),), _ = _fused_case(device, (49,))
+    for delta in (True, False):
+        _route(delta)(q, k, v, cu, cu_seqlens_host=FUSED_CU_SEQLENS)
+    monkeypatch.setattr(nvfp4_ops, "_NVFP4_LAUNCHES", OrderedDict())
+    monkeypatch.setattr(nvfp4_ops, "_OVERLAP_WIDTH", {})
+    for delta in (True, False):
+        _route(delta)(q, k, v, cu, cu_seqlens_host=FUSED_CU_SEQLENS)
+    torch.cuda.synchronize()
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", _SERIALIZED_SCRIPT],
+            env=dict(os.environ, CUDA_LAUNCH_BLOCKING="1"),
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("overlapped calls with serialized launches did not finish in 600 s")
+    stderr_tail = result.stderr[-4000:]
+    assert result.returncode == 0 and "SERIALIZED_OK" in result.stdout, stderr_tail
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "cu_seqlens",
+    [
+        (0, 1100, 2100),
+        (0, 257, 4567, 4824),
+        (0, 4096),
+        (0, 8368, 16736, 25104, 33472),
+    ],
+)
+def test_minimax_h3_sm120_varlen_attention_nvfp4_nodelta_producer_builds_are_bitwise(
+    cu_seqlens, monkeypatch
+) -> None:
+    """The overlapped form's two producer builds, ``PREPROCESS_HEAD_MAJOR`` and ``PREPROCESS_HEAD_MAJOR_KA``
+    (a K item waits for its head's K sums in the worker's second warp), give bit-identical outputs of the
+    uncompensated route: each in turn produces for the lead and tail the host routes on this device (on 188
+    SMs the host's own producers are ``PREPROCESS_HEAD_MAJOR_KA``), two calls each, the first included."""
+    device = torch.device("cuda:0")
+    num_sms = nvfp4_ops._sm_count(0)
+    if num_sms not in nvfp4_ops._OVERLAP_WIDTH:
+        pytest.skip(f"no overlapped form on {num_sms} SMs")
+    q, k, v = synthetic_inputs(
+        cu_seqlens[-1], MINIMAX_H3_NUM_HEADS, seed=67, device=device
+    )
+    cu = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
+    host_programs = nvfp4_ops.minimax_h3_sm120_nvfp4_programs
+    producers = (nvfp4_ops.PREPROCESS_HEAD_MAJOR, nvfp4_ops.PREPROCESS_HEAD_MAJOR_KA)
+    outs, routed_producers = [], []
+    for producer in producers:
+
+        def programs(plan, sms, *, delta=True, _producer=producer):
+            routed = host_programs(plan, sms, delta=delta)
+            if routed[0] in producers:
+                routed_producers.append(routed[0])
+                return (_producer, *routed[1:])
+            return routed
+
+        monkeypatch.setattr(nvfp4_ops, "minimax_h3_sm120_nvfp4_programs", programs)
+        monkeypatch.setattr(nvfp4_ops, "_NVFP4_LAUNCHES", OrderedDict())
+        monkeypatch.setattr(nvfp4_ops, "_NVFP4_OVERLAP_LOADED", set())
+        first = minimax_h3_sm120_varlen_attention_nvfp4_nodelta(
+            q, k, v, cu, cu_seqlens_host=cu_seqlens
+        )
+        again = minimax_h3_sm120_varlen_attention_nvfp4_nodelta(
+            q, k, v, cu, cu_seqlens_host=cu_seqlens
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(first, again)
+        outs.append(first)
+    assert len(routed_producers) >= 2, "the plan did not take the overlapped form"
+    if num_sms in nvfp4_ops._OVERLAP_WS_NODELTA_SMS:
+        assert all(p is nvfp4_ops.PREPROCESS_HEAD_MAJOR_KA for p in routed_producers)
+    else:
+        assert all(p is nvfp4_ops.PREPROCESS_HEAD_MAJOR for p in routed_producers)
+    assert torch.equal(outs[0], outs[1])
+
+
+@requires_sm120
+@pytest.mark.parametrize(
+    "cu_seqlens",
+    [
+        (0, 1100, 2100),
+        (0, 257, 4567, 4824),
+        (0, 4096),
+        (0, 8368, 16736, 25104, 33472),
+    ],
+)
+def test_minimax_h3_sm120_varlen_attention_nvfp4_sfsel_lead_tail_are_bitwise(
+    cu_seqlens, monkeypatch
+) -> None:
+    """The compensated overlapped form's two lead / tail builds, ``ATTENTION_LEAD`` / ``ATTENTION_TAIL`` and
+    ``ATTENTION_SFSEL_LEAD`` / ``ATTENTION_SFSEL_TAIL`` (each MMA selects its tile's B scale record), give
+    bit-identical outputs: each pair in turn runs as the lead and tail of the overlapped form the host routes on
+    this device (on 170 SMs the host's own pair is the second for a plan above the fused pre-processing, the
+    first for a plan of it), two calls each, the first included."""
+    device = torch.device("cuda:0")
+    num_sms = nvfp4_ops._sm_count(0)
+    if num_sms not in nvfp4_ops._OVERLAP_WIDTH:
+        pytest.skip(f"no overlapped form on {num_sms} SMs")
+    q, k, v = synthetic_inputs(
+        cu_seqlens[-1], MINIMAX_H3_NUM_HEADS, seed=71, device=device
+    )
+    cu = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
+    host_programs = nvfp4_ops.minimax_h3_sm120_nvfp4_programs
+    pairs = (
+        (nvfp4_ops.ATTENTION_LEAD, nvfp4_ops.ATTENTION_TAIL),
+        (nvfp4_ops.ATTENTION_SFSEL_LEAD, nvfp4_ops.ATTENTION_SFSEL_TAIL),
+    )
+    outs, routed_pairs = [], []
+    for pair in pairs:
+
+        def programs(plan, sms, *, delta=True, _pair=pair):
+            routed = host_programs(plan, sms, delta=delta)
+            if tuple(routed[1:]) in pairs:
+                routed_pairs.append(tuple(routed[1:]))
+                return (routed[0], *_pair)
+            return routed
+
+        monkeypatch.setattr(nvfp4_ops, "minimax_h3_sm120_nvfp4_programs", programs)
+        monkeypatch.setattr(nvfp4_ops, "_NVFP4_LAUNCHES", OrderedDict())
+        monkeypatch.setattr(nvfp4_ops, "_NVFP4_OVERLAP_LOADED", set())
+        first = minimax_h3_sm120_varlen_attention_nvfp4(
+            q, k, v, cu, cu_seqlens_host=cu_seqlens
+        )
+        again = minimax_h3_sm120_varlen_attention_nvfp4(
+            q, k, v, cu, cu_seqlens_host=cu_seqlens
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(first, again)
+        outs.append(first)
+    assert len(routed_pairs) >= 2, "the plan did not take the overlapped form"
+    padded = -(-cu_seqlens[-1] // 128) * 128
+    fused = (
+        nvfp4_ops._PREPROCESS_MIN_TOKENS <= padded <= nvfp4_ops._PREPROCESS_MAX_TOKENS
+    )
+    sfsel = num_sms in nvfp4_ops._OVERLAP_SFSEL_SMS and not fused
+    expected = pairs[1] if sfsel else pairs[0]
+    assert all(p[0] is expected[0] and p[1] is expected[1] for p in routed_pairs)
+    assert torch.equal(outs[0], outs[1])

@@ -211,6 +211,7 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
     fp8_unit_sfa_main[0] = fp8_unit_word_main[0];
     fp8_unit_sfb_main[0] = fp8_unit_word_main[0];
     unsigned int _phase_q_full_0 = 0;
+    unsigned int _phase_k_full = 0;
     #pragma unroll 1
     for (int slot = bid; slot < total_units; slot += num_bids) {
         int seg = unit_table[2 * slot];
@@ -387,7 +388,7 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
             : "memory");
         #pragma unroll 1
         for (int kb = kb_first; kb < kb_last + 1; kb++) {
-            mbarrier_wait(k_full_addr + (kv_stage) * 8, kv_phase);
+            mbarrier_wait(k_full_addr + (kv_stage) * 8, _phase_k_full);
             asm volatile("barrier.sync %0, 256;" :: "r"(1 + warp / 4) : "memory");
             asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                 : "=r"(k_frag[0]), "=r"(k_frag[1]), "=r"(k_frag[2]), "=r"(k_frag[3])
@@ -1266,7 +1267,7 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
                                        "f"(p_tmp[6]), "f"(p_tmp[7]));
                 p_frag[15] = _packed;
             }
-            mbarrier_wait(v_full_addr + (kv_stage) * 8, kv_phase);
+            mbarrier_wait(v_full_addr + (kv_stage) * 8, _phase_k_full);
             asm volatile("barrier.sync %0, 256;" :: "r"(1 + warp / 4) : "memory");
             asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                 : "=r"(v_frag[0]), "=r"(v_frag[1]), "=r"(v_frag[2]), "=r"(v_frag[3])
@@ -1595,7 +1596,7 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
                 mbarrier_arrive(v_empty_addr + (kv_stage) * 8);
             }
             if (warp == 0) {
-                mbarrier_wait(k_empty_addr + (kv_stage) * 8, kv_phase);
+                mbarrier_wait(k_empty_addr + (kv_stage) * 8, _phase_k_full);
             }
             if (kb_last >= kb + 2) {
                 if (warp == 0) {
@@ -1647,7 +1648,7 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
                 }
             }
             if (warp == 4) {
-                mbarrier_wait(v_empty_addr + (kv_stage) * 8, kv_phase);
+                mbarrier_wait(v_empty_addr + (kv_stage) * 8, _phase_k_full);
             }
             if (kb_last >= kb + 2) {
                 if (warp == 4) {
@@ -1686,7 +1687,7 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
                 }
             }
             kv_stage += 1;
-            if (kv_stage == 2) { kv_stage = 0; kv_phase ^= 1; }
+            if (kv_stage == 2) { kv_stage = 0; _phase_k_full ^= 1; }
         }
         float l0 = l_state[0];
         float l1 = l_state[1];
@@ -1720,13 +1721,13 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
             reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2))[0] = reinterpret_cast<unsigned*>(_packed_0)[0];
         }
         if (row1 < seg_end_v) {
-            unsigned int _packed_1[1];
+            unsigned int _packed_32_0[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 2], o_tmp[_lp*2+1 + 2]));
-                _packed_1[_lp] = *(uint32_t*)&_bf2;
+                _packed_32_0[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2))[0] = reinterpret_cast<unsigned*>(_packed_1)[0];
+            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2))[0] = reinterpret_cast<unsigned*>(_packed_32_0)[0];
         }
         float _vec_load_1[2];
         {
@@ -1739,22 +1740,22 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         o_tmp[2] = o_acc[6] * inv1 * _vec_load_1[0];
         o_tmp[3] = o_acc[7] * inv1 * _vec_load_1[1];
         if (row0 < seg_end_v) {
-            unsigned int _packed_2[1];
+            unsigned int _packed_1[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 0], o_tmp[_lp*2+1 + 0]));
-                _packed_2[_lp] = *(uint32_t*)&_bf2;
+                _packed_1[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 8))[0] = reinterpret_cast<unsigned*>(_packed_2)[0];
+            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 8))[0] = reinterpret_cast<unsigned*>(_packed_1)[0];
         }
         if (row1 < seg_end_v) {
-            unsigned int _packed_3[1];
+            unsigned int _packed_32_1[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 2], o_tmp[_lp*2+1 + 2]));
-                _packed_3[_lp] = *(uint32_t*)&_bf2;
+                _packed_32_1[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 8))[0] = reinterpret_cast<unsigned*>(_packed_3)[0];
+            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 8))[0] = reinterpret_cast<unsigned*>(_packed_32_1)[0];
         }
         float _vec_load_2[2];
         {
@@ -1767,22 +1768,22 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         o_tmp[2] = o_acc[10] * inv1 * _vec_load_2[0];
         o_tmp[3] = o_acc[11] * inv1 * _vec_load_2[1];
         if (row0 < seg_end_v) {
-            unsigned int _packed_4[1];
+            unsigned int _packed_2[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 0], o_tmp[_lp*2+1 + 0]));
-                _packed_4[_lp] = *(uint32_t*)&_bf2;
+                _packed_2[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 16))[0] = reinterpret_cast<unsigned*>(_packed_4)[0];
+            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 16))[0] = reinterpret_cast<unsigned*>(_packed_2)[0];
         }
         if (row1 < seg_end_v) {
-            unsigned int _packed_5[1];
+            unsigned int _packed_32_2[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 2], o_tmp[_lp*2+1 + 2]));
-                _packed_5[_lp] = *(uint32_t*)&_bf2;
+                _packed_32_2[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 16))[0] = reinterpret_cast<unsigned*>(_packed_5)[0];
+            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 16))[0] = reinterpret_cast<unsigned*>(_packed_32_2)[0];
         }
         float _vec_load_3[2];
         {
@@ -1795,22 +1796,22 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         o_tmp[2] = o_acc[14] * inv1 * _vec_load_3[0];
         o_tmp[3] = o_acc[15] * inv1 * _vec_load_3[1];
         if (row0 < seg_end_v) {
-            unsigned int _packed_6[1];
+            unsigned int _packed_3[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 0], o_tmp[_lp*2+1 + 0]));
-                _packed_6[_lp] = *(uint32_t*)&_bf2;
+                _packed_3[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 24))[0] = reinterpret_cast<unsigned*>(_packed_6)[0];
+            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 24))[0] = reinterpret_cast<unsigned*>(_packed_3)[0];
         }
         if (row1 < seg_end_v) {
-            unsigned int _packed_7[1];
+            unsigned int _packed_32_3[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 2], o_tmp[_lp*2+1 + 2]));
-                _packed_7[_lp] = *(uint32_t*)&_bf2;
+                _packed_32_3[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 24))[0] = reinterpret_cast<unsigned*>(_packed_7)[0];
+            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 24))[0] = reinterpret_cast<unsigned*>(_packed_32_3)[0];
         }
         float _vec_load_4[2];
         {
@@ -1823,22 +1824,22 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         o_tmp[2] = o_acc[18] * inv1 * _vec_load_4[0];
         o_tmp[3] = o_acc[19] * inv1 * _vec_load_4[1];
         if (row0 < seg_end_v) {
-            unsigned int _packed_8[1];
+            unsigned int _packed_4[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 0], o_tmp[_lp*2+1 + 0]));
-                _packed_8[_lp] = *(uint32_t*)&_bf2;
+                _packed_4[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 32))[0] = reinterpret_cast<unsigned*>(_packed_8)[0];
+            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 32))[0] = reinterpret_cast<unsigned*>(_packed_4)[0];
         }
         if (row1 < seg_end_v) {
-            unsigned int _packed_9[1];
+            unsigned int _packed_32_4[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 2], o_tmp[_lp*2+1 + 2]));
-                _packed_9[_lp] = *(uint32_t*)&_bf2;
+                _packed_32_4[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 32))[0] = reinterpret_cast<unsigned*>(_packed_9)[0];
+            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 32))[0] = reinterpret_cast<unsigned*>(_packed_32_4)[0];
         }
         float _vec_load_5[2];
         {
@@ -1851,22 +1852,22 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         o_tmp[2] = o_acc[22] * inv1 * _vec_load_5[0];
         o_tmp[3] = o_acc[23] * inv1 * _vec_load_5[1];
         if (row0 < seg_end_v) {
-            unsigned int _packed_10[1];
+            unsigned int _packed_5[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 0], o_tmp[_lp*2+1 + 0]));
-                _packed_10[_lp] = *(uint32_t*)&_bf2;
+                _packed_5[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 40))[0] = reinterpret_cast<unsigned*>(_packed_10)[0];
+            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 40))[0] = reinterpret_cast<unsigned*>(_packed_5)[0];
         }
         if (row1 < seg_end_v) {
-            unsigned int _packed_11[1];
+            unsigned int _packed_32_5[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 2], o_tmp[_lp*2+1 + 2]));
-                _packed_11[_lp] = *(uint32_t*)&_bf2;
+                _packed_32_5[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 40))[0] = reinterpret_cast<unsigned*>(_packed_11)[0];
+            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 40))[0] = reinterpret_cast<unsigned*>(_packed_32_5)[0];
         }
         float _vec_load_6[2];
         {
@@ -1879,22 +1880,22 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         o_tmp[2] = o_acc[26] * inv1 * _vec_load_6[0];
         o_tmp[3] = o_acc[27] * inv1 * _vec_load_6[1];
         if (row0 < seg_end_v) {
-            unsigned int _packed_12[1];
+            unsigned int _packed_6[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 0], o_tmp[_lp*2+1 + 0]));
-                _packed_12[_lp] = *(uint32_t*)&_bf2;
+                _packed_6[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 48))[0] = reinterpret_cast<unsigned*>(_packed_12)[0];
+            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 48))[0] = reinterpret_cast<unsigned*>(_packed_6)[0];
         }
         if (row1 < seg_end_v) {
-            unsigned int _packed_13[1];
+            unsigned int _packed_32_6[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 2], o_tmp[_lp*2+1 + 2]));
-                _packed_13[_lp] = *(uint32_t*)&_bf2;
+                _packed_32_6[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 48))[0] = reinterpret_cast<unsigned*>(_packed_13)[0];
+            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 48))[0] = reinterpret_cast<unsigned*>(_packed_32_6)[0];
         }
         float _vec_load_7[2];
         {
@@ -1907,22 +1908,22 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         o_tmp[2] = o_acc[30] * inv1 * _vec_load_7[0];
         o_tmp[3] = o_acc[31] * inv1 * _vec_load_7[1];
         if (row0 < seg_end_v) {
-            unsigned int _packed_14[1];
+            unsigned int _packed_7[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 0], o_tmp[_lp*2+1 + 0]));
-                _packed_14[_lp] = *(uint32_t*)&_bf2;
+                _packed_7[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 56))[0] = reinterpret_cast<unsigned*>(_packed_14)[0];
+            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 56))[0] = reinterpret_cast<unsigned*>(_packed_7)[0];
         }
         if (row1 < seg_end_v) {
-            unsigned int _packed_15[1];
+            unsigned int _packed_32_7[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 2], o_tmp[_lp*2+1 + 2]));
-                _packed_15[_lp] = *(uint32_t*)&_bf2;
+                _packed_32_7[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 56))[0] = reinterpret_cast<unsigned*>(_packed_15)[0];
+            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 56))[0] = reinterpret_cast<unsigned*>(_packed_32_7)[0];
         }
         float _vec_load_8[2];
         {
@@ -1935,22 +1936,22 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         o_tmp[2] = o_acc[34] * inv1 * _vec_load_8[0];
         o_tmp[3] = o_acc[35] * inv1 * _vec_load_8[1];
         if (row0 < seg_end_v) {
-            unsigned int _packed_16[1];
+            unsigned int _packed_8[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 0], o_tmp[_lp*2+1 + 0]));
-                _packed_16[_lp] = *(uint32_t*)&_bf2;
+                _packed_8[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 64))[0] = reinterpret_cast<unsigned*>(_packed_16)[0];
+            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 64))[0] = reinterpret_cast<unsigned*>(_packed_8)[0];
         }
         if (row1 < seg_end_v) {
-            unsigned int _packed_17[1];
+            unsigned int _packed_32_8[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 2], o_tmp[_lp*2+1 + 2]));
-                _packed_17[_lp] = *(uint32_t*)&_bf2;
+                _packed_32_8[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 64))[0] = reinterpret_cast<unsigned*>(_packed_17)[0];
+            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 64))[0] = reinterpret_cast<unsigned*>(_packed_32_8)[0];
         }
         float _vec_load_9[2];
         {
@@ -1963,22 +1964,22 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         o_tmp[2] = o_acc[38] * inv1 * _vec_load_9[0];
         o_tmp[3] = o_acc[39] * inv1 * _vec_load_9[1];
         if (row0 < seg_end_v) {
-            unsigned int _packed_18[1];
+            unsigned int _packed_9[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 0], o_tmp[_lp*2+1 + 0]));
-                _packed_18[_lp] = *(uint32_t*)&_bf2;
+                _packed_9[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 72))[0] = reinterpret_cast<unsigned*>(_packed_18)[0];
+            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 72))[0] = reinterpret_cast<unsigned*>(_packed_9)[0];
         }
         if (row1 < seg_end_v) {
-            unsigned int _packed_19[1];
+            unsigned int _packed_32_9[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 2], o_tmp[_lp*2+1 + 2]));
-                _packed_19[_lp] = *(uint32_t*)&_bf2;
+                _packed_32_9[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 72))[0] = reinterpret_cast<unsigned*>(_packed_19)[0];
+            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 72))[0] = reinterpret_cast<unsigned*>(_packed_32_9)[0];
         }
         float _vec_load_10[2];
         {
@@ -1991,22 +1992,22 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         o_tmp[2] = o_acc[42] * inv1 * _vec_load_10[0];
         o_tmp[3] = o_acc[43] * inv1 * _vec_load_10[1];
         if (row0 < seg_end_v) {
-            unsigned int _packed_20[1];
+            unsigned int _packed_10[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 0], o_tmp[_lp*2+1 + 0]));
-                _packed_20[_lp] = *(uint32_t*)&_bf2;
+                _packed_10[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 80))[0] = reinterpret_cast<unsigned*>(_packed_20)[0];
+            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 80))[0] = reinterpret_cast<unsigned*>(_packed_10)[0];
         }
         if (row1 < seg_end_v) {
-            unsigned int _packed_21[1];
+            unsigned int _packed_32_10[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 2], o_tmp[_lp*2+1 + 2]));
-                _packed_21[_lp] = *(uint32_t*)&_bf2;
+                _packed_32_10[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 80))[0] = reinterpret_cast<unsigned*>(_packed_21)[0];
+            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 80))[0] = reinterpret_cast<unsigned*>(_packed_32_10)[0];
         }
         float _vec_load_11[2];
         {
@@ -2019,22 +2020,22 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         o_tmp[2] = o_acc[46] * inv1 * _vec_load_11[0];
         o_tmp[3] = o_acc[47] * inv1 * _vec_load_11[1];
         if (row0 < seg_end_v) {
-            unsigned int _packed_22[1];
+            unsigned int _packed_11[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 0], o_tmp[_lp*2+1 + 0]));
-                _packed_22[_lp] = *(uint32_t*)&_bf2;
+                _packed_11[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 88))[0] = reinterpret_cast<unsigned*>(_packed_22)[0];
+            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 88))[0] = reinterpret_cast<unsigned*>(_packed_11)[0];
         }
         if (row1 < seg_end_v) {
-            unsigned int _packed_23[1];
+            unsigned int _packed_32_11[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 2], o_tmp[_lp*2+1 + 2]));
-                _packed_23[_lp] = *(uint32_t*)&_bf2;
+                _packed_32_11[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 88))[0] = reinterpret_cast<unsigned*>(_packed_23)[0];
+            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 88))[0] = reinterpret_cast<unsigned*>(_packed_32_11)[0];
         }
         float _vec_load_12[2];
         {
@@ -2047,22 +2048,22 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         o_tmp[2] = o_acc[50] * inv1 * _vec_load_12[0];
         o_tmp[3] = o_acc[51] * inv1 * _vec_load_12[1];
         if (row0 < seg_end_v) {
-            unsigned int _packed_24[1];
+            unsigned int _packed_12[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 0], o_tmp[_lp*2+1 + 0]));
-                _packed_24[_lp] = *(uint32_t*)&_bf2;
+                _packed_12[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 96))[0] = reinterpret_cast<unsigned*>(_packed_24)[0];
+            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 96))[0] = reinterpret_cast<unsigned*>(_packed_12)[0];
         }
         if (row1 < seg_end_v) {
-            unsigned int _packed_25[1];
+            unsigned int _packed_32_12[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 2], o_tmp[_lp*2+1 + 2]));
-                _packed_25[_lp] = *(uint32_t*)&_bf2;
+                _packed_32_12[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 96))[0] = reinterpret_cast<unsigned*>(_packed_25)[0];
+            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 96))[0] = reinterpret_cast<unsigned*>(_packed_32_12)[0];
         }
         float _vec_load_13[2];
         {
@@ -2075,22 +2076,22 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         o_tmp[2] = o_acc[54] * inv1 * _vec_load_13[0];
         o_tmp[3] = o_acc[55] * inv1 * _vec_load_13[1];
         if (row0 < seg_end_v) {
-            unsigned int _packed_26[1];
+            unsigned int _packed_13[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 0], o_tmp[_lp*2+1 + 0]));
-                _packed_26[_lp] = *(uint32_t*)&_bf2;
+                _packed_13[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 104))[0] = reinterpret_cast<unsigned*>(_packed_26)[0];
+            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 104))[0] = reinterpret_cast<unsigned*>(_packed_13)[0];
         }
         if (row1 < seg_end_v) {
-            unsigned int _packed_27[1];
+            unsigned int _packed_32_13[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 2], o_tmp[_lp*2+1 + 2]));
-                _packed_27[_lp] = *(uint32_t*)&_bf2;
+                _packed_32_13[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 104))[0] = reinterpret_cast<unsigned*>(_packed_27)[0];
+            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 104))[0] = reinterpret_cast<unsigned*>(_packed_32_13)[0];
         }
         float _vec_load_14[2];
         {
@@ -2103,22 +2104,22 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         o_tmp[2] = o_acc[58] * inv1 * _vec_load_14[0];
         o_tmp[3] = o_acc[59] * inv1 * _vec_load_14[1];
         if (row0 < seg_end_v) {
-            unsigned int _packed_28[1];
+            unsigned int _packed_14[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 0], o_tmp[_lp*2+1 + 0]));
-                _packed_28[_lp] = *(uint32_t*)&_bf2;
+                _packed_14[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 112))[0] = reinterpret_cast<unsigned*>(_packed_28)[0];
+            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 112))[0] = reinterpret_cast<unsigned*>(_packed_14)[0];
         }
         if (row1 < seg_end_v) {
-            unsigned int _packed_29[1];
+            unsigned int _packed_32_14[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 2], o_tmp[_lp*2+1 + 2]));
-                _packed_29[_lp] = *(uint32_t*)&_bf2;
+                _packed_32_14[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 112))[0] = reinterpret_cast<unsigned*>(_packed_29)[0];
+            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 112))[0] = reinterpret_cast<unsigned*>(_packed_32_14)[0];
         }
         float _vec_load_15[2];
         {
@@ -2131,22 +2132,22 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         o_tmp[2] = o_acc[62] * inv1 * _vec_load_15[0];
         o_tmp[3] = o_acc[63] * inv1 * _vec_load_15[1];
         if (row0 < seg_end_v) {
-            unsigned int _packed_30[1];
+            unsigned int _packed_15[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 0], o_tmp[_lp*2+1 + 0]));
-                _packed_30[_lp] = *(uint32_t*)&_bf2;
+                _packed_15[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 120))[0] = reinterpret_cast<unsigned*>(_packed_30)[0];
+            reinterpret_cast<unsigned*>(O + ((row0 * num_heads + head) * 128 + (lane & 3) * 2 + 120))[0] = reinterpret_cast<unsigned*>(_packed_15)[0];
         }
         if (row1 < seg_end_v) {
-            unsigned int _packed_31[1];
+            unsigned int _packed_32_15[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(o_tmp[_lp*2 + 2], o_tmp[_lp*2+1 + 2]));
-                _packed_31[_lp] = *(uint32_t*)&_bf2;
+                _packed_32_15[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 120))[0] = reinterpret_cast<unsigned*>(_packed_31)[0];
+            reinterpret_cast<unsigned*>(O + ((row1 * num_heads + head) * 128 + (lane & 3) * 2 + 120))[0] = reinterpret_cast<unsigned*>(_packed_32_15)[0];
         }
     }
     if (warp < 4) {
