@@ -65,7 +65,7 @@
       "closure_sha256": "9e825aa34c11a4aa63eac161c2cdfdaa868d7859421b24a80bc2228d0f671bf9",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_rmsnorm_silu_gate_train_3c1aaebdec47df0111e4_sm_100a",
       "nvcc_flags": [
         "--prec-div=true",
@@ -272,7 +272,7 @@
       "closure_sha256": "a61a2d040b7c16e3b1249dc3b025199ab9e333873feff349aed163f0c1bbe5b5",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
-      "min_cuda": "12.8",
+      "min_cuda": "12.9",
       "name": "cake_rmsnorm_silu_gate_train_aeceb63b55b0c3368dc9_sm_100a",
       "nvcc_flags": [
         "--prec-div=true",
