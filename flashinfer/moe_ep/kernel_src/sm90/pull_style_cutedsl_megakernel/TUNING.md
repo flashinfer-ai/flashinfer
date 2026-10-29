@@ -923,8 +923,15 @@ join the candidates together with the selected table's tactics; tuning
 therefore always measures the default. H7168/I3072/E384/EP4 grows from 43
 to 49 candidates (51 where the bucket default is a folded N64 tile), and
 H2560/I640/E512/EP2 from 8 to 17 (19). NV candidates and NV cache
-provenance exclude these defaults, and the tail-pair candidates are still
-derived from the legacy table.
+provenance exclude these MXFP4 defaults. NV instead adds the N72/N80 tilings
+of its own bucket default (NV tuning version v3) when that default is a
+folded N64 tile. A scale-ring default is tiled on its lockstep (sf0) core:
+the two-slot ring needs four AB stages, which N72/N80 tiles do not fit.
+H7168/I3072/E384/EP4 NV tuning thus grows from 60 to 62 candidates above
+256 tokens. There the sf0 N72 tiling measured 0.89x the scale-ring default
+at 1024 tokens, N72 0.62x and 0.92x the NV default at 1152 and 2048 tokens,
+and N80 0.87x at 1280 tokens. The tail-pair candidates are still derived
+from the legacy table.
 
 Online `knobs="auto"` and offline `flashinfer.moe_ep.tune` use the same
 `hopper_mxfp4_candidates` list. The default public scorer takes

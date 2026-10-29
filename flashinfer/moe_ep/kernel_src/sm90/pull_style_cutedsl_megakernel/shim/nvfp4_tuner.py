@@ -11,6 +11,7 @@ from typing import Any
 
 from .nvfp4_policy import split_nvfp4_conversion_tactic, validate_nvfp4_kperm
 from .mxfp4_optimization import (
+    _row_tile_variants,
     hopper_mxfp4_candidates,
     normalize_mxfp4_optimization_tactic,
     resolve_mxfp4_tactic_optimizations,
@@ -19,11 +20,13 @@ from .nvfp4_candidate_data import (
     NVFP4_SF0_CANDIDATE_SEEDS,
     _H200_REFERENCE,
     NVFP4_DEFAULT_TACTICS_BY_TOKENS,
+    NVFP4_SF0_DEFAULT_CORES_BY_TOKENS,
     NVFP4_SF2_CANDIDATE_SEEDS,
     _scale_ring_tactic,
 )
 
-NVFP4_TUNING_VERSION = "nvfp4_single_k64_scale_ring_candidates_v2"
+# v3: the candidates include the N72/N80 tilings of the bucket default.
+NVFP4_TUNING_VERSION = "nvfp4_single_k64_scale_ring_candidates_v3"
 
 
 def normalize_hopper_nvfp4_tactic(tactic: Mapping[str, Any]) -> dict[str, Any]:
@@ -133,6 +136,12 @@ def hopper_nvfp4_candidates(
     )
     seeds.extend(NVFP4_SF0_CANDIDATE_SEEDS)
     seeds.extend(NVFP4_SF2_CANDIDATE_SEEDS)
+    # One N72/N80 task holds an expert's 65-72/65-80 rows where N64 needs a
+    # second, nearly empty tile; offer both tilings of this capacity's default
+    # (of its sf0 core, as the scale ring fits only N64 tiles).
+    buckets = tuple(NVFP4_DEFAULT_TACTICS_BY_TOKENS)
+    bucket = next((value for value in buckets if value >= max_tokens), buckets[-1])
+    seeds.extend(_row_tile_variants(NVFP4_SF0_DEFAULT_CORES_BY_TOKENS[bucket]).values())
     result = []
     for seed in seeds:
         try:
