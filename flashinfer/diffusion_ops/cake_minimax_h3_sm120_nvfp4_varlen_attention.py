@@ -161,7 +161,7 @@ _OVERLAP_WSIL_MIN_SEGMENT = {188: 2560}
 # (no entry: never), with the overlap width ``_OVERLAP_WIDTH_LONG``.  On 170 SMs both routes and on 188 SMs the
 # compensated route overlap every such plan: the hidden pre-processing pays for the overlap attention's per-unit Q
 # load at any segment length.  On 188 SMs the uncompensated route overlaps such a plan up to an attention-weighted
-# mean segment of 40960 tokens; above it the separate launches with the warp-specialised attention
+# mean segment of 53248 tokens; above it the separate launches with the warp-specialised attention
 # (``ATTENTION_WS_NODELTA``, three warps per SM sub-partition) finish first, unless the plan's mean segment keeps
 # the separate launches on the base attention (``_warp_specialised``), which keeps the overlap.
 _OVERLAP_WIDTH_LONG = {170: 64, 188: 46}
@@ -169,7 +169,7 @@ _OVERLAP_LONG_MAX_SEGMENT = {
     (170, True): 1 << 40,
     (170, False): 1 << 40,
     (188, True): 1 << 40,
-    (188, False): 40960,
+    (188, False): 53248,
 }
 # The overlapped form of a plan of the fused pre-processing whose attention-weighted mean segment length (the sum of
 # the squared segment lengths over the token count: the attention work per pre-processed token) is short is bound

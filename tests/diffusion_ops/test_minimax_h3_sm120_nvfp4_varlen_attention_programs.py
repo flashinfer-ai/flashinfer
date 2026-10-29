@@ -513,7 +513,7 @@ def test_fused_plans_take_the_overlapped_form_on_the_overlap_sm_counts(
         ((0, 33472), 170, True, True),
         ((0, 33472), 188, True, True),
         # the compensated route overlaps every long plan on 170 and 188 SMs; on 188 SMs the uncompensated route
-        # overlaps up to an attention-weighted mean segment of 40960 tokens
+        # overlaps up to an attention-weighted mean segment of 53248 tokens
         ((0, 36864), 188, True, True),
         ((0, 36865), 188, True, True),
         ((0, 38592), 188, True, True),
@@ -521,15 +521,19 @@ def test_fused_plans_take_the_overlapped_form_on_the_overlap_sm_counts(
         ((0, 40960), 170, True, True),
         ((0, 40960), 188, True, True),
         ((0, 40961), 170, True, True),
-        ((0, 40961), 188, True, False),
+        ((0, 40961), 188, True, True),
         ((0, 48768), 170, True, True),
-        ((0, 48768), 188, True, False),
+        ((0, 48768), 188, True, True),
+        ((0, 53248), 188, True, True),
+        ((0, 53249), 170, True, True),
+        ((0, 53249), 188, True, False),
+        ((0, 58944), 188, True, False),
         ((0, 109901, 109952), 170, True, True),
         ((0, 109901, 109952), 188, True, False),
         # a plan whose separate launches would not take the warp-specialised attention (mean segment, empty
         # segments included, below 1536 tokens) keeps the overlap
-        ((0,) * 33 + (49152,), 188, True, True),
-        ((0,) * 32 + (49152,), 188, True, False),
+        ((0,) * 38 + (57344,), 188, True, True),
+        ((0,) * 37 + (57344,), 188, True, False),
     ],
 )
 def test_long_plans_take_the_overlapped_form_below_the_segment_bound(
@@ -564,15 +568,16 @@ def test_long_plans_take_the_overlapped_form_below_the_segment_bound(
         ((0, 257, 4567, 4824), OVERLAP_WS_NODELTA_WSIL),
         ((0, 4096), OVERLAP_WS_NODELTA_WSIL),
         ((0, 16384), OVERLAP_WS_NODELTA_WSIL),
-        # long plans up to an attention-weighted mean segment of 40960 tokens
+        # long plans up to an attention-weighted mean segment of 53248 tokens
         ((0,) + tuple(2048 * i for i in range(1, 41)), OVERLAP_WS_NODELTA),
         ((0,) + tuple(2560 * i for i in range(1, 8)), OVERLAP_WS_NODELTA_WSIL),
         ((0, 8368, 16736, 25104, 33472), OVERLAP_WS_NODELTA_WSIL),
         ((0, 33472), OVERLAP_WS_NODELTA_WSIL),
         ((0, 38592), OVERLAP_WS_NODELTA_WSIL),
-        ((0, 40960), OVERLAP_WS_NODELTA_WSIL),
+        ((0, 48768), OVERLAP_WS_NODELTA_WSIL),
+        ((0, 53248), OVERLAP_WS_NODELTA_WSIL),
         # above it the separate launches with the warp-specialised attention
-        ((0, 40961), (STATS, QUANTIZE_KV_HBLK64, ATTENTION_WS_NODELTA)),
+        ((0, 53249), (STATS, QUANTIZE_KV_HBLK64, ATTENTION_WS_NODELTA)),
         ((0, 58944), (STATS, QUANTIZE_KV_HBLK64, ATTENTION_WS_NODELTA)),
         ((0, 109901, 109952), (STATS, QUANTIZE_KV_HBLK64, ATTENTION_WS_NODELTA)),
         # a plan below the fused pre-processing keeps the separate launches
