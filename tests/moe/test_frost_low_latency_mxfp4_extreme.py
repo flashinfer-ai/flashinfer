@@ -159,9 +159,17 @@ def test_mxfp4_fc2_mixed_scale_rows_live_graph(tactic):
 @pytest.mark.parametrize("activation", [SiLU(), SwiGLU()])
 @pytest.mark.parametrize("hidden", [256, 2048])
 @pytest.mark.parametrize(
-    "tactic", [("ffma", 2, 4), ("ffma", 2, 4, 8, 8), ("ffma", 2, 4, 2)]
+    "tactic,shared_expert",
+    [
+        (("ffma", 2, 4), False),
+        (("ffma", 2, 4, 8, 8), False),
+        (("ffma", 2, 4, 2), False),
+        pytest.param(("ffma", 2, 4, 2), True, id="grouped-shared"),
+    ],
 )
-def test_mxfp4_fc1_mixed_scale_rows_live_graph(tactic, activation, hidden):
+def test_mxfp4_fc1_mixed_scale_rows_live_graph(
+    tactic, shared_expert, activation, hidden
+):
     cfg, x, ids, scores, pack, view = _inputs(activation, index=1)
     logical_i = cfg.experts.intermediate_size
     branches = 2 if activation.is_gated else 1
@@ -191,8 +199,13 @@ def test_mxfp4_fc1_mixed_scale_rows_live_graph(tactic, activation, hidden):
     runner = FrostLowLatencyRunner(cfg, x.device)
     runner.check_support()
     runner.build()
-    # Unique experts also exercise the grouped tactic's single-route fallback.
-    assert ids.unique().numel() == ids.numel()
+    if shared_expert:
+        # Repeated expert IDs enter the grouped FC1 body for mixed-scale rows.
+        ids.zero_()
+        assert ids.numel() >= tactic[3]
+    else:
+        # Unique experts exercise the grouped tactic's single-route fallback.
+        assert ids.unique().numel() == ids.numel()
     scores.fill_(1.0)
     physical_i = view["fc1_expert_weights"].shape[1] // branches
     input_value = 2.0**-120
