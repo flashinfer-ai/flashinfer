@@ -273,6 +273,8 @@ def quantize_mok_mxfp8_weights(gate, up, down):
     ``forward`` (and its first two entries to ``recompute_forward_context``)
     and ``backward_weights`` to ``backward``. Requantize after every weight
     update; weight gradients are returned in BF16 (or FP32 accumulators).
+    CUDA tensors are quantized by fused kernels without host synchronization
+    (CUDA Graph capturable).
     """
     from .mxfp8 import quantize_routed_weights
 

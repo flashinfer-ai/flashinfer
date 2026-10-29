@@ -74,7 +74,10 @@ backward takes `(data, scales, data_t, scales_t)` for gate and up and the
 transposed `(data_t, scales_t)` pair for down. `quantize_mok_mxfp8_weights`
 produces both sets (E4M3 data, UE8M0 scales for 32-element blocks along the
 reduction dimension, tensor-core scale tiles `[E * rows / 128, cols / 128, 32,
-16]`). MXFP8 weight gradients are BF16 (or the FP32 accumulators).
+16]`). On CUDA tensors it launches one fused Triton kernel per operand
+layout, without host synchronization, so it can be captured in a CUDA Graph;
+without Triton, PyTorch operations produce the same bytes. MXFP8 weight
+gradients are BF16 (or the FP32 accumulators).
 
 `swiglu_limit` is a per-call runtime value; plain and clamped SwiGLU are
 separate kernel builds. `prepare_mok_bf16(clamped_swiglu=..., fp32_wgrad=...)`
@@ -268,7 +271,9 @@ Single-GPU tests:
   against the host reference and the expert layout against a torch reference,
   explicit and launcher-derived), the counter slab, the launch-geometry memo
   and the epilogues.
-- `tests/experimental/test_mok_mxfp8.py`: the weight quantizer, the fused MXFP8
+- `tests/experimental/test_mok_mxfp8.py`: the weight quantizer (fused kernel,
+  PyTorch path and reference byte-identical, NaN / infinity / zero blocks
+  included), the fused MXFP8
   forward and forward+backward against a quantization-aware reference (plain
   and clamped; routed and shared-expert gradients; BF16 or FP32
   weight-gradient accumulation), GLM-5.3-Flash local expert counts and MXFP8
