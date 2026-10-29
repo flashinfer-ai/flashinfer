@@ -1773,8 +1773,13 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         softmax_rescale_threshold_log2: float = 0.0,
         kv_cache_format: str = "native",
         extra_kv_cache_format: str = "native",
+        fixed_seqlen: bool = False,
     ):
-        """Initialize one selected physical tile profile over logical flat Q rows."""
+        """Initialize one selected physical tile profile over logical flat Q rows.
+
+        ``fixed_seqlen=False`` (default) makes the KV and Q lengths runtime
+        launch operands; ``True`` compiles for the exact static lengths.
+        """
         import cutlass as _cutlass
 
         if acc_dtype is None:
@@ -1811,6 +1816,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 softmax_rescale_threshold_log2, qkv_dtype=qkv_dtype
             )
         )
+        self.fixed_seqlen = fixed_seqlen
         self.output_quant = None
         # Sparse attention binds separate source lists; dense attention uses
         # the ordinary page table. Both reuse the staged KV loaders.
@@ -1869,6 +1875,15 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         self.acc_dtype = acc_dtype
         self.lse_dtype = lse_dtype
 
+    @property
+    def runtime_query_lengths(self) -> bool:
+        """Q lengths are runtime launch operands unless ``fixed_seqlen``.
+
+        Sparse MLA flattens Q rows into virtual batch items, so its physical Q
+        length is one and always stays compile-time; only KV is runtime.
+        """
+        return not self.fixed_seqlen and self.sparse_profile is None
+
     def _parallel_reduction_setup(self, cfg):
         """Select reducer geometry for complete D512 heads and the planned split capacity.
 
@@ -1923,7 +1938,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         )
         return (
             "reference",
-            grid[0],
+            None if self.runtime_query_lengths else grid[0],
             grid[1],
             smem,
             threads,
@@ -1934,6 +1949,10 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         """Return the complete batch-independent JIT identity."""
 
         cfg = dataclass_replace(self._make_config(), batch_size=1)
+        if self.runtime_query_lengths:
+            cfg = dataclass_replace(
+                cfg, seq_len_q=0, logical_seq_len_q=0, num_ctas_per_seq_q=0
+            )
         return (
             cfg,
             self.acc_dtype,
@@ -1994,17 +2013,48 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             )
         if self.split_kv_capacity is not None and cfg.use_multi_ctas_kv == 1:
             cfg = dataclass_replace(cfg, num_ctas_per_seq_kv=self.split_kv_capacity)
-        if self.runtime_kv_lengths:
-            representative_kv = cfg.tile_size_kv * cfg.num_insts_kv * 2 + 1
+        if not self.fixed_seqlen:
+            group = cfg.fixed_sparse_kv_tiles
             cfg = dataclass_replace(
                 cfg,
-                seq_len_kv=representative_kv,
-                max_num_pages_per_seq_kv=(
-                    representative_kv + cfg.num_tokens_per_page - 1
-                )
-                // cfg.num_tokens_per_page,
+                seq_len_kv=None,
+                max_num_pages_per_seq_kv=0,
+                sparse_instruction_group=group,
+                sparse_direct_capacities=tuple(
+                    int(x > 0) for x in cfg.sparse_direct_capacities
+                ),
             )
-        return dataclass_replace(cfg, lse_base_on_e=self.lse_base_on_e)
+        return dataclass_replace(
+            cfg,
+            fixed_seqlen=not self.runtime_query_lengths,
+            lse_base_on_e=self.lse_base_on_e,
+        )
+
+    def runtime_config(self, max_seq_len_q):
+        """Bind live Q dimensions without changing the selected resource topology."""
+        cfg = self._make_config()
+        if self.runtime_query_lengths:
+            if cfg.tile_size_q % cfg.logical_num_heads_q == 0:
+                queries_per_tile = cfg.tile_size_q // cfg.logical_num_heads_q
+                # Q bounds are nonnegative. Factor the static head ratio and
+                # use unsigned ceil division without a signed adjustment.
+                q_tiles = Int32(
+                    (cutlass.Uint32(max_seq_len_q) + queries_per_tile - 1)
+                    // queries_per_tile
+                )
+            elif cfg.logical_num_heads_q % cfg.tile_size_q == 0:
+                q_tiles = max_seq_len_q * (cfg.logical_num_heads_q // cfg.tile_size_q)
+            else:
+                q_tiles = (
+                    max_seq_len_q * cfg.logical_num_heads_q + cfg.tile_size_q - 1
+                ) // cfg.tile_size_q
+            cfg = dataclass_replace(
+                cfg,
+                logical_seq_len_q=max_seq_len_q,
+                seq_len_q=q_tiles,
+                num_ctas_per_seq_q=q_tiles,
+            )
+        return cfg
 
     def validate_split_kv_launch(self, split_kv: int, workspace) -> None:
         """Validate host-side split-KV arguments before compiling the JIT body."""
@@ -2077,9 +2127,10 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         output_scale: cutlass.Float32,
         stream: object,
         output_quant_args=None,
+        max_q_len: cutlass.Int32 = 0,
     ):
         """Execute throughput-latency 1CTA MLA with fixed or compact ragged Q."""
-        cfg = self._make_config()
+        cfg = self.runtime_config(max_q_len)
 
         # Public fixed tensors use [H,D,SQ,B]/[H,SQ,B]; compact ragged tensors
         # use [H,D,totalQ]/[H,totalQ]. Both flatten H x Q for TMA because the
@@ -2448,6 +2499,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             c_latent,
             q_latent,
             requested_splits=requested_splits,
+            max_q_len=max_q_len,
         ).launch(
             grid=grid,
             block=[cfg.threads_per_cta, 1, 1],
@@ -2494,6 +2546,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                     attention_sinks,
                     output_quant_args,
                     requested_splits=requested_splits,
+                    max_q_len=max_q_len,
                 )
                 if cutlass.const_expr(topology.cluster_size == 1):
                     parallel_reducer.launch(
@@ -2539,6 +2592,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 cu_seqlens_q,
                 cutlass.Int32(reduction_ctas),
                 requested_splits=requested_splits,
+                max_q_len=max_q_len,
             ).launch(
                 grid=reduction_grid,
                 block=[reduction_threads, 1, 1],
@@ -2575,9 +2629,10 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         c_latent: cute.Tensor = None,
         q_nope_tensor: cute.Tensor = None,
         requested_splits=None,
+        max_q_len: cutlass.Int32 = 0,
     ):
         """Execute one flat-Q, batch, KV-split, and V head-dimension tile."""
-        cfg = self._make_config()
+        cfg = self.runtime_config(max_q_len)
         if cutlass.const_expr(acc_o is not None):
             # Match the PDL launch before reading live metadata or sparse scales.
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
@@ -2589,12 +2644,16 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             request = None
             if cutlass.const_expr(cfg.use_persistent_scheduler != 1):
                 request = cutlass.Int64(cute.arch.block_idx()[2])
+            capacity = ((cutlass.Int32(si.shape[-1]) + 127) // 128) * 128
+            if cutlass.const_expr(cfg.sparse_direct_capacities[1] > 0):
+                capacity = capacity + ((cutlass.Int32(ci.shape[-1]) + 127) // 128) * 128
+            capacity = cute.math.max(cutlass.Int32(256), capacity)
             page_offsets, cache_seqs = bind_sparse_kv_indices(
                 si,
                 ci,
                 sl,
                 cl,
-                cfg.total_kv_tiles * cfg.tile_size_kv,
+                capacity,
                 query_row=request,
                 assume_valid_prefix=cfg.sparse_valid_prefix,
                 has_extra=cfg.sparse_direct_capacities[1] > 0,
@@ -2608,14 +2667,21 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         # once here; Q/O resources retain responsibility for logical-row
         # mapping, compact-ragged offsets, and padded-tail publication.
         cta_idx_x, cta_idx_head_dim_v, batch_idx = cute.arch.block_idx()
+        # Flat Q rows already include every logical head. The config requires
+        # one physical head tile, so decoding X never needs a runtime divide
+        # by the Q-tile count.
+        head_idx = Int32(0)
+        cta_idx_head_q = Int32(0)
         if cutlass.const_expr(cfg.use_cluster_reduction == 1):
-            cta_idx_x = cta_idx_x // Int32(cfg.num_ctas_per_seq_kv)
-            ctas_per_head_tile = Int32(cfg.num_ctas_per_seq_q)
-            cta_idx_head_q = cta_idx_x // ctas_per_head_tile
-            cta_idx_q = cta_idx_x - cta_idx_head_q * ctas_per_head_tile
+            cta_idx_q = cta_idx_x // Int32(cfg.num_ctas_per_seq_kv)
+            if cutlass.const_expr(not self.runtime_query_lengths):
+                cta_idx_head_q = cta_idx_q // Int32(cfg.num_ctas_per_seq_q)
+                cta_idx_q = cta_idx_q - cta_idx_head_q * Int32(cfg.num_ctas_per_seq_q)
             cta_idx_kv = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         elif cutlass.const_expr(
-            cfg.num_ctas_for_all_heads == 1 and cfg.num_ctas_per_seq_q == 1
+            not self.runtime_query_lengths
+            and cfg.num_ctas_for_all_heads == 1
+            and cfg.num_ctas_per_seq_q == 1
         ):
             cta_idx_head_q = Int32(0)
             cta_idx_q = Int32(0)
@@ -2626,11 +2692,16 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
                 if requested_splits is None
                 else runtime_split_count(requested_splits)
             )
-            ctas_per_head_tile = Int32(cfg.num_ctas_per_seq_q) * grid_splits
-            cta_idx_head_q = cta_idx_x // ctas_per_head_tile
-            cta_idx_x_in_head = cta_idx_x - cta_idx_head_q * ctas_per_head_tile
-            cta_idx_q = cta_idx_x_in_head // grid_splits
-            cta_idx_kv = cta_idx_x_in_head - cta_idx_q * grid_splits
+            if cutlass.const_expr(self.runtime_query_lengths):
+                cta_idx_head_q = Int32(0)
+                cta_idx_q = cta_idx_x // grid_splits
+                cta_idx_kv = cta_idx_x - cta_idx_q * grid_splits
+            else:
+                ctas_per_head_tile = Int32(cfg.num_ctas_per_seq_q) * grid_splits
+                cta_idx_head_q = cta_idx_x // ctas_per_head_tile
+                cta_idx_x_in_head = cta_idx_x - cta_idx_head_q * ctas_per_head_tile
+                cta_idx_q = cta_idx_x_in_head // grid_splits
+                cta_idx_kv = cta_idx_x_in_head - cta_idx_q * grid_splits
         head_idx = cta_idx_head_q * Int32(cfg.tile_size_q)
         run_task_graph = cutlass.Boolean(True)
         query_tile_is_active = cutlass.Boolean(True)
@@ -2862,9 +2933,10 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         cu_seqlens_q: cute.Tensor,
         num_reduction_ctas: cutlass.Int32,
         requested_splits=None,
+        max_q_len: cutlass.Int32 = 0,
     ):
         """Dispatch the throughput-latency split-KV reduction body."""
-        cfg = self._make_config()
+        cfg = self.runtime_config(max_q_len)
         run_gmem_reduction_kernel(
             self,
             output,
@@ -2890,10 +2962,11 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         attention_sinks: cute.Tensor | None = None,
         output_quant_args=None,
         requested_splits=None,
+        max_q_len: cutlass.Int32 = 0,
     ):
         """Dispatch the automatically selected parallel standalone reducer."""
 
-        cfg = self._make_config()
+        cfg = self.runtime_config(max_q_len)
         cfg, topology, elements = self._parallel_reduction_setup(cfg)
         run_parallel_gmem_reduction_kernel(
             output,

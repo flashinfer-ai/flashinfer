@@ -26,7 +26,7 @@
       "type": "const",
       "value": 1
     },
-    "max_seq_len_q": {
+    "max_q_len": {
       "type": "const",
       "value": 4,
       "description": "Query-length capacity frozen by plan()."

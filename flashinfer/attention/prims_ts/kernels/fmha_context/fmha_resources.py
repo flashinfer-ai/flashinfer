@@ -519,7 +519,7 @@ class FmhaConfig:
     # synthetic peer0 tail slot used by the general query-paired schedule.
     causal_single_kv_tile: bool = False
     window_size_left: int = 0
-    # Number of valid K/V rows in the final fixed-length dense tile. Zero
+    # Upper bound on valid K/V rows in the final dense tile. Zero
     # means that the K/V extent is tile-aligned (or that this specialization
     # does not use the fixed dense-tail mask).
     fixed_dense_k_tail: int = 0
@@ -1974,6 +1974,7 @@ class SmemPageOffsetsKvResource(MemoryResource):
                 tile_page_ids[chunk * 8 + i] = Int32(values[i])
         return tile_page_ids
 
+    # Stage the current K/V tile page IDs into its acquired SMEM ring slot.
     @cute.jit
     def _producer_load_page_offsets(
         self,
@@ -2917,6 +2918,9 @@ class TmemSPResource(MemoryResource):
     q_half: Constexpr[int] = 0
     enable_early_tile_sum: Constexpr[bool] = False
     q_offset_default: int | Int32 = field(init=False, default=0)
+    max_seq_len_kv: int | Int32 = field(init=False, default=0)
+    # Valid K/V rows of the final tile, computed once when the lengths bind.
+    k_tail_rows: int | Int32 = field(init=False, default=0)
     cum_seqlen_q: cute.Tensor | None = field(init=False, default=None)
     cum_seqlen_k: cute.Tensor | None = field(init=False, default=None)
     seq_lens_kv: cute.Pointer | None = field(init=False, default=None)
@@ -2995,6 +2999,7 @@ class TmemSPResource(MemoryResource):
         cum_seqlen_q: cute.Tensor | None = None,
         cum_seqlen_k: cute.Tensor | None = None,
         seq_lens_kv: cute.Pointer | None = None,
+        max_seq_len_kv: int | Int32 = 0,
         variable_window_token_starts: cute.Tensor | None = None,
         variable_window_token_ends: cute.Tensor | None = None,
         variable_window_cta_starts: cute.Tensor | None = None,
@@ -3028,6 +3033,8 @@ class TmemSPResource(MemoryResource):
         self.cum_seqlen_q = cum_seqlen_q
         self.cum_seqlen_k = cum_seqlen_k
         self.seq_lens_kv = seq_lens_kv
+        self.max_seq_len_kv = max_seq_len_kv
+        self.k_tail_rows = Int32(0)
         self.variable_window_token_starts = variable_window_token_starts
         self.variable_window_token_ends = variable_window_token_ends
         self.variable_window_cta_starts = variable_window_cta_starts
@@ -3688,7 +3695,7 @@ class TmemSPResource(MemoryResource):
         for chunk_idx in cutlass.range_constexpr(num_chunks):
             valid_in_chunk = cute.math.min(
                 cute.math.max(
-                    Int32(self.cfg.fixed_dense_k_tail) - Int32(chunk_idx * tmem_x),
+                    self.k_tail_rows - Int32(chunk_idx * tmem_x),
                     Int32(0),
                 ),
                 Int32(tmem_x),
@@ -3731,6 +3738,11 @@ class TmemSPResource(MemoryResource):
         self, stage_info: StageInfo
     ) -> tuple[Float32, Float32, Float32, Int32]:
         self._init_work_tile_state(stage_info)
+        if cutlass.const_expr(self.cfg.fixed_dense_k_tail > 0):
+            # Bind after the softmax register allocation, like its TMEM addresses.
+            self.k_tail_rows = (Int32(self.max_seq_len_kv) - Int32(1)) % Int32(
+                self.cfg.kv_tile_n
+            ) + Int32(1)
         return (
             Float32(_SOFTMAX_MASK_VALUE),
             Float32(_SOFTMAX_MASK_VALUE),
@@ -5181,17 +5193,24 @@ class TmemSPResource(MemoryResource):
                 dtype=self.cfg.qk_acc_dtype,
             )
             for chunk_idx in cutlass.range_constexpr(num_chunks):
-                valid_in_chunk = cute.math.min(
-                    cute.math.max(
-                        Int32(self.cfg.fixed_dense_k_tail) - Int32(chunk_idx * tmem_x),
-                        Int32(0),
-                    ),
-                    Int32(tmem_x),
+                capacity = min(
+                    tmem_x, max(0, self.cfg.fixed_dense_k_tail - chunk_idx * tmem_x)
                 )
-                mask = cutlass.vector.create_mask([tmem_x], [valid_in_chunk])
-                s_data[chunk_idx] = cutlass.vector.where(
-                    mask, s_data[chunk_idx], masked_values
-                )
+                if cutlass.const_expr(capacity == 0):
+                    s_data[chunk_idx] = masked_values
+                else:
+                    bits = ()
+                    for column in cutlass.range_constexpr(tmem_x):
+                        if cutlass.const_expr(column < capacity):
+                            bits += (
+                                self.k_tail_rows > Int32(chunk_idx * tmem_x + column),
+                            )
+                        else:
+                            bits += (cutlass.Boolean(False),)
+                    mask = cutlass.Vector.from_elements(bits, cutlass.Boolean)
+                    s_data[chunk_idx] = cutlass.vector.where(
+                        mask, s_data[chunk_idx], masked_values
+                    )
         return s_data
 
     @consumer_work(returns=(old_row_max, row_max))
@@ -6039,9 +6058,9 @@ class TmemStatsResource(MemoryResource):
     """Correction statistics with an AsyncAsync pipeline.
 
     Producer: Softmax writes old_max/row_max/row_sum stats. Consumer:
-    Correction reads them for O rescaling. Persistent D256 keeps the payload
-    in a small staged SMEM ring so the stats no longer alias S/P TMEM columns;
-    other schedules retain the original TMEM storage.
+    Correction reads them for O rescaling. The staged SMEM ring keeps the
+    payload disjoint from S/P TMEM columns, including while QK and correction
+    overlap in a non-persistent single-instance schedule.
     """
 
     cfg: Constexpr[FmhaConfig] = field(init=False, default=None)

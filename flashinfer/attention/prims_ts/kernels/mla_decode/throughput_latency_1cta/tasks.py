@@ -129,6 +129,9 @@ class MlaDecodeTask(Task):
         """Return the runtime loop domain for the current 1CTA work tile."""
         if cutlass.const_expr(self.cfg is None):
             return self.domain
+        if cutlass.const_expr(self.seqlens_kv is None and self.cfg.seq_len_kv is None):
+            # Padding and scheduler tasks have no K/V metadata or mainloop.
+            return self.domain
 
         # Persistent 1CTA coordinates combine batch and head tile in z;
         # non-persistent grids keep z as batch. cache_seqs remains batch-owned.
@@ -149,22 +152,22 @@ class MlaDecodeTask(Task):
         # replace a real loop accumulator at a tile boundary.
         cta_idx_q = tile_coord[0]
         if cutlass.const_expr(
-            self.cfg.use_persistent_scheduler != 1 and self.cfg.num_ctas_per_seq_q == 1
+            self.cfg.fixed_seqlen
+            and self.cfg.use_persistent_scheduler != 1
+            and self.cfg.num_ctas_per_seq_q == 1
         ):
             cta_idx_q = Int32(0)
         elif cutlass.const_expr(self.cfg.use_persistent_scheduler != 1):
-            # Nonpersistent grid X combines (head tile, Q tile, KV split), with
-            # KV split innermost. Persistent work queues already expose Q as
-            # tile coordinate 0 and must not be decoded a second time.
             grid_splits = Int32(self.cfg.num_ctas_per_seq_kv)
             if cutlass.const_expr(
                 self.runtime_split_kv is not None
                 and self.cfg.use_cluster_reduction != 1
             ):
                 grid_splits = runtime_split_count(self.runtime_split_kv)
-            cta_idx_q = (tile_coord[0] // grid_splits) % Int32(
-                self.cfg.num_ctas_per_seq_q
-            )
+            # Heads are already flattened into Q; grid-X packs Q and KV split.
+            cta_idx_q = tile_coord[0] // grid_splits
+            if cutlass.const_expr(self.cfg.fixed_seqlen):
+                cta_idx_q = cta_idx_q % Int32(self.cfg.num_ctas_per_seq_q)
         # Cache the raw batch length once per task/work tile. Resource work
         # methods derive their CTA-visible length from this task cache instead
         # of independently reloading cache_seqs throughout the hot loop.

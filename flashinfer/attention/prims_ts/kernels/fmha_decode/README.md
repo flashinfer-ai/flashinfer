@@ -115,7 +115,7 @@ extensions for the new capabilities are deferred.
 scratch. It selects cached policy, obtains compiled kernels and binds resources.
 Every `run()` supplies query/cache, page tables and packed-Q offsets when needed.
 Live K/V lengths come from each run unless `plan(seq_lens_kv=...)` owns a CUDA copy.
-Fixed Q length is exact; packed Q lengths stay within planned `max_seq_len_q`.
+Fixed Q length is exact; packed Q lengths stay within planned `max_q_len`.
 Validation is enabled by default and may synchronize metadata to the host.
 
 All profiles accept nonpositive **per-run** K/V lengths as inactive requests. Their page-table rows and Q/K/V data are not read. Caller-owned output stays untouched; newly allocated output for inactive rows is unspecified. Direct CTAs skip data work, persistent workers advance their queues, and reducers skip stale partials while retaining synchronization and PDL progress. Lengths can change from empty to live between graph replays. A length and table row are still required for every planned request; inactive table entries may be invalid. Plan-owned CPU lengths may also mark inactive requests and are canonicalized to zero, but remain immutable for the plan lifetime.
@@ -182,7 +182,7 @@ have padded storage.
 - Packed Q/O: `[total_q, Hq, D]`, with contiguous `int32[B + 1]`
   `qo_indptr`. Offsets start at zero, increase strictly, and end at
   `total_q`.
-- The execution Q/head extent, `B * max_seq_len_q * Hq`, must fit
+- The execution Q/head extent, `B * max_q_len * Hq`, must fit
   in signed `int32`. This also bounds every packed `total_q * Hq` extent.
 - Combined K/V cache: `[num_pages, 2, Hkv, page_size, D]`.
 - Separate K/V cache: a `(K, V)` tuple whose members are
@@ -197,7 +197,7 @@ have padded storage.
   `max_kv_len` upper bound. A convenience call may read metadata and allocate
   scratch. The unified one-shot API also supports trusted capture-safe calls
   with caller workspace, `out`, explicit `max_kv_len`, and `validate=False`;
-  packed Q additionally requires `max_seq_len_q`. Warm the selected execution
+  packed Q additionally requires `max_q_len`. Warm the selected execution
   before capture and supply `lse` when LSE is enabled. See the shared planning
   contract for workspace initialization and lifetime rules.
 
@@ -205,7 +205,7 @@ For every request `b`, the fixed table must satisfy
 `ceil(seq_lens_kv[b] / page_size) <= C`. Only that active row prefix must contain
 valid physical page IDs; inactive tail entries are never read.
 Query offsets start at zero, increase strictly, end at the packed Q extent,
-and have every delta no larger than the planned `max_seq_len_q`. Causal
+and have every delta no larger than the planned `max_q_len`. Causal
 attention additionally requires each fixed or packed per-request Q length to
 be no greater than the corresponding K/V length.
 
@@ -295,7 +295,7 @@ max_kv_len = pages_per_request * page_size
 seq_lens_kv = torch.full((B,), max_kv_len, device=device, dtype=torch.int32)
 
 wrapper = BatchDecodePagedTSWrapper(kv_layout="HND")
-wrapper.plan(q.device, batch_size=B, max_seq_len_q=1, max_kv_len=max_kv_len, num_qo_heads=Hq, num_kv_heads=Hkv, head_dim=D, page_size=page_size, packed_query=False, q_dtype=q.dtype, k_dtype=kv.dtype, v_dtype=kv.dtype, out_dtype=q.dtype, mask_type='causal')
+wrapper.plan(q.device, batch_size=B, max_q_len=1, max_kv_len=max_kv_len, num_qo_heads=Hq, num_kv_heads=Hkv, head_dim=D, page_size=page_size, packed_query=False, q_dtype=q.dtype, k_dtype=kv.dtype, v_dtype=kv.dtype, out_dtype=q.dtype, mask_type='causal')
 out = wrapper.run(q, kv, seq_lens_kv, block_tables)
 assert out.shape == q.shape
 

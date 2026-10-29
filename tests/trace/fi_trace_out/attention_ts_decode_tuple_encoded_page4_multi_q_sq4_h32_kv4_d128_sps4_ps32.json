@@ -170,7 +170,7 @@
       "dtype": "int32",
       "optional": true
     },
-    "max_seq_len_q": {
+    "max_q_len": {
       "shape": null,
       "dtype": "int32",
       "optional": true

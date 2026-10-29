@@ -81,7 +81,7 @@ def _plan(
     options = dict(
         device="cuda:0",
         batch_size=batch_size,
-        max_seq_len_q=seq_len_q,
+        max_q_len=seq_len_q,
         max_kv_len=seq_len_kv,
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,

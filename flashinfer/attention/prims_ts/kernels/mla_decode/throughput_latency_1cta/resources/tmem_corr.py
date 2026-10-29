@@ -1742,6 +1742,39 @@ class TmemCorrResource(MlaResource):
                     )
             return
 
+        store_col_base = (
+            head_dim_offset
+            + Int32(v_stage_idx * cfg.head_dim_per_stage_v)
+            + half_warp_col_offset
+        )
+        if cutlass.const_expr(self.acc_o_tensor is not None):
+            base_elem_offset = split_o_element_offset(
+                cfg,
+                batch_idx,
+                cta_idx_q,
+                global_head_idx,
+                cta_idx_kv,
+                store_col_base,
+            )
+            base_ptr = self.acc_o_tensor.iterator.raw_ptr().toint(Int64)
+            element_bytes = cfg.partial_o_dtype_bytes
+        else:
+            output_query_row = public_query_flat_row(
+                cfg,
+                storage_flat_query_row,
+                batch_idx,
+                self.cu_seqlens_q,
+            )
+            base_elem_offset = Int64(output_query_row) * Int64(cfg.head_dim_v) + Int64(
+                store_col_base
+            )
+            base_ptr = self.o_tensor.iterator.raw_ptr().toint(Int64)
+            element_bytes = cfg.o_dtype_bytes
+        row_address = base_ptr + base_elem_offset * Int64(element_bytes)
+        valid_store = (global_head_idx < Int32(cfg.num_heads_q)) & valid_output_row
+
+        # Compute the row address once, outside the validity guard. Keeping
+        # only each store predicated lets subsequent TMEM loads overlap it.
         # ``tcgen05.ld.sync.aligned`` must remain convergent across the warp.
         # Padded query rows still own valid physical TMEM rows, so load and
         # normalize every row and predicate only the externally visible store.
@@ -1815,48 +1848,20 @@ class TmemCorrResource(MlaResource):
                         final_vals[6],
                         final_vals[7],
                     )
-                store_col_offset = (
-                    head_dim_offset
-                    + Int32(v_stage_idx * cfg.head_dim_per_stage_v)
-                    + half_warp_col_offset
-                    + Int32(chunk_idx + store_sub)
+                dst_ptr = cutlass.inttoptr(
+                    row_address + Int64((chunk_idx + store_sub) * element_bytes),
+                    mem_space=1,
+                    dtype=Int32,
                 )
-                if global_head_idx < Int32(cfg.num_heads_q) and valid_output_row:
-                    if cutlass.const_expr(self.acc_o_tensor is not None):
-                        base_elem_offset = split_o_element_offset(
-                            cfg,
-                            batch_idx,
-                            cta_idx_q,
-                            global_head_idx,
-                            cta_idx_kv,
-                            store_col_offset,
-                        )
-                        base_ptr = self.acc_o_tensor.iterator.raw_ptr().toint(Int64)
-                        element_bytes = cfg.partial_o_dtype_bytes
-                    else:
-                        output_query_row = public_query_flat_row(
-                            cfg,
-                            storage_flat_query_row,
-                            batch_idx,
-                            self.cu_seqlens_q,
-                        )
-                        base_elem_offset = Int64(output_query_row) * Int64(
-                            cfg.head_dim_v
-                        ) + Int64(store_col_offset)
-                        base_ptr = self.o_tensor.iterator.raw_ptr().toint(Int64)
-                        element_bytes = cfg.o_dtype_bytes
-                    dst_ptr = cutlass.inttoptr(
-                        base_ptr + Int64(base_elem_offset) * Int64(element_bytes),
-                        mem_space=1,
-                        dtype=Int32,
-                    )
-                    if cutlass.const_expr(
-                        cfg.use_fp8_output == 1
-                        and self.acc_o_tensor is None
-                        and cfg.use_cluster_reduction != 1
-                    ):
+                if cutlass.const_expr(
+                    cfg.use_fp8_output == 1
+                    and self.acc_o_tensor is None
+                    and cfg.use_cluster_reduction != 1
+                ):
+                    if valid_store:
                         dst_ptr.store(packed_o.load(0, 2), alignment=8)
-                    else:
+                else:
+                    if valid_store:
                         dst_ptr.store(packed_o.load(0, 4), alignment=16)
 
     @cute.jit

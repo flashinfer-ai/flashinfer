@@ -37,7 +37,7 @@ from __future__ import annotations
 import functools
 import math
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal, Optional
 
 import torch
@@ -1119,7 +1119,7 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
     query_major_memberships = (
         sparse_block_size == 4
         and spec.config.use_fp8_qkv
-        and spec.config.supports_query_major_memberships
+        and replace(spec.config, fixed_seqlen=True).supports_query_major_memberships
     )
     if query_major_memberships:
         page_capacity = (page_capacity + 31) // 32 * 32
@@ -1885,7 +1885,7 @@ def _prepare_q_token_kv_block_sparse_attention(
         out=attention_out,
         seq_len_q=group_size,
         qo_indptr=qo_indptr,
-        max_seq_len_q=group_size if packed_query else None,
+        max_q_len=group_size if packed_query else None,
         out_dtype=out.dtype,
         mask_type="causal",
         window_left=-1,

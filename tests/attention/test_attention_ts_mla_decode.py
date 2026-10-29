@@ -752,7 +752,7 @@ def _plan_case(
     case,
     *,
     qo_indptr: torch.Tensor | None = None,
-    max_seq_len_q: int | None = None,
+    max_q_len: int | None = None,
     softmax_rescale_threshold_log2: float = 0.0,
     **plan_options,
 ):
@@ -762,18 +762,18 @@ def _plan_case(
     )
     resolved_max_seq_len_q = (
         int(case.query.shape[1])
-        if qo_indptr is None and max_seq_len_q is None
-        else max_seq_len_q
+        if qo_indptr is None and max_q_len is None
+        else max_q_len
     )
     if resolved_max_seq_len_q is None:
-        raise ValueError("packed plan coverage requires max_seq_len_q")
+        raise ValueError("packed plan coverage requires max_q_len")
     options = dict(
         packed_query=qo_indptr is not None,
         q_dtype=case.query.dtype,
         kv_dtype=case.kv_cache.dtype,
         out_dtype=case.out_dtype,
         mask_type=case.mask_type,
-        max_seq_len_q=resolved_max_seq_len_q,
+        max_q_len=resolved_max_seq_len_q,
         tuning=MLAAttentionTuning(
             softmax_rescale_threshold_log2=softmax_rescale_threshold_log2
         ),
@@ -812,15 +812,15 @@ def _run_standalone(
     case,
     *,
     qo_indptr: torch.Tensor | None = None,
-    max_seq_len_q: int | None = None,
+    max_q_len: int | None = None,
     out: torch.Tensor | None = None,
 ):
     """Run the caller-workspace public entry point for wrapper parity."""
 
     packed_query = qo_indptr is not None
-    resolved_max_seq_len_q = max_seq_len_q if packed_query else int(case.query.shape[1])
+    resolved_max_seq_len_q = max_q_len if packed_query else int(case.query.shape[1])
     if resolved_max_seq_len_q is None:
-        raise ValueError("packed standalone coverage requires max_seq_len_q")
+        raise ValueError("packed standalone coverage requires max_q_len")
     num_qo_heads = int(case.query.shape[1] if packed_query else case.query.shape[2])
     workspace_size = get_prims_ts_batch_mla_decode_workspace_size(
         case.block_tables.shape[0],
@@ -829,7 +829,7 @@ def _run_standalone(
         _ROPE_DIM,
         case.page_size,
         case.max_kv_len,
-        max_seq_len_q=resolved_max_seq_len_q,
+        max_q_len=resolved_max_seq_len_q,
         q_dtype=case.query.dtype,
         kv_dtype=case.kv_cache.dtype,
         out_dtype=case.out_dtype,
@@ -870,7 +870,7 @@ def _run_standalone(
         kv_lora_rank=_LATENT_DIM,
         qk_rope_head_dim=_ROPE_DIM,
         qo_indptr=qo_indptr,
-        max_seq_len_q=resolved_max_seq_len_q,
+        max_q_len=resolved_max_seq_len_q,
         out=output,
         softmax_scale=case.softmax_scale,
         output_scale=case.output_scale,
@@ -987,7 +987,7 @@ def _exercise_public_paths(
     *,
     exercise_all_paths: bool,
     qo_indptr: torch.Tensor | None = None,
-    max_seq_len_q: int | None = None,
+    max_q_len: int | None = None,
 ):
     """Always check eager; reserve standalone/graph parity for anchor rows."""
 
@@ -999,7 +999,7 @@ def _exercise_public_paths(
     standalone = _run_standalone(
         case,
         qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
     )
     _assert_case_correct(standalone, case, policy, qo_indptr=qo_indptr)
     torch.testing.assert_close(standalone, eager, rtol=0, atol=0)
@@ -1051,14 +1051,14 @@ def _exercise_auto_mla_case(
     *,
     expected_b200: dict[str, object] | None = None,
     qo_indptr: torch.Tensor | None = None,
-    max_seq_len_q: int | None = None,
+    max_q_len: int | None = None,
 ) -> dict[str, object]:
     """Plan automatically and validate one eager public-interface launch."""
 
     wrapper = _plan_case(
         case,
         qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
     )
     policy = _policy_dict(wrapper)
     _assert_auto_policy(
@@ -1072,7 +1072,7 @@ def _exercise_auto_mla_case(
         policy,
         exercise_all_paths=False,
         qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
     )
     return policy
 
@@ -1260,7 +1260,7 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         "qk_rope_head_dim",
         "page_size",
         "max_kv_len",
-        "max_seq_len_q",
+        "max_q_len",
         "packed_query",
         "q_dtype",
         "kv_dtype",
@@ -1281,7 +1281,7 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         assert plan_parameters[name].default is inspect.Parameter.empty
     for name in ("num_qo_heads", "kv_lora_rank", "qk_rope_head_dim", "page_size"):
         assert plan_parameters[name].default is inspect.Parameter.empty
-    assert {"batch_size", "max_kv_len", "max_seq_len_q"}.issubset(plan_parameters)
+    assert {"batch_size", "max_kv_len", "max_q_len"}.issubset(plan_parameters)
     for request_metadata in (
         "block_tables",
         "seq_lens_kv",
@@ -1297,6 +1297,7 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         "block_tables",
         "seq_lens_kv",
         "qo_indptr",
+        "max_q_len",
         "softmax_scale",
         "output_scale",
         "out",
@@ -1325,7 +1326,7 @@ def test_attention_ts_mla_decode_wrapper_trace_names_softmax_rescale_threshold_l
     state = dict(
         packed_query=False,
         mask_type="causal",
-        max_seq_len_q=1,
+        max_q_len=1,
         max_kv_len=64,
         kv_lora_rank=_LATENT_DIM,
         qk_rope_head_dim=_ROPE_DIM,
@@ -1376,7 +1377,7 @@ def test_attention_ts_mla_decode_bound_wrapper_trace_uses_plan_state():
     wrapper._plan_state = SimpleNamespace(
         packed_query=True,
         mask_type="causal",
-        max_seq_len_q=3,
+        max_q_len=3,
         max_kv_len=64,
         kv_lora_rank=_LATENT_DIM,
         qk_rope_head_dim=_ROPE_DIM,
@@ -1404,7 +1405,7 @@ def test_attention_ts_mla_decode_bound_wrapper_trace_uses_plan_state():
         "value": _LATENT_DIM,
         "description": "Latent K/V rank frozen by plan().",
     }
-    assert defn["axes"]["max_seq_len_q"]["value"] == 3
+    assert defn["axes"]["max_q_len"]["value"] == 3
     assert defn["axes"]["max_kv_len"]["value"] == 64
     assert "mask:causal" in defn["tags"]
 
@@ -1498,7 +1499,7 @@ def test_attention_ts_mla_run_validate_false_bypasses_explicit_validators(
         device=torch.device("cpu"),
         batch_size=1,
         num_qo_heads=8,
-        max_seq_len_q=1,
+        max_q_len=1,
         packed_query=False,
         page_size=32,
         q_dtype=torch.bfloat16,
@@ -1530,7 +1531,7 @@ def test_attention_ts_mla_run_validate_false_bypasses_explicit_validators(
     )
     monkeypatch.setattr(mla_decode_module, "_launch_mla_decode", launch)
 
-    tensor = torch.empty(1)
+    tensor = torch.empty((1, 1, 8, _LATENT_DIM + _ROPE_DIM))
     assert wrapper.run(tensor, tensor, tensor, tensor, validate=False) is sentinel
     with pytest.raises(TypeError, match="validate must be a bool"):
         wrapper.run(tensor, tensor, tensor, tensor, validate=0)
@@ -1671,22 +1672,22 @@ def test_attention_ts_mla_int32_kv_coordinate_bound():
     mla_decode_module._validate_mla_query_head_extent(
         batch_size=1,
         num_qo_heads=1,
-        max_seq_len_q=2**31 - 1,
+        max_q_len=2**31 - 1,
     )
     mla_decode_module._validate_mla_query_head_extent(
         batch_size=1,
         num_qo_heads=1,
-        max_seq_len_q=1,
+        max_q_len=1,
         total_q=0,
     )
     with pytest.raises(
         NotImplementedError,
-        match=r"batch_size \* max_seq_len_q \* num_qo_heads must fit",
+        match=r"batch_size \* max_q_len \* num_qo_heads must fit",
     ):
         mla_decode_module._validate_mla_query_head_extent(
             batch_size=1,
             num_qo_heads=2,
-            max_seq_len_q=2**30,
+            max_q_len=2**30,
         )
     with pytest.raises(
         NotImplementedError,
@@ -1695,7 +1696,7 @@ def test_attention_ts_mla_int32_kv_coordinate_bound():
         mla_decode_module._validate_mla_query_head_extent(
             batch_size=1,
             num_qo_heads=2,
-            max_seq_len_q=1,
+            max_q_len=1,
             total_q=2**30,
         )
 
@@ -1807,7 +1808,7 @@ def test_attention_ts_mla_run_validates_kv_lengths(
         q_dtype=torch.bfloat16,
         kv_dtype=torch.bfloat16,
         out_dtype=torch.bfloat16,
-        max_seq_len_q=1,
+        max_q_len=1,
     )
     if message is not None:
         with pytest.raises(ValueError, match=message):
@@ -1863,7 +1864,7 @@ def test_attention_ts_mla_rejects_per_request_causal_q_longer_than_kv(
     qo_indptr = (
         torch.tensor([0, 5, 6], dtype=torch.int32, device=device) if packed_q else None
     )
-    max_seq_len_q = 5 if packed_q else 8
+    max_q_len = 5 if packed_q else 8
     query = torch.empty(
         (6, 8, _QK_DIM) if packed_q else (2, 8, 8, _QK_DIM),
         dtype=torch.bfloat16,
@@ -1886,7 +1887,7 @@ def test_attention_ts_mla_rejects_per_request_causal_q_longer_than_kv(
         kv_dtype=torch.bfloat16,
         out_dtype=torch.bfloat16,
         mask_type="causal",
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
     )
     with pytest.raises(ValueError, match=match):
         wrapper.run(query, kv_cache, block_tables, seq_lens_kv, qo_indptr=qo_indptr)
@@ -1897,7 +1898,7 @@ def test_attention_ts_mla_rejects_per_request_causal_q_longer_than_kv(
             block_tables,
             seq_lens_kv,
             qo_indptr=qo_indptr,
-            max_seq_len_q=max_seq_len_q,
+            max_q_len=max_q_len,
             mask_type="causal",
             max_kv_len=16,
         )
@@ -1919,7 +1920,7 @@ def test_attention_ts_mla_packed_query_requires_explicit_bound(validate):
     )
     case, qo_indptr = _pack_mla_case(case, (1, 1))
     workspace = torch.empty(1, dtype=torch.uint8, device="cuda")
-    with pytest.raises(ValueError, match="requires max_seq_len_q"):
+    with pytest.raises(ValueError, match="requires max_q_len"):
         batch_mla_decode_with_paged_kv_cache(
             case.query,
             case.kv_cache,
@@ -2015,16 +2016,56 @@ def test_attention_ts_mla_speculative_mask_oracle_distinguishes_tail_visibility(
 
 
 @_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_packed_launch_bounds():
+    """Inferred and bucketed Q bounds preserve packed MLA numerical output."""
+    case = _make_mla_case(
+        batch_size=2,
+        num_qo_heads=16,
+        max_kv_len=257,
+        seq_len_q=4,
+        qkv_dtype=torch.bfloat16,
+        mask_type="causal",
+        device="cuda",
+        seed=710646,
+    )
+    case, offsets = _pack_mla_case(case, (2, 3))
+    wrapper = _plan_case(case, qo_indptr=offsets, max_q_len=4)
+    policy = _policy_dict(wrapper)
+    out = torch.empty_like(case.query[..., :_LATENT_DIM])
+
+    def run(**bounds):
+        return wrapper.run(
+            case.query,
+            case.kv_cache,
+            case.block_tables,
+            case.seq_lens_kv,
+            qo_indptr=offsets,
+            softmax_scale=case.softmax_scale,
+            output_scale=case.output_scale,
+            out=out,
+            **bounds,
+        )
+
+    for bounds in ({}, dict(max_q_len=3), dict(max_q_len=4)):
+        _assert_case_correct(run(**bounds), case, policy, qo_indptr=offsets)
+    for bound, message in ((2, "cover"), (5, "capacity")):
+        out.fill_(float("nan"))
+        with pytest.raises(ValueError, match=f"max_q_len.*{message}"):
+            run(max_q_len=bound)
+        assert out.isnan().all()
+
+
+@_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_packed_q_public_parity():
     """Define variable and empty runtime Q lengths with cumulative offsets."""
 
     q_lens = (1, 0, 8)
-    max_seq_len_q = max(q_lens)
+    max_q_len = max(q_lens)
     case = _make_mla_case(
         batch_size=len(q_lens),
         num_qo_heads=16,
         max_kv_len=4097,
-        seq_len_q=max_seq_len_q,
+        seq_len_q=max_q_len,
         qkv_dtype=torch.bfloat16,
         mask_type="causal",
         device="cuda",
@@ -2034,11 +2075,11 @@ def test_attention_ts_mla_decode_packed_q_public_parity():
     wrapper = _plan_case(
         case,
         qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
     )
     assert wrapper._plan_state is not None
     assert wrapper._plan_state.packed_query is True
-    assert wrapper._plan_state.max_seq_len_q == max_seq_len_q
+    assert wrapper._plan_state.max_q_len == max_q_len
     policy = _policy_dict(wrapper)
     _assert_auto_policy(
         policy,
@@ -2056,7 +2097,7 @@ def test_attention_ts_mla_decode_packed_q_public_parity():
         policy,
         exercise_all_paths=True,
         qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
     )
     one_shot = batch_mla_decode_with_paged_kv_cache(
         case.query,
@@ -2064,7 +2105,7 @@ def test_attention_ts_mla_decode_packed_q_public_parity():
         case.block_tables,
         case.seq_lens_kv,
         qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
         mask_type=case.mask_type,
         max_kv_len=case.max_kv_len,
         softmax_scale=case.softmax_scale,
@@ -2074,7 +2115,7 @@ def test_attention_ts_mla_decode_packed_q_public_parity():
     _assert_case_correct(one_shot, case, policy, qo_indptr=qo_indptr)
     torch.testing.assert_close(one_shot, eager, rtol=0, atol=0)
 
-    with pytest.raises(ValueError, match="requires max_seq_len_q"):
+    with pytest.raises(ValueError, match="requires max_q_len"):
         batch_mla_decode_with_paged_kv_cache(
             case.query,
             case.kv_cache,
@@ -2094,12 +2135,12 @@ def test_attention_ts_mla_decode_packed_q_clc_empty_tile_progress():
     """Advance CLC bookkeeping when a packed request has no row in a Q tile."""
 
     q_lens = tuple(0 if batch_idx % 2 == 0 else 2 for batch_idx in range(64))
-    max_seq_len_q = max(q_lens)
+    max_q_len = max(q_lens)
     case = _make_mla_case(
         batch_size=len(q_lens),
         num_qo_heads=128,
         max_kv_len=129,
-        seq_len_q=max_seq_len_q,
+        seq_len_q=max_q_len,
         qkv_dtype=torch.bfloat16,
         mask_type="causal",
         device="cuda",
@@ -2115,7 +2156,7 @@ def test_attention_ts_mla_decode_packed_q_clc_empty_tile_progress():
             "use_clc_dynamic_persistent_scheduler": True,
         },
         qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
     )
     assert policy["source"] == "auto"
 
@@ -2322,12 +2363,12 @@ def test_attention_ts_mla_decode_graph_reloads_all_live_metadata():
 
     q_lens = tuple(0 if batch_idx % 2 == 0 else 2 for batch_idx in range(64))
     replay_q_lens = tuple(reversed(q_lens))
-    max_seq_len_q = max(q_lens)
+    max_q_len = max(q_lens)
     case = _make_mla_case(
         batch_size=len(q_lens),
         num_qo_heads=128,
         max_kv_len=129,
-        seq_len_q=max_seq_len_q,
+        seq_len_q=max_q_len,
         qkv_dtype=torch.bfloat16,
         mask_type="causal",
         device="cuda",
@@ -2337,7 +2378,7 @@ def test_attention_ts_mla_decode_graph_reloads_all_live_metadata():
     wrapper = _plan_case(
         case,
         qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
     )
     policy = _policy_dict(wrapper)
     _assert_auto_policy(
@@ -2549,36 +2590,43 @@ def test_attention_ts_mla_decode_reuses_compiled_topology_across_batch_sizes(
     num_qo_heads: int,
     packed_query: bool,
 ):
-    """One resolved topology accepts different batch extents."""
+    """One resolved topology accepts different batch, Q and KV extents."""
 
     wrappers = []
-    for batch_size in (3, 4):
+    policies = []
+    for batch_size, q_length, kv_length in ((3, 3, 1025), (4, 4, 1151)):
         case = _make_mla_case(
             batch_size=batch_size,
             num_qo_heads=num_qo_heads,
-            max_kv_len=1024,
+            max_kv_len=kv_length,
+            seq_len_q=q_length,
             qkv_dtype=torch.bfloat16,
             device="cuda",
             seed=39000 + num_qo_heads + batch_size,
         )
         qo_indptr = None
         if packed_query:
-            case, qo_indptr = _pack_mla_case(case, (1,) * batch_size)
+            case, qo_indptr = _pack_mla_case(case, (q_length,) * batch_size)
         wrapper = _plan_case(
             case,
             qo_indptr=qo_indptr,
-            max_seq_len_q=1 if packed_query else None,
+            max_q_len=q_length if packed_query else None,
         )
         policy = _policy_dict(wrapper)
         output = _run_case(wrapper, case, qo_indptr=qo_indptr)
         _assert_case_correct(output, case, policy, qo_indptr=qo_indptr)
         wrappers.append(wrapper)
+        policies.append(policy)
 
     first_state = wrappers[0]._plan_state
     second_state = wrappers[1]._plan_state
     assert first_state is not None
     assert second_state is not None
-    assert first_state.compiled is second_state.compiled
+    # Split-KV, tile and CTA choices depend on the GPU's SM count, so a device
+    # can resolve the two plans to different topologies. Reuse is only promised
+    # between plans with the same topology.
+    if policies[0] == policies[1] and first_state.split_kv == second_state.split_kv:
+        assert first_state.compiled is second_state.compiled
 
 
 # Keep the multi-query and single-query endpoints; all four equivalent
@@ -2791,12 +2839,12 @@ def test_attention_ts_mla_decode_packed_dtype_mask_page_product(
     """Cross uneven packed Q with dtype, mask, page, and cache rank."""
 
     q_lens = (1, 3, 5)
-    max_seq_len_q = max(q_lens)
+    max_q_len = max(q_lens)
     case = _make_mla_case(
         batch_size=len(q_lens),
         num_qo_heads=8,
         max_kv_len=4097,
-        seq_len_q=max_seq_len_q,
+        seq_len_q=max_q_len,
         qkv_dtype=qkv_dtype,
         mask_type=mask_type,
         page_size=page_size,
@@ -2810,7 +2858,7 @@ def test_attention_ts_mla_decode_packed_dtype_mask_page_product(
     policy = _exercise_auto_mla_case(
         case,
         qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
     )
     assert policy["source"] == "auto"
 
@@ -2837,12 +2885,12 @@ def test_attention_ts_mla_decode_packed_non_power_of_two_heads(
     """Mixed empty packed requests predicate flat tiles in both families."""
 
     q_lens = (8, 1, 0, 3)
-    max_seq_len_q = max(q_lens)
+    max_q_len = max(q_lens)
     case = _make_mla_case(
         batch_size=len(q_lens),
         num_qo_heads=num_qo_heads,
         max_kv_len=1024,
-        seq_len_q=max_seq_len_q,
+        seq_len_q=max_q_len,
         qkv_dtype=qkv_dtype,
         mask_type="causal",
         page_size=64,
@@ -2854,7 +2902,7 @@ def test_attention_ts_mla_decode_packed_non_power_of_two_heads(
     wrapper = _plan_case(
         case,
         qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
     )
     policy = _policy_dict(wrapper)
     _assert_auto_policy(
@@ -2869,7 +2917,7 @@ def test_attention_ts_mla_decode_packed_non_power_of_two_heads(
         policy,
         exercise_all_paths=True,
         qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
     )
     one_shot = batch_mla_decode_with_paged_kv_cache(
         case.query,
@@ -2877,7 +2925,7 @@ def test_attention_ts_mla_decode_packed_non_power_of_two_heads(
         case.block_tables,
         case.seq_lens_kv,
         qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
         mask_type=case.mask_type,
         max_kv_len=case.max_kv_len,
         softmax_scale=case.softmax_scale,
@@ -2907,12 +2955,12 @@ def test_attention_ts_mla_decode_all_empty_packed_query_noop(
     """An explicitly bounded all-empty batch returns empty public outputs."""
 
     q_lens = (0, 0, 0, 0)
-    max_seq_len_q = 8
+    max_q_len = 8
     case = _make_mla_case(
         batch_size=len(q_lens),
         num_qo_heads=num_qo_heads,
         max_kv_len=257,
-        seq_len_q=max_seq_len_q,
+        seq_len_q=max_q_len,
         qkv_dtype=torch.bfloat16,
         mask_type="causal",
         page_size=64,
@@ -2921,7 +2969,7 @@ def test_attention_ts_mla_decode_all_empty_packed_query_noop(
     )
     case, qo_indptr = _pack_mla_case(case, q_lens)
 
-    with pytest.raises(ValueError, match="requires max_seq_len_q"):
+    with pytest.raises(ValueError, match="requires max_q_len"):
         batch_mla_decode_with_paged_kv_cache(
             case.query,
             case.kv_cache,
@@ -2934,7 +2982,7 @@ def test_attention_ts_mla_decode_all_empty_packed_query_noop(
     wrapper = _plan_case(
         case,
         qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
     )
     policy = _policy_dict(wrapper)
     _assert_auto_policy(
@@ -2955,7 +3003,7 @@ def test_attention_ts_mla_decode_all_empty_packed_query_noop(
     standalone = _run_standalone(
         case,
         qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
     )
     _assert_case_correct(standalone, case, policy, qo_indptr=qo_indptr)
 
@@ -2966,7 +3014,7 @@ def test_attention_ts_mla_decode_all_empty_packed_query_noop(
         case.block_tables,
         case.seq_lens_kv,
         qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q,
+        max_q_len=max_q_len,
         mask_type=case.mask_type,
         max_kv_len=case.max_kv_len,
         softmax_scale=case.softmax_scale,
@@ -3323,7 +3371,7 @@ def test_attention_ts_mla_decode_generic_packed_logical_rows(heads, dtype):
         seed=43000 + heads,
     )
     case, offsets = _pack_mla_case(case, (5, 0, 2))
-    wrapper = _plan_case(case, qo_indptr=offsets, max_seq_len_q=5)
+    wrapper = _plan_case(case, qo_indptr=offsets, max_q_len=5)
     policy = _policy_dict(wrapper)
     assert policy["kernel"] == "throughput_2cta"
     _exercise_public_paths(
@@ -3331,7 +3379,7 @@ def test_attention_ts_mla_decode_generic_packed_logical_rows(heads, dtype):
         case,
         policy,
         qo_indptr=offsets,
-        max_seq_len_q=5,
+        max_q_len=5,
         exercise_all_paths=True,
     )
 
@@ -3352,7 +3400,7 @@ def test_attention_ts_mla_replanned_sizes(heads, dtype, packed_query):
                 qk_rope_head_dim=64,
                 page_size=32,
                 max_kv_len=sk,
-                max_seq_len_q=sq,
+                max_q_len=sq,
                 q_dtype=dtype,
                 out_dtype=torch.bfloat16,
                 device="cuda",
@@ -3386,7 +3434,7 @@ def test_attention_ts_mla_replanned_sizes(heads, dtype, packed_query):
             kv_dtype=dtype,
             out_dtype=torch.bfloat16,
             batch_size=batch,
-            max_seq_len_q=sq,
+            max_q_len=sq,
             max_kv_len=sk,
             workspace_buffer=workspace,
         )
@@ -3440,7 +3488,7 @@ def test_attention_ts_mla_packed_query_allocation_boundary(batch, sq, kv):
     with _query_at_unmapped_boundary(case.query.shape, case.query.dtype) as query:
         query.copy_(case.query)
         case = replace(case, query=query)
-        wrapper = _plan_case(case, qo_indptr=offsets, max_seq_len_q=sq)
+        wrapper = _plan_case(case, qo_indptr=offsets, max_q_len=sq)
         output = _run_case(wrapper, case, qo_indptr=offsets)
         _assert_case_correct(
             output, case, dict(wrapper._plan_state.policy), qo_indptr=offsets
@@ -3459,7 +3507,7 @@ def test_attention_ts_mla_standalone_reuses_caller_workspace():
                 qk_rope_head_dim=64,
                 page_size=32,
                 max_kv_len=sk,
-                max_seq_len_q=sq,
+                max_q_len=sq,
                 q_dtype=torch.bfloat16,
                 device="cuda",
             )
@@ -3528,7 +3576,7 @@ def test_attention_ts_mla_runtime_sm_split_ceiling(dtype):
             kv_dtype=dtype,
             out_dtype=torch.bfloat16,
             batch_size=1,
-            max_seq_len_q=1,
+            max_q_len=1,
             max_kv_len=sk,
             workspace_buffer=workspace,
         )
@@ -3574,7 +3622,7 @@ def test_mla_final_lse(dtype, heads, nq, nk, packed, mode):
     if packed:
         case, offsets = _pack_mla_case(case, (nq, 0))
     query = case.query
-    wrapper = _plan_case(case, qo_indptr=offsets, max_seq_len_q=nq, lse_mode=mode)
+    wrapper = _plan_case(case, qo_indptr=offsets, max_q_len=nq, lse_mode=mode)
     refs = []
     for b, n in enumerate(case.seq_lens_kv.tolist()):
         qb = query[int(offsets[b]) : int(offsets[b + 1])] if packed else query[b]
@@ -3705,3 +3753,26 @@ def test_mla_runtime_count_changes(dtype, heads, batch, kv):
     out.fill_(torch.nan)
     graph.replay()
     torch.testing.assert_close(out.float(), shortened, rtol=rtol, atol=atol)
+
+
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize(("seq_len_q", "kv_len"), ((8, 8192), (4, 2048)))
+def test_attention_ts_mla_decode_2cta_runtime_small_split_reduction(seq_len_q, kv_len):
+    """Runtime small splits preserve 2CTA numerical and graph behavior."""
+    case = _make_mla_case(
+        batch_size=4,
+        num_qo_heads=128,
+        max_kv_len=kv_len,
+        seq_len_q=seq_len_q,
+        kv_seq_lens=(kv_len, kv_len - 191, kv_len - 193, kv_len - 292),
+        qkv_dtype=torch.bfloat16,
+        device="cuda",
+        seed=710629,
+    )
+    wrapper = _plan_case(case)
+    _exercise_public_paths(
+        wrapper,
+        case,
+        _policy_dict(wrapper),
+        exercise_all_paths=True,
+    )

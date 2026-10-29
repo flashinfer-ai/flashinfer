@@ -67,6 +67,7 @@ from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 
 from .fmha_decode_resources.helpers_common import (
     split_kv_grid_coord,
+    UniformQueryOffsets,
     _assume_nonnegative_i32,
     _q_group_token_base,
     _q_seq_bounds,
@@ -185,7 +186,7 @@ class PackedDecodeWorkQueue(WorkQueue):
     def __init__(
         self,
         cfg: FmhaDecodeConfig,
-        cu_seqlens_q: cute.Pointer,
+        cu_seqlens_q: cute.Pointer | UniformQueryOffsets,
         seqlens_kv: cute.Pointer | None = None,
         num_heads_kv: cutlass.Int32 | None = None,
         **kwargs: Any,
@@ -272,6 +273,7 @@ def _can_hold_native_page_window(
         smem_page_offsets is None
         or not smem_page_offsets.use_native_paged_kv
         or cfg.use_sliding_window_causal
+        or not cfg.fixed_seqlen
     ):
         return False
     if cfg.runtime_split_kv:
@@ -932,6 +934,9 @@ class DecodeGenTask(Task):
         """Return this task's loop domain for one static or persistent tile."""
         if self.cfg is None:
             return self.domain
+        if cutlass.const_expr(not self.cfg.fixed_seqlen and self.seq_len_q is None):
+            # Padding and scheduler tasks do not consume request dimensions.
+            return self.domain
 
         # Sparse rows have a runtime-dependent number of prepared KV routes
         # even when sequence lengths are static. Load their compact header
@@ -1019,6 +1024,7 @@ class DecodeGenTask(Task):
         if (
             self.seqlens_kv is None
             and not self.cfg.use_split_kv
+            and self.cfg.fixed_seqlen
             and not self.cfg.uses_runtime_q_kv_union
         ):
             return self.domain
@@ -1029,6 +1035,7 @@ class DecodeGenTask(Task):
         # causal/window/split coordinate construction in every task warp.
         if cutlass.const_expr(
             not self.cfg.use_split_kv
+            and self.cfg.fixed_seqlen
             and not self.cfg.uses_runtime_q_kv_union
             and not self.cfg.use_sliding_window_causal
         ):

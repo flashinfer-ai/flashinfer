@@ -84,7 +84,8 @@ def uses_two_head_gmem_reduction(cfg: MlaConfig) -> bool:
 def uses_q_row_gmem_reduction(cfg: MlaConfig) -> bool:
     """Return whether one reducer CTA covers multiple Q rows for one head."""
     return (
-        cfg.seq_len_q >= 2 * GMEM_REDUCTION_Q_ROWS_PER_CTA
+        cfg.fixed_seqlen
+        and cfg.seq_len_q >= 2 * GMEM_REDUCTION_Q_ROWS_PER_CTA
         and cfg.seq_len_q % GMEM_REDUCTION_Q_ROWS_PER_CTA == 0
         and cfg.head_dim_v == GMEM_REDUCTION_VECTOR_HEAD_DIM
         and cfg.o_dtype_bytes == 2
@@ -132,6 +133,8 @@ def slice_split_num_reduction_ctas(
 ) -> int:
     """Return reducer CTAs per Q/head tile, capped to roughly two SM waves."""
 
+    if not cfg.fixed_seqlen:
+        return 1
     base_ctas = (
         int(seq_len_q)
         * cfg.num_ctas_for_all_heads
@@ -162,9 +165,9 @@ def gmem_reduction_launch_shape(
         )
         return (
             (
-                int(seq_len_q) * num_reduction_ctas,
+                seq_len_q * num_reduction_ctas,
                 cfg.num_ctas_for_all_heads * cfg.num_ctas_per_head_dim,
-                int(batch_size),
+                batch_size,
             ),
             0,
             GMEM_REDUCTION_SLICE_THREADS,

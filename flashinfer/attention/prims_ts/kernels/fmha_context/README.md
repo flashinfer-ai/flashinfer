@@ -84,8 +84,8 @@ Plan capacities and fixed tensor extents must be positive; packed request length
 may be zero. For each contiguous
 run, the aggregate logical Q and K extents—`B*Sq` and `B*Sk` for fixed storage,
 or `total_q` and `total_k` for packed storage—must each be at most
-`2**31 - 256`. Paged runs apply that limit only to `total_q`. Execution geometry checks contiguous `B*max_seq_len_q` and `B*max_kv_len`, or only
-`B*max_seq_len_q` for paged storage. This coordinate-representation limit
+`2**31 - 256`. Paged runs apply that limit only to `total_q`. Execution geometry checks contiguous `B*max_q_len` and `B*max_kv_len`, or only
+`B*max_q_len` for paged storage. This coordinate-representation limit
 reserves 255 values for the padded tail of the largest supported 256-row query
 work tile.
 
@@ -117,13 +117,13 @@ Contiguous inputs:
   Both start at zero, are nondecreasing, and end at the corresponding packed
   tensor extent.
 - Fixed variable-window metadata: inclusive per-token starts and ends shaped
-  `[B, max_seq_len_q]`, with `0 <= start <= end < Sk`. Ends must be
+  `[B, max_q_len]`, with `0 <= start <= end < Sk`. Ends must be
   nondecreasing along Q within each batch item; starts need not be ordered.
   `validate=True` checks ordering, while `validate=False` requires the caller
   to preserve it, including between graph replays.
   `variable_window_cta_starts` may additionally provide
   the exact minimum token start for every Q work tile, shaped
-  `[B, ceil(max_seq_len_q / Tq)]`, where `Tq=256` for head dimension 128 and
+  `[B, ceil(max_q_len / Tq)]`, where `Tq=256` for head dimension 128 and
   `Tq=128` for head dimensions 192 and 256. The final entry in each row covers only the
   remaining real Q rows, without conceptual padding.
 
@@ -147,9 +147,9 @@ Paged inputs:
 
 Every cumulative-offset vector starts at zero and is nondecreasing. For
 packed contiguous runs, `qo_indptr[-1]` equals `total_q`, `kv_indptr[-1]`
-equals `total_k`, each Q delta is at most `max_seq_len_q`, and each K/V delta
+equals `total_k`, each Q delta is at most `max_q_len`, and each K/V delta
 is at most `max_kv_len`. For paged runs, `qo_indptr[-1]` equals `total_q`, each
-Q delta is at most `max_seq_len_q`, and each `seq_lens_kv` value is at most
+Q delta is at most `max_q_len`, and each `seq_lens_kv` value is at most
 `max_kv_len`. All deltas and lengths are nonnegative, and every page ID selected
 for an active page indexes the physical cache.
 
@@ -166,14 +166,14 @@ exact planned batch, zero starting offsets, matching terminal tensor extents,
 nonnegative deltas, and these per-request capacity bounds:
 
 ```text
-0 <= Sq[b] <= planned max_seq_len_q
+0 <= Sq[b] <= planned max_q_len
 0 <= Sk[b] <= planned max_kv_len
 ```
 
 Every active causal request must additionally satisfy `Sq[b] <= Sk[b]`. The
 request-local bottom-right offset `Sk[b] - Sq[b]` may change and is derived
 from the live offsets. Fixed variable-window plans likewise receive current
-`[B, max_seq_len_q]` inclusive start/end bounds on every run. Only the start
+`[B, max_q_len]` inclusive start/end bounds on every run. Only the start
 bounds need per-CTA minima; end bounds remain per-token inputs. A caller may
 provide those minima once for all layers that share the same geometry and
 metadata. Otherwise, the contiguous wrapper derives them on every run using
@@ -182,12 +182,12 @@ its mutable fallback scratch.
 Paged planning fixes model semantics and compile-time metadata promises. The conservative defaults, `uniform_packed_lengths=False` and
 `has_q_offset=True`, allow each run to provide different valid Q offsets,
 block-table rows, K/V lengths, and physical page IDs without another plan. The
-batch remains exact; Q deltas stay nonnegative and within `max_seq_len_q`, K/V
+batch remains exact; Q deltas stay nonnegative and within `max_q_len`, K/V
 lengths stay within `max_kv_len`, and the final Q offset matches the packed Q/O
 extent. For causal attention, every active per-run `Sq[b]` is no greater than `Sk[b]`.
 
 `uniform_packed_lengths=True` is a caller promise that every Q delta equals
-`max_seq_len_q` and every K/V length equals `max_kv_len`.
+`max_q_len` and every K/V length equals `max_kv_len`.
 `has_q_offset=False` is a separate causal promise that `Sq[b] == Sk[b]` for
 every request; dense attention ignores and canonicalizes this flag.
 `paged_v_tail_is_zero=True` promises that unused rows following each request's
@@ -287,7 +287,7 @@ k = torch.randn(B, Sk, Hkv, D, device=device, dtype=torch.bfloat16)
 v = torch.randn_like(k)
 
 wrapper = BatchPrefillTSWrapper()
-wrapper.plan(device=q.device, batch_size=B, max_seq_len_q=Sq, max_kv_len=Sk, num_qo_heads=Hq, num_kv_heads=Hkv, head_dim=D, q_dtype=q.dtype, k_dtype=k.dtype, mask_type='causal')
+wrapper.plan(device=q.device, batch_size=B, max_q_len=Sq, max_kv_len=Sk, num_qo_heads=Hq, num_kv_heads=Hkv, head_dim=D, q_dtype=q.dtype, k_dtype=k.dtype, mask_type='causal')
 out = wrapper.run(q, k, v)
 assert out.shape == q.shape
 ```
@@ -299,7 +299,7 @@ q = torch.randn(1, 8192, 96, 192, device="cuda", dtype=torch.bfloat16)
 k = torch.randn(1, 8192, 1, 192, device="cuda", dtype=torch.bfloat16)
 v = torch.randn(1, 8192, 1, 128, device="cuda", dtype=torch.bfloat16)
 wrapper = BatchPrefillTSWrapper()
-wrapper.plan(device=q.device, batch_size=1, max_seq_len_q=8192, max_kv_len=8192, num_qo_heads=96, num_kv_heads=1, head_dim=192, head_dim_vo=128, q_dtype=q.dtype, k_dtype=k.dtype, mask_type='causal', out_dtype=torch.bfloat16)
+wrapper.plan(device=q.device, batch_size=1, max_q_len=8192, max_kv_len=8192, num_qo_heads=96, num_kv_heads=1, head_dim=192, head_dim_vo=128, q_dtype=q.dtype, k_dtype=k.dtype, mask_type='causal', out_dtype=torch.bfloat16)
 out = wrapper.run(q, k, v)
 assert out.shape == (1, 8192, 96, 128)
 ```
@@ -327,7 +327,7 @@ block_tables = torch.tensor(((0, 1, -1), (2, 3, 4)), device=device, dtype=torch.
 seq_lens_kv = torch.tensor(kv_lens, device=device, dtype=torch.int32)
 
 wrapper = BatchPrefillPagedTSWrapper(kv_layout="HND")
-wrapper.plan(device=q.device, batch_size=B, max_seq_len_q=max(q_lens), max_kv_len=max(kv_lens), num_qo_heads=Hq, num_kv_heads=Hkv, head_dim=D, q_dtype=q.dtype, k_dtype=k_cache.dtype, out_dtype=q.dtype, page_size=page_size, mask_type='causal')
+wrapper.plan(device=q.device, batch_size=B, max_q_len=max(q_lens), max_kv_len=max(kv_lens), num_qo_heads=Hq, num_kv_heads=Hkv, head_dim=D, q_dtype=q.dtype, k_dtype=k_cache.dtype, out_dtype=q.dtype, page_size=page_size, mask_type='causal')
 out = wrapper.run(
     q,
     k_cache,
@@ -335,6 +335,8 @@ out = wrapper.run(
     qo_indptr,
     block_tables,
     seq_lens_kv,
+    max_q_len=max(q_lens),
+    max_kv_len=max(kv_lens),
 )
 assert out.shape == q.shape
 ```
@@ -345,8 +347,9 @@ supply `output_scale=v_descale`; `softmax_scale` is unchanged because Q and K st
 BF16. Both wrappers accept this combination for head dimensions 128, 192, and 256.
 
 For CUDA graph capture, call `plan()` and perform one default-validating
-`run()` first. Capture subsequent calls with `validate=False`, keep every
-run-time tensor shape, stride, and address stable, preserve any explicit
+`run()` first. Capture subsequent calls with `validate=False`, pass the plan's
+capacity as `max_q_len` and `max_kv_len` (omitted packed and paged bounds
+default to plan capacities), keep every run-time tensor shape, stride, and address stable, preserve any explicit
 length or zero-tail promises, keep variable-window token and CTA starts
 consistent when supplying both, and pass a preallocated, non-overlapping `out`.
 Callers must keep storage unmodified until queued work completes. Before

@@ -58,7 +58,9 @@ def local_kv_tile_idx(
             return base + Int32(inst_id)
         return base + Int32(cfg.num_insts_kv + inst_id)
     if cutlass.const_expr(
-        requested_splits is None and cfg.total_kv_tiles <= cfg.num_insts_kv
+        requested_splits is None
+        and cfg.seq_len_kv is not None
+        and cfg.total_kv_tiles <= cfg.num_insts_kv
     ):
         return Int32(inst_id)
     return stage_info.loop_end * Int32(cfg.num_insts_kv) + Int32(inst_id)
@@ -172,7 +174,10 @@ def runtime_local_kv_tiles(
     if cutlass.const_expr(cfg.fixed_sparse_kv_tiles > 0):
         return Int32(cfg.fixed_sparse_kv_tiles)
     if cutlass.const_expr(
-        cfg.sparse_direct and cfg.seq_len_kv <= 256 and cfg.num_ctas_per_seq_kv == 1
+        cfg.seq_len_kv is not None
+        and cfg.sparse_direct
+        and cfg.seq_len_kv <= 256
+        and cfg.num_ctas_per_seq_kv == 1
     ):
         # The short direct schedule executes its planned padded tiles. Every
         # consumer must use that same domain: using the smaller live length

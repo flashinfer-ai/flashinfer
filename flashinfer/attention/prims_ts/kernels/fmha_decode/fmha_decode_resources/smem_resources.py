@@ -529,7 +529,7 @@ class SmemQResource(DecodeGenResourceBase):
                 logical_b_idx,
             )
 
-        if cutlass.const_expr(cfg.max_seq_len_q == 1):
+        if cutlass.const_expr(cfg.fixed_seqlen and cfg.max_seq_len_q == 1):
             return (
                 head_dim_offset,
                 logical_q_group_idx * Int32(cfg.tile_size_q),
@@ -923,7 +923,9 @@ class SmemKvTileResource(DecodeGenResourceBase):
                 + tile_idx
             )
         if cutlass.const_expr(
-            self.seqlens_kv is None and not self.cfg.uses_runtime_q_kv_union
+            self.seqlens_kv is None
+            and self.cfg.fixed_seqlen
+            and not self.cfg.uses_runtime_q_kv_union
         ):
             if cutlass.const_expr(self.cfg.use_split_kv):
                 tile_idx = _static_split_kv_global_tile_idx(
@@ -1901,7 +1903,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         """Read a private, tail-padded query bit-plane without transposing it."""
         cfg = self.cfg
         assert cfg.query_major_memberships and cfg.num_tokens_per_page == 4
-        assert cfg.tile_size_kv == 128 and 2 <= cfg.max_seq_len_q <= 8
+        assert cfg.tile_size_kv == 128
         query = q_token_idx & Int32(7)
         word = Uint32(0)
         if cutlass.const_expr(self.cache_memberships_in_smem):
@@ -2794,7 +2796,9 @@ class SmemKvResource(DecodeGenResourceBase):
         # Apply runtime sequence-length, split-KV, and sliding-window
         # transforms to a local prefetch tile.
         if cutlass.const_expr(
-            self.seqlens_kv is None and not self.cfg.uses_runtime_q_kv_union
+            self.seqlens_kv is None
+            and self.cfg.fixed_seqlen
+            and not self.cfg.uses_runtime_q_kv_union
         ):
             if cutlass.const_expr(self.cfg.use_split_kv):
                 tile_idx = _static_split_kv_global_tile_idx(
