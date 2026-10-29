@@ -38,11 +38,11 @@ backward main kernel needs a large shared-memory carveout, so a side kernel
 holding every SM with the default carveout delays its start until the side
 kernel exits (documented in :mod:`flashinfer.cake_rmsnorm_train`).  The
 documented remedy is checked here: with the side kernel's preferred carveout
-set to the maximum shared memory, the backward starts beside it and costs at
+set to the maximum shared memory, the backward (residual route excepted: it
+also needs nearly all registers) and the forward start beside it and cost at
 most ``MAX_ALL_SM_EXTRA_MS`` more than alone, far below the side kernel's
-``ALL_SM_SPIN_MS`` lifetime; the forward starts beside the default-carveout
-side kernel.  Every side CTA records its SM, and a run counts only when the side
-kernel holds every SM.
+``ALL_SM_SPIN_MS`` lifetime.  Every side CTA records its SM, and a run counts
+only when the side kernel holds every SM.
 """
 
 from __future__ import annotations
@@ -264,13 +264,12 @@ def test_dw_is_bitwise_independent_of_the_launch_grid(
 ALL_SM_SPIN_MS = 50.0
 ALL_SM_THREADS = 128
 ALL_SM_PRE_SLEEP_CYCLES = 2_000_000
-ALL_SM_TOKENS = (4096, 16384)
+ALL_SM_TOKENS = (256, 1024, 4096, 16384)
 ALL_SM_RUNS = 5
 ALL_SM_TRIES = 4
 MAX_ALL_SM_EXTRA_MS = 1.0
-# cudaSharedmemCarveoutMaxShared / cudaSharedmemCarveoutDefault
+# cudaSharedmemCarveoutMaxShared
 CARVEOUT_MAX_SHARED = 100
-CARVEOUT_DEFAULT = -1
 
 _SPIN_KERNEL = "cake_rmsnorm_train_stall_spin"
 _SPIN_SOURCE = r"""
@@ -447,7 +446,7 @@ def test_backward_starts_beside_an_all_sm_kernel_with_the_max_shared_carveout(
 
 @pytest.mark.parametrize("rows", ALL_SM_TOKENS)
 @pytest.mark.parametrize("hidden", [h for h, _eps in WIDTHS], ids=lambda v: str(v))
-def test_forward_starts_beside_an_all_sm_kernel_with_the_default_carveout(
+def test_forward_starts_beside_an_all_sm_kernel_with_the_max_shared_carveout(
     hidden: int, rows: int
 ) -> None:
     _skip_unless_route(hidden, False)
@@ -456,9 +455,9 @@ def test_forward_starts_beside_an_all_sm_kernel_with_the_default_carveout(
     def call():
         return cake_rmsnorm_train_forward(x, w, EPS[hidden])[0]
 
-    alone_ms, busy_ms, alone, busy = _all_sm_medians(call, CARVEOUT_DEFAULT)
+    alone_ms, busy_ms, alone, busy = _all_sm_medians(call, CARVEOUT_MAX_SHARED)
     print(
-        f"ALL_SM_FWD hidden={hidden} rows={rows} carveout=default "
+        f"ALL_SM_FWD hidden={hidden} rows={rows} carveout=max_shared "
         f"alone_ms={alone_ms:.4f} busy_ms={busy_ms:.4f} extra_ms={busy_ms - alone_ms:.4f}"
     )
     reference = alone[0][1]
@@ -466,5 +465,5 @@ def test_forward_starts_beside_an_all_sm_kernel_with_the_default_carveout(
         assert torch.equal(y, reference)
     assert busy_ms - alone_ms <= MAX_ALL_SM_EXTRA_MS, (
         f"hidden={hidden} rows={rows}: forward alone {alone_ms:.4f} ms, beside an all-SM "
-        f"kernel with the default carveout {busy_ms:.4f} ms (at most {MAX_ALL_SM_EXTRA_MS} ms more)"
+        f"kernel with the max-shared carveout {busy_ms:.4f} ms (at most {MAX_ALL_SM_EXTRA_MS} ms more)"
     )

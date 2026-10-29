@@ -46,8 +46,9 @@ than the SMs they hold.  Setting ``cudaFuncAttributePreferredSharedMemoryCarveou
 to ``cudaSharedmemCarveoutMaxShared`` on such a resident kernel, or giving it a
 large dynamic shared-memory allocation, lets the backward start beside it.  The
 residual-fused H 6144 backward also needs nearly all of an SM's registers, so
-it waits beside any kernel resident on every SM.  The forward kernels fit any
-carveout and do not wait.
+it waits beside any kernel resident on every SM.  Some forward programs also
+need more shared memory than a small carveout leaves and wait the same way; the
+same remedy applies to them.
 
 Usage::
 
