@@ -166,7 +166,8 @@ def _blackwell_softmax_cached_kernel_for_testing(
     """Return the cached-cluster kernel the C++ dispatcher would launch, without
     launching it: (cluster CTAs, max tiles, 1 if it is a PDL twin, its resident
     clusters on this device, the resident clusters of the 4-tile kernel twice its
-    size or 0 past 16 CTAs), or () for the other routes."""
+    size or 0 past 16 CTAs, the per-CTA chunk in elements), or () for the other
+    routes."""
     if not logits.is_cuda:
         raise ValueError(f"logits must be a CUDA tensor, got device={logits.device}")
     device_index = logits.device.index
@@ -1633,21 +1634,28 @@ def _top_k_first_fast_path_applicable(
     x: torch.Tensor,
     top_k: Union[torch.Tensor, int],
     indices: Optional[torch.Tensor],
+    top_k_max: Optional[int] = None,
 ) -> bool:
+    # A per-row top_k tensor qualifies only through the caller's top_k_max bound:
+    # deriving the bound from top_k.max() would add a host sync on every call.
+    # Other tensor shapes fall back, which raises ValueError.
+    select_k = top_k if isinstance(top_k, int) else top_k_max
     return (
         indices is None
-        and isinstance(top_k, int)
-        and 0 < top_k <= _TOP_K_FIRST_FAST_PATH_MAX_K
+        and (isinstance(top_k, int) or top_k.shape == (x.size(0),))
+        and select_k is not None
+        and 0 < select_k <= _TOP_K_FIRST_FAST_PATH_MAX_K
         and x.size(-1) >= _TOP_K_FIRST_FAST_PATH_MIN_VOCAB
-        and top_k < x.size(-1)
+        and select_k < x.size(-1)
     )
 
 
 def _top_k_first_fast_path(
     x: torch.Tensor,
-    top_k: int,
+    top_k: Union[torch.Tensor, int],
     top_p: Union[torch.Tensor, float],
     *,
+    top_k_max: Optional[int] = None,
     from_logits: bool,
     deterministic: bool,
     generator: Optional[torch.Generator],
@@ -1663,16 +1671,28 @@ def _top_k_first_fast_path(
     deterministic ordering for both logits and probs inputs, so the two entry points
     reduce to the same ``probs_k`` and stay sample-aligned. This is distribution-equivalent
     to the masked full-vocab path (validated TV ~0.01) but far cheaper at small batch.
+
+    A ``top_k`` tensor selects ``top_k_max`` sorted entries, so masking each row past
+    its own k leaves exactly its top-k.
     """
     # Local import avoids a module-level cycle between sampling and topk.
     from .topk import top_k as _radix_top_k
 
     # deterministic=True makes top-k reproducible (its radix deterministic-collect path is
     # stable even at ties). We do not enforce a tie break that requires 128KB smem/block.
+    select_k = top_k if isinstance(top_k, int) else top_k_max
     values, gathered_indices = _radix_top_k(
-        x, top_k, sorted=True, deterministic=deterministic
+        x, select_k, sorted=True, deterministic=deterministic
     )
     values = values.float()
+    if not isinstance(top_k, int):
+        # As in the fallback: k < 0 means no top-k, k == 0 is greedy.
+        k = top_k.int()
+        row_k = torch.where(k < 0, select_k, k.clamp(min=1)).unsqueeze(-1)
+        cols = torch.arange(select_k, device=x.device)
+        values = values.masked_fill(
+            cols >= row_k, float("-inf") if from_logits else 0.0
+        )
     if from_logits:
         # softmax over the k retained logits == top-k-masked softmax over the full vocab.
         probs_k = torch.softmax(values, dim=-1)
@@ -1716,6 +1736,7 @@ def top_k_top_p_sampling_from_logits(
     check_nan: bool = False,
     seed: Optional[Union[int, torch.Tensor]] = None,
     offset: Optional[Union[int, torch.Tensor]] = None,
+    top_k_max: Optional[int] = None,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for top-k and top-p sampling from pre-softmax logits.
 
@@ -1784,6 +1805,11 @@ def top_k_top_p_sampling_from_logits(
         Warning: If you provide seed and offset explicitly, you are responsible for updating
         their values between calls to ensure different random samples. The offset should be
         incremented based on the number of random values consumed by the operation.
+    top_k_max: Optional[int]
+        Unchecked upper bound on a ``top_k`` tensor; keep it tight. Used only with
+        ``"top_k_first"``, no ``indices``, ``top_k_max <= 256`` and ``num_classes >= 65536``,
+        where rows above it (including "no top-k" rows) sample with ``top_k = top_k_max``.
+        Otherwise ignored. Default is ``None``.
 
     Returns
     -------
@@ -1829,11 +1855,12 @@ def top_k_top_p_sampling_from_logits(
     top_p_sampling_from_probs
     """
     if filter_apply_order == "top_k_first":
-        if _top_k_first_fast_path_applicable(logits, top_k, indices):
+        if _top_k_first_fast_path_applicable(logits, top_k, indices, top_k_max):
             return _top_k_first_fast_path(
                 logits,
                 top_k,
                 top_p,
+                top_k_max=top_k_max,
                 from_logits=True,
                 deterministic=deterministic,
                 generator=generator,
@@ -1885,6 +1912,7 @@ def top_k_top_p_sampling_from_probs(
     seed: Optional[Union[int, torch.Tensor]] = None,
     offset: Optional[Union[int, torch.Tensor]] = None,
     return_valid: bool = False,
+    top_k_max: Optional[int] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Fused GPU kernel for top-k and top-p sampling from probabilities.
 
@@ -1957,6 +1985,11 @@ def top_k_top_p_sampling_from_probs(
         When ``True``, the kernel returns an additional boolean mask
         indicating which rows had a valid (non-degenerate) distribution
         after the renormalization step.  Defaults to ``False``.
+    top_k_max: Optional[int]
+        Unchecked upper bound on a ``top_k`` tensor; keep it tight. Used only with
+        ``"top_k_first"``, no ``indices``, ``top_k_max <= 256`` and ``num_classes >= 65536``,
+        where rows above it (including "no top-k" rows) sample with ``top_k = top_k_max``.
+        Otherwise ignored. Default is ``None``.
 
     Returns
     -------
@@ -2001,11 +2034,12 @@ def top_k_top_p_sampling_from_probs(
     top_k_mask_logits
     """
     if filter_apply_order == "top_k_first":
-        if _top_k_first_fast_path_applicable(probs, top_k, indices):
+        if _top_k_first_fast_path_applicable(probs, top_k, indices, top_k_max):
             return _top_k_first_fast_path(
                 probs,
                 top_k,
                 top_p,
+                top_k_max=top_k_max,
                 from_logits=False,
                 deterministic=deterministic,
                 generator=generator,

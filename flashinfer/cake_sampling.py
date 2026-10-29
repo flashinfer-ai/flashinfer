@@ -299,12 +299,61 @@ def _stage1_variants(smem_limit: Optional[int] = None) -> list[tuple[int, int, b
     """Frozen stage-1 variants whose dynamic shared memory fits ``smem_limit`` (all when None).
 
     The frozen variants were sized for the 227 KB opt-in limit of 9.x-11.x devices; 12.x devices
-    opt in to 99 KB, so the larger register-resident variants are not candidates there."""
+    opt in to 99 KB, so the larger register-resident variants are not candidates there.  The
+    compact-list twins (``compact_list``, launch_flags bit 13) are not variants of their own: their
+    (cluster, ept) are those of the full-list streams they double, which do not fit a 12.x opt-in."""
     return [
         (v["cluster"], v["ept"], bool(v["stream"]))
         for v in load_manifest()["stage1"]
-        if smem_limit is None or int(v["dynamic_smem_bytes"]) <= smem_limit
+        if not v.get("compact_list", False)
+        and (smem_limit is None or int(v["dynamic_smem_bytes"]) <= smem_limit)
     ]
+
+
+# Register-resident builds the host takes on one device only, in place of the build the cost model or a measured pick
+# selects there, per device (capability, SM count): the build replaced -> the build taken.  A 12.x device opts in to
+# 101,376 B of dynamic shared memory, so no stream fits and a row of 131,072 < V <= 163,840 entries lands on the
+# cluster-8 resident.  The (8, 40) build holds the V = 151,936 row at 92.7 % of its registers (77.3 % at ept 48) and
+# compiles for sm_120a without stack or spills, where the (8, 48) build spills; it carries the fused two-warp tail (one
+# launch at k <= fused_tail_kcap) and ships a no-tail twin for the two-launch chain.  RTX PRO 6000 (12, 0) with 188
+# SMs, V = 151936, batch 1-128, top-k 10 / 50 / 1000, against the (8, 48) build (two boards, eager and CUDA graph, two
+# input placements, 8 rounds, the same sampled tokens): 0.867-0.962x, -1.0..-7.1 us.  With 144-512 rows at
+# V = 131073-163840 and top-k 10 / 50 its one-launch fused tail took 0.833-0.988x of the (8, 48) chain's time up to 208
+# rows but up to 1.036x from 224 rows, so from 160 rows a top-k up to fused_tail_kcap takes the (8, 40) build's
+# two-launch chain on its no-tail twin instead (``_MULTI_WAVE_CHAIN_BY_DEVICE``): 0.825-0.987x of the (8, 48) chain's
+# time with 160-512 rows.  The cost model never ranks these builds (its tables were fitted without them), and a device
+# absent here (another SM count of the same capability too) keeps its plans.
+_SM12X_RESIDENTS_BY_DEVICE: dict[
+    tuple[int, int, int], dict[tuple[int, int, bool], tuple[int, int, bool]]
+] = {
+    # RTX PRO 6000 Blackwell Server (188 SMs)
+    (12, 0, 188): {(8, 48, False): (8, 40, False)},
+}
+# Every build of ``_SM12X_RESIDENTS_BY_DEVICE``: none is a cost-model candidate on any device.
+_SM12X_RESIDENT_BUILDS: frozenset[tuple[int, int, bool]] = frozenset(
+    build for table in _SM12X_RESIDENTS_BY_DEVICE.values() for build in table.values()
+)
+
+
+def _sm12x_resident(
+    capability: tuple[int, int],
+    sm_count: int,
+    vocab: int,
+    smem_limit: Optional[int],
+    pick: tuple[int, int, bool],
+) -> tuple[int, int, bool]:
+    """The ``_SM12X_RESIDENTS_BY_DEVICE`` build that replaces ``pick`` on the device (``capability``,
+    ``sm_count``) when it ships, fits ``smem_limit`` and covers ``vocab`` as the cost model's resident candidates do;
+    else ``pick``."""
+    build = _SM12X_RESIDENTS_BY_DEVICE.get(
+        (int(capability[0]), int(capability[1]), int(sm_count)), {}
+    ).get((int(pick[0]), int(pick[1]), bool(pick[2])))
+    if build is None or build not in _stage1_variants(smem_limit):
+        return pick
+    cluster, ept, _ = build
+    if _THREADS * ept * cluster < vocab or _THREADS * ept * (cluster // 2) >= vocab:
+        return pick
+    return build
 
 
 @functools.cache
@@ -336,10 +385,59 @@ def _stage23_variant_flags(device_index: int) -> int:
     return table.get(_device_capability(device_index), table[None])
 
 
+# Per-slab exceptions to the per-capability form: capability -> {(threads, items): variant_flags}.  RTX PRO 6000
+# (12, 0): the (256, 4) slab, which every top-k above 512 runs, dispatches the int_tests + one_cmp_select form; on two
+# boards it took 0.929-0.992x of the base form's call time on all 24 top-k 1000 benchmark cells (eager and CUDA
+# graph), while the same form on every slab slowed the 32 x 2 slab of the top-k 10 / 50 cells by up to 1 %.
+_STAGE23_SLAB_FLAGS_BY_CAPABILITY: dict[tuple[int, int], dict[tuple[int, int], int]] = {
+    (12, 0): {(256, 4): 3},
+}
+
+
+# Two-launch chains of single cells per device (capability, SM count): (vocab, batch) -> the stage-2/3
+# ``variant_flags`` the (256, 4) slab dispatches there, for 768 < top_k_max <= 1024; the chain's stage 1 also takes
+# its build's no-tail twin (launch_flags bit 12).  Round 18: on the 212-SM R200 the V = 32768 rows at batch 1, 2 and 4
+# (the (4, 16) resident's chain) run `c4_e16_nt` + `t256_i4_int_sel1`; at k = 1000 batch 1 at 0.979-0.987 of the
+# `c4_e16` + `t256_i4` chain's time (two nodes, 12 rounds, multi-cell, single-cell and first-in-process layouts, both
+# buffer placements, eager and graph, same sampled tokens) and batch 2 and 4 at 0.985-0.994 (multi-cell layout).  The
+# one-launch whole-CTA tail is not taken at batch 1: alone in a process it runs at 0.888-0.985, but its single CTA's
+# cold-L2 time moves between 11.1 and 14.4 us with the process's allocation history (up to 1.133 of the chain in
+# multi-cell processes).
+_CHAIN_CELL_FORMS_BY_DEVICE: dict[tuple[int, int, int], dict[tuple[int, int], int]] = {
+    (10, 7, 212): {(32768, 1): 3, (32768, 2): 3, (32768, 4): 3},
+}
+
+
+def _chain_cell_form(
+    capability: tuple[int, int],
+    sm_count: int,
+    batch: int,
+    vocab: int,
+    top_k_max: Optional[int],
+) -> Optional[int]:
+    """The ``_CHAIN_CELL_FORMS_BY_DEVICE`` stage-2/3 form of this device's cell, else None."""
+    if top_k_max is None or not (
+        _BLOCK_TAIL_MIN_K < top_k_max <= _fused_block_tail_kcap()
+    ):
+        return None
+    forms = _CHAIN_CELL_FORMS_BY_DEVICE.get(
+        (int(capability[0]), int(capability[1]), int(sm_count)), {}
+    )
+    return forms.get((int(vocab), int(batch)))
+
+
+def _stage23_plan_flags(device_index: int, threads: int, items: int) -> int:
+    """``variant_flags`` of the stage-2/3 form a plan with the ``(threads, items)`` slab dispatches on the device:
+    its ``_STAGE23_SLAB_FLAGS_BY_CAPABILITY`` exception, else the per-capability form."""
+    slabs = _STAGE23_SLAB_FLAGS_BY_CAPABILITY.get(_device_capability(device_index), {})
+    return slabs.get((threads, items), _stage23_variant_flags(device_index))
+
+
 def stage23_variant_flags(device: torch.device | int | None = None) -> int:
     """Bit mask of the static stage-2/3 features dispatched on ``device`` (``STAGE23_FEATURE_BITS``); 0 = base
-    form (f64 tests, max / min exchange), the form every unlisted architecture runs.  Cached per device index:
-    the eager k > 64 path calls this on every launch."""
+    form (f64 tests, max / min exchange), the form every unlisted architecture runs.  A slab listed in
+    ``_STAGE23_SLAB_FLAGS_BY_CAPABILITY`` for the device's capability dispatches its own form instead.  Cached per
+    device index: the eager k > 64 path calls this on every launch."""
     if isinstance(device, int):
         index = device
     elif device is None or device.index is None:
@@ -382,7 +480,8 @@ def _fused_block_tail_kcap() -> int:
 def _stage1_has_fused_block_tail(cluster: int, ept: int, stream: bool) -> bool:
     """Whether the frozen variant ships a whole-CTA-tail build (a manifest entry with ``fused_block_tail``): the
     kernel taken by launch_flags bit 3, built for the cluster-8 streams the host can fuse it into
-    (``_fuse_block_tail``).  The default build of every variant carries only the two-warp tail --
+    (``_fuse_block_tail``) and, as a speculative-sample build (bits 3 + 6), for the cluster-1 ept-32 stream
+    (``_c12_block_tail``).  The default build of every variant carries only the two-warp tail --
     compiling the whole-CTA tail into it slowed every k <= 64 launch on sm_103a / sm_107a by 13-33 %."""
     found = False
     for v in load_manifest()["stage1"]:
@@ -401,20 +500,276 @@ def _stage1_has_fused_block_tail(cluster: int, ept: int, stream: bool) -> bool:
 # cluster-8 streams at k = 1000 win on both (B200 0.89-0.94, GB300 0.89-0.97), so ``_fuse_block_tail`` takes the twin
 # only for a cluster-8 stream with top_k_max > _BLOCK_TAIL_MIN_K on a one-wave grid.  Round 8 adds H100: under graph
 # replay the twin runs 0.93-0.97 of the chain at V = 151936 and 0.96-0.99 at V = 262144 (B = 1-8, k = 800 / 1000, bitwise
-# identical; eager 0.93-0.98).  R200 keeps the chain (no graph-replay A/B recorded for it).
+# identical; eager 0.93-0.98).  R200 keeps the cluster-8 chain (no graph-replay A/B recorded for it).  This policy covers
+# the cluster-8 streams (``_fuse_block_tail``), up to the vocabulary bound of ``_BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY``;
+# the cluster-1 / cluster-2 cells are listed per capability in ``_C12_BLOCK_TAIL_CELLS``.
 _BLOCK_TAIL_CAPABILITIES: frozenset[tuple[int, int]] = frozenset(
     {(9, 0), (10, 0), (10, 3)}
 )
 _BLOCK_TAIL_MIN_CLUSTER = 8
 _BLOCK_TAIL_MIN_K = 768
-# Largest row the whole-CTA tail serves per capability (None: any).  GB300 round-7 matrices: the cluster-8 streams at
-# V = 151936 run 3-11 % faster fused, at V = 262144 3-7 % slower eager (a cold-L2 stage 1 is hidden by the chain's
-# host-bound launch gap there) and even under graph replay, so GB300 keeps the chain above this vocabulary.
+# Largest row the cluster-8 whole-CTA tail serves per capability (None: any); the (vocab, batch) cells of
+# _BLOCK_TAIL_ABOVE_VOCAB_CELLS keep the tail above it.  GB300 round-7 matrices: the cluster-8 streams at V = 151936 ran
+# 3-11 % faster fused, at V = 262144 3-7 % slower eager (a cold-L2 stage 1 is hidden by the chain's host-bound launch
+# gap there) and even under graph replay, so GB300 kept the chain above 196608.  Round 15 (lever LP-BT 3a): the
+# current two-launch chain of the same (8, 16) stream (its leader-push `_lp` build with the row-span filter arm and the
+# early trigger, plus the prepass on 10.x) beats the tail above V = 128256 on all three capabilities (V = 151936 /
+# 262144, B = 1-8, k = 1000; 8 rounds, two buffer placements, eager and graph, bitwise identical): the chain runs
+# 0.949-0.987 of the `_bt_tia` launch on GB300 at V = 151936, 0.936-0.970 of the `_bt` launch on B200 at V = 262144 and
+# 0.975-0.994 at V = 151936 B = 2-8, and 0.935-0.984 on H100.  B200's V = 151936 B = 1 cell keeps the tail (eager
+# 1.002 / 1.010, graph 0.992), and so do its B = 2 and 4 cells: the chain ran 0.980-0.996 of the tail there on those
+# two B200 nodes but 1.003-1.011 on a third, in all 8 eager / graph x placement rows (8 rounds; unchanged cells
+# 0.998-1.002).
+# V = 128256 keeps the tail everywhere: the `_lp` build keeps the 2 k + 64 candidate need
+# that round 14 lowered to 1.5 k + 64 in the `_bt` build only, so its k = 1000 rows there miss the whole-list gather
+# (H100 1.18-1.27).
 _BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY: dict[tuple[int, int], Optional[int]] = {
-    (9, 0): None,
-    (10, 0): None,
-    (10, 3): 196608,
+    (9, 0): 128256,
+    (10, 0): 128256,
+    (10, 3): 128256,
 }
+_BLOCK_TAIL_ABOVE_VOCAB_CELLS: dict[tuple[int, int], frozenset[tuple[int, int]]] = {
+    (10, 0): frozenset({(151936, 1), (151936, 2), (151936, 4)}),
+}
+
+
+@functools.cache
+def _stage1_has_block_tail_build(cluster: int, ept: int, spec_sample: bool) -> bool:
+    """Whether the frozen stream (cluster, ept) ships a whole-CTA-tail build of that sample form (a manifest stream
+    entry with ``fused_block_tail`` and ``spec_sample`` as given, the pull exchange and the f64 tail)."""
+    return any(
+        (v["cluster"], v["ept"], bool(v["stream"])) == (cluster, ept, True)
+        and v["fused_block_tail"]
+        and bool(v["spec_sample"]) == bool(spec_sample)
+        and not v.get("leader_push", False)
+        and not v.get("int_tail", False)
+        for v in load_manifest()["stage1"]
+    )
+
+
+# Cluster-1 / cluster-2 cells whose stream takes the whole-CTA tail (launch_flags bit 3, with bit 6 for the
+# speculative-sample build) per capability: (vocab, batch) -> the (cluster, ept, spec_sample) of the whole-CTA-tail
+# build the cell launches above top-k 768, whatever the measured pick.  One CTA (cluster 1) or two (cluster 2) per row,
+# so on a one-wave grid every row's tail runs beside the others and the stage-2/3 launch, its ramp and its prologue
+# leave the chain.  At V = 262144, batch 128, k = 1000 the cluster-1 speculative-sample launch runs about 0.95-0.97 of
+# the two-launch chain of the same stage-1 text on B200 and GB300 and 0.98-0.99 on R200, eager and under graph replay,
+# with the same sampled tokens.  Round 17 (lever BT-X) adds two H100 cells on the default-sample builds of the (1, 16)
+# and (2, 32) streams: at k = 1000 (two boards, eager and CUDA graph, two input placements, 8 rounds after a warm-up
+# round, the same sampled tokens) V = 32768 with 128 rows ran 0.90-0.91x and V = 262144 with 32 rows 0.94-0.96x of the
+# chains they replace (the (1, 16) speculative-sample chain and the (2, 16) chain).  Other cells lost or tied: on H100
+# V = 128256 / 151936 / 262144 with 128 rows and V = 151936 / 262144 with 64 rows ran 1.07-1.23x; B200 lost on every
+# screened cell but V = 32768 with 128 rows, which tied (up to 1.006x eager), so B200 keeps the chain.
+_C12_BLOCK_TAIL_CELLS: dict[
+    tuple[int, int], dict[tuple[int, int], tuple[int, int, bool]]
+] = {
+    (9, 0): {(32768, 128): (1, 16, False), (262144, 32): (2, 32, False)},
+    (10, 0): {(262144, 128): (1, 32, True)},
+    (10, 3): {(262144, 128): (1, 32, True)},
+    (10, 7): {(262144, 128): (1, 32, True)},
+}
+# Further cluster-1 whole-CTA-tail cells per device (capability, SM count): (vocab, batch) -> the smallest top_k_max
+# (up to the slab) whose launch runs the (1, 32) stream's speculative-sample whole-CTA-tail build
+# (``_C1_BLOCK_TAIL_PICK_BUILD``, through ``_c12_block_tail``) although the cost model picks another variant there.
+# Round 18: on the 212-SM R200 the V = 32768 rows at batch 8 and 16 from k = 800 and at batch 32 from k = 769 (the
+# cost model's (4, 16) resident runs them as a two-launch chain) run `c1_e32s_bt_sp_tia` at 0.927-0.982 of the chain
+# at k = 1000, 0.945-0.989 at k = 800 and 0.865-0.942 at k = 1024 (two nodes, 12 rounds, both buffer placements,
+# eager and graph, same sampled tokens).  The chain's time grows with k, the tail's does not: at k = 769 the tail is
+# 1.019-1.045 of the chain at batch 8 and 16 (0.937-0.949 at batch 32), so those rows keep the chain below 800.
+# Batch 1, 2 and 4 keep the chain in its ``_CHAIN_CELL_FORMS_BY_DEVICE`` form (the tail runs at 0.966-1.032 of the
+# chain at batch 2 and 4).
+_C1_BLOCK_TAIL_PICKS_BY_DEVICE: dict[
+    tuple[int, int, int], dict[tuple[int, int], int]
+] = {
+    (10, 7, 212): {(32768, 8): 800, (32768, 16): 800, (32768, 32): 769},
+}
+_C1_BLOCK_TAIL_PICK_BUILD = (1, 32, True)
+
+
+def _c1_block_tail_pick_cell(
+    capability: tuple[int, int],
+    sm_count: int,
+    batch: int,
+    vocab: int,
+    top_k_max: Optional[int],
+) -> bool:
+    """Whether this device's ``_C1_BLOCK_TAIL_PICKS_BY_DEVICE`` lists the cell for ``top_k_max``."""
+    picks = _C1_BLOCK_TAIL_PICKS_BY_DEVICE.get(
+        (int(capability[0]), int(capability[1]), int(sm_count)), {}
+    )
+    min_k = picks.get((int(vocab), int(batch)))
+    return min_k is not None and top_k_max is not None and int(top_k_max) >= min_k
+
+
+def _c12_block_tail(
+    batch: int,
+    vocab: int,
+    top_k_max: Optional[int],
+    capability: tuple[int, int],
+    sm_count: int,
+    smem_limit: Optional[int] = None,
+) -> Optional[tuple[int, int, bool]]:
+    """The (cluster, ept, spec_sample) of the cluster-1 / cluster-2 whole-CTA-tail stream build this call launches
+    (``_C12_BLOCK_TAIL_CELLS``, and ``_C1_BLOCK_TAIL_PICK_BUILD`` on the device's ``_C1_BLOCK_TAIL_PICKS_BY_DEVICE``
+    cells from their smallest top_k_max): 768 < top_k_max <= the slab, the build ships and fits ``smem_limit``, and
+    its stage-1 grid is a single wave; else None."""
+    if top_k_max is None or not (
+        _BLOCK_TAIL_MIN_K < top_k_max <= _fused_block_tail_kcap()
+    ):
+        return None
+    build = _C12_BLOCK_TAIL_CELLS.get((int(capability[0]), int(capability[1])), {}).get(
+        (int(vocab), int(batch))
+    )
+    if build is None and _c1_block_tail_pick_cell(
+        capability, sm_count, batch, vocab, top_k_max
+    ):
+        build = _C1_BLOCK_TAIL_PICK_BUILD
+    if build is None:
+        return None
+    cluster, ept, spec = build
+    if (cluster, ept, True) not in _stage1_variants(smem_limit):
+        return None
+    if not _stage1_has_block_tail_build(cluster, ept, spec):
+        return None
+    if int(batch) * cluster > min(int(sm_count), _wave_ctas(int(sm_count))[cluster]):
+        return None
+    return build
+
+
+# Round 17 (lever LP-BT 3b): the leader-push form of the cluster-8 ept-16 stream's whole-CTA-tail build (`_lp_bt`, and
+# `_lp_bt_tia` with the integer-tested tail; launch_flags bits 3 + 9).  Every CTA stores its candidate list into rank
+# 0's shared memory before the one exchange barrier; rank 0 selects the k pairs into a shared-memory slab and runs the
+# whole-CTA tail after a CTA barrier, with no second cluster barrier and no slab round trip through L2.  A row whose
+# lists exceed the 512 receive slots of a CTA or 2048 in all takes the cluster passes or the exact fallback with every
+# CTA, the cluster barrier and the global slab, as the pull build does.  Its candidate need is 1.5 k + 64, as the pull
+# build's.  The (vocab, batch) cells per capability whose launch of a top-k above the capability's
+# _LEADER_PUSH_BLOCK_TAIL_MIN_K (or above the cell's _LEADER_PUSH_BLOCK_TAIL_CELL_MIN_K, where that is larger) takes it,
+# on the (8, 16) stream whatever the measured pick, in one launch: against the plans they replace (the pull whole-CTA
+# tail or the leader-push chain of the same stream, or the (8, 32) resident's chain), at top-k 769 / 800 / 1000 / 1024,
+# 1-8 rows, two boards per device, eager and CUDA graph, two input placements, 8 rounds after a warm-up round, the same
+# sampled tokens, H100 ran 0.877-0.957x (-0.7..-2.2 us), B200 0.878-0.989x (-0.1..-2.2 us) and GB300 0.897-0.987x
+# (-0.2..-1.8 us) on every listed cell inside its window.
+_LEADER_PUSH_BLOCK_TAIL_STAGE1 = (8, 16, True)
+_LEADER_PUSH_BLOCK_TAIL_CELLS: dict[tuple[int, int], frozenset[tuple[int, int]]] = {
+    (9, 0): frozenset(
+        {
+            (128256, 1),
+            (128256, 2),
+            (128256, 4),
+            (128256, 8),
+            (151936, 1),
+            (151936, 2),
+            (151936, 4),
+            (151936, 8),
+            (262144, 1),
+            (262144, 2),
+            (262144, 4),
+            (262144, 8),
+        }
+    ),
+    (10, 0): frozenset(
+        {
+            (128256, 1),
+            (128256, 2),
+            (128256, 4),
+            (128256, 8),
+            (151936, 1),
+            (151936, 2),
+            (151936, 4),
+            (151936, 8),
+            (262144, 1),
+            (262144, 2),
+            (262144, 4),
+            (262144, 8),
+        }
+    ),
+    (10, 3): frozenset(
+        {
+            (128256, 1),
+            (128256, 2),
+            (128256, 4),
+            (128256, 8),
+            (151936, 1),
+            (151936, 2),
+            (151936, 4),
+            (151936, 8),
+            (262144, 1),
+            (262144, 2),
+            (262144, 4),
+            (262144, 8),
+        }
+    ),
+}
+# The top-k above which a listed cell takes the leader-push whole-CTA tail, per capability (never below
+# _BLOCK_TAIL_MIN_K).  At V = 262144 the replaced chain was as fast with 1 row at top-k 769 on B200 (up to 1.003x) and
+# on GB300 with 1-2 rows at top-k 769 and 1 row at top-k 800 (up to 1.008x), so the window starts at 800 on B200 and
+# above 800 on GB300.
+_LEADER_PUSH_BLOCK_TAIL_MIN_K: dict[tuple[int, int], int] = {
+    (9, 0): 768,
+    (10, 0): 799,
+    (10, 3): 800,
+}
+# Cells whose window starts above their capability's (the larger start applies).  On two GB300 boards at top-k
+# 801 / 850 / 900 / 950 / 999 (eager and CUDA graph, two input placements, 12 rounds after a warm-up round, the same
+# sampled tokens) the replaced chain was as fast at V = 262144 with 1 row at top-k 801 (up to 1.002x) and with 8 rows
+# at top-k 999 (up to 1.007x, on one of the two boards).  V = 128256 with 2 rows at top-k 801 and V = 262144 with
+# 2 rows at top-k 900 ran faster than the replaced plans (up to 0.924x and 0.972x) and the earlier shipped kernels on
+# every row, but one outlying record of the repeated baseline run widened the noise band past the gain on one board,
+# so the windows of those two cells start above top-k 801 and 900 as well.
+_LEADER_PUSH_BLOCK_TAIL_CELL_MIN_K: dict[
+    tuple[int, int], dict[tuple[int, int], int]
+] = {
+    (10, 3): {(128256, 2): 801, (262144, 1): 801, (262144, 2): 900, (262144, 8): 999},
+}
+# The leader-push whole-CTA-tail launch takes the row-span filter arm (launch_flags bit 5) where the chain does.
+_LEADER_PUSH_BLOCK_TAIL_ROW_SPAN = True
+
+
+@functools.cache
+def _stage1_has_leader_push_block_tail(
+    cluster: int, ept: int, stream: bool, int_tail: bool
+) -> bool:
+    """Whether the frozen variant ships the leader-push form of its whole-CTA-tail build in the given tail form (a
+    manifest entry with ``leader_push``, ``fused_block_tail`` and the matching ``int_tail``)."""
+    return any(
+        (v["cluster"], v["ept"], bool(v["stream"])) == (cluster, ept, stream)
+        and v["fused_block_tail"]
+        and v.get("leader_push", False)
+        and bool(v.get("int_tail", False)) == bool(int_tail)
+        for v in load_manifest()["stage1"]
+    )
+
+
+def _leader_push_block_tail(
+    batch: int,
+    vocab: int,
+    top_k_max: Optional[int],
+    sm_count: int,
+    capability: tuple[int, int],
+) -> bool:
+    """Whether a launch runs the leader-push whole-CTA tail (``_LEADER_PUSH_BLOCK_TAIL_CELLS``): its largest top-k lies
+    in (the capability's _LEADER_PUSH_BLOCK_TAIL_MIN_K or the cell's _LEADER_PUSH_BLOCK_TAIL_CELL_MIN_K, whichever is
+    larger, fused_block_tail_kcap], its (vocab, batch) cell is listed for the capability, the device policy runs the
+    whole-CTA tail and the (8, 16) stream grid is one wave."""
+    cc = (int(capability[0]), int(capability[1]))
+    min_k = max(
+        _BLOCK_TAIL_MIN_K,
+        _LEADER_PUSH_BLOCK_TAIL_MIN_K.get(cc, _BLOCK_TAIL_MIN_K),
+        _LEADER_PUSH_BLOCK_TAIL_CELL_MIN_K.get(cc, {}).get((int(vocab), int(batch)), 0),
+    )
+    if top_k_max is None or not (min_k < top_k_max <= _fused_block_tail_kcap()):
+        return False
+    if (int(vocab), int(batch)) not in _LEADER_PUSH_BLOCK_TAIL_CELLS.get(
+        cc, frozenset()
+    ):
+        return False
+    if not _block_tail_for_capability(cc):
+        return False
+    cluster, ept, stream = _LEADER_PUSH_BLOCK_TAIL_STAGE1
+    if int(batch) * cluster > _wave_ctas(int(sm_count))[cluster]:
+        return False
+    return _stage1_has_leader_push_block_tail(
+        cluster, ept, stream, cc in _INT_TAIL_CAPABILITIES
+    )
 
 
 def _block_tail_for_capability(capability: tuple[int, int]) -> bool:
@@ -449,7 +804,9 @@ def _fuse_block_tail(
     stage-1 grid is a single wave.  Rank 0 of every cluster runs the tail after its row, so a multi-wave grid would
     serialize one tail per wave while the chain's stage-2/3 kernel costs one launch for all rows; under CUDA-graph
     replay the in-CTA tail also loses to the chain on every resident and on every stream at k <= 750 (round 7), and
-    wins 3-11 % only for the cluster-8 streams at k = 1000 on B200 / GB300.  Rows of such a launch with
+    wins 3-11 % only for the cluster-8 streams at k = 1000 on B200 / GB300.  With ``capability`` given, a row longer
+    than the capability's ``_BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY`` bound keeps the chain unless its (vocab, batch) cell
+    is in ``_BLOCK_TAIL_ABOVE_VOCAB_CELLS`` (round 15).  Rows of such a launch with
     k <= CAKE_SAMPLING_FUSED_TAIL_KCAP take the two-warp tail inside the kernel (bit 3 enables it for them too)."""
     if two_launch or top_k_max is None:
         return False
@@ -464,10 +821,14 @@ def _fuse_block_tail(
             raise ValueError(
                 "the whole-CTA tail policy of this capability needs the vocabulary"
             )
-        bound = _BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY.get(
-            (int(capability[0]), int(capability[1]))
-        )
-        if bound is not None and int(vocab) > bound:
+        cc = (int(capability[0]), int(capability[1]))
+        bound = _BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY.get(cc)
+        cells = _BLOCK_TAIL_ABOVE_VOCAB_CELLS.get(cc, frozenset())
+        if (
+            bound is not None
+            and int(vocab) > bound
+            and (int(vocab), int(batch)) not in cells
+        ):
             return False
     wave_ctas = _wave_ctas(int(sm_count))
     return batch * cluster <= wave_ctas[cluster]
@@ -527,7 +888,8 @@ _FLAG_COARSE_PUSH = 256
 # the capabilities in _LEADER_PUSH_CAPABILITIES for any ept-16 stream and for an ept-32 (_LEADER_PUSH_WIDE_EPT) stream only
 # when the row is at most _LEADER_PUSH_WIDE_MAX_CHUNKS register chunks per CTA (round-9 ledger: R200 ept-16 `_cs` cells
 # 0.88-0.94, H100 c8 e16 `_cs` 0.82-0.86 / `_sp` 0.92-0.96, B200 `_sp` 0.89-0.97, GB300 ept-16 `_sp` cells 0.96-0.99 against the slab form; the two-chunk and longer ept-32 rows 1.02-1.31 on
-# R200).  It displaces the slab tail (bit 7) and the pushed coarse sums (bit 8) where both would apply; never with bit 3.
+# R200).  It displaces the slab tail (bit 7) and the pushed coarse sums (bit 8) where both would apply; with bit 3 only
+# on the cells of _LEADER_PUSH_BLOCK_TAIL_CELLS (round 17: the leader-push whole-CTA-tail build).
 _FLAG_LEADER_PUSH = 512
 _LEADER_PUSH_CAPABILITIES: frozenset[tuple[int, int]] = frozenset(
     {(9, 0), (10, 0), (10, 3), (10, 7)}
@@ -582,11 +944,21 @@ _LOCAL_SELECT_WIDE_MAX_CHUNKS = 2
 # build (`_bt_tia` twin).  The tail's f64 target product, cut tests and sample tests run as the stage-2/3 `int_tests`
 # integer emulation, bit-identical; it pays only where the FP64 pipe is slow (GB300 served cluster-8 ept-16 k = 1000 / 200
 # cells 0.916-0.955); B200's full-rate FP64 loses 3-7 % with it and keeps the f64 `_bt` twin.
+# ``_INT_TAIL_DEVICES`` adds devices (capability, SM count).  Round 18: on the 212-SM R200 the cluster-1 cell
+# V = 262144, B = 128, k = 1000 runs `c1_e32s_bt_sp_tia` at 0.923-0.957 of the f64 `_bt_sp` launch (two nodes,
+# 12 rounds, multi-cell and first-in-process layouts, both buffer placements, eager and graph, same sampled tokens);
+# the 208-SM board keeps `_bt_sp`.
 _FLAG_INT_TAIL = 2048
 _INT_TAIL_CAPABILITIES: frozenset[tuple[int, int]] = frozenset({(10, 3)})
+_INT_TAIL_DEVICES: frozenset[tuple[int, int, int]] = frozenset({(10, 7, 212)})
 # Stage-1 launch_flags bit 12: the no-tail form (`_nt` twin) of a fused-tail build, taken by a two-launch chain, whose
 # stage 1 never runs a tail; built without the tail code, the passes keep the registers it took.
 _FLAG_NO_TAIL = 4096
+# Stage-1 launch_flags bit 13: the compact-list form (`_cl8` twin) of a cluster-1 / 2 / 4 stream build, whose candidate
+# list holds 8192 entries per CTA (512 per warp segment) instead of 16384, so one streaming CTA fits the 101,376 B opt-in
+# of compute capability 12.x.  A warp whose segment overflows takes the exact fallback; every output is bit-identical.
+# Only ``_compact_launch_plan`` takes it, on the cells of ``_COMPACT_PICKS_BY_DEVICE``.
+_FLAG_COMPACT_LIST = 8192
 # The build-selection bits a no-tail twin shares with the build it doubles (manifest key per bit).
 _NO_TAIL_SHARED_BITS = (
     (_FLAG_COARSE_SAMPLE, "coarse_sample"),
@@ -599,7 +971,9 @@ _NO_TAIL_SHARED_BITS = (
 # rounds, two input placements).  The twin frees the registers of the tail, but the passes of some builds schedule
 # worse without it: GB300's cluster-8 streams lose 1-4 % with it, H100's cluster-1 stream 6 % and cluster-8 resident
 # 2-5 %, R200's cluster-8 ept-16 stream 1.5-8 % at 16 rows while it wins 1-6 % at up to 8 rows.  A build absent here
-# keeps its fused-tail form.
+# keeps its fused-tail form.  The (12, 0) entry of the (8, 40) resident is its chain form
+# (``_SM12X_RESIDENTS_BY_DEVICE``): a top-k above fused_tail_kcap takes the no-tail build, as the (8, 48) build it
+# replaces there runs without a tail, and so does a smaller top-k on the grids ``_MULTI_WAVE_CHAIN_BY_DEVICE`` lists.
 _NO_TAIL_MAX_BATCH_BY_CAPABILITY: dict[
     tuple[int, int], dict[tuple[int, int, bool, int], int]
 ] = {
@@ -632,6 +1006,7 @@ _NO_TAIL_MAX_BATCH_BY_CAPABILITY: dict[
     (12, 0): {
         (4, 16, False, 0): 1 << 30,
         (8, 32, False, 0): 1 << 30,
+        (8, 40, False, 0): 1 << 30,
     },
 }
 _COARSE_PUSH_CAPABILITIES: frozenset[tuple[int, int]] = frozenset({(9, 0), (10, 3)})
@@ -938,19 +1313,73 @@ def _no_tail_flag(
     )
 
 
+# Fused-tail variants whose small-top-k launch takes the two-launch chain (stage 1 on the no-tail twin) on a multi-wave
+# stage-1 grid, per device (capability, SM count): (cluster, ept, stream) -> (smallest vocab, smallest batch) of the
+# launches that take it.  RTX PRO 6000 (12, 0) with 188 SMs, the (8, 32) resident, the chain against the fused tail (two
+# boards, eager and CUDA graph, two input placements, 8 rounds after a warm-up round, the same sampled tokens): faster
+# on every measured cell with 32-128 rows at V = 92544-131072, top-k 10 / 50 / 64 (0.950-0.996x; at V = 128256
+# 0.983-0.992x with 32 rows, 0.976-0.988x with 64 and 0.950-0.960x with 128), except 32 rows at V = 131072 under CUDA
+# graph, which tie (0.998-1.001x).  Outside that envelope the gain is not consistent: 23 rows at V = 128256 are slower
+# (1.005-1.031x), 24 rows faster eager but up to 1.008x slower under CUDA graph at V = 128256 and up to 1.008x slower at
+# V = 131072, and 32 rows at V = 65537 tie (0.996-1.004x).  Launches with fewer rows or a shorter vocabulary keep the
+# fused tail, including cells where the chain measured faster (24 rows at V = 92544, 26 / 28 rows at V = 128256,
+# 128 rows at V = 65537); top-k below 10 and more than 128 rows were not measured.  The fused tail's own latency steps
+# up by 4.4-5.8 us from 22 to 23 rows at V = 128256, so one cluster-8 wave holds 176 CTAs there (the cluster-8 width of
+# the 212-SM table ``_wave_ctas`` uses for this device) and every listed launch spans at least two waves.  The (8, 40)
+# resident on the same device (``_SM12X_RESIDENTS_BY_DEVICE``: rows of 131072 < V <= 163840), at V = 131073 /
+# 140000 / 151936 / 163840, top-k 10 / 50 (and 64 with 256 rows at V = 151936), 144-512 rows, same protocol: with
+# 160-512 rows the chain took 0.927-0.999x of the fused tail's time (-27.5..+0.3 us) and 0.825-0.987x of the time of the
+# (8, 48) chain the (8, 40) build replaces, on every measured cell; the fused tail took 0.833-0.988x of the (8, 48)
+# chain's time up to 208 rows but up to 1.036x from 224 rows (up to 1.011x with 256 rows, 1.010-1.036x with 384 and
+# 512 rows at V >= 140000).  With 144 rows it keeps the fused tail: the chain took 1.003-1.008x of its time at
+# V = 131073 (0.971-0.998x at the larger vocabularies); 129-143 and 145-159 rows and more than 512 rows were not
+# measured.  An inference, not profiled: as for the whole-CTA tail (``_fuse_block_tail``), rank 0 of every cluster runs
+# the tail after its row, so each later wave presumably starts behind the tails of the wave before it, while the chain's
+# stage-2/3 kernel serves every row in one launch; a second wave of one or two clusters presumably saves too little to
+# pay for the second launch.  A device or variant absent here (another SM count of the same capability too) keeps the
+# fused tail on every grid.
+_MULTI_WAVE_CHAIN_BY_DEVICE: dict[
+    tuple[int, int, int], dict[tuple[int, int, bool], tuple[int, int]]
+] = {
+    # RTX PRO 6000 Blackwell Server (188 SMs)
+    (12, 0, 188): {(8, 32, False): (92544, 32), (8, 40, False): (131073, 160)},
+}
+
+
+def _multi_wave_chain(
+    batch: int,
+    vocab: int,
+    cluster: int,
+    ept: int,
+    stream: bool,
+    capability: tuple[int, int],
+    sm_count: int,
+) -> bool:
+    """Whether a launch of ``batch`` rows of ``vocab`` entries whose top-k fits the two-warp tail takes the two-launch
+    chain instead: the variant is listed for the device (``capability``, ``sm_count``) in
+    ``_MULTI_WAVE_CHAIN_BY_DEVICE`` and ``vocab`` and ``batch`` reach the listed smallest vocab and batch.  The chain's
+    stage 1 then runs the variant's no-tail twin (``_no_tail_flag``)."""
+    least = _MULTI_WAVE_CHAIN_BY_DEVICE.get(
+        (int(capability[0]), int(capability[1]), int(sm_count)), {}
+    ).get((int(cluster), int(ept), bool(stream)))
+    return least is not None and int(vocab) >= least[0] and int(batch) >= least[1]
+
+
 @functools.cache
 def _stage1_has_leader_push(
     cluster: int, ept: int, stream: bool, coarse: bool, spec: bool
 ) -> bool:
     """Whether the frozen variant ships the leader-push exchange form of its default (neither flag), coarse-sample
     (``coarse``) or speculative-sample (``spec``) build (a manifest entry with ``leader_push`` and the matching sample
-    flags): the kernel taken by launch_flags bit 9.  Every output is bit-identical to the pull form."""
+    flags, not the whole-CTA-tail build's): the kernel taken by launch_flags bit 9.  Every output is bit-identical to
+    the pull form."""
     found = False
     for v in load_manifest()["stage1"]:
         if (v["cluster"], v["ept"], bool(v["stream"])) == (cluster, ept, stream):
             found = True
             if (
                 v.get("leader_push", False)
+                and not v["fused_block_tail"]
                 and bool(v["coarse_sample"]) == bool(coarse)
                 and bool(v["spec_sample"]) == bool(spec)
             ):
@@ -974,7 +1403,8 @@ def _leader_push_flag(
     of the build the sample bits select, on a multi-CTA streaming variant that ships it, on the capabilities in
     ``_LEADER_PUSH_CAPABILITIES`` (``capability`` None: every capability), for any row on an ept-16 stream and for a
     row of at most ``_LEADER_PUSH_WIDE_MAX_CHUNKS`` register chunks per CTA on an ept-``_LEADER_PUSH_WIDE_EPT`` stream.
-    Never with the whole-CTA tail (bit 3); the caller drops the slab tail (bit 7) and the pushed coarse sums (bit 8)
+    Never with the whole-CTA tail (bit 3; its leader-push form is ``_leader_push_block_tail``'s); the caller drops the
+    slab tail (bit 7) and the pushed coarse sums (bit 8)
     when this bit is taken.  ``local_select_reach`` (round 10) and ``small_batch_reach`` (round 11,
     ``_leader_push_small_batch_reach``) extend it to a two-chunk ept-32 row."""
     if not stream or int(cluster) < 2 or (launch_flags & _FLAG_FUSE_BLOCK_TAIL) != 0:
@@ -1167,17 +1597,19 @@ def _int_tail_flag(
     stream: bool,
     launch_flags: int,
     capability: Optional[tuple[int, int]] = None,
+    sm_count: Optional[int] = None,
 ) -> int:
     """Stage-1 ``launch_flags`` bit 11 for a whole-CTA-tail launch (``launch_flags`` carries bit 3): the integer-tested
-    tail of a streaming variant that ships it, on the capabilities in ``_INT_TAIL_CAPABILITIES`` (``capability`` None:
-    taken)."""
+    tail of a streaming variant that ships it, on the capabilities in ``_INT_TAIL_CAPABILITIES`` and the devices
+    (capability, ``sm_count``) in ``_INT_TAIL_DEVICES`` (``capability`` None: taken)."""
     if not stream or (launch_flags & _FLAG_FUSE_BLOCK_TAIL) == 0:
         return 0
-    if (
-        capability is not None
-        and (int(capability[0]), int(capability[1])) not in _INT_TAIL_CAPABILITIES
-    ):
-        return 0
+    if capability is not None:
+        cap = (int(capability[0]), int(capability[1]))
+        if cap not in _INT_TAIL_CAPABILITIES and (
+            sm_count is None or (*cap, int(sm_count)) not in _INT_TAIL_DEVICES
+        ):
+            return 0
     return _FLAG_INT_TAIL if _stage1_has_int_tail(cluster, ept, True) else 0
 
 
@@ -1442,7 +1874,9 @@ def _choose_stage1_resolved(
             batch, ce[0], ce[1], stream, int(sm_count), top_k_max, regime_two_launch
         )
 
-    variants = _stage1_variants(smem_limit)
+    variants = [
+        v for v in _stage1_variants(smem_limit) if v not in _SM12X_RESIDENT_BUILDS
+    ]
     epts = sorted({e for _, e, st in variants if not st})
     available = {(c, e) for c, e, st in variants if not st}
     streaming = [(c, e) for c, e, st in variants if st]
@@ -1571,16 +2005,30 @@ def _choose_stage1_resolved(
 # the pick where one variant beat it by 3 % or more in both modes and every top-k of its class (top-k 10 and 50 for
 # the fused tail, _STAGE1_PICK_LARGE_K for the larger top-k).  A second sweep of the cells where the pick was not
 # faster than the previous kernels adds an entry where a variant beat those kernels in both modes, every top-k of its
-# class and every buffer placement measured.  Key (vocab bin, batch bin, larger top-k): the vocab bin
-# is the measured vocab V, serving (max(3 V / 4, previous V), V]; the batch bin is the measured batch B, serving
-# (B / 2, B].  A larger top-k serves its entry only when its launch takes the whole-CTA tail exactly when one at
-# _STAGE1_PICK_LARGE_K does (on the whole-CTA-tail capabilities a top-k up to _BLOCK_TAIL_MIN_K runs the pick as a
-# two-launch chain, which the sweep did not measure).  A vocab or batch outside every bin, or a device absent here,
-# keeps the cost model's pick.
+# class and every buffer placement measured.  Round 15 (lever L-PK2) re-swept V = 32768 / 128256 / 262144 x B = 1, 2, 4,
+# 8, 32, 64 x top-k 10 / 50 / 1000 against the served picks (14 frozen variants forced, two rounds) and adds an entry
+# where a variant ran at most 0.97 of the served pick in both modes at every top-k of its class: GB300 V = 128256
+# B = 1 / 4 the (8, 16) stream 0.963-0.964, B = 64 the (2, 16) stream 0.968, V = 262144 B = 64 top-k 1000 the (2, 16)
+# stream 0.949 / 0.954; B200 V = 32768 B = 32 the (4, 16) stream 0.877-0.925, V = 128256 B = 2 top-k 1000 the (8, 16)
+# stream 0.963 / 0.954, V = 262144 B = 64 top-k 1000 the (2, 16) stream 0.927 / 0.928 -- or at most 0.98 there and
+# again on a second node: GB300 V = 128256 B = 2 / 8 the (8, 16) stream 0.976, B200 V = 128256 B = 4 top-k 1000 the
+# (8, 16) stream 0.971 / 0.970 on the first node.  Key (vocab bin, batch bin,
+# top-k class): the vocab bin is the measured vocab V, serving (max(3 V / 4, previous V), V]; the batch bin is the
+# measured batch B, serving (B / 2, B]; the top-k class is True for a larger top-k, False for a top-k up to
+# _STAGE1_LARGE_K, or _STAGE1_PICK_L1 for a top-k up to the capability's CTA-local-select cap
+# (_LOCAL_SELECT_MAX_K_BY_CAPABILITY), looked up before the False entry: there the leader push is the launch's one
+# cluster round, so a wider grid costs less, and an entry measured at top-k 10 alone serves only that class (round 15:
+# B200 V = 32768 B = 64 the (2, 16) stream 0.955 / 0.962 at top-k 10, 1.026 at 50; H100 V = 32768 B = 32 the (2, 16)
+# stream 0.959 at top-k 10, 1.03 at 50).  A larger top-k serves its entry only when its launch takes the whole-CTA tail
+# exactly when one at _STAGE1_PICK_LARGE_K does (on the whole-CTA-tail capabilities a top-k up to _BLOCK_TAIL_MIN_K
+# runs the pick as a two-launch chain, which the sweep did not measure).  A vocab or batch outside every bin, or a
+# device absent here, keeps the cost model's pick.
 _STAGE1_PICK_LARGE_K = 1000
+_STAGE1_PICK_L1 = "l1"
 _STAGE1_PICK_VOCABS = (32768, 128256, 151936, 262144)
+_Stage1PickKey: TypeAlias = tuple[int, int, Union[bool, str]]
 _STAGE1_PICKS_BY_DEVICE: dict[
-    tuple[int, int, int], dict[tuple[int, int, bool], tuple[int, int, bool]]
+    tuple[int, int, int], dict[_Stage1PickKey, tuple[int, int, bool]]
 ] = {
     # H100 SXM
     (9, 0, 132): {
@@ -1596,6 +2044,7 @@ _STAGE1_PICKS_BY_DEVICE: dict[
         (128256, 2, True): (8, 16, True),
         (128256, 4, True): (8, 16, True),
         (128256, 8, True): (8, 16, True),
+        (32768, 32, _STAGE1_PICK_L1): (2, 16, True),
     },
     # B200
     (10, 0, 148): {
@@ -1604,6 +2053,7 @@ _STAGE1_PICKS_BY_DEVICE: dict[
         (32768, 4, False): (4, 16, True),
         (32768, 8, False): (4, 16, True),
         (32768, 16, False): (4, 16, True),
+        (32768, 32, False): (4, 16, True),
         (128256, 1, False): (8, 16, True),
         (128256, 2, False): (8, 16, True),
         (128256, 4, False): (8, 16, True),
@@ -1611,6 +2061,7 @@ _STAGE1_PICKS_BY_DEVICE: dict[
         (128256, 16, False): (4, 16, True),
         (128256, 32, False): (4, 16, True),
         (128256, 64, False): (2, 16, True),
+        (128256, 128, False): (1, 16, True),
         (151936, 1, False): (8, 16, True),
         (151936, 2, False): (8, 16, True),
         (151936, 4, False): (8, 16, True),
@@ -1626,11 +2077,15 @@ _STAGE1_PICKS_BY_DEVICE: dict[
         (262144, 16, False): (4, 16, True),
         (262144, 32, False): (4, 16, True),
         (262144, 64, False): (2, 16, True),
+        (128256, 2, True): (8, 16, True),
+        (128256, 4, True): (8, 16, True),
         (128256, 64, True): (2, 16, True),
         (128256, 128, True): (1, 16, True),
         (151936, 128, True): (1, 16, True),
         (262144, 16, True): (4, 16, True),
         (262144, 32, True): (4, 16, True),
+        (262144, 64, True): (2, 16, True),
+        (32768, 64, _STAGE1_PICK_L1): (2, 16, True),
     },
     # GB300
     (10, 3, 152): {
@@ -1640,8 +2095,13 @@ _STAGE1_PICKS_BY_DEVICE: dict[
         (32768, 8, False): (4, 16, True),
         (32768, 16, False): (4, 16, True),
         (32768, 32, False): (4, 16, True),
+        (128256, 1, False): (8, 16, True),
+        (128256, 2, False): (8, 16, True),
+        (128256, 4, False): (8, 16, True),
+        (128256, 8, False): (8, 16, True),
         (128256, 16, False): (4, 16, True),
         (128256, 32, False): (4, 16, True),
+        (128256, 64, False): (2, 16, True),
         (151936, 1, False): (8, 16, True),
         (151936, 2, False): (8, 16, True),
         (151936, 4, False): (8, 16, True),
@@ -1660,6 +2120,7 @@ _STAGE1_PICKS_BY_DEVICE: dict[
         (128256, 128, True): (1, 16, True),
         (262144, 16, True): (4, 16, True),
         (262144, 32, True): (4, 16, True),
+        (262144, 64, True): (2, 16, True),
     },
     # R200
     (10, 7, 212): {
@@ -1673,7 +2134,6 @@ _STAGE1_PICKS_BY_DEVICE: dict[
         (151936, 64, False): (2, 16, True),
         (32768, 64, True): (2, 16, True),
         (128256, 128, True): (1, 16, True),
-        (151936, 16, True): (4, 16, True),
         (151936, 128, True): (1, 16, True),
     },
     # R200, 208 SMs
@@ -1708,8 +2168,10 @@ def _measured_stage1_pick(
     smem_limit: Optional[int],
 ) -> Optional[tuple[int, int, bool]]:
     """The ``_STAGE1_PICKS_BY_DEVICE`` entry for this call, when the device has one for its vocab and batch bins and
-    the variant ships, fits ``smem_limit``, covers ``vocab`` as the cost model's candidates do and, for a larger top-k,
-    launches in the form measured at ``_STAGE1_PICK_LARGE_K``; else None."""
+    top-k class (the ``_STAGE1_PICK_L1`` class first for a top-k up to the capability's
+    ``_LOCAL_SELECT_MAX_K_BY_CAPABILITY`` cap) and the variant ships, fits ``smem_limit``, covers ``vocab`` as the
+    cost model's candidates do and, for a larger top-k, launches in the form measured at ``_STAGE1_PICK_LARGE_K``;
+    else None."""
     picks = _STAGE1_PICKS_BY_DEVICE.get(
         (int(capability[0]), int(capability[1]), int(sm_count))
     )
@@ -1726,7 +2188,12 @@ def _measured_stage1_pick(
         return None
     bbin = 1 << (int(batch) - 1).bit_length()
     large = int(top_k_max) > _STAGE1_LARGE_K
-    pick = picks.get((vbin, bbin, large))
+    l1 = int(top_k_max) <= _LOCAL_SELECT_MAX_K_BY_CAPABILITY.get(
+        (int(capability[0]), int(capability[1])), 0
+    )
+    pick = picks.get((vbin, bbin, _STAGE1_PICK_L1)) if l1 else None
+    if pick is None:
+        pick = picks.get((vbin, bbin, large))
     if pick is None or pick not in _stage1_variants(smem_limit):
         return None
     cluster, ept, stream = pick
@@ -1771,6 +2238,144 @@ class _LaunchPlan(NamedTuple):
     stage23_flags: int
 
 
+# Round 17 (lever RTX-S) on RTX PRO 6000 (12.0, 188 SMs): no full-list stream fits the 101,376 B opt-in, so launches of
+# 32-128 rows at V = 128256 / 151936 run the cluster-8 register-resident grids in two to six waves.  The compact-list
+# streams (``_FLAG_COMPACT_LIST``) fit one CTA per SM and run those rows in one wave.  Key (vocab bin, batch bin, top-k
+# class) as ``_STAGE1_PICKS_BY_DEVICE`` (False: a top-k up to the fused tail's, True: a larger top-k); value (cluster,
+# ept, build bits): ``_FLAG_SPEC_SAMPLE`` for the speculative-sample build, ``_FLAG_NO_TAIL`` for the no-tail twin of a
+# two-launch chain.  A small top-k fuses the two-warp tail; a larger one runs the two-launch chain.  Each pick is the
+# compact-list build whose worst ratio over a sweep of its bin's cells was at most 0.97x of the round-15 plan, both
+# modes; 17-32 rows of the V = 128256 bin at top-k above 64 keep their plan (best compact build up to 1.019x).  A pick
+# takes every launch of its key, including those round 16's device rules decide (the (8, 40) resident of
+# ``_SM12X_RESIDENTS_BY_DEVICE`` and the multi-wave chain of ``_MULTI_WAVE_CHAIN_BY_DEVICE``), except a launch whose
+# vocab is not a multiple of 4.  Against the round-16 plans (two boards, eager and CUDA graph, two input placements,
+# 12 rounds after a warm-up round, the same sampled tokens) the picks ran 0.670-0.891x on the 46 measured cells whose
+# plan they change (V = 100000-151936, 17-128 rows, top-k 10-1000), 0.707-0.767x on the 16 of them with V = 128256 /
+# 151936, 32 / 64 / 128 rows and top-k 10 / 50 / 1000, and on two other boards with the same protocol 0.626-0.985x on
+# 182 more launches of their keys (V = 96196-151936, 17-128 rows, top-k 1-1024), in every round.  At a vocab that is not
+# a multiple of 4 the compact-list builds ran up to 1.195x of the round-16 plans (V = 96193-151935, 17-128 rows), so
+# those launches keep their plan; so do 17-32 rows of the V = 151936 bin at top-k above 64, where the pick tied or lost
+# with 17 rows at V = 128260-128320 (up to 1.036x).
+_COMPACT_PICKS_BY_DEVICE: dict[
+    tuple[int, int, int], dict[tuple[int, int, bool], tuple[int, int, int]]
+] = {
+    # RTX PRO 6000 Blackwell Server
+    (12, 0, 188): {
+        (128256, 32, False): (2, 16, _FLAG_SPEC_SAMPLE),
+        (128256, 64, False): (1, 32, _FLAG_SPEC_SAMPLE),
+        (128256, 64, True): (1, 16, _FLAG_SPEC_SAMPLE | _FLAG_NO_TAIL),
+        (128256, 128, False): (1, 16, 0),
+        (128256, 128, True): (1, 16, 0),
+        (151936, 32, False): (2, 32, _FLAG_SPEC_SAMPLE),
+        (151936, 64, False): (2, 32, 0),
+        (151936, 64, True): (2, 16, _FLAG_SPEC_SAMPLE),
+        (151936, 128, False): (1, 16, _FLAG_SPEC_SAMPLE),
+        (151936, 128, True): (1, 32, _FLAG_SPEC_SAMPLE),
+    },
+}
+
+
+@functools.cache
+def _compact_stage1_builds() -> frozenset[tuple[int, int, int, int]]:
+    """``(cluster, ept, build bits, dynamic shared memory)`` of every compact-list twin the frozen module ships (build
+    bits ``_FLAG_SPEC_SAMPLE`` / ``_FLAG_NO_TAIL``)."""
+    return frozenset(
+        (
+            int(v["cluster"]),
+            int(v["ept"]),
+            (_FLAG_SPEC_SAMPLE if v["spec_sample"] else 0)
+            | (_FLAG_NO_TAIL if v.get("no_tail", False) else 0),
+            int(v["dynamic_smem_bytes"]),
+        )
+        for v in load_manifest()["stage1"]
+        if v.get("compact_list", False)
+    )
+
+
+def _compact_pick(
+    capability: tuple[int, int],
+    sm_count: int,
+    batch: int,
+    vocab: int,
+    top_k_max: int,
+    smem_limit: Optional[int],
+) -> Optional[tuple[int, int, int]]:
+    """The ``_COMPACT_PICKS_BY_DEVICE`` entry for this call when the device has one for its vocab and batch bins and
+    top-k class, the vocab is a multiple of 4 and the frozen module ships that compact-list build within
+    ``smem_limit``; else None."""
+    picks = _COMPACT_PICKS_BY_DEVICE.get(
+        (int(capability[0]), int(capability[1]), int(sm_count))
+    )
+    if not picks or not 1 <= batch <= 128 or int(vocab) % 4:
+        return None
+    lower = 0
+    vbin = None
+    for v in _STAGE1_PICK_VOCABS:
+        if max(lower, 3 * v // 4) < vocab <= v:
+            vbin = v
+            break
+        lower = v
+    if vbin is None:
+        return None
+    bbin = 1 << (int(batch) - 1).bit_length()
+    large = int(top_k_max) > _fused_tail_kcap()
+    pick = picks.get((vbin, bbin, large))
+    if pick is None:
+        return None
+    cluster, ept, build = pick
+    if not any(
+        (c, e, b) == (cluster, ept, build)
+        and (smem_limit is None or smem <= smem_limit)
+        for c, e, b, smem in _compact_stage1_builds()
+    ):
+        return None
+    return pick
+
+
+def _compact_launch_plan(
+    device_index: int, batch: int, vocab: int, top_k_max: int
+) -> Optional[_LaunchPlan]:
+    """The launch plan of a compact-list pick (``_COMPACT_PICKS_BY_DEVICE``) for this call, or None: a top-k up to the
+    fused tail's runs the build with the two-warp tail fused (one launch); a larger top-k runs the two-launch chain
+    (its no-tail twin when the pick names it), triggering stage 2/3 as every stream chain does."""
+    sm_count = _sm_count(device_index)
+    pick = _compact_pick(
+        _device_capability(device_index),
+        sm_count,
+        batch,
+        vocab,
+        top_k_max,
+        _smem_optin(device_index),
+    )
+    if pick is None:
+        return None
+    cluster, ept, build = pick
+    threads, items = choose_stage23(top_k_max)
+    fused = top_k_max <= _fused_tail_kcap()
+    if fused:
+        if build & _FLAG_NO_TAIL:
+            return None
+        launch_flags = _FLAG_FUSE_TAIL | build | _FLAG_COMPACT_LIST
+    else:
+        launch_flags = (
+            _early_trigger_flag(batch, cluster, sm_count)
+            | _stream_prepass_flag(device_index)
+            | _row_span_diet_flag(cluster, True, top_k_max, device_index)
+            | build
+            | _FLAG_COMPACT_LIST
+        )
+    return _LaunchPlan(
+        cluster,
+        ept,
+        True,
+        threads,
+        items,
+        launch_flags,
+        fused,
+        _stage23_plan_flags(device_index, threads, items),
+    )
+
+
 @functools.lru_cache(maxsize=8192)
 def _launch_plan(
     device_index: int, batch: int, vocab: int, top_k_max: int
@@ -1779,32 +2384,68 @@ def _launch_plan(
     top-k ``top_k_max`` on device ``device_index``: a pure function of these four values and the frozen bundle, so
     it is computed once per distinct call shape (the route check and the launch share it).  Raises ``ValueError``
     when no frozen stage-1 variant covers ``vocab``."""
+    compact = _compact_launch_plan(device_index, batch, vocab, top_k_max)
+    if compact is not None:
+        return compact
     sm_count = _sm_count(device_index)
     capability = _device_capability(device_index)
     two_launch = _launch_is_two_kernels(top_k_max, device_index)
     smem_limit = _smem_optin(device_index)
-    cluster, ept, stream = _measured_stage1_pick(
-        capability, sm_count, batch, vocab, top_k_max, smem_limit
-    ) or _choose_stage1_resolved(
-        batch, vocab, sm_count, smem_limit, top_k_max, two_launch
+    lp_block = _block_tail_enabled(device_index) and _leader_push_block_tail(
+        batch, vocab, top_k_max, sm_count, capability
     )
+    c12_block = (
+        None
+        if lp_block
+        else _c12_block_tail(batch, vocab, top_k_max, capability, sm_count, smem_limit)
+    )
+    if lp_block:
+        cluster, ept, stream = _LEADER_PUSH_BLOCK_TAIL_STAGE1
+    elif c12_block is not None:
+        cluster, ept, stream = c12_block[0], c12_block[1], True
+    else:
+        cluster, ept, stream = _sm12x_resident(
+            capability,
+            sm_count,
+            vocab,
+            smem_limit,
+            _measured_stage1_pick(
+                capability, sm_count, batch, vocab, top_k_max, smem_limit
+            )
+            or _choose_stage1_resolved(
+                batch, vocab, sm_count, smem_limit, top_k_max, two_launch
+            ),
+        )
     threads, items = choose_stage23(top_k_max)
-    # Small top-k: stage 2/3 runs inside the stage-1 kernel (same outputs, one launch).
-    fused = top_k_max <= _fused_tail_kcap() and _stage1_has_fused_tail(
-        cluster, ept, stream
+    # Small top-k: stage 2/3 runs inside the stage-1 kernel (same outputs, one launch), except for the multi-wave
+    # launches of a variant ``_MULTI_WAVE_CHAIN_BY_DEVICE`` lists for the device, which take the chain.
+    fused = (
+        top_k_max <= _fused_tail_kcap()
+        and _stage1_has_fused_tail(cluster, ept, stream)
+        and not _multi_wave_chain(
+            batch, vocab, cluster, ept, stream, capability, sm_count
+        )
     )
     # Larger top-k up to the slab: the whole-CTA tail, on the capabilities where it beats the chain, for a
     # one-wave stage-1 grid.
-    fused_block = not fused and _fuse_block_tail(
-        batch,
-        cluster,
-        ept,
-        stream,
-        sm_count,
-        top_k_max,
-        not _block_tail_enabled(device_index),
-        vocab,
-        capability,
+    c12_fused = not fused and c12_block is not None
+    fused_block = (
+        c12_fused
+        or lp_block
+        or (
+            not fused
+            and _fuse_block_tail(
+                batch,
+                cluster,
+                ept,
+                stream,
+                sm_count,
+                top_k_max,
+                not _block_tail_enabled(device_index),
+                vocab,
+                capability,
+            )
+        )
     )
     if fused:
         sample_flag = _sample_build_flag(
@@ -1832,8 +2473,17 @@ def _launch_plan(
             cluster, ept, stream, launch_flags, top_k_max, capability, vocab
         )
     elif fused_block:
-        launch_flags = _FLAG_FUSE_BLOCK_TAIL
-        launch_flags |= _int_tail_flag(cluster, ept, stream, launch_flags, capability)
+        spec_block = c12_fused and c12_block is not None and c12_block[2]
+        launch_flags = _FLAG_FUSE_BLOCK_TAIL | (_FLAG_SPEC_SAMPLE if spec_block else 0)
+        launch_flags |= _int_tail_flag(
+            cluster, ept, stream, launch_flags, capability, sm_count
+        )
+        if lp_block:
+            launch_flags |= _FLAG_LEADER_PUSH
+            if _LEADER_PUSH_BLOCK_TAIL_ROW_SPAN:
+                launch_flags |= _row_span_diet_flag(
+                    cluster, stream, top_k_max, device_index
+                )
     else:
         # Two launches: stage 2/3 may start early only when its CTAs fit beside the last stage-1 wave; a
         # streaming variant triggers before its first pass on Blackwell / Rubin, after its filter pass on Hopper.
@@ -1853,6 +2503,13 @@ def _launch_plan(
         launch_flags |= _no_tail_flag(
             cluster, ept, stream, launch_flags, batch, capability
         )
+    stage23_flags = _stage23_plan_flags(device_index, threads, items)
+    cell_form = None
+    if not (fused or fused_block) and (threads, items) == (256, 4):
+        cell_form = _chain_cell_form(capability, sm_count, batch, vocab, top_k_max)
+    if cell_form is not None:
+        launch_flags |= _no_tail_flag(cluster, ept, stream, launch_flags, batch, None)
+        stage23_flags = cell_form
     return _LaunchPlan(
         cluster,
         ept,
@@ -1861,7 +2518,7 @@ def _launch_plan(
         items,
         launch_flags,
         fused or fused_block,
-        _stage23_variant_flags(device_index),
+        stage23_flags,
     )
 
 

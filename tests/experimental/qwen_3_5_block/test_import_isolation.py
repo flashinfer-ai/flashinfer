@@ -59,7 +59,7 @@ assert q.Qwen35BlockWrapper.is_experimental is True and q.Qwen35BlockWrapper.pla
 import torch
 g = q.Qwen35BlockGeometry(d_model=2560, num_qo_heads=24, num_kv_heads=2)
 sup = q.qwen_3_5_block_support(torch.device("cpu"), g)
-assert sup.served is False and sup.source.commit.startswith("d8b0a7ed5")
+assert sup.served is False and sup.source.commit.startswith("977757763")
 assert "cudnn" not in sys.modules or sys.modules["cudnn"] is None
 print("OK", len([k for k in sys.modules if k.startswith("flashinfer.experimental.qwen_3_5_block")]))
 """

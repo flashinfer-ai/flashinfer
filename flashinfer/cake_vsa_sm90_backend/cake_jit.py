@@ -4994,6 +4994,83 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
+    # The position-selected FP8 grouped-query static program (``cake_planner.fp8_gqa_pin``
+    # routes static plans whose lightest CTA runs at least ``PIN_MIN_CTA_LOOP_ITERS``
+    # main-loop iterations to it): the ``attention_fp8_gqa`` record with ``route["pin"] =
+    # True`` and its own program; same parameters, footprint and workspace.
+    "attention_fp8_gqa_pin": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Qs"],
+            ["buffer", "Ks"],
+            ["buffer", "Vs"],
+            ["parameter", "k_scale_groups"],
+            ["buffer", "meta"],
+            ["param_array", "hdr"],
+            ["parameter", "tile_stride"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "scale_log2"],
+            ["buffer", "dbg"],
+            ["buffer", "tl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "count": "num_ctas",
+            "kind": "plan_count",
+        },
+        "kernel": "cake_vsa_sm90_4ffa37777b0860b57b68",
+        "kernel_symbol": "kernel_cake_vsa_sm90_4ffa37777b0860b57b68",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 185216,
+            "use_pdl": False,
+        },
+        "library": "cake_vsa_sm90_4ffa37777b0860b57b68",
+        "logical": {
+            "K": "k",
+            "Ks": "k_scale",
+            "O": "out",
+            "Q": "q",
+            "Qs": "q_scale",
+            "V": "v",
+            "Vs": "v_scale",
+            "dbg": "dbg",
+            "hdr": "hdr",
+            "k_scale_groups": "k_scale_groups",
+            "meta": "meta",
+            "scale_log2": "scale_log2",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+            "tile_stride": "tile_stride",
+            "tl": "tl",
+        },
+        "route": {
+            "compact": False,
+            "dtype": "e4m3",
+            "gqa": True,
+            "kind": "persistent",
+            "pin": True,
+            "queue": False,
+            "tagged": False,
+        },
+        "workspace_rule": {
+            "dbg_words": 64,
+            "kind": "persistent",
+            "tl_words": 8,
+        },
+    },
 }
 
 # One verified build: H100 / H200 (``sm_90a``).  The architecture is compiled
@@ -5005,8 +5082,10 @@ ARCH_BY_CAPABILITY: dict[tuple[int, int], str] = {
 }
 # The stages in registry order: the four BF16 persistent stages, the fifteen
 # shipped BF16 small-selection variants, their nineteen FP8 twins, the two
-# quantizers, then the thirty-eight GQA stages (the same 4 + 15 per data type
-# with ``route["gqa"]``).  ``PERSISTENT_STAGES`` / ``SMALL_STAGES`` keep naming
+# quantizers, then the forty-one GQA stages (the same 4 + 15 per data type
+# with ``route["gqa"]``, the two round-2 FP8 programs and the round-16
+# position-selected FP8 static program ``attention_fp8_gqa_pin``).
+# ``PERSISTENT_STAGES`` / ``SMALL_STAGES`` keep naming
 # the BF16 MHA stages (the planner's own table); the FP8 attention stages are
 # keyed by ``route["dtype"]``, the GQA stages by ``route["gqa"]`` and the
 # quantizers by their route kind.
@@ -5128,6 +5207,7 @@ def persistent_stage(
     fp8: bool = False,
     gqa: bool = False,
     xshare: bool = False,
+    pin: bool = False,
 ) -> str:
     """The persistent kernel's stage: the queue-scheduled twin when ``queue``, the compact
     static program when ``compact`` (uniform pair plans of short tiles with many tiles per
@@ -5137,11 +5217,21 @@ def persistent_stage(
     the ``attention_gqa`` / ``attention_fp8_gqa`` program when ``gqa`` (grouped-query head
     counts, a route decision of the plan); ``attention_fp8_gqa_xs_queue`` when ``xshare``
     (the FP8 grouped-query queue program with the shared V^T transposer, which the planner
-    selects for queue plans of head-pair tiles only: ``cake_planner.fp8_gqa_xshare``)."""
+    selects for queue plans of head-pair tiles only: ``cake_planner.fp8_gqa_xshare``);
+    ``attention_fp8_gqa_pin`` when ``pin`` (the FP8 grouped-query static program with the
+    shared-transposer program's P pack and pinned V release, which the planner selects for
+    static plans whose lightest CTA runs at least ``PIN_MIN_CTA_LOOP_ITERS`` main-loop
+    iterations: ``cake_planner.fp8_gqa_pin``)."""
 
     base = "attention_fp8" if fp8 else "attention"
     if gqa:
         base += "_gqa"
+    if pin:
+        if not (fp8 and gqa) or queue or compact or tagged or xshare:
+            raise ValueError(
+                "the position-selected program is the FP8 grouped-query static program only"
+            )
+        return f"{base}_pin"
     if xshare:
         if not (fp8 and gqa and queue) or compact or tagged:
             raise ValueError(

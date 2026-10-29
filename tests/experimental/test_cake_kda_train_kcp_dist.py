@@ -13,7 +13,8 @@ limitations under the License.
 Multi-GPU rows of the context-parallel (KCP) KDA training route (``cake_kda_train.cake_kcp``): ``W`` ranks over
 NCCL, each holding the fragments of one partition of a packed batch, compared with the exact FP64 per-document
 recurrence of the same operands (``tests/test_helpers/cake_kda_train_reference``) and with one another (saved ==
-replay, repeat, autograd == explicit, checkpoint == direct, document-alone == slice).
+replay, repeat, autograd == explicit, checkpoint == direct, document-alone == slice, graph replay == eager with
+every rank capturing the same calls).
 
 Two launch forms: ``torch.multiprocessing.spawn`` (``pytest``: skipped when fewer than ``W`` CUDA devices are
 visible or the KCP programs are not exported yet) and one process per Slurm task (``SLURM_PROCID`` /
@@ -27,6 +28,7 @@ import json
 import os
 import socket
 import tempfile
+import traceback
 from pathlib import Path
 
 import pytest
@@ -48,6 +50,14 @@ cake_kcp_jit = cake_package("cake_kda_train", "cake_kcp_jit")
 
 PACKAGE_DIR = Path(cake_jit.__file__).resolve().parent
 TENSORS = ("out",) + GRAD_NAMES
+# graph="replay" over four forward + backward calls of one key: the backward's key sees the saved tensors, which
+# change once (the eager forward's -> the captured forward's static ones), so it captures one call after the forward
+GRAPH_EVENTS = [
+    ["eager", "eager"],
+    ["capture", "eager"],
+    ["replay", "capture"],
+    ["replay", "replay"],
+]
 ATOL = RTOL = 1e-2
 SCALE = cake_kcp.SCALE
 
@@ -198,7 +208,11 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
             },
         }
 
-    res = saved_pass()
+    # the probe runs once per backend, on request (spec3_probe="record"; "off" is the default): a row after an
+    # earlier probing backward in this process (the Slurm per-task form runs every row in one process) finds it
+    # spent; the later passes run the default and must match this one bitwise
+    pending = bool(getattr(cake_kcp.get_backend(), "_spec3_pending", False))
+    res = saved_pass(spec3_probe="record")
     spec3 = (cake_kcp.LAST_CALL.get("bwd") or {}).get(
         "spec3"
     )  # SPEC-3 debug assertion of the first saved-mode backward
@@ -216,6 +230,27 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
     ):  # gate 5: the ring path is bitwise the a2a path; the ring receives no c1 tensor, so recompute form only
         res_ring = saved_pass(exchange="ring", save_transfer=False)
         ring_ok = all(torch.equal(res_recompute[n], res_ring[n]) for n in TENSORS)
+    # every rank (a rank without tokens included) captures and replays the same calls: a rank that stayed eager
+    # while the others captured would run its collectives outside the graphs of its peers
+    cake_kcp.graph_cache_clear()
+    events = []
+    try:
+        for _ in range(len(GRAPH_EVENTS)):
+            res_graph = {n: t.clone() for n, t in saved_pass(graph="replay").items()}
+            events.append(
+                [
+                    str(cake_kcp.LAST_CALL["fwd"].get("graph_event")),
+                    str(cake_kcp.LAST_CALL["bwd"].get("graph_event")),
+                ]
+            )
+        torch.cuda.synchronize(device)
+    except BaseException as exc:
+        # the failed call's frames still reference its cache entry and graph: release them before the cleanup
+        traceback.clear_frames(exc.__traceback__)
+        raise
+    finally:
+        # a cached graph holding a NCCL collective blocks the process group's destruction
+        cake_kcp.graph_cache_clear()
     flags = {
         "saved_eq_replay": all(torch.equal(res[n], res_replay[n]) for n in TENSORS),
         "repeat": all(torch.equal(res[n], res_repeat[n]) for n in TENSORS),
@@ -223,12 +258,14 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
         "ckpt_eq_direct": all(torch.equal(res_auto[n], res_ckpt[n]) for n in TENSORS),
         "save_transfer_eq": all(torch.equal(res[n], res_recompute[n]) for n in TENSORS),
         "ring_eq_a2a": ring_ok,
-        # a backend with local stages must have run the SPEC-3 probe (unless disabled); a rank without tokens
-        # launches no local stage, so it has nothing to probe.  The probe's row comparison (the forward's intra
-        # prep against the backward's prep program) is reported in spec3_by_rank, not gated: the requirement of
-        # record is saved_eq_replay (both backward modes run the same local programs)
+        "graph_replay": events == GRAPH_EVENTS
+        and all(torch.equal(res[n], res_graph[n]) for n in TENSORS),
+        # a backend with local stages whose probe was pending must have run it (spec3_probe="record" on the
+        # first pass); a rank without tokens launches no local stage, so it has nothing to probe.  The probe's row
+        # comparison (the forward's intra prep against the backward's prep program) is reported in spec3_by_rank,
+        # not gated: the requirement of record is saved_eq_replay (both backward modes run the same local programs)
         "spec3": (not backend.local_stages)
-        or (spec3 is None and os.environ.get(cake_kcp.SPEC3_ENV, "1") == "0")
+        or not pending
         or (spec3 is None and q.shape[0] == 0)
         or bool(spec3 and spec3.get("checked")),
     }
@@ -242,12 +279,15 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
         gathered[n] = objs
     flag_list = [None] * W
     spec3_list = [None] * W
+    events_list = [None] * W
     if W > 1:
         dist.all_gather_object(flag_list, flags)
         dist.all_gather_object(spec3_list, spec3)
+        dist.all_gather_object(events_list, events)
     else:
         flag_list = [flags]
         spec3_list = [spec3]
+        events_list = [events]
     report = {
         "rank": rank,
         "world": W,
@@ -257,6 +297,7 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
         "backend": backend.name,
         "backend_path": getattr(backend, "path", None),
         "spec3_by_rank": spec3_list,
+        "graph_events_by_rank": events_list,
     }
     for key in flags:
         report["flags"][key] = all(f[key] for f in flag_list)
@@ -310,6 +351,7 @@ def _spawn_entry(rank: int, W: int, row, port: int, result_dir: str) -> None:
             raise AssertionError(f"rank {rank}: {report}")
     finally:
         if dist.is_initialized():
+            cake_kcp.graph_cache_clear()
             dist.destroy_process_group()
 
 
@@ -369,13 +411,13 @@ def test_multi_gpu_rows_match_the_exact_reference(row) -> None:
 def test_public_api_cannot_select_a_precision_mode(monkeypatch) -> None:
     """The private test hook is refused without the environment variable; the public options never reach K3's
     non-shipped programs (SPEC-11)."""
-    monkeypatch.delenv(cake_kcp_plan.TEST_KNOBS_ENV, raising=False)
+    monkeypatch.setattr(cake_kcp_plan, "_TEST_KNOBS_ENABLED", False)
     with pytest.raises(ValueError):
         cake_kcp._options({"_kcp_test_knobs": {"precision_mode": 2}})
     with pytest.raises(TypeError):
         cake_kcp._options({"precision_mode": 1})
     assert cake_kcp._options({}).precision_mode == 0
-    monkeypatch.setenv(cake_kcp_plan.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(cake_kcp_plan, "_TEST_KNOBS_ENABLED", True)
     assert (
         cake_kcp._options({"_kcp_test_knobs": {"precision_mode": 1}}).precision_mode
         == 1
@@ -387,13 +429,13 @@ def test_public_api_cannot_select_a_precision_mode(monkeypatch) -> None:
 def test_public_api_cannot_select_a_transfer_walk(monkeypatch) -> None:
     """The ``transfer_walk`` knob (K3's ``tf32_hilo`` / ``bf16x3`` programs of ``build.test.json``) is reachable only through
     the gated test hook; the public options never select a non-shipped transfer-walk program (SPEC-11)."""
-    monkeypatch.delenv(cake_kcp_plan.TEST_KNOBS_ENV, raising=False)
+    monkeypatch.setattr(cake_kcp_plan, "_TEST_KNOBS_ENABLED", False)
     with pytest.raises(TypeError):
         cake_kcp._options({"transfer_walk": "bf16x3"})
     with pytest.raises(ValueError):
         cake_kcp._options({"_kcp_test_knobs": {"transfer_walk": "bf16x3"}})
     assert cake_kcp._options({}).transfer_walk == "bf16x3_hw64"
-    monkeypatch.setenv(cake_kcp_plan.TEST_KNOBS_ENV, "1")
+    monkeypatch.setattr(cake_kcp_plan, "_TEST_KNOBS_ENABLED", True)
     assert (
         cake_kcp._options(
             {"_kcp_test_knobs": {"transfer_walk": "bf16x3"}}

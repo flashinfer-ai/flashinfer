@@ -115,6 +115,14 @@ ARG_PLANS: dict[str, list[list[str]]] = {
         ["grid", "grid_z"],
     ],
 }
+# The scan programs that draw their work units from the workspace's ticket tail
+# (``cake_policy.TICKET_TAIL_BYTES``), per architecture: the sm_103a gate-warpgroup
+# wide programs.  The host zeroes the tail right before launching one of them
+# (``cake_backend``); every other (program, arch) pair leaves it unused.
+TICKET_TAIL_PROGRAMS: dict[str, tuple[str, ...]] = {
+    "cake_dsa_indexer_topk_3c6dc460295ddf3c44de": ("sm_103a",),
+    "cake_dsa_indexer_topk_808a62a6315ae38034c6": ("sm_103a",),
+}
 PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_dsa_indexer_topk_0d38735ee8e81ae6f5e8": {
         "role": "scan",
@@ -608,7 +616,8 @@ POLICY: dict[str, dict[str, Any]] = {
         "candidate_multiplier": 4,
         "candidate_slack": 128,
         "cand_mult_rule": [384.0, 8],
-        "cand_cap_floor": 16384,
+        "cand_cap_floor": 8192,
+        "cand_cap_floor_rule": [1024, 16384],
         "candidate_multiplier_unsampled": 4,
         "cand_mult_rule_unsampled": [384.0, 8],
         "cand_cap_floor_unsampled": 8192,
@@ -678,6 +687,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "candidate_slack": 128,
         "cand_mult_rule": [384.0, 8],
         "cand_cap_floor": 16384,
+        "cand_cap_floor_rule": None,
         "candidate_multiplier_unsampled": 4,
         "cand_mult_rule_unsampled": [384.0, 8],
         "cand_cap_floor_unsampled": 8192,
@@ -747,6 +757,7 @@ POLICY: dict[str, dict[str, Any]] = {
         "candidate_slack": 128,
         "cand_mult_rule": [384.0, 8],
         "cand_cap_floor": 8192,
+        "cand_cap_floor_rule": None,
         "candidate_multiplier_unsampled": 4,
         "cand_mult_rule_unsampled": [384.0, 8],
         "cand_cap_floor_unsampled": 8192,

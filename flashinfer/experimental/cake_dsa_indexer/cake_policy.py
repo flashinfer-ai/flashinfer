@@ -31,7 +31,11 @@ three-warpgroup rule from ``wide_first_rule[0]`` mean unit tiles on, and the
 CTA pair serves the unit geometries of ``pair_units`` only.  A record may also
 replace the sampled rank shift from a ``top_k`` of ``sample_shift_rule[0]`` on
 (``sample_shift_for``); an explicit ``sample_shift_permille`` knob still
-overrides it.
+overrides it.  The candidate-capacity floor may depend on ``top_k`` the same
+way: ``cand_cap_floor_rule`` = ``[min top_k, floor]`` replaces
+``cand_cap_floor`` from that ``top_k`` on (``cand_cap_floor_for``), so that a
+small-``top_k`` call keeps the smaller buffers (half the workspace at
+``top_k = 512``) and a large-``top_k`` call the larger floor.
 
 Nothing here reads device memory: the segment boundaries stay on the device
 and the dispatch sees only host-known integers.  The chosen program never
@@ -55,6 +59,7 @@ POLICY_FIELDS = (
     "candidate_slack",  # minimum headroom above top_k before a buffer can be compacted
     "cand_mult_rule",  # [min mean unit tiles, multiplier] for long-unit calls, or None
     "cand_cap_floor",  # minimum candidate slots per (warpgroup, query), or None
+    "cand_cap_floor_rule",  # [min top_k, floor] replacing cand_cap_floor from that top_k on (sampled calls), or None
     "candidate_multiplier_unsampled",  # capacity multiplier when the sampled first threshold is off
     "cand_mult_rule_unsampled",  # its [min mean unit tiles, multiplier] long-unit rule, or None
     "cand_cap_floor_unsampled",  # its minimum candidate slots, or None
@@ -126,6 +131,12 @@ MERGE_KEY = "merge"
 # ``sample_shift_rule`` shift.  Every value gives the same bits; the shift only sets how conservative the sampled first
 # threshold is.
 SAMPLE_SHIFT_PERMILLE_BOUNDS = (-1000, 10000)
+# Dynamic unit tickets (the sm_103a gate-warpgroup wide scan programs): the CTAs
+# draw their next work unit from the low u32 word of the first int64 behind the
+# candidate buffers (and behind the split staging), a 128-byte tail every plan's
+# workspace carries.  The host zeroes it right before the scan launch of those
+# programs (``cake_backend``); the other programs leave it unused.
+TICKET_TAIL_BYTES = 128
 
 _INT = ("tile_keys", "block_q_narrow", "block_q_wide", "block_q_l6", "candidate_entry_bytes", "candidate_multiplier",
         "candidate_multiplier_unsampled", "candidate_slack", "split_max", "split_min_range_tiles", "tile_unroll_default", "tile_unroll_factor",
@@ -157,6 +168,7 @@ _OPTIONAL_INT = (
 )
 _OPTIONAL_RULE = (
     "cand_mult_rule",
+    "cand_cap_floor_rule",
     "cand_mult_rule_unsampled",
     "l6_rule",
     "wide_first_rule",
@@ -197,6 +209,7 @@ class DispatchPolicy:
     candidate_slack: int
     cand_mult_rule: Optional[list]
     cand_cap_floor: Optional[int]
+    cand_cap_floor_rule: Optional[list]
     candidate_multiplier_unsampled: int
     cand_mult_rule_unsampled: Optional[list]
     cand_cap_floor_unsampled: Optional[int]
@@ -324,6 +337,13 @@ class DispatchPolicy:
             raise ValueError(
                 f"policy['sample_shift_rule'] must be [min top_k >= 1, shift permille in [{shift_lo}, {shift_hi}]] or None, got {shift_rule!r}"
             )
+        floor_rule = raw["cand_cap_floor_rule"]
+        if floor_rule is not None and (
+            len(floor_rule) != 2 or not all(_is_int(v) and v >= 1 for v in floor_rule)
+        ):
+            raise ValueError(
+                f"policy['cand_cap_floor_rule'] must be [min top_k >= 1, floor slots >= 1] or None, got {floor_rule!r}"
+            )
         if not isinstance(raw["check_period_kind_overrides"], dict):
             raise ValueError("policy['check_period_kind_overrides'] must be a mapping")
         if not isinstance(raw["finalize_threads_fit"], (list, tuple)) or not all(
@@ -396,17 +416,20 @@ class DispatchPolicy:
             raise ValueError(
                 "policy['rank_t16_slots'] must be an ascending list of positive sort-slot counts divisible by 16"
             )
-        for floor_name, ceiling_name in (
-            ("cand_cap_floor", "cand_cap_ceiling"),
-            ("cand_cap_floor_unsampled", "cand_cap_ceiling_unsampled"),
+        for floor_name, ceiling_name, rule_name in (
+            ("cand_cap_floor", "cand_cap_ceiling", "cand_cap_floor_rule"),
+            ("cand_cap_floor_unsampled", "cand_cap_ceiling_unsampled", None),
         ):
             ceiling = raw[ceiling_name]
+            floors = [raw[floor_name]]
+            if rule_name is not None and raw[rule_name] is not None:
+                floors.append(raw[rule_name][1])
             if ceiling is not None and (
-                ceiling <= 0
-                or (raw[floor_name] is not None and ceiling < raw[floor_name])
+                ceiling <= 0 or any(f is not None and ceiling < f for f in floors)
             ):
                 raise ValueError(
-                    f"policy[{ceiling_name!r}] must be a positive slot count at or above policy[{floor_name!r}], got {ceiling!r}"
+                    f"policy[{ceiling_name!r}] must be a positive slot count at or above policy[{floor_name!r}]"
+                    f"{' and the floor of policy[' + repr(rule_name) + ']' if rule_name else ''}, got {ceiling!r}"
                 )
         fit_kinds = raw["sample_fit_kinds"]
         if (
@@ -528,6 +551,19 @@ class DispatchPolicy:
             return int(rule[1])
         return self.sample_shift_permille
 
+    def cand_cap_floor_for(self, top_k: int) -> Optional[int]:
+        """Candidate-slot floor of a sampled call: ``cand_cap_floor_rule[1]`` from the rule's ``top_k`` floor on, else
+        ``cand_cap_floor``.  The larger floor pays for itself on large-``top_k`` calls only (their units fill the buffer
+        early; the floor spares compactions and keeps 64-127-tile units off the sampled path); below the rule's ``top_k``
+        the smaller floor halves the candidate buffers -- 57 MiB instead of 114 MiB for a ``top_k = 512`` call (the
+        ratio-4 pooled selection) on a 152-SM grid with six queries per unit -- with identical ids and score bits.
+        Unsampled calls (``sample_tiles_max=0``) read ``cand_cap_floor_unsampled``.  The shipped ``sm_100a`` record sets
+        the rule; ``sm_103a`` (whose pooled rows measured slower with the smaller buffers) and ``sm_107a`` set none."""
+        rule = self.cand_cap_floor_rule
+        if rule is not None and int(top_k) >= int(rule[0]):
+            return int(rule[1])
+        return self.cand_cap_floor
+
     def cand_cap_multiplier_for(
         self,
         num_queries: int,
@@ -539,14 +575,15 @@ class DispatchPolicy:
     ) -> int:
         """Capacity multiplier of a call: the sampled values by default, the ``*_unsampled`` values
         when the sampled first threshold is off (``sample_tiles_max=0``), whose larger buffers would
-        only delay the first selection.  The long-unit rule replaces the multiplier, the floor raises it
+        only delay the first selection.  The long-unit rule replaces the multiplier, the floor
+        (``cand_cap_floor_for``: keyed by ``top_k`` where the record sets ``cand_cap_floor_rule``) raises it
         and the ceiling lowers it (``cand_cap_ceiling // top_k``, so the buffer stops growing with
         ``top_k`` once it holds the ceiling)."""
         if sampled:
             mult, rule, floor, ceiling = (
                 self.candidate_multiplier,
                 self.cand_mult_rule,
-                self.cand_cap_floor,
+                self.cand_cap_floor_for(top_k),
                 self.cand_cap_ceiling,
             )
         else:
@@ -1272,7 +1309,8 @@ def select_program(
         ),
         scan_entries=scan_entries,
         staging_entries=staging,
-        workspace_bytes=(scan_entries + staging) * policy.candidate_entry_bytes,
+        workspace_bytes=(scan_entries + staging) * policy.candidate_entry_bytes
+        + TICKET_TAIL_BYTES,
     )
 
 

@@ -269,4 +269,8 @@ def _launch(x, weights, ids, mid, stream):
     )
 
 
-_kernel.set_name_prefix("flashinfer_bf16_fma_fc1", remove_cutlass_symbol=True)
+# Activation constants can contain scientific notation such as e+38. Keep
+# those values in the compilation key, but not in the NVVM symbol identifier.
+_kernel.set_name_prefix(
+    "flashinfer_bf16_fma_fc1", keep_mangled_name=False, remove_cutlass_symbol=True
+)

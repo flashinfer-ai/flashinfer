@@ -59,7 +59,7 @@ KIND_SLOTS = {
     ("sm_100a", "tp2"): {"eo": 32, "rsag": 33, "token1": 148},
     ("sm_100a", "tp8"): {"eo": 7, "token1": 144},
     ("sm_103a", "tp2"): {"onehop": 17, "token1": 148, "rsag": 33, "eo": 64},
-    ("sm_103a", "tp4"): {"onehop": 8, "eo": 24, "token1": 152},
+    ("sm_103a", "tp4"): {"onehop": 8, "token1": 152},
     ("sm_107a", "tp4"): {"onehop": 8, "eo": 24, "token1": 212},
 }
 

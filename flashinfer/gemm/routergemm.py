@@ -922,19 +922,29 @@ def _use_tinygemm2_sm100(device: torch.device) -> bool:
 # with the reference's output bits.  They keep the reference's four K chains, the
 # K16 order within a chain and its +0 start, and sum the chains and the bias in the
 # reference's order, so a routed call returns exactly what the reference returns.
-# Five tiles, each with and without the bias and with and without programmatic
+# Nine tiles, each with and without the bias and with and without programmatic
 # dependent launch, as (output features, batch rows) per CTA.  The three narrow
 # tiles differ only in their loops: PACKED_NARROW unrolls them by two rounds, faster
 # on sm_100a; PACKED_NARROW_U4 unrolls its MMA loop by four, faster on sm_107a;
 # PACKED_NARROW_FULL_STAGES also issues a full stage's MMAs without a per-step K
-# test, faster on sm_103a.
+# test, faster on sm_103a.  PACKED_M64_N16 and PACKED_M64_N4 put sixteen output
+# features in each chain's block of an M=64 MMA, on 16 or 4 batch rows (faster on
+# sm_107a).  PACKED_BOX8 is PACKED on 8 batch rows: its activation box is 8 rows
+# tall, so a batch of 8 loads no rows past its end (faster on sm_107a).
+# PACKED_M64_N8 puts sixteen output features in each chain's block of an M=64 MMA
+# on 8 batch rows with an 8-row activation box (sm_107a only).
 _TINYGEMM2_TCGEN05_TILES = {
     "PACKED_NARROW": (8, 2),
     "PACKED_NARROW_U4": (8, 2),
     "PACKED_NARROW_FULL_STAGES": (8, 2),
+    "PACKED_M64_N16": (16, 16),
+    "PACKED_M64_N4": (16, 4),
     "PACKED": (32, 16),
+    "PACKED_BOX8": (32, 8),
+    "PACKED_M64_N8": (16, 8),
     "ACCUMULATORS": (32, 64),
 }
+_NARROW_TILES = ("PACKED_NARROW", "PACKED_NARROW_U4", "PACKED_NARROW_FULL_STAGES")
 
 
 class _Tcgen05Window(NamedTuple):
@@ -950,6 +960,7 @@ class _Tcgen05Window(NamedTuple):
     max_input_features: Optional[int] = None
     min_weight_elements: Optional[int] = None  # output x input features
     one_wave: bool = False  # only while PACKED's grid fits one CTA per SM
+    input_features_multiple: int = 1  # only inputs that are a multiple of this
 
     def admits(
         self, batch: int, out_features: int, in_features: int, bias: bool, sms: int
@@ -966,40 +977,85 @@ class _Tcgen05Window(NamedTuple):
             and within(in_features, self.min_input_features, self.max_input_features)
             and within(out_features * in_features, self.min_weight_elements, None)
             and (not self.one_wave or packed_ctas <= sms)
+            and in_features % self.input_features_multiple == 0
+            and (self.tile not in _NARROW_TILES or in_features % 64 == 0)
         )
 
 
-# The windows where a tile measured faster than the kernel the call runs
-# otherwise (the reference without a bias, tinygemm2_sm100 with one) on every
-# measured shape, with and without programmatic dependent launch; the first
-# window admitting a shape selects its tile, and every other shape keeps that
-# kernel.  The bounds are the measured ranges.  Small weights stay on that kernel:
-# the tensor-memory allocation adds a fixed half microsecond to a launch that
-# takes four.  The narrow tiles serve up to 8 rows and up to 512 output features
-# over long inputs; their windows differ per architecture.  PACKED serves eight rows
-# or fewer only without a bias and from 2880 output features (90 CTAs).  With a
-# bias, tinygemm2_sm100 stays faster up to 27 rows except for PACKED on 9 to 16 rows
-# from 2880 output features and an input of 2112, and up to 32 rows below 1536
-# output features.  From 9 rows without a bias (28 with one) PACKED serves while its
-# grid fits one wave; past that ACCUMULATORS (64 rows per CTA) does.  On sm_107a
-# PACKED serves only 8 rows without a bias and 9 to 16 rows with one, from 3584
-# output features at inputs of 2112 to 6144, and with a bias 28 to 32 rows start at
-# 2048 output features.
+# The windows where a tile measured faster than the kernel the call runs otherwise
+# (the reference without a bias, tinygemm2_sm100 with one) on every measured shape,
+# with and without programmatic dependent launch; the first window admitting a shape
+# selects its tile, and every other shape keeps that kernel.  The bounds are the
+# measured ranges.  Small weights stay on that kernel: the tensor-memory allocation
+# adds a fixed half microsecond to a launch that takes four.  The narrow tiles serve
+# up to 8 rows and up to 512 output features over long inputs; their windows differ
+# per architecture, and they serve only inputs that are a multiple of 64 (128-byte
+# rows): off that, some measured slower.  PACKED serves eight rows or fewer only
+# without a bias and from 2880 output features (90 CTAs).  With a bias,
+# tinygemm2_sm100 stays faster up to 27 rows except for PACKED on 9 to 16 rows from
+# 2880 output features and an input of 2112, and up to 32 rows below 1536 output
+# features.  From 9 rows without a bias (28 with one) PACKED serves while its grid
+# fits one wave; past that ACCUMULATORS (64 rows per CTA) does.  On sm_107a PACKED
+# serves only 8 rows without a bias and 9 to 16 rows with one, from 3584 output
+# features at inputs of 2112 to 6144; with a bias 28 to 32 rows start at 2048 output
+# features, and without one 9 to 16 rows start at 1728 (PACKED measured slower
+# below).  The M=64 tiles serve sm_107a alone, at 2048 to 3072 output features:
+# PACKED_M64_N4 4 rows, PACKED_M64_N16 9 to 16 rows, ahead of PACKED and
+# ACCUMULATORS where they measured faster.  On sm_107a, 17 to 23 rows without a bias
+# whose activations take less than 128 KiB (batch x input features x 2 bytes) load
+# slowly on ACCUMULATORS, whose 64-row boxes reach past the batch: PACKED serves 17 to
+# 21 of these rows from an input of 2048, and 22 or 23 rows from about 120 KiB of
+# activations (PACKED measured faster on every such shape, ACCUMULATORS slower than
+# the reference on some; below 120 KiB, 22 and 23 rows stay on ACCUMULATORS, which
+# measured faster than the reference there and close to PACKED).  PACKED_BOX8
+# serves the 8 rows of PACKED's sm_107a window from an input of 3072 (measured
+# faster than PACKED there).  On sm_107a, 8 rows without a bias go first to
+# PACKED_M64_N8: from 3584 output features at an input of 2048, and at inputs that
+# are a multiple of 64 (off that, some measured slower) from 7168 output features
+# and an input of 2048, from 6144 and an input of 3072, and at 3584 to 4608 from
+# an input of 4096, all up to 8192; then to PACKED_BOX8 at 4096 to 5120 output
+# features and inputs of 2112 to 2560.
 _LARGE_WEIGHT = 6_000_000
-_MANY_ROWS_NOBIAS = (
-    _Tcgen05Window(
-        "PACKED", 9, 32, False, 1536, 4096, None, 6144, _LARGE_WEIGHT, one_wave=True
-    ),
-    _Tcgen05Window(
-        "ACCUMULATORS", 17, 32, False, 1536, 4096, None, 6144, _LARGE_WEIGHT
-    ),
-    _Tcgen05Window(
-        "PACKED", 33, 64, False, 1024, 4096, None, 6144, _LARGE_WEIGHT, one_wave=True
-    ),
-    _Tcgen05Window(
-        "ACCUMULATORS", 33, 64, False, 1024, 4096, None, 6144, _LARGE_WEIGHT
-    ),
-)
+
+
+def _many_rows_nobias(low: int) -> Tuple[_Tcgen05Window, ...]:
+    """Without a bias: 9 to 16 rows from ``low`` output features, 17 to 32 from 1536
+    and 33 to 64 from 1024."""
+    return (
+        _Tcgen05Window(
+            "PACKED", 9, 16, False, low, 4096, None, 6144, _LARGE_WEIGHT, one_wave=True
+        ),
+        _Tcgen05Window(
+            "PACKED",
+            17,
+            32,
+            False,
+            1536,
+            4096,
+            None,
+            6144,
+            _LARGE_WEIGHT,
+            one_wave=True,
+        ),
+        _Tcgen05Window(
+            "ACCUMULATORS", 17, 32, False, 1536, 4096, None, 6144, _LARGE_WEIGHT
+        ),
+        _Tcgen05Window(
+            "PACKED",
+            33,
+            64,
+            False,
+            1024,
+            4096,
+            None,
+            6144,
+            _LARGE_WEIGHT,
+            one_wave=True,
+        ),
+        _Tcgen05Window(
+            "ACCUMULATORS", 33, 64, False, 1024, 4096, None, 6144, _LARGE_WEIGHT
+        ),
+    )
 
 
 def _many_rows_bias(low: int) -> Tuple[_Tcgen05Window, ...]:
@@ -1020,6 +1076,30 @@ def _many_rows_bias(low: int) -> Tuple[_Tcgen05Window, ...]:
     )
 
 
+# sm_107a, 17 to 23 rows without a bias: PACKED from the input in the table up to
+# the largest input (a multiple of 8) that keeps the activations under 128 KiB.
+_SM107_SMALL_ACTIVATIONS = tuple(
+    _Tcgen05Window(
+        "PACKED",
+        batch,
+        batch,
+        False,
+        1536,
+        4096,
+        low,
+        65535 // batch // 8 * 8,
+        _LARGE_WEIGHT,
+    )
+    for batch, low in (
+        (17, 2048),
+        (18, 2048),
+        (19, 2048),
+        (20, 2048),
+        (21, 2048),
+        (22, 2816),
+        (23, 2688),
+    )
+)
 _PACKED_FEW_ROWS = (
     _Tcgen05Window("PACKED", 1, 8, False, 2880, 4096, None, 6144, _LARGE_WEIGHT),
     _Tcgen05Window("PACKED", 9, 16, True, 2880, 4096, 2112, 6144, _LARGE_WEIGHT),
@@ -1033,6 +1113,7 @@ _SM100 = (
     _Tcgen05Window("PACKED_NARROW", 1, 4, True, 32, 320, 8192, 20480),
     _Tcgen05Window("PACKED_NARROW", 1, 6, True, 32, 384, 11264, 20480),
     _Tcgen05Window("PACKED_NARROW", 2, 6, True, 256, 320, 3584, 4096),
+    _Tcgen05Window("PACKED_NARROW", 6, 9, True, 32, 192, 6144, 9216),
     _Tcgen05Window("PACKED_NARROW", 1, 4, False, 32, 512, 8192, 20480),
     _Tcgen05Window("PACKED_NARROW", 2, 8, False, 32, 256, 6144, 20480),
     _Tcgen05Window("PACKED_NARROW", 1, 6, False, 32, 384, 8192, 20480),
@@ -1042,7 +1123,7 @@ _SM100 = (
     _Tcgen05Window("PACKED_NARROW", 3, 8, False, 32, 64, 5120, 20480),
     _Tcgen05Window("PACKED_NARROW", 1, 8, False, 32, 256, 7168, 20480),
     *_PACKED_FEW_ROWS,
-    *_MANY_ROWS_NOBIAS,
+    *_many_rows_nobias(1536),
     *_many_rows_bias(1536),
 )
 _SM103 = (
@@ -1059,12 +1140,13 @@ _SM103 = (
     _Tcgen05Window("PACKED_NARROW_FULL_STAGES", 1, 4, False, 32, 512, 8192, 20480),
     _Tcgen05Window("PACKED_NARROW_FULL_STAGES", 2, 8, False, 32, 256, 6144, 20480),
     _Tcgen05Window("PACKED_NARROW_FULL_STAGES", 3, 8, False, 32, 256, 3584, 3584),
+    _Tcgen05Window("PACKED_NARROW_FULL_STAGES", 4, 8, False, 64, 192, 3584, 5120),
     _Tcgen05Window("PACKED_NARROW_FULL_STAGES", 4, 8, False, 64, 256, 5120, 20480),
     _Tcgen05Window("PACKED_NARROW_FULL_STAGES", 4, 6, False, 32, 64, 3584, 20480),
     _Tcgen05Window("PACKED_NARROW_FULL_STAGES", 1, 6, False, 320, 320, 6144, 20480),
     _Tcgen05Window("PACKED_NARROW_FULL_STAGES", 1, 2, False, 32, 512, 7168, 20480),
     *_PACKED_FEW_ROWS,
-    *_MANY_ROWS_NOBIAS,
+    *_many_rows_nobias(1536),
     *_many_rows_bias(1536),
 )
 _SM107 = (
@@ -1080,9 +1162,31 @@ _SM107 = (
     _Tcgen05Window("PACKED_NARROW_U4", 1, 4, False, 64, 512, 6144, 20480),
     _Tcgen05Window("PACKED_NARROW_U4", 3, 8, False, 64, 128, 5120, 20480),
     _Tcgen05Window("PACKED_NARROW_U4", 1, 6, False, 64, 512, 7168, 20480),
+    _Tcgen05Window("PACKED_NARROW_U4", 4, 8, False, 64, 320, 4096, 8192),
+    _Tcgen05Window("PACKED_M64_N4", 4, 4, True, 2048, 3072, 2880, 8192),
+    _Tcgen05Window("PACKED_M64_N4", 4, 4, False, 2048, 3072, 2880, 10240),
+    _Tcgen05Window("PACKED_M64_N16", 16, 16, True, 2048, 3072, 2880, 10240),
+    _Tcgen05Window("PACKED_M64_N16", 11, 16, True, 2048, 3072, 6144, 10240),
+    _Tcgen05Window("PACKED_M64_N16", 9, 16, True, 2048, 3072, 8192, 10240),
+    _Tcgen05Window("PACKED_M64_N16", 16, 16, False, 2048, 3072, 2048, 10240),
+    _Tcgen05Window("PACKED_M64_N16", 11, 16, False, 2048, 3072, 6144, 10240),
+    _Tcgen05Window("PACKED_M64_N16", 9, 16, False, 2048, 3072, 8192, 10240),
+    _Tcgen05Window("PACKED_M64_N8", 8, 8, False, 3584, 8192, 2048, 2048),
+    _Tcgen05Window(
+        "PACKED_M64_N8", 8, 8, False, 7168, 8192, 2048, 8192, input_features_multiple=64
+    ),
+    _Tcgen05Window(
+        "PACKED_M64_N8", 8, 8, False, 6144, 8192, 3072, 8192, input_features_multiple=64
+    ),
+    _Tcgen05Window(
+        "PACKED_M64_N8", 8, 8, False, 3584, 4608, 4096, 8192, input_features_multiple=64
+    ),
+    _Tcgen05Window("PACKED_BOX8", 8, 8, False, 4096, 5120, 2112, 2560),
+    _Tcgen05Window("PACKED_BOX8", 8, 8, False, 3584, 4096, 3072, 6144),
     _Tcgen05Window("PACKED", 8, 8, False, 3584, 4096, 2112, 6144),
     _Tcgen05Window("PACKED", 9, 16, True, 3584, 4096, 2112, 6144),
-    *_MANY_ROWS_NOBIAS,
+    *_SM107_SMALL_ACTIVATIONS,
+    *_many_rows_nobias(1728),
     *_many_rows_bias(2048),
 )
 _TINYGEMM2_TCGEN05_WINDOWS = {
@@ -1107,7 +1211,11 @@ def _tinygemm2_tcgen05_enabled(
 
 
 def _tinygemm2_tcgen05_program(
-    input: torch.Tensor, weight: torch.Tensor, has_bias: bool, use_pdl: bool
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    has_bias: bool,
+    use_pdl: bool,
 ) -> Optional[str]:
     """The identifier of the generated program serving the call, or ``None``."""
     capability = get_compute_capability(input.device)
@@ -1135,6 +1243,11 @@ def _tinygemm2_tcgen05_program(
         _multiprocessor_count(input.device.index),
     )
     if tile is None:
+        return None
+    # ACCUMULATORS writes a lane's 16 output features as one 32-byte store: a
+    # 32-byte aligned ``out`` (its rows then start aligned, the output features
+    # being a multiple of 16).
+    if tile == "ACCUMULATORS" and out.data_ptr() % 32 != 0:
         return None
     return tile + ("" if has_bias else "_NOBIAS") + ("_PDL" if use_pdl else "")
 
@@ -1173,6 +1286,11 @@ def get_tinygemm2_tcgen05_op():
     ) -> None:
         record = getattr(programs, program)
         tile = program.removesuffix("_PDL").removesuffix("_NOBIAS")
+        # A misaligned 32-byte store faults the CUDA context: refuse the call instead.
+        if tile == "ACCUMULATORS" and out.data_ptr() % 32 != 0:
+            raise ValueError(
+                f"{program} needs a 32-byte aligned out, got {out.data_ptr():#x}"
+            )
         features, rows = _TINYGEMM2_TCGEN05_TILES[tile]
         batch, in_features = input.shape
         out_features = weight.shape[0]
@@ -1276,7 +1394,7 @@ def tinygemm_bf16(
     reference's (``flashinfer.jit.cake_tinygemm2_tcgen05``).  Set
     ``FLASHINFER_DISABLE_TINYGEMM2_TCGEN05=1`` to keep the kernels above.
     """
-    program = _tinygemm2_tcgen05_program(input, weight, bias is not None, use_pdl)
+    program = _tinygemm2_tcgen05_program(input, weight, out, bias is not None, use_pdl)
     if program is not None:
         _tinygemm_bf16_cake(program, input, weight, bias, out, backend="cake")
     elif bias is None:

@@ -670,6 +670,12 @@ class BlockSparseAttentionWrapper:
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         self._o_dtype = canonicalize_torch_dtype(o_data_type)
 
+        # Normalized: the planner and kernels read these as raw pointers (#5260).
+        if indptr is not None:
+            indptr = indptr.contiguous()
+        if indices is not None:
+            indices = indices.contiguous()
+
         if self._backend != "vsa_sm100_blk64" and (
             kv_splits is not None
             or use_clc is not None
@@ -1312,6 +1318,7 @@ class BlockSparseAttentionWrapper:
                 args.append(False)  # disable_split_kv
                 args.append(0)  # num_colocated_ctas
                 args.append(0)  # uniform_q_len
+                args.append(False)  # fixed_uniform_q_len
             self._plan_info = self._cached_module.plan(
                 *args,
             )
@@ -2089,6 +2096,7 @@ class VariableBlockSparseAttentionWrapper:
             args.append(False)  # disable_split_kv
             args.append(0)  # num_colocated_ctas
             args.append(0)  # uniform_q_len
+            args.append(False)  # fixed_uniform_q_len
         self._plan_info = self._cached_module.plan(
             *args,
         )

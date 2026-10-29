@@ -516,6 +516,41 @@ def test_invalid_metadata_leaves_outputs_untouched(kind):
     assert bool(torch.isnan(bufs["q_scale"]).all())
 
 
+@pytest.mark.parametrize("heads", [(8, 1), (64, 8)])
+@pytest.mark.parametrize("is_prefill", [False, True])
+def test_empty_batch_with_rows_leaves_outputs_untouched(heads, is_prefill):
+    """No request (B = 0) with rows is a malformed table (q_indptr = [0]): the call
+    writes nothing and has no flag to set."""
+    _skip_unless_supported()
+    hq, hkv = heads
+    case = make_case(
+        q_lens=[1],
+        ctx_lens=[5],
+        num_q_heads=hq,
+        num_kv_heads=hkv,
+        page_size=16,
+        qk_norm_policy=2,
+        quant_policy=1,
+        seed=13,
+        is_prefill=is_prefill,
+    )
+    dev = case["qkv"].device
+    g = torch.Generator(device="cpu").manual_seed(14)
+    width = (hq + 2 * hkv) * HEAD_DIM
+    case.update(
+        qkv=torch.randn((8, width), generator=g).to(torch.bfloat16).to(dev),
+        seq_lens=torch.zeros(0, dtype=torch.int32, device=dev),
+        q_indptr=torch.zeros(1, dtype=torch.int32, device=dev),
+        page_indices=torch.zeros((0, 1), dtype=torch.int32, device=dev),
+        max_seqlen=8 if is_prefill else 0,
+    )
+    bufs, _ = launch(case)
+    assert tuple(bufs["flags"].shape) == (0, hkv)
+    for name in ("out_q", "key_cache", "value_cache"):
+        assert bool((bufs[name].view(torch.uint8) == POISON_BYTE).all()), name
+    assert bool(torch.isnan(bufs["q_scale"]).all())
+
+
 def test_cuda_graph_replay_matches_eager():
     _skip_unless_supported()
     case = make_case(
@@ -929,7 +964,64 @@ def test_default_launch_plan_is_the_default_builds_grid():
 _POLICY_TABLE: dict[tuple[str, int, int, int, int, int, int, bool, int, bool], str] = {
     # (arch, Hq, Hkv, num_rows, num_requests, page_size, num_sms, is_prefill,
     #  max_pages_per_request, has_out_kv) -> stage
-    ("sm_90a", 8, 1, 32, 32, 64, 132, False, 33, False): "fp8_e4m3_scan_rounds3",
+    # no request (B = 0; with rows, a malformed table): the default build everywhere
+    ("sm_90a", 8, 1, 8, 0, 64, 132, False, 1, False): "fp8_e4m3",
+    ("sm_90a", 8, 1, 8, 0, 64, 132, True, 1, False): "fp8_e4m3",
+    ("sm_100a", 8, 1, 8, 0, 64, 148, False, 1, False): "fp8_e4m3",
+    ("sm_100a", 8, 1, 8, 0, 64, 148, True, 1, False): "fp8_e4m3",
+    ("sm_103a", 8, 1, 8, 0, 64, 148, False, 1, False): "fp8_e4m3",
+    ("sm_103a", 8, 1, 8, 0, 64, 148, True, 1, False): "fp8_e4m3",
+    ("sm_103a", 8, 1, 8, 0, 64, 152, False, 1, False): "fp8_e4m3",
+    ("sm_103a", 8, 1, 8, 0, 64, 152, True, 1, False): "fp8_e4m3",
+    # B300 single-KV-head decode from 512 CTAs: the nine-CTA prefetch
+    (
+        "sm_103a",
+        8,
+        1,
+        256,
+        256,
+        64,
+        148,
+        False,
+        33,
+        False,
+    ): "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1_clear_tie1",
+    (
+        "sm_103a",
+        8,
+        1,
+        224,
+        224,
+        64,
+        148,
+        False,
+        33,
+        False,
+    ): "fp8_e4m3_early_rt21_page_prefetch1_clear_tie1",
+    (
+        "sm_100a",
+        8,
+        1,
+        256,
+        256,
+        64,
+        148,
+        False,
+        33,
+        False,
+    ): "fp8_e4m3_early_rt21_page_prefetch1_clear_tie1",
+    (
+        "sm_90a",
+        8,
+        1,
+        32,
+        32,
+        64,
+        132,
+        False,
+        33,
+        False,
+    ): "fp8_e4m3_scan_rounds3_clear_tie1",
     (
         "sm_90a",
         64,
@@ -941,9 +1033,31 @@ _POLICY_TABLE: dict[tuple[str, int, int, int, int, int, int, bool, int, bool], s
         False,
         33,
         False,
-    ): "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1_grid_order2",
-    ("sm_90a", 8, 1, 128, 8, 64, 132, True, 33, False): "fp8_e4m3_scan_rounds3",
-    ("sm_90a", 64, 8, 128, 8, 64, 132, True, 33, False): "fp8_e4m3_scan_rounds3",
+    ): "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1_grid_order2_clear_tie1",
+    (
+        "sm_90a",
+        8,
+        1,
+        128,
+        8,
+        64,
+        132,
+        True,
+        33,
+        False,
+    ): "fp8_e4m3_scan_rounds3_clear_tie1",
+    (
+        "sm_90a",
+        64,
+        8,
+        128,
+        8,
+        64,
+        132,
+        True,
+        33,
+        False,
+    ): "fp8_e4m3_scan_rounds3_clear_tie1",
     (
         "sm_90a",
         64,
@@ -955,9 +1069,31 @@ _POLICY_TABLE: dict[tuple[str, int, int, int, int, int, int, bool, int, bool], s
         False,
         33,
         False,
-    ): "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1",
-    ("sm_90a", 8, 1, 1024, 1, 64, 132, True, 48, False): "fp8_e4m3_scan_rounds3",
-    ("sm_90a", 8, 1, 32, 32, 16, 132, False, 129, False): "fp8_e4m3_scan_rounds3",
+    ): "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1_clear_tie1",
+    (
+        "sm_90a",
+        8,
+        1,
+        1024,
+        1,
+        64,
+        132,
+        True,
+        48,
+        False,
+    ): "fp8_e4m3_scan_rounds3_clear_tie1",
+    (
+        "sm_90a",
+        8,
+        1,
+        32,
+        32,
+        16,
+        132,
+        False,
+        129,
+        False,
+    ): "fp8_e4m3_scan_rounds3_clear_tie1",
     (
         "sm_100a",
         8,
@@ -969,7 +1105,7 @@ _POLICY_TABLE: dict[tuple[str, int, int, int, int, int, int, bool, int, bool], s
         False,
         33,
         False,
-    ): "fp8_e4m3_early_rt21_page_prefetch1",
+    ): "fp8_e4m3_early_rt21_page_prefetch1_clear_tie1",
     (
         "sm_100a",
         64,
@@ -981,7 +1117,7 @@ _POLICY_TABLE: dict[tuple[str, int, int, int, int, int, int, bool, int, bool], s
         False,
         33,
         False,
-    ): "fp8_e4m3_early_rt21_page_prefetch1",
+    ): "fp8_e4m3_early_rt21_page_prefetch1_clear_tie1",
     (
         "sm_100a",
         8,
@@ -993,9 +1129,20 @@ _POLICY_TABLE: dict[tuple[str, int, int, int, int, int, int, bool, int, bool], s
         True,
         33,
         False,
-    ): "fp8_e4m3_early_rt21_page_prefetch1",
+    ): "fp8_e4m3_early_rt21_page_prefetch1_clear_tie1",
     ("sm_100a", 64, 8, 128, 8, 64, 148, True, 33, False): "fp8_e4m3_grid_order2",
-    ("sm_100a", 64, 8, 256, 256, 64, 148, False, 33, False): "fp8_e4m3_scan_rounds3",
+    (
+        "sm_100a",
+        64,
+        8,
+        256,
+        256,
+        64,
+        148,
+        False,
+        33,
+        False,
+    ): "fp8_e4m3_scan_rounds3_clear_tie1",
     (
         "sm_100a",
         8,
@@ -1031,7 +1178,7 @@ _POLICY_TABLE: dict[tuple[str, int, int, int, int, int, int, bool, int, bool], s
         False,
         33,
         False,
-    ): "fp8_e4m3_early_rt21_page_prefetch1",
+    ): "fp8_e4m3_early_rt21_page_prefetch1_clear_tie1",
     (
         "sm_103a",
         64,
@@ -1043,7 +1190,7 @@ _POLICY_TABLE: dict[tuple[str, int, int, int, int, int, int, bool, int, bool], s
         False,
         33,
         False,
-    ): "fp8_e4m3_early_rt21_page_prefetch1",
+    ): "fp8_e4m3_early_rt21_page_prefetch1_clear_tie1",
     (
         "sm_103a",
         8,
@@ -1055,7 +1202,7 @@ _POLICY_TABLE: dict[tuple[str, int, int, int, int, int, int, bool, int, bool], s
         True,
         33,
         False,
-    ): "fp8_e4m3_early_rt21_page_prefetch1",
+    ): "fp8_e4m3_early_rt21_page_prefetch1_clear_tie1",
     (
         "sm_103a",
         8,
@@ -1079,7 +1226,7 @@ _POLICY_TABLE: dict[tuple[str, int, int, int, int, int, int, bool, int, bool], s
         False,
         33,
         False,
-    ): "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1",
+    ): "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1_clear_tie1",
     (
         "sm_103a",
         8,
@@ -1091,7 +1238,7 @@ _POLICY_TABLE: dict[tuple[str, int, int, int, int, int, int, bool, int, bool], s
         True,
         33,
         False,
-    ): "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1",
+    ): "fp8_e4m3_min_blocks9_early_rt21_page_prefetch1_clear_tie1",
     ("sm_103a", 64, 8, 128, 8, 64, 152, True, 33, False): "fp8_e4m3_grid_order2",
 }
 
@@ -1124,7 +1271,7 @@ def test_stage_policy_only_selects_shipped_builds(arch):
     shipped = set(loader.stages_for(arch))
     for hq, hkv in loader.SUPPORTED_HEADS:
         for page in (4, 16, 64, 128):
-            for reqs in (1, 4, 8, 32, 96, 97, 128, 256, 512):
+            for reqs in (0, 1, 4, 8, 32, 96, 97, 128, 256, 512):
                 # rows < reqs: requests without rows in this step
                 for rows in sorted({reqs, 1, 128, 1024, 4096}):
                     for prefill in (False, True):

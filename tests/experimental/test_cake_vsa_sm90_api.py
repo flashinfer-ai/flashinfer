@@ -615,10 +615,11 @@ def test_facade_re_exports_the_backend():
     assert facade.GQA_GROUPS == backend.GQA_GROUPS == (1, 2, 4, 8)
     assert set(facade.__all__) <= set(dir(backend))
     # 19 BF16 + 19 FP8 twins + 2 quantizers + 19 + 19 GQA stages + the two round-2 FP8 GQA programs
-    assert len(facade.STAGES) == 80
+    # + the round-16 position-selected FP8 GQA static program
+    assert len(facade.STAGES) == 81
     assert len(facade.GQA_PERSISTENT_STAGES) + len(facade.GQA_SMALL_STAGES) == 19
     assert (
-        len(facade.FP8_GQA_PERSISTENT_STAGES) + len(facade.FP8_GQA_SMALL_STAGES) == 21
+        len(facade.FP8_GQA_PERSISTENT_STAGES) + len(facade.FP8_GQA_SMALL_STAGES) == 22
     )
     assert facade.sage_fp8_quantize_sm90 is backend.sage_fp8_quantize_sm90
     assert facade.FP8_DTYPE is torch.float8_e4m3fn and facade.K_SCALE_GROUP == 16
@@ -963,11 +964,24 @@ def test_fp8_gqa_route_against_the_dequantized_reference(
     bf16 = _gqa_wrapper(mask, h, scale=scale)._cake_vsa_sm90_plan
     assert plan.fp8 and plan.gqa == g and backend.stage_gqa(plan.stage)
     assert backend.stage_dtype(plan.stage) == "e4m3" and plan.mode == bf16.mode
-    assert plan.stage == (
+    expected_stage = (
         bf16.stage.replace("attention", "attention_fp8")
         if bf16.stage.startswith("attention")
         else bf16.stage.replace("small_", "small_fp8_")
     )
+    # the Sage-FP8 route serves static grouped-query plans whose lightest CTA runs at least
+    # PIN_MIN_CTA_LOOP_ITERS main-loop iterations on the position-selected static program
+    # (the pair plan of this list runs 13 and takes it from the threshold 8 on); its BF16 twin
+    # is the plain static program, and the bitwise checks below hold on it (pin == static
+    # bits).  The expectation comes from the planner decision on the plan's own device, not
+    # from the stage the wrapper picked, so a plan routed away from the pin program fails here.
+    sms = torch.cuda.get_device_properties(plan.device).multi_processor_count
+    if backend.fp8_gqa_pin(
+        backend.plan_vsa_sm90(mask.cpu(), sms=sms, gqa=g, split_tile_order="group")
+    ):
+        assert expected_stage == "attention_fp8_gqa"
+        expected_stage = "attention_fp8_gqa_pin"
+    assert plan.stage == expected_stage
     outs = [wrapper.run(q8, k8, v8).clone() for _ in range(3)]
     assert outs[0].dtype == torch.bfloat16 and outs[0].shape == q.shape
     for later in outs[1:]:

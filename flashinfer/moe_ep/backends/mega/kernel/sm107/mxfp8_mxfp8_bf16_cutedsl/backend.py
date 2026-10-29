@@ -270,8 +270,15 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             workspace.x_sf[:num_tokens, :sf_cols].view(torch.uint8).copy_(
                 t.scales.view(torch.uint8)
             )
-            workspace.topk_idx[:num_tokens].copy_(t.topk_ids.to(torch.int32))
-            workspace.topk_weights[:num_tokens].copy_(t.topk_weights.to(torch.float32))
+            from ..routing_staging import stage_routes
+
+            stage_routes(
+                t.topk_ids,
+                t.topk_weights,
+                workspace.topk_idx,
+                workspace.topk_weights,
+                workspace=workspace,
+            )
         if num_tokens < capacity:
             workspace.topk_idx[num_tokens:capacity].fill_(-1)
         workspace.note_staged_tokens(num_tokens)

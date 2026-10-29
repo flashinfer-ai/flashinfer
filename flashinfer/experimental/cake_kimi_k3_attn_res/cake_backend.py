@@ -67,6 +67,13 @@ MAX_BLOCKS = int(ROUTES["MAX_BLOCKS"])
 DIRECT_THREADS = 256
 PERSISTENT_THREADS = 288
 PAIR_THREADS = 320
+#: The pair kernel's ``consumer_regs`` builds, three whole warpgroups each: the ``_cr232`` keys hold
+#: the two consumer groups at 232 registers each warp and the producer warpgroup at 40; the
+#: ``_cr200_pk1`` keys hold them at 200 and 104 and park each consumer thread's accumulators in
+#: tensor memory while the prefix chunk streams (``park_acc`` 1).
+PAIR_CONSUMER_REGS = 232
+PAIR_PARK_ACC_CONSUMER_REGS = 200
+PAIR_CONSUMER_REGS_THREADS = 384
 #: Physical SM counts the native ports and the pair kernel are qualified on: 148 (B200 / B300) and
 #: 152 (GB300).  They launch one CTA per SM and grid-stride over the tokens, so their grid is the
 #: device's SM count; any other count keeps the persistent / small-M families, whose grids derive
@@ -380,7 +387,7 @@ def _schedule(arch: str, M: int, K: int, write: bool = False) -> tuple[int, int]
             return PERSISTENT_SOURCES_PER_CHUNK, 3
         if K == 4:
             return (
-                5 if M in {1, 32, 1024, 2048, 4096, 8192, 16384} else 3
+                5 if M in {1024, 2048, 4096, 8192, 16384} else 3
             ), PERSISTENT_CHUNK_DEPTH
     else:
         if K == 1 and M in _SM103_K1_NC2_M:
@@ -465,24 +472,37 @@ _PERSISTENT_FLAG_PWA = 1
 _PERSISTENT_FLAG_PREFIX_BF16_ADD = 2
 _PERSISTENT_FLAG_PREFIX_ROUND_ONCE = 3
 _PERSISTENT_FLAG_REGISTER_CARRY_ONLY = 4
-# ``persistent:k<K>_nc<nc>_d<depth>_f<15 bits>[_fm][_crfnone][_crheld][_write][_cta2]``: ``_fm``
-# is the fast-math twin, ``_crfnone`` (round 3) the fence-authored twin -- the same program built
+# ``persistent:k<K>_nc<nc>_d<depth>_f<15 bits>[_fm][_crfnone][_crheld][_rcp][_write][_cta2]``:
+# ``_fm`` is the fast-math twin, ``_crfnone`` (round 3) the fence-authored twin -- the same program built
 # with ``consumed_release_fence_mode="none"`` (the kernel states its own tcgen05 fences), a
 # registered program of its own whose schedule label ends in ``_authored_fences`` --, ``_crheld``
 # (round 19) the held-release program -- the program of the same key with flag bit 0 set and
 # without the suffix, built without the early consumed release; the key spells bit 0 as 0 and
-# the schedule label adds ``_held_release`` after ``_authored_fences`` --, ``_write`` the
-# snapshot-write variant and ``_cta2`` the program built for two CTAs per SM, launched on
-# ``min(M, 2 x SMs)`` CTAs.  A fallback never crosses the ``_fm`` / ``_crfnone`` / ``_crheld`` /
+# the schedule label adds ``_held_release`` after ``_authored_fences`` --, ``_rcp`` (round 20) the
+# packed register carry of a K = 3 register-carry program -- the program of the same key without
+# the suffix keeping each token's bf16 source words in registers instead of TMEM; the schedule
+# label adds ``_packed_register_carry`` after ``_held_release`` --, ``_write`` the snapshot-write
+# variant and ``_cta2`` the program built for two CTAs per SM, launched on ``min(M, 2 x SMs)``
+# CTAs.  A fallback never crosses the ``_fm`` / ``_crfnone`` / ``_crheld`` / ``_rcp`` /
 # ``_write`` / ``_cta2`` lines.
 _PERSISTENT_KEY = re.compile(
     r"^persistent:k(?P<K>\d+)_nc(?P<nc>\d+)_d(?P<depth>\d+)_f(?P<bits>[01]+)"
-    r"(?P<fm>_fm)?(?P<crfnone>_crfnone)?(?P<crheld>_crheld)?(?P<write>_write)?(?P<cta2>_cta2)?$"
+    r"(?P<fm>_fm)?(?P<crfnone>_crfnone)?(?P<crheld>_crheld)?(?P<rcp>_rcp)?(?P<write>_write)?"
+    r"(?P<cta2>_cta2)?$"
 )
 _SMALL_M_KEY = re.compile(
     r"^small_m_(direct|cluster(\d+)):k(\d+)(?:_nc(\d+))?(_fm)?(_write)?$"
 )
-_PAIR_KEY = re.compile(r"^pair:k(\d+)_nc(\d+)(_pbf16a)?(_fm)?(_write)?$")
+# ``pair:k<K>_nc<nc>[_pbf16a][_fm][_cr232|_cr200_pk1][_write]``: ``_cr232`` is the pair kernel
+# built at ``consumer_regs`` = ``PAIR_CONSUMER_REGS``, ``_cr200_pk1`` the one built at
+# ``consumer_regs`` = ``PAIR_PARK_ACC_CONSUMER_REGS`` with ``park_acc`` 1 (both
+# ``PAIR_CONSUMER_REGS_THREADS`` threads; the schedule label adds ``_consumer_regs232`` /
+# ``_consumer_regs200_park_acc1``).
+_PAIR_KEY = re.compile(
+    r"^pair:k(?P<K>\d+)_nc(?P<nc>\d+)(?P<pbf16a>_pbf16a)?(?P<fm>_fm)?"
+    rf"(?P<cr>_cr{PAIR_CONSUMER_REGS}|_cr{PAIR_PARK_ACC_CONSUMER_REGS}(?P<park>_pk1))?"
+    r"(?P<write>_write)?$"
+)
 
 
 def _persistent_schedule_id(
@@ -491,6 +511,7 @@ def _persistent_schedule_id(
     bits: str,
     authored_fences: bool = False,
     held_release: bool = False,
+    packed_register_carry: bool = False,
 ) -> str:
     schedule_id = f"trtllm_persistent_ws288_nc{nc}_d{depth}_vec128_fp32x2"
     if bits[_PERSISTENT_FLAG_ECR] == "1":
@@ -507,6 +528,8 @@ def _persistent_schedule_id(
         schedule_id += "_authored_fences"
     if held_release:
         schedule_id += "_held_release"
+    if packed_register_carry:
+        schedule_id += "_packed_register_carry"
     return schedule_id
 
 
@@ -592,6 +615,7 @@ def _persistent_fallback(
     want_fm = bool(exact and exact["fm"]) or "_fm" in plan.kernel_key
     want_authored = bool(exact and exact["crfnone"]) or "_crfnone" in plan.kernel_key
     want_held = bool(exact and exact["crheld"]) or "_crheld" in plan.kernel_key
+    want_packed = bool(exact and exact["rcp"]) or "_rcp" in plan.kernel_key
     want_two_ctas = bool(exact and exact["cta2"]) or plan.kernel_key.endswith("_cta2")
     pinned = _cell_pinned_write_keys(plan.arch)
     candidates = []
@@ -613,6 +637,9 @@ def _persistent_fallback(
             continue
         if bool(match["crheld"]) != want_held:
             # a held-release program keeps the early-release levers: never substitute across it
+            continue
+        if bool(match["rcp"]) != want_packed:
+            # a packed-carry program keeps its sources in registers: never substitute across it
             continue
         if bool(match["cta2"]) != want_two_ctas:
             # a two-CTA program launches on another grid: never substitute across it
@@ -638,7 +665,12 @@ def _persistent_fallback(
     else:
         grid_x, grid_policy = _grid(M, num_sms, nc)
     schedule_id = _persistent_schedule_id(
-        nc, depth, bits, want_authored, held_release=want_held
+        nc,
+        depth,
+        bits,
+        want_authored,
+        held_release=want_held,
+        packed_register_carry=want_packed,
     )
     if want_fm:
         schedule_id += "_fastmath"
@@ -889,22 +921,28 @@ def _plan_route_exact(
 def _pair_plan(
     arch: str, num_sms: int, M: int, K: int, use_pdl: bool, key: str
 ) -> RoutePlan:
-    """The plan of a round-2 pair cell: one CTA per SM, 320 threads, the key as the table names it."""
+    """The plan of a round-2 pair cell: one CTA per SM, 320 threads (384 for a ``_cr232`` or a
+    ``_cr200_pk1`` key), the key as the table names it."""
     match = _PAIR_KEY.match(key)
-    if match is None or int(match.group(1)) != K or match.group(5):
+    if match is None or int(match["K"]) != K or match["write"]:
         raise ValueError(
             f"round-2 cell ({M}, {K}) names {key!r}, not a dense pair key of K={K}"
         )
-    nc = int(match.group(2))
-    schedule_id = f"pair_ws{PAIR_THREADS}_nc{nc}"
-    if match.group(3):
+    nc = int(match["nc"])
+    threads = PAIR_CONSUMER_REGS_THREADS if match["cr"] else PAIR_THREADS
+    schedule_id = f"pair_ws{threads}_nc{nc}"
+    if match["pbf16a"]:
         schedule_id += "_prefix_bf16_add"
-    if match.group(4):
+    if match["fm"]:
         schedule_id += "_fastmath"
+    if match["park"]:
+        schedule_id += f"_consumer_regs{PAIR_PARK_ACC_CONSUMER_REGS}_park_acc1"
+    elif match["cr"]:
+        schedule_id += f"_consumer_regs{PAIR_CONSUMER_REGS}"
     schedule_id += f"_grid{num_sms}"
     route_id = f"{schedule_id}.{arch}.pair_no_hint.k{K}.delta1.write0.norm1.pdl{int(use_pdl)}.pair_full_sm"
     return RoutePlan(
-        "pair", key, num_sms, PAIR_THREADS, schedule_id, route_id, arch, use_pdl
+        "pair", key, num_sms, threads, schedule_id, route_id, arch, use_pdl
     )
 
 
@@ -914,8 +952,8 @@ def _persistent_plan_for_key(
     """The plan of a round-2 / round-3 persistent cell: the key as the table names it, the grid of
     its ``nc`` (``min(M, 2 x SMs)`` for a ``_cta2`` key) and the labels of its fields (what
     ``_persistent_plan_exact`` derives for a legacy cell; a ``_crfnone`` key labels its schedule
-    ``_authored_fences``, a ``_crheld`` key ``_held_release``, a ``_cta2`` key
-    ``_two_ctas_per_sm``)."""
+    ``_authored_fences``, a ``_crheld`` key ``_held_release``, a ``_rcp`` key
+    ``_packed_register_carry``, a ``_cta2`` key ``_two_ctas_per_sm``)."""
     match = _PERSISTENT_KEY.match(key)
     if match is None or int(match["K"]) != K or match["write"]:
         raise ValueError(
@@ -927,7 +965,12 @@ def _persistent_plan_for_key(
     else:
         grid_x, grid_policy = _grid(M, num_sms, nc)
     schedule_id = _persistent_schedule_id(
-        nc, depth, bits, bool(match["crfnone"]), held_release=bool(match["crheld"])
+        nc,
+        depth,
+        bits,
+        bool(match["crfnone"]),
+        held_release=bool(match["crheld"]),
+        packed_register_carry=bool(match["rcp"]),
     )
     if match["fm"]:
         schedule_id += "_fastmath"
@@ -983,12 +1026,7 @@ def _persistent_plan_exact(
             )
             and not ecr
         )
-        or (
-            arch == "sm_103a"
-            and (K in {1, 2, 3} or (M == 1 and K == 5))
-            and nc == 4
-            and not ecr
-        )
+        or (arch == "sm_103a" and K in {1, 2, 3} and nc == 4 and not ecr)
         or (K == 4 and nc == 3 and not ecr)
         or (arch == "sm_103a" and K == 8 and nc == 3 and not ecr)
     )
@@ -997,12 +1035,7 @@ def _persistent_plan_exact(
     # one token per CTA (K 1-3, nc 4, held release, grid_x == M), was never reached: every such
     # cell is small-M at 148 / 152 SMs.
     register_carry_only = False
-    prefetch_fifth_stats = (
-        (arch == "sm_103a" or (arch == "sm_100a" and M == 32))
-        and K == 4
-        and nc == 5
-        and not ecr
-    )
+    prefetch_fifth_stats = arch == "sm_103a" and K == 4 and nc == 5 and not ecr
     k4_early_nc5_input_first = (
         arch == "sm_100a" and M == 1024 and K == 4 and nc == 5 and ecr
     )
@@ -1229,7 +1262,7 @@ def _bind(
             )
         arguments.append(kwargs[key])
     module = load(name, arch)
-    return getattr(module, record["ffi_entry"]), tuple(arguments)
+    return module.run, tuple(arguments)
 
 
 @dataclass(frozen=True)

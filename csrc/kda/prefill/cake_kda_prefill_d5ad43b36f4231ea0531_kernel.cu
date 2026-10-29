@@ -331,120 +331,120 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
             lo_reg[0] = zero[0] - hi_reg[0];
             hi_reg[1] = (float)(__nv_bfloat16)zero[1];
             lo_reg[1] = zero[1] - hi_reg[1];
-            unsigned int _packed_0[1];
+            unsigned int packed[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(hi_reg[_lp*2 + 0], hi_reg[_lp*2+1 + 0]));
-                _packed_0[_lp] = *(uint32_t*)&_bf2;
+                packed[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(carry_hi + (((part_begin - 1) * num_heads + task) * 16384 + row_offset[0]))[0] = reinterpret_cast<unsigned*>(_packed_0)[0];
-            unsigned int _packed_1[1];
+            reinterpret_cast<unsigned*>(carry_hi + (((part_begin - 1) * num_heads + task) * 16384 + row_offset[0]))[0] = reinterpret_cast<unsigned*>(packed)[0];
+            unsigned int packed_1[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lo_reg[_lp*2 + 0], lo_reg[_lp*2+1 + 0]));
-                _packed_1[_lp] = *(uint32_t*)&_bf2;
+                packed_1[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(carry_lo + (((part_begin - 1) * num_heads + task) * 16384 + row_offset[0]))[0] = reinterpret_cast<unsigned*>(_packed_1)[0];
+            reinterpret_cast<unsigned*>(carry_lo + (((part_begin - 1) * num_heads + task) * 16384 + row_offset[0]))[0] = reinterpret_cast<unsigned*>(packed_1)[0];
         }
         if (row0 + 1 < 128) {
             hi_reg[0] = (float)(__nv_bfloat16)zero[2];
             lo_reg[0] = zero[2] - hi_reg[0];
             hi_reg[1] = (float)(__nv_bfloat16)zero[3];
             lo_reg[1] = zero[3] - hi_reg[1];
-            unsigned int _packed_2[1];
+            unsigned int packed_2[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(hi_reg[_lp*2 + 0], hi_reg[_lp*2+1 + 0]));
-                _packed_2[_lp] = *(uint32_t*)&_bf2;
+                packed_2[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(carry_hi + (((part_begin - 1) * num_heads + task) * 16384 + row_offset[1]))[0] = reinterpret_cast<unsigned*>(_packed_2)[0];
-            unsigned int _packed_3[1];
+            reinterpret_cast<unsigned*>(carry_hi + (((part_begin - 1) * num_heads + task) * 16384 + row_offset[1]))[0] = reinterpret_cast<unsigned*>(packed_2)[0];
+            unsigned int packed_1_1[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lo_reg[_lp*2 + 0], lo_reg[_lp*2+1 + 0]));
-                _packed_3[_lp] = *(uint32_t*)&_bf2;
+                packed_1_1[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(carry_lo + (((part_begin - 1) * num_heads + task) * 16384 + row_offset[1]))[0] = reinterpret_cast<unsigned*>(_packed_3)[0];
+            reinterpret_cast<unsigned*>(carry_lo + (((part_begin - 1) * num_heads + task) * 16384 + row_offset[1]))[0] = reinterpret_cast<unsigned*>(packed_1_1)[0];
         }
         if (row0 + 2 < 128) {
             hi_reg[0] = (float)(__nv_bfloat16)zero[4];
             lo_reg[0] = zero[4] - hi_reg[0];
             hi_reg[1] = (float)(__nv_bfloat16)zero[5];
             lo_reg[1] = zero[5] - hi_reg[1];
-            unsigned int _packed_4[1];
+            unsigned int packed_3[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(hi_reg[_lp*2 + 0], hi_reg[_lp*2+1 + 0]));
-                _packed_4[_lp] = *(uint32_t*)&_bf2;
+                packed_3[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(carry_hi + (((part_begin - 1) * num_heads + task) * 16384 + row_offset[2]))[0] = reinterpret_cast<unsigned*>(_packed_4)[0];
-            unsigned int _packed_5[1];
+            reinterpret_cast<unsigned*>(carry_hi + (((part_begin - 1) * num_heads + task) * 16384 + row_offset[2]))[0] = reinterpret_cast<unsigned*>(packed_3)[0];
+            unsigned int packed_1_2[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lo_reg[_lp*2 + 0], lo_reg[_lp*2+1 + 0]));
-                _packed_5[_lp] = *(uint32_t*)&_bf2;
+                packed_1_2[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(carry_lo + (((part_begin - 1) * num_heads + task) * 16384 + row_offset[2]))[0] = reinterpret_cast<unsigned*>(_packed_5)[0];
+            reinterpret_cast<unsigned*>(carry_lo + (((part_begin - 1) * num_heads + task) * 16384 + row_offset[2]))[0] = reinterpret_cast<unsigned*>(packed_1_2)[0];
         }
         if (row0 + 3 < 128) {
             hi_reg[0] = (float)(__nv_bfloat16)zero[6];
             lo_reg[0] = zero[6] - hi_reg[0];
             hi_reg[1] = (float)(__nv_bfloat16)zero[7];
             lo_reg[1] = zero[7] - hi_reg[1];
-            unsigned int _packed_6[1];
+            unsigned int packed_4[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(hi_reg[_lp*2 + 0], hi_reg[_lp*2+1 + 0]));
-                _packed_6[_lp] = *(uint32_t*)&_bf2;
+                packed_4[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(carry_hi + (((part_begin - 1) * num_heads + task) * 16384 + row_offset[3]))[0] = reinterpret_cast<unsigned*>(_packed_6)[0];
-            unsigned int _packed_7[1];
+            reinterpret_cast<unsigned*>(carry_hi + (((part_begin - 1) * num_heads + task) * 16384 + row_offset[3]))[0] = reinterpret_cast<unsigned*>(packed_4)[0];
+            unsigned int packed_1_3[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lo_reg[_lp*2 + 0], lo_reg[_lp*2+1 + 0]));
-                _packed_7[_lp] = *(uint32_t*)&_bf2;
+                packed_1_3[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(carry_lo + (((part_begin - 1) * num_heads + task) * 16384 + row_offset[3]))[0] = reinterpret_cast<unsigned*>(_packed_7)[0];
+            reinterpret_cast<unsigned*>(carry_lo + (((part_begin - 1) * num_heads + task) * 16384 + row_offset[3]))[0] = reinterpret_cast<unsigned*>(packed_1_3)[0];
         }
         if (row0 + 4 < 128) {
             hi_reg[0] = (float)(__nv_bfloat16)zero[8];
             lo_reg[0] = zero[8] - hi_reg[0];
             hi_reg[1] = (float)(__nv_bfloat16)zero[9];
             lo_reg[1] = zero[9] - hi_reg[1];
-            unsigned int _packed_8[1];
+            unsigned int packed_5[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(hi_reg[_lp*2 + 0], hi_reg[_lp*2+1 + 0]));
-                _packed_8[_lp] = *(uint32_t*)&_bf2;
+                packed_5[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(carry_hi + (((part_begin - 1) * num_heads + task) * 16384 + row_offset[4]))[0] = reinterpret_cast<unsigned*>(_packed_8)[0];
-            unsigned int _packed_9[1];
+            reinterpret_cast<unsigned*>(carry_hi + (((part_begin - 1) * num_heads + task) * 16384 + row_offset[4]))[0] = reinterpret_cast<unsigned*>(packed_5)[0];
+            unsigned int packed_1_4[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lo_reg[_lp*2 + 0], lo_reg[_lp*2+1 + 0]));
-                _packed_9[_lp] = *(uint32_t*)&_bf2;
+                packed_1_4[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(carry_lo + (((part_begin - 1) * num_heads + task) * 16384 + row_offset[4]))[0] = reinterpret_cast<unsigned*>(_packed_9)[0];
+            reinterpret_cast<unsigned*>(carry_lo + (((part_begin - 1) * num_heads + task) * 16384 + row_offset[4]))[0] = reinterpret_cast<unsigned*>(packed_1_4)[0];
         }
         if (row0 + 5 < 128) {
             hi_reg[0] = (float)(__nv_bfloat16)zero[10];
             lo_reg[0] = zero[10] - hi_reg[0];
             hi_reg[1] = (float)(__nv_bfloat16)zero[11];
             lo_reg[1] = zero[11] - hi_reg[1];
-            unsigned int _packed_10[1];
+            unsigned int packed_6[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(hi_reg[_lp*2 + 0], hi_reg[_lp*2+1 + 0]));
-                _packed_10[_lp] = *(uint32_t*)&_bf2;
+                packed_6[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(carry_hi + (((part_begin - 1) * num_heads + task) * 16384 + row_offset[5]))[0] = reinterpret_cast<unsigned*>(_packed_10)[0];
-            unsigned int _packed_11[1];
+            reinterpret_cast<unsigned*>(carry_hi + (((part_begin - 1) * num_heads + task) * 16384 + row_offset[5]))[0] = reinterpret_cast<unsigned*>(packed_6)[0];
+            unsigned int packed_1_5[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lo_reg[_lp*2 + 0], lo_reg[_lp*2+1 + 0]));
-                _packed_11[_lp] = *(uint32_t*)&_bf2;
+                packed_1_5[_lp] = *(uint32_t*)&_bf2;
             }
-            reinterpret_cast<unsigned*>(carry_lo + (((part_begin - 1) * num_heads + task) * 16384 + row_offset[5]))[0] = reinterpret_cast<unsigned*>(_packed_11)[0];
+            reinterpret_cast<unsigned*>(carry_lo + (((part_begin - 1) * num_heads + task) * 16384 + row_offset[5]))[0] = reinterpret_cast<unsigned*>(packed_1_5)[0];
         }
     }
     unsigned int _phase_map_full = 0;
@@ -527,120 +527,120 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
                 lo_reg[0] = carry_reg[0] - hi_reg[0];
                 hi_reg[1] = (float)(__nv_bfloat16)carry_reg[1];
                 lo_reg[1] = carry_reg[1] - hi_reg[1];
-                unsigned int _packed_12[1];
+                unsigned int packed_7[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(hi_reg[_lp*2 + 0], hi_reg[_lp*2+1 + 0]));
-                    _packed_12[_lp] = *(uint32_t*)&_bf2;
+                    packed_7[_lp] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<unsigned*>(carry_hi + (((part - 1) * num_heads + task) * 16384 + row_offset[0]))[0] = reinterpret_cast<unsigned*>(_packed_12)[0];
-                unsigned int _packed_13[1];
+                reinterpret_cast<unsigned*>(carry_hi + (((part - 1) * num_heads + task) * 16384 + row_offset[0]))[0] = reinterpret_cast<unsigned*>(packed_7)[0];
+                unsigned int packed_1_6[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lo_reg[_lp*2 + 0], lo_reg[_lp*2+1 + 0]));
-                    _packed_13[_lp] = *(uint32_t*)&_bf2;
+                    packed_1_6[_lp] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<unsigned*>(carry_lo + (((part - 1) * num_heads + task) * 16384 + row_offset[0]))[0] = reinterpret_cast<unsigned*>(_packed_13)[0];
+                reinterpret_cast<unsigned*>(carry_lo + (((part - 1) * num_heads + task) * 16384 + row_offset[0]))[0] = reinterpret_cast<unsigned*>(packed_1_6)[0];
             }
             if (row0 + 1 < 128) {
                 hi_reg[0] = (float)(__nv_bfloat16)carry_reg[2];
                 lo_reg[0] = carry_reg[2] - hi_reg[0];
                 hi_reg[1] = (float)(__nv_bfloat16)carry_reg[3];
                 lo_reg[1] = carry_reg[3] - hi_reg[1];
-                unsigned int _packed_14[1];
+                unsigned int packed_8[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(hi_reg[_lp*2 + 0], hi_reg[_lp*2+1 + 0]));
-                    _packed_14[_lp] = *(uint32_t*)&_bf2;
+                    packed_8[_lp] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<unsigned*>(carry_hi + (((part - 1) * num_heads + task) * 16384 + row_offset[1]))[0] = reinterpret_cast<unsigned*>(_packed_14)[0];
-                unsigned int _packed_15[1];
+                reinterpret_cast<unsigned*>(carry_hi + (((part - 1) * num_heads + task) * 16384 + row_offset[1]))[0] = reinterpret_cast<unsigned*>(packed_8)[0];
+                unsigned int packed_1_7[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lo_reg[_lp*2 + 0], lo_reg[_lp*2+1 + 0]));
-                    _packed_15[_lp] = *(uint32_t*)&_bf2;
+                    packed_1_7[_lp] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<unsigned*>(carry_lo + (((part - 1) * num_heads + task) * 16384 + row_offset[1]))[0] = reinterpret_cast<unsigned*>(_packed_15)[0];
+                reinterpret_cast<unsigned*>(carry_lo + (((part - 1) * num_heads + task) * 16384 + row_offset[1]))[0] = reinterpret_cast<unsigned*>(packed_1_7)[0];
             }
             if (row0 + 2 < 128) {
                 hi_reg[0] = (float)(__nv_bfloat16)carry_reg[4];
                 lo_reg[0] = carry_reg[4] - hi_reg[0];
                 hi_reg[1] = (float)(__nv_bfloat16)carry_reg[5];
                 lo_reg[1] = carry_reg[5] - hi_reg[1];
-                unsigned int _packed_16[1];
+                unsigned int packed_9[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(hi_reg[_lp*2 + 0], hi_reg[_lp*2+1 + 0]));
-                    _packed_16[_lp] = *(uint32_t*)&_bf2;
+                    packed_9[_lp] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<unsigned*>(carry_hi + (((part - 1) * num_heads + task) * 16384 + row_offset[2]))[0] = reinterpret_cast<unsigned*>(_packed_16)[0];
-                unsigned int _packed_17[1];
+                reinterpret_cast<unsigned*>(carry_hi + (((part - 1) * num_heads + task) * 16384 + row_offset[2]))[0] = reinterpret_cast<unsigned*>(packed_9)[0];
+                unsigned int packed_1_8[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lo_reg[_lp*2 + 0], lo_reg[_lp*2+1 + 0]));
-                    _packed_17[_lp] = *(uint32_t*)&_bf2;
+                    packed_1_8[_lp] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<unsigned*>(carry_lo + (((part - 1) * num_heads + task) * 16384 + row_offset[2]))[0] = reinterpret_cast<unsigned*>(_packed_17)[0];
+                reinterpret_cast<unsigned*>(carry_lo + (((part - 1) * num_heads + task) * 16384 + row_offset[2]))[0] = reinterpret_cast<unsigned*>(packed_1_8)[0];
             }
             if (row0 + 3 < 128) {
                 hi_reg[0] = (float)(__nv_bfloat16)carry_reg[6];
                 lo_reg[0] = carry_reg[6] - hi_reg[0];
                 hi_reg[1] = (float)(__nv_bfloat16)carry_reg[7];
                 lo_reg[1] = carry_reg[7] - hi_reg[1];
-                unsigned int _packed_18[1];
+                unsigned int packed_10[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(hi_reg[_lp*2 + 0], hi_reg[_lp*2+1 + 0]));
-                    _packed_18[_lp] = *(uint32_t*)&_bf2;
+                    packed_10[_lp] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<unsigned*>(carry_hi + (((part - 1) * num_heads + task) * 16384 + row_offset[3]))[0] = reinterpret_cast<unsigned*>(_packed_18)[0];
-                unsigned int _packed_19[1];
+                reinterpret_cast<unsigned*>(carry_hi + (((part - 1) * num_heads + task) * 16384 + row_offset[3]))[0] = reinterpret_cast<unsigned*>(packed_10)[0];
+                unsigned int packed_1_9[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lo_reg[_lp*2 + 0], lo_reg[_lp*2+1 + 0]));
-                    _packed_19[_lp] = *(uint32_t*)&_bf2;
+                    packed_1_9[_lp] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<unsigned*>(carry_lo + (((part - 1) * num_heads + task) * 16384 + row_offset[3]))[0] = reinterpret_cast<unsigned*>(_packed_19)[0];
+                reinterpret_cast<unsigned*>(carry_lo + (((part - 1) * num_heads + task) * 16384 + row_offset[3]))[0] = reinterpret_cast<unsigned*>(packed_1_9)[0];
             }
             if (row0 + 4 < 128) {
                 hi_reg[0] = (float)(__nv_bfloat16)carry_reg[8];
                 lo_reg[0] = carry_reg[8] - hi_reg[0];
                 hi_reg[1] = (float)(__nv_bfloat16)carry_reg[9];
                 lo_reg[1] = carry_reg[9] - hi_reg[1];
-                unsigned int _packed_20[1];
+                unsigned int packed_11[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(hi_reg[_lp*2 + 0], hi_reg[_lp*2+1 + 0]));
-                    _packed_20[_lp] = *(uint32_t*)&_bf2;
+                    packed_11[_lp] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<unsigned*>(carry_hi + (((part - 1) * num_heads + task) * 16384 + row_offset[4]))[0] = reinterpret_cast<unsigned*>(_packed_20)[0];
-                unsigned int _packed_21[1];
+                reinterpret_cast<unsigned*>(carry_hi + (((part - 1) * num_heads + task) * 16384 + row_offset[4]))[0] = reinterpret_cast<unsigned*>(packed_11)[0];
+                unsigned int packed_1_10[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lo_reg[_lp*2 + 0], lo_reg[_lp*2+1 + 0]));
-                    _packed_21[_lp] = *(uint32_t*)&_bf2;
+                    packed_1_10[_lp] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<unsigned*>(carry_lo + (((part - 1) * num_heads + task) * 16384 + row_offset[4]))[0] = reinterpret_cast<unsigned*>(_packed_21)[0];
+                reinterpret_cast<unsigned*>(carry_lo + (((part - 1) * num_heads + task) * 16384 + row_offset[4]))[0] = reinterpret_cast<unsigned*>(packed_1_10)[0];
             }
             if (row0 + 5 < 128) {
                 hi_reg[0] = (float)(__nv_bfloat16)carry_reg[10];
                 lo_reg[0] = carry_reg[10] - hi_reg[0];
                 hi_reg[1] = (float)(__nv_bfloat16)carry_reg[11];
                 lo_reg[1] = carry_reg[11] - hi_reg[1];
-                unsigned int _packed_22[1];
+                unsigned int packed_12[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(hi_reg[_lp*2 + 0], hi_reg[_lp*2+1 + 0]));
-                    _packed_22[_lp] = *(uint32_t*)&_bf2;
+                    packed_12[_lp] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<unsigned*>(carry_hi + (((part - 1) * num_heads + task) * 16384 + row_offset[5]))[0] = reinterpret_cast<unsigned*>(_packed_22)[0];
-                unsigned int _packed_23[1];
+                reinterpret_cast<unsigned*>(carry_hi + (((part - 1) * num_heads + task) * 16384 + row_offset[5]))[0] = reinterpret_cast<unsigned*>(packed_12)[0];
+                unsigned int packed_1_11[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(lo_reg[_lp*2 + 0], lo_reg[_lp*2+1 + 0]));
-                    _packed_23[_lp] = *(uint32_t*)&_bf2;
+                    packed_1_11[_lp] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<unsigned*>(carry_lo + (((part - 1) * num_heads + task) * 16384 + row_offset[5]))[0] = reinterpret_cast<unsigned*>(_packed_23)[0];
+                reinterpret_cast<unsigned*>(carry_lo + (((part - 1) * num_heads + task) * 16384 + row_offset[5]))[0] = reinterpret_cast<unsigned*>(packed_1_11)[0];
             }
             if (write_rows != 0) {
                 long long row_start = row_starts[part];
@@ -799,13 +799,13 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
                     float rounded[2];
                     rounded[0] = (float)(__nv_bfloat16)carry_reg[0];
                     rounded[1] = (float)(__nv_bfloat16)carry_reg[1];
-                    unsigned int _packed_24[1];
+                    unsigned int packed_13[1];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded[_lp*2 + 0], rounded[_lp*2+1 + 0]));
-                        _packed_24[_lp] = *(uint32_t*)&_bf2;
+                        packed_13[_lp] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<unsigned*>(final_state_bf16 + (final_index))[0] = reinterpret_cast<unsigned*>(_packed_24)[0];
+                    reinterpret_cast<unsigned*>(final_state_bf16 + (final_index))[0] = reinterpret_cast<unsigned*>(packed_13)[0];
                 }
             }
             if (row0 + 1 < 128) {
@@ -819,13 +819,13 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
                     float rounded_1[2];
                     rounded_1[0] = (float)(__nv_bfloat16)carry_reg[2];
                     rounded_1[1] = (float)(__nv_bfloat16)carry_reg[3];
-                    unsigned int _packed_25[1];
+                    unsigned int packed_14[1];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded_1[_lp*2 + 0], rounded_1[_lp*2+1 + 0]));
-                        _packed_25[_lp] = *(uint32_t*)&_bf2;
+                        packed_14[_lp] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_1))[0] = reinterpret_cast<unsigned*>(_packed_25)[0];
+                    reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_1))[0] = reinterpret_cast<unsigned*>(packed_14)[0];
                 }
             }
             if (row0 + 2 < 128) {
@@ -839,13 +839,13 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
                     float rounded_2[2];
                     rounded_2[0] = (float)(__nv_bfloat16)carry_reg[4];
                     rounded_2[1] = (float)(__nv_bfloat16)carry_reg[5];
-                    unsigned int _packed_26[1];
+                    unsigned int packed_15[1];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded_2[_lp*2 + 0], rounded_2[_lp*2+1 + 0]));
-                        _packed_26[_lp] = *(uint32_t*)&_bf2;
+                        packed_15[_lp] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_2))[0] = reinterpret_cast<unsigned*>(_packed_26)[0];
+                    reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_2))[0] = reinterpret_cast<unsigned*>(packed_15)[0];
                 }
             }
             if (row0 + 3 < 128) {
@@ -859,13 +859,13 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
                     float rounded_3[2];
                     rounded_3[0] = (float)(__nv_bfloat16)carry_reg[6];
                     rounded_3[1] = (float)(__nv_bfloat16)carry_reg[7];
-                    unsigned int _packed_27[1];
+                    unsigned int packed_16[1];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded_3[_lp*2 + 0], rounded_3[_lp*2+1 + 0]));
-                        _packed_27[_lp] = *(uint32_t*)&_bf2;
+                        packed_16[_lp] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_3))[0] = reinterpret_cast<unsigned*>(_packed_27)[0];
+                    reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_3))[0] = reinterpret_cast<unsigned*>(packed_16)[0];
                 }
             }
             if (row0 + 4 < 128) {
@@ -879,13 +879,13 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
                     float rounded_4[2];
                     rounded_4[0] = (float)(__nv_bfloat16)carry_reg[8];
                     rounded_4[1] = (float)(__nv_bfloat16)carry_reg[9];
-                    unsigned int _packed_28[1];
+                    unsigned int packed_17[1];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded_4[_lp*2 + 0], rounded_4[_lp*2+1 + 0]));
-                        _packed_28[_lp] = *(uint32_t*)&_bf2;
+                        packed_17[_lp] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_4))[0] = reinterpret_cast<unsigned*>(_packed_28)[0];
+                    reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_4))[0] = reinterpret_cast<unsigned*>(packed_17)[0];
                 }
             }
             if (row0 + 5 < 128) {
@@ -899,13 +899,13 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
                     float rounded_5[2];
                     rounded_5[0] = (float)(__nv_bfloat16)carry_reg[10];
                     rounded_5[1] = (float)(__nv_bfloat16)carry_reg[11];
-                    unsigned int _packed_29[1];
+                    unsigned int packed_18[1];
                     #pragma unroll
                     for (int _lp = 0; _lp < 1; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded_5[_lp*2 + 0], rounded_5[_lp*2+1 + 0]));
-                        _packed_29[_lp] = *(uint32_t*)&_bf2;
+                        packed_18[_lp] = *(uint32_t*)&_bf2;
                     }
-                    reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_5))[0] = reinterpret_cast<unsigned*>(_packed_29)[0];
+                    reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_5))[0] = reinterpret_cast<unsigned*>(packed_18)[0];
                 }
             }
         }
@@ -953,13 +953,13 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
                 float rounded_6[2];
                 rounded_6[0] = (float)(__nv_bfloat16)single_state[0];
                 rounded_6[1] = (float)(__nv_bfloat16)single_state[1];
-                unsigned int _packed_30[1];
+                unsigned int packed_19[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded_6[_lp*2 + 0], rounded_6[_lp*2+1 + 0]));
-                    _packed_30[_lp] = *(uint32_t*)&_bf2;
+                    packed_19[_lp] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_6))[0] = reinterpret_cast<unsigned*>(_packed_30)[0];
+                reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_6))[0] = reinterpret_cast<unsigned*>(packed_19)[0];
             }
         }
         if (row0 + 1 < 128) {
@@ -973,13 +973,13 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
                 float rounded_7[2];
                 rounded_7[0] = (float)(__nv_bfloat16)single_state[2];
                 rounded_7[1] = (float)(__nv_bfloat16)single_state[3];
-                unsigned int _packed_31[1];
+                unsigned int packed_20[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded_7[_lp*2 + 0], rounded_7[_lp*2+1 + 0]));
-                    _packed_31[_lp] = *(uint32_t*)&_bf2;
+                    packed_20[_lp] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_7))[0] = reinterpret_cast<unsigned*>(_packed_31)[0];
+                reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_7))[0] = reinterpret_cast<unsigned*>(packed_20)[0];
             }
         }
         if (row0 + 2 < 128) {
@@ -993,13 +993,13 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
                 float rounded_8[2];
                 rounded_8[0] = (float)(__nv_bfloat16)single_state[4];
                 rounded_8[1] = (float)(__nv_bfloat16)single_state[5];
-                unsigned int _packed_32[1];
+                unsigned int packed_21[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded_8[_lp*2 + 0], rounded_8[_lp*2+1 + 0]));
-                    _packed_32[_lp] = *(uint32_t*)&_bf2;
+                    packed_21[_lp] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_8))[0] = reinterpret_cast<unsigned*>(_packed_32)[0];
+                reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_8))[0] = reinterpret_cast<unsigned*>(packed_21)[0];
             }
         }
         if (row0 + 3 < 128) {
@@ -1013,13 +1013,13 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
                 float rounded_9[2];
                 rounded_9[0] = (float)(__nv_bfloat16)single_state[6];
                 rounded_9[1] = (float)(__nv_bfloat16)single_state[7];
-                unsigned int _packed_33[1];
+                unsigned int packed_22[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded_9[_lp*2 + 0], rounded_9[_lp*2+1 + 0]));
-                    _packed_33[_lp] = *(uint32_t*)&_bf2;
+                    packed_22[_lp] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_9))[0] = reinterpret_cast<unsigned*>(_packed_33)[0];
+                reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_9))[0] = reinterpret_cast<unsigned*>(packed_22)[0];
             }
         }
         if (row0 + 4 < 128) {
@@ -1033,13 +1033,13 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
                 float rounded_10[2];
                 rounded_10[0] = (float)(__nv_bfloat16)single_state[8];
                 rounded_10[1] = (float)(__nv_bfloat16)single_state[9];
-                unsigned int _packed_34[1];
+                unsigned int packed_23[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded_10[_lp*2 + 0], rounded_10[_lp*2+1 + 0]));
-                    _packed_34[_lp] = *(uint32_t*)&_bf2;
+                    packed_23[_lp] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_10))[0] = reinterpret_cast<unsigned*>(_packed_34)[0];
+                reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_10))[0] = reinterpret_cast<unsigned*>(packed_23)[0];
             }
         }
         if (row0 + 5 < 128) {
@@ -1053,13 +1053,13 @@ kernel_cake_kda_prefill_d5ad43b36f4231ea0531(float* __restrict__ split_state, __
                 float rounded_11[2];
                 rounded_11[0] = (float)(__nv_bfloat16)single_state[10];
                 rounded_11[1] = (float)(__nv_bfloat16)single_state[11];
-                unsigned int _packed_35[1];
+                unsigned int packed_24[1];
                 #pragma unroll
                 for (int _lp = 0; _lp < 1; _lp++) {
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(rounded_11[_lp*2 + 0], rounded_11[_lp*2+1 + 0]));
-                    _packed_35[_lp] = *(uint32_t*)&_bf2;
+                    packed_24[_lp] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_11))[0] = reinterpret_cast<unsigned*>(_packed_35)[0];
+                reinterpret_cast<unsigned*>(final_state_bf16 + (final_index_11))[0] = reinterpret_cast<unsigned*>(packed_24)[0];
             }
         }
     }

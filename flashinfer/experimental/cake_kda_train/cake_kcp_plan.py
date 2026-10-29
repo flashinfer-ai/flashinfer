@@ -76,7 +76,7 @@ generalised to unequal fragments) not above the makespan at the base rule's ``P`
 ``"wave_fill1"`` (the previous rule), ``"wave"`` (the earlier rule), ``"occ"`` and
 ``"wave_fill"`` (the fill on every rank with at most three fragments; implemented,
 not adopted) stay selectable through the private test knob
-``_kcp_test_knobs={"p_rule": ...}`` (``CAKE_KCP_TEST_KNOBS=1``) for the A/B
+``_kcp_test_knobs={"p_rule": ...}`` (after :func:`enable_test_knobs`) for the A/B
 record.  Every rule is a pure function of (fragment table, H, SM count).  A ``P``
 change alters the segment recomposition (not bitwise in general);
 for the tie line the bitwise proof set found every changed gate row
@@ -102,7 +102,6 @@ Exchange layouts (one ``all_to_all_single`` per direction; ``s`` = one FP32
 from __future__ import annotations
 
 import dataclasses
-import os
 
 import torch
 import torch.distributed as dist
@@ -200,7 +199,9 @@ TILE_D = 0  # half 0 of a b1 pair tile [2][128][128]: the adjoint offset d_f (ha
 TILE_STRIDE_PLANE = 1  # kernel argument tile_stride: dense plane (c2 S_in, b2 dS_out, b1 offsets-only, carry, the P > 1 staging planes)
 TILE_STRIDE_PAIR = 2  # interleaved pair (c1 [B_f | M_f^T], b1 [d_f | M_f^T] with maps)
 SUMMARY_TILE = 2 * TILE  # elements of one c1 summary tile of one head
-TEST_KNOBS_ENV = "CAKE_KCP_TEST_KNOBS"
+# The process's opt-in to the private ``_kcp_test_knobs`` hook and the test-only record set (``build.test.json``):
+# :func:`enable_test_knobs` sets it; the package reads no environment variable.
+_TEST_KNOBS_ENABLED = False
 PRECISION_MODES = (
     0,
     1,
@@ -1852,7 +1853,7 @@ def build_kcp_context(
     CUDA device's multiprocessor count; ``1`` on a non-CUDA device = no occupancy pressure, ``P = P_chain``).
     Out-of-range problems are rejected here, before any launch: ``n_frag > 65536`` (the layout table's document
     search), int32 overflows of the kernels' offsets (``heads(H)``).  ``_kcp_test_knobs`` is the private test hook
-    (SPEC-11; accepted only with ``CAKE_KCP_TEST_KNOBS=1``): its ``p_rule`` selects the plan's ``P`` rule for this
+    (SPEC-11; accepted only after :func:`enable_test_knobs`): its ``p_rule`` selects the plan's ``P`` rule for this
     context (:data:`P_RULE_DEFAULT` = ``"wave_fill1_p1tie"`` without the knob;
     ``"wave_fill1"`` = the previous rule (the fill without the tie line), ``"wave"`` = the equal-segment wave rule
     above the chain cap alone, ``"occ"`` = the occupancy rule, ``"wave_fill"`` = the unadopted fill on every rank with
@@ -2149,6 +2150,59 @@ def kcp_comm_bytes(
     }
 
 
+# The pools of a rank's KCP workspace (``cake_kcp.KcpWorkspace``) that share one storage: each backward send pool
+# reuses the bytes of the forward send pool beside it.  A forward call waits its c1 / c2 sends before it returns and
+# a replay-mode backward runs its forward (waiting those sends) before the first write of b1_send / b2_send, so the
+# lifetimes never overlap; c1_recv keeps its own storage (the replay-mode backward's adjoint merge reads it).
+SHARED_POOLS = (("c1_send", "b1_send"), ("c2_send", "b2_send"))
+# Pools a workspace allocates on first use only: the ring exchange's hop buffers (``exchange="ring"``), which the
+# a2a exchange never reads.
+LAZY_POOLS = ("ring_out", "ring_in")
+# The pools a workspace sizes for a forward (``backward=False``) and the ones a backward workspace adds.
+FWD_POOLS = (
+    "c1_send",
+    "c1_recv",
+    "c2_send",
+    "stage_b",
+    "stage_m",
+    "carry",
+    "eye",
+) + LAZY_POOLS
+BWD_POOLS = ("b1_send", "b1_recv", "b2_send", "b2_recv")
+
+
+def kcp_pool_numel(
+    ctx: KcpContext, *, H: int = 64, fused_walks: int = 1
+) -> dict[str, int]:
+    """Elements (FP32) of every pool of a rank's KCP workspace and of the call's fresh ``S_in``, by buffer name: the
+    one source of the sizes ``cake_kcp`` gives its pools and fresh tensors.  ``fused_walks`` (shipped ``1``) adds one
+    carry slot per crossing fragment at ``P > 1``; at ``P > 1`` ``c1_send`` also holds one staging tile per head of each
+    crossing-out fragment of this rank (its ``M_f``, transposed into the send layout by the forward)."""
+    H = int(H)
+    hp = ctx.heads(H)
+    n, P, NSEG = hp.numel, int(hp.P), int(hp.NSEG)
+    n_in, n_out = int(ctx.n_in), int(ctx.n_out)
+    n_carry = int(ctx.n_frag) * (P - 1) if P > 1 else 0
+    if fused_walks and P > 1:
+        n_carry += max(n_in, n_out)
+    return {
+        "c1_send": int(n["c1_send"]) + (n_out * H * TILE if P > 1 else 0),
+        "c1_recv": int(n["c1_recv"]),
+        "c2_send": int(n["c2_send"]),
+        "S_in": int(n["c2_recv"]),
+        "b1_send": max(int(n["b1_send_d"]), int(n["b1_send_dm"])),
+        "b1_recv": max(int(n["b1_recv_d"]), int(n["b1_recv_dm"])),
+        "b2_send": int(n["b2_send"]),
+        "b2_recv": int(n["b2_recv"]),
+        "stage_b": NSEG * H * TILE if P > 1 else 0,
+        "stage_m": NSEG * H * TILE if P > 1 else 0,
+        "carry": n_carry * H * TILE,
+        "eye": TILE,
+        "ring_out": max(n_in, n_out) * H * TILE,
+        "ring_in": max(n_in, n_out) * H * TILE,
+    }
+
+
 def kcp_arena_layout(
     ctx: KcpContext,
     *,
@@ -2158,41 +2212,32 @@ def kcp_arena_layout(
     save_transfer: bool = SAVE_TRANSFER_DEFAULT,
     C: int = 8192,
 ) -> dict[str, int]:
-    """The KCP arena's transient buffers in bytes (``KcpWorkspace``; SPEC-4: the saved-set tensors ``S_in``, the
-    c1 receive tensor with ``save_transfer``, ``M_seg`` with ``save_transfer`` at ``P > 1`` and ``hist`` are NOT
-    here).  ``forward`` / ``backward`` are the two lifetimes' sums; ``arena`` is their maximum (one reusable arena).
-    ``staging`` is the ``P > 1`` pair of dense planes ``stage_b`` / ``stage_m`` (``[NSEG, H, 128, 128]`` each; transient
-    in both lifetimes; the ``stage_m`` plane retained as ``M_seg`` with ``save_transfer`` is counted by :func:`kcp_saved_bytes`)."""
+    """The KCP pools of a rank's workspace (``cake_kcp.KcpWorkspace``) in bytes, as the workspace allocates them.
+
+    ``pool.<name>``: the bytes each pool of a forward (``backward=False``) or a backward workspace needs
+    (:func:`kcp_pool_numel`, 4 B per element); ``arena``: the bytes the workspace allocates -- every pool once, each
+    :data:`SHARED_POOLS` pair as one storage of the larger need, the :data:`LAZY_POOLS` not at all (``ring``: the bytes
+    a call with ``exchange="ring"`` adds on first use).  The saved set (``S_in``, the c1 receive tensor kept with
+    ``save_transfer``, ``M_seg``, the forward's saved copy of the carry plane; :func:`kcp_saved_bytes`; the ``carry``
+    pool the backward's adjoint carries use is a workspace pool) and the convolution route's halo rows
+    (per-call tensors; their traffic: :func:`kcp_comm_bytes` ``halo_fwd`` / ``halo_bwd``) are never workspace pools,
+    so ``save_transfer`` and ``C`` leave the workspace unchanged."""
     _check_save_mode(save_mode)
-    H, C = int(H), int(C)
-    hp = ctx.heads(H)
-    n, halo = hp.numel, ctx.halo
-    staging = n["staging"]
-    fwd = {
-        "c1_send": n["c1_send"] * 4,
-        "c1_recv": 0 if save_transfer else n["c1_recv"] * 4,
-        "c2_send": n["c2_send"] * 4,
-        "staging": staging * 4,
-        "carry": n["carry"] * 4,
-        "halo_send": sum(halo.fwd_send_rows) * C * 2,
+    numel = kcp_pool_numel(ctx, H=H)
+    need = {
+        name: numel[name] * 4 for name in FWD_POOLS + (BWD_POOLS if backward else ())
     }
-    b1_send, b1_recv = hp.b1_splits(not save_transfer)
-    bwd = {
-        "b1_send": sum(b1_send) * 4,
-        "b1_recv": sum(b1_recv) * 4,
-        "b2_send": n["b2_send"] * 4,
-        "b2_recv": n["b2_recv"] * 4,
-        "staging": staging * 4,
-        "carry": n["carry"] * 4,
-        "dpre_head": halo.n_head_rows * C * 4,
-        "dpre_tail": halo.n_tail_rows * C * 4,
-    }
-    out = {f"fwd.{k}": v for k, v in fwd.items()}
-    if backward:
-        out.update({f"bwd.{k}": v for k, v in bwd.items()})
-    out["forward"] = sum(fwd.values())
-    out["backward"] = sum(bwd.values()) if backward else 0
-    out["arena"] = max(out["forward"], out["backward"])
+    shared = {name for pair in SHARED_POOLS for name in pair}
+    arena = sum(
+        v for name, v in need.items() if name not in shared and name not in LAZY_POOLS
+    )
+    arena += sum(
+        max((need[name] for name in pair if name in need), default=0)
+        for pair in SHARED_POOLS
+    )
+    out = {f"pool.{name}": v for name, v in need.items()}
+    out["ring"] = sum(need[name] for name in LAZY_POOLS)
+    out["arena"] = arena
     return out
 
 
@@ -2277,10 +2322,26 @@ def kcp_workspace_bytes(
 # Private test knobs (the design note §10.1, SPEC-11)
 
 
+ENABLE_TEST_KNOBS = "cake_kcp_plan.enable_test_knobs()"
+
+
+def enable_test_knobs(enabled: bool = True) -> bool:
+    """Opt this process into (``True``) or out of (``False``) the private ``_kcp_test_knobs`` hook of the KCP entry
+    points and the test-only programs of ``build.test.json``; returns the previous setting.  A test hook: the shipped
+    route never needs it, and without it no option reaches a test-only program (SPEC-11)."""
+    global _TEST_KNOBS_ENABLED
+    previous, _TEST_KNOBS_ENABLED = _TEST_KNOBS_ENABLED, bool(enabled)
+    return previous
+
+
+def test_knobs_enabled() -> bool:
+    """Whether the process opted into the private test hook (:func:`enable_test_knobs`)."""
+    return _TEST_KNOBS_ENABLED
+
+
 def validate_test_knobs(knobs) -> dict:
     """Normalize ``_kcp_test_knobs``: ``None`` -> the public defaults ``{"precision_mode": 0, "p_rule":
-    P_RULE_DEFAULT}`` (``"wave_fill1_p1tie"``); a dict is accepted only when the environment variable ``CAKE_KCP_TEST_KNOBS=1``
-    is set, holds only known keys and selects a known ``precision_mode`` (0 the hi/lo form of the TF32 walk; 1 the explicit
+    P_RULE_DEFAULT}`` (``"wave_fill1_p1tie"``); a dict is accepted only after :func:`enable_test_knobs`, holds only known keys and selects a known ``precision_mode`` (0 the hi/lo form of the TF32 walk; 1 the explicit
     three-MMA form of the R1 bitwise test; 2 plain TF32, the optional G2 cross-check) and a known ``p_rule``
     (:data:`P_RULES`; ``"wave_fill1"`` = the previous rule (the fill without the tie line), ``"wave"`` = the equal-segment
     wave rule above the chain cap alone, ``"occ"`` = the occupancy rule, ``"wave_fill"`` = the unadopted fill; read by
@@ -2288,9 +2349,9 @@ def validate_test_knobs(knobs) -> dict:
     therefore never select a non-zero mode or a P rule other than the shipped one."""
     if knobs is None:
         return {"precision_mode": 0, "p_rule": P_RULE_DEFAULT}
-    if os.environ.get(TEST_KNOBS_ENV) != "1":
+    if not test_knobs_enabled():
         raise ValueError(
-            f"_kcp_test_knobs is a private test hook: it is accepted only with {TEST_KNOBS_ENV}=1 in the environment"
+            f"_kcp_test_knobs is a private test hook: it is accepted only after {ENABLE_TEST_KNOBS}"
         )
     if not isinstance(knobs, dict):
         raise TypeError(f"_kcp_test_knobs must be a dict, got {type(knobs).__name__}")
@@ -2331,10 +2392,16 @@ __all__ = [
     "P_RULES",
     "P_RULE_DEFAULT",
     "SAVE_TRANSFER_DEFAULT",
+    "SHARED_POOLS",
+    "LAZY_POOLS",
+    "FWD_POOLS",
+    "BWD_POOLS",
     "STATE_TILE_BYTES",
     "SUMMARY_TILE",
     "TABLE_NAMES",
-    "TEST_KNOBS_ENV",
+    "ENABLE_TEST_KNOBS",
+    "enable_test_knobs",
+    "test_knobs_enabled",
     "TILE",
     "TILE_B",
     "TILE_M",
@@ -2351,6 +2418,7 @@ __all__ = [
     "head_groups",
     "kcp_arena_layout",
     "kcp_comm_bytes",
+    "kcp_pool_numel",
     "kcp_partition",
     "kcp_plan",
     "kcp_saved_bytes",

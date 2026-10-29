@@ -15,21 +15,34 @@ limitations under the License.
 """
 
 import math
+import re
+import subprocess
+from collections import OrderedDict
+from pathlib import Path
 
 import pytest
 import torch
 
-from flashinfer.experimental.minimax_h3_varlen_attention import cake_backend
+from flashinfer.experimental.minimax_h3_varlen_attention import cake_backend, cake_jit
 from flashinfer.experimental.minimax_h3_varlen_attention.cake_backend import (
     BLOCK_M,
+    BF16_TINY_ATTENTION_KWARGS,
+    BF16_TINY_MAX_SEGMENTS,
+    BF16_TINY_SEGMENT_TOKENS,
     SPLIT_PROGRAM_COST,
+    CLUSTER_Q_BLOCKS,
     CLUSTER_Q_ROWS,
     BLOCK_N,
     COMBINE_WORDS,
     MAX_KV_SPLITS,
     PARTIAL_ROWS,
     UNIT_WORDS,
-    BF16_UNIT_OVERHEAD_BLOCKS,
+    CTA_Q_ROWS,
+    NVFP4_ATTENTION_FP8PV_KWARGS,
+    NVFP4_Q_HALF_SHIFT,
+    NVFP4_QS_DENSE,
+    NVFP4_SINGLE_STAGE_COST,
+    NVFP4_TWO_STAGE_DENSE,
     HEAD_DIM,
     QUANTIZE_SUBS_PER_BLOCK,
     SUPPORTED_COMPUTE_CAPABILITIES,
@@ -39,6 +52,7 @@ from flashinfer.experimental.minimax_h3_varlen_attention.cake_backend import (
     bf16_choose_q_splits,
     bf16_cluster_work,
     bf16_dyn_sched,
+    bf16_tiny_cu_seqlens,
     bf16_unit_cost,
     bf16_unit_weights,
     build_bf16_segment_plan,
@@ -48,7 +62,11 @@ from flashinfer.experimental.minimax_h3_varlen_attention.cake_backend import (
     build_packed_segment_plan,
     build_tile_tables,
     normalize_cu_seqlens,
+    nvfp4_attention_kwargs,
+    nvfp4_attention_stage,
     nvfp4_quantize_grid,
+    nvfp4_tile_tables,
+    nvfp4_unit_cost,
     nvfp4_workspace_shapes,
     prepare_minimax_h3_varlen_attention,
     prepare_minimax_h3_varlen_nvfp4_attention,
@@ -563,7 +581,7 @@ def test_packed_segment_plan(label, cu, heads):
         assert set(cl_kv_base[lo:hi]) == {plan.seg_tile_base[s]}
 
 
-@pytest.mark.parametrize("kv_splits", [None, 1, 3])
+@pytest.mark.parametrize("kv_splits", [None, 1, 2, 3])
 @pytest.mark.parametrize("grid_clusters", PLAN_GRID_CLUSTERS)
 @pytest.mark.parametrize("heads", [7, 14, 28])
 @pytest.mark.parametrize(
@@ -577,8 +595,9 @@ def test_nvfp4_tile_tables(label, cu, heads_unused, heads, grid_clusters, kv_spl
         torch.device("cpu"),
         num_clusters=grid_clusters,
         kv_splits=kv_splits,
+        q_split=False,
     )
-    assert tiles.heads == heads
+    assert tiles.heads == heads and tiles.num_q_split_units == 0
     tables = {name: getattr(tiles, name) for name in TileTables.NAMES}
     for name, table in tables.items():
         assert table.dtype == torch.int32, name
@@ -597,6 +616,13 @@ def test_nvfp4_tile_tables(label, cu, heads_unused, heads, grid_clusters, kv_spl
         assert tiles.num_combine_units == 0
         return
     rows = list(zip(*(tables[name].tolist() for name in TileTables.NAMES), strict=True))
+    # cl_q_block: the plan's first Q block of the tile in bits 0-15, q_half 1 in
+    # bits 16+ on a single-stage unit (at most CTA_Q_ROWS valid rows from its
+    # first row; row[2] is the segment length), 0 on a two-stage one.
+    for row in rows:
+        q_base, q_half = row[4] & 0xFFFF, row[4] >> NVFP4_Q_HALF_SHIFT
+        assert q_half == int(row[2] - q_base * BLOCK_N <= CTA_Q_ROWS)
+    rows = [(*row[:4], row[4] & 0xFFFF, *row[5:]) for row in rows]
     cluster_rows = list(
         zip(
             plan.cl_seg_begin.tolist(),
@@ -630,6 +656,12 @@ def test_nvfp4_tile_tables(label, cu, heads_unused, heads, grid_clusters, kv_spl
         tiles.num_partial_slots,
         tiles.num_combine_units,
     )
+    # A split unit's threads write their own partial rows (slot * PARTIAL_ROWS
+    # + row) with no barrier between units: the split units' slots are
+    # pairwise distinct and inside the partial workspace.
+    split_slots = [row[7] for row in rows if row[7] >= 0]
+    assert len(set(split_slots)) == len(split_slots)
+    assert all(slot < tiles.num_partial_slots for slot in split_slots)
     # Enumeration: segments by descending length (ties in segment order), then
     # head, then the segment's cluster tiles, then the unit's K/V ranges; the
     # slots are that enumeration's longest-processing-time-first assignment.
@@ -652,12 +684,20 @@ def test_nvfp4_tile_tables(label, cu, heads_unused, heads, grid_clusters, kv_spl
     if kv_splits == 1:
         assert tiles.total_tiles == heads * plan.total_clusters
         assert tiles.num_combine_units == 0
-    cost = [r[-1] + BF16_UNIT_OVERHEAD_BLOCKS for r in ranges]
+
+    # Placement cost: a single-stage unit (at most CTA_Q_ROWS valid rows from
+    # its first row; row[2] is the segment length, row[4] the first Q block)
+    # is discounted to the (fp4, sm_100a) default NUM / DEN.
+    def single(r):
+        return r[2] - r[4] * BLOCK_N <= CTA_Q_ROWS
+
+    ss_cost = NVFP4_SINGLE_STAGE_COST[("fp4", "sm_100a")]
+    cost = [nvfp4_unit_cost(r[-1], single(r), ss_cost) for r in ranges]
     G = min(grid_clusters, tiles.total_tiles)
     slots = assign_unit_slots(cost, G)
     assert [row[:7] for row in rows] == [ranges[u] for u in slots]
     for k in range(tiles.total_tiles // G):
-        round_costs = [rows[k * G + i][6] for i in range(G)]
+        round_costs = [cost[u] for u in slots[k * G : (k + 1) * G]]
         assert round_costs == sorted(round_costs)
 
 
@@ -665,12 +705,18 @@ def test_nvfp4_tile_tables_lpt_order():
     # One cluster: the slots are the pure longest-processing-time order -- the
     # 600-token segment's four units (5 + 2 blocks) precede the 167- and
     # 133-token units (2 + 2 blocks, enumeration order kept on ties).
+    # The 600-token segment's second tile holds 88 rows (single-stage, 3 + 2),
+    # so its two-stage first tiles (5 + 2) lead; every single-stage unit
+    # carries q_half 1 in bits 16+ of its Q word.
     plan = build_packed_segment_plan([0, 133, 300, 900], torch.device("cpu"))
-    tiles = build_tile_tables(plan, 2, torch.device("cpu"), num_clusters=1, kv_splits=1)
+    tiles = build_tile_tables(
+        plan, 2, torch.device("cpu"), num_clusters=1, kv_splits=1, q_split=False
+    )
     assert tiles.total_tiles == 2 * 4
     assert tiles.cl_seg_len.tolist() == [600, 600, 600, 600, 167, 167, 133, 133]
-    assert tiles.cl_head.tolist() == [0, 0, 1, 1, 0, 1, 0, 1]
-    assert tiles.cl_q_block.tolist() == [0, 4, 0, 4, 0, 0, 0, 0]
+    assert tiles.cl_head.tolist() == [0, 1, 0, 1, 0, 1, 0, 1]
+    single = 1 << NVFP4_Q_HALF_SHIFT
+    assert tiles.cl_q_block.tolist() == [0, 0] + [4 | single] * 2 + [single] * 4
     assert tiles.cl_kv_base.tolist() == [4, 4, 4, 4, 2, 2, 0, 0]
     assert tiles.cl_seg_begin.tolist() == [300, 300, 300, 300, 133, 133, 0, 0]
     assert tiles.cl_kv_begin.tolist() == [0] * 8
@@ -678,11 +724,282 @@ def test_nvfp4_tile_tables_lpt_order():
     assert tiles.cl_ws_slot.tolist() == [-1] * 8
     # Forced two-way split of every unit: the 600-token units become (0, 3) +
     # (3, 2) block ranges in partial slots 0..7, the short units (0, 1) + (1, 1).
-    tiles = build_tile_tables(plan, 2, torch.device("cpu"), num_clusters=1, kv_splits=2)
+    # The first tiles' (0, 3) ranges (3 + 2) lead; the second tiles' ranges are
+    # single-stage (2 + 2, the cost of a first tile's (3, 2) range).
+    tiles = build_tile_tables(
+        plan, 2, torch.device("cpu"), num_clusters=1, kv_splits=2, q_split=False
+    )
     assert tiles.total_tiles == 16 and tiles.num_combine_units == 8
     assert tiles.num_partial_slots == 16 and tiles.max_kv_splits == 2
-    assert tiles.cl_kv_blocks.tolist()[:8] == [3, 3, 3, 3, 2, 2, 2, 2]
+    assert tiles.cl_kv_blocks.tolist()[:8] == [3, 3, 2, 3, 2, 2, 3, 2]
+    # Every split unit owns its partial slot: 16 distinct slots, all inside
+    # the workspace.
     assert sorted(tiles.cl_ws_slot.tolist()) == list(range(16))
+
+
+@pytest.mark.parametrize("q_split", [True, "all"])
+@pytest.mark.parametrize("grid_clusters", [74, 76, 5])
+@pytest.mark.parametrize("label,cu,heads", SMOKE_ROWS + SEGMENT_ROWS + CENTER_ROWS)
+def test_nvfp4_tile_tables_q_split(label, cu, heads, grid_clusters, q_split):
+    # Q halves cover exactly the rows of the whole tile they replace: every
+    # (head, tile) is one two-stage whole unit (q_half 0), one single-stage unit
+    # (q_half 1, the plain plan's word), or the two halves (1, 2) of a
+    # two-stage unsplit unit, so the K/V ranges, partial slots and combine
+    # rows equal the plain plan's.
+    plan = build_packed_segment_plan(cu, torch.device("cpu"))
+    plain = build_tile_tables(
+        plan, heads, torch.device("cpu"), num_clusters=grid_clusters, q_split=False
+    )
+    tiles = build_tile_tables(
+        plan, heads, torch.device("cpu"), num_clusters=grid_clusters, q_split=q_split
+    )
+    assert tiles.total_tiles == plain.total_tiles + tiles.num_q_split_units
+    assert tiles.combine_table.tolist() == plain.combine_table.tolist()
+    assert tiles.num_partial_slots == plain.num_partial_slots
+    if tiles.total_tiles == 0:
+        return
+    words = tiles.cl_q_block.tolist()
+    rows = list(
+        zip(
+            tiles.cl_head.tolist(),
+            tiles.cl_seg_begin.tolist(),
+            [w & 0xFFFF for w in words],
+            tiles.cl_kv_begin.tolist(),
+            tiles.cl_kv_blocks.tolist(),
+            tiles.cl_ws_slot.tolist(),
+            [w >> NVFP4_Q_HALF_SHIFT for w in words],
+            tiles.cl_seg_len.tolist(),
+            strict=True,
+        )
+    )
+    # Every writer of a partial slot is its own unit: the split units' slots
+    # are pairwise distinct across all records, Q halves included (a halved
+    # split unit would write one slot twice), and inside the partial workspace.
+    split_slots = [row[5] for row in rows if row[5] >= 0]
+    assert len(set(split_slots)) == len(split_slots)
+    assert all(slot < tiles.num_partial_slots for slot in split_slots)
+    halves: dict[tuple, list[int]] = {}
+    for row in rows:
+        halves.setdefault(row[:6] + (row[7],), []).append(row[6])
+    for key, q in halves.items():
+        two_stage_tile = key[6] - key[2] * BLOCK_N > CTA_Q_ROWS
+        if sorted(q) == [1, 2]:
+            assert key[5] == -1 and two_stage_tile  # an unsplit two-stage unit, halved
+        else:
+            assert q == [int(not two_stage_tile)]
+    plain_words = plain.cl_q_block.tolist()
+    plain_keys = sorted(
+        zip(
+            plain.cl_head.tolist(),
+            plain.cl_seg_begin.tolist(),
+            [w & 0xFFFF for w in plain_words],
+            plain.cl_kv_begin.tolist(),
+            plain.cl_kv_blocks.tolist(),
+            plain.cl_ws_slot.tolist(),
+            plain.cl_seg_len.tolist(),
+            strict=True,
+        )
+    )
+    assert sorted(halves) == plain_keys
+    if q_split == "all":
+        halvable = sum(1 for row in rows if row[6] == 0 and row[5] == -1)
+        assert halvable == 0
+
+
+@pytest.mark.parametrize("grid_clusters,tail", [(74, 36), (76, 26)])
+def test_nvfp4_tile_tables_q_split_tail_round(grid_clusters, tail):
+    # center_8s_p4 (14 heads x 29 tiles of 116 blocks = 406 units): the
+    # tail-round units (36 on 74 clusters, 26 on 76) are all halved; the
+    # halves are cheaper than every whole unit, so they fill the last round.
+    plan = build_packed_segment_plan([0, 14736], torch.device("cpu"))
+    tiles = build_tile_tables(plan, 14, torch.device("cpu"), num_clusters=grid_clusters)
+    assert tiles.num_q_split_units == tail and tiles.num_combine_units == 0
+    assert tiles.total_tiles == 406 + tail
+    q_half = [w >> NVFP4_Q_HALF_SHIFT for w in tiles.cl_q_block.tolist()]
+    whole = 406 - tail
+    assert q_half[:whole] == [0] * whole
+    assert sorted(q_half[whole:]) == [1] * tail + [2] * tail
+
+
+@pytest.mark.parametrize("q_split", [None, False, "all"])
+@pytest.mark.parametrize("grid_clusters", [74, 76, 5])
+@pytest.mark.parametrize("label,cu,heads", SMOKE_ROWS + SEGMENT_ROWS + CENTER_ROWS)
+def test_nvfp4_tile_tables_two_stage_dense(label, cu, heads, grid_clusters, q_split):
+    # two_stage_dense (the dense program of NVFP4_TWO_STAGE_DENSE): a plan
+    # without K/V-split units is the heads * total_clusters whole two-stage
+    # units (q_half 0, no halves, whatever q_split says), placed
+    # longest-processing-time first by their whole cost; a plan with split
+    # units binds the split program and is the default plan.
+    cpu = torch.device("cpu")
+    plan = build_packed_segment_plan(cu, cpu)
+    default = build_tile_tables(
+        plan, heads, cpu, num_clusters=grid_clusters, q_split=q_split
+    )
+    tiles = build_tile_tables(
+        plan,
+        heads,
+        cpu,
+        num_clusters=grid_clusters,
+        q_split=q_split,
+        two_stage_dense=True,
+    )
+    if default.num_combine_units:
+        for name in TileTables.NAMES + ("combine_table",):
+            assert getattr(tiles, name).tolist() == getattr(default, name).tolist()
+        assert tiles.num_q_split_units == default.num_q_split_units
+        return
+    assert tiles.num_q_split_units == 0 and tiles.num_partial_slots == 0
+    assert tiles.total_tiles == heads * plan.total_clusters
+    segments = sorted(range(plan.num_segments), key=lambda s: -plan.seg_len[s])
+    units = [
+        (s, head, c)
+        for s in segments
+        for head in range(heads)
+        for c in range(plan.cluster_off[s + 1] - plan.cluster_off[s])
+    ]
+    costs = [
+        nvfp4_unit_cost(_ceil_div(plan.seg_len[s], BLOCK_N), False, (1, 1))
+        for s, _head, _c in units
+    ]
+    order = assign_unit_slots(costs, min(grid_clusters, max(len(units), 1)))
+    assert list(
+        zip(
+            tiles.cl_head.tolist(),
+            tiles.cl_seg_begin.tolist(),
+            tiles.cl_q_block.tolist(),
+            tiles.cl_kv_blocks.tolist(),
+            tiles.cl_ws_slot.tolist(),
+            strict=True,
+        )
+    ) == [
+        (
+            units[u][1],
+            plan.seg_begin[units[u][0]],
+            CLUSTER_Q_BLOCKS * units[u][2],
+            _ceil_div(plan.seg_len[units[u][0]], BLOCK_N),
+            -1,
+        )
+        for u in order
+    ]
+
+
+def test_nvfp4_attention_kwargs_per_arch():
+    # The dense program of NVFP4_TWO_STAGE_DENSE takes total_clusters in place
+    # of num_tiles; every other attention program takes num_tiles, the
+    # single-stage dense program of NVFP4_QS_DENSE (attention_qs) included.
+    assert set(NVFP4_TWO_STAGE_DENSE) == {("fp8", "sm_100a")}
+    assert set(NVFP4_QS_DENSE) == {("fp8", "sm_100a")}
+    assert cake_jit.NVFP4_QS_DENSE_ARCHES == ("sm_100a",)
+    for arch in ("sm_100a", "sm_103a"):
+        for pv_mode in ("fp4", "fp8"):
+            split = nvfp4_attention_kwargs(pv_mode, arch, "attention_split")
+            assert "num_tiles" in split and "total_clusters" not in split
+            dense = nvfp4_attention_kwargs(pv_mode, arch, "attention")
+            if (pv_mode, arch) in NVFP4_TWO_STAGE_DENSE:
+                assert dense == tuple(
+                    "total_clusters" if name == "num_tiles" else name
+                    for name in NVFP4_ATTENTION_FP8PV_KWARGS
+                )
+            else:
+                assert "num_tiles" in dense and "total_clusters" not in dense
+            if (pv_mode, arch) in NVFP4_QS_DENSE:
+                qs = nvfp4_attention_kwargs(pv_mode, arch, "attention_qs")
+                assert qs == NVFP4_ATTENTION_FP8PV_KWARGS
+            else:
+                with pytest.raises(ValueError, match="no attention_qs program"):
+                    nvfp4_attention_kwargs(pv_mode, arch, "attention_qs")
+    with pytest.raises(ValueError, match="not an NVFP4 attention stage"):
+        nvfp4_attention_kwargs("fp8", "sm_100a", "combine")
+
+
+# fp8 PV plans on the 74-cluster grid (B200): center_4s_p2_m16736 has
+# tail-round Q-split units and no K/V-split units in its single-stage tables,
+# center_8s_p2_m29472 neither, and 12 cluster tiles x 7 heads (1.14 waves)
+# K/V-split units.
+NVFP4_DISPATCH_ROWS = [
+    ("q_split", [0, 16736], 28),
+    ("whole", [0, 29472], 28),
+    ("kv_split", [0, 6096], 7),
+]
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+@pytest.mark.parametrize("pv_mode", ["fp8", "fp4"])
+def test_nvfp4_dense_dispatch_binds_attention_qs_for_q_split_plans(pv_mode, arch):
+    # A NVFP4_QS_DENSE pair (sm_100a, fp8 PV) binds the single-stage dense
+    # program attention_qs to the single-stage tables of a plan with Q-split
+    # units and no K/V-split units, and the two-stage attention program to the
+    # two-stage tables of every other plan without K/V-split units; every other
+    # pair keeps its tables and binds attention / attention_split as before.
+    cpu = torch.device("cpu")
+    program_cost = SPLIT_PROGRAM_COST.get((pv_mode, arch), 1.0)
+    single_stage_cost = NVFP4_SINGLE_STAGE_COST[(pv_mode, arch)]
+    two_stage_dense = (pv_mode, arch) in NVFP4_TWO_STAGE_DENSE
+    bound = {}
+    for label, cu, heads in NVFP4_DISPATCH_ROWS:
+        plan = build_packed_segment_plan(cu, cpu)
+        tiles = nvfp4_tile_tables(plan, heads, cpu, pv_mode, arch, num_clusters=74)
+        single, planned = (
+            build_tile_tables(
+                plan,
+                heads,
+                cpu,
+                num_clusters=74,
+                program_cost=program_cost,
+                single_stage_cost=single_stage_cost,
+                two_stage_dense=two_stage,
+            )
+            for two_stage in (False, two_stage_dense)
+        )
+        stage = nvfp4_attention_stage(tiles, pv_mode, arch)
+        bound[label] = stage
+        expected = single if stage == "attention_qs" else planned
+        for name in TileTables.NAMES + ("combine_table",):
+            got, want = getattr(tiles, name).tolist(), getattr(expected, name).tolist()
+            assert got == want, (label, name)
+        assert tiles.total_tiles == expected.total_tiles, label
+        if stage == "attention_qs":
+            assert single.num_partial_slots == 0 and single.num_q_split_units > 0
+            assert tiles.num_q_split_units == single.num_q_split_units > 0
+        elif stage == "attention" and two_stage_dense:
+            # Whole two-stage units: no Q-split halves.
+            assert tiles.num_q_split_units == 0
+            assert tiles.total_tiles == heads * plan.total_clusters
+        # The tables' own stage (without the pair) never names attention_qs.
+        assert nvfp4_attention_stage(tiles) != "attention_qs"
+    if (pv_mode, arch) in NVFP4_QS_DENSE:
+        assert bound == {
+            "q_split": "attention_qs",
+            "whole": "attention",
+            "kv_split": "attention_split",
+        }
+    else:
+        assert bound == {
+            "q_split": "attention",
+            "whole": "attention",
+            "kv_split": "attention_split",
+        }
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+@pytest.mark.parametrize("pv_mode", ["fp8", "fp4"])
+def test_nvfp4_attention_programs_take_the_host_parameters(pv_mode, arch):
+    # Each registered attention program of a route takes exactly the
+    # parameters the host binds to it on that architecture: the runner binds
+    # with _bind_stage(exact=True), which refuses any other program.
+    route = cake_jit.select_route(cake_backend.NVFP4_VARIANT[pv_mode], arch)
+    stages = [s for s in route["stages"] if s in cake_backend.NVFP4_ATTENTION_STAGES]
+    assert stages == (
+        ["attention", "attention_qs", "attention_split"]
+        if (pv_mode, arch) in NVFP4_QS_DENSE
+        else ["attention", "attention_split"]
+    )
+    for stage in stages:
+        record = cake_jit.MODULES[route["modules"][stage]]
+        planned = {
+            "grid" if kind == "grid" else name for kind, name in record["arg_plan"]
+        }
+        assert planned == set(nvfp4_attention_kwargs(pv_mode, arch, stage)), stage
 
 
 def test_nvfp4_quantize_grid():
@@ -705,6 +1022,261 @@ def test_nvfp4_workspace_shapes():
     assert shapes["v_amax"] == ((1,), torch.float32)
     with pytest.raises(ValueError, match="pv_mode"):
         nvfp4_workspace_shapes(7, 3, "bf16")
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+@pytest.mark.parametrize("variant", ["nvfp4_fp4pv", "nvfp4_fp8pv"])
+def test_nvfp4_first_launch_has_full_dependency(variant, arch):
+    # The first launch of a call waits for all earlier work on the stream: its
+    # binding has no programmatic-dependent-launch attribute, so no kernel of
+    # the call can start before the producers of its inputs finish. Every later
+    # stage of the PDL chain carries the attribute (its reads of the previous
+    # stage's outputs follow griddepcontrol.wait); combine is a serial launch.
+    # The fp4 route's first launch is whichever quantizer build the plan binds
+    # (``quantize`` or ``quantize_tp``).
+    route = cake_jit.select_route(variant, arch)
+    csrc = Path(cake_jit.__file__).resolve().parent / "csrc"
+
+    def binding(stage):
+        (source,) = [
+            s
+            for s in cake_jit.MODULES[route["modules"][stage]]["sources"]
+            if s.endswith("_binding.cu")
+        ]
+        return (csrc / source).read_text()
+
+    pdl = "cudaLaunchAttributeProgrammaticStreamSerialization"
+    first, *later = route["stages"]
+    assert pdl not in binding(first), first
+    for stage in later:
+        if stage == "quantize_tp":
+            assert pdl not in binding(stage), stage
+            continue
+        assert (pdl in binding(stage)) == (stage != "combine"), stage
+
+
+def test_nvfp4_quantize_stage_follows_the_quantize_grid():
+    # 148 SMs: two waves of eight CTAs hold 2368 quantize CTAs (heads * PB * 4).
+    choose = cake_backend.nvfp4_quantize_stage
+    assert choose("fp8", 7, 38, 148) == "quantize_early_qk"  # 1064 CTAs
+    assert choose("fp8", 7, 73, 148) == "quantize_early_qk"  # 2044 CTAs
+    assert choose("fp8", 4, 148, 148) == "quantize_early_qk"  # 2368 CTAs
+    assert choose("fp8", 1, 593, 148) == "quantize"  # 2372 CTAs
+    assert choose("fp8", 14, 76, 148) == "quantize"  # 4256 CTAs
+    assert choose("fp8", 7, 38, 148, arch="sm_100a") == "quantize_early_qk"
+    assert choose("fp4", 7, 38, 148) == "quantize"
+    for arch in cake_backend.SUPPORTED_COMPUTE_CAPABILITIES.values():
+        stages = cake_backend.select_route("nvfp4_fp8pv", arch)["stages"]
+        assert stages[1:3] == ["quantize", "quantize_early_qk"]
+        stages = cake_backend.select_route("nvfp4_fp4pv", arch)["stages"]
+        assert "quantize_early_qk" not in stages
+
+
+def test_nvfp4_quantize_tp_binds_up_to_128_packed_blocks():
+    """The fp4 quantizer's by-value-table build (``quantize_tp``) is bound on
+    sm_100a for plans of at most ``QUANTIZE_TP_MAX_PB`` (128) packed blocks,
+    with both tables as 128-entry CPU int32 tensors, zero-padded; PB 129, any
+    sm_103a plan and every fp8 plan bind the other builds."""
+    choose = cake_backend.nvfp4_quantize_stage
+    assert cake_backend.QUANTIZE_TP_MAX_PB == 128
+    assert cake_jit.NVFP4_QUANTIZE_TP_ARCHES == ("sm_100a",)
+    # PB 128: one segment, and three with ragged blocks and an empty one.
+    # PB 129: the first plan past the tables' length.
+    for cu, PB in (
+        ([0, 16384], 128),
+        ([0, 37, 37, 237, 16237], 128),
+        ([0, 16384, 16385], 129),
+        ([0, 1], 1),
+    ):
+        plan = build_packed_segment_plan(cu, torch.device("cpu"))
+        assert plan.PB == PB
+        bound = PB <= 128
+        tp_or_head = "quantize_tp" if bound else "quantize"
+        for heads in (1, 7):
+            assert choose("fp4", heads, PB, 148, arch="sm_100a") == tp_or_head
+            assert choose("fp4", heads, PB, 148, arch="sm_103a") == "quantize"
+            assert choose("fp4", heads, PB, 148) == "quantize"
+            fp8 = choose("fp8", heads, PB, 148)
+            assert choose("fp8", heads, PB, 148, arch="sm_100a") == fp8
+        for name in ("block_token", "block_valid"):
+            table = getattr(plan, "tp_" + name)
+            if not bound:
+                assert table is None, name
+                continue
+            assert table.dtype == torch.int32 and table.device.type == "cpu"
+            assert tuple(table.shape) == (128,) and table.is_contiguous()
+            expected = getattr(plan, name).cpu()
+            assert torch.equal(table[:PB], expected), name
+            assert not table[PB:].any(), name
+    assert cake_backend.quantize_tp_table(list(range(129))) is None
+    stages = cake_backend.select_route("nvfp4_fp4pv", "sm_100a")["stages"]
+    assert stages[:2] == ["quantize", "quantize_tp"]
+    for variant, arch in (("nvfp4_fp4pv", "sm_103a"), ("nvfp4_fp8pv", "sm_100a")):
+        assert "quantize_tp" not in cake_backend.select_route(variant, arch)["stages"]
+    # The route's quantize_tp program takes both tables by value; a program
+    # that takes them as device buffers (the route's ``quantize``) is refused.
+    route = cake_backend.select_route("nvfp4_fp4pv", "sm_100a")
+    arg_plan = cake_jit.MODULES[route["modules"]["quantize_tp"]]["arg_plan"]
+    kinds = {name: kind for kind, name in arg_plan}
+    assert kinds["block_token"] == kinds["block_valid"] == "param_array"
+    with pytest.raises(ValueError, match="param_array"):
+        cake_backend._bind_stage(
+            route["modules"]["quantize"],
+            "sm_100a",
+            {},
+            exact=True,
+            by_value=cake_backend.QUANTIZE_TP_BY_VALUE,
+        )
+
+
+@pytest.mark.parametrize("pv_mode", ["fp8", "fp4"])
+def test_nvfp4_runner_binds_one_quantizer(pv_mode):
+    _require_program(cake_backend.NVFP4_VARIANT[pv_mode])
+    cu, heads = [0, 133, 300, 900], 7
+    q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=5)
+    runner = prepare_minimax_h3_varlen_nvfp4_attention(
+        q, k, v, cu_seqlens, pv_mode=pv_mode, cu_seqlens_host=cu
+    )
+    num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    expected = cake_backend.nvfp4_quantize_stage(
+        pv_mode, heads, runner.plan.PB, num_sms, arch=runner.arch
+    )
+    assert runner.quantize_stage == expected
+    bound = [name for name, entry, _ in runner._stages if entry is not None]
+    assert expected in bound
+    assert (set(cake_backend.QUANTIZER_STAGES) - {expected}).isdisjoint(bound)
+    if pv_mode == "fp4" and runner.arch in cake_jit.NVFP4_QUANTIZE_TP_ARCHES:
+        assert expected == "quantize_tp"  # PB 9
+
+
+def test_nvfp4_early_qk_quantizer_matches_the_head_quantizer():
+    """Both fp8 quantizers, bound on one plan with ragged blocks and an empty
+    segment, write bitwise-identical packed operands (padding included) and
+    give a bitwise-identical attention output."""
+    import tvm_ffi
+
+    _require_program("nvfp4_fp8pv")
+    cu, heads = [0, 133, 133, 300, 900], 7
+    q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=21)
+    runners = {}
+    for stage in ("quantize", "quantize_early_qk"):
+        runner = prepare_minimax_h3_varlen_nvfp4_attention(
+            q, k, v, cu_seqlens, pv_mode="fp8", cu_seqlens_host=cu
+        )
+        for tensor in runner.workspace.values():
+            tensor.view(torch.uint8).fill_(0xA5)
+        route = cake_backend.select_route("nvfp4_fp8pv", runner.arch)
+        with tvm_ffi.use_torch_stream():
+            for name in ("amax", stage):
+                entry, arguments = cake_backend._bind_stage(
+                    route["modules"][name], runner.arch, runner.stage_kwargs[name]
+                )
+                entry(*arguments)
+        runner.attention()
+        runners[stage] = runner
+    torch.cuda.synchronize()
+    head, early = runners["quantize"], runners["quantize_early_qk"]
+    assert head.workspace.keys() == early.workspace.keys()
+    for name, tensor in head.workspace.items():
+        assert torch.equal(
+            tensor.view(torch.uint8), early.workspace[name].view(torch.uint8)
+        ), name
+    torch.testing.assert_close(early.out, head.out, atol=0, rtol=0)
+    _check(
+        early.out,
+        _reference(q, k, v, cu, 1.0 / math.sqrt(HEAD_DIM)),
+        NVFP4_ATOL,
+        NVFP4_RTOL,
+    )
+
+
+def test_nvfp4_tp_quantizer_matches_the_head_quantizer():
+    """Both fp4 quantizers, bound on a plan of exactly ``QUANTIZE_TP_MAX_PB``
+    (128) packed blocks with ragged blocks and an empty segment, write
+    bitwise-identical packed operands (padding included) and give a
+    bitwise-identical attention output; a 129-block plan binds ``quantize``
+    and stays exact."""
+    import tvm_ffi
+
+    arch = _require_program("nvfp4_fp4pv")
+    if arch not in cake_jit.NVFP4_QUANTIZE_TP_ARCHES:
+        pytest.skip(f"the fp4 route carries no quantize_tp program on {arch}")
+    cu, heads = [0, 37, 37, 237, 16237], 2
+    q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=23)
+    runners = {}
+    for stage in ("quantize", "quantize_tp"):
+        runner = prepare_minimax_h3_varlen_nvfp4_attention(
+            q, k, v, cu_seqlens, pv_mode="fp4", cu_seqlens_host=cu
+        )
+        assert runner.plan.PB == 128 and runner.quantize_stage == "quantize_tp"
+        for tensor in runner.workspace.values():
+            tensor.view(torch.uint8).fill_(0xA5)
+        route = cake_backend.select_route("nvfp4_fp4pv", runner.arch)
+        by_value = cake_backend.QUANTIZE_TP_BY_VALUE if stage == "quantize_tp" else ()
+        entry, arguments = cake_backend._bind_stage(
+            route["modules"][stage],
+            runner.arch,
+            runner.stage_kwargs[stage],
+            exact=True,
+            by_value=by_value,
+        )
+        with tvm_ffi.use_torch_stream():
+            entry(*arguments)
+        runner.attention()
+        runners[stage] = runner
+    torch.cuda.synchronize()
+    head, tp = runners["quantize"], runners["quantize_tp"]
+    assert head.workspace.keys() == tp.workspace.keys()
+    for name, tensor in head.workspace.items():
+        assert torch.equal(
+            tensor.view(torch.uint8), tp.workspace[name].view(torch.uint8)
+        ), name
+    torch.testing.assert_close(tp.out, head.out, atol=0, rtol=0)
+    scale = 1.0 / math.sqrt(HEAD_DIM)
+    _check(tp.out, _reference(q, k, v, cu, scale), NVFP4_ATOL, NVFP4_RTOL)
+    cu = [0, 16384, 16385]
+    q, k, v, cu_seqlens = _make_inputs(cu, 1, seed=24)
+    runner = prepare_minimax_h3_varlen_nvfp4_attention(
+        q, k, v, cu_seqlens, pv_mode="fp4", cu_seqlens_host=cu
+    )
+    assert runner.plan.PB == 129 and runner.quantize_stage == "quantize"
+    for name in cake_backend.QUANTIZE_TP_BY_VALUE:
+        assert runner.stage_kwargs["quantize_tp"][name] is None, name
+    out = runner()
+    torch.cuda.synchronize()
+    _check(out, _reference(q, k, v, cu, scale), NVFP4_ATOL, NVFP4_RTOL)
+
+
+def test_nvfp4_early_qk_occupancy_matches_the_host_rule():
+    """``EARLY_QK_CTAS_PER_SM`` is the early-Q/K quantizer's resident CTAs per SM.
+
+    The host binds ``quantize_early_qk`` only when the quantize grid fits in
+    ``EARLY_QK_WAVES`` waves of ``EARLY_QK_CTAS_PER_SM`` CTAs per SM, so the
+    built program's register count (256 threads per CTA, 64K registers and
+    2048 threads per SM) must give exactly that many."""
+    from flashinfer.jit.cpp_ext import get_cuda_path
+
+    arch = _require_program("nvfp4_fp8pv")
+    route = cake_backend.select_route("nvfp4_fp8pv", arch)
+    name = route["modules"]["quantize_early_qk"]
+    spec = cake_jit.gen_cake_minimax_h3_varlen_attention_module(name, arch)
+    spec.build_and_load()
+    cuobjdump = Path(get_cuda_path()) / "bin" / "cuobjdump"
+    if not cuobjdump.exists():
+        pytest.skip(f"{cuobjdump} is needed to read the register count")
+    usage = subprocess.run(
+        [str(cuobjdump), "--dump-resource-usage", str(spec.get_library_path())],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    registers = {int(count) for count in re.findall(r"\bREG:(\d+)", usage)}
+    assert len(registers) == 1, usage
+    (per_thread,) = registers
+    warps = 256 // 32
+    per_warp = -(-per_thread * 32 // 256) * 256  # allocated in 256-register units
+    resident = min(2048 // 256, 65536 // (warps * per_warp))
+    assert resident == cake_backend.EARLY_QK_CTAS_PER_SM, usage
 
 
 @pytest.mark.parametrize("cu", [[1, 2], [0, 5, 3], [0], [0, 3, 3, 2]])
@@ -1102,6 +1674,77 @@ def test_bf16_unit_table_carries_the_ticket_counter_record():
     )
 
 
+# --- tiny-plan BF16 program (`attention_tiny`) ---------------------------------------------------------------------
+# (cu_seqlens, the bounds of its non-empty segments when the plan binds the tiny program, else None), at
+# the rule's boundaries: 32 / 33 tokens in a segment, 64 / 65 non-empty segments, empty segments.
+TINY_RULE_ROWS = [
+    pytest.param([0, 1], [0, 1], id="1_token"),
+    pytest.param([0, 9, 18], [0, 9, 18], id="dit_tiny"),
+    pytest.param([0, 32], [0, 32], id="32_tokens"),
+    pytest.param([0, 33], None, id="33_tokens"),
+    pytest.param([0, 32, 64, 97], None, id="32_32_33_tokens"),
+    pytest.param(list(range(65)), list(range(65)), id="64_segments"),
+    pytest.param(list(range(66)), None, id="65_segments"),
+    pytest.param([0, 0, 5, 5, 37, 37], [0, 5, 37], id="empty_segments"),
+    pytest.param([0, 0, *range(1, 65)], list(range(65)), id="65_segments_one_empty"),
+    pytest.param([0, 0], None, id="all_empty"),
+]
+
+
+@pytest.mark.parametrize("cu,expected", TINY_RULE_ROWS)
+def test_bf16_tiny_plan_rule(cu, expected):
+    """A plan binds ``attention_tiny`` on both architectures when every segment
+    has at most 32 tokens and 1..64 segments are non-empty; its by-value bounds
+    are the non-empty segments' bounds padded with T to 65 int32 on the host."""
+    assert (BF16_TINY_SEGMENT_TOKENS, BF16_TINY_MAX_SEGMENTS) == (32, 64)
+    bounds = bf16_tiny_cu_seqlens(cu)
+    plan = build_bf16_segment_plan(
+        cu, torch.device("cpu"), 7, num_clusters=GB300_GRID_CLUSTERS
+    )
+    if expected is None:
+        assert bounds is None and plan.tiny_cu_seqlens is None
+        for arch in ("sm_100a", "sm_103a"):
+            assert bf16_attention_stage(plan, arch) != "attention_tiny"
+        return
+    padded = expected + [expected[-1]] * (BF16_TINY_MAX_SEGMENTS + 1 - len(expected))
+    assert bounds.device.type == "cpu" and bounds.dtype == torch.int32
+    assert bounds.tolist() == padded
+    assert plan.tiny_cu_seqlens.tolist() == padded
+    for arch in ("sm_100a", "sm_103a"):
+        assert bf16_attention_stage(plan, arch) == "attention_tiny"
+
+
+def test_bf16_tiny_program_only_on_its_architectures():
+    """``attention_tiny`` is a stage of the sm_100a and sm_103a BF16 routes
+    only: a tiny plan on any other architecture binds the general programs."""
+    assert cake_jit.BF16_TINY_ARCHES == ("sm_100a", "sm_103a")
+    plan = build_bf16_segment_plan(
+        [0, 9, 18], torch.device("cpu"), 7, num_clusters=GB300_GRID_CLUSTERS
+    )
+    assert plan.tiny_cu_seqlens is not None
+    for arch in cake_jit.BF16_TINY_ARCHES:
+        assert "attention_tiny" in cake_jit.stages_for("bf16", arch)
+        assert bf16_attention_stage(plan, arch) == "attention_tiny"
+    for arch in ("sm_90a", "sm_120a"):
+        assert "attention_tiny" not in cake_jit.stages_for("bf16", arch)
+        assert bf16_attention_stage(plan, arch) != "attention_tiny"
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+def test_bf16_routes_carry_the_tiny_program(arch):
+    """Both BF16 routes register ``attention_tiny``, a program built for the
+    architecture whose argument plan is exactly the host's tiny binding (the
+    bounds by value), as ``_bind_stage(exact=True)`` requires."""
+    record = cake_jit.select_route("bf16", arch)
+    assert "attention_tiny" in record["stages"]
+    assert tuple(record["stages"]) == cake_jit.stages_for("bf16", arch)
+    program = cake_jit.MODULES[record["modules"]["attention_tiny"]]
+    assert arch in program["arches"]
+    planned = {"grid" if kind == "grid" else name for kind, name in program["arg_plan"]}
+    assert planned == set(BF16_TINY_ATTENTION_KWARGS)
+    assert ["param_array", "cu_seqlens"] in [list(x) for x in program["arg_plan"]]
+
+
 @pytest.mark.parametrize(
     "label,cu,heads,dyn",
     [
@@ -1115,7 +1758,8 @@ def test_bf16_dispatched_program_is_bitwise_the_static_program(
     """The per-plan dispatch changes which program runs, never the arithmetic: on the same scheduled unit
     records the dispatched program's output is bitwise the static ``attention`` program's.  The
     ``attention_dyn`` program owns the padding of ``unit_table`` as launch state: it resets the ticket
-    counter and leaves every cluster's terminal ticket in word 6 of that cluster's padding record;
+    counter and leaves every cluster's last tickets in words 6 and 7 (one per ticket
+    slot) of that cluster's padding record;
     the static programs never write the table."""
     _require_program("bf16")
     cake_backend._BF16_PLANS.clear()
@@ -1145,13 +1789,16 @@ def test_bf16_dispatched_program_is_bitwise_the_static_program(
     # the ticket counter is reset by the last draw
     assert padding[clusters] == [0] * UNIT_WORDS
     for record in padding[:clusters]:
-        assert record[:6] == [0] * 6 and record[7] == 0
-    mailboxes = [record[6] for record in padding[:clusters]]
+        assert record[:6] == [0] * 6
+    # Words 6 and 7 are the cluster's mailboxes, one per ticket slot.
+    mailboxes = [record[6:8] for record in padding[:clusters]]
     if dyn:
-        # Every cluster leaves on a terminal ticket (>= total_tiles) and publishes it to its mailbox.
-        assert all(ticket >= total for ticket in mailboxes)
+        # Every cluster leaves on a terminal ticket (>= total_tiles), published
+        # to the mailbox of its slot; the other slot keeps an earlier ticket.
+        assert all(max(pair) >= total for pair in mailboxes)
+        assert all(ticket >= 0 for pair in mailboxes for ticket in pair)
     else:
-        assert mailboxes == [0] * clusters
+        assert mailboxes == [[0, 0]] * clusters
     # Force the static program: no plan passes the wave floor and the sread arch filter is empty.
     monkeypatch.setattr(cake_backend, "BF16_DYN_SCHED_MIN_WAVES", 1 << 30)
     monkeypatch.setattr(cake_backend, "BF16_SREAD_ARCHES", ())
@@ -1166,6 +1813,145 @@ def test_bf16_dispatched_program_is_bitwise_the_static_program(
     # the static program never writes the table
     assert torch.equal(static.plan.unit_table, table_before)
     assert torch.equal(out_dispatched, out_static)
+    cake_backend._BF16_PLANS.clear()
+
+
+TINY_ROWS = [
+    ("smoke_p8_1", [0, 1], 7, None),
+    ("dit_tiny_p1_m9_9", [0, 9, 18], 56, None),
+    ("dit_tiny_p1_m9_9_fused_qkv", [0, 9, 18], 56, "fused_qkv"),
+    ("full_32_pack", [0, 32, 64], 14, "pack"),
+    ("empty_segments", [0, 0, 5, 5, 37, 38, 38], 7, None),
+    ("lengths_1_to_32", [n * (n + 1) // 2 for n in range(33)], 4, "fused_qkv"),
+    ("ones_64", list(range(65)), 2, None),
+]
+
+
+@pytest.mark.parametrize("label,cu,heads,layout", TINY_ROWS)
+def test_bf16_tiny_program_is_bitwise_the_general_programs(
+    monkeypatch, label, cu, heads, layout
+):
+    """The tiny-plan program changes the launch (one CTA per head and non-empty
+    segment, bounds by value), never the arithmetic: its output is bitwise the
+    output of the program the plan binds without it, on contiguous Q/K/V and on
+    the engine's strided views, and a captured graph replays it."""
+    _require_program("bf16")
+    cake_backend._BF16_PLANS.clear()
+    if layout is None:
+        q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=14)
+    else:
+        q, k, v, cu_seqlens = _make_engine_views(cu, heads, seed=14, layout=layout)
+    tiny = prepare_minimax_h3_varlen_attention(q, k, v, cu_seqlens, cu_seqlens_host=cu)
+    segments = sum(1 for a, b in zip(cu, cu[1:], strict=False) if b > a)
+    assert tiny.attention_stage == "attention_tiny"
+    assert tiny.route_metadata["attention_variant"] == "attention_tiny"
+    assert tuple(tiny.main_kwargs["grid"]) == (heads, segments, 1)
+    assert tiny.num_ctas == heads * segments
+    tiny.out.fill_(float("nan"))
+    out_tiny = tiny().clone()
+    torch.cuda.synchronize()
+    _check(
+        out_tiny,
+        _reference(q, k, v, cu, 1.0 / math.sqrt(HEAD_DIM)),
+        BF16_ATOL,
+        BF16_RTOL,
+    )
+    # The same plan without the tiny program.
+    monkeypatch.setattr(cake_backend, "BF16_TINY_SEGMENT_TOKENS", 0)
+    cake_backend._BF16_PLANS.clear()
+    general = prepare_minimax_h3_varlen_attention(
+        q, k, v, cu_seqlens, cu_seqlens_host=cu
+    )
+    assert general.attention_stage != "attention_tiny"
+    assert general.plan.tiny_cu_seqlens is None
+    general.out.fill_(float("nan"))
+    out_general = general().clone()
+    torch.cuda.synchronize()
+    assert torch.equal(out_tiny.view(torch.int16), out_general.view(torch.int16))
+    # A captured graph of the tiny runner replays the by-value bounds.
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        tiny()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        tiny()
+    tiny.out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(tiny.out.view(torch.int16), out_tiny.view(torch.int16))
+    cake_backend._BF16_PLANS.clear()
+    monkeypatch.undo()
+
+
+# (cu_seqlens, heads, the tiny program's grid, or None when the plan binds the general programs)
+TINY_BOUNDARY_ROWS = [
+    pytest.param([0, 32], 7, (7, 1, 1), id="32_tokens"),
+    pytest.param([0, 33], 7, None, id="33_tokens"),
+    pytest.param(list(range(65)), 3, (3, 64, 1), id="64_segments"),
+    pytest.param(list(range(66)), 3, None, id="65_segments"),
+    pytest.param([0, 0, 5, 5, 37, 37], 7, (7, 2, 1), id="empty_segments"),
+    pytest.param([0, 0, *range(1, 65)], 3, (3, 64, 1), id="65_segments_one_empty"),
+]
+
+
+@pytest.mark.parametrize("cu,heads,grid", TINY_BOUNDARY_ROWS)
+def test_bf16_tiny_boundaries_bind_the_expected_program(cu, heads, grid):
+    """At the tiny rule's boundaries (32 / 33 tokens in a segment, 64 / 65
+    non-empty segments, empty segments) the runner binds ``attention_tiny`` on
+    the expected grid, or the general programs, and the output matches the FP32
+    reference either way."""
+    _require_program("bf16")
+    cake_backend._BF16_PLANS.clear()
+    q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=16)
+    runner = prepare_minimax_h3_varlen_attention(
+        q, k, v, cu_seqlens, cu_seqlens_host=cu
+    )
+    if grid is None:
+        assert runner.attention_stage != "attention_tiny"
+        assert runner.plan.tiny_cu_seqlens is None
+    else:
+        assert runner.attention_stage == "attention_tiny"
+        assert tuple(runner.main_kwargs["grid"]) == grid
+    runner.out.fill_(float("nan"))
+    out = runner().clone()
+    torch.cuda.synchronize()
+    _check(
+        out,
+        _reference(q, k, v, cu, 1.0 / math.sqrt(HEAD_DIM)),
+        BF16_ATOL,
+        BF16_RTOL,
+    )
+    cake_backend._BF16_PLANS.clear()
+
+
+def test_bf16_tiny_one_shot_repeated_calls_do_not_allocate_or_copy():
+    """The tiny program's bounds live in the cached plan: repeated one-shot
+    calls of a tiny layout allocate no device memory and copy nothing to the
+    device."""
+    _require_program("bf16")
+    cake_backend._BF16_PLANS.clear()
+    cu, heads = [0, 9, 18], 56
+    q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=15)
+    out = torch.empty_like(q)
+    minimax_h3_varlen_attention(q, k, v, cu_seqlens, out=out, cu_seqlens_host=cu)
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated()
+    from torch.profiler import ProfilerActivity, profile
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        for _ in range(3):
+            minimax_h3_varlen_attention(
+                q, k, v, cu_seqlens, out=out, cu_seqlens_host=cu
+            )
+        torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated() == allocated
+    names = [event.name for event in prof.events()]
+    assert not [n for n in names if "Memcpy" in n or "memcpy" in n]
+    _check(
+        out, _reference(q, k, v, cu, 1.0 / math.sqrt(HEAD_DIM)), BF16_ATOL, BF16_RTOL
+    )
     cake_backend._BF16_PLANS.clear()
 
 
@@ -1272,44 +2058,80 @@ def test_nvfp4_prepared_runner_stages_and_graph_replay(pv_mode):
     assert runner.plan.PB == 2 + 2 + 5 and runner.plan.total_clusters == 1 + 1 + 2
     assert runner.tile_tables.total_tiles >= heads * 4
     assert runner.route_metadata["pv_mode"] == pv_mode
-    # fp8 precedes the quantizer with the ``amax`` partial-max stage.
-    quantize_stages = ("amax", "quantize") if pv_mode == "fp8" else ("quantize",)
-    assert tuple(runner.stage_kwargs) == quantize_stages + (
-        "attention",
-        "attention_split",
-        "combine",
+    # fp8 precedes the quantizers with the ``amax`` partial-max stage; each
+    # mode carries two quantizers and the plan binds one of them (fp4: the
+    # by-value-table build on sm_100a for this 9-block plan).
+    route_quantize_stages = (
+        ("amax", "quantize", "quantize_early_qk")
+        if pv_mode == "fp8"
+        else ("quantize", "quantize_tp")
     )
-    # A 3-segment plan far below one wave has no split units: the dense
-    # attention program is bound, the split program and combine are not.
+    assert tuple(runner.stage_kwargs) == route_quantize_stages + (
+        ("attention", "attention_qs", "attention_split", "combine")
+        if pv_mode == "fp8"
+        else ("attention", "attention_split", "combine")
+    )
+    quantize_stages = (
+        ("amax", runner.quantize_stage)
+        if pv_mode == "fp8"
+        else (runner.quantize_stage,)
+    )
+    if pv_mode == "fp4":
+        tp_arch = runner.arch in cake_jit.NVFP4_QUANTIZE_TP_ARCHES
+        assert runner.quantize_stage == ("quantize_tp" if tp_arch else "quantize")
+        tp = runner.stage_kwargs["quantize_tp"]
+        assert tuple(tp) == tuple(runner.stage_kwargs["quantize"])
+        for name in cake_backend.QUANTIZE_TP_BY_VALUE:
+            assert tp[name] is getattr(runner.plan, "tp_" + name), name
+            head = runner.stage_kwargs["quantize"][name]
+            assert torch.equal(tp[name][:9], head.cpu()), name
+    assert runner.route_metadata["quantize_variant"] == runner.quantize_stage
+    # A 3-segment plan far below one wave has no split units: a dense
+    # attention program is bound (on a NVFP4_QS_DENSE pair the single-stage
+    # attention_qs when its single-stage tables hold Q-split units), the
+    # split program and combine are not.
     assert runner.tile_tables.num_partial_slots == 0
-    assert runner.attention_stage == "attention"
-    assert runner.route_metadata["attention_variant"] == "attention"
+    dense_stage = runner.attention_stage
+    qs = (pv_mode, runner.arch) in NVFP4_QS_DENSE
+    assert dense_stage == (
+        "attention_qs"
+        if qs and runner.tile_tables.num_q_split_units > 0
+        else "attention"
+    )
+    assert runner.route_metadata["attention_variant"] == dense_stage
     assert [name for name, entry, _ in runner._stages if entry is not None] == list(
         quantize_stages
-    ) + ["attention"]
+    ) + [dense_stage]
     if pv_mode == "fp8":
         assert tuple(runner.stage_kwargs["amax"]) == cake_backend.AMAX_KWARGS
         assert runner.stage_kwargs["amax"]["grid"] == (cake_backend.AMAX_CTAS, 1, 1)
         assert runner.stage_kwargs["amax"]["num_vectors"] == v.numel() // 16
-    # The dense program takes the first delivery's parameter set; the split
-    # program's bindings add the K/V range / partial-slot tables, the partial
-    # workspace and the unit count.
-    dense_names, split_names = (
-        (
-            cake_backend.NVFP4_ATTENTION_FP4PV_KWARGS,
-            cake_backend.NVFP4_ATTENTION_SPLIT_FP4PV_KWARGS,
-        )
-        if pv_mode == "fp4"
-        else (
-            cake_backend.NVFP4_ATTENTION_FP8PV_KWARGS,
-            cake_backend.NVFP4_ATTENTION_SPLIT_FP8PV_KWARGS,
-        )
-    )
+    # The dense program takes the scheduler tables and the unit count (the
+    # two-stage dense program of NVFP4_TWO_STAGE_DENSE the cluster-tile count,
+    # over whole two-stage units); the split program's bindings add the K/V
+    # range / partial-slot tables and the partial workspace.
+    dense_names = nvfp4_attention_kwargs(pv_mode, runner.arch, "attention")
+    split_names = nvfp4_attention_kwargs(pv_mode, runner.arch, "attention_split")
     assert tuple(runner.stage_kwargs["attention"]) == dense_names
     assert tuple(runner.stage_kwargs["attention_split"]) == split_names
+    if pv_mode == "fp8":
+        qs_names = nvfp4_attention_kwargs(pv_mode, "sm_100a", "attention_qs")
+        assert tuple(runner.stage_kwargs["attention_qs"]) == qs_names
+    two_stage_program = (pv_mode, runner.arch) in NVFP4_TWO_STAGE_DENSE
     assert set(split_names) - set(dense_names) == set(
         cake_backend.NVFP4_ATTENTION_SPLIT_KWARGS
-    )
+    ) | ({"num_tiles"} if two_stage_program else set())
+    two_stage = two_stage_program and dense_stage == "attention"
+    tiles = runner.tile_tables
+    q_half = [w >> NVFP4_Q_HALF_SHIFT for w in tiles.cl_q_block.tolist()]
+    if two_stage:
+        assert runner.stage_kwargs["attention"]["total_clusters"] == 4
+        assert tiles.total_tiles == heads * 4 and q_half == [0] * heads * 4
+    else:
+        assert runner.stage_kwargs[dense_stage]["num_tiles"] == tiles.total_tiles
+        # The 133- and 167-token tiles and the 600-token segment's second tile
+        # (88 rows) run single-stage.
+        assert q_half.count(1) >= 3 * heads
     assert runner.stage_kwargs["quantize"]["grid"] == (
         heads * 9 * QUANTIZE_SUBS_PER_BLOCK,
         1,
@@ -1337,6 +2159,10 @@ def test_nvfp4_prepared_runner_stages_and_graph_replay(pv_mode):
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         runner()
+    # New Q, K and V values: every quantizer re-reads all three (the early-Q/K
+    # build reads Q and K before its grid-dependency wait).
+    q.copy_(torch.randn_like(q) * 2.0)
+    k.copy_(torch.randn_like(k) * 0.5)
     v.copy_(torch.randn_like(v) * 3.0)
     out.fill_(float("nan"))
     graph.replay()
@@ -1344,6 +2170,11 @@ def test_nvfp4_prepared_runner_stages_and_graph_replay(pv_mode):
     _check(
         out, _reference(q, k, v, cu, 1.0 / math.sqrt(HEAD_DIM)), NVFP4_ATOL, NVFP4_RTOL
     )
+    replayed = out.clone()
+    out.fill_(float("nan"))
+    runner()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, replayed, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("pv_mode", ["fp8", "fp4"])
@@ -1366,12 +2197,230 @@ def test_nvfp4_split_plan_binds_split_program(pv_mode):
     assert runner.route_metadata["attention_variant"] == "attention_split"
     assert [name for name, entry, _ in runner._stages if entry is not None] == (
         ["amax"] if pv_mode == "fp8" else []
-    ) + ["quantize", "attention_split", "combine"]
+    ) + [runner.quantize_stage, "attention_split", "combine"]
     out = runner()
     torch.cuda.synchronize()
     _check(
         out, _reference(q, k, v, cu, 1.0 / math.sqrt(HEAD_DIM)), NVFP4_ATOL, NVFP4_RTOL
     )
+
+
+@pytest.mark.parametrize("pv_mode", ["fp8", "fp4"])
+def test_nvfp4_q_split_plan_output_is_bitwise_the_plain_plans(monkeypatch, pv_mode):
+    """Q-split halves change only the slot -> rows mapping: each half runs its
+    256 rows over the unit's whole K/V range, as the two-stage unit does, so
+    the output is bitwise the plain plan's.  center_8s_p4 (406 two-stage
+    units, no K/V split) halves its tail round by default (26 units on 76
+    clusters; other grids check the invariants only), and every unit with
+    ``q_split="all"``; both equal the plan without halves.  The dense program
+    of ``NVFP4_TWO_STAGE_DENSE`` (sm_100a fp8 PV) runs whole two-stage units
+    only: a plan with halves binds the single-stage dense program
+    ``attention_qs`` of ``NVFP4_QS_DENSE`` there, the plan without them the
+    two-stage program, and the outputs are bitwise equal across the two."""
+    _require_program(cake_backend.NVFP4_VARIANT[pv_mode])
+    cu, heads, halved = [0, 14736], 14, {76: 26}
+    q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=14)
+    capacity = cake_backend.bf16_grid_clusters(q.device)
+    pair = (pv_mode, cake_backend._arch_for(q.device))
+    two_stage, qs = pair in NVFP4_TWO_STAGE_DENSE, pair in NVFP4_QS_DENSE
+    build = cake_backend.build_tile_tables
+    outs, units = {}, {}
+    for option in (False, None, "all"):
+        monkeypatch.setattr(
+            cake_backend,
+            "build_tile_tables",
+            lambda *args, option=option, **kwargs: build(
+                *args, q_split=option, **kwargs
+            ),
+        )
+        runner = prepare_minimax_h3_varlen_nvfp4_attention(
+            q, k, v, cu_seqlens, pv_mode=pv_mode, cu_seqlens_host=cu
+        )
+        tiles = runner.tile_tables
+        halves = tiles.num_q_split_units > 0
+        assert tiles.num_combine_units == 0 and runner.attention_stage == (
+            "attention_qs" if qs and halves else "attention"
+        )
+        assert tiles.total_tiles == 406 + tiles.num_q_split_units
+        assert runner.route_metadata["q_split_units"] == tiles.num_q_split_units
+        q_half = [w >> NVFP4_Q_HALF_SHIFT for w in tiles.cl_q_block.tolist()]
+        assert q_half.count(2) == q_half.count(1) == tiles.num_q_split_units
+        units[option] = tiles.num_q_split_units
+        outs[option] = runner().clone()
+        torch.cuda.synchronize()
+    monkeypatch.undo()
+    if two_stage and not qs:
+        assert units == {False: 0, None: 0, "all": 0}
+    else:
+        assert units[False] == 0 and units["all"] == 406
+    if capacity in halved and (qs or not two_stage):
+        assert units[None] == halved[capacity], (
+            f"{units[None]} halved units on {capacity} clusters"
+        )
+    assert torch.equal(outs[None], outs[False])
+    assert torch.equal(outs["all"], outs[False])
+    _check(
+        outs["all"],
+        _reference(q, k, v, cu, 1.0 / math.sqrt(HEAD_DIM)),
+        NVFP4_ATOL,
+        NVFP4_RTOL,
+    )
+
+
+@pytest.mark.parametrize("operand", ["query", "key", "value"])
+@pytest.mark.parametrize("pv_mode", ["fp8", "fp4"])
+def test_nvfp4_rejects_operands_without_32_byte_alignment(pv_mode, operand):
+    """The quantizers read Q / K / V with 32-byte vector loads: a contiguous
+    view that is only 16-byte aligned is refused before any launch, and the
+    CUDA context stays usable."""
+    _require_program(cake_backend.NVFP4_VARIANT[pv_mode])
+    cu, heads = [0, 300], 7
+    q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=5)
+    operands = {"query": q, "key": k, "value": v}
+    tensor = operands[operand]
+    # 8 BF16 elements (16 bytes) past an allocation's aligned base.
+    buffer = torch.empty(tensor.numel() + 8, dtype=torch.bfloat16, device="cuda")
+    shifted = buffer[8:].view(tensor.shape)
+    shifted.copy_(tensor)
+    assert shifted.is_contiguous() and shifted.data_ptr() % 32 == 16
+    operands[operand] = shifted
+    with pytest.raises(ValueError, match="32-byte aligned"):
+        prepare_minimax_h3_varlen_nvfp4_attention(
+            *operands.values(), cu_seqlens, pv_mode=pv_mode, cu_seqlens_host=cu
+        )
+    with pytest.raises(ValueError, match="32-byte aligned"):
+        minimax_h3_varlen_nvfp4_attention(
+            *operands.values(), cu_seqlens, pv_mode=pv_mode
+        )
+    out = minimax_h3_varlen_nvfp4_attention(q, k, v, cu_seqlens, pv_mode=pv_mode)
+    torch.cuda.synchronize()
+    _check(
+        out, _reference(q, k, v, cu, 1.0 / math.sqrt(HEAD_DIM)), NVFP4_ATOL, NVFP4_RTOL
+    )
+
+
+@pytest.mark.parametrize("pv_mode", ["fp8", "fp4"])
+def test_nvfp4_rejects_a_misaligned_workspace_tensor(pv_mode):
+    """A caller-owned workspace tensor needs a 16-byte-aligned base (TMA
+    operands and 16-byte quantizer stores): each tensor of the set, shifted by
+    8 bytes, is refused before any launch; the aligned set runs."""
+    _require_program(cake_backend.NVFP4_VARIANT[pv_mode])
+    cu, heads = [0, 300], 7
+    q, k, v, cu_seqlens = _make_inputs(cu, heads, seed=5)
+    runner = prepare_minimax_h3_varlen_nvfp4_attention(
+        q, k, v, cu_seqlens, pv_mode=pv_mode, cu_seqlens_host=cu
+    )
+    for name, tensor in runner.workspace.items():
+        nbytes = tensor.numel() * tensor.element_size()
+        arena = torch.empty(nbytes + 16, dtype=torch.uint8, device="cuda")
+        shifted = arena[8 : 8 + nbytes].view(tensor.dtype).view(tensor.shape)
+        assert shifted.is_contiguous() and shifted.data_ptr() % 16 == 8
+        workspace = {**runner.workspace, name: shifted}
+        with pytest.raises(ValueError, match="16-byte aligned"):
+            prepare_minimax_h3_varlen_nvfp4_attention(
+                q,
+                k,
+                v,
+                cu_seqlens,
+                pv_mode=pv_mode,
+                cu_seqlens_host=cu,
+                workspace=workspace,
+            )
+    out = runner()
+    torch.cuda.synchronize()
+    _check(
+        out, _reference(q, k, v, cu, 1.0 / math.sqrt(HEAD_DIM)), NVFP4_ATOL, NVFP4_RTOL
+    )
+
+
+# Large offsets through the public calls: 301 segments of 8192 tokens, a ragged
+# split segment and a one-block segment (stored directly, not through a partial
+# slot) at 7 heads give T * H = 17296083 output rows (1.03 * 2^24: output
+# element offsets pass 2^31) and, with every unit's K/V range split in two,
+# 67564 partial slots of ``PARTIAL_ROWS`` rows (more than 2^16: partial-row
+# element offsets pass 2^31 as well).  Peak GPU memory is about 31.5 GB (Q, K,
+# V and the output at 4.4 GB each, the partial workspace and the NVFP4 packed
+# operands).
+LARGE_HEADS = 7
+LARGE_LENS = (8192,) * 301 + (5000, 77)
+LARGE_KV_SPLITS = 2
+# Segment groups run again alone: the first two segments, the segment whose
+# rows cross 2^24 (its units' partial slots cross 2^16) and the last three.
+LARGE_GROUPS = ((0, 2), (292, 293), (300, 303))
+# |V| <= 4 everywhere but one 6.0 at the first token of every group, so the fp8
+# route's per-tensor V scale (from max |V|) is the same in every call.
+LARGE_V_CLAMP, LARGE_V_MAX = 4.0, 6.0
+
+
+@pytest.mark.parametrize("route", ["bf16", "fp8", "fp4"])
+def test_large_offsets_match_the_segments_run_alone(route, monkeypatch):
+    """Output rows past 2^24 and partial slots past 2^16 land where they belong.
+
+    The planners' ``choose_kv_splits`` is forced to split every unit in two, so
+    the public call runs the split attention program, the partial workspace
+    and the combine on every multi-block unit.  The output starts as NaN and
+    holds no NaN afterwards; each group of ``LARGE_GROUPS``, run again alone at
+    small offsets, reproduces its rows bit for bit (a unit's arithmetic does
+    not depend on where the plan puts it) and matches the FP32 reference.
+    """
+    _require_program("bf16" if route == "bf16" else cake_backend.NVFP4_VARIANT[route])
+    choose = cake_backend.choose_kv_splits
+    slots: list[int] = []
+
+    def forced(unit_blocks, num_clusters, *, force=None, program_cost=1.0):
+        split_of = choose(
+            unit_blocks, num_clusters, force=LARGE_KV_SPLITS, program_cost=program_cost
+        )
+        slots.append(sum(k for k in split_of if k > 1))
+        return split_of
+
+    monkeypatch.setattr(cake_backend, "choose_kv_splits", forced)
+    # A fresh BF16 plan cache: the forced plans and their partial workspace
+    # leave with it at the end of the test.
+    monkeypatch.setattr(cake_backend, "_BF16_PLANS", OrderedDict())
+
+    def attend(q, k, v, cu, out):
+        cu_seqlens = torch.tensor(cu, dtype=torch.int32, device="cuda")
+        if route == "bf16":
+            return minimax_h3_varlen_attention(
+                q, k, v, cu_seqlens, out=out, cu_seqlens_host=cu
+            )
+        return minimax_h3_varlen_nvfp4_attention(
+            q, k, v, cu_seqlens, pv_mode=route, out=out, cu_seqlens_host=cu
+        )
+
+    cu = [0]
+    for length in LARGE_LENS:
+        cu.append(cu[-1] + length)
+    heads, rows = LARGE_HEADS, 1 << 24
+    assert cu[292] * heads < rows < cu[293] * heads and cu[300] * heads > rows
+    shape = (cu[-1], heads, HEAD_DIM)
+    gen = torch.Generator(device="cuda").manual_seed(6093)
+    q, k, v = (
+        torch.empty(shape, dtype=torch.bfloat16, device="cuda").normal_(generator=gen)
+        for _ in range(3)
+    )
+    v.clamp_(-LARGE_V_CLAMP, LARGE_V_CLAMP)
+    for first, _ in LARGE_GROUPS:
+        v[cu[first], 0, 0] = LARGE_V_MAX
+    out = torch.full(shape, float("nan"), dtype=torch.bfloat16, device="cuda")
+    assert attend(q, k, v, cu, out) is out
+    torch.cuda.synchronize()
+    assert len(slots) == 1 and slots[0] > 1 << 16
+    for chunk in out.split(1 << 18):
+        assert not torch.isnan(chunk).any()
+    tolerance = (BF16_ATOL, BF16_RTOL) if route == "bf16" else (NVFP4_ATOL, NVFP4_RTOL)
+    scale = 1.0 / math.sqrt(HEAD_DIM)
+    for first, last in LARGE_GROUPS:
+        a, b = cu[first], cu[last]
+        local = [x - a for x in cu[first : last + 1]]
+        alone = torch.full(
+            (b - a, heads, HEAD_DIM), float("nan"), dtype=torch.bfloat16, device="cuda"
+        )
+        attend(q[a:b].clone(), k[a:b].clone(), v[a:b].clone(), local, alone)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out[a:b], alone, atol=0, rtol=0)
+        _check(alone, _reference(q[a:b], k[a:b], v[a:b], local, scale), *tolerance)
 
 
 def test_nvfp4_rejects_bad_pv_mode():
