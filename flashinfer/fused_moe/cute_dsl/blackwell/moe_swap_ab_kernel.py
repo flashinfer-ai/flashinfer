@@ -3263,7 +3263,6 @@ class Sm100BlockScaledGroupedGemmKernel:
                             info_pipe, info_state, sInfo, tile + grid, total_tiles
                         )
                     )
-                acc_pipe.producer_tail(producer)
         elif warp < 8:
             if cutlass.const_expr(self.gather_input):
                 cute.arch.setmaxregister_increase(256)
