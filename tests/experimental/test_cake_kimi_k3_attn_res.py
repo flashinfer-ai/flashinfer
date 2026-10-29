@@ -449,7 +449,7 @@ def test_round_2_cells_take_their_table_program():
         ("sm_103a", 152, 4096, 4, "persistent:k4_nc3_d2_f111000000000000"),
     ]
     for arch, sm_count, M, K, key in _r2_cells("R2_PAIR_CELLS"):
-        regs = key.endswith("_cr232")
+        regs = key.endswith(("_cr232", "_cr200_pk1"))
         threads = 384 if regs else 320
         for pdl in (False, True):
             plan = plan_route(arch, sm_count, M, K, pdl)
@@ -457,7 +457,8 @@ def test_round_2_cells_take_their_table_program():
             assert plan.threads == threads and plan.fallback_from is None
             assert plan.schedule_id == (
                 f"pair_ws{threads}_nc2_prefix_bf16_add_fastmath"
-                + ("_consumer_regs232" if regs else "")
+                + ("_consumer_regs232" if key.endswith("_cr232") else "")
+                + ("_consumer_regs200_park_acc1" if key.endswith("_cr200_pk1") else "")
                 + f"_grid{sm_count}"
             )
             seen += 1
@@ -504,13 +505,14 @@ def test_round_2_cells_take_their_table_program():
             "persistent:k1_nc4_d2_f110000000000010",
             "persistent:k1_nc4_d2_f110000000000000",
         )
-    # Cells round 2 left alone keep the legacy program: the GB300 K6 M3 small-M cell, the B300 K6 M192
-    # (pair) cell. Round 6 moved the record-only K2 M8192 (152) / M4096 (148) cells to the K2
-    # register-carry programs without the consumed-release fence.
+    # Cells round 2 left alone keep the legacy program: the GB300 K6 M3 small-M cell (the B300 K6
+    # M192 cell runs the parked-accumulator pair program,
+    # ``test_park_acc_pair_cells_take_the_384_thread_programs``). Round 6 moved the record-only K2
+    # M8192 (152) / M4096 (148) cells to the K2 register-carry programs without the consumed-release
+    # fence.
     assert (
         plan_route("sm_103a", 152, 3, 6, False).kernel_key == "small_m_cluster2:k6_fm"
     )
-    assert plan_route("sm_103a", 148, 192, 6, False).kind == "persistent"
     assert (
         plan_route("sm_103a", 152, 8192, 2, False).kernel_key
         == "persistent:k2_nc3_d2_f011010000000000_crfnone"
@@ -735,14 +737,11 @@ def test_a_packed_register_carry_key_never_falls_back_across_the_carry():
 def test_consumer_regs_pair_cells_take_the_384_thread_programs():
     """Round 20: a ``_cr232`` pair key is the pair kernel built at ``consumer_regs`` 232 (three
     whole warpgroups, 384 threads); its schedule label adds ``_consumer_regs232`` ahead of the grid.
-    The sm_100a (192, 4), (192, 5) and (192, 8) cells, the sm_103a (192, 4) and (192, 5) cells at
-    both SM counts and the sm_103a (192, 6) cell at 152 SMs run it at both PDL modes; no cell runs
-    the 320-thread pair program."""
-    cells = (
-        [("sm_100a", 148, K) for K in (4, 5, 8)]
-        + [("sm_103a", sm_count, K) for sm_count in SM_COUNTS for K in (4, 5)]
-        + [("sm_103a", 152, 6)]
-    )
+    The sm_100a (192, 4), (192, 5) and (192, 8) cells and the sm_103a (192, 4) and (192, 5) cells at
+    both SM counts run it at both PDL modes; no cell runs the 320-thread pair program."""
+    cells = [("sm_100a", 148, K) for K in (4, 5, 8)] + [
+        ("sm_103a", sm_count, K) for sm_count in SM_COUNTS for K in (4, 5)
+    ]
     for arch, sm_count, K in cells:
         for pdl in (False, True):
             plan = plan_route(arch, sm_count, 192, K, pdl)
@@ -756,7 +755,40 @@ def test_consumer_regs_pair_cells_take_the_384_thread_programs():
             ), plan
             record = MODULES[KERNELS[arch][plan.kernel_key]]
             assert record["launch"]["block"][0] == 384, record["launch"]
-    assert all(key.endswith("_cr232") for *_, key in _r2_cells("R2_PAIR_CELLS"))
+    assert all(
+        key.endswith(("_cr232", "_cr200_pk1")) for *_, key in _r2_cells("R2_PAIR_CELLS")
+    )
+
+
+def test_park_acc_pair_cells_take_the_384_thread_programs():
+    """A ``_cr200_pk1`` pair key is the pair kernel built at ``consumer_regs`` 200 with
+    ``park_acc`` 1 (three whole warpgroups, 384 threads; each consumer thread's accumulators wait in
+    tensor memory while the prefix chunk streams); its schedule label adds
+    ``_consumer_regs200_park_acc1`` ahead of the grid. The sm_100a (192, 6) and (192, 7) cells at
+    148 SMs and the sm_103a (192, 6), (192, 7) and (192, 8) cells at both SM counts run it at both
+    PDL modes."""
+    cells = [("sm_100a", 148, K) for K in (6, 7)] + [
+        ("sm_103a", sm_count, K) for sm_count in SM_COUNTS for K in (6, 7, 8)
+    ]
+    for arch, sm_count, K in cells:
+        for pdl in (False, True):
+            plan = plan_route(arch, sm_count, 192, K, pdl)
+            assert (plan.kind, plan.kernel_key) == (
+                "pair",
+                f"pair:k{K}_nc2_pbf16a_fm_cr200_pk1",
+            ), (arch, sm_count, K, pdl, plan)
+            assert plan.threads == cb.PAIR_CONSUMER_REGS_THREADS == 384, plan
+            assert plan.schedule_id == (
+                "pair_ws384_nc2_prefix_bf16_add_fastmath_consumer_regs200_park_acc1"
+                f"_grid{sm_count}"
+            ), plan
+            record = MODULES[KERNELS[arch][plan.kernel_key]]
+            assert record["launch"]["block"][0] == 384, record["launch"]
+    assert sorted(
+        (arch, sm_count, M, K)
+        for arch, sm_count, M, K, key in _r2_cells("R2_PAIR_CELLS")
+        if key.endswith("_pk1")
+    ) == sorted((arch, sm_count, 192, K) for arch, sm_count, K in cells)
 
 
 @pytest.mark.parametrize("pdl", (False, True))

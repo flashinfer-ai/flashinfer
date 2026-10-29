@@ -19,6 +19,7 @@ from .....core.validation.common import (
     validate_mega_fleet_params,
 )
 from .....weights import PrequantizedMoEWeights
+from .genphase_config import GenphaseConfigMixin
 
 if TYPE_CHECKING:
     from .mxfp8_mxfp8_bf16_cutedsl.config import (
@@ -29,7 +30,7 @@ if TYPE_CHECKING:
     )
 
 
-class _StandardBlockScaledBackend(MegaKernelBackend):
+class _StandardBlockScaledBackend(GenphaseConfigMixin, MegaKernelBackend):
     _config: (
         Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
         | Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
@@ -39,15 +40,18 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
     quant_kind: str | None = None
 
     def __init__(self, config):
+        """Validate selector constraints and initialize output capabilities."""
         super().__init__(config)
-        if getattr(config, "kernel_variant", "inference") != "inference":
+        if config.kernel_variant not in ("inference", "genphase"):
             raise MoEEpConfigError(
-                "The standard backend requires kernel_variant='inference'."
+                f"unsupported kernel_variant {config.kernel_variant!r}"
             )
+        if config.kernel_variant == "genphase":
+            self._init_genphase_config()
         if config.knobs not in (None, "auto") and not isinstance(config.knobs, dict):
             raise MoEEpConfigError("knobs must be a dictionary, 'auto', or None.")
         self.supports_unfinalized_output = config.finalize_mode is FinalizeMode.NONE
-        if any(
+        if config.kernel_variant == "inference" and any(
             getattr(config, name, None) is not None
             for name in ("mma_tiler_mnk", "cluster_shape_mn", "schedule_policy")
         ):
@@ -64,6 +68,9 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
         return get_tuned_knobs(workspace)
 
     def _finalize_mode(self, fleet):
+        """Resolve AUTO for inference; GenPhase requires default finalization."""
+        if self._config.kernel_variant == "genphase":
+            return FinalizeMode.DEFAULT
         mode = self._config.finalize_mode
         if mode is not FinalizeMode.AUTO:
             return mode
@@ -102,6 +109,11 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
         self._workspace_config(fleet_params)
 
     def _workspace_config(self, fleet):
+        """Resolve GenPhase geometry or translate inference knobs to native options."""
+        if self._config.kernel_variant == "genphase":
+            config = self._genphase_config(fleet)
+            self._check_genphase_selection(config)
+            return config
         from .....kernel_src.sm100.cutedsl_megamoe import default_knobs
         from .....kernel_src.sm100.next_cutedsl_megamoe import Sm100BlockScaledMoeConfig
 
@@ -188,9 +200,9 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
             epi_flag_batches=tuple(knobs.get("epi_flag_batch", (1, 1))),
             token_back_mode=token_back,
             fc2_use_bulk=not knobs.get("non_ubulk_fc2_store", True),
-            gate_up_clamp=k.gate_up_clamp
-            if k.gate_up_clamp is not None
-            else k.activation_clamp,
+            gate_up_clamp=(
+                k.gate_up_clamp if k.gate_up_clamp is not None else k.activation_clamp
+            ),
             activation=getattr(k, "activation", "swiglu"),
             situ_beta=getattr(k, "situ_beta", None),
             situ_linear_beta=getattr(k, "situ_linear_beta", None),
@@ -262,17 +274,24 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
         )
 
     def _allocate_workspace(self, fleet_params):
+        """Allocate variant-specific buffers and initialize expert scale tensors."""
         from .....kernel_src.sm100.next_cutedsl_megamoe import (
             Sm100BlockScaledSymmBuffer,
+            Sm100GenphaseSymmBuffer,
         )
 
         cfg = self._workspace_config(fleet_params)
-        workspace = Sm100BlockScaledSymmBuffer(
-            cfg,
-            num_valid_tokens_tensor=self._config.num_valid_tokens_tensor
-            if cfg.use_persistent_finalize_kernel
-            else None,
-        )
+        if cfg.kernel_variant == "genphase":
+            workspace = Sm100GenphaseSymmBuffer(cfg)
+        else:
+            workspace = Sm100BlockScaledSymmBuffer(
+                cfg,
+                num_valid_tokens_tensor=(
+                    self._config.num_valid_tokens_tensor
+                    if cfg.use_persistent_finalize_kernel
+                    else None
+                ),
+            )
         if self.supports_unfinalized_output:
             workspace._unfinalized_route_map = torch.arange(
                 cfg.max_tokens_per_rank * cfg.num_topk,
@@ -290,6 +309,7 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
         return workspace
 
     def _workspace_pool_key(self, fleet_params):
+        """Key fixed workspaces by geometry, finalization and borrowed tensors."""
         if self._config.knobs == "auto":
             return None
         from .....core.kernel.workspace_pool import epilogue_pool_key
@@ -301,9 +321,15 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
             id(self._ep_comm_group),
             self._workspace_config(fleet_params),
             self._finalize_mode(fleet_params),
-            epilogue_pool_key(self._config.num_valid_tokens_tensor)
-            if self._workspace_config(fleet_params).use_persistent_finalize_kernel
-            else None,
+            (
+                epilogue_pool_key(self._config.num_valid_tokens_tensor)
+                if getattr(
+                    self._workspace_config(fleet_params),
+                    "use_persistent_finalize_kernel",
+                    False,
+                )
+                else None
+            ),
             tuple(
                 epilogue_pool_key(getattr(self._config, name, None))
                 for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const")
@@ -361,13 +387,14 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
                 )
 
     def stage_inputs(self, t, workspace, *, quantize_input):
+        """Stage quantized activations, mask padded routes and refresh live scales."""
         n = t.hidden_states.shape[0]
         cfg = workspace.config
         if self._kind() == "nvfp4":
             self._legacy_backend().staging.validate_fc1_activation_per_token_scale(
                 t.fc1_activation_per_token_scale,
                 num_tokens=n,
-                enabled=cfg.enable_fc1_activation_per_token_scale,
+                enabled=getattr(cfg, "enable_fc1_activation_per_token_scale", False),
             )
         if quantize_input:
             kwargs = (
@@ -412,7 +439,7 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
                 | (workspace.topk_idx[:n] >= cfg.num_total_experts),
                 0,
             )
-        if cfg.enable_fc1_activation_per_token_scale:
+        if getattr(cfg, "enable_fc1_activation_per_token_scale", False):
             workspace.fc1_activation_per_token_scale[:n].copy_(
                 t.fc1_activation_per_token_scale
             )
@@ -429,10 +456,11 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
                 target.copy_(value)
 
     def validate_capture_ready(self, workspace, transformed_weights):
+        """Require the workspace and any terminal reducer to be warmed up."""
         if workspace._compiled is None:
             raise RuntimeError("Warm up the standard workspace before graph capture.")
         if (
-            workspace.config.use_custom_finalize
+            getattr(workspace.config, "use_custom_finalize", False)
             and not self.supports_unfinalized_output
         ):
             from flashinfer.jit.cake_megamoe_topk_reduce import (
@@ -443,6 +471,7 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
                 raise RuntimeError("Warm up the terminal reducer before graph capture.")
 
     def compute(self, workspace, transformed_weights, *, output):
+        """Launch the prepared MoE and its selected BF16 finalization path."""
         from .....kernel_src.sm100.next_cutedsl_megamoe import (
             sm100_block_scaled_mega_launch_thunk,
             sm100_block_scaled_mega_moe,
@@ -456,7 +485,7 @@ class _StandardBlockScaledBackend(MegaKernelBackend):
             )
         if self.supports_unfinalized_output:
             raise ValueError("finalize_mode=NONE requires compute_unfinalized()")
-        if not workspace.config.use_custom_finalize:
+        if not getattr(workspace.config, "use_custom_finalize", False):
             view = sm100_block_scaled_mega_moe(
                 output,
                 *transformed_weights,

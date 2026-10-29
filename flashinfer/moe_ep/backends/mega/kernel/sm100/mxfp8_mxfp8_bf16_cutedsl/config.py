@@ -25,6 +25,8 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     fp8 weights with ``w13_scale`` / ``w2_scale``.
 
     ``kernel_variant="genphase"`` opts into the Blackwell decoding pipeline.
+    It supports E4M3, E5M2 and ``kind="mxfp4_mxfp8"`` (packed MXFP4 weights
+    with E4M3 activations). The latter requires 128-aligned intermediate size.
     Its ``knobs=None`` selects an exact cached profile or a host heuristic;
     dictionaries and explicit tile/cluster/schedule fields constrain selection.
     GenPhase and the standard ``_cutedsl_next`` selector use ``knobs="auto"``
@@ -34,7 +36,8 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     single-capacity automatic workspace.
 
     ``kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl_next"`` selects the standard
-    provider export for E4M3 or E5M2. Keep ``kernel_variant="inference"`` and
+    provider export for E4M3 or E5M2. ``kernel_variant="genphase"`` selects
+    decoding, including mixed MXFP4/MXFP8. With ``kernel_variant="inference"``,
     use default, fixed or automatic ``knobs``. Activation controls and
     late routing weights are available through this selector.
     """
@@ -42,7 +45,7 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     intermediate_size: int
     top_k: int
     kernel_name: str = "sm100_mxfp8_mxfp8_bf16_cutedsl"
-    kind: Literal["mxfp8_e4m3", "mxfp8_e5m2"] = "mxfp8_e4m3"
+    kind: Literal["mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"] = "mxfp8_e4m3"
     gate_up_clamp: float | None = None
     activation_clamp: float | None = None
     fast_math: bool = True
@@ -87,6 +90,9 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     apply_routing_weights_before_fc2: bool = field(default=True, kw_only=True)
 
     def __post_init__(self) -> None:
+        """Reject incompatible dtype, activation and finalization options."""
+        if self.kind == "mxfp4_mxfp8" and self.kernel_variant != "genphase":
+            raise ValueError("Mixed MXFP4/MXFP8 requires kernel_variant='genphase'.")
         if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
             raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
         if self.swiglu_alpha is not None and self.swiglu_beta is not None:

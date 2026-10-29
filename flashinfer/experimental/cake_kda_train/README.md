@@ -131,8 +131,13 @@ into the saved set.
 
 A workspace is one arena (a `uint8` tensor) holding the internal-layout
 intermediates of one `(S, num_docs, H)` problem; `chunk_kda_fwd` /
-`chunk_kda_bwd` allocate only their outputs and the saved set when given one,
-and without one each call allocates a workspace of its own.  The arena is not
+`chunk_kda_bwd` allocate only their outputs and the saved set when given one.
+Without one, each call allocates its arena when it starts and frees it when it
+returns, so no device memory outlives the call.  The host side of that
+workspace (the plan, which `cake_backend.plan` caches per `(S, num_docs, H,
+sm_count, arch)`, and the layout views) is kept per device, stream and arena
+option, so a repeated problem costs the host about what a caller-owned
+workspace costs.  The arena is not
 initialized: every element a launch reads is written earlier in the same
 call, so the content at allocation never reaches a result (`zero_init=True`
 zero-fills it for diagnostics).  The autograd node of `chunk_kda` holds a
@@ -288,9 +293,14 @@ saved tables describe the whole problem); the whole token tensors and
 gradients (every program reaches the tokens through the absolute `chunk_bos`
 offsets of its tables); the group's slices of a saved `h` / `v_new` tape; and
 its state blocks, recomputed in the view on the `light` and `replay` paths,
-gathered from the saved `hseg` / `seg_state` / `seg_m` by chain rank on
-`light_states` and `tape`, and scattered back from the view when the forward
-saves them.  The records, the segment count per document (`P`, with the
+taken from the saved `hseg` / `seg_state` / `seg_m` by chain rank on
+`light_states` and `tape`, and written back when the forward saves them.  The
+host ranks the chains from `doc_lengths` by the tables' rule (chunk count,
+most first, ties in document order), so a group whose blocks are one run of
+the saved ones reads views of them and its forward carry writes the saved
+`hseg` directly (the offsets / transfers are contiguous copies); a group whose
+blocks are not one run gathers and scatters them by index.  The records, the
+segment count per document (`P`, with the
 non-proportional block table) and the saved set are the whole problem's; the
 saving forward therefore writes the whole problem's tables once with the
 saved-set paths' table program (`table_v3` / `table_v2`) before its groups.
@@ -306,7 +316,8 @@ table gives the documents proportional segment counts (`num_docs * H <= 4` on
 the segmented route: a group of fewer documents would change every document's
 segments) and, on a lean workspace, the checkpoint replay (`saved=None`); a
 batched workspace that is not lean runs the replay group by group.  The costs
-per group are a table launch, the gathers (three state blocks of the group,
+per group are a table launch, the gathers of a group whose blocks are not one
+run (at most three state blocks per segment of the group, within
 `batch_scratch` of `memory_report`) and the smaller grids; the serial route's
 chains of different groups run one group after another.
 
@@ -499,7 +510,9 @@ launches as on `sm_100a`: 1 document, 16 heads (segmented, `P = 9`) 5 / 11 /
 The selection and grid rules are data in `cake_jit.MODULES` (`select_rule`,
 `grid_rule`) and are evaluated by `cake_jit.select_record` / `launch_grid` /
 `segment_plan` / `segment_args`; `cake_backend.plan(S, num_docs, H, sm_count,
-arch)` resolves them once per problem into `Plan.records[path][stage]`, and
+arch)` resolves them once per problem into `Plan.records[path][stage]` (cached
+on its arguments; `arch=None` takes the current CUDA device's architecture, or
+the first exported one when no exported device is present), and
 `Plan.launch_count(path)` is the launch count of each path (`"bwd"`: the
 backward from the plan's own light saved set).
 
@@ -599,7 +612,8 @@ runtime cannot name the captured node, the capture continues without the cap
 after one warning (`LAST_CALL[kind]["cache_config"] == "unavailable"`); the
 results are bitwise identical either way. The previous replay form stays
 reachable for A/B records through the private test knob `graph_cap`
-(`CAKE_KCP_TEST_KNOBS=1`); `graph="off"` is the shipped default. The A/B
+(after `cake_kcp_plan.enable_test_knobs()`); `graph="off"` is the shipped
+default. The A/B
 record was taken with pointer-stable harness inputs; its gain is an upper
 bound of what a framework sees.
 
@@ -610,6 +624,15 @@ than 256 chunk steps (the segment plan's bounds); the byte queries
 `kcp_comm_bytes(ctx, H=..., C=...)` size the rank's workspace, saved set and
 one step's traffic before any allocation.  Every rank of the group calls the
 same entry points in the same order; the collectives are issued inside them.
+
+Workspace of a rank (`KcpWorkspace`, caller-held, reused across calls and
+layers): the local arena of the token-side stages plus the boundary pools.
+The backward's b1 / b2 send pools reuse the storage of the forward's c1 / c2
+send pools (a call waits its sends before a backward writes either), and the
+ring exchange's hop pools are allocated by the first `exchange="ring"` call.
+`kcp_workspace_bytes` is the number of bytes an a2a workspace allocates
+(`KcpWorkspace.bytes` after its first backward); the saved set and the
+convolution's halo rows are per-call tensors outside it.
 
 Saved set of a rank (`KcpSaved`, `boundary_mode="saved"`): the fresh `S_in`
 (the initial states of its fragments), with `save_transfer` the owner's c1
@@ -633,7 +656,7 @@ and restores it before the next launch; a launch issued by another thread of
 the same process during that bracket would take the PreferL1 occupancy for
 itself (occupancy only -- results never depend on the geometry). The earlier
 geometry stays reachable for A/B records through the private test knob
-`walk_geometry` (`CAKE_KCP_TEST_KNOBS=1`).
+`walk_geometry` (after `cake_kcp_plan.enable_test_knobs()`).
 
 Host path: the eager KCP calls reuse the call-independent host work -- the
 validated options, the workspace's last tables and pool views, the local
@@ -645,8 +668,9 @@ reference the table set only weakly, so a training loop that builds a new
 context and workspace per step releases everything with them. The kernels,
 their arguments and their order are unchanged, so the results are bitwise
 those of the previous host path, which stays reachable for A/B records
-through the private test knob `host_trim` (`CAKE_KCP_TEST_KNOBS=1`; the conv
-module's `_set_test_knobs({"host_trim": 0})`).
+through the private test knob `host_trim` (after
+`cake_kcp_plan.enable_test_knobs()`; the conv module's
+`_set_test_knobs({"host_trim": 0})`).
 
 Options of the KDA entry points: `save_transfer` keeps the owner's c1 receive
 tensor (and `M_seg`) for the backward instead of re-sending it in the backward
@@ -655,6 +679,20 @@ exchange -- the default with the all-to-all exchange (an earlier revision).
 receives no such tensor, so `save_transfer` resolves to `False` there
 automatically; an explicit `save_transfer=True` together with the ring is a
 `ValueError`. `KcpSaved.save_transfer` always reports the value that was used.
+`spec3_probe` sets the debug probe of the backend's first saved-mode backward,
+which compares the backward's prep and WY rows with the forward's: `"off"` (the
+default) skips it, `"record"` stores the comparison in
+`LAST_CALL["bwd"]["spec3"]`, `"warn"` warns on a difference, `"assert"` raises
+`KcpPreconditionError`.  A probing backward keeps five token-row planes (about
+`ctx.R * H * 1536` bytes: 1.5 KiB per head for every row of the rank's
+chunk-padded token layout) allocated through its prep and WY programs, so its
+peak memory is higher by up to that amount.
+The backward reads the value of its own call (pass it to
+`chunk_kda_kcp_bwd`; the forward's is not kept in `KcpSaved`).  Pass the
+same value on every rank: the probe is a rank-local check, so `"assert"`
+serves single-process debugging.  Under `graph="replay"` the probing
+backward runs eagerly; a rank without tokens does not hold back its capture.
+No environment variable selects it.
 
 The segment plan splits every fragment into `P` segments: above the 256-chunk
 chain cap the equal-segment wave rule on ranks with at most three fragments,
@@ -696,9 +734,10 @@ The KCP kernels live beside the single-rank programs:
   (the TF32 hi/lo transfer walk, its static `precision_mode` 1 and 2 forms,
   and the full-width BF16x3 walk).  `build.json` never lists them and the
   shipped route never loads them: `cake_kcp_jit.load_test` JIT-builds an
-  entry only under the environment variable `CAKE_KCP_TEST_KNOBS=1`, which
-  also admits the test knobs (`precision_mode`, `transfer_walk`) of the
-  package's own tests; without the file those tests skip.
+  entry only after `cake_kcp_plan.enable_test_knobs()`, which also admits
+  the test knobs (`precision_mode`, `transfer_walk`) of the package's own
+  tests; without the file those tests skip.  The package reads no
+  environment variable.
 * `csrc/cake_kda_train_<digest>_{kernel,binding}.cu` of the thirteen KCP
   programs, rendered like the single-rank ones (digests in `build.json` and
   `build.test.json`).

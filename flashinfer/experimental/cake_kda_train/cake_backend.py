@@ -97,9 +97,12 @@ intermediates; buffers with disjoint lifetimes within one call share a slot
 (:data:`FWD_SLOTS` / :data:`BWD_SLOTS` are the lifetime tables; the saved-set
 paths use the backward layouts without the ``akk_int`` buffer, the replay the
 full ones, and a backward workspace is sized for the larger).  Outputs, the
-saved set and the tables are per-call allocations the caller owns; nothing is
-kept between calls.  :func:`workspace_bytes`, :func:`saved_bytes`,
-:func:`output_bytes` and :func:`memory_report` are the pre-allocation queries.
+saved set and the tables are per-call allocations the caller owns.  A call
+without a workspace allocates its arena at its start and frees it at its end;
+between calls it keeps host objects only (the cached :func:`plan`, the layout
+views of a workspace whose arena storage is released), no device memory.
+:func:`workspace_bytes`, :func:`saved_bytes`, :func:`output_bytes` and
+:func:`memory_report` are the pre-allocation queries.
 ``save_mode="light"`` (the default; saved set version 4) saves ``Aqk`` /
 ``Akk`` on the token rows (256 B per token-head), the tables, the fold's ``qg``
 (256 B per internal token-head: the light backward's prep writes none), on the
@@ -124,11 +127,14 @@ reduce in a fixed order and use no atomic adds.
 
 from __future__ import annotations
 
+import collections
+import contextlib
 import dataclasses
 import functools
+import threading
 import types
 import weakref
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
 import torch
@@ -727,19 +733,51 @@ class Plan:
         return _round_up(off + words, ALIGN // 4)
 
 
+@functools.cache
+def _capability_arch(device_index: int) -> str | None:
+    """The exported architecture of a CUDA device, ``None`` when no record targets it (a device's capability is
+    fixed for the process)."""
+    return cake_jit.arch_for_capability(torch.cuda.get_device_capability(device_index))
+
+
+def _plan_arch(arch: str | None) -> str:
+    """The architecture of a plan: ``arch``; else the current CUDA device's where it is an exported target; else
+    (no CUDA device, or one no record targets: a query of the host scalars alone) the first exported architecture,
+    whose records the byte queries also take without an ``arch`` (their segment count is then the
+    architecture-independent one, :func:`_arch_sms`)."""
+    if arch is not None:
+        return arch
+    if torch.cuda.is_available():
+        found = _capability_arch(torch.cuda.current_device())
+        if found is not None:
+            return found
+    return cake_jit.ARCHES[0]
+
+
 def plan(S: int, num_docs: int, H: int, sm_count: int, arch: str | None = None) -> Plan:
     """The :class:`Plan` of a packed problem; reads no tensor.
 
     ``arch`` selects the architecture's records and, on the few-chain segmented rows, its segment count
-    (:func:`cake_jit.segment_plan`; ``None``: the first exported architecture; the byte queries below take an
-    ``arch`` of their own).  ``ValueError`` when a scalar is below one, ``num_docs`` exceeds :data:`MAX_DOCS` (the
-    depth of the layout table's document search) or an int32 offset of the kernels would overflow: ``H * 128 *
-    64`` per chunk, ``R * H * 64`` over the padded rows of the ``[R, H, 64]`` intra-chunk buffers.
+    (:func:`cake_jit.segment_plan`; ``None``: the current CUDA device's architecture, so the plan serves a
+    :class:`KdaWorkspace` on that device; without an exported device at hand the first exported architecture; the
+    byte queries below take an ``arch`` of their own).  ``ValueError`` when a scalar is below one, ``num_docs``
+    exceeds :data:`MAX_DOCS` (the depth of the layout table's document search) or an int32 offset of the kernels
+    would overflow: ``H * 128 * 64`` per chunk, ``R * H * 64`` over the padded rows of the ``[R, H, 64]``
+    intra-chunk buffers.
+
+    The plan is a pure function of ``(S, num_docs, H, sm_count, arch)`` and is cached on them: a repeated problem
+    returns the same :class:`Plan` object (its record and grid tables are shared, never modified), so the calls
+    of the default entry plan a repeated shape once.
     """
-    S, num_docs, H, sm_count = int(S), int(num_docs), int(H), int(sm_count)
-    arch = cake_jit.ARCHES[0] if arch is None else arch
+    arch = _plan_arch(arch)
     if arch not in cake_jit.ARCHES:
         raise ValueError(f"plan: arch {arch!r} is not one of {cake_jit.ARCHES}")
+    return _plan(int(S), int(num_docs), int(H), int(sm_count), arch)
+
+
+@functools.lru_cache(maxsize=256)
+def _plan(S: int, num_docs: int, H: int, sm_count: int, arch: str) -> Plan:
+    """:func:`plan` of the normalized scalars (the cache; a refused problem raises every time)."""
     nc_max, nc_pad, rows = _check_problem(S, num_docs, H, sm_count)
     recur, segments, num_segments = cake_jit.segment_plan(num_docs, H, sm_count, arch)
     proportional, seg_arg = cake_jit.segment_args(num_docs, H, sm_count, arch)
@@ -813,7 +851,7 @@ def plan(S: int, num_docs: int, H: int, sm_count: int, arch: str | None = None) 
 def _gate_fused(arch: str | None) -> bool:
     """Whether ``arch``'s GLM intra program writes the gate gradients itself (no ``gate_epilogue`` record admits
     its rows; the layouts then carry no ``dg_int`` / ``db_int``).  ``arch=None`` (a byte query without an exported
-    device at hand) takes the first exported architecture's records, as :func:`plan` does."""
+    device at hand) takes the first exported architecture's records, as :func:`plan` does there."""
     arch = cake_jit.ARCHES[0] if arch is None else arch
     return (
         cake_jit.select_record(
@@ -833,8 +871,8 @@ def _light_prep_saves(
     num_chunks_pad: int, num_docs: int, H: int, sm_count: int, arch: str | None
 ) -> tuple[bool, bool]:
     """``(qg, w / u)``: the per-call tensors the light forward of the problem saves (version 4), read off the light
-    backward's prep record as :attr:`Plan.light_saves_qg` / :attr:`Plan.light_saves_wu` do; ``arch=None`` takes
-    the first exported architecture's records."""
+    backward's prep record as :attr:`Plan.light_saves_qg` / :attr:`Plan.light_saves_wu` do; ``arch=None`` (a byte
+    query without an exported device at hand) takes the first exported architecture's records."""
     arch = cake_jit.ARCHES[0] if arch is None else arch
     name = cake_jit.select_record(
         "bwd_prep",
@@ -1638,7 +1676,9 @@ def memory_report(
     totals with the configured backward arena (the replay total keeps the default's: a lean workspace serves no
     replay).  A batched option reports the bound of every group (``arena_bwd_bound_batched``) and, with
     ``doc_lengths``, its exact groups (``batches`` as ``(d0, d1, S, N)``), ``largest_batch_rows``,
-    ``batch_scratch`` (the largest group's table buffer and gathered state blocks, allocated per call) and
+    ``batch_scratch`` (allocated per call: the largest table buffer of a group and three state blocks per segment of
+    the group with the most segments; a group gathers its blocks of the saved states only where they are not one
+    run of them, at most three per segment) and
     ``arena_floor_batched`` (one document per group under the lean four-pass layouts: ``2820 * R_min * H + 3 * P *
     H * 64 KiB``, ``R_min`` the internal rows of the longest document; 2052 for the tape forms)."""
     if save_mode not in SAVE_MODES:
@@ -1715,11 +1755,13 @@ def memory_report(
         if doc_lengths is not None:
             groups = p.batches(arena, doc_lengths)
             batches = [(b.d0, b.d1, b.S, b.N) for b in groups]
-            big = max(groups, key=lambda b: b.NC_pad)
-            largest = big.NC_pad * BT
-            layout = _table_layout(big.NC_pad, big.N, p.batch_segments(big))
-            words = _round_up(layout[-1][1] + layout[-1][2], ALIGN // 4)
-            scratch = words * 4 + 3 * p.batch_segments(big) * H * D * D * 4
+            largest = max(b.NC_pad for b in groups) * BT
+            words = 0
+            for b in groups:
+                layout = _table_layout(b.NC_pad, b.N, p.batch_segments(b))
+                words = max(words, _round_up(layout[-1][1] + layout[-1][2], ALIGN // 4))
+            segments_b = max(p.batch_segments(b) for b in groups)
+            scratch = words * 4 + 3 * segments_b * H * D * D * 4
     if doc_lengths is not None:
         longest = max(p.check_doc_lengths(doc_lengths))
         nc_min = -(-longest // BT) + 1
@@ -1859,6 +1901,120 @@ def _device_index(device: torch.device) -> int:
     return device.index if device.index is not None else torch.cuda.current_device()
 
 
+def _seq_order(lengths: Sequence[int]) -> tuple[int, ...]:
+    """The layout table's ``seq_order`` (the documents by chain rank) from host integers: by chunk count
+    ``ceil(n / 64)``, most first, ties in document order.  Every program that writes the table (``table``,
+    ``table_v2``, ``table_v3`` and the segmented intra program ``fwd_intra_v14``) ranks document ``d`` at
+    ``#{j: nc_j > nc_d} + #{j < d: nc_j == nc_d}``, a strict order the sort reproduces: the zero-length documents
+    (no chunk) rank last, in document order."""
+    chunks = [-(-int(n) // BT) for n in lengths]
+    return tuple(sorted(range(len(chunks)), key=lambda d: (-chunks[d], d)))
+
+
+def _chain_ranks(lengths: Sequence[int]) -> tuple[int, ...]:
+    """Document -> its (document, head) chain rank, the inverse of :func:`_seq_order`: the segmented route's state
+    blocks are laid out by rank, ``P`` per chain (the non-proportional block table)."""
+    ranks = [0] * len(lengths)
+    for rank, d in enumerate(_seq_order(lengths)):
+        ranks[d] = rank
+    return tuple(ranks)
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class _Packing:
+    """One ``doc_lengths`` of a batched workspace (:meth:`KdaWorkspace.batches`), derived on the host from the
+    lengths alone: the document groups (:meth:`Plan.batches`); on the segmented route, per group, where its state
+    blocks are one run of the whole problem's the first of them (``blocks``; a group's tables rank its documents by
+    the whole problem's rule, so its chains keep their relative order), else ``None`` and the group's block
+    indices (``index``; ``None`` on the serial route too, which has no blocks); under a lean workspace's
+    ``tail_passes > 1`` the real chunk count of every tail range of every group at both of its chunk bounds
+    (:func:`_tail_passes`); and the device copy of these integers (``None`` until a call makes it;
+    :func:`_entry_release` drops it)."""
+
+    batches: tuple[Batch, ...]
+    P: int
+    blocks: tuple[int | None, ...]
+    # the int32 words of the copy: the lengths, then the tail counts ((group, chunk bound) -> (first word, words))
+    words: tuple[int, ...]
+    tail_at: dict[tuple[int, int], tuple[int, int]]
+    # the int64 words: the block indices of the groups whose blocks are not one run (group -> (first word, words))
+    index: tuple[int, ...]
+    index_at: dict[int, tuple[int, int]]
+    words_dev: torch.Tensor | None = None
+    index_dev: torch.Tensor | None = None
+
+    def to(self, device: torch.device) -> _Packing:
+        """With the device copy: from pinned host memory on the current stream without blocking (the host never
+        waits for the device); the block indices only where a group needs them."""
+        words = torch.tensor(self.words, dtype=torch.int32, pin_memory=True)
+        index: torch.Tensor | None = None
+        if self.index:
+            index = torch.tensor(self.index, dtype=torch.int64, pin_memory=True)
+            index = index.to(device, non_blocking=True)
+        return dataclasses.replace(
+            self, words_dev=words.to(device, non_blocking=True), index_dev=index
+        )
+
+    def on_host(self) -> _Packing:
+        return dataclasses.replace(self, words_dev=None, index_dev=None)
+
+    @property
+    def lengths(self) -> torch.Tensor:
+        """The device copy of ``doc_lengths`` (for the asynchronous check against ``cu_seqlens``)."""
+        return self.words_dev[: self.batches[-1].d1]
+
+    def tail_counts(self, group: int, nc_pad: int) -> torch.Tensor | None:
+        """The real chunk counts of the group's tail ranges at chunk bound ``nc_pad`` (``None`` without them: the
+        tail passes form them on the device)."""
+        at = self.tail_at.get((group, nc_pad))
+        return None if at is None else self.words_dev[at[0] : at[0] + at[1]]
+
+    def take(self, group: int, states: torch.Tensor) -> torch.Tensor:
+        """The group's blocks of the whole problem's states ``[NSEG, ...]`` in the group's block order: a view where
+        they are one run, else gathered by index."""
+        first = self.blocks[group]
+        if first is not None:
+            return states[first : first + self.batches[group].N * self.P]
+        return states.index_select(0, self.block_index(group))
+
+    def block_index(self, group: int) -> torch.Tensor:
+        at = self.index_at[group]
+        return self.index_dev[at[0] : at[0] + at[1]]
+
+
+def _host_packing(p: Plan, arena: KdaArena, lengths: tuple[int, ...]) -> _Packing:
+    """The host part of :class:`_Packing` for ``lengths`` (checked) on plan ``p`` under the batched ``arena``."""
+    batches = p.batches(arena, lengths)
+    ranks = _chain_ranks(lengths) if p.recur == "seg" else None
+    words = list(lengths)
+    tail_at: dict[tuple[int, int], tuple[int, int]] = {}
+    index: list[int] = []
+    index_at: dict[int, tuple[int, int]] = {}
+    blocks: list[int | None] = []
+    for i, b in enumerate(batches):
+        if arena.tail_passes > 1:
+            # the device rule of _tail_passes, clamp(NC_real - c0, 0, ceil(NC_pad / B)), at the group's real chunks
+            real = sum(-(-n // BT) for n in lengths[b.d0 : b.d1])
+            for nc_pad in sorted({b.NC_pad, b.NC_pad_tape}):
+                ranges = _tail_ranges(nc_pad, arena.tail_passes)
+                tail_at[(i, nc_pad)] = (len(words), len(ranges))
+                words += [min(max(real - c0, 0), ranges[0][1]) for c0, _n in ranges]
+        if ranks is None:
+            blocks.append(None)
+            continue
+        # the whole problem's first block of each of the group's chains, in the group's own rank order
+        starts = [p.P * ranks[b.d0 + d] for d in _seq_order(lengths[b.d0 : b.d1])]
+        if starts == list(range(starts[0], starts[0] + p.P * len(starts), p.P)):
+            blocks.append(starts[0])
+        else:
+            blocks.append(None)
+            index_at[i] = (len(index), p.P * len(starts))
+            index += [s + j for s in starts for j in range(p.P)]
+    return _Packing(
+        batches, p.P, tuple(blocks), tuple(words), tail_at, tuple(index), index_at
+    )
+
+
 class KdaWorkspace:
     """One arena of internal-layout intermediates for one problem shape, allocated once and reused by every call.
 
@@ -1924,19 +2080,16 @@ class KdaWorkspace:
             self.bytes, dtype=torch.uint8, device=self.device
         )
         self._views_cache: dict[str, types.SimpleNamespace] = {}
-        self._eye: torch.Tensor | None = None
-        # the carry launches of this arena under the overlap pair (next_epoch): a one-entry list, shared by every
+        # the eye (eye / flags) and the carry launches' epoch counter (next_epoch): one-entry lists, shared by every
         # view of this arena (with_plan, batch_view), since the flags the epochs stamp live in the shared eye
+        self._eye_box: list[torch.Tensor | None] = [None]
         self._epoch: list[int] = [0]
-        # the tail split's per-call constants (tail_constants), allocated once per workspace
-        self._tail_cache: dict[
-            tuple[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-        ] = {}
-        # the batched option's views of this arena per group geometry, and its groups per doc_lengths
+        # the batched option's views of this arena per group geometry, and per doc_lengths its groups with their
+        # host-derived state blocks and tail counts and the device copy of those integers (None until a call needs
+        # it); the doc_lengths a CUDA-graph capture used, whose entries the cache keeps for the workspace's lifetime
         self._batch_views: dict[tuple[int, int, int], KdaWorkspace] = {}
-        self._doc_cache: dict[
-            tuple[int, ...], tuple[tuple[Batch, ...], torch.Tensor]
-        ] = {}
+        self._doc_cache: dict[tuple[int, ...], _Packing] = {}
+        self._doc_graphs: set[tuple[int, ...]] = set()
 
     def views(self, mode: str) -> types.SimpleNamespace:
         """The buffer views of layout ``mode`` on this arena (``ValueError`` when the arena is too small for it);
@@ -1984,9 +2137,12 @@ class KdaWorkspace:
         """FP32 ``[128, 128]`` buffer outside the arena, built as the identity: the operand the segmented walks
         take as the initial state of the transfer walk (the kernels form the identity themselves and never read
         it), and the home of the overlap pair's release flags (:attr:`flags`)."""
-        if self._eye is None:
-            self._eye = torch.eye(D, dtype=torch.float32, device=self.device)
-        return self._eye
+        eye = self._eye_box[0]
+        if eye is None:
+            eye = self._eye_box[0] = torch.eye(
+                D, dtype=torch.float32, device=self.device
+            )
+        return eye
 
     @property
     def flags(self) -> torch.Tensor:
@@ -2002,25 +2158,6 @@ class KdaWorkspace:
         expects."""
         self._epoch[0] += 1
         return self._epoch[0]
-
-    def tail_constants(
-        self, passes: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """The tail split's int32 device constants for ``passes`` passes over this plan's chunk bound: the first
-        chunk and the length of every range (:func:`_tail_ranges`) and the buffer the real-chunk counts of the
-        ranges are computed into per call (three tiny in-place ops; nothing is allocated per call)."""
-        key = (self.plan.NC_pad, passes)
-        consts = self._tail_cache.get(key)
-        if consts is None:
-            ranges = _tail_ranges(self.plan.NC_pad, passes)
-            c0 = torch.tensor(
-                [r[0] for r in ranges], dtype=torch.int32, device=self.device
-            )
-            ln = torch.tensor(
-                [r[1] for r in ranges], dtype=torch.int32, device=self.device
-            )
-            consts = self._tail_cache[key] = (c0, ln, torch.empty_like(c0))
-        return consts
 
     @property
     def fwd(self) -> types.SimpleNamespace:
@@ -2095,16 +2232,15 @@ class KdaWorkspace:
     def _view(self, plan: Plan) -> KdaWorkspace:
         """A view of this arena under ``plan``: the same bytes, ``eye`` / ``flags`` and epoch counter (the overlap
         pair's release flags live in the eye, stamped with the launch's epoch: views sharing the flags must share
-        the counter, or a later launch's pass 2 could pass its wait on a flag an earlier one left), with view and
-        tail-constant caches of its own."""
-        self.eye  # noqa: B018  (materialized before the copy: one identity and one flag word set for every view)
+        the counter, or a later launch's pass 2 could pass its wait on a flag an earlier one left), with a view
+        cache of its own."""
         other = KdaWorkspace.__new__(KdaWorkspace)
         other.__dict__.update(self.__dict__)
         other.plan = plan
         other._views_cache = {}
-        other._tail_cache = {}
         other._batch_views = {}
         other._doc_cache = {}
+        other._doc_graphs = set()
         return other
 
     def with_plan(self, plan: Plan) -> KdaWorkspace:
@@ -2135,18 +2271,42 @@ class KdaWorkspace:
         """The document groups of a call on this workspace and the device copy of ``doc_lengths`` (for the
         asynchronous check against ``cu_seqlens``), ``None`` when the option is not batched (``doc_lengths`` is then
         unused); ``ValueError`` when it is and ``doc_lengths`` is missing or mismatches the problem.  Cached per
-        ``doc_lengths`` (the last few packings)."""
+        ``doc_lengths`` (the last few packings) with what the calls derive from them on the host (:class:`_Packing`:
+        the groups' state blocks by chain rank, the tail passes' chunk counts), whose device copy rides with the
+        lengths'.  The copy goes from pinned host memory on the current stream without blocking: the host never
+        waits for the device.  Under CUDA-graph capture the copy must already be cached (``RuntimeError``
+        otherwise): a captured copy would read a host buffer the graph does not own, so a batched call is captured
+        on a caller-owned workspace that ran these ``doc_lengths`` once before the capture.  A captured graph reads
+        the copy at each replay, so the cache keeps the packings a capture used for the workspace's lifetime (as
+        the arena the graph also reads) and evicts only the others."""
+        packing = self._packing(doc_lengths)
+        return None if packing is None else (packing.batches, packing.lengths)
+
+    def _packing(self, doc_lengths: Sequence[int] | None) -> _Packing | None:
+        """:meth:`batches` with everything the calls derive from ``doc_lengths`` (:class:`_Packing`)."""
         if not self.arena_option.batched:
             return None
         key = self.plan.check_doc_lengths(doc_lengths)
+        capturing = torch.cuda.is_current_stream_capturing()
         entry = self._doc_cache.get(key)
         if entry is None:
-            if len(self._doc_cache) >= 8:
-                self._doc_cache.pop(next(iter(self._doc_cache)))
-            entry = self._doc_cache[key] = (
-                self.plan.batches(self.arena_option, key),
-                torch.tensor(key, dtype=torch.int32, device=self.device),
-            )
+            entry = _host_packing(self.plan, self.arena_option, key)
+        if entry.words_dev is None:
+            if capturing:
+                raise RuntimeError(
+                    "KdaWorkspace: a batched arena under CUDA-graph capture needs the device copy of these "
+                    "doc_lengths made before the capture: pass a caller-owned workspace and run it once with "
+                    "these doc_lengths outside the capture"
+                )
+            entry = entry.to(self.device)
+        if key not in self._doc_cache:
+            # a new packing evicts the oldest of 8 cached ones no capture used (a graph reads its copy at each replay)
+            free = [k for k in self._doc_cache if k not in self._doc_graphs]
+            if len(free) >= 8:
+                self._doc_cache.pop(free[0])
+        self._doc_cache[key] = entry
+        if capturing:
+            self._doc_graphs.add(key)
         return entry
 
     def paths(self) -> tuple[str, ...]:
@@ -2199,6 +2359,107 @@ class KdaWorkspace:
         )
 
 
+# The workspaces of the calls made without one (the default entry), per (device, stream, problem, arena option and,
+# under a batched option, doc_lengths): the plan, the layout views and the groups' plans are built once, while the
+# arena storage, the eye and the device copy of doc_lengths are allocated at the start of each call and freed at
+# its end (:func:`_entry_acquire` / :func:`_entry_release`).  Between calls only host objects stay; a call's arena
+# is the same per-call allocation as before, from the same caching allocator on the same stream.  Calls on another
+# stream take a workspace of their own, so no two queued calls share an eye.
+_ENTRY_KEYS = 64
+_ENTRY_PER_KEY = 2
+_entry_pool: collections.OrderedDict[tuple[Any, ...], list[KdaWorkspace]] = (
+    collections.OrderedDict()
+)
+_entry_lock = threading.Lock()
+
+
+def _entry_acquire(
+    S: int,
+    N: int,
+    H: int,
+    device: torch.device,
+    *,
+    backward: bool,
+    save_mode: str,
+    arena: KdaArena | None,
+    doc_lengths: Sequence[int] | None,
+) -> tuple[KdaWorkspace, tuple[Any, ...] | None]:
+    """The workspace of one call without a workspace argument, with its arena storage allocated, and its pool key
+    (``None``: a workspace of this call alone, under CUDA-graph capture, whose device allocations belong to the
+    graph; a batched arena is refused there, :meth:`KdaWorkspace.batches`)."""
+    if torch.cuda.is_current_stream_capturing():
+        ws = KdaWorkspace.for_problem(
+            S,
+            N,
+            H,
+            device,
+            backward=backward,
+            save_mode=save_mode,
+            arena=arena,
+            doc_lengths=doc_lengths,
+        )
+        return ws, None
+    index = _device_index(device)
+    option = KdaArena() if arena is None else arena
+    lengths = (
+        tuple(int(x) for x in doc_lengths)
+        if option.batched and doc_lengths is not None
+        else None
+    )
+    key = (
+        index,
+        torch.cuda.current_stream(index).cuda_stream,
+        S,
+        N,
+        H,
+        backward,
+        save_mode,
+        option,
+        lengths,
+    )
+    with _entry_lock:
+        free = _entry_pool.get(key)
+        ws = free.pop() if free else None
+    if ws is None:
+        ws = KdaWorkspace.for_problem(
+            S,
+            N,
+            H,
+            device,
+            backward=backward,
+            save_mode=save_mode,
+            arena=option,
+            doc_lengths=doc_lengths,
+        )
+    else:
+        if doc_lengths is not None and lengths is None:
+            # checked per call, as a new workspace checks them (unused off the batched option)
+            ws.plan.check_doc_lengths(doc_lengths)
+        ws.arena.untyped_storage().resize_(ws.bytes)
+    return ws, key
+
+
+def _entry_release(ws: KdaWorkspace, key: tuple[Any, ...] | None) -> None:
+    """Free the device memory of a call's workspace (arena storage, eye, the device copies of doc_lengths and of
+    what derives from them: the caching allocator takes them back on the call's stream, as when a per-call tensor
+    dies) and keep the rest for the next call with the same key."""
+    if key is None:
+        return
+    ws.arena.untyped_storage().resize_(0)
+    # the next call builds a fresh eye (flags 0 / the identity's 1.0f), so its epochs restart below any flag value
+    ws._eye_box[0] = None
+    ws._epoch[0] = 0
+    ws._doc_cache = {k: packing.on_host() for k, packing in ws._doc_cache.items()}
+    with _entry_lock:
+        free = _entry_pool.setdefault(key, [])
+        _entry_pool.move_to_end(key)
+        if len(free) < _ENTRY_PER_KEY:
+            free.append(ws)
+        while len(_entry_pool) > _ENTRY_KEYS:
+            _entry_pool.popitem(last=False)
+
+
+@contextlib.contextmanager
 def _workspace(
     workspace: KdaWorkspace | None,
     S: int,
@@ -2210,9 +2471,11 @@ def _workspace(
     save_mode: str | None = None,
     arena: KdaArena | None = None,
     doc_lengths: Sequence[int] | None = None,
-) -> KdaWorkspace:
+) -> Iterator[KdaWorkspace]:
+    """The workspace of one call: the caller's (checked against the problem) or, without one, the call's own,
+    whose device memory lives for the call alone (:func:`_entry_acquire`)."""
     if workspace is None:
-        return KdaWorkspace.for_problem(
+        ws, key = _entry_acquire(
             S,
             N,
             H,
@@ -2222,6 +2485,11 @@ def _workspace(
             arena=arena,
             doc_lengths=doc_lengths,
         )
+        try:
+            yield ws
+        finally:
+            _entry_release(ws, key)
+        return
     if arena is not None and arena != workspace.arena_option:
         raise ValueError(
             f"workspace: allocated with arena={workspace.arena_option}, the call asks for arena={arena}; pass "
@@ -2241,7 +2509,7 @@ def _workspace(
         raise ValueError(
             "workspace: allocated with backward=False; the backward needs its layout"
         )
-    return workspace
+    yield workspace
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -2393,22 +2661,6 @@ def _assert_doc_lengths(cu_seqlens: torch.Tensor, lengths: torch.Tensor) -> None
         (cu_seqlens[1:] - cu_seqlens[:-1]).eq(lengths).all(),
         "cake_kda_train: doc_lengths do not match cu_seqlens",
     )
-
-
-def _chain_ranks(seq_order: torch.Tensor) -> torch.Tensor:
-    """Document -> its (document, head) chain rank in the layout table's longest-first order (the inverse of
-    ``seq_order``, which lists the documents by rank): the segmented route's state blocks are laid out by rank,
-    ``P`` per chain."""
-    return torch.argsort(seq_order)
-
-
-def _block_index(
-    ranks: torch.Tensor, seq_order_b: torch.Tensor, d0: int, P: int
-) -> torch.Tensor:
-    """The whole problem's state-block indices of one document group's blocks, in the group's own block order: the
-    group's rank ``r`` is document ``d0 + seq_order_b[r]``, whose ``P`` blocks start at ``P * ranks[document]``."""
-    starts = P * ranks.index_select(0, seq_order_b.to(torch.int64) + d0)
-    return (starts.unsqueeze(1) + torch.arange(P, device=ranks.device)).reshape(-1)
 
 
 def _fwd_intra(
@@ -2591,6 +2843,7 @@ def _tail_passes(
     *,
     path: str,
     h: torch.Tensor,
+    nc_vec: torch.Tensor | None = None,
 ) -> None:
     """Steps 6-8 of the backward (the fused gradient, GLM intra and, where it launches, the gate epilogue) once per tail range
     (:func:`_tail_ranges`) of a lean workspace with ``tail_passes > 1``.  Per range: the whole-sequence arena
@@ -2599,16 +2852,24 @@ def _tail_passes(
     range's real chunks (``num_seqs = 0`` makes the fused gradient read that entry as its item bound), the lean
     layout's per-pass buffers as they are (sized for one range) and the token tensors whole (every kernel reaches
     them through the absolute ``chunk_bos``); the grids are the plan's rules at the range's chunk count.  The same
-    kernels address the same bytes as in one pass, so the gradients are bitwise the same."""
+    kernels address the same bytes as in one pass, so the gradients are bitwise the same.  ``nc_vec`` is the real
+    chunk count of every range where the host has it (a batched call's groups: from ``doc_lengths``,
+    :class:`_Packing`), else formed on the device."""
     p = ws.plan
-    passes = ws.arena_option.tail_passes
-    c0_vec, len_vec, nc_vec = ws.tail_constants(passes)
-    # the real chunks of every range: clamp(NC_real - c0, 0, length), NC_real = seq_chunk_start[N]
-    torch.sub(tables[2][p.N : p.N + 1], c0_vec, out=nc_vec)
-    nc_vec.clamp_(min=0)
-    torch.minimum(nc_vec, len_vec, out=nc_vec)
+    ranges = _tail_ranges(p.NC_pad, ws.arena_option.tail_passes)
+    # without the host's counts (a lean call that is not batched has no doc_lengths), the real chunks of every range
+    # on the device: clamp(NC_real - c0, 0, ceil(NC_pad / B)), NC_real = seq_chunk_start[N] <= NC_pad, so the
+    # clipped last range needs no bound of its own; the first chunks come from an arange (the host does not wait
+    # for the device)
+    if nc_vec is None:
+        nc_vec = torch.sub(
+            tables[2][p.N : p.N + 1],
+            torch.arange(
+                0, p.NC_pad, ranges[0][1], dtype=torch.int32, device=tables[2].device
+            ),
+        ).clamp_(0, ranges[0][1])
     chunk_bos, chunk_len = tables[0], tables[1]
-    for i, (c0, length) in enumerate(_tail_ranges(p.NC_pad, passes)):
+    for i, (c0, length) in enumerate(ranges):
         rows = BT * c0
         pass_values = {
             **values,
@@ -2763,7 +3024,9 @@ def chunk_kda_fwd(
     no internal copies (``write_int = 0``, :meth:`Plan.internal_rows`); every other forward keeps the internal-row
     programs and the copies.  The ``h`` / ``v_new`` tapes are written only in tape mode.  ``workspace``
     (:class:`KdaWorkspace`, the forward layout at least)
-    is reused; without one a workspace is allocated for this call.  ``save_mode=None`` takes the workspace's
+    is reused; without one the call allocates its arena and frees it on return (the plan and the layout views of
+    a repeated problem are reused, so the host cost is close to a caller-owned workspace's: the call adds the
+    arena's allocation and the eye's rebuild).  ``save_mode=None`` takes the workspace's
     default.  ``arena`` (:class:`KdaArena`) is the lower-memory arena option: the forward's layout is the same
     under every option (``None`` takes the workspace's; a differing option on a given workspace is refused).
 
@@ -2773,11 +3036,14 @@ def chunk_kda_fwd(
     group's tables (the intra program writes them, or the table program per group), the whole token tensors
     (absolute ``chunk_bos``), the group's slices of the tape and the group's state blocks.  With
     ``save_for_backward`` the whole problem's tables are written first by the saved-set paths' table program (the
-    saved set carries them, as always), and the groups' saved states are scattered into the whole problem's by
-    chain rank.  The outputs are bitwise the whole problem's (:class:`KdaArena` on the sign of exact zeros).
+    saved set carries them, as always), and the groups' saved states go into the whole problem's by chain rank
+    (ranked on the host from ``doc_lengths`` by the tables' rule): where a group's blocks are one run of them, the
+    carry writes its carried states straight into the saved ``hseg`` and its offsets / transfers are contiguous
+    copies; otherwise they are scattered by index.  The outputs are bitwise the whole problem's (:class:`KdaArena`
+    on the sign of exact zeros).
     """
     q, k, v, g, beta, S, N, H, batched = _operands(q, k, v, g, beta, cu_seqlens)
-    ws = _workspace(
+    with _workspace(
         workspace,
         S,
         N,
@@ -2787,8 +3053,41 @@ def chunk_kda_fwd(
         save_mode=save_mode,
         arena=arena,
         doc_lengths=doc_lengths,
-    )
+    ) as ws:
+        out, saved = _forward(
+            ws,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            cu_seqlens,
+            scale=scale,
+            save_for_backward=save_for_backward,
+            save_mode=save_mode,
+            doc_lengths=doc_lengths,
+        )
+    return _ranked(out, batched), saved
+
+
+def _forward(
+    ws: KdaWorkspace,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    *,
+    scale: float,
+    save_for_backward: bool,
+    save_mode: str | None,
+    doc_lengths: Sequence[int] | None,
+) -> tuple[torch.Tensor, KdaChunkSaved | None]:
+    """:func:`chunk_kda_fwd` on the call's workspace, the operands without their batch axis: ``out`` ``[S, H, 128]``
+    and the saved set."""
     p = ws.plan
+    S, N, H = p.S, p.N, p.H
     save_mode = ws.save_mode if save_mode is None else save_mode
     if save_mode not in SAVE_MODES:
         raise ValueError(
@@ -2803,7 +3102,7 @@ def chunk_kda_fwd(
     seg = p.recur == "seg"
     # light (version 4): the segment-boundary states become per-call saved tensors when the size rule holds
     save_states = seg and save_for_backward and not tape and p.seg_save
-    groups = ws.batches(doc_lengths)
+    packing = ws._packing(doc_lengths)
     path = "fwd" if save_for_backward else "fwd_nosave"
     out = _alloc((S, H, D), torch.bfloat16, ws.device)
     aqk_ext = akk_ext = (
@@ -2835,7 +3134,7 @@ def chunk_kda_fwd(
         seg_state = _alloc((2, p.NSEG, H, D, D), torch.float32, ws.device)
         hseg = _alloc((p.NSEG, H, D, D), torch.float32, ws.device)
     elif tape and seg:
-        if groups is None:
+        if packing is None:
             seg_state = _alloc((2, p.NSEG, H, D, D), torch.float32, ws.device)
             seg_m = seg_state[1]
         else:  # the groups' transfers come out of their arena blocks
@@ -2852,7 +3151,7 @@ def chunk_kda_fwd(
         "beta": beta,
         "scale": float(scale),
     }
-    if groups is None:
+    if packing is None:
         a = ws.views(mode)
         tables = _tables(ws, cu_seqlens, path)
         _forward_launches(
@@ -2874,22 +3173,21 @@ def chunk_kda_fwd(
             **common,
         )
     else:
-        batches, lengths = groups
-        views_b = [(batch, ws.batch_view(batch, tape=row_slices)) for batch in batches]
+        views_b = [
+            (batch, ws.batch_view(batch, tape=row_slices)) for batch in packing.batches
+        ]
         for _batch, ws_b in views_b:
             ws_b.views(
                 mode
             )  # every group's layout fits the arena, or ValueError before any launch
-        _assert_doc_lengths(cu_seqlens, lengths)
+        _assert_doc_lengths(cu_seqlens, packing.lengths)
         # the whole problem's tables for the saved set, by the saved-set paths' table program (the forward's intra
         # program writes the tables of its own call only: here the groups')
         tables = _tables(ws, cu_seqlens, "light") if save_for_backward else None
-        ranks = (
-            _chain_ranks(tables[3])
-            if seg and (save_states or seg_m is not None)
-            else None
-        )
-        for batch, ws_b in views_b:
+        # the groups' state blocks go into the whole problem's saved states by chain rank (from doc_lengths on the
+        # host, :class:`_Packing`)
+        scatter = seg and (save_states or seg_m is not None)
+        for i, (batch, ws_b) in enumerate(views_b):
             pb = ws_b.plan
             a = ws_b.views(mode)
             cu_b = cu_seqlens[batch.d0 : batch.d1 + 1]
@@ -2904,6 +3202,11 @@ def chunk_kda_fwd(
                 h_b, v_new_b = a.h, a.v_new
             # the group's slices of the whole problem's saved rows (the tape geometry: they end inside it)
             rows_b = slice(BT * batch.c0, BT * (batch.c0 + pb.NC_pad))
+            # where the group's blocks are one run of the saved states, the carry writes the carried states straight
+            # into the saved hseg (pass 2 reads them there); the offsets / transfers stay in the arena, since pass
+            # 1 strides its two halves by the group's segment count
+            first = packing.blocks[i] if scatter else None
+            run = None if first is None else slice(first, first + pb.NSEG)
             _forward_launches(
                 ws_b,
                 a,
@@ -2912,7 +3215,9 @@ def chunk_kda_fwd(
                 h=h_b,
                 v_new=v_new_b,
                 seg_state=a.seg_state if seg else None,
-                hseg=a.hseg if seg else None,
+                hseg=(hseg[run] if save_states and run is not None else a.hseg)
+                if seg
+                else None,
                 aqk_ext=a.aqk_int if aqk_ext is None else aqk_ext,
                 akk_ext=a.aqk_int if akk_ext is None else akk_ext,
                 qg=None if qg_saved is None else qg_saved[rows_b],
@@ -2920,15 +3225,22 @@ def chunk_kda_fwd(
                 u=None if u_saved is None else u_saved[rows_b],
                 **common,
             )
-            if (
-                ranks is not None
-            ):  # the group's state blocks into the whole problem's saved states, by chain rank
-                index = _block_index(ranks, tables_b[3], batch.d0, p.P)
+            if run is not None:  # one run: contiguous copies of the halves
+                if save_states:
+                    seg_state[0, run].copy_(a.seg_state[0])
+                    seg_state[1, run].copy_(a.seg_state[1])
+                else:
+                    seg_m[run].copy_(a.seg_state[1])
+            elif scatter:  # the group's blocks scattered by index
+                index = packing.block_index(i)
                 if save_states:
                     hseg.index_copy_(0, index, a.hseg)
                     seg_state.index_copy_(1, index, a.seg_state)
                 else:
                     seg_m.index_copy_(0, index, a.seg_state[1])
+        if tape:  # the last group's slice ends inside the whole tape: no group writes the v_new pad rows after it
+            last, ws_last = views_b[-1]
+            v_new[BT * (last.c0 + ws_last.plan.NC_pad) :].zero_()
     saved = None
     if save_for_backward:
         if tape:
@@ -2961,7 +3273,7 @@ def chunk_kda_fwd(
                 w=w_saved,
                 u=u_saved,
             )
-    return _ranked(out, batched), saved
+    return out, saved
 
 
 def _backward_launches(
@@ -2995,12 +3307,15 @@ def _backward_launches(
     qg: torch.Tensor | None = None,
     w: torch.Tensor | None = None,
     u: torch.Tensor | None = None,
+    nc_vec: torch.Tensor | None = None,
 ) -> None:
     """The launches of one backward on ``ws`` (the whole problem, or one document group through its view, its
-    ``cu_seqlens`` slice, its tables, its tape slices, its slices of the saved ``qg`` / ``w`` / ``u`` and its
-    gathered states; the token tensors, the saved ``Aqk`` / ``Akk`` and the gradients always whole): the replay's
-    intra recompute, the prep, WY, the recurrence recompute, dA / dv, the adjoint recurrence and the tail (once,
-    or per range of a lean workspace's ``tail_passes``), each where the path and the plan dispatch it."""
+    ``cu_seqlens`` slice, its tables, its tape slices, its slices of the saved ``qg`` / ``w`` / ``u``, its blocks of
+    the saved states and its tail counts ``nc_vec``; the token tensors, the saved ``Aqk`` / ``Akk`` and the
+    gradients always whole): the replay's intra recompute, the prep, WY, the recurrence recompute, dA / dv, the
+    adjoint recurrence and the tail (once, or per range of a lean workspace's ``tail_passes``), each where the path
+    and the plan dispatch it.  ``seg_m`` is the forward's transfers where they do not come from ``seg_state[1]``
+    (a tape set's ``seg_m``, a group's blocks of the saved ``seg_state[1]``)."""
     p = ws.plan
     b = views
     # The operand sources of the backward programs: the saved Aqk / Akk token rows and the user's dout on the
@@ -3064,11 +3379,12 @@ def _backward_launches(
         )
     if p.dispatched("dav", path):
         ws.run("dav", values, path=path)
-    # the segmented dhu's reverse carry reads the forward's transfers: the saved seg_m (tape), the saved
-    # seg_state[1] (version 4 with the states) or the recompute's (the arena's seg_state[1])
+    # the segmented dhu's reverse carry reads the forward's transfers: seg_m where given (the saved seg_m of a tape
+    # set, a group's blocks of the saved transfers), else seg_state[1] (the saved one of a version-4 set with the
+    # states, or the recompute's: the arena's)
     transfers = None
     if p.recur == "seg":
-        transfers = (seg_m if tape else seg_state[1]).view(-1, D, D)
+        transfers = (seg_m if seg_m is not None else seg_state[1]).view(-1, D, D)
     _adjoint_recurrence(ws, b, values, path=path, seg_m=transfers)
     if ws.arena_option.tail_passes == 1:
         ws.run("dqkg", values, path=path)
@@ -3078,7 +3394,7 @@ def _backward_launches(
         ):  # not on the fused GLM intra program's architectures
             ws.run("gate_epilogue", values, path=path)
     else:
-        _tail_passes(ws, b, values, tables, path=path, h=h)
+        _tail_passes(ws, b, values, tables, path=path, h=h, nc_vec=nc_vec)
 
 
 def chunk_kda_bwd(
@@ -3111,7 +3427,8 @@ def chunk_kda_bwd(
     adjoint recurrence, the fused dq / dk / dg, GLM intra and [the gate epilogue], where the bracketed ones depend
     on the path and the row (``Plan.launch_count(path)``; the tables are rebuilt when the saved set carries
     none).  The backward writes nothing into the saved set.  ``workspace`` (:class:`KdaWorkspace` with the
-    backward layout) is reused; without one a workspace is allocated for this call.  ``arena``
+    backward layout) is reused; without one the call allocates its arena and frees it on return, as the forward
+    does.  ``arena``
     (:class:`KdaArena`): the lower-memory option of that per-call workspace (``None`` takes a given workspace's
     option; a differing one is refused); a lean per-call arena is sized for the saved set's version (the tape
     layouts for a version-2 set).  A lean workspace serves no replay (``saved=None``): the lean layouts and the
@@ -3122,9 +3439,11 @@ def chunk_kda_bwd(
     (:meth:`Plan.batches`) through a view of the arena sized for the group: the group's ``cu_seqlens`` slice, the
     group's own tables (the table program per group: the saved set's tables describe the whole problem), the whole
     token tensors and gradients (absolute ``chunk_bos``), the group's slices of a saved tape, its state blocks
-    gathered from the saved states by chain rank (``light_states``, ``tape``) or recomputed in its view (``light``,
-    ``replay``: the replay runs group by group on a workspace that is not lean).  The gradients are bitwise the
-    whole problem's (:class:`KdaArena` on the sign of exact zeros).
+    taken from the saved states by chain rank (``light_states``, ``tape``: ranked on the host from ``doc_lengths``
+    by the tables' rule; views where the group's blocks are one run of the saved ones, else gathered by index) or
+    recomputed in its view (``light``, ``replay``: the replay runs group by group on a workspace that is not lean),
+    and on a lean workspace its tail passes' chunk counts from the host.  The gradients are bitwise the whole
+    problem's (:class:`KdaArena` on the sign of exact zeros).
     """
     q, k, v, g, beta, S, N, H, batched = _operands(q, k, v, g, beta, cu_seqlens)
     dout = _squeeze_batch(dout, "dout", 3)
@@ -3149,7 +3468,7 @@ def chunk_kda_bwd(
     lean_tape = (
         option.lean and saved is not None and saved.version == SAVED_VERSION_TAPE
     )
-    ws = _workspace(
+    with _workspace(
         workspace,
         S,
         N,
@@ -3159,8 +3478,41 @@ def chunk_kda_bwd(
         save_mode="tape" if lean_tape else None,
         arena=arena,
         doc_lengths=doc_lengths,
-    )
+    ) as ws:
+        grads = _backward(
+            ws,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            cu_seqlens,
+            dout,
+            saved=saved,
+            scale=scale,
+            doc_lengths=doc_lengths,
+        )
+    return tuple(_ranked(x, batched) for x in grads)
+
+
+def _backward(
+    ws: KdaWorkspace,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    dout: torch.Tensor,
+    *,
+    saved: KdaChunkSaved | None,
+    scale: float,
+    doc_lengths: Sequence[int] | None,
+) -> tuple[torch.Tensor, ...]:
+    """:func:`chunk_kda_bwd` on the call's workspace, the operands without their batch axis: ``(dq, dk, dv, dbeta,
+    dg)``."""
     p = ws.plan
+    S, N, H = p.S, p.N, p.H
     seg = p.recur == "seg"
     replay = saved is None
     tape = False
@@ -3264,7 +3616,7 @@ def chunk_kda_bwd(
     mode = "bwd_tape" if (tape or tape_ws) else "bwd"
     if replay:
         mode = {"bwd": "replay", "bwd_tape": "replay_tape"}[mode]
-    groups = ws.batches(doc_lengths)
+    packing = ws._packing(doc_lengths)
     dq = _alloc((S, H, D), torch.bfloat16, ws.device)
     dk = _alloc((S, H, D), torch.bfloat16, ws.device)
     dv = _alloc((S, H, D), torch.bfloat16, ws.device)
@@ -3294,7 +3646,7 @@ def chunk_kda_bwd(
         "dbeta": dbeta,
         "scale": float(scale),
     }
-    if groups is None:
+    if packing is None:
         tables = (
             _tables(ws, cu_seqlens, path)
             if (replay or saved.tables is None)
@@ -3326,26 +3678,20 @@ def chunk_kda_bwd(
             **common,
         )
     else:
-        batches, lengths = groups
         # the groups' views of whole-problem row tensors (the saved tape, the saved qg / w / u) take the tape geometry
         row_slices = tape or qg_saved is not None or w_saved is not None
-        views_b = [(batch, ws.batch_view(batch, tape=row_slices)) for batch in batches]
+        views_b = [
+            (batch, ws.batch_view(batch, tape=row_slices)) for batch in packing.batches
+        ]
         for _batch, ws_b in views_b:
             ws_b.views(
                 mode
             )  # every group's layout fits the arena, or ValueError before any launch
-        _assert_doc_lengths(cu_seqlens, lengths)
-        # the groups build their own tables; the whole problem's are read for the chain ranks of the saved states
-        gather = seg and not replay and (tape or light_states)
-        tables = None
-        if gather:
-            tables = (
-                saved.tables
-                if saved.tables is not None
-                else _tables(ws, cu_seqlens, path)
-            )
-        ranks = _chain_ranks(tables[3]) if gather else None
-        for batch, ws_b in views_b:
+        _assert_doc_lengths(cu_seqlens, packing.lengths)
+        # the groups build their own tables; their blocks of the saved states come by chain rank (from doc_lengths
+        # on the host, :class:`_Packing`)
+        from_saved = seg and not replay and (tape or light_states)
+        for i, (batch, ws_b) in enumerate(views_b):
             pb = ws_b.plan
             b = ws_b.views(mode)
             cu_b = cu_seqlens[batch.d0 : batch.d1 + 1]
@@ -3361,13 +3707,14 @@ def chunk_kda_bwd(
             seg_state_b = b.seg_state if seg else None
             hseg_b = b.hseg if seg else None
             seg_m_b = None
-            if ranks is not None:  # the group's saved states, gathered by chain rank
-                index = _block_index(ranks, tables_b[3], batch.d0, p.P)
+            if from_saved:  # the group's saved states: views where its blocks are one run, else gathered by index
                 if tape:
-                    seg_m_b = saved.seg_m.index_select(0, index)
+                    seg_m_b = packing.take(i, saved.seg_m)
                 else:
-                    seg_state_b = saved.seg_state.index_select(1, index)
-                    hseg_b = saved.hseg.index_select(0, index)
+                    # pass 2 reads hseg alone and never touches its seg_state at write_ht = 0 (the arena's block
+                    # serves there); the reverse carry reads the transfers as seg_m
+                    hseg_b = packing.take(i, saved.hseg)
+                    seg_m_b = packing.take(i, saved.seg_state[1])
             rows_b = slice(BT * batch.c0, BT * (batch.c0 + pb.NC_pad))
             _backward_launches(
                 ws_b,
@@ -3382,9 +3729,10 @@ def chunk_kda_bwd(
                 qg=None if qg_saved is None else qg_saved[rows_b],
                 w=None if w_saved is None else w_saved[rows_b],
                 u=None if u_saved is None else u_saved[rows_b],
+                nc_vec=packing.tail_counts(i, pb.NC_pad),
                 **common,
             )
-    return tuple(_ranked(x, batched) for x in (dq, dk, dv, dbeta, dg))
+    return dq, dk, dv, dbeta, dg
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -3534,8 +3882,10 @@ def chunk_kda(
     With a ``workspace`` the forward and the backward both run in it (the backward overwrites the forward's
     intermediates, not its saved set, which autograd holds) as long as the caller keeps it: the autograd node
     holds it weakly, so a workspace created for the call and dropped after the forward is freed at once, and the
-    backward allocates its own.  Without one each call allocates its own, for the forward and again for the
-    backward; the arenas are not zero-filled.  After a forward under ``torch.utils.checkpoint``
+    backward allocates its own.  Without one the forward and the backward each allocate an arena for the call and
+    free it on return (not zero-filled); a repeated problem reuses its plan and layout views, so the host cost per
+    call is close to a caller-owned workspace's (the call adds the arena's allocation and the eye's rebuild), and
+    no option (``arena``, ``doc_lengths``) makes the host wait for the device.  After a forward under ``torch.utils.checkpoint``
     (``use_reentrant=False``) the node keeps no arena and no saved tensor alive.  ``save_mode`` (``None``: the
     workspace's default, ``"light"`` without one) selects the saved set's version.  ``arena`` (:class:`KdaArena`,
     ``None``: the workspace's option, off without one) is the lower-memory arena option; the node records it, so

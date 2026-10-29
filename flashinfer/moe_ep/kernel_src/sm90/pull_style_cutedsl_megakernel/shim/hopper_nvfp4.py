@@ -115,8 +115,9 @@ def _validate_complete_nvfp4_tactic(
     """Validate one complete external fused tactic through the tuner schema.
 
     The MXFP4 schema fields are followed by the NVFP4 conversion fields
-    (``compact_pull_buffer``, ``nvfp4_lut_replicas``, ``nvfp4_lut_map``); a tactic without them selects the full pull buffer and the
-    8-replica lane-quad table.
+    (``compact_pull_buffer``, ``nvfp4_lut_replicas``, ``nvfp4_lut_map``,
+    ``nvfp4_sf_stages``); a tactic without them selects the full pull buffer,
+    8-replica lane-quad table and lockstep scale slots.
     """
 
     if not isinstance(knobs, dict):
@@ -147,6 +148,8 @@ class MegaMoEHopperNvfp4Config(MegaMoEHopperMxfp4Config):
     # Conversion-table replicas and lane map (tactic fields; values identical).
     nvfp4_lut_replicas: int = field(default=8, kw_only=True)
     nvfp4_lut_map: Literal["quad", "pair", "lane"] = field(default="quad", kw_only=True)
+    # Zero preserves lockstep weight scales; one or two use a separate ring.
+    nvfp4_sf_stages: int = field(default=0, kw_only=True)
     _weight_format = "NVFP4"
 
     def _validate_conversion_layout(self) -> None:
@@ -160,6 +163,8 @@ class MegaMoEHopperNvfp4Config(MegaMoEHopperMxfp4Config):
             raise ValueError("active_dispatch_warps must be 1, 2, or 4.")
 
     def _validate_weight_schedule(self) -> None:
+        if self.nvfp4_sf_stages and (self.mma_tiler_mnk[2] != 256 or self.pingpong):
+            raise ValueError("nvfp4_sf_stages requires MMA tile K=256 without pingpong")
         validate_nvfp4_fc1_overlap_override(
             self.nvfp4_fc1_k256_overlap,
             mma_tiler_mnk=self.mma_tiler_mnk,
@@ -173,6 +178,7 @@ class MegaMoEHopperNvfp4Config(MegaMoEHopperMxfp4Config):
             kperm=self.nvfp4_kperm,
             lut_replicas=self.nvfp4_lut_replicas,
             lut_map=self.nvfp4_lut_map,
+            sf_stages=self.nvfp4_sf_stages,
         )
 
 
@@ -202,6 +208,7 @@ class MegaMoEHopperNvfp4Frontend(MegaMoEHopperMxfp4Frontend):
             "compact_pull_buffer": bool(kernel.token_comm.compact_pull_buffer),
             "nvfp4_lut_replicas": kernel.nvfp4_conversion.lut_replicas,
             "nvfp4_lut_map": kernel.nvfp4_conversion.lut_map,
+            "nvfp4_sf_stages": kernel.nvfp4_conversion.sf_stages,
         }
 
     _mega_key: Optional[tuple]

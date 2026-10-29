@@ -264,13 +264,14 @@ def cake_mhc_train_forward_workspace_bytes(T: int, device: torch.device) -> int:
     """Bytes of the caller-owned forward workspace for up to ``T`` tokens on ``device``.
 
     The forward routes (``forward_prepare`` and the ``forward_stats`` replay) hold
-    the BF16 pieces of ``fn`` in the mapping operand layout, the FP32 per-K-unit
-    partials of the mapping pass and one 256-byte ticket region.  The size is
-    the maximum over every token count up to ``T``, so a buffer sized for the
-    largest token count serves every smaller one (and CUDA Graph replays at a
-    smaller ``T``).  The ticket words must be zero on first use (allocate with
-    ``torch.zeros`` or :func:`cake_mhc_train_forward_workspace`); the kernels
-    leave them zero.  ``T == 0`` needs no workspace (nothing is launched).
+    one 256-byte ticket region (first, at the same offset for every token count),
+    the BF16 pieces of ``fn`` in the mapping operand layout and the FP32
+    per-K-unit partials of the mapping pass.  The size is the maximum over every
+    token count up to ``T``, so a buffer sized for the largest token count
+    serves every smaller one (and CUDA Graph replays at a smaller ``T``).  The
+    ticket words must be zero on first use (allocate with ``torch.zeros`` or
+    :func:`cake_mhc_train_forward_workspace`); the kernels leave them zero.
+    ``T == 0`` needs no workspace (nothing is launched).
     """
 
     return _workspace_bytes("fwd", T, device)
@@ -279,11 +280,12 @@ def cake_mhc_train_forward_workspace_bytes(T: int, device: torch.device) -> int:
 def cake_mhc_train_backward_workspace_bytes(T: int, device: torch.device) -> int:
     """Bytes of the caller-owned backward workspace for up to ``T`` tokens on ``device``.
 
-    The ``backward_finish`` route holds the transposed BF16 pieces of ``fn``, the
-    per-token records of the token-owner pass (``dz'`` pieces and the per-token
-    scalars, padded to a multiple of 128 rows), the per-CTA parameter partials,
-    the per-chunk FP32 partials of ``dfn`` and one 256-byte ticket region.  The
-    size is the maximum over every token count up to ``T`` (see
+    The ``backward_finish`` route holds one 256-byte ticket region (first, at
+    the same offset for every token count), the transposed BF16 pieces of
+    ``fn``, the per-token records of the token-owner pass (``dz'`` pieces and the
+    per-token scalars, padded to a multiple of 128 rows), the per-CTA parameter
+    partials and the per-chunk FP32 partials of ``dfn``.  The size is the
+    maximum over every token count up to ``T`` (see
     :func:`cake_mhc_train_forward_workspace_bytes`).
     """
 
@@ -1107,16 +1109,21 @@ def _backward_finish(
 class _MHCTrainState:
     """What the prepare and finish autograd nodes of one layer application share.
 
-    The parameters (detached), the constants, the workspaces, ``dY`` and
-    ``grad_stats`` (written by the finish node's backward, read by the prepare
-    node's backward) and, transiently, ``stats``: between the prepare and the
-    finish forward, and as the replay cache of the backward under
-    ``save_stats=False`` or of a finish forward rerun by a checkpoint region
-    that starts after the prepare.  Nothing the forward produced stays on the
-    handle once the finish forward has run: ``stats`` travels through
-    ``save_for_backward`` like the inputs, so an activation checkpoint
-    (non-reentrant ``torch.utils.checkpoint``) keeps no tensor of the layer
-    alive.
+    The parameters (detached), the constants, the workspaces and, transiently,
+    ``stats``: between the prepare and the finish forward.  Nothing the forward
+    produced stays on the state once the finish forward has run: ``stats``
+    travels through ``save_for_backward`` like the inputs, so an activation
+    checkpoint (non-reentrant ``torch.utils.checkpoint``) keeps no tensor of the
+    layer alive.
+
+    The finish node's backward hands ``dY``, the gradient statistics and, under
+    ``save_stats=False``, the statistics it replayed to the prepare node's
+    backward on autograd edges (:class:`_MHCTrainHandle`), so the autograd engine
+    releases them once the prepare node's backward has run, however long the
+    graph stays alive.  ``dY``, ``grad_stats`` and ``stats`` carry them on the
+    state only from a finish node without those edges whose prepare node is
+    ``recorded`` (a finish forward rerun by a reentrant checkpoint region that
+    starts after the prepare); the prepare node's backward empties them.
     """
 
     __slots__ = (
@@ -1126,6 +1133,7 @@ class _MHCTrainState:
         "stats",
         "grad_stats",
         "dY",
+        "recorded",
         "save_stats",
         "rms_eps",
         "hc_eps",
@@ -1146,25 +1154,83 @@ class _MHCTrainState:
     ) -> None:
         self.fn = self.scale = self.base = None
         self.stats = self.grad_stats = self.dY = None
+        self.recorded = False
         self.save_stats = bool(save_stats)
         self.rms_eps, self.hc_eps, self.sinkhorn_iters = rms_eps, hc_eps, sinkhorn_iters
         self.workspace, self.backward_workspace = workspace, backward_workspace
 
-    def statistics(self, X: torch.Tensor) -> torch.Tensor:
-        """The saved ``stats``, or the bitwise-identical replay of the forward prefix."""
+    def replay(self, X: torch.Tensor) -> torch.Tensor:
+        """The bitwise-identical replay of the forward prefix's ``stats``."""
 
-        if self.stats is None:
-            self.stats = cake_mhc_train_forward_stats(
-                X,
-                self.fn,
-                self.scale,
-                self.base,
-                rms_eps=self.rms_eps,
-                hc_eps=self.hc_eps,
-                sinkhorn_iters=self.sinkhorn_iters,
-                workspace=self.workspace,
-            )
-        return self.stats
+        return cake_mhc_train_forward_stats(
+            X,
+            self.fn,
+            self.scale,
+            self.base,
+            rms_eps=self.rms_eps,
+            hc_eps=self.hc_eps,
+            sinkhorn_iters=self.sinkhorn_iters,
+            workspace=self.workspace,
+        )
+
+    def take(
+        self,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """``(dY, grad_stats, stats)`` as a finish node without edges left them; the state lets go of them."""
+
+        held = self.dY, self.grad_stats, self.stats
+        self.dY = self.grad_stats = self.stats = None
+        return held
+
+
+class _MHCTrainHandle:
+    """What :func:`cake_mhc_train_prepare` returns beside ``U``: the shared state and the prepare node's edges.
+
+    The edges are extra outputs of the prepare node: one-element, zero-stride
+    tensors shaped like what the finish node's backward hands the prepare node's
+    backward (``dY``, the gradient statistics and, under ``save_stats=False``,
+    the replayed statistics).  The finish forward takes them off the handle as
+    inputs, so that hand-over runs on autograd edges.  The state never holds
+    them: the prepare node's context holds the state, and the edges hold the
+    prepare node.
+    """
+
+    __slots__ = ("state", "edges")
+
+    def __init__(self, state: _MHCTrainState, edges: tuple[torch.Tensor, ...]) -> None:
+        self.state, self.edges = state, edges
+
+
+# The edge stand-ins per (device, token count, save_stats).  No kernel reads or
+# writes an edge, so the edges of every prepare call alias these one-element
+# buffers; each call takes its own tensors (``detach``), so the edges of two
+# connections are distinct autograd outputs, and allocates no memory.
+_EDGES: dict[tuple[torch.device, int, bool], tuple[torch.Tensor, ...]] = {}
+
+
+def _edges(
+    rows: int, device: torch.device, save_stats: bool
+) -> tuple[torch.Tensor, ...]:
+    """One-element, zero-stride stand-ins of BF16 ``dY`` ``[T, 4, 4096]``, the FP32
+    gradient statistics ``[T, 32]`` and, under ``save_stats=False``, the FP32
+    statistics ``[T, 64]``: the prepare node's edge outputs."""
+
+    key = (device, rows, save_stats)
+    edges = _EDGES.get(key)
+    if edges is None:
+        shapes = [((rows, STREAMS, HIDDEN), _BF16), ((rows, GSTATS_COLS), _F32)]
+        if not save_stats:
+            shapes.append(((rows, STATS_COLS), _F32))
+        edges = tuple(
+            torch.empty_strided(shape, (0,) * len(shape), dtype=dtype, device=device)
+            for shape, dtype in shapes
+        )
+        if len(_EDGES) >= _CACHE_ENTRIES:
+            _EDGES.clear()
+        _EDGES[key] = edges
+    if save_stats:
+        return edges[0].detach(), edges[1].detach()
+    return edges[0].detach(), edges[1].detach(), edges[2].detach()
 
 
 def _as_bf16(
@@ -1176,12 +1242,14 @@ def _as_bf16(
 
 
 class CakeMHCTrainPrepareFunction(torch.autograd.Function):
-    """Autograd node of ``forward_prepare``: ``forward(X, fn, scale, base, state) -> U``.
+    """Autograd node of ``forward_prepare``: ``forward(X, fn, scale, base, state) -> (U, *edges)``.
 
     Its backward is ``backward_finish``: it receives ``dU`` from the external
-    branch and returns the single-cast ``dX`` (mapping, collapse and
-    residual-mixing contributions summed in FP32) and the FP32 parameter
-    gradients; the finish node returns no gradient for ``X``.
+    branch and, as the gradients of the edges (outputs the finish node takes as
+    inputs), ``dY`` and the gradient statistics from the finish node's backward;
+    it returns the single-cast ``dX`` (mapping, collapse and residual-mixing
+    contributions summed in FP32) and the FP32 parameter gradients; the finish
+    node returns no gradient for ``X``.
     """
 
     @staticmethod
@@ -1203,22 +1271,30 @@ class CakeMHCTrainPrepareFunction(torch.autograd.Function):
         else:
             ctx.save_for_backward(X)
         ctx.state = state
-        return U
+        # An output the backward did not reach arrives as ``None``, not as zeros.
+        ctx.set_materialize_grads(False)
+        return (U,) + _edges(X.shape[0], X.device, state.save_stats)
 
     @staticmethod
-    def backward(ctx, dU):
+    def backward(ctx, dU, dY, grad_stats, stats=None):
         X, *saved = ctx.saved_tensors
         state = ctx.state
+        held = state.take()
+        if dY is None:
+            # No edge gradient: a finish node rerun by a reentrant checkpoint left
+            # them on the state, or the finish node's backward never ran (``Y``
+            # did not reach the loss: the residual-mixing path then carries no
+            # gradient).
+            dY, grad_stats, stats = held
         rows = int(X.shape[0])
-        stats = saved[0] if saved else state.statistics(X)
-        # ``Y`` did not reach the loss when the finish node's backward never ran:
-        # the residual-mixing path then carries no gradient.
-        dY = state.dY if state.dY is not None else torch.zeros_like(X)
-        grad_stats = (
-            state.grad_stats
-            if state.grad_stats is not None
-            else torch.zeros((rows, GSTATS_COLS), dtype=_F32, device=X.device)
-        )
+        if saved:
+            stats = saved[0]
+        elif stats is None:
+            stats = state.replay(X)
+        if dY is None:
+            dY = torch.zeros_like(X)
+        if grad_stats is None:
+            grad_stats = torch.zeros((rows, GSTATS_COLS), dtype=_F32, device=X.device)
         dX, dfn, dscale, dbase = _backward_finish(
             X,
             dY,
@@ -1244,17 +1320,21 @@ class CakeMHCTrainPrepareFunction(torch.autograd.Function):
 
 
 class CakeMHCTrainFinishFunction(torch.autograd.Function):
-    """Autograd node of ``forward_finish``: ``forward(X, B, state) -> Y``.
+    """Autograd node of ``forward_finish``: ``forward(X, B, state, *edges) -> Y``.
 
     Its backward is ``backward_prepare``: it returns ``dB`` for the external
-    branch and leaves ``dY`` and the gradient statistics in the shared state for
-    the prepare node, which runs after the branch backward.  When a checkpoint
-    region that starts after the prepare reruns this forward, the statistics
-    the handle already released are replayed bitwise from ``X``.
+    branch and hands ``dY`` and the gradient statistics (under
+    ``save_stats=False`` also the statistics it replayed) to the prepare node as
+    the gradients of ``edges``, the prepare node's edge outputs, so the autograd
+    engine releases them once the prepare node's backward has run.  When a
+    checkpoint region that starts after the prepare reruns this forward, the
+    statistics the state already released are replayed bitwise from ``X``; a
+    reentrant region reruns it without the edges, and its backward leaves them
+    on the state for the prepare node instead.
     """
 
     @staticmethod
-    def forward(ctx, X, B, state):
+    def forward(ctx, X, B, state, *edges):
         stats = state.stats
         if stats is None:
             if state.fn is None:
@@ -1262,15 +1342,15 @@ class CakeMHCTrainFinishFunction(torch.autograd.Function):
                     "cake_mhc_train_finish needs the state of a preceding cake_mhc_train_prepare"
                 )
             # Replay: a checkpoint region that starts after the prepare reruns the
-            # finish on a handle that already released its statistics; recompute
-            # them bitwise from ``X`` (released again below).
-            stats = state.statistics(X)
+            # finish on a state that already released its statistics; recompute
+            # them bitwise from ``X``.
+            stats = state.replay(X)
         Y = cake_mhc_train_forward_finish(X, B, stats)
         if state.save_stats:
             ctx.save_for_backward(X, B, stats)
         else:
             ctx.save_for_backward(X, B)
-        state.stats = None  # nothing of the forward stays on the handle
+        state.stats = None  # nothing of the forward stays on the state
         ctx.state = state
         return Y
 
@@ -1278,7 +1358,7 @@ class CakeMHCTrainFinishFunction(torch.autograd.Function):
     def backward(ctx, dY):
         X, B, *saved = ctx.saved_tensors
         state = ctx.state
-        stats = saved[0] if saved else state.statistics(X)
+        stats = saved[0] if saved else state.replay(X)
         dY = _as_bf16(dY, shape=(X.shape[0], STREAMS, HIDDEN), device=X.device)
         dB, grad_stats = _backward_prepare(
             dY,
@@ -1289,8 +1369,17 @@ class CakeMHCTrainFinishFunction(torch.autograd.Function):
             grad_stats_out=None,
             path=_PATH_BACKWARD if saved else _PATH_CHECKPOINT,
         )
-        state.dY, state.grad_stats = dY, grad_stats
-        return None, dB, None
+        handed = (dY, grad_stats) if saved else (dY, grad_stats, stats)
+        edges = len(ctx.needs_input_grad) - 3
+        if edges and ctx.needs_input_grad[3]:
+            return (None, dB, None, *handed)
+        if state.recorded:
+            # No edge reaches the prepare node (a finish rerun by a reentrant
+            # checkpoint): its backward takes them off the state.
+            state.dY, state.grad_stats = dY, grad_stats
+            if not saved:
+                state.stats = stats
+        return (None, dB, None) + (None,) * edges
 
 
 def cake_mhc_train_prepare(
@@ -1305,7 +1394,7 @@ def cake_mhc_train_prepare(
     save_stats: bool = True,
     workspace: Optional[torch.Tensor] = None,
     backward_workspace: Optional[torch.Tensor] = None,
-) -> tuple[torch.Tensor, _MHCTrainState]:
+) -> tuple[torch.Tensor, _MHCTrainHandle]:
     """Autograd-enabled ``forward_prepare``: ``(U, handle)``; pass ``handle`` to :func:`cake_mhc_train_finish`.
 
     Parameters
@@ -1326,7 +1415,8 @@ def cake_mhc_train_prepare(
 
     Returns
     -------
-    ``(U, handle)``: BF16 ``U`` and the state object shared with the finish node.
+    ``(U, handle)``: BF16 ``U`` and the handle of this prepare node for one
+    :func:`cake_mhc_train_finish`.
     """
 
     state = _MHCTrainState(
@@ -1337,12 +1427,15 @@ def cake_mhc_train_prepare(
         workspace=workspace,
         backward_workspace=backward_workspace,
     )
-    U = CakeMHCTrainPrepareFunction.apply(X, fn, scale, base, state)
-    return U, state
+    out = CakeMHCTrainPrepareFunction.apply(X, fn, scale, base, state)
+    U = out[0]
+    # ``U`` requires grad exactly when the prepare node was recorded.
+    state.recorded = U.requires_grad
+    return U, _MHCTrainHandle(state, out[1:] if state.recorded else ())
 
 
 def cake_mhc_train_finish(
-    X: torch.Tensor, B: torch.Tensor, handle: _MHCTrainState
+    X: torch.Tensor, B: torch.Tensor, handle: _MHCTrainHandle
 ) -> torch.Tensor:
     """Autograd-enabled ``forward_finish``: ``Y`` from ``X``, the branch output ``B`` and the prepare ``handle``.
 
@@ -1353,16 +1446,21 @@ def cake_mhc_train_finish(
     B : torch.Tensor
         BF16 ``[T, 4096]`` output of the external branch applied to ``U`` (may require gradients).
     handle : object
-        The state returned by :func:`cake_mhc_train_prepare`.
+        The handle returned by :func:`cake_mhc_train_prepare`, for one finish.  A
+        reentrant checkpoint region (``use_reentrant=True``) holds both calls or
+        starts after the prepare; it does not end between them.
 
     Returns
     -------
     BF16 ``Y`` of shape ``[T, 4, 4096]``.
     """
 
-    if not isinstance(handle, _MHCTrainState):
-        raise TypeError("handle must be the state returned by cake_mhc_train_prepare")
-    return CakeMHCTrainFinishFunction.apply(X, B, handle)
+    if not isinstance(handle, _MHCTrainHandle):
+        raise TypeError("handle must be the handle returned by cake_mhc_train_prepare")
+    # The forward takes the edges off the handle: the handle then holds nothing of
+    # the prepare node, and a checkpoint rerun of this call runs without them.
+    edges, handle.edges = handle.edges, ()
+    return CakeMHCTrainFinishFunction.apply(X, B, handle.state, *edges)
 
 
 __all__ = [

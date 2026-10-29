@@ -18,10 +18,12 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.utils import device_support_pdl
 from tests.test_helpers.parametrize import (
     parametrize_product,
     pairwise_product_cases,
 )
+from tests.test_helpers.pdl import late_store
 from tests.test_helpers.sampling import (
     required_num_collision_rows,
     required_num_trials,
@@ -438,7 +440,7 @@ def test_blackwell_cached_cluster_spread_keeps_rows_resident(
     )
     probs = flashinfer.sampling.softmax(logits, temperature=0.5, enable_pdl=enable_pdl)
 
-    _, max_tiles, pdl_twin, resident_clusters, next_resident_clusters = kernel
+    _, max_tiles, pdl_twin, resident_clusters, next_resident_clusters, _ = kernel
     on_sm103 = torch.cuda.get_device_capability() == (10, 3)
     # Spreading a row over more CTAs stops before a cluster size whose
     # resident clusters are fewer than the rows, so all rows run in one wave,
@@ -585,8 +587,10 @@ def _skip_unless_b200_or_gb300():
         (40, 100000, "row", "shared_tiles"),
         # 7-tile chunks past one wave of shared-tile clusters: the persistent kernel.
         (84, 100000, "persistent", "persistent"),
-        # 6-tile chunks: the trip rule on sm_100, under 2.5 rows per persistent cluster on sm_103.
-        (80, 90000, "persistent", "shared_tiles"),
+        # 6-tile chunks: the trip rule on sm_100; on sm_103 under 2.5 rows per
+        # persistent cluster, except from 20/9 rows per persistent cluster on.
+        (79, 90000, "persistent", "shared_tiles"),
+        (80, 90000, "persistent", "persistent"),
         # 7-tile 16-CTA chunks: the trip rule on sm_100, under 2.5 rows per persistent cluster on sm_103.
         (24, 212992, "persistent", "shared_tiles"),
         # 5-tile 8-CTA chunks: the persistent kernel from three persistent trips on
@@ -610,6 +614,7 @@ def test_blackwell_cached_cluster_route_rules_per_arch(
 ):
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+    _skip_unless_b200_or_gb300()
     _check_cached_cluster_route(rows, vocab_size, sm100_route, sm103_route)
 
 
@@ -622,22 +627,28 @@ def test_blackwell_cached_cluster_route_rules_per_arch(
         (51, 128000, "row", "shared_tiles"),
         (52, 128000, "row", "row"),
         (56, 128000, "persistent", "persistent"),
-        # 6-tile 8-CTA chunks: two waves up to 10/7 on sm_100.
+        # 6-tile 8-CTA chunks: two waves up to 10/7 on sm_100; on sm_103 past 3/4
+        # of the resident 8-CTA shared-tile clusters up to 7/4.
         (44, 90000, "row", "shared_tiles"),
         (45, 90000, "shared_tiles", "shared_tiles"),
-        (56, 90000, "persistent", "shared_tiles"),
+        (55, 90000, "persistent", "shared_tiles"),
+        (56, 90000, "persistent", "row"),
+        (57, 90000, "persistent", "row"),
+        (58, 90000, "persistent", "shared_tiles"),
         # 7-tile 8-CTA chunks: the trip rule.
         (48, 100000, "shared_tiles", "shared_tiles"),
         (52, 100000, "persistent", "shared_tiles"),
         # 8-tile 8-CTA chunks: the trip rule.
         (68, 128000, "shared_tiles", "persistent"),
         # 6-tile chunks: the trip rule (sm_100), under 2.5 rows per persistent
-        # cluster (sm_103).
+        # cluster (sm_103) unless the rows reach 20/9 rows per persistent cluster.
         (64, 90000, "persistent", "shared_tiles"),
         (68, 90000, "shared_tiles", "shared_tiles"),
         (73, 90000, "persistent", "shared_tiles"),
-        (89, 90000, "persistent", "shared_tiles"),
+        (89, 90000, "persistent", "persistent"),
         (90, 90000, "persistent", "persistent"),
+        (79, 84000, "persistent", "shared_tiles"),
+        (80, 84000, "persistent", "persistent"),
         # 5-tile 8-CTA chunks whose rows fill at least 4/5 of the persistent trips:
         # the persistent kernel from three persistent trips on when the fifth tile
         # is at least 3/8 full (otherwise from 2.5 rows per persistent cluster on
@@ -653,6 +664,44 @@ def test_blackwell_cached_cluster_route_rules_per_arch(
         (496, 80000, "persistent", "persistent"),
         (497, 80000, "shared_tiles", "persistent"),
         (544, 80000, "shared_tiles", "shared_tiles"),
+        # On sm_100 also at three persistent trips from 10/9 rows per shared-tile
+        # cluster on, and below 15/2 rows per shared-tile cluster when the fifth
+        # tile is at most 279/1024 full.
+        (78, 70000, "shared_tiles", "shared_tiles"),
+        (79, 70000, "persistent", "shared_tiles"),
+        (82, 70000, "persistent", "shared_tiles"),
+        (78, 76000, "shared_tiles", "shared_tiles"),
+        (79, 76000, "persistent", "shared_tiles"),
+        (496, 70000, "persistent", "shared_tiles"),
+        (497, 70000, "persistent", "shared_tiles"),
+        (532, 70000, "persistent", "shared_tiles"),
+        (533, 70000, "shared_tiles", "shared_tiles"),
+        (497, 70008, "shared_tiles", "shared_tiles"),
+        # 6- and 7-tile 16-CTA chunks on sm_100: the persistent kernel past 4 rows
+        # per shared-tile cluster up to 20 (6 tiles) or 22 (7 tiles) persistent
+        # trips, or up to 24 trips when the last tile holds at most 6/8 (6 tiles)
+        # or 4/8 (7 tiles) of a tile.
+        (123, 180000, "persistent", "persistent"),
+        (124, 180000, "persistent", "persistent"),
+        (280, 180000, "persistent", "shared_tiles"),
+        (281, 180000, "persistent", "shared_tiles"),
+        (336, 180000, "persistent", "shared_tiles"),
+        (337, 180000, "shared_tiles", "shared_tiles"),
+        (281, 188416, "persistent", "shared_tiles"),
+        (281, 188432, "shared_tiles", "shared_tiles"),
+        (336, 192000, "shared_tiles", "shared_tiles"),
+        (280, 196608, "persistent", "shared_tiles"),
+        (281, 196608, "shared_tiles", "shared_tiles"),
+        (124, 210000, "persistent", "persistent"),
+        (308, 210000, "persistent", "shared_tiles"),
+        (309, 210000, "persistent", "shared_tiles"),
+        (336, 210000, "persistent", "shared_tiles"),
+        (337, 210000, "shared_tiles", "shared_tiles"),
+        (309, 212992, "persistent", "shared_tiles"),
+        (309, 213008, "shared_tiles", "shared_tiles"),
+        (336, 224000, "shared_tiles", "shared_tiles"),
+        (308, 229376, "persistent", "shared_tiles"),
+        (309, 229376, "shared_tiles", "shared_tiles"),
         # 5-tile 16-CTA chunks of four persistent trips keep the shared-tile kernel.
         (48, 151936, "shared_tiles", "shared_tiles"),
         (56, 163840, "shared_tiles", "shared_tiles"),
@@ -671,6 +720,160 @@ def test_blackwell_cached_cluster_route_boundaries_per_arch(
     # These rows sit at the boundaries set by the resident clusters of each part.
     _skip_unless_b200_or_gb300()
     _check_cached_cluster_route(rows, vocab_size, sm100_route, sm103_route)
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size", [(281, 180000), (336, 180000), (309, 210000), (336, 210000)]
+)
+@pytest.mark.parametrize("temperature_kind", ["scalar", "scalar_pdl", "per_row"])
+def test_blackwell_cached_cluster_partial_tile_trip_cap_per_arch(
+    rows, vocab_size, temperature_kind
+):
+    # On sm_100, 6- and 7-tile 16-CTA chunks whose last tile holds at most 6/8
+    # (6 tiles) or 4/8 (7 tiles) of a tile keep the persistent kernel up to 24
+    # persistent trips, unless the temperature is per row; sm_103 takes the
+    # shared-tile kernel.
+    _skip_unless_b200_or_gb300()
+    torch.manual_seed(7)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    enable_pdl = temperature_kind == "scalar_pdl"
+    if temperature_kind == "per_row":
+        temperature = torch.rand(rows, device="cuda") * 0.9 + 0.1
+        probs_ref = torch.softmax(logits / temperature[:, None], dim=-1)
+    else:
+        temperature = 0.5
+        probs_ref = torch.softmax(logits / temperature, dim=-1)
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    persistent = (
+        torch.cuda.get_device_capability() == (10, 0) and temperature_kind != "per_row"
+    )
+    assert route == (
+        flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_PERSISTENT
+        if persistent
+        else flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_SHARED_TILES
+    )
+    probs = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    torch.testing.assert_close(probs, probs_ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "vocab_size,ten_cta_tiles",
+    [
+        (131080, 8),  # 5-tile 16-CTA chunks, 7-tile 10-CTA chunks
+        (163840, 8),  # 8-tile 10-CTA chunks
+        (180000, 10),  # 9-tile 10-CTA chunks
+        (204800, 10),  # 7-tile 16-CTA chunks, 10-tile 10-CTA chunks
+        (204808, 0),  # 11-tile 10-CTA chunks keep 16 CTAs
+    ],
+)
+@pytest.mark.parametrize("rows", [21, 22, 23, 24, 28, 29])
+@pytest.mark.parametrize("temperature_kind", ["scalar", "scalar_pdl", "per_row"])
+def test_blackwell_cached_cluster_ten_cta_rows_per_arch(
+    vocab_size, ten_cta_tiles, rows, temperature_kind
+):
+    # On sm_103 these batches take the 10-CTA kernel from 11/14 of its resident
+    # clusters up to all of them (22 to 28 rows on GB300), unless the
+    # temperature is per row; on sm_100 they keep 16 CTAs.
+    _skip_unless_b200_or_gb300()
+    torch.manual_seed(7)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    enable_pdl = temperature_kind == "scalar_pdl"
+    if temperature_kind == "per_row":
+        temperature = torch.rand(rows, device="cuda") * 0.9 + 0.1
+        probs_ref = torch.softmax(logits / temperature[:, None], dim=-1)
+    else:
+        temperature = 0.5
+        probs_ref = torch.softmax(logits / temperature, dim=-1)
+    kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    ten = (
+        torch.cuda.get_device_capability() == (10, 3)
+        and temperature_kind != "per_row"
+        and ten_cta_tiles > 0
+        and 22 <= rows <= 28
+    )
+    assert kernel[:2] == ((10, ten_cta_tiles) if ten else (16, 8))
+    probs = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    torch.testing.assert_close(probs, probs_ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size,temperature_kind,sm100_chunk,sm103_chunk",
+    [
+        # 4-tile 16-CTA row kernel past one wave or with a cut of more than 1/16.
+        (8, 100000, "none", 6272, 6272),
+        (8, 100000, "scalar", 6272, 6272),
+        (28, 48000, "none", 3008, 3008),
+        (55, 120000, "none", 7520, 7520),
+        # 8-CTA shared-tile and persistent kernels (on sm_103 the persistent
+        # kernel only with a cut of at least 1/10).
+        (45, 81928, "none", 10272, 10272),
+        (320, 69632, "none", 8704, 8704),
+        (82, 70000, "none", 8768, 8768),
+        (52, 100000, "scalar_pdl", 12512, 12512),
+        (370, 66000, "none", 10240, 8256),  # five waves of shared-tile clusters (GB300)
+        (48, 76000, "none", 9504, 9504),
+        (82, 76000, "none", 9504, 9504),
+        (50, 110000, "none", 14336, 13760),
+        (52, 90000, "scalar_pdl", 11264, 11264),
+        (89, 73728, "none", 9216, 9216),  # a cut of exactly 1/10
+        (128, 100000, "none", 12512, 12512),
+        (96, 100000, "scalar_pdl", 12512, 12512),
+        (87, 76000, "none", 9504, 10240),
+        (85, 90000, "none", 11264, 12288),
+        (54, 105000, "none", 13152, 14336),
+        (64, 120000, "none", 15008, 16384),
+        # 16-CTA shared-tile and persistent kernels with a cut of at least 1/10,
+        # or on sm_100 past one wave.
+        (30, 140000, "none", 8768, 8768),
+        (70, 201088, "none", 12576, 12576),
+        (32, 151936, "none", 9504, 10240),
+        (40, 151936, "none", 9504, 10240),
+        (64, 180000, "none", 11264, 12288),
+        # Whole tiles: the wide row kernel, a one-wave 16-CTA chunk with a cut
+        # under 1/10, a one-wave 4-tile 16-CTA row kernel with a cut of at most
+        # 1/16, the 8-tile 16-CTA row kernel, and rows past five waves (180
+        # rows are five persistent waves on GB300) or past one wave with a cut
+        # of at most 1/16.
+        (8, 256000, "none", 26624, 22528),
+        (24, 151936, "none", 10240, 16384),
+        (8, 126464, "none", 8192, 8192),
+        (1, 151936, "none", 10240, 10240),
+        (180, 71680, "none", 10240, 8960),
+        (181, 71680, "none", 10240, 10240),
+        (371, 66000, "none", 10240, 10240),
+        (76, 92000, "none", 12288, 12288),
+    ],
+)
+def test_blackwell_cached_cluster_balanced_chunk_per_arch(
+    rows, vocab_size, temperature_kind, sm100_chunk, sm103_chunk
+):
+    # These kernels cover ceil(V / C) rounded up to 32 elements per CTA instead
+    # of whole tiles; the expected chunk depends on the GPU's resident clusters.
+    _skip_unless_b200_or_gb300()
+    torch.manual_seed(11)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    temperature = None if temperature_kind == "none" else 0.7
+    enable_pdl = temperature_kind == "scalar_pdl"
+    probs_ref = torch.softmax(
+        logits if temperature is None else logits / temperature, dim=-1
+    )
+    kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    on_sm100 = torch.cuda.get_device_capability() == (10, 0)
+    assert kernel[5] == (sm100_chunk if on_sm100 else sm103_chunk)
+    probs = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    torch.testing.assert_close(probs, probs_ref, atol=1e-3, rtol=1e-3)
 
 
 @pytest.mark.parametrize(
@@ -795,6 +998,29 @@ def test_softmax(
     probs_ref = torch.softmax(logits_scaled, dim=-1)
 
     assert torch.allclose(probs, probs_ref, atol=1e-5)
+
+
+# Batches of at most 128 rows with a vocabulary of at least 24576 take the vocab-splitting
+# map-reduce kernels; the rest take the fused kernel.
+@pytest.mark.parametrize("batch_size,vocab_size", [(128, 4096), (4, 32768)])
+def test_softmax_pdl_waits_for_temperature(batch_size, vocab_size):
+    logits = torch.randn(batch_size, vocab_size, device="cuda")
+    if not device_support_pdl(logits.device):
+        pytest.skip("PDL not supported on this device")
+    workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device="cuda")
+    softmax = flashinfer.sampling.get_sampling_module().softmax
+    temperature_value = 0.5
+
+    temperature = torch.full((batch_size,), temperature_value, device="cuda")
+    expected = softmax(workspace, logits, temperature, 0.0, False)
+
+    # Row 0's temperature is what the previous kernel is still producing.
+    # No other kernel may run between that producer and the softmax kernel.
+    temperature[0] = temperature_value * 4
+    late_store(temperature, temperature_value)
+    probs = softmax(workspace, logits, temperature, 0.0, True)
+
+    torch.testing.assert_close(probs, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(

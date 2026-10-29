@@ -13,11 +13,6 @@ import dataclasses
 from typing import Any
 
 KNOB_KEYS = ("mma_tiler_mnk", "cluster_shape_mn", "schedule_policy")
-_GEOMETRIES = (
-    ((256, 128, 128), (4, 1)),
-    ((256, 64, 128), (4, 1)),
-    ((256, 64, 128), (2, 1)),
-)
 
 
 def _effective_sms(config: Any, sm_count: int) -> int:
@@ -85,8 +80,18 @@ def default_sm100_genphase_knobs(
         cga4_tiles = active_experts * ((2 * config.intermediate + 511) // 512)
         cluster = 2 if n == 64 and (sms < 4 or cga4_tiles < sms // 4) else 4
         hint = 4 * (sms // cluster)
+    if config.quant_kind == "nvfp4":
+        n, cluster = 128, 4
+    elif config.quant_kind == "mxfp4_mxfp8":
+        cluster = 4
+    if sms < cluster:
+        raise ValueError(
+            f"{config.quant_kind} GenPhase requires at least {cluster} SMs"
+        )
+    if tokens:
+        hint = 4 * (sms // cluster)
     return {
-        "mma_tiler_mnk": (256, n, 128),
+        "mma_tiler_mnk": (256, n, config.gather_tile_k),
         "cluster_shape_mn": (cluster, 1),
         "schedule_policy": ("grouped", hint),
     }
@@ -115,7 +120,7 @@ def sm100_genphase_candidates(
     if unknown:
         raise ValueError(f"unknown Blackwell GenPhase knob keys: {sorted(unknown)}")
     proposed = [preferred]
-    for tile, cluster in _GEOMETRIES:
+    for tile, cluster in config.admitted_geometries:
         if sms < cluster[0]:
             continue
         for hint in (

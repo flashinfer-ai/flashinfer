@@ -20,9 +20,10 @@ base and warp-specialised forms (ATTENTION, ATTENTION_NODELTA, ATTENTION_WS,
 ATTENTION_WS_NODELTA), and the overlapped form of the fused plans in launch order: the
 head-major pre-processing producers (PREPROCESS_HEAD_MAJOR, a plain launch), the lead
 attention launch (ATTENTION_LEAD, ATTENTION_NODELTA_LEAD) and the tail attention launch
-(ATTENTION_TAIL, ATTENTION_NODELTA_TAIL), each shipped for sm_120a. A CTA of the overlap
-waits only on CTAs launched before it in its call, so a lazy module load only delays a
-call. The host module
+(ATTENTION_TAIL, ATTENTION_NODELTA_TAIL), with the warp-specialised lead and tail of the
+uncompensated overlap (ATTENTION_WS_NODELTA_LEAD, ATTENTION_WS_NODELTA_TAIL), each
+shipped for sm_120a. A CTA of the overlap waits only on CTAs launched before it in its
+call, so a lazy module load only delays a call. The host module
 ``flashinfer.diffusion_ops.cake_minimax_h3_sm120_nvfp4_varlen_attention`` selects the
 programs, computes the grids and launches them behind
 ``minimax_h3_sm120_varlen_attention_nvfp4`` and
@@ -779,6 +780,118 @@ ATTENTION_NODELTA_TAIL = cake_program.CakeProgram(
     needs_device_linking=False,
 )
 
+ATTENTION_WS_NODELTA_LEAD = cake_program.CakeProgram(
+    name="cake_minimax_h3_sm120_nvfp4_varlen_attention_109e69560598d8dbd610",
+    operator_dir="cake_minimax_h3_sm120_nvfp4_varlen_attention",
+    kernel="kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_109e69560598d8dbd610",
+    sources=(
+        "cake_minimax_h3_sm120_nvfp4_varlen_attention_109e69560598d8dbd610_kernel.cu",
+        "cake_minimax_h3_sm120_nvfp4_varlen_attention_109e69560598d8dbd610_binding.cu",
+    ),
+    targets=("sm_120a",),
+    compile_options=(("sm_120a", ()),),
+    args=(
+        "Q_map",
+        "K_map",
+        "KSF_map",
+        "VT_map",
+        "VSF_map",
+        "O",
+        "q_sf",
+        "qm4",
+        "qm_sf",
+        "seg_tile_begin",
+        "unit_table",
+        "total_units",
+        "num_heads",
+        "num_kblocks",
+        "softmax_scale_log2",
+        "hctr",
+        "units_per_head",
+        "lead_ctas",
+        "tail_ctas",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "Q_map",
+        "K_map",
+        "KSF_map",
+        "VT_map",
+        "VSF_map",
+        "O",
+        "q_sf",
+        "qm4",
+        "qm_sf",
+        "seg_tile_begin",
+        "unit_table",
+        "hctr",
+    ),
+    block=(384, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=80896,
+    use_pdl=True,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+ATTENTION_WS_NODELTA_TAIL = cake_program.CakeProgram(
+    name="cake_minimax_h3_sm120_nvfp4_varlen_attention_1535f86756e37add9b3b",
+    operator_dir="cake_minimax_h3_sm120_nvfp4_varlen_attention",
+    kernel="kernel_cake_minimax_h3_sm120_nvfp4_varlen_attention_1535f86756e37add9b3b",
+    sources=(
+        "cake_minimax_h3_sm120_nvfp4_varlen_attention_1535f86756e37add9b3b_kernel.cu",
+        "cake_minimax_h3_sm120_nvfp4_varlen_attention_1535f86756e37add9b3b_binding.cu",
+    ),
+    targets=("sm_120a",),
+    compile_options=(("sm_120a", ()),),
+    args=(
+        "Q_map",
+        "K_map",
+        "KSF_map",
+        "VT_map",
+        "VSF_map",
+        "O",
+        "q_sf",
+        "qm4",
+        "qm_sf",
+        "seg_tile_begin",
+        "unit_table",
+        "total_units",
+        "num_heads",
+        "num_kblocks",
+        "softmax_scale_log2",
+        "hctr",
+        "units_per_head",
+        "lead_ctas",
+        "tail_ctas",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "Q_map",
+        "K_map",
+        "KSF_map",
+        "VT_map",
+        "VSF_map",
+        "O",
+        "q_sf",
+        "qm4",
+        "qm_sf",
+        "seg_tile_begin",
+        "unit_table",
+        "hctr",
+    ),
+    block=(384, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=80896,
+    use_pdl=True,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
 PROGRAMS: tuple[cake_program.CakeProgram, ...] = (
     PREPROCESS,
     STATS,
@@ -793,6 +906,8 @@ PROGRAMS: tuple[cake_program.CakeProgram, ...] = (
     ATTENTION_TAIL,
     ATTENTION_NODELTA_LEAD,
     ATTENTION_NODELTA_TAIL,
+    ATTENTION_WS_NODELTA_LEAD,
+    ATTENTION_WS_NODELTA_TAIL,
 )
 
 
@@ -815,6 +930,8 @@ __all__ = [
     "ATTENTION_TAIL",
     "ATTENTION_NODELTA_LEAD",
     "ATTENTION_NODELTA_TAIL",
+    "ATTENTION_WS_NODELTA_LEAD",
+    "ATTENTION_WS_NODELTA_TAIL",
     "PROGRAMS",
     "aot_specs",
 ]

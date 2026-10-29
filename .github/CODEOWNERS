@@ -13,7 +13,7 @@
 #     are listed on EVERY rule
 
 # ── Catch-all: full approvers and the bot cover everything not matched below ──
-* @flashinfer-bot @yzh119 @yyihuang @bkryu @aleozlx @YangXu1990uiuc @Anerudhan @Jingfan-Sun @dierksen
+* @flashinfer-bot @yzh119 @yyihuang @bkryu @aleozlx @YangXu1990uiuc @Anerudhan @Jingfan-Sun
 
 # ── Attention ──
 csrc/fmha_v2/                  @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan

@@ -103,17 +103,17 @@ kernel_cake_warp_decode_30aabe6953736fdeda01(int* __restrict__ route_experts, in
 
     // === Task calls (declaration order) ===
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-    int expert = tid;
-    if (expert < num_experts) {
-        expert_counts[expert] = 0;
-        expert_tile_offsets[expert] = 0;
-        expert_scatter_offsets[expert] = 0;
+    int expert_2_0 = tid;
+    if (expert_2_0 < num_experts) {
+        expert_counts[expert_2_0] = 0;
+        expert_tile_offsets[expert_2_0] = 0;
+        expert_scatter_offsets[expert_2_0] = 0;
     }
-    int expert_0 = tid + THREADS;
-    if (expert_0 < num_experts) {
-        expert_counts[expert_0] = 0;
-        expert_tile_offsets[expert_0] = 0;
-        expert_scatter_offsets[expert_0] = 0;
+    int expert_2_1 = tid + THREADS;
+    if (expert_2_1 < num_experts) {
+        expert_counts[expert_2_1] = 0;
+        expert_tile_offsets[expert_2_1] = 0;
+        expert_scatter_offsets[expert_2_1] = 0;
     }
     if (tid == 0) {
         expert_tile_offsets[num_experts] = 0;
@@ -147,35 +147,35 @@ kernel_cake_warp_decode_30aabe6953736fdeda01(int* __restrict__ route_experts, in
     }
     int first_inclusive = first_tiles;
     int second_inclusive = second_tiles;
-    int first_peer = __shfl_up_sync(0xFFFFFFFF, first_inclusive, 1, 32);
-    int second_peer = __shfl_up_sync(0xFFFFFFFF, second_inclusive, 1, 32);
+    int first_peer_0 = __shfl_up_sync(0xFFFFFFFF, first_inclusive, 1, 32);
+    int second_peer_0 = __shfl_up_sync(0xFFFFFFFF, second_inclusive, 1, 32);
     if (lane >= 1) {
-        first_inclusive = first_inclusive + first_peer;
-        second_inclusive = second_inclusive + second_peer;
+        first_inclusive = first_inclusive + first_peer_0;
+        second_inclusive = second_inclusive + second_peer_0;
     }
-    int first_peer_0 = __shfl_up_sync(0xFFFFFFFF, first_inclusive, 2, 32);
+    int first_peer_1 = __shfl_up_sync(0xFFFFFFFF, first_inclusive, 2, 32);
     int second_peer_1 = __shfl_up_sync(0xFFFFFFFF, second_inclusive, 2, 32);
     if (lane >= 2) {
-        first_inclusive = first_inclusive + first_peer_0;
+        first_inclusive = first_inclusive + first_peer_1;
         second_inclusive = second_inclusive + second_peer_1;
     }
     int first_peer_2 = __shfl_up_sync(0xFFFFFFFF, first_inclusive, 4, 32);
-    int second_peer_3 = __shfl_up_sync(0xFFFFFFFF, second_inclusive, 4, 32);
+    int second_peer_2 = __shfl_up_sync(0xFFFFFFFF, second_inclusive, 4, 32);
     if (lane >= 4) {
         first_inclusive = first_inclusive + first_peer_2;
+        second_inclusive = second_inclusive + second_peer_2;
+    }
+    int first_peer_3 = __shfl_up_sync(0xFFFFFFFF, first_inclusive, 8, 32);
+    int second_peer_3 = __shfl_up_sync(0xFFFFFFFF, second_inclusive, 8, 32);
+    if (lane >= 8) {
+        first_inclusive = first_inclusive + first_peer_3;
         second_inclusive = second_inclusive + second_peer_3;
     }
-    int first_peer_4 = __shfl_up_sync(0xFFFFFFFF, first_inclusive, 8, 32);
-    int second_peer_5 = __shfl_up_sync(0xFFFFFFFF, second_inclusive, 8, 32);
-    if (lane >= 8) {
-        first_inclusive = first_inclusive + first_peer_4;
-        second_inclusive = second_inclusive + second_peer_5;
-    }
-    int first_peer_6 = __shfl_up_sync(0xFFFFFFFF, first_inclusive, 16, 32);
-    int second_peer_7 = __shfl_up_sync(0xFFFFFFFF, second_inclusive, 16, 32);
+    int first_peer_4 = __shfl_up_sync(0xFFFFFFFF, first_inclusive, 16, 32);
+    int second_peer_4 = __shfl_up_sync(0xFFFFFFFF, second_inclusive, 16, 32);
     if (lane >= 16) {
-        first_inclusive = first_inclusive + first_peer_6;
-        second_inclusive = second_inclusive + second_peer_7;
+        first_inclusive = first_inclusive + first_peer_4;
+        second_inclusive = second_inclusive + second_peer_4;
     }
     if (lane == 31) {
         scan_values[warp] = first_inclusive;

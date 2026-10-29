@@ -161,7 +161,6 @@ def test_blackwell_genphase_schedule_heuristic(tile, cluster, hint, monkeypatch)
     [
         {"kernel_variant": "unknown"},
         {"kernel_variant": "genphase", "capacity": 1025},
-        {"kernel_variant": "genphase", "kind": "mxfp8_e5m2"},
         {"kernel_variant": "genphase", "knobs": "bad"},
         {"kernel_variant": "genphase", "schedule_policy": ("grouped", 0)},
         {"kernel_variant": "genphase", "schedule_policy": ("grouped", -1)},
@@ -816,8 +815,6 @@ def test_blackwell_genphase_import_is_lazy():
 @pytest.mark.parametrize(
     "override",
     [
-        {"quant_kind": "nvfp4"},
-        {"quant_kind": "mxfp4_mxfp8", "intermediate": 256},
         {"mma_tiler_mnk": (256, 64, 256)},
         {"mma_tiler_mnk": (256, 64, 128), "cluster_shape_mn": (1, 1)},
         {"cluster_shape_mn": (2, 1)},
@@ -1216,7 +1213,7 @@ def test_blackwell_genphase_tuning_offline_cli_dispatch_and_admission(monkeypatc
         "65",
     ]
     assert tune.main(args) == 0
-    assert "sm100.mxfp8_mxfp8_bf16_cutedsl.tuner" in loader.call_args.args[0]
+    assert loader.call_args.args[0] == ".backends.mega.kernel.sm100.next_tuning"
     assert module.run_tuning.call_args.args[0].kernel_variant == "genphase"
     loader.reset_mock()
     assert tune.main(args + ["--allow-nondeterministic"]) == 2

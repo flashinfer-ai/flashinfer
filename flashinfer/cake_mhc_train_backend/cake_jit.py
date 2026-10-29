@@ -3380,20 +3380,26 @@ PARAM_LAYOUT: dict[str, tuple[int, int]] = {
 # The caller-owned workspaces (``workspace_rule`` kind ``regions``): ordered
 # regions, each rounded up to 256 bytes; a shape entry that is a string names
 # a host-plan quantity of ``host_plan`` (``t_pad``, ``p_k``, ``parts``, ``chunks``).
+# The ticket region comes first: its offset is 0 for every token count, so a
+# buffer that serves several token counts (a caller buffer sized by
+# ``workspace_bytes_upto``, a default workspace of a token-count bucket, a CUDA
+# Graph captured at a smaller T) keeps its ticket words where the previous call
+# left them -- zero -- instead of reading them from bytes another token count's
+# layout used for partials or records.
 WORKSPACE_REGIONS: dict[str, list[dict[str, Any]]] = {
     "fwd": [
+        {"dtype": "uint32", "name": "ticket", "shape": [64]},
         {"dtype": "bfloat16", "name": "fnp", "shape": [3, 32, 16384]},
         {"dtype": "float32", "name": "spart", "shape": ["p_k", "t_pad", 24]},
         {"dtype": "float32", "name": "qpart", "shape": ["p_k", "t_pad"]},
-        {"dtype": "uint32", "name": "ticket", "shape": [64]},
     ],
     "bwd": [
+        {"dtype": "uint32", "name": "ticket", "shape": [64]},
         {"dtype": "bfloat16", "name": "fnTp", "shape": [3, 16384, 32]},
         {"dtype": "bfloat16", "name": "dzp", "shape": ["t_pad", 96]},
         {"dtype": "float32", "name": "tokp", "shape": ["t_pad", 24]},
         {"dtype": "float32", "name": "param_partial", "shape": ["chunks", 32]},
         {"dtype": "float32", "name": "dfn_part", "shape": ["parts", 24, 16384]},
-        {"dtype": "uint32", "name": "ticket", "shape": [64]},
     ],
 }
 # Scalar values a record fixes itself (the launch policy of a stage record):

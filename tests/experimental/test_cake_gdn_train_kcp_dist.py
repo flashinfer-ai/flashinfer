@@ -926,6 +926,45 @@ def _run_rank(
         kept_delta[k] == v_ for k, v_ in expect.items()
     )
 
+    # issue #7074 (2) + G10: the "auto" form (the shipped default) in a region the GDN node closes takes the kept
+    # path on a rank with tokens (the frame proof "dead"; a rank without tokens replays as before), is bitwise the
+    # direct result, and its checkpointed forward + backward -- the recompute forward, the frame proof over the
+    # autograd graph (structure only, never tensor contents), the kept-tape take -- make no synchronizing CUDA call
+    # (outside the kept-stats window above: the "auto" pass has its own accounting below)
+    AUTO = {"reuse_recompute_tapes": "auto"}
+    auto_stats0 = dict(kcp.KEPT_STATS)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        res_auto_form = autograd_pass(True, **AUTO)
+        flags["auto_no_sync"] = True
+    except RuntimeError as exc:  # a synchronizing call in the "auto" pass
+        info["auto_no_sync_error"] = str(exc)[:200]
+        flags["auto_no_sync"] = False
+        res_auto_form = None
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    if res_auto_form is None:
+        res_auto_form = autograd_pass(True, **AUTO)
+    info["auto_form"] = _kept_record(T_r_here)
+    info["auto_form"]["hand_off_reason"] = kcp.LAST_CALL["fwd"].get("hand_off_reason")
+    flags["auto_eq_direct"] = _eq(res_auto, res_auto_form)
+    # a rank with tokens hands off on the frame proof ("dead"); a rank without tokens has no tapes and switches the
+    # hand-off off before the "auto" decision, as every form does there (recorded "off", the replay form)
+    flags["auto_path_taken"] = bool(info["auto_form"]["path_ok"]) and (
+        info["auto_form"]["hand_off_reason"] == ("dead" if T_r_here > 0 else "off")
+        or not kcp.torch_release_verified()
+    )
+    auto_delta = {k: kcp.KEPT_STATS[k] - auto_stats0[k] for k in auto_stats0}
+    info["auto_stats_delta"] = auto_delta
+    # one hand-off on a rank with tokens (the proof "dead"); none without tokens or on an unverified release -- and no
+    # miss is counted for an "auto" forward that did not hand off
+    n_auto = 1 if (T_r_here > 0 and kcp.torch_release_verified()) else 0
+    flags["auto_registry_empty"] = kcp.kept_registry_size() == 0 and all(
+        auto_delta[k] == v_
+        for k, v_ in {"put": n_auto, "take": n_auto, "miss": 0}.items()
+    )
+
     def _ckpt_peak(**o) -> int:
         torch.cuda.synchronize(device)
         gc.collect()
@@ -958,6 +997,22 @@ def _run_rank(
     flags["backward_twice_accumulates"] = all(
         torch.equal(res_twice[n], res_auto[n] + res_auto[n]) for n in GRADS
     )
+    # G10 (issue #7074): preparing a fresh context of this rank's layout -- the host plan, its table uploads and the
+    # per-key device tables -- makes no synchronizing CUDA call (pinned asynchronous copies), so a pipeline can prepare
+    # the next batch's metadata behind queued device work
+    torch.cuda.synchronize(device)
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        fresh_ctx = plan.build_kcp_context(part, group, rank, device)
+        fresh_ctx.prepare(H_qk, HV)
+        flags["prepare_no_sync"] = True
+    except RuntimeError as exc:  # "called a synchronizing CUDA operation"
+        info["prepare_no_sync_error"] = str(exc)[:200]
+        flags["prepare_no_sync"] = False
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    del fresh_ctx
+    torch.cuda.synchronize(device)
     # #7039: retained bytes after a checkpointed forward (graph off), per-call and caller-held workspace forms.
     # the plan's per-key device tables are uploaded first (ctx.prepare + one warm-up call of the
     # same form) so they are not counted; graph="replay" keeps a static pool and is reported, not asserted.

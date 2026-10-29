@@ -244,7 +244,7 @@ class FrostLowLatencyRunner(MoERunner):
     def _cache_key_extras(self):
         return super()._cache_key_extras() + (
             # Do not reuse winners selected with the deferred individual-call timer.
-            "fp8-grouped-tc-w8-batch-v5"
+            "fp8-grouped-tc-w8-weight-first-v6"
             if self.config.quant.weight is QuantFormat.FP8PerTensor
             and self.config.quant.activation is QuantFormat.FP8PerTensor
             else "block-fp8-grouped-tc-w8-batch-v3"
@@ -260,10 +260,10 @@ class FrostLowLatencyRunner(MoERunner):
                     and self.config.quant.activation
                     in (QuantFormat.BF16, QuantFormat.FP16)
                     else (
-                        "bf16-grouped-tc-w8-batch-v15"
+                        "bf16-grouped-tc-w8-weight-first-v16"
                         if self.config.quant.weight is QuantFormat.BF16
                         else (
-                            "fp16-grouped-tc-w8-batch-v13"
+                            "fp16-grouped-tc-w8-weight-first-v14"
                             if self.config.quant.weight is QuantFormat.FP16
                             else (
                                 "mx-tc-contracts-v6"
@@ -485,6 +485,14 @@ class FrostLowLatencyRunner(MoERunner):
                     tactics.append(("wgmma", 2, 4, 128))
                 else:
                     tactics += [("warp_mma", group, 2, 128) for group in (2, 4)]
+                    if self.config.activation in (SwiGLU(), SiTU()) or (
+                        inputs[0].shape[0] == 8 and self.config.activation == ReLU2()
+                    ):
+                        # Retain the original schedule for cache/reuse controls;
+                        # serial weight-first is an additional tuning choice.
+                        tactics += [
+                            ("warp_mma", group, 2, 128, True) for group in (2, 4)
+                        ]
             if (
                 capability in ((9, 0), (12, 0))
                 and self.config.quant.weight is QuantFormat.DeepSeekFp8
@@ -602,6 +610,11 @@ class FrostLowLatencyRunner(MoERunner):
                         else ((8, 2, 128), (4, 2, 64), (2, 2, 64), (2, 2, 128))
                     )
                     tactics += [("warp_mma", *choice) for choice in choices]
+                    if inputs[0].shape[0] == 8 and self.config.activation == SwiGLU():
+                        # Keep both weight/activation issue orders available to
+                        # tuning; cold and cache-resident weights prefer different
+                        # schedules. Untuned selection remains the original FMA.
+                        tactics += [("warp_mma", *choice, True) for choice in choices]
             return tactics
         tactics = (
             [k for k in (128, 256) if inputs[0].shape[1] % k == 0]

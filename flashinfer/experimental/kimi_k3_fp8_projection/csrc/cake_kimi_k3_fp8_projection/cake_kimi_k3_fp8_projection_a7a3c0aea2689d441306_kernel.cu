@@ -1218,17 +1218,36 @@ kernel_cake_kimi_k3_fp8_projection_a7a3c0aea2689d441306(const __grid_constant__ 
                         }
                     }
                     if (skp_lnc_2 > 1) {
-                        int skp_vi0_1 = ((skp_lt_2 * sk_ksplit + 1) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
-                        float parts_q_1[32];
+                        int skp_vi0_0 = ((skp_lt_2 * sk_ksplit + 1) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
+                        float parts_q_0[32];
                         #pragma unroll
                         for (int skp_v_1 = 0; skp_v_1 < 8; skp_v_1++) {
-                            int skp_vi_1 = skp_vi0_1 + skp_v_1 * 32;
+                            int skp_vi_1 = skp_vi0_0 + skp_v_1 * 32;
                             {
                                 float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_1 * 4) + 0);
-                                parts_q_1[4 * skp_v_1 + 0] = _v4.x;
-                                parts_q_1[4 * skp_v_1 + 1] = _v4.y;
-                                parts_q_1[4 * skp_v_1 + 2] = _v4.z;
-                                parts_q_1[4 * skp_v_1 + 3] = _v4.w;
+                                parts_q_0[4 * skp_v_1 + 0] = _v4.x;
+                                parts_q_0[4 * skp_v_1 + 1] = _v4.y;
+                                parts_q_0[4 * skp_v_1 + 2] = _v4.z;
+                                parts_q_0[4 * skp_v_1 + 3] = _v4.w;
+                            }
+                        }
+                        #pragma unroll
+                        for (int i_0 = 0; i_0 < 32; i_0++) {
+                            pre[i_0] = pre[i_0] + parts_q_0[i_0];
+                        }
+                    }
+                    if (skp_lnc_2 > 2) {
+                        int skp_vi0_1 = ((skp_lt_2 * sk_ksplit + 2) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
+                        float parts_q_1[32];
+                        #pragma unroll
+                        for (int skp_v_2 = 0; skp_v_2 < 8; skp_v_2++) {
+                            int skp_vi_2 = skp_vi0_1 + skp_v_2 * 32;
+                            {
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_2 * 4) + 0);
+                                parts_q_1[4 * skp_v_2 + 0] = _v4.x;
+                                parts_q_1[4 * skp_v_2 + 1] = _v4.y;
+                                parts_q_1[4 * skp_v_2 + 2] = _v4.z;
+                                parts_q_1[4 * skp_v_2 + 3] = _v4.w;
                             }
                         }
                         #pragma unroll
@@ -1236,18 +1255,18 @@ kernel_cake_kimi_k3_fp8_projection_a7a3c0aea2689d441306(const __grid_constant__ 
                             pre[i_1] = pre[i_1] + parts_q_1[i_1];
                         }
                     }
-                    if (skp_lnc_2 > 2) {
-                        int skp_vi0_2 = ((skp_lt_2 * sk_ksplit + 2) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
+                    if (skp_lnc_2 > 3) {
+                        int skp_vi0_2 = ((skp_lt_2 * sk_ksplit + 3) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
                         float parts_q_2[32];
                         #pragma unroll
-                        for (int skp_v_2 = 0; skp_v_2 < 8; skp_v_2++) {
-                            int skp_vi_2 = skp_vi0_2 + skp_v_2 * 32;
+                        for (int skp_v_3 = 0; skp_v_3 < 8; skp_v_3++) {
+                            int skp_vi_3 = skp_vi0_2 + skp_v_3 * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_2 * 4) + 0);
-                                parts_q_2[4 * skp_v_2 + 0] = _v4.x;
-                                parts_q_2[4 * skp_v_2 + 1] = _v4.y;
-                                parts_q_2[4 * skp_v_2 + 2] = _v4.z;
-                                parts_q_2[4 * skp_v_2 + 3] = _v4.w;
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_3 * 4) + 0);
+                                parts_q_2[4 * skp_v_3 + 0] = _v4.x;
+                                parts_q_2[4 * skp_v_3 + 1] = _v4.y;
+                                parts_q_2[4 * skp_v_3 + 2] = _v4.z;
+                                parts_q_2[4 * skp_v_3 + 3] = _v4.w;
                             }
                         }
                         #pragma unroll
@@ -1255,59 +1274,59 @@ kernel_cake_kimi_k3_fp8_projection_a7a3c0aea2689d441306(const __grid_constant__ 
                             pre[i_2] = pre[i_2] + parts_q_2[i_2];
                         }
                     }
-                    if (skp_lnc_2 > 3) {
-                        int skp_vi0_3 = ((skp_lt_2 * sk_ksplit + 3) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
-                        float parts_q_3[32];
-                        #pragma unroll
-                        for (int skp_v_3 = 0; skp_v_3 < 8; skp_v_3++) {
-                            int skp_vi_3 = skp_vi0_3 + skp_v_3 * 32;
-                            {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_3 * 4) + 0);
-                                parts_q_3[4 * skp_v_3 + 0] = _v4.x;
-                                parts_q_3[4 * skp_v_3 + 1] = _v4.y;
-                                parts_q_3[4 * skp_v_3 + 2] = _v4.z;
-                                parts_q_3[4 * skp_v_3 + 3] = _v4.w;
-                            }
-                        }
-                        #pragma unroll
-                        for (int i_3 = 0; i_3 < 32; i_3++) {
-                            pre[i_3] = pre[i_3] + parts_q_3[i_3];
-                        }
-                    }
                     tmem_st_x16_f32(skp_pre_addr, pre);
                     tmem_st_x16_f32(skp_pre_addr + 16, (pre + 16));
                     float pre_0[32];
                     if (skp_lnc_2 > 0) {
-                        int skp_vi0_4 = (skp_lt_2 * sk_ksplit * 2 * 8 * 32 + skp_wvec) * 32 + lane;
-                        float parts_q_4[32];
+                        int skp_vi0_3 = (skp_lt_2 * sk_ksplit * 2 * 8 * 32 + skp_wvec) * 32 + lane;
+                        float parts_q_3[32];
                         #pragma unroll
                         for (int skp_v_4 = 0; skp_v_4 < 8; skp_v_4++) {
-                            int skp_vi_4 = skp_vi0_4 + (8 + skp_v_4) * 32;
+                            int skp_vi_4 = skp_vi0_3 + (8 + skp_v_4) * 32;
                             {
                                 float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_4 * 4) + 0);
-                                parts_q_4[4 * skp_v_4 + 0] = _v4.x;
-                                parts_q_4[4 * skp_v_4 + 1] = _v4.y;
-                                parts_q_4[4 * skp_v_4 + 2] = _v4.z;
-                                parts_q_4[4 * skp_v_4 + 3] = _v4.w;
+                                parts_q_3[4 * skp_v_4 + 0] = _v4.x;
+                                parts_q_3[4 * skp_v_4 + 1] = _v4.y;
+                                parts_q_3[4 * skp_v_4 + 2] = _v4.z;
+                                parts_q_3[4 * skp_v_4 + 3] = _v4.w;
+                            }
+                        }
+                        #pragma unroll
+                        for (int i_3 = 0; i_3 < 32; i_3++) {
+                            pre_0[i_3] = parts_q_3[i_3];
+                        }
+                    }
+                    if (skp_lnc_2 > 1) {
+                        int skp_vi0_4 = ((skp_lt_2 * sk_ksplit + 1) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
+                        float parts_q_4[32];
+                        #pragma unroll
+                        for (int skp_v_5 = 0; skp_v_5 < 8; skp_v_5++) {
+                            int skp_vi_5 = skp_vi0_4 + (8 + skp_v_5) * 32;
+                            {
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_5 * 4) + 0);
+                                parts_q_4[4 * skp_v_5 + 0] = _v4.x;
+                                parts_q_4[4 * skp_v_5 + 1] = _v4.y;
+                                parts_q_4[4 * skp_v_5 + 2] = _v4.z;
+                                parts_q_4[4 * skp_v_5 + 3] = _v4.w;
                             }
                         }
                         #pragma unroll
                         for (int i_4 = 0; i_4 < 32; i_4++) {
-                            pre_0[i_4] = parts_q_4[i_4];
+                            pre_0[i_4] = pre_0[i_4] + parts_q_4[i_4];
                         }
                     }
-                    if (skp_lnc_2 > 1) {
-                        int skp_vi0_5 = ((skp_lt_2 * sk_ksplit + 1) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
+                    if (skp_lnc_2 > 2) {
+                        int skp_vi0_5 = ((skp_lt_2 * sk_ksplit + 2) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
                         float parts_q_5[32];
                         #pragma unroll
-                        for (int skp_v_5 = 0; skp_v_5 < 8; skp_v_5++) {
-                            int skp_vi_5 = skp_vi0_5 + (8 + skp_v_5) * 32;
+                        for (int skp_v_6 = 0; skp_v_6 < 8; skp_v_6++) {
+                            int skp_vi_6 = skp_vi0_5 + (8 + skp_v_6) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_5 * 4) + 0);
-                                parts_q_5[4 * skp_v_5 + 0] = _v4.x;
-                                parts_q_5[4 * skp_v_5 + 1] = _v4.y;
-                                parts_q_5[4 * skp_v_5 + 2] = _v4.z;
-                                parts_q_5[4 * skp_v_5 + 3] = _v4.w;
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_6 * 4) + 0);
+                                parts_q_5[4 * skp_v_6 + 0] = _v4.x;
+                                parts_q_5[4 * skp_v_6 + 1] = _v4.y;
+                                parts_q_5[4 * skp_v_6 + 2] = _v4.z;
+                                parts_q_5[4 * skp_v_6 + 3] = _v4.w;
                             }
                         }
                         #pragma unroll
@@ -1315,18 +1334,18 @@ kernel_cake_kimi_k3_fp8_projection_a7a3c0aea2689d441306(const __grid_constant__ 
                             pre_0[i_5] = pre_0[i_5] + parts_q_5[i_5];
                         }
                     }
-                    if (skp_lnc_2 > 2) {
-                        int skp_vi0_6 = ((skp_lt_2 * sk_ksplit + 2) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
+                    if (skp_lnc_2 > 3) {
+                        int skp_vi0_6 = ((skp_lt_2 * sk_ksplit + 3) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
                         float parts_q_6[32];
                         #pragma unroll
-                        for (int skp_v_6 = 0; skp_v_6 < 8; skp_v_6++) {
-                            int skp_vi_6 = skp_vi0_6 + (8 + skp_v_6) * 32;
+                        for (int skp_v_7 = 0; skp_v_7 < 8; skp_v_7++) {
+                            int skp_vi_7 = skp_vi0_6 + (8 + skp_v_7) * 32;
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_6 * 4) + 0);
-                                parts_q_6[4 * skp_v_6 + 0] = _v4.x;
-                                parts_q_6[4 * skp_v_6 + 1] = _v4.y;
-                                parts_q_6[4 * skp_v_6 + 2] = _v4.z;
-                                parts_q_6[4 * skp_v_6 + 3] = _v4.w;
+                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_7 * 4) + 0);
+                                parts_q_6[4 * skp_v_7 + 0] = _v4.x;
+                                parts_q_6[4 * skp_v_7 + 1] = _v4.y;
+                                parts_q_6[4 * skp_v_7 + 2] = _v4.z;
+                                parts_q_6[4 * skp_v_7 + 3] = _v4.w;
                             }
                         }
                         #pragma unroll
@@ -1334,181 +1353,162 @@ kernel_cake_kimi_k3_fp8_projection_a7a3c0aea2689d441306(const __grid_constant__ 
                             pre_0[i_6] = pre_0[i_6] + parts_q_6[i_6];
                         }
                     }
-                    if (skp_lnc_2 > 3) {
-                        int skp_vi0_7 = ((skp_lt_2 * sk_ksplit + 3) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
-                        float parts_q_7[32];
-                        #pragma unroll
-                        for (int skp_v_7 = 0; skp_v_7 < 8; skp_v_7++) {
-                            int skp_vi_7 = skp_vi0_7 + (8 + skp_v_7) * 32;
-                            {
-                                float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_7 * 4) + 0);
-                                parts_q_7[4 * skp_v_7 + 0] = _v4.x;
-                                parts_q_7[4 * skp_v_7 + 1] = _v4.y;
-                                parts_q_7[4 * skp_v_7 + 2] = _v4.z;
-                                parts_q_7[4 * skp_v_7 + 3] = _v4.w;
-                            }
-                        }
-                        #pragma unroll
-                        for (int i_7 = 0; i_7 < 32; i_7++) {
-                            pre_0[i_7] = pre_0[i_7] + parts_q_7[i_7];
-                        }
-                    }
                     tmem_st_x16_f32(skp_pre_addr + 32, pre_0);
                     tmem_st_x16_f32(skp_pre_addr + 32 + 16, (pre_0 + 16));
                     float pre_1[32];
                     if (skp_lnc_2 > 0) {
-                        int skp_vi0_8 = (skp_lt_2 * sk_ksplit * 2 * 8 * 32 + skp_wvec) * 32 + lane;
-                        float parts_q_8[32];
+                        int skp_vi0_7 = (skp_lt_2 * sk_ksplit * 2 * 8 * 32 + skp_wvec) * 32 + lane;
+                        float parts_q_7[32];
                         #pragma unroll
                         for (int skp_v_8 = 0; skp_v_8 < 8; skp_v_8++) {
-                            int skp_vi_8 = skp_vi0_8 + (16 + skp_v_8) * 32;
+                            int skp_vi_8 = skp_vi0_7 + (16 + skp_v_8) * 32;
                             {
                                 float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_8 * 4) + 0);
-                                parts_q_8[4 * skp_v_8 + 0] = _v4.x;
-                                parts_q_8[4 * skp_v_8 + 1] = _v4.y;
-                                parts_q_8[4 * skp_v_8 + 2] = _v4.z;
-                                parts_q_8[4 * skp_v_8 + 3] = _v4.w;
+                                parts_q_7[4 * skp_v_8 + 0] = _v4.x;
+                                parts_q_7[4 * skp_v_8 + 1] = _v4.y;
+                                parts_q_7[4 * skp_v_8 + 2] = _v4.z;
+                                parts_q_7[4 * skp_v_8 + 3] = _v4.w;
                             }
                         }
                         #pragma unroll
-                        for (int i_8 = 0; i_8 < 32; i_8++) {
-                            pre_1[i_8] = parts_q_8[i_8];
+                        for (int i_7 = 0; i_7 < 32; i_7++) {
+                            pre_1[i_7] = parts_q_7[i_7];
                         }
                     }
                     if (skp_lnc_2 > 1) {
-                        int skp_vi0_9 = ((skp_lt_2 * sk_ksplit + 1) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
-                        float parts_q_9[32];
+                        int skp_vi0_3_1 = ((skp_lt_2 * sk_ksplit + 1) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
+                        float parts_q_3_1[32];
                         #pragma unroll
                         for (int skp_v_9 = 0; skp_v_9 < 8; skp_v_9++) {
-                            int skp_vi_9 = skp_vi0_9 + (16 + skp_v_9) * 32;
+                            int skp_vi_9 = skp_vi0_3_1 + (16 + skp_v_9) * 32;
                             {
                                 float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_9 * 4) + 0);
-                                parts_q_9[4 * skp_v_9 + 0] = _v4.x;
-                                parts_q_9[4 * skp_v_9 + 1] = _v4.y;
-                                parts_q_9[4 * skp_v_9 + 2] = _v4.z;
-                                parts_q_9[4 * skp_v_9 + 3] = _v4.w;
+                                parts_q_3_1[4 * skp_v_9 + 0] = _v4.x;
+                                parts_q_3_1[4 * skp_v_9 + 1] = _v4.y;
+                                parts_q_3_1[4 * skp_v_9 + 2] = _v4.z;
+                                parts_q_3_1[4 * skp_v_9 + 3] = _v4.w;
                             }
                         }
                         #pragma unroll
-                        for (int i_9 = 0; i_9 < 32; i_9++) {
-                            pre_1[i_9] = pre_1[i_9] + parts_q_9[i_9];
+                        for (int i_3_1 = 0; i_3_1 < 32; i_3_1++) {
+                            pre_1[i_3_1] = pre_1[i_3_1] + parts_q_3_1[i_3_1];
                         }
                     }
                     if (skp_lnc_2 > 2) {
-                        int skp_vi0_10 = ((skp_lt_2 * sk_ksplit + 2) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
-                        float parts_q_10[32];
+                        int skp_vi0_4_1 = ((skp_lt_2 * sk_ksplit + 2) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
+                        float parts_q_4_1[32];
                         #pragma unroll
                         for (int skp_v_10 = 0; skp_v_10 < 8; skp_v_10++) {
-                            int skp_vi_10 = skp_vi0_10 + (16 + skp_v_10) * 32;
+                            int skp_vi_10 = skp_vi0_4_1 + (16 + skp_v_10) * 32;
                             {
                                 float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_10 * 4) + 0);
-                                parts_q_10[4 * skp_v_10 + 0] = _v4.x;
-                                parts_q_10[4 * skp_v_10 + 1] = _v4.y;
-                                parts_q_10[4 * skp_v_10 + 2] = _v4.z;
-                                parts_q_10[4 * skp_v_10 + 3] = _v4.w;
+                                parts_q_4_1[4 * skp_v_10 + 0] = _v4.x;
+                                parts_q_4_1[4 * skp_v_10 + 1] = _v4.y;
+                                parts_q_4_1[4 * skp_v_10 + 2] = _v4.z;
+                                parts_q_4_1[4 * skp_v_10 + 3] = _v4.w;
                             }
                         }
                         #pragma unroll
-                        for (int i_10 = 0; i_10 < 32; i_10++) {
-                            pre_1[i_10] = pre_1[i_10] + parts_q_10[i_10];
+                        for (int i_4_1 = 0; i_4_1 < 32; i_4_1++) {
+                            pre_1[i_4_1] = pre_1[i_4_1] + parts_q_4_1[i_4_1];
                         }
                     }
                     if (skp_lnc_2 > 3) {
-                        int skp_vi0_11 = ((skp_lt_2 * sk_ksplit + 3) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
-                        float parts_q_11[32];
+                        int skp_vi0_5_1 = ((skp_lt_2 * sk_ksplit + 3) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
+                        float parts_q_5_1[32];
                         #pragma unroll
                         for (int skp_v_11 = 0; skp_v_11 < 8; skp_v_11++) {
-                            int skp_vi_11 = skp_vi0_11 + (16 + skp_v_11) * 32;
+                            int skp_vi_11 = skp_vi0_5_1 + (16 + skp_v_11) * 32;
                             {
                                 float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_11 * 4) + 0);
-                                parts_q_11[4 * skp_v_11 + 0] = _v4.x;
-                                parts_q_11[4 * skp_v_11 + 1] = _v4.y;
-                                parts_q_11[4 * skp_v_11 + 2] = _v4.z;
-                                parts_q_11[4 * skp_v_11 + 3] = _v4.w;
+                                parts_q_5_1[4 * skp_v_11 + 0] = _v4.x;
+                                parts_q_5_1[4 * skp_v_11 + 1] = _v4.y;
+                                parts_q_5_1[4 * skp_v_11 + 2] = _v4.z;
+                                parts_q_5_1[4 * skp_v_11 + 3] = _v4.w;
                             }
                         }
                         #pragma unroll
-                        for (int i_11 = 0; i_11 < 32; i_11++) {
-                            pre_1[i_11] = pre_1[i_11] + parts_q_11[i_11];
+                        for (int i_5_1 = 0; i_5_1 < 32; i_5_1++) {
+                            pre_1[i_5_1] = pre_1[i_5_1] + parts_q_5_1[i_5_1];
                         }
                     }
                     tmem_st_x16_f32(skp_pre_addr + 64, pre_1);
                     tmem_st_x16_f32(skp_pre_addr + 64 + 16, (pre_1 + 16));
                     float pre_2[16];
                     if (skp_lnc_2 > 0) {
-                        int skp_vi0_12 = (skp_lt_2 * sk_ksplit * 2 * 8 * 32 + skp_wvec) * 32 + lane;
-                        float parts_q_12[16];
+                        int skp_vi0_8 = (skp_lt_2 * sk_ksplit * 2 * 8 * 32 + skp_wvec) * 32 + lane;
+                        float parts_q_8[16];
                         #pragma unroll
                         for (int skp_v_12 = 0; skp_v_12 < 4; skp_v_12++) {
-                            int skp_vi_12 = skp_vi0_12 + (24 + skp_v_12) * 32;
+                            int skp_vi_12 = skp_vi0_8 + (24 + skp_v_12) * 32;
                             {
                                 float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_12 * 4) + 0);
-                                parts_q_12[4 * skp_v_12 + 0] = _v4.x;
-                                parts_q_12[4 * skp_v_12 + 1] = _v4.y;
-                                parts_q_12[4 * skp_v_12 + 2] = _v4.z;
-                                parts_q_12[4 * skp_v_12 + 3] = _v4.w;
+                                parts_q_8[4 * skp_v_12 + 0] = _v4.x;
+                                parts_q_8[4 * skp_v_12 + 1] = _v4.y;
+                                parts_q_8[4 * skp_v_12 + 2] = _v4.z;
+                                parts_q_8[4 * skp_v_12 + 3] = _v4.w;
                             }
                         }
                         #pragma unroll
-                        for (int i_12 = 0; i_12 < 16; i_12++) {
-                            pre_2[i_12] = parts_q_12[i_12];
+                        for (int i_8 = 0; i_8 < 16; i_8++) {
+                            pre_2[i_8] = parts_q_8[i_8];
                         }
                     }
                     if (skp_lnc_2 > 1) {
-                        int skp_vi0_13 = ((skp_lt_2 * sk_ksplit + 1) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
-                        float parts_q_13[16];
+                        int skp_vi0_6_1 = ((skp_lt_2 * sk_ksplit + 1) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
+                        float parts_q_6_1[16];
                         #pragma unroll
                         for (int skp_v_13 = 0; skp_v_13 < 4; skp_v_13++) {
-                            int skp_vi_13 = skp_vi0_13 + (24 + skp_v_13) * 32;
+                            int skp_vi_13 = skp_vi0_6_1 + (24 + skp_v_13) * 32;
                             {
                                 float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_13 * 4) + 0);
-                                parts_q_13[4 * skp_v_13 + 0] = _v4.x;
-                                parts_q_13[4 * skp_v_13 + 1] = _v4.y;
-                                parts_q_13[4 * skp_v_13 + 2] = _v4.z;
-                                parts_q_13[4 * skp_v_13 + 3] = _v4.w;
+                                parts_q_6_1[4 * skp_v_13 + 0] = _v4.x;
+                                parts_q_6_1[4 * skp_v_13 + 1] = _v4.y;
+                                parts_q_6_1[4 * skp_v_13 + 2] = _v4.z;
+                                parts_q_6_1[4 * skp_v_13 + 3] = _v4.w;
                             }
                         }
                         #pragma unroll
-                        for (int i_13 = 0; i_13 < 16; i_13++) {
-                            pre_2[i_13] = pre_2[i_13] + parts_q_13[i_13];
+                        for (int i_6_1 = 0; i_6_1 < 16; i_6_1++) {
+                            pre_2[i_6_1] = pre_2[i_6_1] + parts_q_6_1[i_6_1];
                         }
                     }
                     if (skp_lnc_2 > 2) {
-                        int skp_vi0_14 = ((skp_lt_2 * sk_ksplit + 2) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
-                        float parts_q_14[16];
+                        int skp_vi0_7_1 = ((skp_lt_2 * sk_ksplit + 2) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
+                        float parts_q_7_1[16];
                         #pragma unroll
                         for (int skp_v_14 = 0; skp_v_14 < 4; skp_v_14++) {
-                            int skp_vi_14 = skp_vi0_14 + (24 + skp_v_14) * 32;
+                            int skp_vi_14 = skp_vi0_7_1 + (24 + skp_v_14) * 32;
                             {
                                 float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_14 * 4) + 0);
-                                parts_q_14[4 * skp_v_14 + 0] = _v4.x;
-                                parts_q_14[4 * skp_v_14 + 1] = _v4.y;
-                                parts_q_14[4 * skp_v_14 + 2] = _v4.z;
-                                parts_q_14[4 * skp_v_14 + 3] = _v4.w;
+                                parts_q_7_1[4 * skp_v_14 + 0] = _v4.x;
+                                parts_q_7_1[4 * skp_v_14 + 1] = _v4.y;
+                                parts_q_7_1[4 * skp_v_14 + 2] = _v4.z;
+                                parts_q_7_1[4 * skp_v_14 + 3] = _v4.w;
                             }
                         }
                         #pragma unroll
-                        for (int i_14 = 0; i_14 < 16; i_14++) {
-                            pre_2[i_14] = pre_2[i_14] + parts_q_14[i_14];
+                        for (int i_7_1 = 0; i_7_1 < 16; i_7_1++) {
+                            pre_2[i_7_1] = pre_2[i_7_1] + parts_q_7_1[i_7_1];
                         }
                     }
                     if (skp_lnc_2 > 3) {
-                        int skp_vi0_15 = ((skp_lt_2 * sk_ksplit + 3) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
-                        float parts_q_15[16];
+                        int skp_vi0_8_1 = ((skp_lt_2 * sk_ksplit + 3) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
+                        float parts_q_8_1[16];
                         #pragma unroll
                         for (int skp_v_15 = 0; skp_v_15 < 4; skp_v_15++) {
-                            int skp_vi_15 = skp_vi0_15 + (24 + skp_v_15) * 32;
+                            int skp_vi_15 = skp_vi0_8_1 + (24 + skp_v_15) * 32;
                             {
                                 float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_15 * 4) + 0);
-                                parts_q_15[4 * skp_v_15 + 0] = _v4.x;
-                                parts_q_15[4 * skp_v_15 + 1] = _v4.y;
-                                parts_q_15[4 * skp_v_15 + 2] = _v4.z;
-                                parts_q_15[4 * skp_v_15 + 3] = _v4.w;
+                                parts_q_8_1[4 * skp_v_15 + 0] = _v4.x;
+                                parts_q_8_1[4 * skp_v_15 + 1] = _v4.y;
+                                parts_q_8_1[4 * skp_v_15 + 2] = _v4.z;
+                                parts_q_8_1[4 * skp_v_15 + 3] = _v4.w;
                             }
                         }
                         #pragma unroll
-                        for (int i_15 = 0; i_15 < 16; i_15++) {
-                            pre_2[i_15] = pre_2[i_15] + parts_q_15[i_15];
+                        for (int i_8_1 = 0; i_8_1 < 16; i_8_1++) {
+                            pre_2[i_8_1] = pre_2[i_8_1] + parts_q_8_1[i_8_1];
                         }
                     }
                     tmem_st_x16_f32(skp_pre_addr + 96, pre_2);
@@ -1561,8 +1561,8 @@ kernel_cake_kimi_k3_fp8_projection_a7a3c0aea2689d441306(const __grid_constant__ 
                         : "r"(skp_pre_addr));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
                     #pragma unroll
-                    for (int i_16 = 0; i_16 < 32; i_16++) {
-                        _tmem_load_2[i_16] = _tmem_load_3[i_16] + _tmem_load_2[i_16];
+                    for (int i_9 = 0; i_9 < 32; i_9++) {
+                        _tmem_load_2[i_9] = _tmem_load_3[i_9] + _tmem_load_2[i_9];
                     }
                     float _tmem_load_4[32];
                     asm volatile(
@@ -1572,8 +1572,8 @@ kernel_cake_kimi_k3_fp8_projection_a7a3c0aea2689d441306(const __grid_constant__ 
                         : "r"(skp_pre_addr + 32));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
                     #pragma unroll
-                    for (int i_17 = 0; i_17 < 32; i_17++) {
-                        _tmem_load_2[32 + i_17] = _tmem_load_4[i_17] + _tmem_load_2[32 + i_17];
+                    for (int i_10 = 0; i_10 < 32; i_10++) {
+                        _tmem_load_2[32 + i_10] = _tmem_load_4[i_10] + _tmem_load_2[32 + i_10];
                     }
                     float _tmem_load_5[32];
                     asm volatile(
@@ -1583,15 +1583,15 @@ kernel_cake_kimi_k3_fp8_projection_a7a3c0aea2689d441306(const __grid_constant__ 
                         : "r"(skp_pre_addr + 64));
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
                     #pragma unroll
-                    for (int i_18 = 0; i_18 < 32; i_18++) {
-                        _tmem_load_2[64 + i_18] = _tmem_load_5[i_18] + _tmem_load_2[64 + i_18];
+                    for (int i_11 = 0; i_11 < 32; i_11++) {
+                        _tmem_load_2[64 + i_11] = _tmem_load_5[i_11] + _tmem_load_2[64 + i_11];
                     }
                     float _tmem_load_6[16];
                     tmem_ld_x16(&_tmem_load_6[0], skp_pre_addr + 96);
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
                     #pragma unroll
-                    for (int i_19 = 0; i_19 < 16; i_19++) {
-                        _tmem_load_2[96 + i_19] = _tmem_load_6[i_19] + _tmem_load_2[96 + i_19];
+                    for (int i_12 = 0; i_12 < 16; i_12++) {
+                        _tmem_load_2[96 + i_12] = _tmem_load_6[i_12] + _tmem_load_2[96 + i_12];
                     }
                     float post[16];
                     if (skp_lnc_2 > 0) {
@@ -1609,70 +1609,70 @@ kernel_cake_kimi_k3_fp8_projection_a7a3c0aea2689d441306(const __grid_constant__ 
                             }
                         }
                         #pragma unroll
-                        for (int i_20 = 0; i_20 < 16; i_20++) {
-                            post[i_20] = parts_p[i_20];
+                        for (int i_13 = 0; i_13 < 16; i_13++) {
+                            post[i_13] = parts_p[i_13];
                         }
                     }
                     if (skp_lnc_2 > 1) {
-                        int skp_pvi0_1 = ((skp_lt_2 * sk_ksplit + 1) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
-                        float parts_p_1[16];
+                        int skp_pvi0_0 = ((skp_lt_2 * sk_ksplit + 1) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
+                        float parts_p_0[16];
                         #pragma unroll
                         for (int skp_v_17 = 0; skp_v_17 < 4; skp_v_17++) {
-                            int skp_vi_17 = skp_pvi0_1 + (28 + skp_v_17) * 32;
+                            int skp_vi_17 = skp_pvi0_0 + (28 + skp_v_17) * 32;
                             {
                                 float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_17 * 4) + 0);
-                                parts_p_1[4 * skp_v_17 + 0] = _v4.x;
-                                parts_p_1[4 * skp_v_17 + 1] = _v4.y;
-                                parts_p_1[4 * skp_v_17 + 2] = _v4.z;
-                                parts_p_1[4 * skp_v_17 + 3] = _v4.w;
+                                parts_p_0[4 * skp_v_17 + 0] = _v4.x;
+                                parts_p_0[4 * skp_v_17 + 1] = _v4.y;
+                                parts_p_0[4 * skp_v_17 + 2] = _v4.z;
+                                parts_p_0[4 * skp_v_17 + 3] = _v4.w;
                             }
                         }
                         #pragma unroll
-                        for (int i_21 = 0; i_21 < 16; i_21++) {
-                            post[i_21] = post[i_21] + parts_p_1[i_21];
+                        for (int i_9_1 = 0; i_9_1 < 16; i_9_1++) {
+                            post[i_9_1] = post[i_9_1] + parts_p_0[i_9_1];
                         }
                     }
                     if (skp_lnc_2 > 2) {
-                        int skp_pvi0_2 = ((skp_lt_2 * sk_ksplit + 2) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
-                        float parts_p_2[16];
+                        int skp_pvi0_1 = ((skp_lt_2 * sk_ksplit + 2) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
+                        float parts_p_1[16];
                         #pragma unroll
                         for (int skp_v_18 = 0; skp_v_18 < 4; skp_v_18++) {
-                            int skp_vi_18 = skp_pvi0_2 + (28 + skp_v_18) * 32;
+                            int skp_vi_18 = skp_pvi0_1 + (28 + skp_v_18) * 32;
                             {
                                 float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_18 * 4) + 0);
-                                parts_p_2[4 * skp_v_18 + 0] = _v4.x;
-                                parts_p_2[4 * skp_v_18 + 1] = _v4.y;
-                                parts_p_2[4 * skp_v_18 + 2] = _v4.z;
-                                parts_p_2[4 * skp_v_18 + 3] = _v4.w;
+                                parts_p_1[4 * skp_v_18 + 0] = _v4.x;
+                                parts_p_1[4 * skp_v_18 + 1] = _v4.y;
+                                parts_p_1[4 * skp_v_18 + 2] = _v4.z;
+                                parts_p_1[4 * skp_v_18 + 3] = _v4.w;
                             }
                         }
                         #pragma unroll
-                        for (int i_22 = 0; i_22 < 16; i_22++) {
-                            post[i_22] = post[i_22] + parts_p_2[i_22];
+                        for (int i_10_1 = 0; i_10_1 < 16; i_10_1++) {
+                            post[i_10_1] = post[i_10_1] + parts_p_1[i_10_1];
                         }
                     }
                     if (skp_lnc_2 > 3) {
-                        int skp_pvi0_3 = ((skp_lt_2 * sk_ksplit + 3) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
-                        float parts_p_3[16];
+                        int skp_pvi0_2 = ((skp_lt_2 * sk_ksplit + 3) * 2 * 8 * 32 + skp_wvec) * 32 + lane;
+                        float parts_p_2[16];
                         #pragma unroll
                         for (int skp_v_19 = 0; skp_v_19 < 4; skp_v_19++) {
-                            int skp_vi_19 = skp_pvi0_3 + (28 + skp_v_19) * 32;
+                            int skp_vi_19 = skp_pvi0_2 + (28 + skp_v_19) * 32;
                             {
                                 float4 _v4 = *reinterpret_cast<const float4*>(sk_partials + ((unsigned long long)skp_vi_19 * 4) + 0);
-                                parts_p_3[4 * skp_v_19 + 0] = _v4.x;
-                                parts_p_3[4 * skp_v_19 + 1] = _v4.y;
-                                parts_p_3[4 * skp_v_19 + 2] = _v4.z;
-                                parts_p_3[4 * skp_v_19 + 3] = _v4.w;
+                                parts_p_2[4 * skp_v_19 + 0] = _v4.x;
+                                parts_p_2[4 * skp_v_19 + 1] = _v4.y;
+                                parts_p_2[4 * skp_v_19 + 2] = _v4.z;
+                                parts_p_2[4 * skp_v_19 + 3] = _v4.w;
                             }
                         }
                         #pragma unroll
-                        for (int i_23 = 0; i_23 < 16; i_23++) {
-                            post[i_23] = post[i_23] + parts_p_3[i_23];
+                        for (int i_11_1 = 0; i_11_1 < 16; i_11_1++) {
+                            post[i_11_1] = post[i_11_1] + parts_p_2[i_11_1];
                         }
                     }
                     #pragma unroll
-                    for (int i_24 = 0; i_24 < 16; i_24++) {
-                        _tmem_load_2[112 + i_24] = post[i_24] + _tmem_load_2[112 + i_24];
+                    for (int i_14 = 0; i_14 < 16; i_14++) {
+                        _tmem_load_2[112 + i_14] = post[i_14] + _tmem_load_2[112 + i_14];
                     }
                 }
                 unsigned int tmem_load_0_bf16_1[64];

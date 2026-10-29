@@ -361,6 +361,7 @@ def decode_front_plan(
         early_arrive=False,
         up_prefetch=False,
         sb_norm=False,
+        partial_prefetch=False,
         tiles=tiles,
     )
 
@@ -375,15 +376,20 @@ def decode_tail_plan(
 ) -> dict[str, Any]:
     """Instance configuration of ``tail_decode_fused`` (port of ``_tail_plan`` with the production defaults); the
     few-token multi-partial rows of ``TAIL_SB_NORM_ROUTES`` take the global-y instance of their N_PAD with the
-    resident-B arithmetic (``sb_norm``)."""
+    resident-B arithmetic (``sb_norm``), and the cells of ``TAIL_PARTIAL_PREFETCH_ROUTES`` the instance the table
+    names with the routed partials prefetched into L2 (``partial_prefetch``)."""
     sb_norm_n_pad = tail_sb_norm_n_pad(num_tokens, tp, num_partials)
+    prefetch = tail_partial_prefetch(num_tokens, tp, num_partials)
+    if prefetch is not None:
+        sb_norm_n_pad = TAIL_SB_NORM_ROUTES[int(tp)][0] if prefetch else 0
     if sb_norm_n_pad:
         plan = decode_tail_plan(sb_norm_n_pad, i_local, tp, num_partials, sm_count)
-        if plan["smem_b1"] or plan["split_fin"]:
+        if plan["smem_b1"] or plan["split_fin"] or plan["partial_prefetch"]:
             raise AssertionError(
                 f"tp{tp} N_PAD {sb_norm_n_pad} P={num_partials}: not a global-y instance"
             )
         plan["sb_norm"] = True
+        plan["partial_prefetch"] = prefetch is not None
         return plan
     n_pad = n_pad_for(num_tokens)
     tiles = HIDDEN // BLOCK_ROWS
@@ -451,6 +457,10 @@ def decode_tail_plan(
             if use_rows
             else (SMEM_B1_MIN_STAGES if use_bn else 2),
         )
+    if prefetch is not None and not (use_bn and not use_rows):
+        raise AssertionError(
+            f"tp{tp} T={num_tokens} P={num_partials}: not a resident-B instance without staged rows"
+        )
     # The global-y protocol's levers (the resident-B instances normalise in smem and take neither).
     early_arrive = split_fin and not use_bn and tp == TAIL_EARLY_ARRIVE_TP
     up_prefetch = (
@@ -497,6 +507,7 @@ def decode_tail_plan(
         early_arrive=bool(early_arrive),
         up_prefetch=bool(up_prefetch),
         sb_norm=False,
+        partial_prefetch=prefetch is not None,
         tiles=tiles,
         k1=k1,
         k2=k2,
@@ -541,10 +552,12 @@ TAIL_UP_PREFETCH_N_PAD = (32, 64)
 # ``bf16(bf16(sum) x rstd)``, ``bf16(w x normed)`` in FP32), so its ``y`` and ``out`` are bitwise the resident-B
 # instance's for every input, signed zeros and subnormals included.  ``TAIL_SB_NORM_ROUTES`` maps a TP to the N_PAD of
 # that instance and, per token count, the fewest partials it serves: the cells where it measured faster than the
-# resident-B instance on B300, GB300 and GB200 (paired CUDA-graph timing, both passes beyond the A/A band).
+# resident-B instance on B300, GB300 and GB200 (paired CUDA-graph timing, both passes beyond the A/A band).  The TP8
+# instance serves only with the routed partials prefetched (``TAIL_PARTIAL_PREFETCH_ROUTES``), faster on every cell it
+# served, so its entry keeps the N_PAD alone.
 TAIL_SB_NORM_ROUTES: dict[int, tuple[int, dict[int, int]]] = {
     1: (32, {1: 5, 2: 5, 3: 5, 4: 5, 5: 3, 6: 3, 7: 3, 8: 3}),
-    8: (8, {1: 5, 2: 5, 3: 4, 4: 4}),
+    8: (8, {}),
 }
 
 
@@ -562,6 +575,50 @@ def tail_sb_norm_n_pad(num_tokens: int, tp: int, num_partials: int) -> int:
     n_pad, min_partials = TAIL_SB_NORM_ROUTES.get(int(tp), (0, {}))
     least = min_partials.get(int(num_tokens))
     return n_pad if least is not None and int(num_partials) >= least else 0
+
+
+# Routed-partial L2 prefetch (``partial_prefetch``, symbol suffix ``_ppf``).  The resident-B tail instance and the
+# global-y instances with the resident-B arithmetic sum the P routed partials in a dependent loop, one HBM round trip
+# per partial under the weight stream.  Their ``_ppf`` forms warm the partial rows in L2 with 7 KiB bulk prefetches
+# issued as soon as the partial stride is known (the global-y instance: lanes 1 .. P-1 of the warp that owns a row; the
+# resident-B instance: the (row, partial) pairs spread over the grid, one prefetch per pair); the arithmetic, and so
+# every output, is the instance's own.  ``TAIL_PARTIAL_PREFETCH_ROUTES`` maps a TP and a token count to the partial
+# ranges ``(first, last, sb_norm)`` each form serves -- ``sb_norm`` true: the global-y instance of
+# ``TAIL_SB_NORM_ROUTES`` (``_sbn_ppf``), false: the resident-B instance (``_sb..._ppf``, TP1); ``last`` ``None``: from
+# ``first`` up, as ``TAIL_SB_NORM_ROUTES`` serves from its fewest partials up -- the cells where it measured faster
+# than the route without it on every part measured (paired CUDA-graph timing, both passes beyond the A/A band; 2 to
+# 16 partials).
+_PrefetchCells = dict[int, tuple[tuple[int, Optional[int], bool], ...]]
+TAIL_PARTIAL_PREFETCH_ROUTES: dict[int, _PrefetchCells] = {
+    1: {
+        1: ((4, 6, False), (7, None, True)),
+        2: ((4, 6, False), (7, None, True)),
+        3: ((4, 6, False), (7, None, True)),
+        4: ((4, 6, False), (7, None, True)),
+        5: ((3, 3, False), (5, None, True)),
+        6: ((3, 3, False), (5, None, True)),
+        7: ((3, 3, False), (5, None, True)),
+        8: ((3, 3, False), (5, None, True)),
+    },
+    8: {
+        1: ((4, None, True),),
+        2: ((4, None, True),),
+        3: ((4, None, True),),
+        4: ((3, None, True),),
+    },
+}
+
+
+def tail_partial_prefetch(
+    num_tokens: int, tp: int, num_partials: int
+) -> Optional[bool]:
+    """``sb_norm`` of the routed-partial prefetch instance that serves the decode tail of ``num_tokens`` tokens and
+    ``num_partials`` routed partials at ``tp`` (``TAIL_PARTIAL_PREFETCH_ROUTES``), or ``None`` for the route without it."""
+    cells = TAIL_PARTIAL_PREFETCH_ROUTES.get(int(tp), {})
+    for first, last, sb_norm in cells.get(int(num_tokens), ()):
+        if first <= int(num_partials) and (last is None or int(num_partials) <= last):
+            return sb_norm
+    return None
 
 
 def decode_symbol(plan: dict[str, Any]) -> str:
@@ -584,6 +641,7 @@ def decode_symbol(plan: dict[str, Any]) -> str:
         f"{_l2_promotion_suffix(plan.get('a_l2_promotion', 'none'))}"
         f"{'_sf' if plan.get('split_fin') else ''}{'_ea' if plan.get('early_arrive') else ''}"
         f"{'_upf' if plan.get('up_prefetch') else ''}{'_sbn' if plan.get('sb_norm') else ''}"
+        f"{'_ppf' if plan.get('partial_prefetch') else ''}"
     )
 
 
@@ -2456,6 +2514,7 @@ __all__ = [
     "tail_gemm_config",
     "tail_gemm_final_ts",
     "tail_gemm_kernel_key",
+    "tail_partial_prefetch",
     "tail_sb_norm_n_pad",
     "tail_wide_min_tokens",
     "use_fused_norm",

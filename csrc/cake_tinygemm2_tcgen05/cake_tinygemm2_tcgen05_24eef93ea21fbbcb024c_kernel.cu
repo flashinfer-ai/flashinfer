@@ -280,38 +280,38 @@ kernel_cake_tinygemm2_tcgen05_24eef93ea21fbbcb024c(const __grid_constant__ CUten
             if (elect_sync()) {
                 #pragma unroll 1
                 for (int rho = 0; rho < n_rounds; rho++) {
-                    int s0 = rho * 16;
-                    if (s0 < n_groups) {
+                    int s0_1_0 = rho * 16;
+                    if (s0_1_0 < n_groups) {
                         mbarrier_wait(tma_empty_addr + (a_stage) * 8, _phase_tma_empty);
                         tma_2d_gmem2smem(smem_a_addr + a_stage * 2 * 16384, (&W), rho * 4 * 4 * 64, m0, tma_full_addr + (a_stage) * 8);
                         tma_2d_gmem2smem(smem_a_addr + a_stage * 2 * 16384 + 4096, (&W), (rho * 4 + 1) * 4 * 64, m0, tma_full_addr + (a_stage) * 8);
                         tma_2d_gmem2smem(smem_a_addr + a_stage * 2 * 16384 + 8192, (&W), (rho * 4 + 2) * 4 * 64, m0, tma_full_addr + (a_stage) * 8);
                         tma_2d_gmem2smem(smem_a_addr + a_stage * 2 * 16384 + 12288, (&W), (rho * 4 + 3) * 4 * 64, m0, tma_full_addr + (a_stage) * 8);
-                        if (n_groups > s0 + 1) {
+                        if (n_groups > s0_1_0 + 1) {
                             tma_2d_gmem2smem(smem_a_addr + (a_stage * 2 + 1) * 16384, (&W), (rho * 4 * 4 + 1) * 64, m0, tma_full_addr + (a_stage) * 8);
                             tma_2d_gmem2smem(smem_a_addr + (a_stage * 2 + 1) * 16384 + 4096, (&W), ((rho * 4 + 1) * 4 + 1) * 64, m0, tma_full_addr + (a_stage) * 8);
                             tma_2d_gmem2smem(smem_a_addr + (a_stage * 2 + 1) * 16384 + 8192, (&W), ((rho * 4 + 2) * 4 + 1) * 64, m0, tma_full_addr + (a_stage) * 8);
                             tma_2d_gmem2smem(smem_a_addr + (a_stage * 2 + 1) * 16384 + 12288, (&W), ((rho * 4 + 3) * 4 + 1) * 64, m0, tma_full_addr + (a_stage) * 8);
                         }
-                        int _min_0 = ((n_groups - s0) < (2) ? (n_groups - s0) : (2));
+                        int _min_0 = ((n_groups - s0_1_0) < (2) ? (n_groups - s0_1_0) : (2));
                         mbarrier_arrive_expect_tx(tma_full_addr + (a_stage) * 8, _min_0 * 16384);
                         a_stage += 1;
                         if (a_stage == 4) { a_stage = 0; _phase_tma_empty ^= 1; }
                     }
-                    int s0_0 = rho * 16 + 2;
-                    if (s0_0 < n_groups) {
+                    int s0_1_1 = rho * 16 + 2;
+                    if (s0_1_1 < n_groups) {
                         mbarrier_wait(tma_empty_addr + (a_stage) * 8, _phase_tma_empty);
                         tma_2d_gmem2smem(smem_a_addr + a_stage * 2 * 16384, (&W), (rho * 4 * 4 + 2) * 64, m0, tma_full_addr + (a_stage) * 8);
                         tma_2d_gmem2smem(smem_a_addr + a_stage * 2 * 16384 + 4096, (&W), ((rho * 4 + 1) * 4 + 2) * 64, m0, tma_full_addr + (a_stage) * 8);
                         tma_2d_gmem2smem(smem_a_addr + a_stage * 2 * 16384 + 8192, (&W), ((rho * 4 + 2) * 4 + 2) * 64, m0, tma_full_addr + (a_stage) * 8);
                         tma_2d_gmem2smem(smem_a_addr + a_stage * 2 * 16384 + 12288, (&W), ((rho * 4 + 3) * 4 + 2) * 64, m0, tma_full_addr + (a_stage) * 8);
-                        if (n_groups > s0_0 + 1) {
+                        if (n_groups > s0_1_1 + 1) {
                             tma_2d_gmem2smem(smem_a_addr + (a_stage * 2 + 1) * 16384, (&W), (rho * 4 * 4 + 2 + 1) * 64, m0, tma_full_addr + (a_stage) * 8);
                             tma_2d_gmem2smem(smem_a_addr + (a_stage * 2 + 1) * 16384 + 4096, (&W), ((rho * 4 + 1) * 4 + 2 + 1) * 64, m0, tma_full_addr + (a_stage) * 8);
                             tma_2d_gmem2smem(smem_a_addr + (a_stage * 2 + 1) * 16384 + 8192, (&W), ((rho * 4 + 2) * 4 + 2 + 1) * 64, m0, tma_full_addr + (a_stage) * 8);
                             tma_2d_gmem2smem(smem_a_addr + (a_stage * 2 + 1) * 16384 + 12288, (&W), ((rho * 4 + 3) * 4 + 2 + 1) * 64, m0, tma_full_addr + (a_stage) * 8);
                         }
-                        int _min_1 = ((n_groups - s0_0) < (2) ? (n_groups - s0_0) : (2));
+                        int _min_1 = ((n_groups - s0_1_1) < (2) ? (n_groups - s0_1_1) : (2));
                         mbarrier_arrive_expect_tx(tma_full_addr + (a_stage) * 8, _min_1 * 16384);
                         a_stage += 1;
                         if (a_stage == 4) { a_stage = 0; _phase_tma_empty ^= 1; }
@@ -333,38 +333,38 @@ kernel_cake_tinygemm2_tcgen05_24eef93ea21fbbcb024c(const __grid_constant__ CUten
                 asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
                 #pragma unroll 1
                 for (int rho_1 = 0; rho_1 < n_rounds_b; rho_1++) {
-                    int s0b = rho_1 * 16;
-                    if (s0b < n_groups_b) {
+                    int s0b_1_0 = rho_1 * 16;
+                    if (s0b_1_0 < n_groups_b) {
                         mbarrier_wait(tma_empty_addr + (b_stage) * 8, _phase_tma_empty_1);
                         tma_2d_gmem2smem(smem_b_addr + b_stage * 2 * 8192, (&X), rho_1 * 4 * 4 * 64, n0, tma_full_addr + (b_stage) * 8);
                         tma_2d_gmem2smem(smem_b_addr + b_stage * 2 * 8192 + 2048, (&X), (rho_1 * 4 + 1) * 4 * 64, n0, tma_full_addr + (b_stage) * 8);
                         tma_2d_gmem2smem(smem_b_addr + b_stage * 2 * 8192 + 4096, (&X), (rho_1 * 4 + 2) * 4 * 64, n0, tma_full_addr + (b_stage) * 8);
                         tma_2d_gmem2smem(smem_b_addr + b_stage * 2 * 8192 + 6144, (&X), (rho_1 * 4 + 3) * 4 * 64, n0, tma_full_addr + (b_stage) * 8);
-                        if (n_groups_b > s0b + 1) {
+                        if (n_groups_b > s0b_1_0 + 1) {
                             tma_2d_gmem2smem(smem_b_addr + (b_stage * 2 + 1) * 8192, (&X), (rho_1 * 4 * 4 + 1) * 64, n0, tma_full_addr + (b_stage) * 8);
                             tma_2d_gmem2smem(smem_b_addr + (b_stage * 2 + 1) * 8192 + 2048, (&X), ((rho_1 * 4 + 1) * 4 + 1) * 64, n0, tma_full_addr + (b_stage) * 8);
                             tma_2d_gmem2smem(smem_b_addr + (b_stage * 2 + 1) * 8192 + 4096, (&X), ((rho_1 * 4 + 2) * 4 + 1) * 64, n0, tma_full_addr + (b_stage) * 8);
                             tma_2d_gmem2smem(smem_b_addr + (b_stage * 2 + 1) * 8192 + 6144, (&X), ((rho_1 * 4 + 3) * 4 + 1) * 64, n0, tma_full_addr + (b_stage) * 8);
                         }
-                        int _min_0_1 = ((n_groups_b - s0b) < (2) ? (n_groups_b - s0b) : (2));
+                        int _min_0_1 = ((n_groups_b - s0b_1_0) < (2) ? (n_groups_b - s0b_1_0) : (2));
                         mbarrier_arrive_expect_tx(tma_full_addr + (b_stage) * 8, _min_0_1 * 4096);
                         b_stage += 1;
                         if (b_stage == 4) { b_stage = 0; _phase_tma_empty_1 ^= 1; }
                     }
-                    int s0b_0 = rho_1 * 16 + 2;
-                    if (s0b_0 < n_groups_b) {
+                    int s0b_1_1 = rho_1 * 16 + 2;
+                    if (s0b_1_1 < n_groups_b) {
                         mbarrier_wait(tma_empty_addr + (b_stage) * 8, _phase_tma_empty_1);
                         tma_2d_gmem2smem(smem_b_addr + b_stage * 2 * 8192, (&X), (rho_1 * 4 * 4 + 2) * 64, n0, tma_full_addr + (b_stage) * 8);
                         tma_2d_gmem2smem(smem_b_addr + b_stage * 2 * 8192 + 2048, (&X), ((rho_1 * 4 + 1) * 4 + 2) * 64, n0, tma_full_addr + (b_stage) * 8);
                         tma_2d_gmem2smem(smem_b_addr + b_stage * 2 * 8192 + 4096, (&X), ((rho_1 * 4 + 2) * 4 + 2) * 64, n0, tma_full_addr + (b_stage) * 8);
                         tma_2d_gmem2smem(smem_b_addr + b_stage * 2 * 8192 + 6144, (&X), ((rho_1 * 4 + 3) * 4 + 2) * 64, n0, tma_full_addr + (b_stage) * 8);
-                        if (n_groups_b > s0b_0 + 1) {
+                        if (n_groups_b > s0b_1_1 + 1) {
                             tma_2d_gmem2smem(smem_b_addr + (b_stage * 2 + 1) * 8192, (&X), (rho_1 * 4 * 4 + 2 + 1) * 64, n0, tma_full_addr + (b_stage) * 8);
                             tma_2d_gmem2smem(smem_b_addr + (b_stage * 2 + 1) * 8192 + 2048, (&X), ((rho_1 * 4 + 1) * 4 + 2 + 1) * 64, n0, tma_full_addr + (b_stage) * 8);
                             tma_2d_gmem2smem(smem_b_addr + (b_stage * 2 + 1) * 8192 + 4096, (&X), ((rho_1 * 4 + 2) * 4 + 2 + 1) * 64, n0, tma_full_addr + (b_stage) * 8);
                             tma_2d_gmem2smem(smem_b_addr + (b_stage * 2 + 1) * 8192 + 6144, (&X), ((rho_1 * 4 + 3) * 4 + 2 + 1) * 64, n0, tma_full_addr + (b_stage) * 8);
                         }
-                        int _min_1_1 = ((n_groups_b - s0b_0) < (2) ? (n_groups_b - s0b_0) : (2));
+                        int _min_1_1 = ((n_groups_b - s0b_1_1) < (2) ? (n_groups_b - s0b_1_1) : (2));
                         mbarrier_arrive_expect_tx(tma_full_addr + (b_stage) * 8, _min_1_1 * 4096);
                         b_stage += 1;
                         if (b_stage == 4) { b_stage = 0; _phase_tma_empty_1 ^= 1; }
@@ -387,8 +387,8 @@ kernel_cake_tinygemm2_tcgen05_24eef93ea21fbbcb024c(const __grid_constant__ CUten
             if (elect_sync()) {
                 #pragma unroll 1
                 for (int rho_2 = 0; rho_2 < n_rounds_m; rho_2++) {
-                    int s0m = rho_2 * 16;
-                    if (s0m < n_groups_m) {
+                    int s0m_1_0 = rho_2 * 16;
+                    if (s0m_1_0 < n_groups_m) {
                         mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
@@ -432,7 +432,7 @@ kernel_cake_tinygemm2_tcgen05_24eef93ea21fbbcb024c(const __grid_constant__ CUten
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_smem_desc_lo_0), "r"(_smem_desc_lo_1), "r"(tmem_acc), "r"(1) : "memory");
-                        if (n_groups_m > s0m + 1) {
+                        if (n_groups_m > s0m_1_0 + 1) {
 #if __CUDA_ARCH__ == 1070
                             int _smem_desc_lo_2 = (((smem_a_addr) >> 4) & 0x7FFF) + (mma_stage * 2 + 1) * 1024;
                             int _smem_desc_lo_3 = (((smem_b_addr) >> 4) & 0x7FFF) + (mma_stage * 2 + 1) * 512;
@@ -479,8 +479,8 @@ kernel_cake_tinygemm2_tcgen05_24eef93ea21fbbcb024c(const __grid_constant__ CUten
                         mma_stage += 1;
                         if (mma_stage == 4) { mma_stage = 0; _phase_tma_full ^= 1; }
                     }
-                    int s0m_0 = rho_2 * 16 + 2;
-                    if (s0m_0 < n_groups_m) {
+                    int s0m_1_1 = rho_2 * 16 + 2;
+                    if (s0m_1_1 < n_groups_m) {
                         mbarrier_wait(tma_full_addr + (mma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
 #if __CUDA_ARCH__ == 1070
@@ -524,7 +524,7 @@ kernel_cake_tinygemm2_tcgen05_24eef93ea21fbbcb024c(const __grid_constant__ CUten
                     "tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
                     :: "r"(_smem_desc_lo_4), "r"(_smem_desc_lo_5), "r"(tmem_acc), "r"(1) : "memory");
-                        if (n_groups_m > s0m_0 + 1) {
+                        if (n_groups_m > s0m_1_1 + 1) {
 #if __CUDA_ARCH__ == 1070
                             int _smem_desc_lo_6 = (((smem_a_addr) >> 4) & 0x7FFF) + (mma_stage * 2 + 1) * 1024;
                             int _smem_desc_lo_7 = (((smem_b_addr) >> 4) & 0x7FFF) + (mma_stage * 2 + 1) * 512;
@@ -637,28 +637,28 @@ kernel_cake_tinygemm2_tcgen05_24eef93ea21fbbcb024c(const __grid_constant__ CUten
             }
             asm volatile("tcgen05.fence::before_thread_sync;");
             asm volatile("barrier.sync 2, 128;" ::: "memory");
-            int elem0 = epi_tid;
-            if (elem0 < 512) {
-                int r_e0 = elem0 % 32;
-                int col_e0 = elem0 / 32;
-                float s01_0 = red[elem0] + red[elem0 + 512];
-                float s012_0 = s01_0 + red[elem0 + 1024];
-                float tot0 = s012_0 + red[elem0 + 1536];
-                int my_m0 = m0_e + r_e0;
-                if (my_m0 < M && n0_e + col_e0 < N) {
-                    *(reinterpret_cast<__nv_bfloat16*>(out + (my_m0 + (n0_e + col_e0) * M)) + (0)) = (__nv_bfloat16)tot0;
+            int elem0_1_0 = epi_tid;
+            if (elem0_1_0 < 512) {
+                int r_e0_1_0 = elem0_1_0 % 32;
+                int col_e0_1_0 = elem0_1_0 / 32;
+                float s01_1 = red[elem0_1_0] + red[elem0_1_0 + 512];
+                float s012_1 = s01_1 + red[elem0_1_0 + 1024];
+                float tot0_1_0 = s012_1 + red[elem0_1_0 + 1536];
+                int my_m0_1_0 = m0_e + r_e0_1_0;
+                if (my_m0_1_0 < M && n0_e + col_e0_1_0 < N) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out + (my_m0_1_0 + (n0_e + col_e0_1_0) * M)) + (0)) = (__nv_bfloat16)tot0_1_0;
                 }
             }
-            int elem1 = epi_tid + 128;
-            if (elem1 < 512) {
-                int r_e1 = elem1 % 32;
-                int col_e1 = elem1 / 32;
-                float s01_1 = red[elem1] + red[elem1 + 512];
-                float s012_1 = s01_1 + red[elem1 + 1024];
-                float tot1 = s012_1 + red[elem1 + 1536];
-                int my_m1 = m0_e + r_e1;
-                if (my_m1 < M && n0_e + col_e1 < N) {
-                    *(reinterpret_cast<__nv_bfloat16*>(out + (my_m1 + (n0_e + col_e1) * M)) + (0)) = (__nv_bfloat16)tot1;
+            int elem0_1_1 = epi_tid + 128;
+            if (elem0_1_1 < 512) {
+                int r_e0_1_1 = elem0_1_1 % 32;
+                int col_e0_1_1 = elem0_1_1 / 32;
+                float s01_2 = red[elem0_1_1] + red[elem0_1_1 + 512];
+                float s012_2 = s01_2 + red[elem0_1_1 + 1024];
+                float tot0_1_1 = s012_2 + red[elem0_1_1 + 1536];
+                int my_m0_1_1 = m0_e + r_e0_1_1;
+                if (my_m0_1_1 < M && n0_e + col_e0_1_1 < N) {
+                    *(reinterpret_cast<__nv_bfloat16*>(out + (my_m0_1_1 + (n0_e + col_e0_1_1) * M)) + (0)) = (__nv_bfloat16)tot0_1_1;
                 }
             }
         }

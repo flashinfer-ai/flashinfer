@@ -374,6 +374,7 @@ kernel_cake_dsv4_f81486848bf3b4e05349(const __grid_constant__ CUtensorMap tmap_q
     // Mbarriers at smem_raw[0..128)
 
     if (warp == 0) {
+#if __CUDA_ARCH__ == 1030
         uint32_t leader = elect_sync();
         if (leader) {
             // q_full: 1 barriers, init_count=1
@@ -403,14 +404,41 @@ kernel_cake_dsv4_f81486848bf3b4e05349(const __grid_constant__ CUtensorMap tmap_q
             // partial_done: 1 barriers, init_count=256
             mbarrier_init(smem + 120, 256);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+#else
+        // q_full: 1 barriers, init_count=1
+        // --- pipeline 'kv_pipe' ---
+        // kv_full: 4 barriers, init_count=1
+        // s_full: 2 barriers, init_count=1
+        // p_full: 2 barriers, init_count=128
+        // stats_full: 1 barriers, init_count=128
+        // o_full_lo: 2 barriers, init_count=1
+        // o_full_hi: 2 barriers, init_count=1
+        // tmem_dealloc: 1 barriers, init_count=256
+        // partial_done: 1 barriers, init_count=256
+        // Warp-cooperative initialization in physical record order.
+        uint32_t _mbarrier_init_count_0_0 = 256;
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(14), "r"((uint32_t)(1)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(10), "r"((uint32_t)(128)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(7), "r"((uint32_t)(1)));
+        if (lane < 16) {
+            mbarrier_init(smem + 0 + lane * 8, _mbarrier_init_count_0_0);
+#endif
         }
+#if __CUDA_ARCH__ == 1030
+#else
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+#endif
     }
 
     __syncwarp();
 
     // TMEM alloc (128 columns, 80 used)
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 128);
+#if __CUDA_ARCH__ == 1030
     if (warp == 0) {
+#else
+    if (warp == 12) {
+#endif
         int _tmem_hold = smem + 128;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(128) : "memory");
         __syncwarp();

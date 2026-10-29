@@ -62,7 +62,7 @@ SHAPE_ROWS = {
     ),
     "fp8_b256_q32_k1024": (
         "context_fp8", 256, 32, 1024, 32, 4, 64, True,
-        {"sm100a": "B256", "sm103a": "B256"},
+        {"sm100a": "B256", "sm103a": "B256_KV4"},
     ),
     "nvfp4_b4_q511_k2047": (
         "context_nvfp4", 4, 511, 2047, 32, 4, 16, True,
@@ -91,9 +91,13 @@ SHAPE_ROWS = {
 # both scale forms itself.
 _DEVICE_SCALE_PROGRAM = {
     "B256": "B256_SCALE_PTR",
+    "B256_KV4": "B256_SCALE_PTR_KV4",
     "Q511_SM100A": "Q511_SCALE_PTR_SM100A",
     "Q511_SM103A": "Q511_SCALE_PTR_SM103A",
 }
+# The exact FP8 program of a target (host scales): sm103a ships the 4-stage
+# K/V ring build.
+_FP8_EXACT = {"sm100a": "B256", "sm103a": "B256_KV4"}
 # runtime-size program identifier -> its pack
 _RUNTIME_PACK = {
     identifier: pack
@@ -666,8 +670,12 @@ def test_cake_fmha_context_fp8_exact_routes_come_first(monkeypatch, target) -> N
     for host and device scales alike."""
 
     routes = cake_api._CONTEXT_PROGRAM_ROUTES[target]
-    assert routes[("context_fp8", "host", 32, 4, 8, 1, 64, None)] == "B256"
-    assert routes[("context_fp8", "device", 32, 4, 8, 1, 64, None)] == "B256_SCALE_PTR"
+    exact = _FP8_EXACT[target]
+    assert routes[("context_fp8", "host", 32, 4, 8, 1, 64, None)] == exact
+    assert (
+        routes[("context_fp8", "device", 32, 4, 8, 1, 64, None)]
+        == _DEVICE_SCALE_PROGRAM[exact]
+    )
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
     pack = cake_api._context_fp8_runtime_pack(cake_api._context_pack_g(33, 1024, 32, 4))
     for device_scales in (False, True):
@@ -802,41 +810,55 @@ def test_cake_fmha_context_fp8_split_plan_margins(
     assert (plan is not None) is splits
 
 
-def test_cake_fmha_context_fp8_split_makespan_one_stage_share() -> None:
-    """The one-stage share scales only the partial store and the merge: the
-    whole-tile schedule keeps its time, a split plan's time falls by at most
-    the share's part of one store and one merge per unit of its slowest CTA."""
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+def test_cake_fmha_context_fp8_split_costs_scale_with_the_tile_rows(target) -> None:
+    """A launch's split costs are the target's with the unit, the partial
+    store and the merge scaled by the query rows of its tiles: whole for 256
+    rows and for launches of several m-blocks, less for fewer rows; the
+    launch's fixed cost, the KV block and the extra units' share never
+    scale."""
 
-    costs = cake_api._CONTEXT_FP8_SPLIT_COSTS["sm103a"]
-    _, _, _, store, merge0, merge1, _ = costs
-    blocks = cake_api._context_fp8_tile_blocks(1, 32, 16384, 32, 4)
-    makespan = cake_api._context_fp8_split_makespan
-    assert makespan(blocks, 152, 0, 1, 1, costs, 0.5) == makespan(
-        blocks, 152, 0, 1, 1, costs
-    )
-    two = makespan(blocks, 152, 8, 13, 10, costs)
-    assert makespan(blocks, 152, 8, 13, 10, costs, 1.0) == two
-    one = makespan(blocks, 152, 8, 13, 10, costs, 0.5)
-    # one unit per CTA (80 units): the merger's store and merge are halved
-    assert one == pytest.approx(two - 0.5 * (store + merge0 + merge1 * 10))
+    costs = cake_api._CONTEXT_FP8_SPLIT_COSTS[target]
+    s0, u0 = cake_api._CONTEXT_FP8_SPLIT_ROWS[target]
+    assert 0.0 <= s0 <= 1.0 and 0.0 <= u0 <= 1.0
+    scaled = cake_api._context_fp8_split_costs
+    # 32 tokens x pack 8: 256 rows; 300 tokens: several m-blocks of any pack
+    assert scaled(target, 32, 8) == costs
+    assert scaled(target, 300, 8) == scaled(target, 300, 1) == costs
+    previous = costs
+    for pack in (4, 2, 1):
+        rows = 32 * pack
+        got = scaled(target, 32, pack)
+        assert (got[0], got[1], got[6]) == (costs[0], costs[1], costs[6])
+        assert got[2] == pytest.approx(costs[2] * (u0 + (1 - u0) * rows / 256))
+        for index in (3, 4, 5):
+            assert got[index] == pytest.approx(
+                costs[index] * (s0 + (1 - s0) * rows / 256)
+            )
+        assert all(cost <= more for cost, more in zip(got, previous, strict=True))
+        previous = got
 
 
 # (batch, max_q_len, max_kv_len, num_q_heads, pack): launches the split choice
-# sees; a smaller pack runs a plan only for one m-block of two query stages
-# whose plan splits every tile.
+# sees; a smaller pack runs a plan only for a launch of one m-block.
 _SPLIT_CHOICE_ROWS = [
     (1, 32, 16384, 32, 8),
+    (1, 32, 1024, 32, 8),
     (1, 32, 2048, 32, 8),
+    (1, 32, 4096, 32, 8),
     (1, 32, 32768, 32, 8),
     (1, 32, 16384, 16, 8),
     (1, 24, 8192, 32, 8),
     (2, 32, 16384, 32, 8),
+    (2, 32, 4096, 32, 8),
     (4, 32, 16384, 32, 8),
     (16, 32, 16384, 32, 8),
     (1, 16, 16384, 32, 8),
+    (1, 32, 16384, 64, 8),
     (1, 128, 16384, 32, 8),
     (2, 300, 6000, 32, 8),
     (1, 64, 4096, 64, 4),
+    (1, 32, 16384, 32, 4),
     (1, 256, 8192, 32, 1),
     (256, 32, 1024, 32, 8),
 ]
@@ -849,11 +871,12 @@ _SPLIT_CHOICE_ROWS = [
 def test_cake_fmha_context_fp8_split_choice(
     target, batch, max_q, max_kv, num_q_heads, pack
 ) -> None:
-    """The split choice keeps the pack's plan, or runs the same split
-    (``split_blocks``, ``num_splits``) over every tile of a smaller shipped
-    pack whose tiles hold all query tokens in one stage, where the cost model
-    (one-stage share) predicts it faster by both margins; it splits exactly
-    where the pack's own plan does."""
+    """The split choice keeps the pack's plan, or, for a launch of one
+    m-block, runs a smaller shipped pack whose tiles hold every query token in
+    one stage: the pack's split (``split_blocks``, ``num_splits``) over its
+    tiles, or its own best split; only where the cost model of each pack's
+    tile rows predicts it faster than the pack's plan (or whole tiles) by both
+    margins."""
 
     sm_count = _SM_COUNT[target]
     choice = cake_api._context_fp8_split_choice(
@@ -862,60 +885,86 @@ def test_cake_fmha_context_fp8_split_choice(
     own = cake_api._context_fp8_split_plan(
         target, batch, max_q, max_kv, num_q_heads, pack, sm_count
     )
-    assert (choice is None) is (own is None)
     if choice is None:
+        assert own is None
         return
     chosen, plan = choice
     if chosen == pack:
         assert plan == own
         return
+    assert chosen < pack and pack % chosen == 0
+    assert chosen in (*cake_api._CONTEXT_FP8_RUNTIME_PACKS, 1)
+    assert max_q <= 2 * (128 // pack) and max_q <= 128 // chosen
     blocks = cake_api._context_fp8_tile_blocks(batch, max_q, max_kv, num_q_heads, pack)
     smaller = cake_api._context_fp8_tile_blocks(
         batch, max_q, max_kv, num_q_heads, chosen
     )
-    assert chosen < pack and pack % chosen == 0
-    assert chosen in (*cake_api._CONTEXT_FP8_RUNTIME_PACKS, 1)
-    assert 128 // pack < max_q <= 2 * (128 // pack) and max_q <= 128 // chosen
-    assert own[0] == len(blocks)
-    assert plan == (len(smaller), own[1], own[2])
-    assert len(smaller) <= sm_count - 1
-    costs = cake_api._CONTEXT_FP8_SPLIT_COSTS[target]
-    share = cake_api._CONTEXT_FP8_SPLIT_ONE_STAGE[target]
-    assert share < 1.0
-    time = cake_api._context_fp8_split_makespan(blocks, sm_count, *own, costs)
+    split_tiles, split_blocks, num_splits = plan
+    assert 1 <= split_tiles <= min(len(smaller), sm_count - 1)
+    assert 2 <= num_splits <= cake_api._CONTEXT_FP8_SPLIT_MAX
+    repack = (
+        own is not None
+        and own[0] == len(blocks)
+        and plan == (len(smaller), own[1], own[2])
+    )
+    if not repack:
+        found = cake_api._context_fp8_split_search(
+            target, batch, max_q, max_kv, num_q_heads, chosen, sm_count, True
+        )
+        assert plan == found[0]
+    costs = cake_api._context_fp8_split_costs
+    time = cake_api._context_fp8_split_makespan(
+        blocks, sm_count, *(own or (0, 1, 1)), costs(target, max_q, pack)
+    )
     faster = cake_api._context_fp8_split_makespan(
-        smaller, sm_count, *plan, costs, share
+        smaller, sm_count, *plan, costs(target, max_q, chosen)
     )
     assert faster <= time * (1 - cake_api._CONTEXT_FP8_SPLIT_REL_MARGIN)
     assert time - faster >= cake_api._CONTEXT_FP8_SPLIT_ABS_MARGIN
 
 
+def _clear_split_caches() -> None:
+    for cached in (
+        cake_api._context_fp8_split_costs,
+        cake_api._context_fp8_split_search,
+        cake_api._context_fp8_split_plan,
+        cake_api._context_fp8_split_choice,
+    ):
+        cached.cache_clear()
+
+
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))
 def test_cake_fmha_context_fp8_split_choice_bounds(monkeypatch, target) -> None:
-    """With a one-stage share of 1 no launch changes pack; with a smaller
-    share, one request of 32 query tokens over 16384 keys (4 tiles of pack 8)
-    runs pack 8's split over the 8 tiles of pack 4, while launches that a
-    smaller pack would spread over more than one wave of units (4 requests),
-    whose query tokens span several m-blocks (300 tokens) or fill one stage
-    already (16 tokens) keep pack 8."""
+    """With the shipped costs, launches whose query tokens span several
+    m-blocks (300 tokens) or that run many waves of tiles (256 requests) keep
+    pack 8, while one request of 32 query tokens over 16384 keys runs pack 8's
+    split over the 8 tiles of pack 4 (the same output bytes); where the tile
+    rows do not scale the costs (``S0 = U0 = 1``) no launch changes pack (a
+    smaller pack only adds tiles)."""
 
     sm_count = _SM_COUNT[target]
     choice = cake_api._context_fp8_split_choice
+    for row in ((2, 300, 6000), (256, 32, 1024)):
+        result = choice(target, *row, 32, 8, sm_count)
+        assert result is None or result[0] == 8, row
+    own = cake_api._context_fp8_split_plan(target, 1, 32, 16384, 32, 8, sm_count)
+    assert choice(target, 1, 32, 16384, 32, 8, sm_count) == (4, (8, own[1], own[2]))
+    rows = (
+        (1, 32, 16384),
+        (2, 32, 16384),
+        (1, 32, 2048),
+        (1, 32, 1024),
+        (1, 16, 16384),
+    )
     try:
-        for share, repacks in ((1.0, False), (0.5, True)):
-            monkeypatch.setitem(cake_api._CONTEXT_FP8_SPLIT_ONE_STAGE, target, share)
-            choice.cache_clear()
-            own = cake_api._context_fp8_split_plan(
-                target, 1, 32, 16384, 32, 8, sm_count
-            )
-            expected = (4, (8, own[1], own[2])) if repacks else (8, own)
-            assert choice(target, 1, 32, 16384, 32, 8, sm_count) == expected
-            for row in ((4, 32, 16384), (2, 300, 6000), (1, 16, 16384)):
-                result = choice(target, *row, 32, 8, sm_count)
-                assert result is None or result[0] == 8, row
+        monkeypatch.setitem(cake_api._CONTEXT_FP8_SPLIT_ROWS, target, (1.0, 1.0))
+        _clear_split_caches()
+        for row in rows:
+            result = choice(target, *row, 32, 8, sm_count)
+            assert result is None or result[0] == 8, row
     finally:
-        # the cached choices of the patched share must not outlive the test
-        choice.cache_clear()
+        # the cached choices of the patched costs must not outlive the test
+        _clear_split_caches()
 
 
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))
@@ -930,7 +979,10 @@ def test_cake_fmha_context_fp8_split_route(monkeypatch, target) -> None:
     row = ("context_fp8", 1, 32, 16384, 32, 4, 64, True, None)
     meta = torch.device("meta")
     kwargs = _context_kwargs(row, device="meta")
-    assert cake_api.select_cake_fmha_context_route(meta, **kwargs).program == "B256"
+    assert (
+        cake_api.select_cake_fmha_context_route(meta, **kwargs).program
+        == _FP8_EXACT[target]
+    )
     sm_count = _SM_COUNT[target]
     monkeypatch.setattr(cake_api, "_context_split_sm_count", lambda device: sm_count)
     pack, plan = cake_api._context_fp8_split_choice(
@@ -948,7 +1000,10 @@ def test_cake_fmha_context_fp8_split_route(monkeypatch, target) -> None:
     short = dict(
         kwargs, workspace_buffer=torch.empty(need - 1, dtype=torch.uint8, device="meta")
     )
-    assert cake_api.select_cake_fmha_context_route(meta, **short).program == "B256"
+    assert (
+        cake_api.select_cake_fmha_context_route(meta, **short).program
+        == _FP8_EXACT[target]
+    )
     enough = dict(
         kwargs, workspace_buffer=torch.empty(need, dtype=torch.uint8, device="meta")
     )
@@ -967,7 +1022,56 @@ def test_cake_fmha_context_fp8_split_route(monkeypatch, target) -> None:
         == f"RUNTIME_SK_PACK{pack}_PAGE64"
     )
     many = _context_kwargs("fp8_b256_q32_k1024", device="meta")
-    assert cake_api.select_cake_fmha_context_route(meta, **many).program == "B256"
+    assert (
+        cake_api.select_cake_fmha_context_route(meta, **many).program
+        == _FP8_EXACT[target]
+    )
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+@pytest.mark.parametrize("page", (64, 16))
+@pytest.mark.parametrize("skipped", ("short_workspace", "no_split_program"))
+def test_cake_fmha_context_fp8_split_route_without_a_runtime_pack_plan(
+    monkeypatch, target, page, skipped
+) -> None:
+    """One request of 4 query tokens over 1024 keys, heads 32/4 (B256's exact
+    class at 64-token pages): pack 8 has no split plan, and the split choice
+    runs a smaller pack's own plan.  The call takes that pack's split-KV
+    program where the workspace holds the plan's partials; where it cannot
+    (a workspace one byte short, or no split-KV program of that pack) the call
+    keeps its program, as pack 8 has no plan of its own."""
+
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    sm_count = _SM_COUNT[target]
+    monkeypatch.setattr(cake_api, "_context_split_sm_count", lambda device: sm_count)
+    assert cake_api._context_fp8_split_plan(target, 1, 4, 1024, 32, 8, sm_count) is None
+    pack, plan = cake_api._context_fp8_split_choice(target, 1, 4, 1024, 32, 8, sm_count)
+    assert pack < 8
+    need = cake_api._context_fp8_split_workspace_bytes(plan[0], plan[2])
+    suffix = "_PAGE64" if page == 64 else ""
+    meta = torch.device("meta")
+    row = ("context_fp8", 1, 4, 1024, 32, 4, page, True, None)
+    kwargs = dict(
+        _context_kwargs(row, device="meta"),
+        workspace_buffer=torch.empty(need, dtype=torch.uint8, device="meta"),
+    )
+    route = cake_api.select_cake_fmha_context_route(meta, **kwargs)
+    assert route.program == f"RUNTIME_SK_PACK{pack}{suffix}", route
+    assert (route.pack_g, route.num_m_blocks) == (pack, 1)
+    if skipped == "short_workspace":
+        kwargs["workspace_buffer"] = torch.empty(
+            need - 1, dtype=torch.uint8, device="meta"
+        )
+    else:
+        routes = cake_api._CONTEXT_FP8_SPLIT_ROUTES[target]
+        monkeypatch.setitem(
+            cake_api._CONTEXT_FP8_SPLIT_ROUTES,
+            target,
+            {key: name for key, name in routes.items() if key[0] != pack},
+        )
+    route = cake_api.select_cake_fmha_context_route(meta, **kwargs)
+    assert route.program == (_FP8_EXACT[target] if page == 64 else "RUNTIME_PACK8")
+    assert (route.pack_g, route.num_m_blocks) == (8, 1)
 
 
 # --- The page tables a launch passes (host-only) -----------------------------
@@ -1400,7 +1504,9 @@ def test_cake_context_split_program_takes_the_chosen_plan_of_a_smaller_pack(
 ) -> None:
     """The split-KV program of a pack smaller than the call's runtime pack
     takes the split choice's plan where the choice names its pack (pack 8's
-    split over pack 4's tiles), and its own pack's plan otherwise."""
+    split over pack 4's tiles, with the shipped costs), and its own pack's
+    plan otherwise (no pack change where the tile rows do not scale the
+    costs)."""
 
     module = _stand_in_module("context_fp8", "RUNTIME_SK_PACK4")
     batch, q_len, kv_len, sm_count = 1, 32, 16384, 148
@@ -1424,13 +1530,13 @@ def test_cake_context_split_program_takes_the_chosen_plan_of_a_smaller_pack(
         sm_count=sm_count,
     )
     tables = torch.arange(kv_len // 64, dtype=torch.int32).view(1, -1)
-    choice = cake_api._context_fp8_split_choice
     own8 = cake_api._context_fp8_split_plan("sm100a", 1, 32, 16384, 32, 8, sm_count)
     own4 = cake_api._context_fp8_split_plan("sm100a", 1, 32, 16384, 32, 4, sm_count)
+    shipped = cake_api._CONTEXT_FP8_SPLIT_ROWS["sm100a"]
     try:
-        for share, plan in ((0.5, (8, own8[1], own8[2])), (1.0, own4)):
-            monkeypatch.setitem(cake_api._CONTEXT_FP8_SPLIT_ONE_STAGE, "sm100a", share)
-            choice.cache_clear()
+        for rows, plan in ((shipped, (8, own8[1], own8[2])), ((1.0, 1.0), own4)):
+            monkeypatch.setitem(cake_api._CONTEXT_FP8_SPLIT_ROWS, "sm100a", rows)
+            _clear_split_caches()
             values = _launch_values(monkeypatch, tables, **launch)
             assert (
                 values["split_tiles"],
@@ -1441,7 +1547,7 @@ def test_cake_context_split_program_takes_the_chosen_plan_of_a_smaller_pack(
             units = 8 + (plan[2] - 1) * plan[0]
             assert values["num_ctas"] == values["grid_x"] == min(sm_count, units)
     finally:
-        choice.cache_clear()
+        _clear_split_caches()
 
 
 @pytest.mark.parametrize("given", ("lse", "attention_sinks"))
@@ -1547,13 +1653,16 @@ def _reference_context(
 ):
     """FP32 bottom-right causal GQA attention over the paged HND pools: request
     ``b`` has ``q_lens[b]`` new tokens and attends its first ``kv_lens[b]``
-    cached tokens; query ``i`` sees keys ``j <= i + kv_len - q_len``."""
+    cached tokens; query ``i`` sees keys ``j <= i + kv_len - q_len``.  An
+    empty request (no query token, no key) has no rows."""
 
     num_q_heads, num_kv_heads, page = query.shape[1], key.shape[1], key.shape[2]
     group = num_q_heads // num_kv_heads
     out = torch.empty(query.shape, dtype=torch.float32, device=query.device)
     start = 0
     for b, (q_len, kv_len) in enumerate(zip(q_lens, kv_lens, strict=True)):
+        if q_len == 0:
+            continue
         count = (kv_len + page - 1) // page
         k = (
             key[tables_k[b, :count].long()]
@@ -1587,6 +1696,9 @@ def _reference_context(
         ("Q511", (10, 2), (511,) * 4, (2047, 1777, 1024, 600), 32, True),
         ("Q257", (10, 2), (257,) * 4, (1024, 900, 700, 300), 1024, False),
         ("B128", (32, 4), (64, 40, 17, 64), (192, 100, 64, 130), 16, True),
+        # An empty request (no query token, no key) between others: the launch
+        # completes and the other requests match the reference.
+        ("B128", (32, 4), (64, 0, 17, 64), (192, 0, 64, 130), 16, True),
     ],
 )
 def test_cake_context_bf16_programs_match_reference_and_replay(
@@ -1741,6 +1853,10 @@ def test_cake_context_quantized_programs_match_reference(
         _skip_without_nvfp4_programs("context_nvfp4")
     if program.startswith("Q511"):
         program = f"{program}_SM{_TARGET_ARCH[target][3:].upper()}"
+    if program.startswith("B256"):
+        program = {"B256": _FP8_EXACT[target]}.get(
+            program, _DEVICE_SCALE_PROGRAM[_FP8_EXACT[target]]
+        )
     original = prefill.trtllm_batch_context_with_kv_cache
 
     def cake_context(*args, **kwargs):
@@ -2186,6 +2302,9 @@ _SPLIT_CASES = [
     # one request of 64 query heads over 8 KV heads, 32 KV heads' worth of
     # 4096 keys
     ((64,), (4096,), (64, 8), 64, True),
+    # two requests of 32 query tokens over 16384 keys: a smaller pack's own
+    # split (its units differ from pack 8's)
+    ((32, 32), (16384, 16384), (32, 4), 64, True),
 ]
 
 
@@ -2322,10 +2441,10 @@ def test_cake_context_split_programs_match_reference_and_replay(
 def test_cake_context_split_choice_of_a_smaller_pack_is_bitwise_the_same(
     served_programs, monkeypatch
 ) -> None:
-    """Pack 8's split over the tiles of pack 4 (the split choice where its
-    one-stage share predicts a gain) writes the same output bytes as pack 8's
-    split-KV program: every query row meets the same KV units, merged in the
-    same order."""
+    """Pack 8's split over the tiles of pack 4 (the split choice with the
+    shipped costs) writes the same output bytes as pack 8's split-KV program
+    (the choice where the tile rows do not scale the costs): every query row
+    meets the same KV units, merged in the same order."""
 
     device = torch.device("cuda")
     target = cake_api._cake_fmha_target(device)
@@ -2355,13 +2474,16 @@ def test_cake_context_split_choice_of_a_smaller_pack_is_bitwise_the_same(
     cum_kv = torch.tensor([0, kv_len], dtype=torch.int32, device=device)
     seq_lens = torch.tensor([kv_len], dtype=torch.int32, device=device)
     choice = cake_api._context_fp8_split_choice
+    own = cake_api._context_fp8_split_plan(target, 1, q_len, kv_len, hq, 8, sm_count)
+    shipped = cake_api._CONTEXT_FP8_SPLIT_ROWS[target]
     outs = {}
     try:
-        for share in (1.0, 0.5):
-            monkeypatch.setitem(cake_api._CONTEXT_FP8_SPLIT_ONE_STAGE, target, share)
-            choice.cache_clear()
-            pack, _ = choice(target, 1, q_len, kv_len, hq, 8, sm_count)
-            assert pack == (8 if share == 1.0 else 4)
+        for rows in ((1.0, 1.0), shipped):
+            monkeypatch.setitem(cake_api._CONTEXT_FP8_SPLIT_ROWS, target, rows)
+            _clear_split_caches()
+            pack, plan = choice(target, 1, q_len, kv_len, hq, 8, sm_count)
+            expected = (8, own) if rows == (1.0, 1.0) else (4, (8, *own[1:]))
+            assert (pack, plan) == expected
             out = torch.full_like(query, float("nan"))
             prefill.trtllm_batch_context_with_kv_cache(
                 query,
@@ -2387,5 +2509,5 @@ def test_cake_context_split_choice_of_a_smaller_pack_is_bitwise_the_same(
             assert not counter.any()
             outs[pack] = out
     finally:
-        choice.cache_clear()
+        _clear_split_caches()
     assert torch.equal(_bits(outs[4]), _bits(outs[8]))

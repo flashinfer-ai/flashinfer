@@ -375,37 +375,32 @@ kernel_cake_dsv4_1cd047de4a9a94e4f214(const __grid_constant__ CUtensorMap tmap_q
     // Mbarriers at smem_raw[0..96)
 
     if (warp == 0) {
-        uint32_t leader = elect_sync();
-        if (leader) {
-            // q_full: 1 barriers, init_count=1
-            mbarrier_init(smem + 0, 1);
-            // --- pipeline 'kv_pipe' ---
-            // kv_full: 4 barriers, init_count=3
-            mbarrier_init(smem + 8, 3);
-            mbarrier_init(smem + 16, 3);
-            mbarrier_init(smem + 24, 3);
-            mbarrier_init(smem + 32, 3);
-            // s_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 40, 1);
-            mbarrier_init(smem + 48, 1);
-            // p_full: 2 barriers, init_count=4
-            mbarrier_init(smem + 56, 4);
-            mbarrier_init(smem + 64, 4);
-            // pv_done0: 1 barriers, init_count=1
-            mbarrier_init(smem + 72, 1);
-            // pv_done1: 1 barriers, init_count=1
-            mbarrier_init(smem + 80, 1);
-            // tmem_dealloc: 1 barriers, init_count=7
-            mbarrier_init(smem + 88, 7);
-            asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+        // q_full: 1 barriers, init_count=1
+        // --- pipeline 'kv_pipe' ---
+        // kv_full: 4 barriers, init_count=3
+        // s_full: 2 barriers, init_count=1
+        // p_full: 2 barriers, init_count=4
+        // pv_done0: 1 barriers, init_count=1
+        // pv_done1: 1 barriers, init_count=1
+        // tmem_dealloc: 1 barriers, init_count=7
+        // Warp-cooperative initialization in physical record order.
+        uint32_t _mbarrier_init_count_0_0 = 7;
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(11), "r"((uint32_t)(1)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(9), "r"((uint32_t)(4)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(7), "r"((uint32_t)(1)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(5), "r"((uint32_t)(3)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(1), "r"((uint32_t)(1)));
+        if (lane < 12) {
+            mbarrier_init(smem + 0 + lane * 8, _mbarrier_init_count_0_0);
         }
+        asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
 
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
-    if (warp == 0) {
+    if (warp == 4) {
         int _tmem_hold = smem + 96;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();

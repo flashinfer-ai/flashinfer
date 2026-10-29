@@ -212,10 +212,10 @@ kernel_cake_muse_spark_norm_dd08e4a4868c172adcb0(__nv_bfloat16* __restrict__ bra
     long long fbase = (long long)first * branch_stride_p0;
     if (warp == 0) {
         if (elect_sync()) {
-            int prow = first;
-            if (prow < M) {
-                long long nb = (long long)prow * branch_stride_p0;
-                long long nr = (long long)prow * residual_stride_p0;
+            int prow_2_0 = first;
+            if (prow_2_0 < M) {
+                long long nb = (long long)prow_2_0 * branch_stride_p0;
+                long long nr = (long long)prow_2_0 * residual_stride_p0;
                 mbarrier_arrive_expect_tx(rows_full_addr, 49152);
                 asm volatile(
                     "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
@@ -228,10 +228,10 @@ kernel_cake_muse_spark_norm_dd08e4a4868c172adcb0(__nv_bfloat16* __restrict__ bra
                     :: "r"(rview_addr), "l"(residual + nr), "r"((uint32_t)(32768)), "r"(rows_full_addr)
                     : "memory");
             }
-            int prow_0 = first + row_step;
-            if (prow_0 < M) {
-                long long nb_1 = (long long)prow_0 * branch_stride_p0;
-                long long nr_1 = (long long)prow_0 * residual_stride_p0;
+            int prow_2_1 = first + row_step;
+            if (prow_2_1 < M) {
+                long long nb_1 = (long long)prow_2_1 * branch_stride_p0;
+                long long nr_1 = (long long)prow_2_1 * residual_stride_p0;
                 mbarrier_arrive_expect_tx(rows_full_addr + 8, 49152);
                 asm volatile(
                     "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
@@ -244,10 +244,10 @@ kernel_cake_muse_spark_norm_dd08e4a4868c172adcb0(__nv_bfloat16* __restrict__ bra
                     :: "r"(rview_addr + 49152), "l"(residual + nr_1), "r"((uint32_t)(32768)), "r"(rows_full_addr + 8)
                     : "memory");
             }
-            int prow_1 = first + 2 * row_step;
-            if (prow_1 < M) {
-                long long nb_2 = (long long)prow_1 * branch_stride_p0;
-                long long nr_2 = (long long)prow_1 * residual_stride_p0;
+            int prow_2_2 = first + 2 * row_step;
+            if (prow_2_2 < M) {
+                long long nb_2 = (long long)prow_2_2 * branch_stride_p0;
+                long long nr_2 = (long long)prow_2_2 * residual_stride_p0;
                 mbarrier_arrive_expect_tx(rows_full_addr + 16, 49152);
                 asm volatile(
                     "cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes "
@@ -359,26 +359,26 @@ kernel_cake_muse_spark_norm_dd08e4a4868c172adcb0(__nv_bfloat16* __restrict__ bra
         acc = __fmaf_rn(x0_0, x0_0, acc);
         acc = __fmaf_rn(x1_0, x1_0, acc);
         float2 _cvt_f32_1 = cake_bf16x2_to_f32x2(__as_bf16x2(cur[1]));
-        float x0_2 = _cvt_f32_1.x * wf[2];
-        float x1_2 = _cvt_f32_1.y * wf[3];
-        x[2] = x0_2;
-        x[3] = x1_2;
+        float x0_1 = _cvt_f32_1.x * wf[2];
+        float x1_1 = _cvt_f32_1.y * wf[3];
+        x[2] = x0_1;
+        x[3] = x1_1;
+        acc = __fmaf_rn(x0_1, x0_1, acc);
+        acc = __fmaf_rn(x1_1, x1_1, acc);
+        float2 _cvt_f32_2 = cake_bf16x2_to_f32x2(__as_bf16x2(cur[2]));
+        float x0_2 = _cvt_f32_2.x * wf[4];
+        float x1_2 = _cvt_f32_2.y * wf[5];
+        x[4] = x0_2;
+        x[5] = x1_2;
         acc = __fmaf_rn(x0_2, x0_2, acc);
         acc = __fmaf_rn(x1_2, x1_2, acc);
-        float2 _cvt_f32_2 = cake_bf16x2_to_f32x2(__as_bf16x2(cur[2]));
-        float x0_4 = _cvt_f32_2.x * wf[4];
-        float x1_4 = _cvt_f32_2.y * wf[5];
-        x[4] = x0_4;
-        x[5] = x1_4;
-        acc = __fmaf_rn(x0_4, x0_4, acc);
-        acc = __fmaf_rn(x1_4, x1_4, acc);
         float2 _cvt_f32_3 = cake_bf16x2_to_f32x2(__as_bf16x2(cur[3]));
-        float x0_6 = _cvt_f32_3.x * wf[6];
-        float x1_6 = _cvt_f32_3.y * wf[7];
-        x[6] = x0_6;
-        x[7] = x1_6;
-        acc = __fmaf_rn(x0_6, x0_6, acc);
-        acc = __fmaf_rn(x1_6, x1_6, acc);
+        float x0_3 = _cvt_f32_3.x * wf[6];
+        float x1_3 = _cvt_f32_3.y * wf[7];
+        x[6] = x0_3;
+        x[7] = x1_3;
+        acc = __fmaf_rn(x0_3, x0_3, acc);
+        acc = __fmaf_rn(x1_3, x1_3, acc);
         #pragma unroll
         for (int i = 0; i < 8; i++) {
             float pre = al[i] * res[i];
@@ -429,22 +429,22 @@ kernel_cake_muse_spark_norm_dd08e4a4868c172adcb0(__nv_bfloat16* __restrict__ bra
         float inv = __frcp_rn(_sqrt_4);
         #pragma unroll
         for (int c_2 = 0; c_2 < 1; c_2++) {
-            float yv0 = __fmaf_rn(be[c_2 * 8], x[c_2 * 8] * inv, res[c_2 * 8]);
-            y[c_2 * 8] = yv0;
-            float yv1 = __fmaf_rn(be[c_2 * 8 + 1], x[c_2 * 8 + 1] * inv, res[c_2 * 8 + 1]);
-            y[c_2 * 8 + 1] = yv1;
-            float yv2 = __fmaf_rn(be[c_2 * 8 + 2], x[c_2 * 8 + 2] * inv, res[c_2 * 8 + 2]);
-            y[c_2 * 8 + 2] = yv2;
-            float yv3 = __fmaf_rn(be[c_2 * 8 + 3], x[c_2 * 8 + 3] * inv, res[c_2 * 8 + 3]);
-            y[c_2 * 8 + 3] = yv3;
-            float yv4 = __fmaf_rn(be[c_2 * 8 + 4], x[c_2 * 8 + 4] * inv, res[c_2 * 8 + 4]);
-            y[c_2 * 8 + 4] = yv4;
-            float yv5 = __fmaf_rn(be[c_2 * 8 + 5], x[c_2 * 8 + 5] * inv, res[c_2 * 8 + 5]);
-            y[c_2 * 8 + 5] = yv5;
-            float yv6 = __fmaf_rn(be[c_2 * 8 + 6], x[c_2 * 8 + 6] * inv, res[c_2 * 8 + 6]);
-            y[c_2 * 8 + 6] = yv6;
-            float yv7 = __fmaf_rn(be[c_2 * 8 + 7], x[c_2 * 8 + 7] * inv, res[c_2 * 8 + 7]);
-            y[c_2 * 8 + 7] = yv7;
+            float yv0_1_0 = __fmaf_rn(be[c_2 * 8], x[c_2 * 8] * inv, res[c_2 * 8]);
+            y[c_2 * 8] = yv0_1_0;
+            float yv0_1_1 = __fmaf_rn(be[c_2 * 8 + 1], x[c_2 * 8 + 1] * inv, res[c_2 * 8 + 1]);
+            y[c_2 * 8 + 1] = yv0_1_1;
+            float yv0_1_2 = __fmaf_rn(be[c_2 * 8 + 2], x[c_2 * 8 + 2] * inv, res[c_2 * 8 + 2]);
+            y[c_2 * 8 + 2] = yv0_1_2;
+            float yv0_1_3 = __fmaf_rn(be[c_2 * 8 + 3], x[c_2 * 8 + 3] * inv, res[c_2 * 8 + 3]);
+            y[c_2 * 8 + 3] = yv0_1_3;
+            float yv0_1_4 = __fmaf_rn(be[c_2 * 8 + 4], x[c_2 * 8 + 4] * inv, res[c_2 * 8 + 4]);
+            y[c_2 * 8 + 4] = yv0_1_4;
+            float yv0_1_5 = __fmaf_rn(be[c_2 * 8 + 5], x[c_2 * 8 + 5] * inv, res[c_2 * 8 + 5]);
+            y[c_2 * 8 + 5] = yv0_1_5;
+            float yv0_1_6 = __fmaf_rn(be[c_2 * 8 + 6], x[c_2 * 8 + 6] * inv, res[c_2 * 8 + 6]);
+            y[c_2 * 8 + 6] = yv0_1_6;
+            float yv0_1_7 = __fmaf_rn(be[c_2 * 8 + 7], x[c_2 * 8 + 7] * inv, res[c_2 * 8 + 7]);
+            y[c_2 * 8 + 7] = yv0_1_7;
             {
                 unsigned _stv8_5_0 = __float_as_uint(y[c_2 * 8 + 0]);
                 unsigned _stv8_5_1 = __float_as_uint(y[c_2 * 8 + 1]);

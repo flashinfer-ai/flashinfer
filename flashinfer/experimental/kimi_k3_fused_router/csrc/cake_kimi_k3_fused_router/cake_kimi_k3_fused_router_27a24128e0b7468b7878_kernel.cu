@@ -259,36 +259,36 @@ kernel_cake_kimi_k3_fused_router_27a24128e0b7468b7878(float* __restrict__ logits
         }
     }
     unsigned int published = 0;
-    unsigned int warp_top0;
-    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0) : "r"(lane_bound));
+    unsigned int warp_top0_1_0;
+    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_0) : "r"(lane_bound));
     if (lane == 0) {
-        published = warp_top0;
+        published = warp_top0_1_0;
     }
-    if (lane_bound == warp_top0) {
+    if (lane_bound == warp_top0_1_0) {
         lane_bound = (unsigned int)0;
     }
-    unsigned int warp_top1;
-    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top1) : "r"(lane_bound));
+    unsigned int warp_top0_1_1;
+    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_1) : "r"(lane_bound));
     if (lane == 1) {
-        published = warp_top1;
+        published = warp_top0_1_1;
     }
-    if (lane_bound == warp_top1) {
+    if (lane_bound == warp_top0_1_1) {
         lane_bound = (unsigned int)0;
     }
-    unsigned int warp_top2;
-    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top2) : "r"(lane_bound));
+    unsigned int warp_top0_1_2;
+    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_2) : "r"(lane_bound));
     if (lane == 2) {
-        published = warp_top2;
+        published = warp_top0_1_2;
     }
-    if (lane_bound == warp_top2) {
+    if (lane_bound == warp_top0_1_2) {
         lane_bound = (unsigned int)0;
     }
-    unsigned int warp_top3;
-    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top3) : "r"(lane_bound));
+    unsigned int warp_top0_1_3;
+    asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(warp_top0_1_3) : "r"(lane_bound));
     if (lane == 3) {
-        published = warp_top3;
+        published = warp_top0_1_3;
     }
-    if (lane_bound == warp_top3) {
+    if (lane_bound == warp_top0_1_3) {
         lane_bound = (unsigned int)0;
     }
     if (lane < 4) {
@@ -326,24 +326,24 @@ kernel_cake_kimi_k3_fused_router_27a24128e0b7468b7878(float* __restrict__ logits
     }
     cand_slot += ((keys[0] >= cand_floor) ? 1 : 0);
     if (keys[1] >= cand_floor && cand_slot < 32) {
-        int cand_index1 = warp * 32 + cand_slot;
-        cand_keys[cand_index1] = keys[1];
-        cand_ids[cand_index1] = expert_base + 1;
-        cand_scores[cand_index1] = unbiased[1];
+        int cand_index_0 = warp * 32 + cand_slot;
+        cand_keys[cand_index_0] = keys[1];
+        cand_ids[cand_index_0] = expert_base + 1;
+        cand_scores[cand_index_0] = unbiased[1];
     }
     cand_slot += ((keys[1] >= cand_floor) ? 1 : 0);
     if (keys[2] >= cand_floor && cand_slot < 32) {
-        int cand_index2 = warp * 32 + cand_slot;
-        cand_keys[cand_index2] = keys[2];
-        cand_ids[cand_index2] = expert_base + 2;
-        cand_scores[cand_index2] = unbiased[2];
+        int cand_index_1 = warp * 32 + cand_slot;
+        cand_keys[cand_index_1] = keys[2];
+        cand_ids[cand_index_1] = expert_base + 2;
+        cand_scores[cand_index_1] = unbiased[2];
     }
     cand_slot += ((keys[2] >= cand_floor) ? 1 : 0);
     if (keys[3] >= cand_floor && cand_slot < 32) {
-        int cand_index3 = warp * 32 + cand_slot;
-        cand_keys[cand_index3] = keys[3];
-        cand_ids[cand_index3] = expert_base + 3;
-        cand_scores[cand_index3] = unbiased[3];
+        int cand_index_2 = warp * 32 + cand_slot;
+        cand_keys[cand_index_2] = keys[3];
+        cand_ids[cand_index_2] = expert_base + 3;
+        cand_scores[cand_index_2] = unbiased[3];
     }
     if (lane == 0) {
         cand_counts[warp] = cand_warp;
@@ -868,26 +868,36 @@ kernel_cake_kimi_k3_fused_router_27a24128e0b7468b7878(float* __restrict__ logits
     unsigned int plan_mask3;
     asm volatile("redux.sync.or.b32 %0, %1, 0xffffffff;" : "=r"(plan_mask3) : "r"(((plan_item == 3) ? plan_bit : (unsigned int)0)));
     int plan_running = (int)(unsigned int)__popc(plan_below_warp & 65535) + ((int)(unsigned int)__popc(plan_mask0 & lanemask_lt) + (int)(unsigned int)__popc(plan_mask1 & lanemask_lt)) + ((int)(unsigned int)__popc(plan_mask2 & lanemask_lt) + (int)(unsigned int)__popc(plan_mask3 & lanemask_lt));
-    int plan_flag0 = (int)(plan_mask0 >> (unsigned int)lane & 1);
-    expert_counts[expert_base] = plan_flag0;
-    expert_scatter_offsets[expert_base] = plan_flag0;
-    expert_offsets[expert_base] = plan_running << BLOCK_SHIFT;
-    plan_running += plan_flag0;
-    int plan_flag1 = (int)(plan_mask1 >> (unsigned int)lane & 1);
-    expert_counts[expert_base + 1] = plan_flag1;
-    expert_scatter_offsets[expert_base + 1] = plan_flag1;
-    expert_offsets[expert_base + 1] = plan_running << BLOCK_SHIFT;
-    plan_running += plan_flag1;
-    int plan_flag2 = (int)(plan_mask2 >> (unsigned int)lane & 1);
-    expert_counts[expert_base + 2] = plan_flag2;
-    expert_scatter_offsets[expert_base + 2] = plan_flag2;
-    expert_offsets[expert_base + 2] = plan_running << BLOCK_SHIFT;
-    plan_running += plan_flag2;
-    int plan_flag3 = (int)(plan_mask3 >> (unsigned int)lane & 1);
-    expert_counts[expert_base + 3] = plan_flag3;
-    expert_scatter_offsets[expert_base + 3] = plan_flag3;
-    expert_offsets[expert_base + 3] = plan_running << BLOCK_SHIFT;
-    plan_running += plan_flag3;
+    int plan_cnt[4];
+    int plan_off[4];
+    int plan_flag0_1_0 = (int)(plan_mask0 >> (unsigned int)lane & 1);
+    plan_cnt[0] = plan_flag0_1_0;
+    plan_off[0] = plan_running << BLOCK_SHIFT;
+    plan_running += plan_flag0_1_0;
+    int plan_flag0_1_1 = (int)(plan_mask1 >> (unsigned int)lane & 1);
+    plan_cnt[1] = plan_flag0_1_1;
+    plan_off[1] = plan_running << BLOCK_SHIFT;
+    plan_running += plan_flag0_1_1;
+    int plan_flag0_1_2 = (int)(plan_mask2 >> (unsigned int)lane & 1);
+    plan_cnt[2] = plan_flag0_1_2;
+    plan_off[2] = plan_running << BLOCK_SHIFT;
+    plan_running += plan_flag0_1_2;
+    int plan_flag0_1_3 = (int)(plan_mask3 >> (unsigned int)lane & 1);
+    plan_cnt[3] = plan_flag0_1_3;
+    plan_off[3] = plan_running << BLOCK_SHIFT;
+    plan_running += plan_flag0_1_3;
+    {
+        int4 _iv4 = make_int4(plan_cnt[0 + 0], plan_cnt[0 + 1], plan_cnt[0 + 2], plan_cnt[0 + 3]);
+        *reinterpret_cast<int4*>(expert_counts + expert_base) = _iv4;
+    }
+    {
+        int4 _iv4 = make_int4(plan_cnt[0 + 0], plan_cnt[0 + 1], plan_cnt[0 + 2], plan_cnt[0 + 3]);
+        *reinterpret_cast<int4*>(expert_scatter_offsets + expert_base) = _iv4;
+    }
+    {
+        int4 _iv4 = make_int4(plan_off[0 + 0], plan_off[0 + 1], plan_off[0 + 2], plan_off[0 + 3]);
+        *reinterpret_cast<int4*>(expert_offsets + expert_base) = _iv4;
+    }
 }
 
 } // extern "C"

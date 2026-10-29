@@ -533,7 +533,8 @@ constexpr Schedule SelectSm100aSchedule(const Shape& shape) {
               0,
               0};
     }
-    const RoutePacker planner = shape.num_tokens <= 10 ? RoutePacker::kSortedShort
+    const RoutePacker planner = shape.num_tokens <= 9 ? RoutePacker::kCountRank
+                                : shape.num_tokens <= 10 ? RoutePacker::kSortedShort
                                 : (shape.num_tokens == 11 || shape.num_tokens == 23)
                                     ? RoutePacker::kCountRank
                                     : RoutePacker::kGeneral;
