@@ -961,7 +961,7 @@ class Sm100BlockScaledMoeEpilogue:
                         )
 
     @cute.jit
-    def _run_overlapping_fc1_direction(
+    def run_overlapping_fc1(
         self,
         acc_tensor,
         output_tensor,
@@ -979,18 +979,21 @@ class Sm100BlockScaledMoeEpilogue:
         acc_state,
         channel_stride: cutlass.Constexpr,
         channel_tiles: cutlass.Constexpr,
-        reverse: cutlass.Constexpr,
     ):
         # Treat all channel tiles as one virtual accumulator column range.
         # The actual scale footprint, rounded to a 32-column transpose slab,
         # determines the shared interval. Read it before releasing ownership.
         groups = self.tile_n // 32
-        for step in cutlass.range_constexpr(channel_tiles * groups):
-            slab = channel_tiles * groups - 1 - step if reverse else step
+        slabs = channel_tiles * groups
+        for step in cutlass.range_constexpr(slabs):
+            slab = (
+                step + (1 - acc_state.phase) * (slabs - self.overlap_activation_steps)
+            ) % slabs
             channel_tile = slab // groups
             token_start = (slab % groups) * 32
             tile = cute.make_tensor(
-                acc_tensor.iterator + channel_tile * self.tile_n, acc_tensor.layout
+                acc_tensor.iterator + cute.assume(channel_tile * self.tile_n, divby=32),
+                acc_tensor.layout,
             )
             if token_start < valid_tokens:
                 self._run_token_group(
@@ -1016,67 +1019,6 @@ class Sm100BlockScaledMoeEpilogue:
             elif cutlass.const_expr(step + 1 == self.overlap_activation_steps):
                 cute.arch.fence_view_async_tmem_load()
                 acc_pipeline.consumer_release(acc_state)
-
-    @cute.jit
-    def run_overlapping_fc1(
-        self,
-        acc_tensor,
-        output_tensor,
-        output_sf_tensor,
-        alpha,
-        norm_const,
-        per_token_scale,
-        token_mapping,
-        channel_start,
-        route_start,
-        valid_tokens,
-        tidx,
-        smem_scratch,
-        acc_pipeline,
-        acc_state,
-        channel_stride: cutlass.Constexpr,
-        channel_tiles: cutlass.Constexpr,
-    ):
-        if acc_state.phase == 0:
-            self._run_overlapping_fc1_direction(
-                acc_tensor,
-                output_tensor,
-                output_sf_tensor,
-                alpha,
-                norm_const,
-                per_token_scale,
-                token_mapping,
-                channel_start,
-                route_start,
-                valid_tokens,
-                tidx,
-                smem_scratch,
-                acc_pipeline,
-                acc_state,
-                channel_stride,
-                channel_tiles,
-                True,
-            )
-        else:
-            self._run_overlapping_fc1_direction(
-                acc_tensor,
-                output_tensor,
-                output_sf_tensor,
-                alpha,
-                norm_const,
-                per_token_scale,
-                token_mapping,
-                channel_start,
-                route_start,
-                valid_tokens,
-                tidx,
-                smem_scratch,
-                acc_pipeline,
-                acc_state,
-                channel_stride,
-                channel_tiles,
-                False,
-            )
 
     @cute.jit
     def _scatter_metadata(
@@ -1130,7 +1072,7 @@ class Sm100BlockScaledMoeEpilogue:
         return output_rows, output_scales
 
     @cute.jit
-    def _run_bulk_direction(
+    def _run_bulk(
         self,
         acc_tensor,
         output_tensor,
@@ -1145,7 +1087,6 @@ class Sm100BlockScaledMoeEpilogue:
         smem_scratch,
         acc_pipeline,
         acc_state,
-        reverse: cutlass.Constexpr,
     ):
         warp = (tidx // 32) % 4
         lane = tidx % 32
@@ -1173,13 +1114,20 @@ class Sm100BlockScaledMoeEpilogue:
             cute.recast_ptr(smem_scratch, dtype=self.output_dtype),
             cute.make_layout((tokens * 128, stages), stride=(1, tokens * 128)),
         )
-        for step in cutlass.range_constexpr(self.tile_n // tokens):
-            group = self.tile_n // tokens - 1 - step if reverse else step
+        groups = self.tile_n // tokens
+        for step in cutlass.range_constexpr(groups):
+            group = step
+            if cutlass.const_expr(self.overlap_acc):
+                # Consume the shared interval first without two epilogue copies.
+                rotated_group = (step + groups - 64 // tokens) % groups
+                group = (
+                    step + (1 - acc_state.phase) * (groups - 64 // tokens)
+                ) % groups
             if (group + 1) * tokens <= valid_tokens:
                 shared = shared_all[None, step % stages]
                 ptr = (
                     acc_tensor.iterator
-                    + group * tokens
+                    + cute.assume(group * tokens, divby=32)
                     + cute.assume(warp * (32 << 16), divby=32)
                 )
                 # Ld16x256 assigns lane//4 to one of 8 channels and lane%4
@@ -1207,7 +1155,14 @@ class Sm100BlockScaledMoeEpilogue:
                     if cutlass.const_expr(self.use_per_token_scale):
                         for i in cutlass.range_constexpr(0, tokens // 2, 2):
                             token = (i // 4) * 8 + (lane % 4) * 2
-                            scale = scales[group * (tokens // 32) + i // 16]
+                            # Keep both register indices static when rotating.
+                            scale = scales[step * (tokens // 32) + i // 16]
+                            if cutlass.const_expr(self.overlap_acc):
+                                scale = cutlass.select_(
+                                    acc_state.phase == 0,
+                                    scales[rotated_group * (tokens // 32) + i // 16],
+                                    scale,
+                                )
                             scale_pair = (
                                 cute.arch.shuffle_sync(scale, token % 32),
                                 cute.arch.shuffle_sync(scale, (token + 1) % 32),
@@ -1261,6 +1216,15 @@ class Sm100BlockScaledMoeEpilogue:
                 for sub in cutlass.range_constexpr(tokens // 32):
                     token_start = group * tokens + sub * 32
                     if token_start < valid_tokens:
+                        scale = uniform_scale
+                        if cutlass.const_expr(self.use_per_token_scale):
+                            scale = scales[step * (tokens // 32) + sub]
+                            if cutlass.const_expr(self.overlap_acc):
+                                scale = cutlass.select_(
+                                    acc_state.phase == 0,
+                                    scales[rotated_group * (tokens // 32) + sub],
+                                    scale,
+                                )
                         self._run_token_group(
                             acc_tensor,
                             output_tensor,
@@ -1276,11 +1240,7 @@ class Sm100BlockScaledMoeEpilogue:
                             smem_scratch,
                             token_start,
                             route_start + token_start + lane,
-                            (
-                                scales[group * (tokens // 32) + sub]
-                                if cutlass.const_expr(self.use_per_token_scale)
-                                else uniform_scale
-                            ),
+                            scale,
                             self.overlap_acc
                             and (step + 1) * tokens == 64
                             and sub + 1 == tokens // 32,
@@ -1301,76 +1261,6 @@ class Sm100BlockScaledMoeEpilogue:
         if valid_tokens >= tokens:
             cute.arch.cp_async_bulk_wait_group(0, read=True)
             self.transpose_barrier.arrive_and_wait()
-
-    @cute.jit
-    def _run_bulk(
-        self,
-        acc_tensor,
-        output_tensor,
-        tma_output,
-        alpha,
-        per_token_scale,
-        token_mapping,
-        channel_start,
-        route_start,
-        valid_tokens,
-        tidx,
-        smem_scratch,
-        acc_pipeline,
-        acc_state,
-    ):
-        if cutlass.const_expr(self.overlap_acc):
-            if acc_state.phase == 0:
-                self._run_bulk_direction(
-                    acc_tensor,
-                    output_tensor,
-                    tma_output,
-                    alpha,
-                    per_token_scale,
-                    token_mapping,
-                    channel_start,
-                    route_start,
-                    valid_tokens,
-                    tidx,
-                    smem_scratch,
-                    acc_pipeline,
-                    acc_state,
-                    True,
-                )
-            else:
-                self._run_bulk_direction(
-                    acc_tensor,
-                    output_tensor,
-                    tma_output,
-                    alpha,
-                    per_token_scale,
-                    token_mapping,
-                    channel_start,
-                    route_start,
-                    valid_tokens,
-                    tidx,
-                    smem_scratch,
-                    acc_pipeline,
-                    acc_state,
-                    False,
-                )
-        else:
-            self._run_bulk_direction(
-                acc_tensor,
-                output_tensor,
-                tma_output,
-                alpha,
-                per_token_scale,
-                token_mapping,
-                channel_start,
-                route_start,
-                valid_tokens,
-                tidx,
-                smem_scratch,
-                acc_pipeline,
-                acc_state,
-                False,
-            )
 
     @cute.jit
     def run(
