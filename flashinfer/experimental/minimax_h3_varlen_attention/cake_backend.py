@@ -134,6 +134,19 @@ tensor of ``BF16_TINY_MAX_SEGMENTS + 1`` entries that the binding copies into
 the kernel parameters).  Its arithmetic is the other programs' one-K/V-block
 unit, so its output is bitwise theirs.
 
+On sm_100a, a plan whose tail round leaves most of the grid idle, or whose
+long units finish unevenly, launches on two side streams forked from the
+caller's stream and joined back into it: the NVFP4 tail-first schedule
+(``NVFP4_TFS_ARCHES``) relabels the tail round's heads onto ``[0, k)`` and
+runs the quantizer over those heads and the tail units first on a
+greatest-priority stream while the quantizer over the other heads runs on a
+least-priority stream, then the full rounds; the NVFP4 tail grid
+(``NVFP4_PTG_PAIRS``) and the BF16 tail grid (``BF16_TAIL_GRID_ROUNDS``) run
+the last rounds as one-unit clusters on the SM pairs that the persistent grid
+frees (:func:`nvfp4_launch_schedule`, :func:`bf16_tail_grid_split`).  Every
+other plan, and every sm_103a plan, keeps its one launch; the outputs are
+bitwise those of the one-launch plan.
+
 See ``README.md`` in this package and flashinfer-ai/flashinfer#4532.
 """
 
@@ -141,6 +154,7 @@ from __future__ import annotations
 
 import functools
 import math
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence, Union
@@ -236,6 +250,26 @@ BF16_DYN_SCHED_MIN_UNITS_PER_CLUSTER = 64
 # architecture, binds the general programs.
 BF16_TINY_SEGMENT_TOKENS = 32
 BF16_TINY_MAX_SEGMENTS = 64
+# Tail grid of the static BF16 program (``BF16_TAIL_GRID_ARCHES`` only): a
+# plan that binds ``attention_sread`` with no K/V-split unit and at least
+# ``BF16_TAIL_GRID_MIN_ROUNDS`` rounds (``R = ceil(U / G)``) launches the
+# program twice over its unchanged slot order.  Launch 1 runs slots ``[0, S)``,
+# ``S = G * (R - BF16_TAIL_GRID_ROUNDS)``, on the ``G``-cluster persistent
+# grid (``R - BF16_TAIL_GRID_ROUNDS`` units per cluster); launch 2 runs slots
+# ``[S, U)`` as ``U - S`` one-unit clusters from the plan's
+# ``tail_unit_table``, which the hardware dispatches onto the SM pairs that
+# launch-1 clusters free as they finish, so the last rounds follow the
+# per-SM finish order instead of the static round robin.  Launch 1 is issued
+# on a high-priority stream and launch 2 on a low-priority one (a free SM pair
+# goes to a waiting launch-1 cluster first); both start after the caller's
+# stream and the caller's stream waits for both.  Every unit runs the same
+# program on the same record and the units of an unsplit plan write disjoint
+# output rows, so the output is bitwise that of the single launch.  The fork
+# and join cost host time that a short call cannot hide, hence the minimum
+# round count.
+BF16_TAIL_GRID_ROUNDS = 2
+BF16_TAIL_GRID_MIN_ROUNDS = 8
+BF16_TAIL_GRID_ARCHES = ("sm_100a",)
 # Rows of one CTA's Q stage: a unit with at most this many valid rows from its
 # first row runs a single stage (the kernel's record decode, ``two_stages``).
 CTA_Q_ROWS = CLUSTER_Q_ROWS // 2
@@ -301,10 +335,16 @@ AMAX_CHUNK = 256 * 4
 PV_MODES = ("fp4", "fp8")
 NVFP4_VARIANT = {"fp4": "nvfp4_fp4pv", "fp8": "nvfp4_fp8pv"}
 # Stages of the quantization step (``runner.quantize()``); the rest is attention.
-QUANTIZE_STAGES = ("amax", "quantize", "quantize_early_qk", "quantize_tp")
+QUANTIZE_STAGES = (
+    "amax",
+    "quantize",
+    "quantize_early_qk",
+    "quantize_tp",
+    "quantize_tp_mb8",
+)
 # The builds of the fused quantizer a route may carry; a plan binds one of them
 # (:func:`nvfp4_quantize_stage`).
-QUANTIZER_STAGES = ("quantize", "quantize_early_qk", "quantize_tp")
+QUANTIZER_STAGES = ("quantize", "quantize_early_qk", "quantize_tp", "quantize_tp_mb8")
 # ``quantize_early_qk`` is bound when the quantize grid fits in EARLY_QK_WAVES
 # waves of EARLY_QK_CTAS_PER_SM resident CTAs per SM (its program: REG 32 x 256
 # threads; a GPU test checks the built program against this constant).
@@ -317,6 +357,17 @@ EARLY_QK_CTAS_PER_SM = 8
 # ``tp_block_valid``, CPU tensors); a larger plan binds ``quantize``.
 QUANTIZE_TP_MAX_PB = 128
 QUANTIZE_TP_BY_VALUE = ("block_token", "block_valid")
+# ``quantize_tp_mb8``: a third build of the fp4 quantizer (the ``quantize_tp``
+# parameters, eight resident CTAs per SM), an optional module leaf of the fp4
+# route (``ROUTES[...]["modules"]``, not a stage of ``STAGES``).  A
+# ``quantize_tp`` plan whose quantize grid ``heads * PB * 4`` lies in
+# ``QUANTIZE_TP_MB8_GRID`` (inclusive) and that runs its quantizer as one
+# launch binds it when the route carries it, else ``quantize_tp``; the outputs
+# are bitwise identical.  The upper bound is one wave of eight resident CTAs
+# on 148 SMs.  The lower bound is measured on B200: below 784 CTAs the call
+# with this build is slower than with ``quantize_tp``; from 784 CTAs to the
+# upper bound it is as fast or faster.
+QUANTIZE_TP_MB8_GRID = (784, 1184)
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 
 QK_MMA_DTYPE = {
@@ -481,6 +532,69 @@ NVFP4_ATTENTION_TWO_STAGE_FP8PV_KWARGS = tuple(
     "total_clusters" if name == "num_tiles" else name
     for name in NVFP4_ATTENTION_FP8PV_KWARGS
 )
+# Two-launch schedules of a dense NVFP4 plan (:func:`build_tile_tables`
+# ``launch_pair``; the planner decides from the host tables, the runner forks
+# from the caller's stream onto a greatest-priority stream S1 and a
+# least-priority stream S2 and joins back; every output and workspace bit is
+# that of the one-launch plan).
+#
+# Tail-first schedule (TFS, ``NVFP4_TFS_ARCHES``, both PV modes): a plan
+# without K/V-split units, with ``R = N // G >= 1`` full rounds of its ``N``
+# units on ``G`` clusters and a partial tail round of ``nt = N - R * G``
+# units, runs the tail round first, overlapped with most of the quantizer.
+# The tail units' heads (``k`` of them) are relabelled onto heads ``[0, k)``
+# (``cl_head`` only; every head of a cluster tile has the same records, so the
+# relabelled plan covers the same (tile, head, rows) set).  S1 runs
+# [``amax``,] QZ(A) = the quantizer over heads ``[0, k)``, then ATT-tail =
+# records ``[R G, N)`` as ``nt`` one-unit clusters (the quantizer's
+# programmatic dependent launch); S2 waits for QZ(A) and runs QZ(B) = the
+# quantizer over heads ``[k, H)`` (the same program on views offset by ``k``
+# heads; fp8: ``v_amax`` goes to a private scratch, QZ(A) publishes the
+# kernel's); S1 waits for QZ(B) and runs ATT-bulk = records ``[0, R G)`` on
+# the ``G``-cluster persistent grid.  fp4 binds the dense ``attention``, fp8
+# the single-stage dense ``attention_qs`` for both attention launches.  The
+# tables are the plan's own placed units.  A plan qualifies when its tail
+# round holds Q-split halves (the plan's own Q-split choice; a plan without
+# halves, and the same plan re-placed without them, ran slower on B200 as a
+# tail-first schedule), at least ``NVFP4_TFS_IDLE_MIN`` of the clusters idle
+# in its tail round, ``k <= NVFP4_TFS_HEAD_FRACTION_MAX * H``, the modelled
+# QZ(B) time on the free SMs is at most ``NVFP4_TFS_FIT`` times the
+# tail-unit time, and the modelled gain ``(QZ + tail) - (QZ(A) + max(tail,
+# QZ(B)) + NVFP4_TFS_OVERHEAD_US)`` is positive (:func:`nvfp4_tfs_decision`;
+# per-unit and quantizer times from the B200 measurements below).
+NVFP4_TFS_ARCHES = ("sm_100a",)
+NVFP4_TFS_IDLE_MIN = 0.40
+NVFP4_TFS_HEAD_FRACTION_MAX = 0.15
+NVFP4_TFS_FIT = 1.10
+NVFP4_TFS_QZA_MIN_US = 9.0
+NVFP4_TFS_OVERHEAD_US = 6.0
+# Modelled times (B200, sm_100a): the quantizer per token-head, a two-stage
+# unit per K/V block, and a single-stage unit relative to a two-stage one.
+NVFP4_QUANTIZE_US_PER_TOKEN_HEAD = {
+    "fp4": 104.0 / (28 * 24384),
+    "fp8": 110.0 / (28 * 24384),
+}
+NVFP4_UNIT_US_PER_BLOCK = {"fp4": 235.0 / 191, "fp8": 234.0 / 191}
+NVFP4_SINGLE_STAGE_TIME_RATIO = {"fp4": 0.667, "fp8": 0.707}
+# Tail grid (PTG, ``NVFP4_PTG_PAIRS``): a plan without K/V-split units on
+# which TFS does not fire, with ``N // G >= NVFP4_PTG_MIN_FULL_ROUNDS`` and a
+# modelled attention time (the sum over the ``R = ceil(N / G)`` rounds of
+# the round's longest unit) of at least ``NVFP4_PTG_MIN_ATTENTION_US``, runs
+# its last ``D`` rounds dynamically: S1 runs the quantizer, then L1 = records
+# ``[0, S)``, ``S = G (R - D)``, on the persistent grid (the quantizer's
+# programmatic dependent launch); S2 waits for the quantizer and runs L2 =
+# records ``[S, N)``, longest first, as ``N - S`` one-unit clusters, which
+# the hardware dispatches onto the SM pairs that L1 clusters free as they
+# finish.  ``D`` is the smallest depth, at most ``NVFP4_PTG_MAX_DEPTH``,
+# whose L2 holds more than ``(t - 1) * G`` full units (a unit of at least
+# ``NVFP4_PTG_FULL_UNIT_FRACTION`` of the plan's longest unit time), ``t = 2``
+# when ``R >= NVFP4_PTG_DEEP_ROUNDS`` else 1 (:func:`nvfp4_ptg_decision`).
+NVFP4_PTG_PAIRS: frozenset[tuple[str, str]] = frozenset({("fp4", "sm_100a")})
+NVFP4_PTG_MIN_FULL_ROUNDS = 7
+NVFP4_PTG_MIN_ATTENTION_US = 1000.0
+NVFP4_PTG_DEEP_ROUNDS = 54
+NVFP4_PTG_FULL_UNIT_FRACTION = 0.5
+NVFP4_PTG_MAX_DEPTH = 4
 
 
 # ---------------------------------------------------------------------------
@@ -578,6 +692,41 @@ class BF16SegmentPlan:
     dyn_sched: bool
     sread_unified: bool
     tiny_cu_seqlens: Optional[torch.Tensor] = None
+
+
+@dataclass(frozen=True)
+class BF16TailGridPlan(BF16SegmentPlan):
+    """A :class:`BF16SegmentPlan` that launches on the tail grid
+    (``BF16_TAIL_GRID_ROUNDS``): ``tail_split`` is the split ``S`` (launch 1
+    runs slots ``[0, S)``) and ``tail_unit_table`` holds records
+    ``[S, total_tiles)`` of ``unit_table`` followed by ``total_tiles - S + 1``
+    zero records (launch 2's record prefetch); ``unit_table`` is the plain
+    plan's.  :func:`build_bf16_segment_plan` returns this class only for a
+    split plan, so every other plan keeps the plain class and its fields."""
+
+    tail_split: int = 0
+    tail_unit_table: Optional[torch.Tensor] = None
+
+
+def bf16_tail_grid_split(
+    total_tiles: int, num_clusters: int, dyn_sched: bool, combine_units: int, tiny: bool
+) -> int:
+    """The tail-grid split ``S`` of a plan (0: one launch): ``G * (R -
+    BF16_TAIL_GRID_ROUNDS)`` for a static plan (``dyn_sched`` false, no tiny
+    bounds) with no K/V-split unit and ``R = ceil(U / G) >=
+    BF16_TAIL_GRID_MIN_ROUNDS`` (and ``R > BF16_TAIL_GRID_ROUNDS``)."""
+    total_tiles, num_clusters = int(total_tiles), int(num_clusters)
+    if dyn_sched or tiny or combine_units or num_clusters <= 0 or total_tiles <= 0:
+        return 0
+    rounds = -(-total_tiles // num_clusters)
+    if rounds <= BF16_TAIL_GRID_ROUNDS or rounds < BF16_TAIL_GRID_MIN_ROUNDS:
+        return 0
+    return num_clusters * (rounds - BF16_TAIL_GRID_ROUNDS)
+
+
+def bf16_tail_split(plan: BF16SegmentPlan) -> int:
+    """The plan's tail-grid split ``S`` (0 for a one-launch plan)."""
+    return int(getattr(plan, "tail_split", 0))
 
 
 def bf16_tiny_cu_seqlens(bounds: Sequence[int]) -> Optional[torch.Tensor]:
@@ -894,6 +1043,7 @@ def build_bf16_segment_plan(
     cu_seqlens_host: Optional[Sequence[int]] = None,
     kv_splits: Optional[int] = None,
     q_split: Optional[bool] = None,
+    tail_grid: Optional[bool] = None,
 ) -> BF16SegmentPlan:
     """Build the BF16 segment plan (tables and partial workspace on ``device``).
 
@@ -908,6 +1058,10 @@ def build_bf16_segment_plan(
     ``num_q_split_units`` counts the halved units.  Off, the records are
     those of the plain plan (word 5 is 0).  The plan reproduces the Cake
     production planner's ``build_segment_plan`` table for table.
+    ``tail_grid`` (``None``: on when ``device`` is a CUDA device of
+    ``BF16_TAIL_GRID_ARCHES``) records the tail-grid split
+    (:func:`bf16_tail_grid_split`) and its ``tail_unit_table`` in a
+    :class:`BF16TailGridPlan`; it never changes ``unit_table``.
     """
     bounds = normalize_cu_seqlens(cu_seqlens, cu_seqlens_host=cu_seqlens_host)
     num_heads = int(num_heads)
@@ -1005,7 +1159,40 @@ def build_bf16_segment_plan(
     partial_O, partial_ML = _partial_workspace(partial_slots, device)
     # Per-plan program dispatch from the scheduled records (see ``bf16_dyn_sched``).
     dyn_sched = bf16_dyn_sched(table, total_tiles, num_clusters)
-    return BF16SegmentPlan(
+    tiny_cu_seqlens = bf16_tiny_cu_seqlens(bounds)
+    if tail_grid is None:
+        tail_grid = (
+            device.type == "cuda"
+            and SUPPORTED_COMPUTE_CAPABILITIES.get(
+                _device_facts(_device_index(device))[1]
+            )
+            in BF16_TAIL_GRID_ARCHES
+        )
+    tail_split = (
+        bf16_tail_grid_split(
+            total_tiles,
+            num_clusters,
+            dyn_sched,
+            len(combine) // COMBINE_WORDS,
+            tiny_cu_seqlens is not None,
+        )
+        if tail_grid
+        else 0
+    )
+    tail: dict[str, Any] = {}
+    if tail_split:
+        # Records [S, U) for launch 2 (record S + c on its cluster c) and
+        # U - S + 1 zero records: launch 2 prefetches record c + (U - S).
+        tail = dict(
+            tail_split=tail_split,
+            tail_unit_table=torch.tensor(
+                table[UNIT_WORDS * tail_split :]
+                + [0] * (UNIT_WORDS * (total_tiles - tail_split + 1)),
+                dtype=torch.int32,
+                device=device,
+            ),
+        )
+    return (BF16TailGridPlan if tail_split else BF16SegmentPlan)(
         cu_seqlens=bounds,
         num_heads=num_heads,
         num_segments=len(segments),
@@ -1038,7 +1225,8 @@ def build_bf16_segment_plan(
         dyn_sched=dyn_sched,
         # Recorded arch-independently; the launcher applies ``BF16_SREAD_ARCHES``.
         sread_unified=not dyn_sched,
-        tiny_cu_seqlens=bf16_tiny_cu_seqlens(bounds),
+        tiny_cu_seqlens=tiny_cu_seqlens,
+        **tail,
     )
 
 
@@ -1317,6 +1505,7 @@ def build_tile_tables(
     q_split: Optional[Union[bool, str]] = None,
     two_stage_dense: bool = False,
     q_split_dense: bool = False,
+    launch_pair: Optional[tuple[str, str]] = None,
 ) -> TileTables:
     """Per-unit tables: segment-major enumeration, K/V splits, Q halves, then LPT slot placement.
 
@@ -1349,7 +1538,13 @@ def build_tile_tables(
     planner's order, so their placement relative to the workspace matches it.
     ``num_clusters`` is the grid capacity in 2-CTA clusters (default
     ``bf16_grid_clusters(device)``, a CUDA device).  Mirrors the Cake
-    production planner's ``build_tile_tables``.
+    production planner's ``build_tile_tables``.  ``launch_pair`` (the
+    ``(pv_mode, arch)`` of :func:`nvfp4_launch_tile_tables`; ``None``: one launch)
+    lets the plan take a two-launch schedule (``NVFP4_TFS_ARCHES``,
+    ``NVFP4_PTG_PAIRS``): the planner decides on the host tables
+    (:func:`nvfp4_launch_schedule`) and a scheduled plan's tables are a
+    :class:`ScheduledTileTables`, relabelled (TFS) or reordered (PTG) before
+    the upload; every other plan's tables are those of the one-launch plan.
     """
     pre = _tile_units(
         plan,
@@ -1360,15 +1555,59 @@ def build_tile_tables(
         program_cost=program_cost,
         single_stage_cost=single_stage_cost,
     )
+    slots, num_q_split_units = _plan_slots(
+        plan,
+        pre,
+        q_split=q_split,
+        single_stage_cost=single_stage_cost,
+        two_stage_dense=two_stage_dense,
+        q_split_dense=q_split_dense,
+    )
+    if launch_pair is not None:
+        schedule = nvfp4_launch_schedule(
+            plan, pre, slots, num_q_split_units, launch_pair
+        )
+        if schedule.kind != "single":
+            fields = _upload_tile_tables(
+                plan, pre, schedule.slots, schedule.num_q_split_units, device
+            )
+            return ScheduledTileTables(
+                **fields,
+                schedule=schedule.kind,
+                launch_split=schedule.split,
+                tail_heads=schedule.tail_heads,
+                # fp8 TFS: QZ(B)'s ``v_amax`` (QZ(A) publishes the kernel's).
+                v_amax_scratch=(
+                    torch.zeros(1, dtype=torch.float32, device=device)
+                    if schedule.kind == "tfs" and launch_pair[0] == "fp8"
+                    else None
+                ),
+            )
+    return TileTables(
+        **_upload_tile_tables(plan, pre, slots, num_q_split_units, device)
+    )
+
+
+def _plan_slots(
+    plan: PackedSegmentPlan,
+    pre: "_TileUnits",
+    *,
+    q_split: Optional[Union[bool, str]],
+    single_stage_cost: tuple[int, int],
+    two_stage_dense: bool,
+    q_split_dense: bool,
+) -> tuple[list[tuple[int, int, int, int, int, int]], int]:
+    """The dense-form choice, the Q halves and the LPT placement of
+    :func:`build_tile_tables` on the host: ``(slot -> unit, num_q_split_units)``."""
     units, costs, half_costs = pre.units, pre.costs, pre.half_costs
     if q_split_dense and two_stage_dense and not pre.combine:
         halve = _q_split_halves(costs, half_costs, pre.num_clusters, q_split)
         if any(halve):
-            return _place_tile_units(plan, pre, units, costs, half_costs, halve, device)
+            return _slot_tile_units(pre, units, costs, half_costs, halve)
     if two_stage_dense and not pre.combine:
         units, costs, half_costs = _two_stage_dense_units(plan, pre, single_stage_cost)
     halve = _q_split_halves(costs, half_costs, pre.num_clusters, q_split)
-    return _place_tile_units(plan, pre, units, costs, half_costs, halve, device)
+    return _slot_tile_units(pre, units, costs, half_costs, halve)
 
 
 @dataclass(frozen=True)
@@ -1523,18 +1762,15 @@ def _q_split_halves(
     return bf16_choose_q_splits(costs, half_costs, int(num_clusters))
 
 
-def _place_tile_units(
-    plan: PackedSegmentPlan,
+def _slot_tile_units(
     pre: _TileUnits,
     units: list[tuple[int, int, int, int, int, int]],
     costs: list[int],
     half_costs: Sequence[Optional[int]],
     halve: Sequence[bool],
-    device: torch.device,
-) -> TileTables:
-    """The halves, the LPT slot placement and the device tables of :func:`build_tile_tables`."""
-    heads, num_clusters, cl = pre.heads, pre.num_clusters, pre.cl
-    split_of, combine, partial_slots = pre.split_of, pre.combine, pre.partial_slots
+) -> tuple[list[tuple[int, int, int, int, int, int]], int]:
+    """The halves and the LPT slot placement of :func:`build_tile_tables`:
+    ``(slot -> unit, num_q_split_units)`` on the host."""
     num_q_split_units = 0
     if any(halve):
         split_units: list[tuple[int, int, int, int, int, int]] = []
@@ -1556,8 +1792,22 @@ def _place_tile_units(
     num_tiles = len(units)
     slots = [
         units[u]
-        for u in assign_unit_slots(costs, min(int(num_clusters), max(num_tiles, 1)))
+        for u in assign_unit_slots(costs, min(int(pre.num_clusters), max(num_tiles, 1)))
     ]
+    return slots, num_q_split_units
+
+
+def _upload_tile_tables(
+    plan: PackedSegmentPlan,
+    pre: _TileUnits,
+    slots: Sequence[tuple[int, int, int, int, int, int]],
+    num_q_split_units: int,
+    device: torch.device,
+) -> dict[str, Any]:
+    """The :class:`TileTables` fields of the placed units ``slots`` (the
+    device tables, allocated in the production planner's order)."""
+    heads, cl = pre.heads, pre.cl
+    split_of, combine, partial_slots = pre.split_of, pre.combine, pre.partial_slots
     cl_head = _table([unit[1] for unit in slots], device)
     cl_tables = {
         name: _table(
@@ -1572,9 +1822,9 @@ def _place_tile_units(
         for name, values in cl.items()
     }
     partial_O, partial_ML = _partial_workspace(partial_slots, device)
-    return TileTables(
+    return dict(
         heads=heads,
-        total_tiles=num_tiles,
+        total_tiles=len(slots),
         cl_head=cl_head,
         cl_kv_begin=_table([unit[2] for unit in slots], device),
         cl_kv_blocks=_table([unit[3] for unit in slots], device),
@@ -1592,6 +1842,245 @@ def _place_tile_units(
         num_q_split_units=num_q_split_units,
         **cl_tables,
     )
+
+
+@dataclass(frozen=True)
+class ScheduledTileTables(TileTables):
+    """The tile tables of a plan launched on a two-launch schedule
+    (:func:`nvfp4_launch_schedule`).  ``schedule`` is ``"tfs"`` (the
+    tail-first schedule: ``tail_heads`` heads ``[0, k)`` hold the tail units,
+    ATT-bulk runs records ``[0, launch_split)``, ATT-tail records
+    ``[launch_split, total_tiles)``; fp8: ``v_amax_scratch`` is QZ(B)'s
+    private ``v_amax``) or ``"ptg"`` (the tail grid: L1 runs records ``[0,
+    launch_split)``, L2 the rest as one-unit clusters).  Only such a plan has
+    this class; every other plan keeps :class:`TileTables` and its fields."""
+
+    schedule: str = "single"
+    launch_split: int = 0
+    tail_heads: int = 0
+    v_amax_scratch: Optional[torch.Tensor] = None
+
+
+@dataclass(frozen=True)
+class NVFP4LaunchSchedule:
+    """A plan's launch schedule (:func:`nvfp4_launch_schedule`): ``kind``
+    ``"single"`` / ``"tfs"`` / ``"ptg"``, the placed units to upload (``slots``,
+    ``num_q_split_units``), ``split`` and ``tail_heads`` as in
+    :class:`ScheduledTileTables`, ``form`` (TFS: ``"natural"``, the plan's
+    own placed units; PTG: the depth ``D`` as ``"D<d>"``) and ``facts`` (the
+    decision's numbers and the reason of every rule that did not fire)."""
+
+    kind: str
+    slots: list
+    num_q_split_units: int
+    split: int = 0
+    tail_heads: int = 0
+    form: str = ""
+    facts: Optional[dict] = None
+
+
+def nvfp4_unit_us(seg_len: int, q_half: int, pv_mode: str) -> float:
+    """Modelled time of an unsplit NVFP4 unit (all K/V blocks of its
+    segment; single-stage when ``q_half`` is 1 or 2)."""
+    blocks = (int(seg_len) + BLOCK_N - 1) // BLOCK_N
+    ratio = NVFP4_SINGLE_STAGE_TIME_RATIO[pv_mode] if q_half else 1.0
+    return blocks * NVFP4_UNIT_US_PER_BLOCK[pv_mode] * ratio
+
+
+def _unit_times(
+    pre: _TileUnits,
+    slots: Sequence[tuple[int, int, int, int, int, int]],
+    pv_mode: str,
+) -> list[float]:
+    """:func:`nvfp4_unit_us` of every placed unit in ``slots``."""
+    per_block = NVFP4_UNIT_US_PER_BLOCK[pv_mode]
+    ratio = NVFP4_SINGLE_STAGE_TIME_RATIO[pv_mode]
+    whole = [
+        ((length + BLOCK_N - 1) // BLOCK_N) * per_block
+        for length in pre.cl["cl_seg_len"]
+    ]
+    return [whole[c] * ratio if q else whole[c] * 1.0 for c, _, _, _, _, q in slots]
+
+
+def nvfp4_tail_head_labels(tail_heads: Sequence[int], heads: int) -> list[int]:
+    """``old head -> new head``: a permutation of ``range(heads)`` that maps
+    the sorted ``tail_heads`` onto ``[0, k)`` by transpositions."""
+    labels = list(range(heads))
+    holder = list(range(heads))
+    for i, head in enumerate(sorted(tail_heads)):
+        current, other = labels[head], holder[i]
+        labels[head], labels[other] = i, current
+        holder[i], holder[current] = head, other
+    assert sorted(labels) == list(range(heads))
+    return labels
+
+
+def _tfs_form_facts(
+    plan: PackedSegmentPlan,
+    pre: _TileUnits,
+    slots: Sequence[tuple[int, int, int, int, int, int]],
+    pv_mode: str,
+) -> dict[str, Any]:
+    """Geometry and modelled times of the TFS split of one placed form."""
+    G, H = int(pre.num_clusters), int(pre.heads)
+    N = len(slots)
+    R = N // G
+    RG = R * G
+    nt = N - RG
+    tail_times = _unit_times(pre, slots[RG:], pv_mode)
+    tail_heads = sorted({unit[1] for unit in slots[RG:]})
+    k = len(tail_heads)
+    qz = NVFP4_QUANTIZE_US_PER_TOKEN_HEAD[pv_mode] * H * int(plan.total_tokens)
+    free_sms = 2 * (G - nt)
+    return dict(
+        N=N,
+        R=R,
+        nt=nt,
+        idle=(G - nt) / G,
+        k=k,
+        tail_heads=tail_heads,
+        qz_us=qz,
+        qza_us=max(NVFP4_TFS_QZA_MIN_US, qz * k / H),
+        d_b_us=qz * (H - k) / H * (2 * G) / free_sms if free_sms > 0 else math.inf,
+        t_tail_us=max(tail_times, default=0.0),
+    )
+
+
+def nvfp4_tfs_decision(
+    plan: PackedSegmentPlan,
+    pre: _TileUnits,
+    natural: Sequence[tuple[int, int, int, int, int, int]],
+    num_q_split_units: int,
+    pv_mode: str,
+    arch: str,
+) -> tuple[Optional[str], dict[str, Any]]:
+    """The TFS rule (see ``NVFP4_TFS_ARCHES``): ``"natural"`` when the
+    plan's placed units ``natural`` (``num_q_split_units`` Q-split halves)
+    qualify, else ``None``, and the facts."""
+    facts: dict[str, Any] = {}
+    if arch not in NVFP4_TFS_ARCHES:
+        facts["reason"] = "arch"
+        return None, facts
+    if pv_mode == "fp8" and (pv_mode, arch) not in NVFP4_QS_DENSE:
+        facts["reason"] = "no attention_qs program"
+        return None, facts
+    if pre.combine:
+        facts["reason"] = "kv_split"
+        return None, facts
+    f = _tfs_form_facts(plan, pre, natural, pv_mode)
+    facts["natural"] = f
+    if f["R"] < 1 or f["nt"] == 0:
+        facts["reason"] = "no_full_round" if f["R"] < 1 else "no_tail_round"
+        return None, facts
+    if num_q_split_units == 0:
+        facts["reason"] = "no_q_split_halves"
+        return None, facts
+    native_end = f["qz_us"] + f["t_tail_us"]
+    tfs_end = f["qza_us"] + max(f["t_tail_us"], f["d_b_us"]) + NVFP4_TFS_OVERHEAD_US
+    f["model_gain_us"] = native_end - tfs_end
+    if f["idle"] < NVFP4_TFS_IDLE_MIN:
+        facts["reason"] = f"idle {f['idle']:.4f}"
+    elif f["k"] > NVFP4_TFS_HEAD_FRACTION_MAX * pre.heads:
+        facts["reason"] = f"k {f['k']}/{pre.heads}"
+    elif f["d_b_us"] > NVFP4_TFS_FIT * f["t_tail_us"]:
+        facts["reason"] = f"fit {f['d_b_us']:.1f}>{NVFP4_TFS_FIT}x{f['t_tail_us']:.1f}"
+    elif f["model_gain_us"] <= 0:
+        facts["reason"] = f"model_gain {f['model_gain_us']:.1f}"
+    else:
+        facts["reason"] = "ok"
+        return "natural", facts
+    return None, facts
+
+
+def nvfp4_ptg_decision(
+    pre: _TileUnits,
+    slots: Sequence[tuple[int, int, int, int, int, int]],
+    pv_mode: str,
+    arch: str,
+) -> tuple[int, dict[str, Any]]:
+    """The PTG gate (see ``NVFP4_PTG_PAIRS``): the depth ``D`` (0: no PTG)
+    and the facts."""
+    facts: dict[str, Any] = {}
+    if (pv_mode, arch) not in NVFP4_PTG_PAIRS:
+        facts["reason"] = "pair"
+        return 0, facts
+    if pre.combine:
+        facts["reason"] = "kv_split"
+        return 0, facts
+    G = int(pre.num_clusters)
+    N = len(slots)
+    R = -(-N // G)
+    target = 2 if R >= NVFP4_PTG_DEEP_ROUNDS else 1
+    facts.update(N=N, G=G, R=R, full_rounds=N // G, target=target)
+    if N // G < NVFP4_PTG_MIN_FULL_ROUNDS:
+        facts["reason"] = f"full_rounds {N // G}"
+        return 0, facts
+    times = _unit_times(pre, slots, pv_mode)
+    longest = max(times, default=0.0)
+    attention_us = sum(max(times[r * G : (r + 1) * G]) for r in range(R))
+    facts["attention_us"] = attention_us
+    if attention_us < NVFP4_PTG_MIN_ATTENTION_US:
+        facts["reason"] = f"attention_us {attention_us:.1f}"
+        return 0, facts
+    threshold = NVFP4_PTG_FULL_UNIT_FRACTION * longest
+    for depth in range(1, min(NVFP4_PTG_MAX_DEPTH, R - 1) + 1):
+        start = G * (R - depth)
+        count = sum(1 for t in times[start:] if t >= threshold)
+        facts[f"full_units_D{depth}"] = count
+        if count > (target - 1) * G:
+            facts["reason"] = "ok"
+            return depth, facts
+    facts["reason"] = "depth"
+    return 0, facts
+
+
+def nvfp4_launch_schedule(
+    plan: PackedSegmentPlan,
+    pre: _TileUnits,
+    slots: list[tuple[int, int, int, int, int, int]],
+    num_q_split_units: int,
+    launch_pair: tuple[str, str],
+) -> NVFP4LaunchSchedule:
+    """The launch schedule of a placed NVFP4 plan on ``launch_pair`` =
+    ``(pv_mode, arch)``: TFS when :func:`nvfp4_tfs_decision` fires, else PTG
+    when :func:`nvfp4_ptg_decision` gives a depth, else one launch.  Host
+    only; ``slots`` / ``num_q_split_units`` are the plan's placed units."""
+    pv_mode, arch = launch_pair
+    form, tfs = nvfp4_tfs_decision(plan, pre, slots, num_q_split_units, pv_mode, arch)
+    facts: dict[str, Any] = {"tfs": tfs}
+    if form is not None:
+        chosen = tfs[form]
+        G = int(pre.num_clusters)
+        split = chosen["R"] * G
+        labels = nvfp4_tail_head_labels(chosen["tail_heads"], pre.heads)
+        return NVFP4LaunchSchedule(
+            "tfs",
+            [(unit[0], labels[unit[1]], *unit[2:]) for unit in slots],
+            num_q_split_units,
+            split=split,
+            tail_heads=chosen["k"],
+            form=form,
+            facts=facts,
+        )
+    depth, ptg = nvfp4_ptg_decision(pre, slots, pv_mode, arch)
+    facts["ptg"] = ptg
+    if depth:
+        G = int(pre.num_clusters)
+        split = G * (-(-len(slots) // G) - depth)
+        # L2 longest first (stable: equal times keep the slot order).
+        times = _unit_times(pre, slots[split:], pv_mode)
+        tail = [
+            slots[split + i] for i in sorted(range(len(times)), key=lambda i: -times[i])
+        ]
+        return NVFP4LaunchSchedule(
+            "ptg",
+            list(slots[:split]) + tail,
+            num_q_split_units,
+            split=split,
+            form=f"D{depth}",
+            facts=facts,
+        )
+    return NVFP4LaunchSchedule("single", slots, num_q_split_units, facts=facts)
 
 
 def nvfp4_quantize_grid(heads: int, PB: int) -> tuple[int, int, int]:
@@ -1888,6 +2377,49 @@ def validate_minimax_h3_varlen_inputs(
 
 
 # ---------------------------------------------------------------------------
+# Side streams of the two-launch schedules
+# ---------------------------------------------------------------------------
+
+# The BF16 tail grid and the NVFP4 tail-first / tail-grid schedules
+# (:func:`build_tile_tables` ``launch_pair``) fork from the caller's stream
+# onto a greatest-priority and a least-priority stream and join back.  A
+# prepared runner owns one stream set; the one-shot entries launch and join
+# inside the call, so the calls of one thread share that thread's set.
+_THREAD_SIDE_STREAMS = threading.local()
+
+
+def _new_side_streams(device: torch.device) -> tuple:
+    """``(high, low, e0, e1, e2, e3, ffi_device)``: a greatest-priority and a
+    least-priority stream on ``device``, four events and the device's FFI
+    handle (the launches name the side streams by their raw handles)."""
+    least, greatest = torch.cuda.Stream.priority_range()
+    return (
+        torch.cuda.Stream(device=device, priority=greatest),
+        torch.cuda.Stream(device=device, priority=least),
+        torch.cuda.Event(),
+        torch.cuda.Event(),
+        torch.cuda.Event(),
+        torch.cuda.Event(),
+        tvm_ffi.device(f"cuda:{_device_index(device)}"),
+    )
+
+
+def _side_streams(device: torch.device, shared: bool) -> tuple:
+    """A new stream set (``shared`` false: a prepared runner's) or the calling
+    thread's set for ``device`` (created once; the one-shot entries)."""
+    if not shared:
+        return _new_side_streams(device)
+    sets = getattr(_THREAD_SIDE_STREAMS, "sets", None)
+    if sets is None:
+        sets = _THREAD_SIDE_STREAMS.sets = {}
+    index = _device_index(device)
+    side = sets.get(index)
+    if side is None:
+        side = sets[index] = _new_side_streams(torch.device("cuda", index))
+    return side
+
+
+# ---------------------------------------------------------------------------
 # Runners
 # ---------------------------------------------------------------------------
 
@@ -1900,7 +2432,11 @@ class MiniMaxH3VarlenAttentionRunner:
     current stream with no CUDA allocation and no host synchronization and
     returns ``out``.  The segment plan is fixed at preparation; prepare a new
     runner when ``cu_seqlens``, shapes or tensor bindings change (values may
-    change freely).  CUDA Graph capture belongs to the caller.
+    change freely).  CUDA Graph capture belongs to the caller.  A tail-grid
+    plan (:class:`BF16TailGridPlan`) launches on the runner's two side
+    streams, both ordered after the current stream, which then waits for both
+    (stream capture follows the fork and the join; graph replay applies the
+    stream priorities only when instantiated with per-node priorities).
     """
 
     variant: str
@@ -1913,9 +2449,28 @@ class MiniMaxH3VarlenAttentionRunner:
     _arguments: tuple
     _combine_entry: Optional[Callable[..., Any]] = None
     _combine_arguments: tuple = ()
+    # Tail grid: launch 2's arguments and the side streams (high, low, fork
+    # event, high done, low done, a spare event, the FFI device);
+    # ``_arguments`` are then launch 1's.
+    _tail_arguments: tuple = ()
+    _tail_streams: Optional[tuple] = None
 
     def launch(self) -> torch.Tensor:
-        if self._entry is not None:  # zero tiles: nothing to launch
+        if self._entry is not None and self._tail_streams is not None:
+            high, low, fork, high_done, low_done, _, ffi = self._tail_streams
+            caller = torch.cuda.current_stream(self.out.device)
+            fork.record(caller)
+            high.wait_event(fork)
+            low.wait_event(fork)
+            with tvm_ffi.use_raw_stream(ffi, high.cuda_stream):
+                self._entry(*self._arguments)
+            with tvm_ffi.use_raw_stream(ffi, low.cuda_stream):
+                self._entry(*self._tail_arguments)
+            high_done.record(high)
+            low_done.record(low)
+            caller.wait_event(high_done)
+            caller.wait_event(low_done)
+        elif self._entry is not None:  # zero tiles: nothing to launch
             # Tensor maps are encoded by the host binding and passed by value.
             with tvm_ffi.use_torch_stream():
                 self._entry(*self._arguments)
@@ -1947,6 +2502,11 @@ class MiniMaxH3VarlenAttentionRunner:
             dyn_sched=bool(self.plan.dyn_sched),
             sread_unified=bool(self.plan.sread_unified)
             and self.arch in BF16_SREAD_ARCHES,
+            tail_grid_units=(
+                self.plan.total_tiles - bf16_tail_split(self.plan)
+                if self._tail_streams is not None
+                else 0
+            ),
         )
 
 
@@ -2040,6 +2600,14 @@ class MiniMaxH3VarlenNVFP4AttentionRunner:
     previous call's attention and ``combine`` included, has finished.  All
     launches are enqueued on the current torch stream in order, which is all
     the handshakes require from the host.
+
+    A plan on a two-launch schedule (:class:`ScheduledTileTables`, ``"tfs"``
+    / ``"ptg"``, see ``NVFP4_TFS_ARCHES``) launches on the runner's two side
+    streams: ``launch()`` forks from the current stream, runs the schedule and
+    makes the current stream wait for it (stream capture follows the fork and
+    the join).  ``quantize()`` and ``attention()`` stay one-stream: the whole
+    quantizer, then the bound attention program over all of the plan's
+    records.
     """
 
     variant: str
@@ -2052,39 +2620,104 @@ class MiniMaxH3VarlenNVFP4AttentionRunner:
     out: torch.Tensor
     _value: torch.Tensor
     _stages: tuple[tuple[str, Optional[Callable[..., Any]], tuple], ...]
+    # Two-launch schedule: its kind, its bound launches (TFS: amax or None,
+    # QZ(A), ATT-tail, QZ(B), ATT-bulk; PTG: amax or None, the quantizer, L1,
+    # L2; each ``(entry, arguments)``) and the side streams
+    # ``(S1, S2, e0, e1, e2, e3, ffi_device)``.
+    _schedule: str = "single"
+    _parts: tuple = ()
+    _side: Optional[tuple] = None
 
-    def _run(self, names: Sequence[str]) -> None:
+    def _run(self, names: Optional[Sequence[str]]) -> None:
+        # ``names``: the stages to run (``None``: every bound stage), in order.
         with tvm_ffi.use_torch_stream():
             for name, entry, arguments in self._stages:
-                if name not in names or entry is None:
+                if entry is None or (names is not None and name not in names):
                     continue
                 entry(*arguments)
 
     def quantize(self) -> None:
         # fp8: the ``amax`` partial-max kernel and the quantizer that folds it.
-        self._run(tuple(s for s in STAGES[self.variant] if s in QUANTIZE_STAGES))
+        self._run(QUANTIZE_STAGES)
 
     def attention(self) -> torch.Tensor:
         # The bound attention program and, for K/V-split plans, the combine launch.
-        self._run(tuple(s for s in STAGES[self.variant] if s not in QUANTIZE_STAGES))
+        self._run(tuple(n for n, _, _ in self._stages if n not in QUANTIZE_STAGES))
         return self.out
 
     @property
     def attention_stage(self) -> str:
-        """``"attention_split"`` for plans with K/V-split units, ``"attention_qs"``
-        for the Q-split plans of a ``NVFP4_QS_DENSE`` pair, else ``"attention"``."""
+        """The bound attention program: ``"attention_split"`` for plans with
+        K/V-split units, ``"attention_qs"`` for the Q-split plans of a
+        ``NVFP4_QS_DENSE`` pair and the fp8 tail-first plans, else
+        ``"attention"``."""
+        bound = [
+            name
+            for name, entry, _ in self._stages
+            if entry is not None and name in NVFP4_ATTENTION_STAGES
+        ]
+        if bound:
+            return bound[0]
         return nvfp4_attention_stage(self.tile_tables, self.pv_mode, self.arch)
 
     def launch(self) -> torch.Tensor:
-        self._run(STAGES[self.variant])
+        if self._schedule == "tfs":
+            self._launch_tfs()
+        elif self._schedule == "ptg":
+            self._launch_ptg()
+        else:
+            self._run(None)
         return self.out
+
+    def _launch_tfs(self) -> None:
+        s1, s2, fork, quantized_a, quantized_b, done, ffi = self._side
+        amax, qz_a, att_tail, qz_b, att_bulk = self._parts
+        caller = torch.cuda.current_stream(self.out.device)
+        fork.record(caller)
+        s1.wait_event(fork)
+        with tvm_ffi.use_raw_stream(ffi, s1.cuda_stream):
+            if amax is not None:
+                amax[0](*amax[1])
+            qz_a[0](*qz_a[1])
+            quantized_a.record(s1)
+            att_tail[0](*att_tail[1])
+        s2.wait_event(quantized_a)
+        with tvm_ffi.use_raw_stream(ffi, s2.cuda_stream):
+            qz_b[0](*qz_b[1])
+        quantized_b.record(s2)
+        s1.wait_event(quantized_b)
+        with tvm_ffi.use_raw_stream(ffi, s1.cuda_stream):
+            att_bulk[0](*att_bulk[1])
+        done.record(s1)
+        caller.wait_event(done)
+
+    def _launch_ptg(self) -> None:
+        s1, s2, fork, quantized, done_1, done_2, ffi = self._side
+        amax, qz, launch_1, launch_2 = self._parts
+        caller = torch.cuda.current_stream(self.out.device)
+        fork.record(caller)
+        s1.wait_event(fork)
+        with tvm_ffi.use_raw_stream(ffi, s1.cuda_stream):
+            if amax is not None:
+                amax[0](*amax[1])
+            qz[0](*qz[1])
+            quantized.record(s1)
+            launch_1[0](*launch_1[1])
+        s2.wait_event(quantized)
+        with tvm_ffi.use_raw_stream(ffi, s2.cuda_stream):
+            launch_2[0](*launch_2[1])
+        done_1.record(s1)
+        done_2.record(s2)
+        caller.wait_event(done_1)
+        caller.wait_event(done_2)
 
     __call__ = launch
 
     @property
     def quantize_stage(self) -> str:
         """The quantizer the plan binds: ``"quantize_early_qk"`` (fp8),
-        ``"quantize_tp"`` (fp4) or ``"quantize"`` (:func:`nvfp4_quantize_stage`)."""
+        ``"quantize_tp"`` / ``"quantize_tp_mb8"`` (fp4) or ``"quantize"``
+        (:func:`nvfp4_quantize_stage`)."""
         bound = [
             name
             for name, entry, _ in self._stages
@@ -2113,6 +2746,7 @@ class MiniMaxH3VarlenNVFP4AttentionRunner:
             max_kv_splits=self.tile_tables.max_kv_splits,
             attention_variant=self.attention_stage,
             quantize_variant=self.quantize_stage,
+            launch_schedule=self._schedule,
         )
 
 
@@ -2174,8 +2808,10 @@ def nvfp4_tile_tables(
     *,
     num_clusters: Optional[int] = None,
 ) -> TileTables:
-    """The tile tables an NVFP4 plan of ``(pv_mode, arch)`` binds
-    (:func:`build_tile_tables` with the pair's costs).
+    """The one-launch tile tables an NVFP4 plan of ``(pv_mode, arch)`` binds
+    (:func:`build_tile_tables` with the pair's costs; the runner launches
+    :func:`nvfp4_launch_tile_tables`, these tables unless a two-launch
+    schedule applies).
 
     One :func:`build_tile_tables` call with the pair's costs: a
     ``NVFP4_QS_DENSE`` pair passes ``q_split_dense``, so a plan with tail-round
@@ -2184,6 +2820,36 @@ def nvfp4_tile_tables(
     neither takes the ``two_stage_dense`` form.  ``num_clusters``: as
     :func:`build_tile_tables`.
     """
+    return _nvfp4_tables(plan, heads, device, pv_mode, arch, num_clusters, None)
+
+
+def nvfp4_launch_tile_tables(
+    plan: PackedSegmentPlan,
+    heads: int,
+    device: torch.device,
+    pv_mode: str,
+    arch: str,
+    *,
+    num_clusters: Optional[int] = None,
+) -> TileTables:
+    """The tile tables the prepared runner launches: the
+    :func:`nvfp4_tile_tables` plan, on a two-launch schedule when the pair
+    takes one (:func:`nvfp4_launch_schedule`, ``launch_pair`` of
+    :func:`build_tile_tables`; a :class:`ScheduledTileTables`), else exactly
+    the :func:`nvfp4_tile_tables` tables."""
+    pair = (pv_mode, arch)
+    return _nvfp4_tables(plan, heads, device, pv_mode, arch, num_clusters, pair)
+
+
+def _nvfp4_tables(
+    plan: PackedSegmentPlan,
+    heads: int,
+    device: torch.device,
+    pv_mode: str,
+    arch: str,
+    num_clusters: Optional[int],
+    launch_pair: Optional[tuple[str, str]],
+) -> TileTables:
     pair = (pv_mode, arch)
     return build_tile_tables(
         plan,
@@ -2194,18 +2860,33 @@ def nvfp4_tile_tables(
         single_stage_cost=NVFP4_SINGLE_STAGE_COST[pair],
         two_stage_dense=pair in NVFP4_TWO_STAGE_DENSE,
         q_split_dense=pair in NVFP4_QS_DENSE,
+        launch_pair=launch_pair,
     )
 
 
+def nvfp4_schedule_of(tiles: TileTables) -> str:
+    """The launch schedule of a plan's tile tables: ``"tfs"``, ``"ptg"`` or
+    ``"single"`` (every :class:`TileTables` that is not scheduled)."""
+    return str(getattr(tiles, "schedule", "single"))
+
+
 def nvfp4_quantize_stage(
-    pv_mode: str, heads: int, PB: int, num_sms: int, *, arch: Optional[str] = None
+    pv_mode: str,
+    heads: int,
+    PB: int,
+    num_sms: int,
+    *,
+    arch: Optional[str] = None,
+    mb8: bool = False,
 ) -> str:
     """The quantizer a plan binds.  ``pv_mode="fp8"`` binds ``quantize_early_qk``
     when the quantize grid (``nvfp4_quantize_grid``) fits in ``EARLY_QK_WAVES``
     waves of ``EARLY_QK_CTAS_PER_SM`` CTAs on each of the device's ``num_sms``
     SMs; ``pv_mode="fp4"`` binds ``quantize_tp`` on an ``arch`` of
-    ``NVFP4_QUANTIZE_TP_ARCHES`` when ``PB <= QUANTIZE_TP_MAX_PB``; every
-    other plan binds ``quantize``.
+    ``NVFP4_QUANTIZE_TP_ARCHES`` when ``PB <= QUANTIZE_TP_MAX_PB`` --
+    ``quantize_tp_mb8`` instead when ``mb8`` (the route carries that build and
+    the quantizer runs as one launch) and the quantize grid lies in
+    ``QUANTIZE_TP_MB8_GRID``; every other plan binds ``quantize``.
 
     Each pair builds from one quantizer source (``pv_mode`` ``"fp8"`` /
     ``"fp8_early_qk"``, ``"fp4"`` / ``"fp4_tp"``), specialised at build time,
@@ -2216,6 +2897,9 @@ def nvfp4_quantize_stage(
     """
     if pv_mode == "fp4":
         if arch in NVFP4_QUANTIZE_TP_ARCHES and int(PB) <= QUANTIZE_TP_MAX_PB:
+            low, high = QUANTIZE_TP_MB8_GRID
+            if mb8 and low <= nvfp4_quantize_grid(heads, PB)[0] <= high:
+                return "quantize_tp_mb8"
             return "quantize_tp"
         return "quantize"
     if pv_mode != "fp8":
@@ -2414,8 +3098,37 @@ def prepare_minimax_h3_varlen_attention(
     most-recently-used plan cache (:func:`cached_bf16_segment_plan`): the
     first preparation of a ``(cu_seqlens, num_heads, device, stream)`` builds
     and uploads the tables, later ones reuse them, so the only allocation
-    here is the optional output; the returned runner launches with none.
+    here is the optional output; the returned runner launches with none.  A
+    tail-grid plan (:class:`BF16TailGridPlan`, ``BF16_TAIL_GRID_ARCHES``)
+    also creates the runner's two side streams.
     """
+    return _prepare_bf16(
+        query,
+        key,
+        value,
+        cu_seqlens,
+        softmax_scale=softmax_scale,
+        out=out,
+        cu_seqlens_host=cu_seqlens_host,
+        backend=backend,
+        shared_side_streams=False,
+    )
+
+
+def _prepare_bf16(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_seqlens: Union[torch.Tensor, Sequence[int]],
+    *,
+    softmax_scale: Optional[float],
+    out: Optional[torch.Tensor],
+    cu_seqlens_host: Optional[Sequence[int]],
+    backend: str,
+    shared_side_streams: bool,
+) -> MiniMaxH3VarlenAttentionRunner:
+    """:func:`prepare_minimax_h3_varlen_attention`; ``shared_side_streams``
+    takes the calling thread's side streams (:func:`_side_streams`)."""
     if backend != "cake":
         raise ValueError("MiniMax-H3 varlen attention supports backend='cake'")
     total_tokens, num_heads, device = validate_minimax_h3_varlen_inputs(
@@ -2474,6 +3187,8 @@ def prepare_minimax_h3_varlen_attention(
     arguments: tuple = ()
     combine_entry: Optional[Callable[..., Any]] = None
     combine_arguments: tuple = ()
+    tail_arguments: tuple = ()
+    tail_streams: Optional[tuple] = None
     if attention_stage == "attention_tiny":
         # One CTA per (head, non-empty segment); the program's argument plan
         # must be exactly the tiny one (a route leaf naming another program
@@ -2485,9 +3200,33 @@ def prepare_minimax_h3_varlen_attention(
         # Per-plan program dispatch: the plan's ``dyn_sched`` / ``sread_unified``
         # flags and the arch filter select one of the route's BF16 attention
         # programs (``bf16_attention_stage``).
-        entry, arguments = _bind_stage(
-            route["modules"][attention_stage], arch, main_kwargs
+        split = bf16_tail_split(plan)
+        tail_table = getattr(plan, "tail_unit_table", None)
+        tail_grid = bool(
+            split
+            and attention_stage == "attention_sread"
+            and arch in BF16_TAIL_GRID_ARCHES
+            and tail_table is not None
         )
+        # Tail grid: launch 1 = slots [0, S) on the persistent grid,
+        # launch 2 = slots [S, U) as U - S one-unit clusters.
+        entry, arguments = _bind_stage(
+            route["modules"][attention_stage],
+            arch,
+            dict(main_kwargs, total_tiles=split) if tail_grid else main_kwargs,
+        )
+        if tail_grid:
+            _, tail_arguments = _bind_stage(
+                route["modules"][attention_stage],
+                arch,
+                dict(
+                    main_kwargs,
+                    unit_table=tail_table,
+                    total_tiles=total_tiles - split,
+                    grid=(2 * (total_tiles - split), 1, 1),
+                ),
+            )
+            tail_streams = _side_streams(device, shared_side_streams)
         if plan.num_combine_units > 0:
             combine_entry, combine_arguments = _bind_stage(
                 route["modules"]["combine"],
@@ -2514,6 +3253,8 @@ def prepare_minimax_h3_varlen_attention(
         arguments,
         combine_entry,
         combine_arguments,
+        tail_arguments,
+        tail_streams,
     )
 
 
@@ -2537,8 +3278,40 @@ def prepare_minimax_h3_varlen_nvfp4_attention(
     :func:`nvfp4_workspace_shapes`); the returned runner launches with none.
     ``query`` / ``key`` / ``value`` need ``NVFP4_INPUT_ALIGN``-byte-aligned
     bases and a caller-owned ``workspace`` ``NVFP4_WORKSPACE_ALIGN``-byte-aligned
-    tensors.
+    tensors.  A plan on a two-launch schedule (:class:`ScheduledTileTables`)
+    also creates the runner's two side streams.
     """
+    return _prepare_nvfp4(
+        query,
+        key,
+        value,
+        cu_seqlens,
+        pv_mode=pv_mode,
+        softmax_scale=softmax_scale,
+        out=out,
+        cu_seqlens_host=cu_seqlens_host,
+        workspace=workspace,
+        backend=backend,
+        shared_side_streams=False,
+    )
+
+
+def _prepare_nvfp4(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_seqlens: Union[torch.Tensor, Sequence[int]],
+    *,
+    pv_mode: str,
+    softmax_scale: Optional[float],
+    out: Optional[torch.Tensor],
+    cu_seqlens_host: Optional[Sequence[int]],
+    workspace: Optional[dict[str, torch.Tensor]],
+    backend: str,
+    shared_side_streams: bool,
+) -> MiniMaxH3VarlenNVFP4AttentionRunner:
+    """:func:`prepare_minimax_h3_varlen_nvfp4_attention`; ``shared_side_streams``
+    takes the calling thread's side streams (:func:`_side_streams`)."""
     if backend != "cake":
         raise ValueError("MiniMax-H3 varlen NVFP4 attention supports backend='cake'")
     if pv_mode not in PV_MODES:
@@ -2591,7 +3364,7 @@ def prepare_minimax_h3_varlen_nvfp4_attention(
                     f"{NVFP4_WORKSPACE_ALIGN}-byte aligned"
                 )
     PB = int(plan.PB)
-    tiles = nvfp4_tile_tables(plan, num_heads, device, pv_mode, arch)
+    tiles = nvfp4_launch_tile_tables(plan, num_heads, device, pv_mode, arch)
     quantize_kwargs = dict(
         q=query,
         k=key,
@@ -2713,31 +3486,65 @@ def prepare_minimax_h3_varlen_nvfp4_attention(
         tiles.num_combine_units,
     )
     assert tuple(stage_kwargs) == STAGES[variant]
-    attention_stage = nvfp4_attention_stage(tiles, pv_mode, arch)
+    schedule = nvfp4_schedule_of(tiles) if total_tiles > 0 else "single"
+    if schedule == "tfs":
+        # Both attention launches of the tail-first schedule run the dense
+        # program that takes the unit count (fp8: the single-stage one).
+        attention_stage = "attention" if pv_mode == "fp4" else "attention_qs"
+    else:
+        attention_stage = nvfp4_attention_stage(tiles, pv_mode, arch)
     quantize_stage = nvfp4_quantize_stage(
-        pv_mode, num_heads, PB, _device_facts(_device_index(device))[0], arch=arch
+        pv_mode,
+        num_heads,
+        PB,
+        _device_facts(_device_index(device))[0],
+        arch=arch,
+        # The optional third fp4 quantizer build, for a one-launch quantizer.
+        mb8="quantize_tp_mb8" in route["modules"] and schedule != "tfs",
     )
     stages: list[tuple[str, Optional[Callable[..., Any]], tuple]] = []
     for stage in STAGES[variant]:
+        name = stage
+        if stage == "quantize_tp" and quantize_stage == "quantize_tp_mb8":
+            # The optional build takes the ``quantize_tp`` parameters and slot.
+            name = quantize_stage
         skipped = (
             total_tiles == 0
             or (stage == "combine" and tiles.num_combine_units == 0)
             or (stage in NVFP4_ATTENTION_STAGES and stage != attention_stage)
-            or (stage in QUANTIZER_STAGES and stage != quantize_stage)
+            or (name in QUANTIZER_STAGES and name != quantize_stage)
         )
         if skipped:
-            stages.append((stage, None, ()))
+            stages.append((name, None, ()))
             continue
         # ``quantize_tp`` takes its tables by value: a route leaf naming a
         # program that takes them as device buffers is refused.
         entry, arguments = _bind_stage(
-            route["modules"][stage],
+            route["modules"][name],
             arch,
             stage_kwargs[stage],
             exact=stage in (*NVFP4_ATTENTION_STAGES, "quantize_tp"),
             by_value=QUANTIZE_TP_BY_VALUE if stage == "quantize_tp" else (),
         )
-        stages.append((stage, entry, arguments))
+        stages.append((name, entry, arguments))
+    parts: tuple = ()
+    side: Optional[tuple] = None
+    if schedule != "single":
+        parts = _schedule_parts(
+            route,
+            arch,
+            pv_mode,
+            tiles,
+            stage_kwargs,
+            dict((name, (entry, arguments)) for name, entry, arguments in stages),
+            schedule,
+            attention_stage,
+            quantize_stage,
+            num_heads,
+            PB,
+            device,
+        )
+        side = _side_streams(device, shared_side_streams)
     return MiniMaxH3VarlenNVFP4AttentionRunner(
         variant,
         pv_mode,
@@ -2749,6 +3556,87 @@ def prepare_minimax_h3_varlen_nvfp4_attention(
         out,
         value,
         tuple(stages),
+        schedule,
+        parts,
+        side,
+    )
+
+
+def _schedule_parts(
+    route: dict[str, Any],
+    arch: str,
+    pv_mode: str,
+    tiles: TileTables,
+    stage_kwargs: dict[str, dict],
+    bound: dict[str, tuple],
+    schedule: str,
+    attention_stage: str,
+    quantize_stage: str,
+    heads: int,
+    PB: int,
+    device: torch.device,
+) -> tuple:
+    """The bound launches of a two-launch schedule (see the NVFP4 runner's
+    ``_parts``): the route's own programs on views of the plan's tables,
+    grids and (TFS) operand views offset by ``tail_heads`` heads."""
+    assert isinstance(tiles, ScheduledTileTables)
+    total_tiles = int(tiles.total_tiles)
+    split = int(tiles.launch_split)
+    attention = stage_kwargs[attention_stage]
+    module = route["modules"][attention_stage]
+
+    def attention_launch(first: int, last: int, grid: tuple[int, int, int]) -> tuple:
+        kwargs = dict(attention, num_tiles=last - first, grid=grid)
+        for name in TileTables.NAMES:
+            if name in attention:
+                kwargs[name] = getattr(tiles, name)[first:last]
+        return _bind_stage(module, arch, kwargs, exact=True)
+
+    bulk_grid = _persistent_grid(device, split, at_least_one=True)
+    tail_grid = (2 * (total_tiles - split), 1, 1)
+    amax = bound.get("amax") if pv_mode == "fp8" else None
+    if schedule == "ptg":
+        return (
+            amax,
+            bound[quantize_stage],
+            attention_launch(0, split, bulk_grid),
+            attention_launch(split, total_tiles, tail_grid),
+        )
+    assert schedule == "tfs" and quantize_stage != "quantize_tp_mb8"
+    k = int(tiles.tail_heads)
+    quantize = stage_kwargs[quantize_stage]
+    by_value = QUANTIZE_TP_BY_VALUE if quantize_stage == "quantize_tp" else ()
+
+    def quantize_launch(kwargs: dict[str, Any]) -> tuple:
+        return _bind_stage(
+            route["modules"][quantize_stage],
+            arch,
+            kwargs,
+            exact=quantize_stage == "quantize_tp",
+            by_value=by_value,
+        )
+
+    # QZ(B): the quantizer over heads [k, H) on views that start k heads in
+    # (head-major packed operands; THD inputs, whose token stride stays
+    # ``heads * 128``); fp8: QZ(B) publishes its ``v_amax`` into the scratch.
+    per_head = {
+        name: math.prod(shape)
+        for name, (shape, _) in nvfp4_workspace_shapes(1, PB, pv_mode).items()
+        if name not in ("v_amax_partial", "v_amax")
+    }
+    per_head.update(q=HEAD_DIM, k=HEAD_DIM, v=HEAD_DIM)
+    rest = dict(quantize, grid=nvfp4_quantize_grid(heads - k, PB))
+    for name, size in per_head.items():
+        if name in rest:
+            rest[name] = rest[name].reshape(-1)[k * size :]
+    if "v_amax" in rest:
+        rest["v_amax"] = tiles.v_amax_scratch
+    return (
+        amax,
+        quantize_launch(dict(quantize, grid=nvfp4_quantize_grid(k, PB))),
+        attention_launch(split, total_tiles, tail_grid),
+        quantize_launch(rest),
+        attention_launch(0, split, bulk_grid),
     )
 
 
@@ -2782,8 +3670,9 @@ def minimax_h3_varlen_attention(
     Graph capture prepare once with
     :func:`prepare_minimax_h3_varlen_attention` (or warm this entry up with
     the exact ``cu_seqlens`` on the capture stream) and replay the runner.
+    A tail-grid plan launches on the calling thread's side streams.
     """
-    runner = prepare_minimax_h3_varlen_attention(
+    runner = _prepare_bf16(
         query,
         key,
         value,
@@ -2792,6 +3681,7 @@ def minimax_h3_varlen_attention(
         out=out,
         cu_seqlens_host=cu_seqlens_host,
         backend=backend,
+        shared_side_streams=True,
     )
     return runner.launch()
 
@@ -3028,9 +3918,10 @@ def minimax_h3_varlen_nvfp4_attention(
     ``cu_seqlens_host`` to plan without any device synchronization.  For
     repeated launches of one problem or CUDA Graph capture prepare once
     with :func:`prepare_minimax_h3_varlen_nvfp4_attention` (optionally
-    with a caller-owned ``workspace``) and call the runner.
+    with a caller-owned ``workspace``) and call the runner.  A plan on a
+    two-launch schedule launches on the calling thread's side streams.
     """
-    runner = prepare_minimax_h3_varlen_nvfp4_attention(
+    runner = _prepare_nvfp4(
         query,
         key,
         value,
@@ -3039,6 +3930,8 @@ def minimax_h3_varlen_nvfp4_attention(
         softmax_scale=softmax_scale,
         out=out,
         cu_seqlens_host=cu_seqlens_host,
+        workspace=None,
         backend=backend,
+        shared_side_streams=True,
     )
     return runner.launch()

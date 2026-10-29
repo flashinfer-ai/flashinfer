@@ -2238,8 +2238,11 @@ def test_nvfp4_q_split_plan_output_is_bitwise_the_plain_plans(monkeypatch, pv_mo
         )
         tiles = runner.tile_tables
         halves = tiles.num_q_split_units > 0
+        # A tail-first plan binds the unit-count dense program for both of its
+        # attention launches: attention_qs on a NVFP4_QS_DENSE pair.
+        tail_first = getattr(tiles, "schedule", "single") == "tfs"
         assert tiles.num_combine_units == 0 and runner.attention_stage == (
-            "attention_qs" if qs and halves else "attention"
+            "attention_qs" if qs and (halves or tail_first) else "attention"
         )
         assert tiles.total_tiles == 406 + tiles.num_q_split_units
         assert runner.route_metadata["q_split_units"] == tiles.num_q_split_units

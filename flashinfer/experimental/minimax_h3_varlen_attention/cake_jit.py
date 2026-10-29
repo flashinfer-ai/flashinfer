@@ -55,9 +55,13 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # and the fp4 route on ``NVFP4_QUANTIZE_TP_ARCHES`` a second build of its
 # quantizer, ``quantize_tp`` (its ``pv_mode="fp4_tp"`` build, bitwise-identical
 # outputs; it takes ``block_token`` / ``block_valid`` by value, as
-# ``cake_backend.QUANTIZE_TP_MAX_PB``-entry launch parameters), and the host
-# binds one of the two per plan
-# (``cake_backend.nvfp4_quantize_stage``); the fp8 route precedes the
+# ``cake_backend.QUANTIZE_TP_MAX_PB``-entry launch parameters) -- that
+# route's ``modules`` also name ``quantize_tp_mb8``, the
+# ``pv_mode="fp4_tp_mb8"`` build of ``quantize_tp`` (bitwise-identical
+# outputs; eight resident CTAs per SM), which is no stage: the host binds it
+# in the ``quantize_tp`` slot when the quantize grid lies in
+# ``cake_backend.QUANTIZE_TP_MB8_GRID`` -- and the host binds one of them per
+# plan (``cake_backend.nvfp4_quantize_stage``); the fp8 route precedes the
 # quantizer with ``amax`` (``minimax_h3_varlen_v_amax_partial``,
 # one partial ``max|V|`` per CTA, folded by the quantizer, which is that
 # kernel's programmatic dependent launch); the NVFP4 routes carry two
@@ -84,8 +88,8 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # runner when a plan has no split units).  The generated-program export
 # writes the ``MODULES`` records and the ``ROUTES`` module leaves of the
 # programs it renders; the ``ROUTES`` stage lists, and the leaf of a new
-# stage (naming the program the export then supersedes there), are
-# hand-written.
+# stage (naming the program the export then supersedes there, or, as for
+# ``quantize_tp_mb8``, the program it renders there), are hand-written.
 MODULES: dict[str, dict[str, Any]] = {
     "cake_minimax_h3_varlen_attention_028f5068a74b38fa522e": {
         "arches": ["sm_100a"],
@@ -668,6 +672,7 @@ ROUTES: dict[str, dict[str, Any]] = {
         "modules": {
             "quantize": "cake_minimax_h3_varlen_attention_5d47bc81a6048253de1c",
             "quantize_tp": "cake_minimax_h3_varlen_attention_0f1da56372d7a27d3ae7",
+            "quantize_tp_mb8": "cake_minimax_h3_varlen_attention_cb6b99d150feff074838",
             "attention": "cake_minimax_h3_varlen_attention_1f0285434cb51b016f42",
             "attention_split": "cake_minimax_h3_varlen_attention_90ffa4217c59f26945b8",
             "combine": "cake_minimax_h3_varlen_attention_5e9badc10a1a02a423c0",
