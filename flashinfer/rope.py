@@ -44,6 +44,21 @@ def get_rope_module():
     return gen_rope_module().build_and_load()
 
 
+def _set_rope_launch_override(
+    two_heads: Optional[bool] = None, split: Optional[int] = None
+) -> None:
+    """Test-only: force the token-parallel RoPE launch schedule.
+
+    ``two_heads`` picks the one- or two-heads-per-step kernel (``None``: automatic,
+    which is two heads only on SM107). ``split`` forces ``gridDim.y`` and the
+    token-parallel kernel (``None``: automatic). The setting is process-wide;
+    call with no arguments to restore the automatic schedule.
+    """
+    get_rope_module().rope_set_launch_override(
+        -1 if two_heads is None else int(two_heads), 0 if split is None else split
+    )
+
+
 @register_custom_op("flashinfer::apply_rope", mutates_args=("q_rope", "k_rope"))
 def _apply_rope(
     q: torch.Tensor,
