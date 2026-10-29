@@ -1,0 +1,93 @@
+{
+  "name": "token_sparse_kv_indices_top_k2048_lists2",
+  "description": "Token-sparse attention's K/V slot lists from key positions.",
+  "op_type": "token_sparse_kv_indices",
+  "tags": [
+    "fi_api:flashinfer.token_sparse.token_sparse_kv_indices"
+  ],
+  "axes": {
+    "tokens": {
+      "type": "var",
+      "description": "Query tokens."
+    },
+    "top_k": {
+      "type": "const",
+      "value": 2048,
+      "description": "Key positions per token, a multiple of 512."
+    },
+    "requests": {
+      "type": "var",
+      "description": "Block-table rows."
+    },
+    "blocks": {
+      "type": "var",
+      "description": "64-key blocks per request."
+    },
+    "rows": {
+      "type": "var",
+      "description": "Attention requests, requests_per_token per token."
+    },
+    "lists": {
+      "type": "const",
+      "value": 2,
+      "description": "K slots, then V slots."
+    }
+  },
+  "inputs": {
+    "positions": {
+      "shape": [
+        "tokens",
+        "top_k"
+      ],
+      "dtype": "int32"
+    },
+    "requests": {
+      "shape": [
+        "tokens"
+      ],
+      "dtype": "int32"
+    },
+    "block_table": {
+      "shape": [
+        "requests",
+        "blocks"
+      ],
+      "dtype": "int32"
+    },
+    "block_tables": {
+      "shape": [
+        "rows",
+        "lists",
+        "top_k"
+      ],
+      "dtype": "int32"
+    },
+    "seq_lens": {
+      "shape": [
+        "rows"
+      ],
+      "dtype": "int32"
+    },
+    "requests_per_token": {
+      "shape": null,
+      "dtype": "int32"
+    }
+  },
+  "outputs": {
+    "block_tables": {
+      "shape": [
+        "rows",
+        "lists",
+        "top_k"
+      ],
+      "dtype": "int32"
+    },
+    "seq_lens": {
+      "shape": [
+        "rows"
+      ],
+      "dtype": "int32"
+    }
+  },
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}

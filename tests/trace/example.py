@@ -140,6 +140,7 @@ rmsnorm_quant_h7168.json
 silu_and_mul_h16384.json
 silu_and_mul_mxfp8_experts_quantize_k8192.json
 silu_and_mul_nvfp4_quantize_k16384.json
+token_sparse_kv_indices_top_k2048_lists2.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
 top_k_top_p_sampling_v151936.json
@@ -171,6 +172,7 @@ MSA (msa_*) files require SM120/SM121 (consumer Blackwell) GPUs.
 dsv41_fp4_quantize_*_sparse_mla_cache_*.json and dsv41_fp8_quantize_*_sparse_mla_cache_*.json
 are only generated on SM120/SM121 GPUs.
 trtllm_batch_decode_block_sparse_h16_kv2_d128_ps16.json requires SM100/SM103 GPUs.
+trtllm_batch_decode_token_sparse_h16_kv1_d256_ps1_topk512.json requires SM100/SM103 GPUs.
 trtllm_gen_routing_e256_k8_t8.json requires SM100/SM103/SM120/SM121 GPUs.
 top_k_varlen_n4096_k512.json (windowed prefill mode, gvr_2) requires SM100/SM103/SM107 GPUs.
 """
@@ -2934,6 +2936,20 @@ with contextlib.suppress(Exception):
     )
     trtllm_batch_decode_with_kv_cache(**_tbs_inputs)
 
+# trtllm_batch_decode_with_kv_cache with token-sparse attention (each query
+# token attends to its own K and V slot lists; SM100/103 only).
+with contextlib.suppress(Exception):
+    from flashinfer.decode import trtllm_batch_decode_with_kv_cache
+    from flashinfer.trace.templates.attention import (
+        _trtllm_batch_decode_token_sparse_init,
+    )
+
+    trtllm_batch_decode_with_kv_cache(
+        **_trtllm_batch_decode_token_sparse_init(
+            num_tokens=4, num_heads=16, head_dim=256, sparse_top_k=512, device=device
+        )
+    )
+
 # concat_mla_k (DeepSeek MLA K concat, fixed shape per docstring).
 with contextlib.suppress(Exception):
     from flashinfer.concat_ops import concat_mla_k as _concat_mla_k
@@ -3438,3 +3454,16 @@ try:
 finally:
     if _ulysses_owns_process_group:
         dist.destroy_process_group()
+
+# ── Token-sparse attention inputs: key positions to K/V slot lists ────────────
+from flashinfer.token_sparse import token_sparse_kv_indices
+
+token_sparse_kv_indices.fi_trace(
+    save_dir=SAVE_DIR,
+    positions=torch.empty(4, 2048, dtype=torch.int32),
+    requests=torch.zeros(4, dtype=torch.int32),
+    block_table=torch.empty(2, 64, dtype=torch.int32),
+    block_tables=torch.empty(8, 2, 2048, dtype=torch.int32),
+    seq_lens=torch.empty(8, dtype=torch.int32),
+    requests_per_token=2,
+)

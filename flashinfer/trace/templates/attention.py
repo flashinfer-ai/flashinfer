@@ -4029,8 +4029,153 @@ trtllm_batch_decode_block_sparse_trace = TraceTemplate(
 )
 
 
+@torch.no_grad()
+def _trtllm_batch_decode_token_sparse_reference(
+    query, kv_cache, workspace_buffer, block_tables, seq_lens, max_seq_len, **kwargs
+):
+    """Reference for token-sparse decode: each query token attends only to its
+    own K and V slot lists.
+
+    ``block_tables`` is ``[batch_size, 2, sparse_top_k]``: row ``b`` holds the
+    K slots, then the V slots, of query token ``b``, and ``seq_lens[b]``
+    leading slots of each list are valid. A slot is a one-token page of the
+    one KV head.
+    """
+    if isinstance(kv_cache, (tuple, list)):
+        k_cache, v_cache = kv_cache
+    else:
+        k_cache, v_cache = kv_cache.unbind(1)
+    head_dim = query.shape[-1]
+    keys = k_cache.reshape(k_cache.shape[0], head_dim).to(torch.float32)
+    values = v_cache.reshape(v_cache.shape[0], head_dim).to(torch.float32)
+    bmm1_scale = float(kwargs.get("bmm1_scale") or 1.0 / math.sqrt(head_dim))
+    bmm2_scale = float(kwargs.get("bmm2_scale") or 1.0)
+    top_k = block_tables.shape[-1]
+    valid = torch.arange(top_k, device=query.device) < seq_lens[:, None].to(
+        query.device
+    )
+    k_rows = keys[block_tables[:, 0].to(torch.long).clamp(min=0)]  # [batch, top_k, D]
+    v_rows = values[block_tables[:, 1].to(torch.long).clamp(min=0)]
+    logits = torch.einsum("bhd,bkd->bhk", query.to(torch.float32), k_rows) * bmm1_scale
+    logits = logits.masked_fill(~valid[:, None], float("-inf"))
+    output = torch.matmul(torch.softmax(logits, dim=-1), v_rows) * bmm2_scale
+    return output.to(query.dtype)
+
+
+def _trtllm_batch_decode_token_sparse_init(
+    *,
+    num_tokens: int,
+    num_heads: int = 16,
+    head_dim: int = 256,
+    sparse_top_k: int = 512,
+    num_pages: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build token-sparse inputs for ``trtllm_batch_decode_with_kv_cache``.
+
+    Each query token is a request over one-token pages of one KV head. Its K
+    and V slot lists are distinct random slots; the first token uses all
+    ``sparse_top_k`` of them and the others a random count.
+    """
+    torch.manual_seed(seed)
+    num_pages = max(num_pages, 4 * sparse_top_k)
+    query = torch.randn(
+        num_tokens, num_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    kv_cache = torch.randn(
+        num_pages, 2, 1, 1, head_dim, dtype=torch.bfloat16, device=device
+    )
+    slots = torch.rand(num_tokens, num_pages, device=device).argsort(dim=-1)
+    slots = slots[:, :sparse_top_k].to(torch.int32)
+    seq_lens = torch.randint(
+        1, sparse_top_k + 1, (num_tokens,), dtype=torch.int32, device=device
+    )
+    seq_lens[0] = sparse_top_k
+    return {
+        "query": query,
+        "kv_cache": kv_cache,
+        "workspace_buffer": torch.zeros(
+            128 * 1024 * 1024, dtype=torch.uint8, device=device
+        ),
+        "block_tables": torch.stack((slots, slots), dim=1).contiguous(),
+        "seq_lens": seq_lens,
+        "max_seq_len": int(sparse_top_k),
+        "bmm1_scale": 1.0 / math.sqrt(head_dim),
+        "bmm2_scale": 1.0,
+        "kv_layout": "HND",
+        "sparse_top_k": int(sparse_top_k),
+        "uses_shared_paged_kv_idx": False,
+    }
+
+
+trtllm_batch_decode_token_sparse_trace = TraceTemplate(
+    op_type="trtllm_paged",
+    name_prefix="trtllm_batch_decode_token_sparse",
+    description=(
+        "SM100/SM103 TRT-LLM token-sparse MQA decode: each query token is a "
+        "request over one-token pages of one KV head, and attends only to its "
+        "own K and V slot lists, such as the Top-K keys of an indexer. "
+        "block_tables holds each token's K slots, then its V slots, and "
+        "seq_lens the number of valid leading slots of each list."
+    ),
+    # Not the dense template's max_pages_per_seq, which it adds to _TRTLLM_AXES.
+    axes={
+        **{k: v for k, v in _TRTLLM_AXES.items() if k != "max_pages_per_seq"},
+        "lists": Const(
+            abbrev="", description="The K slots, then the V slots.", value=2
+        ),
+        "top_k": Const(abbrev="topk", description="Slots per list."),
+    },
+    inputs={
+        "query": Tensor(["num_tokens", "num_heads", "head_dim"]),
+        "kv_cache": Tensor(
+            ["num_pages", "kv_cache_dim", "num_kv_heads", "page_size", "head_dim"],
+            description="Paged KV cache of one-token pages and one KV head.",
+        ),
+        "block_tables": Tensor(
+            ["batch_size", "lists", "top_k"],
+            dtype="int32",
+            description="Each query token's K slots, then its V slots.",
+        ),
+        "seq_lens": Tensor(
+            ["batch_size"],
+            dtype="int32",
+            description="Valid leading slots of each token's lists.",
+        ),
+        "max_seq_len": Scalar("int32", description="Slots per list (top_k)."),
+        "bmm1_scale": Scalar(
+            "float32", optional=True, description="Scale applied after Q @ K^T."
+        ),
+        "bmm2_scale": Scalar(
+            "float32", optional=True, description="Scale applied after softmax @ V."
+        ),
+        "sparse_top_k": Scalar(
+            "int32", description="Slots per list; a nonzero value selects token-sparse."
+        ),
+        "uses_shared_paged_kv_idx": Scalar(
+            "bool", description="Must be False: K and V have separate slot lists."
+        ),
+    },
+    outputs={
+        "output": Tensor(["num_tokens", "num_heads", "head_dim"], dtype_from="query"),
+    },
+    constraints=[
+        "num_tokens == batch_size",
+        "num_kv_heads == 1",
+        "page_size == 1",
+        "top_k % 4 == 0",
+        "num_heads <= 128",
+        "head_dim != 512",
+    ],
+    tags=["status:verified", "stage:decode", "backend:trtllm"],
+    reference=_trtllm_batch_decode_token_sparse_reference,
+    init=_trtllm_batch_decode_token_sparse_init,
+)
+
+
 def trtllm_batch_decode_trace_dispatch(save_dir=None, name=None, **kwargs):
-    """Select the dense, block-sparse, or DCP decode template at call time.
+    """Select the dense, block-sparse, token-sparse or DCP decode template at call time.
 
     Pass as ``trace=trtllm_batch_decode_trace_dispatch`` to ``@flashinfer_api``
     so calls are dumped with the schema matching their cache and causal
@@ -4040,6 +4185,8 @@ def trtllm_batch_decode_trace_dispatch(save_dir=None, name=None, **kwargs):
         if isinstance(kwargs.get("kv_cache"), (tuple, list)):
             return trtllm_batch_decode_dcp_spec_split_kv_trace
         return trtllm_batch_decode_dcp_spec_trace
+    if kwargs.get("sparse_top_k"):
+        return trtllm_batch_decode_token_sparse_trace
     if kwargs.get("enable_block_sparse_attention"):
         return trtllm_batch_decode_block_sparse_trace
     return trtllm_batch_decode_trace
@@ -4050,6 +4197,7 @@ def trtllm_batch_decode_trace_dispatch(save_dir=None, name=None, **kwargs):
 trtllm_batch_decode_trace_dispatch.templates = [  # type: ignore[attr-defined]
     trtllm_batch_decode_trace,
     trtllm_batch_decode_block_sparse_trace,
+    trtllm_batch_decode_token_sparse_trace,
     trtllm_batch_decode_dcp_spec_trace,
     trtllm_batch_decode_dcp_spec_split_kv_trace,
 ]
