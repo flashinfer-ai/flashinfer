@@ -255,6 +255,15 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             use_output_state_indices or use_checkpoint_state_indices or use_prefix_lens
         )
 
+    @property
+    def chunked_slot_checkpoints(self) -> bool:
+        """The slot checkpoint paths run the blocks between two checkpoint
+        positions as one loop (see ``run_math_role``)."""
+        return bool(
+            self.needs_checkpointing
+            and (self.use_prefix_lens or self.use_checkpoint_state_indices)
+        )
+
     def get_next_work(
         self,
         cu_seqlens: cute.Tensor,
@@ -769,6 +778,108 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
         for i in cutlass.range(cute.size(tKVrKV), unroll_full=True):
             v_idx, k_idx = tKVcKV[i]
             gKV[k_idx, v_idx] = tKVrKV[i].to(gKV.element_type)
+
+    @cute.jit
+    def kv_store_pairs(
+        self,
+        tKVrKV: cute.Tensor,
+        gKV: cute.Tensor,
+        kv_thr_mma,
+    ):
+        """``kv_store`` into a tile with the static layout (D, D):(1, D)
+        whose base is aligned to two elements. Fragment elements 2j and
+        2j + 1 of every thread are (v, k) and (v, k + 1) with k even (see
+        ``check_kv_pairs``): each pair is one vector store of the same two
+        values, half the store instructions of ``kv_store``."""
+        c_kv = cute.make_identity_tensor((self.D, self.D))
+        tKVcKV = kv_thr_mma.partition_C(c_kv)
+        dtype = gKV.element_type
+        store_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), dtype, num_bits_per_copy=2 * dtype.width
+        )
+        pair = cute.make_rmem_tensor(2, dtype)
+        for j in cutlass.range_constexpr(cute.size(tKVrKV) // 2):
+            v_idx, k_idx = tKVcKV[2 * j]
+            pair[0] = tKVrKV[2 * j].to(dtype)
+            pair[1] = tKVrKV[2 * j + 1].to(dtype)
+            dst = cute.make_tensor(
+                cute.domain_offset((k_idx, v_idx), gKV).iterator.align(
+                    2 * dtype.width // 8
+                ),
+                cute.make_layout(2),
+            )
+            cute.copy(store_atom, pair, dst)
+
+    def check_kv_pairs(self, kv_tiled_mma):
+        """Trace-time check of the fragment order ``kv_store_pairs`` relies
+        on, for every thread of the state MMA."""
+        c_kv = cute.make_identity_tensor((self.D, self.D))
+        for t in range(cute.size(kv_tiled_mma.thr_layout_vmnk)):
+            coords = kv_tiled_mma.get_slice(t).partition_C(c_kv)
+            for j in range(cute.size(coords) // 2):
+                v0, k0 = coords[2 * j]
+                v1, k1 = coords[2 * j + 1]
+                assert v1 == v0 and k1 == k0 + 1 and k0 % 2 == 0, (t, j)
+
+    @property
+    def paired_row_checkpoints(self) -> bool:
+        """Pool-row checkpoints of the slot paths are written as pairs (rows
+        aligned to two elements or more, see ``checkpoint_row_align``)."""
+        return bool(
+            self.needs_checkpointing
+            and self.use_checkpoint_state_indices
+            and self.checkpoint_row_align is not None
+            and self.checkpoint_row_align > 1
+        )
+
+    @cute.jit
+    def store_slot_checkpoint_run(
+        self,
+        tKVrKV: cute.Tensor,
+        g_state_checkpoints: cute.Tensor,
+        checkpoint_cu_starts: cute.Tensor,
+        checkpoint_every_n_tokens: cutlass.Int32,
+        kv_thr_mma,
+        seq_idx: cutlass.Int32,
+        o_head_idx: cutlass.Int32,
+        num_sab_heads: cutlass.Int32,
+        total_checkpoints: cutlass.Int32,
+        block_end: cutlass.Int32,
+        seq_len: cutlass.Int32,
+        ckpt_key,
+        row_pref,
+    ):
+        """``maybe_store_checkpoint`` of the slot paths, with pool-row
+        checkpoints written as pairs when ``paired_row_checkpoints``."""
+        if cutlass.const_expr(self.paired_row_checkpoints):
+            if row_pref >= cutlass.Int32(0):
+                row_stride = cute.assume(
+                    g_state_checkpoints.stride[0], divby=self.checkpoint_row_align
+                )
+                pool_layout = cute.make_layout(
+                    (self.D, self.D, num_sab_heads, g_state_checkpoints.shape[0]),
+                    stride=(1, self.D, self.D * self.D, row_stride),
+                )
+                mPool = cute.make_tensor(g_state_checkpoints.iterator, pool_layout)
+                self.kv_store_pairs(
+                    tKVrKV, mPool[None, None, o_head_idx, row_pref], kv_thr_mma
+                )
+        else:
+            self.maybe_store_checkpoint(
+                tKVrKV,
+                g_state_checkpoints,
+                checkpoint_cu_starts,
+                checkpoint_every_n_tokens,
+                kv_thr_mma,
+                seq_idx,
+                o_head_idx,
+                num_sab_heads,
+                total_checkpoints,
+                block_end,
+                seq_len,
+                ckpt_key=ckpt_key,
+                row_pref=row_pref,
+            )
 
     @cute.jit
     def maybe_store_checkpoint(
@@ -1581,6 +1692,8 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             permutation_mnk=(self.D, self.D, self.BLK_KV),
         )
         kv_thr_mma = kv_tiled_mma.get_slice(math_tidx)
+        if cutlass.const_expr(self.paired_row_checkpoints):
+            self.check_kv_pairs(kv_tiled_mma)
         tKVrKV = cute.make_rmem_tensor(
             kv_thr_mma.partition_shape_C((self.D, self.D)), self.acc_dtype
         )
@@ -1736,69 +1849,161 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
             row_pref=first_row,
         )
 
-        for blk in cutlass.range(
-            cutlass.Int32(1), num_blocks - cutlass.Int32(1), cutlass.Int32(1), unroll=1
-        ):
-            loop_row = self.prefetch_checkpoint_row(
-                checkpoint_every_n_tokens,
-                (blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
-                work_desc.seq_len,
-                ckpt_key,
-                g_checkpoint_rows,
-            )
-            (
-                q_consumer_state,
-                k_consumer_state,
-                v_consumer_state,
-                o_producer_state,
-                alpha_consumer_state,
-                beta_consumer_state,
-            ) = self.compute_loop_body(
-                sQ_SD,
-                sK_SD,
-                sK_DS,
-                sV_DS,
-                sQK,
-                sKK_inv,
-                sKK_opd,
-                sO,
-                sAlpha,
-                sBeta,
-                kv_tiled_mma,
-                q_pipeline,
-                q_consumer_state,
-                k_pipeline,
-                k_consumer_state,
-                v_pipeline,
-                v_consumer_state,
-                o_pipeline,
-                o_producer_state,
-                alpha_pipeline,
-                alpha_consumer_state,
-                beta_pipeline,
-                beta_consumer_state,
-                False,
-                False,
-                cutlass.Int32(self.BLK_KV),
-                tKVrKV,
-                scale,
-                wg_idx,
-            )
-            self.maybe_store_checkpoint(
-                tKVrKV,
-                g_state_checkpoints,
-                checkpoint_cu_starts,
-                checkpoint_every_n_tokens,
-                kv_thr_mma,
-                work_desc.seq_idx,
-                o_head_idx,
-                num_sab_heads,
-                total_checkpoints,
-                (blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
-                work_desc.seq_len,
-                ckpt_key=ckpt_key,
-                row_pref=loop_row,
-            )
+        if cutlass.const_expr(self.chunked_slot_checkpoints):
+            # The blocks up to the next checkpoint position run as one inner
+            # loop without checkpoint code, and the checkpoint due at the end
+            # of the run (if any) is stored after it. The per-block form below
+            # carries the predicated pool-row stores and the due test through
+            # every block, which slows the math warps of long sequences.
+            # Same blocks, same due test, same stores: a run ends at the first
+            # block end at or after the next position p with
+            # (ckpt_key + p) % N == 0, and no earlier block end of the run is
+            # such a position.
+            mid_end = num_blocks - cutlass.Int32(1)
+            first_end = cutlass.Int32(self.BLK_KV)
+            gap = (ckpt_key + first_end) % checkpoint_every_n_tokens
+            if gap < cutlass.Int32(0):
+                gap = gap + checkpoint_every_n_tokens
+            next_pos = first_end + checkpoint_every_n_tokens - gap
+            blk = cutlass.Int32(1)
+            while blk < mid_end:
+                stop = (next_pos + cutlass.Int32(self.BLK_KV - 1)) // cutlass.Int32(
+                    self.BLK_KV
+                )
+                if stop > mid_end:
+                    stop = mid_end
+                stop_end = stop * cutlass.Int32(self.BLK_KV)
+                run_row = self.prefetch_checkpoint_row(
+                    checkpoint_every_n_tokens,
+                    stop_end,
+                    work_desc.seq_len,
+                    ckpt_key,
+                    g_checkpoint_rows,
+                )
+                for _ in cutlass.range(blk, stop, cutlass.Int32(1), unroll=1):
+                    (
+                        q_consumer_state,
+                        k_consumer_state,
+                        v_consumer_state,
+                        o_producer_state,
+                        alpha_consumer_state,
+                        beta_consumer_state,
+                    ) = self.compute_loop_body(
+                        sQ_SD,
+                        sK_SD,
+                        sK_DS,
+                        sV_DS,
+                        sQK,
+                        sKK_inv,
+                        sKK_opd,
+                        sO,
+                        sAlpha,
+                        sBeta,
+                        kv_tiled_mma,
+                        q_pipeline,
+                        q_consumer_state,
+                        k_pipeline,
+                        k_consumer_state,
+                        v_pipeline,
+                        v_consumer_state,
+                        o_pipeline,
+                        o_producer_state,
+                        alpha_pipeline,
+                        alpha_consumer_state,
+                        beta_pipeline,
+                        beta_consumer_state,
+                        False,
+                        False,
+                        cutlass.Int32(self.BLK_KV),
+                        tKVrKV,
+                        scale,
+                        wg_idx,
+                    )
+                self.store_slot_checkpoint_run(
+                    tKVrKV,
+                    g_state_checkpoints,
+                    checkpoint_cu_starts,
+                    checkpoint_every_n_tokens,
+                    kv_thr_mma,
+                    work_desc.seq_idx,
+                    o_head_idx,
+                    num_sab_heads,
+                    total_checkpoints,
+                    stop_end,
+                    work_desc.seq_len,
+                    ckpt_key,
+                    run_row,
+                )
+                while next_pos <= stop_end:
+                    next_pos = next_pos + checkpoint_every_n_tokens
+                blk = stop
+        else:
+            for blk in cutlass.range(
+                cutlass.Int32(1),
+                num_blocks - cutlass.Int32(1),
+                cutlass.Int32(1),
+                unroll=1,
+            ):
+                loop_row = self.prefetch_checkpoint_row(
+                    checkpoint_every_n_tokens,
+                    (blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
+                    work_desc.seq_len,
+                    ckpt_key,
+                    g_checkpoint_rows,
+                )
+                (
+                    q_consumer_state,
+                    k_consumer_state,
+                    v_consumer_state,
+                    o_producer_state,
+                    alpha_consumer_state,
+                    beta_consumer_state,
+                ) = self.compute_loop_body(
+                    sQ_SD,
+                    sK_SD,
+                    sK_DS,
+                    sV_DS,
+                    sQK,
+                    sKK_inv,
+                    sKK_opd,
+                    sO,
+                    sAlpha,
+                    sBeta,
+                    kv_tiled_mma,
+                    q_pipeline,
+                    q_consumer_state,
+                    k_pipeline,
+                    k_consumer_state,
+                    v_pipeline,
+                    v_consumer_state,
+                    o_pipeline,
+                    o_producer_state,
+                    alpha_pipeline,
+                    alpha_consumer_state,
+                    beta_pipeline,
+                    beta_consumer_state,
+                    False,
+                    False,
+                    cutlass.Int32(self.BLK_KV),
+                    tKVrKV,
+                    scale,
+                    wg_idx,
+                )
+                self.maybe_store_checkpoint(
+                    tKVrKV,
+                    g_state_checkpoints,
+                    checkpoint_cu_starts,
+                    checkpoint_every_n_tokens,
+                    kv_thr_mma,
+                    work_desc.seq_idx,
+                    o_head_idx,
+                    num_sab_heads,
+                    total_checkpoints,
+                    (blk + cutlass.Int32(1)) * cutlass.Int32(self.BLK_KV),
+                    work_desc.seq_len,
+                    ckpt_key=ckpt_key,
+                    row_pref=loop_row,
+                )
 
         if num_blocks != cutlass.Int32(1):
             last_blk = num_blocks - cutlass.Int32(1)

@@ -248,7 +248,7 @@ class TestSplitLayerRouting:
             _split_layer(_LoopbackConfig(), layout=EpLayout.EXPERT_MAJOR)
 
     @pytest.mark.cpu_only
-    def test_communication_path_translates_routing_to_local_ids(
+    def test_communication_path_passes_global_routing(
         self, loopback_backend, isolated_single_rank_gloo
     ) -> None:
         layer = _split_layer(_LoopbackConfig())
@@ -274,14 +274,28 @@ class TestSplitLayerRouting:
         ctx = seen["ctx"]
         assert ctx.expert_tensors.shape == (1, 3, 8)
         assert ctx.num_tokens == 3
-        # Padding row carries the invalid id, which is never local.
+        # The received global ids reach the kernel unchanged; the padding row
+        # carries the invalid id.
+        assert ctx.recv_topk_idx_global
         assert ctx.recv_topk_idx.tolist() == [[0, 3], [2, 1], [-1, -1]]
 
         state = layer.create_graph_state(t)
         out = layer(t, graph_state=state)
         assert out is state.out
         torch.testing.assert_close(out, x)
+
+        # The kernel drops its references to the receive buffers before the
+        # transport that owns them is destroyed.
+        order = []
+        kernel_destroy = layer._kernel.destroy
+        comm_destroy = layer._communication.destroy
+        layer._kernel.destroy = lambda: (order.append("kernel"), kernel_destroy())
+        layer._communication.destroy = lambda: (
+            order.append("communication"),
+            comm_destroy(),
+        )
         layer.destroy()
+        assert order == ["kernel", "communication"]
         assert state.destroyed
         assert loopback_backend["destroyed"]
 

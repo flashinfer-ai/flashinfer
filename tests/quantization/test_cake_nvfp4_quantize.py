@@ -181,6 +181,95 @@ def test_row_strided_activation_at_a_new_width_runs_a_registered_program():
     assert replaced > 0
 
 
+# The bindings that check that x is contiguous (the cluster-split, pad-chunked and _ru
+# programs); every other quantizer binding reads x through its row stride.
+_X_CONTIGUOUS_CHECK = re.compile(r'check_contiguous\((?:a|arg)_x,\s*"x"\)')
+
+
+@pytest.mark.parametrize(
+    "arch,sm_count",
+    [("sm_100a", 148), ("sm_100a", 152), ("sm_103a", 148), ("sm_103a", 152)],
+)
+def test_row_strided_activations_run_one_cta_per_row(arch, sm_count):
+    """A row-strided view (``M >= 2``, row stride != K) runs one CTA per padded row, on a
+    program whose binding takes ``x`` through its row stride: the cluster-split,
+    pad-chunked and ``_ru`` programs check that ``x`` is contiguous, so they take
+    contiguous rows only.  The quantizer alone and the chain plan such a row alike, and a
+    row whose contiguous plan already runs one CTA per row with the entry read keeps it."""
+    csrc = Path(cb.__file__).resolve().parent / "csrc"
+    checks_x: dict[str, bool] = {}
+    for module in set(KERNELS[arch].values()):
+        text = (csrc / MODULES[module]["sources"][1]).read_text()
+        checks_x[module] = bool(_X_CONTIGUOUS_CHECK.search(text))
+    assert any(checks_x.values())
+    ms = (*range(2, cb.SINGLE_WAVE_MAX_ROWS + 3), 257, 511, 512, 513, 2048, 8192)
+    moved = 0
+    for k in REACHABLE_K:
+        for m in ms:
+            for fold in (False, True):
+                strided = _registered(
+                    cb.quant_plan(m, k, True, fold, arch, sm_count, k + 64), arch
+                )
+                assert strided.cluster_split == 1 and not strided.pad_chunked
+                assert strided.out_scale_read == "entry" and strided.k_static is None
+                assert strided.grid == strided.padded_rows, (k, m, fold)
+                assert not checks_x[KERNELS[arch][strided.kernel_key]], (
+                    k,
+                    m,
+                    fold,
+                    strided.kernel_key,
+                )
+                assert strided == cb.quant_plan(
+                    m, k, True, fold, arch, sm_count, k + 64, alone=True
+                ), (k, m, fold)
+                for alone in (False, True):
+                    contiguous = cb.quant_plan(
+                        m, k, True, fold, arch, sm_count, alone=alone
+                    )
+                    if (
+                        contiguous.cluster_split > 1
+                        or contiguous.pad_chunked
+                        or contiguous.out_scale_read != "entry"
+                    ):
+                        moved += 1
+                    elif (
+                        contiguous.k_static is None
+                        and contiguous.unregistered_key is None
+                    ):
+                        assert contiguous == strided, (k, m, fold, alone)
+    assert moved > 0
+    # the one-CTA programs the cluster-split and pad-chunked rows run when row-strided
+    for k, m, key in (
+        (16384, 8, "quant:t512_b2_mb1_bf16"),
+        (18432, 8, "quant:t512_b3_mb1_bf16"),
+        (28672, 32, "quant:t512_b4_mb1_bf16"),
+        (8192, 17, "quant:t256_b2_mb3_bf16"),
+        (16384, 130, "quant:t512_b2_mb2_bf16"),
+        (18432, 130, "quant:t512_b3_mb2_bf16"),
+        (28672, 130, "quant:t512_b4_mb2_bf16"),
+    ):
+        for fold in (False, True):
+            plan = cb.quant_plan(m, k, True, fold, arch, sm_count, k + 64)
+            assert plan.kernel_key == key + ("_fold" if fold else ""), (k, m)
+
+
+def test_rows_aligned_rule():
+    """The programs load ``x`` 32 bytes at a time: every row must start on a 32-byte
+    boundary (aligned base, row stride a multiple of 16 bf16 elements)."""
+    k = 7168
+    wide = torch.empty(8, k + 16, dtype=torch.bfloat16)
+    narrow = torch.empty(8, k + 8, dtype=torch.bfloat16)
+    flat = torch.empty(8 * k + 8, dtype=torch.bfloat16)
+    assert all(t.data_ptr() % 32 == 0 for t in (wide, narrow, flat))
+    assert cb.rows_aligned(wide[:, :k])
+    assert cb.rows_aligned(flat[: 8 * k].view(8, k))
+    assert cb.rows_aligned(wide[:1, 16 : 16 + k])
+    assert not cb.rows_aligned(narrow[:, :k])  # row stride K + 8
+    assert not cb.rows_aligned(wide[:, 8 : 8 + k])  # rows start 16 bytes off
+    assert not cb.rows_aligned(flat[8:].view(8, k))  # contiguous, 16 bytes off
+    assert not cb.rows_aligned(wide[:1, 8 : 8 + k])
+
+
 def test_quant_plan_grid_and_keys():
     plan = _registered(cb.quant_plan(257, 7168, True, False, "sm_100a", 148), "sm_100a")
     assert plan.grid == 384 and plan.padded_rows == 384 and plan.padded_cols == 448
@@ -1242,6 +1331,138 @@ def test_quantize_reads_row_strided_activations_at_a_new_width(k, m):
     plan = cb.quant_plan(m, k, True, False, arch, sm_count, x_row_stride=k + 64)
     assert plan.k_static is None and plan.kernel_key in KERNELS[arch]
     test_quantize_reads_row_strided_activations_in_place(k, m)
+
+
+# The token counts whose contiguous bf16 rows split over a cluster (CLUSTER_SPLIT_MAX_M,
+# CLUSTER_SPLIT_MAX_M_FOLD_SM103_K8192, QUANT_ALONE_CLUSTER_SPLIT) or take the pad-chunked
+# program (QUANT_ALONE_PAD_CHUNKED) on some architecture, with and without the folded
+# out_scale.
+_STRIDED_SPLIT_CASES = sorted(
+    {
+        (k, m, fold)
+        for k, limit in cb.CLUSTER_SPLIT_MAX_M.items()
+        for m in (2, limit, cb.CLUSTER_SPLIT_MAX_M_FOLD_SM103_K8192)
+        if 1 < m <= limit
+        for fold in (False, True)
+    }
+    | {
+        (k, m, fold)
+        for table in cb.QUANT_ALONE_CLUSTER_SPLIT.values()
+        for k, ranges in table.items()
+        for lo, hi, _ in ranges
+        for m in (lo, hi)
+        if m > 1
+        for fold in (False, True)
+    }
+    | {
+        (k, m, fold)
+        for table in cb.QUANT_ALONE_PAD_CHUNKED.values()
+        for k, ranges in table.items()
+        for lo, hi in ranges
+        for m in (lo, hi)
+        for fold in (False, True)
+    }
+)
+
+
+@pytest.mark.parametrize("k,m,fold", _STRIDED_SPLIT_CASES)
+def test_quantize_reads_row_strided_split_rows_in_place(k, m, fold):
+    """A row-strided view of a row the cluster split or the pad-chunked program serves
+    when contiguous runs one CTA per padded row and writes the same codes, block scales
+    (padding included) and per-token scales as the contiguous copy, bit for bit, through
+    the prepared entry and both public entries."""
+    device = _require_program()
+    g = torch.Generator(device=device).manual_seed(7000 + m + k)
+    full = torch.randn(m, k + 64, device=device, dtype=torch.bfloat16, generator=g)
+    x = full[:, :k]
+    assert not x.is_contiguous()
+    gs_inv = torch.tensor([GLOBAL_SCALE_INV], dtype=torch.float32, device=device)
+    out_scale = (
+        torch.tensor([0.37], dtype=torch.float32, device=device) if fold else None
+    )
+    got = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    want = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    for t in (*got, *want):
+        t.view(torch.uint8).fill_(0xFF)
+    runner = cb.prepare_nvfp4_per_token_quantize(x, gs_inv, got, out_scale=out_scale)
+    runner()
+    cb.prepare_nvfp4_per_token_quantize(
+        x.contiguous(), gs_inv, want, out_scale=out_scale
+    )()
+    torch.cuda.synchronize()
+    for a, b in zip(got, want, strict=True):
+        assert torch.equal(
+            a.reshape(-1).view(torch.uint8), b.reshape(-1).view(torch.uint8)
+        )
+    kwargs = {} if out_scale is None else {"out_scale": out_scale}
+    for public in (
+        cb.nvfp4_quantize_per_token(x, gs_inv, **kwargs),
+        nvfp4_quantize(x, gs_inv, per_token_activation=True, backend="cake", **kwargs),
+    ):
+        torch.cuda.synchronize()
+        for a, b in zip(public, want, strict=True):
+            assert torch.equal(
+                a.reshape(-1).view(torch.uint8), b.reshape(-1).view(torch.uint8)
+            )
+    _check_against_reference(x, gs_inv, out_scale, *got)
+    assert runner.plan.cluster_split == 1 and not runner.plan.pad_chunked
+
+
+def _misaligned_view(kind, m, k, device):
+    """A bf16 ``x[M, K]`` whose rows do not all start on 32-byte boundaries."""
+    g = torch.Generator(device=device).manual_seed(8100 + m + k)
+    if kind == "row_stride":  # row stride K + 8: every other row starts 16 bytes off
+        full = torch.randn(m, k + 8, device=device, dtype=torch.bfloat16, generator=g)
+        return full[:, :k]
+    if kind == "base":  # row stride K + 16, every row starts 16 bytes off
+        full = torch.randn(m, k + 16, device=device, dtype=torch.bfloat16, generator=g)
+        return full[:, 8 : 8 + k]
+    flat = torch.randn(m * k + 8, device=device, dtype=torch.bfloat16, generator=g)
+    return flat[8:].view(m, k)  # contiguous, 16 bytes off
+
+
+# K = 16384 x 8 tokens splits each contiguous row over a cluster; K = 7168 x 8 tokens
+# runs one CTA per row on every architecture.
+_MISALIGNED_CASES = [
+    (k, m, kind)
+    for k, m in ((16384, 8), (7168, 8))
+    for kind in ("row_stride", "base", "contiguous_base")
+]
+
+
+@pytest.mark.parametrize("k,m,kind", _MISALIGNED_CASES)
+def test_quantize_copies_rows_off_32_byte_boundaries(k, m, kind):
+    """The one-shot entries quantize a view whose rows do not all start on 32-byte
+    boundaries from an aligned copy: the same outputs as the copy, bit for bit."""
+    device = _require_program()
+    x = _misaligned_view(kind, m, k, device)
+    assert x.data_ptr() % 32 or x.stride(0) % 16
+    gs_inv = torch.tensor([GLOBAL_SCALE_INV], dtype=torch.float32, device=device)
+    xc = x.clone()
+    assert xc.is_contiguous() and xc.data_ptr() % 32 == 0
+    want = cb.nvfp4_quantize_per_token(xc, gs_inv)
+    for got in (
+        cb.nvfp4_quantize_per_token(x, gs_inv),
+        nvfp4_quantize(x, gs_inv, per_token_activation=True, backend="cake"),
+    ):
+        torch.cuda.synchronize()
+        for a, b in zip(got, want, strict=True):
+            assert torch.equal(
+                a.reshape(-1).view(torch.uint8), b.reshape(-1).view(torch.uint8)
+            )
+    _check_against_reference(x, gs_inv, None, *got)
+
+
+@pytest.mark.parametrize("k,m,kind", _MISALIGNED_CASES)
+def test_prepare_rejects_rows_off_32_byte_boundaries(k, m, kind):
+    """A prepared runner reads ``x`` in place at every launch, so it refuses a view
+    whose rows do not all start on 32-byte boundaries."""
+    device = _require_program()
+    x = _misaligned_view(kind, m, k, device)
+    gs_inv = torch.tensor([GLOBAL_SCALE_INV], dtype=torch.float32, device=device)
+    outputs = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    with pytest.raises(ValueError, match="32-byte boundaries"):
+        cb.prepare_nvfp4_per_token_quantize(x, gs_inv, outputs)
 
 
 def test_quantize_repeated_call_allocates_only_its_outputs():

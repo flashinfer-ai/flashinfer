@@ -1450,6 +1450,80 @@ def test_prepared_chain_runner_graph_replay_and_no_allocation():
         _assert_matches(out, ref)
 
 
+# Rows whose contiguous chain quantizer splits over a cluster on some architecture.
+@pytest.mark.parametrize(
+    "m,n,k",
+    [(8, 7168, 16384), (32, 7168, 18432), (2, 8192, 28672), (17, 8192, 8192)],
+)
+@pytest.mark.parametrize("fold", [False, True])
+def test_chain_reads_row_strided_activations_in_place(m, n, k, fold):
+    """The chain quantizes a row-strided view with one CTA per padded row and writes the
+    same quantized activation (padding included) and GEMM output as for the contiguous
+    copy, bit for bit."""
+    device = _require_program()
+    x, _, _, _, _, w_fp4, w_sf, gs_inv, w_scale = _operands(
+        m, n, k, torch.bfloat16, device, seed=900 + m
+    )
+    full = torch.zeros((m, k + 64), dtype=torch.bfloat16, device=device)
+    full[:, :k] = x
+    strided = full[:, :k]
+    assert not strided.is_contiguous()
+    out_scale = w_scale if fold else None
+    outs, plans = [], []
+    for activation in (strided, x):
+        ws = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+        for t in ws:
+            t.view(torch.uint8).fill_(0xFF)
+        out = torch.full((m, n), float("nan"), dtype=torch.bfloat16, device=device)
+        runner = cb.prepare_nvfp4_per_token_chain(
+            activation,
+            gs_inv,
+            w_fp4.view(torch.uint8),
+            w_sf,
+            out,
+            ws,
+            out_scale=out_scale,
+        )
+        runner()
+        outs.append((*ws, out))
+        plans.append(runner.quantize.plan)
+    torch.cuda.synchronize()
+    for a, b in zip(*outs, strict=True):
+        assert torch.equal(
+            a.reshape(-1).view(torch.uint8), b.reshape(-1).view(torch.uint8)
+        )
+    fp4, sf, scale, out = outs[0]
+    assert torch.isfinite(out).all()
+    ref = _dequantize(fp4, sf) @ _dequantize(w_fp4, w_sf).T
+    _assert_matches(out, ref * scale[:, None])
+    assert plans[0].cluster_split == 1
+
+
+@pytest.mark.parametrize("m,n,k", [(8, 7168, 16384), (8, 2112, 7168)])
+@pytest.mark.parametrize("kind", ["row_stride", "base", "contiguous_base"])
+def test_chain_rejects_rows_off_32_byte_boundaries(m, n, k, kind):
+    """The chain reads ``x`` in place at every launch, so it refuses a view whose
+    rows do not all start on 32-byte boundaries."""
+    device = _require_program()
+    x, _, _, _, _, w_fp4, w_sf, gs_inv, w_scale = _operands(
+        m, n, k, torch.bfloat16, device, seed=950 + m
+    )
+    if kind == "row_stride":  # row stride K + 8: every other row starts 16 bytes off
+        view = torch.zeros((m, k + 8), dtype=torch.bfloat16, device=device)[:, :k]
+    elif kind == "base":  # row stride K + 16, every row starts 16 bytes off
+        view = torch.zeros((m, k + 16), dtype=torch.bfloat16, device=device)[:, 8:-8]
+    else:  # contiguous, 16 bytes off
+        view = torch.zeros(m * k + 8, dtype=torch.bfloat16, device=device)[8:]
+        view = view.view(m, k)
+    view.copy_(x)
+    ws = cb.allocate_nvfp4_per_token_quantize_outputs(m, k, device)
+    out = torch.empty((m, n), dtype=torch.bfloat16, device=device)
+    with pytest.raises(ValueError, match="32-byte boundaries"):
+        cb.prepare_nvfp4_per_token_chain(
+            view, gs_inv, w_fp4.view(torch.uint8), w_sf, out, ws, out_scale=w_scale
+        )
+
+
 @pytest.mark.parametrize(
     "m,n,k,out_dtype",
     [
