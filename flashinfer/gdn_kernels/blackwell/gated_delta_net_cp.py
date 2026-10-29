@@ -1532,6 +1532,7 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         initial_state_inner_strides: tuple[int, ...] | None = None,
         output_state_inner_strides: tuple[int, ...] | None = None,
         store_initial_state: bool = False,
+        aligned_output_state: bool = True,
     ):
         self.needs_initial_state = needs_initial_state
         self.store_final_state = store_final_state
@@ -1543,6 +1544,9 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         self.initial_state_inner_strides = initial_state_inner_strides
         self.output_state_inner_strides = output_state_inner_strides
         self.store_initial_state = store_initial_state
+        # Whether the output pool is K-contiguous with 16-byte-aligned strides and
+        # base, so every per-thread fragment of a final state starts 16-byte aligned.
+        self.aligned_output_state = aligned_output_state
         self.acc_dtype = cutlass.Float32
         self.mma_dtype = cutlass.TFloat32
         self.D = 128
@@ -1576,6 +1580,7 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
             "initial_state_inner_strides",
             "output_state_inner_strides",
             "store_initial_state",
+            "aligned_output_state",
             "m_stage",
             "n_stage",
             "num_regs_compute",
@@ -1749,9 +1754,13 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         tTR_rAcc = cute.make_rmem_tensor_like(tTR_cAcc, self.acc_dtype)
         if cutlass.const_expr(store_output):
             tTR_gOutputState = thr_t2r.partition_D(gOutputState)
-            tTR_gOutputState = cute.make_tensor(
-                tTR_gOutputState.iterator.align(16), tTR_gOutputState.layout
-            )
+            # Other pool layouts (inner stride > 1, a [N, H, K, V] buffer passed as
+            # its transpose) keep the iterator's own alignment, so autovec_copy
+            # falls back to the narrower stores the layout allows.
+            if cutlass.const_expr(self.aligned_output_state):
+                tTR_gOutputState = cute.make_tensor(
+                    tTR_gOutputState.iterator.align(16), tTR_gOutputState.layout
+                )
             tTR_rOutput = cute.make_rmem_tensor_like(tTR_cAcc, self.state_dtype)
         for sub in cutlass.range(cute.size(tTR_rAcc, mode=[2]), unroll_full=True):
             cute.copy(tiled_t2r, tTR_tAcc[None, 0, sub, stage], tTR_rAcc[None, 0, sub])

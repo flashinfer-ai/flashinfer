@@ -52,12 +52,12 @@ CHUNK = 64
 
 def _skip_if_unsupported():
     major, _ = get_compute_capability(torch.device("cuda"))
-    if major not in (8, 9, 10, 12):
-        pytest.skip("GDN prefill needs SM8x, SM90, SM100/SM103/SM107 or SM12x")
-    if major == 10:
+    if major not in (8, 9, 10, 11, 12):
+        pytest.skip("GDN prefill needs SM8x, SM90, SM100/SM103/SM107, SM110 or SM12x")
+    if major in (10, 11):
         cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
         if cuda_major < 13:
-            pytest.skip("SM100 GDN prefill requires CUDA 13+")
+            pytest.skip("SM100/SM110 GDN prefill requires CUDA 13+")
 
 
 def _cu(lens: list[int], device) -> torch.Tensor:
