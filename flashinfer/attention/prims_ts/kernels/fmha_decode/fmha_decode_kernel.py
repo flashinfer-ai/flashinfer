@@ -94,6 +94,7 @@ from .fmha_decode_resources import (
     TmemTransformedKvResource,
 )
 from .fmha_decode_resources.helpers_common import (
+    _q_cta_first_token,
     _q_group_token_base,
     _q_seq_bounds,
 )
@@ -231,15 +232,15 @@ def _stages_page_ids_per_tile(uses_paired_page_offset_resources: bool) -> bool:
     return uses_paired_page_offset_resources
 
 
-def _compute_decode_gen_loop_domain(total_kv_tiles: int, num_insts_kv: int) -> int:
+def _compute_decode_gen_loop_domain(total_kv_tiles: int, kv_tiles_per_loop: int) -> int:
     """Number of post-head steady-state iterations.
 
-    HEAD consumes the first `num_insts_kv` K tiles. The remaining tiles are
-    processed in staggered groups of `num_insts_kv`, so odd tail groups still
+    HEAD consumes the first `kv_tiles_per_loop` K tiles. The remaining tiles are
+    processed in staggered groups of `kv_tiles_per_loop`, so odd tail groups still
     need one final loop iteration, matching the schedule's pull-down behavior.
     """
-    remaining_kv_tiles = max(total_kv_tiles - num_insts_kv, 0)
-    return (remaining_kv_tiles + num_insts_kv - 1) // num_insts_kv
+    remaining_kv_tiles = max(total_kv_tiles - kv_tiles_per_loop, 0)
+    return (remaining_kv_tiles + kv_tiles_per_loop - 1) // kv_tiles_per_loop
 
 
 def _compute_total_kv_tiles(seq_len_kv: int, tile_size_kv: int) -> int:
@@ -512,7 +513,7 @@ def _build_decode_gen_schedule(
         else SignalingThreads.All
     )
     q_bytes_per_load_warp = (
-        cfg.smem_q_tile_bytes // cfg.load_num_warps if cfg.load_num_warps > 1 else None
+        cfg.smem_q_stage_bytes // cfg.load_num_warps if cfg.load_num_warps > 1 else None
     )
 
     # ------------------------------------------------------------------
@@ -526,10 +527,11 @@ def _build_decode_gen_schedule(
     use_one_inst_qkv = cfg.use_keeps_mma_ab and cfg.num_insts_kv == 1
     # K and V of different byte widths take the split-resource paths with one
     # K ring and one V ring, each shared by both K/V instances; equal widths
-    # (including Int8 K with E4M3 V) share one ring.
+    # (including Int8 K with E4M3 V) share one ring. Paired Q tiles read the
+    # same K/V tiles, so their two instances share the rings as well.
     use_shared_inst_kv_rings = (
         cfg.k_dtype_bytes != cfg.v_dtype_bytes and cfg.tile_size_kv != 256
-    )
+    ) or cfg.query_paired
     one_inst_tmem_stages = 2 if use_one_inst_qkv else 1
     # Keep complete head-dimension rounds in each balanced K/V ring. FP8's
     # smaller stage tiles can prefetch farther without increasing the budget.
@@ -652,7 +654,7 @@ def _build_decode_gen_schedule(
 
     smem_q_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
         num_stages=cfg.q_stages,
-        num_bytes=cfg.smem_q_tile_bytes,
+        num_bytes=cfg.smem_q_stage_bytes,
         producer_group=tma_producer,
         consumer_group=umma_hw,
         cta_layout_vmnk=cta_layout,
@@ -1034,15 +1036,18 @@ def _build_decode_gen_schedule(
             tma_oob_origin=max_seq_len_kv,
             name="smemBlockSparseKvMetadata0",
         )
-        sparse_kv_metadata1 = SmemBlockSparseKvMetadataResource(
-            pipeline_config=None,
-            cfg=cfg,
-            inst_id=1,
-            route_metadata=sparse_route_metadata,
-            route_layout=prepared_route_layout,
-            tma_oob_origin=max_seq_len_kv,
-            name="smemBlockSparseKvMetadata1",
-        )
+        if not cfg.query_paired:
+            # A query-paired CTA loads each routed K/V tile once; the first
+            # instance's route also feeds the second Softmax.
+            sparse_kv_metadata1 = SmemBlockSparseKvMetadataResource(
+                pipeline_config=None,
+                cfg=cfg,
+                inst_id=1,
+                route_metadata=sparse_route_metadata,
+                route_layout=prepared_route_layout,
+                tma_oob_origin=max_seq_len_kv,
+                name="smemBlockSparseKvMetadata1",
+            )
         sparse_softmax_metadata0 = SmemBlockSparseSoftmaxMetadataResource(
             pipeline_config=sparse_softmax_metadata0_cfg,
             cfg=cfg,
@@ -1487,9 +1492,9 @@ def _build_decode_gen_schedule(
         smem_resources.append(smem_page_offsets)
     if smem_page_offsets_v is not None:
         smem_resources.append(smem_page_offsets_v)
-    if sparse_kv_metadata0 is not None:
-        smem_resources.append(sparse_kv_metadata0)
-        smem_resources.append(sparse_kv_metadata1)
+    for resource in (sparse_kv_metadata0, sparse_kv_metadata1):
+        if resource is not None:
+            smem_resources.append(resource)
     if sparse_softmax_metadata0 is not None:
         smem_resources.append(sparse_softmax_metadata0)
         smem_resources.append(sparse_softmax_metadata1)
@@ -1602,7 +1607,7 @@ def _build_decode_gen_schedule(
     # counts, the final wave still requires one additional loop iteration so
     # that inst0 can process the last K/V tile.
     local_kv_tiles = _compute_local_kv_tiles(cfg, total_kv_tiles)
-    loop_domain = _compute_decode_gen_loop_domain(local_kv_tiles, cfg.num_insts_kv)
+    loop_domain = _compute_decode_gen_loop_domain(local_kv_tiles, cfg.kv_tiles_per_loop)
 
     load_domain = loop_domain
     mma_domain = loop_domain
@@ -1987,18 +1992,19 @@ def _build_decode_gen_schedule(
         }
     elif use_per_inst_kv_resources:
         resource_dependency_graph = {
-            **(
-                {
-                    sparse_kv_metadata0: [],
-                    sparse_kv_metadata1: [],
-                }
-                if sparse_kv_metadata0 is not None
-                else {}
-            ),
+            **{
+                resource: []
+                for resource in (sparse_kv_metadata0, sparse_kv_metadata1)
+                if resource is not None
+            },
             **(
                 {
                     sparse_softmax_metadata0: [sparse_kv_metadata0],
-                    sparse_softmax_metadata1: [sparse_kv_metadata1],
+                    sparse_softmax_metadata1: [
+                        sparse_kv_metadata0
+                        if sparse_kv_metadata1 is None
+                        else sparse_kv_metadata1
+                    ],
                 }
                 if sparse_softmax_metadata0 is not None
                 else {}
@@ -3150,7 +3156,7 @@ def decode_gen_kernel(
     if cutlass.const_expr(not cfg.use_persistent_scheduler):
         if cutlass.const_expr(cfg.use_variable_seqlens_q):
             q_token_offset, seq_len_q = _q_seq_bounds(cfg, g_cu_seqlens_q, b_idx)
-        q_token_base = _q_group_token_base(cfg, q_group_idx)
+        q_token_base = _q_cta_first_token(cfg, q_group_idx)
         q_tile_is_active = q_token_base < seq_len_q
         if cutlass.const_expr(
             use_variable_seqlens_kv
@@ -3682,6 +3688,9 @@ def fmha_decode_launch(
             swizzle=cuda.TensorMapSwizzle.none,
         )
 
+    if cutlass.const_expr(cfg.q_groups_per_cta > 1):
+        # One CTA owns ``q_groups_per_cta`` consecutive Q tiles.
+        q_groups = cute.ceil_div(q_groups, cfg.q_groups_per_cta)
     grid_x = q_groups
     if cutlass.const_expr(cfg.use_split_kv):
         grid_x = q_groups * Int32(cfg.splits_kv)
@@ -3986,9 +3995,7 @@ def fmha_block_sparse_launch(
                     swizzle=tma_swizzle,
                 )
 
-    q_groups = Int32(
-        (cfg.max_seq_len_q + cfg.q_tokens_per_cta - 1) // cfg.q_tokens_per_cta
-    )
+    q_groups = Int32(cfg.num_q_ctas)
     if cutlass.const_expr(cfg.use_persistent_scheduler):
         tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
             (q_groups, h_k, b),

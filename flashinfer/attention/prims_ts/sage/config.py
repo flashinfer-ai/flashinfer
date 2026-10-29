@@ -203,6 +203,41 @@ def validate_sage_recipe(
         )
 
 
+def sage_decode_config_fields(
+    config: SageAttentionConfig, *, use_proxy_routes: bool = False
+) -> dict[str, object]:
+    """Return the decode kernel config fields of a Sage recipe.
+
+    Only proxy routes read block-summary scales; other plans give the
+    summary section the K block size.
+    """
+    return {
+        "sage_q_block_size": config.q_block_size,
+        "sage_k_block_size": config.k_block_size,
+        "sage_k_summary_block_size": (
+            config.k_summary_block_size if use_proxy_routes else config.k_block_size
+        ),
+        "sage_v_mean": config.v_mean,
+    }
+
+
+def resolve_sage_config(
+    sage: SageAttentionParams | None, sage_config: SageAttentionConfig | None
+) -> SageAttentionConfig | None:
+    """Return the recipe of a one-shot call's Sage scales.
+
+    The recipe defaults to the default block sizes, with a V mean when the
+    scales carry one; a recipe without scales is rejected.
+    """
+    if sage is None:
+        if sage_config is not None:
+            raise ValueError("sage_config requires the sage scale tensors of this call")
+        return None
+    if sage_config is None:
+        return SageAttentionConfig(v_mean=sage.v_mean is not None)
+    return sage_config
+
+
 def sage_scale_shapes(
     config: SageAttentionConfig,
     *,

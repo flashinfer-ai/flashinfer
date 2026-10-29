@@ -99,6 +99,8 @@ class _SageCase:
     tiny_q_scales: bool = False
     # One routing pattern serves every KV head.
     share_pattern_across_kv_heads: bool = False
+    # Each CTA of a Q128 plan finalizes two consecutive Q tiles.
+    query_paired: bool = False
 
     @property
     def num_kv_blocks(self) -> int:
@@ -130,6 +132,8 @@ _Q128 = dict(
     kv_block_size=64,
     kv_tile=128,
 )
+# 32-token Q blocks hold the two Q128 tiles of a paired CTA.
+_Q128_PAIRED_ROUTES = {**_Q128, "seq_len_q": 64, "q_block_size": 32}
 
 _DENSE_CASES = (
     _SageCase(
@@ -162,6 +166,30 @@ _DENSE_CASES = (
         out_dtype=torch.float16,
         sage=SageAttentionConfig(q_block_size=4, k_block_size=1),
         persistent=True,
+    ),
+    # Three Q128 tiles per sequence pair the first two and leave the third
+    # instance-1 slot past the end of Q.
+    _SageCase(
+        "q128_fp8_k16_mean_paired",
+        **_Q128,
+        sage=SageAttentionConfig(v_mean=True),
+        query_paired=True,
+    ),
+    _SageCase(
+        "q128_fp8_k4_q4_paired_persistent",
+        **_Q128,
+        sage=SageAttentionConfig(q_block_size=4, k_block_size=4),
+        query_paired=True,
+        persistent=True,
+    ),
+    # 536 K/V tokens give the first CTA's second Q tile one more K/V tile
+    # than its first.
+    _SageCase(
+        "q128_fp8_k1_causal_paired",
+        **{**_Q128, "seq_len_kv": 536},
+        sage=SageAttentionConfig(k_block_size=1),
+        mask_type="causal",
+        query_paired=True,
     ),
     # A zero threshold keeps exact KV256 anchors and P at the full E4M3 range.
     _SageCase(
@@ -246,6 +274,27 @@ _SPARSE_CASES = (
         sage=SageAttentionConfig(k_block_size=16, k_summary_block_size=4),
         routes="proxy",
         share_pattern_across_kv_heads=True,
+    ),
+    _SageCase(
+        "q128_exact_int8_k4_q4_bitmask_causal_paired_persistent",
+        **{**_Q128_PAIRED_ROUTES, "seq_len_kv": 536},
+        qk_dtype=torch.int8,
+        out_dtype=torch.float16,
+        sage=SageAttentionConfig(q_block_size=4, k_block_size=4),
+        routes="exact",
+        sparse_format="bitmask",
+        mask_type="causal",
+        persistent=True,
+        query_paired=True,
+    ),
+    # Both instances of a paired CTA read one route's summary scales.
+    _SageCase(
+        "q128_proxy_fp8_k16_s4_shared_pattern_paired",
+        **_Q128_PAIRED_ROUTES,
+        sage=SageAttentionConfig(k_summary_block_size=4),
+        routes="proxy",
+        share_pattern_across_kv_heads=True,
+        query_paired=True,
     ),
 )
 _CASES_BY_NAME = {case.name: case for case in _DENSE_CASES + _SPARSE_CASES}
@@ -406,6 +455,7 @@ def _plan(case: _SageCase, *, max_blocks_per_row: int | None = None):
                 o_data_type=case.out_dtype,
                 sage_config=case.sage,
                 softmax_rescale_threshold_log2=case.softmax_rescale_threshold_log2,
+                query_paired=case.query_paired,
                 **route_kwargs,
             )
     finally:
@@ -414,6 +464,7 @@ def _plan(case: _SageCase, *, max_blocks_per_row: int | None = None):
     assert policy["tile_size_q"] == (64 if case.kv_tile == 256 else 128)
     assert policy["tile_size_kv"] == case.kv_tile
     assert policy["scheduler"] == ("persistent" if case.persistent else "static")
+    assert policy["query_paired"] is case.query_paired
     return wrapper
 
 
@@ -457,8 +508,9 @@ def _row_folds(case: _SageCase, exact_blocks):
 
     A route (a dense tile) packs ``kv_tile`` tokens of the exact blocks or
     ``kv_tile`` summaries, in K64 atoms; exact routes come first. K/V instance
-    ``route % 2`` owns a route and, on KV256, spatial half ``atom % 2`` splits
-    it into two streams, each folding its half of the route at once.
+    ``route % 2`` owns a route (a query-paired instance owns every route) and,
+    on KV256, spatial half ``atom % 2`` splits it into two streams, each
+    folding its half of the route at once.
     """
 
     kv_block, atoms_per_route = case.kv_block_size, case.kv_tile // 64
@@ -492,7 +544,8 @@ def _row_folds(case: _SageCase, exact_blocks):
         for half in range(halves):
             indices = [index for atom in atoms[half::halves] for index in atom]
             if indices:
-                stream = route_idx % 2 * halves + half
+                routes_per_step = 1 if case.query_paired else 2
+                stream = route_idx % routes_per_step * halves + half
                 yield stream, source, torch.tensor(indices, device="cuda")
 
 
@@ -982,17 +1035,12 @@ def _sage_decode_config(
             "direct-output grid",
             id="split-kv",
         ),
-        pytest.param(
-            {"qkv_layout": "pagedKv", "num_tokens_per_page": 128},
-            "contiguous K/V",
-            id="paged-kv",
-        ),
     ),
 )
 def test_sage_decode_config_rejects_unsupported_launches(
     overrides: dict[str, object], match: str
 ) -> None:
-    """Only the direct output store of contiguous K/V applies the V scales."""
+    """Only the direct output store applies the V scales."""
 
     with pytest.raises(ValueError, match=match):
         _sage_decode_config(**overrides)

@@ -82,7 +82,11 @@ from .decode import (
     _validate_runtime_device,
 )
 from .kernels.fmha_decode.fmha_decode_constants import SOFTMAX_RESCALE_THRESHOLD_LOG2
-from .sage.config import SageAttentionConfig, SageAttentionParams
+from .sage.config import (
+    SageAttentionConfig,
+    SageAttentionParams,
+    resolve_sage_config,
+)
 
 
 class _BlockSparseWrapperBase:
@@ -173,6 +177,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         o_data_type: torch.dtype | None = None,
         sage_config: SageAttentionConfig | None = None,
         softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
+        query_paired: bool = False,
     ) -> None:
         """Choose a legal profile and allocate reusable routing capacity.
 
@@ -194,6 +199,11 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         Sage plan. A dense plan may omit ``q_block_size`` and
         ``kv_block_size``; each then defaults to 128, which selects the
         Q128/KV128 Keeps tile. A block-sparse plan requires both.
+        ``query_paired=True`` makes each CTA process two consecutive Q128
+        tiles over one K/V stream; it requires ``head_dim=128`` and a Q128
+        tile (``q_block_size * Hq / Hkv >= 128``). Both tiles of a
+        block-sparse CTA read one route list, so a block-sparse plan also
+        requires ``q_block_size * Hq / Hkv`` to be a multiple of 256.
 
         ``share_pattern_across_kv_heads=False`` retains independent per-KV-head
         patterns. True uses a singleton head axis in BSR/bitmask inputs and
@@ -234,6 +244,11 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         ``k_data_type`` defaults to ``q_data_type`` and ``v_data_type`` to
         ``k_data_type``. ``kv_data_type`` is a compatibility alias that sets
         both K and V; explicit K/V dtypes must agree with it.
+
+        A dense plan also takes per-tensor ``torch.float8_e4m3fn`` Q/K/V with
+        a ``torch.float16`` or ``torch.bfloat16`` output: :meth:`run` folds
+        the Q and K scales into ``sm_scale`` and the V scale into
+        ``bmm2_scale``.
 
         ``sage_config`` enables Sage attention on the Q64/KV256 and Q128/KV128
         Keeps profiles: Q and K share ``torch.float8_e4m3fn`` or
@@ -299,6 +314,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
             sage=sage_config,
             use_block_sparse=use_block_sparse,
             softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+            query_paired=query_paired,
         )
         if use_proxy_routes and static.mask_type != "dense":
             raise ValueError("block-sparse proxy routes require mask_type='dense'")
@@ -339,6 +355,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         out: torch.Tensor | None = None,
         validate: bool = True,
         sage: SageAttentionParams | None = None,
+        bmm2_scale: float = 1.0,
     ) -> torch.Tensor:
         """Launch the current plan on the caller's current CUDA stream.
 
@@ -421,6 +438,10 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
         sage : SageAttentionParams, optional
             Scale tensors of this run. Required by a Sage plan and rejected
             otherwise.
+        bmm2_scale : float
+            Scale applied to the output of a dense plan, such as the V scale
+            of per-tensor E4M3 V, whose Q and K scales ``sm_scale`` carries.
+            Defaults to 1.0; a block-sparse plan accepts only 1.0.
 
         Returns
         -------
@@ -449,6 +470,7 @@ class BlockSparseTSWrapper(_BlockSparseWrapperBase):
             sm_scale=sm_scale,
             out=out,
             sage=sage,
+            bmm2_scale=bmm2_scale,
         )
         run_stream = torch.cuda.current_stream(state.device)
         return self._launch_validated_run(state, run_args, run_stream)
@@ -478,6 +500,7 @@ def block_sparse_attention(
     sage: SageAttentionParams | None = None,
     sage_config: SageAttentionConfig | None = None,
     softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
+    bmm2_scale: float = 1.0,
 ) -> torch.Tensor:
     """Plan and run one compact-BSHD block-sparse or dense attention launch.
 
@@ -546,6 +569,9 @@ def block_sparse_attention(
     softmax_rescale_threshold_log2 : float, optional
         Binades a row maximum may rise before the output is rescaled, 0 to 8
         (default 8); see :meth:`BlockSparseTSWrapper.plan`.
+    bmm2_scale : float, optional
+        Output scale of a dense call, such as the V scale of per-tensor E4M3
+        V; see :meth:`BlockSparseTSWrapper.run`. Defaults to 1.0.
 
     share_pattern_across_kv_heads : bool
         False (default) uses one pattern per KV head. True requires a singleton
@@ -557,10 +583,7 @@ def block_sparse_attention(
         The compact output tensor; identical to ``out`` when provided.
     """
 
-    if sage_config is not None and sage is None:
-        raise ValueError("sage_config requires the sage scale tensors of this call")
-    if sage is not None and sage_config is None:
-        sage_config = SageAttentionConfig(v_mean=sage.v_mean is not None)
+    sage_config = resolve_sage_config(sage, sage_config)
     for tensor, name in ((q, "q"), (k, "k"), (v, "v")):
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"{name} must be a torch.Tensor")
@@ -672,6 +695,7 @@ def block_sparse_attention(
         sm_scale=sm_scale,
         out=out,
         sage=sage,
+        bmm2_scale=bmm2_scale,
     )
 
 

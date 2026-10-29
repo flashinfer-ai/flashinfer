@@ -124,11 +124,16 @@ def load_sage_flat_scale(
     seq_len: Int32,
     token_idx: Int32,
     log2_block: Int32,
+    valid_len: Int32 | None = None,
 ) -> Float32:
     """Return one head's scale of one token from a flat-layout scale array.
 
-    A token past ``seq_len`` takes the last valid slot.
+    ``seq_len`` tokens of every batch entry lay out the flat array. A token
+    past the entry's ``valid_len`` tokens, ``seq_len`` unless given, takes
+    the last valid token's slot; ``valid_len`` must be positive.
     """
-    token_idx = cute.math.min(token_idx, seq_len - Int32(1))
+    if cutlass.const_expr(valid_len is None):
+        valid_len = seq_len
+    token_idx = cute.math.min(token_idx, valid_len - Int32(1))
     slot = sage_flat_scale_slot(batch_idx, token_idx, seq_len, log2_block)
     return _load_sage_scale(scale_addr, head_idx * head_stride + slot)

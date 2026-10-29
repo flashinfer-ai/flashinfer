@@ -9,10 +9,12 @@ The public API describes attention semantics and cache metadata. Tile shapes
 and launch policy are selected internally for the problem and GPU. Fixed-Q
 and packed-Q plans may use direct, persistent, or split-KV execution according
 to the caller's split permission. Sliding-window plans remain nonsplit, but
-may use direct or CLC-persistent execution. There is no public scheduler or
-tuning knob and no fallback to another attention backend.
+may use direct or CLC-persistent execution. Apart from the `query_paired`
+choice described under [Query pairing](#query-pairing), there is no public
+scheduler or tuning knob, and there is no fallback to another attention
+backend.
 
-Fixed multi-query paged plans compare legal Swaps Q8/Q16/Q32 and Keeps Q64/Q128 candidates across page sizes 4, 8, 16, 32, 64, and 128. Each candidate passes the shared profile validator; eligibility does not imply every dtype, MMA orientation, or reducer supports every combination. Sliding-window scoring uses the visible union, bounded by `window_size + Q - 1`, instead of the model context capacity. Partial final query groups remain candidates: the cost model uses the ceil-divided Q grid and complete per-CTA cost. Q1, packed variable-Q, and explicitly pinned choices retain their existing selection paths. Windowed split-KV remains disabled.
+Fixed and packed multi-query paged plans compare legal Swaps Q8/Q16/Q32 and Keeps Q64/Q128 candidates across page sizes 4, 8, 16, 32, 64, and 128. Each candidate passes the shared profile validator; eligibility does not imply every dtype, MMA orientation, or reducer supports every combination. Sliding-window scoring uses the visible union, bounded by `window_size + Q - 1`, instead of the model context capacity. Partial final query groups remain candidates: the cost model uses the ceil-divided Q grid and complete per-CTA cost. A packed plan is scored at its maximum Q length, which sizes its grid. Q1 and explicitly pinned choices retain their existing selection paths. Windowed split-KV remains disabled.
 
 D192 Keeps retains 128-wide SMEM stages while issuing PV N128+N64 into 192 logical O columns. Swaps keeps its padded PV computation and transposed output staging; output stores mask channels beyond D192. `smem_q_head_dim` expresses the 128-byte TMA fragment alignment: 192 elements for FP16/BF16, 256 for FP8. It does not widen the public Q tensor.
 
@@ -154,7 +156,7 @@ supported. Rows may have padding between them; each row must be contiguous.
 | Head dimension | 64, 128, 192, or 256 |
 | Fixed Q length | Any positive integer representable by the metadata and tensor extents |
 | Packed Q | Positive per-request lengths no greater than a positive static maximum |
-| Head mapping | MHA/GQA; `Hq` must be divisible by `Hkv`, with `1 <= Hq/Hkv <= 128`. Qualified fixed-Q FP8 D64/D128/D256 paged profiles use grouped Swaps Q8/Q16/Q32 through ratio 32, Keeps Q64 through ratio 64, and Keeps Q128 through ratio 128. |
+| Head mapping | MHA/GQA; `Hq` must be divisible by `Hkv`, with `1 <= Hq/Hkv <= 128`. Qualified fixed-Q FP8 D64/D128/D256 paged profiles use grouped Swaps Q8/Q16/Q32 through ratio 32, Keeps Q64 through ratio 64, and Keeps Q128 through ratio 128, which also runs packed Q on direct launches. FP16/BF16 and QK-BF16/PV-FP8 D128 plans add grouped Keeps Q128 on direct launches; automatic selection takes it for multi-token launches, fixed or packed Q, with page sizes 4 to 128. Paged grouped Keeps profiles run a causal sliding window on direct launches only. |
 | Q/K dtype | Matching `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
 | V dtype | Equal to Q/K, or `torch.float8_e4m3fn` with `torch.bfloat16` Q/K (`v_data_type`; defaults to `k_data_type`) |
 | Output dtype | `torch.float16` for `torch.float16` input; `torch.bfloat16` for `torch.bfloat16` input; `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` for `torch.float8_e4m3fn` input |
@@ -164,6 +166,7 @@ supported. Rows may have padding between them; each row must be contiguous.
 | Mask | Dense or bottom-right causal |
 | Sliding window | Causal left window; `window_left=-1` disables it and non-negative values include the current token |
 | Scheduling | Automatic direct or CLC-persistent launch; `split_kv=True` permits eligible underfilled fixed/packed-Q grids to split. False disables splitting. Automatic sliding-window splits remain unqualified. |
+| Query pairing | `query_paired`: automatic (`None`), forced when supported (`True`), or off (`False`); see [Query pairing](#query-pairing) |
 | Accumulation | FP32 QK/PV and softmax state |
 
 FP8-E4M3 Q with FP8-E4M3 or NVFP4 K/V can write BF16 directly. Set
@@ -192,6 +195,32 @@ The fixed table controls logical-to-physical lookup only. Native TMA tensor
 maps still span the complete physical page pool and use each cache tensor's
 runtime outer page stride, so page IDs may be arbitrary and physical pages may
 have padded storage.
+
+## Query pairing
+
+A query-paired plan runs two consecutive grouped Keeps Q128 tiles of one
+request and KV head in each CTA, over a single K/V stream. Each of the
+kernel's two K/V instances owns one of the Q tiles for the whole sequence
+instead of alternating K/V tiles of one Q tile, and each K/V tile is loaded
+once for both. Pairing halves the CTA count, so it pays off when K/V loads
+bound the kernel and the paired grid needs fewer CTA waves.
+
+`plan()`, the one-shot and prepared launches, and workspace sizing take
+`query_paired`; pass the same value to workspace sizing as to the launch:
+
+- `None` (default): the automatic tile selection of multi-token launches,
+  fixed or packed Q, on 4- to 128-token pages scores the paired tile with
+  the unpaired ones and pairs the plan when that costs less.
+- `True`: pair whenever the launch supports it: an FP16, BF16,
+  QK-BF16/PV-FP8, FP8, or Sage recipe with head dim 128 (64 or 128 for
+  FP8), at least two Q tiles in a request, and enough unpaired Q tiles to
+  fill one wave of CTAs. Other launches plan unpaired.
+- `False`: never pair.
+
+The plan's policy records the outcome. Paired plans do not split K/V. In a
+causal plan the CTA streams the union of its Q tiles' K/V ranges, from the
+earlier tile's sliding-window start to the later tile's causal end, and each
+tile masks the keys outside its own range.
 
 ## Tensor and metadata layouts
 
@@ -408,8 +437,8 @@ plan-owned length storage and requires graph recapture.
 - Q and K must share one dtype; the only mixed combination is
   `torch.bfloat16` Q/K with `torch.float8_e4m3fn` V.
 - Sage attention (8-bit Q/K of one dtype with `torch.float8_e4m3fn` V and
-  dequantization scales) runs only through `BlockSparseTSWrapper` and
-  `block_sparse_attention`; see
+  dequantization scales) takes `sage_config=` at plan time and `sage=` on
+  every run, with head dim 128 and without split-KV; see
   [Sage attention](../../README.md#sage-attention).
 - Positive K/V lengths must be no greater than the static plan
   bound.
@@ -425,5 +454,6 @@ split-KV, and resource-safety coverage lives in:
 
 ```bash
 pytest -q tests/attention/test_attention_ts_decode.py
+pytest -q tests/attention/test_attention_ts_query_paired.py
 pytest -q tests/trace/test_fi_trace_template_consistency.py
 ```

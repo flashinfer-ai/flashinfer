@@ -277,6 +277,7 @@ class TmemSResource(DecodeGenResourceBase):
     page_offsets_ref: Constexpr[MemoryResource | None] = None
     _p_local_sum_arr: cutlass.Array | None = None
     _global_sum_arr: cutlass.Array | None = None
+    _sage_row_words: cutlass.Array | None = None
     _alloc: Constexpr[TmemAllocation | None] = None
     sync_barrier_id: Constexpr[int] = 0
     _scratch_alloc: Constexpr[SmemAllocation | None] = None
@@ -302,6 +303,10 @@ class TmemSResource(DecodeGenResourceBase):
         self.s_arr.default = _placeholder_local_array(Float32, num_s_regs)
         self._p_local_sum_arr = _placeholder_local_array(Float32, num_scale_groups)
         self._global_sum_arr = _placeholder_local_array(Float32, num_scale_groups)
+        if self.cfg.keeps_sage_row_words:
+            self._sage_row_words = _placeholder_local_array(
+                Float32, self.cfg.sage_keeps_row_groups
+            )
         scratch_entries = (
             4 * num_scale_groups if self.cfg.use_keeps_mma_ab else self.cfg.tile_size_q
         )
@@ -316,6 +321,11 @@ class TmemSResource(DecodeGenResourceBase):
     def load_p_local_sum(self, scale_idx: int) -> Float32:
         """Load the local denominator published with the current P tile."""
         return self._p_local_sum_arr[scale_idx]
+
+    @cute.jit
+    def load_sage_row_word(self, group_idx: int) -> Float32:
+        """Load ``sfK`` word ``group_idx`` of the row the max pass block-scaled."""
+        return self._sage_row_words[group_idx]
 
     @cute.jit
     def store_global_sum(self, scale_idx: int, value: Float32) -> None:
@@ -529,6 +539,10 @@ class TmemSResource(DecodeGenResourceBase):
         self._global_sum_arr = cutlass.Array(
             Float32, num_scale_groups, space=cutlass.AddressSpace.rmem
         )
+        if cutlass.const_expr(self.cfg.keeps_sage_row_words):
+            self._sage_row_words = cutlass.Array(
+                Float32, self.cfg.sage_keeps_row_groups, space=cutlass.AddressSpace.rmem
+            )
         result = {
             "old_max_arr": cutlass.Array(
                 Float32, num_scale_groups, space=cutlass.AddressSpace.rmem
@@ -755,6 +769,10 @@ class TmemSResource(DecodeGenResourceBase):
         else:
             k_desc = _freeze_smem_descriptor(kv_desc)
         q_desc = _freeze_smem_descriptor(q_desc)
+        if cutlass.const_expr(cfg.q_groups_per_cta > 1 and self.inst_id > 0):
+            # Q descriptors name the stage's first Q tile; a paired instance
+            # reads its own tile, ``inst_id`` tiles further into the stage.
+            q_desc = q_desc + Int32((cfg.smem_q_tile_bytes * self.inst_id) >> 4)
         q_desc, head_dim_stage_idx = self._q_desc_for_head_dim_stage(
             q_desc, head_dim_stage_idx
         )
@@ -908,11 +926,11 @@ class TmemSResource(DecodeGenResourceBase):
         A fully masked row must reach the P pass with the ``-FLT_MAX``
         maximum, which ``SmemPResource._exponent_addend`` anchors on zero so
         that its masked scores exponentiate to zero. Most profiles write that
-        sentinel directly. Sage writes ``-inf``: its max pass dequantizes each
-        score with a positive ``sfK`` and scales the maximum by ``sfQ``, which
-        keeps ``-inf`` but can move ``-FLT_MAX`` off the sentinel, and it maps
-        an all ``-inf`` maximum back to the sentinel
-        (``_dequantize_sage_keeps_row``).
+        sentinel directly. Sage writes ``-inf``: its max pass scales scores or
+        their group maxima by a positive ``sfK`` and the maximum by ``sfQ``,
+        which keeps ``-inf`` but can move ``-FLT_MAX`` off the sentinel, and
+        it maps an all ``-inf`` maximum back to the sentinel
+        (``_apply_sage_q_scale``).
         """
         if self.cfg.use_sage_attention:
             return Float32(float("-inf"))
@@ -957,23 +975,23 @@ class TmemSResource(DecodeGenResourceBase):
         return tile_max
 
     @cute.jit
-    def _dequantize_sage_keeps_row(
+    def _reduce_sage_keeps_row_max(
         self,
         stage_info: StageInfo,
         s_vals: cutlass.Array,
         sage_q_scale: Float32,
         sage_k_stage_bytes: Int32,
+        row_maxima: cutlass.Array | None = None,
     ) -> Float32:
-        """Dequantize a complete Sage score row in place and return its tile max.
+        """Return a complete Sage row's tile maximum in dequantized units.
 
-        Each K32 chunk reads its ``sfK`` words from the waited stage and
-        becomes ``(s - bias) * sfK_g`` (``_dequantize_fragment_scores``), so
-        the row reaches the P pass without scale words or bias. ``sfQ``
-        applies once to the tile maximum; masked ``-inf`` scores stay
-        ``-inf``, and only the ``-inf`` identity maps to the finite sentinel.
+        A dequantized row becomes ``(s - bias) * sfK`` in place. A block-scaled
+        row stays raw: each group's maximum (``row_maxima`` or the registers)
+        is scaled by its word, which ``_sage_row_words`` keeps for the P pass.
         """
         cfg = self.cfg
         assert cfg.use_sage_attention and cfg.tile_size_q == 128
+        dequantizes: Constexpr[bool] = not cfg.keeps_sage_row_words
         chunk_regs = cfg.keeps_score_chunk_regs
         groups: Constexpr[int] = cfg.sage_k_groups_per_fragment()
         warp_grp_thread_idx = Int32(
@@ -993,18 +1011,44 @@ class TmemSResource(DecodeGenResourceBase):
             chunk_scales = load_sage_k_fragment(cfg, scales_view, Int32(chunk_idx))
             for score_idx in cutlass.range_constexpr(chunk_regs):
                 chunk[score_idx] = s_vals[first + score_idx]
-            self._dequantize_fragment_scores(chunk, chunk_scales, groups)
-            for score_idx in cutlass.range_constexpr(chunk_regs):
-                s_vals[first + score_idx] = chunk[score_idx]
-                chain_idx: Constexpr[int] = score_idx % 4
-                max_chains[chain_idx] = cute.math.max(
-                    max_chains[chain_idx], Float32(chunk[score_idx]), ftz=True
+            if cutlass.const_expr(dequantizes):
+                self._dequantize_fragment_scores(chunk, chunk_scales, groups)
+                for score_idx in cutlass.range_constexpr(chunk_regs):
+                    s_vals[first + score_idx] = chunk[score_idx]
+                    chain_idx: Constexpr[int] = score_idx % 4
+                    max_chains[chain_idx] = cute.math.max(
+                        max_chains[chain_idx], Float32(chunk[score_idx]), ftz=True
+                    )
+            else:
+                for group_idx in cutlass.range_constexpr(groups):
+                    self._sage_row_words[chunk_idx * groups + group_idx] = chunk_scales[
+                        group_idx
+                    ]
+                if cutlass.const_expr(row_maxima is not None):
+                    maxima: tuple = ()
+                    for group_idx in cutlass.range_constexpr(groups):
+                        maxima += (row_maxima[chunk_idx * groups + group_idx],)
+                else:
+                    maxima = self._score_group_maxima(
+                        chunk, groups=groups, group_regs=chunk_regs // groups
+                    )
+                self._fold_sage_group_maxima(
+                    max_chains,
+                    maxima,
+                    fragment_scales=chunk_scales,
+                    chain_base=chunk_idx * groups,
+                    groups=groups,
                 )
         tile_max = cute.math.max(
             cute.math.max(max_chains[0], max_chains[1], ftz=True),
             cute.math.max(max_chains[2], max_chains[3], ftz=True),
             ftz=True,
         )
+        return self._apply_sage_q_scale(tile_max, sage_q_scale)
+
+    @cute.jit
+    def _apply_sage_q_scale(self, tile_max: Float32, sage_q_scale: Float32) -> Float32:
+        """Apply ``sfQ`` to a Sage tile maximum; only ``-inf`` maps to the sentinel."""
         if tile_max == Float32(float("-inf")):
             tile_max = _neg_max_f32()
         else:
@@ -1018,11 +1062,12 @@ class TmemSResource(DecodeGenResourceBase):
         s_vals: cutlass.Array,
         sage_q_scale: Float32 | None,
         sage_k_stage_bytes: Int32 | None,
+        row_maxima: cutlass.Array | None = None,
     ) -> Float32:
-        """Return a complete row's tile maximum, dequantizing a Sage row first."""
+        """Return a complete row's tile maximum, in dequantized units for Sage."""
         if cutlass.const_expr(self.cfg.use_sage_attention):
-            return self._dequantize_sage_keeps_row(
-                stage_info, s_vals, sage_q_scale, sage_k_stage_bytes
+            return self._reduce_sage_keeps_row_max(
+                stage_info, s_vals, sage_q_scale, sage_k_stage_bytes, row_maxima
             )
         return self._reduce_keeps_row_max(s_vals)
 
@@ -1184,6 +1229,7 @@ class TmemSResource(DecodeGenResourceBase):
         membership_keep_word: Uint32,
         *,
         apply_boundary_mask: Constexpr[bool],
+        row_maxima: cutlass.Array | None = None,
     ) -> None:
         """Load one complete-row Keeps score tile with a compile-time mask policy.
 
@@ -1191,23 +1237,41 @@ class TmemSResource(DecodeGenResourceBase):
         score fragment out of the branch condition avoids carrying 64/128 live
         S registers through a post-load control-flow edge. Max reduction is a
         separate operation because the later P-materialization reload only
-        needs the masked scores.
+        needs the masked scores. ``row_maxima`` receives each ``sfK`` group's
+        maximum, from LDTM.STAT on an unmasked tile, else from the registers.
         """
         cfg = self.cfg
         task_cache = _decode_gen_task_cache(stage_info)
         num_s_regs = cfg.num_s_regs_per_thread
         base_addr = self._softmax_loop_score_tmem_addr(stage_info)
-        for load_atom_idx in cutlass.range_constexpr(num_s_regs // 32):
-            atom_col = load_atom_idx * 32
-            loaded = _keeps_tcgen05_ld(
-                cfg,
-                prims.make_tmem_ptr(base_addr + Int32(atom_col), Float32),
-                num=32,
-                offset=cfg.tile_size_kv // 2,
-            )
+        if cutlass.const_expr(row_maxima is not None and not apply_boundary_mask):
+            # One load per group returns its scores and their maximum.
+            groups: Constexpr[int] = cfg.sage_keeps_row_groups
+            group_cols: Constexpr[int] = num_s_regs // groups
+            group_loads = []
+            for group_idx in cutlass.range_constexpr(groups):
+                group_loads.append(
+                    tcgen05_ld_32x32b_max(
+                        base_addr + Int32(group_idx * group_cols), group_cols
+                    )
+                )
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
-            for atom_reg_idx in cutlass.range_constexpr(32):
-                s_vals[atom_col + atom_reg_idx] = loaded[atom_reg_idx]
+            for group_idx in cutlass.range_constexpr(groups):
+                for col in cutlass.range_constexpr(group_cols):
+                    s_vals[group_idx * group_cols + col] = group_loads[group_idx][col]
+                row_maxima[group_idx] = group_loads[group_idx][group_cols]
+        else:
+            for load_atom_idx in cutlass.range_constexpr(num_s_regs // 32):
+                atom_col = load_atom_idx * 32
+                loaded = _keeps_tcgen05_ld(
+                    cfg,
+                    prims.make_tmem_ptr(base_addr + Int32(atom_col), Float32),
+                    num=32,
+                    offset=cfg.tile_size_kv // 2,
+                )
+                prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+                for atom_reg_idx in cutlass.range_constexpr(32):
+                    s_vals[atom_col + atom_reg_idx] = loaded[atom_reg_idx]
 
         warp_grp_thread_idx = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
         lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
@@ -1351,6 +1415,20 @@ class TmemSResource(DecodeGenResourceBase):
             ):
                 for invalid_q_reg_idx in cutlass.range_constexpr(num_s_regs):
                     s_vals[invalid_q_reg_idx] = self._masked_score()
+                if cutlass.const_expr(
+                    row_maxima is not None and not apply_boundary_mask
+                ):
+                    for group_idx in cutlass.range_constexpr(cfg.sage_keeps_row_groups):
+                        row_maxima[group_idx] = self._masked_score()
+
+        if cutlass.const_expr(row_maxima is not None and apply_boundary_mask):
+            maxima = self._score_group_maxima(
+                s_vals,
+                groups=cfg.sage_keeps_row_groups,
+                group_regs=num_s_regs // cfg.sage_keeps_row_groups,
+            )
+            for group_idx in cutlass.range_constexpr(cfg.sage_keeps_row_groups):
+                row_maxima[group_idx] = maxima[group_idx]
 
     @cute.jit
     def _load_keeps_fragment(
@@ -1365,6 +1443,7 @@ class TmemSResource(DecodeGenResourceBase):
         is_valid_effective_tile: cutlass.Boolean,
         is_masked_final_wave: cutlass.Boolean,
         tile_is_unmasked: cutlass.Boolean,
+        row_maxima: cutlass.Array | None = None,
     ) -> None:
         """Select the masked or unmasked fragment loader before LDTM.
 
@@ -1399,6 +1478,7 @@ class TmemSResource(DecodeGenResourceBase):
                 is_masked_final_wave,
                 membership_keep_word,
                 apply_boundary_mask=False,
+                row_maxima=row_maxima,
             )
         else:
             self._load_keeps_fragment_impl(
@@ -1413,6 +1493,7 @@ class TmemSResource(DecodeGenResourceBase):
                 is_masked_final_wave,
                 membership_keep_word,
                 apply_boundary_mask=True,
+                row_maxima=row_maxima,
             )
 
     @cute.jit
@@ -1433,8 +1514,8 @@ class TmemSResource(DecodeGenResourceBase):
         assigns one row to a lane pair: lanes ``xor 16`` own the low/high
         64-column halves.  This path deliberately avoids the Swaps scratch
         reduction, whose 16x256b register mapping is unrelated to Keeps.
-        A Sage row is dequantized in registers before the maximum
-        (``_dequantize_sage_keeps_row``).
+        A Sage row's maximum is in dequantized units
+        (``_reduce_sage_keeps_row_max``).
         """
         cfg = self.cfg
         if cutlass.const_expr(cfg.streams_tmem_p_fragments):
@@ -1466,6 +1547,11 @@ class TmemSResource(DecodeGenResourceBase):
             _tile_has_valid_scores,
         ) = self._resolve_keeps_tile_context(stage_info)
 
+        row_maxima = None
+        if cutlass.const_expr(cfg.loads_keeps_row_maxima):
+            row_maxima = cutlass.Array(
+                Float32, cfg.sage_keeps_row_groups, space=cutlass.AddressSpace.rmem
+            )
         # Select the complete unmasked/masked TMEM load+max path before any S
         # registers are materialized: fully visible tiles then skip the mask
         # pass, and no loaded score crosses a post-load branch. The shared
@@ -1482,9 +1568,10 @@ class TmemSResource(DecodeGenResourceBase):
             is_valid_effective_tile,
             is_masked_final_wave,
             tile_is_unmasked,
+            row_maxima=row_maxima,
         )
         tile_max = self._reduce_keeps_tile_max(
-            stage_info, s_vals, sage_q_scale, sage_k_stage_bytes
+            stage_info, s_vals, sage_q_scale, sage_k_stage_bytes, row_maxima
         )
         self._publish_keeps_softmax_state(
             s_vals,
@@ -2230,7 +2317,9 @@ class TmemSResource(DecodeGenResourceBase):
                 kv_head_idx=kv_head_idx,
                 num_kv_heads=self.num_heads_kv,
             ),
-            q_tile_idx=_logical_q_group_idx(cfg, stage_info, self.q_group_idx),
+            q_tile_idx=_logical_q_group_idx(
+                cfg, stage_info, self.q_group_idx, self.inst_id
+            ),
             row_idx=_keeps_row_idx(cfg, warp_grp_thread_idx),
         )
 
@@ -2412,7 +2501,7 @@ class TmemSResource(DecodeGenResourceBase):
                 sparse_token_word3,
             )
             logical_q_group_idx = _logical_q_group_idx(
-                cfg, stage_info, self.q_group_idx
+                cfg, stage_info, self.q_group_idx, self.inst_id
             )
             q_token_idx, _ = _q_row_token_and_local_head(
                 cfg,
@@ -2762,13 +2851,8 @@ class TmemSResource(DecodeGenResourceBase):
             ftz=True,
         )
         if cutlass.const_expr(cfg.use_sage_attention):
-            # The chains hold ``gmax * sfK``; ``sfQ`` applies once here. Only
-            # the ``-inf`` identity maps to the finite sentinel: a real
-            # pre-``sfQ`` maximum of ``-FLT_MAX`` is an ordinary score.
-            if tile_max == Float32(float("-inf")):
-                tile_max = _neg_max_f32()
-            else:
-                tile_max = tile_max * sage_q_scale
+            # The chains hold ``gmax * sfK``.
+            tile_max = self._apply_sage_q_scale(tile_max, sage_q_scale)
         if cutlass.const_expr(use_sparse and cfg.use_block_sparse_proxy_routes):
             # The mass enters before the anchor, so the P range is unchanged; a
             # fully masked route's sentinel absorbs the shift in FP32.
@@ -2953,7 +3037,26 @@ class TmemSResource(DecodeGenResourceBase):
         scores need no special case. ``_fold_sage_group_maxima`` dequantizes
         and folds the group maxima.
         """
-        group_regs = self.cfg.softmax_score_fragment_regs // groups
+        maxima = self._score_group_maxima(
+            scores, groups=groups, group_regs=self.cfg.keeps_score_chunk_regs // groups
+        )
+        self._fold_sage_group_maxima(
+            max_chains,
+            maxima,
+            fragment_scales=fragment_scales,
+            chain_base=chain_base,
+            groups=groups,
+        )
+
+    @cute.jit
+    def _score_group_maxima(
+        self,
+        scores,
+        *,
+        groups: Constexpr[int],
+        group_regs: Constexpr[int],
+    ) -> tuple:
+        """Return the maximum of each of ``groups`` consecutive score groups."""
         maxima: tuple = ()
         for group_idx in cutlass.range_constexpr(groups):
             first: Constexpr[int] = group_idx * group_regs
@@ -2980,13 +3083,7 @@ class TmemSResource(DecodeGenResourceBase):
                     ftz=True,
                 )
             maxima += (group_max,)
-        self._fold_sage_group_maxima(
-            max_chains,
-            maxima,
-            fragment_scales=fragment_scales,
-            chain_base=chain_base,
-            groups=groups,
-        )
+        return maxima
 
     @cute.jit
     def _fold_sage_group_maxima(

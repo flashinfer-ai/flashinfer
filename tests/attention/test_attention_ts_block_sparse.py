@@ -79,6 +79,8 @@ class _Case:
     num_kv_heads: int | None = None
     expected_q_tile: int | None = None
     expected_kv_tile: int | None = None
+    # Each CTA runs two consecutive Q128 tiles of one Q block.
+    query_paired: bool = False
 
     @property
     def effective_num_kv_heads(self) -> int:
@@ -511,6 +513,62 @@ _GQA_CASES = (
         num_kv_heads=2,
         expected_q_tile=128,
         expected_kv_tile=128,
+    ),
+    # Paired plans: Q blocks hold both Q128 tiles of a CTA (16 tokens per
+    # tile at 8 Q heads per KV head, 64 at 2). 100 tokens leave the last
+    # CTA's second Q tile past the end of Q.
+    _Case(
+        "gqa8_fp16_dense_partial_empty_row_q128_kv128_paired",
+        2,
+        16,
+        100,
+        777,
+        64,
+        128,
+        torch.float16,
+        "dense",
+        "partial",
+        "static",
+        include_empty_row=True,
+        num_kv_heads=2,
+        expected_q_tile=128,
+        expected_kv_tile=128,
+        query_paired=True,
+    ),
+    _Case(
+        "gqa8_bf16_causal_full_persistent_q128_paired",
+        2,
+        16,
+        64,
+        1100,
+        32,
+        64,
+        torch.bfloat16,
+        "causal",
+        "full",
+        "persistent",
+        pattern="full_and_partial",
+        num_kv_heads=2,
+        expected_q_tile=128,
+        expected_kv_tile=128,
+        query_paired=True,
+    ),
+    _Case(
+        "gqa2_bf16_causal_static_q128_paired",
+        2,
+        4,
+        256,
+        1500,
+        128,
+        64,
+        torch.bfloat16,
+        "causal",
+        "none",
+        "static",
+        num_kv_heads=2,
+        expected_q_tile=128,
+        expected_kv_tile=128,
+        query_paired=True,
     ),
 )
 
@@ -2919,6 +2977,7 @@ def test_contiguous_launch_forwards_the_exact_compiled_adapter_abi() -> None:
         **values,
         kv_valid_bits_is_live=True,
         sm_scale=1.25,
+        bmm2_scale=0.5,
         paged_kv=None,
     )
 
@@ -2950,6 +3009,7 @@ def test_contiguous_launch_forwards_the_exact_compiled_adapter_abi() -> None:
             None,  # v_scale
             None,  # v_mean
             1.25,
+            0.5,  # bmm2_scale
         )
     ]
 
@@ -3043,6 +3103,12 @@ def test_paged_launch_forwards_caller_live_lengths_to_attention() -> None:
             {"num_qo_heads": 65_536, "num_kv_heads": 65_536},
             r"grid\.y.*num_kv_heads=65536",
             id="head-grid-limit",
+        ),
+        # Per-tensor E4M3 runs only dense plans.
+        pytest.param(
+            {"q_data_type": torch.float8_e4m3fn, "o_data_type": torch.bfloat16},
+            "matching Q, K/V, and output dtypes",
+            id="fp8-block-sparse",
         ),
     ),
 )
@@ -4467,10 +4533,12 @@ def test_public_block_sparse_gqa_correctness(
             use_kv_valid_bits=valid_bits is not None,
             mask_type=case.mask_type,
             q_data_type=case.dtype,
+            query_paired=case.query_paired,
         )
         policy = dict(wrapper._policy)
         assert policy["tile_size_q"] == case.expected_q_tile
         assert policy["tile_size_kv"] == case.expected_kv_tile
+        assert policy["query_paired"] is case.query_paired
         assert policy["use_persistent_scheduler"] == (case.scheduler == "persistent")
         if case.expected_parallel_loads is not None:
             assert (

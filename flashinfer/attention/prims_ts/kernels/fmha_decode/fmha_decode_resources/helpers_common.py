@@ -492,7 +492,9 @@ def _softmax_tile_idx(
     cfg: FmhaDecodeConfig, stage_info: StageInfo, inst_id: int
 ) -> Int32:
     """Tile index consumed by the softmax-side MMA loop (inst_id ∈ {0, 1})."""
-    return stage_info.loop_offset * Int32(cfg.num_insts_kv) + Int32(inst_id)
+    return stage_info.loop_offset * Int32(cfg.kv_tiles_per_loop) + Int32(
+        cfg.kv_inst_tile_offset(inst_id)
+    )
 
 
 @cute.jit
@@ -559,19 +561,30 @@ def _logical_q_group_idx(
     cfg: Constexpr[FmhaDecodeConfig],
     stage_info: StageInfo,
     fallback_q_group_idx: Int32,
+    inst_id: Constexpr[int] = 0,
 ) -> Int32:
-    """Resolve the q-group from the persistent work tile or static launch."""
+    """Resolve instance ``inst_id``'s q-group from the persistent work tile or static launch."""
     if cutlass.const_expr(cfg.has_single_q_cta):
         # A split coordinate may still vary in grid X, but every physical CTA
         # maps to logical Q group zero. State this explicitly because the
         # release compiler does not infer the range from the launch geometry.
-        return Int32(0)
+        return _instance_q_group_idx(cfg, Int32(0), inst_id)
     if cutlass.const_expr(stage_info.work_tile is not None):
         q_group_cta_idx = Int32(stage_info.work_tile.tile_idx[0])
         if cutlass.const_expr(cfg.use_split_kv):
             return q_group_cta_idx // Int32(cfg.splits_kv)
-        return q_group_cta_idx
-    return fallback_q_group_idx
+        return _instance_q_group_idx(cfg, q_group_cta_idx, inst_id)
+    return _instance_q_group_idx(cfg, fallback_q_group_idx, inst_id)
+
+
+@cute.jit
+def _instance_q_group_idx(
+    cfg: Constexpr[FmhaDecodeConfig], q_group_idx: Int32, inst_id: Constexpr[int]
+) -> Int32:
+    """Return instance ``inst_id``'s Q tile of a CTA's logical Q group."""
+    if cutlass.const_expr(cfg.q_groups_per_cta == 1):
+        return q_group_idx
+    return q_group_idx * Int32(cfg.q_groups_per_cta) + Int32(inst_id)
 
 
 @cute.jit
@@ -621,6 +634,12 @@ def _q_group_token_base(cfg: Constexpr[FmhaDecodeConfig], q_group_idx: Int32) ->
 
 
 @cute.jit
+def _q_cta_first_token(cfg: Constexpr[FmhaDecodeConfig], q_group_idx: Int32) -> Int32:
+    """Return the first Q token of a CTA's logical Q group, held by its first Q tile."""
+    return _q_group_token_base(cfg, _instance_q_group_idx(cfg, q_group_idx, 0))
+
+
+@cute.jit
 def _q_tile_valid_rows_for_seq(
     cfg: Constexpr[FmhaDecodeConfig],
     h_r: Int32,
@@ -645,10 +664,15 @@ def _q_tile_valid_rows_for_seq(
         token_idx = q_group_idx // head_ctas_per_token
         head_cta_idx = q_group_idx - token_idx * head_ctas_per_token
         head_base = head_cta_idx * Int32(cfg.tile_size_q)
-        return cute.math.min(
+        valid_rows = cute.math.min(
             cute.math.max(Int32(cfg.heads_q_per_kv) - head_base, Int32(0)),
             Int32(cfg.tile_size_q),
         )
+        if cutlass.const_expr(cfg.q_groups_per_cta > 1):
+            # The last CTA's later Q tiles can start past the sequence.
+            if token_idx >= seq_len_q:
+                valid_rows = Int32(0)
+        return valid_rows
     return cute.math.min(
         cute.math.max(
             h_r - q_group_idx * Int32(cfg.tile_size_q),

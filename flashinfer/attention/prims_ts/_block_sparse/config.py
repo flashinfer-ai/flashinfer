@@ -24,7 +24,11 @@ from flashinfer.utils import ceil_div
 
 from ..decode import _cutlass_dtype, _dtype_key, _validate_mask, _validate_positive_int
 from ..kernels.fmha_decode.fmha_decode_constants import SOFTMAX_RESCALE_THRESHOLD_LOG2
-from ..sage.config import SageAttentionConfig, validate_sage_recipe
+from ..sage.config import (
+    SageAttentionConfig,
+    sage_decode_config_fields,
+    validate_sage_recipe,
+)
 from .common import (
     _PREPARED_KV_ROUTE_SIZE,
     _SIGNED_INT32_MAX,
@@ -40,6 +44,13 @@ if TYPE_CHECKING:
 
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
+# Dense (Q, K, V, output) recipes beyond matching 16-bit dtypes: per-tensor
+# E4M3 Q/K/V with a 16-bit output, and BF16 Q/K with E4M3 V (QK-BF16/PV-FP8).
+# The run's sm_scale carries the Q and K scales and bmm2_scale the V scale.
+_DENSE_SCALED_RECIPES = frozenset(
+    [(torch.float8_e4m3fn,) * 3 + (out,) for out in _SUPPORTED_DTYPES]
+    + [(torch.bfloat16, torch.bfloat16, torch.float8_e4m3fn, torch.bfloat16)]
+)
 # KV128 is the general prepared-route geometry. The qualified Q64/D128
 # 16-bit profiles consume one native KV256 route for coarse KV blocks.
 _BLOCK_SPARSE_DEFAULT_KV_ROUTE_SIZE = _PREPARED_KV_ROUTE_SIZE
@@ -96,6 +107,7 @@ class _BlockSparseCompileKey:
     use_block_sparse: bool = True
     sage: SageAttentionConfig | None = None
     softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2
+    query_paired: bool = False
 
 
 @dataclass(frozen=True)
@@ -145,6 +157,8 @@ class _BlockSparseStaticProfile:
     sage: SageAttentionConfig | None = None
     use_block_sparse: bool = True
     softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2
+    # One CTA processes two consecutive Q128 tiles over one K/V stream.
+    query_paired: bool = False
 
 
 def _select_block_sparse_kv_route_size(
@@ -223,6 +237,7 @@ def _select_block_sparse_scheduler(
     use_kv_valid_bits: bool,
     max_row_route_capacity: int,
     use_block_sparse: bool,
+    query_paired: bool = False,
 ) -> tuple[int, bool]:
     """Select the Q tile and scheduler without depending on KV storage.
 
@@ -249,7 +264,7 @@ def _select_block_sparse_scheduler(
     }
     if not use_block_sparse:
         return q_tile_size, _select_persistent_launch(
-            seq_len_kv=seq_len_kv, **launch_args
+            seq_len_kv=seq_len_kv, query_paired=query_paired, **launch_args
         )
     if not _should_consider_clc(
         q_tile_size=q_tile_size,
@@ -272,6 +287,7 @@ def _select_block_sparse_scheduler(
         persistent_min_tiles_per_cta=(
             _CAUSAL_CLC_MIN_MAX_ROW_ROUTES if mask_type == "causal" else 1
         ),
+        query_paired=query_paired,
         **launch_args,
     )
 
@@ -286,13 +302,15 @@ def _select_persistent_launch(
     num_kv_heads: int,
     q_tile_size: int,
     kv_route_size: int,
-    persistent_min_waves: int = 1,
+    query_paired: bool = False,
+    persistent_min_waves: float = 1,
     persistent_min_tiles_per_cta: int = 1,
 ) -> bool:
     """Return whether the decode launch heuristic selects the CLC scheduler.
 
     ``seq_len_kv`` sizes each task. These plans never split K/V, so any other
-    outcome selects the static grid.
+    outcome selects the static grid. ``persistent_min_waves`` counts waves of
+    one-Q-tile tasks.
     """
 
     from ..kernels.fmha_decode.fmha_decode_config import (
@@ -305,12 +323,19 @@ def _select_persistent_launch(
         heads_q_per_kv=num_qo_heads // num_kv_heads,
         groups_tokens_heads_q=True,
     )
+    num_q_ctas = q_geometry.num_q_ctas(seq_len_q)
+    if query_paired:
+        # A paired CTA runs two Q tiles, so the threshold halves in paired
+        # CTAs, but not below one wave: a grid that fits on the device at
+        # once leaves the persistent scheduler nothing to balance.
+        num_q_ctas = ceil_div(num_q_ctas, 2)
+        persistent_min_waves = max(persistent_min_waves / 2, 1)
     with torch.cuda.device(device_index):
         mode = _select_auto_launch_mode(
             batch_size=batch_size,
             num_heads_kv=num_kv_heads,
             seq_len_kv=seq_len_kv,
-            num_q_tiles=q_geometry.num_q_ctas(seq_len_q),
+            num_q_tiles=num_q_ctas,
             tile_size_kv=kv_route_size,
             persistent_min_waves=persistent_min_waves,
             persistent_min_tiles_per_cta=persistent_min_tiles_per_cta,
@@ -370,18 +395,14 @@ def _validate_max_blocks_per_row(
     return max_blocks_per_row
 
 
-def _plan_dtype_key(dtype: torch.dtype) -> str:
-    """Return the compile-key name of a plan dtype; Int8 is a Sage Q/K dtype."""
-
-    return "int8" if dtype == torch.int8 else _dtype_key(dtype)
-
-
 def _resolve_plan_dtypes(
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype | None,
     v_dtype: torch.dtype | None,
     output_dtype: torch.dtype | None,
     sage: SageAttentionConfig | None,
+    *,
+    use_block_sparse: bool,
 ) -> tuple[torch.dtype, torch.dtype, torch.dtype, str]:
     """Return ``(kv_dtype, v_dtype, output_dtype, dtype_key)`` of one plan.
 
@@ -396,6 +417,11 @@ def _resolve_plan_dtypes(
     if sage is None:
         if output_dtype is None:
             output_dtype = q_dtype
+        if (
+            not use_block_sparse
+            and (q_dtype, kv_dtype, v_dtype, output_dtype) in _DENSE_SCALED_RECIPES
+        ):
+            return kv_dtype, v_dtype, output_dtype, _dtype_key(q_dtype)
         return (
             kv_dtype,
             v_dtype,
@@ -411,7 +437,7 @@ def _resolve_plan_dtypes(
         v_dtype=v_dtype,
         output_dtype=output_dtype,
     )
-    return kv_dtype, v_dtype, output_dtype, _plan_dtype_key(q_dtype)
+    return kv_dtype, v_dtype, output_dtype, _dtype_key(q_dtype)
 
 
 def _validate_block_sparse_static_profile(
@@ -436,11 +462,14 @@ def _validate_block_sparse_static_profile(
     sage: SageAttentionConfig | None = None,
     use_block_sparse: bool = True,
     softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
+    query_paired: bool = False,
 ) -> _BlockSparseStaticProfile:
     """Validate static policy before any device work or BSR inspection."""
 
     if not isinstance(share_pattern_across_kv_heads, bool):
         raise TypeError("share_pattern_across_kv_heads must be a bool")
+    if not isinstance(query_paired, bool):
+        raise TypeError("query_paired must be a bool")
     batch_size = _validate_positive_int(batch_size, "batch_size")
     seq_len_q = _validate_positive_int(seq_len_q, "seq_len_q")
     seq_len_kv = _validate_positive_int(seq_len_kv, "seq_len_kv")
@@ -491,7 +520,12 @@ def _validate_block_sparse_static_profile(
     if mask_type == "causal" and seq_len_q > seq_len_kv:
         raise ValueError("causal block-sparse requires seq_len_q <= seq_len_kv")
     kv_dtype, v_dtype, output_dtype, dtype_key = _resolve_plan_dtypes(
-        q_dtype, kv_dtype, v_dtype, output_dtype, sage
+        q_dtype,
+        kv_dtype,
+        v_dtype,
+        output_dtype,
+        sage,
+        use_block_sparse=use_block_sparse,
     )
     kv_route_size = _select_block_sparse_kv_route_size(
         q_tile_size=q_tile_size,
@@ -508,6 +542,20 @@ def _validate_block_sparse_static_profile(
             route_metadata_capacity=0,
             num_rows=1,
         )
+    if query_paired:
+        if q_tile_size != 128:
+            raise NotImplementedError(
+                "query_paired requires a Q128 tile: q_block_size * Hq/Hkv of at "
+                f"least 128; got Q{q_tile_size}"
+            )
+        # Both Q tiles of a paired CTA read one route list.
+        paired_rows = q_block_size * (num_qo_heads // num_kv_heads)
+        if use_block_sparse and paired_rows % 256:
+            raise NotImplementedError(
+                "query_paired with block-sparse routes requires q_block_size * "
+                "Hq/Hkv to be a multiple of 256, so both Q tiles of a CTA share "
+                f"one Q block; got {paired_rows}"
+            )
     return _BlockSparseStaticProfile(
         batch_size=batch_size,
         seq_len_q=seq_len_q,
@@ -520,8 +568,8 @@ def _validate_block_sparse_static_profile(
         q_tile_size=q_tile_size,
         kv_route_size=kv_route_size,
         dtype_key=dtype_key,
-        out_dtype_key=_plan_dtype_key(output_dtype),
-        v_dtype_key=_plan_dtype_key(v_dtype),
+        out_dtype_key=_dtype_key(output_dtype),
+        v_dtype_key=_dtype_key(v_dtype),
         q_dtype=q_dtype,
         kv_dtype=kv_dtype,
         v_dtype=v_dtype,
@@ -534,6 +582,7 @@ def _validate_block_sparse_static_profile(
         sage=sage,
         use_block_sparse=use_block_sparse,
         softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+        query_paired=query_paired,
     )
 
 
@@ -562,6 +611,7 @@ def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig"
         "groups_tokens_heads_q": True,
         "use_block_sparse": key.use_block_sparse,
         "softmax_rescale_threshold_log2": key.softmax_rescale_threshold_log2,
+        "query_paired": key.query_paired,
     }
     if key.use_block_sparse:
         config_args.update(
@@ -579,16 +629,7 @@ def _make_block_sparse_config(key: _BlockSparseCompileKey) -> "FmhaDecodeConfig"
         config_args["use_persistent_scheduler"] = True
     if key.sage is not None:
         config_args.update(
-            {
-                "sage_q_block_size": key.sage.q_block_size,
-                "sage_k_block_size": key.sage.k_block_size,
-                "sage_k_summary_block_size": (
-                    key.sage.k_summary_block_size
-                    if key.use_proxy_routes
-                    else key.sage.k_block_size
-                ),
-                "sage_v_mean": key.sage.v_mean,
-            }
+            sage_decode_config_fields(key.sage, use_proxy_routes=key.use_proxy_routes)
         )
     layout_args: dict[str, object]
     if key.page_size is None:
@@ -645,6 +686,7 @@ def _resolve_block_sparse_launch_spec(
     v_dtype_key: str,
     sage: SageAttentionConfig | None = None,
     softmax_rescale_threshold_log2: float = SOFTMAX_RESCALE_THRESHOLD_LOG2,
+    query_paired: bool = False,
 ) -> _BlockSparseLaunchSpec:
     """Resolve and cache one validated static or CLC launch.
 
@@ -669,6 +711,7 @@ def _resolve_block_sparse_launch_spec(
         use_kv_valid_bits=use_kv_valid_bits,
         max_row_route_capacity=max_row_route_capacity,
         use_block_sparse=use_block_sparse,
+        query_paired=query_paired,
     )
     if not use_block_sparse:
         _validate_dense_contiguous_kv_extent(
@@ -710,6 +753,7 @@ def _resolve_block_sparse_launch_spec(
         v_dtype_key=v_dtype_key,
         sage=sage,
         softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
+        query_paired=query_paired,
     )
     try:
         config = _make_block_sparse_config(compile_key)
@@ -753,6 +797,7 @@ def _resolve_block_sparse_launch_spec(
                 "use_parallel_sparse_kv_loads",
                 compile_key.use_parallel_sparse_kv_loads,
             ),
+            ("query_paired", compile_key.query_paired),
         )
     )
     return _BlockSparseLaunchSpec(

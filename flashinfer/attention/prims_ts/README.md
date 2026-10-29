@@ -331,7 +331,17 @@ the whole contiguous K/V sequence with the same Q-tile selection. A dense plan
 owns no route workspace, and its `run` takes Q/K/V only, plus `sage=` for a
 Sage plan. A dense plan may omit `q_block_size` and `kv_block_size`; each then
 defaults to 128, which selects the Q128/KV128 tile. Block-sparse plans require
-both.
+both. A dense Q128 plan also takes per-tensor `torch.float8_e4m3fn` Q/K/V with
+a 16-bit output, and `torch.bfloat16` Q/K with `torch.float8_e4m3fn` V and a
+`torch.bfloat16` output (QK-BF16/PV-FP8): `run` takes the Q and K scales in
+`sm_scale` and the V scale in `bmm2_scale`, which scales the output.
+
+A Q128 plan (`head_dim=128`, `q_block_size * Hq / Hkv >= 128`) accepts
+`query_paired=True`: each CTA then runs two consecutive Q128 tiles of one
+sequence and KV head over a single K/V stream; see
+[Query pairing](kernels/fmha_decode/README.md#query-pairing). A block-sparse
+plan pairs when `q_block_size * Hq / Hkv` is a multiple of 256, so both Q
+tiles of a CTA read one route list.
 
 Every plan takes `softmax_rescale_threshold_log2` (0 to 8, default 8). On the
 Q64/KV256 and Q128/KV128 tiles of dense and block-sparse plans, a row keeps its
@@ -342,11 +352,14 @@ new maximum.
 ## Sage attention
 
 Sage attention runs attention on 8-bit Q, K and V with dequantization scales
-on two kernels: the contiguous decode kernel, in the dense and block-sparse
-modes of `BlockSparseTSWrapper` and `block_sparse_attention`, and the
-contiguous context kernel, on dense fixed-length plans of
-`BatchPrefillTSWrapper`. The plan fixes the recipe with a
-`SageAttentionConfig` (`sage_config=` for the block-sparse APIs, `sage=` for
+on two kernels: the decode kernel, in the dense and block-sparse modes of
+`BlockSparseTSWrapper` and `block_sparse_attention` over contiguous K/V and
+in the paged decode APIs (`BatchDecodePagedTSWrapper`,
+`batch_decode_with_paged_kv_cache`,
+`prepare_prims_ts_batch_decode_with_kv_cache`), and the contiguous context
+kernel, on dense fixed-length plans of `BatchPrefillTSWrapper`. The plan
+fixes the recipe with a `SageAttentionConfig` (`sage_config=` for the
+block-sparse and paged decode APIs, `sage=` for
 `BatchPrefillTSWrapper.plan`); every run supplies the scales as
 `sage=SageAttentionParams(...)`:
 
@@ -393,6 +406,11 @@ use the trtllm-gen flat layout: within one head, sequence `b` of
 | `v_mean` | `[B, Hkv, D]`; exactly when the recipe sets `v_mean=True` |
 | `k_summary_scale` | `[Hkv, sage_flat_scale_numel(B, ceil(Skv / kv_block_size), k_summary_block_size)]`; exactly for proxy plans |
 
+A paged decode plan keeps this layout with its capacities: `Skv` is the
+plan's `max_kv_len` and `Sq` its `max_seq_len_q`, also for packed Q. Slots
+past a request's K/V or Q length are never read, and the one-shot call
+requires an explicit `max_kv_len`.
+
 With proxy routes, `k_summary` holds the per-block K means in the K dtype,
 quantized as one more K sequence of `ceil(Skv / kv_block_size)` tokens with
 `k_summary_block_size`; `k_summary_scale` holds its scales. `v_summary` holds
@@ -417,13 +435,13 @@ the scores in place in the max pass, which costs more per score.
 
 | | Decode kernel | Context kernel |
 | --- | --- | --- |
-| APIs | `BlockSparseTSWrapper`, `block_sparse_attention` | `BatchPrefillTSWrapper` |
-| K/V storage | Contiguous; the paged block-sparse APIs do not support Sage | Contiguous fixed-length `[B, S, H, D]` (`packed=False`) |
-| Geometry | `head_dim=128`; a Q64/KV256 or Q128/KV128 Keeps tile, which needs a `kv_block_size` multiple of 64 and at least 64 grouped Q rows (`q_block_size * Hq / Hkv`) | `head_dim=128`; 128-token Q tiles of one Q head |
-| Masks and routes | Dense and causal masks; exact and proxy block-sparse routes (BSR or bitmask) | `mask_type="dense"` and `window_left=-1`; no routes, so `k_summary_block_size` is unused |
+| APIs | `BlockSparseTSWrapper`, `block_sparse_attention`; paged decode | `BatchPrefillTSWrapper` |
+| K/V storage | Contiguous, or paged in the paged decode APIs; the paged block-sparse APIs do not support Sage | Contiguous fixed-length `[B, S, H, D]` (`packed=False`) |
+| Geometry | `head_dim=128`; a Q64/KV256 or Q128/KV128 Keeps tile, which needs a `kv_block_size` multiple of 64 and at least 64 grouped Q rows (`q_block_size * Hq / Hkv`). Paged decode runs the grouped Q128/KV128 tile, paired as its `query_paired` selects | `head_dim=128`; 128-token Q tiles of one Q head |
+| Masks and routes | Dense and causal masks; exact and proxy block-sparse routes (BSR or bitmask). Paged decode adds causal sliding windows and fixed or packed Q | `mask_type="dense"` and `window_left=-1`; no routes, so `k_summary_block_size` is unused |
 | Split-KV | Rejected: only the direct output store applies `sfV` and `v_mean` | No split-KV launch |
 | K transport | `SMEM` for every K block size: the load warp stages each K tile's scales in shared memory | `GMEM` for 4-token and coarser blocks: the softmax loads them from global memory before the score wait; `SMEM` for 1-token blocks |
-| Score scaling | `DEQUANTIZED` on dense Q128/KV128 tiles, whose score row stays in registers; on Q64/KV256 tiles and block-sparse routes, `BLOCK` for 4-token and coarser blocks and `DEQUANTIZED` for 1-token blocks | `BLOCK` per 16-column block for 16-token and coarser blocks; `DEQUANTIZED` for 4- and 1-token blocks |
+| Score scaling | `BLOCK` for 16-token and coarser blocks, and for 4-token blocks on Q64/KV256 tiles and block-sparse routes; `DEQUANTIZED` for 1-token blocks, and for 4-token blocks on dense Q128/KV128 tiles, which keep the score row and its words in registers | `BLOCK` per 16-column block for 16-token and coarser blocks; `DEQUANTIZED` for 4- and 1-token blocks |
 | P scale `C` | `448 * 2**-h`, with `h` the plan's `softmax_rescale_threshold_log2` (default 8) | 1: the lazy correction lets `p` reach `2**8` |
 
 Masks and scheduling otherwise follow each kernel's 16-bit plans. In the
@@ -656,6 +674,7 @@ pytest -q \
   tests/attention/test_attention_ts_block_sparse.py \
   tests/attention/test_attention_ts_features.py \
   tests/attention/test_attention_ts_mla_decode.py \
+  tests/attention/test_attention_ts_query_paired.py \
   tests/attention/test_attention_ts_sage.py \
   tests/attention/test_attention_ts_context_sage.py \
   tests/attention/test_attention_ts_vc.py

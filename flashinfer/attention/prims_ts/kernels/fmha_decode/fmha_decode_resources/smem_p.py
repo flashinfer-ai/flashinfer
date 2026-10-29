@@ -791,9 +791,9 @@ class SmemPResource(DecodeGenResourceBase):
         gives paired lanes the low/high 64-column halves of one row. Each lane
         writes disjoint packed blocks into the TMEM or SMEM layout consumed by
         BMM2. Streamed profiles, including every block-sparse Keeps profile,
-        produce P through the rolled fragment loop instead. A Sage row arrives
-        dequantized without ``sfQ`` (``TmemSResource._dequantize_sage_keeps_row``),
-        so its exponent multiplier is ``c * sfQ``.
+        produce P through the rolled fragment loop instead. A Sage row's
+        exponent multiplier is ``c * sfQ``; a block-scaled row's raw scores also
+        take each group's ``sfK`` word (``TmemSResource._sage_row_words``).
         """
         cfg = self.cfg
         # Every block-sparse Keeps profile streams P; only dense complete rows
@@ -819,6 +819,15 @@ class SmemPResource(DecodeGenResourceBase):
         exp_scale = self.scale_softmax_log2
         if cutlass.const_expr(cfg.use_sage_attention):
             exp_scale = self.scale_softmax_log2 * sage_q_scale
+        block_scaled: Constexpr[bool] = cfg.keeps_sage_row_words
+        chunk_regs: Constexpr[int] = cfg.keeps_score_chunk_regs
+        groups: Constexpr[int] = cfg.sage_k_groups_per_fragment()
+        group_multipliers = None
+        group_addends = None
+        if cutlass.const_expr(block_scaled):
+            # Sage V is E4M3, so the FP8 P branch is the only one that scales,
+            # and one ``sfK`` group covers each 16-value vector block.
+            assert cfg.use_fp8_pv and (chunk_regs // groups) % vector_elements == 0
 
         # Preserve four independent modulo-4 sum chains as two packed pairs,
         # without keeping a second 16-value P array live beside the S row.
@@ -831,7 +840,30 @@ class SmemPResource(DecodeGenResourceBase):
         for block_idx in cutlass.range_constexpr(num_vector_blocks):
             s_base = block_idx * vector_elements
             packed_base = block_idx * 4 if cfg.uses_two_inst_tmem_p else 0
+            if cutlass.const_expr(block_scaled and s_base % chunk_regs == 0):
+                # The K32 chunk's ``c * sfQ * sfK_g`` from the max pass's words.
+                chunk_words = cutlass.Array(
+                    Float32, groups, space=cutlass.AddressSpace.rmem
+                )
+                for group_idx in cutlass.range_constexpr(groups):
+                    chunk_words[group_idx] = (
+                        self.tmem_s_ref.load_sage_row_word(
+                            s_base // chunk_regs * groups + group_idx
+                        )
+                        * exp_scale
+                    )
+                group_multipliers, group_addends = self._fragment_exponent_terms(
+                    chunk_words, exponent_addend, groups=groups
+                )
             if cutlass.const_expr(cfg.use_fp8_pv):
+                multipliers = (exp_scale, exp_scale)
+                addends = (exponent_addend, exponent_addend)
+                if cutlass.const_expr(block_scaled):
+                    group: Constexpr[int] = (
+                        s_base % chunk_regs // (chunk_regs // groups)
+                    )
+                    multipliers = (Float32(group_multipliers[group]),) * 2
+                    addends = (Float32(group_addends[group]),) * 2
                 for packed_idx in cutlass.range_constexpr(4):
                     val_base = packed_idx * 4
                     scaled_pair_01 = ffma2(
@@ -839,8 +871,8 @@ class SmemPResource(DecodeGenResourceBase):
                             s_arr[s_base + val_base],
                             s_arr[s_base + val_base + 1],
                         ),
-                        (exp_scale, exp_scale),
-                        (exponent_addend, exponent_addend),
+                        multipliers,
+                        addends,
                     )
                     p_pair_01 = (
                         cute.math.exp2(scaled_pair_01[0], fastmath=True),
@@ -852,8 +884,8 @@ class SmemPResource(DecodeGenResourceBase):
                             s_arr[s_base + val_base + 2],
                             s_arr[s_base + val_base + 3],
                         ),
-                        (exp_scale, exp_scale),
-                        (exponent_addend, exponent_addend),
+                        multipliers,
+                        addends,
                     )
                     p_pair_23 = (
                         cute.math.exp2(scaled_pair_23[0], fastmath=True),
@@ -1461,7 +1493,7 @@ class SmemPResource(DecodeGenResourceBase):
         s_arr: cutlass.Array,
         sage_q_scale: Float32,
     ) -> None:
-        """Compute a complete-row Sage P tile from the max pass's dequantized row."""
+        """Compute a complete-row Sage P tile from the max pass's row and words."""
 
         assert self.cfg.use_sage_attention and self.cfg.stages_q128_p_in_smem
         self._compute_keeps_p(
