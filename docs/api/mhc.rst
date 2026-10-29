@@ -29,9 +29,10 @@ external branch. The caller holds the workspaces:
 and ``cake_mhc_train_backward_workspace_bytes`` /
 ``cake_mhc_train_backward_workspace`` size and allocate a zero-initialized
 buffer that serves every token count up to ``T``,
-``cake_mhc_train_reset_workspace`` returns one to its first-use state after an
-interrupted launch, and ``is_cake_mhc_train_supported`` reports whether a
-device has every exported route.
+``cake_mhc_train_reset_workspace`` returns such a caller-owned buffer to its
+first-use state after an interrupted launch or capture, and
+``is_cake_mhc_train_supported`` reports whether a device has every exported
+route.
 
 CUDA graphs: one training iteration -- the direct entry points, or
 ``cake_mhc_train_prepare`` / ``cake_mhc_train_finish`` around the external
@@ -45,8 +46,10 @@ exist before the capture starts. The launches go to the current stream, so they
 follow the capture stream. Use the same workspaces (caller-owned, or the
 defaults) for the warm-up, the capture and the replays, at the token count the
 graph was captured with. Every launch leaves the ticket words of its workspace
-at zero, so a replay needs no host-side reset; after an interrupted launch or
-capture, ``cake_mhc_train_reset_workspace`` restores the workspace.
+at zero, so a replay needs no host-side reset.
+``cake_mhc_train_reset_workspace`` restores a caller-owned workspace after an
+interrupted launch or capture; callers that need this recovery pass their own
+workspaces.
 
 .. currentmodule:: flashinfer.cake_mhc_train
 

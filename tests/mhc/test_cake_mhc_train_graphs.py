@@ -30,12 +30,14 @@ the per-device default workspaces exist before the capture), in three forms:
   (``preserve_rng_state=False``: the layer draws no random numbers);
 
 and the autograd / checkpointed layer through
-``torch.cuda.make_graphed_callables``.  Each form runs with the default
-workspaces and with caller-owned workspaces.  Three replays, each after the
-static outputs and gradients were overwritten with 0xFF bytes, give every
+``torch.cuda.make_graphed_callables``.  The captured forms run with the
+default workspaces and with caller-owned workspaces.  Three replays, each after
+the static outputs and gradients were overwritten with 0xFF bytes, give every
 output and gradient bitwise equal to the eager iteration on the same inputs
 (the units' ticket words reset themselves at the end of every launch, so a
-replay needs no host-side reset).
+replay needs no host-side reset).  The graphed callables get new input values
+on each of three calls, each compared bitwise with an eager call on the same
+values.
 """
 
 from __future__ import annotations
@@ -273,19 +275,20 @@ def test_make_graphed_callables(T: int, save_stats: bool, ckpt: bool) -> None:
 
     else:
         fwd = layer
-    dY = i["dY"].float()
 
-    def run(f) -> dict:
-        leaves = _leaves(i)
+    def run(f, inp: dict) -> dict:
+        leaves = _leaves(inp)
         Y = f(*leaves)
-        (Y.float() * dY).sum().backward()
+        (Y.float() * inp["dY"].float()).sum().backward()
         return _snapshot({"Y": Y, **_grads(leaves)})
 
-    ref = run(fwd)
     graphed = torch.cuda.make_graphed_callables(
         fwd, tuple(_leaves(i)), num_warmup_iters=3
     )
     for r in range(REPLAYS):
-        _assert_bitwise(
-            ref, run(graphed), f"make_graphed_callables ckpt={ckpt} T={T} call {r}"
-        )
+        # New values of the same shapes on every call: a call whose graphs did
+        # not replay would return the previous call's outputs and fail.
+        ir = _inputs(T, seed=7246 + T + 1000 * (r + 1))
+        ref = run(fwd, ir)
+        got = run(graphed, ir)
+        _assert_bitwise(ref, got, f"make_graphed_callables ckpt={ckpt} T={T} call {r}")
