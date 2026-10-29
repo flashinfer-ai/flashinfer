@@ -231,10 +231,13 @@ class MlaConfig(Nvfp4KVConfig):
         return self.num_tokens_per_page == 1 and self.rope_dim == 0
 
     @property
-    def sparse_d576(self) -> bool:
-        """D576 sparse MLA (DSA): one token row per index (page size one) with
-        a separate 64-wide RoPE tail; each query token is one batch row whose
-        K domain arrives through ``cache_seqs``."""
+    def sparse_d576_reload(self) -> bool:
+        """Use the native FP8 q64 loader that releases K before reloading V.
+
+        Retained native tiles and packed caches share D576 geometry but own
+        different descriptors, coordinate caches and output finalization.
+        The existing format and pipeline traits identify this reload schedule.
+        """
         return (
             self.num_tokens_per_page == 1
             and self.rope_dim == 64
@@ -853,10 +856,10 @@ def keeps_mma_ab_config_kwargs(
         # warp 9 pads.  Register budget for 16 warps: 4x168 + 4x160 + 8x80 =
         # 62464 <= 65536.  QK(t + 1) is issued before PV(t) and V is gathered
         # again from L2 (trtllm-gen's order): softmax(t) overlaps QK(t + 1).
-        # Keeping V resident instead (sparse_reuse_kv) forces PV(t) before
-        # QK(t + 1), which serializes softmax and QK (this order is 25 %
-        # faster at 1024 L2-hot tokens and 6 % at 148).  One CTA runs one
-        # work tile, so a single Q stage suffices and its second 36 KB pays
+        # Retained K/V schedules can also issue QK(t + 1) before PV(t), but
+        # retain the current tile's stages through its V use. Releasing K
+        # early here changes stage availability for the next prefetch.
+        # One CTA runs one work tile, so a single Q stage suffices and its second 36 KB pays
         # for two more KV stages.
         kwargs.update(
             {
@@ -1626,8 +1629,14 @@ def make_throughput_latency_mla_config(
     explicit_persistent: bool | None = None,
     mask_type: MaskType | str = MaskType.CAUSAL,
     softmax_rescale_threshold_log2: float = 0.0,
+    sparse_profile=None,
 ) -> MlaConfig:
-    """Return throughput-latency 1CTA MLA traits for a concrete profile."""
+    """Return throughput-latency 1CTA MLA traits for a concrete profile.
+
+    ``sparse_profile`` is the already-selected general sparse pipeline. Its
+    presence excludes native D576 reload defaults; it adds no independent
+    tuning or compile-time choice.
+    """
 
     mask_type = normalize_mask_type(mask_type)
 
@@ -1657,7 +1666,12 @@ def make_throughput_latency_mla_config(
         raise ValueError("latent_dim must be positive")
     if rope_dim < 0:
         raise ValueError("rope_dim must be non-negative")
-    sparse_d576 = num_tokens_per_page == 1 and rope_dim == 64 and qkv_dtype == "e4m3"
+    sparse_d576 = (
+        num_tokens_per_page == 1
+        and rope_dim == 64
+        and qkv_dtype == "e4m3"
+        and sparse_profile is None
+    )
     if num_tokens_per_page not in SUPPORTED_MLA_PAGE_SIZES and not (
         num_tokens_per_page == 1 and rope_dim in (0, 64)
     ):

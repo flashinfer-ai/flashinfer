@@ -55,7 +55,10 @@ from .decode import (
 )
 
 
-from .kernels.mla_decode.sparse_policy import select_sparse_mla_profile
+from .kernels.mla_decode.sparse_policy import (
+    prefer_sparse_d576_reload,
+    select_sparse_mla_profile,
+)
 
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 2"
 _MLA_LATENT_DIM = 512
@@ -2246,6 +2249,7 @@ def _resolve_sparse_mla_plan(
     out_scale_format="ue8m0",
     num_output_groups=None,
     tuning=None,
+    kv_lora_rank=512,
 ):
     """Resolve sparse geometry and scratch sizing without allocation/compilation."""
     import cutlass
@@ -2263,6 +2267,8 @@ def _resolve_sparse_mla_plan(
         MlaDecodeTs,
     )
 
+    if isinstance(kv_lora_rank, bool) or kv_lora_rank != 512:
+        raise ValueError("sparse MLA requires kv_lora_rank=512")
     if not isinstance(assume_valid_prefix, bool):
         raise TypeError("assume_valid_prefix must be bool")
     device, _ = _resolve_cuda_device(device)
@@ -2325,6 +2331,36 @@ def _resolve_sparse_mla_plan(
         rope_dim=qk_rope_head_dim,
         kv_cache_format=kv_cache_format,
     )
+    # Reloading V from L2 shortens native FP8 decode's producer lifetime.
+    # Sustained grids amortize the retained-KV/CLC pipeline instead; packed
+    # caches and two-source/sink plans retain their format-specific schedules.
+    if (
+        qk_rope_head_dim == 64
+        and kv_cache_format == "native"
+        and q_data_type == torch.float8_e4m3fn
+        and num_heads in _D576_HEADS
+        and not max_extra_topk
+        and not has_sinks
+        and prefer_sparse_d576_reload(
+            rows=max_rows,
+            heads=num_heads,
+            query_length=max_seq_len_q,
+            capacity=max_topk,
+            sm_count=sm_count,
+            general_profile=profile,
+        )
+    ):
+        return resolve_sparse_d576_reload_plan(
+            device,
+            max_rows,
+            num_heads,
+            max_topk=max_topk,
+            max_extra_topk=max_extra_topk,
+            q_data_type=q_data_type,
+            has_sinks=has_sinks,
+            assume_valid_prefix=assume_valid_prefix,
+            threshold=softmax_rescale_threshold_log2,
+        )
     kernel_threshold = 0.0
     if softmax_rescale_threshold_log2 is not None:
         # An explicit threshold replaces the schedule's fixed six-binade
@@ -2429,6 +2465,171 @@ def _resolve_sparse_mla_plan(
     return device, profile, spec, sections, byte_end, capacity, output_quant
 
 
+_D576_HEAD_DIM = 576
+
+
+_D576_V_DIM = 512
+
+
+_D576_HEADS = (64, 128)
+
+
+def _sparse_d576_workspace_bytes(max_rows: int, num_heads: int, split_kv: int) -> int:
+    """Split-KV partials of a D576 plan: BF16 O and FP32 LSE per split row."""
+    if split_kv <= 1:
+        return 0
+    return max_rows * num_heads * split_kv * (_D576_V_DIM * 2 + 4)
+
+
+def resolve_sparse_d576_reload_plan(
+    device,
+    max_rows,
+    num_heads,
+    *,
+    max_topk,
+    max_extra_topk,
+    q_data_type,
+    has_sinks,
+    assume_valid_prefix,
+    threshold,
+):
+    """Plan the native D576 reload schedule and its split-KV scratch.
+
+    One CTA per (token, 64 heads) on the 1CTA keeps-MMA-AB q64 schedule; 128
+    heads run as two physical query positions of one token. The kernel is
+    compiled for the top-k capacity rounded up to whole 128-key tiles (it uses
+    the capacity only through its tile count). Below one wave the plan splits
+    each top-k list over ``split_kv`` CTAs (and the 512 V columns over
+    ``head_dim_ctas``); the parallel GMEM reducer, launched with PDL, merges
+    the partials and publishes natural-log LSE. The split is fixed per plan,
+    so a CUDA graph captured from it uses one compiled kernel.
+    """
+    import cutlass
+
+    from ._hardware import get_max_active_clusters
+    from .kernels.mla_decode.sparse_policy import (
+        SparseMlaProfile,
+        select_sparse_mla_d576_split,
+    )
+    from .kernels.mla_decode.throughput_latency_1cta.config import MlaProfile
+    from .kernels.mla_decode.throughput_latency_1cta.kernel import (
+        ThroughputLatencyMlaDecodeTs,
+    )
+
+    if q_data_type != torch.float8_e4m3fn:
+        raise ValueError("D576 sparse MLA (qk_rope_head_dim=64) requires E4M3 Q / KV")
+    if num_heads not in _D576_HEADS:
+        raise ValueError(
+            f"D576 sparse MLA supports 64 or 128 query heads (64-row tiles), got {num_heads}"
+        )
+    if max_extra_topk:
+        raise ValueError("D576 sparse MLA attends to one KV pool (max_extra_topk=0)")
+    if has_sinks:
+        raise ValueError("D576 sparse MLA does not support attention sinks")
+    if max_rows > 65535:
+        # Each query token is one grid-z slice of the attention and reducer
+        # launches; CUDA caps grid z at 65535.
+        raise ValueError(
+            "D576 sparse MLA supports at most 65535 query tokens per plan "
+            f"(batch_size * max_seq_len_q), got {max_rows}"
+        )
+    split_kv, head_dim_ctas = select_sparse_mla_d576_split(
+        max_rows * (num_heads // 64),
+        max_topk,
+        torch.cuda.get_device_properties(device).multi_processor_count,
+    )
+    profile = SparseMlaProfile(
+        family="keep",
+        tile_size_q=64,
+        split_kv=split_kv,
+        head_dim_ctas=head_dim_ctas,
+        uniform_offset_cache=True,
+        kv_pipeline_stages=10,
+    )
+    capacity = -(-max_topk // 128) * 128
+    phys_sq = num_heads // 64
+    kernel_profile = "h64_keeps_mma_ab"
+    if split_kv > 1:
+        hdim = "" if head_dim_ctas == 1 else f"_hdim{_D576_V_DIM // head_dim_ctas}"
+        kernel_profile = MlaProfile(
+            name=f"h64_keeps_mma_ab_splitkv{split_kv}{hdim}_gmem",
+            num_ctas_per_seq_kv=split_kv,
+            num_ctas_per_head_dim=head_dim_ctas,
+            use_persistent_scheduler=0,
+            use_clc_dynamic_persistent_scheduler=0,
+            use_multi_ctas_kv=1,
+            use_cluster_reduction=0,
+            kernel_variant="keeps_mma_ab",
+            tile_size_q=64,
+        )
+    with torch.cuda.device(device):
+        max_active_clusters = get_max_active_clusters(1)
+    kernel = ThroughputLatencyMlaDecodeTs(
+        batch_size=1,
+        num_heads=64,
+        seq_len_q=phys_sq,
+        seq_len_k=capacity,
+        latent_dim=512,
+        rope_dim=64,
+        page_size=1,
+        max_active_clusters=max_active_clusters,
+        acc_dtype=cutlass.Float32,
+        lse_dtype=cutlass.Float32,
+        qkv_dtype="e4m3",
+        out_dtype="bf16",
+        profile=kernel_profile,
+        reduction_mode=None if split_kv == 1 else "gmem_separate",
+        logical_num_heads=num_heads,
+        logical_seq_len_q=1,
+        tile_size_q=64,
+        explicit_split_kv=None,
+        explicit_persistent=None,
+        mask_type="dense",
+        softmax_rescale_threshold_log2=0.0 if threshold is None else threshold,
+    )
+    cfg = kernel._make_config()
+    if (
+        int(cfg.num_ctas_per_seq_kv) != split_kv
+        or int(cfg.num_ctas_per_head_dim) != head_dim_ctas
+        or int(cfg.use_cluster_reduction) != 0
+    ):
+        raise NotImplementedError(
+            f"D576 sparse MLA expects {split_kv} KV CTAs, {head_dim_ctas} V "
+            f"CTAs and GMEM reduction; got {cfg.num_ctas_per_seq_kv}, "
+            f"{cfg.num_ctas_per_head_dim}, cluster={cfg.use_cluster_reduction}"
+        )
+    if split_kv > 1 and not kernel.use_parallel_reduction:
+        # Only the parallel GMEM reducer publishes the D576 natural-log LSE.
+        raise NotImplementedError("D576 split-KV requires the parallel GMEM reducer")
+    spec = _MLADecodeCompileSpec(
+        device_index=device.index,
+        kernel_signature=_mla_kernel_compile_signature(kernel),
+        num_heads=64,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        page_size=1,
+        q_dtype_key="float8_e4m3fn",
+        output_dtype_key="bfloat16",
+        max_seq_len_q=phys_sq,
+        packed_query=False,
+        has_kernel_workspace=split_kv > 1,
+        split_kv=split_kv,
+        kernel=kernel,
+    )
+    sections = {}
+    byte_end = 0
+    for name, shape, dtype in (
+        (
+            "core",
+            (_sparse_d576_workspace_bytes(max_rows, num_heads, split_kv),),
+            torch.int8,
+        ),
+        ("public_lse", (max_rows, num_heads), torch.float32),
+    ):
+        sections[name], byte_end = _append_workspace_section(byte_end, shape, dtype)
+    return device, profile, spec, sections, byte_end, capacity, None
+
+
 class BatchSparseMLADecodePagedTSWrapper:
     """Plan native BF16/E4M3 attention, then bind one or two source index lists.
 
@@ -2502,6 +2703,7 @@ class BatchSparseMLADecodePagedTSWrapper:
         out_scale_format="ue8m0",
         num_output_groups=None,
         tuning=None,
+        kv_lora_rank=512,
     ):
         """Plan D512/D576 attention over one primary and an optional extra pool.
 
@@ -2601,9 +2803,13 @@ class BatchSparseMLADecodePagedTSWrapper:
                 out_scale_format=out_scale_format,
                 num_output_groups=num_output_groups,
                 tuning=tuning,
+                kv_lora_rank=kv_lora_rank,
             )
         )
         kernel = spec.kernel
+        reload_d576 = (
+            profile.family == "keep" and kernel._make_config().sparse_d576_reload
+        )
         family = profile.family
         splits = profile.split_kv
         max_rows = batch_size * max_seq_len_q
@@ -2617,21 +2823,25 @@ class BatchSparseMLADecodePagedTSWrapper:
         }
         # Finalize the joint distribution in the main kernel or its existing
         # split-KV reducer. No per-source outputs or finishing launch are needed.
-        kernel = copy.copy(kernel)
-        kernel.output_quant = output_quant
-        kernel.assume_valid_prefix = assume_valid_prefix
-        if family == "2cta":
-            kernel.fuse_sparse_epilogue = splits == 1
-            kernel.fuse_sparse_reduction = splits > 1
-        else:
-            kernel.finalize_output = True
-        kernel.direct_sparse = True
-        kernel.direct_sparse_capacities = (max_topk, max_extra_topk)
-        spec = replace(
-            spec, kernel=kernel, kernel_signature=_mla_kernel_compile_signature(kernel)
-        )
+        if not reload_d576:
+            kernel = copy.copy(kernel)
+            kernel.output_quant = output_quant
+            kernel.assume_valid_prefix = assume_valid_prefix
+            if family == "2cta":
+                kernel.fuse_sparse_epilogue = splits == 1
+                kernel.fuse_sparse_reduction = splits > 1
+            else:
+                kernel.finalize_output = True
+            kernel.direct_sparse = True
+            kernel.direct_sparse_capacities = (max_topk, max_extra_topk)
+            spec = replace(
+                spec,
+                kernel=kernel,
+                kernel_signature=_mla_kernel_compile_signature(kernel),
+            )
         compiled = _get_compiled_mla_decode(spec)
         self._state = dict(
+            reload_d576=reload_d576,
             device=device,
             batch=batch_size,
             heads=num_heads,
@@ -2704,6 +2914,8 @@ class BatchSparseMLADecodePagedTSWrapper:
         ]
         if fmt == "fp8" and cache.dtype == torch.float8_e4m3fn:
             cache = cache.view(torch.uint8)
+        if cache.ndim == 2:
+            cache = cache.unsqueeze(1)
         if cache.ndim == 4:
             axis = 1 if state["kv_layout"] == "HND" else 2
             if cache.shape[axis] != 1:
@@ -3000,7 +3212,32 @@ class BatchSparseMLADecodePagedTSWrapper:
             sinks,
             kv_cache_scale,
         )
-        if rows:
+        if rows and state["reload_d576"]:
+            core = state["buffers"]["core"]
+            # Each query token is a batch row; H128 is two q64 query tiles.
+            phys = (rows, state["heads"] // 64, 64)
+            with torch.cuda.device(state["device"]):
+                _launch_mla_decode(
+                    _MLARuntime(
+                        query.view(*phys, _D576_HEAD_DIM),
+                        primary,
+                        out.view(*phys, _D576_V_DIM),
+                        primary.shape[0],
+                        softmax_scale,
+                        output_scale,
+                    ),
+                    block_tables=si,
+                    seq_lens=sl,
+                    qo_indptr=None,
+                    packed_query=False,
+                    kv_lora_rank=512,
+                    split_kv=state["splits"],
+                    workspace=_MLAWorkspaceViews(
+                        core if core.numel() else None, lse.view(*phys)
+                    ),
+                    compiled=state["compiled"],
+                )
+        elif rows:
             buffers = state["buffers"]
             # Quantized stores use output_quant_args, including group/bucket
             # strides. The core O view supplies compact launch geometry only.

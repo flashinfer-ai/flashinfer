@@ -27,6 +27,26 @@ are documented in [helpers/nvfp4_kv.py](helpers/nvfp4_kv.py).
 
 ## Supported execution
 
+Native D576 FP8 attention shares the sparse wrapper with packed caches. Small
+query/head grids can use the q64 Keep-AB reload schedule: four loader warps cache
+Gather4 coordinates, use a compact RoPE stage, and release K before reloading V
+from L2. Split-KV and V-column partitions expose additional work on small grids;
+the existing parallel GMEM reducer includes those partials in the final result.
+Sustained work retains K/V tiles with eight loaders and CLC scheduling instead.
+H128 uses the shared 2CTA schedule beyond the tiny split-grid region. Its packed
+NVFP4 path retains the existing conversion ownership and DSMEM exchange for V.
+These are separate schedules within the shared kernel framework. D512, packed
+formats, narrower heads, extra pools and sinks retain their qualified paths.
+
+The public LSE is always natural-log; split scratch stays base 2 until the final
+store. An empty sparse row writes zero output and negative-infinity LSE. Native
+cache pools accept flat `[rows,D]` storage as well as paged views; indices always
+include each pool's physical row stride. Scale arguments remain host-runtime
+values with the same graph-capture semantics on both schedules.
+An omitted `softmax_scale` uses `1/sqrt(D)` for query width D on every cache
+format. Supply the model's effective attention/Q/K scale explicitly when its
+normalization dimension differs from the absorbed query width.
+
 | Feature | Support |
 |---|---|
 | GPU families | SM100/SM103 Blackwell; NVFP4 paths qualified locally on GB300 |

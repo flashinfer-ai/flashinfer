@@ -249,7 +249,13 @@ class TmemSResource(MlaResource):
         context = stage_info.context
         self._init_tmem_state(stage_info)
         if cutlass.const_expr(
-            not (self.cfg.kernel_variant == "keeps_mma_ab" and (self.cfg.num_tokens_per_page == 1 and not self.cfg.sparse_d576))
+            not (
+                self.cfg.kernel_variant == "keeps_mma_ab"
+                and (
+                    self.cfg.num_tokens_per_page == 1
+                    and not self.cfg.sparse_d576_reload
+                )
+            )
         ):
             self._softmax_scratch = smem_array(
                 context,
@@ -533,7 +539,11 @@ class TmemSResource(MlaResource):
             )
             # D576 query rows of one CTA are heads of one token: one mask.
             if cutlass.const_expr(
-                ((cfg.num_tokens_per_page == 1 and not cfg.sparse_d576) and cfg.logical_seq_len_q == 1) or cfg.sparse_d576
+                (
+                    (cfg.num_tokens_per_page == 1 and not cfg.sparse_d576_reload)
+                    and cfg.logical_seq_len_q == 1
+                )
+                or cfg.sparse_d576_reload
             )
             else raw_mask_routes
         )
@@ -617,7 +627,7 @@ class TmemSResource(MlaResource):
                 next_tile_offset_k > min_seq_len_kv
             )
         if cutlass.const_expr(cfg.num_tokens_per_page == 1):
-            if cutlass.const_expr(cfg.logical_seq_len_q == 1 or cfg.sparse_d576):
+            if cutlass.const_expr(cfg.logical_seq_len_q == 1 or cfg.sparse_d576_reload):
                 # Cached route bits include the live prefix boundary.
                 should_apply_dense_mask = (mask_routes.low | mask_routes.high) != Int32(
                     0

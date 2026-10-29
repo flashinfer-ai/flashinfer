@@ -649,3 +649,34 @@ def select_sparse_mla_d576_split(
     if split == 1:
         return 1, 1
     return split, _d576_v_split(num_ctas * split, sm_count)
+
+
+def prefer_sparse_d576_reload(
+    *, rows, heads, query_length, capacity, sm_count, general_profile
+):
+    """Choose native FP8 reload versus the general retained-KV/2CTA pipeline.
+
+    ``capacity`` is the primary top-k slot count and ``rows`` is B*Q. H128
+    benefits from sharing KV in 2CTA beyond the measured four-or-more native
+    KV-partition region. For H64, small grids and short lists favor early K
+    release. Longer queries increase within-request reuse; measured GB300
+    crossovers keep q<=16 on reload, q<=32 through four SM-sized row groups,
+    and larger query grids on retained KV. These are schedule crossovers, not
+    supported-shape limits. ``general_profile`` is the existing alternative:
+    its narrow-Q/V partitions and cluster finish beat a separate native merge
+    on short lists. The native reload launch alone uses grid-z per row.
+    """
+    if rows > 65535:
+        return False
+    if capacity <= 512 and general_profile.family == "swap":
+        return False
+    if heads == 128:
+        return select_sparse_mla_d576_split(rows * 2, capacity, sm_count)[0] >= 4
+    if heads != 64:
+        return False
+    return (
+        capacity <= 256
+        or rows <= sm_count
+        or query_length <= 16
+        or (query_length <= 32 and rows <= 4 * sm_count)
+    )

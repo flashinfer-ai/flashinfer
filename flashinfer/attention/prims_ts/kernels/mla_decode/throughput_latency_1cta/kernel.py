@@ -1452,7 +1452,9 @@ def _make_single_kv_pipe_task_graph(
     from .resources.tmem_softmax_stats import SmemSoftmaxLocalResource
 
     local_resource = (
-        SmemSoftmaxLocalResource if (cfg.num_tokens_per_page == 1 and not cfg.sparse_d576) else TmemSoftmaxLocalResource
+        SmemSoftmaxLocalResource
+        if (cfg.num_tokens_per_page == 1 and not cfg.sparse_d576_reload)
+        else TmemSoftmaxLocalResource
     )
     local = local_resource(
         cfg=cfg,
@@ -1560,7 +1562,7 @@ def _make_single_kv_pipe_task_graph(
             ),
         ]
     )
-    if cfg.sparse_d576:
+    if cfg.sparse_d576_reload:
         # The D576 sparse layout moves the loader to W12-15 with page
         # offsets on W10; pad W11 unless it loads or stages page offsets, and
         # whichever of warps 9-10 stays unused.
@@ -1608,7 +1610,11 @@ def _make_single_kv_pipe_task_graph(
             )
         )
 
-    if cfg.load_warp_idx == 12 and cfg.page_offsets_warp_idx != 9:
+    if (
+        cfg.load_warp_idx == 12
+        and cfg.page_offsets_warp_idx != 9
+        and not cfg.sparse_d576_reload
+    ):
         idle = create_padding_task(
             cfg, work_queue, warp_idx=9, num_warps=1, task_class=MlaDecodeTask
         )
@@ -1946,6 +1952,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             explicit_persistent=self.explicit_persistent,
             mask_type=self.mask_type,
             softmax_rescale_threshold_log2=self.softmax_rescale_threshold_log2,
+            sparse_profile=self.sparse_profile,
         )
         cfg = dataclass_replace(
             cfg,
@@ -2222,11 +2229,11 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             )
             tma_desc_c_rope = create_tensor_map_tiled_from_view(
                 c_extra_rows,
-                box_dims=(cfg.rope_dim if cfg.sparse_d576 else tma_box0, 1),
+                box_dims=(cfg.rope_dim if cfg.sparse_d576_reload else tma_box0, 1),
                 stride_order=(0, 1),
                 swizzle=(
                     cuda.TensorMapSwizzle.s64b
-                    if cfg.sparse_d576
+                    if cfg.sparse_d576_reload
                     else cuda.TensorMapSwizzle.s128b
                 ),
                 l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
@@ -2262,8 +2269,11 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
         tma_desc_bulk_extra = tma_desc_c_rope
         tma_desc_sparse_rope = tma_desc_c_latent
         tma_desc_sparse_extra_rope = tma_desc_c_rope
-        if cutlass.const_expr(cfg.num_tokens_per_page == 1):
-            # Bulk maps are separate from query RoPE and the gather maps.
+        if cutlass.const_expr(
+            cfg.num_tokens_per_page == 1 and not cfg.sparse_d576_reload
+        ):
+            # Generic sparse bulk maps are separate from query RoPE. The
+            # native reload schedule uses its compact 64-column RoPE map.
             rows_per_issuer = 32
             tma_desc_v = create_tensor_map_tiled_from_view(
                 c_rows,
@@ -2281,7 +2291,10 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
             )
 
         if cutlass.const_expr(
-            cfg.num_tokens_per_page == 1 and cfg.rope_dim and not cfg.has_nvfp4_kv
+            cfg.num_tokens_per_page == 1
+            and cfg.rope_dim
+            and not cfg.has_nvfp4_kv
+            and not cfg.sparse_d576_reload
         ):
             tma_desc_sparse_rope = make_sparse_rope_map(c_latent, cfg.qkv_dtype_bytes)
             tma_desc_sparse_extra_rope = make_sparse_rope_map(
@@ -2517,7 +2530,7 @@ class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
     ):
         """Execute one flat-Q, batch, KV-split, and V head-dimension tile."""
         cfg = self._make_config()
-        if cutlass.const_expr(cfg.sparse_d576 and acc_o is not None):
+        if cutlass.const_expr(cfg.sparse_d576_reload and acc_o is not None):
             # Split-KV launches use PDL (for the reducer); wait for the
             # upstream grid before reading Q / routes / pools in case the
             # producer of those inputs (e.g. the top-k indexer) releases its

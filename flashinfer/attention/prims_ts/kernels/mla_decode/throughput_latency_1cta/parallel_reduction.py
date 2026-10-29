@@ -314,7 +314,7 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
                 # natural-log LSE; global_lse stays base 2 for the weights below.
                 (lse.iterator.raw_ptr() + stats_output_query_row).store(
                     global_lse * Float32(LN_2)
-                    if cutlass.const_expr(finalize_attention or cfg.sparse_d576)
+                    if cutlass.const_expr(finalize_attention or cfg.sparse_d576_reload)
                     else global_lse
                 )
 
@@ -786,7 +786,7 @@ def _run_parallel_gmem_reduction_shared_stats(
             )
             if head_dim_cta_idx == Int32(0) and dim_in_cta == Int32(0):
                 public_lse = smem_global_lse[row_in_slice]
-                if cutlass.const_expr(cfg.sparse_d576):
+                if cutlass.const_expr(cfg.sparse_d576_reload):
                     # D576 sparse (DSA) plans publish natural-log LSE (this
                     # cluster path never finalizes attention).
                     public_lse = public_lse * Float32(LN_2)

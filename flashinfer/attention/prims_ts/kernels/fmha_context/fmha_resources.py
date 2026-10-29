@@ -2121,9 +2121,6 @@ class SmemPageOffsetsKvResource(MemoryResource):
 # SmemSageKScalesResource -- SMEM ring of one K tile's Sage sfK words per stage
 # ---------------------------------------------------------------------------
 
-# Import after FmhaConfig is defined because helpers_paged imports it back.
-from .helpers_paged import _resolve_kv_tile_idx_context  # noqa: E402
-
 
 @dataclass(kw_only=True)
 class SmemSageKScalesResource(MemoryResource):

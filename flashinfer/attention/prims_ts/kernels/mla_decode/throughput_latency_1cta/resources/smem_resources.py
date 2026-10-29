@@ -946,7 +946,7 @@ class SmemPageOffsetsResource(MlaResource):
         """Cache staged page IDs in the selected K stream's register slot."""
         # The load task waits on the page-offset stage, snapshots the page ids
         # into registers, and keeps swaps K0/K1 live until their delayed V use.
-        if cutlass.const_expr(self.cfg.sparse_d576):
+        if cutlass.const_expr(self.cfg.sparse_d576_reload):
             assert self.cfg.cache_uniform_sparse_quads
             # Snapshot this warp's eight quads once per K / V tile as
             # warp-uniform coordinates; every head-dimension stage of the
@@ -1556,7 +1556,7 @@ class SmemKvResource(MlaResource):
         stage_base = self._stage_base(stage_info)
         inner_width = min(tma_inner_dim_elems(cfg), active_width)
         uses_compact_fp8_rope_stage = (
-            (cfg.load_num_warps == 1 or cfg.sparse_d576)
+            (cfg.load_num_warps == 1 or cfg.sparse_d576_reload)
             and cfg.is_fp8_qkv()
             and not is_v
             and cfg.rope_dim == 64
@@ -1564,7 +1564,7 @@ class SmemKvResource(MlaResource):
             and cfg.head_dim_per_stage_kv == 128
         )
 
-        if cutlass.const_expr(cfg.sparse_d576):
+        if cutlass.const_expr(cfg.sparse_d576_reload):
             # D576 sparse K/V stage: each loader warp issues its quads (one
             # Gather4 of four token rows each) from the warp-uniform rows that
             # read_offsets cached for this tile.  The four rows land at
