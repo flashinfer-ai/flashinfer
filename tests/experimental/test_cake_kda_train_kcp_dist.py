@@ -408,6 +408,256 @@ def test_multi_gpu_rows_match_the_exact_reference(row) -> None:
     assert report["pass"], report
 
 
+# (lengths, H, W, layout) of the host-synchronization rows: CP2 / CP4 / CP8, every layout, H 4 / 64, one-token
+# documents and a document spanning >= 3 ranks
+UPLOAD_ROWS = [
+    ((100, 640, 77, 1000, 129), 4, 2, "contiguous"),
+    ((3000,), 64, 4, "zigzag"),
+    ((2048, 5, 3000, 1), 4, 4, "zigzag_per_document"),
+    ((700, 1, 1300, 999, 3000), 64, 8, "zigzag_per_document"),
+    ((5000, 1003), 4, 8, "zigzag"),
+    ((1200 + 900 + 900,), 4, 8, "contiguous"),
+]
+# the previous copies (A/B, negative control)
+OLD_PATH = {"upload": "blocking", "table_cache": "workspace"}
+
+
+def _sync_warnings(fn) -> tuple:
+    """``(result, number of synchronizing operations torch.cuda.set_sync_debug_mode("warn") reported in fn)``."""
+    import warnings
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        torch.cuda.set_sync_debug_mode("warn")
+        try:
+            out = fn()
+        finally:
+            torch.cuda.set_sync_debug_mode(0)
+    return out, sum("synchronizing CUDA operation" in str(w.message) for w in caught)
+
+
+def _run_upload_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict:
+    """Host synchronization on every rank of a CP row: the new path is bitwise the previous one (KDA saved / replay /
+    checkpointed passes with and without a workspace, conv halo forward / backward); steady-state calls report no
+    synchronizing operation (the previous path does); a pack prepared behind queued work (``heads=H``) does not wait
+    for it and runs bitwise; a pack prepared from another thread on a held-back side stream runs bitwise."""
+    import threading
+    import time
+
+    from flashinfer.cake_causal_conv1d_train_backend import kcp as conv
+
+    lengths, H, _w, layout = row
+    device = torch.device("cuda", rank % max(torch.cuda.device_count(), 1))
+    torch.cuda.set_device(device)
+    if W > 1 and not dist.is_initialized():
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", str(port))
+        dist.init_process_group("nccl", rank=rank, world_size=W, device_id=device)
+    group = dist.group.WORLD if W > 1 else None
+    part, cu = _partition(lengths, W, layout)
+    glob = make_inputs(lengths, H, device)
+    ops = _local_slices(part, rank, cu, glob)
+    q, k, v, g, beta, dout = (ops[n] for n in ("q", "k", "v", "g", "beta", "dout"))
+    gen = torch.Generator(device="cpu").manual_seed(0x7815)
+    C = 256
+    xg = torch.randn(cu[-1], C, generator=gen).to(torch.bfloat16).to(device)
+    dyg = torch.randn(cu[-1], C, generator=gen).to(torch.bfloat16).to(device)
+    w = (0.5 * torch.randn(C, 4, generator=gen)).to(device).contiguous()
+    loc = _local_slices(part, rank, cu, {"x": xg, "dy": dyg})
+    x, dy = loc["x"].contiguous(), loc["dy"].contiguous()
+    cycles_per_ms = None
+
+    def sleep_ms(ms: float, stream=None) -> None:
+        nonlocal cycles_per_ms
+        if cycles_per_ms is None:
+            a, b = (
+                torch.cuda.Event(enable_timing=True),
+                torch.cuda.Event(enable_timing=True),
+            )
+            a.record()
+            torch.cuda._sleep(50_000_000)
+            b.record()
+            b.synchronize()
+            cycles_per_ms = 50_000_000 / max(a.elapsed_time(b), 1e-3)
+        with torch.cuda.stream(stream or torch.cuda.current_stream(device)):
+            torch.cuda._sleep(int(cycles_per_ms * ms))
+
+    def run(c, ws, **opts) -> list:
+        out, saved = cake_kcp.chunk_kda_kcp_fwd(
+            q, k, v, g, beta, c, workspace=ws, **opts
+        )
+        grads = cake_kcp.chunk_kda_kcp_bwd(
+            q, k, v, g, beta, c, dout, saved=saved, workspace=ws
+        )
+        return [out, *grads]
+
+    def ckpt(c, ws) -> list:
+        from torch.utils.checkpoint import checkpoint
+
+        leaves = [t.detach().clone().requires_grad_(True) for t in (q, k, v, g, beta)]
+        out = checkpoint(
+            lambda *a: cake_kcp.chunk_kda_kcp(*a, c, None, "light", "saved", ws),
+            *leaves,
+            use_reentrant=False,
+        )
+        out.backward(dout)
+        return [out.detach()] + [lf.grad for lf in leaves]
+
+    def halo(c) -> list:
+        y, hist = conv.cake_causal_conv1d_kcp_forward(x, w, c)
+        return [y, *conv.cake_causal_conv1d_kcp_backward(x, w, c, dy, hist)]
+
+    def eq(a, b) -> bool:
+        return len(a) == len(b) and all(
+            torch.equal(s, t) for s, t in zip(a, b, strict=True)
+        )
+
+    def build(**kw):
+        return cake_kcp_plan.build_kcp_context(part, group, rank, device, **kw)
+
+    prev = cake_kcp_plan.enable_test_knobs(True)
+    try:
+        old = build(_kcp_test_knobs=dict(OLD_PATH))
+        ctx = build(heads=H)
+        ws, ws_old = cake_kcp.KcpWorkspace(), cake_kcp.KcpWorkspace()
+        ref = (
+            run(old, None)
+            + run(old, ws_old)
+            + run(old, None, boundary_mode="replay")
+            + ckpt(old, None)
+            + halo(old)
+        )
+        new = (
+            run(ctx, None)
+            + run(ctx, ws)
+            + run(ctx, ws, boundary_mode="replay")
+            + ckpt(ctx, ws)
+            + halo(ctx)
+        )
+        for _ in range(2):
+            run(ctx, ws)
+            run(ctx, None)
+        torch.cuda.synchronize(device)
+        res_ws, n_ws = _sync_warnings(lambda: run(ctx, ws))
+        res_none, n_none = _sync_warnings(lambda: run(ctx, None) + halo(ctx))
+        _res_old, n_old = _sync_warnings(lambda: run(old, None))
+        # the next pack prepared while this one runs: queued pack + ~0.5 s of work, then the preparation
+        torch.cuda.synchronize(device)
+        run(ctx, ws)
+        sleep_ms(500.0)
+        t0 = time.perf_counter()
+        ctx_b, n_prep = _sync_warnings(lambda: build(heads=H))
+        prep_s = time.perf_counter() - t0
+        prep_busy = not torch.cuda.current_stream(device).query()
+        res_b = run(ctx_b, ws) + halo(ctx_b)
+        # prepared from another thread on a side stream held back by ~0.5 s of its own work
+        side = torch.cuda.Stream(device)
+        holder = {}
+        sleep_ms(500.0, side)
+        th = threading.Thread(
+            target=lambda: holder.update(ctx=build(heads=H, stream=side))
+        )
+        th.start()
+        th.join()
+        ctx_t = holder["ctx"]
+        held = not ctx_t.ready.query()
+        res_t = run(ctx_t, None) + halo(ctx_t)
+        torch.cuda.synchronize(device)
+    finally:
+        cake_kcp_plan.enable_test_knobs(prev)
+    flags = {
+        "new_eq_previous_path": eq(new, ref),
+        "steady_no_sync_reused_ws": n_ws == 0 and eq(res_ws, new[6:12]),
+        "steady_no_sync_no_ws": n_none == 0 and eq(res_none, new[0:6] + new[24:27]),
+        "previous_path_syncs": n_old > 0,
+        "prepare_no_sync": n_prep == 0 and prep_busy and prep_s < 0.25,
+        "prepared_pack_eq": eq(res_b, new[6:12] + new[24:27]),
+        "thread_side_stream_held": held,
+        "thread_prepared_pack_eq": eq(res_t, new[0:6] + new[24:27]),
+    }
+    counts = {
+        "n_ws": n_ws,
+        "n_none": n_none,
+        "n_old": n_old,
+        "n_prep": n_prep,
+        "prep_s": prep_s,
+    }
+    if W > 1:
+        flag_list, count_list = [None] * W, [None] * W
+        dist.all_gather_object(flag_list, flags)
+        dist.all_gather_object(count_list, counts)
+    else:
+        flag_list, count_list = [flags], [counts]
+    report = {
+        "rank": rank,
+        "world": W,
+        "row": _row_id(row),
+        "flags": {},
+        "counts_by_rank": count_list,
+    }
+    for key in flags:
+        report["flags"][key] = all(f[key] for f in flag_list)
+    report["pass"] = all(report["flags"].values())
+    if W > 1:
+        dist.barrier()
+    if rank == 0 and result_dir:
+        os.makedirs(result_dir, exist_ok=True)
+        with open(
+            os.path.join(result_dir, "upload-" + _row_id(row) + ".json"), "w"
+        ) as fh:
+            json.dump(report, fh, indent=1, default=str)
+    return report
+
+
+def _spawn_upload_entry(rank: int, W: int, row, port: int, result_dir: str) -> None:
+    try:
+        report = _run_upload_rank(rank, W, row, port, result_dir)
+        if not report["pass"]:
+            raise AssertionError(f"rank {rank}: {report}")
+    finally:
+        if dist.is_initialized():
+            cake_kcp.graph_cache_clear()
+            dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("row", UPLOAD_ROWS, ids=_row_id)
+def test_multi_gpu_upload_rows_are_bitwise_and_nonblocking(row) -> None:
+    """The rows of :func:`_run_upload_rank`: one process per GPU (``spawn``, rows up to the visible GPU count) or
+    one process per Slurm task (a step with ``SLURM_NTASKS`` > 1 runs the rows of its own world size and skips the
+    others)."""
+    lengths, H, W, layout = row
+    ntasks = int(os.environ.get("SLURM_NTASKS", "1"))
+    if os.environ.get("SLURM_PROCID") is not None and ntasks > 1:
+        if ntasks != W:
+            pytest.skip(f"this Slurm step runs the W = {ntasks} rows")
+        if not _programs_exported():
+            pytest.skip(
+                "the KCP programs are not exported in the package's build.json yet"
+            )
+        report = _run_upload_rank(
+            int(os.environ["SLURM_PROCID"]),
+            W,
+            row,
+            int(os.environ.get("MASTER_PORT", "29500")),
+            os.environ.get("KCP_TEST_RESULT_DIR"),
+        )
+        assert report["pass"], report
+        return
+    _skip_unless_runnable(W)
+    with tempfile.TemporaryDirectory(prefix="cake_kcp_upload_") as tmp:
+        result_dir = os.environ.get("KCP_TEST_RESULT_DIR") or tmp
+        mp.start_processes(
+            _spawn_upload_entry,
+            args=(W, row, _free_port(), result_dir),
+            nprocs=W,
+            join=True,
+            start_method="spawn",
+        )
+        with open(os.path.join(result_dir, "upload-" + _row_id(row) + ".json")) as fh:
+            report = json.load(fh)
+    assert report["pass"], report
+
+
 def test_public_api_cannot_select_a_precision_mode(monkeypatch) -> None:
     """The private test hook is refused without the environment variable; the public options never reach K3's
     non-shipped programs (SPEC-11)."""
