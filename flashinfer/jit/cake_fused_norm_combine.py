@@ -30,12 +30,12 @@ from . import cake_program
 from .core import JitSpec
 
 PARALLEL_SINGLE = cake_program.CakeProgram(
-    name="cake_fused_norm_combine_7778a9a131a0653e5671",
+    name="cake_fused_norm_combine_5d69eac5f72e62976f4e",
     operator_dir="cake_fused_norm_combine",
-    kernel="kernel_cake_fused_norm_combine_7778a9a131a0653e5671",
+    kernel="kernel_cake_fused_norm_combine_5d69eac5f72e62976f4e",
     sources=(
-        "cake_fused_norm_combine_7778a9a131a0653e5671_kernel.cu",
-        "cake_fused_norm_combine_7778a9a131a0653e5671_binding.cu",
+        "cake_fused_norm_combine_5d69eac5f72e62976f4e_kernel.cu",
+        "cake_fused_norm_combine_5d69eac5f72e62976f4e_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(("sm_100a", ("--fmad=true",)), ("sm_103a", ("--fmad=true",))),
@@ -156,12 +156,12 @@ PARALLEL_SPLIT = cake_program.CakeProgram(
 )
 
 OWNER_STREAM = cake_program.CakeProgram(
-    name="cake_fused_norm_combine_426f8d7edfb8a57040ce",
+    name="cake_fused_norm_combine_b18e0a01ecd652ae20b9",
     operator_dir="cake_fused_norm_combine",
-    kernel="kernel_cake_fused_norm_combine_426f8d7edfb8a57040ce",
+    kernel="kernel_cake_fused_norm_combine_b18e0a01ecd652ae20b9",
     sources=(
-        "cake_fused_norm_combine_426f8d7edfb8a57040ce_kernel.cu",
-        "cake_fused_norm_combine_426f8d7edfb8a57040ce_binding.cu",
+        "cake_fused_norm_combine_b18e0a01ecd652ae20b9_kernel.cu",
+        "cake_fused_norm_combine_b18e0a01ecd652ae20b9_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(("sm_100a", ("--fmad=true",)), ("sm_103a", ("--fmad=true",))),
@@ -191,7 +191,7 @@ OWNER_STREAM = cake_program.CakeProgram(
     ),
     block=(320, 1, 1),
     cluster=(1, 1, 1),
-    dynamic_smem_bytes=128,
+    dynamic_smem_bytes=256,
     use_pdl=True,
     cooperative=True,
     needs_device_linking=False,

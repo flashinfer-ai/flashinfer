@@ -160,6 +160,19 @@ def runtime_base_seq_len_kv(cfg: MlaConfig, cache_seqs, batch_idx):
 
 
 @cute.jit
+def runtime_request_publishes(cfg: MlaConfig, cache_seqs, batch_idx):
+    """Return whether a batch row publishes O / LSE (and split scratch).
+
+    An empty request (zero KV length) publishes nothing, which preserves its
+    output. D576 sparse rows keep their contract instead: a token whose
+    top-k length is zero still writes O = 0 and LSE = -inf.
+    """
+    if cutlass.const_expr(cfg.sparse_d576):
+        return cutlass.Boolean(True)
+    return runtime_base_seq_len_kv(cfg, cache_seqs, batch_idx) > Int32(0)
+
+
+@cute.jit
 def runtime_seq_len_kv_for_logical_q(
     cfg: MlaConfig,
     cache_seqs,
@@ -288,7 +301,7 @@ def runtime_work_tile_activity(
         cta_idx_kv,
     )
     query_is_active = query_is_active & (
-        runtime_base_seq_len_kv(cfg, cache_seqs, batch_idx) > Int32(0)
+        runtime_request_publishes(cfg, cache_seqs, batch_idx)
     )
     return query_is_active, split_is_active
 

@@ -491,7 +491,7 @@ def _device_facts(device_index: int) -> tuple[BlackwellMSATarget, int]:
     compute_capability = get_compute_capability(device)
     if compute_capability not in _SUPPORTED_COMPUTE_CAPABILITIES:
         raise RuntimeError(
-            "the SM100/SM103 MSA backend requires compute capability 10.0 or 10.3; "
+            "the Blackwell MSA backend requires compute capability 10.0, 10.3 or 10.7; "
             f"got {compute_capability[0]}.{compute_capability[1]}"
         )
     if compute_capability == (10, 7):
@@ -1124,39 +1124,7 @@ def _fp8_q1_schedule(
     return ""
 
 
-# Lever D4b(dynpair) ships with the route off by default: the two-token
-# ticket program costs 6-11 % on per-token random block selections.  Turning the mirror
-# on needs a Cake re-export that registers ``decode_uniform_fp8:paged_dynpair`` again
-# (``exports/blackwell_msa/export.PRODUCTION_ROUTE_KEYS``); this package carries only
-# the single-token program.
-_UNIFORM_FP8_DYNPAIR_ROUTE = (
-    False  # mirror of minimax_sparse_attention_sm100.UNIFORM_FP8_DYNPAIR_ROUTE
-)
 _UNIFORM_FP8_SINGLE_ROUTE = "decode_uniform_fp8:paged"
-_UNIFORM_FP8_DYNPAIR_ROUTE_KEY = "decode_uniform_fp8:paged_dynpair"
-
-
-def _uniform_fp8_dynpair(seqlen_q: int) -> bool:
-    """Even ``seqlen_q`` in [2, 32] takes the two-token ticket program when the route is on.
-
-    Mirror of ``minimax_sparse_attention_sm100.uniform_fp8_dynpair_route`` (lever
-    D4b(dynpair), shipped off): query pairs ``(2 i, 2 i + 1)`` never straddle a
-    request; the kernel pairs the two tokens of a ticket when their selected-block lists
-    are equal and runs them one after the other otherwise; the output is bitwise the
-    single-token program's.  Same kernel ABI, grid rule and launch arguments as the
-    single-token route.
-    """
-    seqlen_q = int(seqlen_q)
-    return _UNIFORM_FP8_DYNPAIR_ROUTE and 2 <= seqlen_q <= 32 and seqlen_q % 2 == 0
-
-
-def _uniform_fp8_route(seqlen_q: int) -> str:
-    """Route key of the uniform FP8 Q/K/V paged decode program for ``seqlen_q``."""
-    return (
-        _UNIFORM_FP8_DYNPAIR_ROUTE_KEY
-        if _uniform_fp8_dynpair(seqlen_q)
-        else _UNIFORM_FP8_SINGLE_ROUTE
-    )
 
 
 def _uniform_fp8_decode_grid(
@@ -3028,7 +2996,7 @@ def _run_fp8_direct(
 ) -> None:
     """One direct FP8-MMA decode program (BF16-Q xform2 or uniform FP8 Q/K/V)."""
 
-    uniform = route in (_UNIFORM_FP8_SINGLE_ROUTE, _UNIFORM_FP8_DYNPAIR_ROUTE_KEY)
+    uniform = route == _UNIFORM_FP8_SINGLE_ROUTE
     total_q, num_q_heads, _ = (int(value) for value in q.shape)
     num_kv_heads = int(k.shape[1])
     arguments: dict[str, Any] = {
@@ -3768,7 +3736,7 @@ def blackwell_msa_sparse_decode_attention(
                     "force_fused=True, and no explicit q_offset"
                 )
             _run_fp8_direct(
-                route=_uniform_fp8_route(int(seqlen_q)),
+                route=_UNIFORM_FP8_SINGLE_ROUTE,
                 output_scale=output_scale,
                 **common,
             )

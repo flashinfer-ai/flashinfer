@@ -854,8 +854,8 @@ kernel_cake_grouped_fp8_fused_silu_quant_a54057945ffaff1016b1(const __grid_const
                         if (partial_stage == 4) { partial_stage = 0; _phase_partial_full ^= 1; }
                     }
                 }
-                unsigned int output_ab_stage = (consumer_ab_cursor + (unsigned int)k_blocks - 1) % 7;
-                consumer_ab_cursor = (consumer_ab_cursor + (unsigned int)k_blocks) % 7;
+                consumer_ab_cursor += (unsigned int)(k_blocks - 1);
+                unsigned int output_ab_stage = consumer_ab_cursor % 7;
                 int cluster_row = cta_rank * 128 + row;
                 int owns = 0;
                 if (cluster_row >= run_begin) {
@@ -1037,9 +1037,10 @@ kernel_cake_grouped_fp8_fused_silu_quant_a54057945ffaff1016b1(const __grid_const
                 asm volatile("barrier.sync 11, 256;" ::: "memory");
                 if (warp == 0) {
                     if (elect_sync()) {
-                        mbarrier_arrive(ab_free_addr + (output_ab_stage) * 8);
+                        mbarrier_arrive(ab_free_addr + (consumer_ab_cursor % 7) * 8);
                     }
                 }
+                consumer_ab_cursor += 1;
             }
             asm volatile("barrier.sync 9, 288;" ::: "memory");
             unsigned int _phase_producers_done_0 = 0;

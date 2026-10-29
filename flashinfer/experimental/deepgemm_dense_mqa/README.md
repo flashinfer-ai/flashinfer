@@ -271,6 +271,17 @@ route's programs accept: 256 where the KV boxes are fitted to one 256-row block,
 the v9 scan classes; 1 where they may extend past the tensor, the fused `fp8:qle128:short` / `fp8:qle2048:short` and the
 64-head programs). A paged route record carries `stages` and `sequence` only; its geometry is the route name (the
 schedule-meta producer routes `paged:fp8:meta:v<N>` add their launch geometry: `threads`, `dynamic_smem_bytes`, `grid`).
+A `:kvsplit` route record of the `full` kind may also carry `stage_buckets` (optional; the schema stays `dense_mqa.v13`:
+a reader that ignores the key launches `stages`, and each bucket program computes the same logits and schedule words as
+the record's program): `{arch: [{"kv_max": K, "stages": [[stage, program], ...]}, ...]}`, per architecture a list in
+strictly increasing `kv_max`. A plan on `arch` whose KV length `K = kv.shape[0]` is at most an entry's `kv_max` launches
+the first such entry's `stages`; any other K launches the record's `stages`. An entry keeps the record's stage names and
+order and names, per stage, the program the route's `partial`-kind twin (the same name with `partial` for `full`)
+launches on `arch` -- a program that handles every query count of the full kind -- with the record's host call
+(`arg_plan`, `compile_flags`, `ffi_entry`, `kind`, `role`, `standalone`). The route name, its admission, its K rule
+(`kv_min`, `kv_alignment`) and its metadata buffer are the record's; no fallback of `served_route` lands on a
+`:kvsplit` route. `route_stages(record, arch, K)` applies the rule; `program_names(route, arch)` lists the record's
+programs, then the bucket programs.
 Routes: 32 heads `fp8:q1:short`, `fp8:q1`, `fp8:q128:short`, `fp8:{full,partial}:le32:short`, `fp8:{full,partial}:le768:short`,
 `fp8:qle128:short` (one `logits` stage, the program `fp8_fused_qle128` -- bound per architecture since v13: the
 `source_consumer_release` text on sm_100a, the pinned text on sm_103a, `policy.h32_text_options` -- writing the tiered schedule in-kernel for
@@ -303,7 +314,9 @@ each a single `logits` stage -- the
 gridDim-strided `fp8_h64_logits_full` program for `Q % 2 == 0`, `fp8_h64_logits_partial` otherwise (their `_short`
 variants -- the one-split text -- for the `:short` routes, their `_ts` variants -- the per-arch production text plus the
 tile-schedule words -- for the `:ts` routes; their `_kvsplit_<plan>` variants -- the production text under
-the plan, `fp8_h64_logits_partial_kvsplit_q1` for `Q = 1` -- for the `:kvsplit` routes)
+the plan, `fp8_h64_logits_partial_kvsplit_q1` for `Q = 1` -- for the `:kvsplit` routes);
+`fp8:h64:full:qle2048:kvsplit` launches the program of `fp8:h64:partial:qle2048:kvsplit` on sm_100a, and on sm_103a for
+`K <= 8192` (its `stage_buckets`)
 (including `Q = 1`); no metadata program, launch grid = the SM count (the `SM_COUNT` compile-line
 definition, one device text per arch per program), the program's `ScheduleMeta` operand bound to `ks`
 and unused on the grid-stride, one-split and tile-schedule-words routes and to the plan's own `metadata_words(Q, SM_COUNT, 64)` int32 buffer

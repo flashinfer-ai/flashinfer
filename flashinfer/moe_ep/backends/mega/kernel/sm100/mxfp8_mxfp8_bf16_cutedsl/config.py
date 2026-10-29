@@ -25,29 +25,34 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     fp8 weights with ``w13_scale`` / ``w2_scale``.
 
     ``kernel_variant="genphase"`` opts into the Blackwell decoding pipeline.
+    It supports E4M3, E5M2 and ``kind="mxfp4_mxfp8"`` (packed MXFP4 weights
+    with E4M3 activations). The latter requires 128-aligned intermediate size.
     Its ``knobs=None`` selects an exact cached profile or a host heuristic;
     dictionaries and explicit tile/cluster/schedule fields constrain selection.
-    ``knobs="auto"`` tunes collectively during warmup before graph capture.
-    Auto layers own a single capacity and cannot call ``create_workspace()``;
-    use fixed or offline-tuned knobs for additional capacity profiles.
+    GenPhase and the standard ``_cutedsl_next`` selector use ``knobs="auto"``
+    with ``autotune_v2()`` for collective warmup before graph capture.
+    These selectors support independent automatic handles through
+    ``create_workspace()``. The legacy inference selector retains its
+    single-capacity automatic workspace.
 
     ``kernel_name="sm100_mxfp8_mxfp8_bf16_cutedsl_next"`` selects the standard
-    provider export for E4M3 or E5M2. Keep ``kernel_variant="inference"`` and
-    use default or fixed ``knobs`` with this backend. Activation controls and
+    provider export for E4M3 or E5M2. ``kernel_variant="genphase"`` selects
+    decoding, including mixed MXFP4/MXFP8. With ``kernel_variant="inference"``,
+    use default, fixed or automatic ``knobs``. Activation controls and
     late routing weights are available through this selector.
     """
 
     intermediate_size: int
     top_k: int
     kernel_name: str = "sm100_mxfp8_mxfp8_bf16_cutedsl"
-    kind: Literal["mxfp8_e4m3", "mxfp8_e5m2"] = "mxfp8_e4m3"
+    kind: Literal["mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"] = "mxfp8_e4m3"
     gate_up_clamp: float | None = None
     activation_clamp: float | None = None
     fast_math: bool = True
     # Enables in_kernel_fc2_reduce, autotune may still disable this if it is faster
     enable_in_kernel_fc2_reduce: bool = False
-    # NONE makes MoEEpMegaLayer.forward return per-route outputs for caller
-    # finalization; it requires fixed/offline-tuned knobs.
+    # NONE exposes per-route outputs through forward_unfinalized(). The legacy
+    # selector requires fixed/offline-tuned knobs for this mode.
     finalize_mode: FinalizeMode = field(default=FinalizeMode.AUTO, kw_only=True)
     # Caller-owned CUDA int32 (1,) live-token count the PERSISTENT finalize kernel
     # reads; the workspace borrows it and never writes it. Update before every
@@ -56,13 +61,14 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
         default=None, kw_only=True
     )
     # GenPhase: None resolves the cache or geometry heuristic; dictionaries
-    # constrain tile/cluster/schedule_policy; "auto" tunes at collective warmup.
+    # constrain tile/cluster/schedule_policy; "auto" searches within autotune_v2().
     # Inference tuning knobs (see kernel_src.sm100.cutedsl_megamoe.shim.tuner); overrides
     # the token-count default heuristic entirely when set, e.g. a winner from the
     # kernel repo's tester sweep. None -> tuner.default_knobs(..., dtype="mxfp8").
-    # "auto" -> online autotune at the first forward: collectively time the
+    # Legacy "auto" -> online autotune at the first forward: collectively time the
     # shim.autotune candidate set on the live problem and keep the winner
     # (one cute.compile per candidate, paid once per session).
+    # The standard _cutedsl_next selector defers searches to autotune_v2().
     knobs: dict | str | None = None
     # Opt-in decoding pipeline. Existing callers keep the legacy inference
     # path, including its knob cache and online autotuner.
@@ -84,6 +90,9 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     apply_routing_weights_before_fc2: bool = field(default=True, kw_only=True)
 
     def __post_init__(self) -> None:
+        """Reject incompatible dtype, activation and finalization options."""
+        if self.kind == "mxfp4_mxfp8" and self.kernel_variant != "genphase":
+            raise ValueError("Mixed MXFP4/MXFP8 requires kernel_variant='genphase'.")
         if (self.swiglu_alpha is None) != (self.swiglu_beta is None):
             raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
         if self.swiglu_alpha is not None and self.swiglu_beta is not None:
@@ -125,7 +134,10 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
                 raise ValueError(
                     "finalize_mode=NONE requires enable_in_kernel_fc2_reduce=False."
                 )
-            if self.knobs == "auto":
+            if (
+                self.knobs == "auto"
+                and self.kernel_name != "sm100_mxfp8_mxfp8_bf16_cutedsl_next"
+            ):
                 raise ValueError(
                     "finalize_mode=NONE requires fixed/offline-tuned knobs."
                 )

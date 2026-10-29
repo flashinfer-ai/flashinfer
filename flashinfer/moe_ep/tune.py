@@ -95,6 +95,12 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "sm90_fp8_* / sm90_mxfp4 / sm90_bf16 dtypes select sm90",
     )
     parser.add_argument(
+        "--implementation",
+        choices=("default", "next"),
+        default="default",
+        help="SM100 standard kernel implementation; next uses managed autotune v2",
+    )
+    parser.add_argument(
         "--shared-expert",
         action="store_true",
         help="sm120_mxfp4_mxfp8: tune the in-kernel FP8 shared-expert variant",
@@ -321,6 +327,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     if args.dtype == "sm120_mxfp4_mxfp8":
+        if args.implementation != "default":
+            print("--implementation next requires SM100", file=sys.stderr)
+            return 2
         if args.arch != "auto":
             print("sm120_mxfp4_mxfp8 requires --arch auto", file=sys.stderr)
             return 2
@@ -353,10 +362,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(f"--dtype {args.dtype} is unsupported on {family}", file=sys.stderr)
             return 2
         if args.dtype == "mxfp4_mxfp8":
-            if family != "sm107":
-                print("--dtype mxfp4_mxfp8 requires --arch sm107", file=sys.stderr)
+            if family != "sm107" and not (
+                family == "sm100" and args.kernel_variant == "genphase"
+            ):
+                print(
+                    "--dtype mxfp4_mxfp8 requires SM107 or SM100 GenPhase",
+                    file=sys.stderr,
+                )
                 return 2
-            backend = "mxfp8_mxfp4_bf16_cutedsl"
+            backend = (
+                "mxfp8_mxfp4_bf16_cutedsl"
+                if family == "sm107"
+                else "mxfp8_mxfp8_bf16_cutedsl"
+            )
         elif args.dtype == "nvfp4":
             backend = "nvfp4_nvfp4_bf16_cutedsl"
         elif args.dtype == "bf16":
@@ -366,10 +384,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             backend = "mxfp8_mxfp8_bf16_cutedsl"
 
-    if not args.do_finalize or not args.apply_routing_weights_before_fc2:
-        if family != "sm100" or args.dtype != "nvfp4":
+    next_standard = args.implementation == "next"
+    if next_standard and (
+        family != "sm100"
+        or args.dtype not in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8")
+    ):
+        print("--implementation next requires SM100 NVFP4 or MXFP8", file=sys.stderr)
+        return 2
+
+    if not args.do_finalize or (
+        not args.apply_routing_weights_before_fc2 and args.kernel_variant != "genphase"
+    ):
+        if family != "sm100" or not (
+            args.dtype == "nvfp4"
+            or (next_standard and args.kernel_variant == "inference")
+        ):
             print(
-                "caller finalization and routing-weight placement require SM100 NVFP4",
+                "caller finalization and routing-weight placement require SM100 "
+                "NVFP4 or the next standard implementation",
                 file=sys.stderr,
             )
             return 2
@@ -389,18 +421,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.kernel_variant == "genphase" and args.combine_dtype != "bf16":
         print("GenPhase requires --combine-dtype bf16", file=sys.stderr)
         return 2
+    if family == "sm100" and args.kernel_variant == "genphase" and not args.do_finalize:
+        print("Blackwell GenPhase requires --do-finalize", file=sys.stderr)
+        return 2
 
     if (
         args.kernel_variant == "genphase"
         and family != "sm107"
         and not (
             family == "sm100"
-            and args.dtype == "mxfp8_e4m3"
+            and args.dtype in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8")
             and not args.allow_nondeterministic
         )
     ):
         print(
-            "GenPhase requires SM107 or SM100 MXFP8 E4M3 with deterministic reduction",
+            "GenPhase requires SM107 or SM100 block-scaled quantization with deterministic reduction",
             file=sys.stderr,
         )
         return 2
@@ -414,9 +449,21 @@ def main(argv: Optional[List[str]] = None) -> int:
         getattr(args, name) != 1.0
         for name in ("input_norm_const", "fc1_alpha", "fc2_alpha", "fc1_norm_const")
     )
-    if family != "sm107" and (activation_requested or scaling_requested):
+    if (
+        family != "sm107"
+        and not (next_standard and args.kernel_variant == "inference")
+        and not (
+            family == "sm100"
+            and args.kernel_variant == "genphase"
+            and args.dtype == "nvfp4"
+            and not activation_requested
+        )
+        and (activation_requested or scaling_requested)
+    ):
         print(
-            "activation and normalization options require --arch sm107", file=sys.stderr
+            "activation and normalization options require SM107 or the next "
+            "standard SM100 implementation",
+            file=sys.stderr,
         )
         return 2
     if scaling_requested and args.dtype != "nvfp4":
@@ -424,7 +471,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     tuner = importlib.import_module(
-        f".backends.mega.kernel.{family}.{backend}.tuner", __package__
+        (
+            ".backends.mega.kernel.sm100.next_tuning"
+            if next_standard
+            or (family == "sm100" and args.kernel_variant == "genphase")
+            else f".backends.mega.kernel.{family}.{backend}.tuner"
+        ),
+        __package__,
     )
     return tuner.run_tuning(args)
 

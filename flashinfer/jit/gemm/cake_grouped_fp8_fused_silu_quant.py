@@ -75,11 +75,11 @@ ARG_PLANS: dict[str, list[list[str]]] = {
 }
 
 PROGRAMS: dict[str, dict[str, Any]] = {
-    "cake_grouped_fp8_fused_silu_quant_29d4dcf04d2354078682": {
-        "kernel": "kernel_cake_grouped_fp8_fused_silu_quant_29d4dcf04d2354078682",
+    "cake_grouped_fp8_fused_silu_quant_30f61f7a844569f37424": {
+        "kernel": "kernel_cake_grouped_fp8_fused_silu_quant_30f61f7a844569f37424",
         "sources": [
-            "cake_grouped_fp8_fused_silu_quant/cake_grouped_fp8_fused_silu_quant_29d4dcf04d2354078682_kernel.cu",
-            "cake_grouped_fp8_fused_silu_quant/cake_grouped_fp8_fused_silu_quant_29d4dcf04d2354078682_binding.cu",
+            "cake_grouped_fp8_fused_silu_quant/cake_grouped_fp8_fused_silu_quant_30f61f7a844569f37424_kernel.cu",
+            "cake_grouped_fp8_fused_silu_quant/cake_grouped_fp8_fused_silu_quant_30f61f7a844569f37424_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -143,13 +143,13 @@ PROGRAMS: dict[str, dict[str, Any]] = {
 }
 
 MODULES: dict[str, dict[str, str]] = {
-    "cake_grouped_fp8_fused_silu_quant_29d4dcf04d2354078682_sm_100a": {
+    "cake_grouped_fp8_fused_silu_quant_30f61f7a844569f37424_sm_100a": {
         "arch": "sm_100a",
-        "program": "cake_grouped_fp8_fused_silu_quant_29d4dcf04d2354078682",
+        "program": "cake_grouped_fp8_fused_silu_quant_30f61f7a844569f37424",
     },
-    "cake_grouped_fp8_fused_silu_quant_29d4dcf04d2354078682_sm_103a": {
+    "cake_grouped_fp8_fused_silu_quant_30f61f7a844569f37424_sm_103a": {
         "arch": "sm_103a",
-        "program": "cake_grouped_fp8_fused_silu_quant_29d4dcf04d2354078682",
+        "program": "cake_grouped_fp8_fused_silu_quant_30f61f7a844569f37424",
     },
     "cake_grouped_fp8_fused_silu_quant_94fb4bd1033270edf3b4_sm_100a": {
         "arch": "sm_100a",
@@ -186,7 +186,7 @@ MODULES: dict[str, dict[str, str]] = {
 }
 
 ROUTES: dict[str, Any] = {
-    "fused_cg2_ab7_mixedsched_lpt_kg4:main": "cake_grouped_fp8_fused_silu_quant_29d4dcf04d2354078682",
+    "fused_cg2_ab7_mixedsched_lpt_kg4:main": "cake_grouped_fp8_fused_silu_quant_30f61f7a844569f37424",
     "fused_cg2_ab7_pairsched_solotail_kg4:pair": "cake_grouped_fp8_fused_silu_quant_a54057945ffaff1016b1",
     "fused_cg2_ab7_pairsched_solotail_kg4:tail": "cake_grouped_fp8_fused_silu_quant_94fb4bd1033270edf3b4",
     "gemm_then_silu_mul_group_quant_fp8:main": "cake_grouped_fp8_fused_silu_quant_a0d6cfec3d9e63feb767",

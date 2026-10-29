@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Exact-workload cache for Blackwell GenPhase performance knobs.
+"""Exact-workload cache for Blackwell performance knobs.
 
 Entries share the MoE EP cache file but use a distinct device namespace.
 Capacity, live-token bucket, operation attributes, hardware and compiler must
@@ -18,9 +18,14 @@ import warnings
 from pathlib import Path
 from typing import Any
 
-from .tuning import KNOB_KEYS, is_valid_sm100_genphase_knobs, sm100_genphase_candidates
+from .tuning import (
+    knob_keys,
+    is_valid_sm100_knobs,
+    sm100_genphase_candidates,
+    sm100_standard_candidates,
+)
 
-_REVISION = "sm100-genphase-e6256732-auto-v5"
+_REVISION = "sm100-genphase-block-scaled-auto-v6"
 
 
 def knob_cache_path() -> str | None:
@@ -64,11 +69,18 @@ def device_identity() -> str:
 def _key(config, device: str | None = None) -> dict:
     """Key operation attributes and capacity independently of rank and knobs."""
     spec = dataclasses.asdict(config)
-    for name in ("rank", *KNOB_KEYS):
+    for name in ("rank", *knob_keys(config)):
         spec.pop(name)
     return dict(
-        backend_revision=_REVISION,
-        device="sm100-genphase:" + (device_identity() if device is None else device),
+        backend_revision=_REVISION
+        if config.kernel_variant == "genphase"
+        else "sm100-standard-auto-v1",
+        device=(
+            "sm100-genphase:"
+            if config.kernel_variant == "genphase"
+            else "sm100-standard:"
+        )
+        + (device_identity() if device is None else device),
         problem=json.loads(json.dumps(spec)),
     )
 
@@ -99,7 +111,7 @@ def _entries(config, device=None) -> list[dict]:
         data = _read(path)
     except (ValueError, OSError) as exc:
         warnings.warn(
-            f"Ignoring Blackwell GenPhase knob cache: {exc}",
+            f"Ignoring Blackwell knob cache: {exc}",
             RuntimeWarning,
             stacklevel=3,
         )
@@ -115,11 +127,11 @@ def _entries(config, device=None) -> list[dict]:
 def _decode(entry, config):
     """Restore knob tuples and reject malformed or inadmissible cached values."""
     raw = entry.get("knobs")
-    if not isinstance(raw, dict) or set(raw) != set(KNOB_KEYS):
+    if not isinstance(raw, dict) or set(raw) != set(knob_keys(config)):
         return None
     knobs = {k: tuple(v) if isinstance(v, list) else v for k, v in raw.items()}
     try:
-        return knobs if is_valid_sm100_genphase_knobs(knobs, config) else None
+        return knobs if is_valid_sm100_knobs(knobs, config) else None
     except (TypeError, ValueError):
         return None
 
@@ -151,8 +163,14 @@ def resolve_knobs(
     Cache hits must match the live-token count and explicit constraints.
     ``use_cache=False`` starts from the heuristic for a fresh tuning sweep.
     """
-    candidates = sm100_genphase_candidates(
-        config, sm_count=sm_count, live_tokens=live_tokens, constraints=constraints
+    candidates = (
+        sm100_genphase_candidates(
+            config, sm_count=sm_count, live_tokens=live_tokens, constraints=constraints
+        )
+        if config.kernel_variant == "genphase"
+        else sm100_standard_candidates(
+            config, allow_nondeterministic=config.reduce_topk_in_kernel
+        )
     )
     tokens = config.max_tokens_per_rank if live_tokens is None else live_tokens
     if use_cache:
@@ -174,8 +192,16 @@ def record_knobs(
     knobs, config, *, live_tokens: int, p50_us: float, device=None
 ) -> bool:
     """Atomically preserve unrelated entries; cache I/O failure is nonfatal."""
-    if set(knobs) != set(KNOB_KEYS) or not is_valid_sm100_genphase_knobs(knobs, config):
-        raise ValueError("cannot cache invalid Blackwell GenPhase knobs")
+    return write_record(
+        make_record(
+            knobs, config, live_tokens=live_tokens, p50_us=p50_us, device=device
+        )
+    )
+
+
+def make_record(knobs, config, *, live_tokens, p50_us, device=None):
+    if set(knobs) != set(knob_keys(config)) or not is_valid_sm100_knobs(knobs, config):
+        raise ValueError("cannot cache invalid Blackwell knobs")
     if (
         type(live_tokens) is not int
         or not 0 <= live_tokens <= config.max_tokens_per_rank
@@ -183,16 +209,20 @@ def record_knobs(
         raise ValueError("live_tokens must be within workspace capacity")
     if not math.isfinite(p50_us) or p50_us <= 0:
         raise ValueError("p50_us must be finite and positive")
-    path = knob_cache_path()
-    if path is None:
-        return False
-    entry = dict(
+    return dict(
         **_key(config, device),
         live_tokens=live_tokens,
         knobs=knobs,
         p50_us=p50_us,
-        source="cuda-graph-max-rank-sampled-oracle",
+        source="max-rank-sampled-oracle",
     )
+
+
+def write_record(entry):
+    """Publish the selected managed record to the compatibility file."""
+    path = knob_cache_path()
+    if path is None:
+        return False
     identity = ("backend_revision", "device", "problem", "live_tokens")
     temporary = None
     try:
@@ -221,7 +251,7 @@ def record_knobs(
         return True
     except (ValueError, OSError) as exc:
         warnings.warn(
-            f"Could not persist Blackwell GenPhase knobs: {exc}",
+            f"Could not persist Blackwell knobs: {exc}",
             RuntimeWarning,
             stacklevel=2,
         )

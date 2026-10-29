@@ -127,6 +127,16 @@ from .allreduce import (
 )
 from .allreduce import is_mnnvl_cutedsl_supported as is_mnnvl_cutedsl_supported
 
+# Experimental: MNNVL all-reduce fused with the mHC post-map and pre-norm partials. Thin entry
+# points; the backend is imported on first call.
+from .allreduce_mhc import allreduce_mhc_post_prenorm as allreduce_mhc_post_prenorm
+from .allreduce_mhc import (
+    allreduce_mhc_post_prenorm_prepare as allreduce_mhc_post_prenorm_prepare,
+)
+from .allreduce_mhc import (
+    allreduce_mhc_post_prenorm_supported as allreduce_mhc_post_prenorm_supported,
+)
+
 with contextlib.suppress(ImportError, AttributeError):
     from .tp_moe_finalize_rmsnorm import (
         init_tp_moe_finalize_rmsnorm as init_tp_moe_finalize_rmsnorm,

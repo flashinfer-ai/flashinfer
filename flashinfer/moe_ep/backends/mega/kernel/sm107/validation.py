@@ -179,13 +179,15 @@ def validate_forward_metadata(
 def validate_routing_values(
     topk_ids, topk_weights, num_experts: int, *, workspace=None
 ) -> None:
-    """Device assertions run before dispatch, including during graph replay.
+    """Device assertions run before dispatch unless explicitly disabled.
 
     Duplicate valid routes violate the router's workspace capacity proof.
-    -1 is a masked slot; all other IDs must be in range. A failed CUDA
-    assertion invalidates that worker's CUDA context, as with invalid indices
-    in other CUDA indexing operations.
+    -1 is a masked slot whose score is ignored; all other IDs must be in range
+    and have finite scores. A failed CUDA assertion invalidates that worker's
+    CUDA context, as with invalid indices in other CUDA indexing operations.
     """
+    if os.environ.get("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "1") == "0":
+        return
     if (
         topk_ids.is_cuda
         and topk_ids.is_contiguous()
@@ -201,10 +203,11 @@ def validate_routing_values(
     ordered = topk_ids.sort(dim=1).values
     unique = (ordered[:, 1:] != ordered[:, :-1]) | (ordered[:, 1:] == -1)
     valid = ((topk_ids >= -1) & (topk_ids < num_experts)).all()
-    valid = valid & unique.all() & torch.isfinite(topk_weights).all()
+    finite = ((topk_ids == -1) | torch.isfinite(topk_weights)).all()
+    valid = valid & unique.all() & finite
     torch._assert_async(
         valid,
-        "SM107 routes require unique expert IDs in [0, E), or -1, and finite scores",
+        "SM107 routes require unique expert IDs in [0, E), or -1, and finite scores for valid routes",
     )
 
 

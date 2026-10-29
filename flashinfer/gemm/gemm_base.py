@@ -15,8 +15,10 @@ limitations under the License.
 """
 
 import functools
+from collections import Counter, OrderedDict
 import logging
 import os
+import threading
 import warnings
 import weakref
 from dataclasses import astuple, replace
@@ -201,6 +203,12 @@ def _gemm_workspace_at_least(workspace: torch.Tensor, size: int) -> torch.Tensor
 # sizeof(cublasLtMatmulAlgo_t) = uint64_t[8] = 64 bytes.
 # Shared by cuBLAS FP8, cuBLASLt BF16, and any other cuBLASLt-based runners.
 _CUBLASLT_ALGO_BYTES = 64
+# Counts launches where a tuned cuBLASLt tactic did not survive the exact shape and
+# the heuristic default was substituted.  A non-zero count means "reported as tuned,
+# executed untuned" -- benchmarks and tests read it to tell a real tuned hit from a
+# rematerialization.  Keyed by (N, K, compute dtype).
+_CUBLASLT_TACTIC_REMATERIALIZED: "Counter[tuple]" = Counter()
+_CUBLASLT_REMATERIALIZE_WARNED: set = set()
 _CUBLASLT_MAX_ALGOS = 100
 
 # Error messages
@@ -219,8 +227,14 @@ def get_gemm_module():
 
     def cublas_fp8_gemm_runner():
         class CublasFp8GemmRunner(TunableRunner):
+            # Same contract as the BF16 cuBLASLt runner: the instance is memoized
+            # (process-lived), so the algo cache is keyed on the exact launch,
+            # device included, bounded, and locked.
+            _ALGO_CACHE_MAX = 256
+
             def __init__(self):
-                self._algo_cache: dict = {}
+                self._algo_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
+                self._algo_cache_lock = threading.Lock()
 
             def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
                 # Must be synthesis-invariant: including a.shape (dynamic M)
@@ -231,17 +245,34 @@ def get_gemm_module():
                 return (a.dtype, b.dtype, out.dtype)
 
             def _algo_cache_key(self, inputs: List[torch.Tensor]) -> tuple:
-                # Internal cuBLASLt algo-enumeration cache: this one is
-                # shape-specific, so key on full shapes (incl. M).
-                a, b, _, _, out, _ = inputs
-                return (a.shape, b.shape, a.dtype, b.dtype, out.dtype)
+                # The algo list is enumerated per exact problem descriptor and
+                # filtered by the workspace size, so a smaller buffer re-queries.
+                a, b, _, _, out, workspace = inputs
+                dev = a.device
+                major, minor = get_compute_capability(dev)
+                return (
+                    dev.index,
+                    major,
+                    minor,
+                    tuple(a.shape),
+                    tuple(b.shape),
+                    tuple(a.stride()),
+                    tuple(b.stride()),
+                    tuple(out.stride()),
+                    a.dtype,
+                    b.dtype,
+                    out.dtype,
+                    workspace.numel() * workspace.element_size(),
+                )
 
             def _get_algos(self, inputs):
                 a, b, scale_a, scale_b, out, workspace_buffer = inputs
                 key = self._algo_cache_key(inputs)
-                cached = self._algo_cache.get(key)
-                if cached is not None:
-                    return cached
+                with self._algo_cache_lock:
+                    cached = self._algo_cache.get(key)
+                    if cached is not None:
+                        self._algo_cache.move_to_end(key)
+                        return cached
                 algo_buf = torch.empty(
                     _CUBLASLT_MAX_ALGOS * _CUBLASLT_ALGO_BYTES,
                     dtype=torch.uint8,
@@ -257,7 +288,10 @@ def get_gemm_module():
                     algo_buf,
                 )
                 result = (algo_buf, count)
-                self._algo_cache[key] = result
+                with self._algo_cache_lock:
+                    self._algo_cache[key] = result
+                    if len(self._algo_cache) > self._ALGO_CACHE_MAX:
+                        self._algo_cache.popitem(last=False)
                 return result
 
             def get_valid_tactics(
@@ -346,7 +380,7 @@ def get_gemm_module():
 
     # Register the module
     _gemm_module = SimpleNamespace(
-        cublas_fp8_gemm_runner=cublas_fp8_gemm_runner,
+        cublas_fp8_gemm_runner=functools.lru_cache(maxsize=64)(cublas_fp8_gemm_runner),
         cutlass_segment_gemm=cutlass_segment_gemm,
     )
 
@@ -2069,7 +2103,9 @@ def get_gemm_sm120_module_cutlass_fp8():
 
     # Register the module
     return SimpleNamespace(
-        cutlass_fp8_gemm_runner=cutlass_fp8_gemm_runner,
+        cutlass_fp8_gemm_runner=functools.lru_cache(maxsize=64)(
+            cutlass_fp8_gemm_runner
+        ),
     )
 
 
@@ -2109,7 +2145,9 @@ def get_gemm_sm100_module_cutlass_fp8():
 
     # Register the module
     return SimpleNamespace(
-        cutlass_fp8_gemm_runner=cutlass_fp8_gemm_runner,
+        cutlass_fp8_gemm_runner=functools.lru_cache(maxsize=64)(
+            cutlass_fp8_gemm_runner
+        ),
     )
 
 
@@ -2170,7 +2208,9 @@ def get_gemm_sm100_module_cutlass_bf16():
         return CutlassBf16GemmRunner()
 
     return SimpleNamespace(
-        cutlass_bf16_gemm_runner=cutlass_bf16_gemm_runner,
+        cutlass_bf16_gemm_runner=functools.lru_cache(maxsize=64)(
+            cutlass_bf16_gemm_runner
+        ),
     )
 
 
@@ -2180,17 +2220,63 @@ def get_mm_bf16_cublaslt_module():
 
     def cublaslt_bf16_gemm_runner():
         class CublasltBf16GemmRunner(TunableRunner):
+            # The algo list cuBLASLt hands back is enumerated per *exact* problem
+            # descriptor, so the artifact cache below is keyed on the exact launch
+            # signature -- device, layout and shapes included.  The AutoTuner key
+            # (get_cache_key_extras) is the semantic one and must stay
+            # synthesis-invariant.  Conflating the two is what made tuned entries
+            # unreachable (#3868) and, once the runner became long-lived, let two
+            # devices share one algo buffer.
+            _ALGO_CACHE_MAX = 256
+
             def __init__(self):
-                self._algo_cache: dict = {}
+                self._algo_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
+                # The memoized runner is shared across threads; a lookup must not
+                # race an eviction.  Enumeration itself stays outside the lock.
+                self._algo_cache_lock = threading.Lock()
 
             def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
-                a, b, bias, _, out, _ = inputs
+                # Semantic key: synthesis-invariant.  M/N/K already live in the
+                # AutoTuner's input_shapes; repeating the raw (dynamic) M here
+                # made a bucket-tuned entry unreachable at runtime M, silently
+                # discarding the tuning.  Layout is part of the semantics because
+                # a different stride class is a different problem.
+                a, b, _, _, out, _ = inputs
                 return (
-                    a.shape[0],
-                    b.shape[1],
-                    a.shape[1],
+                    a.dtype,
+                    b.dtype,
+                    self._compute_dtype(out.dtype),
+                    a.stride(-1) == 1,
+                    b.stride(-2) == 1,
+                )
+
+            def _algo_cache_key(self, inputs: List[torch.Tensor]) -> tuple:
+                """Exact launch signature for the cuBLASLt algo artifact.
+
+                Device identity is in the key because the runner is memoized and
+                therefore process-lived: without it, an algo enumerated on one
+                GPU would be replayed on another with a different architecture.
+                The workspace size is in it because the heuristic filters algos by
+                it: an algo listed for a larger buffer must not run on a smaller one.
+                """
+                a, b, bias, _, out, workspace = inputs
+                dev = a.device
+                major, minor = get_compute_capability(dev)
+                return (
+                    dev.index,
+                    major,
+                    minor,
+                    tuple(a.shape),
+                    tuple(b.shape),
+                    tuple(a.stride()),
+                    tuple(b.stride()),
+                    tuple(out.stride()),
+                    a.dtype,
+                    b.dtype,
+                    out.dtype,
                     self._compute_dtype(out.dtype),
                     self._pointer_alignment(bias),
+                    workspace.numel() * workspace.element_size(),
                 )
 
             @staticmethod
@@ -2212,10 +2298,12 @@ def get_mm_bf16_cublaslt_module():
             def _get_algos(self, inputs):
                 a, b, bias, _, out, workspace_buffer = inputs
                 compute_dt = self._compute_dtype(out.dtype)
-                key = self.get_cache_key_extras(inputs)
-                cached = self._algo_cache.get(key)
-                if cached is not None:
-                    return cached
+                key = self._algo_cache_key(inputs)
+                with self._algo_cache_lock:
+                    cached = self._algo_cache.get(key)
+                    if cached is not None:
+                        self._algo_cache.move_to_end(key)
+                        return cached
                 algo_buf = torch.empty(
                     _CUBLASLT_MAX_ALGOS * _CUBLASLT_ALGO_BYTES,
                     dtype=torch.uint8,
@@ -2238,7 +2326,13 @@ def get_mm_bf16_cublaslt_module():
                     algo_buf,
                 )
                 result = (algo_buf, count)
-                self._algo_cache[key] = result
+                with self._algo_cache_lock:
+                    self._algo_cache[key] = result
+                    # Bounded: the runner is process-lived now, and a serving
+                    # process walks many exact M values.  The outer factory
+                    # lru_cache bounds the number of runners, not this.
+                    if len(self._algo_cache) > self._ALGO_CACHE_MAX:
+                        self._algo_cache.popitem(last=False)
                 return result
 
             def get_valid_tactics(
@@ -2277,11 +2371,27 @@ def get_mm_bf16_cublaslt_module():
                         "This shape/dtype combination may not be supported."
                     )
                 if tactic >= count:
-                    raise ValueError(
-                        f"Requested tactic {tactic} but only {count} algorithms "
-                        f"available for M={a.shape[0]}, N={b.shape[1]}, K={a.shape[1]}, "
-                        f"dtype={compute_out.dtype}."
-                    )
+                    # cuBLASLt enumerates its algo list per *exact* problem, so a
+                    # tactic tuned at a bucketed M can fall off the end here.
+                    # Raising would break serving; silently taking position 0 would
+                    # report an untuned heuristic launch as a tuned hit.  Take the
+                    # heuristic default, but count and warn so the two are
+                    # distinguishable in a profile or a test.
+                    kind = (b.shape[1], a.shape[1], compute_out.dtype)
+                    _CUBLASLT_TACTIC_REMATERIALIZED[kind] += 1
+                    if kind not in _CUBLASLT_REMATERIALIZE_WARNED:
+                        _CUBLASLT_REMATERIALIZE_WARNED.add(kind)
+                        warnings.warn(
+                            f"cuBLASLt tactic {tactic} is out of range at M="
+                            f"{a.shape[0]} (N={b.shape[1]}, K={a.shape[1]}, "
+                            f"dtype={compute_out.dtype}): only {count} algorithms "
+                            "are enumerated for this exact shape.  Falling back to "
+                            "the heuristic default -- this launch is NOT running "
+                            "the tuned algorithm.  Tune this M, or narrow the "
+                            "tuning buckets.",
+                            stacklevel=2,
+                        )
+                    tactic = 0
                 if tactic < 0:
                     tactic = 0
                 module.mm_bf16_cublaslt_run_with_algo(
@@ -2301,7 +2411,9 @@ def get_mm_bf16_cublaslt_module():
         return CublasltBf16GemmRunner()
 
     return SimpleNamespace(
-        cublaslt_bf16_gemm_runner=cublaslt_bf16_gemm_runner,
+        cublaslt_bf16_gemm_runner=functools.lru_cache(maxsize=64)(
+            cublaslt_bf16_gemm_runner
+        ),
     )
 
 
@@ -2329,10 +2441,22 @@ _BF16_GEMM_SM100_TUNING_CONFIG = TuningConfig(
             -2,
             lambda shapes: shapes[0][-2],
         ),
+        ConstraintSpec(
+            5,  # workspace_buffer index
+            0,
+            # Scratch buffer a backend may resize mid-profile.  Its current
+            # allocation size is not a semantic property of the problem, so pin it
+            # out of the key; otherwise a resize during tuning publishes entries
+            # under a key no later lookup reproduces (#3868).  The workspace
+            # *budget* is a policy the prepared launch must satisfy, which is a
+            # separate concern from this allocation history.
+            lambda shapes: shapes[5][0],
+        ),
     ),
 )
 
 
+@functools.lru_cache(maxsize=64)
 def _tinygemm_bf16_gemm_runner():
     module = get_tinygemm2_module()
 
@@ -2995,7 +3119,7 @@ def fp8_gemm_sm100(
             get_gemm_sm120_module_cutlass_fp8().cutlass_fp8_gemm_runner()
         ),
         "cublas": lambda: get_gemm_module().cublas_fp8_gemm_runner(),
-        "cudnn": _cudnn_gemm_fp8_runner,
+        "cudnn": lambda: _cudnn_gemm_fp8_runner(),
         "cute-dsl_sm107": _cute_dsl_fp8_gemm_runner_sm107,
     }
     runners = [
@@ -3060,7 +3184,9 @@ def _create_cutlass_fp4_gemm_module(module, op_name: str, tuner_name: str):
         return CutlassFp4GemmRunner()
 
     return SimpleNamespace(
-        cutlass_fp4_gemm_runner=cutlass_fp4_gemm_runner,
+        cutlass_fp4_gemm_runner=functools.lru_cache(maxsize=64)(
+            cutlass_fp4_gemm_runner
+        ),
     )
 
 
@@ -3963,6 +4089,22 @@ def _is_cudnn_override_shape_available() -> bool:
         return False
 
 
+# cuDNN frees a plan's runtime-compiled kernels together with the last Python
+# reference to its graph.  CUDA graph replay bypasses Python, so the lru_caches
+# on the build_cudnn_gemm_* helpers never see a captured graph being used and
+# may evict it (e.g. after 2048 other shapes) while a captured CUDA graph still
+# launches its kernels -> use-after-free (segfault in cuGraphLaunch, hangs).
+# Keep every cuDNN graph that is executed during stream capture alive for the
+# life of the process.  This only grows while capturing, so it is bounded by
+# the shapes that are captured (tens in practice), and it is a no-op otherwise.
+_CUDNN_GRAPHS_USED_BY_CUDA_GRAPHS: dict = {}
+
+
+def _retain_cudnn_graph_if_capturing(graph) -> None:
+    if torch.cuda.is_current_stream_capturing():
+        _CUDNN_GRAPHS_USED_BY_CUDA_GRAPHS.setdefault(id(graph), graph)
+
+
 def _get_cudnn_workspace_size(graph, plan_index: int) -> int:
     if plan_index < 0:
         return graph.get_workspace_size()
@@ -3999,7 +4141,10 @@ def _cudnn_graph_engine_knob_tactics(graph) -> List[tuple]:
             )
             continue
         knob_items = tuple(
-            sorted((int(knob_type), int(value)) for knob_type, value in knobs.items())
+            sorted(
+                (int(knob_type), int(value))
+                for knob_type, value in (knobs or {}).items()
+            )
         )
         tactics.append((int(engine_id), knob_items))
     return tactics
@@ -4065,7 +4210,7 @@ def _get_cudnn_plan_index_for_tactic(graph, tactic) -> int:
                 tuple(
                     sorted(
                         (int(knob_type), int(value))
-                        for knob_type, value in knobs.items()
+                        for knob_type, value in (knobs or {}).items()
                     )
                 ),
             )
@@ -4196,6 +4341,9 @@ def clear_cudnn_graph_cache() -> None:
 
     This does **not** clear:
 
+        * cuDNN graphs that were executed during CUDA graph capture
+          (``_CUDNN_GRAPHS_USED_BY_CUDA_GRAPHS``) -- captured CUDA graphs
+          may still launch their kernels.
         * cuDNN handles (``_cudnn_handles``) -- those are cheap to
           re-set the stream on and expensive to recreate.
         * The autotuner's ``_find_nearest_profile`` LRU cache -- it is
@@ -4237,17 +4385,24 @@ _cudnn_handles: dict[int, int] = {}
 
 
 def _get_cudnn_handle(device, stream: torch.cuda.Stream):
-    """Create and return a cached cuDNN handle."""
+    """Create and return a cached cuDNN handle bound to ``stream``."""
     global _cudnn_handles
     device_id = device.index
 
     if _cudnn_handles.get(device_id) is None:
         _check_cudnn_availability()
         _cudnn_handles[device_id] = cudnn.create_handle()
-        print("cudnn_handle created for device_id = {}\n".format(device_id))
-    cudnn.set_stream(_cudnn_handles[device_id], stream.cuda_stream)
+        logger.debug("created cuDNN handle for device_id %s", device_id)
+    handle = _cudnn_handles[device_id]
+    # Deliberately unconditional.  Skipping this when the stream looks unchanged
+    # would need an ownership contract covering the whole bind-to-execute window,
+    # which a per-device shared handle does not have; the right fix is per-thread
+    # handle ownership, not a shadow table.  Costs ~2.4 us/call of green-context
+    # and stream-priority driver queries (cudnn-frontend GH #611 addresses it, but
+    # that half is unmerged on both main and develop as of 2026-08-21).
+    cudnn.set_stream(handle, stream.cuda_stream)
 
-    return _cudnn_handles[device_id]
+    return handle
 
 
 def _validate_fp8_output_dtype(dtype: torch.dtype):
@@ -4266,6 +4421,22 @@ def _validate_bf16_output_dtype(dtype: torch.dtype):
             f"Unsupported output dtype: {dtype}. "
             f"Only torch.bfloat16, torch.float16, and torch.float32 are supported for BF16 GEMM operations."
         )
+
+
+def _effective_cache_m(tuning_config, actual_m: int, spec_idx: int = 0) -> int:
+    """Bucket ``actual_m`` with the *currently effective* tuning buckets.
+
+    Resolved per call rather than captured when the runner is built: the mapper
+    reflects the active ``autotune(tuning_buckets=..., round_up=...)`` override,
+    so a runner constructed under one context must not keep serving another
+    context's buckets.  Capturing it at construction is also what makes the
+    runner factories unsafe to memoize -- the graph's ``cache_m`` would freeze at
+    whatever was effective on the first call and silently stop matching the key
+    the AutoTuner looks the tactic up under.
+    """
+    return AutoTuner.get().get_effective_map_to_tuning_buckets(
+        tuning_config, spec_idx=spec_idx
+    )(actual_m)
 
 
 @functools.lru_cache(maxsize=2048)
@@ -4381,6 +4552,7 @@ def execute_cudnn_gemm_fp4_graph(
     workspace_buffer,
     tactic=-1,
 ):
+    _retain_cudnn_graph_if_capturing(graph)
     variant_pack = {
         UIDs.A_UID.value: a.view(get_native_fp4_dtype()),
         UIDs.B_UID.value: b.view(get_native_fp4_dtype()),
@@ -4564,6 +4736,7 @@ def execute_cudnn_gemm_fp4_graph_override_shape(
     tactic=-1,
 ):
     """Execute FP4 GEMM cuDNN graph with dynamic-shape overrides."""
+    _retain_cudnn_graph_if_capturing(graph)
 
     real_a_shape, real_a_stride = _get_real_fp4_shape_from_packed_uint8(a)
     real_b_shape, real_b_stride = _get_real_fp4_shape_from_packed_uint8(b)
@@ -4698,6 +4871,7 @@ def execute_cudnn_gemm_mxfp8_graph(
     workspace_buffer,
     tactic=-1,
 ):
+    _retain_cudnn_graph_if_capturing(graph)
     _check_mxfp8_gemm_strides(a, b, "cuDNN")
 
     variant_pack = {
@@ -4851,6 +5025,7 @@ def execute_cudnn_gemm_mxfp8_graph_override_shape(
     tactic=-1,
 ):
     """Execute MXFP8 GEMM cuDNN graph with dynamic-shape overrides."""
+    _retain_cudnn_graph_if_capturing(graph)
     # Override-shape graphs require the runtime strides to match the profiled layout.
     if a.stride(-1) != 1:
         raise ValueError(
@@ -5038,6 +5213,7 @@ def execute_cudnn_gemm_fp8_graph(
     workspace,
     tactic=-1,
 ):
+    _retain_cudnn_graph_if_capturing(graph)
     variant_pack = {
         UIDs.A_UID.value: a,
         UIDs.B_UID.value: b,
@@ -5151,6 +5327,7 @@ def execute_cudnn_gemm_fp8_graph_override_shape(
     graph, a, b, a_scale, b_scale, c_final, workspace, tactic=-1
 ):
     """Execute FP8 per-tensor GEMM graph with dynamic-shape overrides."""
+    _retain_cudnn_graph_if_capturing(graph)
     # Override-shape graphs require the runtime strides to match the profiled layout.
     if a.stride(-1) != 1:
         raise ValueError(
@@ -5265,15 +5442,12 @@ def _cudnn_gemm_fp8(
     return out
 
 
+@functools.lru_cache(maxsize=64)
 def _cudnn_gemm_fp8_runner():
-    m_bucket_mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
-        _FP8_GEMM_SM100_TUNING_CONFIG, spec_idx=0
-    )
-
     class CudnnFp8GemmRunner(TunableRunner):
         def __init__(self):
             super().__init__()
-            self._m_bucket_mapper = m_bucket_mapper
+            self._tuning_config = _FP8_GEMM_SM100_TUNING_CONFIG
             self._use_override_shape = _is_cudnn_override_shape_available()
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
@@ -5285,7 +5459,7 @@ def _cudnn_gemm_fp8_runner():
             actual_m = a.shape[-2]
             k = a.shape[-1]
             n = b.shape[-1]
-            cache_m = self._m_bucket_mapper(actual_m)
+            cache_m = _effective_cache_m(self._tuning_config, actual_m)
 
             return _get_cudnn_override_graph(
                 build_cudnn_gemm_fp8_graph_override_shape,
@@ -5466,6 +5640,7 @@ def build_cudnn_gemm_bf16_graph(
 
 
 def execute_cudnn_gemm_bf16_graph(graph, a, b, bias, c_final, workspace, tactic=-1):
+    _retain_cudnn_graph_if_capturing(graph)
     if bias is not None:
         variant_pack = {
             UIDs.A_UID.value: a,
@@ -5605,6 +5780,7 @@ def execute_cudnn_gemm_bf16_graph_override_shape(
     ``override_shapes`` / ``override_strides`` so a single compiled plan
     handles any M dimension without rebuilding.
     """
+    _retain_cudnn_graph_if_capturing(graph)
     a_shape, a_stride = _get_bf16_3d_shape_stride(a)
     b_shape, b_stride = _get_bf16_3d_shape_stride(b)
     c_shape, c_stride = _get_bf16_3d_shape_stride(c_final)
@@ -5721,6 +5897,7 @@ def _cudnn_gemm_bf16(
     return out
 
 
+@functools.lru_cache(maxsize=64)
 def _cudnn_gemm_bf16_runner(
     is_a_k_major: Optional[bool] = None,
     is_b_k_major: Optional[bool] = None,
@@ -5749,10 +5926,6 @@ def _cudnn_gemm_bf16_runner(
     ``a.stride()[-1] == 1`` / ``b.stride()[-2] == 1``.
     """
 
-    m_bucket_mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
-        _BF16_GEMM_SM100_TUNING_CONFIG, spec_idx=0
-    )
-
     class CudnnBf16GemmRunner(TunableRunner):
         def __init__(
             self,
@@ -5760,7 +5933,7 @@ def _cudnn_gemm_bf16_runner(
             is_b_k_major: Optional[bool],
         ):
             super().__init__()
-            self._m_bucket_mapper = m_bucket_mapper
+            self._tuning_config = _BF16_GEMM_SM100_TUNING_CONFIG
             # Default to k-major (the convention torch.rand-synthesized
             # profile tensors use) when caller didn't specify.
             self._is_a_k_major = True if is_a_k_major is None else is_a_k_major
@@ -5787,7 +5960,7 @@ def _cudnn_gemm_bf16_runner(
             # contiguous tensor regardless of the real layout, so reading
             # its stride would build a different graph than the runtime
             # call, breaking tactic-index alignment.
-            cache_m = self._m_bucket_mapper(actual_m)
+            cache_m = _effective_cache_m(self._tuning_config, actual_m)
 
             graph = _get_cudnn_override_graph(
                 build_cudnn_gemm_bf16_graph_override_shape,
@@ -5889,14 +6062,21 @@ def _cudnn_gemm_bf16_runner(
 
 def _get_real_fp4_shape_from_packed_uint8(packed_fp4_tensor):
     # the FP4 data are packed into uint8, we need to expand the shape and stride information to get the real shape and stride to be used in the cuDNN graph.
-    is_column_major = packed_fp4_tensor.stride(-2) == 1
-    real_shape = list(packed_fp4_tensor.shape)
-    real_stride = list(packed_fp4_tensor.stride())
+    return _real_fp4_shape_stride(
+        tuple(packed_fp4_tensor.shape), tuple(packed_fp4_tensor.stride())
+    )
+
+
+@functools.lru_cache(maxsize=1024)
+def _real_fp4_shape_stride(shape: tuple, stride: tuple):
+    is_column_major = stride[-2] == 1
+    real_shape = list(shape)
+    real_stride = list(stride)
 
     # this function will be used for both mm and bmm, so we need to insert batch dimension if the tensor is 2d
     if len(real_shape) == 2:
         real_shape.insert(0, 1)
-        real_stride.insert(0, packed_fp4_tensor.numel())
+        real_stride.insert(0, shape[0] * shape[1])
 
     # each packed uint8 contains 2 fp4 elements
     real_shape[-2 if is_column_major else -1] *= 2
@@ -6311,7 +6491,9 @@ def _create_cutlass_mxfp8_gemm_module(module, op_name: str, tuner_name: str):
         return CutlassMxfp8GemmRunner()
 
     return SimpleNamespace(
-        cutlass_mxfp8_gemm_runner=cutlass_mxfp8_gemm_runner,
+        cutlass_mxfp8_gemm_runner=functools.lru_cache(maxsize=64)(
+            cutlass_mxfp8_gemm_runner
+        ),
     )
 
 
@@ -6763,6 +6945,7 @@ def _sm107_low_m_split_k(
     return 1
 
 
+@functools.lru_cache(maxsize=64)
 def _cute_dsl_gemm_mxfp8_runner(
     sm_major: int,
     sm_minor: int,
@@ -7367,6 +7550,7 @@ def _cute_dsl_mxfp8_runners_sm107(
     return [sm107, low_m] + tail
 
 
+@functools.lru_cache(maxsize=64)
 def _cudnn_mm_mxfp8_runner():
     """Build a TunableRunner for the cuDNN MXFP8 (2D mm) backend.
 
@@ -7383,14 +7567,10 @@ def _cudnn_mm_mxfp8_runner():
     per-shape graph is built (HEURISTICS_CHOICE).
     """
 
-    m_bucket_mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
-        _MM_MXFP8_TUNING_CONFIG, spec_idx=0
-    )
-
     class CudnnMmMxfp8GemmRunner(TunableRunner):
         def __init__(self):
             super().__init__()
-            self._m_bucket_mapper = m_bucket_mapper
+            self._tuning_config = _MM_MXFP8_TUNING_CONFIG
             self._use_override_shape = _is_cudnn_override_shape_available()
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
@@ -7402,7 +7582,7 @@ def _cudnn_mm_mxfp8_runner():
             actual_m = a.shape[0]
             k = a.shape[1]
             n = b.shape[1]
-            cache_m = self._m_bucket_mapper(actual_m)
+            cache_m = _effective_cache_m(self._tuning_config, actual_m)
             return _get_cudnn_override_graph(
                 build_cudnn_gemm_mxfp8_graph_override_shape,
                 tactic,
@@ -7787,6 +7967,7 @@ def _cudnn_gemm_fp4(
     return out
 
 
+@functools.lru_cache(maxsize=64)
 def _cudnn_gemm_fp4_runner(tuning_config):
     """Build a CudnnFp4GemmRunner.
 
@@ -7815,14 +7996,10 @@ def _cudnn_gemm_fp4_runner(tuning_config):
         runtime-time produce the same ``cache_m`` for the same input.
     """
 
-    m_bucket_mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
-        tuning_config, spec_idx=0
-    )
-
     class CudnnFp4GemmRunner(TunableRunner):
         def __init__(self):
             super().__init__()
-            self._m_bucket_mapper = m_bucket_mapper
+            self._tuning_config = tuning_config
             self._use_override_shape = _is_cudnn_override_shape_available()
 
         def _get_override_graph(
@@ -7838,14 +8015,14 @@ def _cudnn_gemm_fp4_runner(tuning_config):
 
             # cache_m must match the AutoTuner cache key so the runtime
             # graph is the SAME graph the autotuner profiled tactics on.
-            # ``self._m_bucket_mapper`` is the *currently effective*
+            # ``_effective_cache_m`` resolves the *currently effective*
             # ``map_to_tuning_buckets`` (with any
             # ``autotune(tuning_buckets=..., round_up=...)`` override
             # applied).  Sharing the mapper keeps cache_m and the tactic
             # cache key in lockstep -- otherwise a tactic profiled on
             # graph ``cache_m=A`` is silently applied to graph ``cache_m=B``
             # at runtime, which has a different plan-index meaning.
-            cache_m = self._m_bucket_mapper(actual_m)
+            cache_m = _effective_cache_m(self._tuning_config, actual_m)
 
             graph = _get_cudnn_override_graph(
                 build_cudnn_gemm_fp4_graph_override_shape,
@@ -8310,6 +8487,7 @@ def _b12x_gemm_fp4_requirement(
 _CUTEDSL_LOW_LATENCY_BLOCK_SCALED_KERNEL_CACHE: dict[tuple, Callable] = {}
 
 
+@functools.lru_cache(maxsize=64)
 def _cutedsl_low_latency_blockscaled_gemm_runner(
     sm_version: int,
     enable_pdl: bool,
@@ -8716,6 +8894,7 @@ def _select_sm100_mm_fp4_splitk_tactic(
     return (tile, (1, 1), True, False, _SM100_SPLITK_KERNEL_TYPE, split_k_slices)
 
 
+@functools.lru_cache(maxsize=64)
 def _cute_dsl_gemm_fp4_runner(
     sm_major: int,
     sm_minor: int,
@@ -10773,9 +10952,11 @@ def _get_trtllm_gemm_module_impl(enable_rubin: bool):
 
     # Register the module
     return SimpleNamespace(
-        trtllm_gemm_runner=trtllm_gemm_runner,
-        trtllm_fp4_gemm_runner=trtllm_fp4_gemm_runner,
-        trtllm_mxfp8_gemm_runner=trtllm_mxfp8_gemm_runner,
+        trtllm_gemm_runner=functools.lru_cache(maxsize=64)(trtllm_gemm_runner),
+        trtllm_fp4_gemm_runner=functools.lru_cache(maxsize=64)(trtllm_fp4_gemm_runner),
+        trtllm_mxfp8_gemm_runner=functools.lru_cache(maxsize=64)(
+            trtllm_mxfp8_gemm_runner
+        ),
         trtllm_gemm=op.trtllm_gemm,
     )
 
@@ -12651,14 +12832,10 @@ def _cudnn_gemm_mxfp8(
 
 
 def _cudnn_gemm_mxfp8_runner():
-    m_bucket_mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
-        _FP8_GEMM_SM100_TUNING_CONFIG, spec_idx=0
-    )
-
     class CudnnMxfp8GemmRunner(TunableRunner):
         def __init__(self):
             super().__init__()
-            self._m_bucket_mapper = m_bucket_mapper
+            self._tuning_config = _FP8_GEMM_SM100_TUNING_CONFIG
             self._use_override_shape = _is_cudnn_override_shape_available()
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
@@ -12670,7 +12847,7 @@ def _cudnn_gemm_mxfp8_runner():
             actual_m = a.shape[-2]
             k = a.shape[-1]
             n = b.shape[-1]
-            cache_m = self._m_bucket_mapper(actual_m)
+            cache_m = _effective_cache_m(self._tuning_config, actual_m)
 
             return _get_cudnn_override_graph(
                 build_cudnn_gemm_mxfp8_graph_override_shape,

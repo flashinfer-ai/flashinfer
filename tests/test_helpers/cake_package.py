@@ -17,6 +17,7 @@ PACKAGES: dict[str, str] = {
     "cake_rmsnorm_train": "flashinfer.cake_rmsnorm_train_backend",
     "cake_causal_conv1d_train": "flashinfer.cake_causal_conv1d_train_backend",
     "cake_gated_act_mxfp8": "flashinfer.cake_gated_act_mxfp8_backend",
+    "cake_rmsnorm_silu_gate_train": "flashinfer.cake_rmsnorm_silu_gate_train_backend",
     "cake_ulysses": "flashinfer.cake_ulysses_backend",
     "cake_fused_qk_rope_append": "flashinfer.cake_fused_qk_rope_append_backend",
     "cake_sage_block_sparse_attention": "flashinfer.cake_sage_block_sparse_attention_backend",
@@ -39,6 +40,8 @@ PACKAGES: dict[str, str] = {
     "deepgemm_fp8_gemm": "flashinfer.experimental.deepgemm_fp8_gemm",
     "deepgemm_batched_gemm": "flashinfer.experimental.deepgemm_batched_gemm",
     "sm110_xqa": "flashinfer.experimental.sm110_xqa",
+    "cake_gdn_det_train": "flashinfer.experimental.cake_gdn_det_train",
+    "cake_gqa_train": "flashinfer.experimental.cake_gqa_train",
 }
 
 

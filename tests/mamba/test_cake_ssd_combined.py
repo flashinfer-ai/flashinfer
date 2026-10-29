@@ -1733,7 +1733,10 @@ def test_cake_ssd_combined_cu_seqlens_form_is_bitwise_the_triple(
             program_triple,
             fused,
         )
-        assert program_cu.split("_", 1)[1] == program_triple.split("_", 1)[1], (
+        ring_triple = _without_table_form(
+            module, program_triple, state_dtype=state_dtype, num_sequences=len(lengths)
+        )
+        assert program_cu.split("_", 1)[1] == ring_triple.split("_", 1)[1], (
             program_cu,
             program_triple,
         )
@@ -3903,6 +3906,30 @@ def _derived_family(module, lengths, *, nheads=8):
     )
 
 
+def _without_table_form(module, name, *, state_dtype, num_sequences, nheads=8):
+    """The ring one-launch program a derived-table call stands for on this
+    device: ``name`` without the prologue form that ``exactone_table_variant``
+    picks for the call's launch grid (SM107: ``tablefirst`` below its grid
+    threshold, ``tableroles`` from it on).  The forms move only where the CTA
+    prologue derives the table; the arithmetic is the ring program's.  Every
+    other program is returned as is."""
+
+    program = module._PROGRAMS[name]
+    if program.family != "exactone" or program.variant == "noring":
+        return name
+    form = module.exactone_table_variant(
+        capability=torch.cuda.get_device_capability(),
+        variant="",
+        state_dtype=state_dtype,
+        grid=module._persistent_grid_size(
+            total_work=num_sequences * nheads,
+            sm_count=module._sm_count(torch.cuda.current_device()),
+        ),
+    )
+    assert program.variant == form, (name, form)
+    return name[: -len(form) - 1] if form else name
+
+
 def _two_kernel_program(module, name, *, num_sequences, seqlen):
     """Assert ``name`` is the two-kernel program of a packed-varlen call
     (``two_kernel_family``) and return its family."""
@@ -4015,8 +4042,13 @@ def test_source_varlen_cumsum_binding_without_gpu(monkeypatch, case, arch):
         # SM103 and SM107 derive a runner-owned table in the fused main kernel's
         # CTA prologue: the one-launch exactone program (the stage's grid is 0,
         # nothing is published), its scratch one row per CTA (one CTA here:
-        # 2 items on this 1-SM device).
-        assert name == "exactone_bf16_varlen"
+        # 2 items on this 1-SM device; on SM107 a grid that small takes the
+        # tablefirst form).
+        assert name == (
+            "exactone_bf16_varlen_tablefirst"
+            if arch == "sm_107a"
+            else "exactone_bf16_varlen"
+        )
         assert launch["preprocess_grid"] == (0, 1, 1)
         assert launch["main_grid"] == (1, 1, 1)
         assert set(preprocess) == set(module._PREPROCESS_ARGS)
@@ -4558,9 +4590,11 @@ def test_source_host_template_binds_stage_arguments_in_loader_order():
 
 
 def test_source_runner_binds_preprocess_status_without_gpu(monkeypatch):
-    """The runner owns one zeroed int32 status word per device, binds it as
-    ``preprocess_status`` on every call and exposes it through the
-    synchronizing debug accessor ``seq_idx_status``."""
+    """The runner owns zeroed int32 status words per device -- two, then one
+    per pair of SMs and one per 32 pairs (none on this one-SM device) -- binds
+    them as ``preprocess_status`` on every call and exposes word 0 through the
+    synchronizing debug accessor ``seq_idx_status``; word 1 is the item
+    counter of the sm_107a claim programs, which every launch leaves 0."""
 
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     calls = []
@@ -4584,14 +4618,16 @@ def test_source_runner_binds_preprocess_status_without_gpu(monkeypatch):
 
     (first, second) = (launch["preprocess"]["preprocess_status"] for _, launch in calls)
     assert first is second
-    assert first.dtype == torch.int32 and tuple(first.shape) == (1,)
-    assert first.device == cpu and int(first.item()) == 0
+    assert first.dtype == torch.int32 and tuple(first.shape) == (2,)
+    assert first.device == cpu and first.tolist() == [0, 0]
+    assert runner.seq_idx_status(device=cpu) == 0
+    first[1] = 7
     assert runner.seq_idx_status(device=cpu) == 0
     first[0] = 1
     assert runner.seq_idx_status(device=cpu) == 1
     assert runner.seq_idx_status(reset=True, device=cpu) == 1
     assert runner.seq_idx_status(device=cpu) == 0
-    assert int(first.item()) == 0
+    assert first.tolist() == [0, 0]
 
 
 def test_source_sequence_arguments_fail_closed_on_missing_values():
@@ -4756,7 +4792,39 @@ def test_source_program_table_names_shipped_sources():
         for variant in ("", "_noring")
         for state in ("bf16", "f16", "f32")
         if (variant, state) != ("_noring", "f32")
-    }
+    } | {"exactpre_bf16_varlen_claim", "exactpre_f32_varlen_claim"} | {
+        f"{family}_{state}_varlen_ibulk"
+        for family in ("exactpre", "exactfused")
+        for state in ("bf16", "f16")
+    } | {
+        "exactone_bf16_varlen_tablefirst",
+        "exactone_bf16_varlen_tableroles",
+        "exactone_f16_varlen_tablefirst",
+        "exactone_f16_varlen_tableroles",
+        "exactone_f32_varlen_tablefirst",
+        "exactone_f32_varlen_tableroles",
+    } | {f"exactpre_{state}_varlen_tailone" for state in ("bf16", "f16", "f32")}
+    # The sm_107a-only programs (the claim programs, the two-kernel and fused
+    # initial-state bulk programs, the two-kernel one-CTA pair programs and
+    # the one-launch programs in the tablefirst / tableroles prologue forms):
+    # their ``_SM107_MODULES`` entry is their sole source.
+    assert {
+        "exactpre_bf16_varlen_claim",
+        "exactpre_f32_varlen_claim",
+        "exactpre_bf16_varlen_ibulk",
+        "exactpre_f16_varlen_ibulk",
+        "exactpre_bf16_varlen_tailone",
+        "exactpre_f16_varlen_tailone",
+        "exactpre_f32_varlen_tailone",
+        "exactfused_bf16_varlen_ibulk",
+        "exactfused_f16_varlen_ibulk",
+        "exactone_bf16_varlen_tablefirst",
+        "exactone_bf16_varlen_tableroles",
+        "exactone_f16_varlen_tablefirst",
+        "exactone_f16_varlen_tableroles",
+        "exactone_f32_varlen_tablefirst",
+        "exactone_f32_varlen_tableroles",
+    } == module._SM107_ONLY_PROGRAMS
     assert set(module._SCAN_MODULES) == {
         name for name in module._PROGRAMS if name.startswith("exact_")
     }
@@ -4773,9 +4841,11 @@ def test_source_program_table_names_shipped_sources():
     # The exactone programs are the SM103 render of the same six fused varlen
     # entries: their own device modules, never the exactfused files (on
     # sm_107a too: the one-launch render beside the exactfused one).
-    assert set(module._EXACTONE_MODULES) == {
-        name for name in module._PROGRAMS if name.startswith("exactone_")
-    }
+    assert (
+        set(module._EXACTONE_MODULES)
+        == {name for name in module._PROGRAMS if name.startswith("exactone_")}
+        - module._SM107_ONLY_PROGRAMS
+    )
     assert {
         name.replace("exactone_", "exactfused_", 1) for name in module._EXACTONE_MODULES
     } == {name for name in module._EXACTFUSED_MODULES if "_varlen" in name}
@@ -4783,45 +4853,58 @@ def test_source_program_table_names_shipped_sources():
         module._EXACTFUSED_MODULES.values()
     )
     assert set(module._EXACTFUSED_MODULES) == {
-        name for name in module._PROGRAMS if name.startswith("exactfused_")
+        name
+        for name in module._PROGRAMS
+        if name.startswith("exactfused_") and name not in module._SM107_ONLY_PROGRAMS
     }
-    assert set(module._EXACTPRE_MODULES) == {
-        name for name in module._PROGRAMS if name.startswith("exactpre_")
-    }
+    assert (
+        set(module._EXACTPRE_MODULES)
+        == {name for name in module._PROGRAMS if name.startswith("exactpre_")}
+        - module._SM107_ONLY_PROGRAMS
+    )
     assert set(module._CHUNKPAR_MODULES) == {
         name for name in module._PROGRAMS if name.startswith("chunkpar_")
     }
     assert set(module._CHUNKPAR3_MODULES) == {
         name for name in module._PROGRAMS if name.startswith("chunkpar3_")
     }
-    # The sm_107a (Rubin) module table: the programs whose Rubin render was
-    # regenerated with its own geometry -- the fused and one-launch varlen
-    # scans, the look-back chunk-parallel program and the two-kernel varlen
-    # ring program -- each entry the fold module's stem under its own
-    # identity (the export's content hash).  Every other program builds its
-    # fold module on sm_107a too: the retained start ``exact_*`` programs,
-    # the SM100-only ``exactmeta_*`` programs and the programs whose Rubin
-    # render differed from the fold only by the descriptor mask (an
-    # ``__CUDA_ARCH__`` branch of the fold source).  The ``exactone_*`` entry
-    # of a suffix is a source of its own (the one-launch render beside the
-    # SM100-form render), as on SM103.
-    assert set(module._SM107_MODULES) == {
-        f"{family}_{state}_{mode}{variant}"
-        for family, mode, variants in (
-            ("exactfused", "varlen", ("", "_noring")),
-            ("exactone", "varlen", ("", "_noring")),
-            ("exactpre", "varlen", ("",)),
-            ("chunkpar", "batched", ("",)),
-            ("chunkpar", "varlen", ("",)),
-        )
-        for variant in variants
-        for state in ("bf16", "f16", "f32")
-        if (variant, state) != ("_noring", "f32")
-    }
-    assert len(module._SM107_MODULES) == 19
+    # The sm_107a (Rubin) module table: every program whose Rubin render was
+    # regenerated with its own geometry -- the fused, one-launch and
+    # two-kernel exact scans (with their ``_noring`` and ``_tail`` variants),
+    # the look-back and the three-phase chunk-parallel programs -- each entry
+    # the fold module's stem under its own identity (the export's content
+    # hash).  Only the retained start ``exact_*`` programs and the SM100-only
+    # ``exactmeta_*`` programs build their fold module on sm_107a.  The
+    # ``exactone_*`` entry of a suffix is a source of its own (the one-launch
+    # render beside the SM100-form render), as on SM103.
+    assert (
+        set(module._SM107_MODULES)
+        == {
+            f"{family}_{state}_{mode}{variant}"
+            for family, mode, variants in (
+                ("exactfused", "batched", ("", "_noring")),
+                ("exactfused", "varlen", ("", "_noring")),
+                ("exactone", "varlen", ("", "_noring")),
+                ("exactpre", "batched", ("", "_tail")),
+                ("exactpre", "varlen", ("", "_tail")),
+                ("chunkpar", "batched", ("",)),
+                ("chunkpar", "varlen", ("",)),
+                ("chunkpar3", "batched", ("",)),
+                ("chunkpar3", "varlen", ("",)),
+            )
+            for variant in variants
+            for state in ("bf16", "f16", "f32")
+            if (variant, state, mode) != ("_noring", "f32", "varlen")
+        }
+        | module._SM107_ONLY_PROGRAMS
+    )
+    assert len(module._SM107_MODULES) == 55
     assert set(module._SM107_MODULES) <= set(module._PROGRAMS)
+    assert set(module._PROGRAMS) - set(module._SM107_MODULES) == {
+        name for name in module._PROGRAMS if name.startswith(("exact_", "exactmeta_"))
+    }
     for name, own in module._SM107_MODULES.items():
-        if name.startswith("exactone_"):
+        if name.startswith("exactone_") and name not in module._SM107_ONLY_PROGRAMS:
             twin = module._SM107_MODULES[name.replace("exactone_", "exactfused_", 1)]
             assert twin != own, (name, twin)
     assert len(set(module._SM107_MODULES.values())) == len(module._SM107_MODULES)
@@ -4885,7 +4968,15 @@ def test_source_program_table_names_shipped_sources():
         template_path, main_args, smem_bytes = family_host[family]
         if variant:
             (variant_name,) = variant
-            assert variant_name in ("noring", "tail")
+            assert variant_name in (
+                "noring",
+                "tail",
+                "tailone",
+                "claim",
+                "ibulk",
+                "tablefirst",
+                "tableroles",
+            )
             assert family in (
                 "exact",
                 "exactfused",
@@ -4893,8 +4984,20 @@ def test_source_program_table_names_shipped_sources():
                 "exactone",
                 "exactpre",
             )
-            if variant_name == "tail":
+            if variant_name in ("tail", "tailone", "claim"):
                 assert family == "exactpre"
+            if variant_name == "tailone":
+                assert mode == "varlen"
+            if variant_name == "ibulk":
+                assert family in ("exactpre", "exactfused")
+            if variant_name == "claim":
+                assert (state_key, mode) in (("bf16", "varlen"), ("f32", "varlen"))
+            if variant_name == "ibulk":
+                assert (state_key, mode) in (("bf16", "varlen"), ("f16", "varlen"))
+            if variant_name in ("tablefirst", "tableroles"):
+                assert family == "exactone" and mode == "varlen"
+            sm107_only = ("claim", "ibulk", "tailone", "tablefirst", "tableroles")
+            assert (variant_name in sm107_only) == (name in module._SM107_ONLY_PROGRAMS)
             smem_bytes = module._VARIANT_SMEM_BYTES[(family, variant_name)]
             assert (
                 smem_bytes
@@ -4902,8 +5005,14 @@ def test_source_program_table_names_shipped_sources():
                     ("exact", "noring"): module._EXACT_NORING_SMEM_BYTES,
                     ("exactfused", "noring"): module._EXACTFUSED_NORING_SMEM_BYTES,
                     ("exactmeta", "noring"): module._EXACTFUSED_NORING_SMEM_BYTES,
+                    ("exactone", "tablefirst"): module._EXACTONE_SMEM_BYTES,
+                    ("exactone", "tableroles"): module._EXACTONE_SMEM_BYTES,
                     ("exactone", "noring"): module._EXACTONE_NORING_SMEM_BYTES,
                     ("exactpre", "tail"): module._EXACTPRE_TAIL_SMEM_BYTES,
+                    ("exactpre", "claim"): module._EXACTPRE_CLAIM_SMEM_BYTES,
+                    ("exactpre", "ibulk"): module._EXACTPRE_IBULK_SMEM_BYTES,
+                    ("exactpre", "tailone"): module._EXACTPRE_TAILONE_SMEM_BYTES,
+                    ("exactfused", "ibulk"): module._EXACTFUSED_IBULK_SMEM_BYTES,
                 }[(family, variant_name)]
             )
         assert program.variant == (variant[0] if variant else "")
@@ -4948,13 +5057,30 @@ def test_source_program_table_names_shipped_sources():
             )
             device_sources.add(source)
         # The sm_107a render of the program (``_SM107_MODULES``): the same
-        # kernel symbol behind the shared preprocess, in its own device source;
-        # a program without an entry builds its fold source on sm_107a too.
+        # kernel symbol, in its own device source, behind the sm_107a render
+        # of the segment preprocess (the ``exactmeta`` programs keep the
+        # shared metadata kernel); a program without an entry builds its fold
+        # main source on sm_107a too.
         rubin = module._arch_program(name, "sm_107a")
         assert rubin.main.kernel == program.main.kernel
-        assert rubin.preprocess is program.preprocess
+        if program.preprocess is module._SEGMENT_PREPROCESS:
+            assert rubin.preprocess is _sm107_segment_preprocess(module, name)
+            assert rubin.preprocess.module != program.preprocess.module
+            source = source_dir / module._DEVICE_DIR / rubin.preprocess.source
+            assert source.is_file(), source
+            assert re.search(
+                rf"\b{rubin.preprocess.kernel}\(",
+                source.read_text(encoding="utf-8"),
+            )
+            device_sources.add(source)
+        else:
+            assert rubin.preprocess is program.preprocess
         if name not in module._SM107_MODULES:
-            assert rubin is program
+            assert rubin.main is program.main
+        elif name in module._SM107_ONLY_PROGRAMS:
+            # no fold source: the program binds its sm_107a render
+            assert rubin.main is program.main
+            assert program.main.module == module._SM107_MODULES[name]
         else:
             assert rubin.main.module == module._SM107_MODULES[name]
             assert rubin.main.module != program.main.module
@@ -4999,8 +5125,13 @@ def test_source_program_table_names_shipped_sources():
     # and the packed-varlen metadata kernel; plus one sm_107a (Rubin) render
     # per ``_SM107_MODULES`` identity (a program without an entry builds its
     # fold source on sm_107a, whose descriptor mask is an ``__CUDA_ARCH__``
-    # branch), no other architecture copies and no orphans.
-    rubin_sources = set(module._SM107_MODULES.values())
+    # branch) and the two sm_107a renders of the segment preprocess (with and
+    # without the early dependent-launch trigger), no other architecture copies
+    # and no orphans.
+    rubin_sources = set(module._SM107_MODULES.values()) | {
+        module._SM107_SEGMENT_PREPROCESS_MODULE,
+        module._SM107_SEGMENT_PREPROCESS_TRIGGER_MODULE,
+    }
     assert len(device_sources) == 53 + len(rubin_sources)
     assert sorted(
         path.name for path in (source_dir / module._DEVICE_DIR).glob("*.cu")
@@ -5018,6 +5149,8 @@ def test_active_source_package_declares_cuda_half_types_explicitly():
         for program in module._PROGRAMS.values()
         for kernel in program.kernels
     } | {f"{identity}.cu" for identity in module._SM107_MODULES.values()}
+    sources.add(module._SM107_SEGMENT_PREPROCESS.source)
+    sources.add(module._SM107_SEGMENT_PREPROCESS_TRIGGER.source)
     assert sources
     for name in sorted(sources):
         source = (source_root / name).read_text(encoding="utf-8")
@@ -5311,8 +5444,8 @@ def test_source_chunk_parallel_family_rule(
     "batch,nheads,nchunks,varlen,expected",
     (
         (1, 8, 16, False, "chunkpar3"),  # perf_batched_1x16: 128 tiles
-        (1, 8, 64, False, "chunkpar3"),  # perf_batched_1x64: 64 chunks (measured 0.90)
-        (1, 8, 128, False, "chunkpar3"),  # 8 items x 128 chunks (0.94)
+        (1, 8, 64, False, "chunkpar3"),  # perf_batched_1x64: 512 tiles, below the band
+        (1, 8, 128, False, "chunkpar"),  # 1024 tiles: the look-back band (1.14)
         (
             1,
             8,
@@ -5326,12 +5459,13 @@ def test_source_chunk_parallel_family_rule(
             8,
             64,
             False,
-            "chunkpar3",
-        ),  # perf_batched_4x64: 32 items x 64 chunks (0.92)
+            "chunkpar",
+        ),  # perf_batched_4x64: 2048 tiles, the look-back band (1.10-1.14)
         (1, 32, 16, False, "chunkpar"),  # cp_b1h32c16: 512 tiles, 16 chunks (1.01)
-        (1, 32, 32, False, "chunkpar3"),  # 32 items x 32 chunks (0.97)
-        (1, 16, 32, False, "chunkpar3"),  # 16 items x 32 chunks (0.94)
-        (1, 16, 128, False, "chunkpar3"),  # 16 items x 128 chunks (0.90)
+        (1, 32, 32, False, "chunkpar"),  # 1024 tiles: the look-back band (1.07)
+        (1, 16, 32, False, "chunkpar3"),  # 512 tiles, 32 chunks (0.97)
+        (1, 16, 128, False, "chunkpar"),  # 2048 tiles: the look-back band (1.11)
+        (4, 8, 128, False, "chunkpar3"),  # 4096 tiles, above the band (0.97)
         (4, 8, 16, True, "chunkpar"),  # varlen never routes three-phase
         (1, 8, 8, False, "exact"),  # 8 chunks: the exact scan (Rubin constants)
         (1, 128, 32, False, "exact"),  # 128 heads: the exact scan
@@ -5347,6 +5481,7 @@ def test_source_chunk_parallel_family_rule(
         "1x32x32",
         "1x16x32",
         "1x16x128",
+        "4x8x128",
         "v4x8x16",
         "1x8x8",
         "1x128x32",
@@ -5357,10 +5492,11 @@ def test_source_chunk_parallel_family_rule_rubin(
 ):
     """The family rule with the Rubin (10, 7) constants at 212 SMs: inside
     the chunk-parallel regime the three-phase program serves every batched
-    call with at most 256 tiles or at least 32 chunks per item (measured
-    three-phase / look-back 0.90-0.97 on Rubin), except at most 8 items with
-    at least 256 chunks (1.01); 32 items x 16 chunks and varlen calls stay on
-    the look-back."""
+    call with at most 256 tiles or at least 32 chunks per item, except calls
+    of more than 512 and at most 2048 tiles (look-back / three-phase time
+    0.88-0.96 on Rubin with the PDL-triggered preprocess)
+    and at most 8 items with at least 256 chunks (1.01); 32 items x 16
+    chunks and varlen calls stay on the look-back."""
 
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     assert module._RUBIN_THREE_PHASE_CAPABILITIES == ((10, 7),)
@@ -5369,6 +5505,7 @@ def test_source_chunk_parallel_family_rule_rubin(
         module._RUBIN_LOOKBACK_MAX_ITEMS == 8
         and module._RUBIN_LOOKBACK_MIN_CHUNKS == 256
     )
+    assert module._RUBIN_LOOKBACK_TILES == (512, 2048)
     family = _family(
         batch,
         nheads,
@@ -5399,10 +5536,8 @@ def test_source_chunk_parallel_family_rule_rubin(
     assert rubin is (expected == "chunkpar3")
     reversed_on_rubin = (batch, nheads, nchunks, varlen) in {
         (1, 8, 64, False),
-        (1, 8, 128, False),
-        (1, 32, 32, False),
+        (4, 8, 64, False),
         (1, 16, 32, False),
-        (1, 16, 128, False),
     }
     assert (rubin != blackwell) is reversed_on_rubin
 
@@ -5748,15 +5883,75 @@ def test_source_chunk_parallel_launch_orders_its_main_arguments(monkeypatch):
         )
 
 
+def _sm107_segment_preprocess(module, name):
+    """The sm_107a segment preprocess the loader binds to program ``name``: the
+    early-trigger twin when its main kernel launches with programmatic
+    dependent launch and its family is in ``_PDL_TRIGGER_FAMILIES``, else the
+    plain sm_107a render."""
+
+    if (
+        module._main_pdl(name, "sm_107a")
+        and module._PROGRAMS[name].family in module._PDL_TRIGGER_FAMILIES
+    ):
+        return module._SM107_SEGMENT_PREPROCESS_TRIGGER
+    return module._SM107_SEGMENT_PREPROCESS
+
+
+def test_source_sm107_preprocess_trigger_twin():
+    """The two sm_107a segment preprocess renders differ only by the early
+    dependent-launch trigger: the twin (``_SM107_SEGMENT_PREPROCESS_TRIGGER``)
+    issues ``griddepcontrol.launch_dependents`` before any work and the plain
+    render never does, so a main grid launched with programmatic dependent
+    launch behind the plain render starts when the preprocess CTAs exit.  Only
+    the ``_PDL_TRIGGER_FAMILIES`` programs that launch their main kernel with
+    programmatic dependent launch run the twin; ``exactpre`` is not one of
+    those families."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    device_dir = module._source_dir() / module._DEVICE_DIR
+    plain_kernel = module._SM107_SEGMENT_PREPROCESS
+    twin_kernel = module._SM107_SEGMENT_PREPROCESS_TRIGGER
+    plain = (device_dir / plain_kernel.source).read_text(encoding="utf-8")
+    twin = (device_dir / twin_kernel.source).read_text(encoding="utf-8")
+    trigger = '    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");\n'
+    assert "griddepcontrol" not in plain
+    assert twin.count("griddepcontrol") == 1 and twin.count(trigger) == 1
+    assert twin.replace(trigger, "", 1) == plain
+    assert twin_kernel.kernel == plain_kernel.kernel
+    assert (twin_kernel.threads, twin_kernel.fast_math) == (
+        plain_kernel.threads,
+        plain_kernel.fast_math,
+    )
+    assert module._PDL_TRIGGER_FAMILIES <= module._PDL_FAMILIES
+    assert "exactpre" not in module._PDL_TRIGGER_FAMILIES
+    triggered = set()
+    for name, program in module._PROGRAMS.items():
+        for arch in ("sm_100a", "sm_103a"):
+            assert module._arch_program(name, arch).preprocess is program.preprocess
+        rubin = module._arch_program(name, "sm_107a")
+        if rubin.preprocess is twin_kernel:
+            assert module._main_pdl(name, "sm_107a")
+            assert program.family in module._PDL_TRIGGER_FAMILIES
+            triggered.add(program.family)
+        elif program.preprocess is module._SEGMENT_PREPROCESS:
+            assert rubin.preprocess is plain_kernel
+    assert triggered == set(module._PDL_TRIGGER_FAMILIES)
+
+
 def test_source_sm107_lookup_shadows_the_fold_main_module():
     """``_main_module`` / ``_arch_program``: on sm_107a (Rubin) a program in
     ``_SM107_MODULES`` builds the table module -- the same kernel symbol,
-    thread count and build flags behind the shared preprocess, host template
-    and SMEM literal -- and every other program (the retained start
+    thread count and build flags behind the same host template and SMEM
+    literal, or the render's own literal for a kind
+    ``_SM107_VARIANT_SMEM_BYTES`` lists -- and every other program (the retained start
     ``exact_*`` programs, the SM100-only ``exactmeta_*`` programs and the
     programs whose fold source selects the Rubin descriptor mask by
     ``__CUDA_ARCH__``) its fold module; sm_100a and sm_103a always build the
-    fold module.  ``_TARGET_ARCHS`` names the three capabilities, the
+    fold module.  On sm_107a every program but ``exactmeta_*`` runs the
+    Rubin render of the segment preprocess (``_SM107_SEGMENT_PREPROCESS``:
+    the same symbol, thread count and build flags in its own module);
+    sm_100a and sm_103a build the shared one.  ``_TARGET_ARCHS`` names the
+    three capabilities, the
     seq_idx triple form deriving its table routes SM107 like SM103 (the
     one-launch ``exactone`` render), the look-back program
     balances against Rubin's 212 SMs capped at the device's SM count and the
@@ -5794,27 +5989,55 @@ def test_source_sm107_lookup_shadows_the_fold_main_module():
             assert module._main_module(name, arch) == program.main.module
             assert module._arch_program(name, arch) is program
         rubin = module._arch_program(name, "sm_107a")
+        if program.family == "exactmeta":
+            assert program.preprocess is module._PACKED_METADATA
+            assert rubin.preprocess is program.preprocess
+            expected_preprocess = program.preprocess
+        else:
+            assert program.preprocess is module._SEGMENT_PREPROCESS
+            expected_kernel = _sm107_segment_preprocess(module, name)
+            assert rubin.preprocess is expected_kernel
+            expected_preprocess = module.replace(
+                program.preprocess, module=expected_kernel.module
+            )
+        assert rubin.preprocess == expected_preprocess
         if name.startswith(("exact_", "exactmeta_")):
             assert name not in module._SM107_MODULES
         if name not in module._SM107_MODULES:
             assert module._main_module(name, "sm_107a") == program.main.module
-            assert rubin is program
+            if program.family == "exactmeta":
+                assert rubin is program
+            else:
+                assert rubin.main is program.main
+                assert module.replace(rubin, preprocess=program.preprocess) == program
             continue
         expected = module._SM107_MODULES[name]
         assert module._main_module(name, "sm_107a") == expected
         assert rubin.main == module._scan(expected)
         assert rubin.main.kernel == program.main.kernel
         assert rubin.main.threads == 512 and rubin.main.fast_math
-        assert rubin.preprocess is program.preprocess
-        assert module.replace(rubin, main=program.main) == program
+        kind = (program.family, name.split("_")[2], program.variant)
+        assert rubin.main_smem_bytes == module._SM107_VARIANT_SMEM_BYTES.get(
+            kind, program.main_smem_bytes
+        )
+        assert (
+            module.replace(
+                rubin,
+                main=program.main,
+                preprocess=program.preprocess,
+                main_smem_bytes=program.main_smem_bytes,
+            )
+            == program
+        )
 
 
 def test_source_sm107_program_builds_its_table_module(monkeypatch, tmp_path):
     """On sm_107a the loader builds the program's ``_SM107_MODULES`` entry,
     never its fold source: the identity is compiled with ``-arch=sm_107a``
     from its own device file and embedded under its own module name next to
-    the shared preprocess cubin.  The table entry is overridden here, so the
-    test holds for a program with or without a shipped sm_107a render."""
+    the sm_107a segment preprocess cubin (never the shared one).  The table
+    entry is overridden here, so the test holds for a program with or without
+    a shipped sm_107a render."""
 
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     name = "exactfused_bf16_batched"
@@ -5826,9 +6049,11 @@ def test_source_sm107_program_builds_its_table_module(monkeypatch, tmp_path):
     module._load_generated_program.cache_clear()
     rubin = module._arch_program(name, "sm_107a")
     assert rubin.main.module == identity and rubin.main.kernel == fold.main.kernel
+    assert rubin.preprocess is module._SM107_SEGMENT_PREPROCESS
+    assert rubin.preprocess.module != fold.preprocess.module
 
-    # The fake source tree holds the shared preprocess and the sm_107a main
-    # source only: reading the fold source would fail.
+    # The fake source tree holds the sm_107a preprocess and main sources
+    # only: reading a fold source would fail.
     device_dir = tmp_path / module._DEVICE_DIR
     device_dir.mkdir(parents=True)
     for kernel in rubin.kernels:
@@ -5876,8 +6101,10 @@ def test_source_sm107_program_builds_its_table_module(monkeypatch, tmp_path):
     rendered = kwargs["cpp_sources"]
     assert f"TVM_FFI_EMBED_CUBIN({identity});" in rendered
     assert f"TVM_FFI_EMBED_CUBIN({fold.main.module});" not in rendered
+    assert f"TVM_FFI_EMBED_CUBIN({rubin.preprocess.module});" in rendered
+    assert f"TVM_FFI_EMBED_CUBIN({fold.preprocess.module});" not in rendered
     assert f"{fold.main.kernel} 4 16 {fold.main_smem_bytes}" in rendered
-    assert set(kwargs["embed_cubin"]) == {fold.preprocess.module, identity}
+    assert set(kwargs["embed_cubin"]) == {rubin.preprocess.module, identity}
     assert (tmp_path / "jit" / args[0] / f"{identity}.cubin").is_file()
 
 
@@ -6665,7 +6892,12 @@ def test_cake_ssd_combined_chunk_parallel_checkpoints_are_bitwise_the_exact_scan
         )
     else:
         family = "exactfused"
-    assert exact.program == f"{family}_{_state_key(state_dtype)}_{mode}"
+    exact_program = exact.program
+    if form == "triple":
+        exact_program = _without_table_form(
+            module, exact_program, state_dtype=state_dtype, num_sequences=len(lengths)
+        )
+    assert exact_program == f"{family}_{_state_key(state_dtype)}_{mode}"
     assert chunk_parallel.program == f"chunkpar_{_state_key(state_dtype)}_{mode}"
     assert three_phase.program == f"chunkpar3_{_state_key(state_dtype)}_{mode}"
     written = {slot for slot in slots if slot >= 0}
@@ -6961,14 +7193,17 @@ def test_source_exact_scan_variant_programs():
                 assert b.main_smem_bytes == noring_smem
                 assert a.main.module != b.main.module
     # the retained and the fused family: six ring programs and the five
-    # ``_noring`` programs the variant rule can select
+    # ``_noring`` programs the variant rule can select; the fused family also
+    # the two sm_107a-only ``_ibulk`` programs
     assert len([name for name in module._PROGRAMS if name.startswith("exact_")]) == 11
     assert (
-        len([name for name in module._PROGRAMS if name.startswith("exactfused_")]) == 11
+        len([name for name in module._PROGRAMS if name.startswith("exactfused_")]) == 13
     )
-    # the two-kernel family: six ring and six ``_tail`` programs, no ``_noring``
+    # the two-kernel family: six ring and six ``_tail`` programs, no ``_noring``,
+    # and the sm_107a-only programs: two ``_claim``, two ``_ibulk`` and three
+    # ``_tailone``
     assert (
-        len([name for name in module._PROGRAMS if name.startswith("exactpre_")]) == 12
+        len([name for name in module._PROGRAMS if name.startswith("exactpre_")]) == 19
     )
     assert not any(name.endswith("_noring") for name in module._EXACTPRE_MODULES)
     assert len([name for name in module._PROGRAMS if name.startswith("chunkpar_")]) == 6
@@ -6981,9 +7216,12 @@ def test_source_exact_scan_variant_programs():
         len([name for name in module._PROGRAMS if name.startswith("exactmeta_")]) == 5
     )
     # The exactone programs: the SM103 render of the same five fused varlen
-    # entries (one launch), their own device modules.
-    assert len([name for name in module._PROGRAMS if name.startswith("exactone_")]) == 5
-    assert len(module._PROGRAMS) == 56
+    # entries (one launch), their own device modules, and the sm_107a-only
+    # programs in the tablefirst / tableroles prologue forms.
+    assert (
+        len([name for name in module._PROGRAMS if name.startswith("exactone_")]) == 11
+    )
+    assert len(module._PROGRAMS) == 71
 
 
 @pytest.mark.parametrize(
@@ -7068,6 +7306,846 @@ def test_source_exact_scan_variant_selected_without_gpu(monkeypatch, case):
     monkeypatch.setattr(module, "_load_generated_program", lambda *_: None)
     prepared = runner.prepare(x=x, dt=dt, A=A, B=B, C=C, **kwargs)
     assert prepared.program_name == expected
+
+
+def test_source_sm107_fp32_one_chunk_items_above_the_bound_take_exactpre():
+    """On SM107 one-chunk ring calls with an fp32 state take the two-kernel
+    ``exactpre`` program above the 2048-item bound too; 16-bit states, the
+    start schedule and other architectures keep the retained ``exact``
+    program there."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+
+    def family(capability, state_dtype, num_sequences=160, variant=""):
+        # 128-token sequences x 128 heads: one chunk per item
+        return module.two_kernel_family(
+            mode_varlen=True,
+            num_sequences=num_sequences,
+            seqlen=num_sequences * 128,
+            nheads=128,
+            sm_count=148,
+            capability=capability,
+            variant=variant,
+            state_dtype=state_dtype,
+        )
+
+    # 160 x 128 = 20480 items, above the bound
+    assert family((10, 7), torch.float32) == "exactpre"
+    assert family((10, 7), torch.bfloat16) == "exact"
+    assert family((10, 7), torch.float16) == "exact"
+    assert family((10, 7), torch.float32, variant="noring") == "exact"
+    assert family((10, 3), torch.float32) == "exact"
+    assert family((10, 0), torch.float32) == "exact"
+    # 8 x 128 = 1024 items, inside the bound: every state dtype
+    assert family((10, 7), torch.bfloat16, num_sequences=8) == "exactpre"
+    # 1 x 128 = 128 items, not above the SM count
+    assert family((10, 7), torch.float32, num_sequences=1) == "exact"
+
+
+def test_source_sm107_claim_rule():
+    """``claim_selected``: on SM107 a packed-varlen ring call of one chunk per
+    item with more than 2048 (sequence, head) items and at least 8 of them per
+    CTA of its persistent grid, with a bf16 or fp32 state, runs the claim
+    program; f16 states, batched calls, multi-chunk items, the start and
+    pair schedules and other architectures do not."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    assert module._CLAIM_MIN_ITEMS == {(10, 7): 2048}
+    assert module._CLAIM_MIN_ITEMS_PER_CTA == 8
+
+    def claim(
+        num_sequences=64,
+        tokens=128,
+        capability=(10, 7),
+        state_dtype=torch.bfloat16,
+        variant="",
+        mode_varlen=True,
+        sm_count=212,
+    ):
+        return module.claim_selected(
+            mode_varlen=mode_varlen,
+            num_sequences=num_sequences,
+            seqlen=num_sequences * tokens,
+            nheads=128,
+            sm_count=sm_count,
+            capability=capability,
+            variant=variant,
+            state_dtype=state_dtype,
+        )
+
+    # 64 / 160 x 128 = 8192 / 20480 one-chunk items
+    assert claim()
+    assert claim(num_sequences=160)
+    assert claim(state_dtype=torch.float32)
+    assert not claim(state_dtype=torch.float16)
+    # 16 x 128 = 2048 items: not above the bound; 17 x 128 = 2176 is
+    assert not claim(num_sequences=16)
+    assert claim(num_sequences=17)
+    # fewer than 8 items per CTA of the persistent grid (1024 SMs: grid 1024)
+    assert not claim(num_sequences=17, sm_count=1024)
+    # a mean of 129 tokens per sequence: two chunks per item
+    assert not claim(tokens=129)
+    assert claim(tokens=1)
+    assert not claim(variant="noring")
+    assert not claim(variant="tail")
+    assert not claim(mode_varlen=False)
+    assert not claim(capability=(10, 3))
+    assert not claim(capability=(10, 0))
+    assert not claim(capability=None)
+    # the programs it selects are exactly the sm_107a-only claim entries
+    assert {
+        module._program_name("exactpre", state_dtype, True, "claim")
+        for state_dtype in module._CLAIM_STATE_DTYPES[(10, 7)]
+    } == {name for name in module._SM107_ONLY_PROGRAMS if name.endswith("_claim")}
+
+
+def test_source_sm107_exactone_table_rule():
+    """``exactone_table_variant``: on SM107 a one-launch ring call takes the
+    tablefirst program at a launch grid below 128 CTAs and the
+    tableroles program from it on; ``noring`` calls and other
+    architectures keep their program."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    assert module._EXACTONE_TABLE_ROLES_MIN_GRID == {(10, 7): 128}
+
+    def variant(grid, capability=(10, 7), current="", state_dtype=torch.bfloat16):
+        return module.exactone_table_variant(
+            capability=capability, variant=current, state_dtype=state_dtype, grid=grid
+        )
+
+    assert variant(grid=1) == "tablefirst"
+    assert variant(grid=127) == "tablefirst"
+    assert variant(grid=128) == "tableroles"
+    assert variant(grid=212) == "tableroles"
+    assert variant(grid=8, current="noring") == "noring"
+    assert variant(grid=212, current="noring") == "noring"
+    assert variant(grid=8, capability=(10, 3)) == ""
+    assert variant(grid=8, capability=(10, 0)) == ""
+    assert variant(grid=8, capability=None) == ""
+    for state_dtype in (torch.bfloat16, torch.float16, torch.float32):
+        assert variant(grid=8, state_dtype=state_dtype) == "tablefirst"
+        assert variant(grid=212, state_dtype=state_dtype) == "tableroles"
+    # the programs it selects are exactly the sm_107a-only one-launch entries
+    assert {
+        module._program_name("exactone", state_dtype, True, form)
+        for state_dtype in module._EXACTONE_TABLE_STATE_DTYPES
+        for form in ("tablefirst", "tableroles")
+    } == {name for name in module._SM107_ONLY_PROGRAMS if name.startswith("exactone_")}
+
+
+@pytest.mark.parametrize("arch", ("sm_103a", "sm_107a"))
+@pytest.mark.parametrize("state_dtype", (torch.bfloat16, torch.float16, torch.float32))
+def test_source_sm107_many_one_chunk_items_take_the_claim_program(
+    monkeypatch, arch, state_dtype
+):
+    """On SM107 a packed-varlen call of 64 128-token sequences x 128 heads
+    (8192 one-chunk items, beyond the fused window and the 2048-item one-chunk
+    bound) runs the claim program of a bf16 or fp32 state, which launches its
+    main kernel with programmatic dependent launch; an f16 state and SM103 keep
+    the retained ``exact`` program (fp32 on SM103 too)."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = []
+    runner = _cpu_forwarding_runner(
+        module,
+        monkeypatch,
+        calls,
+        nheads=128,
+        ngroups=8,
+        has_varlen=True,
+        has_initial_states=True,
+        state_dtype=state_dtype,
+        arch=arch,
+    )
+    num_seqs, tokens = 64, 128
+    seqlen = num_seqs * tokens
+    x = torch.empty((1, seqlen, 128, 64), dtype=torch.bfloat16)
+    dt = torch.empty((1, seqlen, 128), dtype=torch.float32)
+    A = torch.empty((128,), dtype=torch.float32)
+    B = torch.empty((1, seqlen, 8, 128), dtype=torch.bfloat16)
+    C = torch.empty_like(B)
+    kwargs = {
+        "initial_states": torch.empty((num_seqs, 128, 64, 128), dtype=state_dtype),
+        "cu_seqlens": torch.arange(
+            0, (num_seqs + 1) * tokens, tokens, dtype=torch.int32
+        ),
+    }
+    runner.run(x, dt, A, B, C, **kwargs)
+    ((name, launch),) = calls
+    state = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "f32"}[
+        state_dtype
+    ]
+    if arch == "sm_107a" and state_dtype != torch.float16:
+        assert name == f"exactpre_{state}_varlen_claim"
+        assert module._main_pdl(name, arch)
+        program = module._arch_program(name, arch)
+        assert program.variant == "claim"
+        assert program.main_smem_bytes == module._EXACTPRE_CLAIM_SMEM_BYTES
+        assert program.main.kernel == (
+            f"kernel_mamba_ssd_q_tmem_alias_{state}_varlen_precomputed_claim"
+        )
+        status = launch["main"]["preprocess_status"]
+        assert tuple(status.shape) == (2,)
+        assert launch["preprocess"]["preprocess_status"] is status
+    else:
+        assert name == f"exact_{state}_varlen"
+
+
+@pytest.mark.parametrize("arch", ("sm_103a", "sm_107a"))
+@pytest.mark.parametrize(
+    ("num_seqs", "sm107_program"),
+    (
+        # 3 / 6 x 128 = 384 / 768 items: at most four items per SM (212 SMs)
+        (3, "exactfused_bf16_varlen_noring"),
+        (6, "exactfused_bf16_varlen_noring"),
+        # 7 x 128 = 896 and 8 x 128 = 1024 items: the ring exactpre program
+        (7, "exactpre_bf16_varlen"),
+        (8, "exactpre_bf16_varlen"),
+        # 24 x 128 = 3072 items: the ring two-kernel family is the retained
+        # exact program (above the 2048-item one-chunk bound)
+        (24, "exactfused_bf16_varlen_noring"),
+    ),
+)
+def test_source_sm107_retained_noring_call_takes_the_fused_program(
+    monkeypatch, arch, num_seqs, sm107_program
+):
+    """On SM107 a call the retained ``exact_*_noring`` program would serve
+    (packed 64-token sequences x 128 heads with z: one-chunk items outside
+    the fused varlen window, on the start schedule) runs the ring
+    ``exactpre`` program where it has more than four items per SM and its
+    ring two-kernel family is ``exactpre``, else the fused program of the
+    same variant; SM103 keeps the retained program."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = []
+    runner = _cpu_forwarding_runner(
+        module,
+        monkeypatch,
+        calls,
+        nheads=128,
+        ngroups=8,
+        has_varlen=True,
+        has_initial_states=True,
+        has_z=True,
+        arch=arch,
+    )
+    monkeypatch.setattr(module, "_sm_count", lambda _: 212)
+    tokens = 64
+    seqlen = num_seqs * tokens
+    x = torch.empty((1, seqlen, 128, 64), dtype=torch.bfloat16)
+    dt = torch.empty((1, seqlen, 128), dtype=torch.float32)
+    A = torch.empty((128,), dtype=torch.float32)
+    B = torch.empty((1, seqlen, 8, 128), dtype=torch.bfloat16)
+    C = torch.empty_like(B)
+    kwargs = {
+        "initial_states": torch.empty((num_seqs, 128, 64, 128), dtype=torch.bfloat16),
+        "z": torch.empty_like(x),
+        "cu_seqlens": torch.arange(
+            0, (num_seqs + 1) * tokens, tokens, dtype=torch.int32
+        ),
+    }
+    runner.run(x, dt, A, B, C, **kwargs)
+    ((name, _launch),) = calls
+    expected = sm107_program if arch == "sm_107a" else "exact_bf16_varlen_noring"
+    assert name == expected
+
+
+def test_source_sm107_fused_window_extension_without_z():
+    """On SM107 calls without z whose fused program needs no stage take the
+    fused program beyond the seed window: batched one-chunk calls up to 2048
+    items, packed-varlen calls up to 512 items within 512 packed
+    chunk-items; other capabilities and larger calls keep the seed window."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    assert module._FUSED_NO_Z_MAX_ITEMS == {(10, 7): (2048, 512)}
+
+    def ext(capability, num_sequences, chunks, mode_varlen, nheads=8):
+        return module.fused_no_z_extended(
+            capability=capability,
+            nheads=nheads,
+            num_sequences=num_sequences,
+            nchunks=chunks if not mode_varlen else num_sequences * chunks,
+            mode_varlen=mode_varlen,
+            total_tokens=num_sequences * chunks * 128,
+        )
+
+    # batched: 256 x 8 heads = 2048 one-chunk items (perf_batched_256x1)
+    assert ext((10, 7), 256, 1, False)
+    assert ext((10, 7), 136, 1, False)
+    assert not ext((10, 7), 257, 1, False)
+    assert not ext((10, 7), 192, 2, False)
+    # varlen: 64 x 8 heads = 512 one-chunk items (perf_varlen_64x1)
+    assert ext((10, 7), 64, 1, True)
+    assert ext((10, 7), 4, 1, True, nheads=128)
+    assert not ext((10, 7), 65, 1, True)
+    # 16 x 8 heads x 8 chunks: 1024 packed chunk-items
+    assert not ext((10, 7), 16, 8, True)
+    for capability in ((10, 0), (10, 3)):
+        assert not ext(capability, 256, 1, False)
+        assert not ext(capability, 64, 1, True)
+
+
+@pytest.mark.parametrize("arch", ("sm_103a", "sm_107a"))
+@pytest.mark.parametrize(
+    ("form", "has_z", "sm107_family"),
+    (
+        ("batched", False, "exactfused"),
+        ("batched", True, "exactpre"),
+        ("caller", False, "exactfused"),
+        ("cu_seqlens", False, "exactfused"),
+        ("caller", True, "exactpre"),
+        # the triple form deriving its table keeps the two-kernel program
+        ("derived", False, "exactpre"),
+    ),
+)
+def test_source_sm107_no_z_calls_take_the_fused_program(
+    monkeypatch, arch, form, has_z, sm107_family
+):
+    """On SM107 a call without z outside the seed fused window but inside
+    the extension (256 x 8 heads batched one-chunk items; 64 x 8 heads
+    packed 128-token sequences) runs the fused program where it needs no
+    stage ahead of it; calls with z, the derived-table triple form and
+    SM103 keep the two-kernel program."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = []
+    varlen = form != "batched"
+    runner = _cpu_forwarding_runner(
+        module,
+        monkeypatch,
+        calls,
+        nheads=8,
+        ngroups=8,
+        has_varlen=varlen,
+        has_initial_states=varlen,
+        has_z=has_z,
+        arch=arch,
+    )
+    monkeypatch.setattr(module, "_sm_count", lambda _: 212)
+    num_seqs = 64 if varlen else 256
+    batch, seqlen = (1, num_seqs * 128) if varlen else (num_seqs, 128)
+    x = torch.empty((batch, seqlen, 8, 64), dtype=torch.bfloat16)
+    dt = torch.empty((batch, seqlen, 8), dtype=torch.float32)
+    A = torch.empty((8,), dtype=torch.float32)
+    B = torch.empty((batch, seqlen, 8, 128), dtype=torch.bfloat16)
+    C = torch.empty_like(B)
+    kwargs = {}
+    if has_z:
+        kwargs["z"] = torch.empty_like(x)
+    if varlen:
+        kwargs["initial_states"] = torch.empty(
+            (num_seqs, 8, 64, 128), dtype=torch.bfloat16
+        )
+        if form == "cu_seqlens":
+            kwargs["cu_seqlens"] = torch.arange(
+                0, (num_seqs + 1) * 128, 128, dtype=torch.int32
+            )
+        else:
+            kwargs["seq_idx"] = torch.arange(
+                num_seqs, dtype=torch.int32
+            ).repeat_interleave(128)[None]
+            kwargs["chunk_indices"] = torch.arange(num_seqs, dtype=torch.int32)
+            kwargs["chunk_offsets"] = torch.zeros(num_seqs, dtype=torch.int32)
+            if form == "caller":
+                kwargs["seq_chunk_cumsum"] = torch.arange(
+                    num_seqs + 1, dtype=torch.int32
+                )
+    runner.run(x, dt, A, B, C, **kwargs)
+    ((name, _launch),) = calls
+    mode = "varlen" if varlen else "batched"
+    if arch == "sm_107a":
+        # a packed-varlen call without z of these 512 one-chunk items with
+        # initial states runs the initial-state bulk form of its family's ring
+        # program (two-kernel: ibulk_selected, a call with z needs 8 items per
+        # SM; fused: fused_ibulk_selected)
+        ibulk = varlen and not has_z
+        assert name == f"{sm107_family}_bf16_{mode}" + ("_ibulk" if ibulk else "")
+    else:
+        # SM103: the seed window; one-chunk two-kernel calls keep the
+        # retained start program there (no SM103 one-chunk exactpre rule)
+        assert name == f"exact_bf16_{mode}"
+
+
+@pytest.mark.parametrize("arch", ("sm_103a", "sm_107a"))
+@pytest.mark.parametrize("has_z", (False, True))
+def test_source_sm107_long_varlen_items_take_the_tail_pair_program(
+    monkeypatch, arch, has_z
+):
+    """On SM107 a packed-varlen call of 64 sequences x 4096 tokens x 8 heads
+    without z (512 items of 32 chunks on 212 SMs: 3 item waves vs 2.5 pair
+    rounds) runs the tail-pair program under the long-item varlen penalty;
+    with z, and on SM103, it keeps the persistent program."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = []
+    runner = _cpu_forwarding_runner(
+        module,
+        monkeypatch,
+        calls,
+        nheads=8,
+        ngroups=8,
+        has_varlen=True,
+        has_initial_states=True,
+        has_z=has_z,
+        arch=arch,
+    )
+    monkeypatch.setattr(module, "_sm_count", lambda _: 212)
+    num_seqs, tokens = 64, 4096
+    seqlen = num_seqs * tokens
+    x = torch.empty((1, seqlen, 8, 64), dtype=torch.bfloat16)
+    dt = torch.empty((1, seqlen, 8), dtype=torch.float32)
+    A = torch.empty((8,), dtype=torch.float32)
+    B = torch.empty((1, seqlen, 8, 128), dtype=torch.bfloat16)
+    C = torch.empty_like(B)
+    kwargs = {
+        "cu_seqlens": torch.arange(0, seqlen + 1, tokens, dtype=torch.int32),
+        "initial_states": torch.empty((num_seqs, 8, 64, 128), dtype=torch.bfloat16),
+    }
+    if has_z:
+        kwargs["z"] = torch.empty_like(x)
+    runner.run(x, dt, A, B, C, **kwargs)
+    ((name, _launch),) = calls
+    if arch == "sm_107a" and not has_z:
+        assert name == "exactpre_bf16_varlen_tail"
+    else:
+        assert name == "exactpre_bf16_varlen"
+
+
+def test_source_sm107_tail_one_cta_rule():
+    """``tail_one_cta_selected``: on SM107 a packed-varlen pair-program call
+    whose items span fewer host-known chunks than the full-grid admission's
+    ``long_chunks_varlen`` runs the one-CTA pair program; batched calls,
+    longer items and other capabilities keep the 2-CTA pair program."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    assert frozenset({(10, 7)}) == module._TAIL_ONE_CTA_CAPABILITIES
+    long_chunks = module.tail_full_grid_rule((10, 7)).long_chunks_varlen
+    assert long_chunks == 16
+
+    def one(**over):
+        kwargs = {"capability": (10, 7), "mode_varlen": True, "chunks_per_item": 8}
+        kwargs.update(over)
+        return module.tail_one_cta_selected(**kwargs)
+
+    assert one()
+    assert one(chunks_per_item=long_chunks - 1)
+    assert not one(chunks_per_item=long_chunks)
+    assert not one(chunks_per_item=32)
+    assert not one(mode_varlen=False)
+    assert not one(capability=(10, 3))
+    assert not one(capability=(10, 0))
+    assert not one(capability=None)
+    # the programs it selects are exactly the sm_107a-only one-CTA entries:
+    # the two-kernel family's PDL launch, no cluster, their own SMEM literal
+    assert {
+        module._program_name("exactpre", state_dtype, True, "tailone")
+        for state_dtype in (torch.bfloat16, torch.float16, torch.float32)
+    } == {name for name in module._SM107_ONLY_PROGRAMS if name.endswith("_tailone")}
+    for state in ("bf16", "f16", "f32"):
+        name = f"exactpre_{state}_varlen_tailone"
+        program = module._arch_program(name, "sm_107a")
+        assert program.family == "exactpre" and program.variant == "tailone"
+        assert program.cluster_dims == (1, 1, 1)
+        assert program.main_smem_bytes == module._EXACTPRE_TAILONE_SMEM_BYTES
+        assert module._main_pdl(name, "sm_107a")
+        assert program.main.kernel == (
+            f"kernel_mamba_ssd_q_tmem_alias_{state}_varlen_precomputed_tailone"
+        )
+
+
+@pytest.mark.parametrize("has_z", (False, True))
+def test_source_sm107_short_varlen_pair_calls_take_the_one_cta_pair_program(
+    monkeypatch, has_z
+):
+    """On SM107 a packed-varlen call of 32 sequences x 1024 tokens x 8 heads
+    (256 items of 8 chunks on 212 SMs, the full-grid pair admission), with or
+    without z, runs the one-CTA pair program on the pair grid; the runner's
+    status words hold one per pair of SMs and one per 32 pairs past the first
+    two."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = []
+    runner = _cpu_forwarding_runner(
+        module,
+        monkeypatch,
+        calls,
+        nheads=8,
+        ngroups=8,
+        has_varlen=True,
+        has_initial_states=True,
+        has_z=has_z,
+        arch="sm_107a",
+    )
+    monkeypatch.setattr(module, "_sm_count", lambda _: 212)
+    num_seqs, tokens = 32, 1024
+    seqlen = num_seqs * tokens
+    x = torch.empty((1, seqlen, 8, 64), dtype=torch.bfloat16)
+    dt = torch.empty((1, seqlen, 8), dtype=torch.float32)
+    A = torch.empty((8,), dtype=torch.float32)
+    B = torch.empty((1, seqlen, 8, 128), dtype=torch.bfloat16)
+    C = torch.empty_like(B)
+    kwargs = {
+        "cu_seqlens": torch.arange(0, seqlen + 1, tokens, dtype=torch.int32),
+        "initial_states": torch.empty((num_seqs, 8, 64, 128), dtype=torch.bfloat16),
+    }
+    if has_z:
+        kwargs["z"] = torch.empty_like(x)
+    runner.run(x, dt, A, B, C, **kwargs)
+    ((name, launch),) = calls
+    assert name == "exactpre_bf16_varlen_tailone"
+    assert launch["main_grid"] == (module._tail_grid_size(sm_count=212), 1, 1)
+    status = launch["main"]["preprocess_status"]
+    assert tuple(status.shape) == (2 + 106 + 4,) and status.dtype == torch.int32
+    assert launch["preprocess"]["preprocess_status"] is status
+
+
+def test_source_sm107_ibulk_rule():
+    """``ibulk_selected``: on SM107 a packed-varlen two-kernel ring call
+    with a bf16 / f16 state takes the ``_ibulk`` program with at least two
+    (sequence, head) items per SM of at most eight host-known chunks, a call
+    with z only with one chunk per item and at least eight items per SM;
+    batched calls, an f32 state and other capabilities never do."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    assert frozenset({(10, 7)}) == module._IBULK_CAPABILITIES
+    assert frozenset({torch.bfloat16, torch.float16}) == module._IBULK_STATE_DTYPES
+    assert (
+        module._IBULK_MIN_ITEMS_PER_SM,
+        module._IBULK_MAX_CHUNKS_PER_ITEM,
+        module._IBULK_Z_MIN_ITEMS_PER_SM,
+    ) == (2, 8, 8)
+
+    def sel(
+        items,
+        chunks=1,
+        has_z=False,
+        state=torch.bfloat16,
+        capability=(10, 7),
+        mode_varlen=True,
+    ):
+        return module.ibulk_selected(
+            capability=capability,
+            state_dtype=state,
+            mode_varlen=mode_varlen,
+            total_work=items,
+            chunks_per_item=chunks,
+            sm_count=212,
+            has_z=has_z,
+        )
+
+    # 64 / 128 / 256 one-chunk sequences x 8 heads (perf_varlen_*x1)
+    assert sel(512) and sel(1024) and sel(2048)
+    assert sel(2048, state=torch.float16)
+    assert sel(1024, chunks=4)
+    # perf_varlen_64x8: 64 sequences x 8 heads of 8 chunks
+    assert sel(512, chunks=8)
+    # bounds: 2 x 212 items, 8 chunks per item
+    assert sel(424) and not sel(423)
+    assert not sel(512, chunks=9)
+    # z: one chunk per item and at least 8 x 212 items (nem_v16x128: 16
+    # sequences x 128 heads); fewer items (nem_v4x128: 4 x 128) or more
+    # chunks per item keep the ring program
+    assert sel(2048, has_z=True) and sel(2048, has_z=True, state=torch.float16)
+    assert sel(1696, has_z=True) and not sel(1695, has_z=True)
+    assert not sel(512, has_z=True)
+    assert not sel(2048, chunks=2, has_z=True)
+    # batched calls, an f32 state and the other capabilities keep the ring
+    # program
+    assert not sel(2048, mode_varlen=False)
+    assert not sel(1024, chunks=4, mode_varlen=False)
+    assert not sel(2048, state=torch.float32)
+    for capability in ((10, 0), (10, 3)):
+        assert not sel(2048, capability=capability)
+
+
+@pytest.mark.parametrize("arch", ("sm_103a", "sm_107a"))
+@pytest.mark.parametrize(
+    ("mode", "num_seqs", "nheads", "nchunks", "has_z", "state", "ibulk"),
+    (
+        # perf_varlen_128x1 / 256x1: 1024 / 2048 one-chunk items
+        ("varlen", 128, 8, 1, False, torch.bfloat16, True),
+        ("varlen", 256, 8, 1, False, torch.bfloat16, True),
+        ("varlen", 256, 8, 1, False, torch.float16, True),
+        ("varlen", 256, 8, 1, False, torch.float32, False),
+        # nem_v4x128: 512 one-chunk items with z
+        ("varlen", 4, 128, 1, True, torch.bfloat16, False),
+        # nem_v16x128: 2048 one-chunk items with z; two chunks per item keep
+        # the ring program
+        ("varlen", 16, 128, 1, True, torch.bfloat16, True),
+        ("varlen", 16, 128, 2, True, torch.bfloat16, False),
+        # perf_varlen_64x8: 8 chunks per item; 9 chunks keep the ring program
+        ("varlen", 64, 8, 8, False, torch.bfloat16, True),
+        ("varlen", 64, 8, 9, False, torch.bfloat16, False),
+        # perf_batched_256x1 / 128x4 / 512x2
+        ("batched", 256, 8, 1, False, torch.bfloat16, False),
+        ("batched", 128, 8, 4, False, torch.bfloat16, False),
+        ("batched", 512, 8, 2, False, torch.float16, False),
+    ),
+)
+def test_source_sm107_short_item_calls_take_the_ibulk_program(
+    monkeypatch, arch, mode, num_seqs, nheads, nchunks, has_z, state, ibulk
+):
+    """On SM107 a packed-varlen two-kernel ring call of many short items runs
+    the ``_ibulk`` program of its state (with z: one chunk per item and many
+    items); SM103, long items, calls with z of few or longer items, batched
+    calls and an f32 state keep their program."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = []
+    varlen = mode == "varlen"
+    runner = _cpu_forwarding_runner(
+        module,
+        monkeypatch,
+        calls,
+        nheads=nheads,
+        ngroups=8,
+        has_varlen=varlen,
+        has_initial_states=varlen,
+        has_z=has_z,
+        state_dtype=state,
+        arch=arch,
+    )
+    monkeypatch.setattr(module, "_sm_count", lambda _: 212)
+    tokens = nchunks * 128
+    batch, seqlen = (1, num_seqs * tokens) if varlen else (num_seqs, tokens)
+    x = torch.empty((batch, seqlen, nheads, 64), dtype=torch.bfloat16)
+    dt = torch.empty((batch, seqlen, nheads), dtype=torch.float32)
+    A = torch.empty((nheads,), dtype=torch.float32)
+    B = torch.empty((batch, seqlen, 8, 128), dtype=torch.bfloat16)
+    C = torch.empty_like(B)
+    kwargs = {}
+    if has_z:
+        kwargs["z"] = torch.empty_like(x)
+    if varlen:
+        kwargs["initial_states"] = torch.empty((num_seqs, nheads, 64, 128), dtype=state)
+        kwargs["cu_seqlens"] = torch.arange(
+            0, (num_seqs + 1) * tokens, tokens, dtype=torch.int32
+        )
+    runner.run(x, dt, A, B, C, **kwargs)
+    ((name, _launch),) = calls
+    if arch == "sm_107a" and ibulk:
+        assert name == f"exactpre_{module._STATE_DTYPE_KEYS[state]}_{mode}_ibulk"
+    else:
+        assert not name.endswith("_ibulk"), name
+
+
+@pytest.mark.parametrize(
+    ("num_seqs", "expected"),
+    (
+        # 256 one-chunk sequences x 8 heads: the two-kernel ``_ibulk`` program
+        (256, "exactpre_bf16_varlen_ibulk"),
+        # 64 one-chunk sequences x 8 heads: the fused ``_ibulk`` program
+        (64, "exactfused_bf16_varlen_ibulk"),
+    ),
+)
+def test_source_sm107_ibulk_program_binds_aligned_initial_states(
+    monkeypatch, num_seqs, expected
+):
+    """The ``_ibulk`` programs read an item's initial state with one bulk
+    copy: a contiguous ``initial_states`` at an address that is not 16-byte
+    aligned is bound through the workspace's packed copy (the same values),
+    an aligned one directly."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = []
+    runner = _cpu_forwarding_runner(
+        module,
+        monkeypatch,
+        calls,
+        nheads=8,
+        ngroups=8,
+        has_varlen=True,
+        has_initial_states=True,
+        arch="sm_107a",
+    )
+    monkeypatch.setattr(module, "_sm_count", lambda _: 212)
+    tokens = 128
+    seqlen = num_seqs * tokens
+    x = torch.empty((1, seqlen, 8, 64), dtype=torch.bfloat16)
+    dt = torch.empty((1, seqlen, 8), dtype=torch.float32)
+    A = torch.empty((8,), dtype=torch.float32)
+    B = torch.empty((1, seqlen, 8, 128), dtype=torch.bfloat16)
+    C = torch.empty_like(B)
+    cu_seqlens = torch.arange(0, (num_seqs + 1) * tokens, tokens, dtype=torch.int32)
+    count = num_seqs * 8 * 64 * 128
+    storage = torch.randn(count + 8).to(torch.bfloat16)
+    for offset in (0, 1):
+        initial = storage[offset : offset + count].view(num_seqs, 8, 64, 128)
+        assert initial.is_contiguous()
+        runner.run(x, dt, A, B, C, initial_states=initial, cu_seqlens=cu_seqlens)
+        name, launch = calls.pop()
+        assert name == expected
+        bound = launch["main"]["initial_states"]
+        assert bound.data_ptr() % 16 == 0
+        assert (bound is initial) == (initial.data_ptr() % 16 == 0)
+        assert torch.equal(bound, initial)
+
+
+def _varlen_metadata_cpu(lengths):
+    """CPU ``seq_idx`` / ``chunk_indices`` / ``chunk_offsets`` /
+    ``seq_chunk_cumsum`` of a packed batch of non-empty sequences (the values
+    :func:`_varlen_metadata` and :func:`_seq_chunk_cumsum` build on the
+    device)."""
+
+    seq_idx = torch.arange(len(lengths), dtype=torch.int32).repeat_interleave(
+        torch.tensor(lengths)
+    )[None]
+    total = sum(lengths)
+    chunk_indices, chunk_offsets = [], []
+    for chunk in range(-(-total // 128)):
+        values = seq_idx[0, chunk * 128 : (chunk + 1) * 128]
+        previous = torch.cat((values[:1] - 1, values[:-1]))
+        for offset in (values != previous).nonzero(as_tuple=True)[0].tolist():
+            chunk_indices.append(chunk)
+            chunk_offsets.append(offset)
+    cumsum, start = [0], 0
+    for length in lengths:
+        end = start + length
+        cumsum.append(cumsum[-1] + (-(-end // 128) - start // 128))
+        start = end
+    return (
+        seq_idx,
+        torch.tensor(chunk_indices, dtype=torch.int32),
+        torch.tensor(chunk_offsets, dtype=torch.int32),
+        torch.tensor(cumsum, dtype=torch.int32),
+    )
+
+
+def test_source_sm107_fused_ibulk_rule():
+    """``fused_ibulk_selected``: on SM107 a packed-varlen fused ring call
+    with a bf16 / f16 state and initial states takes the fused ``_ibulk``
+    program with more (sequence, head) items than SMs of one host-known
+    chunk; calls without initial states, an f32 state, items of several
+    chunks, at most one item per SM and other capabilities never do."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    assert frozenset({(10, 7)}) == module._FUSED_IBULK_CAPABILITIES
+    assert module._FUSED_IBULK_MAX_CHUNKS_PER_ITEM == 1
+
+    def sel(
+        items,
+        chunks=1,
+        init=True,
+        state=torch.bfloat16,
+        capability=(10, 7),
+    ):
+        return module.fused_ibulk_selected(
+            capability=capability,
+            state_dtype=state,
+            has_initial_states=init,
+            total_work=items,
+            chunks_per_item=chunks,
+            sm_count=212,
+        )
+
+    # 32 / 64 one-chunk sequences x 8 heads (perf_varlen_32x1 / 64x1)
+    assert sel(256) and sel(512)
+    assert sel(512, state=torch.float16)
+    # bound: more items than SMs
+    assert sel(213) and not sel(212)
+    # 1 / 4 / 8 sequences x 8 heads (perf_varlen_1x1 / 4x1 / 8x1)
+    assert not sel(8) and not sel(32) and not sel(64)
+    # items of two or eight chunks (perf_varlen_4x8 / 8x8: 8 chunks)
+    assert not sel(256, chunks=2)
+    assert not sel(64, chunks=8)
+    # no initial states, an f32 state and the other capabilities
+    assert not sel(512, init=False)
+    assert not sel(512, state=torch.float32)
+    for capability in ((10, 0), (10, 3)):
+        assert not sel(512, capability=capability)
+
+
+@pytest.mark.parametrize("arch", ("sm_103a", "sm_107a"))
+@pytest.mark.parametrize(
+    ("form", "num_seqs", "nheads", "tokens", "has_z", "init", "state", "ibulk"),
+    (
+        # perf_varlen_64x1 / 32x1: 512 / 256 one-chunk items
+        ("caller", 64, 8, 128, False, True, torch.bfloat16, True),
+        ("caller", 32, 8, 128, False, True, torch.bfloat16, True),
+        ("cu_seqlens", 64, 8, 128, False, True, torch.bfloat16, True),
+        ("cu_seqlens", 64, 8, 128, False, True, torch.float16, True),
+        # 64-token sequences (partial segments): one host-known chunk per item
+        ("caller", 64, 8, 64, False, True, torch.bfloat16, True),
+        # 2 sequences x 128 heads with z: 256 one-chunk items (seed window)
+        ("caller", 2, 128, 128, True, True, torch.bfloat16, True),
+        # perf_varlen_8x1: 64 items, at most one per SM
+        ("caller", 8, 8, 128, False, True, torch.bfloat16, False),
+        # perf_varlen_4x8: 32 items of 8 chunks
+        ("caller", 4, 8, 1024, False, True, torch.bfloat16, False),
+        # 32 sequences x 2 chunks: 256 items of 2 chunks
+        ("caller", 32, 8, 256, False, True, torch.bfloat16, False),
+        # no initial states, an f32 state
+        ("caller", 64, 8, 128, False, False, torch.bfloat16, False),
+        ("caller", 64, 8, 128, False, True, torch.float32, False),
+        # the triple form deriving its table takes the one-launch program
+        ("derived", 32, 8, 128, False, True, torch.bfloat16, False),
+    ),
+)
+def test_source_sm107_one_chunk_fused_calls_take_the_ibulk_program(
+    monkeypatch, arch, form, num_seqs, nheads, tokens, has_z, init, state, ibulk
+):
+    """On SM107 a packed-varlen call the fused ring program serves with one
+    host-known chunk per item, initial states, a bf16 / f16 state and more
+    items than SMs runs the fused ``_ibulk`` program of its state; SM103,
+    fewer items, longer items, calls without initial states, an f32 state and
+    the one-launch triple form keep their program."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = []
+    runner = _cpu_forwarding_runner(
+        module,
+        monkeypatch,
+        calls,
+        nheads=nheads,
+        ngroups=8,
+        has_varlen=True,
+        has_initial_states=init,
+        has_z=has_z,
+        state_dtype=state,
+        arch=arch,
+    )
+    monkeypatch.setattr(module, "_sm_count", lambda _: 212)
+    seqlen = num_seqs * tokens
+    x = torch.empty((1, seqlen, nheads, 64), dtype=torch.bfloat16)
+    dt = torch.empty((1, seqlen, nheads), dtype=torch.float32)
+    A = torch.empty((nheads,), dtype=torch.float32)
+    B = torch.empty((1, seqlen, 8, 128), dtype=torch.bfloat16)
+    C = torch.empty_like(B)
+    kwargs = {}
+    if has_z:
+        kwargs["z"] = torch.empty_like(x)
+    if init:
+        kwargs["initial_states"] = torch.empty((num_seqs, nheads, 64, 128), dtype=state)
+    if form == "cu_seqlens":
+        kwargs["cu_seqlens"] = torch.arange(
+            0, (num_seqs + 1) * tokens, tokens, dtype=torch.int32
+        )
+    else:
+        lengths = [tokens] * num_seqs
+        seq_idx, chunk_indices, chunk_offsets, cumsum = _varlen_metadata_cpu(lengths)
+        kwargs.update(
+            seq_idx=seq_idx, chunk_indices=chunk_indices, chunk_offsets=chunk_offsets
+        )
+        if form == "caller":
+            kwargs["seq_chunk_cumsum"] = cumsum
+    runner.run(x, dt, A, B, C, **kwargs)
+    ((name, _launch),) = calls
+    key = module._STATE_DTYPE_KEYS[state]
+    if arch == "sm_107a" and ibulk:
+        assert name == f"exactfused_{key}_varlen_ibulk"
+    else:
+        assert not name.endswith("_ibulk"), name
+        if form == "derived" and arch == "sm_107a":
+            # the one-launch program in the prologue form of its launch grid
+            table_form = module.exactone_table_variant(
+                capability=(10, 7),
+                variant="",
+                state_dtype=state,
+                grid=module._persistent_grid_size(
+                    total_work=num_seqs * nheads, sm_count=212
+                ),
+            )
+            assert name == f"exactone_{key}_varlen_{table_form}"
 
 
 def test_source_fused_route_mirrors_the_seed_rule():
@@ -7298,6 +8376,35 @@ def test_source_saturated_batched_call_keeps_the_two_kernel_program(monkeypatch)
     assert launch["main"]["metadata_from_cu_seqlens"] == 0
 
 
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a", "sm_107a"))
+def test_source_batched_preprocess_seqlen_bound_without_gpu(monkeypatch, arch):
+    """The segment preprocess of a batched call gets the caller's ``seqlen``
+    on sm_100a and sm_103a, and the token count of all rows on sm_107a,
+    whose preprocess bounds its aligned-table dt loads by it (the batched
+    tables use it for nothing else)."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = []
+    runner = _cpu_forwarding_runner(
+        module, monkeypatch, calls, nheads=128, ngroups=8, arch=arch
+    )
+    batch, seqlen, nheads, ngroups = 16, 256, 128, 8
+    x = torch.empty((batch, seqlen, nheads, 64), dtype=torch.bfloat16)
+    dt = torch.empty((batch, seqlen, nheads), dtype=torch.float32)
+    A = torch.empty((nheads,), dtype=torch.float32)
+    B = torch.empty((batch, seqlen, ngroups, 128), dtype=torch.bfloat16)
+    runner.run(x, dt, A, B, torch.empty_like(B))
+
+    name, launch = calls[-1]
+    assert module._PROGRAMS[name].preprocess is module._SEGMENT_PREPROCESS
+    preprocess = launch["preprocess"]
+    assert preprocess["direct_varlen_metadata"] == 0
+    assert preprocess["dt"].numel() == batch * seqlen * nheads
+    expected = batch * seqlen if arch == "sm_107a" else seqlen
+    assert preprocess["seqlen"] == expected
+    assert launch["main"]["seqlen"] == seqlen
+
+
 @pytest.mark.parametrize("arch", _ROUTE_ARCHES)
 def test_source_varlen_triple_form_routes_on_the_caller_cumsum(monkeypatch, arch):
     """A short packed-varlen call in the seq_idx triple form inside the fused
@@ -7375,8 +8482,13 @@ def test_source_varlen_triple_form_routes_on_the_caller_cumsum(monkeypatch, arch
     else:
         # ... on SM103 and SM107 the one-launch exactone program: no stage
         # (grid 0); the fused main kernel's CTA prologue derives the table into its row
-        # of the runner's scratch (one CTA: 2 items on this 1-SM device)
-        assert name == "exactone_bf16_varlen"
+        # of the runner's scratch (one CTA: 2 items on this 1-SM device; on
+        # SM107 a grid that small takes the tablefirst form)
+        assert name == (
+            "exactone_bf16_varlen_tablefirst"
+            if arch == "sm_107a"
+            else "exactone_bf16_varlen"
+        )
         assert module._PROGRAMS[name].family == "exactone"
         assert set(launch["preprocess"]) == set(module._PREPROCESS_ARGS)
         assert launch["preprocess_grid"] == (0, 1, 1)
@@ -7434,10 +8546,14 @@ def test_source_varlen_triple_form_routes_on_the_caller_cumsum(monkeypatch, arch
     assert launch["preprocess_grid"][0] >= 1
     assert len(runner._workspaces) == 3
 
-    # Outside the fused window (257 one-token sequences > 256 items) the
-    # trusted table keeps the two-kernel program: one chunk per item, so the
-    # retained start ``exact`` program (``two_kernel_family``).
-    count = 257
+    # Outside the fused window (513 one-token sequences: more than 256 items,
+    # and more than the 512 items of the sm_107a extension for calls without
+    # z) the trusted table keeps the two-kernel program: one chunk per item,
+    # so the retained start ``exact`` program (``two_kernel_family``) -- on
+    # sm_107a, with more items than SMs (one on this device) and at most
+    # 2048, the ``exactpre`` program, there its ``_ibulk`` form (at least two
+    # one-chunk items per SM, :func:`ibulk_selected`).
+    count = 513
     ids = torch.arange(count, dtype=torch.int32)
     wide = {
         "seq_idx": ids.reshape(1, count),
@@ -7451,6 +8567,15 @@ def test_source_varlen_triple_form_routes_on_the_caller_cumsum(monkeypatch, arch
         module.two_kernel_family(mode_varlen=True, num_sequences=count, seqlen=count)
         == "exact"
     )
+    family = module.two_kernel_family(
+        mode_varlen=True,
+        num_sequences=count,
+        seqlen=count,
+        nheads=1,
+        sm_count=1,
+        capability=module._ARCH_CAPABILITIES[arch],
+    )
+    assert family == ("exactpre" if arch == "sm_107a" else "exact")
     runner.run(
         torch.empty((1, count, 1, 64), dtype=torch.bfloat16),
         torch.empty((1, count, 1), dtype=torch.float32),
@@ -7461,8 +8586,9 @@ def test_source_varlen_triple_form_routes_on_the_caller_cumsum(monkeypatch, arch
         seq_chunk_cumsum=torch.arange(count + 1, dtype=torch.int32),
     )
     name, launch = calls[-1]
-    assert name == runner.last_program_name == "exact_bf16_varlen"
-    assert module._PROGRAMS[name].family == "exact"
+    suffix = "_ibulk" if arch == "sm_107a" else ""
+    assert name == runner.last_program_name == f"{family}_bf16_varlen{suffix}"
+    assert module._PROGRAMS[name].family == family
     assert launch["preprocess"]["write_seq_chunk_cumsum"] == 0
     assert launch["preprocess_grid"][0] >= 1
 
@@ -7819,6 +8945,39 @@ def test_source_tail_programs_are_bound():
     )
 
 
+def test_source_sm107_varlen_tail_programs_launch_with_their_smem():
+    """On sm_107a the varlen tail-pair renders (``_SM107_MODULES``) launch with
+    ``_EXACTPRE_TAIL_VARLEN_SM107_SMEM_BYTES`` (their segment-bounds words sit
+    past the pool of the other tail programs); the batched tail-pair programs,
+    every program on sm_100a / sm_103a and every other sm_107a program keep
+    their table literal."""
+
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    own_smem = module._EXACTPRE_TAIL_VARLEN_SM107_SMEM_BYTES
+    assert {
+        ("exactpre", "varlen", "tail"): own_smem
+    } == module._SM107_VARIANT_SMEM_BYTES
+    assert (own_smem, module._EXACTPRE_TAIL_SMEM_BYTES) == (232448, 232320)
+    owners = set()
+    for name, program in module._PROGRAMS.items():
+        for arch in ("sm_100a", "sm_103a", "sm_107a"):
+            built = module._arch_program(name, arch)
+            own = (
+                arch == "sm_107a"
+                and name in module._SM107_MODULES
+                and name.startswith("exactpre_")
+                and name.endswith("_varlen_tail")
+            )
+            if own:
+                owners.add(name)
+            expected = own_smem if own else program.main_smem_bytes
+            assert built.main_smem_bytes == expected, (name, arch)
+            assert built.cluster_dims == program.cluster_dims
+    assert owners == {
+        f"exactpre_{state}_varlen_tail" for state in ("bf16", "f16", "f32")
+    }
+
+
 # ---- every name the route composes ships; every shipped program is named ------
 
 # Representative host-shape grid of the exact-scan route: one to three items of
@@ -7854,8 +9013,8 @@ def test_source_route_functions_name_shipped_programs():
     program -- ``two_kernel_family`` x ``_exact_scan_variant`` (the two-kernel
     route), the fused families with the same variant, the pair program where
     ``tail_selected`` fires and the chunk-parallel family of every override --
-    and the table holds exactly the names so composed: no entry is dead and no
-    route names a missing program.  A ``_noring`` program never pairs with the
+    and the table holds exactly the names so composed, besides its sm_107a-only
+    programs: no entry is dead and no route names a missing program.  A ``_noring`` program never pairs with the
     two-kernel family (its items span at least two chunks, the ``_noring``
     windows one) and never with an f32 state on the varlen path."""
 
@@ -7915,7 +9074,10 @@ def test_source_route_functions_name_shipped_programs():
         for name in names:
             assert name in module._PROGRAMS, (name, items, tokens, nheads, has_z)
         produced.update(names)
-    assert produced == set(module._PROGRAMS)
+    # The sm_107a-only claim and initial-state bulk programs: ``claim_selected`` and
+    # ``ibulk_selected`` name them on capability (10, 7) alone
+    # (test_source_sm107_claim_rule, test_source_sm107_ibulk_rule).
+    assert produced == set(module._PROGRAMS) - module._SM107_ONLY_PROGRAMS
 
 
 def _cpu_route_call(items, tokens, nheads, mode_varlen, has_z, form):
@@ -7967,9 +9129,9 @@ def test_source_every_selected_program_is_shipped_without_gpu(monkeypatch):
     """``prepare`` of every call of the grid -- both capabilities on their SM
     counts, every call form, every override of the chunk-parallel family --
     resolves a shipped program whose family, state dtype, mode and variant are
-    the call's, and the programs so resolved are exactly the table: the one
-    selection path (``_materialize_workspace``) names no missing program and
-    leaves no table entry dead."""
+    the call's, and the programs so resolved are exactly the table but its
+    sm_107a-only programs: the one selection path (``_materialize_workspace``)
+    names no missing program and leaves no table entry dead."""
 
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     monkeypatch.setattr(module, "_load_generated_program", lambda *_: None)
@@ -8035,4 +9197,7 @@ def test_source_every_selected_program_is_shipped_without_gpu(monkeypatch):
                         else:
                             assert family == forced, (name, cell)
                     seen.add(name)
-    assert seen == set(module._PROGRAMS)
+    # The sm_107a-only claim and initial-state bulk programs are routed on capability
+    # (10, 7) alone (test_source_sm107_many_one_chunk_items_take_the_claim_program,
+    # test_source_sm107_short_item_calls_take_the_ibulk_program).
+    assert seen == set(module._PROGRAMS) - module._SM107_ONLY_PROGRAMS

@@ -73,6 +73,7 @@ from flashinfer.cake_causal_conv1d_train import (
     cake_causal_conv1d_train_backward,
     cake_causal_conv1d_train_backward_workspace,
     cake_causal_conv1d_train_forward,
+    cake_causal_conv1d_train_forward_workspace,
     is_cake_causal_conv1d_train_supported,
 )
 from flashinfer.cake_causal_conv1d_train_backend import cake_jit as loader
@@ -284,9 +285,14 @@ class Cake(Comparator):
         workspace = cake_causal_conv1d_train_backward_workspace(
             tokens, channels, x.device
         )
+        forward_workspace = cake_causal_conv1d_train_forward_workspace(
+            tokens, channels, x.device
+        )
 
         def fwd():
-            cake_causal_conv1d_train_forward(x, w, cu, bias=b, out=y)
+            cake_causal_conv1d_train_forward(
+                x, w, cu, bias=b, out=y, workspace=forward_workspace
+            )
             return y
 
         def bwd(dy):

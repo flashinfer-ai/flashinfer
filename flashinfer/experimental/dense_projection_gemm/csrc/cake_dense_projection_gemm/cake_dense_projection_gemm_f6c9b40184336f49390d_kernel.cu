@@ -322,14 +322,14 @@ kernel_cake_dense_projection_gemm_f6c9b40184336f49390d(const __grid_constant__ C
                             "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                             "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [remAddr32], %2;\n\t"
                             "}"
-                            :: "r"(work_full_addr + work_stage * 8), "r"(0), "r"((uint32_t)(16)) : "memory");
+                            :: "r"(work_full_addr + (work_stage) * 8), "r"(0), "r"((uint32_t)(16)) : "memory");
                         asm volatile(
                             "{\n\t"
                             ".reg .b32 remAddr32;\n\t"
                             "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                             "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [remAddr32], %2;\n\t"
                             "}"
-                            :: "r"(work_full_addr + work_stage * 8), "r"(1), "r"((uint32_t)(16)) : "memory");
+                            :: "r"(work_full_addr + (work_stage) * 8), "r"(1), "r"((uint32_t)(16)) : "memory");
                         asm volatile(
                             "fence.proxy.async.shared::cta;\n\t"
                             "clusterlaunchcontrol.try_cancel.async.shared::cta"
@@ -402,7 +402,7 @@ kernel_cake_dense_projection_gemm_f6c9b40184336f49390d(const __grid_constant__ C
                         }
                     }
                     mbarrier_wait(work_full_addr + (work_stage) * 8, _phase_work_full);
-                    uint32_t _clc_valid_0 = 0;
+                    uint32_t clc_valid = 0;
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p1;\n\t"
@@ -411,10 +411,10 @@ kernel_cake_dense_projection_gemm_f6c9b40184336f49390d(const __grid_constant__ C
                         "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                         "selp.u32 %0, 1, 0, p1;\n\t"
                         "}\n"
-                        : "=r"(_clc_valid_0)
+                        : "=r"(clc_valid)
                         : "r"(work_response_addr + work_stage * 16 + 0 * 16)
                         : "memory");
-                    uint32_t _clc_ctaid_0 = 0;
+                    uint32_t clc_ctaid = 0;
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p1;\n\t"
@@ -423,7 +423,7 @@ kernel_cake_dense_projection_gemm_f6c9b40184336f49390d(const __grid_constant__ C
                         "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                         "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                         "}\n"
-                        : "+r"(_clc_ctaid_0)
+                        : "+r"(clc_ctaid)
                         : "r"(work_response_addr + work_stage * 16 + 0 * 16)
                         : "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -433,13 +433,13 @@ kernel_cake_dense_projection_gemm_f6c9b40184336f49390d(const __grid_constant__ C
                         "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                         "}"
-                        :: "r"(work_empty_addr + work_stage * 8), "r"(0) : "memory");
+                        :: "r"(work_empty_addr + (work_stage) * 8), "r"(0) : "memory");
                     work_stage += 1;
                     if (work_stage == 4) { work_stage = 0; _phase_work_empty ^= 1; _phase_work_full ^= 1; }
-                    if (_clc_valid_0 == 0) {
+                    if (clc_valid == 0) {
                         break;
                     }
-                    this_bid = _clc_ctaid_0 + (unsigned int)cta_rank;
+                    this_bid = clc_ctaid + (unsigned int)cta_rank;
                 }
                 #pragma unroll
                 for (int _xs = 0; _xs < 8; _xs++) {
@@ -547,7 +547,7 @@ kernel_cake_dense_projection_gemm_f6c9b40184336f49390d(const __grid_constant__ C
                         if (mma_epi_stage == 2) { mma_epi_stage = 0; _phase_epilogue_done ^= 1; }
                     }
                     mbarrier_wait(work_full_addr + (work_stage_1) * 8, _phase_work_full_1);
-                    uint32_t _clc_valid_1 = 0;
+                    uint32_t clc_valid_1 = 0;
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p1;\n\t"
@@ -556,10 +556,10 @@ kernel_cake_dense_projection_gemm_f6c9b40184336f49390d(const __grid_constant__ C
                         "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                         "selp.u32 %0, 1, 0, p1;\n\t"
                         "}\n"
-                        : "=r"(_clc_valid_1)
+                        : "=r"(clc_valid_1)
                         : "r"(work_response_addr + work_stage_1 * 16 + 0 * 16)
                         : "memory");
-                    uint32_t _clc_ctaid_1 = 0;
+                    uint32_t clc_ctaid_1 = 0;
                     asm volatile(
                         "{\n\t"
                         ".reg .pred p1;\n\t"
@@ -568,7 +568,7 @@ kernel_cake_dense_projection_gemm_f6c9b40184336f49390d(const __grid_constant__ C
                         "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
                         "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
                         "}\n"
-                        : "+r"(_clc_ctaid_1)
+                        : "+r"(clc_ctaid_1)
                         : "r"(work_response_addr + work_stage_1 * 16 + 0 * 16)
                         : "memory");
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -579,13 +579,13 @@ kernel_cake_dense_projection_gemm_f6c9b40184336f49390d(const __grid_constant__ C
                         "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                         "}"
-                        :: "r"(work_empty_addr + work_stage_1 * 8), "r"(0) : "memory");
+                        :: "r"(work_empty_addr + (work_stage_1) * 8), "r"(0) : "memory");
                     work_stage_1 += 1;
                     if (work_stage_1 == 4) { work_stage_1 = 0; _phase_work_full_1 ^= 1; }
-                    if (_clc_valid_1 == 0) {
+                    if (clc_valid_1 == 0) {
                         break;
                     }
-                    this_bid_1 = _clc_ctaid_1 + (unsigned int)cta_rank;
+                    this_bid_1 = clc_ctaid_1 + (unsigned int)cta_rank;
                 }
                 #pragma unroll
                 for (int _xe = 0; _xe < 2; _xe++) {
@@ -622,7 +622,8 @@ kernel_cake_dense_projection_gemm_f6c9b40184336f49390d(const __grid_constant__ C
             const int tmem_col0 = col_part * 96;
             const int local_row = warp_row0 + lane;
             unsigned int this_bid_2 = bid;
-            const int sb_slot = warp - 2;
+            int warp_id_in_role = warp - 2;
+            const int sb_slot = warp_id_in_role;
             unsigned int valid_sb = 1;
             unsigned int next_sb = 0;
             unsigned int zero_u32 = 0;
@@ -739,7 +740,7 @@ kernel_cake_dense_projection_gemm_f6c9b40184336f49390d(const __grid_constant__ C
                             "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
                             "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                             "}"
-                            :: "r"(work_empty_addr + work_stage_2 * 8), "r"(0) : "memory");
+                            :: "r"(work_empty_addr + (work_stage_2) * 8), "r"(0) : "memory");
                         valid_sb = _clc_valid_2;
                         next_sb = _clc_ctaid_2 + (unsigned int)cta_rank;
                         work_stage_2 += 1;
@@ -761,8 +762,8 @@ kernel_cake_dense_projection_gemm_f6c9b40184336f49390d(const __grid_constant__ C
                                     asm volatile("tcgen05.fence::after_thread_sync;");
                                     if (lane == 0) {
                                         unsigned long long off_w = (unsigned long long)(slab * 16 + cta_rank * 8 + (warp - 2)) * 3072 + (unsigned long long)((col0 - slice_col0) * 32);
-                                        mbarrier_arrive_expect_tx(slab_bar_addr + (sb_slot) * 8, (unsigned int)nb);
-                                        cp_async_bulk_gmem2smem(slab_smem_addr + (unsigned int)(sb_slot * 3072 * 4), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(ws) + ((unsigned long long)off_w * (unsigned long long)4)), nb / 4 * 4, slab_bar_addr + (sb_slot) * 8);
+                                        mbarrier_arrive_expect_tx(slab_bar_addr + (warp_id_in_role) * 8, (unsigned int)nb);
+                                        cp_async_bulk_gmem2smem(slab_smem_addr + (unsigned int)(sb_slot * 3072 * 4), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(ws) + ((unsigned long long)off_w * (unsigned long long)4)), nb / 4 * 4, slab_bar_addr + (warp_id_in_role) * 8);
                                     }
                                 }
                                 if (nb > 0) {
@@ -921,7 +922,7 @@ kernel_cake_dense_projection_gemm_f6c9b40184336f49390d(const __grid_constant__ C
                     }
                     if (role == 2) {
                         if (sb_on != 0) {
-                            mbarrier_wait(slab_bar_addr + (sb_slot) * 8, _phase_slab_bar);
+                            mbarrier_wait(slab_bar_addr + (warp_id_in_role) * 8, _phase_slab_bar);
                             unsigned int base_w = slab_smem_addr + (unsigned int)(sb_slot * 12288 + lane * 16);
                             unsigned int pv[4];
                             int nvalid_2 = N - (off_n_1 + col0);
@@ -961,17 +962,17 @@ kernel_cake_dense_projection_gemm_f6c9b40184336f49390d(const __grid_constant__ C
                             if (nvalid_3 >= 96) {
                                 #pragma unroll
                                 for (int j_4 = 0; j_4 < 24; j_4++) {
-                                    float _vec_load_0[4];
+                                    float vec_load[4];
                                     {
                                         float4 _v4 = *reinterpret_cast<const float4*>(ws + (off_0_1 + (unsigned long long)(j_4 * 128)) + 0);
-                                        _vec_load_0[0 + 0] = _v4.x;
-                                        _vec_load_0[0 + 1] = _v4.y;
-                                        _vec_load_0[0 + 2] = _v4.z;
-                                        _vec_load_0[0 + 3] = _v4.w;
+                                        vec_load[0 + 0] = _v4.x;
+                                        vec_load[0 + 1] = _v4.y;
+                                        vec_load[0 + 2] = _v4.z;
+                                        vec_load[0 + 3] = _v4.w;
                                     }
                                     #pragma unroll
                                     for (int i_2 = 0; i_2 < 4; i_2++) {
-                                        _tmem_load_0[j_4 * 4 + i_2] = _tmem_load_0[j_4 * 4 + i_2] + _vec_load_0[i_2];
+                                        _tmem_load_0[j_4 * 4 + i_2] = _tmem_load_0[j_4 * 4 + i_2] + vec_load[i_2];
                                     }
                                 }
                             } else {
@@ -980,17 +981,17 @@ kernel_cake_dense_projection_gemm_f6c9b40184336f49390d(const __grid_constant__ C
                                     if (nvalid_3 > g_2 * 16) {
                                         #pragma unroll
                                         for (int q_8 = 0; q_8 < 4; q_8++) {
-                                            float _vec_load_1[4];
+                                            float vec_load_1[4];
                                             {
                                                 float4 _v4 = *reinterpret_cast<const float4*>(ws + (off_0_1 + (unsigned long long)((g_2 * 4 + q_8) * 128)) + 0);
-                                                _vec_load_1[0 + 0] = _v4.x;
-                                                _vec_load_1[0 + 1] = _v4.y;
-                                                _vec_load_1[0 + 2] = _v4.z;
-                                                _vec_load_1[0 + 3] = _v4.w;
+                                                vec_load_1[0 + 0] = _v4.x;
+                                                vec_load_1[0 + 1] = _v4.y;
+                                                vec_load_1[0 + 2] = _v4.z;
+                                                vec_load_1[0 + 3] = _v4.w;
                                             }
                                             #pragma unroll
                                             for (int i_3 = 0; i_3 < 4; i_3++) {
-                                                _tmem_load_0[(g_2 * 4 + q_8) * 4 + i_3] = _tmem_load_0[(g_2 * 4 + q_8) * 4 + i_3] + _vec_load_1[i_3];
+                                                _tmem_load_0[(g_2 * 4 + q_8) * 4 + i_3] = _tmem_load_0[(g_2 * 4 + q_8) * 4 + i_3] + vec_load_1[i_3];
                                             }
                                         }
                                     }
