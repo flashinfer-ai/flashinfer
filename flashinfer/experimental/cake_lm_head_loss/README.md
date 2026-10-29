@@ -503,19 +503,57 @@ the package imports with `flashinfer` blocked and raises its host-side errors;
 copy's libraries on a GPU node).  Benchmark:
 `benchmarks/bench_cake_lm_head_loss.py`.
 
-Toolchain note: on CUDA 13.0 (nvcc 13.0.x) the `sm_103a` programs are built
+Toolchain note: the package needs CUDA 12.9 or newer.  Every `build.json`
+entry has `min_cuda` 12.9 (`common.requires.cuda_toolkit.min` is 12.9), and
+the loader refuses an older toolkit: `cake_build.jit_spec` raises and the JIT
+spec lists leave the entry out.  CUDA 12.8's ptxas cannot build the 256-bit
+global loads and stores (`ld.global.v8.b32` / `st.global.v8.b32`) of eight
+`sm_100a` programs, the logits GEMM among them ("Illegal vector size: 8");
+`sm_103a` needs 12.9 by its architecture floor.
+
+The `sm_100a` 2-CTA GEMM producer loops (logits, dX and dW) have two orders,
+and the toolkit that compiles them selects one.  Built by nvcc 12.9 or 13.0,
+they issue each stage's `mbarrier.arrive.expect_tx` on the stage's full
+barrier before the stage's TMA loads, the order CUTLASS's producer acquire
+uses.  Built by any other toolkit, they keep the earlier order (the arrive
+after the loads), so other toolkits keep the previously shipped machine code.
+Each such kernel source defines `CAKE_ARRIVE_FIRST` once from `__CUDA_ARCH__`
+and `__CUDACC_VER_MAJOR__` / `__CUDACC_VER_MINOR__`.  The arrive counts and
+transaction bytes of every phase are the same in both orders, so the outputs
+are bitwise the same.
+
+With the earlier order, the `sm_100a` programs built by CUDA 12.9.86 and
+13.0.88 faulted intermittently on GB200 with `cudaErrorIllegalInstruction`
+at a 2-CTA TMA load of the dW and dX GEMMs (in the dW faults examined, the
+second B-operand load, with legal operands): 35 and 64 runs of a 132-run
+test set, and 20 and 155 runs of a 624-run soak.  The builds of CUDA
+13.1.115, 13.2.86, 13.3.73 and 13.4.92 had no fault in that 132-run set,
+and no B200 run faulted; the cause is not established.  With the arrive
+first, the `sm_100a` builds of CUDA 12.9.86 and 13.0.88 each ran 850 test
+runs and a 1872-run soak on GB200 without a fault.  B200 and GB200 run the
+same `sm_100a` code, so B200 builds of CUDA 12.9 and 13.0 also compile the
+arrive-first order.  On B200 with CUDA 13.0.88, over 37 shapes in two
+timing states, the geometric-mean time ratio of the two orders is 0.99987
+(CI95 0.99955 to 1.00022) and 1.00022 (0.99970 to 1.00076); no
+shape was slower at the family-wise level, and two shape-states were
+nominally slower by 0.45 % and 0.56 % in kernel time.  CUDA 12.9 was
+not timed.  The `sm_103a` programs keep the earlier order at every toolkit,
+so their machine code is unchanged; on GB300 their builds of CUDA 12.9,
+13.0, 13.3 and 13.4 ran without a fault.
+
+On CUDA 13.0 (nvcc 13.0.x) the `sm_103a` programs are built
 with `-Xptxas -O0` (build data: every `sm_103a` entry of `build.json` carries
 `{"cuda": "==13.0", "flags": ["-Xptxas", "-O0"]}` under `nvcc_flags_if`; the
 JIT path applies it when the local toolkit matches, a prebuilt `aot/` built by
-that toolkit already carries it).  That toolchain's
-ptxas mis-schedules their 2-CTA TMA producer loops: at -O3 (and -O2, which
-emits the same code), with a short K loop (`chunk_size <= 1024`) the dW
+that toolkit already carries it).  In earlier testing that toolkit's code of
+their 2-CTA TMA producer loops faulted: at -O3 (and -O2, which emits the same
+code), with a short K loop (`chunk_size <= 1024`) the dW
 accumulate GEMM's second B-operand TMA load is rejected by the TMA unit with
 `cudaErrorIllegalInstruction` although every operand is legal; at -O1 the
 structural-form programs' dW cast GEMM (the last chunk's `dz_c^T @ X_c`) faults
 the same way on every call whose last chunk is partial (`T % chunk_size != 0`).
-The -O0 code and the code of CUDA 12.9, 13.3 and 13.4 are correct.  With the
-earlier -O1 code the hidden
+The -O0 code and the code of CUDA 12.9, 13.3 and 13.4 ran without the fault.
+With the earlier -O1 code the hidden
 valid-row count's schedule (the compaction index, chunk 0's row gather and
 device-count logits GEMM queued before the count is read back) still reaches a
 `cudaErrorIllegalInstruction` from the dW accumulate GEMM at its shortest K
@@ -527,4 +565,4 @@ version from `cake_build.record_cuda_version` -- the prebuilt libraries'
 `aot/build_info.json`, else the local toolkit; the same kernels per row,
 bitwise the same outputs).  Every other architecture / toolchain pair builds at the default
 optimization level and runs the hidden count.  Both are mitigations of the
-observed ptxas 13.0 fault, not a root-cause fix.
+observed CUDA 13.0 fault, not a root-cause fix.

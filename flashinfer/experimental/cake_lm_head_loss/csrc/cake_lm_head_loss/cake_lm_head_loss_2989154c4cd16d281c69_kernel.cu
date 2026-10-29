@@ -65,6 +65,11 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_CLC_RESP_STRIDE 16
 #define SMEM_TOTAL 230528
 #define THREADS 224
+#if defined(__CUDACC_VER_MAJOR__) && (__CUDA_ARCH__ == 1000) && ((__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ == 9) || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ == 0))
+#define CAKE_ARRIVE_FIRST 1
+#else
+#define CAKE_ARRIVE_FIRST 0
+#endif
 
 #include <math_constants.h>
 
@@ -315,13 +320,21 @@ kernel_cake_lm_head_loss_2989154c4cd16d281c69(const __grid_constant__ CUtensorMa
                     #pragma unroll 1
                     for (int ld_k = 0; ld_k < k_iters; ld_k++) {
                         mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
+#if CAKE_ARRIVE_FIRST
+                        asm volatile(
+                            "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
+                            :: "r"((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF), "r"((uint32_t)(32768)) : "memory");
+#endif
                         int ld_kk = ld_k_base + ld_k;
                         int ld_k0 = ld_k * 64;
                         tma_3d_gmem2smem_cta2(smem_v0_addr + load_stage * 32768, (&A), 0, ld_off_m, ld_k, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
                         tma_3d_gmem2smem_cta2(smem_v0_addr_0 + load_stage * 32768, (&B), 0, ld_off_n, ld_k, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+#if CAKE_ARRIVE_FIRST
+#else
                         asm volatile(
                             "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
                             :: "r"((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF), "r"((uint32_t)(32768)) : "memory");
+#endif
                         load_stage += 1;
                         if (load_stage == 7) { load_stage = 0; _phase_mma_done ^= 1; }
                     }
