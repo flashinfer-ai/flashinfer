@@ -48,11 +48,9 @@ class CollectiveCounter:
         "all_reduce",
         "broadcast",
         "reduce_scatter_tensor",
-        "isend",
-        "irecv",
-        "send",
-        "recv",
     )
+    # ``isend`` / ``irecv`` are not shimmed: ring exchanges pass those functions themselves as ``P2POp`` operations,
+    # which torch checks by identity; a point-to-point batch counts once, as its ``batch_isend_irecv`` call
 
     def __init__(self) -> None:
         self.phase = "orig"
