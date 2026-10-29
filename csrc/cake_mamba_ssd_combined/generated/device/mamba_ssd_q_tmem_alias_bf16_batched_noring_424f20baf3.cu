@@ -1904,13 +1904,13 @@ kernel_mamba_ssd_q_tmem_alias_bf16_batched_noring(const __grid_constant__ CUtens
                                         }
                                         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_y_addr + output_stage * 16384 + (unsigned int)(row_1 * 128 + dim_base * 2 ^ (row_1 * 128 + dim_base * 2 >> 7 & 7) << 4))), "r"(group_values_bf16[0]), "r"(group_values_bf16[1]), "r"(group_values_bf16[2]), "r"(group_values_bf16[3]) : "memory");
                                     } else {
-                                        unsigned int group_values_pva[4];
+                                        unsigned int group_values_pv[4];
                                         #pragma unroll
                                         for (int _lp = 0; _lp < 4; _lp++) {
                                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(group_values[_lp*2 + 0], group_values[_lp*2+1 + 0]));
-                                            group_values_pva[_lp] = *(uint32_t*)&_bf2;
+                                            group_values_pv[_lp] = *(uint32_t*)&_bf2;
                                         }
-                                        reinterpret_cast<int4*>(out_native + (out_row_base + dim_base))[0] = reinterpret_cast<int4*>(group_values_pva)[0];
+                                        reinterpret_cast<int4*>(out_native + (out_row_base + dim_base))[0] = reinterpret_cast<int4*>(group_values_pv)[0];
                                     }
                                 }
                             }
@@ -2040,13 +2040,13 @@ kernel_mamba_ssd_q_tmem_alias_bf16_batched_noring(const __grid_constant__ CUtens
                                         }
                                         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((smem_y_addr + output_stage * 16384 + (unsigned int)(row_1 * 128 + dim_base_1 * 2 ^ (row_1 * 128 + dim_base_1 * 2 >> 7 & 7) << 4))), "r"(group_values_bf16_1[0]), "r"(group_values_bf16_1[1]), "r"(group_values_bf16_1[2]), "r"(group_values_bf16_1[3]) : "memory");
                                     } else {
-                                        unsigned int group_values_pvb[4];
+                                        unsigned int group_values_pv_1[4];
                                         #pragma unroll
                                         for (int _lp = 0; _lp < 4; _lp++) {
                                             __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(group_values_1[_lp*2 + 0], group_values_1[_lp*2+1 + 0]));
-                                            group_values_pvb[_lp] = *(uint32_t*)&_bf2;
+                                            group_values_pv_1[_lp] = *(uint32_t*)&_bf2;
                                         }
-                                        reinterpret_cast<int4*>(out_native + (out_row_base_1 + dim_base_1))[0] = reinterpret_cast<int4*>(group_values_pvb)[0];
+                                        reinterpret_cast<int4*>(out_native + (out_row_base_1 + dim_base_1))[0] = reinterpret_cast<int4*>(group_values_pv_1)[0];
                                     }
                                 }
                             }
