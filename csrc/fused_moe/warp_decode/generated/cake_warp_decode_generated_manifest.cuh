@@ -6617,6 +6617,15 @@ inline int32_t Fc1LaunchGridN(const warp_decode::Shape& shape,
     if (shape.hidden_size == 3072 && shape.intermediate_size == 384 && shape.num_experts == 256 &&
         shape.local_num_experts == 256 && shape.top_k == 8 && shape.num_tokens == 3)
       pool = std::min<int32_t>(80, pool);  // h3072_e256_i384_k8 T3
+    if (shape.hidden_size == 3072 && shape.intermediate_size == 384 && shape.num_experts == 256 &&
+        shape.local_num_experts == 256 && shape.top_k == 8 && shape.num_tokens == 4)
+      pool = std::min<int32_t>(96, pool);  // h3072_e256_i384_k8 T4
+    if (shape.hidden_size == 3072 && shape.intermediate_size == 768 && shape.num_experts == 256 &&
+        shape.local_num_experts == 256 && shape.top_k == 8 && shape.num_tokens == 2)
+      pool = std::min<int32_t>(96, pool);  // h3072_e256_i768_k8 T2
+    if (shape.hidden_size == 4096 && shape.intermediate_size == 256 && shape.num_experts == 512 &&
+        shape.local_num_experts == 512 && shape.top_k == 10 && shape.num_tokens == 4)
+      pool = std::min<int32_t>(80, pool);  // h4096_e512_i256_k10 T4
     if (shape.hidden_size == 4096 && shape.intermediate_size == 512 && shape.num_experts == 512 &&
         shape.local_num_experts == 512 && shape.top_k == 10 && shape.num_tokens == 2)
       pool = std::min<int32_t>(96, pool);  // h4096_e512_i512_k10 T2
