@@ -303,10 +303,11 @@ On the receiving rank the combine tail (wait for every source, fp32 top-k
 reduce, ack) runs as one fused kernel without a per-round combine-inbox fill;
 `FLASHINFER_SM90_CAKE_BF16_FUSED_TAIL=0` selects the vendored three-kernel
 tail (bit-identical output) for A/B checks, and peers may mix the two. Dedup
-rounds of up to 512 tokens per rank dispatch through one cooperative kernel
+rounds below the grid-dispatch bound (513 tokens per rank, 512 at EP 8) by
+default dispatch through one cooperative kernel
 (count + reserve + store_publish, with the round opening and the receiver-side
-prefix folded in), larger dedup rounds through one grid-strided cooperative
-kernel over the co-resident blocks; `FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH=0`
+prefix folded in), dedup rounds from the bound on through one grid-strided
+cooperative kernel over the co-resident blocks; `FLASHINFER_SM90_CAKE_BF16_FUSED_DISPATCH=0`
 plus `FLASHINFER_SM90_CAKE_BF16_GRID_DISPATCH_MIN_TOKENS=0` select the vendored
 dispatch kernels, which non-dedup pipes always use. The dispatch wire format is
 the vendored one in every combination.

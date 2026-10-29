@@ -1528,6 +1528,7 @@ def test_ep_grid_dispatch_default_bound(mode: str, monkeypatch) -> None:
     )
 
     monkeypatch.delenv(cake_runner.GRID_DISPATCH_MIN_TOKENS_ENV, raising=False)
+    monkeypatch.delenv(cake_runner.FUSED_DISPATCH_ENV, raising=False)
     rank, world_size = _dist_setup()
     device = torch.device("cuda", rank)
     total_experts = LOCAL_EXPERTS * world_size
