@@ -175,7 +175,7 @@ constexpr int64_t kSmallTokenExtendedMax = 71;
 
 // World sizes 4 and 8 run the two-shot program from these token counts on, tested ahead of the
 // small-token tests; world size 8 also runs it for every batch above small_token_max.
-constexpr int64_t kTwoShotMinTokensWorldSize4 = 88;
+constexpr int64_t kTwoShotMinTokensWorldSize4 = 72;
 constexpr int64_t kTwoShotMinTokensWorldSize8 = 56;
 
 // A two-shot batch of at least these token counts runs the deferred two-shot program, except

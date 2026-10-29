@@ -243,7 +243,7 @@ MODULES: dict[str, dict[str, Any]] = {
 
 # The largest token count that runs the small-token program (the binding extends it to
 # 71 tokens at world sizes 2 and 4 except for top_k 4 without a shared expert). The
-# binding tests the two-shot program first: it runs at world size 4 from 88 tokens and
+# binding tests the two-shot program first: it runs at world size 4 from 72 tokens and
 # at world size 8 from 56 tokens, in its deferred form from 1536 and 768 tokens (except
 # at world size 8 for top_k 4 without a shared expert and without an NVFP4 epilogue).
 # Larger batches run the two-shot program at world size 8, the large-token program at
