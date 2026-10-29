@@ -1118,6 +1118,8 @@ BLOCK_M_VALUES = (8, 16)
 #          shared memory; one kernel per row count, non-cooperative launch
 #   LC1_NC: the one-token LC kernel with its bias and logits loads in the
 #          read-only form (one token at block_m 16), same launch
+#   LC2_CW: the two-token LC kernel ranking its winners from a certified
+#          window (SM100, two tokens at block_m 8), same launch
 #   LCG  : one non-portable cluster of 16 CTAs of two row groups each, any
 #          num_tokens <= 32 (the 32-token cell: the counts up to 32 that are
 #          not an LC row count); non-cooperative launch
@@ -1157,6 +1159,7 @@ ARMS = (
     "LPC",
     "LC",
     "LC1_NC",
+    "LC2_CW",
     "LCG",
     "LCG_LW",
     "LCG_LW_OWN",
