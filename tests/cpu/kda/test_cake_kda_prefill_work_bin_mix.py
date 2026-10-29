@@ -258,8 +258,24 @@ def test_program_lookup_refuses_sm103a_even_where_a_loader_names_a_build(
     assert runtime._work_bin_mix_program(program, "sm_103a") is None
 
 
-def test_shipped_loader_names_no_bin_mix_build_yet():
-    assert registry._RENDERED_WORK_BIN_MIX_ROUTES == {"sm_100a": {}, "sm_103a": {}}
+def test_shipped_loader_names_the_unbounded_direct_bin_mix_build():
+    # One bin-mix build on each architecture of WORK_BIN_MIX_ARCHES, beside
+    # the turnover build of the same module, registered like every generated
+    # program; none on another architecture.
+    routes = registry._RENDERED_WORK_BIN_MIX_ROUTES
+    assert set(routes) == {"sm_100a", "sm_103a"}
+    for arch, by_module in routes.items():
+        if arch not in runtime.WORK_BIN_MIX_ARCHES:
+            assert by_module == {}, arch
+            continue
+        assert by_module, arch
+        for module, program in by_module.items():
+            assert module in TURN[arch], (arch, module)
+            assert program != TURN[arch][module]
+            assert registry._RENDERED_MODULES[program]["arches"] == list(
+                runtime.WORK_BIN_MIX_ARCHES
+            )
+            assert runtime._work_bin_mix_program(TURN[arch][module], arch) == program
 
 
 # ------------------------------------------------------------- the plan
