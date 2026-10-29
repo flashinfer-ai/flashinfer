@@ -571,8 +571,9 @@ def test_stage_table_builds_every_stage_from_the_shared_launcher():
     # 4 + 15 BF16 stages, their 19 FP8 twins, 2 quantizers, then the 19 + 19 GQA stages, the
     # two round-2 FP8 GQA programs (attention_fp8_gqa_xs_queue, small_fp8_gqa_k4p2), the
     # round-16 position-selected FP8 GQA static program (attention_fp8_gqa_pin) and the
-    # round-17 planner-routed second BF16 GQA queue program (attention_gqa_queue_vf)
-    assert len(loader.STAGES) == 82 and set(loader.STAGES) == set(loader.MODULES)
+    # round-17 planner-routed second BF16 GQA queue program (attention_gqa_queue_vf) and the
+    # round-19 planner-routed second FP8 GQA position-selected program (attention_fp8_gqa_pin_vf)
+    assert len(loader.STAGES) == 83 and set(loader.STAGES) == set(loader.MODULES)
     referenced = set()
     for stage in loader.STAGES:
         record = loader.stage_record(stage)
@@ -683,7 +684,10 @@ def test_stage_table_geometry_matches_the_stage_names():
             # the position-selected program is a static program of the same family (round 16); it states pin;
             # the second queue program is a queue program of the BF16 GQA family (round 17); it states vf
             xshare = stage == f"{base}_xs_queue"
-            pin = stage == f"{base}_pin"
+            # ... and the second position-selected program is a static program of the same family; it
+            # states pin and vf
+            pin_vf = stage == f"{base}_pin_vf"
+            pin = stage == f"{base}_pin" or pin_vf
             vf = stage == f"{base}_queue_vf"
             expected_route = {
                 "compact": stage == f"{base}_compact",
@@ -701,6 +705,8 @@ def test_stage_table_geometry_matches_the_stage_names():
             if pin:
                 assert fp8 and gqa
                 expected_route["pin"] = True
+            if pin_vf:
+                expected_route["vf"] = True
             if vf:
                 assert gqa and not fp8
                 expected_route["vf"] = True
@@ -713,7 +719,8 @@ def test_stage_table_geometry_matches_the_stage_names():
                 gqa=gqa,
                 xshare=route.get("xshare", False),
                 pin=route.get("pin", False),
-                vf=route.get("vf", False),
+                vf=route.get("vf", False) and not route.get("pin", False),
+                pin_vf=route.get("vf", False) and route.get("pin", False),
             )
             assert ("parameter", "g_shift") not in plan and "g_shift" not in record[
                 "logical"
@@ -872,7 +879,7 @@ def test_stage_table_geometry_matches_the_stage_names():
     }
     # ... plus the shared-transposer queue stage and the depth-2 grouped-query FP8 k4 stage,
     # the two GQA stages without an MHA twin of their own keywords (round 2), and the
-    # position-selected static stage (round 16).
+    # position-selected static stage (round 16) and its planner-routed second form.
     assert set(loader.FP8_GQA_PERSISTENT_STAGES) == {
         "attention_fp8_gqa",
         "attention_fp8_gqa_queue",
@@ -880,6 +887,7 @@ def test_stage_table_geometry_matches_the_stage_names():
         "attention_fp8_gqa_tagged",
         "attention_fp8_gqa_xs_queue",
         "attention_fp8_gqa_pin",
+        "attention_fp8_gqa_pin_vf",
     }
     assert set(loader.FP8_GQA_SMALL_STAGES) == {
         stage.replace("small_", "small_fp8_gqa_") for stage in loader.SMALL_STAGES
@@ -888,7 +896,7 @@ def test_stage_table_geometry_matches_the_stage_names():
     assert len(loader.FP8_PERSISTENT_STAGES) + len(loader.FP8_SMALL_STAGES) == 19
     assert len(loader.GQA_PERSISTENT_STAGES) + len(loader.GQA_SMALL_STAGES) == 20
     assert (
-        len(loader.FP8_GQA_PERSISTENT_STAGES) + len(loader.FP8_GQA_SMALL_STAGES) == 22
+        len(loader.FP8_GQA_PERSISTENT_STAGES) + len(loader.FP8_GQA_SMALL_STAGES) == 23
     )
     assert set(loader.STAGES) == (
         set(loader.PERSISTENT_STAGES)
@@ -909,13 +917,14 @@ def test_stage_table_geometry_matches_the_stage_names():
         + loader.FP8_SMALL_STAGES
         + loader.QUANTIZE_STAGES
     )
-    # (the two round-2 programs, the round-16 program and the round-17 program appended after
-    # the 38 GQA records, in this order)
+    # (the two round-2 programs, the round-16 program, the round-17 program and the round-19
+    # program appended after the 38 GQA records, in this order)
     appended = (
         "attention_fp8_gqa_xs_queue",
         "small_fp8_gqa_k4p2",
         "attention_fp8_gqa_pin",
         "attention_gqa_queue_vf",
+        "attention_fp8_gqa_pin_vf",
     )
     assert loader.STAGES[40:78] == tuple(
         stage
@@ -993,10 +1002,11 @@ def test_stage_table_geometry_matches_the_stage_names():
     assert b["arg_plan"] == a["arg_plan"] and b["logical"] == a["logical"]
     assert b["launch"] == a["launch"] and b["grid_rule"] == a["grid_rule"]
     assert b["workspace_rule"] is None and b["library"] != a["library"]
-    assert loader.STAGES[-3:] == (
+    assert loader.STAGES[-4:] == (
         "small_fp8_gqa_k4p2",
         "attention_fp8_gqa_pin",
         "attention_gqa_queue_vf",
+        "attention_fp8_gqa_pin_vf",
     )
     assert loader.small_stage(4, fp8=True, gqa=True, prefetch=2) == "small_fp8_gqa_k4p2"
     assert loader.small_stage(4, fp8=True, gqa=True) == "small_fp8_gqa_k4"
@@ -1060,7 +1070,7 @@ def test_build_manifest_pins_the_numerics_flags():
     assert not any(
         flag.startswith(numerics) for flag in manifest["common"]["nvcc_flags"]
     )
-    assert len(manifest["libraries"]) == 82
+    assert len(manifest["libraries"]) == 83
     for entry in manifest["libraries"]:
         assert entry["nvcc_flags"] == ["--use_fast_math"], entry["name"]
         assert entry["nvcc_flags_if"] == [], entry["name"]
@@ -1992,17 +2002,21 @@ def test_plan_pin_route_rule(monkeypatch):
 
 
 def test_plan_queue_vf_route_rule(monkeypatch):
-    """Pair-mode BF16 grouped-query queue plans of long tiles (at least QUEUE_VF_MIN_TILE_POS ring
-    positions) whose lightest CTA runs at least QUEUE_VF_MIN_CTA_LOOP_ITERS main-loop iterations
-    carry ``queue_vf`` True and take the planner-routed second queue program
-    (``attention_gqa_queue_vf``: h12-m109632-n109632-k64 at g = 4); pooled plans of short tiles,
-    static plans and every MHA plan carry ``queue_vf`` False and keep their programs.  The planner
-    decides the key inside the plan and ``bf16_gqa_queue_vf`` reads it; the kernel-tests reference
-    planner states the same statistic."""
+    """Pair-mode BF16 grouped-query queue plans whose lightest CTA runs at least
+    QUEUE_VF_MIN_CTA_LOOP_ITERS main-loop iterations on tiles of at least QUEUE_VF_MIN_TILE_POS
+    ring positions (h12-m109632-n109632-k64 at g = 4), or at least
+    QUEUE_VF_SHORT_MIN_CTA_LOOP_ITERS on tiles of at least QUEUE_VF_SHORT_TILE_POS positions
+    (h12-m109632-n109632-k32 at g = 4), carry ``queue_vf`` True and take the planner-routed
+    second queue program (``attention_gqa_queue_vf``); pooled plans of short tiles, short-tile
+    plans of fewer iterations, static plans and every MHA plan carry ``queue_vf`` False and keep
+    their programs.  The planner decides the key inside the plan and ``bf16_gqa_queue_vf`` reads
+    it; the kernel-tests reference planner states the same statistic."""
     module = planner
 
     assert planner.QUEUE_VF_MIN_TILE_POS == 24
     assert planner.QUEUE_VF_MIN_CTA_LOOP_ITERS == 440
+    assert planner.QUEUE_VF_SHORT_TILE_POS == 16
+    assert planner.QUEUE_VF_SHORT_MIN_CTA_LOOP_ITERS == 1000
     g = 4
     long_mask = _topk_mask(
         3, 1713, 1713, 64
@@ -2021,10 +2035,20 @@ def test_plan_queue_vf_route_rule(monkeypatch):
     # the round-robin preview's; the preview's lightest CTA also clears the threshold
     lightest = min(sum(p - 1 for _, p in tiles) for tiles in _cta_tiles(long))
     assert lightest >= planner.QUEUE_VF_MIN_CTA_LOOP_ITERS
-    # h8-m32768-n32768-k32 at g = 4: a queue plan of 16-position tiles stays on the queue program
+    # h12-m109632-n109632-k32 at g = 4: a pair-mode queue plan of 16..17-position tiles whose
+    # lightest CTA runs enough main-loop iterations takes the second queue program too
+    tier_mask = _topk_mask(3, 1713, 1713, 32)
+    tier = plan_vsa_sm90(tier_mask, sms=132, gqa=g)
+    assert tier["mode"] == "pair" and tier["queue"] and tier["gqa"] == g
+    assert max(p for tiles in _cta_tiles(tier) for _, p in tiles) < 24
+    assert tier["cta_loop_iters"] >= planner.QUEUE_VF_SHORT_MIN_CTA_LOOP_ITERS
+    assert tier["queue_vf"] is True and planner.bf16_gqa_queue_vf(tier) is True
+    # h8-m32768-n32768-k32 at g = 4: a queue plan of 16..17-position tiles whose lightest CTA
+    # runs fewer iterations stays on the queue program
     short_mask = _topk_mask(2, 512, 512, 32)
     short = plan_vsa_sm90(short_mask, sms=132, gqa=g)
     assert short["queue"] and short["queue_vf"] is False
+    assert short["cta_loop_iters"] < planner.QUEUE_VF_SHORT_MIN_CTA_LOOP_ITERS
     assert planner.bf16_gqa_queue_vf(short) is False
     # 2112 head-pair tiles of <= 4 positions: the pooled queue plan of the bitwise test
     pooled = plan_vsa_sm90(_topk_mask(2, 528, 64, 8), sms=132, gqa=g)
@@ -2038,21 +2062,74 @@ def test_plan_queue_vf_route_rule(monkeypatch):
     # the key is read, never recomputed: no key or an MHA plan is an unrouted plan
     assert planner.bf16_gqa_queue_vf({"gqa": 4}) is False
     assert planner.bf16_gqa_queue_vf({"gqa": 1, "queue_vf": True}) is False
-    # the threshold is the route; the plan bytes do not depend on it
+    # the thresholds are the route; the plan bytes do not depend on them
     monkeypatch.setattr(module, "QUEUE_VF_MIN_CTA_LOOP_ITERS", 10**9)
+    monkeypatch.setattr(module, "QUEUE_VF_SHORT_MIN_CTA_LOOP_ITERS", 10**9)
     off = plan_vsa_sm90(long_mask, sms=132, gqa=g)
     assert off["queue_vf"] is False and off["cta_loop_iters"] == long["cta_loop_iters"]
     assert torch.equal(off["meta"], long["meta"])
     assert torch.equal(off["hdr"], long["hdr"])
     monkeypatch.setattr(module, "QUEUE_VF_MIN_CTA_LOOP_ITERS", 1)
     assert plan_vsa_sm90(long_mask, sms=132, gqa=g)["queue_vf"] is True
-    # the position threshold holds on its own: 16-position tiles stay unrouted at any loop count
+    # the position thresholds hold on their own: below QUEUE_VF_MIN_TILE_POS positions the
+    # first rule never routes, below QUEUE_VF_SHORT_TILE_POS neither rule does
     assert plan_vsa_sm90(short_mask, sms=132, gqa=g)["queue_vf"] is False
+    assert plan_vsa_sm90(tier_mask, sms=132, gqa=g)["queue_vf"] is False
+    monkeypatch.setattr(module, "QUEUE_VF_SHORT_MIN_CTA_LOOP_ITERS", 1)
+    assert plan_vsa_sm90(short_mask, sms=132, gqa=g)["queue_vf"] is True
+    assert plan_vsa_sm90(_topk_mask(2, 528, 64, 8), sms=132, gqa=g)["queue_vf"] is False
     assert plan_vsa_sm90(_replicated(long_mask, g), sms=132)["queue_vf"] is False
     # without the queue there is no second queue program
     monkeypatch.setattr(module, "POOL_MIN_TILES", 10**9)
     unpooled = plan_vsa_sm90(long_mask, sms=132, gqa=g)
     assert not unpooled["queue"] and unpooled["queue_vf"] is False
+
+
+def test_plan_pin_vf_route_rule(monkeypatch):
+    """Pair-mode pin plans of long tiles (at least PIN_VF_MIN_TILE_POS ring positions) whose lightest
+    CTA runs at least PIN_VF_MIN_CTA_LOOP_ITERS main-loop iterations carry ``pin_vf`` True and take the
+    planner-routed second position-selected program (``attention_fp8_gqa_pin_vf``: h8-m4096-n4096-k64
+    at g = 4, 32..33-position tiles); the pin plans of 16-position tiles (h8-m4096-n4096-k32 at g = 4),
+    the other static, queue and compact plans and every MHA plan carry ``pin_vf`` False.  The planner
+    decides the key inside the plan and ``fp8_gqa_pin_vf`` reads it; the kernel-tests reference planner
+    states the same rule."""
+    module = planner
+
+    assert planner.PIN_VF_MIN_TILE_POS == 24
+    assert planner.PIN_VF_MIN_CTA_LOOP_ITERS == 40
+    g = 4
+    long_mask = _topk_mask(2, 64, 64, 64)  # h8-m4096-n4096-k64 at g = 4
+    long = plan_vsa_sm90(long_mask, sms=132, gqa=g)
+    assert long["mode"] == "pair" and not long["queue"] and long["pin"] is True
+    assert long["cta_loop_iters"] >= planner.PIN_VF_MIN_CTA_LOOP_ITERS
+    assert long["pin_vf"] is True and planner.fp8_gqa_pin_vf(long) is True
+    # h8-m4096-n4096-k32 at g = 4: a pin plan of 16-position tiles keeps the pin program
+    short_tiles = plan_vsa_sm90(_topk_mask(2, 64, 64, 32), sms=132, gqa=g)
+    assert short_tiles["pin"] is True and short_tiles["pin_vf"] is False
+    assert planner.fp8_gqa_pin_vf(short_tiles) is False
+    queue = plan_vsa_sm90(_topk_mask(2, 528, 64, 8), sms=132, gqa=g)
+    assert queue["queue"] and queue["pin_vf"] is False
+    mha = plan_vsa_sm90(_replicated(long_mask, g), sms=132)
+    assert (
+        mha["gqa"] == 1
+        and mha["pin_vf"] is False
+        and planner.fp8_gqa_pin_vf(mha) is False
+    )
+    # the keys are read, never recomputed: pin_vf without pin is an unrouted plan
+    assert planner.fp8_gqa_pin_vf({"gqa": 4, "pin_vf": True}) is False
+    assert planner.fp8_gqa_pin_vf({"gqa": 1, "pin": True, "pin_vf": True}) is False
+    # the threshold is the route; the plan bytes do not depend on it
+    monkeypatch.setattr(module, "PIN_VF_MIN_CTA_LOOP_ITERS", 10**9)
+    off = plan_vsa_sm90(long_mask, sms=132, gqa=g)
+    assert off["pin_vf"] is False and off["pin"] is True
+    assert torch.equal(off["meta"], long["meta"])
+    assert torch.equal(off["hdr"], long["hdr"])
+    monkeypatch.setattr(module, "PIN_VF_MIN_CTA_LOOP_ITERS", 1)
+    # the position threshold holds on its own: 16-position tiles stay unrouted at any loop count
+    assert plan_vsa_sm90(_topk_mask(2, 64, 64, 32), sms=132, gqa=g)["pin_vf"] is False
+    # compact plans are never pin plans, so they never carry pin_vf (h16-m8192-n8192-k5 at g = 4)
+    compact = plan_vsa_sm90(_topk_mask(4, 128, 128, 5), sms=132, gqa=g)
+    assert compact["compact"] and not compact["pin"] and compact["pin_vf"] is False
 
 
 def test_plan_ragged_queue_threshold_and_pool_order():
@@ -4278,11 +4355,12 @@ def test_fp8_gqa_routes_match_the_fp8_mha_route_on_replicated_inputs(
     # from the stage the route picked, so a plan routed away from the pin program fails here.
     expected_stage = _gqa_stage_of(mha.stage)
     sms = torch.cuda.get_device_properties(gqa.device).multi_processor_count
-    if planner.fp8_gqa_pin(
-        plan_vsa_sm90(mask.cpu(), sms=sms, gqa=g, split_tile_order="group")
-    ):
+    fi_plan = plan_vsa_sm90(mask.cpu(), sms=sms, gqa=g, split_tile_order="group")
+    if planner.fp8_gqa_pin(fi_plan):
         assert expected_stage == "attention_fp8_gqa"
         expected_stage = "attention_fp8_gqa_pin"
+    if planner.fp8_gqa_pin_vf(fi_plan):
+        expected_stage = "attention_fp8_gqa_pin_vf"
     assert gqa.stage == expected_stage and loader.stage_gqa(gqa.stage)
     assert gqa.mode == mha.mode
     record_property(f"fp8_repair_split_g{g}", gqa.repair_split)
@@ -4756,3 +4834,83 @@ def test_sage_fp8_quantize_sm90_gqa_matches_torch(shape, record_property):
     qk = loader.MODULES["quantize_qk_vamax"]["kernel_symbol"]
     assert kernels == [qk, qk, loader.MODULES["quantize_v"]["kernel_symbol"]], names
     assert len(names) == len(kernels) + 1 and "Fill" in names[0], names
+
+
+def test_fp8_gqa_pin_vf_route_takes_long_pair_pin_plans_only():
+    """``persistent_stage`` names the second position-selected program for the FP8 GQA static route with
+    ``pin`` and ``pin_vf`` only; the BF16 route, MHA, queue, compact and tagged forms, a ``pin_vf`` without
+    ``pin`` and the BF16 ``vf`` switch on the pin program refuse it."""
+    assert (
+        loader.persistent_stage(False, fp8=True, gqa=True, pin=True, pin_vf=True)
+        == "attention_fp8_gqa_pin_vf"
+    )
+    record = loader.stage_record("attention_fp8_gqa_pin_vf")
+    twin = loader.stage_record("attention_fp8_gqa_pin")
+    assert record["route"] == {**twin["route"], "vf": True}
+    assert record["launch"] == twin["launch"] and record["library"] != twin["library"]
+    assert (
+        record["arg_plan"] == twin["arg_plan"] and record["logical"] == twin["logical"]
+    )
+    assert loader.stage_gqa("attention_fp8_gqa_pin_vf")
+    assert loader.stage_dtype("attention_fp8_gqa_pin_vf") == "e4m3"
+    for kwargs in (
+        dict(queue=True, fp8=True, gqa=True, pin=True, pin_vf=True),
+        dict(queue=False, compact=True, fp8=True, gqa=True, pin=True, pin_vf=True),
+        dict(queue=False, tagged=True, fp8=True, gqa=True, pin=True, pin_vf=True),
+        dict(queue=False, fp8=False, gqa=True, pin=True, pin_vf=True),
+        dict(queue=False, fp8=True, gqa=False, pin=True, pin_vf=True),
+        dict(queue=False, fp8=True, gqa=True, pin_vf=True),
+        dict(queue=False, fp8=True, gqa=True, pin=True, vf=True),
+    ):
+        with pytest.raises(ValueError):
+            loader.persistent_stage(**kwargs)
+
+
+@requires_hopper
+def test_fp8_gqa_pin_vf_kernel_matches_the_pin_kernel_bit_exact(
+    monkeypatch, record_property
+):
+    """The second position-selected program waits for the same V^T slot and generation later in the same
+    iteration: bit-identical to the pin program on the same plan (same CTAs, same meta / hdr bytes), the
+    queue words stay zero and a captured graph replays it."""
+    g, h_kv, mb, nb = (
+        4,
+        2,
+        64,
+        64,
+    )  # h8-m4096-n4096-k64 at g = 4: 32..33-position pair tiles
+    h = g * h_kv
+    mask = _topk_mask(h_kv, mb, nb, 64).cuda()
+    q8, k8, v8, *scales = _fp8_gqa_inputs(h, h_kv, mb, nb)
+    routed = _fp8_gqa_plan_for(mask, h, scales, route="persistent")
+    if routed.stage != "attention_fp8_gqa_pin_vf":
+        pytest.skip(
+            f"this GPU's plan does not reach PIN_VF_MIN_CTA_LOOP_ITERS ({routed.stage})"
+        )
+    record_property("pin_vf_num_ctas", int(routed.num_ctas))
+    out = torch.empty((h * mb * 64, 1, 128), device="cuda", dtype=torch.bfloat16)
+    assert _cuda_kernel_names(lambda: routed.run(q8, k8, v8, out=out)) == [
+        loader.MODULES["attention_fp8_gqa_pin_vf"]["kernel_symbol"]
+    ]
+    first = routed.run(q8, k8, v8, out=out).clone()
+    torch.cuda.synchronize()
+    assert int(routed.dbg[62:64].abs().sum()) == 0
+    # the threshold is the route: above every loop count the planner keeps the pin program on the same plan
+    monkeypatch.setattr(planner, "PIN_VF_MIN_CTA_LOOP_ITERS", 10**9)
+    pinned = _fp8_gqa_plan_for(mask, h, scales, route="persistent")
+    assert (
+        pinned.stage == "attention_fp8_gqa_pin" and pinned.num_ctas == routed.num_ctas
+    )
+    assert _cuda_kernel_names(lambda: pinned.run(q8, k8, v8, out=out)) == [
+        loader.MODULES["attention_fp8_gqa_pin"]["kernel_symbol"]
+    ]
+    torch.testing.assert_close(pinned.run(q8, k8, v8), first, atol=0, rtol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        routed.run(q8, k8, v8, out=out)
+    for _ in range(3):
+        out.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out.view_as(first), first, atol=0, rtol=0)
+        assert int(routed.dbg[62:64].abs().sum()) == 0

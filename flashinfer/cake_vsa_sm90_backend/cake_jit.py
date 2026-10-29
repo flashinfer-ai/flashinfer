@@ -5135,6 +5135,85 @@ MODULES: dict[str, dict[str, Any]] = {
             "tl_words": 8,
         },
     },
+    # The planner-routed second position-selected FP8 grouped-query program
+    # (``cake_planner.fp8_gqa_pin_vf`` routes pair-mode pin plans of long tiles whose
+    # lightest CTA runs at least ``PIN_VF_MIN_CTA_LOOP_ITERS`` main-loop iterations to it):
+    # the ``attention_fp8_gqa_pin`` record with ``route["vf"] = True`` and its own program;
+    # same parameters, footprint and workspace.
+    "attention_fp8_gqa_pin_vf": {
+        "arches": [
+            "sm_90a",
+        ],
+        "arg_plan": [
+            ["buffer", "Q"],
+            ["buffer", "K"],
+            ["buffer", "V"],
+            ["buffer", "O"],
+            ["buffer", "Qs"],
+            ["buffer", "Ks"],
+            ["buffer", "Vs"],
+            ["parameter", "k_scale_groups"],
+            ["buffer", "meta"],
+            ["param_array", "hdr"],
+            ["parameter", "tile_stride"],
+            ["parameter", "seqlen_q"],
+            ["parameter", "seqlen_k"],
+            ["parameter", "scale_log2"],
+            ["buffer", "dbg"],
+            ["buffer", "tl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "count": "num_ctas",
+            "kind": "plan_count",
+        },
+        "kernel": "cake_vsa_sm90_35b46883edd9586633f7",
+        "kernel_symbol": "kernel_cake_vsa_sm90_35b46883edd9586633f7",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 185216,
+            "use_pdl": False,
+        },
+        "library": "cake_vsa_sm90_35b46883edd9586633f7",
+        "logical": {
+            "K": "k",
+            "Ks": "k_scale",
+            "O": "out",
+            "Q": "q",
+            "Qs": "q_scale",
+            "V": "v",
+            "Vs": "v_scale",
+            "dbg": "dbg",
+            "hdr": "hdr",
+            "k_scale_groups": "k_scale_groups",
+            "meta": "meta",
+            "scale_log2": "scale_log2",
+            "seqlen_k": "seqlen_k",
+            "seqlen_q": "seqlen_q",
+            "tile_stride": "tile_stride",
+            "tl": "tl",
+        },
+        "route": {
+            "compact": False,
+            "dtype": "e4m3",
+            "gqa": True,
+            "kind": "persistent",
+            "pin": True,
+            "queue": False,
+            "tagged": False,
+            "vf": True,
+        },
+        "workspace_rule": {
+            "dbg_words": 64,
+            "kind": "persistent",
+            "tl_words": 8,
+        },
+    },
 }
 
 # One verified build: H100 / H200 (``sm_90a``).  The architecture is compiled
@@ -5274,6 +5353,7 @@ def persistent_stage(
     xshare: bool = False,
     pin: bool = False,
     vf: bool = False,
+    pin_vf: bool = False,
 ) -> str:
     """The persistent kernel's stage: the queue-scheduled twin when ``queue``, the compact
     static program when ``compact`` (uniform pair plans of short tiles with many tiles per
@@ -5291,7 +5371,11 @@ def persistent_stage(
     BF16 grouped-query queue program with the per-position V^T wait moved to the PV
     issue, which the planner selects for pair-mode queue plans of long tiles whose
     lightest CTA runs at least ``QUEUE_VF_MIN_CTA_LOOP_ITERS`` main-loop iterations:
-    ``cake_planner.bf16_gqa_queue_vf``)."""
+    ``cake_planner.bf16_gqa_queue_vf``); ``attention_fp8_gqa_pin_vf`` when ``pin`` and
+    ``pin_vf`` (the FP8 grouped-query position-selected program with the per-position V^T
+    wait moved behind the QK issue, which the planner selects for pair-mode pin plans of
+    long tiles whose lightest CTA runs at least ``PIN_VF_MIN_CTA_LOOP_ITERS`` main-loop
+    iterations: ``cake_planner.fp8_gqa_pin_vf``)."""
 
     base = "attention_fp8" if fp8 else "attention"
     if gqa:
@@ -5303,6 +5387,13 @@ def persistent_stage(
                 "program only"
             )
         return f"{base}_queue_vf"
+    if pin_vf:
+        if not (fp8 and gqa and pin) or queue or compact or tagged or xshare:
+            raise ValueError(
+                "the planner-routed second position-selected program is the FP8 grouped-query "
+                "static pin program only"
+            )
+        return f"{base}_pin_vf"
     if pin:
         if not (fp8 and gqa) or queue or compact or tagged or xshare:
             raise ValueError(

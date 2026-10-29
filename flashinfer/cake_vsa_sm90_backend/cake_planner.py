@@ -212,16 +212,39 @@ PIN_MIN_CTA_LOOP_ITERS = 8
 # the queue program with the per-position V^T wait moved from the joint K / V^T gate
 # before QK(next) to just before the PV issue (the same slot and generation, waited
 # later in the same iteration: the output bits are the queue program's), selected for
-# pair-mode BF16 queue plans of tiles of at least QUEUE_VF_MIN_TILE_POS ring positions
-# whose lightest CTA runs at least QUEUE_VF_MIN_CTA_LOOP_ITERS main-loop iterations
-# (``cta_loop_iters``).  The gain is per iteration (H100, paired,
-# cold L2): the rung below the shipped value read inside its null band and keeps
-# ``attention_gqa_queue`` byte for byte, as do split-mode, static, compact and tagged
-# plans, the Sage-FP8 route and every MHA plan.  A value above every plan's loop count
-# disables the program.  Mirrors the kernel-tests reference planner
-# (``QUEUE_VF_MIN_TILE_POS`` / ``QUEUE_VF_MIN_CTA_LOOP_ITERS``); the two must agree.
+# pair-mode BF16 queue plans whose lightest CTA runs at least
+# QUEUE_VF_MIN_CTA_LOOP_ITERS main-loop iterations (``cta_loop_iters``) on tiles of at
+# least QUEUE_VF_MIN_TILE_POS ring positions, or at least
+# QUEUE_VF_SHORT_MIN_CTA_LOOP_ITERS iterations on tiles of at least
+# QUEUE_VF_SHORT_TILE_POS positions.  The gain is per iteration (H100, paired, cold L2).
+# On 32..33-position tiles the measured rungs are 440, 650 and 1000 iterations: at 440,
+# the lowest, the 15 routed plans (500..2428 iterations, 0.91..4.94 ms) run
+# 1.0066..1.0105 x faster in two 3 x 256 and two 9 x 256 processes.  On 16..17-position
+# tiles the measured rungs are 440, 780 and 1000 iterations: at 1000 the one routed plan
+# (1191 iterations, 2.60..2.61 ms) runs 1.0059..1.0065 x faster in two 3 x 256 and two 9
+# x 256 processes.  Split-mode, static, compact and tagged plans, the Sage-FP8 route and
+# every MHA plan keep their programs; a value above every plan's loop count disables its
+# tier.  Mirrors the kernel-tests reference planner (``QUEUE_VF_MIN_TILE_POS`` /
+# ``QUEUE_VF_MIN_CTA_LOOP_ITERS`` / ``QUEUE_VF_SHORT_TILE_POS`` /
+# ``QUEUE_VF_SHORT_MIN_CTA_LOOP_ITERS``); the two must agree.
 QUEUE_VF_MIN_TILE_POS = 24
 QUEUE_VF_MIN_CTA_LOOP_ITERS = 440
+QUEUE_VF_SHORT_TILE_POS = 16
+QUEUE_VF_SHORT_MIN_CTA_LOOP_ITERS = 1000
+# Planner-routed second position-selected FP8 static grouped-query program
+# (``attention_fp8_gqa_pin_vf``): the pin program with the per-position V^T wait moved
+# from the joint K / V^T gate before QK(next) to just after the QK issue (the same slot
+# and generation, waited later in the same iteration: the output bits are the pin
+# program's), selected for pair-mode pin plans of tiles of at least PIN_VF_MIN_TILE_POS
+# ring positions whose lightest CTA runs at least PIN_VF_MIN_CTA_LOOP_ITERS main-loop
+# iterations (``cta_loop_iters``).  The gain is per iteration (H100, paired, cold L2);
+# split-mode and shorter pin plans keep ``attention_fp8_gqa_pin`` byte for byte, as do
+# the other static, queue, compact and tagged plans, the BF16 route and every MHA plan.
+# A value above every plan's loop count disables the program.  Mirrors the kernel-tests
+# reference planner (``PIN_VF_MIN_TILE_POS`` / ``PIN_VF_MIN_CTA_LOOP_ITERS``); the two
+# must agree.
+PIN_VF_MIN_TILE_POS = 24
+PIN_VF_MIN_CTA_LOOP_ITERS = 40
 # Tile ORDER of static UNIFORM plans before the
 # list schedule.  The queue kernel balances its pooled tiles at run time and ragged plans
 # are already list-scheduled costliest first, so both keep the legacy order; the mode and
@@ -371,12 +394,26 @@ def bf16_gqa_queue_vf(plan: dict) -> bool:
     """Whether a grouped-query persistent plan of the BF16 route runs the planner-routed
     second queue program (``attention_gqa_queue_vf``: the queue program with the
     per-position V^T wait moved to the PV issue).  The planner decides it inside
-    :func:`plan_vsa_sm90` (plan key ``queue_vf``: a pair-mode queue plan of tiles of at
-    least ``QUEUE_VF_MIN_TILE_POS`` ring positions whose lightest CTA runs at least
-    ``QUEUE_VF_MIN_CTA_LOOP_ITERS`` main-loop iterations, plan key ``cta_loop_iters``);
-    this reads the key only.  MHA plans (``gqa`` 1) and the Sage-FP8 route never take
-    it; the kernel-tests reference planner states the same rule."""
+    :func:`plan_vsa_sm90` (plan key ``queue_vf``: a pair-mode queue plan whose lightest
+    CTA runs at least ``QUEUE_VF_MIN_CTA_LOOP_ITERS`` main-loop iterations on tiles of
+    at least ``QUEUE_VF_MIN_TILE_POS`` ring positions, or at least
+    ``QUEUE_VF_SHORT_MIN_CTA_LOOP_ITERS`` on tiles of at least
+    ``QUEUE_VF_SHORT_TILE_POS``, plan key ``cta_loop_iters``); this reads the key only.
+    MHA plans (``gqa`` 1) and the Sage-FP8 route never take it; the kernel-tests
+    reference planner states the same rule."""
     return int(plan.get("gqa", 1)) > 1 and bool(plan.get("queue_vf", False))
+
+
+def fp8_gqa_pin_vf(plan: dict) -> bool:
+    """Whether a grouped-query persistent plan of the Sage-FP8 route runs the
+    planner-routed second position-selected static program (``attention_fp8_gqa_pin_vf``:
+    the pin program with the per-position V^T wait moved behind the QK issue).  The
+    planner decides it inside :func:`plan_vsa_sm90` (plan key ``pin_vf``: a pin plan in
+    pair mode of tiles of at least ``PIN_VF_MIN_TILE_POS`` ring positions whose lightest
+    CTA runs at least ``PIN_VF_MIN_CTA_LOOP_ITERS`` main-loop iterations); this reads the
+    keys only.  MHA plans (``gqa`` 1) and the BF16 route never take it; the kernel-tests
+    reference planner states the same rule."""
+    return fp8_gqa_pin(plan) and bool(plan.get("pin_vf", False))
 
 
 def _replicated(mask: torch.Tensor, gqa: int) -> torch.Tensor:
@@ -1758,15 +1795,34 @@ def plan_vsa_sm90(
         and cta_loop_iters >= PIN_MIN_CTA_LOOP_ITERS
     )
     # Planner-routed second BF16 queue grouped-query program (QUEUE_VF_MIN_TILE_POS /
-    # QUEUE_VF_MIN_CTA_LOOP_ITERS): a pair-mode queue plan of long tiles whose lightest
-    # CTA runs enough main-loop iterations, decided here and carried as a plan key; the
-    # kernel-tests reference planner computes the same statistic.
+    # QUEUE_VF_MIN_CTA_LOOP_ITERS, QUEUE_VF_SHORT_TILE_POS /
+    # QUEUE_VF_SHORT_MIN_CTA_LOOP_ITERS): a pair-mode queue plan whose lightest CTA runs
+    # enough main-loop iterations for its tile length, decided here and carried as a
+    # plan key; the kernel-tests reference planner computes the same statistic.
     queue_vf = bool(
         gqa > 1
         and queue
         and mode == "pair"
-        and max(lens) >= QUEUE_VF_MIN_TILE_POS
-        and cta_loop_iters >= QUEUE_VF_MIN_CTA_LOOP_ITERS
+        and (
+            (
+                max(lens) >= QUEUE_VF_MIN_TILE_POS
+                and cta_loop_iters >= QUEUE_VF_MIN_CTA_LOOP_ITERS
+            )
+            or (
+                max(lens) >= QUEUE_VF_SHORT_TILE_POS
+                and cta_loop_iters >= QUEUE_VF_SHORT_MIN_CTA_LOOP_ITERS
+            )
+        )
+    )
+    # Planner-routed second position-selected FP8 static grouped-query program
+    # (PIN_VF_MIN_TILE_POS / PIN_VF_MIN_CTA_LOOP_ITERS): a pair-mode pin plan of long
+    # tiles whose lightest CTA runs enough main-loop iterations, decided here and carried
+    # as a plan key; the kernel-tests reference planner computes the same statistic.
+    pin_vf = bool(
+        pin
+        and mode == "pair"
+        and max(lens) >= PIN_VF_MIN_TILE_POS
+        and cta_loop_iters >= PIN_VF_MIN_CTA_LOOP_ITERS
     )
     for c, st in enumerate(static):
         t = st[0]
@@ -1834,6 +1890,7 @@ def plan_vsa_sm90(
         "cta_loop_iters": int(cta_loop_iters),
         "pin": pin,
         "queue_vf": queue_vf,
+        "pin_vf": pin_vf,
     }
 
 
