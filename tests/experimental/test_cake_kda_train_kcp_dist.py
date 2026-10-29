@@ -951,13 +951,125 @@ def _requested(device) -> int:
     return int(torch.cuda.memory_stats(device).get("requested_bytes.all.current", 0))
 
 
+class _Counter:
+    """Counts the ``torch.distributed`` collectives issued, the waits on their work handles and the bytes of
+    ``all_to_all_single`` (input / output tensors) by phase: ``orig``, ``recompute`` (set by the checkpoint's
+    ``context_fn``, re-entered per recompute) and ``bwd``.  ``isend`` / ``irecv`` stay unshimmed: the ring exchange
+    passes them to ``P2POp``, which checks their identity; its hops are counted as ``batch_isend_irecv`` calls."""
+
+    NAMES = (
+        "all_to_all_single",
+        "batch_isend_irecv",
+        "all_gather_object",
+        "all_gather",
+        "all_gather_into_tensor",
+        "all_reduce",
+        "broadcast",
+        "reduce_scatter_tensor",
+        "send",
+        "recv",
+    )
+
+    def __init__(self) -> None:
+        self.phase = "orig"
+        self.calls: dict[str, int] = {}
+        self.waits: dict[str, int] = {}
+        self.send: dict[str, int] = {}
+        self.recv: dict[str, int] = {}
+        self._saved: dict[str, object] = {}
+        self._stack: list[str] = []
+
+    def _bump(self, table: dict[str, int], n: int = 1) -> None:
+        table[self.phase] = table.get(self.phase, 0) + n
+
+    def _work(self, w):
+        counter = self
+
+        class _Work:
+            def __init__(self, inner) -> None:
+                self._inner = inner
+
+            def wait(self, *a, **kw):
+                counter._bump(counter.waits)
+                return self._inner.wait(*a, **kw)
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        return _Work(w) if hasattr(w, "wait") else w
+
+    def __enter__(self) -> "_Counter":
+        for name in self.NAMES:
+            fn = getattr(dist, name, None)
+            if fn is None:
+                continue
+            self._saved[name] = fn
+
+            def shim(*a, _fn=fn, _name=name, **kw):
+                self._bump(self.calls)
+                if _name == "all_to_all_single":
+                    out_t, in_t = a[0], a[1]
+                    self._bump(self.recv, out_t.numel() * out_t.element_size())
+                    self._bump(self.send, in_t.numel() * in_t.element_size())
+                r = _fn(*a, **kw)
+                if isinstance(r, list):
+                    return [self._work(x) for x in r]
+                return self._work(r)
+
+            setattr(dist, name, shim)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        for name, fn in self._saved.items():
+            setattr(dist, name, fn)
+        self._saved.clear()
+
+    def recompute_cm(self):
+        counter = self
+
+        class _Phase:
+            def __enter__(self):
+                counter._stack.append(counter.phase)
+                counter.phase = "recompute"
+                return self
+
+            def __exit__(self, *exc):
+                counter.phase = counter._stack.pop()
+                return False
+
+        return _Phase()
+
+    def record(self) -> dict:
+        return {
+            t: {p: getattr(self, t).get(p, 0) for p in ("orig", "recompute", "bwd")}
+            for t in ("calls", "waits", "send", "recv")
+        }
+
+
 def _run_rank_ckpt(
     rank: int, W: int, row, port: int, result_dir: str | None, local_id: int
 ) -> dict:
-    """One rank of a checkpoint row: #7039 retained bytes after a checkpointed forward without a handle (per-call
-    and caller-held workspace, after a warm-up step of the same form)."""
-    from torch.utils.checkpoint import checkpoint
+    """One rank of a checkpoint row (issue #7815):
 
+    - #7039: without a handle a checkpointed forward retains nothing (per-call and caller-held workspace, after a
+      warm-up step of the same form);
+    - ``out`` and the five gradients of the checkpoint with a recompute handle (both tiers, ``use_reentrant`` False
+      and True, the ring exchange where the partition allows it, ``retain_graph`` + a second backward, early stop
+      off, nested regions with the handle outside / inside the outer region) are bitwise the plain checkpoint's and
+      the direct pass's;
+    - collectives, waits and all-to-all bytes per phase (``orig`` / ``recompute`` / ``bwd``): the plain checkpoint
+      exchanges in every phase (positive control), the handle's recompute issues none, its original forward and
+      backward match the byte queries of the tier (``kcp_comm_bytes(checkpoint_keep=...)``);
+    - retained bytes after a checkpointed forward with a handle == ``handle.nbytes()`` ==
+      ``kcp_saved_bytes(checkpoint_keep=..., with_conv=False)``;
+    - a symmetric fingerprint mismatch raises on every rank (no collective is issued, no hang);
+    - the layer core: three KCP convolutions (with ``"conv"`` handles, one of them shared with KDA) + q / k
+      normalization + KDA under one checkpoint: the recompute issues no collective; every gradient bitwise."""
+    import contextlib
+
+    from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
+
+    conv_kcp = cake_package("cake_causal_conv1d_train", "kcp")
     lengths, H, _w, layout = row
     device = torch.device("cuda", local_id % max(torch.cuda.device_count(), 1))
     torch.cuda.set_device(device)
@@ -973,16 +1085,37 @@ def _run_rank_ckpt(
     q, k, v, g, beta, dout = (ops[n] for n in ("q", "k", "v", "g", "beta", "dout"))
     ws = cake_kcp.KcpWorkspace()
     flags: dict[str, bool] = {}
-    info: dict[str, object] = {"T_r": int(q.shape[0]), "n_in": int(ctx.n_in)}
+    info: dict[str, object] = {
+        "T_r": int(q.shape[0]),
+        "n_frag": int(ctx.n_frag),
+        "n_in": int(ctx.n_in),
+        "n_out": int(ctx.n_out),
+        "P": int(ctx.heads(H).P),
+        "torch": torch.__version__,
+    }
 
     def leaves():
         return [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
+
+    def bits(t: torch.Tensor) -> torch.Tensor:
+        # bit view: -0.0 vs 0.0 and NaN payloads count as differences
+        return t.contiguous().view(
+            torch.int16 if t.element_size() == 2 else torch.int32
+        )
+
+    def same(a: torch.Tensor, b: torch.Tensor) -> bool:
+        return (
+            a.dtype == b.dtype and a.shape == b.shape and torch.equal(bits(a), bits(b))
+        )
+
+    def eq(a: dict, b: dict) -> bool:
+        return set(a) == set(b) and all(same(a[n], b[n]) for n in a)
 
     # #7039: retained bytes after a checkpointed forward without a handle (the output alone)
     retained = {}
     for form, wsp in (("per_call", None), ("caller_ws", ws)):
 
-        def fn(*a, _w=wsp):
+        def fn0(*a, _w=wsp):
             return cake_kcp.chunk_kda_kcp(*a, ctx, None, "light", "saved", _w)
 
         for step in ("warm", "measure"):
@@ -990,7 +1123,7 @@ def _run_rank_ckpt(
             torch.cuda.synchronize(device)
             gc.collect()
             before = _requested(device)
-            out = checkpoint(fn, *lv, use_reentrant=False)
+            out = checkpoint(fn0, *lv, use_reentrant=False)
             torch.cuda.synchronize(device)
             if step == "measure":
                 retained[form] = (
@@ -1000,6 +1133,333 @@ def _run_rank_ckpt(
             del out, lv
     info["retained_bytes"] = retained
     flags["retained_zero"] = all(v_ == 0 for v_ in retained.values())
+
+    def run(
+        mode: str,
+        handle=None,
+        *,
+        keep=None,
+        twice=False,
+        reentrant=False,
+        early_stop=True,
+        **opts,
+    ):
+        """mode: direct | ckpt | nested_out (handle outside both regions) | nested_in (handle made in the outer)."""
+        lv = leaves()
+        kw = dict(opts)
+        if keep is not None:
+            kw["checkpoint_keep"] = keep
+
+        def fn(q_, k_, v_, g_, b_, h_):
+            return cake_kcp.chunk_kda_kcp(
+                q_, k_, v_, g_, b_, ctx, workspace=ws, recompute_handle=h_, **kw
+            )
+
+        modes = []
+        with _Counter() as cc, set_checkpoint_early_stop(early_stop):
+            ctx_fn = lambda: (contextlib.nullcontext(), cc.recompute_cm())  # noqa: E731
+            if mode == "direct":
+                out = fn(*lv, handle)
+            elif mode == "ckpt":
+                if reentrant:
+                    out = checkpoint(fn, *lv, handle, use_reentrant=True)
+                else:
+                    out = checkpoint(
+                        fn, *lv, handle, use_reentrant=False, context_fn=ctx_fn
+                    )
+            else:
+
+                def outer(q_, k_, v_, g_, b_, h_):
+                    # the product with ones saves a tensor of the outer region (so the outer recompute runs) and
+                    # changes no bit of out or of its gradient
+                    hh = cake_kcp.KcpRecomputeHandle() if mode == "nested_in" else h_
+                    yi = checkpoint(fn, q_, k_, v_, g_, b_, hh, use_reentrant=False)
+                    return yi * torch.ones_like(yi)
+
+                out = checkpoint(
+                    outer, *lv, handle, use_reentrant=False, context_fn=ctx_fn
+                )
+            modes.append(cake_kcp.LAST_CALL["fwd"].get("recompute_handle"))
+            cc.phase = "bwd"
+            out.backward(dout, retain_graph=twice)
+            modes.append(cake_kcp.LAST_CALL["fwd"].get("recompute_handle"))
+            if twice:
+                out.backward(dout)
+                modes.append(cake_kcp.LAST_CALL["fwd"].get("recompute_handle"))
+        res = {"out": out.detach()}
+        res.update(
+            {
+                f"d{n}": lf.grad
+                for n, lf in zip(("q", "k", "v", "g", "beta"), lv, strict=True)
+            }
+        )
+        return res, {**cc.record(), "modes": modes}
+
+    counts: dict[str, dict] = {}
+    direct, counts["direct"] = run("direct")
+    plain, counts["plain"] = run("ckpt")
+    plain_re, counts["plain_reentrant"] = run("ckpt", reentrant=True)
+    flags["plain_eq_direct"] = eq(plain, direct)
+    flags["plain_reentrant_eq_direct"] = eq(plain_re, direct)
+    pc = counts["plain"]
+    # positive control: the plain checkpoint exchanges (c1 + c2) in the original forward and in its recompute and
+    # (b1 + b2) in the backward on every rank
+    flags["positive_control"] = all(
+        pc[t]["orig"] > 0 and pc[t]["recompute"] == pc[t]["orig"] and pc[t]["bwd"] > 0
+        for t in ("calls", "waits")
+    )
+    handles = {}
+    for keep in ("states", "transfer"):
+        for reentrant in (False, True):
+            tag = f"handle_{keep}" + ("_reentrant" if reentrant else "")
+            hd = cake_kcp.KcpRecomputeHandle()
+            res, rec = run("ckpt", hd, keep=keep, reentrant=reentrant)
+            counts[tag] = rec
+            handles[tag] = hd
+            flags[f"{tag}_eq_plain"] = eq(res, plain)
+            flags[f"{tag}_eq_direct"] = eq(res, direct)
+            ref = counts["plain_reentrant" if reentrant else "plain"]
+            if reentrant:  # the recompute runs inside the backward (no context_fn): plain = bwd + recompute
+                want = {
+                    t: {
+                        "orig": ref[t]["orig"],
+                        "recompute": 0,
+                        "bwd": ref[t]["bwd"] - ref[t]["orig"],
+                    }
+                    for t in ("calls", "waits")
+                }
+            else:
+                want = {
+                    t: {"orig": ref[t]["orig"], "recompute": 0, "bwd": ref[t]["bwd"]}
+                    for t in ("calls", "waits")
+                }
+            flags[f"{tag}_counts"] = all(rec[t] == want[t] for t in ("calls", "waits"))
+            flags[f"{tag}_modes"] = rec["modes"] == ["capture", "replay"]
+            # bytes the collectives moved == the byte query of the tier (KDA alone: c1 + c2, b1 + b2; none in the
+            # recompute)
+            cb = cake_kcp_plan.kcp_comm_bytes(ctx, H=H, checkpoint_keep=keep)
+            want_b = {
+                "send": {
+                    "orig": cb["c1"]["send"] + cb["c2"]["send"],
+                    "recompute": cb["recompute"]["send"],
+                    "bwd": cb["b1"]["send"] + cb["b2"]["send"],
+                },
+                "recv": {
+                    "orig": cb["c1"]["recv"] + cb["c2"]["recv"],
+                    "recompute": cb["recompute"]["recv"],
+                    "bwd": cb["b1"]["recv"] + cb["b2"]["recv"],
+                },
+            }
+            if not reentrant:
+                flags[f"{tag}_bytes_eq_query"] = (
+                    rec["send"] == want_b["send"] and rec["recv"] == want_b["recv"]
+                )
+            query = cake_kcp_plan.kcp_saved_bytes(
+                ctx, H=H, checkpoint_keep=keep, with_conv=False
+            )
+            flags[f"{tag}_nbytes_eq_query"] = hd.nbytes() == query
+            info.setdefault("handle_nbytes", {})[tag] = hd.nbytes()
+    # the ring exchange (where the partition allows it): its recompute skips the hops as well
+    ring_ok = int(ctx.n_d_max) - 1 <= cake_kcp.RING_MAX_HOPS
+    info["ring_eligible"] = ring_ok
+    if ring_ok:
+        plain_ring, counts["plain_ring"] = run("ckpt", exchange="ring")
+        hd_ring, counts["handle_ring"] = run(
+            "ckpt", cake_kcp.KcpRecomputeHandle(), exchange="ring"
+        )
+        pr, hr = counts["plain_ring"], counts["handle_ring"]
+        flags["ring_bitwise"] = eq(plain_ring, direct) and eq(hd_ring, plain_ring)
+        flags["ring_counts"] = all(
+            hr[t]["recompute"] == 0
+            and hr[t]["orig"] == pr[t]["orig"]
+            and hr[t]["bwd"] == pr[t]["bwd"]
+            and pr[t]["recompute"] == pr[t]["orig"]
+            for t in ("calls", "waits")
+        ) and hr["modes"] == ["capture", "replay"]
+    # retain_graph: the entry is bound again, no collective; exactly twice the gradients
+    twice, counts["handle_twice"] = run(
+        "ckpt", cake_kcp.KcpRecomputeHandle(), twice=True
+    )
+    tw = counts["handle_twice"]
+    flags["twice_accumulates"] = (
+        all(same(twice[n], direct[n] + direct[n]) for n in TENSORS if n != "out")
+        and tw["calls"]["recompute"] == 0
+        and tw["calls"]["bwd"] == 2 * pc["calls"]["bwd"]
+        and tw["modes"] == ["capture", "replay", "replay"]
+    )
+    # early stop off
+    late, counts["handle_no_early_stop"] = run(
+        "ckpt", cake_kcp.KcpRecomputeHandle(), early_stop=False
+    )
+    flags["no_early_stop"] = (
+        eq(late, direct) and counts["handle_no_early_stop"]["calls"]["recompute"] == 0
+    )
+    # nested checkpoints
+    nest_out, counts["nested_out"] = run("nested_out", cake_kcp.KcpRecomputeHandle())
+    nest_in, counts["nested_in"] = run("nested_in", cake_kcp.KcpRecomputeHandle())
+    flags["nested_out_bitwise"] = eq(nest_out, direct)
+    flags["nested_in_bitwise"] = eq(nest_in, direct)
+    # handle made outside both regions: the outer recompute (recompute phase) and the inner recompute (counted in
+    # the backward phase, outside the outer's context) bind the entry; only the backward exchanges
+    flags["nested_out_counts"] = counts["nested_out"]["calls"] == {
+        "orig": pc["calls"]["orig"],
+        "recompute": 0,
+        "bwd": pc["calls"]["bwd"],
+    }
+    # handle made inside the outer region: the outer recompute's inner forward is an original forward (exchanges)
+    flags["nested_in_counts"] = counts["nested_in"]["calls"] == pc["calls"]
+    # retained bytes after a checkpointed forward with a handle (after a warm-up of the same form): the handle's
+    # entry, i.e. kcp_saved_bytes(checkpoint_keep=..., with_conv=False)
+    retained_h = {}
+    for keep in ("states", "transfer"):
+        for form, wsp in (("per_call", None), ("caller_ws", ws)):
+
+            def fn1(q_, k_, v_, g_, b_, h_, _w=wsp, _k=keep):
+                return cake_kcp.chunk_kda_kcp(
+                    q_,
+                    k_,
+                    v_,
+                    g_,
+                    b_,
+                    ctx,
+                    workspace=_w,
+                    recompute_handle=h_,
+                    checkpoint_keep=_k,
+                )
+
+            for step in ("warm", "measure"):
+                lv = leaves()
+                hd = cake_kcp.KcpRecomputeHandle()
+                torch.cuda.synchronize(device)
+                gc.collect()
+                before = _requested(device)
+                out = checkpoint(fn1, *lv, hd, use_reentrant=False)
+                torch.cuda.synchronize(device)
+                if step == "measure":
+                    retained_h[f"{keep}/{form}"] = (
+                        _requested(device) - before - out.numel() * out.element_size()
+                    )
+                    query = cake_kcp_plan.kcp_saved_bytes(
+                        ctx, H=H, checkpoint_keep=keep, with_conv=False
+                    )
+                    flags[f"retained_{keep}_{form}"] = (
+                        retained_h[f"{keep}/{form}"] == hd.nbytes() == query
+                    )
+                out.backward(dout)
+                del out, lv, hd
+    info["retained_bytes_handle"] = retained_h
+    info["saved_bytes_query"] = {
+        keep: cake_kcp_plan.kcp_saved_bytes(
+            ctx, H=H, checkpoint_keep=keep, with_conv=False
+        )
+        for keep in ("states", "transfer")
+    }
+    # a symmetric mismatch (every rank's entry describes another mode) raises on every rank before any collective
+    hd = cake_kcp.KcpRecomputeHandle()
+    lv = leaves()
+    out = checkpoint(
+        lambda *a: cake_kcp.chunk_kda_kcp(*a[:5], ctx, recompute_handle=a[5]),
+        *lv,
+        hd,
+        use_reentrant=False,
+    )
+    fp = dict(hd.entries["kda"]["fingerprint"])
+    fp["modes"] = (("use_qk_l2norm_in_kernel", True),)
+    hd.entries["kda"]["fingerprint"] = tuple(fp.items())
+    try:
+        out.backward(dout)
+        flags["mismatch_raises"] = False
+    except ValueError as exc:
+        flags["mismatch_raises"] = "differs in ['modes']" in str(exc)
+    del out, lv, hd
+
+    # the layer core: three convolutions + q / k normalization + KDA in one region
+    C = H * 128
+    gen = torch.Generator(device="cpu").manual_seed(78150 + W)
+    T_all = cu[-1]
+    x_all = [torch.randn(T_all, C, generator=gen).to(torch.bfloat16) for _ in range(3)]
+    w_all = [(torch.randn(C, 4, generator=gen) * 0.5).contiguous() for _ in range(3)]
+    xs = [
+        _local_slices(part, rank, cu, {"x": x})["x"].to(device).contiguous()
+        for x in x_all
+    ]
+    wts = [w.to(device) for w in w_all]
+
+    def l2(x):
+        xf = x.float()
+        return (xf * torch.rsqrt((xf * xf).sum(-1, keepdim=True) + 1e-6)).to(
+            torch.bfloat16
+        )
+
+    def layer(xq, xk, xv, wq, wk, wv, g_, b_, hq, hk, hv):
+        T = xq.shape[0]
+        qq = conv_kcp.cake_causal_conv1d_kcp(xq, wq, ctx, recompute_handle=hq)
+        kk = conv_kcp.cake_causal_conv1d_kcp(xk, wk, ctx, recompute_handle=hk)
+        vv = conv_kcp.cake_causal_conv1d_kcp(xv, wv, ctx, recompute_handle=hv)
+        return cake_kcp.chunk_kda_kcp(
+            l2(qq.view(T, H, 128)),
+            l2(kk.view(T, H, 128)),
+            vv.view(T, H, 128),
+            g_,
+            b_,
+            ctx,
+            workspace=ws,
+            recompute_handle=hq,
+        )
+
+    def run_layer(mode: str):
+        lv = [x.detach().clone().requires_grad_(True) for x in (*xs, *wts, g, beta)]
+        hs = (
+            (
+                cake_kcp.KcpRecomputeHandle(),  # shared by the q convolution and KDA
+                conv_kcp.KcpRecomputeHandle(),
+                conv_kcp.KcpRecomputeHandle(),
+            )
+            if mode == "handle"
+            else (None, None, None)
+        )
+        with _Counter() as cc:
+            if mode == "direct":
+                out = layer(*lv, *hs)
+            else:
+                out = checkpoint(
+                    layer,
+                    *lv,
+                    *hs,
+                    use_reentrant=False,
+                    context_fn=lambda: (contextlib.nullcontext(), cc.recompute_cm()),
+                )
+            cc.phase = "bwd"
+            out.backward(dout)
+        names = ("xq", "xk", "xv", "wq", "wk", "wv", "g", "beta")
+        res = {
+            "out": out.detach(),
+            **{f"d{n}": t.grad for n, t in zip(names, lv, strict=True)},
+        }
+        nb = sum(h.nbytes() for h in hs if h is not None)
+        return res, cc.record(), nb, hs
+
+    l_direct, counts["layer_direct"], _, _ = run_layer("direct")
+    l_plain, counts["layer_plain"], _, _ = run_layer("plain")
+    l_handle, counts["layer_handle"], l_nbytes, l_hs = run_layer("handle")
+    lp, lh = counts["layer_plain"], counts["layer_handle"]
+    flags["layer_bitwise"] = eq(l_plain, l_direct) and eq(l_handle, l_plain)
+    flags["layer_positive_control"] = all(
+        lp[t]["orig"] > 0 and lp[t]["recompute"] == lp[t]["orig"] and lp[t]["bwd"] > 0
+        for t in ("calls", "waits")
+    )
+    flags["layer_recompute_no_comm"] = all(
+        lh[t]["recompute"] == 0
+        and lh[t]["orig"] == lp[t]["orig"]
+        and lh[t]["bwd"] == lp[t]["bwd"]
+        for t in ("calls", "waits")
+    )
+    # the shared handle holds "conv" + "kda"; the three handles together = KDA states + three hist pools
+    flags["layer_nbytes"] = sorted(l_hs[0].entries) == ["conv", "kda"] and l_nbytes == (
+        cake_kcp_plan.kcp_saved_bytes(ctx, H=H, checkpoint_keep="states", C=C)
+        + 2 * int(ctx.halo.n_hist_rows) * C * 2
+    )
+    info["counts"] = counts
 
     flag_list = [None] * W
     info_list = [None] * W
@@ -1015,7 +1475,10 @@ def _run_rank_ckpt(
         },
         "info_by_rank": info_list,
     }
-    report["pass"] = all(report["flags"].values())
+    # flags present on every rank only (ring_* where eligible: the eligibility is a property of the partition)
+    report["pass"] = all(report["flags"].values()) and all(
+        set(f) == set(flag_list[0]) for f in flag_list
+    )
     dist.barrier()
     if rank == 0 and result_dir:
         os.makedirs(result_dir, exist_ok=True)
