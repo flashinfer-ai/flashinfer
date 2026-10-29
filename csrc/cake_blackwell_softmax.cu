@@ -127,6 +127,14 @@ constexpr uint64_t kBalancedChunkMinCutDen = 32;
 constexpr uint64_t kBalancedChunkMultiWaveCutDen = 16;
 constexpr uint64_t kBalancedChunkMaxWaves = 5;
 constexpr uint64_t kBalancedChunkSixteenCtaMinCutDen = 10;
+// sm_103: the cuts at which the 8-CTA shared-tile and persistent kernels take
+// the balanced chunk: at least 1/MinCutDen and under 1/MaxCutDen of the
+// whole-tile chunk (1/1: no upper bound). The shared-tile kernel takes it at
+// any cut the rule above allows, the persistent kernel from a cut of 1/10 on.
+constexpr uint64_t kBalancedChunkEightCtaSharedMinCutDenSm103 = 32;
+constexpr uint64_t kBalancedChunkEightCtaSharedMaxCutDenSm103 = 1;
+constexpr uint64_t kBalancedChunkEightCtaPersistentMinCutDenSm103 = 10;
+constexpr uint64_t kBalancedChunkEightCtaPersistentMaxCutDenSm103 = 1;
 constexpr int kMaxDevices = 64;
 
 enum class ParameterKind : int {
@@ -199,11 +207,11 @@ constexpr uint64_t kSixTileTwoWavesSharedDenSm103 = 4;
 constexpr uint64_t kSixTileTwoWavesRowsNumSm103 = 7;
 constexpr uint64_t kSixTileTwoWavesRowsDenSm103 = 4;
 // sm_103: a 5- to 7-tile 16-CTA chunk whose 10-CTA chunk holds at most 10
-// tiles takes the 10-CTA kernel from 6/7 of its resident clusters up to all of
-// them (24 to 28 rows on GB300), unless the temperature is per row.
+// tiles takes the 10-CTA kernel from 11/14 of its resident clusters up to all
+// of them (22 to 28 rows on GB300), unless the temperature is per row.
 constexpr int kTenCtaRowsMaxTilesSm103 = 10;
-constexpr uint64_t kTenCtaRowsNumSm103 = 6;
-constexpr uint64_t kTenCtaRowsDenSm103 = 7;
+constexpr uint64_t kTenCtaRowsNumSm103 = 11;
+constexpr uint64_t kTenCtaRowsDenSm103 = 14;
 // sm_100: a 4-tile 4-CTA chunk keeps spreading to 8 CTAs at twice as many CTAs
 // as SMs from 14 tiles of vocabulary, and up to 8 CTAs past that from 15.
 constexpr uint32_t kSpreadFourTileMinVocabTilesSm100 = 14;
@@ -241,8 +249,8 @@ int wide_max_tiles(uint32_t vocab_size, int cluster_ctas) {
 // chunk; on sm_103 3/2 for a full 8-tile chunk, or 5/3 past 7/10 of the
 // resident 8-CTA shared-tile clusters, and 7/4 for a 6-tile chunk past 3/4 of
 // them. On sm_103 a 5- to 7-tile 16-CTA chunk whose 10-CTA chunk holds at most
-// 10 tiles takes the 10-CTA kernel from 6/7 of its resident clusters up to all
-// of them, unless the temperature is per row.
+// 10 tiles takes the 10-CTA kernel from 11/14 of its resident clusters up to
+// all of them, unless the temperature is per row.
 // A batch of 5-8-tile 16-CTA chunks with one row more than 16-CTA
 // clusters fit one CTA per SM would put two CTAs on the SMs of its last
 // cluster; it takes the wide kernel of 12 CTAs, or else 10 for a 16-CTA chunk
@@ -806,10 +814,11 @@ cudaError_t select_cached_route(uint32_t rows, uint32_t vocab_size, ParameterKin
 // when that balanced chunk is more than 1/32 shorter than the whole-tile chunk
 // and the rows fit one wave of the launched kernel's resident clusters, or it
 // is more than 1/16 shorter and the rows fit five waves, for these kernels
-// (measured on B200 and GB300): the 8-CTA shared-tile and persistent kernels
-// on sm_100; the 4-tile 16-CTA row kernel past one wave or with a cut of more
-// than 1/16; the 16-CTA shared-tile and persistent kernels with a cut of at
-// least 1/10, or on sm_100 past one wave. The other kernels keep whole tiles.
+// (measured on B200 and GB300): the 8-CTA shared-tile kernel; the 8-CTA
+// persistent kernel on sm_100, or on sm_103 with a cut of at least 1/10; the
+// 4-tile 16-CTA row kernel past one wave or with a cut of more than 1/16; the
+// 16-CTA shared-tile and persistent kernels with a cut of at least 1/10, or on
+// sm_100 past one wave. The other kernels keep whole tiles.
 cudaError_t select_cached_launch(uint32_t rows, uint32_t vocab_size, ParameterKind parameter_kind,
                                  bool pdl, int device, CachedLaunch* launch) {
   cudaError_t status = select_cached_route(rows, vocab_size, parameter_kind, pdl, device, launch);
@@ -832,7 +841,7 @@ cudaError_t select_cached_launch(uint32_t rows, uint32_t vocab_size, ParameterKi
   }
   int device_minor = 0;
   status = cudaDeviceGetAttribute(&device_minor, cudaDevAttrComputeCapabilityMinor, device);
-  if (status != cudaSuccess || (eight_cta_chunk && device_minor != 0)) {
+  if (status != cudaSuccess) {
     return status;
   }
   const uint32_t balanced =
@@ -841,6 +850,16 @@ cudaError_t select_cached_launch(uint32_t rows, uint32_t vocab_size, ParameterKi
   const uint64_t cut = whole - balanced;
   if (cut * kBalancedChunkMinCutDen <= whole) {
     return cudaSuccess;
+  }
+  if (eight_cta_chunk && device_minor != 0) {
+    const bool persistent = launch->route == SoftmaxRoute::kCachedClusterPersistent;
+    const uint64_t min_cut_den = persistent ? kBalancedChunkEightCtaPersistentMinCutDenSm103
+                                            : kBalancedChunkEightCtaSharedMinCutDenSm103;
+    const uint64_t max_cut_den = persistent ? kBalancedChunkEightCtaPersistentMaxCutDenSm103
+                                            : kBalancedChunkEightCtaSharedMaxCutDenSm103;
+    if (cut * min_cut_den < whole || cut * max_cut_den >= whole) {
+      return cudaSuccess;
+    }
   }
   // Resident clusters of the launched kernel.
   uint64_t resident = 0;
