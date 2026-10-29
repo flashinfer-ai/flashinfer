@@ -29,6 +29,10 @@
 #include "cake_warp_decode_contract.cuh"
 #include "tvm_ffi_utils.h"
 
+#ifndef FLASHINFER_CAKE_WARP_DECODE_HAS_CLAMPED_E256
+#define FLASHINFER_CAKE_WARP_DECODE_HAS_CLAMPED_E256 0
+#endif
+
 #if !__has_include("generated/cake_warp_decode_generated_manifest.cuh")
 #error \
     "generated/cake_warp_decode_generated_manifest.cuh is required; generate the kernel manifest before building this module"
@@ -37,6 +41,7 @@
 
 namespace flashinfer::warp_decode {
 
+using tvm::ffi::Optional;
 using tvm::ffi::TensorView;
 
 static_assert(generated::kContractVersion == kGeneratedContractVersion,
@@ -86,15 +91,16 @@ void CheckManifestStatus(const ManifestStatus& status) {
                         << " rejected the generated kernel manifest, code=" << status.code;
 }
 
-void CheckSm103a(int32_t device_id) {
+void CheckExactTarget(int32_t device_id) {
   int major = 0;
   int minor = 0;
   CheckCuda(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id),
             "cudaDeviceGetAttribute(computeCapabilityMajor)");
   CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
             "cudaDeviceGetAttribute(computeCapabilityMinor)");
-  TVM_FFI_ICHECK(major == 10 && minor == 3)
-      << "cake warp decode requires exact compute capability 10.3, got " << major << "." << minor;
+  TVM_FFI_ICHECK(major == 10 && minor == FLASHINFER_CAKE_WARP_DECODE_TARGET_MINOR)
+      << "cake warp decode requires exact compute capability 10."
+      << FLASHINFER_CAKE_WARP_DECODE_TARGET_MINOR << ", got " << major << "." << minor;
 }
 
 void CheckDtype(const TensorView& tensor, const char* name, DLDataType expected) {
@@ -194,9 +200,21 @@ Shape CheckedShape(int64_t num_tokens, int64_t hidden_size, int64_t intermediate
   Shape shape{static_cast<int32_t>(num_tokens),        static_cast<int32_t>(hidden_size),
               static_cast<int32_t>(intermediate_size), static_cast<int32_t>(num_experts),
               static_cast<int32_t>(num_experts),       static_cast<int32_t>(top_k)};
-  TVM_FFI_ICHECK(SelectSchedule(shape).supported)
-      << "cake warp decode supports only (H=2048, I=512, E=512, top_k=10) or "
-         "(H=2048, I=1536, E=60, top_k=4), with 1 <= num_tokens <= 32";
+  const Schedule schedule = SelectSchedule(shape);
+  TVM_FFI_ICHECK(schedule.supported)
+      << "cake warp decode supports only (H=2048, I=512, E=512, top_k=10), "
+         "(H=2048, I=1536, E=60, top_k=4), (H=2560, I=768, E=384, top_k=4), "
+         "(H=2048, I=768, E=128, top_k=8), (H=4096, I=1536, E=128, top_k=8), "
+         "(H=2048, I=512, E=256, top_k=8), (H=4096, I=1024, E=512, top_k=10), or "
+         "(H=3072, I=1536, E=256, top_k=8) "
+         "with SwiGLU, or "
+         "(H=6144, I=1536, E=192, top_k=4) with SiLU, "
+         "(H=6144, I=3072, E=128, top_k=4) with parameterized SwiGLU, "
+         "(H=4096, I=2048, E=256, top_k=6) with clamped SwiGLU, or "
+         "(H=3584, I=3072, E=896, top_k=16) with SiTU, with 1 <= num_tokens <= 32";
+  TVM_FFI_ICHECK(schedule.geometry != Geometry::kH4096I2048E256K6 ||
+                 FLASHINFER_CAKE_WARP_DECODE_HAS_CLAMPED_E256)
+      << "clamped E256 generated programs are not installed for this exact target";
   return shape;
 }
 
@@ -219,7 +237,22 @@ void CheckWorkspace(const TensorView& workspace, int32_t device_id, int64_t requ
 struct LaunchContext {
   cudaStream_t stream;
   int32_t launch_count;
+  // Whether the chain's first kernel may also launch with programmatic dependent launch.
+  bool first_launch_programmatic;
 };
+
+// A chain's first kernel may overlap the previous kernel on the stream only if it runs
+// griddepcontrol.wait before it reads any caller input: the routing, the activations and their
+// scales, the weights and the per-expert scalars. It must also trigger its dependents only after
+// that wait, because the later kernels may read caller inputs before their own wait. Direct
+// schedules start with an FC1 program that waits first in every warp role and triggers its
+// dependents only after the wait. Every other schedule starts with a kernel that reads topk_ids
+// before it can wait: a route-pack or route-order kernel, or an FC1 that packs the routes
+// itself. Those chains start in stream order, and so does any schedule not listed here.
+bool FirstKernelWaitsBeforeInputs(const Schedule& schedule) {
+  return schedule.route_layout == RouteLayout::kDirect &&
+         schedule.route_packer == RoutePacker::kNone;
+}
 
 struct WorkspaceKey {
   int32_t device_id;
@@ -367,14 +400,34 @@ int64_t PrepareWorkspaceAlways(const Invocation& invocation, const Schedule& sch
       << "warp-decode prepared-workspace receipt capacity is exhausted";
   CheckManifestStatus(generated::PrepareWorkspace(invocation, schedule, stream));
 
+  if (!IsGeometry(invocation.shape, 4096, 2048, 256, 6)) {
+    // Match source preparation: the FC1 epilogue stores only valid routed rows,
+    // while FC2 loads complete N8 tiles of packed activations and scale factors.
+    // Initialize the three caller-owned scratch regions once, outside capture.
+    // Metadata/counters precede intermediate; activation constants start at clamp_limit.
+    generated::detail::WorkspaceView scratch{};
+    TVM_FFI_ICHECK(generated::detail::ResolveWorkspace(
+        invocation.shape, schedule, invocation.workspace, &scratch));
+    const size_t scratch_bytes = static_cast<size_t>(
+        reinterpret_cast<uint8_t*>(scratch.clamp_limit) - scratch.intermediate);
+    CheckCuda(cudaMemsetAsync(scratch.intermediate, 0, scratch_bytes, stream),
+              "cudaMemsetAsync(workspace intermediate, scales and partials)");
+  }
+
   // Preparation is deliberately outside timed and capture regions. Complete it
   // before returning so a subsequent launch on any CUDA stream has a concrete
   // happens-before edge without adding an external-event node to captured graphs.
   cudaEvent_t ready = nullptr;
   CheckCuda(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming),
             "cudaEventCreateWithFlags(workspace ready)");
-  CheckCuda(cudaEventRecord(ready, stream), "cudaEventRecord(workspace ready)");
-  CheckCuda(cudaEventSynchronize(ready), "cudaEventSynchronize(workspace ready)");
+  try {
+    CheckCuda(cudaEventRecord(ready, stream), "cudaEventRecord(workspace ready)");
+    CheckCuda(cudaEventSynchronize(ready), "cudaEventSynchronize(workspace ready)");
+  } catch (...) {
+    // Preserve the record/synchronize exception if cleanup also fails.
+    (void)cudaEventDestroy(ready);
+    throw;
+  }
   CheckCuda(cudaEventDestroy(ready), "cudaEventDestroy(workspace ready)");
 
   TVM_FFI_ICHECK(next_workspace_receipt > 0 &&
@@ -436,12 +489,17 @@ void LaunchOne(const KernelLaunch& launch, void* opaque_context) {
   TVM_FFI_ICHECK(launch.programmatic_dependent_launch)
       << launch.name << " does not declare the required programmatic dependent launch contract";
 
-  std::array<cudaLaunchAttribute, 5> attributes{};
+  std::array<cudaLaunchAttribute, 6> attributes{};
   uint32_t attribute_count = 0;
 
-  attributes[attribute_count].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-  attributes[attribute_count].val.programmaticStreamSerializationAllowed = 1;
-  ++attribute_count;
+  // A first kernel that reads caller inputs, such as the routing indices, before
+  // it could wait on the previous grid is submitted in stream order. Later
+  // kernels keep programmatic dependent launch.
+  if (context->launch_count > 0 || context->first_launch_programmatic) {
+    attributes[attribute_count].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attributes[attribute_count].val.programmaticStreamSerializationAllowed = 1;
+    ++attribute_count;
+  }
 
   const bool clustered = launch.cluster.x > 1 || launch.cluster.y > 1 || launch.cluster.z > 1;
   if (clustered) {
@@ -462,23 +520,19 @@ void LaunchOne(const KernelLaunch& launch, void* opaque_context) {
     TVM_FFI_ICHECK(!launch.spread_cluster)
         << launch.name << " requests spread scheduling without a cluster";
   }
+  if (launch.preferred_shared_memory_carveout >= 0) {
+    TVM_FFI_ICHECK(launch.preferred_shared_memory_carveout <= 100)
+        << launch.name << " has an invalid shared-memory carveout preference";
+    attributes[attribute_count].id = cudaLaunchAttributePreferredSharedMemoryCarveout;
+    attributes[attribute_count].val.sharedMemCarveout =
+        static_cast<unsigned int>(launch.preferred_shared_memory_carveout);
+    ++attribute_count;
+  }
   if (launch.cooperative) {
     attributes[attribute_count].id = cudaLaunchAttributeCooperative;
     attributes[attribute_count].val.cooperative = 1;
     ++attribute_count;
   }
-#if defined(CUDART_VERSION) && CUDART_VERSION >= 13020
-  if (launch.allow_oversized_smem) {
-    attributes[attribute_count].id = cudaLaunchAttributeSharedMemoryMode;
-    attributes[attribute_count].val.sharedMemoryMode = cudaSharedMemoryModeAllowNonPortable;
-    ++attribute_count;
-  }
-#else
-  // Older runtimes use the per-function MaxDynamicSharedMemorySize attribute
-  // configured by generated::EnsureDeviceReady. CUDA 13.2 added the explicit
-  // per-launch non-portable shared-memory mode used above.
-  (void)launch.allow_oversized_smem;
-#endif
 
   cudaLaunchConfig_t config{};
   config.gridDim = launch.grid;
@@ -499,11 +553,13 @@ void CheckAllTensorArguments(
     const TensorView& gemm1_weights_u8, const TensorView& gemm1_weights_scale_e4m3,
     const TensorView& gemm2_weights_u8, const TensorView& gemm2_weights_scale_e4m3,
     const TensorView& output1_scale_scalar_f32, const TensorView& output1_scale_gate_scalar_f32,
-    const TensorView& output2_scale_scalar_f32, const Shape& shape, int64_t workspace_bytes) {
+    const TensorView& output2_scale_scalar_f32, const Shape& shape, const Schedule& schedule,
+    int64_t workspace_bytes) {
   const int32_t device_id = output_bf16.device().device_id;
   const int64_t tokens = shape.num_tokens;
   const int64_t hidden = shape.hidden_size;
   const int64_t intermediate = shape.intermediate_size;
+  const int64_t gemm1_rows = Gemm1WeightRows(shape, schedule);
   const int64_t experts = shape.num_experts;
   const int64_t top_k = shape.top_k;
 
@@ -527,9 +583,9 @@ void CheckAllTensorArguments(
   CheckShape(hidden_states_scale_e4m3, "hidden_states_scale_e4m3", {tokens, hidden / 16});
   CheckShape(topk_ids_i32, "topk_ids_i32", {tokens, top_k});
   CheckShape(topk_weights_bf16, "topk_weights_bf16", {tokens, top_k});
-  CheckShape(gemm1_weights_u8, "gemm1_weights_u8", {experts, 2 * intermediate, hidden / 2});
+  CheckShape(gemm1_weights_u8, "gemm1_weights_u8", {experts, gemm1_rows, hidden / 2});
   CheckShape(gemm1_weights_scale_e4m3, "gemm1_weights_scale_e4m3",
-             {experts, 2 * intermediate, hidden / 16});
+             {experts, gemm1_rows, hidden / 16});
   CheckShape(gemm2_weights_u8, "gemm2_weights_u8", {experts, hidden, intermediate / 2});
   CheckShape(gemm2_weights_scale_e4m3, "gemm2_weights_scale_e4m3",
              {experts, hidden, intermediate / 16});
@@ -590,6 +646,31 @@ Invocation MakeInvocation(
           TensorStorageBytes(workspace_u8, "workspace_u8")};
 }
 
+void CheckActivationParameters(const Optional<TensorView>& alpha, const Optional<TensorView>& beta,
+                               const Optional<TensorView>& clamp_limit, const TensorView& output,
+                               const TensorView& workspace, const Shape& shape,
+                               const Schedule& schedule) {
+  const Activation activation = ActivationForGeometry(schedule.geometry);
+  const bool parameterized = activation == Activation::kSwiGLUParameterized;
+  const bool situ = activation == Activation::kSiTU;
+  TVM_FFI_ICHECK(alpha.has_value() == (parameterized || situ) &&
+                 beta.has_value() == (parameterized || situ) &&
+                 clamp_limit.has_value() == parameterized)
+      << "warp-decode parameterized SwiGLU requires alpha/beta/clamp tensors; "
+         "SiTU requires alpha/beta and no clamp tensor; other geometries use no activation tensors";
+  const Optional<TensorView>* tensors[] = {&alpha, &beta, &clamp_limit};
+  const char* names[] = {"gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"};
+  for (int32_t i = 0; i < 3; ++i) {
+    if (!tensors[i]->has_value()) continue;
+    const TensorView& tensor = tensors[i]->value();
+    CheckTensor(tensor, names[i], output.device().device_id, dl_float32);
+    CheckShape(tensor, names[i], {shape.num_experts});
+    CheckAlignment(tensor, names[i], alignof(float));
+    CheckNoOverlap(output, "output_bf16", tensor, names[i]);
+    CheckNoOverlap(workspace, "workspace_u8", tensor, names[i]);
+  }
+}
+
 }  // namespace
 
 int64_t WorkspaceSize(int64_t num_tokens, int64_t hidden_size, int64_t intermediate_size,
@@ -607,7 +688,7 @@ int64_t PrepareWorkspace(TensorView workspace_u8, int64_t num_tokens, int64_t hi
   const int64_t workspace_bytes = CheckedWorkspaceSize(shape, schedule);
   const int32_t device_id = workspace_u8.device().device_id;
   ffi::CUDADeviceGuard device_guard(device_id);
-  CheckSm103a(device_id);
+  CheckExactTarget(device_id);
   CheckWorkspace(workspace_u8, device_id, workspace_bytes);
 
   const cudaStream_t stream = get_current_stream();
@@ -625,12 +706,14 @@ int64_t PrepareWorkspace(TensorView workspace_u8, int64_t num_tokens, int64_t hi
   return PrepareWorkspaceAlways(invocation, schedule, device_id, stream);
 }
 
-void Run(TensorView output_bf16, TensorView workspace_u8, TensorView hidden_states_q_u8,
-         TensorView hidden_states_scale_e4m3, TensorView topk_ids_i32, TensorView topk_weights_bf16,
-         TensorView gemm1_weights_u8, TensorView gemm1_weights_scale_e4m3,
-         TensorView gemm2_weights_u8, TensorView gemm2_weights_scale_e4m3,
-         TensorView output1_scale_scalar_f32, TensorView output1_scale_gate_scalar_f32,
-         TensorView output2_scale_scalar_f32, int64_t workspace_receipt, bool enable_pdl) {
+void RunWithActivationParams(
+    TensorView output_bf16, TensorView workspace_u8, TensorView hidden_states_q_u8,
+    TensorView hidden_states_scale_e4m3, TensorView topk_ids_i32, TensorView topk_weights_bf16,
+    TensorView gemm1_weights_u8, TensorView gemm1_weights_scale_e4m3, TensorView gemm2_weights_u8,
+    TensorView gemm2_weights_scale_e4m3, TensorView output1_scale_scalar_f32,
+    TensorView output1_scale_gate_scalar_f32, TensorView output2_scale_scalar_f32,
+    Optional<TensorView> gemm1_alpha, Optional<TensorView> gemm1_beta,
+    Optional<TensorView> gemm1_clamp_limit, int64_t workspace_receipt, bool enable_pdl) {
   TVM_FFI_ICHECK(enable_pdl)
       << "cake warp decode requires programmatic dependent launch; enable_pdl must be true";
   TVM_FFI_ICHECK(output_bf16.device().device_type == kDLCUDA)
@@ -647,12 +730,18 @@ void Run(TensorView output_bf16, TensorView workspace_u8, TensorView hidden_stat
 
   const int32_t device_id = output_bf16.device().device_id;
   ffi::CUDADeviceGuard device_guard(device_id);
-  CheckSm103a(device_id);
+  CheckExactTarget(device_id);
   CheckAllTensorArguments(output_bf16, workspace_u8, hidden_states_q_u8, hidden_states_scale_e4m3,
                           topk_ids_i32, topk_weights_bf16, gemm1_weights_u8,
                           gemm1_weights_scale_e4m3, gemm2_weights_u8, gemm2_weights_scale_e4m3,
                           output1_scale_scalar_f32, output1_scale_gate_scalar_f32,
-                          output2_scale_scalar_f32, shape, workspace_bytes);
+                          output2_scale_scalar_f32, shape, schedule, workspace_bytes);
+  CheckActivationParameters(gemm1_alpha, gemm1_beta, gemm1_clamp_limit, output_bf16, workspace_u8,
+                            shape, schedule);
+
+  if (IsGeometry(shape, 4096, 2048, 256, 6)) {
+    TVM_FFI_ICHECK(kTarget == Target::kSm100a) << "clamped E256 warp decode requires exact SM100";
+  }
 
   const cudaStream_t stream = get_current_stream();
   cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
@@ -661,11 +750,15 @@ void Run(TensorView output_bf16, TensorView workspace_u8, TensorView hidden_stat
   const bool is_capturing = capture_status != cudaStreamCaptureStatusNone;
   CheckManifestStatus(generated::EnsureDeviceReady(device_id, false));
 
-  const Invocation invocation =
+  Invocation invocation =
       MakeInvocation(output_bf16, workspace_u8, hidden_states_q_u8, hidden_states_scale_e4m3,
                      topk_ids_i32, topk_weights_bf16, gemm1_weights_u8, gemm1_weights_scale_e4m3,
                      gemm2_weights_u8, gemm2_weights_scale_e4m3, output1_scale_scalar_f32,
                      output1_scale_gate_scalar_f32, output2_scale_scalar_f32, shape);
+  invocation.gemm1_alpha = gemm1_alpha.has_value() ? gemm1_alpha.value().data_ptr() : nullptr;
+  invocation.gemm1_beta = gemm1_beta.has_value() ? gemm1_beta.value().data_ptr() : nullptr;
+  invocation.gemm1_clamp_limit =
+      gemm1_clamp_limit.has_value() ? gemm1_clamp_limit.value().data_ptr() : nullptr;
   // Keep the registry lock across the complete host-side submission transaction:
   // receipt validation, dependency insertion, kernel submission, and completion
   // recording. GPU execution stays asynchronous. External event nodes make the
@@ -674,12 +767,23 @@ void Run(TensorView output_bf16, TensorView workspace_u8, TensorView hidden_stat
   std::lock_guard<std::mutex> lock(prepared_workspaces_mutex);
   PreparedWorkspaceState& workspace =
       RequirePreparedWorkspace(invocation, schedule, device_id, workspace_receipt);
-  if (workspace.has_submission) {
-    CheckCuda(
-        cudaStreamWaitEvent(stream, workspace.completion, is_capturing ? cudaEventWaitExternal : 0),
-        "cudaStreamWaitEvent(previous workspace submission)");
+  if (workspace.has_submission && !is_capturing) {
+    // Eager submissions keep the explicit dependency on the previous submission
+    // of this workspace (it may still be in flight on another stream).
+    //
+    // Captured submissions deliberately record no wait node: cudaEventQuery is
+    // not permitted while a capture is active, and an external WaitEvent node
+    // costs a fixed ~0.16 us on every graph replay, which is the whole
+    // source-vs-export latency gap measured for these kernels. Inside a capture
+    // the submission is ordered by the capturing stream like every other
+    // captured library call; callers synchronize before capture exactly as
+    // torch.cuda.graph does. The completion event below is still recorded, so a
+    // later eager submission on another stream that finds this one in flight
+    // still waits on it.
+    CheckCuda(cudaStreamWaitEvent(stream, workspace.completion, 0),
+              "cudaStreamWaitEvent(previous workspace submission)");
   }
-  LaunchContext context{stream, 0};
+  LaunchContext context{stream, 0, FirstKernelWaitsBeforeInputs(schedule)};
   try {
     generated::ForEachLaunch(invocation, schedule, LaunchOne, &context);
   } catch (...) {
@@ -711,10 +815,51 @@ void Run(TensorView output_bf16, TensorView workspace_u8, TensorView hidden_stat
     workspace.poisoned = false;
   }
   CheckCuda(completion_status, "cudaEventRecord(workspace completion)");
-  const int32_t expected_launches = schedule.route_layout == RouteLayout::kDirect ? 3 : 4;
+  // Direct rows launch FC1/FC2/finalize; packed rows add the route_pack launch unless the
+  // route tables are derived inside FC1 (RoutePacker::kFusedFc1), which keeps three launches.
+  const int32_t expected_launches =
+      ((schedule.route_layout == RouteLayout::kDirect &&
+        schedule.route_packer == RoutePacker::kNone) ||
+       schedule.route_packer == RoutePacker::kFusedFc1)
+          ? 3
+          : 4;
   TVM_FFI_ICHECK(context.launch_count == expected_launches)
       << "generated manifest emitted " << context.launch_count
       << " launches for a schedule that requires " << expected_launches;
+}
+
+void Run(TensorView output_bf16, TensorView workspace_u8, TensorView hidden_states_q_u8,
+         TensorView hidden_states_scale_e4m3, TensorView topk_ids_i32, TensorView topk_weights_bf16,
+         TensorView gemm1_weights_u8, TensorView gemm1_weights_scale_e4m3,
+         TensorView gemm2_weights_u8, TensorView gemm2_weights_scale_e4m3,
+         TensorView output1_scale_scalar_f32, TensorView output1_scale_gate_scalar_f32,
+         TensorView output2_scale_scalar_f32, int64_t workspace_receipt, bool enable_pdl) {
+  RunWithActivationParams(output_bf16, workspace_u8, hidden_states_q_u8, hidden_states_scale_e4m3,
+                          topk_ids_i32, topk_weights_bf16, gemm1_weights_u8,
+                          gemm1_weights_scale_e4m3, gemm2_weights_u8, gemm2_weights_scale_e4m3,
+                          output1_scale_scalar_f32, output1_scale_gate_scalar_f32,
+                          output2_scale_scalar_f32, {}, {}, {}, workspace_receipt, enable_pdl);
+}
+
+void RunClampedSwiGLU(TensorView output_bf16, TensorView workspace_u8,
+                      TensorView hidden_states_q_u8, TensorView hidden_states_scale_e4m3,
+                      TensorView topk_ids_i32, TensorView topk_weights_bf16,
+                      TensorView gemm1_weights_u8, TensorView gemm1_weights_scale_e4m3,
+                      TensorView gemm2_weights_u8, TensorView gemm2_weights_scale_e4m3,
+                      TensorView output1_scale_scalar_f32, TensorView output1_scale_gate_scalar_f32,
+                      TensorView output2_scale_scalar_f32, TensorView gemm1_alpha_f32,
+                      TensorView gemm1_beta_f32, TensorView gemm1_clamp_limit_f32,
+                      int64_t workspace_receipt, bool enable_pdl) {
+  TVM_FFI_ICHECK(output_bf16.ndim() == 2 && gemm2_weights_u8.ndim() == 3 &&
+                 topk_ids_i32.ndim() == 2 && output_bf16.size(1) == 4096 &&
+                 gemm2_weights_u8.size(0) == 256 && gemm2_weights_u8.size(2) * 2 == 2048 &&
+                 topk_ids_i32.size(1) == 6)
+      << "clamped E256 warp decode requires H4096/I2048/E256/top-k6";
+  RunWithActivationParams(output_bf16, workspace_u8, hidden_states_q_u8, hidden_states_scale_e4m3, topk_ids_i32,
+          topk_weights_bf16, gemm1_weights_u8, gemm1_weights_scale_e4m3, gemm2_weights_u8,
+          gemm2_weights_scale_e4m3, output1_scale_scalar_f32, output1_scale_gate_scalar_f32,
+          output2_scale_scalar_f32, gemm1_alpha_f32, gemm1_beta_f32,
+          gemm1_clamp_limit_f32, workspace_receipt, enable_pdl);
 }
 
 }  // namespace flashinfer::warp_decode
@@ -726,3 +871,8 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_fused_moe_warp_decode_prepare_workspace,
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_fused_moe_warp_decode_release_workspace,
                               flashinfer::warp_decode::ReleaseWorkspaceReceipt);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_fused_moe_warp_decode, flashinfer::warp_decode::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_fused_moe_warp_decode_with_activation_params,
+                              flashinfer::warp_decode::RunWithActivationParams);
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cake_fused_moe_warp_decode_clamped_swiglu,
+                              flashinfer::warp_decode::RunClampedSwiGLU);

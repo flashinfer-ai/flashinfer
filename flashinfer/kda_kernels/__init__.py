@@ -26,7 +26,18 @@ Exported:
 - run_recurrent_kda: Recurrent KDA standard decode and speculative decode backend
 - run_fused_kda_decode: Fused Kimi K3 conv, recurrent KDA, and RMSNorm backend
 - run_packed_kda_decode: Packed Kimi K3 T=1 recurrent decode backend
-- run_kda_prefill_sm120: SM120a ordinary multi-token prefill backend
+- run_fused_kda_decode_multitoken: Packed T>=1 fused KDA backend
+
+The ``run_*`` names above are canonical. The bare ``recurrent_kda``,
+``fused_kda_decode`` and ``packed_kda_decode`` aliases are kept for existing
+callers but are no longer exported: the first two shadow the submodules of the
+same name, so attribute access returns a function where the module is what a
+reader expects. Import ``run_*``, or the module by path.
+
+The ``*_kda_prefill_sm120`` names below are the optional facade that
+``flashinfer.kda_prefill`` dispatches through; they are not part of this
+package's public surface. Reach that backend through ``flashinfer.kda_prefill``,
+or ``flashinfer.kda_kernels.sm120_prefill`` for its cache controls.
 """
 
 from typing import Optional
@@ -50,6 +61,14 @@ except (ImportError, RuntimeError):
 # of the public ``flashinfer.recurrent_kda`` operation (see
 # ``run_recurrent_kda`` in ``recurrent_kda.py``); import it by module path
 # only for tests and benchmarks.
+
+try:
+    from .fused_kda_decode_multitoken import run_fused_kda_decode_multitoken
+
+    fused_kda_decode_multitoken = run_fused_kda_decode_multitoken
+except (ImportError, RuntimeError):
+    run_fused_kda_decode_multitoken = None  # type: ignore
+    fused_kda_decode_multitoken = None  # type: ignore
 
 try:
     if _torch.cuda.is_available():
@@ -101,13 +120,8 @@ except (ImportError, RuntimeError) as _kda_sm120_error:  # pragma: no cover
     run_kda_prefill_sm120 = None  # type: ignore
 
 __all__ = [
-    "can_implement_kda_prefill_sm120",
-    "clear_kda_prefill_sm120_caches",
-    "fused_kda_decode",
-    "packed_kda_decode",
-    "recurrent_kda",
     "run_fused_kda_decode",
-    "run_kda_prefill_sm120",
+    "run_fused_kda_decode_multitoken",
     "run_packed_kda_decode",
     "run_recurrent_kda",
 ]

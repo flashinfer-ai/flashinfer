@@ -1,8 +1,22 @@
 import json
 import os
+import traceback
 import types
 from pathlib import Path
 from typing import Any, Dict, Set
+
+
+def _configure_cute_dsl_cache_dir():
+    if "CUTE_DSL_CACHE_DIR" not in os.environ:
+        workspace_base = Path(
+            os.environ.get("FLASHINFER_WORKSPACE_BASE", Path.home().as_posix())
+        ).expanduser()
+        os.environ["CUTE_DSL_CACHE_DIR"] = str(
+            workspace_base / ".cache" / "flashinfer" / "cute_dsl"
+        )
+
+
+_configure_cute_dsl_cache_dir()
 
 import pytest
 import torch
@@ -23,7 +37,9 @@ def _patch_cutlass_dsl_operand_major_mode():
 _patch_cutlass_dsl_operand_major_mode()
 
 import flashinfer
-from flashinfer.jit import MissingJITCacheError
+from flashinfer.jit import JitSpec, JitSpecNvcc, MissingJITCacheError
+
+pytest_plugins = ["tests.test_helpers.parametrize"]
 
 # Global tracking for JIT cache coverage
 # Store tuples of (test_name, module_name, spec_info)
@@ -76,6 +92,21 @@ TORCH_COMPILE_FNS = [
 ]
 
 _TORCH_COMPILE_CACHE: Dict[str, Any] = dict()
+
+
+def _missing_jit_cache_spec_info(spec: JitSpec) -> Dict[str, Any]:
+    """Return report metadata without assuming a particular JIT backend."""
+    if isinstance(spec, JitSpecNvcc):
+        return {
+            "name": spec.name,
+            "sources": [str(s) for s in spec.sources],
+            "needs_device_linking": spec.needs_device_linking,
+            "aot_path": str(spec.aot_path),
+        }
+    return {
+        "name": spec.name,
+        "artifact_path": str(spec.get_library_path()),
+    }
 
 
 def _set_torch_compile_options():
@@ -159,20 +190,31 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "nvep: requires a moe_ep-enabled install (default)"
     )
+    config.addinivalue_line("markers", "gpu: requires at least one CUDA GPU")
     config.addinivalue_line("markers", "gpu_2: requires >=2 GPUs")
     config.addinivalue_line("markers", "gpu_4: requires >=4 GPUs")
     config.addinivalue_line("markers", "gpu_8: requires >=8 GPUs")
     config.addinivalue_line("markers", "arch_blackwell: requires sm_100 or sm_103")
     config.addinivalue_line("markers", "arch_hopper: requires sm_90 (Hopper)")
+    config.addinivalue_line("markers", "arch_rubin: requires sm_107 (Rubin)")
     config.addinivalue_line(
         "markers", "arch_sm120: requires sm_120/sm_121 (Blackwell-consumer)"
     )
     config.addinivalue_line(
         "markers",
-        "long_running: front-load this test file at the start of the parallel CI queue",
+        "long_running: prioritize runnable units from this source over normal work",
     )
     config.addinivalue_line(
-        "markers", "solo: run this whole test file alone (memory-heavy)"
+        "markers",
+        "node_exclusive: run this whole file alone across the allocation, after "
+        "parallel work, with all GPUs visible; use only for allocation-wide "
+        "requirements such as multi-GPU execution or host-memory OOM risk",
+    )
+    config.addinivalue_line(
+        "markers", "gpu_exclusive: run this whole test file alone on its assigned GPU"
+    )
+    config.addinivalue_line(
+        "markers", "host_memory_heavy: serialize this file with other host-heavy files"
     )
     config.addinivalue_line(
         "markers",
@@ -210,6 +252,13 @@ def pytest_collection_modifyitems(config, items):
             if mk not in item.keywords:
                 continue
             if "WORLD_SIZE" not in os.environ:
+                # Runners that exist only to run multi-rank tests set this so
+                # that a missing launcher fails instead of skipping silently.
+                if os.environ.get("FAIL_ON_DISTRIBUTED_SKIP") == "1":
+                    raise pytest.UsageError(
+                        f"{item.nodeid} needs a torchrun or MPI launch "
+                        "(WORLD_SIZE unset)"
+                    )
                 # Multi-rank tests must be launched via torchrun (see
                 # tests/moe_ep/run_tests.sh); under plain pytest auto-discovery
                 # (e.g. CI unit-test sweeps) they would hang on dist init.
@@ -225,12 +274,23 @@ def pytest_collection_modifyitems(config, items):
                 # (the sm120 kernel drop's bootstrap maps
                 # local_rank % device_count and supports MEGA_SINGLE_GPU_GLOO).
                 item.add_marker(pytest.mark.skip(reason=f"needs >= {req} GPUs"))
-        # Exactly the sm_10x family: the sm_100 tree's kernels do not target
-        # Hopper (below) or the consumer sm_11x/sm_12x families (which use
-        # their own kernel trees), so >= would let them collect on hosts
-        # where the kernel cannot compile.
-        if "arch_blackwell" in item.keywords and cc[0] != 10:
-            item.add_marker(pytest.mark.skip(reason="needs sm_100/sm_103"))
+        # SM100 kernels cannot compile for Rubin (10.7).
+        if "arch_blackwell" in item.keywords and (cc < (10, 0) or cc >= (10, 7)):
+            item.add_marker(pytest.mark.skip(reason="needs sm_100/sm_103 (Blackwell)"))
+        # Exactly sm_107: the Rubin mega kernels compile for sm_107a only.
+        if "arch_rubin" in item.keywords and cc != (10, 7):
+            item.add_marker(pytest.mark.skip(reason="needs sm_107 (Rubin)"))
+        elif "arch_rubin" in item.keywords:
+            from flashinfer.cute_dsl.availability import (
+                is_cute_dsl_arch_supported,
+            )
+
+            if not is_cute_dsl_arch_supported(10, 7, native_only=True):
+                item.add_marker(
+                    pytest.mark.skip(
+                        reason="installed CuTe DSL cannot natively target sm_107"
+                    )
+                )
         # Exactly sm_90: the SM90 mega kernels are Hopper-only (Blackwell
         # hosts use the sm_100 tree's kernels instead).
         if "arch_hopper" in item.keywords and cc != (9, 0):
@@ -245,13 +305,42 @@ def is_cuda_oom_error_str(e: str) -> bool:
     return "CUDA" in e and "out of memory" in e
 
 
+def _release_cuda_oom(e: BaseException) -> bool:
+    """Return whether ``e`` or a linked exception is a CUDA OOM; if so, free its frames.
+
+    torch.testing.assert_close re-raises an OOM from inside its comparison as a
+    RuntimeError caused by the OOM, so both ``__cause__`` and ``__context__`` are
+    followed. The skip exception keeps these exceptions alive, and their
+    tracebacks would keep the test's frames and GPU tensors allocated into the
+    tests that follow.
+    """
+    chain: list[BaseException] = []
+    pending: list[BaseException | None] = [e]
+    while pending:
+        x = pending.pop()
+        if x is None or any(x is seen for seen in chain):
+            continue
+        chain.append(x)
+        pending += [x.__cause__, x.__context__]
+    if not any(
+        isinstance(x, torch.cuda.OutOfMemoryError) or is_cuda_oom_error_str(str(x))
+        for x in chain
+    ):
+        return False
+    for x in chain:
+        traceback.clear_frames(x.__traceback__)
+    return True
+
+
 @pytest.hookimpl(wrapper=True)
 def pytest_runtest_call(item):
     # skip OOM error and missing JIT cache errors
     try:
         yield
     except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
-        if isinstance(e, torch.cuda.OutOfMemoryError) or is_cuda_oom_error_str(str(e)):
+        if os.environ.get("FLASHINFER_STRICT_MOE_EP_TESTS") == "1":
+            raise
+        if _release_cuda_oom(e):
             pytest.skip("Skipping due to OOM")
         elif isinstance(e, MissingJITCacheError):
             # Record the test that was skipped due to missing JIT cache
@@ -260,14 +349,7 @@ def pytest_runtest_call(item):
             module_name = spec.name if spec else "unknown"
 
             # Create a dict with module info for reporting
-            spec_info = None
-            if spec:
-                spec_info = {
-                    "name": spec.name,
-                    "sources": [str(s) for s in spec.sources],
-                    "needs_device_linking": spec.needs_device_linking,
-                    "aot_path": str(spec.aot_path),
-                }
+            spec_info = _missing_jit_cache_spec_info(spec) if spec else None
 
             _MISSING_JIT_CACHE_MODULES.add((test_name, module_name, str(spec_info)))
             pytest.skip(f"Skipping due to missing JIT cache for module: {module_name}")

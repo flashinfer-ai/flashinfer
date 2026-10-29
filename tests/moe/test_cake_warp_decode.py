@@ -1,7 +1,8 @@
-"""CPU contract tests for the exact-SM103 Cake warp-decode MoE runner."""
+"""CPU contract tests for the exact-SM100/SM103 Cake warp-decode MoE runner."""
 
 from __future__ import annotations
 
+import functools
 import gc
 import weakref
 from collections import OrderedDict
@@ -9,6 +10,7 @@ from dataclasses import dataclass, replace
 from types import SimpleNamespace
 
 import flashinfer.fused_moe.runners as moe_runners
+import flashinfer.jit.cake_fused_moe_warp_decode as cake_warp_decode_jit
 import pytest
 import torch
 
@@ -23,15 +25,27 @@ from flashinfer.fused_moe import (
     MoEFinalizeConfig,
     MoEWeightPack,
     QuantConfig,
-    QuantVariant,
+    QuantFormat,
     RoutingConfig,
     RoutingInputMode,
     RoutingMethodType,
+    SiLU,
+    SiTU,
     SwiGLU,
     TrtllmFp4Config,
 )
 from flashinfer.fused_moe.api import _DEFAULT_BACKEND
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
+from tests.moe.cake_warp_decode_reference import (
+    TARGETS,
+    Fixture,
+    Geometry as _GpuGeometry,
+    assert_close,
+    prepare_fixture,
+    prepare_launch,
+    reference,
+    run_cake,
+)
 
 
 @dataclass
@@ -55,6 +69,7 @@ class _Module:
         self.prepare_calls = []
         self.release_calls = []
         self.run_calls = []
+        self.parameter_run_calls = []
         self.next_receipt = 1
         self.live_receipts = set()
         self.release_error: Exception | None = None
@@ -84,6 +99,48 @@ class _Module:
         if self.run_error is not None:
             raise self.run_error
 
+    def cake_fused_moe_warp_decode_with_activation_params(self, *args) -> None:
+        self.parameter_run_calls.append(args)
+        if self.run_error is not None:
+            raise self.run_error
+
+
+@pytest.mark.parametrize("target", ["sm100a", "sm103a"])
+def test_jit_device_sources_resolve_and_share_common_kernels(target):
+    csrc_dir = cake_warp_decode_jit._get_cake_fused_moe_warp_decode_csrc_dir()
+    sources = cake_warp_decode_jit._device_sources(csrc_dir, target)
+    names = [source.name for source in sources]
+    assert sources and len(set(names)) == len(names)
+    assert set(cake_warp_decode_jit._COMMON_SOURCES) <= set(names)
+    assert set(cake_warp_decode_jit._NO_FAST_MATH_SOURCES) <= set(names)
+    with pytest.raises(FileNotFoundError, match="device sources not found"):
+        cake_warp_decode_jit._device_sources(csrc_dir / "missing", target)
+
+
+def test_jit_prefers_checkout_sources_when_editable_data_is_staged(
+    tmp_path, monkeypatch
+):
+    checkout_module = tmp_path / "flashinfer" / "jit" / "cake_warp_decode.py"
+    checkout_module.parent.mkdir(parents=True)
+    checkout_module.touch()
+    checkout_csrc = tmp_path / "csrc" / "fused_moe" / "warp_decode"
+    checkout_csrc.mkdir(parents=True)
+    staged_csrc = (
+        tmp_path / "flashinfer" / "data" / "csrc" / "fused_moe" / "warp_decode"
+    )
+    staged_csrc.mkdir(parents=True)
+
+    monkeypatch.setattr(cake_warp_decode_jit, "__file__", str(checkout_module))
+    monkeypatch.setattr(
+        cake_warp_decode_jit.jit_env,
+        "FLASHINFER_CSRC_DIR",
+        tmp_path / "flashinfer" / "data" / "csrc",
+    )
+
+    assert (
+        cake_warp_decode_jit._get_cake_fused_moe_warp_decode_csrc_dir() == checkout_csrc
+    )
+
 
 def _config(
     *,
@@ -91,23 +148,26 @@ def _config(
     num_experts: int = 60,
     top_k: int = 4,
     enable_pdl: bool | None = True,
+    activation=None,
 ) -> MoEConfig:
     return MoEConfig(
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
-        quant=QuantConfig(variant=QuantVariant.NVFP4),
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
         experts=ExpertConfig(intermediate_size=intermediate_size),
-        activation=SwiGLU(),
+        activation=SwiGLU() if activation is None else activation,
         backend=BackendOptions((CakeWarpDecodeConfig(backend="cake"),)),
         execution=ExecutionConfig(enable_pdl=enable_pdl),
     )
 
 
-def _runner(config: MoEConfig | None = None) -> tuple[CakeWarpDecodeRunner, _Module]:
+def _runner(
+    config: MoEConfig | None = None, *, device_arch: int = 103
+) -> tuple[CakeWarpDecodeRunner, _Module]:
     module = _Module()
     runner = object.__new__(CakeWarpDecodeRunner)
     runner.config = config or _config()
     runner.device = torch.device("cpu")
-    runner._device_arch = 103
+    runner._device_arch = device_arch
     runner._module = module
     runner._support_checked = True
     runner._built = True
@@ -126,10 +186,11 @@ def _activation_pack(
     mode: RoutingInputMode = RoutingInputMode.UnpackedPrecomputed,
     weights_dtype: torch.dtype = torch.bfloat16,
     topk_ids: torch.Tensor | None = None,
+    hidden_size: int = 2048,
 ) -> MoEActivationPack:
     return MoEActivationPack(
-        _TensorSpec((num_tokens, 1024), torch.uint8),
-        _TensorSpec((num_tokens, 128), torch.uint8),
+        _TensorSpec((num_tokens, hidden_size // 2), torch.uint8),
+        _TensorSpec((num_tokens, hidden_size // 16), torch.uint8),
         topk_ids
         if topk_ids is not None
         else _TensorSpec((num_tokens, top_k), torch.int32),
@@ -138,17 +199,41 @@ def _activation_pack(
     )
 
 
-def _weight_pack(*, extra: dict | None = None) -> tuple[MoEWeightPack, dict]:
+def _weight_pack(
+    *,
+    hidden_size: int = 2048,
+    intermediate_size: int = 1536,
+    num_experts: int = 60,
+    activation=None,
+    extra: dict | None = None,
+) -> tuple[MoEWeightPack, dict]:
+    activation = SwiGLU() if activation is None else activation
+    gemm1_rows = intermediate_size * (2 if activation.is_gated else 1)
     view = {
-        "gemm1_weights": _TensorSpec((60, 3072, 1024), torch.uint8),
-        "gemm1_weights_scale": _TensorSpec((60, 3072, 128), torch.uint8),
-        "gemm1_alpha": _TensorSpec((60,), torch.float32),
-        "gemm2_weights": _TensorSpec((60, 2048, 768), torch.uint8),
-        "gemm2_weights_scale": _TensorSpec((60, 2048, 96), torch.uint8),
-        "output1_scale_scalar": _TensorSpec((60,), torch.float32),
-        "output1_scale_gate_scalar": _TensorSpec((60,), torch.float32),
-        "output2_scale_scalar": _TensorSpec((60,), torch.float32),
+        "gemm1_weights": _TensorSpec(
+            (num_experts, gemm1_rows, hidden_size // 2), torch.uint8
+        ),
+        "gemm1_weights_scale": _TensorSpec(
+            (num_experts, gemm1_rows, hidden_size // 16), torch.uint8
+        ),
+        "gemm2_weights": _TensorSpec(
+            (num_experts, hidden_size, intermediate_size // 2), torch.uint8
+        ),
+        "gemm2_weights_scale": _TensorSpec(
+            (num_experts, hidden_size, intermediate_size // 16), torch.uint8
+        ),
+        "output1_scale_scalar": _TensorSpec((num_experts,), torch.float32),
+        "output1_scale_gate_scalar": _TensorSpec((num_experts,), torch.float32),
+        "output2_scale_scalar": _TensorSpec((num_experts,), torch.float32),
     }
+    if activation.is_gated:
+        view["gemm1_alpha"] = _TensorSpec((num_experts,), torch.float32)
+    if isinstance(activation, SiTU) or (
+        isinstance(activation, SwiGLU) and activation != SwiGLU()
+    ):
+        view["gemm1_beta"] = _TensorSpec((num_experts,), torch.float32)
+    if isinstance(activation, SwiGLU) and activation != SwiGLU():
+        view["gemm1_clamp_limit"] = _TensorSpec((num_experts,), torch.float32)
     if extra:
         view.update(extra)
     weights = MoEWeightPack()
@@ -156,25 +241,30 @@ def _weight_pack(*, extra: dict | None = None) -> tuple[MoEWeightPack, dict]:
     return weights, view
 
 
-def test_config_is_explicit_exact_sm103_and_not_default():
+def test_config_is_explicit_exact_sm100_sm103_and_not_default():
     config = CakeWarpDecodeConfig(backend="cake")
     assert repr(config) == "CakeWarpDecodeConfig(backend='cake')"
+    assert config.supported(100)
     assert config.supported(103)
-    assert not config.supported(100)
+    assert not config.supported(101)
+    assert not config.supported(107)
     assert _BACKEND_RUNNERS[CakeWarpDecodeConfig] is CakeWarpDecodeRunner
     assert not any(isinstance(item, CakeWarpDecodeConfig) for item in _DEFAULT_BACKEND)
     with pytest.raises(ValueError, match="must be 'cake'"):
         CakeWarpDecodeConfig(backend="auto")
 
 
-def test_runner_build_passes_its_explicit_device(monkeypatch):
-    runner, _ = _runner()
+@pytest.mark.parametrize("device_arch,target", [(100, "sm100a"), (103, "sm103a")])
+def test_runner_build_passes_its_explicit_target_and_device(
+    monkeypatch, device_arch, target
+):
+    runner, _ = _runner(device_arch=device_arch)
     runner.device = torch.device("cuda:1")
     sentinel = object()
     calls = []
 
-    def load(*, device):
-        calls.append(device)
+    def load(requested_target, *, device):
+        calls.append((requested_target, device))
         return sentinel
 
     monkeypatch.setattr(
@@ -185,10 +275,44 @@ def test_runner_build_passes_its_explicit_device(monkeypatch):
     runner._build()
 
     assert runner._module is sentinel
-    assert calls == [torch.device("cuda:1")]
+    assert calls == [(target, torch.device("cuda:1"))]
 
 
-def test_config_preparation_delegates_to_trtllm_physical_view(monkeypatch):
+@pytest.mark.parametrize(
+    "activation,expected_activation,hidden_size,intermediate_size,num_experts",
+    [
+        (None, SwiGLU(), 2048, 512, 512),
+        (SwiGLU(), SwiGLU(), 2048, 1536, 60),
+        (None, SwiGLU(), 2560, 768, 384),
+        (SwiGLU(), SwiGLU(), 2560, 768, 384),
+        (SiLU(), SiLU(), 6144, 1536, 192),
+        (None, SwiGLU(), 2048, 768, 128),
+        (SwiGLU(), SwiGLU(), 4096, 1536, 128),
+        (SwiGLU(), SwiGLU(), 2048, 512, 256),
+        (SwiGLU(), SwiGLU(), 4096, 1024, 512),
+        (SwiGLU(), SwiGLU(), 3072, 1536, 256),
+        (SwiGLU(), SwiGLU(), 4096, 512, 512),
+        (None, SwiGLU(), 4096, 256, 512),
+        (SwiGLU(), SwiGLU(), 3072, 768, 256),
+        (None, SwiGLU(), 3072, 384, 256),
+        (
+            SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
+            SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
+            6144,
+            3072,
+            128,
+        ),
+        (SiTU(), SiTU(), 3584, 3072, 896),
+    ],
+)
+def test_config_preparation_delegates_to_trtllm_physical_view(
+    monkeypatch,
+    activation,
+    expected_activation,
+    hidden_size,
+    intermediate_size,
+    num_experts,
+):
     expected = object()
     calls = []
 
@@ -200,21 +324,62 @@ def test_config_preparation_delegates_to_trtllm_physical_view(monkeypatch):
     result = CakeWarpDecodeConfig.prepare_weights(
         object(),
         object(),
-        num_local_experts=60,
-        hidden_size=2048,
-        intermediate_size=1536,
+        num_local_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        activation=activation,
     )
     assert result is expected
-    assert calls[0][1]["variant"] is QuantVariant.NVFP4
-    assert calls[0][1]["activation"] == SwiGLU()
-    with pytest.raises(ValueError, match="requires QuantVariant.NVFP4"):
+    assert calls[0][1]["quant"] == QuantConfig(
+        weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4
+    )
+    assert calls[0][1]["activation"] == expected_activation
+    with pytest.raises(ValueError, match=r"NVFP4×NVFP4"):
         CakeWarpDecodeConfig.prepare_weights(
             object(),
             object(),
-            variant=QuantVariant.MXFP4,
-            num_local_experts=60,
-            hidden_size=2048,
-            intermediate_size=1536,
+            quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+            num_local_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+        )
+
+
+@pytest.mark.parametrize(
+    "activation,hidden_size,intermediate_size,num_experts",
+    [
+        (SiLU(), 2048, 1536, 60),
+        (SwiGLU(), 6144, 1536, 192),
+        (SwiGLU(alpha=2.0), 2048, 1536, 60),
+        (SiLU(), 2560, 768, 384),
+        (SwiGLU(alpha=2.0), 2560, 768, 384),
+        (SiLU(), 2048, 768, 128),
+        (SwiGLU(alpha=2.0), 4096, 1536, 128),
+        (SiLU(), 2048, 512, 256),
+        (SiLU(), 4096, 1024, 512),
+        (SiLU(), 3072, 1536, 256),
+        (SiLU(), 4096, 512, 512),
+        (SwiGLU(alpha=2.0), 4096, 256, 512),
+        (SiLU(), 3072, 768, 256),
+        (SwiGLU(alpha=2.0), 3072, 384, 256),
+        (SwiGLU(), 6144, 3072, 128),
+        (SwiGLU(), 3584, 3072, 896),
+        (SwiGLU(alpha=1.702, beta=0.0, limit=7.0), 6144, 3072, 128),
+        (SiTU(gate_scale=1.0), 3584, 3072, 896),
+    ],
+)
+def test_config_preparation_rejects_activation_geometry_cross_product(
+    activation, hidden_size, intermediate_size, num_experts
+):
+    with pytest.raises(ValueError, match="supports only default SwiGLU"):
+        CakeWarpDecodeConfig.prepare_weights(
+            object(),
+            object(),
+            num_local_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
         )
 
 
@@ -230,6 +395,17 @@ def test_support_rejects_semantic_and_geometry_expansion():
     runner._check_support()
 
     runner.config = replace(runner.config, activation=SwiGLU(alpha=2.0))
+    with pytest.raises(NotImplementedError, match="default SwiGLU"):
+        runner._check_support()
+
+    runner.config = _config(
+        intermediate_size=1536, num_experts=192, top_k=4, activation=SiLU()
+    )
+    runner._check_support()
+
+    runner.config = _config(
+        intermediate_size=1536, num_experts=60, top_k=4, activation=SiLU()
+    )
     with pytest.raises(NotImplementedError, match="default SwiGLU"):
         runner._check_support()
 
@@ -263,15 +439,77 @@ def test_support_rejects_semantic_and_geometry_expansion():
         runner._check_support()
 
 
-def test_pack_reuses_prepared_workspace_and_preserves_ffi_order():
-    runner, module = _runner()
-    act = _activation_pack()
-    weights, view = _weight_pack()
+@pytest.mark.parametrize("device_arch", [90, 101, 107, 120])
+def test_support_rejects_nonexact_architectures(device_arch):
+    runner, _ = _runner(device_arch=device_arch)
+    with pytest.raises(NotImplementedError, match="exact SM100 or SM103"):
+        runner._check_support()
+
+
+@pytest.mark.parametrize("device_arch", [100, 103])
+@pytest.mark.parametrize(
+    "intermediate_size,num_experts,top_k",
+    [
+        (1536, 60, 4),
+        (768, 384, 4),
+        (768, 128, 8),
+        (1536, 128, 8),
+        (512, 256, 8),
+        (1024, 512, 10),
+        (1536, 256, 8),
+    ],
+)
+def test_support_accepts_exact_architectures(
+    device_arch, intermediate_size, num_experts, top_k
+):
+    runner, _ = _runner(
+        _config(
+            intermediate_size=intermediate_size, num_experts=num_experts, top_k=top_k
+        ),
+        device_arch=device_arch,
+    )
+    runner._check_support()
+
+
+@pytest.mark.parametrize("device_arch", [100, 103])
+@pytest.mark.parametrize(
+    "hidden_size,intermediate_size,num_experts,top_k",
+    [
+        (2048, 1536, 60, 4),
+        (2560, 768, 384, 4),
+        (2048, 768, 128, 8),
+        (4096, 1536, 128, 8),
+        (2048, 512, 256, 8),
+        (4096, 1024, 512, 10),
+        (3072, 1536, 256, 8),
+        (4096, 512, 512, 10),
+        (4096, 256, 512, 10),
+        (3072, 768, 256, 8),
+        (3072, 384, 256, 8),
+    ],
+)
+def test_pack_reuses_prepared_workspace_and_preserves_ffi_order(
+    device_arch, hidden_size, intermediate_size, num_experts, top_k
+):
+    runner, module = _runner(
+        _config(
+            intermediate_size=intermediate_size, num_experts=num_experts, top_k=top_k
+        ),
+        device_arch=device_arch,
+    )
+    act = _activation_pack(hidden_size=hidden_size, top_k=top_k)
+    weights, view = _weight_pack(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+    )
 
     first = runner.pack_inputs(act, weights)
     second = runner.pack_inputs(act, weights)
 
-    assert module.size_calls == [(7, 2048, 1536, 60, 4)]
+    assert module.size_calls == [
+        (7, hidden_size, intermediate_size, num_experts, top_k)
+    ]
     assert len(module.prepare_calls) == 1
     assert first[1] is second[1]
     assert first[0] is not second[0]
@@ -296,6 +534,191 @@ def test_pack_reuses_prepared_workspace_and_preserves_ffi_order():
     assert len(module.prepare_calls) == 2
     assert runner.forward(first) is first[0]
     assert module.run_calls == [tuple([*first, 2, True])]
+
+
+@pytest.mark.parametrize("device_arch", [100, 103])
+@pytest.mark.parametrize(
+    "activation,hidden_size,num_experts,top_k",
+    [
+        (SwiGLU(alpha=1.702, beta=1.0, limit=7.0), 6144, 128, 4),
+        (SiTU(gate_scale=4.0, linear_scale=25.0), 3584, 896, 16),
+    ],
+)
+def test_parameterized_pack_forwards_live_activation_tensors(
+    device_arch, activation, hidden_size, num_experts, top_k
+):
+    runner, module = _runner(
+        _config(
+            intermediate_size=3072,
+            num_experts=num_experts,
+            top_k=top_k,
+            activation=activation,
+        ),
+        device_arch=device_arch,
+    )
+    runner._check_support()
+    act = _activation_pack(hidden_size=hidden_size, top_k=top_k)
+    weights, view = _weight_pack(
+        hidden_size=hidden_size,
+        intermediate_size=3072,
+        num_experts=num_experts,
+        activation=activation,
+    )
+    inputs = runner.pack_inputs(act, weights)
+    assert len(inputs) == 16
+    assert inputs[13] is view["gemm1_alpha"]
+    assert inputs[14] is view["gemm1_beta"]
+    assert inputs[15] is view.get("gemm1_clamp_limit")
+    assert module.size_calls == [(7, hidden_size, 3072, num_experts, top_k)]
+    assert runner.forward(inputs) is inputs[0]
+    assert module.run_calls == []
+    assert module.parameter_run_calls == [tuple([*inputs, 1, True])]
+
+
+@pytest.mark.parametrize(
+    "activation,hidden_size,num_experts,top_k,missing_key",
+    [
+        (SwiGLU(alpha=1.702, beta=1.0, limit=7.0), 6144, 128, 4, "gemm1_alpha"),
+        (SwiGLU(alpha=1.702, beta=1.0, limit=7.0), 6144, 128, 4, "gemm1_beta"),
+        (SwiGLU(alpha=1.702, beta=1.0, limit=7.0), 6144, 128, 4, "gemm1_clamp_limit"),
+        (SiTU(), 3584, 896, 16, "gemm1_alpha"),
+        (SiTU(), 3584, 896, 16, "gemm1_beta"),
+    ],
+)
+def test_parameterized_pack_requires_prepared_activation_tensors(
+    activation, hidden_size, num_experts, top_k, missing_key
+):
+    runner, module = _runner(
+        _config(
+            intermediate_size=3072,
+            num_experts=num_experts,
+            top_k=top_k,
+            activation=activation,
+        )
+    )
+    act = _activation_pack(hidden_size=hidden_size, top_k=top_k)
+    weights, view = _weight_pack(
+        hidden_size=hidden_size,
+        intermediate_size=3072,
+        num_experts=num_experts,
+        activation=activation,
+    )
+    del view[missing_key]
+    with pytest.raises(KeyError, match=missing_key):
+        runner.pack_inputs(act, weights)
+    assert module.prepare_calls == []
+
+
+def test_situ_pack_rejects_unconsumed_clamp_override():
+    runner, _ = _runner(
+        _config(intermediate_size=3072, num_experts=896, top_k=16, activation=SiTU())
+    )
+    weights, _ = _weight_pack(
+        hidden_size=3584,
+        intermediate_size=3072,
+        num_experts=896,
+        activation=SiTU(),
+        extra={"gemm1_clamp_limit": _TensorSpec((896,), torch.float32)},
+    )
+    with pytest.raises(ValueError, match="gemm1_clamp_limit"):
+        runner.pack_inputs(_activation_pack(hidden_size=3584, top_k=16), weights)
+
+
+def test_silu_pack_uses_nongated_rows_and_preserves_ffi_order():
+    config = _config(
+        intermediate_size=1536, num_experts=192, top_k=4, activation=SiLU()
+    )
+    runner, module = _runner(config)
+    act = _activation_pack(hidden_size=6144)
+    weights, view = _weight_pack(
+        hidden_size=6144,
+        intermediate_size=1536,
+        num_experts=192,
+        activation=SiLU(),
+    )
+
+    packed = runner.pack_inputs(act, weights)
+
+    assert module.size_calls == [(7, 6144, 1536, 192, 4)]
+    assert "gemm1_alpha" not in view
+    assert view["gemm1_weights"].shape == (192, 1536, 3072)
+    assert view["gemm1_weights_scale"].shape == (192, 1536, 384)
+    assert view["gemm2_weights"].shape == (192, 6144, 768)
+    assert view["gemm2_weights_scale"].shape == (192, 6144, 96)
+    assert len(packed) == 13
+    assert packed[2:6] == [
+        act.hidden_states_q,
+        act.hidden_states_scale,
+        act.topk_ids,
+        act.topk_weights,
+    ]
+    assert packed[6:] == [
+        view["gemm1_weights"],
+        view["gemm1_weights_scale"],
+        view["gemm2_weights"],
+        view["gemm2_weights_scale"],
+        view["output1_scale_scalar"],
+        view["output1_scale_gate_scalar"],
+        view["output2_scale_scalar"],
+    ]
+
+
+def test_silu_pack_rejects_gated_rows_and_alpha():
+    config = _config(
+        intermediate_size=1536, num_experts=192, top_k=4, activation=SiLU()
+    )
+    runner, _ = _runner(config)
+    act = _activation_pack(hidden_size=6144)
+    gated_rows, _ = _weight_pack(
+        hidden_size=6144,
+        intermediate_size=1536,
+        num_experts=192,
+        activation=SiLU(),
+        extra={
+            "gemm1_weights": _TensorSpec((192, 3072, 3072), torch.uint8),
+        },
+    )
+    with pytest.raises(ValueError, match="gemm1_weights must have shape"):
+        runner.pack_inputs(act, gated_rows)
+
+    with_alpha, _ = _weight_pack(
+        hidden_size=6144,
+        intermediate_size=1536,
+        num_experts=192,
+        activation=SiLU(),
+        extra={"gemm1_alpha": _TensorSpec((192,), torch.float32)},
+    )
+    with pytest.raises(ValueError, match="must not provide gemm1_alpha"):
+        runner.pack_inputs(act, with_alpha)
+
+
+@pytest.mark.parametrize(
+    "config,hidden_size",
+    [
+        (
+            _config(
+                intermediate_size=1536,
+                num_experts=192,
+                top_k=4,
+                activation=SiLU(),
+            ),
+            2048,
+        ),
+        (_config(), 6144),
+        (_config(intermediate_size=768, num_experts=384), 2048),
+        (
+            _config(intermediate_size=768, num_experts=384, activation=SiLU()),
+            2560,
+        ),
+    ],
+)
+def test_pack_rejects_activation_geometry_cross_product(config, hidden_size):
+    runner, _ = _runner(config)
+    with pytest.raises(ValueError, match="supports only default SwiGLU"):
+        runner.pack_inputs(
+            _activation_pack(hidden_size=hidden_size),
+            _weight_pack()[0],
+        )
 
 
 def test_pack_uses_a_distinct_workspace_per_cuda_stream(monkeypatch):
@@ -677,3 +1100,127 @@ def test_pack_rejects_mode_tokens_weights_and_extra_fields():
     )
     with pytest.raises(ValueError, match="does not accept bias"):
         runner.pack_inputs(_activation_pack(), weights_with_bias)
+
+
+# ---------------------------------------------------------------------------
+# GPU numerical parity on exact SM100 / SM103 devices.
+#
+# The fixture, the public TRT-LLM NVFP4 reference and the launch helpers live in
+# tests/moe/cake_warp_decode_reference.py and are shared with the clamped SM100
+# test. The TRT-LLM NVFP4 routed MoE is the public reference for the SwiGLU and
+# SiTU geometries. The standalone SiLU geometry has no public NVFP4 peer, so its
+# rows check finiteness and launch-to-launch repeatability only.
+# ---------------------------------------------------------------------------
+
+_GPU_SEED = 20260205
+
+
+# Token counts are the schedule / route-packer boundaries of each geometry plus
+# the rows that reach kernels no boundary row launches (named by the short hash
+# of their generated source file). Rows that differ only in workfeed CTAs launch
+# the same kernels and are not listed.
+_GPU_GEOMETRIES = (
+    # T2: sm103 finalize ecc88726. T4: sm100 FC2 984506f0. T5: sm103 finalize b13a3c73.
+    _GpuGeometry("e512_i512_k10", 2048, 512, 512, 10, (1, 2, 3, 4, 5, 32)),
+    _GpuGeometry("e60_i1536_k4", 2048, 1536, 60, 4, (1, 4, 5, 10, 11, 12, 14, 15, 32)),
+    _GpuGeometry("e192_i1536_k4_silu", 6144, 1536, 192, 4, (1, 32), SiLU()),
+    _GpuGeometry("e384_i768_k4", 2560, 768, 384, 4, (1, 32)),
+    # T7: sm100 FC2 5c23234a. T11: sm103 FC1 5304d683. T18: sm100 finalize
+    # f5eac8f9. T21: sm103 FC2 c5afe5ba.
+    _GpuGeometry(
+        "e128_i768_k8", 2048, 768, 128, 8, (1, 7, 8, 9, 10, 11, 15, 16, 18, 21, 32)
+    ),
+    _GpuGeometry("e128_i1536_k8", 4096, 1536, 128, 8, (1, 6, 11, 12, 32)),
+    _GpuGeometry("e256_i512_k8", 2048, 512, 256, 8, (1, 15, 16, 18, 19, 30, 32)),
+    _GpuGeometry("e512_i1024_k10", 4096, 1024, 512, 10, (1, 2, 5, 6, 8, 25, 26, 32)),
+    _GpuGeometry("e256_i1536_k8", 3072, 1536, 256, 8, (1, 15, 16, 32)),
+    _GpuGeometry(
+        "e128_i3072_k4_swiglu_oa",
+        6144,
+        3072,
+        128,
+        4,
+        # T4: first sm100 packed row. T5: sm100 FC1 5312a738 and FC2 8acc0c77.
+        # sm103: fused route-pack FC1 dec95a54 (T1..T15) or 89860cc8 (T16..T32),
+        # then FC2 372605d6.
+        (1, 3, 4, 5, 15, 16, 32),
+        SwiGLU(alpha=1.702, beta=1.0, limit=7.0),
+    ),
+    _GpuGeometry(
+        "e896_i3072_k16_situ",
+        3584,
+        3072,
+        896,
+        16,
+        # T3: sm100 finalize fc64115f.
+        (1, 2, 3, 32),
+        SiTU(gate_scale=4.0, linear_scale=25.0),
+    ),
+    # Sharded per-partition slices (fused route packing on every token count).
+    _GpuGeometry("h4096_e512_i512_k10", 4096, 512, 512, 10, (1, 2, 16, 32)),
+    _GpuGeometry("h4096_e512_i256_k10", 4096, 256, 512, 10, (1, 2, 16, 32)),
+    _GpuGeometry("h3072_e256_i768_k8", 3072, 768, 256, 8, (1, 2, 16, 32)),
+    # T8, T10: linear-grid FC2 cd21fb85 (T9 keeps the pool FC2 b0e329ce).
+    _GpuGeometry("h3072_e256_i384_k8", 3072, 384, 256, 8, (1, 2, 8, 9, 10, 16, 32)),
+)
+_GPU_ROWS = [
+    pytest.param(geometry, num_tokens, id=f"{geometry.name}-t{num_tokens:02d}")
+    for geometry in _GPU_GEOMETRIES
+    for num_tokens in geometry.token_counts
+]
+
+
+def _gpu_target() -> str:
+    if not torch.cuda.is_available():
+        pytest.skip("Cake warp decode GPU parity requires a CUDA device")
+    capability = torch.cuda.get_device_capability(torch.device("cuda"))
+    if capability not in TARGETS:
+        pytest.skip(
+            "Cake warp decode GPU parity requires exact SM100 or SM103, "
+            f"got SM{capability[0]}{capability[1]}"
+        )
+    return TARGETS[capability]
+
+
+@functools.lru_cache(maxsize=1)
+def _gpu_fixture(geometry_name: str) -> Fixture:
+    """Prepare one geometry with the shared harness, seeded by its matrix index.
+
+    One geometry is cached at a time: the largest geometry holds tens of GB of
+    expert weights, and the parity rows are ordered geometry-major.
+    """
+    index, geometry = next(
+        (index, geometry)
+        for index, geometry in enumerate(_GPU_GEOMETRIES)
+        if geometry.name == geometry_name
+    )
+    return prepare_fixture(geometry, _GPU_SEED + index)
+
+
+@pytest.mark.parametrize("geometry,num_tokens", _GPU_ROWS)
+def test_gpu_output_matches_public_nvfp4_reference(geometry, num_tokens):
+    target = _gpu_target()
+    device = torch.device("cuda")
+    fixture = _gpu_fixture(geometry.name)
+    module = cake_warp_decode_jit.get_cake_fused_moe_warp_decode_module(
+        target, device=device
+    )
+    output, workspace, receipt = prepare_launch(module, fixture, num_tokens)
+    try:
+        first = run_cake(
+            module, fixture, num_tokens, output, workspace, receipt
+        ).clone()
+        output.fill_(float("nan"))
+        second = run_cake(
+            module, fixture, num_tokens, output, workspace, receipt
+        ).clone()
+        torch.cuda.synchronize(device)
+    finally:
+        module.cake_fused_moe_warp_decode_release_workspace(receipt)
+
+    assert torch.isfinite(first.float()).all()
+    assert torch.equal(second, first), "repeated launch changed the output"
+    if geometry.has_public_reference:
+        expected = reference(fixture, num_tokens)
+        torch.cuda.synchronize(device)
+        assert_close(first, expected)

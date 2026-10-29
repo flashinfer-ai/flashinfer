@@ -8,7 +8,7 @@ cross-handle recv-buffer reuse, cache invalidation on dtype change and
 
 Everything runs on CPU tensors against the fake ``nccl.ep`` from
 ``conftest.py`` — the fake handle records calls instead of communicating, so
-no GPU or nccl4py wheel is needed.
+no GPU or nccl-extensions wheel is needed.
 """
 
 from __future__ import annotations
@@ -94,7 +94,7 @@ def test_wrap_never_caches_large_tensors(fake_nccl_ep, bypass_build_checks):
     assert key not in handle._hot
 
 
-def test_wrap_bounds_cache_size_by_clearing(fake_nccl_ep, bypass_build_checks):
+def test_wrap_bounds_cache_size_by_evicting_wrappers(fake_nccl_ep, bypass_build_checks):
     import torch
 
     handle = _make_handle(_make_fleet(fake_nccl_ep))
@@ -105,6 +105,41 @@ def test_wrap_bounds_cache_size_by_clearing(fake_nccl_ep, bypass_build_checks):
     # The bound is enforced by clearing, so the cache never grows unbounded
     # (a small overshoot past MAX_ENTRIES before the clear triggers is fine).
     assert len(handle._hot) <= handle._WRAP_MEMO_MAX_ENTRIES + 2
+
+
+@pytest.mark.parametrize("algo_name", ["LOW_LATENCY", "HIGH_THROUGHPUT"])
+def test_wrap_eviction_preserves_transport_buffers_and_configs(
+    fake_nccl_ep, bypass_build_checks, algo_name
+):
+    """Memo churn must not replace allocations an existing graph references."""
+    import weakref
+
+    import torch
+
+    from flashinfer.moe_ep.config import CombineInputParams, EpAlgorithm
+
+    fleet = _make_fleet(fake_nccl_ep, algorithm=EpAlgorithm[algo_name])
+    handle = _make_handle(fleet)
+    x = torch.zeros(16, 2048, dtype=torch.bfloat16)
+    first = _dispatch(handle, x)
+    handle.combine(CombineInputParams(x=[first.expert_tensors]))
+    dispatch_outputs = handle._dispatch_outputs
+    named_entries = {
+        key: value
+        for key, value in fleet._hot_cache.items()
+        if isinstance(key, str) or isinstance(key[0], str)
+    }
+    ephemeral = weakref.ref(handle._wrap(torch.zeros(1)))
+
+    for _ in range(handle._WRAP_MEMO_MAX_ENTRIES + 1):
+        handle._wrap(torch.zeros(1))
+
+    assert ephemeral() is None, "eviction must release old wrapper allocations"
+    for key, value in named_entries.items():
+        assert fleet._hot_cache.get(key) is value, f"eviction replaced {key!r}"
+    second = _dispatch(handle, x)
+    assert second.expert_tensors.data_ptr() == first.expert_tensors.data_ptr()
+    assert handle._dispatch_outputs is dispatch_outputs
 
 
 # ----------------------------------------------------- LL dispatch hot cache
@@ -187,6 +222,71 @@ def test_update_topology_clears_hot_cache(fake_nccl_ep, bypass_build_checks):
 
 
 # ------------------------------------------------------------------ combine
+
+
+@pytest.mark.parametrize("algo_name", ["LOW_LATENCY", "HIGH_THROUGHPUT"])
+@pytest.mark.parametrize("out_is_stable", [False, True])
+@pytest.mark.parametrize("provide_out", [False, True])
+def test_combine_caches_only_stable_caller_outputs(
+    fake_nccl_ep, bypass_build_checks, algo_name, out_is_stable, provide_out
+):
+    """Retain graph buffers, but never a fresh caller or backend allocation."""
+    import torch
+
+    from flashinfer.moe_ep.config import CombineInputParams, EpAlgorithm
+
+    fleet = _make_fleet(fake_nccl_ep, algorithm=EpAlgorithm[algo_name])
+    handle = _make_handle(fleet)
+    x = torch.zeros(16, 2048, dtype=torch.bfloat16)
+    dispatched = _dispatch(handle, x)
+    out = torch.empty_like(x) if provide_out else None
+    params = CombineInputParams(
+        x=[dispatched.expert_tensors], out=out, out_is_stable=out_is_stable
+    )
+
+    first = handle.combine(params).x
+    first_wrapper = handle._combine_outputs.tokens
+    second = handle.combine(params).x
+    second_wrapper = handle._combine_outputs.tokens
+
+    assert first_wrapper.buffer is first
+    assert second_wrapper.buffer is second
+    if provide_out:
+        assert first is second is out
+    else:
+        assert first is not second
+    should_cache = provide_out and out_is_stable
+    assert (first_wrapper is second_wrapper) == should_cache
+    for result in (first, second):
+        key = (result.data_ptr(), result.dtype, tuple(result.shape))
+        assert (key in fleet._hot_cache) == should_cache
+
+
+@pytest.mark.parametrize("algo_name", ["LOW_LATENCY", "HIGH_THROUGHPUT"])
+def test_combine_releases_eager_outputs_with_the_handle(
+    fake_nccl_ep, bypass_build_checks, algo_name
+):
+    """Fleet caching must not extend the lifetime of completed eager outputs."""
+    import weakref
+
+    import torch
+
+    from flashinfer.moe_ep.config import CombineInputParams, EpAlgorithm
+
+    fleet = _make_fleet(fake_nccl_ep, algorithm=EpAlgorithm[algo_name])
+    handle = _make_handle(fleet)
+    dispatched = _dispatch(handle, torch.zeros(16, 2048, dtype=torch.bfloat16))
+    refs = []
+    for _ in range(8):
+        result = handle.combine(CombineInputParams(x=[dispatched.expert_tensors]))
+        refs.append(weakref.ref(result.x))
+        # The recording transport otherwise holds every past call alive.
+        handle._handle.calls.clear()
+        del result
+    handle.destroy()
+    del handle
+
+    assert all(ref() is None for ref in refs)
 
 
 def test_ll_combine_requires_topk_weights(fake_nccl_ep, bypass_build_checks):

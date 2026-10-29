@@ -49,12 +49,16 @@ enum class ActType {
   GeGlu = 1,
   SiTuGlu = 2,
   None = 3,
+  // StepFun applies the gate cap after SiLU: clamp(up, -L, L) * min(silu(gate), L).
+  SwiGluStep = 4,
 };
 
 static_assert(static_cast<int>(ActType::SwiGlu) ==
               static_cast<int>(batchedGemm::gemmGatedAct::ActType::SwiGlu));
 static_assert(static_cast<int>(ActType::GeGlu) ==
               static_cast<int>(batchedGemm::gemmGatedAct::ActType::GeGlu));
+// SwiGluStep is value 4 in trtllm-gen export 7.0.5.0.4.0. The public 7.0.4
+// headers omit it; retain source compatibility until the new cubins are pinned.
 #ifndef TLLM_RUBIN_FEATURES
 // Historically the separate Rubin BMM pin predated SiTuGlu: its
 // gemmGatedAct::ActType was {SwiGlu, GeGlu, None} with None == 2, so these two
@@ -122,6 +126,9 @@ class TrtllmGenBatchedGemmRunner {
                                                int32_t configIndex) const;
 
   // Generic GEMM interface
+  // When validM/validN/validK are non-negative, they specify the valid (unpadded) region
+  // of the M/N/K dimensions for computation while the full m/n/k dimensions describe the
+  // padded tensor memory layout. If negative (default), they are set equal to m/n/k.
   void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
            int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim, void const* a,
            void const* sfA, void const* b, void const* sfB, void const* perTokensSfA,
@@ -131,7 +138,8 @@ class TrtllmGenBatchedGemmRunner {
            int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx,
            int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
            int32_t const* permutedIdxToBiasRowIdx, void* workspace, CUstream stream, int device,
-           int32_t configIndex, bool enable_pdl);
+           int32_t configIndex, bool enable_pdl, int32_t validM = -1, int32_t validN = -1,
+           int32_t validK = -1);
 
   // NVFP4 per-block scaling GEMM
   void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,

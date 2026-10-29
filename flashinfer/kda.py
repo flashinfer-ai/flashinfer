@@ -24,7 +24,8 @@ decode and speculative decode retain the backend exposed by
 ``flashinfer.kda_decode``.
 """
 
-import threading
+import functools
+import math
 from typing import Literal, Optional
 
 import torch
@@ -32,22 +33,133 @@ import torch
 from . import kda_decode as _kda_decode
 from . import kda_prefill as _kda_prefill
 from . import kda_prefill_cute as _kda_prefill_cute
-from .api_logging import flashinfer_api
-from .kda_backward import (
-    RecurrentKDABackwardWorkspace as RecurrentKDABackwardWorkspace,
-)
-from .kda_backward import recurrent_kda_backward as recurrent_kda_backward
-from .kda_training import (
-    RecurrentKDATrainingContext as RecurrentKDATrainingContext,
-)
-from .kda_training import (
-    recurrent_kda_training_backward as recurrent_kda_training_backward,
-)
-from .kda_training import (
-    recurrent_kda_training_forward as recurrent_kda_training_forward,
-)
+from . import kda_prefill_cute_small_bh as _kda_prefill_cute_small_bh
+from .api_logging import flashinfer_api, flashinfer_experimental_api
+from .cute_dsl.availability import is_cute_dsl_available
 from .trace.templates.kda import recurrent_kda_trace
 from .utils import get_compute_capability
+
+
+@functools.cache
+def _cudnn_kda_prefill_available() -> bool:
+    """Probe optional packages once; per-call eligibility stays with native KDA."""
+    from .cudnn.linear_attention import _linear_attention_auto_available
+
+    return _linear_attention_auto_available()
+
+
+def _select_kda_prefill_backend(q, initial_state, cu_seqlens, *, allow_cudnn=True):
+    """Choose a backend for single-sequence BF16 prefill on SM100/SM103.
+
+    The policy covers head dimension 128, 1K-64K tokens, and up to 96 local
+    heads. Few heads means 1-16, moderate means 17-64, and wide means 65-96.
+    K means 1024 tokens. The caller checks backend eligibility.
+
+    With FP32 state, few heads use cute-dsl below 4K and cuDNN from 4K.
+    Moderate heads use persistent below 4K and cuDNN from 4K, except that
+    SM103 keeps persistent from 8K to below 16K. Wide heads use persistent.
+    Moderate and wide FP32 cases require a head count divisible by eight.
+
+    With BF16 state, few heads use small-bh until cuDNN takes over at 4K
+    for up to eight heads, or 8K for 9-16 heads. Moderate heads use small-bh.
+    Wide heads use cuDNN.
+
+    When cuDNN is disallowed, use the corresponding native backend:
+    cute-dsl or persistent for FP32, and small-bh or Cake for BF16.
+    Return None outside this region to retain the existing policy.
+    """
+    if not (
+        q.is_cuda
+        and q.dtype == torch.bfloat16
+        and len(q.shape) == 4
+        and q.shape[0] == 1
+        and q.shape[-1] == 128
+        and 1 <= q.shape[2] <= 96
+        and 1024 <= q.shape[1] <= 65536
+        and cu_seqlens is not None
+        and cu_seqlens.numel() == 2
+        and initial_state is not None
+        and initial_state.dtype in (torch.bfloat16, torch.float32)
+        and not initial_state.requires_grad
+        and (not initial_state.is_inference() or torch.is_inference_mode_enabled())
+    ):
+        return None
+    cc = get_compute_capability(q.device)
+    if cc not in ((10, 0), (10, 3)):
+        return None
+    tokens, heads = q.shape[1:3]
+    if initial_state.dtype == torch.float32:
+        if heads <= 16:
+            return "cudnn" if allow_cudnn and tokens >= 4096 else "cute-dsl"
+        if heads % 8:
+            return None
+        # PTX beats cuDNN by >10% in the SM103 8K bucket. Keep PTX explicit:
+        # its bounded-state contract is narrower than the native auto contract.
+        ptx_region = cc == (10, 3) and 8192 <= tokens < 16384
+        if allow_cudnn and heads <= 64 and tokens >= 4096 and not ptx_region:
+            return "cudnn"
+        return "cute-dsl-persistent"
+    if heads <= 16:
+        threshold = 4096 if heads <= 8 else 8192
+        return "cudnn" if allow_cudnn and tokens >= threshold else "small-bh"
+    if heads <= 64:
+        return "small-bh"
+    return "cudnn" if allow_cudnn else "cake"
+
+
+def _prefer_cudnn_kda_prefill(q, initial_state, cu_seqlens) -> bool:
+    return _select_kda_prefill_backend(q, initial_state, cu_seqlens) == "cudnn"
+
+
+def _try_cudnn_kda_prefill(
+    *,
+    q,
+    k,
+    v,
+    g,
+    beta,
+    A_log,
+    dt_bias,
+    scale,
+    initial_state,
+    output_final_state,
+    lower_bound,
+    cu_seqlens,
+    output,
+):
+    """Substitute an eligible native prefill without changing its math or aliases."""
+    from .cudnn import cudnn_recurrent_kda
+    from .cudnn.linear_attention import _try_cudnn_auto
+
+    # Keep native alias checks before either cuDNN execution or cached fallback.
+    _kda_prefill._check_output_does_not_overlap_inputs(
+        output, q=q, k=k, v=v, g=g, beta=beta, initial_state=initial_state
+    )
+    if scale is not None:
+        scale = float(scale)
+        if not math.isfinite(scale):
+            raise ValueError(f"scale must be finite, got {scale}")
+    # FE graph attributes are scalar values, not tensor-layout cache entries.
+    lower_bound = float(lower_bound) if lower_bound is not None else None
+    return _try_cudnn_auto(
+        cudnn_recurrent_kda,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        lower_bound=lower_bound,
+        cu_seqlens=cu_seqlens,
+        beta_is_logit=True,
+        output=output,
+    )
 
 
 @flashinfer_api(trace=recurrent_kda_trace)
@@ -78,8 +190,21 @@ def recurrent_kda(
     state_checkpoints: Optional[torch.Tensor] = None,
     checkpoint_cu_starts: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
+    checkpoint_state_indices: Optional[torch.Tensor] = None,
     *,
-    backend: Literal["auto", "cute-dsl", "cake"] = "auto",
+    disable_state_update: bool = False,
+    correction_cache: Optional[torch.Tensor] = None,
+    kg_cache: Optional[torch.Tensor] = None,
+    backend: Literal[
+        "auto",
+        "cute-dsl",
+        "cute-dsl-persistent",
+        "tirx",
+        "ptx",
+        "cake",
+        "small-bh",
+        "cudnn",
+    ] = "auto",
 ) -> (
     tuple[torch.Tensor, Optional[torch.Tensor]]
     | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
@@ -95,10 +220,15 @@ def recurrent_kda(
     can use either the frozen Cake schedules or the source-level CuTe DSL BT=16
     kernel. The Cake backend includes a generated two-stage BT=16
     prepare/chain portfolio with device- and shape-specific S7/S8/S9 pipeline
-    selection. ``backend="auto"`` prefers CuTe DSL for supported plain prefill
-    contracts and keeps Cake as the feature-complete fallback; use
+    selection. ``backend="auto"`` selects between CuTe DSL and cuDNN for supported
+    plain prefill contracts and keeps Cake as the feature-complete fallback; use
     ``backend="cake"`` to select and benchmark the generated portfolio
-    explicitly.
+    explicitly, and ``backend="cudnn"`` to run cuDNN's fused SM100 engine.
+    Automatic cuDNN selection preserves the native route's Q/K normalization
+    formula and requires cuDNN frontend 1.31 GA and CuTe DSL 4.7 or newer.
+    Automatic cuDNN selection may ignore a valid ``seq_order`` scheduling hint.
+    Passing ``prefill_workspace`` retains the native provider, including captured
+    calls that use a native workspace.
     Compatible equal-head D128 unbounded-softplus T=1 decode calls use their
     frozen Cake specialization automatically. The Cake path accepts any
     positive runtime head count, so Kimi-Linear tensor parallelism maps global
@@ -110,7 +240,9 @@ def recurrent_kda(
             Query of shape ``[B, T, H, K]``, or
             ``[1, total_tokens, H, K]`` when using ``cu_seqlens``. Must be
             bfloat16. ``T=1`` selects decode; eligible ``T>1`` calls may select
-            the frozen prefill backend.
+            the frozen prefill backend. Ordinary prefill accepts strided Q/K:
+            dense-only providers pack them internally, while cuDNN retains
+            supported strides. Other inputs keep their layout requirements.
         k (torch.Tensor):
             Key with the same shape as ``q``. Must be bfloat16.
         v (torch.Tensor):
@@ -137,13 +269,15 @@ def recurrent_kda(
         scale (Optional[float]):
             Scale factor for queries. If ``None``, defaults to ``1 / sqrt(K)``.
         initial_state (Optional[torch.Tensor]):
-            Initial state of shape ``[N, HV, V, K]``. Must be bfloat16.
-            If ``None``, zero-initialized. Updated in-place. For batched spec
-            decode without ``cu_seqlens``, ``N`` is the packed checkpoint-slot
-            count ``B * (1 + num_spec_tokens)`` when ``ssm_state_indices`` is
-            omitted. For eligible frozen prefill with ``ssm_state_indices``,
-            this is a state pool ``[N_pool, H, 128, 128]`` whose inner slots
-            are contiguous; padding between pool slots is allowed.
+            Initial state of shape ``[N, HV, V, K]``. Eligible prefill
+            backends accept bfloat16 or float32; other modes may be stricter.
+            If ``None``, zero-initialized. Updated in-place. For
+            batched spec decode without ``cu_seqlens``, ``N`` is the packed
+            checkpoint-slot count ``B * (1 + num_spec_tokens)`` when
+            ``ssm_state_indices`` is omitted. For eligible frozen prefill with
+            ``ssm_state_indices``, this is a state pool
+            ``[N_pool, H, 128, 128]`` whose inner slots are contiguous;
+            padding between pool slots is allowed.
         output_final_state (bool):
             Whether to return the final state. Default: ``False``.
         use_qk_l2norm_in_kernel (bool):
@@ -162,14 +296,14 @@ def recurrent_kda(
             int64 outside graph capture; graph capture requires caller-provided
             int64 offsets. For frozen prefill, values must start at zero, be
             non-decreasing, and end at the total token count. This value
-            contract is not normally host-validated. Eager calls without an
-            explicit workspace or ``seq_order`` read these values once per
-            unchanged offsets tensor to schedule longer sequences first on
-            Cake. Eager packed CuTe DSL engine calls also cache a
-            longest-sequence-first order; CuTe DSL decomp calls retain the
-            original order because their CTA grid fits in one wave. Eligible
-            148-SM B200 and 152-SM GB200 Cake calls additionally cache
-            persistent worker task bins.
+            contract is not normally host-validated. Cake may read these values
+            to prepare and cache host scheduling metadata. CuTe DSL generates
+            packed sequence ordering on the device and can generate decomposed
+            chunk metadata there when using
+            :class:`RecurrentKDAPrefillWrapper`. Small-BH prefill caches the
+            maximum sequence length. Eligible 148-SM B200 and
+            152-SM GB200 Cake calls additionally cache persistent worker task
+            bins.
         ssm_state_indices (Optional[torch.Tensor]):
             State cache indices. Shape ``[N]`` int32 for standard decode, or
             ``[N, 1+S]`` int32 for spec decode (``num_spec_tokens`` must also
@@ -199,58 +333,114 @@ def recurrent_kda(
             with ``initial_state_source``.
         beta_is_logit (bool):
             If ``True``, apply sigmoid to ``beta`` inside the recurrent kernel.
+        disable_state_update (bool):
+            Frozen / speculative-verify mode: compute outputs for up to 16
+            tokens per sequence from the committed state and never write any
+            state back (``final_state`` is ``None``). See
+            :func:`flashinfer.kda_decode.recurrent_kda` for the full mode
+            contract, including the optional slot-indexed
+            ``correction_cache`` / ``kg_cache`` verify outputs.
+        correction_cache (Optional[torch.Tensor]):
+            Frozen-verify only: slot-indexed float32 per-token delta-rule
+            corrections ``[num_slots, HV, T_max, V]``.
+        kg_cache (Optional[torch.Tensor]):
+            Frozen-verify only: slot-indexed bf16 (raw key | raw gate)
+            cache ``[num_slots, HV, T_max, 2*K]``.
         seq_order (Optional[torch.Tensor]):
             Optional packed-prefill sequence order, as a contiguous CUDA int32
-            permutation of shape ``[N]``. For eager CuTe DSL packed engine
-            calls, omitting it builds and caches a longest-sequence-first order;
-            CuTe DSL decomp keeps the original order because its CTA grid fits
-            in one wave. CUDA Graph capture of a packed CuTe DSL engine call
-            requires an explicit plan prepared with
-            :class:`RecurrentKDAPrefillWrapper`. Cake constructs and caches its
-            own eager host metadata. On Cake, supplying an order disables
-            persistent host task-bin planning but does not force direct M128;
-            the selected non-persistent route may still be BT16 prepare/chain,
-            M64, small-BH, or direct according to the input shape.
+            permutation of shape ``[N]``. CuTe DSL packed engine calls generate
+            a stable longest-sequence-first order on the device when this is
+            omitted; CuTe DSL decomp keeps the original order unless the graph
+            wrapper requests device-generated metadata. Cake constructs and
+            caches its own eager host metadata. On Cake, supplying an order
+            disables persistent host task-bin planning but does not force direct
+            M128; the selected non-persistent route may still be BT16
+            prepare/chain, M64, small-BH, or direct according to the input shape.
+            Automatic cuDNN selection validates this scheduling hint through the
+            native eligibility checks and may ignore it; output sequence order
+            is unchanged.
             Fixed-layout prefill and decode calls must leave it as ``None``.
         prefill_workspace (Optional[RecurrentKDAPrefillWorkspace]):
             Caller-owned workspace for SM100-family and SM120 prefill backends.
-            It is optional for eager execution and required for CUDA graph
-            capture. Warm it eagerly with the exact tensors on the capture
+            It is optional for eager execution and required for native CUDA
+            graph capture. Auto-selected cuDNN leaves it unused and manages
+            its own scratch buffers. Native fallback uses the supplied workspace.
+            Warm the selected backend with the exact tensors on the capture
             stream before capture. Use one workspace per captured
-            ``recurrent_kda`` invocation. Explicit workspaces and CUDA Graph
-            capture use non-persistent schedules, including eligible BT16,
-            M64, small-BH, and direct routes. Persistent task planning is an
-            eager-only B200/GB200 route because its bins depend on host-visible
-            sequence lengths.
+            ``recurrent_kda`` invocation. Cake's persistent task planning is
+            eager-only because its bins depend on host-visible sequence lengths.
         state_checkpoints (Optional[torch.Tensor]):
-            Caller-owned BF16 checkpoint output ``[C, H, 128, 128]`` for
-            frozen prefill. Row zero for each sequence is its initial state;
-            later rows are the states before token blocks beginning at
-            ``N, 2N, ...``. ``C`` must be at least
-            ``checkpoint_cu_starts[N_seq]``; this capacity contract is not
-            host-validated. Required when ``checkpoint_every_n_tokens > 0``.
+            Checkpoint output or pool ``[C, H, 128, 128]`` for prefill. CuTe DSL
+            accepts BF16 or FP32 and requires it to match ``initial_state`` when
+            present; Cake accepts BF16. Without ``checkpoint_state_indices``,
+            row zero for each sequence is its initial state and later rows are
+            states before token blocks beginning at ``N, 2N, ...``. CuTe DSL
+            allocates this packed output during eager execution when omitted;
+            CUDA graph capture requires a caller-owned tensor.
         checkpoint_cu_starts (Optional[torch.Tensor]):
             Contiguous CUDA int64 cumulative checkpoint counts ``[N_seq+1]``.
-            The first value must be zero, and each consecutive difference must
-            equal ``ceil(seq_len / checkpoint_every_n_tokens)`` for that
-            sequence.
+            The first value must be zero. Without ``checkpoint_state_indices``,
+            each difference is ``ceil(seq_len / N)``. With indices, each
+            difference is ``floor(seq_len / N)`` and counts completed periodic
+            boundaries, including an aligned final boundary and excluding the
+            initial state.
+        checkpoint_state_indices (Optional[torch.Tensor]):
+            CuTe DSL-only contiguous CUDA int32 destination rows. Entry ``i``
+            selects the row of the ``state_checkpoints`` pool written for packed
+            completed-boundary entry ``i``. The kernel writes the pool directly;
+            no temporary checkpoint tensor or scatter is used.
         checkpoint_every_n_tokens (int):
             Checkpoint interval. Zero disables checkpoints; a positive value
             must be divisible by 32, except that the SM100-family exact-N16
             frozen route also accepts multiples of 16. SGLang normally uses
             64 or a larger cache-page-aligned multiple.
-        backend (Literal["auto", "cute-dsl", "cake"]):
-            Implementation backend. ``"auto"`` selects the architecture-
-            appropriate CuTe DSL kernel for supported ordinary multi-token
-            prefill, including the SM120 backend and SM100-family state
-            checkpoints, and otherwise falls back to an exported frozen Cake
-            specialization.
-            ``"cake"`` and ``"cute-dsl"`` select those backends strictly. The
-            Cake prefill path chooses among direct, persistent, small-BH, and
-            two-stage BT16 schedules from the input shape and physical device.
-            The SM100-family kernel additionally needs
-            ``nvidia-cutlass-dsl>=4.7``; below that ``"auto"`` uses Cake there
-            and ``"cute-dsl"`` raises :class:`ImportError`.
+        backend (Literal["auto", "cute-dsl", "cute-dsl-persistent", "tirx", "ptx", "cake", "small-bh", "cudnn"]):
+            Implementation backend. ``"cute-dsl-persistent"`` explicitly selects
+            the SM100/SM103 persistent prefill kernel with contiguous BF16
+            inputs, D128, heads divisible by eight, FP32 state, fused Q/K
+            normalization and beta sigmoid, and a gate bound in [-5, 0).
+            Packed sequences must be nonempty. Graph capture requires an
+            explicit workspace and output, warmed with the exact tensors;
+            sequence offsets must remain fixed throughout replay.
+            ``"tirx"`` explicitly selects the optional SM100/SM103 TIRx prefill
+            kernels for contiguous BF16 inputs, D128, heads divisible by eight,
+            FP32 state, fused Q/K normalization, beta sigmoid and a gate bound
+            in [-5, 0). Requires CUDA-enabled TVM with TIRx and
+            ``tirx_kernels.tirx_lite``. Capture requires an explicit workspace
+            and output warmed with the exact buffers.
+            ``"ptx"`` selects the static SM103a prefill
+            kernels: contiguous BF16 B=1, T>=32, H64/H96, D128; fused Q/K normalization,
+            gate and beta sigmoid, ``lower_bound=-5.0``; FP32 V-first state.
+            Sequence lengths must be positive and at most 16384. Initial state
+            must remain finite with absolute values <= 4096, including graph
+            replays. Requires ptxas >= 13.2 and TVM FFI. Capture requires a
+            caller-owned warmed workspace and output; packed offsets must stay
+            unchanged during capture/replay. See ``docs/api/kda.rst``.
+            ``"auto"`` selects the bundled small-BH
+            CuTe DSL kernel for eligible SM100-family calls whose logical batch
+            size times head count does not exceed half the device's SM count. It
+            selects other architecture-appropriate CuTe DSL kernels for
+            supported ordinary multi-token prefill, including the SM120
+            backend and SM100-family state checkpoints, and otherwise falls
+            back to an exported frozen Cake specialization.
+            ``"cake"``, ``"small-bh"``, and ``"cute-dsl"`` select those backends
+            strictly. The Cake prefill path chooses among direct, persistent,
+            small-BH, and two-stage BT16 schedules from the input shape and
+            physical device. ``"small-bh"`` selects the small-BH CuTe DSL KDA
+            prefill kernel. The SM100-family CuTe DSL kernels (not including
+            small-BH) additionally need ``nvidia-cutlass-dsl>=4.7``; below that
+            ``"auto"`` uses Cake there and an explicitly selected CuTe backend
+            raises :class:`ImportError`.
+            ``"cudnn"`` runs cuDNN's fused SM100 linear-attention engine
+            through :func:`flashinfer.cudnn.cudnn_recurrent_kda`, and raises
+            ``NotImplementedError`` carrying the reason when that engine cannot
+            serve the call. It covers
+            ordinary multi-token prefill only: no speculative decode, no
+            ``initial_state_source``, no state checkpoints. With a cuDNN frontend
+            supporting state pools, ``ssm_state_indices`` reads and updates the
+            selected slots of ``initial_state`` in place. ``output_final_state``
+            returns that pool, not a gathered per-sequence copy. State-pool calls
+            are not automatically selected for cuDNN.
 
     Returns:
         Tuple of ``(output, final_state)`` where ``final_state`` is ``None``
@@ -263,15 +453,418 @@ def recurrent_kda(
         prefill_workspace, _kda_prefill.RecurrentKDAPrefillWorkspace
     ):
         raise TypeError("prefill_workspace must be a RecurrentKDAPrefillWorkspace")
-    if backend not in ("auto", "cute-dsl", "cake"):
+    if backend not in (
+        "auto",
+        "cute-dsl",
+        "cute-dsl-persistent",
+        "tirx",
+        "ptx",
+        "cake",
+        "small-bh",
+        "cudnn",
+    ):
         raise ValueError(
-            f"backend must be 'auto', 'cute-dsl', or 'cake', got {backend!r}"
+            "backend must be 'auto', 'cute-dsl', 'cute-dsl-persistent', 'tirx', 'ptx', 'cake', 'small-bh', or 'cudnn', "
+            f"got {backend!r}"
         )
+    if backend == "cute-dsl-persistent":
+        from .kda_prefill_persistent import _run_persistent_kda
+
+        unsupported = [
+            name
+            for name, requested in (
+                ("ssm_state_indices", ssm_state_indices is not None),
+                ("num_spec_tokens", num_spec_tokens is not None),
+                ("num_accepted_tokens", num_accepted_tokens is not None),
+                ("initial_state_source", initial_state_source is not None),
+                ("initial_state_indices", initial_state_indices is not None),
+                ("seq_order", seq_order is not None),
+                ("state_checkpoints", state_checkpoints is not None),
+                ("checkpoint_cu_starts", checkpoint_cu_starts is not None),
+                ("checkpoint_state_indices", checkpoint_state_indices is not None),
+                ("checkpoint_every_n_tokens", checkpoint_every_n_tokens != 0),
+                ("disable_state_update", disable_state_update),
+                ("correction_cache", correction_cache is not None),
+                ("kg_cache", kg_cache is not None),
+            )
+            if requested
+        ]
+        if unsupported:
+            raise NotImplementedError(
+                "backend='cute-dsl-persistent' does not support "
+                + ", ".join(unsupported)
+            )
+        return _run_persistent_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            beta_is_logit=beta_is_logit,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            output=output,
+            prefill_workspace=prefill_workspace,
+        )
+    if backend == "tirx":
+        from .kda_prefill_tirx import _run_tirx_kda
+
+        unsupported = [
+            name
+            for name, requested in (
+                ("ssm_state_indices", ssm_state_indices is not None),
+                ("num_spec_tokens", num_spec_tokens is not None),
+                ("num_accepted_tokens", num_accepted_tokens is not None),
+                ("initial_state_source", initial_state_source is not None),
+                ("initial_state_indices", initial_state_indices is not None),
+                ("seq_order", seq_order is not None),
+                ("state_checkpoints", state_checkpoints is not None),
+                ("checkpoint_cu_starts", checkpoint_cu_starts is not None),
+                ("checkpoint_state_indices", checkpoint_state_indices is not None),
+                ("checkpoint_every_n_tokens", checkpoint_every_n_tokens != 0),
+                ("disable_state_update", disable_state_update),
+                ("correction_cache", correction_cache is not None),
+                ("kg_cache", kg_cache is not None),
+            )
+            if requested
+        ]
+        if unsupported:
+            raise NotImplementedError(
+                "backend='tirx' does not support " + ", ".join(unsupported)
+            )
+        return _run_tirx_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            beta_is_logit=beta_is_logit,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            output=output,
+            prefill_workspace=prefill_workspace,
+        )
+    if backend == "ptx":
+        from .kda_prefill_ptx import _run_ptx_kda
+
+        unsupported = [
+            name
+            for name, requested in (
+                ("ssm_state_indices", ssm_state_indices is not None),
+                ("num_spec_tokens", num_spec_tokens is not None),
+                ("num_accepted_tokens", num_accepted_tokens is not None),
+                ("initial_state_source", initial_state_source is not None),
+                ("initial_state_indices", initial_state_indices is not None),
+                ("seq_order", seq_order is not None),
+                ("state_checkpoints", state_checkpoints is not None),
+                ("checkpoint_cu_starts", checkpoint_cu_starts is not None),
+                ("checkpoint_state_indices", checkpoint_state_indices is not None),
+                ("checkpoint_every_n_tokens", checkpoint_every_n_tokens != 0),
+                ("disable_state_update", disable_state_update),
+                ("correction_cache", correction_cache is not None),
+                ("kg_cache", kg_cache is not None),
+            )
+            if requested
+        ]
+        if unsupported:
+            raise NotImplementedError(
+                "backend='ptx' does not support " + ", ".join(unsupported)
+            )
+        return _run_ptx_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            beta_is_logit=beta_is_logit,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            output=output,
+            prefill_workspace=prefill_workspace,
+        )
+    if backend == "cudnn":
+        from .cudnn import cudnn_recurrent_kda
+
+        unsupported = [
+            name
+            for name, requested in (
+                ("num_spec_tokens", num_spec_tokens is not None),
+                ("num_accepted_tokens", num_accepted_tokens is not None),
+                ("initial_state_source", initial_state_source is not None),
+                ("initial_state_indices", initial_state_indices is not None),
+                ("seq_order", seq_order is not None),
+                ("prefill_workspace", prefill_workspace is not None),
+                ("state_checkpoints", state_checkpoints is not None),
+                ("checkpoint_cu_starts", checkpoint_cu_starts is not None),
+                ("checkpoint_every_n_tokens", checkpoint_every_n_tokens != 0),
+                ("checkpoint_state_indices", checkpoint_state_indices is not None),
+                ("disable_state_update", disable_state_update),
+                ("correction_cache", correction_cache is not None),
+                ("kg_cache", kg_cache is not None),
+            )
+            if requested
+        ]
+        if unsupported:
+            raise NotImplementedError(
+                'recurrent_kda(backend="cudnn") does not support '
+                + ", ".join(unsupported)
+            )
+        if (
+            ssm_state_indices is not None
+            and not _kda_prefill._is_plain_multi_token_prefill(
+                q, cu_seqlens, num_spec_tokens
+            )
+        ):
+            raise NotImplementedError(
+                'recurrent_kda(backend="cudnn") state pools require ordinary multi-token prefill'
+            )
+        return cudnn_recurrent_kda(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            beta_is_logit=beta_is_logit,
+            output=output,
+            state_indices=ssm_state_indices,
+        )
+    if checkpoint_state_indices is not None and backend == "cake":
+        raise ValueError("checkpoint_state_indices is supported only by CuTe DSL")
+
+    if (correction_cache is not None or kg_cache is not None) and (
+        not disable_state_update
+    ):
+        raise ValueError(
+            "correction_cache/kg_cache are speculative-verify caches and "
+            "require disable_state_update=True"
+        )
+    if disable_state_update:
+        # Frozen / speculative-verify mode (mirrors GDN's
+        # gated_delta_rule_mtp flag): outputs only, no state writes,
+        # optional slot-indexed correction/kg caches. Handled ahead of the
+        # prefill routing — none of the prefill-only features apply.
+        if backend == "small-bh":
+            raise ValueError(
+                f"backend={backend!r} has no frozen-state kernels; "
+                "disable_state_update=True requires the CuTe-DSL backends"
+            )
+        if (
+            seq_order is not None
+            or prefill_workspace is not None
+            or state_checkpoints is not None
+            or checkpoint_cu_starts is not None
+            or checkpoint_state_indices is not None
+            or checkpoint_every_n_tokens != 0
+        ):
+            raise ValueError(
+                "prefill-only arguments are incompatible with disable_state_update=True"
+            )
+        return _kda_decode._dispatch_recurrent_kda_decode(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=ssm_state_indices,
+            num_spec_tokens=num_spec_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+            output=output,
+            initial_state_source=initial_state_source,
+            initial_state_indices=initial_state_indices,
+            beta_is_logit=beta_is_logit,
+            disable_state_update=disable_state_update,
+            correction_cache=correction_cache,
+            kg_cache=kg_cache,
+            backend=backend,
+        )
+
+    is_plain_prefill = _kda_prefill._is_plain_multi_token_prefill(
+        q, cu_seqlens, num_spec_tokens
+    )
+    # Backend eligibility below still validates math and tensor metadata.
+    auto_prefill = (
+        backend == "auto"
+        and is_plain_prefill
+        and cu_seqlens is not None
+        and q.is_contiguous()
+        and isinstance(k, torch.Tensor)
+        and k.is_contiguous()
+        and ssm_state_indices is None
+        and initial_state_source is None
+        and initial_state_indices is None
+        and num_accepted_tokens is None
+        and state_checkpoints is None
+        and checkpoint_cu_starts is None
+        and checkpoint_state_indices is None
+        and checkpoint_every_n_tokens == 0
+        and (
+            initial_state is None
+            or (
+                isinstance(initial_state, torch.Tensor)
+                and initial_state.is_contiguous()
+            )
+        )
+        and isinstance(g, torch.Tensor)
+        and g.shape == q.shape
+        and isinstance(beta, torch.Tensor)
+        and beta.shape == q.shape[:-1]
+    )
+    cudnn_auto = (
+        auto_prefill
+        and _prefer_cudnn_kda_prefill(q, initial_state, cu_seqlens)
+        and _cudnn_kda_prefill_available()
+    )
+    original_q, original_k = q, k
+    if (
+        is_plain_prefill
+        and isinstance(k, torch.Tensor)
+        and (not q.is_contiguous() or not k.is_contiguous())
+    ):
+        # Validate original storage before packing can hide an output alias.
+        if output is not None:
+            _kda_prefill._check_output_does_not_overlap_inputs(
+                output,
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+            )
+        q, k = q.contiguous(), k.contiguous()
+    if backend in ("auto", "small-bh"):
+        small_bh_available = (
+            is_cute_dsl_available()
+            if backend == "small-bh" or is_plain_prefill
+            else False
+        )
+        if backend == "small-bh" and not small_bh_available:
+            raise ImportError(
+                "backend='small-bh' requires the optional CuTe DSL runtime; "
+                "install the appropriate FlashInfer CUDA extra"
+            )
+        eligible = (
+            small_bh_available
+            and is_plain_prefill
+            and checkpoint_state_indices is None
+            and _kda_prefill_cute_small_bh._is_kda_prefill_cute_small_bh_eligible(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                initial_state=initial_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                use_gate_in_kernel=use_gate_in_kernel,
+                lower_bound=lower_bound,
+                cu_seqlens=cu_seqlens,
+                seq_order=seq_order,
+                ssm_state_indices=ssm_state_indices,
+                num_spec_tokens=num_spec_tokens,
+                num_accepted_tokens=num_accepted_tokens,
+                output=output,
+                initial_state_source=initial_state_source,
+                initial_state_indices=initial_state_indices,
+                beta_is_logit=beta_is_logit,
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=checkpoint_cu_starts,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            )
+        )
+        if backend == "small-bh" and not eligible:
+            raise ValueError(
+                "backend='small-bh' does not support this recurrent_kda prefill contract"
+            )
+        use_small_bh = backend == "small-bh"
+        if eligible and backend == "auto":
+            batch_size = q.shape[0] if cu_seqlens is None else cu_seqlens.numel() - 1
+            use_small_bh = (
+                2 * batch_size * q.shape[2]
+                <= torch.cuda.get_device_properties(q.device).multi_processor_count
+            )
+        if eligible and use_small_bh:
+            assert A_log is not None
+            assert dt_bias is not None
+            if cudnn_auto:
+                result = _try_cudnn_kda_prefill(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    scale=scale,
+                    initial_state=initial_state,
+                    output_final_state=output_final_state,
+                    lower_bound=lower_bound,
+                    cu_seqlens=cu_seqlens,
+                    output=output,
+                )
+                if result is not None:
+                    return result
+            return _kda_prefill_cute_small_bh._run_kda_prefill_cute_small_bh(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                lower_bound=lower_bound,
+                cu_seqlens=cu_seqlens,
+                output=output,
+                prefill_workspace=prefill_workspace,
+            )
 
     # SM120 is an architecture-specific CuTe DSL implementation. Try it before
     # the SM100-family CuTe DSL path, whose eligibility check rejects SM120.
     sm120_rejection: Optional[str] = None
-    if backend in ("auto", "cute-dsl"):
+    if backend in ("auto", "cute-dsl") and checkpoint_state_indices is None:
         sm120_prefill_kwargs = dict(
             q=q,
             k=k,
@@ -333,9 +926,6 @@ def recurrent_kda(
                 **sm120_prefill_kwargs
             )
 
-    is_plain_prefill = _kda_prefill._is_plain_multi_token_prefill(
-        q, cu_seqlens, num_spec_tokens
-    )
     try_cute_dsl_prefill = backend in ("auto", "cute-dsl")
     if try_cute_dsl_prefill and is_plain_prefill:
         cute_dsl_eligible = _kda_prefill_cute._is_cute_dsl_kda_prefill_eligible(
@@ -361,6 +951,7 @@ def recurrent_kda(
             beta_is_logit=beta_is_logit,
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_state_indices=checkpoint_state_indices,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         )
         if backend == "cute-dsl" and not cute_dsl_eligible:
@@ -381,30 +972,105 @@ def recurrent_kda(
             assert A_log is not None
             assert dt_bias is not None
             assert lower_bound is not None
-            return _kda_prefill_cute._run_cute_dsl_kda_prefill(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                scale=scale,
-                initial_state=initial_state,
-                output_final_state=output_final_state,
-                lower_bound=lower_bound,
-                cu_seqlens=cu_seqlens,
-                seq_order=seq_order,
-                output=output,
-                prefill_workspace=prefill_workspace,
-                state_indices=ssm_state_indices,
-                state_checkpoints=state_checkpoints,
-                checkpoint_cu_starts=checkpoint_cu_starts,
-                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            if cudnn_auto:
+                result = _try_cudnn_kda_prefill(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    scale=scale,
+                    initial_state=initial_state,
+                    output_final_state=output_final_state,
+                    lower_bound=lower_bound,
+                    cu_seqlens=cu_seqlens,
+                    output=output,
+                )
+                if result is not None:
+                    return result
+            # cuDNN was skipped or declined; select a native fallback.
+            native_backend = (
+                _select_kda_prefill_backend(
+                    q, initial_state, cu_seqlens, allow_cudnn=False
+                )
+                if auto_prefill
+                and seq_order is None
+                and correction_cache is None
+                and kg_cache is None
+                else None
             )
+            if (
+                native_backend == "cute-dsl-persistent"
+                and -5.0 <= float(lower_bound) < 0.0
+                and q.shape[2]
+                <= torch.cuda.get_device_properties(q.device).multi_processor_count
+                and all(
+                    tensor.data_ptr() % 16 == 0
+                    for tensor in (q, k, v, g, beta, A_log, dt_bias)
+                )
+                and initial_state.data_ptr() % 32 == 0
+                and (output is None or output.data_ptr() % 16 == 0)
+            ):
+                # One sequence with H <= SM count cannot need inter-CTA handoffs.
+                from .kda_prefill_persistent import _run_persistent_kda
+
+                return _run_persistent_kda(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    scale=scale,
+                    initial_state=initial_state,
+                    output_final_state=output_final_state,
+                    use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                    use_gate_in_kernel=use_gate_in_kernel,
+                    beta_is_logit=beta_is_logit,
+                    lower_bound=lower_bound,
+                    cu_seqlens=cu_seqlens,
+                    output=output,
+                    prefill_workspace=prefill_workspace,
+                )
+            if native_backend != "cake":
+                return _kda_prefill_cute._run_cute_dsl_kda_prefill(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    scale=scale,
+                    initial_state=initial_state,
+                    output_final_state=output_final_state,
+                    lower_bound=lower_bound,
+                    cu_seqlens=cu_seqlens,
+                    seq_order=seq_order,
+                    output=output,
+                    prefill_workspace=prefill_workspace,
+                    state_indices=ssm_state_indices,
+                    state_checkpoints=state_checkpoints,
+                    checkpoint_cu_starts=checkpoint_cu_starts,
+                    checkpoint_state_indices=checkpoint_state_indices,
+                    checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                )
 
     use_flash_kda_prefill = (
-        backend != "cute-dsl"
+        not (
+            isinstance(initial_state, torch.Tensor)
+            and initial_state.dtype == torch.float32
+            and (
+                checkpoint_every_n_tokens != 0
+                or state_checkpoints is not None
+                or checkpoint_cu_starts is not None
+            )
+        )
+        and backend != "cute-dsl"
+        and checkpoint_state_indices is None
         and _kda_prefill._flash_kda_prefill_is_eligible(
             q=q,
             k=k,
@@ -430,6 +1096,18 @@ def recurrent_kda(
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         )
     )
+    if (
+        backend in ("auto", "cake")
+        and is_plain_prefill
+        and isinstance(initial_state, torch.Tensor)
+        and initial_state.dtype == torch.float32
+        and (
+            checkpoint_every_n_tokens != 0
+            or state_checkpoints is not None
+            or checkpoint_cu_starts is not None
+        )
+    ):
+        raise ValueError("FP32 state checkpoints are not supported by Cake prefill")
     if use_flash_kda_prefill:
         assert A_log is not None
         assert dt_bias is not None
@@ -464,6 +1142,7 @@ def recurrent_kda(
         checkpoint_every_n_tokens != 0
         or state_checkpoints is not None
         or checkpoint_cu_starts is not None
+        or checkpoint_state_indices is not None
     ):
         raise ValueError(
             "state checkpoints are supported only by eligible frozen "
@@ -480,12 +1159,11 @@ def recurrent_kda(
             "seq_order is only supported by eligible packed ordinary "
             "SM100-family prefill"
         )
-    if _kda_decode._run_recurrent_kda is None:
-        raise NotImplementedError("recurrent KDA backend is unavailable")
-
-    return _kda_decode._run_recurrent_kda(
-        q=q,
-        k=k,
+    # An explicit small-BH request either returned or raised in prefill dispatch.
+    assert backend != "small-bh"
+    return _kda_decode._dispatch_recurrent_kda_decode(
+        q=original_q,
+        k=original_k,
         v=v,
         g=g,
         beta=beta,
@@ -505,6 +1183,9 @@ def recurrent_kda(
         initial_state_source=initial_state_source,
         initial_state_indices=initial_state_indices,
         beta_is_logit=beta_is_logit,
+        disable_state_update=disable_state_update,
+        correction_cache=correction_cache,
+        kg_cache=kg_cache,
         backend=backend,
     )
 
@@ -512,21 +1193,32 @@ def recurrent_kda(
 class RecurrentKDAPrefillWrapper:
     """Plan-and-run wrapper for packed recurrent-KDA prefill.
 
+    .. warning::
+        ``RecurrentKDAPrefillWrapper`` is experimental: it provides no
+        compatibility guarantees and may change or be removed without
+        deprecation.  It has not appeared in a release; the plan-and-run shape
+        is expected to change as the ``recurrent_kda`` surface is unified.  See
+        `#5069 <https://github.com/flashinfer-ai/flashinfer/issues/5069>`_ for
+        the graduation plan and
+        `#4936 <https://github.com/flashinfer-ai/flashinfer/issues/4936>`_ for
+        the wider unification audit.  Calling ``plan`` or ``run`` is the opt-in
+        and needs no environment variable; the planning implementation lives in
+        ``flashinfer.experimental.kda_prefill_wrapper``.
+
     Compute capability 10.0 and 10.3 only.  ``run`` forces ``backend="cute-dsl"``
     and always passes the ``seq_order`` it planned, and the CC 12.0 backend
     supports neither, so a CC 12.0 caller should use
     :func:`flashinfer.kda.recurrent_kda` directly.
 
-    ``plan`` runs outside CUDA Graph capture.  It reads ``cu_seqlens`` on the
-    host, builds a stable descending-length sequence order and cumulative chunk
-    prefix, and copies them into fixed-address device buffers.  ``run`` consumes
-    those buffers through :func:`recurrent_kda` as an explicit host plan.
+    ``plan`` runs outside CUDA Graph capture and copies ``cu_seqlens`` into a
+    fixed-address device buffer without reading its values on the host. ``run``
+    generates the stable descending-length sequence order and cumulative chunk
+    prefix on the GPU before the recurrent kernels consume them.
 
-    The number of sequences, total token count, and total BT=16 chunk count are
-    fixed by the first ``plan`` call so device buffer addresses, workspace
-    capacity, and captured launch geometry remain valid across CUDA Graph
-    replays.  Call ``plan`` again before replay to update individual lengths,
-    order, and chunk metadata in place when those totals remain unchanged.
+    The number of sequences and packed token tensor extent are fixed after the
+    first warmup run so device buffer addresses, workspace capacity, and launch
+    geometry remain valid across CUDA Graph replays. Call ``plan`` again before
+    replay to update individual lengths in place.
 
     This wrapper is specific to the CuTe DSL backend and intentionally uses
     its non-persistent schedule. One wrapper instance is a single-writer
@@ -534,24 +1226,19 @@ class RecurrentKDAPrefillWrapper:
     launched by ``run`` may still be reading the wrapper's planned buffers.
     """
 
+    #: Mechanical identification: the decorators only mark ``plan`` and ``run``.
+    is_experimental = True
+
     def __init__(
         self,
         device: torch.device | str,
     ) -> None:
-        self.device = torch.device(device)
-        if self.device.type != "cuda":
-            raise ValueError("RecurrentKDAPrefillWrapper requires a CUDA device")
-        if self.device.index is None:
-            self.device = torch.device("cuda", torch.cuda.current_device())
-        self._workspace = _kda_prefill.RecurrentKDAPrefillWorkspace(self.device)
-        self._cu_seqlens_buf: Optional[torch.Tensor] = None
-        self._seq_order_buf: Optional[torch.Tensor] = None
-        self._cu_chunks_buf: Optional[torch.Tensor] = None
-        self._num_sequences: Optional[int] = None
-        self._total_tokens: Optional[int] = None
-        self._total_chunks: Optional[int] = None
-        self._lock = threading.Lock()
+        from .experimental.kda_prefill_wrapper import RecurrentKDAPrefillPlanner
 
+        self._impl = RecurrentKDAPrefillPlanner(device)
+        self.device = self._impl.device
+
+    @flashinfer_experimental_api(feature="recurrent KDA packed prefill wrapper")
     def plan(
         self,
         cu_seqlens: torch.Tensor,
@@ -561,99 +1248,14 @@ class RecurrentKDAPrefillWrapper:
         """Plan a packed prefill sequence order outside CUDA Graph capture.
 
         ``cu_seqlens`` may reside on CPU or on this wrapper's CUDA device and
-        may use int32 or int64 storage.  Device input is copied to the host for
-        validation and sorting.  The resulting metadata is then copied into
-        stable int64/int32 CUDA buffers owned by the wrapper. Repeated offsets
-        represent zero-length sequences and are retained in the sequence plan
-        with zero chunks.
+        may use int32 or int64 storage. Its values are copied into a stable
+        int64 CUDA buffer; GPU metadata generation during ``run`` handles
+        repeated offsets for zero-length sequences.
         """
 
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "RecurrentKDAPrefillWrapper.plan must run outside CUDA graph capture"
-            )
-        if not isinstance(cu_seqlens, torch.Tensor):
-            raise TypeError("cu_seqlens must be a torch.Tensor")
-        if (
-            cu_seqlens.dtype not in (torch.int32, torch.int64)
-            or cu_seqlens.ndim != 1
-            or not cu_seqlens.is_contiguous()
-            or cu_seqlens.numel() < 2
-        ):
-            raise ValueError(
-                "cu_seqlens must be a contiguous int32 or int64 tensor with "
-                "at least two entries"
-            )
-        if cu_seqlens.is_cuda and cu_seqlens.device != self.device:
-            raise ValueError(
-                f"cu_seqlens must be on {self.device} or CPU, got {cu_seqlens.device}"
-            )
+        self._impl.plan(cu_seqlens, non_blocking=non_blocking)
 
-        offsets = tuple(int(value) for value in cu_seqlens.to("cpu").tolist())
-        if offsets[0] != 0 or any(
-            right < left for left, right in zip(offsets, offsets[1:], strict=False)
-        ):
-            raise ValueError("cu_seqlens must start at zero and be non-decreasing")
-        num_sequences = len(offsets) - 1
-        sequence_order = sorted(
-            range(num_sequences),
-            key=lambda index: offsets[index + 1] - offsets[index],
-            reverse=True,
-        )
-        chunk_counts = [
-            (offsets[index + 1] - offsets[index] + 15) // 16
-            for index in range(num_sequences)
-        ]
-        cu_chunks = [0]
-        for count in chunk_counts:
-            cu_chunks.append(cu_chunks[-1] + count)
-        total_chunks = cu_chunks[-1]
-
-        with self._lock:
-            if self._num_sequences is None:
-                self._num_sequences = num_sequences
-                self._cu_seqlens_buf = torch.empty(
-                    num_sequences + 1, dtype=torch.int64, device=self.device
-                )
-                self._seq_order_buf = torch.empty(
-                    num_sequences, dtype=torch.int32, device=self.device
-                )
-                self._cu_chunks_buf = torch.empty(
-                    num_sequences + 1, dtype=torch.int32, device=self.device
-                )
-                self._total_chunks = total_chunks
-            elif num_sequences != self._num_sequences:
-                raise ValueError(
-                    "the number of sequences is fixed after the first plan call: "
-                    f"expected {self._num_sequences}, got {num_sequences}"
-                )
-            elif offsets[-1] != self._total_tokens:
-                raise ValueError(
-                    "the total token count is fixed after the first plan call: "
-                    f"expected {self._total_tokens}, got {offsets[-1]}"
-                )
-            elif total_chunks != self._total_chunks:
-                raise ValueError(
-                    "the total BT=16 chunk count is fixed after the first plan "
-                    "call so CUDA Graph launch geometry remains stable: "
-                    f"expected {self._total_chunks}, got {total_chunks}"
-                )
-            assert self._cu_seqlens_buf is not None
-            assert self._seq_order_buf is not None
-            assert self._cu_chunks_buf is not None
-            self._cu_seqlens_buf.copy_(cu_seqlens, non_blocking=non_blocking)
-            self._seq_order_buf.copy_(
-                torch.tensor(sequence_order, dtype=torch.int32),
-                non_blocking=non_blocking,
-            )
-            self._cu_chunks_buf.copy_(
-                torch.tensor(cu_chunks, dtype=torch.int32),
-                non_blocking=non_blocking,
-            )
-            self._workspace.__dict__["_cute_dsl_cu_chunks"] = self._cu_chunks_buf
-            self._workspace.__dict__["_cute_dsl_total_chunks"] = total_chunks
-            self._total_tokens = offsets[-1]
-
+    @flashinfer_experimental_api(feature="recurrent KDA packed prefill wrapper")
     def run(
         self,
         q: torch.Tensor,
@@ -674,6 +1276,7 @@ class RecurrentKDAPrefillWrapper:
         state_checkpoints: Optional[torch.Tensor] = None,
         checkpoint_cu_starts: Optional[torch.Tensor] = None,
         checkpoint_every_n_tokens: int = 0,
+        checkpoint_state_indices: Optional[torch.Tensor] = None,
         ssm_state_indices: Optional[torch.Tensor] = None,
     ) -> (
         tuple[torch.Tensor, Optional[torch.Tensor]]
@@ -681,20 +1284,7 @@ class RecurrentKDAPrefillWrapper:
     ):
         """Run packed recurrent-KDA prefill using the most recent plan."""
 
-        with self._lock:
-            if self._total_tokens is None:
-                raise RuntimeError("call plan before run")
-            if q.ndim != 4 or q.shape[0] * q.shape[1] != self._total_tokens:
-                raise ValueError(
-                    "q token count must match the most recent plan: "
-                    f"expected {self._total_tokens}, got "
-                    f"{q.shape[0] * q.shape[1] if q.ndim == 4 else 'invalid rank'}"
-                )
-            cu_seqlens = self._cu_seqlens_buf
-            seq_order = self._seq_order_buf
-        assert cu_seqlens is not None
-        assert seq_order is not None
-        return recurrent_kda(
+        return self._impl.run(
             q=q,
             k=k,
             v=v,
@@ -708,14 +1298,11 @@ class RecurrentKDAPrefillWrapper:
             use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
             use_gate_in_kernel=use_gate_in_kernel,
             lower_bound=lower_bound,
-            cu_seqlens=cu_seqlens,
             output=output,
             beta_is_logit=beta_is_logit,
-            ssm_state_indices=ssm_state_indices,
-            seq_order=seq_order,
-            prefill_workspace=self._workspace,
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_state_indices=checkpoint_state_indices,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
-            backend="cute-dsl",
+            ssm_state_indices=ssm_state_indices,
         )

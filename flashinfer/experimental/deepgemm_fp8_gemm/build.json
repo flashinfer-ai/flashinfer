@@ -1,0 +1,139 @@
+{
+  "arch_flags": {
+    "sm_100a": [
+      "-gencode=arch=compute_100a,code=sm_100a"
+    ],
+    "sm_103a": [
+      "-gencode=arch=compute_103a,code=sm_103a"
+    ]
+  },
+  "common": {
+    "include_dirs": [
+      "csrc"
+    ],
+    "link": {
+      "cudart": "shared",
+      "host_linker": "c++",
+      "tvm_ffi_symbols": "resolved at load; do not pass --no-undefined"
+    },
+    "link_flags": [
+      "-shared",
+      "-lcudart",
+      "-lcuda"
+    ],
+    "nvcc_flags": [
+      "-std=c++17",
+      "-O3",
+      "-DNDEBUG",
+      "--compiler-options=-fPIC",
+      "--expt-relaxed-constexpr",
+      "-Xfatbin=-compress-all",
+      "--compress-mode=size"
+    ],
+    "nvcc_flags_if": [
+      {
+        "cuda": ">=12.8",
+        "flags": [
+          "-static-global-template-stub=false"
+        ]
+      }
+    ],
+    "requires": {
+      "cuda_toolkit": {
+        "min": "12.8"
+      },
+      "tvm_ffi": {
+        "include_dirs": [
+          "tvm_ffi.libinfo.find_include_path()",
+          "tvm_ffi.libinfo.find_dlpack_include_path()"
+        ],
+        "python": "apache-tvm-ffi>=0.1.11,<0.2"
+      }
+    }
+  },
+  "generator": {
+    "cake_revision": "ec8ee046ea9f8691145091f7fff60fe83f024376",
+    "cuda": "13.4.92",
+    "rendered_at": "2026-10-20T23:25:25Z"
+  },
+  "libraries": [
+    {
+      "arch": "sm_100a",
+      "closure_sha256": "a7a723edf016c223d293309cd05c82ac341bac57b3c49333c3542676b74d61c6",
+      "entry": "run",
+      "gencode": "-gencode=arch=compute_100a,code=sm_100a",
+      "min_cuda": "12.8",
+      "name": "cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_sm_100a",
+      "nvcc_flags": [],
+      "nvcc_flags_if": [],
+      "path": "aot/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_sm_100a.so",
+      "sha256": {
+        "csrc/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_binding.cu": "98adb7af1fc2297b1727233e3715d9c31dd0255f78011e938f36712563febd92",
+        "csrc/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_kernel.cu": "672a14441295a8988633e90d75fd8c80b383a25a9f4b051682d2ec3469034833"
+      },
+      "sources": [
+        "csrc/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_kernel.cu",
+        "csrc/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_binding.cu"
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "closure_sha256": "138c13a02eef1549800ce8435be1ea2597e2f26056de332316e245968411dcd2",
+      "entry": "run",
+      "gencode": "-gencode=arch=compute_103a,code=sm_103a",
+      "min_cuda": "12.9",
+      "name": "cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_sm_103a",
+      "nvcc_flags": [],
+      "nvcc_flags_if": [],
+      "path": "aot/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_sm_103a.so",
+      "sha256": {
+        "csrc/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_binding.cu": "98adb7af1fc2297b1727233e3715d9c31dd0255f78011e938f36712563febd92",
+        "csrc/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_kernel.cu": "672a14441295a8988633e90d75fd8c80b383a25a9f4b051682d2ec3469034833"
+      },
+      "sources": [
+        "csrc/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_kernel.cu",
+        "csrc/cake_deepgemm_fp8_gemm_18870a6ac8a0a8be9883_binding.cu"
+      ]
+    },
+    {
+      "arch": "sm_100a",
+      "closure_sha256": "06d7225941f209ab9e8662e96002e368b15cb490e734c30049dcec9589acfaa5",
+      "entry": "run",
+      "gencode": "-gencode=arch=compute_100a,code=sm_100a",
+      "min_cuda": "12.8",
+      "name": "cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_sm_100a",
+      "nvcc_flags": [],
+      "nvcc_flags_if": [],
+      "path": "aot/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_sm_100a.so",
+      "sha256": {
+        "csrc/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_binding.cu": "069f4eb1c02a78c6e4476bcadac03768e6071551b508e7e922054d10a5ddaee7",
+        "csrc/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_kernel.cu": "98819a124177a806affd541a447864b64907ef108fff425f6df3f8a227d5dc00"
+      },
+      "sources": [
+        "csrc/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_kernel.cu",
+        "csrc/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_binding.cu"
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "closure_sha256": "11b36700c19049e0580a0046619192ae5faed8526909ce3466d9a06841bf12e7",
+      "entry": "run",
+      "gencode": "-gencode=arch=compute_103a,code=sm_103a",
+      "min_cuda": "12.9",
+      "name": "cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_sm_103a",
+      "nvcc_flags": [],
+      "nvcc_flags_if": [],
+      "path": "aot/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_sm_103a.so",
+      "sha256": {
+        "csrc/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_binding.cu": "069f4eb1c02a78c6e4476bcadac03768e6071551b508e7e922054d10a5ddaee7",
+        "csrc/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_kernel.cu": "98819a124177a806affd541a447864b64907ef108fff425f6df3f8a227d5dc00"
+      },
+      "sources": [
+        "csrc/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_kernel.cu",
+        "csrc/cake_deepgemm_fp8_gemm_3806a6e9116000fd4200_binding.cu"
+      ]
+    }
+  ],
+  "package": "flashinfer.experimental.deepgemm_fp8_gemm",
+  "schema": "cake-build/1"
+}

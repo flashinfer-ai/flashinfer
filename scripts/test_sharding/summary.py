@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import csv
+import importlib
 import importlib.metadata
 import io
 import json
+import os
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -91,6 +93,8 @@ class SourceSummary(TypedDict):
 class RunSummary(TypedDict):
     schema_version: int
     complete: bool
+    gpu_name: str
+    lane_id: str
     planned_nodes: int
     finalized_nodes: int
     pending_nodes: list[str]
@@ -576,8 +580,10 @@ def publish_summary_under_lock(junit_dir: Path, plan: Plan) -> RunSummary:
     )
     capacity = _capacity_for_latest_attempt(plan, attempt_paths)
     summary: RunSummary = {
-        "schema_version": 3,
+        "schema_version": 4,
         "complete": not scan.pending,
+        "gpu_name": _detect_gpu_name(),
+        "lane_id": _detect_lane_id(),
         "planned_nodes": len(plan.nodes),
         "finalized_nodes": len(scan.rows),
         "pending_nodes": sorted(scan.pending, key=lambda value: value.encode("utf-8")),
@@ -693,8 +699,62 @@ def _torch_cuda_version() -> str:
         return "unavailable"
 
 
+def _cudnn_backend_version() -> str:
+    try:
+        cudnn = importlib.import_module("cudnn")
+    except ModuleNotFoundError as error:
+        if error.name != "cudnn":
+            return "unavailable"
+        return "not-installed"
+    except Exception:
+        return "unavailable"
+    try:
+        return str(cudnn.backend_version())
+    except Exception:
+        return "unavailable"
+
+
+@lru_cache(maxsize=1)
+def _detect_gpu_name() -> str:
+    """Return the GPU name from the ``CI_GPU_NAME`` environment variable.
+
+    This variable is set by the CI workflow matrix and forwarded into the
+    Docker container, avoiding the cost of initialising a CUDA context just
+    to query the device name.
+    """
+    name = os.environ.get("CI_GPU_NAME", "") or ""
+    if not name:
+        print(
+            "WARNING: CI_GPU_NAME is not set; gpu_name will be 'unknown'. "
+            "Ensure the workflow matrix sets gpu_name and ci/bash.sh forwards it.",
+            file=sys.stderr,
+        )
+        return "unknown"
+    return name
+
+
+def _detect_lane_id() -> str:
+    """Build a composite lane identifier from CI environment variables.
+
+    Format: ``{script} - {gpu_name}@{cuda}``, e.g.
+    ``task_run_unit_tests.sh - H100@cu124``.  Falls back to ``gpu_name``
+    alone when the other variables are unavailable.
+    """
+    gpu = _detect_gpu_name()
+    script = os.environ.get("CI_TEST_SCRIPT", "") or ""
+    cuda = os.environ.get("CI_MATRIX_CUDA", "") or ""
+    if script and cuda:
+        return f"{script} - {gpu}@{cuda}"
+    if script:
+        return f"{script} - {gpu}"
+    if cuda:
+        return f"{gpu}@{cuda}"
+    return gpu
+
+
 @lru_cache(maxsize=1)
 def _runtime_version_line() -> str:
+    """Format runtime and dependency versions as space-separated name=value pairs."""
     versions = [
         ("python", sys.version.split()[0]),
         ("flashinfer", _package_version("flashinfer-python")),
@@ -704,7 +764,9 @@ def _runtime_version_line() -> str:
         ("cuda-python", _package_version("cuda-python")),
         ("cuda-tile", _package_version("cuda-tile")),
         ("cuDNN-frontend", _package_version("nvidia-cudnn-frontend")),
+        ("cuDNN-backend", _cudnn_backend_version()),
         ("triton", _package_version("triton")),
+        ("nccl-extensions", _package_version("nccl-extensions")),
         ("nccl4py", _package_version("nccl4py")),
     ]
     return " ".join(f"{name}={version}" for name, version in versions)

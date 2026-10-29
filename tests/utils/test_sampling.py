@@ -18,6 +18,20 @@ import pytest
 import torch
 
 import flashinfer
+from flashinfer.utils import device_support_pdl
+from tests.test_helpers.parametrize import (
+    parametrize_product,
+    pairwise_product_cases,
+)
+from tests.test_helpers.pdl import late_store
+from tests.test_helpers.sampling import (
+    required_num_collision_rows,
+    required_num_trials,
+)
+
+
+# H100 CI peak GPU memory: 39.5 GiB.
+pytestmark = pytest.mark.gpu_exclusive
 
 
 def normal_distribution(std):
@@ -36,6 +50,916 @@ def gumbel_distribution(beta):
 
     gumbel_noise.__name__ = f"gumbel_distribution(beta={beta})"
     return gumbel_noise
+
+
+@pytest.mark.parametrize("vocab_size", [4095, 4096, 4097, 16384, 16387])
+@pytest.mark.parametrize("indices_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_sampling_last_valid_fallback(vocab_size, indices_dtype, deterministic):
+    # Force the rounding fallback: the total mass is below any Philox uniform.
+    # The last nonzero can be in an earlier tile, or in the final partial vector.
+    last = torch.tensor([0, 31, 1023, 2047, 4094, vocab_size - 1], device="cuda")
+    probs = torch.zeros(8, vocab_size, device="cuda")
+    probs[:6, 0] = 1e-20
+    probs[torch.arange(6, device="cuda"), last] = 1e-20
+    probs[7] = float("nan")
+    indices = torch.tensor(
+        [5, 0, 6, 4, 2, 7, 3, 1, 5], device="cuda", dtype=indices_dtype
+    )
+    expected = torch.cat([last, torch.zeros(2, device="cuda", dtype=last.dtype)])
+    expected_valid = torch.arange(8, device="cuda") < 6
+
+    samples, valid = flashinfer.sampling.sampling_from_probs(
+        probs,
+        indices=indices,
+        deterministic=deterministic,
+        seed=42,
+        offset=0,
+        return_valid=True,
+    )
+    torch.testing.assert_close(
+        samples, expected[indices].to(indices_dtype), atol=0, rtol=0
+    )
+    torch.testing.assert_close(valid, expected_valid[indices])
+
+
+@pytest.mark.parametrize("vocab_size", [4095, 4096, 4097, 16387])
+@pytest.mark.parametrize(
+    "sampling_type,mass",
+    [(name, 1.0) for name in ["plain", "top_k", "top_p", "min_p", "joint"]]
+    + [(name, 1e-20) for name in ["plain", "top_k", "top_p", "joint"]],
+)
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_sampling_masked_tiles_graph(vocab_size, sampling_type, mass, deterministic):
+    # Tiny mass forces fallback; min-p scales its uniform by the eligible mass,
+    # so its one-hot input only covers normal selection.
+    # k=2 prevents a bad zero-probability fallback from being hidden by a retry.
+    probs = torch.zeros(4, vocab_size, device="cuda")
+    positions = torch.tensor([0, 1023, 2047, vocab_size - 1], device="cuda")
+    rows = torch.arange(4, device="cuda")
+    probs[rows, positions] = mass
+    ops = {
+        "plain": (flashinfer.sampling.sampling_from_probs, {}),
+        "top_k": (flashinfer.sampling.top_k_sampling_from_probs, {"top_k": 2}),
+        "top_p": (flashinfer.sampling.top_p_sampling_from_probs, {"top_p": 0.9}),
+        "min_p": (flashinfer.sampling.min_p_sampling_from_probs, {"min_p": 0.1}),
+        "joint": (
+            flashinfer.sampling.top_k_top_p_sampling_from_probs,
+            {"top_k": 2, "top_p": 0.9, "filter_apply_order": "joint"},
+        ),
+    }
+    op, kwargs = ops[sampling_type]
+
+    def sample():
+        return op(probs, deterministic=deterministic, seed=42, offset=0, **kwargs)
+
+    torch.testing.assert_close(sample(), positions.to(torch.int32), atol=0, rtol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        samples = sample()
+    graph.replay()
+    torch.testing.assert_close(samples, positions.to(torch.int32), atol=0, rtol=0)
+
+    # A later replay must not retain the previous call's local fallback candidate.
+    probs.zero_()
+    positions = vocab_size - 1 - positions
+    probs[rows, positions] = mass
+    graph.replay()
+    torch.testing.assert_close(samples, positions.to(torch.int32), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("shape", [(1, 4096), (5, 129280), (230, 129280)])
+@pytest.mark.parametrize("per_row_temperature", [False, True])
+def test_softmax_low_temperature_normalization(shape, per_row_temperature):
+    logits = torch.full(shape, -20.0, device="cuda:0")
+    logits[:, 123] = 42.0
+    temperature = 0.001
+    if per_row_temperature:
+        temperature = torch.full((shape[0],), temperature, device=logits.device)
+    probs = flashinfer.sampling.softmax(logits, temperature=temperature)
+    expected = torch.zeros_like(logits)
+    expected[:, 123] = 1.0
+    torch.testing.assert_close(probs, expected, atol=1e-6, rtol=0)
+
+
+def test_softmax_rejects_cpu_before_cuda_state(monkeypatch):
+    def fail_if_called(*args, **kwargs):
+        pytest.fail("CUDA workspace or capability state was accessed for CPU logits")
+
+    monkeypatch.setattr(flashinfer.sampling, "_get_cache_buf", fail_if_called)
+    monkeypatch.setattr(flashinfer.sampling, "device_support_pdl", fail_if_called)
+    monkeypatch.setattr(
+        flashinfer.sampling, "_supports_blackwell_softmax", fail_if_called
+    )
+
+    with pytest.raises(ValueError, match="logits must be a CUDA tensor"):
+        flashinfer.sampling.softmax(torch.randn(2, 3))
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64]
+)
+def test_validate_softmax_temperature_accepts_floating_row_tensor(dtype):
+    logits = torch.empty((3, 5), dtype=torch.float32)
+    temperature = torch.ones(3, dtype=dtype)
+
+    temperature_arr, temperature_val, temperature_is_none = (
+        flashinfer.sampling._validate_softmax_temperature(logits, temperature)
+    )
+
+    assert temperature_arr is temperature
+    assert temperature_val == 0.0
+    assert not temperature_is_none
+
+
+@pytest.mark.parametrize(
+    "temperature,expected_value,is_none",
+    [(None, 1.0, True), (1, 1.0, False), (0.5, 0.5, False)],
+)
+def test_validate_softmax_temperature_accepts_scalar(
+    temperature, expected_value, is_none
+):
+    logits = torch.empty((3, 5), dtype=torch.float32)
+
+    temperature_arr, temperature_val, temperature_is_none = (
+        flashinfer.sampling._validate_softmax_temperature(logits, temperature)
+    )
+
+    assert temperature_arr is None
+    assert temperature_val == expected_value
+    assert temperature_is_none is is_none
+
+
+@pytest.mark.parametrize(
+    "temperature,error_match",
+    [
+        (torch.tensor(1.0), "must be 1D"),
+        (torch.ones(3, 1), "must be 1D"),
+        (torch.ones(2), "length must equal logits.size\\(0\\)"),
+        (torch.ones(3, dtype=torch.int32), "must have dtype"),
+        (torch.ones(3, dtype=torch.bool), "must have dtype"),
+    ],
+)
+def test_validate_softmax_temperature_rejects_invalid_tensor(temperature, error_match):
+    logits = torch.empty((3, 5), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match=error_match):
+        flashinfer.sampling._validate_softmax_temperature(logits, temperature)
+
+
+def test_validate_softmax_temperature_rejects_other_device():
+    logits = torch.empty((3, 5), dtype=torch.float32)
+    temperature = torch.ones(3, device="meta")
+
+    with pytest.raises(ValueError, match="same device as logits"):
+        flashinfer.sampling._validate_softmax_temperature(logits, temperature)
+
+
+@pytest.mark.parametrize("temperature", [True, "1.0", object()])
+def test_validate_softmax_temperature_rejects_non_numeric_scalar(temperature):
+    logits = torch.empty((3, 5), dtype=torch.float32)
+
+    with pytest.raises(TypeError, match="temperature must be None, a real scalar"):
+        flashinfer.sampling._validate_softmax_temperature(logits, temperature)
+
+
+@pytest.mark.parametrize("rows", [128, 256, 384, 512, 1024])
+def test_blackwell_32k_rows_take_cached_cluster_route(rows):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    logits = torch.randn((rows, 32000), device="cuda", dtype=torch.float32)
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=None, enable_pdl=False
+    )
+    actual = flashinfer.sampling.softmax(logits, temperature=None, enable_pdl=False)
+    expected = torch.softmax(logits, dim=-1)
+
+    assert route == flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER
+    assert actual.data_ptr() != logits.data_ptr()
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
+
+
+def test_blackwell_scalar_one_pdl_b64_v32000_takes_cached_cluster_route():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    logits = torch.randn((64, 32000), device="cuda", dtype=torch.float32)
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=1.0, enable_pdl=True
+    )
+    actual = flashinfer.sampling.softmax(logits, temperature=1.0, enable_pdl=True)
+    expected = torch.softmax(logits, dim=-1)
+
+    assert route == flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER
+    assert actual.data_ptr() != logits.data_ptr()
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size,temperature,enable_pdl,expected_route",
+    [
+        (1, 111, 0.5, False, 1),
+        (256, 32004, None, False, 2),
+        (1, 32004, None, False, 3),
+        (256, 32000, None, False, 5),
+        (512, 32000, None, False, 5),
+        (256, 32000, 0.5, False, 5),
+        (256, 64000, None, False, 5),
+        (1, 32000, None, False, 5),
+        (1, 256000, None, False, 5),
+        (48, 256000, None, False, 6),
+        (100, 128000, 0.5, True, 6),
+        (512, 256000, None, False, 7),
+        (1024, 128000, 0.5, True, 7),
+    ],
+)
+def test_blackwell_softmax_all_negative_infinity_matches_public_semantics(
+    rows, vocab_size, temperature, enable_pdl, expected_route
+):
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    logits = torch.full((rows, vocab_size), -torch.inf, device="cuda")
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    actual = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    expected = torch.softmax(logits, dim=-1)
+
+    assert route == expected_route
+    assert actual.data_ptr() != logits.data_ptr()
+    assert torch.isnan(expected).all()
+    assert torch.isnan(actual).all()
+
+
+def test_blackwell_route_observer_falls_back_off_blackwell():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if torch.cuda.get_device_capability() in ((10, 0), (10, 3)):
+        pytest.skip("This test exercises the non-Blackwell observer gate")
+
+    logits = torch.empty((1, 111), device="cuda")
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=0.5, enable_pdl=False
+    )
+
+    assert route == flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_FALLBACK
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size,temperature_kind,enable_pdl,expected_route",
+    [
+        (1, 32000, "none", False, "row"),
+        (1, 262144, "none", False, "row"),  # widest cached row: 16 CTAs x 8 tiles
+        (8, 4096, "scalar", False, "row"),
+        (64, 32000, "scalar", True, "row"),
+        (8, 256000, "none", False, "row"),  # 8-tile rows in one wave
+        (16, 256000, "none", False, "shared_tiles"),  # under 4/5 of persistent trips
+        (48, 151936, "scalar", False, "shared_tiles"),  # 5-tile chunks
+        (48, 256000, "per_row", True, "persistent"),  # persistent 16-CTA clusters
+        (100, 128000, "none", False, "persistent"),  # persistent 8-CTA clusters
+        (64, 128000, "none", False, "persistent"),  # 4/5 of the persistent trips
+        (200, 256000, "per_row", True, "persistent"),  # < 8 rows per shared cluster
+        (96, 100008, "none", False, "persistent"),  # a partial last tile in every row
+        (1024, 128000, "none", False, "shared_tiles"),  # 7+ rows per C8 shared cluster
+        (1024, 256000, "per_row", True, "shared_tiles"),
+        (989, 128256, "per_row", True, "shared_tiles"),  # rows not a multiple of 8
+        (600, 100008, "scalar", False, "shared_tiles"),  # the last tile unreached
+    ],
+)
+def test_blackwell_cached_cluster_route_is_selected_and_correct(
+    rows, vocab_size, temperature_kind, enable_pdl, expected_route
+):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    torch.manual_seed(7)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    if temperature_kind == "none":
+        temperature = None
+        probs_ref = torch.softmax(logits, dim=-1)
+    elif temperature_kind == "scalar":
+        temperature = 0.5
+        probs_ref = torch.softmax(logits / temperature, dim=-1)
+    else:
+        temperature = torch.rand(rows, device="cuda") * 0.9 + 0.1
+        probs_ref = torch.softmax(logits / temperature[:, None], dim=-1)
+
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    probs = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+
+    routes = {
+        "row": flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER,
+        "persistent": flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_PERSISTENT,
+        "shared_tiles": flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_SHARED_TILES,
+    }
+    assert route == routes[expected_route]
+    # Only sm_103a launches with PDL: the row-caching and shared-tile kernels
+    # through their _pdl twins, the persistent kernels through a flag.
+    kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    on_sm103 = torch.cuda.get_device_capability() == (10, 3)
+    pdl_twin = enable_pdl and on_sm103 and expected_route != "persistent"
+    assert kernel[2] == int(pdl_twin)
+    assert probs.data_ptr() != logits.data_ptr()
+    torch.testing.assert_close(probs, probs_ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size",
+    [
+        (240, 256000),  # 16-CTA persistent clusters, about 18 rows each
+        (480, 128000),  # 8-CTA persistent clusters, about 13 rows each
+    ],
+)
+def test_blackwell_persistent_softmax_every_launch_reads_its_own_rows(rows, vocab_size):
+    # The persistent route keeps clusters resident and walks each one over many
+    # rows; a shared-memory tile slot takes the next row's bulk copy once every
+    # thread has read it. Every launch must match the softmax of its own rows.
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    torch.manual_seed(7)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=None, enable_pdl=False
+    )
+    assert (
+        route == flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_PERSISTENT
+    )
+    probs_ref = torch.softmax(logits.double(), dim=-1).float()
+    launches = 4000
+    bad = torch.zeros((), dtype=torch.int64, device="cuda")
+    for _ in range(launches):
+        probs = flashinfer.sampling.softmax(logits, temperature=None, enable_pdl=False)
+        bad += ~((probs - probs_ref).abs() <= 1e-8).all()
+    assert bad.item() == 0, f"{bad.item()} of {launches} launches differ"
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size",
+    [
+        (31, 32000),  # B200: as many rows as resident 16-CTA clusters
+        (32, 32000),  # B200: fewer resident 16-CTA clusters than rows
+        (33, 32000),  # GB300: as many rows as resident 16-CTA clusters
+        (34, 32000),  # B200 and GB300
+        (36, 64000),
+        (71, 24576),  # B200: as many rows as resident 8-CTA clusters
+        (72, 24576),  # B200: fewer resident 8-CTA clusters than rows
+        (73, 24576),
+        (74, 24576),  # GB300: as many rows as resident 8-CTA clusters
+        (75, 24576),  # GB300: fewer resident 8-CTA clusters than rows
+    ],
+)
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_blackwell_cached_cluster_spread_keeps_rows_resident(
+    rows, vocab_size, enable_pdl
+):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    torch.manual_seed(7)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        logits, temperature=0.5, enable_pdl=enable_pdl
+    )
+    probs = flashinfer.sampling.softmax(logits, temperature=0.5, enable_pdl=enable_pdl)
+
+    _, max_tiles, pdl_twin, resident_clusters, next_resident_clusters, _ = kernel
+    on_sm103 = torch.cuda.get_device_capability() == (10, 3)
+    # Spreading a row over more CTAs stops before a cluster size whose
+    # resident clusters are fewer than the rows, so all rows run in one wave,
+    # and not earlier: twice the CTAs would leave rows for a second wave.
+    assert max_tiles == 4
+    assert rows <= resident_clusters
+    assert rows > next_resident_clusters
+    assert pdl_twin == int(enable_pdl and on_sm103)
+    torch.testing.assert_close(
+        probs, torch.softmax(logits / 0.5, dim=-1), atol=1e-3, rtol=1e-3
+    )
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size,cluster_ctas",
+    [
+        (36, 80000, 16),  # 5-tile 8-CTA chunks
+        (36, 128000, 16),  # 8-tile 8-CTA chunks
+        (73, 32000, 8),  # 4-tile 4-CTA chunks; B200: past the resident 8-CTA clusters
+    ],
+)
+def test_blackwell_cached_cluster_spread_of_wide_chunks_ignores_residency(
+    rows, vocab_size, cluster_ctas
+):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    torch.manual_seed(7)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        logits, temperature=0.5
+    )
+    probs = flashinfer.sampling.softmax(logits, temperature=0.5)
+
+    # Rows whose chunks are wider than the capped spreads allow keep spreading
+    # even when some clusters then run in a second wave, as measured faster.
+    assert kernel[:2] == (cluster_ctas, 4)
+    torch.testing.assert_close(
+        probs, torch.softmax(logits / 0.5, dim=-1), atol=1e-3, rtol=1e-3
+    )
+
+
+@pytest.mark.parametrize(
+    "vocab_size",
+    [
+        151936,  # 7-tile 12-CTA chunks, 5-tile 16-CTA chunks
+        196608,  # 8-tile 12-CTA chunks, 6-tile 16-CTA chunks
+        204800,  # 9-tile 12-CTA chunks, 10-tile 10-CTA chunks
+        229376,  # 10-tile 12-CTA chunks, 12-tile 10-CTA chunks
+        262144,  # 11-tile 12-CTA chunks, 13-tile 10-CTA chunks
+    ],
+)
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_blackwell_cached_cluster_one_row_over_takes_wide_kernel(
+    vocab_size, enable_pdl
+):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    torch.manual_seed(7)
+    kernels = {}
+    for rows in range(4, 13):
+        logits = torch.randn(rows, vocab_size, device="cuda")
+        kernels[rows] = (
+            flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+                logits, temperature=0.5, enable_pdl=enable_pdl
+            )
+        )
+    # A batch with one row more than 16-CTA clusters fit one CTA per SM takes
+    # the wide kernel of 12 CTAs, or of 10 CTAs when the 16-CTA chunk exceeds
+    # 6 tiles, with the narrowest register chunk that covers the row; one row
+    # fewer or more keeps 16 CTAs.
+    wide = [rows for rows, kernel in kernels.items() if kernel[0] in (10, 12)]
+    assert len(wide) <= 1
+    sixteen_chunk = -(-vocab_size // 16)
+    sixteen_tiles = -(-sixteen_chunk // 2048)
+    if torch.cuda.get_device_properties(0).multi_processor_count in (148, 152):
+        # B200 and GB300 fit seven 16-CTA clusters one CTA per SM; GB300 fits
+        # eight 12-CTA clusters, B200 eight 10-CTA clusters.
+        if torch.cuda.get_device_capability() == (10, 3) or sixteen_tiles > 6:
+            assert wide == [8]
+        else:
+            assert wide == []
+    for rows, kernel in kernels.items():
+        if rows not in wide:
+            assert kernel[:2] == (16, 8)
+    for rows in wide:
+        cluster_ctas, max_tiles = kernels[rows][:2]
+        assert cluster_ctas == 12 or sixteen_tiles > 6
+        chunk = -(-vocab_size // cluster_ctas)
+        tiles = -(-chunk // 2048)
+        narrowest = (
+            8 if tiles <= 8 else 10 if tiles <= 10 else {12: 11, 10: 13}[cluster_ctas]
+        )
+        assert max_tiles == narrowest
+        assert rows <= kernels[rows][3]
+        logits = torch.randn(rows, vocab_size, device="cuda")
+        probs = flashinfer.sampling.softmax(
+            logits, temperature=0.5, enable_pdl=enable_pdl
+        )
+        torch.testing.assert_close(
+            probs, torch.softmax(logits / 0.5, dim=-1), atol=1e-3, rtol=1e-3
+        )
+
+
+def _check_cached_cluster_route(rows, vocab_size, sm100_route, sm103_route):
+    torch.manual_seed(7)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    capability = torch.cuda.get_device_capability()
+    expected = sm100_route if capability == (10, 0) else sm103_route
+    routes = {
+        "row": flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER,
+        "persistent": flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_PERSISTENT,
+        "shared_tiles": flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_SHARED_TILES,
+    }
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=0.5
+    )
+    assert route == routes[expected]
+    kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        logits, temperature=0.5
+    )
+    if expected == "row":
+        assert kernel[:2] == (16, 4)
+    probs = flashinfer.sampling.softmax(logits, temperature=0.5)
+    torch.testing.assert_close(
+        probs, torch.softmax(logits / 0.5, dim=-1), atol=1e-3, rtol=1e-3
+    )
+
+
+def _skip_unless_b200_or_gb300():
+    capability = torch.cuda.get_device_capability()
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+    if (capability, sm_count) not in (((10, 0), 148), ((10, 3), 152)):
+        pytest.skip("These expectations are stated for B200 and GB300")
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size,sm100_route,sm103_route",
+    [
+        # 8-tile 8-CTA chunks: the 4-tile 16-CTA kernel in two waves.
+        (40, 128000, "row", "row"),
+        # 7-tile 8-CTA chunks: two waves on sm_100, the shared-tile kernel on sm_103.
+        (40, 100000, "row", "shared_tiles"),
+        # 7-tile chunks past one wave of shared-tile clusters: the persistent kernel.
+        (84, 100000, "persistent", "persistent"),
+        # 6-tile chunks: the trip rule on sm_100; on sm_103 under 2.5 rows per
+        # persistent cluster, except from 20/9 rows per persistent cluster on.
+        (79, 90000, "persistent", "shared_tiles"),
+        (80, 90000, "persistent", "persistent"),
+        # 7-tile 16-CTA chunks: the trip rule on sm_100, under 2.5 rows per persistent cluster on sm_103.
+        (24, 212992, "persistent", "shared_tiles"),
+        # 5-tile 8-CTA chunks: the persistent kernel from three persistent trips on
+        # when the fifth tile is at least 3/8 full, otherwise from 2.5 rows per
+        # persistent cluster on (sm_100).
+        (256, 80000, "persistent", "persistent"),
+        # ... whose fifth tile is more than 1/4 (sm_100) or at least 3/8 (sm_103) full.
+        (160, 70000, "persistent", "shared_tiles"),
+        (128, 68000, "shared_tiles", "shared_tiles"),
+        (320, 69632, "shared_tiles", "shared_tiles"),
+        (160, 71680, "persistent", "persistent"),
+        # 5-tile 16-CTA chunks filling 9/10 of three persistent trips.
+        (40, 151936, "persistent", "persistent"),
+        # Full 16-CTA chunks: 10 (sm_100) or 8 (sm_103) rows per shared-tile cluster.
+        (256, 256000, "persistent", "persistent"),
+        (352, 256000, "shared_tiles", "shared_tiles"),
+    ],
+)
+def test_blackwell_cached_cluster_route_rules_per_arch(
+    rows, vocab_size, sm100_route, sm103_route
+):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+    _skip_unless_b200_or_gb300()
+    _check_cached_cluster_route(rows, vocab_size, sm100_route, sm103_route)
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size,sm100_route,sm103_route",
+    [
+        # 8-tile 8-CTA chunks: the 4-tile 16-CTA kernel in two waves up to 9/5
+        # (sm_100) of its resident clusters; on sm_103 past 7/10 of the resident
+        # 8-CTA shared-tile clusters up to 5/3.
+        (51, 128000, "row", "shared_tiles"),
+        (52, 128000, "row", "row"),
+        (56, 128000, "persistent", "persistent"),
+        # 6-tile 8-CTA chunks: two waves up to 10/7 on sm_100; on sm_103 past 3/4
+        # of the resident 8-CTA shared-tile clusters up to 7/4.
+        (44, 90000, "row", "shared_tiles"),
+        (45, 90000, "shared_tiles", "shared_tiles"),
+        (55, 90000, "persistent", "shared_tiles"),
+        (56, 90000, "persistent", "row"),
+        (57, 90000, "persistent", "row"),
+        (58, 90000, "persistent", "shared_tiles"),
+        # 7-tile 8-CTA chunks: the trip rule.
+        (48, 100000, "shared_tiles", "shared_tiles"),
+        (52, 100000, "persistent", "shared_tiles"),
+        # 8-tile 8-CTA chunks: the trip rule.
+        (68, 128000, "shared_tiles", "persistent"),
+        # 6-tile chunks: the trip rule (sm_100), under 2.5 rows per persistent
+        # cluster (sm_103) unless the rows reach 20/9 rows per persistent cluster.
+        (64, 90000, "persistent", "shared_tiles"),
+        (68, 90000, "shared_tiles", "shared_tiles"),
+        (73, 90000, "persistent", "shared_tiles"),
+        (89, 90000, "persistent", "persistent"),
+        (90, 90000, "persistent", "persistent"),
+        (79, 84000, "persistent", "shared_tiles"),
+        (80, 84000, "persistent", "persistent"),
+        # 5-tile 8-CTA chunks whose rows fill at least 4/5 of the persistent trips:
+        # the persistent kernel from three persistent trips on when the fifth tile
+        # is at least 3/8 full (otherwise from 2.5 rows per persistent cluster on
+        # sm_100), below 7 rows per shared-tile cluster.
+        (57, 80000, "shared_tiles", "shared_tiles"),
+        (58, 80000, "shared_tiles", "shared_tiles"),
+        (62, 70000, "shared_tiles", "shared_tiles"),
+        (66, 80000, "shared_tiles", "shared_tiles"),
+        (70, 80000, "shared_tiles", "shared_tiles"),
+        (80, 80000, "persistent", "shared_tiles"),
+        (86, 80000, "persistent", "shared_tiles"),
+        (88, 80000, "persistent", "persistent"),
+        (496, 80000, "persistent", "persistent"),
+        (497, 80000, "shared_tiles", "persistent"),
+        (544, 80000, "shared_tiles", "shared_tiles"),
+        # On sm_100 also at three persistent trips from 10/9 rows per shared-tile
+        # cluster on, and below 15/2 rows per shared-tile cluster when the fifth
+        # tile is at most 279/1024 full.
+        (78, 70000, "shared_tiles", "shared_tiles"),
+        (79, 70000, "persistent", "shared_tiles"),
+        (82, 70000, "persistent", "shared_tiles"),
+        (78, 76000, "shared_tiles", "shared_tiles"),
+        (79, 76000, "persistent", "shared_tiles"),
+        (496, 70000, "persistent", "shared_tiles"),
+        (497, 70000, "persistent", "shared_tiles"),
+        (532, 70000, "persistent", "shared_tiles"),
+        (533, 70000, "shared_tiles", "shared_tiles"),
+        (497, 70008, "shared_tiles", "shared_tiles"),
+        # 6- and 7-tile 16-CTA chunks on sm_100: the persistent kernel past 4 rows
+        # per shared-tile cluster up to 20 (6 tiles) or 22 (7 tiles) persistent
+        # trips, or up to 24 trips when the last tile holds at most 6/8 (6 tiles)
+        # or 4/8 (7 tiles) of a tile.
+        (123, 180000, "persistent", "persistent"),
+        (124, 180000, "persistent", "persistent"),
+        (280, 180000, "persistent", "shared_tiles"),
+        (281, 180000, "persistent", "shared_tiles"),
+        (336, 180000, "persistent", "shared_tiles"),
+        (337, 180000, "shared_tiles", "shared_tiles"),
+        (281, 188416, "persistent", "shared_tiles"),
+        (281, 188432, "shared_tiles", "shared_tiles"),
+        (336, 192000, "shared_tiles", "shared_tiles"),
+        (280, 196608, "persistent", "shared_tiles"),
+        (281, 196608, "shared_tiles", "shared_tiles"),
+        (124, 210000, "persistent", "persistent"),
+        (308, 210000, "persistent", "shared_tiles"),
+        (309, 210000, "persistent", "shared_tiles"),
+        (336, 210000, "persistent", "shared_tiles"),
+        (337, 210000, "shared_tiles", "shared_tiles"),
+        (309, 212992, "persistent", "shared_tiles"),
+        (309, 213008, "shared_tiles", "shared_tiles"),
+        (336, 224000, "shared_tiles", "shared_tiles"),
+        (308, 229376, "persistent", "shared_tiles"),
+        (309, 229376, "shared_tiles", "shared_tiles"),
+        # 5-tile 16-CTA chunks of four persistent trips keep the shared-tile kernel.
+        (48, 151936, "shared_tiles", "shared_tiles"),
+        (56, 163840, "shared_tiles", "shared_tiles"),
+        # Full 16-CTA chunks: 10 (sm_100) or 8 (sm_103) rows per shared-tile cluster.
+        (263, 256000, "persistent", "persistent"),
+        (264, 256000, "persistent", "shared_tiles"),
+        (309, 256000, "persistent", "shared_tiles"),
+        (310, 256000, "shared_tiles", "shared_tiles"),
+        (320, 256000, "shared_tiles", "shared_tiles"),
+        (336, 256000, "shared_tiles", "shared_tiles"),
+    ],
+)
+def test_blackwell_cached_cluster_route_boundaries_per_arch(
+    rows, vocab_size, sm100_route, sm103_route
+):
+    # These rows sit at the boundaries set by the resident clusters of each part.
+    _skip_unless_b200_or_gb300()
+    _check_cached_cluster_route(rows, vocab_size, sm100_route, sm103_route)
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size", [(281, 180000), (336, 180000), (309, 210000), (336, 210000)]
+)
+@pytest.mark.parametrize("temperature_kind", ["scalar", "scalar_pdl", "per_row"])
+def test_blackwell_cached_cluster_partial_tile_trip_cap_per_arch(
+    rows, vocab_size, temperature_kind
+):
+    # On sm_100, 6- and 7-tile 16-CTA chunks whose last tile holds at most 6/8
+    # (6 tiles) or 4/8 (7 tiles) of a tile keep the persistent kernel up to 24
+    # persistent trips, unless the temperature is per row; sm_103 takes the
+    # shared-tile kernel.
+    _skip_unless_b200_or_gb300()
+    torch.manual_seed(7)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    enable_pdl = temperature_kind == "scalar_pdl"
+    if temperature_kind == "per_row":
+        temperature = torch.rand(rows, device="cuda") * 0.9 + 0.1
+        probs_ref = torch.softmax(logits / temperature[:, None], dim=-1)
+    else:
+        temperature = 0.5
+        probs_ref = torch.softmax(logits / temperature, dim=-1)
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    persistent = (
+        torch.cuda.get_device_capability() == (10, 0) and temperature_kind != "per_row"
+    )
+    assert route == (
+        flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_PERSISTENT
+        if persistent
+        else flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_SHARED_TILES
+    )
+    probs = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    torch.testing.assert_close(probs, probs_ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "vocab_size,ten_cta_tiles",
+    [
+        (131080, 8),  # 5-tile 16-CTA chunks, 7-tile 10-CTA chunks
+        (163840, 8),  # 8-tile 10-CTA chunks
+        (180000, 10),  # 9-tile 10-CTA chunks
+        (204800, 10),  # 7-tile 16-CTA chunks, 10-tile 10-CTA chunks
+        (204808, 0),  # 11-tile 10-CTA chunks keep 16 CTAs
+    ],
+)
+@pytest.mark.parametrize("rows", [21, 22, 23, 24, 28, 29])
+@pytest.mark.parametrize("temperature_kind", ["scalar", "scalar_pdl", "per_row"])
+def test_blackwell_cached_cluster_ten_cta_rows_per_arch(
+    vocab_size, ten_cta_tiles, rows, temperature_kind
+):
+    # On sm_103 these batches take the 10-CTA kernel from 11/14 of its resident
+    # clusters up to all of them (22 to 28 rows on GB300), unless the
+    # temperature is per row; on sm_100 they keep 16 CTAs.
+    _skip_unless_b200_or_gb300()
+    torch.manual_seed(7)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    enable_pdl = temperature_kind == "scalar_pdl"
+    if temperature_kind == "per_row":
+        temperature = torch.rand(rows, device="cuda") * 0.9 + 0.1
+        probs_ref = torch.softmax(logits / temperature[:, None], dim=-1)
+    else:
+        temperature = 0.5
+        probs_ref = torch.softmax(logits / temperature, dim=-1)
+    kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    ten = (
+        torch.cuda.get_device_capability() == (10, 3)
+        and temperature_kind != "per_row"
+        and ten_cta_tiles > 0
+        and 22 <= rows <= 28
+    )
+    assert kernel[:2] == ((10, ten_cta_tiles) if ten else (16, 8))
+    probs = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    torch.testing.assert_close(probs, probs_ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size,temperature_kind,sm100_chunk,sm103_chunk",
+    [
+        # 4-tile 16-CTA row kernel past one wave or with a cut of more than 1/16.
+        (8, 100000, "none", 6272, 6272),
+        (8, 100000, "scalar", 6272, 6272),
+        (28, 48000, "none", 3008, 3008),
+        (55, 120000, "none", 7520, 7520),
+        # 8-CTA shared-tile and persistent kernels (on sm_103 the persistent
+        # kernel only with a cut of at least 1/10).
+        (45, 81928, "none", 10272, 10272),
+        (320, 69632, "none", 8704, 8704),
+        (82, 70000, "none", 8768, 8768),
+        (52, 100000, "scalar_pdl", 12512, 12512),
+        (370, 66000, "none", 10240, 8256),  # five waves of shared-tile clusters (GB300)
+        (48, 76000, "none", 9504, 9504),
+        (82, 76000, "none", 9504, 9504),
+        (50, 110000, "none", 14336, 13760),
+        (52, 90000, "scalar_pdl", 11264, 11264),
+        (89, 73728, "none", 9216, 9216),  # a cut of exactly 1/10
+        (128, 100000, "none", 12512, 12512),
+        (96, 100000, "scalar_pdl", 12512, 12512),
+        (87, 76000, "none", 9504, 10240),
+        (85, 90000, "none", 11264, 12288),
+        (54, 105000, "none", 13152, 14336),
+        (64, 120000, "none", 15008, 16384),
+        # 16-CTA shared-tile and persistent kernels with a cut of at least 1/10,
+        # or on sm_100 past one wave.
+        (30, 140000, "none", 8768, 8768),
+        (70, 201088, "none", 12576, 12576),
+        (32, 151936, "none", 9504, 10240),
+        (40, 151936, "none", 9504, 10240),
+        (64, 180000, "none", 11264, 12288),
+        # Whole tiles: the wide row kernel, a one-wave 16-CTA chunk with a cut
+        # under 1/10, a one-wave 4-tile 16-CTA row kernel with a cut of at most
+        # 1/16, the 8-tile 16-CTA row kernel, and rows past five waves (180
+        # rows are five persistent waves on GB300) or past one wave with a cut
+        # of at most 1/16.
+        (8, 256000, "none", 26624, 22528),
+        (24, 151936, "none", 10240, 16384),
+        (8, 126464, "none", 8192, 8192),
+        (1, 151936, "none", 10240, 10240),
+        (180, 71680, "none", 10240, 8960),
+        (181, 71680, "none", 10240, 10240),
+        (371, 66000, "none", 10240, 10240),
+        (76, 92000, "none", 12288, 12288),
+    ],
+)
+def test_blackwell_cached_cluster_balanced_chunk_per_arch(
+    rows, vocab_size, temperature_kind, sm100_chunk, sm103_chunk
+):
+    # These kernels cover ceil(V / C) rounded up to 32 elements per CTA instead
+    # of whole tiles; the expected chunk depends on the GPU's resident clusters.
+    _skip_unless_b200_or_gb300()
+    torch.manual_seed(11)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    temperature = None if temperature_kind == "none" else 0.7
+    enable_pdl = temperature_kind == "scalar_pdl"
+    probs_ref = torch.softmax(
+        logits if temperature is None else logits / temperature, dim=-1
+    )
+    kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    on_sm100 = torch.cuda.get_device_capability() == (10, 0)
+    assert kernel[5] == (sm100_chunk if on_sm100 else sm103_chunk)
+    probs = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    torch.testing.assert_close(probs, probs_ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "extra_rows,vocab_size,sm100_ctas",
+    [
+        (0, 32000, 8),  # rows * 4 CTAs == 2 * SMs: sm_100 keeps spreading to 8 CTAs
+        (0, 28672, 8),  # from 14 tiles of vocabulary
+        (0, 28664, 4),
+        (2, 32768, 8),  # up to 8 CTAs past it from 15 tiles of vocabulary
+        (2, 30712, 4),
+        (3, 32768, 4),
+    ],
+)
+def test_blackwell_cached_cluster_four_tile_chunks_spread_at_twice_the_sms(
+    extra_rows, vocab_size, sm100_ctas
+):
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+    if sm_count % 2:
+        pytest.skip("The rule is stated for an even SM count")
+
+    torch.manual_seed(7)
+    rows = sm_count // 2 + extra_rows
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        logits, temperature=0.5
+    )
+    expected = sm100_ctas if capability == (10, 0) else 4
+    assert kernel[:2] == (expected, 4)
+    probs = flashinfer.sampling.softmax(logits, temperature=0.5)
+    torch.testing.assert_close(
+        probs, torch.softmax(logits / 0.5, dim=-1), atol=1e-3, rtol=1e-3
+    )
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size",
+    [
+        (1, 32004),  # vocabulary not a multiple of 8
+        (256, 262152),  # wider than the 16 x 8 x 2048 cache
+    ],
+)
+def test_blackwell_cached_cluster_route_declines_unaligned_rows(rows, vocab_size):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=None, enable_pdl=False
+    )
+    probs = flashinfer.sampling.softmax(logits, temperature=None, enable_pdl=False)
+
+    assert route not in (
+        flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_FALLBACK,
+        flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER,
+        flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_PERSISTENT,
+        flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_SHARED_TILES,
+    )
+    torch.testing.assert_close(
+        probs, torch.softmax(logits, dim=-1), atol=1e-3, rtol=1e-3
+    )
+
+
+@pytest.mark.parametrize("rows,vocab_size", [(16, 32000), (256, 32004), (1, 111)])
+def test_blackwell_misaligned_base_pointer_takes_fallback(rows, vocab_size):
+    # Every generated route reads 128/256-bit vectors relative to the buffer
+    # base; a storage-offset view with a 16-byte aligned base must not reach
+    # them (the bootstrap kernel faults with cudaErrorMisalignedAddress).
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    storage = torch.randn(rows * vocab_size + 4, device="cuda")
+    logits = storage[4:].view(rows, vocab_size)  # contiguous, 16-byte aligned base
+    assert logits.is_contiguous() and logits.data_ptr() % 32 == 16
+
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=None, enable_pdl=False
+    )
+    probs = flashinfer.sampling.softmax(logits, temperature=None, enable_pdl=False)
+
+    assert route == flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_FALLBACK
+    torch.testing.assert_close(
+        probs, torch.softmax(logits, dim=-1), atol=1e-3, rtol=1e-3
+    )
 
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
@@ -76,6 +1000,95 @@ def test_softmax(
     assert torch.allclose(probs, probs_ref, atol=1e-5)
 
 
+# Batches of at most 128 rows with a vocabulary of at least 24576 take the vocab-splitting
+# map-reduce kernels; the rest take the fused kernel.
+@pytest.mark.parametrize("batch_size,vocab_size", [(128, 4096), (4, 32768)])
+def test_softmax_pdl_waits_for_temperature(batch_size, vocab_size):
+    logits = torch.randn(batch_size, vocab_size, device="cuda")
+    if not device_support_pdl(logits.device):
+        pytest.skip("PDL not supported on this device")
+    workspace = torch.empty(1024 * 1024, dtype=torch.uint8, device="cuda")
+    softmax = flashinfer.sampling.get_sampling_module().softmax
+    temperature_value = 0.5
+
+    temperature = torch.full((batch_size,), temperature_value, device="cuda")
+    expected = softmax(workspace, logits, temperature, 0.0, False)
+
+    # Row 0's temperature is what the previous kernel is still producing.
+    # No other kernel may run between that producer and the softmax kernel.
+    temperature[0] = temperature_value * 4
+    late_store(temperature, temperature_value)
+    probs = softmax(workspace, logits, temperature, 0.0, True)
+
+    torch.testing.assert_close(probs, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "batch_size,vocab_size,temperature_kind",
+    [
+        (1, 32000, "none"),  # cached cluster route, one row spread over 16 CTAs
+        (256, 32000, "none"),  # cached cluster route, 4-CTA clusters
+        (256, 64000, "none"),  # cached cluster route, 8-CTA clusters
+        (512, 64000, "none"),  # cached cluster route, 8-CTA clusters
+        (1024, 64000, "none"),  # cached cluster route, 8-CTA clusters
+        (48, 256000, "none"),  # persistent 16-CTA non-portable clusters
+        (1024, 256000, "none"),  # shared-tile 16-CTA non-portable clusters
+        (989, 128256, "per_row"),  # shared-tile 8-CTA clusters, per-row temperature
+        (1, 32004, "none"),  # cooperative bootstrap route (vocab not a multiple of 8)
+        (256, 32004, "none"),  # rowwise route (vocab not a multiple of 8)
+        (1, 111, "scalar"),  # scalar-temperature warp-packed route
+        (1, 111, "per_row"),  # per-row-temperature warp-packed route
+    ],
+)
+def test_softmax_blackwell_routes(batch_size, vocab_size, temperature_kind):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Cake softmax routes require SM100 or SM103")
+
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size, device="cuda")
+    if temperature_kind == "none":
+        temperature = None
+        probs_ref = torch.softmax(logits, dim=-1)
+    elif temperature_kind == "scalar":
+        temperature = 0.5
+        probs_ref = torch.softmax(logits / temperature, dim=-1)
+    else:
+        temperature = torch.full((batch_size,), 0.5, device="cuda")
+        probs_ref = torch.softmax(logits / temperature[:, None], dim=-1)
+    probs = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=False
+    )
+
+    assert torch.allclose(probs, probs_ref, atol=1e-5)
+
+
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+def test_softmax_blackwell_random_per_row_temperature_contract(vocab_size):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Cake softmax routes require SM100 or SM103")
+
+    torch.manual_seed(42)
+    rows = 989
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    temperature = torch.rand(rows, device="cuda")
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=temperature, enable_pdl=True
+    )
+    probs = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=True
+    )
+    probs_ref = torch.softmax(logits / temperature[:, None], dim=-1)
+
+    assert route != flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_FALLBACK
+    assert probs.data_ptr() != logits.data_ptr()
+    torch.testing.assert_close(
+        probs,
+        probs_ref,
+        atol=1e-3,
+        rtol=1e-3,
+    )
+
+
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize(
     "distribution",
@@ -88,11 +1101,11 @@ def test_softmax(
 @pytest.mark.parametrize("zero_ratio", [0.0, 0.5, 0.9])
 def test_sampling_freq(vocab_size, distribution, zero_ratio):
     torch.manual_seed(42)
-    num_trials = 5000000
     logits = distribution((1, vocab_size), "cuda:0")
     zero_indices = torch.randperm(vocab_size)[: int(vocab_size * zero_ratio)]
     logits[:, zero_indices] = -float("inf")
     probs = torch.softmax(logits, dim=-1)
+    num_trials = required_num_trials(probs, compare_two_samples=False)
     counter = torch.zeros(vocab_size, dtype=torch.int32, device=logits.device)
 
     samples = flashinfer.sampling.sampling_from_probs(
@@ -127,8 +1140,8 @@ def test_top_p_sampling_freq(vocab_size, distribution, p):
     mask.scatter_add_(1, indices, (cdf > (1 - p)).int())
 
     renorm_probs = flashinfer.sampling.top_p_renorm_probs(probs, p)
+    num_trials = required_num_trials(renorm_probs, compare_two_samples=False)
     counter = torch.zeros(vocab_size, dtype=torch.int32, device=logits.device)
-    num_trials = 5000000
     samples = flashinfer.sampling.top_p_sampling_from_probs(
         probs,
         p,
@@ -162,8 +1175,8 @@ def test_top_k_sampling_freq(vocab_size, distribution, k):
     mask = (probs >= pivot.unsqueeze(-1)).int()
 
     renorm_probs = flashinfer.sampling.top_k_renorm_probs(probs, k)
+    num_trials = required_num_trials(renorm_probs, compare_two_samples=False)
     counter = torch.zeros(vocab_size, dtype=torch.int32, device=logits.device)
-    num_trials = 5000000
     samples = flashinfer.sampling.top_k_sampling_from_probs(
         probs,
         k,
@@ -211,9 +1224,9 @@ def test_sampling_from_logits(batch_size, vocab_size):
 )
 def test_sampling_from_logits_freq(vocab_size, distribution):
     torch.manual_seed(42)
-    num_trials = 5000000
     logits = distribution((1, vocab_size), "cuda:0")
     probs = torch.softmax(logits, dim=-1)
+    num_trials = required_num_trials(probs, compare_two_samples=False)
     counter = torch.zeros(vocab_size, dtype=torch.int32, device=logits.device)
     samples = flashinfer.sampling.sampling_from_logits(
         logits, indices=torch.zeros(num_trials, dtype=torch.int32, device=logits.device)
@@ -359,10 +1372,15 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
         ]
 
 
-@pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
-@pytest.mark.parametrize("k", [100])
-@pytest.mark.parametrize("p", [0.1, 0.5])
+@parametrize_product(
+    {
+        "batch_size": [1, 99, 989],
+        "vocab_size": [111, 32000, 128256],
+        "k": [100],
+        "p": [0.1, 0.5],
+    },
+    regular=pairwise_product_cases,
+)
 def test_top_k_top_p_sampling_from_probs_logits_alignment(batch_size, vocab_size, k, p):
     torch.manual_seed(42)
     logits = torch.randn(batch_size, vocab_size, device="cuda:0") * 5
@@ -391,6 +1409,70 @@ def test_top_k_top_p_sampling_from_probs_logits_alignment(batch_size, vocab_size
         f"Sample match rate {match_rate:.2%} is below threshold "
         f"({samples.numel() - num_matches}/{samples.numel()} mismatches, expected <=5%)"
     )
+
+
+def _top_k_top_p_sample(x, top_k, top_p, from_logits, **kwargs):
+    if from_logits:
+        return flashinfer.sampling.top_k_top_p_sampling_from_logits(
+            x, top_k, top_p, **kwargs
+        )
+    return flashinfer.sampling.top_k_top_p_sampling_from_probs(
+        torch.softmax(x, dim=-1), top_k, top_p, **kwargs
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 99])
+@pytest.mark.parametrize("top_k_max", [64, 256])
+@pytest.mark.parametrize("from_logits", [False, True])
+def test_top_k_top_p_sampling_per_row_k_with_top_k_max(
+    batch_size, top_k_max, from_logits
+):
+    torch.manual_seed(42)
+    vocab_size = 128256
+    logits = torch.randn(batch_size, vocab_size, device="cuda:0") * 5
+    top_k = torch.randint(1, top_k_max + 1, (batch_size,), device="cuda:0")
+    # Rows above the bound, including "no top-k" rows, behave as top_k == top_k_max.
+    top_k[0] = vocab_size
+    top_k[-1] = -1
+    expected_k = torch.where(top_k < 0, top_k_max, top_k.clamp(max=top_k_max))
+    sorted_logits, _ = torch.sort(logits, descending=True)
+    pivot = sorted_logits[torch.arange(batch_size), expected_k - 1]
+    mask = logits >= pivot.unsqueeze(-1)
+
+    generator = torch.Generator("cuda:0").manual_seed(0)
+    for _ in range(100):
+        samples = _top_k_top_p_sample(
+            logits, top_k, 0.9, from_logits, top_k_max=top_k_max, generator=generator
+        )
+        assert torch.all(mask[torch.arange(batch_size), samples])
+
+
+@pytest.mark.parametrize("k", [16, 200])
+@pytest.mark.parametrize("from_logits", [False, True])
+def test_top_k_top_p_sampling_per_row_k_with_top_k_max_freq(k, from_logits):
+    torch.manual_seed(42)
+    p = 0.9
+    vocab_size, num_rows, num_iters = 128256, 1000, 50
+    logits = torch.randn(1, vocab_size, device="cuda:0") * 2
+    probs = torch.softmax(logits, dim=-1)
+    ref = flashinfer.sampling.top_p_renorm_probs(
+        flashinfer.sampling.top_k_renorm_probs(probs, k), p
+    )[0]
+
+    # The fast path rejects `indices`, so repeat the row instead.
+    x = logits.expand(num_rows, -1).contiguous()
+    top_k = torch.full((num_rows,), k, dtype=torch.int32, device="cuda:0")
+    generator = torch.Generator("cuda:0").manual_seed(0)
+    counter = torch.zeros(vocab_size, dtype=torch.int32, device="cuda:0")
+    for _ in range(num_iters):
+        samples = _top_k_top_p_sample(
+            x, top_k, p, from_logits, top_k_max=256, generator=generator
+        )
+        counter.scatter_add_(0, samples.long(), torch.ones_like(samples))
+    freq = counter.float() / (num_rows * num_iters)
+    assert torch.all(ref[freq > 0] > 0)
+    similarity = torch.cosine_similarity(freq, ref, dim=0)
+    assert similarity > 0.99, f"similarity: {similarity}"
 
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
@@ -541,6 +1623,71 @@ def test_top_k_renorm_probs(batch_size, vocab_size, k, distribution, dtype):
         f"Some rows have more non-zero elements than allowed by ties. "
         f"nonzero_counts max: {nonzero_counts.max()}, max_valid max: {max_valid.max()}"
     )
+
+
+@pytest.mark.parametrize("top_k_arr", [True, False])
+@pytest.mark.parametrize("is_deterministic", [None, False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_top_k_renorm_probs_custom_op(top_k_arr, is_deterministic, dtype):
+    torch.manual_seed(42)
+    probs = torch.softmax(torch.randn(4, 128, device="cuda:0"), dim=-1).to(dtype)
+    if top_k_arr:
+        top_k = torch.tensor([1, 10, 50, 128], dtype=torch.int32, device=probs.device)
+        maybe_top_k_arr, top_k_val = top_k, 0
+    else:
+        top_k = 10
+        maybe_top_k_arr, top_k_val = None, top_k
+    row_states_buffer = torch.zeros(1024 * 1024, dtype=torch.uint8, device=probs.device)
+    op = flashinfer.sampling.get_sampling_module().top_k_renorm_probs
+
+    if is_deterministic is None:
+        # Preserve the four-argument call used by ProbsTopKOp.
+        actual = op(probs, maybe_top_k_arr, top_k_val, row_states_buffer)
+    else:
+        actual = op(
+            probs, maybe_top_k_arr, top_k_val, row_states_buffer, is_deterministic
+        )
+
+    expected = flashinfer.sampling.top_k_renorm_probs(
+        probs, top_k, is_deterministic=bool(is_deterministic)
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("k", [10, 500])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_top_k_renorm_probs_deterministic(batch_size, vocab_size, k, dtype):
+    """is_deterministic=True must be bitwise reproducible across invocations.
+
+    The default multi-CTA path accumulates the renormalization sum with float
+    atomicAdd, so CTA arrival order changes the last-bit rounding and repeated
+    calls on identical input differ bitwise. Replicated execution (e.g.
+    tensor-parallel ranks running the sampler redundantly on identical inputs)
+    then diverges, which desynchronizes downstream state. The deterministic
+    mode accumulates in fixed-point integer atomics instead.
+    """
+    if k > vocab_size:
+        pytest.skip("k should be less than vocab_size")
+
+    torch.manual_seed(42)
+    logits = normal_distribution(1)((batch_size, vocab_size), "cuda:0")
+    probs = torch.softmax(logits, dim=-1).to(dtype)
+
+    base = flashinfer.sampling.top_k_renorm_probs(probs, k, is_deterministic=True)
+    for _ in range(10):
+        again = flashinfer.sampling.top_k_renorm_probs(probs, k, is_deterministic=True)
+        assert torch.equal(again, base), "deterministic renorm differed across calls"
+
+    # Same kept support as the default kernel; values match within the
+    # fixed-point quantization noise (far below the test tolerance).
+    ref = flashinfer.sampling.top_k_renorm_probs(probs, k)
+    assert torch.equal(base > 0, ref > 0)
+    torch.testing.assert_close(base, ref, rtol=1e-3, atol=1e-3)
+
+    sums = base.float().sum(dim=-1)
+    torch.testing.assert_close(sums, torch.ones_like(sums), rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
@@ -766,6 +1913,50 @@ def test_top_k_mask_logits_mixed_k_persistent_loop(dtype):
             )
 
 
+@pytest.mark.parametrize("initial_offset", [0, 12])
+def test_get_seed_and_offset_reserves_current_range(initial_offset):
+    seed = 12345
+    generator = torch.Generator(device="cuda:0").manual_seed(seed)
+    generator.set_offset(initial_offset)
+    expected_offset = initial_offset
+
+    for increment in [1, 5, 32, 2, 0]:
+        actual_seed, actual_offset = flashinfer.sampling.get_seed_and_offset(
+            increment, generator
+        )
+        assert (actual_seed, actual_offset) == (seed, expected_offset)
+        expected_offset += (increment + 3) // 4 * 4
+        assert generator.get_offset() == expected_offset
+        assert generator.initial_seed() == seed
+
+
+def test_chain_speculative_sampling_reserves_current_range():
+    seed = 12345
+    generator = torch.Generator(device="cuda:0").manual_seed(seed)
+
+    # Rejection consumes N+2 draws: reserve 8 for N=3, then 4 for N=1.
+    for n, offset, next_offset in [(3, 0, 8), (1, 8, 12)]:
+        draft_probs = torch.zeros((1, n, 3), device="cuda:0")
+        draft_probs[..., 0] = 1
+        draft_token_ids = torch.zeros((1, n), dtype=torch.int32, device="cuda:0")
+        target_probs = torch.tensor(
+            [[[0.0, 0.5, 0.5]] + [[0.5, 0.5, 0.0]] * n], device="cuda:0"
+        )
+        args = (draft_probs, draft_token_ids, target_probs)
+
+        actual = flashinfer.sampling.chain_speculative_sampling(
+            *args, generator=generator
+        )
+        assert generator.get_offset() == next_offset
+        expected = flashinfer.sampling.chain_speculative_sampling(
+            *args, generator=generator, seed=seed, offset=offset
+        )
+        # Explicit seed/offset must bypass generator reservation.
+        assert generator.get_offset() == next_offset
+        for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+            torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("num_speculate_tokens", [1, 3, 5, 7])
@@ -832,6 +2023,55 @@ def test_chain_speculative_sampling(
                     assert torch.all(output_token_ids[row, mismatch_idx[0] + 1 :] == -1)
 
         assert torch.all(emitted_num + 1 == (output_token_ids != -1).sum(dim=1))
+
+
+@pytest.mark.parametrize(
+    "vocab_size", [1023, 1024, 1025, 4095, 4096, 4097, 32000, 32001, 128256, 151937]
+)
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_chain_speculative_sampling_residual_normalizer(vocab_size, deterministic):
+    # The residual relu(target - draft) is spread over many indices with unequal mass,
+    # so the value of its sum decides where the inverse-CDF walk stops. A reduction
+    # that drops tiles, vector lanes, or the cross-thread step samples from a truncated
+    # distribution and lowers the mean sampled index. The stride is not a multiple of
+    # the vector width, so every lane carries mass.
+    batch_size = 512
+    draft_probs = torch.zeros(batch_size, 1, vocab_size, device="cuda:0")
+    draft_probs[..., 0] = 1.0
+    draft_token_ids = torch.zeros((batch_size, 1), device="cuda:0", dtype=torch.int32)
+    target_probs = torch.zeros(batch_size, 2, vocab_size, device="cuda:0")
+    idx = torch.arange(1, vocab_size, 65, device="cuda:0")
+    weights = torch.arange(1, idx.numel() + 1, device="cuda:0", dtype=torch.float32)
+    probs = weights / weights.sum()
+    target_probs[:, 0, idx] = probs
+    target_probs[:, 1, 0] = 1.0
+    expected_mean = (idx.double() * probs.double()).sum()
+    variance = ((idx.double() - expected_mean) ** 2 * probs.double()).sum()
+
+    samples = []
+    for seed in (12345, 999, 7):
+        output_token_ids, accepted_num, _ = (
+            flashinfer.sampling.chain_speculative_sampling(
+                draft_probs,
+                draft_token_ids,
+                target_probs,
+                deterministic=deterministic,
+                seed=seed,
+                offset=17,
+            )
+        )
+        # The draft token has no target mass, so every row resamples the residual.
+        assert torch.all(accepted_num == 0)
+        assert torch.all(output_token_ids[:, 1:] == -1)
+        assert torch.all(
+            torch.isin(output_token_ids[:, 0], idx.to(output_token_ids.dtype))
+        )
+        samples.append(output_token_ids[:, 0].double())
+
+    drawn = torch.cat(samples)
+    # Six standard errors: a correct kernel fails this about once in 5e8 runs.
+    standard_error = (variance / drawn.numel()).sqrt()
+    assert (drawn.mean() - expected_mean).abs() < 6 * standard_error
 
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
@@ -1023,9 +2263,13 @@ def test_sampling_from_logits_seed_offset_reproducibility(batch_size, vocab_size
 def test_sampling_different_seed_offset_produces_different_results(vocab_size):
     """Test that different seed/offset values produce different samples."""
     torch.manual_seed(42)
-    batch_size = 1000
+    # Size the two all-match checks before drawing outputs. Larger batch shapes
+    # remain covered by the seed/offset reproducibility tests above.
+    batch_size = 16
     pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+    num_rows = required_num_collision_rows(normalized_prob)
+    normalized_prob = normalized_prob[:num_rows]
 
     samples_seed1 = flashinfer.sampling.sampling_from_probs(
         normalized_prob, seed=12345, offset=0
@@ -1211,3 +2455,134 @@ if __name__ == "__main__":
     # test_top_k_mask_logits(99, 989, 10)
     # test_chain_speculative_sampling(3, 111, 3, False)
     # test_chain_speculative_sampling(3, 111, 3, True)
+
+
+@pytest.mark.parametrize("api", ["top_k", "top_k_top_p"])
+@pytest.mark.parametrize("indices_dtype", [None, torch.int32, torch.int64])
+@pytest.mark.parametrize("threshold_dtype", [torch.int32, torch.int64])
+def test_per_request_top_k_with_indices_dtype(api, indices_dtype, threshold_dtype):
+    """Check the threshold element type without relying on a row-remapping fix.
+
+    Each case uses one batched call and identity indices (or no indices), so
+    probability-row and output-position indexing agree even without #5340.
+    """
+    device = "cuda:0"
+    repeats = 1024
+    rows = torch.tensor(
+        [[0.5, 0.25, 0.125, 0.125]] * 3, dtype=torch.float32, device=device
+    )
+    probs = rows.repeat(repeats, 1)
+    top_k = torch.tensor([1, 2, 4], dtype=threshold_dtype, device=device).repeat(
+        repeats
+    )
+    indices = (
+        None
+        if indices_dtype is None
+        else torch.arange(probs.size(0), dtype=indices_dtype, device=device)
+    )
+    before_probs, before_top_k = probs.clone(), top_k.clone()
+    before_indices = None if indices is None else indices.clone()
+    kwargs = dict(indices=indices, seed=20260920, offset=0, return_valid=True)
+    if api == "top_k":
+        out, valid = flashinfer.sampling.top_k_sampling_from_probs(
+            probs, top_k, **kwargs
+        )
+    else:
+        out, valid = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+            probs, top_k, 1.0, filter_apply_order="joint", **kwargs
+        )
+    output_dtype = torch.int32 if indices is None else indices.dtype
+    assert out.shape == (probs.size(0),) and out.dtype == output_dtype
+    assert valid.shape == out.shape and valid.dtype == torch.bool
+    assert bool(valid.all())
+    assert bool(((out >= 0) & (out < rows.size(1))).all())
+    assert torch.equal(probs, before_probs)
+    assert torch.equal(top_k, before_top_k)
+    if indices is not None:
+        assert torch.equal(indices, before_indices)
+    samples = out.reshape(repeats, 3)
+    expected = [[0], [0, 1], [0, 1, 2, 3]]
+    for lane, support in enumerate(expected):
+        observed = torch.unique(samples[:, lane]).tolist()
+        assert observed == support, (
+            api,
+            indices_dtype,
+            threshold_dtype,
+            lane,
+            observed,
+        )
+
+
+@pytest.mark.parametrize("api", ["top_k", "min_p"])
+@pytest.mark.parametrize("remap", ["keep_all", "argmax", "mixed"])
+@pytest.mark.parametrize("expanded", [False, True], ids=["equal_rows", "more_outputs"])
+def test_per_request_param_indexed_by_row(api, remap, expanded):
+    """A per-request threshold must be read from the probs row ``indices`` selects.
+
+    The three rows have different argmax classes and binary-exact probabilities, so
+    the expected answer for each row is an exact set. Each lane's threshold either
+    keeps everything or keeps the argmax alone, and the remapping gives neighbouring
+    lanes different rows, so reading the threshold by output position changes at
+    least one lane's answer in every case here.
+
+    ``equal_rows`` repeats the rows and the thresholds so that the output-indexed
+    read stays in bounds: it is a negative control with a wrong answer rather than a
+    crash. ``more_outputs`` is the shape the fix enables -- fewer probs rows than
+    outputs -- where the output-indexed read would run off the threshold array.
+    """
+    rows = torch.tensor(
+        [
+            [0.5, 0.25, 0.125, 0.125],
+            [0.125, 0.5, 0.25, 0.125],
+            [0.125, 0.125, 0.5, 0.25],
+        ],
+        dtype=torch.float32,
+        device="cuda:0",
+    )
+    num_classes = rows.size(1)
+    lanes = 1024
+    # row 1 keeps every class; rows 0 and 2 keep their argmax only.
+    if api == "top_k":
+        values, dtype = [1, num_classes, 1], torch.int32
+    else:
+        values, dtype = [0.9, 0.01, 0.9], torch.float32
+    threshold = torch.tensor(values, dtype=dtype, device=rows.device)
+    mapping = {"keep_all": [1, 1, 1], "argmax": [2, 0, 2], "mixed": [1, 2, 0]}[remap]
+    indices = torch.tensor(mapping, dtype=torch.int32, device=rows.device).repeat(lanes)
+    if expanded:
+        probs = rows
+    else:
+        probs = rows.repeat(lanes, 1)
+        threshold = threshold.repeat(lanes)
+
+    probs_before = probs.clone()
+    threshold_before = threshold.clone()
+    indices_before = indices.clone()
+    fn = (
+        flashinfer.sampling.top_k_sampling_from_probs
+        if api == "top_k"
+        else flashinfer.sampling.min_p_sampling_from_probs
+    )
+    samples, valid = fn(
+        probs, threshold, indices=indices, seed=20260919, offset=0, return_valid=True
+    )
+
+    assert samples.shape == indices.shape
+    assert samples.dtype == indices.dtype
+    assert valid.shape == indices.shape and valid.dtype == torch.bool
+    assert bool(valid.all())
+    assert bool(((samples >= 0) & (samples < num_classes)).all())
+    assert torch.equal(probs, probs_before)
+    assert torch.equal(threshold, threshold_before)
+    assert torch.equal(indices, indices_before)
+
+    samples = samples.reshape(lanes, len(mapping))
+    for lane, row_idx in enumerate(mapping):
+        counts = torch.bincount(samples[:, lane].long(), minlength=num_classes)
+        if row_idx == 1:
+            # Every class of row 1 has probability >= 1/8, so a lane that keeps all of
+            # them misses one with probability at most 4 * (7/8)**1024 (~1e-59).
+            assert bool((counts > 0).all()), (remap, lane, counts)
+        else:
+            # rows 0 and 2 keep their argmax alone, and row i's argmax is class i.
+            assert counts[row_idx].item() == lanes, (remap, lane, counts)

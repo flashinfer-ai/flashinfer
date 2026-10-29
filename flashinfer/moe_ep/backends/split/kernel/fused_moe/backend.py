@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 from typing import TYPE_CHECKING, Optional
 
 from .....config import BootstrapConfig, EpAlgorithm, EpLayout, FleetParams
@@ -12,7 +13,9 @@ from .....weights import MoEWeightPack
 from .bridge import (
     build_activation_pack,
     build_activation_pack_rank_major,
+    dispatch_quant_format,
     pack_mxfp8_dispatch_payload,
+    quantize_for_dispatch,
     reshape_for_combine,
 )
 from .config import FusedMoeKernelConfig
@@ -47,12 +50,15 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
     ) -> None:
         validate_compute_consistency(fleet_params, bootstrap, self._moe_config)
         if self._mxfp8_dispatch:
-            from ......fused_moe.api import CuteDslConfig, QuantVariant
+            from ......fused_moe.api import CuteDslConfig, QuantFormat
             from .....core.validation.common import MoEEpConfigError
 
-            if self._moe_config.quant.variant is not QuantVariant.MXFP4:
+            if self._moe_config.quant.pair != (
+                QuantFormat.MXFP4,
+                QuantFormat.MXFP8,
+            ):
                 raise MoEEpConfigError(
-                    "mxfp8_dispatch requires MoEConfig quant variant MXFP4."
+                    "mxfp8_dispatch requires MoEConfig quant pair MXFP4×MXFP8."
                 )
             backends = tuple(self._moe_config.backend)
             if len(backends) != 1 or not isinstance(backends[0], CuteDslConfig):
@@ -64,6 +70,21 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
         if not self._mxfp8_dispatch:
             return x
         return pack_mxfp8_dispatch_payload(x)
+
+    @property
+    def packs_dispatch_payload(self) -> bool:
+        return self._mxfp8_dispatch
+
+    def dispatch_format(self):
+        quant = self._moe_config.quant
+        return dispatch_quant_format(
+            quant,
+            per_token_activation=bool(quant.per_token_scale),
+            mxfp8_dispatch=self._mxfp8_dispatch,
+        )
+
+    def quantize_for_dispatch(self, x):
+        return quantize_for_dispatch(x, self._moe_config.quant)
 
     def preprocess_weights(
         self,
@@ -93,10 +114,25 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
             self._compute = MoELayer(compute_cfg)
         return self._compute
 
+    def _recv_count_for_exclusion(self, ctx: SplitKernelContext):
+        """Per-expert REAL token counts, to be used to drop EP padding.
+
+        Guarded by env var FLASHINFER_MOE_EP_EXCLUDE_PADDING_ROWS=1 (off by default)
+
+        Returns None if all the rows should be considered real tokens
+        """
+        if ctx.recv_count is None:
+            return None
+        if ctx.fleet_params.layout is not EpLayout.EXPERT_MAJOR:
+            return None
+        if os.environ.get("FLASHINFER_MOE_EP_EXCLUDE_PADDING_ROWS", "0") != "1":
+            return None
+        return ctx.recv_count
+
     def compute(self, ctx: SplitKernelContext):
         expert_tensors = ctx.expert_tensors
-        quant_variant = self._moe_config.quant.variant
-        per_token_activation = bool(self._moe_config.quant.per_token_scale)
+        quant = self._moe_config.quant
+        per_token_activation = bool(quant.per_token_scale)
         offset = self._moe_config.experts.local_expert_offset
         dim0, dim1, _ = expert_tensors.shape
 
@@ -114,19 +150,23 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
                 ctx.recv_topk_weights,
                 num_local_experts=self._moe_config.experts.local_num_experts,
                 local_expert_offset=offset,
-                quant_variant=quant_variant,
+                num_experts=self._moe_config.routing.num_experts,
+                quant=quant,
                 per_token_activation=per_token_activation,
                 mxfp8_dispatch=self._mxfp8_dispatch,
                 hidden_size=fleet_params.token_hidden_size,
+                recv_scale=ctx.expert_tensors_scale,
             )
         else:
             act_pack = build_activation_pack(
                 expert_tensors,
                 local_expert_offset=offset,
-                quant_variant=quant_variant,
+                quant=quant,
                 per_token_activation=per_token_activation,
                 mxfp8_dispatch=self._mxfp8_dispatch,
                 hidden_size=fleet_params.token_hidden_size,
+                recv_count=self._recv_count_for_exclusion(ctx),
+                num_experts=self._moe_config.routing.num_experts,
             )
 
         out_2d = self._ensure_compute(fleet_params)(act_pack, self._transformed_weights)

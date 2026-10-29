@@ -23,9 +23,21 @@ from tests.test_helpers.jit_utils import (
     gen_prefill_attention_modules,
 )
 from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
+from tests.test_helpers.parametrize import (
+    parametrize_product,
+    pairwise_product_cases,
+)
 from functools import partial
 import flashinfer
+import flashinfer.cudnn.decode as cudnn_decode
+from flashinfer.cudnn.utils import cudnn_frontend_serves_frost_decode
+from flashinfer.cutile.cutile_common import is_cuda_tile_available
+from flashinfer.decode import _DECODE_AUTO_CUDNN_ENV
 from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
+
+
+# H100 CI peak GPU memory: 62.6 GiB.
+pytestmark = pytest.mark.gpu_exclusive
 
 
 def head_dim_512_supported() -> bool:
@@ -38,28 +50,11 @@ def skip_if_head_dim_unsupported(head_dim: int):
         pytest.skip("16-bit FA2 head_dim > 256 is only supported on SM80 or newer")
 
 
-def skip_if_head_dim_dtype_unsupported(head_dim: int, kv_dtype: torch.dtype):
-    skip_if_head_dim_unsupported(head_dim)
-    if (
-        head_dim > 256
-        and kv_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-        and get_compute_capability(torch.device("cuda:0"))[0] < 10
-    ):
-        pytest.skip("head_dim > 256 with FP8 KV is only validated on SM100 or newer")
-
-
 def skip_if_nvfp4_large_head_decode_unsupported(head_dim: int):
     if head_dim > 256 and get_compute_capability(torch.device("cuda:0"))[0] < 10:
         pytest.skip(
             "head_dim > 256 with NVFP4 KV decode is only validated on SM100 or newer"
         )
-
-
-def skip_if_nvfp4_kv_unsupported():
-    # Mirrors the guard in flashinfer.decode/prefill: no NVFP4-KV decode
-    # kernels exist for SM107.
-    if get_compute_capability(torch.device("cuda:0")) == (10, 7):
-        pytest.skip("KV Cache NVFP4 is not supported on SM107")
 
 
 @pytest.fixture(
@@ -96,20 +91,9 @@ def warmup_jit():
     yield
 
 
-@pytest.mark.parametrize("batch_size", [12, 17, 128])
-@pytest.mark.parametrize("kv_len", [54, 97, 512, 2048, 16384])
-@pytest.mark.parametrize("page_size", [1, 8, 16])
-@pytest.mark.parametrize("num_kv_heads", [4])
-@pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("head_dim", [128, 256, 512])
-@pytest.mark.parametrize("kv_layout", ["NHD"])
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
-@pytest.mark.parametrize("logits_soft_cap", [0.0])
-@pytest.mark.parametrize("return_lse", [True])
-@pytest.mark.parametrize("q_dtype", [torch.float16])
-@pytest.mark.parametrize("kv_dtype", [torch.float16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("contiguous_kv", [True])
-def test_batch_decode_with_paged_kv_cache(
+# Shared with test_batch_decode_cutile.py so both backends use the same oracle.
+def _run_batch_decode_with_paged_kv_cache_case(
+    backend,
     batch_size,
     kv_len,
     page_size,
@@ -124,7 +108,23 @@ def test_batch_decode_with_paged_kv_cache(
     kv_dtype,
     contiguous_kv,
 ):
-    skip_if_head_dim_dtype_unsupported(head_dim, kv_dtype)
+    """Run one paged-decode backend case against the single-decode reference."""
+    # cuTile decode backend capability bounds (mirror the NotImplemented guards
+    # in BatchDecodeWithPagedKVCacheWrapper.run for backend=="cutile").
+    if backend == "cutile":
+        if not is_cuda_tile_available():
+            pytest.skip("cuda-tile / tileiras compiler not available")
+        if kv_layout != "NHD":
+            pytest.skip("cuTile decode requires kv_layout='NHD'.")
+        if pos_encoding_mode != "NONE":
+            pytest.skip(
+                "cuTile decode does not apply RoPE (pos_encoding_mode must be NONE)."
+            )
+        if kv_dtype == torch.float8_e4m3fn:
+            pytest.skip("cuTile decode fp8 KV not covered yet.")
+        if head_dim > 256:
+            pytest.skip("cuTile decode head_dim>256 not covered yet.")
+    skip_if_head_dim_unsupported(head_dim)
     q = torch.randn(batch_size, num_qo_heads, head_dim, device="cuda:0", dtype=q_dtype)
     num_pages_per_seq = (kv_len + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size
@@ -161,7 +161,7 @@ def test_batch_decode_with_paged_kv_cache(
 
     workspace_buffer = torch.empty(32 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
     wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
-        workspace_buffer, kv_layout
+        workspace_buffer, kv_layout, backend=backend
     )
     wrapper.plan(
         kv_indptr,
@@ -176,7 +176,10 @@ def test_batch_decode_with_paged_kv_cache(
         data_type=kv_dtype,
         q_data_type=q_dtype,
     )
-    if return_lse:
+    # cuTile decode backend does not support return_lse; the reference
+    # comparison below only checks `o`, so drop the LSE request for it.
+    want_lse = return_lse and backend != "cutile"
+    if want_lse:
         o, _ = wrapper.run(q, kv_data, return_lse=True)
     else:
         o = wrapper.run(q, kv_data)
@@ -228,6 +231,58 @@ def test_batch_decode_with_paged_kv_cache(
     o_buffer = torch.empty_like(o)
     wrapper.run(q, kv_data, out=o_buffer)
     torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("head_dim", [128, 256, 512])
+@pytest.mark.parametrize("kv_dtype", [torch.float16, torch.float8_e4m3fn])
+@parametrize_product(
+    {
+        "batch_size": [12, 17, 128],
+        "kv_len": [54, 97, 512, 2048, 16384],
+        "page_size": [1, 8, 16],
+        "num_kv_heads": [4],
+        "num_qo_heads": [4, 32],
+        "kv_layout": ["NHD"],
+        "pos_encoding_mode": ["NONE", "ROPE_LLAMA"],
+        "logits_soft_cap": [0.0],
+        "return_lse": [True],
+        "q_dtype": [torch.float16],
+        "contiguous_kv": [True],
+    },
+    regular=pairwise_product_cases,
+)
+def test_batch_decode_with_paged_kv_cache(
+    batch_size,
+    kv_len,
+    page_size,
+    num_kv_heads,
+    num_qo_heads,
+    head_dim,
+    kv_layout,
+    pos_encoding_mode,
+    logits_soft_cap,
+    return_lse,
+    q_dtype,
+    kv_dtype,
+    contiguous_kv,
+):
+    """Paged FA2 decode must match the single-decode reference."""
+    _run_batch_decode_with_paged_kv_cache_case(
+        "fa2",
+        batch_size,
+        kv_len,
+        page_size,
+        num_kv_heads,
+        num_qo_heads,
+        head_dim,
+        kv_layout,
+        pos_encoding_mode,
+        logits_soft_cap,
+        return_lse,
+        q_dtype,
+        kv_dtype,
+        contiguous_kv,
+    )
 
 
 global_override_indptr_cpu = None
@@ -743,7 +798,6 @@ def test_batch_decode_with_paged_kv_cache_nvfp4(
     Reference is computed by dequantizing the packed KV back to q_dtype and running
     single_decode_with_kv_cache per batch item.
     """
-    skip_if_nvfp4_kv_unsupported()
     kv_layout = "NHD"
     torch.manual_seed(42)
 
@@ -1145,8 +1199,8 @@ def test_single_decode_torch_compile_cuda_graph():
     )
 
 
-@pytest.mark.parametrize("batch_size", [4, 8])
-@pytest.mark.parametrize("q_len_per_req", [2, 3])
+@pytest.mark.parametrize("batch_size", [4, 8, 64])
+@pytest.mark.parametrize("q_len_per_req", [1, 2, 3])
 @pytest.mark.parametrize("num_kv_heads", [2, 8])
 @pytest.mark.parametrize("gqa_group_size", [4, 8])
 def test_cuda_graph_uniform_multi_token_decode_with_paged_kv_cache(
@@ -1278,7 +1332,49 @@ def test_cuda_graph_uniform_multi_token_decode_with_paged_kv_cache(
         )
 
 
-def test_tensor_core_decode_rejects_mismatched_q_len():
+@pytest.mark.parametrize("group_size", [1, 2, 4, 8])
+def test_tensor_core_decode_fp8_query(group_size):
+    if get_compute_capability(torch.device("cuda:0")) != (12, 0):
+        pytest.skip("The e4m3-query tensor-core decode runs on SM120 only.")
+    batch_size, kv_len, page_size, num_kv_heads, head_dim = 7, 300, 16, 8, 256
+    num_qo_heads, q_scale = num_kv_heads * group_size, 0.5
+    pages = (kv_len + page_size - 1) // page_size
+    indptr = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda:0") * pages
+    indices = torch.arange(batch_size * pages, dtype=torch.int32, device="cuda:0")
+    last_len = torch.full(
+        (batch_size,), (kv_len - 1) % page_size + 1, dtype=torch.int32, device="cuda:0"
+    )
+    kv = torch.randn(
+        batch_size * pages, 2, page_size, num_kv_heads, head_dim, device="cuda:0"
+    )
+    kv = kv.to(torch.float8_e4m3fn)
+    q8 = (
+        torch.randn(batch_size, num_qo_heads, head_dim, device="cuda:0") / q_scale
+    ).to(torch.float8_e4m3fn)
+    ws = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+    outs = []
+    # The bf16 query holds the same values (q_scale is a power of two).
+    for q, scale in ((q8.to(torch.bfloat16) * q_scale, None), (q8, q_scale)):
+        wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            ws, "NHD", use_tensor_cores=True
+        )
+        wrapper.plan(
+            indptr,
+            indices,
+            last_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=q.dtype,
+            kv_data_type=kv.dtype,
+            o_data_type=torch.bfloat16,
+        )
+        outs.append(wrapper.run(q, kv, q_scale=scale))
+    torch.testing.assert_close(outs[1], outs[0], rtol=1e-2, atol=3e-2)
+
+
+def test_tensor_core_decode_rejects_mismatched_q_len(monkeypatch):
     batch_size = 4
     page_size = 16
     num_qo_heads, num_kv_heads, head_dim = 8, 2, 128
@@ -1311,11 +1407,11 @@ def test_tensor_core_decode_rejects_mismatched_q_len():
     with pytest.raises(ValueError, match="q_len_per_req"):
         wrapper.run(q, kv_data)
 
-    cuda_core_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-        ws, "NHD", use_tensor_cores=False
-    )
-    with pytest.raises(ValueError, match="use_tensor_cores"):
-        cuda_core_wrapper.plan(
+    def plan_cuda_core_multi_token(**wrapper_kwargs):
+        wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            ws, "NHD", use_tensor_cores=False, **wrapper_kwargs
+        )
+        wrapper.plan(
             indptr,
             indices,
             last_len,
@@ -1327,6 +1423,21 @@ def test_tensor_core_decode_rejects_mismatched_q_len():
             kv_data_type=dtype,
             q_len_per_req=2,
         )
+        return wrapper
+
+    with pytest.raises(ValueError, match="use_tensor_cores"):
+        plan_cuda_core_multi_token(backend="fa2")
+    monkeypatch.setenv(_DECODE_AUTO_CUDNN_ENV, "0")
+    with pytest.raises(ValueError, match="use_tensor_cores"):
+        plan_cuda_core_multi_token()
+    monkeypatch.delenv(_DECODE_AUTO_CUDNN_ENV)
+    # backend="auto" hands multi-token CUDA-core decode to cuDNN where it can (#5508).
+    cc = get_compute_capability(torch.device("cuda:0"))
+    if cudnn_decode.CUDNN_AVAILABLE and cudnn_frontend_serves_frost_decode(cc):
+        assert plan_cuda_core_multi_token().resolved_backend == "cudnn"
+    else:
+        with pytest.raises(ValueError, match="use_tensor_cores"):
+            plan_cuda_core_multi_token()
 
     fa3_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
         ws, "NHD", use_tensor_cores=True, backend="fa3"
@@ -1464,3 +1575,87 @@ def test_paged_decode_extreme_negative_logits(dtype):
     assert not o.isnan().any() and not lse.isnan().any()
     torch.testing.assert_close(o, torch.ones_like(o), rtol=0, atol=0)
     torch.testing.assert_close(lse, ref_lse, rtol=1e-5, atol=1e-3)
+
+
+def test_tensor_core_decode_cuda_graph_padding_without_split_kv():
+    """Tensor-core decode plans through the batch prefill scheduler. With CUDA
+    graphs on and split-KV disabled (as SGLang's deterministic inference mode
+    does), the kernel is launched over padded_batch_size CTAs while the plan
+    writes indices only for the real ones, so the padding CTAs must be masked
+    off. The pinned int workspace is poisoned before the plan to stand in for a
+    buffer reused from an earlier plan."""
+    batch_size, page_size = 16, 1
+    num_qo_heads, num_kv_heads, head_dim = 32, 8, 128
+    dtype = torch.float16
+    torch.manual_seed(0)
+    kv_lens = torch.randint(64, 2049, (batch_size,)).tolist()
+    indptr = torch.tensor([0] + kv_lens).cumsum(0).int().to(0)
+    indices = torch.arange(sum(kv_lens)).int().to(0)
+    last_page_len = torch.ones(batch_size, dtype=torch.int32, device="cuda:0")
+    q = torch.randn(batch_size, num_qo_heads, head_dim, dtype=dtype, device="cuda:0")
+    kv_data = torch.randn(
+        sum(kv_lens),
+        2,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        dtype=dtype,
+        device="cuda:0",
+    )
+
+    def workspace():
+        return torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda:0")
+
+    def plan(wrapper):
+        wrapper.plan(
+            indptr,
+            indices,
+            last_page_len,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            page_size,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            disable_split_kv=True,
+        )
+
+    ref_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace(), "NHD", use_tensor_cores=True
+    )
+    plan(ref_wrapper)
+    o_ref = ref_wrapper.run(q, kv_data)
+
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace(),
+        "NHD",
+        use_cuda_graph=True,
+        use_tensor_cores=True,
+        paged_kv_indptr_buffer=indptr.clone(),
+        paged_kv_indices_buffer=indices.clone(),
+        paged_kv_last_page_len_buffer=last_page_len.clone(),
+    )
+    wrapper._pin_memory_int_workspace_buffer.fill_(0x7F)
+    plan(wrapper)
+
+    # Fields are positional, in PrefillPlanInfo::ToVector order (scheduler.cuh).
+    info = wrapper._plan_info
+    padded_batch_size = info[0]
+    block_valid_mask_offset = info[12]
+    enable_cuda_graph, split_kv = info[13], info[14]
+    assert enable_cuda_graph and not split_kv
+    mask = wrapper._int_workspace_buffer[
+        block_valid_mask_offset : block_valid_mask_offset + padded_batch_size
+    ].bool()
+    # The plan without CUDA graphs has no padding: its batch is the real CTA count.
+    num_real = ref_wrapper._plan_info[0]
+    if padded_batch_size == num_real:
+        pytest.skip(
+            f"plan did not pad on this device (padded_batch_size={padded_batch_size})"
+        )
+    # Check the mask itself, so a plan that leaves it unwritten fails instead of skipping.
+    expected_mask = torch.arange(padded_batch_size, device="cuda:0") < num_real
+    torch.testing.assert_close(mask, expected_mask)
+
+    o = wrapper.run(q, kv_data)
+    torch.testing.assert_close(o, o_ref, rtol=1e-3, atol=1e-3)

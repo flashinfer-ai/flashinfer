@@ -384,17 +384,17 @@ def test_out_buffers_written_in_place():
         assert bool((logits[b][sel.long()] >= kth - 1e-4).all())
 
 
-def test_checker_rejects_pre_idx_and_oob_top_k():
-    """Explicit radix_filter calls must fail backend validation, not deeper.
+def test_checker_ignores_pre_idx_and_rejects_oob_top_k():
+    """pre_idx is optional steering for the GVR family, so a hinted caller may
+    use radix_filter (explicitly or via auto) exactly like radix and
+    radix_cutlass: the hint is accepted and ignored and the result stays
+    exact. The vendored kernel only supports top_k in [1, 16384]; an oversized
+    top_k must fail at backend validation (message-matched to the
+    @backend_requirement rejection), not as the kernel constructor's
+    ValueError deep inside the launch.
 
-    The checker docstring advertises pre_idx as a hard exclusion and the
-    vendored kernel only supports top_k in [1, 16384], but neither was
-    enforced: a non-None pre_idx was silently ignored (the kernel ran without
-    the hint) and an oversized top_k surfaced as the kernel constructor's
-    ValueError instead of a backend-validation error. Message-matched to the
-    @backend_requirement rejection so the pre-fix behaviors cannot pass.
-
-    Regression for PR #4621 review round 2 (checker constraints).
+    Regression for PR #4621 review round 2 (top_k bound) and PR #4811
+    (hinted callers may pick hint-free backends).
     """
     device = torch.device("cuda")
     _skip_unless_radix_filter(device)
@@ -403,11 +403,16 @@ def test_checker_rejects_pre_idx_and_oob_top_k():
     logits = torch.randn(8, 32768, dtype=torch.float32, device=device)
     seq_lens = torch.full((8,), 32768, dtype=torch.int32, device=device)
 
-    pre = torch.zeros(8, 4096, dtype=torch.int32, device=device)
-    with pytest.raises(ValueError, match=r"Problem size is not supported"):
-        flashinfer.top_k_varlen(
-            logits, seq_lens, 1024, pre_idx=pre, backend="radix_filter"
-        )
+    pre = torch.zeros(8, 1024, dtype=torch.int32, device=device)
+    idx, _ = flashinfer.top_k_varlen(
+        logits, seq_lens, 1024, pre_idx=pre, backend="radix_filter"
+    )
+    torch.cuda.synchronize()
+    got = torch.sort(logits.gather(1, idx.long()), dim=1, descending=True).values
+    ref = torch.sort(
+        torch.topk(logits, 1024, dim=1).values, dim=1, descending=True
+    ).values
+    assert torch.equal(got, ref), "hinted radix_filter call must stay exact"
     with pytest.raises(ValueError, match=r"Problem size is not supported"):
         flashinfer.top_k_varlen(logits, seq_lens, 16385, backend="radix_filter")
 

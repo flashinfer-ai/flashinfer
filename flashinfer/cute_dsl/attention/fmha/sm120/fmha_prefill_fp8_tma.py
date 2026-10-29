@@ -332,11 +332,16 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
     SUPPORTED_HEAD_TILES = [32, 64, 128, 256]
     SUPPORTED_PAGE_SIZES = SUPPORTED_PAGE_SIZES
     MMA_TILER = (16, 8, 32)  # mma.sync.aligned.m16n8k32
+    # FP8 P pre-scale: P * 2^offset (<= 256 < 448) keeps small weights from
+    # flushing to zero in E4M3 before the PV MMA. It cancels in O = acc / row_sum;
+    # the LSE subtracts it.
+    P_FP8_PRESCALE_LOG2 = 8.0
     # Barrier 0 is the CTA-wide initialization barrier; barrier 1 synchronizes
     # compute warps before the K/V storage is aliased for the output epilogue.
     COMPUTE_BARRIER_ID = 1
-    # K and V operands share a three-slot circular TMA pipeline. D256 uses
-    # 96 KiB for these slots, which fits the SM120 shared-memory capacity.
+    # K and V operands share a three-slot circular TMA pipeline for the
+    # Q128/KV128 fast paths. D128 and D256 use 48 KiB and 96 KiB respectively,
+    # both within the SM120 shared-memory capacity.
     KV_PIPELINE_STAGES = 3
 
     def __init__(
@@ -350,6 +355,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         use_paged_kv: bool = False,
         num_tokens_per_page: int | None = None,
         balanced_scheduler: bool = False,
+        gqa_pack_size: int = 1,
     ) -> None:
         """Initialize the FMHA prefill kernel configuration.
 
@@ -364,6 +370,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         :param balanced_scheduler: Use the causal load-balanced grid mapping
             and visit Q tiles in reverse order. Compilation must guarantee
             that causal masking is enabled when this option is true.
+        :param gqa_pack_size: Q heads sharing one K/V head packed into each Q
+            tile (row ``r`` is token ``r // gqa_pack_size``). Must divide ``q_tile``.
         """
         # Data types
         if in_dtype != cutlass.Float8E4M3FN:
@@ -389,8 +397,12 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         self.head_tile = head_tile
         self.q_tile = q_tile
         self.kv_tile = kv_tile
+        if gqa_pack_size < 1 or q_tile % gqa_pack_size != 0:
+            raise ValueError(f"gqa_pack_size must divide q_tile={q_tile}")
+        self.gqa_pack_size = gqa_pack_size
+        self.q_tile_tokens = q_tile // gqa_pack_size
         self.kv_pipeline_stages = (
-            3 if head_tile == 256 and q_tile == 128 and kv_tile == 128 else 2
+            3 if head_tile in (128, 256) and q_tile == 128 and kv_tile == 128 else 2
         )
         if self.use_paged_kv:
             if num_tokens_per_page not in self.SUPPORTED_PAGE_SIZES:
@@ -490,6 +502,24 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         return smem_col
 
     @cute.jit
+    def q_row_token(self, row: cutlass.Int32) -> cutlass.Int32:
+        """Token offset, within the Q tile, of tile row ``row``."""
+        token = row
+        if cutlass.const_expr(self.gqa_pack_size > 1):
+            token = row // self.gqa_pack_size
+        return token
+
+    @cute.jit
+    def q_row_head_offset(
+        self, row: cutlass.Int32, head_dim: cutlass.Int32
+    ) -> cutlass.Int32:
+        """Element offset of tile row ``row``'s Q head from the tile's first Q head."""
+        offset = cutlass.Int32(0)
+        if cutlass.const_expr(self.gqa_pack_size > 1):
+            offset = (row % self.gqa_pack_size) * head_dim
+        return offset
+
+    @cute.jit
     def get_kv_stage_ptr(
         self, sKV: cutlass.Array, stage: cutlass.Int32
     ) -> cutlass.Pointer:
@@ -558,7 +588,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             return False
 
         kv_pipeline_stages = (
-            3 if head_dim == 256 and q_tile == 128 and kv_tile == 128 else 2
+            3 if head_dim in (128, 256) and q_tile == 128 and kv_tile == 128 else 2
         )
         kv_smem_bytes = kv_pipeline_stages * kv_tile * head_dim * in_dtype.bytes
         output_bytes = q_tile * head_dim * out_dtype.bytes
@@ -752,7 +782,10 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     basic_params.q_warp_row0 + row_quad * 4 + basic_params.lane_div8
                 )
                 col_in_cta = col0_in_cta + basic_params.lane_mod8 * 4
-                cur_q_seq_idx = basic_params.q_seq_idx + row_in_cta
+                cur_q_seq_idx = basic_params.q_seq_idx + self.q_row_token(row_in_cta)
+                q_head_col = col_in_cta + self.q_row_head_offset(
+                    row_in_cta, basic_params.head_dim
+                )
                 if (
                     cur_q_seq_idx < basic_params.seqlen_q
                     and col_in_cta < basic_params.head_dim
@@ -766,7 +799,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                             basic_params.q_ptr
                             + basic_params.q_head_base
                             + cur_q_seq_idx * basic_params.q_seq_stride
-                            + col_in_cta
+                            + q_head_col
                         )
                         q_packed = prims.load_ext(
                             q_src,
@@ -779,7 +812,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                             basic_params.q_ptr
                             + basic_params.q_head_base
                             + cur_q_seq_idx * basic_params.q_seq_stride
-                            + col_in_cta
+                            + q_head_col
                         ).load(count=4, alignment=4)
                         q_regs_per_frag[row_quad] = q_vec.bitcast(cutlass.Int32)[0]
             return q_regs_per_frag
@@ -944,13 +977,17 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
     def mma_qk_single_buffer(
         self,
         basic_params: SimpleNamespace,
-        mma_params: SimpleNamespace,
         q_regs: cutlass.Array,
-    ) -> cutlass.Array:
-        """Original fixed-K QK path for the two-buffer specialization."""
+        sK: cutlass.Pointer,
+        tracks_tile_row_max: cutlass.Constexpr[bool],
+    ) -> tuple:
+        """Direct-row-state QK path, optionally folding in the row-max scan."""
         s_regs = cutlass.Array(cutlass.Float32, self.qk_k_frags * 4, alignment=16)
         for i in cutlass.range_constexpr(self.qk_k_frags * 4):
             s_regs[i] = cutlass.Float32(0.0)
+        tile_row_max = cutlass.Array(cutlass.Float32, 2, alignment=16)
+        for row_half in cutlass.range_constexpr(2):
+            tile_row_max[row_half] = -cutlass.Float32.inf
 
         k_row_in_frag_pair = (basic_params.lane_div8 // 2) * 8 + basic_params.lane_mod8
         k_col_in_frag_pair = (basic_params.lane_div8 % 2) * 16
@@ -964,7 +1001,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             k_chunk = k_col // self.tma_copy_head_per_iter
             k_col_in_chunk = k_col % self.tma_copy_head_per_iter
             sK_ptr = (
-                mma_params.sK.data_ptr()
+                sK
                 + k_chunk * self.tma_copy_elems_per_iter
                 + k_row * self.tma_copy_head_per_iter
                 + self._get_swizzled_col(k_row, k_col_in_chunk)
@@ -1000,6 +1037,28 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         s_regs[s_off + 3],
                         self.in_dtype,
                     )
+                # On the final head-dimension fragment, reduce the preceding
+                # score block while this block's independent MMA results are
+                # still in flight. This overlaps the skip predicate's scalar
+                # work with QK instead of scanning every score afterward.
+                if cutlass.const_expr(
+                    tracks_tile_row_max
+                    and d_frag + 1 == self.qk_d_frags
+                    and k_block > 0
+                ):
+                    previous_k_block = k_block - 1
+                    for previous_k_in_block in cutlass.range_constexpr(4):
+                        previous_k_frag = previous_k_block * 4 + previous_k_in_block
+                        previous_s_off = previous_k_frag * 4
+                        for row_half in cutlass.range_constexpr(2):
+                            tile_row_max[row_half] = cute.arch.fmax(
+                                tile_row_max[row_half],
+                                s_regs[previous_s_off + row_half * 2],
+                            )
+                            tile_row_max[row_half] = cute.arch.fmax(
+                                tile_row_max[row_half],
+                                s_regs[previous_s_off + row_half * 2 + 1],
+                            )
                 if cutlass.const_expr(
                     d_frag == 0 and k_block + 1 < self.qk_k_frags // 4
                 ):
@@ -1015,9 +1074,25 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         d_next,
                         k_pair,
                     )
+            if cutlass.const_expr(
+                tracks_tile_row_max and d_frag + 1 == self.qk_d_frags
+            ):
+                last_k_block = self.qk_k_frags // 4 - 1
+                for last_k_in_block in cutlass.range_constexpr(4):
+                    last_k_frag = last_k_block * 4 + last_k_in_block
+                    last_s_off = last_k_frag * 4
+                    for row_half in cutlass.range_constexpr(2):
+                        tile_row_max[row_half] = cute.arch.fmax(
+                            tile_row_max[row_half],
+                            s_regs[last_s_off + row_half * 2],
+                        )
+                        tile_row_max[row_half] = cute.arch.fmax(
+                            tile_row_max[row_half],
+                            s_regs[last_s_off + row_half * 2 + 1],
+                        )
             k_cur = k_next
 
-        return s_regs
+        return s_regs, tile_row_max
 
     @cute.jit
     def online_softmax(
@@ -1079,7 +1154,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 if cutlass.const_expr(self.is_causal):
                     valid_cols = cute.math.min(
                         basic_params.q_seq_idx
-                        + q_row_in_cta
+                        + self.q_row_token(q_row_in_cta)
                         + basic_params.causal_q_offset
                         + 1,
                         basic_params.seqlen_k,
@@ -1187,7 +1262,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 # anchor to avoid -inf - -inf = NaN while preserving zero P.
                 if exp_max == -cutlass.Float32.inf:
                     exp_max = cutlass.Float32(0.0)
-            neg_exp_max_scaled = -(exp_max * softmax_scale_log2)
+            neg_exp_max_scaled = (
+                -(exp_max * softmax_scale_log2) + self.P_FP8_PRESCALE_LOG2
+            )
             tile_sum0 = cutlass.Float32(0.0)
             tile_sum1 = cutlass.Float32(0.0)
             p_even0 = cutlass.Float32(0.0)
@@ -1252,12 +1329,15 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         basic_params: SimpleNamespace,
         mma_params: SimpleNamespace,
         softmax_params: SimpleNamespace,
+        sV: cutlass.Pointer,
         s_regs: cutlass.Array,
+        tile_row_max: cutlass.Array,
         kv_seq_idx: cutlass.Int32,
         is_masked_frontier_tile: cutlass.Constexpr[bool],
         uses_softmax_init_path: cutlass.Constexpr[bool],
+        uses_precomputed_tile_row_max: cutlass.Constexpr[bool],
     ) -> tuple:
-        """Original direct row-state softmax for the two-buffer path."""
+        """Direct-row-state softmax with an explicit V-stage pointer."""
         o_regs = mma_params.o_regs
         row_max = softmax_params.row_max
         row_sum = softmax_params.row_sum
@@ -1284,39 +1364,42 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 if cutlass.const_expr(self.is_causal):
                     valid_cols = cute.math.min(
                         basic_params.q_seq_idx
-                        + q_row_in_cta
+                        + self.q_row_token(q_row_in_cta)
                         + basic_params.causal_q_offset
                         + 1,
                         basic_params.seqlen_k,
                     )
                     has_valid_cols = kv_seq_idx < valid_cols
 
-            cur_max0 = -cutlass.Float32.inf
-            cur_max1 = -cutlass.Float32.inf
-            for k_frag in cutlass.range_constexpr(self.qk_k_frags):
-                s_off = k_frag * 4
-                s0 = s_regs[s_off + s_reg_idx_lo]
-                s1 = s_regs[s_off + s_reg_idx_hi]
-                if cutlass.const_expr(is_masked_frontier_tile):
-                    k_col0 = kv_seq_idx + k_frag * 8 + 2 * basic_params.lane_mod4
-                    k_col1 = k_col0 + 1
-                    if cutlass.const_expr(self.is_causal):
-                        valid0 = k_col0 < valid_cols if has_valid_cols else False
-                        valid1 = k_col1 < valid_cols if has_valid_cols else False
-                    else:
-                        valid0 = k_col0 < valid_cols
-                        valid1 = k_col1 < valid_cols
-                    if not valid0:
-                        s0 = -cutlass.Float32.inf
-                    if not valid1:
-                        s1 = -cutlass.Float32.inf
-                s_regs[s_off + s_reg_idx_lo] = s0
-                s_regs[s_off + s_reg_idx_hi] = s1
-                cur_max0 = cute.arch.fmax(cur_max0, s0)
-                cur_max1 = cute.arch.fmax(cur_max1, s1)
+            if cutlass.const_expr(uses_precomputed_tile_row_max):
+                cur_max = nvvm_threadquad_reduction_max(tile_row_max[row_half])
+            else:
+                cur_max0 = -cutlass.Float32.inf
+                cur_max1 = -cutlass.Float32.inf
+                for k_frag in cutlass.range_constexpr(self.qk_k_frags):
+                    s_off = k_frag * 4
+                    s0 = s_regs[s_off + s_reg_idx_lo]
+                    s1 = s_regs[s_off + s_reg_idx_hi]
+                    if cutlass.const_expr(is_masked_frontier_tile):
+                        k_col0 = kv_seq_idx + k_frag * 8 + 2 * basic_params.lane_mod4
+                        k_col1 = k_col0 + 1
+                        if cutlass.const_expr(self.is_causal):
+                            valid0 = k_col0 < valid_cols if has_valid_cols else False
+                            valid1 = k_col1 < valid_cols if has_valid_cols else False
+                        else:
+                            valid0 = k_col0 < valid_cols
+                            valid1 = k_col1 < valid_cols
+                        if not valid0:
+                            s0 = -cutlass.Float32.inf
+                        if not valid1:
+                            s1 = -cutlass.Float32.inf
+                    s_regs[s_off + s_reg_idx_lo] = s0
+                    s_regs[s_off + s_reg_idx_hi] = s1
+                    cur_max0 = cute.arch.fmax(cur_max0, s0)
+                    cur_max1 = cute.arch.fmax(cur_max1, s1)
 
-            cur_max = cute.arch.fmax(cur_max0, cur_max1)
-            cur_max = nvvm_threadquad_reduction_max(cur_max)
+                cur_max = cute.arch.fmax(cur_max0, cur_max1)
+                cur_max = nvvm_threadquad_reduction_max(cur_max)
 
             old_scale = cutlass.Float32(1.0)
             if cutlass.const_expr(uses_softmax_init_path):
@@ -1354,7 +1437,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             if cutlass.const_expr(is_masked_frontier_tile):
                 if exp_max == -cutlass.Float32.inf:
                     exp_max = cutlass.Float32(0.0)
-            neg_exp_max_scaled = -(exp_max * softmax_scale_log2)
+            neg_exp_max_scaled = (
+                -(exp_max * softmax_scale_log2) + self.P_FP8_PRESCALE_LOG2
+            )
             tile_sum0 = cutlass.Float32(0.0)
             tile_sum1 = cutlass.Float32(0.0)
             p_even0 = cutlass.Float32(0.0)
@@ -1397,7 +1482,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 # scalar softmax work available to hide the shared-memory load.
                 v_initial = self.load_v_initial_fragments_single_buffer(
                     basic_params,
-                    mma_params,
+                    sV,
                 )
 
         return p_regs, v_initial
@@ -1566,9 +1651,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
     def load_v_initial_fragments_single_buffer(
         self,
         basic_params: SimpleNamespace,
-        mma_params: SimpleNamespace,
+        sV: cutlass.Pointer,
     ) -> cutlass.Array:
-        """Load the first BMM2 V fragment set before online softmax."""
+        """Load the first BMM2 V fragment set from the selected pipeline stage."""
         v_regs = cutlass.Array(cutlass.Int32, self.pv_d_frags * 2, alignment=16)
         v_lane = basic_params.lane
         uses_direct_p_pack = cutlass.const_expr(
@@ -1600,7 +1685,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             v_chunk = v_col // self.tma_copy_head_per_iter
             v_col_in_chunk = v_col % self.tma_copy_head_per_iter
             sV_ptr = (
-                mma_params.sV.data_ptr()
+                sV
                 + v_chunk * self.tma_copy_elems_per_iter
                 + v_row * self.tma_copy_head_per_iter
                 + self._get_swizzled_col(v_row, v_col_in_chunk)
@@ -1624,6 +1709,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         self,
         basic_params: SimpleNamespace,
         mma_params: SimpleNamespace,
+        sV: cutlass.Pointer,
         p_regs: cutlass.Array,
         v_initial: cutlass.Array,
     ) -> None:
@@ -1659,7 +1745,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             v_chunk = v_col // self.tma_copy_head_per_iter
             v_col_in_chunk = v_col % self.tma_copy_head_per_iter
             sV_ptr = (
-                mma_params.sV.data_ptr()
+                sV
                 + v_chunk * self.tma_copy_elems_per_iter
                 + v_row * self.tma_copy_head_per_iter
                 + self._get_swizzled_col(v_row, v_col_in_chunk)
@@ -1783,6 +1869,133 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             pass
 
     @cute.jit
+    def should_skip_softmax(
+        self,
+        basic_params: SimpleNamespace,
+        softmax_params: SimpleNamespace,
+        s_regs: cutlass.Array,
+        row_state: cutlass.Float32,
+        kv_seq_idx: cutlass.Int32,
+        is_masked_frontier_tile: cutlass.Constexpr[bool],
+    ) -> cutlass.Boolean:
+        """Return a warp-uniform decision to skip this K/V tile.
+
+        Each compute warp owns 16 complete query rows.  A tile may be skipped
+        only when every valid row owned by the warp is below the configured
+        threshold.  Keeping the decision warp-uniform lets the caller omit
+        both online-softmax state updates and the PV MMA without introducing
+        divergent MMA execution.
+        """
+        uses_distributed_row_state = cutlass.const_expr(
+            self.head_tile == 256 and self.q_tile == 128 and self.kv_tile == 128
+        )
+        if cutlass.const_expr(not uses_distributed_row_state):
+            row_max = softmax_params.row_max
+
+        thread_wants_skip = cutlass.Boolean(True)
+        for row_half in cutlass.range_constexpr(2):
+            q_row_in_cta = (
+                basic_params.q_warp_row0 + basic_params.lane_div4 + row_half * 8
+            )
+            q_row_is_valid = (
+                basic_params.q_seq_idx + self.q_row_token(q_row_in_cta)
+                < basic_params.seqlen_q
+            )
+
+            valid_cols = basic_params.seqlen_k
+            has_valid_cols = True
+            if cutlass.const_expr(is_masked_frontier_tile):
+                if cutlass.const_expr(self.is_causal):
+                    valid_cols = cute.math.min(
+                        basic_params.q_seq_idx
+                        + self.q_row_token(q_row_in_cta)
+                        + basic_params.causal_q_offset
+                        + 1,
+                        basic_params.seqlen_k,
+                    )
+                    has_valid_cols = kv_seq_idx < valid_cols
+
+            tile_row_max = -cutlass.Float32.inf
+            for k_frag in cutlass.range_constexpr(self.qk_k_frags):
+                s_off = k_frag * 4
+                s0 = s_regs[s_off + row_half * 2]
+                s1 = s_regs[s_off + row_half * 2 + 1]
+                if cutlass.const_expr(is_masked_frontier_tile):
+                    k_col0 = kv_seq_idx + k_frag * 8 + 2 * basic_params.lane_mod4
+                    k_col1 = k_col0 + 1
+                    if cutlass.const_expr(self.is_causal):
+                        valid0 = k_col0 < valid_cols if has_valid_cols else False
+                        valid1 = k_col1 < valid_cols if has_valid_cols else False
+                    else:
+                        valid0 = k_col0 < valid_cols
+                        valid1 = k_col1 < valid_cols
+                    if not valid0:
+                        s0 = -cutlass.Float32.inf
+                    if not valid1:
+                        s1 = -cutlass.Float32.inf
+                tile_row_max = cute.arch.fmax(tile_row_max, s0)
+                tile_row_max = cute.arch.fmax(tile_row_max, s1)
+
+            if cutlass.const_expr(uses_distributed_row_state):
+                tile_row_max = nvvm_threadquad_reduction_max(tile_row_max)
+                previous_row_max = prims.shfl_sync(
+                    thread_mask=0xFFFFFFFF,
+                    val=row_state,
+                    offset=row_half,
+                    mask_and_clamp=0x1C03,
+                    kind=prims.Shfl.IDX,
+                )
+            else:
+                tile_row_max = nvvm_threadquad_reduction_max_full(tile_row_max)
+                previous_row_max = row_max[row_half]
+
+            row_wants_skip = cutlass.Boolean(False)
+            if not q_row_is_valid or tile_row_max == -cutlass.Float32.inf:
+                row_wants_skip = cutlass.Boolean(True)
+            elif previous_row_max != -cutlass.Float32.inf:
+                row_wants_skip = (
+                    (tile_row_max - previous_row_max)
+                    * softmax_params.softmax_scale_log2
+                    < softmax_params.skip_softmax_threshold_log2
+                )
+            thread_wants_skip = thread_wants_skip and row_wants_skip
+
+        return cute.arch.vote_all_sync(thread_wants_skip)
+
+    @cute.jit
+    def should_skip_softmax_from_tile_row_max(
+        self,
+        basic_params: SimpleNamespace,
+        softmax_params: SimpleNamespace,
+        tile_row_max: cutlass.Array,
+    ) -> cutlass.Boolean:
+        """Evaluate the hot-loop skip predicate from QK-folded row maxima."""
+        thread_wants_skip = cutlass.Boolean(True)
+        for row_half in cutlass.range_constexpr(2):
+            q_row_in_cta = (
+                basic_params.q_warp_row0 + basic_params.lane_div4 + row_half * 8
+            )
+            q_row_is_valid = (
+                basic_params.q_seq_idx + self.q_row_token(q_row_in_cta)
+                < basic_params.seqlen_q
+            )
+            reduced_tile_row_max = nvvm_threadquad_reduction_max_full(
+                tile_row_max[row_half]
+            )
+            row_wants_skip = cutlass.Boolean(False)
+            if not q_row_is_valid or reduced_tile_row_max == -cutlass.Float32.inf:
+                row_wants_skip = cutlass.Boolean(True)
+            elif softmax_params.row_max[row_half] != -cutlass.Float32.inf:
+                row_wants_skip = (
+                    (reduced_tile_row_max - softmax_params.row_max[row_half])
+                    * softmax_params.softmax_scale_log2
+                    < softmax_params.skip_softmax_threshold_log2
+                )
+            thread_wants_skip = thread_wants_skip and row_wants_skip
+
+        return cute.arch.vote_all_sync(thread_wants_skip)
+
+    @cute.jit
     def compute_one_kv_tile(
         self,
         basic_params: SimpleNamespace,
@@ -1839,23 +2052,51 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             )
 
         kv_seq_idx = kv_tile_idx * self.kv_tile
-        p_regs, row_state = self.online_softmax(
-            basic_params,
-            mma_params,
-            softmax_params,
-            s_regs,
-            row_state,
-            kv_seq_idx,
-            is_masked_frontier_tile,
-            uses_softmax_init_path,
-        )
-        # Softmax has no V dependency. Delay the arrival wait until the first
-        # V consumer so its scalar work can hide the outstanding TMA transfer.
+        enable_skip_softmax = softmax_params.skip_softmax_threshold_log2 is not None
+        skip_softmax = cutlass.Boolean(False)
+        if cutlass.const_expr(enable_skip_softmax and not uses_softmax_init_path):
+            skip_softmax = self.should_skip_softmax(
+                basic_params,
+                softmax_params,
+                s_regs,
+                row_state,
+                kv_seq_idx,
+                is_masked_frontier_tile,
+            )
         v_arrived = self.get_mbar_stage_ptr(basic_params.mbar_arrived, v_stage)
-        self.wait_pipeline_barrier(v_arrived, v_phase)
-
         sV = self.get_kv_stage_ptr(mma_params.sKV, v_stage)
-        self.mma_pv(basic_params, mma_params, p_regs, sV)
+        if cutlass.const_expr(enable_skip_softmax):
+            if not skip_softmax:
+                p_regs, row_state = self.online_softmax(
+                    basic_params,
+                    mma_params,
+                    softmax_params,
+                    s_regs,
+                    row_state,
+                    kv_seq_idx,
+                    is_masked_frontier_tile,
+                    uses_softmax_init_path,
+                )
+                # Softmax has no V dependency. Delay the arrival wait until
+                # the first V consumer so scalar work hides the TMA transfer.
+                self.wait_pipeline_barrier(v_arrived, v_phase)
+                self.mma_pv(basic_params, mma_params, p_regs, sV)
+            else:
+                # Even a skipped tile must consume its V pipeline slot.
+                self.wait_pipeline_barrier(v_arrived, v_phase)
+        else:
+            p_regs, row_state = self.online_softmax(
+                basic_params,
+                mma_params,
+                softmax_params,
+                s_regs,
+                row_state,
+                kv_seq_idx,
+                is_masked_frontier_tile,
+                uses_softmax_init_path,
+            )
+            self.wait_pipeline_barrier(v_arrived, v_phase)
+            self.mma_pv(basic_params, mma_params, p_regs, sV)
         if prims.elect_sync():
             v_consumed = self.get_mbar_stage_ptr(basic_params.mbar_consumed, v_stage)
             prims.mbarrier_arrive(
@@ -1865,7 +2106,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         return row_state
 
     @cute.jit
-    def compute_one_kv_tile_single_buffer(
+    def compute_one_kv_tile_direct_state(
         self,
         basic_params: SimpleNamespace,
         mma_params: SimpleNamespace,
@@ -1873,48 +2114,120 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         q_regs: cutlass.Array,
         num_kv_tiles: cutlass.Int32,
         kv_tile_idx: cutlass.Int32,
+        k_stage: cutlass.Int32,
+        uses_kv_ring: cutlass.Constexpr[bool],
         is_masked_frontier_tile: cutlass.Constexpr[bool],
         uses_softmax_init_path: cutlass.Constexpr[bool],
     ) -> None:
-        """Original independent fixed-buffer K/V compute iteration."""
-        tma_phase = (num_kv_tiles - 1 - kv_tile_idx) & cutlass.Int32(1)
-        while not prims.mbarrier_try_wait_parity(
-            basic_params.mbar_k_arrived, tma_phase, time_limit=10_000_000
-        ):
-            pass
+        """One direct-row-state QK/skip/softmax/PV iteration."""
+        if cutlass.const_expr(uses_kv_ring):
+            k_phase = k_stage & cutlass.Int32(1)
+            v_stage = k_stage + cutlass.Int32(1)
+            if v_stage == self.kv_pipeline_stages:
+                v_stage = cutlass.Int32(0)
+            v_phase = (k_stage + cutlass.Int32(1)) // cutlass.Int32(2)
+            sK = self.get_kv_stage_ptr(mma_params.sKV, k_stage)
+            k_arrived = self.get_mbar_stage_ptr(basic_params.mbar_arrived, k_stage)
+            k_consumed = self.get_mbar_stage_ptr(basic_params.mbar_consumed, k_stage)
+            sV = self.get_kv_stage_ptr(mma_params.sKV, v_stage)
+            v_arrived = self.get_mbar_stage_ptr(basic_params.mbar_arrived, v_stage)
+            v_consumed = self.get_mbar_stage_ptr(basic_params.mbar_consumed, v_stage)
+        else:
+            tma_phase = (num_kv_tiles - 1 - kv_tile_idx) & cutlass.Int32(1)
+            k_phase = tma_phase
+            v_phase = tma_phase
+            sK = mma_params.sK.data_ptr()
+            k_arrived = basic_params.mbar_k_arrived
+            k_consumed = basic_params.mbar_k_consumed
+            sV = mma_params.sV.data_ptr()
+            v_arrived = basic_params.mbar_v_arrived
+            v_consumed = basic_params.mbar_v_consumed
 
-        s_regs = self.mma_qk_single_buffer(basic_params, mma_params, q_regs)
+        self.wait_pipeline_barrier(k_arrived, k_phase)
+
+        enable_skip_softmax = softmax_params.skip_softmax_threshold_log2 is not None
+        tracks_tile_row_max = cutlass.const_expr(
+            enable_skip_softmax
+            and not uses_softmax_init_path
+            and not is_masked_frontier_tile
+        )
+        s_regs, tile_row_max = self.mma_qk_single_buffer(
+            basic_params,
+            q_regs,
+            sK,
+            tracks_tile_row_max,
+        )
         if prims.elect_sync():
             prims.mbarrier_arrive(
-                basic_params.mbar_k_consumed,
+                k_consumed,
                 count=cute.arch.WARP_SIZE,
             )
 
-        while not prims.mbarrier_try_wait_parity(
-            basic_params.mbar_v_arrived, tma_phase, time_limit=10_000_000
-        ):
-            pass
-
         kv_seq_idx = kv_tile_idx * self.kv_tile
-        p_regs, v_initial = self.online_softmax_single_buffer(
-            basic_params,
-            mma_params,
-            softmax_params,
-            s_regs,
-            kv_seq_idx,
-            is_masked_frontier_tile,
-            uses_softmax_init_path,
-        )
+        skip_softmax = cutlass.Boolean(False)
+        if cutlass.const_expr(enable_skip_softmax and not uses_softmax_init_path):
+            if cutlass.const_expr(tracks_tile_row_max):
+                skip_softmax = self.should_skip_softmax_from_tile_row_max(
+                    basic_params,
+                    softmax_params,
+                    tile_row_max,
+                )
+            else:
+                skip_softmax = self.should_skip_softmax(
+                    basic_params,
+                    softmax_params,
+                    s_regs,
+                    cutlass.Float32(0.0),
+                    kv_seq_idx,
+                    is_masked_frontier_tile,
+                )
 
-        self.mma_pv_single_buffer_preloaded(
-            basic_params,
-            mma_params,
-            p_regs,
-            v_initial,
-        )
+        self.wait_pipeline_barrier(v_arrived, v_phase)
+
+        if cutlass.const_expr(enable_skip_softmax):
+            if not skip_softmax:
+                p_regs, v_initial = self.online_softmax_single_buffer(
+                    basic_params,
+                    mma_params,
+                    softmax_params,
+                    sV,
+                    s_regs,
+                    tile_row_max,
+                    kv_seq_idx,
+                    is_masked_frontier_tile,
+                    uses_softmax_init_path,
+                    tracks_tile_row_max,
+                )
+                self.mma_pv_single_buffer_preloaded(
+                    basic_params,
+                    mma_params,
+                    sV,
+                    p_regs,
+                    v_initial,
+                )
+        else:
+            p_regs, v_initial = self.online_softmax_single_buffer(
+                basic_params,
+                mma_params,
+                softmax_params,
+                sV,
+                s_regs,
+                tile_row_max,
+                kv_seq_idx,
+                is_masked_frontier_tile,
+                uses_softmax_init_path,
+                tracks_tile_row_max,
+            )
+            self.mma_pv_single_buffer_preloaded(
+                basic_params,
+                mma_params,
+                sV,
+                p_regs,
+                v_initial,
+            )
         if prims.elect_sync():
             prims.mbarrier_arrive(
-                basic_params.mbar_v_consumed,
+                v_consumed,
                 count=cute.arch.WARP_SIZE,
             )
 
@@ -1930,10 +2243,12 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         tma_v_desc: cutlass.GridConstant[cuda.TensorMap],
         softmax_scale_log2: cutlass.Float32,
         output_scale: cutlass.Float32,
+        skip_softmax_threshold: cute.Tensor | None,
         seqlens_kv: cute.Tensor | None = None,
         cu_seqlens_q: cute.Tensor | None = None,
         block_tables: cute.Tensor | None = None,
         cu_seqlens_k: cute.Tensor | None = None,
+        kv_tile_ranges: cute.Tensor | None = None,
     ) -> None:
         """SM120 FMHA prefill FP8 kernel.
 
@@ -1947,6 +2262,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         :param softmax_scale_log2: ``softmax_scale * log2(e)``, pre-folded host-side.
         :param output_scale: Scalar V dequantization scale folded into the
             final normalization.
+        :param skip_softmax_threshold: Optional e-based skip threshold for
+            each request, shape ``[batch_size]``.
         :param seqlens_kv: Optional runtime K/V length for each request.
         :param cu_seqlens_q: Optional cumulative offsets for packed Q/O.
         :param block_tables: Shared K/V page indices with shape ``[B,max_pages]``.
@@ -1967,7 +2284,20 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             q_tile_idx = block_x
             q_head_idx = block_y
         batch_idx = block_z
-        q_seq_idx = q_tile_idx * self.q_tile
+        if cutlass.const_expr(self.gqa_pack_size > 1):
+            # The grid indexes groups of gqa_pack_size Q heads.
+            q_head_idx = q_head_idx * self.gqa_pack_size
+        q_seq_idx = q_tile_idx * self.q_tile_tokens
+
+        # Split KV: batch item = (K/V chunk, request), chunk-major.
+        request_idx = batch_idx
+        kv_chunk = cutlass.Int32(0)
+        num_kv_chunks = cutlass.Int32(1)
+        if cutlass.const_expr(kv_tile_ranges is not None):
+            num_requests = cutlass.Int32(cu_seqlens_q.shape[0]) - cutlass.Int32(1)
+            num_kv_chunks = cutlass.Int32(kv_tile_ranges.shape[0]) // num_requests
+            kv_chunk = batch_idx // num_requests
+            request_idx = batch_idx - kv_chunk * num_requests
 
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane = tidx % cute.arch.WARP_SIZE
@@ -1982,17 +2312,26 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         causal_q_offset = cutlass.Int32(0)
 
         cute.arch.griddepcontrol_wait()
-        q_token_base = cutlass.Int32(cu_seqlens_q[batch_idx])
-        seqlen_q = cutlass.Int32(cu_seqlens_q[batch_idx + 1]) - q_token_base
+        # A dynamic threshold can be produced or updated by an earlier kernel.
+        # Keep its load after the PDL dependency wait so a dependent launch
+        # never observes the predecessor's stale value.
+        skip_softmax_threshold_log2 = None
+        if cutlass.const_expr(skip_softmax_threshold is not None):
+            skip_softmax_threshold_log2 = cute.math.log2(
+                cutlass.Float32(skip_softmax_threshold[request_idx]),
+                fastmath=True,
+            )
+        q_token_base = cutlass.Int32(cu_seqlens_q[request_idx])
+        seqlen_q = cutlass.Int32(cu_seqlens_q[request_idx + 1]) - q_token_base
         num_heads_q = q.shape[1]
         head_dim = q.shape[2]
 
         if cutlass.const_expr(self.use_paged_kv):
-            seqlen_k = cutlass.Int32(seqlens_kv[batch_idx])
+            seqlen_k = cutlass.Int32(seqlens_kv[request_idx])
             num_heads_kv = k.shape[1]
         else:
-            k_token_base = cutlass.Int32(cu_seqlens_k[batch_idx])
-            seqlen_k = cutlass.Int32(cu_seqlens_k[batch_idx + 1]) - k_token_base
+            k_token_base = cutlass.Int32(cu_seqlens_k[request_idx])
+            seqlen_k = cutlass.Int32(cu_seqlens_k[request_idx + 1]) - k_token_base
             num_heads_kv = k.shape[1]
 
         if cutlass.const_expr(self.has_causal_q_offset):
@@ -2010,13 +2349,29 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         q_seq_stride = num_heads_q * head_dim
         q_head_base = q_token_base * q_seq_stride + q_head_idx * head_dim
         o_head_base = q_head_base
+        o_seq_stride = q_seq_stride
+        if cutlass.const_expr(kv_tile_ranges is not None):
+            # Chunk c of token p writes O/LSE row p * num_kv_chunks + c.
+            o_seq_stride = q_seq_stride * num_kv_chunks
+            o_head_base = (
+                q_token_base * num_kv_chunks + kv_chunk
+            ) * q_seq_stride + q_head_idx * head_dim
 
         num_kv_tiles = ceil_div(seqlen_k, self.kv_tile)
         if cutlass.const_expr(self.is_causal):
             num_kv_tiles_causal = ceil_div(
-                q_seq_idx + causal_q_offset + self.q_tile, self.kv_tile
+                q_seq_idx + causal_q_offset + self.q_tile_tokens, self.kv_tile
             )
             num_kv_tiles = cute.math.min(num_kv_tiles, num_kv_tiles_causal)
+        # Split KV: the item covers K/V tiles [begin, end); an empty range writes O = 0, LSE = -inf.
+        kv_begin_tile = cutlass.Int32(0)
+        has_kv_work = seqlen_k > 0
+        if cutlass.const_expr(kv_tile_ranges is not None):
+            kv_begin_tile = cutlass.Int32(kv_tile_ranges[batch_idx, 0])
+            num_kv_tiles = cute.math.min(
+                num_kv_tiles, cutlass.Int32(kv_tile_ranges[batch_idx, 1])
+            )
+            has_kv_work = num_kv_tiles > kv_begin_tile
 
         # The epilogue later aliases this storage as sO after compute warps
         # finish consuming the final K/V tile.
@@ -2041,7 +2396,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         # at least one K/V token. The condition is CTA-uniform, so zero-length
         # requests skip every TMA/mbarrier/MMA operation without an early
         # return (early kernel returns are unsupported by CuTe DSL).
-        if q_seq_idx < seqlen_q and seqlen_k > 0:
+        if q_seq_idx < seqlen_q and has_kv_work:
             if warp == self.load_warp_id:
                 if prims.elect_sync():
                     prims.prefetch_tensormap(tma_k_desc_ptr)
@@ -2063,11 +2418,13 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         # /////////////////////////////////////////////////////////////////////////////
         #  LOAD K/V
         # /////////////////////////////////////////////////////////////////////////////
-        if warp == self.load_warp_id and q_seq_idx < seqlen_q and seqlen_k > 0:
+        if warp == self.load_warp_id and q_seq_idx < seqlen_q and has_kv_work:
             prims.setmaxregister(24, prims.SetMaxRegisterAction.DECREASE)
 
             uses_three_stage_pipeline = cutlass.const_expr(
-                self.head_tile == 256 and self.q_tile == 128 and self.kv_tile == 128
+                self.head_tile in (128, 256)
+                and self.q_tile == 128
+                and self.kv_tile == 128
             )
             uses_kv_l2_policy = cutlass.const_expr(
                 self.head_tile in (128, 256)
@@ -2089,7 +2446,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 operand_idx = cutlass.Int32(0)
                 stage = cutlass.Int32(0)
                 empty_phase = cutlass.Int32(0)
-                num_operands = num_kv_tiles * cutlass.Int32(2)
+                num_operands = (num_kv_tiles - kv_begin_tile) * cutlass.Int32(2)
                 while operand_idx < num_operands:
                     if operand_idx >= self.kv_pipeline_stages:
                         empty = self.get_mbar_stage_ptr(mbar_consumed, stage)
@@ -2101,7 +2458,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     ) * self.kv_tile
                     if cutlass.const_expr(self.use_paged_kv):
                         page_ids = self.resolve_paged_kv_tile_pages(
-                            batch_idx,
+                            request_idx,
                             kv_seq_idx,
                             seqlen_k,
                             block_tables,
@@ -2173,7 +2530,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 kv_seq_idx = (num_kv_tiles - 1) * self.kv_tile
                 if cutlass.const_expr(self.use_paged_kv):
                     page_ids = self.resolve_paged_kv_tile_pages(
-                        batch_idx,
+                        request_idx,
                         kv_seq_idx,
                         seqlen_k,
                         block_tables,
@@ -2216,10 +2573,10 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
 
                 kv_seq_idx -= self.kv_tile
                 consumed_phase = cutlass.Int32(0)
-                while kv_seq_idx >= 0:
+                while kv_seq_idx >= kv_begin_tile * self.kv_tile:
                     if cutlass.const_expr(self.use_paged_kv):
                         page_ids = self.resolve_paged_kv_tile_pages(
-                            batch_idx,
+                            request_idx,
                             kv_seq_idx,
                             seqlen_k,
                             block_tables,
@@ -2269,7 +2626,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         # /////////////////////////////////////////////////////////////////////////////
         #  COMPUTE
         # /////////////////////////////////////////////////////////////////////////////
-        elif warp < self.load_warp_id and q_seq_idx < seqlen_q and seqlen_k > 0:
+        elif warp < self.load_warp_id and q_seq_idx < seqlen_q and has_kv_work:
             prims.setmaxregister(240, prims.SetMaxRegisterAction.INCREASE)
 
             q_l2_cache_hint = cutlass.Int64(0)
@@ -2289,7 +2646,12 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             uses_distributed_row_state = cutlass.const_expr(
                 self.head_tile == 256 and self.q_tile == 128 and self.kv_tile == 128
             )
-            uses_unified_kv_ring = uses_distributed_row_state
+            uses_direct_state_ring = cutlass.const_expr(
+                self.head_tile == 128 and self.q_tile == 128 and self.kv_tile == 128
+            )
+            uses_unified_kv_ring = cutlass.const_expr(
+                uses_distributed_row_state or uses_direct_state_ring
+            )
             if cutlass.const_expr(uses_distributed_row_state):
                 # D256/Q128/KV128 crosses the register cliff with four state
                 # scalars. Distribute them across each threadquad: lanes 0/1
@@ -2343,13 +2705,10 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 mbar_k_consumed=mbar_consumed,
                 mbar_v_consumed=mbar_consumed.subview(1),
             )
-            if cutlass.const_expr(uses_distributed_row_state):
+            if cutlass.const_expr(uses_distributed_row_state or uses_direct_state_ring):
                 mma_params = SimpleNamespace(
                     sKV=sKV,
                     o_regs=o_regs,
-                )
-                softmax_params = SimpleNamespace(
-                    softmax_scale_log2=softmax_scale_log2,
                 )
             else:
                 mma_params = SimpleNamespace(
@@ -2358,10 +2717,18 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     sV=sKV.subview(self.kv_tile_elems),
                     o_regs=o_regs,
                 )
+
+            if cutlass.const_expr(uses_distributed_row_state):
+                softmax_params = SimpleNamespace(
+                    softmax_scale_log2=softmax_scale_log2,
+                    skip_softmax_threshold_log2=skip_softmax_threshold_log2,
+                )
+            else:
                 softmax_params = SimpleNamespace(
                     row_max=row_max,
                     row_sum=row_sum,
                     softmax_scale_log2=softmax_scale_log2,
+                    skip_softmax_threshold_log2=skip_softmax_threshold_log2,
                 )
 
             # Load Q into registers.
@@ -2377,13 +2744,13 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 # Packed requests can be rectangular, so reserve one full
                 # extra overlap for the bottom-right causal offset.
                 masked_kv_tile_count = ceil_div(
-                    self.q_tile + self.kv_tile - 1, self.kv_tile
+                    self.q_tile_tokens + self.kv_tile - 1, self.kv_tile
                 )
 
             # Phase 1: potentially masked iterations.
             pipeline_k_stage = cutlass.Int32(0)
             for step in cutlass.range_constexpr(masked_kv_tile_count):
-                if kv_tile_idx >= 0:
+                if kv_tile_idx >= kv_begin_tile:
                     if cutlass.const_expr(uses_distributed_row_state):
                         row_state = self.compute_one_kv_tile(
                             basic_params,
@@ -2396,46 +2763,77 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                             is_masked_frontier_tile=True,
                             uses_softmax_init_path=(step == 0),
                         )
-                    else:
-                        self.compute_one_kv_tile_single_buffer(
+                    elif cutlass.const_expr(uses_direct_state_ring):
+                        self.compute_one_kv_tile_direct_state(
                             basic_params,
                             mma_params,
                             softmax_params,
                             q_regs,
                             num_kv_tiles,
                             kv_tile_idx,
+                            pipeline_k_stage,
+                            uses_kv_ring=True,
+                            is_masked_frontier_tile=True,
+                            uses_softmax_init_path=(step == 0),
+                        )
+                    else:
+                        self.compute_one_kv_tile_direct_state(
+                            basic_params,
+                            mma_params,
+                            softmax_params,
+                            q_regs,
+                            num_kv_tiles,
+                            kv_tile_idx,
+                            pipeline_k_stage,
+                            uses_kv_ring=False,
                             is_masked_frontier_tile=True,
                             uses_softmax_init_path=(step == 0),
                         )
                 kv_tile_idx -= 1
-                if cutlass.const_expr(uses_distributed_row_state):
+                if cutlass.const_expr(uses_unified_kv_ring):
                     if pipeline_k_stage == 0:
                         pipeline_k_stage = cutlass.Int32(2)
                     else:
                         pipeline_k_stage -= 1
 
             # Phase 2: remaining tiles outside the explicit mask frontier.
-            while kv_tile_idx >= 0:
+            while kv_tile_idx >= kv_begin_tile:
                 if cutlass.const_expr(uses_unified_kv_ring):
-                    row_state = self.compute_one_kv_tile(
-                        basic_params,
-                        mma_params,
-                        softmax_params,
-                        q_regs,
-                        row_state,
-                        kv_tile_idx,
-                        pipeline_k_stage,
-                        is_masked_frontier_tile=False,
-                        uses_softmax_init_path=False,
-                    )
+                    if cutlass.const_expr(uses_distributed_row_state):
+                        row_state = self.compute_one_kv_tile(
+                            basic_params,
+                            mma_params,
+                            softmax_params,
+                            q_regs,
+                            row_state,
+                            kv_tile_idx,
+                            pipeline_k_stage,
+                            is_masked_frontier_tile=False,
+                            uses_softmax_init_path=False,
+                        )
+                    else:
+                        self.compute_one_kv_tile_direct_state(
+                            basic_params,
+                            mma_params,
+                            softmax_params,
+                            q_regs,
+                            num_kv_tiles,
+                            kv_tile_idx,
+                            pipeline_k_stage,
+                            uses_kv_ring=True,
+                            is_masked_frontier_tile=False,
+                            uses_softmax_init_path=False,
+                        )
                 else:
-                    self.compute_one_kv_tile_single_buffer(
+                    self.compute_one_kv_tile_direct_state(
                         basic_params,
                         mma_params,
                         softmax_params,
                         q_regs,
                         num_kv_tiles,
                         kv_tile_idx,
+                        pipeline_k_stage,
+                        uses_kv_ring=False,
                         is_masked_frontier_tile=False,
                         uses_softmax_init_path=False,
                     )
@@ -2492,12 +2890,12 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             #
             #   log2(sum(exp(score * scale)))
             #     = row_max * scale * log2(e) + log2(row_sum).
+            # row_sum carries the P pre-scale, so the LSE subtracts it.
             if cutlass.const_expr(lse is not None):
                 if lane_mod4 == 0:
                     for row_half in cutlass.range_constexpr(2):
-                        lse_q_seq_idx = (
-                            q_seq_idx + q_warp_row0 + lane_div4 + row_half * 8
-                        )
+                        lse_row_in_cta = q_warp_row0 + lane_div4 + row_half * 8
+                        lse_q_seq_idx = q_seq_idx + self.q_row_token(lse_row_in_cta)
                         if lse_q_seq_idx < seqlen_q:
                             if cutlass.const_expr(row_half == 0):
                                 lse_row_max = row_max_0
@@ -2506,10 +2904,16 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                                 lse_row_max = row_max_1
                                 lse_row_sum = row_sum_1
                             lse[
-                                q_token_base + lse_q_seq_idx,
-                                q_head_idx,
-                            ] = lse_row_max * softmax_scale_log2 + cute.math.log2(
-                                lse_row_sum, fastmath=True
+                                (q_token_base + lse_q_seq_idx) * num_kv_chunks
+                                + kv_chunk,
+                                q_head_idx
+                                + self.q_row_head_offset(
+                                    lse_row_in_cta, cutlass.Int32(1)
+                                ),
+                            ] = (
+                                lse_row_max * softmax_scale_log2
+                                + cute.math.log2(lse_row_sum, fastmath=True)
+                                - self.P_FP8_PRESCALE_LOG2
                             )
 
             # No compute warp may alias sKV as sO while a peer still reads the
@@ -2570,7 +2974,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
 
             store_row = lane_mod8 + ((lane_div8) % 2) * 8
             store_col = lane_div16 * 8
-            store_q_seq_idx = q_seq_idx + q_warp_row0 + store_row
+            store_row_in_cta = q_warp_row0 + store_row
+            store_q_seq_idx = q_seq_idx + self.q_row_token(store_row_in_cta)
+            store_head_col = self.q_row_head_offset(store_row_in_cta, head_dim)
             for d_frag_pair in cutlass.range_constexpr(self.pv_d_frags // 2):
                 store_col_in_cta = d_frag_pair * 16 + store_col
                 sO_ptr = (
@@ -2583,7 +2989,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 gO_ptr = (
                     o_ptr
                     + o_head_base
-                    + store_q_seq_idx * q_seq_stride
+                    + store_q_seq_idx * o_seq_stride
+                    + store_head_col
                     + store_col_in_cta
                 )
                 if store_q_seq_idx < seqlen_q and store_col_in_cta < head_dim:
@@ -2600,14 +3007,14 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 tuple(self.out_dtype(0.0) for _ in range(8)),
                 dtype=self.out_dtype,
             )
-            zero_q_seq_idx = (
-                q_seq_idx + warp * self.MMA_TILER[0] + lane % self.MMA_TILER[0]
-            )
+            zero_row_in_cta = warp * self.MMA_TILER[0] + lane % self.MMA_TILER[0]
+            zero_q_seq_idx = q_seq_idx + self.q_row_token(zero_row_in_cta)
             if cutlass.const_expr(lse is not None):
                 if lane < self.MMA_TILER[0] and zero_q_seq_idx < seqlen_q:
                     lse[
-                        q_token_base + zero_q_seq_idx,
-                        q_head_idx,
+                        (q_token_base + zero_q_seq_idx) * num_kv_chunks + kv_chunk,
+                        q_head_idx
+                        + self.q_row_head_offset(zero_row_in_cta, cutlass.Int32(1)),
                     ] = -cutlass.Float32.inf
             for head_chunk in cutlass.range_constexpr(self.head_tile // 16):
                 zero_head_col = head_chunk * 16 + lane_div16 * 8
@@ -2615,7 +3022,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                     (
                         o_ptr
                         + o_head_base
-                        + zero_q_seq_idx * q_seq_stride
+                        + zero_q_seq_idx * o_seq_stride
+                        + self.q_row_head_offset(zero_row_in_cta, head_dim)
                         + zero_head_col
                     ).store(zero_vector, alignment=16)
 
@@ -2637,6 +3045,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         lse: cute.Tensor | None,
         softmax_scale_log2: cutlass.Float32,
         output_scale: cutlass.Float32,
+        skip_softmax_threshold: cute.Tensor | None,
         stream: cuda_driver.CUstream,
         seqlens_kv: cute.Tensor | None = None,
         cu_seqlens_q: cute.Tensor | None = None,
@@ -2644,6 +3053,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         cu_seqlens_k: cute.Tensor | None = None,
         max_seqlen_q: cutlass.Int32 | None = None,
         use_pdl: bool = False,
+        kv_tile_ranges: cute.Tensor | None = None,
     ) -> None:
         """Launch the SM120 PRIM FMHA FP8 kernel.
 
@@ -2657,6 +3067,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         :param lse: Optional packed float32 log2 LSE ``(total_q,Hq)``.
         :param softmax_scale_log2: ``softmax_scale * log2(e)``.
         :param output_scale: Scalar multiplier applied to normalized output.
+        :param skip_softmax_threshold: E-based threshold for omitting tiles
+            whose contribution is negligible, one float32 value per request.
+            ``None`` selects the dense specialization.
         :param stream: CUDA stream used for the launch.
         :param seqlens_kv: Runtime K/V lengths, one Int32 per request.
         :param cu_seqlens_q: Packed-Q cumulative Int32 offsets.
@@ -2665,6 +3078,9 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         :param cu_seqlens_k: Packed-K/V cumulative Int32 offsets.
         :param max_seqlen_q: Contiguous-varlen launch-grid bound.
         :param use_pdl: Whether to use Programmatic Dependent Launch.
+        :param kv_tile_ranges: Split KV: Int32 ``(num_chunks * B, 2)`` K/V tile
+            ranges, row ``c * B + r`` for chunk ``c`` of request ``r``. ``o``/``lse``
+            then hold row ``p * num_chunks + c`` for chunk ``c`` of token ``p``.
 
         Direct callers must satisfy the same shape contract enforced by
         :meth:`can_implement_paged`.
@@ -2673,6 +3089,17 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         output_head_dim = o.shape[2]
         num_heads_q = q.shape[1]
         batch_size = cute.size(cu_seqlens_q) - 1
+        if cutlass.const_expr(
+            num_heads_q % k.shape[1] != 0
+            or (num_heads_q // k.shape[1]) % self.gqa_pack_size != 0
+        ):
+            raise ValueError(
+                "gqa_pack_size must divide the number of Q heads per K/V head"
+            )
+        num_head_groups = num_heads_q // self.gqa_pack_size
+        num_items = batch_size
+        if cutlass.const_expr(kv_tile_ranges is not None):
+            num_items = cute.size(kv_tile_ranges, mode=[0])
         if cutlass.const_expr(self.use_paged_kv):
             if cutlass.const_expr(
                 head_dim != k.shape[3]
@@ -2734,15 +3161,15 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             # K/V are scheduled close together, while Q tiles run from the
             # longest causal rows to the shortest.
             grid = (
-                num_heads_q,
-                cute.ceil_div(max_seqlen_q, self.q_tile),
-                batch_size,
+                num_head_groups,
+                cute.ceil_div(max_seqlen_q, self.q_tile_tokens),
+                num_items,
             )
         else:
             grid = (
-                cute.ceil_div(max_seqlen_q, self.q_tile),
-                num_heads_q,
-                batch_size,
+                cute.ceil_div(max_seqlen_q, self.q_tile_tokens),
+                num_head_groups,
+                num_items,
             )
 
         self.kernel(
@@ -2755,10 +3182,12 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             tma_v_desc,
             softmax_scale_log2,
             output_scale,
+            skip_softmax_threshold,
             seqlens_kv,
             cu_seqlens_q,
             block_tables,
             cu_seqlens_k,
+            kv_tile_ranges,
         ).launch(
             grid=grid,
             block=(self.threads_per_cta, 1, 1),

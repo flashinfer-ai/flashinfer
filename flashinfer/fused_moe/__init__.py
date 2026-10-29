@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import importlib
 import warnings
 
 # Unified MoE API
@@ -24,6 +25,7 @@ from .api import (  # noqa: F401
     GeGLU,
     GeGLUTanh,
     Identity,
+    PowLU,
     ReLU,
     ReLU2,
     SiLU,
@@ -34,8 +36,19 @@ from .api import (  # noqa: F401
     B12xNvfp4Config,
     B12xW4A16Config,
     BackendOptions,
+    CakeStepFunConfig,
+    CudnnFrostBf16Config,
+    CudnnFrostMxfp8Config,
+    CudnnFrostNvfp4Config,
+    CudnnFrostMxfp8Mxfp4Config,
     CakeWarpDecodeConfig,
+    CudnnGroupedGemmBf16Config,
+    CudnnGroupedGemmFp8PerTensorConfig,
+    CudnnGroupedGemmMxfp8Config,
+    CudnnGroupedGemmNvfp4Config,
     CuteDslConfig,
+    FrostLowLatencyConfig,
+    PrimsTsConfig,
     CutlassBf16Config,
     CutlassFp8BlockConfig,
     CutlassFp8PerTensorConfig,
@@ -46,6 +59,14 @@ from .api import (  # noqa: F401
     CutlassW4A16Config,
     CutlassW4A8Config,
     CuTileBf16Config,
+    CuTileFp8PerTensorBf16Config,
+    CuTileFp8PerTensorConfig,
+    CuTileMxfp4Bf16Config,
+    CuTileMxfp4Config,
+    CuTileMxfp4Mxfp8Config,
+    CuTileMxfp8Bf16Config,
+    CuTileMxfp8Config,
+    CuTileNvfp4Bf16Config,
     CuTileNvfp4Config,
     ExecutionConfig,
     ExpertConfig,
@@ -53,9 +74,15 @@ from .api import (  # noqa: F401
     MoEConfig,
     MoEFinalizeConfig,
     MoEWeightPack,
+    NVFP44Over6Config,
+    NVFP44Over6ErrMode,
     QuantConfig,
-    QuantVariant,
+    QuantFormat,
     RoutingConfig,
+    SM12xFp8Config,
+    SM12xMxfp8Mxfp4Config,
+    SM12xNvfp4Bf16Config,
+    SM12xNvfp4Config,
     TrtllmBf16Config,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
@@ -71,8 +98,14 @@ from .da_runtime import (  # noqa: F401
 from .runners import (  # noqa: F401
     B12xNvfp4Runner,
     B12xW4A16Runner,
+    CakeStepFunRunner,
     CakeWarpDecodeRunner,
+    CudnnGroupedGemmBf16Runner,
+    CudnnGroupedGemmFp8PerTensorRunner,
+    CudnnGroupedGemmMxfp8Runner,
+    CudnnGroupedGemmNvfp4Runner,
     CutlassBf16Runner,
+    PrimsTsRunner,
     CutlassFp8BlockRunner,
     CutlassFp8PerTensorRunner,
     CutlassHummingRunner,
@@ -82,8 +115,20 @@ from .runners import (  # noqa: F401
     CutlassW4A16Runner,
     CutlassW4A8Runner,
     CuTileBf16Runner,
+    CuTileFp8PerTensorBf16Runner,
+    CuTileFp8PerTensorRunner,
+    CuTileMxfp4Bf16Runner,
+    CuTileMxfp4Runner,
+    CuTileMxfp4Mxfp8Runner,
+    CuTileMxfp8Bf16Runner,
+    CuTileMxfp8Runner,
+    CuTileNvfp4Bf16Runner,
     CuTileNvfp4Runner,
     CuteDslRunner,
+    SM12xFp8Runner,
+    SM12xMxfp8Mxfp4Runner,
+    SM12xNvfp4Bf16Runner,
+    SM12xNvfp4Runner,
     TrtllmBf16RoutedRunner,
     TrtllmFp4RoutedRunner,
     TrtllmFp8BlockRunner,
@@ -91,7 +136,29 @@ from .runners import (  # noqa: F401
     TrtllmMxInt4RoutedRunner,
 )
 
-# Legacy flat-argument APIs (unchanged, not deprecated)
+# Legacy flat-argument Prims-TS APIs are imported on first use. Keeping them
+# lazy prevents a plain ``import flashinfer`` from importing CUTLASS Task
+# Scheduling and applying its process-wide WorkTileInfo customization.
+_PRIMS_TS_LAZY_EXPORTS = {
+    "prims_ts_bf16_moe": ".backends.prims_ts.bf16_op",
+    "prims_ts_bf16_moe_partitioned": ".backends.prims_ts.bf16_op",
+    "prims_ts_bf16_routed_moe": ".backends.prims_ts.bf16_op",
+    "prims_ts_fp8_block_scale_moe": ".backends.prims_ts.fp8_op",
+    "prims_ts_fp8_block_scale_moe_partitioned": ".backends.prims_ts.fp8_op",
+    "prims_ts_fp8_block_scale_routed_moe": ".backends.prims_ts.fp8_op",
+    "prims_ts_fp8_per_tensor_scale_moe": ".backends.prims_ts.fp8_op",
+    "prims_ts_fp8_per_tensor_scale_moe_partitioned": ".backends.prims_ts.fp8_op",
+    "prims_ts_fp4_block_scale_moe": ".backends.prims_ts.fp4_op",
+    "prims_ts_fp4_block_scale_moe_partitioned": ".backends.prims_ts.fp4_op",
+    "prims_ts_fp4_block_scale_routed_moe": ".backends.prims_ts.fp4_op",
+}
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | _PRIMS_TS_LAZY_EXPORTS.keys())
+
+
+# Other legacy flat-argument APIs (unchanged, not deprecated)
 from .core import (
     RoutingInputMode,
     TrtllmMoERoutingMetadata,
@@ -99,6 +166,7 @@ from .core import (
     convert_to_block_layout,
     cutlass_fused_moe,
     cutlass_fused_moe_workspace_size,
+    cake_fused_moe_prepare_workspace,
     gen_cutlass_fused_moe_sm120_module,
     gen_cutlass_fused_moe_sm103_module,
     gen_cutlass_fused_moe_sm100_module,
@@ -113,6 +181,7 @@ from .core import (
     trtllm_fp8_per_channel_scale_routed_moe,
     trtllm_fp8_per_tensor_scale_moe,
     trtllm_fp8_per_tensor_scale_routed_moe,
+    trtllm_fused_moe_workspace_size,
     trtllm_moe_allocate_routing_metadata,
     trtllm_moe_allocate_routing_metadata_multi_tile,
     trtllm_bf16_moe,
@@ -134,8 +203,25 @@ from ..tllm_enums import (
     RoutingMethodType,
 )
 
+from .alphamoe_sm100 import (  # noqa: F401
+    alphamoe_fp8_block_scale_aligned_moe as alphamoe_fp8_block_scale_aligned_moe,
+    alphamoe_interleave_gated_weights as alphamoe_interleave_gated_weights,
+)
+
 from .fused_routing_dsv3 import (  # noqa: F401
     fused_topk_deepseek as fused_topk_deepseek,
+)
+
+from .alphamoe_fused_router import (  # noqa: F401
+    AlphaMoERoutePlan as AlphaMoERoutePlan,
+    allocate_alphamoe_route_plan as allocate_alphamoe_route_plan,
+    alphamoe_fused_router as alphamoe_fused_router,
+)
+
+from .kimi_k3_fused_router import (  # noqa: F401
+    allocate_kimi_k3_route_plan as allocate_kimi_k3_route_plan,
+    kimi_k3_fused_router as kimi_k3_fused_router,
+    prepare_kimi_k3_fused_router as prepare_kimi_k3_fused_router,
 )
 
 from .hash_topk import (  # noqa: F401
@@ -146,9 +232,30 @@ from .trtllm_gen_routing import (  # noqa: F401
     TrtllmGenRoutingResult as TrtllmGenRoutingResult,
     trtllm_gen_routing as trtllm_gen_routing,
 )
+from .cudnn_frost_selected import (  # noqa: F401
+    cudnn_frost_grouped_gemm1_swiglu,
+    cudnn_frost_grouped_gemm1_swiglu_workspace_size,
+)
+
+from .alphamoe_nvfp4_sm100 import (  # noqa: F401
+    alphamoe_nvfp4_aligned_moe as alphamoe_nvfp4_aligned_moe,
+    alphamoe_nvfp4_routed_moe as alphamoe_nvfp4_routed_moe,
+    AlphaMoeNvfp4DeferredOutput as AlphaMoeNvfp4DeferredOutput,
+    alphamoe_nvfp4_routed_moe_deferred as alphamoe_nvfp4_routed_moe_deferred,
+    alphamoe_nvfp4_finalize_deferred as alphamoe_nvfp4_finalize_deferred,
+    prepare_nvfp4_w1_scales as prepare_nvfp4_w1_scales,
+    prepare_nvfp4_w1_data as prepare_nvfp4_w1_data,
+    prepare_nvfp4_w2_data as prepare_nvfp4_w2_data,
+    prepare_nvfp4_w2_data_k256 as prepare_nvfp4_w2_data_k256,
+    prepare_nvfp4_w2_scales_k256 as prepare_nvfp4_w2_scales_k256,
+    prepare_nvfp4_w1_gate_up_data as prepare_nvfp4_w1_gate_up_data,
+    prepare_nvfp4_w1_gate_up_scales as prepare_nvfp4_w1_gate_up_scales,
+    prepare_nvfp4_w2_scales as prepare_nvfp4_w2_scales,
+)
 
 from .bgmv_moe import (  # noqa: F401
-    BGMVMoEBlackwellPlan as BGMVMoEBlackwellPlan,
+    BGMVMoECakePlan as BGMVMoECakePlan,
+    BGMVMoEPortablePlan as BGMVMoEPortablePlan,
     bgmv_moe as bgmv_moe,
     bgmv_moe_shrink as bgmv_moe_shrink,
     bgmv_moe_expand as bgmv_moe_expand,
@@ -180,6 +287,14 @@ try:
         B12xMoEWrapper,
         cute_dsl_fused_moe_bf16,
         CuteDslBf16MoEWrapper,
+        cute_dsl_sm12x_moe_gemm_fp8,
+        cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4,
+        cute_dsl_sm12x_fc1_act_fp8,
+        cute_dsl_sm12x_fc1_act_mxfp8_mxfp4,
+        cute_dsl_sm12x_fc1_act_q1_fp8,
+        cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4,
+        cute_dsl_sm12x_fc2_finalize_fp8,
+        cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4,
     )
 
     _cute_dsl_available = True
@@ -188,6 +303,11 @@ except ImportError:
 
 
 def __getattr__(name: str):
+    module_name = _PRIMS_TS_LAZY_EXPORTS.get(name)
+    if module_name is not None:
+        value = getattr(importlib.import_module(module_name, __name__), name)
+        globals()[name] = value
+        return value
     if name == "CuteDslNvfp4Runner":
         warnings.warn(
             "CuteDslNvfp4Runner is deprecated; use CuteDslRunner instead.",
@@ -199,6 +319,8 @@ def __getattr__(name: str):
 
 
 __all__ = [
+    "alphamoe_fp8_block_scale_aligned_moe",
+    "alphamoe_interleave_gated_weights",
     # Typed activation values
     "ActivationConfig",
     "GELU",
@@ -210,6 +332,7 @@ __all__ = [
     "SiLU",
     "GeGLUTanh",
     "SwiGLUStep",
+    "PowLU",
     "Identity",
     # Unified configs, packs, and runners
     "B12xNvfp4Config",
@@ -217,9 +340,26 @@ __all__ = [
     "B12xW4A16Config",
     "B12xW4A16Runner",
     "BackendOptions",
+    "CakeStepFunConfig",
+    "CudnnFrostBf16Config",
+    "CudnnFrostMxfp8Config",
+    "CudnnFrostNvfp4Config",
+    "CudnnFrostMxfp8Mxfp4Config",
     "CakeWarpDecodeConfig",
+    "CakeStepFunRunner",
     "CakeWarpDecodeRunner",
+    "PrimsTsConfig",
+    "PrimsTsRunner",
+    "CudnnGroupedGemmBf16Config",
+    "CudnnGroupedGemmBf16Runner",
+    "CudnnGroupedGemmFp8PerTensorConfig",
+    "CudnnGroupedGemmFp8PerTensorRunner",
+    "CudnnGroupedGemmMxfp8Config",
+    "CudnnGroupedGemmMxfp8Runner",
+    "CudnnGroupedGemmNvfp4Config",
+    "CudnnGroupedGemmNvfp4Runner",
     "CuteDslConfig",
+    "FrostLowLatencyConfig",
     "CutlassBf16Config",
     "CutlassBf16Runner",
     "CutlassFp8BlockConfig",
@@ -240,6 +380,22 @@ __all__ = [
     "CutlassW4A8Runner",
     "CuTileBf16Config",
     "CuTileBf16Runner",
+    "CuTileFp8PerTensorBf16Config",
+    "CuTileFp8PerTensorBf16Runner",
+    "CuTileFp8PerTensorConfig",
+    "CuTileFp8PerTensorRunner",
+    "CuTileMxfp4Bf16Config",
+    "CuTileMxfp4Bf16Runner",
+    "CuTileMxfp4Config",
+    "CuTileMxfp4Runner",
+    "CuTileMxfp4Mxfp8Config",
+    "CuTileMxfp4Mxfp8Runner",
+    "CuTileMxfp8Bf16Config",
+    "CuTileMxfp8Bf16Runner",
+    "CuTileMxfp8Config",
+    "CuTileMxfp8Runner",
+    "CuTileNvfp4Bf16Config",
+    "CuTileNvfp4Bf16Runner",
     "CuTileNvfp4Config",
     "CuTileNvfp4Runner",
     "ExecutionConfig",
@@ -260,13 +416,23 @@ __all__ = [
     "MoELayer",
     "MoEWeightPack",
     "TrtllmBf16RoutedRunner",
+    "NVFP44Over6Config",
+    "NVFP44Over6ErrMode",
     "TrtllmFp4RoutedRunner",
     "TrtllmFp8BlockRunner",
     "TrtllmFp8PerTensorRunner",
     "TrtllmMxInt4RoutedRunner",
     "QuantConfig",
-    "QuantVariant",
+    "QuantFormat",
     "RoutingConfig",
+    "SM12xFp8Config",
+    "SM12xFp8Runner",
+    "SM12xMxfp8Mxfp4Config",
+    "SM12xNvfp4Bf16Config",
+    "SM12xNvfp4Config",
+    "SM12xMxfp8Mxfp4Runner",
+    "SM12xNvfp4Bf16Runner",
+    "SM12xNvfp4Runner",
     "TrtllmBf16Config",
     "TrtllmFp4Config",
     "TrtllmFp8BlockConfig",
@@ -290,6 +456,17 @@ __all__ = [
     "gen_trtllm_gen_fused_moe_sm100_module",
     "reorder_rows_for_gated_act_gemm",
     "trtllm_bf16_moe",
+    "prims_ts_bf16_moe",
+    "prims_ts_bf16_moe_partitioned",
+    "prims_ts_bf16_routed_moe",
+    "prims_ts_fp4_block_scale_moe",
+    "prims_ts_fp4_block_scale_moe_partitioned",
+    "prims_ts_fp4_block_scale_routed_moe",
+    "prims_ts_fp8_block_scale_moe",
+    "prims_ts_fp8_block_scale_moe_partitioned",
+    "prims_ts_fp8_block_scale_routed_moe",
+    "prims_ts_fp8_per_tensor_scale_moe",
+    "prims_ts_fp8_per_tensor_scale_moe_partitioned",
     "trtllm_bf16_routed_moe",
     "trtllm_fp4_block_scale_moe",
     "trtllm_fp4_block_scale_routed_moe",
@@ -299,14 +476,37 @@ __all__ = [
     "trtllm_fp8_per_channel_scale_routed_moe",
     "trtllm_fp8_per_tensor_scale_moe",
     "trtllm_fp8_per_tensor_scale_routed_moe",
+    "trtllm_fused_moe_workspace_size",
     "trtllm_mxint4_block_scale_moe",
     "trtllm_mxint4_block_scale_routed_moe",
     "fused_topk_deepseek",
+    "AlphaMoERoutePlan",
+    "allocate_alphamoe_route_plan",
+    "alphamoe_fused_router",
+    "allocate_kimi_k3_route_plan",
+    "kimi_k3_fused_router",
+    "prepare_kimi_k3_fused_router",
     "hash_topk",
+    "alphamoe_nvfp4_aligned_moe",
+    "alphamoe_nvfp4_routed_moe",
+    "AlphaMoeNvfp4DeferredOutput",
+    "alphamoe_nvfp4_routed_moe_deferred",
+    "alphamoe_nvfp4_finalize_deferred",
+    "prepare_nvfp4_w1_scales",
+    "prepare_nvfp4_w1_data",
+    "prepare_nvfp4_w2_data",
+    "prepare_nvfp4_w2_data_k256",
+    "prepare_nvfp4_w2_scales_k256",
+    "prepare_nvfp4_w1_gate_up_data",
+    "prepare_nvfp4_w1_gate_up_scales",
+    "prepare_nvfp4_w2_scales",
     "TrtllmGenRoutingResult",
     "trtllm_gen_routing",
+    "cudnn_frost_grouped_gemm1_swiglu",
+    "cudnn_frost_grouped_gemm1_swiglu_workspace_size",
     "bgmv_moe",
-    "BGMVMoEBlackwellPlan",
+    "BGMVMoECakePlan",
+    "BGMVMoEPortablePlan",
     "bgmv_moe_shrink",
     "bgmv_moe_expand",
     "bgmv_moe_gemm1_lora_delta",
@@ -333,4 +533,12 @@ if _cute_dsl_available:
         "B12xMoEWrapper",
         "cute_dsl_fused_moe_bf16",
         "CuteDslBf16MoEWrapper",
+        "cute_dsl_sm12x_moe_gemm_fp8",
+        "cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4",
+        "cute_dsl_sm12x_fc1_act_fp8",
+        "cute_dsl_sm12x_fc1_act_mxfp8_mxfp4",
+        "cute_dsl_sm12x_fc1_act_q1_fp8",
+        "cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4",
+        "cute_dsl_sm12x_fc2_finalize_fp8",
+        "cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4",
     ]

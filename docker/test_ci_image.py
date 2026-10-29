@@ -61,6 +61,118 @@ def _expected_cudnn_backend(version: str) -> int:
     return major * 10000 + minor * 100 + patch
 
 
+def _cuda_version_at_least(version: str, minimum: tuple[int, int]) -> bool:
+    try:
+        major, minor = (int(part) for part in version.split(".", 1))
+    except (TypeError, ValueError):
+        _fail(f"invalid CUDA version: {version}")
+    return (major, minor) >= minimum
+
+
+def _validate_cuda_tile_compiler(
+    expected_cuda_version: str | None = None,
+) -> tuple[str, str, str]:
+    use_system_tileiras = expected_cuda_version is not None and _cuda_version_at_least(
+        expected_cuda_version, (13, 4)
+    )
+
+    try:
+        importlib.import_module("cuda.tile.tune")
+    except ImportError as error:
+        _fail(f"could not import cuda.tile.tune: {error}")
+
+    try:
+        cuda_tile_version = importlib.metadata.version("cuda-tile")
+    except importlib.metadata.PackageNotFoundError as error:
+        _fail(f"required cuda-tile package metadata not found: {error}")
+
+    try:
+        tileiras_version = importlib.metadata.version("nvidia-cuda-tileiras")
+    except importlib.metadata.PackageNotFoundError as error:
+        if not use_system_tileiras:
+            _fail(f"required cuda-tile package metadata not found: {error}")
+        tileiras_version = "system"
+
+    if use_system_tileiras and tileiras_version != "system":
+        _fail(
+            f"nvidia-cuda-tileiras=={tileiras_version} shadows the system compiler; "
+            f"CUDA {expected_cuda_version} images must use the toolkit's TileIRAS"
+        )
+
+    try:
+        compile_module = importlib.import_module("cuda.tile._compile")
+        compiler_path = os.fspath(compile_module._find_compiler_bin().path)
+    except Exception as error:
+        _fail(f"could not discover cuda-tile compiler: {error}")
+
+    try:
+        result = subprocess.run(
+            [compiler_path, "--help"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        _fail("cuda-tile compiler --help timed out after 30 seconds")
+    except subprocess.CalledProcessError as error:
+        _fail(f"cuda-tile compiler --help exited with status {error.returncode}")
+    except OSError as error:
+        _fail(f"could not run cuda-tile compiler --help: {error}")
+
+    if use_system_tileiras:
+        if compiler_path != "/usr/local/cuda/bin/tileiras":
+            _fail(
+                f"cuda-tile selected {compiler_path}; CUDA {expected_cuda_version} "
+                "images must use "
+                "/usr/local/cuda/bin/tileiras"
+            )
+        if "sm_107" not in result.stdout + result.stderr:
+            _fail(
+                f"the CUDA {expected_cuda_version} system TileIRAS does not "
+                "advertise SM107 support"
+            )
+
+    return cuda_tile_version, tileiras_version, compiler_path
+
+
+def _validate_cuda_tile_for_runtime(
+    expected_cuda_version: str,
+) -> tuple[str, str, str] | None:
+    if expected_cuda_version.split(".", 1)[0] != "13":
+        return None
+    return _validate_cuda_tile_compiler(expected_cuda_version)
+
+
+def _validate_cuda_runtime_distributions(
+    expected_cuda_version: str,
+) -> list[tuple[str, str]]:
+    expected_major = expected_cuda_version.split(".", 1)[0]
+    runtime_distributions = []
+    for distribution in importlib.metadata.distributions():
+        name = distribution.metadata.get("Name")
+        if not isinstance(name, str):
+            continue
+        normalized_name = re.sub(r"[-_.]+", "-", name).lower()
+        if normalized_name.startswith("nvidia-cuda-runtime"):
+            runtime_distributions.append((name, distribution.version))
+
+    runtime_distributions.sort(
+        key=lambda item: (re.sub(r"[-_.]+", "-", item[0]).lower(), item[1])
+    )
+    if not runtime_distributions:
+        _fail("no installed nvidia-cuda-runtime distribution found")
+
+    for name, version in runtime_distributions:
+        actual_major = version.split(".", 1)[0]
+        if actual_major != expected_major:
+            _fail(
+                f"{name}=={version} targets CUDA {actual_major}; "
+                f"expected CUDA {expected_major}"
+            )
+    return runtime_distributions
+
+
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("expected_cuda_version", help="expected CUDA major.minor")
@@ -110,6 +222,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"cuda-python targets CUDA {actual_cuda_python}; expected {expected_cuda}"
         )
 
+    cuda_runtime_distributions = _validate_cuda_runtime_distributions(expected_cuda)
+    cuda_tile_compiler = _validate_cuda_tile_for_runtime(expected_cuda)
+
     actual_cudnn = importlib.metadata.version(cudnn_package)
     if actual_cudnn != expected_cudnn:
         _fail(f"{cudnn_package} is {actual_cudnn}; expected {expected_cudnn}")
@@ -144,6 +259,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     for distribution in distributions:
         print(f"{distribution}=={importlib.metadata.version(distribution)}")
+    if cuda_tile_compiler is not None:
+        cuda_tile_version, tileiras_version, compiler_path = cuda_tile_compiler
+        print(f"cuda-tile=={cuda_tile_version}")
+        if tileiras_version == "system":
+            print("nvidia-cuda-tileiras=not-installed")
+        else:
+            print(f"nvidia-cuda-tileiras=={tileiras_version}")
+        print(f"cuda-tile-compiler={compiler_path}")
+    for distribution, version in cuda_runtime_distributions:
+        print(f"cuda-runtime-distribution={distribution}=={version}")
     print(f"architecture={actual_machine}")
     print(f"cuda={torch.version.cuda}")
     print(f"Candidate CI image passed: CUDA {expected_cuda}, {expected_machine}")

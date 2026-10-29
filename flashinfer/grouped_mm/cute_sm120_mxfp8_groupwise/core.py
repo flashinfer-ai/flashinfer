@@ -24,7 +24,7 @@ import torch
 
 from ...api_logging import flashinfer_api
 from ...autotuner import AutoTuner
-from ...jit.cute_sm120_mxfp8_groupwise import gen_gemm_sm120_module_cute_mxfp8
+from ...jit.cute_sm12x_gemm import gen_gemm_sm120_module_cute
 from ...utils import supported_compute_capability
 from .._sm120_moe_autotune import SM120_MOE_TUNING_CONFIG, Sm120MoeTunableRunner
 
@@ -50,7 +50,7 @@ _MXFP8_MOE_GATED_TACTICS_GRANK128 = _MXFP8_MOE_GATED_TACTICS + (
 @functools.cache
 def get_gemm_sm120_module_cute_mxfp8():
     """MXFP8 grouped MM module accessor for SM120 cute backend."""
-    return gen_gemm_sm120_module_cute_mxfp8().build_and_load()
+    return gen_gemm_sm120_module_cute().build_and_load()
 
 
 def _check_m_indptr(m_indptr: torch.Tensor, num_experts: int) -> None:

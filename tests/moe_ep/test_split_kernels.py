@@ -54,11 +54,13 @@ class TestKernelRequiresWeights:
 
         moe = fm.MoEConfig(
             routing=fm.RoutingConfig(num_experts=2, top_k=1),
-            quant=fm.QuantConfig(
-                variant=(
-                    fm.QuantVariant.MXFP4
-                    if variant == "mxfp4"
-                    else fm.QuantVariant.NVFP4
+            quant=(
+                fm.QuantConfig(
+                    weight=fm.QuantFormat.MXFP4, activation=fm.QuantFormat.MXFP8
+                )
+                if variant == "mxfp4"
+                else fm.QuantConfig(
+                    weight=fm.QuantFormat.NVFP4, activation=fm.QuantFormat.NVFP4
                 )
             ),
             experts=fm.ExpertConfig(intermediate_size=128, local_num_experts=2),
@@ -144,7 +146,7 @@ class TestSplitKernelRegistry:
 @pytest.fixture
 def capturing_stub_fleet():
     """Stub fleet that records tensors at dispatch and combine boundaries."""
-    from flashinfer.moe_ep.core.comm.fleet import _BACKEND_REGISTRY
+    from flashinfer.moe_ep.core.comm.fleet import _FLEET_REGISTRY
 
     captured: dict[str, object] = {}
 
@@ -185,17 +187,39 @@ def capturing_stub_fleet():
 
     from unittest import mock
 
-    saved = _BACKEND_REGISTRY.get("nccl_ep")
-    _BACKEND_REGISTRY["nccl_ep"] = _StubFleet
+    saved = _FLEET_REGISTRY.get("nccl_ep")
+    _FLEET_REGISTRY["nccl_ep"] = _StubFleet
     with mock.patch("flashinfer.moe_ep.modes.split_layer.validate_arch_for_backend"):
         yield captured
     if saved is not None:
-        _BACKEND_REGISTRY["nccl_ep"] = saved
+        _FLEET_REGISTRY["nccl_ep"] = saved
     else:
-        _BACKEND_REGISTRY.pop("nccl_ep", None)
+        _FLEET_REGISTRY.pop("nccl_ep", None)
 
 
-def test_split_layer_identity_kernel_wires_dispatch_to_combine(capturing_stub_fleet):
+@pytest.fixture
+def isolated_single_rank_gloo(tmp_path):
+    """Keep this singleton test off the port used by concurrent torchrun jobs."""
+    import torch.distributed as dist
+
+    initialized_here = not dist.is_initialized()
+    if initialized_here:
+        dist.init_process_group(
+            backend="gloo",
+            rank=0,
+            world_size=1,
+            init_method=(tmp_path / "gloo-rendezvous").as_uri(),
+        )
+    try:
+        yield
+    finally:
+        if initialized_here:
+            dist.destroy_process_group()
+
+
+def test_split_layer_identity_kernel_wires_dispatch_to_combine(
+    capturing_stub_fleet, isolated_single_rank_gloo
+):
     """MoEEpSplitLayer + IdentityConfig passes dispatch output into combine."""
     import torch
 
