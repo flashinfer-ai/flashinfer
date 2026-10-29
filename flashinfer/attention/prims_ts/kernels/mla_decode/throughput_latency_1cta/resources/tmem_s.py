@@ -164,10 +164,7 @@ class TmemSResource(MlaResource):
 
     def get_smem_requirements(self):
         """Return the softmax scratch SMEM allocation."""
-        if (
-            self.cfg.kernel_variant == "keeps_mma_ab"
-            and self.cfg.num_tokens_per_page == 1
-        ):
+        if self.cfg.kernel_variant == "keeps_mma_ab" and self.cfg.sparse_d512:
             return []
         if self._scratch_alloc is None:
             self._scratch_alloc = SmemAllocation(
@@ -240,10 +237,7 @@ class TmemSResource(MlaResource):
         context = stage_info.context
         self._init_tmem_state(stage_info)
         if cutlass.const_expr(
-            not (
-                self.cfg.kernel_variant == "keeps_mma_ab"
-                and self.cfg.num_tokens_per_page == 1
-            )
+            not (self.cfg.kernel_variant == "keeps_mma_ab" and self.cfg.sparse_d512)
         ):
             self._softmax_scratch = smem_array(
                 context,
@@ -495,8 +489,9 @@ class TmemSResource(MlaResource):
                 swaps=cfg.kernel_variant != "keeps_mma_ab",
                 tile_size_kv=cfg.tile_size_kv,
             )
+            # D576 query rows of one CTA are heads of one token: one mask.
             if cutlass.const_expr(
-                cfg.num_tokens_per_page == 1 and cfg.logical_seq_len_q == 1
+                (cfg.sparse_d512 and cfg.logical_seq_len_q == 1) or cfg.sparse_d576
             )
             else raw_mask_routes
         )
@@ -563,7 +558,7 @@ class TmemSResource(MlaResource):
                 next_tile_offset_k > min_seq_len_kv
             )
         if cutlass.const_expr(cfg.num_tokens_per_page == 1):
-            if cutlass.const_expr(cfg.logical_seq_len_q == 1):
+            if cutlass.const_expr(cfg.logical_seq_len_q == 1 or cfg.sparse_d576):
                 # Cached route bits include the live prefix boundary.
                 should_apply_dense_mask = (mask_routes.low | mask_routes.high) != Int32(
                     0

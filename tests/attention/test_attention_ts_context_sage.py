@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 import torch
@@ -37,6 +41,30 @@ _REQUIRES_CONTEXT_SAGE_GPU = pytest.mark.skipif(
     or get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3), (10, 7)),
     reason="PrimTS context Sage attention needs an SM100-class GPU",
 )
+
+
+@_REQUIRES_CONTEXT_SAGE_GPU
+def test_context_sage_cold_compile(tmp_path: Path) -> None:
+    """Compile SMEM Sage scales without prior paged imports or cached kernels."""
+    target = (
+        f"{Path(__file__).resolve()}::test_context_sage_matches_dequantized_reference"
+        "[1-512-1000-4-4-1-1-False-float8_e4m3fn]"
+    )
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "--maxfail=1", target],
+        cwd=Path(__file__).resolve().parents[2],
+        env=dict(
+            os.environ,
+            PYTEST_ADDOPTS="",
+            FLASHINFER_WORKSPACE_BASE=str(tmp_path),
+            CUTE_DSL_CACHE_DIR=str(tmp_path / "cute_dsl"),
+        ),
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout, result.stdout + result.stderr
 
 
 def _plan(
