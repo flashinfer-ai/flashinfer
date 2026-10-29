@@ -29,16 +29,36 @@ def _backend_call(instance, method, *args, **kwargs):
 class FP8PagedMQATopKWrapper:
     """Experimental exact paged FP8 MQA TopK, with full or selective scoring.
 
-    Both strategies use a capacity constructor, one ``plan`` per step and
-    one ``run`` per layer. Calling the constructor is the explicit opt-in;
-    no environment variable is required. The interface may change or be
-    removed without deprecation. The ordinary paged scorer is unchanged.
+    The API and backend are experimental. Construction is explicit opt-in and
+    emits ``ExperimentalWarning`` once per process; no environment variable
+    is required. The interface may change or disappear without deprecation.
+    This feature does not participate in automatic routing, autotuning or
+    trace-apply. Owner: TBD. Graduation requires a stable API and competitive
+    decode performance. The ordinary paged scorers remain stable.
+
+    Use this wrapper for paged FP8 MQA indexers in sparse attention. Both
+    strategies require CuTe DSL and SM100 (CUDA >=12.8) or SM103 (CUDA >=12.9),
+    FP8 E4M3 queries, fused paged FP8 KV and FP32 head weights. Supported page
+    sizes are 32, 64 and 128 tokens, subject to specialization/resource checks.
+
+    * ``full`` scores every key and runs GVRv2 using a shared score arena.
+      TopK is 512, 1024 or 2048; compression ratio is 1.
+    * ``selective`` samples thresholds, publishes bounded candidates and
+      repairs failed rows exactly. TopK is 1..2048; ratio is 1 or 4. The caller
+      supplies compressed KV for ratio 4 and receives compressed-slot indices.
+      NaN scores rank as -inf; full retains its scorer's NaN behavior.
+
+    Both use one ``plan`` per step and ``run`` per layer, returning request-local
+    int32 indices with -1 padding. Preparation requires JIT compilation. Plans
+    without host hints are device-only and caller-capturable; host hints are
+    eager-only and only affect full-strategy sizing. The wrapper owns no parent
+    graph. Under caller capture, selective exact repair uses a conditional
+    node whose body is captured by the library. Multi-device execution and
+    installed-cache-only operation are outside the qualification scope.
 
     Construct after allocating the indexer KV cache and before graph capture.
     Keep the wrapper alive while caller graphs replay, and release wrappers
     outside capture. A capacity or layout change requires a new wrapper.
-    See ``flashinfer/experimental/attn_scores/README.md`` for the contract,
-    supported configurations, limitations and graduation requirements.
     """
 
     is_experimental = True
@@ -109,6 +129,10 @@ class FP8PagedMQATopKWrapper:
         bytes (default 512 MiB), shared by eager and caller-captured execution.
         It excludes GVRv2 workspace, metadata, inputs and outputs. Selective
         validates this positive integer but ignores it for scratch sizing.
+        Full requires at least ``8 * max(8192, top_k,
+        padded_seq_len(max_context_length))`` bytes for one query pair.
+        Expanded page/hint tables and payload staging require additional
+        capacity-dependent storage; see the backend README's memory formula.
         """
         _backend_call(
             self,
@@ -145,6 +169,13 @@ class FP8PagedMQATopKWrapper:
         allocations and support caller capture after layout/pool preparation.
         Full uses the constructor's bounded shared score arena; in-capacity length
         and page-map changes preserve prepared bindings and buffer addresses.
+        A full graph bucket is keyed by supplied Q rows, request count
+        (``qo_indptr.numel() - 1``) and ``next_n``. Eagerly plan and prepare
+        every layer pool for that bucket before capturing it.
+        The page map requires at least
+        ``ceil((max_context_length // compression_ratio) / page_size)``
+        columns. Every request or expanded row table must fit int32 indexing:
+        ``rows * page_columns < 2**31``.
         ``next_n`` optionally declares exactly 1, 2 or 4
         query rows per request. A device-side mismatch invalidates the step
         and produces -1 output. Selective validates but does not use the hint
@@ -188,7 +219,15 @@ class FP8PagedMQATopKWrapper:
         return _backend_call(self, "run", q, weights, kv_fused, out=out)
 
     def prepare_pool(self, kv_fused):
-        """Optionally warm a selective layout; prepare each full-plan pool."""
+        """Compile, warm and bind one layer pool outside capture.
+
+        Full requires an eager plan then preparation for every
+        ``(supplied Q rows, request count, next_n)`` graph bucket and pool.
+        First-pool preparation warms every pitch bucket, even without host
+        hints. Score/TopK scratch is shared across serialized layer pools;
+        compilation and warmup are setup costs, separate from plan/run.
+        Selective can also prepare on its first eager run.
+        """
         return _backend_call(self, "prepare_pool", kv_fused)
 
     def clear_pools(self):

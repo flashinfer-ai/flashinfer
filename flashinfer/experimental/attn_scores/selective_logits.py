@@ -4308,6 +4308,8 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
             max_workspace_size: Positive byte budget for the full FP32 score
                 arena only; None means 512 MiB. Excludes GVRv2 workspace,
                 metadata, inputs and outputs. Validated but ignored by selective.
+                Full needs at least ``8 * max(8192, top_k,
+                padded_seq_len(max_context_length))`` bytes for one query pair.
             kv_layout: Optional contiguous CUDA uint8 KV layout exemplar of
                 shape ``[num_pages, page_size, 1, head_dim + 4]``. Not retained.
             num_pages: Physical page capacity, instead of an exemplar.
@@ -4570,9 +4572,10 @@ class FP8PagedMQATopKWrapper(_PublicWrapper):
         alive; the constructor's ``kv_layout``
         exemplar is not bound.
 
-        Full requires plan first and preparation for each supplied-storage
-        extent, uniform layout and pool. It binds scorer/GVR-v2 launches and
-        warms eager hint buckets outside capture. Full pools share staged
+        Full requires eager plan then preparation on every layer pool for each
+        (supplied Q rows, request count, next_n) graph bucket. It binds
+        scorer/GVR-v2 launches and warms all pitch buckets outside capture,
+        even without host hints. Full pools share staged
         inputs, step metadata, the bounded score arena and GVR-v2 workspace;
         serialize their execution. In-capacity length/map changes preserve
         bindings, so they need no repeated pool preparation.
