@@ -1363,14 +1363,19 @@ def _saturating_softplus_inputs(batch, seq_len=4, heads=2, value_heads=8):
 @pytest.mark.parametrize("batch_size", [16, 17], ids=["inline", "warp_specialized"])
 def test_verify_kernel_mtp_saturating_softplus(batch_size):
     """A saturating softplus must not depend on which MTP kernel B selects."""
+    from flashinfer.trace.templates.gdn import _gdn_mtp_reference
+
     _skip_if_not_sm90_or_later()
     value_heads = 8
     inline = (batch_size * value_heads) <= 128
     assert inline == (batch_size == 16), "batch sizes must straddle the selector"
-    output, _ = gated_delta_rule_mtp(**_saturating_softplus_inputs(batch_size))
+    args = _saturating_softplus_inputs(batch_size)
+    output, _ = gated_delta_rule_mtp(**args)
+    reference, _ = _gdn_mtp_reference(**args)
     assert torch.isfinite(output).all(), (
         f"{torch.isnan(output).float().mean().item():.1%} of the output is NaN"
     )
+    torch.testing.assert_close(output.float(), reference.float(), atol=1e-2, rtol=1e-2)
 
 
 def test_verify_kernel_mtp_saturating_softplus_matches_inline():
@@ -1413,6 +1418,31 @@ def _saturating_bf16_state_inputs(batch, seq_len, heads=2, value_heads=8):
     )
 
 
+def _saturating_bf16_state_reference(args):
+    """Step the fp32 reference over the bf16 pool rows the kernel reads."""
+    state = args["initial_state_source"][args["initial_state_indices"].long()]
+    state = state.transpose(-2, -1).contiguous()
+    outputs = []
+    for t in range(args["q"].shape[1]):
+        o_t, state = decode_delta_rule(
+            args["q"][:, t].float(),
+            args["k"][:, t].float(),
+            args["v"][:, t].float(),
+            state,
+            A_log=args["A_log"],
+            a=args["a"][:, t],
+            dt_bias=args["dt_bias"],
+            b=args["b"][:, t],
+            scale_factor=args["scale"],
+            softplus_beta=1.0,
+            softplus_threshold=20.0,
+            use_l2_norm=True,
+            state_dtype=torch.bfloat16,
+        )
+        outputs.append(o_t)
+    return torch.stack(outputs, dim=1)
+
+
 @pytest.mark.parametrize(
     "batch_size", [8, 16, 17], ids=["ilp4", "wide_vec_128", "wide_vec"]
 )
@@ -1421,11 +1451,15 @@ def test_gdn_decode_bf16_state_mtp_saturating_softplus(batch_size):
     _skip_if_not_sm90_or_later()
     if not GDN_DECODE_BF16_STATE_AVAILABLE:
         pytest.skip("gdn_decode_bf16_state not available")
+    args = _saturating_bf16_state_inputs(batch_size, 4)
     output = gdn_decode_bf16_state_mtp(
-        **_saturating_bf16_state_inputs(batch_size, 4), disable_state_update=True
+        **args, disable_state_update=True, use_qk_l2norm_in_kernel=True
     )
     assert torch.isfinite(output).all(), (
         f"{torch.isnan(output).float().mean().item():.1%} of the output is NaN"
+    )
+    torch.testing.assert_close(
+        output.float(), _saturating_bf16_state_reference(args), atol=1e-3, rtol=5e-3
     )
 
 
@@ -1434,9 +1468,13 @@ def test_gdn_decode_bf16_state_t1_saturating_softplus(batch_size):
     _skip_if_not_sm90_or_later()
     if not GDN_DECODE_BF16_STATE_AVAILABLE:
         pytest.skip("gdn_decode_bf16_state not available")
-    output = gdn_decode_bf16_state(**_saturating_bf16_state_inputs(batch_size, 1))
+    args = _saturating_bf16_state_inputs(batch_size, 1)
+    output = gdn_decode_bf16_state(**args, use_qk_l2norm_in_kernel=True)
     assert torch.isfinite(output).all(), (
         f"{torch.isnan(output).float().mean().item():.1%} of the output is NaN"
+    )
+    torch.testing.assert_close(
+        output.float(), _saturating_bf16_state_reference(args), atol=1e-3, rtol=5e-3
     )
 
 

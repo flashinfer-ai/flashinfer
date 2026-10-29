@@ -34,6 +34,15 @@ from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose, ugpu_sta
 from flashinfer.gdn_kernels.gdn_decode_bf16_state import gated_delta_rule as generic
 from flashinfer.gdn_kernels.gdn_decode_bf16_state_rubin import gated_delta_rule_t1_rubin
 
+try:
+    from .reference_delta_rule import decode_delta_rule
+except ImportError:
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from reference_delta_rule import decode_delta_rule
+
 pytestmark = pytest.mark.arch_rubin
 
 D = 128
@@ -486,3 +495,31 @@ def test_rubin_ugpu_on_non_current_device(eager_per_die, monkeypatch):
     torch.cuda.synchronize(1)
     assert torch.equal(o, o_ref)
     assert torch.equal(_as_4d(st), st_ref)
+
+
+@pytest.mark.parametrize("B", [16, 512])
+def test_rubin_t1_saturating_softplus_matches_reference(B):
+    """softplus_beta * (a + dt_bias) beyond ~88 overflows exp; the branch must not."""
+    HQ, HK, HV = 16, 16, 32
+    pool, idx, _ = _pool(B, "single")
+    inp = _inputs(B, HQ, HK, HV, pool, seed=7)
+    inp["a"].fill_(100.0)
+    state = inp.pop("state")
+    out = _call(gated_delta_rule_t1_rubin, inp, state.clone(), idx, None, True)
+    ref_o, _ = decode_delta_rule(
+        inp["q"][:, 0].float(),
+        inp["k"][:, 0].float(),
+        inp["v"][:, 0].float(),
+        state[idx.long()].transpose(-2, -1).contiguous(),
+        A_log=inp["A_log"],
+        a=inp["a"][:, 0],
+        dt_bias=inp["dt_bias"],
+        b=inp["b"][:, 0],
+        scale_factor=1.0 / math.sqrt(D),
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+        use_l2_norm=True,
+        state_dtype=torch.bfloat16,
+    )
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out[:, 0].float(), ref_o.float(), atol=1e-3, rtol=5e-3)

@@ -49,6 +49,8 @@ from cutlass.cute.runtime import from_dlpack
 
 from .device_target import gdn_compile_options, gdn_device_target, target_arch
 from .dtype_compat import as_bf16
+from . import _softplus
+from ._softplus import softplus_fp32
 from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from .cute_dsl_cache_naming import make_kernel_name
 
@@ -401,16 +403,9 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                         r_a_pre = cutlass.Float32(a[i_n, i_t_pre, i_hv])
                         r_b_pre = cutlass.Float32(b[i_n, i_t_pre, i_hv])
                         x_pre = r_a_pre + r_dt_bias
-                        beta_x_pre = softplus_beta * x_pre
-                        softplus_x_pre = x_pre
-                        if beta_x_pre <= softplus_threshold:
-                            softplus_x_pre = (
-                                cutlass.Float32(1.0) / softplus_beta
-                            ) * cute.log(
-                                cutlass.Float32(1.0)
-                                + cute.exp(beta_x_pre, fastmath=True),
-                                fastmath=True,
-                            )
+                        softplus_x_pre = softplus_fp32(
+                            x_pre, softplus_beta, softplus_threshold
+                        )
                         r_g_value_pre = (
                             -cute.exp(r_A_log, fastmath=True) * softplus_x_pre
                         )
@@ -505,16 +500,9 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                         r_a_val = cutlass.Float32(a[i_n, i_t, i_hv])
                         r_b_val = cutlass.Float32(b[i_n, i_t, i_hv])
                         x_val = r_a_val + r_dt_bias
-                        beta_x_val = softplus_beta * x_val
-                        softplus_x_v = x_val
-                        if beta_x_val <= softplus_threshold:
-                            softplus_x_v = (
-                                cutlass.Float32(1.0) / softplus_beta
-                            ) * cute.log(
-                                cutlass.Float32(1.0)
-                                + cute.exp(beta_x_val, fastmath=True),
-                                fastmath=True,
-                            )
+                        softplus_x_v = softplus_fp32(
+                            x_val, softplus_beta, softplus_threshold
+                        )
                         r_g_value_v = -cute.exp(r_A_log, fastmath=True) * softplus_x_v
                         r_beta = cutlass.Float32(1.0) / (
                             cutlass.Float32(1.0) + cute.exp(-r_b_val, fastmath=True)
@@ -558,15 +546,9 @@ def gdn_decode_bf16state_mtp_ilp4_kernel(
                     r_a_val = cutlass.Float32(a[i_n, i_t, i_hv])
                     r_b_val = cutlass.Float32(b[i_n, i_t, i_hv])
                     x_val = r_a_val + r_dt_bias
-                    beta_x_val = softplus_beta * x_val
-                    softplus_x_v = x_val
-                    if beta_x_val <= softplus_threshold:
-                        softplus_x_v = (
-                            cutlass.Float32(1.0) / softplus_beta
-                        ) * cute.log(
-                            cutlass.Float32(1.0) + cute.exp(beta_x_val, fastmath=True),
-                            fastmath=True,
-                        )
+                    softplus_x_v = softplus_fp32(
+                        x_val, softplus_beta, softplus_threshold
+                    )
                     r_g_value_v = -cute.exp(r_A_log, fastmath=True) * softplus_x_v
                     r_beta = cutlass.Float32(1.0) / (
                         cutlass.Float32(1.0) + cute.exp(-r_b_val, fastmath=True)
@@ -1212,13 +1194,7 @@ def gdn_wide_vec_kernel(
                 r_a_pre = cutlass.Float32(a[i_n, i_t_pre, i_hv])
                 r_b_pre = cutlass.Float32(b_gate[i_n, i_t_pre, i_hv])
                 x_pre = r_a_pre + r_dt_bias
-                beta_x_pre = softplus_beta * x_pre
-                softplus_x_pre = x_pre
-                if beta_x_pre <= softplus_threshold:
-                    softplus_x_pre = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                        cutlass.Float32(1.0) + cute.exp(beta_x_pre, fastmath=True),
-                        fastmath=True,
-                    )
+                softplus_x_pre = softplus_fp32(x_pre, softplus_beta, softplus_threshold)
                 r_g_pre = cute.exp(
                     -cute.exp(r_A_log, fastmath=True) * softplus_x_pre, fastmath=True
                 )
@@ -2171,13 +2147,7 @@ def gdn_wide_vec_kernel_t1(
                 r_a_pre = cutlass.Float32(a[i_n, i_t_pre, i_hv])
                 r_b_pre = cutlass.Float32(b_gate[i_n, i_t_pre, i_hv])
                 x_pre = r_a_pre + r_dt_bias
-                beta_x_pre = softplus_beta * x_pre
-                softplus_x_pre = x_pre
-                if beta_x_pre <= softplus_threshold:
-                    softplus_x_pre = (cutlass.Float32(1.0) / softplus_beta) * cute.log(
-                        cutlass.Float32(1.0) + cute.exp(beta_x_pre, fastmath=True),
-                        fastmath=True,
-                    )
+                softplus_x_pre = softplus_fp32(x_pre, softplus_beta, softplus_threshold)
                 r_g_pre = cute.exp(
                     -cute.exp(r_A_log, fastmath=True) * softplus_x_pre, fastmath=True
                 )
@@ -3319,7 +3289,7 @@ def gated_delta_rule_mtp_wide_vec(
                     per_token_pool_scatter_flat,
                     stream,
                 ),
-                extra_key_files=(__file__,),
+                extra_key_files=(__file__, _softplus.__file__),
             ),
             # Per-B default tensors (B-dependent shapes; can't be shared
             # across batch sizes — see #L bug at cache_key without B).
@@ -3584,7 +3554,7 @@ def gated_delta_rule_t1_wide_vec(
                     same_pool,
                     stream,
                 ),
-                extra_key_files=(__file__,),
+                extra_key_files=(__file__, _softplus.__file__),
             ),
             # Per-B default tensors (B-dependent shapes — see batch-dynamic
             # correctness note in gated_delta_rule_mtp_wide_vec).
@@ -3987,7 +3957,7 @@ def gated_delta_rule_mtp(
                     per_token_pool_scatter_flat,
                     stream,
                 ),
-                extra_key_files=(__file__,),
+                extra_key_files=(__file__, _softplus.__file__),
             ),
             # Per-B default tensors (B-dependent shapes — see batch-dynamic
             # correctness note in gated_delta_rule_mtp_wide_vec).
