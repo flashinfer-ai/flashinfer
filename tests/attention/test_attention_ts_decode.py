@@ -1799,8 +1799,6 @@ def _assert_case_correct(output, case):
             f"match ratio {match_ratio} is below {threshold}"
         )
         return
-    elif case.q.dtype == _FP8 and case.k_cache.dtype == torch.uint8:
-        rtol, atol = 1e-2, 0.125
     elif case.out_dtype == _FP8:
         rtol, atol = 5e-2, 2e-3
     elif case.q.dtype == _FP8 and case.out_dtype == torch.bfloat16:
@@ -4777,6 +4775,28 @@ def test_attention_ts_decode_nvfp4_padded_scale_page_stride(out_dtype):
     page_size = 64
     q_dtype = _FP8
     kv_dtype = torch.uint8
+    # FP8-P rounding follows each split's local max; model the planned split.
+    reference_spec = _resolve_decode_launch_spec(
+        torch.cuda.current_device(),
+        batch_size,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        seq_len_kv,
+        seq_len_q,
+        "float8_e4m3fn",
+        "float4_e2m1fn",
+        "float4_e2m1fn",
+        str(out_dtype).removeprefix("torch."),
+        "HND",
+        "dense",
+        False,
+        -1,
+    )
+    # Capacity buckets can exceed the runtime count. FP8-P rounding follows
+    # the actual split partition, independently of scratch padding.
+    assert reference_spec.requested_splits is not None
 
     case, kv_scale_factors = _make_mixed_precision_decode_case(
         batch_size=batch_size,
@@ -4791,6 +4811,8 @@ def test_attention_ts_decode_nvfp4_padded_scale_page_stride(out_dtype):
         out_dtype=out_dtype,
         device="cuda",
         seed=20260806,
+        splits_kv=reference_spec.requested_splits,
+        num_insts_kv=reference_spec.config.num_insts_kv,
     )
     assert kv_scale_factors is not None
 
