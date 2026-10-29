@@ -1247,6 +1247,13 @@ kernel_cake_fmha_context_fp8_hd256(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap
                     unsigned int l2_mod = tile_idx % l2section;
                     m_block = l2_mod / (unsigned int)l2_swizzle;
                     bh = section * (unsigned int)l2_swizzle + l2_mod % (unsigned int)l2_swizzle;
+                    if (section >= (unsigned int)total_bh / (unsigned int)l2_swizzle) {
+                        // The last section when total_bh is not a multiple of l2_swizzle: its units in turn, every
+                        // m-block of a unit in turn, as the generated programs order it (the swizzled form names
+                        // units past total_bh there and leaves tiles of the section's units out).
+                        m_block = l2_mod % (unsigned int)NUM_M_BLOCKS;
+                        bh = section * (unsigned int)l2_swizzle + l2_mod / (unsigned int)NUM_M_BLOCKS;
+                    }
                     m_block = (unsigned int)(NUM_M_BLOCKS - 1) - m_block;
                 }
                 int seqlen_kv_bh = seq_lens_kv[bh];
@@ -2877,6 +2884,10 @@ kernel_cake_fmha_context_fp8_hd256(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap
                     unsigned int l2_mod_1 = tile_idx_1 % l2section_1;
                     m_block_1 = l2_mod_1 / (unsigned int)l2_swizzle_1;
                     bh_1 = section_1 * (unsigned int)l2_swizzle_1 + l2_mod_1 % (unsigned int)l2_swizzle_1;
+                    if (section_1 >= (unsigned int)total_bh / (unsigned int)l2_swizzle_1) {
+                        m_block_1 = l2_mod_1 % (unsigned int)NUM_M_BLOCKS;
+                        bh_1 = section_1 * (unsigned int)l2_swizzle_1 + l2_mod_1 / (unsigned int)NUM_M_BLOCKS;
+                    }
                     m_block_1 = (unsigned int)(NUM_M_BLOCKS - 1) - m_block_1;
                 }
                 int seqlen_kv_bh_1 = seq_lens_kv[bh_1];
@@ -3028,6 +3039,10 @@ kernel_cake_fmha_context_fp8_hd256(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap
                     unsigned int l2_mod_2 = tile_idx_2 % l2section_2;
                     m_block_2 = l2_mod_2 / (unsigned int)l2_swizzle_2;
                     bh_2 = section_2 * (unsigned int)l2_swizzle_2 + l2_mod_2 % (unsigned int)l2_swizzle_2;
+                    if (section_2 >= (unsigned int)total_bh / (unsigned int)l2_swizzle_2) {
+                        m_block_2 = l2_mod_2 % (unsigned int)NUM_M_BLOCKS;
+                        bh_2 = section_2 * (unsigned int)l2_swizzle_2 + l2_mod_2 / (unsigned int)NUM_M_BLOCKS;
+                    }
                     m_block_2 = (unsigned int)(NUM_M_BLOCKS - 1) - m_block_2;
                 }
                 int seqlen_kv_bh_2 = seq_lens_kv[bh_2];
@@ -3365,6 +3380,10 @@ kernel_cake_fmha_context_fp8_hd256(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap
                     unsigned int l2_mod_3 = tile_idx_3 % l2section_3;
                     m_block_3 = l2_mod_3 / (unsigned int)l2_swizzle_3;
                     bh_3 = section_3 * (unsigned int)l2_swizzle_3 + l2_mod_3 % (unsigned int)l2_swizzle_3;
+                    if (section_3 >= (unsigned int)total_bh / (unsigned int)l2_swizzle_3) {
+                        m_block_3 = l2_mod_3 % (unsigned int)NUM_M_BLOCKS;
+                        bh_3 = section_3 * (unsigned int)l2_swizzle_3 + l2_mod_3 / (unsigned int)NUM_M_BLOCKS;
+                    }
                     m_block_3 = (unsigned int)(NUM_M_BLOCKS - 1) - m_block_3;
                 }
                 int seqlen_kv_bh_3 = seq_lens_kv[bh_3];
@@ -3450,6 +3469,10 @@ kernel_cake_fmha_context_fp8_hd256(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap
                     unsigned int l2_mod_4 = tile_idx_4 % l2section_4;
                     m_block_4 = l2_mod_4 / (unsigned int)l2_swizzle_4;
                     bh_4 = section_4 * (unsigned int)l2_swizzle_4 + l2_mod_4 % (unsigned int)l2_swizzle_4;
+                    if (section_4 >= (unsigned int)total_bh / (unsigned int)l2_swizzle_4) {
+                        m_block_4 = l2_mod_4 % (unsigned int)NUM_M_BLOCKS;
+                        bh_4 = section_4 * (unsigned int)l2_swizzle_4 + l2_mod_4 / (unsigned int)NUM_M_BLOCKS;
+                    }
                     m_block_4 = (unsigned int)(NUM_M_BLOCKS - 1) - m_block_4;
                 }
                 int seqlen_kv_bh_4 = seq_lens_kv[bh_4];
