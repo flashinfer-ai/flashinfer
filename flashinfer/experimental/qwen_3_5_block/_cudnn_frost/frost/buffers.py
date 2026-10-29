@@ -664,8 +664,8 @@ def cutedsl_requirement_error(what):
     """Message naming the installed DSL version when it is below the floor, else None.
 
     Route checks and the lazy-import wrappers use it so a too-old DSL reads as a
-    version problem, not as a missing dependency: pyproject's floor is the
-    downstream floor (4.6.2), below this one (see AGENTS.md Rule 7).
+    version problem, not as a missing dependency, even when an environment
+    bypasses the package dependency floor (see AGENTS.md Rule 7).
     """
     installed, version = cutedsl_state()
     if not installed:

@@ -60,6 +60,8 @@ class DirectSparseMetadataView:
         sparse_block_size=4,
         fragment_size=4,
         head=0,
+        count_current_block_in_topk=True,
+        fixed_query_len=0,
     ):
         self.values = (*inputs, qo_indptr, head)
         self.packed = packed
@@ -68,6 +70,8 @@ class DirectSparseMetadataView:
         self.page_capacity = page_capacity
         self.lengths = lengths
         self.sparse_block_size = sparse_block_size
+        self.count_current_block_in_topk = count_current_block_in_topk
+        self.fixed_query_len = fixed_query_len
         self.fragment_size = fragment_size
         self.fragments_per_block = sparse_block_size // fragment_size
 
@@ -86,6 +90,8 @@ class DirectSparseMetadataView:
             lengths=self.lengths,
             sparse_block_size=self.sparse_block_size,
             fragment_size=self.fragment_size,
+            count_current_block_in_topk=self.count_current_block_in_topk,
+            fixed_query_len=self.fixed_query_len,
             head=new[5],
         )
 
@@ -100,6 +106,8 @@ class DirectSparseMetadataView:
             lengths=self.lengths,
             sparse_block_size=self.sparse_block_size,
             fragment_size=self.fragment_size,
+            count_current_block_in_topk=self.count_current_block_in_topk,
+            fixed_query_len=self.fixed_query_len,
             head=head,
         )
 
@@ -119,8 +127,20 @@ class DirectSparseMetadataView:
         request = Int32(-1)
         visible = Int32(0)
         if valid:
-            request = Int32(requests[row])
-            position = Int64(positions[row])
+            if cutlass.const_expr(self.fixed_query_len > 0):
+                request = row // Int32(self.fixed_query_len)
+                # Fixed Q ends at the per-request KV length.
+                length = Int64(positions[request])
+                position = Int64(-1)
+                if length > Int64(0):
+                    position = (
+                        length
+                        - Int64(self.fixed_query_len)
+                        + Int64(row % Int32(self.fixed_query_len))
+                    )
+            else:
+                request = Int32(requests[row])
+                position = Int64(positions[row])
             valid = (
                 (request >= Int32(0))
                 & (request < Int32(table.shape[0]))
@@ -132,11 +152,19 @@ class DirectSparseMetadataView:
         return row, request, visible
 
     @cute.jit
+    def selected_block_bound(self, visible):
+        """Return the exclusive top-k block bound under the current-block policy."""
+        eligible = visible
+        if cutlass.const_expr(not self.count_current_block_in_topk):
+            eligible = cute.math.max(visible - Int32(1), Int32(0))
+        return eligible // Int32(self.sparse_block_size)
+
+    @cute.jit
     def load_page(self, route_state, slot):
         blocks = self.values[0]
         row, _, visible = route_state
         complete = cute.math.min(
-            visible // Int32(self.sparse_block_size), Int32(blocks.shape[-1])
+            self.selected_block_bound(visible), Int32(blocks.shape[-1])
         )
         logical = Int32(-1)
         candidate = slot // Int32(self.fragments_per_block)
@@ -152,20 +180,20 @@ class DirectSparseMetadataView:
         blocks, table, _, _, _, _ = self.values
         _, request, visible = route_state
         complete = cute.math.min(
-            visible // Int32(self.sparse_block_size), Int32(blocks.shape[-1])
+            self.selected_block_bound(visible), Int32(blocks.shape[-1])
         )
-        tail = visible % Int32(self.sparse_block_size)
+        tail = visible - self.selected_block_bound(visible) * Int32(
+            self.sparse_block_size
+        )
         candidate = slot // Int32(self.fragments_per_block)
         result = Int32(-1)
         if candidate < complete:
-            if (logical < Int32(0)) | (
-                logical >= visible // Int32(self.sparse_block_size)
-            ):
+            if (logical < Int32(0)) | (logical >= self.selected_block_bound(visible)):
                 logical = Int32(-1)
         elif (candidate == complete) & (
             slot % Int32(self.fragments_per_block) * Int32(self.fragment_size) < tail
         ):
-            logical = visible // Int32(self.sparse_block_size)
+            logical = self.selected_block_bound(visible)
         else:
             logical = Int32(-1)
         if logical >= Int32(0):
@@ -186,10 +214,12 @@ class DirectSparseMetadataView:
         if cutlass.const_expr(self.lengths):
             _, _, visible = self.resolve_route(Int32(index))
             complete = cute.math.min(
-                visible // Int32(self.sparse_block_size),
+                self.selected_block_bound(visible),
                 Int32(self.values[0].shape[-1]),
             )
-            tail = visible % Int32(self.sparse_block_size)
+            tail = visible - self.selected_block_bound(visible) * Int32(
+                self.sparse_block_size
+            )
             result = cute.math.max(
                 complete * Int32(self.sparse_block_size) + tail, Int32(1)
             )

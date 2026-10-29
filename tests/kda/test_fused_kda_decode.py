@@ -322,6 +322,51 @@ def test_fused_kda_decode_kimi_k3_shapes(num_heads, num_rows):
 
 
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    ("num_heads", "num_rows"),
+    [(16, 1), (16, 64), (64, 1), (64, 32)],
+    ids=["h16-n1", "h16-n64", "h64-n1", "h64-n32"],
+)
+def test_fused_kda_decode_glm_heads_and_ds_layout(num_heads, num_rows, state_dtype):
+    """GLM-5.3-Flash ranks hold 16 (TP4) or 64 (TP1) heads, and vLLM's NIXL
+    prefill/decode transfer needs its dimension-first (DS) conv-state layout,
+    [slots, 3 * H * 128, 3] with strides [slot, 3, 1]. DS must match SD
+    bit for bit."""
+    inputs = _make_inputs(num_heads, num_rows, state_dtype=state_dtype)
+    reference_conv_state = _clone_strided(inputs["conv_state"])
+    reference_state = _clone_strided(inputs["state"])
+    expected = _reference(inputs, reference_conv_state, reference_state)
+
+    results = {}
+    for layout in ("SD", "DS"):
+        if layout == "SD":
+            conv_state = _clone_strided(inputs["conv_state"])
+        else:
+            # Same paged slot stride as SD, not a compact 9 * H * 128.
+            conv_state = torch.empty_strided(
+                inputs["conv_state"].shape,
+                (inputs["conv_state"].stride(0), 3, 1),
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            conv_state.copy_(inputs["conv_state"])
+        state = _clone_strided(inputs["state"])
+        output = _fused_kda_decode(
+            **{**inputs, "conv_state": conv_state, "state": state}
+        )
+        results[layout] = (output, conv_state, state)
+
+    actual, actual_conv_state, actual_state = results["DS"]
+    assert actual_conv_state.stride() == (inputs["conv_state"].stride(0), 3, 1)
+    assert actual_conv_state.stride(0) > 9 * num_heads * 128
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=2e-2)
+    torch.testing.assert_close(actual_conv_state, reference_conv_state, rtol=0, atol=0)
+    torch.testing.assert_close(actual_state, reference_state, rtol=3e-2, atol=2e-3)
+    for ds, sd in zip(results["DS"], results["SD"], strict=True):
+        torch.testing.assert_close(ds, sd, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("num_rows", [1, 4, 32, 128])
 def test_fused_kda_decode_kimi_linear_softplus(num_rows, state_dtype):
     inputs = _make_inputs(num_heads=32, num_rows=num_rows, state_dtype=state_dtype)
@@ -407,13 +452,124 @@ def test_fused_kda_decode_requires_matching_cache_slots():
         _fused_kda_decode(**inputs)
 
 
+@pytest.mark.parametrize("misaligned", ["slot-stride", "pointer"])
+@pytest.mark.parametrize("ds", [False, True], ids=["SD", "DS"])
+def test_fused_kda_decode_rejects_misaligned_conv_slots(ds, misaligned):
+    inputs = _make_inputs(num_heads=16, num_rows=2)
+    conv_state = inputs["conv_state"]
+    if misaligned == "pointer":
+        # Valid slot stride, base only 4-byte aligned.
+        inputs["conv_state"] = _conv_state_view(
+            conv_state, "DS" if ds else "SD", byte_offset=4
+        )
+        assert inputs["conv_state"].data_ptr() % 8 == 4
+    else:
+        slots, channels, history = conv_state.shape
+        slot_stride = conv_state.stride(0) + 2
+        strides = (slot_stride, 3, 1) if ds else (slot_stride, 1, channels)
+        inputs["conv_state"] = torch.empty_strided(
+            (slots, channels, history), strides, dtype=torch.bfloat16, device="cuda"
+        )
+
+    with pytest.raises(ValueError, match="conv_state slots must start 8-byte aligned"):
+        _fused_kda_decode(**inputs)
+
+
+def _conv_state_view(conv_state, layout, slot_padding=0, byte_offset=0):
+    """Copy ``conv_state`` into an SD or DS view whose slots are padded by
+    ``slot_padding`` elements and whose base is ``byte_offset`` bytes past a
+    fresh allocation."""
+    slots, channels, history = conv_state.shape
+    slot_stride = channels * history + slot_padding
+    strides = (slot_stride, 3, 1) if layout == "DS" else (slot_stride, 1, channels)
+    offset = byte_offset // conv_state.element_size()
+    storage = torch.zeros(
+        offset + slots * slot_stride, dtype=conv_state.dtype, device=conv_state.device
+    )
+    view = storage[offset:].as_strided((slots, channels, history), strides)
+    view.copy_(conv_state)
+    return view
+
+
+@pytest.mark.parametrize("layout", ["SD", "DS"])
+def test_fused_kda_decode_8_byte_aligned_conv_state(layout):
+    """A conv state whose base is 8- but not 16-byte aligned, with slots that
+    alternate between the two (both accepted by the launcher), matches a
+    compact, 16-byte aligned one."""
+    inputs = _make_inputs(num_heads=16, num_rows=8)
+    slot_padding, byte_offset = 4, 8
+    results = {}
+    for name, padding, offset in (
+        ("compact", 0, 0),
+        ("view", slot_padding, byte_offset),
+    ):
+        conv_state = _conv_state_view(inputs["conv_state"], layout, padding, offset)
+        state = _clone_strided(inputs["state"])
+        output = _fused_kda_decode(
+            **{**inputs, "conv_state": conv_state, "state": state}
+        )
+        results[name] = (output, conv_state, state)
+
+    view_conv_state = results["view"][1]
+    assert view_conv_state.data_ptr() % 16 == 8
+    assert view_conv_state.stride(0) == 9 * 16 * 128 + slot_padding
+    for view, compact in zip(results["view"], results["compact"], strict=True):
+        torch.testing.assert_close(view, compact, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("num_heads", [16, 64])
+def test_packed_fused_kda_decode_t1_ds_layout(num_heads):
+    """Packed T=1 rows with the DS conv-state layout match the direct T=1
+    call and the SD layout bit for bit."""
+    num_sequences = 4
+    inputs = _make_inputs(num_heads, num_sequences, state_dtype=torch.float32)
+    inputs["state_indices"] = inputs["state_indices"].reshape(num_sequences, 1)
+    inputs["query_start_loc"] = torch.arange(
+        num_sequences + 1, dtype=torch.int32, device="cuda"
+    )
+    inputs["num_accepted_tokens"] = torch.ones(
+        num_sequences, dtype=torch.int32, device="cuda"
+    )
+    direct_inputs = {
+        key: value
+        for key, value in inputs.items()
+        if key not in ("query_start_loc", "num_accepted_tokens")
+    }
+
+    results = {}
+    for layout in ("SD", "DS"):
+        for call in ("direct", "packed"):
+            conv_state = _conv_state_view(inputs["conv_state"], layout)
+            state = _clone_strided(inputs["state"])
+            if call == "direct":
+                output = _fused_kda_decode(
+                    **{
+                        **direct_inputs,
+                        "conv_state": conv_state,
+                        "state": state,
+                        "state_indices": inputs["state_indices"][:, 0],
+                    }
+                )
+            else:
+                output = _packed_fused_kda_decode(
+                    **{**inputs, "conv_state": conv_state, "state": state}
+                )
+            results[layout, call] = (output, conv_state, state)
+
+    for key in (("DS", "direct"), ("SD", "packed"), ("SD", "direct")):
+        for packed_ds, other in zip(results["DS", "packed"], results[key], strict=True):
+            torch.testing.assert_close(packed_ds, other, rtol=0, atol=0)
+
+
 def test_fused_kda_decode_compile_abi_orders_flags_and_metadata(monkeypatch):
     import importlib
 
     module = importlib.import_module("flashinfer.kda_kernels.fused_kda_decode")
     compiled = []
 
-    monkeypatch.setattr(module, "_make_compile_inputs", lambda dtype: (dtype,))
+    monkeypatch.setattr(
+        module, "_make_compile_inputs", lambda dtype, conv_dim_first: (dtype,)
+    )
 
     def fake_compile(function, *args, **kwargs):
         del function, kwargs
@@ -431,20 +587,27 @@ def test_fused_kda_decode_compile_abi_orders_flags_and_metadata(monkeypatch):
     try:
         for state_dtype in (torch.float32, torch.bfloat16):
             for packed_t1 in (False, True):
-                module._get_compiled_kernel(
-                    state_dtype, -5.0, 1e-5, packed_t1=packed_t1
-                )
+                for conv_dim_first in (False, True):
+                    module._get_compiled_kernel(
+                        state_dtype,
+                        -5.0,
+                        1e-5,
+                        packed_t1=packed_t1,
+                        conv_dim_first=conv_dim_first,
+                    )
     finally:
         module._get_compiled_kernel.cache_clear()
 
-    assert len(compiled) == 4
+    assert len(compiled) == 8
     # _make_compile_inputs contributes one sentinel; constexpr flags follow
-    # the launch signature: state_is_bf16, packed_t1.
-    assert {(args[-5], args[-4]) for args in compiled} == {
-        (False, False),
-        (False, True),
-        (True, False),
-        (True, True),
+    # the launch signature: state_is_bf16, packed_t1, use_lower_bound,
+    # lower_bound, norm_eps, conv_dim_first.
+    flags = (False, True)
+    assert {(args[-6], args[-5], args[-1]) for args in compiled} == {
+        (state_is_bf16, packed_t1, conv_dim_first)
+        for state_is_bf16 in flags
+        for packed_t1 in flags
+        for conv_dim_first in flags
     }
 
 
@@ -467,11 +630,14 @@ def test_fused_kda_decode_cache_key_distinguishes_state_and_gate(monkeypatch):
     try:
         for state_dtype in (torch.float32, torch.bfloat16):
             for lower_bound in (-5.0, None):
-                kernel_module._get_compiled_kernel(state_dtype, lower_bound, 1e-5)
+                for conv_dim_first in (False, True):
+                    kernel_module._get_compiled_kernel(
+                        state_dtype, lower_bound, 1e-5, conv_dim_first=conv_dim_first
+                    )
     finally:
         kernel_module._get_compiled_kernel.cache_clear()
 
-    assert len(kernel_names) == len(set(kernel_names)) == 4
+    assert len(kernel_names) == len(set(kernel_names)) == 8
 
 
 @pytest.mark.parametrize(
@@ -484,6 +650,8 @@ def test_fused_kda_decode_cache_key_distinguishes_state_and_gate(monkeypatch):
         pytest.param(32, 2, 4, id="h32-n2-t4"),
         pytest.param(48, 2, 8, id="h48-n2-t8"),
         pytest.param(96, 1, 3, id="h96-n1-t3"),
+        pytest.param(16, 4, 3, id="h16-n4-t3"),
+        pytest.param(64, 2, 2, id="h64-n2-t2"),
         pytest.param(12, 32, 5, id="h12-n32-t5-wide"),
     ],
 )

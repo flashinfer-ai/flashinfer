@@ -62,6 +62,11 @@ the IEEE-FP32 evaluation of the same reference (TF32 off):
   comparator itself exceeds 2 ulp on that band;
 * checkpoint replay (``forward_stats``, ``cake_mhc_train_prepare(save_stats=False)``)
   gives bitwise the same statistics and gradients as the saved path;
+* the autograd wrappers keep nothing of a connection alive once its backward
+  has run (plain graphs, non-reentrant and reentrant checkpoints, a backward
+  without the prepare node), and repeated backward passes over a retained graph
+  and interleaved connections give bitwise the gradients of a fresh graph and of
+  the connections run one after the other;
 * four consecutive ``accumulate=True`` backward passes equal the FP64 sum of
   the four gradients plus the carried-in values within the FP32 gates, in the
   same >= 25-draw form;
@@ -258,24 +263,37 @@ def _bf16_ulp_error(out: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     return (out.to(F64) - ref64).abs() / _bf16_ulp_spacing(ref64)
 
 
-def _sinkhorn(logits: torch.Tensor) -> torch.Tensor:
-    C = torch.softmax(logits, dim=-1) + HC_EPS
-    C = C / (C.sum(dim=1, keepdim=True) + HC_EPS)
+def _sinkhorn(logits: torch.Tensor, hc_eps: float = HC_EPS) -> torch.Tensor:
+    C = torch.softmax(logits, dim=-1) + hc_eps
+    C = C / (C.sum(dim=1, keepdim=True) + hc_eps)
     for _ in range(SINKHORN_ITERS - 1):
-        C = C / (C.sum(dim=2, keepdim=True) + HC_EPS)
-        C = C / (C.sum(dim=1, keepdim=True) + HC_EPS)
+        C = C / (C.sum(dim=2, keepdim=True) + hc_eps)
+        C = C / (C.sum(dim=1, keepdim=True) + hc_eps)
     return C
 
 
-def _coefficients(z, scale, base):
+def _coefficients(z, scale, base, hc_eps: float = HC_EPS):
     T = z.shape[0]
-    pre = torch.sigmoid(z[:, 0:4] * scale[0] + base[0:4]) + HC_EPS
+    pre = torch.sigmoid(z[:, 0:4] * scale[0] + base[0:4]) + hc_eps
     post = 2 * torch.sigmoid(z[:, 4:8] * scale[1] + base[4:8])
-    C = _sinkhorn((z[:, 8:] * scale[2] + base[8:]).reshape(T, STREAMS, STREAMS))
+    C = _sinkhorn((z[:, 8:] * scale[2] + base[8:]).reshape(T, STREAMS, STREAMS), hc_eps)
     return pre, post, C
 
 
-def _block(X, fn, scale, base, B, dY, dU, *, dtype, want_contrib: bool) -> dict:
+def _block(
+    X,
+    fn,
+    scale,
+    base,
+    B,
+    dY,
+    dU,
+    *,
+    dtype,
+    want_contrib: bool,
+    rms_eps: float = RMS_EPS,
+    hc_eps: float = HC_EPS,
+) -> dict:
     """One row block of the reference: the forward in ``dtype``, the backward by autograd of the FP arithmetic."""
     T = X.shape[0]
     with torch.enable_grad():
@@ -285,9 +303,9 @@ def _block(X, fn, scale, base, B, dY, dU, *, dtype, want_contrib: bool) -> dict:
         based = base.detach().to(dtype).requires_grad_(True)
         Bd = B.detach().to(dtype).requires_grad_(True)
         u = Xd.reshape(T, N)
-        r = torch.rsqrt(u.square().mean(dim=-1, keepdim=True) + RMS_EPS)
+        r = torch.rsqrt(u.square().mean(dim=-1, keepdim=True) + rms_eps)
         z = (u * r) @ fnd.T
-        pre, post, C = _coefficients(z, scaled, based)
+        pre, post, C = _coefficients(z, scaled, based, hc_eps)
         U_pre = (pre.unsqueeze(-1) * Xd).sum(dim=1)
         Y_pre = post.unsqueeze(-1) * Bd.unsqueeze(1) + torch.einsum(
             "tij,tid->tjd", C, Xd
@@ -347,15 +365,17 @@ def _oracle(
     block_tokens: int | None = BLOCK_TOKENS,
     want_contrib: bool = False,
 ) -> dict:
-    """The reference of one input set: FP64 in row blocks (the oracle) or IEEE FP32 in one block (the comparator)."""
+    """The reference of one input set: FP64 in row blocks (the oracle) or IEEE FP32 in one block (the comparator).
+    The epsilons of the case (``i["rms_eps"]`` / ``i["hc_eps"]``, default the model constants) enter the arithmetic."""
     T = i["X"].shape[0]
     if dtype == F32:
         _set_ieee_fp32()
     bt = T if not block_tokens else max(1, min(block_tokens, T))
+    eps = {"rms_eps": i.get("rms_eps", RMS_EPS), "hc_eps": i.get("hc_eps", HC_EPS)}
     blocks = [
         _block(
             i["X"][lo : lo + bt], i["fn"], i["scale"], i["base"], i["B"][lo : lo + bt], i["dY"][lo : lo + bt],
-            i["dU"][lo : lo + bt], dtype=dtype, want_contrib=want_contrib,
+            i["dU"][lo : lo + bt], dtype=dtype, want_contrib=want_contrib, **eps,
         )
         for lo in range(0, T, bt)
     ]  # fmt: skip
@@ -427,8 +447,12 @@ def _make_inputs(
 
 
 def _run(i: dict, *, fwd_ws=None, bwd_ws=None) -> dict:
-    """The package end to end: forward prepare / finish, backward prepare / finish on the inputs of a case."""
-    U, stats = forward_prepare(i["X"], i["fn"], i["scale"], i["base"], workspace=fwd_ws)
+    """The package end to end: forward prepare / finish, backward prepare / finish on the inputs of a case (with the
+    case's epsilons when it carries non-default ones)."""
+    eps = {k: i[k] for k in ("rms_eps", "hc_eps") if k in i}
+    U, stats = forward_prepare(
+        i["X"], i["fn"], i["scale"], i["base"], workspace=fwd_ws, **eps
+    )
     Y = forward_finish(i["X"], i["B"], stats)
     dB, gstats = backward_prepare(i["dY"], i["B"], i["X"], stats)
     dX, dfn, dscale, dbase = backward_finish(
@@ -442,6 +466,7 @@ def _run(i: dict, *, fwd_ws=None, bwd_ws=None) -> dict:
         stats,
         gstats,
         workspace=bwd_ws,
+        **eps,
     )
     return {
         "U": U,
@@ -786,12 +811,21 @@ def _assert_tail_gradients(res: dict, ref: dict, label: str) -> None:
 
 
 def _check_case(
-    T: int, *, mode: str = "unit", fn_scale: float = 1.0, zero_rows=(), seed: int = SEED
+    T: int,
+    *,
+    mode: str = "unit",
+    fn_scale: float = 1.0,
+    zero_rows=(),
+    seed: int = SEED,
+    rms_eps: float = RMS_EPS,
+    hc_eps: float = HC_EPS,
 ) -> dict:
     label = (
         f"T={T} mode={mode}"
         + (f" fn_scale={fn_scale:g}" if fn_scale != 1.0 else "")
         + (f" zero_rows={tuple(zero_rows)}" if zero_rows else "")
+        + (f" rms_eps={rms_eps:g}" if rms_eps != RMS_EPS else "")
+        + (f" hc_eps={hc_eps:g}" if hc_eps != HC_EPS else "")
     )
     # The FP32 regime of the draw: the fn x 1e3 inputs (comparator-relative clauses only), the saturated tails (the tail
     # clause) or the contract's unit / cancellation inputs (the absolute bars; see _assert_fp32).
@@ -800,6 +834,7 @@ def _check_case(
     )
     floor = regime == "large_logits"
     i = _make_inputs(T, mode=mode, seed=seed, fn_scale=fn_scale, zero_rows=zero_rows)
+    i["rms_eps"], i["hc_eps"] = rms_eps, hc_eps
     res = _run(i)
     ref = _oracle(i, want_contrib=(mode == "cancel"))
     comp = _oracle(i, dtype=F32, block_tokens=None)
@@ -1019,6 +1054,307 @@ def test_checkpoint_replay_is_bitwise(T: int) -> None:
         )
 
 
+def _live_bytes() -> int | None:
+    """Bytes the live CUDA tensors asked the caching allocator for (its ``requested_bytes``), not the bytes of the
+    blocks they occupy (``torch.cuda.memory_allocated``): a tensor placed in a reused free block up to 1 MiB larger
+    than itself (the allocator does not split a large block for a remainder of at most 1 MiB) would otherwise count
+    that slack as memory kept alive, as the flashinfer-ci nightly did on torch 2.15 (186880 B on B200, 1047040 B on
+    R200) for the checkpointed output below.  ``None`` under another allocator backend (``cudaMallocAsync`` keeps
+    no ``requested_bytes``), where the retention check is skipped and the gradient checks still run."""
+    torch.cuda.synchronize()
+    if torch.cuda.get_allocator_backend() != "native":
+        return None
+    return int(torch.cuda.memory_stats()["requested_bytes.all.current"])
+
+
+def _assert_nothing_kept(before: int | None, Y: torch.Tensor, what: str) -> None:
+    if before is None:
+        return
+    kept = _live_bytes() - before - Y.untyped_storage().nbytes()
+    assert kept == 0, f"{kept} bytes kept alive after a checkpointed {what}"
+
+
+def _assert_kept(
+    before: int | None, what: str, *alive: torch.Tensor, expected: int = 0
+) -> None:
+    """The live bytes beyond ``before`` are those of ``alive`` plus ``expected``."""
+    if before is None:
+        return
+    kept = _live_bytes() - before - sum(t.untyped_storage().nbytes() for t in alive)
+    assert kept == expected, f"{kept - expected} bytes kept alive after {what}"
+
+
+@pytest.mark.parametrize("T", (129, 2049))
+@pytest.mark.parametrize("save_stats", (True, False))
+def test_checkpoint_keeps_nothing_alive(T: int, save_stats: bool) -> None:
+    """A non-reentrant ``torch.utils.checkpoint`` around prepare / finish keeps no tensor of the layer alive after
+    the forward (``stats`` and the inputs travel through the saved tensors; the handle holds no branch output), and
+    the checkpointed backward is bitwise the plain one."""
+    from torch.utils.checkpoint import checkpoint
+
+    i = _make_inputs(T, seed=SEED + 41)
+
+    def connection(X, fn, scale, base):
+        U, handle = pkg.cake_mhc_train_prepare(
+            X, fn, scale, base, save_stats=save_stats
+        )
+        B = (U.float() + i["B"].float()).to(BF16)
+        return pkg.cake_mhc_train_finish(X, B, handle)
+
+    def leaves() -> list:
+        return [i[k].clone().requires_grad_(True) for k in ("X", "fn", "scale", "base")]
+
+    plain = leaves()
+    (connection(*plain).float() * i["dY"].float()).sum().backward()
+
+    checkpointed = leaves()
+    before = _live_bytes()
+    Y = checkpoint(connection, *checkpointed, use_reentrant=False)
+    _assert_nothing_kept(before, Y, "forward")
+    (Y.float() * i["dY"].float()).sum().backward()
+    for p, c in zip(plain, checkpointed, strict=True):
+        assert torch.equal(p.grad, c.grad), "checkpointing changed a gradient bit"
+
+
+@pytest.mark.parametrize("T", (129, 2049))
+@pytest.mark.parametrize("save_stats", (True, False))
+def test_checkpoint_after_prepare_replays_statistics(T: int, save_stats: bool) -> None:
+    """A non-reentrant ``torch.utils.checkpoint`` region that starts after ``cake_mhc_train_prepare`` (the branch and
+    the finish inside it, the prepare outside) keeps nothing beyond its output after the forward; its backward reruns
+    the finish on a handle that already released the statistics, which the finish forward replays bitwise, so the
+    gradients equal the plain run bit for bit."""
+    from torch.utils.checkpoint import checkpoint
+
+    i = _make_inputs(T, seed=SEED + 42)
+
+    def finish(X, U, handle):
+        B = (U.float() + i["B"].float()).to(BF16)
+        return pkg.cake_mhc_train_finish(X, B, handle)
+
+    def leaves() -> list:
+        return [i[k].clone().requires_grad_(True) for k in ("X", "fn", "scale", "base")]
+
+    plain = leaves()
+    U, handle = pkg.cake_mhc_train_prepare(*plain, save_stats=save_stats)
+    (finish(plain[0], U, handle).float() * i["dY"].float()).sum().backward()
+
+    checkpointed = leaves()
+    U, handle = pkg.cake_mhc_train_prepare(*checkpointed, save_stats=save_stats)
+    # pinned: save_stats=False releases it in the finish forward
+    stats = handle.state.stats
+    before = _live_bytes()
+    Y = checkpoint(finish, checkpointed[0], U, handle, use_reentrant=False)
+    _assert_nothing_kept(before, Y, "finish")
+    # The finish forward takes the prepare node's edge outputs off the handle.
+    assert handle.edges == () and handle.state.stats is None, (
+        "the handle kept the edges or the statistics after the forward"
+    )
+    del stats
+    (Y.float() * i["dY"].float()).sum().backward()
+    for p, c in zip(plain, checkpointed, strict=True):
+        assert torch.equal(p.grad, c.grad), "checkpointed finish: gradient bit changed"
+
+
+def _connection_leaves(i: dict) -> list:
+    return [i[k].clone().requires_grad_(True) for k in ("X", "fn", "scale", "base")]
+
+
+def _two_layers(
+    X, params: list, *, save_stats: bool, checkpointed: bool
+) -> torch.Tensor:
+    """Two layers of two connections each (the branch hands ``U`` on as ``B``), each layer a non-reentrant checkpoint
+    region or not."""
+    from torch.utils.checkpoint import checkpoint
+
+    def connection(x, fn, scale, base):
+        U, handle = pkg.cake_mhc_train_prepare(
+            x, fn, scale, base, save_stats=save_stats
+        )
+        return pkg.cake_mhc_train_finish(x, U, handle)
+
+    def layer(x, k):
+        return connection(connection(x, *params[2 * k]), *params[2 * k + 1])
+
+    if not checkpointed:
+        return layer(layer(X, 0), 1)
+    return checkpoint(
+        layer, checkpoint(layer, X, 0, use_reentrant=False), 1, use_reentrant=False
+    )
+
+
+@pytest.mark.parametrize("T", (129, 2049))
+@pytest.mark.parametrize("save_stats", (True, False))
+@pytest.mark.parametrize("checkpointed", (False, True))
+def test_backward_keeps_nothing_alive(
+    T: int, save_stats: bool, checkpointed: bool
+) -> None:
+    """Once a connection's backward has run, nothing of it stays alive: after ``torch.autograd.grad`` over two layers
+    of two connections the only live tensor of the step is its output ``Y`` (which keeps the graph alive), since the
+    finish node's backward hands ``dY`` and the gradient statistics to the prepare node's backward on autograd edges.
+    A second step gives bitwise the gradients of the first."""
+    i = _make_inputs(T, seed=SEED + 51)
+    params = [
+        [p.clone().requires_grad_(True) for p in (q["fn"], q["scale"], q["base"])]
+        for q in (_make_inputs(1, seed=SEED + 52 + k) for k in range(4))
+    ]
+    X = i["X"].clone().requires_grad_(True)
+    leaves = [X, *[p for ps in params for p in ps]]
+
+    def step() -> tuple:
+        Y = _two_layers(X, params, save_stats=save_stats, checkpointed=checkpointed)
+        return Y, torch.autograd.grad(Y, leaves, i["dY"])
+
+    reference = step()[1]  # also the warm-up: default workspaces and loaded modules
+    before = _live_bytes()
+    Y, grads = step()
+    assert all(torch.equal(g, r) for g, r in zip(grads, reference, strict=True)), (
+        "a second step changed a gradient bit"
+    )
+    del grads
+    _assert_kept(before, "the backward", Y)
+
+
+@pytest.mark.parametrize("T", (129, 2049))
+@pytest.mark.parametrize("save_stats", (True, False))
+def test_repeated_backward_with_retain_graph(T: int, save_stats: bool) -> None:
+    """Backward passes over one retained graph are independent: two full passes give bitwise the gradients of a fresh
+    graph, and a pass in between that reaches the prepare node but not the finish node (the loss is ``U``) takes no
+    ``dY`` of the earlier pass: it equals the same pass on a fresh graph."""
+    i = _make_inputs(T, seed=SEED + 56)
+
+    def graph(leaves: list) -> tuple:
+        U, handle = pkg.cake_mhc_train_prepare(*leaves, save_stats=save_stats)
+        B = (U.float() + i["B"].float()).to(BF16)
+        return U, pkg.cake_mhc_train_finish(leaves[0], B, handle)
+
+    leaves = _connection_leaves(i)
+    U, Y = graph(leaves)
+    first = torch.autograd.grad(Y, leaves, i["dY"], retain_graph=True)
+    u_only = torch.autograd.grad(U, leaves, i["dU"], retain_graph=True)
+    second = torch.autograd.grad(Y, leaves, i["dY"])
+
+    fresh = _connection_leaves(i)
+    full = torch.autograd.grad(graph(fresh)[1], fresh, i["dY"])
+    fresh = _connection_leaves(i)
+    u_fresh = torch.autograd.grad(graph(fresh)[0], fresh, i["dU"])
+    for a, b, f in zip(first, second, full, strict=True):
+        assert torch.equal(a, f) and torch.equal(b, f), (
+            "retain_graph: gradient bit changed"
+        )
+    for a, f in zip(u_only, u_fresh, strict=True):
+        assert torch.equal(a, f), (
+            "a backward that skipped the finish node took a stale dY"
+        )
+
+
+@pytest.mark.parametrize("T", (129, 2049))
+@pytest.mark.parametrize("save_stats", (True, False))
+@pytest.mark.parametrize("region", ("connection", "after_prepare"))
+def test_reentrant_checkpoint(T: int, save_stats: bool, region: str) -> None:
+    """A reentrant ``torch.utils.checkpoint`` around the connection, or around the branch and the finish with the
+    prepare outside (the rerun finish node has no edge to the prepare node, so its backward leaves ``dY`` and the
+    gradient statistics on the shared state and the prepare node's backward empties it), gives bitwise the plain
+    gradients and keeps nothing alive after the backward beyond ``Y`` and the leaves' gradients."""
+    from torch.utils.checkpoint import checkpoint
+
+    i = _make_inputs(T, seed=SEED + 57)
+
+    def finish(X, U, handle):
+        B = (U.float() + i["B"].float()).to(BF16)
+        return pkg.cake_mhc_train_finish(X, B, handle)
+
+    def connection(X, fn, scale, base):
+        U, handle = pkg.cake_mhc_train_prepare(
+            X, fn, scale, base, save_stats=save_stats
+        )
+        return finish(X, U, handle)
+
+    plain = _connection_leaves(i)
+    connection(*plain).backward(i["dY"])
+
+    checkpointed = _connection_leaves(i)
+    before = _live_bytes()
+    if region == "connection":
+        Y = checkpoint(connection, *checkpointed, use_reentrant=True)
+    else:
+        U, handle = pkg.cake_mhc_train_prepare(*checkpointed, save_stats=save_stats)
+        Y = checkpoint(finish, checkpointed[0], U, handle, use_reentrant=True)
+        del U
+    Y.backward(i["dY"])
+    for p, c in zip(plain, checkpointed, strict=True):
+        assert torch.equal(p.grad, c.grad), (
+            f"reentrant checkpoint ({region}): gradient bit changed"
+        )
+    if region == "after_prepare":
+        assert all(t is None for t in handle.state.take()), "the state kept a gradient"
+    _assert_kept(
+        before, "a reentrant checkpointed backward", Y, *(c.grad for c in checkpointed)
+    )
+
+
+@pytest.mark.parametrize("T", (129, 2049))
+@pytest.mark.parametrize("prepare", ("skipped", "not_recorded"))
+def test_backward_without_the_prepare_node(T: int, prepare: str) -> None:
+    """A backward that runs the finish node but not the prepare node (``torch.autograd.grad`` for the branch output
+    alone, or a prepare whose inputs need no gradient) leaves the finish node's ``dY`` and gradient statistics on no
+    handle: the engine drops the edge gradients.  What stays alive is the prepare node's own saved statistics while
+    its backward has not run."""
+    i = _make_inputs(T, seed=SEED + 58)
+    leaves = (
+        _connection_leaves(i)
+        if prepare == "skipped"
+        else [i[k] for k in ("X", "fn", "scale", "base")]
+    )
+
+    def step() -> tuple:
+        U, handle = pkg.cake_mhc_train_prepare(*leaves)
+        B = (U.float() + i["B"].float()).to(BF16)
+        if prepare == "not_recorded":
+            B.requires_grad_(True)
+        Y = pkg.cake_mhc_train_finish(leaves[0], B, handle)
+        return Y, B, handle, torch.autograd.grad(Y, [B], i["dY"])
+
+    step()
+    before = _live_bytes()
+    Y, B, handle, (dB,) = step()
+    assert all(t is None for t in handle.state.take()), "the state kept a gradient"
+    saved_stats = (
+        T * 256 if prepare == "skipped" else 0
+    )  # the 256-byte record per token
+    _assert_kept(
+        before, "a backward without the prepare node", Y, B, dB, expected=saved_stats
+    )
+
+
+@pytest.mark.parametrize("save_stats", (True, False))
+def test_interleaved_connections(save_stats: bool) -> None:
+    """Two connections of one shape whose prepares both run before either finish (their edge outputs alias the same
+    stand-in buffers but are distinct autograd outputs) give bitwise the gradients of the two connections run one
+    after the other."""
+    T = 129
+    a, b = _make_inputs(T, seed=SEED + 61), _make_inputs(T, seed=SEED + 62)
+
+    def branch(i: dict, U: torch.Tensor) -> torch.Tensor:
+        return (U.float() + i["B"].float()).to(BF16)
+
+    def run(interleaved: bool) -> list:
+        la, lb = _connection_leaves(a), _connection_leaves(b)
+        Ua, ha = pkg.cake_mhc_train_prepare(*la, save_stats=save_stats)
+        if interleaved:
+            Ub, hb = pkg.cake_mhc_train_prepare(*lb, save_stats=save_stats)
+            Yb = pkg.cake_mhc_train_finish(lb[0], branch(b, Ub), hb)
+            Ya = pkg.cake_mhc_train_finish(la[0], branch(a, Ua), ha)
+        else:
+            Ya = pkg.cake_mhc_train_finish(la[0], branch(a, Ua), ha)
+            Ub, hb = pkg.cake_mhc_train_prepare(*lb, save_stats=save_stats)
+            Yb = pkg.cake_mhc_train_finish(lb[0], branch(b, Ub), hb)
+        torch.autograd.backward([Ya, Yb], [a["dY"], b["dY"]])
+        return [p.grad for p in la + lb]
+
+    for s, t in zip(run(False), run(True), strict=True):
+        assert torch.equal(s, t), "interleaved connections: gradient bit changed"
+
+
 @pytest.mark.parametrize("T", (1000,))
 def test_accumulate_four_times(T: int) -> None:
     """Four consecutive ``accumulate=True`` passes on four input sets against the FP64 sum of the four gradients plus
@@ -1155,6 +1491,42 @@ def test_changing_rows_in_one_process_does_not_rebuild() -> None:
     )
 
 
+_EPS_CASES = ((2e-5, 2e-6), (1e-6, 1e-5), (1e-5, 4e-6))
+
+
+@pytest.mark.parametrize("T", (64, 2049))
+@pytest.mark.parametrize("rms_eps,hc_eps", _EPS_CASES)
+def test_non_default_eps_match_fp64(T: int, rms_eps: float, hc_eps: float) -> None:
+    """``rms_eps`` / ``hc_eps`` are launch arguments: the forward and backward at other values meet the same FP64
+    bars as the defaults (the oracle is evaluated at the same values), and the statistics actually move."""
+    out = _check_case(T, rms_eps=rms_eps, hc_eps=hc_eps)
+    default = _run(_make_inputs(T))
+    assert not torch.equal(out["result"]["stats"], default["stats"]), (
+        f"stats unchanged by rms_eps={rms_eps:g} hc_eps={hc_eps:g}"
+    )
+
+
+def test_changing_eps_in_one_process_does_not_rebuild() -> None:
+    """A different epsilon is a launch argument of the already compiled programs: no module is rebuilt or reloaded
+    when the epsilons change between calls, and the outputs follow the FP64 oracle at each value."""
+    _check_case(64)
+    loaded_before = loader.load.cache_info().misses
+    for rms_eps, hc_eps in _EPS_CASES + ((RMS_EPS, HC_EPS),):
+        i = _make_inputs(255, seed=SEED + 3)
+        i["rms_eps"], i["hc_eps"] = rms_eps, hc_eps
+        res = _run(i)
+        ref = _oracle(i)
+        _assert_bf16(
+            res["dX"], ref["dX32"], f"dX rms_eps={rms_eps:g} hc_eps={hc_eps:g}"
+        )
+        _assert_fp32(
+            res["dfn"], ref["dfn"], None, f"dfn rms_eps={rms_eps:g} hc_eps={hc_eps:g}"
+        )
+    assert loader.load.cache_info().misses == loaded_before, (
+        "a changed epsilon rebuilt or reloaded a module"
+    )
+
+
 @pytest.mark.parametrize("T", (7, 2049))
 @pytest.mark.parametrize("save_stats", (True, False))
 def test_autograd_end_to_end(T: int, save_stats: bool) -> None:
@@ -1288,9 +1660,31 @@ def test_argument_validation() -> None:
         forward_prepare(padded, fn, scale, base)
     with pytest.raises(ValueError):
         forward_prepare(X.cpu(), fn.cpu(), scale.cpu(), base.cpu())
-    for kwargs in ({"rms_eps": 1e-6}, {"hc_eps": 1e-5}, {"sinkhorn_iters": 19}):
-        with pytest.raises(NotImplementedError):
+    # The epsilons are launch arguments of the compiled programs (any finite positive value runs); the Sinkhorn
+    # iteration count is an integer from 1 to SINKHORN_ITERS_MAX (test_cake_mhc_train_iters.py runs the counts).
+    for kwargs in (
+        {"rms_eps": 1e-6},
+        {"hc_eps": 1e-5},
+        {"rms_eps": 2e-5, "hc_eps": 2e-6},
+    ):
+        forward_prepare(X, fn, scale, base, **kwargs)
+    for kwargs in (
+        {"rms_eps": 0.0},
+        {"rms_eps": -1e-5},
+        {"hc_eps": float("nan")},
+        {"hc_eps": float("inf")},
+    ):
+        with pytest.raises(ValueError):
             forward_prepare(X, fn, scale, base, **kwargs)
+    for kwargs in (
+        {"sinkhorn_iters": 0},
+        {"sinkhorn_iters": 20.5},
+    ):
+        with pytest.raises(ValueError):
+            forward_prepare(X, fn, scale, base, **kwargs)
+    with pytest.raises(NotImplementedError):
+        forward_prepare(X, fn, scale, base, sinkhorn_iters=pkg.SINKHORN_ITERS_MAX + 1)
+    assert pkg.SHIPPED_SINKHORN_ITERS == (SINKHORN_ITERS,)
     U, stats = forward_prepare(X, fn, scale, base)
     with pytest.raises(ValueError):
         forward_finish(X, i["B"][:, : HIDDEN // 2], stats)

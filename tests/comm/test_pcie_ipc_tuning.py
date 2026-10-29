@@ -89,8 +89,10 @@ def test_candidate_rejections_match_the_documented_rules() -> None:
         for t in tuning.TUNE_THREADS
         if b > policy.CE_MAX_PIECES or t != policy.CE_THREADS
     }
+    # Stream publication is off by default, and both of its variants with it.
     expected_rejected |= {
-        (int(IpcVariant.COPY_ENGINE_RING_MEMOP), b, t)
+        (int(v), b, t)
+        for v in (IpcVariant.COPY_ENGINE_RING_MEMOP, IpcVariant.COPY_ENGINE_RING_PIPED)
         for b in tuning.TUNE_BLOCKS
         for t in tuning.TUNE_THREADS
     }
@@ -106,6 +108,7 @@ def test_candidate_rejections_match_the_documented_rules() -> None:
             int(IpcVariant.FLAT_STAGED),
             int(IpcVariant.COPY_ENGINE_ISLAND),
             int(IpcVariant.COPY_ENGINE_RING_MEMOP),
+            int(IpcVariant.COPY_ENGINE_RING_PIPED),
         )
         or (
             t[0] == int(IpcVariant.COPY_ENGINE_RING)
@@ -278,6 +281,7 @@ _CE_VARIANTS = (
     IpcVariant.COPY_ENGINE_RING,
     IpcVariant.COPY_ENGINE_ISLAND,
     IpcVariant.COPY_ENGINE_RING_MEMOP,
+    IpcVariant.COPY_ENGINE_RING_PIPED,
 )
 
 
@@ -505,6 +509,14 @@ def test_cache_key_extras_separate_every_workspace_dimension() -> None:
     ):
         assert tuning.cache_key_extras(**{**base, field: other}) != reference, field
 
+    # The slow-hop mask shapes only the pipelined ring, which only
+    # stream-publication workspaces search, so it keys those alone.
+    memop = {**base, "memop_supported": True}
+    assert tuning.cache_key_extras(**memop, slow_hops=0b10001000) != (
+        tuning.cache_key_extras(**memop)
+    )
+    assert tuning.cache_key_extras(**base, slow_hops=0b10001000) == reference
+
 
 def _synthesise_cache(monkeypatch, *entries) -> None:
     """Install file-backed entries keyed the way ``save_configs`` writes them."""
@@ -524,7 +536,7 @@ def _synthesise_cache(monkeypatch, *entries) -> None:
 def test_original_and_memop_cache_namespaces_remain_loadable(
     memop_supported, monkeypatch, tmp_path
 ) -> None:
-    """Original v3 caches still hit; enabled SM120 retains its separate v4 key."""
+    """Original v3 caches still hit; enabled SM120 keeps a separate v5 key."""
     from flashinfer.autotuner import AutoTuner
 
     workspace_fields = dict(
@@ -532,7 +544,7 @@ def test_original_and_memop_cache_namespaces_remain_loadable(
     )
     # Literal persisted formats, independent of the current key builder.
     if memop_supported:
-        head = (4, 4, PROFILE_ROOTCPLX, 128, 6144 * 128, True)
+        head = (5, 4, PROFILE_ROOTCPLX, 128, 6144 * 128, True, 0)
     else:
         head = (3, 4, PROFILE_ROOTCPLX, 128, 6144 * 128)
     extras = head + ("torch.bfloat16",)
@@ -829,8 +841,47 @@ def test_memop_candidate_requires_group_capability_and_single_piece(world_size):
     common = dict(world_size=world_size, numel=12 * 1024 * 1024 // 2)
     legacy = set(tuning.candidate_tactics(**common, memop_supported=False))
     enabled = set(tuning.candidate_tactics(**common, memop_supported=True))
+    # The pipelined ring has its own admission, tested below.
+    piped = int(IpcVariant.COPY_ENGINE_RING_PIPED)
+    added = {t for t in enabled - legacy if t[0] != piped}
     expected = {(6, 1, 256)} if world_size in (4, 8) else set()
-    assert enabled - legacy == expected
+    assert added == expected
     assert legacy <= enabled
     assert tuning.TUNE_RANK_ROUNDS == 3
     assert tuning.TUNE_SURVIVORS == 48
+
+
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+def test_pipelined_ring_is_offered_at_every_depth_from_its_chunk_floor(world_size):
+    """Stream publication and a chunk of at least the floor, or no depth at all.
+
+    Below the floor every depth is still launchable -- only measuring it is
+    withheld -- so the shape tunes exactly as it did before the schedule existed.
+    """
+    piped = int(IpcVariant.COPY_ENGINE_RING_PIPED)
+    # Two-byte elements; at `floor` each rank's chunk is exactly the floor.
+    floor = tuning.PIPED_MIN_CHUNK_BYTES * world_size // 2
+    every_depth = set(range(1, policy.CE_MAX_PIECES + 1))
+    for numel, memop_supported, offered in (
+        (floor, True, world_size in (4, 8)),
+        (8 * floor, True, world_size in (4, 8)),
+        (floor // 2, True, False),
+        (floor, False, False),
+    ):
+        depths = {
+            b
+            for v, b, _t in tuning.candidate_tactics(
+                world_size, numel=numel, memop_supported=memop_supported
+            )
+            if v == piped
+        }
+        assert depths == (every_depth if offered else set()), (numel, memop_supported)
+        if world_size in (4, 8):
+            for depth in every_depth:
+                assert _is_launchable(
+                    world_size,
+                    IpcLaunchConfig(depth, policy.CE_THREADS, IpcVariant(piped)),
+                    MAX_BLOCKS,
+                    numel,
+                    2,
+                ), (numel, depth)

@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# Cake Router GEMM for datacenter Blackwell: the 32 source-built programs of
-# ``csrc/cake_router_gemm`` (16 token counts x 2 hidden sizes) behind one TVM-FFI
-# binding, built through the standard JIT path.
+# Cake Router GEMM for datacenter Blackwell: the source-built programs of
+# ``csrc/cake_router_gemm`` (one per token count and hidden size, and the narrow
+# programs) behind one TVM-FFI binding, built through the standard JIT path.
 
 from __future__ import annotations
 
@@ -29,21 +29,39 @@ from ..compilation_context import CompilationContext
 from . import env as jit_env
 from .core import JitSpec, gen_jit_spec
 
-# The kernels use plain vector loads, FP32 FMA, warp shuffles and shared memory, so the
-# sources compile for every 10.x build target of the process (``FLASHINFER_CUDA_ARCH_LIST``
-# on AOT hosts, the visible devices otherwise).
+# The kernels use plain vector loads, FP32 FMA, warp shuffles, shared memory and, where
+# they split K, thread-block clusters with distributed shared memory, so the sources
+# compile for every 10.x build target of the process (``FLASHINFER_CUDA_ARCH_LIST`` on
+# AOT hosts, the visible devices otherwise).
 SUPPORTED_MAJOR_VERSIONS = (10,)
 # Capabilities the kernels were validated and measured on; other 10.x devices keep the
 # reference router GEMM.
 VALIDATED_CAPABILITIES = ((10, 0), (10, 3))
 NUM_TOKENS = tuple(range(1, 17))
 HIDDEN_DIMS = (6144, 7168)
-# One device source per (num_tokens, hidden_dim), declared and launched by
-# ``cake_router_gemm.cu``.
+# (num_tokens, hidden_dim) of the narrow programs, one CTA per expert, which the binding
+# launches when their grid fits one CTA per SM.
+NARROW_PROGRAMS = (
+    (7, 7168),
+    (8, 7168),
+    (9, 7168),
+    (10, 7168),
+    (11, 7168),
+    (12, 7168),
+    (13, 7168),
+    (14, 7168),
+    (15, 7168),
+    (16, 7168),
+)
+# One device source per (num_tokens, hidden_dim) and per narrow program, declared and
+# launched by ``cake_router_gemm.cu``.
 DEVICE_SOURCES = tuple(
     f"cake_router_gemm_m{num_tokens}_k{hidden_dim}_device.cu"
     for hidden_dim in HIDDEN_DIMS
     for num_tokens in NUM_TOKENS
+) + tuple(
+    f"cake_router_gemm_m{num_tokens}_k{hidden_dim}_narrow_device.cu"
+    for num_tokens, hidden_dim in NARROW_PROGRAMS
 )
 
 
@@ -104,7 +122,7 @@ def nvcc_flags() -> list[str]:
 
 
 def gen_cake_router_gemm_module() -> JitSpec:
-    """JIT spec of the Cake router GEMM binding and its 32 programs.
+    """JIT spec of the Cake router GEMM binding and its programs.
 
     One fatbin for every 10.x build target.
     """
@@ -126,6 +144,7 @@ def gen_cake_router_gemm_module() -> JitSpec:
 __all__ = [
     "DEVICE_SOURCES",
     "HIDDEN_DIMS",
+    "NARROW_PROGRAMS",
     "NUM_TOKENS",
     "SUPPORTED_MAJOR_VERSIONS",
     "VALIDATED_CAPABILITIES",

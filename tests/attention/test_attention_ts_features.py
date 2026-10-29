@@ -132,7 +132,10 @@ def test_source_dependencies_include_shared_attention_code():
         "decode.py",
         "context.py",
         "mla_decode.py",
-        "sage.py",
+        "sage/config.py",
+        "sage/index.py",
+        "sage/layout.py",
+        "sage/prepare.py",
         "_compile_cache.py",
         "_block_sparse/compiler.py",
         "_block_sparse/prepared.py",
@@ -284,8 +287,8 @@ def test_public_attention_disk_cache_in_fresh_processes(tmp_path):
         "test_attention_ts_decode.py::test_attention_ts_decode_fixed_q_dtype_mask_product[sq2-dense-fp8-bf16]",
         "test_attention_ts_context.py::test_attention_ts_context_bounded_public_correctness_matrix[fixed-fp16-dense-mha-one-shot]",
         "test_attention_ts_context.py::test_attention_ts_context_paged_supported_page_sizes_accuracy[d128-bf16-32]",
-        "test_attention_ts_mla_decode.py::test_attention_ts_mla_decode_compact_variable_k_acceptance[bf16-1cta-direct]",
-        "test_attention_ts_mla_decode.py::test_attention_ts_mla_decode_compact_variable_k_acceptance[bf16-short-k-2cta-fallback]",
+        "test_attention_ts_mla_decode.py::test_attention_ts_mla_fp8_fully_masked_split_partials",
+        "test_attention_ts_mla_decode.py::test_attention_ts_mla_2cta_graph_reloads_remapped_page_window",
         "test_attention_ts_block_sparse.py::test_public_block_sparse_correctness[q16_kv16_fp16_noncausal_holey_static]",
         "test_attention_ts_block_sparse.py::test_public_paged_one_shot_q64_kv256_gqa_matches_reference[live96-two-pages]",
         "test_attention_ts_sage.py::test_sage_matches_dequantized_reference[kv256_fp8_k1_one_shot]",
@@ -327,6 +330,9 @@ raise SystemExit(pytest.main(['-q', '--maxfail=1', *sys.argv[2:]]))
     env["FLASHINFER_WORKSPACE_BASE"] = str(tmp_path)
     env["CUTE_DSL_CACHE_DIR"] = str(tmp_path / "cute_dsl")
     env.pop("FLASHINFER_CUTE_DSL_DISABLE_CACHE", None)
+    # Test actual cold/warm loads. Parallel prebuilding uses a separate build
+    # entry point and would bypass the warm phase's no-recompile assertion.
+    env["FLASHINFER_JIT_PREBUILD_MAX_JOBS"] = "1"
     root = Path(__file__).resolve().parents[2]
     for phase in ("cold", "warm"):
         result = subprocess.run(

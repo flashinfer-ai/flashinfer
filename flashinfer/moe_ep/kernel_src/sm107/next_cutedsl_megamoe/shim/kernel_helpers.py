@@ -24,6 +24,8 @@ from typing import Optional, Sequence, Tuple
 
 import torch
 
+from flashinfer.moe_ep._compat import deprecated_aliases
+
 Mxfp8BlockSize = 32
 Nvfp4BlockSize = 16
 GateUpInterleave = 16  # fixed by the swap-AB gated-act epilogue (gate/up stripe)
@@ -508,6 +510,7 @@ def round_trip_combine(tensor: torch.Tensor, combine_dtype: str) -> torch.Tensor
     raise ValueError(f"unsupported combine_dtype {combine_dtype!r}")
 
 
+@deprecated_aliases(apply_topk_at_fc1="apply_routing_weights_before_fc2")
 def compute_megamoe_reference_sm107_block_scaled(
     x_data: torch.Tensor,
     x_sf: torch.Tensor,
@@ -521,7 +524,7 @@ def compute_megamoe_reference_sm107_block_scaled(
     quant_kind: str,
     local_expert_offset: int,
     gate_up_clamp: Optional[float],
-    apply_topk_at_fc1: bool,
+    apply_routing_weights_before_fc2: bool,
     num_tokens: Optional[int] = None,
     weight_scales_are_swizzled: bool = False,
     combine_dtype: str = "bf16",
@@ -583,7 +586,7 @@ def compute_megamoe_reference_sm107_block_scaled(
             act = (up * gate).reshape(-1, intermediate)
         else:
             act = (up * (gate * torch.sigmoid(gate))).reshape(-1, intermediate)
-        if apply_topk_at_fc1:
+        if apply_routing_weights_before_fc2:
             act = act * topk_weights[src_t, src_k].to(torch.float32).unsqueeze(-1)
         # In-kernel FC2-input requantization (the FC1->FC2 wire format).
         norm_const = 1.0 if fc1_norm_const is None else fc1_norm_const[local_e]
@@ -599,7 +602,7 @@ def compute_megamoe_reference_sm107_block_scaled(
         if fc2_alpha is not None:
             term = term * fc2_alpha[local_e]
         term = round_trip_combine(term, combine_dtype)
-        if not apply_topk_at_fc1:
+        if not apply_routing_weights_before_fc2:
             term = term * topk_weights[src_t, src_k].to(torch.float32).unsqueeze(-1)
         output.index_add_(0, src_t, term)
 

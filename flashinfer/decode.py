@@ -19,7 +19,7 @@ import math
 import os
 import warnings
 from types import SimpleNamespace
-from typing import Any, List, Literal, Optional, Tuple, Union, overload
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 
 import torch
 
@@ -233,7 +233,7 @@ def sm110_gqa_decode(
         allocated tensor.
     """
 
-    from .experimental.sm110_gqa_decode import decode
+    from .experimental.sm110_gqa_decode.backend import sm110_gqa_decode as decode
 
     return decode(
         q,
@@ -259,11 +259,16 @@ def prepare_sm110_gqa_decode(
         ``O`` must not alias any input storage. Optional ``q_scale`` defaults
         to 1.0 and must be finite and positive.
     num_splits : Optional[int]
-        ``None`` selects the prepared shape specialization. Above capacity 64,
-        ``1`` selects the original long kernel. B=1 with capacity 1024 or 4096
-        also supports its fixed split count of ``10``. Above capacity 64,
-        other split choices are rejected. Capacities up to 64 always use the
-        original short kernel; accepted explicit counts are 1, 2, 4, 8, 10, 16.
+        ``None`` (or ``1``) selects the size-based route with one split: one
+        request over a 64-key cache uses the short kernel and over 65..128 keys
+        the long kernel; one request over 129..256 keys or two requests over at
+        most 512 keys use the one-split 64-token-tile build of the split-KV
+        kernel, one or two requests over longer caches its four-slot-ring
+        64-token-tile build, and three or more requests its one-split
+        32-token-tile build. An explicit count in ``{2, 4, 8, 10, 16}``
+        launches the run-time-split program of the shape's tile (64-token tiles
+        for one or two requests over at most 4095 keys, 32-token tiles
+        otherwise) with that many splits; any other value is rejected.
 
     Returns
     -------
@@ -274,15 +279,16 @@ def prepare_sm110_gqa_decode(
     Notes
     -----
     This opt-in interface separates allocation and JIT compilation from
-    sustained decode. Default specializations cover B=4/capacity=256 and
-    B=1/capacity=1024 or 4096; other shapes use the original kernels.
+    sustained decode. The route is a pure function of the batch, the cache
+    capacity and ``num_splits``; a split route owns FP32 partial buffers and
+    self-resetting completion counters in the prepared state.
     Every sequence length must remain in ``[1, capacity]`` at every launch.
     GPU length values may change between launches; preparation does not read
     them back to the host. The caller is responsible for this precondition.
     Prepare and warm up before CUDA Graph capture. Retain the prepared state
     until all asynchronous work completes and captured Graphs are retired.
     """
-    from .experimental.sm110_gqa_decode import prepare_for_launch
+    from .experimental.sm110_gqa_decode.backend import prepare_for_launch
 
     return prepare_for_launch(inputs, num_splits=num_splits)
 
@@ -387,7 +393,7 @@ def launch_sm110_gqa_decode_prepared(prepared: dict[str, Any]) -> torch.Tensor:
     including event-ordered stream handoffs. No allocations or host reads of
     sequence lengths occur in this launch path.
     """
-    from .experimental.sm110_gqa_decode import launch_prepared
+    from .experimental.sm110_gqa_decode.backend import launch_prepared
 
     return launch_prepared(prepared)
 
@@ -1269,6 +1275,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         paged_kv_last_page_len_buffer: Optional[torch.Tensor] = None,
         backend: str = "auto",
         jit_args: Optional[List[Any]] = None,
+        jit_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         r"""Constructor of :class:`BatchDecodeWithPagedKVCacheWrapper`.
 
@@ -1358,6 +1365,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
             otherwise, the wrapper will use default attention implementation.
+
+        jit_kwargs : Optional[Dict[str, Any]]
+            The keyword arguments to create the JIT module, defaults to None.
         """
         if backend == "prims-ts":
             raise NotImplementedError(
@@ -1381,13 +1391,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._jit_module = get_batch_prefill_jit_module(
                     jit_args[0],
                     gen_customize_batch_prefill_module(
-                        backend, *jit_args
+                        backend, *jit_args, **(jit_kwargs or {})
                     ).build_and_load(),
                 )
             else:
                 self._jit_module = get_batch_decode_jit_module(
                     jit_args[0],
-                    gen_customize_batch_decode_module(*jit_args).build_and_load(),
+                    gen_customize_batch_decode_module(
+                        *jit_args, **(jit_kwargs or {})
+                    ).build_and_load(),
                 )
             # jit_args[7] is additional_tensor_names from gen_customize_batch_decode/prefill_module
             self._jit_additional_tensor_names = list(jit_args[7])
@@ -1773,6 +1785,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     "The size of indices should be less than or equal to the allocated buffer"
                 )
 
+        # Normalized like plan(): the native size query reads raw pointers (#5260).
+        indptr = indptr.contiguous()
+        last_page_len = last_page_len.contiguous()
+        if seq_lens is not None:
+            seq_lens = seq_lens.contiguous()
+
         indptr_host = indptr.to("cpu")
         last_page_len_host = last_page_len.to("cpu")
         if seq_lens is None:
@@ -1853,7 +1871,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 args.append(fixed_split_size)
                 args.append(disable_split_kv)
                 args.append(0)  # num_colocated_ctas
-                args.append(q_len_per_req if q_len_per_req > 1 else 0)  # uniform_q_len
+                args.append(q_len_per_req)  # uniform_q_len
+                args.append(True)  # fixed_uniform_q_len
         else:
             if self._jit_module is not None:
                 module = self._jit_module
@@ -2081,6 +2100,13 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._float_workspace_buffer.numel()
             * self._float_workspace_buffer.element_size()
         )
+
+        # Normalized: the planner and kernels read these as raw pointers (#5260).
+        indptr = indptr.contiguous()
+        indices = indices.contiguous()
+        last_page_len = last_page_len.contiguous()
+        if seq_lens is not None:
+            seq_lens = seq_lens.contiguous()
 
         batch_size = len(last_page_len)
         if logits_soft_cap is None:
@@ -2513,6 +2539,26 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         "q_len_per_req > 1 is currently only supported on the "
                         "fa2 tensor-core backend."
                     )
+                if (
+                    self._backend == "fa2"
+                    and q_data_type == torch.float8_e4m3fn
+                    and not (
+                        get_compute_capability(self.device) == (12, 0)
+                        and kv_data_type == torch.float8_e4m3fn
+                        and o_data_type == torch.bfloat16
+                        and head_dim == 256
+                        and pos_encoding_mode == "NONE"
+                        and logits_soft_cap == 0
+                        and q_len_per_req == 1
+                        and num_qo_heads // num_kv_heads in (1, 2, 4, 8)
+                    )
+                ):
+                    raise NotImplementedError(
+                        "The fa2 tensor-core decode takes an e4m3 query only on SM120, "
+                        "for single-token requests with an e4m3 KV cache, bfloat16 "
+                        "output, head_dim 256, no RoPE or soft cap, and 1, 2, 4 or 8 "
+                        "query heads per KV head."
+                    )
                 self._cached_module = get_batch_prefill_module(
                     self._backend,
                     q_data_type,
@@ -2550,7 +2596,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 args.append(fixed_split_size)
                 args.append(disable_split_kv)
                 args.append(0)  # num_colocated_ctas
-                args.append(q_len_per_req if q_len_per_req > 1 else 0)  # uniform_q_len
+                args.append(q_len_per_req)  # uniform_q_len
+                args.append(True)  # fixed_uniform_q_len
             self._plan_info = self._cached_module.plan(
                 *args,
             )
@@ -3363,6 +3410,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                             "maybe_alibi_slopes": lambda: _get_cache_alibi_slopes_buf(
                                 q.shape[1], q.device
                             ),
+                            "maybe_k_cache_sf": key_block_scales,
+                            "maybe_v_cache_sf": value_block_scales,
                         },
                         args,
                     )
@@ -3925,6 +3974,7 @@ def trtllm_batch_decode_with_kv_cache(
     bf16q_fp8kv_transform_mode: Optional[Literal["k_only", "separate_kv"]] = None,
     request_order: Optional[torch.Tensor] = None,
     request_order_plan: Optional[Any] = None,
+    sparse_top_k: int = 0,
 ) -> Union[
     torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
 ]:
@@ -4156,6 +4206,18 @@ def trtllm_batch_decode_with_kv_cache(
         descriptors are initialized; subsequent replays may update only the
         contents of ``request_order`` in place.
 
+    sparse_top_k : int = 0
+        Static token-sparse MQA (``trtllm-gen`` backend): each query token attends to
+        its own list of at most ``sparse_top_k`` KV tokens, such as a Top-K selection. Each
+        query token is its own request over pages of one token, with one KV head. Pass
+        ``uses_shared_paged_kv_idx=False`` and ``block_tables`` of shape
+        ``[batch_size, 2, sparse_top_k]`` with each token's K and V token indices, and
+        ``seq_lens`` with how many leading entries of each list are valid. ``sparse_top_k``
+        must be a multiple of 4, the query heads at most 128, and ``batch_size`` at most
+        65535. A sliding window, attention sinks and head dim 512 (MLA's, see
+        :func:`trtllm_batch_decode_with_kv_cache_mla`) are not supported. ``0``
+        (default) disables it.
+
     Returns
     -------
     out : Union[torch.Tensor, FP4Tensor]
@@ -4186,6 +4248,43 @@ def trtllm_batch_decode_with_kv_cache(
             # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
+
+    if sparse_top_k:
+        if q_len_per_req != 1 or cum_seq_lens_q is not None:
+            raise ValueError("sparse_top_k requires one query token per request")
+        # The token-sparse kernels apply neither a sliding window nor sinks.
+        if window_left != -1 or sinks is not None:
+            raise ValueError(
+                "sparse_top_k supports neither a sliding window nor attention sinks"
+            )
+        if (
+            uses_shared_paged_kv_idx
+            or block_tables.shape[1:] != (2, sparse_top_k)
+            or block_tables.shape[0] < query.shape[0]
+            or seq_lens.shape[0] < query.shape[0]
+        ):
+            raise ValueError(
+                "sparse_top_k requires uses_shared_paged_kv_idx=False, block_tables of shape "
+                f"[batch_size, 2, {sparse_top_k}] and batch_size seq_lens, got "
+                f"{tuple(block_tables.shape)} and {tuple(seq_lens.shape)}"
+            )
+        page_size = k_cache.shape[-2 if kv_layout == "HND" else -3]
+        if page_size != 1 or k_cache.stride(0) != v_cache.stride(0):
+            raise ValueError("sparse_top_k needs one-token K and V pages of one stride")
+        # The token-sparse kernels address K/V without a head stride: one KV head.
+        if k_cache.shape[-3 if kv_layout == "HND" else -2] != 1:
+            raise ValueError("sparse_top_k needs one KV head (MQA)")
+        # Sparse 512/512 head dims select the MLA kernels (one latent K/V pool).
+        if query.shape[-1] == 512:
+            raise ValueError(
+                "sparse_top_k with head dim 512 is MLA's: use trtllm_batch_decode_with_kv_cache_mla"
+            )
+        # The kernel copies indices with 16-byte cp.async (four int32s), and its
+        # non-persistent launch grid caps the request count at 65535 (as in mla/_core.py).
+        if sparse_top_k % 4 or query.shape[0] > 65535:
+            raise ValueError(
+                "sparse_top_k must be a multiple of 4 and batch_size at most 65535"
+            )
 
     if k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8:
         if kv_cache_sf is None:
@@ -4315,6 +4414,10 @@ def trtllm_batch_decode_with_kv_cache(
             "trtllm-gen" if get_compute_capability(query.device)[0] == 10 else "xqa"
         )
 
+    if sparse_top_k and backend != "trtllm-gen":
+        raise ValueError(
+            f"sparse_top_k is only supported by the trtllm-gen backend, got {backend!r}"
+        )
     if backend not in ("trtllm-gen", "cake") and bmm1_scale_log2 is not None:
         raise ValueError(
             "bmm1_scale_log2 is only supported when backend is 'trtllm-gen' or 'cake'"
@@ -4633,9 +4736,25 @@ def trtllm_batch_decode_with_kv_cache(
                 )
             )
 
+        if backend == "cake" and (query.size(0) == 0 or batch_size == 0):
+            # No request has a query token: there is nothing to attend or write,
+            # so return before choosing a route or launching a kernel.
+            empty_out = (
+                out
+                if out_dtype != "nvfp4"
+                else FP4Tensor(out, out_scale_factor, o_sf_start_index, query.shape)
+            )
+            if return_lse:
+                return empty_out, lse
+            return empty_out
+
         if backend == "cake":
             from .cake_fmha import (
+                CakeFmhaAlignedDecodeModule,
+                CakeFmhaDecodeProgramModule,
                 _resolve_cake_fmha_decode_module,
+                _run_cake_fmha_aligned_decode,
+                _run_cake_fmha_decode_program,
                 select_cake_fmha_decode_route,
             )
 
@@ -4672,10 +4791,55 @@ def trtllm_batch_decode_with_kv_cache(
                 enable_block_sparse_attention=enable_block_sparse_attention,
                 lse=lse,
                 multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
+                enable_pdl=enable_pdl,
             )
             cake_module, optimized_loaded = _resolve_cake_fmha_decode_module(
                 query.device, cake_route
             )
+            if isinstance(cake_module, CakeFmhaAlignedDecodeModule):
+                # Aligned hd128 q1 decode: a generated in-tree program whose
+                # binding takes the kernel's host parameters positionally plus
+                # the grid.  The route admits only BF16 / FP16 output in the
+                # query dtype without LSE, so ``out`` is the whole result; it
+                # needs no workspace or counter buffer and ignores enable_pdl.
+                _run_cake_fmha_aligned_decode(
+                    cake_module,
+                    query=query,
+                    key_cache=k_cache,
+                    value_cache=v_cache,
+                    out=out,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                    bmm1_scale=bmm1_scale,
+                )
+                return out
+            if isinstance(cake_module, CakeFmhaDecodeProgramModule):
+                # A generated decode program: the host computes every argument
+                # of its binding from host scalars and views of the caller's
+                # tensors (device scales stay on the device), so the launch
+                # reads nothing back and can be captured in a CUDA graph.
+                _run_cake_fmha_decode_program(
+                    cake_module,
+                    query=query,
+                    key_cache=k_cache,
+                    value_cache=v_cache,
+                    out=out,
+                    workspace_buffer=workspace_buffer,
+                    counter_buffer=multi_ctas_kv_counter_buffer,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                    max_seq_len=max_seq_len,
+                    bmm1_scale=bmm1_scale,
+                    bmm2_scale=bmm2_scale,
+                    sinks=sinks,
+                    lse=lse,
+                    key_block_scales=k_block_scales,
+                    value_block_scales=v_block_scales,
+                    sm_count=sm_count,
+                )
+                if return_lse:
+                    return out, lse
+                return out
             if not optimized_loaded:
                 # compat_v1 takes host scalar scales; only the optimized
                 # scale-pointer specialization preserves the device binding.
@@ -4725,7 +4889,7 @@ def trtllm_batch_decode_with_kv_cache(
             o_sf_start_index,
             batch_size,
             window_left,
-            0,  # sparse_mla_top_k
+            sparse_top_k,
             sm_count,
             enable_pdl,
             workspace_buffer.numel() * workspace_buffer.element_size(),
@@ -5009,6 +5173,10 @@ def fast_decode_plan(
     compatible prepared graphs are still reused. The copy-elision below is
     specific to the FA2/FA3 module, not cuDNN's metadata contract.
     """
+    # Normalized: kernels read these as raw pointers (#5260); no-op when contiguous.
+    indptr = indptr.contiguous()
+    indices = indices.contiguous()
+    last_page_len = last_page_len.contiguous()
     batch_size = len(last_page_len)
     wants_cudnn = self._backend == "cudnn"
     if self._requested_backend == "auto":
@@ -5101,6 +5269,18 @@ def fast_decode_plan(
                 "q_len_per_req > 1 is currently only supported on the fa2 "
                 "tensor-core backend."
             )
+    if (
+        getattr(self, "_backend", None) == "fa2"
+        and getattr(self, "_cached_q_data_type", None) == torch.float8_e4m3fn
+        and (
+            q_len_per_req != 1
+            or num_qo_heads not in [num_kv_heads * g for g in (1, 2, 4, 8)]
+        )
+    ):
+        raise NotImplementedError(
+            "The fa2 tensor-core decode takes an e4m3 query only for single-token "
+            "requests with 1, 2, 4 or 8 query heads per KV head."
+        )
     if self.is_cuda_graph_enabled:
         frozen_q_len = getattr(self, "_q_len_per_req", None)
         if frozen_q_len is not None and frozen_q_len != q_len_per_req:
@@ -5177,7 +5357,8 @@ def fast_decode_plan(
     )
 
     indptr_host = (
-        global_override_indptr_cpu
+        # Normalized: the planner reads this as a raw pointer (#5260).
+        global_override_indptr_cpu.contiguous()
         if global_override_indptr_cpu is not None
         else indptr.cpu()
     )
@@ -5220,9 +5401,8 @@ def fast_decode_plan(
                     args.append(fixed_split_size)
                     args.append(disable_split_kv)
                     args.append(0)  # num_colocated_ctas
-                    args.append(
-                        q_len_per_req if q_len_per_req > 1 else 0
-                    )  # uniform_q_len
+                    args.append(q_len_per_req)  # uniform_q_len
+                    args.append(True)  # fixed_uniform_q_len
                 self._plan_info = self._cached_module.plan(
                     *args,
                 )

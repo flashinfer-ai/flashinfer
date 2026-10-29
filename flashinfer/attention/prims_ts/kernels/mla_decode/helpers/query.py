@@ -19,6 +19,7 @@ from dataclasses import dataclass
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64
+from cutlass.experimental import primitives as prims
 
 
 @dataclass(frozen=True)
@@ -236,3 +237,32 @@ def split_o_element_offset(
         * Int64(cfg.num_ctas_per_seq_kv)
         + Int64(split_idx)
     ) * Int64(cfg.head_dim_v) + Int64(dim_idx)
+
+
+@cute.jit
+def copy_q_fp8_to_tmem(source, tmem_base, *, cta_group: cutlass.Constexpr[int]):
+    """Copy64x512 E4M3 Q values to Layout E(1CTA) or Layout B(2CTA).
+
+    Source consists of four SW128 panels. Callers own source lifetime and
+    copy-to-consumer ordering; this helper adds no synchronization.
+    """
+    assert cta_group in (1, 2)
+    group = prims.CTAGroup.CTA_1 if cta_group == 1 else prims.CTAGroup.CTA_2
+    base_desc = Int64(
+        prims.Tcgen05SmemDesc.build(
+            source,
+            leading_byte_offset=16,
+            stride_byte_offset=1024,
+            layout=2,
+        )
+    )
+    for part in cutlass.range_constexpr(32):
+        # The aligned start-address field stays inside the256KiB SMEM range.
+        descriptor = base_desc + Int64((part // 8) * 512 + part % 8)
+        prims.tcgen05_cp(
+            prims.Tcgen05CpShape.SHAPE_64X128B,
+            prims.make_tmem_ptr(tmem_base + Int32(part * 4), Int32),
+            descriptor,
+            group=group,
+            multicast=prims.Tcgen05CpMulticast.WARPX2_02_13,
+        )

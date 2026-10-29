@@ -118,14 +118,12 @@ kernel_cake_sage_block_sparse_attention_ce646595859ababcf2bd(__nv_bfloat16* __re
     float inv[16];
     #pragma unroll
     for (int j_1 = 0; j_1 < 16; j_1++) {
-        float _fmax_0 = fmaxf(amax[j_1], 1e-06f);
-        inv[j_1] = 448.0f / _fmax_0;
+        inv[j_1] = 448.0f / fmaxf(amax[j_1], 1e-06f);
     }
     if (chunk == 0 && tid < 8) {
         #pragma unroll
         for (int j_2 = 0; j_2 < 16; j_2++) {
-            float _fmax_1 = fmaxf(amax[j_2], 1e-06f);
-            v_scale[bh * 128 + channel0 + j_2] = _fmax_1 / 448.0f;
+            v_scale[bh * 128 + channel0 + j_2] = fmaxf(amax[j_2], 1e-06f) / 448.0f;
         }
     }
     #pragma unroll

@@ -24,6 +24,7 @@ from cutlass.cute.runtime import from_dlpack
 # accumulator layout helpers (WGMMA C fragment -> (M, N) view)
 # ---------------------------------------------------------------------------
 def _layout_separate(thr, src, ref):
+    """Split a tiled-MMA layout into its thread part and its value part."""
     lt = cute.make_layout(())
     ge = cute.make_layout(())
     for k, v in enumerate(ref):
@@ -40,6 +41,7 @@ def _layout_separate(thr, src, ref):
 
 
 def layout_acc_mn(tiled_mma, acc):
+    """Accumulator layout of this tiled MMA in (M, N) coordinates."""
     separated = _layout_separate(
         tiled_mma.shape_mnk[0], acc[0], tiled_mma.tv_layout_C.stride[1]
     )
@@ -61,6 +63,7 @@ def layout_acc_mn(tiled_mma, acc):
 
 
 def reduction_target_n(tiled_mma):
+    """N extent the row-max epilogue has to reduce over for this tiled MMA."""
     separated = _layout_separate(
         tiled_mma.shape_mnk[0],
         cute.make_layout(tiled_mma.tv_layout_C.shape[0]),
@@ -82,6 +85,7 @@ def mma_issue(
     kslice,
     nkb: cutlass.Constexpr,
 ):
+    """Issue one WGMMA group over the K slices of this sub-tile."""
     cute.nvgpu.warpgroup.fence()
     mma_atom = cute.make_mma_atom(mma_op)
     mma_atom.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
@@ -117,19 +121,21 @@ def mma_epilogue(
     page: cutlass.Constexpr,
     total_q,
     do_mask: cutlass.Constexpr = True,
+    nvr=0,
 ):
+    """Row-max epilogue: apply the mask if any, then reduce along N."""
     if cutlass.const_expr(do_mask):
         if cutlass.min(delta, kmax) < page - 1:
             for i in cutlass.range_constexpr(cute.size(acc)):
                 cq, ck = tCcS[i]
                 if ck > cutlass.min(cq + delta, kmax):
-                    acc[i] = cutlass.Float16(float("-inf"))
+                    acc[i] = acc.element_type(float("-inf"))
     acc_mn = cute.make_tensor(acc.iterator, acc_mn_layout)
     for i in cutlass.range_constexpr(n_rows):
         s_max[i] = cutlass.Float32(
             acc_mn[i, None]
             .load()
-            .reduce(cute.ReductionOp.MAX, cutlass.Float16(float("-inf")), 0)
+            .reduce(cute.ReductionOp.MAX, acc.element_type(float("-inf")), 0)
         )
     for i in cutlass.range_constexpr(n_rows):
         for r in cutlass.range_constexpr(red_rank):
@@ -142,7 +148,12 @@ def mma_epilogue(
             cute.make_layout(128),
         )
         for i in cutlass.range_constexpr(n_rows):
-            gO[rows[i]] = s_max[i]
+            # m0 is pulled back so the tile fits inside the sequence only when
+            # sqb >= blk_m. A shorter sequence leaves rows [nvr, blk_m) with no
+            # query behind them; storing those walks into the next KV tile's
+            # slice of this head.
+            if rows[i] < nvr:
+                gO[rows[i]] = s_max[i]
 
 
 class MsaProxyScore:
@@ -165,7 +176,9 @@ class MsaProxyScore:
         hq=1,
         use_tma_q=True,
         fold=0,
+        use_fp32_acc=True,
     ):
+        """Record the tile geometry and TMA options this body is built for."""
         self.hq = hq
         self.use_tma_q = use_tma_q
         self.nsub = nsub
@@ -182,7 +195,7 @@ class MsaProxyScore:
         self.n_mma_threads = 128 * self.n_mma_wg
         self.n_threads = self.n_mma_threads + 32
         self.producer_warp = self.n_mma_threads // 32
-        self.acc_dtype = cutlass.Float16
+        self.acc_dtype = cutlass.Float32 if use_fp32_acc else cutlass.Float16
         self.ab_dtype = cutlass.Float8E4M3FN
         self.tile_mnk = (128, page, head_dim)
 
@@ -205,6 +218,7 @@ class MsaProxyScore:
         n_mtiles: cutlass.Int32,
     ):
         # rebuild K as (page, d, num_pages) with STATIC tile modes (TMA needs it)
+        """Launch the proxy-score grid for one call."""
         npages = mK4.shape[0]
         mKp = cute.make_tensor(
             mK4.iterator,
@@ -277,7 +291,13 @@ class MsaProxyScore:
         ).launch(
             grid=[hq * n_mtiles, nkchunk, B],
             block=[self.n_threads, 1, 1],
-            min_blocks_per_mp=2,
+            # 288 threads at two blocks/SM leaves ptxas ~113 registers/thread,
+            # which the fp32 accumulator does not fit: it capped at 96 and spilled
+            # 5.5 GB to local memory for one launch, idling the tensor pipe at
+            # 7.9% against 96.1% for fp16. One block/SM doubles the budget to
+            # ~227. The grid is under one wave here, so the occupancy given up is
+            # far cheaper than the spill traffic.
+            min_blocks_per_mp=1 if self.acc_dtype is cutlass.Float32 else 2,
             stream=stream,
         )
 
@@ -303,6 +323,7 @@ class MsaProxyScore:
         q_smem_layout: cute.ComposedLayout,
         k_smem_layout_staged: cute.ComposedLayout,
     ):
+        """Producer warp streams paged K; consumer warpgroups score and reduce."""
         tidx, _, _ = cute.arch.thread_idx()
         bx, by, bz = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -357,6 +378,12 @@ class MsaProxyScore:
 
         nb = (sk + (self.page - 1)) // self.page
 
+        # rows of this tile that actually have a query behind them
+        nvr = sqb - m0
+        if nvr > self.blk_m:
+            nvr = cutlass.Int32(self.blk_m)
+        if nvr < 0:
+            nvr = cutlass.Int32(0)
         qmax = m0 + self.blk_m - 1
         if qmax > sqb - 1:
             qmax = sqb - 1
@@ -604,6 +631,7 @@ class MsaProxyScore:
                         self.page,
                         total_q,
                         False,
+                        nvr=nvr,
                     )
                     t1 = t0 + nkchunk
                     k1 = t1 * self.page
@@ -632,6 +660,7 @@ class MsaProxyScore:
                         self.page,
                         total_q,
                         False,
+                        nvr=nvr,
                     )
 
                 for j in cutlass.range(npair_safe, npair, unroll=1):
@@ -662,6 +691,7 @@ class MsaProxyScore:
                         sk - k0 - 1,
                         self.page,
                         total_q,
+                        nvr=nvr,
                     )
                     t1 = t0 + nkchunk
                     k1 = t1 * self.page
@@ -689,6 +719,7 @@ class MsaProxyScore:
                         sk - k1 - 1,
                         self.page,
                         total_q,
+                        nvr=nvr,
                     )
 
                 tt = byy + 2 * npair * nkchunk
@@ -718,6 +749,7 @@ class MsaProxyScore:
                         sk - kt - 1,
                         self.page,
                         total_q,
+                        nvr=nvr,
                     )
                     tt2 = tt + nkchunk
                     kt2 = tt2 * self.page
@@ -742,6 +774,7 @@ class MsaProxyScore:
                         sk - kt2 - 1,
                         self.page,
                         total_q,
+                        nvr=nvr,
                     )
                 else:
                     cute.nvgpu.warpgroup.wait_group(0)
@@ -765,12 +798,13 @@ class MsaProxyScore:
                         sk - kt - 1,
                         self.page,
                         total_q,
+                        nvr=nvr,
                     )
 
             # ---- -inf tail (blocks past the sequence / fully masked) ----
             for it in cutlass.range(n_dead, unroll=1):
                 t = t_lim + byy + it * nkchunk
-                if tidx < self.blk_m:
+                if tidx < nvr:
                     gO = cute.make_tensor(
                         mO.iterator + (o_row_base + t * total_q),
                         cute.make_layout(self.blk_m),
@@ -778,8 +812,14 @@ class MsaProxyScore:
                     gO[tidx] = -cutlass.Float32.inf
 
 
-def select_split_k(total_q, hq, batch_size, nkt):
-    n_mtiles = (total_q // batch_size + 127) // 128
+def select_split_k(n_mtiles, hq, batch_size, nkt):
+    """Pick the split-K fan-in from the grid this call would otherwise launch.
+
+    ``n_mtiles`` is the caller's actual query-tile count. Deriving it here from
+    total_q // batch_size priced a ragged batch off the mean: with lengths
+    [128, 128, 128, 4096] the mean picks a fan-in for a one-tile grid while the
+    real grid has 32, which over-splits work that was already wide enough.
+    """
     base_ctas = n_mtiles * hq * batch_size
     best_cost = 0x7FFFFFFF
     best_nk = 1
@@ -841,6 +881,7 @@ _KF_STREAMS: dict = {}
 
 
 def _kf_stream():
+    """CUstream for the current torch stream, cached per handle."""
     h = torch.cuda.current_stream().cuda_stream
     s = _KF_STREAMS.get(h)
     if s is None:
@@ -852,7 +893,18 @@ def _kf_stream():
 _CACHE: dict = {}
 
 
-def run(q, k, cu_seqlens_q, page_table, seqused_k, prefix_lens, max_score):
+def run(
+    q,
+    k,
+    cu_seqlens_q,
+    page_table,
+    seqused_k,
+    prefix_lens,
+    max_score,
+    max_seqlen_q=None,
+    use_fp32_acc=True,
+):
+    """Compute MSA proxy scores for a prefill batch. Writes ``ma``."""
     total_q, hq, _ = q.shape
     batch_size = seqused_k.shape[0]
     # The caller's score buffer is (hq, max_k_tiles, total_q) where max_k_tiles
@@ -868,15 +920,24 @@ def run(q, k, cu_seqlens_q, page_table, seqused_k, prefix_lens, max_score):
             f"expects {nkt}"
         )
     page_table = page_table[:, :nkt]
-    nkchunk = select_split_k(total_q, hq, batch_size, nkt)
-    n_mtiles = (total_q // batch_size + 127) // 128
+    # The M-tile count and the TMA-Q choice must cover the LONGEST request, not
+    # the mean: total_q // batch_size understates a ragged batch, which would
+    # leave the tail of the longest sequence unprocessed. The split-K fan-in is
+    # priced off the same count, so it is computed before the choice is made.
+    sq_max = int(max_seqlen_q) if max_seqlen_q is not None else total_q // batch_size
+    n_mtiles = (sq_max + 127) // 128
+    nkchunk = select_split_k(n_mtiles, hq, batch_size, nkt)
     # Derived inside the kernel object while shapes were static; with dynamic
     # shapes these are the only compile-time selections left, so the driver
     # computes them and they alone key the cache.
-    use_tma_q = (total_q // batch_size) % 128 == 0
+    # total_q % batch_size == 0 does not mean the lengths are uniform: a
+    # ragged batch can divide evenly and still have no sequence of sq_max.
+    # The TMA-Q path indexes a (128, d, qblocks, hq) view that assumes every
+    # sequence contributes sq_max rows, so require that exactly.
+    use_tma_q = sq_max % 128 == 0 and batch_size * sq_max == total_q
     fold = 1 if n_mtiles * 16 >= nkt else 0
 
-    key = (hq, k.shape[2], k.shape[3], use_tma_q, fold)
+    key = (hq, k.shape[2], k.shape[3], use_tma_q, fold, use_fp32_acc)
     op = _CACHE.get(key)
     if op is None:
         kern = MsaProxyScore(
@@ -886,6 +947,7 @@ def run(q, k, cu_seqlens_q, page_table, seqused_k, prefix_lens, max_score):
             head_dim=k.shape[3],
             hq=hq,
             use_tma_q=use_tma_q,
+            use_fp32_acc=use_fp32_acc,
             fold=fold,
         )
         args = (

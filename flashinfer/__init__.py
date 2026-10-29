@@ -37,9 +37,11 @@ from .gated_act_mxfp8 import (
 from .attention import BatchAttention as BatchAttention
 from .attention import (
     BatchAttentionWithAttentionSinkWrapper as BatchAttentionWithAttentionSinkWrapper,
+    BatchDecodeWithAttentionSinkWrapper as BatchDecodeWithAttentionSinkWrapper,
     BatchPrefillWithCausalBidirectionalRangesWrapper as BatchPrefillWithCausalBidirectionalRangesWrapper,
 )
 from .autotune_cache import MeasurementPolicy as MeasurementPolicy
+from .autotune_cache import ReplayCoverage as ReplayCoverage
 from .autotune_cache import autotune_v2 as autotune_v2
 from .autotune_cache import autotune_v2_reload as autotune_v2_reload
 from .autotuner import autotune as autotune
@@ -124,6 +126,7 @@ from .quantization.fp8_quantization import (
     mxfp8_dequantize_host,
     mxfp8_grouped_quantize,
     mxfp8_quantize,
+    silu_and_mul_mxfp8_experts_quantize,
 )
 from .attn_scores import min_block_table_width as min_block_table_width
 from .attn_scores import padded_seq_len as padded_seq_len
@@ -151,12 +154,16 @@ from .fused_moe import (
 _PRIMS_TS_LAZY_EXPORTS = frozenset(
     {
         "prims_ts_bf16_moe",
+        "prims_ts_bf16_moe_partitioned",
         "prims_ts_bf16_routed_moe",
         "prims_ts_fp4_block_scale_moe",
+        "prims_ts_fp4_block_scale_moe_partitioned",
         "prims_ts_fp4_block_scale_routed_moe",
         "prims_ts_fp8_block_scale_moe",
+        "prims_ts_fp8_block_scale_moe_partitioned",
         "prims_ts_fp8_block_scale_routed_moe",
         "prims_ts_fp8_per_tensor_scale_moe",
+        "prims_ts_fp8_per_tensor_scale_moe_partitioned",
     }
 )
 
@@ -189,6 +196,12 @@ with contextlib.suppress(ImportError):
         CuteDslBf16MoEWrapper as CuteDslBf16MoEWrapper,
     )
     from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
+    from .gdn_paged import (
+        chunk_gated_delta_rule_paged as chunk_gated_delta_rule_paged,
+        gated_delta_rule_decode_paged as gated_delta_rule_decode_paged,
+        gdn_paged_decode_slots as gdn_paged_decode_slots,
+        gdn_paged_prefill_slots as gdn_paged_prefill_slots,
+    )
 from .gdn2_prefill import chunk_gated_delta_rule2 as chunk_gated_delta_rule2
 from .gdp_prefill import chunk_gated_delta_product as chunk_gated_delta_product
 
@@ -267,6 +280,21 @@ from .cake_rmsnorm_train import (
 from .cake_rmsnorm_train import (
     cake_rmsnorm_train_forward as cake_rmsnorm_train_forward,
 )
+from .cake_rmsnorm_silu_gate_train import (
+    CakeRMSNormSiLUGateFunction as CakeRMSNormSiLUGateFunction,
+)
+from .cake_rmsnorm_silu_gate_train import (
+    cake_rmsnorm_silu_gate as cake_rmsnorm_silu_gate,
+)
+from .cake_rmsnorm_silu_gate_train import (
+    cake_rmsnorm_silu_gate_train_backward as cake_rmsnorm_silu_gate_train_backward,
+)
+from .cake_rmsnorm_silu_gate_train import (
+    cake_rmsnorm_silu_gate_train_backward_workspace_bytes as cake_rmsnorm_silu_gate_train_backward_workspace_bytes,
+)
+from .cake_rmsnorm_silu_gate_train import (
+    cake_rmsnorm_silu_gate_train_forward as cake_rmsnorm_silu_gate_train_forward,
+)
 from .cake_causal_conv1d_train import (
     CakeCausalConv1dFunction as CakeCausalConv1dFunction,
 )
@@ -280,7 +308,11 @@ from .cake_causal_conv1d_train import (
 from .cake_causal_conv1d_train import (
     cake_causal_conv1d_train_forward as cake_causal_conv1d_train_forward,
 )
+from .cake_causal_conv1d_train import (
+    cake_causal_conv1d_train_forward_workspace_bytes as cake_causal_conv1d_train_forward_workspace_bytes,
+)
 from .cake_mhc_train import CakeMHCTrainFinishFunction as CakeMHCTrainFinishFunction
+from .cake_mhc_train import CakeMHCTrainHeadFunction as CakeMHCTrainHeadFunction
 from .cake_mhc_train import CakeMHCTrainPrepareFunction as CakeMHCTrainPrepareFunction
 from .cake_mhc_train import (
     cake_mhc_train_backward_finish as cake_mhc_train_backward_finish,
@@ -303,6 +335,13 @@ from .cake_mhc_train import (
 )
 from .cake_mhc_train import (
     cake_mhc_train_forward_workspace_bytes as cake_mhc_train_forward_workspace_bytes,
+)
+from .cake_mhc_train import cake_mhc_train_head as cake_mhc_train_head
+from .cake_mhc_train import (
+    cake_mhc_train_head_backward as cake_mhc_train_head_backward,
+)
+from .cake_mhc_train import (
+    cake_mhc_train_head_forward as cake_mhc_train_head_forward,
 )
 from .cake_mhc_train import cake_mhc_train_prepare as cake_mhc_train_prepare
 from .cake_gdp import (
@@ -373,6 +412,8 @@ from .prefill import (
 )
 from .quantization import packbits as packbits
 from .quantization import segment_packbits as segment_packbits
+from .qsa import qsa_forward as qsa_forward
+from .qsa import qsa_indexed_forward as qsa_indexed_forward
 from .rope import apply_llama31_rope as apply_llama31_rope
 from .rope import apply_llama31_rope_inplace as apply_llama31_rope_inplace
 from .rope import apply_llama31_rope_pos_ids as apply_llama31_rope_pos_ids

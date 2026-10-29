@@ -41,7 +41,7 @@ PagedKVScaleFactors = tuple[torch.Tensor, torch.Tensor]
 if TYPE_CHECKING:
     from .kernels.fmha_decode.fmha_decode_config import FmhaDecodeConfig
 
-_SUPPORTED_HEAD_DIMS = (64, 128, 256)
+_SUPPORTED_HEAD_DIMS = (64, 128, 192, 256)
 _SUPPORTED_PAGE_SIZES = (4, 8, 16, 32, 64, 128)
 _MAX_INT32 = 2**31 - 1
 # Decode K/V masks form an exclusive tile endpoint as
@@ -113,6 +113,8 @@ class _DirectQ1CompileSpec(NamedTuple):
     block_topk: int
     kv_block_size: int
     page_capacity: int
+    count_current_block_in_topk: bool = True
+    fixed_query_len: int = 0
 
 
 @dataclass(frozen=True)
@@ -1632,6 +1634,8 @@ def _get_compiled_decode(
                 page_size=storage_page_size,
                 page_capacity=direct_q1_spec.page_capacity,
                 sparse_block_size=direct_q1_spec.kv_block_size,
+                count_current_block_in_topk=direct_q1_spec.count_current_block_in_topk,
+                fixed_query_len=direct_q1_spec.fixed_query_len,
                 fragment_size=static_cfg.num_tokens_per_page,
                 lengths=True,
             )
@@ -1643,6 +1647,8 @@ def _get_compiled_decode(
                 page_size=storage_page_size,
                 page_capacity=direct_q1_spec.page_capacity,
                 sparse_block_size=direct_q1_spec.kv_block_size,
+                count_current_block_in_topk=direct_q1_spec.count_current_block_in_topk,
+                fixed_query_len=direct_q1_spec.fixed_query_len,
                 fragment_size=static_cfg.num_tokens_per_page,
                 lengths=False,
             )
@@ -1738,6 +1744,8 @@ def _get_compiled_decode(
                     page_size=storage_page_size,
                     page_capacity=direct_q1_spec.page_capacity,
                     sparse_block_size=direct_q1_spec.kv_block_size,
+                    count_current_block_in_topk=direct_q1_spec.count_current_block_in_topk,
+                    fixed_query_len=direct_q1_spec.fixed_query_len,
                     fragment_size=static_cfg.num_tokens_per_page,
                     lengths=True,
                 )
@@ -1895,10 +1903,14 @@ def _get_compiled_decode(
                 stride=(cute.sym_int64(), 1),
                 assumed_align=4,
             ),
-            fake_compact(Int32, (rows,), 4),
+            (
+                None
+                if direct_q1_spec.fixed_query_len
+                else fake_compact(Int32, (rows,), 4)
+            ),
             fake_compact(
                 Int64 if direct_q1_spec.position_dtype_key == "int64" else Int32,
-                (rows,),
+                (cute.sym_int(),) if direct_q1_spec.fixed_query_len else (rows,),
                 4,
             ),
         )
@@ -2296,11 +2308,11 @@ def _normalize_plan_seq_lens(
                 "plan seq_lens must contain integers; "
                 f"request {request_idx} has {value!r}"
             )
-        seq_len = int(value)
-        if seq_len <= 0 or seq_len > max_kv_len:
+        seq_len = max(int(value), 0)
+        if seq_len > max_kv_len:
             raise ValueError(
                 "plan seq_lens values must be within "
-                f"[1, {max_kv_len}]; request {request_idx} has {seq_len}"
+                f"[0, {max_kv_len}]; request {request_idx} has {seq_len}"
             )
         normalized.append(seq_len)
     return tuple(normalized)
@@ -2378,7 +2390,9 @@ def _validate_decode_run_metadata_values(
         runtime_seq_lens = tuple(int(value) for value in seq_lens.tolist())
     table_capacity = int(block_tables.shape[1])
     for request_idx, seq_len in enumerate(runtime_seq_lens):
-        if seq_len <= 0 or seq_len > max_kv_len:
+        if seq_len <= 0:
+            continue
+        if seq_len > max_kv_len:
             raise ValueError(
                 f"seq_lens values must be within [1, {max_kv_len}]; "
                 f"request {request_idx} has {seq_len}"
@@ -2398,6 +2412,8 @@ def _validate_decode_run_metadata_values(
     for request_idx, (row, seq_len) in enumerate(
         zip(block_table_rows, runtime_seq_lens, strict=True)
     ):
+        if seq_len <= 0:
+            continue
         required_pages = (seq_len + page_size - 1) // page_size
         if any(
             int(page_id) < 0 or int(page_id) >= locator_capacity
@@ -2430,6 +2446,8 @@ def _validate_decode_run_metadata_values(
         for request_idx, (q_len, kv_len) in enumerate(
             zip(q_lengths, runtime_seq_lens, strict=True)
         ):
+            if kv_len <= 0:
+                continue
             if q_len > kv_len:
                 raise ValueError(
                     "causal decode requires every per-request Q length to be "
@@ -2493,7 +2511,7 @@ class PrimsTSBatchDecodePlan:
     _workspace: _DecodeWorkspaceViews
     _compiled_main: Callable[..., object]
     _compiled_reducer: Optional[Callable[..., object]]
-    _direct_q1_inputs: tuple[torch.Tensor, ...] = ()
+    _direct_q1_inputs: tuple[Optional[torch.Tensor], ...] = ()
     _flat_locator_heads: int = 1
 
     def run(
@@ -2540,7 +2558,7 @@ class PrimsTSBatchDecodePlan:
         out: torch.Tensor,
         scale_qk: float,
         scale_v: float,
-        direct_q1_inputs: Optional[tuple[torch.Tensor, ...]] = None,
+        direct_q1_inputs: Optional[tuple[Optional[torch.Tensor], ...]] = None,
     ) -> torch.Tensor:
         """Launch state already proven by a framework-owned outer plan."""
 
@@ -2908,7 +2926,7 @@ def _resolve_q_token_kv_block_sparse_decode_config(
         and window_left < 0
     ):
         raise ValueError(
-            "PrimTS QToken-KvBlock-Sparse-Attention requires a supported sparse-fragment size, head_dim in {64,128,256}, "
+            "PrimTS QToken-KvBlock-Sparse-Attention requires a supported sparse-fragment size, head_dim in {64,128,192,256}, "
             "FP16/BF16 Q/K/V with matching output or FP8 Q/K/V with FP16/BF16 output, "
             "and a causal non-windowed mask"
         )
@@ -3365,9 +3383,11 @@ def _prepare_prims_ts_batch_decode_plan(
     use_q_token_kv_block_sparse_route: bool = False,
     use_pdl: bool = False,
     split_kv: bool = True,
-    direct_q1_inputs: tuple[torch.Tensor, ...] = (),
+    direct_q1_inputs: tuple[Optional[torch.Tensor], ...] = (),
     direct_q1_max_model_len: Optional[int] = None,
     direct_q1_sparse_block_size: int = 4,
+    direct_q1_fixed_query_len: int = 0,
+    count_current_block_in_topk: bool = True,
     share_pattern_across_kv_heads: bool = True,
     allow_head_aware_locators: bool = False,
 ) -> tuple[PrimsTSBatchDecodePlan, torch.Tensor]:
@@ -3536,12 +3556,15 @@ def _prepare_prims_ts_batch_decode_plan(
     if direct_q1_inputs:
         assert use_q_token_kv_block_sparse_route and seq_len_q == 1
         assert direct_q1_max_model_len is not None
+        assert direct_q1_inputs[0] is not None and direct_q1_inputs[3] is not None
         direct_q1_spec = _DirectQ1CompileSpec(
             position_dtype_key=str(direct_q1_inputs[3].dtype).removeprefix("torch."),
             max_seq_len_kv=direct_q1_max_model_len,
             block_topk=int(direct_q1_inputs[0].shape[-1]),
             kv_block_size=direct_q1_sparse_block_size,
+            count_current_block_in_topk=count_current_block_in_topk,
             page_capacity=max_num_pages,
+            fixed_query_len=direct_q1_fixed_query_len,
         )
     flat_native_kv_tma = (
         use_q_token_kv_block_sparse_route
@@ -3848,7 +3871,8 @@ class BatchDecodePagedTSWrapper:
             Host-only per-request K/V lengths owned by the resulting plan and
             used for specialization. A tensor must be a one-dimensional CPU
             int32 or int64 tensor. The sequence must contain exactly
-            ``batch_size`` positive values no larger than ``max_kv_len``.
+            ``batch_size`` values no larger than ``max_kv_len``; nonpositive values
+            mark inactive requests.
         workspace_buffer : torch.Tensor, optional
             Caller-owned contiguous int8 or uint8 scratch on ``device``. It
             must be 32-byte aligned and large enough for the selected plan.
@@ -3901,7 +3925,12 @@ class BatchDecodePagedTSWrapper:
             _validate_mask(mask_type)
             window_left = _validate_window_left(window_left, mask_type)
 
-            _validate_dtype_pair(q_data_type, k_data_type, v_data_type, o_data_type)
+            _validate_dtype_pair(
+                q_data_type,
+                k_data_type,
+                v_data_type,
+                o_data_type,
+            )
 
             specialization_seq_lens = _normalize_plan_seq_lens(
                 seq_lens,
@@ -3914,7 +3943,7 @@ class BatchDecodePagedTSWrapper:
                 and not packed_query
             ):
                 for request_idx, kv_len in enumerate(specialization_seq_lens):
-                    if seq_len_q > kv_len:
+                    if kv_len > 0 and seq_len_q > kv_len:
                         raise ValueError(
                             "causal decode requires every per-request Q length to be "
                             "no greater than its K/V length; request "
@@ -4095,6 +4124,13 @@ class BatchDecodePagedTSWrapper:
         When :meth:`plan` received sequence lengths, ``seq_lens`` must be
         ``None`` and the plan's owned CUDA copy is used. Otherwise, ``seq_lens``
         must be supplied on every run. This ownership check is unconditional.
+
+        Nonpositive per-run K/V lengths mark inactive requests in every
+        profile. Their page-table rows and data are not read; caller-owned
+        output is left untouched (newly allocated inactive output is unspecified).
+        Producers and reducers retain scheduler/PDL progress. Plan-owned lengths
+        may also mark inactive requests but remain immutable; use per-run lengths
+        for empty/live graph transitions.
 
         ``validate=True`` performs structural and value validation. It
         reads per-run metadata values back to the host.
@@ -4361,7 +4397,8 @@ def batch_decode_with_paged_kv_cache(
     ``max_seq_len_q`` (or its non-default ``seq_len_q`` alias).
     Warm this exact topology outside capture first. Retain stable tensor storage
     and mutate metadata only between completed launches/replays. All live K/V
-    lengths must be positive and within the static bound, active page IDs must
+    positive lengths must be within the static bound; nonpositive lengths mark
+    inactive requests. Active page IDs must
     index the cache, and causal per-request Q lengths must not exceed K/V lengths.
     Packed offsets must start at zero, end at the query token count, and have
     strictly positive deltas within the Q bound. Scratch/output must not alias

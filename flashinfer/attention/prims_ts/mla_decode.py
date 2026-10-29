@@ -27,6 +27,11 @@ from ._hardware import get_max_active_clusters
 
 import torch
 
+from .kernels.mla_decode.helpers.nvfp4_kv import (
+    cache_record_size,
+    validate_nvfp4_kv_formats,
+)
+
 from flashinfer.api_logging import flashinfer_experimental_api
 from flashinfer.trace.templates.attention import (
     prims_ts_decode_mla_one_shot_trace_dispatch,
@@ -50,7 +55,10 @@ from .decode import (
 )
 
 
-from .kernels.mla_decode.sparse_policy import select_sparse_mla_profile
+from .kernels.mla_decode.sparse_policy import (
+    prefer_sparse_d576_reload,
+    select_sparse_mla_profile,
+)
 
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 2"
 _MLA_LATENT_DIM = 512
@@ -134,6 +142,30 @@ class _MLADecodePlanState:
     compiled: Callable[..., object]
     policy: tuple[tuple[str, object], ...]
     split_kv: int
+    softmax_rescale_threshold_log2: float = 0.0
+
+
+@dataclass(frozen=True)
+class MLAAttentionTuning:
+    """Compile-time tuning of one PrimTS MLA attention plan.
+
+    It applies to every query length the MLA wrappers serve, context
+    (multi-token Q) as well as generation. ``softmax_rescale_threshold_log2``
+    is in binades. ``None`` keeps the entry point's default: exact rescale for
+    dense, and each schedule's existing deferral for sparse. An explicit
+    value, including ``0.0``, is compiled into the kernel; see
+    :meth:`BatchMLADecodePagedTSWrapper.plan`.
+    """
+
+    softmax_rescale_threshold_log2: Optional[float] = None
+
+
+def _tuning_rescale_threshold(tuning: object) -> Optional[float]:
+    if tuning is None:
+        return None
+    if not isinstance(tuning, MLAAttentionTuning):
+        raise TypeError("tuning must be an MLAAttentionTuning or None")
+    return tuning.softmax_rescale_threshold_log2
 
 
 @dataclass(frozen=True)
@@ -467,8 +499,6 @@ def _validate_mla_run_metadata(
         q_lengths = (max_seq_len_q,) * batch_size
 
     seq_lens_host = tuple(int(value) for value in seq_lens.tolist())
-    if any(seq_len <= 0 for seq_len in seq_lens_host):
-        raise ValueError("every runtime request must contain at least one KV token")
     runtime_max_kv_len = max(seq_lens_host)
     if runtime_max_kv_len > max_kv_len:
         raise ValueError(
@@ -479,7 +509,7 @@ def _validate_mla_run_metadata(
     for request_idx, (row, seq_len) in enumerate(
         zip(block_table_rows, seq_lens_host, strict=True)
     ):
-        required_pages = _ceil_div(seq_len, page_size)
+        required_pages = _ceil_div(max(seq_len, 0), page_size)
         if any(
             int(page_id) < 0 or int(page_id) >= runtime.num_physical_pages
             for page_id in row[:required_pages]
@@ -493,7 +523,7 @@ def _validate_mla_run_metadata(
         for request_idx, (q_len, kv_len) in enumerate(
             zip(q_lengths, seq_lens_host, strict=True)
         ):
-            if q_len > kv_len:
+            if kv_len > 0 and q_len > kv_len:
                 raise ValueError(
                     "causal MLA decode requires every per-request Q length "
                     "to be no greater than its K/V length; request "
@@ -692,6 +722,28 @@ def _validate_out(
     _validate_16byte_alignment(out, "out")
 
 
+def _check_softmax_rescale_threshold_log2_range(
+    threshold: object, *, q_dtype: torch.dtype
+) -> float:
+    """Return the threshold as float32-rounded ``float``; raise if out of range.
+
+    Values outside ``[0, bound]`` (E4M3: 8, BF16: 32) raise instead of being
+    clamped, as trtllm-gen's ``checkSkipCorrThreshold`` does.
+    """
+
+    from .kernels.mla_decode.helpers.math import (
+        canonicalize_softmax_rescale_threshold_log2,
+    )
+
+    if threshold == 0.0 and type(threshold) in (int, float):
+        # Zero selects the default kernel for every dtype, including ones
+        # without a threshold bound.
+        return 0.0
+    return canonicalize_softmax_rescale_threshold_log2(
+        threshold, qkv_dtype=_kernel_dtype_name(_dtype_key(q_dtype))
+    )
+
+
 def _kernel_dtype_name(dtype_key: str) -> str:
     names = {
         "bfloat16": "bf16",
@@ -741,6 +793,7 @@ def _resolve_mla_decode_launch_spec(
     output_dtype_key: str,
     mask_type: str,
     seq_len_q: int = 1,
+    softmax_rescale_threshold_log2: float = 0.0,
 ):
     """Resolve and cache MLA policy/workspace without compiling."""
 
@@ -871,6 +924,7 @@ def _resolve_mla_decode_launch_spec(
                 explicit_split_kv=None,
                 explicit_persistent=None,
                 mask_type=mask_type,
+                softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
             )
             final_cfg = kernel._make_config()
             split_kv = int(final_cfg.num_ctas_per_seq_kv)
@@ -953,6 +1007,7 @@ def _resolve_mla_decode_launch_spec(
                 seq_len_q=seq_len_q,
                 batch_size=batch_size,
                 mask_type=mask_type,
+                softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
             )
             workspace_size = compute_2cta_workspace_size(
                 tile_size_q=int(launch_shape.tile_size_q),
@@ -1068,6 +1123,8 @@ def _get_compiled_mla_decode(
     max_seq_len_q = compile_spec.max_seq_len_q
     packed_query = compile_spec.packed_query
     kernel = compile_spec.kernel
+    sparse = getattr(kernel, "direct_sparse", False)
+    nvfp4_kv = getattr(kernel, "has_nvfp4_kv", False)
     dtype_map = {
         "bfloat16": cutlass.BFloat16,
         "float8_e4m3fn": cutlass.Float8E4M3FN,
@@ -1105,22 +1162,35 @@ def _get_compiled_mla_decode(
     q_rope_fake = cute.runtime.make_fake_tensor(
         qkv_dtype, q_rope_shape, stride=q_stride, assumed_align=16
     )
-    cache_token_stride = query_dim
-    cache_page_stride = page_size * query_dim
+    cache_dim = (
+        cache_record_size(kernel.kv_cache_format, qk_rope_head_dim)
+        if nvfp4_kv
+        else query_dim
+    )
+    extra_cache_dim = (
+        cache_record_size(kernel.extra_kv_cache_format, qk_rope_head_dim)
+        if nvfp4_kv
+        else query_dim
+    )
+    cache_dtype = cutlass.Uint8 if nvfp4_kv else qkv_dtype
+    cache_token_stride = cache_dim
+    cache_page_stride = page_size * cache_dim
     c_latent_fake = cute.runtime.make_fake_tensor(
-        qkv_dtype,
-        (page_size, kv_lora_rank, physical_pages),
+        cache_dtype,
+        (page_size, cache_dim if nvfp4_kv else kv_lora_rank, physical_pages),
         stride=(cache_token_stride, 1, cache_page_stride),
         assumed_align=16,
     )
     c_rope_fake = cute.runtime.make_fake_tensor(
-        qkv_dtype,
+        cache_dtype,
         (
             page_size,
-            rope_view_dim,
+            extra_cache_dim if sparse else rope_view_dim,
             cute.sym_int() if page_size == 1 else physical_pages,
         ),
-        stride=(cache_token_stride, 1, cache_page_stride),
+        stride=(extra_cache_dim, 1, page_size * extra_cache_dim)
+        if sparse
+        else (cache_token_stride, 1, cache_page_stride),
         assumed_align=16,
     )
     runtime_page_columns = cute.sym_int()
@@ -1188,9 +1258,6 @@ def _get_compiled_mla_decode(
                 assumed_align=4,
             )
 
-        scalar = cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32, (1,), stride_order=(0,), assumed_align=4
-        )
         sink = cute.runtime.make_fake_compact_tensor(
             cutlass.Float32, (num_heads,), stride_order=(0,), assumed_align=4
         )
@@ -1199,9 +1266,8 @@ def _get_compiled_mla_decode(
             sparse_indices(kernel.direct_sparse_capacities[1]),
             cache_seqs_fake,
             cache_seqs_fake,
-            scalar,
-            scalar,
             sink,
+            cutlass.Float32(1.0),
         )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
@@ -1210,26 +1276,30 @@ def _get_compiled_mla_decode(
     # Task objects carry loop-local state through generated control flow, so
     # select the public staged frontend for this compilation.
     def compile_kernel():
-        return cute.compile[cute.FrontendNext](
-            kernel,
-            q_latent_fake,
-            q_rope_fake,
-            c_latent_fake,
-            c_rope_fake,
-            page_offsets_fake,
-            out_fake,
-            lse_fake,
-            workspace_fake,
-            cutlass.Int32(compile_spec.split_kv),
-            cache_seqs_fake,
-            qo_indptr_fake,
-            sparse_inputs_fake,
-            cutlass.Float32(1.0),
-            cutlass.Float32(1.0),
-            stream_fake,
-            output_quant_args=output_quant_args,
-            options=_COMPILE_OPTIONS,
-        )
+        """Compile MLA with opt-in task-builder advisory diagnostics."""
+        from .kernels.mla_decode.helpers.diagnostics import mla_build_diagnostics
+
+        with mla_build_diagnostics():
+            return cute.compile[cute.FrontendNext](
+                kernel,
+                q_latent_fake,
+                q_rope_fake,
+                c_latent_fake,
+                c_rope_fake,
+                page_offsets_fake,
+                out_fake,
+                lse_fake,
+                workspace_fake,
+                cutlass.Int32(compile_spec.split_kv),
+                cache_seqs_fake,
+                qo_indptr_fake,
+                sparse_inputs_fake,
+                cutlass.Float32(1.0),
+                cutlass.Float32(1.0),
+                stream_fake,
+                output_quant_args=output_quant_args,
+                options=_COMPILE_OPTIONS,
+            )
 
     with torch.cuda.device(device_index):
         compiled = build_and_load_attention_kernel(
@@ -1309,6 +1379,9 @@ def get_prims_ts_batch_mla_decode_workspace_size(
         _dtype_key(out_dtype),
         mask_type,
         max_seq_len_q,
+        # The skip-correction threshold does not change the workspace; pass the default
+        # positionally so a default plan() hits the same cached spec.
+        0.0,
     )
     return _make_mla_workspace_layout(
         spec.kernel_workspace_bytes, batch_size, num_heads, max_seq_len_q
@@ -1436,14 +1509,19 @@ def _launch_mla_decode(
         q_rope = runtime.query[..., kv_lora_rank:].permute(2, 3, 1, 0)
         out_kernel = runtime.out.permute(2, 3, 1, 0)
         lse_kernel = workspace.lse.permute(2, 1, 0)
-    c_latent = runtime.normalized_cache[..., :kv_lora_rank].permute(1, 2, 0)
+    c_latent = (
+        runtime.normalized_cache
+        if runtime.normalized_cache.dtype == torch.uint8
+        else runtime.normalized_cache[..., :kv_lora_rank]
+    ).permute(1, 2, 0)
     c_rope = runtime.normalized_cache[..., kv_lora_rank:].permute(1, 2, 0)
     if runtime.query.shape[-1] == kv_lora_rank:
         q_rope = q_latent
         c_rope = c_latent
-        if runtime.extra_cache is not None:
-            c_rope = runtime.extra_cache.permute(1, 2, 0)
+    if runtime.extra_cache is not None:
+        c_rope = runtime.extra_cache.permute(1, 2, 0)
     page_offsets = block_tables.transpose(0, 1)
+    # Persisted FFI callables require positional arguments, including None.
     compiled(
         q_latent,
         q_rope,
@@ -1459,17 +1537,18 @@ def _launch_mla_decode(
         runtime.sparse_inputs,
         runtime.bmm1_scale,
         runtime.bmm2_scale,
-        **(
-            {"output_quant_args": runtime.output_quant_args}
-            if runtime.output_quant_args is not None
-            else {}
-        ),
+        runtime.output_quant_args,
     )
     return runtime.out
 
 
 class BatchMLADecodePagedTSWrapper:
-    """Compile and reuse task-scheduled paged MLA decode launches."""
+    """Compile and reuse task-scheduled paged MLA decode launches.
+
+    Prepare Q in the planned dtype and apply query RoPE upstream. For serving,
+    validate input invariants during setup and use ``run(validate=False)``:
+    the default runtime value checks synchronize CUDA metadata to the host.
+    """
 
     @flashinfer_experimental_api
     def __init__(self) -> None:
@@ -1495,6 +1574,7 @@ class BatchMLADecodePagedTSWrapper:
         mask_type: Literal["dense", "causal"] = "causal",
         workspace_buffer: Optional[torch.Tensor] = None,
         validate: bool = True,
+        tuning: Optional[MLAAttentionTuning] = None,
     ) -> None:
         """Compile one static MLA shape and bind its reusable workspace.
 
@@ -1510,6 +1590,13 @@ class BatchMLADecodePagedTSWrapper:
         every run. ``max_seq_len_q`` is then the per-request capacity.
         Individual packed requests may be empty; an all-empty run returns its
         empty output without dispatching a GPU kernel.
+
+        The request count B remains fixed in both modes. Fixed mode also fixes
+        the total query rows B*SQ; packed mode accepts changing per-request
+        lengths within the planned capacity. Sparse independent rows can use
+        the capacity-plan recipe on :class:`BatchSparseMLADecodePagedTSWrapper`.
+        Q quantization and RoPE are caller-owned preparation; the kernel uses
+        Q in ``q_data_type`` directly.
 
         If ``workspace_buffer`` is omitted, the plan allocates private scratch.
         A workspace is mutable and exclusive to one in-flight launch or graph
@@ -1540,6 +1627,30 @@ class BatchMLADecodePagedTSWrapper:
         validate : bool
             Validate static geometry and caller scratch. Defaults to ``True``.
             Disable only for previously validated inputs and warmed topology.
+        tuning : MLAAttentionTuning, optional
+            Compile-time tuning; ``None`` keeps every default.
+            ``tuning.softmax_rescale_threshold_log2`` is the opt-in skip of
+            the online-softmax O rescale (correction), in binades: 0 to 8 for
+            FP8 QKV, 0 to 32 for BF16 QKV. The name and the FP8 P scale
+            follow the Prims-TS FMHA decode option of the same name; the
+            bounds follow the trtllm-gen FMHA ``skipCorrThreshold``.
+            ``None`` or ``0.0`` rescales on every new row maximum. A positive
+            value T keeps a row's softmax anchor while a K tile raises the row
+            maximum by at most T binades, which skips that tile's rescale of
+            the accumulated output. Probabilities then reach ``2**T``, so FP8
+            P is quantized at ``448 * 2**-T`` instead of 448 (1.75 at T = 8,
+            the trtllm-gen scale). E4M3 P then loses precision from about
+            ``10.3 - 0.69 * T`` nats below the anchor and flushes to zero
+            below about ``13 - 0.69 * T`` nats (4.7 and 7.5 at T = 8); the
+            FP32 row sum keeps the exact values, so the tail's weight is
+            biased low. The loss covers the KV range
+            that shares the anchor's split, which is the whole row when
+            split-KV is not used (typically large batches). Rows whose largest
+            scores come first, such as attention sinks, with a long
+            low-probability tail are the most exposed, so check model accuracy
+            when enabling it for FP8. BF16 P is not scaled. The value is
+            compiled into the kernel, so each distinct value builds its own
+            kernel. It is range-checked even when ``validate`` is False.
         """
 
         if not isinstance(validate, bool):
@@ -1561,6 +1672,13 @@ class BatchMLADecodePagedTSWrapper:
                 max_seq_len_q=max_seq_len_q,
             )
             _validate_mla_dtype_pair(q_data_type, kv_data_type, o_data_type)
+        # Range-check the threshold even when validate is False: it selects a
+        # compiled kernel, and past the per-dtype bound FP8 P (scaled by
+        # 448 * 2**-T) would lose most of the row to E4M3 subnormals.
+        threshold = _tuning_rescale_threshold(tuning)
+        softmax_rescale_threshold_log2 = _check_softmax_rescale_threshold_log2_range(
+            0.0 if threshold is None else threshold, q_dtype=q_data_type
+        )
 
         device, device_index = _resolve_cuda_device(device)
         if validate:
@@ -1582,7 +1700,9 @@ class BatchMLADecodePagedTSWrapper:
             mask_type,
             max_seq_len_q,
         )
-        spec = _resolve_mla_decode_launch_spec(*spec_key)
+        spec = _resolve_mla_decode_launch_spec(
+            *spec_key, softmax_rescale_threshold_log2
+        )
         compile_spec = _make_mla_decode_compile_spec(
             spec,
             device_index=device_index,
@@ -1635,6 +1755,7 @@ class BatchMLADecodePagedTSWrapper:
             compiled=compiled,
             policy=policy,
             split_kv=int(dict(policy)["split_kv"]),
+            softmax_rescale_threshold_log2=softmax_rescale_threshold_log2,
         )
 
     @flashinfer_experimental_api(trace=prims_ts_decode_mla_wrapper_trace_dispatch)
@@ -1761,6 +1882,7 @@ def batch_mla_decode_with_paged_kv_cache(
     out_dtype: torch.dtype = torch.bfloat16,
     workspace_buffer: Optional[torch.Tensor] = None,
     validate: bool = True,
+    tuning: Optional[MLAAttentionTuning] = None,
 ) -> torch.Tensor:
     """One-shot convenience wrapper for fixed or packed-query MLA decode.
 
@@ -1798,13 +1920,18 @@ def batch_mla_decode_with_paged_kv_cache(
         Caller-owned output tensor.
     out_dtype : torch.dtype
         Output dtype.
-
     workspace_buffer : torch.Tensor, optional
         Caller-owned byte scratch, exclusive to one in-flight launch/graph.
     validate : bool
         Validate tensors and metadata values (may synchronize), default True.
         False trusts the caller and requires workspace and explicit bounds;
         skips tensor and metadata validation. Invalid inputs have undefined behavior.
+    tuning : MLAAttentionTuning, optional
+        Compile-time tuning; see :meth:`BatchMLADecodePagedTSWrapper.plan`.
+        ``None`` (default) keeps the exact rescale. A positive
+        ``softmax_rescale_threshold_log2`` T quantizes FP8 P at
+        ``448 * 2**-T`` instead of 448, which costs E4M3 precision for
+        probabilities far below the anchor.
 
     Returns
     -------
@@ -1818,7 +1945,8 @@ def batch_mla_decode_with_paged_kv_cache(
     ``max_seq_len_q``.
     Warm this exact topology outside capture first. Retain stable tensor storage
     and mutate metadata only between completed launches/replays. All live K/V
-    lengths must be positive and within the static bound, active page IDs must
+    positive lengths must be within the static bound; nonpositive lengths mark
+    inactive requests whose output is untouched. Active page IDs must
     index the cache, and causal per-request Q lengths must not exceed K/V lengths.
     Packed offsets must start at zero, end at the query token count, and have
     nonnegative deltas within the Q bound. Scratch/output must not alias
@@ -1927,6 +2055,7 @@ def batch_mla_decode_with_paged_kv_cache(
         mask_type=mask_type,
         workspace_buffer=workspace_buffer,
         validate=validate,
+        tuning=tuning,
     )
     return wrapper.run(
         query,
@@ -2109,6 +2238,9 @@ def _resolve_sparse_mla_plan(
     max_seq_len_q=1,
     packed_query=False,
     q_data_type=torch.bfloat16,
+    qk_rope_head_dim=0,
+    kv_cache_format="native",
+    extra_kv_cache_format=None,
     kv_layout="NHD",
     has_sinks=False,
     return_lse=False,
@@ -2116,6 +2248,8 @@ def _resolve_sparse_mla_plan(
     output_quant_block_size=None,
     out_scale_format="ue8m0",
     num_output_groups=None,
+    tuning=None,
+    kv_lora_rank=512,
 ):
     """Resolve sparse geometry and scratch sizing without allocation/compilation."""
     import cutlass
@@ -2133,6 +2267,8 @@ def _resolve_sparse_mla_plan(
         MlaDecodeTs,
     )
 
+    if isinstance(kv_lora_rank, bool) or kv_lora_rank != 512:
+        raise ValueError("sparse MLA requires kv_lora_rank=512")
     if not isinstance(assume_valid_prefix, bool):
         raise TypeError("assume_valid_prefix must be bool")
     device, _ = _resolve_cuda_device(device)
@@ -2147,6 +2283,10 @@ def _resolve_sparse_mla_plan(
             raise ValueError(f"{name} must be a positive integer")
     if num_heads > 128:
         raise ValueError("num_heads must be at most 128")
+    if isinstance(qk_rope_head_dim, bool) or qk_rope_head_dim not in (0, 64):
+        raise ValueError("qk_rope_head_dim must be 0 or 64")
+    if qk_rope_head_dim and output_quant_block_size is not None:
+        raise ValueError("fused output RoPE requires D512 attention")
     output_quant = _make_sparse_output_quant(
         num_heads, output_quant_block_size, out_scale_format, num_output_groups
     )
@@ -2157,8 +2297,22 @@ def _resolve_sparse_mla_plan(
         raise ValueError("the primary selected-slot capacity must be positive")
     if q_data_type not in (torch.bfloat16, torch.float8_e4m3fn):
         raise ValueError("native BF16 or E4M3 is required")
+    if extra_kv_cache_format is None:
+        extra_kv_cache_format = "nvfp4" if kv_cache_format == "fp8" else kv_cache_format
+    validate_nvfp4_kv_formats(
+        kv_cache_format,
+        extra_kv_cache_format,
+        qk_rope_head_dim,
+        "e4m3" if q_data_type == torch.float8_e4m3fn else "bf16",
+        1,
+    )
     if kv_layout not in ("NHD", "HND"):
         raise ValueError("kv_layout must be NHD or HND")
+    softmax_rescale_threshold_log2 = _tuning_rescale_threshold(tuning)
+    if softmax_rescale_threshold_log2 is not None:
+        softmax_rescale_threshold_log2 = _check_softmax_rescale_threshold_log2_range(
+            softmax_rescale_threshold_log2, q_dtype=q_data_type
+        )
     max_rows = batch_size * max_seq_len_q
     capacity = max(
         256,
@@ -2174,26 +2328,73 @@ def _resolve_sparse_mla_plan(
         capacity=capacity,
         dtype="bf16" if q_data_type == torch.bfloat16 else "fp8",
         sm_count=sm_count,
+        rope_dim=qk_rope_head_dim,
+        kv_cache_format=kv_cache_format,
     )
+    # Reloading V from L2 shortens native FP8 decode's producer lifetime.
+    # Sustained grids amortize the retained-KV/CLC pipeline instead; packed
+    # caches and two-source/sink plans retain their format-specific schedules.
+    # The general path also exploits a hole-free prefix promise; the reload
+    # loader keeps arbitrary-hole masks and does not use that optimization.
+    if (
+        qk_rope_head_dim == 64
+        and kv_cache_format == "native"
+        and q_data_type == torch.float8_e4m3fn
+        and num_heads in _D576_HEADS
+        and not max_extra_topk
+        and not has_sinks
+        and not assume_valid_prefix
+        and prefer_sparse_d576_reload(
+            rows=max_rows,
+            heads=num_heads,
+            query_length=max_seq_len_q,
+            capacity=max_topk,
+            sm_count=sm_count,
+            general_profile=profile,
+        )
+    ):
+        return resolve_sparse_d576_reload_plan(
+            device,
+            max_rows,
+            num_heads,
+            max_topk=max_topk,
+            max_extra_topk=max_extra_topk,
+            q_data_type=q_data_type,
+            has_sinks=has_sinks,
+            assume_valid_prefix=assume_valid_prefix,
+            threshold=softmax_rescale_threshold_log2,
+        )
+    kernel_threshold = 0.0
+    if softmax_rescale_threshold_log2 is not None:
+        # An explicit threshold replaces the schedule's fixed six-binade
+        # deferral; zero restores exact maxima for every schedule.
+        profile = replace(profile, defer_max_update=False)
+        kernel_threshold = softmax_rescale_threshold_log2
     family, tile = profile.family, profile.tile_size_q
     splits, head_dim_ctas = profile.split_kv, profile.head_dim_ctas
     dtype_name = "bf16" if q_data_type == torch.bfloat16 else "e4m3"
     if family == "2cta":
+        active_clusters = sm_count // 2
+        # Keep the physical device limit batch-independent. Quantized
+        # persistent launches balance their grid from live tensor extents.
         kernel = MlaDecodeTs(
             page_size=1,
-            max_active_clusters=sm_count // 2,
+            max_active_clusters=active_clusters,
             is_persistent=profile.scheduler != "nonpersistent",
             is_var_seq=False,
             is_var_split_kv=False,
             static_split_kv=splits,
             qkv_dtype=dtype_name,
             out_dtype="bf16",
-            rope_dim=0,
+            rope_dim=qk_rope_head_dim,
             num_heads=num_heads,
             seq_len_q=1,
             batch_size=max_rows,
             mask_type="dense",
+            softmax_rescale_threshold_log2=kernel_threshold,
         )
+        kernel.kv_cache_format = kv_cache_format
+        kernel.extra_kv_cache_format = extra_kv_cache_format
         kernel.sparse_gather_warps = profile.gather_issue_warps
         kernel.sparse_kv_stages = profile.kv_pipeline_stages
         kernel.sparse_uniform_pages = profile.uniform_offset_cache
@@ -2224,7 +2425,7 @@ def _resolve_sparse_mla_plan(
             num_heads=tile,
             seq_len_q=(num_heads + tile - 1) // tile,
             seq_len_k=capacity,
-            rope_dim=0,
+            rope_dim=qk_rope_head_dim,
             page_size=1,
             max_active_clusters=sm_count,
             qkv_dtype=dtype_name,
@@ -2236,6 +2437,9 @@ def _resolve_sparse_mla_plan(
             tile_size_q=tile,
             sparse_profile=profile,
             mask_type="dense",
+            softmax_rescale_threshold_log2=kernel_threshold,
+            kv_cache_format=kv_cache_format,
+            extra_kv_cache_format=extra_kv_cache_format,
         )
         core_bytes = compute_workspace_size(
             cfg=kernel._make_config(),
@@ -2247,7 +2451,7 @@ def _resolve_sparse_mla_plan(
         device_index=device.index,
         num_heads=num_heads,
         kv_lora_rank=512,
-        qk_rope_head_dim=0,
+        qk_rope_head_dim=qk_rope_head_dim,
         page_size=1,
         q_dtype_key=str(q_data_type).removeprefix("torch."),
         output_dtype_key="float8_e4m3fn" if output_quant is not None else "bfloat16",
@@ -2264,10 +2468,177 @@ def _resolve_sparse_mla_plan(
     return device, profile, spec, sections, byte_end, capacity, output_quant
 
 
+_D576_HEAD_DIM = 576
+
+
+_D576_V_DIM = 512
+
+
+_D576_HEADS = (64, 128)
+
+
+def _sparse_d576_workspace_bytes(max_rows: int, num_heads: int, split_kv: int) -> int:
+    """Split-KV partials of a D576 plan: BF16 O and FP32 LSE per split row."""
+    if split_kv <= 1:
+        return 0
+    return max_rows * num_heads * split_kv * (_D576_V_DIM * 2 + 4)
+
+
+def resolve_sparse_d576_reload_plan(
+    device,
+    max_rows,
+    num_heads,
+    *,
+    max_topk,
+    max_extra_topk,
+    q_data_type,
+    has_sinks,
+    assume_valid_prefix,
+    threshold,
+):
+    """Plan the native D576 reload schedule and its split-KV scratch.
+
+    One CTA per (token, 64 heads) on the 1CTA keeps-MMA-AB q64 schedule; 128
+    heads run as two physical query positions of one token. The kernel is
+    compiled for the top-k capacity rounded up to whole 128-key tiles (it uses
+    the capacity only through its tile count). Below one wave the plan splits
+    each top-k list over ``split_kv`` CTAs (and the 512 V columns over
+    ``head_dim_ctas``); the parallel GMEM reducer, launched with PDL, merges
+    the partials and publishes natural-log LSE. The split is fixed per plan,
+    so a CUDA graph captured from it uses one compiled kernel.
+    """
+    import cutlass
+
+    from ._hardware import get_max_active_clusters
+    from .kernels.mla_decode.sparse_policy import (
+        SparseMlaProfile,
+        select_sparse_mla_d576_split,
+    )
+    from .kernels.mla_decode.throughput_latency_1cta.config import MlaProfile
+    from .kernels.mla_decode.throughput_latency_1cta.kernel import (
+        ThroughputLatencyMlaDecodeTs,
+    )
+
+    if q_data_type != torch.float8_e4m3fn:
+        raise ValueError("D576 sparse MLA (qk_rope_head_dim=64) requires E4M3 Q / KV")
+    if num_heads not in _D576_HEADS:
+        raise ValueError(
+            f"D576 sparse MLA supports 64 or 128 query heads (64-row tiles), got {num_heads}"
+        )
+    if max_extra_topk:
+        raise ValueError("D576 sparse MLA attends to one KV pool (max_extra_topk=0)")
+    if has_sinks:
+        raise ValueError("D576 sparse MLA does not support attention sinks")
+    if max_rows > 65535:
+        # Each query token is one grid-z slice of the attention and reducer
+        # launches; CUDA caps grid z at 65535.
+        raise ValueError(
+            "D576 sparse MLA supports at most 65535 query tokens per plan "
+            f"(batch_size * max_seq_len_q), got {max_rows}"
+        )
+    split_kv, head_dim_ctas = select_sparse_mla_d576_split(
+        max_rows * (num_heads // 64),
+        max_topk,
+        torch.cuda.get_device_properties(device).multi_processor_count,
+    )
+    profile = SparseMlaProfile(
+        family="keep",
+        tile_size_q=64,
+        split_kv=split_kv,
+        head_dim_ctas=head_dim_ctas,
+        uniform_offset_cache=True,
+        kv_pipeline_stages=10,
+    )
+    capacity = -(-max_topk // 128) * 128
+    phys_sq = num_heads // 64
+    kernel_profile = "h64_keeps_mma_ab"
+    if split_kv > 1:
+        hdim = "" if head_dim_ctas == 1 else f"_hdim{_D576_V_DIM // head_dim_ctas}"
+        kernel_profile = MlaProfile(
+            name=f"h64_keeps_mma_ab_splitkv{split_kv}{hdim}_gmem",
+            num_ctas_per_seq_kv=split_kv,
+            num_ctas_per_head_dim=head_dim_ctas,
+            use_persistent_scheduler=0,
+            use_clc_dynamic_persistent_scheduler=0,
+            use_multi_ctas_kv=1,
+            use_cluster_reduction=0,
+            kernel_variant="keeps_mma_ab",
+            tile_size_q=64,
+        )
+    with torch.cuda.device(device):
+        max_active_clusters = get_max_active_clusters(1)
+    kernel = ThroughputLatencyMlaDecodeTs(
+        batch_size=1,
+        num_heads=64,
+        seq_len_q=phys_sq,
+        seq_len_k=capacity,
+        latent_dim=512,
+        rope_dim=64,
+        page_size=1,
+        max_active_clusters=max_active_clusters,
+        acc_dtype=cutlass.Float32,
+        lse_dtype=cutlass.Float32,
+        qkv_dtype="e4m3",
+        out_dtype="bf16",
+        profile=kernel_profile,
+        reduction_mode=None if split_kv == 1 else "gmem_separate",
+        logical_num_heads=num_heads,
+        logical_seq_len_q=1,
+        tile_size_q=64,
+        explicit_split_kv=None,
+        explicit_persistent=None,
+        mask_type="dense",
+        softmax_rescale_threshold_log2=0.0 if threshold is None else threshold,
+    )
+    cfg = kernel._make_config()
+    if (
+        int(cfg.num_ctas_per_seq_kv) != split_kv
+        or int(cfg.num_ctas_per_head_dim) != head_dim_ctas
+        or int(cfg.use_cluster_reduction) != 0
+    ):
+        raise NotImplementedError(
+            f"D576 sparse MLA expects {split_kv} KV CTAs, {head_dim_ctas} V "
+            f"CTAs and GMEM reduction; got {cfg.num_ctas_per_seq_kv}, "
+            f"{cfg.num_ctas_per_head_dim}, cluster={cfg.use_cluster_reduction}"
+        )
+    if split_kv > 1 and not kernel.use_parallel_reduction:
+        # Only the parallel GMEM reducer publishes the D576 natural-log LSE.
+        raise NotImplementedError("D576 split-KV requires the parallel GMEM reducer")
+    spec = _MLADecodeCompileSpec(
+        device_index=device.index,
+        kernel_signature=_mla_kernel_compile_signature(kernel),
+        num_heads=64,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        page_size=1,
+        q_dtype_key="float8_e4m3fn",
+        output_dtype_key="bfloat16",
+        max_seq_len_q=phys_sq,
+        packed_query=False,
+        has_kernel_workspace=split_kv > 1,
+        split_kv=split_kv,
+        kernel=kernel,
+    )
+    sections = {}
+    byte_end = 0
+    for name, shape, dtype in (
+        (
+            "core",
+            (_sparse_d576_workspace_bytes(max_rows, num_heads, split_kv),),
+            torch.int8,
+        ),
+        ("public_lse", (max_rows, num_heads), torch.float32),
+    ):
+        sections[name], byte_end = _append_workspace_section(byte_end, shape, dtype)
+    return device, profile, spec, sections, byte_end, capacity, None
+
+
 class BatchSparseMLADecodePagedTSWrapper:
     """Plan native BF16/E4M3 attention, then bind one or two source index lists.
 
-    Q is [B,Sq,H,512] or packed [total_q,H,512]. Each source supplies int32
+    Q is [B,Sq,H,D] or packed [total_q,H,D], where D is 512 or 576.
+    D576 adds 64 QK-only RoPE channels; V and output remain D512.
+    Each source supplies int32
     [rows, capacity] storage-row indices and int32 [rows] live lengths directly
     to run(). Indices include physical page strides; -1 is masked. Both source
     lists participate in one attention distribution. The caller folds the
@@ -2290,13 +2661,27 @@ class BatchSparseMLADecodePagedTSWrapper:
     warmup, stable addresses, preallocated outputs, and validate=False.
     Input/output/workspace storage must not overlap; this is an unchecked
     caller precondition. Separate wrappers/workspaces are needed per stream.
+
+    Planning compiles one kernel with host-runtime FP32 scale arguments.
+    Scale values may change between launches without recompiling. CUDA graphs
+    capture their values, so new values require graph parameter updates or
+    recapture. For a
+    fixed dispatch profile over a range of independent sparse query rows,
+    plan with ``batch_size=1``, ``packed_query=True`` and
+    ``max_seq_len_q=row_capacity``. Run with ``[rows,H,D]`` queries and
+    ``qo_indptr=[0,rows]`` for any ``rows <= row_capacity``.
+
+    Q quantization and query RoPE belong to the caller. For a serving hot path,
+    establish valid metadata upstream and pass ``run(validate=False)``.
+    The default ``validate=True`` reads CUDA metadata values on the host and
+    therefore synchronizes. Kernel-builder advisories are controlled separately
+    at plan/JIT time by ``FLASHINFER_PRIMS_TS_DEBUG_CHECKS=1``.
     """
 
     @flashinfer_experimental_api
     def __init__(self, workspace_buffer=None):
         self._workspace_buffer = workspace_buffer
         self._state = None
-        self._scalar_cache = {}
         self.workspace_size_bytes = 0
 
     def plan(
@@ -2310,6 +2695,9 @@ class BatchSparseMLADecodePagedTSWrapper:
         max_seq_len_q=1,
         packed_query=False,
         q_data_type=torch.bfloat16,
+        qk_rope_head_dim=0,
+        kv_cache_format="native",
+        extra_kv_cache_format=None,
         kv_layout="NHD",
         has_sinks=False,
         return_lse=False,
@@ -2317,18 +2705,85 @@ class BatchSparseMLADecodePagedTSWrapper:
         output_quant_block_size=None,
         out_scale_format="ue8m0",
         num_output_groups=None,
+        tuning=None,
+        kv_lora_rank=512,
     ):
-        """Plan D512 attention over one primary and an optional extra pool.
+        """Plan D512/D576 attention over one primary and an optional extra pool.
+
+        ``kv_cache_format="nvfp4"`` uses the DS v4.1 D512 format: 256 packed
+        E2M1 bytes followed by 32 E4M3 scales in linear block16 order. Every
+        QK/V channel, including rotated channels, uses the same storage.
+        Keep ``qk_rope_head_dim=0``: there is no additional QK-only tail.
+
+        Set ``qk_rope_head_dim=64`` and ``kv_cache_format="nvfp4.fp8rope"``
+        for D576: 256 packed E2M1 NoPE bytes, 64 unscaled E4M3 RoPE bytes,
+        then 32 E4M3 scales, with block b stored at 320 + 8*(b%4) + b//4.
+        ``kv_cache_format="fp8"`` selects D512 per-tensor E4M3 storage:
+        512 bytes per token with no scale trailer. Pass its positive tensor
+        descale as ``kv_cache_scale`` to run(). Pair it with
+        ``extra_kv_cache_format="nvfp4"`` for FP8 SWA and compressed NVFP4 KV.
+        The extra format defaults to NVFP4 for an FP8 primary, otherwise to
+        the primary format. D512 supports NVFP4 in both pools or FP8 primary
+        with NVFP4 extra; native and mixed-RoPE formats require matching pools.
+        NVFP4-containing recipes require E4M3 Q. NVFP4 block scales are
+        applied in the loader before ordinary FP8 MMA, without a global
+        storage scale. Per-tensor FP8 bytes feed MMA directly; its scale is
+        applied to QK scores and FP32 output accumulation, avoiding another
+        E4M3 rounding. Caches are uint8 records; FP8 accepts E4M3 tensors too.
+        In NVFP4 bytes, even-indexed values occupy the low nibble. NVFP4
+        expands to E4M3 in the loader; BF16 Q must be converted upstream for
+        these recipes.
 
         ``max_topk`` describes arbitrary selected primary entries, not an SWA
         window. Prepared indices already include the physical page stride, so
         the core uses page size one regardless of the pools' external pages.
         Planning compiles no metadata-preparation kernel.
 
+        Fixed queries use exactly ``batch_size * max_seq_len_q`` rows. To reuse
+        one dispatch profile over a range of independent query-row counts,
+        use ``batch_size=1``, ``packed_query=True`` and
+        ``max_seq_len_q=row_capacity``. Supply ``[rows,H,D]`` Q and CUDA INT32
+        ``qo_indptr=[0,rows]`` to each run, with ``rows <= row_capacity``.
+        Index/length tensors and outputs use the same live row count. The
+        profile is chosen for the planned capacity; each captured graph keeps
+        its captured views and addresses. For example::
+
+            wrapper.plan("cuda", 1, heads, max_topk=topk,
+                         max_seq_len_q=row_capacity, packed_query=True,
+                         q_data_type=torch.float8_e4m3fn,
+                         kv_cache_format="nvfp4", return_lse=True)
+            # Q is already quantized/rotated; update metadata upstream.
+            wrapper.run(q, cache, indices, lengths, qo_indptr=qo_indptr,
+                        out=out, lse=lse, validate=False)
+
+        Whole-tile K/V reuse supports nonpersistent split-KV schedules.
+        The 1CTA persistent/CLC scheduler requires ``split_kv=1`` because its
+        work queue enumerates query/head tiles without a KV-split coordinate.
+        Low-level profile overrides must use a nonpersistent scheduler with
+        multiple KV splits; this restriction does not apply to 2CTA profiles.
+
+        Routine task-builder overlap and unused-routing advisories are quiet
+        by default. Set ``FLASHINFER_PRIMS_TS_DEBUG_CHECKS=1`` before a cold
+        plan/JIT build to show them. This controls build diagnostics separately
+        from :meth:`run`'s runtime input validation; other warnings/errors are
+        retained.
+
         Output quantization is disabled by default. When enabled, G must divide
         the local query-head count H. Blocks of 32 with UE8M0 scales implement
         MXFP8; FP32 scales use unrounded amax/448. Both use an amax floor of
         1e-4. A block never crosses a head boundary.
+
+        ``tuning`` (an :class:`MLAAttentionTuning`) has the meaning of
+        :meth:`BatchMLADecodePagedTSWrapper.plan`; its
+        ``softmax_rescale_threshold_log2`` takes 0 to 8 binades for E4M3 and
+        0 to 32 for BF16. ``None`` (default) keeps each schedule's own
+        behavior: some BF16 schedules keep the row anchor while a K tile
+        raises it by at most 6 binades, and all others rescale on every new
+        maximum. An explicit value applies to every schedule; ``0.0``
+        disables the skip (slower than ``None`` on the deferred BF16
+        schedules), and a positive value T also quantizes E4M3 P at
+        ``448 * 2**-T`` instead of 448, with the precision cost described
+        there.
         """
         (device, profile, spec, sections, byte_end, _, output_quant) = (
             _resolve_sparse_mla_plan(
@@ -2340,6 +2795,9 @@ class BatchSparseMLADecodePagedTSWrapper:
                 max_seq_len_q=max_seq_len_q,
                 packed_query=packed_query,
                 q_data_type=q_data_type,
+                qk_rope_head_dim=qk_rope_head_dim,
+                kv_cache_format=kv_cache_format,
+                extra_kv_cache_format=extra_kv_cache_format,
                 kv_layout=kv_layout,
                 has_sinks=has_sinks,
                 return_lse=return_lse,
@@ -2347,9 +2805,14 @@ class BatchSparseMLADecodePagedTSWrapper:
                 output_quant_block_size=output_quant_block_size,
                 out_scale_format=out_scale_format,
                 num_output_groups=num_output_groups,
+                tuning=tuning,
+                kv_lora_rank=kv_lora_rank,
             )
         )
         kernel = spec.kernel
+        reload_d576 = (
+            profile.family == "keep" and kernel._make_config().sparse_d576_reload
+        )
         family = profile.family
         splits = profile.split_kv
         max_rows = batch_size * max_seq_len_q
@@ -2363,30 +2826,25 @@ class BatchSparseMLADecodePagedTSWrapper:
         }
         # Finalize the joint distribution in the main kernel or its existing
         # split-KV reducer. No per-source outputs or finishing launch are needed.
-        kernel = copy.copy(kernel)
-        kernel.output_quant = output_quant
-        kernel.assume_valid_prefix = assume_valid_prefix
-        if family == "2cta":
-            kernel.fuse_sparse_epilogue = splits == 1
-            kernel.fuse_sparse_reduction = splits > 1
-        else:
-            kernel.finalize_output = True
-        kernel.direct_sparse = True
-        kernel.direct_sparse_capacities = (max_topk, max_extra_topk)
-        spec = replace(
-            spec, kernel=kernel, kernel_signature=_mla_kernel_compile_signature(kernel)
-        )
-        compiled = _get_compiled_mla_decode(spec)
-        static_kernel = copy.copy(kernel)
-        static_kernel.direct_static_scales = True
-        compiled_static = _get_compiled_mla_decode(
-            replace(
+        if not reload_d576:
+            kernel = copy.copy(kernel)
+            kernel.output_quant = output_quant
+            kernel.assume_valid_prefix = assume_valid_prefix
+            if family == "2cta":
+                kernel.fuse_sparse_epilogue = splits == 1
+                kernel.fuse_sparse_reduction = splits > 1
+            else:
+                kernel.finalize_output = True
+            kernel.direct_sparse = True
+            kernel.direct_sparse_capacities = (max_topk, max_extra_topk)
+            spec = replace(
                 spec,
-                kernel=static_kernel,
-                kernel_signature=_mla_kernel_compile_signature(static_kernel),
+                kernel=kernel,
+                kernel_signature=_mla_kernel_compile_signature(kernel),
             )
-        )
+        compiled = _get_compiled_mla_decode(spec)
         self._state = dict(
+            reload_d576=reload_d576,
             device=device,
             batch=batch_size,
             heads=num_heads,
@@ -2394,6 +2852,14 @@ class BatchSparseMLADecodePagedTSWrapper:
             max_rows=max_rows,
             packed=packed_query,
             dtype=q_data_type,
+            query_dim=512 + qk_rope_head_dim,
+            cache_dim=cache_record_size(kernel.kv_cache_format, qk_rope_head_dim),
+            extra_cache_dim=cache_record_size(
+                kernel.extra_kv_cache_format, qk_rope_head_dim
+            ),
+            cache_dtype=torch.uint8 if kernel.has_nvfp4_kv else q_data_type,
+            kv_cache_format=kernel.kv_cache_format,
+            extra_kv_cache_format=kernel.extra_kv_cache_format,
             ks=max_topk,
             kc=max_extra_topk,
             kv_layout=kv_layout,
@@ -2403,60 +2869,56 @@ class BatchSparseMLADecodePagedTSWrapper:
             buffers=buffers,
             workspace=workspace,
             compiled=compiled,
-            compiled_static=compiled_static,
             assume_valid_prefix=assume_valid_prefix,
             splits=splits,
             default_cl=torch.full(
                 (max_rows,), max_extra_topk, device=device, dtype=torch.int32
             ),
             dummy_indices=torch.zeros((max_rows, 1), device=device, dtype=torch.int32),
-            dummy_cache=torch.zeros((1, 1, 512), device=device, dtype=q_data_type),
+            dummy_cache=torch.zeros(
+                (
+                    1,
+                    1,
+                    cache_record_size(kernel.extra_kv_cache_format, qk_rope_head_dim),
+                ),
+                device=device,
+                dtype=torch.uint8 if kernel.has_nvfp4_kv else q_data_type,
+            ),
             default_sinks=torch.full(
                 (num_heads,), -torch.inf, device=device, dtype=torch.float32
             ),
         )
 
         self.workspace_size_bytes = byte_end
-        self._scalar_cache.clear()
 
-    def _scalar(self, value, name, validate):
-        state = self._state
-        if isinstance(value, torch.Tensor):
-            if (
-                value.dtype != torch.float32
-                or value.device != state["device"]
-                or value.numel() != 1
-                or not value.is_contiguous()
-            ):
-                raise ValueError(f"{name} must be a scalar CUDA FP32 tensor")
-            if validate and (
-                not torch.isfinite(value).all().item() or (value <= 0).any().item()
-            ):
-                raise ValueError(f"{name} must be positive and finite")
-            return value.reshape(1)
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(value)
-            or value <= 0
-        ):
+    @staticmethod
+    def host_scale(value, name):
+        """Validate and round a host scalar to the runtime kernel's FP32 ABI."""
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise TypeError(f"{name} must be a Python int or float")
+        if not math.isfinite(value) or value <= 0:
             raise ValueError(f"{name} must be positive and finite")
         try:
-            key = struct.unpack("f", struct.pack("f", float(value)))[0]
+            rounded = struct.unpack("f", struct.pack("f", float(value)))[0]
         except OverflowError as error:
             raise ValueError(f"{name} must be representable in float32") from error
-        if not math.isfinite(key) or key <= 0:
+        if not math.isfinite(rounded) or rounded <= 0:
             raise ValueError(f"{name} must be positive finite float32")
-        if key not in self._scalar_cache:
-            self._scalar_cache[key] = torch.full(
-                (1,), key, device=state["device"], dtype=torch.float32
-            )
-        return self._scalar_cache[key]
+        return rounded
 
     def _pool(self, cache, name):
+        """Validate one cache pool and expose its physical rows without repacking storage."""
         state = self._state
+        dim = state["extra_cache_dim" if name == "extra_kv_cache" else "cache_dim"]
         if not isinstance(cache, torch.Tensor):
             raise TypeError(f"{name} must be a tensor")
+        fmt = state[
+            "extra_kv_cache_format" if name == "extra_kv_cache" else "kv_cache_format"
+        ]
+        if fmt == "fp8" and cache.dtype == torch.float8_e4m3fn:
+            cache = cache.view(torch.uint8)
+        if cache.ndim == 2:
+            cache = cache.unsqueeze(1)
         if cache.ndim == 4:
             axis = 1 if state["kv_layout"] == "HND" else 2
             if cache.shape[axis] != 1:
@@ -2465,30 +2927,30 @@ class BatchSparseMLADecodePagedTSWrapper:
         if (
             cache.ndim != 3
             or cache.shape[1] <= 0
-            or cache.shape[2] != 512
+            or cache.shape[2] != dim
             or cache.shape[0] <= 0
         ):
             raise ValueError(
-                f"{name} must have shape [pages,page_size,512] with nonempty pages"
+                f"{name} must have shape [pages,page_size,{dim}] with nonempty pages"
             )
         page_size = cache.shape[1]
-        if cache.device != state["device"] or cache.dtype != state["dtype"]:
+        if cache.device != state["device"] or cache.dtype != state["cache_dtype"]:
             raise ValueError(f"{name} must match the planned device and dtype")
         if (
             cache.stride(-1) != 1
-            or cache.stride(1) != 512
-            or cache.stride(0) < page_size * 512
-            or cache.stride(0) % 512
+            or cache.stride(1) != dim
+            or cache.stride(0) < page_size * dim
+            or cache.stride(0) % dim
             or cache.data_ptr() % 16
         ):
             raise ValueError(
-                f"{name} requires aligned compact rows and a page stride divisible by 512 elements"
+                f"{name} requires aligned compact rows and a page stride divisible by {dim} elements"
             )
-        row_stride = cache.stride(0) // 512
+        row_stride = cache.stride(0) // dim
         rows = (cache.shape[0] - 1) * row_stride + page_size
         if rows >= 0x7FFFFFFF:
             raise ValueError(f"{name} exceeds signed gather coordinate range")
-        return cache.as_strided((rows, 1, 512), (512, 512, 1))
+        return cache.as_strided((rows, 1, dim), (dim, dim, 1))
 
     def _source_metadata(
         self, indices, lengths, capacity, tokens, name, *, rows, validate
@@ -2539,8 +3001,9 @@ class BatchSparseMLADecodePagedTSWrapper:
         extra_indices=None,
         extra_lengths=None,
         qo_indptr=None,
-        softmax_scale=512**-0.5,
+        softmax_scale=None,
         output_scale=1.0,
+        kv_cache_scale=1.0,
         sinks=None,
         out=None,
         lse=None,
@@ -2563,19 +3026,35 @@ class BatchSparseMLADecodePagedTSWrapper:
         and live lengths need no 128-entry padding: the kernel aligns source
         execution spans internally and bounds all source reads.
 
+        ``validate=True`` (default) checks CUDA metadata contents using host
+        reads, which synchronize the device. Serving should establish index,
+        length, offset and position bounds upstream and use ``validate=False``
+        on the hot path and during CUDA graph capture. Shape, dtype, device,
+        stride and alignment checks still run without reading CUDA values.
+        Q must already use the planned dtype and include the required query
+        RoPE; run() performs neither Q quantization nor query rotation.
+
         ``softmax_scale`` and ``output_scale`` are positive finite Python
-        scalars or scalar CUDA FP32 tensors. They are already combined:
+        host scalars, passed as runtime FP32 kernel arguments. They are already combined:
         softmax_scale = attention_scale * q_descale * kv_descale;
         output_scale = output_multiplier * kv_descale. Both pools share that
         KV descale. These multiply QK scores and the weighted stored V values,
         respectively; sink logits are not multiplied by softmax_scale. The
         output multiplier applies before fused RoPE/quantization. ``out_scale``
         instead holds the generated per-block quantization scales.
-        Combine dynamic scales in upstream work before each launch/replay and
-        keep their tensor addresses stable for CUDA Graphs.
+        Combine scales on the host before each launch. Their values are not
+        compilation keys. CUDA graphs capture the supplied values; changing
+        them for replay requires graph parameter updates or recapture.
+
+        For ``kv_cache_format="fp8"``, ``kv_cache_scale`` is the independent
+        positive host-runtime per-tensor descale of the primary pool. It accepts
+        a Python scalar; leave it at the default 1.0
+        for other formats. The extra pool is NVFP4 and has no tensor descale.
+        The primary scale is applied internally to both K and V; do not also
+        fold it into softmax_scale/output_scale.
 
         Caller-owned inputs and plan workspace must outlive graph replay,
-        including tensor scales and sinks, and must not alias writable output
+        including sinks, and must not alias writable output
         or workspace storage. Q and native KV are used directly; flattening
         padded pages only creates a tensor view. Required attention reductions
         remain included. Caller-owned LSE must be contiguous FP32 and 16-byte
@@ -2608,6 +3087,8 @@ class BatchSparseMLADecodePagedTSWrapper:
         state = self._state
         if state is None:
             raise RuntimeError("plan() must be called before run()")
+        if softmax_scale is None:
+            softmax_scale = state["query_dim"] ** -0.5
         _validate_query(
             query,
             packed_query=state["packed"],
@@ -2616,7 +3097,7 @@ class BatchSparseMLADecodePagedTSWrapper:
             num_heads=state["heads"],
             max_seq_len_q=state["max_q"],
             q_dtype=state["dtype"],
-            query_dim=512,
+            query_dim=state["query_dim"],
         )
         prefix = tuple(query.shape[:-2])
         rows = math.prod(prefix)
@@ -2672,13 +3153,11 @@ class BatchSparseMLADecodePagedTSWrapper:
             raise ValueError("sinks must be contiguous CUDA FP32[H]")
         if validate and torch.isnan(sinks).any().item():
             raise ValueError("sinks must not contain NaN")
-        scale_tensors = [
-            self._scalar(v, n, validate)
-            for v, n in (
-                (softmax_scale, "softmax_scale"),
-                (output_scale, "output_scale"),
-            )
-        ]
+        softmax_scale = self.host_scale(softmax_scale, "softmax_scale")
+        output_scale = self.host_scale(output_scale, "output_scale")
+        kv_cache_scale = self.host_scale(kv_cache_scale, "kv_cache_scale")
+        if state["kv_cache_format"] != "fp8" and kv_cache_scale != 1.0:
+            raise ValueError("kv_cache_scale is only supported for an FP8 primary pool")
         quant = state["output_quant"]
         output_quant_args = None
         if quant is not None:
@@ -2728,23 +3207,40 @@ class BatchSparseMLADecodePagedTSWrapper:
             raise ValueError(
                 "lse must be contiguous, 16-byte-aligned FP32 with one value per query/head"
             )
-        static_scales = all(
-            not isinstance(v, torch.Tensor) for v in (softmax_scale, output_scale)
-        )
-        # Both paths consume the same effective scales; no Q/K/V scale
-        # composition or auxiliary preparation is performed here.
-        bmm1_scale = float(softmax_scale) if static_scales else 1.0
-        bmm2_scale = float(output_scale) if static_scales else 1.0
         sparse_inputs = (
             si,
             ci,
             sl,
             cl,
-            scale_tensors[0],
-            scale_tensors[1],
             sinks,
+            kv_cache_scale,
         )
-        if rows:
+        if rows and state["reload_d576"]:
+            core = state["buffers"]["core"]
+            # Each query token is a batch row; H128 is two q64 query tiles.
+            phys = (rows, state["heads"] // 64, 64)
+            with torch.cuda.device(state["device"]):
+                _launch_mla_decode(
+                    _MLARuntime(
+                        query.view(*phys, _D576_HEAD_DIM),
+                        primary,
+                        out.view(*phys, _D576_V_DIM),
+                        primary.shape[0],
+                        softmax_scale,
+                        output_scale,
+                    ),
+                    block_tables=si,
+                    seq_lens=sl,
+                    qo_indptr=None,
+                    packed_query=False,
+                    kv_lora_rank=512,
+                    split_kv=state["splits"],
+                    workspace=_MLAWorkspaceViews(
+                        core if core.numel() else None, lse.view(*phys)
+                    ),
+                    compiled=state["compiled"],
+                )
+        elif rows:
             buffers = state["buffers"]
             # Quantized stores use output_quant_args, including group/bucket
             # strides. The core O view supplies compact launch geometry only.
@@ -2757,12 +3253,12 @@ class BatchSparseMLADecodePagedTSWrapper:
             )
             _launch_mla_decode(
                 _MLARuntime(
-                    query.view(rows, 1, state["heads"], 512),
+                    query.view(rows, 1, state["heads"], state["query_dim"]),
                     primary,
                     core_out,
                     primary.shape[0],
-                    bmm1_scale,
-                    bmm2_scale,
+                    softmax_scale,
+                    output_scale,
                     extra_cache=extra,
                     sparse_inputs=sparse_inputs,
                     output_quant_args=output_quant_args,
@@ -2777,9 +3273,7 @@ class BatchSparseMLADecodePagedTSWrapper:
                     buffers["core"] if buffers["core"].numel() else None,
                     lse.view(rows, 1, state["heads"]),
                 ),
-                compiled=state["compiled_static"]
-                if static_scales
-                else state["compiled"],
+                compiled=state["compiled"],
             )
         if quant is not None:
             return (out, out_scale, lse) if state["return_lse"] else (out, out_scale)
@@ -2810,8 +3304,11 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
     qo_indptr=None,
     max_seq_len_q=None,
     kv_layout="NHD",
-    softmax_scale=512**-0.5,
+    kv_cache_format="native",
+    extra_kv_cache_format=None,
+    softmax_scale=None,
     output_scale=1.0,
+    kv_cache_scale=1.0,
     sinks=None,
     out=None,
     lse=None,
@@ -2824,13 +3321,15 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
     token_positions=None,
     cos_sin_cache=None,
     out_scale=None,
+    tuning=None,
 ):
     """Eager plan-and-run helper using separate source indices and lengths.
 
     Use a planned wrapper for CUDA Graph replay. Index conversion and scale
     composition remain external. softmax_scale includes attention/Q/K descales;
     output_scale includes the V descale and optional output multiplier.
-    Source contracts, output quantization arguments and return layouts follow
+    Source contracts, output quantization arguments, ``tuning`` and return
+    layouts follow
     :class:`BatchSparseMLADecodePagedTSWrapper`.
     """
     if torch.cuda.is_current_stream_capturing():
@@ -2857,6 +3356,9 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
         max_seq_len_q=max_seq_len_q,
         packed_query=packed,
         q_data_type=query.dtype,
+        qk_rope_head_dim=query.shape[-1] - 512,
+        kv_cache_format=kv_cache_format,
+        extra_kv_cache_format=extra_kv_cache_format,
         kv_layout=kv_layout,
         has_sinks=sinks is not None,
         return_lse=return_lse,
@@ -2864,6 +3366,7 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
         output_quant_block_size=output_quant_block_size,
         out_scale_format=out_scale_format,
         num_output_groups=num_output_groups,
+        tuning=tuning,
     )
     return wrapper.run(
         query,
@@ -2876,6 +3379,7 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
         qo_indptr=qo_indptr,
         softmax_scale=softmax_scale,
         output_scale=output_scale,
+        kv_cache_scale=kv_cache_scale,
         sinks=sinks,
         out=out,
         lse=lse,

@@ -214,6 +214,20 @@ def compute_reference_moe(
 
 
 @contextmanager
+def env_var(name: str, value: str):
+    """Set one environment variable for the block, restoring it afterwards."""
+    saved = os.environ.get(name)
+    os.environ[name] = value
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = saved
+
+
+@contextmanager
 def nvfp4_4over6_env(use_4over6: bool):
     original_value = os.environ.get("FLASHINFER_NVFP4_4OVER6", None)
     if use_4over6:
@@ -263,6 +277,7 @@ def set_nvfp4_4over6_env(request):
 
 NON_GATED_ACTIVATION_SUPPORTED_QUANT_MODES = [
     QuantMode.FP4_NVFP4_NVFP4,
+    QuantMode.FP4_MXFP4_MXFP8,
     QuantMode.FP8_BLOCK_SCALE_MXFP8,
     QuantMode.FP8_PER_TENSOR,
     QuantMode.BF16,
@@ -409,14 +424,6 @@ def skip_checks(
         ):
             pytest.skip(
                 "Prims-TS FP8 per-tensor DeepSeekV3 routing requires a gated activation"
-            )
-        if (
-            is_fp4_moe
-            and moe_impl.quant_mode == QuantMode.FP4_NVFP4_NVFP4
-            and activation_type == ActivationType.Relu2
-        ):
-            pytest.skip(
-                "Prims-TS NVFP4xNVFP4 Relu2 output quantization is not supported yet"
             )
     if (
         is_fp8_block_scale_moe
