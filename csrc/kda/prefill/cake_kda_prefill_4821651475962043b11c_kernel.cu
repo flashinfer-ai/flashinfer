@@ -43,23 +43,23 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define CAKE_INF CUDART_INF_F
 #define TMEM_NCOLS 256
 #define TMEM_TMEM_STATE_OFFSET 64
-#define TMEM_TMEM_STATE_DECAY0_OFFSET 64
-#define TMEM_TMEM_STATE_DECAY1_OFFSET 80
-#define TMEM_TMEM_STATE_DECAY2_OFFSET 96
-#define TMEM_TMEM_STATE_DECAY3_OFFSET 112
-#define TMEM_TMEM_STATE_DECAY4_OFFSET 128
-#define TMEM_TMEM_STATE_DECAY5_OFFSET 144
-#define TMEM_TMEM_STATE_DECAY6_OFFSET 160
-#define TMEM_TMEM_STATE_DECAY7_OFFSET 176
+#define TMEM_TMEM_STATE_DECAY_0_OFFSET 64
+#define TMEM_TMEM_STATE_DECAY_1_OFFSET 80
+#define TMEM_TMEM_STATE_DECAY_2_OFFSET 96
+#define TMEM_TMEM_STATE_DECAY_3_OFFSET 112
+#define TMEM_TMEM_STATE_DECAY_4_OFFSET 128
+#define TMEM_TMEM_STATE_DECAY_5_OFFSET 144
+#define TMEM_TMEM_STATE_DECAY_6_OFFSET 160
+#define TMEM_TMEM_STATE_DECAY_7_OFFSET 176
 #define TMEM_TMEM_STATE_INP_OFFSET 0
-#define TMEM_TMEM_STATE_INP_DECAY0_OFFSET 0
-#define TMEM_TMEM_STATE_INP_DECAY1_OFFSET 8
-#define TMEM_TMEM_STATE_INP_DECAY2_OFFSET 16
-#define TMEM_TMEM_STATE_INP_DECAY3_OFFSET 24
-#define TMEM_TMEM_STATE_INP_DECAY4_OFFSET 32
-#define TMEM_TMEM_STATE_INP_DECAY5_OFFSET 40
-#define TMEM_TMEM_STATE_INP_DECAY6_OFFSET 48
-#define TMEM_TMEM_STATE_INP_DECAY7_OFFSET 56
+#define TMEM_TMEM_STATE_INP_DECAY_0_OFFSET 0
+#define TMEM_TMEM_STATE_INP_DECAY_1_OFFSET 8
+#define TMEM_TMEM_STATE_INP_DECAY_2_OFFSET 16
+#define TMEM_TMEM_STATE_INP_DECAY_3_OFFSET 24
+#define TMEM_TMEM_STATE_INP_DECAY_4_OFFSET 32
+#define TMEM_TMEM_STATE_INP_DECAY_5_OFFSET 40
+#define TMEM_TMEM_STATE_INP_DECAY_6_OFFSET 48
+#define TMEM_TMEM_STATE_INP_DECAY_7_OFFSET 56
 #define TMEM_TMEM_U_ACC_OFFSET 224
 #define TMEM_TMEM_U2_INP_OFFSET 224
 #define TMEM_TMEM_U2_ACC_OFFSET 0
@@ -168,30 +168,30 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_SMEM_STATE_DECAY_DIAG_RAW_OFF 1024
 #define SMEM_SMEM_STATE_DECAY_DIAG_RAW_STAGE_BYTES 4096
 #define SMEM_SMEM_STATE_DECAY_DIAG_RAW_STRIDE 4096
-#define SMEM_SMEM_STATE_DECAY_DIAG0_OFF 1024
-#define SMEM_SMEM_STATE_DECAY_DIAG0_STAGE_BYTES 512
-#define SMEM_SMEM_STATE_DECAY_DIAG0_STRIDE 512
-#define SMEM_SMEM_STATE_DECAY_DIAG1_OFF 1536
-#define SMEM_SMEM_STATE_DECAY_DIAG1_STAGE_BYTES 512
-#define SMEM_SMEM_STATE_DECAY_DIAG1_STRIDE 512
-#define SMEM_SMEM_STATE_DECAY_DIAG2_OFF 2048
-#define SMEM_SMEM_STATE_DECAY_DIAG2_STAGE_BYTES 512
-#define SMEM_SMEM_STATE_DECAY_DIAG2_STRIDE 512
-#define SMEM_SMEM_STATE_DECAY_DIAG3_OFF 2560
-#define SMEM_SMEM_STATE_DECAY_DIAG3_STAGE_BYTES 512
-#define SMEM_SMEM_STATE_DECAY_DIAG3_STRIDE 512
-#define SMEM_SMEM_STATE_DECAY_DIAG4_OFF 3072
-#define SMEM_SMEM_STATE_DECAY_DIAG4_STAGE_BYTES 512
-#define SMEM_SMEM_STATE_DECAY_DIAG4_STRIDE 512
-#define SMEM_SMEM_STATE_DECAY_DIAG5_OFF 3584
-#define SMEM_SMEM_STATE_DECAY_DIAG5_STAGE_BYTES 512
-#define SMEM_SMEM_STATE_DECAY_DIAG5_STRIDE 512
-#define SMEM_SMEM_STATE_DECAY_DIAG6_OFF 4096
-#define SMEM_SMEM_STATE_DECAY_DIAG6_STAGE_BYTES 512
-#define SMEM_SMEM_STATE_DECAY_DIAG6_STRIDE 512
-#define SMEM_SMEM_STATE_DECAY_DIAG7_OFF 4608
-#define SMEM_SMEM_STATE_DECAY_DIAG7_STAGE_BYTES 512
-#define SMEM_SMEM_STATE_DECAY_DIAG7_STRIDE 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_0_OFF 1024
+#define SMEM_SMEM_STATE_DECAY_DIAG_0_STAGE_BYTES 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_0_STRIDE 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_1_OFF 1536
+#define SMEM_SMEM_STATE_DECAY_DIAG_1_STAGE_BYTES 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_1_STRIDE 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_2_OFF 2048
+#define SMEM_SMEM_STATE_DECAY_DIAG_2_STAGE_BYTES 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_2_STRIDE 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_3_OFF 2560
+#define SMEM_SMEM_STATE_DECAY_DIAG_3_STAGE_BYTES 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_3_STRIDE 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_4_OFF 3072
+#define SMEM_SMEM_STATE_DECAY_DIAG_4_STAGE_BYTES 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_4_STRIDE 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_5_OFF 3584
+#define SMEM_SMEM_STATE_DECAY_DIAG_5_STAGE_BYTES 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_5_STRIDE 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_6_OFF 4096
+#define SMEM_SMEM_STATE_DECAY_DIAG_6_STAGE_BYTES 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_6_STRIDE 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_7_OFF 4608
+#define SMEM_SMEM_STATE_DECAY_DIAG_7_STAGE_BYTES 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_7_STRIDE 512
 #define SMEM_SMEM_V_ALL_OFF 32384
 #define SMEM_SMEM_V_ALL_STAGE_BYTES 8192
 #define SMEM_SMEM_V_ALL_STRIDE 41984
@@ -569,22 +569,22 @@ kernel_cake_kda_prefill_4821651475962043b11c(__nv_bfloat16* __restrict__ q, cons
     const int smem_gate_bias_all_addr = smem + 227408;
     unsigned int* smem_state_decay_diag_raw = reinterpret_cast<unsigned int*>(smem_raw + 1024);
     const int smem_state_decay_diag_raw_addr = smem + 1024;
-    __nv_bfloat16* smem_state_decay_diag0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
-    const int smem_state_decay_diag0_addr = smem + 1024;
-    __nv_bfloat16* smem_state_decay_diag1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1536);
-    const int smem_state_decay_diag1_addr = smem + 1536;
-    __nv_bfloat16* smem_state_decay_diag2 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 2048);
-    const int smem_state_decay_diag2_addr = smem + 2048;
-    __nv_bfloat16* smem_state_decay_diag3 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 2560);
-    const int smem_state_decay_diag3_addr = smem + 2560;
-    __nv_bfloat16* smem_state_decay_diag4 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 3072);
-    const int smem_state_decay_diag4_addr = smem + 3072;
-    __nv_bfloat16* smem_state_decay_diag5 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 3584);
-    const int smem_state_decay_diag5_addr = smem + 3584;
-    __nv_bfloat16* smem_state_decay_diag6 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 4096);
-    const int smem_state_decay_diag6_addr = smem + 4096;
-    __nv_bfloat16* smem_state_decay_diag7 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 4608);
-    const int smem_state_decay_diag7_addr = smem + 4608;
+    __nv_bfloat16* smem_state_decay_diag_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
+    const int smem_state_decay_diag_addr_0 = smem + 1024;
+    __nv_bfloat16* smem_state_decay_diag_1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1536);
+    const int smem_state_decay_diag_addr_1 = smem + 1536;
+    __nv_bfloat16* smem_state_decay_diag_2 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 2048);
+    const int smem_state_decay_diag_addr_2 = smem + 2048;
+    __nv_bfloat16* smem_state_decay_diag_3 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 2560);
+    const int smem_state_decay_diag_addr_3 = smem + 2560;
+    __nv_bfloat16* smem_state_decay_diag_4 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 3072);
+    const int smem_state_decay_diag_addr_4 = smem + 3072;
+    __nv_bfloat16* smem_state_decay_diag_5 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 3584);
+    const int smem_state_decay_diag_addr_5 = smem + 3584;
+    __nv_bfloat16* smem_state_decay_diag_6 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 4096);
+    const int smem_state_decay_diag_addr_6 = smem + 4096;
+    __nv_bfloat16* smem_state_decay_diag_7 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 4608);
+    const int smem_state_decay_diag_addr_7 = smem + 4608;
     __nv_bfloat16* smem_v_all = reinterpret_cast<__nv_bfloat16*>(smem_raw + 32384);
     const int smem_v_all_addr = smem + 32384;
     float* smem_gate_all = reinterpret_cast<float*>(smem_raw + 25600);
@@ -678,23 +678,23 @@ kernel_cake_kda_prefill_4821651475962043b11c(__nv_bfloat16* __restrict__ q, cons
 
     // Kernel post-init ops
     const int tmem_tmem_state = taddr + 64;
-    const int tmem_tmem_state_decay0 = taddr + 64;
-    const int tmem_tmem_state_decay1 = taddr + 80;
-    const int tmem_tmem_state_decay2 = taddr + 96;
-    const int tmem_tmem_state_decay3 = taddr + 112;
-    const int tmem_tmem_state_decay4 = taddr + 128;
-    const int tmem_tmem_state_decay5 = taddr + 144;
-    const int tmem_tmem_state_decay6 = taddr + 160;
-    const int tmem_tmem_state_decay7 = taddr + 176;
+    const int tmem_tmem_state_decay_0 = taddr + 64;
+    const int tmem_tmem_state_decay_1 = taddr + 80;
+    const int tmem_tmem_state_decay_2 = taddr + 96;
+    const int tmem_tmem_state_decay_3 = taddr + 112;
+    const int tmem_tmem_state_decay_4 = taddr + 128;
+    const int tmem_tmem_state_decay_5 = taddr + 144;
+    const int tmem_tmem_state_decay_6 = taddr + 160;
+    const int tmem_tmem_state_decay_7 = taddr + 176;
     const int tmem_tmem_state_inp = taddr;
-    const int tmem_tmem_state_inp_decay0 = taddr;
-    const int tmem_tmem_state_inp_decay1 = taddr + 8;
-    const int tmem_tmem_state_inp_decay2 = taddr + 16;
-    const int tmem_tmem_state_inp_decay3 = taddr + 24;
-    const int tmem_tmem_state_inp_decay4 = taddr + 32;
-    const int tmem_tmem_state_inp_decay5 = taddr + 40;
-    const int tmem_tmem_state_inp_decay6 = taddr + 48;
-    const int tmem_tmem_state_inp_decay7 = taddr + 56;
+    const int tmem_tmem_state_inp_decay_0 = taddr;
+    const int tmem_tmem_state_inp_decay_1 = taddr + 8;
+    const int tmem_tmem_state_inp_decay_2 = taddr + 16;
+    const int tmem_tmem_state_inp_decay_3 = taddr + 24;
+    const int tmem_tmem_state_inp_decay_4 = taddr + 32;
+    const int tmem_tmem_state_inp_decay_5 = taddr + 40;
+    const int tmem_tmem_state_inp_decay_6 = taddr + 48;
+    const int tmem_tmem_state_inp_decay_7 = taddr + 56;
     const int tmem_tmem_u_acc = taddr + 224;
     const int tmem_tmem_u2_inp = taddr + 224;
     const int tmem_tmem_u2_acc = taddr;
@@ -833,14 +833,14 @@ kernel_cake_kda_prefill_4821651475962043b11c(__nv_bfloat16* __restrict__ q, cons
                 int owned_chunk = chunk_global_local >= 0 && chunk_global_local < num_chunks;
                 int checkpoint_token_entering = chunk_idx * 32;
                 int checkpoint_entering = checkpoint_every_n_tokens != 0 && checkpoint_token_entering % checkpoint_every_n_tokens == 0;
-                float state_panel0[32];
-                float state_panel1[32];
-                float state_panel2[32];
-                float state_panel3[32];
-                unsigned int state_packed0[16];
-                unsigned int state_packed1[16];
-                unsigned int state_packed2[16];
-                unsigned int state_packed3[16];
+                float state_panel_0[32];
+                float state_panel_1[32];
+                float state_panel_2[32];
+                float state_panel_3[32];
+                unsigned int state_packed_0[16];
+                unsigned int state_packed_1[16];
+                unsigned int state_packed_2[16];
+                unsigned int state_packed_3[16];
                 int _stage_qk_full = (int)((unsigned int)chunk_idx % 5);
                 int _parity_qk_full = (int)((unsigned int)chunk_idx / 5 % 2);
                 mbarrier_wait(qk_full_addr + (_stage_qk_full) * 8, _parity_qk_full);
