@@ -141,7 +141,7 @@ __device__ __forceinline__ float approx_rcp(float x) {
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
-kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const __grid_constant__ CUtensorMap Q_map, const __grid_constant__ CUtensorMap K_map, const __grid_constant__ CUtensorMap V_map, __nv_bfloat16* __restrict__ O, float* __restrict__ q_scale, float* __restrict__ k_scale, float* __restrict__ v_scale, int* __restrict__ seg_begin, int* __restrict__ seg_len, int* __restrict__ unit_table, int total_units, int num_heads, int num_kblocks, float softmax_scale_log2)
+kernel_cake_minimax_h3_sm120_quant_varlen_attention_ded4b175c17b3fa37452(const __grid_constant__ CUtensorMap Q_map, const __grid_constant__ CUtensorMap K_map, const __grid_constant__ CUtensorMap V_map, __nv_bfloat16* __restrict__ O, float* __restrict__ q_scale, float* __restrict__ k_scale, float* __restrict__ v_scale, int* __restrict__ seg_begin, int* __restrict__ seg_len, int* __restrict__ unit_table, int total_units, int num_heads, int num_kblocks, float softmax_scale_log2)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -782,44 +782,44 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
                 s_acc[62] = ((seg_begin_v > kb * 128 + 120 + 2 * (lane & 3) || seg_end_v <= kb * 128 + 120 + 2 * (lane & 3)) ? -CUDART_INF_F : s_acc[62]);
                 s_acc[63] = ((seg_begin_v > kb * 128 + 120 + 2 * (lane & 3) + 1 || seg_end_v <= kb * 128 + 120 + 2 * (lane & 3) + 1) ? -CUDART_INF_F : s_acc[63]);
             }
-            float _max_0 = fmaxf(s_acc[0], s_acc[1]);
-            float _max_1 = fmaxf(s_acc[2], s_acc[3]);
-            float _max_2 = fmaxf(_max_0, fmaxf(s_acc[4], s_acc[5]));
-            float _max_3 = fmaxf(_max_1, fmaxf(s_acc[6], s_acc[7]));
-            float _max_4 = fmaxf(_max_2, fmaxf(s_acc[8], s_acc[9]));
-            float _max_5 = fmaxf(_max_3, fmaxf(s_acc[10], s_acc[11]));
-            float _max_6 = fmaxf(_max_4, fmaxf(s_acc[12], s_acc[13]));
-            float _max_7 = fmaxf(_max_5, fmaxf(s_acc[14], s_acc[15]));
-            float _max_8 = fmaxf(_max_6, fmaxf(s_acc[16], s_acc[17]));
-            float _max_9 = fmaxf(_max_7, fmaxf(s_acc[18], s_acc[19]));
-            float _max_10 = fmaxf(_max_8, fmaxf(s_acc[20], s_acc[21]));
-            float _max_11 = fmaxf(_max_9, fmaxf(s_acc[22], s_acc[23]));
-            float _max_12 = fmaxf(_max_10, fmaxf(s_acc[24], s_acc[25]));
-            float _max_13 = fmaxf(_max_11, fmaxf(s_acc[26], s_acc[27]));
-            float _max_14 = fmaxf(_max_12, fmaxf(s_acc[28], s_acc[29]));
-            float _max_15 = fmaxf(_max_13, fmaxf(s_acc[30], s_acc[31]));
-            float _max_16 = fmaxf(_max_14, fmaxf(s_acc[32], s_acc[33]));
-            float _max_17 = fmaxf(_max_15, fmaxf(s_acc[34], s_acc[35]));
-            float _max_18 = fmaxf(_max_16, fmaxf(s_acc[36], s_acc[37]));
-            float _max_19 = fmaxf(_max_17, fmaxf(s_acc[38], s_acc[39]));
-            float _max_20 = fmaxf(_max_18, fmaxf(s_acc[40], s_acc[41]));
-            float _max_21 = fmaxf(_max_19, fmaxf(s_acc[42], s_acc[43]));
-            float _max_22 = fmaxf(_max_20, fmaxf(s_acc[44], s_acc[45]));
-            float _max_23 = fmaxf(_max_21, fmaxf(s_acc[46], s_acc[47]));
-            float _max_24 = fmaxf(_max_22, fmaxf(s_acc[48], s_acc[49]));
-            float _max_25 = fmaxf(_max_23, fmaxf(s_acc[50], s_acc[51]));
-            float _max_26 = fmaxf(_max_24, fmaxf(s_acc[52], s_acc[53]));
-            float _max_27 = fmaxf(_max_25, fmaxf(s_acc[54], s_acc[55]));
-            float _max_28 = fmaxf(_max_26, fmaxf(s_acc[56], s_acc[57]));
-            float _max_29 = fmaxf(_max_27, fmaxf(s_acc[58], s_acc[59]));
-            float _max_30 = fmaxf(_max_28, fmaxf(s_acc[60], s_acc[61]));
-            float _max_31 = fmaxf(_max_29, fmaxf(s_acc[62], s_acc[63]));
-            float _shfl_xor_sync_0 = __shfl_xor_sync(0xFFFFFFFF, _max_30, 1);
-            float _max_32 = fmaxf(_max_30, _shfl_xor_sync_0);
+            float max_k_0 = fmaxf(s_acc[0], s_acc[1]);
+            float max_k_1 = fmaxf(s_acc[2], s_acc[3]);
+            float max_k_2 = fmaxf(max_k_0, fmaxf(s_acc[4], s_acc[5]));
+            float max_k_3 = fmaxf(max_k_1, fmaxf(s_acc[6], s_acc[7]));
+            float max_k_4 = fmaxf(max_k_2, fmaxf(s_acc[8], s_acc[9]));
+            float max_k_5 = fmaxf(max_k_3, fmaxf(s_acc[10], s_acc[11]));
+            float max_k_6 = fmaxf(max_k_4, fmaxf(s_acc[12], s_acc[13]));
+            float max_k_7 = fmaxf(max_k_5, fmaxf(s_acc[14], s_acc[15]));
+            float max_k_8 = fmaxf(max_k_6, fmaxf(s_acc[16], s_acc[17]));
+            float max_k_9 = fmaxf(max_k_7, fmaxf(s_acc[18], s_acc[19]));
+            float max_k_10 = fmaxf(max_k_8, fmaxf(s_acc[20], s_acc[21]));
+            float max_k_11 = fmaxf(max_k_9, fmaxf(s_acc[22], s_acc[23]));
+            float max_k_12 = fmaxf(max_k_10, fmaxf(s_acc[24], s_acc[25]));
+            float max_k_13 = fmaxf(max_k_11, fmaxf(s_acc[26], s_acc[27]));
+            float max_k_14 = fmaxf(max_k_12, fmaxf(s_acc[28], s_acc[29]));
+            float max_k_15 = fmaxf(max_k_13, fmaxf(s_acc[30], s_acc[31]));
+            float max_k_16 = fmaxf(max_k_14, fmaxf(s_acc[32], s_acc[33]));
+            float max_k_17 = fmaxf(max_k_15, fmaxf(s_acc[34], s_acc[35]));
+            float max_k_18 = fmaxf(max_k_16, fmaxf(s_acc[36], s_acc[37]));
+            float max_k_19 = fmaxf(max_k_17, fmaxf(s_acc[38], s_acc[39]));
+            float max_k_20 = fmaxf(max_k_18, fmaxf(s_acc[40], s_acc[41]));
+            float max_k_21 = fmaxf(max_k_19, fmaxf(s_acc[42], s_acc[43]));
+            float max_k_22 = fmaxf(max_k_20, fmaxf(s_acc[44], s_acc[45]));
+            float max_k_23 = fmaxf(max_k_21, fmaxf(s_acc[46], s_acc[47]));
+            float max_k_24 = fmaxf(max_k_22, fmaxf(s_acc[48], s_acc[49]));
+            float max_k_25 = fmaxf(max_k_23, fmaxf(s_acc[50], s_acc[51]));
+            float max_k_26 = fmaxf(max_k_24, fmaxf(s_acc[52], s_acc[53]));
+            float max_k_27 = fmaxf(max_k_25, fmaxf(s_acc[54], s_acc[55]));
+            float max_k_28 = fmaxf(max_k_26, fmaxf(s_acc[56], s_acc[57]));
+            float max_k_29 = fmaxf(max_k_27, fmaxf(s_acc[58], s_acc[59]));
+            float max_k_30 = fmaxf(max_k_28, fmaxf(s_acc[60], s_acc[61]));
+            float max_k_31 = fmaxf(max_k_29, fmaxf(s_acc[62], s_acc[63]));
+            float _shfl_xor_sync_0 = __shfl_xor_sync(0xFFFFFFFF, max_k_30, 1);
+            float _max_32 = fmaxf(max_k_30, _shfl_xor_sync_0);
             float _shfl_xor_sync_1 = __shfl_xor_sync(0xFFFFFFFF, _max_32, 2);
             float _max_33 = fmaxf(_max_32, _shfl_xor_sync_1);
-            float _shfl_xor_sync_2 = __shfl_xor_sync(0xFFFFFFFF, _max_31, 1);
-            float _max_34 = fmaxf(_max_31, _shfl_xor_sync_2);
+            float _shfl_xor_sync_2 = __shfl_xor_sync(0xFFFFFFFF, max_k_31, 1);
+            float _max_34 = fmaxf(max_k_31, _shfl_xor_sync_2);
             float _shfl_xor_sync_3 = __shfl_xor_sync(0xFFFFFFFF, _max_34, 2);
             float _max_35 = fmaxf(_max_34, _shfl_xor_sync_3);
             float _max_36 = fmaxf(m_state[0], _max_33 * (c_row0 * k_scale[head * num_kblocks + kb]));
@@ -828,173 +828,176 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
             float _exp2_1 = approx_exp2(m_state[1] - _max_37);
             m_state[0] = _max_36;
             m_state[1] = _max_37;
-            {
-                float2 _pair_scale_even2_4 = make_float2(_exp2_0, _exp2_0);
-                float2 _pair_scale_odd2_4 = make_float2(_exp2_1, _exp2_1);
-                float2* _pair_scale_src2_4 = reinterpret_cast<float2*>(&o_acc[0]);
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[0]) : "l"(*(unsigned long long*)&_pair_scale_even2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[1]) : "l"(*(unsigned long long*)&_pair_scale_odd2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[2]) : "l"(*(unsigned long long*)&_pair_scale_even2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[3]) : "l"(*(unsigned long long*)&_pair_scale_odd2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[4]) : "l"(*(unsigned long long*)&_pair_scale_even2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[5]) : "l"(*(unsigned long long*)&_pair_scale_odd2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[6]) : "l"(*(unsigned long long*)&_pair_scale_even2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[7]) : "l"(*(unsigned long long*)&_pair_scale_odd2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[8]) : "l"(*(unsigned long long*)&_pair_scale_even2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[9]) : "l"(*(unsigned long long*)&_pair_scale_odd2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[10]) : "l"(*(unsigned long long*)&_pair_scale_even2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[11]) : "l"(*(unsigned long long*)&_pair_scale_odd2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[12]) : "l"(*(unsigned long long*)&_pair_scale_even2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[13]) : "l"(*(unsigned long long*)&_pair_scale_odd2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[14]) : "l"(*(unsigned long long*)&_pair_scale_even2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[15]) : "l"(*(unsigned long long*)&_pair_scale_odd2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[16]) : "l"(*(unsigned long long*)&_pair_scale_even2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[17]) : "l"(*(unsigned long long*)&_pair_scale_odd2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[18]) : "l"(*(unsigned long long*)&_pair_scale_even2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[19]) : "l"(*(unsigned long long*)&_pair_scale_odd2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[20]) : "l"(*(unsigned long long*)&_pair_scale_even2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[21]) : "l"(*(unsigned long long*)&_pair_scale_odd2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[22]) : "l"(*(unsigned long long*)&_pair_scale_even2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[23]) : "l"(*(unsigned long long*)&_pair_scale_odd2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[24]) : "l"(*(unsigned long long*)&_pair_scale_even2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[25]) : "l"(*(unsigned long long*)&_pair_scale_odd2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[26]) : "l"(*(unsigned long long*)&_pair_scale_even2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[27]) : "l"(*(unsigned long long*)&_pair_scale_odd2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[28]) : "l"(*(unsigned long long*)&_pair_scale_even2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[29]) : "l"(*(unsigned long long*)&_pair_scale_odd2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[30]) : "l"(*(unsigned long long*)&_pair_scale_even2_4));
-                asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_4[31]) : "l"(*(unsigned long long*)&_pair_scale_odd2_4));
+            int _warp_vote_4 = __any_sync(0xFFFFFFFF, _exp2_0 != 1.0f || _exp2_1 != 1.0f);
+            if (_warp_vote_4 != 0) {
+                {
+                    float2 _pair_scale_even2_5 = make_float2(_exp2_0, _exp2_0);
+                    float2 _pair_scale_odd2_5 = make_float2(_exp2_1, _exp2_1);
+                    float2* _pair_scale_src2_5 = reinterpret_cast<float2*>(&o_acc[0]);
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[0]) : "l"(*(unsigned long long*)&_pair_scale_even2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[1]) : "l"(*(unsigned long long*)&_pair_scale_odd2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[2]) : "l"(*(unsigned long long*)&_pair_scale_even2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[3]) : "l"(*(unsigned long long*)&_pair_scale_odd2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[4]) : "l"(*(unsigned long long*)&_pair_scale_even2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[5]) : "l"(*(unsigned long long*)&_pair_scale_odd2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[6]) : "l"(*(unsigned long long*)&_pair_scale_even2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[7]) : "l"(*(unsigned long long*)&_pair_scale_odd2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[8]) : "l"(*(unsigned long long*)&_pair_scale_even2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[9]) : "l"(*(unsigned long long*)&_pair_scale_odd2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[10]) : "l"(*(unsigned long long*)&_pair_scale_even2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[11]) : "l"(*(unsigned long long*)&_pair_scale_odd2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[12]) : "l"(*(unsigned long long*)&_pair_scale_even2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[13]) : "l"(*(unsigned long long*)&_pair_scale_odd2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[14]) : "l"(*(unsigned long long*)&_pair_scale_even2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[15]) : "l"(*(unsigned long long*)&_pair_scale_odd2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[16]) : "l"(*(unsigned long long*)&_pair_scale_even2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[17]) : "l"(*(unsigned long long*)&_pair_scale_odd2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[18]) : "l"(*(unsigned long long*)&_pair_scale_even2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[19]) : "l"(*(unsigned long long*)&_pair_scale_odd2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[20]) : "l"(*(unsigned long long*)&_pair_scale_even2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[21]) : "l"(*(unsigned long long*)&_pair_scale_odd2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[22]) : "l"(*(unsigned long long*)&_pair_scale_even2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[23]) : "l"(*(unsigned long long*)&_pair_scale_odd2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[24]) : "l"(*(unsigned long long*)&_pair_scale_even2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[25]) : "l"(*(unsigned long long*)&_pair_scale_odd2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[26]) : "l"(*(unsigned long long*)&_pair_scale_even2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[27]) : "l"(*(unsigned long long*)&_pair_scale_odd2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[28]) : "l"(*(unsigned long long*)&_pair_scale_even2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[29]) : "l"(*(unsigned long long*)&_pair_scale_odd2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[30]) : "l"(*(unsigned long long*)&_pair_scale_even2_5));
+                    asm("mul.rn.f32x2 %0, %0, %1;" : "+l"(*(unsigned long long*)&_pair_scale_src2_5[31]) : "l"(*(unsigned long long*)&_pair_scale_odd2_5));
+                }
             }
-            float _exp2_2 = approx_exp2(__fmaf_rn(s_acc[0], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[0] = _exp2_2;
-            float _exp2_3 = approx_exp2(__fmaf_rn(s_acc[1], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[1] = _exp2_3;
-            float _exp2_4 = approx_exp2(__fmaf_rn(s_acc[2], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[2] = _exp2_4;
-            float _exp2_5 = approx_exp2(__fmaf_rn(s_acc[3], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[3] = _exp2_5;
-            float _exp2_6 = approx_exp2(__fmaf_rn(s_acc[4], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[4] = _exp2_6;
-            float _exp2_7 = approx_exp2(__fmaf_rn(s_acc[5], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[5] = _exp2_7;
-            float _exp2_8 = approx_exp2(__fmaf_rn(s_acc[6], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[6] = _exp2_8;
-            float _exp2_9 = approx_exp2(__fmaf_rn(s_acc[7], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[7] = _exp2_9;
-            float _exp2_10 = approx_exp2(__fmaf_rn(s_acc[8], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[8] = _exp2_10;
-            float _exp2_11 = approx_exp2(__fmaf_rn(s_acc[9], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[9] = _exp2_11;
-            float _exp2_12 = approx_exp2(__fmaf_rn(s_acc[10], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[10] = _exp2_12;
-            float _exp2_13 = approx_exp2(__fmaf_rn(s_acc[11], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[11] = _exp2_13;
-            float _exp2_14 = approx_exp2(__fmaf_rn(s_acc[12], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[12] = _exp2_14;
-            float _exp2_15 = approx_exp2(__fmaf_rn(s_acc[13], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[13] = _exp2_15;
-            float _exp2_16 = approx_exp2(__fmaf_rn(s_acc[14], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[14] = _exp2_16;
-            float _exp2_17 = approx_exp2(__fmaf_rn(s_acc[15], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[15] = _exp2_17;
-            float _exp2_18 = approx_exp2(__fmaf_rn(s_acc[16], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[16] = _exp2_18;
-            float _exp2_19 = approx_exp2(__fmaf_rn(s_acc[17], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[17] = _exp2_19;
-            float _exp2_20 = approx_exp2(__fmaf_rn(s_acc[18], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[18] = _exp2_20;
-            float _exp2_21 = approx_exp2(__fmaf_rn(s_acc[19], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[19] = _exp2_21;
-            float _exp2_22 = approx_exp2(__fmaf_rn(s_acc[20], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[20] = _exp2_22;
-            float _exp2_23 = approx_exp2(__fmaf_rn(s_acc[21], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[21] = _exp2_23;
-            float _exp2_24 = approx_exp2(__fmaf_rn(s_acc[22], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[22] = _exp2_24;
-            float _exp2_25 = approx_exp2(__fmaf_rn(s_acc[23], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[23] = _exp2_25;
-            float _exp2_26 = approx_exp2(__fmaf_rn(s_acc[24], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[24] = _exp2_26;
-            float _exp2_27 = approx_exp2(__fmaf_rn(s_acc[25], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[25] = _exp2_27;
-            float _exp2_28 = approx_exp2(__fmaf_rn(s_acc[26], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[26] = _exp2_28;
-            float _exp2_29 = approx_exp2(__fmaf_rn(s_acc[27], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[27] = _exp2_29;
-            float _exp2_30 = approx_exp2(__fmaf_rn(s_acc[28], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[28] = _exp2_30;
-            float _exp2_31 = approx_exp2(__fmaf_rn(s_acc[29], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[29] = _exp2_31;
-            float _exp2_32 = approx_exp2(__fmaf_rn(s_acc[30], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[30] = _exp2_32;
-            float _exp2_33 = approx_exp2(__fmaf_rn(s_acc[31], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[31] = _exp2_33;
-            float _exp2_34 = approx_exp2(__fmaf_rn(s_acc[32], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[32] = _exp2_34;
-            float _exp2_35 = approx_exp2(__fmaf_rn(s_acc[33], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[33] = _exp2_35;
-            float _exp2_36 = approx_exp2(__fmaf_rn(s_acc[34], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[34] = _exp2_36;
-            float _exp2_37 = approx_exp2(__fmaf_rn(s_acc[35], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[35] = _exp2_37;
-            float _exp2_38 = approx_exp2(__fmaf_rn(s_acc[36], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[36] = _exp2_38;
-            float _exp2_39 = approx_exp2(__fmaf_rn(s_acc[37], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[37] = _exp2_39;
-            float _exp2_40 = approx_exp2(__fmaf_rn(s_acc[38], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[38] = _exp2_40;
-            float _exp2_41 = approx_exp2(__fmaf_rn(s_acc[39], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[39] = _exp2_41;
-            float _exp2_42 = approx_exp2(__fmaf_rn(s_acc[40], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[40] = _exp2_42;
-            float _exp2_43 = approx_exp2(__fmaf_rn(s_acc[41], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[41] = _exp2_43;
-            float _exp2_44 = approx_exp2(__fmaf_rn(s_acc[42], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[42] = _exp2_44;
-            float _exp2_45 = approx_exp2(__fmaf_rn(s_acc[43], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[43] = _exp2_45;
-            float _exp2_46 = approx_exp2(__fmaf_rn(s_acc[44], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[44] = _exp2_46;
-            float _exp2_47 = approx_exp2(__fmaf_rn(s_acc[45], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[45] = _exp2_47;
-            float _exp2_48 = approx_exp2(__fmaf_rn(s_acc[46], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[46] = _exp2_48;
-            float _exp2_49 = approx_exp2(__fmaf_rn(s_acc[47], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[47] = _exp2_49;
-            float _exp2_50 = approx_exp2(__fmaf_rn(s_acc[48], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[48] = _exp2_50;
-            float _exp2_51 = approx_exp2(__fmaf_rn(s_acc[49], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[49] = _exp2_51;
-            float _exp2_52 = approx_exp2(__fmaf_rn(s_acc[50], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[50] = _exp2_52;
-            float _exp2_53 = approx_exp2(__fmaf_rn(s_acc[51], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[51] = _exp2_53;
-            float _exp2_54 = approx_exp2(__fmaf_rn(s_acc[52], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[52] = _exp2_54;
-            float _exp2_55 = approx_exp2(__fmaf_rn(s_acc[53], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[53] = _exp2_55;
-            float _exp2_56 = approx_exp2(__fmaf_rn(s_acc[54], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[54] = _exp2_56;
-            float _exp2_57 = approx_exp2(__fmaf_rn(s_acc[55], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[55] = _exp2_57;
-            float _exp2_58 = approx_exp2(__fmaf_rn(s_acc[56], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[56] = _exp2_58;
-            float _exp2_59 = approx_exp2(__fmaf_rn(s_acc[57], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[57] = _exp2_59;
-            float _exp2_60 = approx_exp2(__fmaf_rn(s_acc[58], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[58] = _exp2_60;
-            float _exp2_61 = approx_exp2(__fmaf_rn(s_acc[59], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[59] = _exp2_61;
-            float _exp2_62 = approx_exp2(__fmaf_rn(s_acc[60], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[60] = _exp2_62;
-            float _exp2_63 = approx_exp2(__fmaf_rn(s_acc[61], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
-            s_acc[61] = _exp2_63;
-            float _exp2_64 = approx_exp2(__fmaf_rn(s_acc[62], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[62] = _exp2_64;
-            float _exp2_65 = approx_exp2(__fmaf_rn(s_acc[63], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
-            s_acc[63] = _exp2_65;
-            l_state[0] = __fmaf_rn(l_state[0], _exp2_0, _exp2_2 + _exp2_3 + _exp2_6 + _exp2_7 + _exp2_10 + _exp2_11 + _exp2_14 + _exp2_15 + _exp2_18 + _exp2_19 + _exp2_22 + _exp2_23 + _exp2_26 + _exp2_27 + _exp2_30 + _exp2_31 + _exp2_34 + _exp2_35 + _exp2_38 + _exp2_39 + _exp2_42 + _exp2_43 + _exp2_46 + _exp2_47 + _exp2_50 + _exp2_51 + _exp2_54 + _exp2_55 + _exp2_58 + _exp2_59 + _exp2_62 + _exp2_63);
-            l_state[1] = __fmaf_rn(l_state[1], _exp2_1, _exp2_4 + _exp2_5 + _exp2_8 + _exp2_9 + _exp2_12 + _exp2_13 + _exp2_16 + _exp2_17 + _exp2_20 + _exp2_21 + _exp2_24 + _exp2_25 + _exp2_28 + _exp2_29 + _exp2_32 + _exp2_33 + _exp2_36 + _exp2_37 + _exp2_40 + _exp2_41 + _exp2_44 + _exp2_45 + _exp2_48 + _exp2_49 + _exp2_52 + _exp2_53 + _exp2_56 + _exp2_57 + _exp2_60 + _exp2_61 + _exp2_64 + _exp2_65);
+            float exp2_k_0 = approx_exp2(__fmaf_rn(s_acc[0], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[0] = exp2_k_0;
+            float exp2_k_1 = approx_exp2(__fmaf_rn(s_acc[1], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[1] = exp2_k_1;
+            float exp2_k_2 = approx_exp2(__fmaf_rn(s_acc[2], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[2] = exp2_k_2;
+            float exp2_k_3 = approx_exp2(__fmaf_rn(s_acc[3], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[3] = exp2_k_3;
+            float exp2_k_4 = approx_exp2(__fmaf_rn(s_acc[4], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[4] = exp2_k_4;
+            float exp2_k_5 = approx_exp2(__fmaf_rn(s_acc[5], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[5] = exp2_k_5;
+            float exp2_k_6 = approx_exp2(__fmaf_rn(s_acc[6], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[6] = exp2_k_6;
+            float exp2_k_7 = approx_exp2(__fmaf_rn(s_acc[7], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[7] = exp2_k_7;
+            float exp2_k_8 = approx_exp2(__fmaf_rn(s_acc[8], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[8] = exp2_k_8;
+            float exp2_k_9 = approx_exp2(__fmaf_rn(s_acc[9], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[9] = exp2_k_9;
+            float exp2_k_10 = approx_exp2(__fmaf_rn(s_acc[10], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[10] = exp2_k_10;
+            float exp2_k_11 = approx_exp2(__fmaf_rn(s_acc[11], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[11] = exp2_k_11;
+            float exp2_k_12 = approx_exp2(__fmaf_rn(s_acc[12], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[12] = exp2_k_12;
+            float exp2_k_13 = approx_exp2(__fmaf_rn(s_acc[13], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[13] = exp2_k_13;
+            float exp2_k_14 = approx_exp2(__fmaf_rn(s_acc[14], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[14] = exp2_k_14;
+            float exp2_k_15 = approx_exp2(__fmaf_rn(s_acc[15], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[15] = exp2_k_15;
+            float exp2_k_16 = approx_exp2(__fmaf_rn(s_acc[16], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[16] = exp2_k_16;
+            float exp2_k_17 = approx_exp2(__fmaf_rn(s_acc[17], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[17] = exp2_k_17;
+            float exp2_k_18 = approx_exp2(__fmaf_rn(s_acc[18], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[18] = exp2_k_18;
+            float exp2_k_19 = approx_exp2(__fmaf_rn(s_acc[19], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[19] = exp2_k_19;
+            float exp2_k_20 = approx_exp2(__fmaf_rn(s_acc[20], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[20] = exp2_k_20;
+            float exp2_k_21 = approx_exp2(__fmaf_rn(s_acc[21], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[21] = exp2_k_21;
+            float exp2_k_22 = approx_exp2(__fmaf_rn(s_acc[22], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[22] = exp2_k_22;
+            float exp2_k_23 = approx_exp2(__fmaf_rn(s_acc[23], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[23] = exp2_k_23;
+            float exp2_k_24 = approx_exp2(__fmaf_rn(s_acc[24], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[24] = exp2_k_24;
+            float exp2_k_25 = approx_exp2(__fmaf_rn(s_acc[25], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[25] = exp2_k_25;
+            float exp2_k_26 = approx_exp2(__fmaf_rn(s_acc[26], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[26] = exp2_k_26;
+            float exp2_k_27 = approx_exp2(__fmaf_rn(s_acc[27], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[27] = exp2_k_27;
+            float exp2_k_28 = approx_exp2(__fmaf_rn(s_acc[28], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[28] = exp2_k_28;
+            float exp2_k_29 = approx_exp2(__fmaf_rn(s_acc[29], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[29] = exp2_k_29;
+            float exp2_k_30 = approx_exp2(__fmaf_rn(s_acc[30], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[30] = exp2_k_30;
+            float exp2_k_31 = approx_exp2(__fmaf_rn(s_acc[31], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[31] = exp2_k_31;
+            float exp2_k_32 = approx_exp2(__fmaf_rn(s_acc[32], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[32] = exp2_k_32;
+            float exp2_k_33 = approx_exp2(__fmaf_rn(s_acc[33], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[33] = exp2_k_33;
+            float exp2_k_34 = approx_exp2(__fmaf_rn(s_acc[34], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[34] = exp2_k_34;
+            float exp2_k_35 = approx_exp2(__fmaf_rn(s_acc[35], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[35] = exp2_k_35;
+            float exp2_k_36 = approx_exp2(__fmaf_rn(s_acc[36], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[36] = exp2_k_36;
+            float exp2_k_37 = approx_exp2(__fmaf_rn(s_acc[37], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[37] = exp2_k_37;
+            float exp2_k_38 = approx_exp2(__fmaf_rn(s_acc[38], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[38] = exp2_k_38;
+            float exp2_k_39 = approx_exp2(__fmaf_rn(s_acc[39], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[39] = exp2_k_39;
+            float exp2_k_40 = approx_exp2(__fmaf_rn(s_acc[40], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[40] = exp2_k_40;
+            float exp2_k_41 = approx_exp2(__fmaf_rn(s_acc[41], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[41] = exp2_k_41;
+            float exp2_k_42 = approx_exp2(__fmaf_rn(s_acc[42], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[42] = exp2_k_42;
+            float exp2_k_43 = approx_exp2(__fmaf_rn(s_acc[43], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[43] = exp2_k_43;
+            float exp2_k_44 = approx_exp2(__fmaf_rn(s_acc[44], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[44] = exp2_k_44;
+            float exp2_k_45 = approx_exp2(__fmaf_rn(s_acc[45], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[45] = exp2_k_45;
+            float exp2_k_46 = approx_exp2(__fmaf_rn(s_acc[46], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[46] = exp2_k_46;
+            float exp2_k_47 = approx_exp2(__fmaf_rn(s_acc[47], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[47] = exp2_k_47;
+            float exp2_k_48 = approx_exp2(__fmaf_rn(s_acc[48], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[48] = exp2_k_48;
+            float exp2_k_49 = approx_exp2(__fmaf_rn(s_acc[49], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[49] = exp2_k_49;
+            float exp2_k_50 = approx_exp2(__fmaf_rn(s_acc[50], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[50] = exp2_k_50;
+            float exp2_k_51 = approx_exp2(__fmaf_rn(s_acc[51], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[51] = exp2_k_51;
+            float exp2_k_52 = approx_exp2(__fmaf_rn(s_acc[52], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[52] = exp2_k_52;
+            float exp2_k_53 = approx_exp2(__fmaf_rn(s_acc[53], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[53] = exp2_k_53;
+            float exp2_k_54 = approx_exp2(__fmaf_rn(s_acc[54], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[54] = exp2_k_54;
+            float exp2_k_55 = approx_exp2(__fmaf_rn(s_acc[55], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[55] = exp2_k_55;
+            float exp2_k_56 = approx_exp2(__fmaf_rn(s_acc[56], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[56] = exp2_k_56;
+            float exp2_k_57 = approx_exp2(__fmaf_rn(s_acc[57], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[57] = exp2_k_57;
+            float exp2_k_58 = approx_exp2(__fmaf_rn(s_acc[58], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[58] = exp2_k_58;
+            float exp2_k_59 = approx_exp2(__fmaf_rn(s_acc[59], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[59] = exp2_k_59;
+            float exp2_k_60 = approx_exp2(__fmaf_rn(s_acc[60], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[60] = exp2_k_60;
+            float exp2_k_61 = approx_exp2(__fmaf_rn(s_acc[61], c_row0 * k_scale[head * num_kblocks + kb], 8.0f - _max_36));
+            s_acc[61] = exp2_k_61;
+            float exp2_k_62 = approx_exp2(__fmaf_rn(s_acc[62], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[62] = exp2_k_62;
+            float exp2_k_63 = approx_exp2(__fmaf_rn(s_acc[63], c_row1 * k_scale[head * num_kblocks + kb], 8.0f - _max_37));
+            s_acc[63] = exp2_k_63;
+            l_state[0] = __fmaf_rn(l_state[0], _exp2_0, exp2_k_0 + exp2_k_1 + exp2_k_4 + exp2_k_5 + exp2_k_8 + exp2_k_9 + exp2_k_12 + exp2_k_13 + exp2_k_16 + exp2_k_17 + exp2_k_20 + exp2_k_21 + exp2_k_24 + exp2_k_25 + exp2_k_28 + exp2_k_29 + exp2_k_32 + exp2_k_33 + exp2_k_36 + exp2_k_37 + exp2_k_40 + exp2_k_41 + exp2_k_44 + exp2_k_45 + exp2_k_48 + exp2_k_49 + exp2_k_52 + exp2_k_53 + exp2_k_56 + exp2_k_57 + exp2_k_60 + exp2_k_61);
+            l_state[1] = __fmaf_rn(l_state[1], _exp2_1, exp2_k_2 + exp2_k_3 + exp2_k_6 + exp2_k_7 + exp2_k_10 + exp2_k_11 + exp2_k_14 + exp2_k_15 + exp2_k_18 + exp2_k_19 + exp2_k_22 + exp2_k_23 + exp2_k_26 + exp2_k_27 + exp2_k_30 + exp2_k_31 + exp2_k_34 + exp2_k_35 + exp2_k_38 + exp2_k_39 + exp2_k_42 + exp2_k_43 + exp2_k_46 + exp2_k_47 + exp2_k_50 + exp2_k_51 + exp2_k_54 + exp2_k_55 + exp2_k_58 + exp2_k_59 + exp2_k_62 + exp2_k_63);
             p_tmp[0] = s_acc[0];
             p_tmp[1] = s_acc[1];
             p_tmp[2] = s_acc[4];
@@ -1691,21 +1694,21 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         }
         float l0 = l_state[0];
         float l1 = l_state[1];
-        float _shfl_xor_sync_5 = __shfl_xor_sync(0xFFFFFFFF, l0, 1);
-        l0 = l0 + _shfl_xor_sync_5;
-        float _shfl_xor_sync_6 = __shfl_xor_sync(0xFFFFFFFF, l0, 2);
+        float _shfl_xor_sync_6 = __shfl_xor_sync(0xFFFFFFFF, l0, 1);
         l0 = l0 + _shfl_xor_sync_6;
-        float _shfl_xor_sync_7 = __shfl_xor_sync(0xFFFFFFFF, l1, 1);
-        l1 = l1 + _shfl_xor_sync_7;
-        float _shfl_xor_sync_8 = __shfl_xor_sync(0xFFFFFFFF, l1, 2);
+        float _shfl_xor_sync_7 = __shfl_xor_sync(0xFFFFFFFF, l0, 2);
+        l0 = l0 + _shfl_xor_sync_7;
+        float _shfl_xor_sync_8 = __shfl_xor_sync(0xFFFFFFFF, l1, 1);
         l1 = l1 + _shfl_xor_sync_8;
+        float _shfl_xor_sync_9 = __shfl_xor_sync(0xFFFFFFFF, l1, 2);
+        l1 = l1 + _shfl_xor_sync_9;
         float inv0 = approx_rcp(l0);
         float inv1 = approx_rcp(l1);
         float _vec_load_0[2];
         {
-            float2 _v2_9 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + (lane & 3) * 2) + 0);
-            _vec_load_0[0] = _v2_9.x;
-            _vec_load_0[0 + 1] = _v2_9.y;
+            float2 _v2_10 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + (lane & 3) * 2) + 0);
+            _vec_load_0[0] = _v2_10.x;
+            _vec_load_0[0 + 1] = _v2_10.y;
         }
         o_tmp[0] = o_acc[0] * inv0 * _vec_load_0[0];
         o_tmp[1] = o_acc[1] * inv0 * _vec_load_0[1];
@@ -1731,9 +1734,9 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         }
         float _vec_load_1[2];
         {
-            float2 _v2_10 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 8 + (lane & 3) * 2) + 0);
-            _vec_load_1[0] = _v2_10.x;
-            _vec_load_1[0 + 1] = _v2_10.y;
+            float2 _v2_11 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 8 + (lane & 3) * 2) + 0);
+            _vec_load_1[0] = _v2_11.x;
+            _vec_load_1[0 + 1] = _v2_11.y;
         }
         o_tmp[0] = o_acc[4] * inv0 * _vec_load_1[0];
         o_tmp[1] = o_acc[5] * inv0 * _vec_load_1[1];
@@ -1759,9 +1762,9 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         }
         float _vec_load_2[2];
         {
-            float2 _v2_11 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 16 + (lane & 3) * 2) + 0);
-            _vec_load_2[0] = _v2_11.x;
-            _vec_load_2[0 + 1] = _v2_11.y;
+            float2 _v2_12 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 16 + (lane & 3) * 2) + 0);
+            _vec_load_2[0] = _v2_12.x;
+            _vec_load_2[0 + 1] = _v2_12.y;
         }
         o_tmp[0] = o_acc[8] * inv0 * _vec_load_2[0];
         o_tmp[1] = o_acc[9] * inv0 * _vec_load_2[1];
@@ -1787,9 +1790,9 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         }
         float _vec_load_3[2];
         {
-            float2 _v2_12 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 24 + (lane & 3) * 2) + 0);
-            _vec_load_3[0] = _v2_12.x;
-            _vec_load_3[0 + 1] = _v2_12.y;
+            float2 _v2_13 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 24 + (lane & 3) * 2) + 0);
+            _vec_load_3[0] = _v2_13.x;
+            _vec_load_3[0 + 1] = _v2_13.y;
         }
         o_tmp[0] = o_acc[12] * inv0 * _vec_load_3[0];
         o_tmp[1] = o_acc[13] * inv0 * _vec_load_3[1];
@@ -1815,9 +1818,9 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         }
         float _vec_load_4[2];
         {
-            float2 _v2_13 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 32 + (lane & 3) * 2) + 0);
-            _vec_load_4[0] = _v2_13.x;
-            _vec_load_4[0 + 1] = _v2_13.y;
+            float2 _v2_14 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 32 + (lane & 3) * 2) + 0);
+            _vec_load_4[0] = _v2_14.x;
+            _vec_load_4[0 + 1] = _v2_14.y;
         }
         o_tmp[0] = o_acc[16] * inv0 * _vec_load_4[0];
         o_tmp[1] = o_acc[17] * inv0 * _vec_load_4[1];
@@ -1843,9 +1846,9 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         }
         float _vec_load_5[2];
         {
-            float2 _v2_14 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 40 + (lane & 3) * 2) + 0);
-            _vec_load_5[0] = _v2_14.x;
-            _vec_load_5[0 + 1] = _v2_14.y;
+            float2 _v2_15 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 40 + (lane & 3) * 2) + 0);
+            _vec_load_5[0] = _v2_15.x;
+            _vec_load_5[0 + 1] = _v2_15.y;
         }
         o_tmp[0] = o_acc[20] * inv0 * _vec_load_5[0];
         o_tmp[1] = o_acc[21] * inv0 * _vec_load_5[1];
@@ -1871,9 +1874,9 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         }
         float _vec_load_6[2];
         {
-            float2 _v2_15 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 48 + (lane & 3) * 2) + 0);
-            _vec_load_6[0] = _v2_15.x;
-            _vec_load_6[0 + 1] = _v2_15.y;
+            float2 _v2_16 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 48 + (lane & 3) * 2) + 0);
+            _vec_load_6[0] = _v2_16.x;
+            _vec_load_6[0 + 1] = _v2_16.y;
         }
         o_tmp[0] = o_acc[24] * inv0 * _vec_load_6[0];
         o_tmp[1] = o_acc[25] * inv0 * _vec_load_6[1];
@@ -1899,9 +1902,9 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         }
         float _vec_load_7[2];
         {
-            float2 _v2_16 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 56 + (lane & 3) * 2) + 0);
-            _vec_load_7[0] = _v2_16.x;
-            _vec_load_7[0 + 1] = _v2_16.y;
+            float2 _v2_17 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 56 + (lane & 3) * 2) + 0);
+            _vec_load_7[0] = _v2_17.x;
+            _vec_load_7[0 + 1] = _v2_17.y;
         }
         o_tmp[0] = o_acc[28] * inv0 * _vec_load_7[0];
         o_tmp[1] = o_acc[29] * inv0 * _vec_load_7[1];
@@ -1927,9 +1930,9 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         }
         float _vec_load_8[2];
         {
-            float2 _v2_17 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 64 + (lane & 3) * 2) + 0);
-            _vec_load_8[0] = _v2_17.x;
-            _vec_load_8[0 + 1] = _v2_17.y;
+            float2 _v2_18 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 64 + (lane & 3) * 2) + 0);
+            _vec_load_8[0] = _v2_18.x;
+            _vec_load_8[0 + 1] = _v2_18.y;
         }
         o_tmp[0] = o_acc[32] * inv0 * _vec_load_8[0];
         o_tmp[1] = o_acc[33] * inv0 * _vec_load_8[1];
@@ -1955,9 +1958,9 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         }
         float _vec_load_9[2];
         {
-            float2 _v2_18 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 72 + (lane & 3) * 2) + 0);
-            _vec_load_9[0] = _v2_18.x;
-            _vec_load_9[0 + 1] = _v2_18.y;
+            float2 _v2_19 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 72 + (lane & 3) * 2) + 0);
+            _vec_load_9[0] = _v2_19.x;
+            _vec_load_9[0 + 1] = _v2_19.y;
         }
         o_tmp[0] = o_acc[36] * inv0 * _vec_load_9[0];
         o_tmp[1] = o_acc[37] * inv0 * _vec_load_9[1];
@@ -1983,9 +1986,9 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         }
         float _vec_load_10[2];
         {
-            float2 _v2_19 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 80 + (lane & 3) * 2) + 0);
-            _vec_load_10[0] = _v2_19.x;
-            _vec_load_10[0 + 1] = _v2_19.y;
+            float2 _v2_20 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 80 + (lane & 3) * 2) + 0);
+            _vec_load_10[0] = _v2_20.x;
+            _vec_load_10[0 + 1] = _v2_20.y;
         }
         o_tmp[0] = o_acc[40] * inv0 * _vec_load_10[0];
         o_tmp[1] = o_acc[41] * inv0 * _vec_load_10[1];
@@ -2011,9 +2014,9 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         }
         float _vec_load_11[2];
         {
-            float2 _v2_20 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 88 + (lane & 3) * 2) + 0);
-            _vec_load_11[0] = _v2_20.x;
-            _vec_load_11[0 + 1] = _v2_20.y;
+            float2 _v2_21 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 88 + (lane & 3) * 2) + 0);
+            _vec_load_11[0] = _v2_21.x;
+            _vec_load_11[0 + 1] = _v2_21.y;
         }
         o_tmp[0] = o_acc[44] * inv0 * _vec_load_11[0];
         o_tmp[1] = o_acc[45] * inv0 * _vec_load_11[1];
@@ -2039,9 +2042,9 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         }
         float _vec_load_12[2];
         {
-            float2 _v2_21 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 96 + (lane & 3) * 2) + 0);
-            _vec_load_12[0] = _v2_21.x;
-            _vec_load_12[0 + 1] = _v2_21.y;
+            float2 _v2_22 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 96 + (lane & 3) * 2) + 0);
+            _vec_load_12[0] = _v2_22.x;
+            _vec_load_12[0 + 1] = _v2_22.y;
         }
         o_tmp[0] = o_acc[48] * inv0 * _vec_load_12[0];
         o_tmp[1] = o_acc[49] * inv0 * _vec_load_12[1];
@@ -2067,9 +2070,9 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         }
         float _vec_load_13[2];
         {
-            float2 _v2_22 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 104 + (lane & 3) * 2) + 0);
-            _vec_load_13[0] = _v2_22.x;
-            _vec_load_13[0 + 1] = _v2_22.y;
+            float2 _v2_23 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 104 + (lane & 3) * 2) + 0);
+            _vec_load_13[0] = _v2_23.x;
+            _vec_load_13[0 + 1] = _v2_23.y;
         }
         o_tmp[0] = o_acc[52] * inv0 * _vec_load_13[0];
         o_tmp[1] = o_acc[53] * inv0 * _vec_load_13[1];
@@ -2095,9 +2098,9 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         }
         float _vec_load_14[2];
         {
-            float2 _v2_23 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 112 + (lane & 3) * 2) + 0);
-            _vec_load_14[0] = _v2_23.x;
-            _vec_load_14[0 + 1] = _v2_23.y;
+            float2 _v2_24 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 112 + (lane & 3) * 2) + 0);
+            _vec_load_14[0] = _v2_24.x;
+            _vec_load_14[0 + 1] = _v2_24.y;
         }
         o_tmp[0] = o_acc[56] * inv0 * _vec_load_14[0];
         o_tmp[1] = o_acc[57] * inv0 * _vec_load_14[1];
@@ -2123,9 +2126,9 @@ kernel_cake_minimax_h3_sm120_quant_varlen_attention_2fcf8d095e20c53cdc4b(const _
         }
         float _vec_load_15[2];
         {
-            float2 _v2_24 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 120 + (lane & 3) * 2) + 0);
-            _vec_load_15[0] = _v2_24.x;
-            _vec_load_15[0 + 1] = _v2_24.y;
+            float2 _v2_25 = *reinterpret_cast<const float2*>(v_scale + ((seg * num_heads + head) * 128 + 120 + (lane & 3) * 2) + 0);
+            _vec_load_15[0] = _v2_25.x;
+            _vec_load_15[0 + 1] = _v2_25.y;
         }
         o_tmp[0] = o_acc[60] * inv0 * _vec_load_15[0];
         o_tmp[1] = o_acc[61] * inv0 * _vec_load_15[1];
