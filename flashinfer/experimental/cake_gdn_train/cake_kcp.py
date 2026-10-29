@@ -586,8 +586,10 @@ class KcpRecomputeHandle:
 
     ``entries`` maps an operation key to that operation's boundary entry: ``"gdn"`` is this package's (the forward's
     incoming states ``S_in``, the very tensor the saved set holds, no copy); other packages that accept a handle
-    with an ``entries`` dict (the causal convolution's halo rows, key ``"conv"``) use their own keys, so one handle
-    serves a whole layer.  A forward that finds no entry is an original forward: it exchanges as always and stores
+    with an ``entries`` dict (the causal convolution's halo rows, key ``"conv"``) use their own keys.  A handle
+    holds one entry per key: it serves one GDN call and at most one convolution call; a layer with several
+    convolution calls (separate Q / K / V convolutions) uses one handle per convolution call, and the GDN call
+    shares one of them.  A forward that finds no entry is an original forward: it exchanges as always and stores
     its entry.  The recompute (inside the backward) finds the entry, checks it against the call and exchanges
     nothing; the entry stays for a second backward (``retain_graph``).  A forward outside the backward that finds an
     entry raises (a handle reused across micro-steps).  With nested checkpoint regions create the handles outside

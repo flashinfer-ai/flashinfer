@@ -313,8 +313,9 @@ def chunk_gdn_kcp(
 
         y = torch.utils.checkpoint.checkpoint(layer, x, KcpRecomputeHandle(), use_reentrant=False)
 
-    One handle serves the whole layer: the context-parallel convolution keeps its halo rows in the same handle under
-    its own key.  Needs ``boundary_mode="saved"`` and ``graph="off"``; implies ``save_transfer=False``.  A forward
+    A handle holds one entry per key: it serves this call and at most one context-parallel convolution call (whose
+    halo rows go under the key ``"conv"``); a layer with separate Q / K / V convolutions uses one handle per
+    convolution call, and this call shares one of them.  Needs ``boundary_mode="saved"`` and ``graph="off"``; implies ``save_transfer=False``.  A forward
     outside the backward that finds an entry raises (a handle reused across micro-steps).
     """
     return _pkg().chunk_gdn_kcp(

@@ -189,9 +189,11 @@ region (a handle created inside a region is empty again in that region's
 recompute, which then exchanges as usual).  The handle needs
 `boundary_mode="saved"` and `graph="off"` and implies `save_transfer=False`.
 A forward outside the backward that finds an entry raises (a handle reused
-across micro-steps).  Other operations of the layer keep their own
-boundary rows in the same handle under their own key (the convolution's halo
-rows under `"conv"`).
+across micro-steps).  Other operations keep their own boundary rows in a
+handle under their own key (the convolution's halo rows under `"conv"`).  A
+handle holds one entry per key: it serves one GDN call and at most one
+convolution call; a layer with separate Q / K / V convolutions uses one handle
+per convolution call, and the GDN call shares one of them.
 
 ```
 gdn_kcp_comm_bytes(ctx, *, H_qk, HV, C) -> {rank: {c1_send, c1_recv, c2_recv, b1_send, b2_recv, halo_fwd, halo_bwd}}
