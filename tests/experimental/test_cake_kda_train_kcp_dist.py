@@ -224,6 +224,55 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
     # the shipped default keeps the owner's c1 receive tensor for the backward (save_transfer=True); the recompute
     # form (save_transfer=False) re-sends it and must be bitwise the same
     res_recompute = saved_pass(save_transfer=False)
+    # the forward-only workspace (the KCP forward layout, the lazy pools) against this backward workspace: a saving
+    # forward on an empty workspace holds the predicted bytes and none of the lazy pools, a forward without a saved
+    # set adds their predicted bytes, both give this workspace's out (and saved set) bitwise, and the backward that
+    # upgrades the forward-only workspace gives the same gradients; workspace=None (a forward-only arena per call)
+    # through autograd too
+    out_b, saved_b = cake_kcp.chunk_kda_kcp_fwd(q, k, v, g, beta, ctx, workspace=ws)
+    ws_f, ws_n = cake_kcp.KcpWorkspace(), cake_kcp.KcpWorkspace()
+    out_f, saved_f = cake_kcp.chunk_kda_kcp_fwd(q, k, v, g, beta, ctx, workspace=ws_f)
+    out_n, _ = cake_kcp.chunk_kda_kcp_fwd(
+        q, k, v, g, beta, ctx, workspace=ws_n, save_for_backward=False
+    )
+    pred_f = cake_kcp_plan.kcp_workspace_bytes(ctx, H=H, backward=False)
+    lazy_f = cake_kcp_plan.kcp_arena_layout(ctx, H=H, backward=False)["lazy"]
+    fwd_only_bytes = (
+        ws_f.bytes == pred_f
+        and not any(ws_f.has(n) for n in cake_kcp_plan.FWD_LAZY_POOLS)
+        and ws_n.bytes == pred_f + lazy_f
+        and (ws_f.local is None or ws_f.local.fwd_layout == "fwd_kcp")
+    )
+    dq, dk, dv, dbeta, dg = cake_kcp.chunk_kda_kcp_bwd(
+        q, k, v, g, beta, ctx, dout, saved=saved_f, workspace=ws_f
+    )
+    res_fwd_only = {
+        "out": out_f,
+        "dq": dq,
+        "dk": dk,
+        "dv": dv,
+        "dg": dg,
+        "dbeta": dbeta,
+    }
+    fwd_only_eq = (
+        torch.equal(out_b, res["out"])
+        and torch.equal(out_n, res["out"])
+        and saved_f.flags() == saved_b.flags()
+        and all(
+            torch.equal(a, b)
+            for a, b in zip(saved_f.tensors(), saved_b.tensors(), strict=True)
+        )
+        and all(torch.equal(res[n], res_fwd_only[n]) for n in TENSORS)
+    )
+    del ws_f, ws_n, out_b, saved_b, out_f, saved_f, out_n, res_fwd_only
+    leaves = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
+    out_0 = cake_kcp.chunk_kda_kcp(*leaves, ctx)
+    out_0.backward(dout)
+    ws_none_eq = torch.equal(out_0.detach(), res["out"]) and all(
+        torch.equal(lf.grad, res[f"d{n}"])
+        for n, lf in zip(("q", "k", "v", "g", "beta"), leaves, strict=True)
+    )
+    del leaves, out_0
     ring_ok = True
     if (
         W > 1 and int(ctx.n_d_max) - 1 <= cake_kcp.RING_MAX_HOPS
@@ -257,6 +306,9 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
         "autograd_eq_saved": all(torch.equal(res[n], res_auto[n]) for n in TENSORS),
         "ckpt_eq_direct": all(torch.equal(res_auto[n], res_ckpt[n]) for n in TENSORS),
         "save_transfer_eq": all(torch.equal(res[n], res_recompute[n]) for n in TENSORS),
+        "fwd_only_eq": fwd_only_eq,
+        "fwd_only_bytes": fwd_only_bytes,
+        "ws_none_eq": ws_none_eq,
         "ring_eq_a2a": ring_ok,
         "graph_replay": events == GRAPH_EVENTS
         and all(torch.equal(res[n], res_graph[n]) for n in TENSORS),

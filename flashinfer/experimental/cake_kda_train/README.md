@@ -641,7 +641,18 @@ send pools (a call waits its sends before a backward writes either), and the
 ring exchange's hop pools are allocated by the first `exchange="ring"` call.
 `kcp_workspace_bytes` is the number of bytes an a2a workspace allocates
 (`KcpWorkspace.bytes` after its first backward); the saved set and the
-convolution's halo rows are per-call tensors outside it.
+convolution's halo rows are per-call tensors outside it.  A workspace that
+has served forwards only (`kcp_workspace_bytes(..., backward=False)`) holds
+its local arena in the KCP forward layout (`fwd_kcp`: 2432 B per internal
+token-head against at least 2560 for the existing backend's forward layout;
+no segment state blocks, the internal `Akk` rows under the `h` tape) and leaves
+the c1 receive, transfer staging and carry pools to their first reader: a
+forward with a saved set writes fresh saved-set tensors in their place, so
+only a forward without one allocates them
+(`cake_kcp_plan.kcp_arena_layout(ctx, H=H, backward=False)["lazy"]` bytes
+more).  The first backward on such a workspace releases its forward arena
+before it allocates the backward one; outputs, saved sets and gradients are
+bitwise those of a backward workspace.
 
 Saved set of a rank (`KcpSaved`, `boundary_mode="saved"`): the fresh `S_in`
 (the initial states of its fragments), with `save_transfer` the owner's c1

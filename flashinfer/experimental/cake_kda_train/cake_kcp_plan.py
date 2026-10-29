@@ -2158,6 +2158,12 @@ SHARED_POOLS = (("c1_send", "b1_send"), ("c2_send", "b2_send"))
 # Pools a workspace allocates on first use only: the ring exchange's hop buffers (``exchange="ring"``), which the
 # a2a exchange never reads.
 LAZY_POOLS = ("ring_out", "ring_in")
+# Pools a forward-only workspace (``backward=False``) allocates on first use only: the c1 receive pool and, at
+# ``P > 1``, the staging plane of the transfers and the carry plane.  A forward with a saved set under the shipped
+# options writes fresh saved-set tensors in their place (``save_transfer``, the saved carry plane) and never reads
+# them; a forward without a saved set reads them (with ``save_transfer=False`` a saving forward reads the first two),
+# and a backward workspace sizes them up front.
+FWD_LAZY_POOLS = ("c1_recv", "stage_m", "carry")
 # The pools a workspace sizes for a forward (``backward=False``) and the ones a backward workspace adds.
 FWD_POOLS = (
     "c1_send",
@@ -2217,7 +2223,9 @@ def kcp_arena_layout(
     ``pool.<name>``: the bytes each pool of a forward (``backward=False``) or a backward workspace needs
     (:func:`kcp_pool_numel`, 4 B per element); ``arena``: the bytes the workspace allocates -- every pool once, each
     :data:`SHARED_POOLS` pair as one storage of the larger need, the :data:`LAZY_POOLS` not at all (``ring``: the bytes
-    a call with ``exchange="ring"`` adds on first use).  The saved set (``S_in``, the c1 receive tensor kept with
+    a call with ``exchange="ring"`` adds on first use) and, in a forward workspace, the :data:`FWD_LAZY_POOLS` not at
+    all either (``lazy``: the bytes the first forward that reads them adds -- a forward without a saved set; zero in a
+    backward workspace, which counts them in ``arena``).  The saved set (``S_in``, the c1 receive tensor kept with
     ``save_transfer``, ``M_seg``, the forward's saved copy of the carry plane; :func:`kcp_saved_bytes`; the ``carry``
     pool the backward's adjoint carries use is a workspace pool) and the convolution route's halo rows
     (per-call tensors; their traffic: :func:`kcp_comm_bytes` ``halo_fwd`` / ``halo_bwd``) are never workspace pools,
@@ -2228,8 +2236,9 @@ def kcp_arena_layout(
         name: numel[name] * 4 for name in FWD_POOLS + (BWD_POOLS if backward else ())
     }
     shared = {name for pair in SHARED_POOLS for name in pair}
+    lazy = LAZY_POOLS + (() if backward else FWD_LAZY_POOLS)
     arena = sum(
-        v for name, v in need.items() if name not in shared and name not in LAZY_POOLS
+        v for name, v in need.items() if name not in shared and name not in lazy
     )
     arena += sum(
         max((need[name] for name in pair if name in need), default=0)
@@ -2237,6 +2246,7 @@ def kcp_arena_layout(
     )
     out = {f"pool.{name}": v for name, v in need.items()}
     out["ring"] = sum(need[name] for name in LAZY_POOLS)
+    out["lazy"] = 0 if backward else sum(need[name] for name in FWD_LAZY_POOLS)
     out["arena"] = arena
     return out
 
@@ -2247,6 +2257,16 @@ def kcp_arena_layout(
 # the KCP's ``dav`` read; its WY and fused-gradient records read the recomputed internal rows).
 LOCAL_PATH_FWD = "fwd_nosave"
 LOCAL_PATH_BWD = "replay"
+# The layout of a forward-only local arena: the KCP route's own forward layout (``cake_backend.FWD_KCP_SLOTS``; no
+# state blocks, the internal Akk rows under the h tape), which the existing backend's forward layout contains.
+LOCAL_LAYOUT_FWD_ONLY = "fwd_kcp"
+
+
+def local_fwd_layout(backward: bool, save_mode: str = "light") -> str:
+    """The forward layout (``cake_backend.KdaWorkspace`` ``fwd_layout``) of a rank's local arena:
+    :data:`LOCAL_LAYOUT_FWD_ONLY` for a forward-only light workspace, else ``"fwd"`` (a backward workspace keeps the
+    existing backend's layouts, so a forward on it runs on that arena's ``fwd`` views)."""
+    return LOCAL_LAYOUT_FWD_ONLY if not backward and save_mode == "light" else "fwd"
 
 
 def intra_writes_tables(plan, path: str = LOCAL_PATH_FWD) -> bool:
@@ -2277,9 +2297,13 @@ def kcp_workspace_bytes(
     C: int = 8192,
 ) -> int:
     """Caller-held workspace bytes of one rank: the existing backend's local arena for ``(T_r, n_frag, H)``
-    (``kda_train_workspace_bytes``; zero on a rank without tokens) with the intra record's scratch table set where
-    it writes one (:func:`local_scratch_table_bytes`), plus the KCP arena of transient buffers
-    (:func:`kcp_arena_layout`; CONSISTENCY-6, SPEC-4: saved-set tensors are counted by :func:`kcp_saved_bytes`)."""
+    (``kda_train_workspace_bytes``; zero on a rank without tokens; a forward-only light workspace,
+    ``backward=False``, takes the KCP forward layout :data:`LOCAL_LAYOUT_FWD_ONLY`, 2432 B per internal token-head)
+    with the intra record's scratch table set where it writes one (:func:`local_scratch_table_bytes`), plus the KCP
+    arena of transient buffers (:func:`kcp_arena_layout`; CONSISTENCY-6, SPEC-4: saved-set tensors are counted by
+    :func:`kcp_saved_bytes`).  A forward-only workspace has two states: these bytes after its forwards with a saved
+    set (the training forward), and ``kcp_arena_layout(...)["lazy"]`` more once a forward without one has read the
+    :data:`FWD_LAZY_POOLS`; the ring exchange's hop pools (``["ring"]``) are not counted either."""
     _check_save_mode(save_mode)
     local = 0
     if ctx.T_r > 0:
@@ -2295,6 +2319,7 @@ def kcp_workspace_bytes(
                 backward=backward,
                 save_mode=save_mode,
                 sm_count=ctx.sm_count,
+                fwd_layout=local_fwd_layout(backward, save_mode),
             )
         )
         # the scratch table set where the intra record writes one (the rule is architecture-independent; the
@@ -2394,6 +2419,7 @@ __all__ = [
     "SAVE_TRANSFER_DEFAULT",
     "SHARED_POOLS",
     "LAZY_POOLS",
+    "FWD_LAZY_POOLS",
     "FWD_POOLS",
     "BWD_POOLS",
     "STATE_TILE_BYTES",

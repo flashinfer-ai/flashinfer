@@ -167,6 +167,10 @@ MODES = ("fwd", "fwd_tape", "bwd", "bwd_tape", "replay", "replay_tape")
 # replay-only buffers, with the tail stages split into ``tail_passes`` chunk ranges (per-pass buffers sized for one
 # range).  Not in :data:`MODES`: a lean workspace serves no replay.
 LEAN_MODES = ("bwd_lean", "bwd_tape_lean")
+# The forward layouts a forward-only workspace (``backward=False``) can be sized for (:class:`KdaWorkspace`
+# ``fwd_layout``): the forward's own and the context-parallel route's (``fwd_kcp``, :data:`FWD_KCP_SLOTS`; light
+# only, not in :data:`MODES`: this module's forward never runs on it).
+FWD_LAYOUTS = ("fwd", "fwd_kcp")
 # The device tables, in the order of the table buffer (the fifth on the segmented route only).
 TABLE_NAMES = (
     "chunk_bos",
@@ -587,12 +591,13 @@ class Plan:
         save_mode: str = "light",
         arena: KdaArena | None = None,
         doc_lengths: Sequence[int] | None = None,
+        fwd_layout: str = "fwd",
     ) -> int:
         """The arena a :class:`KdaWorkspace` of this plan allocates: the larger of the saved-set and the replay
-        layouts for a backward workspace (both paths run in it), the forward layout otherwise; under a lean
-        ``arena`` the lean layout of its ``tail_passes`` (the saved-set paths only); under a batched ``arena`` the
-        largest group's layout, over the groups of ``doc_lengths`` when given, else over the bound of every group
-        of ``batch_tokens`` tokens (:meth:`batch_bound`)."""
+        layouts for a backward workspace (both paths run in it), the forward layout otherwise (``fwd_layout``,
+        :data:`FWD_LAYOUTS`); under a lean ``arena`` the lean layout of its ``tail_passes`` (the saved-set paths
+        only); under a batched ``arena`` the largest group's layout, over the groups of ``doc_lengths`` when given,
+        else over the bound of every group of ``batch_tokens`` tokens (:meth:`batch_bound`)."""
         arena = KdaArena() if arena is None else arena
         self.check_arena(arena, backward=backward)
         if not arena.batched:
@@ -605,6 +610,7 @@ class Plan:
                 save_mode=save_mode,
                 arena=arena,
                 gate_fused=self.gate_fused,
+                fwd_layout=fwd_layout,
             )
         geometries = (
             [self.batch_bound(arena)]
@@ -624,6 +630,7 @@ class Plan:
                 save_mode=save_mode,
                 arena=arena,
                 gate_fused=self.gate_fused,
+                fwd_layout=fwd_layout,
             )
             for nc_pad, rows, nseg in geometries
         )
@@ -1119,6 +1126,27 @@ BWD_TAPE_SLOTS: tuple[tuple[Occupant, ...], ...] = (
     (("beta_int", "V32", 0, (1, 7)),),
     (("db_f", "V32", 0, (6, 7)),),
 )
+# The context-parallel route's forward-only layout (``fwd_kcp``; light only): that route's forward runs this module's
+# intra program (1) and WY program (2), its own walks (3: the segment summaries read w / kg / u / gk, the tape walk
+# writes h and the real rows of v_new) and its own output program (4: qg / h / aqk_int / v_new), never this module's
+# segmented recurrence, so the layout keeps no state blocks, and akk_int (read by WY at 2) rides under the h tape
+# beside kb (sub-offset 256): 2432 B per internal token-head against the forward layout's 2560 (plus its blocks).  The
+# h entries of the pad chunks, which the output program reads but stores no row of, overlay dead kb / akk_int bytes
+# here (dead kb bytes in the forward layout); no result depends on them.
+FWD_KCP_SLOTS: tuple[tuple[Occupant, ...], ...] = (
+    (("gk", "F32", 0, (1, 3)),),
+    (
+        ("kb", "B16", 0, (1, 2)),
+        ("akk_int", "A16", 256, (1, 2)),
+        ("h", "TAPE", 0, (3, 4)),
+    ),
+    (("kg", "B16", 0, (1, 3)),),
+    (("qg", "B16", 0, (1, 4)),),
+    (("v_new", "B16", 0, (1, 4)),),
+    (("aqk_int", "A16", 0, (1, 4)),),
+    (("u", "B16", 0, (2, 3)),),
+    (("w", "B16", 0, (2, 3)),),
+)
 
 
 def _without(
@@ -1137,6 +1165,7 @@ SLOTS: dict[str, tuple[tuple[Occupant, ...], ...]] = {
     "bwd_tape": _without(BWD_TAPE_SLOTS, "akk_int"),
     "replay": BWD_SLOTS,
     "replay_tape": BWD_TAPE_SLOTS,
+    "fwd_kcp": FWD_KCP_SLOTS,
 }
 # The lean layouts' per-pass buffer kinds: the token kinds sized for one tail range of ``R_b = 64 * ceil(NC_pad /
 # tail_passes)`` internal rows instead of ``R``; their sub-offsets count in ``R_b * H`` bytes.
@@ -1247,7 +1276,7 @@ def _slots_of(
         return _lean_slots(tape, tail_passes, R, H, NC, NSEG)
     if mode not in SLOTS:
         raise ValueError(
-            f"layout mode must be one of {MODES + LEAN_MODES}, got {mode!r}"
+            f"layout mode must be one of {MODES + LEAN_MODES + FWD_LAYOUTS[1:]}, got {mode!r}"
         )
     if tail_passes != 1:
         raise ValueError(
@@ -1443,15 +1472,27 @@ def _arena_bytes(
     save_mode: str,
     arena: KdaArena | None = None,
     gate_fused: bool = False,
+    fwd_layout: str = "fwd",
 ) -> int:
     """The arena a :class:`KdaWorkspace` of the problem allocates: the larger of the saved-set and the replay
-    layouts for a backward workspace (both paths run in it), the forward layout otherwise; the ``*_tape`` layouts
-    under ``save_mode="tape"``; under a lean ``arena`` (:class:`KdaArena`) the lean layout of its ``tail_passes``
-    alone (a lean workspace serves no replay); ``gate_fused`` drops the gate epilogue's buffers."""
+    layouts for a backward workspace (both paths run in it), the forward layout otherwise (``fwd_layout``, one of
+    :data:`FWD_LAYOUTS`: ``"fwd_kcp"`` sizes a forward-only light arena of the whole problem for the
+    context-parallel route); the ``*_tape`` layouts under ``save_mode="tape"``; under a lean ``arena``
+    (:class:`KdaArena`) the lean layout of its ``tail_passes`` alone (a lean workspace serves no replay);
+    ``gate_fused`` drops the gate epilogue's buffers."""
     tape = save_mode == "tape"
+    if fwd_layout not in FWD_LAYOUTS:
+        raise ValueError(f"fwd_layout must be one of {FWD_LAYOUTS}, got {fwd_layout!r}")
+    if fwd_layout != "fwd" and (
+        backward or tape or (arena is not None and arena.batched)
+    ):
+        raise ValueError(
+            f"fwd_layout={fwd_layout!r} sizes a forward-only (backward=False) light arena of the whole problem; a "
+            "backward workspace, the tape layouts and a batched arena keep the forward layout 'fwd'"
+        )
     if not backward:
         return _mode_bytes(
-            R, H, NC_pad, NSEG, "fwd_tape" if tape else "fwd", 1, gate_fused
+            R, H, NC_pad, NSEG, "fwd_tape" if tape else fwd_layout, 1, gate_fused
         )
     if arena is not None and arena.lean:
         return _mode_bytes(
@@ -1478,11 +1519,13 @@ def workspace_bytes(
     arch: str | None = None,
     arena: KdaArena | None = None,
     doc_lengths: Sequence[int] | None = None,
+    fwd_layout: str = "fwd",
 ) -> int:
-    """Arena bytes a :class:`KdaWorkspace` of the problem allocates (``backward=False``: the forward's layout only;
-    a backward workspace takes the larger of the saved-set paths' layout and the replay's; ``save_mode`` selects
-    the tape layouts; ``arena`` the lower-memory option, :class:`KdaArena`, whose batched form sizes the arena for
-    the groups of ``doc_lengths`` when given, else for the bound of every group).  A function of the host scalars
+    """Arena bytes a :class:`KdaWorkspace` of the problem allocates (``backward=False``: the forward's layout only,
+    ``fwd_layout`` of :data:`FWD_LAYOUTS`; a backward workspace takes the larger of the saved-set paths' layout and
+    the replay's; ``save_mode`` selects the tape layouts; ``arena`` the lower-memory option, :class:`KdaArena`,
+    whose batched form sizes the arena for the groups of ``doc_lengths`` when given, else for the bound of every
+    group).  A function of the host scalars
     and, through the segmented route's segment count, of
     ``sm_count`` and ``arch`` (:func:`_arch_sms`: the current device's SM count when ``sm_count`` is ``None``, the
     current device's architecture when ``arch`` is ``None``).  The outputs and the saved set are allocated per
@@ -1495,7 +1538,11 @@ def workspace_bytes(
     S, num_docs, H = int(S), int(num_docs), int(H)
     if arena is not None and (arena.lean or arena.batched):
         return plan(S, num_docs, H, sms, arch).arena_bytes(
-            backward=backward, save_mode=save_mode, arena=arena, doc_lengths=doc_lengths
+            backward=backward,
+            save_mode=save_mode,
+            arena=arena,
+            doc_lengths=doc_lengths,
+            fwd_layout=fwd_layout,
         )
     _nc_max, nc_pad, rows = _check_problem(S, num_docs, H, sms)
     nseg = _num_segments(num_docs, H, sms, arch)
@@ -1508,6 +1555,7 @@ def workspace_bytes(
         save_mode=save_mode,
         arena=arena,
         gate_fused=_gate_fused(arch),
+        fwd_layout=fwd_layout,
     )
 
 
@@ -2080,6 +2128,9 @@ class KdaWorkspace:
     exact groups instead of the bound of every group, and the calls on the workspace take the same ``doc_lengths``.
     The attribute ``tail_passes`` is the passes of the workspace's backward tail: the option's, and in a group's
     view (:meth:`batch_view`) the group's own, the fewest up to the option's that fit the arena.
+    ``fwd_layout`` (:data:`FWD_LAYOUTS`, kept as :attr:`fwd_layout`) is the layout a forward-only workspace is sized
+    for: ``"fwd"``, or ``"fwd_kcp"`` for the context-parallel route's forward (:data:`FWD_KCP_SLOTS`; this module's
+    forward does not fit in it); a backward workspace keeps ``"fwd"``.
     """
 
     def __init__(
@@ -2093,6 +2144,7 @@ class KdaWorkspace:
         launcher: Launcher | None = None,
         arena: KdaArena | None = None,
         doc_lengths: Sequence[int] | None = None,
+        fwd_layout: str = "fwd",
     ) -> None:
         if save_mode not in SAVE_MODES:
             raise ValueError(
@@ -2121,7 +2173,9 @@ class KdaWorkspace:
             save_mode=save_mode,
             arena=self.arena_option,
             doc_lengths=self.doc_lengths,
+            fwd_layout=fwd_layout,
         )
+        self.fwd_layout = fwd_layout
         self.zero_init = zero_init
         # The pad-chunk rows of every buffer a consumer reads are written in the same call (see the layout note),
         # so the content at allocation is irrelevant to the results: no fill by default (``zero_init=True`` zeros
@@ -2230,6 +2284,7 @@ class KdaWorkspace:
         launcher: Launcher | None = None,
         arena: KdaArena | None = None,
         doc_lengths: Sequence[int] | None = None,
+        fwd_layout: str = "fwd",
     ) -> KdaWorkspace:
         """A workspace for ``S`` tokens in ``num_docs`` documents with ``H`` heads on ``device``."""
         index = _device_index(torch.device(device))
@@ -2241,6 +2296,7 @@ class KdaWorkspace:
             launcher=launcher,
             arena=arena,
             doc_lengths=doc_lengths,
+            fwd_layout=fwd_layout,
         )
 
     @classmethod
@@ -3988,6 +4044,8 @@ __all__ = [
     "BWD_SLOTS",
     "BWD_TAPE_SLOTS",
     "D",
+    "FWD_KCP_SLOTS",
+    "FWD_LAYOUTS",
     "FWD_SLOTS",
     "FWD_TAPE_SLOTS",
     "KIND_SHAPE",

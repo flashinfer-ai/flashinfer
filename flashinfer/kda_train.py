@@ -607,7 +607,10 @@ def kcp_workspace_bytes(
     the boundary pools of the context's collectives, as ``KcpWorkspace`` allocates them (the backward's send pools
     share the forward's storage; the ring exchange's hop pools, allocated by the first ``exchange="ring"`` call, are
     not counted).  The saved set and the convolution's halo rows are per-call tensors, so ``save_transfer`` and
-    ``C`` do not change it."""
+    ``C`` do not change it.  A forward-only workspace (``backward=False``) has two states: the bytes returned here
+    after its forwards with a saved set (the local arena in the KCP forward layout, 2432 B per internal token-head,
+    and no c1 receive, transfer staging or carry pool), and ``cake_kcp_plan.kcp_arena_layout(ctx, H=H,
+    backward=False)["lazy"]`` bytes more once a forward without a saved set has allocated those three pools."""
     from .experimental.cake_kda_train import cake_kcp_plan
 
     return cake_kcp_plan.kcp_workspace_bytes(
