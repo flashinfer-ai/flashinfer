@@ -314,8 +314,8 @@ void Run(TensorView a_Q, TensorView a_K, TensorView a_V, TensorView a_O_ptr, Ten
       << KERNEL_NAME << ": requires (static_cast<int64_t>(static_cast<uint32_t>(total_bh)) < ((full_sections + 1) * 8))";
   TVM_FFI_CHECK((a_num_bh_units >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (num_bh_units >= 1)";
-  TVM_FFI_CHECK((static_cast<int64_t>(static_cast<uint32_t>(a_num_q_heads)) == CheckedMul(a_num_bh_units, 1LL)), ValueError)
-      << KERNEL_NAME << ": requires (static_cast<int64_t>(static_cast<uint32_t>(num_q_heads)) == (num_bh_units * 1))";
+  TVM_FFI_CHECK((static_cast<int64_t>(static_cast<uint32_t>(a_num_q_heads)) == a_num_bh_units), ValueError)
+      << KERNEL_NAME << ": requires (static_cast<int64_t>(static_cast<uint32_t>(num_q_heads)) == num_bh_units)";
   TVM_FFI_CHECK((a_heads_per_group >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (heads_per_group >= 1)";
   TVM_FFI_CHECK((CMod(a_heads_per_group, 1LL) == 0LL), ValueError)

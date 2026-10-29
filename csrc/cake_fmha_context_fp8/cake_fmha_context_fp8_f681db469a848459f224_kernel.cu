@@ -553,8 +553,8 @@ kernel_cake_fmha_context_fp8_f681db469a848459f224(const __grid_constant__ CUtens
                 int causal_row;
                 unsigned int num_masked_iters;
                 int kv_shift = seqlen_kv_bh - seqlen_q_bh;
-                causal_row = (m_block * 1 + stage) * 16 + (unsigned int)((warp % 4 * 32 + lane) / 8) + (unsigned int)kv_shift;
-                int causal_row_min = (m_block * 1 + stage) * 16 + (unsigned int)kv_shift;
+                causal_row = (m_block + stage) * 16 + (unsigned int)((warp % 4 * 32 + lane) / 8) + (unsigned int)kv_shift;
+                int causal_row_min = (m_block + stage) * 16 + (unsigned int)kv_shift;
                 unsigned int n_block_no_mask_limit = (causal_row_min + 1) / BLOCK_N;
                 num_masked_iters = num_n_blocks - n_block_no_mask_limit;
                 if (num_masked_iters > num_n_blocks) {
@@ -2382,7 +2382,7 @@ kernel_cake_fmha_context_fp8_f681db469a848459f224(const __grid_constant__ CUtens
                     } else {
                         final_scale = 0.0f;
                     }
-                    int q_tok0 = (m_block_1 * 1 + (unsigned int)stage_1) * 16;
+                    int q_tok0 = (m_block_1 + (unsigned int)stage_1) * 16;
                     if (q_tok0 < seqlen_q_bh_1) {
                         int row_valid = warp % 4 * 32 + lane < 128 && seqlen_q_bh_1 > q_tok0 + row_tok;
                         long long o_tok = tok_base + q_tok0 + row_tok;
@@ -2844,7 +2844,7 @@ kernel_cake_fmha_context_fp8_f681db469a848459f224(const __grid_constant__ CUtens
                 uint32_t group_head = (heads_per_group.divisor != 1) ? (__umulhi((uint32_t)(unit_4 * 8), heads_per_group.multiplier) >> heads_per_group.shift_right) : (uint32_t)(unit_4 * 8);
                 uint32_t group_rank = (uint32_t)(unit_4 * 8) - group_head * (uint32_t)(heads_per_group.divisor);
                 int kv_head = group_head;
-                int tok_q0 = (unsigned int)cu_seq_lens_q[b_idx_4] + m_block_4 * 1 * 16;
+                int tok_q0 = (unsigned int)cu_seq_lens_q[b_idx_4] + m_block_4 * 16;
                 mbarrier_wait(q_empty_addr, _phase_q_empty_0);
                 _phase_q_empty_0 ^= 1;
                 if (elect_sync()) {

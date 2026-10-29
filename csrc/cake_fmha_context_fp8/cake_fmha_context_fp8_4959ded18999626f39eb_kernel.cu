@@ -563,8 +563,8 @@ kernel_cake_fmha_context_fp8_4959ded18999626f39eb(const __grid_constant__ CUtens
                 int causal_row;
                 unsigned int num_masked_iters;
                 int kv_shift = seqlen_kv_bh - seqlen_q_bh;
-                causal_row = (m_block * 1 + stage) * 128 + (unsigned int)((warp % 4 * 32 + lane) / 1) + (unsigned int)kv_shift;
-                int causal_row_min = (m_block * 1 + stage) * 128 + (unsigned int)kv_shift;
+                causal_row = (m_block + stage) * 128 + (unsigned int)((warp % 4 * 32 + lane) / 1) + (unsigned int)kv_shift;
+                int causal_row_min = (m_block + stage) * 128 + (unsigned int)kv_shift;
                 unsigned int n_block_no_mask_limit = (causal_row_min + 1) / BLOCK_N;
                 num_masked_iters = num_n_blocks - n_block_no_mask_limit;
                 if (num_masked_iters > num_n_blocks) {
@@ -2349,7 +2349,7 @@ kernel_cake_fmha_context_fp8_4959ded18999626f39eb(const __grid_constant__ CUtens
                 }
                 unsigned int _max_0_1 = ((num_n_blocks_1) > (1) ? (num_n_blocks_1) : (1));
                 num_n_blocks_1 = _max_0_1;
-                int q_head_base = unit_1 * 1;
+                int q_head_base = unit_1;
                 int row_tok = (warp % 4 * 32 + lane) / 1;
                 int row_head = q_head_base + (warp % 4 * 32 + lane) % 1;
                 int tok_base = cu_seq_lens_q[b_idx_1];
@@ -2408,7 +2408,7 @@ kernel_cake_fmha_context_fp8_4959ded18999626f39eb(const __grid_constant__ CUtens
                     } else {
                         final_scale = 0.0f;
                     }
-                    int q_tok0 = (m_block_1 * 1 + (unsigned int)stage_1) * 128;
+                    int q_tok0 = (m_block_1 + (unsigned int)stage_1) * 128;
                     if (q_tok0 < seqlen_q_bh_1) {
                         int row_valid = warp % 4 * 32 + lane < 128 && seqlen_q_bh_1 > q_tok0 + row_tok;
                         long long o_tok = tok_base + q_tok0 + row_tok;
@@ -2874,10 +2874,10 @@ kernel_cake_fmha_context_fp8_4959ded18999626f39eb(const __grid_constant__ CUtens
                 }
                 unsigned int _max_0_4 = ((num_n_blocks_4) > (1) ? (num_n_blocks_4) : (1));
                 num_n_blocks_4 = _max_0_4;
-                uint32_t group_head = (heads_per_group.divisor != 1) ? (__umulhi((uint32_t)(unit_4 * 1), heads_per_group.multiplier) >> heads_per_group.shift_right) : (uint32_t)(unit_4 * 1);
-                uint32_t group_rank = (uint32_t)(unit_4 * 1) - group_head * (uint32_t)(heads_per_group.divisor);
+                uint32_t group_head = (heads_per_group.divisor != 1) ? (__umulhi((uint32_t)(unit_4), heads_per_group.multiplier) >> heads_per_group.shift_right) : (uint32_t)(unit_4);
+                uint32_t group_rank = (uint32_t)(unit_4) - group_head * (uint32_t)(heads_per_group.divisor);
                 int kv_head = group_head;
-                int tok_q0 = (unsigned int)cu_seq_lens_q[b_idx_4] + m_block_4 * 1 * 128;
+                int tok_q0 = (unsigned int)cu_seq_lens_q[b_idx_4] + m_block_4 * 128;
                 mbarrier_wait(q_empty_addr, _phase_q_empty_0);
                 _phase_q_empty_0 ^= 1;
                 if (elect_sync()) {

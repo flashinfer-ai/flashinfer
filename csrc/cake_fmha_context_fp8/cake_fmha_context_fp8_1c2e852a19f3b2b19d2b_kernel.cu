@@ -2397,7 +2397,7 @@ kernel_cake_fmha_context_fp8_1c2e852a19f3b2b19d2b(const __grid_constant__ CUtens
                 }
                 unsigned int _max_0_1 = ((num_n_blocks_1) > (1) ? (num_n_blocks_1) : (1));
                 num_n_blocks_1 = _max_0_1;
-                int q_head_base = unit_1 * 1;
+                int q_head_base = unit_1;
                 int row_tok = (warp % 4 * 32 + lane) / 1;
                 int row_head = q_head_base + (warp % 4 * 32 + lane) % 1;
                 int tok_base = cu_seq_lens_q[b_idx_1];
@@ -3086,8 +3086,8 @@ kernel_cake_fmha_context_fp8_1c2e852a19f3b2b19d2b(const __grid_constant__ CUtens
                 }
                 unsigned int _max_0_4 = ((num_n_blocks_4) > (1) ? (num_n_blocks_4) : (1));
                 num_n_blocks_4 = _max_0_4;
-                uint32_t group_head = (heads_per_group.divisor != 1) ? (__umulhi((uint32_t)(unit_4 * 1), heads_per_group.multiplier) >> heads_per_group.shift_right) : (uint32_t)(unit_4 * 1);
-                uint32_t group_rank = (uint32_t)(unit_4 * 1) - group_head * (uint32_t)(heads_per_group.divisor);
+                uint32_t group_head = (heads_per_group.divisor != 1) ? (__umulhi((uint32_t)(unit_4), heads_per_group.multiplier) >> heads_per_group.shift_right) : (uint32_t)(unit_4);
+                uint32_t group_rank = (uint32_t)(unit_4) - group_head * (uint32_t)(heads_per_group.divisor);
                 int kv_head = group_head;
                 int tok_q0 = (unsigned int)cu_seq_lens_q[b_idx_4] + m_block_4 * 2 * 128;
                 int tok_q1 = tok_q0 + 128;
