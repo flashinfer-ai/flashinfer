@@ -2718,11 +2718,14 @@ def test_prepared_runner_graph_capture_and_replay():
         for _ in range(2):
             runner()
     torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    _assert_ticket_tail_zero(runner)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = runner()
     graph.replay()
     torch.cuda.synchronize()
+    _assert_ticket_tail_zero(runner)
     assert ref.same_bits(captured, eager)
     fresh = ref.make_random_inputs(
         [600, 400], [600, 12000], top_k=1024, seed=51, device="cuda"
@@ -2732,7 +2735,198 @@ def test_prepared_runner_graph_capture_and_replay():
     inputs.w.copy_(fresh.w)
     graph.replay()
     torch.cuda.synchronize()
+    _assert_ticket_tail_zero(runner)
     _judge_ok((captured[0].clone(), captured[1].clone()), ref.select_reference(inputs))
+
+
+def _assert_ticket_tail_zero(runner) -> None:
+    """The ticket word reads 0 after every completed run (every completed scan launch leaves it 0; a
+    backend-owned tail is zeroed once at prepare, a caller-owned one again before every run); None
+    on the architectures without a tail."""
+    if runner.ticket_tail is not None:
+        assert not runner.ticket_tail.any(), runner.ticket_tail[:8].tolist()
+
+
+def _prepare(inputs: ref.IndexerInputs, **extra):
+    return prepare_dsa_indexer_topk(
+        inputs.q,
+        inputs.k,
+        inputs.w,
+        inputs.cu_seqlens_q,
+        inputs.cu_seqlens_k,
+        **inputs.kwargs(),
+        **extra,
+    )
+
+
+def _cloned(out) -> tuple[torch.Tensor, torch.Tensor]:
+    return out[0].clone(), out[1].clone()
+
+
+def test_prepared_runner_ticket_tail_is_zero_at_prepare_after_runs_and_after_a_failed_launch():
+    """Backend-owned workspace: the tail is zeroed once at prepare, no memset in run(); a run that raised
+    while launching marks it dirty and the next run restores it."""
+    _require_program()
+    inputs = ref.make_random_inputs(
+        [600, 400], [600, 12000], top_k=1024, seed=52, device="cuda"
+    )
+    runner = _prepare(inputs)
+    if runner.ticket_tail is None:
+        pytest.skip("no ticket tail on this architecture")
+    assert not runner._tail_shared  # backend-owned: nothing else writes the tail
+    torch.cuda.synchronize()
+    _assert_ticket_tail_zero(runner)  # zeroed once, at prepare
+    expected = runner()
+    expected = (expected[0].clone(), expected[1].clone())
+    torch.cuda.synchronize()
+    # left at 0 by the scan, no memset in run() on this path
+    _assert_ticket_tail_zero(runner)
+    # a launch sequence that raises marks the tail dirty; the next run restores the word before it launches
+    launches = runner.launches
+
+    def failing() -> None:
+        raise RuntimeError("boom")
+
+    runner.launches = (failing,)
+    runner.ticket_tail.fill_(7)  # what an aborted launch could leave behind
+    with pytest.raises(RuntimeError, match="boom"):
+        runner()
+    assert runner._tail_dirty
+    runner.launches = launches
+    out = runner()
+    torch.cuda.synchronize()
+    assert not runner._tail_dirty
+    _assert_ticket_tail_zero(runner)
+    assert ref.same_bits(out, expected)
+
+
+def _workspace_bytes(inputs: ref.IndexerInputs, device: torch.device) -> int:
+    return dsa_indexer_workspace_size(
+        inputs.num_queries,
+        inputs.num_keys,
+        inputs.num_segments,
+        top_k=inputs.top_k,
+        ratio=inputs.ratio,
+        device=device,
+    )
+
+
+def _caller_owned_runner(inputs: ref.IndexerInputs, workspace: torch.Tensor):
+    """A runner on the caller-owned ``workspace`` (skips where the architecture has no ticket tail)."""
+    runner = _prepare(inputs, workspace_buffer=workspace)
+    if runner.ticket_tail is None:
+        pytest.skip("no ticket tail on this architecture")
+    assert runner._tail_shared
+    return runner
+
+
+def test_caller_owned_workspace_shared_by_two_geometries_keeps_every_run_exact():
+    """Two prepared runners of different geometries share one caller-owned buffer; the larger geometry's
+    candidate region covers the smaller one's ticket tail, so every run of B dirties A's tail.  Alternating
+    A, B, A, B: every run's bits equal the same geometry's exclusive-workspace run and the tail of the
+    runner that ran reads 0 afterwards."""
+    _require_program()
+    device = torch.device("cuda", torch.cuda.current_device())
+    inputs_a = ref.make_random_inputs(
+        [300, 200], [300, 6000], top_k=256, seed=70, device="cuda"
+    )
+    inputs_b = ref.make_random_inputs(
+        [900, 300], [900, 7000], top_k=2048, seed=71, device="cuda"
+    )
+    bytes_a = _workspace_bytes(inputs_a, device)
+    bytes_b = _workspace_bytes(inputs_b, device)
+    # B's candidate region covers A's tail
+    assert bytes_b > bytes_a + 128, (bytes_a, bytes_b)
+    expected_a = _cloned(_run(inputs_a))  # exclusive, backend-owned workspaces
+    expected_b = _cloned(_run(inputs_b))
+    shared = torch.empty(bytes_b, dtype=torch.uint8, device=device)
+    runner_a = _caller_owned_runner(inputs_a, shared)
+    runner_b = _caller_owned_runner(inputs_b, shared)
+    assert runner_a.workspace_bytes == bytes_a and runner_b.workspace_bytes == bytes_b
+    tail_a = runner_a.ticket_tail
+    assert (
+        tail_a.data_ptr() >= shared.data_ptr()
+        and tail_a.data_ptr() + 128 <= shared.data_ptr() + bytes_b - 128
+    )  # A's tail lies inside B's candidate region
+    for step, (runner, expected) in enumerate(
+        [(runner_a, expected_a), (runner_b, expected_b)] * 2
+    ):
+        out = runner()
+        torch.cuda.synchronize()
+        assert ref.same_bits(out, expected), step
+        _assert_ticket_tail_zero(runner)
+
+
+def test_caller_owned_workspace_tail_written_between_runs_is_restored_before_the_next_run():
+    """The direct hazard: on a caller-owned workspace another kernel writes the ticket word between two
+    runs of a cached runner; the next run zeroes it first and stays bit-exact, and the tail reads 0 after."""
+    _require_program()
+    device = torch.device("cuda", torch.cuda.current_device())
+    inputs = ref.make_random_inputs(
+        [600, 400], [600, 12000], top_k=1024, seed=72, device="cuda"
+    )
+    workspace = torch.empty(
+        _workspace_bytes(inputs, device), dtype=torch.uint8, device=device
+    )
+    runner = _caller_owned_runner(inputs, workspace)
+    torch.cuda.synchronize()
+    _assert_ticket_tail_zero(runner)  # zeroed at prepare as well
+    expected = _cloned(runner())
+    torch.cuda.synchronize()
+    _assert_ticket_tail_zero(runner)
+    _judge_ok(expected, ref.select_reference(inputs))
+    for fill in (7, 0xFF, 1):
+        # what another kernel could leave in a shared buffer; not a failed launch,
+        # so the shared flag alone drives the memset
+        runner.ticket_tail.fill_(fill)
+        assert not runner._tail_dirty
+        out = runner()
+        torch.cuda.synchronize()
+        assert ref.same_bits(out, expected), fill
+        _assert_ticket_tail_zero(runner)
+
+
+def test_caller_owned_workspace_graph_replay_restores_the_tail():
+    """A graph capturing a caller-owned runner carries the tail memset node: corrupting the tail between
+    replays leaves every replay bit-exact and the tail 0 afterwards."""
+    _require_program()
+    device = torch.device("cuda", torch.cuda.current_device())
+    inputs = ref.make_random_inputs(
+        [600, 400], [600, 12000], top_k=1024, seed=73, device="cuda"
+    )
+    workspace = torch.empty(
+        _workspace_bytes(inputs, device), dtype=torch.uint8, device=device
+    )
+    runner = _caller_owned_runner(inputs, workspace)
+    eager = _cloned(_run(inputs))
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(2):
+            runner()
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = runner()
+    for fill in (7, 0xFF):
+        runner.ticket_tail.fill_(fill)
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_ticket_tail_zero(runner)
+        assert ref.same_bits(captured, eager), fill
+    fresh = ref.make_random_inputs(
+        [600, 400], [600, 12000], top_k=1024, seed=74, device="cuda"
+    )
+    inputs.q.copy_(fresh.q)
+    inputs.k.copy_(fresh.k)
+    inputs.w.copy_(fresh.w)
+    runner.ticket_tail.fill_(3)
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_ticket_tail_zero(runner)
+    _judge_ok(_cloned(captured), ref.select_reference(inputs))
 
 
 def test_workspace_bound_is_respected():

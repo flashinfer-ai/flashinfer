@@ -120,6 +120,33 @@ BF16_N16_M128_CHUNK = 16
 # part: BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS_GB300 on a 152-SM sm_103a.
 BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS = 8
 BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS_GB300 = 16
+# Fixed cost of one (sequence, head) task, in 32-token chunks, outside its chunk
+# loop: a CTA of the one-task-per-CTA body pays it for every task, a bin of the
+# turnover build hides it beside the previous task's chunks.  An unbounded
+# direct N32 launch that the strict bin test keeps one task per CTA still takes
+# work bins for its module's turnover build where the bins charged this cost
+# per task pay (_turnover_bins_route, _use_turnover_work_bins), and its bin
+# table charges the same cost.  The floor of the one-task-per-CTA body's
+# measured single-wave fixed time per CTA (about 3.5 chunks of one CTA's chunk
+# time on both parts).
+BF16_WORK_BIN_TURNOVER_TASK_COST = 3
+# 32-token chunks per task every work bin of a bounded (lower-bound gate)
+# launch must exceed on average for the launch to take its module's
+# turnover build: each task's turnover (the epilogue's store of the previous
+# task's final state, then warp 8's load of the next one) costs about what
+# moving the state off the compute saves on this many chunks, and the bin
+# with the shortest tasks sets the makespan.  Measured per part:
+# BF16_BOUNDED_TURNOVER_CHUNKS_PER_TASK_GB300 on a 152-SM sm_103a (None:
+# the part keeps bounded launches on their work-binned build).
+BF16_BOUNDED_TURNOVER_CHUNKS_PER_TASK = 3
+BF16_BOUNDED_TURNOVER_CHUNKS_PER_TASK_GB300: int | None = 3
+# A bounded launch also keeps the turnover only when at most one task in
+# this many has two chunks or fewer: each such task pays a whole turnover
+# for at most two chunks of saving, and a heavy tail of them loses even
+# where long tasks lift every bin above the count.  Measured per part:
+# BF16_BOUNDED_TURNOVER_SHORT_TASK_RATIO_GB300 on a 152-SM sm_103a.
+BF16_BOUNDED_TURNOVER_SHORT_TASK_RATIO = 4
+BF16_BOUNDED_TURNOVER_SHORT_TASK_RATIO_GB300 = 4
 BF16_BETA_TMA_MIN_HEADS = 8
 BF16_DIRECT_ORDER_MAX_PASSES = 1
 BF16_DIRECT_INSERTION_MAX_SEQUENCES = 16
@@ -144,6 +171,33 @@ M64_PAIR_SHARE_MIN_SEQ_LEN_GB300 = ((32, 1024), (64, 2048), (72, 4096))
 # keeps it at one CTA per SM (the cluster capacity probe launches this shape).
 M64_CTA_THREADS = 1024
 M64_CTA_SMEM_BYTES = 227328
+# The owner/helper build of an M64 value-split module (see
+# _m64_owner_helper_factory): H helper CTAs per task prepare each 32-token
+# chunk once and hand it to the task's two value-half owner CTAs through a
+# global ring, on a grid (tasks, 2 + H) whose CTAs are all resident at once
+# (one per SM, launched cooperatively).  Each helper has M64_OWNER_HELPER_SLOTS
+# ring slots of M64_OWNER_HELPER_SLOT_ELEMENTS BF16 elements per task; the
+# ready and consumed words hold M64_OWNER_HELPER_WORD_STRIDE helpers per task
+# whatever H is.
+M64_OWNER_HELPER_MAX_HELPERS = 3
+M64_OWNER_HELPER_DEFAULT_HELPERS = 2
+M64_OWNER_HELPER_SLOTS = 5
+M64_OWNER_HELPER_SLOT_ELEMENTS = 16384
+M64_OWNER_HELPER_WORD_STRIDE = 3
+# Shortest sequence of an M64 FP32-state value-split launch that takes the
+# owner/helper build, by task count: the first (most tasks, shortest sequence)
+# row whose task count holds the launch's tasks decides, and every sequence of
+# the launch must be at least the row's length.  A row may carry a third
+# column, its helpers per task (else M64_OWNER_HELPER_DEFAULT_HELPERS); the
+# launch takes at most as many as the device holds and needs two.  A launch
+# beyond the last row keeps its pair-share or routed program, and so does
+# every launch while a part's table is empty.  Per part:
+# M64_OWNER_HELPER_MIN_SEQ_LEN_GB300 on a 152-SM sm_103a.  Both rows come from
+# paired timings of 8 to 36 tasks at 1024 to 16384 tokens per sequence on
+# B200 and GB300 with two helpers per task (three helpers never beat two in
+# the measured sweep); 36 tasks is the largest count measured.
+M64_OWNER_HELPER_MIN_SEQ_LEN: tuple[tuple[int, ...], ...] = ((36, 1024),)
+M64_OWNER_HELPER_MIN_SEQ_LEN_GB300: tuple[tuple[int, ...], ...] = ((36, 1024),)
 # Architectures whose one-wave BF16 grid sweep selected the M64 value split over
 # every direct M128 tile (see _should_use_bf16_one_wave_dvsplit).
 BF16_ONE_WAVE_DVSPLIT_ARCHES = ("sm_100a", "sm_103a")
@@ -1085,6 +1139,195 @@ def _m64_pair_share_factory(name, *args, **kwargs):
     return _kda_registry.PreparedKernel(program, arch)
 
 
+_M64_COOPERATIVE_CAPACITY: dict = {}
+_M64_COOPERATIVE_PROBE_WARNED = False
+
+
+def _m64_cooperative_capacity(device: torch.device) -> int:
+    """How many CTAs of the M64 value split's shape the device holds at once.
+
+    ``cuOccupancyMaxActiveBlocksPerMultiprocessor`` for a probe kernel with
+    the M64 CTA's threads and dynamic shared memory (one CTA per SM) times the
+    SM count: the device's, or the current context's where the driver reports
+    fewer.  Only an answer is cached (per device): when the driver cannot
+    answer, the call returns 0 (the runtime keeps the pair-share or routed
+    program), logs one warning per process and probes again on the next call.
+    """
+    capacity = _M64_COOPERATIVE_CAPACITY.get(device)
+    if capacity is None:
+        capacity = _probe_m64_cooperative_capacity(device)
+        if capacity is None:
+            return 0
+        _M64_COOPERATIVE_CAPACITY[device] = capacity
+    return capacity
+
+
+def _probe_m64_cooperative_capacity(device: torch.device) -> Optional[int]:
+    """The driver's answer for ``_m64_cooperative_capacity``; ``None`` on failure."""
+    global _M64_COOPERATIVE_PROBE_WARNED
+    import torch
+
+    try:
+        from cuda.bindings import driver
+
+        def check(result):
+            err, *values = result if isinstance(result, tuple) else (result,)
+            if err != driver.CUresult.CUDA_SUCCESS:
+                raise RuntimeError(f"CUDA driver error {err}")
+            return values[0] if values else None
+
+        with torch.cuda.device(device):
+            torch.empty(0, device=device)  # the primary context is current
+            sm_count = int(
+                check(
+                    driver.cuDeviceGetAttribute(
+                        driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                        check(driver.cuDeviceGet(torch.cuda.current_device())),
+                    )
+                )
+            )
+            try:
+                context = check(driver.cuCtxGetCurrent())
+                resource = check(
+                    driver.cuCtxGetDevResource(
+                        context, driver.CUdevResourceType.CU_DEV_RESOURCE_TYPE_SM
+                    )
+                )
+                sm_count = min(sm_count, int(resource.sm.smCount))
+            except Exception:
+                pass  # a driver without context resources: the device's count
+            module = check(driver.cuModuleLoadData(_PAIR_PROBE_PTX))
+            try:
+                function = check(
+                    driver.cuModuleGetFunction(module, b"cake_kda_pair_probe")
+                )
+                check(
+                    driver.cuFuncSetAttribute(
+                        function,
+                        driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        M64_CTA_SMEM_BYTES,
+                    )
+                )
+                per_sm = check(
+                    driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+                        function, M64_CTA_THREADS, M64_CTA_SMEM_BYTES
+                    )
+                )
+                return int(per_sm) * sm_count
+            finally:
+                driver.cuModuleUnload(module)
+    except Exception as error:
+        if not _M64_COOPERATIVE_PROBE_WARNED:
+            _M64_COOPERATIVE_PROBE_WARNED = True
+            from flashinfer.jit.core import logger
+
+            logger.warning(
+                "KDA prefill: the M64 cooperative capacity probe failed (%s: %s); "
+                "M64 launches keep the pair-share or routed program until a probe "
+                "succeeds",
+                type(error).__name__,
+                error,
+            )
+        return None
+
+
+def _m64_owner_helper_count(
+    *,
+    gpu_arch: str,
+    sm_count: int,
+    total_tasks: int,
+    min_seq_len: int,
+    device: torch.device,
+) -> int:
+    """Helper CTAs per task of the M64 owner/helper build, or 0 to keep the
+    pair-share or routed program.
+
+    The part's ``M64_OWNER_HELPER_MIN_SEQ_LEN`` row (the first whose task
+    count holds ``total_tasks``) must hold ``min_seq_len``; its helper count
+    (else ``M64_OWNER_HELPER_DEFAULT_HELPERS``) is cut to what the device holds
+    at once beside two owners per task (``_m64_cooperative_capacity``, probed
+    only for a launch a row takes) and must stay at least two.
+    """
+    if gpu_arch not in ("sm_100a", "sm_103a") or total_tasks < 1:
+        return 0
+    rows = (
+        M64_OWNER_HELPER_MIN_SEQ_LEN_GB300
+        if gpu_arch == "sm_103a" and sm_count == 152
+        else M64_OWNER_HELPER_MIN_SEQ_LEN
+    )
+    row = next((row for row in rows if total_tasks <= row[0]), None)
+    if row is None or min_seq_len < row[1]:
+        return 0
+    wanted = row[2] if len(row) > 2 else M64_OWNER_HELPER_DEFAULT_HELPERS
+    helpers = min(
+        wanted,
+        M64_OWNER_HELPER_MAX_HELPERS,
+        _m64_cooperative_capacity(device) // total_tasks - 2,
+    )
+    return helpers if helpers >= 2 else 0
+
+
+def _m64_owner_helper_program(name, *args, **kwargs):
+    """The ``_RENDERED_M64_OWNER_HELPER_ROUTES`` build of the factory row's
+    module, or ``None``: the module needs a pair-share build too (the
+    owner/helper build replaces the pair-share or routed program of long
+    launches only)."""
+    arch = detect_gpu_arch()
+    rows = _kda_registry.FACTORIES.get(arch, {}).get(name, {})
+    module = rows.get(_kda_registry._key(args, kwargs))
+    if module not in _kda_registry._RENDERED_PAIR_SHARE_ROUTES.get(arch, {}):
+        return None
+    return _kda_registry._RENDERED_M64_OWNER_HELPER_ROUTES.get(arch, {}).get(module)
+
+
+# Long M64 FP32-state value-split launches the owner/helper rule takes run the
+# loader's ``_RENDERED_M64_OWNER_HELPER_ROUTES`` build of the module (the same
+# bits as the pair-share and routed programs); the returned kernel's
+# ``m64_owner_helper`` says whether the call got it.
+def _m64_owner_helper_factory(name, *args, **kwargs):
+    """The owner/helper build of the factory row's M64 module, else ``_factory``."""
+    program = _m64_owner_helper_program(name, *args, **kwargs)
+    if program is None:
+        return _factory(name, *args, **kwargs)
+    kernel = _kda_registry.PreparedKernel(program, detect_gpu_arch())
+    kernel.m64_owner_helper = True
+    return kernel
+
+
+# What the rendered bindings report when the driver refuses a cooperative grid
+# it cannot hold at once (the runtime's error string, or the driver's name).
+_COOPERATIVE_REFUSALS = (
+    "too many blocks in cooperative launch",
+    "cudaErrorCooperativeLaunchTooLarge",
+    "CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE",
+)
+_M64_OWNER_HELPER_REFUSAL_WARNED = False
+
+
+def _cooperative_launch_refused(error: BaseException) -> bool:
+    """``error`` is a binding's report of a refused cooperative launch."""
+    message = str(error)
+    return any(text in message for text in _COOPERATIVE_REFUSALS)
+
+
+def _clear_cuda_launch_error() -> None:
+    """Reset the CUDA runtime's last error after a refused launch.
+
+    The runtime records the refusal for the next ``cudaGetLastError`` of this
+    thread, which torch's launch checks read; every CUDA runtime library the
+    process loaded is reset.
+    """
+    import ctypes
+
+    try:
+        with open("/proc/self/maps") as maps:
+            paths = {line.split()[-1] for line in maps if "/libcudart.so" in line}
+        for path in sorted(paths):
+            ctypes.CDLL(path).cudaGetLastError()
+    except OSError:
+        pass
+
+
 def _work_bin_turnover_program(
     name,
     *args,
@@ -1150,12 +1393,64 @@ def _work_bin_turnover_route(
     """
     if not route_work_bins or direct_n16 or n32_ft_slab:
         return False
-    limit = (
-        BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS_GB300
-        if gpu_arch == "sm_103a" and sm_count == 152
-        else BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS
+    return max_seq_len <= BF16_M128_CHUNK * _work_bin_turnover_max_task_chunks(
+        gpu_arch, sm_count
     )
-    return max_seq_len <= BF16_M128_CHUNK * limit
+
+
+def _work_bin_turnover_max_task_chunks(gpu_arch: str, sm_count: int) -> int:
+    """The part's turnover chunk count (``BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS``)."""
+    if gpu_arch == "sm_103a" and sm_count == 152:
+        return BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS_GB300
+    return BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS
+
+
+def _bounded_turnover_route(
+    *,
+    bounded_gate: bool,
+    seq_lens: tuple[int, ...],
+    num_heads: int,
+    gpu_arch: str,
+    sm_count: int,
+) -> bool:
+    """Whether a launch the turnover route admits keeps it for its gate.
+
+    An unbounded launch always does.  A bounded (lower-bound gate) launch
+    does only when at most one task in the part's ratio has two chunks or
+    fewer and every bin of its work-bin table averages more than the part's
+    count of 32-token chunks per task; otherwise, and on a part without a
+    count, it keeps the work-binned build.
+    """
+    if not bounded_gate:
+        return True
+    gb300 = gpu_arch == "sm_103a" and sm_count == 152
+    per_task = (
+        BF16_BOUNDED_TURNOVER_CHUNKS_PER_TASK_GB300
+        if gb300
+        else BF16_BOUNDED_TURNOVER_CHUNKS_PER_TASK
+    )
+    if per_task is None:
+        return False
+    ratio = (
+        BF16_BOUNDED_TURNOVER_SHORT_TASK_RATIO_GB300
+        if gb300
+        else BF16_BOUNDED_TURNOVER_SHORT_TASK_RATIO
+    )
+    chunks = [(length + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK for length in seq_lens]
+    short = sum(count <= 2 for count in chunks)
+    if short * ratio > len(chunks):
+        return False
+    table, num_bins = _make_direct_work_bins(
+        seq_lens,
+        num_heads=num_heads,
+        worker_count=sm_count,
+        chunk_tokens=BF16_M128_CHUNK,
+    )
+    return all(
+        sum(chunks[task // num_heads] for task in table[start:end])
+        > per_task * (end - start)
+        for start, end in zip(table[:num_bins], table[1 : num_bins + 1], strict=True)
+    )
 
 
 # Bodies that reach an operand only through its TMA descriptor never
@@ -1787,16 +2082,22 @@ def _make_direct_sequence_order(
 
 @cache
 def _make_direct_work_bins(
-    seq_lens: tuple[int, ...], *, num_heads: int, worker_count: int, chunk_tokens: int
+    seq_lens: tuple[int, ...],
+    *,
+    num_heads: int,
+    worker_count: int,
+    chunk_tokens: int,
+    task_cost: int = 0,
 ) -> tuple[tuple[int, ...], int]:
     """Bin table of a direct M128 body built with work bins.
 
     Each CTA of such a body runs one bin of (sequence, head) tasks back to
     back.  Tasks go in descending chunk count (sequences in descending length,
     stable in index; heads ascending) to the least-loaded bin, lowest bin
-    first; the bin count is ``min(tasks, worker_count)``.  The table holds the
-    bin offsets as absolute table indices, then the task ids
-    ``sequence * num_heads + head``.  Returns the table and the bin count.
+    first; a task loads its bin with its chunk count plus ``task_cost``.  The
+    bin count is ``min(tasks, worker_count)``.  The table holds the bin offsets
+    as absolute table indices, then the task ids ``sequence * num_heads +
+    head``.  Returns the table and the bin count.
     """
     if num_heads <= 0 or worker_count <= 0 or chunk_tokens <= 0:
         raise ValueError("direct work-bin inputs must be positive")
@@ -1811,7 +2112,7 @@ def _make_direct_work_bins(
         for head_idx in range(num_heads):
             load, bin_idx = heapq.heappop(loads)
             bins[bin_idx].append(seq_idx * num_heads + head_idx)
-            heapq.heappush(loads, (load + chunks, bin_idx))
+            heapq.heappush(loads, (load + chunks + task_cost, bin_idx))
     table = [num_bins + 1]
     for tasks in bins:
         table.append(table[-1] + len(tasks))
@@ -1848,6 +2149,89 @@ def _use_direct_work_bins(
         for index in range(num_bins)
     )
     return largest_bin > max(chunks)
+
+
+def _use_turnover_work_bins(
+    seq_lens: tuple[int, ...],
+    *,
+    num_heads: int,
+    sm_count: int,
+    gpu_arch: str,
+) -> bool:
+    """Whether an unbounded direct M128 N32 launch that
+    ``_use_direct_work_bins`` keeps one task per CTA asks for work bins for its
+    module's turnover build (``_turnover_bins_route`` asks it for unbounded
+    launches only).
+
+    The strict test charges a task its chunks only.  A one-task-per-CTA launch
+    also pays a fixed cost per task (``BF16_WORK_BIN_TURNOVER_TASK_COST``
+    chunks) that a turnover bin hides, so with more tasks than SMs and a
+    longest sequence of at most the part's turnover chunk count
+    (``_work_bin_turnover_max_task_chunks``) bins pay where the bin
+    assignment that charges every task that cost has a largest bin above the
+    longest task plus that cost.  The launch then builds that assignment
+    (``task_cost``) and takes the turnover build only: ``_build_body`` keeps
+    the one-task-per-CTA program of a module without one.
+    """
+    if not seq_lens or min(seq_lens) <= 0:
+        return False
+    if len(seq_lens) * num_heads <= sm_count:
+        return False
+    chunks = [(length + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK for length in seq_lens]
+    if max(chunks) > _work_bin_turnover_max_task_chunks(gpu_arch, sm_count):
+        return False
+    cost = BF16_WORK_BIN_TURNOVER_TASK_COST
+    table, num_bins = _make_direct_work_bins(
+        seq_lens,
+        num_heads=num_heads,
+        worker_count=sm_count,
+        chunk_tokens=BF16_M128_CHUNK,
+        task_cost=cost,
+    )
+    largest_bin = max(
+        sum(
+            chunks[task // num_heads] + cost
+            for task in table[table[index] : table[index + 1]]
+        )
+        for index in range(num_bins)
+    )
+    return largest_bin > max(chunks) + cost
+
+
+def _turnover_bins_route(
+    *,
+    strict: bool,
+    route: str,
+    tf32_direct: bool,
+    n32_ft_slab: bool,
+    unbounded: bool,
+    seq_lens: tuple[int, ...],
+    num_heads: int,
+    sm_count: int,
+    gpu_arch: str,
+) -> bool:
+    """Whether a direct launch the strict bin test keeps one task per CTA
+    (``strict`` False) asks for work bins for its module's turnover build.
+
+    Only an unbounded (softplus gate) direct M128 N32 launch outside the TF32
+    direct body and the N32 FT slab does, where ``_use_turnover_work_bins``
+    holds.  A bounded (lower-bound gate) launch keeps one task per CTA: its
+    turnover builds take the bounded rule of work-binned launches only
+    (``_bounded_turnover_route``).
+    """
+    return (
+        (not strict)
+        and unbounded
+        and route == BF16_ROUTE_DIRECT_M128
+        and (not tf32_direct)
+        and (not n32_ft_slab)
+        and _use_turnover_work_bins(
+            seq_lens,
+            num_heads=num_heads,
+            sm_count=sm_count,
+            gpu_arch=gpu_arch,
+        )
+    )
 
 
 def _constrained_direct_m128_route(
@@ -1996,14 +2380,26 @@ class FlashKDABlackwellBF16FusedLaunch:
     _checkpoint_accumulate = False
     _affine_main_indexed_initial = False
     _active_beta_f32 = False
+    #: Helper CTAs per task of the M64 owner/helper build the plan launches
+    #: (0: another program).
+    m64_owner_helpers = 0
 
-    def _build_body(self, factory, *args, work_bin_turnover=False, **kwargs):
+    def _build_body(
+        self,
+        factory,
+        *args,
+        work_bin_turnover=False,
+        turnover_bins_only=False,
+        **kwargs,
+    ):
         """Build one body and record which raw q / k / v pointers it never reads.
 
         With ``work_bin_turnover`` a ``_factory`` build takes the loader's
         turnover build of the resolved module (``_work_bin_turnover_factory``)
         where ``_work_bin_turnover_program`` names one; every other build keeps
-        ``factory``.
+        ``factory``.  With ``turnover_bins_only`` (work bins asked for the
+        turnover build only, ``_use_turnover_work_bins``) a ``_factory`` build
+        that takes no turnover build drops its work bins instead.
         """
         if (
             work_bin_turnover
@@ -2015,6 +2411,12 @@ class FlashKDABlackwellBF16FusedLaunch:
         ):
             factory = partial(
                 _work_bin_turnover_factory, *factory.args, **factory.keywords
+            )
+        elif turnover_bins_only and getattr(factory, "func", None) is _factory:
+            factory = partial(
+                _factory,
+                *factory.args,
+                **{**factory.keywords, "route_work_bins": False},
             )
         module = self._build_kda_module(factory, *args, **kwargs)
         self._qkv_carrier_names[id(module)] = _qkv_raw_pointer_names(factory)
@@ -2746,11 +3148,14 @@ class FlashKDABlackwellBF16FusedLaunch:
         )
         # Work bins where a bin runs tasks back to back (the direct N32 and N16
         # bodies, in chunks of their own size).
+        seq_lens = tuple(
+            offsets[index + 1] - offsets[index] for index in range(num_seqs)
+        )
         route_work_bins = (
             route in {BF16_ROUTE_DIRECT_M128, BF16_ROUTE_DIRECT_M128_N16}
             and (not use_tf32_direct_m128)
             and _use_direct_work_bins(
-                tuple(offsets[index + 1] - offsets[index] for index in range(num_seqs)),
+                seq_lens,
                 num_heads=num_heads,
                 sm_count=sm_count,
                 chunk_tokens=(
@@ -2758,13 +3163,38 @@ class FlashKDABlackwellBF16FusedLaunch:
                 ),
             )
         )
+        # An unbounded direct N32 serving launch the strict test keeps one task
+        # per CTA may still take work bins for its module's turnover build,
+        # where bins that charge each task its fixed cost pay; a module without
+        # a turnover build keeps one task per CTA (``_build_body``), and so does
+        # a bounded launch.
+        route_turnover_bins = _turnover_bins_route(
+            strict=route_work_bins,
+            route=route,
+            tf32_direct=use_tf32_direct_m128,
+            n32_ft_slab=self._n32_ft_slab,
+            unbounded=unbounded_softplus,
+            seq_lens=seq_lens,
+            num_heads=num_heads,
+            sm_count=sm_count,
+            gpu_arch=gpu_arch,
+        )
+        route_work_bins = route_work_bins or route_turnover_bins
         # A work-binned N32 serving launch whose longest sequence has at most
-        # the part's turnover chunk count may take its module's turnover build.
+        # the part's turnover chunk count may take its module's turnover build;
+        # a bounded one only when few of its tasks are short and every work bin
+        # averages more than the part's bounded chunk count per task.
         route_work_bin_turnover = _work_bin_turnover_route(
             route_work_bins=route_work_bins,
             direct_n16=use_direct_m128_n16,
             n32_ft_slab=self._n32_ft_slab,
             max_seq_len=max_seq_len,
+            gpu_arch=gpu_arch,
+            sm_count=sm_count,
+        ) and _bounded_turnover_route(
+            bounded_gate=gate_kind == KDAGateKind.LOWER_BOUND,
+            seq_lens=seq_lens,
+            num_heads=num_heads,
             gpu_arch=gpu_arch,
             sm_count=sm_count,
         )
@@ -3105,6 +3535,7 @@ class FlashKDABlackwellBF16FusedLaunch:
             )
         owner_helpers = 0
         owner_helper_pool = 0
+        m64_owner_helpers = 0
         if use_bt16_prepare_chain:
             self.prepare_module = self._build_body(
                 partial(_factory, "compiled_tf32_bt16_prepare"),
@@ -3183,6 +3614,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 ),
                 BF16_N16_M128_CHUNK if use_direct_m128_n16 else BF16_M128_CHUNK,
                 work_bin_turnover=route_work_bin_turnover,
+                turnover_bins_only=route_turnover_bins,
                 serving_native_abi=serving_native_abi,
                 gate_kind=gate_kind,
                 checkpoint_tma=bool(checkpoint_every_n_tokens and use_direct_m128_n16),
@@ -3345,13 +3777,37 @@ class FlashKDABlackwellBF16FusedLaunch:
                 and max_seq_len >= pair_share_min_seq_len
                 and total_tasks <= _m64_pair_cluster_capacity(q.device)
             )
-            self.module = self._build_body(
-                partial(
-                    _m64_pair_share_factory if pair_share else _factory,
-                    "compiled_bf16_fused_m64",
-                ),
+            m64_body = dict(
                 state_dtype_is_fp32=self._state_dtype_is_fp32,
                 active_beta_f32=self._active_beta_f32,
+            )
+            # The owner/helper build takes the FP32-state launches its rule
+            # takes; its ring and words ride in the BF16 final_state and
+            # seq_order slots the FP32-state body never reads.
+            if (
+                self._state_dtype_is_fp32
+                and _m64_owner_helper_program("compiled_bf16_fused_m64", **m64_body)
+                is not None
+            ):
+                m64_owner_helpers = _m64_owner_helper_count(
+                    gpu_arch=gpu_arch,
+                    sm_count=sm_count,
+                    total_tasks=total_tasks,
+                    min_seq_len=min(
+                        end - start
+                        for start, end in zip(offsets, offsets[1:], strict=False)
+                    ),
+                    device=q.device,
+                )
+            m64_factory = partial(
+                _m64_pair_share_factory if pair_share else _factory,
+                "compiled_bf16_fused_m64",
+            )
+            self.module = self._build_body(
+                partial(_m64_owner_helper_factory, "compiled_bf16_fused_m64")
+                if m64_owner_helpers
+                else m64_factory,
+                **m64_body,
             )
             self.schedule = (
                 "fused_active_beta_checkpoint_dvsplit_m64"
@@ -3360,6 +3816,18 @@ class FlashKDABlackwellBF16FusedLaunch:
                 if self._state_dtype_is_fp32
                 else "fused_m64_independent_dvsplit"
             )
+            if m64_owner_helpers:
+                # The program a refused cooperative launch takes instead
+                # (_fall_back_from_m64_owner_helper), prepared with the plan.
+                m64_fallback_module = self._build_body(m64_factory, **m64_body)
+                m64_fallback_schedule = self.schedule + (
+                    "_pair_share"
+                    if m64_fallback_module.name
+                    in _kda_registry._RENDERED_PAIR_SHARE_ROUTES.get(
+                        gpu_arch, {}
+                    ).values()
+                    else ""
+                )
             if getattr(self.module, "name", None) in (
                 _kda_registry._RENDERED_PAIR_SHARE_ROUTES.get(gpu_arch, {}).values()
             ):
@@ -3400,11 +3868,17 @@ class FlashKDABlackwellBF16FusedLaunch:
                     "work bins are built for the direct M128 N32 and N16 bodies only"
                 )
             work_bin_table, num_work_bins = _make_direct_work_bins(
-                tuple(offsets[index + 1] - offsets[index] for index in range(num_seqs)),
+                seq_lens,
                 num_heads=num_heads,
                 worker_count=sm_count,
                 chunk_tokens=(
                     BF16_N16_M128_CHUNK if use_direct_m128_n16 else BF16_M128_CHUNK
+                ),
+                # A strict launch reads the table the strict test cached.
+                **(
+                    {"task_cost": BF16_WORK_BIN_TURNOVER_TASK_COST}
+                    if route_turnover_bins
+                    else {}
                 ),
             )
             work_bin_upload = _upload_int32_batch(
@@ -3511,6 +3985,13 @@ class FlashKDABlackwellBF16FusedLaunch:
         elif self.owner_helpers:
             self.grid = (total_tasks * (1 + self.owner_helpers), 1, 1)
             self.schedule += f"_owner{self.owner_helpers}helper"
+        self.m64_owner_helpers = (
+            m64_owner_helpers if getattr(self.module, "m64_owner_helper", False) else 0
+        )
+        if self.m64_owner_helpers:
+            m64_fallback_grid = self.grid
+            self.grid = (total_tasks, 2 + self.m64_owner_helpers, 1)
+            self.schedule += f"_owner{self.m64_owner_helpers}helper"
         self.prepare_grid = (bt16_prepare_total_ctas, 1, 1)
         qkv_carriers = self._qkv_carrier_names.get(id(self.module), ())
         self.args = {
@@ -3647,6 +4128,33 @@ class FlashKDABlackwellBF16FusedLaunch:
                 ),
                 zero_workspace=owner_helper_words[:slots],
                 state_checkpoint_needed=owner_helper_words[slots:],
+            )
+        if self.m64_owner_helpers:
+            # The packet ring (final_state) and its ready and consumed words
+            # (seq_order, ready words first). The program leaves every word
+            # zero when it exits, so one zeroed allocation serves every launch
+            # of the plan.
+            m64_owner_helper_words = torch.zeros(
+                2 * M64_OWNER_HELPER_WORD_STRIDE * M64_OWNER_HELPER_SLOTS * total_tasks,
+                dtype=torch.int32,
+                device=q.device,
+            )
+            m64_owner_helper_ring = torch.empty(
+                total_tasks
+                * self.m64_owner_helpers
+                * M64_OWNER_HELPER_SLOTS
+                * M64_OWNER_HELPER_SLOT_ELEMENTS,
+                dtype=torch.bfloat16,
+                device=q.device,
+            )
+            self._m64_owner_helper_fallback = (
+                m64_fallback_module,
+                m64_fallback_grid,
+                m64_fallback_schedule,
+                {name: self.args[name] for name in ("final_state", "seq_order")},
+            )
+            self.args.update(
+                final_state=m64_owner_helper_ring, seq_order=m64_owner_helper_words
             )
         self.prepare_args: dict[str, Any] = {}
         if use_bt16_prepare_chain:
@@ -3830,8 +4338,59 @@ class FlashKDABlackwellBF16FusedLaunch:
                     self.prepare_module, self.prepare_grid, self.prepare_args
                 )
             )
-        records.append(_prepared_kernel_record(self.module, self.grid, self.args))
+        records.append(
+            self._m64_owner_helper_record()
+            if self.m64_owner_helpers
+            else _prepared_kernel_record(self.module, self.grid, self.args)
+        )
         return records
+
+    def _m64_owner_helper_record(self) -> tuple:
+        """The launch record of the M64 owner/helper build.
+
+        The driver can refuse the cooperative grid although the capacity probe
+        passed (an MPS client's SM limit, a green context).  The first refused
+        launch switches the plan for good to the program it would otherwise
+        have taken (_fall_back_from_m64_owner_helper) and launches that instead;
+        a refused launch leaves the words untouched.
+        """
+        call, arguments = _prepared_kernel_record(self.module, self.grid, self.args)
+
+        def launch(*packed):
+            if self.m64_owner_helpers:
+                try:
+                    call(*packed)
+                    return
+                except RuntimeError as error:
+                    if not _cooperative_launch_refused(error):
+                        raise
+                self._fall_back_from_m64_owner_helper()
+            _run_launch_records(
+                (_prepared_kernel_record(self.module, self.grid, self.args),)
+            )
+
+        return launch, arguments
+
+    def _fall_back_from_m64_owner_helper(self) -> None:
+        """Switch the plan to the pair-share or routed program it would otherwise take."""
+        global _M64_OWNER_HELPER_REFUSAL_WARNED
+        module, grid, schedule, bindings = self._m64_owner_helper_fallback
+        _clear_cuda_launch_error()
+        self.args.update(bindings)
+        self.module, self.grid, self.schedule = module, grid, schedule
+        self.ir = module.schedule
+        self.m64_owner_helpers = 0
+        module.prepare(grid=grid, **self.args)
+        self.__dict__.pop("_launch_records", None)
+        if not _M64_OWNER_HELPER_REFUSAL_WARNED:
+            _M64_OWNER_HELPER_REFUSAL_WARNED = True
+            from flashinfer.jit.core import logger
+
+            logger.warning(
+                "KDA prefill: the device refused a cooperative M64 owner/helper "
+                "launch; the plan runs %s instead",
+                schedule,
+            )
 
     def _launch_in_stream(self) -> None:
         """Launch inside an already entered FFI/Torch stream context."""

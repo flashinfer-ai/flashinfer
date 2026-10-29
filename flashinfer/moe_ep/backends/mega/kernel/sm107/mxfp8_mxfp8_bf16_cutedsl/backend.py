@@ -239,12 +239,11 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
     def stage_inputs(
         self, t: "MoEEpTensors", workspace: Any, *, quantize_input: bool
     ) -> None:
-        validate_routing_values(
-            t.topk_ids,
-            t.topk_weights,
-            workspace.config.num_total_experts,
-            workspace=workspace,
-        )
+        """Stage validated MXFP8 activations and routes, masking unused rows.
+
+        BF16 inputs may fuse validation with quantization; prequantized inputs
+        are validated before copying their payload and logical scale columns.
+        """
         if quantize_input:
             staged = stage_mega_moe_inputs(
                 t.hidden_states,
@@ -255,9 +254,18 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
                 workspace.topk_idx,
                 workspace.topk_weights,
                 kind=self._kernel_config.kind,
+                num_experts=workspace.config.num_total_experts,
+                workspace=workspace,
             )
             workspace.note_staged_tokens(staged)
             return
+
+        validate_routing_values(
+            t.topk_ids,
+            t.topk_weights,
+            workspace.config.num_total_experts,
+            workspace=workspace,
+        )
 
         num_tokens = t.hidden_states.shape[0]
         capacity = workspace.x.shape[0]

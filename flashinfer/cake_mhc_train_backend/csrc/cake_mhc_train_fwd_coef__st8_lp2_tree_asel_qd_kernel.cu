@@ -144,39 +144,39 @@ kernel_cake_mhc_train_fwd_coef__st8_lp2_tree_asel_qd(float* __restrict__ spart, 
         }
         if (p_k <= 8) {
             long long sa_row = (long long)g * 8;
-            int sa_i0 = tid_2;
-            int sa_plane0 = sa_i0 / 48;
-            int sa_within0 = sa_i0 - sa_plane0 * 48;
-            long long sa_src0 = ((long long)sa_plane0 * tp64 + sa_row) * 24 + (long long)(sa_within0 * 4);
+            int sa_i0_1_0 = tid_2;
+            int sa_plane0_1_0 = sa_i0_1_0 / 48;
+            int sa_within0_1_0 = sa_i0_1_0 - sa_plane0_1_0 * 48;
+            long long sa_src0_1_0 = ((long long)sa_plane0_1_0 * tp64 + sa_row) * 24 + (long long)(sa_within0_1_0 * 4);
             asm volatile(
                 "{\n\t"
                 ".reg .pred p;\n\t"
                 "setp.ne.b32 p, %0, 0;\n\t"
                 "@p cp.async.cg.shared::cta.global.L2::cache_hint [%1], [%2], 16, %3;\n\t"
                 "}"
-                :: "r"((sa_i0 < nf4) ? 1 : 0), "r"(sview_addr + (unsigned int)((boff + 4 * sa_i0) * 4)), "l"(spart + sa_src0), "l"(0x14F0000000000000ULL));
-            int sa_i1 = tid_2 + 128;
-            int sa_plane1 = sa_i1 / 48;
-            int sa_within1 = sa_i1 - sa_plane1 * 48;
-            long long sa_src1 = ((long long)sa_plane1 * tp64 + sa_row) * 24 + (long long)(sa_within1 * 4);
+                :: "r"((sa_i0_1_0 < nf4) ? 1 : 0), "r"(sview_addr + (unsigned int)((boff + 4 * sa_i0_1_0) * 4)), "l"(spart + sa_src0_1_0), "l"(0x14F0000000000000ULL));
+            int sa_i0_1_1 = tid_2 + 128;
+            int sa_plane0_1_1 = sa_i0_1_1 / 48;
+            int sa_within0_1_1 = sa_i0_1_1 - sa_plane0_1_1 * 48;
+            long long sa_src0_1_1 = ((long long)sa_plane0_1_1 * tp64 + sa_row) * 24 + (long long)(sa_within0_1_1 * 4);
             asm volatile(
                 "{\n\t"
                 ".reg .pred p;\n\t"
                 "setp.ne.b32 p, %0, 0;\n\t"
                 "@p cp.async.cg.shared::cta.global.L2::cache_hint [%1], [%2], 16, %3;\n\t"
                 "}"
-                :: "r"((sa_i1 < nf4) ? 1 : 0), "r"(sview_addr + (unsigned int)((boff + 4 * sa_i1) * 4)), "l"(spart + sa_src1), "l"(0x14F0000000000000ULL));
-            int sa_i2 = tid_2 + 256;
-            int sa_plane2 = sa_i2 / 48;
-            int sa_within2 = sa_i2 - sa_plane2 * 48;
-            long long sa_src2 = ((long long)sa_plane2 * tp64 + sa_row) * 24 + (long long)(sa_within2 * 4);
+                :: "r"((sa_i0_1_1 < nf4) ? 1 : 0), "r"(sview_addr + (unsigned int)((boff + 4 * sa_i0_1_1) * 4)), "l"(spart + sa_src0_1_1), "l"(0x14F0000000000000ULL));
+            int sa_i0_1_2 = tid_2 + 256;
+            int sa_plane0_1_2 = sa_i0_1_2 / 48;
+            int sa_within0_1_2 = sa_i0_1_2 - sa_plane0_1_2 * 48;
+            long long sa_src0_1_2 = ((long long)sa_plane0_1_2 * tp64 + sa_row) * 24 + (long long)(sa_within0_1_2 * 4);
             asm volatile(
                 "{\n\t"
                 ".reg .pred p;\n\t"
                 "setp.ne.b32 p, %0, 0;\n\t"
                 "@p cp.async.cg.shared::cta.global.L2::cache_hint [%1], [%2], 16, %3;\n\t"
                 "}"
-                :: "r"((sa_i2 < nf4) ? 1 : 0), "r"(sview_addr + (unsigned int)((boff + 4 * sa_i2) * 4)), "l"(spart + sa_src2), "l"(0x14F0000000000000ULL));
+                :: "r"((sa_i0_1_2 < nf4) ? 1 : 0), "r"(sview_addr + (unsigned int)((boff + 4 * sa_i0_1_2) * 4)), "l"(spart + sa_src0_1_2), "l"(0x14F0000000000000ULL));
             asm volatile("cp.async.commit_group;");
             #pragma unroll
             for (int j_3 = 0; j_3 < 2; j_3++) {

@@ -280,6 +280,21 @@ from .cake_rmsnorm_train import (
 from .cake_rmsnorm_train import (
     cake_rmsnorm_train_forward as cake_rmsnorm_train_forward,
 )
+from .cake_rmsnorm_silu_gate_train import (
+    CakeRMSNormSiLUGateFunction as CakeRMSNormSiLUGateFunction,
+)
+from .cake_rmsnorm_silu_gate_train import (
+    cake_rmsnorm_silu_gate as cake_rmsnorm_silu_gate,
+)
+from .cake_rmsnorm_silu_gate_train import (
+    cake_rmsnorm_silu_gate_train_backward as cake_rmsnorm_silu_gate_train_backward,
+)
+from .cake_rmsnorm_silu_gate_train import (
+    cake_rmsnorm_silu_gate_train_backward_workspace_bytes as cake_rmsnorm_silu_gate_train_backward_workspace_bytes,
+)
+from .cake_rmsnorm_silu_gate_train import (
+    cake_rmsnorm_silu_gate_train_forward as cake_rmsnorm_silu_gate_train_forward,
+)
 from .cake_causal_conv1d_train import (
     CakeCausalConv1dFunction as CakeCausalConv1dFunction,
 )

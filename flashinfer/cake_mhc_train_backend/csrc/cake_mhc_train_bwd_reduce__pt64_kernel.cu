@@ -160,29 +160,29 @@ kernel_cake_mhc_train_bwd_reduce__pt64(float* __restrict__ dfn_part, float* __re
         }
         #pragma unroll 1
         for (int p = 1; p < n_parts; p++) {
-            float _vec_load_1[4];
+            float vec_load[4];
             {
                 float4 _v4 = *reinterpret_cast<const float4*>(dfn_part + ((long long)p * 393216 + e0) + 0);
-                _vec_load_1[0 + 0] = _v4.x;
-                _vec_load_1[0 + 1] = _v4.y;
-                _vec_load_1[0 + 2] = _v4.z;
-                _vec_load_1[0 + 3] = _v4.w;
+                vec_load[0 + 0] = _v4.x;
+                vec_load[0 + 1] = _v4.y;
+                vec_load[0 + 2] = _v4.z;
+                vec_load[0 + 3] = _v4.w;
             }
             #pragma unroll
             for (int k_2 = 0; k_2 < 4; k_2++) {
-                unsigned int wu_d = __as_u32(_vec_load_1[k_2]);
-                unsigned int wa_d = wu_d & 2147483647;
-                unsigned int we_d = wa_d >> 23;
-                unsigned int ws_d = __as_u32(mul_f32_rn_noftz(_vec_load_1[k_2], 1.6777216e+07f));
-                unsigned int ww_d = ((we_d == 0) ? ws_d & 2147483647 : wa_d);
-                unsigned int wj_d = ((we_d == 0) ? 914358272 : ((we_d == 255) ? 1879048192 : 939524096));
-                unsigned int wg_d = wu_d & 2147483648u;
-                unsigned int wm_d = wj_d + (ww_d >> 3);
-                unsigned int wh_d = ((ww_d == 0) ? wg_d : wg_d | wm_d);
-                unsigned int wp_d[2];
-                wp_d[0] = ww_d << 29;
-                wp_d[1] = wh_d;
-                a[k_2] = a[k_2] + reinterpret_cast<double*>(wp_d)[0];
+                unsigned int wu_s_1 = __as_u32(vec_load[k_2]);
+                unsigned int wa_s_1 = wu_s_1 & 2147483647;
+                unsigned int we_s_1 = wa_s_1 >> 23;
+                unsigned int ws_s_1 = __as_u32(mul_f32_rn_noftz(vec_load[k_2], 1.6777216e+07f));
+                unsigned int ww_s_1 = ((we_s_1 == 0) ? ws_s_1 & 2147483647 : wa_s_1);
+                unsigned int wj_s_1 = ((we_s_1 == 0) ? 914358272 : ((we_s_1 == 255) ? 1879048192 : 939524096));
+                unsigned int wg_s_1 = wu_s_1 & 2147483648u;
+                unsigned int wm_s_1 = wj_s_1 + (ww_s_1 >> 3);
+                unsigned int wh_s_1 = ((ww_s_1 == 0) ? wg_s_1 : wg_s_1 | wm_s_1);
+                unsigned int wp_s_1[2];
+                wp_s_1[0] = ww_s_1 << 29;
+                wp_s_1[1] = wh_s_1;
+                a[k_2] = a[k_2] + reinterpret_cast<double*>(wp_s_1)[0];
             }
         }
         if (accumulate != 0) {
@@ -196,19 +196,19 @@ kernel_cake_mhc_train_bwd_reduce__pt64(float* __restrict__ dfn_part, float* __re
             }
             #pragma unroll
             for (int k_3 = 0; k_3 < 4; k_3++) {
-                unsigned int wu_c = __as_u32(_vec_load_2[k_3]);
-                unsigned int wa_c = wu_c & 2147483647;
-                unsigned int we_c = wa_c >> 23;
-                unsigned int ws_c = __as_u32(mul_f32_rn_noftz(_vec_load_2[k_3], 1.6777216e+07f));
-                unsigned int ww_c = ((we_c == 0) ? ws_c & 2147483647 : wa_c);
-                unsigned int wj_c = ((we_c == 0) ? 914358272 : ((we_c == 255) ? 1879048192 : 939524096));
-                unsigned int wg_c = wu_c & 2147483648u;
-                unsigned int wm_c = wj_c + (ww_c >> 3);
-                unsigned int wh_c = ((ww_c == 0) ? wg_c : wg_c | wm_c);
-                unsigned int wp_c[2];
-                wp_c[0] = ww_c << 29;
-                wp_c[1] = wh_c;
-                a[k_3] = a[k_3] + reinterpret_cast<double*>(wp_c)[0];
+                unsigned int wu_s_2 = __as_u32(_vec_load_2[k_3]);
+                unsigned int wa_s_2 = wu_s_2 & 2147483647;
+                unsigned int we_s_2 = wa_s_2 >> 23;
+                unsigned int ws_s_2 = __as_u32(mul_f32_rn_noftz(_vec_load_2[k_3], 1.6777216e+07f));
+                unsigned int ww_s_2 = ((we_s_2 == 0) ? ws_s_2 & 2147483647 : wa_s_2);
+                unsigned int wj_s_2 = ((we_s_2 == 0) ? 914358272 : ((we_s_2 == 255) ? 1879048192 : 939524096));
+                unsigned int wg_s_2 = wu_s_2 & 2147483648u;
+                unsigned int wm_s_2 = wj_s_2 + (ww_s_2 >> 3);
+                unsigned int wh_s_2 = ((ww_s_2 == 0) ? wg_s_2 : wg_s_2 | wm_s_2);
+                unsigned int wp_s_2[2];
+                wp_s_2[0] = ww_s_2 << 29;
+                wp_s_2[1] = wh_s_2;
+                a[k_3] = a[k_3] + reinterpret_cast<double*>(wp_s_2)[0];
             }
         }
         #pragma unroll
@@ -263,19 +263,19 @@ kernel_cake_mhc_train_bwd_reduce__pt64(float* __restrict__ dfn_part, float* __re
                 negl = _max_5;
                 int _max_6 = ((bad) > ((int)(cvalid != 0 && ce == 255)) ? (bad) : ((int)(cvalid != 0 && ce == 255)));
                 bad = _max_6;
-                unsigned int wu_u = cb;
-                unsigned int wa_u = wu_u & 2147483647;
-                unsigned int we_u = wa_u >> 23;
-                unsigned int ws_u = __as_u32(mul_f32_rn_noftz(__uint_as_float(cb), 1.6777216e+07f));
-                unsigned int ww_u = ((we_u == 0) ? ws_u & 2147483647 : wa_u);
-                unsigned int wj_u = ((we_u == 0) ? 914358272 : ((we_u == 255) ? 1879048192 : 939524096));
-                unsigned int wg_u = wu_u & 2147483648u;
-                unsigned int wm_u = wj_u + (ww_u >> 3);
-                unsigned int wh_u = ((ww_u == 0) ? wg_u : wg_u | wm_u);
-                unsigned int wp_u[2];
-                wp_u[0] = ww_u << 29;
-                wp_u[1] = wh_u;
-                part = part + reinterpret_cast<double*>(wp_u)[0];
+                unsigned int wu_s_3 = cb;
+                unsigned int wa_s_3 = wu_s_3 & 2147483647;
+                unsigned int we_s_3 = wa_s_3 >> 23;
+                unsigned int ws_s_3 = __as_u32(mul_f32_rn_noftz(__uint_as_float(cb), 1.6777216e+07f));
+                unsigned int ww_s_3 = ((we_s_3 == 0) ? ws_s_3 & 2147483647 : wa_s_3);
+                unsigned int wj_s_3 = ((we_s_3 == 0) ? 914358272 : ((we_s_3 == 255) ? 1879048192 : 939524096));
+                unsigned int wg_s_3 = wu_s_3 & 2147483648u;
+                unsigned int wm_s_3 = wj_s_3 + (ww_s_3 >> 3);
+                unsigned int wh_s_3 = ((ww_s_3 == 0) ? wg_s_3 : wg_s_3 | wm_s_3);
+                unsigned int wp_s_3[2];
+                wp_s_3[0] = ww_s_3 << 29;
+                wp_s_3[1] = wh_s_3;
+                part = part + reinterpret_cast<double*>(wp_s_3)[0];
             }
             int _warp_redux_7;
             asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_7) : "r"(emax));
@@ -321,19 +321,19 @@ kernel_cake_mhc_train_bwd_reduce__pt64(float* __restrict__ dfn_part, float* __re
                     #pragma unroll 8
                     for (int rloc = 0; rloc < rows; rloc++) {
                         float xf = sstage_f[rloc];
-                        unsigned int wu_v = __as_u32(xf);
-                        unsigned int wa_v = wu_v & 2147483647;
-                        unsigned int we_v = wa_v >> 23;
-                        unsigned int ws_v = __as_u32(mul_f32_rn_noftz(xf, 1.6777216e+07f));
-                        unsigned int ww_v = ((we_v == 0) ? ws_v & 2147483647 : wa_v);
-                        unsigned int wj_v = ((we_v == 0) ? 914358272 : ((we_v == 255) ? 1879048192 : 939524096));
-                        unsigned int wg_v = wu_v & 2147483648u;
-                        unsigned int wm_v = wj_v + (ww_v >> 3);
-                        unsigned int wh_v = ((ww_v == 0) ? wg_v : wg_v | wm_v);
-                        unsigned int wp_v[2];
-                        wp_v[0] = ww_v << 29;
-                        wp_v[1] = wh_v;
-                        tot[0] = tot[0] + reinterpret_cast<double*>(wp_v)[0];
+                        unsigned int wu_s_4 = __as_u32(xf);
+                        unsigned int wa_s_4 = wu_s_4 & 2147483647;
+                        unsigned int we_s_4 = wa_s_4 >> 23;
+                        unsigned int ws_s_4 = __as_u32(mul_f32_rn_noftz(xf, 1.6777216e+07f));
+                        unsigned int ww_s_4 = ((we_s_4 == 0) ? ws_s_4 & 2147483647 : wa_s_4);
+                        unsigned int wj_s_4 = ((we_s_4 == 0) ? 914358272 : ((we_s_4 == 255) ? 1879048192 : 939524096));
+                        unsigned int wg_s_4 = wu_s_4 & 2147483648u;
+                        unsigned int wm_s_4 = wj_s_4 + (ww_s_4 >> 3);
+                        unsigned int wh_s_4 = ((ww_s_4 == 0) ? wg_s_4 : wg_s_4 | wm_s_4);
+                        unsigned int wp_s_4[2];
+                        wp_s_4[0] = ww_s_4 << 29;
+                        wp_s_4[1] = wh_s_4;
+                        tot[0] = tot[0] + reinterpret_cast<double*>(wp_s_4)[0];
                     }
                 }
             }
@@ -342,33 +342,33 @@ kernel_cake_mhc_train_bwd_reduce__pt64(float* __restrict__ dfn_part, float* __re
         if (tid_0 == 0) {
             if (accumulate != 0) {
                 if (col < 24) {
-                    unsigned int wu_cb = __as_u32(dbase[col64]);
-                    unsigned int wa_cb = wu_cb & 2147483647;
-                    unsigned int we_cb = wa_cb >> 23;
-                    unsigned int ws_cb = __as_u32(mul_f32_rn_noftz(dbase[col64], 1.6777216e+07f));
-                    unsigned int ww_cb = ((we_cb == 0) ? ws_cb & 2147483647 : wa_cb);
-                    unsigned int wj_cb = ((we_cb == 0) ? 914358272 : ((we_cb == 255) ? 1879048192 : 939524096));
-                    unsigned int wg_cb = wu_cb & 2147483648u;
-                    unsigned int wm_cb = wj_cb + (ww_cb >> 3);
-                    unsigned int wh_cb = ((ww_cb == 0) ? wg_cb : wg_cb | wm_cb);
-                    unsigned int wp_cb[2];
-                    wp_cb[0] = ww_cb << 29;
-                    wp_cb[1] = wh_cb;
-                    tot[0] = tot[0] + reinterpret_cast<double*>(wp_cb)[0];
+                    unsigned int wu_s_5 = __as_u32(dbase[col64]);
+                    unsigned int wa_s_5 = wu_s_5 & 2147483647;
+                    unsigned int we_s_5 = wa_s_5 >> 23;
+                    unsigned int ws_s_5 = __as_u32(mul_f32_rn_noftz(dbase[col64], 1.6777216e+07f));
+                    unsigned int ww_s_5 = ((we_s_5 == 0) ? ws_s_5 & 2147483647 : wa_s_5);
+                    unsigned int wj_s_5 = ((we_s_5 == 0) ? 914358272 : ((we_s_5 == 255) ? 1879048192 : 939524096));
+                    unsigned int wg_s_5 = wu_s_5 & 2147483648u;
+                    unsigned int wm_s_5 = wj_s_5 + (ww_s_5 >> 3);
+                    unsigned int wh_s_5 = ((ww_s_5 == 0) ? wg_s_5 : wg_s_5 | wm_s_5);
+                    unsigned int wp_s_5[2];
+                    wp_s_5[0] = ww_s_5 << 29;
+                    wp_s_5[1] = wh_s_5;
+                    tot[0] = tot[0] + reinterpret_cast<double*>(wp_s_5)[0];
                 } else {
-                    unsigned int wu_cs = __as_u32(dscale[scol64]);
-                    unsigned int wa_cs = wu_cs & 2147483647;
-                    unsigned int we_cs = wa_cs >> 23;
-                    unsigned int ws_cs = __as_u32(mul_f32_rn_noftz(dscale[scol64], 1.6777216e+07f));
-                    unsigned int ww_cs = ((we_cs == 0) ? ws_cs & 2147483647 : wa_cs);
-                    unsigned int wj_cs = ((we_cs == 0) ? 914358272 : ((we_cs == 255) ? 1879048192 : 939524096));
-                    unsigned int wg_cs = wu_cs & 2147483648u;
-                    unsigned int wm_cs = wj_cs + (ww_cs >> 3);
-                    unsigned int wh_cs = ((ww_cs == 0) ? wg_cs : wg_cs | wm_cs);
-                    unsigned int wp_cs[2];
-                    wp_cs[0] = ww_cs << 29;
-                    wp_cs[1] = wh_cs;
-                    tot[0] = tot[0] + reinterpret_cast<double*>(wp_cs)[0];
+                    unsigned int wu_s_6 = __as_u32(dscale[scol64]);
+                    unsigned int wa_s_6 = wu_s_6 & 2147483647;
+                    unsigned int we_s_6 = wa_s_6 >> 23;
+                    unsigned int ws_s_6 = __as_u32(mul_f32_rn_noftz(dscale[scol64], 1.6777216e+07f));
+                    unsigned int ww_s_6 = ((we_s_6 == 0) ? ws_s_6 & 2147483647 : wa_s_6);
+                    unsigned int wj_s_6 = ((we_s_6 == 0) ? 914358272 : ((we_s_6 == 255) ? 1879048192 : 939524096));
+                    unsigned int wg_s_6 = wu_s_6 & 2147483648u;
+                    unsigned int wm_s_6 = wj_s_6 + (ww_s_6 >> 3);
+                    unsigned int wh_s_6 = ((ww_s_6 == 0) ? wg_s_6 : wg_s_6 | wm_s_6);
+                    unsigned int wp_s_6[2];
+                    wp_s_6[0] = ww_s_6 << 29;
+                    wp_s_6[1] = wh_s_6;
+                    tot[0] = tot[0] + reinterpret_cast<double*>(wp_s_6)[0];
                 }
             }
             res[0] = (float)tot[0];

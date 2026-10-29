@@ -138,9 +138,10 @@ def cake_mhc_train_forward_prepare(
     hc_eps : float
         Coefficient epsilon (default ``1e-6``): a launch argument like ``rms_eps``.
     sinkhorn_iters : int
-        Finite Sinkhorn iteration count (default ``20``): a compile-time constant of
-        the exported programs; a count the export has not delivered raises
-        ``NotImplementedError``.
+        Sinkhorn iteration count, 1 to 64 (default ``20``).  The default runs the
+        compiled programs, whose chain is unrolled for it; every other count runs
+        the run-time-count programs of the coefficient and token-owner passes.  A
+        count above 64 raises ``NotImplementedError``.
     out : torch.Tensor, optional
         Preallocated BF16 ``[T, 4096]`` contiguous ``U``.
     stats_out : torch.Tensor, optional
@@ -200,8 +201,8 @@ def cake_mhc_train_forward_stats(
     hc_eps : float
         Coefficient epsilon (default ``1e-6``; a launch argument).
     sinkhorn_iters : int
-        Finite Sinkhorn iteration count (default ``20``; compile-time, delivered
-        counts only).
+        Sinkhorn iteration count, 1 to 64 (default ``20``; as in
+        :func:`cake_mhc_train_forward_prepare`).
     stats_out : torch.Tensor, optional
         Preallocated FP32 ``[T, 64]`` contiguous statistics record.
     workspace : torch.Tensor, optional
@@ -347,8 +348,8 @@ def cake_mhc_train_backward_finish(
     hc_eps : float
         Coefficient epsilon (default ``1e-6``; a launch argument).
     sinkhorn_iters : int
-        Finite Sinkhorn iteration count (default ``20``; compile-time, delivered
-        counts only).
+        Sinkhorn iteration count, 1 to 64 (default ``20``; as in
+        :func:`cake_mhc_train_forward_prepare`).
     accumulate : bool
         ``False`` (default): ``dfn``, ``dscale`` and ``dbase`` are written.
         ``True``: the caller passes all three and the fixed-order sums are added
@@ -427,8 +428,8 @@ def cake_mhc_train_prepare(
     hc_eps : float
         Coefficient epsilon (default ``1e-6``; a launch argument).
     sinkhorn_iters : int
-        Finite Sinkhorn iteration count (default ``20``; compile-time, delivered
-        counts only).
+        Sinkhorn iteration count, 1 to 64 (default ``20``; as in
+        :func:`cake_mhc_train_forward_prepare`).
     save_stats : bool
         ``True`` (default): the per-token statistics are kept for the backward.
         ``False``: they are dropped after the forward and recomputed from ``X``

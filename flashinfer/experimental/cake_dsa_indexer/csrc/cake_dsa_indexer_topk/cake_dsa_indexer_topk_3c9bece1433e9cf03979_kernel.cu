@@ -228,17 +228,17 @@ kernel_cake_dsa_indexer_topk_3c9bece1433e9cf03979(const __grid_constant__ CUtens
                         if (_min_0_1 >= 0) {
                             int blk_1 = nb_1 - 1 - (unit_1 - unit_base_k);
                             int q0_0 = cu_seqlens_q[seg_1];
-                            int lq_1_1 = cu_seqlens_q[seg_1 + 1] - q0_0;
+                            int lq_0 = cu_seqlens_q[seg_1 + 1] - q0_0;
                             int lk = cu_seqlens_k[seg_1 + 1] - cu_seqlens_k[seg_1];
                             long long off = 0;
                             if (has_offsets != 0) {
                                 off = q_offsets[seg_1];
                             } else if (ratio == 1) {
-                                off = (long long)lk - (long long)lq_1_1;
+                                off = (long long)lk - (long long)lq_0;
                             }
-                            long long off_2 = off;
-                            int last_u = ((blk_1 * 6 + 5) < (lq_1_1 - 1) ? (blk_1 * 6 + 5) : (lq_1_1 - 1));
-                            long long num = off_2 + (long long)last_u + 1;
+                            long long off_1 = off;
+                            int last_u = ((blk_1 * 6 + 5) < (lq_0 - 1) ? (blk_1 * 6 + 5) : (lq_0 - 1));
+                            long long num = off_1 + (long long)last_u + 1;
                             int vis = 0;
                             if (num > 0) {
                                 long long quotient = num / (long long)ratio;
@@ -338,18 +338,18 @@ kernel_cake_dsa_indexer_topk_3c9bece1433e9cf03979(const __grid_constant__ CUtens
                     int _min_0_2 = ((unit_2 - unit_base_m) < (unit_base_m + nb_2 - 1 - unit_2) ? (unit_2 - unit_base_m) : (unit_base_m + nb_2 - 1 - unit_2));
                     if (_min_0_2 >= 0) {
                         int blk_2 = nb_2 - 1 - (unit_2 - unit_base_m);
-                        int q0_0_1 = cu_seqlens_q[seg_2];
-                        int lq_1_2 = cu_seqlens_q[seg_2 + 1] - q0_0_1;
+                        int q0_1_1 = cu_seqlens_q[seg_2];
+                        int lq_2_1 = cu_seqlens_q[seg_2 + 1] - q0_1_1;
                         int lk_1 = cu_seqlens_k[seg_2 + 1] - cu_seqlens_k[seg_2];
-                        long long off_1 = 0;
+                        long long off_2 = 0;
                         if (has_offsets != 0) {
-                            off_1 = q_offsets[seg_2];
+                            off_2 = q_offsets[seg_2];
                         } else if (ratio == 1) {
-                            off_1 = (long long)lk_1 - (long long)lq_1_2;
+                            off_2 = (long long)lk_1 - (long long)lq_2_1;
                         }
-                        long long off_2_1 = off_1;
-                        int last_u_1 = ((blk_2 * 6 + 5) < (lq_1_2 - 1) ? (blk_2 * 6 + 5) : (lq_1_2 - 1));
-                        long long num_1 = off_2_1 + (long long)last_u_1 + 1;
+                        long long off_1_1 = off_2;
+                        int last_u_1 = ((blk_2 * 6 + 5) < (lq_2_1 - 1) ? (blk_2 * 6 + 5) : (lq_2_1 - 1));
+                        long long num_1 = off_1_1 + (long long)last_u_1 + 1;
                         int vis_1 = 0;
                         if (num_1 > 0) {
                             long long quotient_1 = num_1 / (long long)ratio;
@@ -442,13 +442,13 @@ kernel_cake_dsa_indexer_topk_3c9bece1433e9cf03979(const __grid_constant__ CUtens
                                 _phase_verdict_bar_2 ^= 1;
                                 int vread_m = 0;
                                 if (lane == 0) {
-                                    uint32_t _shared_weak_0;
-                                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_shared_weak_0) : "r"(static_cast<uint32_t>(s_fail_addr)));
-                                    unsigned int f_2 = _shared_weak_0;
+                                    uint32_t shared_weak;
+                                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(shared_weak) : "r"(static_cast<uint32_t>(s_fail_addr)));
+                                    unsigned int f_2 = shared_weak;
                                     for (int fw = 1; fw < 6; fw++) {
-                                        uint32_t _shared_weak_1;
-                                        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(_shared_weak_1) : "r"(static_cast<uint32_t>(s_fail_addr + (unsigned int)(4 * fw))));
-                                        f_2 = f_2 | _shared_weak_1;
+                                        uint32_t shared_weak_1;
+                                        asm volatile("ld.shared.b32 %0, [%1];" : "=r"(shared_weak_1) : "r"(static_cast<uint32_t>(s_fail_addr + (unsigned int)(4 * fw))));
+                                        f_2 = f_2 | shared_weak_1;
                                     }
                                     vread_m = (int)f_2;
                                 }
@@ -513,7 +513,7 @@ kernel_cake_dsa_indexer_topk_3c9bece1433e9cf03979(const __grid_constant__ CUtens
                 } else if (ratio == 1) {
                     off_3 = (long long)lk_2 - (long long)lq_3;
                 }
-                long long off_0 = off_3;
+                long long dst = off_3;
                 #pragma unroll 1
                 for (int rnd_3 = unit_base / grid_ctas; rnd_3 < (unit_base + nb_3 - 1) / grid_ctas + 1; rnd_3++) {
                     int bid_i_0 = (int)bid;
@@ -523,22 +523,22 @@ kernel_cake_dsa_indexer_topk_3c9bece1433e9cf03979(const __grid_constant__ CUtens
                     if (_min_0_3 >= 0) {
                         int blk_3 = nb_3 - 1 - (unit_3 - unit_base);
                         int u_base = blk_3 * 6;
-                        int q0_0_2 = cu_seqlens_q[seg_3];
-                        int lq_1_3 = cu_seqlens_q[seg_3 + 1] - q0_0_2;
-                        int lk_2_1 = cu_seqlens_k[seg_3 + 1] - cu_seqlens_k[seg_3];
-                        long long off_3_1 = 0;
+                        int q0_2_1 = cu_seqlens_q[seg_3];
+                        int lq_3_1 = cu_seqlens_q[seg_3 + 1] - q0_2_1;
+                        int lk_0 = cu_seqlens_k[seg_3 + 1] - cu_seqlens_k[seg_3];
+                        long long off_1_2 = 0;
                         if (has_offsets != 0) {
-                            off_3_1 = q_offsets[seg_3];
+                            off_1_2 = q_offsets[seg_3];
                         } else if (ratio == 1) {
-                            off_3_1 = (long long)lk_2_1 - (long long)lq_1_3;
+                            off_1_2 = (long long)lk_0 - (long long)lq_3_1;
                         }
-                        long long off_4 = off_3_1;
-                        int last_u_2 = ((blk_3 * 6 + 5) < (lq_1_3 - 1) ? (blk_3 * 6 + 5) : (lq_1_3 - 1));
-                        long long num_2 = off_4 + (long long)last_u_2 + 1;
+                        long long off_1_0 = off_1_2;
+                        int last_u_2 = ((blk_3 * 6 + 5) < (lq_3_1 - 1) ? (blk_3 * 6 + 5) : (lq_3_1 - 1));
+                        long long num_2 = off_1_0 + (long long)last_u_2 + 1;
                         int vis_2 = 0;
                         if (num_2 > 0) {
                             long long quotient_2 = num_2 / (long long)ratio;
-                            long long lk64_2 = (long long)lk_2_1;
+                            long long lk64_2 = (long long)lk_0;
                             long long bounded_2 = ((quotient_2 < lk64_2) ? quotient_2 : lk64_2);
                             vis_2 = (int)bounded_2;
                         }
@@ -566,15 +566,15 @@ kernel_cake_dsa_indexer_topk_3c9bece1433e9cf03979(const __grid_constant__ CUtens
                         row_valid[0] = valid_q;
                         int vis_q = 0;
                         if (valid_q != 0) {
-                            long long num_0 = off_0 + (long long)u_q + 1;
-                            int vis_1_1 = 0;
+                            long long num_0 = dst + (long long)u_q + 1;
+                            int vis_0 = 0;
                             if (num_0 > 0) {
                                 long long quotient_3 = num_0 / (long long)ratio;
                                 long long lk64_3 = (long long)lk_2;
                                 long long bounded_3 = ((quotient_3 < lk64_3) ? quotient_3 : lk64_3);
-                                vis_1_1 = (int)bounded_3;
+                                vis_0 = (int)bounded_3;
                             }
-                            vis_q = vis_1_1;
+                            vis_q = vis_0;
                         }
                         visible[0] = vis_q;
                         buf_base[0] = buf_unit;
@@ -583,15 +583,15 @@ kernel_cake_dsa_indexer_topk_3c9bece1433e9cf03979(const __grid_constant__ CUtens
                         row_valid[1] = valid_q_7;
                         int vis_q_8 = 0;
                         if (valid_q_7 != 0) {
-                            long long num_0_1 = off_0 + (long long)u_q_6 + 1;
-                            int vis_1_2 = 0;
-                            if (num_0_1 > 0) {
-                                long long quotient_4 = num_0_1 / (long long)ratio;
+                            long long num_1_1 = dst + (long long)u_q_6 + 1;
+                            int vis_2_1 = 0;
+                            if (num_1_1 > 0) {
+                                long long quotient_4 = num_1_1 / (long long)ratio;
                                 long long lk64_4 = (long long)lk_2;
                                 long long bounded_4 = ((quotient_4 < lk64_4) ? quotient_4 : lk64_4);
-                                vis_1_2 = (int)bounded_4;
+                                vis_2_1 = (int)bounded_4;
                             }
-                            vis_q_8 = vis_1_2;
+                            vis_q_8 = vis_2_1;
                         }
                         visible[1] = vis_q_8;
                         buf_base[1] = buf_unit + cand_cap;
@@ -693,28 +693,28 @@ kernel_cake_dsa_indexer_topk_3c9bece1433e9cf03979(const __grid_constant__ CUtens
                                 unsigned int _warp_vote_1 = __ballot_sync(0xFFFFFFFF, emit != 0);
                                 ballot2[0] = _warp_vote_1;
                                 float2 sum0_0 = make_float2(0.0f, 0.0f);
-                                float2 sum1_1 = make_float2(0.0f, 0.0f);
+                                float2 sum1_0 = make_float2(0.0f, 0.0f);
                                 #pragma unroll
                                 for (int j_1 = 0; j_1 < 32; j_1 += 4) {
                                     float2 doubled0_1 = add_f32x2_noftz(make_float2(_tmem_load_0[32 + j_1], _tmem_load_0[32 + (j_1 + 1)]), make_float2(fabsf(_tmem_load_0[32 + j_1]), fabsf(_tmem_load_0[32 + (j_1 + 1)])));
                                     sum0_0 = fma_f32x2_rn_noftz(doubled0_1, make_float2(weights_reg[32 + j_1], weights_reg[32 + j_1 + 1]), sum0_0);
                                     float2 doubled1_1 = add_f32x2_noftz(make_float2(_tmem_load_0[32 + (j_1 + 2)], _tmem_load_0[32 + (j_1 + 3)]), make_float2(fabsf(_tmem_load_0[32 + (j_1 + 2)]), fabsf(_tmem_load_0[32 + (j_1 + 3)])));
-                                    sum1_1 = fma_f32x2_rn_noftz(doubled1_1, make_float2(weights_reg[32 + j_1 + 2], weights_reg[32 + j_1 + 3]), sum1_1);
+                                    sum1_0 = fma_f32x2_rn_noftz(doubled1_1, make_float2(weights_reg[32 + j_1 + 2], weights_reg[32 + j_1 + 3]), sum1_0);
                                 }
-                                float2 total_2 = add_f32x2_noftz(sum0_0, sum1_1);
-                                float relu_wsum_3 = (total_2.x + total_2.y) * 0.5f;
-                                float score_4 = relu_wsum_3;
+                                float2 total_0 = add_f32x2_noftz(sum0_0, sum1_0);
+                                float relu_wsum_0 = (total_0.x + total_0.y) * 0.5f;
+                                float score_4 = relu_wsum_0;
                                 unsigned int bits_5 = 0;
                                 bits_5 = reinterpret_cast<unsigned int*>(&score_4)[0];
                                 bits2[1] = bits_5;
-                                unsigned int magnitude_6 = bits_5 & 2147483647;
-                                unsigned int m_7 = ((magnitude_6 != 0) ? bits_5 : zero_u);
-                                unsigned int key32_8 = (((m_7 & sign_mask) != 0) ? ~m_7 : m_7 | sign_mask);
-                                if (magnitude_6 > nan_floor) {
-                                    key32_8 = zero_u;
+                                unsigned int magnitude_0 = bits_5 & 2147483647;
+                                unsigned int m_0 = ((magnitude_0 != 0) ? bits_5 : zero_u);
+                                unsigned int key32_0 = (((m_0 & sign_mask) != 0) ? ~m_0 : m_0 | sign_mask);
+                                if (magnitude_0 > nan_floor) {
+                                    key32_0 = zero_u;
                                 }
-                                unsigned long long key64_9 = (unsigned long long)key32_8 << 32 | (unsigned long long)(unsigned int)kid;
-                                unsigned long long key_10 = key64_9;
+                                unsigned long long key64_0 = (unsigned long long)key32_0 << 32 | (unsigned long long)(unsigned int)kid;
+                                unsigned long long key_10 = key64_0;
                                 int in_prefix_11 = ((kid < visible[1]) ? 1 : 0);
                                 int above_12 = ((key_10 >= tau[1]) ? 1 : 0);
                                 int emit_13 = row_valid[1] & in_prefix_11 & above_12;
@@ -730,35 +730,35 @@ kernel_cake_dsa_indexer_topk_3c9bece1433e9cf03979(const __grid_constant__ CUtens
                                     int _atomic_fetch_add_3 = atomicAdd(s_count + (wg * 2 + lane_0), cnt_lane);
                                     reservation = _atomic_fetch_add_3;
                                 }
-                                int slot_base = __shfl_sync(0xFFFFFFFF, reservation, 0);
+                                int slot_base_1_0 = __shfl_sync(0xFFFFFFFF, reservation, 0);
                                 if (emit2[0] != 0) {
-                                    int slot = buf_base[0] + slot_base + (int)(unsigned int)__popc(ballot2[0] & lower_lanes);
-                                    unsigned int magnitude_0 = bits2[0] & 2147483647;
-                                    unsigned int m_1 = ((magnitude_0 != 0) ? bits2[0] : zero_u);
-                                    unsigned int key32_2 = (((m_1 & sign_mask) != 0) ? ~m_1 : m_1 | sign_mask);
-                                    if (magnitude_0 > nan_floor) {
-                                        key32_2 = zero_u;
+                                    int slot_1_0 = buf_base[0] + slot_base_1_0 + (int)(unsigned int)__popc(ballot2[0] & lower_lanes);
+                                    unsigned int magnitude_1 = bits2[0] & 2147483647;
+                                    unsigned int m_1 = ((magnitude_1 != 0) ? bits2[0] : zero_u);
+                                    unsigned int key32_1 = (((m_1 & sign_mask) != 0) ? ~m_1 : m_1 | sign_mask);
+                                    if (magnitude_1 > nan_floor) {
+                                        key32_1 = zero_u;
                                     }
-                                    unsigned long long key64_3 = (unsigned long long)key32_2 << 32 | (unsigned long long)(unsigned int)kid;
-                                    unsigned long long okey = key64_3;
+                                    unsigned long long key64_1 = (unsigned long long)key32_1 << 32 | (unsigned long long)(unsigned int)kid;
+                                    unsigned long long okey = key64_1;
                                     unsigned long long flag_o = ((bits2[0] == sign_mask) ? flag64 : zero_u64);
                                     okey = okey | flag_o;
-                                    Cand[slot] = (long long)okey;
+                                    Cand[slot_1_0] = (long long)okey;
                                 }
-                                int slot_base_14 = __shfl_sync(0xFFFFFFFF, reservation, 1);
+                                int slot_base_1_1 = __shfl_sync(0xFFFFFFFF, reservation, 1);
                                 if (emit2[1] != 0) {
-                                    int slot_1 = buf_base[1] + slot_base_14 + (int)(unsigned int)__popc(ballot2[1] & lower_lanes);
-                                    unsigned int magnitude_0_1 = bits2[1] & 2147483647;
-                                    unsigned int m_1_1 = ((magnitude_0_1 != 0) ? bits2[1] : zero_u);
-                                    unsigned int key32_2_1 = (((m_1_1 & sign_mask) != 0) ? ~m_1_1 : m_1_1 | sign_mask);
-                                    if (magnitude_0_1 > nan_floor) {
-                                        key32_2_1 = zero_u;
+                                    int slot_1_1 = buf_base[1] + slot_base_1_1 + (int)(unsigned int)__popc(ballot2[1] & lower_lanes);
+                                    unsigned int magnitude_2 = bits2[1] & 2147483647;
+                                    unsigned int m_2 = ((magnitude_2 != 0) ? bits2[1] : zero_u);
+                                    unsigned int key32_2 = (((m_2 & sign_mask) != 0) ? ~m_2 : m_2 | sign_mask);
+                                    if (magnitude_2 > nan_floor) {
+                                        key32_2 = zero_u;
                                     }
-                                    unsigned long long key64_3_1 = (unsigned long long)key32_2_1 << 32 | (unsigned long long)(unsigned int)kid;
-                                    unsigned long long okey_1 = key64_3_1;
+                                    unsigned long long key64_2 = (unsigned long long)key32_2 << 32 | (unsigned long long)(unsigned int)kid;
+                                    unsigned long long okey_1 = key64_2;
                                     unsigned long long flag_o_1 = ((bits2[1] == sign_mask) ? flag64 : zero_u64);
                                     okey_1 = okey_1 | flag_o_1;
-                                    Cand[slot_1] = (long long)okey_1;
+                                    Cand[slot_1_1] = (long long)okey_1;
                                 }
                                 math_tmem_stage += 1;
                                 if (math_tmem_stage == 2) { math_tmem_stage = 0; _phase_umma_full ^= 1; }
@@ -775,74 +775,74 @@ kernel_cake_dsa_indexer_topk_3c9bece1433e9cf03979(const __grid_constant__ CUtens
                                     int kw[2];
                                     int km[2];
                                     int sk[2];
-                                    int c_q = s_count[wg * 2];
-                                    int limit_q = ((tau[0] != 0) ? cand_cap : first_cap);
-                                    int need_q = ((limit_q < c_q + trigger_room) ? 1 : 0);
-                                    int kw_q = top_k;
-                                    int km_q = keep_cap;
-                                    int sk_q = 0;
-                                    if (need_q == 0) {
+                                    int c_q_1_0 = s_count[wg * 2];
+                                    int limit_q_2_0 = ((tau[0] != 0) ? cand_cap : first_cap);
+                                    int need_q_1_0 = ((limit_q_2_0 < c_q_1_0 + trigger_room) ? 1 : 0);
+                                    int kw_q_1_0 = top_k;
+                                    int km_q_1_0 = keep_cap;
+                                    int sk_q_1_0 = 0;
+                                    if (need_q_1_0 == 0) {
                                         if (sample_now != 0) {
                                             if (row_valid[0] != 0) {
-                                                int vis_abs = visible[0];
-                                                int vis_c = vis_abs;
-                                                int _max_4 = ((vis_c - (n_tiles_5 - 1) * 128) > (0) ? (vis_c - (n_tiles_5 - 1) * 128) : (0));
-                                                int n_diag = ((_max_4) < (128) ? (_max_4) : (128));
-                                                int c_far = c_q - n_diag;
-                                                int v_far = vis_c - n_diag;
-                                                if (v_far > 0) {
-                                                    int r_q = (top_k * c_far + v_far - 1) / v_far;
-                                                    int r_shift = r_q + r_q * sample_shift_permille / 1000 + 24;
-                                                    if (r_shift < c_far) {
-                                                        need_q = 1;
-                                                        kw_q = r_shift;
-                                                        int _min_5 = ((r_shift + 64) < (keep_cap) ? (r_shift + 64) : (keep_cap));
-                                                        km_q = _min_5;
-                                                        sk_q = n_diag;
+                                                int vis_abs_1_0 = visible[0];
+                                                int vis_c_1_0 = vis_abs_1_0;
+                                                int _max_4 = ((vis_c_1_0 - (n_tiles_5 - 1) * 128) > (0) ? (vis_c_1_0 - (n_tiles_5 - 1) * 128) : (0));
+                                                int n_diag_1_0 = ((_max_4) < (128) ? (_max_4) : (128));
+                                                int c_far_1_0 = c_q_1_0 - n_diag_1_0;
+                                                int v_far_1_0 = vis_c_1_0 - n_diag_1_0;
+                                                if (v_far_1_0 > 0) {
+                                                    int r_q_1_0 = (top_k * c_far_1_0 + v_far_1_0 - 1) / v_far_1_0;
+                                                    int r_shift_1_0 = r_q_1_0 + r_q_1_0 * sample_shift_permille / 1000 + 24;
+                                                    if (r_shift_1_0 < c_far_1_0) {
+                                                        need_q_1_0 = 1;
+                                                        kw_q_1_0 = r_shift_1_0;
+                                                        int _min_5 = ((r_shift_1_0 + 64) < (keep_cap) ? (r_shift_1_0 + 64) : (keep_cap));
+                                                        km_q_1_0 = _min_5;
+                                                        sk_q_1_0 = n_diag_1_0;
                                                     }
                                                 }
                                             }
                                         }
                                     }
-                                    need[0] = need_q;
-                                    kw[0] = kw_q;
-                                    km[0] = km_q;
-                                    sk[0] = sk_q;
-                                    need_any = need_any | need_q;
-                                    int c_q_0 = s_count[wg * 2 + 1];
-                                    int limit_q_1 = ((tau[1] != 0) ? cand_cap : first_cap);
-                                    int need_q_2 = ((limit_q_1 < c_q_0 + trigger_room) ? 1 : 0);
-                                    int kw_q_3 = top_k;
-                                    int km_q_4 = keep_cap;
-                                    int sk_q_5 = 0;
-                                    if (need_q_2 == 0) {
+                                    need[0] = need_q_1_0;
+                                    kw[0] = kw_q_1_0;
+                                    km[0] = km_q_1_0;
+                                    sk[0] = sk_q_1_0;
+                                    need_any = need_any | need_q_1_0;
+                                    int c_q_1_1 = s_count[wg * 2 + 1];
+                                    int limit_q_2_1 = ((tau[1] != 0) ? cand_cap : first_cap);
+                                    int need_q_1_1 = ((limit_q_2_1 < c_q_1_1 + trigger_room) ? 1 : 0);
+                                    int kw_q_1_1 = top_k;
+                                    int km_q_1_1 = keep_cap;
+                                    int sk_q_1_1 = 0;
+                                    if (need_q_1_1 == 0) {
                                         if (sample_now != 0) {
                                             if (row_valid[1] != 0) {
-                                                int vis_abs_1 = visible[1];
-                                                int vis_c_1 = vis_abs_1;
-                                                int _max_6 = ((vis_c_1 - (n_tiles_5 - 1) * 128) > (0) ? (vis_c_1 - (n_tiles_5 - 1) * 128) : (0));
-                                                int n_diag_1 = ((_max_6) < (128) ? (_max_6) : (128));
-                                                int c_far_1 = c_q_0 - n_diag_1;
-                                                int v_far_1 = vis_c_1 - n_diag_1;
-                                                if (v_far_1 > 0) {
-                                                    int r_q_1 = (top_k * c_far_1 + v_far_1 - 1) / v_far_1;
-                                                    int r_shift_1 = r_q_1 + r_q_1 * sample_shift_permille / 1000 + 24;
-                                                    if (r_shift_1 < c_far_1) {
-                                                        need_q_2 = 1;
-                                                        kw_q_3 = r_shift_1;
-                                                        int _min_7 = ((r_shift_1 + 64) < (keep_cap) ? (r_shift_1 + 64) : (keep_cap));
-                                                        km_q_4 = _min_7;
-                                                        sk_q_5 = n_diag_1;
+                                                int vis_abs_1_1 = visible[1];
+                                                int vis_c_1_1 = vis_abs_1_1;
+                                                int _max_6 = ((vis_c_1_1 - (n_tiles_5 - 1) * 128) > (0) ? (vis_c_1_1 - (n_tiles_5 - 1) * 128) : (0));
+                                                int n_diag_1_1 = ((_max_6) < (128) ? (_max_6) : (128));
+                                                int c_far_1_1 = c_q_1_1 - n_diag_1_1;
+                                                int v_far_1_1 = vis_c_1_1 - n_diag_1_1;
+                                                if (v_far_1_1 > 0) {
+                                                    int r_q_1_1 = (top_k * c_far_1_1 + v_far_1_1 - 1) / v_far_1_1;
+                                                    int r_shift_1_1 = r_q_1_1 + r_q_1_1 * sample_shift_permille / 1000 + 24;
+                                                    if (r_shift_1_1 < c_far_1_1) {
+                                                        need_q_1_1 = 1;
+                                                        kw_q_1_1 = r_shift_1_1;
+                                                        int _min_7 = ((r_shift_1_1 + 64) < (keep_cap) ? (r_shift_1_1 + 64) : (keep_cap));
+                                                        km_q_1_1 = _min_7;
+                                                        sk_q_1_1 = n_diag_1_1;
                                                     }
                                                 }
                                             }
                                         }
                                     }
-                                    need[1] = need_q_2;
-                                    kw[1] = kw_q_3;
-                                    km[1] = km_q_4;
-                                    sk[1] = sk_q_5;
-                                    need_any = need_any | need_q_2;
+                                    need[1] = need_q_1_1;
+                                    kw[1] = kw_q_1_1;
+                                    km[1] = km_q_1_1;
+                                    sk[1] = sk_q_1_1;
+                                    need_any = need_any | need_q_1_1;
                                     asm volatile("barrier.sync %0, 128;" :: "r"(1 + wg) : "memory");
                                     if (need_any != 0) {
                                         int need_pair = need[1];
@@ -934,25 +934,25 @@ kernel_cake_dsa_indexer_topk_3c9bece1433e9cf03979(const __grid_constant__ CUtens
                                                 lane_bins[7] = s_hist[hist_base + lane_0 * 8 + 7];
                                                 lane_sum += lane_bins[7];
                                                 int suffix = lane_sum;
-                                                int above_part = __shfl_down_sync(0xFFFFFFFF, suffix, 1, 32);
+                                                int above_part_4_0 = __shfl_down_sync(0xFFFFFFFF, suffix, 1, 32);
                                                 if (lane_0 + 1 < 32) {
-                                                    suffix += above_part;
+                                                    suffix += above_part_4_0;
                                                 }
-                                                int above_part_0 = __shfl_down_sync(0xFFFFFFFF, suffix, 2, 32);
+                                                int above_part_4_1 = __shfl_down_sync(0xFFFFFFFF, suffix, 2, 32);
                                                 if (lane_0 + 2 < 32) {
-                                                    suffix += above_part_0;
+                                                    suffix += above_part_4_1;
                                                 }
-                                                int above_part_1 = __shfl_down_sync(0xFFFFFFFF, suffix, 4, 32);
+                                                int above_part_4_2 = __shfl_down_sync(0xFFFFFFFF, suffix, 4, 32);
                                                 if (lane_0 + 4 < 32) {
-                                                    suffix += above_part_1;
+                                                    suffix += above_part_4_2;
                                                 }
-                                                int above_part_2 = __shfl_down_sync(0xFFFFFFFF, suffix, 8, 32);
+                                                int above_part_4_3 = __shfl_down_sync(0xFFFFFFFF, suffix, 8, 32);
                                                 if (lane_0 + 8 < 32) {
-                                                    suffix += above_part_2;
+                                                    suffix += above_part_4_3;
                                                 }
-                                                int above_part_3 = __shfl_down_sync(0xFFFFFFFF, suffix, 16, 32);
+                                                int above_part_4_4 = __shfl_down_sync(0xFFFFFFFF, suffix, 16, 32);
                                                 if (lane_0 + 16 < 32) {
-                                                    suffix += above_part_3;
+                                                    suffix += above_part_4_4;
                                                 }
                                                 int excl = suffix - lane_sum;
                                                 int is_target = ((excl < k_rem && k_rem <= excl + lane_sum) ? 1 : 0);
@@ -1211,25 +1211,25 @@ kernel_cake_dsa_indexer_topk_3c9bece1433e9cf03979(const __grid_constant__ CUtens
                                         lane_bins_1[7] = s_hist[hist_base + lane_0 * 8 + 7];
                                         lane_sum_1 += lane_bins_1[7];
                                         int suffix_1 = lane_sum_1;
-                                        int above_part_4 = __shfl_down_sync(0xFFFFFFFF, suffix_1, 1, 32);
+                                        int above_part_4_5 = __shfl_down_sync(0xFFFFFFFF, suffix_1, 1, 32);
                                         if (lane_0 + 1 < 32) {
-                                            suffix_1 += above_part_4;
+                                            suffix_1 += above_part_4_5;
                                         }
-                                        int above_part_0_1 = __shfl_down_sync(0xFFFFFFFF, suffix_1, 2, 32);
+                                        int above_part_4_6 = __shfl_down_sync(0xFFFFFFFF, suffix_1, 2, 32);
                                         if (lane_0 + 2 < 32) {
-                                            suffix_1 += above_part_0_1;
+                                            suffix_1 += above_part_4_6;
                                         }
-                                        int above_part_1_1 = __shfl_down_sync(0xFFFFFFFF, suffix_1, 4, 32);
+                                        int above_part_4_7 = __shfl_down_sync(0xFFFFFFFF, suffix_1, 4, 32);
                                         if (lane_0 + 4 < 32) {
-                                            suffix_1 += above_part_1_1;
+                                            suffix_1 += above_part_4_7;
                                         }
-                                        int above_part_2_1 = __shfl_down_sync(0xFFFFFFFF, suffix_1, 8, 32);
+                                        int above_part_4_8 = __shfl_down_sync(0xFFFFFFFF, suffix_1, 8, 32);
                                         if (lane_0 + 8 < 32) {
-                                            suffix_1 += above_part_2_1;
+                                            suffix_1 += above_part_4_8;
                                         }
-                                        int above_part_3_1 = __shfl_down_sync(0xFFFFFFFF, suffix_1, 16, 32);
+                                        int above_part_4_9 = __shfl_down_sync(0xFFFFFFFF, suffix_1, 16, 32);
                                         if (lane_0 + 16 < 32) {
-                                            suffix_1 += above_part_3_1;
+                                            suffix_1 += above_part_4_9;
                                         }
                                         int excl_1 = suffix_1 - lane_sum_1;
                                         int is_target_1 = ((excl_1 < k_rem_1 && k_rem_1 <= excl_1 + lane_sum_1) ? 1 : 0);
@@ -1375,8 +1375,8 @@ kernel_cake_dsa_indexer_topk_3c9bece1433e9cf03979(const __grid_constant__ CUtens
                                                         bits_e = sign_mask;
                                                     }
                                                     score_k = reinterpret_cast<float*>(&bits_e)[0];
-                                                    int kid_o = (int)(unsigned int)(cur_k[u_10] & 2147483647);
-                                                    Indices[slot_k] = kid_o;
+                                                    int kid_1 = (int)(unsigned int)(cur_k[u_10] & 2147483647);
+                                                    Indices[slot_k] = kid_1;
                                                     Scores[slot_k] = score_k;
                                                 }
                                                 pos_k += (int)(unsigned int)__popc(_vote_1);
@@ -1430,8 +1430,8 @@ kernel_cake_dsa_indexer_topk_3c9bece1433e9cf03979(const __grid_constant__ CUtens
                                                         bits_e_1 = sign_mask;
                                                     }
                                                     score_k_1 = reinterpret_cast<float*>(&bits_e_1)[0];
-                                                    int kid_o_1 = (int)(unsigned int)(cur_k_1[u_14] & 2147483647);
-                                                    Indices[slot_k_1] = kid_o_1;
+                                                    int kid_2 = (int)(unsigned int)(cur_k_1[u_14] & 2147483647);
+                                                    Indices[slot_k_1] = kid_2;
                                                     Scores[slot_k_1] = score_k_1;
                                                 }
                                                 pos_k_1 += (int)(unsigned int)__popc(_vote_2);
