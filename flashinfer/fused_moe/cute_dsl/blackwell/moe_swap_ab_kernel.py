@@ -92,6 +92,29 @@ _iket = None
 
 
 @dsl_user_op
+def _copy_gather_sf(destination, source, issue, load, loc=None, ip=None):
+    """Copy one SF word, zeroing MMA padding and skipping unused rows."""
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int32(destination.toint(loc=loc, ip=ip)).ir_value(loc=loc, ip=ip),
+            cutlass.Int64(source.toint(loc=loc, ip=ip)).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(issue).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(load).ir_value(loc=loc, ip=ip),
+        ],
+        "{ .reg .pred issue, ignore_source; "
+        "setp.ne.b32 issue, $2, 0; setp.eq.b32 ignore_source, $3, 0; "
+        "@issue cp.async.ca.shared.global [$0], [$1], 4, ignore_source; }",
+        "r,l,r,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def _gather_mbarrier_arrive(mbarrier, cta_group_size, loc=None, ip=None):
     """Publish this CTA's completed shared-memory inputs to the MMA leader."""
     if cta_group_size == 1:
@@ -3455,9 +3478,6 @@ class Sm100BlockScaledGroupedGemmKernel:
                 cute.arch.setmaxregister_decrease(128)
                 gather_warp = warp - 8
                 gather_thread = tidx - 256
-                copy_sf = cute.make_copy_atom(
-                    cpasync.CopyG2SOp(), self.sf_dtype, num_bits_per_copy=32
-                )
                 producer = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.num_stages
                 )
@@ -3523,6 +3543,8 @@ class Sm100BlockScaledGroupedGemmKernel:
                             weights.shape[1] // self.sf_vec_size
                         )
                     shared_sf_offset = (sf_row & 31) * 16 + (sf_row >> 5) * 4
+                    mma_n_alignment = 8 * self.cta_group_size
+                    mma_n = (valid + mma_n_alignment - 1) & -mma_n_alignment
                     for k_tile in cutlass.range(k_tiles):
                         if cutlass.const_expr(self.enable_iket):
                             _iket.range_push("producer_gather_empty")
@@ -3551,32 +3573,22 @@ class Sm100BlockScaledGroupedGemmKernel:
                                 channel = (
                                     k_tile * self.tile_k + sf_block * self.sf_block_k
                                 )
-                                source = cute.make_tensor(
-                                    gather_activations_sf.iterator
-                                    + cute.assume(
-                                        sf_offsets[row_block]
-                                        + channel // self.sf_vec_size,
-                                        divby=4,
-                                    ),
-                                    cute.make_layout((4,)),
+                                source = gather_activations_sf.iterator + cute.assume(
+                                    sf_offsets[row_block] + channel // self.sf_vec_size,
+                                    divby=4,
                                 )
-                                destination = cute.make_tensor(
-                                    sSFB.iterator
-                                    + cute.assume(
-                                        producer.index * self.sfb_stage_bytes
-                                        + row_block * self.sf_stage_bytes
-                                        + sf_block * 512
-                                        + shared_sf_offset,
-                                        divby=4,
-                                    ),
-                                    cute.make_layout((4,)),
+                                destination = sSFB.iterator + cute.assume(
+                                    producer.index * self.sfb_stage_bytes
+                                    + row_block * self.sf_stage_bytes
+                                    + sf_block * 512
+                                    + shared_sf_offset,
+                                    divby=4,
                                 )
-                                predicate = cute.make_rmem_tensor((1,), cutlass.Boolean)
-                                predicate[0] = (row < valid) & (
-                                    channel < weights.shape[1]
-                                )
-                                cute.copy_atom_call(
-                                    copy_sf, source, destination, pred=predicate
+                                _copy_gather_sf(
+                                    destination,
+                                    source,
+                                    row < mma_n,
+                                    (row < valid) & (channel < weights.shape[1]),
                                 )
                         cute.arch.cp_async_mbarrier_arrive_noinc(
                             storage.gather_local_barriers.data_ptr() + producer.index
