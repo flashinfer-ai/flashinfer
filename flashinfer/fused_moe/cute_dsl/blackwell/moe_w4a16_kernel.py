@@ -34,7 +34,7 @@ then executes BF16 tensor-core MMA with FP32 accumulation.
 """
 
 from math import ceil, log2
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -71,6 +71,8 @@ from .utils import (
     release_gpu,
 )
 
+
+_iket: Any = None
 
 _NVFP4_SCALE_GRANULARITY_M = 1
 _NVFP4_SCALE_GRANULARITY_K = 16
@@ -281,8 +283,17 @@ class Sm100W4A16GroupedGemmKernel:
         gated_weight_group_size: int = 64,
         gather_input: bool = False,
         gather_top_k: int = 1,
+        enable_iket: bool = False,
     ):
         """Initialize the W4A16 grouped GEMM configuration."""
+        self.enable_iket = enable_iket
+        if enable_iket:
+            # Compile with options="iket" to collect these optional ranges.
+            global _iket
+            try:
+                from cutlass.cute.experimental import iket as _iket
+            except (ImportError, NotImplementedError):
+                from cutlass.cute import iket as _iket
         self.group_count = group_count
         self.gather_input = gather_input
         self.gather_top_k = gather_top_k
@@ -672,12 +683,14 @@ class Sm100W4A16GroupedGemmKernel:
         self, name: cutlass.Constexpr, k_tile: cutlass.Int32
     ) -> None:
         """Let callers optionally trace a transform stage."""
-        pass
+        if cutlass.const_expr(self.enable_iket):
+            _iket.range_push(name, k_tile)
 
     @cute.jit
     def _trace_transform_pop(self) -> None:
         """Close an optional caller-owned transform range."""
-        pass
+        if cutlass.const_expr(self.enable_iket):
+            _iket.range_pop()
 
     @cute.jit
     def _finish_transform_stage(
@@ -1484,7 +1497,11 @@ class Sm100W4A16GroupedGemmKernel:
 
         if cutlass.const_expr(self.gather_input and self.enable_pdl):
             # Without prepare, sort has not yet published routing to FC1.
+            if cutlass.const_expr(self.enable_iket):
+                _iket.range_push("pdl_dependency_wait")
             griddepcontrol_wait()
+            if cutlass.const_expr(self.enable_iket):
+                _iket.range_pop()
 
         if warp_idx >= self.mma_warp_id and warp_idx < self.transform_warp_id[0]:
             cute.arch.setmaxregister_decrease(self.num_regs_generic_warps)
@@ -1510,6 +1527,8 @@ class Sm100W4A16GroupedGemmKernel:
                     )
                     not_last_tile = cutlass.Boolean(1)
                     while not_last_tile:
+                        if cutlass.const_expr(self.enable_iket):
+                            _iket.range_push("scheduler_item")
                         tile_coord_mnl = work_tile.tile_idx
                         route_tile_idx = tile_coord_mnl[1]
                         is_routed_tile = work_tile.is_valid_tile and (
@@ -1554,12 +1573,18 @@ class Sm100W4A16GroupedGemmKernel:
                             tile_info_producer_state.advance()
 
                         if work_tile.is_valid_tile:
+                            if cutlass.const_expr(self.enable_iket):
+                                _iket.range_push("scheduler_clc_ready")
                             clc_pipeline.consumer_wait(clc_consumer_state)
+                            if cutlass.const_expr(self.enable_iket):
+                                _iket.range_pop()
                             work_tile = tile_sched.get_current_work()
                             clc_pipeline.consumer_release(clc_consumer_state)
                             clc_consumer_state.advance()
                         else:
                             not_last_tile = cutlass.Boolean(0)
+                        if cutlass.const_expr(self.enable_iket):
+                            _iket.range_pop()
 
                     tile_info_pipeline.producer_tail(tile_info_producer_state)
                     if is_first_cta_in_cluster:
@@ -1575,6 +1600,8 @@ class Sm100W4A16GroupedGemmKernel:
                     not_last_tile = cutlass.Boolean(1)
                     if cutlass.const_expr(self.raster_along_m):
                         while not_last_tile:
+                            if cutlass.const_expr(self.enable_iket):
+                                _iket.range_push("scheduler_item")
                             tile_info_pipeline.producer_acquire(
                                 tile_info_producer_state
                             )
@@ -1618,8 +1645,12 @@ class Sm100W4A16GroupedGemmKernel:
                             tile_info_producer_state.advance()
                             tile_sched.advance_to_next_work()
                             work_tile = tile_sched.get_current_work()
+                            if cutlass.const_expr(self.enable_iket):
+                                _iket.range_pop()
                     else:
                         while not_last_tile:
+                            if cutlass.const_expr(self.enable_iket):
+                                _iket.range_push("scheduler_item")
                             cluster_tile_coord_mnl = work_tile.tile_idx
                             cta_tile_coord_m = (
                                 cluster_tile_coord_mnl[0] * self.cluster_shape_mn[0]
@@ -1677,6 +1708,8 @@ class Sm100W4A16GroupedGemmKernel:
                                 work_tile = tile_sched.get_current_work()
                             else:
                                 not_last_tile = cutlass.Boolean(0)
+                            if cutlass.const_expr(self.enable_iket):
+                                _iket.range_pop()
 
                     tile_info_pipeline.producer_tail(tile_info_producer_state)
 
@@ -1696,14 +1729,22 @@ class Sm100W4A16GroupedGemmKernel:
                         pipeline.PipelineUserType.Producer, self.num_load2trans_stage
                     )
                     if cutlass.const_expr(self.enable_pdl):
+                        if cutlass.const_expr(self.enable_iket):
+                            _iket.range_push("pdl_dependency_wait")
                         griddepcontrol_wait()
+                        if cutlass.const_expr(self.enable_iket):
+                            _iket.range_pop()
                         # Let the standalone finalizer prepare routing metadata while
                         # FC2 runs; its own dependency wait protects every output load.
                         if cutlass.const_expr(
                             not self.fuse_activation and not self.use_fused_finalize
                         ):
                             with cute.arch.elect_one():
+                                if cutlass.const_expr(self.enable_iket):
+                                    _iket.range_push("pdl_signal")
                                 griddepcontrol_launch_dependents()
+                                if cutlass.const_expr(self.enable_iket):
+                                    _iket.range_pop()
 
                     while work_tile.is_valid_tile:
                         activation_coord_n = work_tile.coord_n
@@ -1740,9 +1781,14 @@ class Sm100W4A16GroupedGemmKernel:
 
                         b_load2mma_producer_state.reset_count()
                         for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                            if cutlass.const_expr(self.enable_iket):
+                                _iket.range_push("activation_tma_empty")
                             b_load2mma_pipeline.producer_acquire(
                                 b_load2mma_producer_state
                             )
+                            if cutlass.const_expr(self.enable_iket):
+                                _iket.range_pop()
+                                _iket.range_push("activation_tma_issue")
                             cute.copy(
                                 tma_atom_b,
                                 tBgB_slice[(None, b_load2mma_producer_state.count)],
@@ -1756,6 +1802,8 @@ class Sm100W4A16GroupedGemmKernel:
                             b_load2mma_pipeline.producer_commit(
                                 b_load2mma_producer_state
                             )
+                            if cutlass.const_expr(self.enable_iket):
+                                _iket.range_pop()
                             b_load2mma_producer_state.advance()
 
                         tile_info_pipeline.consumer_wait(tile_info_consumer_state)
@@ -1795,7 +1843,11 @@ class Sm100W4A16GroupedGemmKernel:
                                 publishes_ancestors = is_leader_cta
                             if publishes_ancestors:
                                 release_gpu()
+                        if cutlass.const_expr(self.enable_iket):
+                            _iket.range_push("pdl_signal")
                         griddepcontrol_launch_dependents()
+                        if cutlass.const_expr(self.enable_iket):
+                            _iket.range_pop()
                 while work_tile.is_valid_tile:
                     tAgA_slice = tAgA[
                         (
@@ -1832,10 +1884,15 @@ class Sm100W4A16GroupedGemmKernel:
                             )
                         )
                     for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                        if cutlass.const_expr(self.enable_iket):
+                            _iket.range_push("weight_tma_empty")
                         a_load2trans_pipeline.producer_acquire(
                             a_load2trans_producer_state,
                             peek_load2trans_empty_status,
                         )
+                        if cutlass.const_expr(self.enable_iket):
+                            _iket.range_pop()
+                            _iket.range_push("weight_tma_issue")
                         cute.copy(
                             tma_atom_a,
                             tAgA_slice[(None, a_load2trans_producer_state.count)],
@@ -1860,6 +1917,8 @@ class Sm100W4A16GroupedGemmKernel:
                         a_load2trans_pipeline.producer_commit(
                             a_load2trans_producer_state
                         )
+                        if cutlass.const_expr(self.enable_iket):
+                            _iket.range_pop()
                         a_load2trans_producer_state.advance()
                         if a_load2trans_producer_state.count < k_tile_cnt:
                             peek_load2trans_empty_status = (
@@ -1930,7 +1989,11 @@ class Sm100W4A16GroupedGemmKernel:
                                     trans2mma_consumer_state
                                 )
                             )
+                        if cutlass.const_expr(self.enable_iket):
+                            _iket.range_push("mma_acc_empty")
                         acc_pipeline.producer_acquire(acc_producer_state)
+                        if cutlass.const_expr(self.enable_iket):
+                            _iket.range_pop()
 
                         # A privately supplied empty tile still participates in
                         # every pipeline; issue the minimum legal MMA extent.
@@ -1951,12 +2014,20 @@ class Sm100W4A16GroupedGemmKernel:
                             for _k_tile in cutlass.range(
                                 first_stage, last_stage, 1, unroll=1
                             ):
+                                if cutlass.const_expr(self.enable_iket):
+                                    _iket.range_push("mma_a_ready")
                                 trans2mma_pipeline.consumer_wait(
                                     trans2mma_consumer_state, peek_trans2mma_full_status
                                 )
+                                if cutlass.const_expr(self.enable_iket):
+                                    _iket.range_pop()
+                                    _iket.range_push("mma_b_ready")
                                 b_load2mma_pipeline.consumer_wait(
                                     b_load2mma_consumer_state
                                 )
+                                if cutlass.const_expr(self.enable_iket):
+                                    _iket.range_pop()
+                                    _iket.range_push("mma_issue")
                                 self._issue_mma_tile(
                                     tiled_mma,
                                     tCtAcc,
@@ -1980,12 +2051,17 @@ class Sm100W4A16GroupedGemmKernel:
                                     valid_tokens,
                                     stage_k,
                                 )
+                                if cutlass.const_expr(self.enable_iket):
+                                    _iket.range_pop()
+                                    _iket.range_push("mma_release")
                                 trans2mma_pipeline.consumer_release(
                                     trans2mma_consumer_state
                                 )
                                 b_load2mma_pipeline.consumer_release(
                                     b_load2mma_consumer_state
                                 )
+                                if cutlass.const_expr(self.enable_iket):
+                                    _iket.range_pop()
                                 trans2mma_consumer_state.advance()
                                 b_load2mma_consumer_state.advance()
                                 peek_trans2mma_full_status = cutlass.Boolean(1)
@@ -2281,7 +2357,12 @@ class Sm100W4A16GroupedGemmKernel:
                     (None, None, None, None, None, acc_consumer_state.index)
                 ]
                 # Wait for accumulator buffer full
+                if cutlass.const_expr(self.enable_iket):
+                    _iket.range_push("epi_acc_wait")
                 acc_pipeline.consumer_wait(acc_consumer_state)
+                if cutlass.const_expr(self.enable_iket):
+                    _iket.range_pop()
+                    _iket.range_push("epi_body")
                 if cutlass.const_expr(not self.gated):
                     bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
 
@@ -2680,6 +2761,8 @@ class Sm100W4A16GroupedGemmKernel:
                             cute.flatten(tTR_gC[(None, None, None, subtile_idx)]),
                             pred=cute.flatten(tCpC),
                         )
+                if cutlass.const_expr(self.enable_iket):
+                    _iket.range_pop()
                 # Advance to next tile
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
                 work_tile = mixed_input_utils.make_contiguous_group_work_tile_info(
@@ -2755,9 +2838,14 @@ class Sm100W4A16GroupedGemmKernel:
                             )
                     producer.reset_count()
                     for k_tile in cutlass.range(k_tile_cnt, unroll=1):
+                        if cutlass.const_expr(self.enable_iket):
+                            _iket.range_push("gather_empty")
                         b_load2mma_pipeline.producer_acquire(
                             producer, expected_tx=tx_bytes
                         )
+                        if cutlass.const_expr(self.enable_iket):
+                            _iket.range_pop()
+                            _iket.range_push("gather_issue")
                         for i in cutlass.range_constexpr(groups_per_warp):
                             row = (row_lane + i * row_issuers) * 4
                             for j in cutlass.range_constexpr(
@@ -2800,6 +2888,8 @@ class Sm100W4A16GroupedGemmKernel:
                                                 else None
                                             ),
                                         )
+                        if cutlass.const_expr(self.enable_iket):
+                            _iket.range_pop()
                         producer.advance()
                     tile_info_pipeline.consumer_wait(info_state)
                     work_tile = mixed_input_utils.make_contiguous_group_work_tile_info(
@@ -2814,7 +2904,11 @@ class Sm100W4A16GroupedGemmKernel:
         ):
             if warp_idx == self.mma_warp_id:
                 with cute.arch.elect_one():
+                    if cutlass.const_expr(self.enable_iket):
+                        _iket.range_push("pdl_signal")
                     griddepcontrol_launch_dependents()
+                    if cutlass.const_expr(self.enable_iket):
+                        _iket.range_pop()
 
     @staticmethod
     def _compute_stages_and_tmem_cols(
