@@ -149,11 +149,13 @@ jobs:
           # check_suite_id, which keeps a same-named job from another
           # workflow from counting.
           #
-          # Remaining window: for ~10-20s after a run-ci label is applied,
-          # the gate is still running and Setup does not exist yet, so that
-          # run looks like a no-op. If we re-apply the label then, pr-test's
-          # cancel-in-progress group cancels the first run and starts one new
-          # run — a restart, never a duplicate or a missed run.
+          # Gate delay: for ~10-20s after a run-ci label is applied, that
+          # run's gate is still running and Setup does not exist yet, so the
+          # run would look like a no-op. Waiting 30s before querying lets any
+          # run labeled just before this one (e.g. a manual
+          # `@flashinfer-bot run`) create its Setup check run first. A label
+          # applied after the query can still restart a run through pr-test's
+          # cancel-in-progress group, but never duplicates or misses one.
           #
           # API failures fail this step instead of guessing; every later step
           # requires needs_ci == 'true', so nothing is triggered.
@@ -162,6 +164,9 @@ jobs:
           # "no runs", re-triggering CI on an API outage.
           set -o pipefail
           REPO="${{ github.repository }}"
+
+          echo "Waiting 30s for any just-labeled pr-test run to pass its gate"
+          sleep 30
 
           RUNS=$(gh api --paginate -X GET \
             "/repos/${REPO}/actions/workflows/pr-test.yml/runs" \
