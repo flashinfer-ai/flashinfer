@@ -428,6 +428,7 @@ def test_prefill_jit_helper_skips_fa3_unsupported_large_head(monkeypatch):
     assert ("batch", "fa2", 512, 512) in calls
 
 
+@pytest.mark.cpu_only
 def test_get_cuda_path_canonicalizes_symlinked_toolkit(monkeypatch, tmp_path):
     real = tmp_path / "cuda-13.2"
     (real / "bin").mkdir(parents=True)
@@ -442,6 +443,7 @@ def test_get_cuda_path_canonicalizes_symlinked_toolkit(monkeypatch, tmp_path):
         cpp_ext.get_cuda_path.cache_clear()
 
 
+@pytest.mark.cpu_only
 def test_trusted_stamp_skips_ninja_for_restored_cache(monkeypatch, tmp_path):
     monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
     monkeypatch.setattr(core.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
@@ -477,6 +479,7 @@ def test_trusted_stamp_skips_ninja_for_restored_cache(monkeypatch, tmp_path):
     assert runs == [1, 1, 1]
 
 
+@pytest.mark.cpu_only
 def test_trusted_stamp_rehashes_source_contents(monkeypatch, tmp_path):
     """Editing a source in place must invalidate the stamp even though the
     generated build.ninja is byte-identical."""
@@ -505,6 +508,7 @@ def test_trusted_stamp_rehashes_source_contents(monkeypatch, tmp_path):
     assert runs == [1, 1]  # content change re-runs ninja
 
 
+@pytest.mark.cpu_only
 def test_trusted_stamp_rehashes_embedded_cubins(monkeypatch, tmp_path):
     """A cubin regenerated in place under the same path must invalidate the
     stamp even though the generated build.ninja is byte-identical."""
