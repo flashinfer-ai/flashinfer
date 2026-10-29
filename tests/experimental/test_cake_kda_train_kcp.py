@@ -17,8 +17,8 @@ CPU tests of the KCP metadata layer (``cake_kcp_plan``): partitions against the 
 splits and chain tables, head ownership, the plan rule, the byte queries, the private test knobs; the GPU parity test
 of the CPU-built chunk tables against the ``table`` program (``-k gpu``); and the FP64
 fake backend against the unpartitioned FP64 reference (``-k fake``).  Rows, reference partitions and operands come
-from the reference harness (``kcp_shapes``, ``kcp_inputs``) and the reference module ``reference_kcp`` when they are on
-``PYTHONPATH``; the harness-backed tests are skipped otherwise.
+from the reference harness ``tests/test_helpers/cake_kcp_shapes.py`` / ``cake_kcp_inputs.py``, the FP64 reference
+from ``tests/test_helpers/cake_kcp_reference.py``.
 """
 
 import ctypes
@@ -33,6 +33,7 @@ import weakref
 import pytest
 import torch
 
+from tests.test_helpers import cake_kcp_shapes as kcp_shapes
 from tests.test_helpers.cake_kda_train_kcp_saved import written_carry, written_tensors
 from tests.test_helpers.cake_package import cake_package
 
@@ -41,14 +42,6 @@ cake_backend = cake_package("cake_kda_train", "cake_backend")
 cake_jit = cake_package("cake_kda_train", "cake_jit")
 cake_kcp_jit = cake_package("cake_kda_train", "cake_kcp_jit")
 
-try:  # the reference harness (rows of record and the reference partitions)
-    import kcp_shapes
-except ImportError:  # pragma: no cover - the harness is an optional environment module
-    kcp_shapes = None
-
-HARNESS = pytest.mark.skipif(
-    kcp_shapes is None, reason="reference harness kcp_shapes not on PYTHONPATH"
-)
 SM_COUNT = 152  # GB300; the plan rule's examples of the design note §7.2
 EVIDENCE_DIR = os.environ.get("KCP_EVIDENCE_DIR")
 LAYOUT_NAMES = {"C": "contiguous", "Z": "zigzag", "D": "zigzag_per_document"}
@@ -71,8 +64,6 @@ def _evidence(name: str, record: dict) -> None:
 def _cases():
     """(row, W, layout letter) of every C row (all its CP and layouts, the explicit ragged tables as 'R'), every
     adversarial row of record and every perf pack at CP {2, 4, 8, 16} x {C, Z, D}."""
-    if kcp_shapes is None:
-        return []
     cases = []
     for row in kcp_shapes.CORRECT.values():
         for W in row.cp:
@@ -121,7 +112,6 @@ def contexts(part, sm_count: int = SM_COUNT):
     ]
 
 
-@HARNESS
 @pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
 def test_partition_matches_the_harness(case) -> None:
     """Gate 1: kcp_partition == kcp_shapes.partition / links / local_cu_seqlens on every row, CP and layout."""
@@ -155,7 +145,6 @@ def test_partition_matches_the_harness(case) -> None:
     )
 
 
-@HARNESS
 @pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
 def test_splits_chains_and_bytes(case) -> None:
     """Gate 2: split sizes sum to the §7.4 buffer sizes on every rank and agree pairwise; the chain tables cover every
@@ -994,7 +983,6 @@ def test_kcp_plan_wave_rule_is_pure_in_sm_count() -> None:
         )
 
 
-@HARNESS
 @pytest.mark.parametrize("W", (4, 8, 16))
 def test_kcp_plan_wave_rule_on_q1_c(monkeypatch, W) -> None:
     """The Q1 C fragment sets at CP4 / CP8 / CP16 (hand-derived from Q1's lengths) and the P of the rules per rank
@@ -1124,7 +1112,6 @@ def test_kcp_plan_wave_rule_on_q1_c(monkeypatch, W) -> None:
     )
 
 
-@HARNESS
 @pytest.mark.parametrize(
     "case", LANE_LC_ROWS, ids=[f"{n}-cp{W}-{lay}-H{H}" for n, W, lay, H in LANE_LC_ROWS]
 )
@@ -1368,8 +1355,6 @@ def _kb_rows():
     """Enumeration set: every C row at its CP / layouts for H in {1, 4, 64} (the H2 gate-2 / gate-4
     rows and their H coverage), the CP16 semantics row C6, every adversarial row at its CP in layouts C / Z (A3v2: D / Z),
     and every perf pack at CP {2, 4, 8, 16} x {C, Z, D} at H = 64."""
-    if kcp_shapes is None:
-        return []
     rows = []
     for row in kcp_shapes.CORRECT.values():
         for W in row.cp:
@@ -1391,7 +1376,6 @@ def _kb_rows():
 KB_ROWS = _kb_rows()
 
 
-@HARNESS
 @pytest.mark.parametrize(
     "case", KB_ROWS, ids=[f"{n}-cp{W}-{lay}-H{H}" for n, W, lay, H in KB_ROWS]
 )
@@ -1766,7 +1750,6 @@ P1TIE_CHANGED_ROWS = frozenset(
 )
 
 
-@HARNESS
 @pytest.mark.parametrize(
     "case", KB_ROWS, ids=[f"{n}-cp{W}-{lay}-H{H}" for n, W, lay, H in KB_ROWS]
 )
@@ -3020,27 +3003,26 @@ def _fused_cases():
             ),
         )
     )
-    if kcp_shapes is not None:
-        for name, W, lay in (
-            ("Q1", 4, "C"),
-            ("Q1", 4, "Z"),
-            ("Q1", 4, "D"),
-            ("Q1", 8, "C"),
-            ("Q1", 16, "C"),
-            ("Q1", 16, "Z"),
-            ("C1", 4, "C"),
-            ("C2", 4, "Z"),
-            ("C3", 4, "D"),
-            ("C4b", 4, "R"),
-            ("C5", 4, "R"),
-            ("C7", 4, "R"),
-        ):
-            cases.append(
-                (
-                    f"{name}-cp{W}-{lay}",
-                    harness_partition(kcp_shapes.ROWS[name], W, lay)[1],
-                )
+    for name, W, lay in (
+        ("Q1", 4, "C"),
+        ("Q1", 4, "Z"),
+        ("Q1", 4, "D"),
+        ("Q1", 8, "C"),
+        ("Q1", 16, "C"),
+        ("Q1", 16, "Z"),
+        ("C1", 4, "C"),
+        ("C2", 4, "Z"),
+        ("C3", 4, "D"),
+        ("C4b", 4, "R"),
+        ("C5", 4, "R"),
+        ("C7", 4, "R"),
+    ):
+        cases.append(
+            (
+                f"{name}-cp{W}-{lay}",
+                harness_partition(kcp_shapes.ROWS[name], W, lay)[1],
             )
+        )
     return cases
 
 
@@ -3290,7 +3272,6 @@ def test_walk_geometry_tables(case, H) -> None:
         _evidence("walk_geometry", {"case": name, "H": H, "rank": ctx.rank, **rec})
 
 
-@HARNESS
 @pytest.mark.parametrize(
     "case",
     [c for c in CASES if c[0].startswith("Q") and c[1] in (8, 16)],
@@ -3356,11 +3337,7 @@ def device() -> torch.device:
     return _device_or_skip()
 
 
-PARITY_CASES = (
-    [c for c in CASES if kcp_shapes.ROWS[c[0]].kind != "perf"]
-    if kcp_shapes is not None
-    else []
-)
+PARITY_CASES = [c for c in CASES if kcp_shapes.ROWS[c[0]].kind != "perf"]
 PARITY_IDS = [f"{name}-cp{W}-{lay}" for name, W, lay in PARITY_CASES]
 PARITY_EXTRA_P = (
     1,
@@ -3369,7 +3346,6 @@ PARITY_EXTRA_P = (
 )  # segment counts checked beside the plan's own P (empty segments, P > chunks, P = 1)
 
 
-@HARNESS
 @pytest.mark.parametrize("case", PARITY_CASES, ids=PARITY_IDS)
 def test_gpu_table_parity(device, case) -> None:
     """Gate 5 (R15): the CPU-built chunk_bos / chunk_len / seq_chunk_start / seq_order are bitwise the
@@ -3504,8 +3480,6 @@ _REFS: dict = {}
 
 @pytest.fixture(scope="module")
 def fake():
-    pytest.importorskip("kcp_inputs")
-    pytest.importorskip("reference_kcp")
     from tests.test_helpers import cake_kcp_fake_backend as fb
 
     return fb
@@ -3518,9 +3492,7 @@ def _progress(msg: str) -> None:
 def _reference_of(fake, row):
     ref = _REFS.get(row.name)
     if ref is None:
-        ref = fake.load_or_compute_reference(
-            row, os.environ.get("KCP_REF_DIR"), progress=_progress
-        )
+        ref = fake.compute_reference(row, progress=_progress)
         _REFS[row.name] = ref
     return ref
 
@@ -3537,7 +3509,6 @@ def _assert_close_to_reference(fake, res, ref, row, docs, tag: str) -> dict:
     return m
 
 
-@HARNESS
 @pytest.mark.parametrize("case", FAKE_CASES, ids=FAKE_IDS)
 def test_fake_backend_matches_fp64_reference(fake, case) -> None:
     """Gate 6: the FP64 fake backend (W emulated ranks, dict collectives, the reference per-fragment compute) equals the
@@ -3584,7 +3555,6 @@ def test_fake_backend_matches_fp64_reference(fake, case) -> None:
     )
 
 
-@HARNESS
 def test_fake_backend_save_transfer_is_bitwise(fake) -> None:
     """save_transfer=True (the owner keeps the c1 receive tensor) gives bitwise the save_transfer=False gradients."""
     row = kcp_shapes.ROWS["C2"]
@@ -3605,7 +3575,6 @@ def test_fake_backend_save_transfer_is_bitwise(fake) -> None:
     )
 
 
-@HARNESS
 @pytest.mark.parametrize(
     "case", [("C1", 4, "C"), ("C3", 4, "D")], ids=["C1-cp4-C", "C3-cp4-D"]
 )
@@ -3640,12 +3609,11 @@ def test_fake_backend_document_alone_equals_slice(fake, case) -> None:
         )
 
 
-@HARNESS
-def test_fake_backend_transfer_matches_lane_p(fake) -> None:
+def test_fake_backend_transfer_matches_basis_transfer(fake) -> None:
     """The identity / v = 0 transfer map equals the reference basis-vector ``transfer`` helper (FP64) on a 63-token fragment."""
     row = kcp_shapes.ROWS["C5"]
     ranks = fake.build_ranks(row, 4, "R", progress=_progress)
-    err = fake._transfer_matches_lane_p(ranks.frag_ops(0, 0), row.h)
+    err = fake._transfer_matches_basis_transfer(ranks.frag_ops(0, 0), row.h)
     _progress(
         f"transfer (identity, v = 0) vs the reference transfer(): max |diff| {err:.3e}"
     )
@@ -3708,7 +3676,7 @@ def test_gpu_graph_replay_is_bitwise(device, monkeypatch, graph_cap, walk_form) 
 
     def unit(
         x,
-    ):  # the delta rule's operand contract (harness kcp_inputs): q / k L2-normalized per head; raw randn keys blow the state up
+    ):  # the delta rule's operand contract (cake_kcp_inputs): q / k L2-normalized per head; raw randn keys blow the state up
         return x * torch.rsqrt((x * x).sum(-1, keepdim=True) + 1e-6)
 
     q = unit(randn(T, H, cake_kcp.D)).to(dt["q"])
@@ -5250,7 +5218,7 @@ def test_gpu_host_trim_fresh_context_per_call_releases_everything(device) -> Non
 
     def unit(
         x,
-    ):  # the delta rule's operand contract (harness kcp_inputs): q / k L2-normalized per head
+    ):  # the delta rule's operand contract (cake_kcp_inputs): q / k L2-normalized per head
         return x * torch.rsqrt((x * x).sum(-1, keepdim=True) + 1e-6)
 
     q = unit(randn(T, H, cake_kcp.D)).to(dt["q"])
