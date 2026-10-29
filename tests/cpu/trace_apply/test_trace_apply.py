@@ -376,6 +376,7 @@ def test_mla_decode_solution_falls_back_for_prefill(monkeypatch, structural_inpu
     assert stats["hit"] == 1
     ta.disable_apply()
 
+
 def test_output_adapt_value_returning_returns_value():
     tmpl = _live_template(FI_API)
     x = torch.randn(4, 8)
