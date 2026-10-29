@@ -35,7 +35,11 @@ def get_paged_mqa_logits_metadata(
     exported head counts (32, 64) select different schedules -- ``next_n`` 5
     and 6 above the small-batch class -- in which case the ``ValueError`` says
     so; for ``next_n`` 1-4 and for every small batch it may be omitted, exactly
-    like DeepGEMM's signature. ``max_context_hint`` (keyword-only) is an upper
+    like DeepGEMM's signature, unless a device route (RTX 5090 or RTX PRO 6000
+    at its full CTA budget, with a ``max_context_hint`` inside a route context
+    window) makes the head counts select different schedules for this call,
+    where the ``ValueError`` names it as well.
+    ``max_context_hint`` (keyword-only) is an upper
     bound of the batch's context lengths in KV tokens known on the host; from
     16384 up it selects the native-atom schedules at batches 2..8 (``num_heads``
     is then required for ``next_n`` 5/6 there too), ``None`` keeps the

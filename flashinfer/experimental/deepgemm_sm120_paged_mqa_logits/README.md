@@ -221,6 +221,10 @@ exported head counts select different schedules — `next_n` 5 and 6 at
 `B > 8` — in which case the `ValueError` names it; for `next_n` 1–4 and for
 every `B <= 8` without a long-context hint the DeepGEMM-shaped call without
 `num_heads` is exact (the hint changes this for `next_n` 5 and 6; see below).
+On RTX 5090 and RTX PRO 6000 at the full CTA budget, with a `max_context_hint`
+inside a route context window, a device route can also make the two head counts
+select different schedules for other `next_n` values and batches; `num_heads`
+is then required there too, and the `ValueError` names it.
 `clean_logits=True` is rejected for two-dimensional context lengths exactly as
 DeepGEMM does, and `indices` (variable-length request selection) must be
 `None` — that scheduling branch is not ported.
