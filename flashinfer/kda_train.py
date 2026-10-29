@@ -600,7 +600,7 @@ def kcp_workspace_bytes(
     H: int = 64,
     save_mode: str = "light",
     backward: bool = True,
-    save_transfer: bool = False,
+    save_transfer: Optional[bool] = None,
     C: int = 8192,
 ) -> int:
     """Bytes of this rank's KCP workspace for ``H`` heads: the local arena (that of :func:`kda_train_workspace_bytes`
@@ -610,13 +610,15 @@ def kcp_workspace_bytes(
     not counted).  The saved set and the convolution's halo rows are per-call tensors, so ``C`` does not change it,
     and ``save_transfer`` does not change a backward workspace.  A forward-only workspace (``backward=False``) has
     two states.  After its forwards with a saved set it holds the bytes returned here for the forward's
-    ``save_transfer`` (pass it: the a2a forward resolves an unset one to ``True``); with ``True`` it holds no c1
-    receive, transfer staging or carry pool, with ``False`` it holds the first two.  Once a forward without a saved
-    set has allocated the rest, it holds ``cake_kcp_plan.kcp_arena_layout(ctx, H=H, backward=False,
-    save_transfer=save_transfer)["lazy"]`` bytes more.  Under ``exchange="ring"`` it never holds the c1 receive
-    pool."""
+    ``save_transfer`` (``None``, the default, resolves to ``True`` as the a2a forward does; pass ``False`` for the
+    ring or the recompute form); with ``True`` it holds no c1 receive, transfer staging or carry pool, with ``False``
+    it holds the first two.  Once a forward without a saved set has allocated the rest, it holds
+    ``cake_kcp_plan.kcp_arena_layout(ctx, H=H, backward=False, save_transfer=save_transfer)["lazy"]`` bytes more.
+    Under ``exchange="ring"`` it never holds the c1 receive pool."""
     from .experimental.cake_kda_train import cake_kcp_plan
 
+    if save_transfer is None:
+        save_transfer = cake_kcp_plan.SAVE_TRANSFER_DEFAULT
     return cake_kcp_plan.kcp_workspace_bytes(
         ctx,
         H=H,
