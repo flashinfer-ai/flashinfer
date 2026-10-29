@@ -3646,3 +3646,138 @@ def test_reuse_recompute_tapes_auto_is_an_option_value() -> None:
     for bad in ("yes", 1, 0, "AUTO"):
         with pytest.raises(TypeError, match="must be a bool or 'auto'"):
             opt.KcpOptions(reuse_recompute_tapes=bad).check()
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# Recompute handle (issue #7818): the checkpoint recompute reads the original forward's incoming states from the
+# handle instead of exchanging them again.  These CPU rows run one rank (no crossing fragment, ``S_in`` empty): they
+# check the code path -- the capture / replay decision, the local carries at ``P > 1``, bitwise equality, retention
+# and misuse; the multi-GPU rows (test_cake_gdn_train_kcp_dist.py) check the exchange count and the retained bytes.
+
+
+def _handle_autograd(
+    kcp, ctx, ops, *, handle, twice: bool = False, **opts
+) -> tuple[dict[str, torch.Tensor], list]:
+    """One ``chunk_gdn_kcp`` layer under a non-reentrant checkpoint with ``recompute_handle=handle`` (``None``: the
+    plain checkpoint); returns out + gradients and the ``recompute_handle`` mode of the original forward and of the
+    recompute of every backward (read from ``LAST_CALL`` after each: torch's early stop ends the recompute inside the
+    node's ``apply``, after the forward recorded itself)."""
+    leaves = [
+        ops[n].detach().clone().requires_grad_(True)
+        for n in ("q", "k", "v", "g", "beta")
+    ]
+    o = {"backend": "fake", "save_transfer": False, **opts}
+
+    def fn(q, k, v, g, beta, h):
+        return kcp.chunk_gdn_kcp(q, k, v, g, beta, ctx, recompute_handle=h, **o)
+
+    from torch.utils.checkpoint import checkpoint
+
+    out = checkpoint(fn, *leaves, handle, use_reentrant=False)
+    modes = [kcp.LAST_CALL["fwd"]["recompute_handle"]]
+    out.backward(ops["dout"], retain_graph=twice)
+    modes.append(kcp.LAST_CALL["fwd"]["recompute_handle"])
+    if twice:
+        out.backward(ops["dout"])
+        modes.append(kcp.LAST_CALL["fwd"]["recompute_handle"])
+    return {
+        "out": out.detach(),
+        **{n: lf.grad for n, lf in zip(CKPT_GRADS, leaves, strict=True)},
+    }, modes
+
+
+@pytest.mark.parametrize("segments", [1, 2])
+@pytest.mark.parametrize("reuse", [True, False, "auto"])
+def test_recompute_handle_is_bitwise_the_checkpoint_and_the_direct_pass(
+    segments, reuse
+) -> None:
+    """The original forward stores ``S_in`` ("capture"), torch's recompute reads it ("replay"): out and the five
+    gradients are bitwise the plain checkpoint's and the direct pass's at the same options, at ``P = 1`` and
+    ``P = 2`` (the carries rebuilt locally), with and without the kept tapes."""
+    kcp, ctx, ops = _ckpt_setup()
+    base = dict(segments=segments, reuse_recompute_tapes=reuse)
+    direct = _ckpt_autograd(kcp, ctx, ops, ckpt=False, save_transfer=False, **base)
+    plain, plain_modes = _handle_autograd(kcp, ctx, ops, handle=None, **base)
+    handle = kcp.KcpRecomputeHandle()
+    got, modes = _handle_autograd(kcp, ctx, ops, handle=handle, **base)
+    _assert_same(plain, direct, "plain checkpoint vs direct")
+    _assert_same(got, direct, "handle checkpoint vs direct")
+    assert plain_modes == [None, None], plain_modes
+    assert modes == ["capture", "replay"], modes
+    assert kcp.HANDLE_KEY in handle.entries
+    assert kcp.kept_registry_size() == 0
+
+
+def test_recompute_handle_retains_exactly_s_in_and_survives_a_second_backward() -> None:
+    """The entry is the saved set's own ``S_in`` (no copy; ``nbytes`` is its size and the light byte query without
+    the transfer and the convolution rows); ``retain_graph`` + a second backward reuses it and accumulates exactly
+    twice the gradient."""
+    kcp, ctx, ops = _ckpt_setup()
+    H_qk, HV = ops["q"].shape[-2], ops["v"].shape[-2]
+    handle = kcp.KcpRecomputeHandle()
+    once, _ = _handle_autograd(kcp, ctx, ops, handle=kcp.KcpRecomputeHandle())
+    twice, modes = _handle_autograd(kcp, ctx, ops, handle=handle, twice=True)
+    assert modes == ["capture", "replay", "replay"], modes
+    for n in CKPT_GRADS:
+        assert torch.equal(twice[n], once[n] + once[n]), n
+    s_in = handle.entries[kcp.HANDLE_KEY]["S_in"]
+    assert handle.nbytes() == s_in.numel() * s_in.element_size()
+    assert handle.nbytes() == kcp.gdn_kcp_saved_bytes(
+        ctx, H_qk=H_qk, HV=HV, save_mode="light", save_transfer=False, with_conv=False
+    )
+    handle.clear()
+    assert handle.nbytes() == 0 and not handle.entries
+
+
+def test_recompute_handle_entry_rules() -> None:
+    """A forward outside the backward that finds an entry raises (a handle reused across micro-steps); a recompute
+    whose handle lost its entry is an original forward again (it captures; the result is unchanged);
+    ``save_transfer=True`` (keyword or options dict), ``boundary_mode="replay"``, ``graph="replay"`` and
+    ``debug_sequence`` are refused; an object without an ``entries`` dict is refused."""
+    kcp, ctx, ops = _ckpt_setup()
+    q, k, v, g, beta = (ops[n] for n in ("q", "k", "v", "g", "beta"))
+    handle = kcp.KcpRecomputeHandle()
+    kcp.chunk_gdn_kcp(q, k, v, g, beta, ctx, backend="fake", recompute_handle=handle)
+    assert kcp.LAST_CALL["fwd"]["recompute_handle"] == "capture"
+    with pytest.raises(RuntimeError, match="new KcpRecomputeHandle per micro-step"):
+        kcp.chunk_gdn_kcp(
+            q, k, v, g, beta, ctx, backend="fake", recompute_handle=handle
+        )
+    leaves = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
+    h2 = kcp.KcpRecomputeHandle()
+    from torch.utils.checkpoint import checkpoint
+
+    def fn(*a):
+        return kcp.chunk_gdn_kcp(
+            *a[:5], ctx, backend="fake", save_transfer=False, recompute_handle=a[5]
+        )
+
+    out = checkpoint(fn, *leaves, h2, use_reentrant=False)
+    h2.clear()
+    out.backward(ops["dout"])
+    assert kcp.LAST_CALL["fwd"]["recompute_handle"] == "capture"
+    assert kcp.HANDLE_KEY in h2.entries
+    ref = _ckpt_autograd(kcp, ctx, ops, ckpt=False, save_transfer=False)
+    for n, lf in zip(CKPT_GRADS, leaves, strict=True):
+        assert torch.equal(lf.grad, ref[n]), n
+    for bad in (
+        {"save_transfer": True},
+        {"options": {"save_transfer": True}},
+        {"boundary_mode": "replay"},
+        {"graph": "replay", "workspace": kcp.KcpWorkspace()},
+        {"test_knobs": {"debug_sequence": True}},
+    ):
+        with pytest.raises(ValueError):
+            kcp.chunk_gdn_kcp(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ctx,
+                backend="fake",
+                recompute_handle=kcp.KcpRecomputeHandle(),
+                **bad,
+            )
+    with pytest.raises(TypeError, match="entries"):
+        kcp.chunk_gdn_kcp(q, k, v, g, beta, ctx, backend="fake", recompute_handle=object())

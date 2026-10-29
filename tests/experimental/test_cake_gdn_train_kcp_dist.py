@@ -41,6 +41,7 @@ Operands come from the seeded CPU generator (bitwise identical on every rank and
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime as _dt
 import gc
@@ -799,6 +800,86 @@ def _kept_record(T_r: int) -> dict:
     }
 
 
+class _CollectiveCounter:
+    """Counts the ``torch.distributed`` collectives issued and the waits on their work handles, by phase: ``"orig"``
+    (the checkpointed forward), ``"recompute"`` (torch's recompute, marked by the checkpoint's ``context_fn``) and
+    ``"bwd"`` (the rest of the backward).  The shims replace the module attributes the package calls
+    (``dist.all_to_all_single`` ...) while the counter is entered; tensor contents are never read."""
+
+    NAMES = (
+        "all_to_all_single",
+        "batch_isend_irecv",
+        "all_gather_object",
+        "all_gather",
+        "all_gather_into_tensor",
+        "all_reduce",
+        "broadcast",
+        "reduce_scatter_tensor",
+        "isend",
+        "irecv",
+        "send",
+        "recv",
+    )
+
+    def __init__(self) -> None:
+        self.phase = "orig"
+        self.calls: dict[str, int] = {}
+        self.waits: dict[str, int] = {}
+        self._saved: dict[str, object] = {}
+
+    def _bump(self, table: dict[str, int]) -> None:
+        table[self.phase] = table.get(self.phase, 0) + 1
+
+    def _work(self, w):
+        counter = self
+
+        class _Work:
+            def __init__(self, inner) -> None:
+                self._inner = inner
+
+            def wait(self, *a, **kw):
+                counter._bump(counter.waits)
+                return self._inner.wait(*a, **kw)
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+        return _Work(w) if hasattr(w, "wait") else w
+
+    def __enter__(self) -> "_CollectiveCounter":
+        for name in self.NAMES:
+            fn = getattr(dist, name, None)
+            if fn is None:
+                continue
+            self._saved[name] = fn
+
+            def shim(*a, _fn=fn, **kw):
+                self._bump(self.calls)
+                r = _fn(*a, **kw)
+                if isinstance(r, list):
+                    return [self._work(x) for x in r]
+                return self._work(r)
+
+            setattr(dist, name, shim)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        for name, fn in self._saved.items():
+            setattr(dist, name, fn)
+        self._saved.clear()
+
+    @contextlib.contextmanager
+    def recompute(self):
+        prev, self.phase = self.phase, "recompute"
+        try:
+            yield
+        finally:
+            self.phase = prev
+
+    def record(self) -> dict:
+        return {"calls": dict(self.calls), "waits": dict(self.waits)}
+
+
 def _run_rank(
     rank: int,
     W: int,
@@ -964,6 +1045,137 @@ def _run_rank(
         auto_delta[k] == v_
         for k, v_ in {"put": n_auto, "take": n_auto, "miss": 0}.items()
     )
+
+    # issue #7818: a KcpRecomputeHandle carries this rank's incoming states S_in from the checkpointed forward to
+    # torch's recompute, which then issues no collective and waits on none (counted by phase through shims on
+    # torch.distributed; the recompute phase is marked by the checkpoint's context_fn).  Out and the five gradients
+    # are bitwise the plain checkpoint's (same options) and the direct pass's; the original forward and the backward
+    # exchange exactly as the plain checkpoint does (A4); a second backward reuses the entry; the handle retains
+    # exactly S_in (the light saved set without the transfer and the convolution rows).  The row's own plan P is
+    # used (a forced segment count is not valid on every rank of every row); info records it.  The plain
+    # checkpoint's per-phase counts are recorded as the reproduction of the issue.
+    class _RecomputePhase:
+        """The recompute context of the checkpoint's context_fn: re-entered by every recompute (retain_graph)."""
+
+        def __init__(self, counter: "_CollectiveCounter") -> None:
+            self.counter, self.prev = counter, []
+
+        def __enter__(self):
+            self.prev.append(self.counter.phase)
+            self.counter.phase = "recompute"
+            return self
+
+        def __exit__(self, *exc) -> None:
+            self.counter.phase = self.prev.pop()
+
+    def handle_pass(handle: bool, *, twice: bool = False, workspace=ws, **opts):
+        leaves = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
+        o = {**base, "save_transfer": False, **opts}
+        hd = kcp.KcpRecomputeHandle() if handle else None
+
+        def fn(q_, k_, v_, g_, b_, h_):
+            return kcp.chunk_gdn_kcp(
+                q_, k_, v_, g_, b_, ctx, workspace=workspace, recompute_handle=h_, **o
+            )
+
+        from torch.utils.checkpoint import checkpoint
+
+        with _CollectiveCounter() as cc:
+            rphase = _RecomputePhase(cc)
+            out = checkpoint(
+                fn,
+                *leaves,
+                hd,
+                use_reentrant=False,
+                context_fn=lambda: (contextlib.nullcontext(), rphase),
+            )
+            # torch's early stop ends the recompute inside the node's apply, after the forward recorded itself
+            modes = [kcp.LAST_CALL["fwd"].get("recompute_handle")]
+            P_used = int(kcp.LAST_CALL["fwd"].get("P", 0) or 0)
+            cc.phase = "bwd"
+            out.backward(dout, retain_graph=twice)
+            modes.append(kcp.LAST_CALL["fwd"].get("recompute_handle"))
+            if twice:
+                out.backward(dout)
+                modes.append(kcp.LAST_CALL["fwd"].get("recompute_handle"))
+        rec = {
+            **cc.record(),
+            "modes": modes,
+            "P": P_used,
+            "handle_bytes": hd.nbytes() if hd is not None else 0,
+        }
+        return {
+            "out": out.detach(),
+            **{n: lf.grad for n, lf in zip(GRADS, leaves, strict=True)},
+        }, rec
+
+    handle_info: dict[str, object] = {}
+    res_plain, rec_plain = handle_pass(False)
+    res_h, rec_h = handle_pass(True)
+    handle_info["plain"], handle_info["handle"] = rec_plain, rec_h
+    flags["handle_eq_ckpt"] = _eq(res_plain, res_h)
+    flags["handle_eq_direct"] = _eq(res_auto, res_h)
+    flags["handle_recompute_no_comm"] = (
+        rec_h["calls"].get("recompute", 0) == 0
+        and rec_h["waits"].get("recompute", 0) == 0
+    )
+    flags["handle_orig_bwd_comm_unchanged"] = all(
+        rec_h[t].get(ph, 0) == rec_plain[t].get(ph, 0)
+        for t in ("calls", "waits")
+        for ph in ("orig", "bwd")
+    )
+    flags["handle_modes"] = rec_h["modes"] == ["capture", "replay"]
+    res_h2, rec_h2 = handle_pass(True, twice=True)
+    handle_info["twice"] = rec_h2
+    flags["handle_twice_accumulates"] = (
+        all(torch.equal(res_h2[n], res_auto[n] + res_auto[n]) for n in GRADS)
+        and rec_h2["calls"].get("recompute", 0) == 0
+        and rec_h2["modes"] == ["capture", "replay", "replay"]
+    )
+    s_in_query = int(
+        kcp.gdn_kcp_saved_bytes(
+            ctx,
+            H_qk=H_qk,
+            HV=HV,
+            save_mode="light",
+            save_transfer=False,
+            with_conv=False,
+        )
+    )
+    handle_info["s_in_query_bytes"] = s_in_query
+    flags["handle_bytes_eq_query"] = rec_h["handle_bytes"] == s_in_query
+    # retained after the checkpointed forward (per-call workspace, after a warm-up of the same form): exactly the
+    # handle's S_in, where the plain checkpoint retains nothing (retained_zero below)
+    handle_pass(True, workspace=None)
+    torch.cuda.synchronize(device)
+    gc.collect()
+    leaves_h = [x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)]
+    hd_r = kcp.KcpRecomputeHandle()
+
+    def fn_r(q_, k_, v_, g_, b_, h_):
+        return kcp.chunk_gdn_kcp(
+            q_, k_, v_, g_, b_, ctx, recompute_handle=h_, save_transfer=False, **base
+        )
+
+    from torch.utils.checkpoint import checkpoint as _checkpoint
+
+    before_h = _alloc_stats(device)
+    out_h = _checkpoint(fn_r, *leaves_h, hd_r, use_reentrant=False)
+    torch.cuda.synchronize(device)
+    after_h = _alloc_stats(device)
+    retained_h = int(
+        after_h["requested"]
+        - before_h["requested"]
+        - out_h.numel() * out_h.element_size()
+    )
+    handle_info["retained_bytes"] = retained_h
+    flags["handle_retained_eq_s_in"] = retained_h == hd_r.nbytes() == s_in_query
+    out_h.backward(dout)
+    del out_h, leaves_h, hd_r
+    # the reproduction of the issue: the plain checkpoint's recompute exchanges (W > 1 with a crossing fragment)
+    handle_info["plain_recompute_calls"] = rec_plain["calls"].get("recompute", 0)
+    handle_info["plain_recompute_waits"] = rec_plain["waits"].get("recompute", 0)
+    info["recompute_handle"] = handle_info
 
     def _ckpt_peak(**o) -> int:
         torch.cuda.synchronize(device)

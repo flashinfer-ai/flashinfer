@@ -259,6 +259,7 @@ def chunk_gdn_kcp(
     workspace: Optional[Any] = None,
     graph: str = "off",
     options: Optional[Any] = None,
+    recompute_handle: Optional[Any] = None,
     **knobs: Any,
 ) -> torch.Tensor:
     r"""Context-parallel packed GDN training as an autograd node (``torch.utils.checkpoint`` compatible).
@@ -293,6 +294,28 @@ def chunk_gdn_kcp(
     recompute, a non-executable node, another torch build (``cake_kcp.LAST_CALL["fwd"]["fwd_o_reason"]`` records the
     decision and its reason).  The gradients and the retained bytes are unchanged either way; ``"always"`` is the
     unconditional launch.
+
+    ``recompute_handle`` (keyword-only, default ``None``; a :class:`KcpRecomputeHandle`): the checkpoint recompute
+    of this forward runs without cross-rank communication.  The original forward exchanges as always and stores
+    this rank's incoming states ``S_in`` (the saved set's own tensor) in the handle; torch's recompute of the forward
+    inside ``.backward()`` reads them back and runs no exchange, no transfer-summary walk and no merge -- only the
+    prep program, at ``P > 1`` the local segment walks and carry merges, and the state walk from ``S_in``, the
+    launches of the light backward's replay -- so
+    the gradients are bitwise those of the same checkpoint without a handle.  The backward still exchanges.  The
+    handle retains ``S_in`` (``gdn_kcp_saved_bytes(ctx, ..., save_mode="light", save_transfer=False)``) from the
+    original forward until the checkpoint frame holding it is freed, instead of retaining nothing (``with_conv=False``
+    in that query: the convolution keeps its own rows).  Create one handle per layer and micro-step, outside the
+    outermost checkpoint region, and pass it as an argument of the checkpointed function::
+
+        def layer(x, handle):
+            ...
+            return chunk_gdn_kcp(q, k, v, g, beta, ctx, recompute_handle=handle)
+
+        y = torch.utils.checkpoint.checkpoint(layer, x, KcpRecomputeHandle(), use_reentrant=False)
+
+    One handle serves the whole layer: the context-parallel convolution keeps its halo rows in the same handle under
+    its own key.  Needs ``boundary_mode="saved"`` and ``graph="off"``; implies ``save_transfer=False``.  A forward
+    outside the backward that finds an entry raises (a handle reused across micro-steps).
     """
     return _pkg().chunk_gdn_kcp(
         q,
@@ -307,6 +330,7 @@ def chunk_gdn_kcp(
         workspace=workspace,
         graph=graph,
         options=options,
+        recompute_handle=recompute_handle,
         **knobs,
     )
 
@@ -371,7 +395,14 @@ def _device_arch(cake_jit: Any, index: int) -> str | None:
 # The public types of the package (the contract's exported names), resolved on first access so that importing the
 # facade imports the package lazily: ``KcpOptions``, ``KcpContext``, ``KcpPartition``.  ``KcpSaved`` (returned by
 # ``chunk_gdn_kcp_fwd``) and ``KcpWorkspace`` resolve the same way but are not public names of the contract.
-_LAZY_TYPES = ("KcpOptions", "KcpContext", "KcpPartition", "KcpSaved", "KcpWorkspace")
+_LAZY_TYPES = (
+    "KcpOptions",
+    "KcpContext",
+    "KcpPartition",
+    "KcpRecomputeHandle",
+    "KcpSaved",
+    "KcpWorkspace",
+)
 
 
 def __getattr__(name: str) -> Any:
@@ -388,6 +419,7 @@ __all__ = [
     "KcpContext",  # noqa: F822 - resolved by __getattr__
     "KcpOptions",  # noqa: F822
     "KcpPartition",  # noqa: F822
+    "KcpRecomputeHandle",  # noqa: F822
     "build_kcp_context",
     "chunk_gdn_kcp",
     "chunk_gdn_kcp_bwd",
