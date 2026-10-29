@@ -102,6 +102,9 @@ Exchange layouts (one ``all_to_all_single`` per direction; ``s`` = one FP32
 from __future__ import annotations
 
 import dataclasses
+import weakref
+from collections.abc import Mapping
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -218,6 +221,148 @@ def _ceil_div(a: int, b: int) -> int:
 
 def _round_up(n: int, m: int) -> int:
     return _ceil_div(n, m) * m
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# Host-built integer tables on the device without a synchronizing call
+
+# Test knobs of build_kcp_context (after enable_test_knobs(), for the A/B record and the negative control of the
+# host-synchronization tests): ``upload="blocking"`` = the previous per-table ``torch.tensor(values, device=)`` copies
+# (pageable; each synchronizes the stream), eager at preparation as before; ``table_cache="workspace"`` = the previous
+# per-workspace table-set cache (keyed by the context) instead of the context's own.
+UPLOADS = ("async", "blocking")
+UPLOAD_DEFAULT = "async"
+TABLE_CACHES = ("context", "workspace")
+TABLE_CACHE_DEFAULT = "context"
+
+
+@dataclasses.dataclass(eq=False)
+class KcpUpload:
+    """One asynchronous upload: the device ``blob`` its tables view, the ``stream`` that ran the copy and the ``ready``
+    event recorded after it (:meth:`KcpContext.wait_ready`)."""
+
+    blob: Any
+    stream: Any
+    ready: Any
+
+
+def _upload_blocking(
+    specs: dict[str, tuple], device: torch.device
+) -> dict[str, torch.Tensor]:
+    """The previous path of the ``upload="blocking"`` knob: one pageable ``torch.tensor(values, device=)`` per table."""
+    out = {}
+    for name, (values, dtype, shape) in specs.items():
+        t = torch.tensor(list(values), dtype=dtype, device=device)
+        out[name] = t if shape is None else t.reshape(shape)
+    return out
+
+
+def _upload_tables(
+    specs: dict[str, tuple], device, *, stream=None
+) -> tuple[dict[str, torch.Tensor], KcpUpload | None]:
+    """Device copies of integer tables built on the host (``name -> (values, dtype, shape)``; ``values`` a flat or
+    nested sequence of ints, ``shape`` ``None`` = the sequence's own shape) without a synchronizing CUDA call.
+
+    ``torch.tensor(values, device=cuda)`` copies from pageable memory and synchronizes the stream once per table, so a
+    table built behind queued device work waits for that work.  Here every table is laid out at a 256-byte boundary
+    (:data:`ALIGN`) of one pinned ``uint8`` staging buffer, and one ``copy_(non_blocking=True)`` on ``stream``
+    (default: the current stream of ``device``) moves them into one device blob; the host caching allocator records
+    the copy on the staging block, so the block is reused only after the copy has run.  An event recorded after the
+    copy is returned with the blob in a :class:`KcpUpload`.  Each table is a contiguous view of the blob with the dtype,
+    shape and values of ``torch.tensor(values, dtype)``.  On a non-CUDA device the tables are plain tensors and no
+    record is returned.  Under CUDA-graph capture this raises ``RuntimeError``: a captured copy would re-read a host
+    buffer the graph does not own (the same rule as GDN's ``upload_tables``, whose code this follows)."""
+    device = torch.device(device)
+    items: list[tuple[str, torch.Tensor, tuple[int, ...]]] = []
+    for name, (values, dtype, shape) in specs.items():
+        cpu = torch.tensor(list(values), dtype=dtype)
+        shape = tuple(cpu.shape) if shape is None else tuple(int(x) for x in shape)
+        flat = cpu.reshape(-1)
+        numel = 1
+        for x in shape:
+            numel *= x
+        if flat.numel() != numel:
+            raise ValueError(
+                f"_upload_tables: table {name!r} holds {flat.numel()} values, shape {shape} needs {numel}"
+            )
+        items.append((name, flat, shape))
+    if device.type != "cuda":
+        return {name: flat.view(shape).to(device) for name, flat, shape in items}, None
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "_upload_tables: a table upload under CUDA-graph capture would re-read host memory the graph does not own; "
+            "run the first call of a context eagerly (graph='replay' does) or prepare it before the capture"
+        )
+    offsets, total = [], 0
+    for _name, flat, _shape in items:
+        offsets.append(total)
+        total += _round_up(flat.numel() * flat.element_size(), ALIGN)
+    s = torch.cuda.current_stream(device) if stream is None else stream
+    with torch.cuda.device(device), torch.cuda.stream(s):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "_upload_tables: the upload stream is capturing a CUDA graph"
+            )
+        staging = torch.zeros(
+            (total,), dtype=torch.uint8, pin_memory=True
+        )  # the alignment padding is defined, never read
+        for (_name, flat, _shape), off in zip(items, offsets, strict=True):
+            n = flat.numel() * flat.element_size()
+            if n:
+                staging[off : off + n].copy_(flat.view(torch.uint8))
+        blob = torch.empty((total,), dtype=torch.uint8, device=device)
+        blob.copy_(
+            staging, non_blocking=True
+        )  # cudaMemcpyAsync from pinned memory; the staging block is held until the copy has run
+        ready = torch.cuda.Event()
+        ready.record(s)
+    out = {}
+    for (name, flat, shape), off in zip(items, offsets, strict=True):
+        n = flat.numel() * flat.element_size()
+        out[name] = blob[off : off + n].view(flat.dtype).view(shape)
+    return out, KcpUpload(blob=blob, stream=s, ready=ready)
+
+
+class _LazyTables(Mapping):
+    """``KcpHeadPlan.device_tables``: the head plan's device tables, uploaded together (one asynchronous copy through
+    the context) when one of them is first read.  The shipped launch path reads none of them (it uploads its own
+    walk / index / chain tables per table set), so a byte query or a prepared head plan does no device work."""
+
+    def __init__(self, ctx: Any, specs: dict[str, tuple], device: torch.device) -> None:
+        self._specs = specs
+        self._device = device
+        self._tables: dict[str, torch.Tensor] | None = None
+        self._ctx: Any
+        try:
+            self._ctx = weakref.ref(ctx)
+        except TypeError:  # a context type without weak references
+            self._ctx = lambda c=ctx: c
+
+    def _materialize(self) -> dict[str, torch.Tensor]:
+        if self._tables is None:
+            ctx = self._ctx()
+            up = getattr(ctx, "upload_tables", None)
+            self._tables = (
+                up(self._specs, self._device)
+                if up is not None
+                else _upload_tables(self._specs, self._device)[0]
+            )
+        return self._tables
+
+    def __getitem__(self, name: str) -> torch.Tensor:
+        if name not in self._specs:
+            raise KeyError(name)
+        return self._materialize()[name]
+
+    def __iter__(self):
+        return iter(self._specs)
+
+    def __len__(self) -> int:
+        return len(self._specs)
+
+    @property
+    def uploaded(self) -> bool:
+        return self._tables is not None
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -1214,7 +1359,9 @@ class KcpHeadPlan:
     (``dS_out`` of the predecessor in the b2 send buffer).  ``hg_stride[table]`` is the element stride between
     consecutive heads of each offset table (``SUMMARY_TILE`` in the pair buffers, ``TILE`` in the planes).  Every
     offset is ``-1`` or a non-negative multiple of 4 floats (checked here, before any launch).
-    ``device_tables`` holds the int32 / int64 device copies of the tables the kernels read."""
+    ``device_tables`` maps the tables' names to their int32 / int64 device copies, uploaded together (one asynchronous
+    copy) when one of them is first read: the shipped launch path uploads its own per-table-set copies, so building a
+    head plan (``ctx.heads(H)``, the byte queries) is host work only."""
 
     H: int
     Hg: int
@@ -1260,7 +1407,7 @@ class KcpHeadPlan:
     adj_m_off_b1: tuple[int, ...]
     adj_m_off_c1: tuple[int, ...]
     adj_out_off: tuple[int, ...]
-    device_tables: dict[str, torch.Tensor]
+    device_tables: Mapping[str, torch.Tensor]
 
     @property
     def P(self) -> int:
@@ -1567,49 +1714,44 @@ def _build_head_plan(ctx: KcpContext, H: int) -> KcpHeadPlan:
     dev = ctx.device
     i32, i64 = torch.int32, torch.int64
 
-    def t(values, dtype=i32):
-        return torch.tensor(list(values), dtype=dtype, device=dev)
+    def tiles(rows) -> tuple:
+        return ([list(x) for x in rows], i32, (len(rows), H))
 
-    device_tables = {
-        "seg_chunk_start": t(seg_table),
-        "h0_index": t(h0_index),
-        "carry_index": t(carry_index),
-        "dht_index": t(dht_index),
-        "dcarry_index": t(dcarry_index),
-        "out_index": t(out_index),
-        "walk_seg_offset": t(walk_offset),
-        "walk_seg_tape": t(walk_tape),
-        "out_tile": torch.tensor(
-            [list(x) for x in out_tile], dtype=i32, device=dev
-        ).reshape(len(out_tile), H),
-        "h0_tile": torch.tensor(
-            [list(x) for x in h0_tile], dtype=i32, device=dev
-        ).reshape(len(h0_tile), H),
-        "dht_tile": torch.tensor(
-            [list(x) for x in dht_tile], dtype=i32, device=dev
-        ).reshape(len(dht_tile), H),
-        "b1_d_tile_d": torch.tensor(
-            [list(x) for x in b1_d_tile_d], dtype=i32, device=dev
-        ).reshape(len(b1_d_tile_d), H),
-        "b1_d_tile_dm": torch.tensor(
-            [list(x) for x in b1_d_tile_dm], dtype=i32, device=dev
-        ).reshape(len(b1_d_tile_dm), H),
-        "b1_m_tile_dm": torch.tensor(
-            [list(x) for x in b1_m_tile_dm], dtype=i32, device=dev
-        ).reshape(len(b1_m_tile_dm), H),
-        "fwd_chain_start": t(fwd_start),
-        "fwd_chain_doc": t(fwd_doc),
-        "fwd_m_off": t(fwd_m, i64),
-        "fwd_b_off": t(fwd_b, i64),
-        "fwd_out_off": t(fwd_out, i64),
-        "adj_chain_start": t(adj_start),
-        "adj_chain_doc": t(adj_doc),
-        "adj_d_off_d": t(adj_dd, i64),
-        "adj_d_off_dm": t(adj_ddm, i64),
-        "adj_m_off_b1": t(adj_mb1, i64),
-        "adj_m_off_c1": t(adj_mc1, i64),
-        "adj_out_off": t(adj_out, i64),
+    specs: dict[str, tuple] = {
+        "seg_chunk_start": (seg_table, i32, None),
+        "h0_index": (h0_index, i32, None),
+        "carry_index": (carry_index, i32, None),
+        "dht_index": (dht_index, i32, None),
+        "dcarry_index": (dcarry_index, i32, None),
+        "out_index": (out_index, i32, None),
+        "walk_seg_offset": (walk_offset, i32, None),
+        "walk_seg_tape": (walk_tape, i32, None),
+        "out_tile": tiles(out_tile),
+        "h0_tile": tiles(h0_tile),
+        "dht_tile": tiles(dht_tile),
+        "b1_d_tile_d": tiles(b1_d_tile_d),
+        "b1_d_tile_dm": tiles(b1_d_tile_dm),
+        "b1_m_tile_dm": tiles(b1_m_tile_dm),
+        "fwd_chain_start": (fwd_start, i32, None),
+        "fwd_chain_doc": (fwd_doc, i32, None),
+        "fwd_m_off": (fwd_m, i64, None),
+        "fwd_b_off": (fwd_b, i64, None),
+        "fwd_out_off": (fwd_out, i64, None),
+        "adj_chain_start": (adj_start, i32, None),
+        "adj_chain_doc": (adj_doc, i32, None),
+        "adj_d_off_d": (adj_dd, i64, None),
+        "adj_d_off_dm": (adj_ddm, i64, None),
+        "adj_m_off_b1": (adj_mb1, i64, None),
+        "adj_m_off_c1": (adj_mc1, i64, None),
+        "adj_out_off": (adj_out, i64, None),
     }
+    # host-only by default: the tables are uploaded (one asynchronous copy) when one is first read; the upload="blocking"
+    # knob keeps the previous eager per-table copies
+    device_tables: Mapping[str, torch.Tensor] = (
+        _upload_blocking(specs, dev)
+        if getattr(ctx, "upload", UPLOAD_DEFAULT) == "blocking"
+        else _LazyTables(ctx, specs, dev)
+    )
     return KcpHeadPlan(
         H=H,
         Hg=Hg,
@@ -1687,8 +1829,8 @@ class KcpContext:
     layers; never reads a tensor's contents.
 
     Local problem: ``T_r`` tokens in ``n_frag`` local sequences (``cu_seqlens_local`` int32 device ``[n_frag + 1]``,
-    ``frag_table`` int32 device ``[n_frag, 4]`` = ``(doc, off, len, flags)`` with ``FLAG_CROSSING_IN`` /
-    ``FLAG_CROSSING_OUT`` / ``FLAG_CONTINUING``).  Crossing lists: ``in_slot[slot]`` / ``out_slot[slot]`` (``-1``
+    ``frag_rows`` = ``(doc, off, len, flags)`` per fragment with ``FLAG_CROSSING_IN`` / ``FLAG_CROSSING_OUT`` /
+    ``FLAG_CONTINUING``, as int32 device ``[n_frag, 4]`` in ``frag_table`` on first read).  Crossing lists: ``in_slot[slot]`` / ``out_slot[slot]`` (``-1``
     when not crossing) number the rank's crossing-in / crossing-out fragments in local order (``n_in`` / ``n_out``;
     ``N_in`` / ``N_out`` are the group totals; ``*_by_rank`` and ``*_all`` the per-rank counts / tables every owner
     needs).  ``chains[doc]`` are the ``(rank, slot)`` of each document's non-empty fragments in order.  Tables of the
@@ -1710,7 +1852,7 @@ class KcpContext:
     n_frag: int
     cu_seqlens_local_cpu: tuple[int, ...]
     cu_seqlens_local: torch.Tensor
-    frag_table: torch.Tensor
+    frag_rows: tuple[tuple[int, int, int, int], ...]
     in_slot: tuple[int, ...]
     out_slot: tuple[int, ...]
     n_in: int
@@ -1737,13 +1879,87 @@ class KcpContext:
     halo_tables: dict[str, torch.Tensor]
     p_rule: str = P_RULE_DEFAULT  # plan rule: "wave_fill1_p1tie" shipped; "wave_fill1" (previous) / "wave" / "occ" / "wave_fill" via the test knob
     sequence: KcpSequence = dataclasses.field(default_factory=KcpSequence, repr=False)
+    upload: str = UPLOAD_DEFAULT  # test knob: "async" (shipped) | "blocking" (the previous pageable copies)
+    table_cache: str = TABLE_CACHE_DEFAULT  # test knob: "context" (shipped) | "workspace" (the previous cache)
     _head_plans: dict[int, KcpHeadPlan] = dataclasses.field(
         default_factory=dict, repr=False
     )
+    # the launch table sets of cake_kcp (``_Tables`` per (H, fused_walks, walk_geometry)): shared by every workspace
+    # (and by workspace=None calls); they hold this context only weakly
+    _table_sets: dict = dataclasses.field(default_factory=dict, repr=False)
+    _uploads: list = dataclasses.field(
+        default_factory=list, repr=False
+    )  # KcpUpload records, in issue order
+    _waited: dict = dataclasses.field(
+        default_factory=dict, repr=False
+    )  # stream handle -> number of records ordered on it
+    _lazy: dict = dataclasses.field(
+        default_factory=dict, repr=False
+    )  # tables uploaded on first read (frag_table)
 
     @property
     def fragments(self) -> tuple[KcpFragment, ...]:
         return self.partition.fragments[self.rank]
+
+    @property
+    def frag_table(self) -> torch.Tensor:
+        """int32 ``[n_frag, 4]`` ``(doc, off, len, flags)`` on the context's device, uploaded at its first read (no
+        kernel reads it)."""
+        t = self._lazy.get("frag_table")
+        if t is None:
+            t = self._lazy["frag_table"] = self.upload_tables(
+                {
+                    "frag_table": (
+                        [list(r) for r in self.frag_rows],
+                        torch.int32,
+                        (self.n_frag, 4),
+                    )
+                }
+            )["frag_table"]
+        return t
+
+    def upload_tables(
+        self, specs: dict[str, tuple], device=None, *, stream=None, record: bool = True
+    ) -> dict[str, torch.Tensor]:
+        """Device copies of host-built tables of this context (``name -> (values, dtype, shape)``, see
+        :func:`_upload_tables`): one pinned non-blocking copy on ``stream`` (default: the current stream), recorded
+        for :meth:`wait_ready` (``record``: tables that live as long as the context -- its own, its head plans', its
+        table sets'; the record holds the blob); under the ``upload="blocking"`` test knob the previous per-table
+        pageable copies."""
+        device = self.device if device is None else torch.device(device)
+        if self.upload == "blocking":
+            return _upload_blocking(specs, device)
+        out, rec = _upload_tables(specs, device, stream=stream)
+        if rec is not None and record:
+            self._uploads.append(rec)
+        return out
+
+    @property
+    def ready(self):
+        """The CUDA event recorded after the context's own tables were copied (``None`` on a non-CUDA device or under
+        the ``upload="blocking"`` knob)."""
+        return self._uploads[0].ready if self._uploads else None
+
+    def wait_ready(self, stream=None) -> None:
+        """Order every upload of this context before the later work of ``stream`` (default: the current stream of
+        the context's device), without blocking the host: once per (upload, stream), ``stream.wait_event`` on the
+        upload's event plus ``record_stream`` of its blob for an upload made on another stream; nothing for an upload
+        made on ``stream`` itself (stream order covers it) and nothing under CUDA-graph capture.  The KDA entry points
+        call it; a caller that prepares a context on another stream calls it before handing the context's tables to
+        work of its own (the conv halo entry calls it as well)."""
+        n = len(self._uploads)
+        if not n or torch.cuda.is_current_stream_capturing():
+            return
+        s = torch.cuda.current_stream(self.device) if stream is None else stream
+        key = s.cuda_stream
+        i = self._waited.get(key, 0)
+        if i >= n:
+            return
+        for rec in self._uploads[i:n]:
+            if rec.stream.cuda_stream != key:
+                s.wait_event(rec.ready)
+                rec.blob.record_stream(s)
+        self._waited[key] = n
 
     @property
     def ring_eligible(self) -> bool:
@@ -1842,6 +2058,8 @@ def build_kcp_context(
     conv_kernel_size: int = 4,
     *,
     sm_count: int | None = None,
+    heads=None,
+    stream=None,
     _kcp_test_knobs: dict | None = None,
 ) -> KcpContext:
     """The :class:`KcpContext` of ``rank`` (the KCP contract §3.1).
@@ -1858,7 +2076,17 @@ def build_kcp_context(
     ``"wave_fill1"`` = the previous rule (the fill without the tie line), ``"wave"`` = the equal-segment wave rule
     above the chain cap alone, ``"occ"`` = the occupancy rule, ``"wave_fill"`` = the unadopted fill on every rank with
     at most three fragments, kept for the A/B record); the
-    public API never selects a rule other than the default.
+    public API never selects a rule other than the default.  The knobs ``upload="blocking"`` / ``table_cache="workspace"``
+    keep the previous pageable per-table copies / the per-workspace table-set cache (A/B record, negative control).
+
+    Host synchronization: the context's device tables (``tables``, ``halo_tables``, ``cu_seqlens_local``) are copied
+    in ONE pinned non-blocking copy on ``stream`` (default: the current stream of ``device``), so the host never waits
+    for device work queued before it -- a pack can be prepared while the previous one runs.  ``heads`` (an int or a
+    sequence of ints) also derives the head plans of those head counts here (host work only; their device tables are
+    uploaded only when read).  The tables are valid for work enqueued on ``stream`` after this call; for another
+    stream ``S`` call ``ctx.wait_ready(S)`` (the KDA and conv halo entry points call ``ctx.wait_ready()`` on their
+    current stream themselves).  A thread other than the one that runs the pack must pass ``stream`` (the current
+    stream is per thread).  Not under CUDA-graph capture (``RuntimeError``).
     """
     if not isinstance(part, KcpPartition):
         raise TypeError(
@@ -1890,7 +2118,32 @@ def build_kcp_context(
     sm_count = int(sm_count)
     if sm_count < 1:
         raise ValueError(f"build_kcp_context: sm_count must be >= 1, got {sm_count}")
-    p_rule = validate_test_knobs(_kcp_test_knobs)["p_rule"]
+    knobs = _kcp_test_knobs
+    upload, table_cache = UPLOAD_DEFAULT, TABLE_CACHE_DEFAULT
+    if isinstance(knobs, dict) and ("upload" in knobs or "table_cache" in knobs):
+        if not test_knobs_enabled():
+            raise ValueError(
+                f"_kcp_test_knobs is a private test hook: it is accepted only after {ENABLE_TEST_KNOBS}"
+            )
+        knobs = dict(knobs)
+        upload = str(knobs.pop("upload", UPLOAD_DEFAULT))
+        table_cache = str(knobs.pop("table_cache", TABLE_CACHE_DEFAULT))
+        if upload not in UPLOADS:
+            raise ValueError(
+                f"_kcp_test_knobs: upload must be one of {UPLOADS}, got {upload!r}"
+            )
+        if table_cache not in TABLE_CACHES:
+            raise ValueError(
+                f"_kcp_test_knobs: table_cache must be one of {TABLE_CACHES}, got {table_cache!r}"
+            )
+    p_rule = validate_test_knobs(knobs)["p_rule"]
+    head_counts: tuple[int, ...] = (
+        ()
+        if heads is None
+        else (int(heads),)
+        if isinstance(heads, int)
+        else tuple(int(h) for h in heads)
+    )
     mine = part.fragments[rank]
     n_frag = len(mine)
     if n_frag > MAX_FRAGS:
@@ -1925,38 +2178,49 @@ def build_kcp_context(
     tables_cpu = chunk_tables(local_cu)
     nc_max, nc_pad, rows = chunk_geometry(T_r, n_frag)
     i32 = torch.int32
-    tables = {
-        name: torch.tensor(list(values), dtype=i32, device=device)
-        for name, values in tables_cpu.items()
-    }
     flags = [
         (FLAG_CROSSING_IN if f.crossing_in else 0)
         | (FLAG_CROSSING_OUT if f.crossing_out else 0)
         | (FLAG_CONTINUING if (f.length > 0 and f.off > 0) else 0)
         for f in mine
     ]
-    frag_rows = [
-        [f.doc, f.off, f.length, fl] for f, fl in zip(mine, flags, strict=True)
-    ]
-    frag_table = torch.tensor(frag_rows, dtype=i32, device=device).reshape(n_frag, 4)
+    frag_rows = tuple(
+        (f.doc, f.off, f.length, fl) for f, fl in zip(mine, flags, strict=True)
+    )
     halo_plan = _halo_plan(part, rank, halo, local_cu)
-    halo_tables = {
-        "hist_row_off": torch.tensor(
-            [list(r) for r in halo_plan.hist_row_off], dtype=i32, device=device
-        ).reshape(n_frag, halo),
-        "tail_row_off": torch.tensor(
-            [list(r) for r in halo_plan.tail_row_off], dtype=i32, device=device
-        ).reshape(n_frag, halo),
-        "head_row_off": torch.tensor(
-            [[list(c) for c in r] for r in halo_plan.head_row_off],
-            dtype=i32,
-            device=device,
-        ).reshape(n_frag, halo, halo),
-        "hist_index": torch.tensor(
-            list(halo_plan.hist_index), dtype=torch.int64, device=device
-        ),
+    # the tables the token-side stages and the conv halo read: one upload (the frag_table has no reader: on first read)
+    specs: dict[str, tuple] = {
+        name: (values, i32, None) for name, values in tables_cpu.items()
     }
-    return KcpContext(
+    specs.update(
+        hist_row_off=(
+            [list(r) for r in halo_plan.hist_row_off],
+            i32,
+            (n_frag, halo),
+        ),
+        tail_row_off=(
+            [list(r) for r in halo_plan.tail_row_off],
+            i32,
+            (n_frag, halo),
+        ),
+        head_row_off=(
+            [[list(c) for c in r] for r in halo_plan.head_row_off],
+            i32,
+            (n_frag, halo, halo),
+        ),
+        hist_index=(list(halo_plan.hist_index), torch.int64, None),
+        cu_seqlens_local=(list(local_cu), i32, None),
+    )
+    if upload == "blocking":
+        dev_tables, rec = _upload_blocking(specs, device), None
+    else:
+        dev_tables, rec = _upload_tables(specs, device, stream=stream)
+    tables = {name: dev_tables[name] for name in tables_cpu}
+    halo_tables = {
+        name: dev_tables[name]
+        for name in ("hist_row_off", "tail_row_off", "head_row_off", "hist_index")
+    }
+    ctx = KcpContext(
         partition=part,
         rank=rank,
         world_size=W,
@@ -1968,8 +2232,8 @@ def build_kcp_context(
         T_r=T_r,
         n_frag=n_frag,
         cu_seqlens_local_cpu=local_cu,
-        cu_seqlens_local=torch.tensor(list(local_cu), dtype=i32, device=device),
-        frag_table=frag_table,
+        cu_seqlens_local=dev_tables["cu_seqlens_local"],
+        frag_rows=frag_rows,
         in_slot=in_slot_all[rank],
         out_slot=out_slot_all[rank],
         n_in=n_in_by[rank],
@@ -1994,7 +2258,16 @@ def build_kcp_context(
         tables=tables,
         halo=halo_plan,
         halo_tables=halo_tables,
+        upload=upload,
+        table_cache=table_cache,
     )
+    if rec is not None:
+        ctx._uploads.append(rec)
+    if upload == "blocking":  # the previous path: every table at preparation
+        ctx.frag_table  # noqa: B018
+    for H in head_counts:
+        ctx.heads(H)
+    return ctx
 
 
 # ----------------------------------------------------------------------------------------------------------------

@@ -2185,35 +2185,35 @@ class Chains:
                     f"Chains: {name} holds an offset that is not a multiple of 4 floats"
                 )
 
-    def device_tables(self, device: str) -> dict[str, torch.Tensor]:
+    def device_tables(
+        self, device: str, upload: Any | None = None
+    ) -> dict[str, torch.Tensor]:
         """Trimmed host path: the six device tables of the K4 launch (``chain_start`` int32; ``elem_m`` / ``elem_c`` / ``elem_y`` /
         ``x0_index`` / ``y_final`` int64; an empty element table holds one 0 so the kernel has a valid pointer -- the
         same tensors :func:`cake_kcp_jit._chain_tables` builds), cached on the chain set per device.  The tables are
-        frozen once the launches start (``_Tables`` builds them once per ``(ctx, H)``)."""
+        frozen once the launches start (``_Tables`` builds them once per ``(ctx, H)``).  ``upload`` (the table set's
+        :meth:`_Tables.upload_specs`) copies the six in one asynchronous pinned copy; without it one
+        ``torch.tensor(..., device=)`` each."""
         cache = self.__dict__.setdefault("_dev_tables", {})
         t = cache.get(device)
         if t is None:
             pad = lambda table: table if table else [0]  # noqa: E731
-            t = cache[device] = {
-                "chain_start": torch.tensor(
-                    list(self.chain_start), dtype=torch.int32, device=device
-                ),
-                "elem_m": torch.tensor(
-                    pad(list(self.elem_m)), dtype=torch.int64, device=device
-                ),
-                "elem_c": torch.tensor(
-                    pad(list(self.elem_c)), dtype=torch.int64, device=device
-                ),
-                "elem_y": torch.tensor(
-                    pad(list(self.elem_y)), dtype=torch.int64, device=device
-                ),
-                "x0_index": torch.tensor(
-                    list(self.x0_index), dtype=torch.int64, device=device
-                ),
-                "y_final": torch.tensor(
-                    list(self.y_final), dtype=torch.int64, device=device
-                ),
+            i32, i64 = torch.int32, torch.int64
+            specs: dict[str, tuple] = {
+                "chain_start": (list(self.chain_start), i32, None),
+                "elem_m": (pad(list(self.elem_m)), i64, None),
+                "elem_c": (pad(list(self.elem_c)), i64, None),
+                "elem_y": (pad(list(self.elem_y)), i64, None),
+                "x0_index": (list(self.x0_index), i64, None),
+                "y_final": (list(self.y_final), i64, None),
             }
+            if upload is not None:
+                t = cache[device] = upload(specs, device)
+            else:
+                t = cache[device] = {
+                    name: torch.tensor(values, dtype=dtype, device=device)
+                    for name, (values, dtype, _shape) in specs.items()
+                }
         return t
 
     @classmethod
@@ -2257,7 +2257,10 @@ def _prefix(values) -> list[int]:
 class _Tables:
     """Everything the launch sequences read for one ``(ctx, H)``: the segment plan, walk lists, the compact tile
     tables of every pool, the collective splits and the K4 chains, derived once from ``cake_kcp_plan.KcpContext`` /
-    ``KcpHeadPlan`` and cached by the workspace (the design note §7.2, §10.3, §14.4).
+    ``KcpHeadPlan`` and cached on the context (``ctx._table_sets``, shared by every workspace; the test knob
+    ``table_cache="workspace"`` keeps the previous per-workspace cache) (the design note §7.2, §10.3, §14.4).  The set
+    holds the context weakly; a table it copies to the device at first use costs one asynchronous pinned copy
+    (:meth:`upload_specs`).
 
     Pools (tile = 16384 floats; tile numbers pool-relative): ``c1_send`` = owner-major ``(out_slot, head)`` pairs
     ``[B_f | M_f^T]`` (B tile ``2 t``, M tile ``2 t + 1`` of ``hp.out_tile[out_slot][h] = t``); ``S_in`` (the c2
@@ -2275,6 +2278,8 @@ class _Tables:
     """
 
     _ring: _Ring | None = None  # the ring-exchange tables, derived on first use
+    # held by the context's table-set cache (KcpWorkspace.tables)
+    on_context: bool = False
 
     def __init__(
         self,
@@ -2284,7 +2289,10 @@ class _Tables:
         fused_walks: int = FUSED_WALKS_DEFAULT,
         walk_geometry: str = WALK_GEOMETRY_DEFAULT,
     ) -> None:
-        self.ctx = ctx
+        try:  # the context owns its table sets (ctx._table_sets): no reference cycle, refcount frees both
+            self.ctx = weakref.proxy(ctx)
+        except TypeError:  # a context type without weak references
+            self.ctx = ctx
         self.H = H = int(H)
         self.fused_walks = int(
             fused_walks
@@ -2849,9 +2857,37 @@ class _Tables:
         t = cache.get(key)
         if t is None:
             flat = [int(x) for row in tiles for x in row]
-            t = torch.tensor(flat, dtype=torch.int64, device=device)
+            t = self.upload(flat, torch.int64, device)
             cache[key] = t
         return t
+
+    def upload_specs(
+        self, specs: dict[str, tuple], device: torch.device | str
+    ) -> dict[str, torch.Tensor]:
+        """Device copies of tables of this set (``name -> (values, dtype, shape)``) in one pinned non-blocking copy
+        on the current stream, recorded on the context for its ``wait_ready`` (the context's ``upload="blocking"``
+        knob keeps the previous pageable per-table copies).  Never a host synchronization: a table-set miss of a
+        call costs one asynchronous copy."""
+        up = getattr(self.ctx, "upload_tables", None)
+        if up is None:  # a duck-typed context: the same copy, unrecorded
+            return cake_kcp_plan._upload_tables(specs, device)[0]
+        # recorded for ctx.wait_ready only when this set lives as long as the context (its own table-set cache);
+        # a set of the table_cache="workspace" knob may be rebuilt per call and must not accumulate records
+        return up(specs, device, record=self.on_context)
+
+    def upload(
+        self, values: Sequence[int], dtype: torch.dtype, device: torch.device | str
+    ) -> torch.Tensor:
+        """One flat table of this set on the device (:meth:`upload_specs`)."""
+        return self.upload_specs({"t": (values, dtype, None)}, device)["t"]
+
+    def absent_index(self, device: torch.device | str) -> torch.Tensor:
+        """Trimmed host path: the slot table of an absent pool (``NSEG`` entries of ``-1``), one device copy per
+        table set and device (the untrimmed path keeps the process cache of ``cake_kcp_jit``)."""
+        lst = self.__dict__.get("_absent")
+        if lst is None:
+            lst = self._absent = [-1] * self.NSEG
+        return self.dev_list(lst, device)
 
     @functools.cached_property
     def walk_all_p0(self) -> list[int]:
@@ -2888,7 +2924,7 @@ class _Tables:
         hit = cache.get(key)
         if hit is not None and hit[0] is values:
             return hit[1]
-        t = torch.tensor([int(v) for v in values], dtype=dtype, device=device)
+        t = self.upload([int(v) for v in values], dtype, device)
         cache[key] = (values, t)
         return t
 
@@ -2916,7 +2952,7 @@ class _Tables:
             H=int(H),
             addr=addr,
             device=str(device),
-            dev_index=torch.tensor(list(index_t), dtype=torch.int32, device=device),
+            dev_index=self.upload(list(index_t), torch.int32, device),
         )
         cache[key] = (index, tiles, meta)
         return meta
@@ -3057,11 +3093,19 @@ class KcpWorkspace:
         fused_walks: int = FUSED_WALKS_DEFAULT,
         walk_geometry: str = WALK_GEOMETRY_DEFAULT,
     ) -> _Tables:
-        key = (ctx, int(H), int(fused_walks), str(walk_geometry))
-        tb = self._tables.get(key)
+        key: tuple = (int(H), int(fused_walks), str(walk_geometry))
+        sets = getattr(ctx, "_table_sets", None)
+        if (
+            sets is None
+            or getattr(ctx, "table_cache", cake_kcp_plan.TABLE_CACHE_DEFAULT)
+            != "context"
+        ):  # a duck-typed context, or the table_cache="workspace" knob: the previous per-workspace cache
+            sets, key = self._tables, (ctx, *key)
+        tb = sets.get(key)
         if tb is None:
             tb = _Tables(ctx, H, fused_walks=fused_walks, walk_geometry=walk_geometry)
-            self._tables[key] = tb
+            tb.on_context = sets is not self._tables
+            sets[key] = tb
         return tb
 
     def ensure(
@@ -4780,6 +4824,10 @@ def _prepare(
         raise ValueError(
             f"workspace state dtype {workspace.state_dtype} differs from the backend's {backend.dtypes['state']}"
         )
+    wait_ready = getattr(ctx, "wait_ready", None)
+    # a context prepared on another stream: order its uploads on this one (enqueue only)
+    if wait_ready is not None:
+        wait_ready()
     tb = workspace.ensure(
         ctx,
         H,

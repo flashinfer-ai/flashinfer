@@ -205,6 +205,8 @@ def _context(ctx: Any, *, device: torch.device, T_r: int) -> tuple[torch.Tensor,
     """The context's local ``cu_seqlens`` (int32 device ``[n_frag + 1]``) and fragment count, checked against the
     tokens the call received."""
 
+    # tables of a context prepared on another stream: order them here
+    getattr(ctx, "wait_ready", lambda: None)()
     if int(ctx.T_r) != T_r:
         raise ValueError(
             f"x_local holds {T_r} tokens but ctx was built for T_r={int(ctx.T_r)}"
