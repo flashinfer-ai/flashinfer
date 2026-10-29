@@ -208,16 +208,23 @@ def _bad_cases():
             dict(support_offsets=off.to(torch.int16)),
             "support_offsets must be int32 or int64",
         ),
-        "M over 2^31": (
+        "M over the limit": (
             dict(
                 X=torch.zeros(4, H_HOST, dtype=torch.bfloat16, device=meta),
                 W=torch.zeros(V_HOST, H_HOST, dtype=torch.bfloat16, device=meta),
-                support_ids=torch.zeros(2**31, dtype=torch.int32, device=meta),
+                support_ids=torch.zeros(
+                    cake_support.SUPPORT_M_MAX + 1, dtype=torch.int32, device=meta
+                ),
                 support_offsets=off.to(meta),
                 k_cap=2**31,
             ),
-            "fewer than 2\\^31",
+            "at most 2\\^31 - 2\\^16",
         ),
+        "path": (dict(path="fast"), "path\\['F'\\] must be one of"),
+        "path key": (dict(path={"Z": "dense"}), "path keys must be among"),
+        "dw_mode": (dict(dw_mode="local"), "dw_mode must be one of"),
+        "vocab_block": (dict(vocab_block=300), "vocab_block must be a multiple of 256"),
+        "dw_split": (dict(dw_split=0), "dw_split must be a positive integer"),
         "k_cap 0": (dict(k_cap=0), "k_cap must be a positive integer"),
         "k_cap bool": (dict(k_cap=True), "k_cap must be a positive integer"),
         "k_cap float": (dict(k_cap=2.0), "k_cap must be a positive integer"),
@@ -343,10 +350,90 @@ def test_temperature_forms_resolve():
     assert resolve(torch.ones(0), 0, DEV)[0] == "tensor"
 
 
-def test_cake_backend_not_built():
+def test_cake_backend_needs_a_device():
     X, W, ids, off = _base()
-    with pytest.raises(NotImplementedError, match="backend='reference'"):
+    with pytest.raises(ValueError, match="use backend='reference'"):
         support_logprob(X, W, ids, off, k_cap=3, backend="cake")
+
+
+def test_huge_k_cap_is_no_cap():
+    """``k_cap`` above the int32 range (``2**40``, "no cap") equals the exact cap (the validation stage takes
+    ``min(k_cap, 2^31 - 1)``; ``K_t <= M < 2^31``)."""
+    inp = small(T=65, k_cap=8, labels=True)
+    a = run_support(inp, ("selected",))
+    b = run_support(inp, ("selected",), k_cap=2**40)
+    assert_same(a, b)
+
+
+def test_no_rows_checks_the_first_offset():
+    X = torch.zeros(0, H_HOST, dtype=torch.bfloat16)
+    W = torch.zeros(V_HOST, H_HOST, dtype=torch.bfloat16)
+    ids = torch.zeros(0, dtype=torch.int64)
+    for check_inputs in (False, True):
+        with pytest.raises(ValueError, match="at row 0: .*offsets\\[0\\]"):
+            support_logprob(
+                X,
+                W,
+                ids,
+                torch.ones(1, dtype=torch.int64),
+                k_cap=3,
+                check_inputs=check_inputs,
+                backend=REF,
+            )
+    out = support_logprob(
+        X, W, ids, torch.zeros(1, dtype=torch.int64), k_cap=3, backend=REF
+    )
+    assert out.shape == (0,)
+
+
+def test_memory_report_buckets():
+    """The memory report on host-known sizes: the sparse dW split from the partial-row budget, the measured sort
+    bytes per key, the global / chunked weight-gradient mode and the dense blocks."""
+    rep = cake_support.support_memory_report
+    T, H, V = 16384, 6144, 154880
+    budget = cake_support.SGA_PARTIAL_BUDGET_BYTES
+    for M in (65565, 2**20, 2**23):
+        r = rep(T, H, V, M, outputs=("packed", "kl"), path="sparse")
+        split = r["plan"]["dw_split"]
+        n = r["plan"]["dw_pairs"]
+        assert r["plan"]["dw_mode"] == "global" and n == M
+        assert 8 * H * -(-n // split) <= budget
+        assert (
+            split == cake_support.SGA_SPLIT_MIN
+            or 8 * H * -(-n // (split // 2)) > budget
+        )
+        assert r["sort_bytes"] == math.ceil(cake_support.SORT_BYTES_PER_KEY * n)
+        assert r["weight_gradient_storage"] == 0
+        assert r["packed_state"] == 2 * M + 4 * M + 4 * (T + 1) + 8 * T
+        assert r["total"] == sum(
+            r[k]
+            for k in (
+                "packed_state",
+                "outputs",
+                "forward_workspace",
+                "backward_workspace",
+                "weight_gradient_storage",
+                "gradients",
+            )
+        )
+    big = rep(T, H, V, 2**23 + 1, path="sparse")
+    assert big["plan"]["dw_mode"] == "chunked"
+    assert big["plan"]["dw_pairs"] == 4096 * -(-(2**23 + 1) // T)
+    assert big["weight_gradient_storage"] == 4 * V * H
+    dense = rep(T, H, V, 2**24, path="dense")
+    vb = dense["plan"]["vocab_block"]
+    assert vb % 256 == 0 and dense["plan"]["dense_chunk"] == 4096
+    assert dense["forward_workspace"] == 2 * 4096 * vb
+    assert dense["weight_gradient_storage"] == 4 * V * H  # four token chunks
+    assert rep(4096, H, V, 2**20, path="dense")["weight_gradient_storage"] == 0
+    with pytest.raises(ValueError, match="the dense X pass needs H"):
+        rep(64, 256, 512, 64, path="dense")
+    auto = rep(T, H, V, 2 * T)
+    assert (auto["plan"]["forward"], auto["plan"]["dx"], auto["plan"]["dw"]) == (
+        "sparse",
+        "sparse",
+        "sparse",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1192,13 +1279,30 @@ def test_device_assert_ends_the_context(what):
         print("NO_ASSERT", flush=True)
         """
     )
+    _expect_device_assert(script, what)
+
+
+_DEVICE_ASSERT_TEXT = {
+    "support": "invalid candidate support",
+    "first offset": "invalid candidate support",
+    "temperature": "temperature values must be positive and finite",
+}
+
+
+def _expect_device_assert(script, what):
+    """Run ``script`` in a fresh process: the queued device assertion (not a host ``ValueError``) ends it.
+
+    The failed assertion is sticky, so it surfaces at the first CUDA call that follows the assert kernel: inside
+    the entry point when a later launch of the same call reports it, else at the final synchronization."""
     proc = subprocess.run(
         [sys.executable, "-c", script], capture_output=True, text=True, timeout=600
     )
-    assert "QUEUED" in proc.stdout and "NO_ASSERT" not in proc.stdout, (
-        proc.stdout + proc.stderr
-    )
-    assert proc.returncode != 0
+    log = proc.stdout + proc.stderr
+    assert proc.returncode != 0, log
+    assert "NO_ASSERT" not in proc.stdout, log
+    assert "ValueError" not in proc.stderr, log
+    assert "device-side assert triggered" in proc.stderr, log
+    assert _DEVICE_ASSERT_TEXT[what] in proc.stderr, log
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
@@ -1215,3 +1319,437 @@ def test_device_reference_matches_oracle():
     )
     check_gates(inp, ("packed", "kl"))
     check_gates(inp, ("selected",))
+
+
+# ---------------------------------------------------------------------------
+# Cake backend (the generated kernels; CUDA, compute capability 10.0 / 10.3)
+# ---------------------------------------------------------------------------
+
+CUDA = torch.device("cuda")
+# pass forms of the cake backend: the host rule, every pass sparse, every pass dense (one vocabulary block and
+# 256-column blocks)
+CAKE_FORMS = {
+    "auto": {},
+    "sparse": dict(path="sparse"),
+    "dense": dict(path="dense"),
+    "dense vb256": dict(path="dense", vocab_block=256),
+}
+
+
+def _require_cake():
+    if not torch.cuda.is_available():
+        pytest.skip("requires a CUDA device")
+    if not cake_support.support_program_available(CUDA):
+        pytest.skip("the candidate-support programs are not registered for this device")
+
+
+def cuda_inputs(T, **kw):
+    """A problem on the device; ``H`` defaults to 512 (the dense dX / dW form needs whole 512-column items)."""
+    kw.setdefault("seed", SEED)
+    kw.setdefault("H", 512)
+    return make_support_inputs(T, device="cuda", **kw)
+
+
+def _cuda_with_tau(inp, temperature):
+    inp2 = cuda_inputs(
+        inp.T,
+        seed=inp.seed,
+        H=inp.H,
+        V=inp.V,
+        k_cap=inp.k_cap,
+        labels=True,
+        teacher=True,
+    )
+    inp2.temperature = temperature
+    return inp2
+
+
+def _numeric_case(case, H=512):
+    outputs, mk, kw = NUMERIC_CASES[case]
+    mk = dict(mk)
+    inp = cuda_inputs(mk.pop("T"), H=H, **mk)
+    if case == "selected strided X":
+        padded = torch.zeros(inp.T, inp.H + 64, dtype=torch.bfloat16, device=CUDA)
+        padded[:, : inp.H] = inp.X
+        inp.X = padded[:, : inp.H]
+    return inp, outputs, kw
+
+
+@pytest.mark.parametrize("form", sorted(CAKE_FORMS))
+@pytest.mark.parametrize("case", sorted(NUMERIC_CASES))
+def test_cake_numerics_against_oracle(case, form):
+    """Every output and both gradients of the cake backend pass the gate against the FP64 oracle (each pass form
+    forced and the host rule), and a rerun is bitwise equal."""
+    _require_cake()
+    inp, outputs, kw = _numeric_case(case)
+    kw = dict(kw, backend="cake", **CAKE_FORMS[form])
+    res, _, _ = check_gates(inp, outputs, **kw)
+    assert_same(res, run_support(inp, outputs, **kw))
+
+
+@pytest.mark.parametrize(
+    "dw", [("global", None), ("global", 16), ("chunked", None), ("chunked", 16)]
+)
+@pytest.mark.parametrize(
+    "case", ["kl+packed heavy constant", "selected heavy hetero", "kl two chunks"]
+)
+def test_cake_sparse_weight_gradient_modes(case, dw):
+    """The sparse dW in the global (BF16 store) and chunked (FP32 pair ranges) modes, with the default split and a
+    split of 16 (every segment of a heavy id cut into parts and summed in part order)."""
+    _require_cake()
+    inp, outputs, kw = _numeric_case(case)
+    mode, split = dw
+    kw = dict(kw, backend="cake", path="sparse", dw_mode=mode, dw_split=split)
+    res, _, _ = check_gates(inp, outputs, **kw)
+    assert_same(res, run_support(inp, outputs, **kw))
+
+
+@pytest.mark.parametrize("form", ["sparse", "dense vb256"])
+def test_cake_temperature_forms_bitwise(form):
+    _require_cake()
+    inp = cuda_inputs(129, k_cap=32, labels=True, teacher=True)
+    kw = dict(backend="cake", **CAKE_FORMS[form])
+    ones = torch.ones(inp.T, device=CUDA)
+    for outputs in (("selected",), ("packed", "kl")):
+        ref = run_support(_cuda_with_tau(inp, None), outputs, **kw)
+        for tau in (1.0, 1, torch.tensor(1.0), ones):
+            assert_same(ref, run_support(_cuda_with_tau(inp, tau), outputs, **kw))
+        for s in (0.5, 0.7, 1.3):
+            full = torch.full((inp.T,), s, device=CUDA)
+            assert_same(
+                run_support(_cuda_with_tau(inp, s), outputs, **kw),
+                run_support(_cuda_with_tau(inp, full), outputs, **kw),
+            )
+
+
+@pytest.mark.parametrize("form", ["sparse", "dense vb256"])
+def test_cake_frozen_inputs_and_retain_graph(form):
+    """One-sided gradients equal the two-sided ones bitwise; a retained graph's second backward equals the first."""
+    _require_cake()
+    inp = cuda_inputs(200, k_cap=16, teacher=True, tau_form="hetero")
+    kw = dict(backend="cake", **CAKE_FORMS[form])
+    both = run_support(inp, ("packed", "kl"), **kw)
+    only_x = run_support(inp, ("packed", "kl"), need_dw=False, **kw)
+    only_w = run_support(inp, ("packed", "kl"), need_dx=False, **kw)
+    assert torch.equal(only_x["dX"].view(torch.int16), both["dX"].view(torch.int16))
+    assert torch.equal(only_w["dW"].view(torch.int16), both["dW"].view(torch.int16))
+    X = inp.X.detach().requires_grad_(True)
+    W = inp.W.detach().requires_grad_(True)
+    kl, logp = support_kl(
+        X,
+        W,
+        inp.support_ids,
+        inp.support_offsets,
+        inp.teacher,
+        return_logprobs=True,
+        **inp.kwargs(),
+        **kw,
+    )
+    torch.autograd.backward([kl, logp], [inp.e, inp.g], retain_graph=True)
+    first = (X.grad.clone(), W.grad.clone())
+    X.grad = W.grad = None
+    torch.autograd.backward([kl, logp], [inp.e, inp.g])
+    assert torch.equal(first[0].view(torch.int16), X.grad.view(torch.int16))
+    assert torch.equal(first[1].view(torch.int16), W.grad.view(torch.int16))
+
+
+@pytest.mark.parametrize("form", ["sparse", "dense vb256"])
+def test_cake_nan_upstream_on_inactive_entries(form):
+    _require_cake()
+    inp = cuda_inputs(129, k_cap=8, labels=True, teacher=True)
+    kw = dict(backend="cake", **CAKE_FORMS[form])
+    lab = inp.labels != IGNORE_INDEX
+    small_row = inp.counts <= 1
+    pair_small = small_row[
+        torch.repeat_interleave(torch.arange(inp.T, device=CUDA), inp.counts)
+    ]
+    d_nan = torch.where(lab, inp.d, torch.full_like(inp.d, math.nan))
+    d_zero = torch.where(lab, inp.d, torch.zeros_like(inp.d))
+    assert_same(
+        run_support(inp, ("selected",), upstream=dict(selected=d_nan), **kw),
+        run_support(inp, ("selected",), upstream=dict(selected=d_zero), **kw),
+    )
+    e_nan = torch.where(small_row, torch.full_like(inp.e, math.nan), inp.e)
+    e_zero = torch.where(small_row, torch.zeros_like(inp.e), inp.e)
+    g_nan = torch.where(pair_small, torch.full_like(inp.g, math.nan), inp.g)
+    g_zero = torch.where(pair_small, torch.zeros_like(inp.g), inp.g)
+    a = run_support(inp, ("packed", "kl"), upstream=dict(packed=g_nan, kl=e_nan), **kw)
+    b = run_support(
+        inp, ("packed", "kl"), upstream=dict(packed=g_zero, kl=e_zero), **kw
+    )
+    assert bool(torch.isfinite(a["dX"].float()).all())
+    assert bool(torch.isfinite(a["dW"].float()).all())
+    assert_same(a, b)
+
+
+@pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("offsets_dtype", [torch.int32, torch.int64])
+def test_cake_index_dtypes_bitwise(ids_dtype, offsets_dtype):
+    """Every (ids, offsets) dtype pair runs its own validation program and gives the same bits."""
+    _require_cake()
+    inp = cuda_inputs(150, k_cap=16, labels=True, teacher=True, tau_form="hetero")
+    ref = run_support(inp, ("packed", "kl"), backend="cake")
+    ref_sel = run_support(inp, ("selected",), backend="cake")
+    inp.support_ids = inp.support_ids.to(ids_dtype)
+    inp.support_offsets = inp.support_offsets.to(offsets_dtype)
+    assert_same(ref, run_support(inp, ("packed", "kl"), backend="cake"))
+    assert_same(ref_sel, run_support(inp, ("selected",), backend="cake"))
+
+
+@pytest.mark.parametrize("pad", [64, 3])
+@pytest.mark.parametrize("form", ["sparse", "dense vb256"])
+def test_cake_strided_x_bitwise(pad, form):
+    """A row view of X (pitch H + 64: read in place; pitch H + 3: not a 16-byte pitch, copied once) gives the bits
+    of the contiguous X."""
+    _require_cake()
+    inp = cuda_inputs(130, k_cap=16, labels=True)
+    kw = dict(backend="cake", **CAKE_FORMS[form])
+    ref = run_support(inp, ("selected",), **kw)
+    padded = torch.zeros(inp.T, inp.H + pad, dtype=torch.bfloat16, device=CUDA)
+    padded[:, : inp.H] = inp.X
+    inp.X = padded[:, : inp.H]
+    assert cake_support._x_copied(inp.X) == (pad == 3)
+    assert_same(ref, run_support(inp, ("selected",), **kw))
+
+
+def test_cake_huge_k_cap_is_no_cap():
+    _require_cake()
+    inp = cuda_inputs(65, k_cap=8, labels=True)
+    assert_same(
+        run_support(inp, ("selected",), backend="cake"),
+        run_support(inp, ("selected",), backend="cake", k_cap=2**40),
+    )
+
+
+def test_cake_dense_needs_whole_items():
+    _require_cake()
+    inp = cuda_inputs(16, H=256, k_cap=8)
+    with pytest.raises(ValueError, match="the dense X pass needs H"):
+        run_support(inp, ("packed",), backend="cake", path="dense")
+    # the dense forward alone runs at any H
+    check_gates(inp, ("packed",), backend="cake", path={"F": "dense"})
+
+
+def test_cake_empty_calls():
+    _require_cake()
+    W = torch.randn(V_HOST, H_HOST, device=CUDA).to(torch.bfloat16).requires_grad_()
+    X0 = torch.zeros(0, H_HOST, dtype=torch.bfloat16, device=CUDA, requires_grad=True)
+    ids0 = torch.zeros(0, dtype=torch.int64, device=CUDA)
+    off0 = torch.zeros(1, dtype=torch.int64, device=CUDA)
+    kl, logp = support_kl(
+        X0,
+        W,
+        ids0,
+        off0,
+        torch.zeros(0, device=CUDA),
+        k_cap=4,
+        return_logprobs=True,
+        backend="cake",
+    )
+    assert kl.shape == (0,) and logp.shape == (0,)
+    (kl.sum() + logp.sum()).backward()
+    assert X0.grad.shape == (0, H_HOST) and not W.grad.any()
+    W.grad = None
+    X = torch.randn(3, H_HOST, device=CUDA).to(torch.bfloat16).requires_grad_()
+    off = torch.zeros(4, dtype=torch.int64, device=CUDA)
+    lab = torch.full((3,), IGNORE_INDEX, device=CUDA)
+    sel = support_logprob(X, W, ids0, off, lab, k_cap=4, backend="cake")
+    assert torch.equal(sel, torch.zeros(3, device=CUDA))
+    sel.sum().backward()
+    assert not X.grad.any() and not W.grad.any()
+    with pytest.raises(ValueError, match="at row 1: the row has an empty support"):
+        support_logprob(
+            X,
+            W,
+            ids0,
+            off,
+            torch.tensor([-100, 4, -100], device=CUDA),
+            k_cap=4,
+            check_inputs=True,
+            backend="cake",
+        )
+
+
+@pytest.mark.parametrize(
+    "case", sorted(c for c, v in K1_CASES.items() if v[4] is not None)
+)
+def test_cake_support_check_raises(case):
+    """``check_inputs=True``: the validation kernel's word names the rule and the row the reference names."""
+    _require_cake()
+    ids, off, labels, k_cap, (code, row) = K1_CASES[case]
+    T = len(off) - 1
+    X = torch.zeros(T, H_HOST, dtype=torch.bfloat16, device=CUDA)
+    W = torch.zeros(V_HOST, H_HOST, dtype=torch.bfloat16, device=CUDA)
+    rule = cake_support.SUPPORT_ERRORS[code][1]
+    for dtype in (torch.int64, torch.int32):
+        lab = None if labels is None else torch.tensor(labels, device=CUDA)
+        with pytest.raises(ValueError, match=re.escape(f"at row {row}: {rule}")):
+            support_logprob(
+                X,
+                W,
+                torch.tensor(ids, dtype=dtype, device=CUDA),
+                torch.tensor(off, dtype=dtype, device=CUDA),
+                lab,
+                k_cap=k_cap,
+                check_inputs=True,
+                backend="cake",
+            )
+
+
+@pytest.mark.parametrize("what", ["support", "temperature", "first offset"])
+def test_cake_device_assert_ends_the_context(what):
+    """``check_inputs=False``: no readback; the queued device assertion fails the stream."""
+    _require_cake()
+    script = textwrap.dedent(
+        f"""
+        import torch
+        from tests.test_helpers.cake_package import cake_package
+        cs = cake_package("cake_lm_head_loss", "cake_support")
+        T = 0 if "{what}" == "first offset" else 4
+        X = torch.zeros(T, 256, dtype=torch.bfloat16, device="cuda")
+        W = torch.zeros(512, 256, dtype=torch.bfloat16, device="cuda")
+        ids = torch.tensor([1, 2, 3, 4][:T], dtype=torch.int64, device="cuda")
+        off = {{"support": [0, 4, 4, 4, 4], "temperature": [0, 1, 2, 3, 4], "first offset": [3]}}["{what}"]
+        off = torch.tensor(off, device="cuda")
+        tau = torch.tensor([1.0, 0.0, 1.0, 1.0], device="cuda") if "{what}" == "temperature" else 1.0
+        out = cs.chunked_lm_head_support_logprob(X, W, ids, off, k_cap=2, temperature=tau, backend="cake")
+        print("QUEUED", flush=True)
+        torch.cuda.synchronize()
+        print("NO_ASSERT", flush=True)
+        """
+    )
+    _expect_device_assert(script, what)
+
+
+@pytest.mark.parametrize("form", ["sparse", "dense vb256"])
+def test_cake_does_not_synchronize(form):
+    """``check_inputs=False``: forward and backward run without a host synchronization."""
+    _require_cake()
+    inp = cuda_inputs(300, k_cap=32, teacher=True, tau_form="hetero")
+    kw = dict(backend="cake", **CAKE_FORMS[form])
+    run_support(inp, ("packed", "kl"), **kw)  # load the programs
+    X = inp.X.detach().requires_grad_(True)
+    W = inp.W.detach().requires_grad_(True)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        kl, logp = support_kl(
+            X,
+            W,
+            inp.support_ids,
+            inp.support_offsets,
+            inp.teacher,
+            return_logprobs=True,
+            **inp.kwargs(),
+            **kw,
+        )
+        torch.autograd.backward([kl, logp], [inp.e, inp.g])
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
+    assert bool(torch.isfinite(X.grad.float()).all())
+
+
+@pytest.mark.parametrize("form", ["sparse", "dense", "sparse chunked"])
+def test_cake_step_peak_within_memory_report(form):
+    """The device bytes a training step allocates above the inputs stay within :func:`support_memory_report`."""
+    _require_cake()
+    T, H, V = 2048, 512, 8192
+    inp = cuda_inputs(T, V=V, k_cap=64, teacher=True)
+    kw = dict(backend="cake")
+    if form == "sparse chunked":
+        kw.update(path="sparse", dw_mode="chunked", chunk_size=512)
+    else:
+        kw.update(path=form)
+    arch = cake_backend.arch_for(CUDA)
+    report = cake_support.support_memory_report(
+        T,
+        H,
+        V,
+        inp.M,
+        outputs=("packed", "kl"),
+        ids_dtype=inp.support_ids.dtype,
+        arch=arch,
+        chunk_size=kw.get("chunk_size"),
+        path=kw["path"],
+        dw_mode=kw.get("dw_mode", "auto"),
+    )
+    run_support(inp, ("packed", "kl"), **kw)  # load the programs and the constants
+    X = inp.X.detach().requires_grad_(True)
+    W = inp.W.detach().requires_grad_(True)
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    base = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    kl, logp = support_kl(
+        X,
+        W,
+        inp.support_ids,
+        inp.support_offsets,
+        inp.teacher,
+        return_logprobs=True,
+        **inp.kwargs(),
+        **kw,
+    )
+    torch.autograd.backward([kl, logp], [inp.e, inp.g])
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() - base
+    assert peak <= report["total"] + 8 * 2**20, (peak, report)
+
+
+def test_cake_replay_uses_the_recorded_support():
+    _require_cake()
+    T, V, H = 96, V_HOST, 512
+    base = cuda_inputs(T, H=H, V=V, k_cap=16, x_scale=4.0)
+    ids, off = topp_support(base.X, base.W, p=0.9, k_cap=16)
+    gen = torch.Generator().manual_seed(SEED + 5)
+    W1 = (
+        base.W.float().cpu() + 0.5 * torch.randn(V, H, generator=gen) / math.sqrt(H)
+    ).to(torch.bfloat16)
+    rec = cuda_inputs(T, H=H, V=V, k_cap=16, W=W1.to(CUDA), x_scale=4.0)
+    rec.support_ids, rec.support_offsets = ids.to(CUDA), off.to(CUDA)
+    rec.g = (torch.randn(int(ids.numel()), generator=gen) * 0.05).to(CUDA)
+    for form in ("sparse", "dense vb256"):
+        check_gates(rec, ("packed",), backend="cake", **CAKE_FORMS[form])
+
+
+def test_public_support_entries():
+    """The public entries are experimental, serve the cake backend only and pass every argument through."""
+    import inspect
+
+    import flashinfer.chunked_lm_head as public
+
+    for name in ("chunked_lm_head_support_logprob", "chunked_lm_head_support_kl"):
+        fn = getattr(public, name)
+        assert fn.is_experimental is True
+        assert "SM100" in fn.__doc__
+        inner = inspect.signature(getattr(cake_support, name)).parameters
+        outer = inspect.signature(fn).parameters
+        knobs = {"path", "dw_mode", "vocab_block", "dw_split"}
+        assert set(outer) == set(inner) - knobs, name
+        for p in outer:
+            assert outer[p].default == inner[p].default, (name, p)
+    X, W, ids, off = _base()
+    with pytest.raises(ValueError, match="backend"):
+        public.chunked_lm_head_support_logprob(X, W, ids, off, k_cap=3, backend=REF)
+    with pytest.raises(ValueError, match="use backend='reference'"):
+        public.chunked_lm_head_support_logprob(X, W, ids, off, k_cap=3)
+
+
+def test_cake_public_entries_match_the_backend():
+    _require_cake()
+    import flashinfer.chunked_lm_head as public
+
+    inp = cuda_inputs(100, k_cap=16, labels=True, teacher=True, tau_form="hetero")
+    args = (inp.X, inp.W, inp.support_ids, inp.support_offsets)
+    a = public.chunked_lm_head_support_logprob(*args, inp.labels, **inp.kwargs())
+    b = support_logprob(*args, inp.labels, backend="cake", **inp.kwargs())
+    assert torch.equal(a.view(torch.int32), b.view(torch.int32))
+    ka, la = public.chunked_lm_head_support_kl(
+        *args, inp.teacher, return_logprobs=True, **inp.kwargs()
+    )
+    kb, lb = support_kl(
+        *args, inp.teacher, return_logprobs=True, backend="cake", **inp.kwargs()
+    )
+    assert torch.equal(ka.view(torch.int32), kb.view(torch.int32))
+    assert torch.equal(la.view(torch.int32), lb.view(torch.int32))

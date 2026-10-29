@@ -24,7 +24,7 @@ Contract
 * ``support_ids [M]`` int32 / int64 and ``support_offsets [T + 1]`` int32 / int64: the candidates of
   row ``t`` are ``support_ids[offsets[t]:offsets[t + 1]]``, ``K_t = offsets[t + 1] - offsets[t]``,
   ``offsets[0] = 0``, nondecreasing, ``offsets[T] = M``, ``0 <= K_t <= k_cap``, ids in ``[0, V)`` and
-  unique inside a row (any order; ids repeat freely across rows).  ``M < 2^31``.
+  unique inside a row (any order; ids repeat freely across rows).  ``M <= 2^31 - 2^16``.
 * Per row ``t`` with ``z_j = f32(bf16(X_t . W_{v_j}))`` (BF16 RN of an FP32 accumulation) and the
   temperature ``tau_t``: ``q_j = RN(z_j / tau_t)``, ``lse_t = log sum_j exp(q_j)`` over the row's
   candidates, ``logp_j = q_j - lse_t`` (FP32, the fixed sequence of :data:`CANONICAL_SEQUENCE`).
@@ -52,11 +52,39 @@ boundaries: the row stages follow :data:`CANONICAL_SEQUENCE` operation by operat
 ``div.rn``, exact ``fma``, the 32-lane strided sums with the xor butterfly), the projection and the
 gradient products run as BF16 x BF16 products with FP32 accumulation per token chunk of
 ``chunk_size`` rows (a development aid: it materializes a ``[chunk_size, V]`` block and is not
-allocation-free).  ``backend="cake"`` is the generated-kernel path (not built in this revision).
+allocation-free).
+
+``backend="cake"`` runs the generated kernels (SM100 / SM103, CUDA tensors), with no ``[T, V]`` or
+``[chunk, V]`` tensor in the sparse form:
+
+* the validation stage (int32 copies of int64 ids / offsets, clamped), then the logits at the support
+  ``z [M]`` (BF16): sparse = a gather GEMM over tiles of 128 consecutive pairs (the pairs' ``W`` rows
+  against their tokens' ``X`` rows), dense = the shipped logits GEMM per token chunk and vocabulary
+  block (``W[v0:v1]`` views) and a gather of the support's columns;
+* the forward row stage (one warp per row) and the backward row stage, which writes ``dz [M]`` (BF16);
+* ``dX``: sparse = one CTA per token and 1024 columns adding its pairs' ``W`` rows in pair order (rows
+  of fewer than two candidates write +0 without reading ``W``), dense = a scatter of ``dz`` into the
+  chunk's ``[chunk, vb]`` block and the shipped dX GEMM per block, blocks added in ascending order in
+  FP32, one cast per chunk;
+* ``dW``: sparse = the unique keys ``(v << 32) | p`` of the pairs (a pair of a row no upstream reaches
+  takes a sentinel row), sorted, then one CTA per key range adding the ``X`` rows of each id's pairs in
+  pair order (a long segment, an id most tokens share, is cut into parts summed in part order); the
+  BF16 ``dW`` is written directly (ids in no support stay +0) up to
+  :data:`SUPPORT_DW_GLOBAL_MAX_PAIRS` pairs, above that pair ranges of ``chunk_size * ceil(M / T)``
+  pairs accumulate into an FP32 ``[V, H]`` sum cast once; dense = the shipped weight-gradient GEMM per
+  block, accumulated in chunk order.
+
+The pass form of each pass is a host rule on host-known sizes (:data:`SUPPORT_DENSE_MIN_MEAN_K`):
+deterministic, no synchronization.  Every sum has one owner and one order (no atomics on values), so
+reruns are bitwise equal; the bits depend on the pass form, ``chunk_size``, the dense vocabulary block
+and the sparse split.  The device bytes of a step by bucket: :func:`support_memory_report`.  A token
+of two or more candidates that no upstream reaches gets ``dX = +0`` for finite ``W`` (``+0`` times its
+rows), as the reference backend does.
 """
 
 from __future__ import annotations
 
+import functools
 import math
 import operator
 from dataclasses import dataclass
@@ -71,17 +99,26 @@ from .cake_backend import (
     IGNORE_INDEX,
     Geometry,
     _assert_on_device,
+    _device_constants,
+    _eager_launch,
+    _ffi_stream_context,
     _mm_fp32,
     _resolve_temperature,
     _temperature_rows,
+    arch_for,
+    gemm_scalars,
+    record_abi,
+    record_for,
 )
+from .cake_jit import MODULES, select_module
 
 BACKENDS = ("cake", "reference")
 SUPPORT_INDEX_DTYPES = (torch.int32, torch.int64)
 # Largest vocabulary of the validation stage's per-warp shared-memory bitmap (V bits = 192 KiB at the limit).
 SUPPORT_V_MAX = 1536 * 1024
-# ``M < 2^31``: packed pair indices (label positions, CSC keys) are int32 in the kernels.
-SUPPORT_M_MAX = 2**31 - 1
+# Packed pair indices (label positions, CSC keys) are int32 in the kernels, whose 32-wide loops over a row's pairs
+# step past the end of the row: ``M <= 2^31 - 2^16`` keeps every such index and the pair tile count in int32.
+SUPPORT_M_MAX = 2**31 - 2**16
 LANES = 32  # lanes of the row stages' warp: lane l takes the row's entries l, l + 32, ... in ascending order
 _BUTTERFLY = (
     16,
@@ -271,7 +308,9 @@ def validate_support_inputs(
     _index_tensor(support_offsets, "support_offsets", T + 1)
     M = int(support_ids.numel())
     if M > SUPPORT_M_MAX:
-        raise ValueError(f"support_ids must have fewer than 2^31 entries, got {M}")
+        raise ValueError(
+            f"support_ids must have at most 2^31 - 2^16 = {SUPPORT_M_MAX} entries, got {M}"
+        )
     k_cap = _positive_int(k_cap, "k_cap")
     if T == 0 and M:
         raise ValueError("support_ids must be empty when X has no rows")
@@ -773,6 +812,969 @@ class SupportOutputs:
         return tuple(n for n in ("packed", "selected", "kl") if getattr(self, n))
 
 
+# ---------------------------------------------------------------------------
+# Cake backend: the generated support kernels and the shipped GEMMs
+# ---------------------------------------------------------------------------
+
+# The validation stage, one program per (ids dtype, offsets dtype).
+SUPPORT_CHECK_STAGES: dict[tuple[torch.dtype, torch.dtype], str] = {
+    (torch.int32, torch.int32): "support_check_ids_i32_off_i32",
+    (torch.int32, torch.int64): "support_check_ids_i32_off_i64",
+    (torch.int64, torch.int32): "support_check_ids_i64_off_i32",
+    (torch.int64, torch.int64): "support_check_ids_i64_off_i64",
+}
+# Every generated support program the cake backend launches (registered in ``cake_jit`` beside the chunked LM-head
+# programs, one translation unit per architecture each).
+SUPPORT_STAGES = (
+    *SUPPORT_CHECK_STAGES.values(),
+    "support_row_finalize",
+    "support_row_grad",
+    "support_gather_bf16",
+    "support_scatter_dz_bf16",
+    "support_logits_gather_gemm",
+    "support_sga_dx",
+    "support_sga_dw",
+    "support_sga_dw_f32_add",
+    "support_sga_combine",
+    "support_sga_combine_f32_add",
+)
+# The shipped GEMMs the dense pass form runs on row-block views ``W[v0:v1]`` (the call geometry is a launch scalar,
+# so one record serves every block width).
+SUPPORT_DENSE_STAGES = (
+    "gemm_logits_nostats",
+    "gemm_dx",
+    "gemm_dw_acc",
+    "gemm_dw_cast_bf16",
+)
+# Bits of the row finalize's ``outputs`` and of the row gradient's ``upstreams``.
+OUTPUT_BITS = {"packed": 1, "selected": 2, "kl": 4}
+# The three passes with a pass form: the forward logits ``F``, the input gradient ``X`` and the weight gradient ``W``.
+PASSES = ("F", "X", "W")
+PATHS = ("auto", "sparse", "dense")
+DW_MODES = ("auto", "global", "chunked")
+# Dispatch: pass ``P`` takes the dense form iff ``M >= K_P* x T`` (the mean support size reaches ``K_P*``), a host
+# rule on host-known sizes (no synchronization, deterministic).  PROVISIONAL per-architecture constants from the
+# kernel times measured so far (the sparse passes scale with M, the dense ones with V); they are recalibrated on a
+# separate measurement set before any performance claim.  The rule cannot see how much the rows share their
+# candidates.
+SUPPORT_DENSE_MIN_MEAN_K: dict[str, dict[str, int]] = {
+    "sm_100a": {"F": 512, "X": 1024, "W": 512},
+    "sm_103a": {"F": 512, "X": 1024, "W": 512},
+}
+# Global weight-gradient mode (one pair range, BF16 dW stored directly, no FP32 [V, H] accumulator) up to this many
+# pairs; above it the pairs are cut into ranges of ``chunk_size * ceil(M / T)`` pairs accumulated in FP32.
+SUPPORT_DW_GLOBAL_MAX_PAIRS = 2**23
+# Sparse dW: CTA key range of the segment gather-accumulate and the split of a long segment (a row many tokens share)
+# into parts of at most ``split`` pairs, each with an FP32 partial row of H floats (2 ceil(n / split) rows).  The split
+# is the smallest power of two >= SGA_SPLIT_MIN whose partial rows fit SGA_PARTIAL_BUDGET_BYTES.
+SGA_SPAN = 128
+SGA_SPLIT_MIN = 256
+SGA_PARTIAL_BUDGET_BYTES = 128 * 2**20
+# Measured device bytes per key of ``torch.sort`` on the int64 CSC keys, its outputs included (values and indices).
+SORT_BYTES_PER_KEY = 40.25
+# CSC row of a structurally zero pair (an inactive row's pairs): any row >= V sorts last and ends the walk.
+SENTINEL_ROW = 2**31 - 1
+# The validation stage takes the cap as int32; K_t <= M < 2^31, so a larger cap is exactly "no cap".
+K1_K_CAP_MAX = 2**31 - 1
+# Dense form: vocabulary block of about this many columns (a multiple of 256) and token chunks of at most
+# DENSE_CHUNK_MAX rows (the shipped GEMMs' chunk bound).
+DENSE_VOCAB_BLOCK_TARGET = 16384
+DENSE_CHUNK_MAX = 65535
+
+
+@dataclass(frozen=True)
+class SupportKnobs:
+    """Backend-level knobs of the cake backend (not public; tests and measurements force them): the pass form of each
+    pass (``"auto"`` = :data:`SUPPORT_DENSE_MIN_MEAN_K`), the weight-gradient mode, the dense vocabulary block and the
+    sparse dW split.  They enter :class:`SupportPlan` and, through its launch scalars, every remembered binding."""
+
+    path: tuple[tuple[str, str], ...] = (("F", "auto"), ("X", "auto"), ("W", "auto"))
+    dw_mode: str = "auto"
+    vocab_block: Optional[int] = None
+    dw_split: Optional[int] = None
+
+
+def _resolve_knobs(path, dw_mode, vocab_block, dw_split) -> SupportKnobs:
+    if isinstance(path, str):
+        forms = {p: path for p in PASSES}
+    elif isinstance(path, dict):
+        unknown = sorted(set(path) - set(PASSES))
+        if unknown:
+            raise ValueError(f"path keys must be among {PASSES}, got {unknown}")
+        forms = {p: path.get(p, "auto") for p in PASSES}
+    else:
+        raise ValueError(
+            f"path must be one of {PATHS} or a dict over {PASSES}, got {path!r}"
+        )
+    for p, form in forms.items():
+        if form not in PATHS:
+            raise ValueError(f"path[{p!r}] must be one of {PATHS}, got {form!r}")
+    if dw_mode not in DW_MODES:
+        raise ValueError(f"dw_mode must be one of {DW_MODES}, got {dw_mode!r}")
+    if vocab_block is not None:
+        vocab_block = _positive_int(vocab_block, "vocab_block")
+        if vocab_block % 256:
+            raise ValueError(
+                f"vocab_block must be a multiple of 256, got {vocab_block}"
+            )
+    if dw_split is not None:
+        dw_split = _positive_int(dw_split, "dw_split")
+        if dw_split > K1_K_CAP_MAX:
+            raise ValueError(f"dw_split must be below 2^31, got {dw_split}")
+    return SupportKnobs(
+        tuple((p, forms[p]) for p in PASSES), dw_mode, vocab_block, dw_split
+    )
+
+
+DEFAULT_KNOBS = SupportKnobs()
+
+
+@dataclass(frozen=True)
+class SupportPlan:
+    """Host decisions of one cake-backend call (pure functions of host-known sizes and the knobs): the pass forms, the
+    weight-gradient mode and pair range, the dense vocabulary block and token chunk, the sparse dW split override."""
+
+    arch: str
+    forward: str  # "sparse" | "dense"
+    dx: str
+    dw: str
+    dw_mode: str  # "global" | "chunked"
+    dw_pairs: int  # pairs per weight-gradient range (M in global mode)
+    vocab_block: int
+    dense_chunk: int
+    dw_split: Optional[int]
+
+
+def _dense_vocab_block(vocab: int) -> int:
+    blocks = -(-vocab // DENSE_VOCAB_BLOCK_TARGET)
+    width = -(-vocab // blocks)
+    return min(vocab, -(-width // 256) * 256)
+
+
+def _dense_dx_dw_admissible(problem: SupportProblem, geometry: Geometry) -> bool:
+    """The dense dX / dW form runs the shipped GEMMs with ``N = H``: H must hold whole work items of both."""
+    return problem.hidden % math.lcm(geometry.dx_item_cols, geometry.dw_item_cols) == 0
+
+
+@functools.lru_cache(maxsize=256)
+def make_support_plan(
+    problem: SupportProblem, arch: str, geometry: Geometry, knobs: SupportKnobs
+) -> SupportPlan:
+    """The :class:`SupportPlan` of ``problem`` on ``arch`` (remembered per argument tuple: a pure function)."""
+    T, M = problem.num_rows, problem.num_pairs
+    table = SUPPORT_DENSE_MIN_MEAN_K[arch]
+    forms = dict(knobs.path)
+    dense_ok = {"F": True, "X": _dense_dx_dw_admissible(problem, geometry)}
+    dense_ok["W"] = dense_ok["X"]
+    chosen: dict[str, str] = {}
+    for p in PASSES:
+        form = forms[p]
+        if form == "auto":
+            form = "dense" if dense_ok[p] and table[p] * T <= M else "sparse"
+        elif form == "dense" and not dense_ok[p]:
+            raise ValueError(
+                f"the dense {p} pass needs H to be a multiple of "
+                f"{math.lcm(geometry.dx_item_cols, geometry.dw_item_cols)} on {arch}, got H = {problem.hidden}"
+            )
+        chosen[p] = form
+    dw_mode = knobs.dw_mode
+    if dw_mode == "auto":
+        dw_mode = "global" if M <= SUPPORT_DW_GLOBAL_MAX_PAIRS else "chunked"
+    if dw_mode == "global":
+        dw_pairs = max(M, 1)
+    else:
+        dw_pairs = max(1, problem.chunk * -(-M // max(T, 1)))
+    vocab_block = (
+        _dense_vocab_block(problem.vocab)
+        if knobs.vocab_block is None
+        else min(knobs.vocab_block, problem.vocab)
+    )
+    return SupportPlan(
+        arch=arch,
+        forward=chosen["F"],
+        dx=chosen["X"],
+        dw=chosen["W"],
+        dw_mode=dw_mode,
+        dw_pairs=dw_pairs,
+        vocab_block=vocab_block,
+        dense_chunk=max(1, min(problem.chunk, DENSE_CHUNK_MAX)),
+        dw_split=knobs.dw_split,
+    )
+
+
+def support_split(n_keys: int, hidden: int, override: Optional[int] = None) -> int:
+    """The sparse dW split of a range of ``n_keys`` keys: ``override``, else the smallest power of two
+    ``>= SGA_SPLIT_MIN`` whose ``2 ceil(n_keys / split)`` FP32 partial rows of ``hidden`` floats fit
+    :data:`SGA_PARTIAL_BUDGET_BYTES`.  A smaller split spreads a long segment (a row most tokens share) over more
+    CTAs; the bits of ``dW`` depend on it (a fixed function of the sizes)."""
+    if override is not None:
+        return int(override)
+    split = SGA_SPLIT_MIN
+    while 8 * hidden * -(-max(n_keys, 1) // split) > SGA_PARTIAL_BUDGET_BYTES:
+        split *= 2
+    return split
+
+
+@dataclass(frozen=True, eq=False)
+class _Cake:
+    """The device, the registered record of its architecture and the record's geometry."""
+
+    device: torch.device
+    index: int
+    module: str
+    record: dict
+    geometry: Geometry
+    arch: str
+
+
+def _cake_context(device: torch.device) -> _Cake:
+    if device.type != "cuda":
+        raise ValueError(
+            "backend='cake' runs on CUDA tensors of a compute capability 10.0 / 10.3 device; use backend='reference'"
+        )
+    module, record = record_for(device)
+    record_abi(record)
+    missing = [s for s in SUPPORT_STAGES + SUPPORT_DENSE_STAGES if s not in record]
+    if missing:
+        raise NotImplementedError(
+            f"the candidate-support programs {missing} are not registered for {record['arch']} in this checkout"
+        )
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _Cake(
+        device,
+        int(index),
+        module,
+        record,
+        Geometry.from_record(record),
+        str(record["arch"]),
+    )
+
+
+def support_program_available(device: Optional[torch.device] = None) -> bool:
+    """True when this checkout registers every program of the cake backend for ``device``."""
+    arch = arch_for(device)
+    if arch is None or arch not in SUPPORT_DENSE_MIN_MEAN_K:
+        return False
+    try:
+        record = MODULES[select_module(arch)]
+    except NotImplementedError:
+        return False
+    return all(s in record for s in SUPPORT_STAGES + SUPPORT_DENSE_STAGES)
+
+
+@functools.lru_cache(maxsize=None)
+def _dummies(index: int) -> dict:
+    """One-element operands of the pointers a launch never touches (an absent output / upstream / label array)."""
+    device = torch.device("cuda", index)
+    return {
+        torch.int32: torch.full((1,), -1, dtype=torch.int32, device=device),
+        torch.int64: torch.zeros((1,), dtype=torch.int64, device=device),
+        torch.float32: torch.zeros((16,), dtype=torch.float32, device=device),
+    }
+
+
+def _or_dummy(cx: _Cake, t: Optional[torch.Tensor], dtype) -> torch.Tensor:
+    return _dummies(cx.index)[dtype] if t is None else t
+
+
+def _run(cx: _Cake, stage: str, values: dict) -> None:
+    """Launch one stage of the record on the current stream (bound by the package's eager binding; the templated
+    launch is remembered per stage, device and launch scalars)."""
+    launch, arguments = _eager_launch(
+        cx.record, cx.module, stage, values, cx.device, cx.geometry
+    )
+    with _ffi_stream_context(cx.index):
+        if launch.prepare is not None:
+            launch.prepare(*arguments)
+        launch.entry(*arguments)
+
+
+def _x_operand(X: torch.Tensor) -> torch.Tensor:
+    """``X`` as the kernels read it: rows 16-byte aligned with a row pitch that is a multiple of 8 elements (the TMA
+    and 16-byte-load rule); otherwise one contiguous copy (``2 T H`` bytes)."""
+    T, H = (int(s) for s in X.shape)
+    ld = int(X.stride(0))
+    if T and (ld < H or ld % 8 or X.data_ptr() % 16):
+        return torch.empty((T, H), dtype=X.dtype, device=X.device).copy_(X)
+    return X
+
+
+def _x_copied(X: torch.Tensor) -> bool:
+    T, H = (int(s) for s in X.shape)
+    ld = int(X.stride(0))
+    return bool(T and (ld < H or ld % 8 or X.data_ptr() % 16))
+
+
+def _rows_operand(t: torch.Tensor) -> tuple[torch.Tensor, int]:
+    """``(tensor, ld_rows)`` of a row-major ``[R, H]`` operand of the segment gather-accumulate kernels, which take a
+    contiguous tensor and the row stride: the tensor itself, or the contiguous 1-D span its rows cover."""
+    R, H = (int(s) for s in t.shape)
+    if t.is_contiguous():
+        return t, H
+    ld = int(t.stride(0))
+    return t.as_strided(((R - 1) * ld + H,), (1,), t.storage_offset()), ld
+
+
+def _cake_check(
+    cx: _Cake,
+    problem: SupportProblem,
+    ids: torch.Tensor,
+    offsets: torch.Tensor,
+    labels: Optional[torch.Tensor],
+):
+    """The validation stage: ``(word [1], lpos [T] | None, offsets32 [T + 1], the int32 ids the later stages read)``.
+    The int32 copies are clamped (offsets to ``[0, M]``, int64 ids to ``[0, V - 1]``), an int32 caller array is read
+    as it is (every later stage clamps it again)."""
+    T, M, V = problem.num_rows, problem.num_pairs, problem.vocab
+    device = cx.device
+    word = torch.full((1,), NO_ERROR, dtype=torch.int64, device=device)
+    off32 = torch.empty((T + 1,), dtype=torch.int32, device=device)
+    lpos = (
+        torch.empty((T,), dtype=torch.int32, device=device)
+        if labels is not None
+        else None
+    )
+    wide_ids = ids.dtype == torch.int64
+    ids32 = (
+        torch.empty((M,), dtype=torch.int32, device=device) if wide_ids and M else None
+    )
+    _run(
+        cx,
+        SUPPORT_CHECK_STAGES[(ids.dtype, offsets.dtype)],
+        dict(
+            ids=ids if M else _dummies(cx.index)[ids.dtype],
+            offsets=offsets,
+            labels=_or_dummy(cx, labels, torch.int64),
+            word=word,
+            lpos=_or_dummy(cx, lpos, torch.int32),
+            offsets32=off32,
+            ids32=_or_dummy(cx, ids32, torch.int32),
+            T=T,
+            M=M,
+            V=V,
+            k_cap=min(problem.k_cap, K1_K_CAP_MAX),
+            has_labels=int(labels is not None),
+        ),
+    )
+    ids_rows = ids32 if wide_ids else ids
+    return word, lpos, off32, ids_rows
+
+
+def _gemm(
+    cx: _Cake,
+    stage: str,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    *,
+    stats: torch.Tensor,
+    ws: torch.Tensor,
+    hidden: int,
+    vocab: int,
+    rows_c: int,
+    first_chunk: int = 1,
+) -> None:
+    values = dict(
+        A=A,
+        B=B,
+        C=C,
+        STATS_OUT=stats,
+        WS=ws,
+        **gemm_scalars(
+            stage,
+            cx.geometry,
+            hidden=hidden,
+            vocab=vocab,
+            rows_c=rows_c,
+            first_chunk=first_chunk,
+        ),
+    )
+    _run(cx, stage, values)
+
+
+def _blocks(total: int, width: int) -> list[tuple[int, int]]:
+    return [(v0, min(width, total - v0)) for v0 in range(0, total, width)]
+
+
+def _dense_logits(
+    cx: _Cake,
+    plan: SupportPlan,
+    problem: SupportProblem,
+    Xop: torch.Tensor,
+    W: torch.Tensor,
+    ids_rows: torch.Tensor,
+    off32: torch.Tensor,
+    z: torch.Tensor,
+) -> None:
+    """Dense forward: per token chunk and vocabulary block (both ascending), the shipped logits GEMM writes the BF16
+    block ``zblk`` and the gather copies the support's logits out of it (each pair's id lies in one block)."""
+    T, H, V, M = problem.num_rows, problem.hidden, problem.vocab, problem.num_pairs
+    C, vb = min(plan.dense_chunk, T), plan.vocab_block
+    flat = torch.empty((C * vb,), dtype=torch.bfloat16, device=cx.device)
+    f32 = _device_constants(cx.index)["f32_dummy"]
+    for r0, rows_c in _blocks(T, C):
+        A = Xop[r0 : r0 + rows_c]
+        for v0, width in _blocks(V, vb):
+            blk = flat[: rows_c * width].view(rows_c, width)
+            _gemm(
+                cx,
+                "gemm_logits_nostats",
+                A,
+                W[v0 : v0 + width],
+                blk,
+                stats=f32,
+                ws=f32,
+                hidden=H,
+                vocab=width,
+                rows_c=rows_c,
+            )
+            _run(
+                cx,
+                "support_gather_bf16",
+                dict(
+                    zblk=blk,
+                    ids=ids_rows,
+                    offsets=off32,
+                    z=z,
+                    t0=r0,
+                    rows=rows_c,
+                    v0=v0,
+                    vb=width,
+                    ldc=width,
+                    M=M,
+                    V=V,
+                ),
+            )
+
+
+def _dense_backward(
+    cx: _Cake,
+    plan: SupportPlan,
+    problem: SupportProblem,
+    Xop: Optional[torch.Tensor],
+    W: torch.Tensor,
+    ids_rows: torch.Tensor,
+    off32: torch.Tensor,
+    dz: torch.Tensor,
+    need_dx: bool,
+    need_dw: bool,
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Dense backward, chunk-outer: per token chunk and vocabulary block (ascending) the scatter builds the BF16
+    gradient block ``dzblk`` (``dz`` at the support, +0 elsewhere); the shipped dX GEMM writes the block's FP32
+    product, added into the chunk's FP32 ``dX_c`` in block order (one cast per chunk); the shipped weight-gradient
+    GEMM stores / accumulates ``dW_acc[v0:v1]`` in chunk order and the last chunk's GEMM writes the BF16 ``dW`` from
+    its epilogue (``cast(dW_acc + tile)``, or ``cast(tile)`` for one chunk)."""
+    T, H, V, M = problem.num_rows, problem.hidden, problem.vocab, problem.num_pairs
+    device = cx.device
+    C, vb = min(plan.dense_chunk, T), plan.vocab_block
+    consts = _device_constants(cx.index)
+    f32 = consts["f32_dummy"]
+    chunks = _blocks(T, C)
+    multi = len(chunks) > 1
+    flat = torch.empty((C * vb,), dtype=torch.bfloat16, device=device)
+    dX = torch.empty((T if need_dx else 0, H), dtype=torch.bfloat16, device=device)
+    dxc = torch.empty((C if need_dx else 0, H), dtype=torch.float32, device=device)
+    tmp = torch.empty((C if need_dx else 0, H), dtype=torch.float32, device=device)
+    dW = torch.empty((V if need_dw else 0, H), dtype=torch.bfloat16, device=device)
+    dw_acc = torch.empty(
+        (V if need_dw and multi else 0, H), dtype=torch.float32, device=device
+    )
+    for ci, (r0, rows_c) in enumerate(chunks):
+        last = ci == len(chunks) - 1
+        for bi, (v0, width) in enumerate(_blocks(V, vb)):
+            blk = flat[: rows_c * width].view(rows_c, width)
+            _run(
+                cx,
+                "support_scatter_dz_bf16",
+                dict(
+                    dz=dz,
+                    ids=ids_rows,
+                    offsets=off32,
+                    dzblk=blk,
+                    t0=r0,
+                    rows=rows_c,
+                    v0=v0,
+                    vb=width,
+                    ldc=width,
+                    M=M,
+                    V=V,
+                ),
+            )
+            if need_dx:
+                out = dxc[:rows_c] if bi == 0 else tmp[:rows_c]
+                _gemm(
+                    cx,
+                    "gemm_dx",
+                    blk,
+                    W[v0 : v0 + width],
+                    out,
+                    stats=f32,
+                    ws=f32,
+                    hidden=H,
+                    vocab=width,
+                    rows_c=rows_c,
+                )
+                if bi:
+                    dxc[:rows_c].add_(
+                        tmp[:rows_c]
+                    )  # block order, one FP32 add per element
+            if need_dw:
+                assert Xop is not None
+                B = Xop[r0 : r0 + rows_c]
+                if not last:
+                    _gemm(
+                        cx,
+                        "gemm_dw_acc",
+                        blk,
+                        B,
+                        dw_acc[v0 : v0 + width],
+                        stats=f32,
+                        ws=f32,
+                        hidden=H,
+                        vocab=width,
+                        rows_c=rows_c,
+                        first_chunk=int(ci == 0),
+                    )
+                else:
+                    _gemm(
+                        cx,
+                        "gemm_dw_cast_bf16",
+                        blk,
+                        B,
+                        dW[v0 : v0 + width],
+                        stats=consts["unit_scale"],
+                        ws=dw_acc[v0 : v0 + width] if multi else f32,
+                        hidden=H,
+                        vocab=width,
+                        rows_c=rows_c,
+                        first_chunk=int(not multi),
+                    )
+        if need_dx:
+            dX[r0 : r0 + rows_c].copy_(dxc[:rows_c])  # one round to BF16
+    return (dX if need_dx else None), (dW if need_dw else None)
+
+
+def _row_active(
+    off32: torch.Tensor, lpos: Optional[torch.Tensor], selected_only: bool
+) -> torch.Tensor:
+    """Rows whose ``dz`` can be nonzero: ``K_t >= 2`` and an upstream reaches the row (the selected upstream alone
+    reaches only the rows with a label)."""
+    active = (off32[1:] - off32[:-1]) >= 2
+    if selected_only:
+        assert lpos is not None
+        active &= lpos >= 0
+    return active
+
+
+def _sga_dw_range(
+    cx: _Cake,
+    plan: SupportPlan,
+    problem: SupportProblem,
+    rows: torch.Tensor,
+    ld_rows: int,
+    ids_rows: torch.Tensor,
+    off32: torch.Tensor,
+    dz: torch.Tensor,
+    active: torch.Tensor,
+    out: torch.Tensor,
+    mode: str,
+    p0: int,
+    p1: int,
+) -> None:
+    """One sparse dW pass over the pairs ``[p0, p1)``: the unique CSC keys ``(v << 32) | p`` (a pair of an inactive
+    row takes :data:`SENTINEL_ROW`), sorted (unique keys: one order for any correct sort), then the segment
+    gather-accumulate and, when a segment can be longer than the split, the ordered sum of its parts."""
+    T, H, V, M = problem.num_rows, problem.hidden, problem.vocab, problem.num_pairs
+    n = p1 - p0
+    p = torch.arange(p0, p1, dtype=torch.int32, device=cx.device)
+    row = torch.searchsorted(off32[1:], p, right=True).clamp_(max=T - 1)
+    keep = active[row]
+    del row
+    keys = ids_rows[p0:p1].to(torch.int64)
+    keys.masked_fill_(~keep, SENTINEL_ROW)
+    del keep
+    keys.bitwise_left_shift_(32).bitwise_or_(p)
+    del p
+    keys = torch.sort(keys).values
+    split = support_split(n, H, plan.dw_split)
+    partial = torch.empty(
+        (2 * -(-n // split), H), dtype=torch.float32, device=cx.device
+    )
+    suffix = "" if mode == "bf16" else "_f32_add"
+    _run(
+        cx,
+        "support_sga_dw" + suffix,
+        dict(
+            rows=rows,
+            scale=dz,
+            keys=keys,
+            offsets=off32,
+            out=out,
+            partial=partial,
+            ld_rows=ld_rows,
+            H=H,
+            V=V,
+            M=M,
+            T=T,
+            n_keys=n,
+            split=split,
+            span=SGA_SPAN,
+        ),
+    )
+    if n > split:
+        _run(
+            cx,
+            "support_sga_combine" + suffix,
+            dict(
+                keys=keys,
+                partial=partial,
+                out=out,
+                H=H,
+                V=V,
+                n_keys=n,
+                split=split,
+                span=SGA_SPAN,
+            ),
+        )
+
+
+def _sparse_dw(
+    cx: _Cake,
+    plan: SupportPlan,
+    problem: SupportProblem,
+    Xop: torch.Tensor,
+    ids_rows: torch.Tensor,
+    off32: torch.Tensor,
+    dz: torch.Tensor,
+    active: torch.Tensor,
+) -> torch.Tensor:
+    """Sparse dW.  Global mode: ``dW`` zero-filled (ids in no support keep +0), then one BF16 pass over every pair.
+    Chunked mode: an FP32 ``dW_acc`` zero-filled once, one FP32 add per element per pair range in range order, one
+    cast at the end."""
+    V, H, M = problem.vocab, problem.hidden, problem.num_pairs
+    rows, ld = _rows_operand(Xop)
+    if plan.dw_mode == "global":
+        dW = torch.zeros((V, H), dtype=torch.bfloat16, device=cx.device)
+        _sga_dw_range(
+            cx, plan, problem, rows, ld, ids_rows, off32, dz, active, dW, "bf16", 0, M
+        )
+        return dW
+    acc = torch.zeros((V, H), dtype=torch.float32, device=cx.device)
+    for p0 in range(0, M, plan.dw_pairs):
+        _sga_dw_range(
+            cx,
+            plan,
+            problem,
+            rows,
+            ld,
+            ids_rows,
+            off32,
+            dz,
+            active,
+            acc,
+            "f32_add",
+            p0,
+            min(M, p0 + plan.dw_pairs),
+        )
+    return acc.to(torch.bfloat16)
+
+
+def _cake_forward(
+    cx: _Cake,
+    plan: SupportPlan,
+    problem: SupportProblem,
+    outputs: SupportOutputs,
+    X: torch.Tensor,
+    W: torch.Tensor,
+    support_ids: torch.Tensor,
+    support_offsets: torch.Tensor,
+    labels: Optional[torch.Tensor],
+    teacher: Optional[torch.Tensor],
+    tau: torch.Tensor,
+    check_inputs: bool,
+):
+    """``(results, saved)``: the requested outputs and ``lse``, and the packed state the backward reads."""
+    T, H, V, M = problem.num_rows, problem.hidden, problem.vocab, problem.num_pairs
+    device = cx.device
+    ids = support_ids.contiguous()
+    offsets = support_offsets.contiguous()
+    lab = labels.contiguous() if outputs.selected and labels is not None else None
+    word, lpos, off32, ids_rows = _cake_check(cx, problem, ids, offsets, lab)
+    _check_word(word, check_inputs)
+    teacher_c = teacher.contiguous() if outputs.kl and teacher is not None else None
+    if (
+        M == 0
+    ):  # every row is empty: lse = 0, every output 0; no launch reads the support
+        zero_t = torch.zeros((T,), dtype=torch.float32, device=device)
+        res = dict(
+            lse=zero_t,
+            packed=torch.zeros((0,), dtype=torch.float32, device=device),
+            selected=zero_t.clone(),
+            kl=zero_t.clone(),
+        )
+        z = torch.zeros((0,), dtype=torch.bfloat16, device=device)
+        return res, (ids_rows, off32, lpos, teacher_c, z, zero_t)
+    z = torch.empty((M,), dtype=torch.bfloat16, device=device)
+    Xop = _x_operand(X)
+    if plan.forward == "sparse":
+        _run(
+            cx,
+            "support_logits_gather_gemm",
+            dict(W=W, X=Xop, z=z, ids=ids_rows, offsets=off32, M=M, T=T, V=V, H=H),
+        )
+    else:
+        _dense_logits(cx, plan, problem, Xop, W, ids_rows, off32, z)
+    del Xop
+    lse = torch.empty((T,), dtype=torch.float32, device=device)
+    packed = (
+        torch.empty((M,), dtype=torch.float32, device=device)
+        if outputs.packed
+        else None
+    )
+    selected = (
+        torch.empty((T,), dtype=torch.float32, device=device)
+        if outputs.selected
+        else None
+    )
+    kl = torch.empty((T,), dtype=torch.float32, device=device) if outputs.kl else None
+    bits = sum(OUTPUT_BITS[n] for n in outputs.names())
+    _run(
+        cx,
+        "support_row_finalize",
+        dict(
+            z=z,
+            tau=tau,
+            offsets=off32,
+            lpos=_or_dummy(cx, lpos, torch.int32),
+            teacher=_or_dummy(cx, teacher_c, torch.float32),
+            lse=lse,
+            packed=_or_dummy(cx, packed, torch.float32),
+            selected=_or_dummy(cx, selected, torch.float32),
+            kl=_or_dummy(cx, kl, torch.float32),
+            T=T,
+            M=M,
+            outputs=bits,
+        ),
+    )
+    res = dict(lse=lse, packed=packed, selected=selected, kl=kl)
+    return res, (ids_rows, off32, lpos, teacher_c, z, lse)
+
+
+def _upstream(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    return None if t is None else t.to(torch.float32).contiguous()
+
+
+def _cake_backward(
+    cx: _Cake,
+    plan: SupportPlan,
+    problem: SupportProblem,
+    X: torch.Tensor,
+    W: torch.Tensor,
+    saved,
+    tau: torch.Tensor,
+    g: Optional[torch.Tensor],
+    d: Optional[torch.Tensor],
+    e: Optional[torch.Tensor],
+    need_dx: bool,
+    need_dw: bool,
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    T, H, V, M = problem.num_rows, problem.hidden, problem.vocab, problem.num_pairs
+    device = cx.device
+    ids_rows, off32, lpos, teacher, z, lse = saved
+    dX: Optional[torch.Tensor] = None
+    dW: Optional[torch.Tensor] = None
+    if M == 0:  # no pair: zero gradients, no launch
+        if need_dx:
+            dX = torch.zeros((T, H), dtype=torch.bfloat16, device=device)
+        if need_dw:
+            dW = torch.zeros((V, H), dtype=torch.bfloat16, device=device)
+        return dX, dW
+    g, d, e = _upstream(g), _upstream(d), _upstream(e)
+    dz = torch.empty((M,), dtype=torch.bfloat16, device=device)
+    bits = (
+        (OUTPUT_BITS["packed"] if g is not None else 0)
+        | (OUTPUT_BITS["selected"] if d is not None else 0)
+        | (OUTPUT_BITS["kl"] if e is not None else 0)
+    )
+    _run(
+        cx,
+        "support_row_grad",
+        dict(
+            z=z,
+            tau=tau,
+            lse=lse,
+            offsets=off32,
+            lpos=_or_dummy(cx, lpos if d is not None else None, torch.int32),
+            teacher=_or_dummy(cx, teacher if e is not None else None, torch.float32),
+            g=_or_dummy(cx, g, torch.float32),
+            d=_or_dummy(cx, d, torch.float32),
+            e=_or_dummy(cx, e, torch.float32),
+            dz=dz,
+            T=T,
+            M=M,
+            upstreams=bits,
+        ),
+    )
+    del g, d, e
+    dense_x = need_dx and plan.dx == "dense"
+    dense_w = need_dw and plan.dw == "dense"
+    Xop = _x_operand(X) if need_dw else None
+    if dense_x or dense_w:
+        dX, dW = _dense_backward(
+            cx, plan, problem, Xop, W, ids_rows, off32, dz, dense_x, dense_w
+        )
+    if need_dx and not dense_x:
+        dX = torch.empty((T, H), dtype=torch.bfloat16, device=device)
+        _run(
+            cx,
+            "support_sga_dx",
+            dict(
+                rows=W,
+                scale=dz,
+                ids=ids_rows,
+                offsets=off32,
+                out=dX,
+                ld_rows=H,
+                H=H,
+                V=V,
+                M=M,
+                T=T,
+                min_pairs=2,
+            ),
+        )
+    if need_dw and not dense_w:
+        assert Xop is not None
+        active = _row_active(off32, lpos, bits == OUTPUT_BITS["selected"])
+        dW = _sparse_dw(cx, plan, problem, Xop, ids_rows, off32, dz, active)
+    return dX, dW
+
+
+def support_memory_report(
+    T: int,
+    H: int,
+    V: int,
+    M: int,
+    *,
+    outputs: tuple[str, ...] = ("packed",),
+    ids_dtype: torch.dtype = torch.int64,
+    chunk_size: Optional[int] = None,
+    arch: str = "sm_100a",
+    path: Union[str, dict] = "auto",
+    dw_mode: str = "auto",
+    vocab_block: Optional[int] = None,
+    dw_split: Optional[int] = None,
+    need_dx: bool = True,
+    need_dw: bool = True,
+    x_copy: bool = False,
+) -> dict:
+    """Device bytes of one cake-backend training step (forward + backward) by bucket, from host-known sizes and the
+    plan the call would take on ``arch`` (an upper bound per bucket: every temporary of a phase counted at once).
+
+    * ``packed_state``: the saved ``O(M)`` / ``O(T)`` state (``z`` 2 B and, for int64 ids, the int32 ids 4 B per pair;
+      int32 offsets, ``lse``, ``tau`` and, with labels, ``lpos`` 4 B per row) -- counted with the packed outputs.
+    * ``outputs``: the requested outputs (``packed`` 4 B per pair, ``selected`` / ``kl`` 4 B per row).
+    * ``forward_workspace``: the dense logits block ``[C, vb]`` BF16 (dense forward only), plus ``X``'s copy when its
+      rows are not 16-byte aligned (``x_copy``).
+    * ``backward_workspace``: ``dz`` 2 B per pair; dense dX / dW: the gradient block ``[C, vb]`` BF16 and, for dX, two
+      FP32 ``[C, H]`` blocks; sparse dW: per pair range of ``n`` pairs the pair index (4 B), the row index (8 B), the
+      keys (8 B), :data:`SORT_BYTES_PER_KEY` measured ``torch.sort`` bytes per key, the row activity (1 B per row) and
+      ``2 ceil(n / split)`` FP32 partial rows; ``X``'s copy (``x_copy``).
+    * ``weight_gradient_storage``: the FP32 ``dW_acc [V, H]`` (sparse chunked mode, or dense with more than one token
+      chunk).
+    * ``gradients``: BF16 ``dX`` and ``dW``.
+    * ``plan``: the pass forms, the dW mode, the pair range, the split, the vocabulary block and the dense chunk.
+    """
+    if arch not in SUPPORT_DENSE_MIN_MEAN_K:
+        raise ValueError(f"arch must be one of {sorted(SUPPORT_DENSE_MIN_MEAN_K)}")
+    names = tuple(outputs)
+    if not names or any(n not in OUTPUT_BITS for n in names):
+        raise ValueError(f"outputs must name some of {tuple(OUTPUT_BITS)}")
+    geometry = Geometry.from_record(MODULES[select_module(arch)])
+    chunk = (
+        DEFAULT_CHUNK_SIZE
+        if chunk_size is None
+        else _positive_int(chunk_size, "chunk_size")
+    )
+    problem = SupportProblem(
+        num_rows=int(T),
+        hidden=int(H),
+        vocab=int(V),
+        num_pairs=int(M),
+        k_cap=max(1, int(M)),
+        chunk=chunk,
+        has_labels="selected" in names,
+        has_teacher="kl" in names,
+    )
+    plan = make_support_plan(
+        problem, arch, geometry, _resolve_knobs(path, dw_mode, vocab_block, dw_split)
+    )
+    T, H, V, M = int(T), int(H), int(V), int(M)
+    C = min(plan.dense_chunk, max(T, 1))
+    vb = plan.vocab_block
+    x_bytes = 2 * T * H if x_copy else 0
+    packed_state = (
+        2 * M
+        + (4 * M if ids_dtype == torch.int64 else 0)
+        + 4 * (T + 1)
+        + 8 * T
+        + (4 * T if "selected" in names else 0)
+    )
+    out_bytes = (
+        (4 * M if "packed" in names else 0)
+        + (4 * T if "selected" in names else 0)
+        + (4 * T if "kl" in names else 0)
+    )
+    forward_ws = (2 * C * vb if plan.forward == "dense" and M else 0) + x_bytes
+    backward_ws = 2 * M if M and (need_dx or need_dw) else 0
+    dense_x = need_dx and plan.dx == "dense" and M
+    dense_w = need_dw and plan.dw == "dense" and M
+    if dense_x or dense_w:
+        backward_ws += 2 * C * vb + (8 * C * H if dense_x else 0)
+    split: Optional[int] = None
+    if need_dw and M and not dense_w:
+        n = min(plan.dw_pairs, M)
+        split = support_split(n, H, plan.dw_split)
+        backward_ws += (
+            math.ceil((4 + 8 + 8 + SORT_BYTES_PER_KEY) * n) + T + 8 * H * -(-n // split)
+        )
+    if need_dw and M:
+        backward_ws += x_bytes
+    multi_chunk = T > C
+    dw_storage = (
+        4 * V * H
+        if need_dw
+        and M
+        and ((not dense_w and plan.dw_mode == "chunked") or (dense_w and multi_chunk))
+        else 0
+    )
+    grads = (2 * T * H if need_dx else 0) + (2 * V * H if need_dw else 0)
+    report = dict(
+        packed_state=packed_state,
+        outputs=out_bytes,
+        forward_workspace=forward_ws,
+        backward_workspace=backward_ws,
+        weight_gradient_storage=dw_storage,
+        gradients=grads,
+        sort_bytes=math.ceil(SORT_BYTES_PER_KEY * min(plan.dw_pairs, M))
+        if need_dw and M and not dense_w
+        else 0,
+        plan=dict(
+            forward=plan.forward,
+            dx=plan.dx,
+            dw=plan.dw,
+            dw_mode=plan.dw_mode,
+            dw_pairs=plan.dw_pairs,
+            dw_split=split,
+            vocab_block=vb,
+            dense_chunk=plan.dense_chunk,
+        ),
+    )
+    report["total"] = (
+        packed_state + out_bytes + forward_ws + backward_ws + dw_storage + grads
+    )
+    return report
+
+
 class SupportLogprobFunction(torch.autograd.Function):
     """One forward serves every requested output; gradients to ``X`` and ``W`` only."""
 
@@ -790,9 +1792,15 @@ class SupportLogprobFunction(torch.autograd.Function):
         outputs: SupportOutputs,
         check_inputs: bool,
         backend: str,
+        cake,
     ):
         ctx.set_materialize_grads(False)
-        ctx.problem, ctx.outputs, ctx.backend = problem, outputs, backend
+        ctx.problem, ctx.outputs, ctx.backend, ctx.cake = (
+            problem,
+            outputs,
+            backend,
+            cake,
+        )
         T, M = problem.num_rows, problem.num_pairs
         device = X.device
         if T == 0:
@@ -803,6 +1811,24 @@ class SupportLogprobFunction(torch.autograd.Function):
                 kl=torch.zeros(0, dtype=torch.float32, device=device),
             )
             return tuple(empty[n] for n in outputs.names())
+        if backend == "cake":
+            cx, plan = cake
+            res, saved = _cake_forward(
+                cx,
+                plan,
+                problem,
+                outputs,
+                X,
+                W,
+                support_ids,
+                support_offsets,
+                labels,
+                teacher,
+                tau,
+                check_inputs,
+            )
+            ctx.save_for_backward(X, W, *saved, tau)
+            return tuple(res[n] for n in outputs.names())
         engine = ENGINES[backend]
         chk = engine.support_check(
             support_ids,
@@ -842,7 +1868,7 @@ class SupportLogprobFunction(torch.autograd.Function):
         problem, outputs = ctx.problem, ctx.outputs
         up = dict(zip(outputs.names(), grads, strict=True))
         g, d, e = up.get("packed"), up.get("selected"), up.get("kl")
-        rest = (None,) * 9
+        rest = (None,) * 10
         need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
         if (g is None and d is None and e is None) or not (need_dx or need_dw):
             return (None, None) + rest
@@ -861,6 +1887,23 @@ class SupportLogprobFunction(torch.autograd.Function):
             )
             return (dX, dW) + rest
         X, W, ids, offsets, lpos, teacher, z, lse, tau = ctx.saved_tensors
+        if ctx.backend == "cake":
+            cx, plan = ctx.cake
+            dX, dW = _cake_backward(
+                cx,
+                plan,
+                problem,
+                X,
+                W,
+                (ids, offsets, lpos, teacher, z, lse),
+                tau,
+                g,
+                d,
+                e,
+                need_dx,
+                need_dw,
+            )
+            return (dX, dW) + rest
         engine = ENGINES[ctx.backend]
         rows = SupportRows.build(ids, offsets, num_rows=T, vocab=V, k_cap=problem.k_cap)
         dz = engine.row_grad(z, tau, lse, rows, lpos, teacher, g, d, e)
@@ -883,6 +1926,10 @@ def _support_call(
     check_inputs,
     backend,
     outputs: SupportOutputs,
+    path="auto",
+    dw_mode="auto",
+    vocab_block=None,
+    dw_split=None,
 ) -> dict[str, torch.Tensor]:
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}, got {backend!r}")
@@ -901,12 +1948,15 @@ def _support_call(
     resolved = _resolve_temperature(
         temperature, problem.num_rows, X.device, check=check_inputs
     )
+    knobs = _resolve_knobs(path, dw_mode, vocab_block, dw_split)
     tau = _support_tau_rows(resolved, problem.num_rows, X.device)
+    if problem.num_rows == 0:
+        # no row, so no validation stage: the one offsets rule left (offsets[0] == 0) is checked here
+        _check_first_offset(support_offsets, check_inputs)
+    cake = None
     if backend == "cake":
-        raise NotImplementedError(
-            "the cake backend of the candidate-support entry points is not built in this revision; "
-            "use backend='reference'"
-        )
+        cx = _cake_context(X.device)
+        cake = (cx, make_support_plan(problem, cx.arch, cx.geometry, knobs))
     result = SupportLogprobFunction.apply(
         X,
         W,
@@ -919,8 +1969,22 @@ def _support_call(
         outputs,
         check_inputs,
         backend,
+        cake,
     )
     return dict(zip(outputs.names(), result, strict=True))
+
+
+def _check_first_offset(offsets: torch.Tensor, check_inputs: bool) -> None:
+    """``offsets[0] == 0`` of a call without rows: one readback and ``ValueError`` (``check_inputs=True`` or a host
+    tensor), else an asynchronous device assertion."""
+    first = offsets[0]
+    if check_inputs or first.device.type != "cuda":
+        if int(first) != 0:
+            raise ValueError(
+                describe_support_error(support_error_word(ERR_OFFSETS_FIRST, 0))
+            )
+    else:
+        _assert_on_device(first == 0, _ASSERT_MESSAGE)
 
 
 def chunked_lm_head_support_logprob(
@@ -935,6 +1999,10 @@ def chunked_lm_head_support_logprob(
     chunk_size: Optional[int] = None,
     check_inputs: bool = False,
     backend: str = "cake",
+    path: Union[str, dict] = "auto",
+    dw_mode: str = "auto",
+    vocab_block: Optional[int] = None,
+    dw_split: Optional[int] = None,
 ) -> torch.Tensor:
     """Differentiable FP32 log-probabilities of ``z = X @ W^T`` normalized over each row's candidates.
 
@@ -946,6 +2014,13 @@ def chunked_lm_head_support_logprob(
     rounding depends on it.  ``check_inputs``: read the validation word back and raise ``ValueError``
     (default: an asynchronous device assertion, no synchronization).  Under ``torch.no_grad()`` the call
     only runs the forward (teacher-target preparation).  See the module docstring for the contract.
+
+    Backend-level knobs of ``backend="cake"`` (not part of the public API; tests and measurements force them):
+    ``path`` (``"auto"`` / ``"sparse"`` / ``"dense"``, or a dict over the passes ``"F"`` / ``"X"`` / ``"W"``),
+    ``dw_mode`` (``"auto"`` / ``"global"`` / ``"chunked"``), ``vocab_block`` (the dense form's vocabulary block, a
+    multiple of 256) and ``dw_split`` (the sparse weight gradient's segment split).  The bits of ``dX`` / ``dW``
+    depend on the pass form, ``chunk_size``, ``vocab_block`` and ``dw_split`` (fixed functions of the sizes when
+    left at their defaults); reruns with the same arguments are bitwise equal.
     """
     outputs = SupportOutputs(
         packed=labels is None, selected=labels is not None, kl=False
@@ -963,6 +2038,10 @@ def chunked_lm_head_support_logprob(
         check_inputs=check_inputs,
         backend=backend,
         outputs=outputs,
+        path=path,
+        dw_mode=dw_mode,
+        vocab_block=vocab_block,
+        dw_split=dw_split,
     )
     return res["packed"] if labels is None else res["selected"]
 
@@ -980,13 +2059,17 @@ def chunked_lm_head_support_kl(
     chunk_size: Optional[int] = None,
     check_inputs: bool = False,
     backend: str = "cake",
+    path: Union[str, dict] = "auto",
+    dw_mode: str = "auto",
+    vocab_block: Optional[int] = None,
+    dw_split: Optional[int] = None,
 ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
     """Unreduced FP32 forward KL ``[T]``, ``KL_t = sum_j Q_j (lq_j - logp_j)`` over the row's candidates with
     ``Q_j = exp(lq_j) > 0``, for the detached FP32 teacher log-probabilities ``teacher_logprobs [M]``
     (``lq``, aligned with ``support_ids``; ``-inf`` allowed: ``Q = 0``).  Student and teacher share the
     support.  Rows with ``K_t <= 1`` give 0.  ``return_logprobs=True`` also returns the differentiable
     packed student ``logp [M]``: ``(kl, logp)``.  Weighting, reduction and any ``tau ** 2`` factor belong to
-    the caller.  Other arguments as in :func:`chunked_lm_head_support_logprob`.
+    the caller.  Other arguments (and the backend-level knobs) as in :func:`chunked_lm_head_support_logprob`.
     """
     outputs = SupportOutputs(packed=bool(return_logprobs), selected=False, kl=True)
     res = _support_call(
@@ -1002,6 +2085,10 @@ def chunked_lm_head_support_kl(
         check_inputs=check_inputs,
         backend=backend,
         outputs=outputs,
+        path=path,
+        dw_mode=dw_mode,
+        vocab_block=vocab_block,
+        dw_split=dw_split,
     )
     return (res["kl"], res["packed"]) if return_logprobs else res["kl"]
 
@@ -1010,6 +2097,7 @@ __all__ = [
     "CANONICAL_SEQUENCE",
     "NO_ERROR",
     "SUPPORT_ERRORS",
+    "SUPPORT_M_MAX",
     "SUPPORT_V_MAX",
     "SupportLogprobFunction",
     "SupportReferenceEngine",
@@ -1019,5 +2107,7 @@ __all__ = [
     "decode_support_error",
     "describe_support_error",
     "support_error_word",
+    "support_memory_report",
+    "support_program_available",
     "validate_support_inputs",
 ]
