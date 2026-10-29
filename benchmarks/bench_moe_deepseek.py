@@ -1585,9 +1585,16 @@ def run_benchmark(
             include_activation_quant=include_activation_quant,
             use_fused_finalize=use_fused_finalize,
             quant_family=quant_family,
+            swap_ab=swap_ab,
         )
         for row, histogram_record in rows_and_histograms:
-            _print_row(row, histogram_record, quant_family=quant_family)
+            _print_row(
+                row,
+                histogram_record,
+                quant_family=quant_family,
+                swap_ab=swap_ab,
+                use_fused_finalize=use_fused_finalize,
+            )
         _print_footer(quant_family=quant_family)
 
     return results
@@ -1820,6 +1827,7 @@ def _print_header(
     include_activation_quant=False,
     use_fused_finalize=True,
     quant_family="nvfp4",
+    swap_ab=False,
 ):
     """Print benchmark header."""
     _, backends, baselines, winner_width, table_width = _table_layout(quant_family)
@@ -1880,7 +1888,7 @@ def _print_header(
             "shared experts, router GEMM and communication excluded."
         )
     for backend, _, _ in backends:
-        skip_reason = _backend_skip_reason(backend)
+        skip_reason = _backend_skip_reason(backend, swap_ab, use_fused_finalize)
         if skip_reason is not None:
             print(f"N/A: {skip_reason}; skipped before preparation and timing.")
     if quant_family == "nvfp4":
@@ -1931,13 +1939,22 @@ def _print_header(
     print("-" * table_width)
 
 
-def _print_row(results, histogram_record, quant_family="nvfp4"):
+def _print_row(
+    results,
+    histogram_record,
+    quant_family="nvfp4",
+    swap_ab=False,
+    use_fused_finalize=True,
+):
     """Print a single row of benchmark results."""
     # Extract values by backend
     rows = {result.backend: result for result in results}
     _, backends, baselines, winner_width, _ = _table_layout(quant_family)
     for key, _, _ in backends:
-        if key not in rows and _backend_skip_reason(key) is None:
+        if (
+            key not in rows
+            and _backend_skip_reason(key, swap_ab, use_fused_finalize) is None
+        ):
             raise ValueError(f"Missing result for supported backend: {key}")
     fields = [f"{results[0].tokens:>6}"]
     for key, _, width in backends:

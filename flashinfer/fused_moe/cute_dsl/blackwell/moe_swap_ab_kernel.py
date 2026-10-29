@@ -1646,7 +1646,7 @@ class Sm100BlockScaledGroupedGemmKernel:
     def _accumulator_storage(acc_cols, scale_cols):
         capacity = cute.arch.get_max_tmem_alloc_cols("sm_100")
         stages = min(2, (capacity - scale_cols) // acc_cols)
-        if stages < 1 or stages * acc_cols + scale_cols > capacity:
+        if stages < 1:
             raise ValueError("Not enough SM100 tensor memory for one accumulator tile")
         # The current epilogues release at most 64 columns before the next MMA:
         # one/two 32-column activation slabs, or the first 64-column bulk slab.
@@ -1920,7 +1920,7 @@ class Sm100BlockScaledGroupedGemmKernel:
             self._epilogue_storage(available, self.bulk_output_bytes)
         )
         self.epilogue_scratch_floats = scratch_bytes // 4
-        if available < self.epilogue_scratch_floats * 4:
+        if available < scratch_bytes:
             raise ValueError(
                 "Blockscaled pipeline exceeds SM100 shared memory capacity"
             )

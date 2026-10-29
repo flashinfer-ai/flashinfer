@@ -608,24 +608,10 @@ def _fc2_scale_kernel(
             row_scale = tl.load(ROW_SCALE)
         else:
             row_scale = tl.load(ROW_SCALE + row, index < N, other=0)
-        scale = tl.inline_asm_elementwise(
-            "mul.rn.f32 $0, $1, $2;",
-            "=f,f,f",
-            [scale, row_scale],
-            tl.float32,
-            True,
-            1,
-        )
+        scale = _mul_rn_f32(scale, row_scale)
     scale = scale.to(SCALE_DTYPE, fp_downcast_rounding="rtne").to(tl.float32)
     value = tl.load(ACC + index, index < N, other=0)
-    value = tl.inline_asm_elementwise(
-        "mul.rn.f32 $0, $1, $2;",
-        "=f,f,f",
-        [value, scale],
-        tl.float32,
-        True,
-        1,
-    )
+    value = _mul_rn_f32(value, scale)
     tl.store(
         OUT + index,
         value.to(OUT.dtype.element_ty, fp_downcast_rounding="rtne"),
@@ -696,14 +682,7 @@ def _combine_kernel(
         )
         weight = tl.load(WEIGHTS + route, (index < N) & valid, other=0).to(tl.float32)
         if slot == 0:
-            term = tl.inline_asm_elementwise(
-                "mul.rn.f32 $0, $1, $2;",
-                "=f,f,f",
-                [value, weight],
-                tl.float32,
-                True,
-                1,
-            )
+            term = _mul_rn_f32(value, weight)
         else:
             term = tl.inline_asm_elementwise(
                 "fma.rn.f32 $0, $1, $2, $3;",

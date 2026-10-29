@@ -372,8 +372,7 @@ def launch_gather_gemm(
 
     # Output quantization is explicit because Float8E4M3FN can also be used as
     # an ordinary (non-block-scaled) output by other internal configurations.
-    generate_sfc = quantize_output
-    if generate_sfc:
+    if quantize_output:
         if c_dtype not in {"float4_e2m1fn", "float8_e4m3fn"}:
             raise ValueError(
                 f"Output scale generation is unsupported for c_dtype={c_dtype}"
@@ -406,7 +405,7 @@ def launch_gather_gemm(
 
     # Create output tensor if not provided
     if out is None:
-        if generate_sfc and c_dtype == "float4_e2m1fn":
+        if quantize_output and c_dtype == "float4_e2m1fn":
             # FP4 output: 2 values per byte
             out = torch.empty(
                 (permuted_m, intermediate_size // 2),
@@ -421,7 +420,7 @@ def launch_gather_gemm(
             )
 
     # Create output scale tensor if needed and not provided
-    if generate_sfc:
+    if quantize_output:
         # Scale factor layout for output
         scale_atom_n = sf_vec_size * 4
         scale_rest_n = (intermediate_size + scale_atom_n - 1) // scale_atom_n
@@ -445,7 +444,7 @@ def launch_gather_gemm(
         activation=a,
         activation_sf=a_scale,
         output=out,
-        output_sf=out_scale if generate_sfc else None,
+        output_sf=out_scale,
         alpha=alpha,
         norm_const=global_scale,
         token_mapping=token_id_mapping,
@@ -481,7 +480,7 @@ def launch_gather_gemm(
         use_clc_scheduler=use_clc_scheduler,
         sm_count=sm_count,
     )
-    return out, out_scale if generate_sfc else None
+    return out, out_scale
 
 
 def launch_finalize_gemm(

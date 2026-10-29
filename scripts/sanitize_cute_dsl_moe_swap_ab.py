@@ -89,27 +89,15 @@ def _num_tactic_shards(tool):
 
 def _owned_kernels(quant_mode, per_token):
     if quant_mode == "w4a16":
-        return (
-            "Sm100W4A16GroupedGemmKernel",
-            "PrepareRouted",
-            "_MoeFinalizeKernel",
-        )
-    if quant_mode == "w4a4":
-        kernels = (
-            "Sm100BlockScaledGroupedGemmKernel",
-            "PrepareRouted",
-            "_MoeFinalizeKernel",
-        )
-        if per_token:
-            kernels += ("NVFP4QuantizePerTokenKernel",)
-        return kernels
-    if quant_mode in ("mxfp8", "w4a8"):
-        return (
-            "Sm100BlockScaledGroupedGemmKernel",
-            "PrepareRouted",
-            "_MoeFinalizeKernel",
-        )
-    raise ValueError(f"Unsupported quantization mode: {quant_mode}")
+        gemm = "Sm100W4A16GroupedGemmKernel"
+    elif quant_mode in ("w4a4", "mxfp8", "w4a8"):
+        gemm = "Sm100BlockScaledGroupedGemmKernel"
+    else:
+        raise ValueError(f"Unsupported quantization mode: {quant_mode}")
+    kernels = (gemm, "PrepareRouted", "_MoeFinalizeKernel")
+    if quant_mode == "w4a4" and per_token:
+        kernels += ("NVFP4QuantizePerTokenKernel",)
+    return kernels
 
 
 def _sanitizer_options(tool, quant_mode, per_token):

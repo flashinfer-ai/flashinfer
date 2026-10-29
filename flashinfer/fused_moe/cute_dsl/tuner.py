@@ -1001,18 +1001,21 @@ class CuteDslFusedMoERunner(TunableRunner):
         if self.swap_ab:
             from .blackwell.moe_swap_ab_tuner import (
                 DEFAULT_SWAP_AB_MOE_TACTIC,
-                extract_swap_ab_tactic_params,
+                canonicalize_swap_ab_tactic,
             )
 
             if tactic is None or tactic == -1:
                 tactic = DEFAULT_SWAP_AB_MOE_TACTIC
-            params = extract_swap_ab_tactic_params(tactic)
-            kwargs.update(
-                gemm1_k_steps=params["gemm1_k_steps"],
-                gemm2_k_steps=params["gemm2_k_steps"],
-                gemm1_use_clc_scheduler=params["gemm1_use_clc_scheduler"],
-                gemm2_use_clc_scheduler=params["gemm2_use_clc_scheduler"],
+            tile_size, gemm1, gemm2, k_steps, use_clc = canonicalize_swap_ab_tactic(
+                tactic
             )
+            kwargs.update(
+                gemm1_k_steps=k_steps[0],
+                gemm2_k_steps=k_steps[1],
+                gemm1_use_clc_scheduler=use_clc,
+                gemm2_use_clc_scheduler=use_clc,
+            )
+            tactic = (tile_size, gemm1, gemm2)
         else:
             if tactic is None or tactic == -1:
                 tactic = (
@@ -1022,7 +1025,7 @@ class CuteDslFusedMoERunner(TunableRunner):
                 )
             elif self.quant_mode in ("w4a8", "mxfp8"):
                 tactic = canonicalize_w4a8_tactic(tactic)
-            params = _extract_tactic_params(tactic)
+        params = _extract_tactic_params(tactic)
 
         (
             x,

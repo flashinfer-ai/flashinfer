@@ -1299,7 +1299,6 @@ class CuteDslMoEWrapper:
         gemm2_k_steps: Optional[int] = None,
         gemm1_use_clc_scheduler: bool = True,
         gemm2_use_clc_scheduler: bool = False,
-        swap_ab: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         """Forward implementation called by auto-tuner."""

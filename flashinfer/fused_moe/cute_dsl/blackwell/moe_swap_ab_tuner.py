@@ -86,28 +86,6 @@ def canonicalize_swap_ab_tactic(tactic: Any) -> Tuple:
     return result
 
 
-def extract_swap_ab_tactic_params(tactic: Any) -> dict:
-    tile_size, gemm1, gemm2, k_steps, use_clc = canonicalize_swap_ab_tactic(tactic)
-    params = {"tile_size": tile_size, "is_rubin": False}
-    for phase, gemm, depth in (
-        ("gemm1", gemm1, k_steps[0]),
-        ("gemm2", gemm2, k_steps[1]),
-    ):
-        mma_tiler_mn, cluster_shape_mn, raster_along_m = gemm
-        params.update(
-            {
-                f"{phase}_mma_tiler_mn": mma_tiler_mn,
-                f"{phase}_cluster_shape_mn": cluster_shape_mn,
-                f"{phase}_raster_along_m": raster_along_m,
-                f"{phase}_mma_tiler": None,
-                f"{phase}_mma_inst_shape": None,
-                f"{phase}_k_steps": depth,
-                f"{phase}_use_clc_scheduler": use_clc,
-            }
-        )
-    return params
-
-
 def get_valid_swap_ab_tactics(runner, inputs: List[torch.Tensor]) -> List[Tuple]:
     import cutlass
 

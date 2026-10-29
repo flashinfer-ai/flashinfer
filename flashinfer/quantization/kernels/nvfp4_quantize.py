@@ -3208,7 +3208,6 @@ def nvfp4_quantize_per_token_cute_dsl(
     sf_layout: int = SF_LAYOUT_128x4,
     enable_pdl: bool | None = None,
     out_scale: torch.Tensor | None = None,
-    # Appended last so existing positional construction keeps working.
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
     valid_rows: torch.Tensor | None = None,
     row_limits: torch.Tensor | None = None,
