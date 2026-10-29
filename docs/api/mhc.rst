@@ -65,3 +65,20 @@ workspaces.
     cake_mhc_train_finish
     CakeMHCTrainPrepareFunction
     CakeMHCTrainFinishFunction
+
+The model's head, the mean of the last layer's four residual streams, has its
+own kernels for hidden sizes 4096, 5120 and 7168 (4096 on SM107):
+``cake_mhc_train_head_forward`` returns ``Y = X.mean(dim=1)`` bit for bit as
+torch computes it for BF16 ``X`` ``[T, 4, H]``,
+``cake_mhc_train_head_backward`` writes the gradient
+``dX[:, i, :] = BF16(dY / 4)`` of each stream or adds it into a caller's
+``dX`` (``accumulate=True``), and ``cake_mhc_train_head`` is the autograd form.
+
+.. autosummary::
+    :toctree: ../generated
+
+    cake_mhc_train_head_forward
+    cake_mhc_train_head_backward
+    cake_mhc_train_head
+    CakeMHCTrainHeadFunction
+    is_cake_mhc_train_head_supported
