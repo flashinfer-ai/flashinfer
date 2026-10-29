@@ -413,6 +413,34 @@ def _get_num_workers() -> Optional[int]:
     return None
 
 
+def clean_ninja(workdir: Path, ninja_file: Path) -> None:
+    """Delete every output ``ninja_file`` builds, so the next run rebuilds all."""
+    workdir.mkdir(parents=True, exist_ok=True)
+    command = [
+        "ninja",
+        "-C",
+        str(workdir.resolve()),
+        "-f",
+        str(ninja_file.resolve()),
+        "-t",
+        "clean",
+    ]
+    try:
+        subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=str(workdir.resolve()),
+            check=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as e:
+        msg = "Ninja clean failed."
+        if e.output:
+            msg += " Ninja output:\n" + e.output
+        raise RuntimeError(msg) from e
+
+
 def run_ninja(
     workdir: Path,
     ninja_file: Path,

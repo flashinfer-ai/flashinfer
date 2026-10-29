@@ -29,7 +29,12 @@ from filelock import FileLock
 
 from ..compilation_context import CompilationContext
 from . import env as jit_env
-from .cpp_ext import generate_ninja_build_for_op, get_nvcc_parallelism_flags, run_ninja
+from .cpp_ext import (
+    clean_ninja,
+    generate_ninja_build_for_op,
+    get_nvcc_parallelism_flags,
+    run_ninja,
+)
 from .utils import write_if_different
 
 os.makedirs(jit_env.FLASHINFER_WORKSPACE_DIR, exist_ok=True)
@@ -597,6 +602,9 @@ class JitSpecNvcc(JitSpec):
         included headers are NOT hashed — that residual risk is why the stamp
         is opt-in and aimed at restored caches of released packages, not
         editable checkouts.
+
+        Raises ``OSError`` if any input is unreadable: such an input cannot be
+        vouched for, so no stamp may match or be written for it.
         """
         h = hashlib.sha256(self.ninja_path.read_bytes())
         inputs = (
@@ -606,11 +614,12 @@ class JitSpecNvcc(JitSpec):
         for kind, paths in inputs:
             for path in paths:
                 h.update(f"{kind}:{path}".encode())
-                try:
-                    h.update(path.read_bytes())
-                except OSError:
-                    h.update(b"<unreadable>")
+                h.update(path.read_bytes())
         return h.hexdigest()
+
+    @staticmethod
+    def _trust_cache_stamp() -> bool:
+        return os.environ.get("FLASHINFER_JIT_TRUST_CACHE_STAMP", "0") == "1"
 
     def _stamp_is_current(self) -> bool:
         """Whether a trusted stamp proves the cached library is up to date.
@@ -627,7 +636,7 @@ class JitSpecNvcc(JitSpec):
         default: mtime scanning stays authoritative for editable checkouts
         where sources legitimately change within one version.
         """
-        if os.environ.get("FLASHINFER_JIT_TRUST_CACHE_STAMP", "0") != "1":
+        if not self._trust_cache_stamp():
             return False
         try:
             return (
@@ -637,9 +646,9 @@ class JitSpecNvcc(JitSpec):
         except OSError:
             return False
 
-    def _write_stamp(self) -> None:
+    def _write_stamp(self, digest: str) -> None:
         with contextlib.suppress(OSError):
-            self.stamp_path.write_text(self._stamp_digest() + "\n")
+            self.stamp_path.write_text(digest + "\n")
 
     def try_load(self) -> Optional[Any]:
         # Only the AOT artifact is known-valid without building.
@@ -706,8 +715,19 @@ class JitSpecNvcc(JitSpec):
                     "first use.",
                     self.name,
                 )
+            if self._trust_cache_stamp():
+                # The stamp vouches for content, not mtimes, so ninja's mtime
+                # scan must not pick what to reuse: a restored object can be
+                # newer than a source whose content changed. Rebuild in full.
+                clean_ninja(self.build_dir, self.ninja_path)
+            # Digest before building, so an input edited mid-build is not
+            # recorded as part of a library compiled from its old content.
+            stamp_digest = None
+            with contextlib.suppress(OSError):
+                stamp_digest = self._stamp_digest()
             run_ninja(self.build_dir, self.ninja_path, verbose)
-            self._write_stamp()
+            if stamp_digest is not None:
+                self._write_stamp(stamp_digest)
 
     def load(self, so_path: Optional[Path] = None):
         module = tvm_ffi.load_module(str(so_path or self.jit_library_path))
