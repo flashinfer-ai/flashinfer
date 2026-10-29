@@ -74,6 +74,7 @@ class KernelSpec:
     has_mask: bool
     has_physical_map: bool
     has_unmapped: bool
+    enable_pdl: bool = False
 
     @property
     def name(self) -> str:
@@ -90,7 +91,7 @@ class KernelSpec:
         )
         return (
             f"bt{c.block_tokens}_s{c.num_split_k}_st{c.num_stages}_g{c.num_gate_warps}"
-            f"{'c' if c.cooperative_gate else ''}_k{self.hidden}"
+            f"{'c' if c.cooperative_gate else ''}{'_pdl' if self.enable_pdl else ''}_k{self.hidden}"
             f"_e{self.num_experts}_top{self.num_topk}_sh{self.num_shared}_f{flags}"
         )
 
@@ -167,6 +168,7 @@ def load_kernel(arch: str, device_index: int, spec: KernelSpec):
             has_mask=spec.has_mask,
             has_physical_map=spec.has_physical_map,
             has_unmapped=spec.has_unmapped,
+            enable_pdl=spec.enable_pdl,
         )
         # The subscript form: ``options=`` with a tuple silently drops TVM-FFI and
         # falls back to the several-times slower ctypes argument path.
@@ -226,10 +228,16 @@ class MegaGateSm12xPlan:
         scratch=None,
         score_barriers=None,
         descriptor_workspace=None,
+        enable_pdl=None,
         _config=None,
     ):
-        """``_config`` (a ``MegaGateConfig``) overrides the heuristic; for tuning and tests."""
+        """``enable_pdl`` launches with programmatic dependent launch (default: when the
+        device supports it): the weight starts streaming while the previous kernel
+        finishes. ``_config`` (a ``MegaGateConfig``) overrides the heuristic; for tuning
+        and tests."""
         import torch
+
+        from flashinfer.utils import device_support_pdl
 
         if x.device.type != "cuda":
             raise RuntimeError("Mega Gate requires a CUDA device")
@@ -386,6 +394,9 @@ class MegaGateSm12xPlan:
             has_mask=mask is not None,
             has_physical_map=to_physical_map is not None,
             has_unmapped=unmapped_topk_idx is not None,
+            enable_pdl=device_support_pdl(x.device)
+            if enable_pdl is None
+            else bool(enable_pdl),
         )
         # Placeholders for absent inputs: never read, but every argument needs a tensor.
         dummy_f32 = torch.zeros(1, dtype=torch.float32, device=device)
@@ -421,6 +432,8 @@ class MegaGateSm12xPlan:
             num_expert_groups=config.num_expert_groups,
             num_stages=config.num_stages,
             num_gate_warps=config.num_gate_warps,
+            cooperative_gate=config.cooperative_gate,
+            enable_pdl=spec.enable_pdl,
             num_worker_groups=num_worker_groups,
             launch_ctas=num_worker_groups * config.num_logical_ctas,
             num_sms=sms,

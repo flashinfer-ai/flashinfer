@@ -106,6 +106,12 @@ def main():
     parser.add_argument("--scale", type=float, default=1.5)
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--cupti", action="store_true")
+    parser.add_argument(
+        "--pdl",
+        action="store_true",
+        help="launch with PDL (a standalone timing then also counts the wait for the "
+        "previous kernel)",
+    )
     parser.add_argument("--no-baseline", action="store_true")
     args = parser.parse_args()
 
@@ -138,6 +144,7 @@ def main():
             unmapped_topk_idx=logical,
             routed_scaling_factor=args.scale,
             deterministic=args.deterministic,
+            enable_pdl=args.pdl,
         )
         fused = median_us(plan.run, args.cupti)
         moved = (x.numel() + weight.numel()) * 2

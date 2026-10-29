@@ -39,6 +39,8 @@ def prepare_mega_gate(
     configurations (see MegaGatePlan); SM120 runs a CuTe DSL backend that also
     takes other K/E/top-k, no bias, token masks and image bias (see
     MegaGateSm12xPlan). Both document their reusable workspace layouts.
+    ``enable_pdl`` (SM12x only) launches with programmatic dependent launch,
+    by default when the device supports it.
     """
     import torch
 
@@ -68,8 +70,11 @@ def prepare_mega_gate(
             scratch=scratch,
             score_barriers=score_barriers,
             descriptor_workspace=descriptor_workspace,
+            enable_pdl=enable_pdl,
         )
 
+    if enable_pdl is not None:
+        raise ValueError("enable_pdl is only configurable on the SM12x backend")
     from .experimental.deepgemm_mega_gate.mega_gate import MegaGatePlan
 
     return MegaGatePlan(

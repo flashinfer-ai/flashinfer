@@ -289,7 +289,9 @@ class Sm12xMegaGateKernel:
         has_mask: bool,
         has_physical_map: bool,
         has_unmapped: bool,
+        enable_pdl: bool = False,
     ):
+        self.enable_pdl = enable_pdl
         self.block_tokens = config.block_tokens
         self.num_split_k = config.num_split_k
         self.num_stages = config.num_stages
@@ -448,6 +450,7 @@ class Sm12xMegaGateKernel:
             block=[self.num_threads, 1, 1],
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=self.enable_pdl,
         )
 
     # ------------------------------------------------------------------- device
@@ -536,8 +539,12 @@ class Sm12xMegaGateKernel:
         k_block_base = split_idx * Int32(self.k_blocks_per_split)
         counters_address = Int64(counters.iterator.toint())
 
+        # Programmatic dependent launch: whatever a prerequisite grid may write (the
+        # tokens, the maps, this plan's workspace) is touched only after griddepcontrol.wait
+        # (a no-op without PDL), so only the launch and the prologue overlap that grid.
         if warp_idx < Int32(NUM_MMA_WARPS):
             # ---------------------------------------------------- MMA warps
+            cute.arch.griddepcontrol_wait()
             consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_stages
             )
@@ -648,6 +655,11 @@ class Sm12xMegaGateKernel:
             producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_stages
             )
+            # Under PDL the tokens (a prerequisite grid's output) are loaded only after
+            # griddepcontrol.wait. Loading the first weight tiles before it was measured
+            # slower whenever the wait returns at once: the token tiles then queue behind
+            # them in the TMA unit and the first stage, so every refill, starts later.
+            cute.arch.griddepcontrol_wait()
             for token_block in cutlass.range(
                 worker_group, num_token_blocks, num_worker_groups, unroll=1
             ):
@@ -677,6 +689,7 @@ class Sm12xMegaGateKernel:
 
         else:
             # -------------------------------------------------------- gate warps
+            cute.arch.griddepcontrol_wait()
             exchange_layout = cute.make_layout(
                 self.num_aligned_experts if self.cooperative else EXPERTS_PER_LANE
             )
@@ -837,6 +850,10 @@ class Sm12xMegaGateKernel:
                     barrier_id=GATE_BARRIER_ID,
                     number_of_threads=self.num_gate_warps * 32,
                 )
+                # In the CTA's last block only the gate's share is left (the block's MMA
+                # is complete everywhere): let a PDL dependent launch now.
+                if token_block + num_worker_groups >= num_token_blocks:
+                    cute.arch.griddepcontrol_launch_dependents()
                 # Count this CTA's pass through the wait (and rearm the line once every
                 # waiter has), from a warp that ranks nothing first: gate warp 0 of a
                 # cooperative gate, which waits for the waves anyway, else the last gate

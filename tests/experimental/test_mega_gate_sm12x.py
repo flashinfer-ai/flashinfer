@@ -104,6 +104,13 @@ def test_schedule_invariants(num_sms, deterministic):
                 assert 1 <= workers <= config.num_token_blocks(num_tokens)
 
 
+def test_enable_pdl_is_sm12x_only():
+    x = torch.zeros((1, 64), dtype=torch.bfloat16)
+    weight = torch.zeros((8, 64), dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="SM12x"):
+        prepare_mega_gate(x, weight, 2, enable_pdl=True)
+
+
 # --------------------------------------------------------------- reference
 
 
@@ -408,6 +415,29 @@ def test_repeated_runs_are_bitwise_identical(num_tokens):
         for result, reference in zip(plan.run(), expected, strict=True):
             assert torch.equal(result, reference)
     assert torch.all(plan.score_barriers.view(torch.int64) == 0)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 512])
+def test_pdl_launch_follows_the_token_producer(num_tokens):
+    """Under PDL the gate may start while the kernel writing its tokens finishes: every
+    run must see that kernel's tokens, and PDL must not change the result."""
+    _skip_unless_sm120()
+    x, weight, bias = _make_inputs(num_tokens, 5120, 384, seed=3)
+    source = x.clone()
+    plans = {
+        pdl: prepare_mega_gate(x, weight, 6, bias=bias, enable_pdl=pdl)
+        for pdl in (False, True)
+    }
+    assert plans[True].route["enable_pdl"] and not plans[False].route["enable_pdl"]
+    for step in range(4):
+        rolled = source.roll(step * 7, dims=1)
+        x.copy_(rolled)  # the producer kernel right before the PDL launch
+        indices, weights = (t.clone() for t in plans[True].run())
+        x.copy_(rolled)
+        expected = plans[False].run()
+        torch.cuda.synchronize()
+        assert torch.equal(indices, expected[0])
+        assert torch.equal(weights, expected[1])
 
 
 def test_deterministic_is_batch_invariant():

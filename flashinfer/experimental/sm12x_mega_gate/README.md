@@ -69,6 +69,15 @@ Compared to the SM100 programs this backend also accepts other hidden sizes
 and image bias. Fixed routing (`fix_routing_mask`) and random routing
 (`force_random`) are not implemented yet and raise `NotImplementedError`.
 
+Plans launch with programmatic dependent launch by default (`enable_pdl`): the
+tokens, maps and workspace are read only after `griddepcontrol.wait`, so the
+launch and the prologue overlap the previous kernel (about 0.5 us per call in a
+CUDA graph after flashinfer's RMSNorm, 110-SM board), and the CTAs of the last
+token block let a PDL dependent launch once only their gate work is left. A
+standalone CUPTI timing of a PDL launch also counts its wait for the kernel
+before it; `benchmarks/bench_mega_gate_sm12x.py` measures without PDL unless
+`--pdl` is given.
+
 Kernels are compiled once per schedule and input signature through
 FlashInfer's persistent CuTe DSL cache (`cached_ops/sm12x_mega_gate_v1_sm120a_cute_dsl/`);
 the token count is a runtime argument.
