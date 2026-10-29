@@ -2300,6 +2300,19 @@ def _check_save_mode(save_mode: str) -> None:
         raise ValueError(f"save_mode must be 'light' or 'tape', got {save_mode!r}")
 
 
+# What a checkpoint recompute handle keeps of one KDA call (``cake_kcp.chunk_kda_kcp(..., recompute_handle=,
+# checkpoint_keep=)``): ``"states"`` (the default) the incoming states ``S_in`` -- the call runs with
+# ``save_transfer=False`` --, ``"transfer"`` also the owner's c1 receive tensor (``save_transfer=True``).
+CHECKPOINT_KEEPS = ("states", "transfer")
+
+
+def _check_checkpoint_keep(checkpoint_keep: str | None) -> None:
+    if checkpoint_keep is not None and checkpoint_keep not in CHECKPOINT_KEEPS:
+        raise ValueError(
+            f"checkpoint_keep must be None or one of {CHECKPOINT_KEEPS}, got {checkpoint_keep!r}"
+        )
+
+
 def kcp_saved_bytes(
     ctx: KcpContext,
     *,
@@ -2309,6 +2322,7 @@ def kcp_saved_bytes(
     with_conv: bool = True,
     C: int = 8192,
     saved_carry: bool = True,
+    checkpoint_keep: str | None = None,
 ) -> int:
     """Saved-set bytes of one layer on this rank (the KCP contract §3.2 ``kcp_saved_bytes(ctx, ...)``)::
 
@@ -2332,10 +2346,30 @@ def kcp_saved_bytes(
     The retained ``S_in`` and c1 tensors are the padded receive buffers (``s`` -> ``n_owners Hg`` tiles,
     ``Hg_r`` -> ``Hg_pad_r``); identical to the formula for ``H = 64``, and the padding is reported by
     ``kcp_comm_bytes(...)["padding"]``.  ``M_seg`` stays the dense copy of §9 (``NSEG s``).
-    """
+
+    ``checkpoint_keep`` (``None`` = the saved set above): the bytes a checkpoint recompute handle retains for this
+    layer while its backward is pending -- the tensors the handle's ``"kda"`` entry holds (exactly
+    ``handle.nbytes()`` of a handle that served this call alone) plus, with ``with_conv``, one convolution's
+    history pool (its ``"conv"`` entry)::
+
+    n_in * s_pad                                               # S_in: "states" and "transfer"
+    + ["transfer"] * N_out * 2 * s * Hg_r / H                  # the owner's whole c1 receive tensor
+    + [with_conv] * n_hist_rows * C * 2                        # one convolution's hist pool (BF16)
+
+    The tier fixes ``save_transfer`` (``False`` / ``True``); ``save_mode``, ``save_transfer`` and ``saved_carry``
+    are not read.  The saved set itself is released by the checkpoint as before (#7039)."""
     _check_save_mode(save_mode)
+    _check_checkpoint_keep(checkpoint_keep)
     H, C = int(H), int(C)
     hp = ctx.heads(H)
+    if checkpoint_keep is not None:
+        numel = kcp_pool_numel(ctx, H=H)
+        kept = numel["S_in"] * 4
+        if checkpoint_keep == "transfer":
+            kept += numel["c1_recv"] * 4
+        if with_conv:
+            kept += ctx.halo.n_hist_rows * C * 2
+        return kept
     s = H * STATE_TILE_BYTES
     s_pad = hp.n_owners * hp.Hg * STATE_TILE_BYTES  # = s without padding
     total = tables_bytes(ctx.NC_pad, ctx.n_frag, hp.NSEG)
@@ -2360,6 +2394,7 @@ def kcp_comm_bytes(
     C: int = 8192,
     save_transfer: bool = SAVE_TRANSFER_DEFAULT,
     boundary_mode: str = "saved",
+    checkpoint_keep: str | None = None,
 ) -> dict:
     """Bytes this rank moves per collective and per boundary (the KCP contract §3.2 ``kcp_comm_bytes(ctx)``; ``send`` / ``recv``
     per collective, totals ``B1`` = forward (c1, c2, halo_fwd), ``B2`` = backward from the saved context (b1 with
@@ -2369,11 +2404,25 @@ def kcp_comm_bytes(
     ``bwd_adjoint_bytes`` of the harness ``kcp_shapes.comm_bytes`` (plus the padding when ``H % Hg != 0``).
     ``padding`` reports the padding bytes contained in c1 / c2 / b1 / b2 (``send`` / ``recv``), their ``B1`` /
     ``B2`` sums, the padding retained inside the saved ``S_in`` (``s_in_saved``), the ``padded_owner`` and the
-    ``pad_tiles_per_slot``; all zero for the production ``H = 64``."""
+    ``pad_tiles_per_slot``; all zero for the production ``H = 64``.
+
+    ``checkpoint_keep`` (``"states"`` | ``"transfer"``; ``None`` = the table above): the traffic of a checkpointed
+    step with a recompute handle of that tier.  The tier fixes ``save_transfer`` (``False`` / ``True``; the
+    argument is not read), so ``B2`` (``b1`` in the ``dm`` form under ``"states"``) is the backward's traffic; the
+    recompute moves nothing (``recompute``: no c1 / c2, and no ``halo_fwd`` when the convolution carries its own
+    handle), so the step moves ``B1 + B2`` instead of the ``B1 + B1 + B2`` of a checkpoint without a handle; the
+    table also reports ``checkpoint_keep``."""
     if boundary_mode not in ("saved", "replay"):
         raise ValueError(
             f"boundary_mode must be 'saved' or 'replay', got {boundary_mode!r}"
         )
+    _check_checkpoint_keep(checkpoint_keep)
+    if checkpoint_keep is not None:
+        if boundary_mode != "saved":
+            raise ValueError(
+                "checkpoint_keep describes a saved-mode call: it needs boundary_mode='saved'"
+            )
+        save_transfer = checkpoint_keep == "transfer"
     H, C = int(H), int(C)
     hp = ctx.heads(H)
     sp, halo = hp.splits, ctx.halo
@@ -2422,7 +2471,7 @@ def kcp_comm_bytes(
     }
     padding["B1"] = total(padding["c1"], padding["c2"])
     padding["B2"] = total(padding["b1"], padding["b2"])
-    return {
+    table = {
         **coll,
         "b1_replay": b1_replay,
         "padding": padding,
@@ -2442,6 +2491,10 @@ def kcp_comm_bytes(
         "save_transfer": bool(save_transfer),
         "boundary_mode": boundary_mode,
     }
+    if checkpoint_keep is not None:
+        table["checkpoint_keep"] = checkpoint_keep
+        table["recompute"] = {"send": 0, "recv": 0}
+    return table
 
 
 # The pools of a rank's KCP workspace (``cake_kcp.KcpWorkspace``) that share one storage: each backward send pool
