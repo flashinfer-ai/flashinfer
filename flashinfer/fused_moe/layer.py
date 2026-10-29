@@ -66,6 +66,7 @@ from .api import (
     CuTileNvfp4Bf16Config,
     CuTileNvfp4Config,
     CuteDslConfig,
+    FrostLowLatencyConfig,
     MoEActivationPack,
     MoEConfig,
     MoEWeightPack,
@@ -124,10 +125,12 @@ from .backends.cudnn_frost.bf16.moe import CudnnFrostBf16MoeRunner
 from .backends.cudnn_frost.mxfp8.moe import CudnnFrostMxfp8MoeRunner
 from .backends.cudnn_frost.nvfp4.moe import CudnnFrostNvfp4MoeRunner
 from .backends.cudnn_frost.mxfp8_mxfp4.moe import CudnnFrostMxfp8Mxfp4MoeRunner
+from .backends.frost_low_latency.runner import FrostLowLatencyRunner
 from .utils import map_to_hybrid_bucket
 
 # Concrete host runners for configured candidates; device kernel loading stays deferred.
 _RunnerT = Union[
+    FrostLowLatencyRunner,
     CakeStepFunRunner,
     CudnnFrostBf16MoeRunner,
     CudnnFrostMxfp8MoeRunner,
@@ -174,6 +177,7 @@ _RunnerT = Union[
 
 # Map backend-config class -> runner class
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
+    FrostLowLatencyConfig: FrostLowLatencyRunner,
     CakeStepFunConfig: CakeStepFunRunner,
     CudnnFrostBf16Config: CudnnFrostBf16MoeRunner,
     CudnnFrostMxfp8Config: CudnnFrostMxfp8MoeRunner,
@@ -386,6 +390,8 @@ class MoELayer:
         Only runners that support this pack's ``routing_input_mode`` compete —
         not every backend has an in-kernel router — and the winner is cached
         per ``(token-count bucket, mode)`` so repeated calls skip reselection.
+        Candidate pools containing Frost low-latency use exact token counts
+        because their bounded tactics need not cover every row in a bucket.
 
         Parameters
         ----------
@@ -441,6 +447,14 @@ class MoELayer:
             )
 
         bucket = map_to_hybrid_bucket(act_pack.num_tokens, ceiling)
+        # Frost's bounded decode tactics can require exactly T=4 or T=8.
+        # Sharing their winner with T=3 or T=5..7 is not a valid specialization.
+        # Other candidate pools retain hybrid bucketing; Frost admits at most
+        # eight token counts, so exact keys remain bounded.
+        if any(
+            isinstance(self.runners[index], FrostLowLatencyRunner) for index in eligible
+        ):
+            bucket = act_pack.num_tokens
         # Candidate positions distinguish different options for the same backend
         # and prevent changing weight views or shape eligibility from reusing a winner.
         winner_key = (bucket, mode, eligible)

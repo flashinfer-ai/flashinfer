@@ -4,7 +4,9 @@ Two routes share one physical schedule (BM128 / BN224 / BK128, six TMA stages,
 ``cta_group::2``): ``forward`` writes BF16 ``out = A @ B^T``; ``wgrad``
 accumulates ``out += A @ B^T`` into FP32 in place.  Problem sizes, tile counts
 and the persistent CTA count are launch scalars, so every ``M`` / ``N`` and
-every ``K`` multiple of 128 runs on the same compiled program.
+every ``K`` multiple of 128 runs on the same compiled program.  The programs
+are the records of :mod:`.cake_jit` (one per route, ``KERNELS``); their
+libraries load through :func:`.cake_jit.load`.
 """
 
 from __future__ import annotations
@@ -20,9 +22,18 @@ BLOCK_M, BLOCK_N, BLOCK_K = 128, 224, 128
 SF_WORD_K_BLOCKS = 4  # K128 UE8M0 bytes packed per uint32 scale word
 # Grouped-raster M extent folded into the programs.  DeepGEMM's rule
 # ``min((8, 16), key=g -> g * BLOCK_M + ceil(num_sms / g) * BLOCK_N)`` selects
-# 16 on every part with at least 72 SMs; ``launch_geometry`` refuses others.
+# 16 on every part with more than 72 SMs; ``launch_geometry`` refuses others.
 RASTER_GROUP_M = 16
-_ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+# The grid rule every record of the registry declares: this module evaluates it
+# (``launch_geometry``), and ``prepare_fp8_gemm_1d1d`` refuses a record whose
+# rule is another.
+GRID_RULE = {
+    "kind": "deepgemm_persistent_even",
+    "block_m": BLOCK_M,
+    "block_n": BLOCK_N,
+    "block_k": BLOCK_K,
+    "raster_group_m": RASTER_GROUP_M,
+}
 
 
 def device_arch(device) -> str:
@@ -37,14 +48,14 @@ def device_arch(device) -> str:
 @functools.cache
 def _device_facts(index: int) -> tuple[str, int]:
     capability = tuple(torch.cuda.get_device_capability(index))
-    arch = _ARCHES.get(capability)
+    arch = cake_jit.arch_for_capability(capability)
     if arch is None or any(
         arch not in record["arches"] for record in cake_jit.MODULES.values()
     ):
         raise RuntimeError(
             f"FP8 1D1D GEMM has no generated programs for compute capability {capability}"
         )
-    return arch, int(torch.cuda.get_device_properties(index).multi_processor_count)
+    return arch, cake_jit.sm_count(index)
 
 
 def raster_group_m(num_sms: int) -> int:
@@ -138,6 +149,15 @@ def _check_tma_operand(t: torch.Tensor, name: str) -> None:
         )
 
 
+def _check_grid_rule(name: str, record: dict) -> None:
+    """The record's grid rule is the one this module evaluates."""
+    if dict(record["grid_rule"]) != GRID_RULE:
+        raise RuntimeError(
+            f"record {name} declares the grid rule {record['grid_rule']!r}; "
+            f"this runtime evaluates {GRID_RULE!r}"
+        )
+
+
 class Fp8GemmPlan:
     """One prepared launch; ``run()`` submits it on the current PyTorch stream."""
 
@@ -168,7 +188,8 @@ def prepare_fp8_gemm_1d1d(a, b, sfa, sfb, out, *, accumulate=False, cache_dir=No
     column slice of a wider buffer (``torch.empty(M, pitch, ...)[:, :N]``),
     whose pad columns are never written.  ``run()`` allocates nothing and can
     be captured into a CUDA graph.  ``cache_dir`` is accepted for signature
-    stability only: programs are built by FlashInfer's JIT.
+    stability only: programs load through ``cake_jit.load`` (a prebuilt
+    library, else FlashInfer's JIT).
     """
     del cache_dir
     case = "wgrad" if accumulate else "forward"
@@ -213,7 +234,10 @@ def prepare_fp8_gemm_1d1d(a, b, sfa, sfb, out, *, accumulate=False, cache_dir=No
         _check_tma_operand(t, operand_name)
     name = cake_jit.KERNELS[case]
     record = cake_jit.MODULES[name]
-    module = cake_jit.load_module(name, arch)
+    _check_grid_rule(name, record)
+    module = cake_jit.load(name, arch)
+    # The launch values by the kernel parameters' logical names (the record's
+    # ``logical`` map is the identity), plus the grid axes the plan exposes.
     bindings = dict(
         A=a,
         B=b,
@@ -230,5 +254,6 @@ def prepare_fp8_gemm_1d1d(a, b, sfa, sfb, out, *, accumulate=False, cache_dir=No
         grid_y=1,
         grid_z=1,
     )
-    args = tuple(bindings[key] for _, key in record["arg_plan"])
-    return Fp8GemmPlan(module[record["ffi_entry"]], args, bindings, geometry)
+    grid = (bindings["grid_x"], bindings["grid_y"], bindings["grid_z"])
+    args = cake_jit.launch_args(record, bindings, grid)
+    return Fp8GemmPlan(getattr(module, record["ffi_entry"]), args, bindings, geometry)

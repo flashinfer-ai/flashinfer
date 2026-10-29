@@ -23,15 +23,11 @@ from importlib import resources
 from typing import Any, Dict, Optional, Tuple
 
 import torch
+import tvm_ffi
 
-from . import cake_concat_mla_kv_quant_fp8
 from .api_logging import flashinfer_api
-from .jit.cake_concat_mla_kv_quant_fp8 import (
-    ROUTES,
-    concat_mla_kv_quant_fp8_route_record,
-    concat_mla_kv_quant_fp8_target_for_capability,
-    load_concat_mla_kv_quant_fp8_build,
-)
+from .jit.cake_concat_mla_kv_quant_fp8 import HG1, HG2, HG3, HG4, PROGRAMS
+from .jit.cake_program import CakeProgram
 from .jit.mla_kv_pack import gen_mla_kv_pack_fp8_module
 from .trace.templates.attention import concat_mla_kv_quant_fp8_trace
 from .utils import get_compute_capability
@@ -83,6 +79,10 @@ _SMALL_T_TOKENS = 2048
 # Most head pairs (4 KB of input) a warp keeps in flight within the register
 # budget; every warp of a token but the last takes this many.
 _MAX_HEAD_GROUP = 4
+# The generated Cake programs by head group: the host plans the head group from
+# ``(num_tokens, num_heads)`` and launches that program (one library per exact
+# target, ``sm_100a`` / ``sm_103a``, loaded on first use).
+_CAKE_PROGRAMS: Dict[int, CakeProgram] = {1: HG1, 2: HG2, 3: HG3, 4: HG4}
 
 # Dispatch surface of the fused kernels (package data; see the file's note).
 _WORKLOAD_FILE = "mla_kv_pack_fp8_workloads.json"
@@ -136,9 +136,9 @@ def _plan_head_group(num_tokens: int, num_heads: int) -> int:
     three for H in {5, 6}, 4 + 1 for H in {9, 10}, 4 + 2 for H in {11, 12},
     4 + 4 + 1 for H in {17, 18}; four per warp for H = 24 .. 128). The 4 + 2 split
     replaced the earlier balanced 3 + 3 split for 12 local heads after the
-    B200 / GB300 A/B of the two programs (Cake CAKE-1089 round 11): 4 + 2 is
-    faster on every one of the 18 Kimi-K3 serving shapes on B200 (+0.5 % to
-    +1.5 %) and equal within noise on GB300.
+    B200 / GB300 A/B of the two programs: 4 + 2 is faster on every one of the
+    18 Kimi-K3 serving shapes on B200 (+0.5 % to +1.5 %) and equal within noise
+    on GB300.
     """
     head_pairs = (int(num_heads) + 1) // 2
     if int(num_tokens) <= _SMALL_T_TOKENS and head_pairs % 2 == 0:
@@ -156,7 +156,66 @@ def _plan_grid(num_tokens: int, num_heads: int, head_group: int) -> Tuple[int, i
     return grid, warps_per_token
 
 
-# Loaded JIT modules. The Cake backend builds one module per (exact target,
+def _cake_target(program: CakeProgram, device: torch.device) -> str:
+    """The exact compile target of ``program`` on ``device``; a device the
+    program is not built for is an error (the guards take the fallback first)."""
+    major, minor = get_compute_capability(device)
+    target = program.target_for((int(major), int(minor)))
+    if target is None:
+        raise RuntimeError(
+            "the Cake concat_mla_kv_quant_fp8 backend requires exact compute "
+            f"capability 10.0 or 10.3, got {major}.{minor}"
+        )
+    return target
+
+
+def cake_target_for_capability(capability: Tuple[int, int]) -> Optional[str]:
+    """The exact target every generated program is built for on a device of
+    ``capability``, or ``None`` (another 10.x / 12.x part takes the composable
+    path: the host never cross-routes a library)."""
+    targets = {program.target_for(capability) for program in _CAKE_PROGRAMS.values()}
+    if len(targets) != 1:
+        return None
+    return targets.pop()
+
+
+def _cake_launch_values(
+    kv_nope: torch.Tensor,
+    k_pe: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    *,
+    warps_per_token: int,
+    grid_x: int,
+) -> Dict[str, Any]:
+    """The generated binding's arguments by name (``CakeProgram.args`` orders
+    them): the four tensors, the five launch scalars and the grid.  The pack
+    program uses plain global pointers: no descriptors, no workspace, nothing
+    allocated, so the launch is CUDA-graph capturable."""
+    num_tokens, num_heads = int(kv_nope.shape[0]), int(kv_nope.shape[1])
+    # ``k_pe`` rows may be a column slice of a wider workspace (unit last stride,
+    # 32-byte-aligned rows, see _k_pe_rows_admissible); the kernel takes the row
+    # stride in elements and checks it against its 256-bit lane loads.  With one
+    # token the stride is never dereferenced and the guards admit any value, so
+    # the dense row stride is passed.
+    k_pe_row_stride = int(k_pe.stride(0)) if num_tokens > 1 else ROPE_DIM
+    return {
+        "kv_nope": kv_nope,
+        "k_pe": k_pe,
+        "key": key,
+        "value": value,
+        "num_tokens": num_tokens,
+        "num_heads": num_heads,
+        "head_pairs": (num_heads + 1) // 2,
+        "warps_per_token": int(warps_per_token),
+        "k_pe_row_stride": k_pe_row_stride,
+        "grid_x": int(grid_x),
+        "grid_y": 1,
+        "grid_z": 1,
+    }
+
+
+# Loaded JIT modules. The Cake backend loads one library per (exact target,
 # head group); the specialized backend one module holding both head-count
 # variants. Keyed by backend name so a future backend adds an entry, not a
 # global.
@@ -183,8 +242,8 @@ def _bump_fallback(reason: str) -> None:
     reasons[reason] = reasons.get(reason, 0) + 1
 
 
-def _get_module(target: str, head_group: int):
-    """Build/load the Cake (target, head group) JIT module once; never inside a CUDA-graph capture."""
+def _get_module(program: CakeProgram, target: str, head_group: int):
+    """Build/load the Cake (target, head group) program once; never inside a CUDA-graph capture."""
     key = (target, int(head_group))
     module = _cake_modules.get(key)
     if module is not None:
@@ -192,9 +251,7 @@ def _get_module(target: str, head_group: int):
     with _module_lock:
         if key not in _cake_modules and key not in _module_errors:
             try:
-                _cake_modules[key] = load_concat_mla_kv_quant_fp8_build(
-                    target, int(head_group)
-                )
+                _cake_modules[key] = program.load(target)
                 _stats["module_loaded"] = True
             except Exception as exc:  # noqa: BLE001 - guard must never break the stock path
                 error = f"{type(exc).__name__}: {exc}"[:500]
@@ -243,7 +300,7 @@ def _concat_mla_kv_quant_fp8_stats() -> dict:
     the 12-head unrolled variant and the runtime-head-count variant. Token and
     head counts are runtime launch arguments on both, so nothing is compiled
     per shape. ``compiled_variants`` counts the modules loaded so far;
-    ``distinct_kernels_for_allowlist`` is the Cake route table's program count.
+    ``distinct_kernels_for_allowlist`` is the number of generated Cake programs.
     """
     allowlist = _load_allowlist()
     return {
@@ -260,9 +317,12 @@ def _concat_mla_kv_quant_fp8_stats() -> dict:
             "specialized": "specialized" in _backend_modules,
             "cake": len(_cake_modules),
         },
-        "distinct_kernels_for_allowlist": len(ROUTES),
+        "distinct_kernels_for_allowlist": len(PROGRAMS),
         "distinct_kernels": "cake: one generated program per head group "
-        + ", ".join(sorted(ROUTES))
+        + ", ".join(
+            f"{head_group}: {program.name}"
+            for head_group, program in sorted(_CAKE_PROGRAMS.items())
+        )
         + " (head group planned from num_tokens and num_heads); specialized: "
         "num_heads==12 (unrolled) + runtime-heads variant (T and H are runtime "
         "arguments on both)",
@@ -388,7 +448,8 @@ def _cake_supported(
     reason = _device_supported(kv_nope)
     if reason is not None:
         return reason
-    target = concat_mla_kv_quant_fp8_target_for_capability(
+    head_group = _plan_head_group(num_tokens, num_heads)
+    target = _CAKE_PROGRAMS[head_group].target_for(
         get_compute_capability(kv_nope.device)
     )
     if target is None:
@@ -396,7 +457,7 @@ def _cake_supported(
         return "exact_target"
     if (
         torch.cuda.is_current_stream_capturing()
-        and _cake_modules.get((target, _plan_head_group(num_tokens, num_heads))) is None
+        and _cake_modules.get((target, head_group)) is None
     ):
         # Never compile/load inside a capture; the stock path is capture-safe.
         return "capturing_before_jit"
@@ -467,22 +528,18 @@ def _launch_cake(
 ) -> bool:
     num_tokens, num_heads = int(kv_nope.shape[0]), int(kv_nope.shape[1])
     head_group = _plan_head_group(num_tokens, num_heads)
-    route = concat_mla_kv_quant_fp8_route_record(kv_nope.device, head_group)
-    module = _get_module(route["target"], head_group)
-    if module is None:
+    program = _CAKE_PROGRAMS[head_group]
+    target = _cake_target(program, kv_nope.device)
+    if _get_module(program, target, head_group) is None:
         return False
-    grid, warps_per_token = _plan_grid(num_tokens, num_heads, head_group)
-    cake_concat_mla_kv_quant_fp8.launch(
-        kv_nope,
-        k_pe,
-        key,
-        value,
-        head_group=head_group,
-        warps_per_token=warps_per_token,
-        grid=grid,
-        module=module,
-        record=route["module"],
+    grid_x, warps_per_token = _plan_grid(num_tokens, num_heads, head_group)
+    values = _cake_launch_values(
+        kv_nope, k_pe, key, value, warps_per_token=warps_per_token, grid_x=grid_x
     )
+    entry = program.entry(target)
+    arguments = [values[name] for name in program.args]
+    with tvm_ffi.use_torch_stream():
+        entry(*arguments)
     return True
 
 

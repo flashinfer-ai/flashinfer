@@ -73,6 +73,7 @@ from .fp4_common import (
     ue8m0_to_output_scale,
     # Reduction utilities
     row_reduce,
+    zero_swizzled_sf_padding,
     # Predicate utility
     predicate_k,
     # Helper functions for SF block processing
@@ -499,7 +500,20 @@ class AddRMSNormFP4QuantKernel:
             tv_layout,
             tiler_mn,
         ).launch(
-            grid=[cute.ceil_div(M, self.rows_per_block), self.cluster_n, 1],
+            grid=[
+                cute.ceil_div(
+                    # A swizzled scale buffer is padded to 128 rows; the CTAs past M
+                    # only zero their rows of that padding (zero_swizzled_sf_padding).
+                    (M + 127) // 128 * 128
+                    if cutlass.const_expr(
+                        self.output_swizzled or self.output_both_sf_layouts
+                    )
+                    else M,
+                    self.rows_per_block,
+                ),
+                self.cluster_n,
+                1,
+            ],
             block=[self.num_threads, 1, 1],
             cluster=[1, self.cluster_n, 1]
             if cutlass.const_expr(self.cluster_n > 1)
@@ -1140,6 +1154,17 @@ class AddRMSNormFP4QuantKernel:
                                     is_fp16,
                                 )
 
+        if cutlass.const_expr(self.output_swizzled or self.output_both_sf_layouts):
+            zero_swizzled_sf_padding(
+                mS,
+                M,
+                actual_row_idx,
+                lane_in_row,
+                num_sf_blocks_per_row,
+                self.num_k_tiles,
+                self.threads_per_row,
+            )
+
         if enable_pdl:
             cute.arch.griddepcontrol_launch_dependents()
 
@@ -1436,6 +1461,17 @@ def add_rmsnorm_fp4quant(
     - FP4 E2M1 format has a max representable value of 6.0.
     """
     _require_cute_dsl_arch_for(input.device)
+    # residual and caller-provided outputs are written in place with row-major
+    # addressing; a strided view would be written through a temporary copy and
+    # left unchanged.
+    assert residual.is_contiguous(), "residual must be contiguous"
+    for name, out in (
+        ("y_fp4", y_fp4),
+        ("block_scale", block_scale),
+        ("block_scale_unswizzled", block_scale_unswizzled),
+    ):
+        if out is not None:
+            assert out.is_contiguous(), f"{name} must be contiguous"
     is_3d = input.dim() == 3
     if is_3d:
         B, S, H = input.shape

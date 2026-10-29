@@ -67,17 +67,28 @@ def validate_tactic(tactic: DirectTactic, m: int, n: int, k: int) -> None:
 
 def default_tactic(m: int, n: int, k: int) -> DirectTactic:
     """Choose the measured register-prefetch fallback tactic."""
-    block_size = next(
-        (
-            block
-            for block in (256, 192, 128, 96, 64, 32)
-            if k % (block * _VECTOR_WIDTH) == 0
-        ),
-        None,
-    )
-    if block_size is None:
+    blocks = [
+        block
+        for block in (256, 192, 128, 96, 64, 32)
+        if k % (block * _VECTOR_WIDTH) == 0
+    ]
+    if not blocks:
         raise ValueError("direct GEMM requires a supported 16-byte K tiling")
-    outputs_per_block = next(outputs for outputs in (2, 1) if n % outputs == 0)
+    # For M <= 4, keep at least two prefetched B vectors per thread: with one,
+    # a short-K CTA has too few loads in flight (cold-L2 B200/B300 sweep: up to
+    # 15% at M <= 2, K = 2048).  Larger M already issues a load per row.
+    block_size = blocks[0]
+    if m <= 4:
+        block_size = next(
+            (block for block in blocks if k // (block * _VECTOR_WIDTH) >= 2),
+            blocks[-1],
+        )
+    # Small weights (< 4 MiB): one output per CTA doubles the CTA count (up to
+    # 20% at M=8, N=128); larger weights already fill the SMs with two.
+    if n * k < 1 << 21:
+        outputs_per_block = 1
+    else:
+        outputs_per_block = next(outputs for outputs in (2, 1) if n % outputs == 0)
     tactic = DirectTactic(
         block_size,
         outputs_per_block,
@@ -114,17 +125,37 @@ def autotune_tactics(m: int, n: int, k: int) -> list[DirectTactic]:
     return list(dict.fromkeys(tactics))
 
 
-def prefer_direct_bf16_gemm_sm100(m: int, n: int, k: int) -> bool:
-    """Return the conservative B200 no-autotune crossover heuristic.
+def is_direct_bf16_gemm_candidate_sm100(m: int, n: int) -> bool:
+    """Return whether direct is worth profiling for public ``(M, N)``.
 
-    The three bands are a compact fit to a warm/cold sweep over M=1..16,24,32,
-    18 N values, and 11 K values.  This is deliberately not a blanket rule for
-    K=8192: direct wins only where public M and N leave the tensor-core path
-    with too little independent output work.
+    Direct splits N one to four outputs per CTA, so it wins while M * N is too
+    small for the 16-wide warp / tensor-core tiles to fill the SMs; above
+    M = 8 each row group also re-reads B.  In a cold-L2 CUPTI sweep on B200
+    and B300 (M in {1, 2, 3, 4, 6, 8, 12, 16, 24, 32}, N = 128..8192,
+    K = 768..40960, every tactic of all three runners), direct never beat warp /
+    cluster Split-K by more than 1% outside this region.  M <= 3 is profiled
+    regardless of N because direct can still win by a few percent there.
     """
-    return k == 8192 and (
-        (m == 1 and n <= 4608) or (m <= 4 and n <= 512) or (m <= 8 and n <= 256)
-    )
+    return m <= 3 or m * n <= 4096
+
+
+def prefer_direct_bf16_gemm_sm100(m: int, n: int, k: int) -> bool:
+    """Return the no-autotune crossover heuristic (same rule on every GPU).
+
+    True implies ``default_tactic(m, n, k)`` succeeds.  The region contains the
+    previous K == 8192 bands and only shapes where the default direct tactic
+    was no slower than the previous no-autotune choice (the warp / cluster
+    Split-K default, or direct inside those bands) in cold-L2 CUPTI sweeps
+    with interleaved re-timing (within 2%).  Direct wins while M * N is too
+    small to fill the SMs with Split-K tiles; at M = 1 it also wins on long K.
+    M = 2 with larger N, M = 1 with K < 5120, and K = 40960 are left out
+    because the Split-K default can be faster there.
+    """
+    if not 1 <= m <= _MAX_M or n <= 0 or k <= 0:
+        return False
+    if k % (_SUPPORTED_BLOCK_SIZES[0] * _VECTOR_WIDTH):
+        return False
+    return m * n <= 2048 or (m == 1 and n <= 8192 and 5120 <= k <= 16384)
 
 
 class DirectDenseGemmKernel:
@@ -376,6 +407,7 @@ __all__ = [
     "DirectTactic",
     "autotune_tactics",
     "default_tactic",
+    "is_direct_bf16_gemm_candidate_sm100",
     "prefer_direct_bf16_gemm_sm100",
     "run_direct_dense",
 ]

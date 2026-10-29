@@ -42,6 +42,8 @@ from b12x.attention.compressed_sparse_mla._scratch import (
 )
 
 from b12x.testing.reference.helpers import require_b12x as _require_b12x
+from b12x.attention import compressed_sparse_mla
+from ._prepared_compressed_test_utils import prepare_compressed_binding
 
 
 # GLM_NSA uncompressed decode contract: q_head_dim = d_nope + d_rope = 512 + 64 = 576,
@@ -553,7 +555,9 @@ def _make_dsv4_scratch(device, *, topk, max_chunks):
     )
     layout = _compressed_sparse_mla_scratch_layout(caps)
     storage = torch.zeros(int(layout.nbytes), dtype=torch.uint8, device=device)
-    return _materialize_compressed_sparse_mla_scratch(caps, storage, layout)
+    return _materialize_compressed_sparse_mla_scratch(
+        caps, storage, layout, execution_config=None
+    )
 
 
 @torch.inference_mode()
@@ -632,14 +636,25 @@ def test_dsv4_compressed_prefill_mode_routes_to_unified_prefill(mode) -> None:
     q, cache, indices, lengths = _make_dsv4_compressed_case(
         device, topk=topk, seed=topk
     )
-    scratch = _make_dsv4_scratch(device, topk=topk, max_chunks=8)
-    scratch.mode = mode
-    output = compressed_sparse_mla_decode_forward(
-        q_all=q,
+    owners = prepare_compressed_binding(
+        caps=B12XCompressedSparseMLAScratchCaps(
+            device=q.device,
+            num_q_heads=_DSV4_HEADS,
+            max_q_rows=1,
+            max_width=topk,
+            max_chunks_per_row=8,
+            mode=mode,
+        ),
+        q=q,
         swa_k_cache=cache,
         swa_indices=indices,
-        swa_topk_lengths=lengths,
-        workspace=scratch,
+        swa_lengths=lengths,
+        sm_scale=_DSV4_SM_SCALE,
+        swa_page_size=_DSV4_PAGE,
+    )
+    output = compressed_sparse_mla.run(
+        binding=owners[3],
+        swa_k_cache=cache,
         sm_scale=_DSV4_SM_SCALE,
         swa_page_size=_DSV4_PAGE,
     )
@@ -693,20 +708,30 @@ def test_dsv4_compressed_decode_extra_cache_routes_to_unified(monkeypatch) -> No
     exp_O = case["expected_O"][0].float()
 
     n_chunks = (topk + 64 - 1) // 64 + (extra_topk + 64 - 1) // 64
-    scratch = _make_dsv4_scratch(
-        device, topk=topk + extra_topk, max_chunks=max(8, n_chunks)
-    )
-
-    out = compressed_sparse_mla_decode_forward(
-        q_all=q,
+    owners = prepare_compressed_binding(
+        caps=B12XCompressedSparseMLAScratchCaps(
+            device=q.device,
+            num_q_heads=_DSV4_HEADS,
+            max_q_rows=1,
+            max_width=topk + extra_topk,
+            max_chunks_per_row=max(8, n_chunks),
+        ),
+        q=q,
         swa_k_cache=swa_cache,
         swa_indices=main_idx,
-        swa_topk_lengths=lengths,
+        swa_lengths=lengths,
         indexed_k_cache=idx_cache,
         indexed_indices=extra_idx,
-        indexed_topk_lengths=extra_lengths,
+        indexed_lengths=extra_lengths,
         indexed_page_size=pbs_extra,
-        workspace=scratch,
+        sm_scale=case["sm_scale"],
+        swa_page_size=_DSV4_PAGE,
+    )
+    out = compressed_sparse_mla.run(
+        binding=owners[3],
+        swa_k_cache=swa_cache,
+        indexed_k_cache=idx_cache,
+        indexed_page_size=pbs_extra,
         sm_scale=case["sm_scale"],
         swa_page_size=_DSV4_PAGE,
     )
@@ -880,7 +905,9 @@ def _make_dsv4_scratch_heads(device, *, topk, max_chunks, num_heads):
     )
     layout = _compressed_sparse_mla_scratch_layout(caps)
     storage = torch.zeros(int(layout.nbytes), dtype=torch.uint8, device=device)
-    return _materialize_compressed_sparse_mla_scratch(caps, storage, layout)
+    return _materialize_compressed_sparse_mla_scratch(
+        caps, storage, layout, execution_config=None
+    )
 
 
 def _run_unified_dsv4(device, *, topk, forced_num_splits, seed):
@@ -2256,7 +2283,9 @@ def _run_unified_dsv4_multitoken(
     )
     layout = _compressed_sparse_mla_scratch_layout(caps)
     storage = torch.zeros(int(layout.nbytes), dtype=torch.uint8, device=device)
-    scratch = _materialize_compressed_sparse_mla_scratch(caps, storage, layout)
+    scratch = _materialize_compressed_sparse_mla_scratch(
+        caps, storage, layout, execution_config=None
+    )
 
     out = run_unified_decode(
         q_all=q,
@@ -2461,7 +2490,9 @@ def test_unified_decode_dual_cache_multitoken_per_token_length(num_tokens) -> No
     )
     layout = _compressed_sparse_mla_scratch_layout(caps)
     storage = torch.zeros(int(layout.nbytes), dtype=torch.uint8, device=device)
-    scratch = _materialize_compressed_sparse_mla_scratch(caps, storage, layout)
+    scratch = _materialize_compressed_sparse_mla_scratch(
+        caps, storage, layout, execution_config=None
+    )
 
     out = run_unified_decode(
         q_all=q,

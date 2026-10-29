@@ -279,7 +279,20 @@ def test_prepared_run_replays_bitwise_from_a_cuda_graph(monkeypatch, form):
     else:
         family = "exactfused"
     mode = "batched" if form in ("batched", "chunk_parallel") else "varlen"
-    assert prepared.program_name == f"{family}_bf16_{mode}"
+    table_form = ""
+    if family == "exactone":
+        # SM107 picks the one-launch prologue form by the launch grid.
+        table_form = importlib.import_module(
+            "flashinfer.mamba.cake_ssd_combined"
+        ).exactone_table_variant(
+            capability=torch.cuda.get_device_capability(),
+            variant="",
+            state_dtype=torch.bfloat16,
+            grid=prepared.grid[0],
+        )
+    assert prepared.program_name == f"{family}_bf16_{mode}" + (
+        f"_{table_form}" if table_form else ""
+    )
     if family in ("exactfused", "exactone"):
         # The fused program is prepared only as a single launch (the
         # one-launch program always is).
@@ -1184,7 +1197,18 @@ def test_fused_window_programs_never_take_the_tail_variant_without_gpu(
             assert runner._allocations_in_last_run == 0
         program = module._PROGRAMS[name]
         assert program.family == family, (arch, form, name)
-        assert program.variant == "" and program.cluster_dims == (1, 1, 1)
+        # SM107's one-launch program takes the prologue form of its grid.
+        table_form = (
+            module.exactone_table_variant(
+                capability=module._ARCH_CAPABILITIES[arch],
+                variant="",
+                state_dtype=torch.bfloat16,
+                grid=grid,
+            )
+            if family == "exactone"
+            else ""
+        )
+        assert program.variant == table_form and program.cluster_dims == (1, 1, 1)
         assert not name.endswith("_tail")
         assert launch["main_grid"] == (grid, 1, 1) == (16, 1, 1)
         if family == "exactone":
