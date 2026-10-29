@@ -595,14 +595,14 @@ kernel_cake_kimi_k3_fp8_projection_352e525a7e614a09b448(const __grid_constant__ 
                     } else {
                         int _max_4 = ((0) > (-my_rank) ? (0) : (-my_rank));
                         int _min_3 = ((1) < (_max_4) ? (1) : (_max_4));
-                        int o_idx = -_min_3;
-                        unsigned int stg_b = (unsigned int)(o_idx * 2560) + line_b;
+                        int o_idx_0 = -_min_3;
+                        unsigned int stg_b_0 = (unsigned int)(o_idx_0 * 2560) + line_b;
                         {
-                            uint32_t _addr_5 = static_cast<uint32_t>(smem_stg_addr + stg_b);
+                            uint32_t _addr_5 = static_cast<uint32_t>(smem_stg_addr + stg_b_0);
                             asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_5), "f"(_tmem_load_0[0]) : "memory");
                         }
                         {
-                            uint32_t _addr_6 = static_cast<uint32_t>(smem_stg_addr + (stg_b + 4));
+                            uint32_t _addr_6 = static_cast<uint32_t>(smem_stg_addr + (stg_b_0 + 4));
                             asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_6), "f"(_tmem_load_0[1]) : "memory");
                         }
                     }
@@ -618,14 +618,14 @@ kernel_cake_kimi_k3_fp8_projection_352e525a7e614a09b448(const __grid_constant__ 
                     } else {
                         int _max_10 = ((0) > (1 - my_rank) ? (0) : (1 - my_rank));
                         int _min_9 = ((1) < (_max_10) ? (1) : (_max_10));
-                        int o_idx_0 = 1 - _min_9;
-                        unsigned int stg_b_0 = (unsigned int)(o_idx_0 * 2560) + line_b;
+                        int o_idx_1 = 1 - _min_9;
+                        unsigned int stg_b_1 = (unsigned int)(o_idx_1 * 2560) + line_b;
                         {
-                            uint32_t _addr_11 = static_cast<uint32_t>(smem_stg_addr + stg_b_0);
+                            uint32_t _addr_11 = static_cast<uint32_t>(smem_stg_addr + stg_b_1);
                             asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_11), "f"(_tmem_load_0[2]) : "memory");
                         }
                         {
-                            uint32_t _addr_12 = static_cast<uint32_t>(smem_stg_addr + (stg_b_0 + 4));
+                            uint32_t _addr_12 = static_cast<uint32_t>(smem_stg_addr + (stg_b_1 + 4));
                             asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_12), "f"(_tmem_load_0[3]) : "memory");
                         }
                     }
@@ -641,14 +641,14 @@ kernel_cake_kimi_k3_fp8_projection_352e525a7e614a09b448(const __grid_constant__ 
                     } else {
                         int _max_16 = ((0) > (2 - my_rank) ? (0) : (2 - my_rank));
                         int _min_15 = ((1) < (_max_16) ? (1) : (_max_16));
-                        int o_idx_1 = 2 - _min_15;
-                        unsigned int stg_b_1 = (unsigned int)(o_idx_1 * 2560) + line_b;
+                        int o_idx_2 = 2 - _min_15;
+                        unsigned int stg_b_2 = (unsigned int)(o_idx_2 * 2560) + line_b;
                         {
-                            uint32_t _addr_17 = static_cast<uint32_t>(smem_stg_addr + stg_b_1);
+                            uint32_t _addr_17 = static_cast<uint32_t>(smem_stg_addr + stg_b_2);
                             asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_17), "f"(_tmem_load_0[4]) : "memory");
                         }
                         {
-                            uint32_t _addr_18 = static_cast<uint32_t>(smem_stg_addr + (stg_b_1 + 4));
+                            uint32_t _addr_18 = static_cast<uint32_t>(smem_stg_addr + (stg_b_2 + 4));
                             asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_18), "f"(_tmem_load_0[5]) : "memory");
                         }
                     }
@@ -664,14 +664,14 @@ kernel_cake_kimi_k3_fp8_projection_352e525a7e614a09b448(const __grid_constant__ 
                     } else {
                         int _max_22 = ((0) > (3 - my_rank) ? (0) : (3 - my_rank));
                         int _min_21 = ((1) < (_max_22) ? (1) : (_max_22));
-                        int o_idx_2 = 3 - _min_21;
-                        unsigned int stg_b_2 = (unsigned int)(o_idx_2 * 2560) + line_b;
+                        int o_idx_3 = 3 - _min_21;
+                        unsigned int stg_b_3 = (unsigned int)(o_idx_3 * 2560) + line_b;
                         {
-                            uint32_t _addr_23 = static_cast<uint32_t>(smem_stg_addr + stg_b_2);
+                            uint32_t _addr_23 = static_cast<uint32_t>(smem_stg_addr + stg_b_3);
                             asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_23), "f"(_tmem_load_0[6]) : "memory");
                         }
                         {
-                            uint32_t _addr_24 = static_cast<uint32_t>(smem_stg_addr + (stg_b_2 + 4));
+                            uint32_t _addr_24 = static_cast<uint32_t>(smem_stg_addr + (stg_b_3 + 4));
                             asm volatile("st.shared.f32 [%0], %1;" :: "r"(_addr_24), "f"(_tmem_load_0[7]) : "memory");
                         }
                     }
@@ -712,83 +712,83 @@ kernel_cake_kimi_k3_fp8_projection_352e525a7e614a09b448(const __grid_constant__ 
                 mbarrier_wait_cluster_hint(red_full_addr, _phase_red_full, 10000000);
                 if (epi_group == 0) {
                     if (0 == my_rank) {
-                        float total_1_0 = 0.0f;
+                        float total_0 = 0.0f;
                         #pragma unroll
-                        for (int src_1_0 = 0; src_1_0 < 14; src_1_0++) {
-                            total_1_0 = total_1_0 + smem_red[src_1_0 * 640 + lane_row * 5];
+                        for (int src_0 = 0; src_0 < 14; src_0++) {
+                            total_0 = total_0 + smem_red[src_0 * 640 + lane_row * 5];
                         }
-                        int tok_c_2_0 = tok0;
-                        if (feature < n_valid && tok_c_2_0 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_2_0 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_1_0;
+                        int tok_c_0 = tok0;
+                        if (feature < n_valid && tok_c_0 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_0 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_0;
                         }
-                        float total_2_0 = 0.0f;
+                        float total_1 = 0.0f;
                         #pragma unroll
-                        for (int src_1_1 = 0; src_1_1 < 14; src_1_1++) {
-                            total_2_0 = total_2_0 + smem_red[src_1_1 * 640 + lane_row * 5 + 1];
+                        for (int src_1 = 0; src_1 < 14; src_1++) {
+                            total_1 = total_1 + smem_red[src_1 * 640 + lane_row * 5 + 1];
                         }
-                        int tok_c_3_0 = tok0 + 1;
-                        if (feature < n_valid && tok_c_3_0 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_3_0 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_2_0;
+                        int tok_c_1 = tok0 + 1;
+                        if (feature < n_valid && tok_c_1 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_1 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_1;
                         }
                     }
                     if (1 == my_rank) {
-                        float total_1_1 = 0.0f;
+                        float total_2 = 0.0f;
                         #pragma unroll
-                        for (int src_1_2 = 0; src_1_2 < 14; src_1_2++) {
-                            total_1_1 = total_1_1 + smem_red[src_1_2 * 640 + lane_row * 5];
+                        for (int src_2 = 0; src_2 < 14; src_2++) {
+                            total_2 = total_2 + smem_red[src_2 * 640 + lane_row * 5];
                         }
-                        int tok_c_2_1 = tok0 + 2;
-                        if (feature < n_valid && tok_c_2_1 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_2_1 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_1_1;
+                        int tok_c_2 = tok0 + 2;
+                        if (feature < n_valid && tok_c_2 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_2 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_2;
                         }
-                        float total_2_1 = 0.0f;
+                        float total_3 = 0.0f;
                         #pragma unroll
-                        for (int src_1_3 = 0; src_1_3 < 14; src_1_3++) {
-                            total_2_1 = total_2_1 + smem_red[src_1_3 * 640 + lane_row * 5 + 1];
+                        for (int src_3 = 0; src_3 < 14; src_3++) {
+                            total_3 = total_3 + smem_red[src_3 * 640 + lane_row * 5 + 1];
                         }
-                        int tok_c_3_1 = tok0 + 3;
-                        if (feature < n_valid && tok_c_3_1 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_3_1 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_2_1;
+                        int tok_c_3 = tok0 + 3;
+                        if (feature < n_valid && tok_c_3 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_3 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_3;
                         }
                     }
                     if (2 == my_rank) {
-                        float total_1_2 = 0.0f;
+                        float total_4 = 0.0f;
                         #pragma unroll
-                        for (int src_1_4 = 0; src_1_4 < 14; src_1_4++) {
-                            total_1_2 = total_1_2 + smem_red[src_1_4 * 640 + lane_row * 5];
+                        for (int src_4 = 0; src_4 < 14; src_4++) {
+                            total_4 = total_4 + smem_red[src_4 * 640 + lane_row * 5];
                         }
-                        int tok_c_2_2 = tok0 + 4;
-                        if (feature < n_valid && tok_c_2_2 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_2_2 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_1_2;
+                        int tok_c_4 = tok0 + 4;
+                        if (feature < n_valid && tok_c_4 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_4 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_4;
                         }
-                        float total_2_2 = 0.0f;
+                        float total_5 = 0.0f;
                         #pragma unroll
-                        for (int src_1_5 = 0; src_1_5 < 14; src_1_5++) {
-                            total_2_2 = total_2_2 + smem_red[src_1_5 * 640 + lane_row * 5 + 1];
+                        for (int src_5 = 0; src_5 < 14; src_5++) {
+                            total_5 = total_5 + smem_red[src_5 * 640 + lane_row * 5 + 1];
                         }
-                        int tok_c_3_2 = tok0 + 5;
-                        if (feature < n_valid && tok_c_3_2 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_3_2 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_2_2;
+                        int tok_c_5 = tok0 + 5;
+                        if (feature < n_valid && tok_c_5 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_5 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_5;
                         }
                     }
                     if (3 == my_rank) {
-                        float total_1_3 = 0.0f;
+                        float total_6 = 0.0f;
                         #pragma unroll
-                        for (int src_1_6 = 0; src_1_6 < 14; src_1_6++) {
-                            total_1_3 = total_1_3 + smem_red[src_1_6 * 640 + lane_row * 5];
+                        for (int src_6 = 0; src_6 < 14; src_6++) {
+                            total_6 = total_6 + smem_red[src_6 * 640 + lane_row * 5];
                         }
-                        int tok_c_2_3 = tok0 + 6;
-                        if (feature < n_valid && tok_c_2_3 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_2_3 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_1_3;
+                        int tok_c_6 = tok0 + 6;
+                        if (feature < n_valid && tok_c_6 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_6 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_6;
                         }
-                        float total_2_3 = 0.0f;
+                        float total_7 = 0.0f;
                         #pragma unroll
-                        for (int src_1_7 = 0; src_1_7 < 14; src_1_7++) {
-                            total_2_3 = total_2_3 + smem_red[src_1_7 * 640 + lane_row * 5 + 1];
+                        for (int src_7 = 0; src_7 < 14; src_7++) {
+                            total_7 = total_7 + smem_red[src_7 * 640 + lane_row * 5 + 1];
                         }
-                        int tok_c_3_3 = tok0 + 7;
-                        if (feature < n_valid && tok_c_3_3 < M) {
-                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_3_3 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_2_3;
+                        int tok_c_7 = tok0 + 7;
+                        if (feature < n_valid && tok_c_7 < M) {
+                            *(reinterpret_cast<__nv_bfloat16*>(out + ((unsigned long long)tok_c_7 * (unsigned long long)ldo + col)) + (0)) = (__nv_bfloat16)total_7;
                         }
                     }
                 }
