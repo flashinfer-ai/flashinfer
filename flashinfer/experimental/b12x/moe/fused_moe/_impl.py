@@ -2835,6 +2835,8 @@ def _heuristic_moe_decode_config(
             and query.routed_rows > _DIRECT_ROUTING_MAX_ROUTED_ROWS
         ):
             backend = "dynamic"
+    if backend == "micro" and query.deterministic_output:
+        backend = "dynamic"
     dynamic_tile_m = None
     dynamic_route_mode = None
     if backend == "dynamic":
