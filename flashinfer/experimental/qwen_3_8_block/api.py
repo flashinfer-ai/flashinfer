@@ -8,8 +8,8 @@ batch, the query rows per sequence, the page size and the pools' layout, the blo
 compressed-key cache's rows per page, the ring's capacity --, the input-contract flags, the knobs); ``prepare`` builds it outside
 CUDA-graph capture (it JIT-compiles the kernels and sizes the workspace), ``run`` launches it -- on the DECODE form the FIRST ``run``
 after ``prepare`` may already be captured (no plan constant, no allocation, no host read on the execute path); on the EXTEND forms a
-capture takes the run AFTER one eager warm-up on the capture stream (the first run uploads the select window plan's constants and, past
-128 rows, creates the band GEMM's graph-route handle).  The functional entry point keeps a small LRU of plans keyed on exactly the facts
+capture takes the run AFTER one eager warm-up on the capture stream (the first run uploads the select window plan's constants; under
+the 128-row bound every projection rides the capture-safe JIT route).  The functional entry point keeps a small LRU of plans keyed on exactly the facts
 a plan compiles in (the Qwen 3.5 package's rules: a plan a CUDA graph was captured over outlives its eviction and is released by
 ``clear_plan_cache`` only).  The vendored tree is the Qwen 3.5 package's (``..qwen_3_5_block._cudnn_frost``) and so are the cache roots
 (``configure_vendored_tree``) and the operand helpers.
@@ -489,7 +489,7 @@ class Qwen38BlockPlan:
     index_cache_dtype: torch.dtype = (
         torch.bfloat16
     )  #: the paged compressed-key cache's dtype
-    ring_cap: int = 0  #: the raw-key ring's rows per block the plan was declared with (a run may bind a ring with at least q_len + 3)
+    ring_cap: int = 0  #: the raw-key ring's rows per block the plan was declared with (decode: a run may bind a ring with at least q_len + 3; extend / prefill: exact, ``ring_cap_exact``)
     ring_slots: bool = False  #: run(index_state_slot_mapping=) names the ring WRITE rows (the stack's own slots)
     rope_position_tables_only: bool = True  #: every rotation reads the position tables; rope_cos / rope_sin are None at run
     fuse_prepare: bool = True  #: the resolved prepare-fusion knob (one launch vs the four-launch twin; bitwise)

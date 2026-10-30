@@ -947,9 +947,7 @@ def require_served(
     """The plan-time gate: a typed ``NotImplementedError`` naming the form, the device, the DSL version, the dtype or the geometry."""
     if form not in ALL_FORMS:
         raise ValueError(f"form must be one of {ALL_FORMS}, got {form!r}")
-    assert form in FORMS, (
-        form
-    )  # every form of ALL_FORMS is served by the one gate since the 4c8e24355 pin
+    # every form of ALL_FORMS is served by the one gate since the 4c8e24355 pin (FORMS == ALL_FORMS; no second check)
     reason = (
         geometry.unsupported_reason()
         or dtype_reason(dtype)
