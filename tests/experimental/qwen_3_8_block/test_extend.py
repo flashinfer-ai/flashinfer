@@ -833,7 +833,9 @@ def test_launch_census_by_kernel_name_matches_the_declaration():
     assert not any("nvjet" in n.lower() or "cublas" in n.lower() for n in names), (
         "the slab left the FROST route"
     )
-    # a lowered budget: 40 rows per select window over 80 rows -> two windows (+ 2 launches: the second scorer + top-k pair), the same bytes
+    # a lowered budget: 40 rows per select window over 80 rows -> two windows (+ 2 launches: the second scorer + top-k pair), the same bytes;
+    # every run starts from the restored caches (one run leaves the chunk's last cap raw keys in the ring: the next chunk's input, not this one's)
+    case.restore()
     out_one = _run(plan, case).clone()
     ids_one = case.block_ids_out.clone()
     case.restore()
@@ -869,7 +871,8 @@ def test_launch_census_by_kernel_name_matches_the_declaration():
 def test_workspace_query_is_honest_and_runs_allocate_nothing():
     """``qwen_3_8_block_workspace_size("extend" / "prefill", ...)`` equals the compiled plan's carve (bf16 and e4m3 caches; the ring cap does
     not enter the carve: cap 4 and cap 8 equal); the wrapper over ONE shared workspace serves a decode bucket and an extend bucket in turn;
-    after the warm-up three runs make no CUDA allocation under ``set_sync_debug_mode("error")``."""
+    after the warm-up three runs into a caller-provided ``out`` make no CUDA allocation under ``set_sync_debug_mode("error")`` (``run`` allocates
+    the output only when the caller passes none)."""
     from flashinfer.qwen_3_8_block import (
         Qwen38BlockWrapper,
         qwen_3_8_block_workspace_size,
@@ -913,7 +916,8 @@ def test_workspace_query_is_honest_and_runs_allocate_nothing():
             )
         sizes[cache_dtype] = plan.workspace_size
         case.snapshot()
-        _run(plan, case)  # the warm-up
+        out_buf = torch.empty(case.t, g.d_model, dtype=torch.bfloat16, device="cuda")
+        _run(plan, case, out=out_buf)  # the warm-up
         torch.cuda.synchronize()
         stat = lambda: torch.cuda.memory_stats()["allocation.all.allocated"]  # noqa: E731
         n0 = stat()
@@ -922,7 +926,7 @@ def test_workspace_query_is_honest_and_runs_allocate_nothing():
         try:
             for _ in range(3):
                 case.restore()
-                _run(plan, case)
+                _run(plan, case, out=out_buf)
         finally:
             torch.cuda.set_sync_debug_mode(prev)
         assert stat() - n0 == 0, (
