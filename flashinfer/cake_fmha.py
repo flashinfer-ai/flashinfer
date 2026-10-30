@@ -4423,6 +4423,19 @@ _CONTEXT_FP8_ONE_STAGE_COSTS: dict[str, tuple[float, float]] = {
     "sm100a": (1.31, 1.213),
     "sm103a": (1.10, 0.852),
 }
+# The one-stage tiles of one launch at the packs it may take rank by their
+# query rows too: a tile of ``r`` query rows costs ``U0 + (1 - U0) x max(r,
+# 64) / 128`` of the one-stage unit (fewer rows per tile store and reduce less;
+# below 64 rows, more tiles of one wave timed no faster).  This ranks the packs
+# only: the gain over the launch's current schedule takes the unit above.
+# ``U0`` per target, fitted to timed one-stage launches of 32 query tokens
+# at packs 4, 2 and 1, heads 32/4 and 32/8, one or two requests over 128 ..
+# 1024 keys (B200, GB300).
+_CONTEXT_FP8_ONE_STAGE_ROWS: dict[str, float] = {
+    "sm100a": 0.51,
+    "sm103a": 0.71,
+}
+_CONTEXT_FP8_ONE_STAGE_MIN_ROWS = 64
 
 
 def _context_fp8_tile_blocks(
@@ -4787,8 +4800,10 @@ def _context_fp8_one_stage_choice(
     tiles hold every query token in one stage (``max_q_len <= 128 / pack``),
     in at most :data:`_CONTEXT_FP8_SPLIT_MAX_WAVES` waves of tiles (one wave
     for a smaller pack); the fastest under the one-stage cost model
-    (:data:`_CONTEXT_FP8_ONE_STAGE_COSTS`) is taken where predicted faster
-    than ``current`` under the split cost model by the split margins.  Every
+    (:data:`_CONTEXT_FP8_ONE_STAGE_COSTS`, its unit scaled by the tile's query
+    rows, :data:`_CONTEXT_FP8_ONE_STAGE_ROWS`) is taken where predicted faster
+    than ``current`` under the split cost model by the split margins (with
+    the unscaled unit).  Every
     query row meets the same KV blocks in the same order as in a whole tile
     of two stages (the blocks a tile of two stages adds above a row's keys
     are fully masked for it)."""
@@ -4817,8 +4832,10 @@ def _context_fp8_one_stage_choice(
     )
     unit, block = one_stage
     one_stage_costs = (split_costs[0], block, unit, 0.0, 0.0, 0.0, 0.0)
+    rows_floor = _CONTEXT_FP8_ONE_STAGE_ROWS.get(target, 1.0)
     best: int | None = None
     best_time = time
+    best_rank = time
     for candidate in (*_CONTEXT_FP8_RUNTIME_PACKS, 1):
         if candidate > pack or pack % candidate or max_q_len > 128 // candidate:
             continue
@@ -4831,8 +4848,14 @@ def _context_fp8_one_stage_choice(
         candidate_time = _context_fp8_split_makespan(
             tiles, sm_count, 0, 1, 1, one_stage_costs
         )
-        if candidate_time < best_time:
-            best, best_time = candidate, candidate_time
+        rows = max(max_q_len * candidate, _CONTEXT_FP8_ONE_STAGE_MIN_ROWS)
+        share = rows_floor + (1.0 - rows_floor) * min(rows, 128) / 128
+        rank_costs = (split_costs[0], block, unit * share, 0.0, 0.0, 0.0, 0.0)
+        candidate_rank = _context_fp8_split_makespan(
+            tiles, sm_count, 0, 1, 1, rank_costs
+        )
+        if candidate_rank < best_rank:
+            best, best_time, best_rank = candidate, candidate_time, candidate_rank
     if best is not None and _context_fp8_split_gain(time, best_time):
         return best
     return None
