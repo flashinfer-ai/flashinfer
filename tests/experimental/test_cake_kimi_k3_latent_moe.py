@@ -761,7 +761,7 @@ def test_plans_follow_the_device_sm_count():
     assert prefill_front_plan(1024, i_local_for_tp(1), 148)["sk_tiles"] == 0
     assert prefill_front_plan(1024, i_local_for_tp(1), 152)["sk_tiles"] == 36
     for tp in SUPPORTED_TP:
-        for tokens in (256, 512, 300, 1024, 2048, 4096, 8192, 16384):
+        for tokens in (256, 512, 300, 384, 1024, 2048, 4096, 8192, 16384):
             same_front = route_kernel_keys(
                 "front", tp, tokens, 148
             ) == route_kernel_keys("front", tp, tokens, 152)
@@ -776,13 +776,15 @@ def test_plans_follow_the_device_sm_count():
                 "tail", tp, tokens, 152
             )
             # The 256 x 512 tail tile starts at 4096 TP1 tokens on 152 SMs, at 8192 on 148; the TP1 rows of
-            # 129..512 tokens take the 192-wide tile on 152 SMs, and the 128-wide TP8 tile serves T=1024 on
-            # 152 SMs only.
+            # 129..512 tokens take the 192-wide tile on 152 SMs, the 128-wide TP8 tile serves T=1024 on
+            # 152 SMs only, and at sm_100a the claimed fused-norm TP8 tail serves 257..300 tokens on 148 SMs
+            # and 257..384 on 152 SMs.
             assert same_tail == (
                 not (
                     tp == 1 and (4096 <= tokens < 8192 or DECODE_MAX_T < tokens <= 512)
                 )
                 and not (tp == 8 and tokens == 1024)
+                and not (tp == 8 and 300 < tokens <= 384)
             )
 
 
@@ -841,7 +843,8 @@ def test_tail_n192_rule_on_152_sms():
 def test_front_n224_rule_on_152_sms():
     """152-SM parts (GB200 / GB300) run the TP1 front rows of 129..512 tokens on the 224-wide pair tile: 75 column
     tiles per pair row (4 router + 16 latent + 55 shared, the last one 96 columns wide), whole evict_first tiles in
-    one wave at one pair row and two at two; 148-SM parts and the TP8 rows keep the 256-wide tile."""
+    one wave at one pair row and two at two; 148-SM parts keep the 256-wide tile for TP1 (the TP8 rows:
+    ``test_front_n224_tp8_rule``)."""
     for tokens, pair_rows in ((129, 1), (256, 1), (300, 2), (511, 2), (512, 2)):
         plan = prefill_front_plan(tokens, i_local_for_tp(1), 152)
         assert (plan["block_n"], plan["n_tiles"], plan["evict_first"]) == (
@@ -857,8 +860,102 @@ def test_front_n224_rule_on_152_sms():
         assert route_kernel_keys("front", 1, tokens, 148) == ("front:i6144e1",)
     for tokens in (128, 513, 1024):
         assert "n224" not in "".join(route_kernel_keys("front", 1, tokens, 152))
-    for tokens in (129, 256, 512):
+    for tokens in (129, 256, 513):
         assert prefill_front_plan(tokens, i_local_for_tp(8), 152)["block_n"] == 256
+
+
+def test_front_n224_tp8_rule():
+    """The TP8 front rows of 257..512 tokens (two pair rows) run the 224-wide pair tile on the parts of
+    ``FRONT_N224_TP8_PARTS``: 27 column tiles per pair row (4 router + 16 latent + 7 shared, the last one 96 columns
+    wide), 54 whole evict_first tiles, one wave of the resident clusters; every other part and row keeps the 256-wide
+    tile."""
+    il = i_local_for_tp(8)
+    assert cb.front_n_tiles(il, 224) == 27
+    for sm_count in QUALIFIED_SM_COUNTS:
+        for arch in SUPPORTED_COMPUTE_CAPABILITIES.values():
+            on = (sm_count, arch) in cb.FRONT_N224_TP8_PARTS
+            for tokens in (257, 300, 384, 511, 512):
+                plan = prefill_front_plan(tokens, il, sm_count, arch)
+                key = route_kernel_keys("front", 8, tokens, sm_count, arch=arch)
+                if on:
+                    assert (plan["block_n"], plan["n_tiles"], plan["evict_first"]) == (
+                        224,
+                        27,
+                        True,
+                    )
+                    assert (
+                        plan["cluster_tiles"]
+                        == plan["num_items"]
+                        == plan["full_items"]
+                        == 54
+                    )
+                    assert plan["sk_max_seg"] == 1 and plan["grid"] == 108
+                    assert key == ("front:i768e1n224",)
+                else:
+                    assert plan["block_n"] == 256 and key == ("front:i768e1",)
+            for tokens in (129, 256, 513, 768):
+                assert prefill_front_plan(tokens, il, sm_count, arch)["block_n"] == 256
+                assert "n224" not in "".join(
+                    route_kernel_keys("front", 8, tokens, sm_count, arch=arch)
+                )
+    assert sorted(cb.FRONT_N224_TP8_PARTS) == [
+        (148, "sm_100a"),
+        (148, "sm_103a"),
+        (152, "sm_100a"),
+        (152, "sm_103a"),
+    ]
+
+
+def test_tail_tp8_claimed_rule():
+    """The TP8 tail rows of one routed partial from 257 tokens up to the part's bound in
+    ``TAIL_TP8_CLAIMED_MAX_T_BY_PART`` fuse the norm on the claimed resident grid (one launch,
+    ``tail_gemm:tp8e0f1t1ci``): the 256-wide tile at the default ring, 56 whole pair items, 112 CTAs; more routed
+    partials, fewer tokens, the rows past the bound and the parts not listed keep the norm launch."""
+    assert cb.TAIL_TP8_CLAIMED_MAX_T_BY_PART == {
+        (148, "sm_100a"): 300,
+        (148, "sm_103a"): 257,
+        (152, "sm_100a"): 384,
+        (152, "sm_103a"): 257,
+    }
+    for sm_count in QUALIFIED_SM_COUNTS:
+        for arch in SUPPORTED_COMPUTE_CAPABILITIES.values():
+            bound = cb.TAIL_TP8_CLAIMED_MAX_T_BY_PART.get((sm_count, arch), 0)
+            for tokens in (256, 257, 300, 301, 384, 511, 512, 513):
+                for num_partials in (1, 2):
+                    plan = prefill_tail_plan(tokens, 8, sm_count, num_partials, arch)
+                    keys = route_kernel_keys(
+                        "tail", 8, tokens, sm_count, num_partials, arch
+                    )
+                    claimed = num_partials == 1 and 257 <= tokens <= bound
+                    assert (
+                        cb.use_tp8_claimed_fused_norm(
+                            tokens, 8, sm_count, arch, num_partials
+                        )
+                        is claimed
+                    )
+                    assert (
+                        plan["claim_items"] is claimed and plan["fused_norm"] is claimed
+                    )
+                    if claimed:
+                        assert keys == ("tail_gemm:tp8e0f1t1ci",)
+                        assert (
+                            plan["block_n"],
+                            plan["num_stages"],
+                            plan["final_ts"],
+                        ) == (256, cb.TAIL_NUM_STAGES, True)
+                        assert (
+                            plan["num_items"] == plan["full_items"] == 56
+                            and plan["sk_tiles"] == 0
+                        )
+                        assert (
+                            plan["gemm_grid"] == 112 and not plan["weights_evict_first"]
+                        )
+                    else:
+                        assert len(keys) == 2 and keys[0].startswith("tail_norm:")
+                        assert not keys[1].endswith("ci")
+    # TP1 keeps its own rules; the TP8 claimed instance is not reached by TP1 rows.
+    for tokens in (257, 300, 512):
+        assert "tp8" not in "".join(route_kernel_keys("tail", 1, tokens, 148))
 
 
 def test_generated_program_available_follows_partials_and_sm_count(monkeypatch):
@@ -913,12 +1010,12 @@ def test_route_rules_select_the_expected_programs():
         "tail_gemm:tp8e0f0s9n128",
     )
     for tokens in (300, 511):
-        plan = cb.prefill_tail_plan(tokens, 8)
+        plan = cb.prefill_tail_plan(tokens, 8, SM_COUNT, 2)
         assert not plan["fused_norm"] and not plan["early_trigger"]
         assert plan["weights_evict_first"]
-        assert len(route_kernel_keys("tail", 8, tokens)) == 2
-        assert route_kernel_keys("tail", 8, tokens)[0] == "tail_norm:e0"
-    assert cb.prefill_tail_plan(512, 8)["early_trigger"]
+        assert len(route_kernel_keys("tail", 8, tokens, SM_COUNT, 2)) == 2
+        assert route_kernel_keys("tail", 8, tokens, SM_COUNT, 2)[0] == "tail_norm:e0"
+    assert cb.prefill_tail_plan(512, 8, SM_COUNT, 2)["early_trigger"]
     assert len(route_kernel_keys("tail", 1, 16384)) == 1
     assert len(route_kernel_keys("tail", 8, 16384)) == 2
     # TP8 prefill norm: the packed instance for one routed partial from 2048 tokens, the summing one otherwise.
@@ -1598,11 +1695,14 @@ def _tail_case(device, tp, rank, tokens, num_partials, seed):
     return w, routed, shared_act, out, y
 
 
-@pytest.mark.parametrize("tokens", (300, 511))
+@pytest.mark.parametrize("tokens", (257, 300, 384, 511))
 def test_tail_tp8_between_the_single_wave_rows(tokens):
-    """TP8 tails for 256 < T < 512 run the norm launch with the late trigger before the GEMM."""
+    """TP8 tails for 256 < T < 512 run one claimed launch with the fused norm on the parts and rows of
+    ``TAIL_TP8_CLAIMED_MAX_T_BY_PART``, else the norm launch with the late trigger before the GEMM."""
     tp, rank = 8, 0
     device = _require_program("tail", tp, tokens)
+    sm_count = int(torch.cuda.get_device_properties(0).multi_processor_count)
+    claimed = cb.use_tp8_claimed_fused_norm(tokens, tp, sm_count, _gpu_arch(), 1)
     w, routed, shared_act, out, y = _tail_case(
         device, tp, rank, tokens, 1, 900 + tokens
     )
@@ -1617,8 +1717,12 @@ def test_tail_tp8_between_the_single_wave_rows(tokens):
         rank=rank,
         y_workspace=y,
     )
-    assert runner.route == "prefill" and runner.launch_count == 2
-    assert not runner.plan["early_trigger"] and not runner.plan["fused_norm"]
+    assert runner.route == "prefill" and runner.launch_count == (1 if claimed else 2)
+    if claimed:
+        assert runner.plan["fused_norm"] and runner.plan["claim_items"]
+        assert runner.kernel_keys == ("tail_gemm:tp8e0f1t1ci",)
+    else:
+        assert not runner.plan["early_trigger"] and not runner.plan["fused_norm"]
     runner()
     torch.cuda.synchronize()
     expected = tail_reference(routed, shared_act, w, tp, rank)
@@ -2442,7 +2546,7 @@ def test_partial_workspace_and_control_word_sizes():
                 for tokens in sorted(set(cb.ROW_TOKENS) | {129, 300, 511, 1000, 3000}):
                     if tokens <= DECODE_MAX_T:
                         continue
-                    tail = prefill_tail_plan(tokens, tp, sm_count)
+                    tail = prefill_tail_plan(tokens, tp, sm_count, 1, arch)
                     front = prefill_front_plan(
                         tokens, i_local_for_tp(tp), sm_count, arch
                     )
@@ -2599,10 +2703,10 @@ def _force_tail_plan(monkeypatch, **overrides):
             return cb.TAIL_NUM_STAGES, cb.BLOCK_N, cb.TAIL_FINAL_TS
         return num_stages, block_n, final_ts
 
-    def plan(M, tp, sm_count=SM_COUNT, num_partials=1):
+    def plan(M, tp, sm_count=SM_COUNT, num_partials=1, arch="sm_100a"):
         with monkeypatch.context() as m:
             m.setattr(cb, "tail_gemm_config", config_256)
-            p = dict(plan_of(M, tp, sm_count, num_partials))
+            p = dict(plan_of(M, tp, sm_count, num_partials, arch))
         assert p["block_n"] == cb.BLOCK_N
         p.update(
             weights_evict_first=False,

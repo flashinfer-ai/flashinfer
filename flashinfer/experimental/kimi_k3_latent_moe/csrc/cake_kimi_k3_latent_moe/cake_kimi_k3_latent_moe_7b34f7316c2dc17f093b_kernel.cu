@@ -202,7 +202,7 @@ __device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
 extern "C" {
 
 __global__ __launch_bounds__(320) __cluster_dims__(2,1,1) void
-kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap WG, const __grid_constant__ CUtensorMap WD, const __grid_constant__ CUtensorMap WS, float* __restrict__ logits, __nv_bfloat16* __restrict__ latent, __nv_bfloat16* __restrict__ shared_act, float* __restrict__ ws, int* __restrict__ counters, int M, int m_tiles, int num_items, int full_items, int sk_ipc, int sk_max_seg, int sk_total)
+kernel_cake_kimi_k3_latent_moe_7b34f7316c2dc17f093b(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap WG, const __grid_constant__ CUtensorMap WD, const __grid_constant__ CUtensorMap WS, float* __restrict__ logits, __nv_bfloat16* __restrict__ latent, __nv_bfloat16* __restrict__ shared_act, float* __restrict__ ws, int* __restrict__ counters, int M, int m_tiles, int num_items, int full_items, int sk_ipc, int sk_max_seg, int sk_total)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -576,27 +576,27 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                     if (fo_cin == 1 && seg_i == fill_seg) {
                         if (warp == 2) {
                             if (elect_sync()) {
-                                int32_t _fcar_ld_0;
-                                asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_fcar_ld_0) : "l"(counters + fo_prev) : "memory");
-                                int fcnt_c = _fcar_ld_0;
+                                int32_t fill_ld0;
+                                asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(fill_ld0) : "l"(counters + fo_prev) : "memory");
+                                int fill_cnt = fill_ld0;
                                 #pragma unroll 1
-                                for (int _fspin_c = 0; _fspin_c < 4194304; _fspin_c++) {
-                                    if (fcnt_c >= 1) {
+                                for (int _fill_spin = 0; _fill_spin < 4194304; _fill_spin++) {
+                                    if (fill_cnt >= 1) {
                                         break;
                                     }
-                                    int32_t _fcar_ld_1;
-                                    asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_fcar_ld_1) : "l"(counters + fo_prev) : "memory");
-                                    fcnt_c = _fcar_ld_1;
+                                    int32_t fill_ld1;
+                                    asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(fill_ld1) : "l"(counters + fo_prev) : "memory");
+                                    fill_cnt = fill_ld1;
                                 }
-                                if (fcnt_c < 1) {
+                                if (fill_cnt < 1) {
                                     asm volatile("trap;" ::: "memory");
                                 }
                                 asm volatile("fence.acquire.gpu;" ::: "memory");
                             }
                         }
                         asm volatile("barrier.sync 1, 256;" ::: "memory");
-                        unsigned long long fcbase = (unsigned long long)fo_prev * (unsigned long long)(BLOCK_M * BLOCK_N) + (unsigned long long)local_row * 16;
-                        float fcfill[64];
+                        unsigned long long fill_base = (unsigned long long)fo_prev * (unsigned long long)(BLOCK_M * BLOCK_N) + (unsigned long long)local_row * 16;
+                        float fill_regs[64];
                         {
                             unsigned _ldv8_4_0;
                             unsigned _ldv8_4_1;
@@ -608,15 +608,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_4_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_4_0), "=r"(_ldv8_4_1), "=r"(_ldv8_4_2), "=r"(_ldv8_4_3), "=r"(_ldv8_4_4), "=r"(_ldv8_4_5), "=r"(_ldv8_4_6), "=r"(_ldv8_4_7) : "l"((const void*)(ws + (fcbase + (unsigned long long)((col_half * B_HALF_N + 0 + 0) * BLOCK_M) + 0) + (0))) : "memory");
-                            fcfill[0 + 0] = __uint_as_float(_ldv8_4_0);
-                            fcfill[0 + 1] = __uint_as_float(_ldv8_4_1);
-                            fcfill[0 + 2] = __uint_as_float(_ldv8_4_2);
-                            fcfill[0 + 3] = __uint_as_float(_ldv8_4_3);
-                            fcfill[0 + 4] = __uint_as_float(_ldv8_4_4);
-                            fcfill[0 + 5] = __uint_as_float(_ldv8_4_5);
-                            fcfill[0 + 6] = __uint_as_float(_ldv8_4_6);
-                            fcfill[0 + 7] = __uint_as_float(_ldv8_4_7);
+                                : "=r"(_ldv8_4_0), "=r"(_ldv8_4_1), "=r"(_ldv8_4_2), "=r"(_ldv8_4_3), "=r"(_ldv8_4_4), "=r"(_ldv8_4_5), "=r"(_ldv8_4_6), "=r"(_ldv8_4_7) : "l"((const void*)(ws + (fill_base + (unsigned long long)((col_half * B_HALF_N + 0 + 0) * BLOCK_M) + 0) + (0))) : "memory");
+                            fill_regs[0 + 0] = __uint_as_float(_ldv8_4_0);
+                            fill_regs[0 + 1] = __uint_as_float(_ldv8_4_1);
+                            fill_regs[0 + 2] = __uint_as_float(_ldv8_4_2);
+                            fill_regs[0 + 3] = __uint_as_float(_ldv8_4_3);
+                            fill_regs[0 + 4] = __uint_as_float(_ldv8_4_4);
+                            fill_regs[0 + 5] = __uint_as_float(_ldv8_4_5);
+                            fill_regs[0 + 6] = __uint_as_float(_ldv8_4_6);
+                            fill_regs[0 + 7] = __uint_as_float(_ldv8_4_7);
                         }
                         {
                             unsigned _ldv8_5_0;
@@ -629,15 +629,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_5_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_5_0), "=r"(_ldv8_5_1), "=r"(_ldv8_5_2), "=r"(_ldv8_5_3), "=r"(_ldv8_5_4), "=r"(_ldv8_5_5), "=r"(_ldv8_5_6), "=r"(_ldv8_5_7) : "l"((const void*)(ws + (fcbase + (unsigned long long)((col_half * B_HALF_N + 0 + 0) * BLOCK_M) + 8) + (0))) : "memory");
-                            fcfill[8 + 0] = __uint_as_float(_ldv8_5_0);
-                            fcfill[8 + 1] = __uint_as_float(_ldv8_5_1);
-                            fcfill[8 + 2] = __uint_as_float(_ldv8_5_2);
-                            fcfill[8 + 3] = __uint_as_float(_ldv8_5_3);
-                            fcfill[8 + 4] = __uint_as_float(_ldv8_5_4);
-                            fcfill[8 + 5] = __uint_as_float(_ldv8_5_5);
-                            fcfill[8 + 6] = __uint_as_float(_ldv8_5_6);
-                            fcfill[8 + 7] = __uint_as_float(_ldv8_5_7);
+                                : "=r"(_ldv8_5_0), "=r"(_ldv8_5_1), "=r"(_ldv8_5_2), "=r"(_ldv8_5_3), "=r"(_ldv8_5_4), "=r"(_ldv8_5_5), "=r"(_ldv8_5_6), "=r"(_ldv8_5_7) : "l"((const void*)(ws + (fill_base + (unsigned long long)((col_half * B_HALF_N + 0 + 0) * BLOCK_M) + 8) + (0))) : "memory");
+                            fill_regs[8 + 0] = __uint_as_float(_ldv8_5_0);
+                            fill_regs[8 + 1] = __uint_as_float(_ldv8_5_1);
+                            fill_regs[8 + 2] = __uint_as_float(_ldv8_5_2);
+                            fill_regs[8 + 3] = __uint_as_float(_ldv8_5_3);
+                            fill_regs[8 + 4] = __uint_as_float(_ldv8_5_4);
+                            fill_regs[8 + 5] = __uint_as_float(_ldv8_5_5);
+                            fill_regs[8 + 6] = __uint_as_float(_ldv8_5_6);
+                            fill_regs[8 + 7] = __uint_as_float(_ldv8_5_7);
                         }
                         {
                             unsigned _ldv8_6_0;
@@ -650,15 +650,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_6_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_6_0), "=r"(_ldv8_6_1), "=r"(_ldv8_6_2), "=r"(_ldv8_6_3), "=r"(_ldv8_6_4), "=r"(_ldv8_6_5), "=r"(_ldv8_6_6), "=r"(_ldv8_6_7) : "l"((const void*)(ws + (fcbase + (unsigned long long)((col_half * B_HALF_N + 0 + 16) * BLOCK_M) + 0) + (0))) : "memory");
-                            fcfill[16 + 0] = __uint_as_float(_ldv8_6_0);
-                            fcfill[16 + 1] = __uint_as_float(_ldv8_6_1);
-                            fcfill[16 + 2] = __uint_as_float(_ldv8_6_2);
-                            fcfill[16 + 3] = __uint_as_float(_ldv8_6_3);
-                            fcfill[16 + 4] = __uint_as_float(_ldv8_6_4);
-                            fcfill[16 + 5] = __uint_as_float(_ldv8_6_5);
-                            fcfill[16 + 6] = __uint_as_float(_ldv8_6_6);
-                            fcfill[16 + 7] = __uint_as_float(_ldv8_6_7);
+                                : "=r"(_ldv8_6_0), "=r"(_ldv8_6_1), "=r"(_ldv8_6_2), "=r"(_ldv8_6_3), "=r"(_ldv8_6_4), "=r"(_ldv8_6_5), "=r"(_ldv8_6_6), "=r"(_ldv8_6_7) : "l"((const void*)(ws + (fill_base + (unsigned long long)((col_half * B_HALF_N + 0 + 16) * BLOCK_M) + 0) + (0))) : "memory");
+                            fill_regs[16 + 0] = __uint_as_float(_ldv8_6_0);
+                            fill_regs[16 + 1] = __uint_as_float(_ldv8_6_1);
+                            fill_regs[16 + 2] = __uint_as_float(_ldv8_6_2);
+                            fill_regs[16 + 3] = __uint_as_float(_ldv8_6_3);
+                            fill_regs[16 + 4] = __uint_as_float(_ldv8_6_4);
+                            fill_regs[16 + 5] = __uint_as_float(_ldv8_6_5);
+                            fill_regs[16 + 6] = __uint_as_float(_ldv8_6_6);
+                            fill_regs[16 + 7] = __uint_as_float(_ldv8_6_7);
                         }
                         {
                             unsigned _ldv8_7_0;
@@ -671,15 +671,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_7_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_7_0), "=r"(_ldv8_7_1), "=r"(_ldv8_7_2), "=r"(_ldv8_7_3), "=r"(_ldv8_7_4), "=r"(_ldv8_7_5), "=r"(_ldv8_7_6), "=r"(_ldv8_7_7) : "l"((const void*)(ws + (fcbase + (unsigned long long)((col_half * B_HALF_N + 0 + 16) * BLOCK_M) + 8) + (0))) : "memory");
-                            fcfill[24 + 0] = __uint_as_float(_ldv8_7_0);
-                            fcfill[24 + 1] = __uint_as_float(_ldv8_7_1);
-                            fcfill[24 + 2] = __uint_as_float(_ldv8_7_2);
-                            fcfill[24 + 3] = __uint_as_float(_ldv8_7_3);
-                            fcfill[24 + 4] = __uint_as_float(_ldv8_7_4);
-                            fcfill[24 + 5] = __uint_as_float(_ldv8_7_5);
-                            fcfill[24 + 6] = __uint_as_float(_ldv8_7_6);
-                            fcfill[24 + 7] = __uint_as_float(_ldv8_7_7);
+                                : "=r"(_ldv8_7_0), "=r"(_ldv8_7_1), "=r"(_ldv8_7_2), "=r"(_ldv8_7_3), "=r"(_ldv8_7_4), "=r"(_ldv8_7_5), "=r"(_ldv8_7_6), "=r"(_ldv8_7_7) : "l"((const void*)(ws + (fill_base + (unsigned long long)((col_half * B_HALF_N + 0 + 16) * BLOCK_M) + 8) + (0))) : "memory");
+                            fill_regs[24 + 0] = __uint_as_float(_ldv8_7_0);
+                            fill_regs[24 + 1] = __uint_as_float(_ldv8_7_1);
+                            fill_regs[24 + 2] = __uint_as_float(_ldv8_7_2);
+                            fill_regs[24 + 3] = __uint_as_float(_ldv8_7_3);
+                            fill_regs[24 + 4] = __uint_as_float(_ldv8_7_4);
+                            fill_regs[24 + 5] = __uint_as_float(_ldv8_7_5);
+                            fill_regs[24 + 6] = __uint_as_float(_ldv8_7_6);
+                            fill_regs[24 + 7] = __uint_as_float(_ldv8_7_7);
                         }
                         {
                             unsigned _ldv8_8_0;
@@ -692,15 +692,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_8_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_8_0), "=r"(_ldv8_8_1), "=r"(_ldv8_8_2), "=r"(_ldv8_8_3), "=r"(_ldv8_8_4), "=r"(_ldv8_8_5), "=r"(_ldv8_8_6), "=r"(_ldv8_8_7) : "l"((const void*)(ws + (fcbase + (unsigned long long)((col_half * B_HALF_N + 0 + 32) * BLOCK_M) + 0) + (0))) : "memory");
-                            fcfill[32 + 0] = __uint_as_float(_ldv8_8_0);
-                            fcfill[32 + 1] = __uint_as_float(_ldv8_8_1);
-                            fcfill[32 + 2] = __uint_as_float(_ldv8_8_2);
-                            fcfill[32 + 3] = __uint_as_float(_ldv8_8_3);
-                            fcfill[32 + 4] = __uint_as_float(_ldv8_8_4);
-                            fcfill[32 + 5] = __uint_as_float(_ldv8_8_5);
-                            fcfill[32 + 6] = __uint_as_float(_ldv8_8_6);
-                            fcfill[32 + 7] = __uint_as_float(_ldv8_8_7);
+                                : "=r"(_ldv8_8_0), "=r"(_ldv8_8_1), "=r"(_ldv8_8_2), "=r"(_ldv8_8_3), "=r"(_ldv8_8_4), "=r"(_ldv8_8_5), "=r"(_ldv8_8_6), "=r"(_ldv8_8_7) : "l"((const void*)(ws + (fill_base + (unsigned long long)((col_half * B_HALF_N + 0 + 32) * BLOCK_M) + 0) + (0))) : "memory");
+                            fill_regs[32 + 0] = __uint_as_float(_ldv8_8_0);
+                            fill_regs[32 + 1] = __uint_as_float(_ldv8_8_1);
+                            fill_regs[32 + 2] = __uint_as_float(_ldv8_8_2);
+                            fill_regs[32 + 3] = __uint_as_float(_ldv8_8_3);
+                            fill_regs[32 + 4] = __uint_as_float(_ldv8_8_4);
+                            fill_regs[32 + 5] = __uint_as_float(_ldv8_8_5);
+                            fill_regs[32 + 6] = __uint_as_float(_ldv8_8_6);
+                            fill_regs[32 + 7] = __uint_as_float(_ldv8_8_7);
                         }
                         {
                             unsigned _ldv8_9_0;
@@ -713,15 +713,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_9_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_9_0), "=r"(_ldv8_9_1), "=r"(_ldv8_9_2), "=r"(_ldv8_9_3), "=r"(_ldv8_9_4), "=r"(_ldv8_9_5), "=r"(_ldv8_9_6), "=r"(_ldv8_9_7) : "l"((const void*)(ws + (fcbase + (unsigned long long)((col_half * B_HALF_N + 0 + 32) * BLOCK_M) + 8) + (0))) : "memory");
-                            fcfill[40 + 0] = __uint_as_float(_ldv8_9_0);
-                            fcfill[40 + 1] = __uint_as_float(_ldv8_9_1);
-                            fcfill[40 + 2] = __uint_as_float(_ldv8_9_2);
-                            fcfill[40 + 3] = __uint_as_float(_ldv8_9_3);
-                            fcfill[40 + 4] = __uint_as_float(_ldv8_9_4);
-                            fcfill[40 + 5] = __uint_as_float(_ldv8_9_5);
-                            fcfill[40 + 6] = __uint_as_float(_ldv8_9_6);
-                            fcfill[40 + 7] = __uint_as_float(_ldv8_9_7);
+                                : "=r"(_ldv8_9_0), "=r"(_ldv8_9_1), "=r"(_ldv8_9_2), "=r"(_ldv8_9_3), "=r"(_ldv8_9_4), "=r"(_ldv8_9_5), "=r"(_ldv8_9_6), "=r"(_ldv8_9_7) : "l"((const void*)(ws + (fill_base + (unsigned long long)((col_half * B_HALF_N + 0 + 32) * BLOCK_M) + 8) + (0))) : "memory");
+                            fill_regs[40 + 0] = __uint_as_float(_ldv8_9_0);
+                            fill_regs[40 + 1] = __uint_as_float(_ldv8_9_1);
+                            fill_regs[40 + 2] = __uint_as_float(_ldv8_9_2);
+                            fill_regs[40 + 3] = __uint_as_float(_ldv8_9_3);
+                            fill_regs[40 + 4] = __uint_as_float(_ldv8_9_4);
+                            fill_regs[40 + 5] = __uint_as_float(_ldv8_9_5);
+                            fill_regs[40 + 6] = __uint_as_float(_ldv8_9_6);
+                            fill_regs[40 + 7] = __uint_as_float(_ldv8_9_7);
                         }
                         {
                             unsigned _ldv8_10_0;
@@ -734,15 +734,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_10_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_10_0), "=r"(_ldv8_10_1), "=r"(_ldv8_10_2), "=r"(_ldv8_10_3), "=r"(_ldv8_10_4), "=r"(_ldv8_10_5), "=r"(_ldv8_10_6), "=r"(_ldv8_10_7) : "l"((const void*)(ws + (fcbase + (unsigned long long)((col_half * B_HALF_N + 0 + 48) * BLOCK_M) + 0) + (0))) : "memory");
-                            fcfill[48 + 0] = __uint_as_float(_ldv8_10_0);
-                            fcfill[48 + 1] = __uint_as_float(_ldv8_10_1);
-                            fcfill[48 + 2] = __uint_as_float(_ldv8_10_2);
-                            fcfill[48 + 3] = __uint_as_float(_ldv8_10_3);
-                            fcfill[48 + 4] = __uint_as_float(_ldv8_10_4);
-                            fcfill[48 + 5] = __uint_as_float(_ldv8_10_5);
-                            fcfill[48 + 6] = __uint_as_float(_ldv8_10_6);
-                            fcfill[48 + 7] = __uint_as_float(_ldv8_10_7);
+                                : "=r"(_ldv8_10_0), "=r"(_ldv8_10_1), "=r"(_ldv8_10_2), "=r"(_ldv8_10_3), "=r"(_ldv8_10_4), "=r"(_ldv8_10_5), "=r"(_ldv8_10_6), "=r"(_ldv8_10_7) : "l"((const void*)(ws + (fill_base + (unsigned long long)((col_half * B_HALF_N + 0 + 48) * BLOCK_M) + 0) + (0))) : "memory");
+                            fill_regs[48 + 0] = __uint_as_float(_ldv8_10_0);
+                            fill_regs[48 + 1] = __uint_as_float(_ldv8_10_1);
+                            fill_regs[48 + 2] = __uint_as_float(_ldv8_10_2);
+                            fill_regs[48 + 3] = __uint_as_float(_ldv8_10_3);
+                            fill_regs[48 + 4] = __uint_as_float(_ldv8_10_4);
+                            fill_regs[48 + 5] = __uint_as_float(_ldv8_10_5);
+                            fill_regs[48 + 6] = __uint_as_float(_ldv8_10_6);
+                            fill_regs[48 + 7] = __uint_as_float(_ldv8_10_7);
                         }
                         {
                             unsigned _ldv8_11_0;
@@ -755,20 +755,20 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_11_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_11_0), "=r"(_ldv8_11_1), "=r"(_ldv8_11_2), "=r"(_ldv8_11_3), "=r"(_ldv8_11_4), "=r"(_ldv8_11_5), "=r"(_ldv8_11_6), "=r"(_ldv8_11_7) : "l"((const void*)(ws + (fcbase + (unsigned long long)((col_half * B_HALF_N + 0 + 48) * BLOCK_M) + 8) + (0))) : "memory");
-                            fcfill[56 + 0] = __uint_as_float(_ldv8_11_0);
-                            fcfill[56 + 1] = __uint_as_float(_ldv8_11_1);
-                            fcfill[56 + 2] = __uint_as_float(_ldv8_11_2);
-                            fcfill[56 + 3] = __uint_as_float(_ldv8_11_3);
-                            fcfill[56 + 4] = __uint_as_float(_ldv8_11_4);
-                            fcfill[56 + 5] = __uint_as_float(_ldv8_11_5);
-                            fcfill[56 + 6] = __uint_as_float(_ldv8_11_6);
-                            fcfill[56 + 7] = __uint_as_float(_ldv8_11_7);
+                                : "=r"(_ldv8_11_0), "=r"(_ldv8_11_1), "=r"(_ldv8_11_2), "=r"(_ldv8_11_3), "=r"(_ldv8_11_4), "=r"(_ldv8_11_5), "=r"(_ldv8_11_6), "=r"(_ldv8_11_7) : "l"((const void*)(ws + (fill_base + (unsigned long long)((col_half * B_HALF_N + 0 + 48) * BLOCK_M) + 8) + (0))) : "memory");
+                            fill_regs[56 + 0] = __uint_as_float(_ldv8_11_0);
+                            fill_regs[56 + 1] = __uint_as_float(_ldv8_11_1);
+                            fill_regs[56 + 2] = __uint_as_float(_ldv8_11_2);
+                            fill_regs[56 + 3] = __uint_as_float(_ldv8_11_3);
+                            fill_regs[56 + 4] = __uint_as_float(_ldv8_11_4);
+                            fill_regs[56 + 5] = __uint_as_float(_ldv8_11_5);
+                            fill_regs[56 + 6] = __uint_as_float(_ldv8_11_6);
+                            fill_regs[56 + 7] = __uint_as_float(_ldv8_11_7);
                         }
-                        tmem_st_x16_f32(fill_addr + col_half * B_HALF_N + 0, fcfill);
-                        tmem_st_x16_f32(fill_addr + col_half * B_HALF_N + 16, (fcfill + 16));
-                        tmem_st_x16_f32(fill_addr + col_half * B_HALF_N + 32, (fcfill + 32));
-                        tmem_st_x16_f32(fill_addr + col_half * B_HALF_N + 48, (fcfill + 48));
+                        tmem_st_x16_f32(fill_addr + col_half * B_HALF_N + 0, fill_regs);
+                        tmem_st_x16_f32(fill_addr + col_half * B_HALF_N + 16, (fill_regs + 16));
+                        tmem_st_x16_f32(fill_addr + col_half * B_HALF_N + 32, (fill_regs + 32));
+                        tmem_st_x16_f32(fill_addr + col_half * B_HALF_N + 48, (fill_regs + 48));
                         {
                             unsigned _ldv8_12_0;
                             unsigned _ldv8_12_1;
@@ -780,15 +780,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_12_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_12_0), "=r"(_ldv8_12_1), "=r"(_ldv8_12_2), "=r"(_ldv8_12_3), "=r"(_ldv8_12_4), "=r"(_ldv8_12_5), "=r"(_ldv8_12_6), "=r"(_ldv8_12_7) : "l"((const void*)(ws + (fcbase + (unsigned long long)((col_half * B_HALF_N + 64 + 0) * BLOCK_M) + 0) + (0))) : "memory");
-                            fcfill[0 + 0] = __uint_as_float(_ldv8_12_0);
-                            fcfill[0 + 1] = __uint_as_float(_ldv8_12_1);
-                            fcfill[0 + 2] = __uint_as_float(_ldv8_12_2);
-                            fcfill[0 + 3] = __uint_as_float(_ldv8_12_3);
-                            fcfill[0 + 4] = __uint_as_float(_ldv8_12_4);
-                            fcfill[0 + 5] = __uint_as_float(_ldv8_12_5);
-                            fcfill[0 + 6] = __uint_as_float(_ldv8_12_6);
-                            fcfill[0 + 7] = __uint_as_float(_ldv8_12_7);
+                                : "=r"(_ldv8_12_0), "=r"(_ldv8_12_1), "=r"(_ldv8_12_2), "=r"(_ldv8_12_3), "=r"(_ldv8_12_4), "=r"(_ldv8_12_5), "=r"(_ldv8_12_6), "=r"(_ldv8_12_7) : "l"((const void*)(ws + (fill_base + (unsigned long long)((col_half * B_HALF_N + 64 + 0) * BLOCK_M) + 0) + (0))) : "memory");
+                            fill_regs[0 + 0] = __uint_as_float(_ldv8_12_0);
+                            fill_regs[0 + 1] = __uint_as_float(_ldv8_12_1);
+                            fill_regs[0 + 2] = __uint_as_float(_ldv8_12_2);
+                            fill_regs[0 + 3] = __uint_as_float(_ldv8_12_3);
+                            fill_regs[0 + 4] = __uint_as_float(_ldv8_12_4);
+                            fill_regs[0 + 5] = __uint_as_float(_ldv8_12_5);
+                            fill_regs[0 + 6] = __uint_as_float(_ldv8_12_6);
+                            fill_regs[0 + 7] = __uint_as_float(_ldv8_12_7);
                         }
                         {
                             unsigned _ldv8_13_0;
@@ -801,15 +801,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_13_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_13_0), "=r"(_ldv8_13_1), "=r"(_ldv8_13_2), "=r"(_ldv8_13_3), "=r"(_ldv8_13_4), "=r"(_ldv8_13_5), "=r"(_ldv8_13_6), "=r"(_ldv8_13_7) : "l"((const void*)(ws + (fcbase + (unsigned long long)((col_half * B_HALF_N + 64 + 0) * BLOCK_M) + 8) + (0))) : "memory");
-                            fcfill[8 + 0] = __uint_as_float(_ldv8_13_0);
-                            fcfill[8 + 1] = __uint_as_float(_ldv8_13_1);
-                            fcfill[8 + 2] = __uint_as_float(_ldv8_13_2);
-                            fcfill[8 + 3] = __uint_as_float(_ldv8_13_3);
-                            fcfill[8 + 4] = __uint_as_float(_ldv8_13_4);
-                            fcfill[8 + 5] = __uint_as_float(_ldv8_13_5);
-                            fcfill[8 + 6] = __uint_as_float(_ldv8_13_6);
-                            fcfill[8 + 7] = __uint_as_float(_ldv8_13_7);
+                                : "=r"(_ldv8_13_0), "=r"(_ldv8_13_1), "=r"(_ldv8_13_2), "=r"(_ldv8_13_3), "=r"(_ldv8_13_4), "=r"(_ldv8_13_5), "=r"(_ldv8_13_6), "=r"(_ldv8_13_7) : "l"((const void*)(ws + (fill_base + (unsigned long long)((col_half * B_HALF_N + 64 + 0) * BLOCK_M) + 8) + (0))) : "memory");
+                            fill_regs[8 + 0] = __uint_as_float(_ldv8_13_0);
+                            fill_regs[8 + 1] = __uint_as_float(_ldv8_13_1);
+                            fill_regs[8 + 2] = __uint_as_float(_ldv8_13_2);
+                            fill_regs[8 + 3] = __uint_as_float(_ldv8_13_3);
+                            fill_regs[8 + 4] = __uint_as_float(_ldv8_13_4);
+                            fill_regs[8 + 5] = __uint_as_float(_ldv8_13_5);
+                            fill_regs[8 + 6] = __uint_as_float(_ldv8_13_6);
+                            fill_regs[8 + 7] = __uint_as_float(_ldv8_13_7);
                         }
                         {
                             unsigned _ldv8_14_0;
@@ -822,15 +822,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_14_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_14_0), "=r"(_ldv8_14_1), "=r"(_ldv8_14_2), "=r"(_ldv8_14_3), "=r"(_ldv8_14_4), "=r"(_ldv8_14_5), "=r"(_ldv8_14_6), "=r"(_ldv8_14_7) : "l"((const void*)(ws + (fcbase + (unsigned long long)((col_half * B_HALF_N + 64 + 16) * BLOCK_M) + 0) + (0))) : "memory");
-                            fcfill[16 + 0] = __uint_as_float(_ldv8_14_0);
-                            fcfill[16 + 1] = __uint_as_float(_ldv8_14_1);
-                            fcfill[16 + 2] = __uint_as_float(_ldv8_14_2);
-                            fcfill[16 + 3] = __uint_as_float(_ldv8_14_3);
-                            fcfill[16 + 4] = __uint_as_float(_ldv8_14_4);
-                            fcfill[16 + 5] = __uint_as_float(_ldv8_14_5);
-                            fcfill[16 + 6] = __uint_as_float(_ldv8_14_6);
-                            fcfill[16 + 7] = __uint_as_float(_ldv8_14_7);
+                                : "=r"(_ldv8_14_0), "=r"(_ldv8_14_1), "=r"(_ldv8_14_2), "=r"(_ldv8_14_3), "=r"(_ldv8_14_4), "=r"(_ldv8_14_5), "=r"(_ldv8_14_6), "=r"(_ldv8_14_7) : "l"((const void*)(ws + (fill_base + (unsigned long long)((col_half * B_HALF_N + 64 + 16) * BLOCK_M) + 0) + (0))) : "memory");
+                            fill_regs[16 + 0] = __uint_as_float(_ldv8_14_0);
+                            fill_regs[16 + 1] = __uint_as_float(_ldv8_14_1);
+                            fill_regs[16 + 2] = __uint_as_float(_ldv8_14_2);
+                            fill_regs[16 + 3] = __uint_as_float(_ldv8_14_3);
+                            fill_regs[16 + 4] = __uint_as_float(_ldv8_14_4);
+                            fill_regs[16 + 5] = __uint_as_float(_ldv8_14_5);
+                            fill_regs[16 + 6] = __uint_as_float(_ldv8_14_6);
+                            fill_regs[16 + 7] = __uint_as_float(_ldv8_14_7);
                         }
                         {
                             unsigned _ldv8_15_0;
@@ -843,15 +843,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_15_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_15_0), "=r"(_ldv8_15_1), "=r"(_ldv8_15_2), "=r"(_ldv8_15_3), "=r"(_ldv8_15_4), "=r"(_ldv8_15_5), "=r"(_ldv8_15_6), "=r"(_ldv8_15_7) : "l"((const void*)(ws + (fcbase + (unsigned long long)((col_half * B_HALF_N + 64 + 16) * BLOCK_M) + 8) + (0))) : "memory");
-                            fcfill[24 + 0] = __uint_as_float(_ldv8_15_0);
-                            fcfill[24 + 1] = __uint_as_float(_ldv8_15_1);
-                            fcfill[24 + 2] = __uint_as_float(_ldv8_15_2);
-                            fcfill[24 + 3] = __uint_as_float(_ldv8_15_3);
-                            fcfill[24 + 4] = __uint_as_float(_ldv8_15_4);
-                            fcfill[24 + 5] = __uint_as_float(_ldv8_15_5);
-                            fcfill[24 + 6] = __uint_as_float(_ldv8_15_6);
-                            fcfill[24 + 7] = __uint_as_float(_ldv8_15_7);
+                                : "=r"(_ldv8_15_0), "=r"(_ldv8_15_1), "=r"(_ldv8_15_2), "=r"(_ldv8_15_3), "=r"(_ldv8_15_4), "=r"(_ldv8_15_5), "=r"(_ldv8_15_6), "=r"(_ldv8_15_7) : "l"((const void*)(ws + (fill_base + (unsigned long long)((col_half * B_HALF_N + 64 + 16) * BLOCK_M) + 8) + (0))) : "memory");
+                            fill_regs[24 + 0] = __uint_as_float(_ldv8_15_0);
+                            fill_regs[24 + 1] = __uint_as_float(_ldv8_15_1);
+                            fill_regs[24 + 2] = __uint_as_float(_ldv8_15_2);
+                            fill_regs[24 + 3] = __uint_as_float(_ldv8_15_3);
+                            fill_regs[24 + 4] = __uint_as_float(_ldv8_15_4);
+                            fill_regs[24 + 5] = __uint_as_float(_ldv8_15_5);
+                            fill_regs[24 + 6] = __uint_as_float(_ldv8_15_6);
+                            fill_regs[24 + 7] = __uint_as_float(_ldv8_15_7);
                         }
                         {
                             unsigned _ldv8_16_0;
@@ -864,15 +864,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_16_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_16_0), "=r"(_ldv8_16_1), "=r"(_ldv8_16_2), "=r"(_ldv8_16_3), "=r"(_ldv8_16_4), "=r"(_ldv8_16_5), "=r"(_ldv8_16_6), "=r"(_ldv8_16_7) : "l"((const void*)(ws + (fcbase + (unsigned long long)((col_half * B_HALF_N + 64 + 32) * BLOCK_M) + 0) + (0))) : "memory");
-                            fcfill[32 + 0] = __uint_as_float(_ldv8_16_0);
-                            fcfill[32 + 1] = __uint_as_float(_ldv8_16_1);
-                            fcfill[32 + 2] = __uint_as_float(_ldv8_16_2);
-                            fcfill[32 + 3] = __uint_as_float(_ldv8_16_3);
-                            fcfill[32 + 4] = __uint_as_float(_ldv8_16_4);
-                            fcfill[32 + 5] = __uint_as_float(_ldv8_16_5);
-                            fcfill[32 + 6] = __uint_as_float(_ldv8_16_6);
-                            fcfill[32 + 7] = __uint_as_float(_ldv8_16_7);
+                                : "=r"(_ldv8_16_0), "=r"(_ldv8_16_1), "=r"(_ldv8_16_2), "=r"(_ldv8_16_3), "=r"(_ldv8_16_4), "=r"(_ldv8_16_5), "=r"(_ldv8_16_6), "=r"(_ldv8_16_7) : "l"((const void*)(ws + (fill_base + (unsigned long long)((col_half * B_HALF_N + 64 + 32) * BLOCK_M) + 0) + (0))) : "memory");
+                            fill_regs[32 + 0] = __uint_as_float(_ldv8_16_0);
+                            fill_regs[32 + 1] = __uint_as_float(_ldv8_16_1);
+                            fill_regs[32 + 2] = __uint_as_float(_ldv8_16_2);
+                            fill_regs[32 + 3] = __uint_as_float(_ldv8_16_3);
+                            fill_regs[32 + 4] = __uint_as_float(_ldv8_16_4);
+                            fill_regs[32 + 5] = __uint_as_float(_ldv8_16_5);
+                            fill_regs[32 + 6] = __uint_as_float(_ldv8_16_6);
+                            fill_regs[32 + 7] = __uint_as_float(_ldv8_16_7);
                         }
                         {
                             unsigned _ldv8_17_0;
@@ -885,15 +885,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_17_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_17_0), "=r"(_ldv8_17_1), "=r"(_ldv8_17_2), "=r"(_ldv8_17_3), "=r"(_ldv8_17_4), "=r"(_ldv8_17_5), "=r"(_ldv8_17_6), "=r"(_ldv8_17_7) : "l"((const void*)(ws + (fcbase + (unsigned long long)((col_half * B_HALF_N + 64 + 32) * BLOCK_M) + 8) + (0))) : "memory");
-                            fcfill[40 + 0] = __uint_as_float(_ldv8_17_0);
-                            fcfill[40 + 1] = __uint_as_float(_ldv8_17_1);
-                            fcfill[40 + 2] = __uint_as_float(_ldv8_17_2);
-                            fcfill[40 + 3] = __uint_as_float(_ldv8_17_3);
-                            fcfill[40 + 4] = __uint_as_float(_ldv8_17_4);
-                            fcfill[40 + 5] = __uint_as_float(_ldv8_17_5);
-                            fcfill[40 + 6] = __uint_as_float(_ldv8_17_6);
-                            fcfill[40 + 7] = __uint_as_float(_ldv8_17_7);
+                                : "=r"(_ldv8_17_0), "=r"(_ldv8_17_1), "=r"(_ldv8_17_2), "=r"(_ldv8_17_3), "=r"(_ldv8_17_4), "=r"(_ldv8_17_5), "=r"(_ldv8_17_6), "=r"(_ldv8_17_7) : "l"((const void*)(ws + (fill_base + (unsigned long long)((col_half * B_HALF_N + 64 + 32) * BLOCK_M) + 8) + (0))) : "memory");
+                            fill_regs[40 + 0] = __uint_as_float(_ldv8_17_0);
+                            fill_regs[40 + 1] = __uint_as_float(_ldv8_17_1);
+                            fill_regs[40 + 2] = __uint_as_float(_ldv8_17_2);
+                            fill_regs[40 + 3] = __uint_as_float(_ldv8_17_3);
+                            fill_regs[40 + 4] = __uint_as_float(_ldv8_17_4);
+                            fill_regs[40 + 5] = __uint_as_float(_ldv8_17_5);
+                            fill_regs[40 + 6] = __uint_as_float(_ldv8_17_6);
+                            fill_regs[40 + 7] = __uint_as_float(_ldv8_17_7);
                         }
                         {
                             unsigned _ldv8_18_0;
@@ -906,15 +906,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_18_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_18_0), "=r"(_ldv8_18_1), "=r"(_ldv8_18_2), "=r"(_ldv8_18_3), "=r"(_ldv8_18_4), "=r"(_ldv8_18_5), "=r"(_ldv8_18_6), "=r"(_ldv8_18_7) : "l"((const void*)(ws + (fcbase + (unsigned long long)((col_half * B_HALF_N + 64 + 48) * BLOCK_M) + 0) + (0))) : "memory");
-                            fcfill[48 + 0] = __uint_as_float(_ldv8_18_0);
-                            fcfill[48 + 1] = __uint_as_float(_ldv8_18_1);
-                            fcfill[48 + 2] = __uint_as_float(_ldv8_18_2);
-                            fcfill[48 + 3] = __uint_as_float(_ldv8_18_3);
-                            fcfill[48 + 4] = __uint_as_float(_ldv8_18_4);
-                            fcfill[48 + 5] = __uint_as_float(_ldv8_18_5);
-                            fcfill[48 + 6] = __uint_as_float(_ldv8_18_6);
-                            fcfill[48 + 7] = __uint_as_float(_ldv8_18_7);
+                                : "=r"(_ldv8_18_0), "=r"(_ldv8_18_1), "=r"(_ldv8_18_2), "=r"(_ldv8_18_3), "=r"(_ldv8_18_4), "=r"(_ldv8_18_5), "=r"(_ldv8_18_6), "=r"(_ldv8_18_7) : "l"((const void*)(ws + (fill_base + (unsigned long long)((col_half * B_HALF_N + 64 + 48) * BLOCK_M) + 0) + (0))) : "memory");
+                            fill_regs[48 + 0] = __uint_as_float(_ldv8_18_0);
+                            fill_regs[48 + 1] = __uint_as_float(_ldv8_18_1);
+                            fill_regs[48 + 2] = __uint_as_float(_ldv8_18_2);
+                            fill_regs[48 + 3] = __uint_as_float(_ldv8_18_3);
+                            fill_regs[48 + 4] = __uint_as_float(_ldv8_18_4);
+                            fill_regs[48 + 5] = __uint_as_float(_ldv8_18_5);
+                            fill_regs[48 + 6] = __uint_as_float(_ldv8_18_6);
+                            fill_regs[48 + 7] = __uint_as_float(_ldv8_18_7);
                         }
                         {
                             unsigned _ldv8_19_0;
@@ -927,20 +927,20 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_19_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_19_0), "=r"(_ldv8_19_1), "=r"(_ldv8_19_2), "=r"(_ldv8_19_3), "=r"(_ldv8_19_4), "=r"(_ldv8_19_5), "=r"(_ldv8_19_6), "=r"(_ldv8_19_7) : "l"((const void*)(ws + (fcbase + (unsigned long long)((col_half * B_HALF_N + 64 + 48) * BLOCK_M) + 8) + (0))) : "memory");
-                            fcfill[56 + 0] = __uint_as_float(_ldv8_19_0);
-                            fcfill[56 + 1] = __uint_as_float(_ldv8_19_1);
-                            fcfill[56 + 2] = __uint_as_float(_ldv8_19_2);
-                            fcfill[56 + 3] = __uint_as_float(_ldv8_19_3);
-                            fcfill[56 + 4] = __uint_as_float(_ldv8_19_4);
-                            fcfill[56 + 5] = __uint_as_float(_ldv8_19_5);
-                            fcfill[56 + 6] = __uint_as_float(_ldv8_19_6);
-                            fcfill[56 + 7] = __uint_as_float(_ldv8_19_7);
+                                : "=r"(_ldv8_19_0), "=r"(_ldv8_19_1), "=r"(_ldv8_19_2), "=r"(_ldv8_19_3), "=r"(_ldv8_19_4), "=r"(_ldv8_19_5), "=r"(_ldv8_19_6), "=r"(_ldv8_19_7) : "l"((const void*)(ws + (fill_base + (unsigned long long)((col_half * B_HALF_N + 64 + 48) * BLOCK_M) + 8) + (0))) : "memory");
+                            fill_regs[56 + 0] = __uint_as_float(_ldv8_19_0);
+                            fill_regs[56 + 1] = __uint_as_float(_ldv8_19_1);
+                            fill_regs[56 + 2] = __uint_as_float(_ldv8_19_2);
+                            fill_regs[56 + 3] = __uint_as_float(_ldv8_19_3);
+                            fill_regs[56 + 4] = __uint_as_float(_ldv8_19_4);
+                            fill_regs[56 + 5] = __uint_as_float(_ldv8_19_5);
+                            fill_regs[56 + 6] = __uint_as_float(_ldv8_19_6);
+                            fill_regs[56 + 7] = __uint_as_float(_ldv8_19_7);
                         }
-                        tmem_st_x16_f32(fill_addr + col_half * B_HALF_N + 64, fcfill);
-                        tmem_st_x16_f32(fill_addr + col_half * B_HALF_N + 80, (fcfill + 16));
-                        tmem_st_x16_f32(fill_addr + col_half * B_HALF_N + 96, (fcfill + 32));
-                        tmem_st_x16_f32(fill_addr + col_half * B_HALF_N + 112, (fcfill + 48));
+                        tmem_st_x16_f32(fill_addr + col_half * B_HALF_N + 64, fill_regs);
+                        tmem_st_x16_f32(fill_addr + col_half * B_HALF_N + 80, (fill_regs + 16));
+                        tmem_st_x16_f32(fill_addr + col_half * B_HALF_N + 96, (fill_regs + 32));
+                        tmem_st_x16_f32(fill_addr + col_half * B_HALF_N + 112, (fill_regs + 48));
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                         asm volatile("barrier.sync 1, 256;" ::: "memory");
                         if (warp == 2) {
@@ -958,27 +958,27 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                     if (fo_pre == 1 && seg_i == nsegs_2 - 1) {
                         if (warp == 2) {
                             if (elect_sync()) {
-                                int32_t _fpre_ld_0;
-                                asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_fpre_ld_0) : "l"(counters + fo_pslot) : "memory");
-                                int fcnt_p = _fpre_ld_0;
+                                int32_t fill_ld0_1;
+                                asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(fill_ld0_1) : "l"(counters + fo_pslot) : "memory");
+                                int fill_cnt_1 = fill_ld0_1;
                                 #pragma unroll 1
-                                for (int _fspin_p = 0; _fspin_p < 4194304; _fspin_p++) {
-                                    if (fcnt_p >= 1) {
+                                for (int _fill_spin_1 = 0; _fill_spin_1 < 4194304; _fill_spin_1++) {
+                                    if (fill_cnt_1 >= 1) {
                                         break;
                                     }
-                                    int32_t _fpre_ld_1;
-                                    asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_fpre_ld_1) : "l"(counters + fo_pslot) : "memory");
-                                    fcnt_p = _fpre_ld_1;
+                                    int32_t fill_ld1_1;
+                                    asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(fill_ld1_1) : "l"(counters + fo_pslot) : "memory");
+                                    fill_cnt_1 = fill_ld1_1;
                                 }
-                                if (fcnt_p < 1) {
+                                if (fill_cnt_1 < 1) {
                                     asm volatile("trap;" ::: "memory");
                                 }
                                 asm volatile("fence.acquire.gpu;" ::: "memory");
                             }
                         }
                         asm volatile("barrier.sync 1, 256;" ::: "memory");
-                        unsigned long long fpbase = (unsigned long long)fo_pslot * (unsigned long long)(BLOCK_M * BLOCK_N) + (unsigned long long)local_row * 16;
-                        float fpfill[64];
+                        unsigned long long fill_base_1 = (unsigned long long)fo_pslot * (unsigned long long)(BLOCK_M * BLOCK_N) + (unsigned long long)local_row * 16;
+                        float fill_regs_1[64];
                         {
                             unsigned _ldv8_20_0;
                             unsigned _ldv8_20_1;
@@ -990,15 +990,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_20_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_20_0), "=r"(_ldv8_20_1), "=r"(_ldv8_20_2), "=r"(_ldv8_20_3), "=r"(_ldv8_20_4), "=r"(_ldv8_20_5), "=r"(_ldv8_20_6), "=r"(_ldv8_20_7) : "l"((const void*)(ws + (fpbase + (unsigned long long)((col_half * B_HALF_N + 0 + 0) * BLOCK_M) + 0) + (0))) : "memory");
-                            fpfill[0 + 0] = __uint_as_float(_ldv8_20_0);
-                            fpfill[0 + 1] = __uint_as_float(_ldv8_20_1);
-                            fpfill[0 + 2] = __uint_as_float(_ldv8_20_2);
-                            fpfill[0 + 3] = __uint_as_float(_ldv8_20_3);
-                            fpfill[0 + 4] = __uint_as_float(_ldv8_20_4);
-                            fpfill[0 + 5] = __uint_as_float(_ldv8_20_5);
-                            fpfill[0 + 6] = __uint_as_float(_ldv8_20_6);
-                            fpfill[0 + 7] = __uint_as_float(_ldv8_20_7);
+                                : "=r"(_ldv8_20_0), "=r"(_ldv8_20_1), "=r"(_ldv8_20_2), "=r"(_ldv8_20_3), "=r"(_ldv8_20_4), "=r"(_ldv8_20_5), "=r"(_ldv8_20_6), "=r"(_ldv8_20_7) : "l"((const void*)(ws + (fill_base_1 + (unsigned long long)((col_half * B_HALF_N + 0 + 0) * BLOCK_M) + 0) + (0))) : "memory");
+                            fill_regs_1[0 + 0] = __uint_as_float(_ldv8_20_0);
+                            fill_regs_1[0 + 1] = __uint_as_float(_ldv8_20_1);
+                            fill_regs_1[0 + 2] = __uint_as_float(_ldv8_20_2);
+                            fill_regs_1[0 + 3] = __uint_as_float(_ldv8_20_3);
+                            fill_regs_1[0 + 4] = __uint_as_float(_ldv8_20_4);
+                            fill_regs_1[0 + 5] = __uint_as_float(_ldv8_20_5);
+                            fill_regs_1[0 + 6] = __uint_as_float(_ldv8_20_6);
+                            fill_regs_1[0 + 7] = __uint_as_float(_ldv8_20_7);
                         }
                         {
                             unsigned _ldv8_21_0;
@@ -1011,15 +1011,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_21_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_21_0), "=r"(_ldv8_21_1), "=r"(_ldv8_21_2), "=r"(_ldv8_21_3), "=r"(_ldv8_21_4), "=r"(_ldv8_21_5), "=r"(_ldv8_21_6), "=r"(_ldv8_21_7) : "l"((const void*)(ws + (fpbase + (unsigned long long)((col_half * B_HALF_N + 0 + 0) * BLOCK_M) + 8) + (0))) : "memory");
-                            fpfill[8 + 0] = __uint_as_float(_ldv8_21_0);
-                            fpfill[8 + 1] = __uint_as_float(_ldv8_21_1);
-                            fpfill[8 + 2] = __uint_as_float(_ldv8_21_2);
-                            fpfill[8 + 3] = __uint_as_float(_ldv8_21_3);
-                            fpfill[8 + 4] = __uint_as_float(_ldv8_21_4);
-                            fpfill[8 + 5] = __uint_as_float(_ldv8_21_5);
-                            fpfill[8 + 6] = __uint_as_float(_ldv8_21_6);
-                            fpfill[8 + 7] = __uint_as_float(_ldv8_21_7);
+                                : "=r"(_ldv8_21_0), "=r"(_ldv8_21_1), "=r"(_ldv8_21_2), "=r"(_ldv8_21_3), "=r"(_ldv8_21_4), "=r"(_ldv8_21_5), "=r"(_ldv8_21_6), "=r"(_ldv8_21_7) : "l"((const void*)(ws + (fill_base_1 + (unsigned long long)((col_half * B_HALF_N + 0 + 0) * BLOCK_M) + 8) + (0))) : "memory");
+                            fill_regs_1[8 + 0] = __uint_as_float(_ldv8_21_0);
+                            fill_regs_1[8 + 1] = __uint_as_float(_ldv8_21_1);
+                            fill_regs_1[8 + 2] = __uint_as_float(_ldv8_21_2);
+                            fill_regs_1[8 + 3] = __uint_as_float(_ldv8_21_3);
+                            fill_regs_1[8 + 4] = __uint_as_float(_ldv8_21_4);
+                            fill_regs_1[8 + 5] = __uint_as_float(_ldv8_21_5);
+                            fill_regs_1[8 + 6] = __uint_as_float(_ldv8_21_6);
+                            fill_regs_1[8 + 7] = __uint_as_float(_ldv8_21_7);
                         }
                         {
                             unsigned _ldv8_22_0;
@@ -1032,15 +1032,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_22_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_22_0), "=r"(_ldv8_22_1), "=r"(_ldv8_22_2), "=r"(_ldv8_22_3), "=r"(_ldv8_22_4), "=r"(_ldv8_22_5), "=r"(_ldv8_22_6), "=r"(_ldv8_22_7) : "l"((const void*)(ws + (fpbase + (unsigned long long)((col_half * B_HALF_N + 0 + 16) * BLOCK_M) + 0) + (0))) : "memory");
-                            fpfill[16 + 0] = __uint_as_float(_ldv8_22_0);
-                            fpfill[16 + 1] = __uint_as_float(_ldv8_22_1);
-                            fpfill[16 + 2] = __uint_as_float(_ldv8_22_2);
-                            fpfill[16 + 3] = __uint_as_float(_ldv8_22_3);
-                            fpfill[16 + 4] = __uint_as_float(_ldv8_22_4);
-                            fpfill[16 + 5] = __uint_as_float(_ldv8_22_5);
-                            fpfill[16 + 6] = __uint_as_float(_ldv8_22_6);
-                            fpfill[16 + 7] = __uint_as_float(_ldv8_22_7);
+                                : "=r"(_ldv8_22_0), "=r"(_ldv8_22_1), "=r"(_ldv8_22_2), "=r"(_ldv8_22_3), "=r"(_ldv8_22_4), "=r"(_ldv8_22_5), "=r"(_ldv8_22_6), "=r"(_ldv8_22_7) : "l"((const void*)(ws + (fill_base_1 + (unsigned long long)((col_half * B_HALF_N + 0 + 16) * BLOCK_M) + 0) + (0))) : "memory");
+                            fill_regs_1[16 + 0] = __uint_as_float(_ldv8_22_0);
+                            fill_regs_1[16 + 1] = __uint_as_float(_ldv8_22_1);
+                            fill_regs_1[16 + 2] = __uint_as_float(_ldv8_22_2);
+                            fill_regs_1[16 + 3] = __uint_as_float(_ldv8_22_3);
+                            fill_regs_1[16 + 4] = __uint_as_float(_ldv8_22_4);
+                            fill_regs_1[16 + 5] = __uint_as_float(_ldv8_22_5);
+                            fill_regs_1[16 + 6] = __uint_as_float(_ldv8_22_6);
+                            fill_regs_1[16 + 7] = __uint_as_float(_ldv8_22_7);
                         }
                         {
                             unsigned _ldv8_23_0;
@@ -1053,15 +1053,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_23_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_23_0), "=r"(_ldv8_23_1), "=r"(_ldv8_23_2), "=r"(_ldv8_23_3), "=r"(_ldv8_23_4), "=r"(_ldv8_23_5), "=r"(_ldv8_23_6), "=r"(_ldv8_23_7) : "l"((const void*)(ws + (fpbase + (unsigned long long)((col_half * B_HALF_N + 0 + 16) * BLOCK_M) + 8) + (0))) : "memory");
-                            fpfill[24 + 0] = __uint_as_float(_ldv8_23_0);
-                            fpfill[24 + 1] = __uint_as_float(_ldv8_23_1);
-                            fpfill[24 + 2] = __uint_as_float(_ldv8_23_2);
-                            fpfill[24 + 3] = __uint_as_float(_ldv8_23_3);
-                            fpfill[24 + 4] = __uint_as_float(_ldv8_23_4);
-                            fpfill[24 + 5] = __uint_as_float(_ldv8_23_5);
-                            fpfill[24 + 6] = __uint_as_float(_ldv8_23_6);
-                            fpfill[24 + 7] = __uint_as_float(_ldv8_23_7);
+                                : "=r"(_ldv8_23_0), "=r"(_ldv8_23_1), "=r"(_ldv8_23_2), "=r"(_ldv8_23_3), "=r"(_ldv8_23_4), "=r"(_ldv8_23_5), "=r"(_ldv8_23_6), "=r"(_ldv8_23_7) : "l"((const void*)(ws + (fill_base_1 + (unsigned long long)((col_half * B_HALF_N + 0 + 16) * BLOCK_M) + 8) + (0))) : "memory");
+                            fill_regs_1[24 + 0] = __uint_as_float(_ldv8_23_0);
+                            fill_regs_1[24 + 1] = __uint_as_float(_ldv8_23_1);
+                            fill_regs_1[24 + 2] = __uint_as_float(_ldv8_23_2);
+                            fill_regs_1[24 + 3] = __uint_as_float(_ldv8_23_3);
+                            fill_regs_1[24 + 4] = __uint_as_float(_ldv8_23_4);
+                            fill_regs_1[24 + 5] = __uint_as_float(_ldv8_23_5);
+                            fill_regs_1[24 + 6] = __uint_as_float(_ldv8_23_6);
+                            fill_regs_1[24 + 7] = __uint_as_float(_ldv8_23_7);
                         }
                         {
                             unsigned _ldv8_24_0;
@@ -1074,15 +1074,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_24_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_24_0), "=r"(_ldv8_24_1), "=r"(_ldv8_24_2), "=r"(_ldv8_24_3), "=r"(_ldv8_24_4), "=r"(_ldv8_24_5), "=r"(_ldv8_24_6), "=r"(_ldv8_24_7) : "l"((const void*)(ws + (fpbase + (unsigned long long)((col_half * B_HALF_N + 0 + 32) * BLOCK_M) + 0) + (0))) : "memory");
-                            fpfill[32 + 0] = __uint_as_float(_ldv8_24_0);
-                            fpfill[32 + 1] = __uint_as_float(_ldv8_24_1);
-                            fpfill[32 + 2] = __uint_as_float(_ldv8_24_2);
-                            fpfill[32 + 3] = __uint_as_float(_ldv8_24_3);
-                            fpfill[32 + 4] = __uint_as_float(_ldv8_24_4);
-                            fpfill[32 + 5] = __uint_as_float(_ldv8_24_5);
-                            fpfill[32 + 6] = __uint_as_float(_ldv8_24_6);
-                            fpfill[32 + 7] = __uint_as_float(_ldv8_24_7);
+                                : "=r"(_ldv8_24_0), "=r"(_ldv8_24_1), "=r"(_ldv8_24_2), "=r"(_ldv8_24_3), "=r"(_ldv8_24_4), "=r"(_ldv8_24_5), "=r"(_ldv8_24_6), "=r"(_ldv8_24_7) : "l"((const void*)(ws + (fill_base_1 + (unsigned long long)((col_half * B_HALF_N + 0 + 32) * BLOCK_M) + 0) + (0))) : "memory");
+                            fill_regs_1[32 + 0] = __uint_as_float(_ldv8_24_0);
+                            fill_regs_1[32 + 1] = __uint_as_float(_ldv8_24_1);
+                            fill_regs_1[32 + 2] = __uint_as_float(_ldv8_24_2);
+                            fill_regs_1[32 + 3] = __uint_as_float(_ldv8_24_3);
+                            fill_regs_1[32 + 4] = __uint_as_float(_ldv8_24_4);
+                            fill_regs_1[32 + 5] = __uint_as_float(_ldv8_24_5);
+                            fill_regs_1[32 + 6] = __uint_as_float(_ldv8_24_6);
+                            fill_regs_1[32 + 7] = __uint_as_float(_ldv8_24_7);
                         }
                         {
                             unsigned _ldv8_25_0;
@@ -1095,15 +1095,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_25_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_25_0), "=r"(_ldv8_25_1), "=r"(_ldv8_25_2), "=r"(_ldv8_25_3), "=r"(_ldv8_25_4), "=r"(_ldv8_25_5), "=r"(_ldv8_25_6), "=r"(_ldv8_25_7) : "l"((const void*)(ws + (fpbase + (unsigned long long)((col_half * B_HALF_N + 0 + 32) * BLOCK_M) + 8) + (0))) : "memory");
-                            fpfill[40 + 0] = __uint_as_float(_ldv8_25_0);
-                            fpfill[40 + 1] = __uint_as_float(_ldv8_25_1);
-                            fpfill[40 + 2] = __uint_as_float(_ldv8_25_2);
-                            fpfill[40 + 3] = __uint_as_float(_ldv8_25_3);
-                            fpfill[40 + 4] = __uint_as_float(_ldv8_25_4);
-                            fpfill[40 + 5] = __uint_as_float(_ldv8_25_5);
-                            fpfill[40 + 6] = __uint_as_float(_ldv8_25_6);
-                            fpfill[40 + 7] = __uint_as_float(_ldv8_25_7);
+                                : "=r"(_ldv8_25_0), "=r"(_ldv8_25_1), "=r"(_ldv8_25_2), "=r"(_ldv8_25_3), "=r"(_ldv8_25_4), "=r"(_ldv8_25_5), "=r"(_ldv8_25_6), "=r"(_ldv8_25_7) : "l"((const void*)(ws + (fill_base_1 + (unsigned long long)((col_half * B_HALF_N + 0 + 32) * BLOCK_M) + 8) + (0))) : "memory");
+                            fill_regs_1[40 + 0] = __uint_as_float(_ldv8_25_0);
+                            fill_regs_1[40 + 1] = __uint_as_float(_ldv8_25_1);
+                            fill_regs_1[40 + 2] = __uint_as_float(_ldv8_25_2);
+                            fill_regs_1[40 + 3] = __uint_as_float(_ldv8_25_3);
+                            fill_regs_1[40 + 4] = __uint_as_float(_ldv8_25_4);
+                            fill_regs_1[40 + 5] = __uint_as_float(_ldv8_25_5);
+                            fill_regs_1[40 + 6] = __uint_as_float(_ldv8_25_6);
+                            fill_regs_1[40 + 7] = __uint_as_float(_ldv8_25_7);
                         }
                         {
                             unsigned _ldv8_26_0;
@@ -1116,15 +1116,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_26_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_26_0), "=r"(_ldv8_26_1), "=r"(_ldv8_26_2), "=r"(_ldv8_26_3), "=r"(_ldv8_26_4), "=r"(_ldv8_26_5), "=r"(_ldv8_26_6), "=r"(_ldv8_26_7) : "l"((const void*)(ws + (fpbase + (unsigned long long)((col_half * B_HALF_N + 0 + 48) * BLOCK_M) + 0) + (0))) : "memory");
-                            fpfill[48 + 0] = __uint_as_float(_ldv8_26_0);
-                            fpfill[48 + 1] = __uint_as_float(_ldv8_26_1);
-                            fpfill[48 + 2] = __uint_as_float(_ldv8_26_2);
-                            fpfill[48 + 3] = __uint_as_float(_ldv8_26_3);
-                            fpfill[48 + 4] = __uint_as_float(_ldv8_26_4);
-                            fpfill[48 + 5] = __uint_as_float(_ldv8_26_5);
-                            fpfill[48 + 6] = __uint_as_float(_ldv8_26_6);
-                            fpfill[48 + 7] = __uint_as_float(_ldv8_26_7);
+                                : "=r"(_ldv8_26_0), "=r"(_ldv8_26_1), "=r"(_ldv8_26_2), "=r"(_ldv8_26_3), "=r"(_ldv8_26_4), "=r"(_ldv8_26_5), "=r"(_ldv8_26_6), "=r"(_ldv8_26_7) : "l"((const void*)(ws + (fill_base_1 + (unsigned long long)((col_half * B_HALF_N + 0 + 48) * BLOCK_M) + 0) + (0))) : "memory");
+                            fill_regs_1[48 + 0] = __uint_as_float(_ldv8_26_0);
+                            fill_regs_1[48 + 1] = __uint_as_float(_ldv8_26_1);
+                            fill_regs_1[48 + 2] = __uint_as_float(_ldv8_26_2);
+                            fill_regs_1[48 + 3] = __uint_as_float(_ldv8_26_3);
+                            fill_regs_1[48 + 4] = __uint_as_float(_ldv8_26_4);
+                            fill_regs_1[48 + 5] = __uint_as_float(_ldv8_26_5);
+                            fill_regs_1[48 + 6] = __uint_as_float(_ldv8_26_6);
+                            fill_regs_1[48 + 7] = __uint_as_float(_ldv8_26_7);
                         }
                         {
                             unsigned _ldv8_27_0;
@@ -1137,20 +1137,20 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_27_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_27_0), "=r"(_ldv8_27_1), "=r"(_ldv8_27_2), "=r"(_ldv8_27_3), "=r"(_ldv8_27_4), "=r"(_ldv8_27_5), "=r"(_ldv8_27_6), "=r"(_ldv8_27_7) : "l"((const void*)(ws + (fpbase + (unsigned long long)((col_half * B_HALF_N + 0 + 48) * BLOCK_M) + 8) + (0))) : "memory");
-                            fpfill[56 + 0] = __uint_as_float(_ldv8_27_0);
-                            fpfill[56 + 1] = __uint_as_float(_ldv8_27_1);
-                            fpfill[56 + 2] = __uint_as_float(_ldv8_27_2);
-                            fpfill[56 + 3] = __uint_as_float(_ldv8_27_3);
-                            fpfill[56 + 4] = __uint_as_float(_ldv8_27_4);
-                            fpfill[56 + 5] = __uint_as_float(_ldv8_27_5);
-                            fpfill[56 + 6] = __uint_as_float(_ldv8_27_6);
-                            fpfill[56 + 7] = __uint_as_float(_ldv8_27_7);
+                                : "=r"(_ldv8_27_0), "=r"(_ldv8_27_1), "=r"(_ldv8_27_2), "=r"(_ldv8_27_3), "=r"(_ldv8_27_4), "=r"(_ldv8_27_5), "=r"(_ldv8_27_6), "=r"(_ldv8_27_7) : "l"((const void*)(ws + (fill_base_1 + (unsigned long long)((col_half * B_HALF_N + 0 + 48) * BLOCK_M) + 8) + (0))) : "memory");
+                            fill_regs_1[56 + 0] = __uint_as_float(_ldv8_27_0);
+                            fill_regs_1[56 + 1] = __uint_as_float(_ldv8_27_1);
+                            fill_regs_1[56 + 2] = __uint_as_float(_ldv8_27_2);
+                            fill_regs_1[56 + 3] = __uint_as_float(_ldv8_27_3);
+                            fill_regs_1[56 + 4] = __uint_as_float(_ldv8_27_4);
+                            fill_regs_1[56 + 5] = __uint_as_float(_ldv8_27_5);
+                            fill_regs_1[56 + 6] = __uint_as_float(_ldv8_27_6);
+                            fill_regs_1[56 + 7] = __uint_as_float(_ldv8_27_7);
                         }
-                        tmem_st_x16_f32(pre_addr + col_half * B_HALF_N + 0, fpfill);
-                        tmem_st_x16_f32(pre_addr + col_half * B_HALF_N + 16, (fpfill + 16));
-                        tmem_st_x16_f32(pre_addr + col_half * B_HALF_N + 32, (fpfill + 32));
-                        tmem_st_x16_f32(pre_addr + col_half * B_HALF_N + 48, (fpfill + 48));
+                        tmem_st_x16_f32(pre_addr + col_half * B_HALF_N + 0, fill_regs_1);
+                        tmem_st_x16_f32(pre_addr + col_half * B_HALF_N + 16, (fill_regs_1 + 16));
+                        tmem_st_x16_f32(pre_addr + col_half * B_HALF_N + 32, (fill_regs_1 + 32));
+                        tmem_st_x16_f32(pre_addr + col_half * B_HALF_N + 48, (fill_regs_1 + 48));
                         {
                             unsigned _ldv8_28_0;
                             unsigned _ldv8_28_1;
@@ -1162,15 +1162,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_28_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_28_0), "=r"(_ldv8_28_1), "=r"(_ldv8_28_2), "=r"(_ldv8_28_3), "=r"(_ldv8_28_4), "=r"(_ldv8_28_5), "=r"(_ldv8_28_6), "=r"(_ldv8_28_7) : "l"((const void*)(ws + (fpbase + (unsigned long long)((col_half * B_HALF_N + 64 + 0) * BLOCK_M) + 0) + (0))) : "memory");
-                            fpfill[0 + 0] = __uint_as_float(_ldv8_28_0);
-                            fpfill[0 + 1] = __uint_as_float(_ldv8_28_1);
-                            fpfill[0 + 2] = __uint_as_float(_ldv8_28_2);
-                            fpfill[0 + 3] = __uint_as_float(_ldv8_28_3);
-                            fpfill[0 + 4] = __uint_as_float(_ldv8_28_4);
-                            fpfill[0 + 5] = __uint_as_float(_ldv8_28_5);
-                            fpfill[0 + 6] = __uint_as_float(_ldv8_28_6);
-                            fpfill[0 + 7] = __uint_as_float(_ldv8_28_7);
+                                : "=r"(_ldv8_28_0), "=r"(_ldv8_28_1), "=r"(_ldv8_28_2), "=r"(_ldv8_28_3), "=r"(_ldv8_28_4), "=r"(_ldv8_28_5), "=r"(_ldv8_28_6), "=r"(_ldv8_28_7) : "l"((const void*)(ws + (fill_base_1 + (unsigned long long)((col_half * B_HALF_N + 64 + 0) * BLOCK_M) + 0) + (0))) : "memory");
+                            fill_regs_1[0 + 0] = __uint_as_float(_ldv8_28_0);
+                            fill_regs_1[0 + 1] = __uint_as_float(_ldv8_28_1);
+                            fill_regs_1[0 + 2] = __uint_as_float(_ldv8_28_2);
+                            fill_regs_1[0 + 3] = __uint_as_float(_ldv8_28_3);
+                            fill_regs_1[0 + 4] = __uint_as_float(_ldv8_28_4);
+                            fill_regs_1[0 + 5] = __uint_as_float(_ldv8_28_5);
+                            fill_regs_1[0 + 6] = __uint_as_float(_ldv8_28_6);
+                            fill_regs_1[0 + 7] = __uint_as_float(_ldv8_28_7);
                         }
                         {
                             unsigned _ldv8_29_0;
@@ -1183,15 +1183,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_29_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_29_0), "=r"(_ldv8_29_1), "=r"(_ldv8_29_2), "=r"(_ldv8_29_3), "=r"(_ldv8_29_4), "=r"(_ldv8_29_5), "=r"(_ldv8_29_6), "=r"(_ldv8_29_7) : "l"((const void*)(ws + (fpbase + (unsigned long long)((col_half * B_HALF_N + 64 + 0) * BLOCK_M) + 8) + (0))) : "memory");
-                            fpfill[8 + 0] = __uint_as_float(_ldv8_29_0);
-                            fpfill[8 + 1] = __uint_as_float(_ldv8_29_1);
-                            fpfill[8 + 2] = __uint_as_float(_ldv8_29_2);
-                            fpfill[8 + 3] = __uint_as_float(_ldv8_29_3);
-                            fpfill[8 + 4] = __uint_as_float(_ldv8_29_4);
-                            fpfill[8 + 5] = __uint_as_float(_ldv8_29_5);
-                            fpfill[8 + 6] = __uint_as_float(_ldv8_29_6);
-                            fpfill[8 + 7] = __uint_as_float(_ldv8_29_7);
+                                : "=r"(_ldv8_29_0), "=r"(_ldv8_29_1), "=r"(_ldv8_29_2), "=r"(_ldv8_29_3), "=r"(_ldv8_29_4), "=r"(_ldv8_29_5), "=r"(_ldv8_29_6), "=r"(_ldv8_29_7) : "l"((const void*)(ws + (fill_base_1 + (unsigned long long)((col_half * B_HALF_N + 64 + 0) * BLOCK_M) + 8) + (0))) : "memory");
+                            fill_regs_1[8 + 0] = __uint_as_float(_ldv8_29_0);
+                            fill_regs_1[8 + 1] = __uint_as_float(_ldv8_29_1);
+                            fill_regs_1[8 + 2] = __uint_as_float(_ldv8_29_2);
+                            fill_regs_1[8 + 3] = __uint_as_float(_ldv8_29_3);
+                            fill_regs_1[8 + 4] = __uint_as_float(_ldv8_29_4);
+                            fill_regs_1[8 + 5] = __uint_as_float(_ldv8_29_5);
+                            fill_regs_1[8 + 6] = __uint_as_float(_ldv8_29_6);
+                            fill_regs_1[8 + 7] = __uint_as_float(_ldv8_29_7);
                         }
                         {
                             unsigned _ldv8_30_0;
@@ -1204,15 +1204,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_30_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_30_0), "=r"(_ldv8_30_1), "=r"(_ldv8_30_2), "=r"(_ldv8_30_3), "=r"(_ldv8_30_4), "=r"(_ldv8_30_5), "=r"(_ldv8_30_6), "=r"(_ldv8_30_7) : "l"((const void*)(ws + (fpbase + (unsigned long long)((col_half * B_HALF_N + 64 + 16) * BLOCK_M) + 0) + (0))) : "memory");
-                            fpfill[16 + 0] = __uint_as_float(_ldv8_30_0);
-                            fpfill[16 + 1] = __uint_as_float(_ldv8_30_1);
-                            fpfill[16 + 2] = __uint_as_float(_ldv8_30_2);
-                            fpfill[16 + 3] = __uint_as_float(_ldv8_30_3);
-                            fpfill[16 + 4] = __uint_as_float(_ldv8_30_4);
-                            fpfill[16 + 5] = __uint_as_float(_ldv8_30_5);
-                            fpfill[16 + 6] = __uint_as_float(_ldv8_30_6);
-                            fpfill[16 + 7] = __uint_as_float(_ldv8_30_7);
+                                : "=r"(_ldv8_30_0), "=r"(_ldv8_30_1), "=r"(_ldv8_30_2), "=r"(_ldv8_30_3), "=r"(_ldv8_30_4), "=r"(_ldv8_30_5), "=r"(_ldv8_30_6), "=r"(_ldv8_30_7) : "l"((const void*)(ws + (fill_base_1 + (unsigned long long)((col_half * B_HALF_N + 64 + 16) * BLOCK_M) + 0) + (0))) : "memory");
+                            fill_regs_1[16 + 0] = __uint_as_float(_ldv8_30_0);
+                            fill_regs_1[16 + 1] = __uint_as_float(_ldv8_30_1);
+                            fill_regs_1[16 + 2] = __uint_as_float(_ldv8_30_2);
+                            fill_regs_1[16 + 3] = __uint_as_float(_ldv8_30_3);
+                            fill_regs_1[16 + 4] = __uint_as_float(_ldv8_30_4);
+                            fill_regs_1[16 + 5] = __uint_as_float(_ldv8_30_5);
+                            fill_regs_1[16 + 6] = __uint_as_float(_ldv8_30_6);
+                            fill_regs_1[16 + 7] = __uint_as_float(_ldv8_30_7);
                         }
                         {
                             unsigned _ldv8_31_0;
@@ -1225,15 +1225,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_31_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_31_0), "=r"(_ldv8_31_1), "=r"(_ldv8_31_2), "=r"(_ldv8_31_3), "=r"(_ldv8_31_4), "=r"(_ldv8_31_5), "=r"(_ldv8_31_6), "=r"(_ldv8_31_7) : "l"((const void*)(ws + (fpbase + (unsigned long long)((col_half * B_HALF_N + 64 + 16) * BLOCK_M) + 8) + (0))) : "memory");
-                            fpfill[24 + 0] = __uint_as_float(_ldv8_31_0);
-                            fpfill[24 + 1] = __uint_as_float(_ldv8_31_1);
-                            fpfill[24 + 2] = __uint_as_float(_ldv8_31_2);
-                            fpfill[24 + 3] = __uint_as_float(_ldv8_31_3);
-                            fpfill[24 + 4] = __uint_as_float(_ldv8_31_4);
-                            fpfill[24 + 5] = __uint_as_float(_ldv8_31_5);
-                            fpfill[24 + 6] = __uint_as_float(_ldv8_31_6);
-                            fpfill[24 + 7] = __uint_as_float(_ldv8_31_7);
+                                : "=r"(_ldv8_31_0), "=r"(_ldv8_31_1), "=r"(_ldv8_31_2), "=r"(_ldv8_31_3), "=r"(_ldv8_31_4), "=r"(_ldv8_31_5), "=r"(_ldv8_31_6), "=r"(_ldv8_31_7) : "l"((const void*)(ws + (fill_base_1 + (unsigned long long)((col_half * B_HALF_N + 64 + 16) * BLOCK_M) + 8) + (0))) : "memory");
+                            fill_regs_1[24 + 0] = __uint_as_float(_ldv8_31_0);
+                            fill_regs_1[24 + 1] = __uint_as_float(_ldv8_31_1);
+                            fill_regs_1[24 + 2] = __uint_as_float(_ldv8_31_2);
+                            fill_regs_1[24 + 3] = __uint_as_float(_ldv8_31_3);
+                            fill_regs_1[24 + 4] = __uint_as_float(_ldv8_31_4);
+                            fill_regs_1[24 + 5] = __uint_as_float(_ldv8_31_5);
+                            fill_regs_1[24 + 6] = __uint_as_float(_ldv8_31_6);
+                            fill_regs_1[24 + 7] = __uint_as_float(_ldv8_31_7);
                         }
                         {
                             unsigned _ldv8_32_0;
@@ -1246,15 +1246,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_32_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_32_0), "=r"(_ldv8_32_1), "=r"(_ldv8_32_2), "=r"(_ldv8_32_3), "=r"(_ldv8_32_4), "=r"(_ldv8_32_5), "=r"(_ldv8_32_6), "=r"(_ldv8_32_7) : "l"((const void*)(ws + (fpbase + (unsigned long long)((col_half * B_HALF_N + 64 + 32) * BLOCK_M) + 0) + (0))) : "memory");
-                            fpfill[32 + 0] = __uint_as_float(_ldv8_32_0);
-                            fpfill[32 + 1] = __uint_as_float(_ldv8_32_1);
-                            fpfill[32 + 2] = __uint_as_float(_ldv8_32_2);
-                            fpfill[32 + 3] = __uint_as_float(_ldv8_32_3);
-                            fpfill[32 + 4] = __uint_as_float(_ldv8_32_4);
-                            fpfill[32 + 5] = __uint_as_float(_ldv8_32_5);
-                            fpfill[32 + 6] = __uint_as_float(_ldv8_32_6);
-                            fpfill[32 + 7] = __uint_as_float(_ldv8_32_7);
+                                : "=r"(_ldv8_32_0), "=r"(_ldv8_32_1), "=r"(_ldv8_32_2), "=r"(_ldv8_32_3), "=r"(_ldv8_32_4), "=r"(_ldv8_32_5), "=r"(_ldv8_32_6), "=r"(_ldv8_32_7) : "l"((const void*)(ws + (fill_base_1 + (unsigned long long)((col_half * B_HALF_N + 64 + 32) * BLOCK_M) + 0) + (0))) : "memory");
+                            fill_regs_1[32 + 0] = __uint_as_float(_ldv8_32_0);
+                            fill_regs_1[32 + 1] = __uint_as_float(_ldv8_32_1);
+                            fill_regs_1[32 + 2] = __uint_as_float(_ldv8_32_2);
+                            fill_regs_1[32 + 3] = __uint_as_float(_ldv8_32_3);
+                            fill_regs_1[32 + 4] = __uint_as_float(_ldv8_32_4);
+                            fill_regs_1[32 + 5] = __uint_as_float(_ldv8_32_5);
+                            fill_regs_1[32 + 6] = __uint_as_float(_ldv8_32_6);
+                            fill_regs_1[32 + 7] = __uint_as_float(_ldv8_32_7);
                         }
                         {
                             unsigned _ldv8_33_0;
@@ -1267,15 +1267,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_33_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_33_0), "=r"(_ldv8_33_1), "=r"(_ldv8_33_2), "=r"(_ldv8_33_3), "=r"(_ldv8_33_4), "=r"(_ldv8_33_5), "=r"(_ldv8_33_6), "=r"(_ldv8_33_7) : "l"((const void*)(ws + (fpbase + (unsigned long long)((col_half * B_HALF_N + 64 + 32) * BLOCK_M) + 8) + (0))) : "memory");
-                            fpfill[40 + 0] = __uint_as_float(_ldv8_33_0);
-                            fpfill[40 + 1] = __uint_as_float(_ldv8_33_1);
-                            fpfill[40 + 2] = __uint_as_float(_ldv8_33_2);
-                            fpfill[40 + 3] = __uint_as_float(_ldv8_33_3);
-                            fpfill[40 + 4] = __uint_as_float(_ldv8_33_4);
-                            fpfill[40 + 5] = __uint_as_float(_ldv8_33_5);
-                            fpfill[40 + 6] = __uint_as_float(_ldv8_33_6);
-                            fpfill[40 + 7] = __uint_as_float(_ldv8_33_7);
+                                : "=r"(_ldv8_33_0), "=r"(_ldv8_33_1), "=r"(_ldv8_33_2), "=r"(_ldv8_33_3), "=r"(_ldv8_33_4), "=r"(_ldv8_33_5), "=r"(_ldv8_33_6), "=r"(_ldv8_33_7) : "l"((const void*)(ws + (fill_base_1 + (unsigned long long)((col_half * B_HALF_N + 64 + 32) * BLOCK_M) + 8) + (0))) : "memory");
+                            fill_regs_1[40 + 0] = __uint_as_float(_ldv8_33_0);
+                            fill_regs_1[40 + 1] = __uint_as_float(_ldv8_33_1);
+                            fill_regs_1[40 + 2] = __uint_as_float(_ldv8_33_2);
+                            fill_regs_1[40 + 3] = __uint_as_float(_ldv8_33_3);
+                            fill_regs_1[40 + 4] = __uint_as_float(_ldv8_33_4);
+                            fill_regs_1[40 + 5] = __uint_as_float(_ldv8_33_5);
+                            fill_regs_1[40 + 6] = __uint_as_float(_ldv8_33_6);
+                            fill_regs_1[40 + 7] = __uint_as_float(_ldv8_33_7);
                         }
                         {
                             unsigned _ldv8_34_0;
@@ -1288,15 +1288,15 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_34_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_34_0), "=r"(_ldv8_34_1), "=r"(_ldv8_34_2), "=r"(_ldv8_34_3), "=r"(_ldv8_34_4), "=r"(_ldv8_34_5), "=r"(_ldv8_34_6), "=r"(_ldv8_34_7) : "l"((const void*)(ws + (fpbase + (unsigned long long)((col_half * B_HALF_N + 64 + 48) * BLOCK_M) + 0) + (0))) : "memory");
-                            fpfill[48 + 0] = __uint_as_float(_ldv8_34_0);
-                            fpfill[48 + 1] = __uint_as_float(_ldv8_34_1);
-                            fpfill[48 + 2] = __uint_as_float(_ldv8_34_2);
-                            fpfill[48 + 3] = __uint_as_float(_ldv8_34_3);
-                            fpfill[48 + 4] = __uint_as_float(_ldv8_34_4);
-                            fpfill[48 + 5] = __uint_as_float(_ldv8_34_5);
-                            fpfill[48 + 6] = __uint_as_float(_ldv8_34_6);
-                            fpfill[48 + 7] = __uint_as_float(_ldv8_34_7);
+                                : "=r"(_ldv8_34_0), "=r"(_ldv8_34_1), "=r"(_ldv8_34_2), "=r"(_ldv8_34_3), "=r"(_ldv8_34_4), "=r"(_ldv8_34_5), "=r"(_ldv8_34_6), "=r"(_ldv8_34_7) : "l"((const void*)(ws + (fill_base_1 + (unsigned long long)((col_half * B_HALF_N + 64 + 48) * BLOCK_M) + 0) + (0))) : "memory");
+                            fill_regs_1[48 + 0] = __uint_as_float(_ldv8_34_0);
+                            fill_regs_1[48 + 1] = __uint_as_float(_ldv8_34_1);
+                            fill_regs_1[48 + 2] = __uint_as_float(_ldv8_34_2);
+                            fill_regs_1[48 + 3] = __uint_as_float(_ldv8_34_3);
+                            fill_regs_1[48 + 4] = __uint_as_float(_ldv8_34_4);
+                            fill_regs_1[48 + 5] = __uint_as_float(_ldv8_34_5);
+                            fill_regs_1[48 + 6] = __uint_as_float(_ldv8_34_6);
+                            fill_regs_1[48 + 7] = __uint_as_float(_ldv8_34_7);
                         }
                         {
                             unsigned _ldv8_35_0;
@@ -1309,20 +1309,20 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                             unsigned _ldv8_35_7;
                             asm volatile(
                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_ldv8_35_0), "=r"(_ldv8_35_1), "=r"(_ldv8_35_2), "=r"(_ldv8_35_3), "=r"(_ldv8_35_4), "=r"(_ldv8_35_5), "=r"(_ldv8_35_6), "=r"(_ldv8_35_7) : "l"((const void*)(ws + (fpbase + (unsigned long long)((col_half * B_HALF_N + 64 + 48) * BLOCK_M) + 8) + (0))) : "memory");
-                            fpfill[56 + 0] = __uint_as_float(_ldv8_35_0);
-                            fpfill[56 + 1] = __uint_as_float(_ldv8_35_1);
-                            fpfill[56 + 2] = __uint_as_float(_ldv8_35_2);
-                            fpfill[56 + 3] = __uint_as_float(_ldv8_35_3);
-                            fpfill[56 + 4] = __uint_as_float(_ldv8_35_4);
-                            fpfill[56 + 5] = __uint_as_float(_ldv8_35_5);
-                            fpfill[56 + 6] = __uint_as_float(_ldv8_35_6);
-                            fpfill[56 + 7] = __uint_as_float(_ldv8_35_7);
+                                : "=r"(_ldv8_35_0), "=r"(_ldv8_35_1), "=r"(_ldv8_35_2), "=r"(_ldv8_35_3), "=r"(_ldv8_35_4), "=r"(_ldv8_35_5), "=r"(_ldv8_35_6), "=r"(_ldv8_35_7) : "l"((const void*)(ws + (fill_base_1 + (unsigned long long)((col_half * B_HALF_N + 64 + 48) * BLOCK_M) + 8) + (0))) : "memory");
+                            fill_regs_1[56 + 0] = __uint_as_float(_ldv8_35_0);
+                            fill_regs_1[56 + 1] = __uint_as_float(_ldv8_35_1);
+                            fill_regs_1[56 + 2] = __uint_as_float(_ldv8_35_2);
+                            fill_regs_1[56 + 3] = __uint_as_float(_ldv8_35_3);
+                            fill_regs_1[56 + 4] = __uint_as_float(_ldv8_35_4);
+                            fill_regs_1[56 + 5] = __uint_as_float(_ldv8_35_5);
+                            fill_regs_1[56 + 6] = __uint_as_float(_ldv8_35_6);
+                            fill_regs_1[56 + 7] = __uint_as_float(_ldv8_35_7);
                         }
-                        tmem_st_x16_f32(pre_addr + col_half * B_HALF_N + 64, fpfill);
-                        tmem_st_x16_f32(pre_addr + col_half * B_HALF_N + 80, (fpfill + 16));
-                        tmem_st_x16_f32(pre_addr + col_half * B_HALF_N + 96, (fpfill + 32));
-                        tmem_st_x16_f32(pre_addr + col_half * B_HALF_N + 112, (fpfill + 48));
+                        tmem_st_x16_f32(pre_addr + col_half * B_HALF_N + 64, fill_regs_1);
+                        tmem_st_x16_f32(pre_addr + col_half * B_HALF_N + 80, (fill_regs_1 + 16));
+                        tmem_st_x16_f32(pre_addr + col_half * B_HALF_N + 96, (fill_regs_1 + 32));
+                        tmem_st_x16_f32(pre_addr + col_half * B_HALF_N + 112, (fill_regs_1 + 48));
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                         asm volatile("barrier.sync 1, 256;" ::: "memory");
                         if (warp == 2) {
@@ -1625,19 +1625,19 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                         if (fo_ws == 1) {
                             if (warp == 2) {
                                 if (elect_sync()) {
-                                    int32_t _fws_ld_0;
-                                    asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_fws_ld_0) : "l"(counters + fo_wslot) : "memory");
-                                    int fcnt_w = _fws_ld_0;
+                                    int32_t fill_ld0_2;
+                                    asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(fill_ld0_2) : "l"(counters + fo_wslot) : "memory");
+                                    int fill_cnt_2 = fill_ld0_2;
                                     #pragma unroll 1
-                                    for (int _fspin_w = 0; _fspin_w < 4194304; _fspin_w++) {
-                                        if (fcnt_w >= 1) {
+                                    for (int _fill_spin_2 = 0; _fill_spin_2 < 4194304; _fill_spin_2++) {
+                                        if (fill_cnt_2 >= 1) {
                                             break;
                                         }
-                                        int32_t _fws_ld_1;
-                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(_fws_ld_1) : "l"(counters + fo_wslot) : "memory");
-                                        fcnt_w = _fws_ld_1;
+                                        int32_t fill_ld1_2;
+                                        asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(fill_ld1_2) : "l"(counters + fo_wslot) : "memory");
+                                        fill_cnt_2 = fill_ld1_2;
                                     }
-                                    if (fcnt_w < 1) {
+                                    if (fill_cnt_2 < 1) {
                                         asm volatile("trap;" ::: "memory");
                                     }
                                     asm volatile("fence.acquire.gpu;" ::: "memory");
@@ -1680,7 +1680,7 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                                 if (fo_ws == 1) {
                                     #pragma unroll
                                     for (int q = 0; q < 8; q++) {
-                                        float fwv[8];
+                                        float ws_part[8];
                                         {
                                             unsigned _ldv8_52_0;
                                             unsigned _ldv8_52_1;
@@ -1693,18 +1693,18 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                                             asm volatile(
                                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
                                                 : "=r"(_ldv8_52_0), "=r"(_ldv8_52_1), "=r"(_ldv8_52_2), "=r"(_ldv8_52_3), "=r"(_ldv8_52_4), "=r"(_ldv8_52_5), "=r"(_ldv8_52_6), "=r"(_ldv8_52_7) : "l"((const void*)(ws + (fwbase + (unsigned long long)(colf * BLOCK_M) + (unsigned long long)(q / 2 * (16 * BLOCK_M)) + (unsigned long long)(q % 2 * 8)) + (0))) : "memory");
-                                            fwv[0 + 0] = __uint_as_float(_ldv8_52_0);
-                                            fwv[0 + 1] = __uint_as_float(_ldv8_52_1);
-                                            fwv[0 + 2] = __uint_as_float(_ldv8_52_2);
-                                            fwv[0 + 3] = __uint_as_float(_ldv8_52_3);
-                                            fwv[0 + 4] = __uint_as_float(_ldv8_52_4);
-                                            fwv[0 + 5] = __uint_as_float(_ldv8_52_5);
-                                            fwv[0 + 6] = __uint_as_float(_ldv8_52_6);
-                                            fwv[0 + 7] = __uint_as_float(_ldv8_52_7);
+                                            ws_part[0 + 0] = __uint_as_float(_ldv8_52_0);
+                                            ws_part[0 + 1] = __uint_as_float(_ldv8_52_1);
+                                            ws_part[0 + 2] = __uint_as_float(_ldv8_52_2);
+                                            ws_part[0 + 3] = __uint_as_float(_ldv8_52_3);
+                                            ws_part[0 + 4] = __uint_as_float(_ldv8_52_4);
+                                            ws_part[0 + 5] = __uint_as_float(_ldv8_52_5);
+                                            ws_part[0 + 6] = __uint_as_float(_ldv8_52_6);
+                                            ws_part[0 + 7] = __uint_as_float(_ldv8_52_7);
                                         }
                                         #pragma unroll
                                         for (int e_2 = 0; e_2 < 8; e_2++) {
-                                            totf[q * 8 + e_2] = totf[q * 8 + e_2] + fwv[e_2];
+                                            totf[q * 8 + e_2] = totf[q * 8 + e_2] + ws_part[e_2];
                                         }
                                     }
                                 }
@@ -1729,35 +1729,35 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                                 }
                                 #pragma unroll
                                 for (int q_1 = 0; q_1 < 4; q_1++) {
-                                    float outf[16];
+                                    float out16[16];
                                     #pragma unroll
                                     for (int e_4 = 0; e_4 < 16; e_4++) {
-                                        outf[e_4] = totf[q_1 * 16 + e_4];
+                                        out16[e_4] = totf[q_1 * 16 + e_4];
                                     }
                                     if (cls_1 == 0) {
                                         if (row_ok + store_rf == 2) {
                                             {
-                                                unsigned _stv8_53_0 = __float_as_uint(outf[0 + 0]);
-                                                unsigned _stv8_53_1 = __float_as_uint(outf[0 + 1]);
-                                                unsigned _stv8_53_2 = __float_as_uint(outf[0 + 2]);
-                                                unsigned _stv8_53_3 = __float_as_uint(outf[0 + 3]);
-                                                unsigned _stv8_53_4 = __float_as_uint(outf[0 + 4]);
-                                                unsigned _stv8_53_5 = __float_as_uint(outf[0 + 5]);
-                                                unsigned _stv8_53_6 = __float_as_uint(outf[0 + 6]);
-                                                unsigned _stv8_53_7 = __float_as_uint(outf[0 + 7]);
+                                                unsigned _stv8_53_0 = __float_as_uint(out16[0 + 0]);
+                                                unsigned _stv8_53_1 = __float_as_uint(out16[0 + 1]);
+                                                unsigned _stv8_53_2 = __float_as_uint(out16[0 + 2]);
+                                                unsigned _stv8_53_3 = __float_as_uint(out16[0 + 3]);
+                                                unsigned _stv8_53_4 = __float_as_uint(out16[0 + 4]);
+                                                unsigned _stv8_53_5 = __float_as_uint(out16[0 + 5]);
+                                                unsigned _stv8_53_6 = __float_as_uint(out16[0 + 6]);
+                                                unsigned _stv8_53_7 = __float_as_uint(out16[0 + 7]);
                                                 asm volatile(
                                                     "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
                                                     :: "l"((void*)(logits + (row_out_rf + (unsigned long long)(fh * 64) + (unsigned long long)(q_1 * 16)) + (0))), "r"(_stv8_53_0), "r"(_stv8_53_1), "r"(_stv8_53_2), "r"(_stv8_53_3), "r"(_stv8_53_4), "r"(_stv8_53_5), "r"(_stv8_53_6), "r"(_stv8_53_7) : "memory");
                                             }
                                             {
-                                                unsigned _stv8_54_0 = __float_as_uint(outf[8 + 0]);
-                                                unsigned _stv8_54_1 = __float_as_uint(outf[8 + 1]);
-                                                unsigned _stv8_54_2 = __float_as_uint(outf[8 + 2]);
-                                                unsigned _stv8_54_3 = __float_as_uint(outf[8 + 3]);
-                                                unsigned _stv8_54_4 = __float_as_uint(outf[8 + 4]);
-                                                unsigned _stv8_54_5 = __float_as_uint(outf[8 + 5]);
-                                                unsigned _stv8_54_6 = __float_as_uint(outf[8 + 6]);
-                                                unsigned _stv8_54_7 = __float_as_uint(outf[8 + 7]);
+                                                unsigned _stv8_54_0 = __float_as_uint(out16[8 + 0]);
+                                                unsigned _stv8_54_1 = __float_as_uint(out16[8 + 1]);
+                                                unsigned _stv8_54_2 = __float_as_uint(out16[8 + 2]);
+                                                unsigned _stv8_54_3 = __float_as_uint(out16[8 + 3]);
+                                                unsigned _stv8_54_4 = __float_as_uint(out16[8 + 4]);
+                                                unsigned _stv8_54_5 = __float_as_uint(out16[8 + 5]);
+                                                unsigned _stv8_54_6 = __float_as_uint(out16[8 + 6]);
+                                                unsigned _stv8_54_7 = __float_as_uint(out16[8 + 7]);
                                                 asm volatile(
                                                     "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
                                                     :: "l"((void*)(logits + (row_out_rf + (unsigned long long)(fh * 64) + (unsigned long long)(q_1 * 16) + 8) + (0))), "r"(_stv8_54_0), "r"(_stv8_54_1), "r"(_stv8_54_2), "r"(_stv8_54_3), "r"(_stv8_54_4), "r"(_stv8_54_5), "r"(_stv8_54_6), "r"(_stv8_54_7) : "memory");
@@ -1766,49 +1766,49 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                                     }
                                     if (cls_1 == 1) {
                                         if (row_ok == 1) {
-                                            unsigned int fpack[8];
+                                            unsigned int bf16_packed[8];
                                             #pragma unroll
                                             for (int _lp = 0; _lp < 1; _lp++) {
-                                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(outf[_lp*2 + 0], outf[_lp*2+1 + 0]));
-                                                fpack[_lp] = *(uint32_t*)&_bf2;
+                                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out16[_lp*2 + 0], out16[_lp*2+1 + 0]));
+                                                bf16_packed[_lp] = *(uint32_t*)&_bf2;
                                             }
                                             #pragma unroll
                                             for (int _lp = 0; _lp < 1; _lp++) {
-                                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(outf[_lp*2 + 2], outf[_lp*2+1 + 2]));
-                                                fpack[_lp + 1] = *(uint32_t*)&_bf2;
+                                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out16[_lp*2 + 2], out16[_lp*2+1 + 2]));
+                                                bf16_packed[_lp + 1] = *(uint32_t*)&_bf2;
                                             }
                                             #pragma unroll
                                             for (int _lp = 0; _lp < 1; _lp++) {
-                                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(outf[_lp*2 + 4], outf[_lp*2+1 + 4]));
-                                                fpack[_lp + 2] = *(uint32_t*)&_bf2;
+                                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out16[_lp*2 + 4], out16[_lp*2+1 + 4]));
+                                                bf16_packed[_lp + 2] = *(uint32_t*)&_bf2;
                                             }
                                             #pragma unroll
                                             for (int _lp = 0; _lp < 1; _lp++) {
-                                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(outf[_lp*2 + 6], outf[_lp*2+1 + 6]));
-                                                fpack[_lp + 3] = *(uint32_t*)&_bf2;
+                                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out16[_lp*2 + 6], out16[_lp*2+1 + 6]));
+                                                bf16_packed[_lp + 3] = *(uint32_t*)&_bf2;
                                             }
                                             #pragma unroll
                                             for (int _lp = 0; _lp < 1; _lp++) {
-                                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(outf[_lp*2 + 8], outf[_lp*2+1 + 8]));
-                                                fpack[_lp + 4] = *(uint32_t*)&_bf2;
+                                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out16[_lp*2 + 8], out16[_lp*2+1 + 8]));
+                                                bf16_packed[_lp + 4] = *(uint32_t*)&_bf2;
                                             }
                                             #pragma unroll
                                             for (int _lp = 0; _lp < 1; _lp++) {
-                                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(outf[_lp*2 + 10], outf[_lp*2+1 + 10]));
-                                                fpack[_lp + 5] = *(uint32_t*)&_bf2;
+                                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out16[_lp*2 + 10], out16[_lp*2+1 + 10]));
+                                                bf16_packed[_lp + 5] = *(uint32_t*)&_bf2;
                                             }
                                             #pragma unroll
                                             for (int _lp = 0; _lp < 1; _lp++) {
-                                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(outf[_lp*2 + 12], outf[_lp*2+1 + 12]));
-                                                fpack[_lp + 6] = *(uint32_t*)&_bf2;
+                                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out16[_lp*2 + 12], out16[_lp*2+1 + 12]));
+                                                bf16_packed[_lp + 6] = *(uint32_t*)&_bf2;
                                             }
                                             #pragma unroll
                                             for (int _lp = 0; _lp < 1; _lp++) {
-                                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(outf[_lp*2 + 14], outf[_lp*2+1 + 14]));
-                                                fpack[_lp + 7] = *(uint32_t*)&_bf2;
+                                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out16[_lp*2 + 14], out16[_lp*2+1 + 14]));
+                                                bf16_packed[_lp + 7] = *(uint32_t*)&_bf2;
                                             }
                                             {
-                                                const unsigned* _raw_stv8_55 = reinterpret_cast<const unsigned*>(fpack);
+                                                const unsigned* _raw_stv8_55 = reinterpret_cast<const unsigned*>(bf16_packed);
                                                 asm volatile(
                                                     "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
                                                     :: "l"((void*)(latent + (row_out_lf + (unsigned long long)(fh * 64) + (unsigned long long)(q_1 * 16)))), "r"(_raw_stv8_55[0]), "r"(_raw_stv8_55[1]), "r"(_raw_stv8_55[2]), "r"(_raw_stv8_55[3]), "r"(_raw_stv8_55[4]), "r"(_raw_stv8_55[5]), "r"(_raw_stv8_55[6]), "r"(_raw_stv8_55[7]) : "memory");
@@ -1853,7 +1853,7 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                                 if (fo_ws == 1) {
                                     #pragma unroll
                                     for (int q_2 = 0; q_2 < 4; q_2++) {
-                                        float fwg[8];
+                                        float ws_g[8];
                                         {
                                             unsigned _ldv8_56_0;
                                             unsigned _ldv8_56_1;
@@ -1866,16 +1866,16 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                                             asm volatile(
                                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
                                                 : "=r"(_ldv8_56_0), "=r"(_ldv8_56_1), "=r"(_ldv8_56_2), "=r"(_ldv8_56_3), "=r"(_ldv8_56_4), "=r"(_ldv8_56_5), "=r"(_ldv8_56_6), "=r"(_ldv8_56_7) : "l"((const void*)(ws + (fwbase + (unsigned long long)(colgf * BLOCK_M) + (unsigned long long)(q_2 / 2 * (16 * BLOCK_M)) + (unsigned long long)(q_2 % 2 * 8)) + (0))) : "memory");
-                                            fwg[0 + 0] = __uint_as_float(_ldv8_56_0);
-                                            fwg[0 + 1] = __uint_as_float(_ldv8_56_1);
-                                            fwg[0 + 2] = __uint_as_float(_ldv8_56_2);
-                                            fwg[0 + 3] = __uint_as_float(_ldv8_56_3);
-                                            fwg[0 + 4] = __uint_as_float(_ldv8_56_4);
-                                            fwg[0 + 5] = __uint_as_float(_ldv8_56_5);
-                                            fwg[0 + 6] = __uint_as_float(_ldv8_56_6);
-                                            fwg[0 + 7] = __uint_as_float(_ldv8_56_7);
+                                            ws_g[0 + 0] = __uint_as_float(_ldv8_56_0);
+                                            ws_g[0 + 1] = __uint_as_float(_ldv8_56_1);
+                                            ws_g[0 + 2] = __uint_as_float(_ldv8_56_2);
+                                            ws_g[0 + 3] = __uint_as_float(_ldv8_56_3);
+                                            ws_g[0 + 4] = __uint_as_float(_ldv8_56_4);
+                                            ws_g[0 + 5] = __uint_as_float(_ldv8_56_5);
+                                            ws_g[0 + 6] = __uint_as_float(_ldv8_56_6);
+                                            ws_g[0 + 7] = __uint_as_float(_ldv8_56_7);
                                         }
-                                        float fwu[8];
+                                        float ws_u[8];
                                         {
                                             unsigned _ldv8_57_0;
                                             unsigned _ldv8_57_1;
@@ -1888,19 +1888,19 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                                             asm volatile(
                                                 "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
                                                 : "=r"(_ldv8_57_0), "=r"(_ldv8_57_1), "=r"(_ldv8_57_2), "=r"(_ldv8_57_3), "=r"(_ldv8_57_4), "=r"(_ldv8_57_5), "=r"(_ldv8_57_6), "=r"(_ldv8_57_7) : "l"((const void*)(ws + (fwbase + (unsigned long long)(B_HALF_N * BLOCK_M) + (unsigned long long)(colgf * BLOCK_M) + (unsigned long long)(q_2 / 2 * (16 * BLOCK_M)) + (unsigned long long)(q_2 % 2 * 8)) + (0))) : "memory");
-                                            fwu[0 + 0] = __uint_as_float(_ldv8_57_0);
-                                            fwu[0 + 1] = __uint_as_float(_ldv8_57_1);
-                                            fwu[0 + 2] = __uint_as_float(_ldv8_57_2);
-                                            fwu[0 + 3] = __uint_as_float(_ldv8_57_3);
-                                            fwu[0 + 4] = __uint_as_float(_ldv8_57_4);
-                                            fwu[0 + 5] = __uint_as_float(_ldv8_57_5);
-                                            fwu[0 + 6] = __uint_as_float(_ldv8_57_6);
-                                            fwu[0 + 7] = __uint_as_float(_ldv8_57_7);
+                                            ws_u[0 + 0] = __uint_as_float(_ldv8_57_0);
+                                            ws_u[0 + 1] = __uint_as_float(_ldv8_57_1);
+                                            ws_u[0 + 2] = __uint_as_float(_ldv8_57_2);
+                                            ws_u[0 + 3] = __uint_as_float(_ldv8_57_3);
+                                            ws_u[0 + 4] = __uint_as_float(_ldv8_57_4);
+                                            ws_u[0 + 5] = __uint_as_float(_ldv8_57_5);
+                                            ws_u[0 + 6] = __uint_as_float(_ldv8_57_6);
+                                            ws_u[0 + 7] = __uint_as_float(_ldv8_57_7);
                                         }
                                         #pragma unroll
                                         for (int e_7 = 0; e_7 < 8; e_7++) {
-                                            totgf[q_2 * 8 + e_7] = totgf[q_2 * 8 + e_7] + fwg[e_7];
-                                            totuf[q_2 * 8 + e_7] = totuf[q_2 * 8 + e_7] + fwu[e_7];
+                                            totgf[q_2 * 8 + e_7] = totgf[q_2 * 8 + e_7] + ws_g[e_7];
+                                            totuf[q_2 * 8 + e_7] = totuf[q_2 * 8 + e_7] + ws_u[e_7];
                                         }
                                     }
                                 }
@@ -1927,63 +1927,63 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                                 }
                                 #pragma unroll
                                 for (int q_3 = 0; q_3 < 2; q_3++) {
-                                    float out_f[16];
+                                    float situ16[16];
                                     #pragma unroll
                                     for (int j_1 = 0; j_1 < 16; j_1++) {
-                                        float gf = (float)(__nv_bfloat16)totgf[q_3 * 16 + j_1];
-                                        float uf = (float)(__nv_bfloat16)totuf[q_3 * 16 + j_1];
-                                        float _exp2_58 = approx_exp2((-gf) * 1.442695f);
-                                        float sigf = approx_rcp(1.0f + _exp2_58);
-                                        float _tanh_59 = tanhf(gf * 0.25f);
-                                        float af = 4.0f * _tanh_59 * sigf;
-                                        float _tanh_60 = tanhf(uf * 0.04f);
-                                        float bf = 25.0f * _tanh_60;
-                                        out_f[j_1] = af * bf;
+                                        float situ_g = (float)(__nv_bfloat16)totgf[q_3 * 16 + j_1];
+                                        float situ_u = (float)(__nv_bfloat16)totuf[q_3 * 16 + j_1];
+                                        float _exp2_58 = approx_exp2((-situ_g) * 1.442695f);
+                                        float situ_sig = approx_rcp(1.0f + _exp2_58);
+                                        float _tanh_59 = tanhf(situ_g * 0.25f);
+                                        float situ_a = 4.0f * _tanh_59 * situ_sig;
+                                        float _tanh_60 = tanhf(situ_u * 0.04f);
+                                        float situ_b = 25.0f * _tanh_60;
+                                        situ16[j_1] = situ_a * situ_b;
                                     }
                                     if (row_ok == 1) {
-                                        unsigned int fpack_s[8];
+                                        unsigned int bf16_packed_1[8];
                                         #pragma unroll
                                         for (int _lp = 0; _lp < 1; _lp++) {
-                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_f[_lp*2 + 0], out_f[_lp*2+1 + 0]));
-                                            fpack_s[_lp] = *(uint32_t*)&_bf2;
+                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(situ16[_lp*2 + 0], situ16[_lp*2+1 + 0]));
+                                            bf16_packed_1[_lp] = *(uint32_t*)&_bf2;
                                         }
                                         #pragma unroll
                                         for (int _lp = 0; _lp < 1; _lp++) {
-                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_f[_lp*2 + 2], out_f[_lp*2+1 + 2]));
-                                            fpack_s[_lp + 1] = *(uint32_t*)&_bf2;
+                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(situ16[_lp*2 + 2], situ16[_lp*2+1 + 2]));
+                                            bf16_packed_1[_lp + 1] = *(uint32_t*)&_bf2;
                                         }
                                         #pragma unroll
                                         for (int _lp = 0; _lp < 1; _lp++) {
-                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_f[_lp*2 + 4], out_f[_lp*2+1 + 4]));
-                                            fpack_s[_lp + 2] = *(uint32_t*)&_bf2;
+                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(situ16[_lp*2 + 4], situ16[_lp*2+1 + 4]));
+                                            bf16_packed_1[_lp + 2] = *(uint32_t*)&_bf2;
                                         }
                                         #pragma unroll
                                         for (int _lp = 0; _lp < 1; _lp++) {
-                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_f[_lp*2 + 6], out_f[_lp*2+1 + 6]));
-                                            fpack_s[_lp + 3] = *(uint32_t*)&_bf2;
+                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(situ16[_lp*2 + 6], situ16[_lp*2+1 + 6]));
+                                            bf16_packed_1[_lp + 3] = *(uint32_t*)&_bf2;
                                         }
                                         #pragma unroll
                                         for (int _lp = 0; _lp < 1; _lp++) {
-                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_f[_lp*2 + 8], out_f[_lp*2+1 + 8]));
-                                            fpack_s[_lp + 4] = *(uint32_t*)&_bf2;
+                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(situ16[_lp*2 + 8], situ16[_lp*2+1 + 8]));
+                                            bf16_packed_1[_lp + 4] = *(uint32_t*)&_bf2;
                                         }
                                         #pragma unroll
                                         for (int _lp = 0; _lp < 1; _lp++) {
-                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_f[_lp*2 + 10], out_f[_lp*2+1 + 10]));
-                                            fpack_s[_lp + 5] = *(uint32_t*)&_bf2;
+                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(situ16[_lp*2 + 10], situ16[_lp*2+1 + 10]));
+                                            bf16_packed_1[_lp + 5] = *(uint32_t*)&_bf2;
                                         }
                                         #pragma unroll
                                         for (int _lp = 0; _lp < 1; _lp++) {
-                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_f[_lp*2 + 12], out_f[_lp*2+1 + 12]));
-                                            fpack_s[_lp + 6] = *(uint32_t*)&_bf2;
+                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(situ16[_lp*2 + 12], situ16[_lp*2+1 + 12]));
+                                            bf16_packed_1[_lp + 6] = *(uint32_t*)&_bf2;
                                         }
                                         #pragma unroll
                                         for (int _lp = 0; _lp < 1; _lp++) {
-                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_f[_lp*2 + 14], out_f[_lp*2+1 + 14]));
-                                            fpack_s[_lp + 7] = *(uint32_t*)&_bf2;
+                                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(situ16[_lp*2 + 14], situ16[_lp*2+1 + 14]));
+                                            bf16_packed_1[_lp + 7] = *(uint32_t*)&_bf2;
                                         }
                                         {
-                                            const unsigned* _raw_stv8_61 = reinterpret_cast<const unsigned*>(fpack_s);
+                                            const unsigned* _raw_stv8_61 = reinterpret_cast<const unsigned*>(bf16_packed_1);
                                             asm volatile(
                                                 "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
                                                 :: "l"((void*)(shared_act + (row_out_sf + (unsigned long long)(fh_1 * 32) + (unsigned long long)(q_3 * 16)))), "r"(_raw_stv8_61[0]), "r"(_raw_stv8_61[1]), "r"(_raw_stv8_61[2]), "r"(_raw_stv8_61[3]), "r"(_raw_stv8_61[4]), "r"(_raw_stv8_61[5]), "r"(_raw_stv8_61[6]), "r"(_raw_stv8_61[7]) : "memory");
@@ -2052,49 +2052,49 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                                 tmem_ld_x16(&_tmem_load_11[0], lane_addr + col_half * B_HALF_N + col_1);
                                 asm volatile("tcgen05.wait::ld.sync.aligned;");
                                 if (row_ok == 1) {
-                                    unsigned int _packed_4[8];
+                                    unsigned int bf16_packed_2[8];
                                     #pragma unroll
                                     for (int _lp = 0; _lp < 1; _lp++) {
                                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_11[_lp*2 + 0], _tmem_load_11[_lp*2+1 + 0]));
-                                        _packed_4[_lp] = *(uint32_t*)&_bf2;
+                                        bf16_packed_2[_lp] = *(uint32_t*)&_bf2;
                                     }
                                     #pragma unroll
                                     for (int _lp = 0; _lp < 1; _lp++) {
                                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_11[_lp*2 + 2], _tmem_load_11[_lp*2+1 + 2]));
-                                        _packed_4[_lp + 1] = *(uint32_t*)&_bf2;
+                                        bf16_packed_2[_lp + 1] = *(uint32_t*)&_bf2;
                                     }
                                     #pragma unroll
                                     for (int _lp = 0; _lp < 1; _lp++) {
                                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_11[_lp*2 + 4], _tmem_load_11[_lp*2+1 + 4]));
-                                        _packed_4[_lp + 2] = *(uint32_t*)&_bf2;
+                                        bf16_packed_2[_lp + 2] = *(uint32_t*)&_bf2;
                                     }
                                     #pragma unroll
                                     for (int _lp = 0; _lp < 1; _lp++) {
                                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_11[_lp*2 + 6], _tmem_load_11[_lp*2+1 + 6]));
-                                        _packed_4[_lp + 3] = *(uint32_t*)&_bf2;
+                                        bf16_packed_2[_lp + 3] = *(uint32_t*)&_bf2;
                                     }
                                     #pragma unroll
                                     for (int _lp = 0; _lp < 1; _lp++) {
                                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_11[_lp*2 + 8], _tmem_load_11[_lp*2+1 + 8]));
-                                        _packed_4[_lp + 4] = *(uint32_t*)&_bf2;
+                                        bf16_packed_2[_lp + 4] = *(uint32_t*)&_bf2;
                                     }
                                     #pragma unroll
                                     for (int _lp = 0; _lp < 1; _lp++) {
                                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_11[_lp*2 + 10], _tmem_load_11[_lp*2+1 + 10]));
-                                        _packed_4[_lp + 5] = *(uint32_t*)&_bf2;
+                                        bf16_packed_2[_lp + 5] = *(uint32_t*)&_bf2;
                                     }
                                     #pragma unroll
                                     for (int _lp = 0; _lp < 1; _lp++) {
                                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_11[_lp*2 + 12], _tmem_load_11[_lp*2+1 + 12]));
-                                        _packed_4[_lp + 6] = *(uint32_t*)&_bf2;
+                                        bf16_packed_2[_lp + 6] = *(uint32_t*)&_bf2;
                                     }
                                     #pragma unroll
                                     for (int _lp = 0; _lp < 1; _lp++) {
                                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_11[_lp*2 + 14], _tmem_load_11[_lp*2+1 + 14]));
-                                        _packed_4[_lp + 7] = *(uint32_t*)&_bf2;
+                                        bf16_packed_2[_lp + 7] = *(uint32_t*)&_bf2;
                                     }
                                     {
-                                        const unsigned* _raw_stv8_64 = reinterpret_cast<const unsigned*>(_packed_4);
+                                        const unsigned* _raw_stv8_64 = reinterpret_cast<const unsigned*>(bf16_packed_2);
                                         asm volatile(
                                             "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
                                             :: "l"((void*)(latent + (row_out_l + (unsigned long long)col_1))), "r"(_raw_stv8_64[0]), "r"(_raw_stv8_64[1]), "r"(_raw_stv8_64[2]), "r"(_raw_stv8_64[3]), "r"(_raw_stv8_64[4]), "r"(_raw_stv8_64[5]), "r"(_raw_stv8_64[6]), "r"(_raw_stv8_64[7]) : "memory");
@@ -2117,60 +2117,60 @@ kernel_cake_kimi_k3_latent_moe_4bb4ae8bb58462edbc88(const __grid_constant__ CUte
                                 float out_vals[16];
                                 #pragma unroll
                                 for (int j_1_1 = 0; j_1_1 < 16; j_1_1++) {
-                                    float g = (float)(__nv_bfloat16)_tmem_load_12[j_1_1];
-                                    float u = (float)(__nv_bfloat16)_tmem_load_13[j_1_1];
-                                    float _exp2_65 = approx_exp2((-g) * 1.442695f);
-                                    float sig = approx_rcp(1.0f + _exp2_65);
-                                    float _tanh_66 = tanhf(g * 0.25f);
-                                    float a = 4.0f * _tanh_66 * sig;
-                                    float _tanh_67 = tanhf(u * 0.04f);
-                                    float b = 25.0f * _tanh_67;
-                                    out_vals[j_1_1] = a * b;
+                                    float situ_g_1 = (float)(__nv_bfloat16)_tmem_load_12[j_1_1];
+                                    float situ_u_1 = (float)(__nv_bfloat16)_tmem_load_13[j_1_1];
+                                    float _exp2_65 = approx_exp2((-situ_g_1) * 1.442695f);
+                                    float situ_sig_1 = approx_rcp(1.0f + _exp2_65);
+                                    float _tanh_66 = tanhf(situ_g_1 * 0.25f);
+                                    float situ_a_1 = 4.0f * _tanh_66 * situ_sig_1;
+                                    float _tanh_67 = tanhf(situ_u_1 * 0.04f);
+                                    float situ_b_1 = 25.0f * _tanh_67;
+                                    out_vals[j_1_1] = situ_a_1 * situ_b_1;
                                 }
                                 if (row_ok == 1) {
-                                    unsigned int _packed_5[8];
+                                    unsigned int bf16_packed_3[8];
                                     #pragma unroll
                                     for (int _lp = 0; _lp < 1; _lp++) {
                                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_vals[_lp*2 + 0], out_vals[_lp*2+1 + 0]));
-                                        _packed_5[_lp] = *(uint32_t*)&_bf2;
+                                        bf16_packed_3[_lp] = *(uint32_t*)&_bf2;
                                     }
                                     #pragma unroll
                                     for (int _lp = 0; _lp < 1; _lp++) {
                                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_vals[_lp*2 + 2], out_vals[_lp*2+1 + 2]));
-                                        _packed_5[_lp + 1] = *(uint32_t*)&_bf2;
+                                        bf16_packed_3[_lp + 1] = *(uint32_t*)&_bf2;
                                     }
                                     #pragma unroll
                                     for (int _lp = 0; _lp < 1; _lp++) {
                                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_vals[_lp*2 + 4], out_vals[_lp*2+1 + 4]));
-                                        _packed_5[_lp + 2] = *(uint32_t*)&_bf2;
+                                        bf16_packed_3[_lp + 2] = *(uint32_t*)&_bf2;
                                     }
                                     #pragma unroll
                                     for (int _lp = 0; _lp < 1; _lp++) {
                                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_vals[_lp*2 + 6], out_vals[_lp*2+1 + 6]));
-                                        _packed_5[_lp + 3] = *(uint32_t*)&_bf2;
+                                        bf16_packed_3[_lp + 3] = *(uint32_t*)&_bf2;
                                     }
                                     #pragma unroll
                                     for (int _lp = 0; _lp < 1; _lp++) {
                                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_vals[_lp*2 + 8], out_vals[_lp*2+1 + 8]));
-                                        _packed_5[_lp + 4] = *(uint32_t*)&_bf2;
+                                        bf16_packed_3[_lp + 4] = *(uint32_t*)&_bf2;
                                     }
                                     #pragma unroll
                                     for (int _lp = 0; _lp < 1; _lp++) {
                                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_vals[_lp*2 + 10], out_vals[_lp*2+1 + 10]));
-                                        _packed_5[_lp + 5] = *(uint32_t*)&_bf2;
+                                        bf16_packed_3[_lp + 5] = *(uint32_t*)&_bf2;
                                     }
                                     #pragma unroll
                                     for (int _lp = 0; _lp < 1; _lp++) {
                                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_vals[_lp*2 + 12], out_vals[_lp*2+1 + 12]));
-                                        _packed_5[_lp + 6] = *(uint32_t*)&_bf2;
+                                        bf16_packed_3[_lp + 6] = *(uint32_t*)&_bf2;
                                     }
                                     #pragma unroll
                                     for (int _lp = 0; _lp < 1; _lp++) {
                                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out_vals[_lp*2 + 14], out_vals[_lp*2+1 + 14]));
-                                        _packed_5[_lp + 7] = *(uint32_t*)&_bf2;
+                                        bf16_packed_3[_lp + 7] = *(uint32_t*)&_bf2;
                                     }
                                     {
-                                        const unsigned* _raw_stv8_68 = reinterpret_cast<const unsigned*>(_packed_5);
+                                        const unsigned* _raw_stv8_68 = reinterpret_cast<const unsigned*>(bf16_packed_3);
                                         asm volatile(
                                             "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
                                             :: "l"((void*)(shared_act + (row_out_s + (unsigned long long)col_2))), "r"(_raw_stv8_68[0]), "r"(_raw_stv8_68[1]), "r"(_raw_stv8_68[2]), "r"(_raw_stv8_68[3]), "r"(_raw_stv8_68[4]), "r"(_raw_stv8_68[5]), "r"(_raw_stv8_68[6]), "r"(_raw_stv8_68[7]) : "memory");
